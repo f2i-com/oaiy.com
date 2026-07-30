@@ -90,7 +90,13 @@ export function createAgentModule(
     set: async (args: any[]) => {
       const key = String(args[0]);
       const value = args[1];
-      deps.agentMemory.set(key, value as any);
+      if (!deps.agentMemory.set(key, value as any)) {
+        // Refused for size. Say so loudly — silently returning null here is how
+        // a "successful" write became an unreadable key.
+        const msg = `Agent memory: value for "${key}" is too large to store and was NOT saved`;
+        if (deps.onLog) deps.onLog({ source: 'Agent', message: msg, type: 'error' });
+        throw new Error(msg);
+      }
       return null;
     },
     memory: async (args: any[]) => {
@@ -102,7 +108,14 @@ export function createAgentModule(
         await deps.loadPersistedMemory();
         switch (operation) {
           case 'set': {
-            deps.agentMemory.set(key, inputValue as any);
+            if (!deps.agentMemory.set(key, inputValue as any)) {
+              // Do NOT persist a value the in-memory map rejected: the row would
+              // be re-inserted and re-rejected on every later run, so the key
+              // would read as null forever while the database claimed otherwise.
+              const msg = `Agent memory: value for "${key}" is too large to store and was NOT saved`;
+              if (deps.onLog) deps.onLog({ source: 'Agent', message: msg, type: 'error' });
+              throw new Error(msg);
+            }
             try {
               await deps.persistMemoryEntry(key, inputValue);
             } catch (err) {
@@ -120,7 +133,16 @@ export function createAgentModule(
             } else {
               resultArray = [inputValue];
             }
-            deps.agentMemory.set(key, resultArray);
+            if (!deps.agentMemory.set(key, resultArray)) {
+              // The accumulated array has outgrown the per-value cap. Refuse the
+              // append rather than let every subsequent one read a stale value
+              // and quietly lose entries.
+              const msg =
+                `Agent memory: appending to "${key}" would exceed the per-value size limit ` +
+                `(${resultArray.length} entries) — nothing was saved`;
+              if (deps.onLog) deps.onLog({ source: 'Agent', message: msg, type: 'error' });
+              throw new Error(msg);
+            }
             try {
               await deps.persistMemoryEntry(key, resultArray);
             } catch (err) {
