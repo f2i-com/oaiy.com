@@ -2,3 +2,6 @@ dist/
 node_modules/
 src/generated/
 *.tsbuildinfo
+
+# Scratch scripts (ad-hoc probes while debugging the CLI).
+_*.mjs
