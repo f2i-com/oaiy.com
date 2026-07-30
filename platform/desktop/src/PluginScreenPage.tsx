@@ -66,16 +66,30 @@ const HOST_BOOTSTRAP = `
     aiSources: function () { return call('aiSources', []); },
     restartPlugin: function () { return call('restartPlugin', []); },
     events: {
+      // Resolves to a HANDLE (with .unsubscribe()), not the function itself —
+      // callers do subscribe(...).then(h => handle = h).
       subscribe: function (names, cb) {
         subs.push(cb);
-        call('subscribe', [names || []]);
-        return function () { subs = subs.filter(function (s) { return s !== cb; }); };
+        return call('subscribe', [names || []]).then(function () {
+          return {
+            unsubscribe: function () {
+              subs = subs.filter(function (s) { return s !== cb; });
+            }
+          };
+        });
       }
     },
-    // Surfaces this host does not implement. Rejecting by name is deliberate —
-    // a plugin tab then shows its own honest error instead of hanging on a
-    // promise that never settles or calling undefined.
-    consent: function () { return Promise.reject(new Error('consent grants are not supported by OAIY Desktop')); },
+    // Consent is a plain connector surface on the plugin (consent.get/set/revoke
+    // are declared commands), so it routes through the same gateway as any other
+    // command — the plugin owns the grant, the host just carries it.
+    consent: {
+      get: function () { return call('command', ['consent.get']); },
+      issue: function (grant) { return call('command', ['consent.set', grant]); },
+      revoke: function () { return call('command', ['consent.revoke']); }
+    },
+    // No OAIY equivalent and no backing plugin commands: reject by name so the
+    // tab shows its own honest error instead of hanging on a promise that never
+    // settles, or calling through undefined.
     companionPairing: {
       status: function () { return Promise.reject(new Error('companion pairing is not supported by OAIY Desktop')); },
       createOffer: function () { return Promise.reject(new Error('companion pairing is not supported by OAIY Desktop')); },
@@ -141,16 +155,22 @@ export default function PluginScreenPage({ pluginId, navId }: Props) {
         ).join('\n');
         // Manifest order matters: app.js defines the registry the tab modules
         // register into, and it is listed first.
-        const js = (
-          await Promise.all(files.filter((f) => f.endsWith('.js')).map(fetchText))
-        ).join('\n;\n');
+        //
+        // One <script> PER FILE, not one concatenated blob: concatenating puts
+        // every module in a single script, so a throw anywhere aborts all the
+        // modules after it — which silently cost us every tab that registers
+        // after the first failure. Separate tags give identical global semantics
+        // and identical ordering, but isolate a bad module to itself.
+        const jsFiles = files.filter((f) => f.endsWith('.js'));
+        const sources = await Promise.all(jsFiles.map(fetchText));
         if (cancelled) return;
+        const scripts = sources.map((s) => `<script>${s}</script>`).join('');
         setDoc(
           `<!doctype html><html><head><meta charset="utf-8">` +
             // No external anything: the plugin ships inline SVG and its own CSS.
             `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src data: blob:; font-src data:; connect-src 'none'">` +
             `<style>${css}</style></head><body>${body}` +
-            `<script>${HOST_BOOTSTRAP}</script><script>${js}</script></body></html>`,
+            `<script>${HOST_BOOTSTRAP}</script>${scripts}</body></html>`,
         );
         setError(null);
       } catch (e) {
@@ -168,7 +188,11 @@ export default function PluginScreenPage({ pluginId, navId }: Props) {
       switch (method) {
         case 'command': {
           const [name, payload] = args as [string, unknown];
-          const res = await bridge.connectorRequest(pluginId, name, payload);
+          // Always send an idempotency key: the gateway REQUIRES one for the
+          // plugin's journalled (physically side-effecting) commands, and a
+          // fresh key per user action is the correct semantics for the rest.
+          const key = `ui-${name}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+          const res = await bridge.connectorRequest(pluginId, name, payload, key);
           // Plugins answer with the SDK envelope { ok, data }; hand the screen
           // the inner data, which is what its call sites expect.
           const r = res.result as { ok?: boolean; data?: unknown } | undefined;
@@ -291,8 +315,14 @@ export default function PluginScreenPage({ pluginId, navId }: Props) {
       {record.state !== 'running' && (
         <div className="banner banner-err" role="alert">
           <span>
-            <TriangleAlert size={13} /> “{record.manifest?.name ?? record.id}” is {record.state} — the
-            screen loads, but anything it asks the plugin to do will fail until you start it.
+            <TriangleAlert size={13} /> “{record.manifest?.name ?? record.id}” is {record.state}
+            {record.reason ? ` — ${record.reason}` : ''}
+            {/* An unhealthy plugin is RUNNING and still answers commands (health
+                is a coarse signal), so telling the user to start it would be
+                wrong — and often the screen itself is where the fix lives. */}
+            {record.state === 'unhealthy'
+              ? '. The screen still works — you may be able to resolve this here.'
+              : '. Start it from Plugins before using this screen.'}
           </span>
         </div>
       )}

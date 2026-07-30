@@ -414,11 +414,18 @@ export const plugins = {
 
 /** What a plugin-contributed screen needs from the host to be useful. */
 export const bridge = {
-  /** Invoke a connector command on a plugin, exactly as a flow would. */
-  connectorRequest: (connectorId: string, command: string, payload?: unknown) =>
+  /** Invoke a connector command on a plugin, exactly as a flow would.
+   *  `idempotencyKey` is required by the gateway for the plugin's journalled
+   *  (physically side-effecting) commands, so callers should always pass one. */
+  connectorRequest: (
+    connectorId: string,
+    command: string,
+    payload?: unknown,
+    idempotencyKey?: string,
+  ) =>
     request<{ ok: boolean; result?: unknown }>(
       `/api/bridge/connectors/${encodeURIComponent(connectorId)}/request`,
-      { method: 'POST', body: JSON.stringify({ command, payload }) },
+      { method: 'POST', body: JSON.stringify({ command, payload, idempotencyKey }) },
     ),
   /** Poll plugin events after `since` (0 = from the current tail). */
   events: (since: number, limit = 100) =>
