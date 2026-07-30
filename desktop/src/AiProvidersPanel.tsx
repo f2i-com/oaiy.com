@@ -99,6 +99,10 @@ export default function AiProvidersPanel() {
   /** Set only when the LIST fetch fails, so a failed first load shows a retry
    *  instead of an eternal "Loading providers…". */
   const [loadError, setLoadError] = useState<string | null>(null);
+  /** A failed action (test / remove / save …). Persistent + dismissible like
+   *  ServicesPanel's: an upstream provider error can be long, and a toast that
+   *  vanishes after five seconds is not enough time to read or act on it. */
+  const [actionError, setActionError] = useState<string | null>(null);
   const [form, setForm] = useState<FormState>(EMPTY);
   const [showForm, setShowForm] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -227,14 +231,10 @@ export default function AiProvidersPanel() {
       const detail = err instanceof Error ? err.message : String(err);
       // Report what actually happened: if the provider saved and only the key
       // failed, saying "could not save provider" would be a lie the user acts on.
-      toast.push(
+      setActionError(
         created
-          ? {
-              kind: 'error',
-              title: `Saved “${name}”, but its API key could not be stored`,
-              body: detail,
-            }
-          : { kind: 'error', title: 'Could not save provider', body: detail },
+          ? `Saved “${name}”, but its API key could not be stored — ${detail}`
+          : `Could not save “${name}” — ${detail}`,
       );
       if (created) resetForm();
     } finally {
@@ -246,16 +246,14 @@ export default function AiProvidersPanel() {
   const runAction = useCallback(
     async (id: string, action: string, fn: () => Promise<unknown>, done?: string) => {
       setBusy((b) => ({ ...b, [id]: action }));
+      setActionError(null);
       try {
         await fn();
         if (done) toast.push({ kind: 'success', title: done });
         await refresh();
       } catch (e) {
-        toast.push({
-          kind: 'error',
-          title: `Could not ${action} “${id}”`,
-          body: e instanceof Error ? e.message : String(e),
-        });
+        const detail = e instanceof Error ? e.message : String(e);
+        setActionError(`Could not ${action} “${id}” — ${detail}`);
       } finally {
         setBusy((b) => {
           const next = { ...b };
@@ -291,6 +289,20 @@ export default function AiProvidersPanel() {
         <div className="banner banner-err banner-dismissable" role="alert">
           <span>Couldn't reach the AI gateway: {loadError}</span>
           <button className="banner-dismiss" onClick={() => setLoadError(null)} aria-label="Dismiss">
+            ×
+          </button>
+        </div>
+      )}
+
+      {actionError && (
+        <div className="banner banner-err banner-dismissable" role="alert">
+          <span>⚠ {actionError}</span>
+          <button
+            type="button"
+            className="banner-dismiss"
+            aria-label="Dismiss error"
+            onClick={() => setActionError(null)}
+          >
             ×
           </button>
         </div>
