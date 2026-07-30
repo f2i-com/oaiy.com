@@ -887,6 +887,8 @@ pub async fn serve(
     // AI gateway provider store (holds provider API keys). Built at the call site
     // where the data dir is known; the AI router pairs it with the registry below.
     ai_providers: crate::ai::providers::ProviderStoreHandle,
+    // The ChatGPT connector (a managed codex child, keyed to its own CODEX_HOME).
+    ai_codex: crate::ai::CodexHandle,
 ) -> Result<(), BoxError> {
     // CORS stays permissive so a hosted oaiy-web at any domain can READ the
     // API (the localhost bind keeps non-local processes out). State-changing
@@ -930,6 +932,7 @@ pub async fn serve(
     let ai_routes = crate::ai::ai_router(crate::ai::AiState {
         providers: ai_providers,
         registry: registry_for_ai,
+        codex: ai_codex,
     });
 
     let app = Router::new()

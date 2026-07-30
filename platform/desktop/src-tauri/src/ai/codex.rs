@@ -1,0 +1,532 @@
+//! Managed Codex app-server adapter — the ChatGPT connector.
+//!
+//! This is NOT an editable provider with an API key. It runs the official
+//! `codex` CLI as a supervised child in `app-server` mode and speaks
+//! line-delimited JSON-RPC over its stdio. **The child owns ChatGPT OAuth**: the
+//! login flow, the refresh tokens and the credential file all live inside a
+//! dedicated `CODEX_HOME`, and OAIY only ever passes login start/cancel/logout
+//! through and reads back account metadata. No token enters this process, and
+//! raw JSON-RPC never crosses the HTTP boundary.
+//!
+//! Scope note vs. the FormLogic reference this is adapted from: OAIY does not
+//! (yet) apply the Windows EFS + protected-DACL hardening to `CODEX_HOME`, so
+//! the credential file is protected by normal user-profile permissions, the same
+//! posture as OAIY's other on-device secrets. That is a real difference and is
+//! surfaced in the status payload rather than hidden.
+
+use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::io::{BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+/// The provider id this agent answers to, in the sources union and in
+/// `/api/ai/providers/<id>/v1/chat/completions`.
+pub const CODEX_PROVIDER_ID: &str = "openai-codex-agent";
+
+const RPC_TIMEOUT: Duration = Duration::from_secs(60);
+/// A turn can take a while; the caller's HTTP timeout is the real bound.
+const TURN_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// Hosts a Codex login URL is allowed to point at. A login URL is handed to the
+/// user's browser, so an unexpected host would be a redirect to somewhere we did
+/// not intend.
+const LOGIN_HOSTS: [&str; 3] = ["auth.openai.com", "chatgpt.com", "platform.openai.com"];
+
+#[derive(Debug)]
+pub enum CodexError {
+    /// The `codex` CLI is not installed / not runnable.
+    Unavailable(String),
+    /// Signed out — the caller should start a login.
+    NotAuthenticated,
+    /// The child answered with a JSON-RPC error, or misbehaved.
+    Rpc(String),
+}
+
+impl CodexError {
+    pub fn code(&self) -> &'static str {
+        match self {
+            CodexError::Unavailable(_) => "codex_unavailable",
+            CodexError::NotAuthenticated => "codex_not_authenticated",
+            CodexError::Rpc(_) => "codex_error",
+        }
+    }
+    pub fn message(&self) -> String {
+        match self {
+            CodexError::Unavailable(m) | CodexError::Rpc(m) => m.clone(),
+            CodexError::NotAuthenticated => {
+                "not signed in to ChatGPT — start a login from OAIY Desktop → Providers".into()
+            }
+        }
+    }
+}
+
+/// One live child + its RPC plumbing.
+struct Session {
+    child: Child,
+    stdin: ChildStdin,
+    next_id: AtomicI64,
+    /// id → the reply, filled by the reader thread.
+    replies: Arc<Mutex<HashMap<i64, Value>>>,
+    /// Notifications, in arrival order (turn deltas etc.).
+    notes: Arc<Mutex<Vec<Value>>>,
+    _stop: Sender<()>,
+}
+
+impl Session {
+    fn spawn(codex_home: &Path) -> Result<Self, CodexError> {
+        std::fs::create_dir_all(codex_home)
+            .map_err(|e| CodexError::Unavailable(format!("cannot create CODEX_HOME: {e}")))?;
+
+        let mut cmd = base_command();
+        cmd.arg("app-server");
+        // Nothing of this process's environment reaches the child except an
+        // explicit allow-list: no PATH games, no OPENAI_API_KEY, no proxy vars.
+        cmd.env_clear();
+        for key in env_allow_list() {
+            if let Ok(v) = std::env::var(key) {
+                cmd.env(key, v);
+            }
+        }
+        cmd.env("CODEX_HOME", codex_home);
+        cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| CodexError::Unavailable(format!("cannot run the codex CLI: {e}")))?;
+        let stdin = child.stdin.take().ok_or_else(|| CodexError::Unavailable("no stdin".into()))?;
+        let stdout = child.stdout.take().ok_or_else(|| CodexError::Unavailable("no stdout".into()))?;
+
+        let replies: Arc<Mutex<HashMap<i64, Value>>> = Arc::new(Mutex::new(HashMap::new()));
+        let notes: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let (tx, rx): (Sender<()>, Receiver<()>) = channel();
+
+        let r2 = replies.clone();
+        let n2 = notes.clone();
+        std::thread::spawn(move || {
+            let reader = BufReader::new(stdout);
+            for line in reader.lines() {
+                if rx.try_recv().is_ok() {
+                    return;
+                }
+                let Ok(line) = line else { return };
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let Ok(msg) = serde_json::from_str::<Value>(trimmed) else { continue };
+                match msg.get("id").and_then(Value::as_i64) {
+                    // A reply to something we asked.
+                    Some(id) if msg.get("method").is_none() => {
+                        if let Ok(mut map) = r2.lock() {
+                            map.insert(id, msg);
+                        }
+                    }
+                    // A server→client REQUEST. We expose no tools, so refusing is
+                    // the correct answer (and prevents the child from stalling).
+                    Some(_) => {}
+                    None => {
+                        if let Ok(mut v) = n2.lock() {
+                            v.push(msg);
+                        }
+                    }
+                }
+            }
+        });
+
+        Ok(Session { child, stdin, next_id: AtomicI64::new(0), replies, notes, _stop: tx })
+    }
+
+    fn notify(&mut self, method: &str, params: Value) -> Result<(), CodexError> {
+        let line = json!({ "jsonrpc": "2.0", "method": method, "params": params }).to_string();
+        writeln!(self.stdin, "{line}").map_err(|e| CodexError::Rpc(format!("write failed: {e}")))?;
+        self.stdin.flush().ok();
+        Ok(())
+    }
+
+    fn call(&mut self, method: &str, params: Value, timeout: Duration) -> Result<Value, CodexError> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
+        let line = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }).to_string();
+        writeln!(self.stdin, "{line}").map_err(|e| CodexError::Rpc(format!("write failed: {e}")))?;
+        self.stdin.flush().ok();
+
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if let Ok(mut map) = self.replies.lock() {
+                if let Some(msg) = map.remove(&id) {
+                    if let Some(err) = msg.get("error") {
+                        return Err(CodexError::Rpc(
+                            err.get("message").and_then(Value::as_str).unwrap_or("codex error").to_string(),
+                        ));
+                    }
+                    return Ok(msg.get("result").cloned().unwrap_or(Value::Null));
+                }
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        Err(CodexError::Rpc(format!("{method} timed out")))
+    }
+
+    /// Notifications received since `from`, leaving the buffer intact.
+    fn notes_since(&self, from: usize) -> Vec<Value> {
+        self.notes.lock().map(|v| v[from.min(v.len())..].to_vec()).unwrap_or_default()
+    }
+    fn notes_len(&self) -> usize {
+        self.notes.lock().map(|v| v.len()).unwrap_or(0)
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn base_command() -> Command {
+    // `codex` ships as a shell shim on Windows (codex.cmd), which only resolves
+    // through the command processor.
+    #[cfg(windows)]
+    {
+        let mut c = Command::new("cmd");
+        c.arg("/c").arg("codex");
+        c
+    }
+    #[cfg(not(windows))]
+    {
+        Command::new("codex")
+    }
+}
+
+fn env_allow_list() -> &'static [&'static str] {
+    #[cfg(windows)]
+    {
+        &["TEMP", "TMP", "SystemRoot", "WINDIR", "APPDATA", "LOCALAPPDATA", "USERPROFILE", "PATH"]
+    }
+    #[cfg(not(windows))]
+    {
+        &["HOME", "TMPDIR", "PATH", "LANG", "LC_ALL", "XDG_RUNTIME_DIR"]
+    }
+}
+
+/// Accept only an https login URL on a known OpenAI host.
+fn safe_login_url(raw: Option<&str>) -> Option<String> {
+    let raw = raw?;
+    if raw.len() > 4096 {
+        return None;
+    }
+    let url = reqwest::Url::parse(raw).ok()?;
+    if url.scheme() != "https" || !url.username().is_empty() || url.password().is_some() {
+        return None;
+    }
+    let host = url.host_str()?;
+    LOGIN_HOSTS.contains(&host).then(|| raw.to_string())
+}
+
+/// The managed agent. One child at a time, started lazily and reused.
+pub struct CodexAgent {
+    codex_home: PathBuf,
+    session: Mutex<Option<Session>>,
+}
+
+pub type CodexHandle = Arc<CodexAgent>;
+
+pub fn new_handle(data_dir: &Path) -> CodexHandle {
+    Arc::new(CodexAgent {
+        codex_home: data_dir.join("ai").join("codex-home"),
+        session: Mutex::new(None),
+    })
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexStatus {
+    /// The CLI is installed and the app server answered.
+    pub available: bool,
+    /// A ChatGPT account is signed in.
+    pub connected: bool,
+    pub email: Option<String>,
+    pub plan_type: Option<String>,
+    pub account_type: Option<String>,
+    /// Why it isn't available, when it isn't.
+    pub detail: Option<String>,
+}
+
+impl CodexAgent {
+    /// Run `f` against a live, initialized session, starting one if needed.
+    fn with_session<T>(
+        &self,
+        f: impl FnOnce(&mut Session) -> Result<T, CodexError>,
+    ) -> Result<T, CodexError> {
+        let mut guard = self.session.lock().map_err(|_| CodexError::Rpc("session lock poisoned".into()))?;
+        if guard.is_none() {
+            let mut s = Session::spawn(&self.codex_home)?;
+            s.call(
+                "initialize",
+                json!({ "clientInfo": { "name": "oaiy-desktop", "title": "OAIY Desktop",
+                                        "version": env!("CARGO_PKG_VERSION") } }),
+                RPC_TIMEOUT,
+            )?;
+            s.notify("initialized", json!({}))?;
+            *guard = Some(s);
+        }
+        let session = guard.as_mut().expect("just ensured");
+        let out = f(session);
+        // A dead child must not be reused: drop it so the next call respawns.
+        if let Err(CodexError::Rpc(_)) = &out {
+            if session.child.try_wait().ok().flatten().is_some() {
+                *guard = None;
+            }
+        }
+        out
+    }
+
+    /// Sign-in state + whether the CLI is usable at all. Never errors: the panel
+    /// wants to render "not installed" as a state, not a failure.
+    pub fn status(&self) -> CodexStatus {
+        match self.with_session(|s| s.call("account/read", json!({ "refreshToken": false }), RPC_TIMEOUT)) {
+            Ok(v) => {
+                // `requiresOpenaiAuth` is ALWAYS true and is not the sign-in
+                // fact — the presence of a chatgpt account object is.
+                let acct = v.get("account").filter(|a| !a.is_null());
+                let account_type = acct
+                    .and_then(|a| a.get("accountType").or_else(|| a.get("type")))
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                CodexStatus {
+                    available: true,
+                    connected: acct.is_some(),
+                    email: acct.and_then(|a| a.get("email")).and_then(Value::as_str).map(str::to_string),
+                    plan_type: acct
+                        .and_then(|a| a.get("planType").or_else(|| a.get("plan")))
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    account_type,
+                    detail: None,
+                }
+            }
+            Err(e) => CodexStatus {
+                available: !matches!(e, CodexError::Unavailable(_)),
+                connected: false,
+                email: None,
+                plan_type: None,
+                account_type: None,
+                detail: Some(e.message()),
+            },
+        }
+    }
+
+    /// Begin a ChatGPT sign-in. Returns the URL (and device code, when the CLI
+    /// chooses the device flow) for the user to complete in a browser.
+    pub fn start_login(&self, device_code: bool) -> Result<Value, CodexError> {
+        let kind = if device_code { "chatgptDeviceCode" } else { "chatgpt" };
+        let v = self.with_session(|s| {
+            s.call("account/login/start", json!({ "type": kind }), RPC_TIMEOUT)
+        })?;
+        // Only hand back fields we validated — never the raw RPC result.
+        Ok(json!({
+            "loginId": v.get("loginId").and_then(Value::as_str),
+            "authUrl": safe_login_url(v.get("authUrl").and_then(Value::as_str)),
+            "verificationUrl": safe_login_url(v.get("verificationUrl").and_then(Value::as_str)),
+            "userCode": v.get("userCode").and_then(Value::as_str),
+        }))
+    }
+
+    pub fn cancel_login(&self, login_id: Option<&str>) -> Result<(), CodexError> {
+        let params = login_id.map(|id| json!({ "loginId": id })).unwrap_or_else(|| json!({}));
+        self.with_session(|s| s.call("account/login/cancel", params, RPC_TIMEOUT)).map(|_| ())
+    }
+
+    pub fn logout(&self) -> Result<(), CodexError> {
+        self.with_session(|s| s.call("account/logout", json!({}), RPC_TIMEOUT)).map(|_| ())
+    }
+
+    /// Models this account can use, in the OpenAI `{object:"list",data:[…]}` shape.
+    pub fn models(&self) -> Result<Value, CodexError> {
+        let v = self.with_session(|s| s.call("model/list", json!({}), RPC_TIMEOUT))?;
+        let items = v
+            .get("items")
+            .or_else(|| v.get("models"))
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let data: Vec<Value> = items
+            .iter()
+            .filter_map(|m| {
+                m.get("id")
+                    .or_else(|| m.get("slug"))
+                    .and_then(Value::as_str)
+                    .map(|id| json!({ "id": id, "object": "model" }))
+            })
+            .collect();
+        Ok(json!({ "object": "list", "data": data }))
+    }
+
+    /// Run one ephemeral turn and return an OpenAI-shaped chat completion.
+    ///
+    /// The thread is started with every tool surface refused — no file, command,
+    /// browser, MCP or network access — because this is a text completion for a
+    /// flow, not an agent session with a workspace.
+    pub fn chat(&self, body: &Value) -> Result<Value, CodexError> {
+        let prompt = flatten_prompt(body);
+        if prompt.trim().is_empty() {
+            return Err(CodexError::Rpc("the request carried no message content".into()));
+        }
+        let model = body.get("model").and_then(Value::as_str).map(str::to_string);
+
+        let text = self.with_session(|s| {
+            // Refuse everything a turn could otherwise reach.
+            let mut params = json!({
+                "approvalPolicy": "never",
+                "dynamicTools": [],
+                "environments": [],
+                "runtimeWorkspaceRoots": [],
+                "allowProviderModelFallback": false,
+            });
+            if let Some(m) = &model {
+                params["model"] = Value::String(m.clone());
+            }
+            let thread = s.call("thread/start", params, RPC_TIMEOUT)?;
+            let thread_id = thread
+                .get("threadId")
+                .or_else(|| thread.get("id"))
+                .and_then(Value::as_str)
+                .ok_or_else(|| CodexError::Rpc("codex did not return a thread id".into()))?
+                .to_string();
+
+            let from = s.notes_len();
+            s.call(
+                "turn/start",
+                json!({ "threadId": thread_id, "input": { "text": prompt } }),
+                TURN_TIMEOUT,
+            )?;
+
+            // Collect the agent's message from the notification stream.
+            let deadline = Instant::now() + TURN_TIMEOUT;
+            let mut out = String::new();
+            let mut done = false;
+            while Instant::now() < deadline && !done {
+                for n in s.notes_since(from) {
+                    let method = n.get("method").and_then(Value::as_str).unwrap_or("");
+                    let p = n.get("params").unwrap_or(&Value::Null);
+                    match method {
+                        "item/agentMessage/delta" => {
+                            if let Some(d) = p.get("delta").and_then(Value::as_str) {
+                                out.push_str(d);
+                            }
+                        }
+                        "item/completed" => {
+                            if let Some(t) = p.pointer("/item/text").and_then(Value::as_str) {
+                                if out.is_empty() {
+                                    out.push_str(t);
+                                }
+                            }
+                        }
+                        "turn/completed" => done = true,
+                        _ => {}
+                    }
+                }
+                if !done {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+            if out.is_empty() {
+                return Err(CodexError::Rpc("codex returned no output for this turn".into()));
+            }
+            Ok(out)
+        })?;
+
+        let created = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        Ok(json!({
+            "object": "chat.completion",
+            "created": created,
+            "model": model.unwrap_or_else(|| CODEX_PROVIDER_ID.to_string()),
+            "choices": [{
+                "index": 0,
+                "message": { "role": "assistant", "content": text },
+                "finish_reason": "stop",
+            }],
+        }))
+    }
+}
+
+/// Collapse an OpenAI `messages` array into the single prompt a turn takes,
+/// keeping role labels so a system instruction still reads as one.
+fn flatten_prompt(body: &Value) -> String {
+    let Some(messages) = body.get("messages").and_then(Value::as_array) else {
+        return String::new();
+    };
+    let mut out = String::new();
+    for m in messages {
+        let role = m.get("role").and_then(Value::as_str).unwrap_or("user");
+        let content = match m.get("content") {
+            Some(Value::String(s)) => s.clone(),
+            // The array form SDKs emit: keep the text parts.
+            Some(Value::Array(parts)) => parts
+                .iter()
+                .filter_map(|p| p.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join(""),
+            _ => String::new(),
+        };
+        if content.trim().is_empty() {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push_str("\n\n");
+        }
+        match role {
+            "system" => out.push_str(&format!("[instructions]\n{content}")),
+            "assistant" => out.push_str(&format!("[assistant]\n{content}")),
+            _ => out.push_str(&content),
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_https_openai_login_urls_are_accepted() {
+        assert!(safe_login_url(Some("https://auth.openai.com/x?y=1")).is_some());
+        assert!(safe_login_url(Some("https://chatgpt.com/device")).is_some());
+        assert!(safe_login_url(Some("http://auth.openai.com/x")).is_none(), "http rejected");
+        assert!(safe_login_url(Some("https://evil.example/x")).is_none(), "unknown host rejected");
+        assert!(safe_login_url(Some("https://u:p@auth.openai.com/x")).is_none(), "creds rejected");
+        assert!(safe_login_url(None).is_none());
+    }
+
+    #[test]
+    fn prompt_flattening_keeps_system_and_array_content() {
+        let body = json!({ "messages": [
+            { "role": "system", "content": "be terse" },
+            { "role": "user", "content": [{ "type": "text", "text": "2+2?" }] },
+        ]});
+        let p = flatten_prompt(&body);
+        assert!(p.contains("[instructions]"), "{p}");
+        assert!(p.contains("be terse"));
+        assert!(p.contains("2+2?"), "array content must not be dropped: {p}");
+    }
+
+    #[test]
+    fn empty_or_contentless_bodies_flatten_to_nothing() {
+        assert_eq!(flatten_prompt(&json!({})), "");
+        assert_eq!(flatten_prompt(&json!({ "messages": [{ "role": "user", "content": "" }] })), "");
+    }
+
+    #[test]
+    fn the_environment_allow_list_excludes_credentials() {
+        let allow = env_allow_list();
+        assert!(!allow.contains(&"OPENAI_API_KEY"), "an API key must never reach the child");
+        assert!(!allow.iter().any(|k| k.to_ascii_lowercase().contains("proxy")));
+    }
+}

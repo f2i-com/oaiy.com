@@ -30,6 +30,9 @@ use crate::services::registry::{RegistryHandle, ServiceStatus};
 pub struct AiState {
     pub providers: ProviderStoreHandle,
     pub registry: RegistryHandle,
+    /// The ChatGPT connector: a managed `codex` CLI child that owns its own
+    /// OAuth. Not in the provider store — it has no API key to hold.
+    pub codex: super::codex::CodexHandle,
 }
 
 pub fn router(state: AiState) -> Router {
@@ -47,6 +50,11 @@ pub fn router(state: AiState) -> Router {
         // gateway — named provider (key injected server-side by id)
         .route("/api/ai/providers/:id/v1/models", get(models_for))
         .route("/api/ai/providers/:id/v1/chat/completions", post(chat_for))
+        // ChatGPT connector (the managed codex agent): sign-in lifecycle. The
+        // chat/models paths reuse the provider routes above via its provider id.
+        .route("/api/ai/codex/status", get(codex_status))
+        .route("/api/ai/codex/login", post(codex_login_start).delete(codex_login_cancel))
+        .route("/api/ai/codex/logout", post(codex_logout))
         .with_state(state)
     // OUT OF SCOPE v1 (hook here later, same shape as the reference):
     //   POST /api/ai/v1/audio/transcriptions      -> Capability::Transcription
@@ -130,6 +138,66 @@ async fn test_ai_provider(State(st): State<AiState>, Path(id): Path<String>) -> 
 }
 
 // ---------------------------------------------------------------------------
+// ChatGPT connector (managed codex agent)
+// ---------------------------------------------------------------------------
+
+fn codex_err(e: super::codex::CodexError) -> Response {
+    let status = match e {
+        // Signed out is a precondition, not an auth failure of OUR API — a 401
+        // would make a paired client drop its perfectly good pairing token.
+        super::codex::CodexError::NotAuthenticated => StatusCode::PRECONDITION_REQUIRED,
+        super::codex::CodexError::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+        super::codex::CodexError::Rpc(_) => StatusCode::BAD_GATEWAY,
+    };
+    ai_error(status, e.code(), e.message())
+}
+
+async fn codex_status(State(st): State<AiState>) -> Response {
+    let codex = st.codex.clone();
+    // Spawning and talking to the child blocks; keep it off the async worker.
+    match tokio::task::spawn_blocking(move || codex.status()).await {
+        Ok(s) => (StatusCode::OK, Json(s)).into_response(),
+        Err(e) => ai_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexLoginBody {
+    /// Device-code flow (show a code to type) vs. a browser redirect.
+    #[serde(default)]
+    device_code: bool,
+}
+
+async fn codex_login_start(State(st): State<AiState>, body: Option<Json<CodexLoginBody>>) -> Response {
+    let device = body.map(|b| b.device_code).unwrap_or(false);
+    let codex = st.codex.clone();
+    match tokio::task::spawn_blocking(move || codex.start_login(device)).await {
+        Ok(Ok(v)) => (StatusCode::OK, Json(v)).into_response(),
+        Ok(Err(e)) => codex_err(e),
+        Err(e) => ai_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()),
+    }
+}
+
+async fn codex_login_cancel(State(st): State<AiState>) -> Response {
+    let codex = st.codex.clone();
+    match tokio::task::spawn_blocking(move || codex.cancel_login(None)).await {
+        Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Err(e)) => codex_err(e),
+        Err(e) => ai_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()),
+    }
+}
+
+async fn codex_logout(State(st): State<AiState>) -> Response {
+    let codex = st.codex.clone();
+    match tokio::task::spawn_blocking(move || codex.logout()).await {
+        Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Err(e)) => codex_err(e),
+        Err(e) => ai_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Gateway — chat + models
 // ---------------------------------------------------------------------------
 
@@ -141,6 +209,19 @@ async fn chat_for(State(st): State<AiState>, Path(id): Path<String>, Json(body):
 }
 
 async fn chat_impl(st: &AiState, provider_id: Option<&str>, mut body: Value) -> Response {
+    // The ChatGPT connector is a managed agent, not a stored provider: it has no
+    // key to inject, so it never goes through the egress/key path below.
+    if provider_id == Some(super::codex::CODEX_PROVIDER_ID) {
+        if let Some(o) = body.as_object_mut() {
+            o.remove("provider");
+        }
+        let codex = st.codex.clone();
+        return match tokio::task::spawn_blocking(move || codex.chat(&body)).await {
+            Ok(Ok(v)) => (StatusCode::OK, Json(v)).into_response(),
+            Ok(Err(e)) => codex_err(e),
+            Err(e) => ai_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()),
+        };
+    }
     // Resolve the FULL provider under the lock, drop the guard before await.
     let provider = {
         let store = st.providers.lock().unwrap_or_else(|e| e.into_inner());
@@ -203,6 +284,14 @@ async fn models_default(State(st): State<AiState>) -> Response {
 }
 
 async fn models_for(State(st): State<AiState>, Path(id): Path<String>) -> Response {
+    if id == super::codex::CODEX_PROVIDER_ID {
+        let codex = st.codex.clone();
+        return match tokio::task::spawn_blocking(move || codex.models()).await {
+            Ok(Ok(v)) => (StatusCode::OK, Json(v)).into_response(),
+            Ok(Err(e)) => codex_err(e),
+            Err(e) => ai_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()),
+        };
+    }
     let provider = { st.providers.lock().unwrap_or_else(|e| e.into_inner()).get_full(&id) };
     let Some(p) = provider else {
         return ai_error(StatusCode::NOT_FOUND, "no_provider", format!("unknown provider {id:?}"));
@@ -323,6 +412,34 @@ async fn list_ai_sources(State(st): State<AiState>) -> Response {
                 "model": p.model,
                 "useCases": ["flows"],              // MUST include 'flows'
             }));
+        }
+    }
+
+    // ---- the ChatGPT connector, as a virtual provider ----
+    // Advertised only when it's actually signed in: a source a flow cannot use
+    // is worse than one that isn't offered.
+    {
+        let codex = st.codex.clone();
+        if let Ok(status) = tokio::task::spawn_blocking(move || codex.status()).await {
+            if status.available && status.connected {
+                sources.push(json!({
+                    "id": format!("provider:{}", super::codex::CODEX_PROVIDER_ID),
+                    "kind": "provider",
+                    "providerId": super::codex::CODEX_PROVIDER_ID,
+                    "name": "ChatGPT (Codex)",
+                    "category": "chatgpt",
+                    "status": "provider",
+                    "protocol": "codex",
+                    "capabilities": ["chat"],
+                    // No key to hold — the agent owns its own OAuth.
+                    "hasKey": true,
+                    "enabled": true,
+                    "model": Value::Null,
+                    "useCases": ["flows"],
+                    "account": status.email,
+                    "planType": status.plan_type,
+                }));
+            }
         }
     }
 

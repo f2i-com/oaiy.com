@@ -6,10 +6,12 @@
 //! - `gateway`   — the chat/models proxy + OpenAI↔Anthropic normalization.
 //! - `routes`    — the `/api/ai/*` axum sub-router (merged in `http::serve`).
 
+pub mod codex;
 pub mod egress;
 pub mod gateway;
 pub mod providers;
 pub mod routes;
 
+pub use codex::{CodexHandle, CODEX_PROVIDER_ID};
 pub use providers::{open_handle, ProviderStoreHandle};
 pub use routes::{router as ai_router, AiState};

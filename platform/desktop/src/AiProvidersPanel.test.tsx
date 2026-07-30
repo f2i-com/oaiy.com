@@ -28,6 +28,17 @@ vi.mock('./api', () => ({
     delete: deleteMock,
     test: testMock,
   },
+  // The panel embeds the ChatGPT connector, which reads this on mount. Stubbed
+  // as "CLI not installed" so these tests exercise the provider list only —
+  // without it the connector's status() would throw into a catch and the tests
+  // would pass for the wrong reason.
+  codex: {
+    status: vi.fn().mockResolvedValue({ available: false, connected: false, detail: 'not installed' }),
+    startLogin: vi.fn(),
+    cancelLogin: vi.fn(),
+    logout: vi.fn(),
+  },
+  openExternal: vi.fn(),
 }));
 // Toasts pulls in @tauri-apps/plugin-notification at module scope; mocking it
 // keeps that out of the test module graph AND gives us the push spy.
