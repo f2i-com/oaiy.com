@@ -1,6 +1,6 @@
 //! Tray icon + context menu setup.
 //!
-//! The companion is designed to live in the system tray. The main window
+//! OAIY Desktop is designed to live in the system tray. The main window
 //! is hidden by default (see tauri.conf.json `visible: false`); the user
 //! opens it from the tray menu when they want to see service status.
 
@@ -17,10 +17,10 @@ pub fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
     let quit_item = MenuItem::with_id(handle, "quit", "Quit", true, None::<&str>)?;
     let menu = Menu::with_items(handle, &[&open_item, &quit_item])?;
 
-    let mut builder = TrayIconBuilder::with_id("oaiy-companion")
+    let mut builder = TrayIconBuilder::with_id("oaiy-desktop")
         .menu(&menu)
         .show_menu_on_left_click(false)
-        .tooltip("OAIY");
+        .tooltip("OAIY Desktop");
     // Tauri 2 does NOT auto-assign a tray icon — without this the tray
     // entry shows blank. Reuse the app's bundled window icon.
     if let Some(icon) = handle.default_window_icon().cloned() {

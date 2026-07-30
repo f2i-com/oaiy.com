@@ -19,5 +19,5 @@ files sit in `public/` and are copied verbatim into `dist/` alongside them.
 Both are **variable** weight, which the design system depends on — it asks for
 580/620/650/720 and a static cut would snap those to the nearest available.
 
-The desktop companion self-hosts its own pair separately; see
+The OAIY Desktop self-hosts its own pair separately; see
 `desktop/public/fonts/README.md`.

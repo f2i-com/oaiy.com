@@ -24,7 +24,7 @@ import PythonPanel from './PythonPanel';
 import SettingsPanel from './SettingsPanel';
 
 /**
- * OAIY companion — the OAIY design-system shell (222px sidebar + a workspace of
+ * OAIY Desktop — the OAIY design-system shell (222px sidebar + a workspace of
  * topbar / content page / endpoint dock), carrying the same four views it always
  * had: Services · Models · Python · Settings.
  *
@@ -36,7 +36,10 @@ import SettingsPanel from './SettingsPanel';
 
 interface HealthResponse {
   status: string;
-  companion: string;
+  /** Stable machine identity (`oaiy-desktop`). */
+  product?: string;
+  /** Bridge Protocol the sidecar speaks, e.g. `oaiy-bridge/1`. */
+  protocol?: string;
   version: string;
 }
 
@@ -115,9 +118,9 @@ export default function App() {
         // one of them owns the port first our bind fails and every *other* call
         // 401s against a stranger — while a version-only check reads as healthy.
         // Verify the identity, and name the squatter so the cause is obvious.
-        if (body?.companion !== 'oaiy-companion') {
+        if (body?.product !== 'oaiy-desktop') {
           throw new Error(
-            `port ${new URL(API_BASE).port} is owned by "${body?.companion ?? 'an unknown app'}", not OAIY`,
+            `port ${new URL(API_BASE).port} is owned by "${body?.product ?? 'an unknown app'}", not OAIY`,
           );
         }
         setHealth(body);
@@ -248,7 +251,7 @@ export default function App() {
         <header className="topbar">
           <div className="top-title">
             <span>
-              OAIY <ChevronRight size={12} /> Companion
+              OAIY <ChevronRight size={12} /> Desktop
             </span>
             <div>
               <h1>{page.crumb}</h1>

@@ -5,7 +5,7 @@ import type { NodeDefinition } from 'oaiy-core';
 import { BUNDLED_MODULES, getModuleLoader } from 'oaiy-core';
 import { getCustomNodeDefinition } from '../../services/customNodeRegistry';
 import { getService, listAllServices } from '../../utils/serviceRegistry';
-import { listCompanionServices } from '../../lib/companionServices';
+import { listDesktopServices } from '../../lib/desktopServices';
 
 // Static Tailwind literals for the node accent swatch, keyed by the node
 // definition's `color`. Tailwind only emits classes it sees as whole literal
@@ -242,12 +242,12 @@ const PropertiesPanel = memo(({ selectedNode, updateNodeData, className = '' }: 
                     // Hide the Service Preset dropdown when there are no
                     // services to pick at all — an empty picker is just noise.
                     // Count BOTH the user's saved services AND any the OAIY
-                    // Companion is currently exposing; otherwise a running
+                    // OAIY Desktop is currently exposing; otherwise a running
                     // companion service is unpickable for a user who hasn't
                     // saved one of their own.
                     .filter((prop) => {
                         if (prop.id !== 'service') return true;
-                        return listAllServices().length > 0 || listCompanionServices().length > 0;
+                        return listAllServices().length > 0 || listDesktopServices().length > 0;
                     })
                     .map((prop) => {
                         // Same resolution order as `allValues` above: node

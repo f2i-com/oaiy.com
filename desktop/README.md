@@ -1,6 +1,6 @@
 # OAIY (desktop)
 
-Tray-resident desktop companion for **oaiy-web**. Manages local AI services
+Tray-resident OAIY Desktop for **oaiy-web**. Manages local AI services
 (Ollama, llama.cpp, custom Python rigs), model downloads from HuggingFace,
 and a bundled portable Python runtime with reusable venvs — exposing
 everything to the oaiy-web flow editor over a localhost HTTP API.
@@ -16,8 +16,8 @@ Two-process architecture by design:
   running Playwright for browser automation (Phase 4).
 
 The web app polls `http://127.0.0.1:17972/api/health` on load to detect
-the companion. When found, the palette lights up extra capabilities —
-companion-managed services appear, browser nodes become usable.
+OAIY Desktop. When found, the palette lights up extra capabilities —
+OAIY-Desktop-managed services appear, browser nodes become usable.
 
 ## Roadmap
 
@@ -25,7 +25,7 @@ companion-managed services appear, browser nodes become usable.
 |---|---|---|
 | **1** | Scaffold, tray icon, localhost API `/api/health`, web-side detection probe | ✅ |
 | **2** | Service registry (start/stop/install/logs) · bundled install scripts (llama.cpp, Ollama, Python) · HF model downloads with pause/resume · embedded Python + reusable venvs · React dashboard with Services / Models / Python tabs | ✅ |
-| **3** | oaiy-web fetches companion services into the palette automatically | ✅ |
+| **3** | oaiy-web fetches OAIY Desktop services into the palette automatically | ✅ |
 | **4** | Playwright sidecar (managed "Playwright Browser" service) + `browser_*` nodes in oaiy-web | ✅ |
 | **5** | Single-exe productisation, auto-update, settings persistence | next |
 
@@ -38,7 +38,7 @@ config dir on first run; edit there to customise without rebuilding):
 |---|---|
 | **llama.cpp** | Pinned llama-server release; CUDA build when an NVIDIA GPU is detected, AVX2 CPU otherwise. Serves OpenAI-compatible API on `:8080`. |
 | **Ollama** | Official Windows installer (system-wide). Serves on `:11434`. |
-| **Playwright Browser** | Headless Chromium backend for the `browser_*` nodes (goto/extract/click/screenshot). Installs Playwright into a venv reusing the companion's Python. Serves on `:17880`. |
+| **Playwright Browser** | Headless Chromium backend for the `browser_*` nodes (goto/extract/click/screenshot). Installs Playwright into a venv reusing OAIY Desktop's Python. Serves on `:17880`. |
 | **LTX-2.3 Video** | Lightricks LTX-2.3 distilled text-to-video (with audio); CUDA venv via uv. Weights are user-supplied (point it at a model folder). Serves on `:17890`. |
 | **Lance (Image+Video)** | ByteDance **Lance** 3B unified image+video model; Python 3.11 CUDA venv, downloads weights, exposes a JSON API plus Lance's Gradio UI at `/ui`. Serves on `:17900`. |
 | **Krea-2 Turbo** | Official `krea-ai/krea-2` text-to-image inference (no ComfyUI); CUDA venv, pinned commit, GGUF checkpoint (Q4_K_M by default, `OAIY_KREA2_QUANT=bf16` for the full 24 GB). Serves on `:17910`. |
@@ -52,7 +52,7 @@ All routes are bound to `127.0.0.1:17972`. CORS is `*` since the bind
 is loopback-only.
 
 ### General
-- `GET    /api/health` — `{ status, companion, version }`
+- `GET    /api/health` — `{ status, product, protocol, version }`
 - `GET    /api/config` — `{ activeDir, defaultDir, configuredDir, isCustom, restartRequired }` (read-only; changing the data dir is a desktop-only action — native picker + restart)
 
 ### Services
@@ -105,7 +105,7 @@ curl http://127.0.0.1:17972/api/health
 ```
 Expected response:
 ```json
-{ "status": "ok", "companion": "oaiy-companion", "version": "0.1.0" }
+{ "status": "ok", "product": "oaiy-desktop", "protocol": "oaiy-bridge/1", "version": "0.1.0" }
 ```
 
 ## Production build
@@ -131,7 +131,7 @@ cargo build --release --no-default-features --bin oaiy-server  # tauri-free, for
 ```
 
 The GUI and the server share one crate but split on a default **`gui`** Cargo
-feature: `oaiy-companion` (the tray app) requires it; `oaiy-server` built with
+feature: `oaiy-desktop` (the tray app) requires it; `oaiy-server` built with
 `--no-default-features` drops tauri entirely — **no `webkit2gtk`/GTK on the
 box** (`cargo tree -i tauri` is empty). `npm run tauri:dev` / `tauri:build`
 pass `--features gui` for the GUI.
@@ -180,7 +180,7 @@ By default everything lives under the OS app-data dir
 (`%APPDATA%/com.oaiy/` on Windows). The **Settings** tab lets
 you point it anywhere — a roomy drive, a folder you can browse easily —
 via a native picker. The choice persists in a tiny pointer file
-(`companion-config.json` in the OS config dir, which never moves) and
+(`desktop-config.json` in the OS config dir, which never moves) and
 applies on the next launch. Existing downloads aren't auto-moved; copy
 them across if you relocate.
 
@@ -198,14 +198,14 @@ them across if you relocate.
 
 Everything is under one folder so users know exactly what disk a clean
 uninstall takes — delete that directory (plus the tiny
-`companion-config.json` pointer in `%APPDATA%/com.oaiy/`).
+`desktop-config.json` pointer in `%APPDATA%/com.oaiy/`).
 
 ## Port choice
 
 `17972` is fixed for now. It's high enough to avoid permission issues
 and low-collision; if a real conflict ever arises we can fall back to a
 range probe + a discovery file under the user's config dir. The web
-side reads the port from a single constant (`ui/src/lib/companionDetection.ts`).
+side reads the port from a single constant (`ui/src/lib/desktopDetection.ts`).
 
 ## File layout
 
@@ -262,6 +262,6 @@ desktop/
 
 ## Why a separate folder, not a separate repo
 
-Keeps phasing tight — every change to the companion ships alongside the
-matching oaiy-web wire-up. When the companion stabilises and gets
+Keeps phasing tight — every change to OAIY Desktop ships alongside the
+matching oaiy-web wire-up. When OAIY Desktop stabilises and gets
 released independently, it's a clean lift.

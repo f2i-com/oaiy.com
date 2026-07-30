@@ -98,9 +98,9 @@ Drive the same service/model/Python management the desktop dashboard does, from
 the CLI — install AI services, create Python venvs, download models, all against
 a running `oaiy-server` (`OAIY_SERVER_URL`, default `http://127.0.0.1:17972`).
 Privileged ops (install / define / delete) need the server's bearer token in
-`OAIY_SERVER_TOKEN`. To drive the **desktop companion** (not just a headless
-`oaiy-server`) this way, launch the companion with `OAIY_SERVER_TOKEN` set and use
-the same value here — the companion accepts the token *and* still serves its own
+`OAIY_SERVER_TOKEN`. To drive the **OAIY Desktop** (not just a headless
+`oaiy-server`) this way, launch OAIY Desktop with `OAIY_SERVER_TOKEN` set and use
+the same value here — OAIY Desktop accepts the token *and* still serves its own
 webview, so the GUI keeps working.
 
 ```bash

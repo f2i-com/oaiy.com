@@ -1,7 +1,7 @@
 //! Localhost HTTP API the oaiy-web flow editor talks to.
 //!
 //! Phase 1 surface:
-//!   GET /api/health    → { status, companion, version }
+//!   GET /api/health    → { status, product, protocol, version }
 //!
 //! Phase 2 surface (this file):
 //!   GET    /api/services                  → list registered + running services
@@ -58,7 +58,7 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 /// env vars. This is the `GET /api/config` response shape.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct CompanionConfig {
+pub struct DesktopConfig {
     /// The dir this running process is actually using right now.
     pub active_dir: String,
     /// The OS default (what "Reset" goes back to).
@@ -88,10 +88,10 @@ pub struct CompanionConfig {
     pub ollama_model: Option<String>,
 }
 
-/// Supplies the [`CompanionConfig`] snapshot for `GET /api/config` without
+/// Supplies the [`DesktopConfig`] snapshot for `GET /api/config` without
 /// binding the HTTP layer to any particular host (Tauri AppHandle vs env vars).
 pub trait ConfigProvider: Send + Sync + 'static {
-    fn snapshot(&self, registry: &RegistryHandle) -> CompanionConfig;
+    fn snapshot(&self, registry: &RegistryHandle) -> DesktopConfig;
 }
 
 #[derive(Clone)]
@@ -103,17 +103,37 @@ struct AppState {
     catalog: CatalogHandle,
 }
 
+/// The handshake every client uses to decide "is this actually us?".
+///
+/// A fixed loopback port is trivially squatted — this check has already caught a
+/// different vendor's app answering `/api/health` with a compatible shape, which
+/// turned the UI's status badge green while every authenticated call 401'd. So
+/// the identity is asserted, not assumed.
+///
+/// `protocol` is the negotiable part: clients must branch on it rather than on
+/// `version`, which moves for reasons that have nothing to do with the wire
+/// format. See `protocol/README.md`.
 #[derive(Serialize)]
 struct HealthResponse {
     status: &'static str,
-    companion: &'static str,
+    /// Stable machine identity. Never localise or re-word this.
+    product: &'static str,
+    /// Bridge Protocol the rest of this API speaks.
+    protocol: &'static str,
     version: &'static str,
 }
+
+/// Wire identity. Deliberately NOT derived from the crate name — renaming the
+/// binary must not silently change what clients match on.
+pub const PRODUCT_ID: &str = "oaiy-desktop";
+/// Bump only on a breaking wire change; add fields freely without touching it.
+pub const BRIDGE_PROTOCOL: &str = "oaiy-bridge/1";
 
 async fn health() -> Json<HealthResponse> {
     Json(HealthResponse {
         status: "ok",
-        companion: "oaiy-companion",
+        product: PRODUCT_ID,
+        protocol: BRIDGE_PROTOCOL,
         version: env!("CARGO_PKG_VERSION"),
     })
 }
@@ -289,9 +309,9 @@ struct EnsureByPortRequest {
     port: u16,
 }
 
-/// Start the companion service that owns `port` if it isn't already
+/// Start OAIY Desktop service that owns `port` if it isn't already
 /// running. Called by oaiy-web before it hits a `127.0.0.1:<port>`
-/// endpoint a companion service owns, so picking a stopped service in a
+/// endpoint an OAIY Desktop service owns, so picking a stopped service in a
 /// flow and running it "just works". Returns immediately after the
 /// spawn — the flow's HTTP/LLM node retries while the server warms up.
 async fn ensure_service_by_port(
@@ -515,7 +535,7 @@ fn is_allowed_origin(origin: &str) -> bool {
     if is_loopback_origin(origin) {
         return true;
     }
-    // Tauri webview origins (in case the companion's own UI ever calls over HTTP).
+    // Tauri webview origins (in case OAIY Desktop's own UI ever calls over HTTP).
     if origin == "tauri://localhost"
         || origin == "http://tauri.localhost"
         || origin == "https://tauri.localhost"
@@ -579,7 +599,7 @@ fn is_restricted_read_path(path: &str) -> bool {
         || (path.starts_with("/api/services/") && path.ends_with("/logs"))
 }
 
-/// Stricter allow-list for privileged endpoints: the companion's OWN webview and
+/// Stricter allow-list for privileged endpoints: OAIY Desktop's OWN webview and
 /// oaiy.com only — never an arbitrary localhost page. Loopback origins are
 /// allowed in debug builds (the dev UI is served from a localhost port) but NOT
 /// in a release build, which is what ships.
@@ -632,7 +652,7 @@ fn token_eq(want: &str, got: &str) -> bool {
 /// for privileged routes on a headless server that has one set) plus `gui_mode`,
 /// which the GUI companion sets so its trusted webview still reaches privileged
 /// routes via the origin allow-list even when a token is ALSO configured -- so
-/// the CLI can drive the companion without locking out its own UI.
+/// the CLI can drive OAIY Desktop without locking out its own UI.
 #[derive(Clone)]
 struct AuthConfig {
     token: Option<String>,
@@ -651,7 +671,7 @@ fn privileged_allowed(token_ok: bool, gui_mode: bool, _has_token: bool, origin_p
 }
 
 /// Gate mutating/exec requests (POST/PUT/DELETE/PATCH) on the `Origin` header.
-/// Privileged (command-defining / destructive) paths require the companion's own
+/// Privileged (command-defining / destructive) paths require OAIY Desktop's own
 /// origin and fail CLOSED on a missing Origin; other mutations keep the broad
 /// loopback allow-list. GET reads and CORS preflight (OPTIONS) pass through.
 async fn origin_guard(

@@ -1,4 +1,4 @@
-//! `oaiy-server` — the companion's HTTP API + service supervisor, headless.
+//! `oaiy-server` — OAIY Desktop's HTTP API + service supervisor, headless.
 //!
 //! Same axum API as the tray app (services / models / python on
 //! `127.0.0.1:17972`), but with no window, tray, or webview — for running on a
@@ -28,12 +28,12 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use oaiy_companion_lib::http::{self, CompanionConfig, ConfigProvider};
-use oaiy_companion_lib::services::catalog::CatalogHandle;
-use oaiy_companion_lib::services::downloads::{Downloads, DownloadsHandle};
-use oaiy_companion_lib::services::python::{Python, PythonHandle};
-use oaiy_companion_lib::services::registry::{Registry, RegistryHandle};
-use oaiy_companion_lib::COMPANION_PORT;
+use oaiy_desktop_lib::http::{self, DesktopConfig, ConfigProvider};
+use oaiy_desktop_lib::services::catalog::CatalogHandle;
+use oaiy_desktop_lib::services::downloads::{Downloads, DownloadsHandle};
+use oaiy_desktop_lib::services::python::{Python, PythonHandle};
+use oaiy_desktop_lib::services::registry::{Registry, RegistryHandle};
+use oaiy_desktop_lib::DESKTOP_PORT;
 
 /// Env-var-backed config provider (the headless analogue of the GUI's
 /// AppHandle-backed one). No pointer file, no restart-required concept.
@@ -43,10 +43,10 @@ struct EnvConfig {
 }
 
 impl ConfigProvider for EnvConfig {
-    fn snapshot(&self, _registry: &RegistryHandle) -> CompanionConfig {
+    fn snapshot(&self, _registry: &RegistryHandle) -> DesktopConfig {
         let d = self.data_dir.display().to_string();
         let m = self.models_dir.display().to_string();
-        CompanionConfig {
+        DesktopConfig {
             active_dir: d.clone(),
             default_dir: d,
             configured_dir: None,
@@ -147,8 +147,8 @@ async fn main() {
     // than silently binding the default (which leaves the server reachable on a
     // port the operator didn't choose, with no error).
     let port: u16 = match std::env::var("OAIY_SERVER_PORT") {
-        Err(_) => COMPANION_PORT,
-        Ok(s) if s.trim().is_empty() => COMPANION_PORT,
+        Err(_) => DESKTOP_PORT,
+        Ok(s) if s.trim().is_empty() => DESKTOP_PORT,
         Ok(s) => s.trim().parse::<u16>().ok().filter(|p| *p != 0).unwrap_or_else(|| {
             eprintln!("oaiy-server: invalid OAIY_SERVER_PORT {s:?} (want 1-65535)");
             std::process::exit(1);

@@ -598,7 +598,7 @@ function GpuSelector({ serviceId, currentGpu }: { serviceId: string; currentGpu:
 /**
  * Model selector for single-model servers (llama.cpp). Lists the GGUFs found
  * across the model folders and lets the user pick one — or type a custom path.
- * The choice persists (companion-config `llamaModel`) and applies the next time
+ * The choice persists (desktop-config `llamaModel`) and applies the next time
  * the service starts, so it's safe to change while stopped (the normal
  * "load on flow demand" case). A running service needs a restart to swap models.
  */
@@ -723,7 +723,7 @@ function LlamaModelSelector({ running }: { running: boolean }) {
  * Model selector for multi-model servers (Ollama). Lists the models PULLED into
  * the running Ollama server (its /api/tags) and lets the user pick one — or type
  * a name they've pulled. The choice is the model NAME sent in each request,
- * persisted to companion-config `ollamaModel` and applied on the next flow run
+ * persisted to desktop-config `ollamaModel` and applied on the next flow run
  * (no restart). Empty = the pre-pulled default (qwen2.5:0.5b).
  */
 function OllamaModelSelector() {

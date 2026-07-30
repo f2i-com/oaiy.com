@@ -141,7 +141,7 @@ export default function PythonPanel() {
     <div className="panel">
       {error && (
         <div className="banner banner-err">
-          <span>⚠ Couldn't reach the OAIY companion: {error}</span>
+          <span>⚠ Couldn't reach the OAIY Desktop: {error}</span>
         </div>
       )}
       {actionError && (

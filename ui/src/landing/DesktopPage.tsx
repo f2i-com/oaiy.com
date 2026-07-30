@@ -2,7 +2,7 @@
  * DesktopPage — the dedicated page at `/desktop.html`.
  *
  * Expands the landing page's "Desktop" section into a full page: how the OAIY
- * Companion works, how to run it, the CustomService JSON format, and a live
+ * OAIY Desktop works, how to run it, the CustomService JSON format, and a live
  * "service library" of example JSON files you can download (served by the PHP
  * API from a folder — drop a file in and it shows up here).
  *
@@ -85,7 +85,7 @@ function Hero() {
     <section className="mx-auto max-w-6xl px-5 pt-16 pb-4 sm:px-8 sm:pt-24">
       <div className="mx-auto max-w-3xl text-center">
         <h1 className="lp-h1" style={{ fontSize: 'clamp(2.2rem, 4.6vw, 3.4rem)' }}>
-          The OAIY Companion
+          The OAIY Desktop
         </h1>
         <p className="mx-auto mt-5 max-w-xl text-base sm:text-lg" style={{ color: 'rgb(var(--color-text-secondary))', lineHeight: 1.6 }}>
           A small system-tray app that does the heavy local work the browser can't —
@@ -116,7 +116,7 @@ function HowItWorks() {
       <SectionHeading
         eyebrow="How it works"
         title="Two processes, one localhost handshake"
-        sub="The web app runs in your browser. The companion runs in your tray. When the app loads it probes the companion on localhost — find it, and companion-managed services light up the palette automatically."
+        sub="The web app runs in your browser. OAIY Desktop runs in your tray. When the app loads it probes OAIY Desktop on localhost — find it, and OAIY-Desktop-managed services light up the palette automatically."
       />
       <div className="grid gap-6 lg:grid-cols-[1fr_0.85fr] lg:items-center">
         <Reveal>
@@ -127,7 +127,7 @@ function HowItWorks() {
                 <span className="font-mono text-[10px] uppercase tracking-[0.18em]">localhost · 127.0.0.1:17972</span>
               </div>
               <div className="flex justify-center" aria-hidden="true"><LinkVertical /></div>
-              <ProcessCard tone="124 58 237" badge="In your system tray" title="OAIY desktop companion" body="Model servers, Hugging Face downloads, portable Python venvs, browser sidecar." />
+              <ProcessCard tone="124 58 237" badge="In your system tray" title="OAIY OAIY Desktop" body="Model servers, Hugging Face downloads, portable Python venvs, browser sidecar." />
             </div>
             <p className="mt-5 text-center text-xs" style={{ color: 'rgb(var(--color-text-muted))' }}>
               The web app probes <code className="font-mono">/api/health</code> on load. No companion? Everything a browser can do still works.
@@ -155,7 +155,7 @@ function HowItWorks() {
 function Capabilities() {
   const caps = [
     { icon: <PythonIcon />, title: 'Bundled Python + venvs', body: 'Ships a portable Python runtime with reusable virtual environments. Run Python services without touching your system Python — and two services can share one heavy install.' },
-    { icon: <CodeIcon />, title: 'Runs custom code', body: 'A service is just an install script + a run command, so the companion can launch any local process — a model server, your own script, a whole cloned repo — and own its start / stop / restart.' },
+    { icon: <CodeIcon />, title: 'Runs custom code', body: 'A service is just an install script + a run command, so OAIY Desktop can launch any local process — a model server, your own script, a whole cloned repo — and own its start / stop / restart.' },
     { icon: <ChipIcon />, title: 'Uses your local GPU', body: 'Inference runs on your own hardware. Whatever you install — CUDA, Metal, ROCm, llama.cpp, ComfyUI — uses the GPU directly; nothing round-trips to a cloud.' },
     { icon: <DownloadIcon />, title: 'Hugging Face downloads', body: 'Pull GGUFs and safetensors with pause / resume into a shared models dir that every service can read via ${modelsDir}.' },
     { icon: <TerminalIcon />, title: 'Logs, health & lifecycle', body: 'Tail each service’s stdout/stderr live, watch status, and a health probe confirms it’s actually up before the web app starts using it.' },
@@ -166,7 +166,7 @@ function Capabilities() {
       <SectionHeading
         eyebrow="What it can do"
         title="Local compute, on tap"
-        sub="The companion is the bridge between the browser sandbox and your machine's real muscle — Python, arbitrary processes, and the GPU."
+        sub="OAIY Desktop is the bridge between the browser sandbox and your machine's real muscle — Python, arbitrary processes, and the GPU."
       />
       <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
         {caps.map((c, i) => (
@@ -185,13 +185,13 @@ function Capabilities() {
 
 function Install() {
   const steps = [
-    { n: 1, title: 'Download & launch', body: 'Grab the companion for Windows and run it. It lives in the system tray — no window to babysit.' },
-    { n: 2, title: 'It binds localhost', body: 'The companion serves a small HTTP API on 127.0.0.1:17972 and exposes its services there.' },
-    { n: 3, title: 'Open the web app', body: 'On load the app probes /api/health. Found it? Companion services appear in the palette automatically.' },
+    { n: 1, title: 'Download & launch', body: 'Grab OAIY Desktop for Windows and run it. It lives in the system tray — no window to babysit.' },
+    { n: 2, title: 'It binds localhost', body: 'OAIY Desktop serves a small HTTP API on 127.0.0.1:17972 and exposes its services there.' },
+    { n: 3, title: 'Open the web app', body: 'On load the app probes /api/health. Found it? OAIY Desktop services appear in the palette automatically.' },
   ];
   return (
     <Section id="install">
-      <SectionHeading eyebrow="Getting set up" title="Running the companion" sub="It's optional and local-only. The app degrades gracefully without it — nodes that need a companion service show an actionable hint instead of silently failing." />
+      <SectionHeading eyebrow="Getting set up" title="Running OAIY Desktop" sub="It's optional and local-only. The app degrades gracefully without it — nodes that need an OAIY Desktop service show an actionable hint instead of silently failing." />
       <div className="grid gap-4 sm:grid-cols-3">
         {steps.map((s, i) => (
           <Reveal key={s.n} delay={i * 70}>
@@ -218,7 +218,7 @@ const FORMAT_FIELDS: { field: string; req?: boolean; desc: string }[] = [
   { field: 'category', desc: 'Groups it in the library, e.g. "LLM" / "Image".' },
   { field: 'defaultPort', desc: 'Port the service listens on. Available everywhere as ${port}.' },
   { field: 'install', desc: '{ "kind": "none" } or { "kind": "script", "windows", "unix" } — a per-OS install script run once.' },
-  { field: 'run', desc: '{ command, args[], env, cwd } — how to launch it. A bare command resolves against the companion bin dir, then PATH.' },
+  { field: 'run', desc: '{ command, args[], env, cwd } — how to launch it. A bare command resolves against OAIY Desktop bin dir, then PATH.' },
   { field: 'health', desc: '{ url, timeoutSecs } — readiness probe; url supports ${port}.' },
   { field: 'docsUrl', desc: 'Optional link shown on the service card.' },
   { field: 'files', desc: '{ filename: contents } — bundled scripts written to the scripts dir, so a template is fully self-contained.' },
@@ -251,9 +251,9 @@ function ServiceFormat() {
   return (
     <Section id="format">
       <SectionHeading
-        eyebrow="The companion service format"
+        eyebrow="OAIY Desktop service format"
         title="A service = an install step + a run command"
-        sub="Each local service you add to the companion is one JSON template: how to install it, how to launch it, and how to know it's healthy. Put a binary, a Python venv, or a whole repo behind it — the companion handles the lifecycle."
+        sub="Each local service you add to OAIY Desktop is one JSON template: how to install it, how to launch it, and how to know it's healthy. Put a binary, a Python venv, or a whole repo behind it — OAIY Desktop handles the lifecycle."
       />
       {/* Example + substitution reference, side by side */}
       <div className="grid gap-6 lg:grid-cols-2 lg:items-start">
@@ -275,11 +275,11 @@ function ServiceFormat() {
             <CalloutBox label="Placeholders" hint="in run + health">
               {['${port}', '${dataDir}', '${binDir}', '${modelsDir}', '${modelDirs}'].map((p) => <Chip key={p}>{p}</Chip>)}
             </CalloutBox>
-            <CalloutBox label="Install-script env vars" hint="point at the companion's dirs">
+            <CalloutBox label="Install-script env vars" hint="point at OAIY Desktop's dirs">
               {['OAIY_DATA_DIR', 'OAIY_VENVS_DIR', 'OAIY_BIN_DIR', 'OAIY_MODELS_DIR', 'OAIY_SCRIPTS_DIR'].map((v) => <Chip key={v}>{v}</Chip>)}
             </CalloutBox>
             <p className="text-xs" style={{ color: 'rgb(var(--color-text-muted))', lineHeight: 1.6 }}>
-              Import a downloaded template via the companion's <strong style={{ color: 'rgb(var(--color-text-tertiary))' }}>Services → Add / Import</strong>. A template only runs commands you can read first — review before importing.
+              Import a downloaded template via OAIY Desktop's <strong style={{ color: 'rgb(var(--color-text-tertiary))' }}>Services → Add / Import</strong>. A template only runs commands you can read first — review before importing.
             </p>
           </div>
         </Reveal>
@@ -319,7 +319,7 @@ interface LibraryItem {
   downloadUrl: string;
 }
 
-// Companion service templates have no `icon` field — fall back to a per-category
+// OAIY Desktop service templates have no `icon` field — fall back to a per-category
 // emoji so the cards still read at a glance.
 const CATEGORY_EMOJI: Record<string, string> = {
   LLM: '🤖', Image: '🎨', Audio: '🎙️', Video: '🎬', Example: '🧩',
@@ -351,7 +351,7 @@ function Library() {
       <SectionHeading
         eyebrow="Service library"
         title="Grab a ready-made companion service"
-        sub="Example service templates you can download and import into the companion. Each is a plain .json file served live from a folder on the API — new examples just get dropped in."
+        sub="Example service templates you can download and import into OAIY Desktop. Each is a plain .json file served live from a folder on the API — new examples just get dropped in."
       />
 
       {state === 'loading' && (
@@ -403,7 +403,7 @@ function Library() {
       )}
 
       <p className="mt-10 text-center text-xs" style={{ color: 'rgb(var(--color-text-muted))', lineHeight: 1.6 }}>
-        Downloaded a template? In the <strong>companion</strong> open <strong>Services → Add / Import</strong> and pick the .json — it lands with its install + run wired up. Review the script first; the companion only runs what's in the file.
+        Downloaded a template? In the <strong>companion</strong> open <strong>Services → Add / Import</strong> and pick the .json — it lands with its install + run wired up. Review the script first; OAIY Desktop only runs what's in the file.
       </p>
     </Section>
   );

@@ -1,7 +1,7 @@
 # Service Library
 
-Example **companion ServiceTemplate** files — local services you download and
-import into the OAIY Companion (install script + run command + health check).
+Example **OAIY Desktop ServiceTemplate** files — local services you download and
+import into the OAIY Desktop (install script + run command + health check).
 Served to the desktop page (`/desktop.html`) so visitors can browse + download.
 
 ## Adding an example
@@ -15,7 +15,7 @@ automatically (no rebuild, no manifest). The API reads the folder live:
 
 Override the folder with `SERVICE_LIBRARY_DIR` (absolute path) in `api/.env`.
 
-## File shape (companion ServiceTemplate)
+## File shape (OAIY Desktop ServiceTemplate)
 
 | field | notes |
 |---|---|
@@ -23,7 +23,7 @@ Override the folder with `SERVICE_LIBRARY_DIR` (absolute path) in `api/.env`.
 | `name`, `description`, `category` | display + grouping |
 | `defaultPort` | port the service listens on; available everywhere as `${port}` |
 | `install` | `{"kind":"none"}` or `{"kind":"script","windows","unix"}` — a per-OS install script |
-| `run` | `{command, args[], env, cwd}` — how to launch; a bare command resolves against the companion bin dir then PATH |
+| `run` | `{command, args[], env, cwd}` — how to launch; a bare command resolves against OAIY Desktop bin dir then PATH |
 | `health` | `{url, timeoutSecs}` — readiness probe; `url` supports `${port}` |
 | `docsUrl` | optional link |
 | `files` | `{filename: contents}` — bundled scripts written to the scripts dir (self-contained package) |

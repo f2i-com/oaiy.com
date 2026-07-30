@@ -14,11 +14,11 @@ import { BUILT_IN_SERVICES, type CustomService } from '../core-service/examples'
 // in below explicit data.* fields, replacing the per-provider hardcoded
 // defaults — single source of truth for "how do I reach this engine".
 const SERVICE_STORAGE_KEY = 'oaiy.customServices';
-// Companion-managed services (Phase 3) are published to a separate key
-// by lib/companionServices.ts while the desktop companion is running.
+// OAIY-Desktop-managed services (Phase 3) are published to a separate key
+// by lib/desktopServices.ts while the OAIY Desktop is running.
 // Read it inline (no app-module import) so this bundled compiler stays
 // self-contained, mirroring how it reads oaiy.customServices.
-const COMPANION_SERVICE_STORAGE_KEY = 'oaiy.companionServices';
+const DESKTOP_SERVICE_STORAGE_KEY = 'oaiy.desktopServices';
 function readServiceKey(key: string): CustomService[] {
   try {
     if (typeof localStorage === 'undefined') return [];
@@ -39,7 +39,7 @@ function resolveService(id: string): CustomService | null {
   // built-in examples — companion ids are `companion:*` so no collision.
   const all = [
     ...getCustomServices(),
-    ...readServiceKey(COMPANION_SERVICE_STORAGE_KEY),
+    ...readServiceKey(DESKTOP_SERVICE_STORAGE_KEY),
     ...BUILT_IN_SERVICES,
   ];
   return all.find((s) => s.id === id) ?? null;

@@ -34,7 +34,7 @@ import {
   extractJsonLdScript,
 } from './extractors';
 
-// Per-job method factory: methods + session maps + the companion client all close
+// Per-job method factory: methods + session maps + OAIY Desktop client all close
 // over THIS job's ctx (no module-level singletons), so concurrent jobs don't
 // cross-contaminate. A per-job cleanup (MODULE_CLEANUP, attached to the returned
 // methods) closes this job's Chromium/webview sessions at teardown.
@@ -42,7 +42,7 @@ function createBrowserMethods(ctx: RuntimeContext): Record<string, RuntimeMethod
 
 // True in the standalone WEB build: the tauri-shim sets this marker and provides a
 // (truthy) ctx.tauri, so `!ctx.tauri` can NOT detect "no native browser host" there.
-// When true, chromium browser ops route to the OAIY Companion's Playwright server over
+// When true, chromium browser ops route to the OAIY Desktop's Playwright server over
 // HTTP. Desktop (native plugin) and the Node CLI (node-host Playwright) leave the
 // marker unset, so they keep the native ctx.tauri path. Evaluated per call — the shim
 // sets the marker before this lazily-loaded module ever runs.
@@ -1023,26 +1023,26 @@ function requireTauri(op: string): NonNullable<RuntimeContext['tauri']> {
 //
 // When oaiy-web runs in a plain browser there is no Tauri host, so the
 // chromium-backed `browser_v2_*` ops can't reach a native plugin. The OAIY
-// Companion (the desktop sidecar) ships a managed "Playwright Browser"
+// OAIY Desktop ships a managed "Playwright Browser"
 // service that exposes the same operations over HTTP. Whenever `!ctx.tauri`
 // we route every chromium-session op to that service instead.
 //
 // `ctx.tauri` is constant for the lifetime of a renderer, so a session
-// created via the companion is *always* driven via the companion — session
+// created via OAIY Desktop is *always* driven via OAIY Desktop — session
 // ids never cross transports, and no per-session bookkeeping is needed
 // beyond what `v2Sessions` already tracks.
 //
-// The companion's HTTP API binds a fixed loopback port (mirrors
-// `companionDetection` in the app shell — kept inline here so this bundled
+// OAIY Desktop's HTTP API binds a fixed loopback port (mirrors
+// `desktopDetection` in the app shell — kept inline here so this bundled
 // module stays self-contained). The Playwright server itself runs on a
 // separate port that we discover from `/api/services`.
 
-const COMPANION_API = 'http://127.0.0.1:17972';
+const DESKTOP_API = 'http://127.0.0.1:17972';
 
-/** Resolved base URL of the companion's Playwright server; cached per load. */
+/** Resolved base URL of OAIY Desktop's Playwright server; cached per load. */
 let companionBrowserBase: string | null = null;
 
-interface CompanionErrorPayload {
+interface DesktopErrorPayload {
   error?: string;
 }
 
@@ -1066,7 +1066,7 @@ async function companionFetchJson<T = unknown>(
       headers: { 'Content-Type': 'application/json', ...(init?.headers || {}) },
     });
     const text = await resp.text();
-    const json = (text ? JSON.parse(text) : {}) as T & CompanionErrorPayload;
+    const json = (text ? JSON.parse(text) : {}) as T & DesktopErrorPayload;
     if (!resp.ok) {
       throw new Error(json?.error || `HTTP ${resp.status}`);
     }
@@ -1077,43 +1077,43 @@ async function companionFetchJson<T = unknown>(
 }
 
 /**
- * Locate the companion's Playwright Browser service, make sure it's
+ * Locate OAIY Desktop's Playwright Browser service, make sure it's
  * running, wait until it's actually ready, and return its base URL. The
- * result is cached. Throws an *actionable* error when the companion isn't
+ * result is cached. Throws an *actionable* error when OAIY Desktop isn't
  * reachable or the service isn't installed.
  */
-async function resolveCompanionBrowserBase(): Promise<string> {
+async function resolveDesktopBrowserBase(): Promise<string> {
   if (companionBrowserBase) return companionBrowserBase;
 
   let services: Array<{ id: string; port?: number; defaultPort?: number; status?: string }>;
   try {
     const snap = await companionFetchJson<{ services?: typeof services }>(
-      `${COMPANION_API}/api/services`,
+      `${DESKTOP_API}/api/services`,
       { method: 'GET' },
       2500
     );
     services = Array.isArray(snap?.services) ? snap.services : [];
   } catch {
     throw new Error(
-      '[Browser] No native browser host, and the OAIY Companion is not running. ' +
-        'Start the OAIY Companion to use browser nodes in the browser build.'
+      '[Browser] No native browser host, and the OAIY Desktop is not running. ' +
+        'Start the OAIY Desktop to use browser nodes in the browser build.'
     );
   }
 
   const svc = services.find(s => s.id === 'playwright-browser');
   if (!svc) {
     throw new Error(
-      '[Browser] The OAIY Companion is running but its "Playwright Browser" service ' +
-        'is not installed. Open the companion → Services → install Playwright Browser.'
+      '[Browser] The OAIY Desktop is running but its "Playwright Browser" service ' +
+        'is not installed. Open OAIY Desktop → Services → install Playwright Browser.'
     );
   }
   const port = svc.port || svc.defaultPort || 17880;
 
-  // Ask the companion to start it if it isn't already (returns immediately —
+  // Ask OAIY Desktop to start it if it isn't already (returns immediately —
   // the readiness poll below is what actually gates us).
   try {
     await companionFetchJson(
-      `${COMPANION_API}/api/services/ensure-by-port`,
+      `${DESKTOP_API}/api/services/ensure-by-port`,
       { method: 'POST', body: JSON.stringify({ port }) },
       4000
     );
@@ -1152,14 +1152,14 @@ async function resolveCompanionBrowserBase(): Promise<string> {
 }
 
 /**
- * Thin client for the companion's Playwright server. Each method mirrors a
+ * Thin client for OAIY Desktop's Playwright server. Each method mirrors a
  * `browser_v2_*` op so the call-site routing stays a one-liner. The server's
  * request/response shapes were deliberately designed to match these.
  */
 const companionBrowser = {
   async createSession(config: BrowserSessionConfigV2): Promise<string> {
     try {
-      const base = await resolveCompanionBrowserBase();
+      const base = await resolveDesktopBrowserBase();
       const r = await companionFetchJson<{ sessionId?: string }>(
         `${base}/session`,
         { method: 'POST', body: JSON.stringify({ config }) },
@@ -1175,7 +1175,7 @@ const companionBrowser = {
     }
   },
   async goto(sessionId: string, url: string, options: BrowserGotoOptions): Promise<BrowserNavigateResult> {
-    const base = await resolveCompanionBrowserBase();
+    const base = await resolveDesktopBrowserBase();
     const r = await companionFetchJson<{ url?: string; title?: string; status?: number }>(
       `${base}/session/${sessionId}/goto`,
       { method: 'POST', body: JSON.stringify({ url, waitUntil: options.waitUntil }) },
@@ -1188,7 +1188,7 @@ const companionBrowser = {
     };
   },
   async evaluate(sessionId: string, script: string): Promise<unknown> {
-    const base = await resolveCompanionBrowserBase();
+    const base = await resolveDesktopBrowserBase();
     const r = await companionFetchJson<{ result?: unknown }>(
       `${base}/session/${sessionId}/evaluate`,
       { method: 'POST', body: JSON.stringify({ script }) },
@@ -1197,22 +1197,22 @@ const companionBrowser = {
     return r.result;
   },
   async getHtml(sessionId: string): Promise<string> {
-    const base = await resolveCompanionBrowserBase();
+    const base = await resolveDesktopBrowserBase();
     const r = await companionFetchJson<{ html?: string }>(`${base}/session/${sessionId}/html`, { method: 'GET' });
     return r.html ?? '';
   },
   async getTitle(sessionId: string): Promise<string> {
-    const base = await resolveCompanionBrowserBase();
+    const base = await resolveDesktopBrowserBase();
     const r = await companionFetchJson<{ title?: string }>(`${base}/session/${sessionId}/title`, { method: 'GET' });
     return r.title ?? '';
   },
   async getUrl(sessionId: string): Promise<string> {
-    const base = await resolveCompanionBrowserBase();
+    const base = await resolveDesktopBrowserBase();
     const r = await companionFetchJson<{ url?: string }>(`${base}/session/${sessionId}/url`, { method: 'GET' });
     return r.url ?? '';
   },
   async waitForSelector(sessionId: string, selector: string, timeoutMs: number): Promise<void> {
-    const base = await resolveCompanionBrowserBase();
+    const base = await resolveDesktopBrowserBase();
     await companionFetchJson(
       `${base}/session/${sessionId}/wait`,
       { method: 'POST', body: JSON.stringify({ selector, timeoutMs }) },
@@ -1220,7 +1220,7 @@ const companionBrowser = {
     );
   },
   async screenshot(sessionId: string, options: BrowserScreenshotOptions): Promise<BrowserScreenshotResult> {
-    const base = await resolveCompanionBrowserBase();
+    const base = await resolveDesktopBrowserBase();
     const r = await companionFetchJson<{ dataUrl?: string }>(
       `${base}/session/${sessionId}/screenshot`,
       { method: 'POST', body: JSON.stringify({ fullPage: options.fullPage }) },
@@ -1229,7 +1229,7 @@ const companionBrowser = {
     return { dataUrl: r.dataUrl, format: options.format || 'png', width: 0, height: 0 };
   },
   async getCookies(sessionId: string, domain?: string): Promise<BrowserCookieV2[]> {
-    const base = await resolveCompanionBrowserBase();
+    const base = await resolveDesktopBrowserBase();
     const r = await companionFetchJson<{ cookies?: BrowserCookieV2[] }>(
       `${base}/session/${sessionId}/cookies`,
       { method: 'GET' }
@@ -1240,14 +1240,14 @@ const companionBrowser = {
     return domain ? all.filter(c => (c.domain || '').includes(domain)) : all;
   },
   async setCookies(sessionId: string, cookies: BrowserCookieV2[], merge: boolean): Promise<void> {
-    const base = await resolveCompanionBrowserBase();
+    const base = await resolveDesktopBrowserBase();
     await companionFetchJson(
       `${base}/session/${sessionId}/cookies`,
       { method: 'POST', body: JSON.stringify({ cookies, merge }) }
     );
   },
   async close(sessionId: string): Promise<void> {
-    const base = await resolveCompanionBrowserBase();
+    const base = await resolveDesktopBrowserBase();
     await companionFetchJson(`${base}/session/${sessionId}`, { method: 'DELETE' }, 4000).catch(() => {});
   },
 };
@@ -1257,9 +1257,9 @@ async function createSessionV2(config: BrowserSessionConfigV2): Promise<BrowserS
   ctx.log('info', `[Browser] createSessionV2 mode=${mode}`);
 
   if (mode === 'chromium') {
-    // Browser build (no Tauri host): drive the companion's Playwright server.
+    // Browser build (no Tauri host): drive OAIY Desktop's Playwright server.
     // Don't fall back to webview here — webview also needs Tauri, so its
-    // error would mask the actionable "start the companion" message.
+    // error would mask the actionable "start OAIY Desktop" message.
     if (isWebShim()) {
       const id = await companionBrowser.createSession(config);
       const session: BrowserSessionV2 = {
@@ -1271,7 +1271,7 @@ async function createSessionV2(config: BrowserSessionConfigV2): Promise<BrowserS
         createdAt: new Date().toISOString(),
       };
       v2Sessions.set(id, session);
-      ctx.log('info', `[Browser] using OAIY Companion Playwright server (session ${id})`);
+      ctx.log('info', `[Browser] using OAIY Desktop Playwright server (session ${id})`);
       return session;
     }
     const tauri = requireTauri('createSessionV2(chromium)');
@@ -1375,7 +1375,7 @@ async function httpImpersonateRequest(args: {
   // caller crash on `null.body` with an opaque "Cannot read properties of null".
   if (!result || typeof result.status !== 'number') {
     throw new Error(
-      'Chrome/JA3 impersonation HTTP requires the OAIY desktop app — it is not available in the browser build. Disable impersonation to use plain HTTP, or run this flow in the OAIY Companion.',
+      'Chrome/JA3 impersonation HTTP requires the OAIY desktop app — it is not available in the browser build. Disable impersonation to use plain HTTP, or run this flow in the OAIY Desktop.',
     );
   }
   return result;

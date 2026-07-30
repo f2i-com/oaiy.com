@@ -1,8 +1,8 @@
 {
-  "name": "oaiy-companion",
+  "name": "oaiy-desktop",
   "private": true,
   "version": "0.1.0",
-  "description": "Tray-resident desktop companion for oaiy-web. Manages local AI services (Ollama, ComfyUI, custom Python) and exposes them to the oaiy-web flow editor via a localhost API.",
+  "description": "Tray-resident OAIY Desktop for oaiy-web. Manages local AI services (Ollama, ComfyUI, custom Python) and exposes them to the oaiy-web flow editor via a localhost API.",
   "license": "Apache-2.0",
   "type": "module",
   "scripts": {

@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Default capabilities for the OAIY Companion's main window. Tray + shell-spawn are the only privileged surfaces needed in Phase 1.",
+  "description": "Default capabilities for the OAIY Desktop's main window. Tray + shell-spawn are the only privileged surfaces needed in Phase 1.",
   "windows": ["main"],
   "permissions": [
     "core:default",

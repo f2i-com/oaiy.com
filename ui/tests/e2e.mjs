@@ -246,6 +246,73 @@ for (const theme of ['dark', 'light']) {
 }
 
 // ---------------------------------------------------------------------------
+// The flows rail collapses, stays collapsed, and can be brought back.
+//
+// It used to `return null` when closed, which is a hide rather than a collapse:
+// the panel vanished, left no affordance where it had been, and the only way
+// back was an icon in the topbar. So the assertions here are specifically that
+// something REMAINS (a 44px rail with the reopen control on it), that the canvas
+// actually reclaims the width, and that the choice survives a reload — a panel
+// that silently reopens on every visit is not usefully collapsible.
+section('flows rail collapse');
+{
+  const ctx = await browser.newContext({ viewport: { width: 1440, height: 900 } });
+  const page = await ctx.newPage();
+  await page.addInitScript(() => {
+    localStorage.setItem('skipSplash', 'true');
+    localStorage.setItem('oaiy.wizard.completed', 'true');
+  });
+  await page.goto(`${BASE}/app.html`, { waitUntil: 'networkidle' });
+  await page.waitForTimeout(2200);
+
+  const state = () =>
+    page.evaluate(() => {
+      const h = [...document.querySelectorAll('h2')].find((e) =>
+        /^(Flows|Your Flows)$/.test(e.textContent.trim()),
+      );
+      const panel = h?.closest('div.flex.flex-col');
+      const railBtn = document.querySelector('button[aria-label="Expand the flows panel"]');
+      const canvas = document.querySelector('.oaiy-canvas-wrap');
+      return {
+        panel: panel ? Math.round(panel.getBoundingClientRect().width) : 0,
+        rail: railBtn ? Math.round(railBtn.parentElement.getBoundingClientRect().width) : 0,
+        canvas: canvas ? Math.round(canvas.getBoundingClientRect().width) : 0,
+        stored: localStorage.getItem('oaiy.flowsRail'),
+      };
+    });
+
+  const expanded = await state();
+  ok('rail starts expanded', expanded.panel > 200, `panel=${expanded.panel}`);
+  ok('no rail stub while expanded', expanded.rail === 0, `rail=${expanded.rail}`);
+
+  await page.click('button[aria-label="Collapse the flows panel"]');
+  await page.waitForTimeout(450);
+  const collapsed = await state();
+  ok('collapsing hides the panel', collapsed.panel === 0, `panel=${collapsed.panel}`);
+  ok('a rail remains, with the reopen control', collapsed.rail > 0 && collapsed.rail < 80, `rail=${collapsed.rail}`);
+  ok('canvas reclaims the width', collapsed.canvas > expanded.canvas, `${expanded.canvas} -> ${collapsed.canvas}`);
+  ok('collapse is persisted', collapsed.stored === 'collapsed', String(collapsed.stored));
+
+  await page.keyboard.press('Control+b');
+  await page.waitForTimeout(450);
+  ok('Ctrl+B expands again', (await state()).panel > 200);
+  await page.keyboard.press('Control+b');
+  await page.waitForTimeout(450);
+  ok('Ctrl+B collapses again', (await state()).panel === 0);
+
+  await page.reload({ waitUntil: 'networkidle' });
+  await page.waitForTimeout(2200);
+  const afterReload = await state();
+  ok('still collapsed after a reload', afterReload.panel === 0 && afterReload.rail > 0, JSON.stringify(afterReload));
+
+  await page.click('button[aria-label="Expand the flows panel"]');
+  await page.waitForTimeout(450);
+  ok('the rail button restores the panel', (await state()).panel > 200);
+
+  await ctx.close();
+}
+
+// ---------------------------------------------------------------------------
 // Self-hosted fonts, and no third-party requests at all.
 //
 // Both halves of this are here because both failed silently once.

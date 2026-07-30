@@ -658,7 +658,7 @@ function OaiyLocalModelPicker({ value, onChange }: OaiyLocalModelPickerProps) {
 }
 
 /**
- * Companion mmproj `.gguf` picker for Internal (OAIY Local) mode. The
+ * OAIY Desktop mmproj `.gguf` picker for Internal (OAIY Local) mode. The
  * runtime resolves the path verbatim when absolute, or relative to the
  * LLM models dir; passing a path here switches `llm_chat` to the
  * vision-conditioned splice path whenever an image input is wired.

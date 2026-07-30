@@ -102,7 +102,7 @@ function Hero() {
             </a>
             <a href="#desktop" className="btn btn-secondary btn-lg">
               <DownloadIcon />
-              Get the desktop companion
+              Get the OAIY Desktop
             </a>
           </div>
 
@@ -629,7 +629,7 @@ function Privacy() {
 }
 
 /* ------------------------------------------------------------------ */
-/* Desktop companion                                                   */
+/* OAIY Desktop                                                   */
 /* ------------------------------------------------------------------ */
 
 function Desktop() {
@@ -642,7 +642,7 @@ function Desktop() {
   return (
     <Section id="desktop">
       <SectionHeading
-        eyebrow="The desktop companion"
+        eyebrow="The OAIY Desktop"
         title="Optional muscle for the heavy local work"
         sub="The web app does everything a browser can. For the rest — spawning model servers, downloading weights, running Python — there’s a small tray companion."
       />
@@ -667,13 +667,13 @@ function Desktop() {
               <ProcessCard
                 tone="124 58 237"
                 badge="In your system tray"
-                title="OAIY desktop companion"
+                title="OAIY OAIY Desktop"
                 body="Model servers, Hugging Face downloads, portable Python venvs, browser sidecar."
               />
             </div>
             <p className="mt-5 text-center text-xs" style={{ color: 'rgb(var(--color-text-muted))' }}>
               The web app probes <code className="font-mono">/api/health</code> on load. Found it?
-              The palette lights up with companion-managed services automatically.
+              The palette lights up with OAIY-Desktop-managed services automatically.
             </p>
           </div>
         </Reveal>
@@ -695,11 +695,11 @@ function Desktop() {
           ))}
           <div className="mt-1 flex flex-wrap items-center gap-3">
             <a href="desktop.html" className="btn btn-primary btn-md">
-              Learn about the companion
+              Learn about OAIY Desktop
               <ArrowRight />
             </a>
             <span className="inline-flex items-center gap-1.5 text-xs" style={{ color: 'rgb(var(--color-text-muted))' }}>
-              <WindowsIcon /> Desktop companion for Windows · optional
+              <WindowsIcon /> OAIY Desktop for Windows · optional
             </span>
           </div>
         </div>

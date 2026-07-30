@@ -17,7 +17,7 @@ import {
 } from 'oaiy-core/modules/core-service/examples';
 import { invalidateDynamicOptions } from 'oaiy-ui-components';
 import { notifyStorageQuotaExceeded } from '../lib/storageQuota';
-import { listCompanionServices } from '../lib/companionServices';
+import { listDesktopServices } from '../lib/desktopServices';
 
 const STORAGE_KEY = 'oaiy.customServices';
 
@@ -69,11 +69,11 @@ export function listCustomServices(): CustomService[] {
 export function getService(id: string): CustomService | null {
   const own = listAllServices().find((s) => s.id === id);
   if (own) return own;
-  // Companion-managed services (ids prefixed `companion:`) live in a separate
+  // OAIY-Desktop-managed services (ids prefixed `companion:`) live in a separate
   // registry. Fall through so the UI can resolve + display a picked companion
   // service's fields and node title — the compiler already resolves these at
   // run time, this just keeps the editor in sync.
-  return listCompanionServices().find((s) => s.id === id) ?? null;
+  return listDesktopServices().find((s) => s.id === id) ?? null;
 }
 
 export function saveService(svc: CustomService): void {

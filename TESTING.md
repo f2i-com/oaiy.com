@@ -39,7 +39,7 @@ port the suite aborts with exit 2 and tells you what actually answered, rather
 than failing 40 assertions about missing hashes. Pass a base URL to override:
 `composer test -- http://api.oaiy.local`.
 
-That guard has paid for itself twice, so don't remove it. Once on the companion
+That guard has paid for itself twice, so don't remove it. Once on OAIY Desktop
 port, where an unrelated app answered `/api/health` with a matching shape — the
 UI went green while every authenticated call 401'd. And once here: both READMEs
 used to recommend `:8080` for the API, which is llama.cpp's own default port and
@@ -154,7 +154,7 @@ Worth knowing before trusting a green run:
   services (Ollama, ComfyUI, a Python venv), so `oaiy run` against a real model
   is manual. The CLI suite covers module isolation and the job queue, not
   inference.
-- **The companion's HTTP API has only Rust-side unit tests.** Its routes are
+- **OAIY Desktop's HTTP API has only Rust-side unit tests.** Its routes are
   exercised by hand; a browser can't authenticate to them, which is by design.
 - **No visual regression testing.** Both themes are asserted structurally, not
   pixel-wise.

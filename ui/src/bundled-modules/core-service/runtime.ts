@@ -193,11 +193,11 @@ async function call(
     }
   }
 
-  // If this endpoint targets a companion-managed local port, ask the companion
+  // If this endpoint targets an OAIY Desktop-managed local port, ask OAIY Desktop
   // to start the matching service (if stopped) before firing the request — so
   // picking a stopped companion service in a flow and running it "just works"
   // (Phase 3.5). Same cross-host handshake core-ai uses: on web ctx.tauri is the
-  // shim, whose ensure_service_ready_by_port proxies to the companion; on
+  // shim, whose ensure_service_ready_by_port proxies to OAIY Desktop; on
   // desktop/CLI it's the real command. Fire-and-forget — any failure (no
   // companion, or a non-companion local server) falls through to the direct
   // request. A heavy service still loading its model may not answer this first

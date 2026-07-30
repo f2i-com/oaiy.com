@@ -3,7 +3,7 @@
  *
  * The app used to `<link>` Inter and JetBrains Mono from fonts.googleapis.com,
  * so every page load told Google who was reading — in a product whose landing
- * page sells "nothing leaves your device", and whose desktop companion already
+ * page sells "nothing leaves your device", and whose OAIY Desktop already
  * self-hosts the same two families from disk.
  *
  * **Why this is a .ts file and not an `@import` in index.css.** That was the

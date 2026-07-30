@@ -20,25 +20,25 @@ installConsoleBuffer();
 //                                  e.g. `service:list:ai_llm` for the AI LLM dropdown.
 import { registerDynamicOptionsResolver } from 'oaiy-ui-components';
 import { listAllServices } from './utils/serviceRegistry';
-import { listCompanionServices } from './lib/companionServices';
+import { listDesktopServices } from './lib/desktopServices';
 import {
   filterServicesForNodeType,
   type ServiceNodeTag,
 } from 'oaiy-core/modules/core-service/examples';
 registerDynamicOptionsResolver('service:list', (rest: string) => {
-  // User-saved services first, then any services the OAIY Companion is
-  // currently running (Phase 3). Companion entries carry a `companion:`
+  // User-saved services first, then any services the OAIY Desktop is
+  // currently running (Phase 3). OAIY Desktop entries carry a `companion:`
   // id prefix so they never collide with the user's own.
-  const all = [...listAllServices(), ...listCompanionServices()];
+  const all = [...listAllServices(), ...listDesktopServices()];
   const filtered = filterServicesForNodeType(all, (rest as ServiceNodeTag) || '');
-  const isCompanion = (id: string) => id.startsWith('companion:');
+  const isDesktop = (id: string) => id.startsWith('companion:');
   return [
     { value: '', label: rest ? '(none — use the fields below)' : '(none — fill fields inline)' },
     ...filtered.map((s) => ({
       value: s.id,
-      label: isCompanion(s.id) ? `${s.name}` : s.name,
-      description: isCompanion(s.id)
-        ? (s.description || 'Running in the OAIY Companion')
+      label: isDesktop(s.id) ? `${s.name}` : s.name,
+      description: isDesktop(s.id)
+        ? (s.description || 'Running in the OAIY Desktop')
         : s.description || (s.isBuiltIn ? 'Built-in example' : 'Custom service'),
     })),
   ];
@@ -47,16 +47,16 @@ registerDynamicOptionsResolver('service:list', (rest: string) => {
 // Dynamic module discovery - MUST be imported first before any module access
 import './dynamicModules';
 
-// Start the OAIY Companion detection probe. Polls a fixed localhost
-// port for the desktop companion app and re-renders any subscribed
-// component when the status flips. See lib/companionDetection.ts.
-import { startCompanionDetection } from './lib/companionDetection';
-import { startCompanionServiceSync } from './lib/companionServices';
-startCompanionDetection();
-// Mirror the companion's running services into the service dropdowns +
-// compilers while it's available (Phase 3). No-op when the companion
-// isn't running. See lib/companionServices.ts.
-startCompanionServiceSync();
+// Start the OAIY Desktop detection probe. Polls a fixed localhost
+// port for the OAIY Desktop app and re-renders any subscribed
+// component when the status flips. See lib/desktopDetection.ts.
+import { startDesktopDetection } from './lib/desktopDetection';
+import { startDesktopServiceSync } from './lib/desktopServices';
+startDesktopDetection();
+// Mirror OAIY Desktop's running services into the service dropdowns +
+// compilers while it's available (Phase 3). No-op when OAIY Desktop
+// isn't running. See lib/desktopServices.ts.
+startDesktopServiceSync();
 
 import { StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'

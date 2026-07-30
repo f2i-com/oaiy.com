@@ -12,7 +12,7 @@ import {
  * `useToast().push({ ... })` to surface a transient notification in the
  * bottom-right corner.
  *
- * Native OS notifications: the companion is tray-resident, so most of the
+ * Native OS notifications: OAIY Desktop is tray-resident, so most of the
  * time its window is hidden — an in-app toast no one can see is useless
  * for "your 40 GB download finished". So every pushed toast ALSO fires a
  * native OS notification *when the window isn't focused* (focused → just
@@ -25,7 +25,7 @@ import {
 let notifyPermission: 'unknown' | 'granted' | 'denied' = 'unknown';
 
 /**
- * Fire a native OS notification, but only when the companion window is in
+ * Fire a native OS notification, but only when OAIY Desktop window is in
  * the background — a focused user already sees the in-app toast. Lazily
  * requests permission on first use; degrades silently (the toast still
  * showed) if notifications aren't available.

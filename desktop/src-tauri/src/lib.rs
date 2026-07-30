@@ -1,4 +1,4 @@
-//! OAIY Companion — entry point.
+//! OAIY Desktop — entry point.
 //!
 //! Phase 1: bring up the Tauri shell + a tray icon + a localhost HTTP API
 //! that oaiy-web can discover.
@@ -10,7 +10,7 @@ pub mod services;
 
 /// Port the localhost API binds to. Fixed so oaiy-web's detection probe has a
 /// stable target. Shared by both binaries (the GUI and the headless server).
-pub const COMPANION_PORT: u16 = 17972;
+pub const DESKTOP_PORT: u16 = 17972;
 
 // Everything below `open_path` is the GUI companion (Tauri), gated behind the
 // default `gui` feature: `cargo build --bin oaiy-server --no-default-features`
@@ -25,9 +25,9 @@ pub use gui::run;
 
 #[cfg(feature = "gui")]
 mod gui {
-use super::COMPANION_PORT;
+use super::DESKTOP_PORT;
 use crate::{http, migrate, tray};
-use crate::http::CompanionConfig;
+use crate::http::DesktopConfig;
 use crate::migrate::{MigratePlan, MigrationHandle, MigrationProgress};
 use crate::services::catalog::CatalogHandle;
 use crate::services::downloads::{Downloads, DownloadsHandle};
@@ -156,8 +156,8 @@ fn open_url(url: String) -> Result<(), String> {
     Ok(())
 }
 
-// COMPANION_PORT is declared at the crate root (above mod gui) so the headless
-// oaiy-server shares it; here it's in scope via `use super::COMPANION_PORT`.
+// DESKTOP_PORT is declared at the crate root (above mod gui) so the headless
+// oaiy-server shares it; here it's in scope via `use super::DESKTOP_PORT`.
 
 /// The OS-default data dir (`%APPDATA%/<id>/` on Windows, etc.). This is
 /// where everything lives unless the user has chosen a custom folder.
@@ -175,8 +175,11 @@ fn config_pointer_path(app: &tauri::AppHandle) -> Option<PathBuf> {
     app.path()
         .app_config_dir()
         .ok()
-        .map(|d| d.join("companion-config.json"))
+        .map(|d| d.join(CONFIG_POINTER_NAME))
 }
+
+/// Bootstrap pointer filename.
+const CONFIG_POINTER_NAME: &str = "desktop-config.json";
 
 /// Process-wide lock serializing read-modify-write cycles on the pointer
 /// file. Every mutating writer (`write_config_str`, `write_extra_model_dirs`,
@@ -445,13 +448,13 @@ fn resolve_models_dir(app: &tauri::AppHandle, data_dir: &std::path::Path) -> Pat
     data_dir.join("models")
 }
 
-// `CompanionConfig` lives in `http.rs`; it's imported at the top of `mod gui`.
+// `DesktopConfig` lives in `http.rs`; it's imported at the top of `mod gui`.
 // The GUI builds it from AppHandle paths via `config_snapshot` +
 // `TauriConfigProvider` below.
 
 /// Build the config snapshot from AppHandle paths. Used by the Tauri command +
 /// the GUI's `ConfigProvider`.
-pub(crate) fn config_snapshot(app: &tauri::AppHandle, registry: &RegistryHandle) -> CompanionConfig {
+pub(crate) fn config_snapshot(app: &tauri::AppHandle, registry: &RegistryHandle) -> DesktopConfig {
     // One lock: pull both the active data dir and the active models dir.
     let (active_dir, models_active_dir) = registry
         .lock()
@@ -479,7 +482,7 @@ pub(crate) fn config_snapshot(app: &tauri::AppHandle, registry: &RegistryHandle)
         .clone()
         .unwrap_or_else(|| models_default_dir.clone());
 
-    CompanionConfig {
+    DesktopConfig {
         restart_required: norm(&effective) != norm(&active_dir),
         is_custom: configured_dir.is_some(),
         active_dir,
@@ -502,14 +505,14 @@ struct TauriConfigProvider {
 }
 
 impl http::ConfigProvider for TauriConfigProvider {
-    fn snapshot(&self, registry: &RegistryHandle) -> CompanionConfig {
+    fn snapshot(&self, registry: &RegistryHandle) -> DesktopConfig {
         config_snapshot(&self.app, registry)
     }
 }
 
 /// Tauri command: current data-dir configuration for the Settings panel.
 #[tauri::command]
-fn get_config(app: tauri::AppHandle, registry: tauri::State<RegistryHandle>) -> CompanionConfig {
+fn get_config(app: tauri::AppHandle, registry: tauri::State<RegistryHandle>) -> DesktopConfig {
     config_snapshot(&app, &registry)
 }
 
@@ -982,7 +985,7 @@ pub fn run() {
                     Err(e) => {
                         log::error!("registry init failed at {}: {e}", data_dir.display());
                         // Empty placeholder; the UI surfaces "no templates" cleanly.
-                        let fallback = std::env::temp_dir().join("oaiy-companion-fallback");
+                        let fallback = std::env::temp_dir().join("oaiy-desktop-fallback");
                         let fb_models = fallback.join("models");
                         // Even the temp-dir fallback does filesystem work and can
                         // fail (read-only/full temp). Don't panic — degrade to a
@@ -1058,7 +1061,7 @@ pub fn run() {
                 Arc::new(TauriConfigProvider { app: app_handle });
             tauri::async_runtime::spawn(async move {
                 if let Err(e) = http::serve(
-                    COMPANION_PORT,
+                    DESKTOP_PORT,
                     config_provider,
                     // GUI: webview-origin auth, plus an OPTIONAL bearer token
                     // (set OAIY_SERVER_TOKEN) so the CLI can drive this companion
@@ -1134,7 +1137,7 @@ pub fn run() {
             });
 
             // Build the tray icon + menu. tray::setup hides the main
-            // window on close so the companion stays alive in the tray.
+            // window on close so OAIY Desktop stays alive in the tray.
             tray::setup(app)?;
 
             Ok(())

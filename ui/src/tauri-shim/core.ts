@@ -898,8 +898,8 @@ const handlers: Record<string, (args: InvokeArgs) => Promise<unknown>> = {
     already_running: false,
     error: 'Local service spawn is not available in the browser build',
   }),
-  // The OAIY Companion (fixed localhost API :17972) may own this port. Ask it to
-  // start the matching service if stopped, so picking a companion service in a
+  // The OAIY Desktop (fixed localhost API :17972) may own this port. Ask it to
+  // start the matching service if stopped, so picking an OAIY Desktop service in a
   // flow and running it "just works" without a manual Start first (Phase 3.5).
   // Fail-safe: any error, a non-OK response, or an absent companion returns
   // success:false — exactly the old no-op — so the caller falls through to a
@@ -921,7 +921,7 @@ const handlers: Record<string, (args: InvokeArgs) => Promise<unknown>> = {
         signal: ctrl.signal,
       }).finally(() => clearTimeout(timer));
       if (!r.ok) return { success: false, already_running: false };
-      // The companion serializes EnsureByPortResult in camelCase (alreadyRunning).
+      // OAIY Desktop serializes EnsureByPortResult in camelCase (alreadyRunning).
       const res = (await r.json().catch(() => null)) as
         | { found?: boolean; started?: boolean; alreadyRunning?: boolean }
         | null;
@@ -930,7 +930,7 @@ const handlers: Record<string, (args: InvokeArgs) => Promise<unknown>> = {
         already_running: !!res?.alreadyRunning,
       };
     } catch {
-      // Companion absent / not reachable, or a non-companion local server.
+      // OAIY Desktop absent / not reachable, or an unrelated local server.
       return { success: false, already_running: false };
     }
   },

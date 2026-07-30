@@ -1,7 +1,7 @@
 {
   "id": "playwright-browser",
   "name": "Playwright Browser",
-  "description": "Headless Chromium automation backend for the browser_* nodes (goto, extract, click, screenshot). Installs Playwright into a Python venv; reuses the companion's Python runtime.",
+  "description": "Headless Chromium automation backend for the browser_* nodes (goto, extract, click, screenshot). Installs Playwright into a Python venv; reuses OAIY Desktop's Python runtime.",
   "category": "Browser",
   "defaultPort": 17880,
   "install": {

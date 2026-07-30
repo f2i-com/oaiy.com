@@ -913,24 +913,24 @@ async function chat(
       }
     }
   } else if (!ctx.tauri && endpoint.includes('127.0.0.1')) {
-    // Browser build (oaiy-web): no Tauri, but the OAIY Companion may own
+    // Browser build (oaiy-web): no Tauri, but the OAIY Desktop may own
     // this port. Ask it to start the matching service if it's stopped —
-    // so picking a companion service in a flow and running it "just
+    // so picking an OAIY Desktop service in a flow and running it "just
     // works" without manually starting it first (Phase 3.5). Fire-and-
-    // forget: the companion returns as soon as the spawn kicks off and
+    // forget: OAIY Desktop returns as soon as the spawn kicks off and
     // the 503/connection-refused retry loop below rides out the warm-up.
     const portMatch = endpoint.match(/:(\d+)/);
     if (portMatch) {
       const port = parseInt(portMatch[1], 10);
       try {
-        // 17972 is the companion's fixed localhost API port (see
-        // ui/src/lib/companionDetection.ts). Plain fetch is fine — the
+        // 17972 is OAIY Desktop's fixed localhost API port (see
+        // ui/src/lib/desktopDetection.ts). Plain fetch is fine — the
         // companion sets permissive CORS and the bind is loopback-only.
         // Hard 2s cap: ensure-by-port returns as soon as the spawn kicks
         // off, so a healthy companion answers in <100ms. The timeout keeps
         // a wedged companion (accepting connections but not responding)
         // from hanging an otherwise-fine flow run — on abort we fall
-        // through to the direct request just like the companion-absent case.
+        // through to the direct request just like OAIY Desktop-absent case.
         const ctrl = new AbortController();
         const abortTimer = setTimeout(() => ctrl.abort(), 2000);
         const r = await fetch('http://127.0.0.1:17972/api/services/ensure-by-port', {
@@ -949,7 +949,7 @@ async function chat(
           }
         }
       } catch {
-        // Companion not running / not reachable — fall through and let
+        // OAIY Desktop not running / not reachable — fall through and let
         // the request hit the endpoint directly (it may be a non-
         // companion local server the user started themselves).
       }
@@ -1213,7 +1213,7 @@ async function chat(
       const tplVars: Record<string, string> = {
         prompt: finalPrompt,
         // Alias for the documented NodeSpec/{{input}} convention (and what
-        // core-service provides), so a companion service marked apiFormat:'openai'
+        // core-service provides), so an OAIY Desktop service marked apiFormat:'openai'
         // with a {{input}}-based body renders identically on the ai_llm path.
         input: finalPrompt,
         system: effectiveSystemPrompt || '',

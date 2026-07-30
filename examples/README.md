@@ -3,7 +3,7 @@
 Sample flow files — each is a minimal OAIY **project** (a top-level `flows` array
 wrapping one flow graph) so the same file both runs headlessly with the CLI
 (`cli/`) **and** imports cleanly into the web app. They drive **managed AI
-services** installed via the companion / `oaiy-server` (see `desktop/README.md`,
+services** installed via OAIY Desktop / `oaiy-server` (see `desktop/README.md`,
 `cli/README.md`).
 
 | File | What it does | Services needed |
@@ -13,7 +13,7 @@ services** installed via the companion / `oaiy-server` (see `desktop/README.md`,
 
 The `service_call` nodes carry their HTTP call **inline** (`endpoint` /
 `bodyTemplate` / `responsePath`), so a file is self-contained — it runs the same
-whether or not the companion's service list is populated.
+whether or not OAIY Desktop's service list is populated.
 
 ## Open in the web app
 
@@ -22,7 +22,7 @@ as a new flow (your current project is untouched), then hit **Run**. (The header
 **Import project** button also works, but it *replaces* the whole project.)
 
 Make sure the services are running first (start them from the desktop
-companion's **Services** tab, or the CLI below).
+OAIY Desktop's **Services** tab, or the CLI below).
 
 ## Run with the CLI
 

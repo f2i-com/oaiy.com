@@ -1,12 +1,12 @@
 /**
- * Companion service → flow palette bridge (Phase 3).
+ * OAIY Desktop service → flow palette bridge (Phase 3).
  *
- * When the OAIY Companion is running it manages local AI services
+ * When the OAIY Desktop is running it manages local AI services
  * (Ollama, llama.cpp, custom Python rigs) and exposes them at
  * `GET /api/services`. This module polls that endpoint while the
  * companion is available, maps each RUNNING service to the oaiy
  * `CustomService` shape, and publishes the result into a dedicated
- * localStorage key (`oaiy.companionServices`) — kept SEPARATE from the
+ * localStorage key (`oaiy.desktopServices`) — kept SEPARATE from the
  * user's own `oaiy.customServices` so we never touch their saved data.
  *
  * Three readers merge this list:
@@ -18,7 +18,7 @@
  * Lifecycle: the poll starts/stops in lockstep with companion
  * availability (it subscribes to the detection probe). When the
  * companion goes away the published list is cleared, so a service you
- * stop in the companion disappears from the dropdowns within a tick.
+ * stop in OAIY Desktop disappears from the dropdowns within a tick.
  *
  * Why localStorage and not just an in-memory list? The compilers run in
  * the renderer and read service config synchronously from localStorage
@@ -29,18 +29,18 @@
 import { invalidateDynamicOptions } from 'oaiy-ui-components';
 import type { CustomService } from 'oaiy-core/modules/core-service/examples';
 import {
-  COMPANION_API_BASE,
-  subscribeCompanionStatus,
-} from './companionDetection';
+  DESKTOP_API_BASE,
+  subscribeDesktopStatus,
+} from './desktopDetection';
 
 /** Shared contract with the two compilers (which read this key inline). */
-export const COMPANION_SERVICE_STORAGE_KEY = 'oaiy.companionServices';
+export const DESKTOP_SERVICE_STORAGE_KEY = 'oaiy.desktopServices';
 
 const POLL_INTERVAL_MS = 10_000;
 const FETCH_TIMEOUT_MS = 1500;
 
 /** A template-declared call contract (companion ServiceSnapshot.node). */
-interface CompanionNodeSpec {
+interface DesktopNodeSpec {
   endpoint?: string | null;
   method?: string | null;
   bodyTemplate?: string | null;
@@ -49,8 +49,8 @@ interface CompanionNodeSpec {
   icon?: string | null;
 }
 
-/** Subset of the companion's ServiceSnapshot we actually use. */
-interface CompanionServiceSnapshot {
+/** Subset of OAIY Desktop's ServiceSnapshot we actually use. */
+interface DesktopServiceSnapshot {
   id: string;
   name: string;
   description: string;
@@ -60,13 +60,13 @@ interface CompanionServiceSnapshot {
   defaultPort: number;
   docsUrl: string | null;
   /** How to call this service as a node, declared by its template (optional). */
-  node?: CompanionNodeSpec | null;
+  node?: DesktopNodeSpec | null;
 }
 
 /**
  * Map one companion service to a `CustomService`. Both running AND
  * stopped services are surfaced — a stopped one is still pickable, and
- * the AI/HTTP runtime asks the companion to start it (ensure-by-port)
+ * the AI/HTTP runtime asks OAIY Desktop to start it (ensure-by-port)
  * the moment a flow that uses it runs. The status is folded into the
  * dropdown label so the user knows what they're picking.
  *
@@ -79,7 +79,7 @@ interface CompanionServiceSnapshot {
  *
  * Returns null only when there's no usable port.
  */
-function mapToCustomService(s: CompanionServiceSnapshot): CustomService | null {
+function mapToCustomService(s: DesktopServiceSnapshot): CustomService | null {
   const port = s.port || s.defaultPort;
   if (!port) return null;
   const cat = (s.category || '').toLowerCase();
@@ -87,9 +87,9 @@ function mapToCustomService(s: CompanionServiceSnapshot): CustomService | null {
   const id = `companion:${s.id}`;
   const running = s.status === 'running';
   const statusTag = running ? 'running' : s.status;
-  // Keep the node/palette description to a tidy one-liner — a companion can
+  // Keep the node/palette description to a tidy one-liner — OAIY Desktop can
   // report a long paragraph (krea2's is), which overflows the node body.
-  const rawDesc = (s.description || `Managed by the OAIY Companion on port ${port}.`).trim();
+  const rawDesc = (s.description || `Managed by the OAIY Desktop on port ${port}.`).trim();
   const firstSentence = rawDesc.split('. ')[0];
   const baseDesc =
     firstSentence.length > 90 ? `${firstSentence.slice(0, 87).trimEnd()}…` : firstSentence;
@@ -118,7 +118,7 @@ function mapToCustomService(s: CompanionServiceSnapshot): CustomService | null {
         nodeTypes: ['ai_llm', 'service_call'],
         apiFormat: 'openai',
         model: '',
-        installHint: `Managed by the OAIY Companion (port ${port}). Start/stop it from the companion's Services tab.`,
+        installHint: `Managed by the OAIY Desktop (port ${port}). Start/stop it from OAIY Desktop's Services tab.`,
       };
     }
     return {
@@ -134,7 +134,7 @@ function mapToCustomService(s: CompanionServiceSnapshot): CustomService | null {
       isBuiltIn: false,
       icon: node.icon || '🧩',
       nodeTypes: ['service_call'],
-      installHint: `Managed by the OAIY Companion (port ${port}).`,
+      installHint: `Managed by the OAIY Desktop (port ${port}).`,
     };
   }
 
@@ -160,7 +160,7 @@ function mapToCustomService(s: CompanionServiceSnapshot): CustomService | null {
       nodeTypes: ['ai_llm', 'service_call'],
       apiFormat: 'openai',
       model: '',
-      installHint: `Managed by the OAIY Companion (port ${port}). Start/stop it from the companion's Services tab.`,
+      installHint: `Managed by the OAIY Desktop (port ${port}). Start/stop it from OAIY Desktop's Services tab.`,
     };
   }
 
@@ -182,7 +182,7 @@ function mapToCustomService(s: CompanionServiceSnapshot): CustomService | null {
       isBuiltIn: false,
       icon: isVideo ? '🎬' : '🎨',
       nodeTypes: ['service_call'],
-      installHint: `Managed by the OAIY Companion (port ${port}).`,
+      installHint: `Managed by the OAIY Desktop (port ${port}).`,
     };
   }
 
@@ -199,18 +199,18 @@ function mapToCustomService(s: CompanionServiceSnapshot): CustomService | null {
     isBuiltIn: false,
     icon: '🧩',
     nodeTypes: ['service_call'],
-    installHint: `Managed by the OAIY Companion (port ${port}).`,
+    installHint: `Managed by the OAIY Desktop (port ${port}).`,
   };
 }
 
 function publish(list: CustomService[]): void {
   const next = JSON.stringify(list);
-  const prev = localStorage.getItem(COMPANION_SERVICE_STORAGE_KEY) ?? '[]';
+  const prev = localStorage.getItem(DESKTOP_SERVICE_STORAGE_KEY) ?? '[]';
   if (next === prev) return; // no change — skip the write + dropdown churn
   if (list.length === 0) {
-    localStorage.removeItem(COMPANION_SERVICE_STORAGE_KEY);
+    localStorage.removeItem(DESKTOP_SERVICE_STORAGE_KEY);
   } else {
-    localStorage.setItem(COMPANION_SERVICE_STORAGE_KEY, next);
+    localStorage.setItem(DESKTOP_SERVICE_STORAGE_KEY, next);
   }
   // Refresh any mounted service dropdown so the change shows immediately.
   invalidateDynamicOptions();
@@ -220,9 +220,9 @@ function publish(list: CustomService[]): void {
  * Synchronous snapshot of the current companion-service list. Used by
  * the `service:list` resolver; the compilers read the same key inline.
  */
-export function listCompanionServices(): CustomService[] {
+export function listDesktopServices(): CustomService[] {
   try {
-    const raw = localStorage.getItem(COMPANION_SERVICE_STORAGE_KEY);
+    const raw = localStorage.getItem(DESKTOP_SERVICE_STORAGE_KEY);
     if (!raw) return [];
     const parsed = JSON.parse(raw);
     return Array.isArray(parsed) ? (parsed as CustomService[]) : [];
@@ -246,7 +246,7 @@ async function pollOnce(): Promise<void> {
   try {
     const controller = new AbortController();
     const t = window.setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-    const resp = await fetch(`${COMPANION_API_BASE}/api/services`, {
+    const resp = await fetch(`${DESKTOP_API_BASE}/api/services`, {
       method: 'GET',
       signal: controller.signal,
       credentials: 'omit',
@@ -258,7 +258,7 @@ async function pollOnce(): Promise<void> {
       return;
     }
     const body = (await resp.json().catch(() => null)) as {
-      services?: CompanionServiceSnapshot[];
+      services?: DesktopServiceSnapshot[];
     } | null;
     const services = body?.services ?? [];
     // Running services first so the immediately-usable ones sit at the
@@ -273,7 +273,7 @@ async function pollOnce(): Promise<void> {
       .filter((x): x is CustomService => x !== null);
     commit(mapped);
   } catch {
-    // Companion went away mid-poll, timeout, CORS — clear the list.
+    // OAIY Desktop went away mid-poll, timeout, CORS — clear the list.
     commit([]);
   }
 }
@@ -298,10 +298,10 @@ function stopPoll(): void {
  * Begin syncing companion services into the palette. Wires itself to the
  * companion detection probe — it polls `/api/services` only while the
  * companion is available, and clears the list when it's not. Safe to
- * call once at app boot (after startCompanionDetection()).
+ * call once at app boot (after startDesktopDetection()).
  */
-export function startCompanionServiceSync(): void {
-  subscribeCompanionStatus((info) => {
+export function startDesktopServiceSync(): void {
+  subscribeDesktopStatus((info) => {
     if (info.available) startPoll();
     else stopPoll();
   });

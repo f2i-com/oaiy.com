@@ -303,7 +303,7 @@ fn os_fix_path(s: String) -> String {
 /// The standard per-user install location an installer like Ollama's `OllamaSetup.exe` drops
 /// `<cmd>.exe` into: `%LOCALAPPDATA%\Programs\<cmd>\<cmd>.exe`. Probed directly because such
 /// installers add themselves only to the PERSISTED registry PATH — the already-running
-/// companion's in-process PATH (captured at launch) doesn't pick that up until a restart, so
+/// OAIY Desktop's in-process PATH (captured at launch) doesn't pick that up until a restart, so
 /// without this a just-installed ollama reads as "not installed" and refuses to start. (The
 /// Windows FS is case-insensitive, so the bare `ollama` resolves the installer's `Ollama` dir.)
 #[cfg(windows)]
@@ -1160,7 +1160,7 @@ impl Registry {
                 .find(|p| p.exists())
                 .map(|p| p.display().to_string())
                 // Resolve a just-installed system tool (e.g. ollama) to its real path so the
-                // spawn doesn't fall back to the bare name + the companion's stale PATH (which
+                // spawn doesn't fall back to the bare name + OAIY Desktop's stale PATH (which
                 // wouldn't find it until a restart) and Error out.
                 .or_else(|| user_programs_exe(&raw_cmd).map(|p| p.display().to_string()))
                 .unwrap_or(raw_cmd)
@@ -1284,9 +1284,9 @@ impl Registry {
     }
 
     /// Ensure the service listening on `port` is running, starting it if
-    /// needed. This is the companion-side mirror of the desktop's
+    /// needed. This is OAIY Desktop-side mirror of the desktop's
     /// `ensure_service_ready_by_port`: oaiy-web calls it (over HTTP) right
-    /// before hitting a `127.0.0.1:<port>` endpoint that a companion
+    /// before hitting a `127.0.0.1:<port>` endpoint that an OAIY Desktop
     /// service owns, so picking a stopped companion service in a flow and
     /// running it "just works" — no manual Start click first.
     ///

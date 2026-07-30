@@ -21,11 +21,11 @@ import { ShellSidebar, ShellTopbar, ShellIconAction, ShellDock } from './chrome/
 import { Activity, HelpCircle, PanelLeft, Settings2, Share2 } from 'lucide-react';
 import { useTheme } from '../contexts/ThemeContext';
 import {
-  COMPANION_API_BASE,
-  getCompanionInfo,
-  subscribeCompanionStatus,
-  type CompanionInfo,
-} from '../lib/companionDetection';
+  DESKTOP_API_BASE,
+  getDesktopInfo,
+  subscribeDesktopStatus,
+  type DesktopInfo,
+} from '../lib/desktopDetection';
 import { subscribeStorageQuota } from '../lib/storageQuota';
 import type { WorkflowGraph, GraphNode, Flow, LocalNetworkPermissionRequest, LocalNetworkPermissionResponse } from 'oaiy-core';
 import LocalNetworkPermissionDialog from './dialogs/LocalNetworkPermissionDialog';
@@ -44,6 +44,9 @@ type MainTab = 'builder' | 'data';
 
 // Re-export types for backward compatibility
 export type { LoadedPackage, ActivePackageFlow };
+
+/** Persisted collapse state for the flows rail. */
+const FLOWS_RAIL_KEY = 'oaiy.flowsRail';
 
 // Connected FlowsSidebar that accesses JobQueue context
 interface ConnectedFlowsSidebarProps extends Omit<React.ComponentProps<typeof FlowsSidebar>, 'isFlowRunning'> {
@@ -114,7 +117,25 @@ export default function OAIYApp() {
     unloadEmbeddedContent,
   } = usePackageNodes();
 
-  const [flowsSidebarOpen, setFlowsSidebarOpen] = useState(true);
+  // Collapsed-or-not survives a reload. A panel that silently reopens every
+  // time you come back isn't collapsible in any useful sense — you'd re-collapse
+  // it on every visit. Defaults to open so a first-time workspace shows its
+  // flows; a malformed/absent value reads as open for the same reason.
+  const [flowsSidebarOpen, setFlowsSidebarOpen] = useState(() => {
+    try {
+      return localStorage.getItem(FLOWS_RAIL_KEY) !== 'collapsed';
+    } catch {
+      // Private mode / storage disabled — not a reason to fail to render.
+      return true;
+    }
+  });
+  useEffect(() => {
+    try {
+      localStorage.setItem(FLOWS_RAIL_KEY, flowsSidebarOpen ? 'expanded' : 'collapsed');
+    } catch {
+      // Quota or a blocked store: losing the preference is survivable.
+    }
+  }, [flowsSidebarOpen]);
   const [settingsPanelOpen, setSettingsPanelOpen] = useState(false);
   // Track which Settings tab to land on. The agent panel's "Manage in
   // Settings…" affordance deep-links to 'models'; the toolbar gear
@@ -138,10 +159,10 @@ export default function OAIYApp() {
   const [activeTab, setActiveTab] = useState<MainTab>('builder');
   // Theme lives in ThemeContext; the topbar toggle just drives it.
   const { resolvedTheme, setTheme } = useTheme();
-  // Companion presence feeds the sidebar's engine card AND the dock's LED, so
+  // OAIY Desktop presence feeds the sidebar's engine card AND the dock's LED, so
   // subscribe once here rather than in each.
-  const [companion, setCompanion] = useState<CompanionInfo>(getCompanionInfo);
-  useEffect(() => subscribeCompanionStatus(setCompanion), []);
+  const [companion, setDesktop] = useState<DesktopInfo>(getDesktopInfo);
+  useEffect(() => subscribeDesktopStatus(setDesktop), []);
   const [showNewProjectDialog, setShowNewProjectDialog] = useState(false);
 
   // Package management hook
@@ -505,6 +526,13 @@ export default function OAIYApp() {
         e.preventDefault();
         setShowNewProjectDialog(true);
       }
+      // Ctrl/Cmd + B collapses/expands the flows rail — the convention every
+      // editor uses for its file sidebar, and what both collapse buttons
+      // advertise in their tooltip.
+      if ((e.ctrlKey || e.metaKey) && key === 'b') {
+        e.preventDefault();
+        setFlowsSidebarOpen((open) => !open);
+      }
     };
 
     window.addEventListener('keydown', handleKeyDown);
@@ -569,7 +597,7 @@ export default function OAIYApp() {
         companionOnline={companion.available}
         companionDetail={
           companion.available
-            ? `Companion v${companion.version ?? '?'}`
+            ? `Desktop v${companion.version ?? '?'}`
             : 'Browser-only execution'
         }
       />
@@ -711,6 +739,7 @@ export default function OAIYApp() {
               hasMacroBeenModified={hasMacroBeenModified}
               isOpen={flowsSidebarOpen}
               onClose={() => setFlowsSidebarOpen(false)}
+              onOpen={() => setFlowsSidebarOpen(true)}
               loadedPackages={loadedPackages}
               activePackageFlow={activePackageFlow}
               onSelectPackageFlow={handleSelectPackageFlow}
@@ -854,9 +883,9 @@ export default function OAIYApp() {
         <ShellDock
           companionOnline={companion.available}
           endpointLabel={companion.available ? 'Local engine ready' : 'Local engine idle'}
-          endpointUrl={backend.share ? backend.share.editUrl : COMPANION_API_BASE}
+          endpointUrl={backend.share ? backend.share.editUrl : DESKTOP_API_BASE}
           onCopyEndpoint={() => {
-            const url = backend.share ? backend.share.editUrl : COMPANION_API_BASE;
+            const url = backend.share ? backend.share.editUrl : DESKTOP_API_BASE;
             void navigator.clipboard
               ?.writeText(url)
               .then(() => addToast('Endpoint URL copied.', 'success'))
