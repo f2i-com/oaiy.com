@@ -119,9 +119,16 @@ export function ToastProvider({ children }: { children: ReactNode }) {
   return (
     <ToastContext.Provider value={value}>
       {children}
-      <div className="toast-stack" role="region" aria-live="polite">
+      {/* Named so the region is identifiable in a landmark list. Errors carry
+          role="alert" so they're announced immediately rather than queuing behind
+          routine success chatter. */}
+      <div className="toast-stack" role="region" aria-label="Notifications" aria-live="polite">
         {toasts.map((t) => (
-          <div key={t.id} className={`toast toast-${t.kind}`}>
+          <div
+            key={t.id}
+            className={`toast toast-${t.kind}`}
+            role={t.kind === 'error' ? 'alert' : undefined}
+          >
             <div className="toast-content">
               <div className="toast-title">{t.title}</div>
               {t.body && <div className="toast-body">{t.body}</div>}

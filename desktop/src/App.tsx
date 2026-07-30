@@ -376,8 +376,10 @@ export default function App() {
             <button
               type="button"
               className="icon-button"
-              aria-label="Copy the local API URL"
-              title="Copy endpoint"
+              /* The confirmation is otherwise only an icon swap — name the button
+                 for its current state so a screen reader hears the copy landed. */
+              aria-label={copied ? 'Local API URL copied' : 'Copy the local API URL'}
+              title={copied ? 'Copied' : 'Copy endpoint'}
               onClick={() => void copyEndpoint()}
             >
               {copied ? <Check size={14} /> : <Copy size={14} />}
