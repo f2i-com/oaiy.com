@@ -35,10 +35,12 @@
 //! installed, and the user's next move — reinstalling — does not help.
 
 pub mod manifest;
+pub mod process;
 pub mod registry;
 pub mod rpc;
 pub mod runner;
 
+pub use process::{CallError, PluginProcess, SpawnOptions};
 pub use manifest::{ManifestError, PluginManifest, HOST_CAPABILITIES};
 pub use registry::{
     GateRefusal, PluginRecord, PluginRegistry, PluginRegistryHandle, PluginState, ScanReport,
