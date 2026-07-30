@@ -4,6 +4,7 @@
 // plugin loading) runs here. The full builder lives at /app.html.
 import { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
+import '../styles/fonts';
 import '../index.css';
 import { ThemeProvider } from '../contexts/ThemeContext';
 import LandingPage from './LandingPage';
