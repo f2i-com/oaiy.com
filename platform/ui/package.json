@@ -1,0 +1,44 @@
+{
+  "name": "oaiy-web",
+  "private": true,
+  "version": "0.0.1",
+  "type": "module",
+  "description": "Browser-based OAIY flow builder — local-AI-only, no bundled services.",
+  "license": "Apache-2.0",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "dependencies": {
+    "@ffmpeg/ffmpeg": "^0.12.15",
+    "@ffmpeg/util": "^0.12.2",
+    "@monaco-editor/react": "^4.7.0",
+    "@sqlite.org/sqlite-wasm": "3.53.0-build1",
+    "@xyflow/react": "^12.9.3",
+    "acorn": "^8.16.0",
+    "cheerio": "^1.0.0",
+    "dagre": "^0.8.5",
+    "esbuild-wasm": "^0.24.0",
+    "lucide-react": "^0.468.0",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "uuid": "^13.0.0"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4.1.17",
+    "@types/dagre": "^0.7.53",
+    "@types/node": "^24.10.1",
+    "@types/react": "^19.2.5",
+    "@types/react-dom": "^19.2.3",
+    "@types/uuid": "^10.0.0",
+    "@vitejs/plugin-react": "^5.1.1",
+    "autoprefixer": "^10.4.22",
+    "playwright": "^1.60.0",
+    "postcss": "^8.5.6",
+    "tailwindcss": "^4.1.17",
+    "typescript": "^5.8.3",
+    "vite": "^7.2.4"
+  }
+}

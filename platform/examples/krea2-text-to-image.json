@@ -1,0 +1,44 @@
+{
+  "_comment": "Krea-2 Turbo text-to-image. Needs the 'krea2' service installed + running (default port 17910). Web app: open via Flows sidebar → 'Load from File' (adds it as a new flow). CLI: oaiy run examples/krea2-text-to-image.json",
+  "name": "Krea-2 Turbo text-to-image",
+  "flows": [
+    {
+      "id": "krea2-text-to-image",
+      "name": "Krea-2 Turbo text-to-image",
+      "description": "Renders an image from a prompt with Krea-2 Turbo. Requires the 'krea2' service (port 17910) running.",
+      "graph": {
+        "nodes": [
+          {
+            "id": "prompt",
+            "type": "template",
+            "position": { "x": 0, "y": 60 },
+            "data": { "template": "a cozy log cabin in a snowy forest at dusk, warm glowing windows, wood smoke, photorealistic, highly detailed" }
+          },
+          {
+            "id": "image",
+            "type": "service_call",
+            "position": { "x": 360, "y": 60 },
+            "data": {
+              "service": "companion:krea2",
+              "endpoint": "http://127.0.0.1:17910/generate",
+              "method": "POST",
+              "bodyTemplate": "{\"prompt\": {{input}}, \"width\": 1024, \"height\": 1024, \"steps\": 8}",
+              "responseType": "json",
+              "responsePath": "imageUrl"
+            }
+          },
+          {
+            "id": "out",
+            "type": "output",
+            "position": { "x": 720, "y": 60 },
+            "data": { "label": "image", "outputType": "text" }
+          }
+        ],
+        "edges": [
+          { "id": "e-prompt-image", "source": "prompt", "target": "image", "sourceHandle": "result", "targetHandle": "input" },
+          { "id": "e-image-out", "source": "image", "target": "out", "sourceHandle": "response", "targetHandle": "result" }
+        ]
+      }
+    }
+  ]
+}

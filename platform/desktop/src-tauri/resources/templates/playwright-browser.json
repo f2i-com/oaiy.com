@@ -1,0 +1,32 @@
+{
+  "id": "playwright-browser",
+  "name": "Playwright Browser",
+  "description": "Headless Chromium automation backend for the browser_* nodes (goto, extract, click, screenshot). Installs Playwright into a Python venv; reuses the companion's Python runtime.",
+  "category": "Browser",
+  "defaultPort": 17880,
+  "install": {
+    "kind": "script",
+    "windows": "install-playwright.ps1",
+    "unix": "install-playwright.sh"
+  },
+  "run": {
+    "command": "${dataDir}/venvs/playwright/Scripts/python.exe",
+    "args": [
+      "${dataDir}/scripts/playwright_server.py"
+    ],
+    "env": {
+      "OAIY_BROWSER_PORT": "${port}"
+    }
+  },
+  "health": {
+    "url": "http://127.0.0.1:${port}/health",
+    "timeoutSecs": 60
+  },
+  "uninstall": {
+    "paths": [
+      "${dataDir}/venvs/playwright"
+    ]
+  },
+  "installedMarker": "${dataDir}/venvs/playwright/.oaiy-installed",
+  "docsUrl": "https://playwright.dev"
+}

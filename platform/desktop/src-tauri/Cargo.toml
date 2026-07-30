@@ -1,0 +1,93 @@
+[package]
+name = "oaiy-companion"
+version = "0.1.0"
+description = "Tray-resident desktop companion for oaiy-web. Manages local AI services + browser automation, exposes them to the web flow editor via a localhost API."
+authors = ["OAIY"]
+license = "Apache-2.0"
+edition = "2021"
+rust-version = "1.77"
+# The crate ships two binaries now (the GUI companion + the headless oaiy-server),
+# so `cargo run` / `tauri dev` would be ambiguous without naming the default.
+default-run = "oaiy-companion"
+
+[lib]
+name = "oaiy_companion_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+# The crate builds two binaries from one shared lib:
+#   oaiy-companion — the Tauri GUI (needs the `gui` feature → tauri/webkit2gtk)
+#   oaiy-server    — headless HTTP API (no GUI deps when built --no-default-features)
+[features]
+default = ["gui"]
+gui = [
+    "dep:tauri",
+    "dep:tauri-plugin-shell",
+    "dep:tauri-plugin-dialog",
+    "dep:tauri-plugin-notification",
+    "dep:tauri-build",
+]
+
+[[bin]]
+name = "oaiy-companion"
+path = "src/main.rs"
+required-features = ["gui"]
+
+[[bin]]
+name = "oaiy-server"
+path = "src/bin/oaiy-server.rs"
+
+[build-dependencies]
+tauri-build = { version = "2.0", features = [], optional = true }
+
+[dependencies]
+# Tauri 2.x with tray-icon support — GUI only, so optional behind `gui`.
+tauri = { version = "2.1", features = ["tray-icon"], optional = true }
+tauri-plugin-shell = { version = "2.0", optional = true }
+# Native folder picker for "choose where models/services live".
+tauri-plugin-dialog = { version = "2.0", optional = true }
+# Native OS notifications so a download/install finishing reaches the user
+# even when the companion window is hidden to the tray.
+tauri-plugin-notification = { version = "2.0", optional = true }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Async runtime + HTTP server. axum is the small, focused choice — we
+# don't need the heavier alternatives. tower-http gives us the CORS
+# layer that lets a hosted oaiy-web at any origin reach the companion.
+tokio = { version = "1.40", features = ["full"] }
+axum = "0.7"
+tower-http = { version = "0.6", features = ["cors"] }
+
+# Logging through Tauri's standard mechanism so logs flow into the
+# companion's own console + (later) the LogsViewer UI.
+log = "0.4"
+
+# Timestamps on log lines + ServiceRuntime.last_status_change so the UI
+# can show "started 3m ago" without round-tripping system time across
+# the JSON boundary as strings.
+chrono = { version = "0.4", features = ["serde"] }
+
+# HTTP client for model downloads. rustls (not native-tls) keeps the
+# Windows build self-contained — no schannel ABI surprises and no
+# OpenSSL on Linux. `stream` is needed for incremental progress so the
+# UI can show "1.2 GB / 4.7 GB · 38 MB/s" instead of a frozen bar.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "blocking"] }
+futures-util = "0.3"
+
+# Native python-build-standalone install: gunzip + untar the PBS release
+# in-process, so installing Python needs no PowerShell / tar.exe / .ps1.
+flate2 = "1"
+tar = "0.4"
+
+# UUIDs for download / install job IDs. v4 only — no need for the
+# timestamp/MAC variants.
+uuid = { version = "1", features = ["v4"] }
+
+# URL parsing for the HuggingFace `huggingface.co/<repo>/blob/...`
+# → `/resolve/...` rewrite so users can paste either flavour.
+url = "2"
+
+# Cross-platform free-disk-space query, for the pre-download space check
+# (refuse a 40 GB model before filling the drive) + the "X free" readout
+# in the Models tab.
+fs2 = "0.4"

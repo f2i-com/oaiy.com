@@ -1,0 +1,77 @@
+{
+  "id": "core-video",
+  "name": "Core Video",
+  "version": "1.0.0",
+  "description": "Video processing and frame extraction using FFmpeg",
+  "author": "OAIY Team",
+  "category": "Video",
+  "icon": "video",
+  "color": "orange",
+  "nodes": [
+    "video_frame_extractor",
+    "video_gen",
+    "video_save",
+    "extend_videos",
+    "video_append",
+    "audio_mixer",
+    "video_avatar",
+    "video_pip",
+    "video_captions",
+    "video_downloader"
+  ],
+  "permissions": [
+    "filesystem",
+    "shell"
+  ],
+  "runtime": {
+    "typescript": "runtime.ts",
+    "compiler": "compiler.ts",
+    "native": {
+      "plugin": "oaiy-video",
+      "source": "native/src/lib.rs",
+      "cargo": "native/Cargo.toml"
+    }
+  },
+  "ui": {
+    "nodes": [
+      {
+        "nodeType": "video_frame_extractor",
+        "componentName": "VideoFrameExtractorNode"
+      },
+      {
+        "nodeType": "video_gen",
+        "componentName": "VideoGenNode"
+      },
+      {
+        "nodeType": "video_save",
+        "componentName": "VideoSaveNode"
+      },
+      {
+        "nodeType": "video_append",
+        "componentName": "VideoAppendNode"
+      },
+      {
+        "nodeType": "audio_mixer",
+        "componentName": "AudioMixerNode"
+      },
+      {
+        "nodeType": "video_avatar",
+        "componentName": "VideoAvatarNode"
+      },
+      {
+        "nodeType": "video_pip",
+        "componentName": "VideoPipNode"
+      },
+      {
+        "nodeType": "video_downloader",
+        "componentName": "VideoDownloaderNode"
+      }
+    ]
+  },
+  "binaries": {
+    "ffmpeg": {
+      "download": "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-{platform}-gpl.zip",
+      "version": "latest"
+    }
+  }
+}

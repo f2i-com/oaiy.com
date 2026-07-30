@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en" class="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <!-- Safe baseline CSP: blocks plugin (<object>/<embed>) + <base href> injection,
+         zero risk. Full script-src lockdown needs the inline theme script externalized
+         + live testing (engine needs 'unsafe-eval'; flows hit arbitrary endpoints). -->
+    <meta http-equiv="Content-Security-Policy" content="object-src 'none'; base-uri 'self'" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <meta name="theme-color" content="#7167ff" />
+    <meta name="theme-color" media="(prefers-color-scheme: light)" content="#f3f0e9" />
+    <meta name="theme-color" media="(prefers-color-scheme: dark)" content="#070a12" />
+
+    <title>OAIY Companion — the desktop app</title>
+    <meta
+      name="description"
+      content="The OAIY Companion is an optional desktop app that manages your local AI: model servers, Hugging Face downloads, portable Python, and a browser sidecar — exposed to the web app over localhost. Plus the service .json format and a downloadable library of example services."
+    />
+    <link rel="canonical" href="https://oaiy.com/desktop.html" />
+
+    <!-- Open Graph / social -->
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="OAIY" />
+    <meta property="og:title" content="OAIY Companion — the desktop app" />
+    <meta
+      property="og:description"
+      content="The optional desktop companion that manages your local models, services and Python — and a downloadable library of example service .json files for the web app."
+    />
+    <meta property="og:image" content="/apple-touch-icon.png" />
+    <meta name="twitter:card" content="summary" />
+    <meta name="twitter:title" content="OAIY Companion — the desktop app" />
+    <meta
+      name="twitter:description"
+      content="Manages your local models, services and Python over localhost. Includes the service .json format and a downloadable library of examples."
+    />
+
+    <!-- Pre-paint theme so the page never flashes the wrong colours. -->
+    <script>
+      (function () {
+        try {
+          var t = localStorage.getItem('oaiy_theme');
+          var resolved =
+            t === 'dark' ? 'dark'
+            : t === 'light' ? 'light'
+            : t === 'system'
+              ? (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark')
+              : 'dark';
+          var r = document.documentElement;
+          r.classList.remove('light', 'dark');
+          r.classList.add(resolved);
+          r.style.colorScheme = resolved;
+        } catch (e) { /* localStorage blocked — fall back to the class on <html> */ }
+      })();
+    </script>
+
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300..800&family=JetBrains+Mono:wght@400..600&display=swap" rel="stylesheet" />
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/landing/desktop-main.tsx"></script>
+  </body>
+</html>

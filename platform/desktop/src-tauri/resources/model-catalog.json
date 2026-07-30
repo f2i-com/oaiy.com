@@ -1,0 +1,82 @@
+{
+  "_comment": "Curated quick-add list shown in the Models tab. Every URL here is verified downloadable (ranged-GET 206) and sizeBytes is the exact Content-Range total as of 2026-05-29. Users can paste any URL too; this just gets popular weights one click closer. Seeded to APPDATA on first run, then user-editable.",
+  "categories": [
+    {
+      "id": "llm",
+      "name": "LLM (GGUF)",
+      "description": "Local chat / completion models for llama.cpp + Ollama. Q4_K_M is the sweet spot for quality-vs-size; pick by how much VRAM you have.",
+      "models": [
+        {
+          "id": "qwen3-0.6b-q8",
+          "name": "Qwen3 0.6B (Q8_0)",
+          "description": "Tiny + fast. Great as a spec-decode draft model or for low-VRAM machines.",
+          "url": "https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q8_0.gguf",
+          "filename": "Qwen3-0.6B-Q8_0.gguf",
+          "subdir": "llm",
+          "sizeBytes": 639446688
+        },
+        {
+          "id": "gemma-3-4b-q4_k_m",
+          "name": "Gemma 3 4B IT (Q4_K_M)",
+          "description": "Google's small multimodal-capable chat model. Fits comfortably in 6 GB VRAM.",
+          "url": "https://huggingface.co/bartowski/google_gemma-3-4b-it-GGUF/resolve/main/google_gemma-3-4b-it-Q4_K_M.gguf",
+          "filename": "google_gemma-3-4b-it-Q4_K_M.gguf",
+          "subdir": "llm",
+          "sizeBytes": 2489758112
+        },
+        {
+          "id": "qwen3-4b-q4_k_m",
+          "name": "Qwen3 4B (Q4_K_M)",
+          "description": "Strong small general model with a thinking mode. ~2.3 GB.",
+          "url": "https://huggingface.co/Qwen/Qwen3-4B-GGUF/resolve/main/Qwen3-4B-Q4_K_M.gguf",
+          "filename": "Qwen3-4B-Q4_K_M.gguf",
+          "subdir": "llm",
+          "sizeBytes": 2497280256
+        },
+        {
+          "id": "qwen2.5-coder-7b-q4_k_m",
+          "name": "Qwen2.5-Coder 7B (Q4_K_M)",
+          "description": "Best-in-class open coding model at this size. ~4.4 GB, fits in 8 GB VRAM.",
+          "url": "https://huggingface.co/bartowski/Qwen2.5-Coder-7B-Instruct-GGUF/resolve/main/Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf",
+          "filename": "Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf",
+          "subdir": "llm",
+          "sizeBytes": 4683074336
+        },
+        {
+          "id": "llama-3.1-8b-q4_k_m",
+          "name": "Llama 3.1 8B Instruct (Q4_K_M)",
+          "description": "Meta's tuned 8B chat model — a reliable general-purpose default. ~4.6 GB.",
+          "url": "https://huggingface.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF/resolve/main/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
+          "filename": "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
+          "subdir": "llm",
+          "sizeBytes": 4920739232
+        },
+        {
+          "id": "gemma-3-12b-q4_k_m",
+          "name": "Gemma 3 12B IT (Q4_K_M)",
+          "description": "Larger Gemma 3 for stronger reasoning. ~6.8 GB — wants 12 GB+ VRAM.",
+          "url": "https://huggingface.co/bartowski/google_gemma-3-12b-it-GGUF/resolve/main/google_gemma-3-12b-it-Q4_K_M.gguf",
+          "filename": "google_gemma-3-12b-it-Q4_K_M.gguf",
+          "subdir": "llm",
+          "sizeBytes": 7300575264
+        }
+      ]
+    },
+    {
+      "id": "embed",
+      "name": "Embeddings",
+      "description": "Text embedding models for RAG / semantic search.",
+      "models": [
+        {
+          "id": "nomic-embed-text-v1.5",
+          "name": "Nomic Embed Text v1.5 (F16)",
+          "description": "Open 768-d embedding model with long context. ~0.26 GB.",
+          "url": "https://huggingface.co/nomic-ai/nomic-embed-text-v1.5-GGUF/resolve/main/nomic-embed-text-v1.5.f16.gguf",
+          "filename": "nomic-embed-text-v1.5.f16.gguf",
+          "subdir": "embed",
+          "sizeBytes": 274290560
+        }
+      ]
+    }
+  ]
+}

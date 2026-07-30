@@ -1,0 +1,51 @@
+{
+    "id": "macro_output",
+    "name": "Macro Output",
+    "description": "Defines an output port for a macro. Place this node in a workflow to expose it as an output when the workflow is used as a macro.",
+    "doc": "Define an output value for a macro workflow.\n\nUsage:\n1. Add to a macro workflow\n2. Set the output name and type\n3. Connect the result you want to expose\n4. The output appears as a handle on the Macro node\n\nProperties:\n• Name - label shown on the macro node\n• Type - declares the output data type\n\nMultiple Outputs:\nAdd multiple Macro Output nodes to expose several results from a single macro.",
+    "icon": "arrow-left-circle",
+    "color": "violet",
+    "tags": ["macro", "output", "port", "result"],
+    "inputs": [
+        {
+            "id": "value",
+            "name": "Value",
+            "type": "any",
+            "position": "left",
+            "description": "The value to output from this macro port"
+        }
+    ],
+    "outputs": [],
+    "properties": [
+        {
+            "id": "name",
+            "name": "Output Name",
+            "type": "string",
+            "default": "output",
+            "description": "Name of this output (shown on macro node handle)"
+        },
+        {
+            "id": "outputType",
+            "name": "Type",
+            "type": "select",
+            "default": "any",
+            "options": [
+                { "value": "any", "label": "Any" },
+                { "value": "text", "label": "Text" },
+                { "value": "number", "label": "Number" },
+                { "value": "image", "label": "Image" },
+                { "value": "video", "label": "Video" },
+                { "value": "audio", "label": "Audio" },
+                { "value": "file", "label": "File" }
+            ],
+            "description": "Type of output data"
+        }
+    ],
+    "compiler": {
+        "customHandler": true,
+        "statusTracking": true
+    },
+    "ui": {
+        "width": 200
+    }
+}

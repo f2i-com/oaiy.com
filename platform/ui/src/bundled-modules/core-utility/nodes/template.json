@@ -1,0 +1,78 @@
+{
+  "id": "template",
+  "name": "Template",
+  "description": "Combine inputs using a template with {{placeholders}}.",
+  "doc": "Combine multiple inputs into formatted text.\n\nPlaceholders:\n• {{input}} - first input\n• {{input2}} - second input\n• {{input3}} - third input\n• {{input4}} - fourth input\n• {{input5}} - fifth input\n\nExample:\nInputs: name=\"Alice\", age=30\nTemplate: \"Hello {{input}}, you are {{input2}} years old.\"\nResult: \"Hello Alice, you are 30 years old.\"\n\nUse Cases:\n• Build AI prompts with dynamic content\n• Format output messages\n• Combine multiple data sources",
+  "icon": "file-text",
+  "color": "amber",
+  "tags": ["template", "format", "combine", "merge"],
+  "flowplan": {
+    "stepTypes": ["template", "log"],
+    "fieldMapping": {
+      "template": "template",
+      "message": "template"
+    },
+    "defaults": {
+      "template": "{{input}}"
+    },
+    "templateFields": ["template", "message", "inputs"]
+  },
+  "inputs": [
+    {
+      "id": "input",
+      "name": "Input",
+      "type": "any",
+      "position": "left"
+    },
+    {
+      "id": "input2",
+      "name": "Input 2",
+      "type": "any",
+      "position": "left"
+    },
+    {
+      "id": "input3",
+      "name": "Input 3",
+      "type": "any",
+      "position": "left"
+    },
+    {
+      "id": "input4",
+      "name": "Input 4",
+      "type": "any",
+      "position": "left"
+    },
+    {
+      "id": "input5",
+      "name": "Input 5",
+      "type": "any",
+      "position": "left"
+    }
+  ],
+  "outputs": [
+    {
+      "id": "result",
+      "name": "Result",
+      "type": "string",
+      "position": "right"
+    }
+  ],
+  "properties": [
+    {
+      "id": "template",
+      "name": "Template",
+      "type": "textarea",
+      "default": "{{input}}",
+      "description": "Use {{input}}, {{input2}}, {{input3}}, {{input4}}, {{input5}} as placeholders",
+      "rows": 4
+    }
+  ],
+  "compiler": {
+    "template": "\"{{prop.template.raw}}\"",
+    "customHandler": "template"
+  },
+  "ui": {
+    "width": 300,
+    "resizable": true
+  }
+}

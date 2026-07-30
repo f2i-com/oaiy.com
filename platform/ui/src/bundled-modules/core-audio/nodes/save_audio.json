@@ -1,0 +1,79 @@
+{
+    "id": "save_audio",
+    "name": "Save Audio",
+    "description": "Save audio data to a file.",
+    "doc": "Export audio to a file on disk.\n\nFeatures:\n• Choose output format (WAV or MP3)\n• Custom filename and directory\n• Optional overwrite protection\n\nUsage:\n• Connect audio from TTS, Music Gen, or other audio nodes\n• Specify filename (extension added automatically)\n• Leave directory empty to use default output folder",
+    "icon": "save",
+    "color": "emerald",
+    "tags": [
+        "audio",
+        "save",
+        "file",
+        "export"
+    ],
+    "inputs": [
+        {
+            "id": "audio",
+            "name": "Audio",
+            "type": "audio",
+            "position": "left",
+            "description": "Audio file path to save"
+        }
+    ],
+    "outputs": [
+        {
+            "id": "path",
+            "name": "Path",
+            "type": "string",
+            "position": "right",
+            "description": "Path to saved audio file"
+        }
+    ],
+    "properties": [
+        {
+            "id": "filename",
+            "name": "Filename",
+            "type": "string",
+            "default": "audio_output",
+            "description": "Output filename (without extension)"
+        },
+        {
+            "id": "directory",
+            "name": "Directory",
+            "type": "string",
+            "default": "",
+            "description": "Output directory (leave empty for default output folder)"
+        },
+        {
+            "id": "format",
+            "name": "Format",
+            "type": "select",
+            "default": "wav",
+            "options": [
+                {
+                    "value": "wav",
+                    "label": "WAV"
+                },
+                {
+                    "value": "mp3",
+                    "label": "MP3"
+                }
+            ]
+        },
+        {
+            "id": "overwrite",
+            "name": "Overwrite",
+            "type": "boolean",
+            "default": false,
+            "description": "Overwrite existing file if it exists"
+        }
+    ],
+    "compiler": {
+        "template": "{{await}}Audio.saveAudio({{input.audio}}, {{prop.filename}}, {{prop.directory}}, {{prop.format.raw}}, {{prop.overwrite}}, \"{{nodeId}}\")",
+        "async": true,
+        "statusTracking": true
+    },
+    "ui": {
+        "width": 260
+    }
+}

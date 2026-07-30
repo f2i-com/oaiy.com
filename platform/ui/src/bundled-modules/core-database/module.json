@@ -1,0 +1,27 @@
+{
+  "id": "core-database",
+  "name": "Core Database",
+  "version": "1.0.0",
+  "description": "Data storage and retrieval",
+  "author": "OAIY Team",
+  "category": "Database",
+  "icon": "database",
+  "color": "emerald",
+  "nodes": ["database", "database_query"],
+  "permissions": ["filesystem"],
+  "runtime": {
+    "typescript": "runtime.ts",
+    "compiler": "compiler.ts",
+    "native": {
+      "plugin": "oaiy-database",
+      "source": "native/src/lib.rs",
+      "cargo": "native/Cargo.toml"
+    }
+  },
+  "ui": {
+    "nodes": [
+      { "nodeType": "database", "componentName": "DatabaseNode" },
+      { "nodeType": "database_query", "componentName": "DatabaseQueryNode" }
+    ]
+  }
+}

@@ -1,0 +1,90 @@
+{
+    "id": "audio_fade",
+    "name": "Audio Fade",
+    "description": "Apply audio fade-in or fade-out effect to a video file.",
+    "doc": "Apply audio fade effects to video files using FFmpeg.\n\nFade Types:\n- Exponential: Natural-sounding fade that matches human perception\n- Linear: Constant rate volume change\n\nFade Directions:\n- Fade Out: Gradually reduce volume at the end\n- Fade In: Gradually increase volume at the start\n\nUse Cases:\n- Smooth endings for music videos\n- Professional audio transitions\n- Avoiding abrupt audio cuts",
+    "icon": "volume-2",
+    "color": "pink",
+    "tags": [
+        "audio",
+        "video",
+        "fade",
+        "effect",
+        "transition"
+    ],
+    "inputs": [
+        {
+            "id": "video",
+            "name": "Video",
+            "type": "video",
+            "position": "left",
+            "description": "Input video with audio to fade"
+        }
+    ],
+    "outputs": [
+        {
+            "id": "video",
+            "name": "Video",
+            "type": "video",
+            "position": "right",
+            "description": "Video with faded audio"
+        },
+        {
+            "id": "path",
+            "name": "Path",
+            "type": "string",
+            "position": "right",
+            "description": "File path to output video"
+        }
+    ],
+    "properties": [
+        {
+            "id": "fadeDirection",
+            "name": "Fade Direction",
+            "type": "select",
+            "default": "out",
+            "options": [
+                { "value": "out", "label": "Fade Out (End)" },
+                { "value": "in", "label": "Fade In (Start)" }
+            ],
+            "description": "Where to apply the fade effect"
+        },
+        {
+            "id": "fadeType",
+            "name": "Fade Curve",
+            "type": "select",
+            "default": "exponential",
+            "options": [
+                { "value": "exponential", "label": "Exponential" },
+                { "value": "linear", "label": "Linear" }
+            ],
+            "description": "Shape of the fade curve"
+        },
+        {
+            "id": "fadeDuration",
+            "name": "Fade Duration (seconds)",
+            "type": "number",
+            "default": 10,
+            "min": 1,
+            "max": 60,
+            "step": 1,
+            "description": "How long the fade effect lasts"
+        },
+        {
+            "id": "filename",
+            "name": "Filename",
+            "type": "string",
+            "default": "audio_faded",
+            "description": "Base filename for output"
+        }
+    ],
+    "compiler": {
+        "customHandler": true,
+        "async": true,
+        "statusTracking": true
+    },
+    "ui": {
+        "width": 280,
+        "customComponent": "AudioFadeNode"
+    }
+}

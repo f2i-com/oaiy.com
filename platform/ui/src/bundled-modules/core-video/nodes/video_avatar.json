@@ -1,0 +1,108 @@
+{
+    "id": "video_avatar",
+    "name": "Video Avatar",
+    "description": "Generate lip-synced talking head video from an image and audio using Ditto.",
+    "doc": "Create talking head videos with lip sync.\n\nInputs:\n• Image - face/portrait photo\n• Audio - speech audio to lip sync\n\nHow it Works:\nUses Ditto AI to animate the face in the image to match the audio, creating realistic lip movements.\n\nSettings:\n• Guidance Scale - how closely to follow the prompt\n• Inference Steps - quality vs speed tradeoff\n\nRequires: Ditto API service (default: localhost:8768)",
+    "icon": "video",
+    "color": "purple",
+    "tags": [
+        "video",
+        "avatar",
+        "talking head",
+        "lip sync",
+        "ditto",
+        "ai"
+    ],
+    "flowplan": {
+        "stepTypes": [
+            "video_avatar"
+        ],
+        "fieldMapping": {
+            "image": "image",
+            "audio": "audio"
+        },
+        "literalInputFields": [],
+        "templateFields": [
+            "prompt"
+        ],
+        "inputHandleMapping": {
+            "image": "image",
+            "audio": "audio"
+        }
+    },
+    "inputs": [
+        {
+            "id": "image",
+            "name": "Image",
+            "type": "image",
+            "position": "left",
+            "required": true,
+            "description": "Reference face image"
+        },
+        {
+            "id": "audio",
+            "name": "Audio",
+            "type": "audio",
+            "position": "left",
+            "required": true,
+            "description": "Audio to lip-sync to"
+        }
+    ],
+    "outputs": [
+        {
+            "id": "video",
+            "name": "Video",
+            "type": "video",
+            "position": "right",
+            "description": "Generated talking head video"
+        }
+    ],
+    "properties": [
+        {
+            "id": "apiUrl",
+            "name": "API URL",
+            "type": "string",
+            "default": "http://127.0.0.1:8768/generate",
+            "placeholder": "http://127.0.0.1:8768/generate",
+            "description": "Video Avatar service endpoint"
+        },
+        {
+            "id": "prompt",
+            "name": "Prompt",
+            "type": "string",
+            "default": "",
+            "placeholder": "A person talking naturally",
+            "description": "Optional prompt to guide generation"
+        },
+        {
+            "id": "guidanceScale",
+            "name": "Guidance Scale",
+            "type": "number",
+            "default": 5.0,
+            "min": 1,
+            "max": 15,
+            "step": 0.5,
+            "description": "How closely to follow the prompt"
+        },
+        {
+            "id": "numInferenceSteps",
+            "name": "Inference Steps",
+            "type": "number",
+            "default": 30,
+            "min": 10,
+            "max": 100,
+            "step": 5,
+            "description": "Number of diffusion steps"
+        }
+    ],
+    "compiler": {
+        "customHandler": true,
+        "async": true,
+        "abortable": true,
+        "statusTracking": true
+    },
+    "ui": {
+        "width": 320,
+        "resizable": false
+    }
+}

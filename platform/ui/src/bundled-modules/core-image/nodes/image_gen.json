@@ -1,0 +1,255 @@
+{
+  "id": "image_gen",
+  "name": "Image Gen",
+  "description": "Generate images using ComfyUI or other local image APIs.",
+  "doc": "Generate AI images from text prompts.\n\nSupported APIs:\n• ComfyUI (Stable Diffusion, FLUX, etc.)\n• Any OpenAI-compatible image API (set the endpoint per node)\n\nFeatures:\n• Custom dimensions (width/height)\n• Negative prompts to avoid unwanted elements\n• Image-to-image with input images\n• Input image size limits for API compatibility\n\nTip: Set default API settings in Project Settings to avoid configuring each node.",
+  "icon": "image",
+  "color": "pink",
+  "tags": ["image", "generate", "ai", "comfyui", "stable-diffusion"],
+  "flowplan": {
+    "stepTypes": ["ai_image", "image_gen"],
+    "fieldMapping": {
+      "prompt": "prompt",
+      "image": "image"
+    },
+    "literalInputFields": ["prompt"],
+    "templateFields": ["prompt", "image"],
+    "inputHandleMapping": {
+      "prompt": "prompt"
+    },
+    "compilerOptionsMapping": {
+      "imageModel": "model",
+      "imageEndpoint": "endpoint",
+      "imageApiKeyConstant": "apiKeyConstant",
+      "imageApiFormat": "apiFormat"
+    }
+  },
+  "inputs": [
+    {
+      "id": "prompt",
+      "name": "Prompt",
+      "type": "string",
+      "position": "left",
+      "required": true,
+      "description": "Image generation prompt"
+    }
+  ],
+  "outputs": [
+    {
+      "id": "image",
+      "name": "Image",
+      "type": "image",
+      "position": "right",
+      "description": "Generated image (base64)"
+    }
+  ],
+  "properties": [
+    {
+      "id": "service",
+      "name": "Service Preset",
+      "type": "select",
+      "default": "",
+      "dynamicOptionsSource": "service:list:image_gen",
+      "description": "Pick a registered image-gen service (manage in Settings → Services) to auto-fill endpoint + model. Fields below still override the preset. Leave blank to use the inline endpoint / API Format below."
+    },
+    {
+      "id": "endpoint",
+      "name": "API Endpoint",
+      "type": "string",
+      "default": "",
+      "placeholder": "Use default from settings",
+      "description": "Image generation API endpoint",
+      "showIf": { "property": "service", "equals": "" }
+    },
+    {
+      "id": "model",
+      "name": "Model",
+      "type": "string",
+      "default": "",
+      "placeholder": "Use default from settings",
+      "description": "Model name for image generation",
+      "showIf": { "property": "service", "equals": "" }
+    },
+    {
+      "id": "apiKeyConstant",
+      "name": "API Key Constant",
+      "type": "string",
+      "default": "",
+      "placeholder": "Use default from settings",
+      "description": "Name of the constant containing API key",
+      "showIf": { "property": "service", "equals": "" }
+    },
+    {
+      "id": "apiFormat",
+      "name": "API Format",
+      "type": "select",
+      "default": "",
+      "options": [
+        { "value": "comfyui", "label": "ComfyUI" },
+        { "value": "openai", "label": "External (OpenAI-compatible)" }
+      ],
+      "description": "Image backend. 'ComfyUI' for local workflows, or 'External (OpenAI-compatible)' for any generic HTTP image API — set the Endpoint + API Key below. The tool-specific Wan2GP and Gemini formats were removed; re-add { \"value\": \"wan2gp\" } / { \"value\": \"gemini\" } here if you need them.",
+      "showIf": { "property": "service", "equals": "" }
+    },
+    {
+      "id": "wan2gpModel",
+      "name": "Wan2GP Model",
+      "type": "select",
+      "default": "",
+      "options": [
+        { "value": "qwen", "label": "Qwen Image Edit Plus (20B)" },
+        { "value": "flux2_klein_4b", "label": "Flux 2 Klein (4B)" },
+        { "value": "flux2_klein_9b", "label": "Flux 2 Klein (9B)" },
+        { "value": "z_image", "label": "Z-Image Turbo (6B)" }
+      ],
+      "description": "Model for Wan2GP image generation",
+      "showWhen": { "apiFormat": ["wan2gp"] }
+    },
+    {
+      "id": "wan2gpVram",
+      "name": "VRAM",
+      "type": "select",
+      "default": "auto",
+      "options": [
+        { "value": "auto", "label": "Auto" },
+        { "value": "6", "label": "6 GB (Low)" },
+        { "value": "8", "label": "8 GB" },
+        { "value": "10", "label": "10 GB" },
+        { "value": "12", "label": "12 GB" },
+        { "value": "16", "label": "16 GB" },
+        { "value": "24", "label": "24 GB+" }
+      ],
+      "description": "VRAM budget for generation",
+      "showWhen": { "apiFormat": ["wan2gp"] }
+    },
+    {
+      "id": "wan2gpResolution",
+      "name": "Resolution",
+      "type": "select",
+      "default": "1024x1024",
+      "options": [
+        { "value": "1024x1024", "label": "1024x1024 (1:1)" },
+        { "value": "1280x720", "label": "1280x720 (16:9)" },
+        { "value": "720x1280", "label": "720x1280 (9:16)" },
+        { "value": "1024x576", "label": "1024x576 (16:9)" },
+        { "value": "576x1024", "label": "576x1024 (9:16)" },
+        { "value": "832x624", "label": "832x624 (4:3)" },
+        { "value": "624x832", "label": "624x832 (3:4)" },
+        { "value": "512x512", "label": "512x512 (1:1)" }
+      ],
+      "description": "Output resolution for Wan2GP",
+      "showWhen": { "apiFormat": ["wan2gp"] }
+    },
+    {
+      "id": "wan2gpSteps",
+      "name": "Steps",
+      "type": "number",
+      "default": 4,
+      "min": 1,
+      "max": 100,
+      "description": "Number of inference steps",
+      "showWhen": { "apiFormat": ["wan2gp"] }
+    },
+    {
+      "id": "wan2gpSampler",
+      "name": "Sampler",
+      "type": "select",
+      "default": "lightning",
+      "options": [
+        { "value": "default", "label": "Default (Euler)" },
+        { "value": "lightning", "label": "Lightning (Distilled)" }
+      ],
+      "description": "Sampling algorithm (Lightning for nunchaku distilled models, Default for standard weights)",
+      "showWhen": { "apiFormat": ["wan2gp"] }
+    },
+    {
+      "id": "wan2gpSeed",
+      "name": "Seed",
+      "type": "number",
+      "default": -1,
+      "min": -1,
+      "description": "Seed for reproducible generation (-1 = random)",
+      "showWhen": { "apiFormat": ["wan2gp"] }
+    },
+    {
+      "id": "wan2gpRandomSeed",
+      "name": "Random Seed",
+      "type": "boolean",
+      "default": true,
+      "description": "Use a random seed each generation",
+      "showWhen": { "apiFormat": ["wan2gp"] }
+    },
+    {
+      "id": "negativePrompt",
+      "name": "Negative Prompt",
+      "type": "textarea",
+      "default": "",
+      "description": "What to avoid in the image",
+      "rows": 2
+    },
+    {
+      "id": "width",
+      "name": "Width",
+      "type": "number",
+      "default": 1024,
+      "min": 64,
+      "max": 2048
+    },
+    {
+      "id": "height",
+      "name": "Height",
+      "type": "number",
+      "default": 1024,
+      "min": 64,
+      "max": 2048
+    },
+    {
+      "id": "steps",
+      "name": "Steps",
+      "type": "number",
+      "default": 20,
+      "min": 1,
+      "max": 150
+    },
+    {
+      "id": "imageInputCount",
+      "name": "Image Inputs",
+      "type": "number",
+      "default": 0,
+      "min": 0,
+      "max": 4,
+      "description": "Number of image inputs for img2img"
+    },
+    {
+      "id": "maxImageDimension",
+      "name": "Max Input Image Dimension",
+      "type": "number",
+      "default": 0,
+      "min": 0,
+      "max": 4096,
+      "description": "Maximum width/height for input images (0 = use default 1024px). Only applies when image inputs are connected."
+    },
+    {
+      "id": "maxImageSizeKB",
+      "name": "Max Input Image Size (KB)",
+      "type": "number",
+      "default": 0,
+      "min": 0,
+      "max": 20480,
+      "description": "Maximum input image size in KB (0 = use default 200KB). Only applies when image inputs are connected."
+    }
+  ],
+  "compiler": {
+    "template": "{{await}}Image.generate({{input}}, {{prop.negativePrompt}}, {{prop.width}}, {{prop.height}}, {{prop.steps}}, \"{{nodeId}}\")",
+    "async": true,
+    "abortable": true,
+    "statusTracking": true
+  },
+  "runtime": {
+    "streaming": true
+  },
+  "ui": {
+    "width": 320,
+    "resizable": true
+  }
+}

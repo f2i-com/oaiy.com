@@ -1,0 +1,4 @@
+# Inside public/: pass anything that doesn't map to a real file to index.php.
+RewriteEngine On
+RewriteCond %{REQUEST_FILENAME} !-f
+RewriteRule ^ index.php [QSA,L]

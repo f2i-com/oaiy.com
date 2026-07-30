@@ -1,0 +1,63 @@
+{
+    "id": "core-audio",
+    "name": "Core Audio",
+    "version": "1.0.0",
+    "description": "Audio processing and text-to-speech using embedded sherpa-onnx",
+    "author": "OAIY Team",
+    "category": "Audio",
+    "icon": "volume-2",
+    "color": "teal",
+    "nodes": [
+        "text_to_speech",
+        "save_audio",
+        "music_gen",
+        "audio_append",
+        "speech_to_text",
+        "audio_fade"
+    ],
+    "permissions": [
+        "filesystem"
+    ],
+    "runtime": {
+        "typescript": "runtime.ts",
+        "compiler": "compiler.ts",
+        "native": {
+            "plugin": "oaiy-audio",
+            "source": "native/src/lib.rs",
+            "cargo": "native/Cargo.toml"
+        }
+    },
+    "ui": {
+        "nodes": [
+            {
+                "nodeType": "text_to_speech",
+                "componentName": "TextToSpeechNode"
+            },
+            {
+                "nodeType": "music_gen",
+                "componentName": "MusicGenNode"
+            },
+            {
+                "nodeType": "speech_to_text",
+                "componentName": "SpeechToTextNode"
+            },
+            {
+                "nodeType": "audio_fade",
+                "componentName": "AudioFadeNode"
+            }
+        ]
+    },
+    "settings": {
+        "tts": {
+            "provider": "sherpa",
+            "modelPath": "",
+            "defaultVoice": "en_US-lessac-medium"
+        }
+    },
+    "models": {
+        "sherpa-tts": {
+            "download": "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-piper-en_US-lessac-medium.tar.bz2",
+            "description": "English (US) Lessac medium quality voice"
+        }
+    }
+}

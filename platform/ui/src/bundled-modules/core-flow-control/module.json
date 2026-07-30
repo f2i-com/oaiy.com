@@ -1,0 +1,27 @@
+{
+  "id": "core-flow-control",
+  "name": "Core Flow Control",
+  "version": "1.0.0",
+  "description": "Flow control nodes for loops, conditions, subflows, and macros",
+  "author": "OAIY Team",
+  "category": "Flow Control",
+  "icon": "git-branch",
+  "color": "amber",
+  "nodes": ["loop_start", "loop_end", "condition", "output", "subflow", "macro_input", "macro_output", "macro"],
+  "runtime": {
+    "typescript": "runtime.ts",
+    "compiler": "compiler.ts"
+  },
+  "ui": {
+    "nodes": [
+      { "nodeType": "loop_start", "componentName": "LoopStartNode" },
+      { "nodeType": "loop_end", "componentName": "LoopEndNode" },
+      { "nodeType": "condition", "componentName": "ConditionNode" },
+      { "nodeType": "output", "componentName": "OutputNode" },
+      { "nodeType": "subflow", "componentName": "SubflowNode" },
+      { "nodeType": "macro_input", "componentName": "MacroInputNode" },
+      { "nodeType": "macro_output", "componentName": "MacroOutputNode" },
+      { "nodeType": "macro", "componentName": "MacroNode" }
+    ]
+  }
+}

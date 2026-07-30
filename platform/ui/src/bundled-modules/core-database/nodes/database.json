@@ -1,0 +1,53 @@
+{
+  "id": "database",
+  "name": "Store Data",
+  "description": "Store data to a collection in the database.",
+  "doc": "Save data to a SQLite collection.\n\nFeatures:\n• Each flow has its own isolated database\n• Collections are created automatically\n• Data stored as JSON documents\n• Auto-generated unique IDs\n\nUsage:\n• Connect any data (object, string, number, etc.)\n• Specify collection name to organize data\n• Output includes the stored record with ID\n\nTip: Use different collection names to organize different types of data within your flow.",
+  "icon": "database",
+  "color": "emerald",
+  "tags": ["database", "store", "save", "data"],
+  "flowplan": {
+    "stepTypes": ["database_store", "database"],
+    "fieldMapping": {
+      "data": "data",
+      "collection": "collection_name"
+    },
+    "templateFields": ["data"],
+    "inputHandleMapping": {
+      "data": "data"
+    }
+  },
+  "inputs": [
+    {
+      "id": "data",
+      "name": "Data",
+      "type": "any",
+      "position": "left",
+      "description": "Data to store"
+    }
+  ],
+  "outputs": [
+    {
+      "id": "result",
+      "name": "Result",
+      "type": "any",
+      "position": "right",
+      "description": "Stored record with ID"
+    }
+  ],
+  "properties": [
+    {
+      "id": "collection_name",
+      "name": "Collection",
+      "type": "string",
+      "default": "default",
+      "description": "Collection/table name to store data in"
+    }
+  ],
+  "compiler": {
+    "customHandler": true
+  },
+  "ui": {
+    "width": 280
+  }
+}

@@ -1,0 +1,135 @@
+{
+  "id": "video_frame_extractor",
+  "name": "Video Frames",
+  "description": "Extract frames from a video file.",
+  "doc": "Extract image frames from videos.\n\nExtraction Modes:\n• FPS - extract at specified frames per second\n• Timestamps - extract at specific times\n• Last Frame Only - efficient for scene chaining\n\nSettings:\n• Max Frames - limit total frames\n• Start/End Time - extract specific range\n• Output Format - JPEG or PNG\n• Batch Size - process in chunks\n\nUse Cases:\n• Extract keyframes for AI analysis\n• Get last frame for video continuation\n• Create thumbnails or previews",
+  "icon": "film",
+  "color": "orange",
+  "tags": [
+    "video",
+    "frames",
+    "extract",
+    "images"
+  ],
+  "inputs": [
+    {
+      "id": "video",
+      "name": "Video",
+      "type": "video",
+      "position": "left",
+      "description": "Video file path or URL"
+    },
+    {
+      "id": "timestamps",
+      "name": "Timestamps",
+      "type": "array",
+      "position": "left",
+      "optional": true,
+      "description": "Specific timestamps (in seconds) to extract frames at"
+    },
+    {
+      "id": "startTimeInput",
+      "name": "Start",
+      "type": "number",
+      "position": "left",
+      "optional": true,
+      "description": "Start time in seconds (overrides property)"
+    },
+    {
+      "id": "endTimeInput",
+      "name": "End",
+      "type": "number",
+      "position": "left",
+      "optional": true,
+      "description": "End time in seconds (overrides property)"
+    }
+  ],
+  "outputs": [
+    {
+      "id": "frames",
+      "name": "Frames",
+      "type": "array",
+      "position": "right",
+      "description": "Array of frame images"
+    }
+  ],
+  "properties": [
+    {
+      "id": "fps",
+      "name": "FPS",
+      "type": "number",
+      "default": 1,
+      "min": 0.1,
+      "max": 60,
+      "description": "Frames per second to extract"
+    },
+    {
+      "id": "maxFrames",
+      "name": "Max Frames",
+      "type": "number",
+      "default": 100,
+      "min": 1,
+      "max": 10000,
+      "description": "Maximum number of frames"
+    },
+    {
+      "id": "startTime",
+      "name": "Start Time",
+      "type": "number",
+      "default": 0,
+      "min": 0,
+      "description": "Start time in seconds"
+    },
+    {
+      "id": "endTime",
+      "name": "End Time",
+      "type": "number",
+      "default": 0,
+      "min": 0,
+      "description": "End time in seconds (0 = entire video)"
+    },
+    {
+      "id": "outputFormat",
+      "name": "Output Format",
+      "type": "select",
+      "default": "jpeg",
+      "options": [
+        {
+          "value": "jpeg",
+          "label": "JPEG"
+        },
+        {
+          "value": "png",
+          "label": "PNG"
+        }
+      ],
+      "description": "Image format for extracted frames"
+    },
+    {
+      "id": "lastFrameOnly",
+      "name": "Last Frame Only",
+      "type": "boolean",
+      "default": false,
+      "description": "Extract only the last frame (efficient for scene chaining)"
+    },
+    {
+      "id": "batchSize",
+      "name": "Batch Size",
+      "type": "number",
+      "default": 10,
+      "min": 0,
+      "max": 100,
+      "description": "Frames per batch (0 = all at once)"
+    }
+  ],
+  "compiler": {
+    "customHandler": true,
+    "async": true,
+    "abortable": true,
+    "statusTracking": true
+  },
+  "ui": {
+    "width": 300,
+    "customComponent": "VideoFrameExtractorNode"
+  }
+}

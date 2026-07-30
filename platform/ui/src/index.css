@@ -1,0 +1,1894 @@
+@import "tailwindcss";
+
+/* Configure dark mode variant for class-based switching */
+@variant dark (&:where(.dark, .dark *));
+
+/* ============================================
+   DESIGN TOKENS — OAIY design system.
+
+   Two named themes, not one palette with a dark filter:
+     Prism Lab    (dark, the house default) — #070a12 shell, violet primary,
+                  cyan/magenta/green/amber signal accents, soft glows.
+     Paper Circuit (light) — #f3f0e9 warm paper, one blue primary, HARD offset
+                  shadows (2px 2px 0), squarer radii, no glow.
+
+   Colours are space-separated RGB triples so every consumer can compose alpha
+   via `rgb(var(--token) / 0.5)` — that contract is unchanged, only the values
+   and the semantics of the two themes are new.
+   ============================================ */
+:root {
+  /* One neutral grotesque carries every sans role (the prototype has no serif);
+     JetBrains Mono carries the data/code voice. --font-display is kept as a
+     token name because ~40 components reference it, but it now points at the
+     same family with tighter tracking applied via .font-display. */
+  --font-display: Inter, ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --font-body: Inter, ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, 'SF Mono', 'Cascadia Mono', Menlo, monospace;
+
+  font-family: var(--font-body);
+  line-height: 1.5;
+  font-weight: 400;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+
+  /* Spacing scale */
+  --space-1: 0.25rem;
+  --space-2: 0.5rem;
+  --space-3: 0.75rem;
+  --space-4: 1rem;
+  --space-5: 1.25rem;
+  --space-6: 1.5rem;
+  --space-8: 2rem;
+
+  /* Transitions */
+  --transition-fast: 150ms ease;
+  --transition-base: 200ms ease;
+  --transition-slow: 300ms ease;
+
+  /* Border radius */
+  --radius-sm: 0.375rem;
+  --radius-md: 0.5rem;
+  --radius-lg: 0.75rem;
+  --radius-xl: 1rem;
+  --radius-full: 9999px;
+
+  /* Accent color (OAIY brand: violet; can be customized via ThemeContext) */
+  --accent-primary: 113 103 255;
+  --accent-hover: 141 133 255;
+  --accent-glow: 113 103 255;
+  --accent-secondary: 77 139 255;
+
+  /* Signal accents — fixed hues that do NOT follow the customizable accent.
+     Node kinds, edge classes and status chrome key off these. */
+  --signal-cyan: 53 212 232;
+  --signal-magenta: 231 107 243;
+  --signal-green: 69 214 162;
+  --signal-amber: 242 184 75;
+  --signal-danger: 255 110 120;
+
+  /* Dynamic background tint (can be customized via ThemeContext) */
+  --bg-primary: 8 13 24;
+  --bg-secondary: 14 20 34;
+  --bg-tertiary: 19 28 45;
+
+  /* Default theme colors — Prism Lab (dark) is the house default. */
+  color-scheme: dark;
+  --color-bg-primary: 7 10 18;
+  --color-bg-secondary: 14 20 34;
+  --color-bg-tertiary: 19 28 45;
+  --color-bg-elevated: 14 20 34;
+  --color-bg-canvas: 8 13 24;
+  --color-text-primary: 244 247 255;
+  --color-text-secondary: 152 166 189;
+  --color-text-tertiary: 102 117 141;
+  --color-text-muted: 74 86 112;
+  --color-border-primary: 32 42 60;
+  --color-border-secondary: 22 30 44;
+  --color-border-strong: 51 66 92;
+  --dot: 38 52 77;
+
+  /* Prism Lab shadows — deep and diffuse. */
+  --shadow-sm: 0 1px 2px 0 rgb(0 0 0 / 0.35);
+  --shadow-md: 0 10px 26px rgb(0 0 0 / 0.18), 0 2px 4px -2px rgb(0 0 0 / 0.3);
+  --shadow-lg: 0 18px 50px rgb(0 0 0 / 0.28);
+  --shadow-glow-accent: 0 0 0 3px rgb(var(--accent-primary) / 0.3);
+  --shadow-glow-green: 0 0 0 3px rgb(var(--signal-green) / 0.3);
+}
+
+/* ============================================
+   BASE INTERACTION POLISH — theme-aware (tracks the customizable accent)
+   ============================================ */
+:root {
+  /* Native form controls (checkbox / radio / range / progress) follow the theme accent instead
+     of the browser's default blue. Inherited, so it reaches every control. */
+  accent-color: rgb(var(--accent-primary));
+  /* Suppress the grey flash WebView2 / touch paints over a tapped element. */
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* Text selection picks up the (user-customizable) accent as a soft tint — a small brand touch
+   visible everywhere, and it tracks whatever accent the user chose in Settings. */
+::selection {
+  background-color: rgb(var(--accent-primary) / 0.22);
+  /* Normalize selected text to the primary color so accent-colored text (links, the violet
+     headline accent, status text) stays readable on the tint — and it adapts to light/dark. */
+  color: rgb(var(--color-text-primary));
+}
+
+/* ============================================
+   PAPER CIRCUIT — light theme. Warm paper, ONE blue primary, hard offset
+   shadows instead of glows, squarer corners. Not a lightened Prism Lab.
+   ============================================ */
+:root.light {
+  color-scheme: light;
+
+  --accent-primary: 36 87 230;
+  --accent-hover: 26 68 190;
+  --accent-glow: 36 87 230;
+  --accent-secondary: 36 87 230;
+
+  --signal-cyan: 22 117 185;
+  --signal-magenta: 239 94 76;
+  --signal-green: 33 132 80;
+  --signal-amber: 156 106 8;
+  --signal-danger: 233 75 60;
+
+  --bg-primary: 248 245 238;
+  --bg-secondary: 255 254 250;
+  --bg-tertiary: 246 243 237;
+
+  /* Background colors */
+  --color-bg-primary: 243 240 233;
+  --color-bg-secondary: 255 254 250;
+  --color-bg-tertiary: 246 243 237;
+  --color-bg-elevated: 255 255 255;
+  --color-bg-canvas: 248 245 238;
+
+  /* Text colors — near-black ink on paper */
+  --color-text-primary: 23 23 23;
+  --color-text-secondary: 104 100 94;
+  --color-text-tertiary: 145 139 130;
+  --color-text-muted: 169 162 154;
+
+  /* Border colors — warm graphite */
+  --color-border-primary: 206 200 190;
+  --color-border-secondary: 222 216 206;
+  --color-border-strong: 159 153 143;
+  --dot: 215 209 199;
+
+  /* Paper Circuit's signature: an un-blurred offset, like ink on card. */
+  --shadow-sm: 1px 1px 0 rgb(50 42 30 / 0.05);
+  --shadow-md: 2px 2px 0 rgb(50 42 30 / 0.045);
+  --shadow-lg: 6px 6px 0 rgb(28 24 18 / 0.13);
+  --shadow-glow-accent: 0 0 0 3px rgb(var(--accent-primary) / 0.18);
+  --shadow-glow-green: 0 0 0 3px rgb(var(--signal-green) / 0.22);
+}
+
+/* ============================================
+   PRISM LAB — dark theme (also the bare :root default above)
+   ============================================ */
+:root.dark, :root:not(.light) {
+  color-scheme: dark;
+
+  --signal-cyan: 53 212 232;
+  --signal-magenta: 231 107 243;
+  --signal-green: 69 214 162;
+  --signal-amber: 242 184 75;
+  --signal-danger: 255 110 120;
+
+  /* Background colors */
+  --color-bg-primary: 7 10 18;
+  --color-bg-secondary: 14 20 34;
+  --color-bg-tertiary: 19 28 45;
+  --color-bg-elevated: 14 20 34;
+  --color-bg-canvas: 8 13 24;
+
+  /* Text colors */
+  --color-text-primary: 244 247 255;
+  --color-text-secondary: 152 166 189;
+  --color-text-tertiary: 102 117 141;
+  --color-text-muted: 74 86 112;
+
+  /* Border colors */
+  --color-border-primary: 32 42 60;
+  --color-border-secondary: 22 30 44;
+  --color-border-strong: 51 66 92;
+  --dot: 38 52 77;
+
+  /* Shadows */
+  --shadow-sm: 0 1px 2px 0 rgb(0 0 0 / 0.35);
+  --shadow-md: 0 10px 26px rgb(0 0 0 / 0.18), 0 2px 4px -2px rgb(0 0 0 / 0.3);
+  --shadow-lg: 0 18px 50px rgb(0 0 0 / 0.28);
+  --shadow-glow-accent: 0 0 0 3px rgb(var(--accent-primary) / 0.3);
+  --shadow-glow-green: 0 0 0 3px rgb(var(--signal-green) / 0.3);
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+  background-color: rgb(var(--color-bg-primary));
+  color: rgb(var(--color-text-primary));
+  font-family: var(--font-body);
+  font-feature-settings: 'ss01', 'ss02', 'cv11';
+}
+
+#root {
+  width: 100%;
+  height: 100vh;
+}
+
+/* Display typography — the same grotesque, tightened. The OAIY design system
+   has no serif: headline voice comes from weight + negative tracking, exactly
+   as in the prototype's .page-intro h2 / .top-title h1. */
+.font-display {
+  font-family: var(--font-display);
+  font-weight: 620;
+  letter-spacing: -0.035em;
+}
+
+/* Mono utility — tabular numbers for IDs, paths, status */
+.font-mono {
+  font-family: var(--font-mono);
+  font-feature-settings: 'tnum';
+  letter-spacing: -0.01em;
+}
+
+/* Subtle dot grid background — for canvas / ambient surfaces. Matches the
+   prototype's --dot at an 18px gap. */
+.bg-dotgrid {
+  background-image: radial-gradient(circle, rgb(var(--dot)) 1px, transparent 1px);
+  background-size: 18px 18px;
+  background-position: 0 0;
+}
+
+/* ============================================
+   GLOBAL FOCUS STATES
+   ============================================ */
+
+/* Improved focus visibility for all interactive elements */
+button:focus-visible,
+a:focus-visible,
+input:focus-visible,
+textarea:focus-visible,
+select:focus-visible,
+[tabindex]:focus-visible {
+  /* transparent outline = a visible ring in Windows forced-colors / high-contrast,
+     which strips box-shadow; the box-shadow is the styled ring everywhere else. */
+  outline: 2px solid transparent;
+  outline-offset: 2px;
+  box-shadow: 0 0 0 2px rgb(var(--color-bg-elevated)), 0 0 0 5px rgb(var(--accent-primary));
+}
+
+/* Focus within for custom components */
+.focus-ring:focus-within {
+  box-shadow: 0 0 0 2px rgb(var(--color-bg-elevated)), 0 0 0 5px rgb(var(--accent-primary));
+}
+
+/* ============================================
+   BUTTON UTILITIES
+   ============================================ */
+
+/* Base button reset */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.45rem;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  font-weight: 580;
+  white-space: nowrap;
+  transition: background var(--transition-fast), border-color var(--transition-fast),
+    transform 60ms ease, box-shadow var(--transition-fast);
+  cursor: pointer;
+  user-select: none;
+}
+
+.btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* Button sizes */
+.btn-sm {
+  padding: 0.375rem 0.75rem;
+  font-size: 0.75rem;
+  line-height: 1rem;
+}
+
+.btn-md {
+  padding: 0.5rem 1rem;
+  font-size: 0.875rem;
+  line-height: 1.25rem;
+}
+
+.btn-lg {
+  padding: 0.625rem 1.25rem;
+  font-size: 0.875rem;
+  line-height: 1.25rem;
+}
+
+/* Button variants */
+/* The design system's primary: a lit gradient with an accent bloom under it in
+   Prism Lab; Paper Circuit keeps the gradient but drops the bloom, because a
+   glow on paper reads as a printing error rather than emphasis. */
+.btn-primary {
+  border-color: rgb(var(--accent-primary));
+  background: linear-gradient(115deg, rgb(var(--accent-primary)), rgb(var(--accent-secondary)));
+  color: white;
+  box-shadow: 0 8px 22px rgb(var(--accent-primary) / 0.25),
+              inset 0 1px 0 rgb(255 255 255 / 0.2);
+}
+:root.light .btn-primary {
+  box-shadow: 2px 2px 0 rgb(50 42 30 / 0.1), inset 0 1px 0 rgb(255 255 255 / 0.2);
+}
+
+.btn-primary:hover:not(:disabled) { transform: translateY(-1px); }
+.btn-primary:active:not(:disabled) { transform: translateY(0); }
+
+.btn-secondary {
+  border-color: rgb(var(--color-border-strong));
+  background-color: rgb(var(--color-bg-tertiary) / 0.7);
+  color: rgb(var(--color-text-primary));
+}
+
+.btn-secondary:hover:not(:disabled) {
+  border-color: rgb(var(--accent-primary));
+  background-color: rgb(var(--accent-primary) / 0.14);
+}
+
+.btn-ghost {
+  background-color: transparent;
+  color: rgb(var(--color-text-secondary));
+}
+
+.btn-ghost:hover:not(:disabled) {
+  background-color: rgb(var(--color-bg-tertiary) / 0.7);
+  color: rgb(var(--color-text-primary));
+}
+
+.btn-danger {
+  background-color: rgb(220 38 38);
+  color: white;
+}
+
+.btn-danger:hover:not(:disabled) {
+  background-color: rgb(239 68 68);
+}
+
+.btn-warning {
+  background-color: rgb(180 83 9);
+  color: white;
+}
+
+.btn-warning:hover:not(:disabled) {
+  background-color: rgb(217 119 6);
+}
+
+/* Icon button */
+.btn-icon {
+  padding: 0.5rem;
+  border-radius: var(--radius-md);
+}
+
+.btn-icon-sm {
+  padding: 0.375rem;
+}
+
+/* ============================================
+   INPUT UTILITIES
+   ============================================ */
+
+.input {
+  width: 100%;
+  padding-top: 0.5rem;
+  padding-bottom: 0.5rem;
+  padding-left: 2rem;
+  padding-right: 0.75rem;
+  background-color: rgb(var(--color-bg-elevated));
+  border: 1px solid rgb(var(--color-border-primary));
+  border-radius: var(--radius-md);
+  color: rgb(var(--color-text-primary));
+  font-size: 0.875rem;
+  font-family: var(--font-body);
+  transition: border-color var(--transition-fast), box-shadow var(--transition-fast);
+}
+
+.input::placeholder {
+  color: rgb(var(--color-text-muted));
+}
+
+.input:hover:not(:disabled) {
+  border-color: rgb(var(--color-text-muted));
+}
+
+.input:focus {
+  outline: none;
+  border-color: rgb(var(--accent-primary));
+  box-shadow: var(--shadow-glow-accent);
+}
+
+.input:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* ============================================
+   PANEL UTILITIES
+   ============================================ */
+
+.panel {
+  background-color: rgb(var(--color-bg-elevated));
+  border: 1px solid rgb(var(--color-border-primary));
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+}
+
+.panel-header {
+  padding: 0.75rem 1rem;
+  border-bottom: 1px solid rgb(var(--color-border-secondary));
+  background-color: rgb(var(--color-bg-tertiary) / 0.4);
+}
+
+.panel-body {
+  padding: 1rem;
+}
+
+.panel-footer {
+  padding: 0.75rem 1rem;
+  border-top: 1px solid rgb(var(--color-border-secondary));
+  background-color: rgb(var(--color-bg-tertiary) / 0.4);
+}
+
+/* ============================================
+   CARD UTILITIES
+   ============================================ */
+
+.card {
+  background-color: rgb(var(--color-bg-secondary));
+  border: 1px solid rgb(var(--color-border-primary));
+  border-radius: 11px;
+  box-shadow: var(--shadow-md);
+  padding: 1rem;
+  transition: border-color var(--transition-fast), background var(--transition-fast),
+    transform var(--transition-fast), box-shadow var(--transition-fast);
+}
+/* Paper Circuit squares the corners and swaps the diffuse shadow for a hard
+   offset — the single strongest cue that it is a different theme, not a tint. */
+:root.light .card { border-radius: 8px; }
+
+.card-interactive:hover {
+  border-color: rgb(var(--accent-primary) / 0.35);
+  background-color: rgb(var(--color-bg-secondary));
+  transform: translateY(-1px);
+  box-shadow: var(--shadow-md);
+}
+
+.card-interactive:active {
+  transform: translateY(0);
+}
+
+/* ============================================
+   LIST UTILITIES
+   ============================================ */
+
+.list-item {
+  padding: 0.625rem 0.75rem;
+  border-radius: var(--radius-md);
+  transition: background-color var(--transition-fast), color var(--transition-fast);
+  cursor: pointer;
+  color: rgb(var(--color-text-secondary));
+}
+
+.list-item:hover {
+  background-color: rgb(var(--color-bg-tertiary) / 0.7);
+  color: rgb(var(--color-text-primary));
+}
+
+.list-item-active {
+  background-color: rgb(var(--accent-primary) / 0.10);
+  color: rgb(var(--accent-primary));
+  font-weight: 500;
+}
+
+.list-item-active:hover {
+  background-color: rgb(var(--accent-primary) / 0.14);
+  color: rgb(var(--accent-primary));
+}
+
+/* ============================================
+   TRANSITIONS & ANIMATIONS
+   ============================================ */
+
+/* Fade in */
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+  }
+
+  to {
+    opacity: 1;
+  }
+}
+
+.animate-fadeIn {
+  animation: fadeIn var(--transition-base) forwards;
+}
+
+/* Slide up */
+@keyframes slideUp {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.animate-slideUp {
+  animation: slideUp var(--transition-base) forwards;
+}
+
+/* Slide down */
+@keyframes slideDown {
+  from {
+    opacity: 0;
+    transform: translateY(-10px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.animate-slideDown {
+  animation: slideDown var(--transition-base) forwards;
+}
+
+/* Scale in */
+@keyframes scaleIn {
+  from {
+    opacity: 0;
+    transform: scale(0.95);
+  }
+
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+.animate-scaleIn {
+  animation: scaleIn var(--transition-fast) forwards;
+}
+
+/* Blinking cursor animation for streaming */
+@keyframes blink {
+
+  0%,
+  50% {
+    opacity: 1;
+  }
+
+  51%,
+  100% {
+    opacity: 0;
+  }
+}
+
+.animate-blink {
+  animation: blink 1s step-end infinite;
+}
+
+/* Spin animation */
+@keyframes spin {
+  from {
+    transform: rotate(0deg);
+  }
+
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.animate-spin {
+  animation: spin 1s linear infinite;
+}
+
+/* Pulse animation */
+@keyframes pulse {
+
+  0%,
+  100% {
+    opacity: 1;
+  }
+
+  50% {
+    opacity: 0.5;
+  }
+}
+
+.animate-pulse {
+  animation: pulse 2s ease-in-out infinite;
+}
+
+/* Toast Animations */
+@keyframes toast-enter {
+  from {
+    opacity: 0;
+    transform: translateX(100%);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+@keyframes toast-exit {
+  from {
+    opacity: 1;
+    transform: translateX(0);
+  }
+
+  to {
+    opacity: 0;
+    transform: translateX(100%);
+  }
+}
+
+.animate-toast-enter {
+  animation: toast-enter 0.3s ease-out forwards;
+}
+
+.animate-toast-exit {
+  animation: toast-exit 0.3s ease-in forwards;
+}
+
+/* ============================================
+   REACT FLOW CUSTOMIZATIONS
+   ============================================ */
+
+.react-flow__node {
+  border-radius: var(--radius-lg);
+  background: transparent !important;
+  border: none !important;
+  box-shadow: none !important;
+  outline: none !important;
+}
+
+.react-flow__node.selected,
+.react-flow__node:focus,
+.react-flow__node:focus-visible {
+  background: transparent !important;
+  border: none !important;
+  box-shadow: none !important;
+  outline: none !important;
+}
+
+.react-flow__node.selected>div {
+  box-shadow: 0 0 0 2px rgb(var(--accent-primary));
+  border-radius: var(--radius-lg);
+}
+
+.react-flow__handle {
+  /* Force larger handle size for easier clicking */
+  width: 1.5rem !important;
+  height: 1.5rem !important;
+  min-width: 1.5rem !important;
+  min-height: 1.5rem !important;
+  border-radius: var(--radius-full);
+  border-width: 2px;
+  border-color: rgb(var(--color-text-muted));
+  transition: border-color var(--transition-fast), box-shadow var(--transition-fast);
+}
+
+.react-flow__handle:hover {
+  border-color: rgb(var(--accent-primary));
+  box-shadow: 0 0 0 3px rgb(var(--accent-primary) / 0.25);
+}
+
+.react-flow__handle-left {
+  left: -0.75rem;
+}
+
+.react-flow__handle-right {
+  right: -0.75rem;
+}
+
+/* Edge styles */
+.react-flow__edge {
+  pointer-events: all;
+  cursor: pointer;
+}
+
+.react-flow__edge-path {
+  stroke: rgb(var(--color-text-muted));
+  stroke-width: 2;
+  pointer-events: stroke;
+  transition: stroke var(--transition-fast), stroke-width var(--transition-fast);
+}
+
+.react-flow__edge.selected .react-flow__edge-path {
+  stroke: rgb(var(--accent-primary));
+  stroke-width: 3;
+}
+
+.react-flow__edge:hover .react-flow__edge-path {
+  stroke: rgb(var(--color-text-secondary));
+  stroke-width: 3;
+}
+
+.react-flow__edge.selected:hover .react-flow__edge-path {
+  stroke: rgb(var(--accent-hover));
+}
+
+/* ============================================
+   CUSTOM SCROLLBAR
+   ============================================ */
+
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background-color: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background-color: rgb(var(--color-text-muted) / 0.4);
+  border-radius: var(--radius-full);
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background-color: rgb(var(--color-text-muted) / 0.65);
+}
+
+/* Firefox scrollbar */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: rgb(var(--color-text-muted) / 0.4) transparent;
+}
+
+/* ============================================
+   FORM ELEMENTS IN REACT FLOW
+   ============================================ */
+
+/* Ensure text selection works in form elements */
+input,
+textarea,
+select,
+[contenteditable] {
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+/* Allow text selection to be deselected on click */
+.react-flow {
+  user-select: none;
+}
+
+.react-flow__node input,
+.react-flow__node textarea,
+.react-flow__node select {
+  user-select: text;
+  -webkit-user-select: text;
+  cursor: text;
+}
+
+/* Prevent React Flow from intercepting mouse events on form elements */
+.react-flow__node input,
+.react-flow__node textarea,
+.react-flow__node select,
+.react-flow__node button {
+  pointer-events: auto;
+}
+
+/* ============================================
+   NODE STATUS ANIMATIONS
+   ============================================ */
+
+@keyframes pulse-glow {
+
+  0%,
+  100% {
+    box-shadow: 0 0 5px 0 rgb(var(--accent-primary) / 0.5),
+      0 0 20px 0 rgb(var(--accent-primary) / 0.3);
+  }
+
+  50% {
+    box-shadow: 0 0 10px 2px rgb(var(--accent-primary) / 0.8),
+      0 0 40px 5px rgb(var(--accent-primary) / 0.4);
+  }
+}
+
+@keyframes success-flash {
+  0% {
+    box-shadow: 0 0 20px 5px rgba(34, 197, 94, 0.8);
+  }
+
+  100% {
+    box-shadow: none;
+  }
+}
+
+.node-running {
+  animation: pulse-glow 1.5s ease-in-out infinite;
+  border-color: rgb(var(--accent-primary)) !important;
+}
+
+.node-completed {
+  animation: success-flash 0.5s ease-out forwards;
+}
+
+.node-error {
+  box-shadow: 0 0 15px 3px rgba(239, 68, 68, 0.6);
+  border-color: rgb(239 68 68) !important;
+}
+
+/* ============================================
+   EMPTY STATE UTILITIES
+   ============================================ */
+
+.empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 2rem 1rem;
+  text-align: center;
+  color: rgb(var(--color-text-tertiary));
+}
+
+.empty-state-icon {
+  width: 3rem;
+  height: 3rem;
+  margin-bottom: 1rem;
+  opacity: 0.5;
+}
+
+.empty-state-title {
+  font-size: 0.875rem;
+  font-weight: 500;
+  color: rgb(var(--color-text-primary));
+  margin-bottom: 0.25rem;
+}
+
+.empty-state-description {
+  font-size: 0.75rem;
+  color: rgb(var(--color-text-tertiary));
+}
+
+/* ============================================
+   SKELETON LOADING
+   ============================================ */
+
+@keyframes shimmer {
+  0% {
+    background-position: -200% 0;
+  }
+
+  100% {
+    background-position: 200% 0;
+  }
+}
+
+.skeleton {
+  background: linear-gradient(90deg,
+      rgb(var(--color-bg-tertiary)) 25%,
+      rgb(var(--color-bg-secondary)) 50%,
+      rgb(var(--color-bg-tertiary)) 75%);
+  background-size: 200% 100%;
+  animation: shimmer 1.5s ease-in-out infinite;
+  border-radius: var(--radius-md);
+}
+
+/* ============================================
+   TOOLTIP
+   ============================================ */
+
+.tooltip {
+  position: relative;
+}
+
+.tooltip::after {
+  content: attr(data-tooltip);
+  position: absolute;
+  bottom: 100%;
+  left: 50%;
+  transform: translateX(-50%) translateY(-0.5rem);
+  padding: 0.375rem 0.625rem;
+  background-color: rgb(var(--color-text-primary));
+  border: 1px solid rgb(var(--color-text-primary));
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-md);
+  font-size: 0.75rem;
+  color: rgb(var(--color-bg-elevated));
+  white-space: nowrap;
+  opacity: 0;
+  visibility: hidden;
+  transition: all var(--transition-fast);
+  pointer-events: none;
+  z-index: 50;
+}
+
+.tooltip:hover::after {
+  opacity: 1;
+  visibility: visible;
+  transform: translateX(-50%) translateY(-0.25rem);
+}
+
+/* ============================================
+   BADGE UTILITIES
+   ============================================ */
+
+.badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.125rem 0.5rem;
+  font-size: 0.625rem;
+  font-weight: 500;
+  border-radius: var(--radius-full);
+  text-transform: uppercase;
+  letter-spacing: 0.025em;
+}
+
+/* Light-theme base: dark, high-contrast text on a soft color tint. */
+.badge-blue {
+  background-color: rgb(59 130 246 / 0.14);
+  color: rgb(29 78 216);
+}
+
+.badge-green {
+  background-color: rgb(34 197 94 / 0.16);
+  color: rgb(21 128 61);
+}
+
+.badge-red {
+  background-color: rgb(239 68 68 / 0.14);
+  color: rgb(185 28 28);
+}
+
+.badge-amber {
+  background-color: rgb(245 158 11 / 0.16);
+  color: rgb(180 83 9);
+}
+
+.badge-slate {
+  background-color: rgb(100 116 139 / 0.14);
+  color: rgb(51 65 85);
+}
+
+/* Dark theme: the original light-on-tint values read better on a dark surface. */
+:where(.dark) .badge-blue  { background-color: rgb(59 130 246 / 0.2); color: rgb(147 197 253); }
+:where(.dark) .badge-green { background-color: rgb(34 197 94 / 0.2); color: rgb(134 239 172); }
+:where(.dark) .badge-red   { background-color: rgb(239 68 68 / 0.2); color: rgb(252 165 165); }
+:where(.dark) .badge-amber { background-color: rgb(245 158 11 / 0.2); color: rgb(252 211 77); }
+:where(.dark) .badge-slate { background-color: rgb(100 116 139 / 0.2); color: rgb(203 213 225); }
+
+/* ============================================
+   LANDING PAGE (marketing root at /)
+   ============================================
+   Scoped helpers used only by src/landing/*. Namespaced `lp-` so they
+   never collide with app styles. All animations collapse correctly under
+   the prefers-reduced-motion block below (it !important-overrides
+   animation-duration globally), so the graph simply renders in its
+   final, fully-drawn state for motion-sensitive users. */
+
+/* Staggered entrance — pair with an inline animation-delay. */
+@keyframes lp-fade-up {
+  from { opacity: 0; transform: translateY(18px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.lp-reveal {
+  opacity: 0;
+  animation: lp-fade-up 0.7s cubic-bezier(0.22, 0.7, 0.2, 1) forwards;
+}
+
+/* One-time draw-in for the hero graph edges (pair with stroke-dasharray
+   + a large stroke-dashoffset set inline). */
+@keyframes lp-draw {
+  to { stroke-dashoffset: 0; }
+}
+.lp-edge-draw {
+  animation: lp-draw 1.1s ease-out forwards;
+}
+
+/* Continuous "data flowing" shimmer along an edge. */
+@keyframes lp-flow {
+  to { stroke-dashoffset: -64; }
+}
+.lp-edge-flow {
+  stroke-dasharray: 5 11;
+  animation: lp-flow 1.4s linear infinite;
+}
+
+/* Slow breathing for the ambient hero halo. */
+@keyframes lp-breathe {
+  0%, 100% { transform: translate(-50%, -50%) scale(1); opacity: 0.16; }
+  50%      { transform: translate(-50%, -50%) scale(1.06); opacity: 0.22; }
+}
+.lp-halo {
+  animation: lp-breathe 9s ease-in-out infinite;
+}
+
+/* Gentle node bob, offset per-node via inline animation-delay. */
+@keyframes lp-bob {
+  0%, 100% { transform: translateY(0); }
+  50%      { transform: translateY(-4px); }
+}
+.lp-node-bob {
+  animation: lp-bob 5s ease-in-out infinite;
+}
+
+/* Marquee for the engines strip. The track is duplicated in markup so the
+   -50% translate loops seamlessly. */
+@keyframes lp-marquee {
+  from { transform: translateX(0); }
+  to   { transform: translateX(-50%); }
+}
+.lp-marquee-track {
+  animation: lp-marquee 32s linear infinite;
+}
+.lp-marquee-mask {
+  -webkit-mask-image: linear-gradient(to right, transparent, #000 8%, #000 92%, transparent);
+  mask-image: linear-gradient(to right, transparent, #000 8%, #000 92%, transparent);
+}
+
+/* ============================================
+   REDUCED MOTION
+   ============================================
+   Users who set `prefers-reduced-motion: reduce` (Windows: Settings →
+   Ease of Access → Display → "Show animations in Windows"; macOS:
+   System Settings → Accessibility → Display → "Reduce motion") get
+   shortened animations and transitions everywhere. Vestibular-disorder
+   users find translate/scale/rotate effects nauseating, so we collapse
+   them to ~0ms.
+
+   Exceptions kept at full duration:
+   - `.animate-spin`: loading spinners need to keep moving so users
+     still get progress feedback — otherwise a 5-minute generation
+     looks identical to a hang. We slow them slightly (1.5s vs 1s) to
+     reduce visual intensity but keep them rotating.
+   - `.animate-pulse`: same reasoning for "alive" indicators on
+     in-progress jobs. */
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+
+  /* Spinners and "alive" pulses still need to convey activity. */
+  .animate-spin,
+  [class*="animate-spin"] {
+    animation-duration: 1.5s !important;
+    animation-iteration-count: infinite !important;
+  }
+  .animate-pulse,
+  [class*="animate-pulse"] {
+    animation-duration: 3s !important;
+    animation-iteration-count: infinite !important;
+  }
+}
+
+/* ============================================================================
+   OAIY SHELL — the design system's app chrome, ported from the OAIY prototype.
+
+   Layout is a 222px sidebar + a workspace grid of 72px topbar / canvas /
+   64px endpoint dock. These are plain semantic classes (not Tailwind
+   utilities) because they carry the brand and need to stay legible as one
+   block; the panels inside them keep their existing utility classes.
+
+   Breakpoints mirror the prototype: 1240 collapses the sidebar to an icon
+   rail, 960 hides the dock chips, 760 compacts the topbar.
+   ============================================================================ */
+
+.app-shell {
+  display: grid;
+  grid-template-columns: 222px minmax(0, 1fr);
+  width: 100vw;
+  height: 100vh;
+  overflow: hidden;
+  background:
+    radial-gradient(circle at 72% -5%, rgb(var(--accent-primary) / 0.13), transparent 32%),
+    rgb(var(--color-bg-primary));
+  color: rgb(var(--color-text-primary));
+  font-size: 14px;
+}
+:root.light .app-shell {
+  background:
+    radial-gradient(circle at 72% -5%, rgb(var(--accent-primary) / 0.06), transparent 32%),
+    rgb(var(--color-bg-primary));
+}
+
+.oaiy-skip {
+  position: fixed;
+  z-index: 200;
+  top: 8px;
+  left: 8px;
+  transform: translateY(-160%);
+  border-radius: 6px;
+  background: rgb(var(--accent-primary));
+  color: #fff;
+  padding: 8px 11px;
+  text-decoration: none;
+}
+.oaiy-skip:focus { transform: translateY(0); }
+
+/* ---------- sidebar ---------- */
+
+.oaiy-sidebar {
+  z-index: 10;
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  border-right: 1px solid rgb(var(--color-border-primary));
+  background: rgb(var(--color-bg-secondary));
+  padding: 25px 14px 16px;
+}
+
+.oaiy-brand { padding: 0 12px; }
+.oaiy-brand > strong {
+  display: block;
+  font-size: 34px;
+  font-weight: 650;
+  letter-spacing: 0.11em;
+  line-height: 1;
+}
+.oaiy-brand > span {
+  display: block;
+  margin-top: 8px;
+  color: rgb(var(--color-text-secondary));
+  font-size: 12px;
+}
+.oaiy-brand > small {
+  display: block;
+  margin-top: 11px;
+  color: rgb(var(--color-text-tertiary));
+  font-size: 11px;
+}
+
+.oaiy-new {
+  display: flex;
+  width: 100%;
+  height: 42px;
+  align-items: center;
+  gap: 9px;
+  margin-top: 28px;
+  border: 1px solid rgb(var(--color-border-strong));
+  border-radius: 9px;
+  background: transparent;
+  color: rgb(var(--color-text-primary));
+  padding: 0 11px;
+  font-size: 12px;
+  text-align: left;
+  transition: border-color 0.14s, background 0.14s;
+}
+.oaiy-new:hover {
+  border-color: rgb(var(--accent-primary));
+  background: rgb(var(--accent-primary) / 0.14);
+}
+.oaiy-new > span { flex: 1; min-width: 0; }
+
+.oaiy-kbd {
+  border: 1px solid rgb(var(--color-border-primary));
+  border-radius: 5px;
+  background: rgb(var(--color-bg-tertiary) / 0.7);
+  color: rgb(var(--color-text-tertiary));
+  padding: 2px 5px;
+  font-family: var(--font-mono);
+  font-size: 9px;
+}
+
+.oaiy-nav { display: flex; flex-direction: column; gap: 4px; margin-top: 18px; }
+.oaiy-nav button,
+.oaiy-settings-btn {
+  position: relative;
+  display: flex;
+  width: 100%;
+  min-height: 43px;
+  align-items: center;
+  gap: 13px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: rgb(var(--color-text-secondary));
+  padding: 0 12px;
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.14s, color 0.14s;
+}
+.oaiy-nav button:hover,
+.oaiy-settings-btn:hover {
+  background: rgb(var(--color-bg-tertiary) / 0.7);
+  color: rgb(var(--color-text-primary));
+}
+.oaiy-nav button.active,
+.oaiy-settings-btn.active {
+  background: linear-gradient(90deg, rgb(var(--accent-primary) / 0.14), transparent);
+  color: rgb(var(--color-text-primary));
+}
+.oaiy-nav button.active::before,
+.oaiy-settings-btn.active::before {
+  position: absolute;
+  top: 9px;
+  bottom: 9px;
+  left: 0;
+  width: 2px;
+  border-radius: 4px;
+  background: rgb(var(--accent-primary));
+  content: '';
+}
+.oaiy-nav button > span,
+.oaiy-settings-btn > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.oaiy-nav button > em {
+  margin-left: auto;
+  border-radius: 999px;
+  background: rgb(var(--accent-primary) / 0.16);
+  color: rgb(var(--accent-primary));
+  padding: 2px 6px;
+  font-size: 9px;
+  font-style: normal;
+  font-weight: 700;
+}
+
+.oaiy-fill { flex: 1; }
+
+.oaiy-engine {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 12px 0;
+  border: 1px solid rgb(var(--color-border-primary));
+  border-radius: 9px;
+  background: rgb(var(--color-bg-tertiary) / 0.7);
+  padding: 11px;
+}
+.oaiy-engine > svg { flex: none; color: rgb(var(--signal-green)); }
+.oaiy-engine.off > svg { color: rgb(var(--color-text-tertiary)); }
+.oaiy-engine > span { display: flex; min-width: 0; flex-direction: column; gap: 2px; }
+.oaiy-engine strong { font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em; }
+.oaiy-engine small {
+  overflow: hidden;
+  color: rgb(var(--color-text-tertiary));
+  font-size: 9px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.oaiy-engine > i {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: rgb(var(--signal-green));
+  box-shadow: 0 0 0 4px rgb(var(--signal-green) / 0.12);
+}
+.oaiy-engine.off > i {
+  background: rgb(var(--color-text-tertiary));
+  box-shadow: 0 0 0 4px rgb(var(--color-text-tertiary) / 0.12);
+}
+
+.oaiy-trust {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 11px 12px 0;
+  color: rgb(var(--color-text-tertiary));
+  font-size: 10px;
+}
+
+/* ---------- workspace ---------- */
+
+.oaiy-workspace {
+  display: grid;
+  min-width: 0;
+  min-height: 0;
+  grid-template-rows: 72px minmax(0, 1fr) 64px;
+}
+
+.oaiy-topbar {
+  z-index: 8;
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  border-bottom: 1px solid rgb(var(--color-border-primary));
+  background: rgb(var(--color-bg-secondary) / 0.91);
+  padding: 0 19px 0 24px;
+  backdrop-filter: blur(18px);
+}
+.oaiy-title { min-width: 0; }
+.oaiy-title > span {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 5px;
+  color: rgb(var(--color-text-tertiary));
+  font-size: 9px;
+  font-weight: 650;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.oaiy-title > div { display: flex; min-width: 0; align-items: center; gap: 9px; }
+.oaiy-title h1,
+.oaiy-title input.oaiy-name {
+  overflow: hidden;
+  min-width: 0;
+  max-width: 320px;
+  margin: 0;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  outline: 0;
+  background: transparent;
+  color: rgb(var(--color-text-primary));
+  padding: 1px 4px;
+  font-family: inherit;
+  font-size: 17px;
+  font-weight: 630;
+  letter-spacing: -0.02em;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.oaiy-title input.oaiy-name:hover { border-color: rgb(var(--color-border-primary)); }
+.oaiy-title input.oaiy-name:focus {
+  border-color: rgb(var(--accent-primary));
+  background: rgb(var(--color-bg-tertiary) / 0.6);
+  box-shadow: none;
+}
+.oaiy-chip {
+  flex: none;
+  border: 1px solid rgb(var(--color-border-primary));
+  border-radius: 999px;
+  background: rgb(var(--color-bg-tertiary) / 0.7);
+  color: rgb(var(--color-text-secondary));
+  padding: 3px 7px;
+  font-size: 9px;
+  font-style: normal;
+  white-space: nowrap;
+}
+.oaiy-chip.ok {
+  border-color: rgb(var(--signal-green) / 0.35);
+  background: rgb(var(--signal-green) / 0.12);
+  color: rgb(var(--signal-green));
+}
+.oaiy-chip.accent {
+  border-color: rgb(var(--accent-primary) / 0.35);
+  background: rgb(var(--accent-primary) / 0.14);
+  color: rgb(var(--accent-primary));
+}
+.oaiy-saved {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 5px;
+  color: rgb(var(--color-text-tertiary));
+  font-size: 10px;
+  white-space: nowrap;
+}
+.oaiy-saved svg { color: rgb(var(--signal-green)); }
+
+.oaiy-actions { display: flex; flex: 0 0 auto; align-items: center; gap: 8px; }
+
+.oaiy-toggle {
+  display: flex;
+  border: 1px solid rgb(var(--color-border-primary));
+  border-radius: 8px;
+  background: rgb(var(--color-bg-tertiary) / 0.7);
+  padding: 2px;
+}
+.oaiy-icon-btn {
+  display: grid;
+  width: 30px;
+  height: 30px;
+  flex: 0 0 auto;
+  place-items: center;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: rgb(var(--color-text-secondary));
+  padding: 0;
+  cursor: pointer;
+  transition: background 0.14s, color 0.14s;
+}
+.oaiy-icon-btn:hover,
+.oaiy-icon-btn.active {
+  background: rgb(var(--color-bg-elevated));
+  color: rgb(var(--color-text-primary));
+}
+.oaiy-icon-btn.on {
+  background: rgb(var(--accent-primary) / 0.14);
+  color: rgb(var(--accent-primary));
+}
+
+.oaiy-btn {
+  display: inline-flex;
+  height: 36px;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  padding: 0 13px;
+  font-size: 11px;
+  font-weight: 580;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background 0.14s, border-color 0.14s, transform 0.06s;
+}
+.oaiy-btn:disabled { cursor: not-allowed; opacity: 0.45; }
+.oaiy-btn.primary {
+  border-color: rgb(var(--accent-primary));
+  background: linear-gradient(115deg, rgb(var(--accent-primary)), rgb(var(--accent-secondary)));
+  box-shadow: 0 8px 22px rgb(var(--accent-primary) / 0.25), inset 0 1px rgb(255 255 255 / 0.2);
+  color: #fff;
+}
+.oaiy-btn.primary:hover:not(:disabled) { transform: translateY(-1px); }
+.oaiy-btn.secondary {
+  border-color: rgb(var(--color-border-strong));
+  background: rgb(var(--color-bg-tertiary) / 0.7);
+  color: rgb(var(--color-text-primary));
+}
+.oaiy-btn.secondary:hover:not(:disabled) {
+  border-color: rgb(var(--accent-primary));
+  background: rgb(var(--accent-primary) / 0.14);
+}
+.oaiy-btn.danger {
+  border-color: rgb(var(--signal-danger) / 0.4);
+  background: rgb(var(--signal-danger) / 0.1);
+  color: rgb(var(--signal-danger));
+}
+
+/* ---------- canvas region ---------- */
+
+.oaiy-view { position: relative; min-width: 0; min-height: 0; overflow: hidden; }
+.oaiy-canvas-wrap {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  background: rgb(var(--color-bg-canvas));
+}
+/* Ambient prism wash over the canvas — the prototype's .canvas::before. */
+.oaiy-canvas-wrap::before {
+  position: absolute;
+  z-index: 0;
+  inset: 0;
+  pointer-events: none;
+  background:
+    radial-gradient(circle at 72% 16%, rgb(var(--accent-primary) / 0.1), transparent 36%),
+    radial-gradient(circle at 35% 72%, rgb(var(--signal-cyan) / 0.07), transparent 30%);
+  content: '';
+}
+:root.light .oaiy-canvas-wrap::before { opacity: 0.35; }
+
+/* ---------- endpoint dock ---------- */
+
+.oaiy-dock {
+  z-index: 9;
+  display: grid;
+  min-width: 0;
+  grid-template-columns: auto minmax(200px, 1fr) auto auto auto;
+  align-items: center;
+  gap: 9px;
+  border-top: 1px solid rgb(var(--color-border-primary));
+  background: rgb(var(--color-bg-secondary));
+  padding: 0 17px;
+}
+.oaiy-dock > button {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  border: 0;
+  background: transparent;
+  padding: 0;
+  cursor: pointer;
+  text-align: left;
+}
+.oaiy-dock > button > i {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: rgb(var(--signal-green));
+  box-shadow: 0 0 0 4px rgb(var(--signal-green) / 0.12);
+}
+.oaiy-dock.off > button > i {
+  background: rgb(var(--color-text-tertiary));
+  box-shadow: 0 0 0 4px rgb(var(--color-text-tertiary) / 0.12);
+}
+.oaiy-dock > button > span { display: flex; min-width: 0; flex-direction: column; gap: 2px; }
+.oaiy-dock > button strong { font-size: 9px; }
+.oaiy-dock > button small { color: rgb(var(--color-text-tertiary)); font-size: 8px; }
+.oaiy-dock-url {
+  display: flex;
+  min-width: 0;
+  height: 35px;
+  align-items: center;
+  border: 1px solid rgb(var(--color-border-primary));
+  border-radius: 7px;
+  background: rgb(var(--color-bg-tertiary) / 0.7);
+  padding-left: 11px;
+}
+.oaiy-dock-url code {
+  overflow: hidden;
+  min-width: 0;
+  flex: 1;
+  color: rgb(var(--color-text-secondary));
+  font-family: var(--font-mono);
+  font-size: 9px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.oaiy-dock > em {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border: 1px solid rgb(var(--accent-primary) / 0.35);
+  border-radius: 999px;
+  background: rgb(var(--accent-primary) / 0.14);
+  color: rgb(var(--accent-primary));
+  padding: 5px 7px;
+  font-size: 8px;
+  font-style: normal;
+  white-space: nowrap;
+}
+.oaiy-dock > em.ok {
+  border-color: rgb(var(--signal-green) / 0.35);
+  background: rgb(var(--signal-green) / 0.12);
+  color: rgb(var(--signal-green));
+}
+.oaiy-dock > button:last-child { color: rgb(var(--color-text-secondary)); font-size: 9px; }
+
+/* ---------- react-flow, in the prototype's voice ---------- */
+
+.oaiy-canvas-wrap .react-flow__edge-path {
+  stroke: rgb(var(--color-border-strong));
+  stroke-width: 1.7;
+}
+.oaiy-canvas-wrap .react-flow__edge.selected .react-flow__edge-path,
+.oaiy-canvas-wrap .react-flow__edge:hover .react-flow__edge-path {
+  stroke: rgb(var(--accent-primary));
+  stroke-width: 2.25;
+}
+.oaiy-canvas-wrap .react-flow__edge.animated .react-flow__edge-path {
+  stroke-width: 2.25;
+  filter: drop-shadow(0 0 4px currentColor);
+}
+.oaiy-canvas-wrap .react-flow__edge-text { fill: rgb(var(--color-text-secondary)); font-size: 9px; }
+.oaiy-canvas-wrap .react-flow__edge-textbg {
+  fill: rgb(var(--color-bg-secondary));
+  stroke: rgb(var(--color-border-primary));
+  stroke-width: 0.5;
+}
+.oaiy-canvas-wrap .react-flow__controls {
+  overflow: hidden;
+  border: 1px solid rgb(var(--color-border-primary)) !important;
+  border-radius: 8px !important;
+  background: rgb(var(--color-bg-secondary)) !important;
+  box-shadow: var(--shadow-lg) !important;
+}
+.oaiy-canvas-wrap .react-flow__controls button {
+  width: 30px !important;
+  height: 30px !important;
+  border-bottom-color: rgb(var(--color-border-primary)) !important;
+  background: rgb(var(--color-bg-secondary)) !important;
+  fill: rgb(var(--color-text-secondary)) !important;
+}
+.oaiy-canvas-wrap .react-flow__minimap {
+  overflow: hidden;
+  border: 1px solid rgb(var(--color-border-primary)) !important;
+  border-radius: 8px !important;
+  background: rgb(var(--color-bg-secondary)) !important;
+  box-shadow: var(--shadow-lg) !important;
+}
+.oaiy-canvas-wrap .react-flow__minimap-mask {
+  fill: rgb(var(--color-bg-primary) / 0.78);
+}
+.oaiy-canvas-wrap .react-flow__minimap-node {
+  fill: rgb(var(--accent-primary) / 0.55);
+  stroke: none;
+}
+.oaiy-canvas-wrap .react-flow__attribution { display: none; }
+
+/* ---------- responsive, mirroring the prototype ---------- */
+
+@media (max-width: 1240px) {
+  .app-shell { grid-template-columns: 74px minmax(0, 1fr); }
+  .oaiy-sidebar { align-items: center; padding-right: 10px; padding-left: 10px; }
+  .oaiy-brand { padding: 0; text-align: center; }
+  .oaiy-brand > strong { font-size: 19px; letter-spacing: 0.05em; }
+  .oaiy-brand > span,
+  .oaiy-brand > small,
+  .oaiy-new > span,
+  .oaiy-new .oaiy-kbd,
+  .oaiy-nav button > span,
+  .oaiy-nav button > em,
+  .oaiy-settings-btn > span,
+  .oaiy-engine > span,
+  .oaiy-trust span { display: none; }
+  .oaiy-new,
+  .oaiy-nav,
+  .oaiy-settings-btn { width: 43px; }
+  .oaiy-new,
+  .oaiy-nav button,
+  .oaiy-settings-btn { justify-content: center; padding: 0; }
+  .oaiy-engine { width: 43px; justify-content: center; padding: 7px; }
+  .oaiy-engine > i { top: 4px; right: 4px; }
+  .oaiy-trust { padding: 8px 0 0; }
+}
+
+@media (max-width: 960px) {
+  .oaiy-dock { grid-template-columns: auto minmax(150px, 1fr) auto; }
+  .oaiy-dock > em { display: none; }
+  .oaiy-saved { display: none; }
+}
+
+@media (max-width: 760px) {
+  .oaiy-workspace { grid-template-rows: 65px minmax(0, 1fr) 56px; }
+  .oaiy-topbar { padding: 0 10px 0 14px; }
+  .oaiy-title > span,
+  .oaiy-chip { display: none; }
+  .oaiy-title h1,
+  .oaiy-title input.oaiy-name { font-size: 14px; }
+  .oaiy-dock { grid-template-columns: auto minmax(0, 1fr); padding: 0 10px; }
+  .oaiy-dock > button:last-child,
+  .oaiy-dock > button > span { display: none; }
+}
+
+
+/* ============================================================================
+   LANDING PAGES — the same design system, applied to the marketing surfaces
+   (index.html and desktop.html). Shared with the app via the tokens above; only
+   the type idiom and the hero flow-node need their own rules.
+   ============================================================================ */
+
+/* The OAIY wordmark: tracked-out caps, exactly the prototype's .brand > strong
+   at a nav-appropriate size. No gradient chip — the letterforms are the mark. */
+.lp-wordmark {
+  font-size: 19px;
+  font-weight: 650;
+  letter-spacing: 0.16em;
+  line-height: 1;
+  color: rgb(var(--color-text-primary));
+}
+.lp-tagline {
+  color: rgb(var(--color-text-tertiary));
+  font-size: 10px;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+}
+
+/* Section eyebrow + heading — the prototype's .kicker / .page-intro h2 pair. */
+.lp-kicker {
+  display: block;
+  color: rgb(var(--accent-primary));
+  font-size: 10px;
+  font-weight: 720;
+  letter-spacing: 0.13em;
+  text-transform: uppercase;
+}
+.lp-h2 {
+  margin: 10px 0 0;
+  font-size: clamp(1.75rem, 3.2vw, 2.5rem);
+  font-weight: 620;
+  letter-spacing: -0.035em;
+  line-height: 1.08;
+  color: rgb(var(--color-text-primary));
+}
+.lp-h1 {
+  font-weight: 620;
+  letter-spacing: -0.045em;
+  line-height: 1.02;
+  font-size: clamp(2.6rem, 6vw, 4.4rem);
+  color: rgb(var(--color-text-primary));
+}
+
+/* Hero graph node — the prototype's .flow-node, scaled for an SVG-free
+   HTML mock. `--node` is set per node so one rule covers every accent. */
+.lp-node {
+  --node: rgb(var(--accent-primary));
+  position: relative;
+  border: 1px solid rgb(var(--color-border-strong));
+  border-radius: 12px;
+  background: linear-gradient(
+    145deg,
+    rgb(var(--color-bg-tertiary)),
+    rgb(var(--color-bg-secondary))
+  );
+  box-shadow: 0 10px 28px rgb(0 0 0 / 0.17);
+  padding: 10px 11px;
+}
+:root.light .lp-node {
+  border-radius: 8px;
+  background: rgb(var(--color-bg-elevated));
+  box-shadow: 2px 2px 0 rgb(50 42 30 / 0.06);
+}
+.lp-node-overline {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  color: rgb(var(--color-text-tertiary));
+  font-size: 8px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+.lp-node-overline svg { color: var(--node); }
+.lp-node > strong {
+  display: block;
+  margin-top: 6px;
+  color: rgb(var(--color-text-primary));
+  font-size: 13px;
+  font-weight: 600;
+}
+.lp-node > footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 9px;
+}
+.lp-node > footer code {
+  border: 1px solid var(--node);
+  border-radius: 5px;
+  background: color-mix(in srgb, var(--node) 9%, transparent);
+  color: var(--node);
+  padding: 2px 5px;
+  font-family: var(--font-mono);
+  font-size: 8px;
+}
+.lp-node > footer span { color: rgb(var(--color-text-tertiary)); font-size: 8px; }
+/* Typed handles on the node edges, as on the real canvas. */
+.lp-node-handle {
+  position: absolute;
+  top: 50%;
+  width: 10px;
+  height: 10px;
+  transform: translateY(-50%);
+  border: 2px solid var(--node);
+  border-radius: 50%;
+  background: rgb(var(--color-bg-canvas));
+}
+.lp-node-handle.in { left: -5px; }
+.lp-node-handle.out { right: -5px; }
+
+.lp-accent-violet { --node: rgb(var(--accent-primary)); }
+.lp-accent-cyan { --node: rgb(var(--signal-cyan)); }
+.lp-accent-magenta { --node: rgb(var(--signal-magenta)); }
+.lp-accent-green { --node: rgb(var(--signal-green)); }
+.lp-accent-amber { --node: rgb(var(--signal-amber)); }
+
+/* Pill used for the hero status chip and the feature tags. */
+.lp-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid rgb(var(--accent-primary) / 0.35);
+  border-radius: 999px;
+  background: rgb(var(--accent-primary) / 0.14);
+  color: rgb(var(--accent-primary));
+  padding: 5px 11px;
+  font-size: 11px;
+  font-weight: 560;
+}
+
+/* The hero graph's node cards. An SVG <rect> can't take a box-shadow, so the
+   elevation is a filter — diffuse in Prism Lab, a hard offset in Paper Circuit. */
+.lp-graph-card { filter: drop-shadow(0 10px 22px rgb(0 0 0 / 0.35)); }
+:root.light .lp-graph-card { filter: drop-shadow(2px 2px 0 rgb(50 42 30 / 0.07)); }
+
+/* ---------- shared site nav (index.html + desktop.html) ---------- */
+
+.site-nav {
+  position: sticky;
+  z-index: 50;
+  top: 0;
+  border-bottom: 1px solid rgb(var(--color-border-primary));
+  background: rgb(var(--color-bg-primary) / 0.85);
+  backdrop-filter: blur(18px);
+}
+.site-nav-bar {
+  display: flex;
+  max-width: 72rem;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  margin: 0 auto;
+  height: 60px;
+  padding: 0 1.25rem;
+}
+@media (min-width: 640px) { .site-nav-bar { padding: 0 2rem; } }
+
+.site-nav-links { display: flex; align-items: center; gap: 2px; }
+.site-nav-links > a:not(.btn) {
+  position: relative;
+  display: none;
+  border-radius: 7px;
+  color: rgb(var(--color-text-secondary));
+  padding: 7px 11px;
+  font-size: 13px;
+  transition: background 0.14s, color 0.14s;
+}
+@media (min-width: 720px) { .site-nav-links > a:not(.btn) { display: inline-block; } }
+.site-nav-links > a:not(.btn):hover {
+  background: rgb(var(--color-bg-tertiary) / 0.7);
+  color: rgb(var(--color-text-primary));
+  text-decoration: none;
+}
+/* The current page gets the accent underline the app's inspector tabs use, so
+   "where am I" reads the same on the marketing pages as inside the product. */
+.site-nav-links > a.active {
+  color: rgb(var(--color-text-primary));
+  font-weight: 560;
+}
+.site-nav-links > a.active::after {
+  position: absolute;
+  right: 11px;
+  bottom: -1px;
+  left: 11px;
+  height: 2px;
+  border-radius: 3px;
+  background: rgb(var(--accent-primary));
+  content: '';
+}
+.site-nav-links .oaiy-icon-btn { margin-left: 6px; }
+
+/* In-page jump list for whichever page you're on — subordinate to the site bar
+   above it, which is the point: page sections should not look like site nav. */
+.site-subnav {
+  border-top: 1px solid rgb(var(--color-border-secondary));
+  background: rgb(var(--color-bg-secondary) / 0.55);
+}
+.site-subnav nav {
+  display: flex;
+  max-width: 72rem;
+  align-items: center;
+  gap: 2px;
+  margin: 0 auto;
+  overflow-x: auto;
+  padding: 7px 1.25rem;
+  scrollbar-width: none;
+}
+.site-subnav nav::-webkit-scrollbar { display: none; }
+@media (min-width: 640px) { .site-subnav nav { padding: 7px 2rem; } }
+.site-subnav a {
+  flex: none;
+  border-radius: 999px;
+  color: rgb(var(--color-text-tertiary));
+  padding: 4px 10px;
+  font-size: 11px;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+  transition: background 0.14s, color 0.14s;
+}
+.site-subnav a:hover {
+  background: rgb(var(--accent-primary) / 0.12);
+  color: rgb(var(--accent-primary));
+  text-decoration: none;
+}
+
+/* Marching dashes on the hero graph's feedback edge — the visual cue that the
+   loop actually runs. Paused under reduced-motion by the global rule. */
+@keyframes lp-edge-march { to { stroke-dashoffset: -22; } }
+.lp-edge-flow { animation: lp-edge-march 1.1s linear infinite; }

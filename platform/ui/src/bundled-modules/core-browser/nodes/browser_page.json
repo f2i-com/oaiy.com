@@ -1,0 +1,95 @@
+{
+  "id": "browser_page",
+  "name": "Browser Page",
+  "description": "Open a URL in a session and wait for it to be ready. Returns the final URL, title, HTML, and visible text.",
+  "doc": "Drive a Browser Session to a URL.\n\nWait strategies:\n• Page Load (default) - waits for the load event\n• DOM Ready - earlier, fires on parse\n• Network Idle - waits for network to go quiet (heavier)\n\nIf you also fill in 'Wait For Selector', the node blocks until that selector exists in the DOM after the wait condition.\n\nReturns { url, title, html, text } so you can chain Browser Extract or pipe directly into other nodes.",
+  "icon": "arrow-right-circle",
+  "color": "cyan",
+  "tags": ["browser", "navigate", "goto", "page"],
+  "inputs": [
+    {
+      "id": "session",
+      "name": "Session",
+      "type": "object",
+      "position": "left",
+      "description": "Browser session"
+    },
+    {
+      "id": "url",
+      "name": "URL",
+      "type": "string",
+      "position": "left",
+      "description": "URL (overrides property)",
+      "optional": true
+    }
+  ],
+  "outputs": [
+    {
+      "id": "session",
+      "name": "Session",
+      "type": "object",
+      "position": "right",
+      "description": "Same session, passed through"
+    },
+    {
+      "id": "result",
+      "name": "Page",
+      "type": "object",
+      "position": "right",
+      "description": "{ url, title, html, text, status }"
+    }
+  ],
+  "properties": [
+    {
+      "id": "url",
+      "name": "URL",
+      "type": "string",
+      "default": "",
+      "description": "URL to open (used if no URL input is connected)"
+    },
+    {
+      "id": "waitUntil",
+      "name": "Wait For",
+      "type": "select",
+      "default": "load",
+      "options": [
+        { "value": "load", "label": "Page Load" },
+        { "value": "domcontentloaded", "label": "DOM Ready" },
+        { "value": "networkidle", "label": "Network Idle" }
+      ]
+    },
+    {
+      "id": "waitForSelector",
+      "name": "Wait For Selector",
+      "type": "string",
+      "default": "",
+      "description": "Optional CSS selector to wait for after the wait condition",
+      "advanced": true
+    },
+    {
+      "id": "settleMs",
+      "name": "Settle (ms)",
+      "type": "number",
+      "default": 1000,
+      "min": 0,
+      "max": 30000,
+      "description": "Extra delay after wait (lets dynamic content render)",
+      "advanced": true
+    },
+    {
+      "id": "timeoutMs",
+      "name": "Timeout (ms)",
+      "type": "number",
+      "default": 30000,
+      "min": 1000,
+      "max": 600000
+    }
+  ],
+  "compiler": {
+    "async": true,
+    "abortable": true,
+    "statusTracking": true,
+    "customHandler": true
+  },
+  "ui": { "width": 300 }
+}

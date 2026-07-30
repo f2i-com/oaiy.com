@@ -1,0 +1,54 @@
+{
+  "id": "memory",
+  "name": "Memory",
+  "description": "Store and recall values across workflow iterations.",
+  "doc": "Persist values across workflow runs using a key-value store.\n\nOperations:\n• Get - retrieve stored value\n• Set - store new value\n• Append - add to array (creates if doesn't exist)\n• Clear - delete stored value\n\nUse Cases:\n• Track conversation history\n• Accumulate results across runs\n• Store configuration between sessions\n\nStorage:\nValues are persisted in the shared agent memory database and survive app restarts.",
+  "icon": "database",
+  "color": "cyan",
+  "tags": ["memory", "store", "recall", "persist"],
+  "inputs": [
+    {
+      "id": "value",
+      "name": "Value",
+      "type": "any",
+      "position": "left",
+      "description": "Value to store (optional)"
+    }
+  ],
+  "outputs": [
+    {
+      "id": "value",
+      "name": "Value",
+      "type": "any",
+      "position": "right",
+      "description": "Stored value"
+    }
+  ],
+  "properties": [
+    {
+      "id": "key",
+      "name": "Key",
+      "type": "string",
+      "default": "my_value",
+      "description": "Memory key to store/retrieve"
+    },
+    {
+      "id": "operation",
+      "name": "Operation",
+      "type": "select",
+      "default": "get",
+      "options": [
+        { "value": "get", "label": "Get Value" },
+        { "value": "set", "label": "Set Value" },
+        { "value": "append", "label": "Append to Array" },
+        { "value": "clear", "label": "Clear Value" }
+      ]
+    }
+  ],
+  "compiler": {
+    "template": "Agent.memory({{prop.key}}, {{prop.operation.raw}}, {{input}})"
+  },
+  "ui": {
+    "width": 260
+  }
+}

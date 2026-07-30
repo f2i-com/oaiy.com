@@ -1,0 +1,18 @@
+{
+  "id": "echo-example",
+  "name": "Echo (template)",
+  "description": "A minimal, self-contained service that bundles its own Python script via the files field. Copy it as a starting point for your own.",
+  "category": "Example",
+  "defaultPort": 8200,
+  "install": { "kind": "none" },
+  "run": {
+    "command": "${dataDir}/python/python.exe",
+    "args": ["${dataDir}/scripts/echo_server.py", "${port}"],
+    "env": {},
+    "cwd": null
+  },
+  "health": { "url": "http://127.0.0.1:${port}/health", "timeoutSecs": 15 },
+  "files": {
+    "echo_server.py": "import sys\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\n\nclass H(BaseHTTPRequestHandler):\n    def do_GET(self):\n        self.send_response(200)\n        self.send_header('Content-Type', 'application/json')\n        self.end_headers()\n        self.wfile.write(b'{\"ok\": true}')\n    def log_message(self, *a):\n        pass\n\nport = int(sys.argv[1]) if len(sys.argv) > 1 else 8200\nHTTPServer(('127.0.0.1', port), H).serve_forever()\n"
+  }
+}

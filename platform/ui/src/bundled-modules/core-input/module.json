@@ -1,0 +1,48 @@
+{
+  "id": "core-input",
+  "name": "Core Input",
+  "version": "1.0.0",
+  "description": "Core input nodes for accepting user data and files",
+  "author": "OAIY Team",
+  "category": "Input",
+  "icon": "file-input",
+  "color": "green",
+  "nodes": [
+    "input_text",
+    "input_file",
+    "input_video",
+    "input_folder",
+    "input_audio"
+  ],
+  "permissions": [
+    "filesystem"
+  ],
+  "runtime": {
+    "typescript": "runtime.ts",
+    "compiler": "compiler.ts"
+  },
+  "ui": {
+    "nodes": [
+      {
+        "nodeType": "input_text",
+        "componentName": "InputTextNode"
+      },
+      {
+        "nodeType": "input_file",
+        "componentName": "InputFileNode"
+      },
+      {
+        "nodeType": "input_video",
+        "componentName": "InputVideoNode"
+      },
+      {
+        "nodeType": "input_folder",
+        "componentName": "InputFolderNode"
+      },
+      {
+        "nodeType": "input_audio",
+        "componentName": "InputAudioNode"
+      }
+    ]
+  }
+}

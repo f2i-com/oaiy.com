@@ -1,0 +1,50 @@
+{
+  "id": "lance",
+  "name": "Lance (Image+Video)",
+  "description": "ByteDance Lance: a 3B unified model for image + video generation, editing and understanding. OAIY serves it through lance_server.py, which exposes a JSON API (POST /generate) for oaiy-web AND mounts Lance's own Gradio UI at /ui on the same port. One-click install sets up a Python 3.11 venv (CUDA PyTorch 2.8 + an SDPA flash_attn shim), fetches the Lance repo + requirements, and downloads the weights into the models folder. LANCE_GPUS lists the GPUs to run on (one full model copy per GPU = that many concurrent jobs); a single large 480p clip needs ~40GB peak, so keep resolution/frames modest per card, or lower LANCE_GPUS to your GPU count. To instead fit ONE big clip across all GPUs, set OAIY_LANCE_SHARD=1 (experimental device_map sharding) or OAIY_LANCE_OFFLOAD=1 (CPU offload, slow but fits anything).",
+  "category": "Image Generation",
+  "defaultPort": 17900,
+  "install": {
+    "kind": "script",
+    "windows": "install-lance.bat",
+    "unix": "install-lance.sh"
+  },
+  "run": {
+    "command": "${dataDir}/venvs/lance/Scripts/python.exe",
+    "args": [
+      "${dataDir}/scripts/lance_server.py",
+      "--server-name",
+      "127.0.0.1",
+      "--server-port",
+      "${port}"
+    ],
+    "cwd": "${dataDir}/services/lance/Lance-main",
+    "env": {
+      "LANCE_GPUS": "0,1",
+      "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+      "OAIY_LANCE_SHARD": "0",
+      "OAIY_LANCE_OFFLOAD": "0",
+      "LANCE_MODEL_BASE_DIR": "${modelsDir}/lance",
+      "PYTHONPATH": "${dataDir}/services/lance/Lance-main"
+    }
+  },
+  "health": {
+    "url": "http://127.0.0.1:${port}/health",
+    "timeoutSecs": 5
+  },
+  "uninstall": {
+    "paths": [
+      "${dataDir}/venvs/lance",
+      "${dataDir}/services/lance"
+    ]
+  },
+  "installedMarker": "${dataDir}/venvs/lance/.oaiy-installed",
+  "docsUrl": "https://huggingface.co/bytedance-research/Lance",
+  "node": {
+    "endpoint": "/generate",
+    "method": "POST",
+    "bodyTemplate": "{\"prompt\": {{input}}}",
+    "responsePath": "imageUrl",
+    "icon": "🎨"
+  }
+}

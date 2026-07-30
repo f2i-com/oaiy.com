@@ -1,0 +1,152 @@
+{
+  "id": "browser_extract",
+  "name": "Browser Extract",
+  "description": "Extract data from a live browser session, or from HTML/JSON content.",
+  "doc": "Pick what to extract from the dropdown — most workflows only need one node:\n\nLive page (needs Session input):\n• Text - cleaned visible text\n• Links - all anchors with text + href\n• Images - <img> elements with src/alt/dimensions\n• Emails - addresses from mailto and visible text\n• Phones - numbers from tel and visible text (region-aware)\n• Colors - brand color palette\n• Run JavaScript - run a custom script and get a JSON result\n\nContent (needs Content input — string of HTML or JSON):\n• CSS Selector - elements from HTML\n• Regex - pattern matching\n• JSON Path - navigate JSON\n",
+  "icon": "code",
+  "color": "cyan",
+  "tags": ["browser", "extract", "parse", "html", "json"],
+  "inputs": [
+    {
+      "id": "session",
+      "name": "Session",
+      "type": "object",
+      "position": "left",
+      "description": "Browser session for live extraction (text, links, images, emails, phones, colors, JavaScript)",
+      "optional": true
+    },
+    {
+      "id": "content",
+      "name": "Content",
+      "type": "any",
+      "position": "left",
+      "description": "HTML or JSON string for selector / regex / jsonpath",
+      "optional": true
+    }
+  ],
+  "outputs": [
+    {
+      "id": "result",
+      "name": "Result",
+      "type": "any",
+      "position": "right",
+      "description": "Extracted data (shape depends on Extract type)"
+    }
+  ],
+  "properties": [
+    {
+      "id": "type",
+      "name": "Extract",
+      "type": "select",
+      "default": "text",
+      "options": [
+        { "value": "text", "label": "Text" },
+        { "value": "links", "label": "Links" },
+        { "value": "images", "label": "Images" },
+        { "value": "emails", "label": "Emails" },
+        { "value": "phones", "label": "Phones" },
+        { "value": "colors", "label": "Colors" },
+        { "value": "evaluate", "label": "Run JavaScript" },
+        { "value": "selector", "label": "CSS Selector (HTML)" },
+        { "value": "regex", "label": "Regex" },
+        { "value": "jsonpath", "label": "JSON Path" }
+      ]
+    },
+    {
+      "id": "selector",
+      "name": "Selector / Scope",
+      "type": "string",
+      "default": "",
+      "description": "CSS selector. For text/links/images this scopes the search; for 'CSS Selector' this is the pattern.",
+      "showIf": { "property": "type", "in": ["text", "links", "images", "selector"] }
+    },
+    {
+      "id": "pattern",
+      "name": "Pattern",
+      "type": "string",
+      "default": "",
+      "description": "Regex or JSON path expression",
+      "showIf": { "property": "type", "in": ["regex", "jsonpath"] }
+    },
+    {
+      "id": "attribute",
+      "name": "Attribute",
+      "type": "string",
+      "default": "text",
+      "description": "Attribute to extract: text, href, src, or any HTML attribute",
+      "showIf": { "property": "type", "equals": "selector" }
+    },
+    {
+      "id": "script",
+      "name": "Script",
+      "type": "textarea",
+      "default": "(() => ({ title: document.title, url: location.href }))()",
+      "description": "JavaScript expression evaluated in the page",
+      "rows": 6,
+      "showIf": { "property": "type", "equals": "evaluate" }
+    },
+    {
+      "id": "region",
+      "name": "Region",
+      "type": "string",
+      "default": "GENERIC",
+      "placeholder": "AU, US, UK, CA, NZ, IN, DE, FR, GENERIC",
+      "description": "Phone-format region for the regex. Tuned for AU/US/CA/UK/NZ/IN/DE/FR; anything else falls back to GENERIC.",
+      "showIf": { "property": "type", "equals": "phones" }
+    },
+    {
+      "id": "max",
+      "name": "Max Results",
+      "type": "number",
+      "default": 0,
+      "min": 0,
+      "description": "Limit results (0 = no limit)",
+      "advanced": true,
+      "showIf": { "property": "type", "in": ["links", "images", "emails", "phones"] }
+    },
+    {
+      "id": "maxLength",
+      "name": "Max Text Length",
+      "type": "number",
+      "default": 10000,
+      "min": 0,
+      "description": "Truncate text output (0 = no limit)",
+      "advanced": true,
+      "showIf": { "property": "type", "in": ["text", "html"] }
+    },
+    {
+      "id": "sameOriginOnly",
+      "name": "Same Origin Only",
+      "type": "boolean",
+      "default": false,
+      "description": "Filter links to the same origin as the page",
+      "advanced": true,
+      "showIf": { "property": "type", "equals": "links" }
+    },
+    {
+      "id": "minSize",
+      "name": "Min Image Size (px)",
+      "type": "number",
+      "default": 0,
+      "advanced": true,
+      "showIf": { "property": "type", "equals": "images" }
+    },
+    {
+      "id": "paletteSize",
+      "name": "Palette Size",
+      "type": "number",
+      "default": 5,
+      "min": 1,
+      "max": 16,
+      "advanced": true,
+      "showIf": { "property": "type", "equals": "colors" }
+    }
+  ],
+  "compiler": {
+    "async": true,
+    "abortable": true,
+    "statusTracking": true,
+    "customHandler": true
+  },
+  "ui": { "width": 300, "resizable": true }
+}

@@ -1,0 +1,22 @@
+{
+  "id": "core-utility",
+  "name": "Core Utility",
+  "version": "1.0.0",
+  "description": "Utility nodes for text processing and data manipulation",
+  "author": "OAIY Team",
+  "category": "Utility",
+  "icon": "tool",
+  "color": "slate",
+  "nodes": ["template", "logic_block", "memory", "comfyui_free_memory"],
+  "runtime": {
+    "typescript": "runtime.ts",
+    "compiler": "compiler.ts"
+  },
+  "ui": {
+    "nodes": [
+      { "nodeType": "template", "componentName": "TemplateNode" },
+      { "nodeType": "logic_block", "componentName": "LogicBlockNode" },
+      { "nodeType": "memory", "componentName": "MemoryNode" }
+    ]
+  }
+}

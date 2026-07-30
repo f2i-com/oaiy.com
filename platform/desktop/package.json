@@ -1,0 +1,31 @@
+{
+  "name": "oaiy-companion",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Tray-resident desktop companion for oaiy-web. Manages local AI services (Ollama, ComfyUI, custom Python) and exposes them to the oaiy-web flow editor via a localhost API.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "tauri": "tauri",
+    "tauri:dev": "tauri dev --features gui",
+    "tauri:build": "tauri build --features gui"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.1.1",
+    "@tauri-apps/plugin-notification": "^2.3.3",
+    "lucide-react": "^0.468.0",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.1.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^4.3.4",
+    "typescript": "^5.7.0",
+    "vite": "^7.0.0"
+  }
+}

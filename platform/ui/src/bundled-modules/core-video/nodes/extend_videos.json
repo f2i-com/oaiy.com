@@ -1,0 +1,60 @@
+{
+    "id": "extend_videos",
+    "name": "Extend Videos",
+    "description": "Extend videos to match target durations by freezing the last frame. Use this to sync video with TTS narration.",
+    "doc": "Extend video clips to specific durations.\n\nHow it Works:\nFreezes the last frame to reach target duration. Useful when video clips are shorter than corresponding audio.\n\nTypical Workflow:\n1. Generate TTS audio segments\n2. Generate video clips\n3. Extend videos to match TTS durations\n4. Combine with Video Append\n5. Mix audio with Audio Mixer\n\nInputs:\n• Videos Array - clips to extend\n• Target Durations - array of seconds",
+    "icon": "clock",
+    "color": "cyan",
+    "tags": [
+        "video",
+        "extend",
+        "pad",
+        "sync",
+        "duration"
+    ],
+    "inputs": [
+        {
+            "id": "videos",
+            "name": "Videos Array",
+            "type": "array",
+            "position": "left",
+            "description": "Array of videos to extend",
+            "required": true
+        },
+        {
+            "id": "durations",
+            "name": "Target Durations",
+            "type": "array",
+            "position": "left",
+            "description": "Array of target durations in seconds for each video",
+            "required": false
+        }
+    ],
+    "outputs": [
+        {
+            "id": "videos",
+            "name": "Videos",
+            "type": "array",
+            "position": "right",
+            "description": "Extended videos array"
+        }
+    ],
+    "properties": [
+        {
+            "id": "filename",
+            "name": "Output Filename",
+            "type": "string",
+            "default": "extended_video",
+            "description": "Base filename for output videos (without extension)"
+        }
+    ],
+    "compiler": {
+        "template": "{{await}}VideoFrames.extendVideos({{input.videos}}, {{input.durations}}, {{prop.filename}}, \"{{nodeId}}\")",
+        "async": true,
+        "statusTracking": true
+    },
+    "ui": {
+        "width": 250,
+        "resizable": false
+    }
+}

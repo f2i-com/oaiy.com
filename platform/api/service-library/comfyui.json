@@ -1,0 +1,19 @@
+{
+  "id": "comfyui",
+  "name": "ComfyUI",
+  "description": "Local Stable Diffusion image server with its own node graph. The install script clones the repo and sets up a venv.",
+  "category": "Image",
+  "defaultPort": 8188,
+  "install": {
+    "kind": "script",
+    "windows": "@echo off\r\nrem Install scripts get OAIY_* env vars for the companion's dirs.\r\ngit clone --depth 1 https://github.com/comfyanonymous/ComfyUI \"%OAIY_DATA_DIR%\\comfyui\"\r\n\"%OAIY_DATA_DIR%\\python\\python.exe\" -m venv \"%OAIY_VENVS_DIR%\\comfyui\"\r\n\"%OAIY_VENVS_DIR%\\comfyui\\Scripts\\pip.exe\" install -r \"%OAIY_DATA_DIR%\\comfyui\\requirements.txt\"\r\n"
+  },
+  "run": {
+    "command": "${dataDir}/venvs/comfyui/Scripts/python.exe",
+    "args": ["${dataDir}/comfyui/main.py", "--port", "${port}"],
+    "env": {},
+    "cwd": "${dataDir}/comfyui"
+  },
+  "health": { "url": "http://127.0.0.1:${port}/", "timeoutSecs": 120 },
+  "docsUrl": "https://github.com/comfyanonymous/ComfyUI"
+}

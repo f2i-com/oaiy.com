@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <!-- OAIY — flows converging into an orchestration hub (spark). Violet brand tile. -->
+  <defs>
+    <linearGradient id="oaiyBg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#6366f1"/>
+      <stop offset="1" stop-color="#4338ca"/>
+    </linearGradient>
+  </defs>
+  <rect width="1024" height="1024" rx="224" fill="url(#oaiyBg)"/>
+  <!-- converging flow edges -->
+  <g fill="none" stroke="#ffffff" stroke-width="30" stroke-linecap="round" opacity="0.92">
+    <path d="M300 320 C 470 360, 545 462, 700 504"/>
+    <path d="M300 512 C 470 512, 560 512, 700 512"/>
+    <path d="M300 704 C 470 664, 545 562, 700 520"/>
+  </g>
+  <!-- input nodes -->
+  <g fill="#ffffff">
+    <circle cx="300" cy="320" r="46"/>
+    <circle cx="300" cy="512" r="46"/>
+    <circle cx="300" cy="704" r="46"/>
+    <!-- orchestration hub -->
+    <circle cx="720" cy="512" r="112"/>
+  </g>
+  <!-- AI spark inside the hub (knockout in deep indigo) -->
+  <path d="M720 430 L745 487 L802 512 L745 537 L720 594 L695 537 L638 512 L695 487 Z" fill="#4338ca"/>
+</svg>
