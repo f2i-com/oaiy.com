@@ -73,17 +73,23 @@ cd api
 composer install
 cp .env.example .env      # SQLite by default; flip DB_DRIVER=mysql if you want MySQL
 php bin/migrate.php       # driver-aware: handles both SQLite + MySQL schemas
-php -S 0.0.0.0:8080 -t public/   # or hand public/ to nginx/Apache
+php -S 0.0.0.0:8081 -t public/   # or hand public/ to nginx/Apache
 ```
+
+`:8081`, not `:8080`, because llama.cpp — a service OAIY downloads and launches
+for you — binds `:8080` by default. Note also that `php -S` is single-threaded
+and the run long-poll holds a request open for 20s, so it blocks every other
+request; it is fine for poking at the API alone, but see `api/README.md` before
+running the UI against it.
 
 The driver-aware migration runner reads `DB_DRIVER` from `.env` and applies the matching schema (`migrations/001_initial.sqlite.sql` or `001_initial.sql`). SQLite stores at `api/var/oaiy.sqlite` by default. The router lives at `public/index.php`; everything else is under `src/`.
 
 ### Pointing the UI at the backend
 
-The frontend talks to the backend over HTTP. Set `VITE_API_BASE` at build time (or in `ui/.env.local` for dev):
+The frontend talks to the backend over HTTP. Set `VITE_API_BASE` at build time (or in `ui/.env.development.local` for dev):
 
 ```
-VITE_API_BASE=http://localhost:8080
+VITE_API_BASE=http://localhost:8081
 ```
 
 > **Put a dev-only value in `ui/.env.development.local`, not `ui/.env.local`.**

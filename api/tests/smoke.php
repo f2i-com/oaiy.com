@@ -7,7 +7,7 @@ declare(strict_types=1);
  * Drives a RUNNING server over HTTP — it is not a unit test. Point it at
  * whichever server you want to certify:
  *
- *     php tests/smoke.php                      # http://127.0.0.1:8080
+ *     php tests/smoke.php                      # http://127.0.0.1:8081
  *     php tests/smoke.php http://api.oaiy.local
  *     composer test
  *
@@ -29,7 +29,7 @@ declare(strict_types=1);
  * Exit code is 0 only when every assertion passes, so it is CI-usable.
  */
 
-$base = rtrim($argv[1] ?? 'http://127.0.0.1:8080', '/');
+$base = rtrim($argv[1] ?? 'http://127.0.0.1:8081', '/');
 
 $pass = 0;
 $fail = 0;
@@ -95,7 +95,7 @@ section('reachability + identity');
 $root = req('GET', '/');
 if ($root['status'] === 0) {
     fwrite(STDERR, "\nCannot reach $base — is the server running?\n");
-    fwrite(STDERR, "  php -S 127.0.0.1:8080 -t public/   (single-client only; see README)\n");
+    fwrite(STDERR, "  php -S 127.0.0.1:8081 -t public/   (single-client only; see README)\n");
     exit(2);
 }
 ok('GET / responds 200', $root['status'] === 200, "status={$root['status']}");
@@ -103,14 +103,22 @@ ok('GET / identifies as oaiy-api', ($root['body']['name'] ?? null) === 'oaiy-api
 ok('GET / advertises a docs url', is_string($root['body']['docs'] ?? null) && str_starts_with($root['body']['docs'], 'https://'));
 
 // Something answered, but is it US? A high port is easily owned by another dev
-// service (llama.cpp defaults to :8080, the very port the README suggests here),
-// and every later assertion would fail with a confusing message about missing
-// hashes rather than the actual problem. Say what's wrong and stop.
+// service — llama.cpp defaults to :8080, one below the port used here, and WAMP's
+// Apache usually sits there too — and every later assertion would fail with a
+// confusing message about a missing hash rather than the actual problem. Say
+// what is wrong and stop.
+//
+// This check earned its keep twice. Once on the companion port, where another
+// app answered /api/health with a matching shape so the UI went green while every
+// authenticated call 401'd. And once here: the README used to recommend :8080 for
+// the API — llama.cpp's own default — and pointing this test there got a 415 and
+// "gzip is not supported by this browser" back from Apache, which is what
+// surfaced the collision.
 if (($root['body']['name'] ?? null) !== 'oaiy-api') {
     fwrite(STDERR, "\n$base answered, but it is not the OAIY API.\n");
     fwrite(STDERR, "  it replied: " . substr(trim($root['raw']), 0, 160) . "\n");
     fwrite(STDERR, "  another service probably owns that port — pass the right base URL:\n");
-    fwrite(STDERR, "      php tests/smoke.php http://127.0.0.1:8081\n");
+    fwrite(STDERR, "      php tests/smoke.php http://127.0.0.1:9000\n");
     fwrite(STDERR, "      composer test -- http://api.oaiy.local\n");
     exit(2);
 }
