@@ -37,8 +37,10 @@
 pub mod ledger;
 pub mod routes;
 pub mod triggers;
+pub mod worker;
 
 pub use routes::{router as bridge_router, BridgeState};
+pub use worker::{FlowStore, Worker};
 pub use triggers::{dispatch, BindingMode, DispatchOutcome, Event, SkipReason, TriggerBinding};
 pub use ledger::{
     ClaimOutcome, Ledger, LedgerHandle, LineageRef, ReserveOutcome, RunError, RunErrorCode,

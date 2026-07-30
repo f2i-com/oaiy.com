@@ -45,11 +45,16 @@ use super::ledger::{
 };
 use crate::http::BRIDGE_PROTOCOL;
 use crate::plugins::registry::PluginRegistryHandle;
+use crate::plugins::{CallError, ForwardError, CONNECTOR_TIMEOUT};
 
 #[derive(Clone)]
 pub struct BridgeState {
     pub ledger: LedgerHandle,
     pub plugins: PluginRegistryHandle,
+    /// The live-process side of the plugin story: start/stop, health, and the
+    /// gated forwarding path. Shares `plugins` and `ledger` with this state.
+    pub host: std::sync::Arc<crate::plugins::PluginHost>,
+    pub flows: std::sync::Arc<super::worker::FlowStore>,
     /// Stable per-install id, echoed in discovery so a consumer can tell two
     /// machines apart in run history.
     pub device_id: String,
@@ -181,6 +186,9 @@ fn to_run_request(body: &RunRequestBody) -> RunRequest {
         caller_product: body.caller.product.clone(),
         flow_id: body.flow_id.clone(),
         inline_graph: body.graph.is_some(),
+        input: body.input.clone(),
+        timeout_ms: body.timeout_ms,
+        mode: body.mode.clone().unwrap_or_else(|| "async".into()),
         correlation_id: body.correlation_id.clone(),
         idempotency_key: body.idempotency_key.clone(),
         lineage,
@@ -471,36 +479,24 @@ async fn connector_request(
     Path(connector_id): Path<String>,
     Json(body): Json<ConnectorBody>,
 ) -> axum::response::Response {
-    let reg = match st.plugins.lock() {
-        Ok(r) => r,
-        Err(_) => {
-            return bridge_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal",
-                "plugin registry lock poisoned".into(),
-            )
-        }
-    };
+    // The host gates first (state, allow-list, journalling), forwards second.
+    // Run on a blocking thread: the plugin RPC legitimately takes seconds and
+    // must not park an async executor thread for the duration.
+    let host = st.host.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        host.forward_connector(
+            &connector_id,
+            &body.command,
+            body.payload,
+            body.idempotency_key.as_deref(),
+            CONNECTOR_TIMEOUT,
+        )
+    })
+    .await;
 
-    // The gate runs before anything is forwarded. An undeclared command must
-    // never reach the plugin process.
-    match reg.gate(&connector_id, &body.command, body.idempotency_key.as_deref()) {
-        Ok(_rec) => {
-            // The supervised process and its stdio are not wired yet, so this is
-            // an honest typed refusal rather than a fabricated success. Returning
-            // {ok:true} with an empty result would be the "quiet green light"
-            // this whole protocol exists to prevent.
-            bridge_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "capability_unavailable",
-                format!(
-                    "The \"{connector_id}\" plugin passed the capability gate, but this build \
-                     cannot forward commands yet — the supervised plugin process is not wired up. \
-                     Nothing was sent to the plugin."
-                ),
-            )
-        }
-        Err(refusal) => {
+    match result {
+        Ok(Ok(value)) => (StatusCode::OK, Json(json!({ "ok": true, "result": value }))).into_response(),
+        Ok(Err(ForwardError::Refused(refusal))) => {
             let status = match refusal.code() {
                 "capability_denied" => StatusCode::FORBIDDEN,
                 "invalid_request" => StatusCode::BAD_REQUEST,
@@ -508,6 +504,192 @@ async fn connector_request(
             };
             bridge_error(status, refusal.code(), refusal.message())
         }
+        Ok(Err(ForwardError::NotRunning { plugin_id })) => bridge_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "capability_unavailable",
+            format!(
+                "The {plugin_id} plugin stopped between the gate check and the call.                  Start it in OAIY Desktop → Plugins."
+            ),
+        ),
+        Ok(Err(ForwardError::Call(CallError::Timeout { method, waited }))) => bridge_error(
+            StatusCode::GATEWAY_TIMEOUT,
+            "timeout",
+            format!("the plugin did not answer {method} within {:.0}s", waited.as_secs_f32()),
+        ),
+        Ok(Err(ForwardError::Call(CallError::Plugin { message, typed, .. }))) => {
+            // The plugin's own typed refusal passes through untranslated — it
+            // knows why it refused better than we do.
+            bridge_error(
+                StatusCode::BAD_GATEWAY,
+                typed.as_deref().unwrap_or("node_failed"),
+                message,
+            )
+        }
+        Ok(Err(ForwardError::Call(e))) => {
+            bridge_error(StatusCode::BAD_GATEWAY, "runtime_unavailable", e.to_string())
+        }
+        Ok(Err(ForwardError::Internal(m))) => {
+            bridge_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", m)
+        }
+        Err(join) => bridge_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            format!("forwarding task failed: {join}"),
+        ),
+    }
+}
+
+// ------- plugin lifecycle -------
+
+async fn start_plugin(State(st): State<BridgeState>, Path(id): Path<String>) -> axum::response::Response {
+    let host = st.host.clone();
+    // Blocking: spawn + handshake can take the full HANDSHAKE_TIMEOUT.
+    match tokio::task::spawn_blocking(move || host.start(&id)).await {
+        Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Err(e)) => bridge_error(StatusCode::CONFLICT, "capability_unavailable", e),
+        Err(e) => bridge_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()),
+    }
+}
+
+async fn stop_plugin(State(st): State<BridgeState>, Path(id): Path<String>) -> axum::response::Response {
+    let host = st.host.clone();
+    match tokio::task::spawn_blocking(move || host.stop(&id)).await {
+        Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Err(e)) => bridge_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", e),
+        Err(e) => bridge_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct LogsQuery {
+    tail: Option<usize>,
+}
+
+async fn plugin_logs(
+    State(st): State<BridgeState>,
+    Path(id): Path<String>,
+    axum::extract::Query(q): axum::extract::Query<LogsQuery>,
+) -> axum::response::Response {
+    match st.host.logs(&id, q.tail) {
+        Some(lines) => (StatusCode::OK, Json(json!({ "lines": lines }))).into_response(),
+        // Not running is not an error - logs simply do not exist yet. An empty
+        // list keeps a UI polling logs from erroring the moment a plugin stops.
+        None => (StatusCode::OK, Json(json!({ "lines": [] }))).into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct EnableBody {
+    enabled: bool,
+}
+
+async fn set_plugin_enabled(
+    State(st): State<BridgeState>,
+    Path(id): Path<String>,
+    Json(body): Json<EnableBody>,
+) -> axum::response::Response {
+    if !body.enabled {
+        // Disabling a running plugin stops it first - a disabled-but-running
+        // plugin would keep serving commands the user just declined.
+        let host = st.host.clone();
+        let id2 = id.clone();
+        let _ = tokio::task::spawn_blocking(move || host.stop(&id2)).await;
+    }
+    match st.plugins.lock() {
+        Ok(mut reg) => {
+            reg.set_user_disabled(&id, !body.enabled);
+            match reg.get(&id) {
+                Some(rec) => (StatusCode::OK, Json(rec.clone())).into_response(),
+                None => bridge_error(
+                    StatusCode::NOT_FOUND,
+                    "invalid_request",
+                    format!("no plugin named {id:?}"),
+                ),
+            }
+        }
+        Err(_) => bridge_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", "registry lock poisoned".into()),
+    }
+}
+
+// ------- triggers -------
+
+async fn list_triggers(State(st): State<BridgeState>) -> axum::response::Response {
+    match st.host.triggers.lock() {
+        Ok(t) => (StatusCode::OK, Json(json!({ "bindings": t.list() }))).into_response(),
+        Err(_) => bridge_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", "trigger store lock poisoned".into()),
+    }
+}
+
+async fn upsert_trigger(
+    State(st): State<BridgeState>,
+    Json(binding): Json<crate::bridge::triggers::TriggerBinding>,
+) -> axum::response::Response {
+    match st.host.triggers.lock() {
+        Ok(mut t) => match t.upsert(binding) {
+            Ok(()) => (StatusCode::OK, Json(json!({ "bindings": t.list() }))).into_response(),
+            Err(e) => bridge_error(StatusCode::BAD_REQUEST, "invalid_request", e),
+        },
+        Err(_) => bridge_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", "trigger store lock poisoned".into()),
+    }
+}
+
+async fn delete_trigger(State(st): State<BridgeState>, Path(id): Path<String>) -> axum::response::Response {
+    match st.host.triggers.lock() {
+        Ok(mut t) => match t.remove(&id) {
+            Ok(true) => StatusCode::NO_CONTENT.into_response(),
+            Ok(false) => bridge_error(StatusCode::NOT_FOUND, "invalid_request", format!("no binding {id:?}")),
+            Err(e) => bridge_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", e),
+        },
+        Err(_) => bridge_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", "trigger store lock poisoned".into()),
+    }
+}
+
+// ------- events (polling) -------
+
+#[derive(Debug, Deserialize)]
+struct EventsQuery {
+    #[serde(default)]
+    since: u64,
+    limit: Option<usize>,
+}
+
+async fn poll_events(
+    State(st): State<BridgeState>,
+    axum::extract::Query(q): axum::extract::Query<EventsQuery>,
+) -> axum::response::Response {
+    let events = st.host.events_since(q.since, q.limit.unwrap_or(100).min(500));
+    let next = events.last().map(|e| e.seq).unwrap_or(q.since);
+    (StatusCode::OK, Json(json!({ "events": events, "next": next }))).into_response()
+}
+
+// ------- flows -------
+
+async fn list_flows(State(st): State<BridgeState>) -> axum::response::Response {
+    let flows: Vec<serde_json::Value> = st
+        .flows
+        .list()
+        .into_iter()
+        .map(|(id, name)| json!({ "flowId": id, "name": name.unwrap_or_else(|| id.clone()) }))
+        .collect();
+    (StatusCode::OK, Json(json!({ "flows": flows }))).into_response()
+}
+
+async fn put_flow(
+    State(st): State<BridgeState>,
+    Path(id): Path<String>,
+    body: String,
+) -> axum::response::Response {
+    match st.flows.put(&id, &body) {
+        Ok(_) => (StatusCode::OK, Json(json!({ "flowId": id }))).into_response(),
+        Err(e) => bridge_error(StatusCode::BAD_REQUEST, "invalid_request", e),
+    }
+}
+
+async fn delete_flow(State(st): State<BridgeState>, Path(id): Path<String>) -> axum::response::Response {
+    match st.flows.delete(&id) {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => bridge_error(StatusCode::NOT_FOUND, "invalid_request", format!("no flow {id:?}")),
+        Err(e) => bridge_error(StatusCode::BAD_REQUEST, "invalid_request", e),
     }
 }
 
@@ -523,6 +705,18 @@ pub fn router(state: BridgeState) -> Router {
         .route(
             "/api/bridge/connectors/:id/request",
             post(connector_request),
+        )
+        .route("/api/plugins/:id/start", post(start_plugin))
+        .route("/api/plugins/:id/stop", post(stop_plugin))
+        .route("/api/plugins/:id/logs", get(plugin_logs))
+        .route("/api/plugins/:id/enabled", post(set_plugin_enabled))
+        .route("/api/bridge/triggers", get(list_triggers).post(upsert_trigger))
+        .route("/api/bridge/triggers/:id", axum::routing::delete(delete_trigger))
+        .route("/api/bridge/events", get(poll_events))
+        .route("/api/bridge/flows", get(list_flows))
+        .route(
+            "/api/bridge/flows/:id",
+            axum::routing::put(put_flow).delete(delete_flow),
         )
         .with_state(state)
 }

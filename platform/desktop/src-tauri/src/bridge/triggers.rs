@@ -220,10 +220,16 @@ pub fn dispatch(
             depth: origin.depth + 1,
         };
 
+        // Inputs resolve at dispatch, not at claim: the worker holds a record,
+        // not the event, so the mapping must already be applied.
+        let inputs = resolve_inputs(&b.input_map, event);
         let req = RunRequest {
             caller_product: format!("oaiy-trigger:{}", event.source),
             flow_id: Some(b.flow_id.clone()),
             inline_graph: false,
+            input: if inputs.is_empty() { None } else { Some(Value::Object(inputs)) },
+            timeout_ms: None,
+            mode: "async".into(),
             correlation_id: event.correlation_id.clone(),
             // The dedupe key: one binding handles one event occurrence once,
             // however many times that event is delivered.
