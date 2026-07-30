@@ -1096,6 +1096,59 @@ select:disabled { cursor: not-allowed; opacity: 0.5; }
 
 .form-row-pair { display: flex; flex-wrap: wrap; gap: 10px; }
 
+/* ---------------------------------------------------------------------------
+ * OVERVIEW (control centre) + plugin-contributed screens
+ * ------------------------------------------------------------------------ */
+
+/* Status tiles: auto-fit so they reflow from 4-up to 1-up without breakpoints. */
+.overview-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 10px;
+}
+.overview-tile {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+  padding: 12px 13px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-card);
+  background: var(--surface-raised, var(--surface));
+  color: inherit;
+  cursor: pointer;
+  text-align: left;
+  transition: border-color 0.15s ease, transform 0.15s ease;
+}
+.overview-tile:hover { border-color: var(--strong-border); transform: translateY(-1px); }
+.overview-tile:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+.overview-tile strong { font-size: 20px; font-weight: 650; letter-spacing: -0.01em; }
+.overview-tile small { color: var(--muted); font-size: 11.5px; }
+
+/* A plugin's nav badge ("New"), sized to sit beside the sidebar label. */
+.nav-badge {
+  margin-left: auto;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: var(--primary-soft, var(--surface-raised));
+  color: var(--primary);
+  font-size: 9.5px;
+  font-style: normal;
+  font-weight: 650;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+/* The hosted plugin screen fills the content area; the plugin owns its own
+   styling inside, so we only give it a frame. */
+.plugin-screen {
+  width: 100%;
+  min-height: 70vh;
+  border: 1px solid var(--border);
+  border-radius: var(--r-card);
+  background: var(--surface);
+}
+
 /* A checkbox that sits inline with its label instead of stacking (the AI provider
    form's "local endpoint" toggle). The forms themselves reuse .dl-form. */
 .form-row-inline { flex: initial; flex-direction: row; align-items: center; gap: 8px; }
