@@ -16,5 +16,10 @@
     },
     "config": {
         "sort-packages": true
+    },
+    "scripts": {
+        "test": "php tests/smoke.php",
+        "migrate": "php bin/migrate.php",
+        "gc": "php bin/gc.php"
     }
 }

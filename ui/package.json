@@ -9,7 +9,10 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "typecheck": "tsc --noEmit -p tsconfig.json"
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test:e2e": "node tests/e2e.mjs",
+    "test:css": "node tests/css-tokens.mjs",
+    "test": "npm run typecheck && npm run test:css"
   },
   "dependencies": {
     "@ffmpeg/ffmpeg": "^0.12.15",
