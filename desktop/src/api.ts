@@ -27,7 +27,11 @@ async function request<T>(
       let detail = resp.statusText;
       try {
         const body = await resp.json();
-        if (body?.error) detail = body.error;
+        // Two error shapes in this API: the plain `{ error: "msg" }` the
+        // services/models/python routes use, and the taxonomy `{ error: { code,
+        // message } }` the bridge + AI gateway routes use. Surface either.
+        if (typeof body?.error === 'string') detail = body.error;
+        else if (typeof body?.error?.message === 'string') detail = body.error.message;
       } catch {
         /* not JSON — ignore */
       }
@@ -404,6 +408,58 @@ export const plugins = {
     request<{ lines: LogLine[] }>(
       `/api/plugins/${encodeURIComponent(id)}/logs?tail=${tail}`,
     ),
+};
+
+// ----- AI providers (the local AI gateway) -----
+
+export type AiProtocol = 'openai' | 'anthropic';
+export type AiCapability = 'chat' | 'transcription' | 'speech' | 'embeddings' | 'realtime';
+
+/** A configured AI provider, secret-free: the API key never leaves the device,
+ *  so the wire carries only `hasKey`. */
+export interface AiProviderPublic {
+  id: string;
+  name: string;
+  category?: string | null;
+  protocol: AiProtocol;
+  baseUrl: string;
+  model?: string | null;
+  capabilities: AiCapability[];
+  enabled: boolean;
+  allowLocal: boolean;
+  hasKey: boolean;
+}
+
+/** Upsert body — no key (the key is set separately via `setKey`; an edit that
+ *  omits it preserves the existing key). */
+export interface AiProviderInput {
+  id: string;
+  name: string;
+  category?: string;
+  protocol: AiProtocol;
+  baseUrl: string;
+  model?: string;
+  capabilities?: AiCapability[];
+  enabled?: boolean;
+  allowLocal?: boolean;
+}
+
+export const aiProviders = {
+  list: () => request<{ providers: AiProviderPublic[] }>('/api/ai/providers'),
+  upsert: (input: AiProviderInput) =>
+    request<{ id: string }>('/api/ai/providers', { method: 'POST', body: JSON.stringify(input) }),
+  delete: (id: string) =>
+    request<void>(`/api/ai/providers/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  /** Set the plaintext key (stored on-device), or clear it with `null`. */
+  setKey: (id: string, key: string | null) =>
+    request<void>(`/api/ai/providers/${encodeURIComponent(id)}/key`, {
+      method: 'POST',
+      body: JSON.stringify({ key }),
+    }),
+  /** A real authenticated round trip. Resolves on reachable+authorized; throws
+   *  (the API returns 502) otherwise. */
+  test: (id: string) =>
+    request<{ ok: boolean }>(`/api/ai/providers/${encodeURIComponent(id)}/test`, { method: 'POST' }),
 };
 
 // ----- formatting helpers used by multiple components -----
