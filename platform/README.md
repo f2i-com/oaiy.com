@@ -148,6 +148,18 @@ All routes are JSON in / JSON out. Both `hash_view` and `hash_edit` accept the s
 - **Stale runs self-heal.** A run left in `running` because its browser tab died is reset to a terminal `error` after `RUN_TTL` seconds (default 900), so an external poller always reaches a terminal status.
 - The `owner_token` (returned from create, replayed via the `X-Owner-Token` header) is the only thing that authorises `DELETE` on a flow — the hashes alone are read+update only.
 
+## Testing
+
+Four suites, one per deployable — Rust unit tests, CLI engine tests, an API
+end-to-end smoke test and a browser end-to-end suite. See [`TESTING.md`](TESTING.md).
+
+```bash
+(cd desktop/src-tauri && cargo test)   # 28 tests, no services needed
+(cd cli && npm test)                   # 4 suites, no services needed
+(cd api && composer test)              # needs a running API + migrated DB
+(cd ui && npm run test:e2e)            # needs `npm run dev`
+```
+
 ## License
 
 Licensed under the **Apache License 2.0** — see [`LICENSE`](LICENSE) and
