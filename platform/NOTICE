@@ -18,9 +18,9 @@ limitations under the License.
 --------------------------------------------------------------------------------
 THIRD-PARTY FONTS REDISTRIBUTED IN THIS REPOSITORY
 
-The desktop companion self-hosts two web fonts so it renders offline. They are
-NOT covered by the Apache License above — each keeps its own upstream license,
-and both are distributed under the SIL Open Font License, Version 1.1. The
+Both apps self-host their fonts so they render offline. Those fonts are NOT
+covered by the Apache License above — each keeps its own upstream license, and
+all four are distributed under the SIL Open Font License, Version 1.1. The
 verbatim license text for each ships next to the font it applies to.
 
   desktop/public/fonts/public-sans.woff2
@@ -34,11 +34,25 @@ verbatim license text for each ships next to the font it applies to.
       https://github.com/JetBrains/JetBrainsMono
       License: desktop/public/fonts/jetbrains-mono.OFL.txt
 
+  ui/ (bundled from the @fontsource-variable/* packages at build time, emitted
+  into dist/assets/ as hashed .woff2 files)
+      Inter. Copyright 2016 The Inter Project Authors.
+      https://github.com/rsms/inter
+      License: ui/public/fonts/inter.OFL.txt
+
+      JetBrains Mono. Copyright 2020 The JetBrains Mono Project Authors.
+      https://github.com/JetBrainsMono
+      License: ui/public/fonts/jetbrains-mono.OFL.txt
+
+The web app used to load these two from fonts.googleapis.com at runtime instead.
+That sent every page load to a third party, in a product whose landing page sells
+"nothing leaves your device" — so it now self-hosts them, and the licenses moved
+in here with the binaries. Because the bundler emits the .woff2 files as opaque
+hashed assets with no license of their own, the two .txt files live in
+ui/public/fonts/ and are copied verbatim into dist/fonts/ alongside them.
+
 The OFL is permissive and imposes no conditions on the surrounding Apache-2.0
 code. Its obligations are limited to the font files themselves: keep the license
 text and copyright notice with them, don't sell the fonts on their own, and
 don't reuse the reserved font names for a modified version. See
-desktop/public/fonts/README.md.
-
-The WEB app (ui/) does not redistribute any font — it loads Inter and JetBrains
-Mono from Google Fonts at runtime — so only the two files above are affected.
+desktop/public/fonts/README.md and ui/public/fonts/README.md.

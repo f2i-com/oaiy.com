@@ -42,9 +42,28 @@ import { toBlobURL } from '@ffmpeg/util';
 
 // Pin a specific @ffmpeg/core version to match the @ffmpeg/ffmpeg API.
 // Bumped 2026-05-28 to match @ffmpeg/ffmpeg ^0.12.15.
-const FFMPEG_CORE_VERSION = '0.12.10';
-const FFMPEG_CORE_BASE =
-  `https://unpkg.com/@ffmpeg/core@${FFMPEG_CORE_VERSION}/dist/umd`;
+//
+// SELF-HOSTED by default. This used to fetch the core from
+// `https://unpkg.com/@ffmpeg/core@<v>/dist/umd`, which meant every video and
+// audio node needed the public internet and trusted a third-party CDN at
+// runtime — in an app whose whole claim is that media processing happens on your
+// machine. The `?url` imports below make the bundler emit both files as hashed
+// assets instead, so they are versioned with the app and work offline.
+//
+// The cost is honest and large: ffmpeg-core.wasm is ~31 MB. It is lazily
+// fetched, only when a flow first touches a media node, so it never affects page
+// load. If you would rather serve it from a CDN or your own mirror, set
+// VITE_FFMPEG_CORE_BASE at build time to a base URL holding ffmpeg-core.js and
+// ffmpeg-core.wasm.
+// Relative, not '@ffmpeg/core/...': the package's exports map only exposes "."
+// and "./wasm" and both point at the ESM build, while ffmpeg.wasm's coreURL
+// needs the UMD one. A relative path resolves the real file directly.
+import ffmpegCoreJsUrl from '../../node_modules/@ffmpeg/core/dist/umd/ffmpeg-core.js?url';
+import ffmpegCoreWasmUrl from '../../node_modules/@ffmpeg/core/dist/umd/ffmpeg-core.wasm?url';
+
+const FFMPEG_CORE_OVERRIDE = (
+  (import.meta.env?.VITE_FFMPEG_CORE_BASE as string | undefined) ?? ''
+).replace(/\/$/, '');
 
 let ffmpegInstance: FFmpeg | null = null;
 let loadPromise: Promise<FFmpeg> | null = null;
@@ -82,8 +101,14 @@ async function getFFmpeg(): Promise<FFmpeg> {
     console.info('[ffmpeg-shim] loading ffmpeg-core (~25 MB, first time only)…');
     const t0 = performance.now();
     await ff.load({
-      coreURL: await toBlobURL(`${FFMPEG_CORE_BASE}/ffmpeg-core.js`, 'text/javascript'),
-      wasmURL: await toBlobURL(`${FFMPEG_CORE_BASE}/ffmpeg-core.wasm`, 'application/wasm'),
+      coreURL: await toBlobURL(
+        FFMPEG_CORE_OVERRIDE ? `${FFMPEG_CORE_OVERRIDE}/ffmpeg-core.js` : ffmpegCoreJsUrl,
+        'text/javascript',
+      ),
+      wasmURL: await toBlobURL(
+        FFMPEG_CORE_OVERRIDE ? `${FFMPEG_CORE_OVERRIDE}/ffmpeg-core.wasm` : ffmpegCoreWasmUrl,
+        'application/wasm',
+      ),
     });
     // eslint-disable-next-line no-console
     console.info(`[ffmpeg-shim] loaded in ${((performance.now() - t0) / 1000).toFixed(1)}s`);

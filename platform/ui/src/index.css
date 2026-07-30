@@ -1,5 +1,14 @@
 @import "tailwindcss";
 
+/* Self-hosted fonts. These were <link>ed from fonts.googleapis.com, which meant
+   the app phoned home to Google on every page load — in a product whose landing
+   page sells "nothing leaves your device", and whose desktop companion already
+   self-hosts the same two families. Variable weight matters: the design system
+   asks for 580/620/650/720, which a static cut would snap to the nearest. Both
+   are SIL OFL 1.1; see NOTICE. */
+@import "@fontsource-variable/inter";
+@import "@fontsource-variable/jetbrains-mono";
+
 /* Tailwind v4 is CSS-first and does NOT pick up tailwind.config.js on its own.
    Without this the JS config is dead: its theme extensions and — more visibly —
    the custom `short:` variant (@media (max-height: 780px), used across 9 dialog

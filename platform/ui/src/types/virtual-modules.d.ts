@@ -7,3 +7,8 @@ declare module 'virtual:sandbox-runtime' {
   const runtime: string;
   export default runtime;
 }
+
+declare module '@ffmpeg-core/wasm?url' {
+  const url: string;
+  export default url;
+}
