@@ -1380,3 +1380,27 @@ select:disabled { cursor: not-allowed; opacity: 0.5; }
    actively working. */
 .spin { animation: spin-rotate 0.9s linear infinite; }
 @keyframes spin-rotate { to { transform: rotate(360deg); } }
+
+/* --- Pairing prompt (a consumer earning a token) --- */
+.pairing-wrap { display: flex; flex-direction: column; gap: 10px; margin-bottom: 16px; }
+.pairing-card {
+  border: 1px solid rgb(var(--color-border-primary));
+  border-radius: 12px;
+  padding: 14px 16px;
+  background: rgb(var(--color-bg-elevated));
+}
+.pairing-pending {
+  /* Draw the eye — an unapproved request is the one thing needing a decision. */
+  border-color: rgb(var(--accent-primary) / 0.55);
+  box-shadow: 0 0 0 1px rgb(var(--accent-primary) / 0.25);
+}
+.pairing-head { display: flex; align-items: center; gap: 8px; font-size: 14px; margin-bottom: 6px; }
+.pairing-body { display: flex; flex-direction: column; gap: 4px; font-size: 13px; opacity: 0.85; }
+.pairing-code code {
+  font-size: 15px; letter-spacing: 2px; font-weight: 600;
+  padding: 1px 6px; border-radius: 6px;
+  background: rgb(var(--color-bg-tertiary) / 0.7);
+}
+.pairing-actions { display: flex; gap: 8px; margin-top: 12px; }
+.pairing-list { list-style: none; margin: 6px 0 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.pairing-list li { display: flex; align-items: center; justify-content: space-between; font-size: 13px; }
