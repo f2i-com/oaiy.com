@@ -143,6 +143,14 @@ export function ThemeProvider({ children }: ThemeProviderProps) {
     root.style.setProperty('--accent-primary', colors.primary);
     root.style.setProperty('--accent-hover', colors.hover);
     root.style.setProperty('--accent-glow', colors.glow);
+    // Primary gradients use --accent-secondary as their second stop. Prism Lab
+    // pairs violet with azure; every other accent (and all of Paper Circuit,
+    // which is deliberately single-primary) reads better as a flat fill, so it
+    // mirrors the primary rather than staying stuck on the default violet.
+    root.style.setProperty(
+      '--accent-secondary',
+      resolvedTheme === 'dark' && accentColor === 'indigo' ? '77 139 255' : colors.primary,
+    );
   }, [accentColor, resolvedTheme]);
 
   // Apply background tint as CSS variables. useLayoutEffect (pre-paint) — the

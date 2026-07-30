@@ -11,7 +11,7 @@
  * it doesn't couple to LandingPage's internal helpers.
  */
 import { useEffect, useState } from 'react';
-import SiteNav from './SiteNav';
+import SiteNav, { REPO_URL } from './SiteNav';
 
 const APP_URL = 'app.html';
 const LANDING_URL = '/';
@@ -64,6 +64,7 @@ function Footer() {
         </a>
         <nav className="flex items-center gap-5 text-sm" style={{ color: 'rgb(var(--color-text-tertiary))' }} aria-label="Footer">
           <a href={LANDING_URL}>Home</a>
+          <a href={REPO_URL} target="_blank" rel="noopener noreferrer">GitHub</a>
           <a href={APP_URL}>Open app</a>
           <a href="#library">Library</a>
         </nav>

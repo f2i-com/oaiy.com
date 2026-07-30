@@ -11,7 +11,7 @@
   "scripts": {
     "build": "node esbuild.mjs",
     "typecheck": "tsc --noEmit -p tsconfig.json",
-    "test": "esbuild test/module-ctx-isolation.ts --bundle --platform=node --format=esm --outfile=dist/_ctxtest.mjs && node dist/_ctxtest.mjs && esbuild test/cross-module-isolation.ts --bundle --platform=node --format=esm --outfile=dist/_xmtest.mjs && node dist/_xmtest.mjs && esbuild test/ssrf-guard.test.ts --bundle --platform=node --format=esm --outfile=dist/_ssrftest.mjs && node dist/_ssrftest.mjs && node test/build-engine-tests.mjs",
+    "test": "esbuild test/module-ctx-isolation.ts --bundle --platform=node --format=esm --outfile=dist/_ctxtest.mjs && node dist/_ctxtest.mjs && esbuild test/cross-module-isolation.ts --bundle --platform=node --format=esm --outfile=dist/_xmtest.mjs && node dist/_xmtest.mjs && esbuild test/ssrf-guard.test.ts --bundle --platform=node --format=esm --packages=external --outfile=dist/_ssrftest.mjs && node dist/_ssrftest.mjs && node test/build-engine-tests.mjs",
     "oaiy": "node bin/oaiy.mjs"
   },
   "dependencies": {

@@ -178,6 +178,7 @@ export default function App() {
           className="open-editor"
           type="button"
           onClick={() => openExternal(WEB_APP_URL)}
+          aria-label="Open the OAIY flow editor"
           title={WEB_APP_URL}
         >
           <Workflow size={17} />
@@ -194,6 +195,11 @@ export default function App() {
                 key={item.value}
                 className={view === item.value ? 'active' : ''}
                 aria-current={view === item.value ? 'page' : undefined}
+                /* Below 1240px the label <span> is display:none and the icon is
+                   aria-hidden, which would leave the button with no accessible
+                   name at all — so name it explicitly. */
+                aria-label={item.label}
+                title={item.label}
                 onClick={() => setView(item.value)}
               >
                 <Icon size={18} />
@@ -224,6 +230,8 @@ export default function App() {
           className={view === 'settings' ? 'settings active' : 'settings'}
           type="button"
           aria-current={view === 'settings' ? 'page' : undefined}
+          aria-label="Settings"
+          title="Settings"
           onClick={() => setView('settings')}
         >
           <Settings2 size={18} />
@@ -236,7 +244,7 @@ export default function App() {
         </div>
       </aside>
 
-      <main id="main" className="workspace">
+      <main id="main" className="workspace" tabIndex={-1}>
         <header className="topbar">
           <div className="top-title">
             <span>

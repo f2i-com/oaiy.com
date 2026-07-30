@@ -5,7 +5,6 @@ import {
   Cloud,
   Copy,
   Database,
-  HelpCircle,
   LockKeyhole,
   Moon,
   Plus,
@@ -14,7 +13,6 @@ import {
   Settings2,
   Share2,
   Sun,
-  Upload,
   Workflow,
   type LucideIcon,
 } from 'lucide-react';
@@ -40,7 +38,6 @@ export interface ShellNavItem {
   label: string;
   icon: LucideIcon;
   active: boolean;
-  badge?: string;
   onClick: () => void;
 }
 
@@ -51,7 +48,6 @@ export function ShellSidebar({
   onSelectView,
   onNewFlow,
   onOpenQueue,
-  queueBadge,
   onOpenPlugins,
   onOpenServices,
   onOpenSettings,
@@ -63,7 +59,6 @@ export function ShellSidebar({
   onSelectView: (v: ShellView) => void;
   onNewFlow: () => void;
   onOpenQueue: () => void;
-  queueBadge?: string;
   onOpenPlugins: () => void;
   onOpenServices: () => void;
   onOpenSettings: () => void;
@@ -85,7 +80,6 @@ export function ShellSidebar({
       label: 'Runs',
       icon: Activity,
       active: false,
-      badge: queueBadge,
       onClick: onOpenQueue,
     },
     { id: 'plugins', label: 'Plugins', icon: Puzzle, active: false, onClick: onOpenPlugins },
@@ -124,7 +118,6 @@ export function ShellSidebar({
             >
               <Icon size={18} />
               <span>{item.label}</span>
-              {item.badge && <em>{item.badge}</em>}
             </button>
           );
         })}
@@ -254,8 +247,6 @@ export function ShellIconAction({
     </button>
   );
 }
-
-export { HelpCircle, Upload, Share2, Activity, Settings2, Copy };
 
 /* ---------------------------------------------------------------------- dock */
 
