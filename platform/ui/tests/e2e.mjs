@@ -245,6 +245,83 @@ for (const theme of ['dark', 'light']) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Self-hosted fonts, and no third-party requests at all.
+//
+// Both halves of this are here because both failed silently once.
+//
+// The app used to pull Inter and JetBrains Mono from fonts.googleapis.com, so
+// every page load reported the reader to Google — in a product whose landing
+// page sells "nothing leaves your device". Self-hosting them then failed twice
+// over without a single console warning: the @font-face rules named the family
+// `Inter Variable` while the CSS tokens asked for `Inter`, and Tailwind v4
+// inlined the font @import without rebasing its relative url()s, so the rules
+// pointed at files that were never emitted. Result: no woff2 request, no error,
+// and every page rendering in Segoe UI while looking entirely deliberate.
+//
+// Checking `document.fonts.check()` alone is not enough — it answers about the
+// family, not about whether real glyphs arrived — so this also measures text
+// rendered in the face against a guaranteed-missing family. Identical widths
+// mean the browser fell back and the font never loaded.
+section('self-hosted fonts + zero third-party requests');
+for (const path of ['/', '/desktop.html', '/app.html']) {
+  const ctx = await browser.newContext();
+  const page = await ctx.newPage();
+  const external = [];
+  const woff2 = [];
+  page.on('request', (r) => {
+    const u = r.url();
+    if (!/^(https?:\/\/localhost|https?:\/\/127\.0\.0\.1|data:|blob:)/.test(u)) external.push(u);
+  });
+  page.on('response', (r) => {
+    if (/\.woff2?(\?|$)/.test(r.url())) woff2.push(r.status());
+  });
+
+  await page.goto(BASE + path, { waitUntil: 'networkidle' });
+  await page.waitForTimeout(1200);
+
+  const r = await page.evaluate(async () => {
+    await document.fonts.ready;
+    const el = document.createElement('span');
+    el.textContent = 'OAIY orchestrate 0123';
+    el.style.position = 'absolute';
+    el.style.whiteSpace = 'pre';
+    document.body.appendChild(el);
+    const widthIn = (family) => {
+      el.style.font = `400 40px ${family}`;
+      return el.getBoundingClientRect().width;
+    };
+    const measured = {
+      inter: widthIn('"Inter Variable"'),
+      mono: widthIn('"JetBrains Mono Variable"'),
+      // A family that cannot exist, so the browser must use the generic.
+      fallbackSans: widthIn('"__oaiy_missing__", sans-serif'),
+      fallbackMono: widthIn('"__oaiy_missing__", monospace'),
+    };
+    el.remove();
+    return {
+      interReady: document.fonts.check('16px "Inter Variable"'),
+      monoReady: document.fonts.check('16px "JetBrains Mono Variable"'),
+      bodyFirst: getComputedStyle(document.body).fontFamily.split(',')[0].replace(/["']/g, '').trim(),
+      interDistinct: Math.abs(measured.inter - measured.fallbackSans) > 0.5,
+      monoDistinct: Math.abs(measured.mono - measured.fallbackMono) > 0.5,
+    };
+  });
+
+  ok(`${path} fetches its fonts locally`, woff2.length > 0, `${woff2.length} woff2 responses`);
+  ok(`${path} every font response is 200`, woff2.length > 0 && woff2.every((s) => s === 200), woff2.join(','));
+  ok(`${path} Inter Variable is loaded`, r.interReady);
+  ok(`${path} JetBrains Mono Variable is loaded`, r.monoReady);
+  ok(`${path} Inter actually renders (not a fallback)`, r.interDistinct);
+  ok(`${path} JetBrains Mono actually renders (not a fallback)`, r.monoDistinct);
+  ok(`${path} body resolves to the self-hosted family`, r.bodyFirst === 'Inter Variable', r.bodyFirst);
+  // The api base is same-origin-ish (127.0.0.1) and allowed above; anything else
+  // is a CDN or a tracker that crept back in.
+  ok(`${path} makes no third-party requests`, external.length === 0, external.join(' '));
+
+  await ctx.close();
+}
+
 await browser.close();
 
 console.log(`\n${'-'.repeat(60)}`);

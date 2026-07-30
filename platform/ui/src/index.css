@@ -1,13 +1,8 @@
 @import "tailwindcss";
 
-/* Self-hosted fonts. These were <link>ed from fonts.googleapis.com, which meant
-   the app phoned home to Google on every page load — in a product whose landing
-   page sells "nothing leaves your device", and whose desktop companion already
-   self-hosts the same two families. Variable weight matters: the design system
-   asks for 580/620/650/720, which a static cut would snap to the nearest. Both
-   are SIL OFL 1.1; see NOTICE. */
-@import "@fontsource-variable/inter";
-@import "@fontsource-variable/jetbrains-mono";
+/* The @font-face rules for the two self-hosted families are NOT imported here.
+   They come in through the JS graph instead — see src/styles/fonts.ts, which
+   every page entry imports alongside this file, and which explains why. */
 
 /* Tailwind v4 is CSS-first and does NOT pick up tailwind.config.js on its own.
    Without this the JS config is dead: its theme extensions and — more visibly —
@@ -37,9 +32,15 @@
      JetBrains Mono carries the data/code voice. --font-display is kept as a
      token name because ~40 components reference it, but it now points at the
      same family with tighter tracking applied via .font-display. */
-  --font-display: Inter, ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
-  --font-body: Inter, ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
-  --font-mono: 'JetBrains Mono', ui-monospace, 'SF Mono', 'Cascadia Mono', Menlo, monospace;
+  /* 'Inter Variable' first, then plain 'Inter'. The self-hosted @font-face rules
+     declare the -Variable name (that is fontsource's convention for the variable
+     cuts), so a stack asking only for 'Inter' matches nothing and silently falls
+     through to Segoe UI — which is exactly what happened when these were first
+     un-CDN'd, and it is invisible unless you check document.fonts. Plain 'Inter'
+     is kept behind it so a locally installed copy is still honoured. */
+  --font-display: 'Inter Variable', Inter, ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --font-body: 'Inter Variable', Inter, ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --font-mono: 'JetBrains Mono Variable', 'JetBrains Mono', ui-monospace, 'SF Mono', 'Cascadia Mono', Menlo, monospace;
 
   font-family: var(--font-body);
   line-height: 1.5;
