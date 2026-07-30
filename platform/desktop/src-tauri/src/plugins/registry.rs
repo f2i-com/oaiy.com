@@ -323,6 +323,13 @@ impl PluginRegistry {
         self.plugins.insert(record.id.clone(), record);
     }
 
+    /// Drop a plugin from the in-memory registry after its directory has been
+    /// removed. `scan()` only ADDS what it finds on disk, so without this an
+    /// uninstalled plugin would linger in the listing until the next restart.
+    pub fn forget(&mut self, id: &str) -> bool {
+        self.plugins.remove(id).is_some()
+    }
+
     /// Move a plugin to `state`, with a reason for every non-running state.
     ///
     /// Takes the reason as `Option` but stores a fallback when a non-running

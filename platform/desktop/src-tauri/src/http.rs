@@ -581,6 +581,8 @@ fn is_privileged_path(method: &Method, path: &str) -> bool {
             path.starts_with("/api/services/")
                 || path.starts_with("/api/models/")
                 || path.starts_with("/api/python/venvs/")
+                // Uninstalling a plugin removes native code from disk.
+                || path.starts_with("/api/plugins/")
                 || is_bridge_exec_path(path)
                 || is_ai_exec_path(path)
         }
@@ -614,6 +616,11 @@ fn is_bridge_exec_path(path: &str) -> bool {
         || path.ends_with("/approve")
         || path.ends_with("/deny")
         || path.starts_with("/api/bridge/pairings")
+        // Installing a plugin installs NATIVE CODE this host will then supervise,
+        // and removing one deletes it from disk — strictly more dangerous than
+        // starting an already-reviewed plugin. A paired web page must never
+        // reach either; only OAIY's own window or a token holder.
+        || path == "/api/plugins/install"
         || (path.starts_with("/api/plugins/")
             && (path.ends_with("/start")
                 || path.ends_with("/stop")
@@ -1005,6 +1012,9 @@ mod tests {
             (Method::POST, "/api/plugins/aokie/start"),
             (Method::POST, "/api/plugins/aokie/stop"),
             (Method::POST, "/api/plugins/aokie/enabled"),
+            // Installing/removing native code is the most dangerous of the lot.
+            (Method::POST, "/api/plugins/install"),
+            (Method::DELETE, "/api/plugins/aokie"),
         ] {
             assert!(
                 is_privileged_path(&m, path),
