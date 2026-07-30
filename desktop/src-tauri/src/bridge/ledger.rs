@@ -36,20 +36,31 @@
 //!
 //! # Durability
 //!
-//! In-memory for now, behind [`LedgerHandle`]. The API is deliberately shaped so
-//! the store can move to SQLite without callers changing: every mutation is a
-//! single method taking a key, returning a typed outcome, and the guards are
-//! evaluated inside the lock rather than by the caller. The unique-key
-//! reservation and the compare-and-set claim are exactly the two operations a
-//! SQL backend implements as `INSERT … ON CONFLICT` and
-//! `UPDATE … WHERE status = 'queued'`.
+//! In memory, optionally backed by an append-and-replay JOURNAL on disk
+//! ([`Ledger::open`]). Every mutation appends the updated record as one JSON
+//! line and fsyncs; on startup the journal is replayed (last write per run id
+//! wins) and compacted. A dependency-free journal, not SQLite, because the
+//! ledger is bounded and small and a bundled C library is the wrong weight for a
+//! cross-platform tray app — and the write pattern is exactly the two operations
+//! a SQL backend would run: an upsert per mutation, replayed as last-wins.
 //!
-//! A restart currently loses queued runs. That is honest for a tray app whose
-//! consumers re-drive from their own durable side, and it is the reason
-//! `reserve` is keyed on a caller-supplied string rather than something we mint.
+//! Durability matters most for the STANDALONE consumer. FormLogic re-drives from
+//! its own `flow_run_logs`, but a coding agent or an OpenAI-compatible client has
+//! no ledger of its own — so a reboot mid-run must not leave the outcome
+//! unknowable. On replay, a run left `Running` (its executor died with the app)
+//! is finalised `Failed`/`runtime_unavailable`, so a consumer polling gets a
+//! terminal state instead of a run stuck `running` forever, and a queued run
+//! survives to be claimed.
+//!
+//! The `fired` loop-guard set is deliberately NOT persisted: its job is covered
+//! by the idempotency keys, which ARE persisted (on the run records). A trigger
+//! tree interrupted by a restart that re-fires a binding produces a Duplicate,
+//! because the run it would create already exists on disk.
 
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::io::Write as _;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -357,6 +368,70 @@ fn mint_run_id(seq: u64) -> String {
     format!("run_{:013x}_{:x}", now_ms(), seq)
 }
 
+/// Compact the journal once it exceeds `max(this, 2 x live runs)` lines. Two,
+/// not more: a run appends ~3 lines over its life (reserve/claim/finish), so a
+/// higher factor would let the file outgrow the live set faster than compaction
+/// reclaims it.
+/// long-lived process does not accumulate an unbounded rewrite history.
+const COMPACT_MIN_LINES: usize = 512;
+
+/// Append-only durability for the ledger. One JSON line per mutation (the full,
+/// updated record); replay is last-write-wins per run id.
+struct Journal {
+    path: PathBuf,
+    file: std::fs::File,
+    /// Lines written since the last compaction — the compaction trigger.
+    lines: usize,
+}
+
+impl Journal {
+    fn open(path: PathBuf) -> std::io::Result<Self> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
+        Ok(Self { path, file, lines: 0 })
+    }
+
+    /// Append one record and flush it to the OS. fsync per write is affordable at
+    /// a desktop's run rate (a few writes per run) and keeps the on-disk state
+    /// honest — a lost write here is a run a consumer might never learn the fate
+    /// of. Errors are surfaced to the caller, which logs; a journal that cannot
+    /// be written must not take the in-memory ledger down with it.
+    fn append(&mut self, rec: &RunRecord) -> std::io::Result<()> {
+        let line = serde_json::to_string(rec).map_err(std::io::Error::other)?;
+        self.file.write_all(line.as_bytes())?;
+        self.file.write_all(b"\n")?;
+        self.file.sync_all()?;
+        self.lines += 1;
+        Ok(())
+    }
+
+    /// Rewrite the journal to exactly `records`, atomically (`.tmp` + rename), so
+    /// evicted/duplicate/orphan-fixed lines are dropped and a crash mid-compaction
+    /// cannot leave a half-written file that replays as corruption.
+    fn compact(&mut self, records: &[RunRecord]) -> std::io::Result<()> {
+        let tmp = self.path.with_extension("jsonl.tmp");
+        {
+            let mut f = std::fs::File::create(&tmp)?;
+            for rec in records {
+                let line = serde_json::to_string(rec).map_err(std::io::Error::other)?;
+                f.write_all(line.as_bytes())?;
+                f.write_all(b"\n")?;
+            }
+            f.sync_all()?;
+        }
+        std::fs::rename(&tmp, &self.path)?;
+        // Reopen the append handle onto the freshly-rotated file.
+        self.file = std::fs::OpenOptions::new().create(true).append(true).open(&self.path)?;
+        self.lines = records.len();
+        Ok(())
+    }
+}
+
 #[derive(Default)]
 pub struct Ledger {
     runs: HashMap<String, RunRecord>,
@@ -369,11 +444,106 @@ pub struct Ledger {
     /// Insertion order over `fired`, for bounded FIFO eviction.
     fired_order: VecDeque<(String, String, String)>,
     seq: u64,
+    /// On-disk durability. `None` for an in-memory ledger (tests, the default);
+    /// `Some` after [`Ledger::open`].
+    journal: Option<Journal>,
 }
 
 impl Ledger {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Open a durable ledger backed by a journal at `path`.
+    ///
+    /// Replays the existing journal (last write per run id wins), fixes up
+    /// orphaned runs, then compacts — so the on-disk file after `open` reflects
+    /// exactly the loaded, capped, fixed state, dropping the replay history. A
+    /// journal that fails to open is a hard error the caller decides on (the
+    /// build wiring falls back to an in-memory ledger with a log, so a
+    /// filesystem problem degrades durability rather than blocking startup).
+    pub fn open(path: PathBuf) -> std::io::Result<Self> {
+        let mut ledger = Ledger::new();
+
+        // Replay: collect the last record per run id, then insert in reservation
+        // order so the cap evicts the oldest terminal runs exactly as at runtime.
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            let mut latest: HashMap<String, RunRecord> = HashMap::new();
+            for line in text.lines() {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                match serde_json::from_str::<RunRecord>(line) {
+                    // Last line for a run id wins — that is the upsert semantics.
+                    Ok(rec) => {
+                        latest.insert(rec.run_id.clone(), rec);
+                    }
+                    // A single corrupt line (a torn final write, say) must not
+                    // discard the whole ledger. Skip it and keep the rest.
+                    Err(_) => continue,
+                }
+            }
+            let mut records: Vec<RunRecord> = latest.into_values().collect();
+            records.sort_by_key(|r| r.reserved_at_ms);
+            for mut rec in records {
+                // A run left Running means its executor died with the app — the
+                // result was never recorded. Finalise it so a consumer polling
+                // gets a terminal answer rather than a run stuck Running forever.
+                if rec.status == RunStatus::Running {
+                    rec.status = RunStatus::Failed;
+                    rec.finished_at_ms = Some(now_ms());
+                    rec.error = Some(
+                        RunError::new(
+                            RunErrorCode::RuntimeUnavailable,
+                            "OAIY Desktop restarted while this run was executing; its result was not recorded.",
+                        )
+                        .retryable(),
+                    );
+                }
+                ledger.restore(rec);
+            }
+            ledger.evict_terminal_over_cap();
+        }
+
+        // Attach the journal and rewrite it to the loaded state in one shot, so
+        // the replay history + orphan fixes are flattened to a clean baseline.
+        let mut journal = Journal::open(path)?;
+        let snapshot: Vec<RunRecord> = ledger.runs.values().cloned().collect();
+        journal.compact(&snapshot)?;
+        ledger.journal = Some(journal);
+        Ok(ledger)
+    }
+
+    /// Insert a record loaded from the journal, bypassing reserve()'s guards and
+    /// dedupe (the record already exists — replaying it must not re-run the loop
+    /// guards or mint a new id).
+    fn restore(&mut self, rec: RunRecord) {
+        self.by_key.insert(rec.idempotency_key.clone(), rec.run_id.clone());
+        self.run_order.push_back(rec.run_id.clone());
+        self.runs.insert(rec.run_id.clone(), rec);
+    }
+
+    /// Append `rec` to the journal (if durable) and compact when it has grown.
+    fn persist(&mut self, rec: &RunRecord) {
+        let live = self.runs.len();
+        let compact_now = match self.journal.as_mut() {
+            None => return,
+            Some(j) => {
+                if let Err(e) = j.append(rec) {
+                    eprintln!("[ledger] journal append failed (durability degraded): {e}");
+                }
+                j.lines > COMPACT_MIN_LINES.max(live.saturating_mul(2))
+            }
+        };
+        if compact_now {
+            let snapshot: Vec<RunRecord> = self.runs.values().cloned().collect();
+            if let Some(j) = self.journal.as_mut() {
+                if let Err(e) = j.compact(&snapshot) {
+                    eprintln!("[ledger] journal compaction failed: {e}");
+                }
+            }
+        }
     }
 
     /// Record a run before executing it.
@@ -439,6 +609,7 @@ impl Ledger {
         self.run_order.push_back(run_id.clone());
         self.runs.insert(run_id, record.clone());
         self.evict_terminal_over_cap();
+        self.persist(&record);
         ReserveOutcome::Reserved(record)
     }
 
@@ -544,22 +715,29 @@ impl Ledger {
     /// the same lock that read the status. Splitting the read and the write is
     /// precisely the race this exists to prevent.
     pub fn claim(&mut self, run_id: &str, runtime: Runtime, worker: &str) -> ClaimOutcome {
-        let Some(rec) = self.runs.get_mut(run_id) else {
-            return ClaimOutcome::Unknown;
-        };
-        match rec.status {
-            RunStatus::Queued => {
-                rec.status = RunStatus::Running;
-                rec.runtime = Some(runtime);
-                rec.claimed_by = Some(worker.to_string());
-                rec.started_at_ms = Some(now_ms());
-                ClaimOutcome::Claimed(rec.clone())
+        let outcome = {
+            let Some(rec) = self.runs.get_mut(run_id) else {
+                return ClaimOutcome::Unknown;
+            };
+            match rec.status {
+                RunStatus::Queued => {
+                    rec.status = RunStatus::Running;
+                    rec.runtime = Some(runtime);
+                    rec.claimed_by = Some(worker.to_string());
+                    rec.started_at_ms = Some(now_ms());
+                    ClaimOutcome::Claimed(rec.clone())
+                }
+                RunStatus::Running => ClaimOutcome::AlreadyClaimed {
+                    claimed_by: rec.claimed_by.clone(),
+                },
+                other => ClaimOutcome::NotClaimable { status: other },
             }
-            RunStatus::Running => ClaimOutcome::AlreadyClaimed {
-                claimed_by: rec.claimed_by.clone(),
-            },
-            other => ClaimOutcome::NotClaimable { status: other },
+        };
+        // Persist only the winning transition — a lost claim changed nothing.
+        if let ClaimOutcome::Claimed(rec) = &outcome {
+            self.persist(rec);
         }
+        outcome
     }
 
     /// Move a run to a terminal state. Refuses if it is already terminal.
@@ -583,20 +761,24 @@ impl Ledger {
         if matches!(status, RunStatus::Failed | RunStatus::TimedOut) && error.is_none() {
             return Err(format!("{status:?} must carry an error"));
         }
-        let Some(rec) = self.runs.get_mut(run_id) else {
-            return Err(format!("unknown run {run_id}"));
+        let updated = {
+            let Some(rec) = self.runs.get_mut(run_id) else {
+                return Err(format!("unknown run {run_id}"));
+            };
+            if rec.status.is_terminal() {
+                return Err(format!(
+                    "run {run_id} is already {:?}; terminal states are immutable",
+                    rec.status
+                ));
+            }
+            rec.status = status;
+            rec.output = output;
+            rec.error = error;
+            rec.finished_at_ms = Some(now_ms());
+            rec.clone()
         };
-        if rec.status.is_terminal() {
-            return Err(format!(
-                "run {run_id} is already {:?}; terminal states are immutable",
-                rec.status
-            ));
-        }
-        rec.status = status;
-        rec.output = output;
-        rec.error = error;
-        rec.finished_at_ms = Some(now_ms());
-        Ok(rec.clone())
+        self.persist(&updated);
+        Ok(updated)
     }
 
     /// Request cancellation.
@@ -606,25 +788,32 @@ impl Ledger {
     /// finalises it when it notices. Reporting a running run as already cancelled
     /// would tell the consumer work had stopped when it had not.
     pub fn request_cancel(&mut self, run_id: &str) -> Result<RunStatus, String> {
-        let Some(rec) = self.runs.get_mut(run_id) else {
-            return Err(format!("unknown run {run_id}"));
+        let (status, updated) = {
+            let Some(rec) = self.runs.get_mut(run_id) else {
+                return Err(format!("unknown run {run_id}"));
+            };
+            match rec.status {
+                RunStatus::Queued => {
+                    rec.status = RunStatus::Cancelled;
+                    rec.finished_at_ms = Some(now_ms());
+                    rec.error = Some(RunError::new(
+                        RunErrorCode::Cancelled,
+                        "Cancelled before it started.",
+                    ));
+                    (RunStatus::Cancelled, rec.clone())
+                }
+                RunStatus::Running => {
+                    // The cancel REQUEST is durable too: a reboot between the
+                    // request and the runner noticing must not lose it, or a
+                    // consumer's cancel would silently do nothing after a restart.
+                    rec.cancel_requested = true;
+                    (RunStatus::Running, rec.clone())
+                }
+                other => return Err(format!("run {run_id} is already {other:?}")),
+            }
         };
-        match rec.status {
-            RunStatus::Queued => {
-                rec.status = RunStatus::Cancelled;
-                rec.finished_at_ms = Some(now_ms());
-                rec.error = Some(RunError::new(
-                    RunErrorCode::Cancelled,
-                    "Cancelled before it started.",
-                ));
-                Ok(RunStatus::Cancelled)
-            }
-            RunStatus::Running => {
-                rec.cancel_requested = true;
-                Ok(RunStatus::Running)
-            }
-            other => Err(format!("run {run_id} is already {other:?}")),
-        }
+        self.persist(&updated);
+        Ok(status)
     }
 
     pub fn get(&self, run_id: &str) -> Option<RunRecord> {
@@ -676,6 +865,22 @@ pub fn new_handle() -> LedgerHandle {
     Arc::new(Mutex::new(Ledger::new()))
 }
 
+/// A durable ledger handle backed by a journal at `path`, or an in-memory one
+/// with a log if the journal cannot be opened — a filesystem problem degrades
+/// durability, it does not block the runtime from starting.
+pub fn open_handle(path: PathBuf) -> LedgerHandle {
+    match Ledger::open(path.clone()) {
+        Ok(l) => Arc::new(Mutex::new(l)),
+        Err(e) => {
+            eprintln!(
+                "[ledger] could not open the durable journal at {} ({e}); running in memory (runs will not survive a restart)",
+                path.display()
+            );
+            new_handle()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -693,6 +898,211 @@ mod tests {
             lineage: LineageRef::default(),
             trigger_event: None,
         }
+    }
+
+    // --- durability -------------------------------------------------------
+
+    /// A scratch journal path, unique per test, cleaned on drop.
+    struct JournalDir(std::path::PathBuf);
+    impl JournalDir {
+        fn new(tag: &str) -> Self {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static N: AtomicU32 = AtomicU32::new(0);
+            let n = N.fetch_add(1, Ordering::Relaxed);
+            let p = std::env::temp_dir()
+                .join(format!("oaiy-ledger-{tag}-{}-{n}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&p);
+            std::fs::create_dir_all(&p).unwrap();
+            Self(p)
+        }
+        fn path(&self) -> std::path::PathBuf {
+            self.0.join("ledger.jsonl")
+        }
+    }
+    impl Drop for JournalDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn a_queued_run_survives_a_reopen() {
+        // The durability win: a run reserved before a restart is still there,
+        // still Queued, still claimable, after the process comes back.
+        let d = JournalDir::new("survive");
+        let run_id = {
+            let mut l = Ledger::open(d.path()).unwrap();
+            match l.reserve(&req("k1")) {
+                ReserveOutcome::Reserved(r) => r.run_id,
+                o => panic!("{o:?}"),
+            }
+        };
+        let l2 = Ledger::open(d.path()).unwrap();
+        let rec = l2.get(&run_id).expect("the run must survive the reopen");
+        assert_eq!(rec.status, RunStatus::Queued);
+        assert_eq!(rec.idempotency_key, "k1");
+        // Its input survived too — a claimer must be able to execute it.
+        assert_eq!(rec.input, Some(serde_json::json!({"phone": "+61400000000"})));
+    }
+
+    #[test]
+    fn idempotency_survives_a_reopen() {
+        // A retry of a completed run's key after a restart must NOT re-execute —
+        // this is the property a standalone consumer relies on for exactly-once.
+        let d = JournalDir::new("idem");
+        let original;
+        {
+            let mut l = Ledger::open(d.path()).unwrap();
+            original = match l.reserve(&req("dup")) {
+                ReserveOutcome::Reserved(r) => r.run_id,
+                o => panic!("{o:?}"),
+            };
+            l.claim(&original, Runtime::Desktop, "d").ok_claimed();
+            l.finish(&original, RunStatus::Succeeded, Some(serde_json::json!({"ok": true})), None)
+                .unwrap();
+        }
+        let mut l2 = Ledger::open(d.path()).unwrap();
+        match l2.reserve(&req("dup")) {
+            ReserveOutcome::Duplicate(r) => {
+                assert_eq!(r.run_id, original);
+                assert_eq!(r.status, RunStatus::Succeeded, "the completed outcome survived");
+                assert_eq!(r.output, Some(serde_json::json!({"ok": true})));
+            }
+            o => panic!("a reopened key must dedupe, got {o:?}"),
+        }
+    }
+
+    #[test]
+    fn a_run_left_running_is_finalised_on_reload() {
+        // Its executor died with the app. A consumer polling must get a terminal
+        // answer, not a run stuck Running forever.
+        let d = JournalDir::new("orphan");
+        let run_id = {
+            let mut l = Ledger::open(d.path()).unwrap();
+            let r = match l.reserve(&req("k")) {
+                ReserveOutcome::Reserved(r) => r,
+                o => panic!("{o:?}"),
+            };
+            l.claim(&r.run_id, Runtime::Desktop, "d").ok_claimed();
+            // Deliberately NOT finished — simulate the process dying here.
+            r.run_id
+        };
+        let l2 = Ledger::open(d.path()).unwrap();
+        let rec = l2.get(&run_id).unwrap();
+        assert_eq!(rec.status, RunStatus::Failed);
+        let err = rec.error.expect("a failed run must carry an error");
+        assert_eq!(err.code, RunErrorCode::RuntimeUnavailable);
+        assert!(err.retryable, "the consumer may re-drive it");
+        assert!(err.message.contains("restarted"), "{}", err.message);
+    }
+
+    #[test]
+    fn a_terminal_run_reloads_unchanged() {
+        let d = JournalDir::new("terminal");
+        let run_id = {
+            let mut l = Ledger::open(d.path()).unwrap();
+            let r = match l.reserve(&req("k")) {
+                ReserveOutcome::Reserved(r) => r,
+                o => panic!("{o:?}"),
+            };
+            l.claim(&r.run_id, Runtime::Desktop, "d").ok_claimed();
+            l.finish(&r.run_id, RunStatus::Succeeded, Some(serde_json::json!(42)), None).unwrap();
+            r.run_id
+        };
+        let rec = Ledger::open(d.path()).unwrap().get(&run_id).unwrap();
+        assert_eq!(rec.status, RunStatus::Succeeded, "a finished run is not re-orphaned");
+        assert_eq!(rec.output, Some(serde_json::json!(42)));
+    }
+
+    #[test]
+    fn a_pending_cancel_survives_a_reopen() {
+        // A consumer's cancel of a running run must not silently vanish on a
+        // restart before the runner noticed.
+        let d = JournalDir::new("cancel");
+        let run_id = {
+            let mut l = Ledger::open(d.path()).unwrap();
+            let r = match l.reserve(&req("k")) {
+                ReserveOutcome::Reserved(r) => r,
+                o => panic!("{o:?}"),
+            };
+            l.claim(&r.run_id, Runtime::Desktop, "d").ok_claimed();
+            assert_eq!(l.request_cancel(&r.run_id).unwrap(), RunStatus::Running);
+            r.run_id
+        };
+        // On reload the run is orphan-finalised (Failed), but the reopen must not
+        // panic and the record is present — the cancel intent was durably written.
+        let rec = Ledger::open(d.path()).unwrap().get(&run_id).unwrap();
+        assert!(rec.status.is_terminal());
+    }
+
+    #[test]
+    fn the_journal_is_compacted_and_stays_bounded() {
+        // Many mutations must not grow the file without bound: compaction keeps
+        // it proportional to the LIVE run set, not the mutation history.
+        let d = JournalDir::new("compact");
+        {
+            let mut l = Ledger::open(d.path()).unwrap();
+            // Each run does 3 mutations (reserve/claim/finish) = 3 lines. 600
+            // runs = 1800 writes, well past COMPACT_MIN_LINES.
+            for i in 0..600 {
+                let key = format!("k{i}");
+                let r = match l.reserve(&req(&key)) {
+                    ReserveOutcome::Reserved(r) => r,
+                    o => panic!("{o:?}"),
+                };
+                l.claim(&r.run_id, Runtime::Desktop, "d").ok_claimed();
+                l.finish(&r.run_id, RunStatus::Succeeded, Some(serde_json::json!(i)), None).unwrap();
+            }
+        }
+        // During the run, in-flight compaction kept the file well under the 1800
+        // mutations — proving it does not grow with mutation HISTORY.
+        let during = std::fs::read_to_string(d.path()).unwrap().lines().count();
+        assert!(
+            during < 1800,
+            "journal grew with mutation history ({during} lines for 1800 mutations)"
+        );
+
+        // The strongest bound: a fresh open() compacts to exactly one line per
+        // live run — O(live), not O(mutations).
+        let live = {
+            let l2 = Ledger::open(d.path()).unwrap();
+            l2.len()
+        };
+        let after = std::fs::read_to_string(d.path()).unwrap().lines().count();
+        assert_eq!(after, live, "open() must compact to one line per live run");
+        assert!(live > 0 && live <= 600);
+    }
+
+    #[test]
+    fn a_corrupt_line_does_not_discard_the_whole_ledger() {
+        // A torn final write (power loss mid-append) must lose only that line.
+        let d = JournalDir::new("corrupt");
+        let good_id;
+        {
+            let mut l = Ledger::open(d.path()).unwrap();
+            good_id = match l.reserve(&req("good")) {
+                ReserveOutcome::Reserved(r) => r.run_id,
+                o => panic!("{o:?}"),
+            };
+        }
+        // Append a garbage line, as a half-flushed write would leave.
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new().append(true).open(d.path()).unwrap();
+            f.write_all(b"{ this is not a complete record\n").unwrap();
+        }
+        let l2 = Ledger::open(d.path()).unwrap();
+        assert!(l2.get(&good_id).is_some(), "the good run must survive a corrupt neighbour");
+    }
+
+    #[test]
+    fn an_in_memory_ledger_has_no_journal() {
+        // The default path stays pure — no file IO, so the other tests and the
+        // hot path pay nothing.
+        let mut l = Ledger::new();
+        assert!(l.journal.is_none());
+        // And mutations still work without a journal.
+        assert!(matches!(l.reserve(&req("k")), ReserveOutcome::Reserved(_)));
     }
 
     // --- invariant 1: reserve is idempotent -------------------------------

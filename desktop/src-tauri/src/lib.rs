@@ -1227,7 +1227,10 @@ pub fn build_bridge_state(
     data_dir: std::path::PathBuf,
     device_id: String,
 ) -> bridge::BridgeState {
-    let ledger = bridge::ledger::new_handle();
+    // Durable: runs survive a restart, and a run left mid-execution is finalised
+    // on reload so a standalone consumer (no ledger of its own) always gets a
+    // terminal answer. Under <data>/bridge/ so it moves with a relocated data dir.
+    let ledger = bridge::ledger::open_handle(data_dir.join("bridge").join("ledger.jsonl"));
     let plugins = plugins::registry::new_handle(plugins_root);
     let triggers: plugins::TriggerStoreHandle = std::sync::Arc::new(std::sync::Mutex::new(
         plugins::TriggerStore::load(data_dir.join("triggers.json")),
