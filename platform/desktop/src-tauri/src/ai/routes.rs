@@ -153,7 +153,7 @@ async fn chat_impl(st: &AiState, provider_id: Option<&str>, mut body: Value) -> 
         return ai_error(
             StatusCode::NOT_FOUND,
             "no_provider",
-            "no AI provider is configured for chat — add one in Services → AI Providers".into(),
+            "no AI provider is configured for chat — add one in OAIY Desktop → Providers".into(),
         );
     };
     if !p.enabled {

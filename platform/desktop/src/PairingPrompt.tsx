@@ -67,11 +67,22 @@ export default function PairingPrompt() {
 
   return (
     <div className="pairing-wrap">
+      {/* role="alert", not "alertdialog": this is an inline banner that does not
+          trap focus, and claiming to be a modal dialog misleads a screen reader
+          into waiting for one. "alert" still announces it the moment it appears,
+          which is what a connection request needs. */}
       {pending.map((req) => (
-        <div key={req.pairingId} className="pairing-card pairing-pending" role="alertdialog">
+        <div
+          key={req.pairingId}
+          className="pairing-card pairing-pending"
+          role="alert"
+          aria-labelledby={`pairing-title-${req.pairingId}`}
+        >
           <div className="pairing-head">
-            <Link2 size={16} />
-            <strong>{req.label ?? req.product} wants to connect</strong>
+            <Link2 size={16} aria-hidden />
+            <strong id={`pairing-title-${req.pairingId}`}>
+              {req.label ?? req.product} wants to connect
+            </strong>
           </div>
           <div className="pairing-body">
             <span>

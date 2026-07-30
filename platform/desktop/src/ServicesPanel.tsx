@@ -555,8 +555,13 @@ function GpuSelector({ serviceId, currentGpu }: { serviceId: string; currentGpu:
   const pinnedMissing = currentGpu != null && !gpus.some((g) => g.index === currentGpu);
   return (
     <div style={MODEL_SELECTOR_ROW_STYLE}>
-      <label style={{ opacity: 0.8 }}>GPU</label>
+      {/* Wrapping the control in the <label> associates the two, so the select
+          has an accessible name (a bare sibling <label> named nothing). */}
+      <label style={{ opacity: 0.8 }} htmlFor={`gpu-${serviceId}`}>
+        GPU
+      </label>
       <select
+        id={`gpu-${serviceId}`}
         value={value}
         disabled={pending}
         onChange={async (e) => {

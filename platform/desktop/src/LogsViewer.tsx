@@ -56,9 +56,13 @@ export default function LogsViewer({ load, title, onClose }: Props) {
     };
   }, [load]);
 
-  // Move focus into the panel when it opens, so keyboard users land here.
+  // Move focus into the panel when it opens, so keyboard users land here — and
+  // hand it back to whatever opened it on close, so closing doesn't dump focus
+  // at the top of the document.
   useEffect(() => {
+    const opener = document.activeElement as HTMLElement | null;
     rootRef.current?.focus();
+    return () => opener?.focus?.();
   }, []);
 
   useEffect(() => {
