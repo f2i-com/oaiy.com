@@ -480,6 +480,35 @@ export interface AiProviderInput {
   allowLocal?: boolean;
 }
 
+/** The ChatGPT connector: a managed `codex` child that owns its own OAuth. */
+export interface CodexStatus {
+  available: boolean;
+  connected: boolean;
+  email?: string | null;
+  planType?: string | null;
+  accountType?: string | null;
+  detail?: string | null;
+}
+
+export interface CodexLogin {
+  loginId?: string | null;
+  authUrl?: string | null;
+  verificationUrl?: string | null;
+  userCode?: string | null;
+}
+
+export const codex = {
+  status: () => request<CodexStatus>('/api/ai/codex/status'),
+  /** Begin sign-in. `deviceCode` shows a code to type instead of a redirect. */
+  startLogin: (deviceCode = true) =>
+    request<CodexLogin>('/api/ai/codex/login', {
+      method: 'POST',
+      body: JSON.stringify({ deviceCode }),
+    }),
+  cancelLogin: () => request<void>('/api/ai/codex/login', { method: 'DELETE' }),
+  logout: () => request<void>('/api/ai/codex/logout', { method: 'POST' }),
+};
+
 export const aiProviders = {
   list: () => request<{ providers: AiProviderPublic[] }>('/api/ai/providers'),
   upsert: (input: AiProviderInput) =>

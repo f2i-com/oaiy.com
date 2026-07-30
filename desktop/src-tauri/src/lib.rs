@@ -1090,6 +1090,9 @@ pub fn run() {
                 // guarded by the full/public split — never over the wire.
                 let ai_providers_for_http =
                     crate::ai::open_handle(data_dir_for_bridge.join("ai").join("providers.json"));
+                // The ChatGPT connector: its OAuth lives in a CODEX_HOME under
+                // the data dir, owned by the codex child, not by us.
+                let ai_codex_for_http = crate::ai::codex::new_handle(&data_dir_for_bridge);
                 if let Err(e) = http::serve(
                     DESKTOP_PORT,
                     config_provider,
@@ -1104,6 +1107,7 @@ pub fn run() {
                     catalog_for_http,
                     bridge_for_http,
                     ai_providers_for_http,
+                    ai_codex_for_http,
                 )
                 .await
                 {

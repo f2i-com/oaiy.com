@@ -18,6 +18,7 @@ import {
   type AiProviderPublic,
 } from './api';
 import { useToast } from './Toasts';
+import ChatGptConnector from './ChatGptConnector';
 
 /**
  * AI Providers panel — configure the cloud (or local) AI providers the local AI
@@ -307,6 +308,10 @@ export default function AiProvidersPanel() {
           </button>
         </div>
       )}
+
+      {/* Sign in with a ChatGPT account — no API key involved, so it lives above
+          the key-based providers rather than among them. */}
+      <ChatGptConnector />
 
       {/* Add / edit form — gated behind a button like ServicesPanel's add form, so
           the panel opens on the providers themselves rather than an empty form. */}
