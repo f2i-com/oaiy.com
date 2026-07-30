@@ -1,0 +1,80 @@
+{
+  "id": "video_downloader",
+  "name": "Video Downloader",
+  "description": "Download videos or audio from YouTube, Vimeo, Twitter, TikTok, and 1000+ more sites",
+  "doc": "Download media from online platforms.\n\nSupported Sites:\n• YouTube, Vimeo, Dailymotion\n• Twitter/X, TikTok, Instagram\n• 1000+ more sites via yt-dlp\n\nModes:\n• Video - full video download\n• Audio - audio track only (MP3)\n\nOptions:\n• Quality selection (best, 1080p, 720p, etc.)\n• Time range (start/end seconds)\n\nOutputs:\nFile path, duration, and video dimensions.",
+  "category": "video",
+  "icon": "download",
+  "color": "#F97316",
+  "inputs": [
+    {
+      "id": "url",
+      "name": "Video URL",
+      "type": "string",
+      "required": true,
+      "description": "URL of the video to download (supports 1000+ sites)"
+    },
+    {
+      "id": "mode",
+      "name": "Mode",
+      "type": "string",
+      "required": false,
+      "default": "video",
+      "description": "Download mode: 'video' for full video, 'audio' for audio only"
+    },
+    {
+      "id": "start",
+      "name": "Start Time",
+      "type": "number",
+      "required": false,
+      "default": 0,
+      "description": "Start time in seconds"
+    },
+    {
+      "id": "end",
+      "name": "End Time",
+      "type": "number",
+      "required": false,
+      "description": "End time in seconds (leave empty for full video)"
+    },
+    {
+      "id": "quality",
+      "name": "Quality",
+      "type": "string",
+      "required": false,
+      "default": "best",
+      "description": "Video quality: 'best', '1080', '720', '480', '360'"
+    }
+  ],
+  "outputs": [
+    {
+      "id": "video",
+      "name": "Video/Audio",
+      "type": "video",
+      "description": "Path to the downloaded video or audio file"
+    },
+    {
+      "id": "duration",
+      "name": "Duration",
+      "type": "number",
+      "description": "Duration of the media in seconds"
+    },
+    {
+      "id": "width",
+      "name": "Width",
+      "type": "number",
+      "description": "Video width in pixels (video mode only)"
+    },
+    {
+      "id": "height",
+      "name": "Height",
+      "type": "number",
+      "description": "Video height in pixels (video mode only)"
+    }
+  ],
+  "compiler": {
+    "customHandler": true,
+    "async": true,
+    "statusTracking": true
+  }
+}

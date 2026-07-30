@@ -1,0 +1,28 @@
+{
+  "id": "core-filesystem",
+  "name": "Core File System",
+  "version": "1.0.0",
+  "description": "File system operations for reading and writing files",
+  "author": "OAIY Team",
+  "category": "File System",
+  "icon": "file",
+  "color": "emerald",
+  "nodes": ["file_read", "file_write", "text_chunker"],
+  "permissions": ["filesystem"],
+  "runtime": {
+    "typescript": "runtime.ts",
+    "compiler": "compiler.ts",
+    "native": {
+      "plugin": "oaiy-filesystem",
+      "source": "native/src/lib.rs",
+      "cargo": "native/Cargo.toml"
+    }
+  },
+  "ui": {
+    "nodes": [
+      { "nodeType": "file_read", "componentName": "FileReadNode" },
+      { "nodeType": "file_write", "componentName": "FileWriteNode" },
+      { "nodeType": "text_chunker", "componentName": "TextChunkerNode" }
+    ]
+  }
+}

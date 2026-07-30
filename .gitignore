@@ -1,0 +1,59 @@
+# ---------------------------------------------------------------------------
+# oaiy-web — repo-root gitignore
+# ---------------------------------------------------------------------------
+# `ui/` is the React + Vite frontend; `api/` is the PHP/Slim backend.
+# Lockfiles are committed (package-lock.json + composer.lock); installed
+# dependency trees are not.
+
+# --- ui/ frontend ----------------------------------------------------------
+ui/node_modules/
+ui/dist/
+ui/build/
+ui/.vite/
+ui/.cache/
+# Vite serves a synthetic deps cache when imports change at runtime.
+ui/.tmp/
+
+# --- api/ backend ----------------------------------------------------------
+api/vendor/
+# .env carries the live DB password — committed copy lives at .env.example.
+api/.env
+# Default SQLite location + the WAL/journal sidecars libsqlite drops
+# next to it. Schema lives in api/migrations/, so the DB file itself is
+# always rebuildable with `php bin/migrate.php`.
+api/var/*.sqlite
+api/var/*.sqlite-journal
+api/var/*.sqlite-wal
+api/var/*.sqlite-shm
+api/var/cache/
+api/var/log/
+api/storage/
+
+# --- editor / OS noise -----------------------------------------------------
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/settings.json
+!.vscode/launch.json
+!.vscode/extensions.json
+*.swp
+*.swo
+*~
+.history/
+
+# --- logs / dumps ----------------------------------------------------------
+*.log
+*.log.*
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# --- env / secrets ---------------------------------------------------------
+.env
+.env.local
+.env.*.local
+
+# --- agent-task / scratch (Claude Code, etc.) ------------------------------
+.claude/
+.cursor/

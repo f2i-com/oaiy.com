@@ -1,0 +1,73 @@
+{
+    "id": "video_save",
+    "name": "Video Save",
+    "description": "Save a video to a file on disk.",
+    "doc": "Export videos to disk files.\n\nFormats:\n• MP4 - widely compatible, good compression\n• WebM - web-optimized format\n\nPath Options:\n• Specify full path with filename\n• Specify folder only (auto-generates name)\n• Leave empty for default output folder\n\nOutput:\nReturns the path to the saved video file.",
+    "icon": "save",
+    "color": "orange",
+    "tags": [
+        "video",
+        "save",
+        "file",
+        "export"
+    ],
+    "inputs": [
+        {
+            "id": "video",
+            "name": "Video",
+            "type": "video",
+            "position": "left",
+            "description": "Video to save (URL or path)"
+        }
+    ],
+    "outputs": [
+        {
+            "id": "path",
+            "name": "Video",
+            "type": "video",
+            "position": "right",
+            "description": "Path of saved video file"
+        }
+    ],
+    "properties": [
+        {
+            "id": "path",
+            "name": "File Path",
+            "type": "string",
+            "default": "",
+            "description": "Path to save to (or folder for auto-naming)"
+        },
+        {
+            "id": "filename",
+            "name": "Filename",
+            "type": "string",
+            "default": "video",
+            "description": "Base filename (without extension)"
+        },
+        {
+            "id": "format",
+            "name": "Format",
+            "type": "select",
+            "default": "mp4",
+            "options": [
+                {
+                    "value": "mp4",
+                    "label": "MP4"
+                },
+                {
+                    "value": "webm",
+                    "label": "WebM"
+                }
+            ]
+        }
+    ],
+    "compiler": {
+        "template": "{{await}}VideoFrames.save({{input}}, {{prop.path}}, {{prop.filename}}, {{prop.format.raw}}, \"{{nodeId}}\")",
+        "async": true,
+        "statusTracking": true
+    },
+    "ui": {
+        "width": 280,
+        "customComponent": "VideoSaveNode"
+    }
+}

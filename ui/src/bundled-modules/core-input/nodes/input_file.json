@@ -1,0 +1,66 @@
+{
+  "id": "input_file",
+  "name": "File Input",
+  "description": "Provides image or text file input to the workflow. For video files, use the Video Input node.",
+  "doc": "Select and load a file into the workflow.\n\nSupported Files:\n• Images (PNG, JPG, etc.) - loaded as base64\n• Text files (TXT, JSON, etc.) - loaded as text\n• For videos, use Video Input node instead\n\nOutput:\n• Images: base64 data URL ready for AI vision\n• Text: raw file content as string\n\nTip: Click the file picker or drag & drop a file onto the node.",
+  "icon": "file",
+  "color": "green",
+  "tags": ["input", "file", "read", "image", "text"],
+  "inputs": [],
+  "outputs": [
+    {
+      "id": "content",
+      "name": "Content",
+      "type": "any",
+      "position": "right",
+      "description": "File content (text or base64 for images)"
+    }
+  ],
+  "properties": [
+    {
+      "id": "label",
+      "name": "Label",
+      "type": "string",
+      "default": "File",
+      "description": "Name for this input"
+    },
+    {
+      "id": "filePath",
+      "name": "File Path",
+      "type": "string",
+      "default": "",
+      "description": "Path to the selected file"
+    },
+    {
+      "id": "fileName",
+      "name": "File Name",
+      "type": "string",
+      "default": "",
+      "description": "Name of the selected file",
+      "hidden": true
+    },
+    {
+      "id": "fileContent",
+      "name": "File Content",
+      "type": "string",
+      "default": "",
+      "hidden": true
+    },
+    {
+      "id": "fileType",
+      "name": "File Type",
+      "type": "string",
+      "default": "",
+      "hidden": true
+    }
+  ],
+  "compiler": {
+    "template": "{{prop.fileContent}}",
+    "statusTracking": false,
+    "customHandler": "input_file"
+  },
+  "ui": {
+    "width": 280,
+    "customComponent": "InputFileNode"
+  }
+}

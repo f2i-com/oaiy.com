@@ -1,0 +1,44 @@
+{
+  "id": "core-image",
+  "name": "Core Image",
+  "version": "1.0.0",
+  "description": "Image generation, viewing, and manipulation nodes",
+  "author": "OAIY Team",
+  "category": "Image",
+  "icon": "image",
+  "color": "pink",
+  "nodes": ["image_gen", "image_view", "image_save", "image_resize"],
+  "permissions": ["network", "filesystem"],
+  "runtime": {
+    "typescript": "runtime.ts",
+    "compiler": "compiler.ts"
+  },
+  "ui": {
+    "nodes": [
+      { "nodeType": "image_gen", "componentName": "ImageGenNode" },
+      { "nodeType": "image_view", "componentName": "ImageViewNode" },
+      { "nodeType": "image_save", "componentName": "ImageSaveNode" }
+    ]
+  },
+  "settings": {
+    "defaultEndpoint": {
+      "type": "string",
+      "label": "Default Image Endpoint",
+      "description": "Default image generation API endpoint"
+    },
+    "defaultApiFormat": {
+      "type": "select",
+      "label": "Default API Format",
+      "description": "Default image generation API format",
+      "default": "openai",
+      "options": [
+        { "value": "openai", "label": "OpenAI GPT Image" },
+        { "value": "gemini-3-pro", "label": "Gemini 3 Pro" },
+        { "value": "gemini-flash", "label": "Gemini 2.5 Flash" },
+        { "value": "gemini-2-flash", "label": "Gemini 2.0 Flash" },
+        { "value": "comfyui", "label": "ComfyUI (Local)" },
+        { "value": "custom", "label": "Custom" }
+      ]
+    }
+  }
+}

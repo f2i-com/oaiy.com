@@ -1,0 +1,172 @@
+{
+    "id": "video_pip",
+    "name": "Video PiP",
+    "description": "Overlay a picture-in-picture video (like a talking head) on top of a main video.",
+    "doc": "Add a picture-in-picture overlay to videos.\n\nCommon Use:\nOverlay a talking head video on top of screen recordings or background content.\n\nSettings:\n• Position - corner placement\n• Size - percentage of main video width\n• Shape - rectangle, rounded, or circle\n• Timing - when PiP appears and duration\n• Volume - control both audio tracks\n\nTip: Use with Video Avatar to create presenter-style videos.",
+    "icon": "video",
+    "color": "cyan",
+    "tags": [
+        "video",
+        "pip",
+        "picture-in-picture",
+        "overlay",
+        "composite",
+        "talking head"
+    ],
+    "flowplan": {
+        "stepTypes": [
+            "video_pip"
+        ],
+        "fieldMapping": {
+            "mainVideo": "mainVideo",
+            "pipVideo": "pipVideo",
+            "position": "position",
+            "size": "size",
+            "margin": "margin",
+            "shape": "shape",
+            "startTime": "startTime",
+            "pipDuration": "pipDuration",
+            "mainVolume": "mainVolume",
+            "pipVolume": "pipVolume"
+        },
+        "literalInputFields": [
+            "position",
+            "size",
+            "margin",
+            "shape",
+            "startTime",
+            "pipDuration",
+            "mainVolume",
+            "pipVolume"
+        ],
+        "templateFields": [],
+        "inputHandleMapping": {
+            "mainVideo": "mainVideo",
+            "pipVideo": "pipVideo"
+        }
+    },
+    "inputs": [
+        {
+            "id": "mainVideo",
+            "name": "Main Video",
+            "type": "video",
+            "position": "left",
+            "required": true,
+            "description": "Background/main video"
+        },
+        {
+            "id": "pipVideo",
+            "name": "PiP Video",
+            "type": "video",
+            "position": "left",
+            "required": true,
+            "description": "Picture-in-picture overlay video (e.g., talking head)"
+        }
+    ],
+    "outputs": [
+        {
+            "id": "video",
+            "name": "Video",
+            "type": "video",
+            "position": "right",
+            "description": "Composited video with PiP overlay"
+        }
+    ],
+    "properties": [
+        {
+            "id": "position",
+            "name": "Position",
+            "type": "select",
+            "default": "bottom-right",
+            "options": [
+                { "value": "top-left", "label": "Top Left" },
+                { "value": "top-right", "label": "Top Right" },
+                { "value": "bottom-left", "label": "Bottom Left" },
+                { "value": "bottom-right", "label": "Bottom Right" }
+            ],
+            "description": "Corner position for the PiP overlay"
+        },
+        {
+            "id": "size",
+            "name": "Size (%)",
+            "type": "number",
+            "default": 25,
+            "min": 10,
+            "max": 50,
+            "step": 5,
+            "description": "Size of PiP as percentage of main video width"
+        },
+        {
+            "id": "margin",
+            "name": "Margin (px)",
+            "type": "number",
+            "default": 20,
+            "min": 0,
+            "max": 100,
+            "step": 5,
+            "description": "Distance from the edge in pixels"
+        },
+        {
+            "id": "shape",
+            "name": "Shape",
+            "type": "select",
+            "default": "rectangle",
+            "options": [
+                { "value": "rectangle", "label": "Rectangle" },
+                { "value": "rounded", "label": "Rounded" },
+                { "value": "circle", "label": "Circle" }
+            ],
+            "description": "Shape of the PiP overlay"
+        },
+        {
+            "id": "startTime",
+            "name": "Start Time (s)",
+            "type": "number",
+            "default": 0,
+            "min": 0,
+            "max": 3600,
+            "step": 0.5,
+            "description": "When the PiP appears (in seconds)"
+        },
+        {
+            "id": "pipDuration",
+            "name": "PiP Duration (s)",
+            "type": "number",
+            "default": 0,
+            "min": 0,
+            "max": 3600,
+            "step": 0.5,
+            "description": "How long to show PiP (0 = until PiP video ends)"
+        },
+        {
+            "id": "mainVolume",
+            "name": "Main Video Volume",
+            "type": "number",
+            "default": 1.0,
+            "min": 0,
+            "max": 2,
+            "step": 0.1,
+            "description": "Volume of the main/background video audio"
+        },
+        {
+            "id": "pipVolume",
+            "name": "PiP Video Volume",
+            "type": "number",
+            "default": 1.0,
+            "min": 0,
+            "max": 2,
+            "step": 0.1,
+            "description": "Volume of the PiP overlay video audio"
+        }
+    ],
+    "compiler": {
+        "customHandler": true,
+        "async": true,
+        "abortable": true,
+        "statusTracking": true
+    },
+    "ui": {
+        "width": 300,
+        "resizable": false
+    }
+}

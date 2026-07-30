@@ -1,0 +1,63 @@
+{
+  "id": "core-ai",
+  "name": "Core AI",
+  "version": "1.0.0",
+  "description": "AI/LLM integration nodes for text generation and analysis",
+  "author": "OAIY Team",
+  "category": "AI",
+  "icon": "brain",
+  "color": "purple",
+  "nodes": ["ai_llm"],
+  "permissions": ["network", "filesystem"],
+  "runtime": {
+    "typescript": "runtime.ts",
+    "compiler": "compiler.ts"
+  },
+  "ui": {
+    "nodes": [
+      { "nodeType": "ai_llm", "componentName": "AILLMNode" }
+    ]
+  },
+  "settings": {
+    "defaultProvider": {
+      "type": "select",
+      "label": "Default Provider",
+      "description": "Default AI/LLM provider",
+      "default": "ollama",
+      "options": [
+        { "value": "ollama", "label": "Ollama (Local)" },
+        { "value": "lmstudio", "label": "LM Studio (Local)" },
+        { "value": "custom", "label": "Custom (OpenAI-compatible)" }
+      ]
+    },
+    "defaultEndpoint": {
+      "type": "string",
+      "label": "Default API Endpoint",
+      "description": "Default LLM API endpoint (OpenAI-compatible)",
+      "default": "https://api.openai.com/v1/chat/completions"
+    },
+    "defaultApiKey": {
+      "type": "secret",
+      "label": "Default API Key",
+      "description": "Default API key for LLM requests"
+    },
+    "defaultModel": {
+      "type": "string",
+      "label": "Default Model",
+      "description": "Default model to use",
+      "default": "gpt-5.4-mini"
+    },
+    "ollamaEndpoint": {
+      "type": "string",
+      "label": "Ollama Endpoint",
+      "description": "Ollama server endpoint (default: http://localhost:11434)",
+      "default": "http://localhost:11434"
+    },
+    "lmstudioEndpoint": {
+      "type": "string",
+      "label": "LM Studio Endpoint",
+      "description": "LM Studio server endpoint (default: http://localhost:1234)",
+      "default": "http://localhost:1234"
+    }
+  }
+}

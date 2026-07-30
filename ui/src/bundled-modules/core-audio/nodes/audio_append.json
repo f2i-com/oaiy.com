@@ -1,0 +1,69 @@
+{
+    "id": "audio_append",
+    "name": "Audio Append",
+    "description": "Concatenate multiple audio files into a single audio file.",
+    "doc": "Join multiple audio files into one continuous track.\n\nUsage:\n• Connect an array of audio files to the input\n• Audio files are concatenated in array order\n• Supports WAV and MP3 output formats\n\nCommon Uses:\n• Combine TTS segments into full narration\n• Join music tracks together\n• Merge audio clips from a loop\n\nNote: Uses FFmpeg for audio processing.",
+    "icon": "music",
+    "color": "teal",
+    "tags": [
+        "audio",
+        "concat",
+        "append",
+        "merge"
+    ],
+    "inputs": [
+        {
+            "id": "audios",
+            "name": "Audio Files",
+            "type": "audio[]",
+            "position": "left",
+            "required": true,
+            "description": "Array of audio files to concatenate"
+        }
+    ],
+    "outputs": [
+        {
+            "id": "audio",
+            "name": "Audio",
+            "type": "audio",
+            "position": "right",
+            "description": "Concatenated audio file (media URL)"
+        },
+        {
+            "id": "path",
+            "name": "Path",
+            "type": "string",
+            "position": "right",
+            "description": "File path to concatenated audio (for FFmpeg operations)"
+        }
+    ],
+    "properties": [
+        {
+            "id": "filename",
+            "name": "Output Filename",
+            "type": "string",
+            "default": "concatenated_audio",
+            "description": "Base filename for output"
+        },
+        {
+            "id": "format",
+            "name": "Output Format",
+            "type": "select",
+            "default": "wav",
+            "options": [
+                { "value": "wav", "label": "WAV" },
+                { "value": "mp3", "label": "MP3" }
+            ],
+            "description": "Output audio format"
+        }
+    ],
+    "compiler": {
+        "customHandler": true,
+        "async": true,
+        "statusTracking": true
+    },
+    "ui": {
+        "width": 250,
+        "resizable": false
+    }
+}

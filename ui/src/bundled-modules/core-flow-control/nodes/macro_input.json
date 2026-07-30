@@ -1,0 +1,65 @@
+{
+    "id": "macro_input",
+    "name": "Macro Input",
+    "description": "Defines an input port for a macro. Place this node in a workflow to expose it as an input when the workflow is used as a macro.",
+    "doc": "Define an input parameter for a macro workflow.\n\nUsage:\n1. Add to a macro workflow\n2. Set the input name and type\n3. Connect to nodes that need the input value\n4. The input appears as a handle on the Macro node\n\nProperties:\n• Name - label shown on the macro node\n• Type - expected data type (for validation)\n• Default - fallback if nothing connected\n• Required - whether input must be provided\n\nTip: Use clear, descriptive names like 'Image' or 'Prompt' instead of generic names.",
+    "icon": "arrow-right-circle",
+    "color": "violet",
+    "tags": ["macro", "input", "port", "parameter"],
+    "inputs": [],
+    "outputs": [
+        {
+            "id": "value",
+            "name": "Value",
+            "type": "any",
+            "position": "right",
+            "description": "The input value passed to this macro port"
+        }
+    ],
+    "properties": [
+        {
+            "id": "name",
+            "name": "Input Name",
+            "type": "string",
+            "default": "input",
+            "description": "Name of this input (shown on macro node handle)"
+        },
+        {
+            "id": "inputType",
+            "name": "Type",
+            "type": "select",
+            "default": "any",
+            "options": [
+                { "value": "any", "label": "Any" },
+                { "value": "text", "label": "Text" },
+                { "value": "number", "label": "Number" },
+                { "value": "image", "label": "Image" },
+                { "value": "video", "label": "Video" },
+                { "value": "audio", "label": "Audio" },
+                { "value": "file", "label": "File" }
+            ],
+            "description": "Expected type of input data"
+        },
+        {
+            "id": "defaultValue",
+            "name": "Default Value",
+            "type": "string",
+            "default": "",
+            "description": "Default value if no input is connected"
+        },
+        {
+            "id": "required",
+            "name": "Required",
+            "type": "boolean",
+            "default": true,
+            "description": "Whether this input is required"
+        }
+    ],
+    "compiler": {
+        "customHandler": true,
+        "statusTracking": true
+    },
+    "ui": {
+        "width": 200
+    }
+}

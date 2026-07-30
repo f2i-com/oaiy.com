@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png" />
+    <meta name="theme-color" content="#7167ff" />
+    <meta name="theme-color" media="(prefers-color-scheme: light)" content="#f3f0e9" />
+    <meta name="theme-color" media="(prefers-color-scheme: dark)" content="#070a12" />
+    <!-- Prism Lab is the default theme, so paint the shell colour before the
+         bundle boots; theme.ts rewrites data-theme on first tick if the user
+         has chosen Paper Circuit. -->
+    <style>
+      html { background: #070a12; }
+      html[data-theme='light'] { background: #f3f0e9; }
+    </style>
+    <title>OAIY — Companion</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

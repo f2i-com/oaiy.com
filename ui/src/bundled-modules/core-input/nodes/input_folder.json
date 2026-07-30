@@ -1,0 +1,74 @@
+{
+  "id": "input_folder",
+  "name": "Folder Input",
+  "description": "Scans a folder and outputs a list of files matching the specified patterns.",
+  "doc": "Scan a folder and get a list of matching files.\n\nPattern Examples:\n• *.png, *.jpg - image files\n• *.txt, *.md - text files\n• * - all files\n\nOutput Format:\nArray of file info objects containing:\n• path - full file path\n• name - filename with extension\n• nameWithoutExt - filename without extension\n• ext - file extension\n\nUse with Loops:\nConnect to Loop Start to process each file. Use file info properties in File Write templates.",
+  "icon": "folder",
+  "color": "green",
+  "tags": [
+    "input",
+    "folder",
+    "files",
+    "batch"
+  ],
+  "inputs": [
+    {
+      "id": "path",
+      "name": "Path",
+      "type": "string",
+      "position": "left",
+      "description": "Optional dynamic path from another node"
+    }
+  ],
+  "outputs": [
+    {
+      "id": "files",
+      "name": "Files",
+      "type": "array",
+      "position": "right",
+      "description": "Array of file info objects"
+    }
+  ],
+  "properties": [
+    {
+      "id": "path",
+      "name": "Folder Path",
+      "type": "string",
+      "default": "",
+      "description": "Path to the folder to scan"
+    },
+    {
+      "id": "includePatterns",
+      "name": "Include Patterns",
+      "type": "string",
+      "default": "*.png, *.jpg, *.jpeg",
+      "description": "Comma-separated glob patterns for files to include"
+    },
+    {
+      "id": "recursive",
+      "name": "Recursive",
+      "type": "boolean",
+      "default": false,
+      "description": "Scan subdirectories"
+    },
+    {
+      "id": "maxFiles",
+      "name": "Max Files",
+      "type": "number",
+      "default": 100,
+      "min": 1,
+      "max": 10000,
+      "description": "Maximum number of files to return"
+    }
+  ],
+  "compiler": {
+    "template": "{{await}}FileSystem.listFolder({{prop.path}}, {{prop.recursive}}, {{prop.includePatterns}}, {{prop.maxFiles}}, \"{{nodeId}}\")",
+    "async": true,
+    "abortable": true,
+    "statusTracking": true
+  },
+  "ui": {
+    "width": 300,
+    "resizable": true
+  }
+}

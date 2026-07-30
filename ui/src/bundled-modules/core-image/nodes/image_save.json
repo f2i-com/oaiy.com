@@ -1,0 +1,66 @@
+{
+  "id": "image_save",
+  "name": "Image Save",
+  "description": "Save an image to a file on disk.",
+  "doc": "Export images to disk files.\n\nFormats:\n• PNG - lossless, best for graphics/screenshots\n• JPEG - smaller files, adjustable quality\n• WebP - modern format, good compression\n\nPath Options:\n• Full path: C:/images/output.png\n• Folder only: C:/images/ (auto-generates filename)\n• Empty: uses default output folder\n\nOutput:\nReturns the full path to the saved file, useful for chaining with other file operations.",
+  "icon": "save",
+  "color": "teal",
+  "tags": ["image", "save", "file", "export"],
+  "inputs": [
+    {
+      "id": "image",
+      "name": "Image",
+      "type": "image",
+      "position": "left",
+      "description": "Image to save"
+    }
+  ],
+  "outputs": [
+    {
+      "id": "path",
+      "name": "Path",
+      "type": "string",
+      "position": "right",
+      "description": "Path of saved file"
+    }
+  ],
+  "properties": [
+    {
+      "id": "path",
+      "name": "File Path",
+      "type": "string",
+      "default": "",
+      "description": "Path to save to (or folder for auto-naming)"
+    },
+    {
+      "id": "format",
+      "name": "Format",
+      "type": "select",
+      "default": "png",
+      "options": [
+        { "value": "png", "label": "PNG" },
+        { "value": "jpg", "label": "JPEG" },
+        { "value": "webp", "label": "WebP" }
+      ]
+    },
+    {
+      "id": "quality",
+      "name": "Quality",
+      "type": "number",
+      "default": 95,
+      "min": 1,
+      "max": 100,
+      "description": "Quality for JPEG/WebP",
+      "advanced": true
+    }
+  ],
+  "compiler": {
+    "template": "{{await}}Image.save({{input}}, {{prop.path}}, {{prop.format.raw}}, {{prop.quality}}, \"{{nodeId}}\")",
+    "async": true,
+    "statusTracking": true
+  },
+  "ui": {
+    "width": 280,
+    "customComponent": "ImageSaveNode"
+  }
+}

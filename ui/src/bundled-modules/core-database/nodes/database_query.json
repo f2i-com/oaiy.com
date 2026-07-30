@@ -1,0 +1,56 @@
+{
+  "id": "database_query",
+  "name": "Read Data",
+  "description": "Read data from a collection in the database.",
+  "doc": "Query data from a SQLite collection.\n\nFiltering:\n• No filter - returns all records in collection\n• JSON filter - match specific field values\n  Example: {\"status\": \"active\"}\n  Example: {\"category\": \"images\", \"processed\": true}\n\nOutput:\nReturns array of matching records, each containing:\n• id - unique record identifier\n• data - the stored data object\n• created_at - timestamp when stored\n\nTip: Connect filter input dynamically from other nodes for conditional queries.",
+  "icon": "database",
+  "color": "blue",
+  "tags": ["database", "read", "query", "data", "select"],
+  "flowplan": {
+    "stepTypes": ["database_query", "database_read", "database-query"],
+    "fieldMapping": {
+      "collection": "collectionName",
+      "filter": "filter"
+    }
+  },
+  "inputs": [
+    {
+      "id": "filter",
+      "name": "Filter",
+      "type": "object",
+      "position": "left",
+      "description": "Optional filter criteria (e.g., {\"status\": \"active\"})"
+    }
+  ],
+  "outputs": [
+    {
+      "id": "result",
+      "name": "Data",
+      "type": "array",
+      "position": "right",
+      "description": "Array of matching records"
+    }
+  ],
+  "properties": [
+    {
+      "id": "collectionName",
+      "name": "Collection",
+      "type": "string",
+      "default": "default",
+      "description": "Collection/table name to read from"
+    },
+    {
+      "id": "filterJson",
+      "name": "Filter (JSON)",
+      "type": "string",
+      "default": "{}",
+      "description": "Filter criteria as JSON (used if no input connected)"
+    }
+  ],
+  "compiler": {
+    "customHandler": true
+  },
+  "ui": {
+    "width": 280
+  }
+}

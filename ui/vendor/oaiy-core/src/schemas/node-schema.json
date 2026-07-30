@@ -1,0 +1,322 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://oaiy.com/schemas/node.json",
+  "title": "OAIY Node Definition",
+  "description": "Schema for OAIY workflow node definitions",
+  "type": "object",
+  "required": ["id", "name", "inputs", "outputs", "compiler"],
+  "properties": {
+    "id": {
+      "type": "string",
+      "description": "Unique identifier for the node type",
+      "pattern": "^[a-z][a-z0-9_]*$"
+    },
+    "name": {
+      "type": "string",
+      "description": "Display name of the node"
+    },
+    "description": {
+      "type": "string",
+      "description": "Brief description of what the node does"
+    },
+    "icon": {
+      "type": "string",
+      "description": "Icon name from Lucide icons"
+    },
+    "color": {
+      "type": "string",
+      "description": "Node color (hex or Tailwind color)"
+    },
+    "tags": {
+      "type": "array",
+      "description": "Tags for search and categorization",
+      "items": { "type": "string" }
+    },
+
+    "inputs": {
+      "type": "array",
+      "description": "Input handles for the node",
+      "items": { "$ref": "#/definitions/handle" }
+    },
+
+    "outputs": {
+      "type": "array",
+      "description": "Output handles for the node",
+      "items": { "$ref": "#/definitions/handle" }
+    },
+
+    "properties": {
+      "type": "array",
+      "description": "Configurable properties for the node",
+      "items": { "$ref": "#/definitions/property" },
+      "default": []
+    },
+
+    "compiler": {
+      "type": "object",
+      "description": "Code generation configuration",
+      "required": ["template"],
+      "properties": {
+        "template": {
+          "type": "string",
+          "description": "JavaScript code template with {{placeholders}}"
+        },
+        "preCode": {
+          "type": "string",
+          "description": "Code to execute before the main template"
+        },
+        "postCode": {
+          "type": "string",
+          "description": "Code to execute after the main template"
+        },
+        "async": {
+          "type": "boolean",
+          "description": "Whether the node executes asynchronously",
+          "default": false
+        },
+        "abortable": {
+          "type": "boolean",
+          "description": "Whether execution can be aborted",
+          "default": false
+        },
+        "statusTracking": {
+          "type": "boolean",
+          "description": "Whether to track node status (running/completed/error)",
+          "default": true
+        },
+        "outputVariable": {
+          "type": "string",
+          "description": "Custom output variable name pattern"
+        },
+        "customHandler": {
+          "type": "string",
+          "description": "Name of a custom compiler handler function for complex nodes"
+        }
+      }
+    },
+
+    "ui": {
+      "type": "object",
+      "description": "UI configuration for the node",
+      "properties": {
+        "width": {
+          "type": "number",
+          "description": "Default width in pixels",
+          "default": 280
+        },
+        "minWidth": {
+          "type": "number",
+          "description": "Minimum width in pixels",
+          "default": 200
+        },
+        "maxWidth": {
+          "type": "number",
+          "description": "Maximum width in pixels",
+          "default": 600
+        },
+        "minHeight": {
+          "type": "number",
+          "description": "Minimum height in pixels"
+        },
+        "resizable": {
+          "type": "boolean",
+          "description": "Whether the node can be resized",
+          "default": true
+        },
+        "collapsible": {
+          "type": "boolean",
+          "description": "Whether the node can be collapsed",
+          "default": true
+        },
+        "previewField": {
+          "type": "string",
+          "description": "Property ID to show as preview when collapsed"
+        },
+        "showPreview": {
+          "type": "boolean",
+          "description": "Whether to show image/content preview",
+          "default": false
+        },
+        "customComponent": {
+          "type": "string",
+          "description": "Path to custom React component (relative to module)"
+        }
+      }
+    },
+
+    "runtime": {
+      "type": "object",
+      "description": "Runtime behavior configuration",
+      "properties": {
+        "streaming": {
+          "type": "boolean",
+          "description": "Whether the node supports streaming output",
+          "default": false
+        },
+        "cacheable": {
+          "type": "boolean",
+          "description": "Whether results can be cached",
+          "default": false
+        },
+        "retryable": {
+          "type": "boolean",
+          "description": "Whether failed execution can be retried",
+          "default": false
+        },
+        "maxRetries": {
+          "type": "number",
+          "description": "Maximum retry attempts",
+          "default": 3
+        }
+      }
+    }
+  },
+
+  "definitions": {
+    "handle": {
+      "type": "object",
+      "required": ["id", "name", "type"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Unique identifier for the handle"
+        },
+        "name": {
+          "type": "string",
+          "description": "Display name for the handle"
+        },
+        "type": {
+          "type": "string",
+          "description": "Data type of the handle",
+          "enum": ["any", "string", "number", "boolean", "array", "object", "image", "file", "json"]
+        },
+        "required": {
+          "type": "boolean",
+          "description": "Whether this input is required",
+          "default": false
+        },
+        "multiple": {
+          "type": "boolean",
+          "description": "Whether multiple connections are allowed",
+          "default": false
+        },
+        "position": {
+          "type": "string",
+          "description": "Position of the handle",
+          "enum": ["left", "right", "top", "bottom"],
+          "default": "left"
+        },
+        "color": {
+          "type": "string",
+          "description": "Handle color (hex or Tailwind class)"
+        },
+        "description": {
+          "type": "string",
+          "description": "Tooltip description"
+        }
+      }
+    },
+
+    "property": {
+      "type": "object",
+      "required": ["id", "name", "type"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Property identifier (used in data object)"
+        },
+        "name": {
+          "type": "string",
+          "description": "Display label"
+        },
+        "type": {
+          "type": "string",
+          "description": "Property type",
+          "enum": ["string", "text", "textarea", "number", "boolean", "select", "multiselect", "secret", "color", "file", "code", "json", "array", "keyvalue"]
+        },
+        "default": {
+          "description": "Default value"
+        },
+        "placeholder": {
+          "type": "string",
+          "description": "Placeholder text"
+        },
+        "description": {
+          "type": "string",
+          "description": "Help text or description"
+        },
+        "required": {
+          "type": "boolean",
+          "default": false
+        },
+        "disabled": {
+          "type": "boolean",
+          "default": false
+        },
+        "hidden": {
+          "type": "boolean",
+          "description": "Whether to hide this property",
+          "default": false
+        },
+        "showIf": {
+          "type": "object",
+          "description": "Conditional visibility based on other properties",
+          "properties": {
+            "property": { "type": "string" },
+            "equals": {},
+            "notEquals": {},
+            "in": { "type": "array" }
+          }
+        },
+        "min": {
+          "type": "number",
+          "description": "Minimum value (for number type)"
+        },
+        "max": {
+          "type": "number",
+          "description": "Maximum value (for number type)"
+        },
+        "step": {
+          "type": "number",
+          "description": "Step value (for number type)"
+        },
+        "options": {
+          "type": "array",
+          "description": "Options for select/multiselect types",
+          "items": {
+            "type": "object",
+            "required": ["value", "label"],
+            "properties": {
+              "value": {},
+              "label": { "type": "string" },
+              "description": { "type": "string" }
+            }
+          }
+        },
+        "language": {
+          "type": "string",
+          "description": "Language for code editor (for code type)",
+          "enum": ["javascript", "typescript", "json", "html", "css", "sql", "markdown"]
+        },
+        "rows": {
+          "type": "number",
+          "description": "Number of rows for textarea",
+          "default": 3
+        },
+        "accept": {
+          "type": "string",
+          "description": "Accepted file types (for file type)"
+        },
+        "group": {
+          "type": "string",
+          "description": "Group name for organizing properties"
+        },
+        "advanced": {
+          "type": "boolean",
+          "description": "Whether this is an advanced property (hidden by default)",
+          "default": false
+        }
+      }
+    }
+  }
+}

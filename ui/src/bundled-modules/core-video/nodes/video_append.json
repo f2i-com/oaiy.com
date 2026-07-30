@@ -1,0 +1,107 @@
+{
+    "id": "video_append",
+    "name": "Video Append",
+    "description": "Concatenate multiple videos into a single video file.",
+    "doc": "Join multiple videos into one continuous video.\n\nInput Options:\n• Videos Array - connect from loop output\n• Individual inputs - Video 1, 2, 3, 4\n\nBehavior:\n• Videos are joined in order\n• Resolutions are normalized\n• Audio tracks are concatenated\n\nUse Cases:\n• Combine generated video scenes\n• Join clips from different sources\n• Build final video from loop results",
+    "icon": "layers",
+    "color": "purple",
+    "tags": [
+        "video",
+        "append",
+        "concat",
+        "merge",
+        "join"
+    ],
+    "inputs": [
+        {
+            "id": "videos",
+            "name": "Videos Array",
+            "type": "array",
+            "position": "left",
+            "description": "Array of videos to concatenate (from loop)",
+            "optional": true
+        },
+        {
+            "id": "video_1",
+            "name": "Video 1",
+            "type": "video",
+            "position": "left",
+            "description": "First video (URL or path)",
+            "optional": true
+        },
+        {
+            "id": "video_2",
+            "name": "Video 2",
+            "type": "video",
+            "position": "left",
+            "description": "Second video (URL or path)",
+            "optional": true
+        },
+        {
+            "id": "video_3",
+            "name": "Video 3",
+            "type": "video",
+            "position": "left",
+            "description": "Third video (optional)",
+            "optional": true
+        },
+        {
+            "id": "video_4",
+            "name": "Video 4",
+            "type": "video",
+            "position": "left",
+            "description": "Fourth video (optional)",
+            "optional": true
+        }
+    ],
+    "outputs": [
+        {
+            "id": "video",
+            "name": "Video",
+            "type": "video",
+            "position": "right",
+            "description": "Concatenated video output"
+        },
+        {
+            "id": "path",
+            "name": "Path",
+            "type": "string",
+            "position": "right",
+            "description": "Path to output video file"
+        }
+    ],
+    "properties": [
+        {
+            "id": "filename",
+            "name": "Output Filename",
+            "type": "string",
+            "default": "appended_video",
+            "description": "Base filename for output (without extension)"
+        },
+        {
+            "id": "format",
+            "name": "Format",
+            "type": "select",
+            "default": "mp4",
+            "options": [
+                {
+                    "value": "mp4",
+                    "label": "MP4"
+                },
+                {
+                    "value": "webm",
+                    "label": "WebM"
+                }
+            ]
+        }
+    ],
+    "compiler": {
+        "template": "(() => { const __videos = {{input.videos}} || [{{input.video_1}}, {{input.video_2}}, {{input.video_3}}, {{input.video_4}}].filter(v => v); const __result = {{await}}VideoFrames.appendVideos(__videos, {{prop.filename}}, {{prop.format.raw}}, \"{{nodeId}}\"); return { video: __result, path: __result }; })()",
+        "async": true,
+        "statusTracking": true
+    },
+    "ui": {
+        "width": 280,
+        "customComponent": "VideoAppendNode"
+    }
+}

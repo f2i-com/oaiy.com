@@ -1,0 +1,51 @@
+{
+  "id": "input_text",
+  "name": "Text Input",
+  "description": "Provides text input to the workflow. Can be set manually or via workflow inputs.",
+  "doc": "Provide static or dynamic text to your workflow.\n\nUsage:\n• Enter text directly in the node\n• Use as prompt input for AI nodes\n• Pass configuration values between nodes\n\nLabel Property:\nWhen running a workflow with inputs, the label identifies this input field. Use descriptive labels like 'Prompt' or 'Instructions'.\n\nTip: Resize the node for longer text content.",
+  "icon": "type",
+  "color": "green",
+  "tags": ["input", "text", "string"],
+  "inputs": [],
+  "outputs": [
+    {
+      "id": "text",
+      "name": "Text",
+      "type": "string",
+      "position": "right"
+    }
+  ],
+  "properties": [
+    {
+      "id": "label",
+      "name": "Label",
+      "type": "string",
+      "default": "Input",
+      "description": "Name for this input (used when running workflow with inputs)"
+    },
+    {
+      "id": "value",
+      "name": "Value",
+      "type": "textarea",
+      "default": "",
+      "description": "The text value to output",
+      "rows": 4
+    },
+    {
+      "id": "multiline",
+      "name": "Multiline",
+      "type": "boolean",
+      "default": true,
+      "description": "Allow multiple lines of text",
+      "advanced": true
+    }
+  ],
+  "compiler": {
+    "template": "{{prop.value}}",
+    "statusTracking": false
+  },
+  "ui": {
+    "width": 280,
+    "resizable": true
+  }
+}

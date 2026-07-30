@@ -1,0 +1,86 @@
+{
+  "id": "condition",
+  "name": "Condition",
+  "description": "Branch workflow based on a condition.",
+  "doc": "Split workflow into two paths based on a condition.\n\nOperators:\n• Equals / Not Equals - exact value match\n• Contains / Not Contains - substring check\n• Greater / Less Than - numeric comparison\n• Is Empty / Not Empty - check for null/empty\n\nOutputs:\n• True (green) - condition passes\n• False (red) - condition fails\n\nTip: Connect both outputs to different processing paths. Only the matching path will execute.",
+  "icon": "git-branch",
+  "color": "cyan",
+  "tags": ["if", "else", "branch", "condition"],
+  "flowplan": {
+    "stepTypes": ["condition"],
+    "fieldMapping": {
+      "input": "value",
+      "operator": "operator",
+      "value": "compareValue"
+    },
+    "valueMapping": {
+      "operator": {
+        "greater_than": "greater",
+        "less_than": "less"
+      }
+    },
+    "templateFields": ["input"],
+    "inputHandleMapping": {
+      "input": "value"
+    }
+  },
+  "inputs": [
+    {
+      "id": "value",
+      "name": "Value",
+      "type": "any",
+      "position": "left",
+      "description": "Value to evaluate"
+    }
+  ],
+  "outputs": [
+    {
+      "id": "true",
+      "name": "True",
+      "type": "any",
+      "position": "right",
+      "color": "green",
+      "description": "Output if condition is true"
+    },
+    {
+      "id": "false",
+      "name": "False",
+      "type": "any",
+      "position": "right",
+      "color": "red",
+      "description": "Output if condition is false"
+    }
+  ],
+  "properties": [
+    {
+      "id": "operator",
+      "name": "Operator",
+      "type": "select",
+      "default": "equals",
+      "options": [
+        { "value": "equals", "label": "Equals" },
+        { "value": "not_equals", "label": "Not Equals" },
+        { "value": "contains", "label": "Contains" },
+        { "value": "not_contains", "label": "Not Contains" },
+        { "value": "greater", "label": "Greater Than" },
+        { "value": "less", "label": "Less Than" },
+        { "value": "is_empty", "label": "Is Empty" },
+        { "value": "not_empty", "label": "Not Empty" }
+      ]
+    },
+    {
+      "id": "compareValue",
+      "name": "Compare Value",
+      "type": "string",
+      "default": "",
+      "description": "Value to compare against"
+    }
+  ],
+  "compiler": {
+    "template": "{{input}}",
+    "customHandler": "condition"
+  },
+  "ui": {
+    "width": 240
+  }
+}

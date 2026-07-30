@@ -1,0 +1,375 @@
+{
+  "id": "ai_llm",
+  "name": "AI LLM",
+  "description": "Send prompts to an LLM (Language Model) and receive generated responses. Supports OpenAI-compatible APIs.",
+  "doc": "Connect to AI language models. Two modes:\n\n**Internal** — Pure-Rust GGUF inference via plugin-llm (no network). Pick from the live model manifest; missing files show an inline Download button. Models stay resident across nodes until evicted (see Free VRAM toggle).\n\n**External** — Any OpenAI-compatible HTTP server. Pick a preset to auto-fill endpoint + model + auth:\n  • LM Studio (localhost:1234)\n  • Ollama (localhost:11434)\n  • OpenAI\n  • Anthropic\n  • Custom — raw override: edit endpoint / model / API key / request format by hand. Use this for OpenRouter, Groq, HuggingFace TGI, vLLM, etc.\n\nFeatures:\n• Vision support — attach images for multimodal models (External today; Internal once plugin-llm engine `forward_embeds` lands)\n• Streaming responses\n• Custom system prompts\n• Configurable token limits\n• API keys via Project Constants (avoid pasting into each node)\n\nLegacy note: workflows saved with the older Google / OpenRouter / Groq / HuggingFace dropdown options render as External / Custom with their endpoint + model preserved.",
+  "icon": "brain",
+  "color": "purple",
+  "tags": [
+    "ai",
+    "llm",
+    "chat",
+    "gpt",
+    "openai"
+  ],
+  "flowplan": {
+    "stepTypes": [
+      "ai_llm"
+    ],
+    "fieldMapping": {
+      "prompt": "prompt",
+      "image": "image",
+      "systemPrompt": "systemPrompt"
+    },
+    "literalInputFields": [
+      "prompt"
+    ],
+    "compilerOptionsMapping": {
+      "aiModel": "model",
+      "aiEndpoint": "endpoint",
+      "aiApiKeyConstant": "apiKeyConstant",
+      "aiRequestFormat": "format",
+      "aiProvider": "provider"
+    },
+    "conditionalDefaults": {
+      "imageFormat": {
+        "when": "image",
+        "then": "base64_inline",
+        "else": "none"
+      },
+      "imageInputCount": {
+        "when": "image",
+        "then": 1,
+        "else": 0
+      }
+    },
+    "templateFields": [
+      "prompt",
+      "image"
+    ],
+    "inputHandleMapping": {
+      "prompt": "prompt",
+      "image": "image"
+    }
+  },
+  "inputs": [
+    {
+      "id": "prompt",
+      "name": "Prompt",
+      "type": "string",
+      "position": "left",
+      "required": true,
+      "description": "The user prompt to send to the LLM"
+    },
+    {
+      "id": "image",
+      "name": "Image",
+      "type": "image",
+      "position": "left",
+      "description": "Optional image for vision models"
+    },
+    {
+      "id": "video",
+      "name": "Video",
+      "type": "video",
+      "position": "left",
+      "description": "Optional video for models that support video understanding (MiniCPM-V 4.6 — up to 128 frames via stack_frames mode; future Qwen3-VL Video). The runtime extracts N evenly-spaced frames (controlled by 'Video Frames' below) and feeds them as image inputs through the existing vision-chat path. Ignored by text-only models."
+    }
+  ],
+  "outputs": [
+    {
+      "id": "response",
+      "name": "Response",
+      "type": "string",
+      "position": "right",
+      "description": "The generated response from the LLM"
+    }
+  ],
+  "properties": [
+    {
+      "id": "service",
+      "name": "Service Preset",
+      "type": "select",
+      "default": "",
+      "dynamicOptionsSource": "service:list:ai_llm",
+      "description": "Pick a registered service to auto-fill endpoint + model + headers (manage in Settings → Services). Inline fields below still override the preset's values. Leave blank to use the Provider dropdown defaults."
+    },
+    {
+      "id": "provider",
+      "name": "Provider",
+      "type": "select",
+      "default": "",
+      "options": [
+        {
+          "value": "ollama",
+          "label": "Ollama (Local)"
+        },
+        {
+          "value": "lmstudio",
+          "label": "LM Studio (Local)"
+        },
+        {
+          "value": "huggingface",
+          "label": "HuggingFace TGI / vLLM (Local)"
+        },
+        {
+          "value": "custom",
+          "label": "Custom (OpenAI-compatible)"
+        }
+      ],
+      "description": "Local AI engine (OpenAI-compatible HTTP). Cloud providers (OpenAI / Anthropic / Google / OpenRouter / Groq) were removed for the local-first build — re-add entries here (and uncomment them in AILLMNode.tsx EXTERNAL_PRESETS) if needed.",
+      "showIf": { "property": "service", "equals": "" }
+    },
+    {
+      "id": "apiKeyConstant",
+      "name": "API Key Constant",
+      "type": "string",
+      "default": "",
+      "placeholder": "Enter constant name (e.g. OPENAI_API_KEY)",
+      "description": "Name of the constant containing the API key (overrides manual key)",
+      "showIf": { "property": "service", "equals": "" }
+    },
+    {
+      "id": "headers",
+      "name": "Custom Headers",
+      "type": "json",
+      "default": {},
+      "description": "Custom headers (JSON)",
+      "rows": 3,
+      "advanced": true
+    },
+    {
+      "id": "imageInputCount",
+      "name": "Image Input Count",
+      "type": "number",
+      "default": 0,
+      "min": 0,
+      "max": 10,
+      "description": "Number of image inputs for vision",
+      "advanced": true
+    },
+    {
+      "id": "videoFrames",
+      "name": "Video Frames",
+      "type": "number",
+      "default": 8,
+      "min": 1,
+      "max": 128,
+      "description": "Number of frames to extract from the connected Video input. Frames are sampled evenly across the clip and fed to the vision tower one-per-image. MiniCPM-V 4.6 trained on up to 128 frames; most cases work well at 4–16. Ignored when no Video input is connected.",
+      "advanced": true
+    },
+    {
+      "id": "mmprojPath",
+      "name": "Vision Projector (mmproj)",
+      "type": "filepath",
+      "default": "",
+      "fileFilters": [
+        { "name": "GGUF", "extensions": ["gguf"] },
+        { "name": "All Files", "extensions": ["*"] }
+      ],
+      "description": "Path to a companion `mmproj-*.gguf` file. Required for vision input on the Internal (OAIY Local) provider — without it, attached images are rejected with a clear error. Today only Gemma 3 and Qwen 3.5 / 3.6 multimodal mmprojs are wired end-to-end through plugin-llm's vision_chat. External cloud providers ignore this field; they expect images as base64/url via the existing Image Format field.",
+      "showWhen": {
+        "provider": ["oaiy-local"]
+      }
+    },
+    {
+      "id": "systemPrompt",
+      "name": "System Prompt",
+      "type": "textarea",
+      "default": "",
+      "description": "Optional system prompt to set context",
+      "rows": 3
+    },
+    {
+      "id": "model",
+      "name": "Model",
+      "type": "string",
+      "default": "",
+      "placeholder": "Use default from settings",
+      "description": "Model name (e.g., gpt-5.4-mini, claude-sonnet-4-6)",
+      "showIf": { "property": "service", "equals": "" }
+    },
+    {
+      "id": "endpoint",
+      "name": "API Endpoint",
+      "type": "string",
+      "default": "",
+      "placeholder": "Use default from settings",
+      "description": "OpenAI-compatible API endpoint",
+      "showIf": { "property": "service", "equals": "" }
+    },
+    {
+      "id": "apiKey",
+      "name": "API Key",
+      "type": "secret",
+      "default": "",
+      "placeholder": "Use default from settings",
+      "description": "API key for authentication",
+      "showIf": { "property": "service", "equals": "" }
+    },
+    {
+      "id": "customBodyTemplate",
+      "name": "Custom Request Body (template)",
+      "type": "textarea",
+      "default": "",
+      "rows": 5,
+      "placeholder": "{\"model\": {{model}}, \"messages\": {{messagesJsonRaw}}, \"stream\": false}",
+      "description": "Custom provider only: define the exact JSON request body. Placeholders {{prompt}} {{system}} {{model}} {{apiKey}} are JSON-escaped + quoted; {{messagesJsonRaw}} inserts the raw OpenAI-style messages array; append 'Raw' to any var for unescaped substitution. Leave blank to send the standard OpenAI chat body.",
+      "advanced": true,
+      "showWhen": { "provider": ["custom"] }
+    },
+    {
+      "id": "customResponsePath",
+      "name": "Custom Response Path",
+      "type": "string",
+      "default": "",
+      "placeholder": "choices.0.message.content",
+      "description": "Custom provider only: dot/bracket path into the JSON response to extract the reply text (e.g. 'choices.0.message.content', 'output.text', 'data[0].content'). Leave blank to use the standard OpenAI response path.",
+      "advanced": true,
+      "showWhen": { "provider": ["custom"] }
+    },
+    {
+      "id": "customHeaders",
+      "name": "Custom Request Headers (JSON)",
+      "type": "textarea",
+      "default": "",
+      "rows": 2,
+      "placeholder": "{\"Content-Type\": \"application/json\", \"Authorization\": \"Bearer {{apiKey}}\"}",
+      "description": "Custom provider only: HTTP headers as JSON. {{apiKey}} resolves the API Key Constant. Leave blank for Content-Type: application/json (plus Authorization if a key is set).",
+      "advanced": true,
+      "showWhen": { "provider": ["custom"] }
+    },
+    {
+      "id": "format",
+      "name": "API Format",
+      "type": "select",
+      "default": "openai",
+      "options": [
+        {
+          "value": "openai",
+          "label": "OpenAI"
+        },
+        {
+          "value": "anthropic",
+          "label": "Anthropic"
+        },
+        {
+          "value": "ollama",
+          "label": "Ollama"
+        },
+        {
+          "value": "lmstudio",
+          "label": "LM Studio"
+        }
+      ],
+      "description": "API format to use",
+      "showIf": { "property": "service", "equals": "" }
+    },
+    {
+      "id": "imageFormat",
+      "name": "Image Format",
+      "type": "select",
+      "default": "none",
+      "options": [
+        {
+          "value": "none",
+          "label": "None"
+        },
+        {
+          "value": "base64_inline",
+          "label": "Base64 Inline"
+        },
+        {
+          "value": "base64_separate",
+          "label": "Base64 Separate"
+        },
+        {
+          "value": "url",
+          "label": "URL"
+        },
+        {
+          "value": "binary",
+          "label": "Binary"
+        }
+      ],
+      "description": "How to handle image input for vision",
+      "advanced": true
+    },
+    {
+      "id": "maxImageDimension",
+      "name": "Max Image Dimension",
+      "type": "number",
+      "default": 0,
+      "min": 0,
+      "max": 4096,
+      "description": "Maximum width/height for images (0 = use default 1024px)",
+      "advanced": true,
+      "showWhen": {
+        "imageFormat": [
+          "base64_inline",
+          "base64_separate",
+          "binary"
+        ]
+      }
+    },
+    {
+      "id": "maxImageSizeKB",
+      "name": "Max Image Size (KB)",
+      "type": "number",
+      "default": 0,
+      "min": 0,
+      "max": 20480,
+      "description": "Maximum image size in KB (0 = use default 200KB). OpenAI accepts up to 20MB.",
+      "advanced": true,
+      "showWhen": {
+        "imageFormat": [
+          "base64_inline",
+          "base64_separate",
+          "binary"
+        ]
+      }
+    },
+    {
+      "id": "maxTokens",
+      "name": "Max Tokens",
+      "type": "number",
+      "default": 0,
+      "min": 0,
+      "max": 100000,
+      "description": "Maximum tokens in response (0 = no limit)",
+      "advanced": true
+    },
+    {
+      "id": "enableThinking",
+      "name": "Enable Thinking",
+      "type": "boolean",
+      "default": false,
+      "description": "Enable reasoning/thinking mode for models that support it (e.g. Qwen 3.5)",
+      "advanced": true
+    },
+    {
+      "id": "contextLength",
+      "name": "Context Length",
+      "type": "number",
+      "default": 0,
+      "min": 0,
+      "max": 200000,
+      "description": "Max context window size (0 = default)",
+      "advanced": true
+    }
+  ],
+  "compiler": {
+    "template": "{{await}}AI.vision({{input}}, {{input.image}}, {{prop.systemPrompt}}, {{prop.model.raw}}, \"{{nodeId}}\", {{prop.format.raw}}, {{prop.endpoint.raw}}, {{prop.apiKey.raw}}, {{prop.imageFormat.raw}}, {{prop.contextLength}}, {{prop.maxTokens}}, {{prop.maxImageDimension}}, {{prop.maxImageSizeKB}}, {{prop.mmprojPath.raw}}, {{input.video}}, {{prop.videoFrames}})",
+    "async": true,
+    "abortable": true,
+    "statusTracking": true
+  },
+  "runtime": {
+    "streaming": true
+  },
+  "ui": {
+    "width": 340,
+    "resizable": true,
+    "minWidth": 280
+  }
+}

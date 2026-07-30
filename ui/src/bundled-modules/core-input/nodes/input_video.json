@@ -1,0 +1,51 @@
+{
+  "id": "input_video",
+  "name": "Video Input",
+  "description": "Provides video file input to the workflow. Passes video path for processing.",
+  "doc": "Select a video file for processing.\n\nSupported Formats:\n• MP4, MOV, AVI, MKV, WebM\n\nOutput:\nReturns the video file path for use with video processing nodes.\n\nCommon Uses:\n• Video Gen - extend or modify videos\n• Speech to Text - transcribe audio track\n• Video Frame Extractor - get frames as images\n\nTip: Preview the video in the node to verify selection.",
+  "icon": "video",
+  "color": "orange",
+  "tags": ["input", "video", "media"],
+  "inputs": [],
+  "outputs": [
+    {
+      "id": "path",
+      "name": "Path",
+      "type": "video",
+      "position": "right",
+      "description": "Path to the video file. Output type is `video` so it links directly via QuickConnect to nodes that accept a video pin (Video Frame Extractor, Video Save, Video Append, Audio Mixer, AI LLM video input, …) without manual edge creation."
+    }
+  ],
+  "properties": [
+    {
+      "id": "label",
+      "name": "Label",
+      "type": "string",
+      "default": "Video",
+      "description": "Name for this input"
+    },
+    {
+      "id": "filePath",
+      "name": "Video Path",
+      "type": "string",
+      "default": "",
+      "hidden": true
+    },
+    {
+      "id": "fileName",
+      "name": "File Name",
+      "type": "string",
+      "default": "",
+      "hidden": true
+    }
+  ],
+  "compiler": {
+    "template": "{{prop.filePath}}",
+    "statusTracking": false,
+    "customHandler": "input_video"
+  },
+  "ui": {
+    "width": 260,
+    "customComponent": "InputVideoNode"
+  }
+}

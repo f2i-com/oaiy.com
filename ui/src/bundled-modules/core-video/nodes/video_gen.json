@@ -1,0 +1,293 @@
+{
+    "id": "video_gen",
+    "name": "Video Gen",
+    "description": "Generate videos using ComfyUI workflows or other local video APIs.",
+    "doc": "Generate AI videos from prompts or images.\n\nSupported Backends:\n• ComfyUI (custom workflows)\n• Any local/HTTP video API (set the endpoint per node)\n\nModes:\n• Text-to-video: Describe what you want\n• Image-to-video: Animate a source image\n\nSettings:\n• Frame Count - number of frames to generate\n• Width/Height - video dimensions\n• Frame Rate - output FPS\n\nTip: Use 'Free Memory' node before video generation to prevent out-of-memory errors.",
+    "icon": "video",
+    "color": "orange",
+    "tags": [
+        "video",
+        "generate",
+        "ai",
+        "comfyui"
+    ],
+    "flowplan": {
+        "stepTypes": [
+            "video_gen"
+        ],
+        "fieldMapping": {
+            "prompt": "prompt"
+        },
+        "literalInputFields": [
+            "prompt"
+        ],
+        "templateFields": [
+            "prompt"
+        ],
+        "inputHandleMapping": {
+            "prompt": "prompt"
+        }
+    },
+    "inputs": [
+        {
+            "id": "prompt",
+            "name": "Prompt",
+            "type": "string",
+            "position": "left",
+            "required": false,
+            "description": "Video generation prompt"
+        },
+        {
+            "id": "image",
+            "name": "Image",
+            "type": "image",
+            "position": "left",
+            "required": false,
+            "description": "Start image for img2vid generation"
+        },
+        {
+            "id": "image_end",
+            "name": "End Image",
+            "type": "image",
+            "position": "left",
+            "required": false,
+            "description": "End image for video generation (optional)"
+        },
+        {
+            "id": "frameCount",
+            "name": "Frame Count",
+            "type": "number",
+            "position": "left",
+            "required": false,
+            "description": "Number of frames (overrides workflow default)"
+        },
+        {
+            "id": "duration",
+            "name": "Duration",
+            "type": "number",
+            "position": "left",
+            "required": false,
+            "description": "Video duration in seconds (overrides node setting)"
+        },
+        {
+            "id": "audio",
+            "name": "Audio",
+            "type": "audio",
+            "position": "left",
+            "required": false,
+            "description": "Audio input for audio-guided video generation (LTX 2.3, etc.)"
+        }
+    ],
+    "outputs": [
+        {
+            "id": "video",
+            "name": "Video",
+            "type": "video",
+            "position": "right",
+            "description": "Generated video URL/Path"
+        }
+    ],
+    "properties": [
+        {
+            "id": "service",
+            "name": "Service Preset",
+            "type": "select",
+            "default": "",
+            "dynamicOptionsSource": "service:list:video_gen",
+            "description": "Pick a registered video-gen service (manage in Settings → Services) to auto-fill endpoint. Fields below still override the preset. Leave blank to use the inline Backend dropdown below."
+        },
+        {
+            "id": "apiFormat",
+            "name": "Backend",
+            "type": "select",
+            "default": "comfyui",
+            "options": [
+                { "value": "comfyui", "label": "ComfyUI" }
+            ],
+            "description": "Video generation backend (generic HTTP). The tool-specific Wan2GP format was removed for the generic local-first build — re-add { \"value\": \"wan2gp\" } here if needed.",
+            "showIf": { "property": "service", "equals": "" }
+        },
+        {
+            "id": "wan2gpModel",
+            "name": "Wan2GP Model",
+            "type": "select",
+            "default": "ltx2_22B_distilled",
+            "options": [
+                { "value": "ltx2_22B_distilled", "label": "LTX Video 2.3 Distilled (22B)" },
+                { "value": "ltx2_22B", "label": "LTX Video 2.3 (22B)" },
+                { "value": "ltx2_19B", "label": "LTX Video 2.0 (19B)" },
+                { "value": "t2v", "label": "Wan 2.1 T2V (14B)" },
+                { "value": "t2v_1.3B", "label": "Wan 2.1 T2V (1.3B)" },
+                { "value": "i2v", "label": "Wan 2.1 I2V 480p" },
+                { "value": "i2v_720p", "label": "Wan 2.1 I2V 720p" },
+                { "value": "t2v_2_2", "label": "Wan 2.2 T2V" },
+                { "value": "hunyuan_t2v", "label": "Hunyuan Video T2V" }
+            ],
+            "description": "Model for Wan2GP video generation",
+            "showWhen": { "apiFormat": ["wan2gp"] }
+        },
+        {
+            "id": "wan2gpDuration",
+            "name": "Duration (seconds)",
+            "type": "number",
+            "default": 5,
+            "min": 1,
+            "max": 60,
+            "description": "Video duration in seconds",
+            "showWhen": { "apiFormat": ["wan2gp"] }
+        },
+        {
+            "id": "wan2gpResolution",
+            "name": "Resolution",
+            "type": "select",
+            "default": "832x480",
+            "options": [
+                { "value": "3840x2176", "label": "3840 x 2176 (16:9 4K)" },
+                { "value": "2176x3840", "label": "2176 x 3840 (9:16 4K)" },
+                { "value": "3840x1664", "label": "3840 x 1664 (21:9 4K)" },
+                { "value": "1664x3840", "label": "1664 x 3840 (9:21 4K)" },
+                { "value": "2560x1440", "label": "2560 x 1440 (16:9 1440p)" },
+                { "value": "1440x2560", "label": "1440 x 2560 (9:16 1440p)" },
+                { "value": "1920x1440", "label": "1920 x 1440 (4:3 1440p)" },
+                { "value": "1440x1920", "label": "1440 x 1920 (3:4 1440p)" },
+                { "value": "2160x1440", "label": "2160 x 1440 (3:2 1440p)" },
+                { "value": "1440x2160", "label": "1440 x 2160 (2:3 1440p)" },
+                { "value": "1440x1440", "label": "1440 x 1440 (1:1 1440p)" },
+                { "value": "2688x1152", "label": "2688 x 1152 (21:9 1440p)" },
+                { "value": "1152x2688", "label": "1152 x 2688 (9:21 1440p)" },
+                { "value": "1920x1088", "label": "1920 x 1088 (16:9 1080p)" },
+                { "value": "1088x1920", "label": "1088 x 1920 (9:16 1080p)" },
+                { "value": "1920x832", "label": "1920 x 832 (21:9)" },
+                { "value": "832x1920", "label": "832 x 1920 (9:21)" },
+                { "value": "1024x1024", "label": "1024 x 1024 (1:1)" },
+                { "value": "1280x720", "label": "1280 x 720 (16:9 720p)" },
+                { "value": "720x1280", "label": "720 x 1280 (9:16 720p)" },
+                { "value": "1280x544", "label": "1280 x 544 (21:9)" },
+                { "value": "544x1280", "label": "544 x 1280 (9:21)" },
+                { "value": "1104x832", "label": "1104 x 832 (4:3)" },
+                { "value": "832x1104", "label": "832 x 1104 (3:4)" },
+                { "value": "960x960", "label": "960 x 960 (1:1)" },
+                { "value": "960x544", "label": "960 x 544 (16:9 540p)" },
+                { "value": "544x960", "label": "544 x 960 (9:16 540p)" },
+                { "value": "832x624", "label": "832 x 624 (4:3 480p)" },
+                { "value": "624x832", "label": "624 x 832 (3:4)" },
+                { "value": "720x720", "label": "720 x 720 (1:1)" },
+                { "value": "832x480", "label": "832 x 480 (16:9 480p)" },
+                { "value": "480x832", "label": "480 x 832 (9:16)" },
+                { "value": "512x512", "label": "512 x 512 (1:1 Small)" }
+            ],
+            "description": "Video resolution (width x height)",
+            "showWhen": { "apiFormat": ["wan2gp"] }
+        },
+        {
+            "id": "wan2gpSteps",
+            "name": "Steps",
+            "type": "number",
+            "default": 8,
+            "min": 1,
+            "max": 100,
+            "description": "Number of inference steps",
+            "showWhen": { "apiFormat": ["wan2gp"] }
+        },
+        {
+            "id": "endpoint",
+            "name": "Endpoint",
+            "type": "string",
+            "default": "",
+            "placeholder": "Use default",
+            "description": "Server URL (ComfyUI or Wan2GP)",
+            "showIf": { "property": "service", "equals": "" }
+        },
+        {
+            "id": "comfyWorkflow",
+            "name": "Workflow JSON",
+            "type": "json",
+            "default": "",
+            "hidden": true
+        },
+        {
+            "id": "comfyWorkflowName",
+            "name": "Workflow Name",
+            "type": "string",
+            "default": "",
+            "hidden": true
+        },
+        {
+            "id": "comfyPrimaryPromptNodeId",
+            "name": "Prompt Node ID",
+            "type": "string",
+            "default": "",
+            "hidden": true
+        },
+        {
+            "id": "comfyImageInputConfigs",
+            "name": "Image Input Configs",
+            "type": "json",
+            "default": [],
+            "hidden": true
+        },
+        {
+            "id": "comfySeedMode",
+            "name": "Seed Mode",
+            "type": "string",
+            "default": "random",
+            "hidden": true
+        },
+        {
+            "id": "comfyFixedSeed",
+            "name": "Fixed Seed",
+            "type": "number",
+            "default": null,
+            "hidden": true
+        },
+        {
+            "id": "comfyAllImageNodeIds",
+            "name": "All Image Node IDs",
+            "type": "json",
+            "default": [],
+            "hidden": true
+        },
+        {
+            "id": "comfyFrameCount",
+            "name": "Frame Count",
+            "type": "number",
+            "default": null,
+            "placeholder": "121",
+            "description": "Number of frames to generate (overrides workflow)"
+        },
+        {
+            "id": "comfyWidth",
+            "name": "Width",
+            "type": "number",
+            "default": null,
+            "placeholder": "1280",
+            "description": "Video width in pixels (overrides workflow)"
+        },
+        {
+            "id": "comfyHeight",
+            "name": "Height",
+            "type": "number",
+            "default": null,
+            "placeholder": "720",
+            "description": "Video height in pixels (overrides workflow)"
+        },
+        {
+            "id": "comfyFrameRate",
+            "name": "Frame Rate",
+            "type": "number",
+            "default": null,
+            "placeholder": "24",
+            "description": "Frames per second (overrides workflow)"
+        }
+    ],
+    "compiler": {
+        "customHandler": true,
+        "async": true,
+        "abortable": true,
+        "statusTracking": true
+    },
+    "ui": {
+        "width": 280,
+        "resizable": false
+    }
+}

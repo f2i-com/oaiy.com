@@ -1,0 +1,44 @@
+{
+  "id": "ltx2-video",
+  "name": "LTX-2.3 Video",
+  "description": "Lightricks LTX-2.3 distilled text-to-video (with audio). One-click install bootstraps uv, fetches the official LTX-2 repo, creates a CUDA venv (no xformers; SDPA fallback works on consumer Blackwell), and installs the JSON API server. Weights are NOT downloaded — point it at the folder holding the LTX-2.3 distilled + spatial-upscaler .safetensors and a gemma-3-* text-encoder dir (add it under Settings → Model Folders, e.g. E:\\ckpts). Exposes POST /generate {\"prompt\":\"...\"} → an mp4. Auto-picks the GPU with the most free VRAM.",
+  "category": "Video Generation",
+  "defaultPort": 17890,
+  "install": {
+    "kind": "script",
+    "windows": "install-ltx2.bat",
+    "unix": "install-ltx2.sh"
+  },
+  "run": {
+    "command": "${dataDir}/services/ltx2/LTX-2-main/.venv/Scripts/python.exe",
+    "args": [
+      "${dataDir}/scripts/ltx2_server.py",
+      "--server-port",
+      "${port}"
+    ],
+    "env": {
+      "LTX2_PORT": "${port}",
+      "LTX2_MODEL_DIRS": "${modelDirs}",
+      "LTX2_OUT_DIR": "${dataDir}/services/ltx2/out",
+      "LTX2_QUANT": "fp8-cast"
+    }
+  },
+  "health": {
+    "url": "http://127.0.0.1:${port}/health",
+    "timeoutSecs": 60
+  },
+  "uninstall": {
+    "paths": [
+      "${dataDir}/services/ltx2"
+    ]
+  },
+  "installedMarker": "${dataDir}/services/ltx2/.oaiy-installed",
+  "docsUrl": "https://github.com/Lightricks/LTX-2",
+  "node": {
+    "endpoint": "/generate",
+    "method": "POST",
+    "bodyTemplate": "{\"prompt\": {{input}}}",
+    "responsePath": "videoUrl",
+    "icon": "🎬"
+  }
+}

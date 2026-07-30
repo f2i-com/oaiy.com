@@ -1,0 +1,441 @@
+/**
+ * Core Utility Module Compiler
+ *
+ * Compiles utility nodes (template, logic_block, memory) into JavaScript code.
+ */
+
+import type { ModuleCompiler, ModuleCompilerContext } from 'oaiy-core/src/module-types';
+
+const CoreUtilityCompiler: ModuleCompiler = {
+  name: 'Utility',
+
+  getNodeTypes() {
+    return ['template', 'logic_block', 'memory', 'comfyui_free_memory'];
+  },
+
+  compileNode(nodeType: string, ctx: ModuleCompilerContext): string | null {
+    const { node, inputs, outputVar, sanitizedId, skipVarDeclaration, isInLoop, loopStartId, escapeString, sanitizeId, debugEnabled } = ctx;
+    const data = node.data;
+    const letOrAssign = skipVarDeclaration ? '' : 'let ';
+    const debug = debugEnabled ?? false;
+    // Check multiple possible handle names: 'default', 'input', 'input1', 'value'
+    const inputVar = inputs.get('default') || inputs.get('input') || inputs.get('input1') || inputs.get('value') || 'null';
+
+    let code = `
+  // --- Node: ${node.id} (${nodeType}) ---`;
+
+    switch (nodeType) {
+      case 'template': {
+        let template = escapeString(String(data.template || ''));
+
+        // Debug: log the raw template (only in debug mode)
+        if (debug) {
+          console.log(`[Template Compiler] Node ${node.id}: raw template (first 500 chars):`, template.substring(0, 500));
+          console.log(`[Template Compiler] Node ${node.id}: template includes {{history}}:`, template.includes('{{history}}'));
+        }
+
+        // Find all {{varName}} patterns and their input sources
+        const templateVars = template.match(/\{\{([^}]+)\}\}/g) || [];
+        if (debug) {
+          console.log(`[Template Compiler] Node ${node.id}: found templateVars:`, templateVars);
+        }
+        const varMap: Record<string, string> = {};
+
+        // Render a connected value into a template slot at RUNTIME. The old
+        // `"" + (v || '')` coercion silently dropped falsy values (0, false,
+        // '', NaN all became '') and collapsed objects to "[object Object]".
+        // This mirrors the runtime template() helper: null/undefined -> '',
+        // objects/arrays -> JSON, everything else (incl. 0 / false) -> String().
+        const slot = (expr: string) =>
+          `(${expr} == null ? '' : (typeof ${expr} === 'object' ? JSON.stringify(${expr}) : String(${expr})))`;
+
+        // Track the first connected input for conditional branch detection
+        let firstInputVar: string | null = null;
+
+        // Get custom input names from node data (e.g., ['value', 'count'])
+        const inputNames = (data.inputNames as string[]) || [];
+        // Map from standard handle IDs to custom names
+        const handleToName: Record<string, string> = {
+          'input': inputNames[0] || 'input',
+          'input2': inputNames[1] || 'input2',
+          'input3': inputNames[2] || 'input3',
+          'input4': inputNames[3] || 'input4',
+          'input5': inputNames[4] || 'input5',
+          'input6': inputNames[5] || 'input6',
+        };
+
+        // Build map of template variable -> source variable
+        for (const [handleId, sourceVar] of inputs) {
+          // Map the handle ID to the custom input name
+          const varName = handleToName[handleId] || handleId;
+          varMap[varName] = sourceVar;
+          // Also add the handle ID itself as a fallback
+          varMap[handleId] = sourceVar;
+          // Track first input for condition branch null-check
+          if (!firstInputVar) {
+            firstInputVar = sourceVar;
+          }
+          // Also allow {{input}} to refer to the first connected input
+          if (!varMap['input'] && (handleId === 'default' || handleId === 'input' || handleId === 'input1')) {
+            varMap['input'] = sourceVar;
+          }
+        }
+
+        if (debug) {
+          console.log(`[Template Compiler] Node ${node.id}: inputNames:`, inputNames, 'varMap keys:', Object.keys(varMap));
+        }
+
+        // Special handling for loop variables - these are substituted at runtime, not compile-time
+        // We'll add the runtime substitution code after the template is initialized
+        let loopSubstitutions = '';
+        if (isInLoop && loopStartId) {
+          const historyStrVar = `${sanitizeId(loopStartId)}_history_str`;
+          const indexVar = `node_${sanitizeId(loopStartId)}_out_index`;
+          const itemVar = `node_${sanitizeId(loopStartId)}_out`;
+
+          // Debug: log the variable names being used (only in debug mode)
+          if (debug) {
+            code += `
+  console.log("[Template] (${node.id}) loop context: historyStrVar=${historyStrVar}, historyValue=" + ${historyStrVar});`;
+          }
+
+          // Build runtime substitution code for loop variables
+          loopSubstitutions = `
+  _tmpl_${sanitizedId} = _tmpl_${sanitizedId}.split("{{history}}").join(${slot(historyStrVar)});
+  _tmpl_${sanitizedId} = _tmpl_${sanitizedId}.split("{{index}}").join(${slot(indexVar)});
+  _tmpl_${sanitizedId} = _tmpl_${sanitizedId}.split("{{item}}").join(JSON.stringify(${itemVar}));`;
+        }
+
+        // Check if input comes from a condition branch (ends with _out_true or _out_false)
+        // If the input is null, output null to support conditional branching
+        const checkForConditionBranch = firstInputVar &&
+          (firstInputVar.includes('_out_true') || firstInputVar.includes('_out_false'));
+
+        if (checkForConditionBranch) {
+          // Declare output variable before the if-else so it's in scope
+          code += `
+  // Check if condition branch input is null (skip template if so)
+  ${letOrAssign}${outputVar} = null;
+  if (${firstInputVar} === null) {
+    console.log("[Template] (${node.id}): skipped (condition branch input is null)");
+    workflow_context["${node.id}"] = null;
+  } else {`;
+
+          // Build substitution code
+          code += `
+    console.log("[Template] (${node.id}) === Template Node Start ===");
+    let _tmpl_${sanitizedId} = "${template}";
+    console.log("[Template] (${node.id}) raw template length: " + _tmpl_${sanitizedId}.length);`;
+
+          // Add loop variable substitutions
+          if (loopSubstitutions) {
+            code += loopSubstitutions;
+          }
+
+          // Substitute connected variables
+          for (const varName of templateVars) {
+            const cleanName = varName.replace(/\{\{|\}\}/g, '');
+            if (varMap[cleanName]) {
+              code += `
+    _tmpl_${sanitizedId} = _tmpl_${sanitizedId}.split("{{${cleanName}}}").join(${slot(varMap[cleanName])});`;
+            }
+          }
+
+          // Default: replace {{input}} with the main input
+          code += `
+    _tmpl_${sanitizedId} = _tmpl_${sanitizedId}.split("{{input}}").join(${slot(inputVar)});
+    ${outputVar} = _tmpl_${sanitizedId};
+    console.log("[Template] output (${node.id}): " + ${outputVar}.substring(0, 100));
+    workflow_context["${node.id}"] = ${outputVar};
+  }`;
+        } else {
+          // Non-conditional template - original code path
+          code += `
+  console.log("[Template] (${node.id}) === Template Node Start ===");
+  let _tmpl_${sanitizedId} = "${template}";
+  console.log("[Template] (${node.id}) raw template length: " + _tmpl_${sanitizedId}.length);`;
+
+          // Add loop variable substitutions (must be done at runtime since these are loop context variables)
+          if (loopSubstitutions) {
+            code += loopSubstitutions;
+          }
+
+          // Substitute connected variables
+          for (const varName of templateVars) {
+            const cleanName = varName.replace(/\{\{|\}\}/g, '');
+            if (varMap[cleanName]) {
+              code += `
+  _tmpl_${sanitizedId} = _tmpl_${sanitizedId}.split("{{${cleanName}}}").join(${slot(varMap[cleanName])});`;
+            }
+          }
+
+          // Default: replace {{input}} with the main input
+          code += `
+  _tmpl_${sanitizedId} = _tmpl_${sanitizedId}.split("{{input}}").join(${slot(inputVar)});
+  ${letOrAssign}${outputVar} = _tmpl_${sanitizedId};
+  console.log("[Template] output (${node.id}): " + ${outputVar}.substring(0, 100));
+  workflow_context["${node.id}"] = ${outputVar};`;
+        }
+        break;
+      }
+
+      case 'logic_block': {
+        // Get the user's code - use 'code' field (from UI) or 'script' field (legacy)
+        let userCode = String(data.code || data.script || 'input');
+        userCode = userCode.trim();
+
+        // Inlining user code is `code:execute`-equivalent — it runs arbitrary
+        // JS inside the workflow. Gate it exactly like the condition node's
+        // expression mode, so an untrusted/imported package can't execute a
+        // logic_block without the code:execute permission. Emitted once at the
+        // top of the node so every branch below (do/while, async IIFE, plain)
+        // is covered.
+        code += `
+  yield Utility.requireCodeExecute(["logic_block in node ${node.id}"]);`;
+
+        // Build named input variables and IIFE parameters
+        // Pass all inputs as IIFE parameters (avoids legacy closure capture pitfalls)
+        const iifeParams: string[] = [];
+        const iifeArgs: string[] = [];
+        let namedInputsSetup = '';
+
+        // Add primary input
+        iifeParams.push('_p_input');
+        iifeArgs.push(inputVar);
+        namedInputsSetup += `
+  let input = _p_input;`;
+
+        // Add other named inputs
+        for (const [handleId, sourceVar] of inputs) {
+          // Skip 'default' and 'input' since we already have 'input'
+          if (handleId !== 'default' && handleId !== 'input') {
+            const paramName = `_p_${handleId}`;
+            iifeParams.push(paramName);
+            iifeArgs.push(sourceVar);
+            namedInputsSetup += `
+  let ${handleId} = ${paramName};`;
+          }
+        }
+
+        // Expose loop index when inside a loop
+        if (isInLoop && loopStartId) {
+          const sanitizedLoopId = sanitizeId(loopStartId);
+          const loopIdxVar = `_i_${sanitizedLoopId}`;
+          iifeParams.push('_p_loop_index');
+          iifeArgs.push(loopIdxVar);
+          namedInputsSetup += `
+  let loop_index = _p_loop_index;`;
+        }
+
+        // Check if code has return statements - if so, wrap in IIFE for proper return behavior
+        const hasReturn = /\breturn\b/.test(userCode);
+        // Check if code uses await - if so, use async IIFE
+        const hasAwait = /\bawait\b/.test(userCode);
+        const asyncPrefix = hasAwait ? 'async ' : '';
+        const awaitPrefix = hasAwait ? 'await ' : '';
+
+        if (hasReturn && hasAwait) {
+          // Logic block with both return and await: inline the code using do/while(false) + break
+          // Can't use async IIFE because the runtime's await→yield replacement breaks nested functions.
+          // Transform "return X;" into "outputVar = (X); break;" for early-return support.
+          // Process line-by-line to skip comment lines (avoid transforming "return" inside comments).
+          const transformedCode = userCode.split('\n').map((ln: string) => {
+            if (ln.trimStart().startsWith('//')) return ln;
+            return ln
+              .replace(/\breturn\s+([^;\n]+);?/g, `${outputVar} = ($1); break;`)
+              .replace(/\breturn\s*;?\s*$/, 'break;');
+          }).join('\n');
+
+          code += `
+  // Logic block: inline with await + return (do/while pattern)
+  let context = workflow_context;`;
+          // Set up named inputs inline
+          code += `
+  let input = ${inputVar};`;
+          for (const [handleId, sourceVar] of inputs) {
+            if (handleId !== 'default' && handleId !== 'input') {
+              code += `
+  let ${handleId} = ${sourceVar};`;
+            }
+          }
+          if (isInLoop && loopStartId) {
+            const sanitizedLoopId = sanitizeId(loopStartId);
+            code += `
+  let loop_index = _i_${sanitizedLoopId};`;
+          }
+          code += `
+  ${letOrAssign}${outputVar} = null;
+  do {
+    ${transformedCode}
+  } while (false);
+  workflow_context["${node.id}"] = ${outputVar};`;
+        } else if (hasReturn) {
+          // Logic block with return but no await: inline using do/while(false) + break
+          // Avoids IIFE for cleaner generated output and to keep parameter passing simple.
+          // Transform "return X;" into "outputVar = (X); break;" for early-return support.
+          // Process line-by-line to skip comment lines (avoid transforming "return" inside comments).
+          const transformedCode = userCode.split('\n').map((ln: string) => {
+            if (ln.trimStart().startsWith('//')) return ln;
+            return ln
+              .replace(/\breturn\s+([^;\n]+);?/g, `${outputVar} = ($1); break;`)
+              .replace(/\breturn\s*;?\s*$/, 'break;');
+          }).join('\n');
+
+          code += `
+  // Logic block: inline with return (do/while pattern)
+  console.log("[LogicBlock Debug] (${node.id}) inputVar=${inputVar}, type:", typeof ${inputVar}, "preview:", JSON.stringify(${inputVar}).substring(0, 300));
+  let context = workflow_context;`;
+          // Set up named inputs inline
+          code += `
+  let input = ${inputVar};`;
+          for (const [handleId, sourceVar] of inputs) {
+            if (handleId !== 'default' && handleId !== 'input') {
+              code += `
+  let ${handleId} = ${sourceVar};`;
+            }
+          }
+          if (isInLoop && loopStartId) {
+            const sanitizedLoopId = sanitizeId(loopStartId);
+            code += `
+  let loop_index = _i_${sanitizedLoopId};`;
+          }
+          code += `
+  ${letOrAssign}${outputVar} = null;
+  do {
+    ${transformedCode}
+  } while (false);
+  console.log("[LogicBlock Debug] (${node.id}) outputVar=${outputVar}, type:", typeof ${outputVar}, "preview:", JSON.stringify(${outputVar}).substring(0, 300));
+  workflow_context["${node.id}"] = ${outputVar};`;
+        } else {
+          // No return statements - simple inline execution
+          // If it's a single expression, use it directly; otherwise wrap as expression
+          const isSingleExpression = !userCode.includes(';') && !userCode.includes('\n');
+
+          if (isSingleExpression && !hasAwait) {
+            // Simple expression - inline without IIFE (only if no await)
+            // Still need to evaluate inputs at the right point
+            code += `
+  // Logic block: inline JavaScript execution
+  let context = workflow_context;
+  let input = ${inputVar};`;
+            for (const [handleId, sourceVar] of inputs) {
+              if (handleId !== 'default' && handleId !== 'input') {
+                code += `
+  let ${handleId} = ${sourceVar};`;
+              }
+            }
+            if (isInLoop && loopStartId) {
+              const sanitizedLoopId = sanitizeId(loopStartId);
+              code += `
+  let loop_index = _i_${sanitizedLoopId};`;
+            }
+            code += `
+  ${letOrAssign}${outputVar} = ${userCode};
+  workflow_context["${node.id}"] = ${outputVar};`;
+          } else if (hasAwait) {
+            // Multi-statement code with await but no return - inline directly
+            // Can't use async IIFE because the runtime's await→yield replacement breaks nested functions.
+            code += `
+  // Logic block: multi-statement with await (inline)
+  let context = workflow_context;
+  let input = ${inputVar};`;
+            for (const [handleId, sourceVar] of inputs) {
+              if (handleId !== 'default' && handleId !== 'input') {
+                code += `
+  let ${handleId} = ${sourceVar};`;
+              }
+            }
+            if (isInLoop && loopStartId) {
+              const sanitizedLoopId = sanitizeId(loopStartId);
+              code += `
+  let loop_index = _i_${sanitizedLoopId};`;
+            }
+            code += `
+  ${userCode};
+  ${letOrAssign}${outputVar} = null;
+  workflow_context["${node.id}"] = ${outputVar};`;
+          } else {
+            // Multi-statement code without return or await - inline directly
+            // Avoids IIFE for cleaner generated output and to keep parameter passing simple.
+            code += `
+  // Logic block: multi-statement (no return, inline)
+  let context = workflow_context;
+  let input = ${inputVar};`;
+            for (const [handleId, sourceVar] of inputs) {
+              if (handleId !== 'default' && handleId !== 'input') {
+                code += `
+  let ${handleId} = ${sourceVar};`;
+              }
+            }
+            if (isInLoop && loopStartId) {
+              const sanitizedLoopId = sanitizeId(loopStartId);
+              code += `
+  let loop_index = _i_${sanitizedLoopId};`;
+            }
+            code += `
+  ${userCode};
+  ${letOrAssign}${outputVar} = null;
+  workflow_context["${node.id}"] = ${outputVar};`;
+          }
+        }
+        break;
+      }
+
+      case 'memory': {
+        const memoryKey = escapeString(String(data.key || 'default'));
+        const operation = String(data.operation || 'get');
+
+        if (operation === 'set') {
+          code += `
+  // Memory set: store value
+  console.log("[Memory] (${node.id}) === Memory Set ===");
+  console.log("[Memory] (${node.id}) key: ${memoryKey}, input type: " + (typeof ${inputVar}));
+  await Agent.set("${memoryKey}", ${inputVar});
+  ${letOrAssign}${outputVar} = ${inputVar};
+  workflow_context["${node.id}"] = ${outputVar};`;
+        } else {
+          // Get operation
+          code += `
+  // Memory get: retrieve stored value
+  console.log("[Memory] (${node.id}) === Memory Get ===");
+  console.log("[Memory] (${node.id}) key: ${memoryKey}");
+  ${letOrAssign}${outputVar} = await Agent.get("${memoryKey}");
+  console.log("[Memory] (${node.id}) retrieved type: " + (typeof ${outputVar}));
+  if (${outputVar} == null) {
+    ${outputVar} = ${inputVar}; // Fallback to input if nothing stored
+    console.log("[Memory] (${node.id}) using fallback input");
+  }
+  workflow_context["${node.id}"] = ${outputVar};`;
+        }
+        break;
+      }
+
+      case 'comfyui_free_memory': {
+        const comfyuiUrl = escapeString(String(data.comfyuiUrl || 'http://127.0.0.1:8188'));
+        const unloadModels = data.unloadModels !== false;
+        const freeMemory = data.freeMemory !== false;
+
+        code += `
+  // ComfyUI Free Memory: unload models and free GPU memory
+  console.log("[ComfyUI Free Memory] (${node.id}) === Freeing GPU Memory ===");
+  await Utility.comfyuiFreeMemory(
+    "${comfyuiUrl}",
+    ${unloadModels},
+    ${freeMemory},
+    "${node.id}"
+  );
+  // Pass through the input unchanged
+  ${letOrAssign}${outputVar} = ${inputVar};
+  workflow_context["${node.id}"] = ${outputVar};`;
+        break;
+      }
+
+      default:
+        return null;
+    }
+
+    return code;
+  },
+};
+
+export default CoreUtilityCompiler;

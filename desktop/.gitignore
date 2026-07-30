@@ -1,0 +1,11 @@
+node_modules/
+dist/
+src-tauri/target/
+src-tauri/Cargo.lock
+src-tauri/gen/
+.DS_Store
+*.log
+
+# Python bytecode from any bundled .py scripts
+__pycache__/
+*.pyc

@@ -1,0 +1,272 @@
+{
+    "id": "text_to_speech",
+    "name": "Text to Speech",
+    "description": "Convert text to natural speech. Internal mode uses the OAIY DramaBox engine (local, fast, voice cloning). External mode drives any HTTP TTS service (ElevenLabs, OpenAI, Chatterbox, your own).",
+    "doc": "Generate natural-sounding speech from text.\n\n## Two modes\n\n**Internal** — DramaBox running natively in OAIY (no Python, no server). Realtime on a recent GPU. Connect a 5-15 s reference wav to the **voice** pin for voice cloning.\n\n**External** — drive any HTTP TTS endpoint via a request/response template. Presets ship for ElevenLabs, OpenAI, Chatterbox, and Qwen3; pick **Custom** to point at your own service.\n\n## Pins\n\n• **Text (in)** — what to say\n• **Description (in)** — optional voice-style hint (overrides the Voice Description field when connected)\n• **Voice (in)** — reference wav for voice cloning (Internal) or to fill `{{voiceRefPath}}` (External)\n• **Audio (out)** — playable media URL\n• **Path (out)** — absolute file path for Save Audio / FFmpeg / diffusion-video audio input",
+    "icon": "mic",
+    "color": "teal",
+    "tags": [
+        "audio",
+        "tts",
+        "speech",
+        "voice",
+        "narration"
+    ],
+    "inputs": [
+        {
+            "id": "text",
+            "name": "Text",
+            "type": "string",
+            "position": "left",
+            "description": "Text to convert to speech"
+        },
+        {
+            "id": "descriptionInput",
+            "name": "Description",
+            "type": "string",
+            "position": "left",
+            "optional": true,
+            "description": "Voice description (overrides the Voice Description field when connected)"
+        },
+        {
+            "id": "audioPrompt",
+            "name": "Voice",
+            "type": "audio",
+            "position": "left",
+            "optional": true,
+            "description": "Reference audio (5-15 s WAV) for voice cloning. Internal + External both honour it."
+        }
+    ],
+    "outputs": [
+        {
+            "id": "audio",
+            "name": "Audio",
+            "type": "audio",
+            "position": "right",
+            "description": "Generated audio (media URL for playback / video-diffusion audio pin)"
+        },
+        {
+            "id": "path",
+            "name": "Path",
+            "type": "string",
+            "position": "right",
+            "description": "Absolute file path of the generated audio (for Save Audio / FFmpeg)"
+        }
+    ],
+    "properties": [
+        {
+            "id": "service",
+            "name": "Service Preset",
+            "type": "select",
+            "default": "",
+            "dynamicOptionsSource": "service:list:text_to_speech",
+            "description": "Pick a registered TTS service (manage in Settings → Services) to auto-fill the URL + headers + body template. Inline external* fields below still override. Leave blank to fill manually."
+        },
+        {
+            "id": "provider",
+            "name": "Mode",
+            "type": "select",
+            "default": "external",
+            "description": "Local TTS via an HTTP service (Chatterbox / Qwen3 TTS / Custom). The bundled DramaBox engine was removed in the local-first build.",
+            "options": [
+                { "value": "external", "label": "Local HTTP service" }
+            ],
+            "showIf": { "property": "service", "equals": "" }
+        },
+
+        {
+            "id": "internalModel",
+            "name": "Model",
+            "type": "select",
+            "default": "dramabox-v1",
+            "description": "Local TTS model. Auto-downloads weights on first use.",
+            "options": [
+                { "value": "dramabox-v1", "label": "DramaBox v1" }
+            ],
+            "dynamicOptionsSource": "tts:list-models",
+            "showIf": { "provider": "internal" }
+        },
+        {
+            "id": "internalCfgScale",
+            "name": "Guidance (CFG)",
+            "type": "number",
+            "default": 2.5,
+            "description": "Classifier-Free Guidance. 2.5 is the ResembleAI default; higher = more on-prompt but can introduce echo/distortion; lower = more freedom.",
+            "showIf": { "provider": "internal" }
+        },
+        {
+            "id": "internalDurationSeconds",
+            "name": "Duration (s)",
+            "type": "number",
+            "default": 0,
+            "description": "Target output length in seconds. Leave blank or set 0 to let DramaBox auto-size from the dialogue length (recommended). Override with 3–20 to force a specific clip length; the model clamps at 20 s.",
+            "showIf": { "provider": "internal" }
+        },
+        {
+            "id": "internalStreaming",
+            "name": "Streaming",
+            "type": "boolean",
+            "default": false,
+            "description": "Emit audio in ~1s chunks as they're vocoded (per-chunk Tauri events). For low-latency playback. Final saved file is identical either way.",
+            "showIf": { "provider": "internal" }
+        },
+        {
+            "id": "internalFastMode",
+            "name": "Fast mode (skip BWE)",
+            "type": "boolean",
+            "default": false,
+            "description": "Skip the bandwidth-extension generator. ~20% faster end-to-end, slightly muffled above ~7 kHz. Good for previews.",
+            "showIf": { "provider": "internal" }
+        },
+        {
+            "id": "internalSeed",
+            "name": "Seed",
+            "type": "number",
+            "default": 0,
+            "description": "Random seed for reproducibility. 0 = randomize each call.",
+            "showIf": { "provider": "internal" }
+        },
+
+        {
+            "id": "externalPreset",
+            "name": "Service",
+            "type": "select",
+            "default": "elevenlabs",
+            "description": "Pick a service to auto-fill URL + auth + body. Choose Custom to author your own.",
+            "options": [
+                { "value": "elevenlabs", "label": "ElevenLabs" },
+                { "value": "openai-tts", "label": "OpenAI TTS" },
+                { "value": "chatterbox-tts", "label": "Chatterbox TTS (local, port 8765)" },
+                { "value": "qwen3-tts", "label": "Qwen3 TTS (local, port 8772)" },
+                { "value": "custom", "label": "Custom" }
+            ],
+            "showIf": { "provider": "external", "service": "" }
+        },
+        {
+            "id": "externalUrl",
+            "name": "API URL",
+            "type": "string",
+            "default": "https://api.elevenlabs.io/v1/text-to-speech/{{speaker}}",
+            "description": "Full endpoint URL. Templates may use {{speaker}}, {{language}}, etc.",
+            "showIf": { "provider": "external", "service": "" }
+        },
+        {
+            "id": "externalApiKeyConstant",
+            "name": "API Key (secret name)",
+            "type": "string",
+            "default": "ELEVENLABS_API_KEY",
+            "description": "Name of an OAIY secret containing the API key. Exposed as {{apiKey}} in headers + body. Leave blank for unauthenticated local services.",
+            "showIf": { "provider": "external", "service": "" }
+        },
+        {
+            "id": "externalMethod",
+            "name": "Method",
+            "type": "select",
+            "default": "POST",
+            "options": [
+                { "value": "POST", "label": "POST" },
+                { "value": "GET", "label": "GET" }
+            ],
+            "showIf": { "provider": "external", "service": "" }
+        },
+        {
+            "id": "externalHeaders",
+            "name": "Headers (JSON)",
+            "type": "string",
+            "default": "{\"Content-Type\": \"application/json\", \"xi-api-key\": \"{{apiKey}}\"}",
+            "description": "HTTP headers as JSON. {{apiKey}} resolves the secret above.",
+            "showIf": { "provider": "external", "service": "" }
+        },
+        {
+            "id": "externalBodyTemplate",
+            "name": "Body (template)",
+            "type": "string",
+            "default": "{\"text\": {{text}}, \"model_id\": \"eleven_multilingual_v2\"}",
+            "description": "Request body. {{text}} {{voiceRefPath}} {{description}} {{speaker}} {{language}} are auto JSON-escaped + quoted; use {{textRaw}} etc. for raw substitution.",
+            "showIf": { "provider": "external", "service": "" }
+        },
+        {
+            "id": "externalResponseType",
+            "name": "Response Type",
+            "type": "select",
+            "default": "binary_mp3",
+            "description": "How the API returns audio. Binary = raw response body; file_path/url = JSON field at Response Path.",
+            "options": [
+                { "value": "binary_mp3", "label": "Binary MP3 (response body is audio)" },
+                { "value": "binary_wav", "label": "Binary WAV (response body is audio)" },
+                { "value": "base64_mp3", "label": "Base64-encoded MP3" },
+                { "value": "base64_wav", "label": "Base64-encoded WAV" },
+                { "value": "url", "label": "URL in response JSON" },
+                { "value": "file_path", "label": "Server-side file path in JSON" }
+            ],
+            "showIf": { "provider": "external", "service": "" }
+        },
+        {
+            "id": "externalResponsePath",
+            "name": "Response Path (JSON only)",
+            "type": "string",
+            "default": "",
+            "description": "Dot/bracket path into the JSON response (e.g. 'audio_path', 'data.url', '[0].audio'). Ignored for binary_* response types.",
+            "showIf": { "provider": "external", "service": "" }
+        },
+
+        {
+            "id": "description",
+            "name": "Voice Description",
+            "type": "string",
+            "default": "",
+            "description": "Optional voice-style hint, e.g. 'A warm narrator', 'A cheerful young woman'. Used by Internal and as {{description}} in External templates."
+        },
+        {
+            "id": "speaker",
+            "name": "Speaker / Voice ID",
+            "type": "string",
+            "default": "",
+            "description": "External: voice/speaker ID (e.g. ElevenLabs voice ID, 'alloy' for OpenAI). Internal ignores."
+        },
+        {
+            "id": "language",
+            "name": "Language",
+            "type": "select",
+            "default": "Auto",
+            "options": [
+                { "value": "Auto", "label": "Auto Detect" },
+                { "value": "English", "label": "English" },
+                { "value": "Chinese", "label": "Chinese" },
+                { "value": "Japanese", "label": "Japanese" },
+                { "value": "Korean", "label": "Korean" },
+                { "value": "Spanish", "label": "Spanish" },
+                { "value": "French", "label": "French" },
+                { "value": "German", "label": "German" },
+                { "value": "Portuguese", "label": "Portuguese" }
+            ],
+            "description": "Language hint. Internal auto-detects; External passes as {{language}}."
+        },
+        {
+            "id": "outputFormat",
+            "name": "Output Format",
+            "type": "select",
+            "default": "wav",
+            "options": [
+                { "value": "wav", "label": "WAV" },
+                { "value": "mp3", "label": "MP3" }
+            ]
+        },
+        {
+            "id": "filename",
+            "name": "Filename",
+            "type": "string",
+            "default": "tts_output",
+            "description": "Base filename for the saved audio (no extension)."
+        }
+    ],
+    "compiler": {
+        "customHandler": true,
+        "async": true,
+        "statusTracking": true
+    },
+    "ui": {
+        "width": 320,
+        "customComponent": "TextToSpeechNode"
+    }
+}

@@ -1,0 +1,86 @@
+{
+    "id": "audio_mixer",
+    "name": "Audio Mixer",
+    "description": "Mix an audio track into a video with volume control.",
+    "doc": "Combine audio tracks with video.\n\nModes:\n• Mix - blend audio with video's original audio\n• Replace - completely replace video audio\n\nVolume Control:\n• 0 = mute\n• 1.0 = normal\n• 2.0 = double volume\n\nUse Cases:\n• Add TTS narration to videos\n• Add background music\n• Replace video audio with better recording",
+    "icon": "volume-2",
+    "color": "teal",
+    "tags": [
+        "audio",
+        "video",
+        "mix",
+        "volume",
+        "narration",
+        "music"
+    ],
+    "inputs": [
+        {
+            "id": "video",
+            "name": "Video",
+            "type": "video",
+            "position": "left",
+            "description": "Input video"
+        },
+        {
+            "id": "audio",
+            "name": "Audio",
+            "type": "audio",
+            "position": "left",
+            "description": "Audio track to mix in (narration, music, etc.)"
+        }
+    ],
+    "outputs": [
+        {
+            "id": "video",
+            "name": "Video",
+            "type": "video",
+            "position": "right",
+            "description": "Video with mixed audio"
+        }
+    ],
+    "properties": [
+        {
+            "id": "videoVolume",
+            "name": "Video Volume",
+            "type": "number",
+            "default": 1.0,
+            "min": 0,
+            "max": 2,
+            "step": 0.1,
+            "description": "Volume level for original video audio (0-2)"
+        },
+        {
+            "id": "audioVolume",
+            "name": "Audio Volume",
+            "type": "number",
+            "default": 1.0,
+            "min": 0,
+            "max": 2,
+            "step": 0.1,
+            "description": "Volume level for added audio track (0-2)"
+        },
+        {
+            "id": "replaceAudio",
+            "name": "Replace Audio",
+            "type": "boolean",
+            "default": false,
+            "description": "Replace video audio entirely instead of mixing"
+        },
+        {
+            "id": "filename",
+            "name": "Output Filename",
+            "type": "string",
+            "default": "mixed_video",
+            "description": "Base filename for output (without extension)"
+        }
+    ],
+    "compiler": {
+        "template": "{{await}}VideoFrames.mixAudio({{input.video}}, {{input.audio}}, {{prop.videoVolume}}, {{prop.audioVolume}}, {{prop.replaceAudio}}, {{prop.filename}}, \"{{nodeId}}\")",
+        "async": true,
+        "statusTracking": true
+    },
+    "ui": {
+        "width": 300,
+        "customComponent": "AudioMixerNode"
+    }
+}

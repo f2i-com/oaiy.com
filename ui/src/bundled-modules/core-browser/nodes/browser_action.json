@@ -1,0 +1,167 @@
+{
+  "id": "browser_action",
+  "name": "Browser Action",
+  "description": "Drive a browser session: click, type, scroll, wait, screenshot, cookies, close.",
+  "doc": "Single node for everything you do to a session after Browser Page.\n\nActions:\n• Click - click an element by CSS selector\n• Type - type text into an input\n• Scroll - scroll the page (down/up/to selector)\n• Wait - wait for a selector to appear\n• Screenshot - capture the page (PNG/JPEG, optionally save to disk)\n• Get Cookies / Set Cookies - read or write session cookies\n• Close - close the session\n\nProperties show only the fields the chosen action needs.",
+  "icon": "cursor",
+  "color": "cyan",
+  "tags": ["browser", "action", "click", "type", "screenshot", "cookies"],
+  "inputs": [
+    {
+      "id": "session",
+      "name": "Session",
+      "type": "object",
+      "position": "left",
+      "description": "Browser session"
+    },
+    {
+      "id": "value",
+      "name": "Value",
+      "type": "any",
+      "position": "left",
+      "description": "Dynamic value (text to type, cookies array for Set Cookies)",
+      "optional": true
+    }
+  ],
+  "outputs": [
+    {
+      "id": "session",
+      "name": "Session",
+      "type": "object",
+      "position": "right",
+      "description": "Same session, passed through (false-ish if Close)"
+    },
+    {
+      "id": "result",
+      "name": "Result",
+      "type": "any",
+      "position": "right",
+      "description": "Action result (screenshot dataUrl/path, cookies array, or null)"
+    }
+  ],
+  "properties": [
+    {
+      "id": "action",
+      "name": "Action",
+      "type": "select",
+      "default": "click",
+      "options": [
+        { "value": "click", "label": "Click" },
+        { "value": "type", "label": "Type Text" },
+        { "value": "scroll", "label": "Scroll" },
+        { "value": "wait", "label": "Wait For Selector" },
+        { "value": "screenshot", "label": "Screenshot" },
+        { "value": "get_cookies", "label": "Get Cookies" },
+        { "value": "set_cookies", "label": "Set Cookies" },
+        { "value": "close", "label": "Close Session" }
+      ]
+    },
+    {
+      "id": "selector",
+      "name": "Selector",
+      "type": "string",
+      "default": "",
+      "description": "CSS selector",
+      "showIf": { "property": "action", "in": ["click", "type", "scroll", "wait", "screenshot"] }
+    },
+    {
+      "id": "text",
+      "name": "Text",
+      "type": "string",
+      "default": "",
+      "description": "Text to type (overridden by Value input)",
+      "showIf": { "property": "action", "equals": "type" }
+    },
+    {
+      "id": "scrollTo",
+      "name": "Scroll To",
+      "type": "select",
+      "default": "bottom",
+      "options": [
+        { "value": "bottom", "label": "Bottom" },
+        { "value": "top", "label": "Top" },
+        { "value": "selector", "label": "Selector" }
+      ],
+      "showIf": { "property": "action", "equals": "scroll" }
+    },
+    {
+      "id": "format",
+      "name": "Format",
+      "type": "select",
+      "default": "png",
+      "options": [
+        { "value": "png", "label": "PNG" },
+        { "value": "jpeg", "label": "JPEG" }
+      ],
+      "showIf": { "property": "action", "equals": "screenshot" }
+    },
+    {
+      "id": "fullPage",
+      "name": "Full Page",
+      "type": "boolean",
+      "default": false,
+      "description": "Capture beyond the viewport",
+      "showIf": { "property": "action", "equals": "screenshot" }
+    },
+    {
+      "id": "savePath",
+      "name": "Save Path",
+      "type": "string",
+      "default": "",
+      "description": "Optional path to save screenshot",
+      "advanced": true,
+      "showIf": { "property": "action", "equals": "screenshot" }
+    },
+    {
+      "id": "quality",
+      "name": "JPEG Quality",
+      "type": "number",
+      "default": 80,
+      "min": 1,
+      "max": 100,
+      "advanced": true,
+      "showIf": { "property": "action", "equals": "screenshot" }
+    },
+    {
+      "id": "domain",
+      "name": "Domain",
+      "type": "string",
+      "default": "",
+      "description": "Filter cookies to this domain (empty = all)",
+      "showIf": { "property": "action", "equals": "get_cookies" }
+    },
+    {
+      "id": "cookies",
+      "name": "Cookies (JSON)",
+      "type": "textarea",
+      "default": "[]",
+      "description": "JSON array of cookie objects (overridden by Value input)",
+      "rows": 4,
+      "showIf": { "property": "action", "equals": "set_cookies" }
+    },
+    {
+      "id": "merge",
+      "name": "Merge",
+      "type": "boolean",
+      "default": true,
+      "description": "Merge with existing cookies (off = clear first)",
+      "showIf": { "property": "action", "equals": "set_cookies" }
+    },
+    {
+      "id": "timeoutMs",
+      "name": "Timeout (ms)",
+      "type": "number",
+      "default": 15000,
+      "min": 100,
+      "max": 600000,
+      "advanced": true
+    }
+  ],
+  "compiler": {
+    "async": true,
+    "abortable": true,
+    "statusTracking": true,
+    "customHandler": true
+  },
+  "ui": { "width": 300 }
+}

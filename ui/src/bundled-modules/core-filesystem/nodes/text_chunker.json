@@ -1,0 +1,81 @@
+{
+  "id": "text_chunker",
+  "name": "Text Chunker",
+  "description": "Split text, JSON arrays, CSV, or lines into batches. Auto-detects type from file extension (.json, .csv, .txt). Supports streaming 100MB+ files.",
+  "doc": "Split content into batches for processing.\n\nContent Types:\n• Raw Text - split by character count with optional overlap\n• JSON Array - batch array items together\n• CSV Rows - batch CSV rows (header preserved)\n• Lines - batch lines together\n\nUse Cases:\n• Process large files that exceed LLM context limits\n• Batch API requests (e.g., 100 items at a time)\n• RAG preparation - chunk documents for embeddings\n\nBatch Size:\n• Raw text: characters per chunk (with overlap)\n• Structured: items per batch\n\nTip: Use overlap for text to maintain context across chunks.",
+  "icon": "scissors",
+  "color": "amber",
+  "tags": ["text", "split", "chunk", "divide", "json", "csv", "lines", "batch", "stream"],
+  "inputs": [
+    {
+      "id": "text",
+      "name": "Input",
+      "type": "string",
+      "position": "left",
+      "description": "Content from File Input or File Read node"
+    }
+  ],
+  "outputs": [
+    {
+      "id": "chunks",
+      "name": "Chunks",
+      "type": "array",
+      "position": "right",
+      "description": "Array of chunks/batches for processing"
+    }
+  ],
+  "properties": [
+    {
+      "id": "contentType",
+      "name": "Content Type",
+      "type": "select",
+      "default": "raw",
+      "options": [
+        { "value": "raw", "label": "Raw Text" },
+        { "value": "json_array", "label": "JSON Array" },
+        { "value": "csv", "label": "CSV Rows" },
+        { "value": "lines", "label": "Lines" }
+      ],
+      "description": "Auto-detects from file extension, or select manually"
+    },
+    {
+      "id": "chunkSize",
+      "name": "Batch Size",
+      "type": "number",
+      "default": 1000,
+      "min": 1,
+      "max": 100000,
+      "description": "Characters per chunk (raw text) or items per batch (JSON/CSV/Lines)"
+    },
+    {
+      "id": "overlap",
+      "name": "Overlap",
+      "type": "number",
+      "default": 100,
+      "min": 0,
+      "max": 5000,
+      "description": "Overlap between chunks (raw text only)"
+    },
+    {
+      "id": "csvHasHeader",
+      "name": "CSV Has Header",
+      "type": "boolean",
+      "default": true,
+      "description": "First row is header (CSV only)"
+    },
+    {
+      "id": "indexName",
+      "name": "Index Name",
+      "type": "string",
+      "default": "default",
+      "description": "Name for the document index (used in chunk IDs)"
+    }
+  ],
+  "compiler": {
+    "template": "Text.chunk({{input}}, {{prop.chunkSize}}, {{prop.overlap}}, {{prop.contentType.raw}})"
+  },
+  "ui": {
+    "width": 260,
+    "customComponent": "TextChunkerNode"
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "id": "ollama",
+  "name": "Ollama",
+  "description": "Run Ollama's local model server. No install step — requires Ollama already on your PATH (ollama.com). Shows install:none + a PATH command.",
+  "category": "LLM",
+  "defaultPort": 11434,
+  "install": { "kind": "none" },
+  "run": {
+    "command": "ollama",
+    "args": ["serve"],
+    "env": { "OLLAMA_HOST": "127.0.0.1:${port}" },
+    "cwd": null
+  },
+  "health": { "url": "http://127.0.0.1:${port}/api/tags", "timeoutSecs": 30 },
+  "docsUrl": "https://ollama.com"
+}

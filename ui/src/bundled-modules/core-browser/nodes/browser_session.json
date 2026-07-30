@@ -1,0 +1,166 @@
+{
+  "id": "browser_session",
+  "name": "Browser Session",
+  "description": "Open a browser session. Choose Chromium for headless scraping, WebView for visible/interactive, or HTTP for plain fetch.",
+  "doc": "Modes:\n• Chromium (default) - bundled native engine via CDP. Best for scraping at scale.\n• WebView - Tauri's embedded browser panel. Visible and interactive.\n• HTTP - plain fetch, no JavaScript.\n\nFeatures:\n• Optional proxy (static or from Mobile Proxy)\n• Per-session profile, persistable across runs\n• Custom user agent and viewport\n• Block resource types (image, font, media, stylesheet, script) for faster scraping\n• Initial cookies and headers\n• Stealth: inject fingerprint overrides for basic bot evasion\n\nFor sites with strong bot detection (Cloudflare Turnstile, hCaptcha): use stealth + headless:false + persistent profile, then warm cookies by navigating manually once before automating.",
+  "icon": "globe",
+  "color": "cyan",
+  "tags": ["browser", "session", "chromium", "webview"],
+  "inputs": [
+    {
+      "id": "proxy",
+      "name": "Proxy",
+      "type": "object",
+      "position": "left",
+      "description": "Optional BrowserProxyConfig (Mobile Proxy or static)",
+      "optional": true
+    }
+  ],
+  "outputs": [
+    {
+      "id": "session",
+      "name": "Session",
+      "type": "object",
+      "position": "right",
+      "description": "Session handle for downstream Browser Page / Extract / Action nodes"
+    }
+  ],
+  "properties": [
+    {
+      "id": "mode",
+      "name": "Mode",
+      "type": "select",
+      "default": "chromium",
+      "options": [
+        { "value": "chromium", "label": "Chromium (CDP)" },
+        { "value": "webview", "label": "WebView (Tauri)" },
+        { "value": "http", "label": "HTTP Only" }
+      ]
+    },
+    {
+      "id": "headless",
+      "name": "Headless",
+      "type": "boolean",
+      "default": true,
+      "description": "Run Chromium without a visible window",
+      "showIf": { "property": "mode", "equals": "chromium" }
+    },
+    {
+      "id": "profile",
+      "name": "Profile",
+      "type": "string",
+      "default": "default",
+      "description": "Profile name. Same name reuses cookies/storage when Persist Profile is on.",
+      "showIf": { "property": "mode", "equals": "chromium" }
+    },
+    {
+      "id": "persistProfile",
+      "name": "Persist Profile",
+      "type": "boolean",
+      "default": false,
+      "description": "Keep profile data dir between runs",
+      "showIf": { "property": "mode", "equals": "chromium" }
+    },
+    {
+      "id": "userAgent",
+      "name": "User Agent",
+      "type": "string",
+      "default": "",
+      "description": "Custom user agent. Empty = engine default."
+    },
+    {
+      "id": "viewportWidth",
+      "name": "Viewport Width",
+      "type": "number",
+      "default": 1365,
+      "min": 320,
+      "max": 4096,
+      "showIf": { "property": "mode", "equals": "chromium" }
+    },
+    {
+      "id": "viewportHeight",
+      "name": "Viewport Height",
+      "type": "number",
+      "default": 900,
+      "min": 240,
+      "max": 4096,
+      "showIf": { "property": "mode", "equals": "chromium" }
+    },
+    {
+      "id": "blockResources",
+      "name": "Block Resources",
+      "type": "multiselect",
+      "default": [],
+      "options": [
+        { "value": "image", "label": "Images" },
+        { "value": "font", "label": "Fonts" },
+        { "value": "media", "label": "Media" },
+        { "value": "stylesheet", "label": "Stylesheets" },
+        { "value": "script", "label": "Scripts" }
+      ],
+      "description": "Resource types blocked at the network layer for faster scraping",
+      "advanced": true,
+      "showIf": { "property": "mode", "equals": "chromium" }
+    },
+    {
+      "id": "headers",
+      "name": "Initial Headers",
+      "type": "textarea",
+      "default": "",
+      "description": "JSON map of headers added to every request",
+      "rows": 3,
+      "advanced": true
+    },
+    {
+      "id": "cookies",
+      "name": "Initial Cookies",
+      "type": "textarea",
+      "default": "",
+      "description": "JSON map of cookie name/value pairs (or array of cookie objects)",
+      "rows": 3,
+      "advanced": true
+    },
+    {
+      "id": "timeoutMs",
+      "name": "Default Timeout (ms)",
+      "type": "number",
+      "default": 30000,
+      "min": 1000,
+      "max": 600000,
+      "advanced": true
+    },
+    {
+      "id": "stealth",
+      "name": "Stealth",
+      "type": "boolean",
+      "default": false,
+      "description": "Inject fingerprint overrides (navigator.webdriver=undefined, fake chrome global, plugins, WebGL/canvas/audio noise, WebRTC IP block). Beats most non-Turnstile bot checks.",
+      "advanced": true,
+      "showIf": { "property": "mode", "equals": "chromium" }
+    },
+    {
+      "id": "impersonate",
+      "name": "TLS Impersonate",
+      "type": "select",
+      "default": "",
+      "options": [
+        { "value": "", "label": "Off (plain fetch)" },
+        { "value": "chrome131", "label": "Chrome 131 (Windows)" },
+        { "value": "chrome124", "label": "Chrome 124 (Windows)" }
+      ],
+      "description": "HTTP-mode only. Speak real Chrome TLS ClientHello + HTTP/2 SETTINGS on the wire (BoringSSL). Defeats JA3/JA4 bot scoring at the network layer.",
+      "advanced": true,
+      "showIf": { "property": "mode", "equals": "http" }
+    }
+  ],
+  "compiler": {
+    "async": true,
+    "abortable": true,
+    "statusTracking": true,
+    "customHandler": true
+  },
+  "ui": {
+    "width": 320,
+    "resizable": true
+  }
+}

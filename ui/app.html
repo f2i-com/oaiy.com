@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en" class="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <!-- Safe baseline CSP: blocks plugin (<object>/<embed>) and <base href> injection
+         with zero risk to the app. A full script-src lockdown (the bigger XSS win)
+         needs the inline pre-paint theme script externalized first + live testing,
+         since the engine requires 'unsafe-eval' and flows connect to arbitrary
+         user endpoints (so connect-src can't be tightened). -->
+    <meta http-equiv="Content-Security-Policy" content="object-src 'none'; base-uri 'self'" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <meta name="theme-color" content="#7167ff" />
+    <meta name="theme-color" media="(prefers-color-scheme: light)" content="#f3f0e9" />
+    <meta name="theme-color" media="(prefers-color-scheme: dark)" content="#070a12" />
+    <title>OAIY — Workspace</title>
+    <meta name="description" content="A visual workflow builder for AI automation — chain LLMs, browser automation, image/video/audio gen, and logic without writing boilerplate." />
+    <!-- Pre-paint theme so the workspace never flashes the wrong colours.
+         Mirrors ThemeContext's key + defaults; ThemeContext re-applies on
+         mount (idempotent), so this is purely a flash-of-wrong-theme guard. -->
+    <script>
+      (function () {
+        try {
+          var t = localStorage.getItem('oaiy_theme');
+          var resolved =
+            t === 'dark' ? 'dark'
+            : t === 'light' ? 'light'
+            : t === 'system'
+              ? (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark')
+              : 'dark';
+          var r = document.documentElement;
+          r.classList.remove('light', 'dark');
+          r.classList.add(resolved);
+          r.style.colorScheme = resolved;
+        } catch (e) { /* localStorage blocked — fall back to the class on <html> */ }
+      })();
+    </script>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300..800&family=JetBrains+Mono:wght@400..600&display=swap" rel="stylesheet" />
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

@@ -1,0 +1,160 @@
+{
+  "id": "browser_request",
+  "name": "Browser Request",
+  "description": "Make HTTP requests with full header control.",
+  "doc": "Make HTTP/HTTPS requests to APIs and websites.\n\nMethods: GET, POST, PUT, DELETE, PATCH\n\nBody Types:\n• None - no body (GET requests)\n• Form (URL encoded) - form submissions\n• JSON - API requests with JSON payload\n• Multipart - file uploads\n• Raw - custom body content\n\nResponse Formats:\n• HTML - web page content\n• JSON - parsed JSON object\n• Text - raw text response\n• Full - includes headers and status code\n\nLocal Network:\nEnable 'Allow Local Network' for localhost APIs like Ollama, ComfyUI, etc.",
+  "icon": "zap",
+  "color": "cyan",
+  "tags": [
+    "http",
+    "request",
+    "fetch",
+    "api"
+  ],
+  "flowplan": {
+    "stepTypes": [
+      "http_request",
+      "browser_request"
+    ],
+    "fieldMapping": {
+      "url": "url",
+      "method": "method",
+      "body": "body",
+      "headers": "headers"
+    },
+    "defaults": {
+      "method": "GET"
+    },
+    "templateFields": [
+      "url",
+      "body"
+    ],
+    "inputHandleMapping": {
+      "url": "url"
+    }
+  },
+  "inputs": [
+    {
+      "id": "session",
+      "name": "Session",
+      "type": "object",
+      "position": "left",
+      "description": "Browser session (optional)"
+    },
+    {
+      "id": "url",
+      "name": "URL",
+      "type": "string",
+      "position": "left",
+      "description": "URL to request"
+    }
+  ],
+  "outputs": [
+    {
+      "id": "response",
+      "name": "Response",
+      "type": "object",
+      "position": "right",
+      "description": "Response object with body, headers, status"
+    }
+  ],
+  "properties": [
+    {
+      "id": "url",
+      "name": "URL",
+      "type": "string",
+      "default": "",
+      "placeholder": "https://api.example.com/path",
+      "description": "Request URL (overridden by URL input handle if connected)"
+    },
+    {
+      "id": "method",
+      "name": "Method",
+      "type": "select",
+      "default": "GET",
+      "options": [
+        {
+          "value": "GET",
+          "label": "GET"
+        },
+        {
+          "value": "POST",
+          "label": "POST"
+        },
+        {
+          "value": "PUT",
+          "label": "PUT"
+        },
+        {
+          "value": "DELETE",
+          "label": "DELETE"
+        },
+        {
+          "value": "PATCH",
+          "label": "PATCH"
+        }
+      ]
+    },
+    {
+      "id": "headers",
+      "name": "Headers",
+      "type": "textarea",
+      "default": "",
+      "description": "Custom headers (JSON format)",
+      "rows": 3
+    },
+    {
+      "id": "body",
+      "name": "Body",
+      "type": "textarea",
+      "default": "",
+      "description": "Request body (string for raw, JSON.stringify-able object for json/form)",
+      "rows": 3,
+      "showIf": { "property": "method", "in": ["POST", "PUT", "PATCH", "DELETE"] }
+    },
+    {
+      "id": "bodyType",
+      "name": "Body Type",
+      "type": "select",
+      "default": "none",
+      "options": [
+        { "value": "none", "label": "None" },
+        { "value": "json", "label": "JSON (sets Content-Type, stringifies)" },
+        { "value": "form_urlencoded", "label": "Form (URL encoded)" },
+        { "value": "raw", "label": "Raw (no Content-Type set)" }
+      ],
+      "description": "How the body is encoded and what Content-Type is set",
+      "showIf": { "property": "method", "in": ["POST", "PUT", "PATCH", "DELETE"] }
+    },
+    {
+      "id": "responseFormat",
+      "name": "Response Format",
+      "type": "select",
+      "default": "auto",
+      "options": [
+        { "value": "auto", "label": "Auto (detect from Content-Type)" },
+        { "value": "json", "label": "JSON (parse body)" },
+        { "value": "text", "label": "Text (raw string)" },
+        { "value": "full", "label": "Full ({status, headers, body})" }
+      ],
+      "description": "What shape the Response output should be"
+    },
+    {
+      "id": "allowLocalNetwork",
+      "name": "Allow Local Network",
+      "type": "boolean",
+      "default": false,
+      "description": "Allow requests to localhost and private IPs (e.g., for ComfyUI, Ollama)"
+    }
+  ],
+  "compiler": {
+    "async": true,
+    "abortable": true,
+    "statusTracking": true,
+    "customHandler": true
+  },
+  "ui": {
+    "width": 320,
+    "resizable": true
+  }
+}

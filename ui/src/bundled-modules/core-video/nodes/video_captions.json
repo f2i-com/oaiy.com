@@ -1,0 +1,154 @@
+{
+    "id": "video_captions",
+    "name": "Video Captions",
+    "description": "Add text captions/subtitles overlay to a video. Automatically times captions based on narration segments.",
+    "doc": "Add timed captions/subtitles to videos.\n\nSegment Timing:\nUse ' ... ' (space-ellipsis-space) to separate caption segments. Each segment is timed automatically across the video duration.\n\nExample:\n\"Welcome to our video ... Today we'll learn ... Let's get started!\"\n\nCustomization:\n• Position: top, middle, bottom\n• Font size and color\n• Background color with opacity\n• Padding and margin\n\nAdvanced:\nConnect durations array for precise timing per segment.",
+    "icon": "film",
+    "color": "cyan",
+    "tags": [
+        "video",
+        "captions",
+        "subtitles",
+        "text",
+        "overlay"
+    ],
+    "flowplan": {
+        "stepTypes": [
+            "video_captions"
+        ],
+        "fieldMapping": {
+            "video": "video",
+            "text": "text",
+            "position": "position",
+            "fontSize": "fontSize",
+            "fontColor": "fontColor",
+            "backgroundColor": "backgroundColor",
+            "padding": "padding",
+            "margin": "margin"
+        },
+        "literalInputFields": [
+            "position",
+            "fontSize",
+            "fontColor",
+            "backgroundColor",
+            "padding",
+            "margin"
+        ],
+        "templateFields": [],
+        "inputHandleMapping": {
+            "video": "video",
+            "text": "text"
+        }
+    },
+    "inputs": [
+        {
+            "id": "video",
+            "name": "Video",
+            "type": "video",
+            "position": "left",
+            "required": true,
+            "description": "Input video to add captions to"
+        },
+        {
+            "id": "text",
+            "name": "Text",
+            "type": "string",
+            "position": "left",
+            "required": true,
+            "description": "Caption text. Use ' ... ' to separate segments for timed display."
+        },
+        {
+            "id": "durations",
+            "name": "Durations",
+            "type": "array",
+            "position": "left",
+            "required": false,
+            "description": "Optional array of durations (in seconds) for each segment. If provided, uses these instead of equal division."
+        },
+        {
+            "id": "segments",
+            "name": "STT Segments",
+            "type": "array",
+            "position": "left",
+            "required": false,
+            "description": "STT segments array with {start, end, text}. When connected, text and durations are extracted automatically from segments."
+        }
+    ],
+    "outputs": [
+        {
+            "id": "video",
+            "name": "Video",
+            "type": "video",
+            "position": "right",
+            "description": "Video with captions overlay"
+        }
+    ],
+    "properties": [
+        {
+            "id": "position",
+            "name": "Position",
+            "type": "select",
+            "default": "bottom",
+            "options": [
+                { "value": "top", "label": "Top" },
+                { "value": "center", "label": "Middle" },
+                { "value": "bottom", "label": "Bottom" }
+            ],
+            "description": "Vertical position of captions"
+        },
+        {
+            "id": "fontSize",
+            "name": "Font Size",
+            "type": "number",
+            "default": 48,
+            "min": 12,
+            "max": 120,
+            "step": 4,
+            "description": "Caption text font size in pixels"
+        },
+        {
+            "id": "fontColor",
+            "name": "Font Color",
+            "type": "string",
+            "default": "white",
+            "description": "Caption text color (e.g., white, yellow, #FFFFFF)"
+        },
+        {
+            "id": "backgroundColor",
+            "name": "Background Color",
+            "type": "string",
+            "default": "black@0.7",
+            "description": "Caption background color with opacity (e.g., black@0.7)"
+        },
+        {
+            "id": "padding",
+            "name": "Padding (px)",
+            "type": "number",
+            "default": 15,
+            "min": 0,
+            "max": 50,
+            "step": 5,
+            "description": "Padding around caption text"
+        },
+        {
+            "id": "margin",
+            "name": "Margin (px)",
+            "type": "number",
+            "default": 50,
+            "min": 0,
+            "max": 200,
+            "step": 10,
+            "description": "Distance from edge of video"
+        }
+    ],
+    "compiler": {
+        "customHandler": true,
+        "async": true,
+        "abortable": true,
+        "statusTracking": true
+    },
+    "ui": {
+        "width": 280,
+        "resizable": false
+    }
+}

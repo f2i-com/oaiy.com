@@ -1,0 +1,31 @@
+# Apache: route every request through public/index.php.
+# nginx users: equivalent block is in README.md → "Deploying behind nginx".
+#
+# DEFENSE IN DEPTH: the RECOMMENDED layout points the DocumentRoot at
+# api/public/ (or moves api/ outside the web root entirely), under which none
+# of the files below are reachable and these rules are simply inert. But the
+# README also documents a fallback where the DocumentRoot is api/ itself — and
+# there the whole tree is web-reachable, so a direct GET to /.env or
+# /var/oaiy.sqlite would otherwise return the raw file (DB credentials + every
+# stored flow/run). The deny rules below block those sensitive paths regardless
+# of the doc-root layout. Prefer the api/public/ docroot anyway.
+
+# Belt: block sensitive files for servers honouring <FilesMatch> (Apache 2.4).
+<FilesMatch "^\.|\.(env|sqlite|sqlite-wal|sqlite-shm|sqlite-journal)$|^composer\.(json|lock)$">
+  Require all denied
+</FilesMatch>
+
+RewriteEngine On
+
+# Suspenders: the same protection via mod_rewrite (works on 2.2 + 2.4, and
+# covers whole directories). 403 on source/data/tooling dirs, dotfiles
+# (except ACME's .well-known), the SQLite DB sidecars, and Composer manifests.
+RewriteRule (^|/)(src|var|migrations|bin|vendor|storage)/ - [F,L]
+RewriteRule (^|/)\.(?!well-known) - [F,L]
+RewriteRule \.(env|sqlite|sqlite-wal|sqlite-shm|sqlite-journal)$ - [F,L]
+RewriteRule (^|/)composer\.(json|lock)$ - [F,L]
+
+# Route everything that isn't a real file/dir through the front controller.
+RewriteCond %{REQUEST_FILENAME} !-f
+RewriteCond %{REQUEST_FILENAME} !-d
+RewriteRule ^(.*)$ public/index.php [QSA,L]

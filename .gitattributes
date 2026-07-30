@@ -1,0 +1,17 @@
+# Line-ending normalization.
+# Shell scripts MUST be LF — a CRLF copy breaks under `sh` on Linux, and they
+# are embedded verbatim into oaiy-server via include_str! at build time.
+*.sh text eol=lf
+
+# Windows scripts stay CRLF.
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Licence texts must stay byte-identical to their canonical upstream copies
+# (LICENSE is the official Apache-2.0 file, sha256 c6596eb7…; the .OFL.txt files
+# come from the fonts' own repos). core.autocrlf would rewrite them to CRLF on
+# checkout and change those hashes, so pin them to LF.
+LICENSE text eol=lf
+NOTICE text eol=lf
+*.OFL.txt text eol=lf

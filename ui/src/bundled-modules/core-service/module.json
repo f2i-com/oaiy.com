@@ -1,0 +1,24 @@
+{
+  "id": "core-service",
+  "name": "Service",
+  "version": "1.0.0",
+  "description": "Call any local HTTP service with a templated request and extract a typed response. Designed for engines the user runs themselves (Ollama, ComfyUI, Whisper.cpp server, or custom).",
+  "author": "OAIY Team",
+  "category": "Integration",
+  "icon": "server",
+  "color": "cyan",
+  "nodes": ["service_call"],
+  "permissions": ["network"],
+  "runtime": {
+    "typescript": "runtime.ts",
+    "compiler": "compiler.ts"
+  },
+  "ui": {
+    "nodes": [
+      {
+        "nodeType": "service_call",
+        "componentName": "ServiceCallNode"
+      }
+    ]
+  }
+}

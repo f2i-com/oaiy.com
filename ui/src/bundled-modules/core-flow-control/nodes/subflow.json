@@ -1,0 +1,46 @@
+{
+  "id": "subflow",
+  "name": "Subflow",
+  "description": "Execute another workflow as a subflow.",
+  "doc": "Run another workflow as part of this flow.\n\nUsage:\n• Select a workflow to execute\n• Input is passed to the subflow\n• Output returns the subflow's result\n\nDifference from Macros:\n• Subflows run a complete workflow\n• Macros are designed for reusable components with defined inputs/outputs\n\nTip: Use subflows to organize complex automations into smaller, manageable pieces.",
+  "icon": "share",
+  "color": "cyan",
+  "tags": ["subflow", "workflow", "nested", "call"],
+  "inputs": [
+    {
+      "id": "input",
+      "name": "Input",
+      "type": "any",
+      "position": "left",
+      "description": "Input to pass to subflow"
+    }
+  ],
+  "outputs": [
+    {
+      "id": "default",
+      "name": "Output",
+      "type": "any",
+      "position": "right",
+      "description": "Output from subflow"
+    }
+  ],
+  "properties": [
+    {
+      "id": "flowId",
+      "name": "Flow",
+      "type": "string",
+      "default": "",
+      "description": "Flow ID to execute",
+      "placeholder": "Select a flow"
+    }
+  ],
+  "compiler": {
+    "template": "{{await}}Flow.execute({{prop.flowId.raw}}, {{input}}, \"{{nodeId}}\")",
+    "async": true,
+    "abortable": true,
+    "statusTracking": true
+  },
+  "ui": {
+    "width": 260
+  }
+}

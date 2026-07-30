@@ -1,0 +1,15 @@
+{
+  "name": "OAIY — Orchestrate AI Yourself",
+  "short_name": "OAIY",
+  "description": "A visual, node-based canvas for local AI. Chain LLMs, browser automation, and image, audio & video generation on your own machine.",
+  "start_url": "/app.html",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#070a12",
+  "theme_color": "#7167ff",
+  "icons": [
+    { "src": "/favicon.svg", "type": "image/svg+xml", "sizes": "any", "purpose": "any" },
+    { "src": "/apple-touch-icon.png", "type": "image/png", "sizes": "180x180" },
+    { "src": "/favicon-32.png", "type": "image/png", "sizes": "32x32" }
+  ]
+}

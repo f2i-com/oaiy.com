@@ -1,0 +1,55 @@
+{
+  "id": "logic_block",
+  "name": "Logic Block",
+  "description": "Custom JavaScript code block for advanced processing. Write JavaScript code to transform data.",
+  "doc": "Write custom JavaScript to transform data.\n\nInput Access:\n• $input - the value connected to the Input handle\n\nReturn Value:\nThe last expression is returned as output.\n\nExample:\n// Parse JSON and extract field\nlet data = JSON.parse($input);\ndata.items.map(i => i.name)\n\nUse Cases:\n• Transform data structures\n• Apply custom logic not covered by other nodes\n• Parse and format complex data\n\nNote: Code runs in a sandboxed environment.",
+  "icon": "code",
+  "color": "blue",
+  "tags": ["code", "logic", "custom", "script"],
+  "inputs": [
+    {
+      "id": "input",
+      "name": "Input",
+      "type": "any",
+      "position": "left"
+    }
+  ],
+  "outputs": [
+    {
+      "id": "default",
+      "name": "Output",
+      "type": "any",
+      "position": "right"
+    }
+  ],
+  "properties": [
+    {
+      "id": "code",
+      "name": "Code",
+      "type": "code",
+      "language": "javascript",
+      "default": "// input is available as $input\nlet result = $input;\nresult",
+      "description": "JavaScript code to execute",
+      "rows": 8
+    }
+  ],
+  "flowplan": {
+    "stepTypes": ["logic_block", "code"],
+    "fieldMapping": {
+      "code": "code"
+    },
+    "templateFields": ["input"],
+    "inputHandleMapping": {
+      "input": "input"
+    },
+    "literalInputFields": ["code"]
+  },
+  "compiler": {
+    "template": "(function() { let $input = {{input}}; {{prop.code.raw}} })()",
+    "customHandler": "logic_block"
+  },
+  "ui": {
+    "width": 340,
+    "resizable": true
+  }
+}

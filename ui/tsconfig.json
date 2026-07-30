@@ -1,0 +1,35 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "useDefineForClassFields": true,
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "types": ["vite/client", "node"],
+    "skipLibCheck": true,
+    "baseUrl": ".",
+    "paths": {
+      "react": ["./node_modules/@types/react"],
+      "react/*": ["./node_modules/@types/react/*"],
+      "@xyflow/react": ["./node_modules/@xyflow/react"],
+      "@monaco-editor/react": ["./node_modules/@monaco-editor/react"],
+      "oaiy-ui-components": ["./vendor/oaiy-ui-components/src"],
+      "oaiy-ui-components/*": ["./vendor/oaiy-ui-components/src/*"],
+      "oaiy-core": ["./vendor/oaiy-core/src"],
+      "oaiy-core/modules/*": ["./src/bundled-modules/*"],
+      "oaiy-core/*": ["./vendor/oaiy-core/*"],
+      "@tauri-apps/api/core": ["./src/tauri-shim/core.ts"],
+      "@tauri-apps/api/event": ["./src/tauri-shim/event.ts"],
+      "@tauri-apps/plugin-dialog": ["./src/tauri-shim/dialog.ts"],
+      "@tauri-apps/plugin-fs": ["./src/tauri-shim/fs.ts"],
+      "@tauri-apps/plugin-sql": ["./src/tauri-shim/sql.ts"]
+    },
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "moduleDetection": "force",
+    "noEmit": true,
+    "jsx": "react-jsx",
+    "strict": true,
+    "noFallthroughCasesInSwitch": true
+  },
+  "include": ["src", "vendor"]
+}

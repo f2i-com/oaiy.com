@@ -1,0 +1,7 @@
+# OAIY — allow crawling the marketing site + app shell.
+# Shared flows are addressed by query string (?flow=<110-bit hash>); they
+# aren't enumerable, but we still ask crawlers not to index share links so a
+# publicly-pasted link doesn't end up in a search index.
+User-agent: *
+Allow: /
+Disallow: /*?flow=

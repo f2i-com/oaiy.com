@@ -1,0 +1,55 @@
+{
+  "id": "llama-cpp",
+  "name": "Llama.cpp Server",
+  "description": "Fast local LLM inference (llama.cpp server). Pick which GGUF to load in its Model selector.",
+  "category": "LLM",
+  "defaultPort": 8080,
+  "install": {
+    "kind": "script",
+    "windows": "install-llama-cpp.ps1",
+    "unix": "install-llama-cpp.sh"
+  },
+  "run": {
+    "command": "llama-server",
+    "args": [
+      "--host",
+      "127.0.0.1",
+      "--port",
+      "${port}",
+      "-m",
+      "${llamaModel}"
+    ],
+    "env": {}
+  },
+  "health": {
+    "url": "http://127.0.0.1:${port}/health",
+    "timeoutSecs": 30
+  },
+  "docsUrl": "https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md",
+  "node": {
+    "endpoint": "/v1/chat/completions",
+    "method": "POST",
+    "bodyTemplate": "{\"model\": \"local-model\", \"messages\": [{\"role\": \"system\", \"content\": {{system}}}, {\"role\": \"user\", \"content\": {{input}}}], \"stream\": false}",
+    "responsePath": "choices.0.message.content",
+    "icon": "🦙"
+  },
+  "uninstall": {
+    "paths": [
+      "${binDir}/llama-*.exe",
+      "${binDir}/llama*.dll",
+      "${binDir}/llava*",
+      "${binDir}/mtmd*",
+      "${binDir}/ggml*",
+      "${binDir}/rpc-server*",
+      "${binDir}/test-*",
+      "${binDir}/vulkan*",
+      "${binDir}/cudart64_*.dll",
+      "${binDir}/cublas*.dll",
+      "${binDir}/llama-server"
+    ]
+  },
+  "files": {
+    "install-llama-cpp.ps1": "# install-llama-cpp.ps1\n#\n# Downloads the official prebuilt llama.cpp server binary for Windows and\n# drops it under %OAIY_BIN_DIR%. Picks the right asset for the host's\n# capabilities (CUDA if present, CPU/AVX2 otherwise -- heuristic via\n# `nvidia-smi` lookup).\n#\n# Env vars supplied by the companion:\n#   OAIY_BIN_DIR     where to drop the extracted binaries\n#   OAIY_MODELS_DIR  reserved for future use (model downloads)\n#\n# This script ships INLINE in templates/llama-cpp.json (the `files` map), so the\n# whole service installs from that one .json. To pin a different llama.cpp build\n# or point at a custom binary, edit that template.\n\n$ErrorActionPreference = 'Stop'\n# Silence Invoke-WebRequest's progress bar — it's slow and can stall the\n# download in a piped (no-console) context like the install runner.\n$ProgressPreference = 'SilentlyContinue'\n\nif (-not $env:OAIY_BIN_DIR) {\n    Write-Error 'OAIY_BIN_DIR is not set; this script expects to be invoked by the OAIY app.'\n    exit 1\n}\n\n$binDir = $env:OAIY_BIN_DIR\nNew-Item -ItemType Directory -Force -Path $binDir | Out-Null\n\n# Pinned for reproducibility; bump as needed (matches install-llama-cpp.sh).\n$release = 'b9802'\n\n# Pick CUDA build when an NVIDIA GPU + CUDA runtime appear to be present,\n# else fall back to CPU. Both binaries serve the same HTTP API. The CUDA 13.3\n# build targets modern archs INCLUDING Blackwell / RTX 50-series (sm_120).\n$useCuda = $false\ntry {\n    $null = Get-Command nvidia-smi -ErrorAction Stop\n    & nvidia-smi | Out-Null\n    if ($LASTEXITCODE -eq 0) { $useCuda = $true }\n} catch {}\n\nif ($useCuda) {\n    $assetName = \"llama-$release-bin-win-cuda-13.3-x64.zip\"\n    Write-Host \"[install-llama-cpp] NVIDIA GPU detected -- downloading CUDA 13.3 build (supports Blackwell / RTX 50-series sm_120)\"\n} else {\n    $assetName = \"llama-$release-bin-win-cpu-x64.zip\"\n    Write-Host \"[install-llama-cpp] No CUDA detected -- downloading CPU build\"\n}\n\n$url = \"https://github.com/ggml-org/llama.cpp/releases/download/$release/$assetName\"\n$zipPath = Join-Path $env:TEMP $assetName\n\nWrite-Host \"[install-llama-cpp] downloading $url\"\nInvoke-WebRequest -Uri $url -OutFile $zipPath -UseBasicParsing\n\nWrite-Host \"[install-llama-cpp] extracting to $binDir\"\nExpand-Archive -Path $zipPath -DestinationPath $binDir -Force\nRemove-Item $zipPath -Force\n\nif ($useCuda) {\n    # The CUDA build's zip does NOT bundle the CUDA runtime DLLs (cudart/cublas);\n    # they ship in a separate, non-versioned asset. Without them llama-server.exe\n    # fails to launch with a missing-DLL error on hosts without a CUDA toolkit.\n    $cudart = \"cudart-llama-bin-win-cuda-13.3-x64.zip\"\n    $cudartUrl = \"https://github.com/ggml-org/llama.cpp/releases/download/$release/$cudart\"\n    $cudartZip = Join-Path $env:TEMP $cudart\n    Write-Host \"[install-llama-cpp] downloading CUDA runtime DLLs $cudartUrl\"\n    Invoke-WebRequest -Uri $cudartUrl -OutFile $cudartZip -UseBasicParsing\n    Expand-Archive -Path $cudartZip -DestinationPath $binDir -Force\n    Remove-Item $cudartZip -Force\n}\n\n# Verify the binary landed where the template expects.\n$exe = Join-Path $binDir 'llama-server.exe'\nif (-not (Test-Path $exe)) {\n    Write-Error \"Expected $exe after extraction but it's missing. Release layout may have changed.\"\n    exit 2\n}\n\nWrite-Host \"[install-llama-cpp] done. llama-server.exe is at $exe\"\nWrite-Host \"[install-llama-cpp] Pick which GGUF to load in the service's Model selector, then start it.\"\n",
+    "install-llama-cpp.sh": "#!/usr/bin/env sh\n# install-llama-cpp.sh\n#\n# Downloads the prebuilt llama.cpp server (Linux x64, CPU) and drops it under\n# $OAIY_BIN_DIR. CUDA users should build from source (the prebuilt CUDA Linux\n# assets aren't published for every release); the CPU build serves the same\n# OpenAI-compatible HTTP API.\n#\n# Ships INLINE in templates/llama-cpp.json (the `files` map), so the whole\n# service installs from that one .json.\n#\n# Env: OAIY_BIN_DIR (where to put binaries), OAIY_MODELS_DIR (reserved).\n\nset -e\n\nif [ -z \"$OAIY_BIN_DIR\" ]; then\n  echo \"[install-llama-cpp] OAIY_BIN_DIR not set; run via the OAIY app/server.\" >&2\n  exit 1\nfi\nmkdir -p \"$OAIY_BIN_DIR\"\n\n# Pinned for reproducibility; bump as needed (matches install-llama-cpp.ps1).\nrelease=\"b9802\"\n# The Linux build is published as a gzip tarball (NOT a .zip like Windows).\nasset=\"llama-$release-bin-ubuntu-x64.tar.gz\"\nurl=\"https://github.com/ggml-org/llama.cpp/releases/download/$release/$asset\"\n\ntmp=\"$(mktemp -d)\"\ntrap 'rm -rf \"$tmp\"' EXIT\n\necho \"[install-llama-cpp] downloading $url\"\ncurl -fL \"$url\" -o \"$tmp/$asset\"\n\necho \"[install-llama-cpp] extracting\"\nmkdir -p \"$tmp/x\"\ntar -xzf \"$tmp/$asset\" -C \"$tmp/x\"\n\n# Linux release zips nest binaries (e.g. build/bin/); flatten into OAIY_BIN_DIR.\nserver=\"$(find \"$tmp/x\" -name llama-server -type f | head -1)\"\nif [ -z \"$server\" ]; then\n  echo \"[install-llama-cpp] llama-server not found in the release archive (layout may have changed).\" >&2\n  exit 3\nfi\n# Copy the server + any sibling shared libs it links against.\ncp \"$(dirname \"$server\")\"/* \"$OAIY_BIN_DIR\"/ 2>/dev/null || true\ncp \"$server\" \"$OAIY_BIN_DIR/llama-server\"\nchmod +x \"$OAIY_BIN_DIR/llama-server\"\n\necho \"[install-llama-cpp] done — $OAIY_BIN_DIR/llama-server (CPU build).\"\necho \"[install-llama-cpp] Pick which GGUF to load in the service's Model selector, then start it. For CUDA, build llama.cpp from source.\"\n"
+  }
+}

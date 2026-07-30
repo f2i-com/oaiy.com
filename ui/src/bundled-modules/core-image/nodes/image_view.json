@@ -1,0 +1,47 @@
+{
+  "id": "image_view",
+  "name": "Image View",
+  "description": "Display an image in the workflow.",
+  "doc": "Preview images directly in the workflow canvas.\n\nFeatures:\n• Inline image preview with adjustable height\n• Pass-through output (doesn't modify the image)\n• Works with base64 images and URLs\n\nUsage:\nInsert between image nodes to see intermediate results. Useful for debugging image processing pipelines.\n\nTip: Adjust max height to balance between preview size and canvas space.",
+  "icon": "eye",
+  "color": "indigo",
+  "tags": ["image", "display", "view", "preview"],
+  "inputs": [
+    {
+      "id": "image",
+      "name": "Image",
+      "type": "image",
+      "position": "left",
+      "description": "Image to display"
+    }
+  ],
+  "outputs": [
+    {
+      "id": "image",
+      "name": "Image",
+      "type": "image",
+      "position": "right",
+      "description": "Pass-through image"
+    }
+  ],
+  "properties": [
+    {
+      "id": "maxHeight",
+      "name": "Max Height",
+      "type": "number",
+      "default": 300,
+      "min": 50,
+      "max": 1000,
+      "description": "Maximum display height in pixels"
+    }
+  ],
+  "compiler": {
+    "template": "{{input}}",
+    "statusTracking": true
+  },
+  "ui": {
+    "width": 320,
+    "resizable": true,
+    "customComponent": "ImageViewNode"
+  }
+}

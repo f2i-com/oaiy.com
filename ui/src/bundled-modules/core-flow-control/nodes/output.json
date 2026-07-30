@@ -1,0 +1,61 @@
+{
+  "id": "output",
+  "name": "Output",
+  "description": "Workflow output/endpoint. Marks the end of a workflow path.",
+  "doc": "Mark the completion of a workflow path.\n\nUsage:\n• Connect the final result value\n• Label describes what this output represents\n• Multiple outputs can exist in one flow\n\nWhen to Use:\n• End of main workflow path\n• After conditional branches converge\n• When subflow results need to be captured\n\nTip: Descriptive labels help understand workflow results at a glance.",
+  "icon": "check-circle",
+  "color": "emerald",
+  "tags": ["output", "end", "result"],
+  "inputs": [
+    {
+      "id": "result",
+      "name": "Result",
+      "type": "any",
+      "position": "left",
+      "description": "Final result value"
+    }
+  ],
+  "outputs": [],
+  "properties": [
+    {
+      "id": "label",
+      "name": "Label",
+      "type": "string",
+      "default": "Output",
+      "description": "Name for this output"
+    },
+    {
+      "id": "outputType",
+      "name": "Output Type",
+      "type": "select",
+      "default": "text",
+      "options": [
+        { "value": "text", "label": "Text" },
+        { "value": "json", "label": "JSON" },
+        { "value": "image", "label": "Image" },
+        { "value": "audio", "label": "Audio" },
+        { "value": "video", "label": "Video" },
+        { "value": "file", "label": "File" }
+      ],
+      "description": "Hint for how downstream consumers should render this output. Stored in workflow_context.__output_type__.",
+      "advanced": true
+    }
+  ],
+  "flowplan": {
+    "stepTypes": ["output"],
+    "fieldMapping": {
+      "label": "label"
+    },
+    "templateFields": ["result"],
+    "inputHandleMapping": {
+      "result": "result"
+    }
+  },
+  "compiler": {
+    "template": "{{input}}",
+    "statusTracking": true
+  },
+  "ui": {
+    "width": 200
+  }
+}

@@ -1,0 +1,93 @@
+{
+  "id": "loop_start",
+  "name": "Loop Start",
+  "description": "Begin a loop. Iterates over an array or a fixed number of times.",
+  "doc": "Begin an iteration loop.\n\nLoop Modes:\n• Count - run N times (1, 2, 3...)\n• For Each - iterate over array items\n• While True - loop until stopped by condition\n\nOutputs:\n• Item - current array item (For Each) or iteration number\n• Index - 1-based iteration count\n\nUsage:\nPlace Loop End node to mark where the loop body ends. Results from each iteration are collected into an array.\n\nTip: Name your loops for clarity when using nested loops.",
+  "icon": "play",
+  "color": "amber",
+  "tags": [
+    "loop",
+    "iterate",
+    "repeat",
+    "for"
+  ],
+  "flowplan": {
+    "stepTypes": [
+      "loop",
+      "loop_start"
+    ]
+  },
+  "inputs": [
+    {
+      "id": "array",
+      "name": "Array",
+      "type": "array",
+      "position": "left",
+      "description": "Array to iterate over (or connect iterations count)"
+    }
+  ],
+  "outputs": [
+    {
+      "id": "item",
+      "name": "Item",
+      "type": "any",
+      "position": "right",
+      "description": "Current item in the iteration",
+      "varSuffix": ""
+    },
+    {
+      "id": "index",
+      "name": "Index",
+      "type": "number",
+      "position": "right",
+      "description": "Current iteration index (1-based)",
+      "varSuffix": "_index"
+    }
+  ],
+  "properties": [
+    {
+      "id": "loopName",
+      "name": "Loop Name",
+      "type": "string",
+      "default": "",
+      "description": "Name to identify this loop"
+    },
+    {
+      "id": "loopMode",
+      "name": "Loop Mode",
+      "type": "select",
+      "default": "count",
+      "options": [
+        {
+          "value": "count",
+          "label": "Count"
+        },
+        {
+          "value": "foreach",
+          "label": "For Each"
+        },
+        {
+          "value": "while_true",
+          "label": "While True"
+        }
+      ],
+      "description": "Type of loop execution"
+    },
+    {
+      "id": "iterations",
+      "name": "Iterations",
+      "type": "number",
+      "default": 3,
+      "min": 1,
+      "max": 10000,
+      "description": "Number of iterations (if no array connected)"
+    }
+  ],
+  "compiler": {
+    "template": "{{prop.iterations}}",
+    "customHandler": "loop_start"
+  },
+  "ui": {
+    "width": 200
+  }
+}
