@@ -5,11 +5,13 @@ import {
   Copy,
   ExternalLink,
   HardDrive,
+  LayoutDashboard,
   LoaderCircle,
   LockKeyhole,
   Moon,
   Package,
   Plug,
+  Puzzle,
   Server,
   Settings2,
   Sparkles,
@@ -18,13 +20,15 @@ import {
   Workflow,
   type LucideIcon,
 } from 'lucide-react';
-import { API_BASE, openExternal } from './api';
+import { API_BASE, openExternal, plugins as pluginsApi } from './api';
 import { applyTheme, initialTheme, THEME_LABEL, type ThemeMode } from './theme';
 import ServicesPanel from './ServicesPanel';
 import ModelsPanel from './ModelsPanel';
 import PythonPanel from './PythonPanel';
 import PluginsPanel from './PluginsPanel';
 import AiProvidersPanel from './AiProvidersPanel';
+import OverviewPanel from './OverviewPanel';
+import PluginScreenPage from './PluginScreenPage';
 import PairingPrompt from './PairingPrompt';
 import SettingsPanel from './SettingsPanel';
 
@@ -48,11 +52,30 @@ interface HealthResponse {
   version: string;
 }
 
-type View = 'services' | 'plugins' | 'models' | 'python' | 'providers' | 'settings';
+type BuiltinView =
+  | 'overview'
+  | 'services'
+  | 'plugins'
+  | 'models'
+  | 'python'
+  | 'providers'
+  | 'settings';
+
+/** A plugin-contributed screen, addressed as `plugin:<pluginId>:<navId>`. */
+type View = BuiltinView | `plugin:${string}:${string}`;
+
+/** One nav entry a plugin contributes (`manifest.ui.nav[]`). */
+interface PluginNavEntry {
+  pluginId: string;
+  navId: string;
+  label: string;
+  badge?: string;
+}
 
 const WEB_APP_URL = 'https://oaiy.com/app.html';
 
-const NAV: { value: View; label: string; icon: LucideIcon }[] = [
+const NAV: { value: BuiltinView; label: string; icon: LucideIcon }[] = [
+  { value: 'overview', label: 'Overview', icon: LayoutDashboard },
   { value: 'services', label: 'Services', icon: Server },
   { value: 'plugins', label: 'Plugins', icon: Plug },
   { value: 'models', label: 'Models', icon: Package },
@@ -64,7 +87,13 @@ const NAV: { value: View; label: string; icon: LucideIcon }[] = [
  * `crumb` is the short topbar name; `title` is the descriptive page heading.
  * Keeping them different avoids saying the same words twice on one screen.
  */
-const PAGE: Record<View, { crumb: string; kicker: string; title: string; copy: string }> = {
+const PAGE: Record<BuiltinView, { crumb: string; kicker: string; title: string; copy: string }> = {
+  overview: {
+    crumb: 'Overview',
+    kicker: 'Control centre',
+    title: 'Overview',
+    copy: 'What this machine is running, and anything your flows need you to fix.',
+  },
   services: {
     crumb: 'Services',
     kicker: 'Connections',
@@ -106,7 +135,9 @@ const PAGE: Record<View, { crumb: string; kicker: string; title: string; copy: s
 export default function App() {
   const [health, setHealth] = useState<HealthResponse | null>(null);
   const [healthError, setHealthError] = useState<string | null>(null);
-  const [view, setView] = useState<View>('services');
+  const [view, setView] = useState<View>('overview');
+  /** Nav entries contributed by installed plugins (`manifest.ui.nav[]`). */
+  const [pluginNav, setPluginNav] = useState<PluginNavEntry[]>([]);
   const [theme, setThemeState] = useState<ThemeMode>(initialTheme);
   const [copied, setCopied] = useState(false);
 
@@ -177,11 +208,65 @@ export default function App() {
     };
   }, []);
 
+  // Plugins can contribute sidebar entries that open a screen they ship. Polled
+  // (not one-shot) so installing or removing a plugin updates the nav without a
+  // restart — the same cadence the Plugins panel uses.
+  useEffect(() => {
+    let cancelled = false;
+    const load = async () => {
+      try {
+        const snap = await pluginsApi.list();
+        if (cancelled) return;
+        const entries: PluginNavEntry[] = [];
+        for (const p of snap.plugins) {
+          const ui = (p.manifest as unknown as { ui?: { nav?: Array<Record<string, string>> } } | undefined)?.ui;
+          for (const n of ui?.nav ?? []) {
+            if (n.id && n.label) {
+              entries.push({ pluginId: p.id, navId: n.id, label: n.label, badge: n.badge });
+            }
+          }
+        }
+        setPluginNav(entries);
+      } catch {
+        /* the Plugins panel surfaces the error; the nav just stays as it was */
+      }
+    };
+    load();
+    const id = window.setInterval(load, 5000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+    };
+  }, []);
+
+  // A plugin screen the user is on can disappear (plugin removed/disabled) —
+  // fall back to Overview rather than rendering a dead page.
+  useEffect(() => {
+    if (!view.startsWith('plugin:')) return;
+    const [, pluginId, navId] = view.split(':');
+    if (pluginNav.length > 0 && !pluginNav.some((n) => n.pluginId === pluginId && n.navId === navId)) {
+      setView('overview');
+    }
+  }, [view, pluginNav]);
+
   // One derived state drives the engine card, the topbar readout and the dock.
   const link: 'up' | 'down' | 'pending' = health ? 'up' : healthError ? 'down' : 'pending';
   const engineClass =
     link === 'up' ? 'engine-card' : `engine-card ${link === 'down' ? 'offline' : 'pending'}`;
-  const page = PAGE[view];
+  // A plugin screen has no PAGE entry — its heading comes from the nav entry the
+  // plugin contributed.
+  const pluginView = view.startsWith('plugin:') ? view.split(':') : null;
+  const activePluginNav = pluginView
+    ? pluginNav.find((n) => n.pluginId === pluginView[1] && n.navId === pluginView[2])
+    : undefined;
+  const page = pluginView
+    ? {
+        crumb: activePluginNav?.label ?? 'Plugin',
+        kicker: 'Plugin',
+        title: activePluginNav?.label ?? 'Plugin screen',
+        copy: `Provided by the ${pluginView[1]} plugin.`,
+      }
+    : PAGE[view as BuiltinView];
 
   return (
     <div className="app-shell">
@@ -226,6 +311,27 @@ export default function App() {
               >
                 <Icon size={18} />
                 <span>{item.label}</span>
+              </button>
+            );
+          })}
+
+          {/* Screens installed plugins contribute. Rendered after the built-ins so
+              a plugin can extend the app without displacing its own navigation. */}
+          {pluginNav.map((n) => {
+            const value: View = `plugin:${n.pluginId}:${n.navId}`;
+            return (
+              <button
+                type="button"
+                key={value}
+                className={view === value ? 'active' : ''}
+                aria-current={view === value ? 'page' : undefined}
+                aria-label={n.label}
+                title={`${n.label} — provided by the ${n.pluginId} plugin`}
+                onClick={() => setView(value)}
+              >
+                <Puzzle size={18} />
+                <span>{n.label}</span>
+                {n.badge && <em className="nav-badge">{n.badge}</em>}
               </button>
             );
           })}
@@ -348,6 +454,13 @@ export default function App() {
                 <p>{page.copy}</p>
               </div>
             </div>
+            {view === 'overview' && (
+              <OverviewPanel
+                onNavigate={(v) => setView(v)}
+                onOpenPluginScreen={(pluginId, navId) => setView(`plugin:${pluginId}:${navId}`)}
+              />
+            )}
+            {pluginView && <PluginScreenPage pluginId={pluginView[1]} navId={pluginView[2]} />}
             {view === 'services' && <ServicesPanel />}
             {view === 'plugins' && <PluginsPanel />}
             {view === 'models' && <ModelsPanel />}

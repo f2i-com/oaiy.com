@@ -729,6 +729,125 @@ async fn set_plugin_enabled(
     }
 }
 
+// ------- plugin-contributed UI -------
+
+/// Content type for a plugin UI asset, by extension. Deliberately a small
+/// allow-list: anything else is served as an opaque download rather than
+/// something the webview will execute.
+fn ui_content_type(path: &str) -> &'static str {
+    let ext = path.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    match ext.as_str() {
+        "html" | "htm" => "text/html; charset=utf-8",
+        "js" | "mjs" => "text/javascript; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "json" => "application/json; charset=utf-8",
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "ico" => "image/x-icon",
+        "woff2" => "font/woff2",
+        "woff" => "font/woff",
+        "ttf" => "font/ttf",
+        _ => "application/octet-stream",
+    }
+}
+
+/// `GET /api/plugins/:id/ui/:screen/*path` — serve one plugin-shipped UI asset.
+///
+/// A plugin may contribute screens (`manifest.ui.screens[]`): static HTML/CSS/JS
+/// that the desktop hosts in an iframe, so a plugin can ship its own interface
+/// (the Aokie plugin's "AI Receptionist", for example) instead of being limited
+/// to the generic Plugins card.
+///
+/// Only files the screen DECLARES in its `files` list are served. That, not path
+/// arithmetic, is the real guard: a traversal string simply won't be in the
+/// allow-list, and neither will the plugin's own executables, DLLs or manifest.
+/// The path is additionally rejected if it is absolute or contains `..`.
+async fn plugin_ui_asset(
+    State(st): State<BridgeState>,
+    Path((id, screen, asset)): Path<(String, String, String)>,
+) -> axum::response::Response {
+    // Cheap structural rejects before touching the registry.
+    let asset = asset.replace('\\', "/");
+    if asset.starts_with('/') || asset.split('/').any(|seg| seg == ".." || seg == ".") {
+        return bridge_error(StatusCode::BAD_REQUEST, "invalid_request", "invalid asset path".into());
+    }
+
+    let (dir, declared) = {
+        let mut reg = match st.plugins.lock() {
+            Ok(r) => r,
+            Err(_) => {
+                return bridge_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", "plugin registry lock poisoned".into())
+            }
+        };
+        // The registry is populated lazily by scan(). Scan only on a MISS: an
+        // iframe pulls a dozen assets per screen and rescanning each time would
+        // stat the whole plugins tree over and over — but a screen must still
+        // load in a fresh process that has not listed plugins yet, rather than
+        // depending on which route the UI happened to call first.
+        if reg.get(&id).is_none() {
+            reg.scan();
+        }
+        let Some(rec) = reg.get(&id) else {
+            return bridge_error(StatusCode::NOT_FOUND, "invalid_request", format!("no plugin {id:?}"));
+        };
+        // The declared file list for THIS screen, from the manifest's `ui` block
+        // (retained verbatim in `extra`, since the host has no other opinion on it).
+        let files: Vec<String> = rec
+            .manifest
+            .as_ref()
+            .and_then(|m| m.extra.get("ui"))
+            .and_then(|ui| ui.get("screens"))
+            .and_then(|s| s.as_array())
+            .and_then(|screens| {
+                screens
+                    .iter()
+                    .find(|s| s.get("id").and_then(|v| v.as_str()) == Some(screen.as_str()))
+            })
+            .and_then(|s| s.get("files"))
+            .and_then(|f| f.as_array())
+            .map(|f| f.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+            .unwrap_or_default();
+        (rec.dir.clone(), files)
+    };
+
+    if declared.is_empty() {
+        return bridge_error(
+            StatusCode::NOT_FOUND,
+            "invalid_request",
+            format!("plugin {id:?} declares no screen {screen:?}"),
+        );
+    }
+    if !declared.iter().any(|f| f.replace('\\', "/") == asset) {
+        return bridge_error(
+            StatusCode::FORBIDDEN,
+            "capability_denied",
+            format!("{asset:?} is not declared by screen {screen:?}"),
+        );
+    }
+
+    let full = dir.join(&asset);
+    match std::fs::read(&full) {
+        Ok(bytes) => (
+            StatusCode::OK,
+            [
+                (axum::http::header::CONTENT_TYPE, ui_content_type(&asset)),
+                // Plugin assets change when the plugin is updated, never mid-run.
+                (axum::http::header::CACHE_CONTROL, "no-cache"),
+            ],
+            bytes,
+        )
+            .into_response(),
+        Err(e) => bridge_error(
+            StatusCode::NOT_FOUND,
+            "invalid_request",
+            format!("cannot read {asset:?}: {e}"),
+        ),
+    }
+}
+
 // ------- triggers -------
 
 async fn list_triggers(State(st): State<BridgeState>) -> axum::response::Response {
@@ -943,6 +1062,10 @@ pub fn router(state: BridgeState) -> Router {
         .route("/api/plugins/:id/start", post(start_plugin))
         .route("/api/plugins/:id/stop", post(stop_plugin))
         .route("/api/plugins/:id/logs", get(plugin_logs))
+        // Plugin-contributed UI: static assets the desktop hosts in an iframe.
+        // Open GET (an iframe navigation cannot carry a bearer), but restricted
+        // to the files the screen declares — see plugin_ui_asset.
+        .route("/api/plugins/:id/ui/:screen/*path", get(plugin_ui_asset))
         .route("/api/plugins/:id/enabled", post(set_plugin_enabled))
         .route("/api/bridge/triggers", get(list_triggers).post(upsert_trigger))
         .route("/api/bridge/triggers/:id", axum::routing::delete(delete_trigger))
