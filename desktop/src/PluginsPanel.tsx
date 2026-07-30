@@ -8,6 +8,7 @@ import {
   Plug,
   TriangleAlert,
   FolderOpen,
+  Trash2,
 } from 'lucide-react';
 import {
   plugins,
@@ -58,6 +59,9 @@ export default function PluginsPanel() {
   const [error, setError] = useState<string | null>(null);
   const [pending, setPending] = useState<Set<string>>(new Set());
   const [logsFor, setLogsFor] = useState<string | null>(null);
+  /** Path to a plugin folder or .tar.gz to install. */
+  const [installSource, setInstallSource] = useState('');
+  const [installing, setInstalling] = useState(false);
   // Track state per plugin so we toast on a transition (crash, came up),
   // not on every poll — same pattern the Services panel uses.
   const seen = useRef<Map<string, PluginState>>(new Map());
@@ -128,6 +132,40 @@ export default function PluginsPanel() {
 
   const list = useMemo(() => snapshot?.plugins ?? [], [snapshot]);
 
+  const installPlugin = useCallback(async () => {
+    const source = installSource.trim();
+    if (!source) return;
+    setInstalling(true);
+    try {
+      const out = await plugins.install(source);
+      toast.push({
+        kind: 'success',
+        title: out.replaced
+          ? `Updated ${out.name} to v${out.version}`
+          : `Installed ${out.name} v${out.version}`,
+        body: 'Click Start to run it.',
+      });
+      setInstallSource('');
+      await refresh();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setInstalling(false);
+    }
+  }, [installSource, refresh, toast]);
+
+  const uninstallPlugin = useCallback(
+    async (p: PluginRecord) => {
+      const name = p.manifest?.name ?? p.id;
+      if (!confirm(`Remove the “${name}” plugin? Its files are deleted from this machine.`)) return;
+      await runAction(p.id, async () => {
+        await plugins.uninstall(p.id);
+        toast.push({ kind: 'success', title: `Removed ${name}` });
+      });
+    },
+    [runAction, toast],
+  );
+
   return (
     <div className="panel">
       {error && (
@@ -142,8 +180,7 @@ export default function PluginsPanel() {
       {snapshot && (
         <div className="datadir-note">
           <span>
-            Plugins live in <code>{snapshot.root}</code>. Drop a plugin folder there — it appears
-            on the next poll.
+            Plugins live in <code>{snapshot.root}</code>.
           </span>
           <button
             className="btn-tiny"
@@ -153,6 +190,45 @@ export default function PluginsPanel() {
           </button>
         </div>
       )}
+
+      {/* Install from a path on this machine. Until this existed the only way to
+          add a plugin was to copy a folder in by hand — and every connector OAIY
+          offers a flow comes from a plugin. */}
+      <section className="service-section">
+        <div className="section-title-row">
+          <h3 className="section-title">Install a plugin</h3>
+        </div>
+        <form
+          className="dl-form"
+          onSubmit={(e) => {
+            e.preventDefault();
+            void installPlugin();
+          }}
+        >
+          <label className="form-row">
+            <span>Plugin folder or .tar.gz on this machine</span>
+            <input
+              type="text"
+              placeholder="C:\path\to\my-plugin"
+              value={installSource}
+              onChange={(e) => setInstallSource(e.target.value)}
+            />
+          </label>
+          <p className="form-hint">
+            Installing a plugin installs native code this app will run. Only install plugins you
+            trust. Re-installing over an existing plugin updates it in place.
+          </p>
+          <div className="form-actions">
+            <button
+              className="btn btn-primary"
+              type="submit"
+              disabled={installing || !installSource.trim()}
+            >
+              {installing ? <Loader2 size={14} className="spin" /> : <Plug size={14} />} Install
+            </button>
+          </div>
+        </form>
+      </section>
 
       {!snapshot ? (
         <div className="empty-state">Loading plugins…</div>
@@ -179,6 +255,7 @@ export default function PluginsPanel() {
                 runAction(p.id, () => plugins.setEnabled(p.id, p.userDisabled))
               }
               onViewLogs={() => setLogsFor(p.id)}
+              onUninstall={() => void uninstallPlugin(p)}
             />
           ))}
         </section>
@@ -202,9 +279,18 @@ interface CardProps {
   onStop: () => void;
   onToggleEnabled: () => void;
   onViewLogs: () => void;
+  onUninstall: () => void;
 }
 
-function PluginCard({ plugin: p, pending, onStart, onStop, onToggleEnabled, onViewLogs }: CardProps) {
+function PluginCard({
+  plugin: p,
+  pending,
+  onStart,
+  onStop,
+  onToggleEnabled,
+  onViewLogs,
+  onUninstall,
+}: CardProps) {
   const loadable = isLoadable(p);
   const running = p.state === 'running' || p.state === 'unhealthy' || p.state === 'starting';
   const connectorCount =
@@ -291,6 +377,15 @@ function PluginCard({ plugin: p, pending, onStart, onStop, onToggleEnabled, onVi
             {p.userDisabled ? 'Enable' : 'Disable'}
           </button>
         )}
+
+        <button
+          className="btn btn-ghost btn-danger"
+          onClick={onUninstall}
+          disabled={pending}
+          aria-label={`Remove the ${p.manifest?.name ?? p.id} plugin`}
+        >
+          <Trash2 size={14} /> Remove
+        </button>
       </div>
     </div>
   );

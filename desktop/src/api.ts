@@ -408,6 +408,16 @@ export const plugins = {
     request<{ lines: LogLine[] }>(
       `/api/plugins/${encodeURIComponent(id)}/logs?tail=${tail}`,
     ),
+  /** Install (or replace) a plugin from a path on this machine — a plugin folder
+   *  or a .tar.gz of one. Installing native code, so it's Desktop-window only. */
+  install: (source: string) =>
+    request<{ id: string; name: string; version: string; replaced: boolean }>(
+      '/api/plugins/install',
+      { method: 'POST', body: JSON.stringify({ source }) },
+    ),
+  /** Stop a plugin and remove it from disk. */
+  uninstall: (id: string) =>
+    request<void>(`/api/plugins/${encodeURIComponent(id)}`, { method: 'DELETE' }),
 };
 
 // ----- bridge (connector commands + plugin events) -----

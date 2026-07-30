@@ -35,6 +35,7 @@
 //! installed, and the user's next move — reinstalling — does not help.
 
 pub mod host;
+pub mod install;
 pub mod manifest;
 pub mod process;
 pub mod registry;

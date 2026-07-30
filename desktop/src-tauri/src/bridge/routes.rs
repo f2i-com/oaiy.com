@@ -729,6 +729,102 @@ async fn set_plugin_enabled(
     }
 }
 
+// ------- plugin install / uninstall -------
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct InstallBody {
+    /// A path ON THIS MACHINE: a plugin directory, or a `.tar.gz` of one.
+    /// Deliberately not a URL — this route installs native code, and fetching
+    /// that from the network would make it a remote-code-install primitive.
+    source: String,
+}
+
+/// `POST /api/plugins/install` — install (or replace) a plugin from a local path.
+///
+/// PRIVILEGED: installing a plugin means installing native code that the host
+/// will supervise, so a paired web page must never reach this — only OAIY's own
+/// window or a token holder (see `is_ai_exec_path`'s sibling classification in
+/// http.rs).
+async fn install_plugin(
+    State(st): State<BridgeState>,
+    Json(body): Json<InstallBody>,
+) -> axum::response::Response {
+    let source = std::path::PathBuf::from(body.source.trim());
+    if source.as_os_str().is_empty() {
+        return bridge_error(StatusCode::BAD_REQUEST, "invalid_request", "a source path is required".into());
+    }
+    let root = match st.plugins.lock() {
+        Ok(reg) => reg.root().to_path_buf(),
+        Err(_) => {
+            return bridge_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", "plugin registry lock poisoned".into())
+        }
+    };
+
+    // A running plugin holds its executable open, so replacing it would fail
+    // mid-way. Stop it first if this install targets an id we already run.
+    let host = st.host.clone();
+    let installed = tokio::task::spawn_blocking(move || {
+        // Peek at the id before copying, so we only stop what we are replacing.
+        if let Ok(id) = crate::plugins::install::peek_id(&source) {
+            let _ = host.stop(&id);
+        }
+        crate::plugins::install::install_from_path(&source, &root)
+    })
+    .await;
+
+    match installed {
+        Ok(Ok(out)) => {
+            // Pick the new plugin up immediately rather than on the next poll.
+            if let Ok(mut reg) = st.plugins.lock() {
+                reg.scan();
+            }
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "id": out.id,
+                    "name": out.name,
+                    "version": out.version,
+                    "replaced": out.replaced,
+                })),
+            )
+                .into_response()
+        }
+        Ok(Err(e)) => bridge_error(StatusCode::BAD_REQUEST, "invalid_request", e),
+        Err(e) => bridge_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()),
+    }
+}
+
+/// `DELETE /api/plugins/:id` — stop a plugin and remove it from disk. PRIVILEGED.
+async fn uninstall_plugin(State(st): State<BridgeState>, Path(id): Path<String>) -> axum::response::Response {
+    let root = match st.plugins.lock() {
+        Ok(reg) => reg.root().to_path_buf(),
+        Err(_) => {
+            return bridge_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", "plugin registry lock poisoned".into())
+        }
+    };
+    let host = st.host.clone();
+    let id2 = id.clone();
+    let removed = tokio::task::spawn_blocking(move || {
+        // Stop first: on Windows the running executable pins its own directory.
+        let _ = host.stop(&id2);
+        crate::plugins::install::uninstall(&id2, &root)
+    })
+    .await;
+
+    match removed {
+        Ok(Ok(())) => {
+            if let Ok(mut reg) = st.plugins.lock() {
+                reg.forget(&id);
+                reg.scan();
+            }
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Ok(Err(e)) => bridge_error(StatusCode::NOT_FOUND, "invalid_request", e),
+        Err(e) => bridge_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()),
+    }
+}
+
 // ------- plugin-contributed UI -------
 
 /// Content type for a plugin UI asset, by extension. Deliberately a small
@@ -1062,6 +1158,10 @@ pub fn router(state: BridgeState) -> Router {
         .route("/api/plugins/:id/start", post(start_plugin))
         .route("/api/plugins/:id/stop", post(stop_plugin))
         .route("/api/plugins/:id/logs", get(plugin_logs))
+        // Install / remove a plugin. Privileged (see http.rs): this installs
+        // native code the host will supervise.
+        .route("/api/plugins/install", post(install_plugin))
+        .route("/api/plugins/:id", axum::routing::delete(uninstall_plugin))
         // Plugin-contributed UI: static assets the desktop hosts in an iframe.
         // Open GET (an iframe navigation cannot carry a bearer), but restricted
         // to the files the screen declares — see plugin_ui_asset.
