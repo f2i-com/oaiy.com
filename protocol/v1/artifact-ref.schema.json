@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oaiy.com/schemas/bridge/v1/artifact-ref.schema.json",
+  "title": "Artifact reference",
+  "description": "How binaries travel. Inline base64 is capped at 64 KiB because a 32 MB data URL in a run payload gets copied into the run ledger, the event stream and every log sink simultaneously.",
+  "type": "object",
+  "required": [
+    "kind",
+    "id",
+    "mediaType"
+  ],
+  "properties": {
+    "kind": {
+      "const": "artifact"
+    },
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "mediaType": {
+      "type": "string",
+      "maxLength": 128
+    },
+    "bytes": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "url": {
+      "type": "string",
+      "description": "Short-lived loopback URL. Never a public URL, never one carrying a credential.",
+      "maxLength": 2048
+    },
+    "filename": {
+      "type": "string",
+      "maxLength": 255
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "inline": {
+      "type": "string",
+      "contentEncoding": "base64",
+      "maxLength": 87400,
+      "description": "base64, \u226464 KiB decoded. Prefer `url`."
+    }
+  },
+  "additionalProperties": false
+}

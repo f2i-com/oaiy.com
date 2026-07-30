@@ -1,0 +1,102 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oaiy.com/schemas/bridge/v1/run-result.schema.json",
+  "title": "Flow run result",
+  "description": "GET /api/bridge/runs/{runId}, and the terminal payload a consumer stores.\n\nA run must NEVER report `succeeded` when a step could not do what it was asked. Substituting a default, skipping the node or passing input through unchanged produces a green run and silently wrong data, which is the most expensive failure mode this system has.",
+  "type": "object",
+  "required": [
+    "runId",
+    "status"
+  ],
+  "properties": {
+    "runId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "status": {
+      "enum": [
+        "queued",
+        "running",
+        "succeeded",
+        "failed",
+        "timed_out",
+        "cancelled"
+      ],
+      "description": "Terminal states are immutable; a second finalise is 409."
+    },
+    "output": {
+      "description": "The flow result. Present only when status is `succeeded`."
+    },
+    "error": {
+      "$ref": "https://oaiy.com/schemas/bridge/v1/error.schema.json"
+    },
+    "idempotent": {
+      "type": "boolean",
+      "description": "True when this request matched an existing run and nothing new executed."
+    },
+    "runtime": {
+      "enum": [
+        "desktop",
+        "browser",
+        "cli",
+        "cloud"
+      ],
+      "description": "Where execution happens. A capability is offered by a runtime, not by the platform in the abstract."
+    },
+    "claimedBy": {
+      "type": "string",
+      "maxLength": 128,
+      "description": "Device/worker that won the claim. Doubles as a device label in run history."
+    },
+    "caller": {
+      "$ref": "https://oaiy.com/schemas/bridge/v1/caller.schema.json"
+    },
+    "correlationId": {
+      "type": "string",
+      "maxLength": 150
+    },
+    "idempotencyKey": {
+      "type": "string",
+      "maxLength": 255
+    },
+    "startedAt": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "finishedAt": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "artifacts": {
+      "type": "array",
+      "items": {
+        "$ref": "https://oaiy.com/schemas/bridge/v1/artifact-ref.schema.json"
+      },
+      "maxItems": 64
+    }
+  },
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "enum": [
+              "failed",
+              "timed_out"
+            ]
+          }
+        },
+        "required": [
+          "status"
+        ]
+      },
+      "then": {
+        "required": [
+          "error"
+        ]
+      }
+    }
+  ]
+}

@@ -1,0 +1,89 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oaiy.com/schemas/bridge/v1/trigger-binding.schema.json",
+  "title": "Trigger binding",
+  "description": "Binds an event to a flow. Bindings live with whoever owns the events; this schema exists so every dispatcher behaves identically.\n\nThe `condition` is evaluated in a sandbox FAIL-SAFE: false OR ERRORING cancels the handler run. An erroring condition must never read as true \u2014 that turns a typo into a flow that fires on everything.",
+  "type": "object",
+  "required": [
+    "id",
+    "event",
+    "flowId",
+    "mode"
+  ],
+  "properties": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "event": {
+      "type": "string",
+      "maxLength": 128,
+      "description": "Event name to match, e.g. `aokie.call.incoming`. Terminal flow events (`flow.succeeded` etc.) are bindable."
+    },
+    "flowId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "mode": {
+      "enum": [
+        "sync",
+        "async",
+        "background",
+        "manual"
+      ],
+      "description": "`manual` never receives events \u2014 it renders a button. Binding a `manual` trigger to an event is an authoring mistake worth warning about."
+    },
+    "enabled": {
+      "type": "boolean",
+      "default": true
+    },
+    "condition": {
+      "type": "string",
+      "maxLength": 4000,
+      "description": "Sandboxed boolean expression over the event. Fail-safe: error means do not run."
+    },
+    "inputMap": {
+      "type": "object",
+      "description": "Maps event data onto flow inputs via selectors (`$event.data.callerPhone`). Resolved by the executor at run time \u2014 no caller expression is ever evaluated server-side.",
+      "additionalProperties": {
+        "type": "string",
+        "maxLength": 500
+      }
+    },
+    "outputActions": {
+      "type": "array",
+      "maxItems": 32,
+      "items": {
+        "type": "object"
+      },
+      "description": "What to do with the result. Interpreted by the consuming product, not by OAIY."
+    },
+    "timeoutMs": {
+      "type": "integer",
+      "minimum": 250,
+      "maximum": 900000
+    },
+    "retryPolicy": {
+      "type": "object",
+      "properties": {
+        "maxAttempts": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10
+        },
+        "backoffMs": {
+          "type": "integer",
+          "minimum": 100,
+          "maximum": 600000
+        }
+      },
+      "additionalProperties": false
+    },
+    "sortOrder": {
+      "type": "integer"
+    }
+  },
+  "additionalProperties": false
+}

@@ -1,0 +1,98 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oaiy.com/schemas/bridge/v1/flow-descriptor.schema.json",
+  "title": "Flow descriptor",
+  "description": "One entry from GET /api/bridge/flows. Enough to invoke a flow and to render a picker, without shipping the whole graph.",
+  "type": "object",
+  "required": [
+    "flowId",
+    "name"
+  ],
+  "properties": {
+    "flowId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "name": {
+      "type": "string",
+      "maxLength": 200
+    },
+    "description": {
+      "type": "string",
+      "maxLength": 1000
+    },
+    "enabled": {
+      "type": "boolean",
+      "default": true
+    },
+    "revision": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Bumps on every saved edit. A run pins the revision it executed so history stays interpretable after the flow changes."
+    },
+    "inputs": {
+      "type": "array",
+      "maxItems": 64,
+      "items": {
+        "type": "object",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "maxLength": 128
+          },
+          "required": {
+            "type": "boolean",
+            "default": false
+          },
+          "type": {
+            "enum": [
+              "string",
+              "number",
+              "boolean",
+              "object",
+              "array",
+              "artifact",
+              "any"
+            ]
+          },
+          "example": {},
+          "description": {
+            "type": "string",
+            "maxLength": 500
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "capabilities": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "description": "Dotted capability id. `oaiy.*` is reserved for the platform; products and plugins own their own namespace (`connector.aokie.*`).",
+        "pattern": "^[a-z][a-z0-9_]*(\\.[a-zA-Z0-9_*]+)+$",
+        "maxLength": 128
+      },
+      "maxItems": 64,
+      "description": "What this flow needs. A caller can check its grants before offering the flow at all."
+    },
+    "runtimes": {
+      "type": "array",
+      "items": {
+        "enum": [
+          "desktop",
+          "browser",
+          "cli",
+          "cloud"
+        ],
+        "description": "Where execution happens. A capability is offered by a runtime, not by the platform in the abstract."
+      },
+      "maxItems": 4,
+      "description": "Runtimes able to execute it. A flow touching the filesystem is desktop/cli only, and saying so up front beats failing at the node."
+    }
+  },
+  "additionalProperties": false
+}

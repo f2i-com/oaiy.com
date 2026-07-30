@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oaiy.com/schemas/bridge/v1/connector-request.schema.json",
+  "title": "Connector command request",
+  "description": "POST /api/bridge/connectors/{connectorId}/request, and the params of the runtime -> plugin JSON-RPC method `connector.request`.\n\nAuthorised against the EXACT capability `connector.<connectorId>.<command>`, fail closed. Wildcards are expanded when a grant is issued, never pattern-matched at call time \u2014 matching at the boundary is how `connector.aokie.*` quietly becomes 'everything Aokie ever adds'.",
+  "type": "object",
+  "required": [
+    "connectorId",
+    "command"
+  ],
+  "properties": {
+    "connectorId": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]{1,63}$"
+    },
+    "command": {
+      "type": "string",
+      "pattern": "^[a-z][a-zA-Z0-9_]*(\\.[a-zA-Z0-9_]+)+$",
+      "maxLength": 96
+    },
+    "payload": {
+      "description": "Command-specific JSON."
+    },
+    "timeoutMs": {
+      "type": "integer",
+      "minimum": 100,
+      "maximum": 120000
+    },
+    "requestId": {
+      "type": "string",
+      "maxLength": 128,
+      "description": "Caller-supplied, echoed back for tracing."
+    },
+    "idempotencyKey": {
+      "type": "string",
+      "maxLength": 255,
+      "description": "Required for commands the plugin declares as journalled \u2014 those have side effects a retry must not repeat."
+    }
+  },
+  "additionalProperties": false
+}

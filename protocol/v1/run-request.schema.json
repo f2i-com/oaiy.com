@@ -1,0 +1,115 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oaiy.com/schemas/bridge/v1/run-request.schema.json",
+  "title": "Flow run request",
+  "description": "POST /api/bridge/runs.\n\n`idempotencyKey` is REQUIRED and is the deduplication gate: the run row is reserved under a unique constraint on it BEFORE execution begins, so a duplicate returns the existing run instead of executing again. This is load-bearing rather than defensive \u2014 triggers fire from retried webhooks, several browser tabs and at-least-once event delivery, so without it 'the customer got three follow-up emails' is a routine outcome. The key must be stable for the same logical event (`binding:<id>:<eventId>`), never a fresh UUID.",
+  "type": "object",
+  "required": [
+    "protocol",
+    "caller",
+    "correlationId",
+    "idempotencyKey"
+  ],
+  "properties": {
+    "protocol": {
+      "type": "string",
+      "const": "oaiy-bridge/1",
+      "description": "Protocol the sender speaks. Receivers reject unknown majors rather than guessing."
+    },
+    "caller": {
+      "$ref": "https://oaiy.com/schemas/bridge/v1/caller.schema.json"
+    },
+    "flowId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "description": "Stable flow id. Either this or `graph`, never both."
+    },
+    "graph": {
+      "type": "object",
+      "description": "Inline graph: { nodes: [{id,type,data,position?}], edges: [{source,target,sourceHandle?,targetHandle?}] }."
+    },
+    "input": {
+      "type": "object",
+      "description": "Named flow inputs, matching the flow's declared input set."
+    },
+    "capabilities": {
+      "type": "array",
+      "description": "Capabilities the flow needs. Checked up front so a flow that would fail halfway \u2014 after it has already sent an email \u2014 is refused before it starts.",
+      "items": {
+        "type": "string",
+        "description": "Dotted capability id. `oaiy.*` is reserved for the platform; products and plugins own their own namespace (`connector.aokie.*`).",
+        "pattern": "^[a-z][a-z0-9_]*(\\.[a-zA-Z0-9_*]+)+$",
+        "maxLength": 128
+      },
+      "maxItems": 64,
+      "uniqueItems": true
+    },
+    "mode": {
+      "enum": [
+        "sync",
+        "async",
+        "queued"
+      ],
+      "default": "async",
+      "description": "`sync` waits for the terminal result. `async` returns 202 + runId. `queued` reserves without starting, for a worker to claim."
+    },
+    "timeoutMs": {
+      "type": "integer",
+      "minimum": 250,
+      "maximum": 900000
+    },
+    "correlationId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 150,
+      "description": "Ties this run to one logical interaction (a whole call, not one moment in it)."
+    },
+    "idempotencyKey": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 255
+    },
+    "lineage": {
+      "type": "object",
+      "description": "Set when this run was triggered by another run. The loop guards depend on it, so a dispatcher must populate it.",
+      "properties": {
+        "rootRunId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "parentRunId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "bindingId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "depth": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 16,
+          "description": "Caps at 16. Terminal flow events can trigger flows, so without a depth cap this is an unbounded fork bomb that presents as a hung machine."
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "oneOf": [
+    {
+      "required": [
+        "flowId"
+      ]
+    },
+    {
+      "required": [
+        "graph"
+      ]
+    }
+  ],
+  "additionalProperties": false
+}

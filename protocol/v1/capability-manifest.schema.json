@@ -1,0 +1,114 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oaiy.com/schemas/bridge/v1/capability-manifest.schema.json",
+  "title": "Capability manifest",
+  "description": "GET /api/bridge/capabilities \u2014 what this runtime can actually do right now.\n\nA hint, not a guarantee: a service can stop between discovery and invocation, so authoritative failure always arrives as a typed run error. An unavailable capability must still be LISTED with a reason \u2014 omitting it makes 'installed but stopped' indistinguishable from 'never heard of it', and the caller cannot tell the user whether to install something, start something, or give up.",
+  "type": "object",
+  "required": [
+    "protocol",
+    "runtime",
+    "capabilities"
+  ],
+  "properties": {
+    "protocol": {
+      "type": "string",
+      "const": "oaiy-bridge/1",
+      "description": "Protocol the sender speaks. Receivers reject unknown majors rather than guessing."
+    },
+    "runtime": {
+      "enum": [
+        "desktop",
+        "browser",
+        "cli",
+        "cloud"
+      ],
+      "description": "Where execution happens. A capability is offered by a runtime, not by the platform in the abstract."
+    },
+    "deviceId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "capabilities": {
+      "type": "array",
+      "maxItems": 512,
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "available"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Dotted capability id. `oaiy.*` is reserved for the platform; products and plugins own their own namespace (`connector.aokie.*`).",
+            "pattern": "^[a-z][a-z0-9_]*(\\.[a-zA-Z0-9_*]+)+$",
+            "maxLength": 128
+          },
+          "available": {
+            "type": "boolean"
+          },
+          "reason": {
+            "enum": [
+              "not_installed",
+              "service_stopped",
+              "connection_missing",
+              "plugin_disabled",
+              "plugin_crashed",
+              "permission_denied",
+              "unsupported_platform",
+              "hardware_missing"
+            ],
+            "description": "Why a capability is not usable right now. Closed set so a caller can branch on it; `detail` carries the sentence a person reads."
+          },
+          "detail": {
+            "type": "string",
+            "maxLength": 500,
+            "description": "Actionable sentence naming what to install or start. Never 'coming soon'."
+          },
+          "connections": {
+            "type": "array",
+            "description": "Connection ids that can satisfy this capability. Ids only \u2014 a connection's credentials never cross the bridge.",
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            "maxItems": 64
+          },
+          "pluginId": {
+            "type": "string",
+            "maxLength": 64,
+            "description": "Set when a plugin contributes this capability."
+          },
+          "title": {
+            "type": "string",
+            "maxLength": 120
+          }
+        },
+        "additionalProperties": false,
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "available": {
+                  "const": false
+                }
+              },
+              "required": [
+                "available"
+              ]
+            },
+            "then": {
+              "required": [
+                "reason",
+                "detail"
+              ]
+            }
+          }
+        ]
+      }
+    }
+  },
+  "additionalProperties": false
+}

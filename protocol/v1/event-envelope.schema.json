@@ -1,0 +1,69 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oaiy.com/schemas/bridge/v1/event-envelope.schema.json",
+  "title": "Runtime event envelope",
+  "description": "Every event flowing plugin -> runtime -> consumer.\n\n`correlationId` and `idempotencyKey` are both required because delivery is at-least-once: without them a reconnect replays an interaction's history and re-fires every trigger attached to it.",
+  "type": "object",
+  "required": [
+    "schemaVersion",
+    "source",
+    "name",
+    "correlationId",
+    "idempotencyKey",
+    "occurredAt",
+    "data"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": 1
+    },
+    "source": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "description": "Origin subsystem: a plugin id (`aokie`) or a runtime subsystem (`desktop`, `flows`, `services`)."
+    },
+    "name": {
+      "type": "string",
+      "description": "Dot-namespaced, e.g. `aokie.call.incoming`.",
+      "pattern": "^[a-z][a-z0-9_]*(\\.[a-zA-Z0-9_]+)+$",
+      "maxLength": 128
+    },
+    "correlationId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "description": "Shared by every event of one logical interaction."
+    },
+    "idempotencyKey": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 255,
+      "description": "Identifies THIS occurrence. Consumers dedupe on it."
+    },
+    "occurredAt": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "data": {
+      "description": "Event payload. May contain PII and MUST be minimised by the producer \u2014 the runtime does not sanitise it."
+    },
+    "pluginId": {
+      "type": "string",
+      "maxLength": 64
+    },
+    "connectorId": {
+      "type": "string",
+      "maxLength": 64
+    },
+    "severity": {
+      "enum": [
+        "debug",
+        "info",
+        "warning",
+        "error"
+      ]
+    }
+  },
+  "additionalProperties": false
+}
