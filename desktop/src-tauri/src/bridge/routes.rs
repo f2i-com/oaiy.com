@@ -196,6 +196,25 @@ fn to_run_request(body: &RunRequestBody) -> RunRequest {
     }
 }
 
+/// The closed error taxonomy from `protocol/v1/error.schema.json`. A plugin may
+/// name one of these; anything else the host authors itself.
+fn is_taxonomy_code(code: &str) -> bool {
+    matches!(
+        code,
+        "invalid_request"
+            | "invalid_flow"
+            | "flow_not_found"
+            | "capability_denied"
+            | "capability_unavailable"
+            | "connection_missing"
+            | "node_failed"
+            | "timeout"
+            | "cancelled"
+            | "runtime_unavailable"
+            | "internal"
+    )
+}
+
 fn bridge_error(status: StatusCode, code: &str, message: String) -> axum::response::Response {
     (
         status,
@@ -556,13 +575,19 @@ async fn connector_request(
             format!("the plugin did not answer {method} within {:.0}s", waited.as_secs_f32()),
         ),
         Ok(Err(ForwardError::Call(CallError::Plugin { message, typed, .. }))) => {
-            // The plugin's own typed refusal passes through untranslated — it
-            // knows why it refused better than we do.
-            bridge_error(
-                StatusCode::BAD_GATEWAY,
-                typed.as_deref().unwrap_or("node_failed"),
-                message,
-            )
+            // The plugin's typed code passes through only if it is IN the closed
+            // taxonomy. A plugin is untrusted, and `error.code` is the field a
+            // consumer branches on — echoing an arbitrary string lets a plugin
+            // emit `capability_denied` (a verdict the host never made) or a code
+            // outside the enum (which fails schema validation at a conforming
+            // consumer, the exact failure the closed set exists to prevent).
+            // Anything unrecognised becomes node_failed: the plugin's call
+            // genuinely failed, we just will not let it name the reason falsely.
+            let code = match typed.as_deref() {
+                Some(t) if is_taxonomy_code(t) => t,
+                _ => "node_failed",
+            };
+            bridge_error(StatusCode::BAD_GATEWAY, code, message)
         }
         Ok(Err(ForwardError::Call(e))) => {
             bridge_error(StatusCode::BAD_GATEWAY, "runtime_unavailable", e.to_string())

@@ -87,7 +87,7 @@ const OS_ENV_ALLOW_LIST: &[&str] = &["PATH", "HOME", "TMPDIR", "LANG", "LC_ALL",
 /// Belt and braces: the allow-list above is the control, but a future edit adding
 /// something broad (`*_PROXY`, say) shouldn't be able to leak a credential
 /// without tripping a test.
-const NEVER_FORWARD: &[&str] = &[
+pub(crate) const NEVER_FORWARD: &[&str] = &[
     "OAIY_HF_TOKEN",
     "HF_TOKEN",
     "HUGGINGFACE_TOKEN",

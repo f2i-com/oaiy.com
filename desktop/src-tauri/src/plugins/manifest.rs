@@ -215,10 +215,29 @@ impl PluginManifest {
             }
         }
 
+        // Every declared event must be namespaced under something this plugin
+        // OWNS — its own id or one of its connector ids. Without this, the
+        // `source` pin in the runtime is cosmetic: the trigger dispatcher matches
+        // bindings on NAME alone, so a plugin declaring `aokie.call.incoming` in
+        // its own manifest (source = itself, which passes the runtime check)
+        // fires every binding meant for the real Aokie — forging another
+        // subsystem's events with zero declared capabilities. Tying the event
+        // namespace to an owned prefix is what makes the source pin enforceable.
+        let owned_prefixes: BTreeSet<&str> = std::iter::once(self.id.as_str())
+            .chain(self.connectors.iter().map(|c| c.id.as_str()))
+            .collect();
         for e in &self.events {
             if !is_valid_event_name(e) {
                 return Err(ManifestError::Invalid(format!(
                     "event name {e:?} must be dot-namespaced, e.g. \"aokie.call.incoming\""
+                )));
+            }
+            let first = e.split('.').next().unwrap_or("");
+            if !owned_prefixes.contains(first) {
+                return Err(ManifestError::Invalid(format!(
+                    "event {e:?} is namespaced under {first:?}, which this plugin does not own; \
+                     declare events under the plugin id ({:?}) or a declared connector id",
+                    self.id
                 )));
             }
         }
@@ -858,6 +877,43 @@ mod tests {
                 "command {bad:?} must be refused"
             );
         }
+    }
+
+    #[test]
+    fn a_plugin_cannot_declare_another_subsystems_events() {
+        // The forgery fix: the runtime pins event `source` to the plugin, but the
+        // dispatcher matches bindings on NAME. So an evil plugin declaring
+        // `aokie.call.incoming` (source = itself) fired every real-Aokie binding.
+        // The manifest now refuses events not namespaced under something the
+        // plugin owns.
+        let mut v = base();
+        v["id"] = serde_json::json!("evil");
+        v["connectors"] = serde_json::json!([]);
+        v["capabilities"] = serde_json::json!([]);
+        v["commands"] = serde_json::json!({ "journalled": [] });
+        v["events"] = serde_json::json!(["aokie.call.incoming"]);
+        let d = write_manifest(&v);
+        let err = PluginManifest::load(d.path()).expect_err("forged namespace must be refused");
+        assert!(err.reason().contains("does not own"), "{}", err.reason());
+    }
+
+    #[test]
+    fn a_plugin_may_namespace_events_under_its_id_or_a_connector() {
+        // aokie: id == aokie, connector id == aokie, events aokie.* — the real
+        // shipped shape, which must still load.
+        let d = write_manifest(&base());
+        let m = PluginManifest::load(d.path()).expect("owned namespace loads");
+        assert!(m.declares_event("aokie.call.incoming"));
+
+        // A connector-namespaced event on a differently-named plugin is fine.
+        let mut v = base();
+        v["id"] = serde_json::json!("acme-weather");
+        v["connectors"] = serde_json::json!([{ "id": "weather", "commands": ["forecast.get"] }]);
+        v["capabilities"] = serde_json::json!(["connector.weather.forecast.get"]);
+        v["commands"] = serde_json::json!({ "journalled": [] });
+        v["events"] = serde_json::json!(["weather.updated"]);
+        let d = write_manifest(&v);
+        assert!(PluginManifest::load(d.path()).is_ok(), "connector-owned namespace is legitimate");
     }
 
     #[test]

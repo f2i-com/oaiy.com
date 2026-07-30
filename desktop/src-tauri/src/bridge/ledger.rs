@@ -178,6 +178,17 @@ pub const MAX_LINEAGE_DEPTH: u32 = 16;
 /// has already terminated.
 const GUARD_CAPACITY: usize = 8192;
 
+/// Cap on retained runs. The ledger held every run forever — each carrying its
+/// full input JSON — plus a by_key entry, so an event flood or a plugin looping
+/// `flow.run` grew memory without limit until the tray process was OOM-killed,
+/// taking every supervised plugin and service with it. Only TERMINAL runs are
+/// evicted (oldest first); a queued or running run is never dropped, so nothing
+/// in flight is lost. Evicting a terminal run means a much-later retry of its
+/// idempotency key could re-execute — an acceptable trade against unbounded
+/// growth, and the keys are the caller's to choose, so a live retry loop keeps
+/// its recent runs.
+const MAX_RUNS: usize = 20_000;
+
 /// What a caller asks for. Mirrors `protocol/v1/run-request.schema.json`.
 #[derive(Debug, Clone)]
 pub struct RunRequest {
@@ -351,6 +362,8 @@ pub struct Ledger {
     runs: HashMap<String, RunRecord>,
     /// `idempotency_key` -> `run_id`. The uniqueness gate.
     by_key: HashMap<String, String>,
+    /// Run ids in reservation order, for bounded eviction of terminal runs.
+    run_order: VecDeque<String>,
     /// `(root_run_id, binding_id, event)` triples already fired in a tree.
     fired: HashSet<(String, String, String)>,
     /// Insertion order over `fired`, for bounded FIFO eviction.
@@ -423,8 +436,41 @@ impl Ledger {
 
         self.by_key
             .insert(req.idempotency_key.clone(), run_id.clone());
+        self.run_order.push_back(run_id.clone());
         self.runs.insert(run_id, record.clone());
+        self.evict_terminal_over_cap();
         ReserveOutcome::Reserved(record)
+    }
+
+    /// Drop oldest TERMINAL runs until under [`MAX_RUNS`]. A queued/running run is
+    /// never evicted — losing an in-flight run would strand its caller — so the
+    /// effective ceiling can exceed the cap when many runs are simultaneously
+    /// live, which is self-limiting (they terminate) and far better than OOM.
+    fn evict_terminal_over_cap(&mut self) {
+        if self.runs.len() <= MAX_RUNS {
+            return;
+        }
+        let mut scanned = 0usize;
+        let budget = self.run_order.len();
+        while self.runs.len() > MAX_RUNS && scanned < budget {
+            let Some(id) = self.run_order.pop_front() else { break };
+            scanned += 1;
+            match self.runs.get(&id) {
+                Some(rec) if rec.status.is_terminal() => {
+                    let key = rec.idempotency_key.clone();
+                    self.runs.remove(&id);
+                    // Only clear by_key if it still points at THIS run — a later
+                    // reservation could in principle reuse the string.
+                    if self.by_key.get(&key).map(String::as_str) == Some(id.as_str()) {
+                        self.by_key.remove(&key);
+                    }
+                }
+                // Still live: keep it, and put it at the back so the scan makes
+                // progress instead of re-examining it forever.
+                Some(_) => self.run_order.push_back(id),
+                None => {} // already gone
+            }
+        }
     }
 
     /// The three loop guards. `None` means the run may proceed.
