@@ -338,7 +338,7 @@ mod tests {
             category: None,
             protocol: Protocol::OpenAi,
             base_url: "https://api.openai.com".into(),
-            model: Some("gpt-4o-mini".into()),
+            model: Some("example-model".into()),
             capabilities: vec![],
             enabled: true,
             allow_local: false,
