@@ -71,7 +71,7 @@ const PAGE: Record<View, { crumb: string; kicker: string; title: string; copy: s
     crumb: 'Plugins',
     kicker: 'Extensions',
     title: 'Plugins',
-    copy: 'Supervised extensions that add connectors and events — like the Aokie phone bridge.',
+    copy: 'Supervised extensions that add connectors and events to your flows.',
   },
   models: {
     crumb: 'Models',
