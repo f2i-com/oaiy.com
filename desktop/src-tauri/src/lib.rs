@@ -830,7 +830,7 @@ async fn pick_folder(app: tauri::AppHandle) -> Result<Option<String>, String> {
 /// from disk — clean. Under `tauri dev`, though, `app.restart()` relaunches the
 /// binary but the Vite dev server is owned by the `tauri dev` supervisor and is
 /// torn down with the old process, so the new window loads a dead
-/// `http://localhost:1420` ("Hmmm… can't reach this page"). So in a debug build
+/// `http://localhost:17973` ("Hmmm… can't reach this page"). So in a debug build
 /// we DON'T relaunch — we leave the working window in place and tell the user to
 /// re-run the dev command to apply the change.
 #[tauri::command]
