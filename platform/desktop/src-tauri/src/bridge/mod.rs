@@ -35,10 +35,12 @@
 //! (Python venvs, llama.cpp, a Playwright browser).
 
 pub mod ledger;
+pub mod pairing;
 pub mod routes;
 pub mod triggers;
 pub mod worker;
 
+pub use pairing::{PairingHandle, PairingManager};
 pub use routes::{router as bridge_router, BridgeState};
 pub use worker::{FlowStore, Worker};
 pub use triggers::{dispatch, BindingMode, DispatchOutcome, Event, SkipReason, TriggerBinding};

@@ -1243,6 +1243,9 @@ pub fn build_bridge_state(
         cfg!(debug_assertions),
     );
     let flows = std::sync::Arc::new(bridge::FlowStore::new(data_dir.join("flows")));
+    // Durable pairing tokens under <data>/bridge, so a paired consumer stays
+    // paired across restarts.
+    let pairing = bridge::pairing::open_handle(data_dir.join("bridge").join("pairings.json"));
     // The worker owns nothing the state needs back; its stop flag is dropped
     // deliberately — it runs for the process lifetime, and the ledger being
     // in-memory means there is nothing to hand over on exit.
@@ -1252,6 +1255,7 @@ pub fn build_bridge_state(
         plugins,
         host,
         flows,
+        pairing,
         device_id,
     }
 }
