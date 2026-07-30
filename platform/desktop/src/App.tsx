@@ -12,6 +12,7 @@ import {
   Plug,
   Server,
   Settings2,
+  Sparkles,
   Sun,
   TriangleAlert,
   Workflow,
@@ -23,6 +24,7 @@ import ServicesPanel from './ServicesPanel';
 import ModelsPanel from './ModelsPanel';
 import PythonPanel from './PythonPanel';
 import PluginsPanel from './PluginsPanel';
+import AiProvidersPanel from './AiProvidersPanel';
 import PairingPrompt from './PairingPrompt';
 import SettingsPanel from './SettingsPanel';
 
@@ -46,7 +48,7 @@ interface HealthResponse {
   version: string;
 }
 
-type View = 'services' | 'plugins' | 'models' | 'python' | 'settings';
+type View = 'services' | 'plugins' | 'models' | 'python' | 'providers' | 'settings';
 
 const WEB_APP_URL = 'https://oaiy.com/app.html';
 
@@ -54,6 +56,7 @@ const NAV: { value: View; label: string; icon: LucideIcon }[] = [
   { value: 'services', label: 'Services', icon: Server },
   { value: 'plugins', label: 'Plugins', icon: Plug },
   { value: 'models', label: 'Models', icon: Package },
+  { value: 'providers', label: 'Providers', icon: Sparkles },
   { value: 'python', label: 'Python', icon: HardDrive },
 ];
 
@@ -79,6 +82,12 @@ const PAGE: Record<View, { crumb: string; kicker: string; title: string; copy: s
     kicker: 'Storage',
     title: 'Model library',
     copy: 'Download weights from Hugging Face and manage what is on disk.',
+  },
+  providers: {
+    crumb: 'Providers',
+    kicker: 'AI gateway',
+    title: 'AI providers',
+    copy: 'Cloud or local AI providers your flows can call — keys stay on this device.',
   },
   python: {
     crumb: 'Python',
@@ -342,6 +351,7 @@ export default function App() {
             {view === 'services' && <ServicesPanel />}
             {view === 'plugins' && <PluginsPanel />}
             {view === 'models' && <ModelsPanel />}
+            {view === 'providers' && <AiProvidersPanel />}
             {view === 'python' && <PythonPanel />}
             {view === 'settings' && <SettingsPanel />}
           </div>
