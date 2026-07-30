@@ -410,6 +410,25 @@ export const plugins = {
     ),
 };
 
+// ----- bridge (connector commands + plugin events) -----
+
+/** What a plugin-contributed screen needs from the host to be useful. */
+export const bridge = {
+  /** Invoke a connector command on a plugin, exactly as a flow would. */
+  connectorRequest: (connectorId: string, command: string, payload?: unknown) =>
+    request<{ ok: boolean; result?: unknown }>(
+      `/api/bridge/connectors/${encodeURIComponent(connectorId)}/request`,
+      { method: 'POST', body: JSON.stringify({ command, payload }) },
+    ),
+  /** Poll plugin events after `since` (0 = from the current tail). */
+  events: (since: number, limit = 100) =>
+    request<{ events: Array<{ seq: number; envelope: Record<string, unknown> }>; next: number }>(
+      `/api/bridge/events?since=${since}&limit=${limit}`,
+    ),
+  /** The AI sources union (local services + configured providers). */
+  aiSources: () => request<{ sources: unknown[] }>('/api/ai/sources'),
+};
+
 // ----- AI providers (the local AI gateway) -----
 
 export type AiProtocol = 'openai' | 'anthropic';
