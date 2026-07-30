@@ -130,11 +130,38 @@ struct EventRing {
     ring: Mutex<VecDeque<ReceivedEvent>>,
 }
 
+/// Everything mutable about plugin processes, under ONE lock.
+///
+/// One table rather than separate maps because the review confirmed four
+/// distinct races between them: two concurrent start()s both passing an empty
+/// running-map check (check-then-act across a seconds-long handshake), a stop()
+/// arriving mid-handshake and reporting success while the plugin came up
+/// anyway, a pending restart resurrecting a manually-stopped plugin, and the
+/// supervisor's stale snapshot misreading a graceful stop as a crash. Every one
+/// of them is an atomicity problem between "who is running", "who is starting"
+/// and "who is scheduled to restart" — so those three live behind one mutex and
+/// every transition is a single critical section.
+#[derive(Default)]
+struct ProcTable {
+    running: HashMap<String, Arc<PluginProcess>>,
+    /// Ids with a start in flight (spawn + handshake take seconds, outside the
+    /// lock). A second start() sees the id here and returns idempotently
+    /// instead of spawning a rival process onto the same hardware.
+    starting: std::collections::HashSet<String>,
+    /// Ids whose in-flight start should be abandoned: stop() arrived during the
+    /// handshake. The finishing start() kills the process instead of
+    /// registering it.
+    stop_during_start: std::collections::HashSet<String>,
+    /// Crash-restart due times. In the table — NOT supervisor-local — so a
+    /// manual stop() can cancel one before it fires.
+    restarts: HashMap<String, Instant>,
+}
+
 pub struct PluginHost {
     pub registry: PluginRegistryHandle,
     pub ledger: LedgerHandle,
     pub triggers: TriggerStoreHandle,
-    running: Mutex<HashMap<String, Arc<PluginProcess>>>,
+    procs: Mutex<ProcTable>,
     events: EventRing,
     event_tx: Sender<(String, Value)>,
     desktop_version: String,
@@ -155,7 +182,7 @@ impl PluginHost {
             registry,
             ledger,
             triggers,
-            running: Mutex::new(HashMap::new()),
+            procs: Mutex::new(ProcTable::default()),
             events: EventRing {
                 seq: AtomicU64::new(0),
                 ring: Mutex::new(VecDeque::with_capacity(EVENT_RING_CAPACITY)),
@@ -181,11 +208,10 @@ impl PluginHost {
             let host = Arc::downgrade(&host);
             thread::spawn(move || {
                 let mut trackers: HashMap<String, HealthTracker> = HashMap::new();
-                let mut pending_restart: Vec<(String, Instant)> = Vec::new();
                 loop {
                     thread::sleep(HEALTH_INTERVAL);
                     let Some(host) = host.upgrade() else { break };
-                    host.supervise(&mut trackers, &mut pending_restart);
+                    host.supervise(&mut trackers);
                 }
             });
         }
@@ -223,15 +249,31 @@ impl PluginHost {
             (m, rec.dir.clone())
         };
 
-        // Already running? Idempotent success rather than a second process — two
-        // processes for one plugin would fight over the same hardware and data.
-        if let Ok(running) = self.running.lock() {
-            if let Some(existing) = running.get(id) {
+        // Claim the start ATOMICALLY. "Check the map, then spawn" is a
+        // check-then-act race across a seconds-long handshake: two concurrent
+        // starts both pass an empty-map check and spawn rival processes onto the
+        // same hardware (the review traced it end to end). Inserting into
+        // `starting` under the same lock that reads `running` makes the second
+        // caller's outcome deterministic: idempotent success.
+        {
+            let mut t = self.procs.lock().map_err(|_| "process table poisoned")?;
+            if let Some(existing) = t.running.get(id) {
                 if existing.check_exited().is_none() {
                     return Ok(());
                 }
+                t.running.remove(id);
             }
+            if !t.starting.insert(id.to_string()) {
+                // A start is already in flight; joining it is what the caller
+                // wanted anyway.
+                return Ok(());
+            }
+            // A manual start supersedes any scheduled crash-restart.
+            t.restarts.remove(id);
+            t.stop_during_start.remove(id);
         }
+        // From here on, every return path must clear the `starting` claim.
+        let claim = StartClaim { host: self, id: id.to_string() };
 
         self.set_state(id, PluginState::Starting, Some("Launching…".into()));
 
@@ -286,9 +328,21 @@ impl PluginHost {
             }
         }
 
-        if let Ok(mut running) = self.running.lock() {
-            running.insert(id.to_string(), process);
+        {
+            let mut t = self.procs.lock().map_err(|_| "process table poisoned")?;
+            // A stop() that arrived during the handshake wins: registering the
+            // process now would leave it Running seconds after the user was told
+            // the stop succeeded. Kill it instead — it never served anything.
+            if t.stop_during_start.remove(id) {
+                drop(t);
+                process.kill();
+                drop(claim);
+                self.set_state(id, PluginState::Stopped, Some("Stopped while starting.".into()));
+                return Err(format!("{id} was stopped while it was starting"));
+            }
+            t.running.insert(id.to_string(), process);
         }
+        drop(claim);
         if let Ok(mut reg) = self.registry.lock() {
             reg.reset_restarts(id);
         }
@@ -296,17 +350,35 @@ impl PluginHost {
         Ok(())
     }
 
-    /// Stop a plugin gracefully.
+    /// Stop a plugin gracefully. Also cancels a scheduled crash-restart and
+    /// overrides a start that is still mid-handshake — a stop that can be
+    /// outraced by its own plugin coming up is not a stop.
     pub fn stop(&self, id: &str) -> Result<(), String> {
-        let process = self
-            .running
-            .lock()
-            .map_err(|_| "running map lock poisoned")?
-            .remove(id);
+        let (process, start_in_flight) = {
+            let mut t = self.procs.lock().map_err(|_| "process table poisoned")?;
+            // Cancel any pending crash-restart: the user said stop, and a timer
+            // resurrecting the plugin afterwards reads as the stop not working.
+            t.restarts.remove(id);
+            let in_flight = t.starting.contains(id);
+            if in_flight {
+                // The start will observe this when its handshake completes and
+                // kill the process instead of registering it.
+                t.stop_during_start.insert(id.to_string());
+            }
+            (t.running.remove(id), in_flight)
+        };
         match process {
             Some(p) => {
                 p.shutdown();
                 self.set_state(id, PluginState::Stopped, Some("Stopped by request.".into()));
+                Ok(())
+            }
+            None if start_in_flight => {
+                self.set_state(
+                    id,
+                    PluginState::Stopped,
+                    Some("Stop requested while starting; the start will be abandoned.".into()),
+                );
                 Ok(())
             }
             None => {
@@ -320,8 +392,17 @@ impl PluginHost {
 
     /// Stop everything. Called on app exit so no child outlives the host.
     pub fn stop_all(&self) {
-        let drained: Vec<(String, Arc<PluginProcess>)> = match self.running.lock() {
-            Ok(mut r) => r.drain().collect(),
+        let drained: Vec<(String, Arc<PluginProcess>)> = match self.procs.lock() {
+            Ok(mut t) => {
+                // No restarts may fire during shutdown, and any in-flight start
+                // must be abandoned when it completes.
+                t.restarts.clear();
+                let starting: Vec<String> = t.starting.iter().cloned().collect();
+                for id in starting {
+                    t.stop_during_start.insert(id);
+                }
+                t.running.drain().collect()
+            }
             Err(_) => return,
         };
         for (id, p) in drained {
@@ -332,9 +413,10 @@ impl PluginHost {
 
     /// Recent log lines for a plugin, running or not.
     pub fn logs(&self, id: &str, tail: Option<usize>) -> Option<Vec<crate::services::runner::LogLine>> {
-        self.running
+        self.procs
             .lock()
             .ok()?
+            .running
             .get(id)
             .map(|p| p.logs.snapshot(tail))
     }
@@ -362,9 +444,10 @@ impl PluginHost {
         };
 
         let process = self
-            .running
+            .procs
             .lock()
-            .map_err(|_| ForwardError::Internal("running map lock poisoned".into()))?
+            .map_err(|_| ForwardError::Internal("process table poisoned".into()))?
+            .running
             .get(&plugin_id)
             .cloned();
         let Some(process) = process else {
@@ -470,10 +553,10 @@ impl PluginHost {
         // ledger's idempotency keys make the redelivery harmless.
         if !idempotency_key.is_empty() {
             let process = self
-                .running
+                .procs
                 .lock()
                 .ok()
-                .and_then(|r| r.get(plugin_id).cloned());
+                .and_then(|t| t.running.get(plugin_id).cloned());
             if let Some(p) = process {
                 let _ = p.ack_event(&idempotency_key);
             }
@@ -561,27 +644,34 @@ impl PluginHost {
     }
 
     /// One supervisor tick: probe, detect exits, schedule bounded restarts.
-    fn supervise(
-        self: &Arc<Self>,
-        trackers: &mut HashMap<String, HealthTracker>,
-        pending_restart: &mut Vec<(String, Instant)>,
-    ) {
-        // Fire any due restarts first.
+    fn supervise(self: &Arc<Self>, trackers: &mut HashMap<String, HealthTracker>) {
+        // Fire due restarts. They live in the table so stop() can cancel them;
+        // remove-then-start keeps each one at-most-once.
         let now = Instant::now();
-        let due: Vec<String> = pending_restart
-            .iter()
-            .filter(|(_, at)| *at <= now)
-            .map(|(id, _)| id.clone())
-            .collect();
-        pending_restart.retain(|(_, at)| *at > now);
+        let due: Vec<String> = match self.procs.lock() {
+            Ok(mut t) => {
+                let due: Vec<String> = t
+                    .restarts
+                    .iter()
+                    .filter(|(_, at)| **at <= now)
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                for id in &due {
+                    t.restarts.remove(id);
+                }
+                due
+            }
+            Err(_) => Vec::new(),
+        };
         for id in due {
-            // start() re-checks user_disabled and manifest validity, so a plugin
-            // disabled while a restart was pending stays down.
+            // start() re-checks user_disabled and manifest validity; a plugin
+            // stopped or disabled while the restart was pending was already
+            // cancelled out of the map by stop().
             let _ = self.start(&id);
         }
 
-        let snapshot: Vec<(String, Arc<PluginProcess>)> = match self.running.lock() {
-            Ok(r) => r.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+        let snapshot: Vec<(String, Arc<PluginProcess>)> = match self.procs.lock() {
+            Ok(t) => t.running.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
             Err(_) => return,
         };
 
@@ -589,8 +679,26 @@ impl PluginHost {
             // Exit first: probing a dead process would just add a 5s timeout to
             // what check_exited answers instantly.
             if let Some(code) = process.check_exited() {
-                if let Ok(mut r) = self.running.lock() {
-                    r.remove(&id);
+                // The snapshot is stale by up to a whole tick, and stop() may
+                // have removed — or a new start() replaced — this entry while we
+                // were probing another plugin. Only treat the exit as a crash if
+                // the table still holds THIS process (`Arc::ptr_eq`); otherwise
+                // the exit was a graceful stop already accounted for, and
+                // "crashing" it would overwrite Stopped, burn a restart attempt,
+                // and resurrect a plugin the user shut down.
+                let still_ours = match self.procs.lock() {
+                    Ok(mut t) => match t.running.get(&id) {
+                        Some(current) if Arc::ptr_eq(current, &process) => {
+                            t.running.remove(&id);
+                            true
+                        }
+                        _ => false,
+                    },
+                    Err(_) => false,
+                };
+                if !still_ours {
+                    trackers.remove(&id);
+                    continue;
                 }
                 trackers.remove(&id);
                 let reason = match code {
@@ -609,7 +717,9 @@ impl PluginHost {
                         PluginState::Crashed,
                         Some(format!("{reason} Restarting in {}s (attempt {attempts}).", delay.as_secs())),
                     );
-                    pending_restart.push((id.clone(), Instant::now() + delay));
+                    if let Ok(mut t) = self.procs.lock() {
+                        t.restarts.insert(id.clone(), Instant::now() + delay);
+                    }
                 } else {
                     self.set_state(
                         &id,
@@ -668,6 +778,29 @@ impl PluginHost {
     fn set_state(&self, id: &str, state: PluginState, reason: Option<String>) {
         if let Ok(mut reg) = self.registry.lock() {
             reg.set_state(id, state, reason);
+        }
+    }
+}
+
+/// Panic-safe release of a `starting` claim.
+///
+/// A guard rather than manual removal at each return, because start() has five
+/// exit paths and a forgotten one would leave the id permanently "starting" —
+/// every later start() would return Ok while doing nothing, an unstartable
+/// plugin that reports success.
+struct StartClaim<'a> {
+    host: &'a PluginHost,
+    id: String,
+}
+
+impl Drop for StartClaim<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut t) = self.host.procs.lock() {
+            t.starting.remove(&self.id);
+            // A stop intent that never met its start (e.g. the spawn failed
+            // before the completion check) must not linger and abandon the NEXT
+            // legitimate start.
+            t.stop_during_start.remove(&self.id);
         }
     }
 }

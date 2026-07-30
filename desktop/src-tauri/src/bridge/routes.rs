@@ -282,24 +282,63 @@ async fn create_run(
         return bridge_error(StatusCode::BAD_REQUEST, "invalid_request", rej.message());
     }
     let req = to_run_request(&body);
-    let mut ledger = match st.ledger.lock() {
-        Ok(l) => l,
-        Err(_) => {
-            return bridge_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal",
-                "run ledger lock poisoned".into(),
-            )
-        }
+    // Block-scoped: this handler awaits below, and a std MutexGuard anywhere in
+    // the async fn's state — even one already drop()ed — makes the future !Send
+    // and the whole route fail to compile as a handler. The guard must
+    // provably end before the first await.
+    let outcome = {
+        let mut ledger = match st.ledger.lock() {
+            Ok(l) => l,
+            Err(_) => {
+                return bridge_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal",
+                    "run ledger lock poisoned".into(),
+                )
+            }
+        };
+        ledger.reserve(&req)
     };
-    match ledger.reserve(&req) {
-        ReserveOutcome::Reserved(rec) => (StatusCode::CREATED, Json(rec)).into_response(),
+
+    match outcome {
+        ReserveOutcome::Reserved(rec) => {
+            if req.mode == "sync" {
+                // `sync` means the caller wants the terminal result, and the
+                // protocol says so — the first cut validated the mode and then
+                // ignored it, returning 201 Queued, which made sync
+                // indistinguishable from async and broke every caller that
+                // trusted the contract. Poll the ledger (the worker executes on
+                // its own thread) up to the run's own budget plus scheduling
+                // slack.
+                let deadline = std::time::Instant::now()
+                    + std::time::Duration::from_millis(req.timeout_ms.unwrap_or(30_000))
+                    + std::time::Duration::from_secs(5);
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                    let current = { st.ledger.lock().ok().and_then(|l| l.get(&rec.run_id)) };
+                    match current {
+                        Some(r) if r.status.is_terminal() => {
+                            return (StatusCode::OK, Json(r)).into_response();
+                        }
+                        _ if std::time::Instant::now() >= deadline => {
+                            // Honest partial answer: accepted, still running.
+                            // 202 rather than 200 so a schema-driven caller can
+                            // tell "result" from "still waiting".
+                            let latest = { st.ledger.lock().ok().and_then(|l| l.get(&rec.run_id)) }
+                                .unwrap_or_else(|| rec.clone());
+                            return (StatusCode::ACCEPTED, Json(latest)).into_response();
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            (StatusCode::CREATED, Json(rec)).into_response()
+        }
         // 200, not 201: nothing was created and nothing will execute. The flag is
         // what stops a caller treating a dedupe as a fresh run.
-        ReserveOutcome::Duplicate(rec) => {
-            let mut v = serde_json::to_value(&rec).unwrap_or_else(|_| json!({}));
-            v["idempotent"] = json!(true);
-            (StatusCode::OK, Json(v)).into_response()
+        ReserveOutcome::Duplicate(mut rec) => {
+            rec.idempotent = true;
+            (StatusCode::OK, Json(rec)).into_response()
         }
         // 422 rather than 409: a guard refusal will never succeed on retry, so
         // the caller should stop rather than back off.
@@ -539,6 +578,57 @@ async fn connector_request(
     }
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct FinishBody {
+    status: String,
+    #[serde(default)]
+    output: Option<serde_json::Value>,
+    #[serde(default)]
+    error: Option<crate::bridge::ledger::RunError>,
+}
+
+/// Finalise a run an EXTERNAL claimer executed.
+///
+/// The desktop's own worker finishes its runs in-process, which is why this
+/// route did not exist at first — and its absence made `mode: "queued"` a trap:
+/// a browser could claim a run and then had no way to ever record its outcome,
+/// so the run sat `running` forever, immune even to cancellation (which only
+/// flags; the finisher is whoever executes). The claim/finish pair is only a
+/// pair if both halves are reachable.
+async fn finish_run(
+    State(st): State<BridgeState>,
+    Path(id): Path<String>,
+    Json(body): Json<FinishBody>,
+) -> axum::response::Response {
+    let status = match body.status.as_str() {
+        "succeeded" => RunStatus::Succeeded,
+        "failed" => RunStatus::Failed,
+        "timed_out" => RunStatus::TimedOut,
+        "cancelled" => RunStatus::Cancelled,
+        other => {
+            return bridge_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                format!("{other:?} is not a terminal status (succeeded | failed | timed_out | cancelled)"),
+            )
+        }
+    };
+    let mut ledger = match st.ledger.lock() {
+        Ok(l) => l,
+        Err(_) => {
+            return bridge_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", "run ledger lock poisoned".into())
+        }
+    };
+    match ledger.finish(&id, status, body.output, body.error) {
+        Ok(rec) => (StatusCode::OK, Json(rec)).into_response(),
+        // The ledger's refusals here are all conflicts: already terminal, a
+        // failure with no error, an unknown run. 409 tells the claimer its view
+        // of the run is stale — re-read, don't retry blindly.
+        Err(e) => bridge_error(StatusCode::CONFLICT, "invalid_request", e),
+    }
+}
+
 // ------- plugin lifecycle -------
 
 async fn start_plugin(State(st): State<BridgeState>, Path(id): Path<String>) -> axum::response::Response {
@@ -700,6 +790,7 @@ pub fn router(state: BridgeState) -> Router {
         .route("/api/bridge/runs", get(queued_runs).post(create_run))
         .route("/api/bridge/runs/:id", get(get_run))
         .route("/api/bridge/runs/:id/claim", post(claim_run))
+        .route("/api/bridge/runs/:id/finish", post(finish_run))
         .route("/api/bridge/runs/:id/cancel", post(cancel_run))
         .route("/api/plugins", get(list_plugins))
         .route(

@@ -74,6 +74,75 @@
         "$ref": "https://oaiy.com/schemas/bridge/v1/artifact-ref.schema.json"
       },
       "maxItems": 64
+    },
+    "callerProduct": {
+      "type": "string",
+      "maxLength": 64,
+      "description": "The caller's product id alone, for implementations that store it flat rather than as the full caller object."
+    },
+    "flowId": {
+      "type": "string",
+      "maxLength": 128
+    },
+    "input": {
+      "description": "The named inputs the run was reserved with, so a claimer can execute without the original request."
+    },
+    "timeoutMs": {
+      "type": "integer",
+      "minimum": 250,
+      "maximum": 900000
+    },
+    "mode": {
+      "enum": [
+        "sync",
+        "async",
+        "queued"
+      ]
+    },
+    "cancelRequested": {
+      "type": "boolean",
+      "description": "A caller asked a running run to stop. The run stays `running` until the executor notices and finalises it."
+    },
+    "reservedAt": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "lineage": {
+      "type": "object",
+      "description": "Trigger ancestry, echoed for diagnosis of loop-guard refusals.",
+      "properties": {
+        "rootRunId": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 128
+        },
+        "parentRunId": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 128
+        },
+        "bindingId": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 128
+        },
+        "depth": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 16
+        }
+      },
+      "additionalProperties": false
+    },
+    "triggerEvent": {
+      "type": "string",
+      "maxLength": 128
     }
   },
   "additionalProperties": false,

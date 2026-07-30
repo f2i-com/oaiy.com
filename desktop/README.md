@@ -82,6 +82,46 @@ is loopback-only.
 - `POST   /api/python/venvs` — body `{ name, requirements[] }`; reuses existing venv with the same name (so two services can share one torch install)
 - `DELETE /api/python/venvs/:name`
 
+### Bridge Protocol v1 (`oaiy-bridge/1`)
+
+The runtime surface consumers integrate against — contract in
+[`../protocol/README.md`](../protocol/README.md), which is normative.
+
+- `GET    /api/bridge/capabilities` — what this runtime can do right now; unavailable capabilities carry a `reason` + actionable `detail`
+- `POST   /api/bridge/runs` — reserve a run. `201` reserved · `200`+`idempotent:true` duplicate · `422` loop-guard refusal
+- `GET    /api/bridge/runs` / `GET /api/bridge/runs/:id` — queue + one run
+- `POST   /api/bridge/runs/:id/claim` — single-winner claim (`409` names the holder)
+- `POST   /api/bridge/runs/:id/cancel` — a *request*: `202` while running; the worker kills the child when it notices
+- `GET    /api/bridge/events?since=N` — poll validated plugin events by sequence number; each carries its trigger-dispatch outcomes
+- `GET/POST /api/bridge/triggers`, `DELETE /api/bridge/triggers/:id` — event→flow bindings, persisted to `<data>/triggers.json`
+- `GET    /api/bridge/flows`, `PUT/DELETE /api/bridge/flows/:id` — flow documents under `<data>/flows/`, executed verbatim by the CLI
+
+Queued runs (any mode but `queued`) are claimed by the built-in worker and
+executed by spawning the **`oaiy` CLI** — the same `oaiy-core` engine the
+browser runs, so desktop and browser execution are identical by construction.
+Resolution: `OAIY_CLI` env (a path to `cli/bin/oaiy.mjs` or a binary), else
+`oaiy` on PATH; neither present fails each run typed and actionable, never a
+silent queue stall.
+
+### Plugins
+
+Directories under `<data>/plugins/<id>/` with a `manifest.json` and an
+executable, run as supervised children speaking JSON-RPC 2.0 over
+newline-delimited stdio. Capabilities are declared in the manifest; wildcards
+expand at load against declared commands, and undeclared commands/events are
+refused/dropped before the plugin is involved.
+
+- `GET    /api/plugins` — installed plugins; every non-running state carries a reason
+- `POST   /api/plugins/:id/start` / `POST /api/plugins/:id/stop`
+- `POST   /api/plugins/:id/enabled` — body `{ "enabled": bool }`; disabling stops first
+- `GET    /api/plugins/:id/logs?tail=N` — stdout/stderr ring (non-protocol output lands here)
+- `POST   /api/bridge/connectors/:id/request` — body `{ command, payload?, idempotencyKey? }`, gated against the manifest **before** forwarding; journalled commands require the key
+
+Supervision: 10s health probes (3 consecutive misses → `unhealthy`, still
+serving), crash detection with bounded 1s/4s/16s restarts, graceful shutdown
+(`plugin.shutdown` → 5s grace → kill). Children get an allow-listed environment
+— no host secrets — and a per-plugin data dir inside the plugin folder.
+
 ## Dev workflow
 
 Requirements (Windows):

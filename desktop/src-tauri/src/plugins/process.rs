@@ -91,12 +91,26 @@ pub type RequestHandler =
 
 type Pending = Arc<Mutex<HashMap<RpcId, Sender<Result<Value, CallError>>>>>;
 
+/// Sender half of the stdin writer channel. `None` after close.
+type WriteTx = Arc<Mutex<Option<std::sync::mpsc::SyncSender<String>>>>;
+
 pub struct PluginProcess {
     pub plugin_id: String,
     pub pid: u32,
     pub logs: LogBuffer,
     child: Arc<Mutex<Option<Child>>>,
-    stdin: Arc<Mutex<Option<std::process::ChildStdin>>>,
+    /// All stdin writes go through a bounded channel to ONE writer thread.
+    ///
+    /// This replaced a mutex held across a blocking pipe write, and the change
+    /// is load-bearing: `request()`'s timeout bounds only the reply wait, not
+    /// the write, so a plugin that stopped draining its stdin filled the OS
+    /// pipe buffer and the next writer blocked forever HOLDING THE MUTEX. The
+    /// supervisor thread and the event thread are shared across ALL plugins,
+    /// so one wedged plugin froze supervision, event dispatch, `stop()` and
+    /// app exit — the review confirmed the full chain. With a channel, only
+    /// the writer thread blocks; a full channel is reported as an error
+    /// (`try_send`), never waited on.
+    write_tx: WriteTx,
     pending: Pending,
     next_id: Arc<Mutex<i64>>,
 }
@@ -176,7 +190,28 @@ impl PluginProcess {
 
         let logs = LogBuffer::new();
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
-        let stdin = Arc::new(Mutex::new(Some(stdin)));
+
+        // Bounded: an unbounded channel to a wedged writer grows without limit.
+        // 256 lines of headroom absorbs bursts (an event storm of acks) while a
+        // plugin that has genuinely stopped reading surfaces as a send error
+        // within one buffer's worth of traffic.
+        let (raw_tx, write_rx) = std::sync::mpsc::sync_channel::<String>(256);
+        let write_tx: WriteTx = Arc::new(Mutex::new(Some(raw_tx)));
+        {
+            // The ONLY thread that touches the child's stdin. It alone blocks on
+            // a full pipe; everyone else does a non-blocking try_send.
+            let mut stdin_owned = stdin;
+            thread::spawn(move || {
+                while let Ok(line) = write_rx.recv() {
+                    if write_line(&mut stdin_owned, &line).is_err() {
+                        break;
+                    }
+                }
+                // Channel closed or write failed: dropping stdin sends EOF, the
+                // well-behaved plugin's exit signal.
+                drop(stdin_owned);
+            });
+        }
 
         // stderr is drained on its own thread. Without this a chatty plugin fills
         // the pipe buffer and blocks forever on its next write — a hang whose
@@ -198,7 +233,7 @@ impl PluginProcess {
         {
             let logs = logs.clone();
             let pending = pending.clone();
-            let stdin_for_replies = stdin.clone();
+            let tx_for_replies = write_tx.clone();
             let plugin_id = manifest.id.clone();
             let events = opts.events.clone();
             let requests = opts.requests.clone();
@@ -257,9 +292,9 @@ impl PluginProcess {
                                     Some(&typed),
                                 ),
                             };
-                            if let Ok(mut guard) = stdin_for_replies.lock() {
-                                if let Some(w) = guard.as_mut() {
-                                    let _ = write_line(w, &reply);
+                            if let Ok(guard) = tx_for_replies.lock() {
+                                if let Some(tx) = guard.as_ref() {
+                                    let _ = tx.try_send(reply);
                                 }
                             }
                         }
@@ -278,7 +313,7 @@ impl PluginProcess {
             pid,
             logs,
             child: Arc::new(Mutex::new(Some(child))),
-            stdin,
+            write_tx,
             pending,
             next_id: Arc::new(Mutex::new(1)),
         })
@@ -348,14 +383,24 @@ impl PluginProcess {
     }
 
     fn write(&self, line: &str) -> Result<(), CallError> {
-        let mut guard = self
-            .stdin
+        let guard = self
+            .write_tx
             .lock()
-            .map_err(|_| CallError::Transport("stdin lock poisoned".into()))?;
-        let w = guard
-            .as_mut()
+            .map_err(|_| CallError::Transport("write channel lock poisoned".into()))?;
+        let tx = guard
+            .as_ref()
             .ok_or_else(|| CallError::Gone("stdin already closed".into()))?;
-        write_line(w, line).map_err(|e| CallError::Transport(e.to_string()))
+        // try_send, never send: a full channel means the plugin has stopped
+        // reading its stdin, and the caller must learn that as an error, not by
+        // blocking a thread the whole host shares.
+        tx.try_send(line.to_string()).map_err(|e| match e {
+            std::sync::mpsc::TrySendError::Full(_) => CallError::Gone(
+                "the plugin has stopped reading its stdin (write backlog full)".into(),
+            ),
+            std::sync::mpsc::TrySendError::Disconnected(_) => {
+                CallError::Gone("the plugin's stdin writer has exited".into())
+            }
+        })
     }
 
     /// The `plugin.init` handshake.
@@ -426,7 +471,10 @@ impl PluginProcess {
     }
 
     fn close_stdin(&self) {
-        if let Ok(mut g) = self.stdin.lock() {
+        // Dropping the sender disconnects the channel; the writer thread drains
+        // what it already accepted, then drops ChildStdin, which is EOF to the
+        // plugin — its second exit signal after `plugin.shutdown`.
+        if let Ok(mut g) = self.write_tx.lock() {
             g.take();
         }
     }
@@ -434,6 +482,15 @@ impl PluginProcess {
     pub fn kill(&self) {
         if let Ok(mut g) = self.child.lock() {
             if let Some(child) = g.as_mut() {
+                // Kill the TREE, not just the direct child. A plugin's entry is
+                // routinely a shim (a .cmd launching node, a script launching a
+                // real binary); Child::kill terminates only the shim and orphans
+                // the grandchild, which keeps holding its hardware and its
+                // inherited pipe handles. Proven twice in this repo's own test
+                // runs: a killed test plugin's node grandchild survived and held
+                // a pipeline open past a ten-minute timeout. services/registry
+                // learned this lesson first; reuse its taskkill machinery.
+                crate::services::registry::kill_process_tree(child.id());
                 let _ = child.kill();
                 let _ = child.wait();
             }
@@ -963,6 +1020,52 @@ process.stdin.on("data", (chunk) => {
             // already know is gone.
             let r = waiter.join().expect("thread");
             assert!(matches!(r, Err(CallError::Gone(_))), "got {r:?}");
+        }
+
+        #[test]
+        fn a_plugin_that_never_reads_stdin_cannot_wedge_shutdown() {
+            // The review's blocker: writes used to hold a mutex across a
+            // blocking pipe write, so a plugin that stopped draining stdin
+            // froze the supervisor, the event thread, stop() and app exit.
+            // This plugin never reads AT ALL — the worst case.
+            let Some(f) = Fixture::new() else { return };
+            fs::write(
+                f.dir.join("plugin.mjs"),
+                // Stays alive, ignores stdin entirely.
+                "setInterval(() => {}, 1000);\n",
+            )
+            .unwrap();
+            let (p, _, _) = spawn(&f);
+
+            // Flood well past the channel bound. Every call must RETURN — an
+            // error is fine, a hang is the bug.
+            let start = std::time::Instant::now();
+            let mut errors = 0;
+            for i in 0..400 {
+                if p.request(
+                    "plugin.health",
+                    serde_json::json!({ "n": i }),
+                    Duration::from_millis(50),
+                )
+                .is_err()
+                {
+                    errors += 1;
+                }
+            }
+            assert!(errors > 0, "an unread stdin must eventually surface as errors");
+
+            // And shutdown must complete despite the wedged child — this is the
+            // app-exit guarantee the old code violated.
+            p.shutdown();
+            assert!(
+                p.check_exited().is_some(),
+                "shutdown must kill a plugin that ignores it"
+            );
+            assert!(
+                start.elapsed() < Duration::from_secs(40),
+                "the whole ordeal must be bounded, took {:?}",
+                start.elapsed()
+            );
         }
 
         #[test]

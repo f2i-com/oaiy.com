@@ -353,6 +353,23 @@ impl Worker {
             }
         };
 
+        // Drain BOTH pipes on their own threads, from the start. The first cut
+        // read stderr only after exit and stdout never — so a CLI that logged
+        // more than one OS pipe buffer (~4-64 KB; routine for a verbose Node
+        // process) blocked in write(), could never exit, and was killed at the
+        // deadline as a false `timed_out`. The review traced the whole chain,
+        // and this crate documents the identical hazard for plugin stderr.
+        let captured_err = Arc::new(std::sync::Mutex::new(String::new()));
+        if let Some(err) = child.stderr.take() {
+            let sink = captured_err.clone();
+            thread::spawn(move || drain_capped(err, &sink));
+        }
+        let captured_out = Arc::new(std::sync::Mutex::new(String::new()));
+        if let Some(out) = child.stdout.take() {
+            let sink = captured_out.clone();
+            thread::spawn(move || drain_capped(out, &sink));
+        }
+
         // Grace over the CLI's own timeout so the CLI gets to time out FIRST and
         // report which node was stuck — killing from out here loses that.
         let deadline = Instant::now() + timeout + Duration::from_secs(10);
@@ -392,11 +409,10 @@ impl Worker {
             thread::sleep(CHILD_POLL);
         };
 
-        let mut capture = String::new();
-        if let Some(mut err) = child.stderr.take() {
-            use std::io::Read;
-            let _ = err.by_ref().take(MAX_CAPTURE as u64).read_to_string(&mut capture);
-        }
+        let capture = captured_err
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default();
 
         let result = match status {
             Some(st) if st.success() => match std::fs::read_to_string(&out_path) {
@@ -439,6 +455,37 @@ impl Worker {
 
         let _ = std::fs::remove_dir_all(&scratch);
         result
+    }
+}
+
+/// Read a pipe to EOF, keeping at most [`MAX_CAPTURE`] bytes.
+///
+/// The read must continue past the cap — stopping would refill the pipe and
+/// recreate the deadlock the cap exists to report on. Late bytes overwrite
+/// nothing; the buffer simply stops growing, and `tail_of` later keeps the end.
+fn drain_capped<R: std::io::Read>(mut reader: R, sink: &std::sync::Mutex<String>) {
+    let mut buf = [0u8; 8192];
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                if let Ok(mut s) = sink.lock() {
+                    if s.len() < MAX_CAPTURE {
+                        let room = MAX_CAPTURE - s.len();
+                        let chunk = String::from_utf8_lossy(&buf[..n]);
+                        if chunk.len() <= room {
+                            s.push_str(&chunk);
+                        } else {
+                            let mut end = room;
+                            while end > 0 && !chunk.is_char_boundary(end) {
+                                end -= 1;
+                            }
+                            s.push_str(&chunk[..end]);
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
