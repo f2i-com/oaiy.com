@@ -35,7 +35,9 @@
 //! (Python venvs, llama.cpp, a Playwright browser).
 
 pub mod ledger;
+pub mod routes;
 
+pub use routes::{router as bridge_router, BridgeState};
 pub use ledger::{
     ClaimOutcome, Ledger, LedgerHandle, LineageRef, ReserveOutcome, RunError, RunErrorCode,
     RunRecord, RunRequest, RunStatus, Runtime,

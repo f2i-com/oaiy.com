@@ -1059,9 +1059,28 @@ pub fn run() {
             let downloads_for_http = downloads.clone();
             let python_for_http = python.clone();
             let catalog_for_http = catalog.clone();
+            // Plugins live under the data dir so relocating that folder takes them
+            // along. Plugins hold their own state — Aokie keeps phone pairing keys
+            // in its data dir — and leaving that behind on a move reads as data loss.
+            let plugins_root_for_http = data_dir.join("plugins");
+            // A stable per-install id, so run history on a consumer can tell two
+            // machines apart. Derived from the data dir rather than minted fresh
+            // each launch, which would make every restart look like a new device.
+            let device_id_for_http = crate::stable_device_id(&data_dir);
             let config_provider: Arc<dyn http::ConfigProvider> =
                 Arc::new(TauriConfigProvider { app: app_handle });
             tauri::async_runtime::spawn(async move {
+                // Bridge state. The plugins root sits under the data dir so a
+                // relocated data folder takes its plugins with it — plugins hold
+                // their own state (Aokie keeps phone pairing keys), and leaving
+                // that behind on a move would look like data loss.
+                let bridge_for_http = crate::bridge::BridgeState {
+                    ledger: crate::bridge::ledger::new_handle(),
+                    plugins: crate::plugins::registry::new_handle(
+                        plugins_root_for_http.clone(),
+                    ),
+                    device_id: device_id_for_http.clone(),
+                };
                 if let Err(e) = http::serve(
                     DESKTOP_PORT,
                     config_provider,
@@ -1074,6 +1093,7 @@ pub fn run() {
                     downloads_for_http,
                     python_for_http,
                     catalog_for_http,
+                    bridge_for_http,
                 )
                 .await
                 {
@@ -1185,3 +1205,16 @@ pub fn run() {
         });
 }
 } // mod gui
+
+/// A stable per-install device id.
+///
+/// Derived from the data dir path rather than minted per launch: a consumer
+/// reads `deviceId` to attribute runs to a machine, and a fresh id every restart
+/// would make one PC look like an endless stream of new devices in run history.
+/// Hashed rather than sent raw because the path contains the OS username.
+pub fn stable_device_id(data_dir: &std::path::Path) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    data_dir.to_string_lossy().to_lowercase().hash(&mut h);
+    format!("dev_{:016x}", h.finish())
+}
