@@ -1374,3 +1374,9 @@ select:disabled { cursor: not-allowed; opacity: 0.5; }
     transition-duration: 0.001ms !important;
   }
 }
+
+/* Rotating spinner for in-flight plugin actions (Start/Stop). The other panels
+   use a static LoaderCircle; a rotation reads better on a button that is
+   actively working. */
+.spin { animation: spin-rotate 0.9s linear infinite; }
+@keyframes spin-rotate { to { transform: rotate(360deg); } }
