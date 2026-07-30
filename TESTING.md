@@ -1,7 +1,7 @@
 # Testing
 
-Four independent suites, one per deployable. None of them need a fixture
-database or a mocking framework — they drive the real thing.
+Six independent suites. None of them need a fixture database or a mocking
+framework — they drive the real thing.
 
 | Suite | Where | Needs a running service? | Run |
 |---|---|---|---|
@@ -30,14 +30,23 @@ cd api
 composer install
 cp .env.example .env          # SQLite by default; set DB_DRIVER=mysql for MySQL
 php bin/migrate.php
-php -S 127.0.0.1:8080 -t public/   &    # see the caveat below
+php -S 127.0.0.1:8081 -t public/   &    # see the caveat below
 composer test                            # or: php tests/smoke.php http://api.oaiy.local
 ```
 
-`composer test` defaults to `http://127.0.0.1:8080`. If something else owns that
-port (llama.cpp's server defaults to it too) the suite aborts with exit 2 and
-tells you what actually answered, rather than failing 40 assertions. Pass a base
-URL to override: `composer test -- http://127.0.0.1:8081`.
+`composer test` defaults to `http://127.0.0.1:8081`. If something else owns that
+port the suite aborts with exit 2 and tells you what actually answered, rather
+than failing 40 assertions about missing hashes. Pass a base URL to override:
+`composer test -- http://api.oaiy.local`.
+
+That guard has paid for itself twice, so don't remove it. Once on the companion
+port, where an unrelated app answered `/api/health` with a matching shape — the
+UI went green while every authenticated call 401'd. And once here: both READMEs
+used to recommend `:8080` for the API, which is llama.cpp's own default port and
+where WAMP's Apache usually sits. Pointed there, the suite got a 415 and "gzip is
+not supported by this browser" from Apache, which is how the collision surfaced.
+`:8081` is now the documented port precisely so the API and a local LLM engine
+can run at the same time.
 
 It creates flows, drives the run queue through to a terminal state, checks both
 hash-auth boundaries, trips the rate limit, and deletes what it made. It is safe
@@ -77,11 +86,11 @@ npm run test:e2e       # terminal 2
 npm run test:e2e -- http://localhost:4173    # or against `vite preview`
 ```
 
-Checks all three pages in **both themes**: clean console, shell rendered,
-cross-page nav, flow creation, and that every design token resolves. Also holds
-regression cases for the shell rewrite — the project name staying editable
-alongside an open flow, the flow name being keyboard-reachable, and the topbar
-actions not clipping as the window narrows.
+92 assertions. Checks all three pages in **both themes**: clean console, shell
+rendered, cross-page nav, flow creation, and that every design token resolves.
+Also holds regression cases for the shell rewrite — the project name staying
+editable alongside an open flow, the flow name being keyboard-reachable, and the
+topbar actions not clipping as the window narrows.
 
 Set `VITE_API_BASE` if you want the desktop page's service library populated;
 without it that fetch fails and the suite tolerates it.
@@ -97,6 +106,25 @@ against an api that sends no `Access-Control-Allow-Credentials`, so *every*
 browser↔api call threw "Failed to fetch" — sharing, autosave, the run long-poll,
 heartbeat, result reporting — while Settings' bare-`fetch` "Test Connection"
 still reported the backend as reachable.
+
+### Fonts and third-party requests
+
+The last block asserts, on all three pages, that the two self-hosted families
+load and that **nothing is requested from a third party**. Both halves are
+regression guards for failures that made no sound.
+
+The app used to `<link>` Inter and JetBrains Mono from `fonts.googleapis.com`, so
+every page load reported the reader to Google — in a product whose landing page
+sells "nothing leaves your device". Self-hosting them then broke twice over: the
+`@font-face` rules declare the family `Inter Variable` while the CSS tokens asked
+for `Inter`, and Tailwind v4 inlines an `@import` *without rebasing the relative
+`url()`s inside it*, so the rules pointed at files Vite never emitted. Every page
+rendered in Segoe UI with no console warning and no visual cue.
+
+So the check does not stop at `document.fonts.check()` — that answers about the
+family, not about whether glyphs arrived. It measures text rendered in each face
+against a deliberately missing family and requires the widths to differ. Equal
+widths mean a silent fallback.
 
 ## Node contracts
 
