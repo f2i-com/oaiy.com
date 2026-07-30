@@ -36,8 +36,10 @@
 
 pub mod ledger;
 pub mod routes;
+pub mod triggers;
 
 pub use routes::{router as bridge_router, BridgeState};
+pub use triggers::{dispatch, BindingMode, DispatchOutcome, Event, SkipReason, TriggerBinding};
 pub use ledger::{
     ClaimOutcome, Ledger, LedgerHandle, LineageRef, ReserveOutcome, RunError, RunErrorCode,
     RunRecord, RunRequest, RunStatus, Runtime,
