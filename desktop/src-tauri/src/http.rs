@@ -572,6 +572,7 @@ fn is_privileged_path(method: &Method, path: &str) -> bool {
                     | "/api/python/install"
             ) || (path.starts_with("/api/services/") && path.ends_with("/uninstall"))
                 || is_bridge_exec_path(path)
+                || is_ai_exec_path(path)
         }
         // PUT is only used by the bridge (flow documents). A flow doc is
         // executable code the worker hands to the CLI, so it is exec surface.
@@ -581,6 +582,7 @@ fn is_privileged_path(method: &Method, path: &str) -> bool {
                 || path.starts_with("/api/models/")
                 || path.starts_with("/api/python/venvs/")
                 || is_bridge_exec_path(path)
+                || is_ai_exec_path(path)
         }
         _ => false,
     }
@@ -616,6 +618,17 @@ fn is_bridge_exec_path(path: &str) -> bool {
             && (path.ends_with("/start")
                 || path.ends_with("/stop")
                 || path.ends_with("/enabled")))
+}
+
+/// The AI gateway surface: provider CRUD + credential admin AND the chat/models
+/// proxy that spends the stored key. ALL of it takes the exec-surface gate
+/// (trusted origin OR bearer/paired token, fail-closed on a missing Origin) — an
+/// anonymous local page must not reconfigure a provider, plant a key, or spend
+/// the user's API credits. The path prefix covers `/api/ai/providers*` (config)
+/// and `/api/ai/{v1,providers/:id/v1}/*` (the gateway). GET reads are handled by
+/// `is_restricted_read_path`, not here.
+fn is_ai_exec_path(path: &str) -> bool {
+    path.starts_with("/api/ai/")
 }
 
 /// GET /api/services/:id/export returns the FULL ServiceTemplate — including `run.env` (which a
@@ -654,6 +667,10 @@ fn is_restricted_read_path(path: &str) -> bool {
         // able to poll for its own token), only the listing `/api/bridge/pairing`.
         || path == "/api/bridge/pairing"
         || path == "/api/bridge/pairings"
+        // The AI gateway's reads: sources union + provider listing (names, base
+        // URLs, hasKey/enabled — no secret) and the models proxy. Not for an
+        // arbitrary remote page; a paired token or a trusted origin passes.
+        || path.starts_with("/api/ai/")
 }
 
 /// Stricter allow-list for privileged endpoints: OAIY Desktop's OWN webview and
@@ -860,6 +877,9 @@ pub async fn serve(
     // Bridge Protocol v1 surface. Passed in rather than constructed here so the
     // GUI and the headless server can share one ledger with their own lifetimes.
     bridge: crate::bridge::BridgeState,
+    // AI gateway provider store (holds provider API keys). Built at the call site
+    // where the data dir is known; the AI router pairs it with the registry below.
+    ai_providers: crate::ai::providers::ProviderStoreHandle,
 ) -> Result<(), BoxError> {
     // CORS stays permissive so a hosted oaiy-web at any domain can READ the
     // API (the localhost bind keeps non-local processes out). State-changing
@@ -877,6 +897,10 @@ pub async fn serve(
         ])
         .allow_headers(Any);
 
+    // The AI sources union needs to read the services registry; clone the handle
+    // before `registry` is moved into AppState below.
+    let registry_for_ai = registry.clone();
+
     let state = AppState {
         config,
         registry,
@@ -892,6 +916,14 @@ pub async fn serve(
     // the auth guard can validate paired tokens.
     let pairing_for_auth = bridge.pairing.clone();
     let bridge_routes = crate::bridge::bridge_router(bridge);
+
+    // The AI gateway is its own sub-router with its own state (provider store +
+    // registry clone), merged INSIDE the guard layers like the bridge — provider
+    // CRUD and the credential-injecting chat proxy need the same origin/token gate.
+    let ai_routes = crate::ai::ai_router(crate::ai::AiState {
+        providers: ai_providers,
+        registry: registry_for_ai,
+    });
 
     let app = Router::new()
         .route("/api/health", get(health))
@@ -931,6 +963,7 @@ pub async fn serve(
         // origin/token gate as the services routes. Adding them after `.layer()`
         // would leave them ungated — reachable by any web page the user has open.
         .merge(bridge_routes)
+        .merge(ai_routes)
         .layer(middleware::from_fn_with_state(
             AuthConfig { token: auth_token, gui_mode, pairing: Some(pairing_for_auth) },
             origin_guard,
@@ -994,6 +1027,34 @@ mod tests {
         // Seeing WHO is asking, and which apps are paired, is the UI's alone.
         assert!(is_restricted_read_path("/api/bridge/pairing"), "the pending list is gated");
         assert!(is_restricted_read_path("/api/bridge/pairings"), "the paired list is gated");
+    }
+
+    #[test]
+    fn ai_gateway_is_gated_like_the_exec_surface() {
+        use axum::http::Method;
+        // Provider config + credential admin AND the credential-spending gateway
+        // are all privileged for mutations — an anonymous local page must not
+        // reconfigure a provider, plant a key, or spend the user's API credits.
+        for (m, path) in [
+            (Method::POST, "/api/ai/providers"),
+            (Method::DELETE, "/api/ai/providers/openai"),
+            (Method::POST, "/api/ai/providers/openai/key"),
+            (Method::POST, "/api/ai/providers/openai/test"),
+            (Method::POST, "/api/ai/v1/chat/completions"),
+            (Method::POST, "/api/ai/providers/openai/v1/chat/completions"),
+        ] {
+            assert!(is_privileged_path(&m, path), "{m} {path} must be privileged");
+        }
+        // The reads (sources union, provider listing, models) are restricted —
+        // gated against an arbitrary remote page, open to a paired token / trusted origin.
+        for path in [
+            "/api/ai/sources",
+            "/api/ai/providers",
+            "/api/ai/v1/models",
+            "/api/ai/providers/openai/v1/models",
+        ] {
+            assert!(is_restricted_read_path(path), "{path} must be a restricted read");
+        }
     }
 
     #[test]

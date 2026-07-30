@@ -5,6 +5,7 @@
 //! Phase 2: load the service registry, manage child processes, expose
 //! /api/services/* and stop everything cleanly on exit.
 
+pub mod ai;
 pub mod http;
 pub mod services;
 pub mod bridge;
@@ -1084,6 +1085,11 @@ pub fn run() {
                 // Managed so the Exit arm can stop plugin children alongside
                 // services — an orphaned plugin keeps holding its hardware.
                 app_for_http.manage(bridge_for_http.host.clone());
+                // AI provider store under <data>/ai so it moves with the data dir
+                // (like bridge/pairings.json). Holds provider API keys plaintext,
+                // guarded by the full/public split — never over the wire.
+                let ai_providers_for_http =
+                    crate::ai::open_handle(data_dir_for_bridge.join("ai").join("providers.json"));
                 if let Err(e) = http::serve(
                     DESKTOP_PORT,
                     config_provider,
@@ -1097,6 +1103,7 @@ pub fn run() {
                     python_for_http,
                     catalog_for_http,
                     bridge_for_http,
+                    ai_providers_for_http,
                 )
                 .await
                 {
