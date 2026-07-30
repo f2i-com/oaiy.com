@@ -23,6 +23,7 @@ import ServicesPanel from './ServicesPanel';
 import ModelsPanel from './ModelsPanel';
 import PythonPanel from './PythonPanel';
 import PluginsPanel from './PluginsPanel';
+import PairingPrompt from './PairingPrompt';
 import SettingsPanel from './SettingsPanel';
 
 /**
@@ -330,6 +331,7 @@ export default function App() {
               the next view opens at the previous one's scroll offset, i.e.
               mid-content. */}
           <div className="content-page" key={view}>
+            <PairingPrompt />
             <div className="page-intro">
               <div>
                 <span className="kicker">{page.kicker}</span>

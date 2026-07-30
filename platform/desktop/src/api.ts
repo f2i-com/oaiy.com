@@ -357,6 +357,38 @@ export interface PluginsSnapshot {
   scan: { added: number; unchanged: number; invalid: number };
 }
 
+// ----- pairing (a consumer earning a bearer token) -----
+
+export interface PendingPairing {
+  pairingId: string;
+  product: string;
+  label?: string;
+  origin?: string;
+  code: string;
+  status: 'pending' | 'approved' | 'denied' | 'expired';
+  createdAtMs: number;
+}
+
+export interface PairedApp {
+  id: string;
+  product: string;
+  label?: string;
+  createdAtMs: number;
+}
+
+export const pairing = {
+  /** Pending requests awaiting the user's approval (privileged — the webview). */
+  pending: () => request<{ pending: PendingPairing[] }>('/api/bridge/pairing'),
+  approve: (id: string) =>
+    request<void>(`/api/bridge/pairing/${encodeURIComponent(id)}/approve`, { method: 'POST' }),
+  deny: (id: string) =>
+    request<void>(`/api/bridge/pairing/${encodeURIComponent(id)}/deny`, { method: 'POST' }),
+  /** Apps currently paired (secret-free). */
+  paired: () => request<{ paired: PairedApp[] }>('/api/bridge/pairings'),
+  revoke: (id: string) =>
+    request<void>(`/api/bridge/pairings/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+};
+
 export const plugins = {
   list: () => request<PluginsSnapshot>('/api/plugins'),
   start: (id: string) =>
