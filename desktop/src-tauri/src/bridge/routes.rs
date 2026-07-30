@@ -854,7 +854,9 @@ async fn create_pairing(
 
 /// The consumer polls for approval. Open — a pairingId is an unguessable handle,
 /// and the token is only ever returned to whoever holds it. Returns the status
-/// and, once approved, the token exactly once for the consumer to store.
+/// and, once approved, the token for the consumer to store. Re-fetchable by the
+/// id-holder until the request ages out (so a dropped response can retry), not
+/// single-use — the unguessable id and the TTL bound the exposure.
 async fn poll_pairing(State(st): State<BridgeState>, Path(id): Path<String>) -> axum::response::Response {
     match st.pairing.lock() {
         Ok(mut mgr) => match mgr.poll(&id) {

@@ -163,8 +163,10 @@ impl PairingManager {
     }
 
     /// The consumer polls this. Returns the request WITH its token once approved.
-    /// A request the caller has already collected the token for stays approved
-    /// but the token is only handed out once.
+    /// The token stays re-fetchable by whoever holds the (unguessable) pairingId
+    /// until the request ages out — deliberately NOT single-use, so a transport
+    /// blip mid-collection can retry and still land the token. The exposure is
+    /// bounded by the 128-bit id (only the requester knows it) and the TTL sweep.
     pub fn poll(&mut self, pairing_id: &str) -> Option<PairingRequest> {
         self.sweep_expired();
         self.pending.iter().find(|r| r.pairing_id == pairing_id).cloned()
