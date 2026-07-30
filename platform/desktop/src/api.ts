@@ -316,6 +316,64 @@ export const python = {
     }),
 };
 
+// ----- plugins (Bridge Protocol) -----
+
+export type PluginState =
+  | 'installed'
+  | 'stopped'
+  | 'starting'
+  | 'running'
+  | 'unhealthy'
+  | 'crashed'
+  | 'disabled';
+
+/** One plugin as the registry reports it (`GET /api/plugins`). */
+export interface PluginRecord {
+  id: string;
+  state: PluginState;
+  /** Present for every state that is not `running`. */
+  reason?: string;
+  dir: string;
+  manifest?: {
+    name: string;
+    version: string;
+    publisher?: string;
+    description?: string;
+    connectors?: Array<{ id: string; commands: string[] }>;
+    events?: string[];
+  };
+  /** Capability names rewritten from a pre-OAIY spelling, for a UI nudge. */
+  legacyCapabilities?: Array<[string, string]>;
+  /** Declared capabilities that grant nothing (a typo, or a name OAIY has no
+   *  equivalent for). Worth surfacing so a mystery denial has a cause. */
+  unknownCapabilities?: string[];
+  userDisabled: boolean;
+  restartAttempts: number;
+}
+
+export interface PluginsSnapshot {
+  plugins: PluginRecord[];
+  root: string;
+  scan: { added: number; unchanged: number; invalid: number };
+}
+
+export const plugins = {
+  list: () => request<PluginsSnapshot>('/api/plugins'),
+  start: (id: string) =>
+    request<void>(`/api/plugins/${encodeURIComponent(id)}/start`, { method: 'POST' }),
+  stop: (id: string) =>
+    request<void>(`/api/plugins/${encodeURIComponent(id)}/stop`, { method: 'POST' }),
+  setEnabled: (id: string, enabled: boolean) =>
+    request<PluginRecord>(`/api/plugins/${encodeURIComponent(id)}/enabled`, {
+      method: 'POST',
+      body: JSON.stringify({ enabled }),
+    }),
+  logs: (id: string, tail = 200) =>
+    request<{ lines: LogLine[] }>(
+      `/api/plugins/${encodeURIComponent(id)}/logs?tail=${tail}`,
+    ),
+};
+
 // ----- formatting helpers used by multiple components -----
 
 export function formatBytes(n: number | null | undefined): string {

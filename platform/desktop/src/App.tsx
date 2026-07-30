@@ -9,6 +9,7 @@ import {
   LockKeyhole,
   Moon,
   Package,
+  Plug,
   Server,
   Settings2,
   Sun,
@@ -21,6 +22,7 @@ import { applyTheme, initialTheme, THEME_LABEL, type ThemeMode } from './theme';
 import ServicesPanel from './ServicesPanel';
 import ModelsPanel from './ModelsPanel';
 import PythonPanel from './PythonPanel';
+import PluginsPanel from './PluginsPanel';
 import SettingsPanel from './SettingsPanel';
 
 /**
@@ -43,12 +45,13 @@ interface HealthResponse {
   version: string;
 }
 
-type View = 'services' | 'models' | 'python' | 'settings';
+type View = 'services' | 'plugins' | 'models' | 'python' | 'settings';
 
 const WEB_APP_URL = 'https://oaiy.com/app.html';
 
 const NAV: { value: View; label: string; icon: LucideIcon }[] = [
   { value: 'services', label: 'Services', icon: Server },
+  { value: 'plugins', label: 'Plugins', icon: Plug },
   { value: 'models', label: 'Models', icon: Package },
   { value: 'python', label: 'Python', icon: HardDrive },
 ];
@@ -63,6 +66,12 @@ const PAGE: Record<View, { crumb: string; kicker: string; title: string; copy: s
     kicker: 'Connections',
     title: 'Local AI services',
     copy: 'Start, stop and install the engines this machine exposes to OAIY.',
+  },
+  plugins: {
+    crumb: 'Plugins',
+    kicker: 'Extensions',
+    title: 'Plugins',
+    copy: 'Supervised extensions that add connectors and events — like the Aokie phone bridge.',
   },
   models: {
     crumb: 'Models',
@@ -329,6 +338,7 @@ export default function App() {
               </div>
             </div>
             {view === 'services' && <ServicesPanel />}
+            {view === 'plugins' && <PluginsPanel />}
             {view === 'models' && <ModelsPanel />}
             {view === 'python' && <PythonPanel />}
             {view === 'settings' && <SettingsPanel />}
