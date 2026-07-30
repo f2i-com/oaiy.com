@@ -49,8 +49,14 @@ php bin/migrate.php
 ## Run (dev)
 
 ```bash
-php -S 0.0.0.0:8080 -t public/
+php -S 0.0.0.0:8081 -t public/
 ```
+
+> **Why 8081 and not 8080?** Because `llama.cpp` — a service this product
+> downloads and launches for you — binds `:8080` by default (see
+> `service-library/llama-cpp-server.json`). Running the API there means the
+> moment a user starts their local LLM engine, one of the two fails to bind and
+> the other looks broken. `:8081` keeps the whole stack able to run at once.
 
 > **`php -S` cannot serve the long-poll properly.** The built-in server is
 > single-threaded, and `GET /api/flows/{hash_edit}/runs/pending` deliberately
@@ -64,7 +70,7 @@ php -S 0.0.0.0:8080 -t public/
 > this platform`), so use a real server — see the Apache/nginx sections below.
 > `php -S` is fine for single-client poking at the non-polling routes.
 
-Then `curl http://localhost:8080/` should respond:
+Then `curl http://localhost:8081/` should respond:
 
 ```json
 { "name": "oaiy-api", "docs": "..." }
