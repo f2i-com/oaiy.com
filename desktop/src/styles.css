@@ -53,7 +53,11 @@
 
   --text: #f4f7ff;
   --muted: #98a6bd;
-  --faint: #66758d;
+  /* Lifted from the prototype's #66758d: there it dressed 7-9px decorative
+     labels, but this app puts real content on it (engine detail, dock
+     sublabels, service meta, log timestamps). #66758d is ~3.9:1 on the card
+     surfaces — under the 4.5:1 floor for body text. #8592ab clears it. */
+  --faint: #8592ab;
 
   --border: #202a3c;
   --strong-border: #33425c;
@@ -106,7 +110,8 @@
 
   --text: #171717;
   --muted: #68645e;
-  --faint: #918b82;
+  /* Same reasoning as Prism Lab: #918b82 is ~2.9:1 on paper. */
+  --faint: #6f6a63;
 
   --border: #cec8be;
   --strong-border: #9f998f;

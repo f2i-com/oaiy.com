@@ -105,13 +105,13 @@ The Share dialog (header button when sharing is enabled) calls `POST /api/flows`
 
 ### Optional password encryption
 
-Setting a password on the Share dialog enables **AES-GCM (256-bit) + PBKDF2-SHA256 (250k iters)** client-side encryption. The backend never sees plaintext — only an opaque envelope `{$enc, kdf, iter, salt, iv, ct}`. Opening an encrypted shared link triggers a password prompt; wrong-password decrypt is detected by GCM auth-tag failure and re-prompts up to 5 times. Lose the password = lose the flow (we genuinely can't recover it).
+Setting a password on the Share dialog enables **AES-GCM (256-bit) + PBKDF2-SHA256 (600k iters)** client-side encryption. The backend never sees plaintext — only an opaque envelope `{$enc, kdf, iter, salt, iv, ct}`. Opening an encrypted shared link triggers a password prompt; wrong-password decrypt is detected by GCM auth-tag failure and re-prompts up to 5 times. Lose the password = lose the flow (we genuinely can't recover it).
 
 ### Driving a flow from an AI
 
 Hand any HTTP-capable AI the **edit URL** plus a one-shot prompt:
 
-> Read `https://api.oaiy.com/api/flows/<hash_edit>/manifest` — that gives you the current graph + the inputs the flow accepts + the node catalogue. Build a payload that fills the inputs. POST it to `https://api.oaiy.com/api/flows/<hash_edit>/runs`. Poll `https://api.oaiy.com/api/runs/<id>` until status is `done` or `error`.
+> Read `https://api.oaiy.com/api/flows/<hash_edit>/manifest` — that gives you the current graph + the inputs the flow accepts + the node catalogue. Build a payload that fills the inputs. POST it to `https://api.oaiy.com/api/flows/<hash_edit>/runs`. The response carries a `poll` path — follow it (`https://api.oaiy.com/api/flows/<hash_edit>/runs/<id>`) until status is `done` or `error`. Runs are flow-scoped, so the hash is part of the poll URL.
 
 The browser dispatcher (`ui/src/lib/backendDispatcher.ts`) long-polls `/api/flows/<hash_edit>/runs/pending` (~20s window per request). When a queued run appears it claims it atomically (optimistic concurrency on the `runs` table), hands it to the local executor, and POSTs the result back to `/api/runs/<id>/result`. Encrypted flows have their inputs/results encrypted in-transit the same way the flow body is.
 
