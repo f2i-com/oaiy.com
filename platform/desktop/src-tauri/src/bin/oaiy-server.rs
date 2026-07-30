@@ -315,10 +315,13 @@ async fn main() {
         data_dir.clone(),
         oaiy_desktop_lib::stable_device_id(&data_dir),
     );
+    // AI provider store under <data>/ai (holds provider API keys plaintext,
+    // guarded by the full/public split — never over the wire).
+    let ai_providers = oaiy_desktop_lib::ai::open_handle(data_dir.join("ai").join("providers.json"));
 
     // gui_mode = false: headless server is token-strict (no webview origin).
     if let Err(e) = http::serve(
-        port, config, auth_token, false, registry, downloads, python, catalog, bridge,
+        port, config, auth_token, false, registry, downloads, python, catalog, bridge, ai_providers,
     )
     .await
     {
