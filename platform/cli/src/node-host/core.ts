@@ -121,7 +121,27 @@ async function httpRequest(args: InvokeArgs): Promise<unknown> {
       r.allow_private_networks === true || process.env.OAIY_HTTP_ALLOW_LOCAL === '1';
     const confined = fsConfinementOn() && !allowLocal;
     const init: RequestInit = { method, headers, body, signal: ac.signal };
-    const resp = confined ? await ssrfSafeFetch(url, init) : await fetch(url, init);
+    let resp: Response;
+    try {
+      resp = confined ? await ssrfSafeFetch(url, init) : await fetch(url, init);
+    } catch (e) {
+      // Node's fetch throws a bare `TypeError: fetch failed` and hides the real
+      // reason on `.cause`. Surfaced verbatim through the runtime that became
+      // "Error: TypeError: fetch failed" in the job log — no URL, no reason, so a
+      // flow pointing at a service that isn't running looked identical to a DNS
+      // failure or a TLS error. Re-throw with the method, the URL, and whatever
+      // the cause chain actually says.
+      const cause = (e as { cause?: unknown }).cause;
+      const causeMsg =
+        cause instanceof Error
+          ? `${(cause as NodeJS.ErrnoException).code ?? cause.name}: ${cause.message}`
+          : cause
+            ? String(cause)
+            : e instanceof Error
+              ? e.message
+              : String(e);
+      throw new Error(`${method} ${url} failed — ${causeMsg}`, { cause: e });
+    }
     const respHeaders: Record<string, string> = {};
     resp.headers.forEach((v, k) => {
       respHeaders[k] = v;

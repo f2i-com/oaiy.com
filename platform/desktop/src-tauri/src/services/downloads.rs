@@ -471,7 +471,43 @@ impl Downloads {
         // distinct URLs could spawn unbounded tasks/connections/.part writes
         // and exhaust the tray app.
         const MAX_CONCURRENT_DOWNLOADS: usize = 8;
-        if let Ok(g) = self.progress.lock() {
+
+        let id = Uuid::new_v4().to_string();
+        let progress = DownloadProgress {
+            id: id.clone(),
+            url: normalised.clone(),
+            filename: chosen_filename.clone(),
+            subdir: subdir.map(|s| s.to_string()),
+            dest_path: dest.display().to_string(),
+            status: DownloadStatus::Queued,
+            bytes_downloaded: 0,
+            bytes_total: None,
+            started_at: Utc::now(),
+            finished_at: None,
+            error: None,
+            resumable: None,
+            speed_bps: None,
+            eta_secs: None,
+        };
+
+        // Dedup, cap and insert must be ONE critical section. These were three
+        // separate lock acquisitions, which made both guards check-then-act: two
+        // concurrent POST /api/models/download calls for the same URL each looked,
+        // saw no in-flight row (neither had inserted yet), and both spawned a
+        // transfer onto the same .part file — interleaved writes to one path. The
+        // cap raced the same way (two callers both seeing in_flight == 7). Holding
+        // the lock across the decision AND the insert makes the winner visible to
+        // the loser. Registering the row before spawn_transfer also means the
+        // spawn can no longer outrun its own bookkeeping.
+        //
+        // A poisoned lock is now fatal rather than silently ignored: proceeding
+        // past a poisoned registry is exactly how the duplicate transfer happened.
+        {
+            let mut g = self
+                .progress
+                .lock()
+                .map_err(|_| "download registry lock poisoned".to_string())?;
+
             if let Some(existing) = g.values().find(|p| {
                 p.url == normalised
                     && matches!(
@@ -494,26 +530,7 @@ impl Downloads {
                     "too many concurrent downloads ({MAX_CONCURRENT_DOWNLOADS} max) — wait for some to finish"
                 ));
             }
-        }
 
-        let id = Uuid::new_v4().to_string();
-        let progress = DownloadProgress {
-            id: id.clone(),
-            url: normalised.clone(),
-            filename: chosen_filename.clone(),
-            subdir: subdir.map(|s| s.to_string()),
-            dest_path: dest.display().to_string(),
-            status: DownloadStatus::Queued,
-            bytes_downloaded: 0,
-            bytes_total: None,
-            started_at: Utc::now(),
-            finished_at: None,
-            error: None,
-            resumable: None,
-            speed_bps: None,
-            eta_secs: None,
-        };
-        if let Ok(mut g) = self.progress.lock() {
             g.insert(id.clone(), progress);
         }
 
@@ -550,14 +567,23 @@ impl Downloads {
     /// byte counter; if the server refuses, the .part is wiped and we
     /// restart from 0 (with a warning surfaced on `error`).
     pub fn resume(&self, id: &str) -> Result<(), String> {
-        let (url, dest, status) = {
-            let g = self.progress.lock().map_err(|_| "lock poisoned")?;
-            let p = g.get(id).ok_or("unknown download")?;
-            (p.url.clone(), PathBuf::from(&p.dest_path), p.status)
+        // CLAIM the download atomically: check the state and flip it to Queued
+        // under ONE lock. This used to read the status, drop the lock, then check
+        // and spawn — so two concurrent resume() calls on the same paused row both
+        // saw Paused, both passed, and both spawned a transfer that reopens the
+        // same .part with .append(true). Interleaved appends corrupt the file and
+        // the byte counter. Transitioning inside the critical section means the
+        // second caller sees Queued and takes the error path instead.
+        let (url, dest) = {
+            let mut g = self.progress.lock().map_err(|_| "lock poisoned")?;
+            let p = g.get_mut(id).ok_or("unknown download")?;
+            if !matches!(p.status, DownloadStatus::Paused | DownloadStatus::Failed) {
+                return Err(format!("can't resume download in state {:?}", p.status));
+            }
+            p.status = DownloadStatus::Queued;
+            p.error = None;
+            (p.url.clone(), PathBuf::from(&p.dest_path))
         };
-        if !matches!(status, DownloadStatus::Paused | DownloadStatus::Failed) {
-            return Err(format!("can't resume download in state {status:?}"));
-        }
         // Resume from the ACTUAL bytes on disk, not the throttle-lagged counter.
         // Every chunk is write_all'd in order, but `bytes_downloaded` only advances
         // on the ~1 MiB / 250 ms emit tick — so the .part is up to ~1 MiB longer
@@ -574,9 +600,9 @@ impl Downloads {
         let resume_from = std::fs::metadata(part_path_for(&dest))
             .map(|m| m.len())
             .unwrap_or(0);
+        // Status/error already set while claiming above; only the offset is left,
+        // and it needed file I/O so it's computed outside the lock.
         self.update(id, |p| {
-            p.status = DownloadStatus::Queued;
-            p.error = None;
             p.bytes_downloaded = resume_from;
         });
         self.spawn_transfer(id.to_string(), url, dest, resume_from);

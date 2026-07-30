@@ -60,12 +60,25 @@ export class BoundedMap<K, V> {
     return value;
   }
 
-  set(key: K, value: V): this {
+  /**
+   * Store a value. Returns **false** when the value was rejected for exceeding
+   * `maxValueSize`, true when it was stored.
+   *
+   * This deliberately does not return `this` (Map's fluent convention). A refusal
+   * used to be indistinguishable from success, and the one caller — the Agent
+   * memory module — went on to persist the value to the database anyway. So the
+   * write "succeeded", but a later `memory('get')` read from this map and got
+   * null; on the next run the persisted row was re-inserted here, rejected
+   * again, and stayed permanently unreadable. `append` compounded it: past the
+   * threshold, every append read a stale in-memory value and silently lost
+   * entries. Callers must now check.
+   */
+  set(key: K, value: V): boolean {
     // Check value size
     const valueSize = this.estimateSize(value);
     if (valueSize > this.maxValueSize) {
       console.warn(`[BoundedMap] Value too large (${valueSize} bytes), max is ${this.maxValueSize}`);
-      return this;
+      return false;
     }
 
     // If key exists, delete it first (for LRU ordering)
@@ -84,7 +97,7 @@ export class BoundedMap<K, V> {
     }
 
     this.map.set(key, value);
-    return this;
+    return true;
   }
 
   delete(key: K): boolean {

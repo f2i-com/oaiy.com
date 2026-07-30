@@ -1223,7 +1223,17 @@ impl Registry {
         // run before replacing it. Runner has no Drop, so simply overwriting
         // svc.runner below would orphan the old process (zombie + port conflict).
         if let Some(old) = svc.runner.take() {
-            kill_process_tree(old.pid);
+            // Only kill the tree if that process is STILL OURS. Reaching here
+            // after a crash or a failed health check is the common case, and a
+            // dead child's pid is not just useless — the OS recycles pids, so
+            // `kill_process_tree` on a stale one force-kills whatever unrelated
+            // process now holds it. check_exited() reaps and reports: None means
+            // still running (safe to kill), Some(code) means already gone.
+            match old.check_exited() {
+                None => kill_process_tree(old.pid),
+                Some(_code) => { /* already exited — pid may be recycled, do not touch it */ }
+            }
+            // Idempotent, and reaps the child if check_exited() didn't.
             let _ = old.stop();
         }
         svc.set_status(ServiceStatus::Starting, None);

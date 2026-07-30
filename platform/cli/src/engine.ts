@@ -7,7 +7,7 @@
 // Side effect: install window.__TAURI__ before any shared code reads it.
 import './node-host/core';
 import { createEngine } from '../../ui/src/engine/createEngine';
-import type { WorkflowGraph } from 'oaiy-core';
+import type { Flow, WorkflowGraph } from 'oaiy-core';
 import { loadNodeBundledModules } from './generated/bundled-modules';
 import { closeAll as closeBrowserSessions } from './node-host/browser';
 
@@ -19,6 +19,12 @@ export interface RunOptions {
   /** Auto-allow local-network (private IP) requests. Default true for headless. */
   allowLocalNetwork?: boolean;
   flowName?: string;
+  /**
+   * Every flow available for subflow/macro resolution, including the entry flow.
+   * The compiler looks its subflow and macro targets up by id in this list, so
+   * without it those nodes silently fall through to the unknown-type passthrough.
+   */
+  availableFlows?: Flow[];
 }
 
 export interface RunResult {
@@ -41,6 +47,9 @@ export async function runFlow(graph: WorkflowGraph, opts: RunOptions = {}): Prom
   await loadNodeBundledModules();
 
   const engine = createEngine({
+    // Subflow and macro nodes resolve their target by id out of this list. It was
+    // never passed, so those nodes could not execute headlessly at all.
+    availableFlows: opts.availableFlows,
     projectConstants: opts.constants,
     networkPermissionHandler: async () => ({
       allowed: opts.allowLocalNetwork !== false,

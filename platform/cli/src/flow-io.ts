@@ -4,11 +4,22 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { unzipSync, strFromU8 } from 'fflate';
-import type { WorkflowGraph } from 'oaiy-core';
+import type { Flow, WorkflowGraph } from 'oaiy-core';
 
 export interface LoadedFlow {
   graph: WorkflowGraph;
   name: string;
+  /**
+   * Every flow in the file, including the entry one.
+   *
+   * Needed because subflow and macro nodes resolve their target by id out of
+   * the compiler's `availableFlows`. Loading only `flows[0].graph` (which is all
+   * this used to return) meant a flow containing a subflow or macro node could
+   * never execute headlessly — the target was simply not present, so the node
+   * fell through the compiler's unknown-type passthrough. Empty for the bare
+   * `{ nodes, edges }` shapes, which cannot contain a resolvable reference.
+   */
+  flows?: Flow[];
 }
 
 /** Accept the common on-disk shapes a saved flow can take. */
@@ -24,12 +35,21 @@ function normalizeGraph(data: any): WorkflowGraph {
   throw new Error('Unrecognized flow file shape — expected { nodes, edges }.');
 }
 
+/** Pull every flow out of a project-shaped file, for subflow/macro resolution. */
+function siblingFlows(data: any): Flow[] | undefined {
+  if (!Array.isArray(data?.flows)) return undefined;
+  const flows = data.flows.filter(
+    (f: any) => f && typeof f.id === 'string' && Array.isArray(f?.graph?.nodes),
+  ) as Flow[];
+  return flows.length > 0 ? flows : undefined;
+}
+
 export function loadFlowFile(file: string): LoadedFlow {
   const ext = path.extname(file).toLowerCase();
   const name = path.basename(file, ext);
   if (ext === '.oaiy') return loadPackage(file, name);
   const data = JSON.parse(fs.readFileSync(file, 'utf-8'));
-  return { graph: normalizeGraph(data), name };
+  return { graph: normalizeGraph(data), name, flows: siblingFlows(data) };
 }
 
 /** Load a `.oaiy` package (a zip): manifest.json → entryFlow → graph. */

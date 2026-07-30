@@ -52,7 +52,7 @@ program
   .option('--quiet', 'suppress progress logs on stderr', false)
   .action(async (flowPath: string, opts: Record<string, any>) => {
     const { runFlow } = await import('./engine');
-    const { graph, name } = loadFlowFile(flowPath);
+    const { graph, name, flows } = loadFlowFile(flowPath);
     const inputs = parseInputs(opts.input ?? [], opts.inputs);
     const constants = gatherConstants(opts.constant ?? [], opts.constants);
 
@@ -63,6 +63,9 @@ program
     const res = await runFlow(graph, {
       inputs,
       constants,
+      // Without this, a flow containing a subflow or macro node can't run
+      // headlessly — the compiler resolves those targets by id out of this list.
+      availableFlows: flows,
       flowName: name,
       timeoutMs: opts.timeout ? opts.timeout * 1000 : undefined,
     });
