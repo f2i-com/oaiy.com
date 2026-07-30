@@ -32,13 +32,23 @@ const HEARTBEAT_MS = 30_000;
 /** Parse the `→ <status>:` we encode in apiJson errors; 0 = network/no-status. */
 const httpStatusOf = (msg: string): number => Number((msg.match(/→ (\d{3}):/) || [])[1]) || 0;
 
+/**
+ * Detect the browser's encrypted envelope.
+ *
+ * Must match what actually produces one — `encryptPayload` in
+ * ui/src/lib/flowCrypto.ts emits `{ $enc: 'aes-gcm/pbkdf2', kdf, iter, salt, iv,
+ * ct }`. This used to look for a `ciphertext` field, which nothing in the system
+ * has ever emitted, so the guard never fired: an encrypted flow fell through to
+ * extractGraph(), yielded no nodes, and the worker "ran" it and reported the run
+ * as done. The `$enc` tag is the canonical marker; ct/iv is a shape fallback.
+ */
+const ENC_ENVELOPE_TAG = 'aes-gcm/pbkdf2';
+
 function isEncrypted(x: unknown): boolean {
-  return (
-    !!x &&
-    typeof x === 'object' &&
-    typeof (x as Record<string, unknown>).ciphertext === 'string' &&
-    typeof (x as Record<string, unknown>).iv === 'string'
-  );
+  if (!x || typeof x !== 'object') return false;
+  const o = x as Record<string, unknown>;
+  if (o.$enc === ENC_ENVELOPE_TAG) return true;
+  return typeof o.ct === 'string' && typeof o.iv === 'string';
 }
 
 async function apiJson(

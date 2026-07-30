@@ -10,6 +10,7 @@ database or a mocking framework — they drive the real thing.
 | API end-to-end | `api/tests/smoke.php` | **yes** — the API | `composer test` |
 | Web end-to-end | `ui/tests/e2e.mjs` | **yes** — the dev server | `npm run test:e2e` |
 | CSS token check | `ui/tests/css-tokens.mjs` | no | `npm run test:css` |
+| Node contracts | `ui/tests/node-contracts.mjs` | no | `npm run test:contracts` |
 
 ## Everything that runs without a server
 
@@ -84,6 +85,38 @@ actions not clipping as the window narrows.
 
 Set `VITE_API_BASE` if you want the desktop page's service library populated;
 without it that fetch fails and the suite tolerates it.
+
+Pass an api base as a second argument to exercise the cross-origin CORS case:
+
+```bash
+npm run test:e2e -- http://localhost:5173 http://127.0.0.1:8081
+```
+
+That one is a regression guard. The client briefly used `credentials: 'include'`
+against an api that sends no `Access-Control-Allow-Credentials`, so *every*
+browser↔api call threw "Failed to fetch" — sharing, autosave, the run long-poll,
+heartbeat, result reporting — while Settings' bare-`fetch` "Test Connection"
+still reported the backend as reachable.
+
+## Node contracts
+
+```bash
+cd ui && npm run test:contracts
+```
+
+Checks that every input handle a node declares is actually read by the module
+compiler that handles it. The core compiler keys a node's inputs map strictly on
+`edge.targetHandle`, so a node declaring `text` while its compiler reads `input`
+silently drops every edge into it: the generated code falls back to the literal
+`null`, and the flow compiles, runs and reports **success with wrong output**.
+
+Two nodes were in exactly that state — `text_chunker`, and `input_folder`'s
+documented "optional dynamic path". Nothing else catches this class of bug: it
+type-checks, it builds, and it produces a green run.
+
+Nodes whose inputs are consumed somewhere other than their own module compiler
+(loop, macro and subflow boundaries) are listed explicitly in the test, each with
+the reason, so an exemption can be re-checked rather than trusted forever.
 
 ## What isn't covered
 

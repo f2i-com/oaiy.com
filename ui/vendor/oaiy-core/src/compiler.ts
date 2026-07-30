@@ -1209,7 +1209,19 @@ workflow_context;
         return result;
       }
     } catch (e) {
+      // Do NOT swallow this. Returning null here is indistinguishable from "no
+      // module claimed this node type", and the caller's fallback for that is a
+      // PASSTHROUGH that assigns the node's first input straight to its output.
+      // So a compiler bug used to turn the node into an identity function while
+      // the flow compiled, ran, and reported success — the worst failure mode a
+      // data pipeline has, and invisible unless you had devtools open, since the
+      // compiler has no log callback wired to the job log or the UI.
+      const msg = e instanceof Error ? e.message : String(e);
       console.error(`[Compiler] Module compiler error for ${node.type}:`, e);
+      throw new Error(
+        `Node "${node.id}" (${node.type}) failed to compile in module compiler ` +
+          `"${module.compiler.name}": ${msg}`,
+      );
     }
 
     return null;
