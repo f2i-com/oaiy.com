@@ -35,7 +35,16 @@
 //! installed, and the user's next move — reinstalling — does not help.
 
 pub mod manifest;
+pub mod registry;
 pub mod rpc;
+pub mod runner;
 
 pub use manifest::{ManifestError, PluginManifest, HOST_CAPABILITIES};
+pub use registry::{
+    GateRefusal, PluginRecord, PluginRegistry, PluginRegistryHandle, PluginState, ScanReport,
+};
 pub use rpc::{RpcError, RpcMessage, RpcPeer, MAX_LINE_BYTES};
+pub use runner::{
+    plugin_env, restart_delay, should_restart, HealthTracker, HealthVerdict, HANDSHAKE_TIMEOUT,
+    HEALTH_INTERVAL, MAX_RESTART_ATTEMPTS, SHUTDOWN_GRACE,
+};
