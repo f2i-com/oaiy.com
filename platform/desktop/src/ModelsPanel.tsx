@@ -46,7 +46,7 @@ export default function ModelsPanel() {
   // Catalog only changes when the user edits the JSON, so we fetch once.
   useEffect(() => {
     models.catalog().then(setCatalog).catch(() => {
-      /* non-fatal — Quick add stays hidden if companion is offline */
+      /* non-fatal — Quick add stays hidden if OAIY Desktop is offline */
     });
   }, []);
 

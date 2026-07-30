@@ -1,6 +1,6 @@
 /**
  * Delegation client for `oaiy-server` — the heavy "lifecycle" ops the Node host
- * doesn't do natively. When a flow needs a companion-managed AI service
+ * doesn't do natively. When a flow needs an OAIY Desktop-managed AI service
  * (Ollama, llama.cpp, LTX2, …) started/ensured, the runtime calls
  * `ensure_service_ready(_by_port)`; here we forward that to oaiy-server's HTTP
  * API, which actually spawns/supervises the service. The flow then HTTP-calls

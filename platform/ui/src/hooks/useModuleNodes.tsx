@@ -17,7 +17,7 @@ import {
 import { subscribeToDynamicOptionsInvalidation } from 'oaiy-ui-components';
 import type { PackageNodeInfo } from './usePackageNodes';
 import { listAllServices } from '../utils/serviceRegistry';
-import { listCompanionServices } from '../lib/companionServices';
+import { listDesktopServices } from '../lib/desktopServices';
 import { moduleLogger as logger } from '../utils/logger';
 
 // ============================================
@@ -190,18 +190,18 @@ export function useModuleNodes(options?: UseModuleNodesOptions) {
     // node with data.service pre-pinned. The actual handles + runtime
     // come from the real service_call definition; this is just a nicer
     // palette face.
-    // The user's own services PLUS any the OAIY Companion is currently
+    // The user's own services PLUS any the OAIY Desktop is currently
     // exposing — so a service you start in the desktop app shows up here as
     // a draggable palette entry (id `companion:<id>`), the same as a custom
-    // one. They refresh live: companionServices.publish() fires the same
+    // one. They refresh live: desktopServices.publish() fires the same
     // invalidate that bumps servicesVersion below.
-    const services = [...listAllServices(), ...listCompanionServices()];
+    const services = [...listAllServices(), ...listDesktopServices()];
     const syntheticModule: ModuleManifest = {
       id: 'core-service',
       name: 'Service',
       version: '1.0.0',
       category: 'AI' as ModuleCategory,
-      description: 'Custom + companion-managed services',
+      description: 'Custom + OAIY-Desktop-managed services',
       nodes: [],
     };
     for (const svc of services) {

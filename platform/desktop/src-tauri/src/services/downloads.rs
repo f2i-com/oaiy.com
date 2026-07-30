@@ -122,7 +122,7 @@ fn is_hf_host(url: &str) -> bool {
 
 /// True when an IP is one a model download must NEVER reach: loopback, private (RFC1918),
 /// link-local (incl. the 169.254.169.254 cloud-metadata endpoint), CGNAT, unspecified, etc.
-/// The SSRF guard, so an untrusted catalog/template download URL can't drive the companion
+/// The SSRF guard, so an untrusted catalog/template download URL can't drive OAIY Desktop
 /// into internal services on the user's (possibly cloud/corporate) machine.
 fn is_disallowed_ip(ip: std::net::IpAddr) -> bool {
     use std::net::IpAddr;
@@ -359,7 +359,7 @@ impl Downloads {
     ) -> Result<String, String> {
         let normalised = normalise_hf_url(url)?;
         // SSRF guard: refuse a non-https URL or one pointing at an internal/special address
-        // BEFORE spawning, so an untrusted catalog/template URL can't make the companion probe
+        // BEFORE spawning, so an untrusted catalog/template URL can't make OAIY Desktop probe
         // internal services (and never spawns a task whose status would leak as an oracle).
         validate_download_url(&normalised)?;
         let chosen_filename = match filename {
@@ -683,7 +683,7 @@ async fn run_download(
     update(Box::new(|p| p.status = DownloadStatus::Active));
 
     let client = match reqwest::Client::builder()
-        .user_agent(format!("oaiy-companion/{}", env!("CARGO_PKG_VERSION")))
+        .user_agent(format!("oaiy-desktop/{}", env!("CARGO_PKG_VERSION")))
         // Re-validate every redirect hop: a public host (incl. the HF resolve URL) may 302 to a
         // CDN, but it must stay https and must not point at an internal literal IP (defense over
         // the start() guard, which only sees the original URL). DNS-name hops are followed and

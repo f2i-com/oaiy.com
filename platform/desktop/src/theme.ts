@@ -1,5 +1,5 @@
 /**
- * Theme for the OAIY companion — two named themes from the OAIY design system:
+ * Theme for the OAIY Desktop — two named themes from the OAIY design system:
  *   'dark'  → Prism Lab    (near-black shell, violet primary, signal accents)
  *   'light' → Paper Circuit (warm paper, one blue primary, hard offset shadows)
  *

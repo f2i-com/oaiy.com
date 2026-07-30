@@ -129,7 +129,7 @@ All config lives in `.env`. See `.env.example` for the full list:
 | `MAX_QUEUED_RUNS` | `10` | Per-flow cap on `status='queued'` rows. POSTing past it returns 429. |
 | `RUN_TTL` | `900` | Seconds before a run stuck in `running` is reset to a terminal `error` (floored at 60). |
 | `APP_DEBUG` | `false` | When `true`, 500s return DB/stack detail. Leave `false`/unset in production. |
-| `SERVICE_LIBRARY_DIR` | `service-library` | Folder the companion service library is served from (`GET /api/service-library`). |
+| `SERVICE_LIBRARY_DIR` | `service-library` | Folder OAIY Desktop service library is served from (`GET /api/service-library`). |
 
 ## Layout
 

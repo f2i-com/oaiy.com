@@ -43,11 +43,11 @@ interface ServiceCallNodeProps {
 }
 
 const STORAGE_KEY = 'oaiy.customServices';
-// Services the OAIY Companion is exposing — published here by
-// lib/companionServices.ts (ids prefixed `companion:`). Read so a dragged or
+// Services the OAIY Desktop is exposing — published here by
+// lib/desktopServices.ts (ids prefixed `companion:`). Read so a dragged or
 // picked companion service resolves on the CANVAS too, not just in the
 // Properties panel (whose getService() already falls through to these).
-const COMPANION_STORAGE_KEY = 'oaiy.companionServices';
+const DESKTOP_STORAGE_KEY = 'oaiy.desktopServices';
 
 function readKey(key: string): CustomService[] {
   try {
@@ -68,7 +68,7 @@ function readCustomServices(): CustomService[] {
 function resolveService(id?: string): CustomService | null {
   if (!id) return null;
   // Custom + companion services first so user edits shadow same-id built-ins.
-  const all = [...readCustomServices(), ...readKey(COMPANION_STORAGE_KEY), ...BUILT_IN_SERVICES];
+  const all = [...readCustomServices(), ...readKey(DESKTOP_STORAGE_KEY), ...BUILT_IN_SERVICES];
   return all.find((s) => s.id === id) ?? null;
 }
 

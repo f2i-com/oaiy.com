@@ -43,6 +43,8 @@ interface FlowsSidebarProps {
   hasMacroBeenModified?: (flowId: string) => boolean;
   isOpen: boolean;
   onClose: () => void;
+  /** Expand from the collapsed rail. */
+  onOpen: () => void;
   // Job tracking props
   isFlowRunning?: (flowId: string) => boolean;
   // Multi-package props
@@ -72,6 +74,7 @@ export default function FlowsSidebar({
   hasMacroBeenModified,
   isOpen,
   onClose,
+  onOpen,
   isFlowRunning,
   loadedPackages,
   activePackageFlow,
@@ -272,7 +275,62 @@ export default function FlowsSidebar({
     setContextMenuFlowId(null);
   }, []);
 
-  if (!isOpen) return null;
+  // Collapsed: a narrow rail rather than nothing.
+  //
+  // This used to `return null`, which made the panel vanish with no affordance
+  // left behind — the only way back was a topbar icon nowhere near where the
+  // panel had been, so collapsing it read as "I broke something". A rail keeps
+  // the reopen control exactly where the panel was, and keeps the flow count
+  // visible so the workspace still tells you it has flows in it.
+  //
+  // Only on md+. Below that the panel is an overlay over the canvas, so a
+  // permanent rail would eat scarce width for a control the topbar already
+  // provides — there it still hides completely, with the backdrop to dismiss.
+  if (!isOpen) {
+    return (
+      <div
+        className="hidden md:flex w-11 shrink-0 flex-col items-center gap-3 py-3"
+        style={{
+          backgroundColor: 'rgb(var(--color-bg-elevated))',
+          borderRight: '1px solid rgb(var(--color-border-primary))',
+        }}
+      >
+        <button
+          type="button"
+          onClick={onOpen}
+          className="p-1.5 rounded-md transition-colors hover:bg-slate-200 dark:hover:bg-slate-700"
+          aria-label="Expand the flows panel"
+          aria-expanded={false}
+          title="Expand flows (Ctrl+B)"
+          style={{ color: 'rgb(var(--color-text-secondary))' }}
+        >
+          <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 5l7 7-7 7M5 5l7 7-7 7" />
+          </svg>
+        </button>
+
+        {/* Vertical label + count. `writing-mode` keeps it legible in 44px. */}
+        <button
+          type="button"
+          onClick={onOpen}
+          className="flex-1 flex items-center justify-center cursor-pointer group"
+          aria-hidden
+          tabIndex={-1}
+        >
+          <span
+            className="text-[11px] font-medium tracking-wide whitespace-nowrap transition-colors group-hover:opacity-100"
+            style={{
+              writingMode: 'vertical-rl',
+              transform: 'rotate(180deg)',
+              color: 'rgb(var(--color-text-tertiary))',
+            }}
+          >
+            Flows{flows.length > 0 ? ` · ${flows.length}` : ''}
+          </span>
+        </button>
+      </div>
+    );
+  }
 
   return (
     <>
@@ -425,7 +483,25 @@ export default function FlowsSidebar({
             >
               {loadedPackages && loadedPackages.size > 0 ? 'Your Flows' : 'Flows'}
             </h2>
+            {/* Collapse, on md+. The topbar has a toggle too, but a control in
+                the panel's own header is where you look when you want the panel
+                out of the way. */}
             <button
+              type="button"
+              onClick={onClose}
+              className="hidden md:block p-1 hover:bg-slate-200 dark:hover:bg-slate-700 rounded transition-colors"
+              aria-label="Collapse the flows panel"
+              aria-expanded
+              title="Collapse flows (Ctrl+B)"
+            >
+              <svg className="w-4 h-4 text-slate-500 dark:text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M11 19l-7-7 7-7m8 14l-7-7 7-7" />
+              </svg>
+            </button>
+            {/* Below md the panel is an overlay, so this dismisses rather than
+                collapses — a distinct affordance for distinct behaviour. */}
+            <button
+              type="button"
               onClick={onClose}
               className="md:hidden p-1 hover:bg-slate-200 dark:hover:bg-slate-700 rounded transition-colors"
               aria-label="Close sidebar"

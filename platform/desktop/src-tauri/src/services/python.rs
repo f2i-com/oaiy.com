@@ -1,6 +1,6 @@
 //! Embedded Python runtime + venv management.
 //!
-//! The companion bundles a portable Python distribution (python-build-
+//! OAIY Desktop bundles a portable Python distribution (python-build-
 //! standalone) under `${dataDir}/python/`. Services that need Python
 //! (ComfyUI, custom scripts, etc.) reference this single interpreter and
 //! create venvs under `${dataDir}/venvs/<name>/`. Venvs are user-named
@@ -442,7 +442,7 @@ fn install_python_native(dest: &Path, logs: &LogBuffer) -> Result<(), String> {
 
     logs.push("stdout", format!("downloading {url}"));
     let client = reqwest::blocking::Client::builder()
-        .user_agent(concat!("oaiy-companion/", env!("CARGO_PKG_VERSION")))
+        .user_agent(concat!("oaiy-desktop/", env!("CARGO_PKG_VERSION")))
         .build()
         .map_err(|e| format!("http client: {e}"))?;
     let mut resp = client

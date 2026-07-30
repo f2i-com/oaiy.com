@@ -31,15 +31,15 @@ The flow lives in the user's browser. Inference happens against THEIR local engi
 ├── ui/        # React + Vite + TypeScript frontend (the visual flow builder)
 ├── cli/       # Headless Node CLI — run flows on a server with no browser (`oaiy`)
 ├── api/       # PHP 8.1+ / Slim 4 backend — sharing + AI-driven runs (SQLite or MySQL)
-├── desktop/   # Tauri 2 companion app + `oaiy-server` headless binary — manages local
+├── desktop/   # Tauri 2 desktop app (OAIY Desktop) + `oaiy-server` headless binary — manages local
 │              #   model servers, Python venvs, model downloads + the browser sidecar
 ├── .gitignore
 └── README.md  # you are here
 ```
 
-The parts are independently deployable. `ui/` runs standalone (no backend) and gives the full flow-builder experience; `api/` adds shareable hash URLs + remote AI control; the optional `desktop/` companion lets the browser app drive local model servers, Python, and `browser_*` nodes over a localhost API (see `desktop/README.md`).
+The parts are independently deployable. `ui/` runs standalone (no backend) and gives the full flow-builder experience; `api/` adds shareable hash URLs + remote AI control; the optional `desktop/` app (OAIY Desktop) lets the browser app drive local model servers, Python, and `browser_*` nodes over a localhost API (see `desktop/README.md`).
 
-**Run flows without a browser.** `cli/` shares the *exact same* `oaiy-core` engine as `ui/` via a Node host adapter, so a flow runs identically headless — `oaiy run flow.json` (or `.oaiy`), or `oaiy worker` to drive the `api/` run-queue on a server. The `desktop/` crate also builds **`oaiy-server`**, the companion's service/model API with no GUI, for the same server deployments. See `cli/README.md`.
+**Run flows without a browser.** `cli/` shares the *exact same* `oaiy-core` engine as `ui/` via a Node host adapter, so a flow runs identically headless — `oaiy run flow.json` (or `.oaiy`), or `oaiy worker` to drive the `api/` run-queue on a server. The `desktop/` crate also builds **`oaiy-server`**, OAIY Desktop's service/model API with no GUI, for the same server deployments. See `cli/README.md`.
 
 ## Quick start
 

@@ -18,10 +18,10 @@ import type { ModuleCompiler, ModuleCompilerContext } from 'oaiy-core/src/module
 import { BUILT_IN_SERVICES, type CustomService } from './examples';
 
 const STORAGE_KEY = 'oaiy.customServices';
-// Companion-managed services (Phase 3), published to a separate key by
-// lib/companionServices.ts while the desktop companion is running. Read
+// OAIY-Desktop-managed services (Phase 3), published to a separate key by
+// lib/desktopServices.ts while the OAIY Desktop is running. Read
 // inline so this bundled compiler stays self-contained.
-const COMPANION_SERVICE_STORAGE_KEY = 'oaiy.companionServices';
+const DESKTOP_SERVICE_STORAGE_KEY = 'oaiy.desktopServices';
 
 function readServiceKey(key: string): CustomService[] {
   try {
@@ -45,7 +45,7 @@ function resolveService(id: string): CustomService | null {
   // live companion services (`companion:*` ids), then built-in examples.
   const all = [
     ...getCustomServices(),
-    ...readServiceKey(COMPANION_SERVICE_STORAGE_KEY),
+    ...readServiceKey(DESKTOP_SERVICE_STORAGE_KEY),
     ...BUILT_IN_SERVICES,
   ];
   return all.find((s) => s.id === id) ?? null;

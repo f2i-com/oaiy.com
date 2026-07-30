@@ -4,7 +4,7 @@ import {
   formatBytes,
   isTauri,
   openInExplorer,
-  type CompanionConfig,
+  type DesktopConfig,
   type MigratePlan,
   type MigrationProgress,
 } from './api';
@@ -22,7 +22,7 @@ import { useToast } from './Toasts';
  * pointer file and applies on the next launch.
  */
 export default function SettingsPanel() {
-  const [cfg, setCfg] = useState<CompanionConfig | null>(null);
+  const [cfg, setCfg] = useState<DesktopConfig | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [manualPath, setManualPath] = useState('');
   const [busy, setBusy] = useState(false);

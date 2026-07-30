@@ -115,12 +115,12 @@ const WEB_HIDDEN_NODE_IDS = new Set<string>([
   // USED to be hidden here: in a plain browser the chromium ops
   // (click/type/scroll/screenshot) had no backend and silently failed.
   //
-  // As of Phase 4b they're driven by the OAIY Companion's managed
+  // As of Phase 4b they're driven by the OAIY Desktop's managed
   // "Playwright Browser" service: core-browser/runtime.ts routes every
   // chromium-session op to `http://127.0.0.1:<port>/session/...` when
-  // there's no native Tauri host. With the companion + that service
+  // there's no native Tauri host. With OAIY Desktop + that service
   // running they work end-to-end; without it they throw an *actionable*
-  // error ("start the OAIY Companion / install Playwright Browser")
+  // error ("start the OAIY Desktop / install Playwright Browser")
   // instead of silently no-op'ing. So they're unhidden — strictly
   // better than the old hide-because-broken behaviour.
   //

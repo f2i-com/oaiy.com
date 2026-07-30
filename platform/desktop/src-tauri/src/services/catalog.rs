@@ -8,7 +8,7 @@
 //!
 //! Why on-disk + user-editable instead of fully baked-in?
 //!   - The set of "popular models this month" drifts; users want to add
-//!     their team's favourites without waiting for a companion release
+//!     their team's favourites without waiting for an OAIY Desktop release
 //!   - One pattern matches services + scripts (seed-on-first-run +
 //!     editable) so there's nothing new for the user to learn
 

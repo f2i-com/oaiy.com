@@ -49,7 +49,7 @@ pub struct ServiceTemplate {
     #[serde(default)]
     pub uninstall: Option<UninstallSpec>,
 
-    /// A placeholder-expanded path the companion writes when this service's installer EXITS 0,
+    /// A placeholder-expanded path OAIY Desktop writes when this service's installer EXITS 0,
     /// and checks for `installed`. For a venv service whose interpreter exists right after the
     /// venv is created (step 1) — BEFORE the multi-GB pip/model download that can fail — the
     /// interpreter merely existing isn't "installed"; this marker, written only on success, is.

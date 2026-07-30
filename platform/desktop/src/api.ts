@@ -1,5 +1,5 @@
 /**
- * Typed wrapper around the companion's localhost HTTP API.
+ * Typed wrapper around OAIY Desktop's localhost HTTP API.
  *
  * One module per concern (services / models / python) so the components
  * each pull a focused slice. All requests are JSON in/out and surface
@@ -12,7 +12,7 @@ async function request<T>(
   path: string,
   init?: RequestInit,
 ): Promise<T> {
-  // Bound every call so a wedged companion handler (TCP accepted but no response)
+  // Bound every call so a wedged OAIY Desktop handler (TCP accepted but no response)
   // can't leave the promise pending forever and stack up under the 1.5-2s pollers.
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(), 15000);
@@ -351,8 +351,8 @@ export function formatEta(secs: number | null | undefined): string {
 }
 
 /**
- * Call a Tauri command on the companion's Rust side. Inside the
- * companion webview the `__TAURI_INTERNALS__` global is always present;
+ * Call a Tauri command on OAIY Desktop's Rust side. Inside the
+ * OAIY Desktop webview the `__TAURI_INTERNALS__` global is always present;
  * in a plain browser tab it's absent, so we reject with a clear message.
  */
 export function tauriInvoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
@@ -365,7 +365,7 @@ export function tauriInvoke<T>(cmd: string, args?: Record<string, unknown>): Pro
   return tauri.invoke(cmd, args ?? {}) as Promise<T>;
 }
 
-/** Whether we're running inside the companion's Tauri webview. */
+/** Whether we're running inside OAIY Desktop's Tauri webview. */
 export function isTauri(): boolean {
   return !!(window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
 }
@@ -395,7 +395,7 @@ export function openExternal(url: string): void {
 
 // ----- config (data dir) — Tauri commands, desktop-only -----
 
-export interface CompanionConfig {
+export interface DesktopConfig {
   /** The dir the running app is actually using right now. */
   activeDir: string;
   /** OS default (what "Reset" returns to). */
@@ -454,7 +454,7 @@ export interface MigrationProgress {
 }
 
 export const appConfig = {
-  get: () => tauriInvoke<CompanionConfig>('get_config'),
+  get: () => tauriInvoke<DesktopConfig>('get_config'),
   setDataDir: (path: string) => tauriInvoke<void>('set_data_dir', { path }),
   /** Set (or reset, with '') the models folder — separate from the data dir. */
   setModelsDir: (path: string) => tauriInvoke<void>('set_models_dir', { path }),

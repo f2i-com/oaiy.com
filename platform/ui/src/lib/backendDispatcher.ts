@@ -157,7 +157,7 @@ async function apiJson<T>(
     //
     // 'include' bought nothing anyway: the api issues no cookies at all and
     // authenticates DELETE with the X-Owner-Token header. This matches what
-    // companionDetection.ts and companionServices.ts already do.
+    // desktopDetection.ts and desktopServices.ts already do.
     credentials: 'omit',
   });
   // 204 = empty success (heartbeat); 200/201/202 = JSON body.

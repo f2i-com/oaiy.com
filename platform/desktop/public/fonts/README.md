@@ -1,6 +1,6 @@
 # Bundled fonts
 
-Two self-hosted web fonts so the companion renders identically offline — no
+Two self-hosted web fonts so OAIY Desktop renders identically offline — no
 Google Fonts request, which also means no third-party call from an app whose
 whole pitch is that nothing leaves your device.
 

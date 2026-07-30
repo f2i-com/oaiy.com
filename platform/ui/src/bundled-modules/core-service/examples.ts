@@ -294,7 +294,7 @@ export const BUILT_IN_SERVICES: CustomService[] = [
       'Works with InstructPix2Pix servers, SDXL inpaint webhooks, or any custom edit endpoint that accepts JSON {prompt, image}.',
   },
   {
-    // ByteDance Lance, served by the OAIY Companion's lance_server.py
+    // ByteDance Lance, served by the OAIY Desktop's lance_server.py
     // (JSON API at /generate, Gradio UI at /ui, default port 17900). The
     // body template carries the gen knobs (edit seconds/seed/steps/size
     // inline on the node); {{prompt}} is the connected text input. The
@@ -304,7 +304,7 @@ export const BUILT_IN_SERVICES: CustomService[] = [
     name: 'Lance — Text → Video',
     icon: '🎬',
     description:
-      "ByteDance Lance text-to-video via the OAIY Companion's Lance service (port 17900). Connect a text prompt; outputs a playable video URL. Tweak seconds/seed/steps/size in the body template.",
+      "ByteDance Lance text-to-video via the OAIY Desktop's Lance service (port 17900). Connect a text prompt; outputs a playable video URL. Tweak seconds/seed/steps/size in the body template.",
     endpoint: 'http://127.0.0.1:17900/generate',
     method: 'POST',
     headers: '{}',
@@ -320,7 +320,7 @@ export const BUILT_IN_SERVICES: CustomService[] = [
     ],
     outputs: [{ id: 'response', name: 'Video', type: 'video' }],
     installHint:
-      "Install + start 'Lance (Image+Video)' in the OAIY Companion (Services tab). JSON API at http://127.0.0.1:17900/generate, Lance UI at http://127.0.0.1:17900/ui. The first generation loads the model (slow); later ones reuse it. Needs a large GPU (~40GB peak for 480p).",
+      "Install + start 'Lance (Image+Video)' in the OAIY Desktop (Services tab). JSON API at http://127.0.0.1:17900/generate, Lance UI at http://127.0.0.1:17900/ui. The first generation loads the model (slow); later ones reuse it. Needs a large GPU (~40GB peak for 480p).",
   },
   {
     // Same Lance service, image task -> returns an absolute imageUrl.
@@ -328,7 +328,7 @@ export const BUILT_IN_SERVICES: CustomService[] = [
     name: 'Lance — Text → Image',
     icon: '🎨',
     description:
-      "ByteDance Lance text-to-image via the OAIY Companion's Lance service (port 17900). Connect a text prompt; outputs an image URL. Tweak seed/steps/size in the body template.",
+      "ByteDance Lance text-to-image via the OAIY Desktop's Lance service (port 17900). Connect a text prompt; outputs an image URL. Tweak seed/steps/size in the body template.",
     endpoint: 'http://127.0.0.1:17900/generate',
     method: 'POST',
     headers: '{}',
@@ -344,11 +344,11 @@ export const BUILT_IN_SERVICES: CustomService[] = [
     ],
     outputs: [{ id: 'response', name: 'Image', type: 'image' }],
     installHint:
-      "Install + start 'Lance (Image+Video)' in the OAIY Companion (Services tab). JSON API at http://127.0.0.1:17900/generate, Lance UI at http://127.0.0.1:17900/ui. The first generation loads the model (slow); later ones reuse it.",
+      "Install + start 'Lance (Image+Video)' in the OAIY Desktop (Services tab). JSON API at http://127.0.0.1:17900/generate, Lance UI at http://127.0.0.1:17900/ui. The first generation loads the model (slow); later ones reuse it.",
   },
   {
     // Lightricks LTX-2.3 distilled (text → video + audio), served by the
-    // OAIY Companion's ltx2_server.py (JSON /generate, default port 17890).
+    // OAIY Desktop's ltx2_server.py (JSON /generate, default port 17890).
     // The distilled pipeline runs two stages internally (half-res gen → 2×
     // spatial upscale → refine). Body carries the gen knobs; {{prompt}} is
     // the connected text input. Returns an ABSOLUTE videoUrl for direct
@@ -359,7 +359,7 @@ export const BUILT_IN_SERVICES: CustomService[] = [
     name: 'LTX-2.3 — Text → Video',
     icon: '🎬',
     description:
-      "Lightricks LTX-2.3 distilled text-to-video (with audio) via the OAIY Companion's LTX-2.3 service (port 17890). Connect a text prompt; outputs a playable video URL. Tune size/frames/seed in the body template (dims ÷64, frames = 8k+1).",
+      "Lightricks LTX-2.3 distilled text-to-video (with audio) via the OAIY Desktop's LTX-2.3 service (port 17890). Connect a text prompt; outputs a playable video URL. Tune size/frames/seed in the body template (dims ÷64, frames = 8k+1).",
     endpoint: 'http://127.0.0.1:17890/generate',
     method: 'POST',
     headers: '{}',
@@ -375,7 +375,7 @@ export const BUILT_IN_SERVICES: CustomService[] = [
     ],
     outputs: [{ id: 'response', name: 'Video', type: 'video' }],
     installHint:
-      "Install + start 'LTX-2.3 Video' in the OAIY Companion (Services tab), and add the folder holding the LTX-2.3 weights under Settings → Model Folders (e.g. E:\\ckpts). JSON API at http://127.0.0.1:17890/generate. The first generation loads the 22B model (slow); later ones reuse it. Needs a ~32 GB GPU; the server auto-picks the freest one.",
+      "Install + start 'LTX-2.3 Video' in the OAIY Desktop (Services tab), and add the folder holding the LTX-2.3 weights under Settings → Model Folders (e.g. E:\\ckpts). JSON API at http://127.0.0.1:17890/generate. The first generation loads the 22B model (slow); later ones reuse it. Needs a ~32 GB GPU; the server auto-picks the freest one.",
   },
 ];
 

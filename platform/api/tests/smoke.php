@@ -108,7 +108,7 @@ ok('GET / advertises a docs url', is_string($root['body']['docs'] ?? null) && st
 // confusing message about a missing hash rather than the actual problem. Say
 // what is wrong and stop.
 //
-// This check earned its keep twice. Once on the companion port, where another
+// This check earned its keep twice. Once on the OAIY Desktop port, where another
 // app answered /api/health with a matching shape so the UI went green while every
 // authenticated call 401'd. And once here: the README used to recommend :8080 for
 // the API — llama.cpp's own default — and pointing this test there got a 415 and
