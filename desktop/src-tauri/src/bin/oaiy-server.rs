@@ -310,11 +310,11 @@ async fn main() {
 
     // Plugins live under the data dir so relocating it takes them along; they
     // hold their own state and leaving it behind reads as data loss.
-    let bridge = oaiy_desktop_lib::bridge::BridgeState {
-        ledger: oaiy_desktop_lib::bridge::ledger::new_handle(),
-        plugins: oaiy_desktop_lib::plugins::registry::new_handle(data_dir.join("plugins")),
-        device_id: oaiy_desktop_lib::stable_device_id(&data_dir),
-    };
+    let bridge = oaiy_desktop_lib::build_bridge_state(
+        data_dir.join("plugins"),
+        data_dir.clone(),
+        oaiy_desktop_lib::stable_device_id(&data_dir),
+    );
 
     // gui_mode = false: headless server is token-strict (no webview origin).
     if let Err(e) = http::serve(

@@ -1063,6 +1063,8 @@ pub fn run() {
             // along. Plugins hold their own state — Aokie keeps phone pairing keys
             // in its data dir — and leaving that behind on a move reads as data loss.
             let plugins_root_for_http = data_dir.join("plugins");
+            let data_dir_for_bridge = data_dir.clone();
+            let app_for_http = app.handle().clone();
             // A stable per-install id, so run history on a consumer can tell two
             // machines apart. Derived from the data dir rather than minted fresh
             // each launch, which would make every restart look like a new device.
@@ -1074,13 +1076,14 @@ pub fn run() {
                 // relocated data folder takes its plugins with it — plugins hold
                 // their own state (Aokie keeps phone pairing keys), and leaving
                 // that behind on a move would look like data loss.
-                let bridge_for_http = crate::bridge::BridgeState {
-                    ledger: crate::bridge::ledger::new_handle(),
-                    plugins: crate::plugins::registry::new_handle(
-                        plugins_root_for_http.clone(),
-                    ),
-                    device_id: device_id_for_http.clone(),
-                };
+                let bridge_for_http = crate::build_bridge_state(
+                    plugins_root_for_http.clone(),
+                    data_dir_for_bridge.clone(),
+                    device_id_for_http.clone(),
+                );
+                // Managed so the Exit arm can stop plugin children alongside
+                // services — an orphaned plugin keeps holding its hardware.
+                app_for_http.manage(bridge_for_http.host.clone());
                 if let Err(e) = http::serve(
                     DESKTOP_PORT,
                     config_provider,
@@ -1192,6 +1195,13 @@ pub fn run() {
                 // processes. Done synchronously — the user just clicked
                 // Quit and is waiting; a few hundred ms is fine.
                 RunEvent::Exit => {
+                    // Plugins first: they are lighter to stop than model servers,
+                    // and a plugin holding hardware (Aokie's dongle) should get
+                    // its graceful shutdown before anything slow runs.
+                    if let Some(host) = app_handle.try_state::<std::sync::Arc<crate::plugins::PluginHost>>() {
+                        log::info!("stopping all plugins on exit");
+                        host.stop_all();
+                    }
                     if let Some(reg) = app_handle.try_state::<RegistryHandle>() {
                         // Recover from a poisoned mutex — stopping services on exit
                         // matters more than poison-safety (else they're orphaned).
@@ -1205,6 +1215,43 @@ pub fn run() {
         });
 }
 } // mod gui
+
+/// Build the bridge state both binaries share: ledger, plugin registry + host,
+/// trigger store, flow store — and start the flow worker.
+///
+/// One constructor rather than two hand-rolled blocks, because the two binaries
+/// drifting apart here means "works in the GUI, broken headless" (or vice
+/// versa), which is the least-tested path by definition.
+pub fn build_bridge_state(
+    plugins_root: std::path::PathBuf,
+    data_dir: std::path::PathBuf,
+    device_id: String,
+) -> bridge::BridgeState {
+    let ledger = bridge::ledger::new_handle();
+    let plugins = plugins::registry::new_handle(plugins_root);
+    let triggers: plugins::TriggerStoreHandle = std::sync::Arc::new(std::sync::Mutex::new(
+        plugins::TriggerStore::load(data_dir.join("triggers.json")),
+    ));
+    let host = plugins::PluginHost::new(
+        plugins.clone(),
+        ledger.clone(),
+        triggers,
+        env!("CARGO_PKG_VERSION").to_string(),
+        cfg!(debug_assertions),
+    );
+    let flows = std::sync::Arc::new(bridge::FlowStore::new(data_dir.join("flows")));
+    // The worker owns nothing the state needs back; its stop flag is dropped
+    // deliberately — it runs for the process lifetime, and the ledger being
+    // in-memory means there is nothing to hand over on exit.
+    let _ = bridge::Worker::start(ledger.clone(), flows.clone(), device_id.clone());
+    bridge::BridgeState {
+        ledger,
+        plugins,
+        host,
+        flows,
+        device_id,
+    }
+}
 
 /// A stable per-install device id.
 ///

@@ -178,6 +178,18 @@ pub struct RunRequest {
     pub caller_product: String,
     pub flow_id: Option<String>,
     pub inline_graph: bool,
+    /// The flow's named inputs. Stored on the record because the worker that
+    /// CLAIMS the run is not the caller that reserved it — without this, a
+    /// claimed run would execute with no inputs and "succeed" on empty data,
+    /// which is the quiet-wrong-output failure the protocol forbids.
+    pub input: Option<serde_json::Value>,
+    /// Wall-clock budget for execution. `None` = the runner's default.
+    pub timeout_ms: Option<u64>,
+    /// `sync` | `async` | `queued`. The desktop's own worker must NOT claim
+    /// `queued` runs — those are reserved for an external claimer (a browser
+    /// session, a remote worker). Auto-claiming them would race the very
+    /// consumer that asked for reserve-without-execution.
+    pub mode: String,
     pub correlation_id: String,
     pub idempotency_key: String,
     pub lineage: LineageRef,
@@ -196,6 +208,19 @@ pub struct RunRecord {
     pub flow_id: Option<String>,
     pub correlation_id: String,
     pub idempotency_key: String,
+    /// Named flow inputs, carried so the claimer can execute. See [`RunRequest`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+    pub mode: String,
+    /// Set when a caller asked a RUNNING run to stop. The run stays `Running` —
+    /// cancellation is a request, not a state — but the worker polls this flag
+    /// and kills the child when it flips. Without recording it, `cancel` on a
+    /// running run was acknowledged (202) and then went nowhere: no field
+    /// existed for the runner to observe.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub cancel_requested: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runtime: Option<Runtime>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -295,6 +320,10 @@ impl Ledger {
             flow_id: req.flow_id.clone(),
             correlation_id: req.correlation_id.clone(),
             idempotency_key: req.idempotency_key.clone(),
+            input: req.input.clone(),
+            timeout_ms: req.timeout_ms,
+            mode: req.mode.clone(),
+            cancel_requested: false,
             runtime: None,
             claimed_by: None,
             output: None,
@@ -464,13 +493,32 @@ impl Ledger {
                 ));
                 Ok(RunStatus::Cancelled)
             }
-            RunStatus::Running => Ok(RunStatus::Running),
+            RunStatus::Running => {
+                rec.cancel_requested = true;
+                Ok(RunStatus::Running)
+            }
             other => Err(format!("run {run_id} is already {other:?}")),
         }
     }
 
     pub fn get(&self, run_id: &str) -> Option<RunRecord> {
         self.runs.get(run_id).cloned()
+    }
+
+    /// Runs the DESKTOP'S OWN worker may claim: queued status, and not
+    /// `mode: "queued"` — those are reserved for an external claimer, and
+    /// auto-claiming them would race the very consumer that asked for
+    /// reserve-without-execution.
+    pub fn claimable_by_worker(&self, limit: usize) -> Vec<RunRecord> {
+        let mut q: Vec<_> = self
+            .runs
+            .values()
+            .filter(|r| r.status == RunStatus::Queued && r.mode != "queued")
+            .cloned()
+            .collect();
+        q.sort_by_key(|r| r.reserved_at_ms);
+        q.truncate(limit);
+        q
     }
 
     /// Claimable runs, oldest first — a worker polls this then claims.
@@ -511,6 +559,9 @@ mod tests {
             caller_product: "formlogic".into(),
             flow_id: Some("caller-lookup".into()),
             inline_graph: false,
+            input: Some(serde_json::json!({"phone": "+61400000000"})),
+            timeout_ms: Some(30_000),
+            mode: "async".into(),
             correlation_id: "call_abc".into(),
             idempotency_key: key.into(),
             lineage: LineageRef::default(),
@@ -707,6 +758,9 @@ mod tests {
             caller_product: "formlogic".into(),
             flow_id: Some("handler".into()),
             inline_graph: false,
+            input: None,
+            timeout_ms: None,
+            mode: "async".into(),
             correlation_id: "c".into(),
             idempotency_key: key.into(),
             lineage: LineageRef {

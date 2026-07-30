@@ -34,12 +34,14 @@
 //! that quietly fails to appear is indistinguishable from one that was never
 //! installed, and the user's next move — reinstalling — does not help.
 
+pub mod host;
 pub mod manifest;
 pub mod process;
 pub mod registry;
 pub mod rpc;
 pub mod runner;
 
+pub use host::{ForwardError, PluginHost, ReceivedEvent, TriggerStore, TriggerStoreHandle, CONNECTOR_TIMEOUT};
 pub use process::{CallError, PluginProcess, SpawnOptions};
 pub use manifest::{ManifestError, PluginManifest, HOST_CAPABILITIES};
 pub use registry::{
