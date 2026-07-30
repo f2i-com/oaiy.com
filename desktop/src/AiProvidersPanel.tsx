@@ -23,11 +23,6 @@ const DEFAULT_BASE: Record<AiProtocol, string> = {
   anthropic: 'https://api.anthropic.com',
 };
 
-const MODEL_HINT: Record<AiProtocol, string> = {
-  openai: 'gpt-4o-mini',
-  anthropic: 'claude-3-5-sonnet-latest',
-};
-
 interface FormState {
   id: string;
   name: string;
@@ -233,9 +228,10 @@ export default function AiProvidersPanel() {
           </label>
           <label className="form-row">
             <span>Default model (optional)</span>
+            {/* No placeholder model name — model IDs churn too fast to suggest one
+                that stays valid; the user pastes the exact id their provider serves. */}
             <input
               type="text"
-              placeholder={MODEL_HINT[form.protocol]}
               value={form.model}
               onChange={(e) => setForm((f) => ({ ...f, model: e.target.value }))}
             />

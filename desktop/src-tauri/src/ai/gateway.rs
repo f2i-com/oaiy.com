@@ -17,9 +17,8 @@ use serde_json::{json, Value};
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 /// Cap on a buffered (non-streaming) upstream response.
 pub const MAX_RESPONSE_BYTES: u64 = 32 * 1024 * 1024;
-/// Default when an Anthropic request arrives with no model on the profile or body.
-const ANTHROPIC_DEFAULT_MODEL: &str = "claude-3-5-sonnet-latest";
-/// Anthropic requires max_tokens; default when the OpenAI request omits it.
+/// Anthropic requires max_tokens; default when the OpenAI request omits it. (This
+/// is a protocol constant, not a model id — safe to hardcode.)
 const ANTHROPIC_DEFAULT_MAX_TOKENS: u64 = 1024;
 
 /// Closed error taxonomy for the gateway. Mapped to `{error:{code,message}}` by
@@ -104,7 +103,7 @@ async fn read_capped(resp: reqwest::Response) -> Result<Vec<u8>, GatewayError> {
 /// Non-streaming chat. Returns an OpenAI `chat.completion` JSON regardless of the
 /// provider's protocol.
 pub async fn chat(provider: &AiProvider, mut body: Value) -> Result<Value, GatewayError> {
-    default_model(provider, &mut body);
+    ensure_model(provider, &mut body)?;
     if let Some(obj) = body.as_object_mut() {
         obj.remove("provider"); // non-OpenAI routing hint — never forward it
         obj.remove("stream"); // this path is buffered
@@ -146,7 +145,7 @@ pub async fn chat(provider: &AiProvider, mut body: Value) -> Result<Value, Gatew
 /// A non-2xx upstream is buffered (capped) and surfaced as an error so an error
 /// page never masquerades as an event stream.
 pub async fn chat_stream(provider: &AiProvider, mut body: Value) -> Result<reqwest::Response, GatewayError> {
-    default_model(provider, &mut body);
+    ensure_model(provider, &mut body)?;
     if let Some(obj) = body.as_object_mut() {
         obj.remove("provider");
         obj.insert("stream".into(), Value::Bool(true));
@@ -218,7 +217,10 @@ async fn anthropic_probe(provider: &AiProvider) -> Result<(), GatewayError> {
     let model = provider
         .model
         .clone()
-        .unwrap_or_else(|| ANTHROPIC_DEFAULT_MODEL.to_string());
+        .filter(|m| !m.is_empty())
+        .ok_or_else(|| {
+            GatewayError::BadRequest("set a default model for this Anthropic provider before testing".into())
+        })?;
     let body = json!({
         "model": model,
         "max_tokens": 1,
@@ -239,20 +241,24 @@ async fn anthropic_probe(provider: &AiProvider) -> Result<(), GatewayError> {
     Err(GatewayError::Upstream(format!("upstream {status}: {detail}")))
 }
 
-/// Default the model from the profile when the caller omitted it (Anthropic also
-/// falls back to a sane default since it must send a model).
-fn default_model(provider: &AiProvider, body: &mut Value) {
-    if body.get("model").and_then(Value::as_str).is_some() {
-        return;
+/// Ensure the request carries a model: the caller's takes precedence, else the
+/// provider's configured default. There is NO hardcoded fallback — model ids
+/// change too often to bake one in — so if neither is set this is a clear,
+/// actionable error rather than a silently-stale guess.
+fn ensure_model(provider: &AiProvider, body: &mut Value) -> Result<(), GatewayError> {
+    if body.get("model").and_then(Value::as_str).is_some_and(|m| !m.is_empty()) {
+        return Ok(());
     }
-    let model = provider
-        .model
-        .clone()
-        .or_else(|| (provider.protocol == Protocol::Anthropic).then(|| ANTHROPIC_DEFAULT_MODEL.to_string()));
-    if let Some(m) = model {
-        if let Some(obj) = body.as_object_mut() {
-            obj.insert("model".into(), Value::String(m));
+    match provider.model.as_deref().filter(|m| !m.is_empty()) {
+        Some(m) => {
+            if let Some(obj) = body.as_object_mut() {
+                obj.insert("model".into(), Value::String(m.to_string()));
+            }
+            Ok(())
         }
+        None => Err(GatewayError::BadRequest(
+            "no model specified — set a default model for this provider or include a \"model\" in the request".into(),
+        )),
     }
 }
 
@@ -274,10 +280,9 @@ fn message_text(content: Option<&Value>) -> String {
 
 /// OpenAI chat-completions body → Anthropic `/v1/messages` body.
 fn openai_chat_to_anthropic(body: &Value) -> Value {
-    let model = body
-        .get("model")
-        .and_then(Value::as_str)
-        .unwrap_or(ANTHROPIC_DEFAULT_MODEL);
+    // The model is guaranteed present by ensure_model() before this runs; empty
+    // only in a direct unit call (Anthropic would then reject it, as it should).
+    let model = body.get("model").and_then(Value::as_str).unwrap_or("");
     let max = body
         .get("max_tokens")
         .and_then(Value::as_u64)
@@ -379,7 +384,7 @@ mod tests {
             category: None,
             protocol: Protocol::Anthropic,
             base_url: "https://api.anthropic.com".into(),
-            model: Some("claude-3-5-sonnet-latest".into()),
+            model: Some("example-model".into()),
             capabilities: vec![],
             enabled: true,
             allow_local: false,
@@ -398,6 +403,7 @@ mod tests {
     #[test]
     fn openai_to_anthropic_pulls_system_out_and_defaults_max_tokens() {
         let body = json!({
+            "model": "example-model",
             "messages": [
                 { "role": "system", "content": "be terse" },
                 { "role": "user", "content": "hi" }
@@ -408,14 +414,34 @@ mod tests {
         assert_eq!(a["max_tokens"], 1024);
         assert_eq!(a["messages"].as_array().unwrap().len(), 1);
         assert_eq!(a["messages"][0]["role"], "user");
-        assert_eq!(a["model"], "claude-3-5-sonnet-latest");
+        // The model is passed through as-is (no hardcoded fallback).
+        assert_eq!(a["model"], "example-model");
+    }
+
+    #[test]
+    fn ensure_model_uses_request_then_provider_then_errors() {
+        let mut p = anthropic_provider();
+        // A model on the request wins.
+        let mut body = json!({ "model": "req-model", "messages": [] });
+        ensure_model(&p, &mut body).unwrap();
+        assert_eq!(body["model"], "req-model");
+        // Else the provider's configured default fills in.
+        let mut body = json!({ "messages": [] });
+        ensure_model(&p, &mut body).unwrap();
+        assert_eq!(body["model"], "example-model");
+        // Neither set → a clear error, NOT a stale hardcoded guess.
+        p.model = None;
+        let mut body = json!({ "messages": [] });
+        let err = ensure_model(&p, &mut body).unwrap_err();
+        assert!(matches!(err, GatewayError::BadRequest(_)));
+        assert!(err.message().contains("no model"));
     }
 
     #[test]
     fn anthropic_response_maps_to_openai_chat_shape() {
         let resp = json!({
             "id": "msg_1",
-            "model": "claude-3-5-sonnet-latest",
+            "model": "example-model",
             "content": [{ "type": "text", "text": "hello" }, { "type": "text", "text": " world" }],
             "stop_reason": "end_turn",
             "usage": { "input_tokens": 5, "output_tokens": 2 }
@@ -467,6 +493,6 @@ mod tests {
     async fn anthropic_models_are_synthesized_from_the_profile() {
         // No network: the Anthropic models() path short-circuits to the profile.
         let out = models(&anthropic_provider()).await.unwrap();
-        assert_eq!(out["data"][0]["id"], "claude-3-5-sonnet-latest");
+        assert_eq!(out["data"][0]["id"], "example-model");
     }
 }
