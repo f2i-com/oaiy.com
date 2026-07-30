@@ -571,14 +571,42 @@ fn is_privileged_path(method: &Method, path: &str) -> bool {
                     | "/api/python/venvs"
                     | "/api/python/install"
             ) || (path.starts_with("/api/services/") && path.ends_with("/uninstall"))
+                || is_bridge_exec_path(path)
         }
+        // PUT is only used by the bridge (flow documents). A flow doc is
+        // executable code the worker hands to the CLI, so it is exec surface.
+        Method::PUT => is_bridge_exec_path(path),
         Method::DELETE => {
             path.starts_with("/api/services/")
                 || path.starts_with("/api/models/")
                 || path.starts_with("/api/python/venvs/")
+                || is_bridge_exec_path(path)
         }
         _ => false,
     }
+}
+
+/// Bridge + plugin routes that EXECUTE code, cause physical side effects, or
+/// persist a foothold across restart. A security review found the entire bridge
+/// surface was on the broad (loopback-permissive) allow-list: a local web page
+/// could `PUT` a flow document and `POST /api/bridge/runs` to run it — remote
+/// code execution of exactly the shape `is_privileged_path` already defends the
+/// services routes against — or `POST` a connector command to send an SMS. So
+/// these join the strict-origin set (OAIY's own webview / oaiy.com only; loopback
+/// only in debug) and fail closed on a missing Origin. `/api/bridge/capabilities`
+/// and `/api/health` are deliberately NOT here — they are the open discovery
+/// handshake the protocol commits to, and carry no user data.
+fn is_bridge_exec_path(path: &str) -> bool {
+    path == "/api/bridge/runs"                       // reserve + execute a flow
+        || path == "/api/bridge/triggers"            // create a persistent binding
+        || path.starts_with("/api/bridge/runs/")     // claim / finish / cancel
+        || path.starts_with("/api/bridge/flows/")    // define / delete a flow doc
+        || path.starts_with("/api/bridge/triggers/") // delete a binding
+        || path.starts_with("/api/bridge/connectors/") // physical side effects
+        || (path.starts_with("/api/plugins/")
+            && (path.ends_with("/start")
+                || path.ends_with("/stop")
+                || path.ends_with("/enabled")))
 }
 
 /// GET /api/services/:id/export returns the FULL ServiceTemplate — including `run.env` (which a
@@ -597,6 +625,20 @@ fn is_restricted_read_path(path: &str) -> bool {
     path == "/api/config"
         || path == "/api/python/logs"
         || (path.starts_with("/api/services/") && path.ends_with("/logs"))
+        // Bridge/plugin reads carry real data an arbitrary remote page must not
+        // scrape cross-origin: events hold plugin-supplied payloads (for Aokie,
+        // caller phone numbers and message bodies), runs hold flow inputs and
+        // outputs, and the plugins listing exposes each plugin's absolute `dir`
+        // — the OS username, the exact leak `/api/config` is already gated for.
+        // `capabilities` + `health` stay open (discovery); everything else under
+        // these prefixes is gated to a non-remote origin.
+        || path == "/api/plugins"
+        || path == "/api/bridge/events"
+        || path == "/api/bridge/runs"
+        || path == "/api/bridge/flows"
+        || path == "/api/bridge/triggers"
+        || path.starts_with("/api/bridge/runs/")
+        || (path.starts_with("/api/plugins/") && path.ends_with("/logs"))
 }
 
 /// Stricter allow-list for privileged endpoints: OAIY Desktop's OWN webview and
@@ -861,7 +903,84 @@ pub async fn serve(
 
 #[cfg(test)]
 mod tests {
-    use super::privileged_allowed;
+    use super::{
+        is_allowed_origin_privileged, is_privileged_path, is_restricted_read_path,
+        privileged_allowed,
+    };
+    use axum::http::Method;
+
+    #[test]
+    fn bridge_exec_routes_are_privileged() {
+        // The blocker: the whole bridge exec surface was on the broad
+        // loopback-permissive allow-list, so any local web page could PUT a flow
+        // and POST /runs to execute it (RCE), or POST a connector command to send
+        // an SMS. These must take the strict origin check.
+        for (m, path) in [
+            (Method::POST, "/api/bridge/runs"),
+            (Method::POST, "/api/bridge/runs/run_1/claim"),
+            (Method::POST, "/api/bridge/runs/run_1/finish"),
+            (Method::POST, "/api/bridge/runs/run_1/cancel"),
+            (Method::PUT, "/api/bridge/flows/pwn"),
+            (Method::DELETE, "/api/bridge/flows/pwn"),
+            (Method::POST, "/api/bridge/triggers"),
+            (Method::DELETE, "/api/bridge/triggers/b1"),
+            (Method::POST, "/api/bridge/connectors/aokie/request"),
+            (Method::POST, "/api/plugins/aokie/start"),
+            (Method::POST, "/api/plugins/aokie/stop"),
+            (Method::POST, "/api/plugins/aokie/enabled"),
+        ] {
+            assert!(
+                is_privileged_path(&m, path),
+                "{m} {path} must be privileged (exec/side-effect surface)"
+            );
+        }
+    }
+
+    #[test]
+    fn discovery_stays_open_but_reads_are_gated() {
+        // capabilities + health are the discovery handshake the protocol commits
+        // to keeping open. Everything else under the bridge/plugin prefixes
+        // carries data (phone numbers, flow io, the OS username) and must be a
+        // restricted read.
+        assert!(!is_restricted_read_path("/api/health"));
+        assert!(!is_restricted_read_path("/api/bridge/capabilities"));
+        for path in [
+            "/api/plugins",
+            "/api/plugins/aokie/logs",
+            "/api/bridge/events",
+            "/api/bridge/runs",
+            "/api/bridge/runs/run_1",
+            "/api/bridge/flows",
+            "/api/bridge/triggers",
+        ] {
+            assert!(
+                is_restricted_read_path(path),
+                "{path} leaks data and must be a restricted read"
+            );
+        }
+    }
+
+    #[test]
+    fn a_release_build_refuses_a_random_localhost_page_on_the_exec_surface() {
+        // The concrete blocker check: in a release build, a page served from an
+        // arbitrary localhost port must NOT satisfy the privileged origin gate,
+        // so PUT /api/bridge/flows from evil-on-localhost is refused even in GUI
+        // mode with no token. (In debug the dev UI needs loopback, hence the
+        // cfg.)
+        let origin_priv_ok = is_allowed_origin_privileged("http://localhost:6006");
+        #[cfg(not(debug_assertions))]
+        {
+            assert!(!origin_priv_ok, "a release build must not trust a random localhost page");
+            assert!(
+                !privileged_allowed(false, true, false, origin_priv_ok),
+                "GUI + no token + random localhost origin must be refused on exec routes"
+            );
+        }
+        // oaiy.com and the tauri webview always pass — the legit callers.
+        assert!(is_allowed_origin_privileged("https://oaiy.com"));
+        assert!(is_allowed_origin_privileged("tauri://localhost"));
+        let _ = origin_priv_ok;
+    }
 
     #[test]
     fn privileged_auth_matrix() {

@@ -337,6 +337,22 @@ impl Worker {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+
+        // Drop known credential env vars before the CLI inherits the rest.
+        //
+        // A flow is untrusted code — writable over HTTP, and deliberately never
+        // graph-validated here — so the same reasoning that gives plugins an
+        // allow-listed environment applies. The CLI legitimately needs far more
+        // than a plugin (it IS the engine: PATH, HOME, node's own vars), so this
+        // is a deny-list of the sensitive names rather than an allow-list, and it
+        // matters because the engine's getSecret() reads process.env by name
+        // BEFORE its own store — an inherited AWS/OpenAI key would be directly
+        // addressable from inside a flow. A flow that genuinely needs a cloud key
+        // should carry it as a constant, not inherit it ambiently. Reuses the
+        // plugin host's list so the two paths cannot drift.
+        for name in crate::plugins::runner::NEVER_FORWARD {
+            cmd.env_remove(name);
+        }
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
@@ -583,6 +599,17 @@ mod tests {
     }
 
     // --- output capture ----------------------------------------------------
+
+    #[test]
+    fn the_secret_deny_list_covers_the_known_credentials() {
+        // The CLI child drops these before inheriting the rest. Pin the list so a
+        // rename or a new provider key is a conscious decision, and assert the
+        // engine-relevant ones are present.
+        let deny = crate::plugins::runner::NEVER_FORWARD;
+        for expected in ["OPENAI_API_KEY", "ANTHROPIC_API_KEY", "OAIY_HF_TOKEN", "AWS_SECRET_ACCESS_KEY"] {
+            assert!(deny.contains(&expected), "{expected} must be denied to the CLI child");
+        }
+    }
 
     #[test]
     fn tail_keeps_the_end_of_a_stack_trace() {

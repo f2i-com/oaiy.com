@@ -544,8 +544,19 @@ fn handle_notification(
                 .and_then(Value::as_str)
                 .unwrap_or("info");
             let msg = params.get("message").and_then(Value::as_str).unwrap_or("");
+            // Truncate on a CHAR BOUNDARY. `&msg[..N]` panics when byte N is
+            // inside a multi-byte char, and msg is untrusted plugin output — one
+            // >2KiB log line containing an emoji or an accented name (byte 2048
+            // mid-'é') panicked the reader thread, which then never drained the
+            // plugin, never failed its pending calls, and left it permanently
+            // unresponsive-but-alive. A security review caught it; a real plugin
+            // would have hit it by accident.
             let truncated = if msg.len() > rpc::MAX_LOG_BYTES {
-                format!("{}… (truncated)", &msg[..rpc::MAX_LOG_BYTES])
+                let mut end = rpc::MAX_LOG_BYTES;
+                while end > 0 && !msg.is_char_boundary(end) {
+                    end -= 1;
+                }
+                format!("{}… (truncated)", &msg[..end])
             } else {
                 msg.to_string()
             };

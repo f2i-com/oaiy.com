@@ -33,7 +33,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{channel, Sender};
+use std::sync::mpsc::{sync_channel, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -163,7 +163,14 @@ pub struct PluginHost {
     pub triggers: TriggerStoreHandle,
     procs: Mutex<ProcTable>,
     events: EventRing,
-    event_tx: Sender<(String, Value)>,
+    /// Bounded: a plugin can emit events faster than the single event thread
+    /// dispatches them (each dispatch takes the ledger lock). An unbounded
+    /// channel let a flooding plugin grow this queue without limit — the review's
+    /// memory-exhaustion path. `try_send` drops on a full queue and logs it,
+    /// which is the right failure: better to shed events under a flood, with a
+    /// record, than to run the machine out of memory. At-least-once delivery
+    /// means a dropped event is re-sent by a well-behaved plugin anyway.
+    event_tx: SyncSender<(String, Value)>,
     desktop_version: String,
     dev_mode: bool,
 }
@@ -177,7 +184,7 @@ impl PluginHost {
         desktop_version: String,
         dev_mode: bool,
     ) -> Arc<Self> {
-        let (event_tx, event_rx) = channel::<(String, Value)>();
+        let (event_tx, event_rx) = sync_channel::<(String, Value)>(1024);
         let host = Arc::new(Self {
             registry,
             ledger,
@@ -290,9 +297,18 @@ impl PluginHost {
                 dev_mode: self.dev_mode,
                 events: Arc::new(move |_name, envelope| {
                     if let Some(host) = host_for_events.upgrade() {
-                        // Channel, not dispatch: this closure runs on the reader
-                        // thread. See the module docs.
-                        let _ = host.event_tx.send((plugin_for_events.clone(), envelope));
+                        // try_send, not send: this closure runs on the reader
+                        // thread (see the module docs), and a bounded queue must
+                        // never block it — a blocked reader stops routing RPC
+                        // replies too. A full queue means the event thread is
+                        // swamped; shed with a log rather than grow without bound.
+                        if host
+                            .event_tx
+                            .try_send((plugin_for_events.clone(), envelope))
+                            .is_err()
+                        {
+                            host.logs_drop_notice(&plugin_for_events);
+                        }
                     }
                 }),
                 requests: Arc::new(move |method, params| {
@@ -771,6 +787,17 @@ impl PluginHost {
                         self.set_state(&id, PluginState::Unhealthy, Some(detail));
                     }
                 }
+            }
+        }
+    }
+
+    /// Note a dropped event on the plugin's own log ring, so a flood is
+    /// diagnosable rather than silent. Best-effort and rate-oblivious — under a
+    /// real flood this line itself is shed by the ring's own cap.
+    fn logs_drop_notice(&self, plugin_id: &str) {
+        if let Ok(t) = self.procs.lock() {
+            if let Some(p) = t.running.get(plugin_id) {
+                p.logs.push("stderr", "[event dropped] host event queue full".into());
             }
         }
     }
