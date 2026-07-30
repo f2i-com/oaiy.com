@@ -14,7 +14,7 @@
  * keys), so a returning user sees the landing in whatever theme they last
  * chose. No app boot runs here (see landing/main.tsx).
  */
-import SiteNav from './SiteNav';
+import SiteNav, { REPO_URL } from './SiteNav';
 
 const APP_URL = 'app.html';
 
@@ -24,14 +24,11 @@ export default function LandingPage() {
       className="min-h-screen w-full overflow-x-hidden"
       style={{ backgroundColor: 'rgb(var(--color-bg-primary))', color: 'rgb(var(--color-text-primary))' }}
     >
-      <SiteNav
-        page="overview"
-        sections={[
-          { id: 'capabilities', label: 'Capabilities' },
-          { id: 'how', label: 'How it works' },
-          { id: 'desktop', label: 'Desktop companion' },
-        ]}
-      />
+      {/* No `sections` here: the overview's own sections (Capabilities, How it
+          works) are already top-nav destinations, so a sub-nav would just
+          repeat them. desktop.html passes its sections, which the top nav
+          doesn't cover. */}
+      <SiteNav page="overview" />
       <main>
         <Hero />
         <EnginesStrip />
@@ -804,6 +801,18 @@ function FinalCta() {
             </a>
             <a href="#desktop" className="btn btn-secondary btn-lg">Learn about the desktop app</a>
           </div>
+          <p className="mt-7 text-sm" style={{ color: 'rgb(var(--color-text-secondary))' }}>
+            OAIY is open source under Apache-2.0.{' '}
+            <a
+              href={REPO_URL}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="lp-star-inline"
+            >
+              Star us on GitHub
+            </a>{' '}
+            if it's useful to you.
+          </p>
         </div>
       </div>
     </Section>
@@ -822,6 +831,7 @@ function Footer() {
           <a href={APP_URL}>Open app</a>
           <a href="#capabilities">Capabilities</a>
           <a href="#desktop">Desktop</a>
+          <a href={REPO_URL} target="_blank" rel="noopener noreferrer">GitHub</a>
         </nav>
         <p className="font-mono text-[11px]" style={{ color: 'rgb(var(--color-text-tertiary))' }}>
           © 2026 oaiy.com · Apache-2.0

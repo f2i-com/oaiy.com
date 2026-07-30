@@ -52,6 +52,18 @@ php bin/migrate.php
 php -S 0.0.0.0:8080 -t public/
 ```
 
+> **`php -S` cannot serve the long-poll properly.** The built-in server is
+> single-threaded, and `GET /api/flows/{hash_edit}/runs/pending` deliberately
+> holds a request open for `POLL_TIMEOUT` (20s by default). One browser with
+> sharing enabled therefore blocks *every* other request for up to 20s —
+> measured at 17.8s for an unrelated `GET /` on Windows. Symptoms are an API
+> that looks hung, or a dev server that falls over under a second client.
+>
+> On Linux/macOS, `PHP_CLI_SERVER_WORKERS=8 php -S …` forks workers and fixes
+> it. On **Windows that env var does nothing** (`forking is not supported on
+> this platform`), so use a real server — see the Apache/nginx sections below.
+> `php -S` is fine for single-client poking at the non-polling routes.
+
 Then `curl http://localhost:8080/` should respond:
 
 ```json

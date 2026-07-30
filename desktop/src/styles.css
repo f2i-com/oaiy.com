@@ -474,8 +474,7 @@ kbd {
   padding: 2px;
 }
 
-.icon-button,
-.icon-btn {
+.icon-button {
   display: grid;
   width: 30px;
   height: 30px;
@@ -489,8 +488,7 @@ kbd {
   transition: background 0.14s, color 0.14s;
 }
 .icon-button:hover,
-.icon-button.active,
-.icon-btn:hover {
+.icon-button.active {
   background: var(--surface-raised);
   color: var(--text);
 }

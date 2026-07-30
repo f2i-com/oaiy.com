@@ -15,6 +15,9 @@ import { useTheme } from '../contexts/ThemeContext';
 
 export type SitePage = 'overview' | 'desktop';
 
+/** The public repo — OAIY is Apache-2.0, so the source link is part of the pitch. */
+export const REPO_URL = 'https://github.com/f2i-com/oaiy.com';
+
 /**
  * Site-level destinations. `page` is which page the target lives on, so a link
  * can resolve to a bare hash when you're already there and a full cross-page
@@ -75,6 +78,16 @@ export default function SiteNav({
               </a>
             );
           })}
+          <a
+            className="site-nav-star"
+            href={REPO_URL}
+            target="_blank"
+            rel="noopener noreferrer"
+            title="Star OAIY on GitHub"
+          >
+            <GitHubMark />
+            <span>Star us</span>
+          </a>
           <ThemeToggle />
           <a href="app.html" className="btn btn-primary btn-sm ml-1">
             Open the app
@@ -136,6 +149,16 @@ function ArrowRight() {
   return (
     <svg className="h-3.5 w-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M5 12h14m-6-6l6 6-6 6" />
+    </svg>
+  );
+}
+
+/** GitHub's mark, inlined — one more request avoided on a page that sells not
+ *  phoning home. Filled rather than stroked, so it reads at 15px. */
+function GitHubMark() {
+  return (
+    <svg viewBox="0 0 16 16" width="15" height="15" fill="currentColor" aria-hidden="true">
+      <path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-2.92-.88-2.92-2.9 0-.86.31-1.57.82-2.12-.07-.2-.36-1.01.08-2.1 0 0 .67-.21 2.2.82a7.4 7.4 0 0 1 2-.27c.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.09.15 1.9.08 2.1.51.55.82 1.25.82 2.12 0 2.03-1.15 2.7-2.93 2.9.3.26.56.76.56 1.54 0 1.11-.01 2.01-.01 2.29 0 .21.15.46.55.38A7.99 7.99 0 0 0 16 8c0-4.42-3.58-8-8-8Z" />
     </svg>
   );
 }

@@ -645,36 +645,51 @@ export default function OAIYApp() {
         >
           {activePackageFlowData && activePackage ? (
             <h1>{activePackageFlowData.name}</h1>
-          ) : editingFlowName ? (
-            <input
-              ref={flowNameInputRef}
-              className="oaiy-name"
-              type="text"
-              value={flowNameValue}
-              onChange={(e) => setFlowNameValue(e.target.value)}
-              onBlur={finishEditingFlowName}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter') finishEditingFlowName();
-                if (e.key === 'Escape') setEditingFlowName(false);
-              }}
-              autoFocus
-            />
-          ) : activeFlow ? (
-            <h1
-              onDoubleClick={startEditingFlowName}
-              title="Double-click to rename this flow"
-              style={{ cursor: 'text' }}
-            >
-              {activeFlow.name}
-            </h1>
           ) : (
-            <input
-              className="oaiy-name"
-              type="text"
-              value={project.name}
-              onChange={(e) => renameProject(e.target.value)}
-              aria-label="Project name"
-            />
+            /* project / flow, both reachable — they are not alternatives. The
+               project name is always editable in place; the flow name is a real
+               button so it can be reached and activated from the keyboard. */
+            <>
+              <input
+                className="oaiy-name oaiy-name-project"
+                type="text"
+                value={project.name}
+                onChange={(e) => renameProject(e.target.value)}
+                aria-label="Project name"
+              />
+              {activeFlow && (
+                <>
+                  <span className="oaiy-name-sep" aria-hidden="true">
+                    /
+                  </span>
+                  {editingFlowName ? (
+                    <input
+                      ref={flowNameInputRef}
+                      className="oaiy-name"
+                      type="text"
+                      value={flowNameValue}
+                      onChange={(e) => setFlowNameValue(e.target.value)}
+                      onBlur={finishEditingFlowName}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') finishEditingFlowName();
+                        if (e.key === 'Escape') setEditingFlowName(false);
+                      }}
+                      aria-label="Flow name"
+                      autoFocus
+                    />
+                  ) : (
+                    <button
+                      type="button"
+                      className="oaiy-name oaiy-name-flow"
+                      onClick={startEditingFlowName}
+                      title="Rename this flow"
+                    >
+                      {activeFlow.name}
+                    </button>
+                  )}
+                </>
+              )}
+            </>
           )}
         </ShellTopbar>
 
