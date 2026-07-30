@@ -92,6 +92,14 @@ final class DispatchController
         // bounds the DB write if post_max_size is raised. Symmetric with the inputs
         // cap on enqueue.
         $encodedResult = $result === null ? null : json_encode($result);
+        // The three sibling write paths (FlowsController::create/update and
+        // enqueue) all reject a failed encode; this one didn't. json_encode
+        // returns false on malformed UTF-8 — which a local executor's output can
+        // absolutely contain — and `false` would then be bound to the column,
+        // silently storing an empty result and reporting the run as done.
+        if ($result !== null && $encodedResult === false) {
+            return FlowsController::json($res, ['error' => 'result is not serializable'], 400);
+        }
         $maxPayload = (int) ($_ENV['MAX_PAYLOAD_BYTES'] ?? 16 * 1024 * 1024);
         if ($encodedResult !== null && strlen($encodedResult) > $maxPayload) {
             return FlowsController::json($res, ['error' => 'result too large'], 413);

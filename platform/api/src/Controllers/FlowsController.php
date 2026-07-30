@@ -163,7 +163,7 @@ final class FlowsController
         if ($row === null) {
             return self::json($res, ['error' => 'not found'], 404);
         }
-        $lastSeen = $row['last_seen'] ? strtotime($row['last_seen']) : null;
+        $lastSeen = $row['last_seen'] ? strtotime($row['last_seen'] . ' UTC') : null;
         // Consider the browser "connected" if a heartbeat landed in the
         // last 60 seconds. Browser dispatcher hits it every ~30s.
         $connected = $lastSeen !== null && (time() - $lastSeen) < 60;
@@ -220,6 +220,21 @@ final class FlowsController
     // ---------------------------------------------------------------------
 
     /**
+     * True when `$hash` could be a flow hash at all.
+     *
+     * Cheap shape check that runs BEFORE any query. It exists for correctness,
+     * not just speed: `hash_view`/`hash_edit` are `char(22)` with an
+     * `ascii_bin` collation, and binding a non-ASCII string to them makes MySQL
+     * fail the collation conversion (SQLSTATE[HY000] 3988) — surfacing as a 500
+     * with the driver message instead of an ordinary 404. Nothing outside the
+     * Crockford alphabet can be a real hash, so a mismatch is simply not found.
+     */
+    private static function looksLikeHash(string $hash): bool
+    {
+        return (bool) preg_match('/^[0-9A-HJKMNP-TV-Z]{22}$/', $hash);
+    }
+
+    /**
      * Find by view OR edit hash (read-only endpoints).
      *
      * The two placeholders are DISTINCT on purpose even though they always
@@ -232,6 +247,9 @@ final class FlowsController
      */
     public static function findByEitherHash(string $hash): ?array
     {
+        if (!self::looksLikeHash($hash)) {
+            return null;
+        }
         $stmt = Db::pdo()->prepare(
             'SELECT * FROM flows WHERE hash_view = :hv OR hash_edit = :he LIMIT 1'
         );
@@ -243,6 +261,9 @@ final class FlowsController
     /** Find by edit hash only (write/run endpoints). 404 if a read hash is supplied. */
     public static function findByEditHash(string $hash): ?array
     {
+        if (!self::looksLikeHash($hash)) {
+            return null;
+        }
         $stmt = Db::pdo()->prepare(
             'SELECT * FROM flows WHERE hash_edit = :h LIMIT 1'
         );

@@ -125,7 +125,7 @@ final class App
         $app->get('/', function (ServerRequestInterface $req, ResponseInterface $res) {
             $res->getBody()->write(json_encode([
                 'name' => 'oaiy-api',
-                'docs' => 'https://github.com/oaiy-com/oaiy.com#api-reference',
+                'docs' => 'https://github.com/f2i-com/oaiy.com#api-reference',
             ]) ?: '{}');
             return $res->withHeader('Content-Type', 'application/json');
         });

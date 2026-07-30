@@ -314,7 +314,10 @@ export default function App() {
         </header>
 
         <section className={`view view-${view}`}>
-          <div className="content-page">
+          {/* keyed so React remounts the scroller on a view change — otherwise
+              the next view opens at the previous one's scroll offset, i.e.
+              mid-content. */}
+          <div className="content-page" key={view}>
             <div className="page-intro">
               <div>
                 <span className="kicker">{page.kicker}</span>

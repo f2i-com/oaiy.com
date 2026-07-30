@@ -16,7 +16,7 @@ VFS / wasm); the CLI aliases the same specifiers to `src/node-host/*`
 
 ```
 shared engine (oaiy-core + bundled-modules)  ──┬── ui/  → tauri-shim (browser)
-                                              └── cli/ → node-host (Node)
+                                               └── cli/ → node-host (Node)
 ```
 
 ## Build

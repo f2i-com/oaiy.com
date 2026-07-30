@@ -103,6 +103,18 @@ final class Db
             PDO::ATTR_ERRMODE            => PDO::ERRMODE_EXCEPTION,
             PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
             PDO::ATTR_EMULATE_PREPARES   => false,
+            // MySQL converts TIMESTAMP columns to/from the SESSION time zone.
+            // Without this the session inherits @@time_zone = SYSTEM (server
+            // local), while PHP defaults to UTC — so CURRENT_TIMESTAMP is
+            // written and read back offset from PHP's clock. FlowsController::
+            // status() compares `last_seen` against time() via strtotime(), so
+            // on a UTC+10 server every stale browser reported
+            // `client_connected: true` (the delta went negative) and on a
+            // UTC-negative server it would report false forever. The migration
+            // already pins '+00:00', but that binds only the migration's own
+            // session. INIT_COMMAND (not a post-connect exec) so it is re-applied
+            // on reconnect; a numeric offset needs no tz tables loaded.
+            PDO::MYSQL_ATTR_INIT_COMMAND => "SET time_zone = '+00:00'",
         ]);
     }
 
