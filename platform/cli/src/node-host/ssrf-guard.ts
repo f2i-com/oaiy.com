@@ -132,6 +132,33 @@ export async function ssrfSafeFetch(
   maxRedirects = 10,
 ): Promise<Response> {
   let url = raw;
+  // Because we drive the redirect loop ourselves (`redirect: 'manual'`, so each
+  // hop can be IP-validated), we also inherit two responsibilities undici's own
+  // follow logic handles and a naive re-issue loses:
+  //
+  //  1. Credentials must not cross an origin. Under `oaiy worker` the URL comes
+  //     from queue inputs and `init.headers` is whatever the flow set — which for
+  //     a service call is an `Authorization: Bearer <apiKeyConstant>`. Replaying
+  //     that on a redirect hands the user's API key to whatever host answers
+  //     `302 Location: https://attacker.example/`, and the SSRF check waves it
+  //     through because an attacker-owned host is exactly "public".
+  //  2. 301/302/303 must become a GET with no body; only 307/308 preserve them.
+  //
+  // `carried` is mutated per hop; `init` is never reused directly after hop 0.
+  const carried: RequestInit = { ...init };
+  // `Headers` is a Node global here; the DOM `HeadersInit` type is not in this
+  // package's lib, hence the cast rather than an annotation.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const carriedHeaders = new Headers((init.headers as any) ?? undefined);
+  let originOf = (v: string): string => {
+    try {
+      return new URL(v).origin;
+    } catch {
+      return '';
+    }
+  };
+  let currentOrigin = originOf(raw);
+
   for (let hop = 0; hop <= maxRedirects; hop++) {
     // Scheme-check + resolve-and-validate ONCE per hop (not via assertUrlAllowed, so we don't
     // resolve twice — the second resolve is exactly the window a rebind would exploit).
@@ -148,7 +175,8 @@ export async function ssrfSafeFetch(
     const agent = pin ? pinnedAgent(pin) : undefined;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const resp = await undiciFetch(url, {
-      ...(init as any),
+      ...(carried as any),
+      headers: carriedHeaders,
       redirect: 'manual',
       ...(agent ? { dispatcher: agent } : {}),
     });
@@ -162,7 +190,27 @@ export async function ssrfSafeFetch(
           /* ignore */
         }
         agent?.destroy().catch(() => {});
-        url = new URL(loc, url).toString();
+        const next = new URL(loc, url).toString();
+
+        // Cross-origin hop: drop everything that authenticates the caller.
+        const nextOrigin = originOf(next);
+        if (nextOrigin !== currentOrigin) {
+          carriedHeaders.delete('authorization');
+          carriedHeaders.delete('cookie');
+          carriedHeaders.delete('proxy-authorization');
+          currentOrigin = nextOrigin;
+        }
+
+        // Per the Fetch spec, 301/302/303 rewrite the request to a bodyless GET.
+        // 307/308 exist precisely to preserve the method and body.
+        if (resp.status === 301 || resp.status === 302 || resp.status === 303) {
+          carried.method = 'GET';
+          carried.body = undefined;
+          carriedHeaders.delete('content-type');
+          carriedHeaders.delete('content-length');
+        }
+
+        url = next;
         continue;
       }
     }

@@ -146,7 +146,19 @@ async function apiJson<T>(
     method,
     headers,
     body: body === undefined ? undefined : JSON.stringify(body),
-    credentials: 'include',
+    // 'omit', not 'include'. The api is cross-origin by design (oaiy.com vs an
+    // api host; localhost:5173 vs :8081 in dev) and it sets
+    // Access-Control-Allow-Origin but NOT Access-Control-Allow-Credentials — so
+    // per the Fetch spec a credentialed request fails the CORS check outright.
+    // With 'include' every call through this helper threw "Failed to fetch":
+    // sharing, autosave, the run long-poll, heartbeat and result reporting. It
+    // stayed hidden because Settings' "Test Connection" uses a bare fetch()
+    // (default credentials) and so reported the backend as reachable.
+    //
+    // 'include' bought nothing anyway: the api issues no cookies at all and
+    // authenticates DELETE with the X-Owner-Token header. This matches what
+    // companionDetection.ts and companionServices.ts already do.
+    credentials: 'omit',
   });
   // 204 = empty success (heartbeat); 200/201/202 = JSON body.
   if (resp.status === 204) return undefined as T;

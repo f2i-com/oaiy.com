@@ -17,7 +17,13 @@ const CoreFilesystemCompiler: ModuleCompiler = {
     const { node, inputs, outputVar, sanitizedId, skipVarDeclaration, escapeString, isInLoop, loopStartId, sanitizeId } = ctx;
     const data = node.data;
     const letOrAssign = skipVarDeclaration ? '' : 'let ';
-    const inputVar = inputs.get('input') || 'null';
+    // The declared handle is 'text' — both text_chunker.json and
+    // TextChunkerNode's inputHandles use that id, and the core compiler keys
+    // this map strictly on `edge.targetHandle`. Reading only 'input' therefore
+    // never matched, inputVar fell back to the literal 'null', and every Text
+    // Chunker silently chunked nothing while the flow reported success.
+    // 'input'/'default' stay as tolerant fallbacks for older saved graphs.
+    const inputVar = inputs.get('text') || inputs.get('input') || inputs.get('default') || 'null';
 
     // Quote-aware CSV line parser, emitted once per CSV-parsing node and used
     // for BOTH the header row and data rows so quoted fields containing commas

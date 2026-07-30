@@ -12,7 +12,8 @@
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "test:e2e": "node tests/e2e.mjs",
     "test:css": "node tests/css-tokens.mjs",
-    "test": "npm run typecheck && npm run test:css"
+    "test": "npm run typecheck && npm run test:css && npm run test:contracts",
+    "test:contracts": "node tests/node-contracts.mjs"
   },
   "dependencies": {
     "@ffmpeg/ffmpeg": "^0.12.15",

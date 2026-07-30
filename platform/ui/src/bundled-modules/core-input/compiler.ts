@@ -14,7 +14,7 @@ const CoreInputCompiler: ModuleCompiler = {
   },
 
   compileNode(nodeType: string, ctx: ModuleCompilerContext): string | null {
-    const { node, outputVar, skipVarDeclaration, escapeString } = ctx;
+    const { node, inputs, outputVar, skipVarDeclaration, escapeString } = ctx;
     const data = node.data;
     const letOrAssign = skipVarDeclaration ? '' : 'let ';
 
@@ -110,9 +110,16 @@ const CoreInputCompiler: ModuleCompiler = {
         const recursive = data.recursive !== false;
         const includePatterns = escapeString(String(data.includePatterns || '*'));
         const maxFiles = Number(data.maxFiles) || 1000;
+        // input_folder.json declares a `path` input described as "Optional
+        // dynamic path from another node", and InputFolderNode renders the
+        // handle — but this only ever used the static data.path, so connecting
+        // anything to that handle did nothing at all. Prefer the wire when it is
+        // connected and fall back to the configured value.
+        const pathInput = inputs.get('path') || inputs.get('default');
+        const pathExpr = pathInput ? `(${pathInput} ?? "${path}")` : `"${path}"`;
 
         code += `
-  ${letOrAssign}${outputVar} = await FileSystem.listFolder("${path}", ${recursive}, "${includePatterns}", ${maxFiles}, "${node.id}");
+  ${letOrAssign}${outputVar} = await FileSystem.listFolder(${pathExpr}, ${recursive}, "${includePatterns}", ${maxFiles}, "${node.id}");
   if (${outputVar} === "__ABORT__") {
     console.log("[Workflow] aborted");
     return workflow_context;

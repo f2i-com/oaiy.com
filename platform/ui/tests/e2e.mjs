@@ -24,6 +24,8 @@
 import { chromium } from 'playwright';
 
 const BASE = (process.argv[2] ?? 'http://localhost:5173').replace(/\/+$/, '');
+/** Optional: an api base to exercise the cross-origin CORS regression case. */
+const API_BASE = (process.argv[3] ?? '').replace(/\/+$/, '');
 
 let pass = 0;
 const failures = [];
@@ -192,6 +194,32 @@ for (const theme of ['dark', 'light']) {
     const secondary = await page.evaluate(() =>
       getComputedStyle(document.documentElement).getPropertyValue('--accent-secondary').trim());
     ok('--accent-secondary is set', secondary.length > 0, secondary);
+
+    // regression: the api is cross-origin and sets no Allow-Credentials, so a
+    // credentialed request fails the CORS check outright. With credentials:
+    // 'include' every call through backendDispatcher.apiJson threw "Failed to
+    // fetch" — sharing, autosave, the run long-poll, heartbeat and result
+    // reporting — while Settings' bare-fetch "Test Connection" still said OK.
+    // Pass an api base as the 2nd arg to exercise it; skipped otherwise.
+    if (API_BASE) {
+      const probe = await page.evaluate(async (base) => {
+        const out = {};
+        for (const mode of ['omit', 'include']) {
+          try {
+            const r = await fetch(base + '/', { credentials: mode });
+            out[mode] = 'HTTP ' + r.status;
+          } catch (e) {
+            out[mode] = 'THREW';
+          }
+        }
+        return out;
+      }, API_BASE);
+      ok('cross-origin api call succeeds with credentials omitted',
+        String(probe.omit).startsWith('HTTP 2'), JSON.stringify(probe));
+      // Not asserted as a failure — it documents WHY we use omit. If the api ever
+      // starts sending Allow-Credentials this flips, which is worth noticing.
+      console.log(`    (with credentials:'include' the same call is ${probe.include})`);
+    }
 
     // theme toggle round-trip: click whichever segment is NOT active
     const before = await page.evaluate(() => document.documentElement.className);
