@@ -377,7 +377,7 @@ export function openInExplorer(path: string): Promise<void> {
 
 /**
  * Open an external URL in the system default browser. In the Tauri app this
- * invokes the native `open_url` command; in a plain dev browser (vite :1420)
+ * invokes the native `open_url` command; in a plain dev browser (vite :17973)
  * it falls back to window.open so the link works there too.
  */
 export function openExternal(url: string): void {
