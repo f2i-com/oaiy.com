@@ -603,6 +603,15 @@ fn is_bridge_exec_path(path: &str) -> bool {
         || path.starts_with("/api/bridge/flows/")    // define / delete a flow doc
         || path.starts_with("/api/bridge/triggers/") // delete a binding
         || path.starts_with("/api/bridge/connectors/") // physical side effects
+        // Pairing APPROVAL/denial is the user's trust act, and revoke unpairs an
+        // app — only OAIY's own webview (or a token holder) may. But raising a
+        // request (`POST /api/bridge/pairing`) and polling it
+        // (`/api/bridge/pairing/<id>`) are OPEN — their whole job is to let an
+        // untrusted consumer bootstrap, and neither grants anything without the
+        // approval below. `pairings` (plural) is the granted-token surface.
+        || path.ends_with("/approve")
+        || path.ends_with("/deny")
+        || path.starts_with("/api/bridge/pairings")
         || (path.starts_with("/api/plugins/")
             && (path.ends_with("/start")
                 || path.ends_with("/stop")
@@ -639,6 +648,12 @@ fn is_restricted_read_path(path: &str) -> bool {
         || path == "/api/bridge/triggers"
         || path.starts_with("/api/bridge/runs/")
         || (path.starts_with("/api/plugins/") && path.ends_with("/logs"))
+        // Who is asking to pair, and which apps are paired, are the OAIY UI's to
+        // see — not a remote page's. Note the exact match: the POLL route
+        // `/api/bridge/pairing/<id>` is deliberately NOT here (a consumer must be
+        // able to poll for its own token), only the listing `/api/bridge/pairing`.
+        || path == "/api/bridge/pairing"
+        || path == "/api/bridge/pairings"
 }
 
 /// Stricter allow-list for privileged endpoints: OAIY Desktop's OWN webview and
@@ -699,6 +714,28 @@ fn token_eq(want: &str, got: &str) -> bool {
 struct AuthConfig {
     token: Option<String>,
     gui_mode: bool,
+    /// Tokens minted by the pairing flow. A consumer that paired (the user
+    /// approved it in the OAIY UI) presents one of these as its bearer — the
+    /// production path for an untrusted-origin consumer like FormLogic Web. The
+    /// guard checks it alongside the single configured `token`.
+    pairing: Option<crate::bridge::PairingHandle>,
+}
+
+impl AuthConfig {
+    /// Does `presented` match the configured token OR a live paired token?
+    fn token_matches(&self, presented: &str) -> bool {
+        if let Some(want) = self.token.as_deref() {
+            if token_eq(want, presented) {
+                return true;
+            }
+        }
+        if let Some(p) = &self.pairing {
+            if let Ok(mgr) = p.lock() {
+                return mgr.is_valid_token(presented);
+            }
+        }
+        false
+    }
 }
 
 /// Decide whether a privileged request is allowed. A matching bearer token
@@ -724,6 +761,15 @@ async fn origin_guard(
     let m = req.method().clone();
     let mutating =
         m == Method::POST || m == Method::PUT || m == Method::DELETE || m == Method::PATCH;
+    // A tiny public-mutation allow-list: raising a pairing request is a POST that
+    // MUST be reachable from an untrusted origin — bootstrapping a token is its
+    // whole purpose, and it grants nothing without the user's approval (a
+    // separate, privileged act). Without this exemption the ordinary mutation
+    // guard below would 403 FormLogic's very first call. Everything else stays
+    // gated.
+    if mutating && m == Method::POST && req.uri().path() == "/api/bridge/pairing" {
+        return next.run(req).await;
+    }
     if mutating {
         let privileged = is_privileged_path(&m, req.uri().path());
         let origin = req
@@ -735,10 +781,8 @@ async fn origin_guard(
         // (the CLI, oaiy-server tooling) perform privileged ops the origin
         // allow-list would otherwise block — there's no browser origin on a
         // server. Compared without per-byte short-circuit (token_eq).
-        let token_ok = matches!(
-            (auth.token.as_deref(), bearer_token(&req)),
-            (Some(want), Some(got)) if token_eq(want, &got)
-        );
+        // A configured token OR a paired token satisfies auth.
+        let token_ok = bearer_token(&req).is_some_and(|got| auth.token_matches(&got));
         let allowed = if privileged {
             let origin_priv_ok =
                 matches!(origin.as_deref(), Some(o) if is_allowed_origin_privileged(o));
@@ -778,10 +822,7 @@ async fn origin_guard(
                 .get(ORIGIN)
                 .and_then(|o| o.to_str().ok())
                 .map(str::to_owned);
-            let token_ok = matches!(
-                (auth.token.as_deref(), bearer_token(&req)),
-                (Some(want), Some(got)) if token_eq(want, &got)
-            );
+            let token_ok = bearer_token(&req).is_some_and(|got| auth.token_matches(&got));
             let allowed = match origin.as_deref() {
                 None => true,
                 Some(o) => {
@@ -847,6 +888,9 @@ pub async fn serve(
     // Merged rather than inlined: the bridge owns its own state (the run ledger
     // + the plugin registry) and should not be threaded through AppState, which
     // every services/models/python handler would then carry for no reason.
+    // Capture the pairing handle before `bridge` is moved into its router, so
+    // the auth guard can validate paired tokens.
+    let pairing_for_auth = bridge.pairing.clone();
     let bridge_routes = crate::bridge::bridge_router(bridge);
 
     let app = Router::new()
@@ -888,7 +932,7 @@ pub async fn serve(
         // would leave them ungated — reachable by any web page the user has open.
         .merge(bridge_routes)
         .layer(middleware::from_fn_with_state(
-            AuthConfig { token: auth_token, gui_mode },
+            AuthConfig { token: auth_token, gui_mode, pairing: Some(pairing_for_auth) },
             origin_guard,
         ))
         .layer(cors);
@@ -905,7 +949,7 @@ pub async fn serve(
 mod tests {
     use super::{
         is_allowed_origin_privileged, is_privileged_path, is_restricted_read_path,
-        privileged_allowed,
+        privileged_allowed, AuthConfig,
     };
     use axum::http::Method;
 
@@ -934,6 +978,44 @@ mod tests {
                 "{m} {path} must be privileged (exec/side-effect surface)"
             );
         }
+    }
+
+    #[test]
+    fn pairing_bootstrap_is_open_but_granting_is_privileged() {
+        use axum::http::Method;
+        // Raising and polling a pairing request must be OPEN — their whole job is
+        // to let an untrusted consumer bootstrap, and neither grants anything.
+        assert!(!is_privileged_path(&Method::POST, "/api/bridge/pairing"), "raising a request is open");
+        assert!(!is_restricted_read_path("/api/bridge/pairing/pair_abc"), "polling is open");
+        // Granting/denying/revoking IS the trust act — privileged.
+        assert!(is_privileged_path(&Method::POST, "/api/bridge/pairing/pair_abc/approve"));
+        assert!(is_privileged_path(&Method::POST, "/api/bridge/pairing/pair_abc/deny"));
+        assert!(is_privileged_path(&Method::DELETE, "/api/bridge/pairings/tok_abc"), "revoke is privileged");
+        // Seeing WHO is asking, and which apps are paired, is the UI's alone.
+        assert!(is_restricted_read_path("/api/bridge/pairing"), "the pending list is gated");
+        assert!(is_restricted_read_path("/api/bridge/pairings"), "the paired list is gated");
+    }
+
+    #[test]
+    fn a_paired_token_satisfies_the_guard_like_the_configured_one() {
+        use crate::bridge::pairing::PairingManager;
+        let mgr = std::sync::Arc::new(std::sync::Mutex::new(PairingManager::new()));
+        let token = {
+            let mut m = mgr.lock().unwrap();
+            let id = m.request("formlogic", None, None).pairing_id;
+            m.approve(&id).unwrap().token.unwrap()
+        };
+        let auth = AuthConfig { token: None, gui_mode: false, pairing: Some(mgr) };
+        assert!(auth.token_matches(&token), "a paired token authenticates");
+        assert!(!auth.token_matches("oaiypat_wrong"), "a non-granted token does not");
+        // And a configured token still works alongside pairing.
+        let auth2 = AuthConfig {
+            token: Some("cfg".into()),
+            gui_mode: false,
+            pairing: Some(std::sync::Arc::new(std::sync::Mutex::new(PairingManager::new()))),
+        };
+        assert!(auth2.token_matches("cfg"));
+        assert!(!auth2.token_matches("nope"));
     }
 
     #[test]

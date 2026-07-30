@@ -55,6 +55,9 @@ pub struct BridgeState {
     /// gated forwarding path. Shares `plugins` and `ledger` with this state.
     pub host: std::sync::Arc<crate::plugins::PluginHost>,
     pub flows: std::sync::Arc<super::worker::FlowStore>,
+    /// Pairing: minting + validating the tokens an untrusted-origin consumer
+    /// uses to reach privileged routes. Shared with the HTTP auth guard.
+    pub pairing: super::pairing::PairingHandle,
     /// Stable per-install id, echoed in discovery so a consumer can tell two
     /// machines apart in run history.
     pub device_id: String,
@@ -808,6 +811,119 @@ async fn delete_flow(State(st): State<BridgeState>, Path(id): Path<String>) -> a
     }
 }
 
+// ------- pairing -------
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PairingRequestBody {
+    /// Consuming product, e.g. "formlogic". Displayed to the user; not trusted.
+    product: String,
+    #[serde(default)]
+    label: Option<String>,
+}
+
+/// Raise a pairing request. UNAUTHENTICATED by design — its only power is to put
+/// a prompt in front of the user, who is the actual trust boundary. The response
+/// carries the code the consumer shows so the user can confirm it matches the
+/// prompt. The Origin (a real browser cannot forge it) is captured for the
+/// prompt.
+async fn create_pairing(
+    State(st): State<BridgeState>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<PairingRequestBody>,
+) -> axum::response::Response {
+    if body.product.trim().is_empty() {
+        return bridge_error(StatusCode::BAD_REQUEST, "invalid_request", "product is required".into());
+    }
+    let origin = headers
+        .get(axum::http::header::ORIGIN)
+        .and_then(|o| o.to_str().ok())
+        .map(str::to_string);
+    match st.pairing.lock() {
+        Ok(mut mgr) => {
+            let req = mgr.request(&body.product, body.label, origin);
+            (
+                StatusCode::CREATED,
+                Json(json!({ "pairingId": req.pairing_id, "code": req.code, "status": req.status })),
+            )
+                .into_response()
+        }
+        Err(_) => bridge_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", "pairing lock poisoned".into()),
+    }
+}
+
+/// The consumer polls for approval. Open — a pairingId is an unguessable handle,
+/// and the token is only ever returned to whoever holds it. Returns the status
+/// and, once approved, the token exactly once for the consumer to store.
+async fn poll_pairing(State(st): State<BridgeState>, Path(id): Path<String>) -> axum::response::Response {
+    match st.pairing.lock() {
+        Ok(mut mgr) => match mgr.poll(&id) {
+            Some(req) => (
+                StatusCode::OK,
+                Json(json!({ "status": req.status, "token": req.token, "product": req.product })),
+            )
+                .into_response(),
+            None => bridge_error(StatusCode::NOT_FOUND, "invalid_request", format!("unknown pairing {id}")),
+        },
+        Err(_) => bridge_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", "pairing lock poisoned".into()),
+    }
+}
+
+/// Pending requests for the approval UI. PRIVILEGED — only OAIY's own webview (or
+/// a token holder) may see who is asking and act on it.
+async fn list_pending_pairings(State(st): State<BridgeState>) -> axum::response::Response {
+    match st.pairing.lock() {
+        Ok(mut mgr) => (StatusCode::OK, Json(json!({ "pending": mgr.pending() }))).into_response(),
+        Err(_) => bridge_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", "pairing lock poisoned".into()),
+    }
+}
+
+/// Approve a pending request — the user's trust act. PRIVILEGED.
+async fn approve_pairing(State(st): State<BridgeState>, Path(id): Path<String>) -> axum::response::Response {
+    match st.pairing.lock() {
+        Ok(mut mgr) => match mgr.approve(&id) {
+            // The token is not returned here — the requester collects it by
+            // polling, so it only travels to whoever holds the pairingId.
+            Ok(_) => StatusCode::NO_CONTENT.into_response(),
+            Err(e) => bridge_error(StatusCode::CONFLICT, "invalid_request", e),
+        },
+        Err(_) => bridge_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", "pairing lock poisoned".into()),
+    }
+}
+
+/// Deny a pending request. PRIVILEGED.
+async fn deny_pairing(State(st): State<BridgeState>, Path(id): Path<String>) -> axum::response::Response {
+    match st.pairing.lock() {
+        Ok(mut mgr) => match mgr.deny(&id) {
+            Ok(()) => StatusCode::NO_CONTENT.into_response(),
+            Err(e) => bridge_error(StatusCode::NOT_FOUND, "invalid_request", e),
+        },
+        Err(_) => bridge_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", "pairing lock poisoned".into()),
+    }
+}
+
+/// The apps currently paired, secret-free. PRIVILEGED.
+async fn list_paired(State(st): State<BridgeState>) -> axum::response::Response {
+    match st.pairing.lock() {
+        Ok(mgr) => (StatusCode::OK, Json(json!({ "paired": mgr.paired() }))).into_response(),
+        Err(_) => bridge_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", "pairing lock poisoned".into()),
+    }
+}
+
+/// Revoke a granted token by its public id (unpair). PRIVILEGED.
+async fn revoke_pairing(State(st): State<BridgeState>, Path(id): Path<String>) -> axum::response::Response {
+    match st.pairing.lock() {
+        Ok(mut mgr) => {
+            if mgr.revoke(&id) {
+                StatusCode::NO_CONTENT.into_response()
+            } else {
+                bridge_error(StatusCode::NOT_FOUND, "invalid_request", format!("no paired app {id}"))
+            }
+        }
+        Err(_) => bridge_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", "pairing lock poisoned".into()),
+    }
+}
+
 /// The bridge router, ready to `.merge()` into the main app.
 pub fn router(state: BridgeState) -> Router {
     Router::new()
@@ -834,6 +950,12 @@ pub fn router(state: BridgeState) -> Router {
             "/api/bridge/flows/:id",
             axum::routing::put(put_flow).delete(delete_flow),
         )
+        .route("/api/bridge/pairing", get(list_pending_pairings).post(create_pairing))
+        .route("/api/bridge/pairing/:id", get(poll_pairing))
+        .route("/api/bridge/pairing/:id/approve", post(approve_pairing))
+        .route("/api/bridge/pairing/:id/deny", post(deny_pairing))
+        .route("/api/bridge/pairings", get(list_paired))
+        .route("/api/bridge/pairings/:id", axum::routing::delete(revoke_pairing))
         .with_state(state)
 }
 
