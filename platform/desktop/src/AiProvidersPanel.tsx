@@ -300,7 +300,7 @@ export default function AiProvidersPanel() {
           the panel opens on the providers themselves rather than an empty form. */}
       <section className="service-section">
         {showForm ? (
-          <form className="service-card provider-form" onSubmit={submit}>
+          <form className="dl-form" onSubmit={submit}>
             <div className="section-title-row">
               <h3 className="section-title">{editingId ? `Edit ${editingId}` : 'Add a provider'}</h3>
               <button type="button" className="btn-tiny" onClick={resetForm}>

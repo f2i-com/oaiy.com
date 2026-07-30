@@ -1096,8 +1096,8 @@ select:disabled { cursor: not-allowed; opacity: 0.5; }
 
 .form-row-pair { display: flex; flex-wrap: wrap; gap: 10px; }
 
-/* AI Providers add/edit form: even vertical rhythm between rows + a checkbox row. */
-.provider-form { display: flex; flex-direction: column; gap: 12px; margin-bottom: 16px; }
+/* A checkbox that sits inline with its label instead of stacking (the AI provider
+   form's "local endpoint" toggle). The forms themselves reuse .dl-form. */
 .form-row-inline { flex: initial; flex-direction: row; align-items: center; gap: 8px; }
 .form-row-inline > span { font-size: 12px; letter-spacing: normal; text-transform: none; }
 .form-row-inline input[type='checkbox'] { flex: initial; width: auto; margin: 0; }
