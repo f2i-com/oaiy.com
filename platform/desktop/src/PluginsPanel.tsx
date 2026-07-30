@@ -162,8 +162,8 @@ export default function PluginsPanel() {
           <p>No plugins installed.</p>
           <p style={{ fontSize: 13, opacity: 0.7 }}>
             A plugin is a folder with a <code>manifest.json</code> and an executable, placed in the
-            plugins directory above. It runs supervised and speaks the Bridge Protocol — the Aokie
-            phone bridge is one.
+            plugins directory above. It runs supervised and speaks the Bridge Protocol, contributing
+            connectors and events to your flows.
           </p>
         </div>
       ) : (
