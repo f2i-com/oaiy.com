@@ -409,10 +409,21 @@ the schema wins and this document is the bug.
 
 ```
 protocol/
-├── README.md          # you are here
-├── v1/                # JSON Schemas (2020-12), the normative artifacts
-└── tests/             # conformance suite
+├── README.md            # you are here
+├── v1/                  # JSON Schemas (2020-12), the normative artifacts
+├── tests/               # conformance suite
+└── clients/typescript/  # the reference consumer client (@oaiy/bridge-client)
 ```
+
+## Reference client
+
+[`clients/typescript/`](clients/typescript/) is the consumer half — the
+zero-dependency TypeScript client a product (FormLogic first) imports to drive a
+runtime, rather than re-deriving the protocol and drifting from it. It maps the
+`oaiy.runFlow` action from the architecture notes to one call, asserts the health
+identity, and preserves every distinction this document insists on (a duplicate
+is a value, a failed run throws its typed code). See its
+[README](clients/typescript/README.md).
 
 ### Running the conformance suite
 
