@@ -1,5 +1,8 @@
 import { memo, useCallback, useRef, useEffect, useMemo, useState } from 'react';
 import { Position } from '@xyflow/react';
+// Side-effect import: points the loader at the bundled monaco instead of the
+// CDN it defaults to. Must precede the first <Editor> mount.
+import '../../../services/monacoSetup';
 import Editor from '@monaco-editor/react';
 import { useNodeResize, CollapsibleNodeWrapper, type HandleConfig } from 'oaiy-ui-components';
 

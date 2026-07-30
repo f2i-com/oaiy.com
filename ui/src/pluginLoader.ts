@@ -29,6 +29,10 @@ import {
 } from 'oaiy-core';
 import * as OAIYUIComponents from 'oaiy-ui-components';
 import { registerNodeComponent, registerComponentByName } from 'oaiy-ui-components';
+// Plugins get MonacoReact through __PLUGIN_GLOBALS__, so the loader must be
+// pointed at the local copy here too — a plugin opening an editor would
+// otherwise still pull the whole editor from a CDN.
+import './services/monacoSetup';
 import * as MonacoReact from '@monaco-editor/react';
 import { createLogger } from './utils/logger';
 
