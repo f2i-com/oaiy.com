@@ -86,6 +86,13 @@ The frontend talks to the backend over HTTP. Set `VITE_API_BASE` at build time (
 VITE_API_BASE=http://localhost:8080
 ```
 
+> **Put a dev-only value in `ui/.env.development.local`, not `ui/.env.local`.**
+> Vite loads `.env.local` for `vite build` as well as `vite dev`, so a localhost
+> URL there gets baked into your production bundle — and because a non-empty
+> `VITE_API_BASE` is what switches the sharing code path on, the built app then
+> tries to reach a backend that only exists on your machine. Both filenames are
+> gitignored; only `.env.development.local` is dev-scoped.
+
 If `VITE_API_BASE` is empty, the frontend skips all backend calls and operates purely locally (no sharing, no remote dispatch). When set, sharing is still **off by default** — flip the toggle in **Settings → Defaults → Sharing & remote runs** to enable it. The Test Connection button in that panel verifies the backend is reachable.
 
 ## How the sharing model works

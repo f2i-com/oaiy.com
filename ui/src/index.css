@@ -1,5 +1,12 @@
 @import "tailwindcss";
 
+/* Tailwind v4 is CSS-first and does NOT pick up tailwind.config.js on its own.
+   Without this the JS config is dead: its theme extensions and — more visibly —
+   the custom `short:` variant (@media (max-height: 780px), used across 9 dialog
+   components to compact them on short screens) register as nothing, so those
+   utilities silently emit no CSS. */
+@config "../tailwind.config.js";
+
 /* Configure dark mode variant for class-based switching */
 @variant dark (&:where(.dark, .dark *));
 

@@ -6,6 +6,9 @@
  */
 
 import * as esbuild from 'esbuild-wasm';
+// Emitted as a hashed asset by the bundler rather than assumed to exist in
+// public/ — see initializeEsbuild() below.
+import esbuildWasmURL from 'esbuild-wasm/esbuild.wasm?url';
 import type { EmbeddedCustomNode } from 'oaiy-core';
 import { createLogger } from '../utils/logger';
 
@@ -32,21 +35,19 @@ async function initializeEsbuild(): Promise<void> {
   esbuildInitializing = true;
 
   initPromise = (async () => {
-    // Local-only: see pluginCompiler.ts for the rationale. The CDN
-    // fallback was removed in round 4 of the security hardening as a
-    // supply-chain and offline-first concern.
-    const localWasmURL = '/esbuild.wasm';
-
+    // Local-only: the CDN fallback was removed as a supply-chain and
+    // offline-first concern.
+    //
+    // The URL comes from a `?url` import (see the top of this file), so the
+    // bundler resolves it out of node_modules and emits it as a hashed asset.
+    // This used to hard-code `/esbuild.wasm` and HEAD-check it, which meant
+    // custom-node compilation was dead in every build — nothing ever put that
+    // file in public/, so the check always failed and the only symptom was an
+    // error telling you to restore a path that doesn't exist in this repo.
+    // Importing it makes the asset a build dependency instead of an assumption.
     try {
-      const localCheck = await fetch(localWasmURL, { method: 'HEAD' }).catch(() => null);
-      if (!localCheck?.ok) {
-        throw new Error(
-          `esbuild.wasm is not bundled in public/. Refusing to load it from a CDN. ` +
-            `Restore packages/oaiy-desktop/public/esbuild.wasm (run "npm install" / rebuild the desktop bundle).`,
-        );
-      }
-      logger.debug('Using local esbuild.wasm');
-      await esbuild.initialize({ wasmURL: localWasmURL });
+      logger.debug('Using bundled esbuild.wasm', { url: esbuildWasmURL });
+      await esbuild.initialize({ wasmURL: esbuildWasmURL });
       esbuildInitialized = true;
       logger.debug('esbuild-wasm initialized');
     } catch (error) {
