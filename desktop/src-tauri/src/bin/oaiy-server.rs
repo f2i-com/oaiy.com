@@ -308,9 +308,19 @@ async fn main() {
         },
     );
 
+    // Plugins live under the data dir so relocating it takes them along; they
+    // hold their own state and leaving it behind reads as data loss.
+    let bridge = oaiy_desktop_lib::bridge::BridgeState {
+        ledger: oaiy_desktop_lib::bridge::ledger::new_handle(),
+        plugins: oaiy_desktop_lib::plugins::registry::new_handle(data_dir.join("plugins")),
+        device_id: oaiy_desktop_lib::stable_device_id(&data_dir),
+    };
+
     // gui_mode = false: headless server is token-strict (no webview origin).
-    if let Err(e) =
-        http::serve(port, config, auth_token, false, registry, downloads, python, catalog).await
+    if let Err(e) = http::serve(
+        port, config, auth_token, false, registry, downloads, python, catalog, bridge,
+    )
+    .await
     {
         eprintln!("oaiy-server: HTTP server error: {e}");
         std::process::exit(1);

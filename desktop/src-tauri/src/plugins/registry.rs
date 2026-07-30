@@ -49,6 +49,31 @@ pub enum PluginState {
 }
 
 impl PluginState {
+    /// The `capability-manifest` unavailability reason for this state.
+    ///
+    /// Mapped explicitly rather than defaulted, because the codes are what a
+    /// consumer branches on to decide what to tell the user — and the first cut
+    /// of this reported `plugin_crashed` for a plugin that had simply never been
+    /// started, which tells someone their software is broken when it is merely
+    /// idle. "Start it" and "it crashed, look at the logs" are different
+    /// instructions.
+    ///
+    /// Returns `None` for states that ARE available.
+    pub fn unavailable_reason(self, user_disabled: bool) -> Option<&'static str> {
+        match self {
+            PluginState::Running | PluginState::Unhealthy => None,
+            // Present and fine, just not started.
+            PluginState::Installed | PluginState::Stopped => Some("service_stopped"),
+            // Mid-start: not yet usable, and not a fault.
+            PluginState::Starting => Some("service_stopped"),
+            PluginState::Crashed => Some("plugin_crashed"),
+            // A host refusal (bad manifest, unsupported API) is not the user's
+            // opt-out, and the fixes differ.
+            PluginState::Disabled if user_disabled => Some("plugin_disabled"),
+            PluginState::Disabled => Some("not_installed"),
+        }
+    }
+
     /// Can a connector command be forwarded right now?
     pub fn accepts_commands(self) -> bool {
         // `Unhealthy` still accepts: health is a coarse signal, and refusing
@@ -675,6 +700,85 @@ mod tests {
             reg.get("aokie").unwrap().reason.is_none(),
             "a running plugin needs no excuse"
         );
+    }
+
+    #[test]
+    fn a_never_started_plugin_does_not_report_as_crashed() {
+        // Found by driving the live API: discovery reported `plugin_crashed` for a
+        // freshly installed plugin, which tells a user their software broke when
+        // it is merely idle. "Start it" and "it crashed, check the logs" are
+        // different instructions.
+        assert_eq!(
+            PluginState::Installed.unavailable_reason(false),
+            Some("service_stopped")
+        );
+        assert_eq!(
+            PluginState::Stopped.unavailable_reason(false),
+            Some("service_stopped")
+        );
+        assert_eq!(
+            PluginState::Starting.unavailable_reason(false),
+            Some("service_stopped"),
+            "mid-start is not a fault"
+        );
+        assert_eq!(
+            PluginState::Crashed.unavailable_reason(false),
+            Some("plugin_crashed")
+        );
+    }
+
+    #[test]
+    fn an_available_state_has_no_unavailability_reason() {
+        assert_eq!(PluginState::Running.unavailable_reason(false), None);
+        assert_eq!(
+            PluginState::Unhealthy.unavailable_reason(false),
+            None,
+            "unhealthy still serves commands, so it is not unavailable"
+        );
+    }
+
+    #[test]
+    fn a_user_optout_reads_differently_from_a_host_refusal() {
+        assert_eq!(
+            PluginState::Disabled.unavailable_reason(true),
+            Some("plugin_disabled")
+        );
+        assert_eq!(
+            PluginState::Disabled.unavailable_reason(false),
+            Some("not_installed"),
+            "a manifest this host cannot honour is not the user's opt-out"
+        );
+    }
+
+    #[test]
+    fn every_unavailability_reason_is_in_the_protocol_enum() {
+        // `capability-manifest.schema.json` closes this set; an invented code
+        // would fail schema validation at the consumer.
+        const ALLOWED: &[&str] = &[
+            "not_installed",
+            "service_stopped",
+            "connection_missing",
+            "plugin_disabled",
+            "plugin_crashed",
+            "permission_denied",
+            "unsupported_platform",
+            "hardware_missing",
+        ];
+        for st in [
+            PluginState::Installed,
+            PluginState::Stopped,
+            PluginState::Starting,
+            PluginState::Running,
+            PluginState::Unhealthy,
+            PluginState::Crashed,
+            PluginState::Disabled,
+        ] {
+            for ud in [true, false] {
+                if let Some(r) = st.unavailable_reason(ud) {
+                    assert!(ALLOWED.contains(&r), "{st:?}/{ud} -> {r:?} is not in the schema enum");
+                }
+            }
+        }
     }
 
     #[test]

@@ -774,6 +774,9 @@ pub async fn serve(
     downloads: DownloadsHandle,
     python: PythonHandle,
     catalog: CatalogHandle,
+    // Bridge Protocol v1 surface. Passed in rather than constructed here so the
+    // GUI and the headless server can share one ledger with their own lifetimes.
+    bridge: crate::bridge::BridgeState,
 ) -> Result<(), BoxError> {
     // CORS stays permissive so a hosted oaiy-web at any domain can READ the
     // API (the localhost bind keeps non-local processes out). State-changing
@@ -798,6 +801,11 @@ pub async fn serve(
         python,
         catalog,
     };
+
+    // Merged rather than inlined: the bridge owns its own state (the run ledger
+    // + the plugin registry) and should not be threaded through AppState, which
+    // every services/models/python handler would then carry for no reason.
+    let bridge_routes = crate::bridge::bridge_router(bridge);
 
     let app = Router::new()
         .route("/api/health", get(health))
@@ -832,6 +840,11 @@ pub async fn serve(
         .route("/api/python/venvs", post(create_venv))
         .route("/api/python/venvs/:name", delete(delete_venv))
         .with_state(state)
+        // Merged INSIDE the guard layers, not outside: the bridge's POST routes
+        // reserve runs and invoke connector commands, so they need the same
+        // origin/token gate as the services routes. Adding them after `.layer()`
+        // would leave them ungated — reachable by any web page the user has open.
+        .merge(bridge_routes)
         .layer(middleware::from_fn_with_state(
             AuthConfig { token: auth_token, gui_mode },
             origin_guard,
