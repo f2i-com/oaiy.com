@@ -1,0 +1,76 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oaiy.com/schemas/bridge/v1/health.schema.json",
+  "title": "Bridge handshake",
+  "description": "GET /api/health. The first call any client makes. A 200 on a fixed loopback port is not proof you reached OAIY \u2014 an unrelated app has already answered this shape on a neighbouring port \u2014 so `product` must be matched exactly.",
+  "type": "object",
+  "required": [
+    "status",
+    "product",
+    "protocol",
+    "version"
+  ],
+  "properties": {
+    "status": {
+      "enum": [
+        "ok",
+        "degraded"
+      ]
+    },
+    "product": {
+      "type": "string",
+      "description": "Stable machine identity, e.g. `oaiy-desktop`. Never localised. Match on this.",
+      "maxLength": 64
+    },
+    "protocol": {
+      "type": "string",
+      "const": "oaiy-bridge/1",
+      "description": "Protocol the sender speaks. Receivers reject unknown majors rather than guessing."
+    },
+    "version": {
+      "type": "string",
+      "description": "Build version. INFORMATIONAL \u2014 never gate behaviour on it; it moves for reasons unrelated to the wire format.",
+      "maxLength": 32
+    },
+    "runtime": {
+      "enum": [
+        "desktop",
+        "browser",
+        "cli",
+        "cloud"
+      ],
+      "description": "Where execution happens. A capability is offered by a runtime, not by the platform in the abstract."
+    },
+    "deviceId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "description": "Stable per-install id, used to pair this device with a cloud tenant."
+    },
+    "detail": {
+      "type": "string",
+      "maxLength": 500,
+      "description": "Required when status is `degraded`: what is wrong."
+    }
+  },
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "degraded"
+          }
+        },
+        "required": [
+          "status"
+        ]
+      },
+      "then": {
+        "required": [
+          "detail"
+        ]
+      }
+    }
+  ]
+}

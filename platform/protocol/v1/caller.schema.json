@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oaiy.com/schemas/bridge/v1/caller.schema.json",
+  "title": "Caller identity",
+  "description": "Who is asking. Everything but `product` is OPAQUE TO OAIY: stored on the run, echoed back, used for grouping and display, never parsed and never branched on.\n\nThis replaces FormLogic's `appContext.appSlug`, which was a required field naming a FormLogic-only concept \u2014 a coding agent or an OpenAI-compatible client has no app slug and would have to invent one. The moment OAIY special-cases the contents of these fields, the consumer's schema has leaked in and the next consumer has to impersonate the first.",
+  "type": "object",
+  "required": [
+    "product"
+  ],
+  "properties": {
+    "product": {
+      "type": "string",
+      "description": "Consuming product, e.g. `formlogic`, `aokie`, `cli`, `openai-client`.",
+      "pattern": "^[a-z][a-z0-9-]{1,63}$"
+    },
+    "tenantId": {
+      "type": "string",
+      "maxLength": 128,
+      "description": "Opaque owner/tenant id in the caller's own namespace."
+    },
+    "scopeId": {
+      "type": "string",
+      "maxLength": 128,
+      "description": "Opaque sub-scope in the caller's namespace. OAIY must not parse this."
+    },
+    "label": {
+      "type": "string",
+      "maxLength": 200,
+      "description": "Human-readable, for display and logs. The ONLY field here that may carry PII. Treat as untrusted text."
+    }
+  },
+  "additionalProperties": false
+}
