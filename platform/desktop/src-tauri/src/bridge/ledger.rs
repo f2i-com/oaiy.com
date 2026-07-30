@@ -110,6 +110,7 @@ pub enum RunErrorCode {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RunError {
     pub code: RunErrorCode,
     pub message: String,
@@ -119,6 +120,11 @@ pub struct RunError {
     pub node_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub capability: Option<String>,
+    /// Defaulted on deserialize: the schema marks retryable optional, and
+    /// requiring it made a caller's finish body fail to PARSE — surfacing as a
+    /// 422 where the handler meant to answer 409. Found by the double-finish
+    /// probe. Absent means false, the conservative direction.
+    #[serde(default)]
     pub retryable: bool,
 }
 
@@ -219,8 +225,12 @@ pub struct RunRecord {
     /// and kills the child when it flips. Without recording it, `cancel` on a
     /// running run was acknowledged (202) and then went nowhere: no field
     /// existed for the runner to observe.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    #[serde(skip_serializing_if = "std::ops::Not::not", default)]
     pub cancel_requested: bool,
+    /// Convenience for HTTP callers: set only on the Duplicate path by the
+    /// routes layer. Lives on the record so the wire shape has one source.
+    #[serde(skip_serializing_if = "std::ops::Not::not", default)]
+    pub idempotent: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runtime: Option<Runtime>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -229,10 +239,26 @@ pub struct RunRecord {
     pub output: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<RunError>,
+    /// Stored as epoch millis; SERIALIZED as RFC 3339 under the schema's field
+    /// names. The wire is the contract (`run-result.schema.json` says
+    /// `startedAt: date-time`), and the first cut leaked the internal
+    /// representation — `startedAtMs: 1785…` — which a validating consumer
+    /// rejects outright under `additionalProperties: false`.
+    #[serde(rename = "reservedAt", with = "iso_ms")]
     pub reserved_at_ms: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "startedAt",
+        with = "iso_ms_opt",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
     pub started_at_ms: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "finishedAt",
+        with = "iso_ms_opt",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
     pub finished_at_ms: Option<u64>,
     pub lineage: LineageRef,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -262,6 +288,49 @@ pub enum ClaimOutcome {
     /// The run reached a terminal state before anyone claimed it.
     NotClaimable { status: RunStatus },
     Unknown,
+}
+
+/// Epoch-millis <-> RFC 3339, so the stored representation stays cheap while
+/// the wire matches `format: date-time`.
+mod iso_ms {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(ms: &u64, s: S) -> Result<S::Ok, S::Error> {
+        match chrono::DateTime::from_timestamp_millis(*ms as i64) {
+            Some(dt) => s.serialize_str(&dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)),
+            None => Err(serde::ser::Error::custom("timestamp out of range")),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
+        let raw = String::deserialize(d)?;
+        chrono::DateTime::parse_from_rfc3339(&raw)
+            .map(|dt| dt.timestamp_millis() as u64)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+mod iso_ms_opt {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(ms: &Option<u64>, s: S) -> Result<S::Ok, S::Error> {
+        match ms {
+            Some(v) => super::iso_ms::serialize(v, s),
+            // skip_serializing_if handles None; reaching here means a caller
+            // disabled the skip, and null is the honest value.
+            None => s.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
+        let raw = Option::<String>::deserialize(d)?;
+        match raw {
+            None => Ok(None),
+            Some(text) => chrono::DateTime::parse_from_rfc3339(&text)
+                .map(|dt| Some(dt.timestamp_millis() as u64))
+                .map_err(serde::de::Error::custom),
+        }
+    }
 }
 
 fn now_ms() -> u64 {
@@ -301,14 +370,24 @@ impl Ledger {
     /// guard refusal would poison that key and a legitimate retry of the same
     /// logical event could never run.
     pub fn reserve(&mut self, req: &RunRequest) -> ReserveOutcome {
-        if let Some(reason) = self.guard_violation(req) {
-            return ReserveOutcome::Refused { reason };
-        }
-
+        // Duplicates BEFORE guards. A retried triggered request — same key, same
+        // lineage, redelivered webhook — used to hit guard 3 first ("this
+        // binding already handled this event") and get a Refused, which the HTTP
+        // layer maps to 422 "stop retrying". The caller then never learned the
+        // original runId, so the run's outcome was unreachable to the very
+        // consumer that triggered it. The review caught it: the duplicate-key
+        // tests all used empty lineage, which disables guard 3. A retry of an
+        // already-reserved request is by definition a Duplicate, whatever its
+        // lineage says. Neither ordering consumes the key on refusal, so the
+        // guard-refusal-does-not-poison-the-key property is unchanged.
         if let Some(existing_id) = self.by_key.get(&req.idempotency_key) {
             if let Some(rec) = self.runs.get(existing_id) {
                 return ReserveOutcome::Duplicate(rec.clone());
             }
+        }
+
+        if let Some(reason) = self.guard_violation(req) {
+            return ReserveOutcome::Refused { reason };
         }
 
         self.seq += 1;
@@ -328,6 +407,7 @@ impl Ledger {
             claimed_by: None,
             output: None,
             error: None,
+            idempotent: false,
             reserved_at_ms: now_ms(),
             started_at_ms: None,
             finished_at_ms: None,
@@ -884,6 +964,83 @@ mod tests {
     }
 
     // --- serialisation matches the protocol's vocabulary -------------------
+
+    #[test]
+    fn the_wire_shape_matches_the_schema_not_the_storage() {
+        // run-result.schema.json says `startedAt: date-time` under
+        // additionalProperties:false. The first cut leaked the storage
+        // representation — startedAtMs: 1785… — so every response failed
+        // validation at a conforming consumer. The conformance suite now
+        // refuses the Ms spelling; this is the Rust side of the same pin.
+        let mut l = Ledger::new();
+        let rec = match l.reserve(&req("k")) {
+            ReserveOutcome::Reserved(r) => r,
+            o => panic!("{o:?}"),
+        };
+        l.claim(&rec.run_id, Runtime::Desktop, "dev-1").ok_claimed();
+        l.finish(
+            &rec.run_id,
+            RunStatus::Failed,
+            None,
+            Some(RunError {
+                code: RunErrorCode::NodeFailed,
+                message: "boom".into(),
+                detail: None,
+                node_id: Some("n1".into()),
+                capability: None,
+                retryable: true,
+            }),
+        )
+        .unwrap();
+
+        let v = serde_json::to_value(l.get(&rec.run_id).unwrap()).unwrap();
+        let obj = v.as_object().unwrap();
+
+        for leaked in ["reservedAtMs", "startedAtMs", "finishedAtMs", "node_id"] {
+            assert!(
+                !v.to_string().contains(leaked),
+                "{leaked} leaked into the wire: {v}"
+            );
+        }
+        for (field, _) in [("reservedAt", 0), ("startedAt", 0), ("finishedAt", 0)] {
+            let s = obj
+                .get(field)
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_else(|| panic!("{field} missing or not a string: {v}"));
+            assert!(
+                s.contains('T') && s.ends_with('Z'),
+                "{field} must be RFC 3339 UTC: {s}"
+            );
+        }
+        assert_eq!(v["error"]["nodeId"], "n1", "RunError must be camelCase: {v}");
+
+        // And it round-trips, so a stored record can be re-read.
+        let back: RunRecord = serde_json::from_value(v).unwrap();
+        assert_eq!(back.run_id, rec.run_id);
+        assert!(back.started_at_ms.is_some());
+    }
+
+    #[test]
+    fn a_retried_triggered_request_is_a_duplicate_not_a_guard_refusal() {
+        // The review's finding: guards ran before the idempotency lookup, so a
+        // redelivered webhook carrying lineage hit guard 3 ("already handled")
+        // and got a 422 "stop retrying" — losing the caller its only route to
+        // the original runId. The duplicate-key tests all used empty lineage,
+        // which disables guard 3, so they never noticed.
+        let mut l = Ledger::new();
+        let first = triggered("same-key", "root", "root", "b1", "flow.succeeded", 1);
+        let original = match l.reserve(&first) {
+            ReserveOutcome::Reserved(r) => r,
+            o => panic!("{o:?}"),
+        };
+
+        // The identical request, redelivered.
+        let retry = triggered("same-key", "root", "root", "b1", "flow.succeeded", 1);
+        match l.reserve(&retry) {
+            ReserveOutcome::Duplicate(r) => assert_eq!(r.run_id, original.run_id),
+            o => panic!("a retry with lineage must be a Duplicate, got {o:?}"),
+        }
+    }
 
     #[test]
     fn status_serialises_as_the_protocol_spells_it() {

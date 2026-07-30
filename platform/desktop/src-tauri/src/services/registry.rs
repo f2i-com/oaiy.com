@@ -1856,7 +1856,7 @@ impl Registry {
 /// Kill a process and its descendants. The installer shell spawns pip /
 /// python downloaders; a plain kill of the shell would orphan them (they'd
 /// keep downloading), so use the OS tree-kill.
-fn kill_process_tree(pid: u32) {
+pub(crate) fn kill_process_tree(pid: u32) {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;

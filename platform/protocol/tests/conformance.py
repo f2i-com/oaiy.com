@@ -199,6 +199,22 @@ CASES: list[tuple[str, str, dict, bool]] = [
     ("run-result.schema.json", "failed WITH a typed error is accepted",
      {"runId": "run_1", "status": "failed",
       "error": {"code": "node_failed", "message": "Krea-2 refused the prompt.", "nodeId": "img_1"}}, True),
+    ("run-result.schema.json", "a full desktop-runtime record validates",
+     {"runId": "run_1", "status": "succeeded", "callerProduct": "oaiy-trigger:fake",
+      "flowId": "hello", "correlationId": "corr_1", "idempotencyKey": "binding:b:e",
+      "input": {"greeting": "hi"}, "mode": "async", "runtime": "desktop",
+      "claimedBy": "dev_1", "output": {"ok": True},
+      "reservedAt": "2026-07-30T04:12:09.100Z", "startedAt": "2026-07-30T04:12:09.400Z",
+      "finishedAt": "2026-07-30T04:12:11.000Z",
+      "lineage": {"rootRunId": None, "parentRunId": None, "bindingId": "b", "depth": 1},
+      "triggerEvent": "fake.thing.happened"}, True),
+    ("run-result.schema.json", "the internal epoch-ms spelling is refused",
+     # The regression: the runtime once serialized its storage representation
+     # (startedAtMs: 1785…) instead of the schema's date-time strings, and a
+     # validating consumer rejects the whole record.
+     {"runId": "run_1", "status": "succeeded", "startedAtMs": 1785393905283}, False),
+    ("error.schema.json", "the snake_case nodeId spelling is refused",
+     {"code": "node_failed", "message": "x", "node_id": "n1"}, False),
     ("run-result.schema.json", "an invented status is refused",
      {"runId": "run_1", "status": "mostly_fine"}, False),
     ("run-result.schema.json", "'done' (the FormLogic status) is refused",
