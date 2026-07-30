@@ -7,6 +7,7 @@
 
 pub mod http;
 pub mod services;
+pub mod bridge;
 
 /// Port the localhost API binds to. Fixed so oaiy-web's detection probe has a
 /// stable target. Shared by both binaries (the GUI and the headless server).
