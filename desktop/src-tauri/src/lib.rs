@@ -1140,6 +1140,8 @@ pub fn run() {
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                     if let Ok(mut reg) = registry_for_reaper.lock() {
                         reg.reap_exited();
+                        // Retry anything whose crash backoff has elapsed.
+                        reg.run_scheduled_restarts();
                     }
                     python_for_reaper.reap_exited();
                 }

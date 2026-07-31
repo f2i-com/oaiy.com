@@ -79,6 +79,12 @@ export interface ServiceSnapshot {
   /** GPU index this service is pinned to (CUDA_VISIBLE_DEVICES), or null for default
    *  placement. Set via the GPU picker. */
   gpu: number | null;
+  /** Consecutive automatic restarts since it last ran healthily. */
+  restartAttempts?: number;
+  /** Why it died last time — survives the restart that replaces its log buffer. */
+  lastCrash?: { code: number; at: string; detail?: string | null } | null;
+  /** Automatic recovery gave up; a human needs to look (offer Repair). */
+  needsRepair?: boolean;
 }
 
 /** A CUDA GPU present on the machine (from nvidia-smi). */
@@ -158,6 +164,9 @@ export const services = {
     request<void>(`/api/services/${encodeURIComponent(id)}/start`, {
       method: 'POST',
     }),
+  /** Clear a tripped crash breaker and start from a clean slate. */
+  repair: (id: string) =>
+    request<void>(`/api/services/${encodeURIComponent(id)}/repair`, { method: 'POST' }),
   stop: (id: string) =>
     request<void>(`/api/services/${encodeURIComponent(id)}/stop`, {
       method: 'POST',

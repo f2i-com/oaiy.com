@@ -231,7 +231,12 @@ async fn main() {
                 // Recover from poison so reaping survives a panic that poisoned the
                 // mutex (otherwise exited children stop being reaped for the process
                 // lifetime).
-                registry.lock().unwrap_or_else(|e| e.into_inner()).reap_exited();
+                {
+                    let mut reg = registry.lock().unwrap_or_else(|e| e.into_inner());
+                    reg.reap_exited();
+                    // Retry anything whose crash backoff has elapsed.
+                    reg.run_scheduled_restarts();
+                }
                 python.reap_exited();
             }
         });

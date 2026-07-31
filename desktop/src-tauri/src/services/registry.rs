@@ -146,6 +146,11 @@ pub enum ServiceStatus {
     Errored,
 }
 
+/// Automatic restarts before the breaker trips and a human is required.
+const MAX_RESTART_ATTEMPTS: u32 = 5;
+/// Stay up this long and the crash counter resets.
+const RESTART_QUIET_SECS: i64 = 60;
+
 /// Runtime status of one service.
 #[derive(Clone)]
 pub struct ServiceRuntime {
@@ -160,6 +165,26 @@ pub struct ServiceRuntime {
     pub installer: Option<Arc<Runner>>,
     pub port: u16,
     pub last_status_change: DateTime<Utc>,
+    /// Consecutive automatic restarts since this service last ran healthily.
+    /// Reset once it stays up past the quiet period, so an occasional crash a
+    /// week apart never trips the breaker.
+    pub restart_attempts: u32,
+    /// When the next scheduled restart is due (exponential backoff).
+    pub restart_at: Option<DateTime<Utc>>,
+    /// Why it died last time — kept ACROSS restarts, because the runner's log
+    /// buffer is replaced by the next start and "it's erroring" with no cause is
+    /// the least useful thing we can tell an operator.
+    pub last_crash: Option<ExitDiagnostics>,
+}
+
+/// A structured record of an unexpected exit, preserved across restarts.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExitDiagnostics {
+    pub code: i32,
+    pub at: DateTime<Utc>,
+    /// The tail of what the process said before dying.
+    pub detail: Option<String>,
 }
 
 impl ServiceRuntime {
@@ -173,6 +198,9 @@ impl ServiceRuntime {
             installer: None,
             port,
             last_status_change: Utc::now(),
+            restart_attempts: 0,
+            restart_at: None,
+            last_crash: None,
         }
     }
 
@@ -213,6 +241,13 @@ pub struct ServiceSnapshot {
     /// How to call this service as a flow node (from the template), so the web
     /// app can surface it pre-wired. None → the client falls back to a convention.
     pub node: Option<NodeSpec>,
+    /// Consecutive automatic restarts since it last ran healthily.
+    pub restart_attempts: u32,
+    /// Why it died last time, kept across restarts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_crash: Option<ExitDiagnostics>,
+    /// The breaker has tripped — automatic recovery gave up.
+    pub needs_repair: bool,
 }
 
 /// Result of `ensure_by_port` — surfaced to oaiy-web so it can tell the
@@ -1033,6 +1068,65 @@ impl Registry {
         started
     }
 
+    /// Start anything whose backoff has elapsed. Driven by the same tick as
+    /// `reap_exited`, so a crash at 3am is retried without anyone present.
+    pub fn run_scheduled_restarts(&mut self) -> Vec<String> {
+        let now = Utc::now();
+        let due: Vec<String> = self
+            .services
+            .values()
+            .filter(|s| s.restart_at.map(|t| t <= now).unwrap_or(false))
+            .map(|s| s.template.id.clone())
+            .collect();
+        let mut started = Vec::new();
+        for id in due {
+            if let Some(svc) = self.services.get_mut(&id) {
+                svc.restart_at = None;
+            }
+            match self.start(&id) {
+                Ok(()) => started.push(id),
+                Err(_) => {
+                    // start() has already recorded the error. Schedule the next
+                    // attempt (or trip the breaker) so a service that cannot even
+                    // spawn is retried on the same bounded schedule.
+                    if let Some(svc) = self.services.get_mut(&id) {
+                        if svc.restart_attempts < MAX_RESTART_ATTEMPTS {
+                            let delay = 2i64.saturating_pow(svc.restart_attempts + 1);
+                            svc.restart_attempts += 1;
+                            svc.restart_at = Some(Utc::now() + chrono::Duration::seconds(delay));
+                        }
+                    }
+                }
+            }
+        }
+        started
+    }
+
+    /// Operator "Repair": clear the breaker and try again from a clean slate.
+    ///
+    /// Also tears down any process tree still holding on from the last run —
+    /// the classic wedge is a dead-but-not-reaped child keeping the port, where
+    /// a plain Start just loses the bind race and looks broken for no reason.
+    pub fn repair(&mut self, id: &str) -> Result<(), String> {
+        {
+            let svc = self
+                .services
+                .get_mut(id)
+                .ok_or_else(|| format!("unknown service {id:?}"))?;
+            if let Some(runner) = &svc.runner {
+                kill_process_tree(runner.pid);
+            }
+            if let Some(installer) = &svc.installer {
+                kill_process_tree(installer.pid);
+            }
+            svc.runner = None;
+            svc.restart_attempts = 0;
+            svc.restart_at = None;
+            svc.set_status(ServiceStatus::Stopped, None);
+        }
+        self.start(id)
+    }
+
     pub fn snapshot(&self) -> RegistrySnapshot {
         let mut services: Vec<ServiceSnapshot> = self
             .services
@@ -1049,6 +1143,12 @@ impl Registry {
                 pid: s.runner.as_ref().map(|r| r.pid),
                 started_at: s.runner.as_ref().map(|r| r.started_at),
                 last_status_change: s.last_status_change,
+                restart_attempts: s.restart_attempts,
+                last_crash: s.last_crash.clone(),
+                // True once the breaker has tripped: automatic recovery is done
+                // and a human needs to look (the UI offers Repair).
+                needs_repair: s.status == ServiceStatus::Errored
+                    && s.restart_attempts >= MAX_RESTART_ATTEMPTS,
                 docs_url: s.template.docs_url.clone(),
                 installable: !matches!(s.template.install, InstallSpec::None),
                 uninstallable: s.template.uninstall.is_some(),
@@ -1461,6 +1561,46 @@ impl Registry {
                 if let Some(code) = runner.check_exited() {
                     let msg = format!("process exited (code {code}) — open Logs for details");
                     let err = if code == 0 { None } else { Some(msg) };
+                    if code != 0 {
+                        // A service that stayed up past the quiet period earned a
+                        // clean slate: an occasional crash days apart must not
+                        // accumulate into a tripped breaker.
+                        let uptime_ok =
+                            (Utc::now() - runner.started_at).num_seconds() >= RESTART_QUIET_SECS;
+                        if uptime_ok {
+                            svc.restart_attempts = 0;
+                        }
+                        svc.last_crash = Some(ExitDiagnostics {
+                            code,
+                            at: Utc::now(),
+                            // The tail of what it said before dying: the runner's
+                            // buffer is replaced by the next start, so capture it now.
+                            detail: {
+                                let lines = runner.logs.snapshot(Some(3));
+                                (!lines.is_empty()).then(|| {
+                                    lines
+                                        .iter()
+                                        .map(|l| l.text.trim())
+                                        .filter(|t| !t.is_empty())
+                                        .collect::<Vec<_>>()
+                                        .join(" | ")
+                                })
+                                .filter(|t: &String| !t.is_empty())
+                            },
+                        });
+                        if svc.restart_attempts < MAX_RESTART_ATTEMPTS {
+                            // Exponential backoff: a service crashing because a
+                            // port is still held, or a GPU is busy, usually
+                            // succeeds a few seconds later; one that is genuinely
+                            // broken should not be respawned in a tight loop.
+                            let delay = 2i64.saturating_pow(svc.restart_attempts + 1);
+                            svc.restart_attempts += 1;
+                            svc.restart_at =
+                                Some(Utc::now() + chrono::Duration::seconds(delay));
+                        } else {
+                            svc.restart_at = None;
+                        }
+                    }
                     // KEEP the runner (and its LogBuffer) so a crashed service's
                     // stderr/traceback stays visible in the LogsViewer — dropping
                     // it here made crash logs vanish the instant the process died
