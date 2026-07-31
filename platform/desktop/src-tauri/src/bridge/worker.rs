@@ -231,7 +231,34 @@ fn lookup_on_path(name: &str) -> Option<PathBuf> {
 /// Uses the SAME resolution a run does, so status cannot claim the runtime is
 /// ready while an actual run fails with `runtime_unavailable` (or the reverse).
 pub fn cli_status() -> Option<CliInvocation> {
-    resolve_cli(std::env::var("OAIY_CLI").ok().as_deref(), bundled_cli_script, lookup_on_path)
+    /// How long a resolution is reused. The CLI is bundled with the app or sits
+    /// on PATH; neither changes while the process runs, short of the user
+    /// installing one — which a minute of staleness covers.
+    const TTL: std::time::Duration = std::time::Duration::from_secs(60);
+    static CACHE: std::sync::Mutex<Option<(std::time::Instant, Option<CliInvocation>)>> =
+        std::sync::Mutex::new(None);
+
+    // Resolving falls through to `where oaiy`, i.e. a child process — and the
+    // readiness endpoint that calls this is polled every few seconds by the UI.
+    // Uncached, that spawned a process per poll to answer a question whose
+    // answer does not change, inside an async handler where a blocking spawn
+    // occupies a runtime worker.
+    if let Ok(cache) = CACHE.lock() {
+        if let Some((at, cached)) = cache.as_ref() {
+            if at.elapsed() < TTL {
+                return cached.clone();
+            }
+        }
+    }
+    let resolved = resolve_cli(
+        std::env::var("OAIY_CLI").ok().as_deref(),
+        bundled_cli_script,
+        lookup_on_path,
+    );
+    if let Ok(mut cache) = CACHE.lock() {
+        *cache = Some((std::time::Instant::now(), resolved.clone()));
+    }
+    resolved
 }
 
 pub struct Worker {
