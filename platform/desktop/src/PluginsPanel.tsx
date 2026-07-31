@@ -20,6 +20,7 @@ import {
   serviceDefinitions,
   type ServiceDefinition,
 } from './api';
+import { peek, put } from './useCached';
 import { useToast } from './Toasts';
 import LogsViewer from './LogsViewer';
 
@@ -58,7 +59,8 @@ function isLoadable(p: PluginRecord): boolean {
 
 export default function PluginsPanel() {
   const toast = useToast();
-  const [snapshot, setSnapshot] = useState<PluginsSnapshot | null>(null);
+  // Last known snapshot, so a revisit renders the plugin list immediately.
+  const [snapshot, setSnapshot] = useState<PluginsSnapshot | null>(() => peek('pluginsSnapshot') ?? null);
   const [error, setError] = useState<string | null>(null);
   const [pending, setPending] = useState<Set<string>>(new Set());
   const [logsFor, setLogsFor] = useState<string | null>(null);
@@ -66,7 +68,7 @@ export default function PluginsPanel() {
   const [installSource, setInstallSource] = useState('');
   const [installing, setInstalling] = useState(false);
   /** Action surfaces the installed plugins contribute. */
-  const [definitions, setDefinitions] = useState<ServiceDefinition[]>([]);
+  const [definitions, setDefinitions] = useState<ServiceDefinition[]>(() => peek('definitions') ?? []);
   // Track state per plugin so we toast on a transition (crash, came up),
   // not on every poll — same pattern the Services panel uses.
   const seen = useRef<Map<string, PluginState>>(new Map());
@@ -99,8 +101,12 @@ export default function PluginsPanel() {
       }
       firstPoll.current = false;
       setSnapshot(snap);
+      put('pluginsSnapshot', snap);
+      put('plugins', snap.plugins);
       try {
-        setDefinitions((await serviceDefinitions.list()).definitions);
+        const defs = (await serviceDefinitions.list()).definitions;
+        setDefinitions(defs);
+        put('definitions', defs);
       } catch {
         /* a definition listing failure must not blank the plugin list */
       }

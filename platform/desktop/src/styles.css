@@ -546,8 +546,20 @@ kbd {
 /* The panels' own root. */
 .panel { display: flex; max-width: 1000px; flex-direction: column; gap: 14px; }
 
-/* Calm one-time staggered reveal, as before. */
+/* Calm one-time staggered reveal.
+   "One-time" is load-bearing: switching views remounts the content, so without
+   the `.revisit` opt-out below the app replayed a 0.42s animation with up to
+   0.24s of stagger on EVERY navigation — which reads as the interface lagging,
+   even when the data was already in hand. */
 .panel > * { animation: rise 0.42s cubic-bezier(0.2, 0.8, 0.2, 1) both; }
+
+/* A panel the user has already seen this session appears instantly. */
+.content-page.revisit .panel > * { animation: none; }
+
+/* Respect a reduced-motion preference everywhere, not just on revisits. */
+@media (prefers-reduced-motion: reduce) {
+  .panel > * { animation: none; }
+}
 .panel > *:nth-child(2) { animation-delay: 0.05s; }
 .panel > *:nth-child(3) { animation-delay: 0.1s; }
 .panel > *:nth-child(4) { animation-delay: 0.15s; }

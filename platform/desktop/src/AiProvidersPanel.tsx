@@ -17,6 +17,7 @@ import {
   type AiProviderInput,
   type AiProviderPublic,
 } from './api';
+import { peek, put } from './useCached';
 import { useToast } from './Toasts';
 import ChatGptConnector from './ChatGptConnector';
 
@@ -96,7 +97,8 @@ function cardStatus(p: AiProviderPublic): string {
 
 export default function AiProvidersPanel() {
   const toast = useToast();
-  const [providers, setProviders] = useState<AiProviderPublic[] | null>(null);
+  // Seeded from cache so reopening Providers doesn't flash "Loading providers…".
+  const [providers, setProviders] = useState<AiProviderPublic[] | null>(() => peek('providers') ?? null);
   /** Set only when the LIST fetch fails, so a failed first load shows a retry
    *  instead of an eternal "Loading providers…". */
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -117,6 +119,7 @@ export default function AiProvidersPanel() {
     try {
       const res = await aiProviders.list();
       setProviders(res.providers);
+      put('providers', res.providers);
       setLoadError(null);
     } catch (e) {
       setLoadError(e instanceof Error ? e.message : String(e));

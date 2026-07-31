@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   Check,
   ChevronRight,
@@ -138,6 +138,8 @@ export default function App() {
   const [view, setView] = useState<View>('overview');
   /** Nav entries contributed by installed plugins (`manifest.ui.nav[]`). */
   const [pluginNav, setPluginNav] = useState<PluginNavEntry[]>([]);
+  /** Views already opened this session — they skip the entrance animation. */
+  const visited = useRef<Set<string>>(new Set()).current;
   const [theme, setThemeState] = useState<ThemeMode>(initialTheme);
   const [copied, setCopied] = useState(false);
 
@@ -248,6 +250,11 @@ export default function App() {
       setView('overview');
     }
   }, [view, pluginNav]);
+
+  // Mark AFTER render: the first open of a view still animates, a return does not.
+  useEffect(() => {
+    visited.add(view);
+  }, [view, visited]);
 
   // One derived state drives the engine card, the topbar readout and the dock.
   const link: 'up' | 'down' | 'pending' = health ? 'up' : healthError ? 'down' : 'pending';
@@ -445,7 +452,12 @@ export default function App() {
           {/* keyed so React remounts the scroller on a view change — otherwise
               the next view opens at the previous one's scroll offset, i.e.
               mid-content. */}
-          <div className="content-page" key={view}>
+          {/* Keyed so React remounts the scroller on a view change — otherwise
+              the next view opens at the previous one's scroll offset. `revisit`
+              suppresses the entrance animation the second time you open a panel,
+              so navigation feels instant instead of replaying a staggered reveal
+              on every switch. */}
+          <div className={visited.has(view) ? 'content-page revisit' : 'content-page'} key={view}>
             <PairingPrompt />
             <div className="page-intro">
               <div>
