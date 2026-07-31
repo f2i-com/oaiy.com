@@ -83,6 +83,9 @@ pub struct DesktopConfig {
     /// picked one (else none — there is no implicit default). Shown in the
     /// service's Model picker.
     pub llama_model: Option<String>,
+    /// The multimodal projector loaded beside `llama_model`, if the user picked
+    /// one. Surfaced so the picker can show the current choice.
+    pub llama_mmproj: Option<String>,
     /// The model NAME a multi-model server (Ollama) is set to use, if the user
     /// picked one (else the pre-pulled default). Shown in its Model picker.
     pub ollama_model: Option<String>,

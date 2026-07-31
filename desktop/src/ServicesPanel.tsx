@@ -749,6 +749,94 @@ function LlamaModelSelector({ running }: { running: boolean }) {
 }
 
 /**
+ * The multimodal projector loaded beside the llama.cpp model.
+ *
+ * Separate from the Model picker because it is a different KIND of choice: the
+ * model list excludes `mmproj*` files (a projector cannot be run on its own),
+ * and a projector is optional in a way a model is not — no model means the
+ * service refuses to start, no projector just means text-only.
+ *
+ * Suggests the projector whose filename shares the model's stem, because that
+ * is how they ship (`gemma-4-e2b-q4_k_m.gguf` next to
+ * `gemma-4-e2b-mmproj-F16.gguf`) and pairing the wrong one produces a server
+ * that loads and then answers nonsense.
+ */
+function LlamaMmprojSelector({ running }: { running: boolean }) {
+  const [files, setFiles] = useState<string[]>([]);
+  const [current, setCurrent] = useState<string>('');
+  const [model, setModel] = useState<string>('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let alive = true;
+    Promise.all([appConfig.listMmprojFiles(), appConfig.get()])
+      .then(([list, cfg]) => {
+        if (!alive) return;
+        setFiles(list);
+        setCurrent(cfg.llamaMmproj ?? '');
+        setModel(cfg.llamaModel ?? '');
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  const apply = async (path: string) => {
+    setBusy(true);
+    setError(null);
+    try {
+      await appConfig.setLlamaMmproj(path);
+      setCurrent(path);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  // Same stem as the chosen model, ignoring the quantisation suffix.
+  const stem = (p: string) =>
+    (p.split(/[\\/]/).pop() ?? '').toLowerCase().replace(/\.gguf$/, '');
+  const modelStem = stem(model).replace(/-(q\d[^-]*|f16|bf16|fp16)$/i, '');
+  const suggestion =
+    !current && modelStem
+      ? files.find((f) => stem(f).includes(modelStem.split('-').slice(0, 3).join('-')))
+      : undefined;
+
+  if (files.length === 0) return null;
+
+  return (
+    <div style={MODEL_SELECTOR_ROW_STYLE}>
+      <span style={{ fontWeight: 600 }}>Vision / audio</span>
+      <select value={current} disabled={busy} onChange={(e) => void apply(e.target.value)}>
+        <option value="">— None (text only) —</option>
+        {files.map((f) => (
+          <option key={f} value={f}>
+            {f.split(/[\\/]/).pop()}
+          </option>
+        ))}
+      </select>
+      {suggestion && (
+        <button className="btn-tiny" disabled={busy} onClick={() => void apply(suggestion)}>
+          Use {suggestion.split(/[\\/]/).pop()}
+        </button>
+      )}
+      {current && running && (
+        <span className="warn">restart the service to load it</span>
+      )}
+      {current && !running && (
+        <span className="form-hint">
+          adds image and audio input; costs extra VRAM
+        </span>
+      )}
+      {error && <span className="service-error">⚠ {error}</span>}
+    </div>
+  );
+}
+
+/**
  * Model selector for multi-model servers (Ollama). Lists the models PULLED into
  * the running Ollama server (its /api/tags) and lets the user pick one — or type
  * a name they've pulled. The choice is the model NAME sent in each request,
@@ -933,9 +1021,14 @@ function ServiceCard({
             <div className="service-error">⚠ {service.error}</div>
           )}
           {service.id === 'llama-cpp' && (
-            <LlamaModelSelector
-              running={service.status === 'running' || service.status === 'starting'}
-            />
+            <>
+              <LlamaModelSelector
+                running={service.status === 'running' || service.status === 'starting'}
+              />
+              <LlamaMmprojSelector
+                running={service.status === 'running' || service.status === 'starting'}
+              />
+            </>
           )}
           {service.id === 'ollama' && (
             <OllamaModelSelector

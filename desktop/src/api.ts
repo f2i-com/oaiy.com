@@ -791,6 +791,8 @@ export interface DesktopConfig {
   /** The GGUF a single-model server (llama.cpp) is set to load, if the user
    * picked one in its Model selector (null = the `model.gguf` default). */
   llamaModel: string | null;
+  /** Multimodal projector loaded beside the model, if any. */
+  llamaMmproj: string | null;
 
   /** The model name the Ollama node uses, if the user picked one in its Model
    * selector (null = the pre-pulled default qwen2.5:0.5b). */
@@ -849,9 +851,13 @@ export const appConfig = {
   // ----- single-model server (llama.cpp) model selection -----
   /** Loadable GGUFs discovered across the model folders — the picker options. */
   listGgufModels: () => tauriInvoke<string[]>('list_gguf_models'),
+  /** Multimodal projectors, which the model list deliberately excludes. */
+  listMmprojFiles: () => tauriInvoke<string[]>('list_mmproj_files'),
   /** Set (or reset, with '') which GGUF the llama.cpp server loads. Applies to
    * the next start of the service — no app restart needed. */
   setLlamaModel: (path: string) => tauriInvoke<void>('set_llama_model', { path }),
+  /** Load a projector beside the model (''  clears it, back to text-only). */
+  setLlamaMmproj: (path: string) => tauriInvoke<void>('set_llama_mmproj', { path }),
 
   // ----- multi-model server (Ollama) model selection -----
   /** Models pulled into the running Ollama server — the Ollama picker options

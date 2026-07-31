@@ -434,6 +434,15 @@ fn read_llama_model_override(app: &tauri::AppHandle) -> Option<String> {
     read_config_str(app, "llamaModel")
 }
 
+/// The multimodal projector chosen beside the model, if any.
+fn read_llama_mmproj_override(app: &tauri::AppHandle) -> Option<String> {
+    read_config_str(app, "llamaMmproj")
+}
+
+fn write_llama_mmproj_override(app: &tauri::AppHandle, path: Option<&str>) -> Result<(), String> {
+    write_config_str(app, "llamaMmproj", path)
+}
+
 fn write_llama_model_override(app: &tauri::AppHandle, model: Option<&str>) -> Result<(), String> {
     write_config_str(app, "llamaModel", model)
 }
@@ -643,6 +652,7 @@ pub(crate) fn config_snapshot(app: &tauri::AppHandle, registry: &RegistryHandle)
         models_default_dir,
         models_configured_dir,
         llama_model: read_llama_model_override(app),
+        llama_mmproj: read_llama_mmproj_override(app),
         ollama_model: read_ollama_model_override(app),
     }
 }
@@ -848,6 +858,46 @@ fn set_llama_model(
         r.set_llama_model(value.map(str::to_string));
     }
     Ok(())
+}
+
+/// Tauri command: set (or clear, with '') the multimodal projector loaded
+/// beside the llama.cpp model.
+///
+/// Clearing is a first-class action, not an oversight: a projector costs real
+/// VRAM (~1.2 GiB for gemma-4-e2b) and forces llama.cpp's device fitting off,
+/// so a user who only wants text should be able to put the model back to
+/// text-only without re-picking it.
+#[tauri::command]
+fn set_llama_mmproj(
+    app: tauri::AppHandle,
+    registry: tauri::State<RegistryHandle>,
+    path: String,
+) -> Result<(), String> {
+    let trimmed = path.trim();
+    let value = if trimmed.is_empty() { None } else { Some(trimmed) };
+    if let Some(v) = value {
+        if !PathBuf::from(v).is_file() {
+            return Err(format!("not a file: {v}"));
+        }
+    }
+    write_llama_mmproj_override(&app, value)?;
+    if let Ok(mut r) = registry.lock() {
+        r.set_llama_mmproj(value.map(str::to_string));
+    }
+    Ok(())
+}
+
+/// Tauri command: the projector files OAIY can see, for the picker.
+///
+/// The main model list deliberately EXCLUDES `mmproj*` files — a projector is
+/// not a model you can run — so they need their own listing or they would be
+/// invisible everywhere.
+#[tauri::command(async)]
+fn list_mmproj_files(registry: tauri::State<RegistryHandle>) -> Vec<String> {
+    registry
+        .lock()
+        .map(|r| r.list_mmproj_files())
+        .unwrap_or_default()
 }
 
 /// Tauri command: set (or clear, with '') the Ollama model NAME a node uses.
@@ -1245,6 +1295,8 @@ pub fn run() {
             remove_model_dir,
             list_gguf_models,
             set_llama_model,
+            set_llama_mmproj,
+            list_mmproj_files,
             set_ollama_model,
             list_gpus,
             set_service_gpu,
@@ -1296,6 +1348,7 @@ pub fn run() {
             // registry so the next flow-triggered start loads it — no restart.
             if let Ok(mut r) = registry.lock() {
                 r.set_llama_model(read_llama_model_override(app.handle()));
+                r.set_llama_mmproj(read_llama_mmproj_override(app.handle()));
                 r.set_ollama_model(read_ollama_model_override(app.handle()));
                 // Drop GPU pins to cards that no longer exist (removed / re-imaged box) —
                 // otherwise start() would export CUDA_VISIBLE_DEVICES at a missing index and

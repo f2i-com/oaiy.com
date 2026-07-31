@@ -14,6 +14,7 @@
 //!   OAIY_SERVER_TOKEN    bearer token gating privileged routes    [none]
 //!   OAIY_HF_TOKEN        HuggingFace token for gated downloads    [none]
 //!   OAIY_LLAMACPP_MODEL  GGUF the llama-cpp service loads         [none]
+//!   OAIY_LLAMACPP_MMPROJ mmproj projector for vision/audio input  [none]
 //!                       (the headless equivalent of the Model selector)
 //!   OAIY_OLLAMA_MODEL    model the ollama service uses (${ollamaModel}) [qwen2.5:0.5b]
 //!
@@ -60,6 +61,12 @@ impl ConfigProvider for EnvConfig {
             // Headless: reflect the OAIY_LLAMACPP_MODEL env (applied to the live
             // registry at startup) so /api/config reports the active model.
             llama_model: std::env::var("OAIY_LLAMACPP_MODEL")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
+            // Same for the multimodal projector, so a headless box can serve a
+            // vision/audio model without a GUI to pick one in.
+            llama_mmproj: std::env::var("OAIY_LLAMACPP_MMPROJ")
                 .ok()
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty()),
@@ -187,6 +194,16 @@ async fn main() {
         if !m.is_empty() {
             if let Ok(mut r) = registry.lock() {
                 r.set_llama_model(Some(m));
+            }
+        }
+    }
+    // The projector too, so a headless box can serve a multimodal model. Unset
+    // is the ordinary case and simply leaves the service text-only.
+    if let Ok(m) = std::env::var("OAIY_LLAMACPP_MMPROJ") {
+        let m = m.trim().to_string();
+        if !m.is_empty() {
+            if let Ok(mut r) = registry.lock() {
+                r.set_llama_mmproj(Some(m));
             }
         }
     }
