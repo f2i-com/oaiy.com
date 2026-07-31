@@ -145,6 +145,24 @@ pub struct LinkStatus {
     pub last_heartbeat_at: Option<chrono::DateTime<chrono::Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub heartbeat_error: Option<String>,
+    /// When the command lane last polled cleanly, and why it stopped if it did.
+    ///
+    /// Surfaced for the same reason as the heartbeat, and it is the half that
+    /// bites harder: a relay that is failing shows up ONLY on the provider's
+    /// website, as "no desktop picked it up in time" — which reads as a broken
+    /// connection and sends the user looking in the wrong place entirely.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_relay_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relay_error: Option<String>,
+    /// Whether the linked connector declares each lane at all.
+    ///
+    /// Taken from the descriptor, not from whether anything has happened yet: a
+    /// lane a provider simply does not have must read as absent, never as
+    /// pending. Without these, a connector with no relay would sit under a
+    /// "connecting…" that is never going to resolve.
+    pub heartbeat_supported: bool,
+    pub relay_supported: bool,
     /// The in-flight attempt, if any.
     pub attempt: LinkPhase,
     /// Every provider this build can link to.
@@ -177,6 +195,7 @@ struct Inner {
     cancel: Arc<AtomicBool>,
     last_heartbeat_at: Option<chrono::DateTime<chrono::Utc>>,
     heartbeat_error: Option<String>,
+    last_relay_at: Option<chrono::DateTime<chrono::Utc>>,
     relay_error: Option<String>,
 }
 
@@ -203,6 +222,7 @@ pub fn open_handle(data_dir: PathBuf) -> LinkHandle {
             cancel: Arc::new(AtomicBool::new(false)),
             last_heartbeat_at: None,
             heartbeat_error: None,
+            last_relay_at: None,
             relay_error: None,
         }),
     });
@@ -243,26 +263,37 @@ impl LinkStore {
                 linked_at: None,
                 last_heartbeat_at: None,
                 heartbeat_error: None,
+                last_relay_at: None,
+                relay_error: None,
+                heartbeat_supported: false,
+                relay_supported: false,
                 attempt: inner.attempt.clone(),
                 available,
             },
-            Some(a) => LinkStatus {
-                linked: true,
-                connector_name: descriptors
-                    .iter()
-                    .find(|d| d.id == a.connector_id)
-                    .map(|d| d.name.clone()),
-                connector_id: Some(a.connector_id.clone()),
-                base_url: Some(a.base_url.clone()),
-                account_name: a.account_name.clone(),
-                account_id: a.account_id.clone(),
-                granted_scopes: a.granted_scopes.clone(),
-                linked_at: Some(a.linked_at),
-                last_heartbeat_at: inner.last_heartbeat_at,
-                heartbeat_error: inner.heartbeat_error.clone(),
-                attempt: inner.attempt.clone(),
-                available,
-            },
+            Some(a) => {
+                // The descriptor says which lanes this provider has at all, so
+                // the panel can distinguish a lane that is broken from one that
+                // was never there.
+                let d = descriptors.iter().find(|d| d.id == a.connector_id);
+                LinkStatus {
+                    linked: true,
+                    connector_name: d.map(|d| d.name.clone()),
+                    connector_id: Some(a.connector_id.clone()),
+                    base_url: Some(a.base_url.clone()),
+                    account_name: a.account_name.clone(),
+                    account_id: a.account_id.clone(),
+                    granted_scopes: a.granted_scopes.clone(),
+                    linked_at: Some(a.linked_at),
+                    last_heartbeat_at: inner.last_heartbeat_at,
+                    heartbeat_error: inner.heartbeat_error.clone(),
+                    last_relay_at: inner.last_relay_at,
+                    relay_error: inner.relay_error.clone(),
+                    heartbeat_supported: d.is_some_and(|d| d.heartbeat.is_some()),
+                    relay_supported: d.is_some_and(|d| d.relay.is_some()),
+                    attempt: inner.attempt.clone(),
+                    available,
+                }
+            }
         }
     }
 
@@ -306,8 +337,16 @@ impl LinkStore {
     }
 
     /// Record the outcome of a relay poll.
+    ///
+    /// The timestamp is what makes "no error" mean something: the lane is a long
+    /// poll, so a clean return every few seconds is the only evidence it is
+    /// alive. Without it, "never started" and "running fine" look identical.
     pub fn note_relay(&self, error: Option<String>) {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner()).relay_error = error;
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if error.is_none() {
+            inner.last_relay_at = Some(chrono::Utc::now());
+        }
+        inner.relay_error = error;
     }
 
     /// Record the outcome of a heartbeat.
@@ -350,12 +389,14 @@ impl LinkStore {
             inner.attempt = LinkPhase::Idle;
             inner.last_heartbeat_at = None;
             inner.heartbeat_error = None;
+            // Both lanes, or a failure from the provider just disconnected
+            // would be shown against the next one that is linked.
+            inner.last_relay_at = None;
+            inner.relay_error = None;
         }
         // Withdrawn in the same action that forgot the link: a provider we are
         // no longer linked to must not keep reaching this machine.
         set_linked_origin(None);
-        {
-        }
         self.status()
     }
 
@@ -411,7 +452,9 @@ fn restrict_to_owner(path: &std::path::Path) {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
     }
-    #[cfg(not(windows))]
+    // Everywhere the block above did not consume it. `not(windows)` would leave
+    // it unused on Windows, which is the one platform this ships on.
+    #[cfg(not(unix))]
     let _ = path;
 }
 
@@ -662,6 +705,73 @@ mod tests {
         let ok = s.status();
         assert!(ok.last_heartbeat_at.is_some());
         assert!(ok.heartbeat_error.is_none(), "success must clear the error");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_status_reports_why_the_command_lane_stopped() {
+        // The heartbeat's twin, and the one that fails more confusingly: a
+        // broken relay is visible ONLY on the provider's website, as "no desktop
+        // picked it up in time" — which reads as a connection problem and sends
+        // the user looking at their network instead of at the reason.
+        let (dir, s) = store("relay-status");
+        s.persist(&account()).unwrap();
+        s.inner.lock().unwrap().account = Some(account());
+
+        // Before anything has happened: no error, and nothing claiming success.
+        let fresh = s.status();
+        assert!(fresh.relay_error.is_none() && fresh.last_relay_at.is_none());
+
+        s.note_relay(Some("claim refused: HTTP 500".into()));
+        let bad = s.status();
+        assert!(bad.relay_error.unwrap().contains("500"));
+        assert!(bad.last_relay_at.is_none(), "a failed poll is not a poll");
+
+        s.note_relay(None);
+        let good = s.status();
+        assert!(good.relay_error.is_none(), "success must clear the error");
+        // The timestamp is what makes "no error" mean something: on a long poll,
+        // a clean return is the only evidence the lane is alive at all.
+        assert!(good.last_relay_at.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_status_says_which_lanes_the_connector_actually_has() {
+        // Without this the panel cannot tell a lane that is broken from one the
+        // provider never had, and a connector with no relay would sit forever
+        // under a "connecting…" that is never going to resolve.
+        let (dir, s) = store("lanes");
+        s.persist(&account()).unwrap();
+        s.inner.lock().unwrap().account = Some(account());
+
+        let status = s.status();
+        assert!(status.heartbeat_supported, "the built-in connector declares one");
+        assert!(status.relay_supported, "…and a relay");
+
+        // Unlinked, nothing is claimed either way.
+        let after = s.unlink();
+        assert!(!after.heartbeat_supported && !after.relay_supported);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unlinking_forgets_the_relays_failure_along_with_the_key() {
+        // Otherwise the next provider linked on this machine inherits the last
+        // one's error and looks broken from the moment it connects.
+        let (dir, s) = store("relay-unlink");
+        s.persist(&account()).unwrap();
+        s.inner.lock().unwrap().account = Some(account());
+        // A healthy poll first, so there is a timestamp to leak, then a failure.
+        s.note_relay(None);
+        s.note_relay(Some("the provider no longer accepts this desktop's key".into()));
+        s.note_heartbeat(Some("boom".into()));
+        assert!(s.status().last_relay_at.is_some(), "the setup must have left one");
+
+        let after = s.unlink();
+        assert!(after.relay_error.is_none(), "a stale error must not outlive the link");
+        assert!(after.last_relay_at.is_none());
+        assert!(after.heartbeat_error.is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -16,7 +16,6 @@
 //! then ordinary state changes instead of lifecycle events something has to
 //! subscribe to — and there is no way to leak a thread per link attempt.
 
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::descriptor::{self, HeartbeatSpec};

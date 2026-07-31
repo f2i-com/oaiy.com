@@ -100,8 +100,6 @@ pub fn dispatcher(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     /// The op names FormLogic queues, minus the `desktop.` connector prefix it
     /// strips before storing. Pinned because a rename on either side turns into
     /// "no desktop picked it up" with nothing pointing here.

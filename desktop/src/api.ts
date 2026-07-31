@@ -557,6 +557,19 @@ export interface LinkStatus {
   lastHeartbeatAt?: string;
   /** Why the last heartbeat failed, if it did. */
   heartbeatError?: string;
+  /** When the command lane last polled cleanly. On a long poll, a clean return
+   *  is the only evidence it is alive — without it, "never started" and
+   *  "running fine" look identical. */
+  lastRelayAt?: string;
+  /** Why the command lane stopped. Its failures are invisible on this machine:
+   *  they show up on the provider's website as "no desktop picked it up in
+   *  time", which reads as a broken connection rather than a lane erroring. */
+  relayError?: string;
+  /** Which lanes the linked connector declares at all, so the UI can tell a
+   *  lane that is broken from one this provider never had. Absent from an older
+   *  host, hence optional. */
+  heartbeatSupported?: boolean;
+  relaySupported?: boolean;
   attempt: LinkPhase;
   /** Every provider this build can link to — the UI hardcodes no list. */
   available: LinkConnector[];
