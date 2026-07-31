@@ -211,12 +211,15 @@ async fn chat_for(State(st): State<AiState>, Path(id): Path<String>, Json(body):
 async fn chat_impl(st: &AiState, provider_id: Option<&str>, mut body: Value) -> Response {
     // The ChatGPT connector is a managed agent, not a stored provider: it has no
     // key to inject, so it never goes through the egress/key path below.
-    if provider_id == Some(super::codex::CODEX_PROVIDER_ID) {
+    // The generic route, plus the four fixed live-call aliases. All of them are
+    // the same managed agent — the alias only pins the turn's model and effort.
+    let codex_alias = provider_id.and_then(super::codex::LiveCallAlias::from_id);
+    if provider_id == Some(super::codex::CODEX_PROVIDER_ID) || codex_alias.is_some() {
         if let Some(o) = body.as_object_mut() {
             o.remove("provider");
         }
         let codex = st.codex.clone();
-        return match tokio::task::spawn_blocking(move || codex.chat(&body)).await {
+        return match tokio::task::spawn_blocking(move || codex.chat_as(&body, codex_alias)).await {
             Ok(Ok(v)) => (StatusCode::OK, Json(v)).into_response(),
             Ok(Err(e)) => codex_err(e),
             Err(e) => ai_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()),
@@ -284,7 +287,10 @@ async fn models_default(State(st): State<AiState>) -> Response {
 }
 
 async fn models_for(State(st): State<AiState>, Path(id): Path<String>) -> Response {
-    if id == super::codex::CODEX_PROVIDER_ID {
+    // An alias pins one model, so listing is the agent's own catalogue either
+    // way — a caller asking what a fixed route can run deserves an answer, not
+    // a 404 that reads like the route does not exist.
+    if id == super::codex::CODEX_PROVIDER_ID || super::codex::LiveCallAlias::from_id(&id).is_some() {
         let codex = st.codex.clone();
         return match tokio::task::spawn_blocking(move || codex.models()).await {
             Ok(Ok(v)) => (StatusCode::OK, Json(v)).into_response(),
@@ -439,6 +445,32 @@ async fn list_ai_sources(State(st): State<AiState>) -> Response {
                     "account": status.email,
                     "planType": status.plan_type,
                 }));
+
+                // The fixed live-call routes, so a phone agent can be pointed
+                // at one from the same picker as everything else. Listed only
+                // alongside a connected account, for the same reason as above.
+                for alias in super::codex::LiveCallAlias::all() {
+                    sources.push(json!({
+                        "id": format!("provider:{}", alias.id()),
+                        "kind": "provider",
+                        "providerId": alias.id(),
+                        "name": alias.display_name(),
+                        "category": "chatgpt",
+                        "status": "provider",
+                        "protocol": "codex",
+                        "capabilities": ["chat"],
+                        "hasKey": true,
+                        "enabled": true,
+                        "model": alias.model(),
+                        // Not offered for flows: these pin a low/no reasoning
+                        // effort for latency, which is the wrong trade for
+                        // background work. `liveCall` is what the phone agent
+                        // filters on.
+                        "useCases": ["liveCall"],
+                        "account": status.email,
+                        "planType": status.plan_type,
+                    }));
+                }
             }
         }
     }
