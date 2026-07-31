@@ -194,6 +194,10 @@ fn base_command() -> Command {
     {
         let mut c = Command::new("cmd");
         c.arg("/c").arg("codex");
+        // `cmd` is a console program and this app has no console, so without
+        // this Windows opens a visible one — once per status poll, which during
+        // a pending sign-in is every 3 seconds.
+        crate::HiddenCommand::pipe_hidden(&mut c);
         c
     }
     #[cfg(not(windows))]

@@ -15,6 +15,40 @@ pub mod plugins;
 /// stable target. Shared by both binaries (the GUI and the headless server).
 pub const DESKTOP_PORT: u16 = 17972;
 
+/// Keep a spawned console program from flashing a window.
+///
+/// The release GUI is built with `windows_subsystem = "windows"`, so the process
+/// has no console of its own — and Windows gives a console-subsystem child a
+/// brand new visible one unless told otherwise. Every probe this app runs
+/// (`nvidia-smi`, `where`, `node -v`) is such a program, and some of them ran
+/// per UI poll, so black windows flickered across the user's desktop while they
+/// worked. Reported as "it was spawning multiple terminal windows".
+///
+/// The service runner, plugin host, python installer and CLI worker already do
+/// this; these probes were simply missed.
+#[cfg(windows)]
+fn hide_console(cmd: &mut std::process::Command) {
+    use std::os::windows::process::CommandExt as _;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    cmd.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(windows))]
+fn hide_console(_cmd: &mut std::process::Command) {}
+
+/// `cmd.pipe_hidden()` — chainable [`hide_console`], so a probe's spawn stays a
+/// single expression instead of needing a `let mut` dance around a cfg block.
+pub trait HiddenCommand {
+    fn pipe_hidden(&mut self) -> &mut Self;
+}
+
+impl HiddenCommand for std::process::Command {
+    fn pipe_hidden(&mut self) -> &mut Self {
+        hide_console(self);
+        self
+    }
+}
+
 // Everything below `open_path` is the GUI companion (Tauri), gated behind the
 // default `gui` feature: `cargo build --bin oaiy-server --no-default-features`
 // builds the headless server WITHOUT tauri/webkit2gtk. `http` + `services`
@@ -29,6 +63,7 @@ pub use gui::run;
 #[cfg(feature = "gui")]
 mod gui {
 use super::DESKTOP_PORT;
+use crate::HiddenCommand as _;
 use crate::{http, migrate, tray};
 use crate::http::DesktopConfig;
 use crate::migrate::{MigratePlan, MigrationHandle, MigrationProgress};
@@ -757,6 +792,7 @@ fn list_gpus() -> Vec<GpuInfo> {
     .stdin(std::process::Stdio::null())
     .stdout(std::process::Stdio::piped())
     .stderr(std::process::Stdio::null())
+    .pipe_hidden()
     .spawn()
     {
         Ok(c) => c,

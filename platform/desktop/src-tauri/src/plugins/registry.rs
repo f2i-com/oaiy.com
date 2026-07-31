@@ -213,14 +213,54 @@ impl PluginRecord {
 #[derive(Default)]
 pub struct PluginRegistry {
     root: PathBuf,
+    /// Plugin ids the user has explicitly turned off.
+    ///
+    /// Persisted, because `scan()` rebuilds every `PluginRecord` from its
+    /// manifest and `from_manifest` hardcodes `user_disabled: false`. While
+    /// nothing started plugins on its own that was merely forgetful; once boot
+    /// autostart existed it became a policy INVERSION — every launch would
+    /// start the very plugins the user had turned off, and for the phone bridge
+    /// that means seizing a Bluetooth dongle they had deliberately released.
+    disabled: std::collections::BTreeSet<String>,
     /// Keyed by plugin id, ordered so listings are stable rather than
     /// hash-order — a list that reshuffles between polls is unusable in a UI.
     plugins: BTreeMap<String, PluginRecord>,
 }
 
 impl PluginRegistry {
+    /// `<plugins root>/disabled.json` — the user's opt-outs.
+    fn disabled_path(root: &std::path::Path) -> PathBuf {
+        root.join("disabled.json")
+    }
+
+    fn load_disabled(root: &std::path::Path) -> std::collections::BTreeSet<String> {
+        std::fs::read_to_string(Self::disabled_path(root))
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default()
+    }
+
+    /// Atomic (`.tmp` + rename): a crash mid-write must not leave a truncated
+    /// file that reads as "nothing is disabled" and starts everything.
+    fn persist_disabled(&self) {
+        let path = Self::disabled_path(&self.root);
+        let write = || -> std::io::Result<()> {
+            if let Some(dir) = path.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            let tmp = path.with_extension("json.tmp");
+            let body = serde_json::to_string(&self.disabled).map_err(std::io::Error::other)?;
+            std::fs::write(&tmp, body)?;
+            std::fs::rename(&tmp, &path)
+        };
+        if let Err(e) = write() {
+            log::warn!("could not persist disabled plugins to {}: {e}", path.display());
+        }
+    }
+
     pub fn new(root: PathBuf) -> Self {
         Self {
+            disabled: Self::load_disabled(&root),
             root,
             plugins: BTreeMap::new(),
         }
@@ -308,6 +348,9 @@ impl PluginRegistry {
         // the record while the process lives would orphan a child we supervise.
         self.plugins
             .retain(|id, r| seen.contains(id) || r.state == PluginState::Running);
+        // Records were rebuilt from manifests above, which resets user_disabled
+        // to false — re-apply the user's persisted choice before anyone reads it.
+        self.apply_disabled();
         report
     }
 
@@ -347,7 +390,30 @@ impl PluginRegistry {
     }
 
     /// User opt-out. Distinct from a host refusal, though both read `Disabled`.
+    /// Re-apply the persisted opt-outs to freshly-scanned records.
+    ///
+    /// Called at the end of `scan()`: records are rebuilt from their manifests
+    /// there, so without this the user's choice is silently discarded on every
+    /// rescan — and a rescan happens on every plugin listing.
+    fn apply_disabled(&mut self) {
+        for (id, rec) in self.plugins.iter_mut() {
+            if self.disabled.contains(id) {
+                rec.user_disabled = true;
+                if rec.state != PluginState::Running {
+                    rec.state = PluginState::Disabled;
+                    rec.reason = Some("Turned off in OAIY Desktop → Plugins.".into());
+                }
+            }
+        }
+    }
+
     pub fn set_user_disabled(&mut self, id: &str, disabled: bool) {
+        if disabled {
+            self.disabled.insert(id.to_string());
+        } else {
+            self.disabled.remove(id);
+        }
+        self.persist_disabled();
         if let Some(rec) = self.plugins.get_mut(id) {
             rec.user_disabled = disabled;
             if disabled {
@@ -836,6 +902,43 @@ mod tests {
             PluginState::Disabled,
             "a toggle cannot fix a manifest"
         );
+    }
+
+    #[test]
+    fn a_users_opt_out_survives_a_restart_and_a_rescan() {
+        // Regression: `user_disabled` lived only in memory and `scan()` rebuilds
+        // every record from its manifest, so the flag reset to false on each
+        // scan. Harmless while nothing started plugins by itself — but boot
+        // autostart turned it into a policy INVERSION: the plugins the user
+        // turned off were the ones started for them, every launch. For the phone
+        // bridge that means seizing a Bluetooth dongle they deliberately freed.
+        let root = Root::new();
+        root.plugin("aokie", manifest("aokie"));
+        root.plugin("other", manifest("other"));
+
+        {
+            let mut reg = PluginRegistry::new(root.path().to_path_buf());
+            reg.scan();
+            reg.set_user_disabled("aokie", true);
+            // A rescan in the SAME process must not resurrect it either.
+            reg.scan();
+            assert!(reg.get("aokie").unwrap().user_disabled);
+            assert_eq!(reg.autostart_ids(), vec!["other".to_string()]);
+        }
+
+        // A fresh registry over the same root — i.e. the next app launch.
+        let mut reopened = PluginRegistry::new(root.path().to_path_buf());
+        reopened.scan();
+        assert!(reopened.get("aokie").unwrap().user_disabled, "the opt-out must survive a restart");
+        assert_eq!(reopened.get("aokie").unwrap().state, PluginState::Disabled);
+        assert_eq!(reopened.autostart_ids(), vec!["other".to_string()]);
+
+        // And turning it back on sticks, so the file is not write-only.
+        reopened.set_user_disabled("aokie", false);
+        let mut again = PluginRegistry::new(root.path().to_path_buf());
+        again.scan();
+        assert!(!again.get("aokie").unwrap().user_disabled);
+        assert_eq!(again.autostart_ids().len(), 2);
     }
 
     #[test]

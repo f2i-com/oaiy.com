@@ -12,6 +12,7 @@
 //! matching the deliberate choice `python.rs` documents.
 
 use std::io::{BufReader, Read, Write};
+use crate::HiddenCommand as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -78,8 +79,10 @@ fn system_exe() -> Option<PathBuf> {
     let finder = if cfg!(windows) { "where" } else { "which" };
     let out = std::process::Command::new(finder)
         .arg("node")
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
+        .pipe_hidden()
         .output()
         .ok()?;
     if !out.status.success() {
@@ -97,8 +100,10 @@ fn system_exe() -> Option<PathBuf> {
 fn probe_version(exe: &Path) -> Option<String> {
     let out = std::process::Command::new(exe)
         .arg("-v")
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
+        .pipe_hidden()
         .output()
         .ok()?;
     out.status.success().then(|| {
@@ -201,8 +206,26 @@ impl NodeRuntime {
             let result = install_node_native(&dest, &logs);
             match &result {
                 Ok(()) => logs.push("stdout", "Node runtime ready.".into()),
-                Err(e) => logs.push("stderr", format!("install failed: {e}")),
+                Err(e) => {
+                    logs.push("stderr", format!("install failed: {e}"));
+                    // A half-extracted tree leaves a node.exe that `resolve()`
+                    // would PREFER over the user's working system Node, so the
+                    // failure has to remove it rather than leave it lying there.
+                    if let Err(rm) = std::fs::remove_dir_all(&dest) {
+                        if rm.kind() != std::io::ErrorKind::NotFound {
+                            logs.push("stderr", format!("could not clean up {}: {rm}", dest.display()));
+                        }
+                    }
+                    log::warn!("portable Node install failed: {e}");
+                }
             }
+            // Invalidate AFTER the work, not only before it. Clearing the cache
+            // when the install STARTS is useless on its own: the UI polls
+            // readiness every few seconds, so the first poll re-probes and
+            // re-caches the pre-install answer, and that stale "not installed"
+            // then outlives the whole download — leaving the button offering an
+            // 86 MB download that already completed.
+            me.invalidate_probe();
             *me.installing.lock().unwrap_or_else(|p| p.into_inner()) = false;
         });
         Ok(())
