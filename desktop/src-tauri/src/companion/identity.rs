@@ -29,12 +29,25 @@ use chrono::{DateTime, Utc};
 use ed25519_dalek::{Signature, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+
+use super::pairing::{
+    domain_separated_canonical, random_id, MobilePairingResponse, PairingPayload, OFFER_KIND,
+    PAIRING_RESPONSE_DOMAIN, PAIRING_TTL_SECONDS, RESPONSE_KIND, SCHEMA_VERSION,
+};
 
 /// Longest acceptable protocol identifier. Bounded so a hostile relay cannot
 /// push an unbounded string into a filename or a log line.
 const MAX_ID_BYTES: usize = 128;
+
+/// Tolerance for the phone's clock disagreeing with ours.
+///
+/// Small on purpose. It exists so a handset a few seconds out does not fail to
+/// pair; widening it widens the window in which a captured response is still
+/// replayable.
+const CLOCK_SKEW_SECONDS: u64 = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -176,6 +189,19 @@ pub struct IdentityStatus {
     pub warning: Option<String>,
 }
 
+/// A published pairing offer: the payload, the text to paste, and a QR of it.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PairingOffer {
+    pub request_id: String,
+    pub payload: PairingPayload,
+    /// The exact JSON the operator pastes into the phone. Kept alongside the QR
+    /// because a camera is not always an option.
+    pub encoded_payload: String,
+    /// Raw SVG, not a data URI — the UI wraps it itself.
+    pub qr_svg: String,
+}
+
 /// A mobile that proved possession of its key and now awaits the owner's word.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -203,6 +229,15 @@ struct Inner {
     roster: PersistedRoster,
     pending: Vec<PendingMobileApproval>,
     warning: Option<String>,
+    /// Live offers, by nonce. In memory only: an offer that did not survive a
+    /// restart SHOULD be dead, because its whole purpose is to be answered
+    /// within ten minutes by someone standing at the machine.
+    challenges: HashMap<String, PairingPayload>,
+    /// `(nonce, jti)` pairs already answered. Kept after the challenge is
+    /// removed so a replayed response is refused as "already used" rather than
+    /// as "unknown", which is the honest reason and the one that tells an
+    /// operator they are looking at a duplicate rather than a typo.
+    consumed: HashSet<(String, String)>,
 }
 
 /// The desktop's half of companion trust.
@@ -239,6 +274,8 @@ impl EndpointIdentity {
                 roster,
                 pending: Vec::new(),
                 warning,
+                challenges: HashMap::new(),
+                consumed: HashSet::new(),
             }),
         })
     }
@@ -274,6 +311,197 @@ impl EndpointIdentity {
             remote_access_ready: inner.signing_key.is_some() && !inner.roster.approved.is_empty(),
             warning: inner.warning.clone(),
         }
+    }
+
+    /// Publish an offer for a phone to answer.
+    pub fn create_offer(
+        &self,
+        app_id: &str,
+        workspace_id: Option<&str>,
+        desktop_connection_id: &str,
+    ) -> Result<PairingOffer, String> {
+        self.create_offer_at(
+            app_id,
+            workspace_id,
+            desktop_connection_id,
+            Utc::now().timestamp().max(1) as u64,
+        )
+    }
+
+    fn create_offer_at(
+        &self,
+        app_id: &str,
+        workspace_id: Option<&str>,
+        desktop_connection_id: &str,
+        now: u64,
+    ) -> Result<PairingOffer, String> {
+        safe_id("app id", app_id)?;
+        safe_id("desktop connection id", desktop_connection_id)?;
+        if let Some(w) = workspace_id {
+            safe_id("workspace id", w)?;
+        }
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        purge_expired(&mut inner, now);
+        let key = inner
+            .signing_key
+            .as_ref()
+            .ok_or_else(|| "the desktop endpoint identity is unavailable".to_string())?;
+
+        let nonce = random_id(32)?;
+        let jti = format!("pair-{}", uuid::Uuid::new_v4().simple());
+        let payload = PairingPayload {
+            kind: OFFER_KIND.into(),
+            schema_version: SCHEMA_VERSION,
+            app_id: app_id.into(),
+            workspace_id: workspace_id.map(str::to_string),
+            desktop_connection_id: desktop_connection_id.into(),
+            desktop_endpoint_key: EndpointPublicKey::from_verifying_key(&key.verifying_key()),
+            nonce: nonce.clone(),
+            jti: jti.clone(),
+            issued_at: now,
+            expires_at: now.saturating_add(PAIRING_TTL_SECONDS),
+        };
+
+        let encoded_payload = serde_json::to_string(&payload)
+            .map_err(|e| format!("could not encode the pairing payload: {e}"))?;
+        let qr_svg = qrcode::QrCode::new(encoded_payload.as_bytes())
+            .map_err(|_| "the pairing payload is too large for a QR code".to_string())?
+            .render::<qrcode::render::svg::Color>()
+            .min_dimensions(280, 280)
+            .dark_color(qrcode::render::svg::Color("#111827"))
+            .light_color(qrcode::render::svg::Color("#ffffff"))
+            .build();
+
+        inner.challenges.insert(nonce, payload.clone());
+        Ok(PairingOffer {
+            request_id: jti,
+            payload,
+            encoded_payload,
+            qr_svg,
+        })
+    }
+
+    /// Accept a phone's answer to a live offer.
+    ///
+    /// Everything here establishes that the answer is cryptographically sound
+    /// and bound to an offer WE issued. It deliberately stops short of trust:
+    /// the result is a pending item the owner must approve after comparing a
+    /// fingerprint, because nothing checked below can distinguish the intended
+    /// phone from anyone else who saw the offer.
+    pub fn receive_response(
+        &self,
+        response: &MobilePairingResponse,
+    ) -> Result<PendingMobileApproval, String> {
+        self.receive_response_at(response, Utc::now().timestamp().max(1) as u64)
+    }
+
+    fn receive_response_at(
+        &self,
+        response: &MobilePairingResponse,
+        now: u64,
+    ) -> Result<PendingMobileApproval, String> {
+        if response.kind != RESPONSE_KIND || response.schema_version != SCHEMA_VERSION {
+            return Err("unsupported mobile pairing response".into());
+        }
+        let claims = &response.claims;
+        safe_id("app id", &claims.app_id)?;
+        safe_id("desktop connection id", &claims.desktop_connection_id)?;
+        safe_id("desktop key thumbprint", &claims.desktop_key_thumbprint)?;
+        safe_id("mobile device id", &claims.device_id)?;
+        safe_id("pairing nonce", &claims.pairing_nonce)?;
+        safe_id("pairing jti", &claims.jti)?;
+        if let Some(w) = claims.workspace_id.as_deref() {
+            safe_id("workspace id", w)?;
+        }
+
+        // Purge BEFORE the lifetime check, not after it. An expired response
+        // returns early, so leaving the sweep downstream meant a machine that
+        // published one offer and never paired kept that challenge in memory
+        // for the life of the process — the one case where nothing else would
+        // come along to clear it.
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        purge_expired(&mut inner, now);
+
+        // Lifetime next, so an expired response still costs no signature check.
+        if claims.issued_at > now.saturating_add(CLOCK_SKEW_SECONDS)
+            || claims.expires_at <= claims.issued_at
+            || claims.expires_at.saturating_add(CLOCK_SKEW_SECONDS) < now
+        {
+            return Err("the mobile pairing response is expired or has an invalid lifetime".into());
+        }
+
+        if inner
+            .consumed
+            .contains(&(claims.pairing_nonce.clone(), claims.jti.clone()))
+        {
+            return Err("that pairing challenge was already used".into());
+        }
+        let expected = inner
+            .challenges
+            .get(&claims.pairing_nonce)
+            .cloned()
+            .ok_or_else(|| "no live pairing offer matches that response".to_string())?;
+
+        if claims.jti != expected.jti {
+            return Err("the pairing response JTI does not match the one-use request".into());
+        }
+        if claims.app_id != expected.app_id || claims.workspace_id != expected.workspace_id {
+            return Err("the pairing response is for a different app or workspace".into());
+        }
+        // Binding to OUR key, not merely to a nonce: without it a response
+        // could be replayed against another desktop that issued the same nonce.
+        if claims.desktop_connection_id != expected.desktop_connection_id
+            || claims.desktop_key_thumbprint != expected.desktop_endpoint_key.thumbprint
+        {
+            return Err("the pairing response is for a different desktop endpoint".into());
+        }
+        if claims.issued_at.saturating_add(CLOCK_SKEW_SECONDS) < expected.issued_at
+            || claims.issued_at > expected.expires_at.saturating_add(CLOCK_SKEW_SECONDS)
+        {
+            return Err("the pairing response is outside the desktop challenge window".into());
+        }
+
+        // A key we previously revoked must not walk back in through a fresh
+        // ceremony without the owner noticing it is the same device.
+        if inner
+            .roster
+            .revoked
+            .iter()
+            .any(|r| r.thumbprint == claims.mobile_endpoint_key.thumbprint)
+        {
+            return Err("that device's key was revoked on this machine".into());
+        }
+
+        // Signature LAST: the cheap structural checks above shed hostile input
+        // before spending a verification on it.
+        let message = domain_separated_canonical(PAIRING_RESPONSE_DOMAIN, claims)?;
+        claims
+            .mobile_endpoint_key
+            .verify(&message, &response.signature)?;
+
+        let display_name = claims
+            .display_name
+            .clone()
+            .filter(|n| !n.trim().is_empty())
+            .unwrap_or_else(|| claims.device_id.clone());
+        let pending = PendingMobileApproval {
+            id: format!("approval-{}", uuid::Uuid::new_v4().simple()),
+            device_id: claims.device_id.clone(),
+            display_name,
+            thumbprint: claims.mobile_endpoint_key.thumbprint.clone(),
+            fingerprint: display_fingerprint(&claims.mobile_endpoint_key)?,
+            endpoint_key: claims.mobile_endpoint_key.clone(),
+            received_at: Utc::now(),
+        };
+
+        // One answer per offer: burn the challenge and remember the pair, so a
+        // second copy of the same response is refused as a replay.
+        inner.challenges.remove(&claims.pairing_nonce);
+        inner
+            .consumed
+            .insert((claims.pairing_nonce.clone(), claims.jti.clone()));
+        inner.pending.push(pending.clone());
+        Ok(pending)
     }
 
     /// Approve a mobile that has already proved possession of its key.
@@ -450,6 +678,13 @@ fn safe_id(field: &str, value: &str) -> Result<(), String> {
     }
 }
 
+/// Drop offers whose window has closed.
+fn purge_expired(inner: &mut Inner, now: u64) {
+    inner
+        .challenges
+        .retain(|_, p| p.expires_at.saturating_add(CLOCK_SKEW_SECONDS) >= now);
+}
+
 fn load_or_create_key(dir: &std::path::Path) -> Result<(SigningKey, KeyProtection), String> {
     let path = dir.join("endpoint.key");
     if let Ok(raw) = std::fs::read_to_string(&path) {
@@ -477,6 +712,10 @@ fn mint_key(dir: &std::path::Path) -> Result<(SigningKey, KeyProtection), String
 
 #[cfg(test)]
 mod tests {
+    use super::super::pairing::{
+        domain_separated_canonical, MobilePairingResponse, PAIRING_RESPONSE_DOMAIN, RESPONSE_KIND,
+        SCHEMA_VERSION,
+    };
     use super::*;
 
     struct Dir(PathBuf);
@@ -513,6 +752,159 @@ mod tests {
     fn a_key(seed: u8) -> EndpointPublicKey {
         let sk = SigningKey::from_bytes(&[seed; 32]);
         EndpointPublicKey::from_verifying_key(&sk.verifying_key())
+    }
+
+    /// Answer an offer the way the phone does, so the tests exercise the real
+    /// verification path rather than a hand-built approximation.
+    fn answer(offer: &PairingOffer, sk: &SigningKey) -> MobilePairingResponse {
+        use ed25519_dalek::Signer;
+        let pk = EndpointPublicKey::from_verifying_key(&sk.verifying_key());
+        let claims = super::super::pairing::MobilePairingClaims {
+            app_id: offer.payload.app_id.clone(),
+            workspace_id: offer.payload.workspace_id.clone(),
+            desktop_connection_id: offer.payload.desktop_connection_id.clone(),
+            desktop_key_thumbprint: offer.payload.desktop_endpoint_key.thumbprint.clone(),
+            device_id: "phone-1".into(),
+            display_name: Some("Lance's phone".into()),
+            mobile_endpoint_key: pk,
+            pairing_nonce: offer.payload.nonce.clone(),
+            jti: offer.payload.jti.clone(),
+            issued_at: offer.payload.issued_at,
+            expires_at: offer.payload.expires_at,
+        };
+        let msg = domain_separated_canonical(PAIRING_RESPONSE_DOMAIN, &claims).unwrap();
+        MobilePairingResponse {
+            kind: RESPONSE_KIND.into(),
+            schema_version: SCHEMA_VERSION,
+            claims,
+            signature: URL_SAFE_NO_PAD.encode(sk.sign(&msg).to_bytes()),
+        }
+    }
+
+    #[test]
+    fn an_offer_carries_no_secret_and_expires() {
+        // It is shown as a QR on screen, so everything in it is public by
+        // construction — that is the property that makes displaying it safe.
+        let dir = Dir::new("offer");
+        let id = EndpointIdentity::open(dir.0.clone(), "aokie");
+        let offer = id.create_offer("app_a", None, "conn-1").unwrap();
+
+        assert_eq!(offer.payload.kind, "aokie_mobile_pairing");
+        assert_eq!(offer.payload.schema_version, 2);
+        assert_eq!(
+            offer.payload.expires_at - offer.payload.issued_at,
+            600,
+            "ten minutes: long enough to reach the phone, short enough that an offer left on screen is not a standing invitation"
+        );
+        // The desktop's PUBLIC key, and nothing resembling the private one.
+        let encoded = &offer.encoded_payload;
+        assert!(encoded.contains(&offer.payload.desktop_endpoint_key.public_key));
+        let seed = std::fs::read_to_string(dir.0.join("companion/aokie/endpoint.key")).unwrap();
+        assert!(!encoded.contains(seed.trim()), "an offer must never carry the private seed");
+        assert!(offer.qr_svg.starts_with("<?xml") || offer.qr_svg.contains("<svg"));
+    }
+
+    #[test]
+    fn a_genuine_answer_becomes_a_pending_approval_not_a_trusted_device() {
+        // The signature proves possession of a key. It does NOT prove the
+        // answering device is the phone in your hand, so the ceremony must stop
+        // at pending and wait for a human.
+        let dir = Dir::new("answer");
+        let id = EndpointIdentity::open(dir.0.clone(), "aokie");
+        let offer = id.create_offer("app_a", None, "conn-1").unwrap();
+        let phone = SigningKey::from_bytes(&[7u8; 32]);
+
+        let pending = id.receive_response(&answer(&offer, &phone)).unwrap();
+        assert_eq!(pending.device_id, "phone-1");
+        assert_eq!(pending.display_name, "Lance's phone");
+        // The operator compares THIS against the phone's screen.
+        assert!(pending.fingerprint.contains(':'), "{}", pending.fingerprint);
+
+        let status = id.status();
+        assert_eq!(status.pending_approvals.len(), 1);
+        assert!(status.approved_mobiles.is_empty(), "signing alone must not confer trust");
+        assert!(!status.remote_access_ready);
+    }
+
+    #[test]
+    fn the_same_answer_cannot_be_replayed() {
+        // A relay that captured a valid response could otherwise enrol the same
+        // device repeatedly, or race a second approval past the operator.
+        let dir = Dir::new("replay");
+        let id = EndpointIdentity::open(dir.0.clone(), "aokie");
+        let offer = id.create_offer("app_a", None, "conn-1").unwrap();
+        let phone = SigningKey::from_bytes(&[8u8; 32]);
+        let response = answer(&offer, &phone);
+
+        assert!(id.receive_response(&response).is_ok());
+        let err = id.receive_response(&response).unwrap_err();
+        // "already used" rather than "unknown": the honest reason, and the one
+        // that tells an operator they are looking at a duplicate not a typo.
+        assert!(err.contains("already used"), "{err}");
+    }
+
+    #[test]
+    fn an_answer_to_another_desktops_offer_is_refused() {
+        // The claims bind to OUR thumbprint. Without that a response could be
+        // replayed against a different desktop that issued the same nonce.
+        let dir = Dir::new("crossdesktop");
+        let mine = EndpointIdentity::open(dir.0.join("a"), "aokie");
+        let theirs = EndpointIdentity::open(dir.0.join("b"), "aokie");
+        let phone = SigningKey::from_bytes(&[9u8; 32]);
+
+        let their_offer = theirs.create_offer("app_a", None, "conn-1").unwrap();
+        let err = mine.receive_response(&answer(&their_offer, &phone)).unwrap_err();
+        assert!(err.contains("no live pairing offer"), "{err}");
+    }
+
+    #[test]
+    fn an_expired_offer_is_refused_and_forgotten() {
+        let dir = Dir::new("expiry");
+        let id = EndpointIdentity::open(dir.0.clone(), "aokie");
+        let offer = id.create_offer_at("app_a", None, "conn-1", 1_000).unwrap();
+        let phone = SigningKey::from_bytes(&[10u8; 32]);
+        let response = answer(&offer, &phone);
+
+        // Comfortably past the ten-minute window.
+        let err = id.receive_response_at(&response, 1_000 + 600 + 60).unwrap_err();
+        assert!(err.contains("expired"), "{err}");
+        // And the challenge is gone rather than lingering to be answered later.
+        assert!(id.inner.lock().unwrap().challenges.is_empty());
+    }
+
+    #[test]
+    fn a_revoked_key_cannot_quietly_re_enrol() {
+        // Otherwise revoking a lost phone buys nothing: it re-pairs and the
+        // owner sees an ordinary approval rather than the return of a device
+        // they deliberately cut off.
+        let dir = Dir::new("revoked-return");
+        let id = EndpointIdentity::open(dir.0.clone(), "aokie");
+        let phone = SigningKey::from_bytes(&[11u8; 32]);
+
+        let first = id.create_offer("app_a", None, "conn-1").unwrap();
+        let pending = id.receive_response(&answer(&first, &phone)).unwrap();
+        id.approve(&pending.id).unwrap();
+        id.revoke(&pending.thumbprint).unwrap();
+
+        let second = id.create_offer("app_a", None, "conn-1").unwrap();
+        let err = id.receive_response(&answer(&second, &phone)).unwrap_err();
+        assert!(err.contains("revoked"), "{err}");
+    }
+
+    #[test]
+    fn a_tampered_answer_is_refused() {
+        let dir = Dir::new("tamper");
+        let id = EndpointIdentity::open(dir.0.clone(), "aokie");
+        let offer = id.create_offer("app_a", None, "conn-1").unwrap();
+        let phone = SigningKey::from_bytes(&[12u8; 32]);
+
+        let mut r = answer(&offer, &phone);
+        r.claims.device_id = "someone-elses-phone".into();
+        assert!(id.receive_response(&r).is_err());
+
+        // …and the failed attempt must not have burned the challenge, or a
+        // hostile frame would deny the real phone its one chance to answer.
+        assert!(id.receive_response(&answer(&offer, &phone)).is_ok());
     }
 
     #[test]
