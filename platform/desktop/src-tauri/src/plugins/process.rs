@@ -283,20 +283,36 @@ impl PluginProcess {
                             );
                         }
                         RpcMessage::Request { id, method, params } => {
-                            let reply = match requests(&method, params) {
-                                Ok(v) => result_line(&id, v),
-                                Err((typed, msg)) => error_line(
-                                    &id,
-                                    rpc::METHOD_NOT_FOUND,
-                                    &msg,
-                                    Some(&typed),
-                                ),
-                            };
-                            if let Ok(guard) = tx_for_replies.lock() {
-                                if let Some(tx) = guard.as_ref() {
-                                    let _ = tx.try_send(reply);
+                            // Answered on its OWN thread, not inline.
+                            //
+                            // This is the plugin's stdout reader: while it is in
+                            // here, that plugin's logs and events are not being
+                            // read at all. A handler that reaches the network —
+                            // `companion.admission` brokers through an upstream
+                            // issuer — would stall the whole stream for as long
+                            // as the request takes.
+                            //
+                            // Safe to overlap because replies are keyed by JSON-RPC
+                            // id and the peer matches them through a pending map,
+                            // so ordering was never part of the contract.
+                            let requests = requests.clone();
+                            let tx_for_replies = tx_for_replies.clone();
+                            thread::spawn(move || {
+                                let reply = match requests(&method, params) {
+                                    Ok(v) => result_line(&id, v),
+                                    Err((typed, msg)) => error_line(
+                                        &id,
+                                        rpc::METHOD_NOT_FOUND,
+                                        &msg,
+                                        Some(&typed),
+                                    ),
+                                };
+                                if let Ok(guard) = tx_for_replies.lock() {
+                                    if let Some(tx) = guard.as_ref() {
+                                        let _ = tx.try_send(reply);
+                                    }
                                 }
-                            }
+                            });
                         }
                         RpcMessage::NonProtocol(text) => {
                             if !text.is_empty() {

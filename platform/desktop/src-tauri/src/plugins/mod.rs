@@ -43,7 +43,7 @@ pub mod registry;
 pub mod rpc;
 pub mod runner;
 
-pub use host::{ForwardError, PluginHost, ReceivedEvent, TriggerStore, TriggerStoreHandle, CONNECTOR_TIMEOUT};
+pub use host::{CompanionBroker, ForwardError, PluginHost, ReceivedEvent, TriggerStore, TriggerStoreHandle, CONNECTOR_TIMEOUT};
 pub use process::{CallError, PluginProcess, SpawnOptions};
 pub use manifest::{ManifestError, PluginManifest, HOST_CAPABILITIES};
 pub use registry::{

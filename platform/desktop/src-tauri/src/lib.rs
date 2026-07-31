@@ -1480,6 +1480,23 @@ pub fn run() {
                 // The ChatGPT connector: its OAuth lives in a CODEX_HOME under
                 // the data dir, owned by the codex child, not by us.
                 let ai_codex_for_http = crate::ai::codex::new_handle(&data_dir_for_bridge);
+                // Companion trust and its relay. Built here, before serve(),
+                // because the plugin host answers `companion.admission` from
+                // the SAME identity store the routes administer — two stores
+                // would disagree about which phones are trusted.
+                let companion_for_http = crate::companion::new_handle(
+                    data_dir_for_bridge.clone(),
+                    bridge_for_http.plugins.clone(),
+                );
+                let companion_upstream_for_http = crate::companion::upstream::UpstreamStore::open(
+                    data_dir_for_bridge.join("companion").join("relay.json"),
+                );
+                bridge_for_http.host.set_companion_broker(
+                    crate::plugins::CompanionBroker {
+                        companion: companion_for_http.clone(),
+                        upstream: companion_upstream_for_http.clone(),
+                    },
+                );
                 if let Err(e) = http::serve(
                     DESKTOP_PORT,
                     config_provider,
@@ -1493,7 +1510,8 @@ pub fn run() {
                     python_for_http,
                     catalog_for_http,
                     bridge_for_http,
-                    data_dir_for_bridge.clone(),
+                    companion_for_http,
+                    companion_upstream_for_http,
                     ai_providers_for_http,
                     ai_codex_for_http,
                     node_for_http,

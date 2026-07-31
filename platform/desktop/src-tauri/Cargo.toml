@@ -71,7 +71,7 @@ chrono = { version = "0.4", features = ["serde"] }
 # Windows build self-contained — no schannel ABI surprises and no
 # OpenSSL on Linux. `stream` is needed for incremental progress so the
 # UI can show "1.2 GB / 4.7 GB · 38 MB/s" instead of a frozen bar.
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "blocking"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "blocking", "json"] }
 futures-util = "0.3"
 
 # Native python-build-standalone install: gunzip + untar the PBS release
