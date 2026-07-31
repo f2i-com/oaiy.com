@@ -22,6 +22,7 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use sha2::{Digest, Sha256};
 use tokio::task::AbortHandle;
 use uuid::Uuid;
 
@@ -63,6 +64,20 @@ pub struct DownloadProgress {
     /// Seconds remaining at the current speed. `None` when `bytes_total`
     /// or `speed_bps` isn't known yet.
     pub eta_secs: Option<u64>,
+    /// SHA-256 of what we actually wrote, computed as it streamed. Reported
+    /// whether or not anything could be checked against it — a user with a
+    /// digest from elsewhere can then compare by eye.
+    pub sha256: Option<String>,
+    /// The digest we're checking against: supplied by the caller, or taken from
+    /// HuggingFace's `X-Linked-ETag` (the git-lfs OID, which IS the content's
+    /// SHA-256). `None` means nothing could be verified — see `verified`.
+    pub expected_sha256: Option<String>,
+    /// `Some(true)` the content matched, `Some(false)` it did not (the file is
+    /// deleted and the download failed), `None` there was nothing to check it
+    /// against. Deliberately three-valued: reporting "unverified" as `false`
+    /// would cry wolf on every direct URL, and as `true` would claim a
+    /// guarantee that was never made.
+    pub verified: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -90,6 +105,42 @@ pub struct ModelsSnapshot {
 /// Headroom we keep free so a download never fills the drive to zero —
 /// the final `.part` → final-name rename, plus logs/temp, all need room.
 const DISK_MARGIN_BYTES: u64 = 64 * 1024 * 1024; // 64 MiB
+
+/// A lowercase 64-char hex string, and nothing else.
+fn is_sha256_hex(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Normalise a caller-supplied digest, or refuse it.
+///
+/// Refused rather than ignored: a user who pastes a truncated or MD5 digest and
+/// gets a silently-unverified download is worse off than one who gets an error,
+/// because they believe a check happened.
+fn parse_expected_sha256(raw: &str) -> Result<String, String> {
+    let cleaned = raw.trim().trim_start_matches("sha256:").trim();
+    if !is_sha256_hex(cleaned) {
+        return Err(format!(
+            "expectedSha256 must be 64 hex characters (got {} characters)",
+            cleaned.len()
+        ));
+    }
+    Ok(cleaned.to_ascii_lowercase())
+}
+
+/// Read a content digest out of an ETag-style header value.
+///
+/// HuggingFace sets `X-Linked-ETag` to the file's git-lfs OID, which by the LFS
+/// spec is the SHA-256 of the content — so for LFS-backed model files this is an
+/// authoritative digest, published by the origin, that costs nothing to obtain.
+///
+/// Only `X-Linked-ETag` is trusted. The CDN's own `etag` on the final response
+/// is also 64 hex characters but is a DIFFERENT value (the object store's, not
+/// the content's) — verified against the HF API's `lfs.oid`. Treating it as a
+/// content digest would fail every download.
+fn digest_from_etag(value: &str) -> Option<String> {
+    let v = value.trim().trim_start_matches("W/").trim_matches('"');
+    is_sha256_hex(v).then(|| v.to_ascii_lowercase())
+}
 
 /// Pure free-space decision: how many bytes short we'd be after reserving
 /// the margin, or `None` if `needed` fits. Split out so it's unit-testable
@@ -356,7 +407,14 @@ impl Downloads {
         url: &str,
         filename: Option<&str>,
         subdir: Option<&str>,
+        expected_sha256: Option<&str>,
     ) -> Result<String, String> {
+        // Validated up front so a malformed digest is a 400 the caller sees,
+        // not a surprise after a 40 GB transfer.
+        let expected_sha256 = expected_sha256
+            .filter(|s| !s.trim().is_empty())
+            .map(parse_expected_sha256)
+            .transpose()?;
         let normalised = normalise_hf_url(url)?;
         // SSRF guard: refuse a non-https URL or one pointing at an internal/special address
         // BEFORE spawning, so an untrusted catalog/template URL can't make OAIY Desktop probe
@@ -457,6 +515,12 @@ impl Downloads {
                             resumable: None,
                             speed_bps: None,
                             eta_secs: None,
+                            // Not re-hashed: this file was not downloaded now,
+                            // and claiming a verification we did not perform is
+                            // the one thing this feature must never do.
+                            sha256: None,
+                            expected_sha256: expected_sha256.clone(),
+                            verified: None,
                         },
                     );
                 }
@@ -488,6 +552,9 @@ impl Downloads {
             resumable: None,
             speed_bps: None,
             eta_secs: None,
+            sha256: None,
+            expected_sha256: expected_sha256.clone(),
+            verified: None,
         };
 
         // Dedup, cap and insert must be ONE critical section. These were three
@@ -534,7 +601,13 @@ impl Downloads {
             g.insert(id.clone(), progress);
         }
 
-        self.spawn_transfer(id.clone(), normalised, dest, /* resume_from = */ 0);
+        self.spawn_transfer(
+            id.clone(),
+            normalised,
+            dest,
+            /* resume_from = */ 0,
+            expected_sha256,
+        );
         Ok(id)
     }
 
@@ -605,7 +678,14 @@ impl Downloads {
         self.update(id, |p| {
             p.bytes_downloaded = resume_from;
         });
-        self.spawn_transfer(id.to_string(), url, dest, resume_from);
+        // Carried across a resume: the digest is a property of the file, not of
+        // one transfer attempt.
+        let expected = self
+            .progress
+            .lock()
+            .ok()
+            .and_then(|g| g.get(id).and_then(|p| p.expected_sha256.clone()));
+        self.spawn_transfer(id.to_string(), url, dest, resume_from, expected);
         Ok(())
     }
 
@@ -644,7 +724,14 @@ impl Downloads {
         }
     }
 
-    fn spawn_transfer(&self, id: String, url: String, dest: PathBuf, resume_from: u64) {
+    fn spawn_transfer(
+        &self,
+        id: String,
+        url: String,
+        dest: PathBuf,
+        resume_from: u64,
+        expected_sha256: Option<String>,
+    ) {
         let progress_map = self.progress.clone();
         // The abort_map clone is moved into the task so it can remove its
         // own AbortHandle entry on completion — without this, finished
@@ -655,7 +742,17 @@ impl Downloads {
         let id_for_task = id.clone();
         let token = self.hf_token.lock().ok().and_then(|g| g.clone());
         let handle = tokio::spawn(async move {
-            run_download(progress_map, abort_map, id_for_task, url, dest, resume_from, token).await;
+            run_download(
+                progress_map,
+                abort_map,
+                id_for_task,
+                url,
+                dest,
+                resume_from,
+                token,
+                expected_sha256,
+            )
+            .await;
         });
         if let Ok(mut g) = self.abort_handles.lock() {
             g.insert(id, handle.abort_handle());
@@ -671,6 +768,7 @@ async fn run_download(
     dest: PathBuf,
     resume_from: u64,
     hf_token: Option<String>,
+    expected_sha256: Option<String>,
 ) {
     let update = |f: Box<dyn FnOnce(&mut DownloadProgress)>| {
         if let Ok(mut g) = progress_map.lock() {
@@ -899,6 +997,36 @@ async fn run_download(
         }
     };
 
+    // The digest to check against: what the caller asked for, else whatever the
+    // origin published. Asking HuggingFace costs one redirect-less HEAD and
+    // covers essentially every model download without the user supplying
+    // anything — the whole reason this is worth doing.
+    let expected = match expected_sha256 {
+        Some(d) => Some(d),
+        None => hf_linked_digest(&url, hf_token.as_deref()).await,
+    };
+    if let Some(d) = expected.clone() {
+        update(Box::new(move |p| p.expected_sha256 = Some(d)));
+    }
+
+    // Hash as we write. On a resume the bytes already on disk were hashed by a
+    // previous process that is gone, so re-read them — one pass over the
+    // partial, only on the uncommon path, versus re-reading the whole file at
+    // the end of every download.
+    let mut hasher = if resuming && resume_accepted {
+        match hash_prefix(&part, resume_from).await {
+            Ok(h) => Some(h),
+            Err(e) => {
+                // Verification is now impossible for this transfer. Say so
+                // rather than finishing and reporting a digest of the tail.
+                eprintln!("[downloads] cannot re-hash {}: {e}", part.display());
+                None
+            }
+        }
+    } else {
+        Some(Sha256::new())
+    };
+
     let mut downloaded: u64 = if resuming && resume_accepted { resume_from } else { 0 };
     let mut last_emit: u64 = downloaded;
     // Sliding-window speed tracker: keep (timestamp, bytes_so_far) samples
@@ -931,6 +1059,9 @@ async fn run_download(
                 p.finished_at = Some(Utc::now());
             }));
             return;
+        }
+        if let Some(h) = hasher.as_mut() {
+            h.update(&chunk);
         }
         downloaded += chunk.len() as u64;
 
@@ -975,6 +1106,33 @@ async fn run_download(
         }
     }
 
+    // Verify BEFORE the rename: a file that fails its digest must never appear
+    // under its final name, however briefly. Something else on this machine could
+    // pick it up in between, and the whole point is that a corrupted or swapped
+    // model never becomes a model this app will load.
+    let actual = hasher.map(|h| format!("{:x}", h.finalize()));
+    if let (Some(expected), Some(actual)) = (expected.as_deref(), actual.as_deref()) {
+        if expected != actual {
+            let _ = tokio::fs::remove_file(&part).await;
+            let (e, a) = (expected.to_string(), actual.to_string());
+            update(Box::new(move |p| {
+                p.status = DownloadStatus::Failed;
+                p.verified = Some(false);
+                p.sha256 = Some(a.clone());
+                p.error = Some(format!(
+                    "content does not match its published checksum — the file was deleted. \
+                     Expected {e}, got {a}. Retry; if it keeps happening, the source or the \
+                     connection is not to be trusted."
+                ));
+                p.finished_at = Some(Utc::now());
+            }));
+            if let Ok(mut g) = abort_map.lock() {
+                g.remove(&id);
+            }
+            return;
+        }
+    }
+
     if let Err(e) = tokio::fs::rename(&part, &dest).await {
         update(Box::new(move |p| {
             p.status = DownloadStatus::Failed;
@@ -984,9 +1142,15 @@ async fn run_download(
         return;
     }
 
+    let verified = match (&expected, &actual) {
+        (Some(_), Some(_)) => Some(true), // a mismatch returned above
+        _ => None,
+    };
     update(Box::new(move |p| {
         p.status = DownloadStatus::Completed;
         p.bytes_downloaded = downloaded;
+        p.sha256 = actual;
+        p.verified = verified;
         p.finished_at = Some(Utc::now());
         // Clear speed/ETA on completion — leaving them stale would say
         // "12 MiB/s · 0 min remaining" on a finished row.
@@ -1000,6 +1164,57 @@ async fn run_download(
     if let Ok(mut g) = abort_map.lock() {
         g.remove(&id);
     }
+}
+
+/// Hash the first `len` bytes of a file, for seeding a resumed download.
+async fn hash_prefix(path: &Path, len: u64) -> std::io::Result<Sha256> {
+    use tokio::io::AsyncReadExt as _;
+    let mut f = tokio::fs::File::open(path).await?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 1 << 20];
+    let mut read_total: u64 = 0;
+    while read_total < len {
+        let want = ((len - read_total) as usize).min(buf.len());
+        let n = f.read(&mut buf[..want]).await?;
+        if n == 0 {
+            // The partial is shorter than the byte counter claims. Better to
+            // fail the hash than to report a digest over the wrong bytes.
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!("partial file is {read_total} bytes, expected at least {len}"),
+            ));
+        }
+        hasher.update(&buf[..n]);
+        read_total += n as u64;
+    }
+    Ok(hasher)
+}
+
+/// Ask HuggingFace for a file's published SHA-256.
+///
+/// `X-Linked-ETag` rides the 302 from `huggingface.co` to the CDN, so this must
+/// NOT follow redirects — the final CDN response carries a different `etag` that
+/// is not the content digest. Best-effort: any failure just means the download
+/// is unverified, which is exactly where it was before.
+async fn hf_linked_digest(url: &str, hf_token: Option<&str>) -> Option<String> {
+    if !is_hf_host(url) {
+        return None;
+    }
+    let client = reqwest::Client::builder()
+        .user_agent(format!("oaiy-desktop/{}", env!("CARGO_PKG_VERSION")))
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .ok()?;
+    let mut req = client.head(url);
+    if let Some(t) = hf_token {
+        req = req.bearer_auth(t);
+    }
+    let resp = req.send().await.ok()?;
+    resp.headers()
+        .get("x-linked-etag")
+        .and_then(|v| v.to_str().ok())
+        .and_then(digest_from_etag)
 }
 
 /// Compute bytes/sec + ETA from a sliding window of (timestamp, bytes)
@@ -1295,5 +1510,94 @@ mod tests {
         assert_eq!(parse("bytes 0-500/1001"), Some(0));
         assert_eq!(parse("bytes */1001"), None);
         assert_eq!(parse("nonsense"), None);
+    }
+
+    // --- checksum verification ---------------------------------------------
+
+    #[test]
+    fn a_caller_digest_is_normalised_or_refused() {
+        let good = "9EE36184E616DFC76DF4F5DD66F908DBDE6979524AE36E6CEFB67F532F798CB8";
+        assert_eq!(
+            parse_expected_sha256(good).unwrap(),
+            good.to_ascii_lowercase()
+        );
+        // The form a user copies out of a lockfile or an LFS pointer.
+        assert_eq!(
+            parse_expected_sha256(&format!("  sha256:{good}  ")).unwrap(),
+            good.to_ascii_lowercase()
+        );
+
+        // Refused, not ignored: someone who pastes an MD5 or a truncated digest
+        // and gets a silently-unverified download is worse off than one who
+        // gets an error, because they believe a check happened.
+        assert!(parse_expected_sha256("d41d8cd98f00b204e9800998ecf8427e").is_err());
+        assert!(parse_expected_sha256(&good[..63]).is_err());
+        assert!(parse_expected_sha256(&format!("{}z", &good[..63])).is_err());
+        assert!(parse_expected_sha256("").is_err());
+    }
+
+    #[test]
+    fn only_a_real_sha256_is_read_out_of_an_etag() {
+        let oid = "9ee36184e616dfc76df4f5dd66f908dbde6979524ae36e6cefb67f532f798cb8";
+        assert_eq!(digest_from_etag(&format!("\"{oid}\"")).as_deref(), Some(oid));
+        assert_eq!(digest_from_etag(&format!("W/\"{oid}\"")).as_deref(), Some(oid));
+        assert_eq!(digest_from_etag(oid).as_deref(), Some(oid));
+
+        // A non-LFS file's ETag is a git blob SHA-1 (40 hex). Treating that as a
+        // content digest would fail every small-file download.
+        assert_eq!(digest_from_etag("\"8d1c9f0e2b3a4d5c6e7f8091a2b3c4d5e6f70819\""), None);
+        // S3-style multipart ETags carry a part suffix.
+        assert_eq!(digest_from_etag("\"d41d8cd98f00b204e9800998ecf8427e-7\""), None);
+        assert_eq!(digest_from_etag("\"\""), None);
+    }
+
+    #[tokio::test]
+    async fn hashing_a_resumed_prefix_matches_hashing_the_whole_thing() {
+        // The resume path re-reads what a previous process wrote, then continues
+        // hashing the tail. If the two halves didn't compose, every resumed
+        // download would fail verification — which looks exactly like tampering.
+        let dir = std::env::temp_dir().join(format!("oaiy-hash-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("part.bin");
+
+        let head: Vec<u8> = (0..100_000u32).map(|i| (i % 251) as u8).collect();
+        let tail: Vec<u8> = (0..37_000u32).map(|i| (i % 197) as u8).collect();
+        std::fs::write(&path, &head).unwrap();
+
+        let mut resumed = hash_prefix(&path, head.len() as u64).await.unwrap();
+        resumed.update(&tail);
+
+        let mut whole = Sha256::new();
+        whole.update(&head);
+        whole.update(&tail);
+
+        assert_eq!(
+            format!("{:x}", resumed.finalize()),
+            format!("{:x}", whole.finalize())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_partial_shorter_than_its_counter_fails_rather_than_hashing_the_wrong_bytes() {
+        let dir = std::env::temp_dir().join(format!("oaiy-hash-short-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("part.bin");
+        std::fs::write(&path, b"only twenty bytes...").unwrap();
+
+        // Claiming 5000 bytes are there when 20 are: reporting a digest over the
+        // short read would produce a mismatch blamed on the server.
+        assert!(hash_prefix(&path, 5_000).await.is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_non_huggingface_url_is_never_asked_for_a_digest() {
+        // hf_linked_digest attaches the user's HF bearer token, so the host gate
+        // matters as much here as it does on the transfer itself.
+        assert!(!is_hf_host("https://example.com/model.gguf"));
+        assert!(!is_hf_host("http://huggingface.co/x/resolve/main/m.gguf"));
+        assert!(is_hf_host("https://huggingface.co/x/resolve/main/m.gguf"));
+        assert!(is_hf_host("https://cdn-lfs.huggingface.co/x"));
     }
 }

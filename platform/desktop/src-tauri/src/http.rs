@@ -351,7 +351,13 @@ async fn list_models(State(state): State<AppState>) -> impl IntoResponse {
     }
 }
 
+/// `camelCase` + `deny_unknown_fields` because this body carries a CHECKSUM.
+/// Without the rename, `expectedSha256` deserialised to `None` and the download
+/// ran unverified while the caller believed it had asked for verification —
+/// silently, which is the worst possible way for a checksum to fail. Denying
+/// unknown fields turns the next such typo into a 400 instead of a shrug.
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ModelDownloadRequest {
     /// Either a HuggingFace URL ("https://huggingface.co/<repo>/resolve/<rev>/<file>")
     /// or a direct download URL.
@@ -362,6 +368,11 @@ struct ModelDownloadRequest {
     /// Optional subdirectory under the models dir.
     #[serde(default)]
     subdir: Option<String>,
+    /// Expected SHA-256 of the content, if the caller knows it. HuggingFace
+    /// downloads don't need this — the origin publishes the digest and we use
+    /// it automatically. Refused if malformed rather than ignored.
+    #[serde(default)]
+    expected_sha256: Option<String>,
 }
 
 async fn start_model_download(
@@ -370,7 +381,12 @@ async fn start_model_download(
 ) -> impl IntoResponse {
     match state
         .downloads
-        .start(&req.url, req.filename.as_deref(), req.subdir.as_deref())
+        .start(
+            &req.url,
+            req.filename.as_deref(),
+            req.subdir.as_deref(),
+            req.expected_sha256.as_deref(),
+        )
     {
         Ok(id) => (StatusCode::ACCEPTED, Json(serde_json::json!({ "downloadId": id })))
             .into_response(),
@@ -1054,9 +1070,49 @@ pub async fn serve(
 mod tests {
     use super::{
         is_allowed_origin_privileged, is_privileged_path, is_restricted_read_path,
-        privileged_allowed, AuthConfig,
+        privileged_allowed, AuthConfig, ModelDownloadRequest,
     };
     use axum::http::Method;
+
+    #[test]
+    fn a_download_request_actually_reads_its_checksum_field() {
+        // Regression: the struct had no camelCase rename, so `expectedSha256`
+        // deserialised to None and the download ran UNVERIFIED while the caller
+        // believed it had asked for verification. Caught only by watching a
+        // deliberately-wrong digest complete successfully against a live app.
+        let digest = "0000000000000000000000000000000000000000000000000000000000000000";
+        let req: ModelDownloadRequest = serde_json::from_str(&format!(
+            r#"{{"url":"https://huggingface.co/x/resolve/main/m.gguf","expectedSha256":"{digest}"}}"#
+        ))
+        .expect("a well-formed body parses");
+        assert_eq!(req.expected_sha256.as_deref(), Some(digest));
+    }
+
+    #[test]
+    fn a_misspelled_checksum_field_is_refused_rather_than_ignored() {
+        // The failure mode this whole feature exists to prevent is believing a
+        // check happened when it did not — so an unknown field is a 400.
+        assert!(serde_json::from_str::<ModelDownloadRequest>(
+            r#"{"url":"https://huggingface.co/x/resolve/main/m.gguf","expected_sha256":"abc"}"#
+        )
+        .is_err());
+        assert!(serde_json::from_str::<ModelDownloadRequest>(
+            r#"{"url":"https://huggingface.co/x/resolve/main/m.gguf","sha256":"abc"}"#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn the_ordinary_download_body_still_parses() {
+        // The rename must not break what the app itself sends.
+        let req: ModelDownloadRequest = serde_json::from_str(
+            r#"{"url":"https://huggingface.co/x/resolve/main/m.gguf","filename":"m.gguf","subdir":"qwen"}"#,
+        )
+        .expect("the app's own body parses");
+        assert_eq!(req.filename.as_deref(), Some("m.gguf"));
+        assert_eq!(req.subdir.as_deref(), Some("qwen"));
+        assert_eq!(req.expected_sha256, None);
+    }
 
     #[test]
     fn bridge_exec_routes_are_privileged() {
