@@ -718,7 +718,11 @@ kbd {
 .row-actions,
 .service-actions,
 .dl-actions { display: flex; flex: none; gap: 6px; }
-.service-actions { flex-wrap: wrap; justify-content: flex-end; }
+/* `flex: none` from the shared rule above resolves the basis to max-content,
+   which for a wrapping row is every button on ONE line — so `flex-wrap` could
+   never take effect and the buttons were clipped instead. Shrinking is what
+   makes wrapping reachable. */
+.service-actions { flex: 0 1 auto; flex-wrap: wrap; justify-content: flex-end; }
 
 /* ---------------------------------------------------------------------------
  * DATA VOICE — code, paths, readouts
@@ -952,7 +956,25 @@ code {
 }
 .service-meta { color: var(--faint); font-family: var(--font-mono); font-size: 11px; }
 .service-meta a { color: var(--cyan); }
-.service-error { display: block; margin-top: 6px; color: var(--danger); font-size: 11.5px; }
+/* Error and crash text is machine-generated: file paths, URLs and messages like
+   "127.0.0.1:8781:" contain no spaces to break at, so the default
+   `overflow-wrap: normal` lets one token run straight out of the card. These
+   are the only strings in the app not written by a human, so they are the only
+   ones that need this. */
+.service-error,
+.service-crash {
+  display: block;
+  margin-top: 6px;
+  color: var(--danger);
+  font-size: 11.5px;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+.service-crash {
+  margin: 6px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+}
 
 /* Per-service model pickers (llama.cpp / Ollama) sit inside a service card. */
 .llama-model,

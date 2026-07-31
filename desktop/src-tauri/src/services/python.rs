@@ -735,6 +735,9 @@ fn run_logged(program: &Path, args: &[String], logs: &LogBuffer) -> i32 {
             return -1;
         }
     };
+    // pip pulls gigabytes. Orphaned, it keeps downloading invisibly and the
+    // next launch has no handle with which to find or stop it.
+    crate::services::job_object::adopt(child.id());
     let mut handles = Vec::new();
     if let Some(out) = child.stdout.take() {
         let l = logs.clone();

@@ -16,6 +16,7 @@
 //!   5. python::Python manages a bundled python-build-standalone runtime
 //!      + named, reusable venvs under `${dataDir}/venvs/`.
 
+pub mod job_object;
 pub mod catalog;
 pub mod downloads;
 pub mod node_runtime;

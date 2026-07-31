@@ -114,6 +114,10 @@ impl Runner {
         }
 
         let mut child = cmd.spawn()?;
+        // The backstop for a parent that is KILLED rather than asked to stop.
+        // Without it this exact child — a voice server holding 8781 — outlives
+        // OAIY and blocks the next launch from binding. See `job_object`.
+        crate::services::job_object::adopt(child.id());
         let pid = child.id();
 
         // Capture stdout + stderr on dedicated threads. We use std::thread
