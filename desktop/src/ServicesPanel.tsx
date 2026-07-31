@@ -12,6 +12,7 @@ import {
 } from './api';
 import LogsViewer from './LogsViewer';
 import { useToast } from './Toasts';
+import { peek, put } from './useCached';
 
 /**
  * Services panel — list every template, surface status, and offer
@@ -20,7 +21,13 @@ import { useToast } from './Toasts';
  * the user clicking refresh.
  */
 export default function ServicesPanel() {
-  const [snapshot, setSnapshot] = useState<RegistrySnapshot | null>(null);
+  // Seeded from the shared cache, like every other panel. Switching views
+  // remounts this subtree, so starting at `null` meant a "Loading services…"
+  // flash on EVERY visit — even though Overview polls the same endpoint and
+  // had the answer sitting in the cache the whole time.
+  const [snapshot, setSnapshot] = useState<RegistrySnapshot | null>(
+    () => peek('servicesSnapshot') ?? null,
+  );
   const [error, setError] = useState<string | null>(null);
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
@@ -79,6 +86,10 @@ export default function ServicesPanel() {
       }
       firstPollRef.current = false;
       setSnapshot(next);
+      put('servicesSnapshot', next);
+      // Overview reads this key; keeping it fresh means arriving there from
+      // here is instant too.
+      put('services', next.services);
       setError(null);
     } catch (e) {
       if (seq !== reqSeqRef.current) return;
@@ -733,7 +744,7 @@ function LlamaModelSelector({ running }: { running: boolean }) {
  * persisted to desktop-config `ollamaModel` and applied on the next flow run
  * (no restart). Empty = the pre-pulled default (qwen2.5:0.5b).
  */
-function OllamaModelSelector() {
+function OllamaModelSelector({ running }: { running: boolean }) {
   const [models, setModels] = useState<string[]>([]);
   const [current, setCurrent] = useState<string>(''); // '' = default
   const [customMode, setCustomMode] = useState(false);
@@ -744,8 +755,11 @@ function OllamaModelSelector() {
 
   useEffect(() => {
     let alive = true;
+    // A stopped Ollama cannot list its models, so asking is a guaranteed wait
+    // for a connection that will not answer — on every visit to this panel,
+    // collapsed card or not. Read the saved choice, skip the probe.
     Promise.all([
-      appConfig.listOllamaModels().catch(() => [] as string[]),
+      running ? appConfig.listOllamaModels().catch(() => [] as string[]) : Promise.resolve([]),
       appConfig.get(),
     ])
       .then(([list, cfg]) => {
@@ -765,7 +779,7 @@ function OllamaModelSelector() {
     return () => {
       alive = false;
     };
-  }, []);
+  }, [running]);
 
   const apply = async (model: string) => {
     setBusy(true);
@@ -912,7 +926,11 @@ function ServiceCard({
               running={service.status === 'running' || service.status === 'starting'}
             />
           )}
-          {service.id === 'ollama' && <OllamaModelSelector />}
+          {service.id === 'ollama' && (
+            <OllamaModelSelector
+              running={service.status === 'running' || service.status === 'starting'}
+            />
+          )}
           <GpuSelector serviceId={service.id} currentGpu={service.gpu} />
         </div>
         {/* Why it died, and whether we are still retrying — the runner's log

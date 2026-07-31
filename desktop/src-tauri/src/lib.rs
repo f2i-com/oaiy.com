@@ -670,7 +670,10 @@ fn remove_model_dir(
 
 /// Tauri command: the loadable GGUFs found across the model search roots —
 /// the options for the llama.cpp Model picker.
-#[tauri::command]
+/// `async` for the same reason as [`list_gpus`]: this walks the model
+/// directories, which is instant on an empty install and very much not on a
+/// library of 40 GB checkpoints.
+#[tauri::command(async)]
 fn list_gguf_models(registry: tauri::State<RegistryHandle>) -> Vec<String> {
     registry
         .lock()
@@ -727,7 +730,11 @@ struct GpuInfo {
 
 /// Tauri command: the CUDA GPUs present (index + name), via nvidia-smi. Empty on a box
 /// without an NVIDIA GPU / nvidia-smi — the GPU picker then hides itself.
-#[tauri::command]
+/// `async` so Tauri runs it OFF the main thread: this spawns `nvidia-smi`,
+/// which costs ~60ms on a healthy machine and much more on a busy one. Every
+/// service card mounts a GPU picker, so on the plain `#[tauri::command]` form
+/// that stall landed on the UI thread exactly as the Services panel rendered.
+#[tauri::command(async)]
 fn list_gpus() -> Vec<GpuInfo> {
     let out = match std::process::Command::new(resolved_system_exe(
         "System32",
