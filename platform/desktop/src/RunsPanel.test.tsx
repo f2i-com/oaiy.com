@@ -108,6 +108,18 @@ describe('RunsPanel', () => {
     expect(runsMock).toHaveBeenLastCalledWith('all', 50);
   });
 
+  it('counts every state the failures filter fetches, cancelled included', async () => {
+    // The badge was summed from a hand-written subset while the query used
+    // FAILURE_STATES, so the tab said "Failures (2)" above five rows.
+    runsMock.mockResolvedValue({
+      runs: [FAILED],
+      total: 12,
+      byStatus: { failed: 1, timed_out: 1, cancelled: 3, succeeded: 7 },
+    });
+    await mount();
+    expect(text()).toContain('Failures (5)');
+  });
+
   it('distinguishes "nothing failed" from "nothing ran"', async () => {
     runsMock.mockResolvedValue({ runs: [], total: 8, byStatus: { succeeded: 8 } });
     await mount();
@@ -119,6 +131,17 @@ describe('RunsPanel', () => {
     root = createRoot(host);
     await mount();
     expect(text()).toContain('No flow has run on this machine yet');
+  });
+
+  it('does not call a queued run finished', async () => {
+    // The count came from `total` — the whole ledger — so three runs stuck in
+    // the queue read as "all 12 recorded runs finished cleanly", an all-clear
+    // over work that had not started. Nothing ages a queued run out, so that
+    // sentence stays wrong for as long as the runs are stuck.
+    runsMock.mockResolvedValue({ runs: [], total: 12, byStatus: { succeeded: 9, queued: 3 } });
+    await mount();
+    expect(text()).toContain('9 finished cleanly, 3 still queued or running');
+    expect(text()).not.toContain('all 12 recorded runs');
   });
 
   it('never paints one filter’s rows under the other filter’s heading', async () => {

@@ -243,22 +243,24 @@ impl ProviderStore {
             Some(slot) => *slot = provider,
             None => self.providers.push(provider),
         }
-        self.persist();
+        self.persist()?;
         Ok(id)
     }
 
-    /// Remove a provider by id. Returns Err on an unknown id so the caller can 404.
+    /// Remove a provider by id. Returns Err on an unknown id so the caller can
+    /// 404, or when the removal could not be written to disk.
     pub fn delete(&mut self, id: &str) -> Result<(), String> {
         let before = self.providers.len();
         self.providers.retain(|p| p.id != id);
         if self.providers.len() == before {
             return Err(format!("unknown provider {id:?}"));
         }
-        self.persist();
-        Ok(())
+        self.persist()
     }
 
-    /// Set (or clear, on empty/None) a provider's plaintext key.
+    /// Set (or clear, on empty/None) a provider's plaintext key. Err on an
+    /// unknown id, a rejected key, or a key that could not be written to disk —
+    /// the caller must not report a key it will not still have after a restart.
     pub fn set_key(&mut self, id: &str, key: Option<&str>) -> Result<(), String> {
         let trimmed = key.map(str::trim).filter(|k| !k.is_empty());
         if let Some(k) = trimmed {
@@ -272,8 +274,7 @@ impl ProviderStore {
             .find(|p| p.id == id)
             .ok_or_else(|| format!("unknown provider {id:?}"))?;
         provider.api_key = trimmed.map(str::to_string);
-        self.persist();
-        Ok(())
+        self.persist()
     }
 
     /// INTERNAL: the full record incl. `api_key`, for the gateway's outbound call
@@ -296,19 +297,44 @@ impl ProviderStore {
         self.providers.iter().find(|p| p.id == id)
     }
 
-    /// Atomic tmp + rename (mirrors `PairingManager::persist`). No-op when in-memory.
-    fn persist(&self) {
-        let Some(path) = &self.path else { return };
+    /// Atomic tmp + rename. No-op when in-memory; otherwise the io error reaches
+    /// the caller.
+    ///
+    /// This was previously infallible by construction (`if write(..).is_ok() {
+    /// let _ = rename(..) }`), which made a failed save indistinguishable from a
+    /// successful one: `set_key` still answered 204, `list()` still reported
+    /// `hasKey: true` off the in-memory vec, chat worked for the rest of the
+    /// session — and the key was simply absent on the next launch, with nothing
+    /// logged anywhere. A data dir that exists but is not writable, a full disk,
+    /// or a rename an indexer/AV blocks is enough to hit it.
+    ///
+    /// The in-memory change is deliberately NOT rolled back on failure: this
+    /// writes the WHOLE store every time, so the next persist that succeeds
+    /// carries the missed edits with it and a transient failure heals itself.
+    fn persist(&self) -> Result<(), String> {
+        let Some(path) = &self.path else { return Ok(()) };
+        let fail = |e: &dyn std::fmt::Display| {
+            format!("could not save providers.json ({e}) — the change applies to this session only and is lost on restart")
+        };
         if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
+            std::fs::create_dir_all(dir).map_err(|e| fail(&e))?;
         }
         let shape = PersistShape { providers: self.providers.clone() };
-        if let Ok(body) = serde_json::to_string_pretty(&shape) {
-            let tmp = path.with_extension("json.tmp");
-            if std::fs::write(&tmp, &body).is_ok() {
-                let _ = std::fs::rename(&tmp, path);
-            }
+        let body = serde_json::to_string_pretty(&shape).map_err(|e| fail(&e))?;
+        let tmp = path.with_extension("json.tmp");
+        // Remove the tmp on either failure: it holds the PLAINTEXT key and
+        // nothing ever reads or cleans `providers.json.tmp` (`open` only ever
+        // reads `path`), so a failed rename would leave the secret sitting in a
+        // second file indefinitely. Same reason as `lib.rs`'s `atomic_write`.
+        if let Err(e) = std::fs::write(&tmp, &body) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(fail(&e));
         }
+        if let Err(e) = std::fs::rename(&tmp, path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(fail(&e));
+        }
+        Ok(())
     }
 }
 
@@ -441,6 +467,33 @@ mod tests {
         let s2 = ProviderStore::open(path.clone());
         assert_eq!(s2.list().len(), 1);
         assert_eq!(s2.get_full("openai").unwrap().api_key.as_deref(), Some("sk-persist"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_save_is_reported_and_leaves_no_plaintext_tmp() {
+        // A directory standing where providers.json belongs makes the rename fail
+        // exactly as a read-only data dir or a locked target does in the field,
+        // without needing real permissions in a test.
+        let dir = std::env::temp_dir().join(format!("oaiy-ai-unwritable-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("providers.json");
+        std::fs::create_dir_all(&path).unwrap();
+        let mut s = ProviderStore::open(path.clone());
+
+        let err = s.upsert(input("openai")).unwrap_err();
+        assert!(err.contains("providers.json"), "the io failure must reach the caller: {err}");
+        // The 204-with-a-lost-key case: set_key must not answer Ok for a secret
+        // that never reached the disk.
+        assert!(s.set_key("openai", Some("sk-secret")).is_err(), "an unsaved key must not report success");
+        // Not rolled back — the edit stays live for the session so a later
+        // persist that succeeds still carries it to disk.
+        assert!(s.get_full("openai").unwrap().has_key());
+        assert!(s.delete("openai").is_err(), "an unsaved delete must not report success");
+        assert!(
+            !path.with_extension("json.tmp").exists(),
+            "the plaintext key must not survive in providers.json.tmp"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

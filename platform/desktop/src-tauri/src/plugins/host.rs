@@ -29,6 +29,13 @@
 //! starve every in-flight request of its answers. So the sink only sends into a
 //! channel; a dedicated event thread does the heavy work — ring buffer, trigger
 //! dispatch, and the `event.ack` that lets the plugin stop re-delivering.
+//!
+//! The rule covers the FAILURE path too, which is where it was quietly lost
+//! once: recording a shed event durably is a whole-file rewrite plus an fsync,
+//! and doing it in the sink put a disk sync per dropped event in front of every
+//! RPC reply the reader still had to route — under a flood, i.e. exactly when
+//! the plugin can least afford it. So sheds get their own channel and their own
+//! thread as well. Nothing on the reader thread may wait on a lock or the disk.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
@@ -46,6 +53,7 @@ use super::runner::{restart_delay, should_restart, HealthTracker, HealthVerdict,
 use crate::bridge::deadletters::{DeadLetterHandle, DeadReason};
 use crate::bridge::ledger::{LedgerHandle, LineageRef, ReserveOutcome, RunRequest};
 use crate::bridge::triggers::{dispatch, DispatchOutcome, Event, SkipReason, TriggerBinding};
+use crate::services::runner::LogBuffer;
 
 /// Does this skip mean something went WRONG, or the trigger system working?
 ///
@@ -111,6 +119,14 @@ fn dead_reason_for(results: &[DispatchOutcome]) -> Option<DeadReason> {
 pub const CONNECTOR_TIMEOUT: Duration = Duration::from_secs(30);
 /// Events kept for `GET /api/bridge/events` polling.
 const EVENT_RING_CAPACITY: usize = 500;
+/// How long a plugin must stay up before its crash-restart budget is refilled.
+///
+/// The rest of the supervision policy lives in [`super::runner`]; this one is
+/// here because the host is the only thing that observes uptime. Several health
+/// intervals long, so "it came up" and "it stayed up" cannot be the same event —
+/// that conflation is what made [`super::runner::MAX_RESTART_ATTEMPTS`]
+/// unreachable.
+const STABLE_UPTIME: Duration = Duration::from_secs(60);
 
 /// One received event, as the polling endpoint returns it.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -141,11 +157,86 @@ pub struct TriggerStore {
 
 impl TriggerStore {
     pub fn load(path: PathBuf) -> Self {
-        let bindings = std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default();
+        let bindings = match std::fs::read_to_string(&path) {
+            Ok(text) => Self::parse(&path, &text),
+            // No file at all IS the first boot. Anything else is a file that
+            // holds the user's bindings and could not be read — a lock from a
+            // backup agent or AV, bad UTF-8 — and must not be mistaken for
+            // "this workspace has no triggers", because the next `upsert` would
+            // make that true on disk.
+            Err(e) => {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    eprintln!("[triggers] cannot read {}: {e}", path.display());
+                    Self::quarantine(&path);
+                }
+                Vec::new()
+            }
+        };
         Self { path, bindings }
+    }
+
+    /// Deserialize entry by entry, keeping everything that loads.
+    ///
+    /// Whole-file `from_str::<Vec<TriggerBinding>>` made ONE malformed binding
+    /// — a hand edit, a field a newer build wrote — deserialize to nothing:
+    /// every automation stopped firing, `GET /api/bridge/triggers` returned the
+    /// same empty list a workspace with no triggers returns, and the first
+    /// `upsert` afterwards rewrote the file from that empty Vec, destroying the
+    /// other bindings for good. The ledger and the dead-letter queue both skip
+    /// only the bad entry for exactly this reason.
+    fn parse(path: &std::path::Path, text: &str) -> Vec<TriggerBinding> {
+        let rows: Vec<Value> = match serde_json::from_str(text) {
+            Ok(rows) => rows,
+            Err(e) => {
+                // Not a list at all, so there is nothing to salvage per entry —
+                // salvage the file instead.
+                eprintln!("[triggers] {} is not a list of bindings ({e})", path.display());
+                Self::quarantine(path);
+                return Vec::new();
+            }
+        };
+        let total = rows.len();
+        let loaded: Vec<TriggerBinding> = rows
+            .into_iter()
+            .filter_map(|row| match serde_json::from_value::<TriggerBinding>(row.clone()) {
+                Ok(b) => Some(b),
+                Err(e) => {
+                    // Loud, because the symptom otherwise is a flow that stopped
+                    // running and a UI that says nothing is wrong.
+                    log::warn!("skipping a trigger binding that will not load ({e}): {row}");
+                    None
+                }
+            })
+            .collect();
+
+        // A well-formed list where NOTHING survived is not "the user has no
+        // bindings" — it is a shape this build cannot read. The realistic cause
+        // is our own doing: add a required field to `TriggerBinding` and every
+        // existing row fails at once. Returning empty is then indistinguishable
+        // from a fresh install, and the first `upsert` writes that emptiness
+        // over the only copy. Quarantine so the file survives to be recovered.
+        if total > 0 && loaded.is_empty() {
+            log::warn!(
+                "none of the {total} bindings in {} could be loaded; keeping the file aside",
+                path.display()
+            );
+            Self::quarantine(path);
+        }
+        loaded
+    }
+
+    /// Move a bindings file we could not load out of the way.
+    ///
+    /// Renamed rather than left in place, because `persist` rewrites the whole
+    /// file from memory: leaving it means the first `upsert` after a failed load
+    /// silently overwrites the only copy the user has. A `.corrupt` file is
+    /// something they can hand back to us; an overwritten one is not.
+    fn quarantine(path: &std::path::Path) {
+        let aside = path.with_extension("json.corrupt");
+        match std::fs::rename(path, &aside) {
+            Ok(()) => eprintln!("[triggers] kept the original at {}", aside.display()),
+            Err(e) => eprintln!("[triggers] could not preserve {}: {e}", path.display()),
+        }
     }
 
     pub fn list(&self) -> &[TriggerBinding] {
@@ -228,9 +319,37 @@ struct ProcTable {
     /// handshake. The finishing start() kills the process instead of
     /// registering it.
     stop_during_start: std::collections::HashSet<String>,
+    /// Children that have been spawned but not yet handshaken.
+    ///
+    /// `stop_during_start` alone is only a REQUEST — the start thread reads it
+    /// when its handshake returns, up to HANDSHAKE_TIMEOUT after the child was
+    /// spawned. On app exit there is no such time: `stop_all` returned, the
+    /// process exited, and the child survived as an orphan still holding the
+    /// dongle it opened during init. So the handle is published here from the
+    /// instant the child exists, and `stop_all` can actually stop it.
+    starting_procs: HashMap<String, Arc<PluginProcess>>,
     /// Crash-restart due times. In the table — NOT supervisor-local — so a
     /// manual stop() can cancel one before it fires.
     restarts: HashMap<String, Instant>,
+    /// When each running plugin was registered, for [`STABLE_UPTIME`]. Entries
+    /// are consumed by the refill, so a plugin pays for the registry lock once
+    /// per life rather than once per supervisor tick.
+    started_at: HashMap<String, Instant>,
+    /// Log rings, kept past the process that produced them.
+    ///
+    /// Written on spawn and NOT removed when the plugin leaves `running`: the
+    /// stderr a plugin writes on its way out ("no dongle at COM3", a traceback)
+    /// is the only evidence of why it crashed, and the Logs button is offered in
+    /// every state. Reading these from `running` meant the panel said "No output
+    /// yet." within one supervisor tick of the exit — precisely when there was
+    /// something to read. services/registry keeps its runner and installer after
+    /// exit for the same reason and the same LogBuffer type. Replaced on the
+    /// next spawn, so a restarted plugin does not show its previous life.
+    log_rings: HashMap<String, LogBuffer>,
+    /// Set by `stop_all`: the app is exiting. Nothing may spawn a child after
+    /// it — the autostart loop and a due crash-restart would otherwise start a
+    /// plugin with nobody left to stop it.
+    shutting_down: bool,
 }
 
 pub struct PluginHost {
@@ -249,12 +368,21 @@ pub struct PluginHost {
     /// record, than to run the machine out of memory. At-least-once delivery
     /// means a dropped event is re-sent by a well-behaved plugin anyway.
     event_tx: SyncSender<(String, Value)>,
+    /// Events the queue above refused, on their way to a durable record.
+    ///
+    /// A second channel rather than doing the work in the sink: recording a shed
+    /// rewrites and fsyncs the whole dead-letter queue, and the sink runs on the
+    /// plugin's reader thread — the thread this module promises never to block,
+    /// during the flood that caused the drop. And not the event thread either,
+    /// which is by definition swamped whenever anything is being shed.
+    shed_tx: SyncSender<(String, Value)>,
     desktop_version: String,
     dev_mode: bool,
 }
 
 impl PluginHost {
-    /// Build the host and start its two background threads (events, supervisor).
+    /// Build the host and start its three background threads (events, shed,
+/// supervisor).
     pub fn new(
         registry: PluginRegistryHandle,
         ledger: LedgerHandle,
@@ -264,6 +392,9 @@ impl PluginHost {
         dev_mode: bool,
     ) -> Arc<Self> {
         let (event_tx, event_rx) = sync_channel::<(String, Value)>(1024);
+        // Smaller than the event queue: this only ever holds what that queue
+        // already refused, and each slot is a whole envelope.
+        let (shed_tx, shed_rx) = sync_channel::<(String, Value)>(256);
         let host = Arc::new(Self {
             registry,
             ledger,
@@ -275,6 +406,7 @@ impl PluginHost {
                 ring: Mutex::new(VecDeque::with_capacity(EVENT_RING_CAPACITY)),
             },
             event_tx,
+            shed_tx,
             desktop_version,
             dev_mode,
         });
@@ -286,6 +418,20 @@ impl PluginHost {
                 while let Ok((plugin_id, envelope)) = event_rx.recv() {
                     let Some(host) = host.upgrade() else { break };
                     host.process_event(&plugin_id, envelope);
+                }
+            });
+        }
+
+        // Shed thread: the durable record of a dropped event, and the log-ring
+        // notice beside it. Both take a lock and one of them fsyncs; neither may
+        // happen on the reader thread that dropped the event.
+        {
+            let host = Arc::downgrade(&host);
+            thread::spawn(move || {
+                while let Ok((plugin_id, envelope)) = shed_rx.recv() {
+                    let Some(host) = host.upgrade() else { break };
+                    host.logs_drop_notice(&plugin_id);
+                    host.record_shed(&plugin_id, envelope);
                 }
             });
         }
@@ -329,6 +475,14 @@ impl PluginHost {
                 Err(_) => return,
             };
             for id in ids {
+                // Quitting during boot is ordinary — this loop is slow by
+                // design. Without the check it kept spawning children after
+                // stop_all had already run and had nothing left to stop them
+                // with. `start` refuses too; stopping here keeps a quit from
+                // logging one failure per remaining plugin.
+                if host.is_shutting_down() {
+                    return;
+                }
                 // Sequential: two plugins loading model weights at once on a
                 // laptop is worse than one after the other, and boot is not
                 // waiting on this thread anyway.
@@ -345,6 +499,14 @@ impl PluginHost {
 
     /// Start a plugin: spawn, handshake, mark `Running`.
     pub fn start(self: &Arc<Self>, id: &str) -> Result<(), String> {
+        // Before anything that could spawn. Every caller of `start` outlives
+        // `stop_all` — the autostart loop, a due crash-restart, a POST
+        // /api/plugins/:id/start already sitting in a blocking task — and a
+        // child spawned after shutdown has nobody left to stop it: it survives
+        // the app as an orphan holding whatever hardware it opened.
+        if self.is_shutting_down() {
+            return Err(format!("{id} was not started: OAIY Desktop is shutting down"));
+        }
         // Copy what spawn needs out of the registry, then release the lock —
         // spawning and handshaking take seconds.
         let (manifest, dir) = {
@@ -422,15 +584,15 @@ impl PluginHost {
                         if let Err(e) =
                             host.event_tx.try_send((plugin_for_events.clone(), envelope))
                         {
-                            host.logs_drop_notice(&plugin_for_events);
-                            // The log ring is itself overwriting under the flood
-                            // that caused this, so the durable record is what
-                            // actually survives.
                             let (_, envelope) = match e {
                                 std::sync::mpsc::TrySendError::Full(v) => v,
                                 std::sync::mpsc::TrySendError::Disconnected(v) => v,
                             };
-                            host.record_shed(&plugin_for_events, envelope);
+                            // The log ring is itself overwriting under the flood
+                            // that caused this, so the durable record is what
+                            // actually survives — but writing it is the shed
+                            // thread's job, not this thread's. See `note_shed`.
+                            host.note_shed(&plugin_for_events, envelope);
                         }
                     }
                 }),
@@ -453,6 +615,42 @@ impl PluginHost {
                 return Err(e);
             }
         };
+        // A child exists from here on, so this is the critical section that has
+        // to settle its ownership — and it settles the shutdown race by being
+        // the FIRST one after the spawn. Either `stop_all` got here first, in
+        // which case we see the flag and kill the child ourselves, or we did, in
+        // which case it is in `starting_procs` and `stop_all` will stop it. The
+        // check at the top of `start` only saves the work; this is what shrinks
+        // the orphan window from up to HANDSHAKE_TIMEOUT (10s of dongle
+        // enumeration and model loading) to the thread-scheduling gap between
+        // `spawn` returning and this lock being taken. Not zero — if the process
+        // exits inside that gap the child is orphaned exactly as before — but
+        // small enough that the realistic case, quitting during a slow start,
+        // is covered.
+        let abandon: Option<&str> = match self.procs.lock() {
+            Ok(mut t) if !t.shutting_down => {
+                // Published BEFORE the handshake, which can take
+                // HANDSHAKE_TIMEOUT — far longer than app exit is willing to
+                // wait, and `stop_during_start` is not read until afterwards.
+                t.starting_procs.insert(id.to_string(), process.clone());
+                // And the log ring, so the output of a start that never
+                // completes — the ModuleNotFoundError, the missing DLL — is
+                // still readable once `start` has returned. That is the
+                // commonest plugin failure there is.
+                t.log_rings.insert(id.to_string(), process.logs.clone());
+                None
+            }
+            Ok(_) => Some("OAIY Desktop is shutting down"),
+            // Nothing can hold a handle to this child, so the only alternative
+            // to killing it is leaking it.
+            Err(_) => Some("the process table is unusable"),
+        };
+        if let Some(why) = abandon {
+            process.kill();
+            let reason = format!("{id} was not started: {why}");
+            self.set_state(id, PluginState::Stopped, Some(reason.clone()));
+            return Err(reason);
+        }
 
         // Handshake, with the process killed on failure — a plugin that cannot
         // answer plugin.init is not going to answer anything else, and leaving
@@ -480,11 +678,11 @@ impl PluginHost {
                 return Err(format!("{id} was stopped while it was starting"));
             }
             t.running.insert(id.to_string(), process);
+            // The clock the restart budget is refilled from. NOT refilled here:
+            // see `refill_restart_budget_if_stable`.
+            t.started_at.insert(id.to_string(), Instant::now());
         }
         drop(claim);
-        if let Ok(mut reg) = self.registry.lock() {
-            reg.reset_restarts(id);
-        }
         self.set_state(id, PluginState::Running, None);
         Ok(())
     }
@@ -504,6 +702,7 @@ impl PluginHost {
                 // kill the process instead of registering it.
                 t.stop_during_start.insert(id.to_string());
             }
+            t.started_at.remove(id);
             (t.running.remove(id), in_flight)
         };
         match process {
@@ -531,33 +730,61 @@ impl PluginHost {
 
     /// Stop everything. Called on app exit so no child outlives the host.
     pub fn stop_all(&self) {
-        let drained: Vec<(String, Arc<PluginProcess>)> = match self.procs.lock() {
-            Ok(mut t) => {
-                // No restarts may fire during shutdown, and any in-flight start
-                // must be abandoned when it completes.
-                t.restarts.clear();
-                let starting: Vec<String> = t.starting.iter().cloned().collect();
-                for id in starting {
-                    t.stop_during_start.insert(id);
+        let (drained, in_flight): (Vec<(String, Arc<PluginProcess>)>, Vec<(String, Arc<PluginProcess>)>) =
+            match self.procs.lock() {
+                Ok(mut t) => {
+                    // Nothing new may spawn, no restart may fire, and any
+                    // in-flight start must be abandoned when it completes.
+                    t.shutting_down = true;
+                    t.restarts.clear();
+                    let starting: Vec<String> = t.starting.iter().cloned().collect();
+                    for id in starting {
+                        t.stop_during_start.insert(id);
+                    }
+                    t.started_at.clear();
+                    (t.running.drain().collect(), t.starting_procs.drain().collect())
                 }
-                t.running.drain().collect()
-            }
-            Err(_) => return,
-        };
+                Err(_) => return,
+            };
         for (id, p) in drained {
             p.shutdown();
+            self.set_state(&id, PluginState::Stopped, Some("OAIY Desktop is exiting.".into()));
+        }
+        // Children that were spawned but had not finished handshaking. Their
+        // start thread will honour `stop_during_start` when the handshake
+        // returns — but that is up to HANDSHAKE_TIMEOUT away, and this process
+        // exits as soon as we return. Without stopping them here, quitting
+        // during a slow start (the boot autostart window, or Start-then-quit)
+        // left a child with no owner, still holding its dongle, until the user
+        // found it or replugged the device.
+        for (id, p) in in_flight {
+            // `kill`, not `shutdown`. A graceful shutdown waits SHUTDOWN_GRACE
+            // for the child to answer `plugin.shutdown` — but a child that is
+            // still handshaking is by definition not reading stdin yet (it is
+            // doing the slow work, enumerating a dongle or loading models, that
+            // created this window at all), so the full grace always elapses. On
+            // the exact path this covers — quit during boot autostart — that
+            // added ~5s per plugin to a Quit the user is watching. There is also
+            // nothing to be graceful ABOUT: the plugin has been handed no work,
+            // so it has no state to flush.
+            p.kill();
             self.set_state(&id, PluginState::Stopped, Some("OAIY Desktop is exiting.".into()));
         }
     }
 
     /// Recent log lines for a plugin, running or not.
+    ///
+    /// The retained ring, not the live process: see [`ProcTable::log_rings`].
+    /// `None` means this plugin has never been spawned in this session, which is
+    /// a different thing from having produced no output and is why the caller is
+    /// given the distinction.
     pub fn logs(&self, id: &str, tail: Option<usize>) -> Option<Vec<crate::services::runner::LogLine>> {
         self.procs
             .lock()
             .ok()?
-            .running
+            .log_rings
             .get(id)
-            .map(|p| p.logs.snapshot(tail))
+            .map(|logs| logs.snapshot(tail))
     }
 
     /// Forward a connector command through the capability gate to the plugin.
@@ -814,6 +1041,7 @@ impl PluginHost {
                     Ok(mut t) => match t.running.get(&id) {
                         Some(current) if Arc::ptr_eq(current, &process) => {
                             t.running.remove(&id);
+                            t.started_at.remove(&id);
                             true
                         }
                         _ => false,
@@ -856,6 +1084,9 @@ impl PluginHost {
                 }
                 continue;
             }
+
+            // Alive, and alive is what the restart budget is bought with.
+            self.refill_restart_budget_if_stable(&id);
 
             let tracker = trackers.entry(id.clone()).or_default();
             match process.health() {
@@ -940,6 +1171,65 @@ impl PluginHost {
             })
             .collect();
         Dispatched { outcomes, dead, reserved }
+    }
+
+    /// Is the app on its way out? See [`ProcTable::shutting_down`].
+    fn is_shutting_down(&self) -> bool {
+        self.procs.lock().map(|t| t.shutting_down).unwrap_or(false)
+    }
+
+    /// Refill a plugin's crash-restart budget once it has actually STAYED up.
+    ///
+    /// This used to happen the moment `plugin.init` returned, which made
+    /// [`super::runner::MAX_RESTART_ATTEMPTS`] unreachable: a plugin that
+    /// handshakes and then dies — Aokie answers `plugin.init` before it touches
+    /// the radio, so an unplugged dongle looks exactly like this — zeroed its
+    /// own counter on every cycle. `should_restart` was therefore always true,
+    /// `restart_delay` never left 1s, and the terminal "start it manually once
+    /// the cause is fixed" state was dead code. The user got a child process
+    /// every ~11 seconds indefinitely, each one grabbing and releasing the
+    /// hardware, and was never told what to fix.
+    ///
+    /// Returns whether the budget was refilled.
+    fn refill_restart_budget_if_stable(&self, id: &str) -> bool {
+        let stable = match self.procs.lock() {
+            Ok(mut t) => {
+                let stable = t
+                    .started_at
+                    .get(id)
+                    .is_some_and(|at| at.elapsed() >= STABLE_UPTIME);
+                if stable {
+                    // Once per life: the entry IS the outstanding claim, so
+                    // dropping it keeps every later tick off the registry lock.
+                    t.started_at.remove(id);
+                }
+                stable
+            }
+            Err(_) => false,
+        };
+        if stable {
+            if let Ok(mut reg) = self.registry.lock() {
+                reg.reset_restarts(id);
+            }
+        }
+        stable
+    }
+
+    /// Hand a shed event to the shed thread. Never blocks — that is the point.
+    ///
+    /// The caller is the `EventSink` closure, i.e. the plugin's reader thread,
+    /// which also routes every RPC reply (see the module docs). Recording used
+    /// to happen inline there: a full dead-letter rewrite plus an `fsync` per
+    /// dropped event, and a `procs` lock for the log notice, in front of the
+    /// `plugin.health` and `connector.request` replies the same thread still had
+    /// to deliver. A flood therefore timed out live connector calls and could
+    /// mark a perfectly alive plugin `Unhealthy` — the durable-record feature
+    /// undoing the responsiveness the channel exists to protect.
+    fn note_shed(&self, plugin_id: &str, envelope: Value) {
+        // A full shed channel means the recorder is behind as well. The event is
+        // then lost with no record, which is bad — and still the right end of
+        // the line, because the only alternative is blocking the reader thread.
+        let _ = self.shed_tx.try_send((plugin_id.to_string(), envelope));
     }
 
     /// Record an event dropped before it reached dispatch.
@@ -1045,6 +1335,9 @@ impl Drop for StartClaim<'_> {
             // before the completion check) must not linger and abandon the NEXT
             // legitimate start.
             t.stop_during_start.remove(&self.id);
+            // The in-flight handle only covers the window between spawn and
+            // registration in `running`; past that, `running` owns the process.
+            t.starting_procs.remove(&self.id);
         }
     }
 }
@@ -1464,5 +1757,207 @@ mod tests {
         let (outcomes, reserved) = host.redrive(&id).expect("loaded from disk");
         assert!(reserved, "{outcomes:?}");
         assert_eq!(host.ledger.lock().unwrap().len(), 1);
+    }
+
+    // --- loading bindings: partial is not the same as none ------------------
+
+    #[test]
+    fn one_unloadable_binding_does_not_take_the_others_with_it() {
+        // The whole-file parse turned a single bad row into ZERO bindings: every
+        // automation stopped firing, the API returned the same empty list an
+        // untriggered workspace returns, and the next upsert rewrote the file
+        // from that empty Vec — the good bindings gone for good.
+        let sb = Sandbox::new("partial");
+        let path = sb.0.join("triggers.json");
+        let first = serde_json::to_value(binding("keep-me", None)).unwrap();
+        let last = serde_json::to_value(binding("keep-me-too", None)).unwrap();
+        std::fs::write(
+            &path,
+            // The middle row is what a hand edit — or a field a newer build
+            // made required — looks like arriving here: valid JSON, not a
+            // binding.
+            serde_json::to_string(&json!([first, { "id": "half-written" }, last])).unwrap(),
+        )
+        .unwrap();
+
+        let store = TriggerStore::load(path);
+        let ids: Vec<&str> = store.list().iter().map(|b| b.id.as_str()).collect();
+        assert_eq!(ids, ["keep-me", "keep-me-too"]);
+    }
+
+    #[test]
+    fn a_bindings_file_that_will_not_load_is_kept_rather_than_overwritten() {
+        let sb = Sandbox::new("corrupt");
+        let path = sb.0.join("triggers.json");
+        // A torn write: the array never closes, so nothing is recoverable
+        // entry by entry.
+        std::fs::write(&path, r#"[{"id":"b1","event":"a","flowId":"f","mode":"async""#).unwrap();
+
+        let mut store = TriggerStore::load(path.clone());
+        assert!(store.list().is_empty(), "an unparseable file loads nothing");
+        // Starting empty is survivable. Silently overwriting the user's only
+        // copy on the next edit is not — persist() writes the whole file.
+        store.upsert(binding("new", None)).unwrap();
+        let kept = std::fs::read_to_string(sb.0.join("triggers.json.corrupt"))
+            .expect("the original must still exist somewhere");
+        assert!(kept.contains("b1"), "{kept}");
+
+        let reloaded = TriggerStore::load(path);
+        assert_eq!(reloaded.list().len(), 1);
+        assert_eq!(reloaded.list()[0].id, "new");
+    }
+
+    // --- the reader thread must never pay for a shed ------------------------
+
+    #[test]
+    fn recording_a_shed_does_not_block_the_thread_that_dropped_the_event() {
+        // The sink runs on the plugin's reader thread, which also routes every
+        // RPC reply. Recording used to be inline there: a whole-queue rewrite
+        // plus an fsync per dropped event, in front of the health and connector
+        // replies the same thread still had to deliver.
+        let (_sb, host) = host_with("shed", vec![]);
+        let held = host.dead.lock().unwrap();
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let handoff = host.clone();
+        thread::spawn(move || {
+            handoff.note_shed("aokie", envelope());
+            let _ = done_tx.send(());
+        });
+        assert!(
+            done_rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "the shed handoff waited on the dead-letter queue"
+        );
+        drop(held);
+
+        // And it is still recorded — durably, which is the point of the feature.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let q = host.dead.lock().unwrap();
+            if let Some(item) = q.list(1).first() {
+                assert_eq!(item.reason, DeadReason::Shed);
+                // Intact, or the entry cannot be redriven.
+                assert_eq!(item.envelope["data"]["from"], "+61400000000");
+                break;
+            }
+            drop(q);
+            assert!(Instant::now() < deadline, "the shed was never recorded");
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    // --- shutdown ------------------------------------------------------------
+
+    #[test]
+    fn nothing_starts_once_the_host_is_shutting_down() {
+        // stop_all runs on RunEvent::Exit — the last thing before the process
+        // goes away. A child spawned after it has nobody left to stop it and
+        // survives as an orphan holding whatever hardware it opened; the
+        // autostart loop's next iteration is exactly that case.
+        let (_sb, host) = host_with("shutdown", vec![]);
+        host.stop_all();
+        let err = host.start("aokie").unwrap_err();
+        assert!(err.contains("shutting down"), "{err}");
+    }
+
+    // --- the restart bound ---------------------------------------------------
+
+    use crate::plugins::registry::PluginRecord;
+
+    /// A registry record for `id` with `attempts` crash-restarts already spent.
+    ///
+    /// Inserted directly rather than scanned off disk: the bound is arithmetic
+    /// over one field, and a manifest would only add a spawn that cannot
+    /// succeed anyway.
+    fn record_with_restarts(host: &PluginHost, id: &str, attempts: u32) {
+        host.registry.lock().unwrap().insert(PluginRecord {
+            id: id.into(),
+            state: PluginState::Running,
+            reason: None,
+            dir: PathBuf::from("."),
+            manifest: None,
+            legacy_capabilities: Vec::new(),
+            unknown_capabilities: Vec::new(),
+            user_disabled: false,
+            restart_attempts: attempts,
+        });
+    }
+
+    #[test]
+    fn the_restart_budget_is_refilled_only_once_a_plugin_has_stayed_up() {
+        // Refilling at handshake time made MAX_RESTART_ATTEMPTS unreachable: a
+        // plugin that answers plugin.init and then dies — Aokie answers before
+        // it touches the radio, so an unplugged dongle looks exactly like this —
+        // zeroed its own counter every cycle, so should_restart was always true,
+        // the backoff never left 1s, and the terminal "start it manually" state
+        // was dead code. One child process every ~11 seconds, forever.
+        let (_sb, host) = host_with("stable", vec![]);
+        record_with_restarts(&host, "aokie", 3);
+        let attempts = |host: &Arc<PluginHost>| {
+            host.registry.lock().unwrap().get("aokie").unwrap().restart_attempts
+        };
+
+        host.procs
+            .lock()
+            .unwrap()
+            .started_at
+            .insert("aokie".into(), Instant::now());
+        assert!(!host.refill_restart_budget_if_stable("aokie"));
+        assert_eq!(attempts(&host), 3, "coming up is not staying up");
+
+        // A machine that booted seconds ago has no Instant this far back.
+        let Some(long_ago) = Instant::now().checked_sub(STABLE_UPTIME + Duration::from_secs(1))
+        else {
+            return;
+        };
+        host.procs
+            .lock()
+            .unwrap()
+            .started_at
+            .insert("aokie".into(), long_ago);
+        assert!(host.refill_restart_budget_if_stable("aokie"));
+        assert_eq!(attempts(&host), 0, "it stayed up, so it earns a fresh budget");
+        // Once per life, or every later tick takes the registry lock for nothing.
+        assert!(!host.refill_restart_budget_if_stable("aokie"));
+    }
+
+    // --- logs outlive the process --------------------------------------------
+
+    #[test]
+    fn a_crashed_plugins_logs_are_still_readable() {
+        // The state one supervisor tick after a crash: the process is out of
+        // `running` and its stderr is the only evidence of why it died. Reading
+        // `running` meant the Logs button — which the panel offers in every
+        // state — said "No output yet." precisely when there was output.
+        let (_sb, host) = host_with("logs", vec![]);
+        let ring = LogBuffer::new();
+        ring.push("stderr", "no dongle at COM3".into());
+        host.procs
+            .lock()
+            .unwrap()
+            .log_rings
+            .insert("aokie".into(), ring);
+
+        let lines = host.logs("aokie", None).expect("a crashed plugin still has logs");
+        assert!(lines.iter().any(|l| l.text.contains("no dongle")), "{lines:?}");
+
+        // The load-bearing half: NOTHING may drop the ring on the way out. A
+        // future `log_rings.remove(id)` in stop() or the supervisor's exit path
+        // would restore the exact bug — the Logs button saying "No output yet."
+        // at the one moment there is output worth reading — while the assertion
+        // above still passed.
+        let _ = host.stop("aokie");
+        assert!(
+            host.logs("aokie", None).is_some_and(|l| l.iter().any(|x| x.text.contains("no dongle"))),
+            "stop() must not discard the retained ring"
+        );
+        host.stop_all();
+        assert!(
+            host.logs("aokie", None).is_some_and(|l| l.iter().any(|x| x.text.contains("no dongle"))),
+            "shutdown must not discard the retained ring either"
+        );
+
+        // A plugin that never ran has nothing, which is a different answer.
+        assert!(host.logs("never-spawned", None).is_none());
     }
 }

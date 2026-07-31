@@ -10,6 +10,7 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use super::runner::{LogLine, Runner, SpawnConfig};
 use super::template::{substitute, InstallSpec, NodeSpec, ServiceTemplate, UninstallSpec};
@@ -267,6 +268,25 @@ pub struct EnsureByPortResult {
     pub error: Option<String>,
 }
 
+/// A `templates/*.json` that is on disk but could not be loaded.
+///
+/// Carried on the wire because a skipped template is otherwise completely
+/// invisible: its card is simply absent from the Services panel (not errored,
+/// not stopped), and the `log::warn!` at the skip site reaches only
+/// `<dataDir>/logs/oaiy-desktop.log` — which nobody thinks to open while
+/// wondering where their card went. The surface is one the app tells users to edit,
+/// and `seed_builtin_script` deliberately never re-seeds over a hand-edited
+/// file, so a stray comma is permanent and unexplained.
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct TemplateLoadError {
+    /// File name only — it lives in `<dataDir>/templates`, which the snapshot
+    /// already reports.
+    pub file: String,
+    /// The deserialize error verbatim; it carries the line/column of the typo.
+    pub error: String,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RegistrySnapshot {
@@ -276,6 +296,9 @@ pub struct RegistrySnapshot {
     /// Without the rename this came across as `data_dir` and the
     /// "configs live under …" line + open-folder button got `undefined`.
     pub data_dir: String,
+    /// Templates present but unloadable, newest scan wins. Empty in the normal
+    /// case. Serialized as `templateErrors`.
+    pub template_errors: Vec<TemplateLoadError>,
 }
 
 /// Combine the primary models dir with extra roots into an ordered, deduped
@@ -415,6 +438,10 @@ pub struct Registry {
     /// service's own default (e.g. krea2 keeps DIT on GPU 0 + encoder on GPU 1). Set live
     /// from the GPU picker; takes effect on the next start.
     service_gpus: HashMap<String, u32>,
+    /// Templates that failed to load on the last scan, for the snapshot.
+    /// Rebuilt wholesale by `reload_new_templates` (which runs on every
+    /// /api/services poll), so fixing the file clears the report by itself.
+    template_errors: Vec<TemplateLoadError>,
 }
 
 /// Seed a built-in plumbing script, refreshing it when we ship a new
@@ -604,6 +631,7 @@ impl Registry {
         seed_builtin_template_files(&data_dir.join("scripts"));
 
         let mut services = HashMap::new();
+        let mut template_errors: Vec<TemplateLoadError> = Vec::new();
         for entry in std::fs::read_dir(data_dir.join("templates"))? {
             let entry = entry?;
             let path = entry.path();
@@ -623,6 +651,10 @@ impl Registry {
                 }
                 Err(e) => {
                     log::warn!("skipping bad template {}: {}", path.display(), e);
+                    template_errors.push(TemplateLoadError {
+                        file: file_label(&path),
+                        error: e.to_string(),
+                    });
                 }
             }
         }
@@ -641,6 +673,7 @@ impl Registry {
             llama_model: None,
             ollama_model: None,
             service_gpus: HashMap::new(),
+            template_errors,
         })
     }
 
@@ -657,6 +690,7 @@ impl Registry {
             llama_model: None,
             ollama_model: None,
             service_gpus: HashMap::new(),
+            template_errors: Vec::new(),
         }
     }
 
@@ -1170,6 +1204,7 @@ impl Registry {
         RegistrySnapshot {
             services,
             data_dir: self.data_dir.display().to_string(),
+            template_errors: self.template_errors.clone(),
         }
     }
 
@@ -1388,11 +1423,12 @@ impl Registry {
             // process now holds it. check_exited() reaps and reports: None means
             // still running (safe to kill), Some(code) means already gone.
             match old.check_exited() {
-                None => kill_process_tree(old.pid),
+                // Bounded: we're about to bind the same port, so it's worth
+                // waiting for the old server to actually go — but never
+                // forever (see kill_tree_and_reap).
+                None => kill_tree_and_reap(&old, RESPAWN_REAP_GRACE),
                 Some(_code) => { /* already exited — pid may be recycled, do not touch it */ }
             }
-            // Idempotent, and reaps the child if check_exited() didn't.
-            let _ = old.stop();
         }
         svc.set_status(ServiceStatus::Starting, None);
 
@@ -1423,10 +1459,9 @@ impl Registry {
         if let Some(runner) = svc.runner.take() {
             // The runner may have spawned children (a shell wrapper, python
             // subprocesses); a plain kill of the direct child would orphan
-            // them, so kill the whole process tree first, then stop() to reap
-            // the direct child and clear the slot.
-            kill_process_tree(runner.pid);
-            let _ = runner.stop();
+            // them, so kill the whole process tree first, then reap the direct
+            // child and clear the slot.
+            kill_tree_and_reap(&runner, REAP_GRACE);
         }
         // Stop during an in-flight install: the live process tree is owned by
         // svc.installer (the script + its pip/curl/git children), NOT runner — so
@@ -1437,8 +1472,7 @@ impl Registry {
         // install, the exact collision start()/install_streaming() guard against.
         if svc.status == ServiceStatus::Installing {
             if let Some(installer) = &svc.installer {
-                kill_process_tree(installer.pid);
-                let _ = installer.stop();
+                kill_tree_and_reap(installer, REAP_GRACE);
             }
         }
         svc.set_status(ServiceStatus::Stopped, None);
@@ -1771,8 +1805,9 @@ impl Registry {
         if let Some(svc) = self.services.get_mut(id) {
             if svc.runner.as_ref().is_some_and(|r| r.is_alive()) {
                 if let Some(old) = svc.runner.take() {
-                    kill_process_tree(old.pid);
-                    let _ = old.stop();
+                    // The installer is about to overwrite the binary/venv this
+                    // process has open, so wait for it — bounded, as in start().
+                    kill_tree_and_reap(&old, RESPAWN_REAP_GRACE);
                 }
             }
         }
@@ -1859,8 +1894,7 @@ impl Registry {
             return Err("no install is in progress for this service".into());
         }
         if let Some(installer) = &svc.installer {
-            kill_process_tree(installer.pid);
-            let _ = installer.stop();
+            kill_tree_and_reap(installer, REAP_GRACE);
         }
         svc.set_status(ServiceStatus::Stopped, Some("install cancelled".into()));
         Ok(())
@@ -1878,8 +1912,7 @@ impl Registry {
             // build running unmanaged.
             if let Some(svc) = self.services.get_mut(&id) {
                 if let Some(installer) = svc.installer.take() {
-                    kill_process_tree(installer.pid);
-                    let _ = installer.stop();
+                    kill_tree_and_reap(&installer, REAP_GRACE);
                 }
             }
         }
@@ -2004,6 +2037,9 @@ impl Registry {
         };
         let scripts_dir = self.data_dir.join("scripts");
         let mut added = 0usize;
+        // Rebuilt from scratch on every scan (i.e. every /api/services poll) so a
+        // fixed file stops being reported without anything having to invalidate.
+        let mut errors: Vec<TemplateLoadError> = Vec::new();
         for entry in rd.flatten() {
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) != Some("json") {
@@ -2016,6 +2052,10 @@ impl Registry {
                 Ok(t) => t,
                 Err(e) => {
                     log::warn!("skipping bad template {}: {}", path.display(), e);
+                    errors.push(TemplateLoadError {
+                        file: file_label(&path),
+                        error: e.to_string(),
+                    });
                     continue;
                 }
             };
@@ -2031,6 +2071,7 @@ impl Registry {
             self.services.insert(id, ServiceRuntime::new(t));
             added += 1;
         }
+        self.template_errors = errors;
         added
     }
 
@@ -2090,6 +2131,98 @@ pub(crate) fn kill_process_tree(pid: u32) {
     }
 }
 
+/// How long a kill+reap may block its CALLER — and therefore the registry
+/// mutex — before the rest of the wait is handed off. 250ms is far more than a
+/// terminated process normally needs and is imperceptible in the UI.
+const REAP_GRACE: Duration = Duration::from_millis(250);
+
+/// The same bound for the sites that immediately respawn onto the SAME port
+/// (`start`, `install_streaming`): here the wait is load-bearing — spawn before
+/// the old server has released its listener and the new one dies on bind — so
+/// trade a longer bounded stall for the process actually being gone. Past this
+/// the respawn may lose the bind race, which is self-healing (the crash backoff
+/// retries); a permanently parked lock is not.
+const RESPAWN_REAP_GRACE: Duration = Duration::from_secs(5);
+
+/// Poll `exited` every 10ms until it reports the child gone or `grace` elapses;
+/// returns whether it exited in time. Split out of [`kill_tree_and_reap`] so the
+/// deadline is testable without an unkillable process.
+fn wait_exited_bounded(grace: Duration, mut exited: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + grace;
+    loop {
+        if exited() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Kill a runner's process tree and reap the direct child, blocking the caller
+/// for at most `grace`.
+///
+/// Every caller holds the one global registry Mutex — the axum Stop, Install,
+/// cancel-install and ensure-by-port handlers, the 2s reaper tick, and
+/// `stop_all` on app exit — the same Mutex
+/// that the 2s `/api/services`, `/api/python` and `/api/ai/sources` polls also
+/// need. `Runner::stop` ends in a bare `child.wait()` — i.e.
+/// `WaitForSingleObject(INFINITE)` on Windows — and the direct child here is
+/// typically a multi-GB CUDA server (lance / ltx2 / krea2 run the venv
+/// `python.exe` itself), exactly the kind of process that can sit unkillable in
+/// a driver call. One of those held the lock for the whole teardown, and each
+/// queued poll then parked its own tokio worker on the mutex until the entire
+/// loopback API — `/api/health` included, though it needs no lock — had no
+/// thread left to answer on. Bound the wait instead; the same reasoning the
+/// Unix branch of `kill_process_tree` above already spells out.
+fn kill_tree_and_reap(runner: &Arc<Runner>, grace: Duration) {
+    kill_process_tree(runner.pid);
+    // check_exited() is a non-blocking try_wait that also reaps, so the normal
+    // case — the child is gone a few ms after the kill — never reaches the
+    // handoff below and costs one poll.
+    if wait_exited_bounded(grace, || runner.check_exited().is_some()) {
+        return;
+    }
+    // Still there. Move the `Child` OUT of the runner rather than handing the
+    // Arc to a thread and calling `Runner::stop`: stop() holds the child mutex
+    // across its untimed wait(), so a stubborn process would park every later
+    // check_exited() / is_alive() on that mutex too — including stop_all()'s
+    // second pass over an installer it has already killed once.
+    let child = runner.child.lock().ok().and_then(|mut g| g.take());
+    if let Some(mut child) = child {
+        // `Builder::spawn` rather than `thread::spawn`, whose Err is a PANIC.
+        // This runs with the global registry Mutex held by an axum handler, and
+        // a panic there POISONS it — after which every `registry.lock()` in
+        // http.rs returns Err and all service routes fail for the rest of the
+        // process. The slow path exists precisely for a machine under memory
+        // pressure, which is also when the OS is most likely to refuse a
+        // thread, so the two coincide. Failing to spawn leaks one Child; that
+        // is enormously better than bricking the registry.
+        let spawned = std::thread::Builder::new()
+            .name("oaiy-reap".into())
+            .spawn(move || {
+                let _ = child.kill();
+                // Reap so we don't leak a zombie. This is the call that may
+                // never return, which is why it isn't on the caller's thread.
+                let _ = child.wait();
+            });
+        if let Err(e) = spawned {
+            log::warn!("could not spawn a reaper thread for pid {}: {e}", runner.pid);
+        }
+    }
+}
+
+/// File name for a template-load report — the full path is redundant (the
+/// snapshot already carries `dataDir`) and long enough to wrap the banner.
+/// Falls back to the whole path if it somehow has no file name.
+fn file_label(path: &Path) -> String {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
 fn valid_service_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 64
@@ -2124,6 +2257,7 @@ pub type RegistryHandle = Arc<Mutex<Registry>>;
 #[cfg(test)]
 mod tests {
     use super::venv_name_in;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn extracts_venv_name_from_run_command() {
@@ -2323,6 +2457,149 @@ mod tests {
             !data.join("venvs/svc/.oaiy-installed").exists(),
             "one-time backfill must not resurrect a post-migration partial install"
         );
+
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    fn reap_wait_gives_up_at_its_deadline() {
+        // The child that never dies — a model server wedged in a GPU driver call.
+        // The old code went straight into child.wait() here (i.e.
+        // WaitForSingleObject(INFINITE)) while holding the registry mutex, and the
+        // whole loopback API went with it. The poll must return at the deadline.
+        let mut polls = 0u32;
+        let started = Instant::now();
+        let exited = super::wait_exited_bounded(Duration::from_millis(120), || {
+            polls += 1;
+            false
+        });
+        let elapsed = started.elapsed();
+        assert!(!exited, "a child that never exits must not report exited");
+        assert!(polls > 1, "should keep polling until the deadline, got {polls}");
+        assert!(
+            elapsed >= Duration::from_millis(100) && elapsed < Duration::from_secs(2),
+            "must return at ~the grace, took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn reap_wait_returns_as_soon_as_the_child_is_gone() {
+        // The normal case must not pay the grace: a RESPAWN_REAP_GRACE that was
+        // always waited out would add 5s to every start/restart.
+        let mut left = 2u32;
+        let started = Instant::now();
+        let exited = super::wait_exited_bounded(super::RESPAWN_REAP_GRACE, || {
+            if left == 0 {
+                return true;
+            }
+            left -= 1;
+            false
+        });
+        assert!(exited);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "must return on the exit, not at the deadline"
+        );
+    }
+
+    #[test]
+    fn kill_tree_and_reap_clears_the_child_slot_without_blocking() {
+        // A real child, long enough to outlive the call. Whichever path wins —
+        // reaped inside the grace, or handed to the detached thread — the slot
+        // must end up empty, so no later check_exited()/is_alive() can park on
+        // the child mutex and no zombie is left behind.
+        let (command, args) = if cfg!(windows) {
+            (
+                super::system32_exe("cmd.exe"),
+                vec![
+                    "/C".to_string(),
+                    "ping".to_string(),
+                    "-n".to_string(),
+                    "10".to_string(),
+                    "127.0.0.1".to_string(),
+                ],
+            )
+        } else {
+            (
+                "sh".to_string(),
+                vec!["-c".to_string(), "sleep 10".to_string()],
+            )
+        };
+        let env = std::collections::HashMap::new();
+        let runner = std::sync::Arc::new(
+            super::Runner::spawn(super::SpawnConfig {
+                command: &command,
+                args: &args,
+                env: &env,
+                cwd: None,
+            })
+            .expect("spawn a sleeper"),
+        );
+
+        let started = Instant::now();
+        super::kill_tree_and_reap(&runner, super::REAP_GRACE);
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "kill+reap must not block its caller (and the registry lock), took {elapsed:?}"
+        );
+        assert!(
+            !runner.is_alive(),
+            "the child slot must be empty on return, either reaped or handed off"
+        );
+    }
+
+    #[test]
+    fn an_unloadable_template_is_reported_in_the_snapshot() {
+        let data = std::env::temp_dir().join(format!("oaiy-badtpl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&data);
+        std::fs::create_dir_all(data.join("templates")).unwrap();
+
+        std::fs::write(
+            data.join("templates/ok.json"),
+            r#"{
+                "id": "ok", "name": "Ok", "description": "", "category": "test",
+                "defaultPort": 9998,
+                "run": { "command": "ok.exe", "args": [] }
+            }"#,
+        )
+        .unwrap();
+        // The hand-edit that used to make a service card vanish with no message
+        // anywhere: one trailing comma.
+        std::fs::write(
+            data.join("templates/lance.json"),
+            r#"{ "id": "lance", "name": "Lance", }"#,
+        )
+        .unwrap();
+
+        let mut reg = super::Registry::empty(data.clone(), data.join("models"));
+        assert_eq!(reg.reload_new_templates(), 1, "only the good one loads");
+        let snap = reg.snapshot();
+        assert_eq!(snap.services.len(), 1);
+        assert_eq!(snap.template_errors.len(), 1);
+        assert_eq!(snap.template_errors[0].file, "lance.json");
+        assert!(
+            !snap.template_errors[0].error.is_empty(),
+            "the parse error must come along — it carries the line/column"
+        );
+        // camelCase on the wire like every other snapshot field (the `data_dir`
+        // regression left the panel rendering `undefined`).
+        let json = serde_json::to_value(&snap).unwrap();
+        assert!(json.get("templateErrors").is_some(), "got {json}");
+
+        // Fixing the file clears the report on the next poll — nothing has to
+        // invalidate anything.
+        std::fs::write(
+            data.join("templates/lance.json"),
+            r#"{
+                "id": "lance", "name": "Lance", "description": "", "category": "test",
+                "defaultPort": 9997,
+                "run": { "command": "lance.exe", "args": [] }
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(reg.reload_new_templates(), 1);
+        assert!(reg.snapshot().template_errors.is_empty());
 
         let _ = std::fs::remove_dir_all(&data);
     }

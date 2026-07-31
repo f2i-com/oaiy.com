@@ -21,10 +21,14 @@
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 
+// One definition of "this archive member escapes the package", shared with the
+// Node runtime's extractor. Two copies drifted once already — this one grew a
+// ParentDir-only check that the Node one had never accepted as sufficient.
+use super::node_runtime::safe_member;
 use super::runner::{LogBuffer, LogLine};
 
 #[derive(Debug, Clone, Serialize)]
@@ -417,7 +421,12 @@ impl Python {
 /// bootstrap pip. Pure Rust — no `tar.exe` / PowerShell. Streams progress
 /// into `logs`. Blocking; call from a background thread.
 fn install_python_native(dest: &Path, logs: &LogBuffer) -> Result<(), String> {
-    std::fs::create_dir_all(dest).map_err(|e| format!("mkdir {}: {e}", dest.display()))?;
+    // `dest` itself is created by the rename in install_from_tarball, not here
+    // — see the staging comment there. Only its parent has to exist.
+    let parent = dest
+        .parent()
+        .ok_or_else(|| format!("{} has no parent directory", dest.display()))?;
+    std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
 
     // Pinned PBS release (bump when a newer one is stable). The
     // `install_only` flavour skips the cpython source/headers we don't need.
@@ -484,52 +493,9 @@ fn install_python_native(dest: &Path, logs: &LogBuffer) -> Result<(), String> {
     }
 
     logs.push("stdout", "extracting...".into());
-    // PBS install_only tarballs unpack as a single top-level `python/` dir;
-    // strip it so the interpreter lands at <dest>/python.exe (Windows) or
-    // <dest>/bin/python3 (Unix).
-    let tar_gz = std::fs::File::open(&tmp).map_err(|e| format!("open temp: {e}"))?;
-    let gz = flate2::read::GzDecoder::new(BufReader::new(tar_gz));
-    let mut archive = tar::Archive::new(gz);
-    archive.set_preserve_permissions(true);
-    let entries = archive.entries().map_err(|e| format!("read archive: {e}"))?;
-    for entry in entries {
-        let mut entry = entry.map_err(|e| format!("archive entry: {e}"))?;
-        let path = entry
-            .path()
-            .map_err(|e| format!("entry path: {e}"))?
-            .into_owned();
-        let stripped: PathBuf = path.components().skip(1).collect();
-        if stripped.as_os_str().is_empty() {
-            continue;
-        }
-        // Defend against path traversal in a garbled/malicious archive.
-        if stripped
-            .components()
-            .any(|c| matches!(c, std::path::Component::ParentDir))
-        {
-            continue;
-        }
-        let out = dest.join(&stripped);
-        if let Some(parent) = out.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        entry
-            .unpack(&out)
-            .map_err(|e| format!("unpack {}: {e}", stripped.display()))?;
-    }
+    let staged = install_from_tarball(&tmp, dest);
     let _ = std::fs::remove_file(&tmp);
-
-    let python = if cfg!(windows) {
-        dest.join("python.exe")
-    } else {
-        dest.join("bin").join("python3")
-    };
-    if !python.exists() {
-        return Err(format!(
-            "expected {} after extraction but it's missing — PBS layout may have changed",
-            python.display()
-        ));
-    }
+    let python = staged?;
 
     logs.push("stdout", "bootstrapping pip (ensurepip)...".into());
     let code = run_logged(
@@ -548,6 +514,206 @@ fn install_python_native(dest: &Path, logs: &LogBuffer) -> Result<(), String> {
     }
     logs.push("stdout", format!("done. python is at {}", python.display()));
     Ok(())
+}
+
+/// The bundled interpreter inside an extracted PBS tree.
+fn interpreter_in(root: &Path) -> PathBuf {
+    if cfg!(windows) {
+        root.join("python.exe")
+    } else {
+        root.join("bin").join("python3")
+    }
+}
+
+/// Unpack `tarball` into a staging dir and promote it to `dest` with a single
+/// rename, only once the interpreter is actually there. Returns its path.
+///
+/// Unpacking straight into the live runtime dir meant any mid-extract failure
+/// (disk full, an antivirus lock on a freshly written .exe/.pyd, the app
+/// quitting — the install thread is detached and nothing revalidates the tree
+/// at startup) left a directory that already held python.exe but not its
+/// stdlib. `interpreter_path()` is a bare exists() probe, so that reads as
+/// "installed": the Install button disappears, POST /api/python/install answers
+/// 400 "already installed" forever, and every venv create then fails on an
+/// interpreter that cannot import its own stdlib. There is no uninstall route,
+/// so the only way out was deleting %APPDATA%\...\python by hand. Stage and
+/// swap, the same way plugins/install.rs does.
+fn install_from_tarball(tarball: &Path, dest: &Path) -> Result<PathBuf, String> {
+    let staging = dest.with_extension(format!("incoming-{}", std::process::id()));
+    let staged = extract_pbs_tarball(tarball, &staging).and_then(|()| {
+        // This check used to run after the tree was already in `dest`, where it
+        // could report the damage but never prevent it.
+        if interpreter_in(&staging).exists() {
+            Ok(())
+        } else {
+            Err(format!(
+                "expected {} after extraction but it's missing — PBS layout may have changed",
+                interpreter_in(dest).display()
+            ))
+        }
+    });
+    if let Err(e) = staged {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(e);
+    }
+    // `dest` can still be a stump left by an install that failed before this
+    // staging existed. install_runtime() has already established there is no
+    // interpreter under it, so replacing it is the recovery path out of that
+    // state, not data loss — and rename() on Windows refuses to overwrite a
+    // directory, so it has to go either way.
+    if dest.exists() {
+        std::fs::remove_dir_all(dest).map_err(|e| format!("clear {}: {e}", dest.display()))?;
+    }
+    std::fs::rename(&staging, dest).map_err(|e| {
+        let _ = std::fs::remove_dir_all(&staging);
+        format!("move {} into place: {e}", staging.display())
+    })?;
+    Ok(interpreter_in(dest))
+}
+
+/// Unpack the PBS tarball into `staging`, which is emptied first. PBS
+/// install_only tarballs unpack as a single top-level `python/` dir; strip it
+/// so the interpreter lands at `<staging>/python.exe` (Windows) or
+/// `<staging>/bin/python3` (Unix).
+fn extract_pbs_tarball(tarball: &Path, staging: &Path) -> Result<(), String> {
+    // An install killed at the wrong moment can leave a staging dir behind
+    // under a since-recycled pid; start from empty either way.
+    let _ = std::fs::remove_dir_all(staging);
+    std::fs::create_dir_all(staging).map_err(|e| format!("mkdir {}: {e}", staging.display()))?;
+
+    let tar_gz = std::fs::File::open(tarball).map_err(|e| format!("open temp: {e}"))?;
+    let gz = flate2::read::GzDecoder::new(BufReader::new(tar_gz));
+    let mut archive = tar::Archive::new(gz);
+    archive.set_preserve_permissions(true);
+    let entries = archive.entries().map_err(|e| format!("read archive: {e}"))?;
+    for entry in entries {
+        let mut entry = entry.map_err(|e| format!("archive entry: {e}"))?;
+        let path = entry
+            .path()
+            .map_err(|e| format!("entry path: {e}"))?
+            .into_owned();
+        let Some(rel) = member_rel_path(&path)? else {
+            continue;
+        };
+        let kind = entry.header().entry_type();
+        if kind.is_symlink() || kind.is_hard_link() {
+            let target = entry
+                .link_name()
+                .map_err(|e| format!("entry link name: {e}"))?
+                .ok_or_else(|| format!("link entry {} has no target", path.display()))?;
+            // `Entry::unpack` is the only API that lets us strip the archive's
+            // top-level dir, and unlike `Entry::unpack_in` it does not contain
+            // links at all. A `python/lib -> ../../..` symlink passes the
+            // per-member check above — its own path is fine — and every member
+            // unpacked underneath it afterwards is written THROUGH the link,
+            // outside the tree. Hard links are worse: with no target base, tar
+            // resolves the target against the process CWD, so a PBS hard link
+            // would already be broken today; refuse it rather than link to
+            // whatever that relative path happens to hit.
+            if kind.is_hard_link() {
+                return Err(format!(
+                    "archive entry {} is a hard link, which the PBS layout does not use",
+                    path.display()
+                ));
+            }
+            if !link_stays_inside(&rel, &target) {
+                return Err(format!(
+                    "archive entry {} links outside the package",
+                    path.display()
+                ));
+            }
+        }
+        let out = staging.join(&rel);
+        if let Some(parent) = out.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        // Containment checked against the RESOLVED parent, not the member's
+        // spelling. The lexical check above cannot see through a symlink this
+        // same archive created a moment ago: `a/x -> ..` then `a/x/y -> ../..`
+        // both pass depth arithmetic, yet on disk the second lands two levels
+        // ABOVE the staging root, and every later member written under it
+        // escapes with no `..` anywhere for a path check to notice. This is the
+        // containment `Entry::unpack_in` performs and `Entry::unpack` — the only
+        // API that lets us strip the top-level dir — does not.
+        if !resolves_inside(staging, &out) {
+            return Err(format!(
+                "archive entry {} resolves outside the package once earlier entries are applied",
+                rel.display()
+            ));
+        }
+        entry
+            .unpack(&out)
+            .map_err(|e| format!("unpack {}: {e}", rel.display()))?;
+    }
+    Ok(())
+}
+
+/// Where an archive member belongs relative to the extraction root, with the
+/// archive's top-level dir stripped. `Ok(None)` is that top-level entry itself;
+/// `Err` is a member that escapes.
+///
+/// The order is the whole point. This used to strip first and then check the
+/// RESULT for `..`, which is blind to a Windows drive or UNC prefix: `skip(1)`
+/// eats the `C:` of `C:/Windows/System32/evil.dll` but leaves the RootDir
+/// behind it, and joining a rooted-but-prefixless path onto the destination
+/// resolves straight back to `C:\Windows\System32\evil.dll` — with no `..`
+/// anywhere for the old check to see. (`...\Start Menu\Programs\Startup\
+/// evil.exe` is the same trick without needing elevation.) Validating the
+/// ORIGINAL path, every component Normal, is what `safe_member` already did for
+/// the Node archive next door.
+fn member_rel_path(member: &Path) -> Result<Option<PathBuf>, String> {
+    if !safe_member(member) {
+        return Err(format!(
+            "archive entry {} escapes the package",
+            member.display()
+        ));
+    }
+    let stripped: PathBuf = member.components().skip(1).collect();
+    Ok((!stripped.as_os_str().is_empty()).then_some(stripped))
+}
+
+/// A cheap LEXICAL reject for a link whose target obviously points out of the
+/// package: `member` is the link's own path relative to the extraction root,
+/// `target` the raw link name the OS resolves against the link's directory.
+///
+/// Deliberately not the whole story, and must not be read as containment: the
+/// arithmetic counts path components and so cannot see through a symlink that
+/// an earlier member of the same archive already created. [`resolves_inside`],
+/// applied to every member just before it is written, is what actually bounds
+/// the extraction; this only rejects the blatant cases sooner and with a
+/// clearer message.
+/// Is `out` genuinely inside `root` once the filesystem has resolved every
+/// symlink on the way there?
+///
+/// `canonicalize` on the PARENT, because `out` itself does not exist yet. A
+/// parent that cannot be canonicalized is treated as outside: refusing to write
+/// somewhere we could not verify is the safe direction, and on the honest path
+/// the parent was just created by `create_dir_all` and always resolves.
+fn resolves_inside(root: &Path, out: &Path) -> bool {
+    let Some(parent) = out.parent() else { return false };
+    match (root.canonicalize(), parent.canonicalize()) {
+        (Ok(root), Ok(parent)) => parent.starts_with(root),
+        _ => false,
+    }
+}
+
+fn link_stays_inside(member: &Path, target: &Path) -> bool {
+    let mut depth = member.parent().map_or(0, |p| p.components().count());
+    for c in target.components() {
+        match c {
+            Component::Normal(_) => depth += 1,
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if depth == 0 {
+                    return false;
+                }
+                depth -= 1;
+            }
+            // A rooted or drive-qualified target is outside by construction.
+            _ => return false,
+        }
+    }
+    true
 }
 
 /// Run a subprocess, streaming its stdout/stderr into `logs` line by line.
@@ -648,5 +814,134 @@ mod tests {
         assert!(valid_venv_name("comfyui"));
         assert!(valid_venv_name("torch-cuda121"));
         assert!(valid_venv_name("Default_2"));
+    }
+
+    #[test]
+    fn archive_members_are_stripped_and_contained() {
+        assert_eq!(
+            member_rel_path(Path::new("python/bin/python3")).unwrap(),
+            Some(PathBuf::from("bin").join("python3"))
+        );
+        // The archive's own top-level dir strips to nothing and is skipped.
+        assert_eq!(member_rel_path(Path::new("python")).unwrap(), None);
+        assert!(member_rel_path(Path::new("python/../../evil")).is_err());
+        assert!(member_rel_path(Path::new("/etc/cron.d/evil")).is_err());
+    }
+
+    /// The escape the ParentDir-only check could not see, because it ran on the
+    /// already-stripped path: `skip(1)` drops a drive/UNC prefix but keeps the
+    /// RootDir behind it, so the join lands back at the filesystem root with no
+    /// `..` involved anywhere.
+    #[cfg(windows)]
+    #[test]
+    fn windows_rooted_members_cannot_escape_the_extraction_dir() {
+        let dest = Path::new(r"C:\Users\u\AppData\Roaming\oaiy\python");
+        for member in [
+            r"C:/Windows/System32/evil.dll",
+            r"C:/Users/u/AppData/Roaming/Microsoft/Windows/Start Menu/Programs/Startup/evil.exe",
+            r"//server/share/evil.dll",
+            r"\\?\C:\Windows\evil.dll",
+        ] {
+            let m = Path::new(member);
+            let old: PathBuf = m.components().skip(1).collect();
+            assert!(
+                !dest.join(&old).starts_with(dest),
+                "{member} has to be a real escape or this test proves nothing"
+            );
+            assert!(member_rel_path(m).is_err(), "{member} must be rejected");
+        }
+    }
+
+    #[test]
+    fn link_members_cannot_point_out_of_the_tree() {
+        assert!(link_stays_inside(
+            Path::new("bin/python3"),
+            Path::new("python3.12")
+        ));
+        // Relative and deep enough to stay inside is fine — PBS does ship these.
+        assert!(link_stays_inside(
+            Path::new("share/man/man1/python.1"),
+            Path::new("../../../man/python.1")
+        ));
+        assert!(!link_stays_inside(
+            Path::new("lib/pkgconfig"),
+            Path::new("../../etc")
+        ));
+        assert!(!link_stays_inside(
+            Path::new("bin/python3"),
+            Path::new("/usr/bin/python3")
+        ));
+    }
+
+    /// A PBS-shaped `.tar.gz`: one top-level `python/` dir with the interpreter
+    /// first, then a large member. Stored rather than deflated so truncating
+    /// the stream reliably cuts inside that second member — i.e. the
+    /// interpreter is on disk when the unpack dies.
+    fn pbs_shaped_tarball() -> Vec<u8> {
+        let mut b = tar::Builder::new(flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::none(),
+        ));
+        let interp = Path::new("python").join(interpreter_in(Path::new("")));
+        for (path, len) in [
+            (interp.as_path(), 4096u64),
+            (Path::new("python/Lib/os.py"), 512 * 1024),
+        ] {
+            let mut h = tar::Header::new_gnu();
+            h.set_entry_type(tar::EntryType::Regular);
+            h.set_mode(0o755);
+            h.set_size(len);
+            b.append_data(&mut h, path, std::io::repeat(0xa5).take(len))
+                .unwrap();
+        }
+        b.into_inner().unwrap().finish().unwrap()
+    }
+
+    #[test]
+    fn a_failed_extraction_leaves_no_half_installed_runtime() {
+        // The state this prevents: python.exe on disk without its stdlib.
+        // interpreter_path() is a bare exists() probe, so that reads as
+        // "installed" — Install button gone, POST /api/python/install 400s
+        // forever, every venv create fails on an interpreter that cannot import
+        // its own stdlib, and no uninstall route to get out of it.
+        let base =
+            std::env::temp_dir().join(format!("oaiy-python-install-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let full = pbs_shaped_tarball();
+
+        // Prove the fixture really does write the interpreter before the point
+        // the torn copy dies, or the assertions below would pass vacuously.
+        let good = base.join("good.tar.gz");
+        std::fs::write(&good, &full).unwrap();
+        let scratch = base.join("scratch");
+        extract_pbs_tarball(&good, &scratch).unwrap();
+        assert!(interpreter_in(&scratch).exists());
+
+        let torn = base.join("torn.tar.gz");
+        std::fs::write(&torn, &full[..full.len() / 3]).unwrap();
+        let dest = base.join("python");
+        install_from_tarball(&torn, &dest).unwrap_err();
+        assert!(
+            !dest.exists(),
+            "a torn unpack must leave the runtime dir absent, not a tree with an \
+             interpreter and no stdlib"
+        );
+        let leftovers: Vec<String> = std::fs::read_dir(&base)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("python"))
+            .collect();
+        assert!(leftovers.is_empty(), "staging left behind: {leftovers:?}");
+
+        // The intact tarball promotes into place.
+        assert_eq!(
+            install_from_tarball(&good, &dest).unwrap(),
+            interpreter_in(&dest)
+        );
+        assert!(interpreter_in(&dest).exists());
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

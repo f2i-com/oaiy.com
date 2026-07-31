@@ -740,7 +740,8 @@ impl Ledger {
         outcome
     }
 
-    /// Move a run to a terminal state. Refuses if it is already terminal.
+    /// Move a RUNNING run to a terminal state. Refuses anything else: a run that
+    /// is already terminal, and a run nobody has claimed.
     ///
     /// `Err` here is not "the run failed" — it is "this finalise was rejected",
     /// which the HTTP layer maps to 409. Conflating the two would let a late
@@ -768,6 +769,21 @@ impl Ledger {
             if rec.status.is_terminal() {
                 return Err(format!(
                     "run {run_id} is already {:?}; terminal states are immutable",
+                    rec.status
+                ));
+            }
+            // Only an executing run can end. Refusing a QUEUED one closes a hole
+            // the terminal check alone left open: a caller that never claimed the
+            // run could journal an outcome for work nothing had run, and because
+            // the record was then terminal it dropped out of
+            // `claimable_by_worker` — so nothing ever would. `protocol/README.md`
+            // draws every terminal edge off `running`; the single exception,
+            // `queued -> cancelled`, belongs to `request_cancel` and is
+            // implemented there. Cancellation of a running run deliberately
+            // leaves the status Running, so the worker can still finalise it.
+            if rec.status != RunStatus::Running {
+                return Err(format!(
+                    "run {run_id} is {:?}, not Running; only a claimed run can be finalised",
                     rec.status
                 ));
             }
@@ -1291,6 +1307,41 @@ mod tests {
         assert!(l.finish(&r.run_id, RunStatus::Running, None, None).is_err());
     }
 
+    #[test]
+    fn only_a_claimed_run_can_be_finalised() {
+        // The write-side half of the single-winner claim. Without it the claim
+        // bought nothing: anyone reaching /finish could journal an outcome for a
+        // run that had never executed, and the now-terminal record dropped out of
+        // claimable_by_worker, so nothing ever would execute it.
+        let mut l = Ledger::new();
+        let r = match l.reserve(&req("k")) {
+            ReserveOutcome::Reserved(r) => r,
+            o => panic!("{o:?}"),
+        };
+        let why = l
+            .finish(
+                &r.run_id,
+                RunStatus::Succeeded,
+                Some(serde_json::json!({"fabricated": true})),
+                None,
+            )
+            .expect_err("a queued run has no result to record");
+        assert!(why.contains("not Running"), "{why}");
+
+        // Untouched, and still there for a worker to pick up.
+        let rec = l.get(&r.run_id).unwrap();
+        assert_eq!(rec.status, RunStatus::Queued);
+        assert!(rec.output.is_none(), "no outcome may be invented");
+        assert!(rec.finished_at_ms.is_none());
+        assert_eq!(l.queued(10).len(), 1, "the run must stay claimable");
+
+        // And once it IS claimed, the same finalise lands.
+        l.claim(&r.run_id, Runtime::Desktop, "d").ok_claimed();
+        assert!(l
+            .finish(&r.run_id, RunStatus::Succeeded, Some(serde_json::json!(1)), None)
+            .is_ok());
+    }
+
     // --- cancellation ------------------------------------------------------
 
     #[test]
@@ -1316,6 +1367,12 @@ mod tests {
         // stopped when a node may be mid-HTTP-call.
         assert_eq!(l.request_cancel(&r.run_id).unwrap(), RunStatus::Running);
         assert_eq!(l.get(&r.run_id).unwrap().status, RunStatus::Running);
+        // Which is also what lets the runner finalise it after killing the child:
+        // finish() requires Running, and a cancel request deliberately does not
+        // leave that state.
+        assert!(l
+            .finish(&r.run_id, RunStatus::Cancelled, None, None)
+            .is_ok());
     }
 
     // --- loop guards -------------------------------------------------------
