@@ -1,0 +1,34 @@
+{
+  "id": "formlogic",
+  "name": "FormLogic",
+  "description": "Link this machine to a FormLogic account so it can run flows, relay connector commands, and act as a desktop runtime.",
+  "docsUrl": "https://formlogic.com/docs/desktop",
+  "defaultBaseUrl": "https://formlogic.com",
+  "auth": {
+    "kind": "oauth2_pkce",
+    "clientId": "formlogic-desktop",
+    "authorizePath": "/oauth/authorize",
+    "tokenPath": "/api/oauth/token",
+    "callbackPath": "/callback",
+    "deviceParam": "device",
+    "extraAuthorizeParams": {
+      "response_type": "code"
+    },
+    "scopes": [
+      "flows:read",
+      "flows:write",
+      "responses:read",
+      "responses:write",
+      "responses:manage",
+      "connector:relay",
+      "aokie:realtime"
+    ],
+    "tokenResponse": {
+      "credentialFields": ["formlogic_api_key", "access_token"],
+      "accountIdField": "desktop_connection_id",
+      "accountNameField": "device_name",
+      "scopeField": "scope"
+    }
+  },
+  "healthPath": "/api/v1/desktop-connections"
+}

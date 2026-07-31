@@ -1,9 +1,11 @@
 import { useCallback, useEffect, useState } from 'react';
-import { Check, Link2, Radio, ShieldCheck, TriangleAlert, X } from 'lucide-react';
+import { Check, Cloud, Link2, Radio, ShieldCheck, TriangleAlert, X } from 'lucide-react';
 import {
   companion,
+  link as linkApi,
   pairing,
   type CompanionRelayStatus,
+  type LinkStatus,
   type PairedApp,
   type PendingPairing,
 } from './api';
@@ -31,6 +33,10 @@ export default function ConnectionsPanel() {
   const [relay, setRelay] = useState<CompanionRelayStatus | null>(() => peek('companionRelay') ?? null);
   const [relayForm, setRelayForm] = useState({ baseUrl: '', token: '', appId: '' });
   const [relayError, setRelayError] = useState<string | null>(null);
+  const [account, setAccount] = useState<LinkStatus | null>(() => peek('linkStatus') ?? null);
+  const [accountForm, setAccountForm] = useState({ connectorId: '', baseUrl: '' });
+  const [accountError, setAccountError] = useState<string | null>(null);
+  const [linking, setLinking] = useState(false);
 
   const refreshRelay = useCallback(async () => {
     try {
@@ -40,6 +46,25 @@ export default function ConnectionsPanel() {
     } catch {
       // A relay this desktop has never configured is the normal case, not an
       // error worth a banner over the pairing list.
+    }
+  }, []);
+
+  const refreshAccount = useCallback(async () => {
+    try {
+      const next = await linkApi.status();
+      setAccount(next);
+      put('linkStatus', next);
+      // Default the form to the first provider and its suggested address, so
+      // the common case is one click.
+      setAccountForm((f) => {
+        if (f.connectorId) return f;
+        const first = next.available[0];
+        return first
+          ? { connectorId: first.id, baseUrl: first.defaultBaseUrl ?? '' }
+          : f;
+      });
+    } catch (e) {
+      setAccountError(e instanceof Error ? e.message : String(e));
     }
   }, []);
 
@@ -66,6 +91,53 @@ export default function ConnectionsPanel() {
   useEffect(() => {
     void refreshRelay();
   }, [refreshRelay]);
+
+  useEffect(() => {
+    void refreshAccount();
+  }, [refreshAccount]);
+
+  // While a link is in flight the ceremony is happening in the user's browser,
+  // so this screen has no way to know it finished except by asking.
+  useEffect(() => {
+    const phase = account?.attempt.phase;
+    if (phase !== 'awaitingBrowser' && phase !== 'exchanging') return;
+    const id = window.setInterval(() => void refreshAccount(), 1500);
+    return () => window.clearInterval(id);
+  }, [account?.attempt.phase, refreshAccount]);
+
+  const startLink = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setAccountError(null);
+    setLinking(true);
+    try {
+      await linkApi.start(accountForm.connectorId, accountForm.baseUrl.trim());
+      await refreshAccount();
+      toast.push({ kind: 'info', title: 'Approve the link in your browser' });
+    } catch (err) {
+      setAccountError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setLinking(false);
+    }
+  };
+
+  const unlink = async () => {
+    const name = account?.connectorName ?? 'this account';
+    if (
+      !confirm(
+        `Disconnect ${name}?\n\nThis forgets the key on this machine only \u2014 it does not revoke it at the provider. Remove this desktop there too if you want the key to stop working.`,
+      )
+    )
+      return;
+    setAccountError(null);
+    try {
+      const next = await linkApi.unlink();
+      setAccount(next);
+      put('linkStatus', next);
+      toast.push({ kind: 'success', title: `Disconnected ${name}` });
+    } catch (err) {
+      setAccountError(err instanceof Error ? err.message : String(err));
+    }
+  };
 
   const saveRelay = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -226,6 +298,125 @@ export default function ConnectionsPanel() {
               </li>
             ))}
           </ul>
+        )}
+      </section>
+
+      <section className="service-section">
+        <div className="section-title-row">
+          <h3 className="section-title">Linked account</h3>
+        </div>
+        <p className="form-hint" style={{ marginBottom: 10 }}>
+          One account, on any provider that speaks the connector protocol. Approving happens
+          in your browser and this machine never sees your password \u2014 it receives a scoped key.
+        </p>
+
+        {accountError && (
+          <div className="banner banner-err" role="alert" style={{ marginBottom: 10 }}>
+            {accountError}
+          </div>
+        )}
+
+        {account?.attempt.phase === 'awaitingBrowser' && (
+          <div className="banner banner-pending" style={{ marginBottom: 10 }}>
+            <strong>Waiting for you to approve in the browser\u2026</strong>
+            {/* The launcher can silently do nothing; without this the user is
+                stuck looking at a spinner with no way forward. */}
+            <div style={{ marginTop: 6, fontSize: 12.5 }}>
+              Didn\u2019t a tab open?{' '}
+              <a href={account.attempt.authorizeUrl} target="_blank" rel="noreferrer">
+                Open the approval page
+              </a>
+            </div>
+          </div>
+        )}
+        {account?.attempt.phase === 'exchanging' && (
+          <div className="banner banner-pending" style={{ marginBottom: 10 }}>
+            Finishing the link\u2026
+          </div>
+        )}
+        {account?.attempt.phase === 'failed' && !account.linked && (
+          <div className="banner banner-err" role="alert" style={{ marginBottom: 10 }}>
+            {account.attempt.message}
+          </div>
+        )}
+
+        {account?.linked ? (
+          <ul className="pairing-list">
+            <li>
+              <span>
+                <Cloud size={13} aria-hidden /> {account.connectorName ?? account.connectorId}
+                {account.accountName && <strong> \u00b7 {account.accountName}</strong>}
+                <code className="pairing-origin">{account.baseUrl}</code>
+                {account.grantedScopes && (
+                  <small style={{ display: 'block', opacity: 0.6, marginTop: 2 }}>
+                    {account.grantedScopes}
+                  </small>
+                )}
+              </span>
+              <button className="btn-tiny btn-danger" onClick={() => void unlink()}>
+                Disconnect
+              </button>
+            </li>
+          </ul>
+        ) : account && account.available.length === 0 ? (
+          <p className="form-hint">
+            No connectors are available in this build. Drop a connector descriptor into the
+            <code> connectors</code> folder in your data directory to add one.
+          </p>
+        ) : (
+          <form className="dl-form" style={{ marginTop: 12 }} onSubmit={(e) => void startLink(e)}>
+            <label className="form-row">
+              <span>Provider</span>
+              {/* Populated from the host, never hardcoded \u2014 adding a descriptor
+                  file is all it takes for a new provider to appear here. */}
+              <select
+                value={accountForm.connectorId}
+                onChange={(e) => {
+                  const id = e.target.value;
+                  const c = account?.available.find((x) => x.id === id);
+                  setAccountForm({ connectorId: id, baseUrl: c?.defaultBaseUrl ?? '' });
+                }}
+              >
+                {(account?.available ?? []).map((c) => (
+                  <option key={c.id} value={c.id}>
+                    {c.name}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="form-row">
+              <span>Address</span>
+              <input
+                type="text"
+                placeholder="https://provider.example"
+                value={accountForm.baseUrl}
+                onChange={(e) => setAccountForm((f) => ({ ...f, baseUrl: e.target.value }))}
+              />
+            </label>
+            {(() => {
+              const c = account?.available.find((x) => x.id === accountForm.connectorId);
+              return c?.scopes.length ? (
+                <p className="form-hint" style={{ margin: '2px 0 0' }}>
+                  Will ask for: {c.scopes.join(', ')}
+                </p>
+              ) : null;
+            })()}
+            <div className="form-actions">
+              <button
+                type="submit"
+                className="btn btn-secondary"
+                disabled={
+                  linking ||
+                  !accountForm.connectorId ||
+                  !accountForm.baseUrl.trim() ||
+                  account?.attempt.phase === 'awaitingBrowser' ||
+                  account?.attempt.phase === 'exchanging'
+                }
+              >
+                Link account
+              </button>
+            </div>
+          </form>
         )}
       </section>
 

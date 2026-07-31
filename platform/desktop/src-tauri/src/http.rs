@@ -697,6 +697,10 @@ fn is_bridge_exec_path(path: &str) -> bool {
         // call's audio, and rotation invalidates every existing pairing. A
         // local web page must not reach them just by being on loopback.
         || path.starts_with("/api/companion/")
+        // Linking opens the user's browser and ends in a stored credential;
+        // unlinking throws that credential away. Neither belongs to a local
+        // page that happens to be on loopback.
+        || path.starts_with("/api/link")
         // Pairing APPROVAL/denial is the user's trust act, and revoke unpairs an
         // app — only OAIY's own webview (or a token holder) may. But raising a
         // request (`POST /api/bridge/pairing`) and polling it
@@ -770,6 +774,9 @@ fn is_restricted_read_path(path: &str) -> bool {
         // thumbprint — the material an attacker would want in order to imitate
         // a pairing screen. Same tier as the other bridge reads.
         || path.starts_with("/api/companion/")
+        // The link status names the provider, the account and the granted
+        // scopes — an inventory of what this machine can reach.
+        || path.starts_with("/api/link")
         || path == "/api/bridge/events"
         || path == "/api/bridge/runs"
         || path == "/api/bridge/flows"
@@ -999,6 +1006,8 @@ pub async fn serve(
     // phones are trusted.
     companion: crate::companion::routes::CompanionHandle,
     companion_upstream: crate::companion::upstream::UpstreamHandle,
+    // The one outbound account link, and the descriptors it can be made with.
+    link: crate::link::LinkHandle,
     // AI gateway provider store (holds provider API keys). Built at the call site
     // where the data dir is known; the AI router pairs it with the registry below.
     ai_providers: crate::ai::providers::ProviderStoreHandle,
@@ -1044,6 +1053,7 @@ pub async fn serve(
     let pairing_for_auth = bridge.pairing.clone();
     let companion_routes =
         crate::companion::routes::router(companion.clone(), companion_upstream.clone());
+    let link_routes = crate::link::routes::router(link);
     let bridge_routes = crate::bridge::bridge_router(bridge);
 
     // The AI gateway is its own sub-router with its own state (provider store +
@@ -1098,6 +1108,7 @@ pub async fn serve(
         // would leave them ungated — reachable by any web page the user has open.
         .merge(bridge_routes)
         .merge(companion_routes)
+        .merge(link_routes)
         .merge(ai_routes)
         .layer(middleware::from_fn_with_state(
             AuthConfig { token: auth_token, gui_mode, pairing: Some(pairing_for_auth) },
@@ -1120,6 +1131,17 @@ mod tests {
         privileged_allowed, AuthConfig, ModelDownloadRequest,
     };
     use axum::http::Method;
+
+    #[test]
+    fn linking_is_privileged_and_the_status_is_a_restricted_read() {
+        // Starting a link opens the user's browser and ends in a stored
+        // credential; unlinking throws it away. A local page must reach
+        // neither. Reading the status changes nothing, but it inventories what
+        // this machine can reach, so it stays off the open GET surface.
+        assert!(is_privileged_path(&Method::POST, "/api/link/start"));
+        assert!(is_privileged_path(&Method::DELETE, "/api/link"));
+        assert!(is_restricted_read_path("/api/link"));
+    }
 
     #[test]
     fn clearing_run_history_is_privileged() {
