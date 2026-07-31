@@ -16,6 +16,8 @@
 pub mod descriptor;
 pub mod heartbeat;
 pub mod oauth;
+pub mod ops;
+pub mod relay;
 pub mod routes;
 
 use serde::{Deserialize, Serialize};
@@ -175,6 +177,7 @@ struct Inner {
     cancel: Arc<AtomicBool>,
     last_heartbeat_at: Option<chrono::DateTime<chrono::Utc>>,
     heartbeat_error: Option<String>,
+    relay_error: Option<String>,
 }
 
 pub struct LinkStore {
@@ -200,6 +203,7 @@ pub fn open_handle(data_dir: PathBuf) -> LinkHandle {
             cancel: Arc::new(AtomicBool::new(false)),
             last_heartbeat_at: None,
             heartbeat_error: None,
+            relay_error: None,
         }),
     });
     // One worker for the process lifetime. It asks the store what to do each
@@ -299,6 +303,11 @@ impl LinkStore {
             }
             None => heartbeat::new_instance_id(),
         }
+    }
+
+    /// Record the outcome of a relay poll.
+    pub fn note_relay(&self, error: Option<String>) {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).relay_error = error;
     }
 
     /// Record the outcome of a heartbeat.

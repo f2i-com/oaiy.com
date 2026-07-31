@@ -104,6 +104,44 @@ pub struct ConnectorDescriptor {
     /// provider that tracks presence some other way, or not at all.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub heartbeat: Option<HeartbeatSpec>,
+    /// How this provider queues remote-control commands for the desktop.
+    /// Omitted for a provider that has no such lane.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay: Option<RelaySpec>,
+}
+
+/// The long-poll / claim / complete lane a provider's web app uses to act on
+/// this desktop from anywhere.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RelaySpec {
+    /// Long-poll for work addressed to this instance.
+    pub pending_path: String,
+    /// Take one command, exactly-once. `{id}` is substituted.
+    pub claim_path: String,
+    /// Report the outcome. `{id}` is substituted.
+    pub complete_path: String,
+    /// How long the server may hold the poll open.
+    #[serde(default = "default_relay_wait")]
+    pub wait_seconds: u64,
+    #[serde(default = "default_relay_batch")]
+    pub batch_limit: u32,
+    /// Pause after a failed poll, so a provider that is down does not become a
+    /// hot loop against it.
+    #[serde(default = "default_relay_backoff")]
+    pub error_backoff_seconds: u64,
+}
+
+fn default_relay_wait() -> u64 {
+    25
+}
+
+fn default_relay_batch() -> u32 {
+    20
+}
+
+fn default_relay_backoff() -> u64 {
+    10
 }
 
 /// The periodic ping that keeps a desktop looking online.
@@ -177,6 +215,36 @@ impl ConnectorDescriptor {
                 return Err(format!(
                     "connector {:?} heartbeat interval {} is out of range (1..3600s)",
                     self.id, h.interval_seconds
+                ));
+            }
+        }
+        if let Some(r) = &self.relay {
+            for (label, path) in [
+                ("pendingPath", &r.pending_path),
+                ("claimPath", &r.claim_path),
+                ("completePath", &r.complete_path),
+            ] {
+                if !path.starts_with('/') {
+                    return Err(format!(
+                        "connector {:?} relay {label} must begin with '/', got {path:?}",
+                        self.id
+                    ));
+                }
+            }
+            // Without the placeholder every claim would hit one fixed URL and
+            // quietly do nothing useful.
+            for (label, path) in [("claimPath", &r.claim_path), ("completePath", &r.complete_path)] {
+                if !path.contains("{id}") {
+                    return Err(format!(
+                        "connector {:?} relay {label} must contain the {{id}} placeholder",
+                        self.id
+                    ));
+                }
+            }
+            if r.wait_seconds == 0 || r.wait_seconds > 300 {
+                return Err(format!(
+                    "connector {:?} relay wait {} is out of range (1..300s)",
+                    self.id, r.wait_seconds
                 ));
             }
         }

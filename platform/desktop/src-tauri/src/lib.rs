@@ -1494,6 +1494,17 @@ pub fn run() {
                     data_dir_for_bridge.join("companion").join("relay.json"),
                 );
                 let link_for_http = crate::link::open_handle(data_dir_for_bridge.clone());
+                // Serve remote-control commands the linked provider queues for
+                // this machine. Without it every action a user takes on the
+                // provider's website expires as "no desktop picked it up".
+                crate::link::relay::spawn(
+                    link_for_http.clone(),
+                    crate::link::ops::dispatcher(
+                        registry_for_http.clone(),
+                        bridge_for_http.plugins.clone(),
+                        bridge_for_http.host.clone(),
+                    ),
+                );
                 bridge_for_http.host.set_companion_broker(
                     crate::plugins::CompanionBroker {
                         companion: companion_for_http.clone(),

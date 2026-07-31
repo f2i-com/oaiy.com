@@ -365,6 +365,14 @@ async fn main() {
         data_dir.join("companion").join("relay.json"),
     );
     let link = oaiy_desktop_lib::link::open_handle(data_dir.clone());
+    oaiy_desktop_lib::link::relay::spawn(
+        link.clone(),
+        oaiy_desktop_lib::link::ops::dispatcher(
+            registry.clone(),
+            bridge.plugins.clone(),
+            bridge.host.clone(),
+        ),
+    );
     bridge.host.set_companion_broker(oaiy_desktop_lib::plugins::CompanionBroker {
         companion: companion.clone(),
         upstream: companion_upstream.clone(),
