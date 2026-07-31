@@ -819,6 +819,76 @@ async fn list_ollama_models(
     Ok(models)
 }
 
+/// Explain a fatal API-server failure to the user, then quit.
+///
+/// The bind failure that matters in practice is "OAIY is already running" —
+/// launching a second copy leaves a window with no API behind it, which looks
+/// like the app is simply broken. It is also actively harmful: two instances
+/// share one data directory, so two plugin hosts end up fighting over the same
+/// hardware (the phone bridge owns a Bluetooth dongle, and only one process can).
+///
+/// So the second instance identifies WHO holds the port before it complains —
+/// another OAIY reads very differently from an unrelated program — and then
+/// exits rather than lingering as a broken window.
+async fn report_fatal_server_error(app: &tauri::AppHandle, detail: &str) {
+    use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
+
+    let ours = port_holder_is_oaiy().await;
+    let (title, body) = if ours {
+        (
+            "OAIY is already running",
+            format!(
+                "Another copy of OAIY Desktop already has port {DESKTOP_PORT}.\n\n\
+                 Only one can run at a time — they share the same data folder, and \
+                 two plugin hosts would fight over the same hardware. Use the copy \
+                 that is already open (check the system tray).",
+            ),
+        )
+    } else {
+        (
+            "OAIY could not start its local API",
+            format!(
+                "Port {DESKTOP_PORT} is being used by another program, so OAIY \
+                 cannot serve its local API and nothing in this window will work.\n\n\
+                 Close whatever is using that port and start OAIY again.\n\n{detail}"
+            ),
+        )
+    };
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.dialog()
+        .message(body)
+        .title(title)
+        .kind(MessageDialogKind::Error)
+        .show(move |_| {
+            let _ = tx.send(());
+        });
+    let _ = rx.await;
+    app.exit(1);
+}
+
+/// Is the process holding our port another OAIY, or something unrelated?
+///
+/// Asks the same `/api/health` handshake every client uses — a fixed loopback
+/// port is trivially squatted, so identity is asserted rather than assumed.
+async fn port_holder_is_oaiy() -> bool {
+    let Ok(client) = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+    else {
+        return false;
+    };
+    let url = format!("http://127.0.0.1:{DESKTOP_PORT}/api/health");
+    let Ok(resp) = client.get(&url).send().await else {
+        return false;
+    };
+    let Ok(text) = resp.text().await else { return false };
+    serde_json::from_str::<serde_json::Value>(&text)
+        .ok()
+        .and_then(|v| v.get("product").and_then(|p| p.as_str()).map(str::to_string))
+        .is_some_and(|product| product == http::PRODUCT_ID)
+}
+
 /// Tauri command: open a native folder picker, returning the chosen path
 /// (or None if cancelled). Non-blocking via a oneshot so we never stall
 /// the UI thread.
@@ -1093,6 +1163,7 @@ pub fn run() {
             let device_id_for_http = crate::stable_device_id(&data_dir);
             let config_provider: Arc<dyn http::ConfigProvider> =
                 Arc::new(TauriConfigProvider { app: app_handle });
+            let app_for_dialog = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 // Bridge state. The plugins root sits under the data dir so a
                 // relocated data folder takes its plugins with it — plugins hold
@@ -1139,6 +1210,11 @@ pub fn run() {
                 .await
                 {
                     log::error!("HTTP server exited: {e}");
+                    // A log nobody reads is not a report. Without the API this
+                    // window is inert — every panel loads forever and nothing
+                    // works — so say what happened and stop, rather than
+                    // presenting a running app that silently does nothing.
+                    report_fatal_server_error(&app_for_dialog, &e.to_string()).await;
                 }
             });
 
