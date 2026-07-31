@@ -975,6 +975,64 @@ impl Registry {
         let _ = std::fs::write(&sentinel, "");
     }
 
+    /// Where the "what was running" note lives, beside the other registry state.
+    fn running_note_path(&self) -> PathBuf {
+        self.data_dir.join("services-running.json")
+    }
+
+    /// Record which services are up, so a restart can bring them back.
+    ///
+    /// Called after every successful start/stop rather than only at exit: a
+    /// desktop that is killed, crashes, or loses power never runs its shutdown
+    /// path, and "restore what was running" is worth exactly nothing if the note
+    /// is only written when we exit cleanly.
+    pub fn remember_running(&self) {
+        let ids: Vec<&str> = self
+            .services
+            .values()
+            .filter(|s| matches!(s.status, ServiceStatus::Running | ServiceStatus::Starting))
+            .map(|s| s.template.id.as_str())
+            .collect();
+        if let Ok(body) = serde_json::to_string(&ids) {
+            let path = self.running_note_path();
+            let tmp = path.with_extension("json.tmp");
+            if std::fs::write(&tmp, body).is_ok() {
+                let _ = std::fs::rename(&tmp, &path);
+            }
+        }
+    }
+
+    /// Ids recorded by [`Self::remember_running`], if any.
+    fn remembered_running(&self) -> Vec<String> {
+        std::fs::read_to_string(self.running_note_path())
+            .ok()
+            .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
+            .unwrap_or_default()
+    }
+
+    /// Start everything that was running when this machine last had OAIY up.
+    ///
+    /// Returns the ids it started. Without this, a reboot (or just closing the
+    /// app) silently takes the whole local runtime offline: a paired page's AI
+    /// calls fail and every trigger-fired flow that needs a local service breaks
+    /// until a human opens the window and clicks Start on each one.
+    pub fn autostart_remembered(&mut self) -> Vec<String> {
+        let mut started = Vec::new();
+        for id in self.remembered_running() {
+            // Only what still exists and isn't already up; a start failure is
+            // logged by `start` and must not stop the rest from coming back.
+            match self.services.get(&id).map(|s| s.status) {
+                Some(ServiceStatus::Running) | Some(ServiceStatus::Starting) => continue,
+                Some(_) => {}
+                None => continue,
+            }
+            if self.start(&id).is_ok() {
+                started.push(id);
+            }
+        }
+        started
+    }
+
     pub fn snapshot(&self) -> RegistrySnapshot {
         let mut services: Vec<ServiceSnapshot> = self
             .services
@@ -1246,6 +1304,10 @@ impl Registry {
                 // Running, but the immediate UI feedback is "it's
                 // starting → it spawned, looking good".
                 svc.set_status(ServiceStatus::Running, None);
+                // Note it now, not at shutdown: a crash or power loss never runs
+                // the exit path, and a restore note only written on a clean exit
+                // is worth nothing.
+                self.remember_running();
                 Ok(())
             }
             Err(e) => {
@@ -1280,6 +1342,8 @@ impl Registry {
             }
         }
         svc.set_status(ServiceStatus::Stopped, None);
+        // A deliberate stop must not come back on the next launch.
+        self.remember_running();
         Ok(())
     }
 
