@@ -94,9 +94,12 @@ const HOST_BOOTSTRAP = `
       issue: function (grant) { return call('command', ['consent.set', grant]); },
       revoke: function () { return call('command', ['consent.revoke']); }
     },
-    // Companion device trust. Served by the host, not by the plugin: the
-    // desktop's endpoint key is the thing a phone authenticates AGAINST, so it
-    // must not live in the process the phone is talking to.
+    // Companion device trust. Served by the host, not by the plugin.
+    //
+    // The plugin does hold the endpoint SIGNING key — it hosts the WebRTC peer,
+    // so it has to sign as this desktop. What it must not hold is the power to
+    // change who is trusted: approving and revoking a phone stay here, on the
+    // side of the boundary the plugin cannot reach.
     //
     // All SEVEN methods are defined, including the three the screen only calls
     // from a confirm step. A missing one throws synchronously inside a handler
