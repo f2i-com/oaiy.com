@@ -283,6 +283,63 @@ pub struct EnsureByPortResult {
     pub error: Option<String>,
 }
 
+/// How deep to look for GGUFs under a model root.
+///
+/// Top level only was the old behaviour, and it made the obvious thing not
+/// work: drop a folder of weights into the models directory — which is how
+/// people organise 22 of them — and llama.cpp's Model picker stayed empty,
+/// with nothing saying why. Model libraries are nested by publisher or by
+/// family, so a flat scan finds the one file somebody left loose and none of
+/// the rest.
+///
+/// Bounded rather than unlimited: a model root can be a whole drive (`E:\`),
+/// and this runs from the picker. Four levels covers
+/// `<root>/<publisher>/<family>/<quant>/model.gguf` with room to spare, while
+/// keeping a mis-pointed root from walking an entire filesystem.
+const GGUF_SCAN_DEPTH: u32 = 4;
+
+/// Recursively collect `.gguf` files under `dir`, skipping multimodal
+/// projectors (`mmproj*`), which are not standalone models.
+fn collect_ggufs(
+    dir: &Path,
+    depth: u32,
+    seen: &mut std::collections::HashSet<String>,
+    out: &mut Vec<String>,
+) {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in rd.flatten() {
+        let p = entry.path();
+        // `file_type` rather than `p.is_dir()`: the latter follows symlinks, so
+        // a link pointing back up its own tree would recurse until the depth
+        // budget ran out, doing real work each time.
+        let Ok(ft) = entry.file_type() else { continue };
+        if ft.is_dir() {
+            if depth > 0 {
+                collect_ggufs(&p, depth - 1, seen, out);
+            }
+            continue;
+        }
+        let is_gguf = p
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("gguf"))
+            .unwrap_or(false);
+        if !is_gguf {
+            continue;
+        }
+        let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if name.to_ascii_lowercase().starts_with("mmproj") {
+            continue;
+        }
+        let s = p.display().to_string();
+        if seen.insert(s.clone()) {
+            out.push(s);
+        }
+    }
+}
+
 /// A `templates/*.json` that is on disk but could not be loaded.
 ///
 /// Carried on the wire because a skipped template is otherwise completely
@@ -834,28 +891,7 @@ impl Registry {
         let mut seen = std::collections::HashSet::new();
         let mut out = Vec::new();
         for dir in &self.model_dirs {
-            let Ok(rd) = std::fs::read_dir(dir) else {
-                continue;
-            };
-            for entry in rd.flatten() {
-                let p = entry.path();
-                let is_gguf = p
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .map(|e| e.eq_ignore_ascii_case("gguf"))
-                    .unwrap_or(false);
-                if !is_gguf {
-                    continue;
-                }
-                let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                if name.to_ascii_lowercase().starts_with("mmproj") {
-                    continue;
-                }
-                let s = p.display().to_string();
-                if seen.insert(s.clone()) {
-                    out.push(s);
-                }
-            }
+            collect_ggufs(dir, GGUF_SCAN_DEPTH, &mut seen, &mut out);
         }
         out.sort();
         out
@@ -2634,6 +2670,53 @@ mod tests {
             !runner.is_alive(),
             "the child slot must be empty on return, either reaped or handed off"
         );
+    }
+
+    #[test]
+    fn ggufs_are_found_in_subfolders_of_a_model_root() {
+        // Top-level-only was the old behaviour and it made the obvious thing
+        // fail: drop a folder of weights into the models directory and the
+        // llama.cpp Model picker stayed empty, with nothing explaining why.
+        let root = std::env::temp_dir().join(format!("oaiy-gguf-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let models = root.join("models");
+        std::fs::create_dir_all(models.join("qwen/30b")).unwrap();
+        // Exactly at the depth budget, and one level past it.
+        std::fs::create_dir_all(models.join("a/b/c/d/e")).unwrap();
+
+        std::fs::write(models.join("loose.gguf"), b"x").unwrap();
+        std::fs::write(models.join("qwen/mid.gguf"), b"x").unwrap();
+        std::fs::write(models.join("qwen/30b/nested.gguf"), b"x").unwrap();
+        // A multimodal projector is not a standalone model, at any depth.
+        std::fs::write(models.join("qwen/mmproj-thing.gguf"), b"x").unwrap();
+        std::fs::write(models.join("a/b/c/d/edge.gguf"), b"x").unwrap();
+        // Past the budget, so a mis-pointed root cannot walk a whole drive.
+        std::fs::write(models.join("a/b/c/d/e/way.gguf"), b"x").unwrap();
+        // Not a model.
+        std::fs::write(models.join("qwen/notes.txt"), b"x").unwrap();
+
+        let reg = super::Registry::empty(root.clone(), models.clone());
+        let found: Vec<String> = reg
+            .list_gguf_models()
+            .into_iter()
+            .map(|p| {
+                std::path::Path::new(&p)
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .collect();
+
+        assert!(found.contains(&"loose.gguf".to_string()), "{found:?}");
+        assert!(found.contains(&"mid.gguf".to_string()), "a subfolder must be searched: {found:?}");
+        assert!(found.contains(&"nested.gguf".to_string()), "two levels down: {found:?}");
+        assert!(!found.iter().any(|f| f.starts_with("mmproj")), "{found:?}");
+        assert!(found.contains(&"edge.gguf".to_string()), "the last allowed level: {found:?}");
+        assert!(!found.contains(&"way.gguf".to_string()), "depth must stay bounded: {found:?}");
+        assert!(!found.iter().any(|f| f.ends_with(".txt")), "{found:?}");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

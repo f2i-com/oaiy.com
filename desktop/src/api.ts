@@ -202,7 +202,12 @@ export interface ModelFile {
 
 export interface ModelsSnapshot {
   rootDir: string;
+  /** One PAGE of the library — see `total`. */
   models: ModelFile[];
+  /** Files in the whole library, so the count shown is never a page length. */
+  total: number;
+  offset: number;
+  limit: number;
   /** Free space on the drive holding the models dir (null if unknown). */
   freeBytes: number | null;
 }
@@ -263,7 +268,10 @@ export interface CatalogSnapshot {
 }
 
 export const models = {
-  list: () => request<ModelsSnapshot>('/api/models'),
+  /** One page of the library. The panel polls this, so a big library must not
+   *  be serialised in full every tick. */
+  list: (limit = 200, offset = 0) =>
+    request<ModelsSnapshot>(`/api/models?offset=${offset}&limit=${limit}`),
   catalog: () => request<CatalogSnapshot>('/api/models/catalog'),
   download: (url: string, filename?: string, subdir?: string) =>
     request<{ downloadId: string }>('/api/models/download', {
