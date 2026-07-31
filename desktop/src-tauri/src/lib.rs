@@ -160,6 +160,8 @@ impl HiddenCommand for std::process::Command {
     }
 }
 
+pub mod companion;
+
 // Everything below `open_path` is the GUI companion (Tauri), gated behind the
 // default `gui` feature: `cargo build --bin oaiy-server --no-default-features`
 // builds the headless server WITHOUT tauri/webkit2gtk. `http` + `services`
