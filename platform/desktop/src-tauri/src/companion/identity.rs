@@ -280,6 +280,60 @@ impl EndpointIdentity {
         })
     }
 
+    /// The identity-only bootstrap handed to the broker plugin at init.
+    ///
+    /// This carries the desktop's PRIVATE seed. That is the protocol's design,
+    /// not an oversight: the plugin hosts the WebRTC endpoint, so it is the
+    /// process that has to sign as this desktop. What stays here is
+    /// ADMINISTRATION — who is approved, and the ability to revoke them — which
+    /// is why the pairing routes are served by the host and not by the plugin.
+    ///
+    /// `None` when there is nothing worth sending: no key, or no approved
+    /// device. An identity-only bootstrap with an empty roster is rejected by
+    /// the decoder (it requires 1..64 keys), so sending one would only turn a
+    /// not-yet-paired desktop into a plugin that fails to start.
+    ///
+    /// Identity-only means NO admission fields — no gateway URL, token or ICE.
+    /// The plugin asks for those over `companion.admission` when it needs them,
+    /// so a short-lived credential is never baked into a handshake that happens
+    /// once at launch.
+    pub fn private_bootstrap(&self, plugin_api_version: u16) -> Option<serde_json::Value> {
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let key = inner.signing_key.as_ref()?;
+        if inner.roster.approved.is_empty() || inner.roster.approved.len() > 64 {
+            return None;
+        }
+        let public = EndpointPublicKey::from_verifying_key(&key.verifying_key());
+        let thumbprints: Vec<String> = inner
+            .roster
+            .approved
+            .iter()
+            .map(|m| m.endpoint_key.thumbprint.clone())
+            .collect();
+        let keys: Vec<&EndpointPublicKey> = inner
+            .roster
+            .approved
+            .iter()
+            .map(|m| &m.endpoint_key)
+            .collect();
+        let _ = plugin_api_version;
+        Some(serde_json::json!({
+            "schemaVersion": SCHEMA_VERSION,
+            "pluginId": self.owner_plugin,
+            "endpointIdentity": {
+                "algorithm": public.algorithm,
+                "publicKey": public.public_key,
+                "thumbprint": public.thumbprint,
+                "privateKeySeed": URL_SAFE_NO_PAD.encode(key.to_bytes()),
+            },
+            "approvedMobileRoster": {
+                "revision": inner.roster.revision,
+                "rosterHash": peer_roster_hash(inner.roster.revision, &thumbprints),
+                "keys": keys,
+            },
+        }))
+    }
+
     fn dir(&self) -> PathBuf {
         self.root.join("companion").join(&self.owner_plugin)
     }
@@ -652,16 +706,23 @@ fn endpoint_thumbprint(public_key: &str) -> String {
 
 /// A stable hash of who is trusted right now, so a peer can notice its view is
 /// stale without being told the roster itself.
+///
+/// The derivation is fixed by the v2 protocol, NOT free for this host to
+/// choose: the plugin recomputes it from the roster it was handed and refuses a
+/// bootstrap whose hash disagrees, and the gateway signs the same value into an
+/// admission. Domain tag, canonical JSON, sorted thumbprints — all load-bearing.
 pub fn peer_roster_hash(revision: u64, thumbprints: &[String]) -> String {
-    let mut sorted: Vec<&str> = thumbprints.iter().map(String::as_str).collect();
-    sorted.sort_unstable();
-    let mut hasher = Sha256::new();
-    hasher.update(revision.to_string().as_bytes());
-    for t in sorted {
-        hasher.update(b"\n");
-        hasher.update(t.as_bytes());
-    }
-    URL_SAFE_NO_PAD.encode(hasher.finalize())
+    let mut sorted = thumbprints.to_vec();
+    sorted.sort();
+    let payload = serde_json::json!({
+        "approvedPeerKeyThumbprints": sorted,
+        "peerRosterRevision": revision,
+    });
+    let canonical = super::pairing::canonical_json_value(&payload)
+        .expect("a roster of strings and one integer is always canonicalizable");
+    let mut message = b"aokie/v2/peer-roster\0".to_vec();
+    message.extend_from_slice(&canonical);
+    URL_SAFE_NO_PAD.encode(Sha256::digest(message))
 }
 
 /// Identifiers that reach a filename, a log line, or a protocol frame.
@@ -905,6 +966,69 @@ mod tests {
         // …and the failed attempt must not have burned the challenge, or a
         // hostile frame would deny the real phone its one chance to answer.
         assert!(id.receive_response(&answer(&offer, &phone)).is_ok());
+    }
+
+    /// Emit a real bootstrap for the PLUGIN's decoder to verify.
+    ///
+    /// Ignored by default because it writes a file and proves nothing on its
+    /// own. Run it, then parse the output with
+    /// `aokie_plugin::companion_gateway::CompanionBootstrap::parse` — that
+    /// decoder recomputes the roster hash and refuses a mismatch, which is how
+    /// a divergence in `peer_roster_hash` is caught end to end rather than only
+    /// against the vectors above.
+    ///
+    ///   cargo test --lib dump_bootstrap_for_cross_check -- --ignored
+    #[test]
+    #[ignore]
+    fn dump_bootstrap_for_cross_check() {
+        let dir = Dir::new("bootstrap-dump");
+        let id = EndpointIdentity::open(dir.0.clone(), "aokie");
+        let offer = id.create_offer("app_a", None, "conn-1").unwrap();
+        let phone = SigningKey::from_bytes(&[21u8; 32]);
+        let pending = id.receive_response(&answer(&offer, &phone)).unwrap();
+        id.approve(&pending.id).unwrap();
+        let b = id.private_bootstrap(1).expect("a bootstrap once a device is approved");
+        std::fs::write(
+            std::env::temp_dir().join("oaiy-bootstrap.json"),
+            serde_json::to_string_pretty(&b).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn the_roster_hash_matches_the_v2_protocol_byte_for_byte() {
+        // Vectors produced by aokie-protocol's own peer_roster_hash. This is a
+        // CROSS-IMPLEMENTATION check, not a change detector: the plugin refuses
+        // a bootstrap whose hash it cannot reproduce, and the gateway signs the
+        // same value into an admission, so an OAIY-only derivation would fail
+        // at connect time with nothing pointing back here.
+        //
+        // An earlier version of this function hashed the revision and
+        // thumbprints newline-separated, and would have done exactly that.
+        for (revision, thumbprints, expected) in [
+            (0u64, vec![], "fGb5DK3ZHkoj_GOqfYsq1yCFhJPoqcSpF1j7nKb5jT8"),
+            (1, vec!["alpha"], "xyefRCrz0zy72_7NNrosaWgUxSvsHXaW8To0MF3L2LI"),
+            (7, vec!["b", "a"], "aIhQyqG1JxQPkllVN85_Gsc2dcUS72i3ZcCxk4dttNg"),
+            (
+                42,
+                vec!["zzz", "aaa", "mmm"],
+                "NTCkF0ojDLAJR38yF9DSpGTE4DYpohvraTsEmKsl89Y",
+            ),
+        ] {
+            let owned: Vec<String> = thumbprints.iter().map(|t| t.to_string()).collect();
+            assert_eq!(peer_roster_hash(revision, &owned), expected, "revision {revision}");
+        }
+    }
+
+    #[test]
+    fn the_roster_hash_ignores_the_order_it_is_given() {
+        // The roster is a SET. Two desktops holding the same devices must agree,
+        // whatever order their storage happened to yield.
+        let a: Vec<String> = ["m", "a", "z"].iter().map(|s| s.to_string()).collect();
+        let b: Vec<String> = ["z", "m", "a"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(peer_roster_hash(3, &a), peer_roster_hash(3, &b));
+        // …but the revision is part of it, or a stale view would look current.
+        assert_ne!(peer_roster_hash(3, &a), peer_roster_hash(4, &a));
     }
 
     #[test]
