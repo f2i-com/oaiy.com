@@ -373,6 +373,16 @@ async fn main() {
             bridge.host.clone(),
         ),
     );
+    // Answer the sealed chat turns the provider's web app relays. Without it
+    // the website cannot encrypt to this machine at all and says the desktop
+    // has published no key.
+    oaiy_desktop_lib::ai::tunnel::spawn(
+        link.clone(),
+        oaiy_desktop_lib::ai::tunnel::AiSources {
+            providers: ai_providers.clone(),
+            codex: ai_codex.clone(),
+        },
+    );
     bridge.host.set_companion_broker(oaiy_desktop_lib::plugins::CompanionBroker {
         companion: companion.clone(),
         upstream: companion_upstream.clone(),

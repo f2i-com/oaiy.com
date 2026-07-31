@@ -1,0 +1,63 @@
+{
+  "algorithm": "NaCl crypto_box — X25519 ECDH → HSalsa20 → XSalsa20-Poly1305 (tweetnacl box-compatible)",
+  "browser": {
+    "publicKey": "eaYx7t4b+cmPEgMs3q3Q56B5OY/HhriMyEbsia+FpRo=",
+    "secretKey": "QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl8="
+  },
+  "ciphertextLayout": "base64( 16-byte Poly1305 tag || ciphertext ) — the NaCl/tweetnacl layout",
+  "desktop": {
+    "publicKey": "2J47rXlDfb7Z+ENBgwT0YP8Fx/6B/kqVd6gEy5Nn/2Y=",
+    "secretKey": "EBESExQVFhcYGRobHB0eHyAhIiMkJSYnKCkqKywtLi8="
+  },
+  "nonceScheme": "24 bytes, base64: byte 0 = direction (0x00 browser→desktop, 0x01 desktop→browser); bytes 1..=23 = big-endian counter (bytes 1..16 zero, bytes 16..24 = counter as u64 BE). The request envelope uses counter 0; each subsequent frame in the same direction increments.",
+  "sessionScope": "one relayed request id; the peer ephemeral key is pinned at first contact and counters restart per request",
+  "vectors": [
+    {
+      "ciphertext": "Mie5PZqj0m8jBUy3tCnnHJg3Vxc8Kpb9sK/Yufmmnp6oNWoh3mmGBpzXp17kGWAvRUDRihT3cSMlo1td+y3p0j6VRmkOZMglodBvedFfqdR35Z6863DwQ6WucMKA8v80XZUYU3F3LURzXSKonKYg+wU/lOxtUdkLEoJ/DFnATTTw",
+      "counter": 0,
+      "direction": 0,
+      "envelope": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMie5PZqj0m8jBUy3tCnnHJg3Vxc8Kpb9sK/Yufmmnp6oNWoh3mmGBpzXp17kGWAvRUDRihT3cSMlo1td+y3p0j6VRmkOZMglodBvedFfqdR35Z6863DwQ6WucMKA8v80XZUYU3F3LURzXSKonKYg+wU/lOxtUdkLEoJ/DFnATTTw",
+      "name": "request-envelope",
+      "nonce": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "plaintext": "{\"v\":1,\"model\":\"test-model\",\"threadId\":\"thread-1\",\"messages\":[{\"role\":\"user\",\"content\":\"Say hi.\"}],\"clientSeq\":1}"
+    },
+    {
+      "ciphertext": "8cOZhHSHdcXJGkLRCVbwzqqkr5MbsAADLLSaK6tSk0cohXc3vLzn65sv9kPcSGFpMEuT71/+C5dMYb1J9fF4HNfNzj40/qQYi3fMcL1Z5PrH9HB+pl8GkdeSfhPlGfSvCA==",
+      "counter": 0,
+      "direction": 1,
+      "envelope": "AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA8cOZhHSHdcXJGkLRCVbwzqqkr5MbsAADLLSaK6tSk0cohXc3vLzn65sv9kPcSGFpMEuT71/+C5dMYb1J9fF4HNfNzj40/qQYi3fMcL1Z5PrH9HB+pl8GkdeSfhPlGfSvCA==",
+      "name": "delta-frame-0",
+      "nonce": "AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "plaintext": "{\"v\":1,\"kind\":\"delta\",\"delta\":{\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hi\"}}]}}"
+    },
+    {
+      "ciphertext": "QNMcdku7zRCYocolb+r5Of5FKtSEHfLszvJV0rgKsCicuOhn6tkn+fbsbNESH+qTZRSk0SWA23SsOEM74CWSWbC+dAaAca1v4ETVIdK/3LqnxSqZqSAMsV1BIVHMMysCt8mnQ0k=",
+      "counter": 1,
+      "direction": 1,
+      "envelope": "AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAABQNMcdku7zRCYocolb+r5Of5FKtSEHfLszvJV0rgKsCicuOhn6tkn+fbsbNESH+qTZRSk0SWA23SsOEM74CWSWbC+dAaAca1v4ETVIdK/3LqnxSqZqSAMsV1BIVHMMysCt8mnQ0k=",
+      "name": "delta-frame-1",
+      "nonce": "AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB",
+      "plaintext": "{\"v\":1,\"kind\":\"delta\",\"delta\":{\"choices\":[{\"index\":0,\"delta\":{\"content\":\" there\"}}]}}"
+    },
+    {
+      "ciphertext": "bL5tW9rFtQGsqwGqRLs5x/zpAZQ4bOJqP9IY2LIpDp70CDMdGwA=",
+      "counter": 2,
+      "direction": 1,
+      "envelope": "AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAACbL5tW9rFtQGsqwGqRLs5x/zpAZQ4bOJqP9IY2LIpDp70CDMdGwA=",
+      "name": "final-body",
+      "nonce": "AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAC",
+      "plaintext": "{\"v\":1,\"kind\":\"final\"}"
+    },
+    {
+      "ciphertext": "LW2Phs0Tn6l6Kprvjrl6cnCq/3c8oLPrrSheo65xG1IrlX4rQ6Maxu2tgx5Ei/P+uxHhuVw2",
+      "counter": 1,
+      "direction": 0,
+      "envelope": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABLW2Phs0Tn6l6Kprvjrl6cnCq/3c8oLPrrSheo65xG1IrlX4rQ6Maxu2tgx5Ei/P+uxHhuVw2",
+      "name": "input-frame",
+      "nonce": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB",
+      "plaintext": "{\"v\":1,\"kind\":\"input\",\"approved\":true}"
+    }
+  ],
+  "version": 1,
+  "wireEnvelope": "base64( nonce(24 bytes) || ciphertext ) — the single string the relay rows/routes carry; per-vector nonce+ciphertext fields are its components"
+}

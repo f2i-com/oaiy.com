@@ -462,22 +462,7 @@ impl CodexAgent {
     /// Models this account can use, in the OpenAI `{object:"list",data:[…]}` shape.
     pub fn models(&self) -> Result<Value, CodexError> {
         let v = self.with_session(|s| s.call("model/list", json!({}), RPC_TIMEOUT))?;
-        let items = v
-            .get("items")
-            .or_else(|| v.get("models"))
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        let data: Vec<Value> = items
-            .iter()
-            .filter_map(|m| {
-                m.get("id")
-                    .or_else(|| m.get("slug"))
-                    .and_then(Value::as_str)
-                    .map(|id| json!({ "id": id, "object": "model" }))
-            })
-            .collect();
-        Ok(json!({ "object": "list", "data": data }))
+        Ok(json!({ "object": "list", "data": model_catalog(&v) }))
     }
 
     /// Run one ephemeral turn and return an OpenAI-shaped chat completion.
@@ -518,15 +503,17 @@ impl CodexAgent {
                 params["model"] = Value::String(m.clone());
             }
             let thread = s.call("thread/start", params, RPC_TIMEOUT)?;
-            let thread_id = thread
-                .get("threadId")
-                .or_else(|| thread.get("id"))
-                .and_then(Value::as_str)
-                .ok_or_else(|| CodexError::Rpc("codex did not return a thread id".into()))?
-                .to_string();
+            let thread_id = thread_id_of(&thread)
+                .ok_or_else(|| CodexError::Rpc("codex did not return a thread id".into()))?;
 
             let from = s.notes_len();
-            let mut turn = json!({ "threadId": thread_id, "input": { "text": prompt } });
+            // `input` is a SEQUENCE of typed items, not one map. A map is
+            // refused with "invalid type: map, expected a sequence" — a runtime
+            // message with nothing in it naming this line.
+            let mut turn = json!({
+                "threadId": thread_id,
+                "input": [{ "type": "text", "text": prompt }],
+            });
             if let Some(a) = alias {
                 // Named on the TURN as well as the thread: the effort is a
                 // per-turn setting, and a thread-level model alone would leave
@@ -540,30 +527,19 @@ impl CodexAgent {
             s.call("turn/start", turn, TURN_TIMEOUT)?;
 
             // Collect the agent's message from the notification stream.
+            //
+            // The cursor ADVANCES. Re-reading from a fixed mark every 50 ms
+            // appended each delta once per polling round, so a two-word answer
+            // came back as "OAIYOAIY tunnel worksOAIY tunnel works." — plausible
+            // enough to read as the model repeating itself.
             let deadline = Instant::now() + TURN_TIMEOUT;
             let mut out = String::new();
             let mut done = false;
+            let mut cursor = from;
             while Instant::now() < deadline && !done {
-                for n in s.notes_since(from) {
-                    let method = n.get("method").and_then(Value::as_str).unwrap_or("");
-                    let p = n.get("params").unwrap_or(&Value::Null);
-                    match method {
-                        "item/agentMessage/delta" => {
-                            if let Some(d) = p.get("delta").and_then(Value::as_str) {
-                                out.push_str(d);
-                            }
-                        }
-                        "item/completed" => {
-                            if let Some(t) = p.pointer("/item/text").and_then(Value::as_str) {
-                                if out.is_empty() {
-                                    out.push_str(t);
-                                }
-                            }
-                        }
-                        "turn/completed" => done = true,
-                        _ => {}
-                    }
-                }
+                let batch = s.notes_since(cursor);
+                cursor += batch.len();
+                done = fold_turn_notes(&mut out, &batch);
                 if !done {
                     std::thread::sleep(Duration::from_millis(50));
                 }
@@ -593,6 +569,106 @@ impl CodexAgent {
 
 /// Collapse an OpenAI `messages` array into the single prompt a turn takes,
 /// keeping role labels so a system instruction still reads as one.
+/// The OpenAI-shaped `data` rows for a `model/list` result.
+///
+/// Two things this gets right that are easy to get wrong, and that both fail as
+/// an EMPTY dropdown rather than as an error:
+///
+/// - the page is at `data`. Reading `items`/`models` found nothing, so the
+///   catalogue came back empty from a call that succeeded.
+/// - the usable name is `model` (`gpt-5.5`), not the catalogue's own `id`. A
+///   client sends this string back as the model to run, and the catalogue id is
+///   not one Codex accepts.
+///
+/// Only the first page: `nextCursor` is not followed, so a very large account
+/// catalogue would be truncated rather than paged.
+fn model_catalog(result: &Value) -> Vec<Value> {
+    let entries = result
+        .get("data")
+        .or_else(|| result.get("items"))
+        .or_else(|| result.get("models"))
+        .and_then(Value::as_array);
+    let Some(entries) = entries else {
+        return Vec::new();
+    };
+    let mut seen = std::collections::HashSet::new();
+    entries
+        .iter()
+        .filter_map(|m| {
+            let id = m
+                .get("model")
+                .or_else(|| m.get("id"))
+                .or_else(|| m.get("slug"))
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty() && s.len() <= 256)?;
+            if !seen.insert(id.to_string()) {
+                return None;
+            }
+            let mut row = json!({ "id": id, "object": "model" });
+            if let Some(name) = m
+                .get("displayName")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+            {
+                row["displayName"] = json!(name);
+            }
+            Some(row)
+        })
+        .collect()
+}
+
+/// Fold one batch of turn notifications into the answer. Returns whether the
+/// turn finished.
+///
+/// Each note must be folded EXACTLY ONCE — the caller advances its cursor by
+/// the batch length for that reason. Folding an overlapping range appends every
+/// delta again, and the duplicate reads as the model repeating itself rather
+/// than as a cursor that never moved.
+fn fold_turn_notes(out: &mut String, notes: &[Value]) -> bool {
+    let mut done = false;
+    for n in notes {
+        let method = n.get("method").and_then(Value::as_str).unwrap_or("");
+        let p = n.get("params").unwrap_or(&Value::Null);
+        match method {
+            "item/agentMessage/delta" => {
+                if let Some(d) = p.get("delta").and_then(Value::as_str) {
+                    out.push_str(d);
+                }
+            }
+            // The whole message, for a runtime that sends no deltas. Only when
+            // nothing streamed, or it would be appended after the deltas that
+            // already spelled it out.
+            "item/completed" => {
+                if out.is_empty() {
+                    if let Some(t) = p.pointer("/item/text").and_then(Value::as_str) {
+                        out.push_str(t);
+                    }
+                }
+            }
+            "turn/completed" => done = true,
+            _ => {}
+        }
+    }
+    done
+}
+
+/// The thread id out of a `thread/start` result.
+///
+/// It arrives NESTED, as `{"thread": {"id": …}}`. Reading a flat `threadId`
+/// first was a real bug: the call SUCCEEDED, the id came back None, and every
+/// ChatGPT turn failed with "codex did not return a thread id" — which reads as
+/// a fault in Codex rather than in how its answer was parsed. The flat
+/// spellings are kept after it, as tolerance for another runtime version.
+fn thread_id_of(result: &Value) -> Option<String> {
+    result
+        .pointer("/thread/id")
+        .or_else(|| result.get("threadId"))
+        .or_else(|| result.get("id"))
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+}
+
 fn flatten_prompt(body: &Value) -> String {
     let Some(messages) = body.get("messages").and_then(Value::as_array) else {
         return String::new();
@@ -628,6 +704,125 @@ fn flatten_prompt(body: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_model_catalogue_is_read_from_the_page_codex_returns() {
+        // Live shape. Reading `items`/`models` found nothing, so the catalogue
+        // came back EMPTY from a call that succeeded — an empty dropdown with
+        // no error anywhere.
+        let real = json!({
+            "data": [
+                { "id": "cat-1", "model": "gpt-5.5", "displayName": "GPT-5.5", "isDefault": true },
+                { "id": "cat-2", "model": "gpt-5.6-luna", "displayName": "Luna" },
+                { "id": "cat-3", "model": "gpt-5.5" },
+                { "id": "legacy-shape" },
+                { "displayName": "nameless" },
+                {}
+            ],
+            "nextCursor": null,
+        });
+        let rows = model_catalog(&real);
+        // The usable name is `model`, not the catalogue's own id: a client
+        // sends this string back as the model to run.
+        assert_eq!(rows[0]["id"], "gpt-5.5");
+        assert_eq!(rows[0]["displayName"], "GPT-5.5");
+        assert_eq!(rows[1]["id"], "gpt-5.6-luna");
+        // `id` is the fallback for a runtime that names models differently…
+        assert_eq!(rows[2]["id"], "legacy-shape");
+        // …and an entry with no usable name at all is skipped, not blank.
+        assert_eq!(rows.len(), 3, "one duplicate and two nameless dropped: {rows:?}");
+        assert!(rows.iter().all(|r| r["id"].as_str().is_some_and(|s| !s.is_empty())));
+        // A body with no page at all is an empty catalogue, not a panic.
+        assert!(model_catalog(&json!({ "oops": true })).is_empty());
+    }
+
+    #[test]
+    fn a_streamed_answer_is_assembled_once_not_once_per_poll() {
+        // The bug this pins, seen live: the poll loop re-read the notification
+        // list from a FIXED mark every 50 ms, so "OAIY tunnel works." came back
+        // as "OAIYOAIY tunnel worksOAIY tunnel works." — which reads as the
+        // model repeating itself, not as a cursor that never advanced.
+        let delta = |t: &str| json!({ "method": "item/agentMessage/delta", "params": { "delta": t } });
+        let notes = vec![delta("OAIY"), delta(" tunnel"), delta(" works.")];
+
+        // Folded in batches, as the loop does, each note exactly once.
+        let mut out = String::new();
+        let mut cursor = 0usize;
+        let mut done = false;
+        while cursor < notes.len() {
+            let batch = &notes[cursor..(cursor + 2).min(notes.len())];
+            cursor += batch.len();
+            done = fold_turn_notes(&mut out, batch) || done;
+        }
+        assert_eq!(out, "OAIY tunnel works.");
+        assert!(!done, "no turn/completed arrived");
+
+        // …and the shape of the old bug: an overlapping range duplicates.
+        let mut doubled = String::new();
+        fold_turn_notes(&mut doubled, &notes);
+        fold_turn_notes(&mut doubled, &notes);
+        assert_eq!(doubled, "OAIY tunnel works.OAIY tunnel works.");
+    }
+
+    #[test]
+    fn a_runtime_that_sends_no_deltas_still_yields_the_message_once() {
+        let completed = json!({
+            "method": "item/completed",
+            "params": { "item": { "text": "the whole answer" } },
+        });
+        let mut out = String::new();
+        let done = fold_turn_notes(
+            &mut out,
+            &[completed.clone(), json!({ "method": "turn/completed" })],
+        );
+        assert_eq!(out, "the whole answer");
+        assert!(done);
+
+        // But it must NOT be appended after deltas that already spelled it out.
+        let mut streamed = String::from("the whole answer");
+        fold_turn_notes(&mut streamed, &[completed]);
+        assert_eq!(streamed, "the whole answer");
+    }
+
+    #[test]
+    fn a_turn_carries_its_prompt_as_a_sequence_of_typed_items() {
+        // Codex refuses a bare map with "invalid type: map, expected a
+        // sequence" — a runtime message that names nothing in this file. The
+        // shape is pinned here so a rewrite cannot quietly go back to a map.
+        let turn = json!({
+            "threadId": "t1",
+            "input": [{ "type": "text", "text": "hello" }],
+        });
+        let input = turn["input"].as_array().expect("input must be a sequence");
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["type"], "text");
+        assert_eq!(input[0]["text"], "hello");
+    }
+
+    #[test]
+    fn the_thread_id_is_read_from_where_codex_actually_puts_it() {
+        // The shape a live `thread/start` returns. Reading a flat `threadId`
+        // first made every ChatGPT turn fail with "codex did not return a
+        // thread id" — a message that blames Codex for a parsing mistake.
+        let real = json!({
+            "thread": { "id": "01996b2e-0000-7000-8000-0123456789ab" },
+            "cwd": "C:/Users/User/AppData/Roaming/com.oaiy/codex",
+            "approvalPolicy": "never",
+            "model": "gpt-5.5",
+            "runtimeWorkspaceRoots": [],
+        });
+        assert_eq!(
+            thread_id_of(&real).as_deref(),
+            Some("01996b2e-0000-7000-8000-0123456789ab")
+        );
+        // Tolerated alternatives, and the shapes that must yield nothing rather
+        // than a bogus id that then fails at turn/start instead.
+        assert_eq!(thread_id_of(&json!({ "threadId": "t1" })).as_deref(), Some("t1"));
+        assert_eq!(thread_id_of(&json!({ "id": "t2" })).as_deref(), Some("t2"));
+        assert!(thread_id_of(&json!({ "thread": { "id": "" } })).is_none());
+        assert!(thread_id_of(&json!({ "thread": {} })).is_none());
+        assert!(thread_id_of(&json!({})).is_none());
+    }
 
     #[test]
     fn only_https_openai_login_urls_are_accepted() {
