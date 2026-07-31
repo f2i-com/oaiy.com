@@ -172,6 +172,10 @@ describe('ConnectionsPanel · Linked account', () => {
     // Cancelling is not an error — it must not be dressed as one.
     expect(container.querySelector('[role="alert"]')).toBeNull();
     expect(container.textContent).toContain('Linking cancelled');
+    // Cancelling closes the loopback port the provider redirects to, so an
+    // approval page left open leads nowhere. Approving it yields a bare
+    // ERR_CONNECTION_REFUSED that reads as a broken app.
+    expect(container.textContent).toContain('close it');
   });
 
   it('does not describe the wait with mangled escape text', async () => {
