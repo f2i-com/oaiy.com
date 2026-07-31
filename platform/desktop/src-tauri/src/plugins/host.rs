@@ -275,7 +275,44 @@ impl PluginHost {
             });
         }
 
+        host.spawn_autostart();
         host
+    }
+
+    /// Start every plugin that should be running at boot.
+    ///
+    /// On its own thread, because starting is slow — a plugin that loads speech
+    /// models takes seconds, and boot must not wait for it. Without this a
+    /// plugin was only ever running if someone opened the app and clicked Start,
+    /// which for something like a phone bridge means it quietly answers nothing
+    /// until a human remembers it exists. `autostart_ids` already knew which
+    /// ones qualify (loadable, not user-disabled); nothing called it.
+    fn spawn_autostart(self: &Arc<Self>) {
+        let host = Arc::downgrade(self);
+        thread::spawn(move || {
+            let Some(host) = host.upgrade() else { return };
+            let ids = match host.registry.lock() {
+                Ok(mut reg) => {
+                    // The registry is populated lazily; without a scan a fresh
+                    // process has no plugins to autostart at all.
+                    reg.scan();
+                    reg.autostart_ids()
+                }
+                Err(_) => return,
+            };
+            for id in ids {
+                // Sequential: two plugins loading model weights at once on a
+                // laptop is worse than one after the other, and boot is not
+                // waiting on this thread anyway.
+                if let Err(e) = host.start(&id) {
+                    // Not fatal. The supervisor and the UI both surface plugin
+                    // state, and a plugin that will not start at boot will not
+                    // start on a click either — the reason is what matters, and
+                    // `start` has already recorded it on the record.
+                    eprintln!("[plugins] autostart {id}: {e}");
+                }
+            }
+        });
     }
 
     /// Start a plugin: spawn, handshake, mark `Running`.
@@ -1261,6 +1298,67 @@ mod tests {
         let run = &host.ledger.lock().unwrap().recent(1, &[])[0];
         assert_ne!(run.idempotency_key, "evt-1");
         assert!(run.idempotency_key.contains("evt-1"), "{}", run.idempotency_key);
+    }
+
+    #[test]
+    fn a_host_starts_its_autostart_plugins_without_anyone_clicking_start() {
+        // `autostart_ids()` existed, was tested, and had NO callers — so a
+        // plugin only ran if a human opened the app and pressed Start. For
+        // something like a phone bridge that means it quietly answers nothing
+        // until someone remembers it exists.
+        //
+        // The manifest here is valid but its entry command is a stub that
+        // cannot execute, so the start ATTEMPT is what we observe: the record
+        // leaves `Installed` on its own. If the `spawn_autostart()` call is ever
+        // removed, this stays `Installed` forever and the test fails.
+        let sb = Sandbox::new("autostart");
+        let plugins = sb.0.join("plugins");
+        let dir = plugins.join("probe");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("manifest.json"),
+            serde_json::to_string(&json!({
+                "schemaVersion": 3,
+                "id": "probe",
+                "name": "probe plugin",
+                "version": "0.1.0",
+                "pluginApiVersion": 1,
+                "entry": { "kind": "process", "command": "plugin.exe" },
+                "capabilities": ["flow.run"],
+                "connectors": [],
+                "events": []
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(dir.join("plugin.exe"), b"not a real executable").unwrap();
+
+        let host = PluginHost::new(
+            crate::plugins::registry::new_handle(plugins),
+            crate::bridge::ledger::new_handle(),
+            Arc::new(Mutex::new(TriggerStore::load(sb.0.join("triggers.json")))),
+            crate::bridge::deadletters::open_handle(sb.0.join("deadletters.jsonl")),
+            "0.0.0-test".into(),
+            true,
+        );
+
+        // Autostart runs on its own thread so boot is not blocked by it.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let moved = loop {
+            let state = host
+                .registry
+                .lock()
+                .ok()
+                .and_then(|r| r.get("probe").map(|rec| rec.state));
+            if matches!(state, Some(s) if s != PluginState::Installed) {
+                break true;
+            }
+            if std::time::Instant::now() > deadline {
+                break false;
+            }
+            thread::sleep(std::time::Duration::from_millis(100));
+        };
+        assert!(moved, "the host never attempted to start the plugin");
     }
 
     #[test]
