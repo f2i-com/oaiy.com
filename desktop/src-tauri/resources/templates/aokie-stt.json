@@ -1,0 +1,36 @@
+{
+  "id": "aokie-stt",
+  "name": "Aokie Speech-to-Text",
+  "description": "The Aokie receptionist's ears: streaming speech recognition for a live phone call, served locally over the OpenAI /v1/audio/transcriptions API. Installs the Parakeet ONNX weights (~663 MB), every file checksum-verified against the plugin's own manifest.",
+  "category": "Speech",
+  "defaultPort": 8781,
+  "install": {
+    "kind": "script",
+    "windows": "install-aokie-stt.ps1"
+  },
+  "installedMarker": "${modelsDir}/aokie/parakeet/.oaiy-installed",
+  "run": {
+    "command": "${dataDir}/plugins/aokie/aokie-voice-server.exe",
+    "args": [
+      "--mode",
+      "stt",
+      "--port",
+      "${port}",
+      "--stt-model-dir",
+      "${modelsDir}/aokie/parakeet"
+    ],
+    "env": {}
+  },
+  "health": {
+    "url": "http://127.0.0.1:${port}/v1/models",
+    "timeoutSecs": 120
+  },
+  "uninstall": {
+    "paths": [
+      "${modelsDir}/aokie/parakeet"
+    ]
+  },
+  "files": {
+    "install-aokie-stt.ps1": "# install-aokie-voice.ps1  <bundle>\n#\n# Installs ONE voice-model bundle for the Aokie plugin's local speech server.\n#\n# Driven entirely by the plugin's OWN models-manifest.json rather than a copy of\n# its URLs: the plugin ships that file, it pins an immutable HuggingFace\n# revision, and it carries a SHA-256 and a byte size for every file. Reading it\n# means this installer cannot drift out of step with the plugin it serves, and\n# that a plugin update which repoints a model needs no change here.\n#\n# Every file is verified before the bundle is promoted. These are ~800 MB of\n# ONNX weights that the receptionist loads into a live phone call; a truncated\n# or substituted encoder is not something to discover mid-conversation.\n$ErrorActionPreference = 'Stop'\n\n# Which bundle this service needs. The rest of this script is generic.\n$bundleName = 'parakeet'\n\n$dataDir     = $env:OAIY_DATA_DIR\n$modelsDir   = $env:OAIY_MODELS_DIR\nif (-not $dataDir)   { throw \"OAIY_DATA_DIR is not set\" }\nif (-not $modelsDir) { $modelsDir = Join-Path $dataDir 'models' }\n\n$manifestPath = Join-Path $dataDir 'plugins\\aokie\\models-manifest.json'\nif (-not (Test-Path $manifestPath)) {\n  throw \"the Aokie plugin is not installed ($manifestPath not found) - install the plugin first, then this service\"\n}\n\n$manifest = Get-Content $manifestPath -Raw | ConvertFrom-Json\n$bundle = $manifest.bundles | Where-Object { $_.name -eq $bundleName } | Select-Object -First 1\nif (-not $bundle) { throw \"no bundle '$bundleName' in the plugin's models-manifest.json\" }\n\n$dest    = Join-Path $modelsDir \"aokie\\$bundleName\"\n$staging = \"$dest.partial\"\nNew-Item -ItemType Directory -Force -Path $staging | Out-Null\n\n$total = ($bundle.files | Measure-Object -Property size -Sum).Sum\nWrite-Output \"installing $bundleName ($([math]::Round($total/1MB)) MB) - $($bundle.description)\"\nWrite-Output \"license: $($bundle.license)  $($bundle.licenseUrl)\"\n\nforeach ($f in $bundle.files) {\n  $target = Join-Path $staging $f.path\n  New-Item -ItemType Directory -Force -Path (Split-Path $target -Parent) | Out-Null\n\n  # Already here and correct? Re-running an install after a failure partway\n  # through should not re-download 650 MB it already has.\n  if (Test-Path $target) {\n    if ((Get-Item $target).Length -eq $f.size -and\n        (Get-FileHash $target -Algorithm SHA256).Hash.ToLower() -eq $f.sha256.ToLower()) {\n      Write-Output \"  ok (cached)  $($f.path)\"\n      continue\n    }\n    Remove-Item $target -Force\n  }\n\n  $prefix = if ($bundle.source.pathPrefix) { \"$($bundle.source.pathPrefix)/\" } else { \"\" }\n  $url = \"$($bundle.source.baseUrl)$prefix$($f.path)\"\n  Write-Output \"  downloading  $($f.path)  ($([math]::Round($f.size/1MB)) MB)\"\n\n  $tmp = \"$target.part\"\n  # Invoke-WebRequest's progress bar makes large downloads dramatically slower\n  # in a non-interactive host, and this output is piped to the service log.\n  $oldPref = $ProgressPreference\n  $ProgressPreference = 'SilentlyContinue'\n  try {\n    Invoke-WebRequest -Uri $url -OutFile $tmp -UseBasicParsing -MaximumRedirection 5\n  } finally {\n    $ProgressPreference = $oldPref\n  }\n\n  $len = (Get-Item $tmp).Length\n  if ($len -ne $f.size) {\n    Remove-Item $tmp -Force\n    throw \"$($f.path): expected $($f.size) bytes, got $len\"\n  }\n  $got = (Get-FileHash $tmp -Algorithm SHA256).Hash.ToLower()\n  if ($got -ne $f.sha256.ToLower()) {\n    Remove-Item $tmp -Force\n    throw \"$($f.path): checksum mismatch - expected $($f.sha256), got $got\"\n  }\n  Move-Item $tmp $target -Force\n  Write-Output \"  verified     $($f.path)\"\n}\n\n# Promote only once every file in the bundle has been verified, so a half\n# downloaded set is never visible under the name the server loads from.\nif (Test-Path $dest) { Remove-Item $dest -Recurse -Force }\nMove-Item $staging $dest -Force\n\nNew-Item -ItemType File -Force -Path (Join-Path $dest '.oaiy-installed') | Out-Null\nWrite-Output \"$bundleName installed to $dest\"\n"
+  }
+}
