@@ -34,6 +34,7 @@
 //! that quietly fails to appear is indistinguishable from one that was never
 //! installed, and the user's next move — reinstalling — does not help.
 
+pub mod definitions;
 pub mod host;
 pub mod install;
 pub mod manifest;

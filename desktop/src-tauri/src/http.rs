@@ -621,6 +621,10 @@ fn is_bridge_exec_path(path: &str) -> bool {
         // starting an already-reviewed plugin. A paired web page must never
         // reach either; only OAIY's own window or a token holder.
         || path == "/api/plugins/install"
+        // Invoking a plugin-contributed action IS a connector command with
+        // physical side effects (aokie.phone's call.dial places a real call), so
+        // it takes the same gate as the raw connector route.
+        || path.starts_with("/api/services/actions/")
         || (path.starts_with("/api/plugins/")
             && (path.ends_with("/start")
                 || path.ends_with("/stop")
@@ -662,6 +666,8 @@ fn is_restricted_read_path(path: &str) -> bool {
         // `capabilities` + `health` stay open (discovery); everything else under
         // these prefixes is gated to a non-remote origin.
         || path == "/api/plugins"
+        // Which plugins are installed and what they can do — same tier as /api/plugins.
+        || path == "/api/services/definitions"
         || path == "/api/bridge/events"
         || path == "/api/bridge/runs"
         || path == "/api/bridge/flows"

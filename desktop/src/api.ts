@@ -420,6 +420,37 @@ export const plugins = {
     request<void>(`/api/plugins/${encodeURIComponent(id)}`, { method: 'DELETE' }),
 };
 
+/** An invocable action surface a plugin contributes (`manifest.serviceDefinitions`). */
+export interface ServiceDefinitionAction {
+  id: string;
+  title?: string;
+  description?: string;
+  sideEffects?: string;
+  timeoutMs?: number;
+  transport: { kind: string; command?: string };
+  inputSchema?: unknown;
+}
+
+export interface ServiceDefinition {
+  id: string;
+  name: string;
+  version?: string;
+  description?: string;
+  category?: string;
+  actions: ServiceDefinitionAction[];
+  /** Which plugin contributed it — stamped by the host, not self-declared. */
+  pluginId: string;
+}
+
+export const serviceDefinitions = {
+  list: () => request<{ definitions: ServiceDefinition[] }>('/api/services/definitions'),
+  invoke: (definitionId: string, actionId: string, input?: unknown, idempotencyKey?: string) =>
+    request<{ ok: boolean; result?: unknown }>(
+      `/api/services/actions/${encodeURIComponent(definitionId)}/${encodeURIComponent(actionId)}/invoke`,
+      { method: 'POST', body: JSON.stringify({ input, idempotencyKey }) },
+    ),
+};
+
 // ----- bridge (connector commands + plugin events) -----
 
 /** What a plugin-contributed screen needs from the host to be useful. */
