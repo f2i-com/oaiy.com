@@ -272,6 +272,113 @@ mod tests {
         })
     }
 
+    /// A one-shot HTTP issuer. Small enough to be obviously correct, which
+    /// matters more here than generality: these tests are about what the broker
+    /// does with a reply, not about HTTP.
+    fn stub_issuer(reply: &'static str, status_line: &'static str) -> (String, std::sync::mpsc::Receiver<String>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let Ok((mut stream, _)) = listener.accept() else { return };
+            let mut raw = Vec::new();
+            let mut buf = [0u8; 4096];
+            // Read headers, then exactly the declared body length.
+            loop {
+                let Ok(n) = stream.read(&mut buf) else { return };
+                if n == 0 {
+                    break;
+                }
+                raw.extend_from_slice(&buf[..n]);
+                let text = String::from_utf8_lossy(&raw).to_string();
+                if let Some(head_end) = text.find("\r\n\r\n") {
+                    let len: usize = text
+                        .lines()
+                        .find_map(|l| {
+                            l.strip_prefix("content-length: ")
+                                .or_else(|| l.strip_prefix("Content-Length: "))
+                        })
+                        .and_then(|v| v.trim().parse().ok())
+                        .unwrap_or(0);
+                    if raw.len() >= head_end + 4 + len {
+                        break;
+                    }
+                }
+            }
+            let _ = tx.send(String::from_utf8_lossy(&raw).to_string());
+            let _ = write!(
+                stream,
+                "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                reply.len()
+            );
+            let _ = stream.flush();
+        });
+        (format!("http://127.0.0.1:{port}"), rx)
+    }
+
+    fn config(base: String) -> UpstreamConfig {
+        UpstreamConfig { base_url: base, token: "flk_secret".into(), app_id: None }
+    }
+
+    #[test]
+    fn an_honest_issuer_round_trips_and_the_bearer_is_presented() {
+        let reply = r#"{"accessToken":"aokie-adm-v2.aa.bb","gatewayUrl":"wss://relay.example/v2",
+            "endpointPublicKey":{"algorithm":"ed25519","publicKey":"pk","thumbprint":"tp"},
+            "holderKeyThumbprint":"tp","approvedPeerKeyThumbprints":["a","b"],
+            "peerRosterRevision":7,"peerRosterHash":"hash"}"#;
+        let (base, rx) = stub_issuer(reply, "200 OK");
+        let out = broker(&config(base), "app_1", "aokie", Some("Aokie Desktop"), &binding()).unwrap();
+        assert_eq!(out["accessToken"], "aokie-adm-v2.aa.bb");
+        assert_eq!(out["gatewayUrl"], "wss://relay.example/v2");
+
+        let request = rx.recv().unwrap();
+        assert!(request.starts_with("POST /aokie-companion/admission "), "{}", &request[..60]);
+        assert!(request.contains("flk_secret"), "the bearer must be presented");
+        // …and the desktop's private seed must not be anywhere in the request.
+        assert!(!request.contains("privateKey") && !request.contains("seed"), "{request}");
+    }
+
+    #[test]
+    fn an_issuer_that_widens_the_roster_is_refused_over_the_wire() {
+        // The end-to-end form of the check: even a 200 with a valid-looking
+        // token is thrown away, because the token would be signed over a roster
+        // containing a device this desktop never approved.
+        let reply = r#"{"accessToken":"aokie-adm-v2.aa.bb",
+            "endpointPublicKey":{"algorithm":"ed25519","publicKey":"pk","thumbprint":"tp"},
+            "holderKeyThumbprint":"tp","approvedPeerKeyThumbprints":["a","b","attacker"],
+            "peerRosterRevision":7,"peerRosterHash":"hash"}"#;
+        let (base, _rx) = stub_issuer(reply, "200 OK");
+        let err = broker(&config(base), "app_1", "aokie", None, &binding()).unwrap_err();
+        assert!(err.contains("approvedPeerKeyThumbprints"), "{err}");
+    }
+
+    #[test]
+    fn an_issuer_refusal_is_reported_with_its_own_reason() {
+        // The user has to be able to tell "not linked" from "unreachable" —
+        // they are different problems with different fixes.
+        let (base, _rx) = stub_issuer(r#"{"error":"this desktop is not linked"}"#, "403 Forbidden");
+        let err = broker(&config(base), "app_1", "aokie", None, &binding()).unwrap_err();
+        assert!(err.contains("403"), "{err}");
+        assert!(err.contains("not linked"), "the issuer's reason must survive: {err}");
+    }
+
+    #[test]
+    fn an_unreachable_issuer_says_so_rather_than_looking_like_a_refusal() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener); // nothing is listening now
+        let err = broker(
+            &config(format!("http://127.0.0.1:{port}")),
+            "app_1",
+            "aokie",
+            None,
+            &binding(),
+        )
+        .unwrap_err();
+        assert!(err.contains("could not be reached"), "{err}");
+    }
+
     #[test]
     fn the_request_carries_public_policy_and_no_secret() {
         let body = admission_request_body("app_1", "aokie", Some(" Aokie Desktop "), &binding()).unwrap();
