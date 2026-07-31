@@ -253,9 +253,14 @@ async fn clear_upstream(State(state): State<RouterState>) -> axum::response::Res
     (StatusCode::OK, Json(state.upstream.clear())).into_response()
 }
 
+/// State for the relay routes only.
+///
+/// Holds no [`CompanionHandle`] on purpose: the relay is per-MACHINE, not
+/// per-plugin — it is the user's account with a relay deployment, and two
+/// broker plugins reach the same one. Device trust stays per-plugin, which is
+/// what the `/:plugin/` routes carry.
 #[derive(Clone)]
 pub struct RouterState {
-    companion: CompanionHandle,
     upstream: UpstreamHandle,
 }
 
@@ -267,10 +272,7 @@ pub fn router(state: CompanionHandle, upstream: UpstreamHandle) -> Router {
                 .post(set_upstream)
                 .delete(clear_upstream),
         )
-        .with_state(RouterState {
-            companion: state.clone(),
-            upstream,
-        });
+        .with_state(RouterState { upstream });
     Router::new()
         .route("/api/companion/:plugin/pairing", get(status))
         .route("/api/companion/:plugin/pairing/offers", post(create_offer))
