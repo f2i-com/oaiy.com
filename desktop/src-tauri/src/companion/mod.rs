@@ -11,7 +11,12 @@
 //! the plugin's declared `companion.admission` capability.
 
 pub mod identity;
+pub mod pairing;
 
+pub use pairing::{
+    MobilePairingClaims, MobilePairingResponse, PairingPayload, OFFER_KIND, PAIRING_TTL_SECONDS,
+    RESPONSE_KIND, SCHEMA_VERSION,
+};
 pub use identity::{
     peer_roster_hash, ApprovedMobile, EndpointIdentity, EndpointIdentityHandle, EndpointPublicKey,
     IdentityStatus, KeyProtection, PendingMobileApproval,

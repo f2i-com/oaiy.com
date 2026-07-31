@@ -184,6 +184,16 @@ pub struct PendingMobileApproval {
     pub device_id: String,
     pub display_name: String,
     pub endpoint_key: EndpointPublicKey,
+    pub thumbprint: String,
+    /// The colon-grouped uppercase hex digest the OPERATOR compares against the
+    /// one shown on the phone before approving.
+    ///
+    /// A second rendering of the same key, and the whole security of the
+    /// ceremony rests on a human reading it: the relay is untrusted, so the
+    /// only thing distinguishing the intended phone from an attacker's is that
+    /// these two strings match. Hence the grouping — `AB:CD:EF…` is checkable
+    /// by eye in a way an unbroken 64-character run is not.
+    pub fingerprint: String,
     pub received_at: DateTime<Utc>,
 }
 
@@ -373,12 +383,37 @@ impl EndpointIdentity {
     }
 }
 
+/// The human-comparable rendering of a key: uppercase hex, colon-grouped in
+/// pairs of bytes.
+///
+/// Distinct from the thumbprint, which is a base64url hash used by machines.
+/// This one exists to be read aloud or compared on sight against a phone
+/// screen, which is the only step in the pairing ceremony an attacker on the
+/// relay cannot forge.
+pub fn display_fingerprint(key: &EndpointPublicKey) -> Result<String, String> {
+    use std::fmt::Write as _;
+    let bytes = key.verifying_key()?.to_bytes();
+    let digest = Sha256::digest(bytes);
+    let mut encoded = String::with_capacity(64 + 15);
+    for (index, byte) in digest.iter().enumerate() {
+        if index > 0 && index % 2 == 0 {
+            encoded.push(':');
+        }
+        let _ = write!(encoded, "{byte:02X}");
+    }
+    Ok(encoded)
+}
+
 /// The canonical thumbprint of a public key.
 ///
 /// The exact JWK spelling — members in `crv`, `kty`, `x` order, no whitespace —
 /// is what the mobile app hashes. It is reproduced literally rather than built
 /// with a JSON serialiser, because a serialiser is free to reorder keys and
 /// would silently produce a fingerprint no peer agrees with.
+pub fn thumbprint_for(public_key: &str) -> String {
+    endpoint_thumbprint(public_key)
+}
+
 fn endpoint_thumbprint(public_key: &str) -> String {
     let canonical = format!(
         "{{\"crv\":\"Ed25519\",\"kty\":\"OKP\",\"x\":{}}}",
@@ -469,6 +504,8 @@ mod tests {
             device_id: format!("dev-{id}"),
             display_name: "Test phone".into(),
             endpoint_key: key.clone(),
+            thumbprint: key.thumbprint.clone(),
+            fingerprint: display_fingerprint(key).unwrap(),
             received_at: Utc::now(),
         }
     }
