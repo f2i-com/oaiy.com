@@ -45,6 +45,8 @@ pub struct NodeRuntime {
     /// Logs + state of an in-flight install, so the UI can watch it.
     job: Mutex<Option<Arc<LogBuffer>>>,
     installing: Mutex<bool>,
+    /// Last probe result and when it was taken. See [`NodeRuntime::snapshot`].
+    probe_cache: Mutex<Option<(std::time::Instant, NodeSnapshot)>>,
 }
 
 pub type NodeHandle = Arc<NodeRuntime>;
@@ -54,6 +56,7 @@ pub fn new_handle(data_dir: PathBuf) -> NodeHandle {
         data_dir,
         job: Mutex::new(None),
         installing: Mutex::new(false),
+        probe_cache: Mutex::new(None),
     })
 }
 
@@ -117,8 +120,31 @@ impl NodeRuntime {
         portable_exe(&self.root()).or_else(system_exe)
     }
 
+    /// How long a probe result is reused. Node does not appear or change
+    /// version on its own; an install goes through [`Self::install`], which
+    /// clears the cache, so the only thing this delays is noticing a change
+    /// made outside the app.
+    const PROBE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
     pub fn snapshot(&self) -> NodeSnapshot {
         let installing = *self.installing.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Reuse a recent probe. Building this snapshot from scratch shells out
+        // twice (`where node`, then `node -v`), and the readiness endpoint that
+        // wants it is polled every few seconds by the UI — so the uncached
+        // version spawned ~30 processes a minute to render one badge. Worse,
+        // those spawns are blocking calls inside an async handler: when one
+        // stalls it holds a runtime worker, and enough of them stall the whole
+        // HTTP server rather than just this endpoint.
+        if let Ok(cache) = self.probe_cache.lock() {
+            if let Some((at, cached)) = cache.as_ref() {
+                if at.elapsed() < Self::PROBE_TTL {
+                    // `installing` is live state, not a probe result.
+                    return NodeSnapshot { installing, ..cached.clone() };
+                }
+            }
+        }
+
         let (path, source) = match portable_exe(&self.root()) {
             Some(p) => (Some(p), "portable"),
             None => match system_exe() {
@@ -126,13 +152,24 @@ impl NodeRuntime {
                 None => (None, "none"),
             },
         };
-        NodeSnapshot {
+        let snap = NodeSnapshot {
             available: path.is_some(),
             source,
             version: path.as_deref().and_then(probe_version),
             path: path.as_ref().map(|p| p.display().to_string()),
             installing,
             installs_version: NODE_VERSION,
+        };
+        if let Ok(mut cache) = self.probe_cache.lock() {
+            *cache = Some((std::time::Instant::now(), snap.clone()));
+        }
+        snap
+    }
+
+    /// Drop the cached probe so the next snapshot re-reads the world.
+    fn invalidate_probe(&self) {
+        if let Ok(mut cache) = self.probe_cache.lock() {
+            *cache = None;
         }
     }
 
@@ -145,6 +182,9 @@ impl NodeRuntime {
 
     /// Download + extract the pinned portable Node, on a background thread.
     pub fn install(self: &Arc<Self>) -> Result<(), String> {
+        // A finished install changes what a probe would find, so drop the
+        // cached answer rather than reporting the old one for another minute.
+        self.invalidate_probe();
         {
             let mut flag = self.installing.lock().unwrap_or_else(|e| e.into_inner());
             if *flag {
@@ -322,6 +362,38 @@ fn extract_zip_stripped(archive: &Path, dest: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_probe_is_cached_but_installing_stays_live() {
+        // `snapshot()` shells out twice (`where node`, then `node -v`) and the
+        // readiness endpoint that wants it is polled every few seconds, so the
+        // result is cached. The subtlety worth pinning: `installing` is LIVE
+        // state, not a probe result. Serving it from the cache would leave the
+        // UI's "Installing Node…" button stuck on its old value for a minute —
+        // right when the user is watching it.
+        let dir = std::env::temp_dir().join(format!("oaiy-node-cache-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let rt = new_handle(dir.clone());
+
+        let first = rt.snapshot();
+        // Served from cache: the probe result must not drift between calls.
+        let second = rt.snapshot();
+        assert_eq!(first.available, second.available);
+        assert_eq!(first.source, second.source);
+        assert_eq!(first.version, second.version);
+        assert_eq!(first.path, second.path);
+        assert!(!first.installing);
+
+        *rt.installing.lock().unwrap() = true;
+        let during = rt.snapshot();
+        assert!(during.installing, "installing must not be served stale from the cache");
+        // …and the cached probe half is still intact alongside it.
+        assert_eq!(during.source, first.source);
+        assert_eq!(during.path, first.path);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn the_platform_asset_is_a_real_nodejs_dist_url() {

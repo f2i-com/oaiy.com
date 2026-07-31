@@ -736,14 +736,55 @@ struct GpuInfo {
 /// that stall landed on the UI thread exactly as the Services panel rendered.
 #[tauri::command(async)]
 fn list_gpus() -> Vec<GpuInfo> {
-    let out = match std::process::Command::new(resolved_system_exe(
+    // Hard deadline. `nvidia-smi` is a third-party binary talking to a kernel
+    // driver, and it does not always come back: a busy GPU, a half-installed
+    // driver, or a hung one leaves it blocked indefinitely. This used to run
+    // synchronously in app setup, so a stuck probe meant the HTTP server never
+    // bound and OAIY opened as a dead window with no explanation — observed on
+    // this machine, and the reason the timeout exists rather than being a
+    // theoretical nicety.
+    //
+    // `stdin` is explicitly null: a child that inherits a console-less parent's
+    // stdin can block on a read that will never be answered.
+    const GPU_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+    let mut child = match std::process::Command::new(resolved_system_exe(
         "System32",
         "nvidia-smi.exe",
         "nvidia-smi",
     ))
     .args(["--query-gpu=index,name", "--format=csv,noheader,nounits"])
-    .output()
+    .stdin(std::process::Stdio::null())
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::null())
+    .spawn()
     {
+        Ok(c) => c,
+        // No NVIDIA tooling on this box: not an error, just no GPUs to list.
+        Err(_) => return Vec::new(),
+    };
+
+    let deadline = std::time::Instant::now() + GPU_PROBE_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            Ok(None) => {
+                // Wedged. Kill it and report no GPUs — a missing GPU list
+                // degrades one picker; a blocked probe used to take the whole
+                // app down with it.
+                let _ = child.kill();
+                let _ = child.wait();
+                log::warn!("nvidia-smi did not respond within {GPU_PROBE_TIMEOUT:?}; treating this machine as having no NVIDIA GPUs");
+                return Vec::new();
+            }
+            Err(_) => return Vec::new(),
+        }
+    }
+
+    let out = match child.wait_with_output() {
         Ok(o) if o.status.success() => o,
         _ => return Vec::new(),
     };
@@ -1090,22 +1131,7 @@ pub fn run() {
                 // CUDA would see ZERO devices (silent CPU fallback / hard crash). Only prune
                 // when enumeration actually succeeds, so a transient nvidia-smi hiccup can't
                 // wipe valid pins.
-                let mut gpus = read_service_gpus(app.handle());
-                let available = list_gpus();
-                if !available.is_empty() {
-                    let valid: std::collections::HashSet<u32> =
-                        available.iter().map(|g| g.index).collect();
-                    let before = gpus.len();
-                    gpus.retain(|_, idx| valid.contains(idx));
-                    if gpus.len() != before {
-                        log::warn!(
-                            "dropped {} GPU pin(s) for device(s) no longer present",
-                            before - gpus.len()
-                        );
-                        let _ = write_service_gpus(app.handle(), &gpus);
-                    }
-                }
-                r.set_service_gpus(gpus);
+                r.set_service_gpus(read_service_gpus(app.handle()));
                 // Backfill install-completion markers for venv services installed before the
                 // marker existed, so they don't suddenly read as not-installed.
                 r.backfill_install_markers();
@@ -1114,6 +1140,44 @@ pub fn run() {
             // registry's data dir so all four share `${dataDir}`
             // consistently. All are Tauri-managed so any future Tauri
             // command can reach them alongside the HTTP layer.
+            // Prune GPU pins on a background thread. This used to run inline,
+            // and `list_gpus` shells out to nvidia-smi — a third-party binary
+            // talking to a kernel driver, which on a busy or half-broken driver
+            // simply does not return. Setup then never finished, so the HTTP
+            // server never bound and OAIY opened as a window where nothing
+            // worked and nothing said why. Observed here; hence both this and
+            // the timeout inside `list_gpus`.
+            //
+            // Nothing needs the result promptly: a stale pin only matters at the
+            // next service start, which is a human action seconds away at best.
+            {
+                let registry_for_gpus = registry.clone();
+                let app_for_gpus = app.handle().clone();
+                std::thread::spawn(move || {
+                    let available = list_gpus();
+                    // Only prune when enumeration actually SUCCEEDED, so a
+                    // transient nvidia-smi failure cannot wipe valid pins.
+                    if available.is_empty() {
+                        return;
+                    }
+                    let valid: std::collections::HashSet<u32> =
+                        available.iter().map(|g| g.index).collect();
+                    let mut gpus = read_service_gpus(&app_for_gpus);
+                    let before = gpus.len();
+                    gpus.retain(|_, idx| valid.contains(idx));
+                    if gpus.len() != before {
+                        log::warn!(
+                            "dropped {} GPU pin(s) for device(s) no longer present",
+                            before - gpus.len()
+                        );
+                        let _ = write_service_gpus(&app_for_gpus, &gpus);
+                    }
+                    if let Ok(mut r) = registry_for_gpus.lock() {
+                        r.set_service_gpus(gpus);
+                    }
+                });
+            }
+
             let downloads: DownloadsHandle = Downloads::new(models_dir.clone()).into_handle();
             // Load the saved HuggingFace token (if any) so gated downloads
             // work from the first launch without re-entering it.
