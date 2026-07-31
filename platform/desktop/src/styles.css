@@ -743,6 +743,18 @@ code {
 }
 .speed { color: var(--cyan); font-weight: 600; }
 .warn { color: var(--amber); }
+.pairing-origin {
+  display: inline-block;
+  margin-left: 7px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--surface-soft);
+  padding: 0 5px;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--faint);
+}
+
 /* Used for the download checksum readout — stated only when actually true. */
 .ok { color: var(--green); }
 

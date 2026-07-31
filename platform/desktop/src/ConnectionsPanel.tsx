@@ -145,11 +145,17 @@ export default function ConnectionsPanel() {
                 <span>
                   <ShieldCheck size={13} aria-hidden /> {app.label ?? app.product}{' '}
                   <span style={{ opacity: 0.55 }}>({app.product})</span>
+                  {/* The name and product are whatever the consumer called
+                      itself; the origin is the only part that says which site
+                      this actually is — which is what a revoke decision needs. */}
+                  {app.origin && <code className="pairing-origin">{app.origin}</code>}
                 </span>
                 <button
                   className="btn-tiny btn-danger"
                   disabled={busy.has(app.id)}
-                  aria-label={`Revoke access for ${app.label ?? app.product}`}
+                  aria-label={`Revoke access for ${app.label ?? app.product}${
+                    app.origin ? ` at ${app.origin}` : ''
+                  }`}
                   onClick={() => revoke(app)}
                 >
                   Revoke

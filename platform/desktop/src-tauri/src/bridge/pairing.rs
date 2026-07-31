@@ -87,6 +87,14 @@ pub struct PairedToken {
     pub id: String,
     pub product: String,
     pub label: Option<String>,
+    /// The browser origin this token was granted TO, captured from the request
+    /// the user actually approved. Kept because `product` and `label` are both
+    /// supplied by the consumer and neither is unique: two different sites can
+    /// each call themselves "formlogic", and without the origin a user
+    /// reviewing granted access cannot tell which one they are revoking.
+    /// `None` for a native caller, which sends no Origin.
+    #[serde(default)]
+    pub origin: Option<String>,
     pub created_at_ms: u64,
     /// The secret bearer value.
     pub secret: String,
@@ -99,6 +107,7 @@ pub struct PairedTokenPublic {
     pub id: String,
     pub product: String,
     pub label: Option<String>,
+    pub origin: Option<String>,
     pub created_at_ms: u64,
 }
 
@@ -108,6 +117,7 @@ impl PairedToken {
             id: self.id.clone(),
             product: self.product.clone(),
             label: self.label.clone(),
+            origin: self.origin.clone(),
             created_at_ms: self.created_at_ms,
         }
     }
@@ -197,6 +207,7 @@ impl PairingManager {
             id: format!("tok_{}", token_hex(8)),
             product: req.product.clone(),
             label: req.label.clone(),
+            origin: req.origin.clone(),
             created_at_ms: now_ms(),
             secret: secret.clone(),
         };
@@ -377,6 +388,34 @@ mod tests {
     }
 
     #[test]
+    fn a_granted_token_remembers_which_origin_it_was_granted_to() {
+        // `product` and `label` both come from the consumer and neither is
+        // unique — two different sites can each call themselves "formlogic".
+        // The prompt showed the user an origin; if the grant forgets it, the
+        // Connections list cannot tell them apart and a user revoking access
+        // is guessing which one they are cutting off.
+        let mut m = PairingManager::new();
+        let a = m.request("formlogic", Some("FormLogic Web".into()), Some("http://formlogic.local".into()));
+        let b = m.request("formlogic", Some("FormLogic Web".into()), Some("https://evil.example".into()));
+        m.approve(&a.pairing_id).unwrap();
+        m.approve(&b.pairing_id).unwrap();
+
+        let origins: Vec<Option<String>> = m.paired().iter().map(|t| t.origin.clone()).collect();
+        assert!(origins.contains(&Some("http://formlogic.local".into())));
+        assert!(origins.contains(&Some("https://evil.example".into())));
+    }
+
+    #[test]
+    fn a_native_caller_pairs_with_no_origin_rather_than_a_fake_one() {
+        // A CLI sends no Origin. Recording a placeholder would be worse than
+        // recording nothing — it would look like a site.
+        let mut m = PairingManager::new();
+        let req = m.request("oaiy-cli", None, None);
+        m.approve(&req.pairing_id).unwrap();
+        assert_eq!(m.paired()[0].origin, None);
+    }
+
+    #[test]
     fn the_pending_list_never_leaks_a_token() {
         let mut m = PairingManager::new();
         let req = m.request("formlogic", None, None);
@@ -456,7 +495,9 @@ mod tests {
         let token;
         {
             let mut m = PairingManager::open(path.clone());
-            let id = m.request("formlogic", Some("Acme".into()), None).pairing_id;
+            let id = m
+                .request("formlogic", Some("Acme".into()), Some("http://formlogic.local".into()))
+                .pairing_id;
             token = m.approve(&id).unwrap().token.unwrap();
         }
         // A fresh manager on the same file still honours the token — a paired
@@ -465,6 +506,7 @@ mod tests {
         assert!(m2.is_valid_token(&token), "the granted token survived the reopen");
         assert_eq!(m2.paired().len(), 1);
         assert_eq!(m2.paired()[0].product, "formlogic");
+        assert_eq!(m2.paired()[0].origin.as_deref(), Some("http://formlogic.local"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
