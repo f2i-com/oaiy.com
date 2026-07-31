@@ -1,6 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { TriangleAlert } from 'lucide-react';
-import { API_BASE, bridge, plugins, type PluginRecord } from './api';
+import {
+  API_BASE,
+  bridge,
+  companion,
+  plugins,
+  type CompanionOfferRequest,
+  type PluginRecord,
+} from './api';
 import { useToast } from './Toasts';
 
 /**
@@ -87,14 +94,22 @@ const HOST_BOOTSTRAP = `
       issue: function (grant) { return call('command', ['consent.set', grant]); },
       revoke: function () { return call('command', ['consent.revoke']); }
     },
-    // No OAIY equivalent and no backing plugin commands: reject by name so the
-    // tab shows its own honest error instead of hanging on a promise that never
-    // settles, or calling through undefined.
+    // Companion device trust. Served by the host, not by the plugin: the
+    // desktop's endpoint key is the thing a phone authenticates AGAINST, so it
+    // must not live in the process the phone is talking to.
+    //
+    // All SEVEN methods are defined, including the three the screen only calls
+    // from a confirm step. A missing one throws synchronously inside a handler
+    // that has already set busy = true and cannot clear it, which leaves every
+    // button on the tab disabled until reload.
     companionPairing: {
-      status: function () { return Promise.reject(new Error('companion pairing is not supported by OAIY Desktop')); },
-      createOffer: function () { return Promise.reject(new Error('companion pairing is not supported by OAIY Desktop')); },
-      receiveResponse: function () { return Promise.reject(new Error('companion pairing is not supported by OAIY Desktop')); },
-      approve: function () { return Promise.reject(new Error('companion pairing is not supported by OAIY Desktop')); }
+      status: function () { return call('companion.status', []); },
+      createOffer: function (body) { return call('companion.createOffer', [body]); },
+      receiveResponse: function (response) { return call('companion.receiveResponse', [response]); },
+      approve: function (id) { return call('companion.approve', [id]); },
+      deny: function (id) { return call('companion.deny', [id]); },
+      revoke: function (thumbprint) { return call('companion.revoke', [thumbprint]); },
+      rotateDesktopKey: function () { return call('companion.rotate', []); }
     }
   };
 })();
@@ -216,6 +231,27 @@ export default function PluginScreenPage({ pluginId, navId }: Props) {
           await plugins.stop(pluginId).catch(() => {});
           await plugins.start(pluginId);
           return true;
+        // Companion trust. The screen never names a plugin: it gets its OWN id
+        // from the host, so a screen cannot administer another plugin's phones
+        // by asking nicely.
+        case 'companion.status':
+          return await companion.status(pluginId);
+        case 'companion.createOffer':
+          return await companion.createOffer(pluginId, (args[0] ?? {}) as CompanionOfferRequest);
+        case 'companion.receiveResponse':
+          return await companion.receiveResponse(pluginId, args[0]);
+        case 'companion.approve':
+          return await companion.approve(pluginId, String(args[0] ?? ''));
+        case 'companion.deny':
+          // The DELETE/deny routes answer 204, so there is no body to hand
+          // back; the screen only awaits completion and then refreshes.
+          await companion.deny(pluginId, String(args[0] ?? ''));
+          return true;
+        case 'companion.revoke':
+          await companion.revoke(pluginId, String(args[0] ?? ''));
+          return true;
+        case 'companion.rotate':
+          return await companion.rotate(pluginId);
         case 'subscribe': {
           const [names] = args as [string[]];
           subscribed.current = Array.isArray(names) ? names : [];
