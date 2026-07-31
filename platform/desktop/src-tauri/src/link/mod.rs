@@ -14,6 +14,7 @@
 //! This is an account link — outbound, one per machine.
 
 pub mod descriptor;
+pub mod heartbeat;
 pub mod oauth;
 pub mod routes;
 
@@ -41,6 +42,13 @@ pub struct LinkedAccount {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub granted_scopes: Option<String>,
     pub linked_at: chrono::DateTime<chrono::Utc>,
+    /// Stable id for THIS install, sent with every heartbeat.
+    ///
+    /// Optional so a link stored before heartbeats existed still loads; one is
+    /// minted on first use. Persisted because a changing id reads as a new
+    /// desktop each launch and leaves ghost rows behind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_id: Option<String>,
 }
 
 /// Where a link attempt has got to.
@@ -80,6 +88,13 @@ pub struct LinkStatus {
     pub granted_scopes: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub linked_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// When the provider was last told this desktop is here, and why the last
+    /// attempt failed if it did. A link that looks fine but shows offline at the
+    /// provider is otherwise unexplainable from this side.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_heartbeat_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub heartbeat_error: Option<String>,
     /// The in-flight attempt, if any.
     pub attempt: LinkPhase,
     /// Every provider this build can link to.
@@ -110,6 +125,8 @@ struct Inner {
     /// Raised to stop the current attempt. A fresh flag PER ATTEMPT, so a
     /// cancel can never carry over and kill the next one.
     cancel: Arc<AtomicBool>,
+    last_heartbeat_at: Option<chrono::DateTime<chrono::Utc>>,
+    heartbeat_error: Option<String>,
 }
 
 pub struct LinkStore {
@@ -125,7 +142,7 @@ pub fn open_handle(data_dir: PathBuf) -> LinkHandle {
     let account = std::fs::read_to_string(&path)
         .ok()
         .and_then(|raw| serde_json::from_str::<LinkedAccount>(&raw).ok());
-    Arc::new(LinkStore {
+    let store = Arc::new(LinkStore {
         path,
         data_dir,
         inner: Mutex::new(Inner {
@@ -133,8 +150,14 @@ pub fn open_handle(data_dir: PathBuf) -> LinkHandle {
             attempt: LinkPhase::Idle,
             in_flight: false,
             cancel: Arc::new(AtomicBool::new(false)),
+            last_heartbeat_at: None,
+            heartbeat_error: None,
         }),
-    })
+    });
+    // One worker for the process lifetime. It asks the store what to do each
+    // tick, so linking and unlinking need not start or stop anything.
+    heartbeat::spawn(store.clone());
+    store
 }
 
 impl LinkStore {
@@ -165,6 +188,8 @@ impl LinkStore {
                 account_id: None,
                 granted_scopes: None,
                 linked_at: None,
+                last_heartbeat_at: None,
+                heartbeat_error: None,
                 attempt: inner.attempt.clone(),
                 available,
             },
@@ -180,10 +205,60 @@ impl LinkStore {
                 account_id: a.account_id.clone(),
                 granted_scopes: a.granted_scopes.clone(),
                 linked_at: Some(a.linked_at),
+                last_heartbeat_at: inner.last_heartbeat_at,
+                heartbeat_error: inner.heartbeat_error.clone(),
                 attempt: inner.attempt.clone(),
                 available,
             },
         }
+    }
+
+    pub fn data_dir(&self) -> &std::path::Path {
+        &self.data_dir
+    }
+
+    /// This install's stable id, minted and persisted on first use.
+    ///
+    /// Lazily rather than at link time so a link stored before heartbeats
+    /// existed gets one too, instead of beating with an empty id the provider
+    /// would reject.
+    pub fn instance_id(&self) -> String {
+        {
+            let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(id) = inner.account.as_ref().and_then(|a| a.instance_id.clone()) {
+                return id;
+            }
+        }
+        let minted = heartbeat::new_instance_id();
+        let to_save = {
+            let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            match inner.account.as_mut() {
+                // Another caller may have won the race; keep theirs so the id
+                // stays stable.
+                Some(a) => {
+                    let id = a.instance_id.get_or_insert(minted).clone();
+                    a.instance_id = Some(id.clone());
+                    Some((a.clone(), id))
+                }
+                None => None,
+            }
+        };
+        match to_save {
+            Some((account, id)) => {
+                let _ = self.persist(&account);
+                id
+            }
+            None => heartbeat::new_instance_id(),
+        }
+    }
+
+    /// Record the outcome of a heartbeat.
+    pub fn note_heartbeat(&self, error: Option<String>) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if error.is_none() {
+            inner.last_heartbeat_at = Some(chrono::Utc::now());
+        }
+        inner.heartbeat_error = error;
     }
 
     /// The stored credential, for whoever needs to call the provider.
@@ -215,6 +290,8 @@ impl LinkStore {
             let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             inner.account = None;
             inner.attempt = LinkPhase::Idle;
+            inner.last_heartbeat_at = None;
+            inner.heartbeat_error = None;
         }
         self.status()
     }
@@ -395,6 +472,7 @@ pub fn start_link(
                 account_name: creds.account_name,
                 granted_scopes: creds.granted_scopes,
                 linked_at: chrono::Utc::now(),
+                instance_id: Some(heartbeat::new_instance_id()),
             })
         })();
 
@@ -439,6 +517,7 @@ mod tests {
             account_name: Some("Reception PC".into()),
             granted_scopes: Some("flows:read flows:write".into()),
             linked_at: chrono::Utc::now(),
+            instance_id: None,
         }
     }
 
@@ -457,6 +536,80 @@ mod tests {
         assert!(!raw.contains("flk_supersecret"), "{raw}");
         assert!(!raw.contains("credential"), "{raw}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_instance_id_is_minted_once_and_then_kept() {
+        // A changing id reads as a NEW desktop on every launch, so the provider
+        // accumulates ghost rows and ambiguity checks start refusing to route.
+        let (dir, s) = store("instance");
+        let mut a = account();
+        a.instance_id = None;
+        s.persist(&a).unwrap();
+        s.inner.lock().unwrap().account = Some(a);
+
+        let first = s.instance_id();
+        assert!(first.starts_with("oaiy-"), "{first}");
+        assert_eq!(s.instance_id(), first, "the same id within a session");
+        // …and across a restart, which is the half that matters.
+        assert_eq!(open_handle(dir.clone()).instance_id(), first);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_link_stored_before_heartbeats_existed_still_loads() {
+        // The stored file has no instanceId field. deny_unknown_fields makes
+        // the reverse fatal, so this is the direction worth pinning.
+        let (dir, s) = store("legacy");
+        let legacy = serde_json::json!({
+            "connectorId": "formlogic",
+            "baseUrl": "https://formlogic.com",
+            "credential": "flk_old",
+            "linkedAt": chrono::Utc::now(),
+        });
+        std::fs::create_dir_all(dir.join("link")).unwrap();
+        std::fs::write(dir.join("link").join("account.json"), legacy.to_string()).unwrap();
+
+        let reopened = open_handle(dir.clone());
+        let a = reopened.account().expect("a pre-heartbeat link must still load");
+        assert_eq!(a.credential, "flk_old");
+        assert!(a.instance_id.is_none());
+        assert!(reopened.instance_id().starts_with("oaiy-"), "one is minted on demand");
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_status_reports_why_a_heartbeat_failed() {
+        // A link that looks fine but shows offline at the provider is otherwise
+        // unexplainable from this side — which is exactly the "No Desktop"
+        // confusion this whole mechanism exists to prevent.
+        let (dir, s) = store("hb-status");
+        s.persist(&account()).unwrap();
+        s.inner.lock().unwrap().account = Some(account());
+
+        s.note_heartbeat(Some("the provider no longer accepts this desktop's key".into()));
+        let status = s.status();
+        assert!(status.linked);
+        assert!(status.last_heartbeat_at.is_none());
+        assert!(status.heartbeat_error.unwrap().contains("no longer accepts"));
+
+        s.note_heartbeat(None);
+        let ok = s.status();
+        assert!(ok.last_heartbeat_at.is_some());
+        assert!(ok.heartbeat_error.is_none(), "success must clear the error");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_builtin_connector_beats_inside_the_providers_presence_window() {
+        // FormLogic marks a desktop offline after 90s without contact. An
+        // interval at or above that would leave it flickering offline no matter
+        // how healthy the link is.
+        let d = descriptor::find(std::path::Path::new("/nonexistent"), "formlogic").unwrap();
+        let h = d.heartbeat.expect("the connector must declare a heartbeat");
+        assert!(h.interval_seconds <= 45, "got {}", h.interval_seconds);
+        assert_eq!(h.instance_id_field, "desktopInstanceId");
     }
 
     #[test]

@@ -232,6 +232,37 @@ describe('ConnectionsPanel · Linked account', () => {
     expect(container.textContent).toContain('data:read');
   });
 
+  it('says when the desktop last checked in with the provider', async () => {
+    // Presence is judged by the provider from how recently we spoke, so this is
+    // the one number that explains a link looking fine here and offline there.
+    linkStatusMock.mockResolvedValue({
+      linked: true,
+      connectorName: 'Acme Cloud',
+      baseUrl: 'https://acme.example',
+      lastHeartbeatAt: '2026-07-31T13:14:57Z',
+      attempt: { phase: 'linked' },
+      available: [CONNECTOR],
+    });
+    await mount();
+    expect(container.textContent).toContain('Checked in');
+  });
+
+  it('explains a failing check-in rather than just looking healthy', async () => {
+    // The exact confusion this fixes: the panel said "linked" while the
+    // provider showed "No Desktop", with nothing connecting the two.
+    linkStatusMock.mockResolvedValue({
+      linked: true,
+      connectorName: 'Acme Cloud',
+      baseUrl: 'https://acme.example',
+      heartbeatError: 'the provider no longer accepts this desktop’s key — link again',
+      attempt: { phase: 'linked' },
+      available: [CONNECTOR],
+    });
+    await mount();
+    expect(container.textContent).toContain('Not checking in');
+    expect(container.textContent).toContain('link again');
+  });
+
   it('warns that disconnecting is local-only before unlinking', async () => {
     // Telling the user the key is dead when it still works at the provider
     // would be worse than saying nothing.

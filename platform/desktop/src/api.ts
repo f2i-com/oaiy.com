@@ -553,6 +553,10 @@ export interface LinkStatus {
   accountId?: string;
   grantedScopes?: string;
   linkedAt?: string;
+  /** When the provider was last told this desktop is here. */
+  lastHeartbeatAt?: string;
+  /** Why the last heartbeat failed, if it did. */
+  heartbeatError?: string;
   attempt: LinkPhase;
   /** Every provider this build can link to — the UI hardcodes no list. */
   available: LinkConnector[];

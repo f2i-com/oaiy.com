@@ -392,6 +392,23 @@ export default function ConnectionsPanel() {
                     {account.grantedScopes}
                   </small>
                 )}
+                {/* Providers judge whether a desktop is reachable from how
+                    recently it last checked in. Without this, a link that looks
+                    perfect here can read as offline there with nothing on this
+                    screen explaining the difference. */}
+                {account.heartbeatError ? (
+                  <small style={{ display: 'block', marginTop: 3, color: 'var(--danger)' }}>
+                    Not checking in: {account.heartbeatError}
+                  </small>
+                ) : account.lastHeartbeatAt ? (
+                  <small style={{ display: 'block', opacity: 0.6, marginTop: 3 }}>
+                    Checked in {new Date(account.lastHeartbeatAt).toLocaleTimeString()}
+                  </small>
+                ) : (
+                  <small style={{ display: 'block', opacity: 0.6, marginTop: 3 }}>
+                    Waiting for the first check-in…
+                  </small>
+                )}
               </span>
               <button className="btn-tiny btn-danger" onClick={() => void unlink()}>
                 Disconnect
