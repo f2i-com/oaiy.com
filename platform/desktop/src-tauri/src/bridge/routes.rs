@@ -535,6 +535,51 @@ struct ConnectorBody {
     idempotency_key: Option<String>,
 }
 
+/// Map a connector-forwarding failure onto the bridge error taxonomy.
+///
+/// Shared by the raw connector route and the service-action route so the two
+/// cannot drift — a plugin failure must read identically however it was reached.
+fn forward_error_response(e: ForwardError) -> axum::response::Response {
+    match e {
+        ForwardError::Refused(refusal) => {
+            let status = match refusal.code() {
+                "capability_denied" => StatusCode::FORBIDDEN,
+                "invalid_request" => StatusCode::BAD_REQUEST,
+                _ => StatusCode::SERVICE_UNAVAILABLE,
+            };
+            bridge_error(status, refusal.code(), refusal.message())
+        }
+        ForwardError::NotRunning { plugin_id } => bridge_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "capability_unavailable",
+            format!(
+                "The {plugin_id} plugin stopped between the gate check and the call.                  Start it in OAIY Desktop → Plugins."
+            ),
+        ),
+        ForwardError::Call(CallError::Timeout { method, waited }) => bridge_error(
+            StatusCode::GATEWAY_TIMEOUT,
+            "timeout",
+            format!("the plugin did not answer {method} within {:.0}s", waited.as_secs_f32()),
+        ),
+        ForwardError::Call(CallError::Plugin { message, typed, .. }) => {
+            // The plugin's typed code passes through only if it is IN the closed
+            // taxonomy. A plugin is untrusted, and `error.code` is the field a
+            // consumer branches on — echoing an arbitrary string lets a plugin
+            // emit `capability_denied` (a verdict the host never made) or a code
+            // outside the enum. Anything unrecognised becomes node_failed.
+            let code = match typed.as_deref() {
+                Some(t) if is_taxonomy_code(t) => t,
+                _ => "node_failed",
+            };
+            bridge_error(StatusCode::BAD_GATEWAY, code, message)
+        }
+        ForwardError::Call(e) => {
+            bridge_error(StatusCode::BAD_GATEWAY, "runtime_unavailable", e.to_string())
+        }
+        ForwardError::Internal(m) => bridge_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", m),
+    }
+}
+
 async fn connector_request(
     State(st): State<BridgeState>,
     Path(connector_id): Path<String>,
@@ -557,47 +602,7 @@ async fn connector_request(
 
     match result {
         Ok(Ok(value)) => (StatusCode::OK, Json(json!({ "ok": true, "result": value }))).into_response(),
-        Ok(Err(ForwardError::Refused(refusal))) => {
-            let status = match refusal.code() {
-                "capability_denied" => StatusCode::FORBIDDEN,
-                "invalid_request" => StatusCode::BAD_REQUEST,
-                _ => StatusCode::SERVICE_UNAVAILABLE,
-            };
-            bridge_error(status, refusal.code(), refusal.message())
-        }
-        Ok(Err(ForwardError::NotRunning { plugin_id })) => bridge_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "capability_unavailable",
-            format!(
-                "The {plugin_id} plugin stopped between the gate check and the call.                  Start it in OAIY Desktop → Plugins."
-            ),
-        ),
-        Ok(Err(ForwardError::Call(CallError::Timeout { method, waited }))) => bridge_error(
-            StatusCode::GATEWAY_TIMEOUT,
-            "timeout",
-            format!("the plugin did not answer {method} within {:.0}s", waited.as_secs_f32()),
-        ),
-        Ok(Err(ForwardError::Call(CallError::Plugin { message, typed, .. }))) => {
-            // The plugin's typed code passes through only if it is IN the closed
-            // taxonomy. A plugin is untrusted, and `error.code` is the field a
-            // consumer branches on — echoing an arbitrary string lets a plugin
-            // emit `capability_denied` (a verdict the host never made) or a code
-            // outside the enum (which fails schema validation at a conforming
-            // consumer, the exact failure the closed set exists to prevent).
-            // Anything unrecognised becomes node_failed: the plugin's call
-            // genuinely failed, we just will not let it name the reason falsely.
-            let code = match typed.as_deref() {
-                Some(t) if is_taxonomy_code(t) => t,
-                _ => "node_failed",
-            };
-            bridge_error(StatusCode::BAD_GATEWAY, code, message)
-        }
-        Ok(Err(ForwardError::Call(e))) => {
-            bridge_error(StatusCode::BAD_GATEWAY, "runtime_unavailable", e.to_string())
-        }
-        Ok(Err(ForwardError::Internal(m))) => {
-            bridge_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", m)
-        }
+        Ok(Err(e)) => forward_error_response(e),
         Err(join) => bridge_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "internal",
@@ -726,6 +731,99 @@ async fn set_plugin_enabled(
             }
         }
         Err(_) => bridge_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", "registry lock poisoned".into()),
+    }
+}
+
+// ------- plugin-contributed service definitions -------
+
+/// Every service definition contributed by an installed plugin, with provenance.
+fn collect_definitions(st: &BridgeState) -> Vec<crate::plugins::definitions::ServiceDefinition> {
+    let Ok(mut reg) = st.plugins.lock() else { return Vec::new() };
+    // Discovery must not depend on call order (the same reason capabilities
+    // scans): a fresh process should list definitions on the first request.
+    reg.scan();
+    let mut out = Vec::new();
+    for rec in reg.list() {
+        if let Some(m) = rec.manifest.as_ref() {
+            out.extend(crate::plugins::definitions::load_for_plugin(&rec.dir, m));
+        }
+    }
+    out
+}
+
+/// `GET /api/services/definitions` — the invocable action surfaces plugins add.
+async fn list_service_definitions(State(st): State<BridgeState>) -> axum::response::Response {
+    let defs = collect_definitions(&st);
+    (StatusCode::OK, Json(json!({ "definitions": defs }))).into_response()
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct InvokeBody {
+    #[serde(default)]
+    input: Option<serde_json::Value>,
+    #[serde(default)]
+    idempotency_key: Option<String>,
+}
+
+/// `POST /api/services/actions/:definition_id/:action_id/invoke`
+///
+/// Resolves the action to the plugin connector command it declares and forwards
+/// it down the ORDINARY gated path — same capability check, same journalling
+/// rule. A definition is a documented facade, not a way around the gate.
+async fn invoke_service_action(
+    State(st): State<BridgeState>,
+    Path((definition_id, action_id)): Path<(String, String)>,
+    body: Option<Json<InvokeBody>>,
+) -> axum::response::Response {
+    let body = body.map(|Json(b)| b).unwrap_or_default();
+    let defs = collect_definitions(&st);
+    let Some(def) = defs.iter().find(|d| d.id == definition_id) else {
+        return bridge_error(
+            StatusCode::NOT_FOUND,
+            "invalid_request",
+            format!("no service definition {definition_id:?}"),
+        );
+    };
+    let Some(action) = def.action(&action_id) else {
+        return bridge_error(
+            StatusCode::NOT_FOUND,
+            "invalid_request",
+            format!("{definition_id:?} has no action {action_id:?}"),
+        );
+    };
+    if action.transport.kind != "plugin-command" {
+        return bridge_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            format!("action {action_id:?} uses an unsupported transport {:?}", action.transport.kind),
+        );
+    }
+    let Some(command) = action.transport.command.clone() else {
+        return bridge_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            format!("action {action_id:?} declares no command"),
+        );
+    };
+
+    let host = st.host.clone();
+    let connector_id = def.plugin_id.clone();
+    let payload = body.input;
+    let key = body.idempotency_key;
+    let timeout = action
+        .timeout_ms
+        .map(std::time::Duration::from_millis)
+        .unwrap_or(CONNECTOR_TIMEOUT);
+    let result = tokio::task::spawn_blocking(move || {
+        host.forward_connector(&connector_id, &command, payload, key.as_deref(), timeout)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(value)) => (StatusCode::OK, Json(json!({ "ok": true, "result": value }))).into_response(),
+        Ok(Err(e)) => forward_error_response(e),
+        Err(e) => bridge_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()),
     }
 }
 
@@ -1162,6 +1260,12 @@ pub fn router(state: BridgeState) -> Router {
         // native code the host will supervise.
         .route("/api/plugins/install", post(install_plugin))
         .route("/api/plugins/:id", axum::routing::delete(uninstall_plugin))
+        // Service definitions a plugin contributes (its invocable action surface).
+        .route("/api/services/definitions", get(list_service_definitions))
+        .route(
+            "/api/services/actions/:definition_id/:action_id/invoke",
+            post(invoke_service_action),
+        )
         // Plugin-contributed UI: static assets the desktop hosts in an iframe.
         // Open GET (an iframe navigation cannot carry a bearer), but restricted
         // to the files the screen declares — see plugin_ui_asset.

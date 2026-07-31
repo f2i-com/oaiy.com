@@ -9,6 +9,7 @@ import {
   TriangleAlert,
   FolderOpen,
   Trash2,
+  Boxes,
 } from 'lucide-react';
 import {
   plugins,
@@ -16,6 +17,8 @@ import {
   type PluginRecord,
   type PluginState,
   type PluginsSnapshot,
+  serviceDefinitions,
+  type ServiceDefinition,
 } from './api';
 import { useToast } from './Toasts';
 import LogsViewer from './LogsViewer';
@@ -62,6 +65,8 @@ export default function PluginsPanel() {
   /** Path to a plugin folder or .tar.gz to install. */
   const [installSource, setInstallSource] = useState('');
   const [installing, setInstalling] = useState(false);
+  /** Action surfaces the installed plugins contribute. */
+  const [definitions, setDefinitions] = useState<ServiceDefinition[]>([]);
   // Track state per plugin so we toast on a transition (crash, came up),
   // not on every poll — same pattern the Services panel uses.
   const seen = useRef<Map<string, PluginState>>(new Map());
@@ -94,6 +99,11 @@ export default function PluginsPanel() {
       }
       firstPoll.current = false;
       setSnapshot(snap);
+      try {
+        setDefinitions((await serviceDefinitions.list()).definitions);
+      } catch {
+        /* a definition listing failure must not blank the plugin list */
+      }
     } catch (e) {
       // A poll failure is usually a momentary blip; keep the last snapshot and
       // show the error rather than blanking the list.
@@ -257,6 +267,36 @@ export default function PluginsPanel() {
               onViewLogs={() => setLogsFor(p.id)}
               onUninstall={() => void uninstallPlugin(p)}
             />
+          ))}
+        </section>
+      )}
+
+      {/* Services a plugin contributes: named, schema'd actions a flow can call.
+          Installed and removed with the plugin, so they belong here rather than
+          alongside the managed local services. */}
+      {definitions.length > 0 && (
+        <section className="service-section">
+          <div className="section-title-row">
+            <h3 className="section-title">Services from plugins</h3>
+          </div>
+          {definitions.map((d) => (
+            <div key={d.id} className="service-card service-card-running">
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+                <Boxes size={14} aria-hidden />
+                <strong style={{ fontSize: 15 }}>{d.name}</strong>
+                <span className="badge badge-neutral">{d.category ?? 'service'}</span>
+                <span style={{ fontSize: 12, opacity: 0.6 }}>
+                  from <code>{d.pluginId}</code>
+                </span>
+              </div>
+              {d.description && (
+                <p style={{ fontSize: 13, opacity: 0.8, margin: '6px 0 0' }}>{d.description}</p>
+              )}
+              <div style={{ fontSize: 12, opacity: 0.7, marginTop: 6 }}>
+                {d.actions.length} action{d.actions.length === 1 ? '' : 's'}:{' '}
+                {d.actions.map((a) => a.id).join(', ')}
+              </div>
+            </div>
           ))}
         </section>
       )}
