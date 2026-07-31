@@ -79,7 +79,7 @@ pub enum Runtime {
 /// Note `Succeeded`/`Failed` rather than FormLogic's `done`/`error`: the protocol
 /// uses the past-tense pair throughout, and the conformance suite refuses `done`
 /// so the two vocabularies cannot quietly coexist.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunStatus {
     Queued,
@@ -849,6 +849,37 @@ impl Ledger {
         q
     }
 
+    /// History, newest first — what a human needs to answer "why did that fail?"
+    ///
+    /// Everything the ledger keeps (up to [`MAX_RUNS`], and durable across
+    /// restarts) was already there; until this there was simply no way to reach
+    /// it without knowing a run id, which meant a failed run was only diagnosable
+    /// by whoever happened to be holding its id at the time.
+    ///
+    /// `statuses` empty means every state. Sorted by reservation time rather than
+    /// by `run_order`, which eviction reorders.
+    pub fn recent(&self, limit: usize, statuses: &[RunStatus]) -> Vec<RunRecord> {
+        let mut q: Vec<_> = self
+            .runs
+            .values()
+            .filter(|r| statuses.is_empty() || statuses.contains(&r.status))
+            .cloned()
+            .collect();
+        q.sort_by(|a, b| b.reserved_at_ms.cmp(&a.reserved_at_ms));
+        q.truncate(limit);
+        q
+    }
+
+    /// Per-status totals over everything retained, so a history view can say how
+    /// many runs failed without paging the whole ledger to count them.
+    pub fn status_counts(&self) -> HashMap<RunStatus, usize> {
+        let mut counts = HashMap::new();
+        for rec in self.runs.values() {
+            *counts.entry(rec.status).or_insert(0) += 1;
+        }
+        counts
+    }
+
     pub fn len(&self) -> usize {
         self.runs.len()
     }
@@ -1519,6 +1550,99 @@ mod tests {
     #[test]
     fn runtime_serialises_lowercase() {
         assert_eq!(serde_json::to_string(&Runtime::Desktop).unwrap(), "\"desktop\"");
+    }
+
+    // --- history ----------------------------------------------------------
+
+    /// Reserve, claim and finish a run in one go, so the history tests read as
+    /// the sequence of outcomes they are about.
+    fn finished(l: &mut Ledger, key: &str, status: RunStatus) -> String {
+        let r = match l.reserve(&req(key)) {
+            ReserveOutcome::Reserved(r) => r,
+            o => panic!("{o:?}"),
+        };
+        l.claim(&r.run_id, Runtime::Desktop, "w").ok_claimed();
+        let err = (!matches!(status, RunStatus::Succeeded | RunStatus::Cancelled))
+            .then(|| RunError::new(RunErrorCode::NodeFailed, format!("{key} blew up")));
+        l.finish(&r.run_id, status, None, err).unwrap();
+        r.run_id
+    }
+
+    #[test]
+    fn recent_returns_newest_first() {
+        let mut l = Ledger::new();
+        // reserved_at_ms can tie inside one millisecond, so stamp them apart —
+        // the ordering claim is about time, not about insertion luck.
+        let ids: Vec<String> = ["a", "b", "c"]
+            .iter()
+            .enumerate()
+            .map(|(i, k)| {
+                let id = finished(&mut l, k, RunStatus::Succeeded);
+                l.runs.get_mut(&id).unwrap().reserved_at_ms = 1_000 + i as u64;
+                id
+            })
+            .collect();
+
+        let seen: Vec<String> = l.recent(10, &[]).into_iter().map(|r| r.run_id).collect();
+        assert_eq!(seen, vec![ids[2].clone(), ids[1].clone(), ids[0].clone()]);
+    }
+
+    #[test]
+    fn recent_filters_to_the_statuses_asked_for() {
+        let mut l = Ledger::new();
+        finished(&mut l, "ok", RunStatus::Succeeded);
+        let bad = finished(&mut l, "bad", RunStatus::Failed);
+        let slow = finished(&mut l, "slow", RunStatus::TimedOut);
+
+        let failures = l.recent(10, &[RunStatus::Failed, RunStatus::TimedOut]);
+        let ids: HashSet<&str> = failures.iter().map(|r| r.run_id.as_str()).collect();
+        assert_eq!(ids, HashSet::from([bad.as_str(), slow.as_str()]));
+        // The whole point of the view: the failure carries its own reason, so
+        // nobody has to go and look the run up by id to find out what happened.
+        assert!(failures.iter().all(|r| r.error.is_some()));
+    }
+
+    #[test]
+    fn recent_respects_its_limit() {
+        let mut l = Ledger::new();
+        for i in 0..5 {
+            finished(&mut l, &format!("k{i}"), RunStatus::Succeeded);
+        }
+        assert_eq!(l.recent(2, &[]).len(), 2);
+        assert_eq!(l.recent(0, &[]).len(), 0);
+    }
+
+    #[test]
+    fn status_counts_cover_every_state_present() {
+        let mut l = Ledger::new();
+        finished(&mut l, "a", RunStatus::Succeeded);
+        finished(&mut l, "b", RunStatus::Succeeded);
+        finished(&mut l, "c", RunStatus::Failed);
+        // …and one left queued, to prove live runs are counted too.
+        l.reserve(&req("d"));
+
+        let counts = l.status_counts();
+        assert_eq!(counts.get(&RunStatus::Succeeded), Some(&2));
+        assert_eq!(counts.get(&RunStatus::Failed), Some(&1));
+        assert_eq!(counts.get(&RunStatus::Queued), Some(&1));
+        // Absent rather than zero — a caller reads this with `unwrap_or(0)`.
+        assert_eq!(counts.get(&RunStatus::Cancelled), None);
+    }
+
+    #[test]
+    fn history_survives_a_reopen() {
+        let dir = JournalDir::new("history");
+        {
+            let mut l = Ledger::open(dir.path()).unwrap();
+            finished(&mut l, "gone-wrong", RunStatus::Failed);
+        }
+        // The whole value of a history view is that it outlives the process that
+        // produced it — a failure you can only read before the next restart is
+        // not a history.
+        let l = Ledger::open(dir.path()).unwrap();
+        let failures = l.recent(10, &[RunStatus::Failed]);
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].error.as_ref().unwrap().message.contains("blew up"));
     }
 
     /// Test helper: assert a claim won, so the tests above stay about their own
