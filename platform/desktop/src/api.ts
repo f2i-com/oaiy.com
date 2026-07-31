@@ -396,6 +396,52 @@ export interface PendingPairing {
   createdAtMs: number;
 }
 
+export interface CompanionEndpointKey {
+  kty: string;
+  crv: string;
+  publicKey: string;
+  thumbprint: string;
+}
+export interface CompanionApproved {
+  deviceId: string;
+  displayName: string;
+  endpointKey: CompanionEndpointKey;
+  approvedAt: string;
+}
+export interface CompanionPending {
+  id: string;
+  deviceId: string;
+  displayName: string;
+  thumbprint: string;
+  /** Grouped hex the operator reads aloud against the phone's screen. */
+  fingerprint: string;
+  endpointKey: CompanionEndpointKey;
+  receivedAt: string;
+}
+export interface CompanionStatus {
+  available: boolean;
+  protectionLabel?: string;
+  endpointKey?: CompanionEndpointKey;
+  rosterRevision: number;
+  rosterHash: string;
+  approvedMobiles: CompanionApproved[];
+  pendingApprovals: CompanionPending[];
+  remoteAccessReady: boolean;
+  warning?: string;
+}
+export interface CompanionOfferRequest {
+  appId?: string;
+  workspaceId?: string;
+  desktopConnectionId?: string;
+}
+export interface CompanionOffer {
+  requestId: string;
+  payload: Record<string, unknown>;
+  /** The exact JSON to paste into the phone when a camera isn't an option. */
+  encodedPayload: string;
+  qrSvg: string;
+}
+
 export interface PairedApp {
   id: string;
   product: string;
@@ -418,6 +464,47 @@ export const pairing = {
   paired: () => request<{ paired: PairedApp[] }>('/api/bridge/pairings'),
   revoke: (id: string) =>
     request<void>(`/api/bridge/pairings/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+};
+
+/**
+ * Companion device trust, scoped to the broker plugin that asked.
+ *
+ * The plugin id is a path segment rather than an implicit "the companion
+ * plugin" because the host gates each route on that plugin declaring
+ * `oaiy.companion.admission` — the id IS the authorisation subject, so it has
+ * to travel with the call.
+ */
+export const companion = {
+  status: (plugin: string) => request<CompanionStatus>(`/api/companion/${encodeURIComponent(plugin)}/pairing`),
+  createOffer: (plugin: string, body: CompanionOfferRequest) =>
+    request<CompanionOffer>(`/api/companion/${encodeURIComponent(plugin)}/pairing/offers`, {
+      method: 'POST',
+      body: JSON.stringify(body ?? {}),
+    }),
+  receiveResponse: (plugin: string, response: unknown) =>
+    request<CompanionPending>(`/api/companion/${encodeURIComponent(plugin)}/pairing/responses`, {
+      method: 'POST',
+      body: JSON.stringify(response),
+    }),
+  approve: (plugin: string, id: string) =>
+    request<CompanionApproved>(
+      `/api/companion/${encodeURIComponent(plugin)}/pairing/approvals/${encodeURIComponent(id)}/approve`,
+      { method: 'POST' },
+    ),
+  deny: (plugin: string, id: string) =>
+    request<void>(
+      `/api/companion/${encodeURIComponent(plugin)}/pairing/approvals/${encodeURIComponent(id)}/deny`,
+      { method: 'POST' },
+    ),
+  revoke: (plugin: string, thumbprint: string) =>
+    request<void>(
+      `/api/companion/${encodeURIComponent(plugin)}/mobiles/${encodeURIComponent(thumbprint)}`,
+      { method: 'DELETE' },
+    ),
+  rotate: (plugin: string) =>
+    request<CompanionStatus>(`/api/companion/${encodeURIComponent(plugin)}/identity/rotate`, {
+      method: 'POST',
+    }),
 };
 
 export const plugins = {
