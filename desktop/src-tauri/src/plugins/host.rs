@@ -70,6 +70,19 @@ fn is_operational_failure(reason: &SkipReason) -> bool {
     }
 }
 
+/// What one dispatch did. `reserved` is a fact the dispatcher already knows;
+/// the alternative was for callers to re-derive it by grepping `outcomes` for a
+/// substring of a human-readable message, which silently breaks the moment
+/// anyone rewords it.
+struct Dispatched {
+    /// Per-binding, for the event ring. Human-readable — not for branching on.
+    outcomes: Vec<String>,
+    /// Set when the event should have produced work and did not.
+    dead: Option<DeadReason>,
+    /// Did any binding actually reserve a run?
+    reserved: bool,
+}
+
 /// Should this dispatch be dead-lettered?
 ///
 /// Only when NOTHING was reserved and at least one binding failed for an
@@ -624,10 +637,11 @@ impl PluginHost {
             origin_run: None,
         };
 
-        let (outcomes, dead_reason) = self.dispatch_event(&event);
-        if let Some(reason) = dead_reason {
+        let dispatched = self.dispatch_event(&event);
+        if let Some(reason) = dispatched.dead {
             self.record_dead(&event.source, &event.name, reason, envelope.clone());
         }
+        let outcomes = dispatched.outcomes;
 
         let seq = self.events.seq.fetch_add(1, Ordering::Relaxed) + 1;
         if let Ok(mut ring) = self.events.ring.lock() {
@@ -874,7 +888,7 @@ impl PluginHost {
     ///
     /// Returns the per-binding outcomes for the event ring, and — when the event
     /// should have produced work but did not — the reason to dead-letter it.
-    fn dispatch_event(&self, event: &Event) -> (Vec<String>, Option<DeadReason>) {
+    fn dispatch_event(&self, event: &Event) -> Dispatched {
         let bindings: Vec<TriggerBinding> = match self.triggers.lock() {
             Ok(t) => t.list().to_vec(),
             Err(_) => Vec::new(),
@@ -885,16 +899,20 @@ impl PluginHost {
             // Not a skip: dispatch never ran. Nothing can have been reserved, so
             // this is always a dead letter.
             Err(_) => {
-                return (
-                    vec!["ledger lock poisoned; nothing dispatched".into()],
-                    Some(DeadReason::NotReserved {
+                return Dispatched {
+                    outcomes: vec!["ledger lock poisoned; nothing dispatched".into()],
+                    dead: Some(DeadReason::NotReserved {
                         detail: "the run ledger was unavailable, so nothing was dispatched".into(),
                     }),
-                )
+                    reserved: false,
+                }
             }
         };
 
         let dead = dead_reason_for(&results);
+        let reserved = results
+            .iter()
+            .any(|o| matches!(o, DispatchOutcome::Reserved { .. }));
         let outcomes: Vec<String> = results
             .into_iter()
             .map(|o| match o {
@@ -906,7 +924,7 @@ impl PluginHost {
                 }
             })
             .collect();
-        (outcomes, dead)
+        Dispatched { outcomes, dead, reserved }
     }
 
     /// Record an event dropped before it reached dispatch.
@@ -958,8 +976,10 @@ impl PluginHost {
             origin_run: None,
         };
 
-        let (outcomes, _) = self.dispatch_event(&event);
-        let reserved = outcomes.iter().any(|o| o.contains(": reserved "));
+        // The dead reason is deliberately dropped: this entry already exists, and
+        // recording a second one for the same event would grow the queue every
+        // time someone retries a redrive that keeps failing.
+        let Dispatched { outcomes, reserved, .. } = self.dispatch_event(&event);
 
         if let Ok(mut q) = self.dead.lock() {
             if reserved {
@@ -1281,6 +1301,37 @@ mod tests {
         assert_eq!(host.ledger.lock().unwrap().len(), 1);
         // Resolved entries go, or someone redrives the same event every morning.
         assert!(host.dead.lock().unwrap().get(&id).is_none());
+    }
+
+    #[test]
+    fn redrive_reads_the_dispatchers_fact_not_its_prose() {
+        // Regression: redrive decided success by grepping the human-readable
+        // outcome for ": reserved ". Reword that message — a prefix, different
+        // punctuation, a translation — and redrive stops recognising success:
+        // it keeps the entry forever, counts endless attempts, and fires a NEW
+        // run on every retry because each gets a fresh idempotency key.
+        //
+        // So assert the two travel together. If `reserved` is ever re-derived
+        // from `outcomes` again, a wording change breaks this test instead of
+        // quietly duplicating runs in production.
+        let (_sb, host) = host_with("prose", vec![binding("b1", None)]);
+        let event = Event {
+            name: "aokie.call.incoming".into(),
+            source: "aokie".into(),
+            correlation_id: "c".into(),
+            idempotency_key: "k-prose".into(),
+            data: json!({ "from": "+61400000000" }),
+            origin_run: None,
+        };
+
+        let d = host.dispatch_event(&event);
+        assert!(d.reserved, "the binding should have fired");
+        assert_eq!(host.ledger.lock().unwrap().len(), 1);
+
+        // Nothing reserved the second time: same key, so the ledger dedupes it.
+        let again = host.dispatch_event(&event);
+        assert!(!again.reserved, "a duplicate reserves nothing");
+        assert_eq!(host.ledger.lock().unwrap().len(), 1, "and creates no second run");
     }
 
     #[test]
