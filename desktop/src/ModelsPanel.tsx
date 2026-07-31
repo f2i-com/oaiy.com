@@ -1,4 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useVisiblePoll } from './useVisiblePoll';
+import { peek, put } from './useCached';
 import {
   formatBytes,
   formatEta,
@@ -23,7 +25,11 @@ import { useToast } from './Toasts';
  * Polls both lists every 1.5s so progress bars tick smoothly.
  */
 export default function ModelsPanel() {
-  const [snapshot, setSnapshot] = useState<ModelsSnapshot | null>(null);
+  // Seeded like the other panels: this painted an empty model library on every
+  // visit while a 1.5s poll re-fetched what it already had a moment earlier.
+  const [snapshot, setSnapshot] = useState<ModelsSnapshot | null>(
+    () => peek('modelsSnapshot') ?? null,
+  );
   const [downloads, setDownloads] = useState<DownloadProgress[]>([]);
   const [catalog, setCatalog] = useState<CatalogSnapshot | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -85,6 +91,7 @@ export default function ModelsPanel() {
       }
       firstPollRef.current = false;
       setSnapshot(snap);
+      put('modelsSnapshot', snap);
       setDownloads(dls);
       setError(null);
     } catch (e) {
@@ -93,11 +100,9 @@ export default function ModelsPanel() {
     }
   }, [toast]);
 
-  useEffect(() => {
-    refresh();
-    const id = setInterval(refresh, 1500);
-    return () => clearInterval(id);
-  }, [refresh]);
+  // Only while the window is visible. This walked the whole model tree 40
+  // times a minute behind a hidden tray window — see useVisiblePoll.
+  useVisiblePoll(refresh, 1500);
 
   const onSubmit = useCallback(
     async (e: React.FormEvent) => {

@@ -108,7 +108,16 @@ export default function OverviewPanel({ onNavigate, onOpenPluginScreen }: Props)
       pairing.paired(),
       bridge.status(),
     ]);
-    if (s.status === 'fulfilled') { setSvc(s.value.services); put('services', s.value.services); }
+    if (s.status === 'fulfilled') {
+      setSvc(s.value.services);
+      put('services', s.value.services);
+      // The WHOLE snapshot too, under the key ServicesPanel seeds from. Writing
+      // only the array meant Overview's 4s poll never populated what Services
+      // reads, so the first visit to Services still showed "Loading services…"
+      // — the exact flash that seeding was meant to remove, surviving on the
+      // one path everybody takes (the app opens on Overview).
+      put('servicesSnapshot', s.value);
+    }
     if (p.status === 'fulfilled') { setPlug(p.value.plugins); put('plugins', p.value.plugins); }
     if (a.status === 'fulfilled') { setProvs(a.value.providers); put('providers', a.value.providers); }
     if (c.status === 'fulfilled') { setApps(c.value.paired); put('pairedApps', c.value.paired); }

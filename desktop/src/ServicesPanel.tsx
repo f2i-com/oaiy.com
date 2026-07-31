@@ -1,4 +1,5 @@
 import { type CSSProperties, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useVisiblePoll } from './useVisiblePoll';
 import {
   appConfig,
   openExternal,
@@ -97,11 +98,8 @@ export default function ServicesPanel() {
     }
   }, [toast]);
 
-  useEffect(() => {
-    refresh();
-    const id = setInterval(refresh, 2000);
-    return () => clearInterval(id);
-  }, [refresh]);
+  // Only while the window is visible — see useVisiblePoll.
+  useVisiblePoll(refresh, 2000);
 
   const runAction = useCallback(
     async (fn: () => Promise<void>, key?: string) => {
