@@ -362,7 +362,13 @@ export default function ConnectionsPanel() {
         )}
         {account?.attempt.phase === 'cancelled' && !account.linked && (
           <div className="banner banner-pending" style={{ marginBottom: 10 }}>
-            Linking cancelled. You can start again whenever you like.
+            <strong>Linking cancelled.</strong>{' '}
+            {/* Cancelling closes the local port the provider redirects back to.
+                An approval page still open in the browser now leads nowhere, and
+                approving it gives a bare ERR_CONNECTION_REFUSED that looks like
+                a broken app rather than a cancelled attempt. */}
+            If an approval page is still open in your browser, close it — approving
+            there can no longer reach this app. Start again here when you&rsquo;re ready.
           </div>
         )}
         {account?.attempt.phase === 'failed' && !account.linked && (
