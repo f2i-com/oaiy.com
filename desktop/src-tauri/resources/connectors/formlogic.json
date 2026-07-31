@@ -6,7 +6,7 @@
   "defaultBaseUrl": "https://formlogic.com",
   "auth": {
     "kind": "oauth2_pkce",
-    "clientId": "formlogic-desktop",
+    "clientId": "oaiy-desktop",
     "authorizePath": "/oauth/authorize",
     "tokenPath": "/api/oauth/token",
     "callbackPath": "/callback",
