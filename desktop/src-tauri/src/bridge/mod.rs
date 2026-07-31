@@ -34,12 +34,14 @@
 //! in the same repo and the desktop already supervises far heavier things
 //! (Python venvs, llama.cpp, a Playwright browser).
 
+pub mod deadletters;
 pub mod ledger;
 pub mod pairing;
 pub mod routes;
 pub mod triggers;
 pub mod worker;
 
+pub use deadletters::{DeadLetter, DeadLetterHandle, DeadLetterQueue, DeadReason};
 pub use pairing::{PairingHandle, PairingManager};
 pub use routes::{router as bridge_router, BridgeState};
 pub use worker::{FlowStore, Worker};

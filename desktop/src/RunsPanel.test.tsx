@@ -9,8 +9,12 @@ import React, { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-const { runsMock } = vi.hoisted(() => ({ runsMock: vi.fn() }));
-vi.mock('./api', () => ({ bridge: { runs: runsMock } }));
+const { runsMock, deadMock } = vi.hoisted(() => ({ runsMock: vi.fn(), deadMock: vi.fn() }));
+// The panel embeds DeadLetters, which polls on mount. Stubbed empty so these
+// tests are about the run list; DeadLetters.test.tsx covers the queue itself.
+vi.mock('./api', () => ({
+  bridge: { runs: runsMock, deadLetters: deadMock, redrive: vi.fn(), dismissDeadLetter: vi.fn() },
+}));
 
 import RunsPanel from './RunsPanel';
 
@@ -54,6 +58,8 @@ const button = (label: string) =>
 
 beforeEach(() => {
   runsMock.mockReset();
+  deadMock.mockReset();
+  deadMock.mockResolvedValue({ deadLetters: [], total: 0 });
   runsMock.mockResolvedValue({ runs: [FAILED], total: 12, byStatus: { failed: 1, succeeded: 11 } });
   host = document.createElement('div');
   document.body.appendChild(host);

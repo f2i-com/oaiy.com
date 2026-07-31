@@ -43,8 +43,56 @@ use serde_json::{json, Value};
 use super::process::{CallError, PluginProcess, SpawnOptions};
 use super::registry::{GateRefusal, PluginRegistryHandle, PluginState};
 use super::runner::{restart_delay, should_restart, HealthTracker, HealthVerdict, HEALTH_INTERVAL};
+use crate::bridge::deadletters::{DeadLetterHandle, DeadReason};
 use crate::bridge::ledger::{LedgerHandle, LineageRef, ReserveOutcome, RunRequest};
-use crate::bridge::triggers::{dispatch, DispatchOutcome, Event, TriggerBinding};
+use crate::bridge::triggers::{dispatch, DispatchOutcome, Event, SkipReason, TriggerBinding};
+
+/// Does this skip mean something went WRONG, or the trigger system working?
+///
+/// The distinction is the whole value of the dead-letter queue. Disabled,
+/// manual, and condition-false are the design doing its job (see
+/// [`crate::bridge::triggers`]: everything fails towards not running), and
+/// recording them would bury the real failures under routine not-firing.
+/// Duplicate likewise means the run already exists — the opposite of lost work.
+///
+/// What remains are the cases where an author or operator meant work to happen
+/// and it did not: a condition that will not parse, a guard refusal, and a
+/// fan-out past the per-event ceiling.
+fn is_operational_failure(reason: &SkipReason) -> bool {
+    match reason {
+        SkipReason::ConditionUnevaluatable { .. }
+        | SkipReason::Guard(_)
+        | SkipReason::TooManyBindings => true,
+        SkipReason::Disabled
+        | SkipReason::ManualMode
+        | SkipReason::ConditionFalse
+        | SkipReason::Duplicate => false,
+    }
+}
+
+/// Should this dispatch be dead-lettered?
+///
+/// Only when NOTHING was reserved and at least one binding failed for an
+/// operational reason. A binding that fired makes the event handled — the
+/// others declining is ordinary fan-out, not lost work.
+fn dead_reason_for(results: &[DispatchOutcome]) -> Option<DeadReason> {
+    if results
+        .iter()
+        .any(|o| matches!(o, DispatchOutcome::Reserved { .. }))
+    {
+        return None;
+    }
+    let failures: Vec<String> = results
+        .iter()
+        .filter_map(|o| match o {
+            DispatchOutcome::Skipped { binding_id, reason } if is_operational_failure(reason) => {
+                Some(format!("{binding_id}: {}", reason.message()))
+            }
+            _ => None,
+        })
+        .collect();
+    (!failures.is_empty()).then(|| DeadReason::NotReserved { detail: failures.join("; ") })
+}
 
 /// Default deadline for a forwarded connector command.
 pub const CONNECTOR_TIMEOUT: Duration = Duration::from_secs(30);
@@ -161,6 +209,8 @@ pub struct PluginHost {
     pub registry: PluginRegistryHandle,
     pub ledger: LedgerHandle,
     pub triggers: TriggerStoreHandle,
+    /// Events that arrived and produced no work. See [`crate::bridge::deadletters`].
+    pub dead: DeadLetterHandle,
     procs: Mutex<ProcTable>,
     events: EventRing,
     /// Bounded: a plugin can emit events faster than the single event thread
@@ -181,6 +231,7 @@ impl PluginHost {
         registry: PluginRegistryHandle,
         ledger: LedgerHandle,
         triggers: TriggerStoreHandle,
+        dead: DeadLetterHandle,
         desktop_version: String,
         dev_mode: bool,
     ) -> Arc<Self> {
@@ -189,6 +240,7 @@ impl PluginHost {
             registry,
             ledger,
             triggers,
+            dead,
             procs: Mutex::new(ProcTable::default()),
             events: EventRing {
                 seq: AtomicU64::new(0),
@@ -302,12 +354,18 @@ impl PluginHost {
                         // never block it — a blocked reader stops routing RPC
                         // replies too. A full queue means the event thread is
                         // swamped; shed with a log rather than grow without bound.
-                        if host
-                            .event_tx
-                            .try_send((plugin_for_events.clone(), envelope))
-                            .is_err()
+                        if let Err(e) =
+                            host.event_tx.try_send((plugin_for_events.clone(), envelope))
                         {
                             host.logs_drop_notice(&plugin_for_events);
+                            // The log ring is itself overwriting under the flood
+                            // that caused this, so the durable record is what
+                            // actually survives.
+                            let (_, envelope) = match e {
+                                std::sync::mpsc::TrySendError::Full(v) => v,
+                                std::sync::mpsc::TrySendError::Disconnected(v) => v,
+                            };
+                            host.record_shed(&plugin_for_events, envelope);
                         }
                     }
                 }),
@@ -529,26 +587,10 @@ impl PluginHost {
             origin_run: None,
         };
 
-        let outcomes: Vec<String> = {
-            let bindings: Vec<TriggerBinding> = match self.triggers.lock() {
-                Ok(t) => t.list().to_vec(),
-                Err(_) => Vec::new(),
-            };
-            match self.ledger.lock() {
-                Ok(mut ledger) => dispatch(&mut ledger, &bindings, &event)
-                    .into_iter()
-                    .map(|o| match o {
-                        DispatchOutcome::Reserved { binding_id, run } => {
-                            format!("{binding_id}: reserved {}", run.run_id)
-                        }
-                        DispatchOutcome::Skipped { binding_id, reason } => {
-                            format!("{binding_id}: skipped — {}", reason.message())
-                        }
-                    })
-                    .collect(),
-                Err(_) => vec!["ledger lock poisoned; nothing dispatched".into()],
-            }
-        };
+        let (outcomes, dead_reason) = self.dispatch_event(&event);
+        if let Some(reason) = dead_reason {
+            self.record_dead(&event.source, &event.name, reason, envelope.clone());
+        }
 
         let seq = self.events.seq.fetch_add(1, Ordering::Relaxed) + 1;
         if let Ok(mut ring) = self.events.ring.lock() {
@@ -791,6 +833,109 @@ impl PluginHost {
         }
     }
 
+    /// Run the trigger dispatcher over one event.
+    ///
+    /// Returns the per-binding outcomes for the event ring, and — when the event
+    /// should have produced work but did not — the reason to dead-letter it.
+    fn dispatch_event(&self, event: &Event) -> (Vec<String>, Option<DeadReason>) {
+        let bindings: Vec<TriggerBinding> = match self.triggers.lock() {
+            Ok(t) => t.list().to_vec(),
+            Err(_) => Vec::new(),
+        };
+
+        let results = match self.ledger.lock() {
+            Ok(mut ledger) => dispatch(&mut ledger, &bindings, event),
+            // Not a skip: dispatch never ran. Nothing can have been reserved, so
+            // this is always a dead letter.
+            Err(_) => {
+                return (
+                    vec!["ledger lock poisoned; nothing dispatched".into()],
+                    Some(DeadReason::NotReserved {
+                        detail: "the run ledger was unavailable, so nothing was dispatched".into(),
+                    }),
+                )
+            }
+        };
+
+        let dead = dead_reason_for(&results);
+        let outcomes: Vec<String> = results
+            .into_iter()
+            .map(|o| match o {
+                DispatchOutcome::Reserved { binding_id, run } => {
+                    format!("{binding_id}: reserved {}", run.run_id)
+                }
+                DispatchOutcome::Skipped { binding_id, reason } => {
+                    format!("{binding_id}: skipped — {}", reason.message())
+                }
+            })
+            .collect();
+        (outcomes, dead)
+    }
+
+    /// Record an event dropped before it reached dispatch.
+    fn record_shed(&self, plugin_id: &str, envelope: Value) {
+        let name = envelope
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("(unnamed)")
+            .to_string();
+        self.record_dead(plugin_id, &name, DeadReason::Shed, envelope);
+    }
+
+    fn record_dead(&self, source: &str, event: &str, reason: DeadReason, envelope: Value) {
+        if let Ok(mut q) = self.dead.lock() {
+            q.record(source, event, reason, envelope);
+        }
+    }
+
+    /// Re-dispatch a stored dead letter against the CURRENT bindings.
+    ///
+    /// Deliberately the ordinary path, guards and all: a guard-refused event is
+    /// offered to the guards again and refused again rather than forced through.
+    /// The only change is the idempotency key, which gains an attempt suffix —
+    /// sound because a dead letter reserved no run, so there is nothing to
+    /// double-execute.
+    ///
+    /// Returns the dispatch outcomes, and whether any binding actually reserved.
+    pub fn redrive(&self, id: &str) -> Option<(Vec<String>, bool)> {
+        let item = self.dead.lock().ok()?.get(id)?;
+        let envelope = &item.envelope;
+        let original_key = envelope
+            .get("idempotencyKey")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+
+        let event = Event {
+            name: item.event.clone(),
+            source: item.source.clone(),
+            correlation_id: envelope
+                .get("correlationId")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            idempotency_key: crate::bridge::DeadLetterQueue::redrive_key(
+                original_key,
+                item.attempts + 1,
+            ),
+            data: envelope.get("data").cloned().unwrap_or(Value::Null),
+            origin_run: None,
+        };
+
+        let (outcomes, _) = self.dispatch_event(&event);
+        let reserved = outcomes.iter().any(|o| o.contains(": reserved "));
+
+        if let Ok(mut q) = self.dead.lock() {
+            if reserved {
+                // Done: leaving it would have someone redriving the same event
+                // every morning.
+                q.remove(id);
+            } else {
+                q.note_attempt(id, outcomes.join("; "));
+            }
+        }
+        Some((outcomes, reserved))
+    }
+
     /// Note a dropped event on the plugin's own log ring, so a flood is
     /// diagnosable rather than silent. Best-effort and rate-oblivious — under a
     /// real flood this line itself is shed by the ring's own cap.
@@ -857,4 +1002,298 @@ fn now_ms() -> u64 {
 fn rand_suffix() -> u64 {
     static N: AtomicU64 = AtomicU64::new(0);
     N.fetch_add(1, Ordering::Relaxed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bridge::ledger::{RunRecord, RunStatus};
+    use crate::bridge::triggers::MAX_BINDINGS_PER_EVENT;
+
+    fn reserved(binding: &str) -> DispatchOutcome {
+        DispatchOutcome::Reserved {
+            binding_id: binding.into(),
+            run: RunRecord {
+                run_id: "run_1".into(),
+                status: RunStatus::Queued,
+                caller_product: "aokie".into(),
+                flow_id: Some("answer".into()),
+                correlation_id: "c".into(),
+                idempotency_key: "k".into(),
+                input: None,
+                timeout_ms: None,
+                mode: "async".into(),
+                cancel_requested: false,
+                idempotent: false,
+                runtime: None,
+                claimed_by: None,
+                output: None,
+                error: None,
+                reserved_at_ms: 0,
+                started_at_ms: None,
+                finished_at_ms: None,
+                lineage: Default::default(),
+                trigger_event: None,
+            },
+        }
+    }
+
+    fn skipped(binding: &str, reason: SkipReason) -> DispatchOutcome {
+        DispatchOutcome::Skipped { binding_id: binding.into(), reason }
+    }
+
+    #[test]
+    fn the_trigger_system_declining_is_not_a_dead_letter() {
+        // Every one of these is the design working as documented: triggers fail
+        // towards not running. Recording them would bury the real failures under
+        // routine not-firing, and the queue would be useless within a day.
+        for reason in [
+            SkipReason::Disabled,
+            SkipReason::ManualMode,
+            SkipReason::ConditionFalse,
+            SkipReason::Duplicate,
+        ] {
+            assert_eq!(
+                dead_reason_for(&[skipped("b", reason.clone())]),
+                None,
+                "{reason:?} must not dead-letter"
+            );
+        }
+    }
+
+    #[test]
+    fn work_that_was_meant_to_happen_and_did_not_is_a_dead_letter() {
+        for reason in [
+            SkipReason::ConditionUnevaluatable {
+                expression: "event.data.x ==== 1".into(),
+                why: "unparseable".into(),
+            },
+            SkipReason::Guard("depth 17 exceeds the maximum".into()),
+            SkipReason::TooManyBindings,
+        ] {
+            let dead = dead_reason_for(&[skipped("b", reason.clone())]);
+            assert!(dead.is_some(), "{reason:?} must dead-letter");
+            // The reason travels with it — a dead letter you cannot diagnose is
+            // just a mystery with a timestamp.
+            assert!(dead.unwrap().message().contains("b: "));
+        }
+    }
+
+    #[test]
+    fn an_event_that_reserved_anything_is_handled() {
+        // Fan-out: one binding fired, another was disabled, a third could not
+        // evaluate. The event produced work, so nothing was lost.
+        let dead = dead_reason_for(&[
+            reserved("fires"),
+            skipped("off", SkipReason::Disabled),
+            skipped(
+                "broken",
+                SkipReason::ConditionUnevaluatable {
+                    expression: "???".into(),
+                    why: "unparseable".into(),
+                },
+            ),
+        ]);
+        assert_eq!(dead, None);
+    }
+
+    #[test]
+    fn an_event_nobody_bound_is_not_a_dead_letter() {
+        // Most plugin events are bound by nobody. Treating that as a failure
+        // would grow the queue without anything being wrong.
+        assert_eq!(dead_reason_for(&[]), None);
+    }
+
+    #[test]
+    fn several_failures_are_reported_together() {
+        let dead = dead_reason_for(&[
+            skipped("a", SkipReason::Guard("cycle".into())),
+            skipped("b", SkipReason::TooManyBindings),
+        ])
+        .expect("both bindings failed");
+        let msg = dead.message();
+        assert!(msg.contains("a: "), "{msg}");
+        assert!(msg.contains("b: "), "{msg}");
+        assert!(msg.contains(&MAX_BINDINGS_PER_EVENT.to_string()), "{msg}");
+    }
+    // --- the wiring, not just the classifier --------------------------------
+    //
+    // The unit tests above prove the RULE; these prove the plumbing that applies
+    // it. Worth the extra setup: the two previous features in this area both
+    // passed their unit tests while being broken end to end, and a dead-letter
+    // queue that is never written to is worse than none — it reads as "nothing
+    // was lost".
+
+    use crate::bridge::deadletters::DeadLetterQueue;
+    use crate::bridge::triggers::BindingMode;
+
+    struct Sandbox(PathBuf);
+    impl Sandbox {
+        fn new(tag: &str) -> Self {
+            use std::sync::atomic::AtomicU32;
+            static N: AtomicU32 = AtomicU32::new(0);
+            let n = N.fetch_add(1, Ordering::Relaxed);
+            let p = std::env::temp_dir().join(format!("oaiy-host-{tag}-{}-{n}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&p);
+            std::fs::create_dir_all(&p).unwrap();
+            Self(p)
+        }
+    }
+    impl Drop for Sandbox {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn binding(id: &str, condition: Option<&str>) -> TriggerBinding {
+        TriggerBinding {
+            id: id.into(),
+            event: "aokie.call.incoming".into(),
+            flow_id: "answer".into(),
+            mode: BindingMode::Async,
+            enabled: true,
+            condition: condition.map(str::to_string),
+            input_map: Default::default(),
+            sort_order: 0,
+        }
+    }
+
+    fn envelope() -> Value {
+        json!({
+            "name": "aokie.call.incoming",
+            "idempotencyKey": "evt-1",
+            "correlationId": "call_1",
+            "data": { "from": "+61400000000" }
+        })
+    }
+
+    /// A host over temp dirs, with `bindings` installed.
+    fn host_with(tag: &str, bindings: Vec<TriggerBinding>) -> (Sandbox, Arc<PluginHost>) {
+        let sb = Sandbox::new(tag);
+        let triggers = TriggerStore::load(sb.0.join("triggers.json"));
+        let triggers: TriggerStoreHandle = Arc::new(Mutex::new(triggers));
+        for b in bindings {
+            triggers.lock().unwrap().upsert(b).unwrap();
+        }
+        let host = PluginHost::new(
+            crate::plugins::registry::new_handle(sb.0.join("plugins")),
+            crate::bridge::ledger::new_handle(),
+            triggers,
+            crate::bridge::deadletters::open_handle(sb.0.join("deadletters.jsonl")),
+            "0.0.0-test".into(),
+            true,
+        );
+        (sb, host)
+    }
+
+    #[test]
+    fn an_event_whose_binding_cannot_evaluate_is_dead_lettered() {
+        // `====` is not an operator the restricted evaluator understands, so the
+        // binding is refused rather than guessed. The author meant this to fire;
+        // without a dead letter they would never learn it didn't.
+        let (_sb, host) = host_with("broken", vec![binding("b1", Some("$event.data.from ==== 1"))]);
+        host.process_event("aokie", envelope());
+
+        let dead = host.dead.lock().unwrap().list(10);
+        assert_eq!(dead.len(), 1, "an unevaluatable condition must dead-letter");
+        assert_eq!(dead[0].event, "aokie.call.incoming");
+        assert_eq!(dead[0].source, "aokie");
+        assert!(dead[0].reason.message().contains("could not be evaluated"));
+        // The envelope has to survive intact or redrive cannot reconstruct it.
+        assert_eq!(dead[0].envelope["data"]["from"], "+61400000000");
+    }
+
+    #[test]
+    fn an_event_that_fires_normally_leaves_the_queue_empty() {
+        let (_sb, host) = host_with("fine", vec![binding("b1", None)]);
+        host.process_event("aokie", envelope());
+
+        assert_eq!(host.ledger.lock().unwrap().len(), 1, "the binding should have fired");
+        // A queue that fills up with successes is a queue nobody reads.
+        assert!(host.dead.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_disabled_binding_does_not_dead_letter() {
+        let mut b = binding("b1", None);
+        b.enabled = false;
+        let (_sb, host) = host_with("disabled", vec![b]);
+        host.process_event("aokie", envelope());
+        assert!(host.dead.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn redrive_reserves_a_run_once_the_binding_is_fixed_and_clears_the_entry() {
+        let (_sb, host) = host_with("redrive", vec![binding("b1", Some("$event.data.from ==== 1"))]);
+        host.process_event("aokie", envelope());
+        let id = host.dead.lock().unwrap().list(1)[0].id.clone();
+
+        // Redriving while it is still broken must NOT claim success, and must
+        // leave the entry in place with the attempt recorded.
+        let (_, reserved) = host.redrive(&id).expect("the entry exists");
+        assert!(!reserved);
+        let still = host.dead.lock().unwrap().get(&id).expect("still queued");
+        assert_eq!(still.attempts, 1);
+        assert!(still.last_outcome.is_some());
+        assert_eq!(host.ledger.lock().unwrap().len(), 0, "nothing should have run");
+
+        // Fix the condition, redrive again: now it fires.
+        host.triggers.lock().unwrap().upsert(binding("b1", None)).unwrap();
+        let (outcomes, reserved) = host.redrive(&id).expect("the entry exists");
+        assert!(reserved, "{outcomes:?}");
+        assert_eq!(host.ledger.lock().unwrap().len(), 1);
+        // Resolved entries go, or someone redrives the same event every morning.
+        assert!(host.dead.lock().unwrap().get(&id).is_none());
+    }
+
+    #[test]
+    fn a_redriven_event_does_not_collide_with_its_own_original_key() {
+        // The original reservation never happened (that is why it is a dead
+        // letter), but the key must still differ or a later legitimate event
+        // carrying the same key would be swallowed as a duplicate of the redrive.
+        let (_sb, host) = host_with("keys", vec![binding("b1", Some("$event.data.from ==== 1"))]);
+        host.process_event("aokie", envelope());
+        let id = host.dead.lock().unwrap().list(1)[0].id.clone();
+
+        host.triggers.lock().unwrap().upsert(binding("b1", None)).unwrap();
+        host.redrive(&id).expect("the entry exists");
+
+        let run = &host.ledger.lock().unwrap().recent(1, &[])[0];
+        assert_ne!(run.idempotency_key, "evt-1");
+        assert!(run.idempotency_key.contains("evt-1"), "{}", run.idempotency_key);
+    }
+
+    #[test]
+    fn a_dead_letter_from_a_previous_run_is_still_redrivable() {
+        // The queue is durable precisely so an event shed overnight can be
+        // actioned in the morning — by a process that never saw it arrive.
+        let sb = Sandbox::new("durable");
+        let dl_path = sb.0.join("deadletters.jsonl");
+        let id = {
+            let mut q = DeadLetterQueue::open(dl_path.clone());
+            q.record(
+                "aokie",
+                "aokie.call.incoming",
+                crate::bridge::DeadReason::Shed,
+                envelope(),
+            )
+            .id
+        };
+
+        let triggers: TriggerStoreHandle =
+            Arc::new(Mutex::new(TriggerStore::load(sb.0.join("triggers.json"))));
+        triggers.lock().unwrap().upsert(binding("b1", None)).unwrap();
+        let host = PluginHost::new(
+            crate::plugins::registry::new_handle(sb.0.join("plugins")),
+            crate::bridge::ledger::new_handle(),
+            triggers,
+            crate::bridge::deadletters::open_handle(dl_path),
+            "0.0.0-test".into(),
+            true,
+        );
+
+        let (outcomes, reserved) = host.redrive(&id).expect("loaded from disk");
+        assert!(reserved, "{outcomes:?}");
+        assert_eq!(host.ledger.lock().unwrap().len(), 1);
+    }
 }
