@@ -392,6 +392,10 @@ export interface PairedApp {
   id: string;
   product: string;
   label?: string;
+  /** The browser origin this token was granted to. `product` and `label` are
+   *  both supplied by the consumer and neither is unique, so this is the only
+   *  field that says WHICH site holds the grant. Absent for a native caller. */
+  origin?: string | null;
   createdAtMs: number;
 }
 
