@@ -383,7 +383,10 @@ mod tests {
             Some("  Reception PC  "),
         );
         assert!(url.starts_with("https://formlogic.com/oauth/authorize?"), "{url}");
-        assert!(url.contains("client_id=formlogic-desktop"));
+        // OAIY has its own registered client id, so a link is attributable and
+        // separately revocable rather than indistinguishable from the
+        // provider's own desktop app.
+        assert!(url.contains("client_id=oaiy-desktop"), "{url}");
         assert!(url.contains("response_type=code"), "descriptor extras must appear");
         assert!(url.contains("code_challenge=chal"));
         assert!(url.contains("code_challenge_method=S256"));
