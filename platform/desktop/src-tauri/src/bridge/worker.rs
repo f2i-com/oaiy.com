@@ -184,7 +184,11 @@ fn bundled_cli_script() -> Option<PathBuf> {
 /// the app, then whatever is on PATH. The bundled step is why an installed OAIY
 /// can run flows without the user installing anything else — before it, a
 /// packaged app resolved nothing and every run failed `runtime_unavailable`.
-pub fn resolve_cli(env_value: Option<&str>, path_lookup: impl Fn(&str) -> Option<PathBuf>) -> Option<CliInvocation> {
+pub fn resolve_cli(
+    env_value: Option<&str>,
+    bundled: impl Fn() -> Option<PathBuf>,
+    path_lookup: impl Fn(&str) -> Option<PathBuf>,
+) -> Option<CliInvocation> {
     if let Some(raw) = env_value.map(str::trim).filter(|s| !s.is_empty()) {
         let p = PathBuf::from(raw);
         let is_js = p
@@ -197,7 +201,7 @@ pub fn resolve_cli(env_value: Option<&str>, path_lookup: impl Fn(&str) -> Option
             CliInvocation::Binary { path: p }
         });
     }
-    if let Some(script) = bundled_cli_script() {
+    if let Some(script) = bundled() {
         return Some(CliInvocation::Node { script });
     }
     path_lookup("oaiy").map(|path| CliInvocation::Binary { path })
@@ -227,7 +231,7 @@ fn lookup_on_path(name: &str) -> Option<PathBuf> {
 /// Uses the SAME resolution a run does, so status cannot claim the runtime is
 /// ready while an actual run fails with `runtime_unavailable` (or the reverse).
 pub fn cli_status() -> Option<CliInvocation> {
-    resolve_cli(std::env::var("OAIY_CLI").ok().as_deref(), lookup_on_path)
+    resolve_cli(std::env::var("OAIY_CLI").ok().as_deref(), bundled_cli_script, lookup_on_path)
 }
 
 pub struct Worker {
@@ -235,6 +239,9 @@ pub struct Worker {
     flows: Arc<FlowStore>,
     device_label: String,
     stop: Arc<AtomicBool>,
+    /// Resolves the Node runtime per run, so installing one mid-session is
+    /// picked up without restarting the app.
+    node: Option<crate::services::node_runtime::NodeHandle>,
 }
 
 impl Worker {
@@ -244,6 +251,7 @@ impl Worker {
         ledger: LedgerHandle,
         flows: Arc<FlowStore>,
         device_label: String,
+        node: Option<crate::services::node_runtime::NodeHandle>,
     ) -> Arc<AtomicBool> {
         let stop = Arc::new(AtomicBool::new(false));
         let worker = Worker {
@@ -251,6 +259,7 @@ impl Worker {
             flows,
             device_label,
             stop: stop.clone(),
+            node,
         };
         thread::spawn(move || worker.run_loop());
         stop
@@ -320,7 +329,7 @@ impl Worker {
             );
         }
 
-        let Some(cli) = resolve_cli(std::env::var("OAIY_CLI").ok().as_deref(), lookup_on_path)
+        let Some(cli) = resolve_cli(std::env::var("OAIY_CLI").ok().as_deref(), bundled_cli_script, lookup_on_path)
         else {
             return (
                 RunStatus::Failed,
@@ -365,7 +374,14 @@ impl Worker {
 
         let mut cmd = match &cli {
             CliInvocation::Node { script } => {
-                let mut c = Command::new("node");
+                // Prefer a resolved Node (portable install, else PATH) over the
+                // bare name: a packaged app cannot assume `node` is on PATH.
+                let exe = self
+                    .node
+                    .as_ref()
+                    .and_then(|n| n.resolve())
+                    .unwrap_or_else(|| PathBuf::from("node"));
+                let mut c = Command::new(exe);
                 c.arg(script);
                 c
             }
@@ -578,7 +594,7 @@ mod tests {
     fn an_explicit_oaiy_cli_wins_over_everything_else() {
         // An operator pointing at their own build must never be silently
         // overridden by the copy we ship.
-        let r = resolve_cli(Some("C:/dev/oaiy-web/cli/bin/oaiy.mjs"), |_| {
+        let r = resolve_cli(Some("C:/dev/oaiy-web/cli/bin/oaiy.mjs"), || None, |_| {
             Some(PathBuf::from("C:/on/path/oaiy.exe"))
         });
         match r {
@@ -591,7 +607,7 @@ mod tests {
 
     #[test]
     fn a_non_js_oaiy_cli_is_treated_as_a_binary() {
-        match resolve_cli(Some("/usr/local/bin/oaiy"), |_| None) {
+        match resolve_cli(Some("/usr/local/bin/oaiy"), || None, |_| None) {
             Some(CliInvocation::Binary { path }) => assert!(path.ends_with("oaiy")),
             other => panic!("expected a binary, got {other:?}"),
         }
@@ -602,7 +618,7 @@ mod tests {
         // Whitespace must not resolve to a nonsense empty path — it has to fall
         // through to the bundled/PATH lookup like an unset variable.
         for env in [Some("   "), Some(""), None] {
-            let r = resolve_cli(env, |_| Some(PathBuf::from("/found/on/path/oaiy")));
+            let r = resolve_cli(env, || None, |_| Some(PathBuf::from("/found/on/path/oaiy")));
             // Either the bundled script (when this checkout has one staged) or
             // the PATH hit — never an empty Node script path.
             match r {
@@ -614,17 +630,34 @@ mod tests {
     }
 
     #[test]
-    fn with_no_env_and_nothing_on_path_resolution_is_none_unless_bundled() {
-        // The honest failure the readiness endpoint reports. When a bundled CLI
-        // IS present next to the test binary, resolution legitimately succeeds —
-        // assert the two possibilities rather than pinning to one environment.
-        match resolve_cli(None, |_| None) {
-            None => {}
+    fn the_bundled_cli_is_used_before_path_but_after_an_explicit_env() {
+        let bundled = || Some(PathBuf::from("C:/app/resources/cli/oaiy.mjs"));
+        let on_path = |_: &str| Some(PathBuf::from("C:/on/path/oaiy.exe"));
+
+        // No env → the copy we ship wins over PATH, which is what makes an
+        // installed app work without the user installing anything.
+        match resolve_cli(None, bundled, on_path) {
             Some(CliInvocation::Node { script }) => {
-                assert!(script.is_file(), "a Some(..) must point at a real bundled script");
+                assert!(script.to_string_lossy().contains("resources/cli"))
             }
-            other => panic!("unexpected resolution {other:?}"),
+            other => panic!("expected the bundled script, got {other:?}"),
         }
+        // An explicit env var still beats the bundle.
+        match resolve_cli(Some("C:/dev/oaiy.mjs"), bundled, on_path) {
+            Some(CliInvocation::Node { script }) => {
+                assert!(script.to_string_lossy().contains("dev"))
+            }
+            other => panic!("expected the explicit path, got {other:?}"),
+        }
+        // No env and no bundle → PATH.
+        match resolve_cli(None, || None, on_path) {
+            Some(CliInvocation::Binary { path }) => {
+                assert!(path.to_string_lossy().contains("on/path"))
+            }
+            other => panic!("expected the PATH binary, got {other:?}"),
+        }
+        // Nothing anywhere → the honest None the readiness endpoint reports.
+        assert_eq!(resolve_cli(None, || None, |_| None), None);
     }
 
     // --- flow ids become path components ----------------------------------
@@ -671,7 +704,7 @@ mod tests {
 
     #[test]
     fn oaiy_cli_env_wins_and_js_goes_through_node() {
-        let r = resolve_cli(Some(r"C:\repo\cli\bin\oaiy.mjs"), |_| {
+        let r = resolve_cli(Some(r"C:\repo\cli\bin\oaiy.mjs"), || None, |_| {
             panic!("PATH must not be consulted when the env var is set")
         });
         assert_eq!(
@@ -680,13 +713,13 @@ mod tests {
                 script: PathBuf::from(r"C:\repo\cli\bin\oaiy.mjs")
             })
         );
-        let r = resolve_cli(Some(r"C:\tools\oaiy.exe"), |_| unreachable!());
+        let r = resolve_cli(Some(r"C:\tools\oaiy.exe"), || None, |_| unreachable!());
         assert!(matches!(r, Some(CliInvocation::Binary { .. })));
     }
 
     #[test]
     fn a_blank_env_var_falls_through_to_path() {
-        let r = resolve_cli(Some("   "), |name| {
+        let r = resolve_cli(Some("   "), || None, |name| {
             assert_eq!(name, "oaiy");
             Some(PathBuf::from("/usr/local/bin/oaiy"))
         });
@@ -695,7 +728,7 @@ mod tests {
 
     #[test]
     fn no_cli_anywhere_is_none_not_a_guess() {
-        assert_eq!(resolve_cli(None, |_| None), None);
+        assert_eq!(resolve_cli(None, || None, |_| None), None);
     }
 
     // --- output capture ----------------------------------------------------

@@ -315,10 +315,12 @@ async fn main() {
 
     // Plugins live under the data dir so relocating it takes them along; they
     // hold their own state and leaving it behind reads as data loss.
+    let node_runtime = oaiy_desktop_lib::services::node_runtime::new_handle(data_dir.clone());
     let bridge = oaiy_desktop_lib::build_bridge_state(
         data_dir.join("plugins"),
         data_dir.clone(),
         oaiy_desktop_lib::stable_device_id(&data_dir),
+        Some(node_runtime.clone()),
     );
     // AI provider store under <data>/ai (holds provider API keys plaintext,
     // guarded by the full/public split — never over the wire).
@@ -341,6 +343,7 @@ async fn main() {
     // gui_mode = false: headless server is token-strict (no webview origin).
     if let Err(e) = http::serve(
         port, config, auth_token, false, registry, downloads, python, catalog, bridge, ai_providers, ai_codex,
+        node_runtime,
     )
     .await
     {

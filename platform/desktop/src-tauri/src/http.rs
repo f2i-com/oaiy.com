@@ -101,6 +101,7 @@ struct AppState {
     downloads: DownloadsHandle,
     python: PythonHandle,
     catalog: CatalogHandle,
+    node: crate::services::node_runtime::NodeHandle,
 }
 
 /// The handshake every client uses to decide "is this actually us?".
@@ -432,6 +433,32 @@ async fn get_config(State(state): State<AppState>) -> impl IntoResponse {
     (StatusCode::OK, Json(state.config.snapshot(&state.registry))).into_response()
 }
 
+// ------- node runtime -------
+
+/// The Node runtime the bundled CLI runs under: system, portable, or absent.
+async fn node_status(State(state): State<AppState>) -> impl IntoResponse {
+    (StatusCode::OK, Json(state.node.snapshot())).into_response()
+}
+
+/// Download + install the pinned portable Node. Returns immediately; progress
+/// streams through `/api/node/logs`, mirroring the Python installer.
+async fn install_node(State(state): State<AppState>) -> impl IntoResponse {
+    match state.node.install() {
+        Ok(()) => StatusCode::ACCEPTED.into_response(),
+        Err(e) => err400(&e),
+    }
+}
+
+async fn node_logs(
+    State(state): State<AppState>,
+    Query(q): Query<LogsQuery>,
+) -> impl IntoResponse {
+    match state.node.current_logs(q.tail) {
+        Some(lines) => (StatusCode::OK, Json(lines)).into_response(),
+        None => (StatusCode::OK, Json(Vec::<crate::services::runner::LogLine>::new())).into_response(),
+    }
+}
+
 // ------- python -------
 
 async fn python_status(State(state): State<AppState>) -> impl IntoResponse {
@@ -587,6 +614,7 @@ fn is_privileged_path(method: &Method, path: &str) -> bool {
                     | "/api/models/download"
                     | "/api/python/venvs"
                     | "/api/python/install"
+                    | "/api/node/install"
             ) || (path.starts_with("/api/services/") && path.ends_with("/uninstall"))
                 || is_bridge_exec_path(path)
                 || is_ai_exec_path(path)
@@ -674,6 +702,8 @@ fn is_export_path(path: &str) -> bool {
 fn is_restricted_read_path(path: &str) -> bool {
     path == "/api/config"
         || path == "/api/python/logs"
+        || path == "/api/node"
+        || path == "/api/node/logs"
         || (path.starts_with("/api/services/") && path.ends_with("/logs"))
         // Bridge/plugin reads carry real data an arbitrary remote page must not
         // scrape cross-origin: events hold plugin-supplied payloads (for Aokie,
@@ -914,6 +944,8 @@ pub async fn serve(
     ai_providers: crate::ai::providers::ProviderStoreHandle,
     // The ChatGPT connector (a managed codex child, keyed to its own CODEX_HOME).
     ai_codex: crate::ai::CodexHandle,
+    // The Node runtime the bundled CLI runs under.
+    node: crate::services::node_runtime::NodeHandle,
 ) -> Result<(), BoxError> {
     // CORS stays permissive so a hosted oaiy-web at any domain can READ the
     // API (the localhost bind keeps non-local processes out). State-changing
@@ -941,6 +973,7 @@ pub async fn serve(
         downloads,
         python,
         catalog,
+        node,
     };
 
     // Merged rather than inlined: the bridge owns its own state (the run ledger
@@ -988,6 +1021,9 @@ pub async fn serve(
         .route("/api/models/downloads/:id/cancel", post(cancel_download))
         .route("/api/models/:name", delete(delete_model))
         // python
+        .route("/api/node", get(node_status))
+        .route("/api/node/install", post(install_node))
+        .route("/api/node/logs", get(node_logs))
         .route("/api/python", get(python_status))
         .route("/api/python/install", post(install_python))
         .route("/api/python/logs", get(python_logs))

@@ -1091,10 +1091,15 @@ pub fn run() {
                 // relocated data folder takes its plugins with it — plugins hold
                 // their own state (Aokie keeps phone pairing keys), and leaving
                 // that behind on a move would look like data loss.
+                // Portable Node lives under the data dir; the worker resolves it
+                // (or the system one) per run.
+                let node_for_http =
+                    crate::services::node_runtime::new_handle(data_dir_for_bridge.clone());
                 let bridge_for_http = crate::build_bridge_state(
                     plugins_root_for_http.clone(),
                     data_dir_for_bridge.clone(),
                     device_id_for_http.clone(),
+                    Some(node_for_http.clone()),
                 );
                 // Managed so the Exit arm can stop plugin children alongside
                 // services — an orphaned plugin keeps holding its hardware.
@@ -1122,6 +1127,7 @@ pub fn run() {
                     bridge_for_http,
                     ai_providers_for_http,
                     ai_codex_for_http,
+                    node_for_http,
                 )
                 .await
                 {
@@ -1253,6 +1259,8 @@ pub fn build_bridge_state(
     plugins_root: std::path::PathBuf,
     data_dir: std::path::PathBuf,
     device_id: String,
+    // Resolves the Node runtime the bundled CLI runs under.
+    node: Option<crate::services::node_runtime::NodeHandle>,
 ) -> bridge::BridgeState {
     // Durable: runs survive a restart, and a run left mid-execution is finalised
     // on reload so a standalone consumer (no ledger of its own) always gets a
@@ -1276,7 +1284,7 @@ pub fn build_bridge_state(
     // The worker owns nothing the state needs back; its stop flag is dropped
     // deliberately — it runs for the process lifetime, and the ledger being
     // in-memory means there is nothing to hand over on exit.
-    let _ = bridge::Worker::start(ledger.clone(), flows.clone(), device_id.clone());
+    let _ = bridge::Worker::start(ledger.clone(), flows.clone(), device_id.clone(), node.clone());
     bridge::BridgeState {
         ledger,
         plugins,
@@ -1284,6 +1292,7 @@ pub fn build_bridge_state(
         flows,
         pairing,
         device_id,
+        node,
     }
 }
 

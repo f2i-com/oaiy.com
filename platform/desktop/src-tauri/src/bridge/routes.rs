@@ -61,6 +61,9 @@ pub struct BridgeState {
     /// Stable per-install id, echoed in discovery so a consumer can tell two
     /// machines apart in run history.
     pub device_id: String,
+    /// The Node runtime the bundled CLI runs under — reported by readiness so a
+    /// missing runtime is distinguishable from a missing CLI.
+    pub node: Option<crate::services::node_runtime::NodeHandle>,
 }
 
 /// `caller` per `protocol/v1/caller.schema.json`.
@@ -780,7 +783,11 @@ async fn runtime_status(State(st): State<BridgeState>) -> axum::response::Respon
         .filter(|p| p.get("servesCommands").and_then(serde_json::Value::as_bool) == Some(true))
         .count();
 
-    let ready = cli.is_some();
+    // The bundled CLI is a Node script, so a resolved CLI is not enough: without
+    // a Node runtime the spawn fails and the run dies with a confusing error.
+    let node = st.node.as_ref().map(|n| n.snapshot());
+    let node_ok = node.as_ref().map(|n| n.available).unwrap_or(true);
+    let ready = cli.is_some() && node_ok;
     (
         StatusCode::OK,
         Json(json!({
@@ -791,10 +798,18 @@ async fn runtime_status(State(st): State<BridgeState>) -> axum::response::Respon
                 "cliKind": cli_kind,
                 // The fix, in the response, so a caller does not have to go
                 // looking for what "not resolved" means.
-                "detail": cli.is_none().then_some(
-                    "Install the `oaiy` CLI so it is on PATH, or set OAIY_CLI to the path of cli/bin/oaiy.mjs."
-                ),
+                // Name the ACTUAL blocker: "no CLI" and "no Node to run it with"
+                // need different fixes, and conflating them sends the user the
+                // wrong way.
+                "detail": if cli.is_none() {
+                    Some("Install the `oaiy` CLI so it is on PATH, or set OAIY_CLI to the path of cli/bin/oaiy.mjs.")
+                } else if !node_ok {
+                    Some("A Node runtime is required to run the bundled CLI — install it from OAIY Desktop, or put node on PATH.")
+                } else {
+                    None
+                },
             },
+            "nodeRuntime": node,
             "runs": { "queued": queued, "known": total_runs },
             "plugins": { "serving": plugins_serving, "total": plugins.len(), "detail": plugins },
         })),
