@@ -324,6 +324,29 @@ pub fn resolve_selector(selector: &str, event: &Event) -> Option<Value> {
 /// truthy-tested. Everything else is an error, and an error means do not fire.
 ///
 /// `&&` binds tighter than `||`, as in JS, so `a || b && c` is `a || (b && c)`.
+/// Can this condition be evaluated at all?
+///
+/// The restricted evaluator's errors are all SYNTACTIC — an unknown token,
+/// parentheses, a missing operand — and a selector that resolves to nothing is
+/// `null` rather than an error. So parseability can be decided against a probe
+/// event with no data, which means an author can be told at SAVE time.
+///
+/// That matters because the fail-safe direction is "do not fire". A binding
+/// whose condition will never parse is accepted, looks correct in the list, and
+/// silently does nothing — the trigger bug that is hardest to find. Refusing it
+/// at the moment it is written puts the error where the mistake is.
+pub fn condition_is_evaluatable(expr: &str) -> Result<(), String> {
+    let probe = Event {
+        name: String::new(),
+        source: String::new(),
+        correlation_id: String::new(),
+        idempotency_key: String::new(),
+        data: Value::Null,
+        origin_run: None,
+    };
+    eval_condition(expr, &probe).map(|_| ())
+}
+
 pub fn eval_condition(expr: &str, event: &Event) -> Result<bool, String> {
     let expr = expr.trim();
     if expr.is_empty() {
@@ -480,6 +503,44 @@ fn operand(text: &str, event: &Event) -> Result<Value, String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // --- save-time validation ------------------------------------------------
+
+    #[test]
+    fn an_unparseable_condition_is_caught_without_an_event() {
+        // Each of these is a real authoring mistake. Accepting them produces a
+        // binding that looks right and never fires.
+        for bad in [
+            "$event.data.x ==== 1",
+            "(a === 1) && (b === 2)",
+            "$event.data.x ===",
+            "flowId === 'abc'",
+            "",
+        ] {
+            assert!(
+                condition_is_evaluatable(bad).is_err(),
+                "{bad:?} should be refused at save time"
+            );
+        }
+    }
+
+    #[test]
+    fn a_valid_condition_passes_even_though_the_probe_has_no_data() {
+        // A selector resolving to nothing is null, not an error — so validation
+        // must not depend on the event carrying the fields the author names.
+        for good in [
+            "$event.data.callerNumber === '+61400000000'",
+            "event.data.known === true",
+            "event.data.attempts !== 0 && event.name === 'x'",
+            "$event.data.flag",
+        ] {
+            assert!(
+                condition_is_evaluatable(good).is_ok(),
+                "{good:?} should be accepted: {:?}",
+                condition_is_evaluatable(good)
+            );
+        }
+    }
 
     fn event() -> Event {
         Event {

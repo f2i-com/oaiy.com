@@ -156,6 +156,21 @@ impl TriggerStore {
         if binding.id.trim().is_empty() {
             return Err("binding id must not be empty".into());
         }
+        // A binding is only ever wrong in one direction: it does not fire, and
+        // nothing says why. Each of these produces exactly that — a row that
+        // looks correct in the list and is incapable of ever doing anything —
+        // so they are refused where the mistake is made rather than discovered
+        // later from a dead letter.
+        if binding.event.trim().is_empty() {
+            return Err("binding event must not be empty — it would match nothing".into());
+        }
+        if binding.flow_id.trim().is_empty() {
+            return Err("binding flowId must not be empty — there would be nothing to run".into());
+        }
+        if let Some(expr) = binding.condition.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
+            crate::bridge::triggers::condition_is_evaluatable(expr)
+                .map_err(|why| format!("condition cannot be evaluated ({why}): {expr}"))?;
+        }
         match self.bindings.iter_mut().find(|b| b.id == binding.id) {
             Some(existing) => *existing = binding,
             None => self.bindings.push(binding),
@@ -1225,13 +1240,18 @@ mod tests {
     }
 
     /// A host over temp dirs, with `bindings` installed.
+    ///
+    /// Written straight to the bindings file rather than through `upsert`,
+    /// because `upsert` now REFUSES a binding whose condition cannot be parsed —
+    /// and the dead-letter tests below need exactly that state. Which is not a
+    /// contrivance: a binding saved before that validation existed, or one
+    /// hand-edited into triggers.json, arrives through this same load path. It
+    /// is precisely why the dead-letter handling still has to work.
     fn host_with(tag: &str, bindings: Vec<TriggerBinding>) -> (Sandbox, Arc<PluginHost>) {
         let sb = Sandbox::new(tag);
-        let triggers = TriggerStore::load(sb.0.join("triggers.json"));
-        let triggers: TriggerStoreHandle = Arc::new(Mutex::new(triggers));
-        for b in bindings {
-            triggers.lock().unwrap().upsert(b).unwrap();
-        }
+        let path = sb.0.join("triggers.json");
+        std::fs::write(&path, serde_json::to_string(&bindings).unwrap()).unwrap();
+        let triggers: TriggerStoreHandle = Arc::new(Mutex::new(TriggerStore::load(path)));
         let host = PluginHost::new(
             crate::plugins::registry::new_handle(sb.0.join("plugins")),
             crate::bridge::ledger::new_handle(),
