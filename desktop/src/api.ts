@@ -856,6 +856,8 @@ export const appConfig = {
   // ----- per-service GPU pinning -----
   /** CUDA GPUs present (index + name). Empty on a box without an NVIDIA GPU. */
   listGpus: () => tauriInvoke<GpuInfo[]>('list_gpus'),
+  /** Where the desktop app writes its log, if logging is attached. */
+  logPath: () => tauriInvoke<string | null>('log_path'),
   /** Pin a service to a GPU index (CUDA_VISIBLE_DEVICES), or pass null to clear. Applies to
    * the service's next start — no app restart needed. */
   setServiceGpu: (id: string, gpu: number | null) =>

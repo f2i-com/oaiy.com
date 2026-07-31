@@ -15,6 +15,117 @@ pub mod plugins;
 /// stable target. Shared by both binaries (the GUI and the headless server).
 pub const DESKTOP_PORT: u16 = 17972;
 
+/// File logging for the GUI build.
+///
+/// The headless binary installs a stderr logger. The GUI installed NONE, so all
+/// 37 `log::` call sites in this crate wrote to nowhere in the packaged app —
+/// including "HTTP server exited", "registry init failed", and every plugin
+/// autostart failure. That is not a cosmetic gap: a startup hang in this app was
+/// diagnosable only by rebuilding it with `eprintln!`s, which is not something a
+/// user can do. A desktop app that cannot say what went wrong has to be debugged
+/// by whoever compiled it.
+///
+/// Deliberately small: no rotation library, no async appender. The write rate is
+/// a few lines per minute and the file is capped and rolled once, which is all
+/// that is needed to answer "what happened just before it broke".
+mod applog {
+    use std::io::Write as _;
+    use std::path::PathBuf;
+    use std::sync::Mutex;
+
+    /// Roll at 2 MiB, keeping one previous file. Enough to cover several
+    /// sessions; small enough that a user can open it and a support request can
+    /// carry it.
+    const MAX_BYTES: u64 = 2 * 1024 * 1024;
+    /// Records held before the data directory is known. The interesting failures
+    /// happen during startup, so dropping those would defeat the purpose — but
+    /// this is bounded, because a logger that can exhaust memory is worse than
+    /// no logger.
+    const PREBUFFER_LINES: usize = 512;
+
+    #[derive(Default)]
+    struct Sink {
+        path: Option<PathBuf>,
+        pending: Vec<String>,
+    }
+
+    pub struct FileLogger {
+        sink: Mutex<Sink>,
+    }
+
+    pub static LOGGER: FileLogger = FileLogger { sink: Mutex::new(Sink { path: None, pending: Vec::new() }) };
+
+    impl FileLogger {
+        /// Point the logger at `<data_dir>/logs/oaiy-desktop.log` and flush
+        /// whatever was buffered before the path was known.
+        pub fn attach(&self, data_dir: &std::path::Path) {
+            let dir = data_dir.join("logs");
+            if std::fs::create_dir_all(&dir).is_err() {
+                return;
+            }
+            let path = dir.join("oaiy-desktop.log");
+            let Ok(mut sink) = self.sink.lock() else { return };
+            let pending = std::mem::take(&mut sink.pending);
+            sink.path = Some(path.clone());
+            drop(sink);
+            for line in pending {
+                self.append(&path, &line);
+            }
+        }
+
+        /// Where the log lives, for the UI to show and open.
+        pub fn path(&self) -> Option<PathBuf> {
+            self.sink.lock().ok().and_then(|s| s.path.clone())
+        }
+
+        fn append(&self, path: &std::path::Path, line: &str) {
+            // Roll before writing so the cap is a real ceiling rather than a
+            // threshold the last write is allowed to blow past.
+            if std::fs::metadata(path).map(|m| m.len()).unwrap_or(0) >= MAX_BYTES {
+                let _ = std::fs::rename(path, path.with_extension("log.1"));
+            }
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                let _ = writeln!(f, "{line}");
+            }
+        }
+    }
+
+    impl log::Log for FileLogger {
+        fn enabled(&self, _: &log::Metadata) -> bool {
+            true
+        }
+
+        fn log(&self, record: &log::Record) {
+            let line = format!(
+                "{} [{}] {}: {}",
+                chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                record.level(),
+                record.target(),
+                record.args()
+            );
+            let path = {
+                let Ok(mut sink) = self.sink.lock() else { return };
+                match sink.path.clone() {
+                    Some(p) => Some(p),
+                    None => {
+                        // Not attached yet: hold it, bounded. Keeping the OLDEST
+                        // is right — the first failure explains the rest.
+                        if sink.pending.len() < PREBUFFER_LINES {
+                            sink.pending.push(line.clone());
+                        }
+                        None
+                    }
+                }
+            };
+            if let Some(p) = path {
+                self.append(&p, &line);
+            }
+        }
+
+        fn flush(&self) {}
+    }
+}
+
 /// Keep a spawned console program from flashing a window.
 ///
 /// The release GUI is built with `windows_subsystem = "windows"`, so the process
@@ -966,6 +1077,16 @@ async fn port_holder_is_oaiy() -> bool {
         .is_some_and(|product| product == http::PRODUCT_ID)
 }
 
+/// Tauri command: where the app's log file is, if logging is attached.
+///
+/// Exposed so Settings can offer "Open logs" — a log the user cannot find is
+/// barely better than no log, and this file is the first thing to ask for when
+/// something goes wrong on a machine we cannot reach.
+#[tauri::command]
+fn log_path() -> Option<String> {
+    crate::applog::LOGGER.path().map(|p| p.display().to_string())
+}
+
 /// Tauri command: open a native folder picker, returning the chosen path
 /// (or None if cancelled). Non-blocking via a oneshot so we never stall
 /// the UI thread.
@@ -1093,12 +1214,21 @@ fn set_hf_token(
 }
 
 pub fn run() {
+    // Before anything else: without this, every log:: call in the GUI went
+    // nowhere. main.rs sets `windows_subsystem = "windows"` so there is no
+    // console either, which is why a startup hang in this app could only be
+    // diagnosed by rebuilding it with eprintln!s. Records emitted before the
+    // data directory is known are buffered and flushed by `attach` below.
+    let _ = log::set_logger(&crate::applog::LOGGER);
+    log::set_max_level(log::LevelFilter::Info);
+
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
         .invoke_handler(tauri::generate_handler![
             open_path,
+            log_path,
             open_url,
             get_config,
             set_data_dir,
@@ -1128,6 +1258,11 @@ pub fn run() {
             let data_dir = resolve_data_dir(app.handle());
             // Models live under a separately-configurable dir (the user can
             // park a big library on another drive); defaults to <dataDir>/models.
+            // The log file lives with the data it describes, and moves when the
+            // user relocates the data folder.
+            crate::applog::LOGGER.attach(&data_dir);
+            log::info!("OAIY Desktop {} starting (data={})", env!("CARGO_PKG_VERSION"), data_dir.display());
+
             let models_dir = resolve_models_dir(app.handle(), &data_dir);
             // Additional read-only weight folders the user registered (e.g.
             // E:\ckpts) — joined with the primary into the ${modelDirs} search

@@ -23,6 +23,7 @@ import { useToast } from './Toasts';
  */
 export default function SettingsPanel() {
   const [cfg, setCfg] = useState<DesktopConfig | null>(null);
+  const [logFile, setLogFile] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [manualPath, setManualPath] = useState('');
   const [busy, setBusy] = useState(false);
@@ -53,6 +54,8 @@ export default function SettingsPanel() {
   const refresh = useCallback(async () => {
     try {
       setCfg(await appConfig.get());
+      // Best-effort: an older build without the command just has no log row.
+      setLogFile(await appConfig.logPath().catch(() => null));
       setError(null);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -367,6 +370,29 @@ export default function SettingsPanel() {
                 )}
               </div>
             </div>
+
+            {/* The first thing to ask for when something goes wrong on a
+                machine we cannot reach. Only shown once logging is attached —
+                claiming a log file that does not exist would be worse. */}
+            {logFile && (
+              <div className="settings-row">
+                <span className="settings-label">Log file</span>
+                <div className="settings-value">
+                  <code className="path-code">{logFile}</code>
+                  <button
+                    className="btn-tiny"
+                    title="Open in file explorer"
+                    onClick={() =>
+                      openInExplorer(logFile).catch((e) =>
+                        setError(e instanceof Error ? e.message : String(e)),
+                      )
+                    }
+                  >
+                    open
+                  </button>
+                </div>
+              </div>
+            )}
 
             {cfg.restartRequired && (
               <div className="banner banner-pending">
