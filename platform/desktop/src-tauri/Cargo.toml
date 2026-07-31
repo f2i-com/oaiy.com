@@ -100,6 +100,10 @@ fs2 = "0.4"
 # verify the SAME payloads — a different curve or encoding would produce
 # signatures the mobile app rejects.
 ed25519-dalek = { version = "2", features = ["signature"] }
+# The pairing offer is shown as a QR so the operator can point a phone at it
+# rather than retyping a 700-byte payload. SVG only — no image encoder, and no
+# default features, because this renders into a string the UI inlines.
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 base64 = "0.22"
 getrandom = "0.2"
 
