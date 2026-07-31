@@ -5,6 +5,7 @@
 //! Phase 2: load the service registry, manage child processes, expose
 //! /api/services/* and stop everything cleanly on exit.
 
+pub mod origin;
 pub mod link;
 pub mod ai;
 pub mod http;

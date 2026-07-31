@@ -285,10 +285,8 @@ pub fn normalize_base(raw: &str) -> Result<String, String> {
     if base.len() > 512 {
         return Err("that address is too long".into());
     }
-    let is_loopback =
-        base.starts_with("http://127.0.0.1") || base.starts_with("http://localhost");
-    if !base.starts_with("https://") && !is_loopback {
-        return Err("the address must be https (or loopback for local testing)".into());
+    if !crate::origin::may_carry_credential(&base) {
+        return Err(crate::origin::INSECURE_ADDRESS_HELP.into());
     }
     if base.contains(['?', '#', ' ']) {
         return Err("the address must be a plain origin, with no query or fragment".into());
@@ -595,6 +593,21 @@ mod tests {
         assert_eq!(status.available[0].id, "formlogic");
         assert!(!status.available[0].scopes.is_empty(), "the UI shows what is granted");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_local_deployment_can_be_linked_over_plain_http() {
+        // The real case: FormLogic served by WAMP as http://formlogic.local.
+        // Requiring a certificate for that would mean the only way to use a
+        // local install is to turn the check off entirely.
+        assert_eq!(
+            normalize_base("http://formlogic.local/").unwrap(),
+            "http://formlogic.local"
+        );
+        assert!(normalize_base("http://formlogic.local:8080").is_ok());
+        assert!(normalize_base("http://api.formlogic.local").is_ok());
+        // …but the exception is on the HOST, so it cannot be smuggled in a path.
+        assert!(normalize_base("http://evil.example/formlogic.local").is_err());
     }
 
     #[test]
