@@ -157,12 +157,11 @@ fn normalize(mut config: UpstreamConfig) -> Result<UpstreamConfig, String> {
     if config.token.is_empty() {
         return Err("an upstream token is required".into());
     }
-    // https, or explicit loopback for a local relay under development. Plain
-    // http to anywhere else would put the bearer on the wire in clear.
-    let is_loopback = config.base_url.starts_with("http://127.0.0.1:")
-        || config.base_url.starts_with("http://localhost:");
-    if !config.base_url.starts_with("https://") && !is_loopback {
-        return Err("the upstream base URL must be https (or loopback for local testing)".into());
+    // Same rule as the account link: https anywhere, plain http only for
+    // loopback or a .local name. A relay is as likely to be a local deployment
+    // as the provider is.
+    if !crate::origin::may_carry_credential(&config.base_url) {
+        return Err(crate::origin::INSECURE_ADDRESS_HELP.into());
     }
     if config.base_url.len() > 512 {
         return Err("the upstream base URL is too long".into());
@@ -452,6 +451,17 @@ mod tests {
         })
         .unwrap_err();
         assert!(err.contains("https"), "{err}");
+    }
+
+    #[test]
+    fn a_local_relay_may_be_reached_over_plain_http() {
+        let c = normalize(UpstreamConfig {
+            base_url: "http://relay.local:18788/api/v1".into(),
+            token: "t".into(),
+            app_id: None,
+        })
+        .unwrap();
+        assert_eq!(c.base_url, "http://relay.local:18788/api/v1");
     }
 
     #[test]

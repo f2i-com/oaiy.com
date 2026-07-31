@@ -69,11 +69,11 @@ async fn unlink(State(store): State<LinkHandle>) -> Json<LinkStatus> {
 /// so `&` has no special meaning. What IS still checked is the scheme — this
 /// must never become a way to launch `file:` or a custom protocol handler.
 pub fn open_in_browser(url: &str) -> Result<(), String> {
-    let allowed = url.starts_with("https://")
-        || url.starts_with("http://127.0.0.1")
-        || url.starts_with("http://localhost");
-    if !allowed {
-        return Err("refusing to open a non-https URL".into());
+    // Same rule as the address itself: https anywhere, plain http only for
+    // loopback or a .local name. If these two disagreed, a link could start and
+    // then silently fail to open the page it was waiting for.
+    if !crate::origin::may_carry_credential(url) {
+        return Err("refusing to open that URL".into());
     }
     // Control characters and quotes could still break out of argv quoting on
     // Windows, where the command line is a single string the callee re-parses.
