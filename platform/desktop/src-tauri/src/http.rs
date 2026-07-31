@@ -122,14 +122,30 @@ struct HealthResponse {
     status: &'static str,
     /// Stable machine identity. Never localise or re-word this.
     product: &'static str,
+    /// The same identity under the name a consumer's desktop-detection probe
+    /// looks for.
+    ///
+    /// Duplicated rather than renamed: `product` is this API's own long-standing
+    /// field and something may already match on it, while `companion` is what a
+    /// host app's loopback probe reads to decide a desktop is present at all.
+    /// Without it OAIY answers health perfectly and is still reported as "no
+    /// desktop", because the field the probe checks was simply absent.
+    companion: &'static str,
     /// Bridge Protocol the rest of this API speaks.
     protocol: &'static str,
     version: &'static str,
+    /// Surfaces the same numbers the probe records, so a consumer can refuse a
+    /// desktop too old for it rather than failing later on a missing route.
+    api_version: u32,
+    plugin_api_version: u32,
 }
 
 /// Wire identity. Deliberately NOT derived from the crate name — renaming the
 /// binary must not silently change what clients match on.
 pub const PRODUCT_ID: &str = "oaiy-desktop";
+
+/// Version of THIS HTTP API, for a consumer deciding whether it can talk to us.
+pub const API_VERSION: u32 = 1;
 /// Bump only on a breaking wire change; add fields freely without touching it.
 pub const BRIDGE_PROTOCOL: &str = "oaiy-bridge/1";
 
@@ -137,8 +153,11 @@ async fn health() -> Json<HealthResponse> {
     Json(HealthResponse {
         status: "ok",
         product: PRODUCT_ID,
+        companion: PRODUCT_ID,
         protocol: BRIDGE_PROTOCOL,
         version: env!("CARGO_PKG_VERSION"),
+        api_version: API_VERSION,
+        plugin_api_version: *crate::plugins::manifest::SUPPORTED_PLUGIN_API.end(),
     })
 }
 
@@ -156,6 +175,16 @@ async fn list_services(State(state): State<AppState>) -> impl IntoResponse {
     }
 }
 
+/// A success body for control routes, instead of 204 No Content.
+///
+/// A bare 204 is correct HTTP and a trap for browser clients: a fetch wrapper
+/// that parses every reply as JSON sees an empty body, fails to parse, and
+/// reports a transport error — so a start that WORKED is shown to the user as a
+/// failure. A tiny body costs nothing and removes the whole class of bug.
+fn ok_body() -> axum::response::Response {
+    (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response()
+}
+
 async fn start_service(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -166,7 +195,7 @@ async fn start_service(
         .map_err(|_| "registry mutex poisoned".to_string())
         .and_then(|mut reg| reg.start(&id));
     match result {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => ok_body(),
         Err(e) => err400(&e),
     }
 }
@@ -181,7 +210,7 @@ async fn stop_service(
         .map_err(|_| "registry mutex poisoned".to_string())
         .and_then(|mut reg| reg.stop(&id));
     match result {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => ok_body(),
         Err(e) => err400(&e),
     }
 }
@@ -201,7 +230,7 @@ async fn repair_service(
         .map_err(|_| "registry mutex poisoned".to_string())
         .and_then(|mut reg| reg.repair(&id));
     match result {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => ok_body(),
         Err(e) => err400(&e),
     }
 }
@@ -612,6 +641,13 @@ fn is_loopback_origin(origin: &str) -> bool {
 fn is_allowed_origin(origin: &str) -> bool {
     // Dev + locally-served oaiy-web (any loopback port).
     if is_loopback_origin(origin) {
+        return true;
+    }
+    // The provider this desktop is LINKED to. Linking is the user approving
+    // that provider, and its web app is where they then expect to see and
+    // control this machine. Derived from the link rather than hardcoded, so no
+    // address is baked in and unlinking withdraws it.
+    if crate::link::linked_origin().is_some_and(|o| o == origin) {
         return true;
     }
     // Tauri webview origins (in case OAIY Desktop's own UI ever calls over HTTP).
@@ -1032,6 +1068,36 @@ pub async fn serve(
         ])
         .allow_headers(Any);
 
+    /// Answer Chrome's Private Network Access preflight.
+    ///
+    /// A page on a public or `.local` address calling `127.0.0.1` is a
+    /// private-network request. Chrome sends
+    /// `Access-Control-Request-Private-Network: true` on the preflight and
+    /// BLOCKS the real request unless the reply carries
+    /// `Access-Control-Allow-Private-Network: true`. Ordinary CORS headers are
+    /// not enough, and the failure shows up as a bare network error — which is
+    /// exactly what "Loading services…" forever looks like.
+    ///
+    /// Only added when asked for, and only on the preflight, so nothing changes
+    /// for the loopback and Tauri callers that never trigger PNA. The existing
+    /// origin gate still decides what the follow-up request may actually do.
+    async fn allow_private_network(
+        req: axum::extract::Request,
+        next: axum::middleware::Next,
+    ) -> axum::response::Response {
+        const REQUEST: &str = "access-control-request-private-network";
+        const ALLOW: &str = "access-control-allow-private-network";
+        let asked = req.method() == Method::OPTIONS
+            && req.headers().get(REQUEST).and_then(|v| v.to_str().ok()) == Some("true");
+        let mut resp = next.run(req).await;
+        if asked {
+            if let Ok(value) = axum::http::HeaderValue::from_str("true") {
+                resp.headers_mut().insert(ALLOW, value);
+            }
+        }
+        resp
+    }
+
     // The AI sources union needs to read the services registry; clone the handle
     // before `registry` is moved into AppState below.
     let registry_for_ai = registry.clone();
@@ -1114,7 +1180,10 @@ pub async fn serve(
             AuthConfig { token: auth_token, gui_mode, pairing: Some(pairing_for_auth) },
             origin_guard,
         ))
-        .layer(cors);
+        .layer(cors)
+        // OUTSIDE the CORS layer so it runs after it and can add to the
+        // preflight response CORS produced.
+        .layer(axum::middleware::from_fn(allow_private_network));
 
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -1127,10 +1196,28 @@ pub async fn serve(
 #[cfg(test)]
 mod tests {
     use super::{
-        is_allowed_origin_privileged, is_privileged_path, is_restricted_read_path,
+        is_allowed_origin, is_allowed_origin_privileged, is_privileged_path, is_restricted_read_path,
         privileged_allowed, AuthConfig, ModelDownloadRequest,
     };
     use axum::http::Method;
+
+    #[test]
+    fn the_linked_providers_origin_is_trusted_and_nothing_else_new_is() {
+        // Linking is the user approving that provider, and its web app is where
+        // they expect to manage this desktop from. Derived from the link so no
+        // address is hardcoded — and so unlinking withdraws it.
+        assert!(!is_allowed_origin("http://formlogic.local"), "untrusted before linking");
+        crate::link::set_linked_origin_for_tests(Some("http://formlogic.local"));
+        assert!(is_allowed_origin("http://formlogic.local"));
+        // Exact origin only: a sibling host or a different scheme/port is a
+        // different origin and must not inherit the trust.
+        assert!(!is_allowed_origin("http://evil.formlogic.local"));
+        assert!(!is_allowed_origin("https://formlogic.local"));
+        assert!(!is_allowed_origin("http://formlogic.local:8080"));
+
+        crate::link::set_linked_origin_for_tests(None);
+        assert!(!is_allowed_origin("http://formlogic.local"), "unlinking withdraws it");
+    }
 
     #[test]
     fn linking_is_privileged_and_the_status_is_a_restricted_read() {

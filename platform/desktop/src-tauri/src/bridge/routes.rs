@@ -762,6 +762,16 @@ async fn finish_run(
 
 // ------- plugin lifecycle -------
 
+/// A success body for control routes, instead of 204 No Content.
+///
+/// A bare 204 is correct HTTP and a trap for browser clients: a fetch wrapper
+/// that parses every reply as JSON sees an empty body, fails to parse, and
+/// reports a transport error — so a start that WORKED is shown to the user as a
+/// failure. A tiny body costs nothing and removes the whole class of bug.
+fn ok_body() -> axum::response::Response {
+    (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response()
+}
+
 async fn start_plugin(State(st): State<BridgeState>, Path(id): Path<String>) -> axum::response::Response {
     let host = st.host.clone();
     // Blocking: spawn + handshake can take the full HANDSHAKE_TIMEOUT.
@@ -775,7 +785,7 @@ async fn start_plugin(State(st): State<BridgeState>, Path(id): Path<String>) -> 
 async fn stop_plugin(State(st): State<BridgeState>, Path(id): Path<String>) -> axum::response::Response {
     let host = st.host.clone();
     match tokio::task::spawn_blocking(move || host.stop(&id)).await {
-        Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Ok(())) => ok_body(),
         Ok(Err(e)) => bridge_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", e),
         Err(e) => bridge_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()),
     }
@@ -1471,7 +1481,7 @@ async fn approve_pairing(State(st): State<BridgeState>, Path(id): Path<String>) 
 async fn deny_pairing(State(st): State<BridgeState>, Path(id): Path<String>) -> axum::response::Response {
     match st.pairing.lock() {
         Ok(mut mgr) => match mgr.deny(&id) {
-            Ok(()) => StatusCode::NO_CONTENT.into_response(),
+            Ok(()) => ok_body(),
             Err(e) => bridge_error(StatusCode::NOT_FOUND, "invalid_request", e),
         },
         Err(_) => bridge_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", "pairing lock poisoned".into()),

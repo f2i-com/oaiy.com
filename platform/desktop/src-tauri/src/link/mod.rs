@@ -26,6 +26,54 @@ use std::time::Instant;
 
 pub use descriptor::ConnectorDescriptor;
 
+/// Origin of the provider this desktop is linked to, if any.
+///
+/// A process-wide cell rather than a parameter because the origin allow-list in
+/// `http.rs` is a free function consulted per request, long before any handle is
+/// in scope. Written whenever the link changes.
+///
+/// Why trust it at all: linking is the user explicitly approving that provider,
+/// and its web app is the surface they then expect to manage this desktop from.
+/// Deriving the trusted origin FROM the link means no address is ever hardcoded
+/// and unlinking withdraws the trust in the same action.
+static LINKED_ORIGIN: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
+
+/// The linked provider's origin, for the origin allow-list.
+pub fn linked_origin() -> Option<String> {
+    LINKED_ORIGIN.read().ok().and_then(|g| g.clone())
+}
+
+/// Set the trusted origin directly, for tests in other modules.
+#[cfg(test)]
+pub fn set_linked_origin_for_tests(base_url: Option<&str>) {
+    set_linked_origin(base_url);
+}
+
+fn set_linked_origin(base_url: Option<&str>) {
+    if let Ok(mut guard) = LINKED_ORIGIN.write() {
+        // Store the ORIGIN, not the base: a provider served under a path still
+        // sends `Origin: scheme://host[:port]`.
+        *guard = base_url.and_then(origin_of);
+    }
+}
+
+/// `scheme://host[:port]` from a base URL, or `None` if it is not one we would
+/// have accepted in the first place.
+fn origin_of(base_url: &str) -> Option<String> {
+    let (scheme, rest) = if let Some(r) = base_url.strip_prefix("https://") {
+        ("https", r)
+    } else if let Some(r) = base_url.strip_prefix("http://") {
+        ("http", r)
+    } else {
+        return None;
+    };
+    let authority = rest.split(['/', '?', '#']).next().filter(|a| !a.is_empty())?;
+    if authority.contains('@') {
+        return None;
+    }
+    Some(format!("{scheme}://{authority}"))
+}
+
 /// The stored link. The credential is in here and never leaves the host.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -157,6 +205,7 @@ pub fn open_handle(data_dir: PathBuf) -> LinkHandle {
     // One worker for the process lifetime. It asks the store what to do each
     // tick, so linking and unlinking need not start or stop anything.
     heartbeat::spawn(store.clone());
+    set_linked_origin(store.account().as_ref().map(|a| a.base_url.as_str()));
     store
 }
 
@@ -292,6 +341,11 @@ impl LinkStore {
             inner.attempt = LinkPhase::Idle;
             inner.last_heartbeat_at = None;
             inner.heartbeat_error = None;
+        }
+        // Withdrawn in the same action that forgot the link: a provider we are
+        // no longer linked to must not keep reaching this machine.
+        set_linked_origin(None);
+        {
         }
         self.status()
     }
@@ -479,6 +533,7 @@ pub fn start_link(
         match outcome {
             Ok(account) => match for_thread.persist(&account) {
                 Ok(()) => {
+                    set_linked_origin(Some(account.base_url.as_str()));
                     let mut inner = for_thread.inner.lock().unwrap_or_else(|e| e.into_inner());
                     inner.account = Some(account);
                     inner.attempt = LinkPhase::Linked;
