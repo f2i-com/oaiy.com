@@ -13,6 +13,7 @@
 //! (`connector.aokie.sms.send`), which are command namespaces a plugin exposes.
 //! This is an account link — outbound, one per machine.
 
+pub mod data_node;
 pub mod descriptor;
 pub mod heartbeat;
 pub mod oauth;
@@ -163,6 +164,14 @@ pub struct LinkStatus {
     /// "connecting…" that is never going to resolve.
     pub heartbeat_supported: bool,
     pub relay_supported: bool,
+    /// This desktop's storage-node enrolment, once the provider has answered.
+    /// The fingerprint here is what the owner compares against their browser
+    /// before approving — the whole ceremony rests on the two matching.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data_node: Option<data_node::DataNodeStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data_node_error: Option<String>,
+    pub data_node_supported: bool,
     /// The in-flight attempt, if any.
     pub attempt: LinkPhase,
     /// Every provider this build can link to.
@@ -197,6 +206,8 @@ struct Inner {
     heartbeat_error: Option<String>,
     last_relay_at: Option<chrono::DateTime<chrono::Utc>>,
     relay_error: Option<String>,
+    data_node: Option<data_node::DataNodeStatus>,
+    data_node_error: Option<String>,
 }
 
 pub struct LinkStore {
@@ -224,11 +235,17 @@ pub fn open_handle(data_dir: PathBuf) -> LinkHandle {
             heartbeat_error: None,
             last_relay_at: None,
             relay_error: None,
+            data_node: None,
+            data_node_error: None,
         }),
     });
     // One worker for the process lifetime. It asks the store what to do each
     // tick, so linking and unlinking need not start or stop anything.
     heartbeat::spawn(store.clone());
+    // Enrolment as a storage node the owner can approve. Separate from the
+    // heartbeat: presence is per-minute, enrolment is per-hour and its answer
+    // is a state the user acts on rather than a liveness signal.
+    data_node::spawn(store.clone());
     set_linked_origin(store.account().as_ref().map(|a| a.base_url.as_str()));
     store
 }
@@ -267,6 +284,9 @@ impl LinkStore {
                 relay_error: None,
                 heartbeat_supported: false,
                 relay_supported: false,
+                data_node: None,
+                data_node_error: None,
+                data_node_supported: false,
                 attempt: inner.attempt.clone(),
                 available,
             },
@@ -290,6 +310,9 @@ impl LinkStore {
                     relay_error: inner.relay_error.clone(),
                     heartbeat_supported: d.is_some_and(|d| d.heartbeat.is_some()),
                     relay_supported: d.is_some_and(|d| d.relay.is_some()),
+                    data_node: inner.data_node.clone(),
+                    data_node_error: inner.data_node_error.clone(),
+                    data_node_supported: d.is_some_and(|d| d.data_node.is_some()),
                     attempt: inner.attempt.clone(),
                     available,
                 }
@@ -349,6 +372,21 @@ impl LinkStore {
         inner.relay_error = error;
     }
 
+    /// Record the outcome of a node registration.
+    pub fn note_data_node(&self, outcome: Result<data_node::DataNodeStatus, String>) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        match outcome {
+            Ok(status) => {
+                inner.data_node = Some(status);
+                inner.data_node_error = None;
+            }
+            // The last known record is KEPT: a failed refresh does not undo an
+            // approval, and blanking the fingerprint mid-ceremony would leave
+            // the owner with nothing to compare against.
+            Err(e) => inner.data_node_error = Some(e),
+        }
+    }
+
     /// Record the outcome of a heartbeat.
     pub fn note_heartbeat(&self, error: Option<String>) {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -393,6 +431,11 @@ impl LinkStore {
             // would be shown against the next one that is linked.
             inner.last_relay_at = None;
             inner.relay_error = None;
+            // The IDENTITY stays on disk: the same machine relinking is the
+            // same node, and re-minting would ask the owner to approve a device
+            // they already approved. Only the provider's answer is forgotten.
+            inner.data_node = None;
+            inner.data_node_error = None;
         }
         // Withdrawn in the same action that forgot the link: a provider we are
         // no longer linked to must not keep reaching this machine.

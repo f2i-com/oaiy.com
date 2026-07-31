@@ -49,6 +49,14 @@
     "batchLimit": 8,
     "errorBackoffSeconds": 10
   },
+  "dataNode": {
+    "registerPath": "/api/v1/data-node/register",
+    "selfPath": "/api/v1/data-node/self",
+    "intervalSeconds": 3600,
+    "capabilities": ["storage"],
+    "protocolMin": 1,
+    "protocolMax": 1
+  },
   "heartbeat": {
     "path": "/api/v1/desktop-connections",
     "intervalSeconds": 45,
