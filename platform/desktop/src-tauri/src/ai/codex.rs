@@ -26,7 +26,101 @@ use std::time::{Duration, Instant};
 
 /// The provider id this agent answers to, in the sources union and in
 /// `/api/ai/providers/<id>/v1/chat/completions`.
+///
+/// This is the GENERIC route: it accepts whatever model the caller names. The
+/// fixed live-call aliases below pin their own, and exist for a different
+/// reason — see [`LiveCallAlias`].
 pub const CODEX_PROVIDER_ID: &str = "openai-codex-agent";
+
+/// Fixed ChatGPT routes for taking a live phone call.
+///
+/// A call cannot wait on a reasoning model: the caller hears the silence. Each
+/// alias therefore pins a model AND a reasoning effort, rather than letting the
+/// caller choose and discovering mid-call that they chose badly.
+///
+/// They are separate provider IDS rather than parameters because the Aokie
+/// plugin recognises a live-call route BY ITS URL, and applies a policy it
+/// cannot apply to a generic one: it forces the matching model and refuses to
+/// send caller audio. A parameter on the generic route would be invisible to
+/// that check.
+///
+/// Ported from FormLogic Desktop so the same plugin, pointed at either host,
+/// gets the same four routes under the same names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LiveCallAlias {
+    ReasoningNone,
+    ReasoningLow,
+    LunaReasoningLow,
+    LunaReasoningLowFast,
+}
+
+pub const LIVE_CALL_MODEL: &str = "gpt-5.5";
+pub const LUNA_LIVE_CALL_MODEL: &str = "gpt-5.6-luna";
+
+impl LiveCallAlias {
+    /// The provider id, i.e. the `<id>` in the gateway path.
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::ReasoningNone => "openai-codex-agent-none",
+            Self::ReasoningLow => "openai-codex-agent-low",
+            Self::LunaReasoningLow => "openai-codex-agent-luna-low",
+            Self::LunaReasoningLowFast => "openai-codex-agent-luna-low-fast",
+        }
+    }
+
+    pub fn from_id(id: &str) -> Option<Self> {
+        [
+            Self::ReasoningNone,
+            Self::ReasoningLow,
+            Self::LunaReasoningLow,
+            Self::LunaReasoningLowFast,
+        ]
+        .into_iter()
+        .find(|a| a.id() == id)
+    }
+
+    pub fn model(self) -> &'static str {
+        match self {
+            Self::ReasoningNone | Self::ReasoningLow => LIVE_CALL_MODEL,
+            Self::LunaReasoningLow | Self::LunaReasoningLowFast => LUNA_LIVE_CALL_MODEL,
+        }
+    }
+
+    pub fn reasoning_effort(self) -> &'static str {
+        match self {
+            Self::ReasoningNone => "none",
+            Self::ReasoningLow | Self::LunaReasoningLow | Self::LunaReasoningLowFast => "low",
+        }
+    }
+
+    /// Luna's fast route asks for priority service; the rest take the default.
+    pub fn service_tier(self) -> Option<&'static str> {
+        match self {
+            Self::LunaReasoningLowFast => Some("priority"),
+            _ => None,
+        }
+    }
+
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Self::ReasoningNone => "ChatGPT / Codex — GPT-5.5, reasoning off",
+            Self::ReasoningLow => "ChatGPT / Codex — GPT-5.5, low reasoning",
+            Self::LunaReasoningLow => "ChatGPT / Codex — GPT-5.6 Luna, low reasoning",
+            Self::LunaReasoningLowFast => {
+                "ChatGPT / Codex — GPT-5.6 Luna, low reasoning, Fast mode"
+            }
+        }
+    }
+
+    pub fn all() -> [Self; 4] {
+        [
+            Self::ReasoningNone,
+            Self::ReasoningLow,
+            Self::LunaReasoningLow,
+            Self::LunaReasoningLowFast,
+        ]
+    }
+}
 
 const RPC_TIMEOUT: Duration = Duration::from_secs(60);
 /// A turn can take a while; the caller's HTTP timeout is the real bound.
@@ -271,8 +365,19 @@ impl CodexAgent {
             let mut s = Session::spawn(&self.codex_home)?;
             s.call(
                 "initialize",
-                json!({ "clientInfo": { "name": "oaiy-desktop", "title": "OAIY Desktop",
-                                        "version": env!("CARGO_PKG_VERSION") } }),
+                json!({
+                    "clientInfo": { "name": "oaiy-desktop", "title": "OAIY Desktop",
+                                    "version": env!("CARGO_PKG_VERSION") },
+                    // Required, not optional. `thread/start` carries
+                    // `runtimeWorkspaceRoots` — the field that pins a turn to
+                    // NO workspace — and the runtime refuses that parameter
+                    // outright unless this capability was negotiated here.
+                    // Without it every chat fails with
+                    // "requires experimentalApi capability", and dropping the
+                    // parameter instead would hand the agent a default
+                    // workspace, which is the opposite of what it is for.
+                    "capabilities": { "experimentalApi": true }
+                }),
                 RPC_TIMEOUT,
             )?;
             s.notify("initialized", json!({}))?;
@@ -376,11 +481,24 @@ impl CodexAgent {
     /// browser, MCP or network access — because this is a text completion for a
     /// flow, not an agent session with a workspace.
     pub fn chat(&self, body: &Value) -> Result<Value, CodexError> {
+        self.chat_as(body, None)
+    }
+
+    /// Run a turn, optionally pinned to a live-call alias.
+    ///
+    /// When `alias` is set its model/effort/tier WIN over anything in the body.
+    /// That is the point of a fixed route: a caller that could talk the
+    /// reasoning-off route into a reasoning model would reintroduce exactly the
+    /// mid-call latency the alias exists to prevent.
+    pub fn chat_as(&self, body: &Value, alias: Option<LiveCallAlias>) -> Result<Value, CodexError> {
         let prompt = flatten_prompt(body);
         if prompt.trim().is_empty() {
             return Err(CodexError::Rpc("the request carried no message content".into()));
         }
-        let model = body.get("model").and_then(Value::as_str).map(str::to_string);
+        let model = match alias {
+            Some(a) => Some(a.model().to_string()),
+            None => body.get("model").and_then(Value::as_str).map(str::to_string),
+        };
 
         let text = self.with_session(|s| {
             // Refuse everything a turn could otherwise reach.
@@ -403,11 +521,18 @@ impl CodexAgent {
                 .to_string();
 
             let from = s.notes_len();
-            s.call(
-                "turn/start",
-                json!({ "threadId": thread_id, "input": { "text": prompt } }),
-                TURN_TIMEOUT,
-            )?;
+            let mut turn = json!({ "threadId": thread_id, "input": { "text": prompt } });
+            if let Some(a) = alias {
+                // Named on the TURN as well as the thread: the effort is a
+                // per-turn setting, and a thread-level model alone would leave
+                // it at the account default.
+                turn["model"] = Value::String(a.model().to_string());
+                turn["effort"] = Value::String(a.reasoning_effort().to_string());
+                if let Some(tier) = a.service_tier() {
+                    turn["serviceTier"] = Value::String(tier.to_string());
+                }
+            }
+            s.call("turn/start", turn, TURN_TIMEOUT)?;
 
             // Collect the agent's message from the notification stream.
             let deadline = Instant::now() + TURN_TIMEOUT;
@@ -532,5 +657,54 @@ mod tests {
         let allow = env_allow_list();
         assert!(!allow.contains(&"OPENAI_API_KEY"), "an API key must never reach the child");
         assert!(!allow.iter().any(|k| k.to_ascii_lowercase().contains("proxy")));
+    }
+
+    #[test]
+    fn the_live_call_aliases_match_the_ids_the_plugin_recognises() {
+        // The Aokie plugin matches a live-call route BY URL, against these exact
+        // ids. A rename here silently stops it applying the live-call policy —
+        // it would treat the route as an ordinary local provider.
+        assert_eq!(LiveCallAlias::ReasoningNone.id(), "openai-codex-agent-none");
+        assert_eq!(LiveCallAlias::ReasoningLow.id(), "openai-codex-agent-low");
+        assert_eq!(LiveCallAlias::LunaReasoningLow.id(), "openai-codex-agent-luna-low");
+        assert_eq!(
+            LiveCallAlias::LunaReasoningLowFast.id(),
+            "openai-codex-agent-luna-low-fast"
+        );
+        // …and none of them collides with the generic route, which has its own
+        // behaviour (caller-chosen model, no forced effort).
+        assert!(LiveCallAlias::from_id(CODEX_PROVIDER_ID).is_none());
+        assert!(LiveCallAlias::from_id("openai-codex-agent-nonesuch").is_none());
+        for alias in LiveCallAlias::all() {
+            assert_eq!(LiveCallAlias::from_id(alias.id()), Some(alias));
+        }
+    }
+
+    #[test]
+    fn every_alias_pins_a_model_and_an_effort() {
+        // The whole reason these exist: a call cannot wait on a reasoning model,
+        // so neither field may be left to the account default.
+        for alias in LiveCallAlias::all() {
+            assert!(!alias.model().is_empty(), "{:?}", alias);
+            assert!(
+                matches!(alias.reasoning_effort(), "none" | "low"),
+                "{:?} pins {:?}, which is not a live-call effort",
+                alias,
+                alias.reasoning_effort()
+            );
+        }
+        assert_eq!(LiveCallAlias::ReasoningNone.reasoning_effort(), "none");
+        assert_eq!(LiveCallAlias::ReasoningNone.model(), LIVE_CALL_MODEL);
+        assert_eq!(LiveCallAlias::LunaReasoningLow.model(), LUNA_LIVE_CALL_MODEL);
+    }
+
+    #[test]
+    fn only_the_fast_luna_route_asks_for_priority_service() {
+        // Requesting priority on every route would spend the account's priority
+        // budget on calls that did not ask for it.
+        assert_eq!(LiveCallAlias::LunaReasoningLowFast.service_tier(), Some("priority"));
+        assert_eq!(LiveCallAlias::ReasoningNone.service_tier(), None);
+        assert_eq!(LiveCallAlias::ReasoningLow.service_tier(), None);
+        assert_eq!(LiveCallAlias::LunaReasoningLow.service_tier(), None);
     }
 }
