@@ -416,10 +416,16 @@ impl PluginManifest {
 /// `oaiy.flow.run` lets a plugin ask the host to run a flow — which is how Aokie
 /// turns an incoming call into an orchestration. It is gated because a plugin
 /// that can start arbitrary flows can reach every capability those flows hold.
+/// `oaiy.companion.admission` lets a plugin broker COMPANION DEVICE TRUST — the
+/// pairing ceremony that lets an approved phone carry a live call's audio. It is
+/// gated because the holder decides which devices the owner is even asked to
+/// approve, and a plugin that could enrol its own devices would make the
+/// owner's confirmation ceremonial.
 pub const HOST_CAPABILITIES: &[&str] = &[
     "oaiy.flow.run",
     "oaiy.events.publish",
     "oaiy.services.read",
+    "oaiy.companion.admission",
 ];
 
 /// Pre-OAIY spellings of host capabilities, mapped to their canonical names.
@@ -440,6 +446,10 @@ pub const HOST_CAPABILITIES: &[&str] = &[
 /// permanent and invisible.
 pub const LEGACY_HOST_CAPABILITY_ALIASES: &[(&str, &str)] = &[
     ("flow.run", "oaiy.flow.run"),
+    // Aokie's shipped manifest declares the bare name; without this mapping the
+    // host would load it, show it running, and then refuse the pairing screen
+    // for a permission the manifest plainly intended.
+    ("companion.admission", "oaiy.companion.admission"),
     ("events.publish", "oaiy.events.publish"),
     ("services.read", "oaiy.services.read"),
 ];
@@ -666,21 +676,33 @@ mod tests {
 
     #[test]
     fn capabilities_that_grant_nothing_are_reported() {
-        // Both a typo and a FormLogic-era name grant nothing, safely but
-        // silently. Reporting them turns a mystery capability_denied into a
-        // manifest warning.
+        // A capability that is neither a host capability nor a declared
+        // connector command grants nothing, safely but silently. Reporting it
+        // turns a mystery capability_denied into a manifest warning.
         let mut v = base();
         v["capabilities"] = serde_json::json!([
             "oaiy.flow.runn",           // typo
-            "companion.admission",      // FormLogic-era, no OAIY equivalent
+            "aokie.hardware.seize",     // invented; no host or connector meaning
             "connector.aokie.call.answer",
             "flow.run",
+            // `companion.admission` used to belong on this list. It is now a
+            // real host capability with a legacy mapping, so it must NOT be
+            // reported — Aokie's shipped manifest declares exactly that name.
+            "companion.admission",
         ]);
         let d = write_manifest(&v);
         let m = PluginManifest::load(d.path()).unwrap();
         let unknown = m.unknown_capabilities();
         assert!(unknown.contains(&"oaiy.flow.runn".to_string()), "{unknown:?}");
-        assert!(unknown.contains(&"companion.admission".to_string()), "{unknown:?}");
+        assert!(unknown.contains(&"aokie.hardware.seize".to_string()), "{unknown:?}");
+        assert!(
+            !unknown.contains(&"companion.admission".to_string()),
+            "the legacy spelling now maps to a real host capability: {unknown:?}"
+        );
+        assert!(
+            m.resolved_capabilities().contains("oaiy.companion.admission"),
+            "and it must resolve to the canonical name"
+        );
         assert!(!unknown.contains(&"oaiy.flow.run".to_string()), "normalised, so known");
         assert!(
             !unknown.contains(&"connector.aokie.call.answer".to_string()),

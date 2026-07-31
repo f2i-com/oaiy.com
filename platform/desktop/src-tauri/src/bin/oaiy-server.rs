@@ -359,8 +359,8 @@ async fn main() {
 
     // gui_mode = false: headless server is token-strict (no webview origin).
     if let Err(e) = http::serve(
-        port, config, auth_token, false, registry, downloads, python, catalog, bridge, ai_providers, ai_codex,
-        node_runtime,
+        port, config, auth_token, false, registry, downloads, python, catalog, bridge,
+        data_dir.clone(), ai_providers, ai_codex, node_runtime,
     )
     .await
     {

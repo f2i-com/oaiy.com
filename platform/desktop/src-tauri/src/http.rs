@@ -693,6 +693,10 @@ fn is_bridge_exec_path(path: &str) -> bool {
         // DELETE on the same prefix destroys the only record that an event was
         // lost, which is not something a local page should be able to do either.
         || path.starts_with("/api/bridge/deadletters")
+        // Companion device trust: these decide which phones may carry a live
+        // call's audio, and rotation invalidates every existing pairing. A
+        // local web page must not reach them just by being on loopback.
+        || path.starts_with("/api/companion/")
         // Pairing APPROVAL/denial is the user's trust act, and revoke unpairs an
         // app — only OAIY's own webview (or a token holder) may. But raising a
         // request (`POST /api/bridge/pairing`) and polling it
@@ -762,6 +766,10 @@ fn is_restricted_read_path(path: &str) -> bool {
         // plugin-supplied payload `/api/bridge/events` is gated for, except
         // durable across restarts rather than a 500-entry ring.
         || path.starts_with("/api/bridge/deadletters")
+        // Companion status names every trusted device and the desktop's own
+        // thumbprint — the material an attacker would want in order to imitate
+        // a pairing screen. Same tier as the other bridge reads.
+        || path.starts_with("/api/companion/")
         || path == "/api/bridge/events"
         || path == "/api/bridge/runs"
         || path == "/api/bridge/flows"
@@ -984,6 +992,8 @@ pub async fn serve(
     // Bridge Protocol v1 surface. Passed in rather than constructed here so the
     // GUI and the headless server can share one ledger with their own lifetimes.
     bridge: crate::bridge::BridgeState,
+    // Where companion identities and rosters live (<data>/companion/<plugin>).
+    companion_data_dir: std::path::PathBuf,
     // AI gateway provider store (holds provider API keys). Built at the call site
     // where the data dir is known; the AI router pairs it with the registry below.
     ai_providers: crate::ai::providers::ProviderStoreHandle,
@@ -1027,6 +1037,12 @@ pub async fn serve(
     // Capture the pairing handle before `bridge` is moved into its router, so
     // the auth guard can validate paired tokens.
     let pairing_for_auth = bridge.pairing.clone();
+    // Built before `bridge` is moved: companion trust is per-plugin, so it
+    // needs the same plugin registry the bridge carries.
+    let companion_routes = crate::companion::routes::router(crate::companion::new_handle(
+        companion_data_dir,
+        bridge.plugins.clone(),
+    ));
     let bridge_routes = crate::bridge::bridge_router(bridge);
 
     // The AI gateway is its own sub-router with its own state (provider store +
@@ -1080,6 +1096,7 @@ pub async fn serve(
         // origin/token gate as the services routes. Adding them after `.layer()`
         // would leave them ungated — reachable by any web page the user has open.
         .merge(bridge_routes)
+        .merge(companion_routes)
         .merge(ai_routes)
         .layer(middleware::from_fn_with_state(
             AuthConfig { token: auth_token, gui_mode, pairing: Some(pairing_for_auth) },
@@ -1102,6 +1119,25 @@ mod tests {
         privileged_allowed, AuthConfig, ModelDownloadRequest,
     };
     use axum::http::Method;
+
+    #[test]
+    fn companion_routes_are_privileged() {
+        // These decide which phones may carry a live call's audio, and rotation
+        // invalidates every existing pairing. A local web page must not reach
+        // them just by being on loopback.
+        // The GET is a RESTRICTED READ rather than privileged: it exposes the
+        // roster and the desktop thumbprint, which an attacker would want in
+        // order to imitate a pairing screen, but reading it changes nothing.
+        assert!(is_restricted_read_path("/api/companion/aokie/pairing"));
+        assert!(is_privileged_path(&Method::POST, "/api/companion/aokie/pairing/offers"));
+        assert!(is_privileged_path(&Method::POST, "/api/companion/aokie/pairing/responses"));
+        assert!(is_privileged_path(
+            &Method::POST,
+            "/api/companion/aokie/pairing/approvals/approval-1/approve"
+        ));
+        assert!(is_privileged_path(&Method::DELETE, "/api/companion/aokie/mobiles/abc"));
+        assert!(is_privileged_path(&Method::POST, "/api/companion/aokie/identity/rotate"));
+    }
 
     #[test]
     fn dead_letter_routes_are_gated_like_the_rest_of_the_bridge() {

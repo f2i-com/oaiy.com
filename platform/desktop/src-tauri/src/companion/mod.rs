@@ -12,7 +12,9 @@
 
 pub mod identity;
 pub mod pairing;
+pub mod routes;
 
+pub use routes::{new_handle, CompanionHandle, CompanionRegistry};
 pub use pairing::{
     MobilePairingClaims, MobilePairingResponse, PairingPayload, OFFER_KIND, PAIRING_TTL_SECONDS,
     RESPONSE_KIND, SCHEMA_VERSION,

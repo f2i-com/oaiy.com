@@ -1082,15 +1082,25 @@ mod tests {
     fn legacy_and_unknown_capabilities_are_surfaced_on_the_record() {
         let root = Root::new();
         let mut m = manifest("aokie");
-        m["capabilities"] = serde_json::json!(["flow.run", "companion.admission"]);
+        // `companion.admission` is the second legacy alias the host understands,
+        // so the unknown example has to be something the host really has no
+        // meaning for — otherwise this test would pass by accident the moment
+        // the name it used became real.
+        m["capabilities"] = serde_json::json!(["flow.run", "companion.admission", "aokie.hardware.seize"]);
         root.plugin("aokie", m);
         let mut reg = PluginRegistry::new(root.path().to_path_buf());
         reg.scan();
         let rec = reg.get("aokie").unwrap();
         assert_eq!(
             rec.legacy_capabilities,
-            vec![("flow.run".to_string(), "oaiy.flow.run".to_string())]
+            vec![
+                ("flow.run".to_string(), "oaiy.flow.run".to_string()),
+                (
+                    "companion.admission".to_string(),
+                    "oaiy.companion.admission".to_string()
+                )
+            ]
         );
-        assert_eq!(rec.unknown_capabilities, vec!["companion.admission".to_string()]);
+        assert_eq!(rec.unknown_capabilities, vec!["aokie.hardware.seize".to_string()]);
     }
 }
