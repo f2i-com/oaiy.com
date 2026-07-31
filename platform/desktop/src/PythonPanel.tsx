@@ -1,4 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useVisiblePoll } from './useVisiblePoll';
+import { peek, put } from './useCached';
 import {
   formatBytes,
   formatTimestamp,
@@ -20,7 +22,11 @@ import { useToast } from './Toasts';
  * vs each service installing its own copy.
  */
 export default function PythonPanel() {
-  const [snapshot, setSnapshot] = useState<PythonSnapshot | null>(null);
+  // Seeded like the other panels: this blocked first paint on every visit,
+  // even though the previous answer was still perfectly good.
+  const [snapshot, setSnapshot] = useState<PythonSnapshot | null>(
+    () => peek('pythonSnapshot') ?? null,
+  );
   const [error, setError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [showLogs, setShowLogs] = useState(false);
@@ -64,6 +70,7 @@ export default function PythonPanel() {
         }
       }
       setSnapshot(next);
+      put('pythonSnapshot', next);
       setError(null);
     } catch (e) {
       if (seq !== reqSeqRef.current) return;
@@ -71,11 +78,8 @@ export default function PythonPanel() {
     }
   }, [toast]);
 
-  useEffect(() => {
-    refresh();
-    const id = setInterval(refresh, 2000);
-    return () => clearInterval(id);
-  }, [refresh]);
+  // Only while the window is visible — see useVisiblePoll.
+  useVisiblePoll(refresh, 2000);
 
   // Auto-open logs ONCE per job while it's in flight so the user sees
   // progress without an extra click. We key off the job and only open

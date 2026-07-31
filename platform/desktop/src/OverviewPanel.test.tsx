@@ -30,7 +30,7 @@ vi.mock('./api', () => ({
 }));
 
 import OverviewPanel from './OverviewPanel';
-import { invalidate } from './useCached';
+import { invalidate, peek } from './useCached';
 import { dismissGuide, reopenGuide } from './setupGuide';
 
 const runtime = (failed: number) => ({
@@ -104,6 +104,19 @@ describe('OverviewPanel failure reporting', () => {
       button('See why')!.dispatchEvent(new MouseEvent('click', { bubbles: true }));
     });
     expect(onNavigate).toHaveBeenCalledWith('runs');
+  });
+
+  it('fills the cache key ServicesPanel actually seeds from', async () => {
+    // The app opens on Overview, so Overview's poll is what has a chance to warm
+    // the Services panel. Writing only the `services` ARRAY meant ServicesPanel —
+    // which seeds from the whole `servicesSnapshot` — still found nothing, and
+    // the very first visit to Services showed "Loading services…" anyway. The
+    // reported symptom, surviving its own fix on the one path everybody takes.
+    dismissGuide();
+    await mount();
+    // Compared against the fixture itself, not a re-typed literal.
+    expect(peek('servicesSnapshot')).toEqual(await servicesMock.mock.results[0].value);
+    expect(peek('services')).toEqual([]);
   });
 
   it('says nothing when nothing has failed', async () => {
