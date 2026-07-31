@@ -7,13 +7,14 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc --noEmit && vite build",
+    "build": "node scripts/sync-cli.mjs && tsc --noEmit && vite build",
     "test": "vitest run",
     "test:unit": "vitest",
     "preview": "vite preview",
     "tauri": "tauri",
     "tauri:dev": "tauri dev --features gui",
-    "tauri:build": "tauri build --features gui"
+    "tauri:build": "tauri build --features gui",
+    "sync-cli": "node scripts/sync-cli.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.1.1",
