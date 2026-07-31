@@ -57,3 +57,6 @@ yarn-error.log*
 # --- agent-task / scratch (Claude Code, etc.) ------------------------------
 .claude/
 .cursor/
+
+# Staged at build time by desktop/scripts/sync-cli.mjs (mirrors cli/dist, which is also ignored).
+desktop/src-tauri/resources/cli/
