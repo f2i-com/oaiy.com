@@ -30,5 +30,11 @@
       "scopeField": "scope"
     }
   },
-  "healthPath": "/api/v1/desktop-connections"
+  "healthPath": "/api/v1/desktop-connections",
+  "heartbeat": {
+    "path": "/api/v1/desktop-connections",
+    "intervalSeconds": 45,
+    "instanceIdField": "desktopInstanceId",
+    "deviceNameField": "deviceName"
+  }
 }

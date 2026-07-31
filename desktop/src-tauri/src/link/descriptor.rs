@@ -100,6 +100,32 @@ pub struct ConnectorDescriptor {
     /// Optional GET that proves the stored credential still works.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub health_path: Option<String>,
+    /// How this provider is told the desktop is still reachable. Omitted for a
+    /// provider that tracks presence some other way, or not at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heartbeat: Option<HeartbeatSpec>,
+}
+
+/// The periodic ping that keeps a desktop looking online.
+///
+/// Providers decide reachability from how recently the desktop last spoke, so
+/// the interval has to sit comfortably inside their window — FormLogic's is 90
+/// seconds and its own desktop beats every 45.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HeartbeatSpec {
+    pub path: String,
+    #[serde(default = "default_heartbeat_interval")]
+    pub interval_seconds: u64,
+    /// Body field carrying this install's stable id.
+    pub instance_id_field: String,
+    /// Body field carrying a human label, when the provider shows one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_name_field: Option<String>,
+}
+
+fn default_heartbeat_interval() -> u64 {
+    45
 }
 
 impl ConnectorDescriptor {
@@ -134,6 +160,25 @@ impl ConnectorDescriptor {
         }
         if o.scopes.is_empty() {
             return Err(format!("connector {:?} requests no scopes", self.id));
+        }
+        if let Some(h) = &self.heartbeat {
+            if !h.path.starts_with('/') {
+                return Err(format!(
+                    "connector {:?} heartbeat path must begin with '/', got {:?}",
+                    self.id, h.path
+                ));
+            }
+            if h.instance_id_field.trim().is_empty() {
+                return Err(format!("connector {:?} heartbeat names no instance id field", self.id));
+            }
+            // A zero interval would spin; one longer than any plausible presence
+            // window would beat too rarely to keep the desktop online at all.
+            if h.interval_seconds == 0 || h.interval_seconds > 3600 {
+                return Err(format!(
+                    "connector {:?} heartbeat interval {} is out of range (1..3600s)",
+                    self.id, h.interval_seconds
+                ));
+            }
         }
         if o.token_response.credential_fields.is_empty() {
             return Err(format!(
