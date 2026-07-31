@@ -357,10 +357,22 @@ async fn main() {
         }
     }
 
+    // Companion trust and its relay, shared with the plugin host so
+    // `companion.admission` is answered from the same roster these routes
+    // administer.
+    let companion = oaiy_desktop_lib::companion::new_handle(data_dir.clone(), bridge.plugins.clone());
+    let companion_upstream = oaiy_desktop_lib::companion::upstream::UpstreamStore::open(
+        data_dir.join("companion").join("relay.json"),
+    );
+    bridge.host.set_companion_broker(oaiy_desktop_lib::plugins::CompanionBroker {
+        companion: companion.clone(),
+        upstream: companion_upstream.clone(),
+    });
+
     // gui_mode = false: headless server is token-strict (no webview origin).
     if let Err(e) = http::serve(
         port, config, auth_token, false, registry, downloads, python, catalog, bridge,
-        data_dir.clone(), ai_providers, ai_codex, node_runtime,
+        companion, companion_upstream, ai_providers, ai_codex, node_runtime,
     )
     .await
     {

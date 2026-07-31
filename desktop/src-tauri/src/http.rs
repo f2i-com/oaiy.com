@@ -992,8 +992,13 @@ pub async fn serve(
     // Bridge Protocol v1 surface. Passed in rather than constructed here so the
     // GUI and the headless server can share one ledger with their own lifetimes.
     bridge: crate::bridge::BridgeState,
-    // Where companion identities and rosters live (<data>/companion/<plugin>).
-    companion_data_dir: std::path::PathBuf,
+    // Companion device trust, and the upstream that brokers admissions for it.
+    // Built by the caller rather than here: the plugin host answers
+    // `companion.admission` from the SAME identity store these routes
+    // administer, and a second store would let the two disagree about which
+    // phones are trusted.
+    companion: crate::companion::routes::CompanionHandle,
+    companion_upstream: crate::companion::upstream::UpstreamHandle,
     // AI gateway provider store (holds provider API keys). Built at the call site
     // where the data dir is known; the AI router pairs it with the registry below.
     ai_providers: crate::ai::providers::ProviderStoreHandle,
@@ -1037,12 +1042,8 @@ pub async fn serve(
     // Capture the pairing handle before `bridge` is moved into its router, so
     // the auth guard can validate paired tokens.
     let pairing_for_auth = bridge.pairing.clone();
-    // Built before `bridge` is moved: companion trust is per-plugin, so it
-    // needs the same plugin registry the bridge carries.
-    let companion_routes = crate::companion::routes::router(crate::companion::new_handle(
-        companion_data_dir,
-        bridge.plugins.clone(),
-    ));
+    let companion_routes =
+        crate::companion::routes::router(companion.clone(), companion_upstream.clone());
     let bridge_routes = crate::bridge::bridge_router(bridge);
 
     // The AI gateway is its own sub-router with its own state (provider store +

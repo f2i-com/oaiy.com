@@ -13,6 +13,7 @@
 pub mod identity;
 pub mod pairing;
 pub mod routes;
+pub mod upstream;
 
 pub use routes::{new_handle, CompanionHandle, CompanionRegistry};
 pub use pairing::{

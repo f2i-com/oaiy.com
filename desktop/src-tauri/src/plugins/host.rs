@@ -378,6 +378,21 @@ pub struct PluginHost {
     shed_tx: SyncSender<(String, Value)>,
     desktop_version: String,
     dev_mode: bool,
+    /// Set after construction by whichever binary wired an HTTP surface.
+    ///
+    /// Optional because the host is also built in tests and by tools with no
+    /// companion support at all; those must keep working, and answering
+    /// `companion.admission` with an honest "not configured" beats making every
+    /// caller supply a broker it will never use.
+    companion: Mutex<Option<CompanionBroker>>,
+}
+
+/// What the host needs to answer `companion.admission`: this desktop's own
+/// device trust, and the upstream that turns it into a gateway admission.
+#[derive(Clone)]
+pub struct CompanionBroker {
+    pub companion: crate::companion::routes::CompanionHandle,
+    pub upstream: crate::companion::upstream::UpstreamHandle,
 }
 
 impl PluginHost {
@@ -409,6 +424,7 @@ impl PluginHost {
             shed_tx,
             desktop_version,
             dev_mode,
+            companion: Mutex::new(None),
         });
 
         // Event thread: ring + trigger dispatch + ack.
@@ -914,17 +930,120 @@ impl PluginHost {
         }
     }
 
-    /// Answer a plugin-initiated request (`flow.run`).
+    /// Let a binary supply the companion broker once its HTTP surface exists.
+    pub fn set_companion_broker(&self, broker: CompanionBroker) {
+        *self.companion.lock().unwrap_or_else(|e| e.into_inner()) = Some(broker);
+    }
+
+    /// Broker a companion admission for the plugin that hosts the WebRTC peer.
+    ///
+    /// The plugin sends its own view of the endpoint binding. The host ignores
+    /// it and rebuilds the roster from its own identity store, because the
+    /// plugin is the process a phone talks to — exactly the process that must
+    /// not get to choose which phones are trusted.
+    fn handle_companion_admission(
+        &self,
+        plugin_id: &str,
+        params: Value,
+    ) -> Result<Value, (String, String)> {
+        let granted = self
+            .registry
+            .lock()
+            .map(|reg| reg.grants(plugin_id, "oaiy.companion.admission"))
+            .unwrap_or(false);
+        if !granted {
+            return Err((
+                "capability_denied".into(),
+                format!("{plugin_id} does not declare the oaiy.companion.admission capability"),
+            ));
+        }
+
+        let broker = self
+            .companion
+            .lock()
+            .ok()
+            .and_then(|g| g.clone())
+            .ok_or_else(|| {
+                (
+                    "unavailable".to_string(),
+                    "this build has no companion broker".to_string(),
+                )
+            })?;
+
+        let identity = broker
+            .companion
+            .identity_for(plugin_id)
+            .map_err(|(_, message)| ("capability_denied".to_string(), message))?;
+        let status = identity.status();
+
+        // OUR roster, not the plugin's.
+        let approved: Vec<String> = status
+            .approved_mobiles
+            .iter()
+            .map(|m| m.endpoint_key.thumbprint.clone())
+            .collect();
+        if approved.is_empty() {
+            return Err((
+                "not_paired".into(),
+                "no Companion device has been approved on this desktop yet".into(),
+            ));
+        }
+        let endpoint_key = status.endpoint_key.clone().ok_or_else(|| {
+            (
+                "unavailable".to_string(),
+                "the desktop endpoint identity is unavailable".to_string(),
+            )
+        })?;
+        let binding = serde_json::json!({
+            "endpointPublicKey": endpoint_key,
+            "holderKeyThumbprint": endpoint_key.thumbprint,
+            "approvedPeerKeyThumbprints": approved,
+            "peerRosterRevision": status.roster_revision,
+            "peerRosterHash": status.roster_hash,
+        });
+
+        let config = broker.upstream.get().ok_or_else(|| {
+            (
+                "unavailable".to_string(),
+                "no Companion relay is configured on this desktop".to_string(),
+            )
+        })?;
+        // The plugin may name its own app; otherwise the configured default.
+        // Refusing when neither exists beats guessing: the app id is what scopes
+        // the admission on the issuer.
+        let app_id = params
+            .get("appId")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| config.app_id.clone())
+            .ok_or_else(|| {
+                (
+                    "invalid_request".to_string(),
+                    "no appId was supplied and the relay config sets no default".to_string(),
+                )
+            })?;
+        let display_name = params.get("displayName").and_then(Value::as_str);
+
+        crate::companion::upstream::broker(&config, &app_id, plugin_id, display_name, &binding)
+            .map_err(|message| ("upstream_error".to_string(), message))
+    }
+
+    /// Answer a plugin-initiated request (`flow.run`, `companion.admission`).
     fn handle_plugin_request(
         &self,
         plugin_id: &str,
         method: &str,
         params: Value,
     ) -> Result<Value, (String, String)> {
+        if method == "companion.admission" {
+            return self.handle_companion_admission(plugin_id, params);
+        }
         if method != "flow.run" {
             return Err((
                 "invalid_request".into(),
-                format!("unknown method {method:?}; this host answers only flow.run"),
+                format!(
+                    "unknown method {method:?}; this host answers flow.run and companion.admission"
+                ),
             ));
         }
 

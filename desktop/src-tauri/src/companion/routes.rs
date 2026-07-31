@@ -23,6 +23,7 @@ use std::sync::{Arc, Mutex};
 
 use super::identity::{EndpointIdentity, EndpointIdentityHandle};
 use super::pairing::MobilePairingResponse;
+use super::upstream::{UpstreamConfig, UpstreamHandle};
 use crate::plugins::registry::PluginRegistryHandle;
 
 /// One endpoint identity per broker plugin, created on first use.
@@ -52,7 +53,7 @@ impl CompanionRegistry {
     /// Checked per request rather than cached: a plugin can be uninstalled or
     /// replaced by one with a different manifest while the app runs, and a
     /// stale yes here would keep serving a permission that no longer exists.
-    fn identity_for(&self, plugin_id: &str) -> Result<EndpointIdentityHandle, (StatusCode, String)> {
+    pub fn identity_for(&self, plugin_id: &str) -> Result<EndpointIdentityHandle, (StatusCode, String)> {
         if plugin_id.is_empty()
             || plugin_id.len() > 64
             || !plugin_id
@@ -228,7 +229,48 @@ async fn rotate(
     }
 }
 
-pub fn router(state: CompanionHandle) -> Router {
+/// The relay this desktop brokers admissions through.
+///
+/// Not per-plugin: it is the user's account with a relay deployment, and two
+/// broker plugins on one machine reach the same one. Their DEVICE TRUST stays
+/// separate — that is the part revocation is expressed against.
+async fn upstream_status(State(state): State<RouterState>) -> axum::response::Response {
+    (StatusCode::OK, Json(state.upstream.status())).into_response()
+}
+
+async fn set_upstream(
+    State(state): State<RouterState>,
+    Json(config): Json<UpstreamConfig>,
+) -> axum::response::Response {
+    match state.upstream.set(config) {
+        Ok(status) => (StatusCode::OK, Json(status)).into_response(),
+        // 400: every rejection is about the URL or token the caller supplied.
+        Err(e) => fail(StatusCode::BAD_REQUEST, e),
+    }
+}
+
+async fn clear_upstream(State(state): State<RouterState>) -> axum::response::Response {
+    (StatusCode::OK, Json(state.upstream.clear())).into_response()
+}
+
+#[derive(Clone)]
+pub struct RouterState {
+    companion: CompanionHandle,
+    upstream: UpstreamHandle,
+}
+
+pub fn router(state: CompanionHandle, upstream: UpstreamHandle) -> Router {
+    let relay = Router::new()
+        .route(
+            "/api/companion/relay",
+            get(upstream_status)
+                .post(set_upstream)
+                .delete(clear_upstream),
+        )
+        .with_state(RouterState {
+            companion: state.clone(),
+            upstream,
+        });
     Router::new()
         .route("/api/companion/:plugin/pairing", get(status))
         .route("/api/companion/:plugin/pairing/offers", post(create_offer))
@@ -241,4 +283,5 @@ pub fn router(state: CompanionHandle) -> Router {
         )
         .route("/api/companion/:plugin/identity/rotate", post(rotate))
         .with_state(state)
+        .merge(relay)
 }
