@@ -42,6 +42,21 @@ const BUILTIN_TEMPLATES: &[(&str, &str)] = &[
         "krea2.json",
         include_str!("../../resources/templates/krea2.json"),
     ),
+    // The Aokie receptionist's ears and voice. Shipped as ordinary services —
+    // installable, startable and visible in the Services panel — because that
+    // is what they were in FormLogic Desktop, and because loading ~800 MB of
+    // ONNX weights once and keeping them warm is the difference between a
+    // receptionist that answers and one that misses the first sentence of
+    // every call. Their run command lives inside the Aokie plugin directory;
+    // installing them without the plugin present fails with that as the reason.
+    (
+        "aokie-stt.json",
+        include_str!("../../resources/templates/aokie-stt.json"),
+    ),
+    (
+        "aokie-tts.json",
+        include_str!("../../resources/templates/aokie-tts.json"),
+    ),
 ];
 
 const BUILTIN_SCRIPTS: &[(&str, &str)] = &[
@@ -411,6 +426,28 @@ fn norm_path_key(s: &str) -> String {
     }
 }
 
+/// The result of last reading one template file, plus enough of its metadata
+/// to tell whether it has changed since.
+///
+/// `reload_new_templates` runs on EVERY `GET /api/services`, i.e. every 2s
+/// while the Services panel is open, and it used to read and re-parse every
+/// template on every one of those calls — all while holding the one global
+/// registry Mutex that the same poll needs. Almost every call parses files it
+/// has already parsed, to reach a `continue`, because the service is already
+/// loaded.
+///
+/// Keyed on (mtime, len) rather than content: both come from the directory
+/// entry we already have to stat, so an unchanged file costs no read and no
+/// parse at all. A rewritten file changes at least one of them — NTFS
+/// timestamps have 100ns resolution — and an edit that somehow preserved both
+/// would simply be picked up on the next genuine change.
+struct TemplateProbe {
+    mtime: Option<std::time::SystemTime>,
+    len: u64,
+    /// The id it loaded as, or the parse error it produced.
+    outcome: Result<String, String>,
+}
+
 pub struct Registry {
     services: HashMap<String, ServiceRuntime>,
     /// Root config dir — `${dataDir}` placeholder. Contains
@@ -442,6 +479,9 @@ pub struct Registry {
     /// Rebuilt wholesale by `reload_new_templates` (which runs on every
     /// /api/services poll), so fixing the file clears the report by itself.
     template_errors: Vec<TemplateLoadError>,
+    /// What each `templates/*.json` looked like last time we read it, keyed by
+    /// path. See [`Registry::reload_new_templates`].
+    template_probes: HashMap<PathBuf, TemplateProbe>,
 }
 
 /// Seed a built-in plumbing script, refreshing it when we ship a new
@@ -674,6 +714,7 @@ impl Registry {
             ollama_model: None,
             service_gpus: HashMap::new(),
             template_errors,
+            template_probes: HashMap::new(),
         })
     }
 
@@ -691,6 +732,7 @@ impl Registry {
             ollama_model: None,
             service_gpus: HashMap::new(),
             template_errors: Vec::new(),
+            template_probes: HashMap::new(),
         }
     }
 
@@ -2040,11 +2082,49 @@ impl Registry {
         // Rebuilt from scratch on every scan (i.e. every /api/services poll) so a
         // fixed file stops being reported without anything having to invalidate.
         let mut errors: Vec<TemplateLoadError> = Vec::new();
+        // Rebuilt rather than mutated, so a template file that has been DELETED
+        // drops out instead of lingering in the cache forever.
+        let mut probes: HashMap<PathBuf, TemplateProbe> = HashMap::new();
         for entry in rd.flatten() {
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) != Some("json") {
                 continue;
             }
+            let meta = entry.metadata().ok();
+            let mtime = meta.as_ref().and_then(|m| m.modified().ok());
+            let len = meta.as_ref().map_or(0, |m| m.len());
+
+            // Unchanged since we last read it: reuse what we learned then.
+            if let Some(prev) = self.template_probes.get(&path) {
+                let same = prev.mtime == mtime && prev.len == len;
+                match (&prev.outcome, same) {
+                    // Still broken, and still broken in the same way. Reported
+                    // from the cached message so a FIXED file — which changes
+                    // mtime — stops being reported on the very next poll,
+                    // exactly as re-reading everything used to achieve.
+                    (Err(msg), true) => {
+                        errors.push(TemplateLoadError {
+                            file: file_label(&path),
+                            error: msg.clone(),
+                        });
+                        probes.insert(path, TemplateProbe { mtime, len, outcome: Err(msg.clone()) });
+                        continue;
+                    }
+                    // Parsed before and the service it produced is still
+                    // loaded, so the full read would only reach `continue`.
+                    // If the id is somehow GONE, fall through and re-read
+                    // rather than leave the user without a card.
+                    (Ok(id), true) if self.services.contains_key(id) => {
+                        probes.insert(
+                            path,
+                            TemplateProbe { mtime, len, outcome: Ok(id.clone()) },
+                        );
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
+
             let Ok(raw) = std::fs::read_to_string(&path) else {
                 continue;
             };
@@ -2052,13 +2132,19 @@ impl Registry {
                 Ok(t) => t,
                 Err(e) => {
                     log::warn!("skipping bad template {}: {}", path.display(), e);
+                    let msg = e.to_string();
                     errors.push(TemplateLoadError {
                         file: file_label(&path),
-                        error: e.to_string(),
+                        error: msg.clone(),
                     });
+                    probes.insert(path, TemplateProbe { mtime, len, outcome: Err(msg) });
                     continue;
                 }
             };
+            probes.insert(
+                path.clone(),
+                TemplateProbe { mtime, len, outcome: Ok(t.id.clone()) },
+            );
             // Already known (by id) — don't disturb its in-memory/runtime state.
             if self.services.contains_key(&t.id) {
                 continue;
@@ -2072,6 +2158,7 @@ impl Registry {
             added += 1;
         }
         self.template_errors = errors;
+        self.template_probes = probes;
         added
     }
 
@@ -2547,6 +2634,57 @@ mod tests {
             !runner.is_alive(),
             "the child slot must be empty on return, either reaped or handed off"
         );
+    }
+
+    #[test]
+    fn a_template_cache_hit_still_reports_and_still_clears() {
+        // `reload_new_templates` runs on every /api/services poll and now skips
+        // the read+parse for files whose (mtime, len) are unchanged. The two
+        // behaviours that skip must not break:
+        //   1. a still-broken file keeps being reported, poll after poll;
+        //   2. a FIXED file stops being reported on the very next poll.
+        let data = std::env::temp_dir().join(format!("oaiy-tplcache-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&data);
+        std::fs::create_dir_all(data.join("templates")).unwrap();
+        let bad = data.join("templates/lance.json");
+        std::fs::write(&bad, r#"{ "id": "lance", "name": "Lance", }"#).unwrap();
+
+        let mut reg = super::Registry::empty(data.clone(), data.join("models"));
+        assert_eq!(reg.reload_new_templates(), 0);
+        assert_eq!(reg.snapshot().template_errors.len(), 1);
+
+        // Second poll, file untouched: served from the probe cache, and the
+        // error must survive that path — returning none here would make the
+        // warning flicker away one poll after it appeared.
+        assert_eq!(reg.reload_new_templates(), 0);
+        assert_eq!(
+            reg.snapshot().template_errors.len(),
+            1,
+            "a cache hit must keep reporting the error"
+        );
+
+        // Now fix it. The rewrite changes len, so the cache cannot mask it.
+        std::fs::write(
+            &bad,
+            r#"{
+                "id": "lance", "name": "Lance", "description": "", "category": "test",
+                "defaultPort": 9997,
+                "run": { "command": "lance.exe", "args": [] }
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(reg.reload_new_templates(), 1, "the repaired file loads");
+        assert!(
+            reg.snapshot().template_errors.is_empty(),
+            "a fixed file must stop being reported"
+        );
+
+        // And a deleted file must not linger in the cache as a phantom.
+        std::fs::remove_file(&bad).unwrap();
+        reg.reload_new_templates();
+        assert!(reg.template_probes.is_empty(), "probes for deleted files are dropped");
+
+        let _ = std::fs::remove_dir_all(&data);
     }
 
     #[test]

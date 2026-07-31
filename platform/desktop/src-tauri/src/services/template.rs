@@ -199,6 +199,38 @@ pub fn substitute(s: &str, ctx: &HashMap<&'static str, String>) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// The two Aokie voice services ship as built-in templates. They are the
+    /// only ones whose `run.command` points INSIDE a plugin directory rather
+    /// than at ${binDir} or PATH, so a schema change that broke that would
+    /// otherwise only surface as a service that will not start.
+    #[test]
+    fn the_shipped_aokie_voice_templates_parse() {
+        for (file, mode, bundle) in [
+            (include_str!("../../resources/templates/aokie-stt.json"), "aokie-stt", "parakeet"),
+            (include_str!("../../resources/templates/aokie-tts.json"), "aokie-tts", "pocket_tts_onnx"),
+        ] {
+            let t: super::ServiceTemplate =
+                serde_json::from_str(file).expect("shipped template must parse");
+            assert_eq!(t.category, "Speech");
+            assert!(t.run.command.contains("plugins/aokie/aokie-voice-server"));
+            assert!(t.run.args.iter().any(|a| a == mode), "{mode} missing from args");
+            // The model dir must match the bundle the installer downloads, or
+            // the server starts and finds nothing to load.
+            assert!(
+                t.run.args.iter().any(|a| a.ends_with(bundle)),
+                "{bundle} model dir missing from args"
+            );
+            // Written only after every file verified — the whole point of
+            // having a marker rather than trusting the directory to exist.
+            assert!(t.installed_marker.as_deref().is_some_and(|m| m.contains(bundle)));
+            // The installer must actually be shipped with the template.
+            let script = format!("install-{}.ps1", t.id);
+            assert!(t.files.contains_key(&script), "{script} not shipped");
+            assert!(t.files[&script].contains("models-manifest.json"),
+                "the installer must read the plugin's manifest rather than hardcode URLs");
+        }
+    }
+
     use super::*;
 
     #[test]
