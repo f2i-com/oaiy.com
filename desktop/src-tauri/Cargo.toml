@@ -107,6 +107,15 @@ qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 base64 = "0.22"
 getrandom = "0.2"
 
+# The end-to-end envelope a provider's web app seals chat with. NaCl `crypto_box`
+# — X25519 ECDH → HSalsa20 → XSalsa20-Poly1305 — which is exactly what the
+# browser's tweetnacl `box` computes, so the two interoperate byte for byte.
+# Notably NOT XChaCha20: the two are easy to conflate and would never open each
+# other's frames. `salsa20` without the default `getrandom` feature, because
+# every key and nonce here is either derived or counter-based, and the crate's
+# curve25519-dalek unifies with the one ed25519-dalek already pulls in.
+crypto_box = { version = "0.9", default-features = false, features = ["alloc", "salsa20"] }
+
 # Content verification for model downloads. HuggingFace serves the file's
 # git-lfs OID — which IS its SHA-256 — in `X-Linked-ETag`, so the overwhelming
 # majority of downloads can be verified with nothing asked of the user.

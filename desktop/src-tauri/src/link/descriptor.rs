@@ -108,6 +108,43 @@ pub struct ConnectorDescriptor {
     /// Omitted for a provider that has no such lane.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay: Option<RelaySpec>,
+    /// How this provider tunnels end-to-end sealed AI turns to the desktop.
+    /// Omitted for a provider whose web app has no such feature.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desktop_ai: Option<DesktopAiSpec>,
+}
+
+/// The sealed AI lane: the provider's web app relays a chat turn the backend
+/// cannot read, and this desktop answers it with the account's own model.
+///
+/// Separate from [`RelaySpec`] because it is a different lane with a different
+/// queue and different semantics — a long chat turn must not block service
+/// control, and the provider treats the two independently.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DesktopAiSpec {
+    /// Where this desktop publishes the public half of its sealing key. Until
+    /// it does, the provider's web app cannot encrypt anything to it and says
+    /// so — which is the whole visible symptom of this lane being absent.
+    pub pubkey_path: String,
+    /// Long-poll for sealed turns addressed to this instance.
+    pub pending_path: String,
+    /// Take one turn, exactly-once. `{id}` is substituted.
+    pub claim_path: String,
+    /// Append one sealed frame. `{id}` is substituted.
+    pub frames_path: String,
+    /// Report the terminal status. `{id}` is substituted.
+    pub complete_path: String,
+    #[serde(default = "default_relay_wait")]
+    pub wait_seconds: u64,
+    #[serde(default = "default_ai_batch")]
+    pub batch_limit: u32,
+    #[serde(default = "default_relay_backoff")]
+    pub error_backoff_seconds: u64,
+}
+
+fn default_ai_batch() -> u32 {
+    8
 }
 
 /// The long-poll / claim / complete lane a provider's web app uses to act on
@@ -245,6 +282,50 @@ impl ConnectorDescriptor {
                 return Err(format!(
                     "connector {:?} relay wait {} is out of range (1..300s)",
                     self.id, r.wait_seconds
+                ));
+            }
+        }
+        if let Some(a) = &self.desktop_ai {
+            for (label, path) in [
+                ("pubkeyPath", &a.pubkey_path),
+                ("pendingPath", &a.pending_path),
+                ("claimPath", &a.claim_path),
+                ("framesPath", &a.frames_path),
+                ("completePath", &a.complete_path),
+            ] {
+                if !path.starts_with('/') {
+                    return Err(format!(
+                        "connector {:?} desktopAi {label} must begin with '/', got {path:?}",
+                        self.id
+                    ));
+                }
+            }
+            for (label, path) in [
+                ("claimPath", &a.claim_path),
+                ("framesPath", &a.frames_path),
+                ("completePath", &a.complete_path),
+            ] {
+                if !path.contains("{id}") {
+                    return Err(format!(
+                        "connector {:?} desktopAi {label} must contain the {{id}} placeholder",
+                        self.id
+                    ));
+                }
+            }
+            // The publish and the poll are not per-turn, so a placeholder there
+            // would be sent to the provider literally.
+            for (label, path) in [("pubkeyPath", &a.pubkey_path), ("pendingPath", &a.pending_path)] {
+                if path.contains("{id}") {
+                    return Err(format!(
+                        "connector {:?} desktopAi {label} takes no {{id}} placeholder",
+                        self.id
+                    ));
+                }
+            }
+            if a.wait_seconds == 0 || a.wait_seconds > 300 {
+                return Err(format!(
+                    "connector {:?} desktopAi wait {} is out of range (1..300s)",
+                    self.id, a.wait_seconds
                 ));
             }
         }

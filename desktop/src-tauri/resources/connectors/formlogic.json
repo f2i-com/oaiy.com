@@ -39,6 +39,16 @@
     "batchLimit": 20,
     "errorBackoffSeconds": 10
   },
+  "desktopAi": {
+    "pubkeyPath": "/api/v1/desktop-ai/pubkey",
+    "pendingPath": "/api/v1/desktop-ai/pending",
+    "claimPath": "/api/v1/desktop-ai/{id}/claim",
+    "framesPath": "/api/v1/desktop-ai/{id}/frames",
+    "completePath": "/api/v1/desktop-ai/{id}/complete",
+    "waitSeconds": 25,
+    "batchLimit": 8,
+    "errorBackoffSeconds": 10
+  },
   "heartbeat": {
     "path": "/api/v1/desktop-connections",
     "intervalSeconds": 45,

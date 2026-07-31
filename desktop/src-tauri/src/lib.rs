@@ -1505,6 +1505,16 @@ pub fn run() {
                         bridge_for_http.host.clone(),
                     ),
                 );
+                // Answer the sealed chat turns the provider's web app relays.
+                // Without it the website cannot encrypt to this machine at all
+                // and says the desktop has published no key.
+                crate::ai::tunnel::spawn(
+                    link_for_http.clone(),
+                    crate::ai::tunnel::AiSources {
+                        providers: ai_providers_for_http.clone(),
+                        codex: ai_codex_for_http.clone(),
+                    },
+                );
                 bridge_for_http.host.set_companion_broker(
                     crate::plugins::CompanionBroker {
                         companion: companion_for_http.clone(),
