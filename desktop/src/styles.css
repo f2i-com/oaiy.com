@@ -743,6 +743,8 @@ code {
 }
 .speed { color: var(--cyan); font-weight: 600; }
 .warn { color: var(--amber); }
+/* Used for the download checksum readout — stated only when actually true. */
+.ok { color: var(--green); }
 
 /* ---------------------------------------------------------------------------
  * BADGES — instrument readouts with an LED dot, in prototype pill form.

@@ -431,6 +431,11 @@ function DownloadRow({ dl, onPause, onResume, onCancel }: RowProps) {
         {dl.resumable === false && (
           <> · <span className="warn">no resume support</span></>
         )}
+        {/* Only stated when it is actually true. An unverified download says
+            nothing rather than claiming a guarantee nobody made. */}
+        {dl.verified === true && (
+          <> · <span className="ok" title={dl.sha256 ?? undefined}>checksum verified</span></>
+        )}
       </div>
       <div
         className="progress-bar"

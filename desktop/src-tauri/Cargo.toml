@@ -93,3 +93,8 @@ url = "2"
 # (refuse a 40 GB model before filling the drive) + the "X free" readout
 # in the Models tab.
 fs2 = "0.4"
+
+# Content verification for model downloads. HuggingFace serves the file's
+# git-lfs OID — which IS its SHA-256 — in `X-Linked-ETag`, so the overwhelming
+# majority of downloads can be verified with nothing asked of the user.
+sha2 = "0.10"

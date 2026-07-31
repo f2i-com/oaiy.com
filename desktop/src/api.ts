@@ -230,6 +230,12 @@ export interface DownloadProgress {
   resumable: boolean | null;
   speedBps: number | null;
   etaSecs: number | null;
+  /** SHA-256 of what was written, computed as it streamed. */
+  sha256?: string | null;
+  expectedSha256?: string | null;
+  /** true matched, false did not (the file was deleted), null nothing to check
+   *  against. Three-valued on purpose — "unverified" is not "bad". */
+  verified?: boolean | null;
 }
 
 export interface CatalogModel {
