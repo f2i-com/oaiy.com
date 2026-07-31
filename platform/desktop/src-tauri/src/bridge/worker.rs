@@ -459,6 +459,10 @@ impl Worker {
                 )
             }
         };
+        // A flow run makes HTTP calls and writes files. Orphaned by a forced
+        // exit it keeps doing both, with no ledger entry left to record it and
+        // no timeout left to stop it.
+        crate::services::job_object::adopt(child.id());
 
         // Drain BOTH pipes on their own threads, from the start. The first cut
         // read stderr only after exit and stdout never — so a CLI that logged

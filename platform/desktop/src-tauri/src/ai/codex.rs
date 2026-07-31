@@ -192,6 +192,11 @@ impl Session {
         let mut child = cmd
             .spawn()
             .map_err(|e| CodexError::Unavailable(format!("cannot run the codex CLI: {e}")))?;
+        // On Windows this child is `cmd /c codex`, so killing the tracked pid
+        // reaps the shell and leaves the real agent running with a live
+        // CODEX_HOME session. Job membership is inherited, so the whole tree
+        // goes together.
+        crate::services::job_object::adopt(child.id());
         let stdin = child.stdin.take().ok_or_else(|| CodexError::Unavailable("no stdin".into()))?;
         let stdout = child.stdout.take().ok_or_else(|| CodexError::Unavailable("no stdout".into()))?;
 

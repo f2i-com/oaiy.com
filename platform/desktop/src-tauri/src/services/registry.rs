@@ -1311,11 +1311,21 @@ impl Registry {
                 .services
                 .get_mut(id)
                 .ok_or_else(|| format!("unknown service {id:?}"))?;
+            // Same liveness guard `start` uses, and for the same reason:
+            // Repair runs precisely when a child has already died, so its pid
+            // is the one most likely to have been recycled — and this is a
+            // `taskkill /T /F`, which would take an unrelated process AND ITS
+            // WHOLE TREE with it. check_exited() reports None only while the
+            // process is still ours.
             if let Some(runner) = &svc.runner {
-                kill_process_tree(runner.pid);
+                if runner.check_exited().is_none() {
+                    kill_process_tree(runner.pid);
+                }
             }
             if let Some(installer) = &svc.installer {
-                kill_process_tree(installer.pid);
+                if installer.check_exited().is_none() {
+                    kill_process_tree(installer.pid);
+                }
             }
             svc.runner = None;
             svc.restart_attempts = 0;
@@ -1617,6 +1627,28 @@ impl Registry {
                 Some(_code) => { /* already exited — pid may be recycled, do not touch it */ }
             }
         }
+        // Pre-flight: is the port already taken?
+        //
+        // Without this a held port is indistinguishable from a crash. The child
+        // spawns, fails to bind, exits 1, and the supervisor — which classifies
+        // purely on `code != 0` — runs the full 2/4/8/16/32s backoff before
+        // parking the service as "needs Repair". That is about a minute of
+        // waiting to be told the wrong thing, and Repair cannot fix it either.
+        //
+        // Checked here rather than in the runner because only the registry
+        // knows the resolved port, and because the honest message belongs on
+        // the service record the user is looking at.
+        if let Some(holder) = port_conflict(svc.port) {
+            let msg = format!(
+                "port {} is already in use{holder} — nothing was started. \
+                 If this is a leftover copy of this service from a previous \
+                 session, close it and start again.",
+                svc.port
+            );
+            svc.set_status(ServiceStatus::Errored, Some(msg.clone()));
+            return Err(msg);
+        }
+
         svc.set_status(ServiceStatus::Starting, None);
 
         match Runner::spawn(cfg) {
@@ -2363,6 +2395,89 @@ pub(crate) fn kill_process_tree(pid: u32) {
     }
 }
 
+/// Whether `port` is already bound on loopback, and by whom if we can tell.
+///
+/// Returns `None` when the port is free. The string in `Some` is a suffix for
+/// an error message — empty when the holder cannot be identified, so the
+/// caller's sentence reads correctly either way.
+///
+/// Binding is the only reliable test: a connect() probe cannot distinguish a
+/// listener that refuses connections, and enumerating sockets needs privileges
+/// this app does not want. We bind exactly as the child is about to, then drop
+/// it immediately — a race is possible in principle, but the child's own bind
+/// failure remains the backstop, and this turns the common case from a silent
+/// 62-second failure into an instant, accurate message.
+fn port_conflict(port: u16) -> Option<String> {
+    use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
+    match TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)) {
+        Ok(listener) => {
+            drop(listener);
+            None
+        }
+        Err(_) => Some(describe_port_holder(port)),
+    }
+}
+
+/// Name the process holding `port`, as a message suffix like " (aokie-voice-server)".
+///
+/// Best-effort and deliberately cheap: a name here is a kindness, not a
+/// contract. Returns an empty string rather than guessing.
+fn describe_port_holder(port: u16) -> String {
+    #[cfg(windows)]
+    {
+        // `netstat -ano` then match the pid to a name. No extra dependency, and
+        // it works without elevation for our own processes, which is exactly
+        // the case that matters (a leftover copy of ourselves).
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let out = std::process::Command::new(system32_exe("netstat.exe"))
+            .args(["-ano", "-p", "TCP"])
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW)
+            .output();
+        let Ok(out) = out else { return String::new() };
+        let text = String::from_utf8_lossy(&out.stdout);
+        let needle = format!(":{port}");
+        for line in text.lines() {
+            if !line.contains("LISTENING") || !line.contains(&needle) {
+                continue;
+            }
+            // The pid is the last whitespace-separated field.
+            let Some(pid) = line.split_whitespace().next_back() else { continue };
+            let Ok(pid) = pid.parse::<u32>() else { continue };
+            if let Some(name) = process_name(pid) {
+                return format!(" (by {name}, pid {pid})");
+            }
+            return format!(" (by pid {pid})");
+        }
+        String::new()
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = port;
+        String::new()
+    }
+}
+
+#[cfg(windows)]
+fn process_name(pid: u32) -> Option<String> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let out = std::process::Command::new(system32_exe("tasklist.exe"))
+        .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    // CSV: "name","pid","session","#","mem"
+    let first = text.lines().next()?.trim();
+    let name = first.strip_prefix('"')?.split('"').next()?;
+    (!name.is_empty()).then(|| name.to_string())
+}
+
 /// How long a kill+reap may block its CALLER — and therefore the registry
 /// mutex — before the rest of the wait is handed off. 250ms is far more than a
 /// terminated process normally needs and is imperceptible in the UI.
@@ -2488,6 +2603,43 @@ pub type RegistryHandle = Arc<Mutex<Registry>>;
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn a_held_port_is_refused_before_anything_is_spawned() {
+        // The reported failure: a leftover voice server held 8781, so each
+        // start spawned a child that could not bind and exited 1. The
+        // supervisor classifies purely on `code != 0`, so it ran the full
+        // 2/4/8/16/32s ladder before parking the service as "needs Repair" —
+        // about a minute of waiting to be told the wrong thing.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let conflict = port_conflict(port);
+        assert!(conflict.is_some(), "a bound port must be reported as taken");
+
+        drop(listener);
+        assert!(
+            port_conflict(port).is_none(),
+            "once released the same port must be free again"
+        );
+    }
+
+    #[test]
+    fn the_conflict_message_is_a_suffix_that_reads_correctly_when_empty() {
+        // It is interpolated mid-sentence, so an unidentifiable holder has to
+        // yield an empty string rather than something like "(unknown)".
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let suffix = port_conflict(port).unwrap();
+        assert!(
+            suffix.is_empty() || suffix.starts_with(" ("),
+            "unexpected suffix {suffix:?}"
+        );
+        let sentence = format!("port {port} is already in use{suffix} — nothing was started.");
+        assert!(!sentence.contains("in use("), "missing space before the holder: {sentence}");
+        assert!(!sentence.contains("  "), "double space in: {sentence}");
+    }
     use super::venv_name_in;
     use std::time::{Duration, Instant};
 

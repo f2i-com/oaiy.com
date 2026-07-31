@@ -111,3 +111,13 @@ getrandom = "0.2"
 # git-lfs OID — which IS its SHA-256 — in `X-Linked-ETag`, so the overwhelming
 # majority of downloads can be verified with nothing asked of the user.
 sha2 = "0.10"
+
+# Windows-only: the job object that kills child processes when this process
+# dies, however it dies. Already in the tree transitively (tauri, tokio); named
+# here because a crate cannot `use` an undeclared transitive dependency.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }

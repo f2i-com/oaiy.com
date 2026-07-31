@@ -184,6 +184,9 @@ impl PluginProcess {
             .spawn()
             .map_err(|e| format!("cannot launch {}: {e}", exe.display()))?;
         let pid = child.id();
+        // A plugin holds hardware (Aokie owns a phone dongle). Orphaning one on
+        // a forced exit leaves that hardware claimed by a process nothing owns.
+        crate::services::job_object::adopt(pid);
         let stdout = child.stdout.take().ok_or("plugin stdout unavailable")?;
         let stderr = child.stderr.take();
         let stdin = child.stdin.take().ok_or("plugin stdin unavailable")?;

@@ -1020,6 +1020,22 @@ function ServiceCard({
           {service.error && (
             <div className="service-error">⚠ {service.error}</div>
           )}
+          {/* Why it died, and whether we are still retrying — the runner's log
+              buffer is replaced by the next start, so without this an
+              auto-recovered crash leaves no trace the user can see.
+
+              Inside .service-info, NOT a sibling of it. As a direct child of
+              the flex .service-row its basis was the max-content width of the
+              whole message, so one long crash detail squeezed the name column
+              to nothing and pushed the buttons out of the card. */}
+          {service.lastCrash && service.status !== 'running' && (
+            <p className="service-crash">
+              Exited with code {service.lastCrash.code}
+              {service.restartAttempts ? ` · restart attempt ${service.restartAttempts}` : ''}
+              {service.needsRepair ? ' · gave up, needs Repair' : ''}
+              {service.lastCrash.detail ? ` — ${service.lastCrash.detail}` : ''}
+            </p>
+          )}
           {service.id === 'llama-cpp' && (
             <>
               <LlamaModelSelector
@@ -1037,18 +1053,6 @@ function ServiceCard({
           )}
           <GpuSelector serviceId={service.id} currentGpu={service.gpu} />
         </div>
-        {/* Why it died, and whether we are still retrying — the runner's log
-            buffer is replaced by the next start, so without this an
-            auto-recovered crash leaves no trace the user can see. */}
-        {service.lastCrash && service.status !== 'running' && (
-          <p style={{ fontSize: 12, opacity: 0.75, margin: '0 0 8px' }}>
-            Exited with code {service.lastCrash.code}
-            {service.restartAttempts ? ` · restart attempt ${service.restartAttempts}` : ''}
-            {service.needsRepair ? ' · gave up, needs Repair' : ''}
-            {service.lastCrash.detail ? ` — ${service.lastCrash.detail}` : ''}
-          </p>
-        )}
-
         <div className="service-actions">
           {/* Start / Stop — only meaningful once installed (you can't start what isn't
               installed). */}
