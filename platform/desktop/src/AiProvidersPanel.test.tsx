@@ -45,6 +45,7 @@ vi.mock('./api', () => ({
 vi.mock('./Toasts', () => ({ useToast: () => ({ push: pushMock }) }));
 
 import AiProvidersPanel from './AiProvidersPanel';
+import { invalidate } from './useCached';
 
 const PROVIDER = {
   id: 'openai',
@@ -123,6 +124,10 @@ async function submitForm() {
 }
 
 beforeEach(() => {
+  // The panel's stale-while-revalidate cache lives outside React and therefore
+  // outside the test, so one case's providers would seed the next one's first
+  // paint. Clear it so each test starts from a genuinely cold panel.
+  invalidate();
   listMock.mockResolvedValue({ providers: [PROVIDER] });
   upsertMock.mockResolvedValue({ id: 'openai' });
   setKeyMock.mockResolvedValue(undefined);
