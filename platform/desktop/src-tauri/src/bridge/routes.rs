@@ -11,6 +11,8 @@
 //! | `GET  /api/bridge/runs/:id` | one run |
 //! | `POST /api/bridge/runs/:id/claim` | single-winner claim |
 //! | `POST /api/bridge/runs/:id/cancel` | request cancellation |
+//! | `GET  /api/bridge/deadletters` | events that produced no work |
+//! | `POST /api/bridge/deadletters/:id/redrive` | re-dispatch one |
 //! | `GET  /api/plugins` | installed plugins + state + reason |
 //! | `POST /api/bridge/connectors/:id/request` | gated connector command |
 //!
@@ -40,6 +42,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use super::deadletters::DeadLetterHandle;
 use super::ledger::{
     ClaimOutcome, LedgerHandle, LineageRef, ReserveOutcome, RunRequest, RunStatus, Runtime,
 };
@@ -50,6 +53,8 @@ use crate::plugins::{CallError, ForwardError, CONNECTOR_TIMEOUT};
 #[derive(Clone)]
 pub struct BridgeState {
     pub ledger: LedgerHandle,
+    /// Events that arrived and produced no work.
+    pub dead: DeadLetterHandle,
     pub plugins: PluginRegistryHandle,
     /// The live-process side of the plugin story: start/stop, health, and the
     /// gated forwarding path. Shares `plugins` and `ledger` with this state.
@@ -1206,6 +1211,77 @@ async fn plugin_ui_asset(
 
 // ------- triggers -------
 
+#[derive(Debug, Deserialize)]
+struct DeadQuery {
+    limit: Option<usize>,
+}
+
+async fn list_dead_letters(
+    State(st): State<BridgeState>,
+    axum::extract::Query(q): axum::extract::Query<DeadQuery>,
+) -> axum::response::Response {
+    match st.dead.lock() {
+        Ok(d) => (
+            StatusCode::OK,
+            Json(json!({ "deadLetters": d.list(q.limit.unwrap_or(100).min(200)), "total": d.len() })),
+        )
+            .into_response(),
+        Err(_) => bridge_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            "dead-letter queue lock poisoned".into(),
+        ),
+    }
+}
+
+/// Re-dispatch one dead letter against the current bindings.
+///
+/// `200` either way — the interesting part is `reserved`, because a redrive that
+/// legitimately fails again (the guard still refuses, the binding is still
+/// broken) is not a request error. Reporting it as one would have callers
+/// retrying a thing that will never work.
+async fn redrive_dead_letter(
+    State(st): State<BridgeState>,
+    Path(id): Path<String>,
+) -> axum::response::Response {
+    match st.host.redrive(&id) {
+        Some((outcomes, reserved)) => (
+            StatusCode::OK,
+            Json(json!({ "reserved": reserved, "outcomes": outcomes })),
+        )
+            .into_response(),
+        None => bridge_error(
+            StatusCode::NOT_FOUND,
+            "invalid_request",
+            format!("unknown dead letter {id}"),
+        ),
+    }
+}
+
+async fn delete_dead_letter(
+    State(st): State<BridgeState>,
+    Path(id): Path<String>,
+) -> axum::response::Response {
+    match st.dead.lock() {
+        Ok(mut d) => {
+            if d.remove(&id) {
+                StatusCode::NO_CONTENT.into_response()
+            } else {
+                bridge_error(
+                    StatusCode::NOT_FOUND,
+                    "invalid_request",
+                    format!("unknown dead letter {id}"),
+                )
+            }
+        }
+        Err(_) => bridge_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            "dead-letter queue lock poisoned".into(),
+        ),
+    }
+}
+
 async fn list_triggers(State(st): State<BridgeState>) -> axum::response::Response {
     match st.host.triggers.lock() {
         Ok(t) => (StatusCode::OK, Json(json!({ "bindings": t.list() }))).into_response(),
@@ -1411,6 +1487,12 @@ pub fn router(state: BridgeState) -> Router {
         .route("/api/bridge/runs/:id/claim", post(claim_run))
         .route("/api/bridge/runs/:id/finish", post(finish_run))
         .route("/api/bridge/runs/:id/cancel", post(cancel_run))
+        .route("/api/bridge/deadletters", get(list_dead_letters))
+        .route(
+            "/api/bridge/deadletters/:id",
+            axum::routing::delete(delete_dead_letter),
+        )
+        .route("/api/bridge/deadletters/:id/redrive", post(redrive_dead_letter))
         .route("/api/plugins", get(list_plugins))
         .route(
             "/api/bridge/connectors/:id/request",

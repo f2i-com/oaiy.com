@@ -1270,10 +1270,16 @@ pub fn build_bridge_state(
     let triggers: plugins::TriggerStoreHandle = std::sync::Arc::new(std::sync::Mutex::new(
         plugins::TriggerStore::load(data_dir.join("triggers.json")),
     ));
+    // Durable alongside the ledger: an event shed at 3am must still be there in
+    // the morning, which is the entire failure this queue exists to fix.
+    let dead = bridge::deadletters::open_handle(
+        data_dir.join("bridge").join("deadletters.jsonl"),
+    );
     let host = plugins::PluginHost::new(
         plugins.clone(),
         ledger.clone(),
         triggers,
+        dead.clone(),
         env!("CARGO_PKG_VERSION").to_string(),
         cfg!(debug_assertions),
     );
@@ -1287,6 +1293,7 @@ pub fn build_bridge_state(
     let _ = bridge::Worker::start(ledger.clone(), flows.clone(), device_id.clone(), node.clone());
     bridge::BridgeState {
         ledger,
+        dead,
         plugins,
         host,
         flows,

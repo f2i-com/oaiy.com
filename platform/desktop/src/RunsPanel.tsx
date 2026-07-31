@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { CircleAlert, RefreshCw } from 'lucide-react';
 import { bridge, type RunHistory, type RunRecord, type RunStatus } from './api';
+import DeadLetters from './DeadLetters';
 import { peek, put } from './useCached';
 
 /**
@@ -92,6 +93,10 @@ export default function RunsPanel() {
   return (
     <div className="panel">
       {error && <div className="banner banner-err">⚠ {error}</div>}
+
+      {/* Above the run list: an event that never became a run is a worse
+          failure than a run that failed, because nothing recorded it tried. */}
+      <DeadLetters />
 
       <section className="service-section">
         <div className="section-title-row">

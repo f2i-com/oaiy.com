@@ -526,6 +526,19 @@ export interface RunHistory {
   byStatus?: Partial<Record<RunStatus, number>>;
 }
 
+/** An event that arrived and produced no work. */
+export interface DeadLetter {
+  id: string;
+  source: string;
+  event: string;
+  reason: { kind: 'shed' | 'not_reserved'; detail?: string };
+  envelope: unknown;
+  recordedAtMs: number;
+  attempts: number;
+  lastAttemptMs?: number;
+  lastOutcome?: string;
+}
+
 export const bridge = {
   /** Can this runtime actually run a flow? (health only asserts identity.) */
   status: () => request<RuntimeStatus>('/api/bridge/status'),
@@ -555,6 +568,20 @@ export const bridge = {
     request<{ events: Array<{ seq: number; envelope: Record<string, unknown> }>; next: number }>(
       `/api/bridge/events?since=${since}&limit=${limit}`,
     ),
+  /** Events that arrived and produced no work, newest first. */
+  deadLetters: (limit = 100) =>
+    request<{ deadLetters: DeadLetter[]; total: number }>(
+      `/api/bridge/deadletters?limit=${limit}`,
+    ),
+  /** Re-dispatch one against the CURRENT bindings. `reserved` says whether it
+   *  finally produced a run; a redrive that fails again is not an error. */
+  redrive: (id: string) =>
+    request<{ reserved: boolean; outcomes: string[] }>(
+      `/api/bridge/deadletters/${encodeURIComponent(id)}/redrive`,
+      { method: 'POST' },
+    ),
+  dismissDeadLetter: (id: string) =>
+    request<void>(`/api/bridge/deadletters/${encodeURIComponent(id)}`, { method: 'DELETE' }),
   /** The AI sources union (local services + configured providers). */
   aiSources: () => request<{ sources: unknown[] }>('/api/ai/sources'),
 };
