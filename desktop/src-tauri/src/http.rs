@@ -118,6 +118,11 @@ struct AppState {
 /// `version`, which moves for reasons that have nothing to do with the wire
 /// format. See `protocol/README.md`.
 #[derive(Serialize)]
+// camelCase because consumers read `apiVersion` / `pluginApiVersion`. The
+// single-word fields are unaffected, so this changes no existing name — but
+// without it the two version fields ship as snake_case and read as `undefined`
+// on the other side, while health still returns a healthy 200.
+#[serde(rename_all = "camelCase")]
 struct HealthResponse {
     status: &'static str,
     /// Stable machine identity. Never localise or re-word this.
@@ -1197,9 +1202,35 @@ pub async fn serve(
 mod tests {
     use super::{
         is_allowed_origin, is_allowed_origin_privileged, is_privileged_path, is_restricted_read_path,
+        HealthResponse, API_VERSION, BRIDGE_PROTOCOL, PRODUCT_ID,
         privileged_allowed, AuthConfig, ModelDownloadRequest,
     };
     use axum::http::Method;
+
+    #[test]
+    fn health_uses_the_field_names_consumers_actually_read() {
+        // A desktop-detection probe matches on `companion` and gates on
+        // `apiVersion`. Ship either under another name and health still returns
+        // a cheerful 200 while the consumer concludes there is no desktop, or
+        // one too old to talk to.
+        let body = serde_json::to_value(HealthResponse {
+            status: "ok",
+            product: PRODUCT_ID,
+            companion: PRODUCT_ID,
+            protocol: BRIDGE_PROTOCOL,
+            version: "0.0.0-test",
+            api_version: API_VERSION,
+            plugin_api_version: 1,
+        })
+        .unwrap();
+        assert_eq!(body["companion"], "oaiy-desktop");
+        assert_eq!(body["apiVersion"], 1);
+        assert_eq!(body["pluginApiVersion"], 1);
+        // The long-standing names must not have moved underneath anyone.
+        assert_eq!(body["product"], "oaiy-desktop");
+        assert_eq!(body["status"], "ok");
+        assert!(body.get("api_version").is_none(), "snake_case must not leak");
+    }
 
     #[test]
     fn the_linked_providers_origin_is_trusted_and_nothing_else_new_is() {
