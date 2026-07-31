@@ -364,6 +364,7 @@ async fn main() {
     let companion_upstream = oaiy_desktop_lib::companion::upstream::UpstreamStore::open(
         data_dir.join("companion").join("relay.json"),
     );
+    let link = oaiy_desktop_lib::link::open_handle(data_dir.clone());
     bridge.host.set_companion_broker(oaiy_desktop_lib::plugins::CompanionBroker {
         companion: companion.clone(),
         upstream: companion_upstream.clone(),
@@ -372,7 +373,7 @@ async fn main() {
     // gui_mode = false: headless server is token-strict (no webview origin).
     if let Err(e) = http::serve(
         port, config, auth_token, false, registry, downloads, python, catalog, bridge,
-        companion, companion_upstream, ai_providers, ai_codex, node_runtime,
+        companion, companion_upstream, link, ai_providers, ai_codex, node_runtime,
     )
     .await
     {

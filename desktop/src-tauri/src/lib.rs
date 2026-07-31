@@ -5,6 +5,7 @@
 //! Phase 2: load the service registry, manage child processes, expose
 //! /api/services/* and stop everything cleanly on exit.
 
+pub mod link;
 pub mod ai;
 pub mod http;
 pub mod services;
@@ -1491,6 +1492,7 @@ pub fn run() {
                 let companion_upstream_for_http = crate::companion::upstream::UpstreamStore::open(
                     data_dir_for_bridge.join("companion").join("relay.json"),
                 );
+                let link_for_http = crate::link::open_handle(data_dir_for_bridge.clone());
                 bridge_for_http.host.set_companion_broker(
                     crate::plugins::CompanionBroker {
                         companion: companion_for_http.clone(),
@@ -1512,6 +1514,7 @@ pub fn run() {
                     bridge_for_http,
                     companion_for_http,
                     companion_upstream_for_http,
+                    link_for_http,
                     ai_providers_for_http,
                     ai_codex_for_http,
                     node_for_http,

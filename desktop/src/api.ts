@@ -529,6 +529,46 @@ export const companion = {
     }),
 };
 
+export interface LinkConnector {
+  id: string;
+  name: string;
+  description?: string;
+  docsUrl?: string;
+  defaultBaseUrl?: string;
+  scopes: string[];
+}
+export type LinkPhase =
+  | { phase: 'idle' }
+  | { phase: 'awaitingBrowser'; authorizeUrl: string }
+  | { phase: 'exchanging' }
+  | { phase: 'linked' }
+  | { phase: 'failed'; message: string };
+export interface LinkStatus {
+  linked: boolean;
+  connectorId?: string;
+  connectorName?: string;
+  baseUrl?: string;
+  accountName?: string;
+  accountId?: string;
+  grantedScopes?: string;
+  linkedAt?: string;
+  attempt: LinkPhase;
+  /** Every provider this build can link to — the UI hardcodes no list. */
+  available: LinkConnector[];
+}
+
+/** The one outbound account link. Generic over the provider: see
+ *  `resources/connectors/*.json`. */
+export const link = {
+  status: () => request<LinkStatus>('/api/link'),
+  start: (connectorId: string, baseUrl: string) =>
+    request<{ authorizeUrl: string }>('/api/link/start', {
+      method: 'POST',
+      body: JSON.stringify({ connectorId, baseUrl }),
+    }),
+  unlink: () => request<LinkStatus>('/api/link', { method: 'DELETE' }),
+};
+
 export const plugins = {
   list: () => request<PluginsSnapshot>('/api/plugins'),
   start: (id: string) =>

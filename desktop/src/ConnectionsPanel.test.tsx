@@ -11,21 +11,32 @@ import React, { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-const { relayStatusMock, setRelayMock, clearRelayMock, pendingMock, pairedMock, pushMock } =
-  vi.hoisted(() => ({
-    relayStatusMock: vi.fn(),
-    setRelayMock: vi.fn(),
-    clearRelayMock: vi.fn(),
-    pendingMock: vi.fn(),
-    pairedMock: vi.fn(),
-    pushMock: vi.fn(),
-  }));
+const {
+  relayStatusMock, setRelayMock, clearRelayMock,
+  linkStatusMock, linkStartMock, unlinkMock,
+  pendingMock, pairedMock, pushMock,
+} = vi.hoisted(() => ({
+  relayStatusMock: vi.fn(),
+  setRelayMock: vi.fn(),
+  clearRelayMock: vi.fn(),
+  linkStatusMock: vi.fn(),
+  linkStartMock: vi.fn(),
+  unlinkMock: vi.fn(),
+  pendingMock: vi.fn(),
+  pairedMock: vi.fn(),
+  pushMock: vi.fn(),
+}));
 
 vi.mock('./api', () => ({
   companion: {
     relayStatus: relayStatusMock,
     setRelay: setRelayMock,
     clearRelay: clearRelayMock,
+  },
+  link: {
+    status: linkStatusMock,
+    start: linkStartMock,
+    unlink: unlinkMock,
   },
   pairing: {
     pending: pendingMock,
@@ -75,12 +86,23 @@ async function type(placeholder: string, value: string) {
   });
 }
 
+const CONNECTOR = {
+  id: 'acme',
+  name: 'Acme Cloud',
+  defaultBaseUrl: 'https://acme.example',
+  scopes: ['data:read', 'data:write'],
+};
+const IDLE = { linked: false, attempt: { phase: 'idle' }, available: [CONNECTOR] };
+
 beforeEach(() => {
   vi.clearAllMocks();
   vi.useFakeTimers({ shouldAdvanceTime: true });
   pendingMock.mockResolvedValue({ pending: [] });
   pairedMock.mockResolvedValue({ paired: [] });
   relayStatusMock.mockResolvedValue({ configured: false, hasToken: false });
+  linkStatusMock.mockResolvedValue(IDLE);
+  linkStartMock.mockResolvedValue({ authorizeUrl: 'https://acme.example/authorize?x=1' });
+  unlinkMock.mockResolvedValue(IDLE);
   vi.stubGlobal('confirm', vi.fn().mockReturnValue(true));
 });
 
@@ -89,6 +111,93 @@ afterEach(async () => {
   container.remove();
   vi.useRealTimers();
   vi.unstubAllGlobals();
+});
+
+describe('ConnectionsPanel · Linked account', () => {
+  it('offers whatever providers the host reports, with no hardcoded list', async () => {
+    // The whole point of the descriptor design: a new provider is a JSON file,
+    // and it must reach the picker without a frontend change.
+    linkStatusMock.mockResolvedValue({
+      linked: false,
+      attempt: { phase: 'idle' },
+      available: [CONNECTOR, { id: 'other', name: 'Other Co', scopes: ['x'] }],
+    });
+    await mount();
+    const options = Array.from(container.querySelectorAll('option')).map((o) => o.textContent);
+    expect(options).toEqual(['Acme Cloud', 'Other Co']);
+  });
+
+  it('prefills the provider address and shows the scopes it will ask for', async () => {
+    await mount();
+    const input = container.querySelector('input[placeholder*="provider.example"]');
+    expect((input as HTMLInputElement)?.value).toBe('https://acme.example');
+    // Consent is meaningless if the user cannot see what is being granted.
+    expect(container.textContent).toContain('data:read, data:write');
+  });
+
+  it('starts the ceremony with the chosen provider and address', async () => {
+    await mount();
+    await click('Link account');
+    expect(linkStartMock).toHaveBeenCalledWith('acme', 'https://acme.example');
+  });
+
+  it('offers a manual link when the browser did not open', async () => {
+    // A launcher can silently do nothing; without this the user is stuck on a
+    // spinner with no way forward.
+    linkStatusMock.mockResolvedValue({
+      linked: false,
+      attempt: { phase: 'awaitingBrowser', authorizeUrl: 'https://acme.example/authorize?x=1' },
+      available: [CONNECTOR],
+    });
+    await mount();
+    const a = container.querySelector('a[href^="https://acme.example/authorize"]');
+    expect(a).toBeTruthy();
+    expect(container.textContent).toContain('Waiting for you to approve');
+  });
+
+  it('surfaces a failed attempt rather than looking idle', async () => {
+    linkStatusMock.mockResolvedValue({
+      linked: false,
+      attempt: { phase: 'failed', message: 'security check failed (state mismatch)' },
+      available: [CONNECTOR],
+    });
+    await mount();
+    expect(container.textContent).toContain('state mismatch');
+  });
+
+  it('shows the linked account and its granted scopes, never a credential', async () => {
+    linkStatusMock.mockResolvedValue({
+      linked: true,
+      connectorId: 'acme',
+      connectorName: 'Acme Cloud',
+      baseUrl: 'https://acme.example',
+      accountName: 'Reception PC',
+      grantedScopes: 'data:read',
+      attempt: { phase: 'linked' },
+      available: [CONNECTOR],
+    });
+    await mount();
+    expect(container.textContent).toContain('Acme Cloud');
+    expect(container.textContent).toContain('Reception PC');
+    expect(container.textContent).toContain('data:read');
+  });
+
+  it('warns that disconnecting is local-only before unlinking', async () => {
+    // Telling the user the key is dead when it still works at the provider
+    // would be worse than saying nothing.
+    linkStatusMock.mockResolvedValue({
+      linked: true,
+      connectorName: 'Acme Cloud',
+      baseUrl: 'https://acme.example',
+      attempt: { phase: 'linked' },
+      available: [CONNECTOR],
+    });
+    await mount();
+    await click('Disconnect');
+    const msg = (globalThis.confirm as ReturnType<typeof vi.fn>).mock.calls[0][0] as string;
+    expect(msg).toContain('does not revoke it at the provider');
+    expect(unlinkMock).toHaveBeenCalled();
+  });
 });
 
 describe('ConnectionsPanel · Companion relay', () => {
