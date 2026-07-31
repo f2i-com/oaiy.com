@@ -95,7 +95,13 @@ pub struct ModelFile {
 #[serde(rename_all = "camelCase")]
 pub struct ModelsSnapshot {
     pub root_dir: String,
+    /// One PAGE of the library, not necessarily all of it — see `total`.
     pub models: Vec<ModelFile>,
+    /// How many files the library holds in total, so the UI can say "showing
+    /// 200 of 1,412" rather than silently presenting a slice as the whole.
+    pub total: usize,
+    pub offset: usize,
+    pub limit: usize,
     /// Free space on the drive holding the models dir, so the UI can show
     /// "142 GiB free" and warn before a download that won't fit. `None`
     /// if the query failed (rare — non-fatal).
@@ -274,6 +280,16 @@ pub struct Downloads {
     /// Where downloaded files land: `${dataDir}/models/`. This is the
     /// "designated folder" the UI shows prominently.
     models_dir: PathBuf,
+    /// The last full directory listing and when it was taken.
+    ///
+    /// `list_models` walks the whole models tree with a `metadata()` per file,
+    /// and the Models panel polls it every 1.5s. On a real library — tens of
+    /// GB across hundreds of files, often on a spinning or network drive —
+    /// that is a recursive stat storm 40 times a minute for an answer that
+    /// changes when a download finishes or a file is deleted, i.e. rarely and
+    /// always through this same type. So it is cached, and the paths that DO
+    /// change it invalidate explicitly rather than waiting for the TTL.
+    models_cache: Arc<Mutex<Option<(std::time::Instant, Vec<ModelFile>)>>>,
     /// All downloads ever attempted in this session, keyed by id.
     /// Completed entries stay so the UI can surface "just finished".
     progress: Arc<Mutex<HashMap<String, DownloadProgress>>>,
@@ -299,6 +315,7 @@ impl Downloads {
         let _ = std::fs::create_dir_all(&models_dir);
         Self {
             models_dir,
+            models_cache: Arc::new(Mutex::new(None)),
             progress: Arc::new(Mutex::new(HashMap::new())),
             abort_handles: Arc::new(Mutex::new(HashMap::new())),
             hf_token: Arc::new(Mutex::new(None)),
@@ -343,19 +360,67 @@ impl Downloads {
         }
     }
 
-    pub fn list_models(&self) -> Result<ModelsSnapshot, String> {
-        let mut models = Vec::new();
-        walk_dir(&self.models_dir, &self.models_dir, &mut models)
-            .map_err(|e| format!("scan failed: {e}"))?;
-        models.sort_by(|a, b| a.name.cmp(&b.name));
+    /// How long a directory listing is reused. Short enough that a file
+    /// dropped in by hand shows up while the user is still looking at the
+    /// panel, long enough to collapse the 1.5s poll into far fewer walks.
+    /// Anything OAIY does itself — a finished download, a delete — invalidates
+    /// immediately, so the TTL only covers changes made behind its back.
+    const MODELS_TTL: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// Forget the cached listing. Called wherever OAIY changes the library.
+    pub fn invalidate_models(&self) {
+        if let Ok(mut c) = self.models_cache.lock() {
+            *c = None;
+        }
+    }
+
+    /// One page of the model library, newest scan reused where possible.
+    ///
+    /// `offset`/`limit` page the RESULT, which is what keeps a 1,400-file
+    /// library from being serialised and re-rendered in full every poll. They
+    /// deliberately do not bound the WALK: the total has to be honest, and a
+    /// partial walk could not report it.
+    pub fn list_models_page(&self, offset: usize, limit: usize) -> Result<ModelsSnapshot, String> {
+        let fresh = self
+            .models_cache
+            .lock()
+            .ok()
+            .and_then(|c| c.as_ref().filter(|(at, _)| at.elapsed() < Self::MODELS_TTL).map(|(_, m)| m.clone()));
+
+        let models = match fresh {
+            Some(m) => m,
+            None => {
+                let mut m = Vec::new();
+                walk_dir(&self.models_dir, &self.models_dir, &mut m)
+                    .map_err(|e| format!("scan failed: {e}"))?;
+                m.sort_by(|a, b| a.name.cmp(&b.name));
+                if let Ok(mut c) = self.models_cache.lock() {
+                    *c = Some((std::time::Instant::now(), m.clone()));
+                }
+                m
+            }
+        };
+
+        let total = models.len();
+        let page: Vec<ModelFile> = models.into_iter().skip(offset).take(limit).collect();
         Ok(ModelsSnapshot {
             root_dir: self.models_dir.display().to_string(),
-            models,
+            models: page,
+            total,
+            offset,
+            limit,
             free_bytes: fs2::available_space(&self.models_dir).ok(),
         })
     }
 
+    /// The whole library. Kept for callers that genuinely need every entry.
+    pub fn list_models(&self) -> Result<ModelsSnapshot, String> {
+        self.list_models_page(0, usize::MAX)
+    }
+
     pub fn delete_model(&self, name: &str) -> Result<(), String> {
+        // Whatever happens below, the cached listing is now suspect.
+        self.invalidate_models();
         // Reject any traversal/absolute component (`..`, a root, or a Windows
         // drive/UNC prefix) outright — more robust than a substring `..`
         // check, which misses e.g. a bare `C:` prefix.
@@ -808,6 +873,7 @@ impl Downloads {
         // abort harmlessly but the map would grow unbounded across long
         // sessions.
         let abort_map = self.abort_handles.clone();
+        let models_cache = self.models_cache.clone();
         let id_for_task = id.clone();
         let token = self.hf_token.lock().ok().and_then(|g| g.clone());
         let handle = tokio::spawn(async move {
@@ -820,6 +886,7 @@ impl Downloads {
                 resume_from,
                 token,
                 expected_sha256,
+                models_cache,
             )
             .await;
         });
@@ -838,6 +905,7 @@ async fn run_download(
     resume_from: u64,
     hf_token: Option<String>,
     expected_sha256: Option<String>,
+    models_cache: Arc<Mutex<Option<(std::time::Instant, Vec<ModelFile>)>>>,
 ) {
     let update = |f: Box<dyn FnOnce(&mut DownloadProgress)>| {
         if let Ok(mut g) = progress_map.lock() {
@@ -1269,6 +1337,13 @@ async fn run_download(
             p.finished_at = Some(Utc::now());
         }));
         return;
+    }
+
+    // A new file just landed in the library, so the cached listing is stale.
+    // Waiting out the TTL here would mean a download that visibly finished did
+    // not appear in the Models list for another ten seconds.
+    if let Ok(mut c) = models_cache.lock() {
+        *c = None;
     }
 
     let verified = match (&expected, &actual) {
@@ -1730,6 +1805,72 @@ mod tests {
     }
 
     // --- checksum verification ---------------------------------------------
+
+    // --- listing: cache + paging -------------------------------------------
+
+    fn models_fixture(tag: &str, n: usize) -> (std::path::PathBuf, Downloads) {
+        let dir = std::env::temp_dir().join(format!("oaiy-models-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // Nested, because a real library is organised into folders and the walk
+        // has always been recursive.
+        std::fs::create_dir_all(dir.join("qwen")).unwrap();
+        for i in 0..n {
+            let sub = if i % 2 == 0 { dir.join("qwen") } else { dir.clone() };
+            std::fs::write(sub.join(format!("m{i:03}.gguf")), b"x").unwrap();
+        }
+        let d = Downloads::new(dir.clone());
+        (dir, d)
+    }
+
+    #[test]
+    fn a_page_reports_the_real_total_not_its_own_length() {
+        // A page that reported its own length as the total would let the UI say
+        // "12 models" about a library of 40 — the one number a user actually
+        // reads off this screen.
+        let (dir, d) = models_fixture("page", 40);
+        let page = d.list_models_page(0, 12).unwrap();
+        assert_eq!(page.models.len(), 12);
+        assert_eq!(page.total, 40);
+        assert_eq!(page.offset, 0);
+        assert_eq!(page.limit, 12);
+
+        let second = d.list_models_page(12, 12).unwrap();
+        assert_eq!(second.models.len(), 12);
+        assert_eq!(second.total, 40);
+        // Pages must not overlap, or a "load more" duplicates rows.
+        assert_ne!(second.models[0].name, page.models[0].name);
+
+        // Past the end is empty, not an error and not a wrap-around.
+        let past = d.list_models_page(100, 12).unwrap();
+        assert!(past.models.is_empty());
+        assert_eq!(past.total, 40);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_listing_is_cached_but_a_deletion_is_not_hidden_by_it() {
+        let (dir, d) = models_fixture("cache", 6);
+        assert_eq!(d.list_models().unwrap().total, 6);
+
+        // Written behind the cache's back: still the old answer, by design —
+        // that is what makes the 1.5s poll cheap.
+        std::fs::write(dir.join("sneaky.gguf"), b"x").unwrap();
+        assert_eq!(d.list_models().unwrap().total, 6, "a cache hit should not rescan");
+
+        // But anything OAIY does itself must invalidate, or a model the user
+        // just deleted keeps appearing in the list they are looking at.
+        d.invalidate_models();
+        assert_eq!(d.list_models().unwrap().total, 7);
+
+        let removed = d.list_models().unwrap().models[0].name.clone();
+        d.delete_model(&removed).unwrap();
+        let after = d.list_models().unwrap();
+        assert_eq!(after.total, 6, "delete must invalidate the cache");
+        assert!(!after.models.iter().any(|m| m.name == removed));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn a_caller_digest_is_normalised_or_refused() {

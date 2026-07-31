@@ -344,8 +344,24 @@ async fn ensure_service_by_port(
 
 // ------- models -------
 
-async fn list_models(State(state): State<AppState>) -> impl IntoResponse {
-    match state.downloads.list_models() {
+#[derive(Debug, Deserialize)]
+struct ModelsQuery {
+    offset: Option<usize>,
+    limit: Option<usize>,
+}
+
+/// The most files one request returns. A library can hold thousands, and
+/// serialising every one of them into a panel that polls is the difference
+/// between a list that opens instantly and one that stutters. `total` is always
+/// the real count, so a page is never mistaken for the whole library.
+const MODELS_PAGE_MAX: usize = 500;
+
+async fn list_models(
+    State(state): State<AppState>,
+    Query(q): Query<ModelsQuery>,
+) -> impl IntoResponse {
+    let limit = q.limit.unwrap_or(MODELS_PAGE_MAX).min(MODELS_PAGE_MAX);
+    match state.downloads.list_models_page(q.offset.unwrap_or(0), limit) {
         Ok(models) => (StatusCode::OK, Json(models)).into_response(),
         Err(e) => err500(&e),
     }

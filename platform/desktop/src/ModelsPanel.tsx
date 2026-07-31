@@ -15,6 +15,10 @@ import {
 } from './api';
 import { useToast } from './Toasts';
 
+/** Rows added per "Show more". The panel polls, so every row on screen is
+ * re-rendered each tick — a whole library at once is what makes it stutter. */
+const PAGE = 200;
+
 /**
  * Models panel — manage model downloads + the on-disk files. Four parts:
  *   1. Designated-folder banner (where everything lands)
@@ -27,6 +31,10 @@ import { useToast } from './Toasts';
 export default function ModelsPanel() {
   // Seeded like the other panels: this painted an empty model library on every
   // visit while a 1.5s poll re-fetched what it already had a moment earlier.
+  // How many rows this panel is currently showing. Grows on "Show more"
+  // rather than rendering a whole library at once — the panel polls, so every
+  // row rendered is re-rendered every tick.
+  const [shown, setShown] = useState(PAGE);
   const [snapshot, setSnapshot] = useState<ModelsSnapshot | null>(
     () => peek('modelsSnapshot') ?? null,
   );
@@ -60,7 +68,7 @@ export default function ModelsPanel() {
     const seq = ++reqSeqRef.current;
     try {
       const [snap, dls] = await Promise.all([
-        models.list(),
+        models.list(shown),
         models.downloads(),
       ]);
       if (seq !== reqSeqRef.current) return; // superseded by a newer refresh
@@ -98,7 +106,7 @@ export default function ModelsPanel() {
       if (seq !== reqSeqRef.current) return;
       setError(e instanceof Error ? e.message : String(e));
     }
-  }, [toast]);
+  }, [shown, toast]);
 
   // Only while the window is visible. This walked the whole model tree 40
   // times a minute behind a hidden tray window — see useVisiblePoll.
@@ -346,11 +354,26 @@ export default function ModelsPanel() {
         <h3 className="section-title">
           On disk{' '}
           {snapshot && (
-            <span className="section-count">({snapshot.models.length})</span>
+            <span className="section-count">
+              {snapshot.models.length < snapshot.total
+                ? `(showing ${snapshot.models.length} of ${snapshot.total})`
+                : `(${snapshot.total})`}
+            </span>
           )}
         </h3>
         {snapshot?.models.length === 0 && (
           <div className="empty-state">No models downloaded yet.</div>
+        )}
+        {snapshot && snapshot.models.length < snapshot.total && (
+          <div className="datadir-note">
+            <span>
+              {snapshot.total - snapshot.models.length} more model
+              {snapshot.total - snapshot.models.length === 1 ? '' : 's'} not shown.
+            </span>
+            <button className="btn-tiny" onClick={() => setShown((n) => n + PAGE)}>
+              Show more
+            </button>
+          </div>
         )}
         {snapshot?.models.map((m) => (
           <div key={m.path} className="model-row">
