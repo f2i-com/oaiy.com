@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useState } from 'react';
-import { CircleAlert, RefreshCw } from 'lucide-react';
+import { CircleAlert, RefreshCw, Trash2 } from 'lucide-react';
 import { bridge, type RunHistory, type RunRecord, type RunStatus } from './api';
 import DeadLetters from './DeadLetters';
-import { peek, put } from './useCached';
+import { useToast } from './Toasts';
+import { invalidate, peek, put } from './useCached';
 
 /**
  * Run history — what happened, and why it failed.
@@ -100,6 +101,8 @@ export default function RunsPanel() {
   );
   const [error, setError] = useState<string | null>(null);
   const [expanded, setExpanded] = useState<string | null>(null);
+  const [clearing, setClearing] = useState(false);
+  const toast = useToast();
 
   const refresh = useCallback(async () => {
     try {
@@ -120,6 +123,35 @@ export default function RunsPanel() {
     const id = window.setInterval(() => void refresh(), POLL_MS);
     return () => window.clearInterval(id);
   }, [refresh, filter]);
+
+  const clear = async () => {
+    // Spell out both halves: what survives, and the one consequence that is
+    // not obvious — a consumer retrying an old idempotency key gets a fresh
+    // run instead of the recorded result, so identical work can run again.
+    if (
+      !confirm(
+        'Clear finished runs from this history?\n\nQueued and running work is kept. This cannot be undone, and an app that retries a request from before the clear will run it again rather than get the old result.',
+      )
+    )
+      return;
+    setClearing(true);
+    try {
+      const { cleared } = await bridge.clearRuns();
+      // Drop BOTH filters' caches: the other tab's cached page still lists rows
+      // that no longer exist, and switching to it would show them as current.
+      invalidate('runHistory:failures');
+      invalidate('runHistory:all');
+      await refresh();
+      toast.push({
+        kind: 'success',
+        title: cleared === 0 ? 'Nothing to clear' : `Cleared ${cleared} finished run${cleared === 1 ? '' : 's'}`,
+      });
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setClearing(false);
+    }
+  };
 
   const counts = data?.byStatus ?? {};
   // Summed over the same constant the query uses. Hand-listing the states here
@@ -157,6 +189,18 @@ export default function RunsPanel() {
           </div>
           <button className="btn-tiny" onClick={() => void refresh()} title="Refresh now">
             <RefreshCw size={13} />
+          </button>
+          {/* Disabled while empty rather than hidden: a button that appears and
+              vanishes with the list is harder to find than one that is always
+              in the same place. */}
+          <button
+            className="btn-tiny btn-danger"
+            onClick={() => void clear()}
+            disabled={clearing || !data || data.total === 0}
+            title="Clear finished runs"
+            aria-label="Clear finished runs"
+          >
+            <Trash2 size={13} />
           </button>
         </div>
 

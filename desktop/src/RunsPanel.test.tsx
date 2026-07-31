@@ -9,12 +9,24 @@ import React, { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-const { runsMock, deadMock } = vi.hoisted(() => ({ runsMock: vi.fn(), deadMock: vi.fn() }));
+const { runsMock, deadMock, clearRunsMock, pushMock } = vi.hoisted(() => ({
+  runsMock: vi.fn(),
+  deadMock: vi.fn(),
+  clearRunsMock: vi.fn(),
+  pushMock: vi.fn(),
+}));
 // The panel embeds DeadLetters, which polls on mount. Stubbed empty so these
 // tests are about the run list; DeadLetters.test.tsx covers the queue itself.
 vi.mock('./api', () => ({
-  bridge: { runs: runsMock, deadLetters: deadMock, redrive: vi.fn(), dismissDeadLetter: vi.fn() },
+  bridge: {
+    runs: runsMock,
+    clearRuns: clearRunsMock,
+    deadLetters: deadMock,
+    redrive: vi.fn(),
+    dismissDeadLetter: vi.fn(),
+  },
 }));
+vi.mock('./Toasts', () => ({ useToast: () => ({ push: pushMock }) }));
 
 import RunsPanel from './RunsPanel';
 import { invalidate, put } from './useCached';
@@ -56,10 +68,17 @@ const click = async (el: Element) => {
 };
 const button = (label: string) =>
   Array.from(host.querySelectorAll('button')).find((b) => b.textContent?.includes(label))!;
+/** The clear button is icon-only; its accessible name is the only handle. */
+const clearButton = () =>
+  host.querySelector<HTMLButtonElement>('button[aria-label="Clear finished runs"]')!;
 
 beforeEach(() => {
   invalidate();
   runsMock.mockReset();
+  clearRunsMock.mockReset();
+  clearRunsMock.mockResolvedValue({ cleared: 11, total: 1 });
+  pushMock.mockReset();
+  vi.stubGlobal('confirm', vi.fn().mockReturnValue(true));
   deadMock.mockReset();
   deadMock.mockResolvedValue({ deadLetters: [], total: 0 });
   runsMock.mockResolvedValue({ runs: [FAILED], total: 12, byStatus: { failed: 1, succeeded: 11 } });
@@ -71,9 +90,66 @@ beforeEach(() => {
 afterEach(() => {
   act(() => root.unmount());
   host.remove();
+  vi.unstubAllGlobals();
 });
 
 describe('RunsPanel', () => {
+  it('clears finished runs and refetches, so the list cannot show deleted rows', async () => {
+    await mount();
+    runsMock.mockResolvedValue({ runs: [], total: 1, byStatus: {} });
+    await click(clearButton());
+
+    expect(clearRunsMock).toHaveBeenCalled();
+    // A refetch after the delete, not an optimistic splice: the host decides
+    // what survived (it keeps work still in flight), so only it can say.
+    expect(runsMock.mock.calls.length).toBeGreaterThan(1);
+    expect(pushMock).toHaveBeenCalledWith(
+      expect.objectContaining({ kind: 'success', title: 'Cleared 11 finished runs' }),
+    );
+  });
+
+  it('warns that a retried request will run again, not just that rows disappear', async () => {
+    // The non-obvious consequence: clearing drops idempotency keys, so an app
+    // retrying a request from before the clear gets a fresh run instead of the
+    // recorded result. Rows vanishing is the part users already expect.
+    await mount();
+    await click(clearButton());
+    const message = (globalThis.confirm as ReturnType<typeof vi.fn>).mock.calls[0][0] as string;
+    expect(message).toContain('run it again');
+    expect(message).toContain('Queued and running work is kept');
+  });
+
+  it('does not clear when the confirm is declined', async () => {
+    vi.stubGlobal('confirm', vi.fn().mockReturnValue(false));
+    await mount();
+    await click(clearButton());
+    expect(clearRunsMock).not.toHaveBeenCalled();
+  });
+
+  it('says so plainly when there was nothing to clear', async () => {
+    // "Cleared 0 finished runs" reads like a bug. It is a real outcome: every
+    // remaining run is still in flight.
+    clearRunsMock.mockResolvedValue({ cleared: 0, total: 3 });
+    await mount();
+    await click(clearButton());
+    expect(pushMock).toHaveBeenCalledWith(
+      expect.objectContaining({ title: 'Nothing to clear' }),
+    );
+  });
+
+  it('surfaces a failed clear instead of pretending it worked', async () => {
+    clearRunsMock.mockRejectedValue(new Error('403: origin not allowed'));
+    await mount();
+    await click(clearButton());
+    expect(text()).toContain('origin not allowed');
+  });
+
+  it('disables the button when there is nothing recorded at all', async () => {
+    runsMock.mockResolvedValue({ runs: [], total: 0, byStatus: {} });
+    await mount();
+    expect(clearButton().disabled).toBe(true);
+  });
+
   it('opens on failures, because a list of successes buries the one row you came for', async () => {
     await mount();
     expect(runsMock).toHaveBeenCalledWith(['failed', 'timed_out', 'cancelled'], 50);

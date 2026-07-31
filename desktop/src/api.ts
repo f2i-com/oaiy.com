@@ -677,6 +677,10 @@ export const bridge = {
         statuses === 'all' ? 'all' : statuses.join(','),
       )}&limit=${limit}`,
     ),
+  /** Forget finished runs. Queued and running work is kept — the host refuses
+   *  to delete a record for work still in flight. Returns how many went. */
+  clearRuns: () =>
+    request<{ cleared: number; total: number }>('/api/bridge/runs', { method: 'DELETE' }),
   /** Invoke a connector command on a plugin, exactly as a flow would.
    *  `idempotencyKey` is required by the gateway for the plugin's journalled
    *  (physically side-effecting) commands, so callers should always pass one. */

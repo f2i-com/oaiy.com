@@ -1122,6 +1122,17 @@ mod tests {
     use axum::http::Method;
 
     #[test]
+    fn clearing_run_history_is_privileged() {
+        // DELETE on the runs collection destroys the record of what this
+        // machine has done. It takes the same gate as creating a run, so a
+        // local page cannot erase the evidence of one.
+        assert!(is_privileged_path(&Method::DELETE, "/api/bridge/runs"));
+        assert!(is_privileged_path(&Method::POST, "/api/bridge/runs"));
+        // Reading history stays a restricted read, not a privileged one.
+        assert!(is_restricted_read_path("/api/bridge/runs"));
+    }
+
+    #[test]
     fn companion_routes_are_privileged() {
         // These decide which phones may carry a live call's audio, and rotation
         // invalidates every existing pairing. A local web page must not reach
