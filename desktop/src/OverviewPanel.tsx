@@ -13,6 +13,7 @@ import { peek, put } from './useCached';
 import {
   aiProviders,
   bridge,
+  nodeRuntime,
   type RuntimeStatus,
   pairing,
   plugins,
@@ -204,6 +205,19 @@ export default function OverviewPanel({ onNavigate, onOpenPluginScreen }: Props)
                 <TriangleAlert size={13} /> Flows cannot run on this machine —{' '}
                 {runtime.flowRuntime.detail ?? 'the OAIY runtime is unavailable.'}
               </span>
+              {/* When the only thing missing is Node, fixing it is one click —
+                  don't make the user go and install a runtime by hand. */}
+              {runtime.nodeRuntime && !runtime.nodeRuntime.available && (
+                <button
+                  className="btn-tiny"
+                  disabled={runtime.nodeRuntime.installing}
+                  onClick={() => void nodeRuntime.install().then(refresh).catch(() => {})}
+                >
+                  {runtime.nodeRuntime.installing
+                    ? 'Installing Node…'
+                    : `Install Node ${runtime.nodeRuntime.installsVersion}`}
+                </button>
+              )}
             </div>
           )}
           {provs !== null && provs.length === 0 && (

@@ -463,11 +463,29 @@ export const serviceDefinitions = {
 // ----- bridge (connector commands + plugin events) -----
 
 /** What a plugin-contributed screen needs from the host to be useful. */
+/** The Node runtime the bundled CLI runs under. */
+export interface NodeSnapshot {
+  available: boolean;
+  source: 'portable' | 'system' | 'none';
+  path?: string | null;
+  version?: string | null;
+  installing: boolean;
+  installsVersion: string;
+}
+
+export const nodeRuntime = {
+  status: () => request<NodeSnapshot>('/api/node'),
+  /** Download the pinned portable Node; progress streams via logs. */
+  install: () => request<void>('/api/node/install', { method: 'POST' }),
+  logs: (tail = 200) => request<LogLine[]>(`/api/node/logs?tail=${tail}`),
+};
+
 export interface RuntimeStatus {
   ready: boolean;
   deviceId: string;
   flowRuntime: { cliResolved: boolean; cliKind: string; detail?: string | null };
   runs: { queued: number; known: number };
+  nodeRuntime?: NodeSnapshot | null;
   plugins: { serving: number; total: number };
 }
 

@@ -78,6 +78,8 @@ futures-util = "0.3"
 # in-process, so installing Python needs no PowerShell / tar.exe / .ps1.
 flate2 = "1"
 tar = "0.4"
+# Node ships a .zip for Windows (tar.gz elsewhere); deflate-only keeps it small.
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 # UUIDs for download / install job IDs. v4 only — no need for the
 # timestamp/MAC variants.

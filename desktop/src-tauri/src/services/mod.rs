@@ -18,6 +18,7 @@
 
 pub mod catalog;
 pub mod downloads;
+pub mod node_runtime;
 pub mod python;
 pub mod registry;
 pub mod runner;
