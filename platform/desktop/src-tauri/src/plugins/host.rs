@@ -1675,6 +1675,93 @@ mod tests {
         (sb, host)
     }
 
+    /// Install a plugin manifest so the registry grants the named capabilities.
+    fn install_plugin(sb: &Sandbox, id: &str, capabilities: &[&str]) {
+        let dir = sb.0.join("plugins").join(id);
+        std::fs::create_dir_all(&dir).unwrap();
+        let manifest = serde_json::json!({
+            "schemaVersion": 3,
+            "id": id,
+            "name": id,
+            "version": "0.1.0",
+            "pluginApiVersion": 1,
+            "entry": { "kind": "process", "command": "plugin.exe" },
+            "capabilities": capabilities,
+        });
+        std::fs::write(dir.join("manifest.json"), manifest.to_string()).unwrap();
+    }
+
+    fn broker_for(sb: &Sandbox, host: &Arc<PluginHost>) -> crate::companion::routes::CompanionHandle {
+        let companion =
+            crate::companion::new_handle(sb.0.clone(), host.registry.clone());
+        let upstream = crate::companion::upstream::UpstreamStore::open(sb.0.join("relay.json"));
+        host.set_companion_broker(CompanionBroker {
+            companion: companion.clone(),
+            upstream,
+        });
+        companion
+    }
+
+    #[test]
+    fn admission_is_refused_to_a_plugin_that_did_not_declare_the_capability() {
+        // The capability is the whole authorisation for reaching the roster.
+        // A plugin that can broker admissions decides which phones take live
+        // call audio, so this is checked per call, not once at load.
+        let (sb, host) = host_with("adm-nocap", vec![]);
+        install_plugin(&sb, "aokie", &["flow.run"]);
+        host.registry.lock().unwrap().scan();
+        broker_for(&sb, &host);
+
+        let (code, message) = host
+            .handle_plugin_request("aokie", "companion.admission", serde_json::json!({}))
+            .unwrap_err();
+        assert_eq!(code, "capability_denied");
+        assert!(message.contains("oaiy.companion.admission"), "{message}");
+    }
+
+    #[test]
+    fn admission_is_refused_before_any_device_has_been_approved() {
+        // An admission with an empty roster admits nobody, so asking the issuer
+        // for one would spend a round trip to obtain a token that cannot carry
+        // a call. Saying so plainly is what tells the user to pair a phone.
+        let (sb, host) = host_with("adm-nopair", vec![]);
+        install_plugin(&sb, "aokie", &["companion.admission"]);
+        host.registry.lock().unwrap().scan();
+        broker_for(&sb, &host);
+
+        let (code, message) = host
+            .handle_plugin_request("aokie", "companion.admission", serde_json::json!({}))
+            .unwrap_err();
+        assert_eq!(code, "not_paired");
+        assert!(message.contains("approved"), "{message}");
+    }
+
+    #[test]
+    fn a_host_with_no_broker_says_so_instead_of_panicking() {
+        // The host is also built by tests and tools that never wire companion
+        // support; those must keep answering, honestly.
+        let (sb, host) = host_with("adm-nobroker", vec![]);
+        install_plugin(&sb, "aokie", &["companion.admission"]);
+        host.registry.lock().unwrap().scan();
+
+        let (code, _) = host
+            .handle_plugin_request("aokie", "companion.admission", serde_json::json!({}))
+            .unwrap_err();
+        assert_eq!(code, "unavailable");
+    }
+
+    #[test]
+    fn an_unknown_method_names_both_methods_the_host_answers() {
+        // The message is a plugin author's only clue when they misspell one.
+        let (_sb, host) = host_with("adm-unknown", vec![]);
+        let (code, message) = host
+            .handle_plugin_request("aokie", "companion.admit", serde_json::json!({}))
+            .unwrap_err();
+        assert_eq!(code, "invalid_request");
+        assert!(message.contains("flow.run"), "{message}");
+        assert!(message.contains("companion.admission"), "{message}");
+    }
+
     #[test]
     fn an_event_whose_binding_cannot_evaluate_is_dead_lettered() {
         // `====` is not an operator the restricted evaluator understands, so the
