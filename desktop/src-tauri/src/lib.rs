@@ -1493,6 +1493,7 @@ pub fn run() {
                     python_for_http,
                     catalog_for_http,
                     bridge_for_http,
+                    data_dir_for_bridge.clone(),
                     ai_providers_for_http,
                     ai_codex_for_http,
                     node_for_http,
