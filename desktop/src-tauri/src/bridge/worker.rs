@@ -33,6 +33,7 @@
 //! all is a **typed, actionable failure** on each run — `runtime_unavailable`,
 //! naming the fixes — never a silent stall of the queue.
 
+use crate::HiddenCommand as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -212,8 +213,10 @@ fn lookup_on_path(name: &str) -> Option<PathBuf> {
     let finder = if cfg!(windows) { "where" } else { "which" };
     let out = Command::new(finder)
         .arg(name)
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
+        .pipe_hidden()
         .output()
         .ok()?;
     if !out.status.success() {

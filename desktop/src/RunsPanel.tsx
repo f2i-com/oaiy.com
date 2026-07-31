@@ -65,7 +65,14 @@ function duration(rec: RunRecord): string | null {
 
 export default function RunsPanel() {
   const [filter, setFilter] = useState<Filter>('failures');
-  const [data, setData] = useState<RunHistory | null>(() => peek('runHistory') ?? null);
+  // Keyed BY FILTER. One shared key meant a revisit could paint the cached
+  // "all" snapshot under the "Failed runs" heading — a list of green succeeded
+  // badges below a title claiming they failed. And if the refresh then failed,
+  // it stayed that way indefinitely behind an error banner that said nothing
+  // about the list being wrong.
+  const [data, setData] = useState<RunHistory | null>(
+    () => peek(`runHistory:${filter}`) ?? null,
+  );
   const [error, setError] = useState<string | null>(null);
   const [expanded, setExpanded] = useState<string | null>(null);
 
@@ -73,7 +80,7 @@ export default function RunsPanel() {
     try {
       const next = await bridge.runs(filter === 'failures' ? FAILURE_STATES : 'all', 50);
       setData(next);
-      put('runHistory', next);
+      put(`runHistory:${filter}`, next);
       setError(null);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -81,10 +88,13 @@ export default function RunsPanel() {
   }, [filter]);
 
   useEffect(() => {
+    // Repaint from THIS filter's cache the moment the filter changes, so the
+    // heading and the rows can never disagree while the refetch is in flight.
+    setData(peek<RunHistory>(`runHistory:${filter}`) ?? null);
     void refresh();
     const id = window.setInterval(() => void refresh(), POLL_MS);
     return () => window.clearInterval(id);
-  }, [refresh]);
+  }, [refresh, filter]);
 
   const counts = data?.byStatus ?? {};
   const failed = (counts.failed ?? 0) + (counts.timed_out ?? 0);

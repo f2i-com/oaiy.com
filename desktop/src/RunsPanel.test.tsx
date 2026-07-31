@@ -17,6 +17,7 @@ vi.mock('./api', () => ({
 }));
 
 import RunsPanel from './RunsPanel';
+import { invalidate, put } from './useCached';
 
 const FAILED = {
   runId: 'run_a1',
@@ -57,6 +58,7 @@ const button = (label: string) =>
   Array.from(host.querySelectorAll('button')).find((b) => b.textContent?.includes(label))!;
 
 beforeEach(() => {
+  invalidate();
   runsMock.mockReset();
   deadMock.mockReset();
   deadMock.mockResolvedValue({ deadLetters: [], total: 0 });
@@ -117,6 +119,26 @@ describe('RunsPanel', () => {
     root = createRoot(host);
     await mount();
     expect(text()).toContain('No flow has run on this machine yet');
+  });
+
+  it('never paints one filter’s rows under the other filter’s heading', async () => {
+    // Regression: both filters shared one cache key, so browsing All and then
+    // revisiting the panel showed green `succeeded` rows beneath the heading
+    // "Failed runs" — and if the refetch then failed, it stayed that way behind
+    // an error banner that said nothing about the list being wrong.
+    put('runHistory:all', {
+      runs: [{ ...FAILED, runId: 'run_ok', status: 'succeeded', error: undefined }],
+      total: 12,
+      byStatus: { succeeded: 12 },
+    });
+    // The refetch never resolves, so whatever paints must come from the cache.
+    runsMock.mockReturnValue(new Promise(() => {}));
+
+    await mount();
+
+    expect(text()).toContain('Failed runs');
+    expect(text()).not.toContain('succeeded');
+    expect(text()).not.toContain('run_ok');
   });
 
   it('surfaces a fetch failure instead of pretending there is no history', async () => {

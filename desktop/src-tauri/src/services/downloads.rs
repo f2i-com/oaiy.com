@@ -1013,19 +1013,42 @@ async fn run_download(
     // previous process that is gone, so re-read them — one pass over the
     // partial, only on the uncommon path, versus re-reading the whole file at
     // the end of every download.
+    let mut unhashable_resume: Option<String> = None;
     let mut hasher = if resuming && resume_accepted {
         match hash_prefix(&part, resume_from).await {
             Ok(h) => Some(h),
             Err(e) => {
-                // Verification is now impossible for this transfer. Say so
-                // rather than finishing and reporting a digest of the tail.
-                eprintln!("[downloads] cannot re-hash {}: {e}", part.display());
+                // Verification is now impossible for this transfer: hashing only
+                // the tail would produce a digest of the wrong bytes. The
+                // alternative was to finish anyway and rename the file into
+                // place with `verified: None` — indistinguishable from a source
+                // that publishes no digest at all. Silently downgrading a
+                // checkable download to an uncheckable one is precisely the lie
+                // this feature exists to prevent, and it was reported only by an
+                // eprintln! to a console a packaged app does not have.
+                //
+                // Restarting from zero is not available here: the file is
+                // already open in append mode and the request already carries a
+                // Range header. So fail, keep the .part, and say what to do —
+                // a retry re-attempts the hash, and cancel starts clean.
+                unhashable_resume = Some(e.to_string());
                 None
             }
         }
     } else {
         Some(Sha256::new())
     };
+
+    if let Some(why) = unhashable_resume {
+        update(Box::new(move |p| {
+            p.status = DownloadStatus::Failed;
+            p.error = Some(format!(
+                "could not re-read the partial file to continue verifying it ({why}).                  The download was stopped rather than finished unverified — retry to                  try again, or cancel and download afresh."
+            ));
+            p.finished_at = Some(Utc::now());
+        }));
+        return;
+    }
 
     let mut downloaded: u64 = if resuming && resume_accepted { resume_from } else { 0 };
     let mut last_emit: u64 = downloaded;
@@ -1089,7 +1112,30 @@ async fn run_download(
             }));
         }
     }
-    let _ = tokio::io::AsyncWriteExt::flush(&mut file).await;
+    // Treat flush as a write, because it IS one: `tokio::fs::File` buffers, and
+    // a deferred I/O failure (a full disk, a network-mapped models dir that
+    // hiccups) surfaces here or nowhere. Every downstream check is computed
+    // from memory — `downloaded` counts bytes off the network and the digest is
+    // taken over those same chunks — so nothing else can notice that the tail
+    // never reached disk. Discarding this error let a SHORT file be renamed
+    // into place and reported "checksum verified", which is the one claim this
+    // code exists to make truthfully.
+    //
+    // fsync as well as flush: "verified" is a claim about what is ON DISK, and
+    // an unsynced tail is not on disk yet.
+    let flushed = tokio::io::AsyncWriteExt::flush(&mut file)
+        .await
+        .and(file.sync_all().await);
+    if let Err(e) = flushed {
+        update(Box::new(move |p| {
+            p.status = DownloadStatus::Failed;
+            p.error = Some(format!("write: {e}"));
+            p.finished_at = Some(Utc::now());
+        }));
+        // Keep the .part: the bytes that DID land are still a valid prefix to
+        // resume from once whatever failed is fixed.
+        return;
+    }
     drop(file);
 
     // Don't rename a silently-truncated body into a "valid" model: when the full size is known,

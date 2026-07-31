@@ -668,6 +668,12 @@ fn is_bridge_exec_path(path: &str) -> bool {
         || path.starts_with("/api/bridge/flows/")    // define / delete a flow doc
         || path.starts_with("/api/bridge/triggers/") // delete a binding
         || path.starts_with("/api/bridge/connectors/") // physical side effects
+        // Redrive re-dispatches a stored event through the ordinary trigger
+        // path, so it RESERVES RUNS the worker then executes — the same power
+        // as creating a run, and it was on the broad loopback allow-list.
+        // DELETE on the same prefix destroys the only record that an event was
+        // lost, which is not something a local page should be able to do either.
+        || path.starts_with("/api/bridge/deadletters")
         // Pairing APPROVAL/denial is the user's trust act, and revoke unpairs an
         // app — only OAIY's own webview (or a token holder) may. But raising a
         // request (`POST /api/bridge/pairing`) and polling it
@@ -733,6 +739,10 @@ fn is_restricted_read_path(path: &str) -> bool {
         || path == "/api/services/definitions"
         // Readiness names plugins + queue depth: gated like the other bridge reads.
         || path == "/api/bridge/status"
+        // A dead letter stores the WHOLE event envelope — the same
+        // plugin-supplied payload `/api/bridge/events` is gated for, except
+        // durable across restarts rather than a 500-entry ring.
+        || path.starts_with("/api/bridge/deadletters")
         || path == "/api/bridge/events"
         || path == "/api/bridge/runs"
         || path == "/api/bridge/flows"
@@ -1073,6 +1083,20 @@ mod tests {
         privileged_allowed, AuthConfig, ModelDownloadRequest,
     };
     use axum::http::Method;
+
+    #[test]
+    fn dead_letter_routes_are_gated_like_the_rest_of_the_bridge() {
+        // Redrive re-dispatches a stored event through the trigger path and
+        // RESERVES RUNS the worker executes — the same power as POST /runs, so
+        // it belongs on the strict gate rather than the broad loopback
+        // allow-list any local page can reach.
+        assert!(is_privileged_path(&Method::POST, "/api/bridge/deadletters/dl_1/redrive"));
+        // Deleting one destroys the only durable record that an event was lost.
+        assert!(is_privileged_path(&Method::DELETE, "/api/bridge/deadletters/dl_1"));
+        // And a dead letter stores the WHOLE envelope, which is exactly what
+        // /api/bridge/events is already restricted for.
+        assert!(is_restricted_read_path("/api/bridge/deadletters"));
+    }
 
     #[test]
     fn a_download_request_actually_reads_its_checksum_field() {

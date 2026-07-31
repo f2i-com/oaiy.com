@@ -526,6 +526,14 @@ const MODEL_SELECTOR_ROW_STYLE: CSSProperties = {
 
 // The GPU list is machine-global — fetch it once and cache so every card's picker shares it
 // (avoids one nvidia-smi per card).
+//
+// Only a NON-EMPTY probe is cached. `list_gpus` returns an empty list for three
+// different situations — no NVIDIA tooling, a probe that errored, and a probe
+// killed by its 5s deadline — and caching that for the session made the last two
+// permanent: a busy GPU is exactly when nvidia-smi is slowest AND exactly when
+// the user has come to Services to move a service off it, so the one control
+// that would fix things vanished until the app was restarted. Retrying on the
+// next mount costs one process spawn and cannot make anything worse.
 let gpusCache: GpuInfo[] | null = null;
 let gpusPromise: Promise<GpuInfo[]> | null = null;
 function useGpus(): GpuInfo[] {
@@ -535,7 +543,12 @@ function useGpus(): GpuInfo[] {
     if (!gpusPromise) gpusPromise = appConfig.listGpus().catch(() => [] as GpuInfo[]);
     let alive = true;
     void gpusPromise.then((g) => {
-      gpusCache = g;
+      if (g.length > 0) {
+        gpusCache = g;
+      } else {
+        // Let the next mount try again rather than remembering "none".
+        gpusPromise = null;
+      }
       if (alive) setGpus(g);
     });
     return () => {
