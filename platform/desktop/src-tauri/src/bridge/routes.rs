@@ -419,9 +419,16 @@ fn parse_statuses(raw: &str) -> Result<Vec<RunStatus>, String> {
     if raw.trim().eq_ignore_ascii_case("all") {
         return Ok(Vec::new());
     }
-    raw.split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
+    let names: Vec<&str> = raw.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+    // `status=` or `status=,,,` named nothing. An empty Vec means "no filter"
+    // downstream, so accepting it would answer a request for SOME runs with ALL
+    // of them — a screen titled "Failed runs" listing successes. That is the
+    // same silent-wrongness as an unknown name, pointing the other way.
+    if names.is_empty() {
+        return Err("status must name at least one state, or be `all`".into());
+    }
+    names
+        .into_iter()
         .map(|s| match s.to_ascii_lowercase().as_str() {
             "queued" => Ok(RunStatus::Queued),
             "running" => Ok(RunStatus::Running),
@@ -1607,6 +1614,20 @@ mod tests {
         );
         // `all` is the explicit "no filter", distinct from omitting the param
         // (which keeps the queued-only default a worker polls).
+        assert!(parse_statuses("all").unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_filter_that_names_nothing_is_an_error_not_everything() {
+        // An empty Vec means "no filter" downstream, so accepting `status=`
+        // would answer a request for SOME runs with ALL of them — the panel
+        // headed "Failed runs" listing successes. Asking for nothing and
+        // getting everything is the worst possible reading.
+        assert!(parse_statuses("").is_err());
+        assert!(parse_statuses("   ").is_err());
+        assert!(parse_statuses(",,,").is_err());
+        assert!(parse_statuses(" , , ").is_err());
+        // `all` remains the explicit, deliberate way to say "no filter".
         assert!(parse_statuses("all").unwrap().is_empty());
     }
 
