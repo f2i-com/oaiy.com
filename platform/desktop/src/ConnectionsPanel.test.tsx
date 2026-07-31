@@ -13,7 +13,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const {
   relayStatusMock, setRelayMock, clearRelayMock,
-  linkStatusMock, linkStartMock, unlinkMock,
+  linkStatusMock, linkStartMock, unlinkMock, cancelLinkMock,
   pendingMock, pairedMock, pushMock,
 } = vi.hoisted(() => ({
   relayStatusMock: vi.fn(),
@@ -22,6 +22,7 @@ const {
   linkStatusMock: vi.fn(),
   linkStartMock: vi.fn(),
   unlinkMock: vi.fn(),
+  cancelLinkMock: vi.fn(),
   pendingMock: vi.fn(),
   pairedMock: vi.fn(),
   pushMock: vi.fn(),
@@ -37,6 +38,7 @@ vi.mock('./api', () => ({
     status: linkStatusMock,
     start: linkStartMock,
     unlink: unlinkMock,
+    cancel: cancelLinkMock,
   },
   pairing: {
     pending: pendingMock,
@@ -103,6 +105,7 @@ beforeEach(() => {
   linkStatusMock.mockResolvedValue(IDLE);
   linkStartMock.mockResolvedValue({ authorizeUrl: 'https://acme.example/authorize?x=1' });
   unlinkMock.mockResolvedValue(IDLE);
+  cancelLinkMock.mockResolvedValue({ ...IDLE, attempt: { phase: 'cancelled' } });
   vi.stubGlobal('confirm', vi.fn().mockReturnValue(true));
 });
 
@@ -153,6 +156,49 @@ describe('ConnectionsPanel · Linked account', () => {
     const a = container.querySelector('a[href^="https://acme.example/authorize"]');
     expect(a).toBeTruthy();
     expect(container.textContent).toContain('Waiting for you to approve');
+  });
+
+  it('lets the user cancel while waiting on the browser', async () => {
+    // Without this the only way out of a link they changed their mind about is
+    // to wait out the five-minute timeout.
+    linkStatusMock.mockResolvedValue({
+      linked: false,
+      attempt: { phase: 'awaitingBrowser', authorizeUrl: 'https://acme.example/authorize?x=1' },
+      available: [CONNECTOR],
+    });
+    await mount();
+    await click('Cancel');
+    expect(cancelLinkMock).toHaveBeenCalled();
+    // Cancelling is not an error — it must not be dressed as one.
+    expect(container.querySelector('[role="alert"]')).toBeNull();
+    expect(container.textContent).toContain('Linking cancelled');
+  });
+
+  it('does not describe the wait with mangled escape text', async () => {
+    // Regression: a patch script wrote literal \\u2026 / \\u2019 sequences into
+    // the JSX, so the panel rendered "browser\\u2026" and "Didn\\u2019t".
+    linkStatusMock.mockResolvedValue({
+      linked: false,
+      attempt: { phase: 'awaitingBrowser', authorizeUrl: 'https://acme.example/authorize' },
+      available: [CONNECTOR],
+    });
+    await mount();
+    const text = container.textContent ?? '';
+    expect(text).not.toMatch(/\\u[0-9a-fA-F]{4}/);
+    expect(text).toContain('Waiting for you to approve this in your browser');
+    expect(text).toContain('No tab opened?');
+  });
+
+  it('offers a way to dismiss a stale failure', async () => {
+    // Otherwise the error banner has no exit short of a successful link.
+    linkStatusMock.mockResolvedValue({
+      linked: false,
+      attempt: { phase: 'failed', message: 'the provider refused the link' },
+      available: [CONNECTOR],
+    });
+    await mount();
+    await click('Dismiss');
+    expect(cancelLinkMock).toHaveBeenCalled();
   });
 
   it('surfaces a failed attempt rather than looking idle', async () => {
