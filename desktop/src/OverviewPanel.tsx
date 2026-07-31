@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from 'react';
 import {
   ChevronRight,
   CircleDot,
+  History,
   ListChecks,
   Package,
   Plug,
@@ -43,6 +44,7 @@ const POLL_MS = 4000;
 export type OverviewNav =
   | 'services'
   | 'plugins'
+  | 'runs'
   | 'models'
   | 'providers'
   | 'python'
@@ -245,6 +247,19 @@ export default function OverviewPanel({ onNavigate, onOpenPluginScreen }: Props)
               {/* When the only thing missing is Node, fixing it is one click —
                   don't make the user go and install a runtime by hand. */}
               {installNode}
+            </div>
+          )}
+          {/* Failures are the one thing on this screen that has already gone
+              wrong rather than merely being unconfigured, so they lead. */}
+          {(runtime?.runs.failed ?? 0) > 0 && (
+            <div className="datadir-note">
+              <span>
+                <TriangleAlert size={13} /> {runtime!.runs.failed} run
+                {runtime!.runs.failed === 1 ? ' has' : 's have'} failed on this machine.
+              </span>
+              <button className="btn-tiny" onClick={() => onNavigate('runs')}>
+                <History size={13} /> See why
+              </button>
             </div>
           )}
           {provs !== null && provs.length === 0 && (

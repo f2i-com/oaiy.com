@@ -7,7 +7,7 @@
 //! |---|---|
 //! | `GET  /api/bridge/capabilities` | what this runtime can do right now |
 //! | `POST /api/bridge/runs` | reserve a run (idempotent) |
-//! | `GET  /api/bridge/runs` | claimable runs, oldest first |
+//! | `GET  /api/bridge/runs` | claimable runs oldest first; `?status=` for history, newest first |
 //! | `GET  /api/bridge/runs/:id` | one run |
 //! | `POST /api/bridge/runs/:id/claim` | single-winner claim |
 //! | `POST /api/bridge/runs/:id/cancel` | request cancellation |
@@ -393,9 +393,76 @@ async fn get_run(State(st): State<BridgeState>, Path(id): Path<String>) -> axum:
     }
 }
 
-async fn queued_runs(State(st): State<BridgeState>) -> axum::response::Response {
+#[derive(Debug, Deserialize)]
+struct RunsQuery {
+    /// Comma-separated statuses, or `all`. Absent keeps the historical
+    /// queued-only behaviour that pollers depend on.
+    status: Option<String>,
+    limit: Option<usize>,
+}
+
+/// The most rows one request will return, whatever `limit` asks for. The ledger
+/// holds 20k runs and every record carries its input and output — serialising
+/// the lot in one response is a memory spike, not a feature.
+const MAX_RUNS_PAGE: usize = 200;
+
+/// Parse `status=failed,timed_out` into the enum. An unrecognised name is an
+/// error rather than an empty filter: silently returning "no runs" for a typo
+/// reads exactly like "nothing failed", which is the one answer that must never
+/// be wrong here.
+fn parse_statuses(raw: &str) -> Result<Vec<RunStatus>, String> {
+    if raw.trim().eq_ignore_ascii_case("all") {
+        return Ok(Vec::new());
+    }
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| match s.to_ascii_lowercase().as_str() {
+            "queued" => Ok(RunStatus::Queued),
+            "running" => Ok(RunStatus::Running),
+            "succeeded" => Ok(RunStatus::Succeeded),
+            "failed" => Ok(RunStatus::Failed),
+            "timed_out" => Ok(RunStatus::TimedOut),
+            "cancelled" => Ok(RunStatus::Cancelled),
+            other => Err(format!("unknown status `{other}`")),
+        })
+        .collect()
+}
+
+/// `GET /api/bridge/runs` — queued runs by default (what a worker polls), or
+/// history when `status` is given.
+async fn queued_runs(
+    State(st): State<BridgeState>,
+    axum::extract::Query(q): axum::extract::Query<RunsQuery>,
+) -> axum::response::Response {
+    let limit = q.limit.unwrap_or(100).min(MAX_RUNS_PAGE);
+    let statuses = match q.status.as_deref().map(parse_statuses).transpose() {
+        Ok(s) => s,
+        Err(msg) => return bridge_error(StatusCode::BAD_REQUEST, "invalid_request", msg),
+    };
+
     match st.ledger.lock() {
-        Ok(l) => (StatusCode::OK, Json(json!({ "runs": l.queued(100) }))).into_response(),
+        Ok(l) => {
+            // No filter asked for: the original contract, oldest first, because a
+            // claimer wants the longest-waiting run — not the newest.
+            let (runs, counts) = match statuses {
+                None => (l.queued(limit), None),
+                Some(s) => (l.recent(limit, &s), Some(l.status_counts())),
+            };
+            let mut body = json!({ "runs": runs, "total": l.len() });
+            if let Some(counts) = counts {
+                // Keyed by the same snake_case names the filter accepts.
+                let by_status: serde_json::Map<String, serde_json::Value> = counts
+                    .into_iter()
+                    .filter_map(|(k, v)| {
+                        let key = serde_json::to_value(k).ok()?;
+                        Some((key.as_str()?.to_string(), json!(v)))
+                    })
+                    .collect();
+                body["byStatus"] = serde_json::Value::Object(by_status);
+            }
+            (StatusCode::OK, Json(body)).into_response()
+        }
         Err(_) => bridge_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "internal",
@@ -760,9 +827,21 @@ async fn runtime_status(State(st): State<BridgeState>) -> axum::response::Respon
         None => "missing",
     };
 
-    let (queued, total_runs) = match st.ledger.lock() {
-        Ok(l) => (l.queued(usize::MAX).len(), l.len()),
-        Err(_) => (0, 0),
+    // `failed` is carried here so Overview can point at the run history without
+    // paging it — a machine where flows are quietly failing should say so on the
+    // first screen rather than only on the one you have to think to open.
+    let (queued, total_runs, failed_runs) = match st.ledger.lock() {
+        Ok(l) => {
+            let counts = l.status_counts();
+            let failed = counts.get(&RunStatus::Failed).copied().unwrap_or(0)
+                + counts.get(&RunStatus::TimedOut).copied().unwrap_or(0);
+            (
+                counts.get(&RunStatus::Queued).copied().unwrap_or(0),
+                l.len(),
+                failed,
+            )
+        }
+        Err(_) => (0, 0, 0),
     };
 
     let plugins: Vec<serde_json::Value> = match st.plugins.lock() {
@@ -810,7 +889,7 @@ async fn runtime_status(State(st): State<BridgeState>) -> axum::response::Respon
                 },
             },
             "nodeRuntime": node,
-            "runs": { "queued": queued, "known": total_runs },
+            "runs": { "queued": queued, "known": total_runs, "failed": failed_runs },
             "plugins": { "serving": plugins_serving, "total": plugins.len(), "detail": plugins },
         })),
     )
@@ -1435,6 +1514,27 @@ mod tests {
                 "{k:?}"
             );
         }
+    }
+
+    #[test]
+    fn the_history_filter_accepts_the_protocols_own_status_names() {
+        assert_eq!(parse_statuses("failed").unwrap(), vec![RunStatus::Failed]);
+        assert_eq!(
+            parse_statuses("failed, timed_out ,cancelled").unwrap(),
+            vec![RunStatus::Failed, RunStatus::TimedOut, RunStatus::Cancelled]
+        );
+        // `all` is the explicit "no filter", distinct from omitting the param
+        // (which keeps the queued-only default a worker polls).
+        assert!(parse_statuses("all").unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_unknown_status_is_an_error_not_an_empty_result() {
+        // A typo must not answer "no runs failed" — that is indistinguishable
+        // from good news, and it is the one thing this view exists to report.
+        let err = parse_statuses("failedd").unwrap_err();
+        assert!(err.contains("failedd"), "{err}");
+        assert!(parse_statuses("succeeded,nonsense").is_err());
     }
 
     #[test]

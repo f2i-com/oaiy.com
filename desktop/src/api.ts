@@ -484,14 +484,59 @@ export interface RuntimeStatus {
   ready: boolean;
   deviceId: string;
   flowRuntime: { cliResolved: boolean; cliKind: string; detail?: string | null };
-  runs: { queued: number; known: number };
+  runs: { queued: number; known: number; failed?: number };
   nodeRuntime?: NodeSnapshot | null;
   plugins: { serving: number; total: number };
+}
+
+export type RunStatus =
+  | 'queued'
+  | 'running'
+  | 'succeeded'
+  | 'failed'
+  | 'timed_out'
+  | 'cancelled';
+
+/** One row of run history. Mirrors the ledger's `RunRecord` wire shape. */
+export interface RunRecord {
+  runId: string;
+  status: RunStatus;
+  callerProduct: string;
+  flowId?: string;
+  correlationId: string;
+  mode: string;
+  runtime?: string;
+  error?: {
+    code: string;
+    message: string;
+    detail?: string;
+    nodeId?: string;
+    capability?: string;
+    retryable?: boolean;
+  };
+  reservedAt: string;
+  startedAt?: string;
+  finishedAt?: string;
+  triggerEvent?: string;
+}
+
+export interface RunHistory {
+  runs: RunRecord[];
+  total: number;
+  byStatus?: Partial<Record<RunStatus, number>>;
 }
 
 export const bridge = {
   /** Can this runtime actually run a flow? (health only asserts identity.) */
   status: () => request<RuntimeStatus>('/api/bridge/status'),
+  /** Run history, newest first. `statuses` empty means every state — omitting
+   *  the filter entirely is the worker's queued-only poll, not what a UI wants. */
+  runs: (statuses: RunStatus[] | 'all' = 'all', limit = 50) =>
+    request<RunHistory>(
+      `/api/bridge/runs?status=${encodeURIComponent(
+        statuses === 'all' ? 'all' : statuses.join(','),
+      )}&limit=${limit}`,
+    ),
   /** Invoke a connector command on a plugin, exactly as a flow would.
    *  `idempotencyKey` is required by the gateway for the plugin's journalled
    *  (physically side-effecting) commands, so callers should always pass one. */

@@ -5,6 +5,7 @@ import {
   Copy,
   ExternalLink,
   HardDrive,
+  History,
   LayoutDashboard,
   LoaderCircle,
   LockKeyhole,
@@ -29,6 +30,7 @@ import PythonPanel from './PythonPanel';
 import PluginsPanel from './PluginsPanel';
 import AiProvidersPanel from './AiProvidersPanel';
 import OverviewPanel from './OverviewPanel';
+import RunsPanel from './RunsPanel';
 import PluginScreenPage from './PluginScreenPage';
 import ConnectionsPanel from './ConnectionsPanel';
 import PairingPrompt from './PairingPrompt';
@@ -58,6 +60,7 @@ type BuiltinView =
   | 'overview'
   | 'services'
   | 'plugins'
+  | 'runs'
   | 'models'
   | 'python'
   | 'providers'
@@ -81,6 +84,7 @@ const NAV: { value: BuiltinView; label: string; icon: LucideIcon }[] = [
   { value: 'overview', label: 'Overview', icon: LayoutDashboard },
   { value: 'services', label: 'Services', icon: Server },
   { value: 'plugins', label: 'Plugins', icon: Plug },
+  { value: 'runs', label: 'Runs', icon: History },
   { value: 'models', label: 'Models', icon: Package },
   { value: 'providers', label: 'Providers', icon: Sparkles },
   { value: 'python', label: 'Python', icon: HardDrive },
@@ -109,6 +113,12 @@ const PAGE: Record<BuiltinView, { crumb: string; kicker: string; title: string; 
     kicker: 'Extensions',
     title: 'Plugins',
     copy: 'Supervised extensions that add connectors and events to your flows.',
+  },
+  runs: {
+    crumb: 'Runs',
+    kicker: 'Flow runtime',
+    title: 'Run history',
+    copy: 'Every flow this machine has run, and the reason any of them failed.',
   },
   models: {
     crumb: 'Models',
@@ -485,6 +495,7 @@ export default function App() {
             {pluginView && <PluginScreenPage pluginId={pluginView[1]} navId={pluginView[2]} />}
             {view === 'services' && <ServicesPanel />}
             {view === 'plugins' && <PluginsPanel />}
+            {view === 'runs' && <RunsPanel />}
             {view === 'models' && <ModelsPanel />}
             {view === 'providers' && <AiProvidersPanel />}
             {view === 'connections' && <ConnectionsPanel />}
