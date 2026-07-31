@@ -31,6 +31,14 @@
     }
   },
   "healthPath": "/api/v1/desktop-connections",
+  "relay": {
+    "pendingPath": "/api/v1/connector-commands/pending",
+    "claimPath": "/api/v1/connector-commands/{id}/claim",
+    "completePath": "/api/v1/connector-commands/{id}/complete",
+    "waitSeconds": 25,
+    "batchLimit": 20,
+    "errorBackoffSeconds": 10
+  },
   "heartbeat": {
     "path": "/api/v1/desktop-connections",
     "intervalSeconds": 45,
