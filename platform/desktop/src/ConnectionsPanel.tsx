@@ -1,6 +1,12 @@
 import { useCallback, useEffect, useState } from 'react';
-import { Check, Link2, ShieldCheck, TriangleAlert, X } from 'lucide-react';
-import { pairing, type PairedApp, type PendingPairing } from './api';
+import { Check, Link2, Radio, ShieldCheck, TriangleAlert, X } from 'lucide-react';
+import {
+  companion,
+  pairing,
+  type CompanionRelayStatus,
+  type PairedApp,
+  type PendingPairing,
+} from './api';
 import { peek, put } from './useCached';
 import { useToast } from './Toasts';
 
@@ -22,6 +28,20 @@ export default function ConnectionsPanel() {
   const [paired, setPaired] = useState<PairedApp[]>(() => peek('pairedApps') ?? []);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState<Set<string>>(new Set());
+  const [relay, setRelay] = useState<CompanionRelayStatus | null>(() => peek('companionRelay') ?? null);
+  const [relayForm, setRelayForm] = useState({ baseUrl: '', token: '', appId: '' });
+  const [relayError, setRelayError] = useState<string | null>(null);
+
+  const refreshRelay = useCallback(async () => {
+    try {
+      const next = await companion.relayStatus();
+      setRelay(next);
+      put('companionRelay', next);
+    } catch {
+      // A relay this desktop has never configured is the normal case, not an
+      // error worth a banner over the pairing list.
+    }
+  }, []);
 
   const refresh = useCallback(async () => {
     try {
@@ -41,6 +61,49 @@ export default function ConnectionsPanel() {
     const id = window.setInterval(refresh, POLL_MS);
     return () => window.clearInterval(id);
   }, [refresh]);
+
+  // Not polled: it only changes when this screen changes it.
+  useEffect(() => {
+    void refreshRelay();
+  }, [refreshRelay]);
+
+  const saveRelay = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setRelayError(null);
+    try {
+      const next = await companion.setRelay({
+        baseUrl: relayForm.baseUrl.trim(),
+        token: relayForm.token,
+        appId: relayForm.appId.trim() || undefined,
+      });
+      setRelay(next);
+      put('companionRelay', next);
+      // Clear the token from component state the moment it is stored: it is
+      // write-only from here on, and there is no reason to keep it in memory.
+      setRelayForm({ baseUrl: '', token: '', appId: '' });
+      toast.push({ kind: 'success', title: 'Companion relay saved' });
+    } catch (err) {
+      setRelayError(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  const disconnectRelay = async () => {
+    if (
+      !confirm(
+        'Disconnect the Companion relay? Phones already approved stay approved, but they will not be able to join a call until a relay is set again.',
+      )
+    )
+      return;
+    setRelayError(null);
+    try {
+      const next = await companion.clearRelay();
+      setRelay(next);
+      put('companionRelay', next);
+      toast.push({ kind: 'success', title: 'Companion relay disconnected' });
+    } catch (err) {
+      setRelayError(err instanceof Error ? err.message : String(err));
+    }
+  };
 
   const act = useCallback(
     async (id: string, fn: () => Promise<unknown>, done: string) => {
@@ -164,6 +227,85 @@ export default function ConnectionsPanel() {
             ))}
           </ul>
         )}
+      </section>
+
+      <section className="service-section">
+        <div className="section-title-row">
+          <h3 className="section-title">Companion relay</h3>
+        </div>
+        <p className="form-hint" style={{ marginBottom: 10 }}>
+          Where this machine gets permission for a phone to join a call. The relay carries
+          signalling only — call audio goes phone-to-desktop and the relay never hears it.
+          FormLogic can act as one, or point this at your own deployment.
+        </p>
+
+        {relayError && (
+          <div className="banner banner-err" role="alert" style={{ marginBottom: 10 }}>
+            {relayError}
+          </div>
+        )}
+
+        {relay?.configured ? (
+          <ul className="pairing-list">
+            <li>
+              <span>
+                <Radio size={13} aria-hidden /> {relay.baseUrl}
+                {relay.appId && <code className="pairing-origin">{relay.appId}</code>}
+                {!relay.hasToken && (
+                  <code className="pairing-origin">no credential — reconnect</code>
+                )}
+              </span>
+              <button className="btn-tiny btn-danger" onClick={() => void disconnectRelay()}>
+                Disconnect
+              </button>
+            </li>
+          </ul>
+        ) : (
+          <p className="form-hint">
+            No relay is connected, so a Companion phone cannot join a call yet.
+          </p>
+        )}
+
+        <form className="dl-form" style={{ marginTop: 12 }} onSubmit={(e) => void saveRelay(e)}>
+          <label className="form-row">
+            <span>Relay address</span>
+            <input
+              type="text"
+              placeholder="https://formlogic.com/api/v1"
+              value={relayForm.baseUrl}
+              onChange={(e) => setRelayForm((f) => ({ ...f, baseUrl: e.target.value }))}
+            />
+          </label>
+          <label className="form-row">
+            <span>Access key</span>
+            {/* type=password so a shoulder or a screen share doesn't catch it.
+                It is never read back — the server returns only whether one is held. */}
+            <input
+              type="password"
+              placeholder="the key your relay issued this machine"
+              value={relayForm.token}
+              onChange={(e) => setRelayForm((f) => ({ ...f, token: e.target.value }))}
+            />
+          </label>
+          <label className="form-row">
+            <span>App (optional)</span>
+            <input
+              type="text"
+              placeholder="used when the plugin names no app of its own"
+              value={relayForm.appId}
+              onChange={(e) => setRelayForm((f) => ({ ...f, appId: e.target.value }))}
+            />
+          </label>
+          <div className="form-actions">
+            <button
+              type="submit"
+              className="btn btn-secondary"
+              disabled={!relayForm.baseUrl.trim() || !relayForm.token}
+            >
+              {relay?.configured ? 'Replace relay' : 'Connect relay'}
+            </button>
+          </div>
+        </form>
       </section>
 
       <div className="datadir-note">

@@ -474,7 +474,29 @@ export const pairing = {
  * `oaiy.companion.admission` — the id IS the authorisation subject, so it has
  * to travel with the call.
  */
+export interface CompanionRelayStatus {
+  configured: boolean;
+  baseUrl?: string;
+  appId?: string;
+  /** Whether a credential is held. The credential itself never comes back. */
+  hasToken: boolean;
+}
+export interface CompanionRelayRequest {
+  baseUrl: string;
+  token: string;
+  appId?: string;
+}
+
 export const companion = {
+  /** The relay is per-machine, not per-plugin: it is the user's account with a
+   *  relay deployment, and two broker plugins reach the same one. */
+  relayStatus: () => request<CompanionRelayStatus>('/api/companion/relay'),
+  setRelay: (body: CompanionRelayRequest) =>
+    request<CompanionRelayStatus>('/api/companion/relay', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+  clearRelay: () => request<CompanionRelayStatus>('/api/companion/relay', { method: 'DELETE' }),
   status: (plugin: string) => request<CompanionStatus>(`/api/companion/${encodeURIComponent(plugin)}/pairing`),
   createOffer: (plugin: string, body: CompanionOfferRequest) =>
     request<CompanionOffer>(`/api/companion/${encodeURIComponent(plugin)}/pairing/offers`, {
