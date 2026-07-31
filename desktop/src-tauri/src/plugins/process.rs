@@ -420,20 +420,33 @@ impl PluginProcess {
     }
 
     /// The `plugin.init` handshake.
-    pub fn init(&self, api_version: u32, data_dir: &std::path::Path, dev_mode: bool) -> Result<Value, CallError> {
-        self.request(
-            "plugin.init",
-            json!({
-                "desktopVersion": env!("CARGO_PKG_VERSION"),
-                "pluginApiVersion": api_version,
-                "dataDir": data_dir.display().to_string(),
-                "devMode": dev_mode,
-                // Advertised host features the plugin may opt into. Absent means
-                // a legacy host, so a plugin must tolerate an empty list.
-                "features": ["eventAck"],
-            }),
-            HANDSHAKE_TIMEOUT,
-        )
+    ///
+    /// `companion_bootstrap` is the endpoint identity a broker plugin signs
+    /// as. Omitted for every other plugin, and for a broker with no approved
+    /// device yet — see [`crate::companion::identity::EndpointIdentity::private_bootstrap`].
+    pub fn init(
+        &self,
+        api_version: u32,
+        data_dir: &std::path::Path,
+        dev_mode: bool,
+        companion_bootstrap: Option<Value>,
+    ) -> Result<Value, CallError> {
+        let mut params = json!({
+            "desktopVersion": env!("CARGO_PKG_VERSION"),
+            "pluginApiVersion": api_version,
+            "dataDir": data_dir.display().to_string(),
+            "devMode": dev_mode,
+            // Advertised host features the plugin may opt into. Absent means
+            // a legacy host, so a plugin must tolerate an empty list.
+            "features": ["eventAck"],
+        });
+        // Sent only when there is one. An explicit null is accepted by the
+        // decoder, but omitting it keeps the handshake of every ordinary plugin
+        // byte-identical to before this existed.
+        if let Some(bootstrap) = companion_bootstrap {
+            params["privateBootstrap"] = bootstrap;
+        }
+        self.request("plugin.init", params, HANDSHAKE_TIMEOUT)
     }
 
     pub fn health(&self) -> Result<Value, CallError> {
@@ -918,7 +931,7 @@ process.stdin.on("data", (chunk) => {
             let (p, events, asked) = spawn(&f);
 
             let init = p
-                .init(1, &f.dir.join("data"), false)
+                .init(1, &f.dir.join("data"), false, None)
                 .expect("plugin.init must answer");
             assert_eq!(init["ok"], true);
             // The host advertises eventAck; the fixture echoes what it received.
@@ -978,7 +991,7 @@ process.stdin.on("data", (chunk) => {
         fn a_typed_plugin_error_survives_the_round_trip() {
             let Some(f) = Fixture::new() else { return };
             let (p, _, _) = spawn(&f);
-            p.init(1, &f.dir.join("data"), false).expect("init");
+            p.init(1, &f.dir.join("data"), false, None).expect("init");
 
             match p.request("boom", serde_json::json!({}), Duration::from_secs(5)) {
                 Err(CallError::Plugin { typed, message, .. }) => {
@@ -994,7 +1007,7 @@ process.stdin.on("data", (chunk) => {
         fn a_request_that_is_never_answered_times_out_without_wedging_the_next_one() {
             let Some(f) = Fixture::new() else { return };
             let (p, _, _) = spawn(&f);
-            p.init(1, &f.dir.join("data"), false).expect("init");
+            p.init(1, &f.dir.join("data"), false, None).expect("init");
 
             match p.request("slow", serde_json::json!({}), Duration::from_millis(400)) {
                 Err(CallError::Timeout { method, .. }) => assert_eq!(method, "slow"),
@@ -1013,7 +1026,7 @@ process.stdin.on("data", (chunk) => {
             // result. Only correct if exactly one thread reads.
             let Some(f) = Fixture::new() else { return };
             let (p, _, _) = spawn(&f);
-            p.init(1, &f.dir.join("data"), false).expect("init");
+            p.init(1, &f.dir.join("data"), false, None).expect("init");
 
             let p = Arc::new(p);
             let handles: Vec<_> = (0..8)
@@ -1033,7 +1046,7 @@ process.stdin.on("data", (chunk) => {
         fn killing_the_process_fails_waiters_instead_of_hanging_them() {
             let Some(f) = Fixture::new() else { return };
             let (p, _, _) = spawn(&f);
-            p.init(1, &f.dir.join("data"), false).expect("init");
+            p.init(1, &f.dir.join("data"), false, None).expect("init");
 
             let p = Arc::new(p);
             let waiter = {

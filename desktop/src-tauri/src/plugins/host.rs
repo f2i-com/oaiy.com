@@ -671,7 +671,28 @@ impl PluginHost {
         // Handshake, with the process killed on failure — a plugin that cannot
         // answer plugin.init is not going to answer anything else, and leaving
         // it alive would hold its hardware while reporting Crashed.
-        match process.init(manifest.plugin_api_version, &super::runner::plugin_data_dir(&dir), self.dev_mode) {
+        // A broker plugin signs as this desktop's companion endpoint, so it is
+        // handed that identity at init. Every other plugin gets None, and so
+        // does a broker with no approved device — see `private_bootstrap`.
+        let companion_bootstrap = self
+            .companion
+            .lock()
+            .ok()
+            .and_then(|g| g.clone())
+            .filter(|_| {
+                self.registry
+                    .lock()
+                    .map(|reg| reg.grants(id, "oaiy.companion.admission"))
+                    .unwrap_or(false)
+            })
+            .and_then(|b| b.companion.identity_for(id).ok())
+            .and_then(|identity| identity.private_bootstrap(manifest.plugin_api_version as u16));
+        match process.init(
+            manifest.plugin_api_version,
+            &super::runner::plugin_data_dir(&dir),
+            self.dev_mode,
+            companion_bootstrap,
+        ) {
             Ok(_) => {}
             Err(e) => {
                 let reason = format!("did not complete the init handshake: {e}");
