@@ -298,6 +298,41 @@ pub struct EnsureByPortResult {
 /// keeping a mis-pointed root from walking an entire filesystem.
 const GGUF_SCAN_DEPTH: u32 = 4;
 
+/// Every `.gguf` under `dir`, projectors included. The shared traversal behind
+/// both [`Registry::list_gguf_models`] and [`Registry::list_mmproj_files`].
+fn collect_ggufs_all(
+    dir: &Path,
+    depth: u32,
+    seen: &mut std::collections::HashSet<String>,
+    out: &mut Vec<String>,
+) {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in rd.flatten() {
+        let p = entry.path();
+        let Ok(ft) = entry.file_type() else { continue };
+        if ft.is_dir() {
+            if depth > 0 {
+                collect_ggufs_all(&p, depth - 1, seen, out);
+            }
+            continue;
+        }
+        let is_gguf = p
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("gguf"))
+            .unwrap_or(false);
+        if !is_gguf {
+            continue;
+        }
+        let s = p.display().to_string();
+        if seen.insert(s.clone()) {
+            out.push(s);
+        }
+    }
+}
+
 /// Recursively collect `.gguf` files under `dir`, skipping multimodal
 /// projectors (`mmproj*`), which are not standalone models.
 fn collect_ggufs(
@@ -329,8 +364,13 @@ fn collect_ggufs(
         if !is_gguf {
             continue;
         }
+        // CONTAINS, not starts_with. Both spellings are common in the wild —
+        // `mmproj-gemma-4-e2b-f16.gguf` and `gemma-4-e2b-mmproj-F16.gguf` — and
+        // the prefix-only test let the second through, so the Model picker
+        // offered a projector as a model and llama-server refused to load it
+        // with nothing pointing at the cause.
         let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        if name.to_ascii_lowercase().starts_with("mmproj") {
+        if name.to_ascii_lowercase().contains("mmproj") {
             continue;
         }
         let s = p.display().to_string();
@@ -523,6 +563,16 @@ pub struct Registry {
     /// `${llamaModel}` placeholder. `None` ⇒ no model selected; start() refuses
     /// to spawn (no implicit default). Set live from the Model picker.
     llama_model: Option<String>,
+    /// The multimodal projector (`mmproj`) to load beside `llama_model`, if the
+    /// user picked one — the `${llamaMmproj}` placeholder.
+    ///
+    /// Optional in a way `llama_model` is not: a missing model is a refusal to
+    /// start, a missing projector just means a text-only model. That asymmetry
+    /// is why it reaches llama-server through the ENVIRONMENT rather than an
+    /// argument — an unset `${...}` in `args` cannot be removed without also
+    /// removing the `--mmproj` flag in front of it, whereas an env entry that
+    /// did not resolve is simply dropped.
+    llama_mmproj: Option<String>,
     /// The model NAME a multi-model server (Ollama) should use — substituted
     /// into the node body template as `${ollamaModel}`. `None` ⇒ the small
     /// default the installer pre-pulls (qwen2.5:0.5b). Set live from its picker.
@@ -768,6 +818,7 @@ impl Registry {
             models_dir,
             model_dirs,
             llama_model: None,
+            llama_mmproj: None,
             ollama_model: None,
             service_gpus: HashMap::new(),
             template_errors,
@@ -786,6 +837,7 @@ impl Registry {
             models_dir,
             model_dirs,
             llama_model: None,
+            llama_mmproj: None,
             ollama_model: None,
             service_gpus: HashMap::new(),
             template_errors: Vec::new(),
@@ -839,6 +891,17 @@ impl Registry {
 
     /// Set (or clear) the GGUF a single-model server loads. Live — the next
     /// service start reads it via `${llamaModel}`, no restart needed.
+    /// The projector to load beside the model, if any.
+    pub fn llama_mmproj(&self) -> Option<&str> {
+        self.llama_mmproj.as_deref()
+    }
+
+    /// Set it live, like [`Self::set_llama_model`] — the next start picks it up
+    /// with no restart of OAIY itself.
+    pub fn set_llama_mmproj(&mut self, path: Option<String>) {
+        self.llama_mmproj = path.filter(|s| !s.trim().is_empty());
+    }
+
     pub fn set_llama_model(&mut self, model: Option<String>) {
         self.llama_model = clean_model_opt(model);
     }
@@ -887,6 +950,29 @@ impl Registry {
     /// (primary + extras), deduped + sorted. Excludes multimodal projector
     /// files (`mmproj*`), which aren't a standalone model. Powers the
     /// llama.cpp Model picker.
+    /// Multimodal projectors OAIY can see, across every model root.
+    ///
+    /// A separate listing because `list_gguf_models` deliberately EXCLUDES
+    /// `mmproj*` — a projector is not a model you can run, and offering it in
+    /// the model picker would only produce a server that fails to load. It is
+    /// still a `.gguf`, so the same recursive walk finds it; only the filter
+    /// differs.
+    pub fn list_mmproj_files(&self) -> Vec<String> {
+        let mut seen = std::collections::HashSet::new();
+        let mut all = Vec::new();
+        for dir in &self.model_dirs {
+            collect_ggufs_all(dir, GGUF_SCAN_DEPTH, &mut seen, &mut all);
+        }
+        all.retain(|p| {
+            std::path::Path::new(p)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.to_ascii_lowercase().contains("mmproj"))
+        });
+        all.sort();
+        all
+    }
+
     pub fn list_gguf_models(&self) -> Vec<String> {
         let mut seen = std::collections::HashSet::new();
         let mut out = Vec::new();
@@ -1379,6 +1465,21 @@ impl Registry {
         // companion resolves the user's pick into the node body template via
         // `${ollamaModel}`. ALWAYS set (with the pre-pulled default) so a node
         // never ships a literal `${ollamaModel}`.
+        // Only when a projector is actually chosen. Left unset, both of these
+        // stay literal and are dropped from the environment below, so the
+        // service runs exactly as it did before multimodal existed.
+        if let Some(mmproj) = self.llama_mmproj.clone().filter(|s| !s.trim().is_empty()) {
+            m.insert("llamaMmproj", mmproj);
+            // llama.cpp's automatic device fitting CRASHES on a multimodal
+            // graph — `GGML_ASSERT(n_inputs < GGML_SCHED_MAX_SPLIT_INPUTS)`,
+            // reproduced here on a two-GPU box with gemma-4-e2b + its audio
+            // projector, and llama.cpp's own log points at `-fit off` when it
+            // dies. Forced off ONLY for multimodal: with fitting disabled the
+            // server no longer sizes layers to VRAM by itself, which is the
+            // right default for every other model.
+            m.insert("llamaMmprojFit", "off".to_string());
+        }
+
         m.insert(
             "ollamaModel",
             self.ollama_model
@@ -1475,6 +1576,14 @@ impl Registry {
                 "{id}: no model selected — pick one in the service's Model selector first"
             ));
         }
+
+        // An env entry whose placeholder never resolved is not a value. Passing
+        // `LLAMA_ARG_MMPROJ=${llamaMmproj}` literally would have llama-server
+        // try to open a file by that name and fail; dropping it is what makes
+        // an OPTIONAL template placeholder expressible at all. Done AFTER the
+        // required-value guard above, so a missing `${llamaModel}` still fails
+        // loudly instead of being quietly discarded here.
+        env.retain(|_, v| !(v.contains("${") && v.contains('}')));
 
         // Default the working dir to the data dir (not the inherited process CWD) when the
         // template doesn't set one, for the same reason as install: a bare helper the run
@@ -2670,6 +2779,63 @@ mod tests {
             !runner.is_alive(),
             "the child slot must be empty on return, either reaped or handed off"
         );
+    }
+
+    #[test]
+    fn projectors_are_offered_separately_from_models() {
+        // A projector is a .gguf but NOT a model you can run: offering it in the
+        // model picker only produces a server that fails to load, and hiding it
+        // everywhere (which the model filter alone does) makes multimodal
+        // impossible to configure. So: excluded from one list, and the only
+        // thing in the other.
+        let root = std::env::temp_dir().join(format!("oaiy-mmproj-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let models = root.join("models");
+        std::fs::create_dir_all(models.join("gemma")).unwrap();
+        std::fs::write(models.join("gemma/gemma-4-e2b-q4_k_m.gguf"), b"x").unwrap();
+        // Both spellings in the wild — prefix and infix.
+        std::fs::write(models.join("gemma/mmproj-gemma-4-e2b-f16.gguf"), b"x").unwrap();
+        std::fs::write(models.join("gemma/gemma-4-e2b-mmproj-F16.gguf"), b"x").unwrap();
+
+        let reg = super::Registry::empty(root.clone(), models.clone());
+        let name = |p: &String| {
+            std::path::Path::new(p).file_name().unwrap().to_string_lossy().to_string()
+        };
+
+        let models_listed: Vec<String> = reg.list_gguf_models().iter().map(name).collect();
+        assert_eq!(models_listed, vec!["gemma-4-e2b-q4_k_m.gguf".to_string()]);
+
+        let projectors: Vec<String> = reg.list_mmproj_files().iter().map(name).collect();
+        assert_eq!(projectors.len(), 2, "{projectors:?}");
+        assert!(projectors.iter().all(|p| p.to_lowercase().contains("mmproj")));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_projector_is_optional_and_forces_device_fitting_off() {
+        // The asymmetry that shapes the whole design: no model is a refusal to
+        // start; no projector is simply a text-only model. So the projector
+        // placeholders must be ABSENT until one is chosen, and the env entries
+        // that reference them get dropped at spawn.
+        let root = std::env::temp_dir().join(format!("oaiy-mmctx-{}", std::process::id()));
+        let mut reg = super::Registry::empty(root.clone(), root.join("models"));
+
+        let ctx = reg.ctx(8080);
+        assert!(!ctx.contains_key("llamaMmproj"), "unset until chosen");
+        assert!(!ctx.contains_key("llamaMmprojFit"));
+
+        reg.set_llama_mmproj(Some("E:/models/gemma-4-e2b-mmproj-F16.gguf".into()));
+        let ctx = reg.ctx(8080);
+        assert_eq!(ctx.get("llamaMmproj").map(String::as_str), Some("E:/models/gemma-4-e2b-mmproj-F16.gguf"));
+        // llama.cpp's auto-fit asserts and dies on a multimodal graph, so it is
+        // forced off — but ONLY when a projector is actually loaded.
+        assert_eq!(ctx.get("llamaMmprojFit").map(String::as_str), Some("off"));
+
+        // Blank clears rather than setting an empty path.
+        reg.set_llama_mmproj(Some("   ".into()));
+        assert!(reg.llama_mmproj().is_none());
+        assert!(!reg.ctx(8080).contains_key("llamaMmprojFit"));
     }
 
     #[test]
