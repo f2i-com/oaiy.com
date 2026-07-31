@@ -886,6 +886,59 @@ impl Ledger {
         q
     }
 
+    /// Forget finished runs. Returns how many were removed.
+    ///
+    /// **Only terminal runs.** A queued or running record is the worker's own
+    /// handle on work that is still in flight — deleting it would orphan that
+    /// work and leave the consumer that asked for it no way to ever learn the
+    /// outcome. Clearing history is a request to tidy the past, not to abandon
+    /// the present.
+    ///
+    /// Their idempotency keys go too. Keeping a key whose run no longer exists
+    /// would leave `reserve` returning a run id that resolves to nothing. The
+    /// honest consequence, which the UI says out loud: a consumer that retries
+    /// with a key from before the clear gets a fresh run instead of the old
+    /// result, so identical work can run a second time.
+    ///
+    /// The fired-binding set is deliberately left alone. It stops one binding
+    /// firing twice inside a run tree, and a tree can still be live even when
+    /// the record naming its root has finished; dropping those entries to tidy
+    /// a history view could duplicate real work.
+    pub fn clear_history(&mut self) -> usize {
+        let doomed: Vec<String> = self
+            .runs
+            .values()
+            .filter(|r| r.status.is_terminal())
+            .map(|r| r.run_id.clone())
+            .collect();
+        if doomed.is_empty() {
+            return 0;
+        }
+        let doomed: HashSet<String> = doomed.into_iter().collect();
+
+        for id in &doomed {
+            if let Some(rec) = self.runs.remove(id) {
+                // Only if it still points at THIS run: a later run may have
+                // taken the key over once this one reached a terminal state.
+                if self.by_key.get(&rec.idempotency_key) == Some(&rec.run_id) {
+                    self.by_key.remove(&rec.idempotency_key);
+                }
+            }
+        }
+        self.run_order.retain(|id| !doomed.contains(id));
+
+        // Rewrite rather than append: the removals are absences, and an
+        // append-only journal cannot express one. Without this the next
+        // startup would replay every cleared run straight back in.
+        let snapshot: Vec<RunRecord> = self.runs.values().cloned().collect();
+        if let Some(j) = self.journal.as_mut() {
+            if let Err(e) = j.compact(&snapshot) {
+                eprintln!("[ledger] journal compaction after clear failed: {e}");
+            }
+        }
+        doomed.len()
+    }
+
     /// Per-status totals over everything retained, so a history view can say how
     /// many runs failed without paging the whole ledger to count them.
     pub fn status_counts(&self) -> HashMap<RunStatus, usize> {
@@ -1017,6 +1070,113 @@ mod tests {
             }
             o => panic!("a reopened key must dedupe, got {o:?}"),
         }
+    }
+
+    // --- clearing history -------------------------------------------------
+
+    #[test]
+    fn clearing_removes_finished_runs_but_never_work_still_in_flight() {
+        // The important half is what SURVIVES. A queued or running record is the
+        // worker's handle on live work; deleting it would orphan that work and
+        // leave its consumer no way to ever learn the outcome.
+        let mut l = Ledger::new();
+        let done = finished(&mut l, "done", RunStatus::Succeeded);
+        let failed = finished(&mut l, "failed", RunStatus::Failed);
+
+        let queued = match l.reserve(&req("queued")) {
+            ReserveOutcome::Reserved(r) => r.run_id,
+            o => panic!("{o:?}"),
+        };
+        let running = match l.reserve(&req("running")) {
+            ReserveOutcome::Reserved(r) => r.run_id,
+            o => panic!("{o:?}"),
+        };
+        l.claim(&running, Runtime::Desktop, "d").ok_claimed();
+
+        assert_eq!(l.clear_history(), 2);
+        assert!(l.get(&done).is_none());
+        assert!(l.get(&failed).is_none());
+        assert_eq!(l.get(&queued).map(|r| r.status), Some(RunStatus::Queued));
+        assert_eq!(l.get(&running).map(|r| r.status), Some(RunStatus::Running));
+        assert_eq!(l.len(), 2);
+
+        // The surviving run must still be finishable — clearing must not have
+        // damaged the bookkeeping the worker completes through.
+        l.finish(&running, RunStatus::Succeeded, None, None).unwrap();
+        assert_eq!(l.get(&running).map(|r| r.status), Some(RunStatus::Succeeded));
+    }
+
+    #[test]
+    fn clearing_an_empty_history_is_a_no_op() {
+        let mut l = Ledger::new();
+        assert_eq!(l.clear_history(), 0);
+        let queued = match l.reserve(&req("q")) {
+            ReserveOutcome::Reserved(r) => r.run_id,
+            o => panic!("{o:?}"),
+        };
+        assert_eq!(l.clear_history(), 0, "nothing terminal to clear");
+        assert!(l.get(&queued).is_some());
+    }
+
+    #[test]
+    fn a_cleared_key_runs_again_rather_than_resolving_to_a_deleted_run() {
+        // The honest consequence of clearing, and the reason the UI says it out
+        // loud. Keeping the key would be worse: `reserve` would answer
+        // Duplicate with a run id that resolves to nothing.
+        let mut l = Ledger::new();
+        let first = finished(&mut l, "same-key", RunStatus::Succeeded);
+        assert_eq!(l.clear_history(), 1);
+
+        match l.reserve(&req("same-key")) {
+            ReserveOutcome::Reserved(r) => assert_ne!(r.run_id, first),
+            o => panic!("a cleared key must reserve fresh, got {o:?}"),
+        }
+    }
+
+    #[test]
+    fn a_key_taken_over_by_a_live_run_is_not_dropped_with_the_old_one() {
+        // Only unlink a key that still points at the run being removed. If a
+        // later run took the key over, dropping it would break dedupe for work
+        // that is still in flight.
+        let mut l = Ledger::new();
+        let old = finished(&mut l, "shared", RunStatus::Succeeded);
+        // Force the key to name a different, live run — the state a takeover
+        // leaves behind.
+        let live = match l.reserve(&req("other")) {
+            ReserveOutcome::Reserved(r) => r.run_id,
+            o => panic!("{o:?}"),
+        };
+        l.by_key.insert("shared".to_string(), live.clone());
+
+        assert_eq!(l.clear_history(), 1);
+        assert!(l.get(&old).is_none());
+        assert_eq!(
+            l.by_key.get("shared"),
+            Some(&live),
+            "the live run must keep the key it took over"
+        );
+    }
+
+    #[test]
+    fn cleared_runs_do_not_come_back_after_a_restart() {
+        // An append-only journal cannot express a removal, so clearing has to
+        // rewrite it. Without that, every cleared run replays on next open and
+        // the button appears to do nothing that lasts.
+        let d = JournalDir::new("clear-durable");
+        let (done, queued) = {
+            let mut l = Ledger::open(d.path()).unwrap();
+            let done = finished(&mut l, "done", RunStatus::Succeeded);
+            let queued = match l.reserve(&req("queued")) {
+                ReserveOutcome::Reserved(r) => r.run_id,
+                o => panic!("{o:?}"),
+            };
+            assert_eq!(l.clear_history(), 1);
+            (done, queued)
+        };
+        let l2 = Ledger::open(d.path()).unwrap();
+        assert!(l2.get(&done).is_none(), "a cleared run must stay cleared");
+        assert!(l2.get(&queued).is_some(), "unfinished work must survive both");
+        assert_eq!(l2.len(), 1);
     }
 
     #[test]

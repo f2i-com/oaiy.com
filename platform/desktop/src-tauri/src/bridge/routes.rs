@@ -443,6 +443,22 @@ fn parse_statuses(raw: &str) -> Result<Vec<RunStatus>, String> {
 
 /// `GET /api/bridge/runs` — queued runs by default (what a worker polls), or
 /// history when `status` is given.
+/// Forget finished runs. Queued and running work is kept — see
+/// [`crate::bridge::ledger::Ledger::clear_history`].
+async fn clear_runs(State(st): State<BridgeState>) -> axum::response::Response {
+    match st.ledger.lock() {
+        Ok(mut l) => {
+            let cleared = l.clear_history();
+            (StatusCode::OK, Json(json!({ "cleared": cleared, "total": l.len() }))).into_response()
+        }
+        Err(_) => bridge_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            "the run ledger lock is poisoned".to_string(),
+        ),
+    }
+}
+
 async fn queued_runs(
     State(st): State<BridgeState>,
     axum::extract::Query(q): axum::extract::Query<RunsQuery>,
@@ -1489,7 +1505,10 @@ pub fn router(state: BridgeState) -> Router {
     Router::new()
         .route("/api/bridge/capabilities", get(capabilities))
         .route("/api/bridge/status", get(runtime_status))
-        .route("/api/bridge/runs", get(queued_runs).post(create_run))
+        .route(
+            "/api/bridge/runs",
+            get(queued_runs).post(create_run).delete(clear_runs),
+        )
         .route("/api/bridge/runs/:id", get(get_run))
         .route("/api/bridge/runs/:id/claim", post(claim_run))
         .route("/api/bridge/runs/:id/finish", post(finish_run))
