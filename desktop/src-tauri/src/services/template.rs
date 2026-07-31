@@ -206,8 +206,13 @@ mod tests {
     #[test]
     fn the_shipped_aokie_voice_templates_parse() {
         for (file, mode, bundle) in [
-            (include_str!("../../resources/templates/aokie-stt.json"), "aokie-stt", "parakeet"),
-            (include_str!("../../resources/templates/aokie-tts.json"), "aokie-tts", "pocket_tts_onnx"),
+            // The mode values the server actually accepts are stt|tts|both.
+            // The `aokie-stt` / `aokie-tts` strings in the executable are its
+            // build names, not modes — passing those makes it exit with
+            // "--mode must be one of stt|tts|both", which is exactly the
+            // mistake this assertion exists to catch.
+            (include_str!("../../resources/templates/aokie-stt.json"), "stt", "parakeet"),
+            (include_str!("../../resources/templates/aokie-tts.json"), "tts", "pocket_tts_onnx"),
         ] {
             let t: super::ServiceTemplate =
                 serde_json::from_str(file).expect("shipped template must parse");
