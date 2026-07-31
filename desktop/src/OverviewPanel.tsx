@@ -9,6 +9,7 @@ import {
   Sparkles,
   TriangleAlert,
 } from 'lucide-react';
+import { peek, put } from './useCached';
 import {
   aiProviders,
   pairing,
@@ -72,10 +73,12 @@ function navIdFor(p: PluginRecord, wanted?: string): string | null {
 }
 
 export default function OverviewPanel({ onNavigate, onOpenPluginScreen }: Props) {
-  const [svc, setSvc] = useState<ServiceSnapshot[] | null>(null);
-  const [plug, setPlug] = useState<PluginRecord[] | null>(null);
-  const [provs, setProvs] = useState<AiProviderPublic[] | null>(null);
-  const [apps, setApps] = useState<PairedApp[] | null>(null);
+  // Seeded from the last known values so returning to Overview paints straight
+  // away instead of showing four em-dashes while the round trips land.
+  const [svc, setSvc] = useState<ServiceSnapshot[] | null>(() => peek('services') ?? null);
+  const [plug, setPlug] = useState<PluginRecord[] | null>(() => peek('plugins') ?? null);
+  const [provs, setProvs] = useState<AiProviderPublic[] | null>(() => peek('providers') ?? null);
+  const [apps, setApps] = useState<PairedApp[] | null>(() => peek('pairedApps') ?? null);
 
   const refresh = useCallback(async () => {
     // Each read is independent: one failing surface must not blank the others.
@@ -85,10 +88,10 @@ export default function OverviewPanel({ onNavigate, onOpenPluginScreen }: Props)
       aiProviders.list(),
       pairing.paired(),
     ]);
-    if (s.status === 'fulfilled') setSvc(s.value.services);
-    if (p.status === 'fulfilled') setPlug(p.value.plugins);
-    if (a.status === 'fulfilled') setProvs(a.value.providers);
-    if (c.status === 'fulfilled') setApps(c.value.paired);
+    if (s.status === 'fulfilled') { setSvc(s.value.services); put('services', s.value.services); }
+    if (p.status === 'fulfilled') { setPlug(p.value.plugins); put('plugins', p.value.plugins); }
+    if (a.status === 'fulfilled') { setProvs(a.value.providers); put('providers', a.value.providers); }
+    if (c.status === 'fulfilled') { setApps(c.value.paired); put('pairedApps', c.value.paired); }
   }, []);
 
   useEffect(() => {
