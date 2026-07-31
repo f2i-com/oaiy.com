@@ -54,6 +54,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// been sitting unaddressed past the newest 500 is not going to be actioned.
 const MAX_DEAD_LETTERS: usize = 500;
 
+/// Compact the file once it exceeds `max(this, 2 x live entries)` lines. Mirrors
+/// the run ledger's journal, for the same reason: replay cost must not grow
+/// without bound just because the process has been up a long time.
+const COMPACT_MIN_LINES: usize = 512;
+
 /// Why an event produced no work.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -118,6 +123,9 @@ pub struct DeadLetterQueue {
     items: VecDeque<DeadLetter>,
     seq: u64,
     path: Option<PathBuf>,
+    /// Lines currently in the file, including superseded ones. Drives
+    /// compaction; see [`DeadLetterQueue::append_one`].
+    lines_on_disk: usize,
 }
 
 impl DeadLetterQueue {
@@ -132,9 +140,25 @@ impl DeadLetterQueue {
     pub fn open(path: PathBuf) -> Self {
         let mut q = Self::new();
         if let Ok(text) = std::fs::read_to_string(&path) {
+            // LAST WRITE PER ID WINS — the same upsert semantics the run
+            // ledger's journal replays with, and what makes appending an update
+            // (a redrive attempt) sound: the newer line supersedes the older
+            // rather than replaying as a second, stale copy of the same entry.
+            // Insertion order is preserved so "newest last" still holds.
+            let mut order: Vec<String> = Vec::new();
+            let mut latest: std::collections::HashMap<String, DeadLetter> =
+                std::collections::HashMap::new();
             for line in text.lines().filter(|l| !l.trim().is_empty()) {
                 if let Ok(item) = serde_json::from_str::<DeadLetter>(line) {
                     q.seq = q.seq.max(seq_of(&item.id));
+                    if !latest.contains_key(&item.id) {
+                        order.push(item.id.clone());
+                    }
+                    latest.insert(item.id.clone(), item);
+                }
+            }
+            for id in order {
+                if let Some(item) = latest.remove(&id) {
                     q.items.push_back(item);
                 }
             }
@@ -143,12 +167,44 @@ impl DeadLetterQueue {
             q.items.pop_front();
         }
         q.path = Some(path);
-        // Replay may have dropped lines (corrupt, over cap); write back what we
-        // actually hold so the file matches memory from here on.
+        // Replay may have dropped lines (corrupt, superseded, over cap); write
+        // back what we actually hold so the file matches memory from here on —
+        // which is also what makes `lines_on_disk` an exact count rather than a
+        // guess.
         q.persist();
         q
     }
 
+    /// Append ONE record. The common path, and the only one on the hot side of
+    /// a flood.
+    ///
+    /// Recording a shed event used to rewrite and fsync the entire retained
+    /// queue — up to [`MAX_DEAD_LETTERS`] entries, each carrying a whole event
+    /// envelope. That is O(queue) work per drop, and drops arrive precisely
+    /// when the machine is already struggling to keep up, so the cost grew with
+    /// the very backlog it was recording. Appending is O(1); the file is
+    /// last-wins on replay (see [`Self::open`]), so a later line for the same id
+    /// simply supersedes an earlier one, exactly as the run ledger's journal
+    /// does.
+    fn append_one(&self, item: &DeadLetter) {
+        let Some(path) = &self.path else { return };
+        let write = || -> std::io::Result<()> {
+            let line = serde_json::to_string(item).map_err(std::io::Error::other)?;
+            let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+            f.write_all(line.as_bytes())?;
+            f.write_all(b"\n")?;
+            f.sync_all()
+        };
+        if let Err(e) = write() {
+            log::warn!("cannot append a dead letter to {}: {e}", path.display());
+        }
+    }
+
+    /// Rewrite the file to exactly what is held now.
+    ///
+    /// Reserved for the paths that REMOVE something — eviction, dismissal,
+    /// clear — because an append-only file cannot express a deletion, and for
+    /// the compaction that keeps replay bounded.
     fn persist(&self) {
         let Some(path) = &self.path else { return };
         let tmp = path.with_extension("jsonl.tmp");
@@ -166,8 +222,17 @@ impl DeadLetterQueue {
         if let Err(e) = write() {
             // A queue that cannot be written must not take the runtime down —
             // it degrades to in-memory, which is what it was before this existed.
-            eprintln!("[deadletters] cannot write {}: {e}", path.display());
+            log::warn!("cannot write dead letters to {}: {e}", path.display());
         }
+    }
+
+    /// Rewrite and re-baseline the line count. `persist` leaves the file holding
+    /// exactly one line per live entry, so anything that calls it must say so —
+    /// otherwise the counter drifts up forever and compaction runs on every
+    /// write.
+    fn persist_and_reset(&mut self) {
+        self.persist();
+        self.lines_on_disk = self.items.len();
     }
 
     /// Record an event that produced no work. Returns the stored entry.
@@ -191,11 +256,31 @@ impl DeadLetterQueue {
             last_outcome: None,
         };
         self.items.push_back(item.clone());
-        while self.items.len() > MAX_DEAD_LETTERS {
-            self.items.pop_front();
+        // Eviction is a deletion, which an append cannot express — so the rare
+        // over-cap case falls back to the full rewrite, and everything else
+        // takes the O(1) path.
+        if self.items.len() > MAX_DEAD_LETTERS {
+            while self.items.len() > MAX_DEAD_LETTERS {
+                self.items.pop_front();
+            }
+            self.persist_and_reset();
+        } else if self.lines_on_disk >= self.compact_threshold() {
+            // Bounded replay: without this, a queue that is written to for a
+            // long time accumulates superseded lines forever and `open` gets
+            // slower every launch.
+            self.persist_and_reset();
+        } else {
+            self.append_one(&item);
+            self.lines_on_disk += 1;
         }
-        self.persist();
         item
+    }
+
+    /// Compact once the file holds meaningfully more lines than live entries.
+    /// Two per entry: a dead letter is written once and then updated by a
+    /// redrive attempt, so steady state is well under this.
+    fn compact_threshold(&self) -> usize {
+        COMPACT_MIN_LINES.max(self.items.len() * 2)
     }
 
     /// Newest first — a queue is worked from the most recent failure back.
@@ -223,7 +308,14 @@ impl DeadLetterQueue {
         item.last_attempt_ms = Some(now_ms());
         item.last_outcome = Some(outcome);
         let snapshot = item.clone();
-        self.persist();
+        // An update, not a deletion: append the new version and let replay's
+        // last-wins rule supersede the old line.
+        if self.lines_on_disk >= self.compact_threshold() {
+            self.persist_and_reset();
+        } else {
+            self.append_one(&snapshot);
+            self.lines_on_disk += 1;
+        }
         Some(snapshot)
     }
 
@@ -234,7 +326,9 @@ impl DeadLetterQueue {
         self.items.retain(|d| d.id != id);
         let removed = self.items.len() != before;
         if removed {
-            self.persist();
+            // A deletion cannot be appended, so this is one of the few paths
+            // that genuinely needs the full rewrite.
+            self.persist_and_reset();
         }
         removed
     }
@@ -243,7 +337,7 @@ impl DeadLetterQueue {
     pub fn clear(&mut self) -> usize {
         let n = self.items.len();
         self.items.clear();
-        self.persist();
+        self.persist_and_reset();
         n
     }
 
@@ -399,6 +493,63 @@ mod tests {
         // The latest outcome, so a human can see redrive is now getting further.
         assert_eq!(item.last_outcome.as_deref(), Some("reserved run_7"));
         assert!(item.last_attempt_ms.is_some());
+    }
+
+    #[test]
+    fn an_appended_update_supersedes_rather_than_duplicating() {
+        // `record` and `note_attempt` APPEND rather than rewriting the whole
+        // queue, so the same id legitimately appears on several lines. Replay
+        // therefore has to be last-wins; without that, one entry redriven twice
+        // would come back after a restart as three separate rows, each offering
+        // its own Redrive button for the same event.
+        let dir = Dir::new("supersede");
+        let id = {
+            let mut q = DeadLetterQueue::open(dir.path());
+            let id = q.record("p", "e", DeadReason::Shed, envelope("a")).id;
+            q.note_attempt(&id, "first try".into());
+            q.note_attempt(&id, "second try".into());
+            id
+        };
+
+        // More lines on disk than entries — proof the appends really happened
+        // and this is not testing a rewrite.
+        let lines = std::fs::read_to_string(dir.path())
+            .unwrap()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .count();
+        assert!(lines > 1, "expected appended lines, found {lines}");
+
+        let q = DeadLetterQueue::open(dir.path());
+        assert_eq!(q.len(), 1, "the same id must not replay as several entries");
+        let item = q.get(&id).unwrap();
+        assert_eq!(item.attempts, 2);
+        assert_eq!(item.last_outcome.as_deref(), Some("second try"));
+    }
+
+    #[test]
+    fn the_file_is_compacted_instead_of_growing_without_bound() {
+        // Appending is O(1) per record, but replay is O(lines) — so the file has
+        // to be compacted or every launch gets slower than the last.
+        let dir = Dir::new("compact");
+        let mut q = DeadLetterQueue::open(dir.path());
+        let id = q.record("p", "e", DeadReason::Shed, envelope("a")).id;
+        for i in 0..(COMPACT_MIN_LINES + 50) {
+            q.note_attempt(&id, format!("attempt {i}"));
+        }
+        let lines = std::fs::read_to_string(dir.path())
+            .unwrap()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .count();
+        assert!(
+            lines <= COMPACT_MIN_LINES,
+            "file should have been compacted, holds {lines} lines"
+        );
+        // …and compaction must not lose the state it was compacting.
+        let reopened = DeadLetterQueue::open(dir.path());
+        assert_eq!(reopened.len(), 1);
+        assert_eq!(reopened.get(&id).unwrap().attempts as usize, COMPACT_MIN_LINES + 50);
     }
 
     #[test]
