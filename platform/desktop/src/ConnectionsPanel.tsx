@@ -36,6 +36,11 @@ export default function ConnectionsPanel() {
   const [account, setAccount] = useState<LinkStatus | null>(() => peek('linkStatus') ?? null);
   const [accountForm, setAccountForm] = useState({ connectorId: '', baseUrl: '' });
   const [accountError, setAccountError] = useState<string | null>(null);
+  // Kept apart from accountError, which belongs to something the user just did.
+  // Now that the status is polled, folding the two together would mean either a
+  // momentary fetch failure sticks around forever with no way to dismiss it, or
+  // the next poll wipes the message from the button they pressed a second ago.
+  const [statusError, setStatusError] = useState<string | null>(null);
   const [linking, setLinking] = useState(false);
 
   const refreshRelay = useCallback(async () => {
@@ -54,6 +59,7 @@ export default function ConnectionsPanel() {
       const next = await linkApi.status();
       setAccount(next);
       put('linkStatus', next);
+      setStatusError(null);
       // Default the form to the first provider and its suggested address, so
       // the common case is one click.
       setAccountForm((f) => {
@@ -64,7 +70,7 @@ export default function ConnectionsPanel() {
           : f;
       });
     } catch (e) {
-      setAccountError(e instanceof Error ? e.message : String(e));
+      setStatusError(e instanceof Error ? e.message : String(e));
     }
   }, []);
 
@@ -92,8 +98,13 @@ export default function ConnectionsPanel() {
     void refreshRelay();
   }, [refreshRelay]);
 
+  // Polled, unlike the companion relay above: both lanes to the provider fail
+  // on their own schedule, so a status fetched once at mount would sit showing
+  // a healthy link through a check-in or a command lane that has since stopped.
   useEffect(() => {
     void refreshAccount();
+    const id = window.setInterval(() => void refreshAccount(), POLL_MS);
+    return () => window.clearInterval(id);
   }, [refreshAccount]);
 
   // While a link is in flight the ceremony is happening in the user's browser,
@@ -321,9 +332,9 @@ export default function ConnectionsPanel() {
           in your browser and this machine never sees your password — it receives a scoped key.
         </p>
 
-        {accountError && (
+        {(accountError ?? statusError) && (
           <div className="banner banner-err" role="alert" style={{ marginBottom: 10 }}>
-            {accountError}
+            {accountError ?? statusError}
           </div>
         )}
 
@@ -396,19 +407,41 @@ export default function ConnectionsPanel() {
                     recently it last checked in. Without this, a link that looks
                     perfect here can read as offline there with nothing on this
                     screen explaining the difference. */}
-                {account.heartbeatError ? (
-                  <small style={{ display: 'block', marginTop: 3, color: 'var(--danger)' }}>
-                    Not checking in: {account.heartbeatError}
-                  </small>
-                ) : account.lastHeartbeatAt ? (
-                  <small style={{ display: 'block', opacity: 0.6, marginTop: 3 }}>
-                    Checked in {new Date(account.lastHeartbeatAt).toLocaleTimeString()}
-                  </small>
-                ) : (
-                  <small style={{ display: 'block', opacity: 0.6, marginTop: 3 }}>
-                    Waiting for the first check-in…
-                  </small>
-                )}
+                {account.heartbeatSupported !== false &&
+                  (account.heartbeatError ? (
+                    <small style={{ display: 'block', marginTop: 3, color: 'var(--danger)' }}>
+                      Not checking in: {account.heartbeatError}
+                    </small>
+                  ) : account.lastHeartbeatAt ? (
+                    <small style={{ display: 'block', opacity: 0.6, marginTop: 3 }}>
+                      Checked in {new Date(account.lastHeartbeatAt).toLocaleTimeString()}
+                    </small>
+                  ) : (
+                    <small style={{ display: 'block', opacity: 0.6, marginTop: 3 }}>
+                      Waiting for the first check-in…
+                    </small>
+                  ))}
+                {/* The other lane, and the one that fails more confusingly.
+                    Checking in only tells the provider this machine is HERE;
+                    everything it then asks for travels the command lane, and a
+                    lane that is failing says so nowhere but on the provider's
+                    own page — as "no desktop picked it up in time", which reads
+                    as a broken connection and sends the user to the wrong
+                    place. Shown only when the connector has one at all. */}
+                {account.relaySupported &&
+                  (account.relayError ? (
+                    <small style={{ display: 'block', marginTop: 3, color: 'var(--danger)' }}>
+                      Not receiving commands: {account.relayError}
+                    </small>
+                  ) : account.lastRelayAt ? (
+                    <small style={{ display: 'block', opacity: 0.6, marginTop: 3 }}>
+                      Listening for commands · {new Date(account.lastRelayAt).toLocaleTimeString()}
+                    </small>
+                  ) : (
+                    <small style={{ display: 'block', opacity: 0.6, marginTop: 3 }}>
+                      Connecting to the command lane…
+                    </small>
+                  ))}
               </span>
               <button className="btn-tiny btn-danger" onClick={() => void unlink()}>
                 Disconnect

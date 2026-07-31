@@ -263,6 +263,106 @@ describe('ConnectionsPanel · Linked account', () => {
     expect(container.textContent).toContain('link again');
   });
 
+  it('explains a failing command lane rather than just looking linked', async () => {
+    // The heartbeat's twin, and the one that fails more confusingly. Checking in
+    // only says this machine is HERE; everything the user then asks for on the
+    // provider's website travels the command lane. A lane that is erroring shows
+    // up nowhere on this machine and, over there, only as "no desktop picked it
+    // up in time" — which reads as a broken connection and sends them looking at
+    // their network instead of at the reason.
+    linkStatusMock.mockResolvedValue({
+      linked: true,
+      connectorName: 'Acme Cloud',
+      baseUrl: 'https://acme.example',
+      lastHeartbeatAt: '2026-08-01T00:14:57Z',
+      heartbeatSupported: true,
+      relaySupported: true,
+      relayError: 'claim refused: HTTP 500',
+      attempt: { phase: 'linked' },
+      available: [CONNECTOR],
+    });
+    await mount();
+    // Both lanes are reported, and independently: checking in is fine here.
+    expect(container.textContent).toContain('Checked in');
+    expect(container.textContent).toContain('Not receiving commands');
+    expect(container.textContent).toContain('HTTP 500');
+  });
+
+  it('says the command lane is alive, so “no error” is not just silence', async () => {
+    linkStatusMock.mockResolvedValue({
+      linked: true,
+      connectorName: 'Acme Cloud',
+      baseUrl: 'https://acme.example',
+      relaySupported: true,
+      lastRelayAt: '2026-08-01T00:14:57Z',
+      attempt: { phase: 'linked' },
+      available: [CONNECTOR],
+    });
+    await mount();
+    expect(container.textContent).toContain('Listening for commands');
+  });
+
+  it('claims nothing about lanes the provider does not have', async () => {
+    // A connector with no relay must read as ABSENT, not as pending — otherwise
+    // it sits under a "connecting…" that is never going to resolve.
+    linkStatusMock.mockResolvedValue({
+      linked: true,
+      connectorName: 'Acme Cloud',
+      baseUrl: 'https://acme.example',
+      heartbeatSupported: false,
+      relaySupported: false,
+      attempt: { phase: 'linked' },
+      available: [CONNECTOR],
+    });
+    await mount();
+    const text = container.textContent ?? '';
+    expect(text).not.toContain('command lane');
+    expect(text).not.toContain('Listening for commands');
+    expect(text).not.toContain('Waiting for the first check-in');
+  });
+
+  it('keeps asking, so a lane that breaks after the screen opens still says so', async () => {
+    // Without polling the whole thing is decoration: the status is fetched once
+    // at mount, so a link that was healthy when the panel opened goes on looking
+    // healthy through every failure that follows.
+    const healthy = {
+      linked: true,
+      connectorName: 'Acme Cloud',
+      baseUrl: 'https://acme.example',
+      relaySupported: true,
+      lastRelayAt: '2026-08-01T00:14:57Z',
+      attempt: { phase: 'linked' },
+      available: [CONNECTOR],
+    };
+    linkStatusMock.mockResolvedValue(healthy);
+    await mount();
+    expect(container.textContent).toContain('Listening for commands');
+
+    linkStatusMock.mockResolvedValue({
+      ...healthy,
+      lastRelayAt: undefined,
+      relayError: 'could not reach the relay',
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3500);
+    });
+    expect(container.textContent).toContain('Not receiving commands');
+  });
+
+  it('does not leave a momentary fetch failure on screen forever', async () => {
+    // The regression polling would otherwise introduce: one failed poll paints a
+    // banner with no dismiss, and it outlives the problem it described.
+    linkStatusMock.mockRejectedValueOnce(new Error('failed to fetch'));
+    await mount();
+    expect(container.textContent).toContain('failed to fetch');
+
+    linkStatusMock.mockResolvedValue(IDLE);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3500);
+    });
+    expect(container.textContent).not.toContain('failed to fetch');
+  });
+
   it('warns that disconnecting is local-only before unlinking', async () => {
     // Telling the user the key is dead when it still works at the provider
     // would be worse than saying nothing.

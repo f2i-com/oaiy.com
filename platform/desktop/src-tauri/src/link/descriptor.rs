@@ -286,7 +286,11 @@ pub fn load_all(data_dir: &Path) -> Vec<ConnectorDescriptor> {
             continue;
         }
         let Ok(raw) = std::fs::read_to_string(&path) else { continue };
-        match serde_json::from_str::<ConnectorDescriptor>(&raw) {
+        // Notepad and PowerShell's `-Encoding utf8` both prepend a byte order
+        // mark, and serde stops at it with "expected value at line 1 column 1".
+        // Since the file is then skipped with only a log line, the user is told
+        // to drop a descriptor in a folder and gets no provider and no reason.
+        match serde_json::from_str::<ConnectorDescriptor>(raw.trim_start_matches('\u{feff}')) {
             Ok(d) => match d.validate() {
                 Ok(()) => {
                     if let Some(slot) = out.iter_mut().find(|e| e.id == d.id) {
@@ -352,6 +356,27 @@ mod tests {
         let all = load_all(&d);
         assert_eq!(all.len(), 1, "an override must replace, not duplicate");
         assert_eq!(all[0].name, "My FormLogic");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_descriptor_saved_by_a_windows_editor_still_loads() {
+        // Found the hard way: PowerShell's `-Encoding utf8` and Notepad both
+        // write a BOM, serde refuses it at column 1, and the file is skipped
+        // with nothing but a log line. The panel tells people to drop a file in
+        // this folder, so the most likely way to write one must work.
+        let d = dir("bom");
+        let mut custom: ConnectorDescriptor = serde_json::from_str(BUILTIN[0]).unwrap();
+        custom.name = "BOM'd FormLogic".into();
+        std::fs::write(
+            d.join("connectors").join("formlogic.json"),
+            format!("\u{feff}{}", serde_json::to_string(&custom).unwrap()),
+        )
+        .unwrap();
+
+        let all = load_all(&d);
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].name, "BOM'd FormLogic", "the BOM must not hide the file");
         let _ = std::fs::remove_dir_all(&d);
     }
 
