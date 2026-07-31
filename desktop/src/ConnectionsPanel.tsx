@@ -24,6 +24,19 @@ import { useToast } from './Toasts';
 
 const POLL_MS = 3000;
 
+/**
+ * A key fingerprint, grouped exactly as the provider's own site groups it:
+ * the first 24 hex characters in blocks of four.
+ *
+ * The user is asked to compare the two by eye before approving this machine as
+ * a storage node. Formatting them differently would not break anything
+ * mechanically — it would just make the check tedious enough to skip, which is
+ * the only thing standing between an approval and approving the wrong key.
+ */
+function groupFingerprint(hex: string): string {
+  return (hex.slice(0, 24).match(/.{1,4}/g) ?? []).join(' ');
+}
+
 export default function ConnectionsPanel() {
   const toast = useToast();
   const [pending, setPending] = useState<PendingPairing[]>(() => peek('pendingPairings') ?? []);
@@ -428,6 +441,23 @@ export default function ConnectionsPanel() {
                     own page — as "no desktop picked it up in time", which reads
                     as a broken connection and sends the user to the wrong
                     place. Shown only when the connector has one at all. */}
+                {/* The approval ceremony is the user comparing this
+                    fingerprint with the one the provider's site shows. Grouped
+                    the same way there, because two differently-formatted
+                    strings make the comparison a chore people skip. */}
+                {account.dataNodeSupported && account.dataNode && (
+                  <small style={{ display: 'block', opacity: 0.6, marginTop: 3 }}>
+                    Storage node:{' '}
+                    {account.dataNode.approved
+                      ? 'approved'
+                      : account.dataNode.status === 'revoked'
+                        ? 'revoked'
+                        : 'waiting for you to approve it on the provider’s site'}{' '}
+                    <code style={{ letterSpacing: '0.04em' }}>
+                      {groupFingerprint(account.dataNode.fingerprint)}
+                    </code>
+                  </small>
+                )}
                 {account.relaySupported &&
                   (account.relayError ? (
                     <small style={{ display: 'block', marginTop: 3, color: 'var(--danger)' }}>

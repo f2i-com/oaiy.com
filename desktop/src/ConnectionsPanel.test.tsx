@@ -363,6 +363,43 @@ describe('ConnectionsPanel · Linked account', () => {
     expect(container.textContent).not.toContain('failed to fetch');
   });
 
+  it('shows the storage-node fingerprint the way the provider shows it', async () => {
+    // The approval ceremony is the user comparing the two strings by eye. The
+    // provider's site groups the first 24 hex characters in fours; formatting
+    // them differently here makes the check tedious enough to skip, which is
+    // the only thing standing between an approval and approving a wrong key.
+    linkStatusMock.mockResolvedValue({
+      linked: true,
+      connectorName: 'Acme Cloud',
+      baseUrl: 'https://acme.example',
+      dataNodeSupported: true,
+      dataNode: {
+        fingerprint: 'a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90',
+        status: 'pending',
+        approved: false,
+        keyGeneration: 1,
+      },
+      attempt: { phase: 'linked' },
+      available: [CONNECTOR],
+    });
+    await mount();
+    expect(container.textContent).toContain('a1b2 c3d4 e5f6 0718 293a 4b5c');
+    // …and it must say what the user has to DO, not just report a state.
+    expect(container.textContent).toContain('waiting for you to approve');
+  });
+
+  it('says nothing about a storage node the provider does not offer', async () => {
+    linkStatusMock.mockResolvedValue({
+      linked: true,
+      connectorName: 'Acme Cloud',
+      baseUrl: 'https://acme.example',
+      attempt: { phase: 'linked' },
+      available: [CONNECTOR],
+    });
+    await mount();
+    expect(container.textContent).not.toContain('Storage node');
+  });
+
   it('warns that disconnecting is local-only before unlinking', async () => {
     // Telling the user the key is dead when it still works at the provider
     // would be worse than saying nothing.

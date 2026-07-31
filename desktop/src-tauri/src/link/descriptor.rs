@@ -112,6 +112,44 @@ pub struct ConnectorDescriptor {
     /// Omitted for a provider whose web app has no such feature.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub desktop_ai: Option<DesktopAiSpec>,
+    /// How this desktop enrols as a storage node the account can approve.
+    /// Omitted for a provider with no such notion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_node: Option<DataNodeSpec>,
+}
+
+/// Enrolment of this machine as a node the account owner approves by name and
+/// by key. Registration only — holding data is a separate surface.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DataNodeSpec {
+    /// Register or refresh this desktop's signing identity. Idempotent.
+    pub register_path: String,
+    /// Read back this desktop's own node record.
+    pub self_path: String,
+    /// How often to refresh. Enrolment is not presence — the provider tracks
+    /// that separately — so this is measured in hours, not seconds.
+    #[serde(default = "default_enrolment_interval")]
+    pub interval_seconds: u64,
+    /// What this node offers to do. `storage` is the only one defined so far.
+    #[serde(default = "default_node_capabilities")]
+    pub capabilities: Vec<String>,
+    #[serde(default = "default_protocol")]
+    pub protocol_min: u32,
+    #[serde(default = "default_protocol")]
+    pub protocol_max: u32,
+}
+
+fn default_enrolment_interval() -> u64 {
+    3600
+}
+
+fn default_node_capabilities() -> Vec<String> {
+    vec!["storage".to_string()]
+}
+
+fn default_protocol() -> u32 {
+    1
 }
 
 /// The sealed AI lane: the provider's web app relays a chat turn the backend
@@ -327,6 +365,30 @@ impl ConnectorDescriptor {
                     "connector {:?} desktopAi wait {} is out of range (1..300s)",
                     self.id, a.wait_seconds
                 ));
+            }
+        }
+        if let Some(n) = &self.data_node {
+            for (label, path) in [
+                ("registerPath", &n.register_path),
+                ("selfPath", &n.self_path),
+            ] {
+                if !path.starts_with('/') {
+                    return Err(format!(
+                        "connector {:?} dataNode {label} must begin with '/', got {path:?}",
+                        self.id
+                    ));
+                }
+            }
+            // A zero interval would hammer the provider with a registration it
+            // treats as a heartbeat; a day is already generous for enrolment.
+            if n.interval_seconds < 60 || n.interval_seconds > 86_400 {
+                return Err(format!(
+                    "connector {:?} dataNode interval {} is out of range (60..86400s)",
+                    self.id, n.interval_seconds
+                ));
+            }
+            if n.capabilities.is_empty() {
+                return Err(format!("connector {:?} dataNode claims no capabilities", self.id));
             }
         }
         if o.token_response.credential_fields.is_empty() {

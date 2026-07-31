@@ -570,6 +570,21 @@ export interface LinkStatus {
    *  host, hence optional. */
   heartbeatSupported?: boolean;
   relaySupported?: boolean;
+  /** This desktop's storage-node enrolment. The fingerprint is what the owner
+   *  compares against the one their browser shows before approving — the whole
+   *  ceremony rests on the two matching, so it has to be visible here. */
+  dataNode?: {
+    fingerprint: string;
+    /** The provider's vocabulary: pending | approved | revoked. */
+    status: string;
+    /** Approved AND holding an unexpired certificate — a node can be approved
+     *  with an expired one and have no authority. */
+    approved: boolean;
+    keyGeneration: number;
+    displayName?: string;
+  };
+  dataNodeError?: string;
+  dataNodeSupported?: boolean;
   attempt: LinkPhase;
   /** Every provider this build can link to — the UI hardcodes no list. */
   available: LinkConnector[];
