@@ -150,6 +150,17 @@ fn space_shortfall(available: u64, needed: u64) -> Option<u64> {
     required.checked_sub(available).filter(|short| *short > 0)
 }
 
+/// Bytes the free-space check may count as ALREADY free: the length of a `.part`
+/// this transfer is about to truncate. `truncating` rather than a `resuming` flag
+/// so the one thing that matters — whether the existing bytes survive the open —
+/// is stated at the call site, and so this is testable without a transfer.
+fn reclaimable_part_bytes(part: &Path, truncating: bool) -> u64 {
+    if !truncating {
+        return 0;
+    }
+    std::fs::metadata(part).map(|m| m.len()).unwrap_or(0)
+}
+
 fn human_gib(bytes: u64) -> String {
     format!("{:.2} GiB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
 }
@@ -536,13 +547,17 @@ impl Downloads {
         // and exhaust the tray app.
         const MAX_CONCURRENT_DOWNLOADS: usize = 8;
 
+        // Compared against every in-flight row's `dest_path` below, so it must be
+        // the SAME rendering the row itself will carry.
+        let dest_str = dest.display().to_string();
+
         let id = Uuid::new_v4().to_string();
         let progress = DownloadProgress {
             id: id.clone(),
             url: normalised.clone(),
             filename: chosen_filename.clone(),
             subdir: subdir.map(|s| s.to_string()),
-            dest_path: dest.display().to_string(),
+            dest_path: dest_str.clone(),
             status: DownloadStatus::Queued,
             bytes_downloaded: 0,
             bytes_total: None,
@@ -585,6 +600,34 @@ impl Downloads {
                     )
             }) {
                 return Ok(existing.id.clone());
+            }
+            // The same URL twice is a duplicate request; a DIFFERENT URL landing on
+            // the same file is not, and it is worse. De-dup keys on the URL, but the
+            // resource actually contended is `dest` and its `.part` sibling — two HF
+            // repos both publishing `model.gguf` (or two URLs given the same Filename
+            // in the Models tab) passed the check above, both spawned, and both
+            // `File::create`d one .part: independent handles, independent cursors,
+            // interleaved bytes. Nothing downstream notices, because the digest AND
+            // the completeness check are both taken over the RESPONSE STREAM rather
+            // than the file — so whichever task finished first renamed a byte-salad
+            // file into place and reported `verified: true`, and the "already on disk"
+            // check above then refused to replace it. Refuse rather than hand back the
+            // other id: the caller asked for a different URL and must not be told a
+            // download of something else is theirs.
+            if let Some(clash) = g.values().find(|p| {
+                p.dest_path == dest_str
+                    && matches!(
+                        p.status,
+                        DownloadStatus::Queued
+                            | DownloadStatus::Active
+                            | DownloadStatus::Paused
+                    )
+            }) {
+                return Err(format!(
+                    "another download is already writing to {chosen_filename} (from {}) — \
+                     give this one a different filename, or wait for that one to finish",
+                    clash.url
+                ));
             }
             let in_flight = g
                 .values()
@@ -692,18 +735,44 @@ impl Downloads {
     /// Cancel + delete the in-progress file. Use when the user clicks
     /// the trash icon next to an active or paused download.
     pub fn cancel(&self, id: &str) -> Result<(), String> {
-        self.abort_task(id);
-        let part_path = {
+        let (status, part_path) = {
             let g = self.progress.lock().map_err(|_| "lock poisoned")?;
-            g.get(id).map(|p| part_path_for(&PathBuf::from(&p.dest_path)))
-                .ok_or("unknown download")?
+            let p = g.get(id).ok_or("unknown download")?;
+            (p.status, part_path_for(&PathBuf::from(&p.dest_path)))
         };
-        let _ = std::fs::remove_file(&part_path);
-        self.update(id, |p| {
-            p.status = DownloadStatus::Cancelled;
-            p.finished_at = Some(Utc::now());
-        });
-        Ok(())
+        // Guard on status the way pause()/resume() do. This used to run
+        // unconditionally, so losing the race with completion silently relabelled a
+        // SUCCESSFUL download: the abort found a dead handle, the .part had already
+        // been renamed to its final name so remove_file no-op'd, and the sole effect
+        // was rewriting a Completed row — digest and all — to say "cancelled" about a
+        // multi-GB model still sitting on disk under the confirm text "partial data
+        // will be discarded". The window is not tight: the panel's poll can't run
+        // while the native confirm() blocks the webview, so it lasts as long as the
+        // user hesitates. Worse, the UI fires "Download complete" only on an observed
+        // transition INTO completed, so the user was never told it had succeeded.
+        // An Err here is a benign 400 the panel refreshes past.
+        match status {
+            DownloadStatus::Queued
+            | DownloadStatus::Active
+            | DownloadStatus::Paused
+            | DownloadStatus::Failed => {
+                self.abort_task(id);
+                let _ = std::fs::remove_file(&part_path);
+                self.update(id, |p| {
+                    p.status = DownloadStatus::Cancelled;
+                    p.finished_at = Some(Utc::now());
+                });
+                Ok(())
+            }
+            // Idempotent, like pause() on an already-paused row: a second click on
+            // the trash button shouldn't raise an error.
+            DownloadStatus::Cancelled => Ok(()),
+            // Completed is deliberately NOT treated as "then delete the file": the
+            // finished model belongs to the user now, and discarding it on a click
+            // labelled "cancel the download" would be data loss. Removing an
+            // installed model is a separate, separately-confirmed action.
+            other => Err(format!("can't cancel download in state {other:?}")),
+        }
     }
 
     // ---- internals ----
@@ -936,7 +1005,21 @@ async fn run_download(
         if need > 0 {
             let check_dir = dest.parent().unwrap_or(&dest);
             if let Ok(avail) = fs2::available_space(check_dir) {
-                if let Some(short) = space_shortfall(avail, need) {
+                // A .part we're about to TRUNCATE is space we're about to get back,
+                // so count it as available. Without this a download killed by a quit
+                // or a crash blocks its own retry: the orphaned .part still holds the
+                // whole file (nothing surfaces it — walk_dir hides .part files and
+                // there is no startup sweep), so the check sees a drive with no room
+                // and tells the user to free space or move the data folder, for the
+                // exact bytes the File::create below is about to release. On an
+                // accepted resume the .part is APPENDED to rather than truncated —
+                // and `need` there is only the remaining tail — so nothing is
+                // reclaimable and the check stays as strict as it was.
+                let reclaimable = reclaimable_part_bytes(
+                    &part_path_for(&dest),
+                    !(resuming && resume_accepted),
+                );
+                if let Some(short) = space_shortfall(avail.saturating_add(reclaimable), need) {
                     update(Box::new(move |p| {
                         p.status = DownloadStatus::Failed;
                         p.error = Some(format!(
@@ -1462,6 +1545,33 @@ mod tests {
     }
 
     #[test]
+    fn a_part_we_are_about_to_truncate_counts_as_free_space() {
+        // Quit mid-download and retry: the orphaned .part still holds the whole
+        // file, so the pre-flight check saw a drive with no room and told the user
+        // to free space — for the bytes File::create was about to free itself.
+        let dir = std::env::temp_dir().join(format!("oaiy-reclaim-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let part = dir.join("model.gguf.part");
+        std::fs::write(&part, vec![0u8; 4_096]).unwrap();
+
+        assert_eq!(reclaimable_part_bytes(&part, true), 4_096);
+        // An accepted resume appends to the .part — those bytes stay put.
+        assert_eq!(reclaimable_part_bytes(&part, false), 0);
+        // The common case: no leftover to reclaim.
+        assert_eq!(reclaimable_part_bytes(&dir.join("absent.part"), true), 0);
+
+        // And the composition the pre-flight check makes: room only because the
+        // .part is coming back.
+        let avail = DISK_MARGIN_BYTES + 1_000;
+        assert_eq!(space_shortfall(avail, 5_096), Some(4_096));
+        assert_eq!(
+            space_shortfall(avail + reclaimable_part_bytes(&part, true), 5_096),
+            None
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn available_space_query_works() {
         // fs2 integration smoke test — the temp dir's drive has *some* free
         // space, and the query succeeds on this platform.
@@ -1481,6 +1591,67 @@ mod tests {
         assert!(d.has_token());
         d.set_token(None);
         assert!(!d.has_token(), "None clears");
+    }
+
+    #[tokio::test]
+    async fn two_urls_that_land_on_one_filename_cannot_both_start() {
+        // De-dup keys on the URL, but what two transfers actually fight over is the
+        // destination and its .part. Two repos publishing `model.gguf` used to pass
+        // de-dup, both spawn, interleave bytes into one file — and the winner's
+        // stream-derived digest still "verified" it.
+        let dir = std::env::temp_dir().join(format!("oaiy-dest-clash-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let d = Downloads::new(dir.clone());
+
+        // Public IP literals so the SSRF guard passes without a DNS lookup. Nothing
+        // awaits the spawned transfers, so on the current-thread test runtime they
+        // are never polled and no request is made.
+        let first = d
+            .start("https://1.1.1.1/RepoA/model.gguf", None, None, None)
+            .expect("first download starts");
+        let err = d
+            .start("https://1.1.1.1/RepoB/model.gguf", None, None, None)
+            .expect_err("a second URL must not be allowed onto the first's .part");
+        assert!(err.contains("model.gguf"), "unhelpful message: {err}");
+
+        // The same URL is still a duplicate rather than a clash — same id back.
+        assert_eq!(
+            d.start("https://1.1.1.1/RepoA/model.gguf", None, None, None)
+                .unwrap(),
+            first
+        );
+        // A different destination is unaffected.
+        d.start("https://1.1.1.1/RepoB/model.gguf", Some("other.gguf"), None, None)
+            .expect("a different filename is free to start");
+
+        assert_eq!(d.snapshot().len(), 2, "one in-flight row per destination");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cancelling_a_finished_download_is_refused_rather_than_relabelling_it() {
+        let dir = std::env::temp_dir().join(format!("oaiy-cancel-done-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let model = dir.join("model.gguf");
+        std::fs::write(&model, b"pretend these are gigabytes of weights").unwrap();
+
+        let d = Downloads::new(dir.clone());
+        // The "already on disk" path registers a Completed row without spawning
+        // anything — the same terminal state a finished transfer leaves behind.
+        let id = d
+            .start("https://1.1.1.1/RepoA/model.gguf", None, None, None)
+            .unwrap();
+        assert_eq!(d.snapshot()[0].status, DownloadStatus::Completed);
+
+        // Losing the race with completion must not rewrite a success into
+        // "cancelled, partial data discarded" while the model sits on disk.
+        let err = d.cancel(&id).unwrap_err();
+        assert!(err.contains("Completed"), "{err}");
+        assert_eq!(d.snapshot()[0].status, DownloadStatus::Completed);
+        assert!(model.exists(), "the finished file must not be touched");
+        assert!(d.cancel("no-such-id").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

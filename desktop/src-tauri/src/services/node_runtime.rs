@@ -27,7 +27,8 @@ const NODE_VERSION: &str = "22.14.0";
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NodeSnapshot {
-    /// A usable node was found (portable install or system).
+    /// A usable node was found (portable install or system) — usable meaning it
+    /// answered `node -v`, not merely that a file by that name exists.
     pub available: bool,
     /// Where it came from: `portable` | `system` | `none`.
     pub source: &'static str,
@@ -157,10 +158,18 @@ impl NodeRuntime {
                 None => (None, "none"),
             },
         };
+        let version = path.as_deref().and_then(probe_version);
         let snap = NodeSnapshot {
-            available: path.is_some(),
+            // "A node that RUNS", not "a file called node.exe is there".
+            // `portable_exe` selects on is_file() alone and `resolve()` prefers
+            // it over the system node, so an install torn in half by a crash or
+            // a power cut leaves a truncated binary that shadows a working
+            // system Node — and reporting presence as health hid that AND took
+            // away the only way back, since OverviewPanel offers Install only
+            // while `available` is false.
+            available: version.is_some(),
             source,
-            version: path.as_deref().and_then(probe_version),
+            version,
             path: path.as_ref().map(|p| p.display().to_string()),
             installing,
             installs_version: NODE_VERSION,
@@ -252,12 +261,24 @@ fn asset_for_platform() -> Result<(String, String, bool), String> {
     Ok((asset, url, is_zip))
 }
 
-/// Reject an archive member whose path escapes the extraction root.
-fn safe_member(path: &Path) -> bool {
-    !path.is_absolute()
-        && path
-            .components()
-            .all(|c| matches!(c, std::path::Component::Normal(_)))
+/// Reject an archive member whose path escapes the extraction root. Note what
+/// this rejects beyond `..`: an absolute path, and on Windows a drive or UNC
+/// prefix — a member named `C:/Windows/...` joined onto the destination lands
+/// back at the drive root without a `..` anywhere in it. `python.rs` shares
+/// this rather than keeping its own, weaker, copy.
+pub(super) fn safe_member(path: &Path) -> bool {
+    use std::path::Component;
+    // A LEADING `./` is ordinary in a tarball — `tar cf` writes it by default —
+    // and Rust preserves it as a `CurDir` component. Rejecting it would abort
+    // an entire install over a naming convention rather than an escape, so it
+    // is skipped. Everything after it must still be Normal: no `..`, no root,
+    // and no Windows drive/UNC prefix (`C:evil` has a Prefix component and is
+    // NOT absolute, so `is_absolute()` alone would let it through).
+    let mut components = path.components().peekable();
+    if matches!(components.peek(), Some(Component::CurDir)) {
+        components.next();
+    }
+    !path.is_absolute() && components.all(|c| matches!(c, Component::Normal(_)))
 }
 
 /// Download the pinned Node and unpack it under `dest`, stripping the archive's
@@ -387,6 +408,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn safe_member_allows_a_leading_dot_slash_but_nothing_else_odd() {
+        use std::path::Path;
+        // `tar cf` writes `./python/bin/python3` by default and Rust keeps that
+        // leading `.` as a CurDir component. Rejecting it would abort a whole
+        // install over a naming convention rather than an escape.
+        assert!(safe_member(Path::new("./python/bin/python3")));
+        assert!(safe_member(Path::new("python/bin/python3")));
+
+        // Everything that is actually an escape still is.
+        assert!(!safe_member(Path::new("../evil")));
+        assert!(!safe_member(Path::new("python/../../evil")));
+        assert!(!safe_member(Path::new("/etc/passwd")));
+        // A Windows drive-relative prefix is NOT absolute, so `is_absolute()`
+        // alone would wave it through — `join` on it replaces the whole base.
+        assert!(!safe_member(Path::new("C:evil.dll")));
+        assert!(!safe_member(Path::new(r"C:\Windows\System32\evil.dll")));
+        // An INTERIOR `.` needs no special handling: Rust's `components()`
+        // normalises it away, so this is already just `python/bin`. Only a
+        // LEADING one survives as a component, which is why the skip is a
+        // single peek rather than a filter.
+        assert!(safe_member(Path::new("python/./bin")));
+        assert_eq!(
+            Path::new("python/./bin").components().count(),
+            2,
+            "interior CurDir is normalised out by components()"
+        );
+    }
+
+    #[test]
     fn the_probe_is_cached_but_installing_stays_live() {
         // `snapshot()` shells out twice (`where node`, then `node -v`) and the
         // readiness endpoint that wants it is polled every few seconds, so the
@@ -443,6 +493,32 @@ mod tests {
         );
         // The top-level dir entry itself strips to nothing and is skipped.
         assert_eq!(strip_first(Path::new("node-v22-win-x64")), None);
+    }
+
+    #[test]
+    fn a_portable_node_that_does_not_run_is_not_available() {
+        // A truncated node.exe is still a file, so `portable_exe` finds it and
+        // `resolve()` hands it to every flow run in preference to the working
+        // system node. Reporting that as available also removed the Install
+        // button (OverviewPanel renders it only when available is false), so
+        // there was no way back from inside the app.
+        let dir = std::env::temp_dir().join(format!("oaiy-node-broken-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let exe = if cfg!(windows) {
+            dir.join("node").join("node.exe")
+        } else {
+            dir.join("node").join("bin").join("node")
+        };
+        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        std::fs::write(&exe, b"half an install").unwrap();
+
+        let rt = new_handle(dir.clone());
+        let snap = rt.snapshot();
+        assert_eq!(snap.source, "portable", "it is still what resolve() picks");
+        assert_eq!(snap.version, None, "it cannot answer `node -v`");
+        assert!(!snap.available, "presence is not health");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

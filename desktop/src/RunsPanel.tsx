@@ -63,6 +63,31 @@ function duration(rec: RunRecord): string | null {
   return ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(1)}s`;
 }
 
+/**
+ * What an empty failures list actually proves — which is less than it looks.
+ *
+ * This used to interpolate `total`, but that is the whole ledger (`l.len()`),
+ * queued and running rows included, so it asserted that runs which had not
+ * started had "finished cleanly". Nothing ages a queued run out — the desktop
+ * worker deliberately leaves `queued`-mode runs for an external claimer — so
+ * with no claimer running, that false all-clear is permanent, not a blink, and
+ * this sentence is the only thing on the failures screen that speaks to overall
+ * run health. byStatus is on the same response and breaks the ledger down per
+ * status, so `succeeded` is the entry that is actually about finished work —
+ * the map itself tallies every state, live runs included.
+ */
+function noFailuresMessage(data: RunHistory): string {
+  if (data.total === 0) return 'No flow has run on this machine yet.';
+  const counts = data.byStatus;
+  // A response (or a cached snapshot) without byStatus leaves total as the only
+  // number there is; saying 0 would be a worse answer than the old overcount.
+  if (!counts) return `Nothing has failed — all ${data.total} recorded runs finished cleanly.`;
+  const clean = counts.succeeded ?? 0;
+  const inFlight = (counts.queued ?? 0) + (counts.running ?? 0);
+  if (inFlight === 0) return `Nothing has failed — all ${clean} recorded runs finished cleanly.`;
+  return `Nothing has failed — ${clean} finished cleanly, ${inFlight} still queued or running.`;
+}
+
 export default function RunsPanel() {
   const [filter, setFilter] = useState<Filter>('failures');
   // Keyed BY FILTER. One shared key meant a revisit could paint the cached
@@ -97,7 +122,13 @@ export default function RunsPanel() {
   }, [refresh, filter]);
 
   const counts = data?.byStatus ?? {};
-  const failed = (counts.failed ?? 0) + (counts.timed_out ?? 0);
+  // Summed over the same constant the query uses. Hand-listing the states here
+  // omitted `cancelled`, which the filter does fetch, so the tab read
+  // "Failures (2)" above a list of five rows — a count and a list drawn from one
+  // response, disagreeing, on the panel whose whole job is being trustworthy
+  // about failures. Worse at the zero end: with only cancelled runs the badge
+  // vanished entirely and the tab read a bare "Failures" over a full list.
+  const failed = FAILURE_STATES.reduce((n, s) => n + (counts[s] ?? 0), 0);
   const runs = data?.runs ?? [];
 
   return (
@@ -133,11 +164,7 @@ export default function RunsPanel() {
           <p className="form-hint">Loading runs…</p>
         ) : runs.length === 0 ? (
           <div className="empty-state">
-            {filter === 'failures'
-              ? data.total === 0
-                ? 'No flow has run on this machine yet.'
-                : `Nothing has failed — all ${data.total} recorded runs finished cleanly.`
-              : 'No runs recorded yet.'}
+            {filter === 'failures' ? noFailuresMessage(data) : 'No runs recorded yet.'}
           </div>
         ) : (
           <ul className="run-list">
