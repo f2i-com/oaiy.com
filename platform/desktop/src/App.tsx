@@ -14,6 +14,7 @@ import {
   Puzzle,
   Server,
   Settings2,
+  ShieldCheck,
   Sparkles,
   Sun,
   TriangleAlert,
@@ -29,6 +30,7 @@ import PluginsPanel from './PluginsPanel';
 import AiProvidersPanel from './AiProvidersPanel';
 import OverviewPanel from './OverviewPanel';
 import PluginScreenPage from './PluginScreenPage';
+import ConnectionsPanel from './ConnectionsPanel';
 import PairingPrompt from './PairingPrompt';
 import SettingsPanel from './SettingsPanel';
 
@@ -59,6 +61,7 @@ type BuiltinView =
   | 'models'
   | 'python'
   | 'providers'
+  | 'connections'
   | 'settings';
 
 /** A plugin-contributed screen, addressed as `plugin:<pluginId>:<navId>`. */
@@ -81,6 +84,7 @@ const NAV: { value: BuiltinView; label: string; icon: LucideIcon }[] = [
   { value: 'models', label: 'Models', icon: Package },
   { value: 'providers', label: 'Providers', icon: Sparkles },
   { value: 'python', label: 'Python', icon: HardDrive },
+  { value: 'connections', label: 'Connections', icon: ShieldCheck },
 ];
 
 /**
@@ -123,6 +127,12 @@ const PAGE: Record<BuiltinView, { crumb: string; kicker: string; title: string; 
     kicker: 'Runtime',
     title: 'Portable Python',
     copy: 'A bundled interpreter and reusable venvs — no system Python needed.',
+  },
+  connections: {
+    crumb: 'Connections',
+    kicker: 'Access',
+    title: 'Connections',
+    copy: 'Apps allowed to run flows and call plugins on this machine.',
   },
   settings: {
     crumb: 'Settings',
@@ -477,6 +487,7 @@ export default function App() {
             {view === 'plugins' && <PluginsPanel />}
             {view === 'models' && <ModelsPanel />}
             {view === 'providers' && <AiProvidersPanel />}
+            {view === 'connections' && <ConnectionsPanel />}
             {view === 'python' && <PythonPanel />}
             {view === 'settings' && <SettingsPanel />}
           </div>

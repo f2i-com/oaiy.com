@@ -33,7 +33,14 @@ import {
 
 const POLL_MS = 4000;
 
-export type OverviewNav = 'services' | 'plugins' | 'models' | 'providers' | 'python' | 'settings';
+export type OverviewNav =
+  | 'services'
+  | 'plugins'
+  | 'models'
+  | 'providers'
+  | 'python'
+  | 'connections'
+  | 'settings';
 
 interface Props {
   /** Jump to one of the built-in panels. */
@@ -172,7 +179,7 @@ export default function OverviewPanel({ onNavigate, onOpenPluginScreen }: Props)
             <strong>{provs === null ? '—' : `${readyProv}/${provs.length}`}</strong>
             <small>AI providers ready</small>
           </button>
-          <button className="overview-tile" onClick={() => onNavigate('settings')}>
+          <button className="overview-tile" onClick={() => onNavigate('connections')}>
             <ShieldCheck size={16} aria-hidden />
             <strong>{apps === null ? '—' : apps.length}</strong>
             <small>Connected apps</small>

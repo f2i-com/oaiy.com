@@ -320,6 +320,19 @@ async fn main() {
     let ai_providers = oaiy_desktop_lib::ai::open_handle(data_dir.join("ai").join("providers.json"));
     let ai_codex = oaiy_desktop_lib::ai::codex::new_handle(&data_dir);
 
+    // Bring back whatever was running before the last shutdown. A headless box
+    // that reboots should come up serving, not waiting for someone to SSH in and
+    // start each service by hand.
+    {
+        let started = registry
+            .lock()
+            .map(|mut r| r.autostart_remembered())
+            .unwrap_or_default();
+        if !started.is_empty() {
+            log::info!("autostarted {} service(s): {}", started.len(), started.join(", "));
+        }
+    }
+
     // gui_mode = false: headless server is token-strict (no webview origin).
     if let Err(e) = http::serve(
         port, config, auth_token, false, registry, downloads, python, catalog, bridge, ai_providers, ai_codex,
