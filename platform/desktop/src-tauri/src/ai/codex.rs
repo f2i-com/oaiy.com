@@ -481,6 +481,23 @@ impl CodexAgent {
     /// reasoning-off route into a reasoning model would reintroduce exactly the
     /// mid-call latency the alias exists to prevent.
     pub fn chat_as(&self, body: &Value, alias: Option<LiveCallAlias>) -> Result<Value, CodexError> {
+        self.chat_streaming(body, alias, |_| {})
+    }
+
+    /// [`chat_as`], calling `on_delta` with each fragment as the model produces
+    /// it — for a caller that can show the answer arriving rather than waiting
+    /// for all of it.
+    ///
+    /// The callback runs on this blocking thread, so it must not block for long
+    /// itself; the tunnel hands fragments to an async sender and returns.
+    /// The buffered completion is still returned, so a caller that ignores the
+    /// callback behaves exactly as before.
+    pub fn chat_streaming(
+        &self,
+        body: &Value,
+        alias: Option<LiveCallAlias>,
+        mut on_delta: impl FnMut(&str),
+    ) -> Result<Value, CodexError> {
         let prompt = flatten_prompt(body);
         if prompt.trim().is_empty() {
             return Err(CodexError::Rpc("the request carried no message content".into()));
@@ -539,7 +556,14 @@ impl CodexAgent {
             while Instant::now() < deadline && !done {
                 let batch = s.notes_since(cursor);
                 cursor += batch.len();
+                let before = out.len();
                 done = fold_turn_notes(&mut out, &batch);
+                // Whatever this batch appended, verbatim — so a streaming
+                // caller sees exactly the text the buffered answer will contain
+                // and the two can never drift apart.
+                if out.len() > before {
+                    on_delta(&out[before..]);
+                }
                 if !done {
                     std::thread::sleep(Duration::from_millis(50));
                 }
@@ -567,8 +591,6 @@ impl CodexAgent {
     }
 }
 
-/// Collapse an OpenAI `messages` array into the single prompt a turn takes,
-/// keeping role labels so a system instruction still reads as one.
 /// The OpenAI-shaped `data` rows for a `model/list` result.
 ///
 /// Two things this gets right that are easy to get wrong, and that both fail as
@@ -669,6 +691,8 @@ fn thread_id_of(result: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Collapse an OpenAI `messages` array into the single prompt a turn takes,
+/// keeping role labels so a system instruction still reads as one.
 fn flatten_prompt(body: &Value) -> String {
     let Some(messages) = body.get("messages").and_then(Value::as_array) else {
         return String::new();

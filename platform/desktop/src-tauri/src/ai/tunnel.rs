@@ -63,6 +63,53 @@ impl TunnelError {
     }
 }
 
+/// How often a stream's accumulated text is sealed into a frame.
+///
+/// The model produces fragments far faster than a relay round trip, and one
+/// POST per token would spend the whole turn on HTTP. Coalescing is invisible
+/// to the reader — the browser appends whatever arrives — and still shows the
+/// answer building rather than landing all at once.
+const DELTA_FLUSH_INTERVAL: Duration = Duration::from_millis(220);
+/// …or sooner once this much text is waiting.
+const DELTA_FLUSH_BYTES: usize = 400;
+/// Bound on the frames one turn may emit, so a runaway stream cannot hold the
+/// lane open indefinitely.
+const MAX_STREAM_FRAMES: u64 = 4096;
+
+/// Everything one claimed turn needs to talk back to the provider.
+///
+/// Bundled because a streaming answer posts frames from several places, and
+/// threading five parameters through each of them invites getting one wrong —
+/// the instance id in particular, which every call must carry.
+struct Lane<'a> {
+    http: reqwest::Client,
+    account: &'a LinkedAccount,
+    spec: &'a DesktopAiSpec,
+    instance: &'a str,
+    id: &'a str,
+}
+
+impl Lane<'_> {
+    async fn post_frame(&self, envelope: &str) -> Result<(), String> {
+        let url = crate::link::oauth::join(
+            &self.account.base_url,
+            &self.spec.frames_path.replace("{id}", self.id),
+        );
+        let resp = self
+            .http
+            .post(&url)
+            .bearer_auth(&self.account.credential)
+            .json(&json!({ "instanceId": self.instance, "envelope": envelope }))
+            .send()
+            .await
+            .map_err(|e| format!("could not post a frame: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("the lane refused a frame: HTTP {}", resp.status().as_u16()));
+        }
+        Ok(())
+    }
+}
+
 /// What this desktop can answer a turn with.
 pub struct AiSources {
     pub providers: crate::ai::providers::ProviderStoreHandle,
@@ -362,7 +409,14 @@ impl AiTunnel {
             };
         }
 
-        let outcome = self.answer(request).await;
+        let lane = Lane {
+            http: client(Duration::from_secs(30))?,
+            account,
+            spec,
+            instance,
+            id: &request.id,
+        };
+        let outcome = self.answer(&lane, request).await;
         let (status, frame) = match outcome {
             Ok(final_plaintext) => match self.sessions.seal_outbound(&request.id, &final_plaintext) {
                 Ok(envelope) => ("done", Some(envelope)),
@@ -375,17 +429,7 @@ impl AiTunnel {
         // completing purges the lane's frames, so anything posted after it would
         // never be readable and the user would see an empty reply.
         if let Some(envelope) = frame {
-            let frames_url = crate::link::oauth::join(
-                &account.base_url,
-                &spec.frames_path.replace("{id}", &request.id),
-            );
-            if let Err(e) = http
-                .post(&frames_url)
-                .bearer_auth(&account.credential)
-                .json(&json!({ "instanceId": instance, "envelope": envelope }))
-                .send()
-                .await
-            {
+            if let Err(e) = lane.post_frame(&envelope).await {
                 log::warn!("AI turn {} final frame: {e}", request.id);
             }
         }
@@ -448,7 +492,7 @@ impl AiTunnel {
     }
 
     /// Open the sealed turn and produce the plaintext to seal back.
-    async fn answer(&self, request: &AiRequest) -> Result<Vec<u8>, TunnelError> {
+    async fn answer(&self, lane: &Lane<'_>, request: &AiRequest) -> Result<Vec<u8>, TunnelError> {
         let eph_pub = request
             .eph_pub
             .as_deref()
@@ -495,7 +539,7 @@ impl AiTunnel {
 
         match kind {
             "models" => self.list_models(provider_id).await,
-            "chat" => self.chat(provider_id, model.as_deref(), &body).await,
+            "chat" => self.chat(lane, provider_id, model.as_deref(), &body).await,
             other => Err(TunnelError::new(
                 "invalid_request",
                 format!("this desktop does not serve the AI request kind {other:?}"),
@@ -582,9 +626,17 @@ impl AiTunnel {
         .unwrap_or_default())
     }
 
-    /// Answer one chat turn from this machine's own account.
+    /// Answer one chat turn from this machine's own account, streaming the
+    /// answer as it is produced.
+    ///
+    /// The terminal frame is where this is easy to get wrong. The reader takes
+    /// a final frame's text as the WHOLE answer, replacing everything the
+    /// deltas built — so once anything has streamed, the final must carry no
+    /// text at all. A final holding, say, the last chunk would silently reduce
+    /// a long reply to one word.
     async fn chat(
         &self,
+        lane: &Lane<'_>,
         provider_id: &str,
         model: Option<&str>,
         body: &Value,
@@ -595,8 +647,12 @@ impl AiTunnel {
             .filter(|m| !m.is_empty())
             .cloned()
             .ok_or_else(|| TunnelError::new("invalid_request", "the turn carries no messages"))?;
+        let mut chat_body = json!({ "messages": messages });
+        if let Some(m) = model {
+            chat_body["model"] = json!(m);
+        }
 
-        let completion = if is_codex(provider_id) {
+        if is_codex(provider_id) {
             // The live-call aliases pin a model and a reasoning effort for a
             // phone call and refuse caller audio; a queued chat turn is not that,
             // and offering them here would be offering guaranteed failures.
@@ -606,35 +662,196 @@ impl AiTunnel {
                     format!("provider {provider_id:?} is for live calls and cannot serve chat"),
                 ));
             }
-            let mut chat_body = json!({ "messages": messages });
-            if let Some(m) = model {
-                chat_body["model"] = json!(m);
+            return self.stream_codex(lane, chat_body).await;
+        }
+
+        let provider = self.resolve(provider_id)?;
+        if crate::ai::gateway::streamable(&provider) {
+            chat_body["stream"] = json!(true);
+            return self.stream_registry(lane, &provider, chat_body).await;
+        }
+        let completion = crate::ai::gateway::chat(&provider, chat_body)
+            .await
+            .map_err(|e| TunnelError::new("upstream_error", e.message()))?;
+        Ok(final_with_completion(completion))
+    }
+
+    /// Stream the managed ChatGPT account's answer.
+    ///
+    /// The turn runs on a blocking thread and hands fragments back through a
+    /// channel; this side coalesces them into frames. The buffered completion
+    /// still comes back, so a turn that produced no fragments at all — a
+    /// runtime with no delta stream — closes with the whole answer instead of
+    /// nothing.
+    async fn stream_codex(
+        &self,
+        lane: &Lane<'_>,
+        chat_body: Value,
+    ) -> Result<Vec<u8>, TunnelError> {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let codex = self.sources.codex.clone();
+        let turn = tokio::task::spawn_blocking(move || {
+            codex.chat_streaming(&chat_body, None, |fragment| {
+                // The receiver is dropped only when this task is abandoned;
+                // a failed send just means nobody is streaming any more.
+                let _ = tx.send(fragment.to_string());
+            })
+        });
+
+        let mut streamed = 0u64;
+        let mut pending = String::new();
+        let mut since_flush = std::time::Instant::now();
+        loop {
+            match tokio::time::timeout(DELTA_FLUSH_INTERVAL, rx.recv()).await {
+                Ok(Some(fragment)) => {
+                    pending.push_str(&fragment);
+                    if pending.len() < DELTA_FLUSH_BYTES && since_flush.elapsed() < DELTA_FLUSH_INTERVAL
+                    {
+                        continue;
+                    }
+                }
+                // The turn ended and the sender dropped: flush the tail.
+                Ok(None) => {
+                    self.flush_delta(lane, &mut pending, &mut streamed).await?;
+                    break;
+                }
+                Err(_) => {}
             }
-            let codex = self.sources.codex.clone();
-            tokio::task::spawn_blocking(move || codex.chat_as(&chat_body, None))
-                .await
-                .map_err(|e| TunnelError::new("upstream_error", e.to_string()))?
-                .map_err(|e| TunnelError::new(codex_code(&e), e.message()))?
+            self.flush_delta(lane, &mut pending, &mut streamed).await?;
+            since_flush = std::time::Instant::now();
+        }
+
+        let completion = turn
+            .await
+            .map_err(|e| TunnelError::new("upstream_error", e.to_string()))?
+            .map_err(|e| TunnelError::new(codex_code(&e), e.message()))?;
+        // Nothing streamed — a runtime that sends no fragments — so the whole
+        // answer has to ride the terminal frame after all.
+        Ok(if streamed == 0 {
+            final_with_completion(completion)
         } else {
-            let provider = self.resolve(provider_id)?;
-            let mut chat_body = json!({ "messages": messages });
-            if let Some(m) = model {
-                chat_body["model"] = json!(m);
-            }
-            crate::ai::gateway::chat(&provider, chat_body)
+            final_after_stream()
+        })
+    }
+
+    /// Stream a registry provider's answer, forwarding each upstream chunk.
+    ///
+    /// The chunk goes through VERBATIM, nested under `delta`. Spreading it at
+    /// the frame's top level instead is silently dropped by the reader — no
+    /// error, just an answer that never appears.
+    async fn stream_registry(
+        &self,
+        lane: &Lane<'_>,
+        provider: &crate::ai::providers::AiProvider,
+        chat_body: Value,
+    ) -> Result<Vec<u8>, TunnelError> {
+        use futures_util::StreamExt;
+
+        let upstream = crate::ai::gateway::chat_stream(provider, chat_body)
+            .await
+            .map_err(|e| TunnelError::new("upstream_error", e.message()))?;
+        // A provider that ignores `stream: true` and answers with a plain JSON
+        // body is not an error — treat it as the buffered case.
+        let is_sse = upstream
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|ct| ct.to_ascii_lowercase().starts_with("text/event-stream"));
+        if !is_sse {
+            let body = upstream
+                .text()
                 .await
-                .map_err(|e| TunnelError::new("upstream_error", e.message()))?
-        };
-        // One terminal frame carrying the whole completion, and no deltas. The
-        // web app prefers a final body's text over anything it accumulated, so
-        // emitting both would show the answer twice.
-        Ok(serde_json::to_vec(&json!({
+                .map_err(|e| TunnelError::new("upstream_error", e.to_string()))?;
+            let completion: Value = serde_json::from_str(&body).map_err(|_| {
+                TunnelError::new("upstream_error", "the provider returned neither a stream nor JSON")
+            })?;
+            return Ok(final_with_completion(completion));
+        }
+
+        let mut stream = upstream.bytes_stream();
+        let mut buf: Vec<u8> = Vec::new();
+        let mut sent = 0u64;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk
+                .map_err(|e| TunnelError::new("upstream_error", format!("stream read failed: {e}")))?;
+            buf.extend_from_slice(&chunk);
+            while let Some(end) = sse_event_end(&buf) {
+                let event: Vec<u8> = buf.drain(..end).collect();
+                for line in event.split(|b| *b == b'\n') {
+                    let Some(data) = trim_ascii(line).strip_prefix(b"data:") else {
+                        continue;
+                    };
+                    let data = trim_ascii(data);
+                    if data == b"[DONE]" || data.is_empty() {
+                        continue;
+                    }
+                    let Ok(delta) = serde_json::from_slice::<Value>(data) else {
+                        continue;
+                    };
+                    sent += 1;
+                    if sent > MAX_STREAM_FRAMES {
+                        return Err(TunnelError::new(
+                            "upstream_error",
+                            "the provider's stream exceeded the frame cap",
+                        ));
+                    }
+                    let frame = json!({ "v": 1, "type": "delta", "kind": "delta", "delta": delta });
+                    let envelope = self
+                        .sessions
+                        .seal_outbound(lane.id, frame.to_string().as_bytes())
+                        .map_err(|e| TunnelError::new(e.code(), e.message()))?;
+                    // A dropped frame leaves a gap the reader can see in its
+                    // own text; abandoning the turn over it would be worse.
+                    if let Err(e) = lane.post_frame(&envelope).await {
+                        log::warn!("AI turn {} delta {sent}: {e}", lane.id);
+                    }
+                }
+            }
+        }
+        if sent == 0 {
+            // Say so rather than closing a turn with no content and no reason:
+            // an empty answer with a `done` status reads as the model having
+            // nothing to say.
+            return Err(TunnelError::new(
+                "upstream_error",
+                "the provider's stream carried no content",
+            ));
+        }
+        Ok(final_after_stream())
+    }
+
+    /// Seal and post whatever text is waiting, if any.
+    async fn flush_delta(
+        &self,
+        lane: &Lane<'_>,
+        pending: &mut String,
+        streamed: &mut u64,
+    ) -> Result<(), TunnelError> {
+        if pending.is_empty() {
+            return Ok(());
+        }
+        if *streamed >= MAX_STREAM_FRAMES {
+            pending.clear();
+            return Ok(());
+        }
+        // The OpenAI streaming-chunk shape, because that is what the reader
+        // digs into: `delta.choices[].delta.content`.
+        let frame = json!({
             "v": 1,
-            "type": "final",
-            "kind": "final",
-            "completion": completion,
-        }))
-        .unwrap_or_default())
+            "type": "delta",
+            "kind": "delta",
+            "delta": { "choices": [{ "index": 0, "delta": { "content": pending.as_str() } }] },
+        });
+        let envelope = self
+            .sessions
+            .seal_outbound(lane.id, frame.to_string().as_bytes())
+            .map_err(|e| TunnelError::new(e.code(), e.message()))?;
+        pending.clear();
+        *streamed += 1;
+        if let Err(e) = lane.post_frame(&envelope).await {
+            log::warn!("AI turn {} delta {streamed}: {e}", lane.id);
+        }
+        Ok(())
     }
 
     /// Fail closed: an unknown, disabled or keyless provider is refused by name
@@ -682,6 +899,45 @@ impl AiTunnel {
 fn is_codex(provider_id: &str) -> bool {
     provider_id == crate::ai::codex::CODEX_PROVIDER_ID
         || crate::ai::codex::LiveCallAlias::from_id(provider_id).is_some()
+}
+
+/// The terminal frame for a turn that streamed nothing: it carries the whole
+/// answer, because nothing else did.
+fn final_with_completion(completion: Value) -> Vec<u8> {
+    serde_json::to_vec(&json!({
+        "v": 1,
+        "type": "final",
+        "kind": "final",
+        "completion": completion,
+    }))
+    .unwrap_or_default()
+}
+
+/// The terminal frame for a turn that already streamed its answer.
+///
+/// Deliberately EMPTY of text. The reader treats a final frame's text as the
+/// whole answer and throws away everything the deltas built, so a completion
+/// here would replace a long reply with whatever this frame happened to hold.
+fn final_after_stream() -> Vec<u8> {
+    br#"{"v":1,"type":"final","kind":"final"}"#.to_vec()
+}
+
+/// End of a complete SSE event (a blank line), if one is buffered.
+fn sse_event_end(buf: &[u8]) -> Option<usize> {
+    buf.windows(2)
+        .position(|w| w == b"\n\n")
+        .map(|i| i + 2)
+        .or_else(|| buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4))
+}
+
+fn trim_ascii(mut s: &[u8]) -> &[u8] {
+    while matches!(s.first(), Some(b' ' | b'\t' | b'\r')) {
+        s = &s[1..];
+    }
+    while matches!(s.last(), Some(b' ' | b'\t' | b'\r')) {
+        s = &s[..s.len() - 1];
+    }
+    s
 }
 
 fn codex_code(e: &crate::ai::codex::CodexError) -> &'static str {
@@ -825,6 +1081,50 @@ mod tests {
         );
         // A shape with no entries at all is an empty list, not a panic.
         assert!(normalize_models(&json!({ "oops": true })).is_empty());
+    }
+
+    #[test]
+    fn the_terminal_frame_after_a_stream_carries_no_text() {
+        // The reader takes a final frame's text as the WHOLE answer and throws
+        // away everything the deltas built. So a completion here would not
+        // duplicate the reply — it would REPLACE it, and a final holding the
+        // last chunk would cut a long answer down to one word.
+        let after: Value = serde_json::from_slice(&final_after_stream()).unwrap();
+        assert_eq!(after["kind"], "final");
+        assert_eq!(after["type"], "final");
+        assert!(after.get("completion").is_none(), "{after}");
+        assert!(after.get("text").is_none(), "{after}");
+
+        // …whereas a turn that streamed nothing must carry the whole answer,
+        // or the reader is left with an empty reply and a done status.
+        let buffered: Value =
+            serde_json::from_slice(&final_with_completion(json!({ "choices": [] }))).unwrap();
+        assert!(buffered.get("completion").is_some());
+    }
+
+    #[test]
+    fn a_delta_frame_nests_the_chunk_where_the_reader_digs_for_it() {
+        // The reader looks at `delta.choices[].delta.content`. A chunk spread
+        // at the frame's top level is dropped in silence — no error, just an
+        // answer that never appears.
+        let frame = json!({
+            "v": 1,
+            "type": "delta",
+            "kind": "delta",
+            "delta": { "choices": [{ "index": 0, "delta": { "content": "Hi" } }] },
+        });
+        assert_eq!(frame["delta"]["choices"][0]["delta"]["content"], "Hi");
+        assert!(frame.get("choices").is_none(), "the chunk must not be top-level");
+        assert_eq!(frame["kind"], "delta");
+    }
+
+    #[test]
+    fn sse_events_are_split_on_a_blank_line_in_either_newline_style() {
+        assert_eq!(sse_event_end(b"data: {}\n\nrest"), Some(10));
+        assert_eq!(sse_event_end(b"data: {}\r\n\r\nrest"), Some(12));
+        // A partial event is not an event yet — draining it would lose bytes.
+        assert_eq!(sse_event_end(b"data: {\"a\":1}"), None);
+        assert_eq!(trim_ascii(b"  data: x \r"), b"data: x");
     }
 
     #[test]
