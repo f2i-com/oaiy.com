@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from 'react';
 import {
   ChevronRight,
   CircleDot,
+  ListChecks,
   Package,
   Plug,
   Server,
@@ -10,6 +11,9 @@ import {
   TriangleAlert,
 } from 'lucide-react';
 import { peek, put } from './useCached';
+import SetupGuidePanel from './SetupGuidePanel';
+import { dismissGuide, reopenGuide, shouldAutoOpen } from './setupGuide';
+import type { StepTarget } from './setupGuide';
 import {
   aiProviders,
   bridge,
@@ -90,6 +94,8 @@ export default function OverviewPanel({ onNavigate, onOpenPluginScreen }: Props)
   const [provs, setProvs] = useState<AiProviderPublic[] | null>(() => peek('providers') ?? null);
   const [apps, setApps] = useState<PairedApp[] | null>(() => peek('pairedApps') ?? null);
   const [runtime, setRuntime] = useState<RuntimeStatus | null>(() => peek('runtimeStatus') ?? null);
+  // Shown until dismissed; the rows tick themselves, so it stays honest.
+  const [guideOpen, setGuideOpen] = useState<boolean>(() => shouldAutoOpen());
 
   const refresh = useCallback(async () => {
     // Each read is independent: one failing surface must not blank the others.
@@ -119,8 +125,38 @@ export default function OverviewPanel({ onNavigate, onOpenPluginScreen }: Props)
   const readyProv = (provs ?? []).filter((p) => p.enabled && (p.hasKey || p.allowLocal)).length;
   const cards = overviewCards(plug ?? []);
 
+  // The one-click Node fix — offered wherever the runtime is reported broken.
+  const installNode =
+    runtime?.nodeRuntime && !runtime.nodeRuntime.available ? (
+      <button
+        className="btn-tiny"
+        disabled={runtime.nodeRuntime.installing}
+        onClick={() => void nodeRuntime.install().then(refresh).catch(() => {})}
+      >
+        {runtime.nodeRuntime.installing
+          ? 'Installing Node…'
+          : `Install Node ${runtime.nodeRuntime.installsVersion}`}
+      </button>
+    ) : null;
+
   return (
     <div className="panel">
+      {guideOpen && (
+        <SetupGuidePanel
+          runtime={runtime}
+          providers={provs}
+          services={svc}
+          plugins={plug}
+          connected={apps}
+          actions={installNode ? { runtime: installNode } : undefined}
+          onNavigate={(t: StepTarget) => onNavigate(t === 'overview' ? 'services' : t)}
+          onDismiss={() => {
+            dismissGuide();
+            setGuideOpen(false);
+          }}
+        />
+      )}
+
       {/* Plugin-contributed hero cards. A plugin declares these so it can own a
           spot on the control centre rather than hiding under Plugins. */}
       {cards.map(({ plugin, card }) => {
@@ -193,8 +229,9 @@ export default function OverviewPanel({ onNavigate, onOpenPluginScreen }: Props)
         </div>
       </section>
 
-      {/* Anything actionable, rather than making the user hunt for it. */}
-      {(svc !== null || plug !== null || provs !== null) && (
+      {/* Anything actionable, rather than making the user hunt for it. While the
+          setup guide is open it covers this same ground, so only one shows. */}
+      {!guideOpen && (svc !== null || plug !== null || provs !== null) && (
         <section className="service-section">
           <div className="section-title-row">
             <h3 className="section-title">Next steps</h3>
@@ -207,17 +244,7 @@ export default function OverviewPanel({ onNavigate, onOpenPluginScreen }: Props)
               </span>
               {/* When the only thing missing is Node, fixing it is one click —
                   don't make the user go and install a runtime by hand. */}
-              {runtime.nodeRuntime && !runtime.nodeRuntime.available && (
-                <button
-                  className="btn-tiny"
-                  disabled={runtime.nodeRuntime.installing}
-                  onClick={() => void nodeRuntime.install().then(refresh).catch(() => {})}
-                >
-                  {runtime.nodeRuntime.installing
-                    ? 'Installing Node…'
-                    : `Install Node ${runtime.nodeRuntime.installsVersion}`}
-                </button>
-              )}
+              {installNode}
             </div>
           )}
           {provs !== null && provs.length === 0 && (
@@ -278,6 +305,20 @@ export default function OverviewPanel({ onNavigate, onOpenPluginScreen }: Props)
               </div>
             )}
         </section>
+      )}
+
+      {!guideOpen && (
+        <div className="setup-reopen">
+          <button
+            className="btn-tiny"
+            onClick={() => {
+              reopenGuide();
+              setGuideOpen(true);
+            }}
+          >
+            <ListChecks size={13} /> Show the setup guide
+          </button>
+        </div>
       )}
 
       {apps !== null && apps.length > 0 && (
