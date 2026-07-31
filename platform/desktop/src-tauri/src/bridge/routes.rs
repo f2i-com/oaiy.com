@@ -734,6 +734,74 @@ async fn set_plugin_enabled(
     }
 }
 
+// ------- runtime readiness -------
+
+/// `GET /api/bridge/status` — is this runtime actually able to run a flow?
+///
+/// `/api/health` deliberately answers a different question: it asserts identity
+/// ("this really is OAIY Desktop") and is open so discovery works. It says
+/// nothing about READINESS, so the only way to learn the flow runtime was
+/// unusable was to submit a run and get `runtime_unavailable` back. This reports
+/// the things that actually stop work: whether the CLI resolves, how deep the
+/// queue is, and which plugins are not serving.
+///
+/// A restricted read — it names plugins and queue state, which is not for an
+/// arbitrary remote page.
+async fn runtime_status(State(st): State<BridgeState>) -> axum::response::Response {
+    // Same resolution a real run performs, so this cannot report ready while a
+    // run would fail (or the reverse).
+    let cli = crate::bridge::worker::cli_status();
+    let cli_kind = match &cli {
+        Some(crate::bridge::worker::CliInvocation::Node { .. }) => "node",
+        Some(crate::bridge::worker::CliInvocation::Binary { .. }) => "binary",
+        None => "missing",
+    };
+
+    let (queued, total_runs) = match st.ledger.lock() {
+        Ok(l) => (l.queued(usize::MAX).len(), l.len()),
+        Err(_) => (0, 0),
+    };
+
+    let plugins: Vec<serde_json::Value> = match st.plugins.lock() {
+        Ok(mut reg) => {
+            reg.scan();
+            reg.list()
+                .into_iter()
+                .map(|r| {
+                    json!({ "id": r.id, "state": r.state, "reason": r.reason,
+                            "servesCommands": r.state.accepts_commands() })
+                })
+                .collect()
+        }
+        Err(_) => Vec::new(),
+    };
+    let plugins_serving = plugins
+        .iter()
+        .filter(|p| p.get("servesCommands").and_then(serde_json::Value::as_bool) == Some(true))
+        .count();
+
+    let ready = cli.is_some();
+    (
+        StatusCode::OK,
+        Json(json!({
+            "ready": ready,
+            "deviceId": st.device_id,
+            "flowRuntime": {
+                "cliResolved": cli.is_some(),
+                "cliKind": cli_kind,
+                // The fix, in the response, so a caller does not have to go
+                // looking for what "not resolved" means.
+                "detail": cli.is_none().then_some(
+                    "Install the `oaiy` CLI so it is on PATH, or set OAIY_CLI to the path of cli/bin/oaiy.mjs."
+                ),
+            },
+            "runs": { "queued": queued, "known": total_runs },
+            "plugins": { "serving": plugins_serving, "total": plugins.len(), "detail": plugins },
+        })),
+    )
+        .into_response()
+}
+
 // ------- plugin-contributed service definitions -------
 
 /// Every service definition contributed by an installed plugin, with provenance.
@@ -1243,6 +1311,7 @@ async fn revoke_pairing(State(st): State<BridgeState>, Path(id): Path<String>) -
 pub fn router(state: BridgeState) -> Router {
     Router::new()
         .route("/api/bridge/capabilities", get(capabilities))
+        .route("/api/bridge/status", get(runtime_status))
         .route("/api/bridge/runs", get(queued_runs).post(create_run))
         .route("/api/bridge/runs/:id", get(get_run))
         .route("/api/bridge/runs/:id/claim", post(claim_run))

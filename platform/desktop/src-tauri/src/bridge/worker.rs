@@ -185,6 +185,14 @@ fn lookup_on_path(name: &str) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+/// How the CLI resolves right now, for the readiness endpoint.
+///
+/// Uses the SAME resolution a run does, so status cannot claim the runtime is
+/// ready while an actual run fails with `runtime_unavailable` (or the reverse).
+pub fn cli_status() -> Option<CliInvocation> {
+    resolve_cli(std::env::var("OAIY_CLI").ok().as_deref(), lookup_on_path)
+}
+
 pub struct Worker {
     ledger: LedgerHandle,
     flows: Arc<FlowStore>,

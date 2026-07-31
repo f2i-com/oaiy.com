@@ -685,6 +685,8 @@ fn is_restricted_read_path(path: &str) -> bool {
         || path == "/api/plugins"
         // Which plugins are installed and what they can do — same tier as /api/plugins.
         || path == "/api/services/definitions"
+        // Readiness names plugins + queue depth: gated like the other bridge reads.
+        || path == "/api/bridge/status"
         || path == "/api/bridge/events"
         || path == "/api/bridge/runs"
         || path == "/api/bridge/flows"
