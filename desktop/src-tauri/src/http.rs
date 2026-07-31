@@ -1139,6 +1139,7 @@ mod tests {
         // neither. Reading the status changes nothing, but it inventories what
         // this machine can reach, so it stays off the open GET surface.
         assert!(is_privileged_path(&Method::POST, "/api/link/start"));
+        assert!(is_privileged_path(&Method::POST, "/api/link/cancel"));
         assert!(is_privileged_path(&Method::DELETE, "/api/link"));
         assert!(is_restricted_read_path("/api/link"));
     }

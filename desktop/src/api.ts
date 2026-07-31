@@ -542,7 +542,8 @@ export type LinkPhase =
   | { phase: 'awaitingBrowser'; authorizeUrl: string }
   | { phase: 'exchanging' }
   | { phase: 'linked' }
-  | { phase: 'failed'; message: string };
+  | { phase: 'failed'; message: string }
+  | { phase: 'cancelled' };
 export interface LinkStatus {
   linked: boolean;
   connectorId?: string;
@@ -567,6 +568,9 @@ export const link = {
       body: JSON.stringify({ connectorId, baseUrl }),
     }),
   unlink: () => request<LinkStatus>('/api/link', { method: 'DELETE' }),
+  /** Abandon an attempt in flight. Distinct from unlink, which throws away a
+   *  credential we already hold. */
+  cancel: () => request<LinkStatus>('/api/link/cancel', { method: 'POST' }),
 };
 
 export const plugins = {

@@ -128,11 +128,23 @@ impl Loopback {
     /// callback path are answered 404 and ignored rather than ending the wait:
     /// browsers speculatively fetch `/favicon.ico`, and treating that as the
     /// callback would abort a ceremony that had not happened yet.
-    pub fn wait(&self, callback_path: &str, deadline: Instant) -> Result<HashMap<String, String>, String> {
+    ///
+    /// `cancel` is polled on the same tick as the deadline, so a user who gave
+    /// up in the browser is not made to wait out the full five minutes before
+    /// the app will let them try again.
+    pub fn wait(
+        &self,
+        callback_path: &str,
+        deadline: Instant,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<HashMap<String, String>, String> {
         self.listener
             .set_nonblocking(true)
             .map_err(|e| format!("callback listener: {e}"))?;
         loop {
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err("cancelled".into());
+            }
             if Instant::now() >= deadline {
                 return Err("timed out waiting for the browser".into());
             }
@@ -466,8 +478,9 @@ mod tests {
             }
         });
 
+        let never = std::sync::atomic::AtomicBool::new(false);
         let params = lb
-            .wait("/callback", Instant::now() + Duration::from_secs(10))
+            .wait("/callback", Instant::now() + Duration::from_secs(10), &never)
             .expect("the real callback should be caught");
         assert_eq!(params.get("code").map(String::as_str), Some("THECODE"));
         assert_eq!(params.get("state").map(String::as_str), Some("S"));
@@ -476,9 +489,29 @@ mod tests {
     #[test]
     fn waiting_past_the_deadline_gives_up_rather_than_hanging() {
         let lb = Loopback::bind("/callback").unwrap();
+        let never = std::sync::atomic::AtomicBool::new(false);
         let err = lb
-            .wait("/callback", Instant::now() + Duration::from_millis(200))
+            .wait("/callback", Instant::now() + Duration::from_millis(200), &never)
             .unwrap_err();
         assert!(err.contains("timed out"), "{err}");
+    }
+
+    #[test]
+    fn cancelling_stops_the_wait_without_waiting_out_the_deadline() {
+        // A user who closed the browser tab must not be made to sit through the
+        // full five minutes before the app will let them try again.
+        let lb = Loopback::bind("/callback").unwrap();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(120));
+            flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+        let started = Instant::now();
+        let err = lb
+            .wait("/callback", Instant::now() + Duration::from_secs(300), &cancel)
+            .unwrap_err();
+        assert_eq!(err, "cancelled", "{err}");
+        assert!(started.elapsed() < Duration::from_secs(5), "it must return promptly");
     }
 }

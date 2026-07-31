@@ -126,9 +126,18 @@ b").is_err());
     }
 }
 
+/// Stop an attempt in flight.
+///
+/// Separate from `unlink`, which throws away a credential we already hold.
+/// This one abandons a ceremony that never produced anything.
+async fn cancel(State(store): State<LinkHandle>) -> Json<LinkStatus> {
+    Json(store.cancel())
+}
+
 pub fn router(store: LinkHandle) -> Router {
     Router::new()
         .route("/api/link", get(status).delete(unlink))
         .route("/api/link/start", post(start))
+        .route("/api/link/cancel", post(cancel))
         .with_state(store)
 }

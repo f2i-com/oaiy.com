@@ -120,11 +120,22 @@ export default function ConnectionsPanel() {
     }
   };
 
+  const cancelLink = async () => {
+    setAccountError(null);
+    try {
+      const next = await linkApi.cancel();
+      setAccount(next);
+      put('linkStatus', next);
+    } catch (err) {
+      setAccountError(err instanceof Error ? err.message : String(err));
+    }
+  };
+
   const unlink = async () => {
     const name = account?.connectorName ?? 'this account';
     if (
       !confirm(
-        `Disconnect ${name}?\n\nThis forgets the key on this machine only \u2014 it does not revoke it at the provider. Remove this desktop there too if you want the key to stop working.`,
+        `Disconnect ${name}?\n\nThis forgets the key on this machine only — it does not revoke it at the provider. Remove this desktop there too if you want the key to stop working.`,
       )
     )
       return;
@@ -307,7 +318,7 @@ export default function ConnectionsPanel() {
         </div>
         <p className="form-hint" style={{ marginBottom: 10 }}>
           One account, on any provider that speaks the connector protocol. Approving happens
-          in your browser and this machine never sees your password \u2014 it receives a scoped key.
+          in your browser and this machine never sees your password — it receives a scoped key.
         </p>
 
         {accountError && (
@@ -318,25 +329,48 @@ export default function ConnectionsPanel() {
 
         {account?.attempt.phase === 'awaitingBrowser' && (
           <div className="banner banner-pending" style={{ marginBottom: 10 }}>
-            <strong>Waiting for you to approve in the browser\u2026</strong>
-            {/* The launcher can silently do nothing; without this the user is
-                stuck looking at a spinner with no way forward. */}
-            <div style={{ marginTop: 6, fontSize: 12.5 }}>
-              Didn\u2019t a tab open?{' '}
-              <a href={account.attempt.authorizeUrl} target="_blank" rel="noreferrer">
-                Open the approval page
-              </a>
+            <strong>Waiting for you to approve this in your browser</strong>
+            {/* The launcher can silently do nothing, and the user may simply
+                change their mind. Both need a way forward that isn't waiting
+                out the five-minute timeout. */}
+            <div
+              style={{
+                marginTop: 8,
+                fontSize: 12.5,
+                display: 'flex',
+                alignItems: 'center',
+                gap: 10,
+                flexWrap: 'wrap',
+              }}
+            >
+              <span>
+                No tab opened?{' '}
+                <a href={account.attempt.authorizeUrl} target="_blank" rel="noreferrer">
+                  Open the approval page
+                </a>
+              </span>
+              <button className="btn-tiny" onClick={() => void cancelLink()}>
+                Cancel
+              </button>
             </div>
           </div>
         )}
         {account?.attempt.phase === 'exchanging' && (
           <div className="banner banner-pending" style={{ marginBottom: 10 }}>
-            Finishing the link\u2026
+            Finishing the link
+          </div>
+        )}
+        {account?.attempt.phase === 'cancelled' && !account.linked && (
+          <div className="banner banner-pending" style={{ marginBottom: 10 }}>
+            Linking cancelled. You can start again whenever you like.
           </div>
         )}
         {account?.attempt.phase === 'failed' && !account.linked && (
           <div className="banner banner-err" role="alert" style={{ marginBottom: 10 }}>
-            {account.attempt.message}
+            <span>{account.attempt.message}</span>{' '}
+            <button className="btn-tiny" onClick={() => void cancelLink()}>
+              Dismiss
+            </button>
           </div>
         )}
 
@@ -345,7 +379,7 @@ export default function ConnectionsPanel() {
             <li>
               <span>
                 <Cloud size={13} aria-hidden /> {account.connectorName ?? account.connectorId}
-                {account.accountName && <strong> \u00b7 {account.accountName}</strong>}
+                {account.accountName && <strong> · {account.accountName}</strong>}
                 <code className="pairing-origin">{account.baseUrl}</code>
                 {account.grantedScopes && (
                   <small style={{ display: 'block', opacity: 0.6, marginTop: 2 }}>
@@ -367,7 +401,7 @@ export default function ConnectionsPanel() {
           <form className="dl-form" style={{ marginTop: 12 }} onSubmit={(e) => void startLink(e)}>
             <label className="form-row">
               <span>Provider</span>
-              {/* Populated from the host, never hardcoded \u2014 adding a descriptor
+              {/* Populated from the host, never hardcoded — adding a descriptor
                   file is all it takes for a new provider to appear here. */}
               <select
                 value={accountForm.connectorId}

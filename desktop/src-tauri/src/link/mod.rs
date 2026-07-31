@@ -19,6 +19,7 @@ pub mod routes;
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -55,6 +56,9 @@ pub enum LinkPhase {
     Exchanging,
     Linked,
     Failed { message: String },
+    /// The user stopped it from this app. Distinct from `Failed` because
+    /// nothing went wrong and an error banner would be a lie.
+    Cancelled,
 }
 
 /// What a UI may know. No credential, ever.
@@ -103,6 +107,9 @@ struct Inner {
     /// Set while a ceremony is running, so a second Link click cannot open a
     /// second browser tab racing the first for the same one-use code.
     in_flight: bool,
+    /// Raised to stop the current attempt. A fresh flag PER ATTEMPT, so a
+    /// cancel can never carry over and kill the next one.
+    cancel: Arc<AtomicBool>,
 }
 
 pub struct LinkStore {
@@ -125,6 +132,7 @@ pub fn open_handle(data_dir: PathBuf) -> LinkHandle {
             account,
             attempt: LinkPhase::Idle,
             in_flight: false,
+            cancel: Arc::new(AtomicBool::new(false)),
         }),
     })
 }
@@ -215,15 +223,40 @@ impl LinkStore {
         self.inner.lock().unwrap_or_else(|e| e.into_inner()).attempt = phase;
     }
 
-    /// Claim the single in-flight slot.
-    fn begin(&self) -> Result<(), String> {
+    /// Claim the single in-flight slot, returning this attempt's cancel flag.
+    fn begin(&self) -> Result<Arc<AtomicBool>, String> {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if inner.in_flight {
             return Err("a link attempt is already in progress".into());
         }
         inner.in_flight = true;
         inner.attempt = LinkPhase::Idle;
-        Ok(())
+        // A NEW flag, not a reset of the old one: a stale handle raising the
+        // previous attempt's flag must not reach into this one.
+        inner.cancel = Arc::new(AtomicBool::new(false));
+        Ok(inner.cancel.clone())
+    }
+
+    /// Stop the attempt in flight, if there is one.
+    ///
+    /// Idempotent and safe when nothing is running — the button is allowed to
+    /// be clicked twice, and the answer is the same either way.
+    pub fn cancel(&self) -> LinkStatus {
+        {
+            let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            if inner.in_flight {
+                inner.cancel.store(true, Ordering::Relaxed);
+                // Reported immediately rather than waiting for the worker to
+                // notice: the user pressed a button and deserves to see it take
+                // effect. The worker clears in_flight when it unwinds.
+                inner.attempt = LinkPhase::Cancelled;
+            } else if matches!(inner.attempt, LinkPhase::Failed { .. }) {
+                // Dismisses a stale error too, so the panel can return to a
+                // clean state without a second control.
+                inner.attempt = LinkPhase::Idle;
+            }
+        }
+        self.status()
     }
 
     fn end(&self) {
@@ -293,7 +326,7 @@ pub fn start_link(
     let descriptor::AuthSpec::Oauth2Pkce(spec) = &descriptor.auth;
     let callback_path = spec.callback_path.clone();
 
-    store.begin()?;
+    let cancel = store.begin()?;
     // From here every exit path must clear the slot, or Link is dead until
     // restart.
     let result = (|| -> Result<(oauth::Loopback, oauth::Pkce, String, String), String> {
@@ -329,7 +362,7 @@ pub fn start_link(
         open_browser(&url_for_thread);
         let deadline = Instant::now() + oauth::LINK_TIMEOUT;
         let outcome = (|| -> Result<LinkedAccount, String> {
-            let params = loopback.wait(&callback_path, deadline)?;
+            let params = loopback.wait(&callback_path, deadline, &cancel)?;
             if let Some(err) = params.get("error") {
                 let detail = params
                     .get("error_description")
@@ -376,6 +409,9 @@ pub fn start_link(
                 }
                 Err(e) => for_thread.set_phase(LinkPhase::Failed { message: e }),
             },
+            // A cancel is not a failure: the user asked for this, so the
+            // panel must not accuse them of an error.
+            Err(e) if e == "cancelled" => for_thread.set_phase(LinkPhase::Cancelled),
             Err(e) => for_thread.set_phase(LinkPhase::Failed { message: e }),
         }
         for_thread.end();
@@ -450,6 +486,81 @@ mod tests {
         assert!(err.contains("already in progress"), "{err}");
         s.end();
         s.begin().expect("the slot must be reusable once the attempt ends");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cancelling_stops_the_attempt_and_frees_the_slot() {
+        let (dir, s) = store("cancel");
+        let cancel = s.begin().unwrap();
+        assert!(!cancel.load(Ordering::Relaxed));
+
+        let status = s.cancel();
+        assert!(cancel.load(Ordering::Relaxed), "the worker must see the flag");
+        // Reported straight away rather than waiting for the worker to notice:
+        // the user pressed a button and deserves to see it take effect.
+        assert_eq!(status.attempt, LinkPhase::Cancelled);
+
+        // The worker unwinds and releases the slot; then Link works again.
+        s.end();
+        s.begin().expect("a cancelled attempt must not wedge the next one");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_cancel_cannot_leak_into_the_next_attempt() {
+        // The bug a shared flag would cause: cancel once, and every future
+        // attempt dies instantly with no explanation. Each attempt gets its own.
+        let (dir, s) = store("cancel-leak");
+        let first = s.begin().unwrap();
+        s.cancel();
+        s.end();
+
+        let second = s.begin().unwrap();
+        assert!(first.load(Ordering::Relaxed), "the old attempt stays cancelled");
+        assert!(
+            !second.load(Ordering::Relaxed),
+            "a fresh attempt must start uncancelled"
+        );
+        // …and raising the STALE handle must not reach the live attempt.
+        first.store(true, Ordering::Relaxed);
+        assert!(!second.load(Ordering::Relaxed));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cancelling_when_nothing_is_running_is_harmless() {
+        // The button is allowed to be clicked twice.
+        let (dir, s) = store("cancel-idle");
+        assert_eq!(s.cancel().attempt, LinkPhase::Idle);
+        assert_eq!(s.cancel().attempt, LinkPhase::Idle);
+        s.begin().expect("an idle cancel must not consume the slot");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cancel_also_dismisses_a_stale_failure() {
+        // Otherwise the panel keeps an old error banner with no way to clear it
+        // short of a successful link.
+        let (dir, s) = store("cancel-dismiss");
+        s.set_phase(LinkPhase::Failed { message: "boom".into() });
+        assert_eq!(s.cancel().attempt, LinkPhase::Idle);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_cancelled_attempt_is_not_reported_as_a_failure() {
+        // The user asked for it; an error banner would accuse them of a fault.
+        let (dir, s) = store("cancel-not-failure");
+        s.begin().unwrap();
+        let status = s.cancel();
+        assert_ne!(
+            std::mem::discriminant(&status.attempt),
+            std::mem::discriminant(&LinkPhase::Failed { message: String::new() }),
+        );
+        assert_eq!(status.attempt, LinkPhase::Cancelled);
+        // And it leaves no account behind.
+        assert!(!status.linked);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
