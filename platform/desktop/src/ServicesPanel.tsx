@@ -269,6 +269,7 @@ export default function ServicesPanel() {
                 }
               }}
               onCancelInstall={() => runAction(() => services.cancelInstall(svc.id), svc.id)}
+              onRepair={() => runAction(() => services.repair(svc.id), svc.id)}
               onExport={() => exportPackage(svc.id, svc.name)}
               onDelete={() => {
                 if (
@@ -497,6 +498,7 @@ interface CardProps {
   onInstall: () => void;
   onUninstall: () => void;
   onCancelInstall: () => void;
+  onRepair: () => void;
   onExport: () => void;
   onDelete: () => void;
 }
@@ -855,6 +857,7 @@ function ServiceCard({
   onInstall,
   onUninstall,
   onCancelInstall,
+  onRepair,
   onExport,
   onDelete,
 }: CardProps) {
@@ -912,6 +915,18 @@ function ServiceCard({
           {service.id === 'ollama' && <OllamaModelSelector />}
           <GpuSelector serviceId={service.id} currentGpu={service.gpu} />
         </div>
+        {/* Why it died, and whether we are still retrying — the runner's log
+            buffer is replaced by the next start, so without this an
+            auto-recovered crash leaves no trace the user can see. */}
+        {service.lastCrash && service.status !== 'running' && (
+          <p style={{ fontSize: 12, opacity: 0.75, margin: '0 0 8px' }}>
+            Exited with code {service.lastCrash.code}
+            {service.restartAttempts ? ` · restart attempt ${service.restartAttempts}` : ''}
+            {service.needsRepair ? ' · gave up, needs Repair' : ''}
+            {service.lastCrash.detail ? ` — ${service.lastCrash.detail}` : ''}
+          </p>
+        )}
+
         <div className="service-actions">
           {/* Start / Stop — only meaningful once installed (you can't start what isn't
               installed). */}
@@ -926,6 +941,14 @@ function ServiceCard({
               Start
             </button>
           ) : null}
+
+          {/* Automatic recovery gave up — offer the manual reset, which also
+              tears down any process tree still holding the port. */}
+          {service.needsRepair && (
+            <button onClick={onRepair} disabled={pending} className="btn btn-secondary">
+              Repair
+            </button>
+          )}
 
           {/* A SINGLE install-state button (not separate Install + Uninstall):
               Install when not installed → Uninstall when installed (or Reinstall if the

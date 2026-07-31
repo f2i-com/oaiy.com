@@ -185,6 +185,23 @@ async fn stop_service(
 /// Install via `Runner` (same pipe + log machinery used for service
 /// processes) so the existing /logs endpoint streams progress in real
 /// time — no extra plumbing on the UI side.
+/// Clear a tripped crash breaker and start the service from a clean slate,
+/// tearing down any process tree still holding its port.
+async fn repair_service(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let result = state
+        .registry
+        .lock()
+        .map_err(|_| "registry mutex poisoned".to_string())
+        .and_then(|mut reg| reg.repair(&id));
+    match result {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => err400(&e),
+    }
+}
+
 async fn install_service(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -950,6 +967,7 @@ pub async fn serve(
         .route("/api/services/:id", delete(delete_service))
         .route("/api/services/:id/start", post(start_service))
         .route("/api/services/:id/stop", post(stop_service))
+        .route("/api/services/:id/repair", post(repair_service))
         .route("/api/services/:id/install", post(install_service))
         .route("/api/services/:id/uninstall", post(uninstall_service))
         .route(
