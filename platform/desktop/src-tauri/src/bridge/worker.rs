@@ -26,9 +26,12 @@
 //! # CLI resolution
 //!
 //! In order: the `OAIY_CLI` env var (a path to `oaiy.mjs`/`oaiy.js` run via
-//! node, or a native binary), then `oaiy` on `PATH`. No CLI is a **typed,
-//! actionable failure** on each run — `runtime_unavailable`, naming both fixes —
-//! never a silent stall of the queue.
+//! node, or a native binary), then the CLI bundle SHIPPED with the app beside
+//! the executable, then `oaiy` on `PATH`. The bundled step is what lets an
+//! installed OAIY run flows with nothing else to install; an explicit env var
+//! still wins so an operator's own build is never silently overridden. No CLI at
+//! all is a **typed, actionable failure** on each run — `runtime_unavailable`,
+//! naming the fixes — never a silent stall of the queue.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -149,7 +152,38 @@ pub enum CliInvocation {
     Binary { path: PathBuf },
 }
 
-/// Resolve the CLI. Pure over its inputs so the policy is testable.
+/// Candidate locations for the CLI bundle that ships INSIDE the app.
+///
+/// Tauri lays resources out beside the executable (`<install>/resources/…` on
+/// Windows/Linux, `…/Contents/Resources/…` in a macOS bundle), and `cargo run`
+/// leaves them under the target dir — so this probes the handful of places the
+/// same file legitimately lands rather than depending on a Tauri API, which
+/// keeps `worker.rs` usable from the headless binary that has no AppHandle.
+fn bundled_cli_script() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?;
+    let rel = [
+        "resources/cli/oaiy.mjs",
+        "../resources/cli/oaiy.mjs",
+        "../Resources/cli/oaiy.mjs",
+        // `cargo run` / `tauri dev`: resources are not copied, so fall back to
+        // the source tree next to the crate.
+        "../../resources/cli/oaiy.mjs",
+    ];
+    // NOT canonicalized: on Windows that yields a verbatim UNC path
+    // (`\\?\C:\…`), which node fails to resolve as a main module — it reported
+    // `EISDIR: illegal operation on a directory, lstat 'C:'`. `current_exe()` is
+    // already absolute, so joining is enough.
+    rel.iter().map(|r| dir.join(r)).find(|p| p.is_file())
+}
+
+/// Resolve how to invoke the OAIY CLI.
+///
+/// Order matters: an explicit `OAIY_CLI` wins (an operator pointing at a build
+/// must not be silently overridden by what we ship), then the copy bundled with
+/// the app, then whatever is on PATH. The bundled step is why an installed OAIY
+/// can run flows without the user installing anything else — before it, a
+/// packaged app resolved nothing and every run failed `runtime_unavailable`.
 pub fn resolve_cli(env_value: Option<&str>, path_lookup: impl Fn(&str) -> Option<PathBuf>) -> Option<CliInvocation> {
     if let Some(raw) = env_value.map(str::trim).filter(|s| !s.is_empty()) {
         let p = PathBuf::from(raw);
@@ -162,6 +196,9 @@ pub fn resolve_cli(env_value: Option<&str>, path_lookup: impl Fn(&str) -> Option
         } else {
             CliInvocation::Binary { path: p }
         });
+    }
+    if let Some(script) = bundled_cli_script() {
+        return Some(CliInvocation::Node { script });
     }
     path_lookup("oaiy").map(|path| CliInvocation::Binary { path })
 }
@@ -534,6 +571,61 @@ fn tail_of(s: &str, n: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- CLI resolution order ---------------------------------------------
+
+    #[test]
+    fn an_explicit_oaiy_cli_wins_over_everything_else() {
+        // An operator pointing at their own build must never be silently
+        // overridden by the copy we ship.
+        let r = resolve_cli(Some("C:/dev/oaiy-web/cli/bin/oaiy.mjs"), |_| {
+            Some(PathBuf::from("C:/on/path/oaiy.exe"))
+        });
+        match r {
+            Some(CliInvocation::Node { script }) => {
+                assert!(script.to_string_lossy().contains("cli/bin/oaiy.mjs"));
+            }
+            other => panic!("expected the explicit .mjs, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_non_js_oaiy_cli_is_treated_as_a_binary() {
+        match resolve_cli(Some("/usr/local/bin/oaiy"), |_| None) {
+            Some(CliInvocation::Binary { path }) => assert!(path.ends_with("oaiy")),
+            other => panic!("expected a binary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn blank_or_absent_env_does_not_count_as_an_override() {
+        // Whitespace must not resolve to a nonsense empty path — it has to fall
+        // through to the bundled/PATH lookup like an unset variable.
+        for env in [Some("   "), Some(""), None] {
+            let r = resolve_cli(env, |_| Some(PathBuf::from("/found/on/path/oaiy")));
+            // Either the bundled script (when this checkout has one staged) or
+            // the PATH hit — never an empty Node script path.
+            match r {
+                Some(CliInvocation::Node { script }) => assert!(!script.as_os_str().is_empty()),
+                Some(CliInvocation::Binary { path }) => assert!(!path.as_os_str().is_empty()),
+                None => panic!("expected a resolution for env {env:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn with_no_env_and_nothing_on_path_resolution_is_none_unless_bundled() {
+        // The honest failure the readiness endpoint reports. When a bundled CLI
+        // IS present next to the test binary, resolution legitimately succeeds —
+        // assert the two possibilities rather than pinning to one environment.
+        match resolve_cli(None, |_| None) {
+            None => {}
+            Some(CliInvocation::Node { script }) => {
+                assert!(script.is_file(), "a Some(..) must point at a real bundled script");
+            }
+            other => panic!("unexpected resolution {other:?}"),
+        }
+    }
 
     // --- flow ids become path components ----------------------------------
 

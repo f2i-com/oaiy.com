@@ -39,7 +39,10 @@
     ],
     "category": "DeveloperTool",
     "shortDescription": "Local AI services + browser automation for oaiy-web",
-    "longDescription": "OAIY is a tray-resident desktop app that manages local AI services (Ollama, ComfyUI, custom Python) and browser automation, exposing them to the oaiy-web flow editor via a localhost API."
+    "longDescription": "OAIY is a tray-resident desktop app that manages local AI services (Ollama, ComfyUI, custom Python) and browser automation, exposing them to the oaiy-web flow editor via a localhost API.",
+    "resources": [
+      "resources/cli/**/*"
+    ]
   },
   "plugins": {}
 }
