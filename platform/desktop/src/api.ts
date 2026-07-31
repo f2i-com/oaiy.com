@@ -463,7 +463,17 @@ export const serviceDefinitions = {
 // ----- bridge (connector commands + plugin events) -----
 
 /** What a plugin-contributed screen needs from the host to be useful. */
+export interface RuntimeStatus {
+  ready: boolean;
+  deviceId: string;
+  flowRuntime: { cliResolved: boolean; cliKind: string; detail?: string | null };
+  runs: { queued: number; known: number };
+  plugins: { serving: number; total: number };
+}
+
 export const bridge = {
+  /** Can this runtime actually run a flow? (health only asserts identity.) */
+  status: () => request<RuntimeStatus>('/api/bridge/status'),
   /** Invoke a connector command on a plugin, exactly as a flow would.
    *  `idempotencyKey` is required by the gateway for the plugin's journalled
    *  (physically side-effecting) commands, so callers should always pass one. */

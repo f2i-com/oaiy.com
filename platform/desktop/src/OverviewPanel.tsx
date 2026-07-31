@@ -12,6 +12,8 @@ import {
 import { peek, put } from './useCached';
 import {
   aiProviders,
+  bridge,
+  type RuntimeStatus,
   pairing,
   plugins,
   services,
@@ -86,19 +88,22 @@ export default function OverviewPanel({ onNavigate, onOpenPluginScreen }: Props)
   const [plug, setPlug] = useState<PluginRecord[] | null>(() => peek('plugins') ?? null);
   const [provs, setProvs] = useState<AiProviderPublic[] | null>(() => peek('providers') ?? null);
   const [apps, setApps] = useState<PairedApp[] | null>(() => peek('pairedApps') ?? null);
+  const [runtime, setRuntime] = useState<RuntimeStatus | null>(() => peek('runtimeStatus') ?? null);
 
   const refresh = useCallback(async () => {
     // Each read is independent: one failing surface must not blank the others.
-    const [s, p, a, c] = await Promise.allSettled([
+    const [s, p, a, c, r] = await Promise.allSettled([
       services.list(),
       plugins.list(),
       aiProviders.list(),
       pairing.paired(),
+      bridge.status(),
     ]);
     if (s.status === 'fulfilled') { setSvc(s.value.services); put('services', s.value.services); }
     if (p.status === 'fulfilled') { setPlug(p.value.plugins); put('plugins', p.value.plugins); }
     if (a.status === 'fulfilled') { setProvs(a.value.providers); put('providers', a.value.providers); }
     if (c.status === 'fulfilled') { setApps(c.value.paired); put('pairedApps', c.value.paired); }
+    if (r.status === 'fulfilled') { setRuntime(r.value); put('runtimeStatus', r.value); }
   }, []);
 
   useEffect(() => {
@@ -193,6 +198,14 @@ export default function OverviewPanel({ onNavigate, onOpenPluginScreen }: Props)
           <div className="section-title-row">
             <h3 className="section-title">Next steps</h3>
           </div>
+          {runtime && !runtime.ready && (
+            <div className="datadir-note">
+              <span>
+                <TriangleAlert size={13} /> Flows cannot run on this machine —{' '}
+                {runtime.flowRuntime.detail ?? 'the OAIY runtime is unavailable.'}
+              </span>
+            </div>
+          )}
           {provs !== null && provs.length === 0 && (
             <div className="datadir-note">
               <span>No AI provider configured — flows have no chat model to call.</span>
@@ -236,7 +249,8 @@ export default function OverviewPanel({ onNavigate, onOpenPluginScreen }: Props)
               </div>
             )}
           {/* The all-clear, so the screen is never ambiguous about being fine. */}
-          {provs !== null &&
+          {runtime?.ready &&
+            provs !== null &&
             plug !== null &&
             svc !== null &&
             readyProv > 0 &&
