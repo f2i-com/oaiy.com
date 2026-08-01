@@ -30,7 +30,7 @@ use super::{LinkHandle, LinkedAccount};
 /// Boxed rather than a generic so the store can hold one without infecting every
 /// type that touches it. Blocking: relay work is service and plugin control,
 /// which is blocking anyway, and it runs on the relay's own thread.
-pub type Dispatcher = Arc<dyn Fn(&str, &Value) -> Result<Value, String> + Send + Sync>;
+pub type Dispatcher = Arc<dyn Fn(&str, &str, &Value) -> Result<Value, String> + Send + Sync>;
 
 /// A command waiting for this desktop.
 #[derive(Debug, Clone, Deserialize)]
@@ -42,9 +42,15 @@ struct Command {
     /// up" — pointing the user at a connection problem that does not exist.
     #[serde(rename = "commandId")]
     id: String,
-    /// The short verb — `services.list`, `plugins.start`. The connector id is
-    /// the namespace, so it is not repeated here.
+    /// The short verb — `services.list`, `plugins.start`, `call.current`. The
+    /// connector id is the namespace, so it is not repeated here.
     command: String,
+    /// WHOSE verb it is. `desktop` means this app itself; anything else names a
+    /// plugin's connector. Ignoring this and matching the verb alone was a real
+    /// bug: every `aokie` command was measured against the desktop's own list
+    /// and refused, so the provider's call console got nothing back.
+    #[serde(default)]
+    connector_id: Option<String>,
     #[serde(default)]
     payload: Value,
 }
@@ -201,7 +207,11 @@ fn serve(
         };
     }
 
-    let outcome = dispatch(&command.command, &command.payload);
+    let outcome = dispatch(
+        command.connector_id.as_deref().unwrap_or("desktop"),
+        &command.command,
+        &command.payload,
+    );
     if let Err(message) = &outcome {
         // Logged so the same failure is diagnosable from this side too, but see
         // the return below: it is not the lane's failure.
@@ -310,6 +320,29 @@ mod tests {
         assert_eq!(c.id, "67c1382d-c318-4ee5-a94c-a4f3d0cf1227");
         assert_eq!(c.command, "plugins.list");
         assert!(c.payload.is_null(), "a null payload must not fail the parse");
+    }
+
+    #[test]
+    fn a_command_carries_whose_verb_it_is() {
+        // The bug this pins, seen live: the provider's call console polls
+        // `call.current` on the `aokie` connector three times a second. Reading
+        // the verb without the connector measured every one against the
+        // desktop's own op list and refused it — so the console got nothing
+        // back for an entire call, while the call itself connected fine.
+        let reply: PendingReply = serde_json::from_value(serde_json::json!({
+            "commands": [
+                { "commandId": "c1", "connectorId": "aokie", "command": "call.current" },
+                { "commandId": "c2", "connectorId": "desktop", "command": "services.list" },
+                { "commandId": "c3", "command": "plugins.list" }
+            ]
+        }))
+        .unwrap();
+        assert_eq!(reply.commands[0].connector_id.as_deref(), Some("aokie"));
+        assert_eq!(reply.commands[1].connector_id.as_deref(), Some("desktop"));
+        // Absent means this app itself — the shape older rows have.
+        assert_eq!(reply.commands[2].connector_id, None);
+        let effective = |c: &Command| c.connector_id.clone().unwrap_or_else(|| "desktop".into());
+        assert_eq!(effective(&reply.commands[2]), crate::link::ops::DESKTOP_CONNECTOR);
     }
 
     #[test]
@@ -430,7 +463,7 @@ mod tests {
         // NOT then report its own lane as broken — asking to start a plugin
         // that does not exist is a normal answer, not a connection fault.
         let (base, rx) = stub_relay(ONE_COMMAND, "200 OK");
-        let dispatch: Dispatcher = Arc::new(|_: &str, _: &Value| -> Result<Value, String> {
+        let dispatch: Dispatcher = Arc::new(|_: &str, _: &str, _: &Value| -> Result<Value, String> {
             Err("no plugin named \"ghost\"".to_string())
         });
 
@@ -456,7 +489,7 @@ mod tests {
         // while on the provider's website every action expires unanswered and
         // the user is sent hunting for a connection problem that is not there.
         let (base, _rx) = stub_relay(ONE_COMMAND, "500 Internal Server Error");
-        let dispatch: Dispatcher = Arc::new(|_: &str, _: &Value| -> Result<Value, String> {
+        let dispatch: Dispatcher = Arc::new(|_: &str, _: &str, _: &Value| -> Result<Value, String> {
             panic!("work must not run without a claim")
         });
 
@@ -474,7 +507,7 @@ mod tests {
         // the other one got there first. Surfacing that as a lane failure would
         // put a red banner on a machine that is working perfectly.
         let (base, rx) = stub_relay(ONE_COMMAND, "409 Conflict");
-        let dispatch: Dispatcher = Arc::new(|_: &str, _: &Value| -> Result<Value, String> {
+        let dispatch: Dispatcher = Arc::new(|_: &str, _: &str, _: &Value| -> Result<Value, String> {
             panic!("a lost claim must not run the work")
         });
 
@@ -496,7 +529,7 @@ mod tests {
         // Claim and complete are separate requests from the poll; a bearer
         // missing on either one turns into a 401 that reads as a dead link.
         let (base, rx) = stub_relay(ONE_COMMAND, "200 OK");
-        let dispatch: Dispatcher = Arc::new(|_: &str, _: &Value| -> Result<Value, String> {
+        let dispatch: Dispatcher = Arc::new(|_: &str, _: &str, _: &Value| -> Result<Value, String> {
             Ok(serde_json::json!({ "ok": true }))
         });
         poll_once(&account(base), &spec(), "oaiy-test", &dispatch).unwrap();
