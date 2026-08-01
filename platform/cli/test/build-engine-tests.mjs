@@ -15,7 +15,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // The engine tests import src/generated/bundled-modules (codegen). Ensure it's fresh.
 genBundledModules();
 
-const entries = ['parallel-jobs.ts', 'connector-flow.ts', 'logic-block-scope.ts'];
+const entries = ['parallel-jobs.ts', 'connector-flow.ts', 'logic-block-scope.ts', 'output-value-refs.ts'];
 let failed = false;
 for (const entry of entries) {
   const out = path.join(__dirname, '..', 'dist', `_engine_${entry.replace(/\.ts$/, '')}.mjs`);

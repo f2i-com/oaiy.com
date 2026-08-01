@@ -84,6 +84,9 @@ program
       status: res.status,
       jobId: res.jobId,
       results: res.results,
+      // The flow's own answer, beside the per-node map. A host reporting a run
+      // to whoever queued it wants THIS; `results` is this engine's working.
+      output: res.output,
       error: res.error,
     };
     if (process.env.OAIY_DEBUG) {

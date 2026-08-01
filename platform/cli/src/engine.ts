@@ -42,9 +42,23 @@ export interface RunResult {
   results: Record<string, unknown>;
   /** Full workflow context (everything, incl. internal `__` keys). */
   result: unknown;
+  /**
+   * What the flow's OUTPUT node declared, which is the flow's answer.
+   *
+   * Reported separately from `results` because a caller wants the flow's
+   * result, not a map of every node's working. A host that hands the whole
+   * per-node map back to whoever queued the run leaks this engine's internals
+   * into their data model, and anything they wrote against "the flow's result"
+   * then addresses the wrong object. `undefined` for a flow with no output
+   * node — an absent answer, which is not the same as an empty one.
+   */
+  output: unknown;
   error?: string;
   logs: unknown[];
 }
+
+/** The context slot the compiled output node assigns. */
+const OUTPUT_SLOT = '__output__';
 
 const TERMINAL = new Set(['completed', 'failed', 'aborted']);
 const DEFAULT_TIMEOUT_MS = 45 * 60 * 1000;
@@ -110,6 +124,10 @@ export async function runFlow(graph: WorkflowGraph, opts: RunOptions = {}): Prom
       jobId,
       results: (job?.nodeOutputs ?? {}) as Record<string, unknown>,
       result: job?.result,
+      output:
+        job?.result && typeof job.result === 'object'
+          ? (job.result as Record<string, unknown>)[OUTPUT_SLOT]
+          : undefined,
       error: success
         ? undefined
         : job?.error ?? (status === 'aborted' ? 'Run aborted (timed out?)' : 'Workflow failed'),
