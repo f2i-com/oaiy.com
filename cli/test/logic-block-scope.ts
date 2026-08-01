@@ -134,6 +134,75 @@ async function main(): Promise<void> {
     `status=${condResult.status} gate=${JSON.stringify(condResult.results?.['gate'])} error=${condResult.error ?? ''}`
   );
 
+  // The shape a linked provider writes EVERY block in: an IIFE wrapper with
+  // small named helpers inside it, each with its own `return`. Inlining that
+  // into do/while and rewriting every `return` to `break` compiled a break into
+  // a function body — "Illegal break statement", at compile, so the block never
+  // ran at all (live report 2026-08-01).
+  const iife: WorkflowGraph = {
+    nodes: [
+      {
+        id: 'cfg',
+        type: 'logic_block',
+        position: { x: 0, y: 0 },
+        data: {
+          expr: `(function () {
+  function text(v, max) {
+    if (v == null) return '';
+    return String(v).slice(0, max);
+  }
+  var rows = [{ answers: { greeting: 'Thank you for calling', active: 'yes' } }];
+  var cfg = {};
+  for (var i = 0; i < rows.length; i++) {
+    var a = rows[i].answers || {};
+    if (String(a.active || 'yes') !== 'no') { cfg = a; break; }
+  }
+  return { greeting: text(cfg.greeting, 80), settingsPayload: { persona: 'warm' } };
+})()`,
+        },
+      },
+    ],
+    edges: [],
+  } as WorkflowGraph;
+  const iifeResult = await runFlow(iife, { timeoutMs: 30_000 });
+  check(
+    'a block wrapped in an IIFE with nested helpers compiles and runs',
+    iifeResult.status === 'completed',
+    `status=${iifeResult.status} error=${iifeResult.error ?? ''}`
+  );
+  const built = iifeResult.results?.['cfg'] as Record<string, unknown> | undefined;
+  check(
+    'its helpers return normally and the block returns its object',
+    built?.greeting === 'Thank you for calling',
+    `got ${JSON.stringify(iifeResult.results?.['cfg'])}`
+  );
+  check(
+    'and a `break` inside a real loop still breaks that loop',
+    (built?.settingsPayload as Record<string, unknown> | undefined)?.persona === 'warm',
+    `got ${JSON.stringify(built?.settingsPayload)}`
+  );
+
+  // Early return from the top level must still stop the block.
+  const early = await runFlow(
+    {
+      nodes: [
+        {
+          id: 'e',
+          type: 'logic_block',
+          position: { x: 0, y: 0 },
+          data: { expr: 'if (true) { return "stopped"; }\nreturn "kept going";' },
+        },
+      ],
+      edges: [],
+    } as WorkflowGraph,
+    { timeoutMs: 30_000 }
+  );
+  check(
+    'an early top-level return still wins',
+    early.results?.['e'] === 'stopped',
+    `got ${JSON.stringify(early.results?.['e'])}`
+  );
+
   console.log(`logic-block-scope: ${passed} passed, ${failed} failed`);
   process.exit(failed ? 1 : 0);
 }

@@ -6,6 +6,60 @@
 
 import type { ModuleCompiler, ModuleCompilerContext } from 'oaiy-core/src/module-types';
 
+/**
+ * Is the whole block one parenthesised EXPRESSION — `(function () { … })()`
+ * being the shape a linked provider writes every block in?
+ *
+ * It matters because such a block's `return`s all belong to the function
+ * INSIDE it, not to the block: wrapping it in another function and calling that
+ * throws the value away, and rewriting its returns corrupts the nested
+ * function. The right handling is neither — evaluate it and take its value.
+ *
+ * Scans rather than pattern-matches, so a bracket inside a string or a comment
+ * cannot be mistaken for structure. Anything it is unsure about is treated as
+ * ordinary statements, which is the safe direction: that path still runs.
+ */
+function isParenthesisedExpression(src: string): boolean {
+  const code = src.trim();
+  if (!code.startsWith('(')) return false;
+  let depth = 0;
+  let i = 0;
+  let quote = '';
+  for (; i < code.length; i++) {
+    const c = code[i];
+    const next = code[i + 1];
+    if (quote) {
+      if (c === '\\') i++;
+      else if (c === quote) quote = '';
+      continue;
+    }
+    if (c === '"' || c === "'" || c === '`') { quote = c; continue; }
+    if (c === '/' && next === '/') {
+      const nl = code.indexOf('\n', i);
+      if (nl === -1) return false;
+      i = nl;
+      continue;
+    }
+    if (c === '/' && next === '*') {
+      const end = code.indexOf('*/', i + 2);
+      if (end === -1) return false;
+      i = end + 1;
+      continue;
+    }
+    if (c === '(') depth++;
+    else if (c === ')') {
+      depth--;
+      if (depth === 0) break;
+      if (depth < 0) return false;
+    }
+  }
+  if (depth !== 0 || i >= code.length) return false;
+  // Whatever follows the first group may only be a call — so
+  // `(function () { … })()` and `(a + b)` qualify, while two statements that
+  // merely begin with a bracket do not.
+  return /^\s*(\(\s*\))?\s*;?\s*$/.test(code.slice(i + 1));
+}
+
 const CoreUtilityCompiler: ModuleCompiler = {
   name: 'Utility',
 
@@ -237,11 +291,29 @@ const CoreUtilityCompiler: ModuleCompiler = {
         const asyncPrefix = hasAwait ? 'async ' : '';
         const awaitPrefix = hasAwait ? 'await ' : '';
 
-        if (hasReturn && hasAwait) {
+        // A block that IS one expression is evaluated as one, whatever returns
+        // it contains — they belong to the function inside it.
+        if (isParenthesisedExpression(userCode) && !hasAwait) {
+          code += `
+  // Logic block: a single expression, taken at its value
+  ${letOrAssign}${outputVar} = null;
+  {${scopedNames()}
+    ${outputVar} = ${userCode.trim().replace(/;\s*$/, '')};
+  }
+  workflow_context["${node.id}"] = ${outputVar};`;
+        } else if (hasReturn && hasAwait) {
           // Logic block with both return and await: inline the code using do/while(false) + break
           // Can't use async IIFE because the runtime's await→yield replacement breaks nested functions.
           // Transform "return X;" into "outputVar = (X); break;" for early-return support.
           // Process line-by-line to skip comment lines (avoid transforming "return" inside comments).
+          //
+          // KNOWN LIMIT, and the reason the no-await branch below does NOT do
+          // this: the rewrite cannot tell which function a `return` belongs to,
+          // so an AWAITING block that also declares a nested function still
+          // fails to compile with "Illegal break statement". Fixing it properly
+          // needs the await→yield transform to survive function boundaries;
+          // until then, awaiting blocks should keep their returns at the top
+          // level.
           const transformedCode = userCode.split('\n').map((ln: string) => {
             if (ln.trimStart().startsWith('//')) return ln;
             return ln
@@ -261,24 +333,28 @@ const CoreUtilityCompiler: ModuleCompiler = {
   }
   workflow_context["${node.id}"] = ${outputVar};`;
         } else if (hasReturn) {
-          // Logic block with return but no await: inline using do/while(false) + break
-          // Avoids IIFE for cleaner generated output and to keep parameter passing simple.
-          // Transform "return X;" into "outputVar = (X); break;" for early-return support.
-          // Process line-by-line to skip comment lines (avoid transforming "return" inside comments).
-          const transformedCode = userCode.split('\n').map((ln: string) => {
-            if (ln.trimStart().startsWith('//')) return ln;
-            return ln
-              .replace(/\breturn\s+([^;\n]+);?/g, `${outputVar} = ($1); break;`)
-              .replace(/\breturn\s*;?\s*$/, 'break;');
-          }).join('\n');
-
+          // Logic block with return and no await: run it as a real FUNCTION, so
+          // `return` is `return`.
+          //
+          // It used to be inlined into `do { … } while (false)` with every
+          // `return X;` rewritten to `out = (X); break;` line by line. That
+          // rewrite cannot tell which function a return belongs to, so a block
+          // holding any nested function — an IIFE wrapper, a small `function
+          // text(v) { return …; }` helper — compiled a `break` into a function
+          // body and died at compile with "Illegal break statement". A provider
+          // whose blocks are all written `(function () { … })()` had every one
+          // of them fail that way (live report 2026-08-01).
+          //
+          // A function needs no rewriting at all: early returns, nested
+          // helpers and returns inside loops all behave as written. The names
+          // the block is given stay in scope through the closure.
           code += `
-  // Logic block: inline with return (do/while pattern)
+  // Logic block: executed as a function so \`return\` means return
   ${letOrAssign}${outputVar} = null;
   {${scopedNames()}
-    do {
-    ${transformedCode}
-    } while (false);
+    ${outputVar} = (function () {
+${userCode}
+    })();
   }
   workflow_context["${node.id}"] = ${outputVar};`;
         } else {
