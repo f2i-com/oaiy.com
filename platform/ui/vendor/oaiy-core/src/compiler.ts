@@ -1301,13 +1301,25 @@ workflow_context;
       return moduleCompilerResult;
     }
 
-    // No module compiler handled this node - unknown node type
-    return `
-  // --- Node: ${node.id} (${node.type}) ---
-  // Unknown node type: ${node.type} - passing through input
-  ${letOrAssign}${outputVar} = ${inputVar};
-  workflow_context["${node.id}"] = ${outputVar};
-`;
+    // No module compiler handled this node.
+    //
+    // This REFUSES rather than passing the input through. Pass-through looked
+    // harmless and was not: a graph using a node type this build does not have
+    // ran to completion, skipped that node's whole job, and reported success.
+    // A flow that was supposed to write a record or call a connector then
+    // "succeeded" having done nothing at all — which is far harder to notice
+    // than a failure, and impossible to distinguish from real success.
+    //
+    // Refusing at COMPILE time, before anything runs, so the message names the
+    // node and no side effect has happened yet.
+    const known = this.moduleRegistry
+      ? Array.from(this.moduleRegistry.nodeToModule.keys()).sort().join(', ')
+      : '(no modules are loaded)';
+    throw new Error(
+      `This build has no implementation for the node type "${node.type}" (node "${node.id}"), ` +
+        `so the flow was not run. Running it would have skipped that node silently and ` +
+        `reported success. Node types available here: ${known}`
+    );
   }
   private topologicalSort(graph: WorkflowGraph): GraphNode[] {
     return topologicalSortUtil(graph);
