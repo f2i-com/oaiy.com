@@ -120,6 +120,216 @@ pub struct ConnectorDescriptor {
     /// for a provider with no flows, whose events then stay local.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub flows: Option<FlowsSpec>,
+    /// How an event on this desktop reaches the account's own LOGIC SCRIPTS —
+    /// a lane separate from flows. Omitted for a provider with no such notion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_logic: Option<AppLogicSpec>,
+}
+
+/// The account's app-logic lane: scripts the provider's apps carry, which turn
+/// one event into a list of EFFECTS this desktop performs.
+///
+/// A third mechanism, next to the local trigger dispatch and the flows lane.
+/// Flows are graphs the account runs; these are small scripts an app ships with
+/// itself, and they are how a transcript gets written at all — nothing else in
+/// this app implements that.
+///
+/// The whole point of this block is the same as [`FlowsSpec::nodes`]: a script
+/// returns effects named in ITS OWN vocabulary, and neither those names nor the
+/// field names inside them belong in this app. The provider declares both; the
+/// OPERATIONS are a small closed set.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AppLogicSpec {
+    /// Where the account's apps, their forms and their scripts are read from.
+    pub path: String,
+    /// The value of a script's hook that means "an event happened". A provider
+    /// may carry scripts for other moments entirely, and running one of those
+    /// on an event would perform work nobody asked for.
+    pub event_hook: String,
+    /// Create a record. `{formId}` is substituted.
+    pub submit_path: String,
+    /// Read records back, so an effect that names a record by a FIELD rather
+    /// than an id can find it. `{formId}` is substituted.
+    pub list_path: String,
+    /// Update a record. `{formId}` and `{id}` are substituted.
+    pub update_path: String,
+    /// How many records one match scans at most.
+    ///
+    /// The listing is not filterable, so a match is resolved by reading the
+    /// newest page and looking. Too small silently stops matching old records;
+    /// too large turns every correction into a large download.
+    #[serde(default = "default_app_logic_scan")]
+    pub match_scan_limit: u32,
+    /// What the fields of an effect — and of a record on the wire — are called.
+    pub fields: AppLogicFields,
+    /// What the parts of the fetched app list are called.
+    pub catalogue: AppLogicCatalogue,
+    /// The effect types this provider's scripts emit, and what each one means
+    /// in terms this desktop can actually perform.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub effects: Vec<AppLogicEffectSpec>,
+}
+
+fn default_app_logic_scan() -> u32 {
+    200
+}
+
+/// One effect type a provider's scripts emit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AppLogicEffectSpec {
+    /// The name the provider's scripts use for it.
+    pub effect_type: String,
+    /// What it does, from a closed set this desktop knows how to perform.
+    pub operation: AppLogicOperation,
+}
+
+/// The operations a provider may map its effect types onto.
+///
+/// Closed on purpose, and small, for the same reason [`FlowNodeOperation`] is:
+/// a script is remote input to this desktop — anyone who can publish an app can
+/// author one — so the set of things an effect can DO is fixed here, and the
+/// provider only chooses which of them its vocabulary maps to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AppLogicOperation {
+    /// Create a record.
+    SubmitRecord,
+    /// Update a record, found by id or by one of its own fields.
+    UpdateRecord,
+    /// Remember something under a key, so a redelivery can be recognised.
+    SetStorage,
+    /// Say something to the person at this machine.
+    Notify,
+    /// Call a plugin connector on this desktop — the same gate the relay uses.
+    ConnectorRequest,
+}
+
+/// What the parts of an effect are called.
+///
+/// Field names are data here for exactly the reason they are in
+/// [`TokenResponseSpec`]: providers disagree about them, and that disagreement
+/// must not become a branch in the code that performs the effect. Every name
+/// below is required — a blank one would read an effect field called "" and
+/// find nothing, on every event, silently.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AppLogicFields {
+    /// On an effect: which of the declared effect types this one is.
+    pub kind: String,
+    /// On an effect: which form the record belongs to, in the app's own
+    /// portable naming rather than the account's record ids.
+    pub form_key: String,
+    /// The record's values. Used both inside an effect and as the wrapper the
+    /// write body puts them in, because they are one idea on both sides.
+    pub record: String,
+    /// On an update effect: the record's id, when the script already knows it.
+    pub record_id: String,
+    /// On an update effect: the block naming a field to find the record by.
+    pub match_block: String,
+    /// Inside that block: which field, and what it must equal.
+    pub match_field: String,
+    pub match_value: String,
+    /// On an update effect: create the record when the match finds none.
+    pub upsert: String,
+    /// On a storage effect: the key, and the value stored under it.
+    pub storage_key: String,
+    pub storage_value: String,
+    /// On a notify effect: what to say, and how loudly.
+    pub message: String,
+    pub level: String,
+    /// On a connector effect: whose command, which command, and its body.
+    pub connector_id: String,
+    pub command: String,
+    pub payload: String,
+    /// In a listing reply: the array of records, and a record's own id.
+    pub items: String,
+    pub id: String,
+    /// On what a script RETURNS: the list of effects. One provider's scripts
+    /// answer `{ effects: [...] }`, another's might say `{ actions: [...] }`,
+    /// and a name spelled in the code would read a key that is not there and
+    /// perform nothing at all, on every event.
+    pub effects_list: String,
+}
+
+/// What the parts of the fetched app list are called.
+///
+/// The catalogue is as much the provider's vocabulary as an effect is: the
+/// wrapper around the apps, the block a set of scripts lives in, the key a form
+/// is named by. Spelling any of them in the code would make this lane work for
+/// exactly one provider while looking general — and the way it would fail for a
+/// second one is silence, because a key that is not there simply reads as an
+/// app with no scripts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AppLogicCatalogue {
+    /// In the reply: the array of installed apps.
+    pub apps: String,
+    /// On one of those: the block identifying the app, and the two names it
+    /// may be identified by. The id is preferred; the slug is the fallback.
+    pub app_block: String,
+    pub app_id: String,
+    pub app_slug: String,
+    /// On one of those: the block the scripts live in, and the array inside it.
+    pub logic_block: String,
+    pub scripts: String,
+    /// On one script: its name, WHEN it runs, and the JavaScript itself.
+    pub script_id: String,
+    pub script_hook: String,
+    pub script_source: String,
+    /// On an app: its forms, a form's own id, and the portable key the app's
+    /// scripts name that form by.
+    pub forms: String,
+    pub form_id: String,
+    pub form_key: String,
+}
+
+impl AppLogicCatalogue {
+    /// Every name, labelled, for the "nothing may be blank" rule.
+    fn all(&self) -> [(&'static str, &str); 12] {
+        [
+            ("apps", self.apps.as_str()),
+            ("appBlock", self.app_block.as_str()),
+            ("appId", self.app_id.as_str()),
+            ("appSlug", self.app_slug.as_str()),
+            ("logicBlock", self.logic_block.as_str()),
+            ("scripts", self.scripts.as_str()),
+            ("scriptId", self.script_id.as_str()),
+            ("scriptHook", self.script_hook.as_str()),
+            ("scriptSource", self.script_source.as_str()),
+            ("forms", self.forms.as_str()),
+            ("formId", self.form_id.as_str()),
+            ("formKey", self.form_key.as_str()),
+        ]
+    }
+}
+
+impl AppLogicFields {
+    /// Every name, labelled, for validation and for the "nothing may be blank"
+    /// rule. Listed once so a new field cannot be added and left unchecked.
+    fn all(&self) -> [(&'static str, &str); 18] {
+        [
+            ("kind", self.kind.as_str()),
+            ("formKey", self.form_key.as_str()),
+            ("record", self.record.as_str()),
+            ("recordId", self.record_id.as_str()),
+            ("matchBlock", self.match_block.as_str()),
+            ("matchField", self.match_field.as_str()),
+            ("matchValue", self.match_value.as_str()),
+            ("upsert", self.upsert.as_str()),
+            ("storageKey", self.storage_key.as_str()),
+            ("storageValue", self.storage_value.as_str()),
+            ("message", self.message.as_str()),
+            ("level", self.level.as_str()),
+            ("connectorId", self.connector_id.as_str()),
+            ("command", self.command.as_str()),
+            ("payload", self.payload.as_str()),
+            ("items", self.items.as_str()),
+            ("id", self.id.as_str()),
+            ("effectsList", self.effects_list.as_str()),
+        ]
+    }
 }
 
 /// The account's flow lane: read the bindings, reserve a run, and — when the
@@ -595,6 +805,125 @@ impl ConnectorDescriptor {
                 }
             }
         }
+        if let Some(a) = &self.app_logic {
+            for (label, path) in [
+                ("path", &a.path),
+                ("submitPath", &a.submit_path),
+                ("listPath", &a.list_path),
+                ("updatePath", &a.update_path),
+            ] {
+                if !path.starts_with('/') {
+                    return Err(format!(
+                        "connector {:?} appLogic {label} must begin with '/', got {path:?}",
+                        self.id
+                    ));
+                }
+            }
+            // A write path with no form placeholder would send every record of
+            // every form to one URL — which either fails on all of them or,
+            // worse, succeeds on the wrong form.
+            for (label, path) in [
+                ("submitPath", &a.submit_path),
+                ("listPath", &a.list_path),
+                ("updatePath", &a.update_path),
+            ] {
+                if !path.contains("{formId}") {
+                    return Err(format!(
+                        "connector {:?} appLogic {label} must contain the {{formId}} placeholder",
+                        self.id
+                    ));
+                }
+            }
+            // An update with no record placeholder would address the whole
+            // collection; a create or a listing WITH one would ask the provider
+            // for a record literally called "{id}".
+            if !a.update_path.contains("{id}") {
+                return Err(format!(
+                    "connector {:?} appLogic updatePath must contain the {{id}} placeholder",
+                    self.id
+                ));
+            }
+            for (label, path) in [
+                ("path", &a.path),
+                ("submitPath", &a.submit_path),
+                ("listPath", &a.list_path),
+            ] {
+                if path.contains("{id}") {
+                    return Err(format!(
+                        "connector {:?} appLogic {label} takes no {{id}} placeholder",
+                        self.id
+                    ));
+                }
+            }
+            if a.path.contains("{formId}") {
+                return Err(format!(
+                    "connector {:?} appLogic path takes no {{formId}} placeholder",
+                    self.id
+                ));
+            }
+            if a.event_hook.trim().is_empty() {
+                return Err(format!(
+                    "connector {:?} appLogic names no eventHook, so it could not tell an \
+                     event script from any other kind",
+                    self.id
+                ));
+            }
+            // Zero would match nothing and make every update look like a fresh
+            // record; a listing large enough to be a download is its own fault.
+            if a.match_scan_limit == 0 || a.match_scan_limit > 5000 {
+                return Err(format!(
+                    "connector {:?} appLogic matchScanLimit {} is out of range (1..5000)",
+                    self.id, a.match_scan_limit
+                ));
+            }
+            for (label, name) in a.fields.all() {
+                if name.trim().is_empty() {
+                    return Err(format!(
+                        "connector {:?} appLogic fields.{label} is blank, which would read a \
+                         field called \"\" on every effect",
+                        self.id
+                    ));
+                }
+            }
+            // Same rule one level up: a blank catalogue name reads a key that
+            // is not there, which is indistinguishable from an account with no
+            // apps — the lane would run nothing and say nothing.
+            for (label, name) in a.catalogue.all() {
+                if name.trim().is_empty() {
+                    return Err(format!(
+                        "connector {:?} appLogic catalogue.{label} is blank, which would read a \
+                         key called \"\" in the app list",
+                        self.id
+                    ));
+                }
+            }
+            let mut seen = std::collections::BTreeSet::new();
+            for effect in &a.effects {
+                if effect.effect_type.trim().is_empty() {
+                    return Err(format!(
+                        "connector {:?} appLogic has an effect with no type",
+                        self.id
+                    ));
+                }
+                // A duplicate would make which operation wins depend on file
+                // order, and the loser would fail in a way nothing explains.
+                if !seen.insert(effect.effect_type.as_str()) {
+                    return Err(format!(
+                        "connector {:?} appLogic declares the effect type {:?} twice",
+                        self.id, effect.effect_type
+                    ));
+                }
+            }
+            // A lane that maps nothing would run every script and then refuse
+            // every effect it produced — all the cost, none of the result.
+            if a.effects.is_empty() {
+                return Err(format!(
+                    "connector {:?} appLogic maps no effect types, so no script could do \
+                     anything",
+                    self.id
+                ));
+            }
+        }
         if o.token_response.credential_fields.is_empty() {
             return Err(format!(
                 "connector {:?} names no credential field, so a successful \
@@ -787,6 +1116,74 @@ mod tests {
         flows.nodes.push(first);
         let err = d.validate().unwrap_err();
         assert!(err.contains("twice"), "{err}");
+    }
+
+    #[test]
+    fn a_provider_names_its_own_effect_vocabulary_and_its_own_field_names() {
+        // The same point as the flow node block, one level down. A script
+        // returns effects named in ITS vocabulary, with ITS field names inside
+        // them — one provider says `formlogic.submitResponse` with `answers`,
+        // another might say `records.create` with `values`. None of those names
+        // belongs in this app, so they are all declared here and the OPERATIONS
+        // are the closed set.
+        let d = find(std::path::Path::new("/nonexistent"), "formlogic").unwrap();
+        let a = d.app_logic.expect("the connector must declare its app-logic lane");
+        assert!(!a.effects.is_empty());
+
+        let by_op = |op: AppLogicOperation| a.effects.iter().filter(|e| e.operation == op).count();
+        assert!(by_op(AppLogicOperation::SubmitRecord) >= 1);
+        assert!(by_op(AppLogicOperation::UpdateRecord) >= 1);
+        assert_eq!(by_op(AppLogicOperation::SetStorage), 1);
+        assert!(by_op(AppLogicOperation::Notify) >= 1);
+        assert_eq!(by_op(AppLogicOperation::ConnectorRequest), 1);
+
+        // Nothing in the CODE names a provider's effect type or field.
+        assert!(a.effects.iter().any(|e| e.effect_type == "formlogic.submitResponse"));
+        assert_eq!(a.fields.record, "answers");
+        assert_eq!(a.fields.kind, "type");
+        // …and every name is filled in, because a blank one reads a field
+        // called "" on every effect and finds nothing, silently.
+        assert!(a.fields.all().iter().all(|(_, v)| !v.trim().is_empty()));
+    }
+
+    #[test]
+    fn an_app_logic_lane_that_maps_nothing_is_refused() {
+        // It would run every script and then refuse every effect they produced:
+        // all of the cost, none of the result.
+        let mut d: ConnectorDescriptor = serde_json::from_str(BUILTIN[0]).unwrap();
+        d.app_logic.as_mut().unwrap().effects.clear();
+        let err = d.validate().unwrap_err();
+        assert!(err.contains("maps no effect types"), "{err}");
+    }
+
+    #[test]
+    fn the_record_paths_take_the_placeholders_they_need_and_no_others() {
+        // Every one of these is a silent failure: a write path with no form
+        // placeholder addresses one fixed form, an update with no record
+        // placeholder addresses the whole collection, and a catalogue path WITH
+        // a placeholder asks the provider for an app literally called "{id}".
+        let base: ConnectorDescriptor = serde_json::from_str(BUILTIN[0]).unwrap();
+
+        let mut no_form = base.clone();
+        no_form.app_logic.as_mut().unwrap().submit_path = "/api/v1/responses".into();
+        assert!(no_form.validate().unwrap_err().contains("submitPath"));
+
+        let mut no_record = base.clone();
+        no_record.app_logic.as_mut().unwrap().update_path = "/api/v1/forms/{formId}/responses".into();
+        assert!(no_record.validate().unwrap_err().contains("updatePath"));
+
+        let mut stray = base.clone();
+        stray.app_logic.as_mut().unwrap().path = "/api/v1/app-logic/{id}".into();
+        assert!(stray.validate().unwrap_err().contains("path"));
+
+        let mut blank = base.clone();
+        blank.app_logic.as_mut().unwrap().fields.record = "  ".into();
+        assert!(blank.validate().unwrap_err().contains("fields.record"));
+
+        let mut duplicated = base.clone();
+        let first = duplicated.app_logic.as_ref().unwrap().effects[0].clone();
+        duplicated.app_logic.as_mut().unwrap().effects.push(first);
+        assert!(duplicated.validate().unwrap_err().contains("twice"));
     }
 
     #[test]

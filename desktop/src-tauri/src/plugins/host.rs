@@ -391,6 +391,11 @@ pub struct PluginHost {
     link: Mutex<Option<crate::link::LinkHandle>>,
     /// The account's trigger bindings, cached between events.
     flow_bindings: crate::link::flows::FlowBindings,
+    /// The account's apps and their logic scripts, cached between events.
+    app_logic: crate::link::app_logic::Catalog,
+    /// Resolves the Node runtime the bundled CLI runs under, for the logic
+    /// scripts. Set after construction like the link, and for the same reason.
+    node: Mutex<Option<crate::services::node_runtime::NodeHandle>>,
 }
 
 /// What the host needs to answer `companion.admission`: this desktop's own
@@ -433,6 +438,8 @@ impl PluginHost {
             companion: Mutex::new(None),
             link: Mutex::new(None),
             flow_bindings: crate::link::flows::FlowBindings::new(),
+            app_logic: crate::link::app_logic::Catalog::new(),
+            node: Mutex::new(None),
         });
 
         // Event thread: ring + trigger dispatch + ack.
@@ -960,6 +967,86 @@ impl PluginHost {
         }
     }
 
+    /// Run the linked account's app LOGIC SCRIPTS against this event.
+    ///
+    /// A third mechanism, separate from the local trigger dispatch above and
+    /// from the flows lane beside it: the apps installed on the account carry
+    /// small scripts that turn an event into record writes, and this desktop
+    /// implements none of that itself. Without this call the flows fire and the
+    /// transcript stays empty.
+    ///
+    /// Best effort and non-fatal, on the same terms as the flow fan-out. It is
+    /// also the most expensive thing on this thread — the scripts run in the
+    /// bundled CLI, which is a process — so an account whose apps carry no
+    /// event scripts must and does cost nothing here.
+    fn fan_out_to_app_logic(&self, event: &crate::bridge::triggers::Event, envelope: &Value) {
+        let link = {
+            let guard = self.link.lock().unwrap_or_else(|e| e.into_inner());
+            match guard.as_ref() {
+                Some(l) => l.clone(),
+                None => return,
+            }
+        };
+        let Some(account) = link.account() else {
+            return;
+        };
+        let Some(spec) = crate::link::descriptor::find(link.data_dir(), &account.connector_id)
+            .and_then(|d| d.app_logic)
+        else {
+            return;
+        };
+        let apps = match self.app_logic.load(&account, &spec) {
+            Ok(a) => a,
+            Err(e) => {
+                log::warn!("app logic for {}: {e}", event.name);
+                return;
+            }
+        };
+        let storage = crate::link::app_logic::StorageStore::open(link.data_dir());
+        let node = self.node.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let connector = |connector_id: &str,
+                         command: &str,
+                         payload: Option<Value>,
+                         key: &str|
+         -> Result<Value, String> {
+            self.forward_connector(connector_id, command, payload, Some(key), CONNECTOR_TIMEOUT)
+                .map_err(|e| match e {
+                    ForwardError::Refused(refusal) => {
+                        format!("the {connector_id} plugin does not offer {command:?} ({refusal:?})")
+                    }
+                    ForwardError::NotRunning { plugin_id } => {
+                        format!("the {plugin_id} plugin is not running on this desktop")
+                    }
+                    ForwardError::Call(err) => {
+                        format!("the {connector_id} plugin did not answer {command:?}: {err:?}")
+                    }
+                    ForwardError::Internal(message) => message,
+                })
+        };
+        for outcome in crate::link::app_logic::handle_event(
+            &account, &spec, &apps, &storage, envelope, node.as_ref(), &connector,
+        ) {
+            // Every outcome, always. A script that quietly records nothing is
+            // the hardest kind of failure to find — the install looks fine and
+            // the console is simply empty.
+            match &outcome.detail {
+                Ok(what) => log::info!(
+                    "app logic {}/{} {}: {what}",
+                    outcome.app,
+                    outcome.script,
+                    outcome.effect
+                ),
+                Err(why) => log::warn!(
+                    "app logic {}/{} {} failed for {}: {why}",
+                    outcome.app,
+                    outcome.script,
+                    outcome.effect,
+                    event.name
+                ),
+            }
+        }
+    }
+
     /// The event thread's work: ring, triggers, ack.
     fn process_event(&self, plugin_id: &str, envelope: Value) {
         let name = envelope
@@ -998,6 +1085,14 @@ impl PluginHost {
         // the flow they wrote never ran. Before the ack, for the same reason
         // the local dispatch is.
         self.fan_out_to_linked_flows(&event, &envelope);
+        // …and to the account's app LOGIC SCRIPTS, which are what actually
+        // write a record. A separate mechanism from the flows above — the flows
+        // a user built are graphs the account runs, these are scripts an app
+        // ships with itself — and this desktop implements neither. Before the
+        // ack, for the same reason: an event acked before its records were
+        // written would be lost entirely if we crashed in between, and the
+        // scripts' own storage markers make the redelivery harmless.
+        self.fan_out_to_app_logic(&event, &envelope);
 
         let seq = self.events.seq.fetch_add(1, Ordering::Relaxed) + 1;
         if let Ok(mut ring) = self.events.ring.lock() {
@@ -1039,8 +1134,19 @@ impl PluginHost {
     pub fn set_link(&self, link: crate::link::LinkHandle) {
         *self.link.lock().unwrap_or_else(|e| e.into_inner()) = Some(link);
         // A fresh link may belong to a different account entirely; keeping the
-        // previous account's bindings would fire the wrong flows.
+        // previous account's bindings would fire the wrong flows, and keeping
+        // its logic scripts would write the previous account's records.
         self.flow_bindings.invalidate();
+        self.app_logic.invalidate();
+    }
+
+    /// Give the host the Node runtime the bundled CLI runs under.
+    ///
+    /// The app's logic scripts are executed through that CLI, and a packaged
+    /// install cannot assume `node` is on PATH — without this they would fail
+    /// `runtime_unavailable` on a machine where flows run perfectly well.
+    pub fn set_node_runtime(&self, node: Option<crate::services::node_runtime::NodeHandle>) {
+        *self.node.lock().unwrap_or_else(|e| e.into_inner()) = node;
     }
 
     /// Broker a companion admission for the plugin that hosts the WebRTC peer.

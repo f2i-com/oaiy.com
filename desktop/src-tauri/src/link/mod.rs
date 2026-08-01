@@ -13,6 +13,7 @@
 //! (`connector.aokie.sms.send`), which are command namespaces a plugin exposes.
 //! This is an account link — outbound, one per machine.
 
+pub mod app_logic;
 pub mod condition;
 pub mod data_node;
 pub mod descriptor;
