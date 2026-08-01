@@ -478,7 +478,7 @@ fn run_in(
     );
 
     match outcome {
-        CliOutcome::Succeeded(v) => Ok(v),
+        CliOutcome::Succeeded(v) => flow_answer(v),
         CliOutcome::Unreadable(why) => Err(Failure::new(FailureCode::NodeFailed, why)),
         CliOutcome::Failed { exit_code, detail } => Err(Failure::new(
             FailureCode::NodeFailed,
@@ -511,6 +511,46 @@ fn run_in(
                 None => message,
             },
         )),
+    }
+}
+
+/// What the CLI wrote, read as the flow's own report of itself.
+///
+/// The CLI writing a result file means the CLI ran, NOT that the flow worked.
+/// Its report carries the flow's own verdict, and a run that reports `success:
+/// false` with an error is a failed run — reporting it as done tells the person
+/// who queued it that their automation ran, when it did not, and leaves the
+/// error sitting in a payload nobody reads. Sixteen of the last sixty runs on
+/// this machine said `success: false` and every one was reported done.
+///
+/// On success the answer is the flow's OUTPUT, not the CLI's envelope. The
+/// envelope is this desktop's business — a job id and a map of every node's
+/// working — and handing it to the provider both leaks a private shape into
+/// their data model and puts the wrong object where their automations look for
+/// the flow's result. An older CLI that reports no `output` at all still has
+/// its envelope passed through, so a stale binary keeps working.
+fn flow_answer(v: Value) -> Result<Value, Failure> {
+    // Only an EXPLICIT denial counts. A report that simply does not carry the
+    // field says nothing about the flow, and treating silence as failure would
+    // fail every run made by a CLI older than this convention.
+    if v.get("success") == Some(&Value::Bool(false)) {
+        let message = v
+            .get("error")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| match v.get("status").and_then(Value::as_str) {
+                Some(s) => format!("the flow reported {s:?} without saying why"),
+                None => "the flow reported failure without saying why".to_string(),
+            });
+        return Err(Failure::new(FailureCode::NodeFailed, message));
+    }
+    match v.get("output") {
+        // `null` IS an answer — a flow may legitimately answer with nothing —
+        // so presence of the key decides, not truthiness.
+        Some(output) => Ok(output.clone()),
+        None => Ok(v),
     }
 }
 
@@ -937,6 +977,58 @@ mod tests {
         assert_eq!(json!(FailureCode::NodeFailed), json!("node_failed"));
         assert_eq!(json!(FailureCode::RunnerUnavailable), json!("runner_unavailable"));
         assert_eq!(json!(FailureCode::InvalidFlow), json!("invalid_flow"));
+    }
+
+    #[test]
+    fn a_flow_that_reports_its_own_failure_is_not_reported_as_done() {
+        // The live shape, verbatim: the CLI ran fine and wrote a result; the
+        // FLOW inside it did not. Reported done, this tells someone their
+        // automation ran and buries the reason it did not.
+        let failed = json!({
+            "jobId": "e80cc135",
+            "status": "failed",
+            "success": false,
+            "results": {},
+            "error": "llm_chat node \"summary\": returned HTTP 403: origin not allowed",
+        });
+        let err = flow_answer(failed).expect_err("a failed flow must not report done");
+        assert_eq!(err.code, FailureCode::NodeFailed);
+        assert!(err.message.contains("403"), "the reason must survive: {}", err.message);
+
+        // Failure with nothing said is still failure, and says so.
+        let mute = json!({ "success": false, "status": "aborted" });
+        let err = flow_answer(mute).expect_err("silence is not success");
+        assert!(err.message.contains("aborted"), "{}", err.message);
+    }
+
+    #[test]
+    fn a_successful_run_answers_with_the_flows_output_not_this_desktops_envelope() {
+        // What the provider's automations read as the flow's result is the
+        // OUTPUT node's declared value. Handing back the envelope instead puts
+        // a job id and every node's working where they look for the answer.
+        let ok = json!({
+            "jobId": "bbbe630b",
+            "status": "completed",
+            "success": true,
+            "results": { "in": { "event": {} }, "out": { "hasCall": true } },
+            "output": { "hasCall": true, "responseId": "resp-1" },
+        });
+        assert_eq!(
+            flow_answer(ok).expect("a successful flow reports its output"),
+            json!({ "hasCall": true, "responseId": "resp-1" })
+        );
+
+        // `null` is an answer a flow may legitimately give; presence decides.
+        let empty = json!({ "success": true, "output": null });
+        assert_eq!(flow_answer(empty).expect("null is an answer"), Value::Null);
+
+        // A CLI older than this convention carries no `output`. Its envelope is
+        // passed through rather than turned into an empty result.
+        let legacy = json!({ "success": true, "results": { "out": 1 } });
+        assert_eq!(
+            flow_answer(legacy.clone()).expect("a legacy report still succeeds"),
+            legacy
+        );
     }
 
     #[test]
