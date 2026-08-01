@@ -203,6 +203,66 @@ async function main(): Promise<void> {
     `got ${JSON.stringify(early.results?.['e'])}`
   );
 
+  // The names a graph addresses its data by. A block reading `nodes.settings`
+  // threw "nodes is not defined" at RUN time having compiled perfectly well —
+  // the flow then reported a node failure with no hint that the name was the
+  // problem (live report 2026-08-01).
+  const vocab: WorkflowGraph = {
+    nodes: [
+      { id: 'settings', type: 'logic_block', position: { x: 0, y: 0 }, data: { expr: 'return [{ answers: { greeting: "hi" } }];' } },
+      {
+        id: 'cfg',
+        type: 'logic_block',
+        position: { x: 100, y: 0 },
+        data: {
+          expr: `(function () {
+  var rows = nodes.settings || [];
+  return {
+    greeting: (rows[0] && rows[0].answers && rows[0].answers.greeting) || '',
+    callId: inputs.callId || '',
+    from: (event && event.data && event.data.from) || '',
+    viaUpstream: Array.isArray(upstream) ? upstream.length : -1,
+    appKnown: typeof app === 'object'
+  };
+})()`,
+        },
+      },
+    ],
+    edges: [{ source: 'settings', target: 'cfg' }],
+  } as WorkflowGraph;
+  const vocabResult = await runFlow(vocab, {
+    inputs: { callId: 'call_72a4607b', event: { data: { from: '0421285243' } } },
+    timeoutMs: 30_000,
+  });
+  check(
+    'a block can address nodes / inputs / event / upstream / app',
+    vocabResult.status === 'completed',
+    `status=${vocabResult.status} error=${vocabResult.error ?? ''}`
+  );
+  const got = vocabResult.results?.['cfg'] as Record<string, unknown> | undefined;
+  check('  nodes.<id> reads an earlier node', got?.greeting === 'hi', `got ${JSON.stringify(got)}`);
+  check('  inputs.<name> reads the run inputs', got?.callId === 'call_72a4607b', `got ${JSON.stringify(got?.callId)}`);
+  check('  event reads the triggering envelope', got?.from === '0421285243', `got ${JSON.stringify(got?.from)}`);
+  check('  upstream reads the wired input', got?.viaUpstream === 1, `got ${JSON.stringify(got?.viaUpstream)}`);
+  check('  app is declared rather than absent', got?.appKnown === true, `got ${JSON.stringify(got?.appKnown)}`);
+
+  // A condition is written by the same author against the same names.
+  const condVocab = await runFlow(
+    {
+      nodes: [
+        { id: 'lookup', type: 'logic_block', position: { x: 0, y: 0 }, data: { expr: 'return { found: true };' } },
+        { id: 'gate', type: 'condition', position: { x: 100, y: 0 }, data: { expr: 'nodes["lookup"].found && inputs.durationSeconds > 5' } },
+      ],
+      edges: [{ source: 'lookup', target: 'gate' }],
+    } as WorkflowGraph,
+    { inputs: { durationSeconds: 33 }, timeoutMs: 30_000 }
+  );
+  check(
+    'a condition can address the same names',
+    condVocab.results?.['gate'] === true,
+    `gate=${JSON.stringify(condVocab.results?.['gate'])} error=${condVocab.error ?? ''}`
+  );
+
   console.log(`logic-block-scope: ${passed} passed, ${failed} failed`);
   process.exit(failed ? 1 : 0);
 }
