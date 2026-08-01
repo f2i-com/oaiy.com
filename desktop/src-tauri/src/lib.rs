@@ -17,6 +17,33 @@ pub mod plugins;
 /// stable target. Shared by both binaries (the GUI and the headless server).
 pub const DESKTOP_PORT: u16 = 17972;
 
+/// The bearer this process shares with the child processes it spawns.
+///
+/// Privileged routes — `/api/ai/*` among them — fail closed on a missing
+/// `Origin`, because any non-browser caller can forge one. That is right for
+/// strangers and wrong for our own children: the CLI running a flow is spawned
+/// BY this process and is exactly as trusted as it is, but it has no browser
+/// origin at all, so every llm_chat node in a relayed flow came back
+/// `403 origin not allowed` and took the flow down with it.
+///
+/// Generated per process and never written down: not persisted, not in the
+/// paired-apps list, gone when this process exits. A leaked one buys an
+/// attacker nothing after a restart, and it can only be presented over
+/// loopback in the first place.
+pub fn internal_token() -> &'static str {
+    static TOKEN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    TOKEN.get_or_init(|| {
+        let mut bytes = [0u8; 32];
+        match getrandom::getrandom(&mut bytes) {
+            Ok(()) => bytes.iter().map(|b| format!("{b:02x}")).collect(),
+            // No OS randomness means no guessable token either: an empty one is
+            // never accepted (the guard rejects empty), so this degrades to the
+            // old behaviour rather than to a predictable credential.
+            Err(_) => String::new(),
+        }
+    })
+}
+
 /// File logging for the GUI build.
 ///
 /// The headless binary installs a stderr logger. The GUI installed NONE, so all

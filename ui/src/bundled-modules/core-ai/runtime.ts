@@ -17,6 +17,32 @@ function createAIMethods(ctx: RuntimeContext): Record<string, RuntimeMethod> {
 // Maximum endpoint URL length
 const MAX_ENDPOINT_LENGTH = 2048;
 
+/**
+ * The bearer for THIS desktop's own API, when that is who we are calling.
+ *
+ * `/api/ai/*` is a privileged route and the guard there fails closed on a
+ * missing `Origin` — deliberately, because any non-browser caller can forge
+ * one. A flow run is exactly such a caller: the desktop spawns the CLI, which
+ * has no browser origin at all, so every llm_chat node routed at the local
+ * gateway came back `403 origin not allowed` and the whole flow failed on it.
+ *
+ * Returned ONLY when the endpoint is the very server the token belongs to,
+ * compared by origin — a token that travelled to a third-party AI endpoint
+ * would be handing this machine's admin credential to a stranger. Absent in a
+ * browser (no `process`), where the webview's own origin is what is trusted.
+ */
+function localServerBearer(endpoint: string): string | null {
+  if (typeof process === 'undefined' || !process.env) return null;
+  const token = process.env.OAIY_SERVER_TOKEN;
+  const base = process.env.OAIY_SERVER_URL;
+  if (!token || !base) return null;
+  try {
+    return new URL(endpoint).origin === new URL(base).origin ? token : null;
+  } catch {
+    return null;
+  }
+}
+
 // Maximum prompt/body length (10MB - allows for base64 images)
 const MAX_CONTENT_LENGTH = 10 * 1024 * 1024;
 
@@ -1326,6 +1352,14 @@ async function chat(
       ctx.onNodeStatus?.(nodeId, 'completed');
       ctx.log('success', `[AI] Chat completed (via Claude-as-AI)`);
       return cleaned;
+    }
+
+    // Calling this desktop's own gateway needs its bearer: the route is
+    // privileged and a native caller has no Origin to be trusted by. Never
+    // overrides a key the node itself configured.
+    const localBearer = localServerBearer(endpoint);
+    if (localBearer && !('Authorization' in headers) && !('authorization' in headers)) {
+      headers['Authorization'] = `Bearer ${localBearer}`;
     }
 
     // Retry loop for 503 (service still loading) with progress logging
