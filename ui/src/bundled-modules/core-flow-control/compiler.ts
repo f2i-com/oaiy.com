@@ -9,6 +9,7 @@
  */
 
 import type { ModuleCompiler, ModuleCompilerContext } from 'oaiy-core/src/module-types';
+import { hasValue as hasOutputValue, resolveRefsExpr } from 'oaiy-core/src/value-refs';
 
 /**
  * Escapes special regex characters in a string.
@@ -16,68 +17,6 @@ import type { ModuleCompiler, ModuleCompilerContext } from 'oaiy-core/src/module
  */
 function escapeRegExpChars(str: string): string {
   return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
-/** Blank (absent / null / empty text) means "pass the upstream value through". */
-function hasOutputValue(value: unknown): boolean {
-  return value !== undefined && value !== null && value !== '';
-}
-
-/**
- * A JS expression that resolves a VALUE REFERENCE template at run time.
- *
- * Two spellings, one language, both of which appear in real graphs:
- *   - a selector as the WHOLE string — "$nodes.decide.hasCall", "$inputs.name",
- *     "$event" — which yields the referenced value itself, object or not;
- *   - "{{ nodes.summarise.content }}" embedded in free text, which stringifies.
- * The `$` inside braces is optional, matching how graphs are actually authored.
- *
- * Emitted as a self-contained IIFE rather than a shared helper so that a flow
- * with two output nodes cannot collide on a declaration — the same trap that
- * made two logic blocks in one graph fail to compile.
- *
- * An unresolvable selector yields `undefined` as a whole value (so the key
- * simply is not there, and a gate reading it stays false) and empty text when
- * interpolated. Both beat the alternative of writing the literal "$nodes.x.y"
- * into somebody's record, which reads as data and is silently wrong.
- */
-function resolveRefsExpr(template: unknown): string {
-  return `(function (t, ctx, ins) {
-    var read = function (root, path) {
-      var base = root === 'nodes' ? ctx
-        : root === 'inputs' ? ins
-        : (ins && typeof ins === 'object' && ins.event !== undefined) ? ins.event : ins;
-      var cur = base;
-      for (var i = 0; i < path.length; i++) {
-        if (cur === null || cur === undefined) return undefined;
-        cur = cur[path[i]];
-      }
-      return cur;
-    };
-    var parts = function (p) { return p ? p.slice(1).split('.') : []; };
-    var SEL = /^\\$(nodes|inputs|event)((?:\\.[^.\\s]+)*)$/;
-    var TPL = /\\{\\{\\s*\\$?(nodes|inputs|event)((?:\\.[^.\\s}]+)*)\\s*\\}\\}/g;
-    var walk = function (v, depth) {
-      if (depth > 32) return v;
-      if (typeof v === 'string') {
-        var m = SEL.exec(v);
-        if (m) return read(m[1], parts(m[2]));
-        return v.replace(TPL, function (_m, r, p) {
-          var got = read(r, parts(p));
-          if (got === null || got === undefined) return '';
-          return typeof got === 'object' ? JSON.stringify(got) : String(got);
-        });
-      }
-      if (Array.isArray(v)) return v.map(function (x) { return walk(x, depth + 1); });
-      if (v && typeof v === 'object') {
-        var o = {};
-        for (var k in v) if (Object.prototype.hasOwnProperty.call(v, k)) o[k] = walk(v[k], depth + 1);
-        return o;
-      }
-      return v;
-    };
-    return walk(t, 0);
-  })(${JSON.stringify(template)}, workflow_context, __inputs)`;
 }
 
 const CoreFlowControlCompiler: ModuleCompiler = {

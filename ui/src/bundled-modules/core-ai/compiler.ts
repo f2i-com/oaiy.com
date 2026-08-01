@@ -5,6 +5,7 @@
  */
 
 import type { ModuleCompiler, ModuleCompilerContext } from 'oaiy-core/src/module-types';
+import { resolveRefsExpr } from 'oaiy-core/src/value-refs';
 import { BUILT_IN_SERVICES, type CustomService } from '../core-service/examples';
 
 // Service-preset lookup mirrors core-service/compiler.ts:
@@ -140,16 +141,24 @@ const CoreAICompiler: ModuleCompiler = {
       provider === 'huggingface' ? hfDefaultEndpoint :
       provider === 'oaiy-local' ? oaiyLocalEndpoint :
       '';
-    const endpoint = escapeString(String(
+    // Both may carry VALUE REFERENCES: a graph that lets the operator choose
+    // the engine writes the endpoint as ".../providers/{{nodes.ctx.provider}}/…"
+    // and the reference is only meaningful once that node has answered. Frozen
+    // at compile time it was sent verbatim, and the gateway was asked for a
+    // provider literally named "{{nodes.ctx.backgroundProvider}}" — which is
+    // how every llm_chat node in a relayed flow failed.
+    const endpointRaw = String(
       data.endpoint
         || preset?.endpoint
         || providerDefaultEndpoint
         || projectSettings?.defaultAIEndpoint
         || ''
-    ));
-    const model = escapeString(String(
+    );
+    const modelRaw = String(
       data.model || preset?.model || projectSettings?.defaultAIModel || ''
-    ));
+    );
+    const endpointExpr = `String(${resolveRefsExpr(endpointRaw)} ?? '')`;
+    const modelExpr = `String(${resolveRefsExpr(modelRaw)} ?? '')`;
     // Check both apiKeyConstant (constant name) and apiKey (direct value)
     // HuggingFace LLM and OAIY Local don't need an API key (local services).
     const defaultApiKey =
@@ -265,8 +274,8 @@ const CoreAICompiler: ModuleCompiler = {
     "${systemPrompt}",
     _user_prompt_${sanitizedId},
     ${imagesExpr},
-    "${endpoint}",
-    "${model}",
+    ${endpointExpr},
+    ${modelExpr},
     "${apiKeyConstant}",
     ${streaming},
     ${maxTokens},
