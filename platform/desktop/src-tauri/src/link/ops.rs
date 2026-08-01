@@ -26,6 +26,16 @@ const FORWARD_TIMEOUT: Duration = Duration::from_secs(30);
 use crate::plugins::PluginRegistryHandle;
 use crate::services::registry::RegistryHandle;
 
+/// The idempotency key for a relayed connector command.
+///
+/// Namespaced so a plugin's journal shows where the key came from, and derived
+/// only from the command id so a redelivery of the SAME command produces the
+/// SAME key — which is the entire point. A generated one would be new each
+/// time and would defeat the journal it is meant to key.
+fn relay_idempotency_key(command_id: &str) -> String {
+    format!("relay-command-{command_id}")
+}
+
 /// Say why a plugin could not serve a relayed command, in words that name the
 /// fix rather than the internals.
 ///
@@ -55,7 +65,7 @@ pub fn dispatcher(
     plugins: PluginRegistryHandle,
     host: std::sync::Arc<crate::plugins::PluginHost>,
 ) -> super::relay::Dispatcher {
-    std::sync::Arc::new(move |connector: &str, command: &str, payload: &Value| {
+    std::sync::Arc::new(move |connector: &str, command: &str, payload: &Value, key: &str| {
         // A command names WHOSE verb it is. Anything that is not this app's own
         // belongs to a plugin's connector, and goes to that plugin through the
         // capability gate its manifest declares — the plugin decides what it
@@ -67,8 +77,16 @@ pub fn dispatcher(
         // refused, and the console got nothing back for the whole call.
         if connector != DESKTOP_CONNECTOR {
             let payload = (!payload.is_null()).then(|| payload.clone());
+            // The key is REQUIRED for anything with side effects. Passing none
+            // was the second half of this bug: read-only verbs like
+            // `call.current` went through, and every verb that DOES something —
+            // answering, hanging up, speaking — came back "requires an
+            // idempotencyKey" from the gate. The relayed command's own id is
+            // the right key: it is stable across redelivery, which is exactly
+            // what stops a blipped socket from answering the call twice.
+            let key = relay_idempotency_key(key);
             return host
-                .forward_connector(connector, command, payload, None, FORWARD_TIMEOUT)
+                .forward_connector(connector, command, payload, Some(&key), FORWARD_TIMEOUT)
                 .map_err(|e| forward_error_message(connector, command, e));
         }
         // The id the op acts on. `.list` needs none; everything else does, and
@@ -183,6 +201,21 @@ mod tests {
         let before = sorted.len();
         sorted.dedup();
         assert_eq!(before, sorted.len());
+    }
+
+    #[test]
+    fn a_relayed_command_keys_on_its_own_id_so_a_retry_cannot_act_twice() {
+        // A plugin refuses any side-effecting command with no key. Passing none
+        // let read-only verbs through while every verb that DOES something came
+        // back "requires an idempotencyKey" — so the call console could watch a
+        // call and never touch it.
+        let key = super::relay_idempotency_key("6b6e21fd-6cd2-41ed-ac1a-a30a91cbad3a");
+        assert!(key.contains("6b6e21fd-6cd2-41ed-ac1a-a30a91cbad3a"));
+        assert!(!key.trim().is_empty());
+        // Same command id, same key: that is what makes a redelivery harmless
+        // rather than a second answered call.
+        assert_eq!(key, super::relay_idempotency_key("6b6e21fd-6cd2-41ed-ac1a-a30a91cbad3a"));
+        assert_ne!(key, super::relay_idempotency_key("a-different-command"));
     }
 
     #[test]

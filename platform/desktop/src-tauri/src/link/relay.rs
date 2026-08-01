@@ -26,11 +26,17 @@ use super::descriptor::{self, RelaySpec};
 use super::{LinkHandle, LinkedAccount};
 
 /// Runs one command and returns its result, or an error to report back.
+/// Called with `(connector, command, payload, idempotency key)`.
 ///
 /// Boxed rather than a generic so the store can hold one without infecting every
 /// type that touches it. Blocking: relay work is service and plugin control,
 /// which is blocking anyway, and it runs on the relay's own thread.
-pub type Dispatcher = Arc<dyn Fn(&str, &str, &Value) -> Result<Value, String> + Send + Sync>;
+///
+/// The key is the relayed command's own id. It matters: a plugin refuses any
+/// side-effecting command that arrives without one, precisely so that a
+/// redelivered command cannot answer the call or send the message twice.
+pub type Dispatcher =
+    Arc<dyn Fn(&str, &str, &Value, &str) -> Result<Value, String> + Send + Sync>;
 
 /// A command waiting for this desktop.
 #[derive(Debug, Clone, Deserialize)]
@@ -211,6 +217,9 @@ fn serve(
         command.connector_id.as_deref().unwrap_or("desktop"),
         &command.command,
         &command.payload,
+        // The command's own id, which is stable across redelivery — the one
+        // property an idempotency key has to have.
+        &command.id,
     );
     if let Err(message) = &outcome {
         // Logged so the same failure is diagnosable from this side too, but see
@@ -463,7 +472,7 @@ mod tests {
         // NOT then report its own lane as broken — asking to start a plugin
         // that does not exist is a normal answer, not a connection fault.
         let (base, rx) = stub_relay(ONE_COMMAND, "200 OK");
-        let dispatch: Dispatcher = Arc::new(|_: &str, _: &str, _: &Value| -> Result<Value, String> {
+        let dispatch: Dispatcher = Arc::new(|_: &str, _: &str, _: &Value, _: &str| -> Result<Value, String> {
             Err("no plugin named \"ghost\"".to_string())
         });
 
@@ -489,7 +498,7 @@ mod tests {
         // while on the provider's website every action expires unanswered and
         // the user is sent hunting for a connection problem that is not there.
         let (base, _rx) = stub_relay(ONE_COMMAND, "500 Internal Server Error");
-        let dispatch: Dispatcher = Arc::new(|_: &str, _: &str, _: &Value| -> Result<Value, String> {
+        let dispatch: Dispatcher = Arc::new(|_: &str, _: &str, _: &Value, _: &str| -> Result<Value, String> {
             panic!("work must not run without a claim")
         });
 
@@ -507,7 +516,7 @@ mod tests {
         // the other one got there first. Surfacing that as a lane failure would
         // put a red banner on a machine that is working perfectly.
         let (base, rx) = stub_relay(ONE_COMMAND, "409 Conflict");
-        let dispatch: Dispatcher = Arc::new(|_: &str, _: &str, _: &Value| -> Result<Value, String> {
+        let dispatch: Dispatcher = Arc::new(|_: &str, _: &str, _: &Value, _: &str| -> Result<Value, String> {
             panic!("a lost claim must not run the work")
         });
 
@@ -529,7 +538,7 @@ mod tests {
         // Claim and complete are separate requests from the poll; a bearer
         // missing on either one turns into a 401 that reads as a dead link.
         let (base, rx) = stub_relay(ONE_COMMAND, "200 OK");
-        let dispatch: Dispatcher = Arc::new(|_: &str, _: &str, _: &Value| -> Result<Value, String> {
+        let dispatch: Dispatcher = Arc::new(|_: &str, _: &str, _: &Value, _: &str| -> Result<Value, String> {
             Ok(serde_json::json!({ "ok": true }))
         });
         poll_once(&account(base), &spec(), "oaiy-test", &dispatch).unwrap();
