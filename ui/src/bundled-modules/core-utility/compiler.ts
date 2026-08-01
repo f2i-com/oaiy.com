@@ -193,39 +193,35 @@ const CoreUtilityCompiler: ModuleCompiler = {
         code += `
   yield Utility.requireCodeExecute(["logic_block in node ${node.id}"]);`;
 
-        // Build named input variables and IIFE parameters
-        // Pass all inputs as IIFE parameters (avoids legacy closure capture pitfalls)
-        const iifeParams: string[] = [];
-        const iifeArgs: string[] = [];
-        let namedInputsSetup = '';
-
-        // Add primary input
-        iifeParams.push('_p_input');
-        iifeArgs.push(inputVar);
-        namedInputsSetup += `
-  let input = _p_input;`;
-
-        // Add other named inputs
-        for (const [handleId, sourceVar] of inputs) {
-          // Skip 'default' and 'input' since we already have 'input'
-          if (handleId !== 'default' && handleId !== 'input') {
-            const paramName = `_p_${handleId}`;
-            iifeParams.push(paramName);
-            iifeArgs.push(sourceVar);
-            namedInputsSetup += `
-  let ${handleId} = ${paramName};`;
+        // The names a logic block sees: `context`, `input`, one per connected
+        // handle, and `loop_index` inside a loop.
+        //
+        // These are emitted into the SCRIPT, and every branch below wraps them
+        // in a block for one reason: they used to sit at top level, so a flow
+        // with two logic blocks emitted `let context` twice and failed to
+        // compile outright with "Identifier 'context' has already been
+        // declared". Two logic blocks in one flow is an ordinary thing to
+        // build, and it could not run at all.
+        //
+        // The block also stops one node's named inputs leaking into a later
+        // node's code, which is how a typo used to silently read a neighbour's
+        // value instead of failing.
+        const scopedNames = (): string => {
+          let out = `
+    let context = workflow_context;
+    let input = ${inputVar};`;
+          for (const [handleId, sourceVar] of inputs) {
+            if (handleId !== 'default' && handleId !== 'input') {
+              out += `
+    let ${handleId} = ${sourceVar};`;
+            }
           }
-        }
-
-        // Expose loop index when inside a loop
-        if (isInLoop && loopStartId) {
-          const sanitizedLoopId = sanitizeId(loopStartId);
-          const loopIdxVar = `_i_${sanitizedLoopId}`;
-          iifeParams.push('_p_loop_index');
-          iifeArgs.push(loopIdxVar);
-          namedInputsSetup += `
-  let loop_index = _p_loop_index;`;
-        }
+          if (isInLoop && loopStartId) {
+            out += `
+    let loop_index = _i_${sanitizeId(loopStartId)};`;
+          }
+          return out;
+        };
 
         // Check if code has return statements - if so, wrap in IIFE for proper return behavior
         const hasReturn = /\breturn\b/.test(userCode);
@@ -246,28 +242,16 @@ const CoreUtilityCompiler: ModuleCompiler = {
               .replace(/\breturn\s*;?\s*$/, 'break;');
           }).join('\n');
 
+          // The output is declared OUTSIDE the block so the code inside can
+          // assign it and the rest of the script can read it.
           code += `
   // Logic block: inline with await + return (do/while pattern)
-  let context = workflow_context;`;
-          // Set up named inputs inline
-          code += `
-  let input = ${inputVar};`;
-          for (const [handleId, sourceVar] of inputs) {
-            if (handleId !== 'default' && handleId !== 'input') {
-              code += `
-  let ${handleId} = ${sourceVar};`;
-            }
-          }
-          if (isInLoop && loopStartId) {
-            const sanitizedLoopId = sanitizeId(loopStartId);
-            code += `
-  let loop_index = _i_${sanitizedLoopId};`;
-          }
-          code += `
   ${letOrAssign}${outputVar} = null;
-  do {
+  {${scopedNames()}
+    do {
     ${transformedCode}
-  } while (false);
+    } while (false);
+  }
   workflow_context["${node.id}"] = ${outputVar};`;
         } else if (hasReturn) {
           // Logic block with return but no await: inline using do/while(false) + break
@@ -283,28 +267,12 @@ const CoreUtilityCompiler: ModuleCompiler = {
 
           code += `
   // Logic block: inline with return (do/while pattern)
-  console.log("[LogicBlock Debug] (${node.id}) inputVar=${inputVar}, type:", typeof ${inputVar}, "preview:", JSON.stringify(${inputVar}).substring(0, 300));
-  let context = workflow_context;`;
-          // Set up named inputs inline
-          code += `
-  let input = ${inputVar};`;
-          for (const [handleId, sourceVar] of inputs) {
-            if (handleId !== 'default' && handleId !== 'input') {
-              code += `
-  let ${handleId} = ${sourceVar};`;
-            }
-          }
-          if (isInLoop && loopStartId) {
-            const sanitizedLoopId = sanitizeId(loopStartId);
-            code += `
-  let loop_index = _i_${sanitizedLoopId};`;
-          }
-          code += `
   ${letOrAssign}${outputVar} = null;
-  do {
+  {${scopedNames()}
+    do {
     ${transformedCode}
-  } while (false);
-  console.log("[LogicBlock Debug] (${node.id}) outputVar=${outputVar}, type:", typeof ${outputVar}, "preview:", JSON.stringify(${outputVar}).substring(0, 300));
+    } while (false);
+  }
   workflow_context["${node.id}"] = ${outputVar};`;
         } else {
           // No return statements - simple inline execution
@@ -316,65 +284,30 @@ const CoreUtilityCompiler: ModuleCompiler = {
             // Still need to evaluate inputs at the right point
             code += `
   // Logic block: inline JavaScript execution
-  let context = workflow_context;
-  let input = ${inputVar};`;
-            for (const [handleId, sourceVar] of inputs) {
-              if (handleId !== 'default' && handleId !== 'input') {
-                code += `
-  let ${handleId} = ${sourceVar};`;
-              }
-            }
-            if (isInLoop && loopStartId) {
-              const sanitizedLoopId = sanitizeId(loopStartId);
-              code += `
-  let loop_index = _i_${sanitizedLoopId};`;
-            }
-            code += `
-  ${letOrAssign}${outputVar} = ${userCode};
+  ${letOrAssign}${outputVar} = null;
+  {${scopedNames()}
+    ${outputVar} = ${userCode};
+  }
   workflow_context["${node.id}"] = ${outputVar};`;
           } else if (hasAwait) {
             // Multi-statement code with await but no return - inline directly
             // Can't use async IIFE because the runtime's await→yield replacement breaks nested functions.
             code += `
   // Logic block: multi-statement with await (inline)
-  let context = workflow_context;
-  let input = ${inputVar};`;
-            for (const [handleId, sourceVar] of inputs) {
-              if (handleId !== 'default' && handleId !== 'input') {
-                code += `
-  let ${handleId} = ${sourceVar};`;
-              }
-            }
-            if (isInLoop && loopStartId) {
-              const sanitizedLoopId = sanitizeId(loopStartId);
-              code += `
-  let loop_index = _i_${sanitizedLoopId};`;
-            }
-            code += `
-  ${userCode};
   ${letOrAssign}${outputVar} = null;
+  {${scopedNames()}
+    ${userCode};
+  }
   workflow_context["${node.id}"] = ${outputVar};`;
           } else {
             // Multi-statement code without return or await - inline directly
             // Avoids IIFE for cleaner generated output and to keep parameter passing simple.
             code += `
   // Logic block: multi-statement (no return, inline)
-  let context = workflow_context;
-  let input = ${inputVar};`;
-            for (const [handleId, sourceVar] of inputs) {
-              if (handleId !== 'default' && handleId !== 'input') {
-                code += `
-  let ${handleId} = ${sourceVar};`;
-              }
-            }
-            if (isInLoop && loopStartId) {
-              const sanitizedLoopId = sanitizeId(loopStartId);
-              code += `
-  let loop_index = _i_${sanitizedLoopId};`;
-            }
-            code += `
-  ${userCode};
   ${letOrAssign}${outputVar} = null;
+  {${scopedNames()}
+    ${userCode};
+  }
   workflow_context["${node.id}"] = ${outputVar};`;
           }
         }
