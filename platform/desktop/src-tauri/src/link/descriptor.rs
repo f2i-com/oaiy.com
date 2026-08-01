@@ -173,6 +173,15 @@ pub struct DesktopAiSpec {
     pub frames_path: String,
     /// Report the terminal status. `{id}` is substituted.
     pub complete_path: String,
+    /// Poll the sealed channel BACK from the web app — how a user's answer to
+    /// an approval reaches this desktop. `{id}` is substituted.
+    pub input_path: String,
+    /// The account's tool catalogue, and where to run one. Omitted for a
+    /// provider whose chat has no tools, which simply never offers any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools_catalog_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools_execute_path: Option<String>,
     #[serde(default = "default_relay_wait")]
     pub wait_seconds: u64,
     #[serde(default = "default_ai_batch")]
@@ -330,6 +339,7 @@ impl ConnectorDescriptor {
                 ("claimPath", &a.claim_path),
                 ("framesPath", &a.frames_path),
                 ("completePath", &a.complete_path),
+                ("inputPath", &a.input_path),
             ] {
                 if !path.starts_with('/') {
                     return Err(format!(
@@ -339,9 +349,32 @@ impl ConnectorDescriptor {
                 }
             }
             for (label, path) in [
+                ("toolsCatalogPath", &a.tools_catalog_path),
+                ("toolsExecutePath", &a.tools_execute_path),
+            ] {
+                if let Some(p) = path {
+                    if !p.starts_with('/') {
+                        return Err(format!(
+                            "connector {:?} desktopAi {label} must begin with '/', got {p:?}",
+                            self.id
+                        ));
+                    }
+                }
+            }
+            // Both or neither: a catalogue with nowhere to run a tool would
+            // offer the model things it can only fail to call.
+            if a.tools_catalog_path.is_some() != a.tools_execute_path.is_some() {
+                return Err(format!(
+                    "connector {:?} desktopAi names one of toolsCatalogPath/toolsExecutePath \
+                     without the other",
+                    self.id
+                ));
+            }
+            for (label, path) in [
                 ("claimPath", &a.claim_path),
                 ("framesPath", &a.frames_path),
                 ("completePath", &a.complete_path),
+                ("inputPath", &a.input_path),
             ] {
                 if !path.contains("{id}") {
                     return Err(format!(
