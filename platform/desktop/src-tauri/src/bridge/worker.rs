@@ -641,31 +641,56 @@ pub fn run_flow_cli(req: CliRequest, cancelled: &dyn Fn() -> bool) -> CliOutcome
 
     let capture = captured_err.lock().map(|g| g.clone()).unwrap_or_default();
 
-    match status {
-        Some(st) if st.success() => match std::fs::read_to_string(req.out_path) {
-            Ok(body) => match serde_json::from_str::<Value>(&body) {
-                Ok(v) => CliOutcome::Succeeded(v),
-                Err(e) => CliOutcome::Unreadable(format!(
-                    "the CLI reported success but its output is not JSON: {e}"
-                )),
-            },
-            Err(_) => CliOutcome::Unreadable(
-                "the CLI reported success but wrote no result file".to_string(),
-            ),
-        },
-        Some(st) => CliOutcome::Failed {
-            exit_code: st.code().unwrap_or(-1),
-            detail: tail_of(&capture, 1500),
-        },
-        None => CliOutcome::TimedOut,
+    let Some(st) = status else {
+        return CliOutcome::TimedOut;
+    };
+
+    // The RESULT FILE is the flow's own report, and it outranks the exit code.
+    //
+    // The runtime can die on the way out — a libuv teardown assertion on
+    // Windows (`UV_HANDLE_CLOSING`, exit 0xC0000409) fires AFTER the flow has
+    // finished and written its result. Judging by exit code alone threw that
+    // work away and reported a failure for a run that had completed, with a
+    // "detail" that was whatever the crash happened to leave in the pipe.
+    //
+    // Reading the file first is also the honest order: what the flow says it
+    // did is better evidence than how its host process happened to exit.
+    let reported = std::fs::read_to_string(req.out_path)
+        .ok()
+        .and_then(|body| serde_json::from_str::<Value>(&body).ok());
+    if let Some(v) = reported {
+        if !st.success() {
+            log::warn!(
+                "the OAIY CLI exited {} after writing a result; honouring the result",
+                st.code().unwrap_or(-1)
+            );
+        }
+        return CliOutcome::Succeeded(v);
+    }
+
+    if st.success() {
+        // Exit 0 and nothing to show for it is ours, not the flow's.
+        return CliOutcome::Unreadable(
+            "the CLI reported success but wrote no readable result file".to_string(),
+        );
+    }
+    CliOutcome::Failed {
+        exit_code: st.code().unwrap_or(-1),
+        detail: tail_of(&capture, 1500),
     }
 }
 
-/// Read a pipe to EOF, keeping at most [`MAX_CAPTURE`] bytes.
+/// Read a pipe to EOF, keeping the LAST [`MAX_CAPTURE`] bytes.
 ///
 /// The read must continue past the cap — stopping would refill the pipe and
-/// recreate the deadlock the cap exists to report on. Late bytes overwrite
-/// nothing; the buffer simply stops growing, and `tail_of` later keeps the end.
+/// recreate the deadlock the cap exists to report on.
+///
+/// The last bytes, not the first, and that is the whole point. This used to
+/// stop appending once full, so what survived was the START of the output. The
+/// engine announces every module it registers before a flow runs, which fills
+/// the cap on its own — so every failure was reported as a wall of
+/// registration notices and the actual error, printed last, was thrown away.
+/// Runs failed with no readable reason for it.
 fn drain_capped<R: std::io::Read>(mut reader: R, sink: &std::sync::Mutex<String>) {
     let mut buf = [0u8; 8192];
     loop {
@@ -673,18 +698,15 @@ fn drain_capped<R: std::io::Read>(mut reader: R, sink: &std::sync::Mutex<String>
             Ok(0) | Err(_) => break,
             Ok(n) => {
                 if let Ok(mut s) = sink.lock() {
-                    if s.len() < MAX_CAPTURE {
-                        let room = MAX_CAPTURE - s.len();
-                        let chunk = String::from_utf8_lossy(&buf[..n]);
-                        if chunk.len() <= room {
-                            s.push_str(&chunk);
-                        } else {
-                            let mut end = room;
-                            while end > 0 && !chunk.is_char_boundary(end) {
-                                end -= 1;
-                            }
-                            s.push_str(&chunk[..end]);
+                    s.push_str(&String::from_utf8_lossy(&buf[..n]));
+                    // Drop from the front, on a char boundary, so the buffer
+                    // holds a rolling window ending at the newest output.
+                    if s.len() > MAX_CAPTURE {
+                        let mut cut = s.len() - MAX_CAPTURE;
+                        while cut < s.len() && !s.is_char_boundary(cut) {
+                            cut += 1;
                         }
+                        s.drain(..cut);
                     }
                 }
             }
@@ -868,6 +890,40 @@ mod tests {
         for expected in ["OPENAI_API_KEY", "ANTHROPIC_API_KEY", "OAIY_HF_TOKEN", "AWS_SECRET_ACCESS_KEY"] {
             assert!(deny.contains(&expected), "{expected} must be denied to the CLI child");
         }
+    }
+
+    #[test]
+    fn a_flood_of_output_keeps_the_error_at_the_end_not_the_preamble() {
+        // The bug this pins, seen live: the engine announces every module it
+        // registers before a flow runs, which filled the capture on its own.
+        // What survived was that preamble, so every failed run was reported as
+        // a wall of registration notices with the real error — printed last —
+        // discarded. Runs failed with no readable reason.
+        let sink = std::sync::Mutex::new(String::new());
+        let noise = "[OAIYRuntime] Registered module 'Browser' with methods: …\n".repeat(4000);
+        let output = format!("{noise}Error: the thing that actually went wrong\n");
+        assert!(output.len() > MAX_CAPTURE * 2, "the flood must exceed the cap");
+        drain_capped(std::io::Cursor::new(output.into_bytes()), &sink);
+
+        let kept = sink.lock().unwrap().clone();
+        assert!(kept.len() <= MAX_CAPTURE, "the cap still holds: {}", kept.len());
+        assert!(
+            kept.contains("the thing that actually went wrong"),
+            "the END must survive, not the preamble"
+        );
+        assert!(tail_of(&kept, 1500).contains("the thing that actually went wrong"));
+    }
+
+    #[test]
+    fn a_rolling_capture_never_splits_a_character() {
+        // The window slides by bytes; a multi-byte char straddling the cut
+        // would corrupt the buffer and could panic on the next boundary op.
+        let sink = std::sync::Mutex::new(String::new());
+        let body = "é".repeat(MAX_CAPTURE); // 2 bytes each: guarantees straddling
+        drain_capped(std::io::Cursor::new(body.into_bytes()), &sink);
+        let kept = sink.lock().unwrap().clone();
+        assert!(kept.len() <= MAX_CAPTURE);
+        assert!(kept.chars().all(|c| c == 'é'), "no replacement chars");
     }
 
     #[test]
