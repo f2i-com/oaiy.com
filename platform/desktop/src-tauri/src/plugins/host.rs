@@ -928,7 +928,9 @@ impl PluginHost {
                 return;
             }
         };
-        let (fire, skipped) = crate::link::flows::select(&bindings, &event.name);
+        // The envelope, not the internal event: conditions are authored against
+        // `event.data.*` as it appears on the wire.
+        let (fire, skipped) = crate::link::flows::select(&bindings, &event.name, envelope);
         for (binding, reason) in skipped {
             log::info!(
                 "flow binding {} did not fire for {}: {}",
