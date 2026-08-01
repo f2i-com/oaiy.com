@@ -11,9 +11,43 @@
 //! more general.
 
 use serde_json::{json, Value};
+use std::time::Duration;
+
+/// The connector id that means "this app itself" rather than a plugin.
+pub const DESKTOP_CONNECTOR: &str = "desktop";
+
+/// How long a plugin gets to answer a relayed connector command.
+///
+/// Comfortably under the provider's own command TTL, so a plugin that hangs
+/// produces a typed timeout the caller can read rather than a command that
+/// expires looking like the desktop never picked it up.
+const FORWARD_TIMEOUT: Duration = Duration::from_secs(30);
 
 use crate::plugins::PluginRegistryHandle;
 use crate::services::registry::RegistryHandle;
+
+/// Say why a plugin could not serve a relayed command, in words that name the
+/// fix rather than the internals.
+///
+/// This message is what the user reads on the provider's website, so "the
+/// aokie plugin is not running on this desktop" beats a debug-printed enum.
+fn forward_error_message(
+    connector: &str,
+    command: &str,
+    error: crate::plugins::ForwardError,
+) -> String {
+    use crate::plugins::ForwardError;
+    match error {
+        ForwardError::Refused(refusal) => format!(
+            "the {connector} plugin does not offer {command:?} ({refusal:?})"
+        ),
+        ForwardError::NotRunning { plugin_id } => {
+            format!("the {plugin_id} plugin is not running on this desktop")
+        }
+        ForwardError::Call(e) => format!("the {connector} plugin did not answer {command:?}: {e:?}"),
+        ForwardError::Internal(message) => message,
+    }
+}
 
 /// Build the dispatcher the relay worker calls.
 pub fn dispatcher(
@@ -21,7 +55,22 @@ pub fn dispatcher(
     plugins: PluginRegistryHandle,
     host: std::sync::Arc<crate::plugins::PluginHost>,
 ) -> super::relay::Dispatcher {
-    std::sync::Arc::new(move |command: &str, payload: &Value| {
+    std::sync::Arc::new(move |connector: &str, command: &str, payload: &Value| {
+        // A command names WHOSE verb it is. Anything that is not this app's own
+        // belongs to a plugin's connector, and goes to that plugin through the
+        // capability gate its manifest declares — the plugin decides what it
+        // exposes, exactly as it does for a local caller.
+        //
+        // Matching the verb alone and ignoring this was a real bug: the
+        // provider's call console polls `call.current` on the `aokie`
+        // connector, every one was measured against the desktop's own list and
+        // refused, and the console got nothing back for the whole call.
+        if connector != DESKTOP_CONNECTOR {
+            let payload = (!payload.is_null()).then(|| payload.clone());
+            return host
+                .forward_connector(connector, command, payload, None, FORWARD_TIMEOUT)
+                .map_err(|e| forward_error_message(connector, command, e));
+        }
         // The id the op acts on. `.list` needs none; everything else does, and
         // an absent one must refuse rather than act on some default.
         let target = |field: &str| -> Result<String, String> {
@@ -91,9 +140,12 @@ pub fn dispatcher(
                 }
             }
             // Named refusal, not a generic fallthrough: a provider that grows a
-            // new op must not silently reach something here that was never
-            // meant to be remotely reachable.
-            other => Err(format!("this desktop does not serve the remote op {other:?}")),
+            // new op on the DESKTOP connector must not silently reach something
+            // here that was never meant to be remotely reachable. A plugin's
+            // connector is a different matter — that went to the plugin above.
+            other => Err(format!(
+                "this desktop does not serve the remote op {other:?} on the desktop connector"
+            )),
         }
     })
 }
@@ -131,6 +183,23 @@ mod tests {
         let before = sorted.len();
         sorted.dedup();
         assert_eq!(before, sorted.len());
+    }
+
+    #[test]
+    fn a_plugins_own_verbs_are_not_measured_against_the_desktops_list() {
+        // `call.current`, `dongle.list`, `phone.listPaired` and friends belong
+        // to the aokie plugin, not to this app. Refusing them because they are
+        // not in the desktop's list is what left the provider's call console
+        // blank for a whole call.
+        for op in ["call.current", "dongle.list", "phone.listPaired", "settings.get"] {
+            assert!(
+                !super::tests::KNOWN_OPS.contains(&op),
+                "{op} is a plugin verb and must not be in the desktop list"
+            );
+        }
+        // …and the desktop's own list is still exactly what it was.
+        assert!(KNOWN_OPS.contains(&"services.list"));
+        assert_eq!(super::DESKTOP_CONNECTOR, "desktop");
     }
 
     #[test]
