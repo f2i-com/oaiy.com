@@ -183,6 +183,45 @@ impl FlowBindings {
     }
 }
 
+/// What the run is started with.
+///
+/// The whole envelope goes under `event`, because an author's `$event.data.…`
+/// expects it there. The binding's INPUT MAP is applied on top: it names the
+/// flow's own inputs — "callId" from "$event.data.callId" — and it is what
+/// makes `$inputs.callId` mean anything once the flow is running.
+///
+/// Dropping it is not a small loss. Seventeen of this account's nineteen
+/// bindings declare one, and while it was discarded every flow that named its
+/// trigger's fields ran blind: the receptionist could not be told which call to
+/// configure, so it answered and hung up.
+///
+/// The map cannot shadow `event` — a flow reading `$event` must get the
+/// envelope whatever an input happens to be called.
+fn input_snapshot(binding: &Binding, spec: &FlowsSpec, envelope: &Value) -> Value {
+    let mapped = match (spec.selectors.as_ref(), spec.input_map_field.as_deref()) {
+        (Some(selectors), Some(field)) => match binding.field(field) {
+            Some(map) => super::result_actions::build_inputs(
+                selectors,
+                map,
+                &super::result_actions::Scope {
+                    event: Some(envelope),
+                    ..super::result_actions::Scope::default()
+                },
+            ),
+            None => json!({}),
+        },
+        // A provider that describes neither still gets the envelope, which is
+        // what this desktop sent before input maps were applied at all.
+        _ => json!({}),
+    };
+    let mut out = match mapped {
+        Value::Object(map) => map,
+        _ => serde_json::Map::new(),
+    };
+    out.insert("event".to_string(), envelope.clone());
+    Value::Object(out)
+}
+
 fn fetch(account: &LinkedAccount, spec: &FlowsSpec) -> Result<Vec<Binding>, String> {
     let http = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(20))
@@ -319,9 +358,7 @@ pub fn reserve(
         "triggerEvent": event_name,
         "correlationId": correlation_id,
         "idempotencyKey": idempotency_key(&binding.id, event_idempotency_key),
-        // The whole envelope, under `event` — the shape a flow's selectors
-        // already expect, so an author's `$event.data.…` resolves unchanged.
-        "inputSnapshot": { "event": envelope },
+        "inputSnapshot": input_snapshot(binding, spec, envelope),
         // QUEUED, deliberately. This desktop does not execute the provider's
         // flow graph; it asks the account to, and whatever runtime already
         // claims queued runs picks it up. Reserving unqueued would insert a row
@@ -380,6 +417,63 @@ mod tests {
             condition: None,
             extra: serde_json::Map::new(),
         }
+    }
+
+    /// The shipped provider, so the test reads the real names rather than ones
+    /// invented here — the point of the descriptor is that these are data.
+    fn shipped_flows() -> FlowsSpec {
+        super::super::descriptor::builtin()
+            .into_iter()
+            .find_map(|c| c.flows)
+            .expect("the built-in connector describes its flows lane")
+    }
+
+    #[test]
+    fn a_run_is_started_with_the_inputs_its_binding_maps() {
+        // The receptionist answered and hung up because its flow asked the
+        // plugin to configure `$inputs.callId` and nothing had ever built
+        // `inputs`. Seventeen of nineteen live bindings declare a map.
+        let spec = shipped_flows();
+        let field = spec
+            .input_map_field
+            .clone()
+            .expect("the provider names its input map");
+        let mut b = binding("b1", "aokie.call.caller_id");
+        b.extra.insert(
+            field,
+            json!({ "from": "$event.data.from", "callId": "$event.data.callId" }),
+        );
+        let envelope = json!({
+            "name": "aokie.call.caller_id",
+            "data": { "from": "0421285243", "callId": "call_5089e2ff" }
+        });
+
+        let snapshot = input_snapshot(&b, &spec, &envelope);
+        assert_eq!(snapshot["callId"], json!("call_5089e2ff"));
+        assert_eq!(snapshot["from"], json!("0421285243"));
+        // The envelope still rides along: an author's `$event.data.…` must keep
+        // resolving whatever the map is called.
+        assert_eq!(snapshot["event"]["data"]["callId"], json!("call_5089e2ff"));
+
+        // A binding with no map still gets the envelope, which is all this
+        // desktop sent before maps were applied at all.
+        let bare = binding("b2", "aokie.call.ended");
+        let plain = input_snapshot(&bare, &spec, &envelope);
+        assert_eq!(plain["event"]["data"]["from"], json!("0421285243"));
+        assert_eq!(plain.as_object().map(|m| m.len()), Some(1));
+    }
+
+    #[test]
+    fn an_input_named_event_cannot_hide_the_envelope() {
+        // A flow reading `$event` must get the envelope whatever an input
+        // happens to be called, or the map silently blinds the whole graph.
+        let spec = shipped_flows();
+        let field = spec.input_map_field.clone().unwrap();
+        let mut b = binding("b3", "aokie.call.ended");
+        b.extra.insert(field, json!({ "event": "$event.data.from" }));
+        let envelope = json!({ "name": "aokie.call.ended", "data": { "from": "0421285243" } });
+        let snapshot = input_snapshot(&b, &spec, &envelope);
+        assert_eq!(snapshot["event"]["data"]["from"], json!("0421285243"));
     }
 
     #[test]
