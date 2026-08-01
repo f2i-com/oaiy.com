@@ -376,7 +376,17 @@ async fn main() {
     // Execute the flow runs the account has queued. The other half of the flows
     // lane: without it this box reserves runs and then waits for a runtime that
     // may not exist, and every one of them sits queued.
-    oaiy_desktop_lib::link::flow_runner::spawn(link.clone(), Some(node_runtime.clone()));
+    oaiy_desktop_lib::link::flow_runner::spawn(
+        link.clone(),
+        Some(node_runtime.clone()),
+        // A binding's post-run actions may call a connector, through the same
+        // dispatcher and gate the relay uses.
+        Some(oaiy_desktop_lib::link::ops::dispatcher(
+            registry.clone(),
+            bridge.plugins.clone(),
+            bridge.host.clone(),
+        )),
+    );
     // Answer the sealed chat turns the provider's web app relays. Without it
     // the website cannot encrypt to this machine at all and says the desktop
     // has published no key.

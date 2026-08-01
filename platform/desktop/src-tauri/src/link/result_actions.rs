@@ -464,6 +464,196 @@ pub fn attach_errors(spec: &ResultActionsSpec, result: Value, errors: &[String])
     Value::Object(map)
 }
 
+/// What performing an action needs from the outside world.
+///
+/// A trait rather than concrete calls so the ordering and reporting below can
+/// be tested without a network or a plugin — the part most worth testing is
+/// which actions run, in what order, and what happens when one fails.
+pub trait Perform {
+    /// Create a record; returns its id when the provider reports one.
+    fn submit(&self, form_id: &str, record: &Value) -> Result<Option<String>, String>;
+    /// Update a record.
+    fn update(&self, form_id: &str, record_id: &str, record: &Value) -> Result<(), String>;
+    /// Say something at this machine.
+    fn notify(&self, message: &str);
+    /// Call a plugin connector, under a key that makes a retry harmless.
+    fn connector(
+        &self,
+        connector_id: &str,
+        command: &str,
+        payload: &Value,
+        idempotency_key: &str,
+    ) -> Result<Value, String>;
+}
+
+/// Perform a binding's actions against a finished run, in order.
+///
+/// Returns what to append to the run's reported result. ORDER IS THE CONTRACT:
+/// actions are written to run in sequence and later ones legitimately depend on
+/// earlier ones — a submit that creates the record a following update patches.
+///
+/// A failure does NOT stop the rest. That is the reference's behaviour and it
+/// is the right one here: the actions in a binding are independent errands, and
+/// abandoning the remaining four because the second one's form was deleted
+/// loses work that would have succeeded. Each failure is collected and reported
+/// with the run instead.
+pub fn perform_all(
+    spec: &ResultActionsSpec,
+    actions: &[Value],
+    scope: &Scope,
+    run_key: &str,
+    doer: &dyn Perform,
+) -> Vec<String> {
+    let (planned, mut errors) = plan_all(spec, actions, scope);
+    for (index, action) in planned {
+        let outcome = match &action {
+            Planned::Skipped => Ok(()),
+            Planned::Submit { form_id, record } => doer.submit(form_id, record).map(|_| ()),
+            Planned::Update {
+                form_id,
+                record_id,
+                record,
+            } => doer.update(form_id, record_id, record),
+            Planned::Notify { message } => {
+                doer.notify(message);
+                Ok(())
+            }
+            Planned::Connector {
+                connector_id,
+                command,
+                payload,
+            } => doer
+                .connector(connector_id, command, payload, &action_key(run_key, index))
+                .map(|_| ()),
+        };
+        if let Err(why) = outcome {
+            errors.push(format!("{}: {why}", planned_name(&action, index)));
+        }
+    }
+    errors
+}
+
+/// The key under which one action's connector call is journalled.
+///
+/// Built from the RUN's own key, which the provider derives from the binding
+/// and the triggering event, plus this action's position. Stable across a
+/// retry of the same logical event — a redelivered call.ended must not send a
+/// second SMS — and distinct between two actions of one binding, which would
+/// otherwise collapse into each other and silently perform only the first.
+fn action_key(run_key: &str, index: usize) -> String {
+    format!("{run_key}#action{}", index + 1)
+}
+
+fn planned_name(action: &Planned, index: usize) -> String {
+    let what = match action {
+        Planned::Skipped => "action",
+        Planned::Submit { .. } => "record write",
+        Planned::Update { .. } => "record update",
+        Planned::Notify { .. } => "message",
+        Planned::Connector { command, .. } => return format!("{command}"),
+    };
+    format!("{what} {}", index + 1)
+}
+
+/// Performing actions for real: records over the provider's API, connector
+/// commands through the same gate the relay uses.
+pub struct Live<'a> {
+    pub account: &'a super::LinkedAccount,
+    pub spec: &'a ResultActionsSpec,
+    /// Absent on a runtime with no plugin host — a connector action then fails
+    /// and says so, rather than being quietly dropped.
+    pub connector: Option<&'a super::relay::Dispatcher>,
+}
+
+impl Live<'_> {
+    fn client() -> Result<reqwest::blocking::Client, String> {
+        reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .map_err(|e| format!("could not build the client: {e}"))
+    }
+
+    fn refusal(status: reqwest::StatusCode, payload: &Value, doing: &str) -> String {
+        let message = payload
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("no reason given");
+        format!(
+            "the provider refused to {doing}: HTTP {}: {message}",
+            status.as_u16()
+        )
+    }
+}
+
+impl Perform for Live<'_> {
+    fn submit(&self, form_id: &str, record: &Value) -> Result<Option<String>, String> {
+        let url = super::oauth::join(
+            &self.account.base_url,
+            &self.spec.submit_path.replace("{formId}", form_id),
+        );
+        let resp = Self::client()?
+            .post(&url)
+            .bearer_auth(&self.account.credential)
+            .json(&json!({ &self.spec.fields.record: record }))
+            .send()
+            .map_err(|e| format!("could not reach the provider to write the record: {e}"))?;
+        let status = resp.status();
+        let payload: Value = resp.json().unwrap_or(Value::Null);
+        if !status.is_success() {
+            return Err(Self::refusal(status, &payload, "write the record"));
+        }
+        Ok(payload
+            .get(&self.spec.fields.id)
+            .or_else(|| payload.get("response").and_then(|r| r.get(&self.spec.fields.id)))
+            .and_then(Value::as_str)
+            .map(str::to_string))
+    }
+
+    fn update(&self, form_id: &str, record_id: &str, record: &Value) -> Result<(), String> {
+        let url = super::oauth::join(
+            &self.account.base_url,
+            &self
+                .spec
+                .update_path
+                .replace("{formId}", form_id)
+                .replace("{id}", record_id),
+        );
+        let resp = Self::client()?
+            .put(&url)
+            .bearer_auth(&self.account.credential)
+            .json(&json!({ &self.spec.fields.record: record }))
+            .send()
+            .map_err(|e| format!("could not reach the provider to update the record: {e}"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let payload: Value = resp.json().unwrap_or(Value::Null);
+            return Err(Self::refusal(status, &payload, "update the record"));
+        }
+        Ok(())
+    }
+
+    fn notify(&self, message: &str) {
+        // Reaches the log, not the user. Said plainly rather than pretended:
+        // the toast lane a script would need does not exist on this side yet.
+        log::info!("flow action says: {message}");
+    }
+
+    fn connector(
+        &self,
+        connector_id: &str,
+        command: &str,
+        payload: &Value,
+        idempotency_key: &str,
+    ) -> Result<Value, String> {
+        let Some(dispatch) = self.connector else {
+            return Err(
+                "this runtime has no plugin host, so the command was not run".to_string()
+            );
+        };
+        dispatch(connector_id, command, payload, idempotency_key)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -747,6 +937,151 @@ mod tests {
 
         // Nothing failed, nothing added.
         assert_eq!(attach_errors(&s, json!({ "ok": true }), &[]), json!({ "ok": true }));
+    }
+
+    /// Records what was asked of it, and fails whichever calls it is told to.
+    #[derive(Default)]
+    struct Spy {
+        done: std::cell::RefCell<Vec<String>>,
+        keys: std::cell::RefCell<Vec<String>>,
+        fail: Vec<&'static str>,
+    }
+
+    impl Perform for Spy {
+        fn submit(&self, form_id: &str, _record: &Value) -> Result<Option<String>, String> {
+            self.done.borrow_mut().push(format!("submit:{form_id}"));
+            if self.fail.contains(&"submit") {
+                return Err("the form is gone".into());
+            }
+            Ok(Some("new-1".into()))
+        }
+        fn update(&self, form_id: &str, record_id: &str, _record: &Value) -> Result<(), String> {
+            self.done
+                .borrow_mut()
+                .push(format!("update:{form_id}/{record_id}"));
+            if self.fail.contains(&"update") {
+                return Err("no such record".into());
+            }
+            Ok(())
+        }
+        fn notify(&self, message: &str) {
+            self.done.borrow_mut().push(format!("notify:{message}"));
+        }
+        fn connector(
+            &self,
+            connector_id: &str,
+            command: &str,
+            _payload: &Value,
+            idempotency_key: &str,
+        ) -> Result<Value, String> {
+            self.done
+                .borrow_mut()
+                .push(format!("connector:{connector_id}/{command}"));
+            self.keys.borrow_mut().push(idempotency_key.to_string());
+            if self.fail.contains(&"connector") {
+                return Err("the plugin refused".into());
+            }
+            Ok(json!({}))
+        }
+    }
+
+    fn live_actions() -> Vec<Value> {
+        vec![
+            json!({ "form": "tasks", "type": "formlogic.submitResponse",
+                    "when": "$result.hasTask", "answers": "$result.task" }),
+            json!({ "type": "connector.request", "when": "$result.hasSms", "command": "sms.send",
+                    "payload": { "to": "$result.sms.to" }, "connectorId": "aokie" }),
+            json!({ "form": "calls", "type": "formlogic.updateResponse",
+                    "when": "$result.hasCall", "answers": "$result.callUpdate",
+                    "responseId": "$result.responseId" }),
+            json!({ "type": "formlogic.toast", "message": "done {{result.responseId}}" }),
+        ]
+    }
+
+    fn live_result() -> Value {
+        json!({
+            "hasTask": true, "task": { "title": "Call back" },
+            "hasSms": true, "sms": { "to": "0421285243" },
+            "hasCall": true, "callUpdate": { "summary": "ok" }, "responseId": "resp-1"
+        })
+    }
+
+    #[test]
+    fn actions_run_in_the_order_written_because_later_ones_depend_on_earlier_ones() {
+        let s = spec();
+        let result = live_result();
+        let scope = result_scope(&result);
+        let spy = Spy::default();
+        let errors = perform_all(&s, &live_actions(), &scope, "flow:b1:call_x:ended:v1", &spy);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(
+            *spy.done.borrow(),
+            vec![
+                "submit:tasks",
+                "connector:aokie/sms.send",
+                "update:calls/resp-1",
+                "notify:done resp-1",
+            ]
+        );
+    }
+
+    #[test]
+    fn one_failed_action_does_not_abandon_the_others_and_is_reported_by_name() {
+        // Four independent errands. Losing three because the second's form was
+        // deleted would throw away work that would have succeeded.
+        let s = spec();
+        let result = live_result();
+        let scope = result_scope(&result);
+        let spy = Spy {
+            fail: vec!["submit"],
+            ..Spy::default()
+        };
+        let errors = perform_all(&s, &live_actions(), &scope, "flow:b1:call_x:ended:v1", &spy);
+        assert_eq!(spy.done.borrow().len(), 4, "every action still ran");
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("the form is gone"), "{:?}", errors);
+    }
+
+    #[test]
+    fn a_connector_call_is_keyed_so_a_redelivered_event_cannot_send_a_second_sms() {
+        // The run's key already identifies the binding and the triggering
+        // event; the position distinguishes two actions of the same binding,
+        // which would otherwise collapse and perform only the first.
+        let s = spec();
+        let result = json!({ "hasSms": true, "sms": { "to": "1" } });
+        let scope = result_scope(&result);
+        let two = vec![
+            json!({ "type": "connector.request", "command": "sms.send",
+                    "payload": {}, "connectorId": "aokie" }),
+            json!({ "type": "connector.request", "command": "call.dial",
+                    "payload": {}, "connectorId": "aokie" }),
+        ];
+        let run_key = "flow:b1:aokie:call_2a6b:ended:v1";
+
+        let first = Spy::default();
+        perform_all(&s, &two, &scope, run_key, &first);
+        let second = Spy::default();
+        perform_all(&s, &two, &scope, run_key, &second);
+
+        // Same event replayed -> byte-identical keys, so the journal dedupes.
+        assert_eq!(*first.keys.borrow(), *second.keys.borrow());
+        // ...and the two actions of one binding are still told apart.
+        let keys = first.keys.borrow().clone();
+        assert_eq!(keys.len(), 2);
+        assert_ne!(keys[0], keys[1]);
+        assert!(keys[0].starts_with(run_key), "{}", keys[0]);
+    }
+
+    #[test]
+    fn a_gated_off_action_never_reaches_the_outside_world() {
+        let s = spec();
+        // No SMS, no call: only the toast should happen.
+        let result = json!({ "hasTask": false, "hasSms": false, "hasCall": false, "responseId": "r" });
+        let scope = result_scope(&result);
+        let spy = Spy::default();
+        let errors = perform_all(&s, &live_actions(), &scope, "k", &spy);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(*spy.done.borrow(), vec!["notify:done r"]);
     }
 
     #[test]
