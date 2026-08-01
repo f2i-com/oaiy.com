@@ -74,7 +74,37 @@
       {
         "nodeType": "formlogic_list_responses",
         "operation": "listRecords",
-        "path": "/api/v1/forms/{form}/responses"
+        "path": "/api/v1/forms/{form}/responses",
+        "listResult": {
+          "items": "responses",
+          "count": "count",
+          "first": "first",
+          "found": "found"
+        },
+        "filters": {
+          "field": "filters",
+          "opKey": "op",
+          "fieldKey": "field",
+          "valueKey": "value",
+          "ops": [
+            {
+              "op": "eq",
+              "param": "answers.{field}"
+            },
+            {
+              "op": "phone_eq",
+              "param": "answersPhone.{field}"
+            },
+            {
+              "op": "gte",
+              "param": "answersGte.{field}"
+            },
+            {
+              "op": "lte",
+              "param": "answersLte.{field}"
+            }
+          ]
+        }
       },
       {
         "nodeType": "formlogic_submit_response",

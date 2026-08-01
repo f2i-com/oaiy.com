@@ -167,6 +167,68 @@ export function resolvePath(call: ConnectorCall, input: unknown, template: strin
   });
 }
 
+/**
+ * The node's row filters, as the provider's query parameters.
+ *
+ * A filter the provider does not accept is REFUSED, never dropped. Dropping one
+ * does not return nothing — it returns the unfiltered listing, so a caller
+ * lookup reads a real record belonging to somebody else and greets the wrong
+ * person by name.
+ */
+function filterQuery(call: ConnectorCall): string {
+  const spec = call.filters;
+  if (!spec) return '';
+  const raw = call.data[spec.field];
+  if (raw === undefined || raw === null || raw === '') return '';
+  if (!Array.isArray(raw)) {
+    fail(call, `the node's "${spec.field}" field must be a list of filters.`);
+  }
+  const parts: string[] = [];
+  for (const row of raw as unknown[]) {
+    if (!isRecord(row)) fail(call, `each entry of "${spec.field}" must be an object.`);
+    const op = String(row[spec.opKey] ?? '');
+    const field = String(row[spec.fieldKey] ?? '');
+    const value = row[spec.valueKey];
+    if (!field) fail(call, `a filter names no field to compare.`);
+    const mapped = spec.ops.find((o) => o.op === op);
+    if (!mapped) {
+      const known = spec.ops.map((o) => o.op).join(', ');
+      fail(
+        call,
+        `this connector cannot apply the filter ${JSON.stringify(op)} — it accepts ${known}. ` +
+          `Applying the listing unfiltered would return the wrong records.`,
+      );
+    }
+    // A filter whose value did not resolve would match everything. Refuse.
+    if (value === undefined || value === null || value === '') {
+      fail(call, `the filter on ${JSON.stringify(field)} has no value to compare against.`);
+    }
+    const param = mapped.param.replace('{field}', field);
+    const text = typeof value === 'object' ? JSON.stringify(value) : String(value);
+    parts.push(`${encodeURIComponent(param)}=${encodeURIComponent(text)}`);
+  }
+  return parts.join('&');
+}
+
+/**
+ * Hand a listing to the graph in the shape its author reads.
+ *
+ * Without a described shape this is the bare array, which is what a graph
+ * iterating rows expects. A provider whose graphs read `.first` or `.found`
+ * describes those names and gets them — reading `undefined` instead is silent,
+ * and reads as "no such record".
+ */
+function shapeListing(call: ConnectorCall, rows: unknown): unknown {
+  const spec = call.listResult;
+  if (!spec) return rows;
+  const list = Array.isArray(rows) ? rows : rows === undefined || rows === null ? [] : [rows];
+  const out: Record<string, unknown> = { [spec.items]: list };
+  if (spec.count) out[spec.count] = list.length;
+  if (spec.first) out[spec.first] = list.length > 0 ? list[0] : null;
+  if (spec.found) out[spec.found] = list.length > 0;
+  return out;
+}
+
 /** Build a query string from an object/JSON-text `query` field. */
 function queryString(call: ConnectorCall, input: unknown): string {
   const raw = field(call, input, 'query', 'params');
@@ -451,7 +513,9 @@ export function createConnectorRuntime(
 
       // -- listRecords ------------------------------------------------------
       listRecords: async (input: unknown, call: ConnectorCall): Promise<unknown> => {
-        const url = recordUrl(call, input, true);
+        const base = recordUrl(call, input, true);
+        const filters = filterQuery(call);
+        const url = filters ? base + (base.includes('?') ? '&' : '?') + filters : base;
         log(`${label(call)}: GET ${url}`);
         const json = await http(ctx, {
           url,
@@ -460,7 +524,7 @@ export function createConnectorRuntime(
           call,
           what: 'listing records',
         });
-        return extractRows(call, input, json);
+        return shapeListing(call, extractRows(call, input, json));
       },
 
       // -- createRecord -----------------------------------------------------

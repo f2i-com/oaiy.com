@@ -554,6 +554,61 @@ pub struct FlowNodeSpec {
     /// placeholders are substituted from the node's own data at run time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+    /// How a LISTING is handed to the rest of the graph.
+    ///
+    /// A provider whose graphs read `$nodes.<id>.first` or `.found` names those
+    /// parts here. Omitted, a listing is the bare array of rows — which is what
+    /// a graph that iterates them expects, and which reads as `undefined` to a
+    /// graph that does not. That failure is silent: the graph decides the
+    /// record does not exist and greets a known customer as a stranger.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub list_result: Option<ListResultSpec>,
+    /// How a node's row FILTERS reach the provider.
+    ///
+    /// Omitted, filters are ignored and the listing comes back unfiltered —
+    /// worse than failing, because the graph then reads a real row belonging to
+    /// somebody else.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filters: Option<FilterSpec>,
+}
+
+/// The names a provider's graphs read a listing's parts by.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ListResultSpec {
+    /// The array of rows.
+    pub items: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub found: Option<String>,
+}
+
+/// How a node's filter rows become the provider's query parameters.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FilterSpec {
+    /// The node-data field holding the filter rows.
+    pub field: String,
+    /// Within one row: which comparison, which record field, and the value.
+    pub op_key: String,
+    pub field_key: String,
+    pub value_key: String,
+    /// The comparisons this provider accepts, and the query parameter each
+    /// becomes. A comparison not listed is REFUSED rather than dropped.
+    pub ops: Vec<FilterOpSpec>,
+}
+
+/// One comparison a provider accepts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FilterOpSpec {
+    /// The name a graph writes.
+    pub op: String,
+    /// The query parameter it becomes; `{field}` is substituted.
+    pub param: String,
 }
 
 /// The operations a provider may map its node types onto.

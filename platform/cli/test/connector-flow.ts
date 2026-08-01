@@ -358,6 +358,90 @@ async function main(): Promise<void> {
     `commands sent: ${JSON.stringify(commands2)}`,
   );
 
+  // --- a listing's shape, and its filters ---------------------------------
+  //
+  // Live report 2026-08-01: a caller lookup answered "unknown caller" for a
+  // customer plainly in the table. The graph reads `$nodes.customers.first`
+  // and `.found`; a bare array has neither, so it read undefined and decided
+  // the record did not exist. Its `phone_eq` filter was ignored too — which is
+  // worse than failing, because the unfiltered listing then hands the graph a
+  // real record belonging to somebody else.
+  sent.length = 0;
+  await loadConnectorModule(
+    writeConfig('shaped.json', {
+      ...CONFIG,
+      nodes: [
+        {
+          nodeType: 'catalogue_lookup',
+          operation: 'listRecords',
+          path: '/api/v1/shelves/{shelf}/items',
+          listResult: { items: 'responses', count: 'count', first: 'first', found: 'found' },
+          filters: {
+            field: 'filters',
+            opKey: 'op',
+            fieldKey: 'field',
+            valueKey: 'value',
+            ops: [{ op: 'phone_eq', param: 'answersPhone.{field}' }],
+          },
+        },
+      ],
+    }),
+  );
+  const shapedId = engine.submit(
+    'test',
+    'connector-list-shape',
+    graph(
+      [
+        {
+          id: 'customers',
+          type: 'catalogue_lookup',
+          position: { x: 100, y: 0 },
+          data: {
+            shelf: 'fixed',
+            filters: [{ op: 'phone_eq', field: 'phone', value: '$inputs.from' }],
+          },
+        },
+      ],
+      [],
+    ),
+    { from: '0421285243' },
+  );
+  const shapedJob = await runToEnd(engine, shapedId);
+  check('listing: the flow completed', shapedJob?.status === 'completed', `error=${shapedJob?.error ?? ''}`);
+  const listUrl = sent.find((s) => s.url.includes('/items'))?.url ?? '';
+  check(
+    'listing: the phone_eq filter reached the provider as a query parameter',
+    listUrl.includes('answersPhone.phone=0421285243'),
+    `url=${listUrl}`,
+  );
+  const shaped = shapedJob?.nodeOutputs?.customers as any;
+  check('listing: it is a structured object, not a bare array', shaped && !Array.isArray(shaped), `got ${JSON.stringify(shaped)?.slice(0, 80)}`);
+  check('listing: .responses carries the rows', Array.isArray(shaped?.responses) && shaped.responses.length === 2, `got ${JSON.stringify(shaped?.responses)?.slice(0, 60)}`);
+  check('listing: .first is the first row', shaped?.first?.id === 'i1', `got ${JSON.stringify(shaped?.first)}`);
+  check('listing: .found says a record exists', shaped?.found === true, `got ${JSON.stringify(shaped?.found)}`);
+  check('listing: .count matches', shaped?.count === 2, `got ${JSON.stringify(shaped?.count)}`);
+
+  // A filter this provider cannot apply must REFUSE, never silently widen.
+  const badFilterId = engine.submit(
+    'test',
+    'connector-bad-filter',
+    graph(
+      [
+        {
+          id: 'q',
+          type: 'catalogue_lookup',
+          position: { x: 0, y: 0 },
+          data: { shelf: 'fixed', filters: [{ op: 'starts_with', field: 'phone', value: '04' }] },
+        },
+      ],
+      [],
+    ),
+    {},
+  );
+  const badFilterJob = await runToEnd(engine, badFilterId);
+  check('listing: an unsupported filter fails the flow rather than widening it', badFilterJob?.status === 'failed');
+  check('listing: and names the filter it cannot apply', String(badFilterJob?.error ?? '').includes('starts_with'), `error=${badFilterJob?.error ?? ''}`);
+
   // --- a node type this build does not have -------------------------------
   const badId = engine.submit(
     'test',

@@ -75,6 +75,10 @@ export function createConnectorCompiler(config: ConnectorConfig): ModuleCompiler
       };
       if (spec.path) call.path = spec.path;
       if (spec.method) call.method = spec.method;
+      // Carried through so the runtime never looks a node type up: how this
+      // provider shapes a listing, and how its row filters are spelled.
+      if (spec.listResult) call.listResult = spec.listResult;
+      if (spec.filters) call.filters = spec.filters;
 
       let callLiteral: string;
       try {
