@@ -375,6 +375,157 @@ pub struct FlowsSpec {
     /// operation each performs; the operations are a small closed set.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub nodes: Vec<FlowNodeSpec>,
+    /// What a BINDING asks for once its flow has finished.
+    ///
+    /// A third thing a binding says, next to which flow to run and when: what to
+    /// DO with the answer. Omitted by a provider whose bindings carry no such
+    /// list, whose runs then simply finish.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_actions: Option<ResultActionsSpec>,
+}
+
+/// Actions a binding performs with a finished run's result.
+///
+/// Every name here is author-facing and therefore the provider's — including
+/// the key the list itself arrives under, for the same reason
+/// [`AppLogicFields::effects_list`] is data: a name spelled in the code would
+/// read a key that is not there and perform nothing at all, silently, on every
+/// run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ResultActionsSpec {
+    /// The key on a BINDING carrying the list.
+    pub actions_field: String,
+    /// The key, inside a reported result, listing actions that failed. The
+    /// provider's console reads it to mark a run that succeeded while its side
+    /// effects did not.
+    pub errors_field: String,
+    /// The key a non-object result is wrapped under before that list can be
+    /// attached — a flow answering with a bare string has nowhere to carry one,
+    /// and the failure would vanish behind a clean success.
+    pub result_wrapper: String,
+    /// Most actions one binding may perform. A binding is remote input; a
+    /// misconfigured one must not turn a single run into unbounded work.
+    #[serde(default = "default_max_result_actions")]
+    pub max_actions: usize,
+    /// Create a record. `{formId}` is substituted.
+    pub submit_path: String,
+    /// Update a record. `{formId}` and `{id}` are substituted.
+    pub update_path: String,
+    /// How a value reference is spelled.
+    pub selectors: SelectorSpec,
+    /// What the parts of one action are called.
+    pub fields: ResultActionFields,
+    /// The action types this provider's bindings carry, and what each one means
+    /// in terms this desktop can actually perform.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub actions: Vec<ResultActionSpec>,
+}
+
+fn default_max_result_actions() -> usize {
+    16
+}
+
+/// How a provider spells a value reference.
+///
+/// Two spellings of one language: a selector standing alone as a whole value,
+/// and the same path interpolated inside free text. Both are the provider's
+/// notation, so both are described rather than assumed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SelectorSpec {
+    /// What marks a string as a reference rather than text.
+    pub sigil: String,
+    /// What negates a gate, repeatable.
+    pub negate: String,
+    /// The delimiters around an interpolated path.
+    pub open: String,
+    pub close: String,
+    /// The roots a reference may address. A root that is DECLARED but has no
+    /// value here still resolves to nothing — which is the point of declaring
+    /// it. Leaving it out instead would make the author's reference a literal,
+    /// and write the text "$nodes.x" into somebody's record as if it were data.
+    pub roots: Vec<SelectorRoot>,
+}
+
+/// One addressable root.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SelectorRoot {
+    /// The name an author writes after the sigil.
+    pub name: String,
+    /// Which value it addresses, from a closed set.
+    pub source: SelectorSource,
+}
+
+/// The values a selector root may address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SelectorSource {
+    /// What the finished flow answered.
+    RunResult,
+    /// The event that triggered the run.
+    RunEvent,
+    /// The inputs the run was started with.
+    RunInputs,
+    /// Which app the flow belongs to.
+    AppContext,
+    /// Addressable, and never has a value out here. Declared so an author's
+    /// reference to it resolves to nothing rather than passing through as text.
+    Unavailable,
+}
+
+/// One action type a provider's bindings carry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ResultActionSpec {
+    /// The name the provider's bindings use for it.
+    pub action_type: String,
+    /// What it does, from a closed set this desktop knows how to perform.
+    pub operation: ResultActionOperation,
+}
+
+/// The operations a provider may map its action types onto.
+///
+/// Closed for the same reason [`FlowNodeOperation`] is: a binding is remote
+/// input, authored by anyone who can build an app on the provider, so what an
+/// action can DO is fixed here and the provider only chooses which of them its
+/// vocabulary names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ResultActionOperation {
+    /// Create a record.
+    SubmitRecord,
+    /// Update a record named by its id.
+    UpdateRecord,
+    /// Say something to the person at this machine.
+    Notify,
+    /// Call a plugin connector on this desktop — the same gate the relay uses.
+    ConnectorRequest,
+}
+
+/// What the parts of one action are called.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ResultActionFields {
+    /// Which of the declared action types this one is.
+    pub kind: String,
+    /// The gate deciding whether it runs at all.
+    pub gate: String,
+    /// Which form the record belongs to. An id, not a portable key — a binding
+    /// names forms the way the account does.
+    pub form_id: String,
+    /// The record's values, and the id of the one being updated.
+    pub record: String,
+    pub record_id: String,
+    /// On a notify action: what to say.
+    pub message: String,
+    /// On a connector action: whose command, which command, and its body.
+    pub connector_id: String,
+    pub command: String,
+    pub payload: String,
+    /// In a write's reply: the record's own id.
+    pub id: String,
 }
 
 /// One node type a provider's graphs use.
@@ -935,11 +1086,12 @@ impl ConnectorDescriptor {
     }
 }
 
-/// Every descriptor available, built-ins first, user files overriding by id.
+/// The descriptors compiled into this binary, parsed and validated.
 ///
-/// A malformed user file is skipped with a log rather than failing the load —
-/// one bad file must not take away every provider, including the working ones.
-pub fn load_all(data_dir: &Path) -> Vec<ConnectorDescriptor> {
+/// Separate from [`load_all`] so a caller that wants the SHIPPED provider — a
+/// test, or anything that must not depend on what happens to be in the user's
+/// data directory — can have it without reading the disk.
+pub fn builtin() -> Vec<ConnectorDescriptor> {
     let mut out: Vec<ConnectorDescriptor> = Vec::new();
     for raw in BUILTIN {
         match serde_json::from_str::<ConnectorDescriptor>(raw) {
@@ -951,6 +1103,15 @@ pub fn load_all(data_dir: &Path) -> Vec<ConnectorDescriptor> {
             Err(e) => debug_assert!(false, "built-in connector does not parse: {e}"),
         }
     }
+    out
+}
+
+/// Every descriptor available, built-ins first, user files overriding by id.
+///
+/// A malformed user file is skipped with a log rather than failing the load —
+/// one bad file must not take away every provider, including the working ones.
+pub fn load_all(data_dir: &Path) -> Vec<ConnectorDescriptor> {
+    let mut out: Vec<ConnectorDescriptor> = builtin();
 
     let dir = data_dir.join("connectors");
     let Ok(entries) = std::fs::read_dir(&dir) else {
