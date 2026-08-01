@@ -383,6 +383,10 @@ async fn main() {
             codex: ai_codex.clone(),
         },
     );
+    // Let plugin events reach the flows the user built on the provider's site.
+    // Without it an Aokie call fires only this desktop's local bindings, and
+    // the flow they actually wrote never runs.
+    bridge.host.set_link(link.clone());
     bridge.host.set_companion_broker(oaiy_desktop_lib::plugins::CompanionBroker {
         companion: companion.clone(),
         upstream: companion_upstream.clone(),

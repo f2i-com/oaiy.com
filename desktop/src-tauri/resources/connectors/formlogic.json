@@ -52,6 +52,10 @@
     "batchLimit": 8,
     "errorBackoffSeconds": 10
   },
+  "flows": {
+    "bindingsPath": "/api/v1/flow-bindings",
+    "reservePath": "/api/v1/flow-runs"
+  },
   "dataNode": {
     "registerPath": "/api/v1/data-node/register",
     "selfPath": "/api/v1/data-node/self",
