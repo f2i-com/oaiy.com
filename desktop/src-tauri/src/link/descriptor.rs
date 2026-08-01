@@ -375,6 +375,22 @@ pub struct FlowsSpec {
     /// operation each performs; the operations are a small closed set.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub nodes: Vec<FlowNodeSpec>,
+    /// How a value reference is spelled, for this whole lane.
+    ///
+    /// The same language appears in three places — the map from a binding's
+    /// trigger to its flow's inputs, the fields of a node, and what a binding
+    /// does with the answer — so it is described once here rather than per
+    /// block, where the copies would drift.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selectors: Option<SelectorSpec>,
+    /// What a binding calls the map from flow input names to value references.
+    ///
+    /// Absent means this desktop does not build a flow's inputs at all, and a
+    /// flow reading `$inputs.x` finds nothing — which is what happened before
+    /// this existed: seventeen of nineteen bindings declared one and every one
+    /// was discarded, so every flow that named its trigger's fields ran blind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_map_field: Option<String>,
     /// What a BINDING asks for once its flow has finished.
     ///
     /// A third thing a binding says, next to which flow to run and when: what to
@@ -412,8 +428,6 @@ pub struct ResultActionsSpec {
     pub submit_path: String,
     /// Update a record. `{formId}` and `{id}` are substituted.
     pub update_path: String,
-    /// How a value reference is spelled.
-    pub selectors: SelectorSpec,
     /// What the parts of one action are called.
     pub fields: ResultActionFields,
     /// The action types this provider's bindings carry, and what each one means

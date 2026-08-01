@@ -24,7 +24,10 @@
       "aokie:realtime"
     ],
     "tokenResponse": {
-      "credentialFields": ["formlogic_api_key", "access_token"],
+      "credentialFields": [
+        "formlogic_api_key",
+        "access_token"
+      ],
       "accountIdField": "desktop_connection_id",
       "accountNameField": "device_name",
       "scopeField": "scope"
@@ -60,14 +63,75 @@
     "completePath": "/api/v1/flow-runs/{id}",
     "graphPath": "/api/v1/flows",
     "nodes": [
-      { "nodeType": "input", "operation": "runInput" },
-      { "nodeType": "llm_chat", "operation": "chat" },
-      { "nodeType": "formlogic_list_responses", "operation": "listRecords", "path": "/api/v1/forms/{form}/responses" },
-      { "nodeType": "formlogic_submit_response", "operation": "createRecord", "path": "/api/v1/forms/{form}/responses" },
-      { "nodeType": "formlogic_update_response", "operation": "updateRecord", "path": "/api/v1/responses/{id}" },
-      { "nodeType": "connector_request", "operation": "connectorRequest" },
-      { "nodeType": "desktop_services", "operation": "serviceControl" }
+      {
+        "nodeType": "input",
+        "operation": "runInput"
+      },
+      {
+        "nodeType": "llm_chat",
+        "operation": "chat"
+      },
+      {
+        "nodeType": "formlogic_list_responses",
+        "operation": "listRecords",
+        "path": "/api/v1/forms/{form}/responses"
+      },
+      {
+        "nodeType": "formlogic_submit_response",
+        "operation": "createRecord",
+        "path": "/api/v1/forms/{form}/responses"
+      },
+      {
+        "nodeType": "formlogic_update_response",
+        "operation": "updateRecord",
+        "path": "/api/v1/responses/{id}"
+      },
+      {
+        "nodeType": "connector_request",
+        "operation": "connectorRequest"
+      },
+      {
+        "nodeType": "desktop_services",
+        "operation": "serviceControl"
+      }
     ],
+    "selectors": {
+      "sigil": "$",
+      "negate": "!",
+      "open": "{{",
+      "close": "}}",
+      "roots": [
+        {
+          "name": "result",
+          "source": "runResult"
+        },
+        {
+          "name": "event",
+          "source": "runEvent"
+        },
+        {
+          "name": "app",
+          "source": "appContext"
+        },
+        {
+          "name": "input",
+          "source": "runInputs"
+        },
+        {
+          "name": "inputs",
+          "source": "runInputs"
+        },
+        {
+          "name": "nodes",
+          "source": "unavailable"
+        },
+        {
+          "name": "upstream",
+          "source": "unavailable"
+        }
+      ]
+    },
+    "inputMapField": "inputMap",
     "resultActions": {
       "actionsField": "outputActions",
       "errorsField": "outputActionErrors",
@@ -75,21 +139,6 @@
       "maxActions": 16,
       "submitPath": "/api/v1/forms/{formId}/responses",
       "updatePath": "/api/v1/forms/{formId}/responses/{id}",
-      "selectors": {
-        "sigil": "$",
-        "negate": "!",
-        "open": "{{",
-        "close": "}}",
-        "roots": [
-          { "name": "result", "source": "runResult" },
-          { "name": "event", "source": "runEvent" },
-          { "name": "app", "source": "appContext" },
-          { "name": "input", "source": "runInputs" },
-          { "name": "inputs", "source": "runInputs" },
-          { "name": "nodes", "source": "unavailable" },
-          { "name": "upstream", "source": "unavailable" }
-        ]
-      },
       "fields": {
         "kind": "type",
         "gate": "when",
@@ -103,10 +152,22 @@
         "id": "id"
       },
       "actions": [
-        { "actionType": "formlogic.submitResponse", "operation": "submitRecord" },
-        { "actionType": "formlogic.updateResponse", "operation": "updateRecord" },
-        { "actionType": "formlogic.toast", "operation": "notify" },
-        { "actionType": "connector.request", "operation": "connectorRequest" }
+        {
+          "actionType": "formlogic.submitResponse",
+          "operation": "submitRecord"
+        },
+        {
+          "actionType": "formlogic.updateResponse",
+          "operation": "updateRecord"
+        },
+        {
+          "actionType": "formlogic.toast",
+          "operation": "notify"
+        },
+        {
+          "actionType": "connector.request",
+          "operation": "connectorRequest"
+        }
       ]
     }
   },
@@ -152,19 +213,39 @@
       "formKey": "packFormId"
     },
     "effects": [
-      { "effectType": "formlogic.submitResponse", "operation": "submitRecord" },
-      { "effectType": "formlogic.updateResponse", "operation": "updateRecord" },
-      { "effectType": "storage.set", "operation": "setStorage" },
-      { "effectType": "ui.toast", "operation": "notify" },
-      { "effectType": "formlogic.toast", "operation": "notify" },
-      { "effectType": "connector.request", "operation": "connectorRequest" }
+      {
+        "effectType": "formlogic.submitResponse",
+        "operation": "submitRecord"
+      },
+      {
+        "effectType": "formlogic.updateResponse",
+        "operation": "updateRecord"
+      },
+      {
+        "effectType": "storage.set",
+        "operation": "setStorage"
+      },
+      {
+        "effectType": "ui.toast",
+        "operation": "notify"
+      },
+      {
+        "effectType": "formlogic.toast",
+        "operation": "notify"
+      },
+      {
+        "effectType": "connector.request",
+        "operation": "connectorRequest"
+      }
     ]
   },
   "dataNode": {
     "registerPath": "/api/v1/data-node/register",
     "selfPath": "/api/v1/data-node/self",
     "intervalSeconds": 3600,
-    "capabilities": ["storage"],
+    "capabilities": [
+      "storage"
+    ],
     "protocolMin": 1,
     "protocolMax": 1
   },

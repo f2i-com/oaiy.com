@@ -22,7 +22,7 @@
 use serde_json::{json, Map, Value};
 
 use super::descriptor::{
-    ResultActionFields, ResultActionOperation, ResultActionsSpec, SelectorSource,
+    ResultActionFields, ResultActionOperation, ResultActionsSpec, SelectorSource, SelectorSpec,
 };
 
 /// How deep a value template is walked before it is left alone.
@@ -105,9 +105,8 @@ fn split_reference<'a>(text: &'a str, sigil: &str) -> Option<(&'a str, Vec<&'a s
 }
 
 /// Is `name` a root this provider declares, and what does it address?
-fn root_of(spec: &ResultActionsSpec, name: &str) -> Option<SelectorSource> {
-    spec.selectors
-        .roots
+fn root_of(sel: &SelectorSpec, name: &str) -> Option<SelectorSource> {
+    sel.roots
         .iter()
         .find(|r| r.name == name)
         .map(|r| r.source)
@@ -119,9 +118,9 @@ fn root_of(spec: &ResultActionsSpec, name: &str) -> Option<SelectorSource> {
 /// DECLARED. This is load-bearing: an SMS body of "$250 deposit received" is
 /// text, and treating every `$` as a reference would send the customer an empty
 /// message. The reference makes the same distinction, and for the same reason.
-fn resolve_one(spec: &ResultActionsSpec, text: &str, scope: &Scope) -> Option<Resolved> {
-    let (root, path) = split_reference(text, &spec.selectors.sigil)?;
-    let source = root_of(spec, root)?;
+fn resolve_one(sel: &SelectorSpec, text: &str, scope: &Scope) -> Option<Resolved> {
+    let (root, path) = split_reference(text, &sel.sigil)?;
+    let source = root_of(sel, root)?;
     let Some(base) = scope.for_source(source) else {
         // A declared root with nothing behind it. Still a reference, and it
         // resolves to nothing — NOT to the text "$nodes.x", which would land in
@@ -140,9 +139,9 @@ fn resolve_one(spec: &ResultActionsSpec, text: &str, scope: &Scope) -> Option<Re
 /// ways. A reference that resolves to nothing interpolates to nothing, and an
 /// object is rendered as its JSON — a message is text, and the alternative is
 /// the word "[object Object]" reaching a caller by SMS.
-fn interpolate(spec: &ResultActionsSpec, text: &str, scope: &Scope) -> String {
-    let open = &spec.selectors.open;
-    let close = &spec.selectors.close;
+fn interpolate(sel: &SelectorSpec, text: &str, scope: &Scope) -> String {
+    let open = &sel.open;
+    let close = &sel.close;
     if open.is_empty() || close.is_empty() {
         return text.to_string();
     }
@@ -155,12 +154,12 @@ fn interpolate(spec: &ResultActionsSpec, text: &str, scope: &Scope) -> String {
         };
         out.push_str(&rest[..start]);
         let raw = after[..end].trim();
-        let with_sigil = if raw.starts_with(&spec.selectors.sigil) {
+        let with_sigil = if raw.starts_with(&sel.sigil) {
             raw.to_string()
         } else {
-            format!("{}{raw}", spec.selectors.sigil)
+            format!("{}{raw}", sel.sigil)
         };
-        match resolve_one(spec, &with_sigil, scope) {
+        match resolve_one(sel, &with_sigil, scope) {
             Some(Resolved::Found(Value::String(s))) => out.push_str(&s),
             Some(Resolved::Found(Value::Null)) | Some(Resolved::Missing) => {}
             Some(Resolved::Found(v)) => out.push_str(&v.to_string()),
@@ -185,20 +184,20 @@ fn interpolate(spec: &ResultActionsSpec, text: &str, scope: &Scope) -> String {
 /// null. That asymmetry is not arbitrary — it is what the reference's
 /// `undefined` does when its structure is serialised, and a record written from
 /// a resolved object must contain the same fields on either runtime.
-fn resolve_deep(spec: &ResultActionsSpec, value: &Value, scope: &Scope, depth: usize) -> Resolved {
+fn resolve_deep(sel: &SelectorSpec, value: &Value, scope: &Scope, depth: usize) -> Resolved {
     if depth > MAX_DEPTH {
         return Resolved::Found(value.clone());
     }
     match value {
-        Value::String(text) => match resolve_one(spec, text, scope) {
+        Value::String(text) => match resolve_one(sel, text, scope) {
             Some(found) => found,
             // Not a reference: interpolate any braces, else leave it be.
-            None => Resolved::Found(Value::String(interpolate(spec, text, scope))),
+            None => Resolved::Found(Value::String(interpolate(sel, text, scope))),
         },
         Value::Array(items) => Resolved::Found(Value::Array(
             items
                 .iter()
-                .map(|item| match resolve_deep(spec, item, scope, depth + 1) {
+                .map(|item| match resolve_deep(sel, item, scope, depth + 1) {
                     Resolved::Found(v) => v,
                     Resolved::Missing => Value::Null,
                 })
@@ -207,7 +206,7 @@ fn resolve_deep(spec: &ResultActionsSpec, value: &Value, scope: &Scope, depth: u
         Value::Object(map) => {
             let mut out = Map::new();
             for (k, v) in map {
-                if let Resolved::Found(resolved) = resolve_deep(spec, v, scope, depth + 1) {
+                if let Resolved::Found(resolved) = resolve_deep(sel, v, scope, depth + 1) {
                     out.insert(k.clone(), resolved);
                 }
             }
@@ -222,17 +221,17 @@ fn resolve_deep(spec: &ResultActionsSpec, value: &Value, scope: &Scope, depth: u
 /// Absent or blank passes. A leading negation flips it, repeatably. A reference
 /// is judged on the truthiness of what it resolves to; anything else is judged
 /// as its own text, so a gate of "yes" runs and a gate of "" does not.
-fn gate_passes(spec: &ResultActionsSpec, gate: Option<&str>, scope: &Scope) -> bool {
+fn gate_passes(sel: &SelectorSpec, gate: Option<&str>, scope: &Scope) -> bool {
     let Some(raw) = gate.map(str::trim).filter(|g| !g.is_empty()) else {
         return true;
     };
     let mut expr = raw;
     let mut negate = false;
-    while let Some(stripped) = expr.strip_prefix(&spec.selectors.negate) {
+    while let Some(stripped) = expr.strip_prefix(&sel.negate) {
         negate = !negate;
         expr = stripped.trim();
     }
-    let truthy = match resolve_one(spec, expr, scope) {
+    let truthy = match resolve_one(sel, expr, scope) {
         Some(Resolved::Found(v)) => truthiness(&v),
         Some(Resolved::Missing) => false,
         None => !expr.is_empty(),
@@ -293,19 +292,19 @@ fn text_field(action: &Value, name: &str) -> Option<String> {
 }
 
 /// A resolved reference that must be a non-empty string to be usable.
-fn resolved_id(spec: &ResultActionsSpec, raw: Option<&Value>, scope: &Scope) -> Option<String> {
-    match resolve_deep(spec, raw?, scope, 0) {
+fn resolved_id(sel: &SelectorSpec, raw: Option<&Value>, scope: &Scope) -> Option<String> {
+    match resolve_deep(sel, raw?, scope, 0) {
         Resolved::Found(Value::String(s)) if !s.trim().is_empty() => Some(s),
         _ => None,
     }
 }
 
 /// A resolved reference that must be an object to be written as a record.
-fn resolved_record(spec: &ResultActionsSpec, raw: Option<&Value>, scope: &Scope) -> Result<Value, String> {
+fn resolved_record(sel: &SelectorSpec, raw: Option<&Value>, scope: &Scope) -> Result<Value, String> {
     let Some(raw) = raw else {
         return Err("names no values to write".to_string());
     };
-    match resolve_deep(spec, raw, scope, 0) {
+    match resolve_deep(sel, raw, scope, 0) {
         Resolved::Found(v @ Value::Object(_)) => Ok(v),
         Resolved::Found(other) => Err(format!(
             "its values resolved to {}, not an object",
@@ -333,6 +332,7 @@ fn kind_of(v: &Value) -> &'static str {
 /// network, a plugin, or a record store.
 pub fn plan(
     spec: &ResultActionsSpec,
+    sel: &SelectorSpec,
     action: &Value,
     scope: &Scope,
 ) -> Result<Planned, String> {
@@ -351,7 +351,7 @@ pub fn plan(
         ));
     };
 
-    if !gate_passes(spec, field(action, &f.gate).and_then(Value::as_str), scope) {
+    if !gate_passes(sel, field(action, &f.gate).and_then(Value::as_str), scope) {
         return Ok(Planned::Skipped);
     }
 
@@ -359,15 +359,15 @@ pub fn plan(
         ResultActionOperation::SubmitRecord => {
             let form_id = text_field(action, &f.form_id)
                 .ok_or_else(|| "names no form to write to".to_string())?;
-            let record = resolved_record(spec, field(action, &f.record), scope)?;
+            let record = resolved_record(sel, field(action, &f.record), scope)?;
             Ok(Planned::Submit { form_id, record })
         }
         ResultActionOperation::UpdateRecord => {
             let form_id = text_field(action, &f.form_id)
                 .ok_or_else(|| "names no form to write to".to_string())?;
-            let record_id = resolved_id(spec, field(action, &f.record_id), scope)
+            let record_id = resolved_id(sel, field(action, &f.record_id), scope)
                 .ok_or_else(|| "names no record to update".to_string())?;
-            let record = resolved_record(spec, field(action, &f.record), scope)?;
+            let record = resolved_record(sel, field(action, &f.record), scope)?;
             Ok(Planned::Update {
                 form_id,
                 record_id,
@@ -378,7 +378,7 @@ pub fn plan(
             let raw = field(action, &f.message)
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            let message = interpolate(spec, raw, scope);
+            let message = interpolate(sel, raw, scope);
             if message.trim().is_empty() {
                 return Err("names no message to show".to_string());
             }
@@ -390,7 +390,7 @@ pub fn plan(
             let command = text_field(action, &f.command)
                 .ok_or_else(|| "names no command to run".to_string())?;
             let payload = match field(action, &f.payload) {
-                Some(raw) => match resolve_deep(spec, raw, scope, 0) {
+                Some(raw) => match resolve_deep(sel, raw, scope, 0) {
                     Resolved::Found(v) => v,
                     Resolved::Missing => json!({}),
                 },
@@ -412,13 +412,14 @@ pub fn plan(
 /// the work it can, and must not do so silently.
 pub fn plan_all(
     spec: &ResultActionsSpec,
+    sel: &SelectorSpec,
     actions: &[Value],
     scope: &Scope,
 ) -> (Vec<(usize, Planned)>, Vec<String>) {
     let mut planned = Vec::new();
     let mut errors = Vec::new();
     for (index, action) in actions.iter().take(spec.max_actions).enumerate() {
-        match plan(spec, action, scope) {
+        match plan(spec, sel, action, scope) {
             Ok(Planned::Skipped) => {}
             Ok(p) => planned.push((index, p)),
             Err(why) => errors.push(format!("{}: {why}", action_name(spec, action, index))),
@@ -464,6 +465,30 @@ pub fn attach_errors(spec: &ResultActionsSpec, result: Value, errors: &[String])
     Value::Object(map)
 }
 
+/// Build a flow's inputs from a binding's input map.
+///
+/// The map is `{ name: reference }` — "callId" from "$event.data.callId" — and
+/// resolving it is what makes `$inputs.callId` mean anything inside the flow.
+/// Without it a flow that names its trigger's fields runs blind: seventeen of
+/// this account's nineteen bindings declare one, and every one was discarded,
+/// so a receptionist could not be told which call it was configuring.
+///
+/// A name whose reference resolves to nothing is LEFT OUT rather than set to
+/// null, so a node can tell "not supplied" from "supplied as nothing" — the
+/// plugin rejects a null callId by name, which is the honest outcome.
+pub fn build_inputs(sel: &SelectorSpec, input_map: &Value, scope: &Scope) -> Value {
+    let Some(map) = input_map.as_object() else {
+        return json!({});
+    };
+    let mut out = Map::new();
+    for (name, reference) in map {
+        if let Resolved::Found(v) = resolve_deep(sel, reference, scope, 0) {
+            out.insert(name.clone(), v);
+        }
+    }
+    Value::Object(out)
+}
+
 /// What performing an action needs from the outside world.
 ///
 /// A trait rather than concrete calls so the ordering and reporting below can
@@ -499,12 +524,13 @@ pub trait Perform {
 /// with the run instead.
 pub fn perform_all(
     spec: &ResultActionsSpec,
+    sel: &SelectorSpec,
     actions: &[Value],
     scope: &Scope,
     run_key: &str,
     doer: &dyn Perform,
 ) -> Vec<String> {
-    let (planned, mut errors) = plan_all(spec, actions, scope);
+    let (planned, mut errors) = plan_all(spec, sel, actions, scope);
     for (index, action) in planned {
         let outcome = match &action {
             Planned::Skipped => Ok(()),
@@ -667,6 +693,13 @@ mod tests {
             .expect("the built-in connector describes the actions it performs")
     }
 
+    fn selectors() -> SelectorSpec {
+        descriptor::builtin()
+            .into_iter()
+            .find_map(|c| c.flows.and_then(|f| f.selectors))
+            .expect("the built-in connector describes how a reference is spelled")
+    }
+
     fn result_scope(v: &Value) -> Scope<'_> {
         Scope {
             result: Some(v),
@@ -695,16 +728,16 @@ mod tests {
     fn a_whole_value_reference_yields_the_referenced_value_itself() {
         // "answers": "$result.callUpdate" replaces the ENTIRE answers map, so a
         // reference must be able to produce an object, not just text.
-        let s = spec();
+        let sel = selectors();
         let result = json!({ "callUpdate": { "summary": "went well" }, "n": 0 });
         let scope = result_scope(&result);
         assert_eq!(
-            resolve_deep(&s, &json!("$result.callUpdate"), &scope, 0),
+            resolve_deep(&sel, &json!("$result.callUpdate"), &scope, 0),
             Resolved::Found(json!({ "summary": "went well" }))
         );
         // A falsy value is a value: 0 is an answer, not an absence.
         assert_eq!(
-            resolve_deep(&s, &json!("$result.n"), &scope, 0),
+            resolve_deep(&sel, &json!("$result.n"), &scope, 0),
             Resolved::Found(json!(0))
         );
     }
@@ -713,11 +746,11 @@ mod tests {
     fn a_missing_reference_is_absent_rather_than_null_or_its_own_text() {
         // Writing null would overwrite a stored value with nothing; writing the
         // literal "$result.nope" puts a selector into a customer's record.
-        let s = spec();
+        let sel = selectors();
         let result = json!({ "kept": 1 });
         let scope = result_scope(&result);
         let Resolved::Found(out) = resolve_deep(
-            &s,
+            &sel,
             &json!({ "kept": "$result.kept", "gone": "$result.nope" }),
             &scope,
             0,
@@ -729,7 +762,7 @@ mod tests {
 
         // In a LIST the element cannot simply vanish without renumbering the
         // rest, so it becomes null — the same as the reference.
-        let Resolved::Found(list) = resolve_deep(&s, &json!(["$result.nope"]), &scope, 0) else {
+        let Resolved::Found(list) = resolve_deep(&sel, &json!(["$result.nope"]), &scope, 0) else {
             panic!("a list always resolves");
         };
         assert_eq!(list, json!([null]));
@@ -739,11 +772,11 @@ mod tests {
     fn a_dollar_sign_in_ordinary_text_is_not_a_reference() {
         // An SMS body of "$250 deposit received" must arrive intact. Only a
         // DECLARED root makes a reference.
-        let s = spec();
+        let sel = selectors();
         let result = json!({});
         let scope = result_scope(&result);
         assert_eq!(
-            resolve_deep(&s, &json!("$250 deposit received"), &scope, 0),
+            resolve_deep(&sel, &json!("$250 deposit received"), &scope, 0),
             Resolved::Found(json!("$250 deposit received"))
         );
     }
@@ -753,18 +786,18 @@ mod tests {
         // `$nodes` is addressable inside the engine and meaningless out here.
         // It must resolve to NOTHING — declaring it is what stops it being
         // mistaken for literal text and written into a record.
-        let s = spec();
+        let sel = selectors();
         let result = json!({});
         let scope = result_scope(&result);
         assert_eq!(
-            resolve_deep(&s, &json!("$nodes.summary.content"), &scope, 0),
+            resolve_deep(&sel, &json!("$nodes.summary.content"), &scope, 0),
             Resolved::Missing
         );
     }
 
     #[test]
     fn templates_interpolate_and_leave_unknown_braces_alone() {
-        let s = spec();
+        let sel = selectors();
         let event = json!({ "data": { "to": "0400111222", "reason": "busy" } });
         let scope = Scope {
             event: Some(&event),
@@ -772,39 +805,40 @@ mod tests {
         };
         // The live toast, verbatim.
         assert_eq!(
-            interpolate(&s, "SMS to {{event.data.to}} FAILED: {{event.data.reason}}", &scope),
+            interpolate(&sel, "SMS to {{event.data.to}} FAILED: {{event.data.reason}}", &scope),
             "SMS to 0400111222 FAILED: busy"
         );
         // The sigil inside braces is optional, and whitespace is tolerated.
-        assert_eq!(interpolate(&s, "{{ $event.data.to }}", &scope), "0400111222");
+        assert_eq!(interpolate(&sel, "{{ $event.data.to }}", &scope), "0400111222");
         // A missing one interpolates to nothing rather than to its own text.
-        assert_eq!(interpolate(&s, "x{{event.data.nope}}y", &scope), "xy");
+        assert_eq!(interpolate(&sel, "x{{event.data.nope}}y", &scope), "xy");
         // Braces that name nothing addressable are left as written.
-        assert_eq!(interpolate(&s, "{{not_a_root}}", &scope), "{{not_a_root}}");
+        assert_eq!(interpolate(&sel, "{{not_a_root}}", &scope), "{{not_a_root}}");
     }
 
     #[test]
     fn the_gate_decides_from_the_result_and_negates() {
-        let s = spec();
+        let sel = selectors();
         let result = json!({ "hasTask": true, "hasSms": false, "count": 0, "list": [] });
         let scope = result_scope(&result);
-        assert!(gate_passes(&s, None, &scope), "no gate runs");
-        assert!(gate_passes(&s, Some(""), &scope), "a blank gate runs");
-        assert!(gate_passes(&s, Some("$result.hasTask"), &scope));
-        assert!(!gate_passes(&s, Some("$result.hasSms"), &scope));
-        assert!(!gate_passes(&s, Some("$result.missing"), &scope));
-        assert!(gate_passes(&s, Some("!$result.hasSms"), &scope));
-        assert!(!gate_passes(&s, Some("!!$result.hasSms"), &scope));
+        assert!(gate_passes(&sel, None, &scope), "no gate runs");
+        assert!(gate_passes(&sel, Some(""), &scope), "a blank gate runs");
+        assert!(gate_passes(&sel, Some("$result.hasTask"), &scope));
+        assert!(!gate_passes(&sel, Some("$result.hasSms"), &scope));
+        assert!(!gate_passes(&sel, Some("$result.missing"), &scope));
+        assert!(gate_passes(&sel, Some("!$result.hasSms"), &scope));
+        assert!(!gate_passes(&sel, Some("!!$result.hasSms"), &scope));
         // 0 is false and an empty list is TRUE, because that is what the author
         // wrote the gate against.
-        assert!(!gate_passes(&s, Some("$result.count"), &scope));
-        assert!(gate_passes(&s, Some("$result.list"), &scope));
+        assert!(!gate_passes(&sel, Some("$result.count"), &scope));
+        assert!(gate_passes(&sel, Some("$result.list"), &scope));
     }
 
     #[test]
     fn the_live_bindings_actions_plan_into_exactly_what_they_say() {
         // Verbatim from this account's bindings.
         let s = spec();
+        let sel = selectors();
         let result = json!({
             "hasTask": true,
             "task": { "title": "Call back", "phone": "0421285243" },
@@ -821,7 +855,7 @@ mod tests {
             "when": "$result.hasTask", "answers": "$result.task"
         });
         assert_eq!(
-            plan(&s, &submit, &scope).unwrap(),
+            plan(&s, &sel, &submit, &scope).unwrap(),
             Planned::Submit {
                 form_id: "62c2a2cc".into(),
                 record: json!({ "title": "Call back", "phone": "0421285243" }),
@@ -834,7 +868,7 @@ mod tests {
             "responseId": "$result.responseId"
         });
         assert_eq!(
-            plan(&s, &update, &scope).unwrap(),
+            plan(&s, &sel, &update, &scope).unwrap(),
             Planned::Update {
                 form_id: "fde1f7f6".into(),
                 record_id: "resp-1".into(),
@@ -849,7 +883,7 @@ mod tests {
             "connectorId": "aokie"
         });
         assert_eq!(
-            plan(&s, &sms, &scope).unwrap(),
+            plan(&s, &sel, &sms, &scope).unwrap(),
             Planned::Connector {
                 connector_id: "aokie".into(),
                 command: "sms.send".into(),
@@ -861,14 +895,15 @@ mod tests {
     #[test]
     fn a_gate_that_says_no_is_skipped_and_is_not_a_failure() {
         let s = spec();
+        let sel = selectors();
         let result = json!({ "hasSms": false });
         let scope = result_scope(&result);
         let sms = json!({
             "type": "connector.request", "when": "$result.hasSms", "command": "sms.send",
             "payload": { "to": "$result.sms.to" }, "connectorId": "aokie"
         });
-        assert_eq!(plan(&s, &sms, &scope).unwrap(), Planned::Skipped);
-        let (planned, errors) = plan_all(&s, std::slice::from_ref(&sms), &scope);
+        assert_eq!(plan(&s, &sel, &sms, &scope).unwrap(), Planned::Skipped);
+        let (planned, errors) = plan_all(&s, &sel, std::slice::from_ref(&sms), &scope);
         assert!(planned.is_empty());
         assert!(errors.is_empty(), "a gate saying no is not an error: {errors:?}");
     }
@@ -878,31 +913,33 @@ mod tests {
         // The failure this most protects against: an ungated update whose
         // answers resolved to nothing would otherwise blank a real record.
         let s = spec();
+        let sel = selectors();
         let result = json!({});
         let scope = result_scope(&result);
         let update = json!({
             "form": "fde1f7f6", "type": "formlogic.updateResponse",
             "answers": "$result.nope", "responseId": "$result.alsoNope"
         });
-        let err = plan(&s, &update, &scope).expect_err("must refuse");
+        let err = plan(&s, &sel, &update, &scope).expect_err("must refuse");
         assert!(err.contains("record"), "{err}");
 
         // And a submit with no id to update at all.
         let submit = json!({ "form": "x", "type": "formlogic.submitResponse", "answers": "$result.nope" });
-        assert!(plan(&s, &submit, &scope).is_err());
+        assert!(plan(&s, &sel, &submit, &scope).is_err());
     }
 
     #[test]
     fn an_action_this_desktop_cannot_map_is_refused_by_name() {
         let s = spec();
+        let sel = selectors();
         let result = json!({});
         let scope = result_scope(&result);
         // Allowed by the provider, deliberately unmapped here for now.
         let speak = json!({ "type": "call.speak", "message": "hello" });
-        let err = plan(&s, &speak, &scope).expect_err("an unmapped action must not be silently skipped");
+        let err = plan(&s, &sel, &speak, &scope).expect_err("an unmapped action must not be silently skipped");
         assert!(err.contains("maps no such action"), "{err}");
         // It is reported, not dropped.
-        let (planned, errors) = plan_all(&s, &[speak], &scope);
+        let (planned, errors) = plan_all(&s, &sel, &[speak], &scope);
         assert!(planned.is_empty());
         assert_eq!(errors.len(), 1);
         assert!(errors[0].contains("call.speak"), "{:?}", errors);
@@ -911,11 +948,12 @@ mod tests {
     #[test]
     fn an_oversized_binding_performs_what_it_can_and_says_what_it_did_not() {
         let s = spec();
+        let sel = selectors();
         let result = json!({ "m": "hi" });
         let scope = result_scope(&result);
         let one = json!({ "type": "formlogic.toast", "message": "{{result.m}}" });
         let many: Vec<Value> = std::iter::repeat_n(one, s.max_actions + 3).collect();
-        let (planned, errors) = plan_all(&s, &many, &scope);
+        let (planned, errors) = plan_all(&s, &sel, &many, &scope);
         assert_eq!(planned.len(), s.max_actions);
         assert_eq!(errors.len(), 1);
         assert!(errors[0].contains("only the first"), "{:?}", errors);
@@ -1009,10 +1047,11 @@ mod tests {
     #[test]
     fn actions_run_in_the_order_written_because_later_ones_depend_on_earlier_ones() {
         let s = spec();
+        let sel = selectors();
         let result = live_result();
         let scope = result_scope(&result);
         let spy = Spy::default();
-        let errors = perform_all(&s, &live_actions(), &scope, "flow:b1:call_x:ended:v1", &spy);
+        let errors = perform_all(&s, &sel, &live_actions(), &scope, "flow:b1:call_x:ended:v1", &spy);
         assert!(errors.is_empty(), "{errors:?}");
         assert_eq!(
             *spy.done.borrow(),
@@ -1030,13 +1069,14 @@ mod tests {
         // Four independent errands. Losing three because the second's form was
         // deleted would throw away work that would have succeeded.
         let s = spec();
+        let sel = selectors();
         let result = live_result();
         let scope = result_scope(&result);
         let spy = Spy {
             fail: vec!["submit"],
             ..Spy::default()
         };
-        let errors = perform_all(&s, &live_actions(), &scope, "flow:b1:call_x:ended:v1", &spy);
+        let errors = perform_all(&s, &sel, &live_actions(), &scope, "flow:b1:call_x:ended:v1", &spy);
         assert_eq!(spy.done.borrow().len(), 4, "every action still ran");
         assert_eq!(errors.len(), 1);
         assert!(errors[0].contains("the form is gone"), "{:?}", errors);
@@ -1048,6 +1088,7 @@ mod tests {
         // event; the position distinguishes two actions of the same binding,
         // which would otherwise collapse and perform only the first.
         let s = spec();
+        let sel = selectors();
         let result = json!({ "hasSms": true, "sms": { "to": "1" } });
         let scope = result_scope(&result);
         let two = vec![
@@ -1059,9 +1100,9 @@ mod tests {
         let run_key = "flow:b1:aokie:call_2a6b:ended:v1";
 
         let first = Spy::default();
-        perform_all(&s, &two, &scope, run_key, &first);
+        perform_all(&s, &sel, &two, &scope, run_key, &first);
         let second = Spy::default();
-        perform_all(&s, &two, &scope, run_key, &second);
+        perform_all(&s, &sel, &two, &scope, run_key, &second);
 
         // Same event replayed -> byte-identical keys, so the journal dedupes.
         assert_eq!(*first.keys.borrow(), *second.keys.borrow());
@@ -1075,13 +1116,56 @@ mod tests {
     #[test]
     fn a_gated_off_action_never_reaches_the_outside_world() {
         let s = spec();
+        let sel = selectors();
         // No SMS, no call: only the toast should happen.
         let result = json!({ "hasTask": false, "hasSms": false, "hasCall": false, "responseId": "r" });
         let scope = result_scope(&result);
         let spy = Spy::default();
-        let errors = perform_all(&s, &live_actions(), &scope, "k", &spy);
+        let errors = perform_all(&s, &sel, &live_actions(), &scope, "k", &spy);
         assert!(errors.is_empty(), "{errors:?}");
         assert_eq!(*spy.done.borrow(), vec!["notify:done r"]);
+    }
+
+    #[test]
+    fn a_bindings_input_map_becomes_the_flows_inputs() {
+        // Live report 2026-08-01: the receptionist answered and hung up. Its
+        // flow asked the plugin to configure the agent for `$inputs.callId`,
+        // and nothing had ever built `inputs` — seventeen of nineteen bindings
+        // declare a map and every one was discarded, so the plugin was handed
+        // no callId and refused, and the call dropped.
+        let sel = selectors();
+        let event = json!({
+            "name": "aokie.call.caller_id",
+            "data": { "from": "0421285243", "callId": "call_5089e2ff" }
+        });
+        let scope = Scope {
+            event: Some(&event),
+            ..Scope::default()
+        };
+        // The binding's map, verbatim.
+        let map = json!({ "from": "$event.data.from", "callId": "$event.data.callId" });
+        assert_eq!(
+            build_inputs(&sel, &map, &scope),
+            json!({ "from": "0421285243", "callId": "call_5089e2ff" })
+        );
+
+        // A name whose reference resolves to nothing is LEFT OUT rather than
+        // set to null: the plugin refuses a missing callId by name, which is
+        // the honest outcome, where a null one reads as a real answer.
+        let sparse = json!({ "callId": "$event.data.callId", "outcome": "$event.data.outcome" });
+        let built = build_inputs(&sel, &sparse, &scope);
+        assert_eq!(built["callId"], json!("call_5089e2ff"));
+        assert!(built.get("outcome").is_none(), "{built}");
+
+        // A literal in the map stays a literal — not every input is a reference.
+        let mixed = json!({ "outcome": "sent", "to": "$event.data.from" });
+        assert_eq!(
+            build_inputs(&sel, &mixed, &scope),
+            json!({ "outcome": "sent", "to": "0421285243" })
+        );
+
+        // No map at all is an empty set, not a failure.
+        assert_eq!(build_inputs(&sel, &json!(null), &scope), json!({}));
     }
 
     #[test]

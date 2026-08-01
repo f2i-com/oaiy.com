@@ -457,6 +457,9 @@ fn apply_result_actions(
     let Some(actions_spec) = spec.result_actions.as_ref() else {
         return result;
     };
+    let Some(selectors) = spec.selectors.as_ref() else {
+        return result;
+    };
     let Some(binding_id) = run.binding_id.as_deref().filter(|s| !s.is_empty()) else {
         return result;
     };
@@ -509,7 +512,8 @@ fn apply_result_actions(
         spec: actions_spec,
         connector,
     };
-    let errors = result_actions::perform_all(actions_spec, &actions, &scope, run_key, &doer);
+    let errors =
+        result_actions::perform_all(actions_spec, selectors, &actions, &scope, run_key, &doer);
     for e in &errors {
         log::info!("flow run {} binding {binding_id}: {e}", run.id);
     }
@@ -1238,6 +1242,8 @@ mod tests {
             complete_path: None,
             graph_path: None,
             nodes: Vec::new(),
+            selectors: None,
+            input_map_field: None,
             result_actions: None,
         };
         assert!(Lane::of(&spec).is_none());
@@ -1350,6 +1356,8 @@ mod tests {
             complete_path: Some("/runs/{id}".into()),
             graph_path: Some("/flows".into()),
             nodes: Vec::new(),
+            selectors: None,
+            input_map_field: None,
             result_actions: None,
         }
     }
