@@ -69,6 +69,56 @@
       { "nodeType": "desktop_services", "operation": "serviceControl" }
     ]
   },
+  "appLogic": {
+    "path": "/api/v1/app-logic",
+    "eventHook": "onConnectorEvent",
+    "submitPath": "/api/v1/forms/{formId}/responses",
+    "listPath": "/api/v1/forms/{formId}/responses",
+    "updatePath": "/api/v1/forms/{formId}/responses/{id}",
+    "matchScanLimit": 200,
+    "fields": {
+      "kind": "type",
+      "formKey": "formKey",
+      "record": "answers",
+      "recordId": "responseId",
+      "matchBlock": "match",
+      "matchField": "field",
+      "matchValue": "value",
+      "upsert": "upsert",
+      "storageKey": "key",
+      "storageValue": "value",
+      "message": "message",
+      "level": "level",
+      "connectorId": "connectorId",
+      "command": "command",
+      "payload": "payload",
+      "items": "responses",
+      "id": "id",
+      "effectsList": "effects"
+    },
+    "catalogue": {
+      "apps": "apps",
+      "appBlock": "app",
+      "appId": "id",
+      "appSlug": "slug",
+      "logicBlock": "customLogic",
+      "scripts": "scripts",
+      "scriptId": "id",
+      "scriptHook": "hook",
+      "scriptSource": "source",
+      "forms": "forms",
+      "formId": "id",
+      "formKey": "packFormId"
+    },
+    "effects": [
+      { "effectType": "formlogic.submitResponse", "operation": "submitRecord" },
+      { "effectType": "formlogic.updateResponse", "operation": "updateRecord" },
+      { "effectType": "storage.set", "operation": "setStorage" },
+      { "effectType": "ui.toast", "operation": "notify" },
+      { "effectType": "formlogic.toast", "operation": "notify" },
+      { "effectType": "connector.request", "operation": "connectorRequest" }
+    ]
+  },
   "dataNode": {
     "registerPath": "/api/v1/data-node/register",
     "selfPath": "/api/v1/data-node/self",

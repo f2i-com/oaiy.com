@@ -1713,6 +1713,11 @@ pub fn build_bridge_state(
         env!("CARGO_PKG_VERSION").to_string(),
         cfg!(debug_assertions),
     );
+    // The account's app logic scripts run through the bundled CLI, which runs
+    // under Node — and a packaged install cannot assume one is on PATH. Same
+    // handle the flow worker below is given, so the two cannot resolve
+    // differently on the same machine.
+    host.set_node_runtime(node.clone());
     let flows = std::sync::Arc::new(bridge::FlowStore::new(data_dir.join("flows")));
     // Durable pairing tokens under <data>/bridge, so a paired consumer stays
     // paired across restarts.
