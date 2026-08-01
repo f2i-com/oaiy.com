@@ -37,6 +37,13 @@ use super::{LinkHandle, LinkedAccount};
 
 const IDENTITY_FILE: &str = "data-node-signing.key";
 
+/// How often the node record is read back.
+///
+/// Enrolment itself is hourly, but APPROVAL happens in a browser at a moment
+/// nothing here can predict, and the owner is usually looking at both screens
+/// when it does. A minute is the difference between "it worked" and "it didn't".
+const REFRESH_INTERVAL: Duration = Duration::from_secs(45);
+
 /// STANDARD base64 with padding — the provider decodes the published key
 /// strictly, and this app's usual alphabet is URL-safe and unpadded.
 const B64: base64::engine::general_purpose::GeneralPurpose =
@@ -151,13 +158,15 @@ pub fn spawn(store: LinkHandle) {
                 return;
             }
         };
-        let mut next_due = std::time::Instant::now();
+        let mut next_register = std::time::Instant::now();
+        let mut next_refresh = std::time::Instant::now();
         loop {
             std::thread::sleep(Duration::from_secs(5));
             let Some(account) = store.account() else {
-                // Unlinked: register promptly when a link next appears rather
-                // than inheriting an old timer.
-                next_due = std::time::Instant::now();
+                // Unlinked: act promptly when a link next appears rather than
+                // inheriting an old timer.
+                next_register = std::time::Instant::now();
+                next_refresh = std::time::Instant::now();
                 continue;
             };
             let Some(spec) =
@@ -165,15 +174,31 @@ pub fn spawn(store: LinkHandle) {
             else {
                 continue;
             };
-            if std::time::Instant::now() < next_due {
+            let now = std::time::Instant::now();
+
+            // Registering is a WRITE and belongs on the slow schedule.
+            if now >= next_register {
+                match register(&account, &spec, &identity) {
+                    Ok(status) => store.note_data_node(Ok(status)),
+                    Err(e) => store.note_data_node(Err(e)),
+                }
+                next_register = now + Duration::from_secs(spec.interval_seconds.max(60));
+                // A register answers with the record too, so the read-back can
+                // wait its full interval rather than firing straight after.
+                next_refresh = now + REFRESH_INTERVAL;
                 continue;
             }
-            match register(&account, &spec, &identity) {
-                Ok(status) => store.note_data_node(Ok(status)),
-                Err(e) => store.note_data_node(Err(e)),
+
+            // Reading the record back is cheap, and it is the ONLY way this
+            // desktop learns the owner approved it. Left to the hourly
+            // registration, an approval sat invisible for up to an hour —
+            // which reads as the approval not having worked.
+            if now >= next_refresh {
+                if let Some(status) = refresh(&account, &spec) {
+                    store.note_data_node(Ok(status));
+                }
+                next_refresh = now + REFRESH_INTERVAL;
             }
-            next_due =
-                std::time::Instant::now() + Duration::from_secs(spec.interval_seconds.max(60));
         }
     });
 }
@@ -214,6 +239,27 @@ fn register(
         return Err(format!("HTTP {}: {message}", status.as_u16()));
     }
     node_status(&payload).ok_or_else(|| "the provider returned no node record".to_string())
+}
+
+/// Read this desktop's node record back.
+///
+/// Returns `None` rather than an error on any failure: a transient read that
+/// could not be made is not news, and replacing a good record with an error
+/// would blank the fingerprint the owner is mid-way through comparing.
+fn refresh(account: &LinkedAccount, spec: &DataNodeSpec) -> Option<DataNodeStatus> {
+    let http = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .ok()?;
+    let resp = http
+        .get(super::oauth::join(&account.base_url, &spec.self_path))
+        .bearer_auth(&account.credential)
+        .send()
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    node_status(&resp.json::<Value>().ok()?)
 }
 
 /// Read the node record out of a register or self response.
