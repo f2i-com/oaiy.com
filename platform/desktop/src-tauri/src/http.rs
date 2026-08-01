@@ -902,12 +902,25 @@ struct AuthConfig {
 }
 
 impl AuthConfig {
-    /// Does `presented` match the configured token OR a live paired token?
+    /// Does `presented` match the configured token, this process's own internal
+    /// token, OR a live paired token?
     fn token_matches(&self, presented: &str) -> bool {
+        // An empty bearer is never a match — a caller that sent nothing must not
+        // pass because something on this side is also unset.
+        if presented.is_empty() {
+            return false;
+        }
         if let Some(want) = self.token.as_deref() {
             if token_eq(want, presented) {
                 return true;
             }
+        }
+        // The credential this process hands its own children (the CLI running a
+        // flow). Same trust as the parent, by construction — it was spawned by
+        // it — and it has no browser origin the guard could recognise instead.
+        let internal = crate::internal_token();
+        if !internal.is_empty() && token_eq(internal, presented) {
+            return true;
         }
         if let Some(p) = &self.pairing {
             if let Ok(mgr) = p.lock() {

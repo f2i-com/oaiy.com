@@ -579,6 +579,17 @@ pub fn run_flow_cli(req: CliRequest, cancelled: &dyn Fn() -> bool) -> CliOutcome
         "OAIY_SERVER_URL",
         format!("http://127.0.0.1:{}", crate::DESKTOP_PORT),
     );
+    // And who it is when it gets there. Privileged routes — the AI gateway
+    // among them — fail closed on a missing Origin, and a spawned CLI has none,
+    // so without this every chat node in a relayed flow was refused with
+    // "origin not allowed" and failed the whole run. The child is this
+    // process's own, so it carries this process's credential.
+    let internal = crate::internal_token();
+    if internal.is_empty() {
+        cmd.env_remove("OAIY_SERVER_TOKEN");
+    } else {
+        cmd.env("OAIY_SERVER_TOKEN", internal);
+    }
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
