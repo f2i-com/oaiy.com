@@ -1505,6 +1505,14 @@ pub fn run() {
                         bridge_for_http.host.clone(),
                     ),
                 );
+                // Execute the flow runs the account has queued. The other half
+                // of the flows lane: without it this desktop reserves runs and
+                // then waits for a runtime that may not exist, and every one of
+                // them sits queued until somebody's reaper calls it stale.
+                crate::link::flow_runner::spawn(
+                    link_for_http.clone(),
+                    Some(node_for_http.clone()),
+                );
                 // Answer the sealed chat turns the provider's web app relays.
                 // Without it the website cannot encrypt to this machine at all
                 // and says the desktop has published no key.

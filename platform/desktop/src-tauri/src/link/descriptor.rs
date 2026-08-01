@@ -122,12 +122,14 @@ pub struct ConnectorDescriptor {
     pub flows: Option<FlowsSpec>,
 }
 
-/// The account's flow triggers: read the bindings, reserve a run.
+/// The account's flow lane: read the bindings, reserve a run, and — when the
+/// provider offers the rest of the paths — claim a queued run and execute it.
 ///
-/// Reserve only. This desktop does not execute the provider's flow graph — it
-/// queues a run and lets whatever runtime already claims queued runs do the
-/// work, which is what keeps there from being a second flow engine to hold in
-/// step with the first.
+/// Reserving is the minimum. A provider that names only `bindingsPath` and
+/// `reservePath` gets runs queued for whatever runtime it already has; one that
+/// also names the queue, the claim, the completion and where its graphs live
+/// lets this desktop be that runtime. There is still no second flow engine —
+/// the graph is handed to the same CLI the browser's engine is built from.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct FlowsSpec {
@@ -144,6 +146,15 @@ pub struct FlowsSpec {
     /// Report a run's terminal status. `{id}` is substituted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub complete_path: Option<String>,
+    /// Where the account's flow GRAPHS are read from.
+    ///
+    /// A claimed run names a flow but does not carry it, and this desktop
+    /// cannot execute what it cannot read — so a provider that wants its runs
+    /// executed here says where the graphs are. Omitted by a provider that only
+    /// wants runs QUEUED, which leaves the claim lane unusable and the runs to
+    /// whatever runtime the provider already has.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph_path: Option<String>,
     /// The node types this provider's graphs are written in, and what each one
     /// means in terms this desktop can actually perform.
     ///
@@ -517,6 +528,7 @@ impl ConnectorDescriptor {
                 ("queuedPath", &f.queued_path),
                 ("claimPath", &f.claim_path),
                 ("completePath", &f.complete_path),
+                ("graphPath", &f.graph_path),
             ] {
                 if let Some(p) = path {
                     if !p.starts_with('/') {
@@ -535,6 +547,30 @@ impl ConnectorDescriptor {
                     "connector {:?} flows names one of claimPath/completePath without the other",
                     self.id
                 ));
+            }
+            // Without the placeholder every claim and every completion would hit
+            // one fixed URL — the failure the relay lane already learned.
+            for (label, path) in [("claimPath", &f.claim_path), ("completePath", &f.complete_path)] {
+                if let Some(p) = path {
+                    if !p.contains("{id}") {
+                        return Err(format!(
+                            "connector {:?} flows {label} must contain the {{id}} placeholder",
+                            self.id
+                        ));
+                    }
+                }
+            }
+            // These two are not per-run, so a placeholder in them would be sent
+            // to the provider literally and fetch nothing.
+            for (label, path) in [("queuedPath", &f.queued_path), ("graphPath", &f.graph_path)] {
+                if let Some(p) = path {
+                    if p.contains("{id}") {
+                        return Err(format!(
+                            "connector {:?} flows {label} takes no {{id}} placeholder",
+                            self.id
+                        ));
+                    }
+                }
             }
             let mut seen = std::collections::BTreeSet::new();
             for node in &f.nodes {
@@ -711,6 +747,36 @@ mod tests {
         flows.complete_path = None;
         let err = d.validate().unwrap_err();
         assert!(err.contains("claimPath/completePath"), "{err}");
+    }
+
+    #[test]
+    fn a_flow_lane_that_can_claim_says_where_the_graphs_are() {
+        // A claimed run names its flow but does not carry it. Without somewhere
+        // to read the graph this desktop would claim runs it cannot execute —
+        // the worst state of all, since a claimed run is one no other runtime
+        // will take either.
+        let d = find(std::path::Path::new("/nonexistent"), "formlogic").unwrap();
+        let f = d.flows.unwrap();
+        assert!(f.queued_path.is_some());
+        assert!(f.graph_path.as_deref().is_some_and(|p| p.starts_with('/')));
+    }
+
+    #[test]
+    fn the_per_run_paths_take_a_placeholder_and_the_list_paths_do_not() {
+        // Both directions are silent failures: a claim path without {id} sends
+        // every claim to one URL, and a queue path WITH one asks the provider
+        // for a run literally called "{id}".
+        let base: ConnectorDescriptor = serde_json::from_str(BUILTIN[0]).unwrap();
+
+        let mut no_placeholder = base.clone();
+        no_placeholder.flows.as_mut().unwrap().claim_path = Some("/api/v1/flow-runs/claim".into());
+        let err = no_placeholder.validate().unwrap_err();
+        assert!(err.contains("claimPath"), "{err}");
+
+        let mut stray = base.clone();
+        stray.flows.as_mut().unwrap().graph_path = Some("/api/v1/flows/{id}".into());
+        let err = stray.validate().unwrap_err();
+        assert!(err.contains("graphPath"), "{err}");
     }
 
     #[test]

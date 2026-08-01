@@ -41,6 +41,10 @@ program
   .option('--inputs <file>', 'JSON file of inputs (merged under --input)')
   .option('--constant <kv...>', 'constant KEY=value (e.g. OPENAI_API_KEY=...) (repeatable)')
   .option('--constants <file>', 'JSON file of constants')
+  .option(
+    '--connector <file>',
+    'JSON connector config from a linked provider; its node types are registered before the run',
+  )
   .option('-o, --out <file>', 'write result JSON to a file (default: stdout)')
   .option('--timeout <seconds>', 'run timeout in seconds', (v) => {
     const n = parseInt(v, 10);
@@ -58,11 +62,16 @@ program
 
     if (!opts.quiet) {
       process.stderr.write(`oaiy: running '${name}' (${graph.nodes.length} nodes)…\n`);
+      if (opts.connector) {
+        process.stderr.write(`oaiy: connector config ${opts.connector}\n`);
+      }
     }
 
     const res = await runFlow(graph, {
       inputs,
       constants,
+      // A linked provider's node types, built from its config at run time.
+      connectorPath: opts.connector,
       // Without this, a flow containing a subflow or macro node can't run
       // headlessly — the compiler resolves those targets by id out of this list.
       availableFlows: flows,

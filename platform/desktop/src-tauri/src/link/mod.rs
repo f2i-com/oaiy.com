@@ -16,6 +16,7 @@
 pub mod condition;
 pub mod data_node;
 pub mod descriptor;
+pub mod flow_runner;
 pub mod flows;
 pub mod heartbeat;
 pub mod oauth;
@@ -158,6 +159,17 @@ pub struct LinkStatus {
     pub last_relay_at: Option<chrono::DateTime<chrono::Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub relay_error: Option<String>,
+    /// When this desktop last looked at the account's queued flow runs, and why
+    /// it stopped if it did.
+    ///
+    /// The same invisible failure as the relay's, one step worse: a run this
+    /// desktop CLAIMED and could not report on is marked running at the
+    /// provider, so no other runtime will take it either. That has to be
+    /// readable from here, because it is not readable from anywhere else.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_flow_run_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub flow_run_error: Option<String>,
     /// Whether the linked connector declares each lane at all.
     ///
     /// Taken from the descriptor, not from whether anything has happened yet: a
@@ -166,6 +178,11 @@ pub struct LinkStatus {
     /// "connecting…" that is never going to resolve.
     pub heartbeat_supported: bool,
     pub relay_supported: bool,
+    /// Whether the connector declares a flow lane this desktop can claim FROM,
+    /// as opposed to one it can only reserve INTO. Distinguishing the two is
+    /// what keeps "this provider runs its own flows" from reading as "flow
+    /// execution is broken here".
+    pub flow_runs_supported: bool,
     /// This desktop's storage-node enrolment, once the provider has answered.
     /// The fingerprint here is what the owner compares against their browser
     /// before approving — the whole ceremony rests on the two matching.
@@ -208,6 +225,8 @@ struct Inner {
     heartbeat_error: Option<String>,
     last_relay_at: Option<chrono::DateTime<chrono::Utc>>,
     relay_error: Option<String>,
+    last_flow_run_at: Option<chrono::DateTime<chrono::Utc>>,
+    flow_run_error: Option<String>,
     data_node: Option<data_node::DataNodeStatus>,
     data_node_error: Option<String>,
 }
@@ -237,6 +256,8 @@ pub fn open_handle(data_dir: PathBuf) -> LinkHandle {
             heartbeat_error: None,
             last_relay_at: None,
             relay_error: None,
+            last_flow_run_at: None,
+            flow_run_error: None,
             data_node: None,
             data_node_error: None,
         }),
@@ -284,8 +305,11 @@ impl LinkStore {
                 heartbeat_error: None,
                 last_relay_at: None,
                 relay_error: None,
+                last_flow_run_at: None,
+                flow_run_error: None,
                 heartbeat_supported: false,
                 relay_supported: false,
+                flow_runs_supported: false,
                 data_node: None,
                 data_node_error: None,
                 data_node_supported: false,
@@ -310,8 +334,18 @@ impl LinkStore {
                     heartbeat_error: inner.heartbeat_error.clone(),
                     last_relay_at: inner.last_relay_at,
                     relay_error: inner.relay_error.clone(),
+                    last_flow_run_at: inner.last_flow_run_at,
+                    flow_run_error: inner.flow_run_error.clone(),
                     heartbeat_supported: d.is_some_and(|d| d.heartbeat.is_some()),
                     relay_supported: d.is_some_and(|d| d.relay.is_some()),
+                    // Every path of the claim lane, not just some: a provider
+                    // missing one of them cannot have its runs executed here.
+                    flow_runs_supported: d.and_then(|d| d.flows.as_ref()).is_some_and(|f| {
+                        f.queued_path.is_some()
+                            && f.claim_path.is_some()
+                            && f.complete_path.is_some()
+                            && f.graph_path.is_some()
+                    }),
                     data_node: inner.data_node.clone(),
                     data_node_error: inner.data_node_error.clone(),
                     data_node_supported: d.is_some_and(|d| d.data_node.is_some()),
@@ -374,6 +408,19 @@ impl LinkStore {
         inner.relay_error = error;
     }
 
+    /// Record the outcome of one look at the account's queued flow runs.
+    ///
+    /// The timestamp is what makes "no error" mean something: without it a lane
+    /// that never started and one that is claiming and running flows every few
+    /// seconds look identical from the panel.
+    pub fn note_flow_run(&self, error: Option<String>) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if error.is_none() {
+            inner.last_flow_run_at = Some(chrono::Utc::now());
+        }
+        inner.flow_run_error = error;
+    }
+
     /// Record the outcome of a node registration.
     pub fn note_data_node(&self, outcome: Result<data_node::DataNodeStatus, String>) {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -433,6 +480,8 @@ impl LinkStore {
             // would be shown against the next one that is linked.
             inner.last_relay_at = None;
             inner.relay_error = None;
+            inner.last_flow_run_at = None;
+            inner.flow_run_error = None;
             // The IDENTITY stays on disk: the same machine relinking is the
             // same node, and re-minting would ask the owner to approve a device
             // they already approved. Only the provider's answer is forgotten.
