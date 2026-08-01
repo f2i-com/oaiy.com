@@ -270,7 +270,20 @@ const CoreUtilityCompiler: ModuleCompiler = {
         const scopedNames = (): string => {
           let out = `
     let context = workflow_context;
-    let input = ${inputVar};`;
+    let input = ${inputVar};
+    // The names a graph addresses its data by. context/input above are this
+    // app's spelling; these are the ones a linked provider's blocks are
+    // written against, and a block reading nodes.settings throws
+    // "nodes is not defined" without them — at run time, having compiled
+    // perfectly well. Same values, so a block may use either vocabulary.
+    let nodes = workflow_context;
+    let inputs = typeof __inputs === 'undefined' ? {} : __inputs;
+    let event = inputs && inputs.event !== undefined ? inputs.event : inputs;
+    let upstream = ${inputVar};
+    // Declared and empty rather than absent: a block asking about the app it
+    // belongs to should read "nothing known" instead of dying, since nothing
+    // out here can answer it.
+    let app = {};`;
           for (const [handleId, sourceVar] of inputs) {
             if (handleId !== 'default' && handleId !== 'input') {
               out += `

@@ -83,11 +83,23 @@ const CoreFlowControlCompiler: ModuleCompiler = {
   yield Utility.requireCodeExecute(["condition expression in node ${node.id}"]);
   let _cond_val_${sanitizedId} = ${inputVar};${loopIndexDecl}
   let _cond_result_${sanitizedId} = false;
-  try {
-    _cond_result_${sanitizedId} = !!(${expr});
-  } catch(e) {
-    console.warn("[Condition] (${node.id}) expression error:", e.message);
-    _cond_result_${sanitizedId} = false;
+  {
+    // The names a graph writes its conditions against — the same set a logic
+    // block gets, because the same author writes both and a route decided by
+    // a throw is a route that silently takes the false branch.
+    let context = workflow_context;
+    let nodes = workflow_context;
+    let input = _cond_val_${sanitizedId};
+    let upstream = _cond_val_${sanitizedId};
+    let inputs = typeof __inputs === 'undefined' ? {} : __inputs;
+    let event = inputs && inputs.event !== undefined ? inputs.event : inputs;
+    let app = {};
+    try {
+      _cond_result_${sanitizedId} = !!(${expr});
+    } catch(e) {
+      console.warn("[Condition] (${node.id}) expression error:", e.message);
+      _cond_result_${sanitizedId} = false;
+    }
   }`;
 
           // Use let for branch outputs only if not inside a loop (loop pre-declares them)
