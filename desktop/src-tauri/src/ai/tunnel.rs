@@ -32,6 +32,7 @@ use std::time::Duration;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use crate::ai::chat_tools;
 use crate::ai::e2e::{E2eIdentity, E2eSessions};
 use crate::ai::providers::Capability;
 use crate::link::descriptor::{self, DesktopAiSpec};
@@ -81,7 +82,7 @@ const MAX_STREAM_FRAMES: u64 = 4096;
 /// Bundled because a streaming answer posts frames from several places, and
 /// threading five parameters through each of them invites getting one wrong —
 /// the instance id in particular, which every call must carry.
-struct Lane<'a> {
+pub struct Lane<'a> {
     http: reqwest::Client,
     account: &'a LinkedAccount,
     spec: &'a DesktopAiSpec,
@@ -90,6 +91,40 @@ struct Lane<'a> {
 }
 
 impl Lane<'_> {
+    /// The relayed request this lane belongs to — also the E2E session key.
+    pub fn id(&self) -> &str {
+        self.id
+    }
+
+    /// Poll the sealed inbound channel for frames after `since`.
+    ///
+    /// The cursor is the provider's own frame sequence, which is global rather
+    /// than per-request, so it is opaque: advance it from what arrives and
+    /// never assume it starts at one.
+    pub async fn fetch_input(&self, since: u64) -> Result<Value, String> {
+        let url = format!(
+            "{}?since={since}&instanceId={}",
+            crate::link::oauth::join(
+                &self.account.base_url,
+                &self.spec.input_path.replace("{id}", self.id),
+            ),
+            urlencode(self.instance),
+        );
+        let resp = self
+            .http
+            .get(&url)
+            .bearer_auth(&self.account.credential)
+            .send()
+            .await
+            .map_err(|e| format!("could not poll for approvals: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("the approval poll failed: HTTP {}", resp.status().as_u16()));
+        }
+        resp.json::<Value>()
+            .await
+            .map_err(|e| format!("the approval poll returned nothing readable: {e}"))
+    }
+
     async fn post_frame(&self, envelope: &str) -> Result<(), String> {
         let url = crate::link::oauth::join(
             &self.account.base_url,
@@ -539,7 +574,7 @@ impl AiTunnel {
 
         match kind {
             "models" => self.list_models(provider_id).await,
-            "chat" => self.chat(lane, provider_id, model.as_deref(), &body).await,
+            "chat" => self.chat(lane, provider_id, model.as_deref(), &body, eph_pub).await,
             other => Err(TunnelError::new(
                 "invalid_request",
                 format!("this desktop does not serve the AI request kind {other:?}"),
@@ -640,6 +675,7 @@ impl AiTunnel {
         provider_id: &str,
         model: Option<&str>,
         body: &Value,
+        eph_pub: &str,
     ) -> Result<Vec<u8>, TunnelError> {
         let messages = body
             .get("messages")
@@ -650,6 +686,39 @@ impl AiTunnel {
         let mut chat_body = json!({ "messages": messages });
         if let Some(m) = model {
             chat_body["model"] = json!(m);
+        }
+
+        // A turn carrying a grant may act on the account. Without one — or with
+        // a catalogue that is empty or unreachable — this is byte-for-byte the
+        // plain path below, so a provider with no tools loses nothing.
+        let grant = body
+            .get("toolGrant")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|g| !g.is_empty());
+        if let (Some(grant), Some(catalog_path), Some(execute_path)) = (
+            grant,
+            lane.spec.tools_catalog_path.as_deref(),
+            lane.spec.tools_execute_path.as_deref(),
+        ) {
+            let tools = chat_tools::catalog(
+                &lane.http,
+                &lane.account.base_url,
+                &lane.account.credential,
+                catalog_path,
+            )
+            .await;
+            if !tools.is_empty() {
+                return self
+                    .chat_with_tools(lane, provider_id, model, &messages, ToolRun {
+                        grant,
+                        execute_path,
+                        tools,
+                        confirm: body.get("toolMode").and_then(Value::as_str) == Some("confirm"),
+                        eph_pub: eph_pub.to_string(),
+                    })
+                    .await;
+            }
         }
 
         if is_codex(provider_id) {
@@ -674,6 +743,181 @@ impl AiTunnel {
             .await
             .map_err(|e| TunnelError::new("upstream_error", e.message()))?;
         Ok(final_with_completion(completion))
+    }
+
+    /// Run the bounded tool loop for one turn.
+    ///
+    /// Non-streaming by design: the loop has to READ each reply before any of
+    /// it is user-visible, because the reply may be a tool call rather than an
+    /// answer. Streaming a call's fenced block to the user would show them the
+    /// machinery instead of the result.
+    async fn chat_with_tools(
+        &self,
+        lane: &Lane<'_>,
+        provider_id: &str,
+        model: Option<&str>,
+        messages: &[Value],
+        run: ToolRun<'_>,
+    ) -> Result<Vec<u8>, TunnelError> {
+        let native = if is_codex(provider_id) {
+            None
+        } else {
+            let p = self.resolve(provider_id)?;
+            // Only the OpenAI dialect carries tool schemas out and tool calls
+            // back; anything translated would drop them on one leg or the other.
+            (p.protocol == crate::ai::providers::Protocol::OpenAi).then_some(p)
+        };
+
+        let mut convo: Vec<Value> = messages.to_vec();
+        // Extra turns the prompt-only transport has to carry itself, since it
+        // has no structured history to append to.
+        let mut prompted_extra: Vec<String> = Vec::new();
+        let mut grant_dead = false;
+        let mut input_cursor: u64 = 0;
+
+        for round in 0..chat_tools::MAX_TOOL_ROUNDS {
+            let offer_tools = chat_tools::tools_available(round, grant_dead);
+            let calls = match &native {
+                Some(provider) => {
+                    let mut request = json!({ "messages": convo });
+                    if let Some(m) = model {
+                        request["model"] = json!(m);
+                    }
+                    if offer_tools {
+                        request["tools"] = json!(chat_tools::as_openai_tools(&run.tools));
+                    }
+                    let completion = crate::ai::gateway::chat(provider, request)
+                        .await
+                        .map_err(|e| TunnelError::new("upstream_error", e.message()))?;
+                    let message = completion
+                        .pointer("/choices/0/message")
+                        .cloned()
+                        .unwrap_or(Value::Null);
+                    let calls = if offer_tools {
+                        chat_tools::parse_native(&message)
+                    } else {
+                        Vec::new()
+                    };
+                    if calls.is_empty() {
+                        return Ok(final_with_completion(completion));
+                    }
+                    // The assistant's own turn has to go back in, or the tool
+                    // replies below answer a message the model never sees.
+                    convo.push(message.clone());
+                    calls
+                }
+                None => {
+                    let mut prompt = if offer_tools {
+                        chat_tools::preamble(&run.tools)
+                    } else {
+                        chat_tools::plain_answer_instruction().to_string()
+                    };
+                    prompt.push_str("\n\n");
+                    prompt.push_str(&chat_tools::render_conversation(&convo));
+                    for extra in &prompted_extra {
+                        prompt.push_str("\n\n");
+                        prompt.push_str(extra);
+                    }
+                    let mut request = json!({
+                        "messages": [{ "role": "user", "content": prompt }],
+                    });
+                    if let Some(m) = model {
+                        request["model"] = json!(m);
+                    }
+                    let codex = self.sources.codex.clone();
+                    let completion =
+                        tokio::task::spawn_blocking(move || codex.chat_as(&request, None))
+                            .await
+                            .map_err(|e| TunnelError::new("upstream_error", e.to_string()))?
+                            .map_err(|e| TunnelError::new(codex_code(&e), e.message()))?;
+                    let text = completion
+                        .pointer("/choices/0/message/content")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    let call = if offer_tools {
+                        chat_tools::parse_prompted(&text, &run.tools)
+                    } else {
+                        None
+                    };
+                    match call {
+                        None => return Ok(final_with_completion(completion)),
+                        Some(c) => vec![c],
+                    }
+                }
+            };
+
+            for call in calls {
+                self.seal_and_post(lane, &chat_tools::call_frame(&call)).await?;
+
+                if run.confirm {
+                    self.seal_and_post(lane, &chat_tools::proposal_frame(&call, lane.id()))
+                        .await?;
+                    let verdict = chat_tools::wait_for_approval(
+                        lane,
+                        &self.sessions,
+                        &self.identity,
+                        &run.eph_pub,
+                        &call.id,
+                        &mut input_cursor,
+                    )
+                    .await;
+                    if let chat_tools::Approval::Denied(reason) = verdict {
+                        // A denial is an ordinary outcome: the model is told and
+                        // carries on. Failing the turn would punish the user for
+                        // saying no.
+                        let outcome = chat_tools::Executed::Failed {
+                            error: format!("not run — {reason}"),
+                            terminal: false,
+                        };
+                        self.seal_and_post(lane, &chat_tools::result_frame(&call, &outcome))
+                            .await?;
+                        push_result(&native, &mut convo, &mut prompted_extra, &call, &outcome);
+                        continue;
+                    }
+                }
+
+                let outcome = chat_tools::execute(
+                    &lane.http,
+                    &lane.account.base_url,
+                    &lane.account.credential,
+                    run.execute_path,
+                    run.grant,
+                    &call,
+                )
+                .await;
+                if let chat_tools::Executed::Failed { terminal: true, .. } = outcome {
+                    // The provider will refuse every later call identically;
+                    // retrying would be dishonest noise.
+                    grant_dead = true;
+                }
+                self.seal_and_post(lane, &chat_tools::result_frame(&call, &outcome))
+                    .await?;
+                push_result(&native, &mut convo, &mut prompted_extra, &call, &outcome);
+            }
+        }
+
+        // Unreachable in practice — the last round is offered no tools, so it
+        // answers — but a loop that could fall out of the bottom silently must
+        // still say something honest.
+        Err(TunnelError::new(
+            "upstream_error",
+            "the assistant kept calling tools without answering",
+        ))
+    }
+
+    /// Seal one activity frame and post it.
+    async fn seal_and_post(&self, lane: &Lane<'_>, frame: &Value) -> Result<(), TunnelError> {
+        let envelope = self
+            .sessions
+            .seal_outbound(lane.id(), frame.to_string().as_bytes())
+            .map_err(|e| TunnelError::new(e.code(), e.message()))?;
+        // A dropped activity frame costs the user a progress line, not the
+        // answer — the turn continues.
+        if let Err(e) = lane.post_frame(&envelope).await {
+            log::warn!("AI turn {} activity frame: {e}", lane.id());
+        }
+        Ok(())
     }
 
     /// Stream the managed ChatGPT account's answer.
@@ -899,6 +1143,40 @@ impl AiTunnel {
 fn is_codex(provider_id: &str) -> bool {
     provider_id == crate::ai::codex::CODEX_PROVIDER_ID
         || crate::ai::codex::LiveCallAlias::from_id(provider_id).is_some()
+}
+
+/// Everything the tool loop needs that the plain path does not.
+struct ToolRun<'a> {
+    grant: &'a str,
+    execute_path: &'a str,
+    tools: Vec<chat_tools::Tool>,
+    confirm: bool,
+    /// The browser's per-request key, needed to OPEN its approval frames.
+    eph_pub: String,
+}
+
+/// Feed one tool's outcome back to the model, in whichever form its transport
+/// understands: a `role:"tool"` message natively, or plain text for a
+/// prompt-only model that has no such role.
+fn push_result(
+    native: &Option<crate::ai::providers::AiProvider>,
+    convo: &mut Vec<Value>,
+    prompted_extra: &mut Vec<String>,
+    call: &chat_tools::ToolCall,
+    outcome: &chat_tools::Executed,
+) {
+    let rendered = chat_tools::result_for_model(call, outcome);
+    match native {
+        Some(_) => convo.push(json!({
+            "role": "tool",
+            // Every tool_call must receive a reply carrying its id, or the
+            // next request is malformed and the provider refuses the round.
+            "tool_call_id": call.id,
+            "name": call.name,
+            "content": rendered,
+        })),
+        None => prompted_extra.push(rendered),
+    }
 }
 
 /// The terminal frame for a turn that streamed nothing: it carries the whole

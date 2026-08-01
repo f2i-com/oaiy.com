@@ -45,6 +45,9 @@
     "claimPath": "/api/v1/desktop-ai/{id}/claim",
     "framesPath": "/api/v1/desktop-ai/{id}/frames",
     "completePath": "/api/v1/desktop-ai/{id}/complete",
+    "inputPath": "/api/v1/desktop-ai/{id}/input",
+    "toolsCatalogPath": "/api/ai/chat-tools/catalog",
+    "toolsExecutePath": "/api/ai/chat-tools/execute",
     "waitSeconds": 25,
     "batchLimit": 8,
     "errorBackoffSeconds": 10
