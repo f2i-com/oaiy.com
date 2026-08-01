@@ -155,6 +155,48 @@ export function parseConnectorConfig(raw: unknown, source = 'connector config'):
       spec.description = requireString(entry.description, 'description', where);
     }
 
+    // How a listing is shaped for the graph, and how its row filters are
+    // spelled. Both belong to listRecords: a provider that describes them on
+    // another operation has almost certainly made a mistake, and silently
+    // ignoring it would leave the graph reading `undefined`.
+    if (entry.listResult !== undefined) {
+      if (operation !== 'listRecords') {
+        throw new Error(`${where}: "listResult" only applies to listRecords (this is ${operation}).`);
+      }
+      const lr = entry.listResult as Record<string, unknown>;
+      spec.listResult = {
+        items: requireString(lr.items, 'listResult.items', where),
+        ...(lr.count !== undefined ? { count: requireString(lr.count, 'listResult.count', where) } : {}),
+        ...(lr.first !== undefined ? { first: requireString(lr.first, 'listResult.first', where) } : {}),
+        ...(lr.found !== undefined ? { found: requireString(lr.found, 'listResult.found', where) } : {}),
+      };
+    }
+    if (entry.filters !== undefined) {
+      if (operation !== 'listRecords') {
+        throw new Error(`${where}: "filters" only applies to listRecords (this is ${operation}).`);
+      }
+      const f = entry.filters as Record<string, unknown>;
+      const ops = Array.isArray(f.ops) ? f.ops : [];
+      if (ops.length === 0) {
+        throw new Error(
+          `${where}: "filters" describes no comparisons, so every filtered listing would be refused.`,
+        );
+      }
+      spec.filters = {
+        field: requireString(f.field, 'filters.field', where),
+        opKey: requireString(f.opKey, 'filters.opKey', where),
+        fieldKey: requireString(f.fieldKey, 'filters.fieldKey', where),
+        valueKey: requireString(f.valueKey, 'filters.valueKey', where),
+        ops: ops.map((o, i) => {
+          const row = (o ?? {}) as Record<string, unknown>;
+          return {
+            op: requireString(row.op, `filters.ops[${i}].op`, where),
+            param: requireString(row.param, `filters.ops[${i}].param`, where),
+          };
+        }),
+      };
+    }
+
     return spec;
   });
 

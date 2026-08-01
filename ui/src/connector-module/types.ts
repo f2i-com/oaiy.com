@@ -72,6 +72,53 @@ export interface ConnectorNodeSpec {
   name?: string;
   /** Optional description for the palette. */
   description?: string;
+  /**
+   * How a LISTING is handed to the rest of the graph.
+   *
+   * Absent, a listing is the bare array of rows. A provider whose graphs read
+   * `$nodes.<id>.first.answers.<field>` or `.found` instead describes those
+   * names here and gets a structured object. Getting this wrong is silent: the
+   * graph reads `undefined`, decides the record does not exist, and carries on
+   * — a caller lookup that answers "unknown caller" for a customer who is
+   * plainly in the table.
+   */
+  listResult?: ConnectorListResultSpec;
+  /**
+   * How a node's row FILTERS reach the provider.
+   *
+   * Absent, filters on a node are ignored and the listing comes back unfiltered
+   * — which is worse than failing, because the graph then reads a real row that
+   * belongs to somebody else.
+   */
+  filters?: ConnectorFilterSpec;
+}
+
+/** The names a provider's graphs read a listing's parts by. */
+export interface ConnectorListResultSpec {
+  /** The array of rows. */
+  items: string;
+  /** How many rows matched. */
+  count?: string;
+  /** The first row, or null. */
+  first?: string;
+  /** Whether anything matched at all. */
+  found?: string;
+}
+
+/** How to turn a node's filter rows into the provider's query parameters. */
+export interface ConnectorFilterSpec {
+  /** The node-data field holding the filter rows. */
+  field: string;
+  /** Within one row: which comparison, which record field, and the value. */
+  opKey: string;
+  fieldKey: string;
+  valueKey: string;
+  /**
+   * The comparisons this provider accepts, and the query parameter each becomes.
+   * `{field}` is substituted. A comparison NOT listed here is refused rather
+   * than dropped: a filter silently ignored returns another person's record.
+   */
+  ops: { op: string; param: string }[];
 }
 
 /**
@@ -108,6 +155,10 @@ export interface ConnectorCall {
   method?: string;
   /** The node instance's own data (its configured fields). */
   data: Record<string, unknown>;
+  /** Copied from the node spec: how a listing is shaped for the graph. */
+  listResult?: ConnectorListResultSpec;
+  /** Copied from the node spec: how row filters reach the provider. */
+  filters?: ConnectorFilterSpec;
 }
 
 /**
