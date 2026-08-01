@@ -39,6 +39,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use super::descriptor::{self, FlowsSpec};
+use super::result_actions;
 use super::{LinkHandle, LinkedAccount};
 use crate::bridge::worker::{run_flow_cli, CliOutcome, CliRequest};
 
@@ -101,6 +102,19 @@ struct QueuedRun {
     /// Which scope the flow lives in; `None` is the account's own workspace.
     #[serde(default)]
     app_id: Option<String>,
+    /// Which BINDING queued this run, when one did.
+    ///
+    /// The binding is where the post-run actions live — the row itself carries
+    /// a same-named field meaning something else (the actions a completion
+    /// RECORDED), and it is empty while a run is queued. Absent for a run
+    /// started directly rather than by a trigger, which simply has no actions.
+    #[serde(default)]
+    binding_id: Option<String>,
+    /// The provider's own key for this run, derived from the binding and the
+    /// triggering event. Reused to key the actions' side effects, so a
+    /// redelivered event cannot send a second SMS.
+    #[serde(default)]
+    idempotency_key: Option<String>,
     /// The inputs the reserving side captured, which become the run's entry
     /// node. Absent is an empty object, not a failure: a flow triggered with
     /// nothing to say still runs.
@@ -211,7 +225,35 @@ impl<'a> Lane<'a> {
 
 /// Poll, claim, run, report — forever, while a link with a claimable flow lane
 /// exists.
-pub fn spawn(store: LinkHandle, node: Option<crate::services::node_runtime::NodeHandle>) {
+/// How a binding's connector actions reach this desktop's plugins.
+///
+/// One per process, because there is one plugin host per process. Set by
+/// [`spawn`]; a runtime started without one (the headless server) leaves it
+/// empty and a connector action then fails with a reason rather than being
+/// silently dropped.
+static CONNECTOR: std::sync::OnceLock<super::relay::Dispatcher> = std::sync::OnceLock::new();
+
+/// The binding list, cached for the same reason the event lane caches it: the
+/// actions for every run of one account come from the same short list.
+fn bindings_cache() -> &'static super::flows::FlowBindings {
+    static BINDINGS: std::sync::OnceLock<super::flows::FlowBindings> = std::sync::OnceLock::new();
+    BINDINGS.get_or_init(super::flows::FlowBindings::new)
+}
+
+/// Run the account's queued flows, performing each binding's post-run actions
+/// with `connector` when one is given.
+pub fn spawn(
+    store: LinkHandle,
+    node: Option<crate::services::node_runtime::NodeHandle>,
+    connector: Option<super::relay::Dispatcher>,
+) {
+    if let Some(dispatcher) = connector {
+        let _ = CONNECTOR.set(dispatcher);
+    }
+    spawn_inner(store, node)
+}
+
+fn spawn_inner(store: LinkHandle, node: Option<crate::services::node_runtime::NodeHandle>) {
     std::thread::spawn(move || loop {
         let Some(account) = store.account() else {
             // Not linked. Sleep rather than spin; a link is a human action and
@@ -379,8 +421,99 @@ fn serve(
     if let Err(f) = &outcome {
         log::info!("flow run {} failed ({:?}): {}", run.id, f.code, f.message);
     }
+    // What the BINDING asked for with the answer, before the run is reported.
+    //
+    // Inside the claimed window on purpose. Reporting first and acting after
+    // would leave a crash in between with the run already terminal, so nothing
+    // would ever retry it and the writes would be lost for good; acting first
+    // leaves the run claimed, which the provider's own reaper returns to the
+    // queue. The provider's exactly-once gates are what make the retry safe —
+    // a run is reserved under a unique key and claimed atomically — and each
+    // side effect additionally carries a key of its own.
+    let outcome = match outcome {
+        Ok(result) => Ok(apply_result_actions(account, spec, run, result)),
+        other => other,
+    };
     report(account, lane, instance, &run.id, outcome)?;
     Ok(true)
+}
+
+/// Perform the binding's post-run actions and fold their failures into the
+/// result the provider is about to be told.
+///
+/// A run with no binding, a provider that declares no such actions, or a
+/// binding carrying none: nothing happens, which is the common case and not a
+/// fault. Failures never turn a successful run into a failed one — the flow DID
+/// run — they ride along in the result so the provider's console can show a run
+/// that succeeded while its side effects did not.
+fn apply_result_actions(
+    account: &LinkedAccount,
+    spec: &FlowsSpec,
+    run: &QueuedRun,
+    result: Value,
+) -> Value {
+    let bindings = bindings_cache();
+    let connector = CONNECTOR.get();
+    let Some(actions_spec) = spec.result_actions.as_ref() else {
+        return result;
+    };
+    let Some(binding_id) = run.binding_id.as_deref().filter(|s| !s.is_empty()) else {
+        return result;
+    };
+    let list = match bindings.load(account, spec) {
+        Ok(list) => list,
+        Err(e) => {
+            // The actions exist and could not be read. Said in the result
+            // rather than dropped, because silence here is indistinguishable
+            // from a binding that asked for nothing.
+            return result_actions::attach_errors(
+                actions_spec,
+                result,
+                &[format!("could not read this run's binding: {e}")],
+            );
+        }
+    };
+    let Some(binding) = list.iter().find(|b| b.id == binding_id) else {
+        return result;
+    };
+    let actions: Vec<Value> = match binding.field(&actions_spec.actions_field) {
+        Some(Value::Array(items)) => items.clone(),
+        _ => return result,
+    };
+    if actions.is_empty() {
+        return result;
+    }
+
+    // The roots an action can address. `inputs` is what the run was started
+    // with; the triggering event rides inside it under its own name, which is
+    // how the provider's own runtime sees it too.
+    let inputs = &run.input_snapshot;
+    let event = inputs.get("event");
+    let scope = result_actions::Scope {
+        result: Some(&result),
+        event,
+        inputs: Some(inputs),
+        app: None,
+    };
+    // The provider's key for this run already identifies the binding and the
+    // triggering event, so a redelivery reproduces it exactly. Falling back to
+    // the run id keeps actions keyed at all for a provider that sends none —
+    // distinct per run, which is weaker but never collides.
+    let run_key = run
+        .idempotency_key
+        .as_deref()
+        .filter(|k| !k.is_empty())
+        .unwrap_or(&run.id);
+    let doer = result_actions::Live {
+        account,
+        spec: actions_spec,
+        connector,
+    };
+    let errors = result_actions::perform_all(actions_spec, &actions, &scope, run_key, &doer);
+    for e in &errors {
+        log::info!("flow run {} binding {binding_id}: {e}", run.id);
+    }
+    result_actions::attach_errors(actions_spec, result, &errors)
 }
 
 /// Hand a possibly-claimed run back, after a claim whose answer never arrived.
@@ -864,6 +997,8 @@ mod tests {
             flow: Some("summary".into()),
             flow_definition_id: Some("f-app".into()),
             app_id: None,
+            binding_id: None,
+            idempotency_key: None,
             input_snapshot: Value::Null,
         };
         assert_eq!(select_flow(&flows, &by_id).unwrap().id.as_deref(), Some("f-app"));
@@ -874,6 +1009,8 @@ mod tests {
             flow: Some("summary".into()),
             flow_definition_id: None,
             app_id: None,
+            binding_id: None,
+            idempotency_key: None,
             input_snapshot: Value::Null,
         };
         assert_eq!(

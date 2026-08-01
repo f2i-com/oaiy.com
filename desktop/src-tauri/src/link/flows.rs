@@ -63,6 +63,22 @@ pub struct Binding {
     /// evaluate it, so its PRESENCE alone is what matters here.
     #[serde(default)]
     pub condition: Option<Value>,
+    /// Everything else the provider publishes on a binding, kept as it arrived.
+    ///
+    /// The post-run actions live under a key this file must not know: the
+    /// descriptor names it, because a second provider will call the same idea
+    /// something else. Capturing the whole remainder means adding a field to
+    /// the descriptor is enough to reach it — no struct change, and nothing
+    /// here to keep in step.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, Value>,
+}
+
+impl Binding {
+    /// One of the provider's own fields, by the name its descriptor gives.
+    pub fn field(&self, name: &str) -> Option<&Value> {
+        self.extra.get(name)
+    }
 }
 
 fn default_true() -> bool {
@@ -362,6 +378,7 @@ mod tests {
             mode: Some("async".into()),
             enabled: true,
             condition: None,
+            extra: serde_json::Map::new(),
         }
     }
 

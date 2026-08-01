@@ -1539,6 +1539,14 @@ pub fn run() {
                 crate::link::flow_runner::spawn(
                     link_for_http.clone(),
                     Some(node_for_http.clone()),
+                    // A binding may ask for a connector command once its flow
+                    // answers — dial, send the SMS. Same dispatcher, same gate
+                    // as the relay's.
+                    Some(crate::link::ops::dispatcher(
+                        registry_for_http.clone(),
+                        bridge_for_http.plugins.clone(),
+                        bridge_for_http.host.clone(),
+                    )),
                 );
                 // Answer the sealed chat turns the provider's web app relays.
                 // Without it the website cannot encrypt to this machine at all
