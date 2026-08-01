@@ -135,6 +135,64 @@ pub struct FlowsSpec {
     pub bindings_path: String,
     /// Reserve one run.
     pub reserve_path: String,
+    /// Queued runs waiting for a runtime to take them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queued_path: Option<String>,
+    /// Take one queued run, exactly-once. `{id}` is substituted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_path: Option<String>,
+    /// Report a run's terminal status. `{id}` is substituted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub complete_path: Option<String>,
+    /// The node types this provider's graphs are written in, and what each one
+    /// means in terms this desktop can actually perform.
+    ///
+    /// The whole point of this block: a graph names nodes in ITS OWN
+    /// vocabulary — one provider calls a node `formlogic_list_responses`,
+    /// another might call the same idea `records.query`. Neither name belongs
+    /// in this app. The provider says what its nodes are called and which
+    /// operation each performs; the operations are a small closed set.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub nodes: Vec<FlowNodeSpec>,
+}
+
+/// One node type a provider's graphs use.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FlowNodeSpec {
+    /// The name the provider's graphs use for it.
+    pub node_type: String,
+    /// What it does, from a closed set this desktop knows how to perform.
+    pub operation: FlowNodeOperation,
+    /// The path the operation acts on, when it needs one. `{id}` and other
+    /// placeholders are substituted from the node's own data at run time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+}
+
+/// The operations a provider may map its node types onto.
+///
+/// Closed on purpose, and small. A node type is remote input to this desktop —
+/// whatever is reachable here is reachable by anyone who can author a flow on
+/// the provider — so the set of things a node can DO is fixed here, and the
+/// provider only chooses which of them its vocabulary maps to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum FlowNodeOperation {
+    /// Read records back from the provider.
+    ListRecords,
+    /// Create a record.
+    CreateRecord,
+    /// Update a record.
+    UpdateRecord,
+    /// Call a plugin connector on this desktop — the same gate the relay uses.
+    ConnectorRequest,
+    /// Read or control this desktop's services.
+    ServiceControl,
+    /// The run's inputs, as the graph's entry node.
+    RunInput,
+    /// A chat completion from this machine's own AI.
+    Chat,
 }
 
 /// Enrolment of this machine as a node the account owner approves by name and
@@ -455,6 +513,51 @@ impl ConnectorDescriptor {
                     ));
                 }
             }
+            for (label, path) in [
+                ("queuedPath", &f.queued_path),
+                ("claimPath", &f.claim_path),
+                ("completePath", &f.complete_path),
+            ] {
+                if let Some(p) = path {
+                    if !p.starts_with('/') {
+                        return Err(format!(
+                            "connector {:?} flows {label} must begin with '/', got {p:?}",
+                            self.id
+                        ));
+                    }
+                }
+            }
+            // Claiming is only meaningful with somewhere to report the outcome:
+            // a run taken and never completed is worse than one left queued,
+            // because it looks to everyone else like it is being worked on.
+            if f.claim_path.is_some() != f.complete_path.is_some() {
+                return Err(format!(
+                    "connector {:?} flows names one of claimPath/completePath without the other",
+                    self.id
+                ));
+            }
+            let mut seen = std::collections::BTreeSet::new();
+            for node in &f.nodes {
+                if node.node_type.trim().is_empty() {
+                    return Err(format!("connector {:?} flows has a node with no type", self.id));
+                }
+                // A duplicate would make which operation wins depend on file
+                // order, and the loser would fail in a way nothing explains.
+                if !seen.insert(node.node_type.as_str()) {
+                    return Err(format!(
+                        "connector {:?} flows declares the node type {:?} twice",
+                        self.id, node.node_type
+                    ));
+                }
+                if let Some(p) = &node.path {
+                    if !p.starts_with('/') {
+                        return Err(format!(
+                            "connector {:?} flows node {:?} path must begin with '/', got {p:?}",
+                            self.id, node.node_type
+                        ));
+                    }
+                }
+            }
         }
         if o.token_response.credential_fields.is_empty() {
             return Err(format!(
@@ -565,6 +668,59 @@ mod tests {
         assert_eq!(all.len(), 1, "an override must replace, not duplicate");
         assert_eq!(all[0].name, "My FormLogic");
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_provider_names_its_own_flow_node_vocabulary() {
+        // The point of the block. A graph names nodes in ITS vocabulary — one
+        // provider says `formlogic_list_responses`, another might say
+        // `records.query` for the same idea. Neither name belongs in this app,
+        // so the provider declares the mapping and the OPERATIONS are the
+        // closed set this desktop knows how to perform.
+        let d = find(std::path::Path::new("/nonexistent"), "formlogic").unwrap();
+        let f = d.flows.expect("the connector must declare its flow lane");
+        assert!(!f.nodes.is_empty(), "a provider with flows declares its node types");
+
+        let by_op = |op: FlowNodeOperation| -> usize {
+            f.nodes.iter().filter(|n| n.operation == op).count()
+        };
+        assert_eq!(by_op(FlowNodeOperation::RunInput), 1);
+        assert_eq!(by_op(FlowNodeOperation::Chat), 1);
+        assert!(by_op(FlowNodeOperation::ListRecords) >= 1);
+        assert!(by_op(FlowNodeOperation::ConnectorRequest) >= 1);
+
+        // Nothing in the CODE names a provider's node type — every one of them
+        // comes from the file.
+        assert!(f.nodes.iter().any(|n| n.node_type == "formlogic_list_responses"));
+        // …and a record operation says WHERE, because the operation alone
+        // cannot know the provider's URL shape.
+        let list = f
+            .nodes
+            .iter()
+            .find(|n| n.operation == FlowNodeOperation::ListRecords)
+            .unwrap();
+        assert!(list.path.as_deref().is_some_and(|p| p.starts_with('/')));
+    }
+
+    #[test]
+    fn a_flow_lane_that_can_claim_must_be_able_to_report() {
+        // A run taken and never completed is worse than one left queued: it
+        // looks to every other runtime like it is being worked on.
+        let mut d: ConnectorDescriptor = serde_json::from_str(BUILTIN[0]).unwrap();
+        let flows = d.flows.as_mut().unwrap();
+        flows.complete_path = None;
+        let err = d.validate().unwrap_err();
+        assert!(err.contains("claimPath/completePath"), "{err}");
+    }
+
+    #[test]
+    fn a_duplicated_node_type_is_refused_rather_than_resolved_by_file_order() {
+        let mut d: ConnectorDescriptor = serde_json::from_str(BUILTIN[0]).unwrap();
+        let flows = d.flows.as_mut().unwrap();
+        let first = flows.nodes[0].clone();
+        flows.nodes.push(first);
+        let err = d.validate().unwrap_err();
+        assert!(err.contains("twice"), "{err}");
     }
 
     #[test]
