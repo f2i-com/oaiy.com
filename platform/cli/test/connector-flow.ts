@@ -190,6 +190,57 @@ async function main(): Promise<void> {
   check('run: the relayed command carried its payload', relayBody.command === 'beep' && relayBody.payload.times === 2);
   check('run: the relay result was unwrapped', (job?.nodeOutputs?.cmd as any)?.acknowledged === true);
 
+  // --- value references in a node's data ----------------------------------
+  //
+  // A graph points a node's fields at values it does not hold. Unresolved, the
+  // REFERENCE is what the connector acts on — live report 2026-08-01:
+  //   callId "$inputs.callId" is not the current call ("call_af6d0b3f…")
+  // which is exactly right, and meant the receptionist could never hang up.
+  sent.length = 0;
+  const refId = engine.submit(
+    'test',
+    'connector-value-refs',
+    graph(
+      [
+        { id: 'start', type: 'run_start', position: { x: 0, y: 0 }, data: {} },
+        {
+          id: 'cmd',
+          type: 'device_command',
+          position: { x: 100, y: 0 },
+          data: {
+            connectorId: 'gadget',
+            command: 'beep',
+            payload: {
+              callId: '$inputs.callId',
+              who: '{{ inputs.from }}',
+              note: 'call {{inputs.callId}} costs $inputs.from',
+              settled: '$nodes.start.settled',
+              literal: '$250 deposit',
+            },
+          },
+        },
+      ],
+      [{ source: 'start', target: 'cmd' }],
+    ),
+    { callId: 'call_af6d0b3f', from: '0421285243', settled: { turns: 3 } },
+  );
+  await runToEnd(engine, refId);
+  const refRelay = sent.find((s) => s.url.includes('/api/bridge/connectors/'));
+  const refPayload = JSON.parse(refRelay?.body ?? '{}').payload ?? {};
+  check('refs: a lone selector resolves to the referenced value', refPayload.callId === 'call_af6d0b3f');
+  check('refs: a template interpolates', refPayload.who === '0421285243');
+  // Braces interpolate INSIDE text; a bare selector does not. Only a whole
+  // string may be a selector, so prose containing a $word survives intact —
+  // otherwise an SMS body would have its own text eaten.
+  check(
+    'refs: braces interpolate in text while a bare $word stays literal',
+    refPayload.note === 'call call_af6d0b3f costs $inputs.from',
+  );
+  // A selector must be able to yield a whole object, not just text.
+  check('refs: a selector can yield an object', refPayload.settled && refPayload.settled.turns === 3);
+  // Only a DECLARED root makes a reference; "$250 deposit" is money, not a path.
+  check('refs: a bare dollar sign stays literal text', refPayload.literal === '$250 deposit');
+
   // --- a node type this build does not have -------------------------------
   const badId = engine.submit(
     'test',

@@ -8,6 +8,7 @@
  */
 
 import type { ModuleCompiler, ModuleCompilerContext } from 'oaiy-core/src/module-types';
+import { resolveRefsExpr } from 'oaiy-core/src/value-refs';
 import { CONNECTOR_RUNTIME_NAME } from './runtime';
 import type { ConnectorCall, ConnectorConfig, ConnectorNodeSpec } from './types';
 
@@ -89,9 +90,20 @@ export function createConnectorCompiler(config: ConnectorConfig): ModuleCompiler
           ? '__inputs'
           : inputs.get('default') || inputs.get('input') || 'null';
 
+      // The node's data is frozen at compile time, but a graph points its
+      // fields at values it does not hold — "$inputs.callId", an answers map
+      // addressed as "$nodes.decide.update". Resolved here, against what the
+      // run actually produced, because otherwise the REFERENCE is what the
+      // operation acts on: a call was rejected with the callId
+      // `"$inputs.callId"`, which is not a call, and the plugin refused it.
+      const dataExpr = resolveRefsExpr(call.data, 'workflow_context', '__inputs', inputExpr);
+
       return `
   // --- Node: ${node.id} (${nodeType} → ${spec.operation}) ---
-  ${letOrAssign}${outputVar} = await ${CONNECTOR_RUNTIME_NAME}.${spec.operation}(${inputExpr}, ${callLiteral});
+  ${letOrAssign}${outputVar} = await ${CONNECTOR_RUNTIME_NAME}.${spec.operation}(
+    ${inputExpr},
+    Object.assign({}, ${callLiteral}, { data: ${dataExpr} })
+  );
   workflow_context[${JSON.stringify(node.id)}] = ${outputVar};`;
     },
   };
