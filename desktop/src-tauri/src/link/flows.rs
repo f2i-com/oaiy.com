@@ -83,23 +83,28 @@ pub enum Skip {
     ManualMode,
     /// No slug, so there is nothing to reserve against.
     NoFlow,
-    /// This desktop cannot evaluate the author's condition, and guessing which
-    /// way it would have gone is exactly the mistake that fires a trigger that
-    /// should not have fired.
-    ConditionNotEvaluatedHere,
+    /// The condition was understood and said no.
+    ConditionFalse,
+    /// The condition was NOT understood. Treated as false deliberately —
+    /// guessing which way it would have gone is exactly the mistake that fires
+    /// a trigger that should not have fired.
+    ConditionUnknown(String),
     TooManyBindings,
 }
 
 impl Skip {
-    pub fn message(&self) -> &'static str {
+    pub fn message(&self) -> String {
         match self {
-            Skip::Disabled => "the binding is disabled",
-            Skip::ManualMode => "the binding is manual, and manual bindings never receive events",
-            Skip::NoFlow => "the binding names no flow slug",
-            Skip::ConditionNotEvaluatedHere => {
-                "it has a condition this desktop cannot evaluate, so it was not fired"
+            Skip::Disabled => "the binding is disabled".into(),
+            Skip::ManualMode => {
+                "the binding is manual, and manual bindings never receive events".into()
             }
-            Skip::TooManyBindings => "too many bindings matched this event",
+            Skip::NoFlow => "the binding names no flow slug".into(),
+            Skip::ConditionFalse => "its condition evaluated false".into(),
+            Skip::ConditionUnknown(why) => format!(
+                "its condition could not be evaluated, so it was treated as false ({why})"
+            ),
+            Skip::TooManyBindings => "too many bindings matched this event".into(),
         }
     }
 }
@@ -196,6 +201,7 @@ fn fetch(account: &LinkedAccount, spec: &FlowsSpec) -> Result<Vec<Binding>, Stri
 pub fn select<'a>(
     bindings: &'a [Binding],
     event_name: &str,
+    envelope: &Value,
 ) -> (Vec<&'a Binding>, Vec<(&'a Binding, Skip)>) {
     let mut fire = Vec::new();
     let mut skipped = Vec::new();
@@ -208,13 +214,16 @@ pub fn select<'a>(
             Some(Skip::ManualMode)
         } else if binding.flow_slug.as_deref().unwrap_or("").is_empty() {
             Some(Skip::NoFlow)
-        } else if has_condition(binding) {
-            Some(Skip::ConditionNotEvaluatedHere)
-        } else if fire.len() >= MAX_BINDINGS_PER_EVENT {
-            Some(Skip::TooManyBindings)
         } else {
-            None
+            match condition_verdict(binding, envelope) {
+                super::condition::Verdict::True => None,
+                super::condition::Verdict::False => Some(Skip::ConditionFalse),
+                super::condition::Verdict::Unknown(why) => Some(Skip::ConditionUnknown(why)),
+            }
         };
+        let reason = reason.or_else(|| {
+            (fire.len() >= MAX_BINDINGS_PER_EVENT).then_some(Skip::TooManyBindings)
+        });
         match reason {
             Some(r) => skipped.push((binding, r)),
             None => fire.push(binding),
@@ -223,17 +232,40 @@ pub fn select<'a>(
     (fire, skipped)
 }
 
-/// Does this binding carry a condition at all?
+/// What this binding's condition decides for this event.
 ///
-/// `null`, an empty string and an empty object all mean "no condition". Reading
-/// any of those as a condition would skip a binding that should have fired.
-fn has_condition(binding: &Binding) -> bool {
-    match binding.condition.as_ref() {
-        None | Some(Value::Null) => false,
-        Some(Value::String(s)) => !s.trim().is_empty(),
-        Some(Value::Object(o)) => !o.is_empty(),
-        Some(_) => true,
-    }
+/// The condition arrives as `{"type":"expression","expr":"…"}`, or as a bare
+/// string, or absent. An absent one is not a condition and fires; a shape this
+/// does not recognise is Unknown, which does not.
+fn condition_verdict(binding: &Binding, envelope: &Value) -> super::condition::Verdict {
+    let Some(raw) = binding.condition.as_ref() else {
+        return super::condition::Verdict::True;
+    };
+    let expr = match raw {
+        Value::Null => return super::condition::Verdict::True,
+        Value::String(s) => s.clone(),
+        Value::Object(o) if o.is_empty() => return super::condition::Verdict::True,
+        Value::Object(o) => match o.get("expr").and_then(Value::as_str) {
+            Some(e) => e.to_string(),
+            None => {
+                return super::condition::Verdict::Unknown(
+                    "the condition names no expression".into(),
+                )
+            }
+        },
+        other => {
+            return super::condition::Verdict::Unknown(format!(
+                "the condition is a {} rather than an expression",
+                match other {
+                    Value::Bool(_) => "boolean",
+                    Value::Number(_) => "number",
+                    Value::Array(_) => "list",
+                    _ => "value",
+                }
+            ))
+        }
+    };
+    super::condition::evaluate(&expr, envelope)
 }
 
 /// The exact idempotency key every runtime uses for a binding-fired run.
@@ -379,6 +411,10 @@ mod tests {
         assert_ne!(idempotency_key("b1", "evt-7"), "binding:b1:evt-7");
     }
 
+    fn envelope(data: Value) -> Value {
+        json!({ "name": "aokie.call.ended", "data": data })
+    }
+
     #[test]
     fn only_bindings_named_for_this_event_are_considered() {
         let all = vec![
@@ -386,13 +422,57 @@ mod tests {
             binding("b2", "aokie.call.incoming"),
             binding("b3", "aokie.call.ended"),
         ];
-        let (fire, skipped) = select(&all, "aokie.call.ended");
+        let e = envelope(json!({}));
+        let (fire, skipped) = select(&all, "aokie.call.ended", &e);
         assert_eq!(fire.iter().map(|b| b.id.as_str()).collect::<Vec<_>>(), ["b1", "b3"]);
         assert!(skipped.is_empty());
         // No wildcards or prefixes: firing on more than the author named is the
         // dangerous direction.
-        assert!(select(&all, "aokie.call").0.is_empty());
-        assert!(select(&all, "aokie.call.ended.extra").0.is_empty());
+        assert!(select(&all, "aokie.call", &e).0.is_empty());
+        assert!(select(&all, "aokie.call.ended.extra", &e).0.is_empty());
+    }
+
+    #[test]
+    fn a_condition_the_author_wrote_is_evaluated_rather_than_skipped() {
+        // The live blocker this fixes: the flows that record a call's
+        // transcript are bound with a condition, so refusing every condition
+        // meant the console showed "no transcript recorded" for every call.
+        let mut b = binding("b1", "aokie.call.transcript.settled");
+        b.condition = Some(json!({
+            "type": "expression",
+            "expr": "event && event.data ? Number(event.data.durationSeconds || 0) > 5 : false",
+        }));
+        let all = vec![b];
+
+        let long = envelope(json!({ "durationSeconds": 33 }));
+        assert_eq!(select(&all, "aokie.call.transcript.settled", &long).0.len(), 1);
+
+        let short = envelope(json!({ "durationSeconds": 2 }));
+        let (fire, skipped) = select(&all, "aokie.call.transcript.settled", &short);
+        assert!(fire.is_empty());
+        // False is a DECISION, and reads differently from "not understood".
+        assert_eq!(skipped[0].1, Skip::ConditionFalse);
+        assert!(skipped[0].1.message().contains("evaluated false"));
+    }
+
+    #[test]
+    fn a_condition_that_is_not_understood_still_refuses_to_fire() {
+        // The safe direction is unchanged: understood-and-true is the only path
+        // to firing, so a shape the evaluator cannot read never sends the SMS.
+        let mut b = binding("b1", "aokie.call.ended");
+        b.condition = Some(json!({ "type": "expression", "expr": "event.data.from.includes('+44')" }));
+        let (fire, skipped) = select(std::slice::from_ref(&b), "aokie.call.ended", &envelope(json!({})));
+        assert!(fire.is_empty());
+        assert!(matches!(skipped[0].1, Skip::ConditionUnknown(_)));
+        // …and it says WHY, so an author is not left guessing.
+        assert!(skipped[0].1.message().contains("could not be evaluated"));
+
+        // A condition of an unexpected SHAPE is equally refused.
+        let mut odd = binding("b2", "aokie.call.ended");
+        odd.condition = Some(json!([1, 2, 3]));
+        let (fire, skipped) = select(std::slice::from_ref(&odd), "aokie.call.ended", &envelope(json!({})));
+        assert!(fire.is_empty());
+        assert!(matches!(skipped[0].1, Skip::ConditionUnknown(_)));
     }
 
     #[test]
@@ -410,12 +490,12 @@ mod tests {
         conditional.condition = Some(json!("event.data.from.startsWith('+44')"));
 
         let all = vec![disabled, manual, no_flow, conditional];
-        let (fire, skipped) = select(&all, "e");
+        let (fire, skipped) = select(&all, "e", &envelope(json!({})));
         assert!(fire.is_empty(), "none of these may fire");
-        assert_eq!(
-            skipped.iter().map(|(_, s)| s.clone()).collect::<Vec<_>>(),
-            [Skip::Disabled, Skip::ManualMode, Skip::NoFlow, Skip::ConditionNotEvaluatedHere]
-        );
+        assert!(matches!(skipped[0].1, Skip::Disabled));
+        assert!(matches!(skipped[1].1, Skip::ManualMode));
+        assert!(matches!(skipped[2].1, Skip::NoFlow));
+        assert!(matches!(skipped[3].1, Skip::ConditionUnknown(_)));
         assert!(skipped.iter().all(|(_, s)| !s.message().is_empty()));
     }
 
@@ -427,19 +507,18 @@ mod tests {
         for empty in [json!(null), json!(""), json!("   "), json!({})] {
             let mut b = binding("b", "e");
             b.condition = Some(empty.clone());
-            assert!(!has_condition(&b), "{empty:?} is not a condition");
-            assert_eq!(select(std::slice::from_ref(&b), "e").0.len(), 1);
+            assert_eq!(
+                select(std::slice::from_ref(&b), "e", &envelope(json!({}))).0.len(),
+                1,
+                "{empty:?} is not a condition and must not block the binding"
+            );
         }
-        // …and a real one is.
-        let mut b = binding("b", "e");
-        b.condition = Some(json!("x === 1"));
-        assert!(has_condition(&b));
     }
 
     #[test]
     fn one_event_cannot_become_an_unbounded_number_of_runs() {
         let all: Vec<Binding> = (0..9).map(|i| binding(&format!("b{i}"), "e")).collect();
-        let (fire, skipped) = select(&all, "e");
+        let (fire, skipped) = select(&all, "e", &envelope(json!({})));
         assert_eq!(fire.len(), MAX_BINDINGS_PER_EVENT);
         assert!(skipped.iter().all(|(_, s)| *s == Skip::TooManyBindings));
         assert_eq!(skipped.len(), 9 - MAX_BINDINGS_PER_EVENT);
