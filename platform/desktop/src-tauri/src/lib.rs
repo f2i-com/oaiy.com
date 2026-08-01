@@ -1452,14 +1452,15 @@ pub fn run() {
             // are non-fatal for the tray itself — the user can still
             // interact with the UI, just no API.
             let app_handle = app.handle().clone();
-            // Restore whatever was running before the app last closed, so a
-            // reboot doesn't silently take the local runtime offline (a paired
-            // page's AI calls would 503 and trigger-fired flows would fail until
-            // someone opened this window and clicked Start on each service).
+            // Start what the user ticked "start with the app", plus whatever was
+            // running before it last closed, so a reboot doesn't silently take
+            // the local runtime offline (a paired page's AI calls would 503 and
+            // trigger-fired flows would fail until someone opened this window
+            // and clicked Start on each service).
             {
                 let started = registry
                     .lock()
-                    .map(|mut r| r.autostart_remembered())
+                    .map(|mut r| r.autostart_on_boot())
                     .unwrap_or_default();
                 if !started.is_empty() {
                     log::info!("autostarted {} service(s): {}", started.len(), started.join(", "));

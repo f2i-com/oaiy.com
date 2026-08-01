@@ -7,6 +7,7 @@
 //!   GET    /api/services                  → list registered + running services
 //!   POST   /api/services/:id/start        → spawn the service process
 //!   POST   /api/services/:id/stop         → terminate it
+//!   POST   /api/services/:id/autostart    → {enabled} start it with the app
 //!   POST   /api/services/:id/install      → run install script (streams logs)
 //!   POST   /api/services/:id/uninstall    → remove its installed files (clean reinstall)
 //!   GET    /api/services/:id/logs[?tail]  → recent stdout+stderr lines
@@ -214,6 +215,34 @@ async fn stop_service(
         .lock()
         .map_err(|_| "registry mutex poisoned".to_string())
         .and_then(|mut reg| reg.stop(&id));
+    match result {
+        Ok(()) => ok_body(),
+        Err(e) => err400(&e),
+    }
+}
+
+/// Body of `POST /api/services/:id/autostart`.
+#[derive(serde::Deserialize)]
+struct AutostartBody {
+    enabled: bool,
+}
+
+/// Tick or untick "start this service when the app starts".
+///
+/// A preference, not an action: it deliberately does NOT start or stop anything
+/// now. Ticking a stopped service and having it spring to life would make the
+/// checkbox a second Start button, and unticking a running one would stop a
+/// service the user never asked to stop.
+async fn set_service_autostart(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<AutostartBody>,
+) -> impl IntoResponse {
+    let result = state
+        .registry
+        .lock()
+        .map_err(|_| "registry mutex poisoned".to_string())
+        .and_then(|mut reg| reg.set_autostart(&id, body.enabled));
     match result {
         Ok(()) => ok_body(),
         Err(e) => err400(&e),
@@ -1159,6 +1188,7 @@ pub async fn serve(
         .route("/api/services/:id/start", post(start_service))
         .route("/api/services/:id/stop", post(stop_service))
         .route("/api/services/:id/repair", post(repair_service))
+        .route("/api/services/:id/autostart", post(set_service_autostart))
         .route("/api/services/:id/install", post(install_service))
         .route("/api/services/:id/uninstall", post(uninstall_service))
         .route(
