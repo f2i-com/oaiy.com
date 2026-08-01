@@ -279,6 +279,85 @@ async function main(): Promise<void> {
   // The tell-tale of the old failure: a `value` wrapper around the input.
   check('whole-payload: it is not wrapped in a `value` key', wholeSent.value === undefined);
 
+  // --- a condition must not run BOTH of its branches -----------------------
+  //
+  // Live report 2026-08-01: a receptionist flow gated `call.reject` behind a
+  // condition that said "do not reject". Both downstream nodes ran anyway — the
+  // untaken one merely receiving null — so the plugin was sent call.reject on
+  // every call and accepted it. Callers were answered and hung up on a second
+  // later. A connector node's work comes from its own data, so a null input
+  // does not make it harmless.
+  sent.length = 0;
+  const branchId = engine.submit(
+    'test',
+    'connector-branch-gate',
+    graph(
+      [
+        { id: 'decide', type: 'logic_block', position: { x: 0, y: 0 }, data: { expr: 'return { reject: false };' } },
+        { id: 'gate', type: 'condition', position: { x: 100, y: 0 }, data: { expr: '(nodes.decide || {}).reject === true' } },
+        {
+          id: 'reject',
+          type: 'device_command',
+          position: { x: 200, y: -50 },
+          data: { connectorId: 'gadget', command: 'call.reject', payload: { callId: '$inputs.callId' } },
+        },
+        {
+          id: 'configure',
+          type: 'device_command',
+          position: { x: 200, y: 50 },
+          data: { connectorId: 'gadget', command: 'call.configureAgent', payload: { callId: '$inputs.callId' } },
+        },
+      ],
+      [
+        { source: 'decide', target: 'gate' },
+        { source: 'gate', target: 'reject', sourceHandle: 'true' },
+        { source: 'gate', target: 'configure', sourceHandle: 'false' },
+      ],
+    ),
+    { callId: 'call_bf26a886' },
+  );
+  const branchJob = await runToEnd(engine, branchId);
+  check('branch: the flow completed', branchJob?.status === 'completed', `error=${branchJob?.error ?? ''}`);
+  const commands = sent
+    .filter((s) => s.url.includes('/api/bridge/connectors/'))
+    .map((s) => JSON.parse(s.body ?? '{}').command);
+  check(
+    'branch: only the taken branch ran its connector command',
+    commands.length === 1 && commands[0] === 'call.configureAgent',
+    `commands sent: ${JSON.stringify(commands)}`,
+  );
+  check('branch: the untaken branch never reached the connector', !commands.includes('call.reject'), `got ${JSON.stringify(commands)}`);
+
+  // And the other way round, so the gate is not simply blocking everything.
+  sent.length = 0;
+  const branch2 = engine.submit(
+    'test',
+    'connector-branch-gate-true',
+    graph(
+      [
+        { id: 'decide', type: 'logic_block', position: { x: 0, y: 0 }, data: { expr: 'return { reject: true };' } },
+        { id: 'gate', type: 'condition', position: { x: 100, y: 0 }, data: { expr: '(nodes.decide || {}).reject === true' } },
+        { id: 'reject', type: 'device_command', position: { x: 200, y: -50 }, data: { connectorId: 'gadget', command: 'call.reject', payload: {} } },
+        { id: 'configure', type: 'device_command', position: { x: 200, y: 50 }, data: { connectorId: 'gadget', command: 'call.configureAgent', payload: {} } },
+      ],
+      [
+        { source: 'decide', target: 'gate' },
+        { source: 'gate', target: 'reject', sourceHandle: 'true' },
+        { source: 'gate', target: 'configure', sourceHandle: 'false' },
+      ],
+    ),
+    {},
+  );
+  await runToEnd(engine, branch2);
+  const commands2 = sent
+    .filter((s) => s.url.includes('/api/bridge/connectors/'))
+    .map((s) => JSON.parse(s.body ?? '{}').command);
+  check(
+    'branch: the true path runs when the condition is true, and only it',
+    commands2.length === 1 && commands2[0] === 'call.reject',
+    `commands sent: ${JSON.stringify(commands2)}`,
+  );
+
   // --- a node type this build does not have -------------------------------
   const badId = engine.submit(
     'test',

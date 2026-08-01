@@ -1298,7 +1298,7 @@ workflow_context;
     // Compile using module compiler
     const moduleCompilerResult = this.tryModuleCompiler(node, inputsMap, outputVar, skipVarDeclaration, !!loopStartId, loopStartId);
     if (moduleCompilerResult !== null) {
-      return moduleCompilerResult;
+      return this.gateOnBranch(node, incomingEdges, graph, outputVar, skipVarDeclaration, moduleCompilerResult);
     }
 
     // No module compiler handled this node.
@@ -1321,6 +1321,56 @@ workflow_context;
         `reported success. Node types available here: ${known}`
     );
   }
+  /**
+   * A node fed by a condition's `true`/`false` handle runs ONLY on that branch.
+   *
+   * Without this a condition routed nothing: it computed its result, set
+   * `<cond>_true` and `<cond>_false`, and then BOTH downstream nodes executed —
+   * the untaken one merely receiving null. For a node that reads its input that
+   * is survivable. For a node whose work comes from its own configuration it is
+   * not: a `connector_request` on the untaken branch fires its command anyway.
+   *
+   * Live, that meant a receptionist flow whose gate said "do not reject this
+   * caller" sent `call.reject` regardless, and the plugin accepted it —
+   * answering every caller and hanging up on them a second later. It was
+   * invisible for as long as the reject carried an unresolved `$inputs.callId`,
+   * which the plugin refused as stale; the moment references resolved, the
+   * latent branch bug became a dropped call (live report 2026-08-01).
+   *
+   * Gated on the condition's own recorded result rather than on the input being
+   * non-null, because a taken branch may legitimately carry null.
+   */
+  private gateOnBranch(
+    node: GraphNode,
+    incomingEdges: { source: string; sourceHandle?: string | null }[],
+    graph: WorkflowGraph,
+    outputVar: string,
+    skipVarDeclaration: boolean,
+    body: string
+  ): string {
+    const branches = incomingEdges
+      .filter((e) => e.sourceHandle === 'true' || e.sourceHandle === 'false')
+      .filter((e) => graph.nodes.find((n) => n.id === e.source)?.type === 'condition');
+    if (branches.length === 0) return body;
+    // Several branch inputs mean "run if ANY of my branches was taken" — the
+    // merge above already picks whichever carried a value.
+    const test = branches
+      .map((e) => {
+        const want = e.sourceHandle === 'true';
+        return `workflow_context[${JSON.stringify(e.source)}] === ${want}`;
+      })
+      .join(' || ');
+    const declare = skipVarDeclaration ? '' : `\n  let ${outputVar} = null;`;
+    // The body declares the output itself when it is allowed to; inside the
+    // guard that declaration would be scoped to the branch, so it is hoisted
+    // and the body told to assign instead.
+    const inner = skipVarDeclaration ? body : body.replace(`let ${outputVar}`, `${outputVar}`);
+    return `${declare}
+  // Branch gate: only runs when this condition took this path
+  if (${test}) {${inner}
+  }`;
+  }
+
   private topologicalSort(graph: WorkflowGraph): GraphNode[] {
     return topologicalSortUtil(graph);
   }
