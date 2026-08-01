@@ -1101,6 +1101,7 @@ mod tests {
             complete_path: None,
             graph_path: None,
             nodes: Vec::new(),
+            result_actions: None,
         };
         assert!(Lane::of(&spec).is_none());
 
@@ -1212,6 +1213,7 @@ mod tests {
             complete_path: Some("/runs/{id}".into()),
             graph_path: Some("/flows".into()),
             nodes: Vec::new(),
+            result_actions: None,
         }
     }
 

@@ -23,6 +23,7 @@ pub mod heartbeat;
 pub mod oauth;
 pub mod ops;
 pub mod relay;
+pub mod result_actions;
 pub mod routes;
 
 use serde::{Deserialize, Serialize};
