@@ -42,6 +42,9 @@ node bin/oaiy.mjs run flow.json --input topic="space" --input lang=en -o result.
 # Inputs / constants from JSON files; API keys as constants.
 node bin/oaiy.mjs run flow.json --inputs in.json --constant OPENAI_API_KEY=sk-...
 
+# A flow whose nodes come from a linked provider (see "Connectors" below).
+node bin/oaiy.mjs run flow.json --connector connector.json
+
 # Inspect a flow without running it.
 node bin/oaiy.mjs inputs flow.json      # list the inputs it expects
 node bin/oaiy.mjs validate flow.json    # parse + structural check
@@ -49,6 +52,45 @@ node bin/oaiy.mjs validate flow.json    # parse + structural check
 
 Constants (API keys etc.) are also read from `OAIY_CONST_<NAME>` env vars.
 Set `OAIY_DEBUG=1` to include the full workflow context + logs in the output.
+
+### Connectors (`--connector <file>`)
+
+A linked provider's node types are not built in — they are DATA. OAIY's Rust side
+claims a queued run, writes a small JSON file, and invokes this CLI with
+`--connector`. The file is the whole contract:
+
+```json
+{
+  "baseUrl": "http://provider.example",
+  "credential": "<bearer for the provider's API>",
+  "nodes": [
+    { "nodeType": "<the provider's name for this step>", "operation": "listRecords",
+      "path": "/api/v1/things/{thing}/rows" }
+  ]
+}
+```
+
+`nodeType` is the provider's vocabulary and is never known ahead of time.
+`operation` is a **closed set** of seven: `runInput`, `chat`, `listRecords`,
+`createRecord`, `updateRecord`, `connectorRequest`, `serviceControl`. `{…}`
+segments in `path` are filled from the node's own fields, falling back to an
+object wired into it.
+
+Record operations call the provider with the credential as a bearer; `chat`,
+`connectorRequest` and `serviceControl` call THIS machine's own API
+(`OAIY_SERVER_URL`, default `http://127.0.0.1:17972`, with `OAIY_SERVER_TOKEN`
+for its privileged routes). A relayed connector command always carries an
+idempotency key — an explicit one if the node sets it, otherwise one derived
+from the run, the node and the payload.
+
+Anything the file names that this build cannot perform is refused **before the
+flow runs**: an unknown operation, a record operation with no path, a node type
+that collides with a built-in one. A flow whose node types were never registered
+fails to compile rather than skipping those nodes and reporting success.
+
+The module is built at run time by `ui/src/connector-module` (a factory, not a
+bundled module — the node types do not exist until a config names them) and
+registered in the same module loader the bundled modules use.
 
 ### Output
 

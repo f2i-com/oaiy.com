@@ -359,26 +359,6 @@ impl Worker {
             );
         }
 
-        let Some(cli) = resolve_cli(std::env::var("OAIY_CLI").ok().as_deref(), bundled_cli_script, lookup_on_path)
-        else {
-            return (
-                RunStatus::Failed,
-                None,
-                Some(
-                    RunError::new(
-                        RunErrorCode::RuntimeUnavailable,
-                        "the OAIY CLI is not available on this machine",
-                    )
-                    .with_detail(
-                        "Install the `oaiy` CLI so it is on PATH, or set OAIY_CLI to the path of \
-                         cli/bin/oaiy.mjs. The desktop runs flows through the CLI so desktop and \
-                         browser execution share one engine.",
-                    )
-                    .retryable(),
-                ),
-            );
-        };
-
         // Inputs travel by file, not argv: values can be large, can contain
         // quoting hazards, and argv is visible to every process lister on the
         // machine — inputs may hold user data.
@@ -400,158 +380,46 @@ impl Worker {
             .timeout_ms
             .map(Duration::from_millis)
             .unwrap_or(DEFAULT_TIMEOUT);
-        let timeout_secs = timeout.as_secs().max(1).to_string();
 
-        let mut cmd = match &cli {
-            CliInvocation::Node { script } => {
-                // Prefer a resolved Node (portable install, else PATH) over the
-                // bare name: a packaged app cannot assume `node` is on PATH.
-                let exe = self
-                    .node
-                    .as_ref()
-                    .and_then(|n| n.resolve())
-                    .unwrap_or_else(|| PathBuf::from("node"));
-                let mut c = Command::new(exe);
-                c.arg(script);
-                c
-            }
-            CliInvocation::Binary { path } => Command::new(path),
-        };
-        cmd.arg("run")
-            .arg(&flow_path)
-            .arg("--inputs")
-            .arg(&inputs_path)
-            .arg("-o")
-            .arg(&out_path)
-            .arg("--timeout")
-            .arg(&timeout_secs)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-
-        // Drop known credential env vars before the CLI inherits the rest.
-        //
-        // A flow is untrusted code — writable over HTTP, and deliberately never
-        // graph-validated here — so the same reasoning that gives plugins an
-        // allow-listed environment applies. The CLI legitimately needs far more
-        // than a plugin (it IS the engine: PATH, HOME, node's own vars), so this
-        // is a deny-list of the sensitive names rather than an allow-list, and it
-        // matters because the engine's getSecret() reads process.env by name
-        // BEFORE its own store — an inherited AWS/OpenAI key would be directly
-        // addressable from inside a flow. A flow that genuinely needs a cloud key
-        // should carry it as a constant, not inherit it ambiently. Reuses the
-        // plugin host's list so the two paths cannot drift.
-        for name in crate::plugins::runner::NEVER_FORWARD {
-            cmd.env_remove(name);
-        }
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-        }
-
-        let mut child = match cmd.spawn() {
-            Ok(c) => c,
-            Err(e) => {
-                return fail(
-                    RunErrorCode::RuntimeUnavailable,
-                    &format!("could not launch the OAIY CLI ({cli:?}): {e}"),
-                )
-            }
-        };
-        // A flow run makes HTTP calls and writes files. Orphaned by a forced
-        // exit it keeps doing both, with no ledger entry left to record it and
-        // no timeout left to stop it.
-        crate::services::job_object::adopt(child.id());
-
-        // Drain BOTH pipes on their own threads, from the start. The first cut
-        // read stderr only after exit and stdout never — so a CLI that logged
-        // more than one OS pipe buffer (~4-64 KB; routine for a verbose Node
-        // process) blocked in write(), could never exit, and was killed at the
-        // deadline as a false `timed_out`. The review traced the whole chain,
-        // and this crate documents the identical hazard for plugin stderr.
-        let captured_err = Arc::new(std::sync::Mutex::new(String::new()));
-        if let Some(err) = child.stderr.take() {
-            let sink = captured_err.clone();
-            thread::spawn(move || drain_capped(err, &sink));
-        }
-        let captured_out = Arc::new(std::sync::Mutex::new(String::new()));
-        if let Some(out) = child.stdout.take() {
-            let sink = captured_out.clone();
-            thread::spawn(move || drain_capped(out, &sink));
-        }
-
-        // Grace over the CLI's own timeout so the CLI gets to time out FIRST and
-        // report which node was stuck — killing from out here loses that.
-        let deadline = Instant::now() + timeout + Duration::from_secs(10);
-        let status = loop {
-            match child.try_wait() {
-                Ok(Some(status)) => break Some(status),
-                Ok(None) => {}
-                Err(_) => break None,
-            }
-            if Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
-                break None;
-            }
-            // Cancellation: the flag the cancel endpoint sets. Observed here
-            // because the worker is the only thing that can actually stop work.
-            let cancelled = self
-                .ledger
-                .lock()
-                .ok()
-                .and_then(|l| l.get(&run.run_id))
-                .map(|r| r.cancel_requested)
-                .unwrap_or(false);
-            if cancelled {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = std::fs::remove_dir_all(&scratch);
-                return (
-                    RunStatus::Cancelled,
-                    None,
-                    Some(RunError::new(
-                        RunErrorCode::Cancelled,
-                        "cancelled while running; side effects already performed stay performed",
-                    )),
-                );
-            }
-            thread::sleep(CHILD_POLL);
-        };
-
-        let capture = captured_err
-            .lock()
-            .map(|g| g.clone())
-            .unwrap_or_default();
-
-        let result = match status {
-            Some(st) if st.success() => match std::fs::read_to_string(&out_path) {
-                Ok(body) => match serde_json::from_str::<Value>(&body) {
-                    Ok(v) => (RunStatus::Succeeded, Some(v), None),
-                    Err(e) => fail(
-                        RunErrorCode::Internal,
-                        &format!("the CLI reported success but its output is not JSON: {e}"),
-                    ),
-                },
-                Err(_) => fail(
-                    RunErrorCode::Internal,
-                    "the CLI reported success but wrote no result file",
-                ),
+        let outcome = run_flow_cli(
+            CliRequest {
+                flow_path: &flow_path,
+                inputs_path: &inputs_path,
+                out_path: &out_path,
+                // A locally stored flow talks to nothing on anyone's behalf.
+                connector_path: None,
+                timeout,
+                node: self.node.as_ref(),
             },
-            Some(st) => (
+            // Cancellation: the flag the cancel endpoint sets. Observed from
+            // here because the worker is the only thing that can stop the work.
+            &|| {
+                self.ledger
+                    .lock()
+                    .ok()
+                    .and_then(|l| l.get(&run.run_id))
+                    .map(|r| r.cancel_requested)
+                    .unwrap_or(false)
+            },
+        );
+
+        let _ = std::fs::remove_dir_all(&scratch);
+        match outcome {
+            CliOutcome::Succeeded(v) => (RunStatus::Succeeded, Some(v), None),
+            CliOutcome::Unreadable(why) => fail(RunErrorCode::Internal, &why),
+            CliOutcome::Failed { exit_code, detail } => (
                 RunStatus::Failed,
                 None,
                 Some(
                     RunError::new(
                         RunErrorCode::NodeFailed,
-                        format!("the flow failed (CLI exit {})", st.code().unwrap_or(-1)),
+                        format!("the flow failed (CLI exit {exit_code})"),
                     )
-                    .with_detail(tail_of(&capture, 1500))
+                    .with_detail(detail)
                     .retryable(),
                 ),
             ),
-            None => (
+            CliOutcome::TimedOut => (
                 RunStatus::TimedOut,
                 None,
                 Some(RunError::new(
@@ -562,10 +430,234 @@ impl Worker {
                     ),
                 )),
             ),
-        };
+            CliOutcome::Cancelled => (
+                RunStatus::Cancelled,
+                None,
+                Some(RunError::new(
+                    RunErrorCode::Cancelled,
+                    "cancelled while running; side effects already performed stay performed",
+                )),
+            ),
+            CliOutcome::Unavailable {
+                message,
+                detail,
+                retryable,
+            } => {
+                let mut e = RunError::new(RunErrorCode::RuntimeUnavailable, message);
+                if let Some(d) = detail {
+                    e = e.with_detail(d);
+                }
+                if retryable {
+                    e = e.retryable();
+                }
+                (RunStatus::Failed, None, Some(e))
+            }
+        }
+    }
+}
 
-        let _ = std::fs::remove_dir_all(&scratch);
-        result
+/// One CLI invocation, by file: which graph, which inputs, where the result goes.
+///
+/// Everything travels as a path rather than argv because values can be large,
+/// can contain quoting hazards, and argv is visible to every process lister on
+/// the machine — inputs and connector credentials are exactly what must not be.
+pub struct CliRequest<'a> {
+    pub flow_path: &'a Path,
+    pub inputs_path: &'a Path,
+    pub out_path: &'a Path,
+    /// Connector config handed over with `--connector`, when the graph is a
+    /// linked provider's and its nodes must be able to reach that provider.
+    /// `None` for a flow stored on this desktop, which speaks for nobody.
+    pub connector_path: Option<&'a Path>,
+    pub timeout: Duration,
+    pub node: Option<&'a crate::services::node_runtime::NodeHandle>,
+}
+
+/// How a CLI invocation ended.
+///
+/// A closed set with no "unknown": every arm has to become a reported outcome,
+/// because a run that started and was never answered is worse than one that
+/// never started.
+#[derive(Debug)]
+pub enum CliOutcome {
+    Succeeded(Value),
+    /// Exit 0 but the result file is missing or is not JSON. Ours, not the
+    /// flow's — hence separate from `Failed`.
+    Unreadable(String),
+    /// The CLI ran and reported failure. `detail` is the useful tail of stderr.
+    Failed { exit_code: i32, detail: String },
+    TimedOut,
+    Cancelled,
+    /// There is no CLI, or it would not start. Actionable, never silent.
+    Unavailable {
+        message: String,
+        detail: Option<String>,
+        /// True when installing something makes this work — as opposed to a
+        /// launch that failed on its own terms, which retrying will repeat.
+        retryable: bool,
+    },
+}
+
+/// Spawn the bundled CLI on one flow and wait for it.
+///
+/// The single place this crate starts a flow engine: the desktop worker uses it
+/// for a locally stored flow, and the link's flow runner for a graph claimed
+/// from the provider. Two copies of this would drift on the parts that are easy
+/// to get wrong — draining both pipes, adopting the child into the job object,
+/// dropping credentials from its environment.
+pub fn run_flow_cli(req: CliRequest, cancelled: &dyn Fn() -> bool) -> CliOutcome {
+    let Some(cli) = resolve_cli(
+        std::env::var("OAIY_CLI").ok().as_deref(),
+        bundled_cli_script,
+        lookup_on_path,
+    ) else {
+        return CliOutcome::Unavailable {
+            message: "the OAIY CLI is not available on this machine".into(),
+            detail: Some(
+                "Install the `oaiy` CLI so it is on PATH, or set OAIY_CLI to the path of \
+                 cli/bin/oaiy.mjs. The desktop runs flows through the CLI so desktop and \
+                 browser execution share one engine."
+                    .into(),
+            ),
+            retryable: true,
+        };
+    };
+
+    let timeout_secs = req.timeout.as_secs().max(1).to_string();
+    let mut cmd = match &cli {
+        CliInvocation::Node { script } => {
+            // Prefer a resolved Node (portable install, else PATH) over the
+            // bare name: a packaged app cannot assume `node` is on PATH.
+            let exe = req
+                .node
+                .and_then(|n| n.resolve())
+                .unwrap_or_else(|| PathBuf::from("node"));
+            let mut c = Command::new(exe);
+            c.arg(script);
+            c
+        }
+        CliInvocation::Binary { path } => Command::new(path),
+    };
+    cmd.arg("run")
+        .arg(req.flow_path)
+        .arg("--inputs")
+        .arg(req.inputs_path)
+        .arg("-o")
+        .arg(req.out_path)
+        .arg("--timeout")
+        .arg(&timeout_secs);
+    if let Some(connector) = req.connector_path {
+        cmd.arg("--connector").arg(connector);
+    }
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    // Drop known credential env vars before the CLI inherits the rest.
+    //
+    // A flow is untrusted code — writable over HTTP, claimable from a linked
+    // provider, and deliberately never graph-validated here — so the same
+    // reasoning that gives plugins an allow-listed environment applies. The CLI
+    // legitimately needs far more than a plugin (it IS the engine: PATH, HOME,
+    // node's own vars), so this is a deny-list of the sensitive names rather
+    // than an allow-list, and it matters because the engine's getSecret() reads
+    // process.env by name BEFORE its own store — an inherited AWS/OpenAI key
+    // would be directly addressable from inside a flow. A flow that genuinely
+    // needs a cloud key should carry it as a constant, not inherit it
+    // ambiently. Reuses the plugin host's list so the two paths cannot drift.
+    for name in crate::plugins::runner::NEVER_FORWARD {
+        cmd.env_remove(name);
+    }
+    // Tell the child where THIS desktop's API is.
+    //
+    // A connector node that chats, calls a plugin connector or touches a
+    // service comes back to us over loopback, and the child had no way to know
+    // the port — it fell back to a default that happens to be right only while
+    // nobody changes it. On a desktop started with a different port those
+    // operations would quietly address whatever else is listening there.
+    cmd.env(
+        "OAIY_SERVER_URL",
+        format!("http://127.0.0.1:{}", crate::DESKTOP_PORT),
+    );
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            return CliOutcome::Unavailable {
+                message: format!("could not launch the OAIY CLI ({cli:?}): {e}"),
+                detail: None,
+                retryable: false,
+            }
+        }
+    };
+    // A flow run makes HTTP calls and writes files. Orphaned by a forced exit it
+    // keeps doing both, with no ledger entry left to record it and no timeout
+    // left to stop it.
+    crate::services::job_object::adopt(child.id());
+
+    // Drain BOTH pipes on their own threads, from the start. The first cut read
+    // stderr only after exit and stdout never — so a CLI that logged more than
+    // one OS pipe buffer (~4-64 KB; routine for a verbose Node process) blocked
+    // in write(), could never exit, and was killed at the deadline as a false
+    // `timed_out`. The review traced the whole chain, and this crate documents
+    // the identical hazard for plugin stderr.
+    let captured_err = Arc::new(std::sync::Mutex::new(String::new()));
+    if let Some(err) = child.stderr.take() {
+        let sink = captured_err.clone();
+        thread::spawn(move || drain_capped(err, &sink));
+    }
+    let captured_out = Arc::new(std::sync::Mutex::new(String::new()));
+    if let Some(out) = child.stdout.take() {
+        let sink = captured_out.clone();
+        thread::spawn(move || drain_capped(out, &sink));
+    }
+
+    // Grace over the CLI's own timeout so the CLI gets to time out FIRST and
+    // report which node was stuck — killing from out here loses that.
+    let deadline = Instant::now() + req.timeout + Duration::from_secs(10);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) => {}
+            Err(_) => break None,
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        if cancelled() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return CliOutcome::Cancelled;
+        }
+        thread::sleep(CHILD_POLL);
+    };
+
+    let capture = captured_err.lock().map(|g| g.clone()).unwrap_or_default();
+
+    match status {
+        Some(st) if st.success() => match std::fs::read_to_string(req.out_path) {
+            Ok(body) => match serde_json::from_str::<Value>(&body) {
+                Ok(v) => CliOutcome::Succeeded(v),
+                Err(e) => CliOutcome::Unreadable(format!(
+                    "the CLI reported success but its output is not JSON: {e}"
+                )),
+            },
+            Err(_) => CliOutcome::Unreadable(
+                "the CLI reported success but wrote no result file".to_string(),
+            ),
+        },
+        Some(st) => CliOutcome::Failed {
+            exit_code: st.code().unwrap_or(-1),
+            detail: tail_of(&capture, 1500),
+        },
+        None => CliOutcome::TimedOut,
     }
 }
 

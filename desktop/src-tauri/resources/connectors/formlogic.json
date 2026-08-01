@@ -58,6 +58,7 @@
     "queuedPath": "/api/v1/flow-runs/queued",
     "claimPath": "/api/v1/flow-runs/{id}/claim",
     "completePath": "/api/v1/flow-runs/{id}",
+    "graphPath": "/api/v1/flows",
     "nodes": [
       { "nodeType": "input", "operation": "runInput" },
       { "nodeType": "llm_chat", "operation": "chat" },

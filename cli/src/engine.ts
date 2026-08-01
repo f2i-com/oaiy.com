@@ -25,6 +25,13 @@ export interface RunOptions {
    * without it those nodes silently fall through to the unknown-type passthrough.
    */
   availableFlows?: Flow[];
+  /**
+   * Path to a connector config (`--connector`). Its node types are built into a
+   * module and registered before the flow compiles, so a graph from the linked
+   * provider resolves. Absent, provider node types are unknown and the compiler
+   * refuses the flow — which is the correct outcome, not a silent skip.
+   */
+  connectorPath?: string;
 }
 
 export interface RunResult {
@@ -45,6 +52,14 @@ const DEFAULT_TIMEOUT_MS = 45 * 60 * 1000;
 export async function runFlow(graph: WorkflowGraph, opts: RunOptions = {}): Promise<RunResult> {
   // Populate the shared module registry (the singleton createEngine reads).
   await loadNodeBundledModules();
+
+  // A linked provider's node types, if one was supplied. Loaded AFTER the
+  // bundled modules so a node-type collision is caught (loadModule refuses it)
+  // instead of shadowing a built-in node.
+  if (opts.connectorPath) {
+    const { loadConnectorModule } = await import('./connector');
+    await loadConnectorModule(opts.connectorPath);
+  }
 
   const engine = createEngine({
     // Subflow and macro nodes resolve their target by id out of this list. It was
