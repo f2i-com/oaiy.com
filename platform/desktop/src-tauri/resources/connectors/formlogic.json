@@ -54,7 +54,19 @@
   },
   "flows": {
     "bindingsPath": "/api/v1/flow-bindings",
-    "reservePath": "/api/v1/flow-runs"
+    "reservePath": "/api/v1/flow-runs",
+    "queuedPath": "/api/v1/flow-runs/queued",
+    "claimPath": "/api/v1/flow-runs/{id}/claim",
+    "completePath": "/api/v1/flow-runs/{id}",
+    "nodes": [
+      { "nodeType": "input", "operation": "runInput" },
+      { "nodeType": "llm_chat", "operation": "chat" },
+      { "nodeType": "formlogic_list_responses", "operation": "listRecords", "path": "/api/v1/forms/{form}/responses" },
+      { "nodeType": "formlogic_submit_response", "operation": "createRecord", "path": "/api/v1/forms/{form}/responses" },
+      { "nodeType": "formlogic_update_response", "operation": "updateRecord", "path": "/api/v1/responses/{id}" },
+      { "nodeType": "connector_request", "operation": "connectorRequest" },
+      { "nodeType": "desktop_services", "operation": "serviceControl" }
+    ]
   },
   "dataNode": {
     "registerPath": "/api/v1/data-node/register",
