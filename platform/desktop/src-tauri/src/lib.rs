@@ -1515,6 +1515,11 @@ pub fn run() {
                         codex: ai_codex_for_http.clone(),
                     },
                 );
+                // Let plugin events reach the flows the user built on the
+                // provider's site. Without it an Aokie call fires only this
+                // desktop's local bindings, and the flow they actually wrote
+                // never runs.
+                bridge_for_http.host.set_link(link_for_http.clone());
                 bridge_for_http.host.set_companion_broker(
                     crate::plugins::CompanionBroker {
                         companion: companion_for_http.clone(),

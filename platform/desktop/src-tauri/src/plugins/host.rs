@@ -385,6 +385,12 @@ pub struct PluginHost {
     /// `companion.admission` with an honest "not configured" beats making every
     /// caller supply a broker it will never use.
     companion: Mutex<Option<CompanionBroker>>,
+    /// The linked account, for fanning events out to its flows. Set after
+    /// construction like the companion broker, and for the same reason: the
+    /// host exists before the link does, and in tests there is no link at all.
+    link: Mutex<Option<crate::link::LinkHandle>>,
+    /// The account's trigger bindings, cached between events.
+    flow_bindings: crate::link::flows::FlowBindings,
 }
 
 /// What the host needs to answer `companion.admission`: this desktop's own
@@ -425,6 +431,8 @@ impl PluginHost {
             desktop_version,
             dev_mode,
             companion: Mutex::new(None),
+            link: Mutex::new(None),
+            flow_bindings: crate::link::flows::FlowBindings::new(),
         });
 
         // Event thread: ring + trigger dispatch + ack.
@@ -890,6 +898,66 @@ impl PluginHost {
 
     // --- internals ---------------------------------------------------------
 
+    /// Reserve a run on the linked account for every binding this event fires.
+    ///
+    /// Best effort and non-fatal: the local dispatch has already happened, and
+    /// a provider that is unreachable must not stop this desktop's own
+    /// automation. Each outcome is logged with the binding it belongs to,
+    /// because a trigger that silently does nothing is the hardest kind of
+    /// automation bug to find.
+    fn fan_out_to_linked_flows(&self, event: &crate::bridge::triggers::Event, envelope: &Value) {
+        let link = {
+            let guard = self.link.lock().unwrap_or_else(|e| e.into_inner());
+            match guard.as_ref() {
+                Some(l) => l.clone(),
+                None => return,
+            }
+        };
+        let Some(account) = link.account() else {
+            return;
+        };
+        let Some(spec) = crate::link::descriptor::find(link.data_dir(), &account.connector_id)
+            .and_then(|d| d.flows)
+        else {
+            return;
+        };
+        let bindings = match self.flow_bindings.load(&account, &spec) {
+            Ok(b) => b,
+            Err(e) => {
+                log::warn!("flow bindings for {}: {e}", event.name);
+                return;
+            }
+        };
+        let (fire, skipped) = crate::link::flows::select(&bindings, &event.name);
+        for (binding, reason) in skipped {
+            log::info!(
+                "flow binding {} did not fire for {}: {}",
+                binding.id,
+                event.name,
+                reason.message()
+            );
+        }
+        for binding in fire {
+            match crate::link::flows::reserve(
+                &account,
+                &spec,
+                binding,
+                &event.name,
+                &event.correlation_id,
+                &event.idempotency_key,
+                envelope,
+            ) {
+                Ok(Some(run_id)) => {
+                    log::info!("flow {} queued run {run_id} for {}", binding.id, event.name)
+                }
+                // Already reserved by an earlier delivery — the idempotency
+                // gate doing its job, not a failure.
+                Ok(None) => log::debug!("flow binding {} already had this event", binding.id),
+                Err(e) => log::warn!("flow binding {} could not reserve a run: {e}", binding.id),
+            }
+        }
+    }
+
     /// The event thread's work: ring, triggers, ack.
     fn process_event(&self, plugin_id: &str, envelope: Value) {
         let name = envelope
@@ -921,6 +989,13 @@ impl PluginHost {
             self.record_dead(&event.source, &event.name, reason, envelope.clone());
         }
         let outcomes = dispatched.outcomes;
+
+        // …and the SAME event to the linked account's own flows. The flows a
+        // user actually built live in the provider's web app, so without this
+        // the event was matched only against local bindings, found nothing, and
+        // the flow they wrote never ran. Before the ack, for the same reason
+        // the local dispatch is.
+        self.fan_out_to_linked_flows(&event, &envelope);
 
         let seq = self.events.seq.fetch_add(1, Ordering::Relaxed) + 1;
         if let Ok(mut ring) = self.events.ring.lock() {
@@ -954,6 +1029,16 @@ impl PluginHost {
     /// Let a binary supply the companion broker once its HTTP surface exists.
     pub fn set_companion_broker(&self, broker: CompanionBroker) {
         *self.companion.lock().unwrap_or_else(|e| e.into_inner()) = Some(broker);
+    }
+
+    /// Give the host the linked account, so plugin events can reach the flows
+    /// the user built there. Until this is set, events stay local — which is
+    /// the correct behaviour for an unlinked desktop.
+    pub fn set_link(&self, link: crate::link::LinkHandle) {
+        *self.link.lock().unwrap_or_else(|e| e.into_inner()) = Some(link);
+        // A fresh link may belong to a different account entirely; keeping the
+        // previous account's bindings would fire the wrong flows.
+        self.flow_bindings.invalidate();
     }
 
     /// Broker a companion admission for the plugin that hosts the WebRTC peer.

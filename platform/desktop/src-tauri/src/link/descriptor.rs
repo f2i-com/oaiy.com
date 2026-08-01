@@ -116,6 +116,25 @@ pub struct ConnectorDescriptor {
     /// Omitted for a provider with no such notion.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data_node: Option<DataNodeSpec>,
+    /// How an event on this desktop reaches the account's own flows. Omitted
+    /// for a provider with no flows, whose events then stay local.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flows: Option<FlowsSpec>,
+}
+
+/// The account's flow triggers: read the bindings, reserve a run.
+///
+/// Reserve only. This desktop does not execute the provider's flow graph — it
+/// queues a run and lets whatever runtime already claims queued runs do the
+/// work, which is what keeps there from being a second flow engine to hold in
+/// step with the first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FlowsSpec {
+    /// The account's enabled trigger bindings.
+    pub bindings_path: String,
+    /// Reserve one run.
+    pub reserve_path: String,
 }
 
 /// Enrolment of this machine as a node the account owner approves by name and
@@ -422,6 +441,19 @@ impl ConnectorDescriptor {
             }
             if n.capabilities.is_empty() {
                 return Err(format!("connector {:?} dataNode claims no capabilities", self.id));
+            }
+        }
+        if let Some(f) = &self.flows {
+            for (label, path) in [
+                ("bindingsPath", &f.bindings_path),
+                ("reservePath", &f.reserve_path),
+            ] {
+                if !path.starts_with('/') {
+                    return Err(format!(
+                        "connector {:?} flows {label} must begin with '/', got {path:?}",
+                        self.id
+                    ));
+                }
             }
         }
         if o.token_response.credential_fields.is_empty() {

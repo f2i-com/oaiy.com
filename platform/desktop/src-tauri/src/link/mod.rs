@@ -15,6 +15,7 @@
 
 pub mod data_node;
 pub mod descriptor;
+pub mod flows;
 pub mod heartbeat;
 pub mod oauth;
 pub mod ops;
