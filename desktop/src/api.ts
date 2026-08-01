@@ -85,6 +85,10 @@ export interface ServiceSnapshot {
   lastCrash?: { code: number; at: string; detail?: string | null } | null;
   /** Automatic recovery gave up; a human needs to look (offer Repair). */
   needsRepair?: boolean;
+  /** The user ticked "start with the app" for this service. Independent of
+   *  whether it is running right now. Optional so a snapshot from an older
+   *  desktop build (no such field) reads as unticked rather than undefined. */
+  autostart?: boolean;
 }
 
 /** A CUDA GPU present on the machine (from nvidia-smi). */
@@ -167,6 +171,14 @@ export const services = {
   /** Clear a tripped crash breaker and start from a clean slate. */
   repair: (id: string) =>
     request<void>(`/api/services/${encodeURIComponent(id)}/repair`, { method: 'POST' }),
+  /** Tick/untick "start this service when the app starts". A stored preference
+   *  only — it never starts or stops the service now. */
+  setAutostart: (id: string, enabled: boolean) =>
+    request<void>(`/api/services/${encodeURIComponent(id)}/autostart`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled }),
+    }),
   stop: (id: string) =>
     request<void>(`/api/services/${encodeURIComponent(id)}/stop`, {
       method: 'POST',

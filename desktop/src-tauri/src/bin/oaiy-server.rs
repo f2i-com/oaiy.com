@@ -344,13 +344,15 @@ async fn main() {
     let ai_providers = oaiy_desktop_lib::ai::open_handle(data_dir.join("ai").join("providers.json"));
     let ai_codex = oaiy_desktop_lib::ai::codex::new_handle(&data_dir);
 
-    // Bring back whatever was running before the last shutdown. A headless box
-    // that reboots should come up serving, not waiting for someone to SSH in and
-    // start each service by hand.
+    // Start what was ticked "start with the app", plus whatever was running
+    // before the last shutdown. A headless box that reboots should come up
+    // serving, not waiting for someone to SSH in and start each service by hand
+    // — and the ticked set is honoured here too, so a preference set in the GUI
+    // means the same thing on a machine that only ever runs the server.
     {
         let started = registry
             .lock()
-            .map(|mut r| r.autostart_remembered())
+            .map(|mut r| r.autostart_on_boot())
             .unwrap_or_default();
         if !started.is_empty() {
             log::info!("autostarted {} service(s): {}", started.len(), started.join(", "));

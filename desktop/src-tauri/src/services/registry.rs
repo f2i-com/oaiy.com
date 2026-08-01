@@ -264,6 +264,9 @@ pub struct ServiceSnapshot {
     pub last_crash: Option<ExitDiagnostics>,
     /// The breaker has tripped — automatic recovery gave up.
     pub needs_repair: bool,
+    /// The user ticked "start this with the app". Drives the checkbox on the
+    /// card; independent of whether it happens to be running right now.
+    pub autostart: bool,
 }
 
 /// Result of `ensure_by_port` — surfaced to oaiy-web so it can tell the
@@ -582,6 +585,16 @@ pub struct Registry {
     /// service's own default (e.g. krea2 keeps DIT on GPU 0 + encoder on GPU 1). Set live
     /// from the GPU picker; takes effect on the next start.
     service_gpus: HashMap<String, u32>,
+    /// Services the user explicitly asked to start with the app, by id.
+    ///
+    /// Deliberately NOT the same thing as the running note (see
+    /// [`Registry::remember_running`]): that restores whatever happened to be
+    /// up last time, which is a guess about intent. This is the intent itself,
+    /// so a service the user stopped mid-session still comes back next launch.
+    /// Held here rather than in the Tauri config because `oaiy-server` boots
+    /// the same registry with no `AppHandle` to read config from — a flag only
+    /// the GUI could honour would silently do nothing headless.
+    autostart: std::collections::HashSet<String>,
     /// Templates that failed to load on the last scan, for the snapshot.
     /// Rebuilt wholesale by `reload_new_templates` (which runs on every
     /// /api/services poll), so fixing the file clears the report by itself.
@@ -589,6 +602,20 @@ pub struct Registry {
     /// What each `templates/*.json` looked like last time we read it, keyed by
     /// path. See [`Registry::reload_new_templates`].
     template_probes: HashMap<PathBuf, TemplateProbe>,
+}
+
+/// Read the explicit start-with-the-app list from a data dir.
+///
+/// A free function because `Registry::init` needs it before there is a `Self`.
+/// Every failure — missing file (the normal case on a fresh install), bad JSON,
+/// unreadable — is an empty set: a preference file we cannot read must not stop
+/// the app booting, and starting nothing is the safe direction to fail in.
+fn read_autostart_note(data_dir: &Path) -> std::collections::HashSet<String> {
+    std::fs::read_to_string(data_dir.join("services-autostart.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
+        .map(|v| v.into_iter().collect())
+        .unwrap_or_default()
 }
 
 /// Seed a built-in plumbing script, refreshing it when we ship a new
@@ -812,6 +839,7 @@ impl Registry {
             data_dir.display()
         );
         let model_dirs = combine_model_dirs(&models_dir, extra_model_dirs);
+        let autostart = read_autostart_note(&data_dir);
         Ok(Self {
             services,
             data_dir,
@@ -821,6 +849,7 @@ impl Registry {
             llama_mmproj: None,
             ollama_model: None,
             service_gpus: HashMap::new(),
+            autostart,
             template_errors,
             template_probes: HashMap::new(),
         })
@@ -840,6 +869,10 @@ impl Registry {
             llama_mmproj: None,
             ollama_model: None,
             service_gpus: HashMap::new(),
+            // The degraded registry has no services to start, and its data dir
+            // is by definition unwritable — reading the note would only ever
+            // produce ids nothing can act on.
+            autostart: std::collections::HashSet::new(),
             template_errors: Vec::new(),
             template_probes: HashMap::new(),
         }
@@ -1235,6 +1268,56 @@ impl Registry {
         }
     }
 
+    /// Where the explicit "start these with the app" list lives, beside the
+    /// running note. Separate file, because the two answer different questions
+    /// and one must not be able to corrupt the other.
+    fn autostart_note_path(&self) -> PathBuf {
+        self.data_dir.join("services-autostart.json")
+    }
+
+    /// Is this service marked to start with the app?
+    pub fn is_autostart(&self, id: &str) -> bool {
+        self.autostart.contains(id)
+    }
+
+    /// Mark (or unmark) a service to start with the app, persisting the choice.
+    ///
+    /// Returns an error only when the choice could not be written: reporting
+    /// success for a preference that will be gone at the next launch is the one
+    /// outcome worth failing loudly on, since the user would have no way to
+    /// tell until the service silently did not come up.
+    pub fn set_autostart(&mut self, id: &str, on: bool) -> Result<(), String> {
+        if !self.services.contains_key(id) {
+            return Err(format!("no such service: {id}"));
+        }
+        let changed = if on {
+            self.autostart.insert(id.to_string())
+        } else {
+            self.autostart.remove(id)
+        };
+        if !changed {
+            return Ok(());
+        }
+        self.persist_autostart()
+    }
+
+    /// Write the current tick list out, atomically.
+    ///
+    /// Separate from [`Self::set_autostart`] because `delete_template` also has
+    /// to prune the list, and it must not go through the "does this service
+    /// exist" guard — by then it deliberately does not.
+    fn persist_autostart(&self) -> Result<(), String> {
+        // Sorted so the file is stable across writes and diffable by hand.
+        let mut ids: Vec<&str> = self.autostart.iter().map(|s| s.as_str()).collect();
+        ids.sort_unstable();
+        let body = serde_json::to_string(&ids).map_err(|e| format!("serialize autostart: {e}"))?;
+        let path = self.autostart_note_path();
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, body).map_err(|e| format!("write {}: {e}", tmp.display()))?;
+        std::fs::rename(&tmp, &path).map_err(|e| format!("replace {}: {e}", path.display()))?;
+        Ok(())
+    }
+
     /// Ids recorded by [`Self::remember_running`], if any.
     fn remembered_running(&self) -> Vec<String> {
         std::fs::read_to_string(self.running_note_path())
@@ -1243,15 +1326,42 @@ impl Registry {
             .unwrap_or_default()
     }
 
-    /// Start everything that was running when this machine last had OAIY up.
+    /// The ids [`Self::autostart_on_boot`] will try, in order.
+    ///
+    /// Split out so the policy can be tested without spawning anything — the
+    /// starting itself is the one part of this that cannot be exercised in a
+    /// unit test.
+    fn boot_start_ids(&self) -> Vec<String> {
+        // Explicit choices first, so they are what gets reported when an id is
+        // in both lists and a long remembered list cannot delay what the user
+        // actually asked for. Sorted for a deterministic order.
+        let mut ids: Vec<String> = self.autostart.iter().cloned().collect();
+        ids.sort_unstable();
+        ids.extend(
+            self.remembered_running()
+                .into_iter()
+                .filter(|id| !self.autostart.contains(id)),
+        );
+        ids
+    }
+
+    /// Start everything that should be up as soon as OAIY is.
+    ///
+    /// Two sources, deliberately unioned:
+    ///  - services the user ticked "start with the app" ([`Self::set_autostart`]),
+    ///    which is a standing instruction and holds even if they stopped the
+    ///    service by hand five minutes before quitting;
+    ///  - whatever happened to be running last time ([`Self::remember_running`]),
+    ///    which is a guess at the same intent and stays as a safety net for
+    ///    everyone who never ticks anything.
     ///
     /// Returns the ids it started. Without this, a reboot (or just closing the
     /// app) silently takes the whole local runtime offline: a paired page's AI
     /// calls fail and every trigger-fired flow that needs a local service breaks
     /// until a human opens the window and clicks Start on each one.
-    pub fn autostart_remembered(&mut self) -> Vec<String> {
+    pub fn autostart_on_boot(&mut self) -> Vec<String> {
         let mut started = Vec::new();
-        for id in self.remembered_running() {
+        for id in self.boot_start_ids() {
             // Only what still exists and isn't already up; a start failure is
             // logged by `start` and must not stop the rest from coming back.
             match self.services.get(&id).map(|s| s.status) {
@@ -1362,6 +1472,7 @@ impl Registry {
                 uninstallable: s.template.uninstall.is_some(),
                 installed: self.run_installed(&s.template, s.port),
                 gpu: self.service_gpus.get(&s.template.id).copied(),
+                autostart: self.autostart.contains(&s.template.id),
                 node: s.template.node.as_ref().map(|n| {
                     // Resolve companion-side `${...}` placeholders (e.g.
                     // `${ollamaModel}`) in the node body BEFORE the web app sees
@@ -2358,6 +2469,17 @@ impl Registry {
         // memory (shouldn't happen normally) we still proceed.
         let _ = std::fs::remove_file(&path);
         self.services.remove(id);
+        // Drop any "start with the app" tick with it. A stale id is harmless at
+        // boot (autostart_on_boot skips ids with no service), but re-importing a
+        // template with the same id would otherwise arrive silently pre-ticked
+        // and start itself — a choice about a service the user deleted. Deleting
+        // the service is the user's goal, so a failed preference write is logged
+        // rather than allowed to fail the delete.
+        if self.autostart.remove(id) {
+            if let Err(e) = self.persist_autostart() {
+                log::warn!("could not drop {id} from the start-with-the-app list: {e}");
+            }
+        }
         Ok(())
     }
 }
@@ -2666,6 +2788,151 @@ mod tests {
         assert_eq!(venv_name_in("${binDir}/llama-server.exe"), None);
         // `venvs/` with nothing after it is not a usable name.
         assert_eq!(venv_name_in("x/venvs/"), None);
+    }
+
+    /// A registry over a throwaway data dir. `init` seeds the built-in
+    /// templates, so the services it loads are real ids we can flag.
+    fn scratch_registry(tag: &str) -> (PathBuf, Registry) {
+        let dir = std::env::temp_dir().join(format!(
+            "oaiy-autostart-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let reg = Registry::init(dir.clone(), dir.join("models"), Vec::new())
+            .expect("a fresh temp dir is writable");
+        (dir, reg)
+    }
+
+    /// Any built-in id, so the tests do not hard-code one that could be renamed.
+    fn some_service_id(reg: &Registry) -> String {
+        let mut ids: Vec<String> = reg.services.keys().cloned().collect();
+        ids.sort();
+        ids.first().expect("built-in templates seeded").clone()
+    }
+
+    #[test]
+    fn ticking_start_with_the_app_survives_a_restart_and_a_manual_stop() {
+        // The whole point of the checkbox: "what was running last time" is a
+        // GUESS at intent, so stopping a service before quitting would cancel
+        // it. An explicit choice has to outlive that.
+        let (dir, mut reg) = scratch_registry("survives");
+        let id = some_service_id(&reg);
+        reg.set_autostart(&id, true).expect("the choice persists");
+        assert!(reg.is_autostart(&id));
+
+        // Nothing was running at exit — the running note stays empty.
+        reg.remember_running();
+
+        let reopened = Registry::init(dir.clone(), dir.join("models"), Vec::new())
+            .expect("reopens the same data dir");
+        assert!(
+            reopened.is_autostart(&id),
+            "the choice must be read back from disk"
+        );
+        assert_eq!(
+            reopened.boot_start_ids(),
+            vec![id],
+            "an explicitly ticked service starts even though nothing was running at exit"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unticking_removes_it_from_the_boot_set() {
+        let (dir, mut reg) = scratch_registry("untick");
+        let id = some_service_id(&reg);
+        reg.set_autostart(&id, true).unwrap();
+        reg.set_autostart(&id, false).unwrap();
+        assert!(!reg.is_autostart(&id));
+        assert!(reg.boot_start_ids().is_empty());
+
+        let reopened = Registry::init(dir.clone(), dir.join("models"), Vec::new()).unwrap();
+        assert!(!reopened.is_autostart(&id), "the removal persists too");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_service_in_both_lists_is_only_started_once() {
+        // Ticked AND running at exit. Starting it twice would race the port
+        // conflict check against ourselves.
+        let (dir, mut reg) = scratch_registry("dedupe");
+        let id = some_service_id(&reg);
+        reg.set_autostart(&id, true).unwrap();
+        // Stand in for the running note rather than actually spawning it.
+        std::fs::write(
+            reg.running_note_path(),
+            serde_json::to_string(&vec![id.clone()]).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(reg.boot_start_ids(), vec![id]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_remembered_set_still_starts_for_anyone_who_never_ticks_anything() {
+        // The new flag must not quietly replace the old safety net.
+        let (dir, reg) = scratch_registry("remembered");
+        let id = some_service_id(&reg);
+        std::fs::write(
+            reg.running_note_path(),
+            serde_json::to_string(&vec![id.clone()]).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(reg.boot_start_ids(), vec![id]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deleting_a_service_forgets_that_it_was_ticked() {
+        // Otherwise re-importing a template with the same id later arrives
+        // silently pre-ticked and starts itself at the next launch — a decision
+        // about a service the user deliberately removed.
+        let (dir, mut reg) = scratch_registry("delete");
+        let id = some_service_id(&reg);
+        reg.set_autostart(&id, true).unwrap();
+        reg.delete_template(&id).expect("a stopped service deletes");
+
+        let reopened = Registry::init(dir.clone(), dir.join("models"), Vec::new()).unwrap();
+        assert!(
+            !reopened.is_autostart(&id),
+            "the tick must not outlive the service it referred to"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ticking_a_service_that_does_not_exist_is_refused() {
+        // Otherwise the note accumulates ids nothing can ever start, and the
+        // user is told their choice was saved.
+        let (dir, mut reg) = scratch_registry("unknown");
+        let err = reg
+            .set_autostart("no-such-service", true)
+            .expect_err("an unknown id is a bad request");
+        assert!(err.contains("no-such-service"), "unhelpful message: {err}");
+        assert!(reg.boot_start_ids().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unreadable_autostart_note_boots_with_nothing_rather_than_failing() {
+        // A preference file we cannot parse must not stop the app coming up,
+        // and starting nothing is the safe direction to fail in.
+        let (dir, _reg) = scratch_registry("corrupt");
+        std::fs::write(dir.join("services-autostart.json"), "{not json").unwrap();
+        let reopened = Registry::init(dir.clone(), dir.join("models"), Vec::new())
+            .expect("a corrupt preference file is not a boot failure");
+        assert!(reopened.boot_start_ids().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_data_dir_from_a_build_without_the_feature_reads_as_nothing_ticked() {
+        // Back-compat: existing installs have no services-autostart.json at all.
+        let (dir, reg) = scratch_registry("absent");
+        assert!(!dir.join("services-autostart.json").exists());
+        assert!(reg.boot_start_ids().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

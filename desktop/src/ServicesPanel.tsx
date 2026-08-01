@@ -557,6 +557,64 @@ function useGpus(): GpuInfo[] {
 }
 
 /**
+ * Per-service "start with the app" checkbox.
+ *
+ * A stored preference, NOT an action: ticking a stopped service deliberately
+ * does not start it here (that would make this a second Start button), and
+ * unticking a running one does not stop it. It takes effect at the next launch,
+ * which is what the hint says.
+ *
+ * Distinct from the app's existing behaviour of restoring whatever was running
+ * at the last shutdown — that is a guess at intent, this is the intent, so it
+ * survives stopping the service by hand before quitting.
+ */
+function AutostartToggle({ serviceId, autostart }: { serviceId: string; autostart: boolean }) {
+  const [on, setOn] = useState(autostart);
+  const [pending, setPending] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  // The 2s poll re-renders this card with the server's value; follow it so a
+  // change made elsewhere (or a failed write) is reflected rather than stuck.
+  useEffect(() => {
+    setOn(autostart);
+  }, [autostart]);
+  return (
+    <div style={MODEL_SELECTOR_ROW_STYLE}>
+      {/* Wrapping the input in the <label> associates the two, so the checkbox
+          has an accessible name. */}
+      <label style={{ opacity: 0.8, display: 'flex', alignItems: 'center', gap: 6 }}>
+        <input
+          type="checkbox"
+          checked={on}
+          disabled={pending}
+          onChange={async (e) => {
+            const next = e.target.checked;
+            const prev = on;
+            setOn(next);
+            setError(null);
+            setPending(true);
+            try {
+              await services.setAutostart(serviceId, next);
+            } catch (err) {
+              // The preference did not persist. Roll back rather than leave a
+              // ticked box that will be gone at the next launch — silently
+              // failing here means a service the user believes is set to start
+              // simply never comes up.
+              setOn(prev);
+              setError(err instanceof Error ? err.message : String(err));
+            } finally {
+              setPending(false);
+            }
+          }}
+        />
+        Start with the app
+      </label>
+      <span style={{ opacity: 0.6, fontSize: '0.85em' }}>applies at next launch</span>
+      {error && <span className="service-error">⚠ {error}</span>}
+    </div>
+  );
+}
+
+/**
  * Per-service GPU picker. Pins the service to a CUDA GPU (CUDA_VISIBLE_DEVICES) so heavy
  * services don't all default to GPU 0 and exhaust its VRAM — e.g. put llama.cpp on GPU 1 so
  * krea2 keeps GPU 0. Hidden when fewer than 2 GPUs. Applies on the service's next start.
@@ -1052,6 +1110,7 @@ function ServiceCard({
             />
           )}
           <GpuSelector serviceId={service.id} currentGpu={service.gpu} />
+          <AutostartToggle serviceId={service.id} autostart={service.autostart === true} />
         </div>
         <div className="service-actions">
           {/* Start / Stop — only meaningful once installed (you can't start what isn't

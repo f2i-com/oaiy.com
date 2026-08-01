@@ -8,13 +8,14 @@ import React, { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-const { listMock, ollamaMock, ggufMock, configMock, gpusMock, pushMock } = vi.hoisted(() => ({
+const { listMock, ollamaMock, ggufMock, configMock, gpusMock, pushMock, autostartMock } = vi.hoisted(() => ({
   listMock: vi.fn(),
   ollamaMock: vi.fn(),
   ggufMock: vi.fn(),
   configMock: vi.fn(),
   gpusMock: vi.fn(),
   pushMock: vi.fn(),
+  autostartMock: vi.fn(),
 }));
 
 vi.mock('./api', () => ({
@@ -26,6 +27,7 @@ vi.mock('./api', () => ({
     uninstall: vi.fn(),
     cancelInstall: vi.fn(),
     repair: vi.fn(),
+    setAutostart: autostartMock,
     delete: vi.fn(),
     add: vi.fn(),
     import: vi.fn(),
@@ -82,6 +84,8 @@ beforeEach(() => {
   ggufMock.mockReset();
   configMock.mockReset();
   gpusMock.mockReset();
+  autostartMock.mockReset();
+  autostartMock.mockResolvedValue(undefined);
   listMock.mockResolvedValue(SNAPSHOT);
   ollamaMock.mockResolvedValue(['qwen2.5:0.5b']);
   ggufMock.mockResolvedValue([]);
@@ -139,5 +143,55 @@ describe('ServicesPanel loading', () => {
     listMock.mockResolvedValue({ ...SNAPSHOT, services: [service({ status: 'running' })] });
     await mount();
     expect(ollamaMock).toHaveBeenCalled();
+  });
+});
+
+// "Start with the app" is a stored preference, not a second Start button. The
+// distinction matters on both edges: ticking must not launch the service now,
+// and a failed write must not leave a ticked box that will be gone at the next
+// launch (the service would simply never come up, with nothing to explain it).
+describe('ServicesPanel start-with-the-app', () => {
+  const box = () => host.querySelector<HTMLInputElement>('input[type="checkbox"]');
+
+  it('reflects the stored preference rather than whether it is running', async () => {
+    listMock.mockResolvedValue({
+      ...SNAPSHOT,
+      services: [service({ status: 'stopped', autostart: true })],
+    });
+    await mount();
+    expect(box()?.checked).toBe(true);
+  });
+
+  it('is unticked for a snapshot from a desktop build that has no such field', async () => {
+    await mount();
+    expect(box()).not.toBeNull();
+    expect(box()?.checked).toBe(false);
+  });
+
+  it('saves the preference without starting the service', async () => {
+    await mount();
+    const el = box()!;
+    // el.click() lets jsdom toggle `checked` and fire the click React maps to
+    // onChange; setting `checked` by hand first makes React see no change.
+    await act(async () => {
+      el.click();
+    });
+    expect(autostartMock).toHaveBeenCalledWith('ollama', true);
+    // The only lever that starts a service is Start.
+    const { services: api } = await import('./api');
+    expect(api.start).not.toHaveBeenCalled();
+  });
+
+  it('rolls the tick back when the preference could not be saved', async () => {
+    autostartMock.mockRejectedValue(new Error('disk full'));
+    await mount();
+    const el = box()!;
+    // el.click() lets jsdom toggle `checked` and fire the click React maps to
+    // onChange; setting `checked` by hand first makes React see no change.
+    await act(async () => {
+      el.click();
+    });
+    expect(box()?.checked).toBe(false);
+    expect(text()).toContain('disk full');
   });
 });
