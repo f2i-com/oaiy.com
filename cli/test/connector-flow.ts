@@ -241,6 +241,44 @@ async function main(): Promise<void> {
   // Only a DECLARED root makes a reference; "$250 deposit" is money, not a path.
   check('refs: a bare dollar sign stays literal text', refPayload.literal === '$250 deposit');
 
+  // --- a whole payload addressed by one reference -------------------------
+  //
+  // The live shape: a logic block builds the payload and the connector node's
+  // payload field is nothing but "$nodes.cfg.settingsPayload". If that does not
+  // resolve, `payload` reads as absent and connectorRequest falls back to
+  // `{ value: input }` — which is exactly the key the plugin then rejected
+  // ("value: objects/arrays are not valid settings values").
+  sent.length = 0;
+  const wholeId = engine.submit(
+    'test',
+    'connector-whole-payload',
+    graph(
+      [
+        {
+          id: 'cfg',
+          type: 'logic_block',
+          position: { x: 0, y: 0 },
+          data: { code: 'return { settingsPayload: { persona: "warm", greeting: "hi", aiReceptionist: true } };' },
+        },
+        {
+          id: 'push',
+          type: 'device_command',
+          position: { x: 100, y: 0 },
+          data: { connectorId: 'gadget', command: 'settings.set', payload: '$nodes.cfg.settingsPayload' },
+        },
+      ],
+      [{ source: 'cfg', target: 'push' }],
+    ),
+    {},
+  );
+  const wholeJob = await runToEnd(engine, wholeId);
+  check('whole-payload: the flow completed', wholeJob?.status === 'completed');
+  const wholeRelay = sent.find((s) => s.url.includes('/api/bridge/connectors/'));
+  const wholeSent = JSON.parse(wholeRelay?.body ?? '{}').payload ?? {};
+  check('whole-payload: the referenced object became the payload', wholeSent.persona === 'warm' && wholeSent.greeting === 'hi');
+  // The tell-tale of the old failure: a `value` wrapper around the input.
+  check('whole-payload: it is not wrapped in a `value` key', wholeSent.value === undefined);
+
   // --- a node type this build does not have -------------------------------
   const badId = engine.submit(
     'test',

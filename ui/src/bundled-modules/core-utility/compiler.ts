@@ -180,8 +180,15 @@ const CoreUtilityCompiler: ModuleCompiler = {
       }
 
       case 'logic_block': {
-        // Get the user's code - use 'code' field (from UI) or 'script' field (legacy)
-        let userCode = String(data.code || data.script || 'input');
+        // The block's source, under any of the names a graph may carry it by:
+        // `code` (this app's editor), `expr` (how a linked provider's graphs
+        // are authored), `script` (legacy). Reading only some of them is not a
+        // partial failure — the fallback is `input`, so the block silently
+        // becomes a pass-through and every value it was supposed to compute is
+        // simply absent. Twenty-five blocks on one live account did nothing at
+        // all this way, which read as empty greetings and unconfigured agents
+        // rather than as an error anybody could see.
+        let userCode = String(data.code || data.expr || data.script || 'input');
         userCode = userCode.trim();
 
         // Inlining user code is `code:execute`-equivalent — it runs arbitrary

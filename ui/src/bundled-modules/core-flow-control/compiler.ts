@@ -63,8 +63,15 @@ const CoreFlowControlCompiler: ModuleCompiler = {
         // arbitrary JS expression into the generated workflow) so the runtime
         // refuses to evaluate it for untrusted packages by checking the gate
         // first.
-        if (data.expression && typeof data.expression === 'string') {
-          const expr = data.expression;
+        // Same spelling problem as logic_block: `expression` here, `expr` in a
+        // linked provider's graphs. Missing it does not fail — the node falls
+        // through to the operator comparison below with no operands, so every
+        // route takes the false branch and half the graph never runs.
+        const expressionSource = typeof data.expression === 'string' && data.expression
+          ? data.expression
+          : (typeof data.expr === 'string' ? data.expr : '');
+        if (expressionSource) {
+          const expr = expressionSource;
           // Expose loop_index when condition is inside a loop (matches logic_block behavior)
           let loopIndexDecl = '';
           if (isInLoop && loopStartId && sanitizeId) {

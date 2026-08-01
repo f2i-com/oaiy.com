@@ -83,6 +83,57 @@ async function main(): Promise<void> {
     `got ${JSON.stringify(namedResult.results?.['input'])}`
   );
 
+  // A graph may carry the block's source under `expr` rather than `code`.
+  // Reading only one of them is not a partial failure: the fallback is `input`,
+  // so the block becomes a silent pass-through and everything it was supposed
+  // to compute is absent. Twenty-five blocks on one live account did nothing
+  // this way — an empty greeting and a receptionist that could not be
+  // configured, with no error anywhere (live report 2026-08-01).
+  const byExpr: WorkflowGraph = {
+    nodes: [
+      {
+        id: 'cfg',
+        type: 'logic_block',
+        position: { x: 0, y: 0 },
+        data: { expr: 'return { greeting: "Thank you for calling", settingsPayload: { persona: "warm" } };' },
+      },
+    ],
+    edges: [],
+  } as WorkflowGraph;
+  const exprResult = await runFlow(byExpr, { timeoutMs: 30_000 });
+  check(
+    'a block whose source is under `expr` runs',
+    exprResult.status === 'completed',
+    `status=${exprResult.status} error=${exprResult.error ?? ''}`
+  );
+  const cfg = exprResult.results?.['cfg'] as Record<string, unknown> | undefined;
+  check(
+    'and returns what it computed rather than passing its input through',
+    cfg?.greeting === 'Thank you for calling',
+    `got ${JSON.stringify(exprResult.results?.['cfg'])}`
+  );
+  check(
+    'including a nested object another node addresses by reference',
+    (cfg?.settingsPayload as Record<string, unknown> | undefined)?.persona === 'warm',
+    `got ${JSON.stringify(cfg?.settingsPayload)}`
+  );
+
+  // A condition's expression has the same two spellings, and missing it routes
+  // every branch false — half the graph silently never runs.
+  const condGraph: WorkflowGraph = {
+    nodes: [
+      { id: 'seed', type: 'logic_block', position: { x: 0, y: 0 }, data: { expr: 'return { ok: true };' } },
+      { id: 'gate', type: 'condition', position: { x: 100, y: 0 }, data: { expr: '_cond_val_gate.ok === true' } },
+    ],
+    edges: [{ source: 'seed', target: 'gate' }],
+  } as WorkflowGraph;
+  const condResult = await runFlow(condGraph, { timeoutMs: 30_000 });
+  check(
+    'a condition whose expression is under `expr` evaluates it',
+    condResult.status === 'completed' && condResult.results?.['gate'] === true,
+    `status=${condResult.status} gate=${JSON.stringify(condResult.results?.['gate'])} error=${condResult.error ?? ''}`
+  );
+
   console.log(`logic-block-scope: ${passed} passed, ${failed} failed`);
   process.exit(failed ? 1 : 0);
 }
