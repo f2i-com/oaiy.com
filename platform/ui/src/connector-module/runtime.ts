@@ -59,6 +59,29 @@ function nonEmpty(v: unknown): boolean {
 }
 
 /**
+ * The bare provider id from however a graph names an AI source.
+ *
+ * Sources are listed to graph authors as `provider:<id>` (the same scheme as
+ * `service:<id>`), and a graph that lets the operator pick one naturally passes
+ * that value straight through. But the gateway addresses providers by their
+ * BARE id — `/api/ai/providers/<id>/v1/chat/completions` — so the qualified form
+ * became a path segment and the gateway was asked for a provider literally
+ * named "provider:openai-codex-agent". It answered 404 no_provider, which is
+ * correct and unhelpful: no such provider can ever exist, so the node failed
+ * identically on every call and the failure looked like "no AI configured"
+ * rather than "this id is malformed".
+ *
+ * Stripping the scheme here rather than in any one graph keeps it working for
+ * every provider and every pack — the reference format belongs to the host, not
+ * to whoever authored the flow.
+ */
+function providerId(v: unknown): unknown {
+  if (typeof v !== 'string') return v;
+  const s = v.trim();
+  return s.startsWith('provider:') ? s.slice('provider:'.length) : s;
+}
+
+/**
  * Whether a value actually SAYS something, as opposed to being a node's
  * untouched default.
  *
@@ -446,7 +469,7 @@ export function createConnectorRuntime(
        * from the provider, and not from a cloud endpoint the flow names.
        */
       chat: async (input: unknown, call: ConnectorCall): Promise<string> => {
-        const provider = field(call, input, 'provider', 'providerId');
+        const provider = providerId(field(call, input, 'provider', 'providerId'));
         const url = nonEmpty(provider)
           ? `${loopbackBase}/api/ai/providers/${encodeURIComponent(String(provider))}/v1/chat/completions`
           : `${loopbackBase}/api/ai/v1/chat/completions`;
