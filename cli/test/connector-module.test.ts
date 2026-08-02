@@ -200,9 +200,17 @@ function compile(
     sanitizeId: (s: string) => s,
   });
   if (code === null) throw new Error(`compiler returned null for ${nodeType}`);
-  const m = /await Connector\.([A-Za-z]+)\((.*?), (\{[\s\S]*\})\);/.exec(code);
-  if (!m) throw new Error(`could not parse emitted call from:\n${code}`);
-  return { code, call: JSON.parse(m[3]) as ConnectorCall };
+  // Two emitted shapes. A node whose `data` holds no value references passes the
+  // ConnectorCall as one JSON literal. A node that DOES carry references wraps it
+  // as `Object.assign({}, <literal>, { data: (function(){…})(…) })` so the
+  // selectors resolve at run time — a multi-line IIFE that no single greedy
+  // regex can skip past without swallowing the literal it is looking for. Both
+  // shapes carry the same literal, which is what these tests assert on.
+  const wrapped = /await Connector\.([A-Za-z]+)\(\s*[\s\S]*?,\s*Object\.assign\(\{\}, (\{.*?\}), \{ data:/.exec(code);
+  const plain = /await Connector\.([A-Za-z]+)\((.*?), (\{[\s\S]*\})\);/.exec(code);
+  const literal = wrapped ? wrapped[2] : plain ? plain[3] : null;
+  if (literal === null) throw new Error(`could not parse emitted call from:\n${code}`);
+  return { code, call: JSON.parse(literal) as ConnectorCall };
 }
 
 {
@@ -210,13 +218,18 @@ function compile(
   check('compile: emits a Connector call for the bound operation', code.includes('await Connector.listRecords('));
   check('compile: the call carries the provider path from config', call.path === '/api/v1/books/{book}/entries');
   check('compile: the call carries the node data', call.data.book === 'b1');
-  check('compile: unwired input compiles to null', code.includes('Connector.listRecords(null,'));
+  // The argument, not its formatting: the emitted call is wrapped across lines
+  // once a node carries value references, so an exact-substring match here was
+  // asserting the pretty-printing rather than what gets passed.
+  const passes = (src: string, op: string, arg: string) =>
+    new RegExp(`Connector\\.${op}\\(\\s*${arg.replace(/[$]/g, '\\$&')},`).test(src);
+  check('compile: unwired input compiles to null', passes(code, 'listRecords', 'null'));
 
   const wired = compile(modA, 'ledger_add_entry', {}, 'node_prev_out');
-  check('compile: a wired input is passed through', wired.code.includes('Connector.createRecord(node_prev_out,'));
+  check('compile: a wired input is passed through', passes(wired.code, 'createRecord', 'node_prev_out'));
 
   const entry = compile(modA, 'input');
-  check('compile: the entry operation reads the run inputs', entry.code.includes('Connector.runInput(__inputs,'));
+  check('compile: the entry operation reads the run inputs', passes(entry.code, 'runInput', '__inputs'));
 
   check('compile: an unknown node type is not claimed', modA.compiler.compileNode('some_other_type', {
     node: { id: 'z', type: 'some_other_type', data: {}, position: { x: 0, y: 0 } },
@@ -390,6 +403,48 @@ async function main(): Promise<void> {
       return body.messages[0].role === 'system' && body.messages[1].content.includes('what is up');
     })());
     check('chat: returns the completion text', out === 'hi there');
+  }
+  {
+    // Sources are offered to graph authors as `provider:<id>`, so a graph that
+    // lets the operator pick one passes that value straight through. The
+    // gateway addresses providers by their BARE id, so the qualified form
+    // became a path segment and it was asked for a provider literally named
+    // "provider:openai-codex-agent" — 404 no_provider on every single call,
+    // reported to the operator as "no AI provider is configured".
+    const { ctx, sent } = mkCtx(() => ({ body: { choices: [{ message: { content: 'ok' } }] } }));
+    const m = modA.runtime.createMethods!(ctx);
+    await m.chat('x', callFor(modA, 'llm_chat', { provider: 'provider:openai-codex-agent' }));
+    check(
+      'chat: a provider:<id> source reference addresses the provider by its bare id',
+      sent[0].url === 'http://127.0.0.1:17972/api/ai/providers/openai-codex-agent/v1/chat/completions',
+    );
+  }
+  {
+    // A bare id keeps working unchanged, and an id that merely CONTAINS the
+    // word is not mangled.
+    const { ctx, sent } = mkCtx(() => ({ body: { choices: [{ message: { content: 'ok' } }] } }));
+    const m = modA.runtime.createMethods!(ctx);
+    await m.chat('x', callFor(modA, 'llm_chat', { provider: 'llama-cpp-local' }));
+    await m.chat('x', callFor(modA, 'llm_chat', { provider: 'my-provider:v2' }));
+    check(
+      'chat: a bare provider id is untouched',
+      sent[0].url === 'http://127.0.0.1:17972/api/ai/providers/llama-cpp-local/v1/chat/completions',
+    );
+    check(
+      'chat: only a LEADING provider: scheme is stripped',
+      sent[1].url === 'http://127.0.0.1:17972/api/ai/providers/my-provider%3Av2/v1/chat/completions',
+    );
+  }
+  {
+    // Blank still means "the gateway's own default chat provider", which is the
+    // Automatic setting most installs run on.
+    const { ctx, sent } = mkCtx(() => ({ body: { choices: [{ message: { content: 'ok' } }] } }));
+    const m = modA.runtime.createMethods!(ctx);
+    await m.chat('x', callFor(modA, 'llm_chat', { provider: '   ' }));
+    check(
+      'chat: a blank provider still uses the default gateway route',
+      sent[0].url === 'http://127.0.0.1:17972/api/ai/v1/chat/completions',
+    );
   }
   {
     // Both knobs default to 0 on the node and BOTH document 0 as "leave it to
