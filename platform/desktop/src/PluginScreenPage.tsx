@@ -45,7 +45,7 @@ interface UiScreen {
 
 /** The bootstrap injected ahead of the plugin's own scripts. Plain ES5-ish so it
  *  runs before any transform, and self-contained: the iframe has no imports. */
-const HOST_BOOTSTRAP = `
+export const HOST_BOOTSTRAP = `
 (function () {
   var seq = 0;
   var pending = {};
@@ -57,9 +57,22 @@ const HOST_BOOTSTRAP = `
       parent.postMessage({ __pluginHost: 1, id: id, method: method, args: args || [] }, '*');
     });
   }
+  // The plugin document is opaque-origin, so the host cannot reach in and
+  // restyle it: the theme has to arrive as a message and be applied from in
+  // here. Both conventions are written — 'fl-dark' is what the shipped plugin
+  // stylesheets key their dark tokens off, and data-theme mirrors the host's
+  // own attribute so a newer plugin can use either without a host change.
+  function applyTheme(mode) {
+    var el = document.documentElement;
+    if (!el) return;
+    if (mode === 'dark') el.classList.add('fl-dark');
+    else el.classList.remove('fl-dark');
+    el.setAttribute('data-theme', mode === 'dark' ? 'dark' : 'light');
+  }
   window.addEventListener('message', function (e) {
     var m = e.data;
     if (!m || !m.__pluginHost) return;
+    if (m.theme) { applyTheme(m.theme); return; }
     if (m.event) { subs.forEach(function (s) { try { s(m.event); } catch (_) {} }); return; }
     var p = pending[m.id];
     if (!p) return;
@@ -183,8 +196,14 @@ export default function PluginScreenPage({ pluginId, navId }: Props) {
         const sources = await Promise.all(jsFiles.map(fetchText));
         if (cancelled) return;
         const scripts = sources.map((s) => `<script>${s}</script>`).join('');
+        // Stamped at assembly rather than messaged in after load, so the screen
+        // never paints light-then-flips. Read from the live attribute instead of
+        // a prop on purpose: this must NOT be a dependency of this effect, or a
+        // theme flip would re-assemble srcdoc and remount the plugin — losing a
+        // live call console mid-call to change a colour.
+        const dark = document.documentElement.getAttribute('data-theme') !== 'light';
         setDoc(
-          `<!doctype html><html><head><meta charset="utf-8">` +
+          `<!doctype html><html${dark ? ' class="fl-dark" data-theme="dark"' : ' data-theme="light"'}><head><meta charset="utf-8">` +
             // No external anything: the plugin ships inline SVG and its own CSS.
             `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src data: blob:; font-src data:; connect-src 'none'">` +
             `<style>${css}</style></head><body>${body}` +
@@ -268,6 +287,25 @@ export default function PluginScreenPage({ pluginId, navId }: Props) {
     },
     [pluginId, toast],
   );
+
+  // Follow the host's theme for as long as this screen is mounted.
+  //
+  // Watching the attribute rather than taking a prop keeps this independent of
+  // who flips the theme (the header toggle today, anything else later) and, more
+  // importantly, keeps the theme out of the srcdoc effect's dependencies — that
+  // effect remounts the plugin, and a colour change must never do that.
+  useEffect(() => {
+    const send = () => {
+      const mode = document.documentElement.getAttribute('data-theme') === 'light' ? 'light' : 'dark';
+      frameRef.current?.contentWindow?.postMessage({ __pluginHost: 1, theme: mode }, '*');
+    };
+    const observer = new MutationObserver(send);
+    observer.observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
+    // Also once now: the iframe may have finished loading after it was stamped,
+    // and a re-assembled document starts from the host's current theme anyway.
+    send();
+    return () => observer.disconnect();
+  }, [doc]);
 
   // RPC pump: only messages from OUR iframe are serviced.
   useEffect(() => {
