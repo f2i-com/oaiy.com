@@ -436,28 +436,19 @@ export default function App() {
           </div>
 
           <div className="top-actions">
-            <div className="theme-toggle">
-              <button
-                type="button"
-                className={`icon-button ${theme === 'light' ? 'active' : ''}`}
-                aria-label="Paper Circuit (light) theme"
-                title={THEME_LABEL.light}
-                aria-pressed={theme === 'light'}
-                onClick={() => setTheme('light')}
-              >
-                <Sun size={16} />
-              </button>
-              <button
-                type="button"
-                className={`icon-button ${theme === 'dark' ? 'active' : ''}`}
-                aria-label="Prism Lab (dark) theme"
-                title={THEME_LABEL.dark}
-                aria-pressed={theme === 'dark'}
-                onClick={() => setTheme('dark')}
-              >
-                <Moon size={16} />
-              </button>
-            </div>
+            {/* One button showing the theme you would switch TO, matching the
+                web app. The label is an action rather than a state, so
+                aria-pressed is gone: this does something, it does not report
+                whether it is on. */}
+            <button
+              type="button"
+              className="icon-button"
+              aria-label={theme === 'dark' ? `Switch to the ${THEME_LABEL.light} light theme` : `Switch to the ${THEME_LABEL.dark} dark theme`}
+              title={theme === 'dark' ? `Switch to ${THEME_LABEL.light}` : `Switch to ${THEME_LABEL.dark}`}
+              onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}
+            >
+              {theme === 'dark' ? <Sun size={16} /> : <Moon size={16} />}
+            </button>
             <button
               className="button secondary"
               type="button"

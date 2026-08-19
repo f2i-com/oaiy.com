@@ -73,3 +73,7 @@ desktop/src-tauri/resources/cli/
 /ui/measure-tmp.mjs
 /ui/vt-*.mjs
 /ui/zz*.mjs
+
+# Screenshots dropped at the ui root by measurement runs. Single-segment on
+# purpose: ui/public/ holds real assets and must not be caught.
+/ui/*.png
