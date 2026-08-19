@@ -589,7 +589,7 @@ export default function OAIYApp() {
         navOpen={navOpen}
         onCloseNav={() => setNavOpen(false)}
         view={activeTab}
-        onSelectView={(v) => { setActiveTab(v); setNavOpen(false); }}
+        onSelectView={setActiveTab}
         onNewFlow={() => handleCreateFlow('Untitled flow')}
         onOpenQueue={() => setQueuePanelOpen(true)}
         onOpenPlugins={() => setShowPackageBrowser(true)}
