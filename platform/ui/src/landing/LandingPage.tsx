@@ -553,7 +553,7 @@ function HowItWorks() {
         {steps.map((s, i) => (
           <Reveal key={s.n} delay={i * 90}>
             <div className="relative h-full rounded-xl p-6" style={{ backgroundColor: 'rgb(var(--color-bg-elevated))', border: '1px solid rgb(var(--color-border-primary))' }}>
-              <span className="font-display text-4xl" style={{ color: 'rgb(var(--accent-primary) / 0.35)', fontWeight: 500 }}>{s.n}</span>
+              <span className="font-display text-4xl" style={{ color: 'rgb(var(--accent-primary) / 0.75)', fontWeight: 500 }}>{s.n}</span>
               <h3 className="mb-1.5 mt-3 text-lg font-semibold" style={{ color: 'rgb(var(--color-text-primary))' }}>{s.title}</h3>
               <p className="text-sm" style={{ color: 'rgb(var(--color-text-tertiary))', lineHeight: 1.6 }}>{s.body}</p>
               {i < steps.length - 1 && (

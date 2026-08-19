@@ -75,7 +75,7 @@
   --accent-primary: 113 103 255;
   --accent-hover: 141 133 255;
   --accent-glow: 113 103 255;
-  --accent-secondary: 77 139 255;
+  --accent-secondary: 64 116 213;
 
   /* Signal accents — fixed hues that do NOT follow the customizable accent.
      Node kinds, edge classes and status chrome key off these. */
@@ -99,8 +99,8 @@
   --color-bg-canvas: 8 13 24;
   --color-text-primary: 244 247 255;
   --color-text-secondary: 152 166 189;
-  --color-text-tertiary: 102 117 141;
-  --color-text-muted: 74 86 112;
+  --color-text-tertiary: 113 126 149;
+  --color-text-muted: 117 126 146;
   --color-border-primary: 32 42 60;
   --color-border-secondary: 22 30 44;
   --color-border-strong: 51 66 92;
@@ -166,8 +166,8 @@
   /* Text colors — near-black ink on paper */
   --color-text-primary: 23 23 23;
   --color-text-secondary: 104 100 94;
-  --color-text-tertiary: 145 139 130;
-  --color-text-muted: 169 162 154;
+  --color-text-tertiary: 114 109 102;
+  --color-text-muted: 114 109 104;
 
   /* Border colors — warm graphite */
   --color-border-primary: 206 200 190;
@@ -205,8 +205,8 @@
   /* Text colors */
   --color-text-primary: 244 247 255;
   --color-text-secondary: 152 166 189;
-  --color-text-tertiary: 102 117 141;
-  --color-text-muted: 74 86 112;
+  --color-text-tertiary: 113 126 149;
+  --color-text-muted: 117 126 146;
 
   /* Border colors */
   --color-border-primary: 32 42 60;
@@ -336,7 +336,7 @@ select:focus-visible,
    glow on paper reads as a printing error rather than emphasis. */
 .btn-primary {
   border-color: rgb(var(--accent-primary));
-  background: linear-gradient(115deg, rgb(var(--accent-primary)), rgb(var(--accent-secondary)));
+  background: linear-gradient(115deg, rgb(var(--accent-fill, var(--accent-primary))), rgb(var(--accent-fill-2, var(--accent-secondary))));
   color: white;
   box-shadow: 0 8px 22px rgb(var(--accent-primary) / 0.25),
               inset 0 1px 0 rgb(255 255 255 / 0.2);
@@ -1457,6 +1457,11 @@ select,
   background: rgb(var(--accent-primary) / 0.14);
   color: rgb(var(--accent-primary));
 }
+/* Declared after `.on` deliberately: at equal specificity the later rule wins,
+   and without this an enabled toggle has no hover feedback at all. */
+.oaiy-icon-btn.on:hover {
+  background: rgb(var(--accent-primary) / 0.24);
+}
 
 /* Buttons in the shell reuse the .btn / .btn-primary utilities above rather
    than a parallel .oaiy-btn family — the duplicate set was unused. */
@@ -1638,6 +1643,23 @@ select,
   .btn,
   button.btn,
   a.btn {
+    min-height: 44px;
+  }
+  /* Icon-only buttons carry no text to widen them, so the min-height above left
+     the thumb toolbar 38px wide -- tall enough, too narrow to hit. */
+  .btn.btn-icon,
+  button.btn.btn-icon {
+    min-width: 44px;
+  }
+  /* React Flow ships its zoom stack as 30x30 buttons flush against each other,
+     so the tap targets are both undersized and touching. */
+  .oaiy-canvas-wrap .react-flow__controls {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .oaiy-canvas-wrap .react-flow__controls button {
+    min-width: 44px;
     min-height: 44px;
   }
 }
