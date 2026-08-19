@@ -91,10 +91,10 @@ export default function EngineEndpointCard() {
             setError(null);
           }}
         />
-        <button type="submit" className="btn btn-primary whitespace-nowrap">Save</button>
+        <button type="submit" className="btn btn-primary whitespace-nowrap px-4">Save</button>
         <button
           type="button"
-          className="btn whitespace-nowrap"
+          className="btn whitespace-nowrap px-4"
           onClick={() => apply(null)}
           disabled={value === DEFAULT_ENGINE_BASE}
           title={`Back to ${DEFAULT_ENGINE_BASE}`}
