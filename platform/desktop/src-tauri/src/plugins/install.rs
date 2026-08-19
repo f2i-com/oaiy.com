@@ -232,7 +232,16 @@ pub fn uninstall(id: &str, plugins_root: &Path) -> Result<(), String> {
         return Err(format!("no plugin {id:?} is installed"));
     }
     std::fs::remove_dir_all(&dir)
-        .map_err(|e| format!("cannot remove the {id:?} plugin — stop it first ({e})"))
+        .map_err(|e| format!("cannot remove the {id:?} plugin — stop it first ({e})"))?;
+    // The writable dir lives outside the bundle now, so removing the bundle no
+    // longer takes it along. Delete it explicitly: a plugin's state outliving
+    // its uninstall surprises people, and Aokie's includes phone pairing keys.
+    let data = super::runner::plugin_data_dir(&dir);
+    if data.exists() {
+        std::fs::remove_dir_all(&data)
+            .map_err(|e| format!("removed the {id:?} plugin but not its data at {} ({e})", data.display()))?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -311,6 +320,26 @@ mod tests {
         assert!(!safe_relative(Path::new("../outside")));
         assert!(!safe_relative(Path::new("/etc/passwd")));
         assert!(safe_relative(Path::new("ui/app.js")));
+    }
+
+    #[test]
+    fn uninstall_takes_the_plugins_data_with_it() {
+        // The data dir moved OUT of the bundle so the package signature can
+        // verify, which means deleting the bundle no longer removes it as a
+        // side effect. Aokie's state includes phone pairing keys, so this is
+        // the property that had to be kept explicitly.
+        let base = tmp("uninstall-data");
+        let src = base.join("src");
+        let root = base.join("plugins");
+        write_plugin(&src, "demo");
+        install_from_path(&src, &root).unwrap();
+
+        let data = super::super::runner::plugin_data_dir(&root.join("demo"));
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::write(data.join("settings.json"), b"pairing-keys").unwrap();
+
+        uninstall("demo", &root).unwrap();
+        assert!(!data.exists(), "{} outlived its uninstall", data.display());
     }
 
     #[test]

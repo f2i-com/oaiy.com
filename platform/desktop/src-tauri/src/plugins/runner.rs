@@ -224,13 +224,65 @@ impl HealthTracker {
     }
 }
 
-/// Per-plugin writable directory, under the plugin's own folder.
+/// Per-plugin writable directory, beside the plugins root rather than inside
+/// the plugin's own folder.
 ///
-/// Kept inside the plugin directory so uninstalling by deleting the folder takes
-/// the plugin's data with it — a plugin whose state outlives its uninstall
-/// surprises people, and Aokie's state includes phone pairing keys.
+/// It used to be `<plugin>/data`, which put mutable runtime state INSIDE the
+/// signed bundle. `package-signer verify` requires every listed file to match
+/// its digest AND no unlisted file to exist, so the plugin's first settings
+/// write invalidated its own signature permanently — there was no way to
+/// re-sign it that survived the next write.
+///
+/// Uninstall still takes the data with it: [`super::install::uninstall`]
+/// removes this directory alongside the bundle. That property is precisely why
+/// the data lived inside the bundle before, so it is now preserved explicitly
+/// rather than as a side effect — Aokie's state includes phone pairing keys,
+/// and state that outlives its uninstall surprises people.
 pub fn plugin_data_dir(plugin_dir: &Path) -> std::path::PathBuf {
-    plugin_dir.join("data")
+    // <dataDir>/plugins/<id>  ->  <dataDir>/plugin-data/<id>
+    match (
+        plugin_dir.parent().and_then(|p| p.parent()),
+        plugin_dir.file_name(),
+    ) {
+        (Some(data_root), Some(id)) => data_root.join("plugin-data").join(id),
+        // Only reachable for a path with no grandparent, which the real layout
+        // never produces. Staying inside the folder beats inventing a location
+        // outside the tree the caller controls.
+        _ => plugin_dir.join("data"),
+    }
+}
+
+/// Move a pre-existing `<plugin>/data` to the new location, once.
+///
+/// Returning an error here would refuse to start a plugin whose data we could
+/// not move, which is worse than starting it: the caller logs and continues,
+/// and a plugin that finds an empty data dir re-pairs rather than breaking.
+/// Only a genuine legacy directory is moved — if the new location already
+/// exists, the old one is left alone rather than merged, so a half-migrated
+/// state can be inspected instead of silently reconciled.
+pub fn migrate_legacy_data_dir(plugin_dir: &Path) -> Result<bool, String> {
+    let legacy = plugin_dir.join("data");
+    if !legacy.is_dir() {
+        return Ok(false);
+    }
+    let target = plugin_data_dir(plugin_dir);
+    if target == legacy {
+        return Ok(false);
+    }
+    if target.exists() {
+        return Err(format!(
+            "both {} and {} exist — leaving the legacy directory in place",
+            legacy.display(),
+            target.display()
+        ));
+    }
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+    }
+    std::fs::rename(&legacy, &target)
+        .map_err(|e| format!("cannot move {} to {}: {e}", legacy.display(), target.display()))?;
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -499,13 +551,58 @@ mod tests {
     // --- data dir ---------------------------------------------------------
 
     #[test]
-    fn plugin_data_lives_inside_the_plugin_folder() {
-        // So deleting the folder uninstalls the plugin AND its data. Aokie's
-        // state includes phone pairing keys; leaving those behind surprises
-        // people.
-        let dir = Path::new(r"C:\plugins\aokie");
+    fn plugin_data_lives_outside_the_signed_bundle() {
+        // Inside the bundle, the first settings write invalidated the plugin's
+        // own package signature: verification demands every listed file match
+        // AND no unlisted file exist.
+        let dir = Path::new("/data/plugins/aokie");
         let data = plugin_data_dir(dir);
-        assert!(data.starts_with(dir));
-        assert!(data.ends_with("data"));
+        assert!(
+            !data.starts_with(dir),
+            "{} must not be inside the bundle",
+            data.display()
+        );
+        assert!(data.ends_with("aokie"), "{}", data.display());
+        assert!(
+            data.to_string_lossy().contains("plugin-data"),
+            "{}",
+            data.display()
+        );
+    }
+
+    #[test]
+    fn a_legacy_data_dir_is_moved_once_and_its_contents_survive() {
+        // The live install's legacy dir holds phone pairing keys, so this has
+        // to move them rather than start clean beside them.
+        let base = std::env::temp_dir().join(format!("oaiy-mig-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let plugin = base.join("plugins").join("aokie");
+        std::fs::create_dir_all(plugin.join("data")).unwrap();
+        std::fs::write(plugin.join("data").join("settings.json"), b"paired").unwrap();
+
+        assert_eq!(migrate_legacy_data_dir(&plugin), Ok(true));
+        let moved = plugin_data_dir(&plugin);
+        assert_eq!(std::fs::read(moved.join("settings.json")).unwrap(), b"paired");
+        assert!(!plugin.join("data").exists(), "legacy dir should be gone");
+
+        // Idempotent: a second start must not error or re-move anything.
+        assert_eq!(migrate_legacy_data_dir(&plugin), Ok(false));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn migration_refuses_to_merge_when_both_locations_exist() {
+        // Merging two settings files silently picks a winner; surfacing the
+        // conflict lets someone look at both.
+        let base = std::env::temp_dir().join(format!("oaiy-mig2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let plugin = base.join("plugins").join("aokie");
+        std::fs::create_dir_all(plugin.join("data")).unwrap();
+        std::fs::create_dir_all(plugin_data_dir(&plugin)).unwrap();
+
+        let err = migrate_legacy_data_dir(&plugin).unwrap_err();
+        assert!(err.contains("both"), "{err}");
+        assert!(plugin.join("data").exists(), "legacy dir must be preserved");
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
