@@ -60,3 +60,8 @@ yarn-error.log*
 
 # Staged at build time by desktop/scripts/sync-cli.mjs (mirrors cli/dist, which is also ignored).
 desktop/src-tauri/resources/cli/
+
+# Scratch probe scripts (Playwright measurement harnesses)
+ui/probe-*.mjs
+ui/m.mjs
+ui/measure-tmp.mjs
