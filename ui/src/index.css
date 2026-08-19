@@ -1700,7 +1700,13 @@ select,
 
   .oaiy-sidebar {
     position: fixed;
-    z-index: 60;
+    /* Above every content overlay, not merely above most of them. The first
+       attempt used 60, which cleared the settings panel (z-50) but sat UNDER
+       the package browser and the package dialogs (z-9999) -- so opening the
+       nav from Plugins slid the drawer in behind the thing it was meant to
+       navigate away from. Navigation chrome outranks the content it moves
+       between, so it is pinned above the highest overlay in the app. */
+    z-index: 10001;
     top: 0;
     left: 0;
     bottom: 0;
@@ -1717,7 +1723,9 @@ select,
 
   .oaiy-nav-scrim {
     position: fixed;
-    z-index: 59;
+    /* Directly beneath the drawer and above everything else, so the scrim
+       dims the overlay it is covering rather than appearing under it. */
+    z-index: 10000;
     inset: 0;
     background: rgb(0 0 0 / 0.5);
   }
