@@ -1613,6 +1613,35 @@ select,
 }
 .oaiy-canvas-wrap .react-flow__attribution { display: none; }
 
+/* ---------- touch targets ----------
+   Guarded on `pointer: coarse` rather than a width, because the thing that
+   matters is the input device, not the viewport: a 390px browser window on a
+   desktop is still driven by a mouse and does not need 44px controls, while a
+   1024px tablet is driven by a thumb and does. Nothing here can match on a
+   mouse-driven machine, so the desktop layout is untouched by construction.
+
+   30x30 is the measured size of the theme toggle and the nav links -- fine for
+   a cursor, under the 44px both Apple and Google publish for a fingertip. The
+   box grows without the icon moving, so nothing reflows. */
+@media (pointer: coarse) {
+  .oaiy-icon-btn {
+    min-width: 44px;
+    min-height: 44px;
+  }
+  .site-nav-links > a:not(.btn) {
+    padding-top: 12px;
+    padding-bottom: 12px;
+  }
+  /* Every button, not a hand-picked list: the landing CTAs measured 38-42px,
+     and picking selectors one at a time guarantees the next one added is
+     missed. min-height only, so type and line box are unchanged. */
+  .btn,
+  button.btn,
+  a.btn {
+    min-height: 44px;
+  }
+}
+
 /* ---------- responsive, mirroring the prototype ---------- */
 
 @media (max-width: 1240px) {

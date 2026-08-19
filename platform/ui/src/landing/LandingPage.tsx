@@ -69,7 +69,7 @@ function Hero() {
         aria-hidden="true"
       />
 
-      <div className="relative mx-auto grid max-w-6xl items-center gap-12 px-5 pb-20 pt-16 sm:px-8 lg:grid-cols-[1fr_1.2fr] lg:gap-10 lg:pb-28 lg:pt-24">
+      <div className="relative mx-auto grid max-w-6xl items-center gap-7 px-5 pb-14 pt-8 sm:gap-12 sm:pb-20 sm:pt-16 sm:px-8 lg:grid-cols-[1fr_1.2fr] lg:gap-10 lg:pb-28 lg:pt-24">
         {/* Copy column */}
         <div>
           <div className="lp-reveal lp-pill mb-5" style={{ animationDelay: '40ms' }}>
