@@ -99,6 +99,15 @@ export function ShellSidebar({
     },
   ];
 
+  // Every control in the rail dismisses the drawer as well as doing its job.
+  // Wrapped once here rather than at each call site: half of these open a panel
+  // rather than switch view, and those were left sitting BEHIND the open
+  // drawer. Centralising it also means a nav entry added later cannot forget.
+  const andClose = (fn?: () => void) => () => {
+    fn?.();
+    onCloseNav?.();
+  };
+
   return (
     <>
     {/* Scrim: only rendered while the drawer is open, and only reachable below
@@ -113,7 +122,7 @@ export function ShellSidebar({
         <small>Connect. Draw. Expose.</small>
       </div>
 
-      <button className="oaiy-new" type="button" onClick={onNewFlow}>
+      <button className="oaiy-new" type="button" onClick={andClose(onNewFlow)}>
         <Plus size={17} />
         <span>New flow</span>
       </button>
@@ -127,7 +136,7 @@ export function ShellSidebar({
               key={item.id}
               className={item.active ? 'active' : ''}
               aria-current={item.active ? 'page' : undefined}
-              onClick={item.onClick}
+              onClick={andClose(item.onClick)}
             >
               <Icon size={18} />
               <span>{item.label}</span>
@@ -153,7 +162,7 @@ export function ShellSidebar({
       <button
         className={settingsActive ? 'oaiy-settings-btn active' : 'oaiy-settings-btn'}
         type="button"
-        onClick={onOpenSettings}
+        onClick={andClose(onOpenSettings)}
       >
         <Settings2 size={18} />
         <span>Settings</span>

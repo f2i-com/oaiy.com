@@ -237,9 +237,6 @@ export default function OAIYBuilder({
     copySelected,
     pasteClipboard,
     hasClipboard,
-    saveWorkflow,
-    loadWorkflow,
-    newWorkflow,
     autoLayout,
     getWorkflowGraph,
   } = useWorkflow({
@@ -339,7 +336,6 @@ export default function OAIYBuilder({
     }
   }, [flowTransitioning, nodes, finishFlowTransition]);
 
-  const [showMenu, setShowMenu] = useState(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
   // Below lg the properties panel is undocked, and until now it had NO mobile
   // counterpart at all -- `hidden lg:flex` and nothing else -- so a phone user
@@ -377,9 +373,7 @@ export default function OAIYBuilder({
   // Mirror the log toggle through the same persistence helper so the
   // existing close button updates localStorage too.
   useEffect(() => { saveBoolPref('oaiy.ui.logPanelVisible', logPanelVisible); }, [logPanelVisible]);
-  const [showNewWorkflowDialog, setShowNewWorkflowDialog] = useState(false);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
-  const fileInputRef = useRef<HTMLInputElement>(null);
   const [showMiniMap, setShowMiniMap] = useState(true); // Toggle minimap visibility
   // The minimap mask must follow the theme — a hardcoded dark mask reads as
   // a heavy navy block over the white canvas in light mode.
@@ -415,38 +409,13 @@ export default function OAIYBuilder({
   // Use stable handlers to avoid recreating functions on each render
   const handlers = useStableHandlers(updateNodeData);
 
-  const handleLoadClick = useCallback(() => {
-    fileInputRef.current?.click();
-    setShowMenu(false);
-  }, []);
-
-  const handleFileChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (file) {
-      loadWorkflow(file);
-      e.target.value = ''; // Reset input
-    }
-  }, [loadWorkflow]);
-
-  const handleSaveClick = useCallback(() => {
-    saveWorkflow();
-    setShowMenu(false);
-  }, [saveWorkflow]);
-
-  const handleNewClick = useCallback(() => {
-    setShowNewWorkflowDialog(true);
-    setShowMenu(false);
-  }, []);
-
   const handleAutoLayoutHorizontal = useCallback(() => {
     autoLayout('LR');
-    setShowMenu(false);
     setContextMenu(null);
   }, [autoLayout]);
 
   const handleAutoLayoutVertical = useCallback(() => {
     autoLayout('TB');
-    setShowMenu(false);
     setContextMenu(null);
   }, [autoLayout]);
 
@@ -472,13 +441,11 @@ export default function OAIYBuilder({
   // making this O(N^2)).
   const handleCollapseAll = useCallback(() => {
     setNodes((nds) => nds.map((n) => ({ ...n, data: { ...n.data, _collapsed: true } })));
-    setShowMenu(false);
     setContextMenu(null);
   }, [setNodes]);
 
   const handleExpandAll = useCallback(() => {
     setNodes((nds) => nds.map((n) => ({ ...n, data: { ...n.data, _collapsed: false } })));
-    setShowMenu(false);
     setContextMenu(null);
   }, [setNodes]);
 
@@ -488,16 +455,14 @@ export default function OAIYBuilder({
     setContextMenu({ x: event.clientX, y: event.clientY });
   }, []);
 
-  // Close menu when clicking outside
-  const handleCanvasClick = useCallback(() => {
-    if (showMenu) setShowMenu(false);
-  }, [showMenu]);
+  // Kept as the canvas click hook: the floating workflow menu it used to
+  // close is gone, and nothing else opens on canvas click today.
+  const handleCanvasClick = useCallback(() => {}, []);
 
   // Handle clicking on the pane (background) to deselect nodes and close menus
   const handlePaneClick = useCallback(() => {
-    if (showMenu) setShowMenu(false);
     if (contextMenu) setContextMenu(null);
-  }, [showMenu, contextMenu]);
+  }, [contextMenu]);
 
   // Handle edge click to select it
   const handleEdgeClick = useCallback(
@@ -1526,92 +1491,6 @@ export default function OAIYBuilder({
           </div>
         )}
 
-        {/* Logo/Title with Menu - hide when showing DataViewer */}
-        {!showDataViewer && (
-          <div className={`absolute left-3 sm:left-4 z-10 ${packageMode ? 'top-7 sm:top-8' : 'top-3 sm:top-4'}`}>
-            <div className="bg-white/90 dark:bg-slate-800/90 backdrop-blur-sm rounded-lg border border-slate-300 dark:border-slate-700">
-              <div className="px-2 sm:px-3 py-2 flex items-center gap-2">
-                {/* Menu Button */}
-                <div className="relative">
-                  <button
-                    onClick={() => setShowMenu(!showMenu)}
-                    className="p-1.5 hover:bg-slate-200 dark:hover:bg-slate-700 rounded transition-colors flex items-center gap-2"
-                    title="Menu"
-                    aria-label="Menu"
-                    aria-expanded={showMenu}
-                    aria-haspopup="menu"
-                  >
-                    <svg className="w-5 h-5 text-slate-500 dark:text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6h16M4 12h16M4 18h16" />
-                    </svg>
-                  </button>
-                  {/* Dropdown Menu */}
-                  {showMenu && (
-                    <div className="absolute top-full left-0 mt-1 bg-white dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-lg shadow-xl min-w-[220px] py-2 z-50" role="menu" aria-label="Workflow menu">
-                      <button
-                        onClick={handleNewClick}
-                        className="w-full px-4 py-2.5 text-left text-base text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700 flex items-center gap-3"
-                        role="menuitem"
-                      >
-                        <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
-                        </svg>
-                        New Workflow
-                      </button>
-                      <button
-                        onClick={handleLoadClick}
-                        className="w-full px-4 py-2.5 text-left text-base text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700 flex items-center gap-3"
-                        role="menuitem"
-                      >
-                        <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12" />
-                        </svg>
-                        Load Workflow
-                      </button>
-                      <button
-                        onClick={handleSaveClick}
-                        className="w-full px-4 py-2.5 text-left text-base text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700 flex items-center gap-3"
-                        role="menuitem"
-                      >
-                        <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
-                        </svg>
-                        Save Workflow
-                      </button>
-                      <div className="border-t border-slate-200 dark:border-slate-700 my-2" />
-                      {onLoadPackage && (
-                        <button
-                          onClick={() => {
-                            onLoadPackage();
-                            setShowMenu(false);
-                          }}
-                          className="w-full px-4 py-2.5 text-left text-base text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700 flex items-center gap-3"
-                          role="menuitem"
-                        >
-                          <svg className="w-5 h-5 text-purple-500 dark:text-purple-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M20 7l-8-4-8 4m16 0l-8 4m8-4v10l-8 4m0-10L4 7m8 4v10M4 7v10l8 4" />
-                          </svg>
-                          Load .oaiy Package
-                        </button>
-                      )}
-                      <div className="px-4 py-2 text-xs text-slate-400 dark:text-slate-500">
-                        Workflows are saved as .json files
-                      </div>
-                    </div>
-                  )}
-                </div>
-              </div>
-            </div>
-            {/* Hidden file input for loading */}
-            <input
-              ref={fileInputRef}
-              type="file"
-              accept=".json"
-              onChange={handleFileChange}
-              className="hidden"
-            />
-          </div>
-        )}
       </div>
 
       {/* Right Panel - Properties & Log Console (stacked) */}
@@ -1760,21 +1639,6 @@ export default function OAIYBuilder({
           onCancel={handleComfyWorkflowDialogCancel}
         />
       )}
-
-      {/* New workflow confirmation dialog */}
-      <ConfirmDialog
-        isOpen={showNewWorkflowDialog}
-        title="Create New Workflow"
-        message="This will clear the current workflow. Any unsaved changes will be lost."
-        confirmLabel="Create New"
-        cancelLabel="Cancel"
-        variant="warning"
-        onConfirm={() => {
-          setShowNewWorkflowDialog(false);
-          newWorkflow();
-        }}
-        onCancel={() => setShowNewWorkflowDialog(false)}
-      />
 
       {/* Run workflow modal - review/modify inputs before running */}
       <RunWorkflowModal
