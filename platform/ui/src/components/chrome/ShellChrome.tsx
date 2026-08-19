@@ -1,4 +1,5 @@
 import {
+  Menu,
   Activity,
   Check,
   ChevronRight,
@@ -44,6 +45,8 @@ export interface ShellNavItem {
 /* ------------------------------------------------------------------ sidebar */
 
 export function ShellSidebar({
+  navOpen = false,
+  onCloseNav,
   view,
   onSelectView,
   onNewFlow,
@@ -55,6 +58,10 @@ export function ShellSidebar({
   companionOnline,
   companionDetail,
 }: {
+  /** Below md the rail is off-canvas; this slides it in. Ignored above md,
+   *  where the rail is part of the grid and always present. */
+  navOpen?: boolean;
+  onCloseNav?: () => void;
   view: ShellView;
   onSelectView: (v: ShellView) => void;
   onNewFlow: () => void;
@@ -93,7 +100,13 @@ export function ShellSidebar({
   ];
 
   return (
-    <aside className="oaiy-sidebar">
+    <>
+    {/* Scrim: only rendered while the drawer is open, and only reachable below
+        md because the drawer cannot open above it. */}
+    {navOpen && (
+      <div className="oaiy-nav-scrim" onClick={onCloseNav} aria-hidden="true" />
+    )}
+    <aside className={`oaiy-sidebar${navOpen ? ' is-open' : ''}`}>
       <div className="oaiy-brand">
         <strong>OAIY</strong>
         <span>Orchestrate AI Yourself</span>
@@ -151,12 +164,14 @@ export function ShellSidebar({
         <span>Keys stay on this device</span>
       </div>
     </aside>
+    </>
   );
 }
 
 /* -------------------------------------------------------------------- topbar */
 
 export function ShellTopbar({
+  onOpenNav,
   crumb,
   children,
   chips,
@@ -165,6 +180,9 @@ export function ShellTopbar({
   onSetTheme,
   actions,
 }: {
+  /** Opens the off-canvas nav. Only rendered below md, where the rail is not
+   *  in the grid — above md the rail is always visible and needs no opener. */
+  onOpenNav?: () => void;
   /** Uppercase breadcrumb line, e.g. `Workflows › Image Review Loop`. */
   crumb: string;
   /** The title row — an editable name input, or a plain heading. */
@@ -177,6 +195,17 @@ export function ShellTopbar({
 }) {
   return (
     <header className="oaiy-topbar">
+      {onOpenNav && (
+        <button
+          type="button"
+          className="oaiy-nav-open oaiy-icon-btn"
+          onClick={onOpenNav}
+          aria-label="Open navigation"
+          title="Menu"
+        >
+          <Menu size={18} />
+        </button>
+      )}
       <div className="oaiy-title">
         <span>
           OAIY <ChevronRight size={12} /> {crumb}

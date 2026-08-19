@@ -137,6 +137,9 @@ export default function OAIYApp() {
     }
   }, [flowsSidebarOpen]);
   const [settingsPanelOpen, setSettingsPanelOpen] = useState(false);
+  // Below md the left rail is off-canvas (see index.css "phone: the rail
+  // becomes a drawer"). Above md it is a grid column and this stays false.
+  const [navOpen, setNavOpen] = useState(false);
   // Track which Settings tab to land on. The agent panel's "Manage in
   // Settings…" affordance deep-links to 'models'; the toolbar gear
   // leaves it `undefined` so the panel restores the user's last tab.
@@ -583,8 +586,10 @@ export default function OAIYApp() {
       <a className="oaiy-skip" href="#oaiy-main">Skip to the canvas</a>
 
       <ShellSidebar
+        navOpen={navOpen}
+        onCloseNav={() => setNavOpen(false)}
         view={activeTab}
-        onSelectView={setActiveTab}
+        onSelectView={(v) => { setActiveTab(v); setNavOpen(false); }}
         onNewFlow={() => handleCreateFlow('Untitled flow')}
         onOpenQueue={() => setQueuePanelOpen(true)}
         onOpenPlugins={() => setShowPackageBrowser(true)}
@@ -604,6 +609,7 @@ export default function OAIYApp() {
 
       <main id="oaiy-main" className="oaiy-workspace">
         <ShellTopbar
+          onOpenNav={() => setNavOpen(true)}
           crumb={activeTab === 'data' ? 'Data' : 'Workflows'}
           theme={resolvedTheme}
           onSetTheme={setTheme}
