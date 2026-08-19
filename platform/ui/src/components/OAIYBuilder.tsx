@@ -341,6 +341,11 @@ export default function OAIYBuilder({
 
   const [showMenu, setShowMenu] = useState(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
+  // Below lg the properties panel is undocked, and until now it had NO mobile
+  // counterpart at all -- `hidden lg:flex` and nothing else -- so a phone user
+  // could add a node and run a flow but could never set an endpoint, a prompt
+  // or a model on it. This is that counterpart: the same panel in a sheet.
+  const [propsSheetOpen, setPropsSheetOpen] = useState(false);
   const [logsOpen, setLogsOpen] = useState(false);
   // Per-panel collapse state, persisted across reloads. The three
   // builder side-panels (palette, properties, execution log) each have
@@ -1043,6 +1048,52 @@ export default function OAIYBuilder({
         )
       )}
 
+      {/* Mobile Properties sheet — the counterpart to the `hidden lg:flex`
+          dock on the right. A bottom sheet rather than a side drawer: a side
+          drawer at 390px covers two thirds of the canvas, and the thing being
+          configured is the node you just tapped, which you want to keep seeing.
+          dvh, not vh, so iOS's collapsing URL bar cannot push the actions off
+          the bottom. */}
+      {!showDataViewer && propsSheetOpen && (
+        <div className="lg:hidden">
+          <div
+            className="fixed inset-0 bg-black/50 z-40"
+            onClick={() => setPropsSheetOpen(false)}
+            aria-hidden="true"
+          />
+          <div
+            className="fixed inset-x-0 bottom-0 z-50 flex flex-col max-h-[70dvh] rounded-t-2xl border-t border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 shadow-2xl"
+            role="dialog"
+            aria-label="Node properties"
+          >
+            <div className="flex items-center justify-between px-3 py-2 border-b border-slate-200 dark:border-slate-800 flex-shrink-0">
+              <div className="flex items-center gap-2 min-w-0">
+                <span className="h-1 w-8 rounded-full bg-slate-300 dark:bg-slate-600" aria-hidden="true" />
+                <span className="text-sm font-medium truncate">Properties</span>
+              </div>
+              <button
+                type="button"
+                onClick={() => setPropsSheetOpen(false)}
+                className="btn btn-ghost btn-icon"
+                aria-label="Close properties"
+              >
+                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                </svg>
+              </button>
+            </div>
+            {/* The panel is position-agnostic (`flex flex-col h-full`), so it
+                needs no change to live here — only somewhere to scroll. */}
+            <div className="flex-1 min-h-0 overflow-y-auto overscroll-contain">
+              <PropertiesPanel
+                selectedNode={selectedNodes[0] || null}
+                updateNodeData={updateNodeData}
+              />
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Mobile Node Palette (drawer) */}
       {!showDataViewer && (
         <div className="lg:hidden">
@@ -1257,6 +1308,21 @@ export default function OAIYBuilder({
             >
               <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
+              </svg>
+            </button>
+            {/* Properties — the only route to a node's settings below lg.
+                Disabled rather than hidden when nothing is selected, so the
+                control does not appear and vanish as selection changes. */}
+            <button
+              onClick={() => setPropsSheetOpen(true)}
+              disabled={selectedNodes.length === 0}
+              className="btn btn-ghost btn-icon disabled:opacity-40"
+              title={selectedNodes.length === 0 ? 'Select a node first' : 'Node properties'}
+              aria-label="Node properties"
+            >
+              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
               </svg>
             </button>
 
