@@ -107,8 +107,8 @@ export function PackageBrowser({
         {/* Header */}
         <div className="px-5 py-4 short:px-4 short:py-2.5 border-b border-slate-200 dark:border-slate-700/50 flex items-center justify-between">
           <div className="flex items-center gap-3">
-            <div className="w-10 h-10 rounded-xl bg-purple-600/20 flex items-center justify-center">
-              <svg className="w-5 h-5 text-purple-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <div className="w-10 h-10 rounded-xl bg-accent/20 flex items-center justify-center">
+              <svg className="w-5 h-5 text-accent" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 7v10c0 2 1.5 3 3.5 3h9c2 0 3.5-1 3.5-3V7M4 7l8-4 8 4M4 7l8 4m8-4l-8 4m0 0v10" />
               </svg>
             </div>
@@ -135,7 +135,7 @@ export function PackageBrowser({
         <div className="px-5 py-3 border-b border-slate-200 dark:border-slate-700/50 flex items-center gap-2">
           <button
             onClick={handleAddSource}
-            className="px-3 py-1.5 text-xs font-medium bg-purple-600/20 hover:bg-purple-600/30 text-purple-300 rounded transition-colors flex items-center gap-1.5"
+            className="px-3 py-1.5 text-xs font-medium bg-accent/20 hover:bg-accent/30 text-accent rounded transition-colors flex items-center gap-1.5"
           >
             <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
@@ -192,7 +192,7 @@ export function PackageBrowser({
                     type="checkbox"
                     checked={source.enabled}
                     onChange={(e) => toggleSource(source.id, e.target.checked)}
-                    className="rounded border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-700 text-purple-500 focus:ring-purple-500"
+                    className="rounded border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-700 text-accent focus:ring-accent"
                   />
                   <div className="flex-1 min-w-0">
                     <div className="font-medium text-slate-700 dark:text-slate-200 truncate">{source.name}</div>
@@ -251,8 +251,8 @@ export function PackageBrowser({
                     }`}
                   >
                     <div className="flex items-start gap-3">
-                      <div className="w-10 h-10 rounded-lg bg-purple-600/20 flex items-center justify-center flex-shrink-0">
-                        <svg className="w-5 h-5 text-purple-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <div className="w-10 h-10 rounded-lg bg-accent/20 flex items-center justify-center flex-shrink-0">
+                        <svg className="w-5 h-5 text-accent" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M20 7l-8-4-8 4m16 0l-8 4m8-4v10l-8 4m0-10L4 7m8 4v10M4 7v10l8 4" />
                         </svg>
                       </div>
@@ -282,7 +282,7 @@ export function PackageBrowser({
                             <span>{pkg.manifest.services.length} service{pkg.manifest.services.length !== 1 ? 's' : ''}</span>
                           )}
                           {pkg.manifest.nodes && pkg.manifest.nodes.length > 0 && (
-                            <span className="text-purple-400">
+                            <span className="text-accent">
                               {pkg.manifest.nodes.length} custom node{pkg.manifest.nodes.length !== 1 ? 's' : ''}
                             </span>
                           )}
@@ -290,7 +290,7 @@ export function PackageBrowser({
                         {/* Custom Nodes Preview */}
                         {pkg.manifest.nodes && pkg.manifest.nodes.length > 0 && (
                           <div className="mt-2 pt-2 border-t border-slate-200 dark:border-slate-700/50">
-                            <div className="flex items-center gap-1.5 text-[10px] text-purple-400 font-medium mb-1.5">
+                            <div className="flex items-center gap-1.5 text-[10px] text-accent font-medium mb-1.5">
                               <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M20 7l-8-4-8 4m16 0l-8 4m8-4v10l-8 4m0-10L4 7m8 4v10M4 7v10l8 4" />
                               </svg>
@@ -300,7 +300,7 @@ export function PackageBrowser({
                               {pkg.manifest.nodes.map((nodeModule, idx) => (
                                 <span
                                   key={idx}
-                                  className="px-1.5 py-0.5 text-[10px] bg-purple-500/10 text-purple-300 rounded border border-purple-500/20"
+                                  className="px-1.5 py-0.5 text-[10px] bg-accent/10 text-accent rounded border border-accent/20"
                                   title={`Module path: ${nodeModule.path}`}
                                 >
                                   {nodeModule.path.split('/').pop() || nodeModule.path}
@@ -313,7 +313,7 @@ export function PackageBrowser({
                       {!isLoaded && (
                         <button
                           onClick={() => handleLoad(pkg)}
-                          className="px-3 py-1.5 text-xs font-medium bg-purple-600 hover:bg-purple-500 text-white rounded transition-colors"
+                          className="px-3 py-1.5 text-xs font-medium bg-accent hover:bg-accent-hover text-white rounded transition-colors"
                         >
                           Load
                         </button>

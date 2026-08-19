@@ -241,28 +241,22 @@ export function ShellTopbar({
         </div>
       </div>
       <div className="oaiy-actions">
-        <div className="oaiy-toggle">
-          <button
-            type="button"
-            className={`oaiy-icon-btn ${theme === 'light' ? 'active' : ''}`}
-            aria-label="Paper Circuit (light) theme"
-            title="Paper Circuit"
-            aria-pressed={theme === 'light'}
-            onClick={() => onSetTheme('light')}
-          >
-            <Sun size={16} />
-          </button>
-          <button
-            type="button"
-            className={`oaiy-icon-btn ${theme === 'dark' ? 'active' : ''}`}
-            aria-label="Prism Lab (dark) theme"
-            title="Prism Lab"
-            aria-pressed={theme === 'dark'}
-            onClick={() => onSetTheme('dark')}
-          >
-            <Moon size={16} />
-          </button>
-        </div>
+        {/* One button, not two. A segmented pair spends double the width to
+            say what one icon says, and in a topbar that already overflows on a
+            phone that is width taken from controls that have nowhere else to
+            go. It shows the theme you would switch TO, which is the thing you
+            are choosing -- so the label is an action ("Switch to X"), not a
+            state, and aria-pressed is gone with it: this is a button that does
+            something, not a toggle reporting whether it is on. */}
+        <button
+          type="button"
+          className="oaiy-icon-btn"
+          aria-label={theme === 'dark' ? 'Switch to the Paper Circuit light theme' : 'Switch to the Prism Lab dark theme'}
+          title={theme === 'dark' ? 'Switch to Paper Circuit' : 'Switch to Prism Lab'}
+          onClick={() => onSetTheme(theme === 'dark' ? 'light' : 'dark')}
+        >
+          {theme === 'dark' ? <Sun size={16} /> : <Moon size={16} />}
+        </button>
         {actions}
       </div>
     </header>
