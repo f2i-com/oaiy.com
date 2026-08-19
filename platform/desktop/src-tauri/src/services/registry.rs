@@ -303,6 +303,39 @@ const GGUF_SCAN_DEPTH: u32 = 4;
 
 /// Every `.gguf` under `dir`, projectors included. The shared traversal behind
 /// both [`Registry::list_gguf_models`] and [`Registry::list_mmproj_files`].
+/// Loadable GGUFs across `dirs` — the options for the llama.cpp model picker.
+///
+/// Free-standing rather than a method so it can run off-lock; see
+/// [`Registry::model_dirs`].
+pub fn scan_gguf_models(dirs: &[PathBuf]) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for dir in dirs {
+        collect_ggufs(dir, GGUF_SCAN_DEPTH, &mut seen, &mut out);
+    }
+    out.sort();
+    out
+}
+
+/// The multimodal projectors across `dirs`. Same walk as
+/// [`scan_gguf_models`], different filter — a projector is still a `.gguf`,
+/// it just cannot be loaded as a model on its own.
+pub fn scan_mmproj_files(dirs: &[PathBuf]) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut all = Vec::new();
+    for dir in dirs {
+        collect_ggufs_all(dir, GGUF_SCAN_DEPTH, &mut seen, &mut all);
+    }
+    all.retain(|p| {
+        Path::new(p)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.to_ascii_lowercase().contains("mmproj"))
+    });
+    all.sort();
+    all
+}
+
 fn collect_ggufs_all(
     dir: &Path,
     depth: u32,
@@ -896,6 +929,13 @@ impl Registry {
     /// (Exposed for completeness alongside `extra_model_dirs()`; the env/ctx
     /// paths read the field directly via `join_model_dirs`.)
     #[allow(dead_code)]
+    /// The model search roots.
+    ///
+    /// Clone these and drop the lock before walking them: the walk is the slow
+    /// half — a library of 40 GB checkpoints on a spinning or network disk —
+    /// and this lock is the same one every `/api/services` poll and every
+    /// start/stop needs, so scanning under it stalled the whole Services view
+    /// rather than just its model picker.
     pub fn model_dirs(&self) -> &[PathBuf] {
         &self.model_dirs
     }
@@ -991,29 +1031,11 @@ impl Registry {
     /// still a `.gguf`, so the same recursive walk finds it; only the filter
     /// differs.
     pub fn list_mmproj_files(&self) -> Vec<String> {
-        let mut seen = std::collections::HashSet::new();
-        let mut all = Vec::new();
-        for dir in &self.model_dirs {
-            collect_ggufs_all(dir, GGUF_SCAN_DEPTH, &mut seen, &mut all);
-        }
-        all.retain(|p| {
-            std::path::Path::new(p)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.to_ascii_lowercase().contains("mmproj"))
-        });
-        all.sort();
-        all
+        scan_mmproj_files(&self.model_dirs)
     }
 
     pub fn list_gguf_models(&self) -> Vec<String> {
-        let mut seen = std::collections::HashSet::new();
-        let mut out = Vec::new();
-        for dir in &self.model_dirs {
-            collect_ggufs(dir, GGUF_SCAN_DEPTH, &mut seen, &mut out);
-        }
-        out.sort();
-        out
+        scan_gguf_models(&self.model_dirs)
     }
 
     /// True when `p` resolves inside a managed root (`${dataDir}` — which

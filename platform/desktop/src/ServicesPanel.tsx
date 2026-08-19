@@ -5,6 +5,7 @@ import {
   openExternal,
   openInExplorer,
   services,
+  type DesktopConfig,
   type GpuInfo,
   type RegistrySnapshot,
   type ServiceSnapshot,
@@ -690,8 +691,11 @@ function GpuSelector({ serviceId, currentGpu }: { serviceId: string; currentGpu:
  * "load on flow demand" case). A running service needs a restart to swap models.
  */
 function LlamaModelSelector({ running }: { running: boolean }) {
-  const [models, setModels] = useState<string[]>([]);
-  const [current, setCurrent] = useState<string>(''); // '' = default model.gguf
+  const [models, setModels] = useState<string[]>(() => peek<string[]>('ggufModels') ?? []);
+  // '' = default model.gguf
+  const [current, setCurrent] = useState<string>(
+    () => peek<DesktopConfig>('desktopConfig')?.llamaModel ?? '',
+  );
   const [customMode, setCustomMode] = useState(false);
   const [customPath, setCustomPath] = useState('');
   const [busy, setBusy] = useState(false);
@@ -701,6 +705,8 @@ function LlamaModelSelector({ running }: { running: boolean }) {
     let alive = true;
     Promise.all([appConfig.listGgufModels(), appConfig.get()])
       .then(([list, cfg]) => {
+        put('ggufModels', list);
+        put('desktopConfig', cfg);
         if (!alive) return;
         setModels(list);
         const sel = cfg.llamaModel ?? '';
@@ -820,9 +826,13 @@ function LlamaModelSelector({ running }: { running: boolean }) {
  * that loads and then answers nonsense.
  */
 function LlamaMmprojSelector({ running }: { running: boolean }) {
-  const [files, setFiles] = useState<string[]>([]);
-  const [current, setCurrent] = useState<string>('');
-  const [model, setModel] = useState<string>('');
+  const [files, setFiles] = useState<string[]>(() => peek<string[]>('mmprojFiles') ?? []);
+  const [current, setCurrent] = useState<string>(
+    () => peek<DesktopConfig>('desktopConfig')?.llamaMmproj ?? '',
+  );
+  const [model, setModel] = useState<string>(
+    () => peek<DesktopConfig>('desktopConfig')?.llamaModel ?? '',
+  );
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -830,6 +840,8 @@ function LlamaMmprojSelector({ running }: { running: boolean }) {
     let alive = true;
     Promise.all([appConfig.listMmprojFiles(), appConfig.get()])
       .then(([list, cfg]) => {
+        put('mmprojFiles', list);
+        put('desktopConfig', cfg);
         if (!alive) return;
         setFiles(list);
         setCurrent(cfg.llamaMmproj ?? '');
