@@ -1484,6 +1484,23 @@ pub fn run() {
             let config_provider: Arc<dyn http::ConfigProvider> =
                 Arc::new(TauriConfigProvider { app: app_handle });
             let app_for_dialog = app.handle().clone();
+            // Listen address, read once at startup because a bound socket cannot
+            // move: changing either of these needs a restart, and the Settings UI
+            // says so rather than pretending the change took effect.
+            //
+            // Both fall back to the safe value on anything unparseable. A typo in
+            // a port must not silently bind a port nobody chose, and a typo in the
+            // LAN flag must not silently expose the machine.
+            let server_port: u16 = read_config_str(&app_for_dialog, "serverPort")
+                .and_then(|s| s.trim().parse::<u16>().ok())
+                .filter(|p| *p != 0)
+                .unwrap_or(DESKTOP_PORT);
+            let lan_access: bool = read_config_str(&app_for_dialog, "lanAccess")
+                .map(|s| s.trim() == "true")
+                .unwrap_or(false);
+            if lan_access {
+                log::warn!("lanAccess is on — the API will bind every interface on port {server_port}");
+            }
             tauri::async_runtime::spawn(async move {
                 // Bridge state. The plugins root sits under the data dir so a
                 // relocated data folder takes its plugins with it — plugins hold
@@ -1571,7 +1588,8 @@ pub fn run() {
                     },
                 );
                 if let Err(e) = http::serve(
-                    DESKTOP_PORT,
+                    server_port,
+                    lan_access,
                     config_provider,
                     // GUI: webview-origin auth, plus an OPTIONAL bearer token
                     // (set OAIY_SERVER_TOKEN) so the CLI can drive this companion

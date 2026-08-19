@@ -14,3 +14,4 @@
 export { default as AppearanceTab } from './AppearanceTab';
 export { default as SecurityTab } from './SecurityTab';
 export { default as ServicesTab } from './ServicesTab';
+export { default as EngineEndpointCard } from './EngineEndpointCard';

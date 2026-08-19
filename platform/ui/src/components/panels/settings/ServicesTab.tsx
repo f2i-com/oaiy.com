@@ -23,6 +23,7 @@ import {
   addExampleAsCustom,
   type CustomService,
 } from '../../../utils/serviceRegistry';
+import EngineEndpointCard from './EngineEndpointCard';
 import { useToast } from '../../Toast';
 import { useConfirmDialog } from '../../../hooks/useConfirmDialog';
 
@@ -271,6 +272,8 @@ export default function ServicesTab({ isOpen }: ServicesTabProps) {
 
   return (
     <div className="p-6 space-y-5 overflow-y-auto">
+      {/* First, because everything below it is reached THROUGH the engine. */}
+      <EngineEndpointCard />
       <div>
         <h2 className="text-lg font-semibold text-slate-900 dark:text-slate-100">Services</h2>
         <p className="text-sm text-slate-600 dark:text-slate-400 mt-1">

@@ -22,7 +22,13 @@
  *     → anything else / no response → assume not running
  */
 
-const DESKTOP_BASE = 'http://127.0.0.1:17972';
+import { DEFAULT_ENGINE_BASE, getEngineBase, subscribeEngineBase } from './engineEndpoint';
+
+/** The compiled-in default. The LIVE value is whatever `getEngineBase()`
+ *  returns, which the user can point at another machine — that is the whole
+ *  reason this stopped being a constant. Kept exported-by-proxy below so
+ *  existing callers of DESKTOP_API_BASE keep working. */
+const DESKTOP_BASE = DEFAULT_ENGINE_BASE;
 const POLL_INTERVAL_MS = 10_000;
 const FETCH_TIMEOUT_MS = 1500;
 
@@ -42,7 +48,7 @@ type Listener = (info: DesktopInfo) => void;
 
 let current: DesktopInfo = {
   available: false,
-  baseUrl: DESKTOP_BASE,
+  baseUrl: getEngineBase(),
   lastChange: Date.now(),
 };
 
@@ -54,7 +60,8 @@ async function probeOnce(): Promise<void> {
   try {
     const controller = new AbortController();
     const timeout = window.setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-    const resp = await fetch(`${DESKTOP_BASE}/api/health`, {
+    const base = getEngineBase();
+    const resp = await fetch(`${base}/api/health`, {
       method: 'GET',
       signal: controller.signal,
       // OAIY Desktop's API is on a different origin (localhost:17972 vs
@@ -77,7 +84,7 @@ async function probeOnce(): Promise<void> {
       const next: DesktopInfo = {
         available: isOaiyCompanion,
         version: isOaiyCompanion ? body?.version : undefined,
-        baseUrl: DESKTOP_BASE,
+        baseUrl: base,
         lastChange:
           current.available !== isOaiyCompanion || current.version !== body?.version
             ? Date.now()
@@ -93,7 +100,7 @@ async function probeOnce(): Promise<void> {
   }
   publish({
     available: false,
-    baseUrl: DESKTOP_BASE,
+    baseUrl: getEngineBase(),
     lastChange: current.available ? Date.now() : current.lastChange,
   });
 }
@@ -179,7 +186,16 @@ export async function refreshDesktopStatus(): Promise<DesktopInfo> {
 // can use a single source of truth. Phase 2/3/4 modules will add their
 // own helpers (e.g. `fetchDesktopServices`, `companionBrowserGoto`)
 // that build on this.
-export const DESKTOP_API_BASE = DESKTOP_BASE;
+/** @deprecated Prefer `getEngineBase()` — this is a snapshot taken at module
+ *  load, so it does not follow a change made in Settings. Kept because several
+ *  callers still import it; each should move to the live getter. */
+export const DESKTOP_API_BASE = getEngineBase();
+
+// Re-probe immediately when the endpoint changes, rather than making the user
+// wait out the 10s poll after typing a new address.
+subscribeEngineBase(() => {
+  void probeOnce();
+});
 
 /** Internal: lets tests/dev tools await an in-flight probe. */
 export function _currentProbePromise(): Promise<void> | null {
