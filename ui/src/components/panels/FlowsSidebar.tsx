@@ -341,9 +341,15 @@ export default function FlowsSidebar({
       />
 
       {/* Sidebar */}
+      {/* Between md and xl the app rail is a 74px COLUMN while this panel is a
+          fixed overlay, so anchoring it at 0 laid it over the rail and the
+          primary navigation looked cut in half. Below md the rail is itself a
+          drawer, so 0 is correct there; at xl this is relative and left is
+          moot. */}
       <div
         className={`
-          fixed xl:relative inset-y-0 left-0 z-50 xl:z-auto
+          fixed xl:relative inset-y-0 z-50 xl:z-auto
+          left-0 md:left-[74px] xl:left-0
           w-[85vw] sm:w-64 max-w-64 flex flex-col
           transform transition-transform duration-200 ease-in-out
           ${isOpen ? 'translate-x-0' : '-translate-x-full xl:translate-x-0'}
