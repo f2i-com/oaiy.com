@@ -106,7 +106,7 @@ function LogConsole({ logs, onClear, isOpen, onClose, className = '' }: LogConso
       {/* Mobile overlay */}
       {isOpen && (
         <div
-          className="md:hidden fixed inset-0 bg-black/50 z-40"
+          className="xl:hidden fixed inset-0 bg-black/50 z-40"
           onClick={onClose}
         />
       )}
@@ -114,11 +114,11 @@ function LogConsole({ logs, onClear, isOpen, onClose, className = '' }: LogConso
       {/* Log panel */}
       <div
         className={`
-          fixed md:relative z-50 md:z-auto right-0 top-0
+          fixed xl:relative z-50 xl:z-auto right-0 top-0
           h-full bg-white dark:bg-slate-950 border-l border-slate-200 dark:border-slate-800 flex flex-col
           transition-transform duration-300 ease-in-out
-          w-72 sm:w-80 md:w-72 lg:w-80
-          ${isOpen ? 'translate-x-0' : 'translate-x-full md:translate-x-0'}
+          w-72 sm:w-80 xl:w-full
+          ${isOpen ? 'translate-x-0' : 'translate-x-full xl:translate-x-0'}
           ${className}
         `}
       >

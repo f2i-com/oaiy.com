@@ -438,7 +438,7 @@ function NodePalette({ onAddNode, onAddNodeAtPosition, isOpen, onClose, macros, 
       {/* Mobile overlay */}
       {isOpen && (
         <div
-          className="lg:hidden fixed inset-0 bg-black/50 z-40"
+          className="xl:hidden fixed inset-0 bg-black/50 z-40"
           onClick={onClose}
         />
       )}
@@ -446,11 +446,11 @@ function NodePalette({ onAddNode, onAddNodeAtPosition, isOpen, onClose, macros, 
       {/* Palette panel */}
       <div
         className={`
-          fixed lg:relative z-50 lg:z-auto
-          h-full max-h-screen bg-white dark:bg-slate-900 border-r border-slate-200 dark:border-slate-800 flex flex-col
+          fixed xl:relative z-50 xl:z-auto left-0 xl:left-auto inset-y-0 xl:inset-y-auto
+          h-full bg-white dark:bg-slate-900 border-r border-slate-200 dark:border-slate-800 flex flex-col
           transition-transform duration-300 ease-in-out
-          w-full lg:w-48 xl:w-64
-          ${isOpen ? 'translate-x-0' : '-translate-x-full lg:translate-x-0'}
+          w-full xl:w-56 2xl:w-64
+          ${isOpen ? 'translate-x-0' : '-translate-x-full xl:translate-x-0'}
         `}
       >
         {/* Header */}
@@ -462,7 +462,7 @@ function NodePalette({ onAddNode, onAddNodeAtPosition, isOpen, onClose, macros, 
             {/* Close button for mobile */}
             <button
               onClick={onClose}
-              className="lg:hidden p-1.5 hover:bg-slate-100 dark:hover:bg-slate-800 rounded transition-colors"
+              className="xl:hidden p-1.5 hover:bg-slate-100 dark:hover:bg-slate-800 rounded transition-colors"
               aria-label="Close node palette"
             >
               <svg className="w-5 h-5 text-slate-500 dark:text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">

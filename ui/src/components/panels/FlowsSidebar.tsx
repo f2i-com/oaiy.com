@@ -289,7 +289,7 @@ export default function FlowsSidebar({
   if (!isOpen) {
     return (
       <div
-        className="hidden xl:flex w-11 shrink-0 flex-col items-center gap-3 py-3"
+        className="hidden md:flex w-11 shrink-0 flex-col items-center gap-3 py-3"
         style={{
           backgroundColor: 'rgb(var(--color-bg-elevated))',
           borderRight: '1px solid rgb(var(--color-border-primary))',
@@ -336,7 +336,7 @@ export default function FlowsSidebar({
     <>
       {/* Mobile backdrop */}
       <div
-        className="xl:hidden fixed inset-0 bg-black/50 z-40"
+        className="md:hidden fixed inset-0 bg-black/50 z-40"
         onClick={onClose}
       />
 
@@ -348,11 +348,10 @@ export default function FlowsSidebar({
           moot. */}
       <div
         className={`
-          fixed xl:relative inset-y-0 z-50 xl:z-auto
-          left-0 md:left-[74px] xl:left-0
+          fixed md:relative inset-y-0 z-50 md:z-auto left-0
           w-[85vw] sm:w-64 max-w-64 flex flex-col
           transform transition-transform duration-200 ease-in-out
-          ${isOpen ? 'translate-x-0' : '-translate-x-full xl:translate-x-0'}
+          ${isOpen ? 'translate-x-0' : '-translate-x-full md:translate-x-0'}
         `}
         style={{
           backgroundColor: 'rgb(var(--color-bg-elevated))',
@@ -495,7 +494,7 @@ export default function FlowsSidebar({
             <button
               type="button"
               onClick={onClose}
-              className="hidden xl:block p-1 hover:bg-slate-200 dark:hover:bg-slate-700 rounded transition-colors"
+              className="hidden md:block p-1 hover:bg-slate-200 dark:hover:bg-slate-700 rounded transition-colors"
               aria-label="Collapse the flows panel"
               aria-expanded
               title="Collapse flows (Ctrl+B)"
@@ -509,7 +508,7 @@ export default function FlowsSidebar({
             <button
               type="button"
               onClick={onClose}
-              className="xl:hidden p-1 hover:bg-slate-200 dark:hover:bg-slate-700 rounded transition-colors"
+              className="md:hidden p-1 hover:bg-slate-200 dark:hover:bg-slate-700 rounded transition-colors"
               aria-label="Close sidebar"
             >
               <svg className="w-5 h-5 text-slate-500 dark:text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">

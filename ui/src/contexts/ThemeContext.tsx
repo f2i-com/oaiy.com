@@ -139,6 +139,25 @@ export function ThemeProvider({ children }: ThemeProviderProps) {
       },
     };
 
+    // White label text on a saturated fill is the one place an accent has to
+    // clear 4.5:1 rather than merely look right, and the bright accents
+    // (orange 2.21:1, cyan, green) never could. Rather than hand-pick a second
+    // palette, scale the fill toward black until it passes: indigo moves by a
+    // couple of percent, orange moves a lot, and no accent can ship a CTA that
+    // fails. Light theme's accents already pass, so they come back untouched.
+    const fillFor = (triple: string): string => {
+      const c = triple.split(' ').map(Number);
+      const chan = (v: number) => {
+        const x = v / 255;
+        return x <= 0.03928 ? x / 12.92 : Math.pow((x + 0.055) / 1.055, 2.4);
+      };
+      const contrast = (rgb: number[]) =>
+        1.05 / (0.2126 * chan(rgb[0]) + 0.7152 * chan(rgb[1]) + 0.0722 * chan(rgb[2]) + 0.05);
+      let scale = 1;
+      while (scale > 0.2 && contrast(c.map((v) => v * scale)) < 4.5) scale -= 0.02;
+      return c.map((v) => Math.round(v * scale)).join(' ');
+    };
+
     const colors = accentColors[resolvedTheme][accentColor];
     root.style.setProperty('--accent-primary', colors.primary);
     root.style.setProperty('--accent-hover', colors.hover);
@@ -147,10 +166,12 @@ export function ThemeProvider({ children }: ThemeProviderProps) {
     // pairs violet with azure; every other accent (and all of Paper Circuit,
     // which is deliberately single-primary) reads better as a flat fill, so it
     // mirrors the primary rather than staying stuck on the default violet.
-    root.style.setProperty(
-      '--accent-secondary',
-      resolvedTheme === 'dark' && accentColor === 'indigo' ? '77 139 255' : colors.primary,
-    );
+    const secondary =
+      resolvedTheme === 'dark' && accentColor === 'indigo' ? '77 139 255' : colors.primary;
+    root.style.setProperty('--accent-secondary', secondary);
+    // Used only by filled controls that put white text on the accent.
+    root.style.setProperty('--accent-fill', fillFor(colors.primary));
+    root.style.setProperty('--accent-fill-2', fillFor(secondary));
   }, [accentColor, resolvedTheme]);
 
   // Apply background tint as CSS variables. useLayoutEffect (pre-paint) — the

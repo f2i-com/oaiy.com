@@ -122,13 +122,13 @@ export default function OAIYApp() {
   // it on every visit. Defaults to open so a first-time workspace shows its
   // flows; a malformed/absent value reads as open for the same reason.
   const [flowsSidebarOpen, setFlowsSidebarOpen] = useState(() => {
-    // Below xl this rail is a fixed OVERLAY, not a column, so "expanded"
+    // Below md this rail is a fixed OVERLAY, not a column, so "expanded"
     // means it covers the canvas AND the topbar — including the nav
     // hamburger, which made the menu unreachable by touch even though it
-    // was drawn. The stored preference is about the desktop rail; on a
-    // phone the honest default is closed, and the toggle still opens it.
+    // was drawn. From md up it is a docked column and should honour the
+    // stored preference like any other week.
     try {
-      if (typeof window !== 'undefined' && window.innerWidth < 1240) return false;
+      if (typeof window !== 'undefined' && window.innerWidth < 760) return false;
       return localStorage.getItem(FLOWS_RAIL_KEY) !== 'collapsed';
     } catch {
       // Private mode / storage disabled — not a reason to fail to render.
@@ -746,7 +746,7 @@ export default function OAIYApp() {
                       type="button"
                       className="oaiy-name oaiy-name-flow"
                       onClick={startEditingFlowName}
-                      title="Rename this flow"
+                      title={`${activeFlow.name} — rename this flow`}
                     >
                       {activeFlow.name}
                     </button>
