@@ -1686,6 +1686,69 @@ select,
   .oaiy-dock > button > span { display: none; }
 }
 
+/* ---------- phone: the rail becomes a drawer ----------
+   Above md the rail is a grid column and always visible; the opener and the
+   scrim below are not rendered, so none of this can fire. Below md the grid
+   collapses to ONE column and the rail goes off-canvas.
+
+   The reason is arithmetic: at 390px the two-column shell spent 74px -- 19% of
+   the screen -- on an icon strip that could not be expanded OR dismissed,
+   leaving 316px for a node canvas. A drawer gives the canvas the whole width
+   and gives the rail its labels back, which the 74px version had to hide. */
+@media (width < 760px) {
+  .app-shell { grid-template-columns: minmax(0, 1fr); }
+
+  .oaiy-sidebar {
+    position: fixed;
+    z-index: 60;
+    top: 0;
+    left: 0;
+    bottom: 0;
+    width: min(78vw, 264px);
+    transform: translateX(-100%);
+    transition: transform 180ms ease;
+    /* Opaque: it sits over the canvas, not beside it. */
+    background: rgb(var(--color-bg-secondary));
+    border-right: 1px solid rgb(var(--color-border-primary));
+    overflow-y: auto;
+    overscroll-behavior: contain;
+  }
+  .oaiy-sidebar.is-open { transform: translateX(0); }
+
+  .oaiy-nav-scrim {
+    position: fixed;
+    z-index: 59;
+    inset: 0;
+    background: rgb(0 0 0 / 0.5);
+  }
+
+  /* Off-canvas it has room for words again, so undo the 1240px icon-only
+     collapse rather than shipping a 264px drawer of unlabelled glyphs. */
+  .oaiy-sidebar .oaiy-brand,
+  .oaiy-sidebar .oaiy-brand > span,
+  .oaiy-sidebar .oaiy-brand > small,
+  .oaiy-sidebar .oaiy-new > span,
+  .oaiy-sidebar .oaiy-nav button > span,
+  .oaiy-sidebar .oaiy-nav button > em,
+  .oaiy-sidebar .oaiy-settings-btn > span,
+  .oaiy-sidebar .oaiy-engine > span,
+  .oaiy-sidebar .oaiy-trust span { display: revert; }
+  .oaiy-sidebar { align-items: stretch; padding-right: 14px; padding-left: 14px; }
+  .oaiy-sidebar .oaiy-brand { padding: revert; text-align: left; }
+  .oaiy-sidebar .oaiy-new,
+  .oaiy-sidebar .oaiy-nav,
+  .oaiy-sidebar .oaiy-settings-btn { width: auto; }
+  .oaiy-sidebar .oaiy-new,
+  .oaiy-sidebar .oaiy-nav button,
+  .oaiy-sidebar .oaiy-settings-btn { justify-content: flex-start; padding: 0 10px; }
+  .oaiy-sidebar .oaiy-engine { width: auto; justify-content: flex-start; padding: 9px 10px; }
+}
+
+/* The opener only exists below md; above it the rail is already on screen. */
+.oaiy-nav-open { display: none; flex: 0 0 auto; margin-right: 10px; }
+@media (width < 760px) { .oaiy-nav-open { display: inline-flex; } }
+
+
 
 /* ============================================================================
    LANDING PAGES — the same design system, applied to the marketing surfaces
