@@ -144,6 +144,17 @@ impl PluginProcess {
             ));
         }
 
+        // Older installs kept this inside the bundle; move it before the plugin
+        // is told where to write. A failure here is logged rather than fatal —
+        // see migrate_legacy_data_dir.
+        match super::runner::migrate_legacy_data_dir(dir) {
+            Ok(true) => log::info!(
+                "moved {}/data out of the plugin bundle so its signature can verify",
+                dir.display()
+            ),
+            Ok(false) => {}
+            Err(e) => log::warn!("legacy plugin data dir not migrated: {e}"),
+        }
         let data_dir = plugin_data_dir(dir);
         // Created eagerly: a plugin told where its data dir is will write there
         // immediately, and failing on the first write is a worse first run than
