@@ -61,7 +61,10 @@ yarn-error.log*
 # Staged at build time by desktop/scripts/sync-cli.mjs (mirrors cli/dist, which is also ignored).
 desktop/src-tauri/resources/cli/
 
-# Scratch probe scripts (Playwright measurement harnesses)
-ui/probe-*.mjs
-ui/m.mjs
-ui/measure-tmp.mjs
+# Scratch measurement/probe harnesses written at the repo root of ui/.
+# Real tooling lives in ui/tests/ or ui/scripts/, so anything loose here is
+# throwaway by definition.
+/ui/*.mjs
+/ui/*.cjs
+!/ui/vite.config.mjs
+!/ui/postcss.config.mjs
