@@ -226,6 +226,7 @@ body {
   margin: 0;
   min-width: 320px;
   min-height: 100vh;
+  min-height: 100dvh;
   background-color: rgb(var(--color-bg-primary));
   color: rgb(var(--color-text-primary));
   font-family: var(--font-body);
@@ -235,6 +236,7 @@ body {
 #root {
   width: 100%;
   height: 100vh;
+  height: 100dvh;
 }
 
 /* Display typography — the same grotesque, tightened. The OAIY design system
@@ -1108,9 +1110,16 @@ select,
 .app-shell {
   display: grid;
   grid-template-columns: 222px minmax(0, 1fr);
-  width: 100vw;
+  /* 100% not 100vw: on a desktop with a classic scrollbar, 100vw INCLUDES the
+     gutter and forces a horizontal scroll of exactly the scrollbar width.
+     dvh not vh: on iOS and Android the URL bar collapses on scroll, and 100vh
+     is the TALLEST viewport -- so the bottom dock sat permanently below the
+     fold, which for this shell means the primary action row. */
+  width: 100%;
   height: 100vh;
+  height: 100dvh;
   overflow: hidden;
+  overscroll-behavior: none;
   background:
     radial-gradient(circle at 72% -5%, rgb(var(--accent-primary) / 0.13), transparent 32%),
     rgb(var(--color-bg-primary));
@@ -1396,10 +1405,27 @@ select,
   min-width: 0;
   flex: 0 1 auto;
   align-items: center;
-  justify-content: flex-end;
+  /* flex-START, not flex-end, even though this cluster sits on the right.
+     The box is `flex: 0 1 auto`, so while everything fits its width IS the
+     content width and the two are visually identical. They differ only when it
+     overflows -- and with flex-end the overflow spills past the START edge,
+     where `overflow: hidden` clipped it and no amount of scrolling could reach
+     it (scrollLeft cannot go negative in LTR). At 390px that is seven icon
+     buttons in about 209px, so the theme toggle and the flows-rail button were
+     simply gone. flex-start puts the overflow at the end, where it is
+     scrollable. */
+  justify-content: flex-start;
   gap: 8px;
-  overflow: hidden;
+  overflow-x: auto;
+  overflow-y: hidden;
+  /* Scrollable, but without a scrollbar sitting across a 40px-tall toolbar. */
+  scrollbar-width: none;
+  -ms-overflow-style: none;
 }
+.oaiy-actions::-webkit-scrollbar { display: none; }
+/* Icon buttons keep their size; shrinking them to avoid the overflow would
+   trade an unreachable control for an untappable one. */
+.oaiy-actions > * { flex: 0 0 auto; }
 
 .oaiy-toggle {
   display: flex;
