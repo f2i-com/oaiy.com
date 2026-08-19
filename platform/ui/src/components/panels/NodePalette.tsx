@@ -574,7 +574,7 @@ function NodePalette({ onAddNode, onAddNodeAtPosition, isOpen, onClose, macros, 
                             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M20 7l-8-4-8 4m16 0l-8 4m8-4v10l-8 4m0-10L4 7m8 4v10M4 7v10l8 4" />
                           </svg>
                         </div>
-                        <span className="text-xs font-semibold uppercase tracking-wide">{group.label}</span>
+                        <span className="text-xs font-semibold uppercase tracking-wide whitespace-nowrap truncate min-w-0" title={group.label}>{group.label}</span>
                         <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-purple-200 dark:bg-purple-500/30 text-purple-600 dark:text-purple-300 font-medium">{group.nodes.length}</span>
                       </button>
                     </div>
@@ -582,7 +582,7 @@ function NodePalette({ onAddNode, onAddNodeAtPosition, isOpen, onClose, macros, 
                   /* Category Header */
                   <button
                     onClick={() => toggleCategory(group.category)}
-                    className={`w-full flex items-center gap-2 px-2 py-1.5 transition-colors ${
+                    className={`w-full flex items-center gap-2 px-2 py-1.5 text-left transition-colors ${
                       hasPackageNodes
                         ? 'text-purple-600 dark:text-purple-400 hover:text-purple-700 dark:hover:text-purple-200'
                         : 'text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:hover:text-slate-200'
@@ -599,8 +599,8 @@ function NodePalette({ onAddNode, onAddNodeAtPosition, isOpen, onClose, macros, 
                     >
                       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
                     </svg>
-                    <span className="text-xs font-medium uppercase tracking-wide">{group.label}</span>
-                    <span className="text-slate-500 dark:text-slate-600 text-xs">({group.nodes.length})</span>
+                    <span className="text-xs font-medium uppercase tracking-wide whitespace-nowrap truncate min-w-0" title={group.label}>{group.label}</span>
+                    <span className="text-slate-500 dark:text-slate-600 text-xs flex-shrink-0">({group.nodes.length})</span>
                   </button>
                   )}
 
