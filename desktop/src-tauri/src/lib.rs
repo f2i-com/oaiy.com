@@ -862,10 +862,11 @@ fn remove_model_dir(
 /// library of 40 GB checkpoints.
 #[tauri::command(async)]
 fn list_gguf_models(registry: tauri::State<RegistryHandle>) -> Vec<String> {
-    registry
-        .lock()
-        .map(|r| r.list_gguf_models())
-        .unwrap_or_default()
+    // Take the search roots under the lock, then release it and walk. Holding
+    // the registry across the walk blocked every /api/services poll and every
+    // start/stop behind the disk for as long as the scan took.
+    let dirs = registry.lock().map(|r| r.model_dirs().to_vec()).unwrap_or_default();
+    crate::services::registry::scan_gguf_models(&dirs)
 }
 
 /// Tauri command: set (or clear, with '') the GGUF a single-model server
@@ -925,10 +926,10 @@ fn set_llama_mmproj(
 /// invisible everywhere.
 #[tauri::command(async)]
 fn list_mmproj_files(registry: tauri::State<RegistryHandle>) -> Vec<String> {
-    registry
-        .lock()
-        .map(|r| r.list_mmproj_files())
-        .unwrap_or_default()
+    // Same off-lock walk as list_gguf_models — identical traversal, and this
+    // one runs beside it whenever the llama.cpp card is expanded.
+    let dirs = registry.lock().map(|r| r.model_dirs().to_vec()).unwrap_or_default();
+    crate::services::registry::scan_mmproj_files(&dirs)
 }
 
 /// Tauri command: set (or clear, with '') the Ollama model NAME a node uses.
