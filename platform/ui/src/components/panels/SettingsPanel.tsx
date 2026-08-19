@@ -276,7 +276,15 @@ export default function SettingsPanel({
   const customConstants = constants.filter(c => c.category !== 'api_key');
 
   return (
-    <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-0 sm:p-4 short:p-2">
+    <div
+      className="fixed inset-x-0 bottom-0 top-[65px] md:top-0 bg-black/50 z-50 flex items-center justify-center p-0 sm:p-4 short:p-2"
+      // Click the backdrop to dismiss, matching the Escape key this panel
+      // already honours. target === currentTarget so a click that merely
+      // BUBBLED from the card does not close it -- no stopPropagation needed
+      // on the card itself, which would have to be repeated on every child
+      // that stops propagation for its own reasons.
+      onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}
+    >
       {/* Outer card — stacks vertically on mobile (header + tab strip on
           top, content below) and switches to the desktop two-column layout
           at md+. The flex direction toggle is what enables both modes. */}

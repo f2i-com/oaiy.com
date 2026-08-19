@@ -122,7 +122,13 @@ export default function OAIYApp() {
   // it on every visit. Defaults to open so a first-time workspace shows its
   // flows; a malformed/absent value reads as open for the same reason.
   const [flowsSidebarOpen, setFlowsSidebarOpen] = useState(() => {
+    // Below xl this rail is a fixed OVERLAY, not a column, so "expanded"
+    // means it covers the canvas AND the topbar — including the nav
+    // hamburger, which made the menu unreachable by touch even though it
+    // was drawn. The stored preference is about the desktop rail; on a
+    // phone the honest default is closed, and the toggle still opens it.
     try {
+      if (typeof window !== 'undefined' && window.innerWidth < 1240) return false;
       return localStorage.getItem(FLOWS_RAIL_KEY) !== 'collapsed';
     } catch {
       // Private mode / storage disabled — not a reason to fail to render.
@@ -586,18 +592,42 @@ export default function OAIYApp() {
       <a className="oaiy-skip" href="#oaiy-main">Skip to the canvas</a>
 
       <ShellSidebar
+        providersOpen={settingsPanelOpen && settingsInitialTab === 'services'}
+        runsOpen={queuePanelOpen}
+        pluginsOpen={showPackageBrowser}
         navOpen={navOpen}
         onCloseNav={() => setNavOpen(false)}
         view={activeTab}
-        onSelectView={setActiveTab}
+        onSelectView={(v) => {
+          // Picking a VIEW dismisses whatever overlay is up. Without this,
+          // tapping Workflows while Providers is open left Providers covering
+          // the workflow you had just asked to see, and the rail highlighted
+          // one thing while the screen showed another.
+          setQueuePanelOpen(false);
+          setShowPackageBrowser(false);
+          setSettingsPanelOpen(false);
+          setActiveTab(v);
+        }}
         onNewFlow={() => handleCreateFlow('Untitled flow')}
-        onOpenQueue={() => setQueuePanelOpen(true)}
-        onOpenPlugins={() => setShowPackageBrowser(true)}
+        onOpenQueue={() => {
+          if (queuePanelOpen) { setQueuePanelOpen(false); return; }
+          setSettingsPanelOpen(false); setShowPackageBrowser(false); setQueuePanelOpen(true);
+        }}
+        onOpenPlugins={() => {
+          if (showPackageBrowser) { setShowPackageBrowser(false); return; }
+          setSettingsPanelOpen(false); setQueuePanelOpen(false); setShowPackageBrowser(true);
+        }}
         onOpenServices={() => {
+          if (settingsPanelOpen && settingsInitialTab === 'services') { setSettingsPanelOpen(false); return; }
+          setQueuePanelOpen(false);
+          setShowPackageBrowser(false);
           setSettingsInitialTab('services');
           setSettingsPanelOpen(true);
         }}
-        onOpenSettings={() => setSettingsPanelOpen(true)}
+        onOpenSettings={() => {
+          if (settingsPanelOpen) { setSettingsPanelOpen(false); return; }
+          setQueuePanelOpen(false); setShowPackageBrowser(false); setSettingsPanelOpen(true);
+        }}
         settingsActive={settingsPanelOpen}
         companionOnline={companion.available}
         companionDetail={

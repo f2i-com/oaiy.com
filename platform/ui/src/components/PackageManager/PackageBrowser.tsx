@@ -93,10 +93,13 @@ export function PackageBrowser({
   if (!isOpen) return null;
 
   return createPortal(
-    <div className="fixed inset-0 bg-black/70 backdrop-blur-sm z-[9999] flex items-center justify-center p-4">
+    <div
+      className="fixed inset-x-0 bottom-0 top-[65px] md:top-0 bg-black/70 backdrop-blur-sm z-[9999] flex items-center justify-center p-0 sm:p-4"
+      onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}
+    >
       <div
         ref={panelRef}
-        className="bg-white dark:bg-slate-900 rounded-2xl border border-slate-200 dark:border-slate-700/50 w-full max-w-2xl shadow-2xl max-h-[80vh] short:max-h-[92vh] flex flex-col"
+        className="bg-white dark:bg-slate-900 rounded-none sm:rounded-2xl border-0 sm:border border-slate-200 dark:border-slate-700/50 w-full h-full sm:h-auto sm:max-w-2xl shadow-2xl sm:max-h-[80vh] short:sm:max-h-[92vh] flex flex-col"
         role="dialog"
         aria-modal="true"
         aria-labelledby="pkg-browser-title"

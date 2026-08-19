@@ -45,6 +45,9 @@ export interface ShellNavItem {
 /* ------------------------------------------------------------------ sidebar */
 
 export function ShellSidebar({
+  providersOpen = false,
+  runsOpen = false,
+  pluginsOpen = false,
   navOpen = false,
   onCloseNav,
   view,
@@ -58,6 +61,13 @@ export function ShellSidebar({
   companionOnline,
   companionDetail,
 }: {
+  /** Which overlay is on screen. The rail is the only place that shows where
+   *  you are, and these three entries open a panel rather than switch view --
+   *  so without them the rail says "Workflows" while you are looking at
+   *  Providers. */
+  providersOpen?: boolean;
+  runsOpen?: boolean;
+  pluginsOpen?: boolean;
   /** Below md the rail is off-canvas; this slides it in. Ignored above md,
    *  where the rail is part of the grid and always present. */
   navOpen?: boolean;
@@ -78,23 +88,23 @@ export function ShellSidebar({
       id: 'builder',
       label: 'Workflows',
       icon: Workflow,
-      active: view === 'builder',
+      active: view === 'builder' && !providersOpen && !runsOpen && !pluginsOpen,
       onClick: () => onSelectView('builder'),
     },
-    { id: 'providers', label: 'Providers', icon: Cloud, active: false, onClick: onOpenServices },
+    { id: 'providers', label: 'Providers', icon: Cloud, active: providersOpen, onClick: onOpenServices },
     {
       id: 'runs',
       label: 'Runs',
       icon: Activity,
-      active: false,
+      active: runsOpen,
       onClick: onOpenQueue,
     },
-    { id: 'plugins', label: 'Plugins', icon: Puzzle, active: false, onClick: onOpenPlugins },
+    { id: 'plugins', label: 'Plugins', icon: Puzzle, active: pluginsOpen, onClick: onOpenPlugins },
     {
       id: 'data',
       label: 'Data',
       icon: Database,
-      active: view === 'data',
+      active: view === 'data' && !providersOpen && !runsOpen && !pluginsOpen,
       onClick: () => onSelectView('data'),
     },
   ];
