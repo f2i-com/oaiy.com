@@ -3,14 +3,17 @@
 //! Same axum API as the tray app (services / models / python on
 //! `127.0.0.1:17972`), but with no window, tray, or webview — for running on a
 //! Linux box (or any server) driven by a CO-LOCATED Node CLI / oaiy-web. The API
-//! binds 127.0.0.1 only (never a network interface); remote access must go through
-//! an SSH tunnel or an authenticating reverse proxy.
+//! binds 127.0.0.1 by default; OAIY_SERVER_BIND=lan binds every interface for the
+//! case this exists to serve — editing from a phone on the same network. Prefer an
+//! SSH tunnel or an authenticating reverse proxy for anything beyond a trusted LAN,
+//! and set OAIY_SERVER_TOKEN whenever you bind wider than loopback.
 //!
 //! Configuration is by environment variable instead of the GUI's pointer file:
 //!   OAIY_DATA_DIR        data root (databases, venvs, templates)  [~/.oaiy-server]
 //!   OAIY_MODELS_DIR      where downloads land                     [<data>/models]
 //!   OAIY_EXTRA_MODEL_DIRS extra read-only model roots (`:`/`;`-separated)
 //!   OAIY_SERVER_PORT     listen port                              [17972]
+//!   OAIY_SERVER_BIND     `lan` binds 0.0.0.0 instead of loopback  [loopback]
 //!   OAIY_SERVER_TOKEN    bearer token gating privileged routes    [none]
 //!   OAIY_HF_TOKEN        HuggingFace token for gated downloads    [none]
 //!   OAIY_LLAMACPP_MODEL  GGUF the llama-cpp service loads         [none]
@@ -121,6 +124,10 @@ async fn shutdown_signal() {
     }
 }
 
+fn auth_token_is_empty() -> bool {
+    std::env::var("OAIY_SERVER_TOKEN").map(|s| s.trim().is_empty()).unwrap_or(true)
+}
+
 #[tokio::main]
 async fn main() {
     let _ = log::set_logger(&LOGGER);
@@ -161,6 +168,18 @@ async fn main() {
             std::process::exit(1);
         }),
     };
+    // Opt-in only, and only on an exact value: anything else (including a typo
+    // like `LAN ` or `true`) keeps loopback, because the failure mode of guessing
+    // wrong here is a server on the network that nobody meant to expose.
+    let bind_all = std::env::var("OAIY_SERVER_BIND")
+        .map(|s| s.trim().eq_ignore_ascii_case("lan"))
+        .unwrap_or(false);
+    if bind_all && auth_token_is_empty() {
+        eprintln!(
+            "oaiy-server: OAIY_SERVER_BIND=lan without OAIY_SERVER_TOKEN — privileged routes stay closed"
+        );
+    }
+
     // Trim symmetrically with the client (bearer_token trims), so surrounding
     // whitespace in the env var can't silently reject a valid token.
     let auth_token = std::env::var("OAIY_SERVER_TOKEN")
@@ -410,7 +429,8 @@ async fn main() {
 
     // gui_mode = false: headless server is token-strict (no webview origin).
     if let Err(e) = http::serve(
-        port, config, auth_token, false, registry, downloads, python, catalog, bridge,
+        port,
+        bind_all, config, auth_token, false, registry, downloads, python, catalog, bridge,
         companion, companion_upstream, link, ai_providers, ai_codex, node_runtime,
     )
     .await

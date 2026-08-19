@@ -1069,6 +1069,14 @@ async fn origin_guard(
 
 pub async fn serve(
     port: u16,
+    // Bind every interface instead of loopback only.
+    //
+    // Off by default and never inferred: it widens the reachable surface from
+    // "this machine" to "anything that can route here", which is a decision for
+    // the person running it, not for us. It exists because the editor is useful
+    // from a phone on the same network, and a loopback-only server can never
+    // serve that no matter what address the phone is given.
+    bind_all: bool,
     config: Arc<dyn ConfigProvider>,
     // Optional bearer token gating privileged routes for non-browser clients.
     auth_token: Option<String>,
@@ -1233,10 +1241,19 @@ pub async fn serve(
         // preflight response CORS produced.
         .layer(axum::middleware::from_fn(allow_private_network));
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let addr = SocketAddr::from((
+        if bind_all { [0, 0, 0, 0] } else { [127, 0, 0, 1] },
+        port,
+    ));
     let listener = tokio::net::TcpListener::bind(addr).await?;
 
-    log::info!("OAIY API listening on http://{addr}");
+    if bind_all {
+        log::warn!(
+            "OAIY API listening on http://{addr} — reachable from the NETWORK, not just this machine"
+        );
+    } else {
+        log::info!("OAIY API listening on http://{addr}");
+    }
     axum::serve(listener, app).await?;
     Ok(())
 }
