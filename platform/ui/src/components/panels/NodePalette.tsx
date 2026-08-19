@@ -438,7 +438,7 @@ function NodePalette({ onAddNode, onAddNodeAtPosition, isOpen, onClose, macros, 
       {/* Mobile overlay */}
       {isOpen && (
         <div
-          className="md:hidden fixed inset-0 bg-black/50 z-40"
+          className="lg:hidden fixed inset-0 bg-black/50 z-40"
           onClick={onClose}
         />
       )}
@@ -446,11 +446,11 @@ function NodePalette({ onAddNode, onAddNodeAtPosition, isOpen, onClose, macros, 
       {/* Palette panel */}
       <div
         className={`
-          fixed md:relative z-50 md:z-auto
+          fixed lg:relative z-50 lg:z-auto
           h-full max-h-screen bg-white dark:bg-slate-900 border-r border-slate-200 dark:border-slate-800 flex flex-col
           transition-transform duration-300 ease-in-out
-          w-64 md:w-56 lg:w-64
-          ${isOpen ? 'translate-x-0' : '-translate-x-full md:translate-x-0'}
+          w-full lg:w-48 xl:w-64
+          ${isOpen ? 'translate-x-0' : '-translate-x-full lg:translate-x-0'}
         `}
       >
         {/* Header */}
@@ -462,7 +462,7 @@ function NodePalette({ onAddNode, onAddNodeAtPosition, isOpen, onClose, macros, 
             {/* Close button for mobile */}
             <button
               onClick={onClose}
-              className="md:hidden p-1.5 hover:bg-slate-100 dark:hover:bg-slate-800 rounded transition-colors"
+              className="lg:hidden p-1.5 hover:bg-slate-100 dark:hover:bg-slate-800 rounded transition-colors"
               aria-label="Close node palette"
             >
               <svg className="w-5 h-5 text-slate-500 dark:text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">

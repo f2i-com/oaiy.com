@@ -10,6 +10,20 @@ export default {
   ],
   darkMode: 'class',
   theme: {
+    // ONE breakpoint scale, in px, shared with the hand-written .oaiy-* rules
+    // in src/index.css. Tailwind's defaults are rem, every hand-written rule is
+    // px, and nothing sets a root font-size -- so a user browsing at a 20px
+    // default moved Tailwind's md from 768 to 960 and landed it exactly on the
+    // CSS 960 rule, reordering the whole cascade. Declared in full (not
+    // `extend`) so the ORDER is explicit rather than merge-dependent.
+    screens: {
+      xs: '480px',   // phone portrait
+      sm: '640px',
+      md: '760px',   // matches the shell's own 760 rule
+      lg: '960px',   // matches the shell's 960 rule
+      xl: '1240px',  // matches the shell's rail-collapse rule
+      '2xl': '1536px',
+    },
     extend: {
       colors: {
         accent: {

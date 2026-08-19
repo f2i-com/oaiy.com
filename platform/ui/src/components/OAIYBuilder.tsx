@@ -1001,7 +1001,7 @@ export default function OAIYBuilder({
           so the user can recover the canvas width and still get back. */}
       {!showDataViewer && (
         paletteCollapsed ? (
-          <div className="hidden md:flex md:h-full md:w-8 md:flex-shrink-0 border-r border-slate-200 dark:border-slate-700 bg-white/30 dark:bg-slate-900/30">
+          <div className="hidden lg:flex lg:h-full lg:w-8 lg:flex-shrink-0 border-r border-slate-200 dark:border-slate-700 bg-white/30 dark:bg-slate-900/30">
             <button
               type="button"
               onClick={togglePaletteCollapsed}
@@ -1016,7 +1016,7 @@ export default function OAIYBuilder({
             </button>
           </div>
         ) : (
-          <div className="hidden md:flex md:h-full md:flex-shrink-0 relative">
+          <div className="hidden lg:flex lg:h-full lg:flex-shrink-0 relative">
             <NodePalette
               onAddNode={handleAddNode}
               onAddNodeAtPosition={handleAddNodeAtPosition}
@@ -1045,7 +1045,7 @@ export default function OAIYBuilder({
 
       {/* Mobile Node Palette (drawer) */}
       {!showDataViewer && (
-        <div className="md:hidden">
+        <div className="lg:hidden">
           <NodePalette
             onAddNode={handleAddNode}
             onAddNodeAtPosition={handleAddNodeAtPosition}
@@ -1169,8 +1169,8 @@ export default function OAIYBuilder({
                     This flow is empty
                   </p>
                   <p className="text-xs mt-1" style={{ color: 'rgb(var(--color-text-tertiary))' }}>
-                    <span className="hidden md:inline">Drag a node from the palette on the left, or right-click to add one.</span>
-                    <span className="md:hidden">Tap the menu icon to open the node palette.</span>
+                    <span className="hidden lg:inline">Drag a node from the palette on the left, or right-click to add one.</span>
+                    <span className="lg:hidden">Tap the menu icon to open the node palette.</span>
                   </p>
                 </div>
               </div>
@@ -1247,7 +1247,7 @@ export default function OAIYBuilder({
 
         {/* Mobile Bottom Toolbar - only show when not in data viewer */}
         {!showDataViewer && (
-          <div className="md:hidden absolute bottom-4 left-1/2 -translate-x-1/2 z-10 flex items-center gap-1.5 bg-white/95 dark:bg-slate-800/95 backdrop-blur-sm rounded-full px-2 py-1.5 border border-slate-300 dark:border-slate-700 shadow-lg" role="toolbar" aria-label="Mobile workflow controls">
+          <div className="lg:hidden absolute bottom-4 left-1/2 -translate-x-1/2 z-10 flex items-center gap-1.5 bg-white/95 dark:bg-slate-800/95 backdrop-blur-sm rounded-full px-2 py-1.5 border border-slate-300 dark:border-slate-700 shadow-lg" role="toolbar" aria-label="Mobile workflow controls">
             {/* Nodes Button */}
             <button
               onClick={() => setPaletteOpen(true)}
@@ -1340,7 +1340,7 @@ export default function OAIYBuilder({
 
         {/* Desktop Floating Action Bar - only show when not in data viewer */}
         {!showDataViewer && (
-          <div className={`hidden md:flex absolute right-4 z-10 items-center gap-3 ${packageMode ? 'top-8' : 'top-4'}`} role="toolbar" aria-label="Workflow controls">
+          <div className={`hidden lg:flex absolute right-4 z-10 items-center gap-3 ${packageMode ? 'top-8' : 'top-4'}`} role="toolbar" aria-label="Workflow controls">
             {/* Macro controls - only show when modified */}
             {isMacro && isMacroModified && (
               <div className="flex items-center gap-2">
@@ -1550,7 +1550,7 @@ export default function OAIYBuilder({
 
       {/* Right Panel - Properties & Log Console (stacked) */}
       {!showDataViewer && (
-        <div className="hidden md:flex flex-col h-full border-l border-slate-200 dark:border-slate-700 w-80 bg-white/50 dark:bg-slate-900/50 backdrop-blur-sm z-20 transition-all duration-300">
+        <div className="hidden lg:flex flex-col h-full border-l border-slate-200 dark:border-slate-700 w-72 xl:w-80 bg-white/50 dark:bg-slate-900/50 backdrop-blur-sm z-20 transition-all duration-300">
 
           {/* Properties Panel or Selection List (Top, Flex-Grow)
               The collapse button lives in a thin header bar that's
@@ -1676,7 +1676,7 @@ export default function OAIYBuilder({
 
       {/* Mobile Log Console (drawer) */}
       {!showDataViewer && (
-        <div className="md:hidden">
+        <div className="lg:hidden">
           <LogConsole
             logs={logs}
             onClear={clearLogs}
