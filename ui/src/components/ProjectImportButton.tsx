@@ -75,14 +75,7 @@ export default function ProjectImportButton({
       <button
         type="button"
         onClick={() => inputRef.current?.click()}
-        className="p-1.5 rounded-md transition-colors"
-        style={{ color: 'rgb(var(--color-text-tertiary))' }}
-        onMouseOver={(e) => {
-          e.currentTarget.style.backgroundColor = 'rgb(var(--color-bg-tertiary) / 0.7)';
-        }}
-        onMouseOut={(e) => {
-          e.currentTarget.style.backgroundColor = '';
-        }}
+        className="oaiy-icon-btn"
         aria-label="Import project from JSON"
         title={'Import project (.json)\n\nReplaces the current project — export first (Ctrl/⌘ + S) to keep a copy.'}
       >
