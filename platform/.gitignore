@@ -64,7 +64,12 @@ desktop/src-tauri/resources/cli/
 # Scratch measurement/probe harnesses written at the repo root of ui/.
 # Real tooling lives in ui/tests/ or ui/scripts/, so anything loose here is
 # throwaway by definition.
-/ui/*.mjs
-/ui/*.cjs
-!/ui/vite.config.mjs
-!/ui/postcss.config.mjs
+# NOTE the trailing-slash-free, single-segment intent: these must NOT match
+# ui/tests/*.mjs, which are the real suites. A `git ls-files 'ui/*.mjs'`
+# pathspec DOES cross directory separators and deleted them once.
+/ui/probe*.mjs
+/ui/probe*.cjs
+/ui/m.mjs
+/ui/measure-tmp.mjs
+/ui/vt-*.mjs
+/ui/zz*.mjs
