@@ -471,14 +471,6 @@ kbd {
 
 .top-actions { display: flex; flex: 0 0 auto; align-items: center; gap: 8px; }
 
-.theme-toggle {
-  display: flex;
-  border: 1px solid var(--border);
-  border-radius: var(--r-ctl);
-  background: var(--surface-soft);
-  padding: 2px;
-}
-
 .icon-button {
   display: grid;
   width: 30px;
