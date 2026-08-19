@@ -971,7 +971,7 @@ export default function OAIYBuilder({
           so the user can recover the canvas width and still get back. */}
       {!showDataViewer && (
         paletteCollapsed ? (
-          <div className="hidden xl:flex xl:h-full xl:w-8 xl:flex-shrink-0 border-r border-slate-200 dark:border-slate-700 bg-white/30 dark:bg-slate-900/30">
+          <div className="hidden xl:flex xl:h-full xl:w-8 xl:flex-shrink-0 border-r border-[rgb(var(--color-border-primary))] bg-white/30 dark:bg-slate-900/30">
             <button
               type="button"
               onClick={togglePaletteCollapsed}
@@ -1495,7 +1495,7 @@ export default function OAIYBuilder({
 
       {/* Right Panel - Properties & Log Console (stacked) */}
       {!showDataViewer && (
-        <div className="hidden xl:flex flex-col h-full border-l border-slate-200 dark:border-slate-700 w-72 2xl:w-80 bg-white/50 dark:bg-slate-900/50 backdrop-blur-sm z-20 transition-all duration-300">
+        <div className="hidden xl:flex flex-col h-full border-l border-[rgb(var(--color-border-primary))] w-72 2xl:w-80 bg-white/50 dark:bg-slate-900/50 backdrop-blur-sm z-20 transition-all duration-300">
 
           {/* Properties Panel or Selection List (Top, Flex-Grow)
               The collapse button lives in a thin header bar that's
@@ -1503,7 +1503,7 @@ export default function OAIYBuilder({
               click. When collapsed, only the header remains and the
               log console takes the freed vertical space. */}
           {propertiesVisible ? (
-            <div className="flex-1 min-h-0 overflow-hidden border-b border-slate-200 dark:border-slate-700/50 flex flex-col">
+            <div className="flex-1 min-h-0 overflow-hidden flex flex-col">
               <div className="flex items-center justify-between px-2 py-1 bg-slate-100/50 dark:bg-slate-800/30 border-b border-slate-200 dark:border-slate-700/50 flex-shrink-0">
                 <span className="text-[11px] font-medium text-slate-500 dark:text-slate-400 uppercase tracking-wider px-1">
                   Properties

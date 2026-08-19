@@ -447,7 +447,7 @@ function NodePalette({ onAddNode, onAddNodeAtPosition, isOpen, onClose, macros, 
       <div
         className={`
           fixed xl:relative z-50 xl:z-auto left-0 xl:left-auto inset-y-0 xl:inset-y-auto
-          h-full bg-white dark:bg-slate-900 border-r border-slate-200 dark:border-slate-800 flex flex-col
+          h-full bg-white dark:bg-slate-900 border-r border-[rgb(var(--color-border-primary))] flex flex-col
           transition-transform duration-300 ease-in-out
           w-full xl:w-56 2xl:w-64
           ${isOpen ? 'translate-x-0' : '-translate-x-full xl:translate-x-0'}
@@ -832,7 +832,7 @@ function NodePalette({ onAddNode, onAddNodeAtPosition, isOpen, onClose, macros, 
         )}
 
         {/* Footer */}
-        <div className="p-2 sm:p-3 border-t border-slate-800">
+        <div className="p-2 sm:p-3 border-t border-[rgb(var(--color-border-primary))]">
           <p className="text-slate-600 text-[10px] text-center hidden sm:block">
             Click or drag to add nodes
           </p>

@@ -1423,6 +1423,25 @@ select,
   -ms-overflow-style: none;
 }
 .oaiy-actions::-webkit-scrollbar { display: none; }
+/* With the scrollbar hidden, an overflowing row is indistinguishable from a
+   short one -- at 390px that hid Settings, the wizard and Import behind a
+   gesture nobody had a reason to try. Fade the trailing edge so the row reads
+   as continuing.
+
+   CSS cannot ask "is this overflowing", so the fade is unconditional and the
+   trailing padding is what keeps it honest: it is exactly as wide as the fade,
+   so when everything fits the gradient falls entirely on padding and no button
+   is dimmed, and when the row is scrolled to its end that same padding arrives
+   under the fade to signal there is nothing further. In between -- the only
+   case where content is actually hidden -- the fade lands on a real button and
+   says so. */
+@media (width < 760px) {
+  .oaiy-actions {
+    padding-right: 22px;
+    -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 22px), transparent);
+    mask-image: linear-gradient(to right, #000 calc(100% - 22px), transparent);
+  }
+}
 /* Icon buttons keep their size; shrinking them to avoid the overflow would
    trade an unreachable control for an untappable one. */
 .oaiy-actions > * { flex: 0 0 auto; }
@@ -1527,6 +1546,8 @@ select,
 .oaiy-dock > button > span { display: flex; min-width: 0; flex-direction: column; gap: 2px; }
 .oaiy-dock > button strong { font-size: 9px; }
 .oaiy-dock > button small { color: rgb(var(--color-text-tertiary)); font-size: 8px; }
+.oaiy-dock > button:hover { color: rgb(var(--color-text-primary)); }
+.oaiy-dock > button:hover small { color: rgb(var(--color-text-secondary)); }
 .oaiy-dock-url {
   display: flex;
   min-width: 0;
@@ -1661,6 +1682,17 @@ select,
   .oaiy-canvas-wrap .react-flow__controls button {
     min-width: 44px;
     min-height: 44px;
+  }
+  .oaiy-nav { gap: 8px; }
+  .oaiy-nav button {
+    min-height: 44px;
+  }
+  /* The status dot stays 8px -- it is a readout, not a control surface. Only
+     the box around it grows, so nothing reflows. */
+  .oaiy-dock > button:first-child {
+    min-width: 44px;
+    min-height: 44px;
+    justify-content: center;
   }
 }
 
