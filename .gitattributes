@@ -15,3 +15,8 @@
 LICENSE text eol=lf
 NOTICE text eol=lf
 *.OFL.txt text eol=lf
+
+# WebAssembly modules are binary. Git auto-detects that today, but the vendored
+# Zipp engine's SHA-256 is asserted by ui/tests/zipp-executor.mjs, so pin it
+# rather than rely on detection — the same reasoning as the licence texts above.
+*.wasm binary

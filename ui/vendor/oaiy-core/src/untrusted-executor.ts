@@ -145,6 +145,17 @@ function runScript(script) {
 `;
 
 /**
+ * Builds the Worker an untrusted workflow runs in, plus the teardown that
+ * releases whatever backs it.
+ *
+ * `OAIYRuntime` accepts one of these via `RuntimeConfig.untrustedWorkerFactory`
+ * so a host app can substitute a different engine — `ui/` supplies a Zipp-backed
+ * Worker — without oaiy-core needing bundler-resolved URLs. Any implementation
+ * must speak the protocol documented at the top of this file.
+ */
+export type UntrustedWorkerFactory = () => { worker: Worker; cleanup: () => void };
+
+/**
  * Construct a Worker from the bootstrap source above. Returns the Worker
  * plus a cleanup function that revokes the Blob URL.
  *

@@ -56,3 +56,24 @@ code. Its obligations are limited to the font files themselves: keep the license
 text and copyright notice with them, don't sell the fonts on their own, and
 don't reuse the reserved font names for a modified version. See
 desktop/public/fonts/README.md and ui/public/fonts/README.md.
+
+--------------------------------------------------------------------------------
+THIRD-PARTY WEBASSEMBLY REDISTRIBUTED IN THIS REPOSITORY
+
+    Zipp. Copyright 2026 the Zipp authors.
+    https://github.com/f2i-com/zipp.org
+    License: ui/vendor/zipp-wasm/LICENSE (Apache License, Version 2.0)
+
+`ui/vendor/zipp-wasm/` holds a prebuilt WebAssembly build of the Zipp JavaScript
+engine. OAIY uses it to execute untrusted package workflows in an engine with no
+host capabilities — see ui/vendor/oaiy-core/src/zipp-executor.ts.
+
+It ships as committed bytes rather than a build step because ui/ is a standalone
+Vite app: `npm install && npm run dev` must work without a Rust toolchain and
+without a sibling checkout. The build provenance, the source commit, and the
+SHA-256 of the exact module are recorded in ui/vendor/zipp-wasm/README.md; the
+SHA is asserted by ui/tests/zipp-executor.mjs so a refresh cannot quietly
+substitute a different engine.
+
+Zipp is Apache-2.0, the same license as OAIY, so it imposes no conditions beyond
+this attribution and the retained license text.

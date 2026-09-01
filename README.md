@@ -161,6 +161,20 @@ All routes are JSON in / JSON out. Both `hash_view` and `hash_edit` accept the s
 - **Stale runs self-heal.** A run left in `running` because its browser tab died is reset to a terminal `error` after `RUN_TTL` seconds (default 900), so an external poller always reaches a terminal status.
 - The `owner_token` (returned from create, replayed via the `X-Owner-Token` header) is the only thing that authorises `DELETE` on a flow — the hashes alone are read+update only.
 
+### Running untrusted package code
+
+Flows you build yourself are trusted — they are your code, running on your machine. Flows that arrive **inside an installed package** are not, and they get a different execution path (`isHardened`, set when a job carries a `packageId`):
+
+1. Every capability is brokered. Package code cannot call anything directly; it goes through `host.call(kind, …)`, and each `kind` is checked against the package's declared permissions. An unclassified method is **refused**, not allowed through.
+2. It runs in a Web Worker, in its own realm, with the network and worker-spawning globals removed and the source scanned for escape patterns. Hardened code that cannot get a Worker is refused rather than downgraded.
+3. Optionally, it runs on a different **engine** entirely.
+
+That third layer is **Settings → Defaults → Sandbox for installed packages**, off by default. It swaps the Worker's JavaScript engine for [Zipp](https://github.com/f2i-com/zipp.org) compiled to WebAssembly. The distinction is worth being precise about: layer 2 is *subtractive* — a full browser realm with the dangerous names taken away one at a time, which both layers' own comments describe as best-effort. Zipp's guest global is a positive allowlist that never held a host object, so a script that successfully reconstructs `globalThis` finds no `fetch`, no `Worker`, no `importScripts`. Not hidden — absent. Zipp also enforces an instruction budget, so a runaway loop stops itself instead of pinning a core until you abort.
+
+It costs a one-off ~1.2 MB engine download on the first package flow (lazy — nothing is fetched until then), interpreted rather than JIT-compiled execution, and a ~16 MiB ceiling on any single value crossing the boundary. The compiled flow script itself is unchanged: OAIY's generator trampoline already talks to the host through exactly the `host.call(kind, args, cb)` contract Zipp's preamble provides. See `ui/vendor/oaiy-core/src/zipp-executor.ts`.
+
+**The `cli/` runner has none of this.** It never sets a `packageId`, so flow code there executes with the CLI process's full authority — `flow-io.ts` says so explicitly and refuses custom-node packages outright. Treat `oaiy run` on a package you did not write exactly as you would `node somebody-elses-script.js`.
+
 ## Testing
 
 Four suites, one per deployable — Rust unit tests, CLI engine tests, an API
@@ -170,6 +184,7 @@ end-to-end smoke test and a browser end-to-end suite. See [`TESTING.md`](TESTING
 (cd desktop/src-tauri && cargo test)   # 28 tests, no services needed
 (cd cli && npm test)                   # 4 suites, no services needed
 (cd api && composer test)              # needs a running API + migrated DB
+(cd ui && npm test)                    # typecheck, css tokens, node contracts, zipp sandbox
 (cd ui && npm run test:e2e)            # needs `npm run dev`
 ```
 
