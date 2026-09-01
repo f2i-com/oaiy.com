@@ -31,6 +31,10 @@ const SHEETS = [
 const RUNTIME_TOKENS = new Set([
   '--accent-primary', '--accent-hover', '--accent-glow', '--accent-secondary',
   '--bg-primary', '--bg-secondary', '--bg-tertiary',
+  // Set alongside --accent-secondary in the same effect (ThemeContext.tsx),
+  // and read only by the filled-control gradient, which already spells its own
+  // fallback: var(--accent-fill, var(--accent-primary)).
+  '--accent-fill', '--accent-fill-2',
 ]);
 
 /** Tokens set on an element by a rule rather than on a theme root (e.g. --node). */
