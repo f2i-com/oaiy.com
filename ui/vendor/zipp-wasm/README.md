@@ -16,11 +16,11 @@ without a sibling checkout, so the artifact is committed rather than built.
 |---|---|
 | Source | `f2i-com/zipp.org`, `crates/zipp-wasm` |
 | Engine version | 0.0.10 |
-| Source commit | `ddbf7cd9` |
+| Source commit | `833680d8` |
 | Built with | rustc 1.92.0, wasm-bindgen 0.2.126, `--target web` |
 | Linked memory maximum | 1 GiB (16384 pages) |
 | Linked stack | 1 MiB |
-| `zipp_wasm_bg.wasm` SHA-256 | `9ccd726769f3c6551d35a6dac8242dd1e7730f4644aa510d09f55a89555cd5de` |
+| `zipp_wasm_bg.wasm` SHA-256 | `442689789c68cab875d8d3166e53987ec26b949cc305497e1e3aea92579f7258` |
 
 Post-processing matches Zipp's release pipeline: name and producers sections
 removed by `wasm-bindgen`, then the optional `target_features` section stripped.
