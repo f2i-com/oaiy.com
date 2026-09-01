@@ -23,6 +23,7 @@ import type {
 } from './types';
 import type { WorkflowGraph, WorkflowInputs, LogEntry, Flow, ProjectSettings, LocalNetworkPermissionRequest, LocalNetworkPermissionResponse, DatabaseRequest, DatabaseResult } from '../types';
 import { createRuntime, OAIYRuntime } from '../runtime';
+import type { UntrustedWorkerFactory } from '../untrusted-executor';
 import type { ModuleRegistry, LoadedModule } from '../module-types';
 import { createLogger } from '../logger';
 import { MAX_JOB_HISTORY_SIZE, FORCE_ABORT_TIMEOUT_MS, MAX_LOG_ENTRIES_PER_JOB } from '../constants';
@@ -85,6 +86,13 @@ export interface JobManagerOptions {
    * via the HTTP API behave the same as jobs triggered from the UI.
    */
   tauriInvoke?: (cmd: string, args?: Record<string, unknown>) => Promise<unknown>;
+
+  /**
+   * Builds the Worker untrusted package workflows run in. Forwarded verbatim
+   * to every runtime this manager creates; leaving it unset keeps oaiy-core's
+   * default Blob-URL Worker. `ui/` passes a Zipp-backed Worker here.
+   */
+  untrustedWorkerFactory?: UntrustedWorkerFactory;
 }
 
 /**
@@ -112,6 +120,7 @@ export class JobManager {
   private projectConstants?: Record<string, string>;
   private secretConstantNames?: Set<string>;
   private tauriInvoke?: (cmd: string, args?: Record<string, unknown>) => Promise<unknown>;
+  private untrustedWorkerFactory: UntrustedWorkerFactory | null = null;
 
   // Subscribers
   private stateSubscribers: Set<JobStateCallback> = new Set();
@@ -139,6 +148,7 @@ export class JobManager {
     this.projectConstants = options.projectConstants;
     this.secretConstantNames = options.secretConstantNames;
     this.tauriInvoke = options.tauriInvoke;
+    this.untrustedWorkerFactory = options.untrustedWorkerFactory ?? null;
     this.config = { ...DEFAULT_CONFIG, ...options.config };
   }
 
@@ -674,6 +684,13 @@ export class JobManager {
       }
       if (this.projectConstants) {
         runtime.setProjectConstants(this.projectConstants, this.secretConstantNames);
+      }
+
+      // Swap the untrusted-workflow engine if the host app supplied one. Must
+      // happen before any script runs, and it only affects hardened (package)
+      // flows — trusted local flows never reach the Worker path at all.
+      if (this.untrustedWorkerFactory) {
+        runtime.setUntrustedWorkerFactory(this.untrustedWorkerFactory);
       }
 
       // Wire the Tauri invoke broker so workflows submitted via the API can

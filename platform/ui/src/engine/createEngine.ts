@@ -26,6 +26,7 @@ import {
   type DatabaseRequest,
   type DatabaseResult,
 } from 'oaiy-core';
+import type { UntrustedWorkerFactory } from 'oaiy-core/src/untrusted-executor';
 import { invoke } from '@tauri-apps/api/core';
 import * as db from '../services/database';
 import { getFlowDatabaseManager } from '../services/database';
@@ -207,6 +208,13 @@ export interface CreateEngineOptions {
    * callers normally leave this unset.
    */
   tauriInvoke?: TauriInvoke;
+  /**
+   * Builds the Worker untrusted package workflows run in. Only the browser
+   * host supplies one (a Zipp-backed Worker, see `lib/zippPrefs.ts`); the CLI
+   * leaves it unset, both because it has no `Worker` and because its flows are
+   * trusted and never reach that path.
+   */
+  untrustedWorkerFactory?: UntrustedWorkerFactory;
 }
 
 /**
@@ -228,5 +236,8 @@ export function createEngine(opts: CreateEngineOptions = {}): JobManager {
     // (browser_v2_*, run_command, http_request, database, …). Without it they
     // fail with "Tauri not detected".
     tauriInvoke: opts.tauriInvoke ?? invoke,
+    ...(opts.untrustedWorkerFactory
+      ? { untrustedWorkerFactory: opts.untrustedWorkerFactory }
+      : {}),
   });
 }

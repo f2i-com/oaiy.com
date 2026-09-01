@@ -28,6 +28,7 @@ import {
   type LocalNetworkPermissionResponse,
 } from 'oaiy-core';
 import { createEngine } from '../engine/createEngine';
+import { zippWorkerFactory } from '../lib/zippPrefs';
 import { useApiBridge, type ApiBridgeCallbacks } from '../hooks/useApiBridge';
 import { createLogger } from '../utils/logger';
 
@@ -220,6 +221,10 @@ export function JobQueueProvider({
       projectSettings,
       projectConstants: constantsMap,
       secretConstantNames,
+      // Untrusted package workflows on the Zipp engine instead of
+      // V8-in-a-Worker, when the user has opted in (Settings → Defaults).
+      // Returns undefined when off or unsupported, which keeps the default.
+      untrustedWorkerFactory: zippWorkerFactory(),
     });
   });
 

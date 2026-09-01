@@ -62,6 +62,13 @@ export const STORAGE_KEYS = {
   /** Workflow clipboard (nodes copied between flows). */
   LEGACY_WORKFLOW_CLIPBOARD: 'oaiy_workflow_clipboard',
 
+  /**
+   * Boolean: run untrusted package workflows on the Zipp engine instead of
+   * V8-in-a-Worker (Settings → Defaults). Unset means "use the default", which
+   * is currently the V8 path — see `zippPrefs.ts`.
+   */
+  ZIPP_SANDBOX_ENABLED: 'oaiy.sandbox.zippEnabled',
+
   // -----------------------------------------------------------------
   // Bare keys (no prefix) — should never grow this list
   // -----------------------------------------------------------------

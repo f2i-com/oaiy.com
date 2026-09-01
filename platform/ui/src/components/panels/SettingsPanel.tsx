@@ -11,6 +11,11 @@ import {
   isSharingEnabled,
   setSharingEnabled,
 } from '../../lib/sharingPrefs';
+import {
+  zippSandboxEnabled,
+  zippSandboxSupported,
+  setZippSandboxEnabled,
+} from '../../lib/zippPrefs';
 
 /**
  * Renders the privacy badges for the currently-selected AI provider.
@@ -473,6 +478,9 @@ export default function SettingsPanel({
               {/* Backend sharing toggle ----------------------------- */}
               <SharingToggle />
 
+              {/* Untrusted-workflow engine -------------------------- */}
+              <ZippSandboxToggle />
+
               <div className="space-y-4 pt-4 border-t border-slate-200 dark:border-slate-700">
                 {/* Slot left for future UI/theme toggles; AppearanceTab owns
                     the live ones today. */}
@@ -685,6 +693,78 @@ export default function SettingsPanel({
 // settings — modules ship inline with their declared defaults — so the
 // component and its supporting types went with the tab. If/when a
 // settings surface for plugin modules returns, restore from git history.
+
+// ===========================================================================
+// ZippSandboxToggle — Defaults tab section that picks the engine untrusted
+// package workflows run on.
+// ===========================================================================
+//
+// Package flows already run in a Web Worker, but that Worker is a full browser
+// realm with the dangerous globals removed one name at a time — `runtime.ts`
+// and `untrusted-executor.ts` both say in their own comments that this is
+// best-effort. Zipp is a JavaScript engine compiled to WebAssembly whose guest
+// global never held a host object at all, so a script that reconstructs
+// `globalThis` there finds nothing to use.
+//
+// Off by default: it costs a ~1.2 MB engine download on the first untrusted
+// run and runs interpreted rather than JIT-compiled. State lives in
+// `localStorage` via `zippPrefs.ts` and is read when a job starts, so flipping
+// it applies to the next run without a reload.
+function ZippSandboxToggle() {
+  const supported = zippSandboxSupported();
+  const [enabled, setEnabled] = useState<boolean>(() => zippSandboxEnabled());
+
+  const toggle = useCallback(() => {
+    if (!supported) return;
+    const next = !enabled;
+    setZippSandboxEnabled(next);
+    setEnabled(next);
+  }, [supported, enabled]);
+
+  return (
+    <div className="space-y-3 pt-4 border-t border-slate-200 dark:border-slate-700">
+      <h3 className="text-sm font-medium text-slate-700 dark:text-slate-200 flex items-center gap-2">
+        <svg className="w-4 h-4" style={{ color: 'rgb(var(--accent-primary))' }} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
+        </svg>
+        Sandbox for installed packages
+      </h3>
+      <label className={`flex items-start gap-3 ${supported ? 'cursor-pointer' : 'cursor-not-allowed opacity-60'}`}>
+        <input
+          type="checkbox"
+          checked={enabled}
+          disabled={!supported}
+          onChange={toggle}
+          style={{ accentColor: 'rgb(var(--accent-primary))' }}
+          className="mt-1 w-4 h-4 rounded border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900 focus:ring-offset-white dark:focus:ring-offset-slate-800"
+        />
+        <div className="flex-1">
+          <div className="text-sm text-slate-700 dark:text-slate-200">
+            Run package flows on the Zipp engine
+          </div>
+          <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
+            Package code normally runs as JavaScript in a background worker,
+            isolated by removing the risky browser features one at a time. Zipp
+            is a separate engine that never had them: no network, no storage, no
+            way to start more workers. It also stops a runaway loop by itself
+            instead of tying up your machine.
+          </p>
+          <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
+            Costs a one-off ~1.2&nbsp;MB download the first time a package flow
+            runs, and package code runs a little slower. Your own flows are
+            unaffected — this only applies to flows from installed packages.
+          </p>
+          {!supported && (
+            <p className="text-xs text-amber-600 dark:text-amber-400 mt-1">
+              This browser cannot run the Zipp engine, so package flows keep
+              using the standard worker.
+            </p>
+          )}
+        </div>
+      </label>
+    </div>
+  );
+}
 
 // ===========================================================================
 // SharingToggle — Defaults tab section that flips the backend on/off,
