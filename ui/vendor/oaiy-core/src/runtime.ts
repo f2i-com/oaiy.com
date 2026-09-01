@@ -17,7 +17,8 @@ import {
   createAgentModule,
 } from './runtime/BuiltinModules.js';
 import { runtimeLogger, redactSensitive, formatPathForLog, type LogPathPolicy } from './logger.js';
-import { spawnUntrustedWorker } from './untrusted-executor.js';
+import { spawnUntrustedWorker, type UntrustedWorkerFactory } from './untrusted-executor.js';
+import { WORKFLOW_TRAMPOLINE } from './workflow-trampoline.js';
 import { parse as acornParse } from 'acorn';
 
 export interface RuntimeConfig {
@@ -44,6 +45,22 @@ export interface RuntimeConfig {
    * (e.g. unit tests in Node) or to debug a regression.
    */
   useWorkerForUntrusted?: boolean;
+  /**
+   * Supplies the Worker that untrusted package workflows run in, replacing the
+   * default Blob-URL Worker from `untrusted-executor.ts`.
+   *
+   * oaiy-core cannot build this itself: a Worker backed by a real module (and
+   * the WebAssembly it loads) needs bundler-resolved URLs, which only the host
+   * app has. The host contract is unchanged either way — whatever this returns
+   * must speak the same `host_call` / `host_result` / `console` / `finish` /
+   * `finish_error` protocol, so permission gating, aborts and logging behave
+   * identically no matter which engine is on the other end.
+   *
+   * `ui/` uses this to run untrusted workflows on the Zipp engine
+   * (`ui/src/workers/zipp-untrusted-worker.ts`); leaving it unset keeps the
+   * V8-in-a-Worker path.
+   */
+  untrustedWorkerFactory?: UntrustedWorkerFactory;
 }
 
 declare global {
@@ -590,6 +607,26 @@ var setImmediate = undefined;
 var queueMicrotask = undefined;
 var requestAnimationFrame = undefined;
 var requestIdleCallback = undefined;
+// The worker's OWN message channel. Neither this preamble nor the worker
+// bootstrap's egress list (untrusted-executor.ts) could shadow these before,
+// because the bootstrap needs them: it calls \`self.postMessage\` and
+// \`self.addEventListener\` to BE the host bridge. But the bootstrap reaches
+// them through \`self\`, from its own outer scope — so shadowing the BARE
+// identifiers here (function-scoped inside \`new Function\`) closes the script's
+// route without touching the bridge.
+//
+// Left open, untrusted code could speak the bridge protocol directly: forge
+// \`{type:'finish', value}\` to make the flow return an attacker-chosen result,
+// forge \`{type:'console'}\` log lines, or \`addEventListener('message')\` to read
+// \`host_result\` payloads. That is result/log integrity, not capability
+// escalation — the main-thread broker still permission-gates every \`kind\` —
+// but a package must not be able to decide what its own flow "returned".
+// \`close()\` would let it silently terminate its own run mid-flight.
+var postMessage = undefined;
+var addEventListener = undefined;
+var removeEventListener = undefined;
+var dispatchEvent = undefined;
+var close = undefined;
 // =========================================================================
 `;
 
@@ -811,6 +848,7 @@ export class OAIYRuntime {
    * when `Worker` is unavailable (e.g. Node-based unit tests).
    */
   private useWorkerForUntrusted: boolean = true;
+  private untrustedWorkerFactory: UntrustedWorkerFactory | null = null;
 
   constructor(configOrOnToken?: RuntimeConfig | StreamCallback, ...legacyArgs: unknown[]) {
     if (configOrOnToken && typeof configOrOnToken === 'object' && !('call' in configOrOnToken)) {
@@ -827,6 +865,9 @@ export class OAIYRuntime {
       this.packageMacros = config.packageMacros || [];
       this.projectSettings = config.projectSettings || {};
       this.moduleSettings = config.moduleSettings || {};
+      if (config.untrustedWorkerFactory) {
+        this.untrustedWorkerFactory = config.untrustedWorkerFactory;
+      }
       if (config.useWorkerForUntrusted !== undefined) {
         this.useWorkerForUntrusted = config.useWorkerForUntrusted;
       }
@@ -1859,6 +1900,18 @@ export class OAIYRuntime {
     }
   }
 
+  /**
+   * Replace the Worker untrusted package workflows run in.
+   *
+   * The setter exists because most callers reach `createRuntime` through its
+   * positional-argument overload, which has no `RuntimeConfig` to carry this.
+   * Equivalent to `RuntimeConfig.untrustedWorkerFactory`; see that field for
+   * the contract the returned Worker has to honour.
+   */
+  setUntrustedWorkerFactory(factory: UntrustedWorkerFactory | null): void {
+    this.untrustedWorkerFactory = factory;
+  }
+
   private getModulesShim(): string {
     let shimCode = `
 
@@ -2074,35 +2127,7 @@ function* __run_workflow() {
    return __res;
 }
 
-let __gen = __run_workflow();
-function __step(val) {
-   try {
-       let item = val === undefined ? __gen.next() : __gen.next(val);
-       if (item.done) {
-          host.call("__system.finish", [JSON.stringify(item.value)], function(){});
-          return;
-       }
-       if (item.value && item.value._kind) {
-          host.call(item.value._kind, item.value._args, function(res) {
-             if (res && typeof res === 'object' && res.__error__) {
-                 try {
-                     __gen.throw(new Error(res.__error__));
-                 } catch(e) {
-                     host.call("__system.finish_error", ["" + e], function(){});
-                 }
-             } else {
-                 __step(res);
-             }
-          });
-       } else {
-          __step();
-       }
-   } catch(e) {
-       host.call("__system.finish_error", ["" + e], function(){});
-   }
-}
-__step();
-`;
+${WORKFLOW_TRAMPOLINE}`;
 
       // ----- Worker path (mandatory for hardened mode when available) -----
       //
@@ -2192,7 +2217,7 @@ __step();
     consoleProxy: { log: (...a: unknown[]) => void; warn: (...a: unknown[]) => void; error: (...a: unknown[]) => void; debug: (...a: unknown[]) => void; info: (...a: unknown[]) => void },
     fail: (err: unknown) => void,
   ): void {
-    const { worker, cleanup } = spawnUntrustedWorker();
+    const { worker, cleanup } = (this.untrustedWorkerFactory ?? spawnUntrustedWorker)();
 
     let terminated = false;
     const tearDown = () => {
@@ -2280,7 +2305,16 @@ __step();
     });
 
     // Kick off execution.
-    worker.postMessage({ type: 'init', script: fullScript });
+    // `hardened` lets an alternative engine reproduce the in-thread path's
+    // strict mode and null-prototype `this` (see `buildZippScript`). Derived
+    // from the package context rather than passed in, so it stays correct if
+    // the routing above ever admits a non-hardened caller. The default
+    // Blob-URL Worker ignores it.
+    worker.postMessage({
+      type: 'init',
+      script: fullScript,
+      hardened: !!this.currentPackageId,
+    });
   }
 
   async runWorkflow(graph: WorkflowGraph, availableFlows?: Flow[], inputs?: WorkflowInputs): Promise<any> {
