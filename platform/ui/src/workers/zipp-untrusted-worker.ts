@@ -21,14 +21,20 @@
  *
  * # One workflow per Worker, and why that is not just tidiness
  *
- * A guest can reach allocation shapes Zipp's heap accounting does not price,
- * and those raise a WebAssembly trap rather than the intended catchable
- * `RangeError`. A trapped Engine cannot even be disposed — `dispose()` throws
- * "recursive use of an object detected" — so it would leak. The WebAssembly
- * *module* survives fine, but the only way to be sure nothing is left behind is
- * to discard the whole Worker after each run. The main thread already does
- * exactly that: `runInWorker` terminates on `finish`, `finish_error`, abort and
- * error. So a trap costs one Worker, which was going away regardless.
+ * A WebAssembly trap leaves an Engine that cannot even be disposed —
+ * `dispose()` throws "recursive use of an object detected" — so it would leak.
+ * The WebAssembly *module* survives fine, but the only way to be sure nothing
+ * is left behind is to discard the whole Worker after each run. The main thread
+ * already does exactly that: `runInWorker` terminates on `finish`,
+ * `finish_error`, abort and error. So a trap costs one Worker, which was going
+ * away regardless.
+ *
+ * Guest code could once force that trap on purpose — the heap ceiling was
+ * re-checked on an instruction stride, and one instruction can commit
+ * megabytes, so a loop of large allocations reached the module's linked memory
+ * maximum before the budget noticed. Fixed in zipp.org `833680d8`, which the
+ * vendored artifact includes; the ceiling now reports a catchable RangeError
+ * for every allocation shape.
  *
  * That is also why the module is instantiated per Worker rather than shared:
  * a fresh linear memory per workflow is the isolation, and `new Engine()` costs

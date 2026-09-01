@@ -256,12 +256,24 @@ export class ZippSession {
     try {
       await this.pump();
     } catch (e) {
-      // A WASM trap (`RuntimeError: unreachable`) lands here. It is terminal
-      // for this Engine — `dispose()` throws afterwards — but not for the
-      // module, so the Worker discards the whole instance and the next run
-      // starts clean. Guest allocation shapes that Zipp's heap accounting does
-      // not price (plain Array element storage, object property storage) can
-      // reach this instead of the intended catchable RangeError.
+      // Two things land here. The ordinary one is a resource ceiling —
+      // `RangeError: script exceeded its memory budget` or its instruction
+      // equivalent — which is sticky and terminal for the run but leaves the
+      // Engine usable.
+      //
+      // The other is a WebAssembly trap (`RuntimeError: unreachable`). That is
+      // terminal for the Engine too, and worse: `dispose()` then throws
+      // "recursive use of an object detected", so the instance leaks. The
+      // module itself survives, and the Worker is discarded after every run
+      // regardless, so a trap costs one Worker that was going away anyway.
+      //
+      // Engine builds before zipp.org `833680d8` could be driven into that
+      // trap deliberately, because the heap ceiling was re-checked on an
+      // instruction stride and a single instruction can commit megabytes. That
+      // is fixed upstream and the vendored artifact carries the fix, but the
+      // handling stays: a trap is always possible in principle, and treating
+      // one as anything other than terminal would be a way to keep using a
+      // poisoned Engine.
       this.fail(errText(e));
     }
   }
