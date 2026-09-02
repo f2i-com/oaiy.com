@@ -1,0 +1,48 @@
+# Continuous checks on every push and pull request: the web app's test chain
+# (typecheck, CSS tokens, node contracts, the Zipp sandbox against the real
+# vendored engine, and engine routing) and the CLI's engine suites. Neither
+# needs a browser, a service or a Rust toolchain; the release workflow is
+# where the desktop app gets built.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  web:
+    name: Web app tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+      - working-directory: ui
+        run: npm ci
+      - working-directory: ui
+        run: npm test
+      - name: Build
+        working-directory: ui
+        run: npm run build
+
+  cli:
+    name: CLI tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: cli/package-lock.json
+      - working-directory: cli
+        run: npm ci
+      - working-directory: cli
+        run: npm run build
+      - working-directory: cli
+        run: npm test

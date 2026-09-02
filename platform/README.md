@@ -188,6 +188,27 @@ end-to-end smoke test and a browser end-to-end suite. See [`TESTING.md`](TESTING
 (cd ui && npm run test:e2e)            # needs `npm run dev`
 ```
 
+## Releases
+
+Tag a version and GitHub Actions builds the whole release (`.github/workflows/release.yml`):
+
+```bash
+git tag 0.0.1
+git push origin 0.0.1
+```
+
+The tag is the version — it is stamped into the desktop app at build time, so no release commit is needed. The release for that tag carries:
+
+| File | What it is |
+|------|------------|
+| `oaiy-web-<v>.zip` / `.tar.gz` | The compiled static site: landing page at `/`, flow builder at `/app.html`, desktop page at `/desktop.html`. Unzip onto any static host. |
+| `oaiy-desktop-<v>-windows-x64-setup.exe`, `.msi` | OAIY Desktop for Windows |
+| `oaiy-desktop-<v>-linux-x86_64.AppImage`, `-amd64.deb`, `-x86_64.rpm` | OAIY Desktop for Linux |
+| `oaiy-server-<v>-linux-x86_64.tar.gz`, `-windows-x64.zip` | The headless server, no GUI or GTK, for hosts driven by the CLI or a hosted web app |
+| `SHA256SUMS.txt` | Checksums for everything above |
+
+The web build is standalone (`VITE_API_BASE` unset) unless a repository Actions variable named `VITE_API_BASE` is set. `.github/workflows/ci.yml` runs the web and CLI test suites on every push and pull request.
+
 ## License
 
 Licensed under the **Apache License 2.0** — see [`LICENSE`](LICENSE) and
