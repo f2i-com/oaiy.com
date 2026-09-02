@@ -246,6 +246,41 @@ async function main(): Promise<void> {
   check('  upstream reads the wired input', got?.viaUpstream === 1, `got ${JSON.stringify(got?.viaUpstream)}`);
   check('  app is declared rather than absent', got?.appKnown === true, `got ${JSON.stringify(got?.appKnown)}`);
 
+  // The block's own documentation. logic_block.json tells the user the input
+  // is `$input` and that "the last expression is returned as output", and
+  // its default snippet is written exactly that way. Neither was true: the
+  // compiler never declared `$input` (ReferenceError on every engine), and the
+  // multi-statement branches evaluated the final expression and dropped it, so
+  // the editor's default produced null. Each case below is a block a user
+  // would write from the doc, chained after a block that returns 1.
+  const documented: Array<[string, string, unknown]> = [
+    ["the editor default snippet", "// input is available as $input\nlet result = $input;\nresult", 1],
+    ["a trailing expression after statements", "const doubled = $input * 2;\nconst tripled = $input * 3;\ndoubled + tripled", 5],
+    ["`input` and `$input` are the same value", "input === $input", true],
+    ["a nested helper with its own return, and a trailing expression", "function twice(v) { return v * 2; }\ntwice($input) + 1", 3],
+    ["the word \"return\" inside a string does not make it a function", "const s = \"return this\";\ns.length + $input", 12],
+    ["a real top-level return still returns", "if ($input === 1) return \"one\";\n\"other\"", "one"],
+    ["a declaration last yields nothing, as documented", "let unused = $input;", null],
+  ];
+  for (const [label, code, expected] of documented) {
+    const result = await runFlow(
+      {
+        nodes: [
+          { id: 'start', type: 'logic_block', position: { x: 0, y: 0 }, data: { code: 'return 1;' } },
+          { id: 'doc', type: 'logic_block', position: { x: 100, y: 0 }, data: { code } },
+        ],
+        edges: [{ source: 'start', target: 'doc' }],
+      } as WorkflowGraph,
+      { timeoutMs: 30_000 }
+    );
+    const got = result.results?.['doc'];
+    check(
+      `documented block: ${label}`,
+      result.status === 'completed' && JSON.stringify(got ?? null) === JSON.stringify(expected),
+      `status=${result.status} error=${result.error ?? ''} got=${JSON.stringify(got)}`
+    );
+  }
+
   // A condition is written by the same author against the same names.
   const condVocab = await runFlow(
     {

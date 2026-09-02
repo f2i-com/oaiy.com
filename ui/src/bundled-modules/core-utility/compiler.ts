@@ -5,6 +5,77 @@
  */
 
 import type { ModuleCompiler, ModuleCompilerContext } from 'oaiy-core/src/module-types';
+import { parse as acornParse } from 'acorn';
+
+/** What a logic block's source is shaped like, read from its syntax tree. */
+interface BlockShape {
+  /** A `return` at the block's own level - not one inside a nested function. */
+  topLevelReturn: boolean;
+  /** The block's final statement, when it is a bare expression. */
+  tail: { start: number; end: number; exprStart: number; exprEnd: number } | null;
+}
+
+/**
+ * Parse a block and report the two facts the compiler branches on.
+ *
+ * Both used to be guessed from the text. `hasReturn` was `/\breturn\b/`, which
+ * also matches the word inside a string or a comment: a block containing
+ * `Function("return this")` was compiled as a returning function, so its value
+ * was `undefined` and its node simply vanished from the results. And nothing
+ * looked for the trailing expression at all, so the node's own promise - "the
+ * last expression is returned as output" - held only for a one-line block;
+ * the editor's default snippet (`let result = $input;` then `result`) produced
+ * null.
+ *
+ * `null` when the source does not parse; the caller keeps the old text-based
+ * guesses so a block that never compiled still fails the way it used to
+ * rather than in a new way.
+ */
+function analyseBlock(src: string): BlockShape | null {
+  let ast: { body: Array<Record<string, unknown>> };
+  try {
+    ast = acornParse(src, {
+      ecmaVersion: 'latest',
+      sourceType: 'script',
+      allowReturnOutsideFunction: true,
+      allowAwaitOutsideFunction: true,
+    }) as unknown as typeof ast;
+  } catch {
+    return null;
+  }
+
+  // Walk statements without descending into function or class bodies: a
+  // `return` in a nested helper belongs to the helper.
+  const hasReturn = (node: unknown): boolean => {
+    if (!node || typeof node !== 'object') return false;
+    if (Array.isArray(node)) return node.some(hasReturn);
+    const n = node as Record<string, unknown>;
+    const t = n.type;
+    if (t === 'ReturnStatement') return true;
+    if (
+      t === 'FunctionDeclaration' || t === 'FunctionExpression' || t === 'ArrowFunctionExpression' ||
+      t === 'ClassDeclaration' || t === 'ClassExpression'
+    ) return false;
+    for (const key of Object.keys(n)) {
+      if (key === 'type' || key === 'start' || key === 'end' || key === 'loc' || key === 'range') continue;
+      if (hasReturn(n[key])) return true;
+    }
+    return false;
+  };
+
+  const last = ast.body[ast.body.length - 1];
+  const tail =
+    last && last.type === 'ExpressionStatement'
+      ? {
+          start: last.start as number,
+          end: last.end as number,
+          exprStart: (last.expression as { start: number }).start,
+          exprEnd: (last.expression as { end: number }).end,
+        }
+      : null;
+
+  return { topLevelReturn: hasReturn(ast.body), tail };
+}
 
 /**
  * Is the whole block one parenthesised EXPRESSION — `(function () { … })()`
@@ -271,6 +342,13 @@ const CoreUtilityCompiler: ModuleCompiler = {
           let out = `
     let context = workflow_context;
     let input = ${inputVar};
+    // The name the node's own doc, default snippet and template promise.
+    // Every branch below inlines the block into the script with only the
+    // names declared here in scope, so a block written the documented way —
+    // \`let result = $input; result\`, the editor's default — threw
+    // "ReferenceError: $input is not defined" on both engines, and the only
+    // blocks that ran were the ones written \`input\` against the doc.
+    let $input = ${inputVar};
     // The names a graph addresses its data by. context/input above are this
     // app's spelling; these are the ones a linked provider's blocks are
     // written against, and a block reading nodes.settings throws
@@ -297,10 +375,26 @@ const CoreUtilityCompiler: ModuleCompiler = {
           return out;
         };
 
-        // Check if code has return statements - if so, wrap in IIFE for proper return behavior
-        const hasReturn = /\breturn\b/.test(userCode);
+        const shape = analyseBlock(userCode);
+        // A `return` at the block's own level decides whether it runs as a
+        // function. From the syntax tree when the block parses; the old text
+        // guess otherwise.
+        const hasReturn = shape ? shape.topLevelReturn : /\breturn\b/.test(userCode);
         // Check if code uses await - if so, use async IIFE
         const hasAwait = /\bawait\b/.test(userCode);
+        // The block's trailing expression IS its output - that is what the node
+        // promises. Rewrite that statement into a capture (an assignment for the
+        // inline branches, a `return` for the function one) so the value
+        // reaches the node instead of being evaluated and dropped.
+        const captureTail = (prefix: string): string => {
+          const tail = shape?.tail;
+          if (!tail) return userCode;
+          return (
+            userCode.slice(0, tail.start) +
+            `${prefix}(${userCode.slice(tail.exprStart, tail.exprEnd)});` +
+            userCode.slice(tail.end)
+          );
+        };
         const asyncPrefix = hasAwait ? 'async ' : '';
         const awaitPrefix = hasAwait ? 'await ' : '';
 
@@ -327,7 +421,7 @@ const CoreUtilityCompiler: ModuleCompiler = {
           // needs the await→yield transform to survive function boundaries;
           // until then, awaiting blocks should keep their returns at the top
           // level.
-          const transformedCode = userCode.split('\n').map((ln: string) => {
+          const transformedCode = captureTail(`${outputVar} = `).split('\n').map((ln: string) => {
             if (ln.trimStart().startsWith('//')) return ln;
             return ln
               .replace(/\breturn\s+([^;\n]+);?/g, `${outputVar} = ($1); break;`)
@@ -366,7 +460,7 @@ const CoreUtilityCompiler: ModuleCompiler = {
   ${letOrAssign}${outputVar} = null;
   {${scopedNames()}
     ${outputVar} = (function () {
-${userCode}
+${captureTail('return ')}
     })();
   }
   workflow_context["${node.id}"] = ${outputVar};`;
@@ -392,7 +486,7 @@ ${userCode}
   // Logic block: multi-statement with await (inline)
   ${letOrAssign}${outputVar} = null;
   {${scopedNames()}
-    ${userCode};
+    ${captureTail(`${outputVar} = `)};
   }
   workflow_context["${node.id}"] = ${outputVar};`;
           } else {
@@ -402,7 +496,7 @@ ${userCode}
   // Logic block: multi-statement (no return, inline)
   ${letOrAssign}${outputVar} = null;
   {${scopedNames()}
-    ${userCode};
+    ${captureTail(`${outputVar} = `)};
   }
   workflow_context["${node.id}"] = ${outputVar};`;
           }
