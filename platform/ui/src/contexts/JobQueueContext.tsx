@@ -28,7 +28,7 @@ import {
   type LocalNetworkPermissionResponse,
 } from 'oaiy-core';
 import { createEngine } from '../engine/createEngine';
-import { untrustedWorkerFactory } from '../lib/zippPrefs';
+import { untrustedWorkerFactory, zippSandboxEnabled } from '../lib/zippPrefs';
 import { useApiBridge, type ApiBridgeCallbacks } from '../hooks/useApiBridge';
 import { createLogger } from '../utils/logger';
 
@@ -226,6 +226,9 @@ export function JobQueueProvider({
       // passed unconditionally here even though this engine is built once —
       // resolving the toggle at this point would freeze it until a reload.
       untrustedWorkerFactory,
+      // Trusted flows go to the same Worker while the Zipp toggle is on. A
+      // function, for the same reason: consulted per job, not frozen here.
+      runTrustedFlowsInWorker: zippSandboxEnabled,
     });
   });
 

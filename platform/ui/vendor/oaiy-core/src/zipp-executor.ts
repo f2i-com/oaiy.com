@@ -160,10 +160,136 @@ ${strict}// Zipp's synchronous host bridge. It is capability-denied by default (
 // embedder never calls setSyncHostCapabilities), so this only removes a
 // misleading affordance — but an untrusted script has no business seeing it.
 var __zippHostCall = undefined;
+${ZIPP_GUEST_SHIMS}
 ${fullScript}
 }).call(${thisArg}, host, __oaiyConsole);
 `;
 }
+
+/**
+ * Host-realm APIs a code node might reach for, made safe inside the engine.
+ *
+ * Declared with `var` inside the wrapper's function scope, so they shadow
+ * Zipp's intrinsics for the flow's code and are themselves overridden by
+ * `HARDENED_SHADOW_PREAMBLE`'s `var x = undefined` when a package flow follows
+ * — hardened flows keep exactly the surface they had.
+ *
+ * Two groups:
+ *
+ *   * Pure computation the engine simply lacks — UTF-8 text coding, base64,
+ *     a structural clone, a microtask hook, a monotonic clock. Provided.
+ *   * Anything needing the event loop or the network. Replaced by a function
+ *     that throws a message naming the alternative, and NOT left as Zipp's
+ *     own. This is load-bearing for timers: Zipp's `setTimeout` with a
+ *     non-zero delay tries to sleep a thread that WebAssembly does not have,
+ *     panics with "can't sleep", and takes the whole instance down as an
+ *     unrecoverable trap. A trusted flow gets no shadow preamble, so without
+ *     this one stray `setTimeout(fn, 100)` in a code node would kill its run.
+ *
+ * `structuredClone` is a JSON round-trip: it handles the plain data flows
+ * carry and documents what it drops. `crypto` is deliberately a throwing stub
+ * rather than a `Math.random` imitation — code that asks for cryptographic
+ * randomness must not silently receive something weaker.
+ */
+const ZIPP_GUEST_SHIMS = String.raw`// ---- host-realm APIs, made safe inside the engine (see ZIPP_GUEST_SHIMS) ----
+var __oaiyUnavailable = function (name, hint) {
+  return function () {
+    throw new TypeError(name + " is not available inside the Zipp sandbox. " + hint);
+  };
+};
+var __oaiyNoTimers = "Flow code resumes through node calls, not timers; put the work after an await on a node instead.";
+var __oaiyNoNet = "Use an HTTP Request node so the host can apply its network policy.";
+var setTimeout = __oaiyUnavailable("setTimeout", __oaiyNoTimers);
+var setInterval = __oaiyUnavailable("setInterval", __oaiyNoTimers);
+var setImmediate = __oaiyUnavailable("setImmediate", __oaiyNoTimers);
+var requestAnimationFrame = __oaiyUnavailable("requestAnimationFrame", __oaiyNoTimers);
+var requestIdleCallback = __oaiyUnavailable("requestIdleCallback", __oaiyNoTimers);
+var clearTimeout = function () {};
+var clearInterval = function () {};
+var fetch = __oaiyUnavailable("fetch", __oaiyNoNet);
+var XMLHttpRequest = __oaiyUnavailable("XMLHttpRequest", __oaiyNoNet);
+var WebSocket = __oaiyUnavailable("WebSocket", __oaiyNoNet);
+var EventSource = __oaiyUnavailable("EventSource", __oaiyNoNet);
+var importScripts = __oaiyUnavailable("importScripts", "Flow code cannot load scripts.");
+var Worker = __oaiyUnavailable("Worker", "Flow code cannot start workers.");
+var crypto = {
+  getRandomValues: __oaiyUnavailable("crypto.getRandomValues", "The sandbox has no entropy source; generate secrets in a node on the host."),
+  randomUUID: __oaiyUnavailable("crypto.randomUUID", "The sandbox has no entropy source; generate ids in a node on the host."),
+  subtle: undefined
+};
+var queueMicrotask = function (fn) { Promise.resolve().then(fn); };
+var __oaiyT0 = Date.now();
+var performance = { now: function () { return Date.now() - __oaiyT0; } };
+var structuredClone = function (value) {
+  // Plain data only: functions and undefined are dropped, Map/Set/Date become
+  // {} / {} / an ISO string, exactly as JSON does. Flows carry JSON-shaped
+  // values across nodes, so that is the shape this needs to clone.
+  return value === undefined ? undefined : JSON.parse(JSON.stringify(value));
+};
+var TextEncoder = function TextEncoder() { this.encoding = "utf-8"; };
+TextEncoder.prototype.encode = function (input) {
+  var s = String(input === undefined ? "" : input);
+  var out = [];
+  for (var i = 0; i < s.length; i++) {
+    var c = s.charCodeAt(i);
+    if (c >= 0xd800 && c <= 0xdbff && i + 1 < s.length) {
+      var d = s.charCodeAt(i + 1);
+      if (d >= 0xdc00 && d <= 0xdfff) { c = 0x10000 + ((c - 0xd800) << 10) + (d - 0xdc00); i++; }
+    }
+    if (c >= 0xd800 && c <= 0xdfff) c = 0xfffd;
+    if (c < 0x80) out.push(c);
+    else if (c < 0x800) out.push(0xc0 | (c >> 6), 0x80 | (c & 63));
+    else if (c < 0x10000) out.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 63), 0x80 | (c & 63));
+    else out.push(0xf0 | (c >> 18), 0x80 | ((c >> 12) & 63), 0x80 | ((c >> 6) & 63), 0x80 | (c & 63));
+  }
+  return new Uint8Array(out);
+};
+var TextDecoder = function TextDecoder(label) {
+  var l = String(label || "utf-8").toLowerCase();
+  if (l !== "utf-8" && l !== "utf8") throw new RangeError("TextDecoder: only utf-8 is available inside the Zipp sandbox");
+  this.encoding = "utf-8";
+};
+TextDecoder.prototype.decode = function (input) {
+  if (input === undefined) return "";
+  var b = input instanceof Uint8Array ? input : new Uint8Array(input.buffer ? input.buffer : input);
+  var s = "";
+  for (var i = 0; i < b.length;) {
+    var c = b[i++], cp;
+    if (c < 0x80) cp = c;
+    else if (c < 0xe0) cp = ((c & 31) << 6) | (b[i++] & 63);
+    else if (c < 0xf0) cp = ((c & 15) << 12) | ((b[i++] & 63) << 6) | (b[i++] & 63);
+    else cp = ((c & 7) << 18) | ((b[i++] & 63) << 12) | ((b[i++] & 63) << 6) | (b[i++] & 63);
+    if (cp > 0xffff) { cp -= 0x10000; s += String.fromCharCode(0xd800 + (cp >> 10), 0xdc00 + (cp & 1023)); }
+    else s += String.fromCharCode(cp);
+  }
+  return s;
+};
+var __oaiyB64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+var btoa = function (input) {
+  var s = String(input), out = "";
+  for (var i = 0; i < s.length; i += 3) {
+    var a = s.charCodeAt(i), b = s.charCodeAt(i + 1), c = s.charCodeAt(i + 2);
+    if (a > 255 || (b === b && b > 255) || (c === c && c > 255)) throw new Error("btoa: string contains characters outside the Latin1 range");
+    var n = (a << 16) | ((b || 0) << 8) | (c || 0);
+    out += __oaiyB64[(n >> 18) & 63] + __oaiyB64[(n >> 12) & 63] +
+      (i + 1 < s.length ? __oaiyB64[(n >> 6) & 63] : "=") +
+      (i + 2 < s.length ? __oaiyB64[n & 63] : "=");
+  }
+  return out;
+};
+var atob = function (input) {
+  var s = String(input).replace(/[\t\n\f\r ]/g, "");
+  if (s.length % 4 === 1 || /[^A-Za-z0-9+\/=]/.test(s.replace(/=+$/, ""))) throw new Error("atob: the string is not correctly encoded");
+  s = s.replace(/=+$/, "");
+  var out = "", bits = 0, acc = 0;
+  for (var i = 0; i < s.length; i++) {
+    acc = (acc << 6) | __oaiyB64.indexOf(s[i]);
+    bits += 6;
+    if (bits >= 8) { bits -= 8; out += String.fromCharCode((acc >> bits) & 255); }
+  }
+  return out;
+};
+// ---- end host-realm shims ----`;
 
 /**
  * Reject a script whose module names would collide with Zipp's preamble.

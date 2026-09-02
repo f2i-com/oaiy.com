@@ -61,6 +61,22 @@ export interface RuntimeConfig {
    * V8-in-a-Worker path.
    */
   untrustedWorkerFactory?: UntrustedWorkerFactory;
+  /**
+   * Also send TRUSTED local flows to `untrustedWorkerFactory`'s Worker, not
+   * just package flows.
+   *
+   * Off, a user's own flow runs in-thread on the host engine — there is
+   * nothing to isolate it from, and it keeps every host-realm global. On, it
+   * runs on whatever engine the factory supplies (Zipp, in `ui/`), which
+   * bounds its CPU and memory and takes the host's ambient capabilities out of
+   * reach of a code node. Permission gating is unchanged: a trusted flow still
+   * has no package context, so the broker still grants it every module call.
+   *
+   * Requires a factory. The default Blob-URL Worker is never used for trusted
+   * flows: it exists to contain package code, and would strip a trusted flow
+   * of host globals for no isolation gain.
+   */
+  runTrustedFlowsInWorker?: boolean;
 }
 
 declare global {
@@ -849,6 +865,7 @@ export class OAIYRuntime {
    */
   private useWorkerForUntrusted: boolean = true;
   private untrustedWorkerFactory: UntrustedWorkerFactory | null = null;
+  private runTrustedFlowsInWorker: boolean = false;
 
   constructor(configOrOnToken?: RuntimeConfig | StreamCallback, ...legacyArgs: unknown[]) {
     if (configOrOnToken && typeof configOrOnToken === 'object' && !('call' in configOrOnToken)) {
@@ -867,6 +884,9 @@ export class OAIYRuntime {
       this.moduleSettings = config.moduleSettings || {};
       if (config.untrustedWorkerFactory) {
         this.untrustedWorkerFactory = config.untrustedWorkerFactory;
+      }
+      if (config.runTrustedFlowsInWorker !== undefined) {
+        this.runTrustedFlowsInWorker = config.runTrustedFlowsInWorker;
       }
       if (config.useWorkerForUntrusted !== undefined) {
         this.useWorkerForUntrusted = config.useWorkerForUntrusted;
@@ -1912,6 +1932,11 @@ export class OAIYRuntime {
     this.untrustedWorkerFactory = factory;
   }
 
+  /** Equivalent to `RuntimeConfig.runTrustedFlowsInWorker`; see that field. */
+  setRunTrustedFlowsInWorker(enabled: boolean): void {
+    this.runTrustedFlowsInWorker = enabled;
+  }
+
   private getModulesShim(): string {
     let shimCode = `
 
@@ -2152,7 +2177,13 @@ ${WORKFLOW_TRAMPOLINE}`;
         typeof Blob !== 'undefined' &&
         typeof URL !== 'undefined' &&
         typeof URL.createObjectURL === 'function';
-      const canUseWorker = isHardened && this.useWorkerForUntrusted && workerAvailable;
+      // Trusted flows take the Worker path only when the host asked for it AND
+      // supplied an engine. Nothing about the hardened decision changes: that
+      // branch still fails closed below if no Worker can be had.
+      const trustedWantsWorker =
+        !isHardened && this.runTrustedFlowsInWorker && this.untrustedWorkerFactory !== null;
+      const canUseWorker =
+        ((isHardened && this.useWorkerForUntrusted) || trustedWantsWorker) && workerAvailable;
 
       if (canUseWorker) {
         try {

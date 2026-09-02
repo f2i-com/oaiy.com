@@ -93,6 +93,13 @@ export interface JobManagerOptions {
    * default Blob-URL Worker. `ui/` passes a Zipp-backed Worker here.
    */
   untrustedWorkerFactory?: UntrustedWorkerFactory;
+
+  /**
+   * Whether a job's TRUSTED flow should also run in that Worker. A function is
+   * consulted per job — a runtime is built for every job, so a Settings toggle
+   * read here applies to the next run without a reload.
+   */
+  runTrustedFlowsInWorker?: boolean | (() => boolean);
 }
 
 /**
@@ -121,6 +128,7 @@ export class JobManager {
   private secretConstantNames?: Set<string>;
   private tauriInvoke?: (cmd: string, args?: Record<string, unknown>) => Promise<unknown>;
   private untrustedWorkerFactory: UntrustedWorkerFactory | null = null;
+  private runTrustedFlowsInWorker: boolean | (() => boolean) = false;
 
   // Subscribers
   private stateSubscribers: Set<JobStateCallback> = new Set();
@@ -149,6 +157,7 @@ export class JobManager {
     this.secretConstantNames = options.secretConstantNames;
     this.tauriInvoke = options.tauriInvoke;
     this.untrustedWorkerFactory = options.untrustedWorkerFactory ?? null;
+    this.runTrustedFlowsInWorker = options.runTrustedFlowsInWorker ?? false;
     this.config = { ...DEFAULT_CONFIG, ...options.config };
   }
 
@@ -691,6 +700,8 @@ export class JobManager {
       // flows — trusted local flows never reach the Worker path at all.
       if (this.untrustedWorkerFactory) {
         runtime.setUntrustedWorkerFactory(this.untrustedWorkerFactory);
+        const trusted = this.runTrustedFlowsInWorker;
+        runtime.setRunTrustedFlowsInWorker(typeof trusted === 'function' ? trusted() : trusted);
       }
 
       // Wire the Tauri invoke broker so workflows submitted via the API can

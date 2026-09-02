@@ -215,6 +215,8 @@ export interface CreateEngineOptions {
    * trusted and never reach that path.
    */
   untrustedWorkerFactory?: UntrustedWorkerFactory;
+  /** Also run trusted local flows in that Worker; consulted per job. */
+  runTrustedFlowsInWorker?: boolean | (() => boolean);
 }
 
 /**
@@ -237,7 +239,10 @@ export function createEngine(opts: CreateEngineOptions = {}): JobManager {
     // fail with "Tauri not detected".
     tauriInvoke: opts.tauriInvoke ?? invoke,
     ...(opts.untrustedWorkerFactory
-      ? { untrustedWorkerFactory: opts.untrustedWorkerFactory }
+      ? {
+          untrustedWorkerFactory: opts.untrustedWorkerFactory,
+          runTrustedFlowsInWorker: opts.runTrustedFlowsInWorker ?? false,
+        }
       : {}),
   });
 }
