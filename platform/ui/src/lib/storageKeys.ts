@@ -65,7 +65,7 @@ export const STORAGE_KEYS = {
   /**
    * Boolean: run untrusted package workflows on the Zipp engine instead of
    * V8-in-a-Worker (Settings → Defaults). Unset means "use the default", which
-   * is currently the V8 path — see `zippPrefs.ts`.
+   * is Zipp — see `zippPrefs.ts`.
    */
   ZIPP_SANDBOX_ENABLED: 'oaiy.sandbox.zippEnabled',
 

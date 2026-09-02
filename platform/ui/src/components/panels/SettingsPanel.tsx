@@ -706,9 +706,10 @@ export default function SettingsPanel({
 // global never held a host object at all, so a script that reconstructs
 // `globalThis` there finds nothing to use.
 //
-// Off by default: it costs a ~1.2 MB engine download on the first untrusted
-// run and runs interpreted rather than JIT-compiled. State lives in
-// `localStorage` via `zippPrefs.ts` and is read when a job starts, so flipping
+// On by default. It costs a ~1.2 MB engine download on the first untrusted
+// run and runs interpreted rather than JIT-compiled, so the toggle is the
+// escape hatch for a package flow that trips over one of those. State lives in
+// `localStorage` via `zippPrefs.ts` and is read when a run starts, so flipping
 // it applies to the next run without a reload.
 function ZippSandboxToggle() {
   const supported = zippSandboxSupported();
@@ -750,9 +751,11 @@ function ZippSandboxToggle() {
             instead of tying up your machine.
           </p>
           <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
-            Costs a one-off ~1.2&nbsp;MB download the first time a package flow
-            runs, and package code runs a little slower. Your own flows are
-            unaffected — this only applies to flows from installed packages.
+            On by default. Costs a one-off ~1.2&nbsp;MB download the first time
+            a package flow runs, and package code runs a little slower. Turn it
+            off to run package flows in the standard worker instead. Your own
+            flows are unaffected — this only applies to flows from installed
+            packages.
           </p>
           {!supported && (
             <p className="text-xs text-amber-600 dark:text-amber-400 mt-1">

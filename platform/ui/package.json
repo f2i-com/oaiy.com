@@ -12,9 +12,10 @@
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "test:e2e": "node tests/e2e.mjs",
     "test:css": "node tests/css-tokens.mjs",
-    "test": "npm run typecheck && npm run test:css && npm run test:contracts && npm run test:zipp",
+    "test": "npm run typecheck && npm run test:css && npm run test:contracts && npm run test:zipp && npm run test:zipp-routing",
     "test:contracts": "node tests/node-contracts.mjs",
-    "test:zipp": "node tests/zipp-executor.mjs"
+    "test:zipp": "node tests/zipp-executor.mjs",
+    "test:zipp-routing": "node tests/zipp-routing.mjs"
   },
   "dependencies": {
     "@ffmpeg/core": "^0.12.10",
