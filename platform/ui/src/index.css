@@ -1004,7 +1004,7 @@ select,
 
 /* Staggered entrance — pair with an inline animation-delay. */
 @keyframes lp-fade-up {
-  from { opacity: 0; transform: translateY(18px); }
+  from { opacity: 0; transform: translateY(14px); }
   to   { opacity: 1; transform: translateY(0); }
 }
 .lp-reveal {
@@ -1012,49 +1012,159 @@ select,
   animation: lp-fade-up 0.7s cubic-bezier(0.22, 0.7, 0.2, 1) forwards;
 }
 
-/* One-time draw-in for the hero graph edges (pair with stroke-dasharray
-   + a large stroke-dashoffset set inline). */
+/* ---------- the hero run ----------
+   One shared 6.4 s timeline, expressed per node as keyframes over the status
+   light's fill and the card's outline. Percentages are seconds/6.4:
 
-/* Continuous "data flowing" shimmer along an edge. */
-@keyframes lp-flow {
-  to { stroke-dashoffset: -64; }
+     image_gen  runs 0.0–0.8   → done      runs again 3.2–4.0 → done
+     ai_llm     runs 0.9–1.9   → done      runs again 4.1–5.1 → done
+     condition  runs 2.0–2.5   → False     runs again 5.2–5.6 → True
+     output                                runs 5.7–6.1 → done
+
+   Every lane uses the same duration and delay so they stay in step. Wires
+   light while data is on them; the False wire marches only during the loop.
+   `both` holds the first frame through the delay, so nothing flashes in
+   before the run starts. */
+.lp-status, .lp-card, .lp-wire, .lp-wire-true, .lp-wire-false,
+.lp-run-dot, .lp-run-label {
+  animation-duration: 6.4s;
+  animation-timing-function: linear;
+  animation-delay: 0.9s;
+  animation-fill-mode: both;
 }
-.lp-edge-flow {
-  stroke-dasharray: 5 11;
-  animation: lp-flow 1.4s linear infinite;
+.lp-status { fill: rgb(var(--color-border-strong)); }
+.lp-card {
+  stroke: rgb(var(--color-border-strong));
+  stroke-width: 1.2;
+}
+.lp-status.lp-run-a { animation-name: lp-st-a; }
+.lp-status.lp-run-b { animation-name: lp-st-b; }
+.lp-status.lp-run-c { animation-name: lp-st-c; }
+.lp-status.lp-run-d { animation-name: lp-st-d; }
+.lp-card.lp-run-a { animation-name: lp-cd-a; }
+.lp-card.lp-run-b { animation-name: lp-cd-b; }
+.lp-card.lp-run-c { animation-name: lp-cd-c; }
+.lp-card.lp-run-d { animation-name: lp-cd-d; }
+
+@keyframes lp-st-a {
+  0%, 12% { fill: rgb(var(--accent-primary)); }
+  13%, 50% { fill: rgb(var(--signal-green)); }
+  51%, 62% { fill: rgb(var(--accent-primary)); }
+  63%, 100% { fill: rgb(var(--signal-green)); }
+}
+@keyframes lp-cd-a {
+  0%, 12% { stroke: rgb(var(--accent-primary)); stroke-width: 2; }
+  13%, 50% { stroke: rgb(var(--color-border-strong)); stroke-width: 1.2; }
+  51%, 62% { stroke: rgb(var(--accent-primary)); stroke-width: 2; }
+  63%, 100% { stroke: rgb(var(--color-border-strong)); stroke-width: 1.2; }
+}
+@keyframes lp-st-b {
+  0%, 14% { fill: rgb(var(--color-border-strong)); }
+  15%, 29% { fill: rgb(var(--accent-primary)); }
+  30%, 63% { fill: rgb(var(--signal-green)); }
+  64%, 79% { fill: rgb(var(--accent-primary)); }
+  80%, 100% { fill: rgb(var(--signal-green)); }
+}
+@keyframes lp-cd-b {
+  0%, 14% { stroke: rgb(var(--color-border-strong)); stroke-width: 1.2; }
+  15%, 29% { stroke: rgb(var(--accent-primary)); stroke-width: 2; }
+  30%, 63% { stroke: rgb(var(--color-border-strong)); stroke-width: 1.2; }
+  64%, 79% { stroke: rgb(var(--accent-primary)); stroke-width: 2; }
+  80%, 100% { stroke: rgb(var(--color-border-strong)); stroke-width: 1.2; }
+}
+@keyframes lp-st-c {
+  0%, 31% { fill: rgb(var(--color-border-strong)); }
+  32%, 38% { fill: rgb(var(--accent-primary)); }
+  39%, 80% { fill: rgb(var(--signal-amber)); }
+  81%, 86% { fill: rgb(var(--accent-primary)); }
+  87%, 100% { fill: rgb(var(--signal-green)); }
+}
+@keyframes lp-cd-c {
+  0%, 31% { stroke: rgb(var(--color-border-strong)); stroke-width: 1.2; }
+  32%, 38% { stroke: rgb(var(--accent-primary)); stroke-width: 2; }
+  39%, 80% { stroke: rgb(var(--color-border-strong)); stroke-width: 1.2; }
+  81%, 86% { stroke: rgb(var(--accent-primary)); stroke-width: 2; }
+  87%, 100% { stroke: rgb(var(--color-border-strong)); stroke-width: 1.2; }
+}
+@keyframes lp-st-d {
+  0%, 88% { fill: rgb(var(--color-border-strong)); }
+  89%, 94% { fill: rgb(var(--accent-primary)); }
+  95%, 100% { fill: rgb(var(--signal-green)); }
+}
+@keyframes lp-cd-d {
+  0%, 88% { stroke: rgb(var(--color-border-strong)); stroke-width: 1.2; }
+  89%, 94% { stroke: rgb(var(--accent-primary)); stroke-width: 2; }
+  95%, 100% { stroke: rgb(var(--signal-green)); stroke-width: 1.6; }
 }
 
-/* Slow breathing for the ambient hero halo. */
-@keyframes lp-breathe {
-  0%, 100% { transform: translate(-50%, -50%) scale(1); opacity: 0.16; }
-  50%      { transform: translate(-50%, -50%) scale(1.06); opacity: 0.22; }
+.lp-wire {
+  fill: none;
+  stroke: rgb(var(--color-text-tertiary) / 0.55);
+  stroke-width: 2;
 }
-.lp-halo {
-  animation: lp-breathe 9s ease-in-out infinite;
+.lp-wire-1 { animation-name: lp-w1; }
+.lp-wire-2 { animation-name: lp-w2; }
+@keyframes lp-w1 {
+  0%, 11% { stroke: rgb(var(--color-text-tertiary) / 0.55); }
+  12%, 15% { stroke: rgb(var(--accent-primary)); }
+  16%, 61% { stroke: rgb(var(--color-text-tertiary) / 0.55); }
+  62%, 65% { stroke: rgb(var(--accent-primary)); }
+  66%, 100% { stroke: rgb(var(--color-text-tertiary) / 0.55); }
+}
+@keyframes lp-w2 {
+  0%, 28% { stroke: rgb(var(--color-text-tertiary) / 0.55); }
+  29%, 32% { stroke: rgb(var(--accent-primary)); }
+  33%, 78% { stroke: rgb(var(--color-text-tertiary) / 0.55); }
+  79%, 82% { stroke: rgb(var(--accent-primary)); }
+  83%, 100% { stroke: rgb(var(--color-text-tertiary) / 0.55); }
+}
+.lp-wire-true { animation-name: lp-wt; }
+@keyframes lp-wt {
+  0%, 86% { opacity: 0.3; }
+  87%, 100% { opacity: 1; }
+}
+.lp-wire-false { animation-name: lp-wf; }
+@keyframes lp-wf {
+  0%, 38% { opacity: 0.4; }
+  39%, 50% { opacity: 1; }
+  51%, 100% { opacity: 0.4; }
+}
+/* The False wire marches only while the loop is live. */
+@keyframes lp-edge-march { to { stroke-dashoffset: -26; } }
+.lp-edge-flow { animation: lp-edge-march 0.9s linear infinite; }
+.lp-wire-label {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.04em;
 }
 
-/* Gentle node bob, offset per-node via inline animation-delay. */
-@keyframes lp-bob {
-  0%, 100% { transform: translateY(0); }
-  50%      { transform: translateY(-4px); }
+/* Run chip in the window bar: a pulse while running, a settled line once done. */
+.lp-run-chip {
+  align-items: center;
+  gap: 7px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: rgb(var(--color-text-secondary));
 }
-.lp-node-bob {
-  animation: lp-bob 5s ease-in-out infinite;
+.lp-run-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 999px;
+  background: rgb(var(--accent-primary));
+  animation-name: lp-run-dot;
 }
-
-/* Marquee for the engines strip. The track is duplicated in markup so the
-   -50% translate loops seamlessly. */
-@keyframes lp-marquee {
-  from { transform: translateX(0); }
-  to   { transform: translateX(-50%); }
+@keyframes lp-run-dot {
+  0%, 94% { background: rgb(var(--accent-primary)); }
+  95%, 100% { background: rgb(var(--signal-green)); }
 }
-.lp-marquee-track {
-  animation: lp-marquee 32s linear infinite;
-}
-.lp-marquee-mask {
-  -webkit-mask-image: linear-gradient(to right, transparent, #000 8%, #000 92%, transparent);
-  mask-image: linear-gradient(to right, transparent, #000 8%, #000 92%, transparent);
-}
+/* Both labels share one grid cell, so the chip is sized by the longer of the
+   two and the swap happens in place instead of overflowing the bar. */
+.lp-run-chip { display: inline-grid; grid-template-columns: auto auto; }
+.lp-run-label { grid-column: 2; grid-row: 1; white-space: nowrap; }
+.lp-run-label-running { animation-name: lp-run-lr; }
+.lp-run-label-done { animation-name: lp-run-ld; }
+@keyframes lp-run-lr { 0%, 94% { opacity: 1; } 95%, 100% { opacity: 0; } }
+@keyframes lp-run-ld { 0%, 94% { opacity: 0; } 95%, 100% { opacity: 1; } }
 
 /* ============================================
    REDUCED MOTION
@@ -1080,6 +1190,13 @@ select,
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
     scroll-behavior: auto !important;
+  }
+
+  /* The landing hero's run lanes have a start delay so they stay in step;
+     with motion reduced they should simply arrive finished, not idle first. */
+  .lp-status, .lp-card, .lp-wire, .lp-wire-true, .lp-wire-false,
+  .lp-run-dot, .lp-run-label {
+    animation-delay: 0s !important;
   }
 
   /* Spinners and "alive" pulses still need to convey activity. */
@@ -1834,47 +1951,454 @@ select,
   text-transform: uppercase;
 }
 
-/* Section eyebrow + heading — the prototype's .kicker / .page-intro h2 pair. */
-.lp-kicker {
-  display: block;
-  color: rgb(var(--accent-primary));
-  font-size: 10px;
-  font-weight: 720;
-  letter-spacing: 0.13em;
-  text-transform: uppercase;
+/* ---------- landing type scale ----------
+   One family (Inter) carries display and text; the display voice is weight
+   and negative tracking, not a second face. JetBrains Mono is reserved for
+   machine facts. Measures stay under ~65 characters. */
+.lp-h1 {
+  font-weight: 640;
+  letter-spacing: -0.045em;
+  line-height: 1.0;
+  font-size: clamp(2.7rem, 7vw, 5.25rem);
+  color: rgb(var(--color-text-primary));
+  text-wrap: balance;
+  max-width: 14ch;
 }
 .lp-h2 {
-  margin: 10px 0 0;
-  font-size: clamp(1.75rem, 3.2vw, 2.5rem);
+  margin: 0;
+  font-size: clamp(1.75rem, 3vw, 2.25rem);
   font-weight: 620;
-  letter-spacing: -0.035em;
-  line-height: 1.08;
+  letter-spacing: -0.03em;
+  line-height: 1.1;
   color: rgb(var(--color-text-primary));
+  text-wrap: balance;
 }
-.lp-h1 {
-  font-weight: 620;
-  letter-spacing: -0.045em;
-  line-height: 1.02;
-  font-size: clamp(2.6rem, 6vw, 4.4rem);
-  color: rgb(var(--color-text-primary));
+.lp-lede {
+  font-size: clamp(1.05rem, 1.4vw, 1.25rem);
+  line-height: 1.55;
+  color: rgb(var(--color-text-secondary));
+  max-width: 34rem;
 }
 
-/* (The hero graph is drawn as inline SVG in LandingPage.tsx — the HTML node
-   card rules that used to live here never matched and were removed.) */
+/* ---------- sections: a heading rail beside the content ---------- */
+.lp-section {
+  padding: 4.5rem 0;
+}
+@media (min-width: 640px) { .lp-section { padding: 6rem 0; } }
+.lp-section + .lp-section { border-top: 1px solid rgb(var(--color-border-secondary)); }
+.lp-rail {
+  position: relative;
+  padding-left: 1.1rem;
+}
+.lp-rail::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 0.35rem;
+  bottom: 0.25rem;
+  width: 3px;
+  border-radius: 3px;
+  background: rgb(var(--tone));
+}
+@media (min-width: 1024px) {
+  .lp-rail { position: sticky; top: 5.5rem; align-self: start; }
+}
+.lp-rail-sub {
+  margin-top: 0.9rem;
+  font-size: 0.975rem;
+  line-height: 1.55;
+  color: rgb(var(--color-text-secondary));
+  max-width: 30rem;
+}
 
-/* Pill used for the hero status chip and the feature tags. */
-.lp-pill {
+/* ---------- definition list (Why, Desktop features) ---------- */
+.lp-defs {
+  display: grid;
+  gap: 1.75rem 2.5rem;
+  margin: 0;
+}
+@media (min-width: 640px) { .lp-defs { grid-template-columns: 1fr 1fr; } }
+.lp-defs-tight { gap: 1.25rem 2rem; }
+.lp-def {
+  border-top: 2px solid rgb(var(--tone) / 0.7);
+  padding-top: 0.9rem;
+}
+.lp-def dt {
+  font-weight: 620;
+  letter-spacing: -0.01em;
+  font-size: 1.05rem;
+  color: rgb(var(--color-text-primary));
+}
+.lp-def dd {
+  margin: 0.4rem 0 0;
+  font-size: 0.95rem;
+  line-height: 1.55;
+  color: rgb(var(--color-text-secondary));
+  max-width: 34rem;
+}
+
+/* ---------- engines strip ---------- */
+.lp-engines {
+  padding: 1.6rem 0;
+  border-top: 1px solid rgb(var(--color-border-secondary));
+  border-bottom: 1px solid rgb(var(--color-border-secondary));
+  background: rgb(var(--color-bg-secondary) / 0.35);
+}
+.lp-engines-lead {
+  flex-shrink: 0;
+  font-size: 0.95rem;
+  color: rgb(var(--color-text-secondary));
+}
+.lp-engine {
+  padding: 0.35rem 0.75rem;
+  border-radius: 999px;
+  border: 1px solid rgb(var(--color-border-primary));
+  background: rgb(var(--color-bg-elevated));
+  color: rgb(var(--color-text-secondary));
+  font-size: 0.85rem;
+  white-space: nowrap;
+}
+
+/* ---------- the palette, drawn the way the app draws it ----------
+   A family is a colour bar and a name; its nodes are the ids the palette
+   lists, in the mono the app uses for them. */
+.lp-palette {
+  display: grid;
+  gap: 1.25rem;
+}
+@media (min-width: 640px) { .lp-palette { grid-template-columns: 1fr 1fr; } }
+.lp-family {
+  padding: 1rem 1.1rem 1.1rem;
+  border-radius: 10px;
+  border: 1px solid rgb(var(--color-border-secondary));
+  background: rgb(var(--color-bg-elevated) / 0.6);
+}
+.lp-family-head {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+}
+.lp-swatch {
+  width: 4px;
+  height: 22px;
+  border-radius: 999px;
+  background: rgb(var(--tone));
+  flex-shrink: 0;
+}
+.lp-family h3 {
+  font-weight: 620;
+  font-size: 1rem;
+  letter-spacing: -0.01em;
+  color: rgb(var(--color-text-primary));
+}
+.lp-family p {
+  margin: 0.55rem 0 0;
+  font-size: 0.9rem;
+  line-height: 1.5;
+  color: rgb(var(--color-text-secondary));
+}
+.lp-nodes {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  margin-top: 0.8rem;
+}
+.lp-nodes li {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.01em;
+  padding: 0.2rem 0.5rem;
+  border-radius: 6px;
+  color: rgb(var(--tone));
+  background: rgb(var(--tone) / 0.1);
+}
+
+/* ---------- how it works: a real sequence, so it is numbered ---------- */
+.lp-steps {
+  display: grid;
+  gap: 1.5rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  counter-reset: lp-step;
+}
+@media (min-width: 768px) { .lp-steps { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 2rem; } }
+.lp-step {
+  position: relative;
+  padding-top: 1rem;
+  border-top: 2px solid rgb(var(--tone) / 0.7);
+}
+.lp-step-n {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
-  border: 1px solid rgb(var(--accent-primary) / 0.35);
+  justify-content: center;
+  width: 1.6rem;
+  height: 1.6rem;
   border-radius: 999px;
-  background: rgb(var(--accent-primary) / 0.14);
-  color: rgb(var(--accent-primary));
-  padding: 5px 11px;
-  font-size: 11px;
-  font-weight: 560;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: rgb(var(--tone));
+  background: rgb(var(--tone) / 0.12);
 }
+.lp-step h3 {
+  margin-top: 0.75rem;
+  font-weight: 620;
+  font-size: 1.05rem;
+  letter-spacing: -0.01em;
+  color: rgb(var(--color-text-primary));
+}
+.lp-step p {
+  margin-top: 0.4rem;
+  font-size: 0.95rem;
+  line-height: 1.55;
+  color: rgb(var(--color-text-secondary));
+}
+
+/* ---------- privacy checklist ---------- */
+.lp-checks {
+  display: grid;
+  gap: 1.25rem 2rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+@media (min-width: 640px) { .lp-checks { grid-template-columns: 1fr 1fr; } }
+.lp-checks li { display: flex; gap: 0.8rem; }
+.lp-check {
+  margin-top: 0.15rem;
+  display: inline-flex;
+  width: 1.4rem;
+  height: 1.4rem;
+  flex-shrink: 0;
+  align-items: center;
+  justify-content: center;
+  border-radius: 999px;
+  color: rgb(var(--tone));
+  background: rgb(var(--tone) / 0.14);
+}
+.lp-checks h3 {
+  font-weight: 620;
+  font-size: 1rem;
+  letter-spacing: -0.01em;
+  color: rgb(var(--color-text-primary));
+}
+.lp-checks p {
+  margin-top: 0.3rem;
+  font-size: 0.925rem;
+  line-height: 1.5;
+  color: rgb(var(--color-text-secondary));
+}
+
+/* ---------- framed "window" surfaces (hero canvas, desktop diagram, API sample) ---------- */
+.lp-window {
+  border-radius: 14px;
+  border: 1px solid rgb(var(--color-border-primary));
+  background: rgb(var(--color-bg-elevated));
+  box-shadow: var(--shadow-md);
+  overflow: hidden;
+}
+.lp-window-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.55rem 0.9rem;
+  border-bottom: 1px solid rgb(var(--color-border-secondary));
+  background: rgb(var(--color-bg-tertiary) / 0.5);
+}
+.lp-window-file {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: rgb(var(--color-text-tertiary));
+}
+.lp-canvas {
+  background-color: rgb(var(--color-bg-canvas));
+  overflow-x: auto;
+}
+.lp-canvas-svg {
+  display: block;
+  width: 100%;
+  min-width: 640px;
+  height: auto;
+}
+.lp-code {
+  margin: 0;
+  padding: 1rem 1.1rem;
+  overflow-x: auto;
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  line-height: 1.75;
+  color: rgb(var(--color-text-secondary));
+  background: rgb(var(--color-bg-canvas));
+}
+.lp-code-c { color: rgb(var(--color-text-muted)); }
+.lp-code-m { color: rgb(var(--tone)); font-weight: 600; }
+.lp-code-v { color: rgb(var(--signal-green)); }
+
+/* the two-process diagram */
+.lp-procs {
+  padding: 1.25rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+.lp-proc {
+  border-radius: 10px;
+  border: 1px solid rgb(var(--tone) / 0.4);
+  background: rgb(var(--color-bg-elevated) / 0.85);
+  padding: 0.85rem 1rem;
+}
+.lp-proc-where {
+  display: block;
+  font-size: 0.8rem;
+  color: rgb(var(--tone));
+}
+.lp-proc h3 {
+  margin-top: 0.15rem;
+  font-weight: 620;
+  font-size: 1rem;
+  color: rgb(var(--color-text-primary));
+}
+.lp-proc p {
+  margin-top: 0.25rem;
+  font-size: 0.875rem;
+  line-height: 1.5;
+  color: rgb(var(--color-text-secondary));
+}
+.lp-proc-link {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  justify-content: center;
+  color: rgb(var(--color-text-tertiary));
+}
+.lp-proc-wire {
+  flex: 1;
+  height: 0;
+  border-top: 2px dashed rgb(var(--tone) / 0.45);
+}
+.lp-proc-addr {
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+.lp-proc-note {
+  margin-top: 0.4rem;
+  font-size: 0.8rem;
+  line-height: 1.5;
+  color: rgb(var(--color-text-tertiary));
+}
+.lp-proc-note code { font-family: var(--font-mono); }
+
+/* ---------- desktop page: small headings, the field reference, the library ---------- */
+.lp-mini-h {
+  font-weight: 620;
+  font-size: 0.95rem;
+  letter-spacing: -0.01em;
+  color: rgb(var(--color-text-primary));
+  margin-bottom: 0.6rem;
+}
+.lp-fields {
+  display: grid;
+  gap: 0;
+  margin: 0;
+  border-top: 1px solid rgb(var(--color-border-secondary));
+}
+@media (min-width: 768px) { .lp-fields { grid-template-columns: 1fr 1fr; column-gap: 3rem; } }
+.lp-field {
+  display: grid;
+  grid-template-columns: 9rem minmax(0, 1fr);
+  gap: 1rem;
+  padding: 0.8rem 0;
+  border-bottom: 1px solid rgb(var(--color-border-secondary));
+}
+.lp-field dt code {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  color: rgb(var(--tone));
+}
+.lp-field-req {
+  display: block;
+  margin-top: 0.15rem;
+  font-size: 11px;
+  color: rgb(var(--color-text-tertiary));
+}
+.lp-field dd {
+  margin: 0;
+  font-size: 0.9rem;
+  line-height: 1.5;
+  color: rgb(var(--color-text-secondary));
+}
+.lp-note {
+  border-left: 3px solid rgb(var(--tone));
+  padding: 0.2rem 0 0.2rem 1rem;
+  font-size: 0.925rem;
+  line-height: 1.55;
+  color: rgb(var(--color-text-secondary));
+  max-width: 40rem;
+}
+.lp-note p + p { margin-top: 0.4rem; color: rgb(var(--color-text-tertiary)); }
+.lp-note code { font-family: var(--font-mono); font-size: 0.9em; }
+.lp-library {
+  display: grid;
+  gap: 1rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+@media (min-width: 640px) { .lp-library { grid-template-columns: 1fr 1fr; } }
+@media (min-width: 1024px) { .lp-library { grid-template-columns: 1fr 1fr 1fr; } }
+.lp-library-item {
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 1rem 1.1rem;
+  border-radius: 10px;
+  border: 1px solid rgb(var(--color-border-secondary));
+  background: rgb(var(--color-bg-elevated) / 0.6);
+}
+.lp-library-item h3 {
+  font-weight: 620;
+  font-size: 1rem;
+  letter-spacing: -0.01em;
+  color: rgb(var(--color-text-primary));
+}
+.lp-library-cat {
+  display: inline-block;
+  margin-top: 0.25rem;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: rgb(var(--tone));
+}
+.lp-library-item p {
+  margin-top: 0.5rem;
+  font-size: 0.9rem;
+  line-height: 1.5;
+  color: rgb(var(--color-text-secondary));
+}
+.lp-library-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+.lp-library-file {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: rgb(var(--color-text-tertiary));
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ---------- final call ---------- */
+.lp-cta {
+  border-radius: 18px;
+  border: 1px solid rgb(var(--color-border-primary));
+  background-color: rgb(var(--color-bg-elevated));
+  padding: 3rem 1.5rem;
+}
+@media (min-width: 640px) { .lp-cta { padding: 4rem 3.5rem; } }
 
 /* The hero graph's node cards. An SVG <rect> can't take a box-shadow, so the
    elevation is a filter — diffuse in Prism Lab, a hard offset in Paper Circuit. */
@@ -1973,8 +2497,6 @@ select,
 
 /* Marching dashes on the hero graph's feedback edge — the visual cue that the
    loop actually runs. Paused under reduced-motion by the global rule. */
-@keyframes lp-edge-march { to { stroke-dashoffset: -22; } }
-.lp-edge-flow { animation: lp-edge-march 1.1s linear infinite; }
 
 /* GitHub star link in the shared nav. Bordered rather than plain text so it
    reads as an action next to "Open the app" without competing with it. */

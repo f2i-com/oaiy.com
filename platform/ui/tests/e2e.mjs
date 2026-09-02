@@ -221,12 +221,29 @@ for (const theme of ['dark', 'light']) {
       console.log(`    (with credentials:'include' the same call is ${probe.include})`);
     }
 
-    // theme toggle round-trip: click whichever segment is NOT active
+    // theme round-trip. The app's own switch now lives in Settings -> Appearance
+    // (the old `.oaiy-toggle` segment control is gone), so exercise the shared
+    // ThemeContext through the site nav's toggle on the landing page instead:
+    // same context, same localStorage key, and it is the one a visitor meets
+    // first. Asserted in place — this section runs under a per-theme init
+    // script that rewrites `oaiy_theme` on every navigation, so a cross-page
+    // check here would be testing the harness, not the app. The toggle is
+    // clicked back so the rest of the run stays in the loop's theme.
+    await page.goto(BASE + '/', { waitUntil: 'domcontentloaded' });
+    await page.waitForTimeout(800);
+    const toggle = page.locator('.site-nav button[aria-label^="Switch to"]').first();
     const before = await page.evaluate(() => document.documentElement.className);
-    await page.locator('.oaiy-toggle .oaiy-icon-btn:not(.active)').first().click();
-    await page.waitForTimeout(500);
+    await toggle.click();
+    await page.waitForTimeout(400);
     const after = await page.evaluate(() => document.documentElement.className);
     ok('theme toggle switches the root class', before !== after, `${before} -> ${after}`);
+    ok('the choice is persisted where the app reads it',
+      (await page.evaluate(() => localStorage.getItem('oaiy_theme'))) === after,
+      await page.evaluate(() => localStorage.getItem('oaiy_theme')));
+    await toggle.click();
+    await page.waitForTimeout(400);
+    await page.goto(BASE + '/app.html', { waitUntil: 'domcontentloaded' });
+    await page.waitForTimeout(2500);
 
     // regression: the topbar actions must not clip as the window narrows
     for (const w of [1024, 900, 780]) {

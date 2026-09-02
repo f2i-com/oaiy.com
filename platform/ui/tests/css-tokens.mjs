@@ -37,8 +37,12 @@ const RUNTIME_TOKENS = new Set([
   '--accent-fill', '--accent-fill-2',
 ]);
 
-/** Tokens set on an element by a rule rather than on a theme root (e.g. --node). */
-const LOCAL_TOKENS = new Set(['--node']);
+/**
+ * Tokens set on an element by a rule or an inline style rather than on a theme
+ * root: --node on canvas nodes, --tone on landing-page sections (each section
+ * sets the signal colour its rail, list markers and chips read).
+ */
+const LOCAL_TOKENS = new Set(['--node', '--tone']);
 
 const stripComments = (s) => s.replace(/\/\*[\s\S]*?\*\//g, '');
 
