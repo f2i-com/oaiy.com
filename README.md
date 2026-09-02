@@ -169,7 +169,7 @@ Flows you build yourself are trusted — they are your code, running on your mac
 2. It runs in a Web Worker, in its own realm, with the network and worker-spawning globals removed and the source scanned for escape patterns. Hardened code that cannot get a Worker is refused rather than downgraded.
 3. Optionally, it runs on a different **engine** entirely.
 
-That third layer is **Settings → Defaults → Sandbox for installed packages**, off by default. It swaps the Worker's JavaScript engine for [Zipp](https://github.com/f2i-com/zipp.org) compiled to WebAssembly. The distinction is worth being precise about: layer 2 is *subtractive* — a full browser realm with the dangerous names taken away one at a time, which both layers' own comments describe as best-effort. Zipp's guest global is a positive allowlist that never held a host object, so a script that successfully reconstructs `globalThis` finds no `fetch`, no `Worker`, no `importScripts`. Not hidden — absent. Zipp also enforces an instruction budget, so a runaway loop stops itself instead of pinning a core until you abort.
+That third layer is **Settings → Defaults → Sandbox for installed packages**, on by default. It swaps the Worker's JavaScript engine for [Zipp](https://github.com/f2i-com/zipp.org) compiled to WebAssembly. The distinction is worth being precise about: layer 2 is *subtractive* — a full browser realm with the dangerous names taken away one at a time, which both layers' own comments describe as best-effort. Zipp's guest global is a positive allowlist that never held a host object, so a script that successfully reconstructs `globalThis` finds no `fetch`, no `Worker`, no `importScripts`. Not hidden — absent. Zipp also enforces an instruction budget, so a runaway loop stops itself instead of pinning a core until you abort.
 
 It costs a one-off ~1.2 MB engine download on the first package flow (lazy — nothing is fetched until then), interpreted rather than JIT-compiled execution, and a ~16 MiB ceiling on any single value crossing the boundary. The compiled flow script itself is unchanged: OAIY's generator trampoline already talks to the host through exactly the `host.call(kind, args, cb)` contract Zipp's preamble provides. See `ui/vendor/oaiy-core/src/zipp-executor.ts`.
 
@@ -184,7 +184,7 @@ end-to-end smoke test and a browser end-to-end suite. See [`TESTING.md`](TESTING
 (cd desktop/src-tauri && cargo test)   # 28 tests, no services needed
 (cd cli && npm test)                   # 4 suites, no services needed
 (cd api && composer test)              # needs a running API + migrated DB
-(cd ui && npm test)                    # typecheck, css tokens, node contracts, zipp sandbox
+(cd ui && npm test)                    # typecheck, css tokens, node contracts, zipp sandbox + routing
 (cd ui && npm run test:e2e)            # needs `npm run dev`
 ```
 

@@ -28,7 +28,7 @@ import {
   type LocalNetworkPermissionResponse,
 } from 'oaiy-core';
 import { createEngine } from '../engine/createEngine';
-import { zippWorkerFactory } from '../lib/zippPrefs';
+import { untrustedWorkerFactory } from '../lib/zippPrefs';
 import { useApiBridge, type ApiBridgeCallbacks } from '../hooks/useApiBridge';
 import { createLogger } from '../utils/logger';
 
@@ -221,10 +221,11 @@ export function JobQueueProvider({
       projectSettings,
       projectConstants: constantsMap,
       secretConstantNames,
-      // Untrusted package workflows on the Zipp engine instead of
-      // V8-in-a-Worker, when the user has opted in (Settings → Defaults).
-      // Returns undefined when off or unsupported, which keeps the default.
-      untrustedWorkerFactory: zippWorkerFactory(),
+      // The Worker untrusted package workflows run in. The factory itself
+      // consults the Zipp toggle (Settings → Defaults) on every run, so it is
+      // passed unconditionally here even though this engine is built once —
+      // resolving the toggle at this point would freeze it until a reload.
+      untrustedWorkerFactory,
     });
   });
 
