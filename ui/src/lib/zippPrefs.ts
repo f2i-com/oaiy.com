@@ -13,15 +13,21 @@
  * `importScripts` — not hidden, absent. It also enforces instruction and heap
  * budgets, so a runaway loop or allocation stops on its own.
  *
- * It is therefore the DEFAULT engine for package workflows. The trade is a
- * ~1.2 MB (compressed) download on the first package run, an interpreter rather
- * than a JIT, and a ~16 MiB ceiling on any single value crossing the boundary;
- * the toggle exists so a user who hits one of those can fall back to the plain
- * Worker for a run without editing anything.
+ * It is therefore the DEFAULT engine for every flow. The trade is a ~1.2 MB
+ * (compressed) download on the first run, an interpreter rather than a JIT, and
+ * a ~16 MiB ceiling on any single value crossing the boundary; the toggle
+ * exists so a user who hits one of those can fall back without editing
+ * anything.
  *
- * Only package (hardened) workflows are affected either way. A user's own flows
- * are trusted and run in-thread on the browser's engine — see `executeScript`
- * in oaiy-core's runtime.ts.
+ * What "off" means differs by trust. A package (hardened) flow falls back to
+ * oaiy-core's plain Web Worker — still isolated, just by subtraction. A user's
+ * own flow falls back to running in-thread on the browser's engine, which is
+ * where it ran before Zipp existed; see `executeScript` in oaiy-core's
+ * runtime.ts. Code nodes in a trusted flow lose nothing the flow model gives
+ * them either way — network goes through module calls, and the wrapper in
+ * `zipp-executor.ts` supplies the pure text/encoding helpers — but a code node
+ * that reached for `fetch` or `setTimeout` directly gets a clear error under
+ * Zipp instead of silently working.
  *
  * # Read per run, not per engine
  *

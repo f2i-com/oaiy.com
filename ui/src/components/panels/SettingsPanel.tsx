@@ -695,8 +695,7 @@ export default function SettingsPanel({
 // settings surface for plugin modules returns, restore from git history.
 
 // ===========================================================================
-// ZippSandboxToggle — Defaults tab section that picks the engine untrusted
-// package workflows run on.
+// ZippSandboxToggle — Defaults tab section that picks the engine flows run on.
 // ===========================================================================
 //
 // Package flows already run in a Web Worker, but that Worker is a full browser
@@ -704,13 +703,14 @@ export default function SettingsPanel({
 // and `untrusted-executor.ts` both say in their own comments that this is
 // best-effort. Zipp is a JavaScript engine compiled to WebAssembly whose guest
 // global never held a host object at all, so a script that reconstructs
-// `globalThis` there finds nothing to use.
+// `globalThis` there finds nothing to use. With the toggle on, the user's own
+// flows run there too, which bounds a runaway code node's CPU and memory.
 //
-// On by default. It costs a ~1.2 MB engine download on the first untrusted
-// run and runs interpreted rather than JIT-compiled, so the toggle is the
-// escape hatch for a package flow that trips over one of those. State lives in
-// `localStorage` via `zippPrefs.ts` and is read when a run starts, so flipping
-// it applies to the next run without a reload.
+// On by default. It costs a ~1.2 MB engine download on the first run and runs
+// interpreted rather than JIT-compiled, so the toggle is the escape hatch for
+// a flow that trips over one of those. State lives in `localStorage` via
+// `zippPrefs.ts` and is read when a run starts, so flipping it applies to the
+// next run without a reload.
 function ZippSandboxToggle() {
   const supported = zippSandboxSupported();
   const [enabled, setEnabled] = useState<boolean>(() => zippSandboxEnabled());
@@ -728,7 +728,7 @@ function ZippSandboxToggle() {
         <svg className="w-4 h-4" style={{ color: 'rgb(var(--accent-primary))' }} fill="none" stroke="currentColor" viewBox="0 0 24 24">
           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
         </svg>
-        Sandbox for installed packages
+        Flow sandbox
       </h3>
       <label className={`flex items-start gap-3 ${supported ? 'cursor-pointer' : 'cursor-not-allowed opacity-60'}`}>
         <input
@@ -741,26 +741,29 @@ function ZippSandboxToggle() {
         />
         <div className="flex-1">
           <div className="text-sm text-slate-700 dark:text-slate-200">
-            Run package flows on the Zipp engine
+            Run flows on the Zipp engine
           </div>
           <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
-            Package code normally runs as JavaScript in a background worker,
-            isolated by removing the risky browser features one at a time. Zipp
-            is a separate engine that never had them: no network, no storage, no
-            way to start more workers. It also stops a runaway loop by itself
-            instead of tying up your machine.
+            Zipp is a separate JavaScript engine that runs inside WebAssembly
+            and never had the browser&apos;s risky features: no network, no
+            storage, no way to start more workers. Flow code reaches the
+            outside world only through the nodes you connect. It also stops a
+            runaway loop or allocation by itself instead of tying up your
+            machine.
           </p>
           <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
-            On by default. Costs a one-off ~1.2&nbsp;MB download the first time
-            a package flow runs, and package code runs a little slower. Turn it
-            off to run package flows in the standard worker instead. Your own
-            flows are unaffected — this only applies to flows from installed
-            packages.
+            On by default, for both your own flows and flows from installed
+            packages. Costs a one-off ~1.2&nbsp;MB download the first time a
+            flow runs, and code nodes run a little slower. A code node that
+            calls <code>fetch</code> or <code>setTimeout</code> directly gets a
+            clear error here — use an HTTP node instead. Turn this off to go
+            back to running your own flows directly in the browser (package
+            flows then use the standard isolated worker).
           </p>
           {!supported && (
             <p className="text-xs text-amber-600 dark:text-amber-400 mt-1">
-              This browser cannot run the Zipp engine, so package flows keep
-              using the standard worker.
+              This browser cannot run the Zipp engine, so flows keep running
+              the standard way.
             </p>
           )}
         </div>

@@ -258,6 +258,72 @@ console.log('\nhardened semantics');
 }
 
 // ---------------------------------------------------------------------------
+// 5b. Trusted flows: host-realm shims, and timers that throw instead of trap.
+// ---------------------------------------------------------------------------
+// A user's own flow gets no shadow preamble, so this is the surface a code node
+// actually sees under Zipp. The timer case is the one that matters: Zipp's own
+// setTimeout with a delay tries to sleep a thread WebAssembly does not have and
+// panics the instance, so the wrapper has to replace it before user code runs.
+console.log('\ntrusted-flow shims');
+{
+  const { value, error } = await runFlow(
+    `       let workflow_context = {};
+       yield Utility.httpRequest("x");
+       const bytes = new TextEncoder().encode("héllo 🌍");
+       const text = new TextDecoder().decode(bytes);
+       let micro = "not yet";
+       queueMicrotask(() => { micro = "ran"; });
+       yield Utility.httpRequest("y");            // re-entry drains microtasks
+       const errs = {};
+       for (const [name, fn] of [
+         ["setTimeout", () => setTimeout(() => {}, 100)],
+         ["setInterval", () => setInterval(() => {}, 100)],
+         ["fetch", () => fetch("https://x.test")],
+         ["crypto", () => crypto.randomUUID()],
+       ]) { try { fn(); errs[name] = "no throw"; } catch (e) { errs[name] = e.message; } }
+       workflow_context.probe = {
+         utf8Bytes: bytes.length,
+         roundTrip: text,
+         b64: btoa("hi there"),
+         b64Back: atob(btoa("hi there")),
+         clone: structuredClone({ a: [1, { b: 2 }] }),
+         perfIsNumber: typeof performance.now() === "number",
+         micro,
+         errs,
+         strictThis: (function(){ return typeof this; })(),
+       };`,
+    { broker: okBroker, hardened: false },
+  );
+  check('trusted flow ran (no trap)', !error, error);
+  const p = value?.probe ?? {};
+  check('TextEncoder produces UTF-8 bytes', p.utf8Bytes === 11, `bytes=${p.utf8Bytes}`);
+  check('TextDecoder round-trips multi-byte text and emoji', p.roundTrip === 'héllo 🌍', p.roundTrip);
+  check('btoa matches the platform', p.b64 === 'aGkgdGhlcmU=', p.b64);
+  check('atob inverts btoa', p.b64Back === 'hi there', p.b64Back);
+  check('structuredClone clones plain data', JSON.stringify(p.clone) === '{"a":[1,{"b":2}]}', JSON.stringify(p.clone));
+  check('performance.now works', p.perfIsNumber === true);
+  check('queueMicrotask callbacks run at the next re-entry', p.micro === 'ran', p.micro);
+  check('setTimeout throws a clear error instead of trapping', /not available inside the Zipp sandbox/.test(p.errs?.setTimeout ?? ''), p.errs?.setTimeout);
+  check('setInterval throws a clear error', /not available/.test(p.errs?.setInterval ?? ''), p.errs?.setInterval);
+  check('fetch throws a clear error naming the alternative', /HTTP Request node/.test(p.errs?.fetch ?? ''), p.errs?.fetch);
+  check('crypto does not silently degrade to Math.random', /entropy/.test(p.errs?.crypto ?? ''), p.errs?.crypto);
+  check('trusted flow is NOT strict (matches the in-thread path)', p.strictThis === 'object', p.strictThis);
+}
+{
+  // The hardened surface is unchanged by the shims: the shadow preamble that
+  // follows them wins, so a package flow still sees `undefined`, not a stub.
+  const { value, error } = await runFlow(
+    `       let workflow_context = {};
+       yield Utility.httpRequest("x");
+       workflow_context.probe = { fetch: typeof fetch, setTimeout: typeof setTimeout, TextEncoder: typeof TextEncoder };`,
+    { broker: okBroker },
+  );
+  check('hardened: fetch is still undefined (preamble wins over shim)', !error && value?.probe?.fetch === 'undefined', JSON.stringify(value?.probe));
+  check('hardened: setTimeout is still undefined', value?.probe?.setTimeout === 'undefined');
+  check('hardened: pure helpers remain available', value?.probe?.TextEncoder === 'function');
+}
+
+// ---------------------------------------------------------------------------
 // 6. A runaway script stops on its own.
 // ---------------------------------------------------------------------------
 // The V8 path has no equivalent: an infinite loop there pins the Worker until

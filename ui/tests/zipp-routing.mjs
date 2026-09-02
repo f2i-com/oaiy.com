@@ -154,6 +154,34 @@ await withWorkerGlobal(true, async () => {
 });
 
 // ---------------------------------------------------------------------------
+// 2b. With runTrustedFlowsInWorker, a trusted flow goes to the factory too —
+//     unhardened, so the engine applies no shadow preamble and no strict mode.
+// ---------------------------------------------------------------------------
+console.log('\ntrusted workflow, Worker requested');
+await withWorkerGlobal(true, async () => {
+  const { factory, log } = spyFactory();
+  const runtime = createRuntime({ untrustedWorkerFactory: factory, runTrustedFlowsInWorker: true });
+  runtime.setFlowContext('flow-2b', null);
+
+  const result = await run(runtime, 'let workflow_context = { from: "script" };');
+  const init = log.posted.find(m => m?.type === 'init');
+
+  check('the factory was used for the trusted flow', log.calls === 1, `calls=${log.calls}`);
+  check('the result came back from the Worker', result?.engine === 'fake-worker', JSON.stringify(result));
+  check('init message carries hardened=false', init?.hardened === false, JSON.stringify(init && { hardened: init.hardened }));
+  check("init script has no 'use strict' (matches the in-thread path)", !/^\s*'use strict';/.test(init?.script ?? ''));
+  check('init script has no shadow preamble', !/var fetch = undefined;/.test(init?.script ?? ''));
+  check('init script still carries the trampoline', /function\* __run_workflow\(\)/.test(init?.script ?? ''));
+});
+await withWorkerGlobal(true, async () => {
+  // The flag without an engine is a no-op: never the default Blob Worker.
+  const runtime = createRuntime({ runTrustedFlowsInWorker: true });
+  runtime.setFlowContext('flow-2c', null);
+  const result = await run(runtime, 'let workflow_context = { engine: "in-thread" };');
+  check('the flag alone (no factory) keeps a trusted flow in-thread', result?.engine === 'in-thread', JSON.stringify(result));
+});
+
+// ---------------------------------------------------------------------------
 // 3. Fail closed: no Worker in this host.
 // ---------------------------------------------------------------------------
 // A hardened flow that cannot get a Worker must be refused, never run

@@ -1,5 +1,10 @@
 /**
- * The Worker that runs untrusted package workflows on the Zipp engine.
+ * The Worker that runs workflows on the Zipp engine.
+ *
+ * Every flow lands here while the Flow sandbox toggle is on: package flows
+ * hardened (strict mode, null-prototype `this`, the shadow preamble), a user's
+ * own flows as-is. The `hardened` flag on the init message is the only
+ * difference the engine sees; see `buildZippScript`.
  *
  * It is a shell. Everything interesting — the script wrapper and the pump loop
  * Zipp leaves to its embedder — lives in `oaiy-core/src/zipp-executor.ts`, so
