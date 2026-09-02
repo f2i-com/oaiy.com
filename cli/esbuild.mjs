@@ -162,6 +162,13 @@ export const commonBuildOptions = {
   // browsers), sharp (optional native image lib) and undici (the SSRF guard's
   // pinned-connection HTTP client) as runtime imports rather than bundling them.
   external: ['node:sqlite', 'playwright', 'sharp', 'undici'],
+  // The engine sources live under ../ui, so esbuild's normal walk-up from the
+  // importing file lands in ui/node_modules — which only exists when the web
+  // app happens to be installed alongside. In CI, and on any machine that
+  // installs the CLI alone, that directory is absent and oaiy-core's own
+  // third-party imports (acorn, uuid) fail to resolve. Fall back to the CLI's
+  // node_modules, where package.json declares them.
+  nodePaths: [path.join(__dirname, 'node_modules')],
   banner: {
     js: "import { createRequire as __cr } from 'node:module'; const require = __cr(import.meta.url);",
   },
