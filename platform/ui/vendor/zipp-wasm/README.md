@@ -15,21 +15,16 @@ without a sibling checkout, so the artifact is committed rather than built.
 | | |
 |---|---|
 | Source | `f2i-com/zipp.org`, `crates/zipp-wasm` |
-| Engine version | 0.0.12 |
-| Source commit | `4299815a` (origin/main, 11 commits past the `v0.0.12` tag) |
+| Engine version | 0.0.13 |
+| Source commit | `671d845f` (origin/main, 2 commits past the `v0.0.13` tag) |
 | Built with | rustc 1.92.0, wasm-bindgen 0.2.126, `--target web` |
 | Linked memory maximum | 1 GiB (16384 pages) |
 | Linked stack | 1 MiB |
-| `zipp_wasm_bg.wasm` SHA-256 | `e91b5b4ef402e4fc14015c0893d3f2d39e108ae8dc0264e3598a71b55f0fee51` |
+| `zipp_wasm_bg.wasm` SHA-256 | `82647a21400ec249375157df2cca9ad9f691832180f8e5bc6eb4c4c676edb521` |
 
 Post-processing matches Zipp's release pipeline: name and producers sections
 removed by `wasm-bindgen`, then the optional `target_features` section stripped.
 No `wasm-opt` pass — Zipp measured it as both slower and larger on the wire.
-
-Zipp's own `crates/zipp-wasm/README.md` documents a slightly earlier 0.0.12
-module (`bd8614fe…`, 5,558,860 bytes) that predates the last engine commits on
-`origin/main`. The one here is built from the commit above and is 519 bytes
-larger; both pass `check-wasm-memory.cjs` and the full `tests/node` suite.
 
 ## Refreshing this directory
 
