@@ -1,0 +1,281 @@
+# Release: tag a version, get everything built and attached to one GitHub Release.
+#
+#   git tag 0.0.1 && git push origin 0.0.1        (a leading "v" works too)
+#
+# What lands on the release for that tag:
+#
+#   oaiy-web-<v>.zip / .tar.gz               the compiled static site — landing page at /,
+#                                            the flow builder at /app.html, the desktop page at
+#                                            /desktop.html, hashed assets, fonts, _headers.
+#                                            Unzip onto any static host and it works.
+#   oaiy-desktop-<v>-windows-x64-setup.exe   OAIY Desktop, NSIS installer
+#   oaiy-desktop-<v>-windows-x64.msi         OAIY Desktop, MSI installer
+#   oaiy-desktop-<v>-linux-x86_64.AppImage   OAIY Desktop, portable
+#   oaiy-desktop-<v>-linux-amd64.deb         OAIY Desktop, Debian/Ubuntu
+#   oaiy-desktop-<v>-linux-x86_64.rpm        OAIY Desktop, Fedora/RHEL
+#   oaiy-server-<v>-linux-x86_64.tar.gz      the headless server (no GUI, no GTK) for Linux hosts
+#   oaiy-server-<v>-windows-x64.zip          the headless server for Windows
+#   SHA256SUMS.txt
+#
+# The tag is the version. It is stamped into desktop/src-tauri/tauri.conf.json
+# and Cargo.toml at build time (never committed), so the installers, the app's
+# About box and the file names all agree with the tag without a release commit.
+#
+# The web build is made with VITE_API_BASE unset: a fully standalone site with
+# sharing off. To ship a build wired to a backend, set that variable in this
+# repository's Actions variables (Settings -> Secrets and variables -> Actions
+# -> Variables) and it is picked up below.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - '[0-9]+.[0-9]+.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to build (e.g. 0.0.1). Builds and uploads artifacts only; no release is created.'
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  NODE_VERSION: '24'
+
+jobs:
+  # ---------------------------------------------------------------- version
+  meta:
+    name: Resolve version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      is_tag: ${{ steps.v.outputs.is_tag }}
+    steps:
+      - id: v
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            raw="${GITHUB_REF#refs/tags/}"
+            echo "is_tag=true" >> "$GITHUB_OUTPUT"
+          else
+            raw="${{ github.event.inputs.version }}"
+            echo "is_tag=false" >> "$GITHUB_OUTPUT"
+          fi
+          version="${raw#v}"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::'$raw' is not a version of the form 0.0.1"; exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Building version $version"
+
+  # ---------------------------------------------------------------- web site
+  web:
+    name: Web site (landing + app)
+    needs: meta
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Install
+        working-directory: ui
+        run: npm ci
+
+      - name: Test
+        working-directory: ui
+        run: npm test
+
+      - name: Build
+        working-directory: ui
+        env:
+          VITE_API_BASE: ${{ vars.VITE_API_BASE }}
+        run: npm run build
+
+      - name: Package
+        shell: bash
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          out="$PWD/release"; mkdir -p "$out"
+          cat > ui/dist/HOSTING.md <<EOF
+          # OAIY web site $VERSION
+
+          This folder is the complete static site: the landing page (index.html),
+          the flow builder (app.html) and the desktop-app page (desktop.html), with
+          their assets. Upload it as-is to any static host — S3, Netlify, Cloudflare
+          Pages, nginx, Apache. No server-side rendering, no rewrite rules needed.
+
+          _headers is read by Netlify and Cloudflare Pages; it sets the strict
+          Content-Security-Policy for the package-compiler sandbox worker. Other hosts
+          should apply the equivalent header to /assets/compiler-sandbox-worker-*.js
+          (see the comments inside the file).
+
+          Built with VITE_API_BASE="${VITE_API_BASE:-}". Empty means standalone: no
+          sharing backend, everything runs in the browser.
+          EOF
+          (cd ui/dist && zip -qr "$out/oaiy-web-$VERSION.zip" .)
+          tar -C ui/dist -czf "$out/oaiy-web-$VERSION.tar.gz" .
+          ls -l "$out"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: web
+          path: release/*
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------- desktop
+  desktop:
+    name: Desktop (${{ matrix.label }})
+    needs: meta
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            label: linux
+          - os: windows-latest
+            label: windows
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop/src-tauri
+
+      - name: Linux build dependencies
+        if: matrix.label == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev \
+            libxdo-dev patchelf build-essential curl wget file libssl-dev
+
+      - name: Stamp the version from the tag
+        shell: bash
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          node -e '
+            const fs = require("fs"); const v = process.argv[1];
+            const conf = "desktop/src-tauri/tauri.conf.json";
+            const j = JSON.parse(fs.readFileSync(conf, "utf8")); j.version = v;
+            fs.writeFileSync(conf, JSON.stringify(j, null, 2) + "\n");
+            const toml = "desktop/src-tauri/Cargo.toml";
+            fs.writeFileSync(toml, fs.readFileSync(toml, "utf8").replace(/^version = "[^"]+"/m, `version = "${v}"`));
+            console.log("stamped", v);
+          ' "$VERSION"
+
+      # The desktop bundles the headless CLI (scripts/sync-cli.mjs copies its
+      # esbuild output into src-tauri/resources), so the CLI has to exist first.
+      - name: Install and build the CLI
+        working-directory: cli
+        run: |
+          npm ci
+          npm run build
+
+      - name: Install the desktop app's dependencies
+        working-directory: desktop
+        run: npm ci
+
+      - name: Build OAIY Desktop
+        working-directory: desktop
+        run: npm run tauri:build
+
+      - name: Build the headless server
+        working-directory: desktop/src-tauri
+        run: cargo build --release --no-default-features --bin oaiy-server
+
+      - name: Collect
+        shell: bash
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+          LABEL: ${{ matrix.label }}
+        run: |
+          set -euo pipefail
+          out="$PWD/release"; mkdir -p "$out"
+          bundle="desktop/src-tauri/target/release/bundle"
+          find "$bundle" -type f | sort
+          if [[ "$LABEL" == "windows" ]]; then
+            cp "$(find "$bundle" -type f -name '*-setup.exe' | head -1)" "$out/oaiy-desktop-$VERSION-windows-x64-setup.exe"
+            cp "$(find "$bundle" -type f -name '*.msi' | head -1)"       "$out/oaiy-desktop-$VERSION-windows-x64.msi"
+            ( cd desktop/src-tauri/target/release && 7z a -bd "$out/oaiy-server-$VERSION-windows-x64.zip" oaiy-server.exe >/dev/null )
+          else
+            cp "$(find "$bundle" -type f -name '*.AppImage' | head -1)" "$out/oaiy-desktop-$VERSION-linux-x86_64.AppImage"
+            cp "$(find "$bundle" -type f -name '*.deb' | head -1)"      "$out/oaiy-desktop-$VERSION-linux-amd64.deb"
+            rpm="$(find "$bundle" -type f -name '*.rpm' | head -1 || true)"
+            [[ -n "$rpm" ]] && cp "$rpm" "$out/oaiy-desktop-$VERSION-linux-x86_64.rpm"
+            tar -C desktop/src-tauri/target/release -czf "$out/oaiy-server-$VERSION-linux-x86_64.tar.gz" oaiy-server
+          fi
+          ls -l "$out"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: desktop-${{ matrix.label }}
+          path: release/*
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------- release
+  release:
+    name: Publish release
+    needs: [meta, web, desktop]
+    if: needs.meta.outputs.is_tag == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: artifacts
+        run: |
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Release notes
+        shell: bash
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          cat > notes.md <<EOF
+          ## What is in this release
+
+          **Web site** — \`oaiy-web-$VERSION.zip\` (or \`.tar.gz\`) is the compiled static site:
+          the landing page at \`/\`, the flow builder at \`/app.html\` and the desktop-app page at
+          \`/desktop.html\`. Unzip it onto any static host. \`HOSTING.md\` inside explains the one
+          header worth setting.
+
+          **OAIY Desktop** — the tray app that manages local model servers, downloads, Python and
+          the browser sidecar for the web app.
+          - Windows: \`oaiy-desktop-$VERSION-windows-x64-setup.exe\` (installer) or the \`.msi\`
+          - Linux: \`.AppImage\` (portable), \`.deb\` (Debian/Ubuntu) or \`.rpm\` (Fedora/RHEL)
+
+          **oaiy-server** — the same local API with no window, tray or GTK, for a Linux or
+          Windows host that the CLI or a hosted web app drives. See \`desktop/README.md\`.
+
+          \`SHA256SUMS.txt\` covers every file above.
+          EOF
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: OAIY ${{ needs.meta.outputs.version }}
+          body_path: notes.md
+          generate_release_notes: true
+          files: artifacts/*
+          fail_on_unmatched_files: true
