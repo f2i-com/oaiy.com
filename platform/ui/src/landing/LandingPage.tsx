@@ -25,11 +25,11 @@ const APP_URL = 'app.html';
 export default function LandingPage() {
   return (
     <div
-      className="min-h-screen w-full overflow-x-hidden"
+      className="oaiy-site min-h-screen w-full"
       style={{ backgroundColor: 'rgb(var(--color-bg-primary))', color: 'rgb(var(--color-text-primary))' }}
     >
       <SiteNav page="overview" />
-      <main>
+      <main id="main-content">
         <Hero />
         <Engines />
         <Why />
@@ -51,26 +51,26 @@ export default function LandingPage() {
 
 function Hero() {
   return (
-    <section id="top" className="relative overflow-hidden bg-dotgrid">
+    <section id="top" className="oaiy-hero">
       <div className="relative mx-auto max-w-6xl px-5 pt-12 sm:px-8 sm:pt-20 lg:pt-24">
-        <div className="max-w-3xl">
+        <div className="oaiy-hero-copy">
+          <p className="oaiy-kicker">ORCHESTRATE AI YOURSELF / OPEN SOURCE</p>
           <h1 className="lp-reveal lp-h1" style={{ animationDelay: '60ms' }}>
-            Build AI workflows you can see.
+            Less prompting.<br /><em>More possibilities.</em>
           </h1>
           <p
             className="lp-reveal lp-lede mt-6"
             style={{ animationDelay: '140ms' }}
           >
-            OAIY is a node canvas for local AI. Chain language models, browser
-            automation and image, audio and video generation by drawing the flow,
-            and run it in your browser against the engines on your own machine.
+            Give your ideas a workflow. Connect models, tools and media on a visual canvas,
+            then run them with the engines you choose — on your machine or through your own endpoints.
           </p>
           <div className="lp-reveal mt-8 flex flex-wrap items-center gap-3" style={{ animationDelay: '220ms' }}>
             <a href={APP_URL} className="btn btn-primary btn-lg">
               Open the app
               <ArrowRight />
             </a>
-            <a href="#desktop" className="btn btn-secondary btn-lg">
+            <a href="desktop.html" className="btn btn-secondary btn-lg">
               Get OAIY Desktop
             </a>
           </div>
@@ -78,14 +78,16 @@ function Hero() {
             className="lp-reveal mt-5 flex flex-wrap gap-x-5 gap-y-1.5 text-sm"
             style={{ animationDelay: '300ms', color: 'rgb(var(--color-text-tertiary))' }}
           >
-            <li className="inline-flex items-center gap-1.5"><CheckIcon /> Nothing to install</li>
+            <li className="inline-flex items-center gap-1.5"><CheckIcon /> Browser-based editor</li>
             <li className="inline-flex items-center gap-1.5"><CheckIcon /> No sign-up</li>
-            <li className="inline-flex items-center gap-1.5"><CheckIcon /> Keys stay on your device</li>
+            <li className="inline-flex items-center gap-1.5"><CheckIcon /> Bring your own engines</li>
           </ul>
         </div>
 
-        <div className="lp-reveal mt-12 sm:mt-16" style={{ animationDelay: '380ms' }}>
-          <HeroGraph />
+        <div className="oaiy-workbench lp-reveal mt-12 sm:mt-16" style={{ animationDelay: '380ms' }}>
+          <div className="oaiy-workbench-header"><span>THE CANVAS / 01</span><span>Example workflow</span></div>
+          <div className="oaiy-graph-scroll" role="region" aria-label="Image review workflow diagram, scroll horizontally on small screens" tabIndex={0}><HeroGraph /></div>
+          <div className="oaiy-workbench-footer"><strong>Generate. Review. Refine.</strong><span>An image meets a vision model. A condition decides what happens next.</span><a href={APP_URL}>Build your own ↗</a></div>
         </div>
       </div>
     </section>

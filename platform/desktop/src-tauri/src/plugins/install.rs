@@ -5,7 +5,7 @@
 //! connector surface is plugin-supplied, that capped what the product could do.
 //!
 //! A plugin is installed from a SOURCE on this machine: either a directory
-//! containing a `manifest.json`, or a `.tar.gz` of one. Nothing is fetched from
+//! containing a `manifest.json`, or a `.zip`/`.tar.gz` of one. Nothing is fetched from
 //! the network here — the operator chooses a local path, which keeps this route
 //! from becoming a remote-code-install primitive.
 //!
@@ -35,16 +35,16 @@ pub struct Installed {
 
 /// Read + validate the manifest at `dir/manifest.json`.
 fn read_manifest(dir: &Path) -> Result<PluginManifest, String> {
-    let path = dir.join("manifest.json");
-    let raw = std::fs::read_to_string(&path)
-        .map_err(|e| format!("no readable manifest.json in {}: {e}", dir.display()))?;
-    let manifest: PluginManifest =
-        serde_json::from_str(&raw).map_err(|e| format!("manifest.json is not valid: {e}"))?;
+    let manifest = PluginManifest::load(dir).map_err(|e| e.to_string())?;
     if !valid_plugin_id(&manifest.id) {
         return Err(format!(
             "manifest id {:?} is invalid — use lowercase letters, digits, dash or underscore",
             manifest.id
         ));
+    }
+    let entry = manifest.resolve_entry(dir).map_err(|e| e.to_string())?;
+    if !entry.is_file() {
+        return Err(format!("required plugin executable is missing: {}", manifest.entry.command));
     }
     Ok(manifest)
 }
@@ -61,7 +61,10 @@ fn valid_plugin_id(id: &str) -> bool {
 
 /// Reject an archive entry whose path escapes the extraction root.
 fn safe_relative(path: &Path) -> bool {
-    !path.is_absolute()
+    !path.as_os_str().is_empty()
+        && !path.to_string_lossy().contains(':')
+        && !path.to_string_lossy().split(['/', '\\']).any(|part| part == "..")
+        && !path.is_absolute()
         && path
             .components()
             .all(|c| matches!(c, std::path::Component::Normal(_)))
@@ -79,9 +82,11 @@ fn copy_tree(src: &Path, dst: &Path, budget: &mut u64, entries: &mut usize) -> R
         }
         let from = entry.path();
         let to = dst.join(entry.file_name());
-        let meta = entry
-            .metadata()
+        let meta = std::fs::symlink_metadata(&from)
             .map_err(|e| format!("cannot stat {}: {e}", from.display()))?;
+        if meta.file_type().is_symlink() {
+            return Err(format!("plugin packages cannot contain symbolic links: {}", from.display()));
+        }
         if meta.is_dir() {
             copy_tree(&from, &to, budget, entries)?;
         } else if meta.is_file() {
@@ -117,6 +122,10 @@ fn extract_tar_gz(archive: &Path, dst: &Path) -> Result<(), String> {
         if !safe_relative(&path) {
             return Err(format!("archive entry {:?} escapes the package", path.display()));
         }
+        let kind = entry.header().entry_type();
+        if !kind.is_file() && !kind.is_dir() {
+            return Err(format!("archive entry {:?} is not a regular file or directory", path.display()));
+        }
         count += 1;
         total = total.saturating_add(entry.size());
         if count > MAX_ENTRIES || total > MAX_TOTAL_BYTES {
@@ -125,6 +134,38 @@ fn extract_tar_gz(archive: &Path, dst: &Path) -> Result<(), String> {
         entry
             .unpack_in(dst)
             .map_err(|e| format!("cannot unpack {:?}: {e}", path.display()))?;
+    }
+    Ok(())
+}
+
+/// Aokie's published artifact is a ZIP. Apply the same containment and resource
+/// limits as the tar path, and reject links rather than materializing them.
+fn extract_zip(archive: &Path, dst: &Path) -> Result<(), String> {
+    let file = std::fs::File::open(archive).map_err(|e| e.to_string())?;
+    let mut zip = zip::ZipArchive::new(file).map_err(|e| format!("invalid plugin ZIP: {e}"))?;
+    if zip.len() > MAX_ENTRIES { return Err("the archive has too many entries".into()); }
+    std::fs::create_dir_all(dst).map_err(|e| e.to_string())?;
+    let mut total = 0u64;
+    for i in 0..zip.len() {
+        let mut entry = zip.by_index(i).map_err(|e| e.to_string())?;
+        let relative = entry.enclosed_name().ok_or("ZIP path escapes the package")?;
+        if !safe_relative(&relative) || entry.unix_mode().is_some_and(|m| m & 0o170000 == 0o120000) {
+            return Err("ZIP entries must be regular files/directories inside the package".into());
+        }
+        total = total.checked_add(entry.size()).ok_or("the archive is too large")?;
+        if total > MAX_TOTAL_BYTES { return Err("the archive is too large to install".into()); }
+        let target = dst.join(relative);
+        if entry.is_dir() {
+            std::fs::create_dir_all(target).map_err(|e| e.to_string())?;
+        } else {
+            std::fs::create_dir_all(target.parent().unwrap()).map_err(|e| e.to_string())?;
+            let mut out = std::fs::OpenOptions::new().write(true).create_new(true)
+                .open(target).map_err(|e| format!("cannot create ZIP entry: {e}"))?;
+            let size = entry.size();
+            let copied = std::io::copy(&mut std::io::Read::take(&mut entry, size + 1), &mut out)
+                .map_err(|e| e.to_string())?;
+            if copied != size { return Err("ZIP entry size differs from its declaration".into()); }
+        }
     }
     Ok(())
 }
@@ -162,7 +203,7 @@ pub fn peek_id(source: &Path) -> Result<String, String> {
     read_manifest(&manifest_root(source)).map(|m| m.id)
 }
 
-/// Install the plugin at `source` (a directory or a `.tar.gz`) into `plugins_root`.
+/// Install a directory, `.zip` or `.tar.gz` into `plugins_root`.
 ///
 /// Returns the installed identity. The caller is responsible for stopping a
 /// running instance of the same id first — this function will refuse to replace
@@ -176,8 +217,13 @@ pub fn install_from_path(source: &Path, plugins_root: &Path) -> Result<Installed
         .map_err(|e| format!("cannot create the plugins directory: {e}"))?;
 
     // Stage beside the destination (same volume, so the final swap is a rename).
-    let staging = plugins_root.join(format!(".staging-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&staging);
+    let staging = plugins_root.join(format!(".staging-{}", uuid::Uuid::new_v4()));
+    // Serialize installs sharing a destination root. Unique staging paths alone
+    // do not prevent two replacements from moving each other's live bundle.
+    let lock = std::fs::OpenOptions::new().create(true).truncate(false).write(true)
+        .open(plugins_root.join(".install.lock")).map_err(|e| e.to_string())?;
+    fs2::FileExt::try_lock_exclusive(&lock)
+        .map_err(|_| "another plugin installation is in progress".to_string())?;
 
     let result = (|| -> Result<Installed, String> {
         let mut budget = MAX_TOTAL_BYTES;
@@ -186,28 +232,42 @@ pub fn install_from_path(source: &Path, plugins_root: &Path) -> Result<Installed
             copy_tree(source, &staging, &mut budget, &mut entries)?;
         } else {
             let name = source.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if !(name.ends_with(".tar.gz") || name.ends_with(".tgz")) {
-                return Err("a plugin package must be a directory or a .tar.gz".into());
+            if name.ends_with(".zip") {
+                extract_zip(source, &staging)?;
+            } else if name.ends_with(".tar.gz") || name.ends_with(".tgz") {
+                extract_tar_gz(source, &staging)?;
+            } else {
+                return Err("a plugin package must be a directory, .zip or .tar.gz".into());
             }
-            extract_tar_gz(source, &staging)?;
         }
 
         let staged = manifest_root(&staging);
         let manifest = read_manifest(&staged)?;
         let dest = plugins_root.join(&manifest.id);
         let replaced = dest.exists();
+        let backup = plugins_root.join(format!(".backup-{}-{}", manifest.id, uuid::Uuid::new_v4()));
         if replaced {
-            // A running plugin holds its executable open on Windows; surface that
-            // as "stop it first" rather than a raw OS error.
-            std::fs::remove_dir_all(&dest).map_err(|e| {
+            // Preserve every old byte until the validated replacement is live.
+            std::fs::rename(&dest, &backup).map_err(|e| {
                 format!(
                     "cannot replace the existing {:?} plugin — stop it first ({e})",
                     manifest.id
                 )
             })?;
         }
-        std::fs::rename(&staged, &dest)
-            .map_err(|e| format!("cannot move the plugin into place: {e}"))?;
+        if let Err(e) = std::fs::rename(&staged, &dest) {
+            if replaced {
+                std::fs::rename(&backup, &dest).map_err(|rollback| format!(
+                    "cannot activate plugin ({e}); cannot restore old bundle ({rollback}); preserved at {}", backup.display()
+                ))?;
+            }
+            return Err(format!("cannot move the plugin into place: {e}; previous bundle preserved"));
+        }
+        if replaced {
+            if let Err(e) = std::fs::remove_dir_all(&backup) {
+                log::warn!("plugin installed, but old bundle remains at {}: {e}", backup.display());
+            }
+        }
 
         Ok(Installed {
             id: manifest.id.clone(),
@@ -293,6 +353,60 @@ mod tests {
         let out = install_from_path(&src, &root).unwrap();
         assert!(out.replaced);
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn installs_the_published_zip_shape_and_rejects_zip_traversal() {
+        use std::io::Write;
+        let base = tmp("zip");
+        let src = base.join("src");
+        let root = base.join("plugins");
+        write_plugin(&src, "demo");
+        let archive = base.join("plugin.zip");
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&archive).unwrap());
+        for name in ["manifest.json", "x.exe"] {
+            zip.start_file(name, zip::write::SimpleFileOptions::default()).unwrap();
+            zip.write_all(&std::fs::read(src.join(name)).unwrap()).unwrap();
+        }
+        zip.finish().unwrap();
+        assert_eq!(install_from_path(&archive, &root).unwrap().id, "demo");
+        let original = std::fs::read(root.join("demo/manifest.json")).unwrap();
+
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&archive).unwrap());
+        zip.start_file("../outside.txt", zip::write::SimpleFileOptions::default()).unwrap();
+        zip.write_all(b"outside").unwrap();
+        zip.finish().unwrap();
+        assert!(install_from_path(&archive, &root).is_err());
+        assert!(!root.join("outside.txt").exists());
+        assert_eq!(std::fs::read(root.join("demo/manifest.json")).unwrap(), original);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn invalid_replacements_preserve_the_working_bundle() {
+        let base = tmp("invalid-replace");
+        let src = base.join("src");
+        let root = base.join("plugins");
+        write_plugin(&src, "demo");
+        install_from_path(&src, &root).unwrap();
+        let original = std::fs::read(root.join("demo/manifest.json")).unwrap();
+        let mut manifest: serde_json::Value = serde_json::from_slice(&original).unwrap();
+        manifest["serviceDefinitions"] = serde_json::json!([{"definitionFile":"definitions/phone.json"}]);
+        std::fs::write(src.join("manifest.json"), manifest.to_string()).unwrap();
+        let err = install_from_path(&src, &root).unwrap_err();
+        assert!(err.contains("service definition"), "{err}");
+        assert_eq!(std::fs::read(root.join("demo/manifest.json")).unwrap(), original);
+        assert_eq!(std::fs::read(root.join("demo/x.exe")).unwrap(), b"binary");
+        manifest.as_object_mut().unwrap().remove("serviceDefinitions");
+        manifest["pluginApiVersion"] = serde_json::json!(999);
+        std::fs::write(src.join("manifest.json"), manifest.to_string()).unwrap();
+        assert!(install_from_path(&src, &root).is_err());
+        assert_eq!(std::fs::read(root.join("demo/manifest.json")).unwrap(), original);
+        write_plugin(&src, "demo");
+        std::fs::remove_file(src.join("x.exe")).unwrap();
+        assert!(install_from_path(&src, &root).unwrap_err().contains("executable"));
+        assert_eq!(std::fs::read(root.join("demo/manifest.json")).unwrap(), original);
+        let _ = std::fs::remove_dir_all(base);
     }
 
     #[test]

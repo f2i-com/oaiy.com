@@ -20,12 +20,14 @@ export default function ChatGptConnector() {
   const [status, setStatus] = useState<CodexStatus | null>(null);
   const [login, setLogin] = useState<CodexLogin | null>(null);
   const [busy, setBusy] = useState(false);
+  const [statusError, setStatusError] = useState(false);
 
   const refresh = useCallback(async () => {
     try {
       setStatus(await codex.status());
+      setStatusError(false);
     } catch {
-      /* the panel's own banner covers a dead API; keep the last state */
+      setStatusError(true);
     }
   }, []);
 
@@ -110,6 +112,8 @@ export default function ChatGptConnector() {
           <code>codex</code> CLI on this machine
           {status.detail ? ` — ${status.detail}` : ''}.
         </p>
+        <ol className="setup-wizard-instructions"><li>Follow the official Codex CLI installation guide.</li><li>Restart OAIY if the CLI is not detected, then check again.</li><li>Sign in here. OAIY uses a separate Codex sign-in for this connection.</li></ol>
+        <div className="form-actions"><button className="btn" onClick={() => openExternal('https://developers.openai.com/codex/cli/')}>Codex installation guide</button><button className="btn" onClick={() => void refresh()}>Check again</button></div>
       </section>
     );
   }
@@ -128,7 +132,7 @@ export default function ChatGptConnector() {
       </div>
 
       <p className="form-hint">
-        Use a ChatGPT subscription instead of an API key. The sign-in is owned by the{' '}
+        Use an eligible ChatGPT account instead of an API key. Your account limits apply. The sign-in is owned by the{' '}
         <code>codex</code> agent running on this machine — OAIY never receives or stores a token.
       </p>
 
@@ -140,6 +144,8 @@ export default function ChatGptConnector() {
       )}
 
       {/* A device-code sign-in: the code must be visible and copyable. */}
+      {statusError && <p role="alert" className="form-hint">Could not check Codex. <button className="btn-tiny" onClick={() => void refresh()}>Retry status</button></p>}
+      {!status && !statusError && <p role="status" className="form-hint">Checking Codex availability...</p>}
       {login && (
         <div className="datadir-note">
           <span>
@@ -184,7 +190,7 @@ export default function ChatGptConnector() {
           <button
             className="btn btn-primary"
             onClick={() => void startLogin()}
-            disabled={busy || login !== null}
+            disabled={busy || login !== null || !status || statusError}
           >
             {busy ? <Loader2 size={14} className="spin" /> : <MessageSquare size={14} />}
             {login ? 'Waiting for the browser…' : 'Sign in with ChatGPT'}

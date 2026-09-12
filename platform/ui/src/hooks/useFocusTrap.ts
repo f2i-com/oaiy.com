@@ -27,6 +27,10 @@
  */
 import { useEffect, type RefObject } from 'react';
 
+// An overlay can open over another dialog (for example the mobile navigation
+// over Settings). Only the most recently opened trap should handle Tab.
+const activeTraps: HTMLElement[] = [];
+
 /**
  * Selector matches the standard set of tab-stops. Excludes elements
  * with `tabindex="-1"` because those are programmatically focusable
@@ -59,6 +63,7 @@ export function useFocusTrap(
     if (!isOpen) return;
     const container = containerRef.current;
     if (!container) return;
+    activeTraps.push(container);
 
     // Save who had focus so we can restore on unmount/close.
     const previouslyFocused = document.activeElement as HTMLElement | null;
@@ -77,6 +82,7 @@ export function useFocusTrap(
     const raf = requestAnimationFrame(() => initial.focus());
 
     const onKeyDown = (e: KeyboardEvent) => {
+      if (activeTraps.at(-1) !== container) return;
       if (e.key !== 'Tab') return;
       const items = focusables(container);
       if (items.length === 0) {
@@ -106,10 +112,13 @@ export function useFocusTrap(
     return () => {
       cancelAnimationFrame(raf);
       document.removeEventListener('keydown', onKeyDown);
+      const wasTop = activeTraps.at(-1) === container;
+      const index = activeTraps.lastIndexOf(container);
+      if (index !== -1) activeTraps.splice(index, 1);
       // Return focus to wherever it was, unless that element is no
       // longer in the document (e.g., the trigger was unmounted while
       // the modal was open). Skip silently in that case.
-      if (previouslyFocused && document.contains(previouslyFocused)) {
+      if (wasTop && previouslyFocused && document.contains(previouslyFocused)) {
         try { previouslyFocused.focus(); } catch { /* element not focusable anymore */ }
       }
     };

@@ -78,11 +78,39 @@ struct DefinitionRef {
     definition_file: String,
 }
 
+/// Required manifest references must resolve before a replacement is activated.
+/// Canonical containment also rejects links escaping an installed directory.
+pub fn validate_for_plugin(dir: &Path, manifest: &PluginManifest) -> Result<(), String> {
+    let Some(refs) = manifest.extra.get("serviceDefinitions") else { return Ok(()) };
+    let refs: Vec<DefinitionRef> = serde_json::from_value(refs.clone())
+        .map_err(|e| format!("invalid serviceDefinitions: {e}"))?;
+    let root = dir.canonicalize().map_err(|e| e.to_string())?;
+    for r in refs {
+        let rel = r.definition_file.replace('\\', "/");
+        if rel.is_empty() || rel.contains(':') || rel.starts_with('/')
+            || rel.split('/').any(|s| s.is_empty() || s == "." || s == "..")
+        {
+            return Err(format!("invalid service definition path: {rel}"));
+        }
+        let path = dir.join(&rel).canonicalize()
+            .map_err(|e| format!("required service definition {rel} is missing: {e}"))?;
+        if !path.starts_with(&root) {
+            return Err(format!("service definition {rel} escapes the plugin directory"));
+        }
+        let raw = std::fs::read_to_string(path).map_err(|e| format!("cannot read {rel}: {e}"))?;
+        let def: ServiceDefinition = serde_json::from_str(&raw)
+            .map_err(|e| format!("invalid service definition {rel}: {e}"))?;
+        if def.id.trim().is_empty() || def.name.trim().is_empty() {
+            return Err(format!("service definition {rel} requires an id and name"));
+        }
+    }
+    Ok(())
+}
+
 /// Load every definition a plugin contributes, from its manifest + directory.
 ///
-/// Never fails the plugin: a bad definition file is skipped (the plugin still
-/// works, it just contributes less), because refusing to load a working phone
-/// bridge over a typo in an optional catalog entry would be the wrong trade.
+/// Manifest loading validates required definitions before activation. This
+/// display helper remains best-effort if files disappear after that validation.
 pub fn load_for_plugin(dir: &Path, manifest: &PluginManifest) -> Vec<ServiceDefinition> {
     let Some(refs) = manifest.extra.get("serviceDefinitions") else {
         return Vec::new();

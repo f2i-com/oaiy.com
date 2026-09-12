@@ -1,4 +1,6 @@
 import { useTheme } from '../contexts/ThemeContext';
+import { useEffect, useRef, useState } from 'react';
+import './marketing.css';
 
 /**
  * SiteNav — ONE navigation bar shared by every marketing page.
@@ -53,15 +55,37 @@ export default function SiteNav({
   page: SitePage;
   sections?: NavSection[];
 }) {
+  const [open, setOpen] = useState(false);
+  const menuButton = useRef<HTMLButtonElement>(null);
+  useEffect(() => {
+    const desktop = window.matchMedia('(min-width: 901px)');
+    const onResize = () => { if (desktop.matches) setOpen(false); };
+    desktop.addEventListener('change', onResize);
+    return () => desktop.removeEventListener('change', onResize);
+  }, []);
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') { setOpen(false); menuButton.current?.focus(); }
+    };
+    document.addEventListener('keydown', onKey);
+    const onOutside = (event: PointerEvent) => {
+      if (event.target instanceof Node && !menuButton.current?.closest('header')?.contains(event.target)) setOpen(false);
+    };
+    document.addEventListener('pointerdown', onOutside);
+    return () => { document.removeEventListener('keydown', onKey); document.removeEventListener('pointerdown', onOutside); };
+  }, [open]);
   return (
     <header className="site-nav">
+      <a className="site-skip" href="#main-content">Skip to content</a>
       <div className="site-nav-bar">
         <a href="index.html" className="flex items-center select-none" aria-label="OAIY home">
           <span className="lp-wordmark">OAIY</span>
           <span className="lp-tagline ml-3 hidden sm:inline">Orchestrate AI Yourself</span>
         </a>
 
-        <nav className="site-nav-links" aria-label="Site">
+        <button type="button" className="site-menu-button" ref={menuButton} aria-expanded={open} aria-controls="site-destinations" onClick={() => setOpen(!open)}>{open ? 'Close' : 'Menu'}</button>
+        <nav id="site-destinations" className={`site-nav-links${open ? ' is-open' : ''}`} aria-label="Site" onClick={(event) => { if ((event.target as HTMLElement).closest('a')) setOpen(false); }}>
           {DESTINATIONS.map((d) => {
             // On the page a link points at, use the bare hash so it scrolls
             // instead of reloading; from elsewhere use the full cross-page href.
@@ -119,7 +143,7 @@ function ThemeToggle() {
       type="button"
       onClick={() => setTheme(isDark ? 'light' : 'dark')}
       className="oaiy-icon-btn"
-      aria-label={isDark ? 'Switch to Paper Circuit (light)' : 'Switch to Prism Lab (dark)'}
+      aria-label={isDark ? 'Switch to light mode' : 'Switch to dark mode'}
       title={isDark ? 'Paper Circuit' : 'Prism Lab'}
     >
       {isDark ? (

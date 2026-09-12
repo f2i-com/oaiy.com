@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
-import { Check, X, Link2, ShieldCheck } from 'lucide-react';
+import { Check, X, Link2, ShieldCheck, ChevronDown } from 'lucide-react';
 import { pairing, type PendingPairing, type PairedApp } from './api';
 import { useToast } from './Toasts';
 
@@ -114,20 +114,29 @@ export default function PairingPrompt() {
       ))}
 
       {paired.length > 0 && (
-        <div className="pairing-card pairing-connected">
-          <div className="pairing-head">
-            <ShieldCheck size={15} />
-            <strong>Connected apps</strong>
-          </div>
+        <details className="pairing-card pairing-connected">
+          <summary className="pairing-summary">
+            <ShieldCheck size={15} aria-hidden />
+            <strong>Connected apps ({paired.length})</strong>
+            <span className="pairing-summary-hint">Manage connections</span>
+            <ChevronDown className="pairing-summary-chevron" size={16} aria-hidden />
+          </summary>
           <ul className="pairing-list">
             {paired.map((app) => (
               <li key={app.id}>
-                <span>
+                <span className="pairing-app-info">
                   {app.label ?? app.product} <span style={{ opacity: 0.55 }}>({app.product})</span>
+                  <code className="pairing-origin">{app.origin || 'Native app'}</code>
+                  {Number.isFinite(app.createdAtMs) && (
+                    <span className="pairing-approved-at">
+                      Approved <time dateTime={new Date(app.createdAtMs).toISOString()}>{new Date(app.createdAtMs).toLocaleString()}</time>
+                    </span>
+                  )}
                 </span>
                 <button
                   className="btn-tiny"
                   disabled={busy.has(app.id)}
+                  aria-label={`Revoke access for ${app.label ?? app.product}${app.origin ? ` at ${app.origin}` : ''}`}
                   onClick={() => act(app.id, () => pairing.revoke(app.id), `Revoked ${app.product}`)}
                 >
                   Revoke
@@ -135,7 +144,7 @@ export default function PairingPrompt() {
               </li>
             ))}
           </ul>
-        </div>
+        </details>
       )}
     </div>
   );

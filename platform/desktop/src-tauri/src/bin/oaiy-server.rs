@@ -176,8 +176,9 @@ async fn main() {
         .unwrap_or(false);
     if bind_all && auth_token_is_empty() {
         eprintln!(
-            "oaiy-server: OAIY_SERVER_BIND=lan without OAIY_SERVER_TOKEN — privileged routes stay closed"
+            "oaiy-server: OAIY_SERVER_BIND=lan requires a non-empty OAIY_SERVER_TOKEN"
         );
+        std::process::exit(1);
     }
 
     // Trim symmetrically with the client (bearer_token trims), so surrounding

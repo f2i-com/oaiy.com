@@ -6,8 +6,33 @@
 // stylesheets key their dark tokens off `html.fl-dark`, the host set
 // `data-theme` on ITS OWN document, and nothing ever crossed the frame
 // boundary, so the plugin screens rendered light under every theme.
-import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { HOST_BOOTSTRAP } from './PluginScreenPage';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { HOST_BOOTSTRAP, pluginAiSources } from './PluginScreenPage';
+import { API_BASE } from './api';
+
+describe('plugin AI source gateway routes', () => {
+  it('uses the configured host API for provider selections and preserves their metadata', () => {
+    const provider = { id: 'provider:qwen', kind: 'provider', providerId: 'qwen', enabled: true, model: 'qwen-q4' };
+    expect(pluginAiSources([provider])).toEqual([{
+      ...provider, gatewayUrl: `${API_BASE}/api/ai/providers/qwen`,
+    }]);
+    expect(provider).not.toHaveProperty('gatewayUrl');
+  });
+
+  it('supports another host port, encodes provider ids, and overrides untrusted gateway metadata', () => {
+    expect(pluginAiSources([{
+      kind: 'provider', id: 'provider:model/one', gatewayUrl: 'http://wrong.invalid',
+    }], 'http://127.0.0.1:23456/')).toEqual([{
+      kind: 'provider', id: 'provider:model/one',
+      gatewayUrl: 'http://127.0.0.1:23456/api/ai/providers/model%2Fone',
+    }]);
+  });
+
+  it('leaves local service endpoints and unknown source records intact', () => {
+    const sources = [{ kind: 'service', id: 'service:tts', url: 'http://127.0.0.1:8782' }, null, { kind: 'provider' }];
+    expect(pluginAiSources(sources)).toEqual(sources);
+  });
+});
 
 /** Run the real bootstrap source against this document, as the iframe would. */
 function boot(): void {
@@ -17,7 +42,7 @@ function boot(): void {
 }
 
 function send(message: unknown): void {
-  window.dispatchEvent(new MessageEvent('message', { data: message }));
+  window.dispatchEvent(new MessageEvent('message', { data: message, source: window.parent }));
 }
 
 describe('plugin iframe bootstrap: theme', () => {
@@ -68,5 +93,30 @@ describe('plugin iframe bootstrap: theme', () => {
     expect(host).toBeDefined();
     expect(typeof host!.command).toBe('function');
     expect(typeof host!.snapshot).toBe('function');
+  });
+
+  it('ignores a protocol message from a window other than its parent', () => {
+    window.dispatchEvent(new MessageEvent('message', { data: { __pluginHost: 1, theme: 'dark' }, source: null }));
+    expect(document.documentElement.classList.contains('fl-dark')).toBe(false);
+  });
+});
+
+describe('plugin RPC recovery', () => {
+  beforeEach(() => { vi.useFakeTimers(); boot(); });
+  afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); });
+  const host = () => (window as unknown as { PluginHost: { command: (name: string) => Promise<unknown> } }).PluginHost;
+
+  it('releases a pending action with an uncertain-outcome error when no reply arrives', async () => {
+    const result = host().command('phone.connect').catch((error: Error) => error.message);
+    await vi.advanceTimersByTimeAsync(20000);
+    expect(await result).toContain('outcome may be unknown');
+    expect(window.parent.postMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it('clears the deadline after a successful response', async () => {
+    const result = host().command('phone.status');
+    send({ __pluginHost: 1, id: 'r1', ok: true, data: { connected: true } });
+    expect(await result).toEqual({ connected: true });
+    expect(vi.getTimerCount()).toBe(0);
   });
 });

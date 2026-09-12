@@ -1,5 +1,6 @@
 import {
   Menu,
+  X,
   Activity,
   Check,
   ChevronRight,
@@ -17,7 +18,8 @@ import {
   Workflow,
   type LucideIcon,
 } from 'lucide-react';
-import type { ReactNode } from 'react';
+import { useEffect, useRef, type ReactNode } from 'react';
+import { useFocusTrap } from '../../hooks/useFocusTrap';
 
 /**
  * OAIY shell chrome — the sidebar, topbar and endpoint dock from the OAIY
@@ -49,6 +51,7 @@ export function ShellSidebar({
   runsOpen = false,
   pluginsOpen = false,
   navOpen = false,
+  isPhone = false,
   onCloseNav,
   view,
   onSelectView,
@@ -71,6 +74,7 @@ export function ShellSidebar({
   /** Below md the rail is off-canvas; this slides it in. Ignored above md,
    *  where the rail is part of the grid and always present. */
   navOpen?: boolean;
+  isPhone?: boolean;
   onCloseNav?: () => void;
   view: ShellView;
   onSelectView: (v: ShellView) => void;
@@ -83,6 +87,21 @@ export function ShellSidebar({
   companionOnline: boolean;
   companionDetail: string;
 }) {
+  const sidebarRef = useRef<HTMLElement>(null);
+  const closeRef = useRef<HTMLButtonElement>(null);
+  useFocusTrap(sidebarRef, isPhone && navOpen, closeRef);
+  useEffect(() => {
+    if (!isPhone || !navOpen) return;
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        onCloseNav?.();
+      }
+    };
+    document.addEventListener('keydown', onKey, true);
+    return () => document.removeEventListener('keydown', onKey, true);
+  }, [isPhone, navOpen, onCloseNav]);
   const nav: ShellNavItem[] = [
     {
       id: 'builder',
@@ -125,14 +144,15 @@ export function ShellSidebar({
     {navOpen && (
       <div className="oaiy-nav-scrim" onClick={onCloseNav} aria-hidden="true" />
     )}
-    <aside className={`oaiy-sidebar${navOpen ? ' is-open' : ''}`}>
+    <aside id="oaiy-navigation" ref={sidebarRef} className={`oaiy-sidebar${navOpen ? ' is-open' : ''}`} inert={isPhone && !navOpen} aria-hidden={isPhone && !navOpen ? true : undefined} role={isPhone && navOpen ? 'dialog' : undefined} aria-modal={isPhone && navOpen ? true : undefined} aria-label="Application navigation">
+      {isPhone && <button ref={closeRef} type="button" className="oaiy-nav-close oaiy-icon-btn" onClick={onCloseNav} aria-label="Close navigation"><X size={20} /></button>}
       <div className="oaiy-brand">
         <strong>OAIY</strong>
         <span>Orchestrate AI Yourself</span>
         <small>Connect. Draw. Expose.</small>
       </div>
 
-      <button className="oaiy-new" type="button" onClick={andClose(onNewFlow)}>
+      <button className="oaiy-new" type="button" aria-label="New flow" onClick={andClose(onNewFlow)}>
         <Plus size={17} />
         <span>New flow</span>
       </button>
@@ -146,6 +166,8 @@ export function ShellSidebar({
               key={item.id}
               className={item.active ? 'active' : ''}
               aria-current={item.active ? 'page' : undefined}
+              aria-label={item.label}
+              title={item.label}
               onClick={andClose(item.onClick)}
             >
               <Icon size={18} />
@@ -172,6 +194,7 @@ export function ShellSidebar({
       <button
         className={settingsActive ? 'oaiy-settings-btn active' : 'oaiy-settings-btn'}
         type="button"
+        aria-label="Settings"
         onClick={andClose(onOpenSettings)}
       >
         <Settings2 size={18} />
@@ -191,6 +214,7 @@ export function ShellSidebar({
 
 export function ShellTopbar({
   onOpenNav,
+  navOpen = false,
   crumb,
   children,
   chips,
@@ -202,6 +226,7 @@ export function ShellTopbar({
   /** Opens the off-canvas nav. Only rendered below md, where the rail is not
    *  in the grid — above md the rail is always visible and needs no opener. */
   onOpenNav?: () => void;
+  navOpen?: boolean;
   /** Uppercase breadcrumb line, e.g. `Workflows › Image Review Loop`. */
   crumb: string;
   /** The title row — an editable name input, or a plain heading. */
@@ -220,6 +245,8 @@ export function ShellTopbar({
           className="oaiy-nav-open oaiy-icon-btn"
           onClick={onOpenNav}
           aria-label="Open navigation"
+          aria-expanded={navOpen}
+          aria-controls="oaiy-navigation"
           title="Menu"
         >
           <Menu size={18} />

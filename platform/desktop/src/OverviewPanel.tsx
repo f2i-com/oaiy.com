@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   ChevronRight,
   CircleDot,
@@ -17,6 +17,7 @@ import { dismissGuide, reopenGuide, shouldAutoOpen } from './setupGuide';
 import type { StepTarget } from './setupGuide';
 import {
   aiProviders,
+  codex,
   bridge,
   nodeRuntime,
   type RuntimeStatus,
@@ -98,16 +99,26 @@ export default function OverviewPanel({ onNavigate, onOpenPluginScreen }: Props)
   const [runtime, setRuntime] = useState<RuntimeStatus | null>(() => peek('runtimeStatus') ?? null);
   // Shown until dismissed; the rows tick themselves, so it stays honest.
   const [guideOpen, setGuideOpen] = useState<boolean>(() => shouldAutoOpen());
+  const [codexConnected, setCodexConnected] = useState(false);
+  const [unavailable, setUnavailable] = useState<string[]>([]);
+  const refreshing = useRef(false);
 
   const refresh = useCallback(async () => {
+    if (refreshing.current) return;
+    refreshing.current = true;
     // Each read is independent: one failing surface must not blank the others.
-    const [s, p, a, c, r] = await Promise.allSettled([
+    const [s, p, a, c, r, cx] = await Promise.allSettled([
       services.list(),
       plugins.list(),
       aiProviders.list(),
       pairing.paired(),
       bridge.status(),
+      codex.status(),
     ]);
+    refreshing.current = false;
+    setCodexConnected(cx.status === 'fulfilled' && cx.value.connected);
+    const labels = ['services', 'plugins', 'AI providers', 'connections', 'runtime'];
+    setUnavailable([s, p, a, c, r].flatMap((result, index) => result.status === 'rejected' ? [labels[index]] : []));
     if (s.status === 'fulfilled') {
       setSvc(s.value.services);
       put('services', s.value.services);
@@ -126,14 +137,14 @@ export default function OverviewPanel({ onNavigate, onOpenPluginScreen }: Props)
 
   useEffect(() => {
     refresh();
-    const id = window.setInterval(refresh, POLL_MS);
+    const id = window.setInterval(() => { if (!document.hidden) void refresh(); }, POLL_MS);
     return () => window.clearInterval(id);
   }, [refresh]);
 
   const runningSvc = (svc ?? []).filter((s) => s.status === 'running').length;
   const runningPlug = (plug ?? []).filter((p) => p.state === 'running').length;
   const crashedPlug = (plug ?? []).filter((p) => p.state === 'crashed' || p.state === 'unhealthy');
-  const readyProv = (provs ?? []).filter((p) => p.enabled && (p.hasKey || p.allowLocal)).length;
+  const readyProv = (provs ?? []).filter((p) => p.enabled && (p.hasKey || p.allowLocal)).length + (codexConnected ? 1 : 0);
   const cards = overviewCards(plug ?? []);
 
   // The one-click Node fix — offered wherever the runtime is reported broken.
@@ -152,8 +163,15 @@ export default function OverviewPanel({ onNavigate, onOpenPluginScreen }: Props)
 
   return (
     <div className="panel">
+      {unavailable.length > 0 && (
+        <div className="banner banner-err" role="status">
+          <span>Couldn't refresh {unavailable.join(', ')}. Showing last known values where available.</span>
+          <button className="btn" onClick={() => void refresh()}>Refresh status</button>
+        </div>
+      )}
       {guideOpen && (
         <SetupGuidePanel
+          codexConnected={codexConnected}
           runtime={runtime}
           providers={provs}
           services={svc}
@@ -245,7 +263,7 @@ export default function OverviewPanel({ onNavigate, onOpenPluginScreen }: Props)
           </button>
           <button className="overview-tile" onClick={() => onNavigate('providers')}>
             <Sparkles size={16} aria-hidden />
-            <strong>{provs === null ? '—' : `${readyProv}/${provs.length}`}</strong>
+            <strong>{provs === null ? '—' : `${readyProv}/${provs.length + (codexConnected ? 1 : 0)}`}</strong>
             <small>AI providers ready</small>
           </button>
           <button className="overview-tile" onClick={() => onNavigate('connections')}>
@@ -274,7 +292,7 @@ export default function OverviewPanel({ onNavigate, onOpenPluginScreen }: Props)
               {installNode}
             </div>
           )}
-          {provs !== null && provs.length === 0 && (
+          {provs !== null && provs.length === 0 && !codexConnected && (
             <div className="datadir-note">
               <span>No AI provider configured — flows have no chat model to call.</span>
               <button className="btn-tiny" onClick={() => onNavigate('providers')}>

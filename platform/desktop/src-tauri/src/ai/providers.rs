@@ -284,12 +284,12 @@ impl ProviderStore {
     }
 
     /// The default provider for a capability: the first enabled, capable provider
-    /// that actually holds a key. Used when a caller hits `/api/ai/v1/*` with no
+    /// that holds a key or is an explicitly allowed local OpenAI-compatible endpoint. Used when a caller hits `/api/ai/v1/*` with no
     /// explicit id. Flat — no aliases.
     pub fn default_for(&self, cap: Capability) -> Option<AiProvider> {
         self.providers
             .iter()
-            .find(|p| p.enabled && p.supports(cap) && p.has_key())
+            .find(|p| p.enabled && p.supports(cap) && (p.has_key() || (p.protocol == Protocol::OpenAi && p.allow_local)))
             .cloned()
     }
 
@@ -410,6 +410,23 @@ mod tests {
         let mut off = input("openai");
         off.enabled = false;
         s.upsert(off).unwrap();
+        assert!(s.default_for(Capability::Chat).is_none());
+    }
+
+    #[test]
+    fn default_accepts_keyless_local_openai_but_not_disabled_or_anthropic() {
+        let mut s = ProviderStore::new();
+        let mut local = input("local-qwen");
+        local.base_url = "http://127.0.0.1:8088".into();
+        local.allow_local = true;
+        s.upsert(local.clone()).unwrap();
+        assert_eq!(s.default_for(Capability::Chat).unwrap().id, "local-qwen");
+        local.enabled = false;
+        s.upsert(local.clone()).unwrap();
+        assert!(s.default_for(Capability::Chat).is_none());
+        local.enabled = true;
+        local.protocol = Protocol::Anthropic;
+        s.upsert(local).unwrap();
         assert!(s.default_for(Capability::Chat).is_none());
     }
 

@@ -1734,6 +1734,32 @@ pub fn run() {
 }
 } // mod gui
 
+// Debug builds simulate plugin hardware by default. An explicit local override
+// lets developers exercise a real device without changing release profiles.
+fn plugin_development_mode(value: Option<&str>, debug_build: bool) -> bool {
+    match value.map(str::trim) {
+        Some("0" | "false") => false,
+        Some("1" | "true") => true,
+        None => debug_build,
+        // A typo must never unexpectedly enable real hardware.
+        Some(_) => true,
+    }
+}
+
+#[cfg(test)]
+mod plugin_mode_tests {
+    #[test]
+    fn hardware_mode_requires_an_explicit_valid_override_in_debug() {
+        use super::plugin_development_mode as mode;
+        assert!(mode(None, true));
+        assert!(!mode(None, false));
+        assert!(!mode(Some("0"), true));
+        assert!(!mode(Some("false"), true));
+        assert!(mode(Some("true"), false));
+        assert!(mode(Some("typo"), false));
+    }
+}
+
 /// Build the bridge state both binaries share: ledger, plugin registry + host,
 /// trigger store, flow store — and start the flow worker.
 ///
@@ -1766,7 +1792,7 @@ pub fn build_bridge_state(
         triggers,
         dead.clone(),
         env!("CARGO_PKG_VERSION").to_string(),
-        cfg!(debug_assertions),
+        plugin_development_mode(std::env::var("OAIY_PLUGIN_DEV_MODE").ok().as_deref(), cfg!(debug_assertions)),
     );
     // The account's app logic scripts run through the bundled CLI, which runs
     // under Node — and a packaged install cannot assume one is on PATH. Same

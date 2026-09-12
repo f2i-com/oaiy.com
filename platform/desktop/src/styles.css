@@ -1615,3 +1615,35 @@ select:disabled { cursor: not-allowed; opacity: 0.5; }
 .pairing-actions { display: flex; gap: 8px; margin-top: 12px; }
 .pairing-list { list-style: none; margin: 6px 0 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
 .pairing-list li { display: flex; align-items: center; justify-content: space-between; font-size: 13px; }
+.pairing-connected { padding: 0; }
+.pairing-summary { display: flex; align-items: center; gap: 8px; min-height: 48px; padding: 12px 16px; cursor: pointer; list-style: none; font-size: 13px; }
+.pairing-summary::-webkit-details-marker { display: none; }
+.pairing-summary:focus-visible { outline: 2px solid var(--primary); outline-offset: 3px; border-radius: 12px; }
+.pairing-summary > svg { flex-shrink: 0; }
+.pairing-summary-hint { margin-left: auto; color: var(--muted); font-size: 12px; }
+.pairing-summary-chevron { margin-left: auto; }
+.pairing-summary-hint + .pairing-summary-chevron { margin-left: 0; }
+.pairing-connected[open] .pairing-summary-chevron { transform: rotate(180deg); }
+.pairing-connected .pairing-list { max-height: 320px; overflow-y: auto; margin: 0; padding: 0 16px 12px; overscroll-behavior: contain; }
+.pairing-connected .pairing-list li { align-items: center; gap: 16px; padding: 12px 0; border-top: 1px solid var(--border); }
+.pairing-app-info { min-width: 0; overflow-wrap: anywhere; }
+.pairing-app-info .pairing-origin { white-space: normal; overflow-wrap: anywhere; }
+.pairing-approved-at { display: block; margin-top: 4px; color: var(--muted); font-size: 12px; }
+.pairing-connected .btn-tiny { min-height: 40px; flex-shrink: 0; }
+.pairing-body { overflow-wrap: anywhere; }
+@media (max-width: 480px) {
+  .pairing-summary { flex-wrap: wrap; }
+  .pairing-summary-hint { display: none; }
+  .pairing-summary-hint + .pairing-summary-chevron { margin-left: auto; }
+  .pairing-connected .btn-tiny { min-height: 44px; }
+}
+/* Guided setup remains usable in narrow desktop windows. */
+.setup-wizard { margin: 16px 0; padding: 20px; border: 1px solid var(--border, #404040); border-radius: 14px; min-width: 0; }
+.setup-wizard h4 { margin: 20px 0 8px; font-size: 17px; }
+.setup-wizard-nav, .setup-wizard-footer { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+.setup-wizard-nav [aria-current="step"], .setup-wizard-nav [aria-pressed="true"] { outline: 2px solid var(--accent, #6989ff); outline-offset: 2px; }
+.setup-wizard-footer { margin-top: 20px; justify-content: space-between; }
+.setup-wizard-instructions { padding-left: 22px; font-size: 13px; line-height: 1.8; overflow-wrap: anywhere; }
+.setup-wizard-choice { margin-top: 16px; }
+.setup-wizard .service-section { margin-top: 20px; }
+@media (max-width: 480px) { .setup-wizard { padding: 14px; } .setup-wizard .form-actions { flex-wrap: wrap; } .setup-wizard-nav button { flex: 1 1 auto; min-height: 40px; } }

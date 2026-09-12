@@ -1,4 +1,5 @@
-# Continuous checks on every push and pull request: the web app's test chain
+# Automatic CI is temporarily paused; run these checks manually when needed.
+# The web app's test chain
 # (typecheck, CSS tokens, node contracts, the Zipp sandbox against the real
 # vendored engine, and engine routing) and the CLI's engine suites. Neither
 # needs a browser, a service or a Rust toolchain; the release workflow is
@@ -7,9 +8,7 @@
 name: CI
 
 on:
-  push:
-    branches: [main]
-  pull_request:
+  workflow_dispatch:
 
 jobs:
   web:

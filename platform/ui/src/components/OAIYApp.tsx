@@ -20,6 +20,7 @@ import ProjectImportButton from './ProjectImportButton';
 import { ShellSidebar, ShellTopbar, ShellIconAction, ShellDock } from './chrome/ShellChrome';
 import { Activity, HelpCircle, PanelLeft, Settings2, Share2 } from 'lucide-react';
 import { useTheme } from '../contexts/ThemeContext';
+import { useMediaQuery } from '../hooks/useMediaQuery';
 import {
   DESKTOP_API_BASE,
   getDesktopInfo,
@@ -146,6 +147,8 @@ export default function OAIYApp() {
   // Below md the left rail is off-canvas (see index.css "phone: the rail
   // becomes a drawer"). Above md it is a grid column and this stays false.
   const [navOpen, setNavOpen] = useState(false);
+  const isPhone = useMediaQuery('(width < 760px)');
+  useEffect(() => { if (!isPhone) setNavOpen(false); }, [isPhone]);
   // Track which Settings tab to land on. The agent panel's "Manage in
   // Settings…" affordance deep-links to 'models'; the toolbar gear
   // leaves it `undefined` so the panel restores the user's last tab.
@@ -596,6 +599,7 @@ export default function OAIYApp() {
         runsOpen={queuePanelOpen}
         pluginsOpen={showPackageBrowser}
         navOpen={navOpen}
+        isPhone={isPhone}
         onCloseNav={() => setNavOpen(false)}
         view={activeTab}
         onSelectView={(v) => {
@@ -637,8 +641,9 @@ export default function OAIYApp() {
         }
       />
 
-      <main id="oaiy-main" className="oaiy-workspace">
+      <main id="oaiy-main" className="oaiy-workspace" inert={isPhone && navOpen}>
         <ShellTopbar
+          navOpen={navOpen}
           onOpenNav={() => setNavOpen(true)}
           crumb={activeTab === 'data' ? 'Data' : 'Workflows'}
           theme={resolvedTheme}

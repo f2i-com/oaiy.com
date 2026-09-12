@@ -38,6 +38,10 @@ use super::LinkedAccount;
 /// fire it — and long enough that a burst of events is not a burst of fetches.
 const BINDINGS_TTL: Duration = Duration::from_secs(60);
 
+/// A failed refresh must not hold up every subsequent plugin event while the
+/// provider is unavailable. Keep the last list and retry after a short pause.
+const FETCH_RETRY_AFTER: Duration = Duration::from_secs(30);
+
 /// Bindings one event may fire, mirroring the local dispatcher's bound: a
 /// misconfigured account should not turn one call into hundreds of runs.
 const MAX_BINDINGS_PER_EVENT: usize = 5;
@@ -87,7 +91,6 @@ fn default_true() -> bool {
 
 #[derive(Debug, Deserialize)]
 struct BindingsReply {
-    #[serde(default)]
     bindings: Vec<Binding>,
 }
 
@@ -127,7 +130,17 @@ impl Skip {
 
 /// Bindings, cached briefly.
 pub struct FlowBindings {
-    inner: Mutex<Option<(Instant, Vec<Binding>)>>,
+    inner: Mutex<BindingsState>,
+}
+
+#[derive(Default)]
+struct BindingsState {
+    // The runner's cache outlives a link. Never reuse another account's output
+    // actions, even during the TTL or when the new provider cannot be reached.
+    source: Option<(LinkedAccount, String)>,
+    fetched: Option<(Instant, Vec<Binding>)>,
+    retry_at: Option<Instant>,
+    last_error: Option<String>,
 }
 
 impl Default for FlowBindings {
@@ -139,7 +152,7 @@ impl Default for FlowBindings {
 impl FlowBindings {
     pub fn new() -> Self {
         Self {
-            inner: Mutex::new(None),
+            inner: Mutex::new(BindingsState::default()),
         }
     }
 
@@ -153,23 +166,42 @@ impl FlowBindings {
         account: &LinkedAccount,
         spec: &FlowsSpec,
     ) -> Result<Vec<Binding>, String> {
-        {
-            let cached = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some((at, list)) = cached.as_ref() {
-                if at.elapsed() < BINDINGS_TTL {
-                    return Ok(list.clone());
-                }
+        // Serialize refreshes as well as cache access: an older in-flight
+        // request must not overwrite the bindings for a newly linked account.
+        let mut state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if state.source.as_ref().map_or(true, |(held, path)| {
+            held != account || path != &spec.bindings_path
+        }) {
+            *state = BindingsState {
+                source: Some((account.clone(), spec.bindings_path.clone())),
+                ..BindingsState::default()
+            };
+        }
+        if let Some((at, list)) = state.fetched.as_ref() {
+            if at.elapsed() < BINDINGS_TTL {
+                return Ok(list.clone());
             }
+        }
+        if state.retry_at.is_some_and(|at| Instant::now() < at) {
+            return match state.fetched.as_ref() {
+                Some((_, list)) => Ok(list.clone()),
+                None => Err(state.last_error.clone().unwrap_or_else(|| {
+                    "the account's flow bindings could not be read; waiting to retry".into()
+                })),
+            };
         }
         match fetch(account, spec) {
             Ok(list) => {
-                *self.inner.lock().unwrap_or_else(|e| e.into_inner()) =
-                    Some((Instant::now(), list.clone()));
+                state.fetched = Some((Instant::now(), list.clone()));
+                state.retry_at = None;
+                state.last_error = None;
                 Ok(list)
             }
             Err(e) => {
-                let cached = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-                match cached.as_ref() {
+                state.retry_at = Some(Instant::now() + FETCH_RETRY_AFTER);
+                state.last_error = Some(e.clone());
+                log::warn!("could not refresh flow bindings: {e}");
+                match state.fetched.as_ref() {
                     Some((_, list)) => Ok(list.clone()),
                     None => Err(e),
                 }
@@ -179,7 +211,7 @@ impl FlowBindings {
 
     /// Drop the cache, so the next event refetches.
     pub fn invalidate(&self) {
-        *self.inner.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *self.inner.lock().unwrap_or_else(|e| e.into_inner()) = BindingsState::default();
     }
 }
 
@@ -426,6 +458,134 @@ mod tests {
             .into_iter()
             .find_map(|c| c.flows)
             .expect("the built-in connector describes its flows lane")
+    }
+
+    fn account(base: String) -> LinkedAccount {
+        LinkedAccount {
+            connector_id: "formlogic".into(),
+            base_url: base,
+            credential: "test-key-one".into(),
+            account_id: Some("account-one".into()),
+            account_name: None,
+            granted_scopes: None,
+            linked_at: chrono::Utc::now(),
+            instance_id: Some("test-desktop".into()),
+        }
+    }
+
+    /// Serve only the expected reads. The notification channel lets recovery
+    /// tests prove that events during backoff did not make more HTTP requests.
+    fn binding_server(
+        replies: Vec<(&'static str, &'static str)>,
+    ) -> (String, std::sync::mpsc::Receiver<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            for (status, body) in replies {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0; 1024];
+                while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                    let length = stream.read(&mut buffer).unwrap();
+                    assert_ne!(length, 0);
+                    request.extend_from_slice(&buffer[..length]);
+                }
+                let _ = tx.send(());
+                write!(stream, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+        });
+        (format!("http://{address}"), rx)
+    }
+
+    const FIRST_BINDINGS: &str = r#"{"bindings":[{"id":"first","event":"aokie.call.ended","flow":"summary"}]}"#;
+    const SECOND_BINDINGS: &str = r#"{"bindings":[{"id":"second","event":"aokie.call.ended","flow":"summary"}]}"#;
+
+    #[test]
+    fn reconnecting_with_a_new_key_never_reuses_the_previous_accounts_bindings() {
+        let (base, requests) = binding_server(vec![("200 OK", FIRST_BINDINGS), ("200 OK", SECOND_BINDINGS)]);
+        let mut account = account(base);
+        let cache = FlowBindings::new();
+        let spec = shipped_flows();
+        assert_eq!(cache.load(&account, &spec).unwrap()[0].id, "first");
+        // The same account id may be retained when credentials are reissued.
+        // A reconnect still needs a fresh list and fresh permission checks.
+        account.credential = "test-key-two".into();
+        assert_eq!(cache.load(&account, &spec).unwrap()[0].id, "second");
+        assert_eq!(requests.iter().count(), 2);
+    }
+
+    #[test]
+    fn changing_providers_does_not_fall_back_to_the_previous_providers_actions() {
+        let (first, _) = binding_server(vec![("200 OK", FIRST_BINDINGS)]);
+        let (second, _) = binding_server(vec![("503 Service Unavailable", r#"{"message":"offline"}"#)]);
+        let mut account = account(first);
+        let cache = FlowBindings::new();
+        let spec = shipped_flows();
+        assert_eq!(cache.load(&account, &spec).unwrap()[0].id, "first");
+        account.base_url = second;
+        assert!(cache.load(&account, &spec).unwrap_err().contains("503"));
+    }
+
+    #[test]
+    fn an_outage_reuses_known_bindings_without_blocking_every_event_and_recovers() {
+        let (base, requests) = binding_server(vec![
+            ("200 OK", FIRST_BINDINGS),
+            ("503 Service Unavailable", r#"{"message":"offline"}"#),
+            ("200 OK", SECOND_BINDINGS),
+        ]);
+        let account = account(base);
+        let cache = FlowBindings::new();
+        let spec = shipped_flows();
+        assert_eq!(cache.load(&account, &spec).unwrap()[0].id, "first");
+        requests.recv().unwrap();
+        cache.inner.lock().unwrap().fetched.as_mut().unwrap().0 = Instant::now() - BINDINGS_TTL;
+        assert_eq!(cache.load(&account, &spec).unwrap()[0].id, "first");
+        requests.recv().unwrap();
+        for _ in 0..5 {
+            assert_eq!(cache.load(&account, &spec).unwrap()[0].id, "first");
+        }
+        assert!(requests.try_recv().is_err(), "events during backoff must not fetch again");
+        cache.inner.lock().unwrap().retry_at = Some(Instant::now());
+        assert_eq!(cache.load(&account, &spec).unwrap()[0].id, "second");
+        requests.recv().unwrap();
+        assert!(cache.inner.lock().unwrap().last_error.is_none());
+    }
+
+    #[test]
+    fn an_initial_failure_backs_off_and_invalidation_allows_immediate_recovery() {
+        let (base, requests) = binding_server(vec![
+            ("503 Service Unavailable", r#"{"message":"offline"}"#),
+            ("200 OK", FIRST_BINDINGS),
+        ]);
+        let account = account(base);
+        let cache = FlowBindings::new();
+        let spec = shipped_flows();
+        let failure = cache.load(&account, &spec).unwrap_err();
+        requests.recv().unwrap();
+        assert_eq!(cache.load(&account, &spec).unwrap_err(), failure);
+        assert!(requests.try_recv().is_err());
+        cache.invalidate();
+        assert_eq!(cache.load(&account, &spec).unwrap()[0].id, "first");
+        requests.recv().unwrap();
+    }
+
+    #[test]
+    fn an_unrecognized_successful_reply_does_not_erase_known_bindings() {
+        let (base, requests) = binding_server(vec![("200 OK", FIRST_BINDINGS), ("200 OK", "{}")]);
+        let account = account(base);
+        let cache = FlowBindings::new();
+        let spec = shipped_flows();
+        cache.load(&account, &spec).unwrap();
+        cache.inner.lock().unwrap().fetched.as_mut().unwrap().0 = Instant::now() - BINDINGS_TTL;
+        assert_eq!(cache.load(&account, &spec).unwrap()[0].id, "first");
+        assert!(cache.inner.lock().unwrap().last_error.as_ref().unwrap().contains("unreadable binding list"));
+        assert_eq!(requests.iter().count(), 2);
+        // An explicitly empty catalogue remains valid: all triggers may have
+        // been removed by the owner.
+        assert!(serde_json::from_value::<BindingsReply>(json!({"bindings": []})).unwrap().bindings.is_empty());
     }
 
     #[test]

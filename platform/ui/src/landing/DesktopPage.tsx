@@ -25,7 +25,7 @@ const API_BASE = ((import.meta.env.VITE_API_BASE as string | undefined) || '').r
 export default function DesktopPage() {
   return (
     <div
-      className="min-h-screen w-full overflow-x-hidden"
+      className="oaiy-site min-h-screen w-full"
       style={{ backgroundColor: 'rgb(var(--color-bg-primary))', color: 'rgb(var(--color-text-primary))' }}
     >
       <SiteNav
@@ -38,7 +38,7 @@ export default function DesktopPage() {
           { id: 'library', label: 'Service library' },
         ]}
       />
-      <main>
+      <main id="main-content">
         <Hero />
         <HowItWorks />
         <Capabilities />
@@ -57,16 +57,16 @@ export default function DesktopPage() {
 
 function Hero() {
   return (
-    <section className="bg-dotgrid">
+    <section id="top" className="oaiy-hero oaiy-desktop-hero">
       <div className="mx-auto max-w-6xl px-5 pb-14 pt-12 sm:px-8 sm:pb-20 sm:pt-20">
-        <div className="max-w-3xl">
-          <h1 className="lp-reveal lp-h1" style={{ animationDelay: '60ms', fontSize: 'clamp(2.4rem, 5.5vw, 4rem)' }}>
-            The desktop app does the heavy local work.
+        <div className="oaiy-hero-copy">
+          <p className="oaiy-kicker">OAIY DESKTOP / THE LOCAL RUNTIME</p>
+          <h1 className="lp-reveal lp-h1" style={{ animationDelay: '60ms' }}>
+            Your machine.<br /><em>Put to work.</em>
           </h1>
           <p className="lp-reveal lp-lede mt-6" style={{ animationDelay: '140ms' }}>
-            A small system-tray app that does what a browser cannot: starts model
-            servers, downloads weights, runs Python, hosts the headless browser.
-            It hands all of that to the web app over localhost.
+            Give your workflows a home on your own hardware. Manage models,
+            services and plugins from one desktop app, and connect them to the web canvas over localhost.
           </p>
           <div className="lp-reveal mt-8 flex flex-wrap items-center gap-3" style={{ animationDelay: '220ms' }}>
             <a href="#install" className="btn btn-primary btn-lg">
@@ -79,8 +79,13 @@ function Hero() {
             className="lp-reveal mt-5 inline-flex items-center gap-1.5 text-sm"
             style={{ animationDelay: '300ms', color: 'rgb(var(--color-text-tertiary))' }}
           >
-            <WindowsIcon /> Windows. Optional: the web app works fully on its own.
+            <WindowsIcon /> Windows desktop app. The browser editor can be opened separately.
           </p>
+        </div>
+        <div className="oaiy-runtime-strip" aria-label="Desktop capabilities">
+          <div><span>01 / MODELS</span><h2>Choose the intelligence.</h2><p>Download weights and manage local model servers.</p></div>
+          <div><span>02 / SERVICES</span><h2>Connect the tools.</h2><p>Bring Python, browser automation and plugins into your flows.</p></div>
+          <div><span>03 / WORKFLOWS</span><h2>Keep the work moving.</h2><p>Run linked flows locally, with status and logs to inspect.</p></div>
         </div>
       </div>
     </section>
@@ -185,6 +190,10 @@ function Install() {
       sub="Optional and local only. Without it the app still works; a node that needs a desktop service says so and tells you what to start."
       tone="var(--signal-green)"
     >
+      <div className="mb-8 flex flex-wrap gap-3">
+        <a className="btn btn-primary btn-lg" href={`${REPO_URL}/releases/latest`}><DownloadIcon /> Get the latest release</a>
+        <a className="btn btn-secondary btn-lg" href={`${REPO_URL}/tree/main/desktop`}>Installation documentation</a>
+      </div>
       <ol className="lp-steps">
         {steps.map((s, i) => (
           <li key={s.title} className="lp-step">
@@ -306,47 +315,62 @@ interface LibraryItem {
 function Library() {
   const [state, setState] = useState<'loading' | 'ok' | 'error'>('loading');
   const [items, setItems] = useState<LibraryItem[]>([]);
+  const [attempt, setAttempt] = useState(0);
 
   useEffect(() => {
     let cancelled = false;
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), 12000);
+    setState('loading');
     (async () => {
       try {
-        const res = await fetch(`${API_BASE}/api/service-library`, { headers: { Accept: 'application/json' } });
+        const res = await fetch(`${API_BASE}/api/service-library`, { headers: { Accept: 'application/json' }, signal: controller.signal });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = await res.json();
+        if (!Array.isArray(data?.services) || !data.services.every((item: unknown) => {
+          if (!item || typeof item !== 'object') return false;
+          const entry = item as Record<string, unknown>;
+          return ['file', 'name', 'description', 'downloadUrl'].every((key) => typeof entry[key] === 'string')
+            && (entry.category === undefined || typeof entry.category === 'string')
+            && /^\/api\//.test(entry.downloadUrl as string)
+            && !(entry.downloadUrl as string).includes('\\');
+        })) throw new Error('Invalid service library response');
         if (cancelled) return;
         setItems(Array.isArray(data.services) ? data.services : []);
         setState('ok');
       } catch {
         if (!cancelled) setState('error');
+      } finally {
+        window.clearTimeout(timeout);
       }
     })();
-    return () => { cancelled = true; };
-  }, []);
+    return () => { cancelled = true; controller.abort(); window.clearTimeout(timeout); };
+  }, [attempt]);
 
   return (
     <Section
       id="library"
       title="Ready-made services"
-      sub="Example service templates you can download and import into OAIY Desktop. Each is a plain .json file served live from a folder on the API; new examples are just dropped in."
+      sub="A starting point for your local setup. Download a service template, review its commands and import it into OAIY Desktop."
       tone="var(--accent-primary)"
     >
       {state === 'loading' && (
-        <p className="text-sm" style={{ color: 'rgb(var(--color-text-tertiary))' }}>Loading the library…</p>
+        <p role="status" className="text-sm" style={{ color: 'rgb(var(--color-text-tertiary))' }}>Loading the library…</p>
       )}
 
       {state === 'error' && (
-        <div className="lp-note">
-          <p>The library is served by the OAIY API, which is not reachable from here.</p>
-          <p>
-            Run the API in <code>api/</code> and set <code>VITE_API_BASE</code> to its URL, or browse the example files directly in <code>api/service-library/</code>.
-          </p>
+        <div className="lp-note" role="status">
+          <p>We couldn’t load the service library. Try again, or browse the templates on GitHub.</p>
+          <div className="mt-4 flex flex-wrap gap-3">
+            <button type="button" className="btn btn-secondary btn-sm" onClick={() => setAttempt((value) => value + 1)}>Try again</button>
+            <a className="btn btn-secondary btn-sm" href={`${REPO_URL}/tree/main/api/service-library`}>Browse templates</a>
+          </div>
         </div>
       )}
 
       {state === 'ok' && items.length === 0 && (
         <p className="text-sm" style={{ color: 'rgb(var(--color-text-tertiary))' }}>
-          No examples in the library yet. Drop a .json into <code className="font-mono">api/service-library/</code>.
+          No templates are available yet. You can create a service using the example above.
         </p>
       )}
 

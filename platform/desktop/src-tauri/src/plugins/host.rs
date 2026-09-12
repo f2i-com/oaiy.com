@@ -1421,8 +1421,23 @@ impl PluginHost {
             // Alive, and alive is what the restart budget is bought with.
             self.refill_restart_budget_if_stable(&id);
 
+            let health = process.health();
+            // A stop/restart may have replaced this process during the probe.
+            // Keep ownership stable while publishing its result so the old
+            // process cannot mark a fresh one healthy or undo a manual stop.
+            let processes = match self.procs.lock() {
+                Ok(processes) => processes,
+                Err(_) => continue,
+            };
+            if !processes.running.get(&id).is_some_and(|current| Arc::ptr_eq(current, &process)) {
+                trackers.remove(&id);
+                continue;
+            }
+            if let Ok(mut registry) = self.registry.lock() {
+                registry.note_health(&id, health.as_ref().map_err(|error| error.to_string()));
+            }
             let tracker = trackers.entry(id.clone()).or_default();
-            match process.health() {
+            match health {
                 Ok(v) if v.get("status").and_then(Value::as_str) == Some("ok") => {
                     if tracker.record_ok() == HealthVerdict::Ok {
                         // Only lift Unhealthy → Running when it was unhealthy;
@@ -2300,6 +2315,9 @@ mod tests {
             unknown_capabilities: Vec::new(),
             user_disabled: false,
             restart_attempts: attempts,
+            last_health: None,
+            last_health_at: None,
+            last_health_error: None,
         });
     }
 
