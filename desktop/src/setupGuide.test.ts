@@ -112,3 +112,9 @@ describe('completion', () => {
     expect(steps.find((s) => s.id === 'ai')!.blocker).toBeUndefined();
   });
 });
+
+it('counts a managed Codex sign-in as AI readiness and clears it on sign-out', () => {
+  expect(step({ ...base, codexConnected: true }, 'ai').done).toBe(true);
+  expect(setupComplete(deriveSetupSteps({ ...base, codexConnected: true }))).toBe(true);
+  expect(step({ ...base, codexConnected: false }, 'ai').done).toBe(false);
+});

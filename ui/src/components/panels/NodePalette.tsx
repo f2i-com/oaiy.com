@@ -1,5 +1,7 @@
 import { memo, useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { createPortal } from 'react-dom';
+import { useFocusTrap } from '../../hooks/useFocusTrap';
+import { useMediaQuery } from '../../hooks/useMediaQuery';
 import type { NodeType, Flow } from 'oaiy-core';
 import { useModuleNodes, getNodeColorClasses, getNodeIcon } from '../../hooks/useModuleNodes';
 import type { PackageNodeInfo } from '../../hooks/usePackageNodes';
@@ -14,6 +16,7 @@ export interface MacroNodeData {
 }
 
 interface NodePaletteProps {
+  docked?: boolean;
   onAddNode: (type: NodeType) => void;
   onAddNodeAtPosition?: (type: NodeType, x: number, y: number) => void;
   isOpen: boolean;
@@ -46,7 +49,20 @@ export function clearGlobalDragState() {
   globalDragState = { isDragging: false, nodeType: null, macroData: null };
 }
 
-function NodePalette({ onAddNode, onAddNodeAtPosition, isOpen, onClose, macros, onAddMacro, onAddMacroAtPosition, activePackageId, packageNodes }: NodePaletteProps) {
+function NodePalette({ docked = false, onAddNode, onAddNodeAtPosition, isOpen, onClose, macros, onAddMacro, onAddMacroAtPosition, activePackageId, packageNodes }: NodePaletteProps) {
+  const panelRef = useRef<HTMLDivElement>(null);
+  const closeRef = useRef<HTMLButtonElement>(null);
+  const compact = useMediaQuery('(width < 1280px)');
+  useFocusTrap(panelRef, !docked && compact && isOpen, closeRef);
+  useEffect(() => {
+    if (docked || !isOpen) return;
+    if (!compact) { onClose(); return; }
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') { event.preventDefault(); onClose(); }
+    };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [docked, compact, isOpen, onClose]);
   const { groupedNodes, isLoading, error, nodes } = useModuleNodes({
     activePackageId,
     packageNodes,
@@ -235,10 +251,10 @@ function NodePalette({ onAddNode, onAddNodeAtPosition, isOpen, onClose, macros, 
     }
     onAddNode(type);
     // Close on mobile after adding
-    if (window.innerWidth < 768) {
+    if (!docked && compact) {
       onClose();
     }
-  }, [draggingType, onAddNode, onClose]);
+  }, [draggingType, onAddNode, onClose, docked, compact]);
 
   // Get the label for the dragging type
   const getDragLabel = useCallback((type: NodeType) => {
@@ -428,10 +444,10 @@ function NodePalette({ onAddNode, onAddNodeAtPosition, isOpen, onClose, macros, 
     if (onAddMacro) {
       onAddMacro(createMacroNodeData(macro));
     }
-    if (window.innerWidth < 768) {
+    if (!docked && compact) {
       onClose();
     }
-  }, [draggingMacro, onAddMacro, createMacroNodeData, onClose]);
+  }, [draggingMacro, onAddMacro, createMacroNodeData, onClose, docked, compact]);
 
   return (
     <>
@@ -445,6 +461,12 @@ function NodePalette({ onAddNode, onAddNodeAtPosition, isOpen, onClose, macros, 
 
       {/* Palette panel */}
       <div
+        ref={panelRef}
+        inert={!docked && !isOpen}
+        aria-hidden={!docked && !isOpen ? true : undefined}
+        role={!docked ? 'dialog' : undefined}
+        aria-modal={!docked && isOpen ? true : undefined}
+        aria-label="Node palette"
         className={`
           fixed xl:relative z-50 xl:z-auto left-0 xl:left-auto inset-y-0 xl:inset-y-auto
           h-full bg-white dark:bg-slate-900 border-r border-[rgb(var(--color-border-primary))] flex flex-col
@@ -461,8 +483,9 @@ function NodePalette({ onAddNode, onAddNodeAtPosition, isOpen, onClose, macros, 
             </div>
             {/* Close button for mobile */}
             <button
+              ref={closeRef}
               onClick={onClose}
-              className="xl:hidden p-1.5 hover:bg-slate-100 dark:hover:bg-slate-800 rounded transition-colors"
+              className="xl:hidden min-h-11 min-w-11 inline-flex items-center justify-center hover:bg-slate-100 dark:hover:bg-slate-800 rounded transition-colors"
               aria-label="Close node palette"
             >
               <svg className="w-5 h-5 text-slate-500 dark:text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">

@@ -23,6 +23,7 @@ vi.mock('./api', () => ({
   services: { list: servicesMock },
   plugins: { list: pluginsMock },
   aiProviders: { list: providersMock },
+  codex: { status: vi.fn().mockResolvedValue({available:false,connected:false}) },
   pairing: { paired: pairedMock },
   bridge: { status: statusMock },
   nodeRuntime: { install: nodeInstallMock },
@@ -57,6 +58,7 @@ const button = (label: string) =>
   Array.from(host.querySelectorAll('button')).find((b) => b.textContent?.includes(label));
 
 beforeEach(() => {
+  vi.clearAllMocks();
   invalidate();
   onNavigate.mockReset();
   servicesMock.mockResolvedValue({ services: [], dataDir: 'C:\\d' });
@@ -78,6 +80,14 @@ afterEach(() => {
 });
 
 describe('OverviewPanel failure reporting', () => {
+  it('surfaces partial refresh failures and recovers on demand', async () => {
+    servicesMock.mockRejectedValueOnce(new Error('offline'));
+    await mount();
+    expect(text()).toContain("Couldn't refresh services");
+    await act(async () => button('Refresh status')!.click());
+    expect(text()).not.toContain("Couldn't refresh services");
+    expect(servicesMock).toHaveBeenCalledTimes(2);
+  });
   it('reports failed runs even while the setup guide is open', async () => {
     reopenGuide(); // guide auto-opens, as on a fresh install
     await mount();

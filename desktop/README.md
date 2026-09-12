@@ -183,18 +183,28 @@ Configuration is by environment variable (no pointer file):
 | `OAIY_DATA_DIR` | `~/.oaiy-server` | data root (databases, venvs, templates) |
 | `OAIY_MODELS_DIR` | `<data>/models` | where downloads land |
 | `OAIY_EXTRA_MODEL_DIRS` | — | extra read-only model roots (`:`/`;`-separated) |
-| `OAIY_SERVER_PORT` | `17972` | listen port (loopback only) |
-| `OAIY_SERVER_TOKEN` | — | bearer token gating privileged routes |
+| `OAIY_SERVER_PORT` | `17972` | listen port (loopback by default) |
+| `OAIY_SERVER_BIND` | — | `lan` enables network binding; requires a token |
+| `OAIY_PLUGIN_DEV_MODE` | debug: `true`, release: `false` | `0`/`false` runs plugins against real hardware; `1`/`true` simulates. Invalid values keep simulation enabled. |
+| `OAIY_SERVER_TOKEN` | — | bearer token required for non-public headless APIs |
 | `OAIY_HF_TOKEN` | — | HuggingFace token for gated downloads |
 | `OAIY_LLAMACPP_MODEL` | — | GGUF the llama.cpp service loads (relative to the models dir) |
 | `OAIY_OLLAMA_MODEL` | — | model tag the Ollama service serves |
 
-**Auth:** reads stay open on loopback. *Privileged* routes (define a service,
-install Python, create/delete a venv, delete a model/service) require either an
-allowed browser origin **or** `Authorization: Bearer <OAIY_SERVER_TOKEN>`. With
-no token set those routes are effectively closed to the headless CLI — set a
-token to administer the server remotely. `SIGTERM`/`Ctrl-C` stops all managed
-services before exit (clean `systemctl stop`).
+**Auth:** set `OAIY_SERVER_TOKEN` and send it as `Authorization: Bearer …`.
+Headless APIs require a valid token for reads and writes except health,
+capability discovery and pairing bootstrap. Missing or forged Origin headers
+never substitute for credentials. Network binding without a token fails at
+startup, including when launched from the GUI. `SIGTERM`/`Ctrl-C` stops managed
+services before exit.
+
+**Release contents:** headless archives now include `resources/cli` and a Node
+binary under `resources/node`. Keep these beside the server executable. The
+bundled runtime takes precedence over the data directory and PATH; no runtime
+download is needed for core flows. `distribution.json` records the exact Node
+version, platform and file hashes. Optional browser/image nodes still require
+their documented services/dependencies. Release CI extracts the final archive
+and executes a real flow through HTTP with system Node excluded from PATH.
 
 **Service installs on Linux:** each service template carries a `unix` install
 script (`.sh`) alongside the Windows one, embedded + seeded by the registry.

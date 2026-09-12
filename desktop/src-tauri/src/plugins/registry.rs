@@ -170,6 +170,14 @@ pub struct PluginRecord {
     /// refusing it. Both read as `Disabled`, and they are not the same problem.
     pub user_disabled: bool,
     pub restart_attempts: u32,
+    /// Latest successful supervisor probe, for plugin screens and diagnostics.
+    /// Only the health contract fields are retained; never the whole RPC reply.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_health: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_health_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_health_error: Option<String>,
 }
 
 impl PluginRecord {
@@ -186,6 +194,9 @@ impl PluginRecord {
             unknown_capabilities: unknown,
             user_disabled: false,
             restart_attempts: 0,
+            last_health: None,
+            last_health_at: None,
+            last_health_error: None,
         }
     }
 
@@ -200,6 +211,9 @@ impl PluginRecord {
             unknown_capabilities: Vec::new(),
             user_disabled: false,
             restart_attempts: 0,
+            last_health: None,
+            last_health_at: None,
+            last_health_error: None,
         }
     }
 
@@ -208,6 +222,31 @@ impl PluginRecord {
     pub fn is_loadable(&self) -> bool {
         self.manifest.is_some()
     }
+
+    fn clear_health(&mut self) {
+        self.last_health = None;
+        self.last_health_at = None;
+        self.last_health_error = None;
+    }
+}
+
+/// Health is plugin-supplied data. Keep its documented display fields only,
+/// with a small total bound so repeated listings cannot grow without limit.
+fn health_snapshot(value: &serde_json::Value) -> Result<serde_json::Value, String> {
+    let status = value.get("status").and_then(serde_json::Value::as_str)
+        .filter(|status| !status.is_empty() && status.len() <= 64)
+        .ok_or_else(|| "The plugin returned an invalid health status.".to_string())?;
+    let mut snapshot = serde_json::json!({ "status": status });
+    if let Some(detail) = value.get("detail").and_then(serde_json::Value::as_str) {
+        snapshot["detail"] = serde_json::json!(detail);
+    }
+    if let Some(components) = value.get("components").filter(|v| v.is_object()) {
+        snapshot["components"] = components.clone();
+    }
+    if snapshot.to_string().len() > 64 * 1024 {
+        return Err("The plugin health report exceeds the 64 KiB display limit.".into());
+    }
+    Ok(snapshot)
 }
 
 #[derive(Default)]
@@ -294,6 +333,11 @@ impl PluginRegistry {
                 continue;
             }
             let dir_name = entry.file_name().to_string_lossy().to_string();
+            // Installer staging/rollback directories are not installed plugins.
+            // A concurrent scan or interrupted cleanup must never expose them.
+            if dir_name.starts_with('.') {
+                continue;
+            }
 
             match PluginManifest::load(&dir) {
                 Ok(m) => {
@@ -381,11 +425,35 @@ impl PluginRegistry {
     pub fn set_state(&mut self, id: &str, state: PluginState, reason: Option<String>) {
         if let Some(rec) = self.plugins.get_mut(id) {
             rec.state = state;
+            if !state.accepts_commands() {
+                rec.clear_health();
+            }
             rec.reason = match (state, reason) {
                 (PluginState::Running, _) => None,
                 (_, Some(r)) => Some(r),
                 (s, None) => Some(format!("{s:?} (no reason recorded)")),
             };
+        }
+    }
+
+    /// Record a probe only while the plugin is live. A failed probe removes a
+    /// previously green snapshot immediately, independently of restart policy.
+    pub fn note_health(&mut self, id: &str, outcome: Result<&serde_json::Value, String>) {
+        let Some(rec) = self.plugins.get_mut(id) else { return };
+        if !rec.state.accepts_commands() {
+            rec.clear_health();
+            return;
+        }
+        match outcome.and_then(health_snapshot) {
+            Ok(snapshot) => {
+                rec.last_health = Some(snapshot);
+                rec.last_health_at = Some(chrono::Utc::now());
+                rec.last_health_error = None;
+            }
+            Err(error) => {
+                rec.clear_health();
+                rec.last_health_error = Some(error.chars().take(2048).collect());
+            }
         }
     }
 
@@ -401,6 +469,7 @@ impl PluginRegistry {
                 rec.user_disabled = true;
                 if rec.state != PluginState::Running {
                     rec.state = PluginState::Disabled;
+                    rec.clear_health();
                     rec.reason = Some("Turned off in OAIY Desktop → Plugins.".into());
                 }
             }
@@ -416,6 +485,7 @@ impl PluginRegistry {
         self.persist_disabled();
         if let Some(rec) = self.plugins.get_mut(id) {
             rec.user_disabled = disabled;
+            rec.clear_health();
             if disabled {
                 rec.state = PluginState::Disabled;
                 rec.reason = Some("Turned off in OAIY Desktop → Plugins.".into());
@@ -603,6 +673,18 @@ mod tests {
     // --- scanning ---------------------------------------------------------
 
     #[test]
+    fn installer_staging_and_backups_are_not_discovered() {
+        let root = Root::new();
+        root.plugin("aokie", manifest("aokie"));
+        root.plugin(".staging-test", manifest("aokie"));
+        root.plugin(".backup-aokie-test", manifest("aokie"));
+        let mut reg = PluginRegistry::new(root.path().to_path_buf());
+        let report = reg.scan();
+        assert_eq!(report.added, 1);
+        assert_eq!(report.invalid, 0);
+    }
+
+    #[test]
     fn a_valid_plugin_is_discovered() {
         let root = Root::new();
         root.plugin("aokie", manifest("aokie"));
@@ -689,6 +771,78 @@ mod tests {
         assert_eq!(report.added, 0);
         assert_eq!(report.unchanged, 1);
         assert_eq!(reg.get("aokie").unwrap().state, PluginState::Running);
+    }
+
+    #[test]
+    fn plugin_listings_keep_the_latest_component_health_across_rescans() {
+        let root = Root::new();
+        root.plugin("aokie", manifest("aokie"));
+        let mut reg = PluginRegistry::new(root.path().to_path_buf());
+        reg.scan();
+        reg.set_state("aokie", PluginState::Running, None);
+        reg.note_health("aokie", Ok(&serde_json::json!({
+            "status": "ok", "detail": null,
+            "components": { "responder": { "mode": "agent", "ready": true }, "voice": { "available": true } },
+            "unexpectedPrivateField": "must not leave the host",
+        })));
+        reg.scan(); // GET /api/plugins follows this exact list/rescan path.
+        let wire = serde_json::to_value(reg.list()).unwrap();
+        assert_eq!(wire[0]["lastHealth"]["status"], "ok");
+        assert_eq!(wire[0]["lastHealth"]["components"]["responder"]["ready"], true);
+        assert!(wire[0]["lastHealthAt"].is_string());
+        assert!(wire[0]["lastHealth"].get("unexpectedPrivateField").is_none());
+        assert!(wire[0].get("lastHealthError").is_none());
+    }
+
+    #[test]
+    fn failed_health_probes_remove_stale_success_and_successful_probes_recover() {
+        let root = Root::new();
+        root.plugin("aokie", manifest("aokie"));
+        let mut reg = PluginRegistry::new(root.path().to_path_buf());
+        reg.scan();
+        reg.set_state("aokie", PluginState::Running, None);
+        reg.note_health("aokie", Ok(&serde_json::json!({ "status": "ok" })));
+        reg.note_health("aokie", Err("Health probe timed out.".into()));
+        let rec = reg.get("aokie").unwrap();
+        assert!(rec.last_health.is_none());
+        assert!(rec.last_health_at.is_none());
+        assert_eq!(rec.last_health_error.as_deref(), Some("Health probe timed out."));
+
+        reg.set_state("aokie", PluginState::Unhealthy, Some("Probe failed.".into()));
+        reg.note_health("aokie", Ok(&serde_json::json!({ "status": "degraded", "detail": "LLM unavailable" })));
+        let rec = reg.get("aokie").unwrap();
+        assert_eq!(rec.last_health.as_ref().unwrap()["detail"], "LLM unavailable");
+        assert!(rec.last_health_error.is_none());
+    }
+
+    #[test]
+    fn stopped_or_restarted_plugins_never_inherit_the_previous_health_report() {
+        let root = Root::new();
+        root.plugin("aokie", manifest("aokie"));
+        let mut reg = PluginRegistry::new(root.path().to_path_buf());
+        reg.scan();
+        for state in [PluginState::Stopped, PluginState::Starting, PluginState::Crashed, PluginState::Disabled] {
+            reg.set_state("aokie", PluginState::Running, None);
+            reg.note_health("aokie", Ok(&serde_json::json!({ "status": "ok" })));
+            reg.set_state("aokie", state, None);
+            // A late reply after the process stopped cannot restore its report.
+            reg.note_health("aokie", Ok(&serde_json::json!({ "status": "ok" })));
+            assert!(reg.get("aokie").unwrap().last_health.is_none());
+            assert!(reg.get("aokie").unwrap().last_health_at.is_none());
+        }
+    }
+
+    #[test]
+    fn malformed_or_oversized_health_is_reported_without_expanding_plugin_listings() {
+        assert!(health_snapshot(&serde_json::json!({ "components": {} })).is_err());
+        assert!(health_snapshot(&serde_json::json!({ "status": 5 })).is_err());
+        assert!(health_snapshot(&serde_json::json!({
+            "status": "ok", "components": { "detail": "x".repeat(64 * 1024) },
+        })).unwrap_err().contains("64 KiB"));
+        let snapshot = health_snapshot(&serde_json::json!({
+            "status": "ok", "detail": null, "components": [], "unrelated": "ignored",
+        })).unwrap();
+        assert_eq!(snapshot, serde_json::json!({ "status": "ok" }));
     }
 
     #[test]

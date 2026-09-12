@@ -307,11 +307,16 @@ async function main(): Promise<void> {
           position: { x: 200, y: 50 },
           data: { connectorId: 'gadget', command: 'call.configureAgent', payload: { callId: '$inputs.callId' } },
         },
+        { id: 'rejectTail', type: 'device_command', position: {x:300,y:-50}, data: {connectorId:'gadget',command:'must.not.run',payload:{}} },
+        { id: 'merge', type: 'device_command', position: {x:400,y:0}, data: {connectorId:'gadget',command:'merge.reached',payload:{}} },
       ],
       [
         { source: 'decide', target: 'gate' },
         { source: 'gate', target: 'reject', sourceHandle: 'true' },
         { source: 'gate', target: 'configure', sourceHandle: 'false' },
+        { source: 'reject', target: 'rejectTail' },
+        { source: 'rejectTail', target: 'merge' },
+        { source: 'configure', target: 'merge' },
       ],
     ),
     { callId: 'call_bf26a886' },
@@ -323,10 +328,11 @@ async function main(): Promise<void> {
     .map((s) => JSON.parse(s.body ?? '{}').command);
   check(
     'branch: only the taken branch ran its connector command',
-    commands.length === 1 && commands[0] === 'call.configureAgent',
+    commands.length === 2 && commands[0] === 'call.configureAgent' && commands[1] === 'merge.reached',
     `commands sent: ${JSON.stringify(commands)}`,
   );
   check('branch: the untaken branch never reached the connector', !commands.includes('call.reject'), `got ${JSON.stringify(commands)}`);
+  check('branch: untaken descendants never execute', !commands.includes('must.not.run'), `got ${JSON.stringify(commands)}`);
 
   // And the other way round, so the gate is not simply blocking everything.
   sent.length = 0;

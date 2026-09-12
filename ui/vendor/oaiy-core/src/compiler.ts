@@ -1298,7 +1298,7 @@ workflow_context;
     // Compile using module compiler
     const moduleCompilerResult = this.tryModuleCompiler(node, inputsMap, outputVar, skipVarDeclaration, !!loopStartId, loopStartId);
     if (moduleCompilerResult !== null) {
-      return this.gateOnBranch(node, incomingEdges, graph, outputVar, skipVarDeclaration, moduleCompilerResult);
+      return this.gateOnBranch(node, graph, outputVar, skipVarDeclaration, moduleCompilerResult);
     }
 
     // No module compiler handled this node.
@@ -1342,24 +1342,37 @@ workflow_context;
    */
   private gateOnBranch(
     node: GraphNode,
-    incomingEdges: { source: string; sourceHandle?: string | null }[],
     graph: WorkflowGraph,
     outputVar: string,
     skipVarDeclaration: boolean,
     body: string
   ): string {
-    const branches = incomingEdges
-      .filter((e) => e.sourceHandle === 'true' || e.sourceHandle === 'false')
-      .filter((e) => graph.nodes.find((n) => n.id === e.source)?.type === 'condition');
-    if (branches.length === 0) return body;
-    // Several branch inputs mean "run if ANY of my branches was taken" — the
-    // merge above already picks whichever carried a value.
-    const test = branches
-      .map((e) => {
-        const want = e.sourceHandle === 'true';
-        return `workflow_context[${JSON.stringify(e.source)}] === ${want}`;
-      })
-      .join(' || ');
+    // Reachability continues through the entire branch, not just its first
+    // node. Otherwise skipping a customer lookup still executes the following
+    // phone lookup (or write). A merge runs when ANY incoming path is active.
+    const memo = new Map<string, string>();
+    const reachable = (id: string, visiting: Set<string>): string => {
+      const cached = memo.get(id);
+      if (cached !== undefined) return cached;
+      // Loop routing is compiled separately; don't recurse around a back edge.
+      if (visiting.has(id)) return 'true';
+      const next = new Set(visiting).add(id);
+      const edges = graph.edges.filter(e => e.target === id);
+      const paths = edges.map(e => {
+        const upstream = reachable(e.source, next);
+        const condition = graph.nodes.find(n => n.id === e.source)?.type === 'condition'
+          && (e.sourceHandle === 'true' || e.sourceHandle === 'false');
+        if (!condition) return upstream;
+        const branch = `workflow_context[${JSON.stringify(e.source)}] === ${e.sourceHandle === 'true'}`;
+        return upstream === 'true' ? branch : `(${upstream}) && (${branch})`;
+      });
+      const value = paths.length === 0 || paths.includes('true') ? 'true'
+        : [...new Set(paths)].map(path => `(${path})`).join(' || ');
+      memo.set(id, value);
+      return value;
+    };
+    const test = reachable(node.id, new Set());
+    if (test === 'true') return body;
     const declare = skipVarDeclaration ? '' : `\n  let ${outputVar} = null;`;
     // The body declares the output itself when it is allowed to; inside the
     // guard that declaration would be scoped to the branch, so it is hoisted

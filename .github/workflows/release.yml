@@ -200,6 +200,16 @@ jobs:
         working-directory: desktop/src-tauri
         run: cargo build --release --no-default-features --bin oaiy-server
 
+      - name: Stage complete headless distribution
+        shell: bash
+        run: |
+          server=desktop/src-tauri/target/release/oaiy-server
+          [[ "$RUNNER_OS" == "Windows" ]] && server="$server.exe"
+          node desktop/scripts/package-server.mjs "$server" headless-dist
+
+      - name: Execute a flow from the headless distribution
+        run: node desktop/scripts/smoke-server.mjs headless-dist
+
       - name: Collect
         shell: bash
         env:
@@ -213,15 +223,29 @@ jobs:
           if [[ "$LABEL" == "windows" ]]; then
             cp "$(find "$bundle" -type f -name '*-setup.exe' | head -1)" "$out/oaiy-desktop-$VERSION-windows-x64-setup.exe"
             cp "$(find "$bundle" -type f -name '*.msi' | head -1)"       "$out/oaiy-desktop-$VERSION-windows-x64.msi"
-            ( cd desktop/src-tauri/target/release && 7z a -bd "$out/oaiy-server-$VERSION-windows-x64.zip" oaiy-server.exe >/dev/null )
+            ( cd headless-dist && 7z a -bd "$out/oaiy-server-$VERSION-windows-x64.zip" . >/dev/null )
           else
             cp "$(find "$bundle" -type f -name '*.AppImage' | head -1)" "$out/oaiy-desktop-$VERSION-linux-x86_64.AppImage"
             cp "$(find "$bundle" -type f -name '*.deb' | head -1)"      "$out/oaiy-desktop-$VERSION-linux-amd64.deb"
             rpm="$(find "$bundle" -type f -name '*.rpm' | head -1 || true)"
             [[ -n "$rpm" ]] && cp "$rpm" "$out/oaiy-desktop-$VERSION-linux-x86_64.rpm"
-            tar -C desktop/src-tauri/target/release -czf "$out/oaiy-server-$VERSION-linux-x86_64.tar.gz" oaiy-server
+            tar -C headless-dist -czf "$out/oaiy-server-$VERSION-linux-x86_64.tar.gz" .
           fi
           ls -l "$out"
+
+      - name: Verify the extracted headless release
+        shell: bash
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+          LABEL: ${{ matrix.label }}
+        run: |
+          mkdir headless-verified
+          if [[ "$LABEL" == "windows" ]]; then
+            7z x -bd "release/oaiy-server-$VERSION-windows-x64.zip" -oheadless-verified >/dev/null
+          else
+            tar -C headless-verified -xzf "release/oaiy-server-$VERSION-linux-x86_64.tar.gz"
+          fi
+          node desktop/scripts/smoke-server.mjs headless-verified
 
       - uses: actions/upload-artifact@v4
         with:

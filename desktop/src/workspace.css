@@ -1,0 +1,41 @@
+/* Shared desktop refinements: comfortable controls, readable status and panels
+   that fit smaller windows. Theme colours remain shared with plugin screens. */
+.app-shell { height: 100dvh; }
+.sidebar { min-height: 0; overflow-y: auto; overscroll-behavior: contain; }
+.sidebar nav button, .sidebar .settings { min-height: 44px; }
+.sidebar nav button[title*="provided by"] > span { white-space: normal; line-height: 1.4; }
+.content-page { overscroll-behavior: contain; scrollbar-gutter: stable; }
+.page-intro, .panel { width: 100%; max-width: 1160px; }
+.page-intro { padding-bottom: 22px; border-bottom: 1px solid var(--border); }
+.page-intro p { max-width: 70ch; font-size: 14px; line-height: 1.6; }
+.kicker { font-size: 11px; color: var(--muted); }
+.panel { gap: 18px; }
+.overview-grid { gap: 12px; grid-template-columns: repeat(auto-fit, minmax(min(100%, 170px), 1fr)); }
+.overview-tile { padding: 20px; gap: 8px; background: var(--surface-solid); box-shadow: var(--shadow-card); }
+.overview-tile strong { font-size: 28px; line-height: 1.15; }
+.overview-tile small { font-size: 13px; line-height: 1.5; }
+.service-card { box-shadow: var(--shadow-card); }
+.banner { flex-wrap: wrap; line-height: 1.5; }
+.banner > span { min-width: 0; overflow-wrap: anywhere; flex: 1 1 240px; }
+.btn, .btn-tiny, .icon-button { min-height: 36px; }
+.plugin-screen { min-height: max(600px, 74dvh); }
+.form-row, .form-row-pair, .service-card { min-width: 0; }
+input, select, textarea { max-width: 100%; }
+@media (max-width: 1240px) { .sidebar .nav-badge { display: none; } }
+@media (max-width: 760px) {
+  .content-page { padding: 20px 16px 32px; }
+  .page-intro { padding-bottom: 16px; gap: 12px; }
+  .page-intro p { font-size: 13px; }
+  .overview-tile { padding: 16px; }
+  .btn, .btn-tiny, .icon-button { min-height: 44px; }
+  .icon-button { min-width: 44px; }
+  .top-actions { gap: 4px; }
+  .plugin-screen { min-height: 78dvh; }
+}
+@media (max-width: 480px) {
+  .app-shell { grid-template-columns: 58px minmax(0, 1fr); }
+  .sidebar { padding: 18px 6px 12px; }
+  .content-page { padding: 16px 10px 24px; }
+  .top-title { display: none; }
+  .topbar { padding: 0 8px; justify-content: flex-end; }
+}

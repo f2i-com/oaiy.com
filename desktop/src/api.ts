@@ -388,6 +388,10 @@ export interface PluginRecord {
   unknownCapabilities?: string[];
   userDisabled: boolean;
   restartAttempts: number;
+  /** Supervisor health report; absent before the first probe or after failure. */
+  lastHealth?: { status: string; detail?: string; components?: Record<string, unknown> };
+  lastHealthAt?: string;
+  lastHealthError?: string;
 }
 
 export interface PluginsSnapshot {
@@ -681,7 +685,7 @@ export const serviceDefinitions = {
 /** The Node runtime the bundled CLI runs under. */
 export interface NodeSnapshot {
   available: boolean;
-  source: 'portable' | 'system' | 'none';
+  source: 'bundled' | 'portable' | 'system' | 'none';
   path?: string | null;
   version?: string | null;
   installing: boolean;

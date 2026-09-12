@@ -69,9 +69,8 @@ const COMPLETE_ATTEMPTS: usize = 3;
 
 /// Cap on the result handed back to the provider.
 ///
-/// Not decoration — a provider rejects an oversized completion, and a rejected
-/// completion is a stranded run. Better to report a truncated result than to
-/// lose the fact that the flow succeeded at all.
+/// An oversized typed result must fail explicitly, never become a successful
+/// placeholder that downstream business actions mistake for real output.
 const MAX_RESULT_BYTES: usize = 192 * 1024;
 
 /// Providers cap the message on a failure; a longer one is refused, and a
@@ -431,7 +430,7 @@ fn serve(
     // a run is reserved under a unique key and claimed atomically — and each
     // side effect additionally carries a key of its own.
     let outcome = match outcome {
-        Ok(result) => Ok(apply_result_actions(account, spec, run, result)),
+        Ok(result) => cap_result(result).map(|result| apply_result_actions(account, spec, run, result)),
         other => other,
     };
     report(account, lane, instance, &run.id, outcome)?;
@@ -810,11 +809,11 @@ fn report(
     run_id: &str,
     outcome: Result<Value, Failure>,
 ) -> Result<(), String> {
-    let body = match outcome {
+    let body = match outcome.and_then(cap_result) {
         Ok(result) => json!({
             "instanceId": instance,
             "status": "done",
-            "result": cap_result(result),
+            "result": result,
         }),
         Err(f) => json!({
             "instanceId": instance,
@@ -868,21 +867,17 @@ fn report(
     ))
 }
 
-/// Keep a result under the size a completion can carry.
-///
-/// An oversized body is refused, and a refused completion is a stranded run —
-/// so a truncated answer is strictly better than the truth nobody receives.
-fn cap_result(result: Value) -> Value {
+/// Keep the original type intact or report a bounded failure. Use the existing
+/// provider error taxonomy for compatibility, with a precise diagnostic marker.
+fn cap_result(result: Value) -> Result<Value, Failure> {
     let encoded = result.to_string();
     if encoded.len() <= MAX_RESULT_BYTES {
-        return result;
+        return Ok(result);
     }
-    json!({
-        "truncated": true,
-        "bytes": encoded.len(),
-        "note": "the flow's result was too large to report and was dropped; \
-                 the run itself succeeded",
-    })
+    Err(Failure::new(FailureCode::NodeFailed, format!(
+        "result_too_large: serialized output is {} bytes; maximum is {MAX_RESULT_BYTES}. Return a smaller result or an artifact reference.",
+        encoded.len()
+    )))
 }
 
 /// Trim to at most `max_bytes` BYTES, never splitting a character.
@@ -1088,7 +1083,7 @@ mod tests {
         // The single most important constraint, asserted against the source
         // rather than trusted. Test fixtures are allowed a provider name; the
         // executing code is not.
-        let source = include_str!("flow_runner.rs");
+        let source = include_str!("flow_runner.rs").replace("\r\n", "\n");
         let code_only: String = source
             .split("#[cfg(test)]\nmod tests")
             .next()
@@ -1173,16 +1168,18 @@ mod tests {
     }
 
     #[test]
-    fn an_oversized_result_still_reports_success() {
-        // A body the provider refuses is a completion that never lands, which
-        // is the one failure this module cannot recover from.
+    fn an_oversized_result_fails_without_replacing_its_type() {
         let small = json!({ "ok": true });
-        assert_eq!(cap_result(small.clone()), small);
+        assert_eq!(cap_result(small.clone()).unwrap(), small);
 
         let huge = json!({ "text": "x".repeat(MAX_RESULT_BYTES + 10) });
-        let capped = cap_result(huge);
-        assert_eq!(capped["truncated"], true);
-        assert!(capped.to_string().len() < 1000);
+        let failure = cap_result(huge).unwrap_err();
+        assert_eq!(failure.code, FailureCode::NodeFailed);
+        assert!(failure.message.starts_with("result_too_large:"));
+        assert!(failure.message.len() < MAX_MESSAGE_BYTES);
+        // UTF-8 byte counts, including JSON framing, set the actual boundary.
+        assert!(cap_result(json!("x".repeat(MAX_RESULT_BYTES - 2))).is_ok());
+        assert!(cap_result(json!("é".repeat(MAX_RESULT_BYTES / 2))).is_err());
     }
 
     #[test]

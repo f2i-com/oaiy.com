@@ -1,4 +1,5 @@
 import type { ReactNode } from 'react';
+import SetupWizard from './SetupWizard';
 import { Check, ChevronRight, CircleDashed, PartyPopper, X } from 'lucide-react';
 import {
   deriveSetupSteps,
@@ -55,6 +56,8 @@ export default function SetupGuidePanel({ onNavigate, onDismiss, actions, ...sta
         </p>
       )}
 
+      <SetupWizard steps={steps} onNavigate={onNavigate} actions={actions} />
+      <details><summary className="form-hint">View all setup checks</summary>
       <ul className="setup-list">
         {steps.map((s) => (
           <li key={s.id} className={s.done ? 'setup-step is-done' : 'setup-step'}>
@@ -83,6 +86,7 @@ export default function SetupGuidePanel({ onNavigate, onDismiss, actions, ...sta
           </li>
         ))}
       </ul>
+      </details>
     </section>
   );
 }

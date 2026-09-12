@@ -503,7 +503,14 @@ export function createConnectorRuntime(
           ];
         }
 
-        const body: Record<string, unknown> = { messages, stream: false };
+        const extraBody = field(call, input, 'extraBody');
+        if (extraBody !== undefined && (extraBody === null || typeof extraBody !== 'object' || Array.isArray(extraBody))) {
+          fail(call, '"extraBody" must be an object of provider options.');
+        }
+        // Preserve provider options such as Qwen's enable_thinking flag. The
+        // connector still owns messages and streaming so its response contract
+        // cannot be changed by an extra option.
+        const body: Record<string, unknown> = { ...(extraBody as Record<string, unknown> | undefined), messages, stream: false };
         const model = field(call, input, 'model');
         if (nonEmpty(model)) body.model = String(model);
         // Both default to 0 on the node, and both document 0 as "leave it to
@@ -525,7 +532,7 @@ export function createConnectorRuntime(
         });
 
         const content = dig(json, 'choices.0.message.content');
-        if (typeof content !== 'string') {
+        if (typeof content !== 'string' || !content.trim()) {
           fail(
             call,
             `the AI gateway answered without a message. Response: ${truncate(JSON.stringify(json) ?? 'null')}`,

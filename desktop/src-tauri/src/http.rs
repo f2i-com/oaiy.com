@@ -981,6 +981,23 @@ async fn origin_guard(
     next: Next,
 ) -> axum::response::Response {
     let m = req.method().clone();
+    let path = req.uri().path();
+    let public = m == Method::OPTIONS
+        || (m == Method::POST && path == "/api/bridge/pairing")
+        || ((m == Method::GET || m == Method::HEAD)
+            && (path == "/api/health"
+                || path == "/api/bridge/capabilities"
+                || path.strip_prefix("/api/bridge/pairing/")
+                    .is_some_and(|id| !id.is_empty() && !id.contains('/'))));
+    // Default-deny on headless/network listeners, including new routes and
+    // HEAD requests. Only discovery and user-approved pairing bootstrap are public.
+    if !auth.gui_mode && !public
+        && !bearer_token(&req).is_some_and(|got| auth.token_matches(&got))
+    {
+        return (StatusCode::FORBIDDEN, Json(serde_json::json!({
+            "error": "authentication required"
+        }))).into_response();
+    }
     let mutating =
         m == Method::POST || m == Method::PUT || m == Method::DELETE || m == Method::PATCH;
     // A tiny public-mutation allow-list: raising a pairing request is a POST that
@@ -1010,18 +1027,12 @@ async fn origin_guard(
                 matches!(origin.as_deref(), Some(o) if is_allowed_origin_privileged(o));
             privileged_allowed(token_ok, auth.gui_mode, auth.token.is_some(), origin_priv_ok)
         } else {
-            // A configured token must gate EVERY mutation on a headless box — a
-            // forged Origin (any non-browser caller can set one) must not substitute
-            // for it. Mirrors privileged_allowed: pass on a matching token, OR when
-            // there's no real lockdown (GUI, or no token configured) AND the origin
-            // is browser-acceptable (loopback/tauri/oaiy.com) or absent (native CLI).
-            // So headless+token now requires the token even with a spoofed Origin,
-            // while GUI mode and the no-token default keep their broad behavior.
+            // Origin is a browser CSRF check, never a headless credential.
             let origin_ok = match origin.as_deref() {
                 Some(o) => is_allowed_origin(o),
                 None => true, // native/CLI caller: no browser Origin to check
             };
-            token_ok || ((auth.gui_mode || auth.token.is_none()) && origin_ok)
+            token_ok || (auth.gui_mode && origin_ok)
         };
         if !allowed {
             return (
@@ -1030,11 +1041,9 @@ async fn origin_guard(
             )
                 .into_response();
         }
-    } else if m == Method::GET {
-        // The GET surface is otherwise ungated and served with CORS Any, so a page the user
-        // visits could read it cross-origin. Gate the SENSITIVE reads (the rest — health, model /
-        // catalog / service listings — carry no secrets and stay open). A native / no-Origin
-        // caller is allowed: it has direct filesystem access anyway, and this keeps the CLI working.
+    } else if m == Method::GET || m == Method::HEAD {
+        // A missing Origin proves nothing about a caller's location or authority.
+        // Sensitive reads require a token outside the loopback GUI listener.
         let path = req.uri().path();
         let export_read = is_export_path(path);
         let restricted_read = is_restricted_read_path(path);
@@ -1045,16 +1054,10 @@ async fn origin_guard(
                 .and_then(|o| o.to_str().ok())
                 .map(str::to_owned);
             let token_ok = bearer_token(&req).is_some_and(|got| auth.token_matches(&got));
-            let allowed = match origin.as_deref() {
-                None => true,
-                Some(o) => {
-                    if export_read {
-                        token_ok || (auth.gui_mode && is_allowed_origin_privileged(o))
-                    } else {
-                        token_ok || is_allowed_origin(o)
-                    }
-                }
-            };
+            let origin_ok = origin.as_deref().is_some_and(|o| {
+                if export_read { is_allowed_origin_privileged(o) } else { is_allowed_origin(o) }
+            });
+            let allowed = token_ok || (auth.gui_mode && origin_ok);
             if !allowed {
                 return (
                     StatusCode::FORBIDDEN,
@@ -1107,6 +1110,7 @@ pub async fn serve(
     // The Node runtime the bundled CLI runs under.
     node: crate::services::node_runtime::NodeHandle,
 ) -> Result<(), BoxError> {
+    validate_listener_auth(bind_all, auth_token.as_deref())?;
     // CORS stays permissive so a hosted oaiy-web at any domain can READ the
     // API (the localhost bind keeps non-local processes out). State-changing
     // and exec endpoints are additionally gated by `origin_guard` below, so a
@@ -1233,7 +1237,9 @@ pub async fn serve(
         .merge(link_routes)
         .merge(ai_routes)
         .layer(middleware::from_fn_with_state(
-            AuthConfig { token: auth_token, gui_mode, pairing: Some(pairing_for_auth) },
+            // A network listener must never trust a forgeable Origin, even
+            // when launched by the GUI. Its clients must present a credential.
+            AuthConfig { token: auth_token, gui_mode: gui_mode && !bind_all, pairing: Some(pairing_for_auth) },
             origin_guard,
         ))
         .layer(cors)
@@ -1258,6 +1264,13 @@ pub async fn serve(
     Ok(())
 }
 
+fn validate_listener_auth(bind_all: bool, token: Option<&str>) -> Result<(), BoxError> {
+    if bind_all && token.is_none_or(|t| t.trim().is_empty()) {
+        return Err("network binding requires a non-empty OAIY_SERVER_TOKEN; use loopback or configure authentication".into());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1266,6 +1279,56 @@ mod tests {
         privileged_allowed, AuthConfig, ModelDownloadRequest,
     };
     use axum::http::Method;
+
+    #[test]
+    fn network_listener_requires_a_nonempty_token() {
+        for token in [None, Some(""), Some("  ")] {
+            assert!(super::validate_listener_auth(true, token).is_err());
+        }
+        assert!(super::validate_listener_auth(true, Some("secret")).is_ok());
+        assert!(super::validate_listener_auth(false, None).is_ok());
+    }
+
+    #[tokio::test]
+    async fn network_guard_rejects_missing_or_forged_origins_and_accepts_bearer() {
+        use axum::{middleware, routing::any, Router};
+        for token in [None, Some("test-admin".to_string())] {
+            let expected_authenticated = if token.is_some() { 200 } else { 403 };
+            let app = Router::new()
+                .fallback(any(|| async { "allowed" }))
+                .layer(middleware::from_fn_with_state(
+                    AuthConfig { token, gui_mode: false, pairing: None },
+                    super::origin_guard,
+                ));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let client = reqwest::Client::new();
+            for (method, path) in [
+                (Method::GET, "/api/config"),
+                (Method::HEAD, "/api/bridge/runs"),
+                (Method::GET, "/api/services/private/export"),
+                (Method::GET, "/api/bridge/flows/private"),
+                (Method::POST, "/api/models/download"),
+                (Method::POST, "/api/plugins/install"),
+                (Method::POST, "/api/bridge/pairing/id/approve"),
+            ] {
+                for origin in [None, Some("https://oaiy.com"), Some("tauri://localhost"), Some("http://localhost:3000")] {
+                    let mut request = client.request(method.clone(), format!("{base}{path}"));
+                    if let Some(origin) = origin { request = request.header("Origin", origin); }
+                    assert_eq!(request.send().await.unwrap().status(), 403, "{method} {path} {origin:?}");
+                }
+            }
+            for path in ["/api/health", "/api/bridge/capabilities", "/api/bridge/pairing/id"] {
+                assert_eq!(client.get(format!("{base}{path}")).send().await.unwrap().status(), 200);
+            }
+            let response = client.get(format!("{base}/api/config"))
+                .bearer_auth("test-admin").send().await.unwrap();
+            // The no-token configuration remains closed even for a guessed bearer.
+            assert_eq!(response.status(), expected_authenticated);
+            server.abort();
+        }
+    }
 
     #[test]
     fn health_uses_the_field_names_consumers_actually_read() {

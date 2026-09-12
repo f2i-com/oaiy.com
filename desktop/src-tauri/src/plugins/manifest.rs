@@ -197,6 +197,7 @@ impl PluginManifest {
         // The entry path is attacker-controlled data in a file we found on disk,
         // so it is validated as a path, not merely as a string.
         self.resolve_entry(dir)?;
+        super::definitions::validate_for_plugin(dir, self).map_err(ManifestError::Invalid)?;
 
         for c in &self.connectors {
             if !is_valid_id(&c.id) {
@@ -829,6 +830,8 @@ mod tests {
         v["serviceDefinitions"] = serde_json::json!([{ "definitionFile": "definitions/phone.json" }]);
         v["somethingFromTheFuture"] = serde_json::json!(true);
         let d = write_manifest(&v);
+        fs::create_dir_all(d.path().join("definitions")).unwrap();
+        fs::write(d.path().join("definitions/phone.json"), r#"{"id":"demo.phone","name":"Phone","actions":[]}"#).unwrap();
         let m = PluginManifest::load(d.path()).expect("additive fields must not break loading");
         assert!(m.extra.contains_key("ui"));
         assert!(m.extra.contains_key("serviceDefinitions"));

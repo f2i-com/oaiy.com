@@ -1425,7 +1425,7 @@ mod tests {
         // rather than trusted. Test fixtures may name a provider; the executing
         // code may not — an effect type or a field name spelled here is a
         // second provider nobody can add without a release.
-        let source = include_str!("app_logic.rs");
+        let source = include_str!("app_logic.rs").replace("\r\n", "\n");
         let code_only = source.split("#[cfg(test)]\nmod tests").next().unwrap();
         for forbidden in [
             "formlogic",

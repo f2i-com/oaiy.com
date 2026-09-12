@@ -20,7 +20,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use super::gateway::{self, GatewayError};
-use super::providers::{AiProviderInput, Capability, Protocol, ProviderStoreHandle};
+use super::providers::{AiProviderInput, AiProviderPublic, Capability, Protocol, ProviderStoreHandle};
 use crate::services::registry::{RegistryHandle, ServiceStatus};
 
 /// Shared state for the AI router (mirrors `BridgeState`): the provider store
@@ -361,6 +361,32 @@ fn protocol_str(p: Protocol) -> &'static str {
     }
 }
 
+fn configured_provider_source(p: &AiProviderPublic) -> Value {
+    // Provider capabilities describe the upstream. Gateway capabilities name
+    // the routes THIS desktop implements, so a realtime-capable provider does
+    // not cause a plugin to offer a websocket path that does not exist here.
+    let capabilities: Vec<&str> = if p.capabilities.is_empty() {
+        vec!["chat"]
+    } else {
+        p.capabilities.iter().map(|c| cap_str(*c)).collect()
+    };
+    json!({
+        "id": format!("provider:{}", p.id),
+        "kind": "provider",
+        "providerId": p.id,
+        "name": p.name,
+        "category": p.category,
+        "status": "provider",
+        "protocol": protocol_str(p.protocol),
+        "capabilities": capabilities,
+        "gatewayCapabilities": ["chat"],
+        "hasKey": p.has_key,
+        "enabled": p.enabled,
+        "model": p.model,
+        "useCases": ["flows"],
+    })
+}
+
 async fn list_ai_sources(State(st): State<AiState>) -> Response {
     let mut sources: Vec<Value> = Vec::new();
 
@@ -397,27 +423,7 @@ async fn list_ai_sources(State(st): State<AiState>) -> Response {
     {
         let store = st.providers.lock().unwrap_or_else(|e| e.into_inner());
         for p in store.list() {
-            // Empty caps == "all": advertise chat explicitly so FormLogic's
-            // isDesktopFlowChatProvider (needs chat + useCases 'flows') accepts it.
-            let capabilities: Vec<&str> = if p.capabilities.is_empty() {
-                vec!["chat"]
-            } else {
-                p.capabilities.iter().map(|c| cap_str(*c)).collect()
-            };
-            sources.push(json!({
-                "id": format!("provider:{}", p.id),
-                "kind": "provider",
-                "providerId": p.id,                 // → the client's refId
-                "name": p.name,
-                "category": p.category,
-                "status": "provider",               // the literal 'provider' (client convention)
-                "protocol": protocol_str(p.protocol),
-                "capabilities": capabilities,
-                "hasKey": p.has_key,
-                "enabled": p.enabled,
-                "model": p.model,
-                "useCases": ["flows"],              // MUST include 'flows'
-            }));
+            sources.push(configured_provider_source(&p));
         }
     }
 
@@ -476,4 +482,34 @@ async fn list_ai_sources(State(st): State<AiState>) -> Response {
     }
 
     (StatusCode::OK, Json(json!({ "sources": sources }))).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_realtime_upstream_does_not_advertise_a_realtime_gateway_that_is_not_implemented() {
+        let source = configured_provider_source(&AiProviderPublic {
+            id: "voice-provider".into(),
+            name: "Voice provider".into(),
+            category: None,
+            protocol: Protocol::OpenAi,
+            base_url: "https://provider.invalid/v1".into(),
+            model: Some("voice-model".into()),
+            capabilities: vec![Capability::Chat, Capability::Realtime],
+            enabled: true,
+            allow_local: false,
+            has_key: true,
+        });
+        // Keep upstream metadata intact for clients that use it directly, but
+        // let the Aokie picker explain why it cannot use Desktop for realtime.
+        assert_eq!(source["capabilities"], json!(["chat", "realtime"]));
+        assert_eq!(source["gatewayCapabilities"], json!(["chat"]));
+        assert_eq!(source["useCases"], json!(["flows"]));
+        assert_eq!(source["providerId"], "voice-provider");
+        assert!(source.get("destinationOrigin").is_none());
+        assert!(source.get("baseUrl").is_none());
+        assert!(source.get("apiKey").is_none());
+    }
 }

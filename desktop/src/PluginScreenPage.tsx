@@ -43,6 +43,23 @@ interface UiScreen {
   files?: string[];
 }
 
+/** Resolve provider routes at the host, which knows its configured API port.
+ * Plugin screens cannot infer it from their opaque iframe origin. */
+export function pluginAiSources(sources: unknown[], apiBase = API_BASE): unknown[] {
+  return sources.map((source) => {
+    if (!source || typeof source !== 'object' || Array.isArray(source)) return source;
+    const record = source as Record<string, unknown>;
+    if (record.kind !== 'provider') return source;
+    const providerId = typeof record.providerId === 'string' ? record.providerId
+      : typeof record.id === 'string' && record.id.startsWith('provider:') ? record.id.slice(9) : '';
+    if (!providerId) return source;
+    return {
+      ...record,
+      gatewayUrl: `${apiBase.replace(/\/+$/, '')}/api/ai/providers/${encodeURIComponent(providerId)}`,
+    };
+  });
+}
+
 /** The bootstrap injected ahead of the plugin's own scripts. Plain ES5-ish so it
  *  runs before any transform, and self-contained: the iframe has no imports. */
 export const HOST_BOOTSTRAP = `
@@ -54,6 +71,10 @@ export const HOST_BOOTSTRAP = `
     return new Promise(function (resolve, reject) {
       var id = 'r' + ++seq;
       pending[id] = { resolve: resolve, reject: reject };
+      pending[id].timer = setTimeout(function () {
+        delete pending[id];
+        reject(new Error('The desktop did not respond. The outcome may be unknown; check its status before trying the action again.'));
+      }, 20000);
       parent.postMessage({ __pluginHost: 1, id: id, method: method, args: args || [] }, '*');
     });
   }
@@ -70,6 +91,7 @@ export const HOST_BOOTSTRAP = `
     el.setAttribute('data-theme', mode === 'dark' ? 'dark' : 'light');
   }
   window.addEventListener('message', function (e) {
+    if (e.source !== parent) return;
     var m = e.data;
     if (!m || !m.__pluginHost) return;
     if (m.theme) { applyTheme(m.theme); return; }
@@ -77,6 +99,7 @@ export const HOST_BOOTSTRAP = `
     var p = pending[m.id];
     if (!p) return;
     delete pending[m.id];
+    clearTimeout(p.timer);
     if (m.ok) p.resolve(m.data); else p.reject(new Error(m.error || 'host call failed'));
   });
   window.PluginHost = {
@@ -96,6 +119,9 @@ export const HOST_BOOTSTRAP = `
               subs = subs.filter(function (s) { return s !== cb; });
             }
           };
+        }, function (error) {
+          subs = subs.filter(function (s) { return s !== cb; });
+          throw error;
         });
       }
     },
@@ -132,10 +158,21 @@ export const HOST_BOOTSTRAP = `
 `;
 
 export default function PluginScreenPage({ pluginId, navId }: Props) {
+  // Changing screens discards the old document, pending RPCs and event cursor.
+  return <PluginScreenContent key={`${pluginId}:${navId}`} pluginId={pluginId} navId={navId} />;
+}
+
+function PluginScreenContent({ pluginId, navId }: Props) {
   const toast = useToast();
   const [record, setRecord] = useState<PluginRecord | null | undefined>(undefined);
+  // The manifest selects and assembles the iframe once. Runtime status changes
+  // separately so a health refresh cannot remount a call console or transcript.
+  const [runtimeStatus, setRuntimeStatus] = useState<Pick<PluginRecord, 'state' | 'reason'> | null>();
+  const snapshotGeneration = useRef(0);
+  const snapshotSequence = useRef(0);
   const [doc, setDoc] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [attempt, setAttempt] = useState(0);
   const frameRef = useRef<HTMLIFrameElement>(null);
   /** Event names the screen subscribed to, and the poll cursor. */
   const subscribed = useRef<string[]>([]);
@@ -143,18 +180,30 @@ export default function PluginScreenPage({ pluginId, navId }: Props) {
 
   useEffect(() => {
     let cancelled = false;
+    const generation = ++snapshotGeneration.current;
+    setRecord(undefined);
+    setRuntimeStatus(undefined);
+    setDoc(null);
+    setError(null);
+    subscribed.current = [];
+    cursor.current = 0;
     (async () => {
       try {
         const snap = await plugins.list();
-        if (!cancelled) setRecord(snap.plugins.find((p) => p.id === pluginId) ?? null);
+        if (!cancelled) {
+          const initial = snap.plugins.find((p) => p.id === pluginId) ?? null;
+          setRecord(initial);
+          setRuntimeStatus(initial ? { state: initial.state, reason: initial.reason } : null);
+        }
       } catch (e) {
         if (!cancelled) setError(e instanceof Error ? e.message : String(e));
       }
     })();
     return () => {
       cancelled = true;
+      if (snapshotGeneration.current === generation) snapshotGeneration.current++;
     };
-  }, [pluginId]);
+  }, [pluginId, attempt]);
 
   const screen = useMemo(() => {
     const ui = (record?.manifest as unknown as { ui?: { nav?: UiNav[]; screens?: UiScreen[] } } | undefined)?.ui;
@@ -169,11 +218,14 @@ export default function PluginScreenPage({ pluginId, navId }: Props) {
   useEffect(() => {
     if (!screen?.id || !screen.entry) return;
     let cancelled = false;
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => controller.abort(), 15000);
     (async () => {
       const base = `${API_BASE}/api/plugins/${encodeURIComponent(pluginId)}/ui/${encodeURIComponent(screen.id!)}`;
       const fetchText = async (rel: string) => {
         const resp = await fetch(`${base}/${rel.split('/').map(encodeURIComponent).join('/')}`, {
           cache: 'no-store',
+          signal: controller.signal,
         });
         if (!resp.ok) throw new Error(`${rel} → HTTP ${resp.status}`);
         return resp.text();
@@ -195,7 +247,7 @@ export default function PluginScreenPage({ pluginId, navId }: Props) {
         const jsFiles = files.filter((f) => f.endsWith('.js'));
         const sources = await Promise.all(jsFiles.map(fetchText));
         if (cancelled) return;
-        const scripts = sources.map((s) => `<script>${s}</script>`).join('');
+        const scripts = sources.map((s) => `<script>${s.replace(/<\/script/gi, '<\\/script')}</script>`).join('');
         // Stamped at assembly rather than messaged in after load, so the screen
         // never paints light-then-flips. Read from the live attribute instead of
         // a prop on purpose: this must NOT be a dependency of this effect, or a
@@ -203,7 +255,7 @@ export default function PluginScreenPage({ pluginId, navId }: Props) {
         // live call console mid-call to change a colour.
         const dark = document.documentElement.getAttribute('data-theme') !== 'light';
         setDoc(
-          `<!doctype html><html${dark ? ' class="fl-dark" data-theme="dark"' : ' data-theme="light"'}><head><meta charset="utf-8">` +
+          `<!doctype html><html${dark ? ' class="fl-dark" data-theme="dark"' : ' data-theme="light"'}><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">` +
             // No external anything: the plugin ships inline SVG and its own CSS.
             `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src data: blob:; font-src data:; connect-src 'none'">` +
             `<style>${css}</style></head><body>${body}` +
@@ -211,11 +263,15 @@ export default function PluginScreenPage({ pluginId, navId }: Props) {
         );
         setError(null);
       } catch (e) {
-        if (!cancelled) setError(e instanceof Error ? e.message : String(e));
+        if (!cancelled) setError(controller.signal.aborted ? 'Loading took too long. Check the desktop connection and try again.' : e instanceof Error ? e.message : String(e));
+      } finally {
+        window.clearTimeout(timer);
       }
     })();
     return () => {
       cancelled = true;
+      controller.abort();
+      window.clearTimeout(timer);
     };
   }, [screen, pluginId]);
 
@@ -230,9 +286,11 @@ export default function PluginScreenPage({ pluginId, navId }: Props) {
           // fresh key per user action is the correct semantics for the rest.
           const key = `ui-${name}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
           const res = await bridge.connectorRequest(pluginId, name, payload, key);
+          if (res.ok === false) throw new Error('The desktop could not complete this plugin request.');
           // Plugins answer with the SDK envelope { ok, data }; hand the screen
           // the inner data, which is what its call sites expect.
           const r = res.result as { ok?: boolean; data?: unknown } | undefined;
+          if (r?.ok === false) throw new Error(String((r as { error?: unknown }).error ?? 'The plugin could not complete this action.'));
           return r && typeof r === 'object' && 'data' in r ? r.data : r;
         }
         case 'toast': {
@@ -244,11 +302,21 @@ export default function PluginScreenPage({ pluginId, navId }: Props) {
           return true;
         }
         case 'snapshot': {
+          const generation = snapshotGeneration.current;
+          const sequence = ++snapshotSequence.current;
           const snap = await plugins.list();
-          return snap.plugins.find((p) => p.id === pluginId) ?? null;
+          const current = snap.plugins.find((p) => p.id === pluginId) ?? null;
+          if (generation === snapshotGeneration.current && sequence === snapshotSequence.current) {
+            setRuntimeStatus((previous) => {
+              if (!current) return null;
+              return previous?.state === current.state && previous?.reason === current.reason
+                ? previous : { state: current.state, reason: current.reason };
+            });
+          }
+          return current;
         }
         case 'aiSources':
-          return (await bridge.aiSources()).sources;
+          return pluginAiSources((await bridge.aiSources()).sources);
         case 'restartPlugin':
           await plugins.stop(pluginId).catch(() => {});
           await plugins.start(pluginId);
@@ -329,10 +397,14 @@ export default function PluginScreenPage({ pluginId, navId }: Props) {
 
   // Forward declared plugin events to the screen.
   useEffect(() => {
+    let busy = false;
+    let cancelled = false;
     const id = window.setInterval(async () => {
-      if (subscribed.current.length === 0) return;
+      if (busy || document.hidden || subscribed.current.length === 0) return;
+      busy = true;
       try {
         const res = await bridge.events(cursor.current, 100);
+        if (cancelled) return;
         cursor.current = res.next;
         for (const e of res.events) {
           const env = e.envelope as { name?: string };
@@ -342,16 +414,19 @@ export default function PluginScreenPage({ pluginId, navId }: Props) {
         }
       } catch {
         /* transient — the next tick retries */
+      } finally {
+        busy = false;
       }
     }, 2000);
-    return () => window.clearInterval(id);
-  }, []);
+    return () => { cancelled = true; window.clearInterval(id); };
+  }, [attempt]);
 
   if (error) {
     return (
       <div className="panel">
         <div className="banner banner-err" role="alert">
           <span>Couldn't load the plugin screen: {error}</span>
+          <button className="btn" onClick={() => setAttempt((value) => value + 1)}>Retry loading</button>
         </div>
       </div>
     );
@@ -387,26 +462,30 @@ export default function PluginScreenPage({ pluginId, navId }: Props) {
     );
   }
 
+  const currentStatus = runtimeStatus === undefined ? record : runtimeStatus;
   return (
     <div className="panel">
-      {record.state !== 'running' && (
+      {currentStatus === null ? (
+        <div className="banner banner-err" role="alert">This plugin is no longer installed. Its open screen has been kept so you can review the current information.</div>
+      ) : currentStatus.state !== 'running' && (
         <div className="banner banner-err" role="alert">
           <span>
-            <TriangleAlert size={13} /> “{record.manifest?.name ?? record.id}” is {record.state}
-            {record.reason ? ` — ${record.reason}` : ''}
+            <TriangleAlert size={13} /> “{record.manifest?.name ?? record.id}” is {currentStatus.state}
+            {currentStatus.reason ? ` — ${currentStatus.reason}` : ''}
             {/* An unhealthy plugin is RUNNING and still answers commands (health
                 is a coarse signal), so telling the user to start it would be
                 wrong — and often the screen itself is where the fix lives. */}
-            {record.state === 'unhealthy'
+            {currentStatus.state === 'unhealthy'
               ? '. The screen still works — you may be able to resolve this here.'
               : '. Start it from Plugins before using this screen.'}
           </span>
         </div>
       )}
       {doc === null ? (
-        <div className="empty-state">Loading screen…</div>
+        <div className="empty-state" role="status">Loading screen…</div>
       ) : (
         <iframe
+          key={attempt}
           ref={frameRef}
           className="plugin-screen"
           title={screen.title ?? navId}

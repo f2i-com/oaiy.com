@@ -222,7 +222,7 @@ export default function PluginsPanel() {
           }}
         >
           <label className="form-row">
-            <span>Plugin folder or .tar.gz on this machine</span>
+            <span>Plugin folder, .zip or .tar.gz on this machine</span>
             <input
               type="text"
               placeholder="C:\path\to\my-plugin"

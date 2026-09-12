@@ -30,7 +30,7 @@ pub struct NodeSnapshot {
     /// A usable node was found (portable install or system) — usable meaning it
     /// answered `node -v`, not merely that a file by that name exists.
     pub available: bool,
-    /// Where it came from: `portable` | `system` | `none`.
+    /// Where it came from: `bundled` | `portable` | `system` | `none`.
     pub source: &'static str,
     /// Absolute path, when we have one.
     pub path: Option<String>,
@@ -73,6 +73,13 @@ fn portable_exe(root: &Path) -> Option<PathBuf> {
         .iter()
         .map(|c| root.join(c))
         .find(|p| p.is_file())
+}
+
+/// Headless distributions carry a tested runtime beside the shipped CLI.
+/// Prefer that version over mutable data directories and arbitrary PATH entries.
+fn bundled_exe() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    portable_exe(&exe.parent()?.join("resources/node"))
 }
 
 /// `node` on PATH, if any.
@@ -119,11 +126,10 @@ impl NodeRuntime {
 
     /// The node the worker should run.
     ///
-    /// Portable FIRST when installed: if the user went to the trouble of
-    /// installing one through OAIY, that pinned build is the one we know works
-    /// with the shipped CLI. Otherwise fall back to whatever is on PATH.
+    /// Prefer the release's bundled version, then a managed portable install,
+    /// then PATH for development and older distributions.
     pub fn resolve(&self) -> Option<PathBuf> {
-        portable_exe(&self.root()).or_else(system_exe)
+        bundled_exe().or_else(|| portable_exe(&self.root())).or_else(system_exe)
     }
 
     /// How long a probe result is reused. Node does not appear or change
@@ -151,12 +157,16 @@ impl NodeRuntime {
             }
         }
 
-        let (path, source) = match portable_exe(&self.root()) {
-            Some(p) => (Some(p), "portable"),
-            None => match system_exe() {
-                Some(p) => (Some(p), "system"),
-                None => (None, "none"),
-            },
+        let (path, source) = if let Some(p) = bundled_exe() {
+            (Some(p), "bundled")
+        } else {
+            match portable_exe(&self.root()) {
+                Some(p) => (Some(p), "portable"),
+                None => match system_exe() {
+                    Some(p) => (Some(p), "system"),
+                    None => (None, "none"),
+                },
+            }
         };
         let version = path.as_deref().and_then(probe_version);
         let snap = NodeSnapshot {

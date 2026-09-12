@@ -465,6 +465,17 @@ async function main(): Promise<void> {
     const body = JSON.parse(sent[0].body!);
     check('chat: real values are still forwarded', body.temperature === 0.7 && body.max_tokens === 256);
   }
+  {
+    const { ctx, sent } = mkCtx(() => ({ body: { choices: [{ message: { content: 'ok' } }] } }));
+    const m = modA.runtime.createMethods!(ctx);
+    await m.chat('hello', callFor(modA, 'llm_chat', { maxTokens: 120, extraBody: { chat_template_kwargs: { enable_thinking: false }, stream: true, messages: [] } }));
+    const body = JSON.parse(sent[0].body!);
+    check('chat: forwards local model options without overriding the response contract', body.chat_template_kwargs.enable_thinking === false && body.stream === false && body.messages.length === 1 && body.max_tokens === 120);
+  }
+  await rejectsWith('chat: reasoning-only responses cannot become successful empty drafts', 'answered without a message', async () => {
+    const { ctx } = mkCtx(() => ({ body: { choices: [{ message: { content: '', reasoning_content: 'thinking' } }] } }));
+    return modA.runtime.createMethods!(ctx).chat('x', callFor(modA, 'llm_chat'));
+  });
   await rejectsWith('chat: an empty gateway answer fails loudly', 'answered without a message', async () => {
     const { ctx } = mkCtx(() => ({ body: { choices: [] } }));
     const m = modA.runtime.createMethods!(ctx);

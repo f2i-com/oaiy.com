@@ -36,6 +36,8 @@ import { ServiceStartupDialog } from './PackageManager/ServiceStartupDialog';
 import { CanvasContextMenu } from './OAIYBuilder/CanvasContextMenu';
 import { makeIsValidConnection } from '../utils/edgeTypeValidation';
 import { useTheme } from '../contexts/ThemeContext';
+import { useFocusTrap } from '../hooks/useFocusTrap';
+import { useMediaQuery } from '../hooks/useMediaQuery';
 import TypedConnectionLine from './OAIYBuilder/TypedConnectionLine';
 
 // Render-invariant literals hoisted to module scope so they keep a stable
@@ -306,7 +308,7 @@ export default function OAIYBuilder({
     screenToFlowPosition: (position: { x: number; y: number }) => { x: number; y: number };
     getViewport: () => { x: number; y: number; zoom: number };
     setViewport: (viewport: Viewport, options?: { duration?: number }) => void;
-    fitView: (options?: { padding?: number; duration?: number }) => void;
+    fitView: (options?: { padding?: number; duration?: number; maxZoom?: number }) => void;
   } | null>(null);
 
   // Clear transitioning state once nodes are ready (after a microtask to ensure render)
@@ -320,7 +322,7 @@ export default function OAIYBuilder({
       const rafId = requestAnimationFrame(() => {
         // Fit view to new nodes before showing
         if (reactFlowInstance.current) {
-          reactFlowInstance.current.fitView({ padding: 0.2, duration: 0 });
+          reactFlowInstance.current.fitView({ padding: 0.2, duration: 0, maxZoom: 1 });
         }
         // Second RAF ensures fitView is painted before revealing
         innerRaf = requestAnimationFrame(() => {
@@ -342,6 +344,17 @@ export default function OAIYBuilder({
   // could add a node and run a flow but could never set an endpoint, a prompt
   // or a model on it. This is that counterpart: the same panel in a sheet.
   const [propsSheetOpen, setPropsSheetOpen] = useState(false);
+  const propsSheetRef = useRef<HTMLDivElement>(null);
+  const propsCloseRef = useRef<HTMLButtonElement>(null);
+  const compact = useMediaQuery('(width < 1280px)');
+  useFocusTrap(propsSheetRef, propsSheetOpen && compact && !showDataViewer, propsCloseRef);
+  useEffect(() => {
+    if (!propsSheetOpen) return;
+    if (!compact) { setPropsSheetOpen(false); return; }
+    const onKey = (event: KeyboardEvent) => { if (event.key === 'Escape') setPropsSheetOpen(false); };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [compact, propsSheetOpen]);
   const [logsOpen, setLogsOpen] = useState(false);
   // Per-panel collapse state, persisted across reloads. The three
   // builder side-panels (palette, properties, execution log) each have
@@ -800,12 +813,13 @@ export default function OAIYBuilder({
         // directly. Subtracting the viewport translation again (a screen-pixel value
         // from a flow coordinate) misplaced every palette-click node after any pan —
         // matching the correct pattern already used by handleAddNodeAtPosition/Macro.
+        const bounds = reactFlowWrapper.current?.getBoundingClientRect();
         const position = reactFlowInstance.current.screenToFlowPosition({
-          x: window.innerWidth / 2 - 128,
-          y: window.innerHeight / 2,
+          x: bounds ? bounds.left + bounds.width / 2 : window.innerWidth / 2,
+          y: bounds ? bounds.top + bounds.height / 2 : window.innerHeight / 2,
         });
         const k = (clickAddOffsetRef.current++ % 8) * 36;
-        addNode(type, { x: position.x + k, y: position.y + k });
+        addNode(type, { x: position.x - 128 + k, y: position.y - 64 + k });
       } else {
         addNode(type);
       }
@@ -845,11 +859,12 @@ export default function OAIYBuilder({
       };
 
       if (reactFlowInstance.current) {
+        const bounds = reactFlowWrapper.current?.getBoundingClientRect();
         const position = reactFlowInstance.current.screenToFlowPosition({
-          x: window.innerWidth / 2 - 128,
-          y: window.innerHeight / 2,
+          x: bounds ? bounds.left + bounds.width / 2 : window.innerWidth / 2,
+          y: bounds ? bounds.top + bounds.height / 2 : window.innerHeight / 2,
         });
-        addNode('macro' as NodeType, position, extraData);
+        addNode('macro' as NodeType, { x: position.x - 128, y: position.y - 64 }, extraData);
       } else {
         addNode('macro' as NodeType, undefined, extraData);
       }
@@ -991,6 +1006,7 @@ export default function OAIYBuilder({
               onAddNode={handleAddNode}
               onAddNodeAtPosition={handleAddNodeAtPosition}
               isOpen={true}
+              docked
               onClose={() => { }}
               macros={macros}
               onAddMacro={handleAddMacro}
@@ -1030,6 +1046,8 @@ export default function OAIYBuilder({
             className="fixed inset-x-0 bottom-0 z-50 flex flex-col max-h-[70dvh] rounded-t-2xl border-t border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 shadow-2xl"
             role="dialog"
             aria-label="Node properties"
+            aria-modal="true"
+            ref={propsSheetRef}
           >
             <div className="flex items-center justify-between px-3 py-2 border-b border-slate-200 dark:border-slate-800 flex-shrink-0">
               <div className="flex items-center gap-2 min-w-0">
@@ -1041,6 +1059,7 @@ export default function OAIYBuilder({
                 onClick={() => setPropsSheetOpen(false)}
                 className="btn btn-ghost btn-icon"
                 aria-label="Close properties"
+                ref={propsCloseRef}
               >
                 <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
@@ -1116,9 +1135,12 @@ export default function OAIYBuilder({
                 if (savedViewportRef.current) {
                   // Restore the saved viewport (preserves zoom level)
                   instance.setViewport(savedViewportRef.current, { duration: 0 });
-                } else {
+                } else if (nodes.length > 0) {
                   // First time: fit view to show all nodes
-                  instance.fitView({ padding: 0.2, duration: 0 });
+                  instance.fitView({ padding: 0.2, duration: 0, maxZoom: 1 });
+                } else {
+                  // Fitting empty bounds can zoom to the maximum before the first node exists.
+                  instance.setViewport({ x: 0, y: 0, zoom: 1 }, { duration: 0 });
                 }
               }
               // Clear transitioning state after viewport is set - use RAF to ensure paint
@@ -1186,7 +1208,7 @@ export default function OAIYBuilder({
                   </p>
                   <p className="text-xs mt-1" style={{ color: 'rgb(var(--color-text-tertiary))' }}>
                     <span className="hidden xl:inline">Drag a node from the palette on the left, or right-click to add one.</span>
-                    <span className="xl:hidden">Tap the menu icon to open the node palette.</span>
+                    <span className="xl:hidden">Tap the + button below to add your first node.</span>
                   </p>
                 </div>
               </div>

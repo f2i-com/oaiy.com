@@ -38,6 +38,7 @@ export interface SetupStep {
 }
 
 export interface SetupInput {
+  codexConnected?: boolean;
   runtime: RuntimeStatus | null;
   providers: AiProviderPublic[] | null;
   services: ServiceSnapshot[] | null;
@@ -61,7 +62,7 @@ export function deriveSetupSteps(input: SetupInput): SetupStep[] {
   const { runtime, providers, services, plugins, connected } = input;
 
   const runtimeReady = runtime?.ready === true;
-  const aiReady = (providers ?? []).some(providerReady) || hasLocalModel(services);
+  const aiReady = input.codexConnected === true || (providers ?? []).some(providerReady) || hasLocalModel(services);
   const pluginRunning = (plugins ?? []).some((p) => p.state === 'running');
   const anyConnected = (connected ?? []).length > 0;
 
