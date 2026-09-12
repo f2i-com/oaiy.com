@@ -1,28 +1,108 @@
-# oaiy.com
+# OAIY — Orchestrate AI Yourself
 
-**OAIY — Orchestrate AI Yourself.** Connect. Draw. Expose.
+**Connect your AI. Build a flow. Put it to work.**
 
-A visual node-graph builder that runs entirely in the browser, talks to whatever local AI engines you have (Ollama, LM Studio, ComfyUI, custom HTTP endpoints — anything you register as a Service), and ships with an optional PHP/MySQL backend for sharing flows and driving them remotely from external AIs (ChatGPT, Claude, etc.) via HTTP.
+OAIY brings a visual flow editor, local AI services, provider connections and
+device plugins into one workspace. Use a local model, an API provider or your
+ChatGPT account through Codex. Run flows in the browser or through OAIY Desktop,
+and connect apps such as FormLogic to the runtime on your own machine.
 
-```
-┌──────────────────┐        ┌──────────────────────┐
-│  ChatGPT/Claude  │ ──POST→│  PHP/Slim + MySQL    │
-│  (any HTTP tool) │        │  api.oaiy.com        │
-└──────────────────┘        │  ┌────────────────┐  │
-                            │  │ flows table    │  │
-                            │  │ runs queue     │  │
-                            │  └────────────────┘  │
-                            └──────┬───────────────┘
-                                   │ HTTP long-poll
-                                   ▼
-                            ┌──────────────────┐
-                            │    OAIY web UI   │ ◀── executes flow
-                            │ in user browser  │     locally on their
-                            │ (this repo: ui/) │     machine + services
-                            └──────────────────┘
-```
+[Desktop setup](#set-up-your-ai) · [FormLogic and Aokie](#connect-formlogic-and-aokie) ·
+[Develop locally](#quick-start) · [CLI guide](cli/README.md) ·
+[Bridge protocol](protocol/README.md)
 
-The flow lives in the user's browser. Inference happens against THEIR local engines. The backend is a rendezvous point: it stores the flow JSON, hands shareable URLs to the user, and queues run requests from external HTTP clients that the user's browser picks up.
+![OAIY Desktop overview showing the setup guide, a running Aokie plugin and local runtime status](docs/images/desktop-overview.png)
+
+*The running desktop workspace. Overview brings setup, service health, plugins
+and connected apps together.*
+
+## What you can do
+
+- **Build visual flows.** Connect model calls, HTTP requests, data processing and
+  device actions in the browser editor, then inspect their runs.
+- **Bring your own AI.** Choose an OpenAI-compatible or Anthropic API provider,
+  a local model server, or OAIY's managed Codex connection.
+- **Manage the local runtime.** Install and start services, download models,
+  manage Python environments and inspect logs from OAIY Desktop.
+- **Connect apps and devices.** Approve browser connections, link a FormLogic
+  account and install plugins such as Aokie for phone features.
+- **Run without the editor.** The CLI and headless desktop server use the same
+  flow engine as the web app. The optional PHP backend adds shared flows and a
+  remote run queue.
+
+## Set up your AI
+
+Open **Overview** in OAIY Desktop and follow the setup guide: **Runtime → Your
+AI → Plugins → FormLogic**. It derives progress from the current runtime and
+configuration; plugins and app connections are optional.
+
+![The OAIY setup wizard with Codex, provider API key and local model choices](docs/images/ai-setup.png)
+
+*The actual setup wizard with Local model selected. Choose the connection that
+fits your existing setup.*
+
+| Connection | How to set it up |
+|---|---|
+| **Codex / ChatGPT** | Select this option and use **Sign in with ChatGPT**. The wizard links to the Codex CLI installation guide if the CLI is missing. OAIY manages a separate Codex session; the CLI owns sign-in and credentials. Your eligible account's limits apply. |
+| **Provider API key** | Open **Providers → Add provider**, choose the protocol, enter the endpoint, model and key, then use **Test**. Provider keys are stored on the desktop and injected into outbound requests by its gateway. Provider charges may apply. |
+| **Local model** | Open **Services** to install or connect a model server, then use **Models** to download its model. Start the service and select it in your flow or connected app. Existing local OpenAI-compatible endpoints can also be added in **Providers**. |
+
+![The Providers screen with the ChatGPT sign-in option and a configured local Qwen model](docs/images/ai-providers.png)
+
+*A real local configuration using Qwen3.5 9B Q4. The model and endpoint shown are
+an example from the development machine, not a required model or bundled
+download. All screenshots were captured from the running app with live API
+responses; no mock data was substituted.*
+
+Use **Test** to check a provider's actual response after configuring it. A saved
+provider or green setup check is not a substitute for an inference test.
+GPU use depends on the model server and its configuration; OAIY's llama.cpp
+installer selects a CUDA build when it detects an NVIDIA GPU on Windows.
+
+## Connect FormLogic and Aokie
+
+FormLogic provides the hosted app, forms, records and backend logic. OAIY
+provides local model access, flow execution and device plugins. They connect
+through the [OAIY Bridge protocol](protocol/README.md).
+
+1. In FormLogic, open **Connect your AI**, choose **OAIY desktop** and start the
+   connection. In OAIY **Connections**, check the matching code and approve it.
+2. Return to FormLogic, select the provider and verify the connection. Keep
+   OAIY running while your app uses its local services.
+3. For account-backed records and automations, complete **Connections → Linked
+   account** as well. Approval happens in the provider's browser page; OAIY
+   receives a scoped key. This account link is separate from granting a browser
+   access to the local runtime.
+4. For phone features, install the Aokie plugin through **Plugins**, start it and
+   open **AI Receptionist**. Its setup guides you through the phone connection
+   and speech, model and voice providers.
+5. In FormLogic, configure the Aokie app's forms and event-to-flow bindings.
+   Plugin events can trigger those linked flows, and the configured app records
+   calls, transcripts and appointments in its workspace. Inspect **Runs** and
+   plugin logs in OAIY when a step needs attention.
+
+Aokie's phone features need compatible phone hardware and configured speech
+services. Its local speech pipeline can combine separate STT, LLM and TTS
+services. OAIY's provider gateway currently exposes chat completions; it does
+not provide a realtime WebSocket proxy. Provider choices report the host's
+supported capabilities.
+
+Review or revoke app access in **Connections**. Linked flows run with the
+permissions granted to their account and plugin; install and approve only the
+connections you intend to use.
+
+## How the pieces fit
+
+The browser editor stores your working flows locally and executes them against
+your configured services. Desktop adds the processes and device access a
+browser cannot manage on its own. Its authenticated local API is the connection
+point for approved apps; linked accounts supply the scoped access for remote
+events, records and flows.
+
+The separate `api/` PHP service stores shared flow snapshots and queues run
+requests. A browser dispatcher or CLI worker picks up those requests and runs
+them against its configured services. Model inference happens at the selected
+provider or local model server.
 
 ## Repo layout
 
@@ -43,15 +123,36 @@ The parts are independently deployable. `ui/` runs standalone (no backend) and g
 
 ## Quick start
 
+### Desktop (`desktop/`)
+
+For a packaged app, use an installer from the repository's
+[Releases](https://github.com/f2i-com/oaiy.com/releases) when available. For local
+development, install Node.js, a stable Rust toolchain and the platform's Tauri
+build prerequisites. Windows needs the Visual Studio C++ build tools and
+WebView2.
+
+```bash
+cd desktop
+npm ci
+npm run tauri:dev
+```
+
+The desktop API uses `http://127.0.0.1:17972` by default. Browser apps pair through
+**Connections**; the headless server requires `OAIY_SERVER_TOKEN` for protected
+API routes. See the [desktop guide](desktop/README.md) for platform setup,
+service templates, data storage and headless deployment.
+
 ### Frontend (`ui/`)
 
-Requires Node 20+ and npm 10+.
+Use a current Node.js LTS release and npm; the release workflow uses Node 24.
 
 ```bash
 cd ui
 npm install
 npm run dev               # http://localhost:5173 (Vite default)
 ```
+
+Open `/` for the site or `/app.html` for the flow editor.
 
 `ui/` is fully standalone — there is **no** sibling-monorepo dependency. The `oaiy-core` engine and `oaiy-ui-components` are vendored under `ui/vendor/`, and the bundled node modules live under `ui/src/bundled-modules/`; both are resolved via the aliases in `ui/vite.config.ts`. `npm install && npm run dev` works on its own, palette and all.
 
@@ -177,16 +278,24 @@ It costs a one-off ~1.2 MB engine download on the first flow run (lazy — nothi
 
 ## Testing
 
-Four suites, one per deployable — Rust unit tests, CLI engine tests, an API
-end-to-end smoke test and a browser end-to-end suite. See [`TESTING.md`](TESTING.md).
+Run checks manually from the directory shown after installing its dependencies.
+Automatic push and pull-request CI is temporarily paused; the
+[CI workflow](.github/workflows/ci.yml) can still be started manually with
+`workflow_dispatch`.
 
-```bash
-(cd desktop/src-tauri && cargo test)   # 28 tests, no services needed
-(cd cli && npm test)                   # 4 suites, no services needed
-(cd api && composer test)              # needs a running API + migrated DB
-(cd ui && npm test)                    # typecheck, css tokens, node contracts, zipp sandbox + routing
-(cd ui && npm run test:e2e)            # needs `npm run dev`
-```
+| Directory | Command | Coverage / requirements |
+|---|---|---|
+| `desktop/` | `npm test` | Desktop UI and integration contracts |
+| `desktop/` | `npm run build` | CLI resource sync, TypeScript and desktop UI build |
+| `desktop/src-tauri/` | `cargo test --no-default-features --lib` | Runtime, gateway, plugins and account links without GUI dependencies |
+| `cli/` | `npm test` | Headless flow engine and host adapters |
+| `ui/` | `npm test` | TypeScript, CSS tokens, node contracts and Zipp sandbox routing |
+| `ui/` | `npm run test:e2e` | Browser checks; needs the web dev server |
+| `api/` | `composer test` | API smoke tests; needs a running API and migrated development database |
+
+See [`TESTING.md`](TESTING.md) for API and browser test setup. Hardware, model
+quality and real phone audio still need integration checks against the chosen
+services and devices.
 
 ## Releases
 
@@ -207,7 +316,10 @@ The tag is the version — it is stamped into the desktop app at build time, so 
 | `oaiy-server-<v>-linux-x86_64.tar.gz`, `-windows-x64.zip` | The headless server, no GUI or GTK, for hosts driven by the CLI or a hosted web app |
 | `SHA256SUMS.txt` | Checksums for everything above |
 
-The web build is standalone (`VITE_API_BASE` unset) unless a repository Actions variable named `VITE_API_BASE` is set. `.github/workflows/ci.yml` runs the web and CLI test suites on every push and pull request.
+The web build is standalone (`VITE_API_BASE` unset) unless a repository Actions
+variable named `VITE_API_BASE` is set. Tag-triggered release publishing remains
+enabled while ordinary CI is paused. The release workflow also supports manual
+builds without publishing a release.
 
 ## License
 
