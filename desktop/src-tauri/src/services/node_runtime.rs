@@ -22,7 +22,9 @@ use super::runner::{LogBuffer, LogLine};
 
 /// Pinned Node release. Bump deliberately — a flow engine changing runtime
 /// under users is not something that should happen by drift.
-const NODE_VERSION: &str = "22.14.0";
+// Match the supported LTS used by release builds. The bundled CLI's HTTP
+// dependency requires Node >=22.19; the previous 22.14 download was too old.
+const NODE_VERSION: &str = "24.19.0";
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -416,6 +418,15 @@ fn extract_zip_stripped(archive: &Path, dest: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn managed_node_meets_the_bundled_cli_http_dependency_requirement() {
+        let lock: serde_json::Value = serde_json::from_str(include_str!("../../../../cli/package-lock.json")).unwrap();
+        let requirement = lock["packages"]["node_modules/undici"]["engines"]["node"].as_str().unwrap();
+        let minimum = requirement.strip_prefix(">=").expect("review the Node installer when the dependency's engine range changes");
+        let version = |v: &str| v.split('.').map(|part| part.parse::<u32>().unwrap()).collect::<Vec<_>>();
+        assert!(version(NODE_VERSION) >= version(minimum), "managed Node {NODE_VERSION} does not satisfy undici's {requirement}");
+    }
 
     #[test]
     fn safe_member_allows_a_leading_dot_slash_but_nothing_else_odd() {
