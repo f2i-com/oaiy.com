@@ -1,58 +1,50 @@
 # zipp-wasm (vendored)
 
-The [Zipp](https://github.com/f2i-com/zipp.org) JavaScript engine, compiled to
-WebAssembly. OAIY uses it to execute untrusted package workflows inside an
-engine that has no host capabilities at all — see
-`ui/vendor/oaiy-core/src/zipp-executor.ts` for the driver and
-`ui/src/workers/zipp-untrusted-worker.ts` for the Worker that hosts it.
+OAIY's browser flow sandbox uses the official [ZIPP v0.0.18 JavaScript WASM
+release](https://github.com/f2i-com/zipp.org/releases/tag/v0.0.18). The engine
+runs in a fresh Worker for each workflow. Host operations go through OAIY's
+module broker; the guest cannot access browser or Node APIs directly.
 
-This directory holds **prebuilt bytes**, deliberately. `ui/` is a standalone
-Vite app: `npm install && npm run dev` has to work without a Rust toolchain and
-without a sibling checkout, so the artifact is committed rather than built.
+The generated bindings and WASM are committed together so `npm ci && npm run
+build` works without Rust or a sibling checkout. This is the JavaScript variant:
+OAIY's generated workflows are JavaScript, so it does not download the optional
+Python engine. Desktop background runs continue to use the bundled Node CLI.
 
 ## Provenance
 
 | | |
 |---|---|
 | Source | `f2i-com/zipp.org`, `crates/zipp-wasm` |
-| Engine version | 0.0.13 |
-| Source commit | `671d845f` (origin/main, 2 commits past the `v0.0.13` tag) |
+| Engine version | 0.0.18 |
+| Source commit | `fc474d15758827770f06d0dc2ebfe3055ebaa625` |
+| Release asset | `zipp-wasm-0.0.18-web.zip` |
 | Built with | rustc 1.92.0, wasm-bindgen 0.2.126, `--target web` |
 | Linked memory maximum | 1 GiB (16384 pages) |
 | Linked stack | 1 MiB |
-| `zipp_wasm_bg.wasm` SHA-256 | `82647a21400ec249375157df2cca9ad9f691832180f8e5bc6eb4c4c676edb521` |
+| `zipp_wasm_bg.wasm` SHA-256 | `512fd864e2831fa2cb46047a7a044d32d4214b2b9caaf44200e8c153f994f1a8` |
+| WASM size | 5,426,696 bytes before HTTP compression |
 
-Post-processing matches Zipp's release pipeline: name and producers sections
-removed by `wasm-bindgen`, then the optional `target_features` section stripped.
-No `wasm-opt` pass — Zipp measured it as both slower and larger on the wire.
+`BUILD-INFO.txt` and `PROFILE.json` come from the release unchanged.
+`UPSTREAM-SHA256SUMS` is the release archive's original checksum list. It also
+lists upstream documentation and the optional host SDK, which OAIY does not
+vendor because it has its own host bridge.
 
-## Refreshing this directory
+## Updating
 
-From a `zipp.org` checkout at the version you want:
+1. Download the official JavaScript web ZIP and release `SHA256SUMS`.
+2. Verify the ZIP against the release checksums, then verify its files against
+   the checksum list inside the archive.
+3. Copy all four `zipp_wasm*` files together, plus `BUILD-INFO.txt`,
+   `PROFILE.json`, and the inner checksum list as `UPSTREAM-SHA256SUMS`.
+4. Update this provenance table and the download-size description in the main
+   README. Run `npm test` and `npm run build` in `ui/`, then exercise a browser
+   flow and the FormLogic desktop connection before tagging.
 
-```sh
-cd crates/zipp-wasm
-RUSTFLAGS='-Dwarnings -C link-arg=--max-memory=1073741824 -C link-arg=-zstack-size=1048576' \
-  cargo +1.92.0 build --locked --release --target wasm32-unknown-unknown
-wasm-bindgen --target web --out-dir pkg \
-  --remove-name-section --remove-producers-section \
-  target/wasm32-unknown-unknown/release/zipp_wasm.wasm
-node tests/node/strip-target-features.cjs \
-  pkg/zipp_wasm_bg.wasm pkg/zipp_wasm_bg.stripped.wasm
-mv pkg/zipp_wasm_bg.stripped.wasm pkg/zipp_wasm_bg.wasm
-
-# MUST pass before copying. A module whose linked maximum is not 16384 pages
-# sits below the VM's own 512 MiB accounting limit, which turns a catchable
-# RangeError into an unrecoverable trap.
-node tests/node/check-wasm-memory.cjs pkg/zipp_wasm_bg.wasm
-```
-
-Then copy `zipp_wasm.js`, `zipp_wasm.d.ts`, `zipp_wasm_bg.wasm` and
-`zipp_wasm_bg.wasm.d.ts` here, and update the table above — the SHA-256 in it is
-asserted by `ui/tests/zipp-executor.mjs`, so a refresh that forgets it fails the
-test run.
+The executor tests verify the bindings and WASM against the upstream checksum
+list and compare the live engine profile with the shipped profile. A stale
+binding or mismatched binary fails the test run.
 
 ## Licence
 
-Apache-2.0. The upstream licence text is in `LICENSE`; the attribution entry is
-in the repository-root `NOTICE`.
+Apache-2.0. The upstream licence text is in `LICENSE`; attribution is in the
+repository-root `NOTICE`.

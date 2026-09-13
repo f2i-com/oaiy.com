@@ -1641,7 +1641,7 @@ select:disabled { cursor: not-allowed; opacity: 0.5; }
 .setup-wizard { margin: 16px 0; padding: 20px; border: 1px solid var(--border, #404040); border-radius: 14px; min-width: 0; }
 .setup-wizard h4 { margin: 20px 0 8px; font-size: 17px; }
 .setup-wizard-nav, .setup-wizard-footer { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
-.setup-wizard-nav [aria-current="step"], .setup-wizard-nav [aria-pressed="true"] { outline: 2px solid var(--accent, #6989ff); outline-offset: 2px; }
+.setup-wizard-nav [aria-current="step"], .setup-wizard-nav [aria-pressed="true"] { outline: 2px solid var(--primary); outline-offset: 2px; }
 .setup-wizard-footer { margin-top: 20px; justify-content: space-between; }
 .setup-wizard-instructions { padding-left: 22px; font-size: 13px; line-height: 1.8; overflow-wrap: anywhere; }
 .setup-wizard-choice { margin-top: 16px; }

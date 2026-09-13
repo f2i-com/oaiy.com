@@ -65,10 +65,25 @@ check(
   declaredSha ? `README ${declaredSha.slice(0, 16)}… vs file ${actualSha.slice(0, 16)}…` : 'no SHA in README',
 );
 
-const { default: init, Engine } = await import(
+const checksums = new Map(fs.readFileSync(path.join(VENDOR, 'UPSTREAM-SHA256SUMS'), 'utf8')
+  .trim().split(/\r?\n/).map(line => {
+    const [digest, name] = line.trim().split(/\s+/, 2);
+    return [name, digest];
+  }));
+for (const name of ['zipp_wasm.js', 'zipp_wasm.d.ts', 'zipp_wasm_bg.wasm', 'zipp_wasm_bg.wasm.d.ts', 'PROFILE.json', 'BUILD-INFO.txt']) {
+  check(`${name} matches the official release checksum`,
+    createHash('sha256').update(fs.readFileSync(path.join(VENDOR, name))).digest('hex') === checksums.get(name));
+}
+
+const { default: init, Engine, zippProfile } = await import(
   pathToFileURL(path.join(VENDOR, 'zipp_wasm.js')).href
 );
 await init({ module_or_path: wasmBytes });
+const profile = JSON.parse(zippProfile());
+check('running engine matches the shipped release profile',
+  JSON.stringify(profile) === JSON.stringify(JSON.parse(fs.readFileSync(path.join(VENDOR, 'PROFILE.json'), 'utf8'))));
+check('release is ZIPP 0.0.18 with the JavaScript sandbox profile',
+  profile.version === '0.0.18' && profile.languages.includes('javascript') && profile.features.includes('safe-sandbox'));
 
 // ---------------------------------------------------------------------------
 // Harness: the OAIY program shape, and a broker that answers it.

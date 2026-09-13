@@ -20,3 +20,11 @@ NOTICE text eol=lf
 # Zipp engine's SHA-256 is asserted by ui/tests/zipp-executor.mjs, so pin it
 # rather than rely on detection — the same reasoning as the licence texts above.
 *.wasm binary
+
+# Official ZIPP release files are checksum-verified byte for byte on every OS.
+ui/vendor/zipp-wasm/zipp_wasm.js text eol=lf
+ui/vendor/zipp-wasm/zipp_wasm.d.ts text eol=lf
+ui/vendor/zipp-wasm/zipp_wasm_bg.wasm.d.ts text eol=lf
+ui/vendor/zipp-wasm/PROFILE.json text eol=lf
+ui/vendor/zipp-wasm/BUILD-INFO.txt text eol=lf
+ui/vendor/zipp-wasm/UPSTREAM-SHA256SUMS text eol=lf
