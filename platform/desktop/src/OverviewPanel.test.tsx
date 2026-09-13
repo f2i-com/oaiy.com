@@ -39,7 +39,7 @@ const runtime = (failed: number) => ({
   deviceId: 'dev_1',
   flowRuntime: { cliResolved: true, cliKind: 'node', detail: null },
   runs: { queued: 0, known: 10, failed },
-  nodeRuntime: { available: true, installing: false, installsVersion: '22.14.0', source: 'system' },
+  nodeRuntime: { available: true, installing: false, installsVersion: '24.19.0', source: 'system' },
   plugins: { serving: 1, total: 1 },
 });
 
