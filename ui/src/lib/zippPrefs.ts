@@ -13,7 +13,7 @@
  * `importScripts` — not hidden, absent. It also enforces instruction and heap
  * budgets, so a runaway loop or allocation stops on its own.
  *
- * It is therefore the DEFAULT engine for every flow. The trade is a ~1.2 MB
+ * It is therefore the DEFAULT engine for every flow. The trade is a ~1.8 MB
  * (compressed) download on the first run, an interpreter rather than a JIT, and
  * a ~16 MiB ceiling on any single value crossing the boundary; the toggle
  * exists so a user who hits one of those can fall back without editing

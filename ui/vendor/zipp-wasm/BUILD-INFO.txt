@@ -1,0 +1,9 @@
+version=0.0.18
+commit=fc474d15758827770f06d0dc2ebfe3055ebaa625
+rustc=rustc 1.92.0 (ded5c06cf 2025-12-08)
+wasm-bindgen=wasm-bindgen 0.2.126
+variant=javascript
+languages=["javascript"]
+stack-bytes=1048576
+target=wasm32-unknown-unknown
+host-sdk=1.2.0

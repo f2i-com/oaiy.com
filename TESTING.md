@@ -146,15 +146,37 @@ Nodes whose inputs are consumed somewhere other than their own module compiler
 (loop, macro and subflow boundaries) are listed explicitly in the test, each with
 the reason, so an exemption can be re-checked rather than trusted forever.
 
+## ZIPP runtime updates
+
+`cd ui && npm run test:zipp` executes real compiled workflow scripts in the
+vendored WASM engine. It covers host round-trips, output, error propagation,
+instruction limits and the guest helpers. It also verifies the official release
+checksums for the bindings, WASM and provenance files, then compares the live
+engine profile with `ui/vendor/zipp-wasm/PROFILE.json`.
+
+After an update, run the full `ui` tests and production build, the `cli` tests,
+and the desktop UI and Rust tests. In the built browser app, run a Logic Block
+and verify its execution log, then test an HTTP host call to the local companion.
+The browser flow uses ZIPP; background flows on the desktop use the Node CLI.
+
+For FormLogic integration, sign in to the intended site, approve the matching
+local OAIY pairing request, and run a disposable diagnostic flow. Check that the
+run completes and its output reaches FormLogic. Keep this separate from the
+WASM test: a successful calculation does not prove pairing or remote delivery.
+Use read-only requests and test-owned records when checking a production site.
+
+A browser flow calling another site's API still needs that API's CORS approval.
+Do not relax the site's policy to make a test pass; use the desktop flow path
+when a target does not support cross-origin browser requests.
+
 ## What isn't covered
 
 Worth knowing before trusting a green run:
 
-- **No test drives a real flow execution.** The engine's node runtimes need live
-  services (Ollama, ComfyUI, a Python venv), so `oaiy run` against a real model
-  is manual. The CLI suite covers module isolation and the job queue, not
-  inference.
-- **OAIY Desktop's HTTP API has only Rust-side unit tests.** Its routes are
-  exercised by hand; a browser can't authenticate to them, which is by design.
+- **Live AI inference remains a manual check.** Local model services (Ollama,
+  ComfyUI and Python environments) are not required by the automated flow tests.
+- **Production FormLogic pairing is manual.** The Rust bridge tests and packaged
+  server smoke test cover local API requests and real CLI execution. A signed-in
+  browser must still be checked against the deployed site using its paired token.
 - **No visual regression testing.** Both themes are asserted structurally, not
   pixel-wise.
