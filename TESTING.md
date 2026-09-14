@@ -169,6 +169,15 @@ A browser flow calling another site's API still needs that API's CORS approval.
 Do not relax the site's policy to make a test pass; use the desktop flow path
 when a target does not support cross-origin browser requests.
 
+## CLI process shutdown
+
+`cd cli && npm run test:http-exit` verifies that HTTPS flows produce intact JSON
+and exit with the correct code on both success and failure. It uses a localhost
+test certificate trusted only by the child process. For the live installed-app
+check, run `node test/cli-http-exit.mjs <installed-cli-path> https://formlogic.com/api/health`.
+Check the process exit code as well as the result: Windows Node can assert during
+forced shutdown even after a flow has written a successful result.
+
 ## What isn't covered
 
 Worth knowing before trusting a green run:
