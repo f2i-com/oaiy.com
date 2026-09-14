@@ -36,6 +36,15 @@
 # the revision, target, features, toolchain, artifact digests and the smoke
 # results, and the release job refuses to publish evidence for any other
 # revision than the one it verified.
+#
+# Evidence is finalised AFTER verification (R3-OAI-01): the build jobs run in
+# parallel with the gate and write their evidence as `unverified` / audit
+# `pending`, so a workflow artifact from a failed or incomplete run never
+# claims a result the run did not establish. The release job, which depends
+# on the gate, runs scripts/attest-release-evidence.mjs: it requires the
+# gate's explicit success, re-checks every artifact digest against the bytes
+# about to be published, and only then stamps `verified` / `pass` together
+# with the exact verification run (id, attempt, URL, ci.yml jobs).
 
 name: Release
 
@@ -167,10 +176,14 @@ jobs:
             fs.writeFileSync("release/release-evidence-web.json", JSON.stringify({
               component: "web", version: process.env.VERSION, revision: process.env.REVISION,
               target: "static-site", features: [], toolchain: { node: process.version },
-              tests: { web: "npm test (ui)", verification: "ci.yml@" + process.env.REVISION },
-              // The gate above ran `npm audit --audit-level=high` for ui, cli and desktop at this
-              // revision; publication depends on it, so a published artifact set implies PASS.
-              dependencyAudit: { status: "pass", tool: "npm audit --audit-level=high (ci.yml)", revision: process.env.REVISION },
+              tests: { web: "npm test (ui)" },
+              // This job runs in parallel with the verification gate and cannot know its
+              // result: the release job attests these two fields after the gate passed
+              // (scripts/attest-release-evidence.mjs, R3-OAI-01). A build artifact from an
+              // incomplete or failed run therefore never claims a passing verification.
+              // (No apostrophes in these comments: they sit inside a single-quoted shell string.)
+              verification: { status: "unverified", gate: ".github/workflows/ci.yml@" + process.env.REVISION },
+              dependencyAudit: { status: "pending", tool: "npm audit --audit-level=high (ci.yml: ui, cli, desktop)", level: "high", revision: process.env.REVISION },
               artifacts: files, builtAt: new Date().toISOString(),
             }, null, 2) + "\n");
           '
@@ -316,7 +329,7 @@ jobs:
           REVISION: ${{ needs.meta.outputs.revision }}
           LABEL: ${{ matrix.label }}
         run: |
-          RUSTC="$(rustc --version)"; CARGO="$(cargo --version)"; NODE="$(node --version)"
+          RUSTC="$(rustc --version)"; CARGO="$(cargo --version)"
           node -e '
             const fs = require("fs"); const crypto = require("crypto"); const path = require("path");
             const files = fs.readdirSync("release").map(name => ({ name, sha256: crypto.createHash("sha256").update(fs.readFileSync(path.join("release", name))).digest("hex") }));
@@ -324,10 +337,12 @@ jobs:
               component: "desktop+headless", version: process.env.VERSION, revision: process.env.REVISION,
               target: process.env.LABEL, runner: process.env.RUNNER_OS,
               features: { desktop: ["gui"], headless: ["--no-default-features"] },
-              toolchain: { rustc: process.argv[1], cargo: process.argv[2], node: process.env.NODE },
-              dependencyAudit: { status: "pass", tool: "npm audit --audit-level=high (ci.yml: ui, cli, desktop)", revision: process.env.REVISION },
+              // The Node version comes from the runtime itself (an unexported shell variable used to leave it empty).
+              toolchain: { rustc: process.argv[1], cargo: process.argv[2], node: process.version },
+              // Attested by the release job after the gate passed (see the note in the web job).
+              verification: { status: "unverified", gate: ".github/workflows/ci.yml@" + process.env.REVISION + " (web, cli npm test + typecheck, desktop vitest, cargo test headless + gui, npm audit high)" },
+              dependencyAudit: { status: "pending", tool: "npm audit --audit-level=high (ci.yml: ui, cli, desktop)", level: "high", revision: process.env.REVISION },
               tests: {
-                verification: "ci.yml@" + process.env.REVISION + " (web, cli npm test + typecheck, desktop vitest, cargo test headless + gui, npm audit high)",
                 cliHttpsShutdown: "node test/cli-http-exit.mjs", stagedHeadlessSmoke: "smoke-server.mjs headless-dist",
                 extractedHeadlessSmoke: "smoke-server.mjs headless-verified (fresh profile, no system Node)",
               },
@@ -351,12 +366,34 @@ jobs:
     if: needs.meta.outputs.is_tag == 'true'
     runs-on: ubuntu-latest
     steps:
+      # The attestation script is taken from the verified revision itself.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.meta.outputs.revision }}
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: artifacts
           merge-multiple: true
 
-      # Every evidence file must name the revision this workflow verified.
+      # Only now, with the gate's result known, does evidence say "verified" /
+      # "pass" (R3-OAI-01). The script refuses on anything but an explicit
+      # success, on a foreign revision, and on any artifact whose bytes no
+      # longer match the digest the build recorded; it writes nothing unless
+      # every file passes.
+      - name: Attest release evidence from the completed verification
+        env:
+          VERIFY_RESULT: ${{ needs.verify.result }}
+          REVISION: ${{ needs.meta.outputs.revision }}
+          VERIFY_WORKFLOW: .github/workflows/ci.yml
+          VERIFY_JOBS: revision,web,cli,desktop (linux),desktop (windows)
+        run: node scripts/attest-release-evidence.mjs --dir artifacts
+
+      # Every evidence file must name the revision this workflow verified and
+      # carry the attested statuses; a file still pending/unverified stops the release.
       - name: Check release evidence names the verified revision
         working-directory: artifacts
         env:
@@ -367,12 +404,18 @@ jobs:
           [[ "$REVISION" == "$TAG_SHA" ]] || { echo "::error::verified revision $REVISION differs from the tagged commit $TAG_SHA"; exit 1; }
           count=0
           for f in release-evidence-*.json; do
-            rev="$(node -e 'console.log(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).revision)' "$f")"
+            read -r rev vstatus astatus run_id < <(node -e '
+              const e = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
+              console.log([e.revision, e.verification && e.verification.status, e.dependencyAudit && e.dependencyAudit.status, e.verification && e.verification.run && e.verification.run.id].join(" "));
+            ' "$f")
             [[ "$rev" == "$REVISION" ]] || { echo "::error::$f records revision $rev, expected $REVISION"; exit 1; }
+            [[ "$vstatus" == "verified" ]] || { echo "::error::$f verification status is '$vstatus', not 'verified'"; exit 1; }
+            [[ "$astatus" == "pass" ]] || { echo "::error::$f dependency audit status is '$astatus', not 'pass'"; exit 1; }
+            [[ "$run_id" == "$GITHUB_RUN_ID" ]] || { echo "::error::$f was attested by run '$run_id', not this run $GITHUB_RUN_ID"; exit 1; }
             count=$((count+1))
           done
           [[ "$count" -ge 3 ]] || { echo "::error::expected evidence for web, linux and windows; found $count"; exit 1; }
-          echo "release evidence verified for $REVISION ($count files)"
+          echo "release evidence verified for $REVISION ($count files, run $GITHUB_RUN_ID attempt ${GITHUB_RUN_ATTEMPT:-1})"
 
       - name: Checksums
         working-directory: artifacts
@@ -402,8 +445,9 @@ jobs:
           Windows host that the CLI or a hosted web app drives. See \`desktop/README.md\`.
 
           \`SHA256SUMS.txt\` covers every file above. \`release-evidence-*.json\` records, per
-          artifact set, the source revision, target, features, toolchain, digests and the tests
-          that ran before publication.
+          artifact set, the source revision, target, features, toolchain, digests, the tests
+          that ran, and the exact verification run (id, attempt, jobs) that passed before
+          publication attested them.
           EOF
 
       - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
