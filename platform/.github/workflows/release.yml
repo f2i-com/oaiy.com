@@ -25,6 +25,17 @@
 # sharing off. To ship a build wired to a backend, set that variable in this
 # repository's Actions variables (Settings -> Secrets and variables -> Actions
 # -> Variables) and it is picked up below.
+#
+# Verification (ecosystem review OAI-01 / ECO-01): every artifact is built
+# from ONE resolved revision, and publication depends on the reusable CI gate
+# (ci.yml via workflow_call) having passed AT THAT REVISION — the web suite,
+# the complete CLI test script and typecheck, the desktop Vitest suite and the
+# native Rust tests in both the headless and GUI configurations. A manual
+# dispatch cannot substitute an older green run: the gate runs fresh, on the
+# commit that is built. Each artifact ships with release-evidence.json naming
+# the revision, target, features, toolchain, artifact digests and the smoke
+# results, and the release job refuses to publish evidence for any other
+# revision than the one it verified.
 
 name: Release
 
@@ -48,12 +59,19 @@ env:
 jobs:
   # ---------------------------------------------------------------- version
   meta:
-    name: Resolve version
+    name: Resolve version and revision
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.v.outputs.version }}
       is_tag: ${{ steps.v.outputs.is_tag }}
+      revision: ${{ steps.rev.outputs.sha }}
     steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      # The ONE revision every job below builds and verifies.
+      - id: rev
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
       - id: v
         shell: bash
         run: |
@@ -71,14 +89,26 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "Building version $version"
 
+  # ---------------------------------------------------------------- verification
+  # The reusable gate, at the exact revision resolved above (OAI-01).
+  verify:
+    name: Verify the release revision
+    needs: meta
+    uses: ./.github/workflows/ci.yml
+    with:
+      ref: ${{ needs.meta.outputs.revision }}
+
   # ---------------------------------------------------------------- web site
   web:
     name: Web site (landing + app)
     needs: meta
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.meta.outputs.revision }}
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: npm
@@ -125,7 +155,23 @@ jobs:
           tar -C ui/dist -czf "$out/oaiy-web-$VERSION.tar.gz" .
           ls -l "$out"
 
-      - uses: actions/upload-artifact@v4
+      - name: Release evidence (web)
+        shell: bash
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+          REVISION: ${{ needs.meta.outputs.revision }}
+        run: |
+          node -e '
+            const fs = require("fs"); const crypto = require("crypto"); const path = require("path");
+            const files = fs.readdirSync("release").map(name => ({ name, sha256: crypto.createHash("sha256").update(fs.readFileSync(path.join("release", name))).digest("hex") }));
+            fs.writeFileSync("release/release-evidence-web.json", JSON.stringify({
+              component: "web", version: process.env.VERSION, revision: process.env.REVISION,
+              target: "static-site", features: [], toolchain: { node: process.version },
+              tests: { web: "npm test (ui)", verification: "ci.yml@" + process.env.REVISION },
+              artifacts: files, builtAt: new Date().toISOString(),
+            }, null, 2) + "\n");
+          '
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: web
           path: release/*
@@ -145,15 +191,19 @@ jobs:
           - os: windows-latest
             label: windows
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.meta.outputs.revision }}
+          persist-credentials: false
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: ${{ env.NODE_VERSION }}
 
-      - uses: dtolnay/rust-toolchain@stable
+      # Pinned to a revision of the `stable` branch, upgraded deliberately.
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable (pinned revision)
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
         with:
           workspaces: desktop/src-tauri
 
@@ -237,7 +287,10 @@ jobs:
           fi
           ls -l "$out"
 
-      - name: Verify the extracted headless release
+      # The final ARCHIVE (not the developer tree) starts with an empty profile,
+      # no system Node/npm on PATH and no checkout paths: smoke-server.mjs
+      # builds that environment itself.
+      - name: Verify the extracted headless release (fresh profile)
         shell: bash
         env:
           VERSION: ${{ needs.meta.outputs.version }}
@@ -251,7 +304,35 @@ jobs:
           fi
           node desktop/scripts/smoke-server.mjs headless-verified
 
-      - uses: actions/upload-artifact@v4
+      # Source revision, target, features, toolchain, artifact digests and the
+      # tests that ran, recorded TOGETHER per artifact set (OAI-01).
+      - name: Release evidence (${{ matrix.label }})
+        shell: bash
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+          REVISION: ${{ needs.meta.outputs.revision }}
+          LABEL: ${{ matrix.label }}
+        run: |
+          RUSTC="$(rustc --version)"; CARGO="$(cargo --version)"; NODE="$(node --version)"
+          node -e '
+            const fs = require("fs"); const crypto = require("crypto"); const path = require("path");
+            const files = fs.readdirSync("release").map(name => ({ name, sha256: crypto.createHash("sha256").update(fs.readFileSync(path.join("release", name))).digest("hex") }));
+            fs.writeFileSync(`release/release-evidence-${process.env.LABEL}.json`, JSON.stringify({
+              component: "desktop+headless", version: process.env.VERSION, revision: process.env.REVISION,
+              target: process.env.LABEL, runner: process.env.RUNNER_OS,
+              features: { desktop: ["gui"], headless: ["--no-default-features"] },
+              toolchain: { rustc: process.argv[1], cargo: process.argv[2], node: process.env.NODE },
+              tests: {
+                verification: "ci.yml@" + process.env.REVISION + " (web, cli npm test + typecheck, desktop vitest, cargo test headless + gui)",
+                cliHttpsShutdown: "node test/cli-http-exit.mjs", stagedHeadlessSmoke: "smoke-server.mjs headless-dist",
+                extractedHeadlessSmoke: "smoke-server.mjs headless-verified (fresh profile, no system Node)",
+              },
+              artifacts: files, builtAt: new Date().toISOString(),
+            }, null, 2) + "\n");
+          ' "$RUSTC" "$CARGO"
+          cat "release/release-evidence-$LABEL.json"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: desktop-${{ matrix.label }}
           path: release/*
@@ -260,14 +341,34 @@ jobs:
   # ---------------------------------------------------------------- release
   release:
     name: Publish release
-    needs: [meta, web, desktop]
+    # Publication needs the verification gate AND every build, all at the
+    # same resolved revision (OAI-01): a failing test in any lane blocks it.
+    needs: [meta, verify, web, desktop]
     if: needs.meta.outputs.is_tag == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: artifacts
           merge-multiple: true
+
+      # Every evidence file must name the revision this workflow verified.
+      - name: Check release evidence names the verified revision
+        working-directory: artifacts
+        env:
+          REVISION: ${{ needs.meta.outputs.revision }}
+          TAG_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          [[ "$REVISION" == "$TAG_SHA" ]] || { echo "::error::verified revision $REVISION differs from the tagged commit $TAG_SHA"; exit 1; }
+          count=0
+          for f in release-evidence-*.json; do
+            rev="$(node -e 'console.log(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).revision)' "$f")"
+            [[ "$rev" == "$REVISION" ]] || { echo "::error::$f records revision $rev, expected $REVISION"; exit 1; }
+            count=$((count+1))
+          done
+          [[ "$count" -ge 3 ]] || { echo "::error::expected evidence for web, linux and windows; found $count"; exit 1; }
+          echo "release evidence verified for $REVISION ($count files)"
 
       - name: Checksums
         working-directory: artifacts
@@ -296,10 +397,12 @@ jobs:
           **oaiy-server** — the same local API with no window, tray or GTK, for a Linux or
           Windows host that the CLI or a hosted web app drives. See \`desktop/README.md\`.
 
-          \`SHA256SUMS.txt\` covers every file above.
+          \`SHA256SUMS.txt\` covers every file above. \`release-evidence-*.json\` records, per
+          artifact set, the source revision, target, features, toolchain, digests and the tests
+          that ran before publication.
           EOF
 
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           tag_name: ${{ github.ref_name }}
           name: OAIY ${{ needs.meta.outputs.version }}
