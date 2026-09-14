@@ -8,6 +8,7 @@
 import './node-host/core';
 import { createEngine } from '../../ui/src/engine/createEngine';
 import type { Flow, WorkflowGraph } from 'oaiy-core';
+import type { WorkflowInputs } from 'oaiy-core';
 import { loadNodeBundledModules } from './generated/bundled-modules';
 import { closeAll as closeBrowserSessions } from './node-host/browser';
 
@@ -88,7 +89,7 @@ export async function runFlow(graph: WorkflowGraph, opts: RunOptions = {}): Prom
 
   try {
     const flowName = opts.flowName ?? 'cli-run';
-    const jobId = engine.submit('cli-run', flowName, graph, opts.inputs);
+    const jobId = engine.submit('cli-run', flowName, graph, opts.inputs as WorkflowInputs | undefined);
 
     await new Promise<void>((resolve) => {
       let done = false;

@@ -62,6 +62,28 @@ jobs:
           cache-dependency-path: ui/package-lock.json
       - working-directory: ui
         run: npm ci
+      # ECO-04: advisories at high or above fail the lane. An unreachable
+      # registry is recorded as UNKNOWN in the run summary, never as clean, and
+      # still fails: a release must carry a completed audit.
+      - name: Dependency audit (high or above)
+        working-directory: ui
+        shell: bash
+        run: |
+          set -o pipefail
+          if out=$(npm audit --audit-level=high 2>&1); then
+            echo "$out" | tail -n 3
+            echo "## Dependency audit (ui): PASS" >> "$GITHUB_STEP_SUMMARY"
+          else
+            code=$?
+            echo "$out" | tail -n 40
+            if echo "$out" | grep -qiE 'ENOTFOUND|ECONNRESET|ETIMEDOUT|EAI_AGAIN|503|registry error|network'; then
+              echo "## Dependency audit (ui): UNKNOWN (registry unreachable at $(date -u +%FT%TZ))" >> "$GITHUB_STEP_SUMMARY"
+              echo "::error::npm audit could not reach the registry; result UNKNOWN, not clean"
+            else
+              echo "## Dependency audit (ui): FAIL" >> "$GITHUB_STEP_SUMMARY"
+            fi
+            exit "$code"
+          fi
       - working-directory: ui
         run: npm test
       - name: Build
@@ -84,6 +106,28 @@ jobs:
           cache-dependency-path: cli/package-lock.json
       - working-directory: cli
         run: npm ci
+      # ECO-04: advisories at high or above fail the lane. An unreachable
+      # registry is recorded as UNKNOWN in the run summary, never as clean, and
+      # still fails: a release must carry a completed audit.
+      - name: Dependency audit (high or above)
+        working-directory: cli
+        shell: bash
+        run: |
+          set -o pipefail
+          if out=$(npm audit --audit-level=high 2>&1); then
+            echo "$out" | tail -n 3
+            echo "## Dependency audit (cli): PASS" >> "$GITHUB_STEP_SUMMARY"
+          else
+            code=$?
+            echo "$out" | tail -n 40
+            if echo "$out" | grep -qiE 'ENOTFOUND|ECONNRESET|ETIMEDOUT|EAI_AGAIN|503|registry error|network'; then
+              echo "## Dependency audit (cli): UNKNOWN (registry unreachable at $(date -u +%FT%TZ))" >> "$GITHUB_STEP_SUMMARY"
+              echo "::error::npm audit could not reach the registry; result UNKNOWN, not clean"
+            else
+              echo "## Dependency audit (cli): FAIL" >> "$GITHUB_STEP_SUMMARY"
+            fi
+            exit "$code"
+          fi
       - working-directory: cli
         run: npm run build
       # The COMPLETE CLI test script (module isolation, SSRF guard, connector
@@ -138,6 +182,28 @@ jobs:
       - name: Install the desktop app's dependencies
         working-directory: desktop
         run: npm ci
+      # ECO-04: advisories at high or above fail the lane. An unreachable
+      # registry is recorded as UNKNOWN in the run summary, never as clean, and
+      # still fails: a release must carry a completed audit.
+      - name: Dependency audit (high or above)
+        working-directory: desktop
+        shell: bash
+        run: |
+          set -o pipefail
+          if out=$(npm audit --audit-level=high 2>&1); then
+            echo "$out" | tail -n 3
+            echo "## Dependency audit (desktop): PASS" >> "$GITHUB_STEP_SUMMARY"
+          else
+            code=$?
+            echo "$out" | tail -n 40
+            if echo "$out" | grep -qiE 'ENOTFOUND|ECONNRESET|ETIMEDOUT|EAI_AGAIN|503|registry error|network'; then
+              echo "## Dependency audit (desktop): UNKNOWN (registry unreachable at $(date -u +%FT%TZ))" >> "$GITHUB_STEP_SUMMARY"
+              echo "::error::npm audit could not reach the registry; result UNKNOWN, not clean"
+            else
+              echo "## Dependency audit (desktop): FAIL" >> "$GITHUB_STEP_SUMMARY"
+            fi
+            exit "$code"
+          fi
       # The desktop Vitest suite — never run by the release workflow before.
       - name: Desktop unit tests (Vitest)
         working-directory: desktop
