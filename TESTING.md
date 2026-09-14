@@ -15,6 +15,22 @@ so a published artifact set always carries a completed audit
 `release-evidence-*.json` naming the source revision, target, features,
 toolchain, digests, the audit result and the tests that ran.
 
+The build jobs run in parallel with the gate, so the evidence they upload says
+`verification.status: "unverified"` and `dependencyAudit.status: "pending"`: a
+workflow artifact from a failed or incomplete run never claims a result the run
+did not establish. The release job, which depends on the gate, runs
+`scripts/attest-release-evidence.mjs` over the downloaded files. It refuses
+unless the gate's result is an explicit success, every file names the verified
+revision, and every artifact digest recorded at build time still matches the
+bytes about to be published; only then does it stamp `verified` / `pass` with
+the exact verification run (workflow run id, attempt, URL, ci.yml job names).
+The publish step then re-checks those statuses and the run id before anything
+is uploaded. The script's own tests run locally with no GitHub access:
+
+```bash
+node scripts/attest-release-evidence.test.mjs
+```
+
 | Suite | Where | Needs a running service? | Run |
 |---|---|---|---|
 | Rust unit tests | `desktop/src-tauri` | no | `cargo test --no-default-features` (headless server) and `cargo test --features gui` (desktop) |
