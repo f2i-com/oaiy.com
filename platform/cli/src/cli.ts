@@ -104,7 +104,9 @@ program
     if (!opts.quiet && !res.success) {
       process.stderr.write(`oaiy: run ${res.status}${res.error ? ` — ${res.error}` : ''}\n`);
     }
-    process.exit(res.success ? 0 : 1);
+    // Let pending socket close callbacks finish before Node tears down libuv.
+    // Forced exit after an HTTP flow can crash on Windows despite a successful result.
+    process.exitCode = res.success ? 0 : 1;
   });
 
 program

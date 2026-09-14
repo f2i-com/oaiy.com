@@ -188,6 +188,10 @@ jobs:
           npm ci
           npm run build
 
+      - name: Check CLI HTTPS shutdown
+        working-directory: cli
+        run: node test/cli-http-exit.mjs
+
       - name: Install the desktop app's dependencies
         working-directory: desktop
         run: npm ci
