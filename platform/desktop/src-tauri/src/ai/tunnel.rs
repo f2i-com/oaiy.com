@@ -27,6 +27,7 @@
 //! another.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -192,6 +193,39 @@ pub struct AiTunnel {
     published_marker: std::path::PathBuf,
     /// Log-once latch, so a provider that is down does not fill the log.
     publish_note: std::sync::Mutex<Option<String>>,
+    codex_catalog_probe: OptionalProviderProbe,
+}
+
+/// An optional provider must not stall discovery of working local providers.
+/// Keep at most one blocking status probe alive, even when its caller times out.
+#[derive(Default)]
+struct OptionalProviderProbe {
+    running: Arc<AtomicBool>,
+    connected: Arc<AtomicBool>,
+}
+
+impl OptionalProviderProbe {
+    async fn check(&self, budget: Duration, probe: impl FnOnce() -> bool + Send + 'static) -> bool {
+        if self.running.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
+            return self.connected.load(Ordering::Acquire);
+        }
+        let running = self.running.clone();
+        let connected = self.connected.clone();
+        let task = tokio::task::spawn_blocking(move || {
+            struct Reset(Arc<AtomicBool>);
+            impl Drop for Reset {
+                fn drop(&mut self) { self.0.store(false, Ordering::Release); }
+            }
+            let _reset = Reset(running);
+            let result = probe();
+            connected.store(result, Ordering::Release);
+            result
+        });
+        match tokio::time::timeout(budget, task).await {
+            Ok(Ok(result)) => result,
+            _ => self.connected.load(Ordering::Acquire),
+        }
+    }
 }
 
 impl AiTunnel {
@@ -203,6 +237,7 @@ impl AiTunnel {
             sources,
             published_marker: data_dir.join("desktop-e2e-published.json"),
             publish_note: std::sync::Mutex::new(None),
+            codex_catalog_probe: OptionalProviderProbe::default(),
         }))
     }
 
@@ -299,6 +334,8 @@ impl AiTunnel {
                         && v.get("publicKey").and_then(Value::as_str) == Some(pubkey.as_str())
                         && v.get("baseUrl").and_then(Value::as_str)
                             == Some(account.base_url.as_str())
+                        && v.get("linkedAt").and_then(Value::as_str)
+                            == Some(account.linked_at.to_rfc3339().as_str())
                 });
             if already {
                 return;
@@ -310,6 +347,7 @@ impl AiTunnel {
                     "instanceId": instance,
                     "publicKey": pubkey,
                     "baseUrl": account.base_url,
+                    "linkedAt": account.linked_at.to_rfc3339(),
                     "publishedAt": chrono::Utc::now().to_rfc3339(),
                 });
                 let tmp = self.published_marker.with_extension("tmp");
@@ -622,9 +660,9 @@ impl AiTunnel {
         // The managed ChatGPT connector, offered only when it is actually signed
         // in — listing it otherwise offers a guaranteed failure.
         let codex = self.sources.codex.clone();
-        if tokio::task::spawn_blocking(move || codex.models())
+        if self.codex_catalog_probe
+            .check(Duration::from_secs(2), move || codex.status().connected)
             .await
-            .is_ok_and(|r| r.is_ok())
         {
             rows.push(json!({
                 "id": crate::ai::codex::CODEX_PROVIDER_ID,
@@ -1275,6 +1313,30 @@ fn urlencode(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn slow_optional_provider_does_not_block_catalog_or_duplicate_probes() {
+        let probe = OptionalProviderProbe::default();
+        let (release, wait) = std::sync::mpsc::channel();
+        let first = probe.check(Duration::from_millis(10), move || {
+            wait.recv_timeout(Duration::from_secs(2)).is_ok()
+        }).await;
+        assert!(!first);
+        assert!(probe.running.load(Ordering::Acquire));
+        let second = probe.check(Duration::from_millis(10), || {
+            panic!("a timed-out probe must not be duplicated")
+        }).await;
+        assert!(!second);
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while probe.running.load(Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }).await.unwrap();
+        assert!(probe.connected.load(Ordering::Acquire));
+        assert!(!probe.check(Duration::from_secs(1), || false).await);
+        assert!(!probe.connected.load(Ordering::Acquire));
+    }
 
     #[test]
     fn a_pending_row_deserializes_from_the_providers_actual_wire_shape() {

@@ -341,8 +341,15 @@ export default function ConnectionsPanel() {
           <h3 className="section-title">Linked account</h3>
         </div>
         <p className="form-hint" style={{ marginBottom: 10 }}>
-          One account, on any provider that speaks the connector protocol. Approving happens
-          in your browser and this machine never sees your password — it receives a scoped key.
+          Link your FormLogic account to use this computer from another laptop, tablet, or phone.
+          OAIY connects outward to the site, so no port forwarding is needed. Approve the link
+          in your browser; OAIY receives a scoped key and never sees your password.
+        </p>
+        <p className="form-hint" style={{ marginBottom: 10 }}>
+          Keep OAIY running, then choose your linked computer on FormLogic. AI conversations and
+          desktop relay flow inputs and results are encrypted end to end. Service and plugin
+          commands use the account’s HTTPS relay. Browser pairing above is for direct access
+          from this computer; it does not replace the account link.
         </p>
 
         {(accountError ?? statusError) && (
@@ -414,6 +421,13 @@ export default function ConnectionsPanel() {
                 {account.grantedScopes && (
                   <small style={{ display: 'block', opacity: 0.6, marginTop: 2 }}>
                     {account.grantedScopes}
+                  </small>
+                )}
+                {account.sealedFlowsSupported && (
+                  <small role="status" style={{ display: 'block', marginTop: 3, color: account.sealedFlowError ? 'var(--danger)' : undefined }}>
+                    {account.sealedFlowError ? `Encrypted flows unavailable: ${account.sealedFlowError}`
+                      : account.lastSealedFlowAt ? `Listening for encrypted flows · ${new Date(account.lastSealedFlowAt).toLocaleTimeString()}`
+                        : 'Connecting to encrypted flows…'}
                   </small>
                 )}
                 {/* Providers judge whether a desktop is reachable from how

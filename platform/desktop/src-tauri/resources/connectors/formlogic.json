@@ -42,6 +42,14 @@
     "batchLimit": 20,
     "errorBackoffSeconds": 10
   },
+  "desktopFlows": {
+    "pendingPath": "/api/v1/desktop-flows/pending",
+    "claimPath": "/api/v1/desktop-flows/{id}/claim",
+    "completePath": "/api/v1/desktop-flows/{id}/complete",
+    "waitSeconds": 25,
+    "batchLimit": 1,
+    "errorBackoffSeconds": 10
+  },
   "desktopAi": {
     "pubkeyPath": "/api/v1/desktop-ai/pubkey",
     "pendingPath": "/api/v1/desktop-ai/pending",

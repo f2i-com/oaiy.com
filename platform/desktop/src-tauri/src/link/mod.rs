@@ -18,6 +18,7 @@ pub mod condition;
 pub mod data_node;
 pub mod descriptor;
 pub mod flow_runner;
+pub mod sealed_flows;
 pub mod flows;
 pub mod heartbeat;
 pub mod oauth;
@@ -185,6 +186,11 @@ pub struct LinkStatus {
     /// what keeps "this provider runs its own flows" from reading as "flow
     /// execution is broken here".
     pub flow_runs_supported: bool,
+    pub sealed_flows_supported: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_sealed_flow_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sealed_flow_error: Option<String>,
     /// This desktop's storage-node enrolment, once the provider has answered.
     /// The fingerprint here is what the owner compares against their browser
     /// before approving — the whole ceremony rests on the two matching.
@@ -229,6 +235,8 @@ struct Inner {
     relay_error: Option<String>,
     last_flow_run_at: Option<chrono::DateTime<chrono::Utc>>,
     flow_run_error: Option<String>,
+    last_sealed_flow_at: Option<chrono::DateTime<chrono::Utc>>,
+    sealed_flow_error: Option<String>,
     data_node: Option<data_node::DataNodeStatus>,
     data_node_error: Option<String>,
 }
@@ -260,6 +268,8 @@ pub fn open_handle(data_dir: PathBuf) -> LinkHandle {
             relay_error: None,
             last_flow_run_at: None,
             flow_run_error: None,
+            last_sealed_flow_at: None,
+            sealed_flow_error: None,
             data_node: None,
             data_node_error: None,
         }),
@@ -312,6 +322,9 @@ impl LinkStore {
                 heartbeat_supported: false,
                 relay_supported: false,
                 flow_runs_supported: false,
+                sealed_flows_supported: false,
+                last_sealed_flow_at: None,
+                sealed_flow_error: None,
                 data_node: None,
                 data_node_error: None,
                 data_node_supported: false,
@@ -340,6 +353,9 @@ impl LinkStore {
                     flow_run_error: inner.flow_run_error.clone(),
                     heartbeat_supported: d.is_some_and(|d| d.heartbeat.is_some()),
                     relay_supported: d.is_some_and(|d| d.relay.is_some()),
+                    sealed_flows_supported: d.is_some_and(|d| d.desktop_flows.is_some()),
+                    last_sealed_flow_at: inner.last_sealed_flow_at,
+                    sealed_flow_error: inner.sealed_flow_error.clone(),
                     // Every path of the claim lane, not just some: a provider
                     // missing one of them cannot have its runs executed here.
                     flow_runs_supported: d.and_then(|d| d.flows.as_ref()).is_some_and(|f| {
@@ -423,6 +439,12 @@ impl LinkStore {
         inner.flow_run_error = error;
     }
 
+    pub fn note_sealed_flow(&self, error: Option<String>) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if error.is_none() { inner.last_sealed_flow_at = Some(chrono::Utc::now()); }
+        inner.sealed_flow_error = error;
+    }
+
     /// Record the outcome of a node registration.
     pub fn note_data_node(&self, outcome: Result<data_node::DataNodeStatus, String>) {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -484,6 +506,8 @@ impl LinkStore {
             inner.relay_error = None;
             inner.last_flow_run_at = None;
             inner.flow_run_error = None;
+            inner.last_sealed_flow_at = None;
+            inner.sealed_flow_error = None;
             // The IDENTITY stays on disk: the same machine relinking is the
             // same node, and re-minting would ask the owner to approve a device
             // they already approved. Only the provider's answer is forgotten.

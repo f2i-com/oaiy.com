@@ -197,7 +197,10 @@ impl Loopback {
                 "You can close this tab and try again from OAIY Desktop.",
             )
         } else {
-            ("You're linked", "You can close this tab and return to OAIY Desktop.")
+            (
+                "Finishing the account link",
+                "Return to OAIY Desktop to confirm the link completed. OAIY still needs to verify this response and save the account. If it shows an error, the account is not linked yet.",
+            )
         };
         let body = format!(
             "<!doctype html><meta charset=utf-8><title>{title}</title>\

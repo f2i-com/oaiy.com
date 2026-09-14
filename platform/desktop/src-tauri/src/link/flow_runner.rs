@@ -550,6 +550,28 @@ fn release_if_claimed(
 }
 
 /// Fetch the graph, hand it to the CLI, and turn the result into an outcome.
+pub(super) fn execute_sealed(
+    account: &LinkedAccount,
+    spec: &FlowsSpec,
+    node: Option<&crate::services::node_runtime::NodeHandle>,
+    flow_id: &str,
+    inputs: Value,
+) -> Result<Value, String> {
+    let graph = spec.graph_path.as_deref().ok_or("this provider has no flow graph endpoint")?;
+    let lane = Lane { queued: "", claim: "", complete: "", graph };
+    let run = QueuedRun {
+        // A fresh local name avoids sharing credential files across execution lanes.
+        id: format!("sealed-{}", uuid::Uuid::new_v4()),
+        flow: None,
+        flow_definition_id: Some(flow_id.to_owned()),
+        app_id: None,
+        binding_id: None,
+        idempotency_key: None,
+        input_snapshot: inputs,
+    };
+    execute(account, spec, &lane, node, &run).map_err(|e| e.message)
+}
+
 fn execute(
     account: &LinkedAccount,
     spec: &FlowsSpec,

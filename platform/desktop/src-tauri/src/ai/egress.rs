@@ -128,6 +128,13 @@ pub fn validate(base_url: &str, path: &str, allow_local: bool) -> Result<reqwest
         return Err("provider base URL is invalid".into());
     }
     let base = base_url.trim_end_matches('/');
+    // OpenAI-compatible settings commonly include /v1 already. Keep custom
+    // proxy prefixes while adding the protocol version only once.
+    let path = if base.ends_with("/v1") {
+        path.strip_prefix("/v1/").unwrap_or(path)
+    } else {
+        path
+    };
     let joined = if path.is_empty() {
         base.to_string()
     } else {
@@ -217,5 +224,19 @@ mod tests {
         assert!(check_base_url_syntax("http://localhost:11434", false).is_err());
         assert!(check_base_url_syntax("http://localhost:11434", true).is_ok());
         assert!(check_base_url_syntax("https://10.0.0.1", false).is_err());
+    }
+
+    #[test]
+    fn versioned_provider_urls_work_for_models_and_chat() {
+        for base in ["http://127.0.0.1:18080", "http://127.0.0.1:18080/v1", "http://127.0.0.1:18080/v1/"] {
+            for endpoint in ["models", "chat/completions", "messages"] {
+                let url = validate(base, &format!("/v1/{endpoint}"), true).unwrap();
+                assert_eq!(url.as_str(), format!("http://127.0.0.1:18080/v1/{endpoint}"));
+            }
+        }
+        let url = validate("http://127.0.0.1:18080/proxy/v1/", "/v1/models", true).unwrap();
+        assert_eq!(url.path(), "/proxy/v1/models");
+        let url = validate("http://127.0.0.1:18080/proxy", "/v1/models", true).unwrap();
+        assert_eq!(url.path(), "/proxy/v1/models");
     }
 }

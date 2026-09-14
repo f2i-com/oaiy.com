@@ -143,6 +143,9 @@ impl E2eIdentity {
     /// rotating would show every user a "key changed" warning they cannot
     /// distinguish from an attack — once per boot, forever.
     pub fn load_or_create(dir: &Path) -> Result<Self, String> {
+        // AI and flow workers start independently but must publish/use one key.
+        static LOAD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = LOAD.lock().map_err(|_| "identity initialization was interrupted")?;
         let path: PathBuf = dir.join(IDENTITY_KEY_FILE);
         match std::fs::read_to_string(&path) {
             Ok(text) => {
