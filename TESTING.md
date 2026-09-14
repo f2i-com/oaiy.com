@@ -7,8 +7,13 @@ Release publication runs the reusable verification gate (`.github/workflows/ci.y
 called by `release.yml` at the exact tagged revision) before anything is uploaded:
 the web suite, the complete CLI `npm test` and `npm run typecheck`, the desktop
 Vitest suite, and the native tests in both feature configurations, on Linux and
-Windows. Each artifact set ships with `release-evidence-*.json` naming the source
-revision, target, features, toolchain, digests and the tests that ran.
+Windows. Each of the three npm lanes (ui, cli, desktop) also runs
+`npm audit --audit-level=high`: an advisory at high or above fails the lane, and
+an unreachable registry is recorded as UNKNOWN in the run summary and fails too,
+so a published artifact set always carries a completed audit
+(`dependencyAudit` in the evidence file). Each artifact set ships with
+`release-evidence-*.json` naming the source revision, target, features,
+toolchain, digests, the audit result and the tests that ran.
 
 | Suite | Where | Needs a running service? | Run |
 |---|---|---|---|
@@ -23,7 +28,7 @@ revision, target, features, toolchain, digests and the tests that ran.
 
 ```bash
 (cd desktop/src-tauri && cargo test --no-default-features && cargo test --features gui)   # both shipped configurations
-(cd cli     && npm test)                 # 4 suites
+(cd cli     && npm test && npm run typecheck)   # 4 suites + tsc (needs `npm run build` first: it generates src/generated/)
 (cd ui      && npm test)                 # typecheck + css tokens
 (cd desktop && npm run build)            # tsc --noEmit + vite build
 ```

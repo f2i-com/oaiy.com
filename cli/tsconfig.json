@@ -10,6 +10,7 @@
     "resolveJsonModule": true,
     "allowJs": true,
     "noEmit": true,
+    "allowImportingTsExtensions": true,
     "types": ["node"],
     "baseUrl": ".",
     "paths": {

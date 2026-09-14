@@ -23,7 +23,7 @@
     "uuid": "^13.0.2"
   },
   "optionalDependencies": {
-    "sharp": "^0.33.5"
+    "sharp": "^0.35.4"
   },
   "devDependencies": {
     "@types/node": "^24.10.1",

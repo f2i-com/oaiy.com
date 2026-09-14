@@ -168,6 +168,9 @@ jobs:
               component: "web", version: process.env.VERSION, revision: process.env.REVISION,
               target: "static-site", features: [], toolchain: { node: process.version },
               tests: { web: "npm test (ui)", verification: "ci.yml@" + process.env.REVISION },
+              // The gate above ran `npm audit --audit-level=high` for ui, cli and desktop at this
+              // revision; publication depends on it, so a published artifact set implies PASS.
+              dependencyAudit: { status: "pass", tool: "npm audit --audit-level=high (ci.yml)", revision: process.env.REVISION },
               artifacts: files, builtAt: new Date().toISOString(),
             }, null, 2) + "\n");
           '
@@ -322,8 +325,9 @@ jobs:
               target: process.env.LABEL, runner: process.env.RUNNER_OS,
               features: { desktop: ["gui"], headless: ["--no-default-features"] },
               toolchain: { rustc: process.argv[1], cargo: process.argv[2], node: process.env.NODE },
+              dependencyAudit: { status: "pass", tool: "npm audit --audit-level=high (ci.yml: ui, cli, desktop)", revision: process.env.REVISION },
               tests: {
-                verification: "ci.yml@" + process.env.REVISION + " (web, cli npm test + typecheck, desktop vitest, cargo test headless + gui)",
+                verification: "ci.yml@" + process.env.REVISION + " (web, cli npm test + typecheck, desktop vitest, cargo test headless + gui, npm audit high)",
                 cliHttpsShutdown: "node test/cli-http-exit.mjs", stagedHeadlessSmoke: "smoke-server.mjs headless-dist",
                 extractedHeadlessSmoke: "smoke-server.mjs headless-verified (fresh profile, no system Node)",
               },
