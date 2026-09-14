@@ -419,6 +419,7 @@ async fn main() {
             codex: ai_codex.clone(),
         },
     );
+    oaiy_desktop_lib::link::sealed_flows::spawn(link.clone(), Some(node_runtime.clone()));
     // Let plugin events reach the flows the user built on the provider's site.
     // Without it an Aokie call fires only this desktop's local bindings, and
     // the flow they actually wrote never runs.

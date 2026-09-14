@@ -586,6 +586,9 @@ export interface LinkStatus {
    *  host, hence optional. */
   heartbeatSupported?: boolean;
   relaySupported?: boolean;
+  sealedFlowsSupported?: boolean;
+  lastSealedFlowAt?: string;
+  sealedFlowError?: string;
   /** This desktop's storage-node enrolment. The fingerprint is what the owner
    *  compares against the one their browser shows before approving — the whole
    *  ceremony rests on the two matching, so it has to be visible here. */

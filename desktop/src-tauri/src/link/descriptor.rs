@@ -112,6 +112,9 @@ pub struct ConnectorDescriptor {
     /// Omitted for a provider whose web app has no such feature.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub desktop_ai: Option<DesktopAiSpec>,
+    /// Browser-initiated flows with sealed inputs/results, using desktop_ai's identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desktop_flows: Option<RelaySpec>,
     /// How this desktop enrols as a storage node the account can approve.
     /// Omitted for a provider with no such notion.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -820,7 +823,12 @@ impl ConnectorDescriptor {
                 ));
             }
         }
-        if let Some(r) = &self.relay {
+        if self.desktop_flows.is_some()
+            && (self.desktop_ai.is_none() || self.flows.as_ref().and_then(|f| f.graph_path.as_ref()).is_none())
+        {
+            return Err("desktopFlows requires desktopAi and flows.graphPath".into());
+        }
+        for r in self.relay.iter().chain(self.desktop_flows.iter()) {
             for (label, path) in [
                 ("pendingPath", &r.pending_path),
                 ("claimPath", &r.claim_path),
@@ -848,6 +856,9 @@ impl ConnectorDescriptor {
                     "connector {:?} relay wait {} is out of range (1..300s)",
                     self.id, r.wait_seconds
                 ));
+            }
+            if r.batch_limit == 0 || r.batch_limit > 50 || r.error_backoff_seconds == 0 {
+                return Err("relay batch limit must be 1..50 and backoff must be positive".into());
             }
         }
         if let Some(a) = &self.desktop_ai {

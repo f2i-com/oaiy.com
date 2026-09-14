@@ -1577,6 +1577,7 @@ pub fn run() {
                         codex: ai_codex_for_http.clone(),
                     },
                 );
+                crate::link::sealed_flows::spawn(link_for_http.clone(), Some(node_for_http.clone()));
                 // Let plugin events reach the flows the user built on the
                 // provider's site. Without it an Aokie call fires only this
                 // desktop's local bindings, and the flow they actually wrote

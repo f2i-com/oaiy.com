@@ -91,6 +91,21 @@ Review or revoke app access in **Connections**. Linked flows run with the
 permissions granted to their account and plugin; install and approve only the
 connections you intend to use.
 
+### Use OAIY from another computer or phone
+
+In OAIY, open **Connections → Linked account** and link your FormLogic site.
+In FormLogic's **Connect your AI** wizard, choose **Through my FormLogic account**.
+OAIY makes outbound HTTPS connections to the site; your browser does not need
+to reach OAIY's localhost port, and no inbound port forwarding is required.
+
+For a saved automation, choose **Desktop relay**, then select its **Linked
+computer** in the test panel. AI requests and relay flow inputs/results are
+encrypted end to end. Service/plugin commands and account records use the
+authenticated HTTPS API. Keep OAIY running while using it remotely.
+
+See [remote FormLogic setup and encryption boundaries](docs/REMOTE_FORMLOGIC.md)
+for machine assignments, diagnostics and developer checks.
+
 ## How the pieces fit
 
 The browser editor stores your working flows locally and executes them against
