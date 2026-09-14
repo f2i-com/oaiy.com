@@ -1,24 +1,63 @@
-# Automatic CI is temporarily paused; run these checks manually when needed.
-# The web app's test chain
-# (typecheck, CSS tokens, node contracts, the Zipp sandbox against the real
-# vendored engine, and engine routing) and the CLI's engine suites. Neither
-# needs a browser, a service or a Rust toolchain; the release workflow is
-# where the desktop app gets built.
+# Automatic CI is temporarily paused (cost control, 2026-09-12); run these
+# checks manually from the Actions tab. Restore push/pull_request triggers
+# when automatic checks are explicitly re-enabled.
+#
+# This workflow is ALSO the reusable verification gate (`workflow_call`) that
+# release.yml runs at the EXACT tagged revision before anything is published
+# (ecosystem review OAI-01 / ECO-01): the web app's test chain, the CLI's
+# complete test script and typecheck, the desktop app's Vitest suite, and the
+# native Rust tests in both the headless (no default features) and the
+# shipping GUI feature configurations, each on the platform it ships on.
+# A later commit can never inherit an earlier run's status: the caller
+# passes the revision it is about to build, and every lane checks it out.
 
 name: CI
 
 on:
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      ref:
+        description: The exact revision to verify (release.yml passes the tagged commit)
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: '24'
 
 jobs:
+  # The revision every lane below actually checked out. Recorded once so the
+  # release evidence names it, and so a reusable call cannot silently verify
+  # the caller's event revision instead of the requested one.
+  revision:
+    name: Resolve verified revision
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.rev.outputs.sha }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.ref || '' }}
+          persist-credentials: false
+      - id: rev
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
   web:
     name: Web app tests
+    needs: revision
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          node-version: '24'
+          ref: ${{ inputs.ref || '' }}
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
           cache: npm
           cache-dependency-path: ui/package-lock.json
       - working-directory: ui
@@ -30,18 +69,87 @@ jobs:
         run: npm run build
 
   cli:
-    name: CLI tests
+    name: CLI tests, typecheck and HTTPS shutdown
+    needs: revision
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          node-version: '24'
+          ref: ${{ inputs.ref || '' }}
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
           cache: npm
           cache-dependency-path: cli/package-lock.json
       - working-directory: cli
         run: npm ci
       - working-directory: cli
         run: npm run build
+      # The COMPLETE CLI test script (module isolation, SSRF guard, connector
+      # module, engine suites) plus the typecheck — release.yml used to run
+      # only the HTTPS shutdown check (OAI-01).
       - working-directory: cli
         run: npm test
+      - working-directory: cli
+        run: npm run typecheck
+      - name: Check CLI HTTPS shutdown
+        working-directory: cli
+        run: node test/cli-http-exit.mjs
+
+  desktop:
+    name: Desktop Vitest + native tests (${{ matrix.label }})
+    needs: revision
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            label: linux
+          - os: windows-latest
+            label: windows
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.ref || '' }}
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable (pinned revision)
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          workspaces: desktop/src-tauri
+      - name: Linux build dependencies
+        if: matrix.label == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev \
+            libxdo-dev patchelf build-essential curl wget file libssl-dev
+      # The desktop bundles the headless CLI (scripts/sync-cli.mjs copies its
+      # esbuild output into src-tauri/resources), so the CLI has to exist first.
+      - name: Install and build the CLI
+        working-directory: cli
+        run: |
+          npm ci
+          npm run build
+      - name: Install the desktop app's dependencies
+        working-directory: desktop
+        run: npm ci
+      # The desktop Vitest suite — never run by the release workflow before.
+      - name: Desktop unit tests (Vitest)
+        working-directory: desktop
+        run: npm test
+      - name: Desktop typecheck + web build
+        working-directory: desktop
+        run: npm run build
+      # Native tests in BOTH shipped configurations: the headless server (no
+      # default features) and the GUI feature set the desktop installer ships.
+      - name: Native tests (headless, no default features)
+        working-directory: desktop/src-tauri
+        run: cargo test --locked --no-default-features
+      - name: Native tests (shipping GUI features)
+        working-directory: desktop/src-tauri
+        run: cargo test --locked --features gui

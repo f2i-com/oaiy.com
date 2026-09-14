@@ -3,9 +3,16 @@
 Six independent suites. None of them need a fixture database or a mocking
 framework — they drive the real thing.
 
+Release publication runs the reusable verification gate (`.github/workflows/ci.yml`,
+called by `release.yml` at the exact tagged revision) before anything is uploaded:
+the web suite, the complete CLI `npm test` and `npm run typecheck`, the desktop
+Vitest suite, and the native tests in both feature configurations, on Linux and
+Windows. Each artifact set ships with `release-evidence-*.json` naming the source
+revision, target, features, toolchain, digests and the tests that ran.
+
 | Suite | Where | Needs a running service? | Run |
 |---|---|---|---|
-| Rust unit tests | `desktop/src-tauri` | no | `cargo test` |
+| Rust unit tests | `desktop/src-tauri` | no | `cargo test --no-default-features` (headless server) and `cargo test --features gui` (desktop) |
 | CLI engine tests | `cli/` | no | `npm test` |
 | API end-to-end | `api/tests/smoke.php` | **yes** — the API | `composer test` |
 | Web end-to-end | `ui/tests/e2e.mjs` | **yes** — the dev server | `npm run test:e2e` |
@@ -15,7 +22,7 @@ framework — they drive the real thing.
 ## Everything that runs without a server
 
 ```bash
-(cd desktop/src-tauri && cargo test)     # 28 tests
+(cd desktop/src-tauri && cargo test --no-default-features && cargo test --features gui)   # both shipped configurations
 (cd cli     && npm test)                 # 4 suites
 (cd ui      && npm test)                 # typecheck + css tokens
 (cd desktop && npm run build)            # tsc --noEmit + vite build
