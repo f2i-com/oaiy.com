@@ -23,7 +23,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
-const DEFAULT_JOBS = 'revision,web,cli,desktop (linux),desktop (windows)';
+const DEFAULT_JOBS = 'revision,zipp,web,cli,desktop (linux),desktop (windows)';
 
 export function attest(dir, env = process.env, log = console.log) {
   const refuse = (message) => { throw new Error(message); };

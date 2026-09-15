@@ -160,6 +160,9 @@ service templates, data storage and headless deployment.
 ### Frontend (`ui/`)
 
 Use a current Node.js LTS release and npm; the release workflow uses Node 24.
+The ZIPP installer that `ui`'s hooks run reads zips with `zlib.crc32`, so it
+needs Node 20.15, 22.2 or newer, and `npm test` runs TypeScript directly, which
+needs Node 22.18 or newer.
 
 ```bash
 cd ui
@@ -285,7 +288,7 @@ Flows you build yourself are trusted — they are your code, running on your mac
 2. It runs in a Web Worker, in its own realm, with the network and worker-spawning globals removed and the source scanned for escape patterns. Hardened code that cannot get a Worker is refused rather than downgraded.
 3. Optionally, it runs on a different **engine** entirely.
 
-That third layer is **Settings → Defaults → Flow sandbox**, on by default, and it applies to **your own flows too**. It swaps the JavaScript engine for [ZIPP v0.0.18](https://github.com/f2i-com/zipp.org/releases/tag/v0.0.18) compiled to WebAssembly, running in a Worker. The distinction is worth being precise about: layer 2 is *subtractive* — a full browser realm with the dangerous names taken away one at a time, which both layers' own comments describe as best-effort. Zipp's guest global is a positive allowlist that never held a host object, so a script that successfully reconstructs `globalThis` finds no `fetch`, no `Worker`, no `importScripts`. Not hidden — absent. Zipp also enforces an instruction budget, so a runaway loop stops itself instead of pinning a core until you abort.
+That third layer is **Settings → Defaults → Flow sandbox**, on by default, and it applies to **your own flows too**. It swaps the JavaScript engine for [ZIPP](https://github.com/f2i-com/zipp.org/releases) compiled to WebAssembly (the JavaScript-only bundle of ZIPP's latest release, installed and checksum-verified at build time by `scripts/fetch-zipp-release.mjs`), running in a Worker. The distinction is worth being precise about: layer 2 is *subtractive* — a full browser realm with the dangerous names taken away one at a time, which both layers' own comments describe as best-effort. Zipp's guest global is a positive allowlist that never held a host object, so a script that successfully reconstructs `globalThis` finds no `fetch`, no `Worker`, no `importScripts`. Not hidden — absent. Zipp also enforces an instruction budget, so a runaway loop stops itself instead of pinning a core until you abort.
 
 It costs a one-off ~1.8 MB engine download on the first flow run (lazy — nothing is fetched until then), interpreted rather than JIT-compiled execution, and a ~16 MiB ceiling on any single value crossing the boundary. The compiled flow script itself is unchanged: OAIY's generator trampoline already talks to the host through exactly the `host.call(kind, args, cb)` contract Zipp's preamble provides. Code nodes get the pure text and encoding helpers (`TextEncoder`/`TextDecoder`, `atob`/`btoa`, `structuredClone`, `queueMicrotask`, `performance.now`) from a wrapper; `fetch`, `XMLHttpRequest`, `WebSocket` and timers throw a clear error pointing at the node to use instead — Zipp's own `setTimeout` with a delay would otherwise try to sleep a thread WebAssembly does not have. With the toggle off, your own flows run in-thread on the browser engine as before, and package flows use the plain isolated Worker. See `ui/vendor/oaiy-core/src/zipp-executor.ts`.
 
@@ -304,7 +307,7 @@ Automatic push and pull-request CI is temporarily paused; the
 | `desktop/` | `npm run build` | CLI resource sync, TypeScript and desktop UI build |
 | `desktop/src-tauri/` | `cargo test --no-default-features --lib` | Runtime, gateway, plugins and account links without GUI dependencies |
 | `cli/` | `npm test` | Headless flow engine and host adapters |
-| `ui/` | `npm test` | TypeScript, CSS tokens, node contracts and Zipp sandbox routing |
+| `ui/` | `npm test` | Installs the ZIPP engines if needed; TypeScript, CSS tokens, node contracts, both ZIPP engines and Zipp sandbox routing |
 | `ui/` | `npm run test:e2e` | Browser checks; needs the web dev server |
 | `api/` | `composer test` | API smoke tests; needs a running API and migrated development database |
 

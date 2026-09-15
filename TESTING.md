@@ -7,7 +7,10 @@ Release publication runs the reusable verification gate (`.github/workflows/ci.y
 called by `release.yml` at the exact tagged revision) before anything is uploaded:
 the web suite, the complete CLI `npm test` and `npm run typecheck`, the desktop
 Vitest suite, and the native tests in both feature configurations, on Linux and
-Windows. Each of the three npm lanes (ui, cli, desktop) also runs
+Windows. The gate resolves ZIPP's latest release once and every lane installs
+that one release (see [ZIPP engines](#zipp-engines)); `release.yml` hands the
+gate the release it froze for its own builds. Each of the three npm lanes (ui,
+cli, desktop) also runs
 `npm audit --audit-level=high`: an advisory at high or above fails the lane, and
 an unreachable registry is recorded as UNKNOWN in the run summary and fails too,
 so a published artifact set always carries a completed audit
@@ -45,8 +48,9 @@ node scripts/attest-release-evidence.test.mjs
 ```bash
 (cd desktop/src-tauri && cargo test --no-default-features && cargo test --features gui)   # both shipped configurations
 (cd cli     && npm test && npm run typecheck)   # 4 suites + tsc (needs `npm run build` first: it generates src/generated/)
-(cd ui      && npm test)                 # typecheck + css tokens
+(cd ui      && npm test)                 # installs the ZIPP engines if needed, then typecheck, css tokens, contracts, both engines
 (cd desktop && npm run build)            # tsc --noEmit + vite build
+node --test scripts/fetch-zipp-release.test.mjs   # the ZIPP installer (see "ZIPP engines")
 ```
 
 ## API end-to-end
@@ -174,18 +178,65 @@ Nodes whose inputs are consumed somewhere other than their own module compiler
 (loop, macro and subflow boundaries) are listed explicitly in the test, each with
 the reason, so an exemption can be re-checked rather than trusted forever.
 
-## ZIPP runtime updates
+## ZIPP engines
 
-`cd ui && npm run test:zipp` executes real compiled workflow scripts in the
-vendored WASM engine. It covers host round-trips, output, error propagation,
-instruction limits and the guest helpers. It also verifies the official release
-checksums for the bindings, WASM and provenance files, then compares the live
-engine profile with `ui/vendor/zipp-wasm/PROFILE.json`.
+The ZIPP engines are not committed. `scripts/fetch-zipp-release.mjs` installs
+both bundles of one zipp.org release: the JavaScript-only web bundle into
+`ui/vendor/zipp-wasm/` (the browser flow sandbox) and the web-python bundle into
+`ui/vendor/zipp-wasm-python/` (installed for the CLI, Desktop and headless
+server, which do not load it yet). Each
+bundle is verified against the release's `SHA256SUMS` and its own inner
+`SHA256SUMS`, its `BUILD-INFO.txt` must describe that variant, both must name the
+same commit, and each module must report it. Each folder records what it took in
+`SOURCE.json`. The installer uses Node built-ins only and needs Node 20.15, 22.2
+or newer (`zlib.crc32`).
 
-After an update, run the full `ui` tests and production build, the `cli` tests,
-and the desktop UI and Rust tests. In the built browser app, run a Logic Block
-and verify its execution log, then test an HTTP host call to the local companion.
-The browser flow uses ZIPP; background flows on the desktop use the Node CLI.
+```bash
+node scripts/fetch-zipp-release.mjs                 # install the latest release
+node scripts/fetch-zipp-release.mjs vX.Y.Z          # or a named one
+node scripts/fetch-zipp-release.mjs --check         # verify both installs, offline
+node scripts/fetch-zipp-release.mjs --check --online   # and against the published release
+node scripts/fetch-zipp-release.mjs --resolve-only  # print {release, sumsSha256} of the latest
+node --test scripts/fetch-zipp-release.test.mjs     # the installer's own tests (below)
+node scripts/regen-zipp-notices.mjs ../zipp.org vX.Y.Z   # regenerate the curated Python notices
+```
+
+The installer's tests build fixture releases and stub GitHub, so they need no
+network. One case repacks the engines `ui/vendor` holds to run the real glue
+through the same checks, so install them first (`npm test` in `ui` does); outside
+CI that case is skipped, with the reason, when there are none.
+
+The web-python bundle ships no notices for the RustPython and Unicode code it
+compiles in, so the install takes OAIY's curated copy in `ui/vendor/zipp-notices/`,
+whose `SOURCE.json` names the ZIPP release it was generated from. A newer release
+installs with a warning (an annotation in GitHub Actions) to check what it
+compiles in and regenerate the copy; see `ui/vendor/zipp-notices/README.md`.
+
+`ui`'s `dev`, `typecheck`, `test`, `test:zipp` and `build` hooks run
+`--ensure`: an install that checks is kept without a request (it does not look
+for a newer release), a missing or broken one is replaced by the latest.
+`ZIPP_RELEASE=vX.Y.Z` and `ZIPP_SUMS_SHA256=<digest of SHA256SUMS>` name the
+release and its digest, and `--ensure` reinstalls unless the install is that
+release. Offline, `ZIPP_RELEASE_DIR=<folder holding SHA256SUMS and both zips>`
+reads a release from disk; downloads are cached in `.zipp-release/<tag>/`,
+which is such a folder. CI resolves the latest release once per run (the `zipp`
+job in `ci.yml`, `meta` in `release.yml`) and every job installs that pair, so
+a run never mixes engines; the release's web job re-verifies with
+`--check --online` before packaging.
+
+`cd ui && npm run test:zipp` executes real compiled workflow scripts in both
+installed engines, one process each (`ZIPP_VENDOR=zipp-wasm-python` picks one).
+It covers host round-trips, output, error propagation, instruction limits and
+the guest helpers. It also checks the install against its release, the bundle
+checksums for the bindings, WASM and provenance files, the live engine profile
+against `PROFILE.json` and `SOURCE.json`, and that the module links a memory
+maximum above the VM's heap accounting limit.
+
+When ZIPP publishes a release, the next install takes it. Run the full `ui`
+tests and production build, the `cli` tests, and the desktop UI and Rust tests.
+In the built browser app, run a Logic Block and verify its execution log, then
+test an HTTP host call to the local companion. The browser flow uses ZIPP;
+background flows on the desktop use the Node CLI.
 
 For FormLogic integration, sign in to the intended site, approve the matching
 local OAIY pairing request, and run a disposable diagnostic flow. Check that the

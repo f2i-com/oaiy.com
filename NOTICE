@@ -58,22 +58,33 @@ don't reuse the reserved font names for a modified version. See
 desktop/public/fonts/README.md and ui/public/fonts/README.md.
 
 --------------------------------------------------------------------------------
-THIRD-PARTY WEBASSEMBLY REDISTRIBUTED IN THIS REPOSITORY
+THIRD-PARTY WEBASSEMBLY REDISTRIBUTED BY OAIY BUILDS
 
     Zipp. Copyright 2026 the Zipp authors.
     https://github.com/f2i-com/zipp.org
-    License: ui/vendor/zipp-wasm/LICENSE (Apache License, Version 2.0)
+    License: LICENSE-APACHE in each install below (Apache License, Version 2.0)
 
-`ui/vendor/zipp-wasm/` holds a prebuilt WebAssembly build of the Zipp JavaScript
-engine. OAIY uses it to execute untrusted package workflows in an engine with no
-host capabilities — see ui/vendor/oaiy-core/src/zipp-executor.ts.
+OAIY runs flow code in prebuilt WebAssembly builds of the Zipp engine, which has
+no host capabilities — see ui/vendor/oaiy-core/src/zipp-executor.ts. They are not
+committed. scripts/fetch-zipp-release.mjs installs both bundles of one official
+zipp.org release, verified against the release's SHA256SUMS and each bundle's
+own, and records the release, commit and digests in each folder's SOURCE.json:
 
-It ships as committed bytes rather than a build step because ui/ is a standalone
-Vite app: `npm install && npm run dev` must work without a Rust toolchain and
-without a sibling checkout. The build provenance, the source commit, and the
-SHA-256 of the exact module are recorded in ui/vendor/zipp-wasm/README.md; the
-SHA is asserted by ui/tests/zipp-executor.mjs so a refresh cannot quietly
-substitute a different engine.
+  ui/vendor/zipp-wasm/          the JavaScript-only web bundle. The web build
+                                (oaiy-web-*.zip) ships its zipp_wasm_bg.wasm.
+  ui/vendor/zipp-wasm-python/   the web-python bundle, installed for the CLI,
+                                Desktop and headless server.
+
+No Rust toolchain or sibling checkout is needed: ui's dev, typecheck, test and
+build hooks run the installer, and ui/tests/zipp-executor.mjs checks each engine
+against its SOURCE.json so a different engine cannot quietly take its place.
 
 Zipp is Apache-2.0, the same license as OAIY, so it imposes no conditions beyond
 this attribution and the retained license text.
+
+The web-python bundle also compiles in the RustPython parser (MIT License,
+Copyright (c) 2020 RustPython Team) and Unicode data (Unicode License v3,
+Copyright © 2015-2024 Unicode, Inc.). Their license texts are in
+ui/vendor/zipp-notices/THIRD_PARTY_LICENSES.txt, which the installer places
+beside that engine as THIRD_PARTY_LICENSES.txt while the release ships no notices
+of its own; anything that redistributes ui/vendor/zipp-wasm-python/ carries it.

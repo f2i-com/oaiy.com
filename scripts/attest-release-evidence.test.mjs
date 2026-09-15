@@ -85,6 +85,18 @@ console.log('attest-release-evidence');
   const r = refuses(dir, env(), /nope\.bin is missing/);
   ok('one bad file prevents every write', r.refused && r.unchanged && read(dir).verification.status === 'unverified', r.message);
 }
+{
+  // With no VERIFY_JOBS the record names every ci.yml lane, the ZIPP resolve job included, as release.yml passes them.
+  const dir = fixture();
+  attest(dir, env(), () => {});
+  const jobs = read(dir).verification.run.jobs;
+  const ci = fs.readFileSync(new URL('../.github/workflows/ci.yml', import.meta.url), 'utf8');
+  const ids = [...ci.slice(ci.indexOf('\njobs:')).matchAll(/^ {2}([a-z][\w-]*):\s*$/gm)].map((m) => m[1]);
+  const labels = [...ci.matchAll(/^\s+label: (\S+)\s*$/gm)].map((m) => m[1]);
+  const lanes = ids.flatMap((id) => (id === 'desktop' ? labels.map((label) => `desktop (${label})`) : [id]));
+  const passedOn = /VERIFY_JOBS: (.+)$/m.exec(fs.readFileSync(new URL('../.github/workflows/release.yml', import.meta.url), 'utf8'))?.[1].trim().split(',');
+  ok('the default job list is every ci.yml lane, as release.yml passes it', jobs.includes('zipp') && JSON.stringify(jobs) === JSON.stringify(lanes) && JSON.stringify(passedOn) === JSON.stringify(lanes), JSON.stringify({ jobs, lanes, passedOn }));
+}
 
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);
