@@ -1,9 +1,15 @@
 /**
- * The Zipp sandbox, exercised against the real vendored WebAssembly module.
+ * The Zipp sandbox, exercised against the real installed WebAssembly modules.
  *
- *     npm run test:zipp
+ *     npm run test:zipp                               both installs, one process each
+ *     ZIPP_VENDOR=zipp-wasm-python npm run test:zipp  one of them
  *
- * This is not a mock. It loads `vendor/zipp-wasm/zipp_wasm_bg.wasm`, drives it
+ * `scripts/fetch-zipp-release.mjs` installs both from one zipp.org release:
+ * `vendor/zipp-wasm` (JavaScript only, the browser Worker's engine) and
+ * `vendor/zipp-wasm-python` (for the CLI, Desktop and headless server). Both
+ * must run OAIY's JavaScript the same way, so both get the whole suite.
+ *
+ * This is not a mock. It loads the install's `zipp_wasm_bg.wasm`, drives it
  * with the same `ZippSession` the Worker uses, and feeds it the exact program
  * shape `runtime.ts` emits — the `getModulesShim` output, `function*
  * __run_workflow`, the `__step` trampoline, and `HARDENED_SHADOW_PREAMBLE`.
@@ -15,6 +21,7 @@
  * relies on native type stripping rather than a build step.
  */
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -28,9 +35,27 @@ import {
 // The REAL trampoline, not a copy. A copy is how the `__gen.throw` resume bug
 // stayed invisible: the test agreed with itself.
 import { WORKFLOW_TRAMPOLINE } from '../vendor/oaiy-core/src/workflow-trampoline.ts';
+import { checkInstall, VARIANTS } from '../../scripts/fetch-zipp-release.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
-const VENDOR = path.join(HERE, '..', 'vendor', 'zipp-wasm');
+
+// The suite below drives one engine per process; with no ZIPP_VENDOR it runs
+// once for each install and fails if either does.
+if (!process.env.ZIPP_VENDOR) {
+  let failed = false;
+  for (const { folder } of VARIANTS) {
+    console.log(`\n=== ${folder} ===`);
+    const run = spawnSync(process.execPath, [...process.execArgv, fileURLToPath(import.meta.url)], { stdio: 'inherit', env: { ...process.env, ZIPP_VENDOR: folder } });
+    if (run.status !== 0) failed = true;
+  }
+  process.exit(failed ? 1 : 0);
+}
+const VARIANT = VARIANTS.find(v => v.folder === process.env.ZIPP_VENDOR);
+if (!VARIANT) {
+  console.error(`ZIPP_VENDOR must name an install: ${VARIANTS.map(v => v.folder).join(' or ')}`);
+  process.exit(1);
+}
+const VENDOR = path.join(HERE, '..', 'vendor', VARIANT.folder);
 
 let pass = 0;
 const failures = [];
@@ -45,33 +70,33 @@ function check(name, ok, detail = '') {
 }
 
 // ---------------------------------------------------------------------------
-// 1. The vendored artifact is the one we verified.
+// 1. The installed artifact is the one the release verified.
 // ---------------------------------------------------------------------------
-// The engine is committed bytes, so nothing else would notice a swap. The
-// README records the SHA of a build that passed Zipp's own
-// `check-wasm-memory.cjs` — the gate proving the module links a 1 GiB maximum,
-// ABOVE the VM's 512 MiB accounting limit. Built the other way round the
-// accounting limit can never fire, and guest heap exhaustion becomes an
-// unrecoverable trap instead of a catchable RangeError. Pinning the SHA is how
-// that property survives a careless refresh.
-console.log('\nvendored artifact');
+// The engine is not committed: the installer takes it from a zipp.org release,
+// checked against ZIPP's SHA256SUMS and the bundle's own, and records what it
+// took in SOURCE.json. Every identity here comes from that record, never from
+// a literal, so a new ZIPP release needs no edit to this file.
+console.log(`\ninstalled artifact (${VARIANT.folder})`);
+let source;
+try {
+  source = checkInstall(VENDOR, VARIANT);
+  check('the install checks against the release it was taken from', true);
+} catch (error) {
+  check('the install checks against the release it was taken from', false, error.message);
+  console.error(`\n${pass} passed, ${failures.length} failed (nothing else can run without the install)`);
+  process.exit(1);
+}
 const wasmBytes = fs.readFileSync(path.join(VENDOR, 'zipp_wasm_bg.wasm'));
-const actualSha = createHash('sha256').update(wasmBytes).digest('hex');
-const readme = fs.readFileSync(path.join(VENDOR, 'README.md'), 'utf8');
-const declaredSha = (readme.match(/`([0-9a-f]{64})`/) || [])[1];
-check(
-  'README SHA-256 matches the committed .wasm',
-  declaredSha === actualSha,
-  declaredSha ? `README ${declaredSha.slice(0, 16)}… vs file ${actualSha.slice(0, 16)}…` : 'no SHA in README',
-);
+check('SOURCE.json records the .wasm beside it',
+  createHash('sha256').update(wasmBytes).digest('hex') === source.sha256);
 
-const checksums = new Map(fs.readFileSync(path.join(VENDOR, 'UPSTREAM-SHA256SUMS'), 'utf8')
+const checksums = new Map(fs.readFileSync(path.join(VENDOR, 'SHA256SUMS'), 'utf8')
   .trim().split(/\r?\n/).map(line => {
     const [digest, name] = line.trim().split(/\s+/, 2);
     return [name, digest];
   }));
 for (const name of ['zipp_wasm.js', 'zipp_wasm.d.ts', 'zipp_wasm_bg.wasm', 'zipp_wasm_bg.wasm.d.ts', 'PROFILE.json', 'BUILD-INFO.txt']) {
-  check(`${name} matches the official release checksum`,
+  check(`${name} matches the release bundle's checksum`,
     createHash('sha256').update(fs.readFileSync(path.join(VENDOR, name))).digest('hex') === checksums.get(name));
 }
 
@@ -82,8 +107,60 @@ await init({ module_or_path: wasmBytes });
 const profile = JSON.parse(zippProfile());
 check('running engine matches the shipped release profile',
   JSON.stringify(profile) === JSON.stringify(JSON.parse(fs.readFileSync(path.join(VENDOR, 'PROFILE.json'), 'utf8'))));
-check('release is ZIPP 0.0.18 with the JavaScript sandbox profile',
-  profile.version === '0.0.18' && profile.languages.includes('javascript') && profile.features.includes('safe-sandbox'));
+check('running engine is the recorded release, commit and languages, with the sandbox profile',
+  profile.version === source.version && profile.source?.sha === source.revision
+    && JSON.stringify(profile.languages) === JSON.stringify(source.languages) && profile.features.includes('safe-sandbox'),
+  `${profile.version} ${profile.source?.sha} ${JSON.stringify(profile.languages)} vs SOURCE.json ${source.version} ${source.revision} ${JSON.stringify(source.languages)}`);
+
+// A module that links a 1 GiB maximum, ABOVE the VM's 512 MiB accounting
+// limit, reports guest heap exhaustion as a catchable RangeError. Linked the
+// other way round the accounting limit can never fire and exhaustion becomes an
+// unrecoverable trap. Zipp's `check-wasm-memory.cjs` gates its builds on this;
+// a release OAIY did not build is held to it here, from the module's own bytes.
+const linkedMax = wasmMemoryMaxBytes(wasmBytes);
+check('the module links a memory maximum above the heap accounting limit',
+  linkedMax !== undefined && linkedMax === profile.limits?.linkedMemoryMaxBytes && linkedMax > profile.limits?.approxHeapBytes,
+  `linked ${linkedMax}, profile linkedMemoryMaxBytes ${profile.limits?.linkedMemoryMaxBytes}, approxHeapBytes ${profile.limits?.approxHeapBytes}`);
+
+/** The declared maximum of the module's linear memory, in bytes (defined or imported), or undefined. */
+function wasmMemoryMaxBytes(bytes) {
+  let at = 8;
+  const leb = () => {
+    let result = 0;
+    let shift = 0;
+    let byte;
+    do {
+      byte = bytes[at++];
+      result += (byte & 0x7f) * 2 ** shift;
+      shift += 7;
+    } while (byte & 0x80);
+    return result;
+  };
+  const limits = () => {
+    const flags = bytes[at++];
+    leb();
+    return flags & 1 ? leb() * 65536 : undefined;
+  };
+  while (at < bytes.length) {
+    const id = bytes[at++];
+    const end = leb() + at;
+    if (id === 5 && leb() > 0) return limits();
+    if (id === 2) {
+      for (let n = leb(); n > 0; n--) {
+        at += leb();
+        at += leb();
+        const kind = bytes[at++];
+        if (kind === 2) return limits();
+        if (kind === 0) leb();
+        else if (kind === 1) { at++; limits(); }
+        else if (kind === 3) at += 2;
+        else if (kind === 4) { at++; leb(); }
+      }
+    }
+    at = end;
+  }
+  return undefined;
+}
 
 // ---------------------------------------------------------------------------
 // Harness: the OAIY program shape, and a broker that answers it.

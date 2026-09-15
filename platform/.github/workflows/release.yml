@@ -45,6 +45,12 @@
 # gate's explicit success, re-checks every artifact digest against the bytes
 # about to be published, and only then stamps `verified` / `pass` together
 # with the exact verification run (id, attempt, URL, ci.yml jobs).
+#
+# One ZIPP per release: meta resolves zipp.org's latest release once, as the
+# tag and the digest of its SHA256SUMS, and every job installs exactly that
+# pair (scripts/fetch-zipp-release.mjs); the verification gate is handed the
+# same pair. The web job re-verifies the engines against the published release
+# before packaging and records the engine the site ships in its evidence.
 
 name: Release
 
@@ -74,6 +80,8 @@ jobs:
       version: ${{ steps.v.outputs.version }}
       is_tag: ${{ steps.v.outputs.is_tag }}
       revision: ${{ steps.rev.outputs.sha }}
+      zipp-release: ${{ steps.zipp.outputs.release }}
+      zipp-sums-sha256: ${{ steps.zipp.outputs.sums-sha256 }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -81,6 +89,21 @@ jobs:
       # The ONE revision every job below builds and verifies.
       - id: rev
         run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      # The ONE ZIPP release every job below installs, frozen with the digest of
+      # its SHA256SUMS so a release ZIPP publishes mid-run changes nothing here.
+      - id: zipp
+        shell: bash
+        run: |
+          set -euo pipefail
+          resolved="$(node scripts/fetch-zipp-release.mjs --resolve-only --latest)"
+          release="$(node -e 'console.log(JSON.parse(process.argv[1]).release)' "$resolved")"
+          sums="$(node -e 'console.log(JSON.parse(process.argv[1]).sumsSha256)' "$resolved")"
+          echo "release=$release" >> "$GITHUB_OUTPUT"
+          echo "sums-sha256=$sums" >> "$GITHUB_OUTPUT"
+          echo "Building with ZIPP $release (SHA256SUMS $sums)"
       - id: v
         shell: bash
         run: |
@@ -106,12 +129,17 @@ jobs:
     uses: ./.github/workflows/ci.yml
     with:
       ref: ${{ needs.meta.outputs.revision }}
+      zipp-release: ${{ needs.meta.outputs.zipp-release }}
+      zipp-sums-sha256: ${{ needs.meta.outputs.zipp-sums-sha256 }}
 
   # ---------------------------------------------------------------- web site
   web:
     name: Web site (landing + app)
     needs: meta
     runs-on: ubuntu-latest
+    env:
+      ZIPP_RELEASE: ${{ needs.meta.outputs.zipp-release }}
+      ZIPP_SUMS_SHA256: ${{ needs.meta.outputs.zipp-sums-sha256 }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -127,6 +155,9 @@ jobs:
         working-directory: ui
         run: npm ci
 
+      - name: Install the ZIPP release
+        run: node scripts/fetch-zipp-release.mjs --ensure
+
       - name: Test
         working-directory: ui
         run: npm test
@@ -136,6 +167,11 @@ jobs:
         env:
           VITE_API_BASE: ${{ vars.VITE_API_BASE }}
         run: npm run build
+
+      # The installed bytes against what the release publishes now, right
+      # before they are packaged: ZIPP's SHA256SUMS and every file taken.
+      - name: Re-verify the ZIPP engines against the published release
+        run: node scripts/fetch-zipp-release.mjs --check --online
 
       - name: Package
         shell: bash
@@ -173,10 +209,22 @@ jobs:
           node -e '
             const fs = require("fs"); const crypto = require("crypto"); const path = require("path");
             const files = fs.readdirSync("release").map(name => ({ name, sha256: crypto.createHash("sha256").update(fs.readFileSync(path.join("release", name))).digest("hex") }));
+            // The engine the site ships is the installed one, found among the built assets by its digest.
+            const digest = file => crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex");
+            const zipp = JSON.parse(fs.readFileSync("ui/vendor/zipp-wasm/SOURCE.json", "utf8"));
+            // The release notes name the pair meta froze, so the evidence must describe that very install.
+            if (zipp.release !== process.env.ZIPP_RELEASE || zipp.sumsSha256 !== process.env.ZIPP_SUMS_SHA256) { console.error("::error::the installed ZIPP is " + zipp.release + " (SHA256SUMS " + zipp.sumsSha256 + "), not the " + process.env.ZIPP_RELEASE + " (" + process.env.ZIPP_SUMS_SHA256 + ") meta froze"); process.exit(1); }
+            const shipped = fs.readdirSync("ui/dist/assets").filter(name => name.endsWith(".wasm") && digest(path.join("ui/dist/assets", name)) === zipp.sha256);
+            if (shipped.length !== 1) { console.error("::error::the built site does not ship the installed ZIPP engine " + zipp.sha256 + " exactly once (found " + shipped.length + ")"); process.exit(1); }
             fs.writeFileSync("release/release-evidence-web.json", JSON.stringify({
               component: "web", version: process.env.VERSION, revision: process.env.REVISION,
               target: "static-site", features: [], toolchain: { node: process.version },
-              tests: { web: "npm test (ui)" },
+              engine: {
+                name: "zipp", repository: zipp.repository, release: zipp.release, revision: zipp.revision,
+                bundle: zipp.bundle, bundleSha256: zipp.bundleSha256, sumsSha256: zipp.sumsSha256,
+                wasmSha256: zipp.sha256, glueSha256: zipp.glueSha256, asset: "assets/" + shipped[0],
+              },
+              tests: { web: "npm test (ui)", zippInstall: "scripts/fetch-zipp-release.mjs --check --online" },
               // This job runs in parallel with the verification gate and cannot know its
               // result: the release job attests these two fields after the gate passed
               // (scripts/attest-release-evidence.mjs, R3-OAI-01). A build artifact from an
@@ -198,6 +246,9 @@ jobs:
     name: Desktop (${{ matrix.label }})
     needs: meta
     runs-on: ${{ matrix.os }}
+    env:
+      ZIPP_RELEASE: ${{ needs.meta.outputs.zipp-release }}
+      ZIPP_SUMS_SHA256: ${{ needs.meta.outputs.zipp-sums-sha256 }}
     strategy:
       fail-fast: false
       matrix:
@@ -215,6 +266,11 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: ${{ env.NODE_VERSION }}
+
+      # The release's one ZIPP, installed from meta's pair as in every job, so
+      # a build of this leg can only ever see that release's engines.
+      - name: Install the ZIPP release
+        run: node scripts/fetch-zipp-release.mjs --ensure
 
       # Pinned to a revision of the `stable` branch, upgraded deliberately.
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable (pinned revision)
@@ -389,7 +445,7 @@ jobs:
           VERIFY_RESULT: ${{ needs.verify.result }}
           REVISION: ${{ needs.meta.outputs.revision }}
           VERIFY_WORKFLOW: .github/workflows/ci.yml
-          VERIFY_JOBS: revision,web,cli,desktop (linux),desktop (windows)
+          VERIFY_JOBS: revision,zipp,web,cli,desktop (linux),desktop (windows)
         run: node scripts/attest-release-evidence.mjs --dir artifacts
 
       # Every evidence file must name the revision this workflow verified and
@@ -427,6 +483,7 @@ jobs:
         shell: bash
         env:
           VERSION: ${{ needs.meta.outputs.version }}
+          ZIPP_RELEASE: ${{ needs.meta.outputs.zipp-release }}
         run: |
           cat > notes.md <<EOF
           ## What is in this release
@@ -434,7 +491,9 @@ jobs:
           **Web site** — \`oaiy-web-$VERSION.zip\` (or \`.tar.gz\`) is the compiled static site:
           the landing page at \`/\`, the flow builder at \`/app.html\` and the desktop-app page at
           \`/desktop.html\`. Unzip it onto any static host. \`HOSTING.md\` inside explains the one
-          header worth setting.
+          header worth setting. Its flow sandbox runs the JavaScript engine of
+          [ZIPP $ZIPP_RELEASE](https://github.com/f2i-com/zipp.org/releases/tag/$ZIPP_RELEASE), verified
+          against that release's \`SHA256SUMS\`; \`release-evidence-web.json\` records its digests.
 
           **OAIY Desktop** — the tray app that manages local model servers, downloads, Python and
           the browser sidecar for the web app.

@@ -16,15 +16,11 @@ LICENSE text eol=lf
 NOTICE text eol=lf
 *.OFL.txt text eol=lf
 
-# WebAssembly modules are binary. Git auto-detects that today, but the vendored
-# Zipp engine's SHA-256 is asserted by ui/tests/zipp-executor.mjs, so pin it
-# rather than rely on detection — the same reasoning as the licence texts above.
+# WebAssembly modules are binary. Git auto-detects that today; pin it rather
+# than rely on detection — the same reasoning as the licence texts above.
 *.wasm binary
 
-# Official ZIPP release files are checksum-verified byte for byte on every OS.
-ui/vendor/zipp-wasm/zipp_wasm.js text eol=lf
-ui/vendor/zipp-wasm/zipp_wasm.d.ts text eol=lf
-ui/vendor/zipp-wasm/zipp_wasm_bg.wasm.d.ts text eol=lf
-ui/vendor/zipp-wasm/PROFILE.json text eol=lf
-ui/vendor/zipp-wasm/BUILD-INFO.txt text eol=lf
-ui/vendor/zipp-wasm/UPSTREAM-SHA256SUMS text eol=lf
+# The ZIPP engines are installed, not committed (scripts/fetch-zipp-release.mjs
+# writes release bytes as they are). The curated notices installed beside the
+# Python engine are committed, and SOURCE.json records their SHA-256.
+ui/vendor/zipp-notices/THIRD_PARTY_LICENSES.txt text eol=lf

@@ -37,9 +37,10 @@
  * Guest code could once force that trap on purpose — the heap ceiling was
  * re-checked on an instruction stride, and one instruction can commit
  * megabytes, so a loop of large allocations reached the module's linked memory
- * maximum before the budget noticed. Fixed in zipp.org `833680d8`, which the
- * vendored artifact includes; the ceiling now reports a catchable RangeError
- * for every allocation shape.
+ * maximum before the budget noticed. Fixed in zipp.org `833680d8`, which every
+ * ZIPP release since v0.0.11 includes (the engine is installed from a release,
+ * scripts/fetch-zipp-release.mjs); the ceiling now reports a catchable
+ * RangeError for every allocation shape.
  *
  * That is also why the module is instantiated per Worker rather than shared:
  * a fresh linear memory per workflow is the isolation, and `new Engine()` costs

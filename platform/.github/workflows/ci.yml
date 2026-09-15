@@ -10,6 +10,11 @@
 # shipping GUI feature configurations, each on the platform it ships on.
 # A later commit can never inherit an earlier run's status: the caller
 # passes the revision it is about to build, and every lane checks it out.
+#
+# The ZIPP engines are not committed. OAIY follows zipp.org's latest release,
+# resolved ONCE per run (the zipp job) into a release tag and the digest of its
+# SHA256SUMS, and every lane installs exactly that pair with
+# scripts/fetch-zipp-release.mjs. release.yml passes the pair it froze instead.
 
 name: CI
 
@@ -19,6 +24,16 @@ on:
     inputs:
       ref:
         description: The exact revision to verify (release.yml passes the tagged commit)
+        required: false
+        type: string
+        default: ''
+      zipp-release:
+        description: The ZIPP release to verify with (release.yml passes the one it resolved); empty resolves the latest
+        required: false
+        type: string
+        default: ''
+      zipp-sums-sha256:
+        description: The SHA-256 of that release's SHA256SUMS; passed together with zipp-release
         required: false
         type: string
         default: ''
@@ -46,10 +61,56 @@ jobs:
       - id: rev
         run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
+  # The ZIPP release every lane below installs, as {release, SHA256SUMS
+  # digest}. Resolved once so a release ZIPP publishes mid-run cannot give two
+  # lanes two engines; a caller's pair is re-read here and refused if the
+  # release's SHA256SUMS has changed since the caller resolved it.
+  zipp:
+    name: Resolve the ZIPP release
+    runs-on: ubuntu-latest
+    outputs:
+      release: ${{ steps.resolve.outputs.release }}
+      sums-sha256: ${{ steps.resolve.outputs.sums-sha256 }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.ref || '' }}
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - id: resolve
+        shell: bash
+        env:
+          ZIPP_RELEASE: ${{ inputs.zipp-release || '' }}
+          ZIPP_SUMS_SHA256: ${{ inputs.zipp-sums-sha256 || '' }}
+        run: |
+          set -euo pipefail
+          ZIPP_RELEASE="${ZIPP_RELEASE:-}"; ZIPP_SUMS_SHA256="${ZIPP_SUMS_SHA256:-}"
+          if [[ -n "$ZIPP_RELEASE" && -z "$ZIPP_SUMS_SHA256" ]] || [[ -z "$ZIPP_RELEASE" && -n "$ZIPP_SUMS_SHA256" ]]; then
+            echo "::error::zipp-release and zipp-sums-sha256 are passed together or not at all"; exit 1
+          fi
+          if [[ -n "$ZIPP_RELEASE" ]]; then
+            resolved="$(node scripts/fetch-zipp-release.mjs --resolve-only)"
+          else
+            resolved="$(node scripts/fetch-zipp-release.mjs --resolve-only --latest)"
+          fi
+          release="$(node -e 'console.log(JSON.parse(process.argv[1]).release)' "$resolved")"
+          sums="$(node -e 'console.log(JSON.parse(process.argv[1]).sumsSha256)' "$resolved")"
+          if [[ -n "$ZIPP_SUMS_SHA256" && "$sums" != "${ZIPP_SUMS_SHA256,,}" ]]; then
+            echo "::error::the ZIPP $release SHA256SUMS is $sums now, not the $ZIPP_SUMS_SHA256 the caller resolved"; exit 1
+          fi
+          echo "release=$release" >> "$GITHUB_OUTPUT"
+          echo "sums-sha256=$sums" >> "$GITHUB_OUTPUT"
+          echo "## ZIPP release: $release (SHA256SUMS $sums)" >> "$GITHUB_STEP_SUMMARY"
+
   web:
     name: Web app tests
-    needs: revision
+    needs: [revision, zipp]
     runs-on: ubuntu-latest
+    env:
+      ZIPP_RELEASE: ${{ needs.zipp.outputs.release }}
+      ZIPP_SUMS_SHA256: ${{ needs.zipp.outputs.sums-sha256 }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -62,6 +123,12 @@ jobs:
           cache-dependency-path: ui/package-lock.json
       - working-directory: ui
         run: npm ci
+      # Both engines, from the run's release. ui's pretest and prebuild hooks
+      # would install them as well; a step of its own puts it in the log.
+      - name: Install the ZIPP release
+        run: node scripts/fetch-zipp-release.mjs --ensure
+      - name: ZIPP release installer tests
+        run: node --test scripts/fetch-zipp-release.test.mjs
       # ECO-04: advisories at high or above fail the lane. An unreachable
       # registry is recorded as UNKNOWN in the run summary, never as clean, and
       # still fails: a release must carry a completed audit.
@@ -92,8 +159,11 @@ jobs:
 
   cli:
     name: CLI tests, typecheck and HTTPS shutdown
-    needs: revision
+    needs: [revision, zipp]
     runs-on: ubuntu-latest
+    env:
+      ZIPP_RELEASE: ${{ needs.zipp.outputs.release }}
+      ZIPP_SUMS_SHA256: ${{ needs.zipp.outputs.sums-sha256 }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -106,6 +176,11 @@ jobs:
           cache-dependency-path: cli/package-lock.json
       - working-directory: cli
         run: npm ci
+      # The CLI and Desktop lanes install the run's release too (the installer
+      # needs Node built-ins only, no ui dependencies), so both engines are
+      # verified on the runners that build the CLI and Desktop, Windows included.
+      - name: Install the ZIPP release
+        run: node scripts/fetch-zipp-release.mjs --ensure
       # ECO-04: advisories at high or above fail the lane. An unreachable
       # registry is recorded as UNKNOWN in the run summary, never as clean, and
       # still fails: a release must carry a completed audit.
@@ -143,8 +218,11 @@ jobs:
 
   desktop:
     name: Desktop Vitest + native tests (${{ matrix.label }})
-    needs: revision
+    needs: [revision, zipp]
     runs-on: ${{ matrix.os }}
+    env:
+      ZIPP_RELEASE: ${{ needs.zipp.outputs.release }}
+      ZIPP_SUMS_SHA256: ${{ needs.zipp.outputs.sums-sha256 }}
     strategy:
       fail-fast: false
       matrix:
@@ -161,6 +239,8 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: ${{ env.NODE_VERSION }}
+      - name: Install the ZIPP release
+        run: node scripts/fetch-zipp-release.mjs --ensure
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable (pinned revision)
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
         with:

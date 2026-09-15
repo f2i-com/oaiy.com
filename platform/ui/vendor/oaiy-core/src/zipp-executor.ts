@@ -395,8 +395,9 @@ export class ZippSession {
       //
       // Engine builds before zipp.org `833680d8` could be driven into that
       // trap deliberately, because the heap ceiling was re-checked on an
-      // instruction stride and a single instruction can commit megabytes. That
-      // is fixed upstream and the vendored artifact carries the fix, but the
+      // instruction stride and a single instruction can commit megabytes.
+      // Every ZIPP release since v0.0.11 carries the fix (the engine is
+      // installed from a release by scripts/fetch-zipp-release.mjs), but the
       // handling stays: a trap is always possible in principle, and treating
       // one as anything other than terminal would be a way to keep using a
       // poisoned Engine.

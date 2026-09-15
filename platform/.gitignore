@@ -14,6 +14,16 @@ ui/.cache/
 # Vite serves a synthetic deps cache when imports change at runtime.
 ui/.tmp/
 
+# --- ZIPP engines ----------------------------------------------------------
+# Installed from a verified zipp.org release by scripts/fetch-zipp-release.mjs
+# (ui's dev, typecheck, test, test:zipp and build hooks run --ensure), never
+# committed. The curated notices in ui/vendor/zipp-notices/ are committed.
+/ui/vendor/zipp-wasm/
+/ui/vendor/zipp-wasm-python/
+# Its install lock and stage folders, and the per-tag download cache.
+/ui/vendor/.zipp-wasm*
+/.zipp-release/
+
 # --- api/ backend ----------------------------------------------------------
 api/vendor/
 # .env carries the live DB password — committed copy lives at .env.example.
