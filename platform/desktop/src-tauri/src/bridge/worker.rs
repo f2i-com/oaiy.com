@@ -199,6 +199,12 @@ pub struct EngineIdentity {
     /// Kept for the heartbeat and for a second language later; nothing reads
     /// it yet, and nothing here must advertise a language no host runs.
     pub run_languages: Vec<String>,
+    /// The CLI's `protocols` map, every integer entry of it (`run`, `script`,
+    /// `profile`, …), so a consumer that needs a protocol other than `run` —
+    /// the script host needs `script` — can require it from the same report
+    /// instead of probing again. Non-integer values are dropped; unknown keys
+    /// are kept, not refused.
+    pub protocols: std::collections::BTreeMap<String, u64>,
 }
 
 /// The answer to "can this CLI run a flow on ZIPP right now?".
@@ -259,6 +265,15 @@ pub fn parse_capabilities(v: &Value) -> Result<EngineIdentity, String> {
         .and_then(Value::as_array)
         .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
         .unwrap_or_default();
+    let protocols = v
+        .get("protocols")
+        .and_then(Value::as_object)
+        .map(|m| {
+            m.iter()
+                .filter_map(|(k, n)| n.as_u64().map(|n| (k.clone(), n)))
+                .collect()
+        })
+        .unwrap_or_default();
     Ok(EngineIdentity {
         name,
         release: text("release").unwrap_or_default(),
@@ -266,12 +281,13 @@ pub fn parse_capabilities(v: &Value) -> Result<EngineIdentity, String> {
         revision: text("revision").unwrap_or_default(),
         wasm_sha256: text("wasmSha256").unwrap_or_default(),
         run_languages,
+        protocols,
     })
 }
 
 /// How long `capabilities --json` may take. It hashes and compiles the staged
 /// wasm (~8 MB) — a second or two — and never runs a flow.
-const PROBE_DEADLINE: Duration = Duration::from_secs(15);
+pub(crate) const PROBE_DEADLINE: Duration = Duration::from_secs(15);
 /// How long a refusal is remembered before the CLI is asked again, so a fixed
 /// install recovers without a restart. A `Ready` answer is kept until the CLI
 /// file itself changes.
@@ -279,7 +295,7 @@ const PROBE_TTL: Duration = Duration::from_secs(60);
 
 /// Start `<cli> …` the way a run does: through the resolved Node when the CLI
 /// is a script, directly when it is a binary.
-fn cli_command(cli: &CliInvocation, node_exe: Option<&Path>) -> Command {
+pub(crate) fn cli_command(cli: &CliInvocation, node_exe: Option<&Path>) -> Command {
     match cli {
         CliInvocation::Node { script } => {
             // Prefer a resolved Node (portable install, else PATH) over the
@@ -312,7 +328,7 @@ fn cli_command(cli: &CliInvocation, node_exe: Option<&Path>) -> Command {
 /// than the one staged beside it. The CLI's digest check makes a wrong folder
 /// inert, but the desktop ships exactly one engine and a child of this process
 /// should not be told to look for another.
-fn harden_child(cmd: &mut Command) {
+pub(crate) fn harden_child(cmd: &mut Command) {
     for name in crate::plugins::runner::NEVER_FORWARD {
         cmd.env_remove(name);
     }
@@ -1200,7 +1216,7 @@ pub fn classify_result(v: Value) -> CliOutcome {
 /// the cap on its own — so every failure was reported as a wall of
 /// registration notices and the actual error, printed last, was thrown away.
 /// Runs failed with no readable reason for it.
-fn drain_capped<R: std::io::Read>(mut reader: R, sink: &std::sync::Mutex<String>) {
+pub(crate) fn drain_capped<R: std::io::Read>(mut reader: R, sink: &std::sync::Mutex<String>) {
     let mut buf = [0u8; 8192];
     loop {
         match reader.read(&mut buf) {
@@ -1229,7 +1245,7 @@ fn fail(code: RunErrorCode, msg: &str) -> (RunStatus, Option<Value>, Option<RunE
 
 /// Last `n` chars of captured output, so the error carries the useful end of a
 /// stack trace rather than its preamble.
-fn tail_of(s: &str, n: usize) -> String {
+pub(crate) fn tail_of(s: &str, n: usize) -> String {
     let t = s.trim();
     if t.len() <= n {
         t.to_string()
@@ -1452,7 +1468,7 @@ mod tests {
         // not any release's.
         json!({
             "version": "0.2.0",
-            "protocols": { "run": 1 },
+            "protocols": { "run": 1, "script": 1, "profile": 1 },
             "engine": {
                 "name": "zipp", "status": "ready",
                 "release": "vF.I.X", "version": "F.I.X", "revision": "0123abcd",
@@ -1460,6 +1476,22 @@ mod tests {
             },
             "run": { "languages": ["javascript"], "defaultInstructionSteps": 50, "maxInstructionSteps": 2000 }
         })
+    }
+
+    #[test]
+    fn the_protocols_map_is_kept_whole_so_other_consumers_can_require_their_own() {
+        // `run` is what this file needs; the script host needs `script`. Both
+        // come from the one report, integers only, unknown keys kept.
+        let id = parse_capabilities(&good_capabilities()).unwrap();
+        assert_eq!(id.protocols.get("run"), Some(&1));
+        assert_eq!(id.protocols.get("script"), Some(&1));
+        assert_eq!(id.protocols.get("profile"), Some(&1));
+        let mut v = good_capabilities();
+        v["protocols"] = json!({ "run": 1, "script": "one", "later": 3 });
+        let id = parse_capabilities(&v).unwrap();
+        assert_eq!(id.protocols.get("script"), None, "a non-integer version is no version");
+        assert_eq!(id.protocols.get("later"), Some(&3), "an unknown protocol is carried, not refused");
+        assert_eq!(id.protocols.len(), 2);
     }
 
     #[test]

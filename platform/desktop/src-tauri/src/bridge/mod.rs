@@ -38,12 +38,16 @@ pub mod deadletters;
 pub mod ledger;
 pub mod pairing;
 pub mod routes;
+pub mod script_host;
 pub mod triggers;
 pub mod worker;
 
 pub use deadletters::{DeadLetter, DeadLetterHandle, DeadLetterQueue, DeadReason};
 pub use pairing::{PairingHandle, PairingManager};
 pub use routes::{router as bridge_router, BridgeState};
+pub use script_host::{
+    Health, HealthSnapshot, HostError, JobError, JobResult, ScriptHost, ScriptResponse,
+};
 pub use worker::{FlowStore, Worker};
 pub use triggers::{dispatch, BindingMode, DispatchOutcome, Event, SkipReason, TriggerBinding};
 pub use ledger::{
