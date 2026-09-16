@@ -92,8 +92,8 @@ shell too.
 ```json
 { "version": "0.2.0",
   "protocols": { "run": 1 },
-  "engine": { "name": "zipp", "release": "v0.0.18", "version": "0.0.18", "revision": "…",
-              "variant": "javascript-python", "bundle": "zipp-wasm-0.0.18-web-python.zip",
+  "engine": { "name": "zipp", "release": "v0.0.19", "version": "0.0.19", "revision": "…",
+              "variant": "javascript-python", "bundle": "zipp-wasm-0.0.19-web-python.zip",
               "wasmSha256": "…", "glueSha256": "…", "languages": ["javascript", "python"],
               "status": "ready" },
   "run": { "languages": ["javascript"], "defaultInstructionSteps": 50000000, "maxInstructionSteps": 2000000000 } }
