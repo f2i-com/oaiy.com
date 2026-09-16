@@ -16,11 +16,13 @@
     "test:e2e": "node tests/e2e.mjs",
     "test:css": "node tests/css-tokens.mjs",
     "pretest": "node ../scripts/fetch-zipp-release.mjs --ensure",
-    "test": "npm run typecheck && npm run test:css && npm run test:contracts && npm run test:zipp && npm run test:zipp-routing",
+    "test": "npm run typecheck && npm run test:css && npm run test:contracts && npm run test:zipp && npm run test:zipp-routing && npm run test:zipp-script",
     "test:contracts": "node tests/node-contracts.mjs",
     "pretest:zipp": "node ../scripts/fetch-zipp-release.mjs --ensure",
     "test:zipp": "node tests/zipp-executor.mjs",
-    "test:zipp-routing": "node tests/zipp-routing.mjs"
+    "test:zipp-routing": "node tests/zipp-routing.mjs",
+    "pretest:zipp-script": "node ../scripts/fetch-zipp-release.mjs --ensure",
+    "test:zipp-script": "node tests/zipp-script.mjs"
   },
   "dependencies": {
     "@ffmpeg/core": "^0.12.10",

@@ -247,8 +247,11 @@ ${scopedShims}${fullScript}
  * carry and documents what it drops. `crypto` is deliberately a throwing stub
  * rather than a `Math.random` imitation — code that asks for cryptographic
  * randomness must not silently receive something weaker.
+ *
+ * Exported for `zipp-script.ts`: a leaf script is trusted code compiled at
+ * run time, so its program carries the same shims at top level.
  */
-const ZIPP_GUEST_SHIMS = String.raw`// ---- host-realm APIs, made safe inside the engine (see ZIPP_GUEST_SHIMS) ----
+export const ZIPP_GUEST_SHIMS = String.raw`// ---- host-realm APIs, made safe inside the engine (see ZIPP_GUEST_SHIMS) ----
 var __oaiyUnavailable = function (name, hint) {
   return function () {
     throw new TypeError(name + " is not available inside the Zipp sandbox. " + hint);

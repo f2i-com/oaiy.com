@@ -1,0 +1,227 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oaiy.com/schemas/script/v1/script-request.schema.json",
+  "title": "Leaf-script request",
+  "description": "One batch of leaf scripts to run on the Zipp engine without a workflow graph: `oaiy script` reads it, `oaiy script --serve` reads one per `batch` line, and the Desktop's script host sends it. Every job runs on its own fresh Engine, in order; the reply is `script-result.schema.json` with one entry per job in the same order. A request with ANY malformed job is refused WHOLE (`{v, error}`), nothing runs. The requester supplies every file, entry point and hook name; OAIY names none. Data (`globals`, `args`, `source`, `files`) crosses into the guest only as JSON literals, never as program text.",
+  "type": "object",
+  "required": [
+    "v",
+    "jobs"
+  ],
+  "properties": {
+    "v": {
+      "const": 1
+    },
+    "profile": {
+      "$ref": "https://oaiy.com/schemas/script/v1/script-profile.schema.json"
+    },
+    "jobs": {
+      "type": "array",
+      "items": {
+        "oneOf": [
+          {
+            "$ref": "#/$defs/javascriptJob"
+          },
+          {
+            "$ref": "#/$defs/pythonJob"
+          }
+        ]
+      }
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "identifier": {
+      "$ref": "https://oaiy.com/schemas/script/v1/script-profile.schema.json#/$defs/identifier",
+      "description": "Owned by the profile schema, so a profile validates on its own."
+    },
+    "pythonIdentifier": {
+      "type": "string",
+      "maxLength": 128,
+      "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+    },
+    "budgetMs": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 60000,
+      "description": "Wall-clock hint for a host watchdog. The runner itself does not enforce it; a host that does reports `timeout`."
+    },
+    "instructionSteps": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 2000000000,
+      "description": "Instruction budget for this job, overriding the profile's. Unset: the engine default."
+    },
+    "files": {
+      "type": "object",
+      "minProperties": 1,
+      "propertyNames": {
+        "minLength": 1,
+        "maxLength": 128
+      },
+      "additionalProperties": {
+        "type": "string"
+      },
+      "description": "Module name (or `name.py`) to source. Modules import one another by name; nothing else can be imported."
+    },
+    "javascriptJob": {
+      "type": "object",
+      "required": [
+        "id",
+        "mode",
+        "source"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/id"
+        },
+        "language": {
+          "const": "javascript"
+        },
+        "mode": {
+          "enum": [
+            "program",
+            "body",
+            "auto",
+            "entry",
+            "parse"
+          ],
+          "description": "`program`: indirect eval, completion value. `body`: `new Function(source)()`. `auto`: decided by parsing, a script or else a function body. `entry`: `source` declares `entry`, called with `args`. `parse`: compiled as an expression, never invoked."
+        },
+        "source": {
+          "type": "string"
+        },
+        "globals": {
+          "type": "object",
+          "description": "Installed as guest globals: own keys that are identifiers, do not start with `__` and are not `__proto__`/`constructor`/`prototype`."
+        },
+        "entry": {
+          "$ref": "#/$defs/identifier"
+        },
+        "args": {
+          "type": "array"
+        },
+        "prepare": {
+          "$ref": "#/$defs/identifier",
+          "description": "A preamble function that maps the parsed globals (`program`/`body`/`auto`) or the args array (`entry`) before the source runs."
+        },
+        "budgetMs": {
+          "$ref": "#/$defs/budgetMs"
+        },
+        "instructionSteps": {
+          "$ref": "#/$defs/instructionSteps"
+        }
+      },
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "mode": {
+                "const": "entry"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "entry"
+            ]
+          },
+          "else": {
+            "not": {
+              "anyOf": [
+                {
+                  "required": [
+                    "entry"
+                  ]
+                },
+                {
+                  "required": [
+                    "args"
+                  ]
+                }
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "mode": {
+                "const": "parse"
+              }
+            }
+          },
+          "then": {
+            "not": {
+              "required": [
+                "prepare"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "pythonJob": {
+      "type": "object",
+      "required": [
+        "id",
+        "language",
+        "mode",
+        "files",
+        "entry",
+        "call"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/id"
+        },
+        "language": {
+          "const": "python"
+        },
+        "mode": {
+          "const": "python-project"
+        },
+        "files": {
+          "$ref": "#/$defs/files"
+        },
+        "entry": {
+          "$ref": "#/$defs/pythonIdentifier",
+          "description": "The module whose top level runs."
+        },
+        "call": {
+          "$ref": "#/$defs/pythonIdentifier",
+          "description": "A top-level function of `entry`, called with `args`."
+        },
+        "args": {
+          "type": "array"
+        },
+        "fallbackOnSourceError": {
+          "type": "object",
+          "required": [
+            "files"
+          ],
+          "properties": {
+            "files": {
+              "$ref": "#/$defs/files"
+            }
+          },
+          "additionalProperties": false,
+          "description": "Tried once, on a fresh Engine, when `files` fails to compile or its top level raises (the engine's `source` kind). Same `entry` and `call`."
+        },
+        "budgetMs": {
+          "$ref": "#/$defs/budgetMs"
+        },
+        "instructionSteps": {
+          "$ref": "#/$defs/instructionSteps"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

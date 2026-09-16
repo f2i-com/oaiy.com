@@ -1,0 +1,138 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oaiy.com/schemas/script/v1/script-profile.schema.json",
+  "title": "Leaf-script profile",
+  "description": "A requester's prelude for the jobs of one leaf-script request (`script-request.schema.json`). `preamble` is program text emitted after the engine's guest shims and before every JavaScript job's own source; `preambleSha256` is its lower-case hex sha256 and is verified by the host before anything runs. A preamble that declares a name the engine or the envelope binds is refused. `hooks` names per-lane `prepare` functions the preamble defines; `python` carries a Python contract the requester unfolds into `python-project` jobs itself. Both are read by requesters, never by the runner.",
+  "type": "object",
+  "required": [
+    "v",
+    "preamble",
+    "preambleSha256"
+  ],
+  "properties": {
+    "v": {
+      "const": 1
+    },
+    "preamble": {
+      "type": "string"
+    },
+    "preambleSha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "instructionSteps": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 2000000000,
+      "description": "Instruction budget for every job that sets none of its own. Unset: the engine default."
+    },
+    "hooks": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "required": [
+          "prepare"
+        ],
+        "properties": {
+          "prepare": {
+            "$ref": "#/$defs/identifier"
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "python": {
+      "type": "object",
+      "required": [
+        "contract",
+        "files",
+        "entry",
+        "call"
+      ],
+      "properties": {
+        "contract": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "files": {
+          "type": "object",
+          "minProperties": 1,
+          "propertyNames": {
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "entry": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "call": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "reservedWord": {
+      "enum": [
+        "await",
+        "break",
+        "case",
+        "catch",
+        "class",
+        "const",
+        "continue",
+        "debugger",
+        "default",
+        "delete",
+        "do",
+        "else",
+        "enum",
+        "export",
+        "extends",
+        "false",
+        "finally",
+        "for",
+        "function",
+        "if",
+        "import",
+        "in",
+        "instanceof",
+        "let",
+        "new",
+        "null",
+        "return",
+        "static",
+        "super",
+        "switch",
+        "this",
+        "throw",
+        "true",
+        "try",
+        "typeof",
+        "var",
+        "void",
+        "while",
+        "with",
+        "yield"
+      ]
+    },
+    "identifier": {
+      "type": "string",
+      "maxLength": 128,
+      "pattern": "^[A-Za-z_$][A-Za-z0-9_$]*$",
+      "not": {
+        "$ref": "#/$defs/reservedWord"
+      }
+    }
+  }
+}
