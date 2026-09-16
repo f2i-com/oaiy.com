@@ -39,6 +39,12 @@ export interface ZippThreadExecutorOptions {
    * worker is spawned rather than failing every job.
    */
   instructionBudgetSteps?: number;
+  /**
+   * A script profile's preamble (`run --profile`), placed at program top level
+   * by `buildZippScript` in the worker (`ZippWorkflowServeOptions.preamble`).
+   * Already validated by `loadScriptProfile`; carried, never inspected, here.
+   */
+  preamble?: string;
 }
 
 type EventKind = 'message' | 'error' | 'messageerror';
@@ -56,7 +62,7 @@ export function createZippThreadExecutor(
 
   return () => {
     const worker = new Worker(artifact.workerEntry, {
-      workerData: { wasmModule: artifact.module, instructionBudgetSteps: steps },
+      workerData: { wasmModule: artifact.module, instructionBudgetSteps: steps, preamble: opts.preamble },
       env: {},
       stdout: true,
       stderr: true,

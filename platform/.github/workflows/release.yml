@@ -15,6 +15,9 @@
 #   oaiy-desktop-<v>-linux-x86_64.rpm        OAIY Desktop, Fedora/RHEL
 #   oaiy-server-<v>-linux-x86_64.tar.gz      the headless server (no GUI, no GTK) for Linux hosts
 #   oaiy-server-<v>-windows-x64.zip          the headless server for Windows
+#   oaiy-cli-<v>.tar.gz                      the CLI alone (oaiy.mjs, both ZIPP worker shells, zipp/,
+#                                            undici), OS-neutral, for a product that embeds it; carries
+#                                            SHA256SUMS and oaiy-cli.json (= `oaiy capabilities --json`)
 #   SHA256SUMS.txt
 #
 # The tag is the version. It is stamped into desktop/src-tauri/tauri.conf.json
@@ -356,6 +359,14 @@ jobs:
             rpm="$(find "$bundle" -type f -name '*.rpm' | head -1 || true)"
             [[ -n "$rpm" ]] && cp "$rpm" "$out/oaiy-desktop-$VERSION-linux-x86_64.rpm"
             tar -C headless-dist -czf "$out/oaiy-server-$VERSION-linux-x86_64.tar.gz" .
+            # The CLI alone, built ONCE (this leg) from a COPY of the staged
+            # resources/cli — the folder package-server.mjs already inventoried
+            # and smoke-server.mjs re-hashes, so it is never written to. The
+            # tarball carries SHA256SUMS and oaiy-cli.json, the copy's own
+            # `capabilities --json` (protocols, engine, languages), which a
+            # consumer embedding the CLI compares against what it speaks. The
+            # summary feeds the evidence below; it is not an asset itself.
+            node scripts/pack-cli-asset.mjs desktop/src-tauri/resources/cli "$out/oaiy-cli-$VERSION.tar.gz" --summary cli-asset-summary.json
           fi
           ls -l "$out"
 
@@ -389,10 +400,14 @@ jobs:
           node -e '
             const fs = require("fs"); const crypto = require("crypto"); const path = require("path");
             const files = fs.readdirSync("release").map(name => ({ name, sha256: crypto.createHash("sha256").update(fs.readFileSync(path.join("release", name))).digest("hex") }));
+            // The standalone CLI asset (linux leg only): its digest and the protocols/engine record its oaiy-cli.json carries.
+            const cliSummary = fs.existsSync("cli-asset-summary.json") ? JSON.parse(fs.readFileSync("cli-asset-summary.json", "utf8")) : null;
+            const cli = cliSummary ? { asset: cliSummary.asset, sha256: cliSummary.sha256, protocols: cliSummary.capabilities.protocols, engine: cliSummary.capabilities.engine, run: cliSummary.capabilities.run, script: cliSummary.capabilities.script } : undefined;
             fs.writeFileSync(`release/release-evidence-${process.env.LABEL}.json`, JSON.stringify({
               component: "desktop+headless", version: process.env.VERSION, revision: process.env.REVISION,
               target: process.env.LABEL, runner: process.env.RUNNER_OS,
               features: { desktop: ["gui"], headless: ["--no-default-features"] },
+              cli,
               // The Node version comes from the runtime itself (an unexported shell variable used to leave it empty).
               toolchain: { rustc: process.argv[1], cargo: process.argv[2], node: process.version },
               // Attested by the release job after the gate passed (see the note in the web job).
@@ -502,6 +517,12 @@ jobs:
 
           **oaiy-server** — the same local API with no window, tray or GTK, for a Linux or
           Windows host that the CLI or a hosted web app drives. See \`desktop/README.md\`.
+
+          **oaiy-cli** — \`oaiy-cli-$VERSION.tar.gz\` is the CLI alone, OS-neutral (JavaScript +
+          the ZIPP $ZIPP_RELEASE web-python engine), for a product that embeds it: \`oaiy.mjs\`, both
+          worker shells, \`zipp/\`, \`node_modules/undici\`, an inner \`SHA256SUMS\`, and \`oaiy-cli.json\` —
+          the CLI's own \`oaiy capabilities --json\` (protocols, engine identity and health, the languages
+          \`run\` and \`script\` accept). \`release-evidence-linux.json\` records the same under \`cli\`.
 
           \`SHA256SUMS.txt\` covers every file above. \`release-evidence-*.json\` records, per
           artifact set, the source revision, target, features, toolchain, digests, the tests

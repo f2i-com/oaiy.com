@@ -4,6 +4,7 @@
  *   oaiy inputs <flow>     — list the inputs a flow expects
  *   oaiy validate <flow>   — parse + structural check, no execution
  *   oaiy capabilities      — what this build is and can run (--json)
+ *   oaiy script            — leaf scripts on the ZIPP engine (--request <file> | --serve)
  */
 import { Command, InvalidArgumentError } from 'commander';
 import fs from 'node:fs';
@@ -74,8 +75,18 @@ program
       return n;
     },
   )
+  .option(
+    '--profile <file>',
+    'a script profile (protocol/v1/script-profile.schema.json): its preamble is placed before every flow script and its instructionSteps is the budget (not with --instruction-budget)',
+  )
   .option('--quiet', 'suppress progress logs on stderr', false)
   .action(async (flowPath: string, opts: Record<string, any>) => {
+    // The profile is loaded, checked and reconciled with --instruction-budget
+    // BEFORE the flow is read or the engine imported: a profile that does not
+    // check, or two budgets, is a usage error and no result file is written.
+    const { loadScriptProfile, resolveInstructionBudget } = await import('./zipp/profile');
+    const profile = opts.profile ? loadScriptProfile(opts.profile) : undefined;
+    resolveInstructionBudget(profile, opts.instructionBudget); // refuses the pair; `runFlow` resolves the figure
     const { runFlow } = await import('./engine');
     const { graph, name, flows } = loadFlowFile(flowPath);
     const inputs = parseInputs(opts.input ?? [], opts.inputs);
@@ -99,6 +110,7 @@ program
       flowName: name,
       timeoutMs: opts.timeout ? opts.timeout * 1000 : undefined,
       instructionBudgetSteps: opts.instructionBudget,
+      profile,
     });
 
     const payload: Record<string, unknown> = {
@@ -172,6 +184,30 @@ program
     // The report is printed either way; an unavailable engine is a failed
     // probe, and the exit code says so to a caller that only checks that.
     process.exitCode = report.engine.status === 'ready' ? 0 : 1;
+  });
+
+program
+  .command('script')
+  .description(
+    'Run leaf scripts (protocol/v1/script-request.schema.json) on the ZIPP engine: one request from a file, or serve requests over stdin/stdout as NDJSON',
+  )
+  .option('--request <file>', 'a script-request JSON document; the response goes to --out or stdout')
+  .option('-o, --out <file>', 'write the response JSON to a file (default: stdout)')
+  .option('--serve', 'keep one warm engine worker and speak NDJSON on stdin/stdout ({op:"batch"|"ping"|"shutdown"})', false)
+  .action(async (opts: Record<string, any>) => {
+    if (opts.serve && opts.request) throw new InvalidArgumentError('script: pass --request <file> or --serve, not both');
+    if (!opts.serve && !opts.request) throw new InvalidArgumentError('script: pass --request <file> or --serve');
+    if (opts.serve && opts.out) throw new InvalidArgumentError('script: --out has no meaning with --serve (responses go to stdout)');
+    // src/script imports the artifact check and the script host only — never
+    // engine.ts, so no __TAURI__ is installed and no module registry loads.
+    const { runScriptFile, serveScript } = await import('./script');
+    if (opts.serve) {
+      const code = await serveScript(process.stdin, process.stdout);
+      // Like `worker`: the streams are blocking, the worker has been
+      // terminated, and a paused stdin pipe must not keep the process alive.
+      process.exit(code);
+    }
+    process.exitCode = await runScriptFile(opts.request, opts.out);
   });
 
 program

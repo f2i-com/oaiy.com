@@ -3,8 +3,9 @@
  * drive them against a fixture without wiping the real `resources/cli`.
  *
  * The CLI runs every flow on the ZIPP VM, so the desktop ships the engine with
- * it: the worker shell and the five files `cli/esbuild.mjs` stages into
- * `dist/zipp/` beside the bundle. A bundle staged without them resolves, probes
+ * it: the two worker shells (workflow and leaf-script) and the five files
+ * `cli/esbuild.mjs` stages into `dist/zipp/` beside the bundle. A bundle
+ * staged without them resolves, probes
  * `engine_unavailable`, and every run fails — so staging is verified, not
  * assumed, and the identity comes from the staged `SOURCE.json`, never from a
  * literal in this file.
@@ -13,15 +14,20 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 
-/** The bundle, the worker shell it spawns, and the engine folder. */
+/** The bundle, the worker shells it spawns, and the engine folder. */
 export const BUNDLE = 'oaiy.mjs';
+/** The workflow shell (`oaiy run`). */
 export const WORKER = 'oaiy-zipp-worker.mjs';
+/** The leaf-script shell (`oaiy script`, the Desktop's script host). */
+export const SCRIPT_WORKER = 'oaiy-script-worker.mjs';
+/** Exactly the shells `cli/esbuild.mjs` (`ZIPP_WORKERS`) builds beside the bundle; the CLI refuses to run without both. */
+export const WORKERS = [WORKER, SCRIPT_WORKER];
 export const ZIPP_DIR = 'zipp';
-/** Exactly what `cli/esbuild.mjs` (`ZIPP_STAGED`) puts in `dist/zipp/`. */
+/** Exactly what `cli/esbuild.mjs` (`ZIPP_STAGED`) puts in `dist/zipp/` — keep the two lists equal. */
 export const ZIPP_STAGED = ['zipp_wasm_bg.wasm', 'PROFILE.json', 'SOURCE.json', 'LICENSE-APACHE', 'THIRD_PARTY_LICENSES.txt'];
 
 /** Every staged path, relative to the destination, that a run needs. */
-export const STAGED_FILES = [BUNDLE, WORKER, ...ZIPP_STAGED.map((name) => path.join(ZIPP_DIR, name))];
+export const STAGED_FILES = [BUNDLE, ...WORKERS, ...ZIPP_STAGED.map((name) => path.join(ZIPP_DIR, name))];
 
 export class StagingError extends Error {}
 
@@ -29,7 +35,7 @@ const sha256 = (file) => createHash('sha256').update(fs.readFileSync(file)).dige
 
 /** The dist files whose absence means the CLI has to be (re)built. */
 export function missingBuildOutputs(dist) {
-  return [BUNDLE, WORKER, path.join(ZIPP_DIR, 'zipp_wasm_bg.wasm'), path.join(ZIPP_DIR, 'SOURCE.json')]
+  return [BUNDLE, ...WORKERS, path.join(ZIPP_DIR, 'zipp_wasm_bg.wasm'), path.join(ZIPP_DIR, 'SOURCE.json')]
     .filter((rel) => !fs.existsSync(path.join(dist, rel)));
 }
 

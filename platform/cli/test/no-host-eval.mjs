@@ -1,7 +1,7 @@
 // Guard A: the built CLI carries no way to compile a string into host code
 // except the two sites this file names.
 //
-//     node test/no-host-eval.mjs [dist/oaiy.mjs [dist/oaiy-zipp-worker.mjs …]]
+//     node test/no-host-eval.mjs [dist/oaiy.mjs [dist/oaiy-zipp-worker.mjs dist/oaiy-script-worker.mjs …]]
 //
 // Every `Function(...)` / `new Function(...)` (directly, via `globalThis` or
 // `window`, or through the `.constructor.constructor` idiom that recovers a
@@ -43,7 +43,7 @@ import { fileURLToPath } from 'node:url';
 const dist = fileURLToPath(new URL('../dist/', import.meta.url));
 const bundles = process.argv.length > 2
   ? process.argv.slice(2)
-  : [path.join(dist, 'oaiy.mjs'), path.join(dist, 'oaiy-zipp-worker.mjs')];
+  : [path.join(dist, 'oaiy.mjs'), path.join(dist, 'oaiy-zipp-worker.mjs'), path.join(dist, 'oaiy-script-worker.mjs')];
 
 const LOGGER_PROBE = 'try { return import.meta } catch(e) { return undefined }';
 const VM_SPECIFIERS = new Set(['vm', 'node:vm']);
@@ -60,6 +60,9 @@ const ALLOWED = {
 const EXPECTED = {
   'oaiy.mjs': { [Object.keys(ALLOWED)[0]]: 1, [Object.keys(ALLOWED)[1]]: 1 },
   'oaiy-zipp-worker.mjs': { [Object.keys(ALLOWED)[0]]: 0, [Object.keys(ALLOWED)[1]]: 0 },
+  // The leaf-script shell (PR5). zipp-script.ts's `new Function` / `eval` are
+  // GUEST program text inside string literals, never calls in this realm.
+  'oaiy-script-worker.mjs': { [Object.keys(ALLOWED)[0]]: 0, [Object.keys(ALLOWED)[1]]: 0 },
 };
 
 function isString(node, value) {

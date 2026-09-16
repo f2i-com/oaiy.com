@@ -20,6 +20,7 @@ for (const required of [
   path.join(cli, 'oaiy.mjs'),
   path.join(cli, 'node_modules/undici/package.json'),
   path.join(cli, 'oaiy-zipp-worker.mjs'),
+  path.join(cli, 'oaiy-script-worker.mjs'),
   path.join(cli, 'zipp/zipp_wasm_bg.wasm'),
   path.join(cli, 'zipp/SOURCE.json'),
 ]) {

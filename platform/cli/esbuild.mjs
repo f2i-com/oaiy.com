@@ -161,8 +161,17 @@ const ZIPP_VARIANT = VARIANTS.find((v) => v.suffix === 'web-python');
 if (!ZIPP_VARIANT) throw new Error('fetch-zipp-release.mjs no longer describes the web-python bundle');
 const zippVendor = path.join(repo, 'ui', 'vendor', ZIPP_VARIANT.folder);
 // Staged beside the CLI: the engine, its profile, the installer's record, and
-// the notices any redistribution of this bundle must carry.
+// the notices any redistribution of this bundle must carry. Mirrored by
+// desktop/scripts/sync-cli-lib.mjs (ZIPP_STAGED) — keep the two lists equal.
 const ZIPP_STAGED = ['zipp_wasm_bg.wasm', 'PROFILE.json', 'SOURCE.json', 'LICENSE-APACHE', 'THIRD_PARTY_LICENSES.txt'];
+// The worker shells built beside the bundle, each with the release's glue
+// bundled in: [source entry, dist name]. The workflow shell runs a flow; the
+// script shell serves `oaiy script`. Mirrored by sync-cli-lib.mjs (WORKERS)
+// and by the artifact check (src/zipp/artifact.ts), which requires both.
+const ZIPP_WORKERS = [
+  ['workflow-worker.ts', 'oaiy-zipp-worker.mjs'],
+  ['script-worker.ts', 'oaiy-script-worker.mjs'],
+];
 const sha256 = (bytes) => createHash('sha256').update(bytes).digest('hex');
 
 let zippIdentityCache = null;
@@ -217,9 +226,9 @@ export function zippDefines() {
 }
 
 /**
- * Stage dist/zipp/ and build dist/oaiy-zipp-worker.mjs. The staged .wasm is
- * hashed AFTER the copy — those bytes are what the CLI checks at run time
- * against the define, so they are checked here against the same digest.
+ * Stage dist/zipp/ and build the worker shells (ZIPP_WORKERS). The staged
+ * .wasm is hashed AFTER the copy — those bytes are what the CLI checks at run
+ * time against the define, so they are checked here against the same digest.
  */
 export async function buildZippAssets({ dist = path.join(__dirname, 'dist'), logLevel = 'info' } = {}) {
   const identity = zippIdentity();
@@ -232,12 +241,14 @@ export async function buildZippAssets({ dist = path.join(__dirname, 'dist'), log
   if (staged !== identity.wasmSha256) {
     throw new Error(`dist/zipp/zipp_wasm_bg.wasm has sha256 ${staged} after the copy, not ${identity.wasmSha256}`);
   }
-  await esbuild.build({
-    entryPoints: [path.join(__dirname, 'src', 'zipp', 'workflow-worker.ts')],
-    outfile: path.join(dist, 'oaiy-zipp-worker.mjs'),
-    logLevel,
-    ...commonBuildOptions,
-  });
+  for (const [entry, name] of ZIPP_WORKERS) {
+    await esbuild.build({
+      entryPoints: [path.join(__dirname, 'src', 'zipp', entry)],
+      outfile: path.join(dist, name),
+      logLevel,
+      ...commonBuildOptions,
+    });
+  }
   return identity;
 }
 
@@ -288,7 +299,7 @@ if (isMain) {
   const count = genBundledModules();
   process.stderr.write(`esbuild: generated registration for ${count} bundled modules\n`);
   const engine = await buildZippAssets();
-  process.stderr.write(`esbuild: staged ZIPP ${engine.release} (${engine.revision.slice(0, 8)}) to dist/zipp and built dist/oaiy-zipp-worker.mjs\n`);
+  process.stderr.write(`esbuild: staged ZIPP ${engine.release} (${engine.revision.slice(0, 8)}) to dist/zipp and built ${ZIPP_WORKERS.map(([, name]) => `dist/${name}`).join(', ')}\n`);
   await esbuild.build({
     entryPoints: [path.join(__dirname, 'src', 'cli.ts')],
     outfile: path.join(__dirname, 'dist', 'oaiy.mjs'),

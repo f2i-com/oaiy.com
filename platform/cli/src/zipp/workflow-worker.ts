@@ -38,17 +38,23 @@ if (!port) {
   throw new Error('oaiy-zipp-worker: not running as a worker_threads Worker');
 }
 
-const { wasmModule, instructionBudgetSteps } = workerData as {
+const { wasmModule, instructionBudgetSteps, preamble } = workerData as {
   wasmModule?: unknown;
   instructionBudgetSteps?: number;
+  preamble?: string;
 };
 if (!(wasmModule instanceof WebAssembly.Module)) {
   throw new Error('oaiy-zipp-worker: workerData carries no compiled WebAssembly.Module');
+}
+if (preamble !== undefined && typeof preamble !== 'string') {
+  throw new Error('oaiy-zipp-worker: workerData.preamble is not a string');
 }
 initSync({ module: wasmModule });
 
 // One workflow per worker; the main thread terminates this thread when it is
 // done with it (see `zipp-worker-loop.ts`). `Engine` is created on `init`.
+// A profile's preamble (`run --profile`) travels with the budget and reaches
+// `buildZippScript` inside the loop — the one place program text is assembled.
 serveZippWorkflow(
   {
     post: (message) => port.postMessage(message),
@@ -57,5 +63,5 @@ serveZippWorkflow(
     },
   },
   () => new Engine() as unknown as ZippEngine,
-  { instructionBudgetSteps },
+  { instructionBudgetSteps, preamble },
 );

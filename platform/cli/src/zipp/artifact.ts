@@ -55,8 +55,14 @@ export interface ZippArtifact {
   identity: ZippEngineIdentity;
   /** The staged `zipp_wasm_bg.wasm`, whose sha256 is `identity.wasmSha256`. */
   wasmPath: string;
-  /** The bundled worker shell (`dist/oaiy-zipp-worker.mjs`), confirmed present. */
+  /** The bundled workflow worker shell (`dist/oaiy-zipp-worker.mjs`), confirmed present. */
   workerEntry: URL;
+  /**
+   * The bundled leaf-script worker shell (`dist/oaiy-script-worker.mjs`, the
+   * `oaiy script` engine), confirmed present. Both shells are staged with the
+   * bundle as one set; a set missing either is no engine at all.
+   */
+  scriptWorkerEntry: URL;
 }
 
 export interface ZippArtifactOptions {
@@ -66,8 +72,10 @@ export interface ZippArtifactOptions {
    * live in the same `dist/`, so the relative path serves them too).
    */
   assetDir?: string;
-  /** The worker shell to spawn. Default: `oaiy-zipp-worker.mjs` beside this bundle. */
+  /** The workflow worker shell to spawn. Default: `oaiy-zipp-worker.mjs` beside this bundle. */
   workerEntry?: URL;
+  /** The script worker shell to spawn. Default: `oaiy-script-worker.mjs` beside this bundle. */
+  scriptWorkerEntry?: URL;
 }
 
 const WASM_FILE = 'zipp_wasm_bg.wasm';
@@ -101,27 +109,30 @@ export function loadZippArtifact(opts: ZippArtifactOptions = {}): Promise<ZippAr
     opts.assetDir ?? (process.env.OAIY_ZIPP_ASSET_DIR || fileURLToPath(new URL('./zipp/', import.meta.url))),
   );
   const workerEntry = opts.workerEntry ?? new URL('./oaiy-zipp-worker.mjs', import.meta.url);
-  const key = `${assetDir}\n${workerEntry.href}`;
+  const scriptWorkerEntry = opts.scriptWorkerEntry ?? new URL('./oaiy-script-worker.mjs', import.meta.url);
+  const key = `${assetDir}\n${workerEntry.href}\n${scriptWorkerEntry.href}`;
 
   let pending = loaded.get(key);
   if (!pending) {
-    pending = load(assetDir, workerEntry);
+    pending = load(assetDir, workerEntry, scriptWorkerEntry);
     loaded.set(key, pending);
     pending.catch(() => loaded.delete(key));
   }
   return pending;
 }
 
-async function load(assetDir: string, workerEntry: URL): Promise<ZippArtifact> {
+async function load(assetDir: string, workerEntry: URL, scriptWorkerEntry: URL): Promise<ZippArtifact> {
   const identity = zippEngineIdentity();
   const wasmPath = path.join(assetDir, WASM_FILE);
   const unavailable = (what: string, cause?: unknown) =>
     new EngineUnavailableError(`ZIPP engine unavailable: ${what}`, cause === undefined ? undefined : { cause });
 
-  try {
-    if (!(await fs.stat(workerEntry)).isFile()) throw new Error('not a file');
-  } catch (e) {
-    throw unavailable(`the worker shell ${fileURLToPath(workerEntry)} is missing`, e);
+  for (const [what, entry] of [['workflow worker shell', workerEntry], ['script worker shell', scriptWorkerEntry]] as const) {
+    try {
+      if (!(await fs.stat(entry)).isFile()) throw new Error('not a file');
+    } catch (e) {
+      throw unavailable(`the ${what} ${fileURLToPath(entry)} is missing`, e);
+    }
   }
 
   let bytes: Buffer;
@@ -146,5 +157,5 @@ async function load(assetDir: string, workerEntry: URL): Promise<ZippArtifact> {
     throw unavailable(`${wasmPath} does not compile: ${e instanceof Error ? e.message : String(e)}`, e);
   }
 
-  return { module, identity, wasmPath, workerEntry };
+  return { module, identity, wasmPath, workerEntry, scriptWorkerEntry };
 }

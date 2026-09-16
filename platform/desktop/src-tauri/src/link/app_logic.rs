@@ -2227,7 +2227,8 @@ mod tests {
     #[test]
     fn the_staged_cli_ships_its_engine_and_the_engine_is_the_one_the_bundle_was_built_for() {
         // What `sync-cli.mjs` stages, checked from the Rust side: the bundle,
-        // the worker shell it spawns, and the five engine files — with the wasm
+        // the two worker shells it spawns (workflow, and the leaf-script shell
+        // behind `oaiy script`), and the five engine files — with the wasm
         // matching the staged SOURCE.json's digest, the notices matching theirs,
         // and the bundle carrying that digest (the define esbuild baked in).
         // Every digest here is READ from the staged record; none is written
@@ -2242,6 +2243,7 @@ mod tests {
         for rel in [
             "oaiy.mjs",
             "oaiy-zipp-worker.mjs",
+            "oaiy-script-worker.mjs",
             "zipp/zipp_wasm_bg.wasm",
             "zipp/PROFILE.json",
             "zipp/SOURCE.json",

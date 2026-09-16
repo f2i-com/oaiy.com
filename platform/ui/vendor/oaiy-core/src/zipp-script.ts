@@ -207,7 +207,8 @@ const RESERVED_WORDS = new Set([
 ]);
 /** Names the envelope's own program binds; a preamble redeclaring one would break the reply channel. */
 export const SCRIPT_ENVELOPE_GLOBALS: readonly string[] = ['__replies', '__emit', '__out', '__ctx', '__args', '__k', '__fn', '__asBody'];
-const MAX_BUDGET_MS = 60_000;
+/** The largest `budgetMs` a job may ask a host watchdog for (the schema's ceiling). */
+export const SCRIPT_MAX_BUDGET_MS = 60_000;
 
 // ---------------------------------------------------------------------------
 // Validation: the whole request, before any Engine exists.
@@ -333,7 +334,7 @@ function validateJob(raw: unknown, index: number): ScriptJob {
   if (language !== 'javascript' && language !== 'python') throw new Invalid(`${where}: unknown language ${JSON.stringify(raw.language)}`);
 
   const base: ScriptJobBase = { id };
-  const budgetMs = optionalInt(raw, 'budgetMs', where, 1, MAX_BUDGET_MS);
+  const budgetMs = optionalInt(raw, 'budgetMs', where, 1, SCRIPT_MAX_BUDGET_MS);
   if (budgetMs !== undefined) base.budgetMs = budgetMs;
   const steps = optionalInt(raw, 'instructionSteps', where, 1, ZIPP_MAX_INSTRUCTION_BUDGET_STEPS);
   if (steps !== undefined) base.instructionSteps = steps;

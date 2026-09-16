@@ -178,8 +178,16 @@ const KIND_CONSOLE = '__system.console';
  * `hardened` mirrors `runtime.ts`: the strict directive and the null-prototype
  * `this` are applied exactly when the in-thread path would have applied them,
  * so the two engines agree on behaviour rather than only on output.
+ *
+ * `preamble` is a requester's prelude (a script profile's, `zipp-script.ts`),
+ * emitted at program top level after the shims and before the wrapper, so a
+ * body the flow compiles at run time sees its names exactly as it sees the
+ * shims. Only a TRUSTED flow may carry one: a hardened flow's whole point is
+ * that nothing but the flow's own program reaches the guest, so a preamble
+ * there is refused, not silently dropped or applied. Absent, the program is
+ * byte-identical to one built without the option.
  */
-export function buildZippScript(fullScript: string, hardened: boolean): string {
+export function buildZippScript(fullScript: string, hardened: boolean, opts: { preamble?: string } = {}): string {
   const strict = hardened ? `'use strict';\n` : '';
   const thisArg = hardened ? 'Object.create(null)' : 'undefined';
   // Trusted: the shims are program-level `var`s, so a `Function(...)` body the
@@ -188,8 +196,12 @@ export function buildZippScript(fullScript: string, hardened: boolean): string {
   // overrides them and a recovered global holds neither stub nor intrinsic.
   const topLevelShims = hardened ? '' : `${ZIPP_GUEST_SHIMS}\n`;
   const scopedShims = hardened ? `${ZIPP_GUEST_SHIMS}\n` : '';
+  if (opts.preamble !== undefined && hardened) {
+    throw new Error('A profile preamble cannot be applied to a hardened (untrusted) flow');
+  }
+  const preamble = opts.preamble ? `${opts.preamble}\n` : '';
 
-  return `${topLevelShims}var __oaiyConsole = {};
+  return `${topLevelShims}${preamble}var __oaiyConsole = {};
 (function () {
   var levels = ${JSON.stringify(CONSOLE_LEVELS)};
   for (var i = 0; i < levels.length; i++) {

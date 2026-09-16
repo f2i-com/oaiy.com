@@ -63,6 +63,15 @@ export type ZippWorkflowIncoming =
   | { type: 'host_result'; id: number; result: unknown }
   | { type: 'abort' };
 
+export interface ZippWorkflowServeOptions extends ZippSessionOptions {
+  /**
+   * A script profile's preamble (`zipp-script.ts`), placed at program top
+   * level by `buildZippScript` for a TRUSTED workflow. A hardened `init` with
+   * a preamble set here is refused by `buildZippScript` and the run fails.
+   */
+  preamble?: string;
+}
+
 /**
  * Serve one workflow over `port`. Registers the message handler, posts
  * `ready`, and returns; the run itself happens when `init` arrives.
@@ -76,8 +85,9 @@ export type ZippWorkflowIncoming =
 export function serveZippWorkflow(
   port: ZippWorkerPort,
   createEngine: () => ZippEngine | Promise<ZippEngine>,
-  opts: ZippSessionOptions = {},
+  opts: ZippWorkflowServeOptions = {},
 ): void {
+  const { preamble, ...sessionOptions } = opts;
   /** Resolvers for `host_call`s awaiting a `host_result` from the main thread. */
   const pending = new Map<number, (result: unknown) => void>();
   let nextCallId = 1;
@@ -112,10 +122,10 @@ export function serveZippWorkflow(
           onFinish: (value: unknown) => port.post({ type: 'finish', value }),
           onError: (msg: string) => port.post({ type: 'finish_error', message: msg }),
         },
-        opts,
+        sessionOptions,
       );
 
-      await session.run(buildZippScript(message.script, message.hardened !== false));
+      await session.run(buildZippScript(message.script, message.hardened !== false, { preamble }));
     } catch (e) {
       port.post({
         type: 'finish_error',

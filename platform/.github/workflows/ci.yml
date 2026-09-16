@@ -235,6 +235,15 @@ jobs:
       - name: ZIPP boundary measurements (recorded, never hang)
         working-directory: cli
         run: node test/zipp-limits.mjs
+      # PR5: the leaf-script command (`oaiy script --request`, `--serve` and its
+      # watchdog/recycle policy, `run --profile`) and the standalone CLI release
+      # asset builder release.yml calls (inner SHA256SUMS, oaiy-cli.json).
+      - name: ZIPP script command — envelope, --serve protocol, run --profile
+        working-directory: cli
+        run: node test/zipp-script.mjs
+      - name: CLI release asset — pack-cli-asset builds from a copy and verifies
+        working-directory: cli
+        run: node test/cli-asset.mjs
 
   desktop:
     name: Desktop Vitest + native tests (${{ matrix.label }})
