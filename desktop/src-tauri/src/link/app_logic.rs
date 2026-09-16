@@ -587,7 +587,7 @@ pub fn handle_event(
             "event": envelope,
             "storage": seen,
         });
-        let results = match run_scripts(&scripts, &ctx, node) {
+        let results = match run_scripts(&scripts, &ctx, node, spec.instruction_budget) {
             Ok(r) => r,
             Err(e) => {
                 out.push(Outcome::err(app, "-", "lane", e));
@@ -680,6 +680,7 @@ fn run_scripts(
     scripts: &[ScriptRef],
     ctx: &Value,
     node: Option<&crate::services::node_runtime::NodeHandle>,
+    instruction_budget: Option<u64>,
 ) -> Result<Vec<Result<Value, String>>, String> {
     let graph = build_graph(scripts, ctx)?;
 
@@ -697,7 +698,7 @@ fn run_scripts(
     let _ = std::fs::remove_dir_all(&scratch);
     std::fs::create_dir_all(&scratch)
         .map_err(|e| format!("could not create a working directory for the scripts: {e}"))?;
-    let result = run_graph_in(&scratch, &graph, scripts.len(), node);
+    let result = run_graph_in(&scratch, &graph, scripts.len(), node, instruction_budget);
     let _ = std::fs::remove_dir_all(&scratch);
     result
 }
@@ -734,6 +735,7 @@ fn run_graph_in(
     graph: &Value,
     count: usize,
     node: Option<&crate::services::node_runtime::NodeHandle>,
+    instruction_budget: Option<u64>,
 ) -> Result<Vec<Result<Value, String>>, String> {
     let graph_path = scratch.join("graph.json");
     let inputs_path = scratch.join("inputs.json");
@@ -754,6 +756,8 @@ fn run_graph_in(
             // performed out here, by this module, against the linked account.
             connector_path: None,
             timeout: RUN_TIMEOUT,
+            // The provider's policy, from its descriptor: it sized its scripts.
+            instruction_budget,
             node,
         },
         // Nothing cancels an event's scripts; the budget does.
@@ -2162,30 +2166,110 @@ mod tests {
 
     // --- against the real runner -------------------------------------------
 
+    /// Where `desktop/scripts/sync-cli.mjs` stages the CLI and its engine.
+    fn staged_cli_dir() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources").join("cli")
+    }
+
     /// The bundled CLI, if this checkout has one staged, and a Node to run it.
     ///
-    /// Skipped rather than failed when either is missing: the test below is
-    /// about whether the generated graph SURVIVES the real compiler, and a box
-    /// without Node cannot answer that either way.
+    /// Skipped rather than failed when either is missing ON A DEV BOX: the
+    /// tests below are about whether the generated graph SURVIVES the real
+    /// compiler, and a box without Node cannot answer that either way. Under
+    /// CI the skip is a failure — see `require_staged`.
     fn staged_runner() -> Option<(PathBuf, PathBuf)> {
-        let cli = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("resources")
-            .join("cli")
-            .join("oaiy.mjs");
-        if !cli.is_file() {
-            return None;
+        let cli = staged_cli_dir().join("oaiy.mjs");
+        let found = (|| {
+            if !cli.is_file() {
+                return None;
+            }
+            let finder = if cfg!(windows) { "where" } else { "which" };
+            let out = std::process::Command::new(finder).arg("node").output().ok()?;
+            if !out.status.success() {
+                return None;
+            }
+            let node = String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .map(str::trim)
+                .find(|l| !l.is_empty())
+                .map(PathBuf::from)?;
+            Some((node, cli))
+        })();
+        require_staged(found, std::env::var_os("CI").is_some())
+    }
+
+    /// Under CI, "nothing staged" is a broken pipeline, not a box without Node:
+    /// ci.yml stages the CLI (sync-cli) and puts node on PATH before cargo
+    /// test, so a `None` there means the steps were reordered or the staging
+    /// silently stopped — and the one test that proves the scripts run on the
+    /// real runner would have quietly become a no-op.
+    fn require_staged<T>(found: Option<T>, ci: bool) -> Option<T> {
+        if found.is_none() && ci {
+            panic!(
+                "CI must stage the CLI (node desktop/scripts/sync-cli.mjs) and have node on PATH before cargo test"
+            );
         }
-        let finder = if cfg!(windows) { "where" } else { "which" };
-        let out = std::process::Command::new(finder).arg("node").output().ok()?;
-        if !out.status.success() {
-            return None;
+        found
+    }
+
+    #[test]
+    #[should_panic(expected = "CI must stage the CLI")]
+    fn under_ci_an_unstaged_cli_fails_the_suite_instead_of_skipping() {
+        require_staged::<()>(None, true);
+    }
+
+    #[test]
+    fn on_a_dev_box_an_unstaged_cli_is_a_skip() {
+        assert!(require_staged::<()>(None, false).is_none());
+        assert_eq!(require_staged(Some(1), true), Some(1));
+    }
+
+    #[test]
+    fn the_staged_cli_ships_its_engine_and_the_engine_is_the_one_the_bundle_was_built_for() {
+        // What `sync-cli.mjs` stages, checked from the Rust side: the bundle,
+        // the worker shell it spawns, and the five engine files — with the wasm
+        // matching the staged SOURCE.json's digest, the notices matching theirs,
+        // and the bundle carrying that digest (the define esbuild baked in).
+        // Every digest here is READ from the staged record; none is written
+        // down. A desktop that fails this ships a CLI that resolves and then
+        // fails every run `engine_unavailable`.
+        use sha2::{Digest, Sha256};
+        if staged_runner().is_none() {
+            eprintln!("no staged CLI or no Node on this machine — skipping");
+            return;
         }
-        let node = String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .map(str::trim)
-            .find(|l| !l.is_empty())
-            .map(PathBuf::from)?;
-        Some((node, cli))
+        let dir = staged_cli_dir();
+        for rel in [
+            "oaiy.mjs",
+            "oaiy-zipp-worker.mjs",
+            "zipp/zipp_wasm_bg.wasm",
+            "zipp/PROFILE.json",
+            "zipp/SOURCE.json",
+            "zipp/LICENSE-APACHE",
+            "zipp/THIRD_PARTY_LICENSES.txt",
+        ] {
+            assert!(dir.join(rel).is_file(), "staged CLI is missing {rel}");
+        }
+        let source: Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("zipp/SOURCE.json")).unwrap()).unwrap();
+        let recorded = source["sha256"].as_str().expect("SOURCE.json records the wasm sha256");
+        assert_eq!(recorded.len(), 64);
+        let hex = |bytes: &[u8]| format!("{:x}", Sha256::digest(bytes));
+        let wasm = std::fs::read(dir.join("zipp/zipp_wasm_bg.wasm")).unwrap();
+        assert_eq!(hex(&wasm), recorded, "the staged wasm is not the one its SOURCE.json records");
+        let notices_name = source["notices"]["file"].as_str().unwrap_or("THIRD_PARTY_LICENSES.txt");
+        let notices = std::fs::read(dir.join("zipp").join(notices_name)).unwrap();
+        assert_eq!(
+            hex(&notices),
+            source["notices"]["sha256"].as_str().expect("SOURCE.json records the notices sha256"),
+            "the staged notices are not the ones SOURCE.json records"
+        );
+        let bundle = std::fs::read_to_string(dir.join("oaiy.mjs")).unwrap();
+        assert!(
+            bundle.contains(recorded),
+            "the staged oaiy.mjs was not built for the staged engine (it does not carry its wasm digest)"
+        );
+        assert_eq!(source["release"].as_str().map(|r| r.starts_with('v')), Some(true), "{}", source["release"]);
     }
 
     #[test]
@@ -2216,15 +2300,23 @@ mod tests {
             { "id": "after-the-throw", "hook": "onConnectorEvent", "source":
               "function run(ctx) { return { effects: [{ type: 'ui.toast', message: 'still here' }] }; }" },
             { "id": "unboxable", "hook": "onConnectorEvent", "source":
-              "function run(ctx) { return { effects: [{ type: 'formlogic.submitResponse', formKey: 'f', answers: { text: 'body', url: 'https://example.test' } }] }; }" }
+              "function run(ctx) { return { effects: [{ type: 'formlogic.submitResponse', formKey: 'f', answers: { text: 'body', url: 'https://example.test' } }] }; }" },
+            { "id": "no-host", "hook": "onConnectorEvent", "source":
+              "function run(ctx) { return { host: typeof process }; }" }
         ]);
         // Through the same reader the lane uses, so this really is the graph an
         // event would build.
         let app = AppEntry(json!({ "app": { "id": "app-1" }, "customLogic": { "scripts": raw } }));
         let s = spec();
         let refs = app.event_scripts(&s.catalogue, &s.event_hook);
-        assert_eq!(refs.len(), 6, "every script here runs on the event hook");
+        assert_eq!(refs.len(), 7, "every script here runs on the event hook");
 
+        // Through the SAME spawn path the lane uses — the engine probe, the
+        // hardened child, the payload read — with the staged CLI handed in
+        // directly (OAIY_CLI is process-global, and under cargo test the
+        // bundled lookup never reaches src-tauri/resources). This is the one
+        // test that proves the probe accepts the CLI this desktop ships and the
+        // payload it writes is read as a result.
         let run = |ctx: Value| -> Vec<Result<Value, String>> {
             let dir = std::env::temp_dir().join(format!(
                 "oaiy-app-logic-e2e-{}-{}",
@@ -2234,28 +2326,32 @@ mod tests {
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).unwrap();
             let graph = build_graph(&refs, &ctx).unwrap();
-            std::fs::write(dir.join("graph.json"), graph.to_string()).unwrap();
-            std::fs::write(dir.join("inputs.json"), "{}").unwrap();
-            let status = std::process::Command::new(&node)
-                .arg(&cli)
-                .arg("run")
-                .arg(dir.join("graph.json"))
-                .arg("--inputs")
-                .arg(dir.join("inputs.json"))
-                .arg("-o")
-                .arg(dir.join("result.json"))
-                .arg("--timeout")
-                .arg("60")
-                .arg("--quiet")
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .expect("the runner must start");
-            let report: Value = std::fs::read_to_string(dir.join("result.json"))
-                .ok()
-                .and_then(|b| serde_json::from_str(&b).ok())
-                .unwrap_or_else(|| panic!("the runner wrote no readable result (exit {status})"));
+            let graph_path = dir.join("graph.json");
+            let inputs_path = dir.join("inputs.json");
+            let out_path = dir.join("result.json");
+            std::fs::write(&graph_path, graph.to_string()).unwrap();
+            std::fs::write(&inputs_path, "{}").unwrap();
+            let outcome = crate::bridge::worker::run_flow_cli_with(
+                &crate::bridge::worker::CliInvocation::Node { script: cli.clone() },
+                Some(&node),
+                CliRequest {
+                    flow_path: &graph_path,
+                    inputs_path: &inputs_path,
+                    out_path: &out_path,
+                    connector_path: None,
+                    timeout: RUN_TIMEOUT,
+                    instruction_budget: spec().instruction_budget,
+                    node: None,
+                },
+                &|| false,
+            );
+            let report = match outcome {
+                CliOutcome::Succeeded(v) => v,
+                other => panic!("the staged CLI must be accepted and run the graph, got {other:?}"),
+            };
+            // The runner says what it ran on, and it is the engine this
+            // desktop ships — not the host's own JavaScript.
+            assert_eq!(report["engine"], "zipp", "{report}");
             let parsed = parse_report(&report, refs.len()).unwrap();
             let _ = std::fs::remove_dir_all(&dir);
             parsed
@@ -2299,6 +2395,10 @@ mod tests {
         let boxed = fresh[5].clone().unwrap();
         assert_eq!(boxed["effects"][0]["answers"]["text"], "body");
         assert_eq!(boxed["effects"][0]["answers"]["url"], "https://example.test");
+        // And the scripts ran inside the ZIPP VM: there is no Node `process`
+        // in the scope a script's `new Function` body sees. A runner that ran
+        // them on the host would answer "object" here.
+        assert_eq!(fresh[6].clone().unwrap()["host"], "undefined");
 
         // The dedup: the SAME event with the marker already stored does nothing
         // at all. Without this the storage file would be decoration and every

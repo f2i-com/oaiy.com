@@ -705,7 +705,13 @@ export const nodeRuntime = {
 export interface RuntimeStatus {
   ready: boolean;
   deviceId: string;
-  flowRuntime: { cliResolved: boolean; cliKind: string; detail?: string | null };
+  flowRuntime: {
+    cliResolved: boolean;
+    cliKind: string;
+    /** What the CLI runs flows on. `ready` only when it answered that it is ZIPP; `unknown` until it has been asked. */
+    engine?: { name: string | null; release: string | null; status: 'ready' | 'unavailable' | 'unknown'; reason?: string | null };
+    detail?: string | null;
+  };
   runs: { queued: number; known: number; failed?: number };
   nodeRuntime?: NodeSnapshot | null;
   plugins: { serving: number; total: number };

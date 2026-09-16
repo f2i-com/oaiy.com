@@ -172,6 +172,11 @@ pub struct AppLogicSpec {
     /// in terms this desktop can actually perform.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub effects: Vec<AppLogicEffectSpec>,
+    /// ZIPP instruction steps each script may spend, handed to the CLI as
+    /// `--instruction-budget`. The provider's policy, not this desktop's: it
+    /// sized its scripts. Absent means the engine's own default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instruction_budget: Option<u64>,
 }
 
 fn default_app_logic_scan() -> u32 {
@@ -401,6 +406,12 @@ pub struct FlowsSpec {
     /// list, whose runs then simply finish.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result_actions: Option<ResultActionsSpec>,
+    /// ZIPP instruction steps a flow's scripts may spend, handed to the CLI as
+    /// `--instruction-budget`. The provider's policy — it sized its flows for
+    /// its own runtime, and a run here must not be cut short on a smaller
+    /// budget it never chose. Absent means the engine's own default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instruction_budget: Option<u64>,
 }
 
 /// Actions a binding performs with a finished run's result.
@@ -771,6 +782,25 @@ fn default_heartbeat_interval() -> u64 {
     45
 }
 
+/// The engine's step ceiling, from the installed release's PROFILE.json
+/// (`limits.maxInstructionBudgetSteps`), which the CLI enforces on
+/// `--instruction-budget` and reports in `capabilities --json`.
+///
+/// Checked HERE because the CLI refuses an out-of-range value with exit 1 and
+/// no result file — every run of that lane would then fail `node_failed` with
+/// a stderr tail, and nothing would point at the one line in the descriptor
+/// that caused it.
+const MAX_INSTRUCTION_BUDGET_STEPS: u64 = 2_000_000_000;
+
+fn check_instruction_budget(id: &str, lane: &str, budget: Option<u64>) -> Result<(), String> {
+    match budget {
+        Some(n) if n == 0 || n > MAX_INSTRUCTION_BUDGET_STEPS => Err(format!(
+            "connector {id:?} {lane} instructionBudget {n} is out of range (1..{MAX_INSTRUCTION_BUDGET_STEPS} steps)"
+        )),
+        _ => Ok(()),
+    }
+}
+
 impl ConnectorDescriptor {
     fn validate(&self) -> Result<(), String> {
         if self.id.is_empty()
@@ -954,6 +984,7 @@ impl ConnectorDescriptor {
             }
         }
         if let Some(f) = &self.flows {
+            check_instruction_budget(&self.id, "flows", f.instruction_budget)?;
             for (label, path) in [
                 ("bindingsPath", &f.bindings_path),
                 ("reservePath", &f.reserve_path),
@@ -1037,6 +1068,7 @@ impl ConnectorDescriptor {
             }
         }
         if let Some(a) = &self.app_logic {
+            check_instruction_budget(&self.id, "appLogic", a.instruction_budget)?;
             for (label, path) in [
                 ("path", &a.path),
                 ("submitPath", &a.submit_path),
@@ -1254,6 +1286,48 @@ mod tests {
             o.token_response.credential_fields.iter().any(|f| f == "formlogic_api_key"),
             "the provider's own key field must be first-class"
         );
+    }
+
+    #[test]
+    fn the_shipped_provider_sets_the_engine_budget_for_both_lanes() {
+        // FormLogic policy, carried as data: its flows and app-logic scripts run
+        // with 200M ZIPP instruction steps, the figure its own host uses. Left
+        // out, the engine's 50M default would apply to a lane the provider
+        // sized for four times that.
+        let d = builtin().remove(0);
+        assert_eq!(d.flows.as_ref().unwrap().instruction_budget, Some(200_000_000));
+        assert_eq!(d.app_logic.as_ref().unwrap().instruction_budget, Some(200_000_000));
+    }
+
+    #[test]
+    fn an_instruction_budget_outside_the_engines_range_is_refused_here_not_at_run_time() {
+        // The CLI refuses an out-of-range `--instruction-budget` with exit 1 and
+        // NO result file, which would surface as `node_failed` with a stderr
+        // tail on every run. The descriptor is where the figure is written, so
+        // it is where the mistake is named.
+        for bad in [0u64, 2_000_000_001] {
+            let mut d: ConnectorDescriptor = serde_json::from_str(BUILTIN[0]).unwrap();
+            d.flows.as_mut().unwrap().instruction_budget = Some(bad);
+            let e = d.validate().expect_err("flows budget must be refused");
+            assert!(e.contains("instructionBudget"), "{e}");
+            assert!(e.contains(&bad.to_string()), "{e}");
+
+            let mut d: ConnectorDescriptor = serde_json::from_str(BUILTIN[0]).unwrap();
+            d.app_logic.as_mut().unwrap().instruction_budget = Some(bad);
+            let e = d.validate().expect_err("appLogic budget must be refused");
+            assert!(e.contains("instructionBudget"), "{e}");
+        }
+        for good in [1u64, 50_000_000, 2_000_000_000] {
+            let mut d: ConnectorDescriptor = serde_json::from_str(BUILTIN[0]).unwrap();
+            d.flows.as_mut().unwrap().instruction_budget = Some(good);
+            d.app_logic.as_mut().unwrap().instruction_budget = Some(good);
+            d.validate().unwrap();
+        }
+        // Absent is the engine's own default, and always valid.
+        let mut d: ConnectorDescriptor = serde_json::from_str(BUILTIN[0]).unwrap();
+        d.flows.as_mut().unwrap().instruction_budget = None;
+        d.app_logic.as_mut().unwrap().instruction_budget = None;
+        d.validate().unwrap();
     }
 
     #[test]

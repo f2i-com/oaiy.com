@@ -60,8 +60,10 @@ try {
   }
   await request('/api/bridge/flows/audit-smoke', {
     nodes: [
-      { id: 'value', type: 'logic_block', position: { x: 0, y: 0 }, data: { code: 'return { message: "audit-ok" };' } },
-      { id: 'out', type: 'output', position: { x: 100, y: 0 }, data: { value: '$nodes.value.message' } },
+      // `typeof process` is the smoke assertion for the engine: a flow on the
+      // ZIPP VM has no Node process object; a flow the host ran itself would.
+      { id: 'value', type: 'logic_block', position: { x: 0, y: 0 }, data: { code: 'return { message: "audit-ok", host: typeof process };' } },
+      { id: 'out', type: 'output', position: { x: 100, y: 0 }, data: { value: '$nodes.value' } },
     ], edges: [{ id: 'edge', source: 'value', target: 'out' }],
   }, 'PUT');
   const input = { protocol: 'oaiy-bridge/1', caller: { product: 'audit-smoke' }, flowId: 'audit-smoke',
@@ -72,11 +74,14 @@ try {
     run = await request(`/api/bridge/runs/${run.runId}`);
   }
   assert.equal(run.status, 'succeeded', JSON.stringify(run));
-  assert.equal(run.output.output, 'audit-ok', JSON.stringify(run.output));
+  // `run.output` is the CLI's whole payload; the flow's own answer is its `output`.
+  assert.equal(run.output.output.message, 'audit-ok', JSON.stringify(run.output));
+  assert.equal(run.output.output.host, 'undefined', `the flow ran outside the ZIPP VM: ${JSON.stringify(run.output)}`);
+  assert.equal(run.output.engine, 'zipp', JSON.stringify(run.output));
   const duplicate = await request('/api/bridge/runs', input);
   assert.equal(duplicate.runId, run.runId);
   assert.equal(duplicate.idempotent, true);
-  console.log('PASS: packaged Node discovery, authenticated HTTP, real CLI flow output, duplicate run recovery');
+  console.log('PASS: packaged Node discovery, authenticated HTTP, real CLI flow output on ZIPP (no process object), duplicate run recovery');
 } finally {
   const exited = once(child, 'exit');
   child.kill();

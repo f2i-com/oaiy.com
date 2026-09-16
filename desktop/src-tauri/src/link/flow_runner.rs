@@ -629,6 +629,8 @@ fn run_in(
             out_path: &out_path,
             connector_path: Some(&connector_path),
             timeout: RUN_TIMEOUT,
+            // The provider's policy, from its descriptor: it sized its flows.
+            instruction_budget: spec.instruction_budget,
             node,
         },
         // Nothing cancels a provider's run from this side; the budget does.
@@ -1264,6 +1266,7 @@ mod tests {
             selectors: None,
             input_map_field: None,
             result_actions: None,
+            instruction_budget: None,
         };
         assert!(Lane::of(&spec).is_none());
 
@@ -1378,6 +1381,7 @@ mod tests {
             selectors: None,
             input_map_field: None,
             result_actions: None,
+            instruction_budget: None,
         }
     }
 
