@@ -62,6 +62,14 @@
  * prologue position, the shadow `var`s become function-scoped again, the module
  * `let`s land in a fresh scope, and `host`/`console` become parameters we
  * supply. `buildZippScript` is that wrapper.
+ *
+ * One thing is deliberately left OUTSIDE it for trusted flows: the guest shims
+ * (`ZIPP_GUEST_SHIMS`). A body compiled at run time — `Function(...)`, an
+ * indirect eval, the Desktop's app-logic wrapper — evaluates at the guest's
+ * global scope and never sees a `var` inside the IIFE; at program top level the
+ * same `var setTimeout` overwrites Zipp's intrinsic, which the executor tests
+ * establish against both installed engines. Hardened flows keep the shims
+ * inside, so a recovered global there stays empty.
  */
 
 /** The subset of Zipp's `Engine` this module drives. */
@@ -174,8 +182,14 @@ const KIND_CONSOLE = '__system.console';
 export function buildZippScript(fullScript: string, hardened: boolean): string {
   const strict = hardened ? `'use strict';\n` : '';
   const thisArg = hardened ? 'Object.create(null)' : 'undefined';
+  // Trusted: the shims are program-level `var`s, so a `Function(...)` body the
+  // flow compiles at run time reaches the stubs, not Zipp's own `setTimeout`.
+  // Hardened: they stay inside the IIFE, where the shadow preamble that follows
+  // overrides them and a recovered global holds neither stub nor intrinsic.
+  const topLevelShims = hardened ? '' : `${ZIPP_GUEST_SHIMS}\n`;
+  const scopedShims = hardened ? `${ZIPP_GUEST_SHIMS}\n` : '';
 
-  return `var __oaiyConsole = {};
+  return `${topLevelShims}var __oaiyConsole = {};
 (function () {
   var levels = ${JSON.stringify(CONSOLE_LEVELS)};
   for (var i = 0; i < levels.length; i++) {
@@ -196,8 +210,7 @@ ${strict}// Zipp's synchronous host bridge. It is capability-denied by default (
 // embedder never calls setSyncHostCapabilities), so this only removes a
 // misleading affordance — but an untrusted script has no business seeing it.
 var __zippHostCall = undefined;
-${ZIPP_GUEST_SHIMS}
-${fullScript}
+${scopedShims}${fullScript}
 }).call(${thisArg}, host, __oaiyConsole);
 `;
 }
@@ -205,10 +218,14 @@ ${fullScript}
 /**
  * Host-realm APIs a code node might reach for, made safe inside the engine.
  *
- * Declared with `var` inside the wrapper's function scope, so they shadow
- * Zipp's intrinsics for the flow's code and are themselves overridden by
- * `HARDENED_SHADOW_PREAMBLE`'s `var x = undefined` when a package flow follows
- * — hardened flows keep exactly the surface they had.
+ * Declared with `var`. For a trusted flow they sit at program top level, where
+ * a `var` overwrites Zipp's intrinsic of the same name — so a body the flow
+ * compiles at run time (`Function(...)`, indirect eval, the Desktop's app-logic
+ * wrapper), which runs at global scope and cannot see the IIFE's bindings,
+ * still gets the stubs. For a hardened flow they sit inside the wrapper's
+ * function scope, where `HARDENED_SHADOW_PREAMBLE`'s `var x = undefined`
+ * overrides them and a recovered global stays empty — hardened flows keep
+ * exactly the surface they had.
  *
  * Two groups:
  *
@@ -216,11 +233,15 @@ ${fullScript}
  *     a structural clone, a microtask hook, a monotonic clock. Provided.
  *   * Anything needing the event loop or the network. Replaced by a function
  *     that throws a message naming the alternative, and NOT left as Zipp's
- *     own. This is load-bearing for timers: Zipp's `setTimeout` with a
- *     non-zero delay tries to sleep a thread that WebAssembly does not have,
- *     panics with "can't sleep", and takes the whole instance down as an
- *     unrecoverable trap. A trusted flow gets no shadow preamble, so without
- *     this one stray `setTimeout(fn, 100)` in a code node would kill its run.
+ *     own. This is load-bearing for timers: `ZippSession` pumps host calls,
+ *     not Zipp's timer queue, so a callback handed to Zipp's own `setTimeout`
+ *     never runs — measured on v0.0.18 (both installs) the call returns
+ *     `undefined`, the callback never fires and the run completes as if the
+ *     timer had been honoured. (An earlier note here said a non-zero delay
+ *     panicked the instance with "can't sleep"; that is not what v0.0.18 does
+ *     through this session.) A trusted flow gets no shadow preamble, so
+ *     without this one stray `setTimeout(fn, 100)` in a code node would
+ *     silently drop its work instead of saying so.
  *
  * `structuredClone` is a JSON round-trip: it handles the plain data flows
  * carry and documents what it drops. `crypto` is deliberately a throwing stub

@@ -72,7 +72,12 @@ one release, verified and installed by `../scripts/fetch-zipp-release.mjs`; the
 ZIPP executor and sets `requireScriptExecutor` last, so no option un-requires it,
 and there is no fallback to Node's own JavaScript. To flow code `process`,
 `require`, `Buffer` and `__TAURI__` are `undefined`; what it can do is what its
-nodes may ask the host for through brokered module calls.
+nodes may ask the host for through brokered module calls. Host-realm names a
+block might reach for — `setTimeout`, `fetch`, `crypto.randomUUID`, … — are
+stubs that throw a `TypeError` naming the alternative, and they are in force at
+the guest's global scope, so a body the block compiles itself (the Desktop's
+`new Function("ctx", …)` app-logic wrapper) gets the same answer; ZIPP's own
+`setTimeout` would return quietly and never fire.
 
 The build (`esbuild.mjs`) checks the installed release, bakes its identity and
 two `PROFILE.json` figures in as defines, stages the `.wasm` and notices to
