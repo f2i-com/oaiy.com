@@ -222,13 +222,38 @@ impl EngineProbe {
     }
 }
 
+/// A lower-case hex sha256, or not a digest at all.
+///
+/// The same rule `desktop/scripts/sync-cli-lib.mjs` already enforces on the
+/// staging side (`/^[0-9a-f]{64}$/`), so both ends of the chain agree on what a
+/// digest is rather than one end trusting whatever the other wrote.
+fn is_hex64(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// The head of a digest, for a log line.
+///
+/// `get`, not `[..12]`: a byte range bounded by `min` bounds the LENGTH, not a
+/// UTF-8 character boundary, so a digest with a multi-byte character in it
+/// panicked the thread that took the probe — the bridge's run loop, or the
+/// warm-up, which then left readiness stuck (see [`ClearOnDrop`]). Logging is
+/// never worth a panic, whatever [`is_hex64`] has already refused upstream.
+fn short_digest(sha: &str) -> &str {
+    sha.get(..12).unwrap_or(sha)
+}
+
 /// Read a `capabilities --json` report. Pure, so the shape is pinned without a
 /// process.
 ///
 /// Requires `protocols.run == 1` (the payload shape this file reads),
-/// `engine.name == "zipp"` and `engine.status == "ready"`. An unavailable
-/// engine's `engine.reason` is the error, verbatim: it is the CLI's own account
-/// of what is wrong with its staged artifact, which is what the user needs.
+/// `engine.name == "zipp"`, `engine.status == "ready"` and an
+/// `engine.wasmSha256` that IS a sha256. An unavailable engine's
+/// `engine.reason` is the error, verbatim: it is the CLI's own account of what
+/// is wrong with its staged artifact, which is what the user needs.
+///
+/// The digest is checked here and nowhere else, so everything downstream — the
+/// heartbeat, the script host's identity match, the log line — has 64 hex
+/// characters or has nothing.
 pub fn parse_capabilities(v: &Value) -> Result<EngineIdentity, String> {
     let run_protocol = v.pointer("/protocols/run").and_then(Value::as_u64);
     if run_protocol != Some(1) {
@@ -260,6 +285,17 @@ pub fn parse_capabilities(v: &Value) -> Result<EngineIdentity, String> {
         }
         None => return Err("the CLI's capabilities report gives its engine no status".to_string()),
     }
+    let wasm_sha256 = text("wasmSha256").unwrap_or_default();
+    if !is_hex64(&wasm_sha256) {
+        return Err(format!(
+            "the CLI names its engine digest {}, which is not a sha256",
+            if wasm_sha256.is_empty() {
+                "nowhere".to_string()
+            } else {
+                format!("{wasm_sha256:?}")
+            }
+        ));
+    }
     let run_languages = v
         .pointer("/run/languages")
         .and_then(Value::as_array)
@@ -279,7 +315,7 @@ pub fn parse_capabilities(v: &Value) -> Result<EngineIdentity, String> {
         release: text("release").unwrap_or_default(),
         version: text("version").unwrap_or_default(),
         revision: text("revision").unwrap_or_default(),
-        wasm_sha256: text("wasmSha256").unwrap_or_default(),
+        wasm_sha256,
         run_languages,
         protocols,
     })
@@ -290,7 +326,8 @@ pub fn parse_capabilities(v: &Value) -> Result<EngineIdentity, String> {
 pub(crate) const PROBE_DEADLINE: Duration = Duration::from_secs(15);
 /// How long a refusal is remembered before the CLI is asked again, so a fixed
 /// install recovers without a restart. A `Ready` answer is kept until the CLI
-/// file itself changes.
+/// file itself changes, or until a RUN finds the engine gone
+/// ([`remember_run_refusal`]) — after which this TTL governs its recovery too.
 const PROBE_TTL: Duration = Duration::from_secs(60);
 
 /// Start `<cli> …` the way a run does: through the resolved Node when the CLI
@@ -468,12 +505,31 @@ static PROBE: Mutex<Option<ProbeEntry>> = Mutex::new(None);
 /// at most one.
 static PROBING: AtomicBool = AtomicBool::new(false);
 
+/// Clears an [`AtomicBool`] however the scope ends, a panic included.
+///
+/// [`warm_engine_probe`] used to clear [`PROBING`] on the line after the probe
+/// returned. Nothing else ever clears it, so a panic on that thread — and one
+/// was reachable, see [`short_digest`] — left it set for the life of the
+/// process: the readiness endpoint would never start another warm-up and would
+/// answer `unknown` until the desktop was restarted.
+struct ClearOnDrop<'a>(&'a AtomicBool);
+
+impl Drop for ClearOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 /// Whether a remembered answer still stands for `key` at `now`.
 ///
 /// `Ready` is reused for as long as the key matches — the CLI is a file that
 /// does not change while the process runs, short of a reinstall, which
 /// changes its mtime and so the key. A refusal is reused for [`PROBE_TTL`]
 /// only, so an install fixed underneath a running desktop recovers on its own.
+///
+/// A `Ready` entry can also be REPLACED by a refusal without the key changing:
+/// [`remember_run_refusal`] does that when a run reports the engine gone. The
+/// key is the CLI file, and the engine is not the CLI file.
 fn reusable(entry: Option<&ProbeEntry>, key: &ProbeKey, now: Instant) -> Option<EngineProbe> {
     let entry = entry?;
     if entry.key != *key {
@@ -485,6 +541,51 @@ fn reusable(entry: Option<&ProbeEntry>, key: &ProbeKey, now: Instant) -> Option<
             Some(entry.probe.clone())
         }
         EngineProbe::Unavailable { .. } => None,
+    }
+}
+
+/// Replace whatever is remembered with what a RUN just found.
+///
+/// Pure, so the rule is pinned without the process-global cache or a child
+/// process. `now` becomes the entry's age, so [`PROBE_TTL`] governs recovery
+/// from here exactly as it does for a probe's own refusal.
+fn remember_run_refusal(
+    cache: &mut Option<ProbeEntry>,
+    key: ProbeKey,
+    reason: String,
+    now: Instant,
+) {
+    *cache = Some(ProbeEntry {
+        key,
+        at: now,
+        probe: EngineProbe::Unavailable { reason },
+    });
+}
+
+/// Record, against the process-global cache, that a run of `cli` found the
+/// engine unavailable.
+///
+/// A run is the strongest evidence there is about an engine: it just tried to
+/// use it. Until this existed, a `Ready` probe stood for the life of the
+/// process — the cache key is the CLI FILE's mtime, and the engine is not the
+/// CLI file. Delete, quarantine or half-replace the staged wasm under an
+/// `oaiy.mjs` whose mtime never moved and every run failed
+/// `runtime_unavailable` while `/api/bridge/status` kept answering
+/// `ready: true` and Overview stayed silent — the exact lie the readiness
+/// comment in `routes.rs` says it prevents. Same for an `OAIY_CLI` override
+/// whose engine folder breaks after the first probe.
+///
+/// Only a run's own answer comes here. A refusal the PROBE made is already
+/// remembered, and re-stamping it would keep pushing its TTL out and stop a
+/// fixed install from recovering.
+fn note_run_found_engine_unavailable(
+    cli: &CliInvocation,
+    node_exe: Option<&Path>,
+    reason: String,
+) {
+    let key = ProbeKey::of(cli, node_exe);
+    if let Ok(mut cache) = PROBE.lock() {
+        remember_run_refusal(&mut cache, key, reason, Instant::now());
     }
 }
 
@@ -504,7 +605,7 @@ pub fn engine_probe(cli: &CliInvocation, node_exe: Option<&Path>) -> EngineProbe
             "the OAIY CLI at {} runs user logic on ZIPP {} ({})",
             cli.path().display(),
             id.release,
-            &id.wasm_sha256[..id.wasm_sha256.len().min(12)]
+            short_digest(&id.wasm_sha256)
         ),
         EngineProbe::Unavailable { reason } => log::warn!(
             "the OAIY CLI at {} does not run user logic on ZIPP: {reason}",
@@ -543,8 +644,10 @@ pub fn warm_engine_probe(cli: CliInvocation, node_exe: Option<PathBuf>) {
         return;
     }
     thread::spawn(move || {
+        // Cleared by the guard, not by the next line: a probe that panics must
+        // not take readiness down with it for the life of the process.
+        let _clear = ClearOnDrop(&PROBING);
         let _ = engine_probe(&cli, node_exe.as_deref());
-        PROBING.store(false, Ordering::Release);
     });
 }
 
@@ -1131,7 +1234,21 @@ pub fn run_flow_cli_with(
                 st.code().unwrap_or(-1)
             );
         }
-        return classify_result(v);
+        let outcome = classify_result(v);
+        // What the run found outranks what the probe remembered. Every
+        // `Unavailable` arm of `classify_result` means the CLI is not the
+        // runner the probe said it was — a missing engine, or a payload from
+        // some other one — so readiness stops saying `ready` for it instead of
+        // saying so until the process restarts.
+        //
+        // The MESSAGE alone is the reason: for `engine_unavailable` it is the
+        // CLI's own account of what is wrong with its artifact, and `detail` is
+        // `engine_fix_hint()`, which every reader of this reason already
+        // appends for itself.
+        if let CliOutcome::Unavailable { message, .. } = &outcome {
+            note_run_found_engine_unavailable(cli, node_exe, message.clone());
+        }
+        return outcome;
     }
 
     if st.success() {
@@ -1507,6 +1624,132 @@ mod tests {
     }
 
     #[test]
+    fn a_digest_that_is_not_a_sha256_is_not_a_capabilities_report() {
+        // Item 2: `wasm_sha256` was copied out of the report with no check at
+        // all, and then byte-sliced for a log line. `.min(12)` bounds the
+        // LENGTH, not a UTF-8 character boundary, so a multi-byte digest
+        // panicked whichever thread took the probe. It is refused here instead,
+        // by the same rule `desktop/scripts/sync-cli-lib.mjs` already applies
+        // on the staging side.
+        for (label, sha) in [
+            ("a multi-byte digest — the one that panicked", "\u{e9}".repeat(32)),
+            ("upper case", "AB".repeat(32)),
+            ("too short", "ab".repeat(31)),
+            ("too long", "ab".repeat(33)),
+            ("not hex", "zz".repeat(32)),
+            ("empty", String::new()),
+        ] {
+            let mut v = good_capabilities();
+            v["engine"]["wasmSha256"] = json!(sha);
+            let e = match parse_capabilities(&v) {
+                Err(e) => e,
+                Ok(id) => panic!("{label}: {sha:?} must not pass as a digest, got {id:?}"),
+            };
+            assert!(e.contains("not a sha256"), "{label}: {e}");
+        }
+        let mut v = good_capabilities();
+        v["engine"]["wasmSha256"] = Value::Null;
+        assert!(parse_capabilities(&v).is_err(), "no digest is not a digest");
+    }
+
+    #[test]
+    fn a_log_line_never_panics_on_a_digest_whatever_is_in_it() {
+        // Belt as well as braces: `parse_capabilities` refuses these now, and
+        // the head taken for the log line still must not split a character.
+        assert_eq!(short_digest(&"ab".repeat(32)), "abababababab");
+        assert_eq!(short_digest("abc"), "abc");
+        assert_eq!(short_digest(""), "");
+        // Byte 12 lands INSIDE the sixth two-byte character here (1 + 2×5 = 11),
+        // which is what `&s[..s.len().min(12)]` panics on and `get` does not.
+        // A digest of `"é".repeat(32)` ALONE would not catch it — 12 is a
+        // boundary there, so the old slice would look sound while still being a
+        // byte range.
+        let multibyte = format!("a{}", "é".repeat(32));
+        assert!(!multibyte.is_char_boundary(12), "the fixture must straddle a character");
+        // `get` answers None for a range that is not a boundary, so the whole
+        // string is logged: long, and never a panic, which is the point.
+        assert_eq!(short_digest(&multibyte), multibyte);
+    }
+
+    #[test]
+    fn a_panicking_probe_still_lets_the_next_warm_up_start() {
+        // Item 8: `PROBING` was cleared on the line AFTER the probe returned,
+        // so a panic inside it (item 2's was reachable) left the flag set for
+        // the life of the process — nothing else clears it, and the readiness
+        // endpoint would answer `unknown` for ever. Tested against a LOCAL
+        // flag, never the process-global one: cargo runs these in parallel.
+        //
+        // The panic's own message reaching stderr is expected. The hook is not
+        // swapped for a quiet one, because it is global and a test running
+        // beside this one would lose its own.
+        let flag = AtomicBool::new(true);
+        let died = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _clear = ClearOnDrop(&flag);
+            panic!("the probe panicked on a digest");
+        }));
+        assert!(died.is_err(), "the probe must actually have panicked");
+        assert!(
+            !flag.load(Ordering::Acquire),
+            "a panic past the guard left PROBING set: readiness would stay unknown until restart"
+        );
+        // And the ordinary path still clears it.
+        flag.store(true, Ordering::Release);
+        {
+            let _clear = ClearOnDrop(&flag);
+        }
+        assert!(!flag.load(Ordering::Acquire), "the guard clears it on an ordinary return too");
+    }
+
+    #[test]
+    fn a_run_that_finds_the_engine_gone_replaces_the_ready_probe() {
+        // Item 1: a `Ready` entry has no TTL and `classify_result` never
+        // touched the cache, so ONE good probe made readiness say `ready:true`
+        // for the life of the process. Delete the staged wasm while `oaiy.mjs`
+        // keeps its mtime and the key still matches: every run failed
+        // `runtime_unavailable` and `/api/bridge/status` said nothing.
+        let key = ProbeKey {
+            cli: CliInvocation::Node { script: PathBuf::from("oaiy.mjs") },
+            modified: None,
+            node_exe: None,
+        };
+        let now = Instant::now();
+        let mut cache = Some(ProbeEntry {
+            key: key.clone(),
+            at: now,
+            probe: EngineProbe::Ready(parse_capabilities(&good_capabilities()).unwrap()),
+        });
+        assert!(
+            reusable(cache.as_ref(), &key, now + PROBE_TTL * 10).unwrap().is_ready(),
+            "a Ready probe stands while the CLI file is unchanged — that part is right"
+        );
+
+        // A run comes back with the CLI's own `engine_unavailable` payload.
+        let outcome = classify_result(json!({
+            "success": false,
+            "engine": "zipp",
+            "errorCode": "engine_unavailable",
+            "error": "zipp/zipp_wasm_bg.wasm is missing",
+        }));
+        let CliOutcome::Unavailable { message, .. } = &outcome else {
+            panic!("engine_unavailable must be Unavailable, got {outcome:?}")
+        };
+        remember_run_refusal(&mut cache, key.clone(), message.clone(), now);
+
+        match reusable(cache.as_ref(), &key, now) {
+            Some(EngineProbe::Unavailable { reason }) => {
+                assert!(reason.contains("zipp_wasm_bg.wasm is missing"), "{reason}")
+            }
+            other => panic!("readiness must stop saying ready, got {other:?}"),
+        }
+        // And the existing TTL governs recovery, so an install fixed underneath
+        // a running desktop still comes back on its own.
+        assert!(
+            reusable(cache.as_ref(), &key, now + PROBE_TTL).is_none(),
+            "after the TTL the CLI is asked again"
+        );
+    }
+
+    #[test]
     fn an_engine_that_is_not_zipp_is_refused_by_name() {
         let mut v = good_capabilities();
         v["engine"]["name"] = json!("v8");
@@ -1811,6 +2054,67 @@ mod tests {
             other => panic!("a v8 CLI must be refused, got {other:?}"),
         }
         assert!(!dir.join("result.json").exists(), "the flow must never have been handed to the stub");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_run_that_reports_engine_unavailable_stops_readiness_saying_ready() {
+        // Item 1, through the real process boundary: the stub's
+        // `capabilities --json` is a READY ZIPP engine, so the probe caches
+        // `Ready` — and then its `run` writes the payload a CLI writes when its
+        // staged wasm has gone. Before this, that cached `Ready` stood for the
+        // life of the process and `/api/bridge/status` kept answering
+        // `ready: true` over an install where every run failed.
+        let Some(node) = node_on_path() else {
+            eprintln!("no node on PATH — skipping");
+            return;
+        };
+        let (dir, script) = stub_cli(
+            "gone",
+            &good_capabilities(),
+            &json!({
+                "success": false,
+                "status": "failed",
+                "engine": "zipp",
+                "errorCode": "engine_unavailable",
+                "error": "zipp/zipp_wasm_bg.wasm is missing",
+            }),
+        );
+        let cli = CliInvocation::Node { script: script.clone() };
+
+        // `PROBE` is one process-global slot and cargo runs tests in parallel,
+        // so another test's probe can evict this entry between the run and the
+        // read. That shows up as `None` — a key mismatch — never as a stale
+        // `Ready`, so retrying settles it while the assertion that matters
+        // holds on every attempt.
+        let mut seen = None;
+        for _ in 0..3 {
+            let outcome = run_stub(&dir, script.clone(), &node);
+            match &outcome {
+                CliOutcome::Unavailable { message, retryable, .. } => {
+                    assert!(message.contains("zipp_wasm_bg.wasm is missing"), "{message}");
+                    assert!(!*retryable, "the same CLI would write the same payload");
+                }
+                other => panic!("an engine_unavailable payload must be Unavailable, got {other:?}"),
+            }
+            match cached_engine_probe(&cli, Some(&node)) {
+                Some(EngineProbe::Ready(id)) => panic!(
+                    "readiness still says ready after a run found the engine gone: {id:?}"
+                ),
+                Some(p @ EngineProbe::Unavailable { .. }) => {
+                    seen = Some(p);
+                    break;
+                }
+                // Evicted by a parallel test's probe; ask again.
+                None => continue,
+            }
+        }
+        match seen {
+            Some(EngineProbe::Unavailable { reason }) => {
+                assert!(reason.contains("zipp_wasm_bg.wasm is missing"), "{reason}")
+            }
+            other => panic!("the run's own reason must be what readiness reports, got {other:?}"),
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

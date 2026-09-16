@@ -1,7 +1,22 @@
 // A tripwire on every way this process could turn a string into code:
 // `Function` (called or constructed, directly or through the constructor of an
-// async, generator or async-generator function), indirect `eval`, and the
-// `node:vm` compilers. Loaded ahead of the program with
+// async, generator or async-generator function), indirect `eval`, the
+// `node:vm` compilers, a `worker_threads` Worker asked to run a STRING
+// (`{ eval: true }`), and `process.binding` / `process._linkedBinding` /
+// `internalBinding`, which reach `contextify` under the public API.
+//
+// The last three were a review's finding: a proxy on `Function` and `eval`
+// sees anything that RESOLVES to them, but a Worker with `eval: true` compiles
+// its source in another thread that this process never asks `Function` for,
+// and `process.binding('contextify')` hands back the compiler itself. Guard A
+// flags all three in the bytes; this catches them if they ever run.
+//
+// `import('data:…')` is the one that stays uncovered here: a data: module is
+// compiled by the loader, in C++, with no JS entry point to proxy. Guard A
+// (test/no-host-eval.mjs) is the control for it, and `--experimental-loader`
+// was not worth a permanent hook in a guard. Stated rather than implied.
+//
+// Loaded ahead of the program with
 //
 //     node --import <this file> dist/oaiy.mjs run <flow> …
 //
@@ -22,7 +37,7 @@
 // loads, engine or no engine, so counting it would tell the guard nothing.
 import vm from 'node:vm';
 import { syncBuiltinESMExports } from 'node:module';
-import { threadId } from 'node:worker_threads';
+import workerThreads, { threadId } from 'node:worker_threads';
 
 export const MARK = '__host_eval_tripwire__';
 const LOGGER_PROBE = 'try { return import.meta } catch(e) { return undefined }';
@@ -83,7 +98,44 @@ for (const name of ['runInThisContext', 'runInContext', 'runInNewContext', 'comp
   };
 }
 vm.Script = trip('vm.Script', vm.Script);
+
+// --- worker_threads: a Worker whose source is a STRING ----------------------
+// Only `{ eval: true }` is recorded. The CLI spawns its own ZIPP and script
+// workers through this same constructor, by path, and those are not host code
+// compilation — recording them would make the canary's "0 calls" meaningless.
+// `Reflect.construct` with `newTarget`, so a subclass of Worker still works.
+{
+  const RealWorker = workerThreads.Worker;
+  workerThreads.Worker = new Proxy(RealWorker, {
+    construct(target, args, newTarget) {
+      if (args[1] && typeof args[1] === 'object' && args[1].eval === true) {
+        record('new Worker({ eval: true })', [String(args[0]).slice(0, 96)]);
+      }
+      return Reflect.construct(target, args, newTarget);
+    },
+  });
+}
 syncBuiltinESMExports();
+
+// --- process.binding: Node's own bindings, contextify among them ------------
+// Deprecated but present on Node 24. `internalBinding` is not reachable
+// without `--expose-internals`, so it is wrapped only if something has put it
+// on the global — the gap is real and named here rather than papered over.
+for (const name of ['binding', '_linkedBinding']) {
+  const real = process[name];
+  if (typeof real !== 'function') continue;
+  process[name] = function (...args) {
+    record(`process.${name}()`, args);
+    return real.apply(this, args);
+  };
+}
+if (typeof globalThis.internalBinding === 'function') {
+  const realInternal = globalThis.internalBinding;
+  globalThis.internalBinding = function (...args) {
+    record('internalBinding()', args);
+    return realInternal.apply(this, args);
+  };
+}
 
 write('loaded', {});
 process.on('exit', () => write('summary', { count }));

@@ -45,7 +45,7 @@
  */
 import { version } from '../package.json';
 import { SCRIPT_MAX_BUDGET_MS } from 'oaiy-core/src/zipp-script';
-import { loadZippArtifact, zippEngineIdentity, type ZippEngineIdentity } from './zipp/artifact';
+import { EngineUnavailableError, loadZippArtifact, zippEngineIdentity, type ZippEngineIdentity } from './zipp/artifact';
 import { SCRIPT_DEFAULT_BUDGET_MS } from './zipp/script-host';
 
 export interface RunLimits {
@@ -63,6 +63,14 @@ export interface Capabilities {
 
 /** The two instruction-step figures the build recorded from PROFILE.json. */
 export function runLimits(): RunLimits {
+  // `typeof` first, as `artifact.ts` guards its own two defines: a bundle
+  // built outside `cli/esbuild.mjs` has no limits, and must SAY so rather than
+  // throw a bare ReferenceError from wherever it is first read.
+  if (typeof __ZIPP_RUN_LIMITS__ !== 'string') {
+    throw new EngineUnavailableError(
+      'ZIPP engine unavailable: this build recorded no run limits (not built by cli/esbuild.mjs)',
+    );
+  }
   const limits = JSON.parse(__ZIPP_RUN_LIMITS__) as Partial<RunLimits>;
   const figure = (n: unknown, name: string): number => {
     if (!Number.isInteger(n) || (n as number) < 1) {

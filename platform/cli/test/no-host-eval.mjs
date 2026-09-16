@@ -12,6 +12,36 @@
 // its browser Worker's bootstrap source is not a finding, and a call that is
 // one IS, however it is spelled or where it lands after bundling.
 //
+// "However it is spelled" was a claim this file did not keep. A review walked
+// twelve spellings past it, so it now also flags, by shape:
+//
+//   * ANY bare reference to `Function` or `eval` that is not the callee the
+//     rules above already judge — which is what catches `const F = Function`,
+//     `Reflect.construct(Function, …)`, ``Function`return 1` `` and the
+//     indirect `(0, eval)('1')`. All three bundles reference those two names
+//     in exactly two places, both allowlisted callees, so the rule costs
+//     nothing and a third reference is a finding;
+//   * ANY computed access on `globalThis`/`window`/`self`/`global`, because
+//     `globalThis['eval']` and `globalThis['Fun'+'ction']` are the same door
+//     with the handle moved. Zero in all three bundles today;
+//   * `.constructor.constructor` with either half written as a computed
+//     literal, and `.constructor` read off a CALL's result —
+//     `Object.getPrototypeOf(async function(){}).constructor` has no name to
+//     match on;
+//   * a dynamic `import()` whose specifier is not a string literal (so
+//     `import('node:' + 'vm')` cannot hide) or IS a `data:` URL (a module made
+//     of a string, which is `eval` with an import statement);
+//   * `new Worker(src, { eval: true })` — worker_threads' own way to run a
+//     string — flagged whenever an `eval` key is present at all. The CLI's own
+//     ZIPP worker spawns by path with no such key;
+//   * `process.binding` / `process._linkedBinding` / `internalBinding`, which
+//     reach Node's `contextify` bindings under the public API.
+//
+// The three the tripwire (Guard B) cannot see are the last three: a `data:`
+// import, a worker_threads `eval: true`, and `process.binding`. The rest are
+// belt as well as braces — B catches them at run time, A catches them in the
+// bytes — and none of the twelve appears anywhere in the sources.
+//
 // The allowlist is by the SHAPE of the call's arguments, never by a line in
 // the bundle (those move with every build):
 //
@@ -79,24 +109,85 @@ function namesFunction(callee) {
   return false;
 }
 
-/** `x.constructor.constructor` — a function constructor recovered from any function. */
-function isConstructorRecovery(node) {
-  return node.type === 'MemberExpression' && !node.computed && node.property.type === 'Identifier' &&
-    node.property.name === 'constructor' && node.object.type === 'MemberExpression' && !node.object.computed &&
-    node.object.property.type === 'Identifier' && node.object.property.name === 'constructor';
+/** The name a member expression reads, written either way: `.x` or `["x"]`. */
+function memberName(node) {
+  if (!node || node.type !== 'MemberExpression') return null;
+  if (node.computed) return node.property.type === 'Literal' ? String(node.property.value) : null;
+  return node.property.type === 'Identifier' ? node.property.name : null;
 }
 
-/** Walk every node of an acorn tree (no dependency on acorn-walk, which is not installed). */
-function walk(node, visit) {
+/** `Worker`, `threads.Worker`, `(await import('node:worker_threads')).Worker`. */
+function namesWorker(callee) {
+  if (callee.type === 'Identifier') return callee.name === 'Worker';
+  return memberName(callee) === 'Worker';
+}
+
+/** `x.constructor.constructor` — a function constructor recovered from any function. */
+function isConstructorRecovery(node) {
+  return memberName(node) === 'constructor' && memberName(node.object) === 'constructor';
+}
+
+/** `f(...).constructor` — the same recovery off a value with no name to match on. */
+function isCallResultConstructor(node) {
+  return node.type === 'MemberExpression' && memberName(node) === 'constructor' &&
+    node.object.type === 'CallExpression';
+}
+
+/** The global objects a computed lookup could pull any intrinsic out of. */
+const GLOBAL_OBJECTS = ['globalThis', 'window', 'self', 'global'];
+
+/**
+ * Whether this `Function`/`eval` identifier is a REFERENCE to the intrinsic,
+ * rather than a name that merely reads the same: a property (`x.Function`), an
+ * object key, a binding being declared, a parameter, an import/export
+ * specifier — or the callee the `CallExpression`/`NewExpression` rules already
+ * judge against the allowlist, which must not be reported twice.
+ */
+function isIntrinsicReference(node, parent) {
+  if (!parent) return false;
+  switch (parent.type) {
+    case 'MemberExpression':
+      return !(parent.property === node && !parent.computed);
+    case 'Property':
+      return !(parent.key === node && !parent.computed);
+    case 'CallExpression':
+    case 'NewExpression':
+      return parent.callee !== node;
+    case 'VariableDeclarator':
+      return parent.id !== node;
+    case 'FunctionDeclaration':
+    case 'FunctionExpression':
+    case 'ClassDeclaration':
+    case 'ClassExpression':
+      return parent.id !== node && !(parent.params ?? []).includes(node);
+    case 'ArrowFunctionExpression':
+      return !(parent.params ?? []).includes(node);
+    case 'ImportSpecifier':
+    case 'ImportDefaultSpecifier':
+    case 'ImportNamespaceSpecifier':
+    case 'ExportSpecifier':
+    case 'MethodDefinition':
+    case 'PropertyDefinition':
+    case 'LabeledStatement':
+    case 'BreakStatement':
+    case 'ContinueStatement':
+      return false;
+    default:
+      return true;
+  }
+}
+
+/** Walk every node of an acorn tree, with its parent (no dependency on acorn-walk, which is not installed). */
+function walk(node, visit, parent = null) {
   if (!node || typeof node.type !== 'string') return;
-  visit(node);
+  visit(node, parent);
   for (const key of Object.keys(node)) {
     if (key === 'loc' || key === 'type') continue;
     const child = node[key];
     if (Array.isArray(child)) {
-      for (const c of child) if (c && typeof c.type === 'string') walk(c, visit);
+      for (const c of child) if (c && typeof c.type === 'string') walk(c, visit, node);
     } else if (child && typeof child.type === 'string') {
-      walk(child, visit);
+      walk(child, visit, node);
     }
   }
 }
@@ -115,12 +206,14 @@ export function scan(source) {
     findings.push({ line, column, what, snippet: (lines[line - 1] ?? '').trim().slice(0, 120) });
   };
 
-  walk(tree, (node) => {
+  walk(tree, (node, parent) => {
     if (node.type === 'ImportDeclaration' && isString(node.source) && VM_SPECIFIERS.has(node.source.value)) {
       flag(node, 'import of node:vm');
     }
-    if (node.type === 'ImportExpression' && isString(node.source) && VM_SPECIFIERS.has(node.source.value)) {
-      flag(node, 'dynamic import of node:vm');
+    if (node.type === 'ImportExpression') {
+      if (!isString(node.source)) flag(node, 'dynamic import of a specifier this file cannot read');
+      else if (VM_SPECIFIERS.has(node.source.value)) flag(node, 'dynamic import of node:vm');
+      else if (/^\s*data:/i.test(node.source.value)) flag(node, 'dynamic import of a data: URL');
     }
     if (node.type === 'CallExpression' && node.callee.type === 'Identifier' && node.callee.name === 'require' &&
         node.arguments.length === 1 && isString(node.arguments[0]) && VM_SPECIFIERS.has(node.arguments[0].value)) {
@@ -129,10 +222,47 @@ export function scan(source) {
     if (node.type === 'Identifier' && RECOVERY_NAMES.has(node.name)) {
       flag(node, `reference to ${node.name}`);
     }
-    if (node.type === 'CallExpression' || node.type === 'NewExpression') {
+    // A bare `Function`/`eval` that is not a callee the rules below judge:
+    // an alias, an argument to `Reflect.construct`, a template tag, the
+    // `eval` of `(0, eval)(...)`.
+    if (node.type === 'Identifier' && (node.name === 'Function' || node.name === 'eval') &&
+        isIntrinsicReference(node, parent)) {
+      flag(node, `reference to ${node.name} (${parent.type})`);
+    }
+    // `globalThis['eval']`, `globalThis['Fun' + 'ction']`, and every other
+    // spelling of the same lookup.
+    if (node.type === 'MemberExpression' && node.computed && node.object.type === 'Identifier' &&
+        GLOBAL_OBJECTS.includes(node.object.name)) {
+      flag(node, `computed lookup on ${node.object.name}`);
+    }
+    if (node.type === 'MemberExpression' && isCallResultConstructor(node)) {
+      flag(node, '.constructor read off a call result');
+    }
+    // `new Worker(source, { eval: true })`: worker_threads' own way to run a
+    // string. Flagged on the PRESENCE of an `eval` key, whatever its value,
+    // so a variable cannot hide it.
+    if (node.type === 'NewExpression' && namesWorker(node.callee)) {
+      const opts = node.arguments[1];
+      if (opts && opts.type === 'ObjectExpression' &&
+          opts.properties.some((p) => p.type === 'Property' && !p.computed &&
+            ((p.key.type === 'Identifier' && p.key.name === 'eval') || isString(p.key, 'eval')))) {
+        flag(node, 'new Worker(..., { eval: ... })');
+      }
+    }
+    if (node.type === 'CallExpression') {
       const { callee } = node;
       if (callee.type === 'Identifier' && callee.name === 'eval') {
         flag(node, 'eval()');
+      } else if (callee.type === 'Identifier' && callee.name === 'internalBinding') {
+        flag(node, 'internalBinding()');
+      } else if (['binding', '_linkedBinding'].includes(memberName(callee) ?? '')) {
+        flag(node, `process.${memberName(callee)}()`);
+      }
+    }
+    if (node.type === 'CallExpression' || node.type === 'NewExpression') {
+      const { callee } = node;
+      if (callee.type === 'Identifier' && callee.name === 'eval') {
+        // already flagged above for a call; a `new eval` is not a thing
       } else if (isConstructorRecovery(callee)) {
         flag(node, 'constructor.constructor(...) recovery');
       } else if (namesFunction(callee)) {
@@ -180,6 +310,53 @@ function report(label, result, expected) {
     const vmd = scan(clean + "\nimport vm from 'node:vm';\n").findings;
     assert.equal(vmd.length, before + 1, 'the scanner did not see a node:vm import');
     console.log('PASS: the scanner sees an injected new Function, a constructor recovery, eval and node:vm');
+
+    // Every spelling a review walked past this guard, each spiked into the
+    // real bundle so the assertion is about THIS scanner on THIS input and not
+    // about a copy of it. `>= 1` rather than `=== 1`: some shapes are two
+    // findings at once (a computed lookup on `globalThis` that is ALSO a
+    // constructor chain), and "at least one" is the property that matters.
+    const SPELLINGS = [
+      ["globalThis['Fun'+'ction']('return 1')()", 'a computed lookup on globalThis'],
+      ["Reflect.construct(Function, ['return 1'])()", 'Function as an argument'],
+      ['const F = Function; new F("return 1")()', 'Function aliased to a const'],
+      ['Function`return 1`()', 'Function as a template tag'],
+      ["(0, eval)('1')", 'indirect eval'],
+      ["globalThis['eval']('1')", "globalThis['eval']"],
+      ["globalThis['constructor']['constructor']('return 1')()", 'a computed constructor chain'],
+      ['Object.getPrototypeOf(async function(){}).constructor("return 1")', '.constructor off a call result'],
+      ["import('data:text/javascript,globalThis.x=1')", "import('data:…')"],
+      ["new (await import('node:worker_threads')).Worker('1', { eval: true })", 'worker_threads with eval: true'],
+      ["process.binding('contextify')", 'process.binding'],
+      ["const vm2 = await import('node:' + 'vm'); vm2.runInThisContext('1')", "import('node:' + 'vm')"],
+    ];
+    for (const [spelling, label] of SPELLINGS) {
+      // `await` needs a module top level, which the bundle is; the statement
+      // is appended to it whole.
+      const found = scan(`${clean}\n${spelling};\n`).findings;
+      assert.ok(
+        found.length >= before + 1,
+        `the scanner did not see ${label}: ${spelling}`,
+      );
+    }
+    console.log(`PASS: the scanner sees all ${SPELLINGS.length} spellings a review walked past it`);
+
+    // And the counterweight: ordinary code that merely mentions these names
+    // is NOT a finding, or the guard would be noise and get switched off.
+    for (const innocent of [
+      'const o = { Function: 1, eval: 2 }; export const k = o.Function + o.eval;',
+      'export function h(x) { return x instanceof Object ? x.constructor : null; }',
+      "const w = new Worker(new URL('./w.mjs', import.meta.url), { workerData: 1 });",
+      "const m = await import('node:fs');",
+      'export class Function2 {}',
+    ]) {
+      assert.equal(
+        scan(`${clean}\n${innocent}\n`).findings.length,
+        before,
+        `the scanner flagged innocent code: ${innocent}`,
+      );
+    }
+    console.log('PASS: naming these things without reaching for them is not a finding');
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });
   }

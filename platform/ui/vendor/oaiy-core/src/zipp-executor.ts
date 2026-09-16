@@ -194,7 +194,27 @@ export function buildZippScript(fullScript: string, hardened: boolean, opts: { p
   // flow compiles at run time reaches the stubs, not Zipp's own `setTimeout`.
   // Hardened: they stay inside the IIFE, where the shadow preamble that follows
   // overrides them and a recovered global holds neither stub nor intrinsic.
-  const topLevelShims = hardened ? '' : `${ZIPP_GUEST_SHIMS}\n`;
+  //
+  // `__zippHostCall` goes with them, for the same reason and no other. Zipp's
+  // synchronous host bridge is bound by the ENGINE's preamble at global scope
+  // (it is in `ZIPP_PREAMBLE_GLOBALS`), so the wrapper's own
+  // `var __zippHostCall = undefined` below shadows it for the flow's program
+  // and for nothing else: a body compiled at run time runs at global scope and
+  // still reached the bridge, along with the `__z*` queue internals beside it.
+  // It is capability-denied today — the embedder never calls
+  // `setSyncHostCapabilities`, so a call comes back as a guest-catchable
+  // "unknown host call" — which makes this a misleading affordance now and a
+  // boundary the day any host installs a sync capability.
+  //
+  // Shadowing it at top level was GATED before it shipped, exactly as the
+  // shims were: on v0.0.19, on both installs, an ordinary `host.call` round
+  // trip, the pump loop and a dynamically compiled body's OWN host call all
+  // still complete with the declaration in place, so the engine's bridge does
+  // not resolve this name by free-variable lookup at call time. That gate is
+  // section 5d of `ui/tests/zipp-executor.mjs` and stays as the permanent
+  // record: a release that DID read it back would fail there rather than in a
+  // flow.
+  const topLevelShims = hardened ? '' : `${ZIPP_GUEST_SHIMS}\nvar __zippHostCall = undefined;\n`;
   const scopedShims = hardened ? `${ZIPP_GUEST_SHIMS}\n` : '';
   if (opts.preamble !== undefined && hardened) {
     throw new Error('A profile preamble cannot be applied to a hardened (untrusted) flow');
@@ -221,6 +241,9 @@ export function buildZippScript(fullScript: string, hardened: boolean, opts: { p
 ${strict}// Zipp's synchronous host bridge. It is capability-denied by default (the
 // embedder never calls setSyncHostCapabilities), so this only removes a
 // misleading affordance — but an untrusted script has no business seeing it.
+// This copy covers the flow's OWN program in both modes; for a trusted flow
+// there is a second, top-level one (see topLevelShims) that covers a body
+// compiled at run time, which runs at global scope and never sees this.
 var __zippHostCall = undefined;
 ${scopedShims}${fullScript}
 }).call(${thisArg}, host, __oaiyConsole);
@@ -547,7 +570,15 @@ export class ZippSession {
       }
       if (this.settled || this.aborted) return;
 
-      this.engine.renewInstructionBudget();
+      // The engine ANSWERS the renewal request: `false` for a budget already
+      // spent, or a disposed engine. Dropping that answer meant the next step
+      // ran on whatever was left and failed `resource` somewhere in the user's
+      // code, with nothing to say the ceiling had not been restored. A renewal
+      // that did not happen fails the run, here, saying so.
+      if (!this.engine.renewInstructionBudget()) {
+        this.fail('Zipp would not renew the instruction budget after a host call');
+        return;
+      }
       this.engine.resolveHostCallback(call.id, result);
       this.drainInto();
     }
