@@ -144,6 +144,31 @@ pub struct ReceivedEvent {
     pub outcomes: Vec<String>,
 }
 
+/// A free-text log field, JSON-quoted, so a condition containing a quote or a
+/// newline cannot break one log line into two.
+fn json_str(s: &str) -> String {
+    Value::String(s.to_string()).to_string()
+}
+
+/// The line one `$event` rewrite leaves behind.
+///
+/// A function rather than a `log::warn!` in place, so the format is pinned by a
+/// test: this line is the only record of an edit to a file the USER owns, and it
+/// has to carry enough to reconstruct exactly what changed — which file, which
+/// binding, the text before and the text after.
+fn migration_line(
+    path: &std::path::Path,
+    r: &crate::bridge::triggers::ConditionRewrite,
+) -> String {
+    format!(
+        "trigger-condition-migrated: file={} binding={} before={} after={}",
+        json_str(&path.display().to_string()),
+        json_str(&r.binding_id),
+        json_str(&r.before),
+        json_str(&r.after),
+    )
+}
+
 /// Persistent trigger bindings, JSON on disk.
 ///
 /// A file rather than a database because the write rate is human (someone edits
@@ -153,12 +178,22 @@ pub struct ReceivedEvent {
 pub struct TriggerStore {
     path: PathBuf,
     bindings: Vec<TriggerBinding>,
+    /// The file's ORIGINAL bytes, kept only while a `$event` migration has been
+    /// applied in memory and its `.bak` could not be written. See [`migrate`].
+    ///
+    /// [`migrate`]: TriggerStore::migrate
+    pending_backup: Option<String>,
 }
 
 impl TriggerStore {
     pub fn load(path: PathBuf) -> Self {
+        let mut original = None;
         let bindings = match std::fs::read_to_string(&path) {
-            Ok(text) => Self::parse(&path, &text),
+            Ok(text) => {
+                let parsed = Self::parse(&path, &text);
+                original = Some(text);
+                parsed
+            }
             // No file at all IS the first boot. Anything else is a file that
             // holds the user's bindings and could not be read — a lock from a
             // backup agent or AV, bad UTF-8 — and must not be mistaken for
@@ -172,7 +207,70 @@ impl TriggerStore {
                 Vec::new()
             }
         };
-        Self { path, bindings }
+        let mut store = Self { path, bindings, pending_backup: None };
+        if let Some(original) = original {
+            store.migrate(original);
+        }
+        store
+    }
+
+    /// Rewrite bare `event` / `$event` condition operands, once.
+    ///
+    /// The Rust grammar read `$event` alone as `event.data`; ZIPP reads it as
+    /// the whole envelope, which is truthy even when `data` is not. Two readings
+    /// of one token IS the bug, so there is no compatibility window: the stored
+    /// text is rewritten a single time, the original is kept beside the file as
+    /// `.bak`, every rewrite is logged with what it was and what it became, and
+    /// the old reading survives nowhere.
+    ///
+    /// Nothing to change means nothing happens — no `.bak`, no write — so a file
+    /// already in the new form is left byte-identical, whatever its formatting.
+    ///
+    /// The original is never lost. The `.bak` is written and renamed into place
+    /// BEFORE the rewrite, and the rewrite itself is `persist`'s `.tmp`+rename,
+    /// so the file on disk is always wholly the old one or wholly the new one.
+    /// If the `.bak` cannot be written, the rewrite is not attempted at all: the
+    /// migrated bindings are used IN MEMORY — they are the safe reading, and the
+    /// migration is idempotent, so the next boot simply tries again — and the
+    /// original text is held for `persist` to back up before it writes anything.
+    fn migrate(&mut self, original: String) {
+        let rewrites = crate::bridge::triggers::migrate_bindings(&mut self.bindings);
+        if rewrites.is_empty() {
+            return;
+        }
+        for r in &rewrites {
+            log::warn!("{}", migration_line(&self.path, r));
+        }
+        match Self::write_backup(&self.path, &original) {
+            Ok(bak) => {
+                log::warn!(
+                    "{} trigger condition(s) were rewritten; the original is at {}",
+                    rewrites.len(),
+                    bak.display()
+                );
+                if let Err(e) = self.persist() {
+                    log::error!(
+                        "the rewritten trigger conditions could not be saved ({e}); they are in force for this run and will be rewritten again on the next boot"
+                    );
+                }
+            }
+            Err(e) => {
+                log::error!(
+                    "the original trigger bindings could not be copied aside ({e}), so {} rewritten condition(s) were NOT saved; they are in force for this run only",
+                    rewrites.len()
+                );
+                self.pending_backup = Some(original);
+            }
+        }
+    }
+
+    /// Copy `original` to `<path>.bak`, atomically.
+    fn write_backup(path: &std::path::Path, original: &str) -> Result<PathBuf, String> {
+        let bak = path.with_extension("json.bak");
+        let tmp = path.with_extension("json.bak.tmp");
+        std::fs::write(&tmp, original).map_err(|e| format!("{}: {e}", tmp.display()))?;
+        std::fs::rename(&tmp, &bak).map_err(|e| format!("{}: {e}", bak.display()))?;
+        Ok(bak)
     }
 
     /// Deserialize entry by entry, keeping everything that loads.
@@ -258,10 +356,12 @@ impl TriggerStore {
         if binding.flow_id.trim().is_empty() {
             return Err("binding flowId must not be empty — there would be nothing to run".into());
         }
-        if let Some(expr) = binding.condition.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
-            crate::bridge::triggers::condition_is_evaluatable(expr)
-                .map_err(|why| format!("condition cannot be evaluated ({why}): {expr}"))?;
-        }
+        // The CONDITION is not checked here any more. It is JavaScript, and the
+        // only thing that can honestly say whether it parses is the engine that
+        // will run it — which is a process, and this runs under the trigger
+        // store's lock. `routes::upsert_trigger` asks ZIPP before it takes that
+        // lock; a condition that reaches this point unchecked still cannot fire,
+        // because dispatch fails closed on anything it cannot decide.
         match self.bindings.iter_mut().find(|b| b.id == binding.id) {
             Some(existing) => *existing = binding,
             None => self.bindings.push(binding),
@@ -280,6 +380,14 @@ impl TriggerStore {
     }
 
     fn persist(&self) -> Result<(), String> {
+        // A migration ran but its `.bak` did not. Writing now would overwrite the
+        // only copy of what the user actually wrote, so retry the backup and
+        // refuse rather than lose it. Loud and recoverable beats silent.
+        if let Some(original) = self.pending_backup.as_deref() {
+            Self::write_backup(&self.path, original).map_err(|e| {
+                format!("the original trigger bindings still cannot be copied aside ({e}), so this write would destroy them")
+            })?;
+        }
         if let Some(dir) = self.path.parent() {
             std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
         }
@@ -396,6 +504,12 @@ pub struct PluginHost {
     /// Resolves the Node runtime the bundled CLI runs under, for the logic
     /// scripts. Set after construction like the link, and for the same reason.
     node: Mutex<Option<crate::services::node_runtime::NodeHandle>>,
+    /// What decides trigger and binding conditions.
+    ///
+    /// The process-wide warm script host, unless a test has substituted its own
+    /// — conditions are the one thing on the event thread that reaches a child
+    /// process, and a unit test must be able to answer them without one.
+    scripts: Mutex<std::sync::Arc<dyn crate::bridge::script_host::ScriptBatch>>,
 }
 
 /// What the host needs to answer `companion.admission`: this desktop's own
@@ -440,6 +554,7 @@ impl PluginHost {
             flow_bindings: crate::link::flows::FlowBindings::new(),
             app_logic: crate::link::app_logic::Catalog::new(),
             node: Mutex::new(None),
+            scripts: Mutex::new(std::sync::Arc::new(crate::bridge::script_host::GlobalHost)),
         });
 
         // Event thread: ring + trigger dispatch + ack.
@@ -936,9 +1051,16 @@ impl PluginHost {
             }
         };
         // The envelope, not the internal event: conditions are authored against
-        // `event.data.*` as it appears on the wire.
-        let (fire, skipped) = crate::link::flows::select(&bindings, &event.name, envelope);
-        for (binding, reason) in skipped {
+        // `event.data.*` as it appears on the wire. Nothing is locked here
+        // either — this lane never held the ledger — so the batch simply runs.
+        let selection = crate::link::flows::select(
+            self.script_evaluator().as_ref(),
+            &bindings,
+            &event.name,
+            &event.source,
+            envelope,
+        );
+        for (binding, reason) in &selection.skipped {
             log::info!(
                 "flow binding {} did not fire for {}: {}",
                 binding.id,
@@ -946,7 +1068,7 @@ impl PluginHost {
                 reason.message()
             );
         }
-        for binding in fire {
+        for binding in selection.fire {
             match crate::link::flows::reserve(
                 &account,
                 &spec,
@@ -1121,6 +1243,23 @@ impl PluginHost {
                 let _ = p.ack_event(&idempotency_key);
             }
         }
+    }
+
+    /// Decide conditions with `evaluator` instead of the process-wide host.
+    ///
+    /// For tests. Nothing in the product calls it: the default IS the host.
+    pub fn set_script_evaluator(
+        &self,
+        evaluator: std::sync::Arc<dyn crate::bridge::script_host::ScriptBatch>,
+    ) {
+        *self.scripts.lock().unwrap_or_else(|e| e.into_inner()) = evaluator;
+    }
+
+    /// What decides conditions right now. The save-time check on
+    /// `POST /api/bridge/triggers` reaches the same evaluator through here, so a
+    /// test that substitutes one substitutes it for every lane at once.
+    pub fn script_evaluator(&self) -> std::sync::Arc<dyn crate::bridge::script_host::ScriptBatch> {
+        self.scripts.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// Let a binary supply the companion broker once its HTTP surface exists.
@@ -1488,8 +1627,21 @@ impl PluginHost {
             Err(_) => Vec::new(),
         };
 
+        // Conditions FIRST, holding NOTHING. `evaluate_conditions` takes the
+        // script host's process-wide batch lock and, on the first conditioned
+        // event after boot, spawns the child that serves it. Under the ledger
+        // lock that would queue every plugin event in the process behind a
+        // script host that is starting — and the ledger lock is also what the
+        // HTTP surface takes to reserve, claim and finalise runs. So the
+        // engine is asked out here, and `dispatch` is handed the answers.
+        //
+        // An event whose bindings carry no conditions sends no batch and starts
+        // no child: `conditions::decide` returns early on an empty job list.
+        let verdicts =
+            crate::bridge::triggers::evaluate_conditions(self.script_evaluator().as_ref(), &bindings, event);
+
         let results = match self.ledger.lock() {
-            Ok(mut ledger) => dispatch(&mut ledger, &bindings, event),
+            Ok(mut ledger) => dispatch(&mut ledger, &bindings, event, &verdicts),
             // Not a skip: dispatch never ran. Nothing can have been reserved, so
             // this is always a dead letter.
             Err(_) => {
@@ -1883,11 +2035,13 @@ mod tests {
     /// A host over temp dirs, with `bindings` installed.
     ///
     /// Written straight to the bindings file rather than through `upsert`,
-    /// because `upsert` now REFUSES a binding whose condition cannot be parsed —
-    /// and the dead-letter tests below need exactly that state. Which is not a
-    /// contrivance: a binding saved before that validation existed, or one
-    /// hand-edited into triggers.json, arrives through this same load path. It
-    /// is precisely why the dead-letter handling still has to work.
+    /// because that is the path a binding hand-edited into triggers.json, or
+    /// saved by an older build, actually takes — and it is the path the `$event`
+    /// migration runs on.
+    ///
+    /// Conditions are decided by the process-wide script host unless a test
+    /// substitutes one (`host_evaluating`). A binding with no condition asks it
+    /// nothing, which is why most of the tests here need no evaluator at all.
     fn host_with(tag: &str, bindings: Vec<TriggerBinding>) -> (Sandbox, Arc<PluginHost>) {
         let sb = Sandbox::new(tag);
         let path = sb.0.join("triggers.json");
@@ -1993,10 +2147,13 @@ mod tests {
 
     #[test]
     fn an_event_whose_binding_cannot_evaluate_is_dead_lettered() {
-        // `====` is not an operator the restricted evaluator understands, so the
+        // `====` is not JavaScript, so ZIPP refuses to compile it and the
         // binding is refused rather than guessed. The author meant this to fire;
         // without a dead letter they would never learn it didn't.
-        let (_sb, host) = host_with("broken", vec![binding("b1", Some("$event.data.from ==== 1"))]);
+        let refusing = Arc::new(crate::bridge::conditions::testing::FakeHost::by_source(|_| {
+            Err(crate::bridge::conditions::testing::guest("SyntaxError: unexpected token '='"))
+        }));
+        let (_sb, host) = host_evaluating("broken", vec![binding("b1", Some("$event.data.from ==== 1"))], refusing);
         host.process_event("aokie", envelope());
 
         let dead = host.dead.lock().unwrap().list(10);
@@ -2029,7 +2186,10 @@ mod tests {
 
     #[test]
     fn redrive_reserves_a_run_once_the_binding_is_fixed_and_clears_the_entry() {
-        let (_sb, host) = host_with("redrive", vec![binding("b1", Some("$event.data.from ==== 1"))]);
+        let refusing = Arc::new(crate::bridge::conditions::testing::FakeHost::by_source(|_| {
+            Err(crate::bridge::conditions::testing::guest("SyntaxError: unexpected token '='"))
+        }));
+        let (_sb, host) = host_evaluating("redrive", vec![binding("b1", Some("$event.data.from ==== 1"))], refusing);
         host.process_event("aokie", envelope());
         let id = host.dead.lock().unwrap().list(1)[0].id.clone();
 
@@ -2397,5 +2557,239 @@ mod tests {
 
         // A plugin that never ran has nothing, which is a different answer.
         assert!(host.logs("never-spawned", None).is_none());
+    }
+    // --- conditions: the verdict boundary and the `$event` migration -------
+
+    use crate::bridge::conditions::testing::{guest, FakeHost};
+
+    /// `host_with`, plus the evaluator that decides its conditions.
+    fn host_evaluating(
+        tag: &str,
+        bindings: Vec<TriggerBinding>,
+        evaluator: Arc<dyn crate::bridge::script_host::ScriptBatch>,
+    ) -> (Sandbox, Arc<PluginHost>) {
+        let (sb, host) = host_with(tag, bindings);
+        host.set_script_evaluator(evaluator);
+        (sb, host)
+    }
+
+    #[test]
+    fn conditions_are_decided_before_the_ledger_is_locked() {
+        // The property this whole restructure exists for. `dispatch` runs under
+        // the ledger lock; the script host takes a process-wide lock of its own
+        // and may spawn a child. Evaluating from inside the ledger lock would
+        // put every plugin event in the process — and every HTTP reserve, claim
+        // and finalise — behind an engine that is starting.
+        //
+        // The proof: an evaluator that takes the ledger lock itself. Outside the
+        // lock it succeeds; inside it, a std::sync::Mutex deadlocks. Driven on
+        // its own thread with a deadline, so a regression FAILS rather than
+        // hanging the suite forever.
+        let (_sb, host) = host_with("boundary", vec![binding("b1", Some("event.data.from"))]);
+        let ledger = host.ledger.clone();
+        host.set_script_evaluator(Arc::new(FakeHost::raw(move |_| {
+            // If this runs under the ledger lock, this line never returns.
+            let held = ledger.lock().is_ok();
+            assert!(held, "the ledger was not available to the evaluator");
+            Ok(crate::bridge::script_host::ScriptResponse {
+                engine: serde_json::json!({}),
+                results: vec![crate::bridge::script_host::JobResult {
+                    id: "c0".into(),
+                    outcome: Ok(serde_json::json!(true)),
+                }],
+            })
+        })));
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = Arc::clone(&host);
+        std::thread::spawn(move || {
+            worker.process_event("aokie", envelope());
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the dispatch deadlocked: conditions are being evaluated under the ledger lock");
+        assert_eq!(host.ledger.lock().unwrap().len(), 1, "and the binding still fired");
+    }
+
+    #[test]
+    fn an_event_whose_bindings_carry_no_conditions_never_reaches_the_engine() {
+        // Load-bearing: the script host is spawned lazily, on the first job. A
+        // workspace whose triggers have no conditions must never pay for a
+        // child process — and most of them do not.
+        let fake = Arc::new(FakeHost::always(serde_json::json!(true)));
+        let (_sb, host) = host_evaluating("noengine", vec![binding("b1", None)], fake.clone());
+        host.process_event("aokie", envelope());
+        assert_eq!(host.ledger.lock().unwrap().len(), 1, "the binding fired");
+        assert_eq!(fake.calls(), 0, "and nothing asked the engine anything");
+    }
+
+    #[test]
+    fn zipp_decides_the_dispatch_not_the_rust_grammar() {
+        // `$event.data.from` is a condition the Rust grammar reads as TRUE for
+        // this envelope. ZIPP says false, and ZIPP is what dispatch obeys.
+        let fake = Arc::new(FakeHost::always(serde_json::json!(false)));
+        let (_sb, host) = host_evaluating("zippwins", vec![binding("b1", Some("$event.data.from"))], fake);
+        host.process_event("aokie", envelope());
+        assert_eq!(host.ledger.lock().unwrap().len(), 0, "ZIPP said no");
+    }
+
+    // --- the `$event` migration, on the store ------------------------------
+
+    fn stored(path: &std::path::Path, text: &str) {
+        std::fs::write(path, text).unwrap();
+    }
+
+    #[test]
+    fn loading_rewrites_a_bare_event_once_and_keeps_the_original_beside_it() {
+        let sb = Sandbox::new("migrate");
+        let path = sb.0.join("triggers.json");
+        let original = r#"[{"id":"b1","event":"e","flowId":"f","mode":"async","condition":"event && event.data.x === 1"}]"#;
+        stored(&path, original);
+
+        let store = TriggerStore::load(path.clone());
+        assert_eq!(
+            store.list()[0].condition.as_deref(),
+            Some("event.data && event.data.x === 1"),
+            "the stored text is rewritten once, and the old reading survives nowhere"
+        );
+
+        // The original is beside the file, byte for byte, and it round-trips:
+        // restoring the `.bak` gives back exactly what the user wrote.
+        let bak = path.with_extension("json.bak");
+        assert_eq!(std::fs::read_to_string(&bak).unwrap(), original);
+        std::fs::copy(&bak, &path).unwrap();
+        let restored = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(restored, original);
+        let reparsed: Vec<TriggerBinding> = serde_json::from_str(&restored).unwrap();
+        assert_eq!(reparsed[0].condition.as_deref(), Some("event && event.data.x === 1"));
+
+        // And the rewritten set is what is on disk now (re-copy it back first).
+        std::fs::write(&path, serde_json::to_string(store.list()).unwrap()).unwrap();
+        let again = TriggerStore::load(path.clone());
+        assert_eq!(again.list()[0].condition.as_deref(), Some("event.data && event.data.x === 1"));
+    }
+
+    #[test]
+    fn migrating_twice_changes_nothing_the_second_time() {
+        let sb = Sandbox::new("migrate-idem");
+        let path = sb.0.join("triggers.json");
+        stored(&path, r#"[{"id":"b1","event":"e","flowId":"f","mode":"async","condition":"$event"}]"#);
+
+        let first = TriggerStore::load(path.clone());
+        assert_eq!(first.list()[0].condition.as_deref(), Some("$event.data"));
+        let after_first = std::fs::read_to_string(&path).unwrap();
+        drop(first);
+
+        // A second boot must be a no-op: no further `.data`, and not one byte
+        // of the file moved.
+        let second = TriggerStore::load(path.clone());
+        assert_eq!(second.list()[0].condition.as_deref(), Some("$event.data"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), after_first);
+    }
+
+    #[test]
+    fn a_file_already_in_the_new_form_is_left_byte_for_byte() {
+        // Deliberately NOT the formatting `persist` writes: compact, odd
+        // spacing, a trailing newline. If anything rewrites the file, the bytes
+        // move even though the meaning does not.
+        let sb = Sandbox::new("migrate-noop");
+        let path = sb.0.join("triggers.json");
+        let text = "[ {\"id\":\"b1\",\"event\":\"e\",\"flowId\":\"f\",\"mode\":\"async\",\"condition\":\"$event.data.x === 1\"} ]\n";
+        stored(&path, text);
+
+        let store = TriggerStore::load(path.clone());
+        assert_eq!(store.list().len(), 1);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text, "nothing changed, so nothing was written");
+        assert!(
+            !path.with_extension("json.bak").exists(),
+            "and no backup was made for a migration that did not happen"
+        );
+    }
+
+    #[test]
+    fn a_rewrite_that_cannot_be_backed_up_is_not_written_at_all() {
+        // The original must survive a failed migration. A directory in the way
+        // of the backup's temp file makes the write fail on every platform.
+        let sb = Sandbox::new("migrate-readonly");
+        let path = sb.0.join("triggers.json");
+        let original = r#"[{"id":"b1","event":"e","flowId":"f","mode":"async","condition":"$event"}]"#;
+        stored(&path, original);
+        std::fs::create_dir_all(path.with_extension("json.bak.tmp")).unwrap();
+
+        let mut store = TriggerStore::load(path.clone());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            original,
+            "the user's file is untouched — not half-written, not emptied"
+        );
+        assert_eq!(
+            store.list()[0].condition.as_deref(),
+            Some("$event.data"),
+            "the safe reading is in force for this run; the migration is idempotent, so the next boot retries"
+        );
+
+        // And a later write must not quietly destroy the original either: it
+        // retries the backup first, and refuses rather than overwrite.
+        let err = store.upsert(binding("b2", None)).unwrap_err();
+        assert!(err.contains("copied aside"), "{err}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+
+        // Clear the obstruction and the same write succeeds, backup and all.
+        std::fs::remove_dir_all(path.with_extension("json.bak.tmp")).unwrap();
+        store.upsert(binding("b3", None)).unwrap();
+        assert_eq!(std::fs::read_to_string(path.with_extension("json.bak")).unwrap(), original);
+    }
+
+    #[test]
+    fn every_rewrite_is_logged_with_the_text_before_and_after() {
+        // The only record of an edit to a file the user owns. It must be enough
+        // to reconstruct the change without the `.bak` — and greppable, with the
+        // free text quoted so a condition containing a newline stays one line.
+        let line = migration_line(
+            std::path::Path::new("C:/data/triggers.json"),
+            &crate::bridge::triggers::ConditionRewrite {
+                binding_id: "b1".into(),
+                before: "event && event.data.x === 'a\nb'".into(),
+                after: "event.data && event.data.x === 'a\nb'".into(),
+            },
+        );
+        assert_eq!(
+            line,
+            r#"trigger-condition-migrated: file="C:/data/triggers.json" binding="b1" before="event && event.data.x === 'a\nb'" after="event.data && event.data.x === 'a\nb'""#
+        );
+        assert!(!line.contains('\n'), "one rewrite is one line: {line}");
+    }
+
+    #[test]
+    fn an_input_map_selector_is_not_migrated() {
+        // `$event` in an inputMap is resolved in Rust and still means the data.
+        let sb = Sandbox::new("migrate-inputmap");
+        let path = sb.0.join("triggers.json");
+        stored(
+            &path,
+            r#"[{"id":"b1","event":"e","flowId":"f","mode":"async","inputMap":{"all":"$event"}}]"#,
+        );
+        let store = TriggerStore::load(path.clone());
+        assert_eq!(store.list()[0].input_map["all"], "$event");
+        assert!(!path.with_extension("json.bak").exists(), "nothing to migrate");
+    }
+
+    #[test]
+    fn an_unparseable_condition_can_still_be_saved_and_still_cannot_fire() {
+        // `upsert` no longer runs a grammar: only the engine can say whether
+        // JavaScript parses, and the route asks it before this lock is taken.
+        // A binding that reaches the store unchecked must still be inert.
+        let (_sb, host) = host_with("upsert-unchecked", vec![]);
+        host.triggers
+            .lock()
+            .unwrap()
+            .upsert(binding("b1", Some("$event.data.from ==== 1")))
+            .expect("the store saves what the route already checked");
+
+        let fake = Arc::new(FakeHost::by_source(|_| Err(guest("SyntaxError: unexpected token '='"))));
+        host.set_script_evaluator(fake);
+        host.process_event("aokie", envelope());
+        assert_eq!(host.ledger.lock().unwrap().len(), 0, "a condition ZIPP refuses never fires");
+        assert_eq!(host.dead.lock().unwrap().list(10).len(), 1, "and it is dead-lettered");
     }
 }

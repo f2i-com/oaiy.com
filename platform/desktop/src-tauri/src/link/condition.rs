@@ -1,4 +1,4 @@
-//! Deciding whether a trigger's condition holds.
+//! The RUST condition grammar — a shadow, for one release.
 //!
 //! Bindings carry conditions written as JavaScript expressions, e.g.
 //!
@@ -6,11 +6,23 @@
 //! event && event.data ? Number(event.data.durationSeconds || 0) > 5 : false
 //! ```
 //!
-//! Embedding a JavaScript engine to answer that would be a great deal of
-//! attack surface for the shape of expression a trigger editor actually emits.
-//! So this is a deliberately small language: literals, property paths, the two
-//! coercions those expressions use, comparison, `&&`/`||`, `!`, parentheses and
-//! the ternary. Anything outside it is **refused, not guessed**.
+//! Embedding a JavaScript engine to answer that would once have been a great
+//! deal of attack surface for the shape of expression a trigger editor actually
+//! emits. So this is a deliberately small language: literals, property paths,
+//! the two coercions those expressions use, comparison, `&&`/`||`, `!`,
+//! parentheses and the ternary. Anything outside it is **refused, not guessed**.
+//!
+//! # This no longer decides anything
+//!
+//! The desktop now has a real engine to ask — ZIPP, behind the warm script host
+//! ([`crate::bridge::conditions`]) — and ZIPP's answer is the one used. This
+//! module runs alongside it for ONE release so that every place the two
+//! disagree is logged as a `condition-shadow` line and classified. PR9 deletes
+//! this file once those lines are accounted for; nothing may start depending on
+//! it again in the meantime.
+//!
+//! [`Verdict`] itself lives in `bridge::conditions` and is only re-exported
+//! here, so that deletion is a deletion and not a refactor.
 //!
 //! # Which way it fails matters more than how often
 //!
@@ -25,27 +37,20 @@
 //! `''`, `0` and `null` are falsy; `||` yields its first truthy operand rather
 //! than a boolean; `String(null)` is `"null"`; `Number('')` is `0`. Getting any
 //! of these subtly wrong would not error — it would fire the wrong flows, which
-//! is the failure this module exists to prevent.
+//! is the failure this module exists to prevent. Where ZIPP and this disagree
+//! about one of them, ZIPP is right by definition: it is the engine the browser
+//! runs.
 
 use serde_json::Value;
 
-/// What a condition decided.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Verdict {
-    True,
-    False,
-    /// Not understood. Never fires, and says why.
-    Unknown(String),
-}
+pub use crate::bridge::conditions::Verdict;
 
-impl Verdict {
-    pub fn fires(&self) -> bool {
-        matches!(self, Verdict::True)
-    }
-}
-
-/// Evaluate `expr` against the event envelope bound to the name `event`.
-pub fn evaluate(expr: &str, event: &Value) -> Verdict {
+/// The Rust grammar's reading of `expr` against the event envelope bound to the
+/// name `event`.
+///
+/// Called only to be COMPARED with ZIPP's reading (see the module header). The
+/// one caller left is the shadow in `link::flows`.
+pub fn shadow_verdict(expr: &str, event: &Value) -> Verdict {
     let expr = expr.trim();
     if expr.is_empty() {
         // No condition is not a failed condition: it fires.
@@ -538,29 +543,29 @@ mod tests {
     #[test]
     fn the_real_conditions_decide_the_way_their_author_meant() {
         let duration = "event && event.data ? Number(event.data.durationSeconds || 0) > 5 : false";
-        assert_eq!(evaluate(duration, &ev(json!({ "durationSeconds": 33 }))), Verdict::True);
-        assert_eq!(evaluate(duration, &ev(json!({ "durationSeconds": 3 }))), Verdict::False);
+        assert_eq!(shadow_verdict(duration, &ev(json!({ "durationSeconds": 33 }))), Verdict::True);
+        assert_eq!(shadow_verdict(duration, &ev(json!({ "durationSeconds": 3 }))), Verdict::False);
         // Absent, null and empty all coerce to 0 — the reason the author wrote
         // `|| 0` at all, and each must stay BELOW the threshold.
         for missing in [json!({}), json!({ "durationSeconds": null }), json!({ "durationSeconds": "" })] {
-            assert_eq!(evaluate(duration, &ev(missing)), Verdict::False);
+            assert_eq!(shadow_verdict(duration, &ev(missing)), Verdict::False);
         }
         // …and a numeric string still compares as a number.
-        assert_eq!(evaluate(duration, &ev(json!({ "durationSeconds": "42" }))), Verdict::True);
+        assert_eq!(shadow_verdict(duration, &ev(json!({ "durationSeconds": "42" }))), Verdict::True);
 
         let outbound = "event && event.data ? String(event.data.direction || '') === 'outbound' : false";
-        assert_eq!(evaluate(outbound, &ev(json!({ "direction": "outbound" }))), Verdict::True);
-        assert_eq!(evaluate(outbound, &ev(json!({ "direction": "inbound" }))), Verdict::False);
-        assert_eq!(evaluate(outbound, &ev(json!({}))), Verdict::False);
+        assert_eq!(shadow_verdict(outbound, &ev(json!({ "direction": "outbound" }))), Verdict::True);
+        assert_eq!(shadow_verdict(outbound, &ev(json!({ "direction": "inbound" }))), Verdict::False);
+        assert_eq!(shadow_verdict(outbound, &ev(json!({}))), Verdict::False);
 
         let held = "event && event.data ? (String(event.data.outcome || '') === 'abandoned_on_hold' \
                     && String(event.data.direction || '') !== 'outbound') : false";
         assert_eq!(
-            evaluate(held, &ev(json!({ "outcome": "abandoned_on_hold" }))),
+            shadow_verdict(held, &ev(json!({ "outcome": "abandoned_on_hold" }))),
             Verdict::True
         );
         assert_eq!(
-            evaluate(held, &ev(json!({ "outcome": "abandoned_on_hold", "direction": "outbound" }))),
+            shadow_verdict(held, &ev(json!({ "outcome": "abandoned_on_hold", "direction": "outbound" }))),
             Verdict::False
         );
 
@@ -568,9 +573,9 @@ mod tests {
                       String(event.data.status || '') === 'missed' || \
                       String(event.data.outcome || '') === 'abandoned_in_queue') && \
                       String(event.data.direction || '') !== 'outbound') : false";
-        assert_eq!(evaluate(missed, &ev(json!({ "status": "missed" }))), Verdict::True);
-        assert_eq!(evaluate(missed, &ev(json!({ "outcome": "abandoned_in_queue" }))), Verdict::True);
-        assert_eq!(evaluate(missed, &ev(json!({ "outcome": "answered" }))), Verdict::False);
+        assert_eq!(shadow_verdict(missed, &ev(json!({ "status": "missed" }))), Verdict::True);
+        assert_eq!(shadow_verdict(missed, &ev(json!({ "outcome": "abandoned_in_queue" }))), Verdict::True);
+        assert_eq!(shadow_verdict(missed, &ev(json!({ "outcome": "answered" }))), Verdict::False);
 
         let after = "event && event.data ? (Number(event.data.durationSeconds || 0) > 5 && \
                      String(event.data.outcome || '') !== 'missed' && \
@@ -581,15 +586,15 @@ mod tests {
                      String(event.data.direction || '') !== 'outbound' && \
                      event.data.manager !== true) : false";
         assert_eq!(
-            evaluate(after, &ev(json!({ "durationSeconds": 33, "outcome": "answered" }))),
+            shadow_verdict(after, &ev(json!({ "durationSeconds": 33, "outcome": "answered" }))),
             Verdict::True
         );
         assert_eq!(
-            evaluate(after, &ev(json!({ "durationSeconds": 33, "outcome": "missed" }))),
+            shadow_verdict(after, &ev(json!({ "durationSeconds": 33, "outcome": "missed" }))),
             Verdict::False
         );
         assert_eq!(
-            evaluate(after, &ev(json!({ "durationSeconds": 33, "manager": true }))),
+            shadow_verdict(after, &ev(json!({ "durationSeconds": 33, "manager": true }))),
             Verdict::False
         );
     }
@@ -611,7 +616,7 @@ mod tests {
             "'unterminated",                            // unterminated string
             "other.thing === 1",                        // a root not in scope
         ] {
-            match evaluate(expr, &ev(json!({ "from": "+4471", "n": 5 }))) {
+            match shadow_verdict(expr, &ev(json!({ "from": "+4471", "n": 5 }))) {
                 Verdict::Unknown(why) => assert!(!why.is_empty(), "{expr}"),
                 other => panic!("{expr:?} must not be decided: got {other:?}"),
             }
@@ -628,16 +633,16 @@ mod tests {
         // present value would stringify to "true" and no comparison would hold.
         let e = ev(json!({ "outcome": "answered" }));
         assert_eq!(
-            evaluate("String(event.data.outcome || 'fallback') === 'answered'", &e),
+            shadow_verdict("String(event.data.outcome || 'fallback') === 'answered'", &e),
             Verdict::True
         );
         assert_eq!(
-            evaluate("String(event.data.missing || 'fallback') === 'fallback'", &e),
+            shadow_verdict("String(event.data.missing || 'fallback') === 'fallback'", &e),
             Verdict::True
         );
         // And `&&` yields the falsy operand, which is what makes the guard
         // `event && event.data ? … : …` work when data is absent.
-        assert_eq!(evaluate("event && event.data ? true : false", &json!({})), Verdict::False);
+        assert_eq!(shadow_verdict("event && event.data ? true : false", &json!({})), Verdict::False);
     }
 
     #[test]
@@ -648,7 +653,7 @@ mod tests {
         }));
         for falsy in ["zero", "empty", "no", "nil", "absent"] {
             assert_eq!(
-                evaluate(&format!("event.data.{falsy} ? true : false"), &e),
+                shadow_verdict(&format!("event.data.{falsy} ? true : false"), &e),
                 Verdict::False,
                 "{falsy}"
             );
@@ -657,7 +662,7 @@ mod tests {
         // empty-so-false is the kind of near-miss that fires the wrong flow.
         for truthy in ["one", "text", "list", "obj"] {
             assert_eq!(
-                evaluate(&format!("event.data.{truthy} ? true : false"), &e),
+                shadow_verdict(&format!("event.data.{truthy} ? true : false"), &e),
                 Verdict::True,
                 "{truthy}"
             );
@@ -667,20 +672,20 @@ mod tests {
     #[test]
     fn strict_equality_does_not_cross_types() {
         let e = ev(json!({ "n": 5, "s": "5" }));
-        assert_eq!(evaluate("event.data.n === 5", &e), Verdict::True);
-        assert_eq!(evaluate("event.data.s === 5", &e), Verdict::False);
-        assert_eq!(evaluate("event.data.s === '5'", &e), Verdict::True);
+        assert_eq!(shadow_verdict("event.data.n === 5", &e), Verdict::True);
+        assert_eq!(shadow_verdict("event.data.s === 5", &e), Verdict::False);
+        assert_eq!(shadow_verdict("event.data.s === '5'", &e), Verdict::True);
         // …but loose equality does, exactly as in JavaScript.
-        assert_eq!(evaluate("event.data.s == 5", &e), Verdict::True);
+        assert_eq!(shadow_verdict("event.data.s == 5", &e), Verdict::True);
         // A missing property is null/undefined, and only equals itself.
-        assert_eq!(evaluate("event.data.gone === null", &e), Verdict::True);
-        assert_eq!(evaluate("event.data.gone === ''", &e), Verdict::False);
+        assert_eq!(shadow_verdict("event.data.gone === null", &e), Verdict::True);
+        assert_eq!(shadow_verdict("event.data.gone === ''", &e), Verdict::False);
     }
 
     #[test]
     fn an_empty_condition_fires_because_it_is_not_a_condition() {
-        assert_eq!(evaluate("", &ev(json!({}))), Verdict::True);
-        assert_eq!(evaluate("   ", &ev(json!({}))), Verdict::True);
+        assert_eq!(shadow_verdict("", &ev(json!({}))), Verdict::True);
+        assert_eq!(shadow_verdict("   ", &ev(json!({}))), Verdict::True);
     }
 
     #[test]
@@ -688,8 +693,8 @@ mod tests {
         // Number('abc') is NaN, and every comparison against NaN is false —
         // including `>`, which is the one that would otherwise fire a flow.
         let e = ev(json!({ "d": "not a number" }));
-        assert_eq!(evaluate("Number(event.data.d) > 5", &e), Verdict::False);
-        assert_eq!(evaluate("Number(event.data.d) < 5", &e), Verdict::False);
-        assert_eq!(evaluate("Number(event.data.d) >= 0", &e), Verdict::False);
+        assert_eq!(shadow_verdict("Number(event.data.d) > 5", &e), Verdict::False);
+        assert_eq!(shadow_verdict("Number(event.data.d) < 5", &e), Verdict::False);
+        assert_eq!(shadow_verdict("Number(event.data.d) >= 0", &e), Verdict::False);
     }
 }

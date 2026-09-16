@@ -1317,11 +1317,28 @@ async fn list_dead_letters(
 /// legitimately fails again (the guard still refuses, the binding is still
 /// broken) is not a request error. Reporting it as one would have callers
 /// retrying a thing that will never work.
+///
+/// On a blocking thread: a redrive is a full dispatch, and a dispatch decides
+/// its conditions on ZIPP — which takes a process-wide lock and, if no child is
+/// up, starts one. That is seconds of blocking, and it must not sit on a tokio
+/// worker.
 async fn redrive_dead_letter(
     State(st): State<BridgeState>,
     Path(id): Path<String>,
 ) -> axum::response::Response {
-    match st.host.redrive(&id) {
+    let host = st.host.clone();
+    let wanted = id.clone();
+    let redriven = match tokio::task::spawn_blocking(move || host.redrive(&id)).await {
+        Ok(r) => r,
+        Err(e) => {
+            return bridge_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                format!("the redrive did not run: {e}"),
+            )
+        }
+    };
+    match redriven {
         Some((outcomes, reserved)) => (
             StatusCode::OK,
             Json(json!({ "reserved": reserved, "outcomes": outcomes })),
@@ -1330,7 +1347,7 @@ async fn redrive_dead_letter(
         None => bridge_error(
             StatusCode::NOT_FOUND,
             "invalid_request",
-            format!("unknown dead letter {id}"),
+            format!("unknown dead letter {wanted}"),
         ),
     }
 }
@@ -1366,13 +1383,61 @@ async fn list_triggers(State(st): State<BridgeState>) -> axum::response::Respons
     }
 }
 
+/// Save a trigger binding, checking its condition first.
+///
+/// The condition is JavaScript, and the only thing that can honestly say
+/// whether it parses is the engine that will run it. That engine is a child
+/// process behind a process-wide lock, so it is asked on a blocking thread and
+/// BEFORE `st.host.triggers` is locked — holding the store's lock across a
+/// script host that may be starting would stall `GET /api/bridge/triggers`,
+/// whose whole job is to answer immediately.
+///
+/// An expression the engine refuses is a 400, not a saved binding with a
+/// warning: a binding that cannot be evaluated looks correct in the list and is
+/// incapable of ever firing, which is the trigger bug that is hardest to find.
+/// Refusing it puts the error where the mistake is. An engine that could not be
+/// REACHED is different — that is our problem, not the author's — so the binding
+/// is saved and the answer says it went unchecked. Nothing unsafe follows:
+/// dispatch decides every condition on ZIPP too, and fails closed.
 async fn upsert_trigger(
     State(st): State<BridgeState>,
     Json(binding): Json<crate::bridge::triggers::TriggerBinding>,
 ) -> axum::response::Response {
+    use crate::bridge::conditions::CheckOutcome;
+
+    let mut warning: Option<String> = None;
+    if let Some(expr) = crate::bridge::triggers::condition_of(&binding).map(str::to_string) {
+        let scripts = st.host.script_evaluator();
+        let source = expr.clone();
+        let checked = tokio::task::spawn_blocking(move || {
+            crate::bridge::conditions::check(scripts.as_ref(), &source)
+        })
+        .await
+        .unwrap_or_else(|e| CheckOutcome::Unchecked(format!("the check did not run: {e}")));
+        match checked {
+            CheckOutcome::Parses => {}
+            CheckOutcome::Rejected(why) => {
+                return bridge_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request",
+                    format!("condition cannot be evaluated ({why}): {expr}"),
+                )
+            }
+            CheckOutcome::Unchecked(why) => {
+                warning = Some(format!("condition not checked: {why}"))
+            }
+        }
+    }
+
     match st.host.triggers.lock() {
         Ok(mut t) => match t.upsert(binding) {
-            Ok(()) => (StatusCode::OK, Json(json!({ "bindings": t.list() }))).into_response(),
+            Ok(()) => {
+                let mut body = json!({ "bindings": t.list() });
+                if let Some(warning) = warning {
+                    body["warning"] = serde_json::Value::String(warning);
+                }
+                (StatusCode::OK, Json(body)).into_response()
+            }
             Err(e) => bridge_error(StatusCode::BAD_REQUEST, "invalid_request", e),
         },
         Err(_) => bridge_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", "trigger store lock poisoned".into()),
@@ -1800,6 +1865,158 @@ mod tests {
             let m = r.message();
             assert!(m.len() > 15, "too terse: {m:?}");
             assert!(!m.starts_with("error"), "lead with the problem: {m:?}");
+        }
+    }
+    // --- saving a trigger: the condition is checked by the engine ----------
+
+    mod saving_a_trigger {
+        use super::super::*;
+        use crate::bridge::conditions::testing::{guest, FakeHost};
+        use crate::bridge::script_host::{HostError, ScriptBatch};
+        use serde_json::Value;
+        use std::sync::Arc;
+
+        struct Sandbox(std::path::PathBuf);
+        impl Sandbox {
+            fn new(tag: &str) -> Self {
+                use std::sync::atomic::{AtomicU32, Ordering};
+                static N: AtomicU32 = AtomicU32::new(0);
+                let n = N.fetch_add(1, Ordering::Relaxed);
+                let p = std::env::temp_dir()
+                    .join(format!("oaiy-routes-{tag}-{}-{n}", std::process::id()));
+                let _ = std::fs::remove_dir_all(&p);
+                std::fs::create_dir_all(&p).unwrap();
+                Self(p)
+            }
+        }
+        impl Drop for Sandbox {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        fn state(tag: &str, evaluator: Arc<dyn ScriptBatch>) -> (Sandbox, BridgeState) {
+            let sb = Sandbox::new(tag);
+            let st = crate::build_bridge_state(
+                sb.0.join("plugins"),
+                sb.0.clone(),
+                "device".into(),
+                None,
+            );
+            st.host.set_script_evaluator(evaluator);
+            (sb, st)
+        }
+
+        fn binding(condition: Option<&str>) -> crate::bridge::triggers::TriggerBinding {
+            crate::bridge::triggers::TriggerBinding {
+                id: "b1".into(),
+                event: "aokie.call.incoming".into(),
+                flow_id: "f".into(),
+                mode: crate::bridge::triggers::BindingMode::Async,
+                enabled: true,
+                condition: condition.map(str::to_string),
+                input_map: Default::default(),
+                sort_order: 0,
+            }
+        }
+
+        async fn read(response: axum::response::Response) -> (StatusCode, Value) {
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+            (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+        }
+
+        #[tokio::test]
+        async fn a_condition_the_engine_refuses_is_a_400_and_is_not_saved() {
+            // A binding whose condition will never parse looks correct in the
+            // list and is incapable of ever firing — the trigger bug that is
+            // hardest to find. Refusing it where the mistake was made is the
+            // whole point; saving it with a warning is not.
+            let refusing =
+                Arc::new(FakeHost::by_source(|_| Err(guest("expected one expression, and \";\" follows it"))));
+            let (_sb, st) = state("refused", refusing);
+
+            let (status, body) =
+                read(upsert_trigger(State(st.clone()), Json(binding(Some("1); x = (1")))).await).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(body["error"]["code"], "invalid_request");
+            assert!(
+                body["error"]["message"].as_str().unwrap().contains("expected one expression"),
+                "the author needs the engine's own reason: {body}"
+            );
+            assert!(st.host.triggers.lock().unwrap().list().is_empty(), "nothing was saved");
+        }
+
+        #[tokio::test]
+        async fn an_engine_that_cannot_be_reached_saves_and_says_so() {
+            // Not the author's fault, so not the author's 400. Saving is safe:
+            // dispatch decides every condition on ZIPP too, and fails closed, so
+            // an unchecked condition still cannot fire.
+            let down = Arc::new(FakeHost::down("the CLI is not installed"));
+            let (_sb, st) = state("unchecked", down);
+
+            let (status, body) = read(
+                upsert_trigger(State(st.clone()), Json(binding(Some("event.data.x === 1")))).await,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            let warning = body["warning"].as_str().expect("a warning: {body}");
+            assert!(warning.starts_with("condition not checked:"), "{warning}");
+            assert!(warning.contains("the CLI is not installed"), "{warning}");
+            assert_eq!(st.host.triggers.lock().unwrap().list().len(), 1, "and it was saved");
+        }
+
+        #[tokio::test]
+        async fn a_condition_the_engine_compiles_saves_without_a_warning() {
+            let ok = Arc::new(FakeHost::always(Value::Null));
+            let (_sb, st) = state("clean", ok);
+            let (status, body) = read(
+                upsert_trigger(State(st.clone()), Json(binding(Some("event.data.x === 1")))).await,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(body.get("warning").is_none(), "nothing went wrong: {body}");
+            assert_eq!(body["bindings"].as_array().unwrap().len(), 1);
+        }
+
+        #[tokio::test]
+        async fn a_binding_with_no_condition_never_asks_the_engine() {
+            let ok = Arc::new(FakeHost::always(Value::Null));
+            let (_sb, st) = state("nocond", ok.clone());
+            let (status, _) = read(upsert_trigger(State(st.clone()), Json(binding(None))).await).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(ok.calls(), 0);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn the_trigger_store_is_not_locked_while_the_engine_is_asked() {
+            // `evaluate` takes a process-wide lock and may spawn a child. Holding
+            // the trigger store's lock across that would stall every read of the
+            // binding list behind an engine that is starting.
+            let slow = Arc::new(FakeHost::raw(|_| {
+                std::thread::sleep(std::time::Duration::from_millis(1500));
+                Err(HostError::Unavailable { reason: "slow".into(), retry_after: None })
+            }));
+            let (_sb, st) = state("unlocked", slow);
+
+            let saving = {
+                let st = st.clone();
+                tokio::spawn(async move {
+                    upsert_trigger(State(st), Json(binding(Some("event.data.x === 1")))).await
+                })
+            };
+            // Give the save a moment to get as far as the check.
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+            let started = std::time::Instant::now();
+            let (status, _) = read(list_triggers(State(st.clone())).await).await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(
+                started.elapsed() < std::time::Duration::from_millis(500),
+                "listing waited {:?} — the store was locked across the engine call",
+                started.elapsed()
+            );
+            saving.await.unwrap();
         }
     }
 }

@@ -34,6 +34,7 @@
 //! in the same repo and the desktop already supervises far heavier things
 //! (Python venvs, llama.cpp, a Playwright browser).
 
+pub mod conditions;
 pub mod deadletters;
 pub mod ledger;
 pub mod pairing;
@@ -45,8 +46,10 @@ pub mod worker;
 pub use deadletters::{DeadLetter, DeadLetterHandle, DeadLetterQueue, DeadReason};
 pub use pairing::{PairingHandle, PairingManager};
 pub use routes::{router as bridge_router, BridgeState};
+pub use conditions::{ConditionJob, ConditionVerdict, Verdict};
 pub use script_host::{
-    Health, HealthSnapshot, HostError, JobError, JobResult, ScriptHost, ScriptResponse,
+    GlobalHost, Health, HealthSnapshot, HostError, JobError, JobResult, ScriptBatch, ScriptHost,
+    ScriptResponse,
 };
 pub use worker::{FlowStore, Worker};
 pub use triggers::{dispatch, BindingMode, DispatchOutcome, Event, SkipReason, TriggerBinding};

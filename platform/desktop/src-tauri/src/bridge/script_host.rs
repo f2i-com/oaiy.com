@@ -1010,6 +1010,49 @@ impl ScriptHost {
 // Tests
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// The seam: anything that can serve one batch
+// ---------------------------------------------------------------------------
+
+/// One batch of script jobs, served.
+///
+/// A trait rather than a bare `&ScriptHost` so the lanes that depend on the
+/// engine — trigger conditions, binding conditions, the save-time check — can be
+/// tested against a stub that answers instantly and records exactly what it was
+/// sent. The real implementation is [`ScriptHost`]; there is no second
+/// production one.
+pub trait ScriptBatch: Send + Sync {
+    /// Serve `request` (a `script-request` document, see [`batch_request`]).
+    ///
+    /// `Err` is a HOST-level failure — nothing was served, so no job has an
+    /// answer. A job that ran and failed comes back inside `Ok` as a
+    /// [`JobError`], which is a very different thing: the requester's source
+    /// misbehaved, the host is fine. The condition lanes depend on that
+    /// distinction — only an answered job may contradict the Rust grammar.
+    fn run(&self, request: &Value) -> Result<ScriptResponse, HostError>;
+}
+
+impl ScriptBatch for ScriptHost {
+    fn run(&self, request: &Value) -> Result<ScriptResponse, HostError> {
+        self.evaluate(request)
+    }
+}
+
+/// The process-wide host, as a `ScriptBatch` value.
+///
+/// [`ScriptHost::global`] hands back a `&'static ScriptHost`, which cannot be
+/// put in the `Arc<dyn ScriptBatch>` the owners store. This zero-sized stand-in
+/// can, and it resolves the global on every call rather than capturing it — so
+/// nothing is spawned by the act of wiring a lane up.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GlobalHost;
+
+impl ScriptBatch for GlobalHost {
+    fn run(&self, request: &Value) -> Result<ScriptResponse, HostError> {
+        ScriptHost::global().evaluate(request)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1693,5 +1736,100 @@ rl.on('close', () => {{ if (!IGNORE_SHUTDOWN) queue.then(() => process.exit(0));
         let t = Instant::now();
         host.shutdown();
         assert!(t.elapsed() < SHUTDOWN_GRACE, "the real child exits on shutdown: {:?}", t.elapsed());
+    }
+    /// The conditions actually on this account's Aokie bindings, decided by the
+    /// real engine through the real `script --serve` child.
+    ///
+    /// `link::condition` pins the same table against the Rust grammar. The point
+    /// here is that ZIPP agrees with it, expression for expression and case for
+    /// case — that is what makes the shadow release a measurement rather than a
+    /// gamble, and what PR9 is allowed to delete the grammar on.
+    #[test]
+    fn the_real_aokie_conditions_decide_the_same_way_on_zipp() {
+        use crate::bridge::conditions::{decide, ConditionJob, Verdict};
+
+        let Some((node, cli)) = staged_runner() else {
+            eprintln!("no staged CLI or no node — skipping");
+            return;
+        };
+        let host = host_for(cli, &node);
+
+        let duration = "event && event.data ? Number(event.data.durationSeconds || 0) > 5 : false";
+        let outbound = "event && event.data ? String(event.data.direction || '') === 'outbound' : false";
+        let held = "event && event.data ? (String(event.data.outcome || '') === 'abandoned_on_hold' \
+                    && String(event.data.direction || '') !== 'outbound') : false";
+        let missed = "event && event.data ? ((String(event.data.outcome || '') === 'missed' || \
+                      String(event.data.status || '') === 'missed' || \
+                      String(event.data.outcome || '') === 'abandoned_in_queue') && \
+                      String(event.data.direction || '') !== 'outbound') : false";
+        let after = "event && event.data ? (Number(event.data.durationSeconds || 0) > 5 && \
+                     String(event.data.outcome || '') !== 'missed' && \
+                     String(event.data.status || '') !== 'missed' && \
+                     String(event.data.outcome || '') !== 'terminated_abuse' && \
+                     String(event.data.outcome || '') !== 'abandoned_on_hold' && \
+                     String(event.data.outcome || '') !== 'abandoned_in_queue' && \
+                     String(event.data.direction || '') !== 'outbound' && \
+                     event.data.manager !== true) : false";
+
+        // (expression, event data, what its author meant).
+        let table: Vec<(&str, Value, bool)> = vec![
+            (duration, json!({ "durationSeconds": 33 }), true),
+            (duration, json!({ "durationSeconds": 3 }), false),
+            // Absent, null and empty all coerce to 0 — the reason the author
+            // wrote `|| 0` at all — and each must stay BELOW the threshold.
+            (duration, json!({}), false),
+            (duration, json!({ "durationSeconds": null }), false),
+            (duration, json!({ "durationSeconds": "" }), false),
+            // …and a numeric string still compares as a number.
+            (duration, json!({ "durationSeconds": "42" }), true),
+            (outbound, json!({ "direction": "outbound" }), true),
+            (outbound, json!({ "direction": "inbound" }), false),
+            (outbound, json!({}), false),
+            (held, json!({ "outcome": "abandoned_on_hold" }), true),
+            (held, json!({ "outcome": "abandoned_on_hold", "direction": "outbound" }), false),
+            (missed, json!({ "status": "missed" }), true),
+            (missed, json!({ "outcome": "abandoned_in_queue" }), true),
+            (missed, json!({ "outcome": "answered" }), false),
+            (after, json!({ "durationSeconds": 33, "outcome": "answered" }), true),
+            (after, json!({ "durationSeconds": 33, "outcome": "missed" }), false),
+            (after, json!({ "durationSeconds": 33, "manager": true }), false),
+        ];
+
+        // ONE batch, exactly as a dispatch sends one.
+        let jobs: Vec<ConditionJob> = table
+            .iter()
+            .enumerate()
+            .map(|(i, (expr, data, _))| ConditionJob {
+                id: ConditionJob::id_for(i),
+                source: (*expr).to_string(),
+                globals: json!({ "event": { "name": "aokie.call.ended", "data": data } }),
+            })
+            .collect();
+
+        let started = Instant::now();
+        let out = decide(&host, &jobs);
+        eprintln!("the real engine decided {} conditions in {:?}", jobs.len(), started.elapsed());
+
+        for (answer, (expr, data, expected)) in out.iter().zip(&table) {
+            let want = if *expected { Verdict::True } else { Verdict::False };
+            assert!(answer.answered, "{expr} / {data} was not answered: {answer:?}");
+            assert_eq!(answer.verdict, want, "{expr}\n  with {data}");
+        }
+
+        // And the save-time check, on the same warm child: a real expression
+        // compiles, and source that is not ONE expression is refused rather
+        // than quietly compiling into two statements.
+        use crate::bridge::conditions::{check, CheckOutcome};
+        assert_eq!(check(&host, duration), CheckOutcome::Parses);
+        match check(&host, "1); globalThis.pwned = (1") {
+            CheckOutcome::Rejected(why) => assert!(!why.is_empty(), "a refusal must say why"),
+            other => panic!("that is not one expression: {other:?}"),
+        }
+        match check(&host, "event.data.x ===") {
+            CheckOutcome::Rejected(_) => {}
+            other => panic!("a half-written condition must be refused at save time: {other:?}"),
+        }
+
+        host.shutdown();
     }
 }
