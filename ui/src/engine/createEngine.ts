@@ -27,6 +27,7 @@ import {
   type DatabaseResult,
 } from 'oaiy-core';
 import type { UntrustedWorkerFactory } from 'oaiy-core/src/untrusted-executor';
+import type { ScriptExecutor } from 'oaiy-core/src/script-executor';
 import { invoke } from '@tauri-apps/api/core';
 import * as db from '../services/database';
 import { getFlowDatabaseManager } from '../services/database';
@@ -210,13 +211,21 @@ export interface CreateEngineOptions {
   tauriInvoke?: TauriInvoke;
   /**
    * Builds the Worker untrusted package workflows run in. Only the browser
-   * host supplies one (a Zipp-backed Worker, see `lib/zippPrefs.ts`); the CLI
-   * leaves it unset, both because it has no `Worker` and because its flows are
-   * trusted and never reach that path.
+   * host supplies one (a Zipp-backed Worker, see `lib/zippPrefs.ts`). The CLI
+   * has no `Worker`; it supplies `scriptExecutor` + `requireScriptExecutor`
+   * instead (from PR2a on) so its flows never run in-thread on V8.
    */
   untrustedWorkerFactory?: UntrustedWorkerFactory;
   /** Also run trusted local flows in that Worker; consulted per job. */
   runTrustedFlowsInWorker?: boolean | (() => boolean);
+  /**
+   * The engine every flow runs on, trusted or hardened, regardless of `Worker`
+   * availability; preempts `untrustedWorkerFactory`. See
+   * `RuntimeConfig.scriptExecutor`.
+   */
+  scriptExecutor?: ScriptExecutor | null;
+  /** Refuse to run flow code when no `scriptExecutor` is set (fail closed). */
+  requireScriptExecutor?: boolean;
 }
 
 /**
@@ -244,5 +253,9 @@ export function createEngine(opts: CreateEngineOptions = {}): JobManager {
           runTrustedFlowsInWorker: opts.runTrustedFlowsInWorker ?? false,
         }
       : {}),
+    // Forwarded unconditionally — the refusal must reach the runtime even when
+    // no Worker factory was supplied (the CLI's case).
+    scriptExecutor: opts.scriptExecutor ?? null,
+    requireScriptExecutor: opts.requireScriptExecutor ?? false,
   });
 }
