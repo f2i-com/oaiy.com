@@ -4,6 +4,9 @@
  * Proves the JobManager actually runs jobs CONCURRENTLY now that the capacity-1 clamp
  * is gone, and that two concurrent jobs keep isolated inputs/outputs. Run via `npm test`.
  *
+ * Both jobs run on the CLI's real engine (`createCliEngine`: the ZIPP VM on a
+ * worker thread each), so the concurrency proved here is two worker threads.
+ *
  * Two checks:
  *  1. Capacity: submit 2 jobs in mode=parallel/maxConcurrency=2 and assert NEITHER is
  *     left 'queued' right after submit — i.e. both started (the old clamp would have
@@ -12,7 +15,7 @@
  *     OWN, not the other's (no cross-contamination through the engine).
  */
 import '../src/node-host/core'; // installs window.__TAURI__ before shared code reads it
-import { createEngine } from '../../ui/src/engine/createEngine';
+import { createCliEngine } from '../src/engine';
 import { loadNodeBundledModules } from '../src/generated/bundled-modules';
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -40,7 +43,7 @@ function templateFlow(text: string): any {
 
 async function main(): Promise<void> {
   await loadNodeBundledModules();
-  const engine = createEngine({
+  const engine = await createCliEngine({
     config: { mode: 'parallel', maxConcurrency: 2 },
     networkPermissionHandler: async () => ({ allowed: true, remember: false }),
   });

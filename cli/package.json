@@ -9,8 +9,11 @@
     "oaiy": "bin/oaiy.mjs"
   },
   "scripts": {
+    "prebuild": "node ../scripts/fetch-zipp-release.mjs --ensure",
     "build": "node esbuild.mjs",
+    "pretypecheck": "node ../scripts/fetch-zipp-release.mjs --ensure",
     "typecheck": "tsc --noEmit -p tsconfig.json",
+    "pretest": "node ../scripts/fetch-zipp-release.mjs --ensure",
     "test": "node test/run-test.mjs test/module-ctx-isolation.ts dist/_ctxtest.mjs && node test/run-test.mjs test/cross-module-isolation.ts dist/_xmtest.mjs && node test/run-test.mjs test/ssrf-guard.test.ts dist/_ssrftest.mjs --packages-external && node test/run-test.mjs test/connector-module.test.ts dist/_connectortest.mjs && node test/build-engine-tests.mjs",
     "test:http-exit": "npm run build && node test/cli-http-exit.mjs",
     "oaiy": "node bin/oaiy.mjs"

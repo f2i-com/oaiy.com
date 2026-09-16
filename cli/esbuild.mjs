@@ -8,11 +8,18 @@
  *  2. Bundle with an alias plugin mirroring ui/vite.config.ts: the same
  *     `oaiy-core` / `oaiy-core/modules/*` source resolution, with `@tauri-apps/*`
  *     pointed at the Node host (src/node-host/*) instead of the browser shim.
+ *  3. Ship the ZIPP engine: verify the installed release (the same check ui's
+ *     tests run), bake its identity into every bundle as `define`s, stage the
+ *     .wasm and notices to dist/zipp/, and build the worker shell that runs
+ *     flows on it (dist/oaiy-zipp-worker.mjs). Nothing here names a release:
+ *     the identity is whatever SOURCE.json the installer wrote.
  */
 import esbuild from 'esbuild';
+import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { checkInstall, VARIANTS } from '../scripts/fetch-zipp-release.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repo = path.resolve(__dirname, '..'); // oaiy-web/
@@ -144,6 +151,73 @@ export const aliasPlugin = {
   },
 };
 
+// --- 3. The ZIPP engine the CLI ships -------------------------------------
+// The web-python bundle of the installed release (ui/vendor/zipp-wasm-python,
+// gitignored; `npm run build` and `npm test` run `--ensure` first). The
+// install is checked the way ui's tests check it, and its SOURCE.json is the
+// only source of the engine's identity — no sha, revision or tag is written
+// here, so a new release needs no edit.
+const ZIPP_VARIANT = VARIANTS.find((v) => v.suffix === 'web-python');
+if (!ZIPP_VARIANT) throw new Error('fetch-zipp-release.mjs no longer describes the web-python bundle');
+const zippVendor = path.join(repo, 'ui', 'vendor', ZIPP_VARIANT.folder);
+// Staged beside the CLI: the engine, its profile, the installer's record, and
+// the notices any redistribution of this bundle must carry.
+const ZIPP_STAGED = ['zipp_wasm_bg.wasm', 'PROFILE.json', 'SOURCE.json', 'LICENSE-APACHE', 'THIRD_PARTY_LICENSES.txt'];
+const sha256 = (bytes) => createHash('sha256').update(bytes).digest('hex');
+
+let zippIdentityCache = null;
+/** Verify the install (throws when it does not check) and read its identity. */
+export function zippIdentity() {
+  if (zippIdentityCache) return zippIdentityCache;
+  const source = checkInstall(zippVendor, ZIPP_VARIANT);
+  zippIdentityCache = {
+    name: 'zipp',
+    release: source.release,
+    version: source.version,
+    revision: source.revision,
+    variant: source.variant,
+    bundle: source.bundle,
+    wasmSha256: source.sha256,
+    glueSha256: source.glueSha256,
+    languages: source.languages,
+  };
+  return zippIdentityCache;
+}
+
+/** The identity as esbuild `define`s (src/types/shared-source-globals.d.ts declares them). */
+export function zippDefines() {
+  const identity = zippIdentity();
+  return {
+    __ZIPP_WASM_SHA256__: JSON.stringify(identity.wasmSha256),
+    __ZIPP_ENGINE__: JSON.stringify(JSON.stringify(identity)),
+  };
+}
+
+/**
+ * Stage dist/zipp/ and build dist/oaiy-zipp-worker.mjs. The staged .wasm is
+ * hashed AFTER the copy — those bytes are what the CLI checks at run time
+ * against the define, so they are checked here against the same digest.
+ */
+export async function buildZippAssets({ dist = path.join(__dirname, 'dist'), logLevel = 'info' } = {}) {
+  const identity = zippIdentity();
+  const outDir = path.join(dist, 'zipp');
+  fs.mkdirSync(outDir, { recursive: true });
+  for (const name of ZIPP_STAGED) {
+    fs.copyFileSync(path.join(zippVendor, name), path.join(outDir, name));
+  }
+  const staged = sha256(fs.readFileSync(path.join(outDir, 'zipp_wasm_bg.wasm')));
+  if (staged !== identity.wasmSha256) {
+    throw new Error(`dist/zipp/zipp_wasm_bg.wasm has sha256 ${staged} after the copy, not ${identity.wasmSha256}`);
+  }
+  await esbuild.build({
+    entryPoints: [path.join(__dirname, 'src', 'zipp', 'workflow-worker.ts')],
+    outfile: path.join(dist, 'oaiy-zipp-worker.mjs'),
+    logLevel,
+    ...commonBuildOptions,
+  });
+  return identity;
+}
+
 // Build options shared by the CLI bundle and the engine-level tests (test/*.ts that
 // import the real createEngine + node-host), so the tests resolve the exact same
 // @tauri-apps→node-host + oaiy-core aliases the CLI does.
@@ -158,6 +232,10 @@ export const commonBuildOptions = {
   define: {
     'import.meta.env': '{}',
     'import.meta.vitest': 'undefined',
+    // The engine identity, in every bundle that can reach src/zipp/artifact.ts
+    // (the CLI, the worker shell, the engine-level tests). Computed when this
+    // module loads, so a build without a verified ZIPP install fails here.
+    ...zippDefines(),
   },
   // Keep node:sqlite (experimental builtin), Playwright (heavy, ships its own
   // browsers), sharp (optional native image lib) and undici (the SSRF guard's
@@ -180,6 +258,8 @@ const isMain = import.meta.url === pathToFileURL(process.argv[1] ?? '').href;
 if (isMain) {
   const count = genBundledModules();
   process.stderr.write(`esbuild: generated registration for ${count} bundled modules\n`);
+  const engine = await buildZippAssets();
+  process.stderr.write(`esbuild: staged ZIPP ${engine.release} (${engine.revision.slice(0, 8)}) to dist/zipp and built dist/oaiy-zipp-worker.mjs\n`);
   await esbuild.build({
     entryPoints: [path.join(__dirname, 'src', 'cli.ts')],
     outfile: path.join(__dirname, 'dist', 'oaiy.mjs'),

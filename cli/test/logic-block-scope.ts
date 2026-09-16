@@ -298,6 +298,33 @@ async function main(): Promise<void> {
     `gate=${JSON.stringify(condVocab.results?.['gate'])} error=${condVocab.error ?? ''}`
   );
 
+  // The host realm must be out of reach. Every block runs inside the ZIPP VM on
+  // a worker thread whose environment is empty (`createCliEngine`), so the
+  // Node globals a flow could once read — and through them the process's
+  // environment, OAIY_SERVER_TOKEN included — are not defined there at all.
+  // On the in-thread `new Function` path this tuple was
+  // ['object', 'undefined', 'function', 'object'].
+  const realm = await runFlow(
+    {
+      nodes: [
+        {
+          id: 'realm',
+          type: 'logic_block',
+          position: { x: 0, y: 0 },
+          data: { code: 'return [typeof process, typeof require, typeof Buffer, typeof globalThis.__TAURI__];' },
+        },
+      ],
+      edges: [],
+    } as WorkflowGraph,
+    { timeoutMs: 30_000 }
+  );
+  check(
+    'a block cannot see process, require, Buffer or __TAURI__',
+    realm.status === 'completed' &&
+      JSON.stringify(realm.results?.['realm']) === JSON.stringify(['undefined', 'undefined', 'undefined', 'undefined']),
+    `status=${realm.status} error=${realm.error ?? ''} got=${JSON.stringify(realm.results?.['realm'])}`
+  );
+
   console.log(`logic-block-scope: ${passed} passed, ${failed} failed`);
   process.exit(failed ? 1 : 0);
 }
