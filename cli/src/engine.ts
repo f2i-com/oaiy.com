@@ -17,6 +17,8 @@ import { loadNodeBundledModules } from './generated/bundled-modules';
 import { closeAll as closeBrowserSessions } from './node-host/browser';
 import { loadZippArtifact, EngineUnavailableError } from './zipp/artifact';
 import { createZippThreadExecutor } from './zipp/thread-executor';
+import { resolveInstructionBudget } from './zipp/profile';
+import type { ScriptProfile } from 'oaiy-core/src/zipp-script';
 
 export interface CliEngineOptions extends CreateEngineOptions {
   /**
@@ -24,6 +26,12 @@ export interface CliEngineOptions extends CreateEngineOptions {
    * (1 to 2e9). Unset runs on the engine's own default, as the browser does.
    */
   instructionBudgetSteps?: number;
+  /**
+   * A script profile's preamble (`run --profile`, `src/zipp/profile.ts`),
+   * emitted at program top level in the worker before every flow script.
+   * Validated (digest, reserved names) before it gets here; this only carries it.
+   */
+  preamble?: string;
 }
 
 /**
@@ -42,7 +50,7 @@ export interface CliEngineOptions extends CreateEngineOptions {
  * outside the engine's range — both before any worker exists.
  */
 export async function createCliEngine(opts: CliEngineOptions = {}): Promise<JobManager> {
-  const { instructionBudgetSteps, ...engineOptions } = opts;
+  const { instructionBudgetSteps, preamble, ...engineOptions } = opts;
   // Not in any shipped bundle: `cli/esbuild.mjs` defines this `false`, and
   // esbuild folds `false && …` to `false` — the call, and the `false` it would
   // pass, are not in dist/oaiy.mjs (test/zipp-guard.mjs checks). The guard
@@ -55,7 +63,7 @@ export async function createCliEngine(opts: CliEngineOptions = {}): Promise<JobM
   const artifact = await loadZippArtifact();
   return createEngine({
     ...engineOptions,
-    scriptExecutor: createZippThreadExecutor(artifact, { instructionBudgetSteps }),
+    scriptExecutor: createZippThreadExecutor(artifact, { instructionBudgetSteps, preamble }),
     requireScriptExecutor: true,
   });
 }
@@ -81,8 +89,19 @@ export interface RunOptions {
    * refuses the flow — which is the correct outcome, not a silent skip.
    */
   connectorPath?: string;
-  /** See `CliEngineOptions.instructionBudgetSteps`. */
+  /**
+   * See `CliEngineOptions.instructionBudgetSteps`. With `profile` present this
+   * must be unset — `resolveInstructionBudget` (src/zipp/profile.ts) refuses
+   * the pair before a run gets this far, so the flow never runs on a budget
+   * the caller did not intend.
+   */
   instructionBudgetSteps?: number;
+  /**
+   * A validated script profile (`run --profile`): its `preamble` goes to the
+   * worker's program top level and its `instructionSteps`, when set, is the
+   * budget. Loaded and checked by `loadScriptProfile` before the flow is read.
+   */
+  profile?: ScriptProfile;
 }
 
 export interface RunResult {
@@ -146,7 +165,11 @@ export async function runFlow(graph: WorkflowGraph, opts: RunOptions = {}): Prom
         allowed: opts.allowLocalNetwork !== false,
         remember: false,
       }),
-      instructionBudgetSteps: opts.instructionBudgetSteps,
+      // The profile's figure when it has one, else the caller's; BOTH throws
+      // (`ScriptProfileError`) — `cli.ts` asks the same question before the
+      // flow is read, so a run never gets this far with two budgets.
+      instructionBudgetSteps: resolveInstructionBudget(opts.profile, opts.instructionBudgetSteps),
+      preamble: opts.profile?.preamble,
     });
   } catch (e) {
     // No engine: the run did not happen. Reported, not thrown, so `run` and

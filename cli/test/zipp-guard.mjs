@@ -231,7 +231,10 @@ try {
   assert.equal(caps.code, 0, `capabilities failed: ${caps.stderr}`);
   const report0 = JSON.parse(caps.stdout);
   assert.equal(report0.version, pkg.version, "version is package.json's");
-  assert.deepEqual(report0.protocols, { run: 1 });
+  assert.deepEqual(report0.protocols, { run: 1, script: 1, profile: 1 });
+  assert.deepEqual(report0.script.languages, stagedSource.languages, 'script.languages is what the leaf envelope runs on this engine');
+  assert.ok(Number.isInteger(report0.script.defaultBudgetMs) && report0.script.defaultBudgetMs > 0);
+  assert.ok(Number.isInteger(report0.script.maxBudgetMs) && report0.script.maxBudgetMs >= report0.script.defaultBudgetMs);
   assert.equal(report0.engine.status, 'ready');
   assert.equal(report0.engine.reason, undefined);
   assert.equal(report0.engine.name, 'zipp');

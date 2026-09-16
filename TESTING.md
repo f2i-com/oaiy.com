@@ -263,18 +263,26 @@ Every flow the CLI runs goes to the ZIPP VM on a `worker_threads` Worker through
 installed web-python bundle, bakes its `SOURCE.json` identity and two figures from
 its `PROFILE.json` (`lifetimeSteps`, `maxInstructionBudgetSteps`) into the bundle
 as defines, stages `zipp_wasm_bg.wasm`, `PROFILE.json`, `SOURCE.json` and the
-notices to `cli/dist/zipp/`, and builds `dist/oaiy-zipp-worker.mjs`. At run time
-the staged bytes must hash to the build's digest or the run is
+notices to `cli/dist/zipp/`, and builds the two worker shells
+`dist/oaiy-zipp-worker.mjs` (a workflow) and `dist/oaiy-script-worker.mjs` (the
+leaf-script engine behind `oaiy script`). At run time the staged bytes must hash
+to the build's digest, and both shells must be present, or the run is
 `engine_unavailable` (exit 1, no job). `oaiy capabilities --json` reports the
-version, the run protocol, the engine identity with `status: ready|unavailable`
-(a real hash-and-compile of the staged artifact, exit 1 when it fails) and
+version, the protocols (`run`, `script`, `profile`, each 1), the engine identity
+with `status: ready|unavailable` (a real hash-and-compile of the staged artifact,
+exit 1 when it fails),
 `run: { languages: ['javascript'], defaultInstructionSteps, maxInstructionSteps }`
-— `run.languages` is what this host runs and is kept apart from
-`engine.languages` (what the bundle could) so nothing advertises Python before a
-host can run it. `oaiy run --instruction-budget <steps>` takes an integer from 1
-to that ceiling and is refused before any flow is read otherwise. A run's payload
-carries `engine: "zipp"` and, when the host rather than the flow ended it,
-`errorCode: "timeout" | "engine_unavailable"`.
+— `run.languages` is what a WORKFLOW may be written in on this host and is kept
+apart from `engine.languages` (what the bundle could) so nothing advertises
+Python flows before a host can run them — and
+`script: { languages, defaultBudgetMs, maxBudgetMs }`, the engine's own language
+list because a `python-project` leaf job runs on the shipped web-python engine.
+`oaiy run --instruction-budget <steps>` takes an integer from 1 to that ceiling
+and is refused before any flow is read otherwise; `run --profile <file>` applies
+a script profile's preamble and budget and is refused the same way when the
+profile does not check or names a budget beside `--instruction-budget`. A run's
+payload carries `engine: "zipp"` and, when the host rather than the flow ended
+it, `errorCode: "timeout" | "engine_unavailable"`.
 
 `cd cli && npm run build && npm test` runs the whole gate; these are its ZIPP
 parts, each runnable alone against the `dist/` the build just made (a stale
@@ -283,11 +291,13 @@ parts, each runnable alone against the `dist/` the build just made (a stale
 | Command | What fails it |
 |---|---|
 | `node test/zipp-cli.mjs` | at the process boundary: the realm probe sees `process`/`require`/`Buffer`/`__TAURI__` or `OAIY_SERVER_TOKEN`; a missing or byte-flipped artifact runs anything or is not `engine_unavailable`; `--timeout` does not abort a budget-renewing loop or leaves a thread behind |
-| `node test/no-host-eval.mjs` (Guard A) | any `Function`/`eval`/`AsyncFunction`-recovery/`node:vm` in `dist/oaiy.mjs` or `dist/oaiy-zipp-worker.mjs` beyond two sites allowlisted by argument shape: the logger's `import.meta` probe (permanent) and the runtime's in-thread `new Function('host','console',script)` (unreachable from the CLI; expires when Phase 6 removes it — the count is exact, so its removal fails the guard until this entry goes). oaiy-core's package loaders do not survive tree-shaking and are not allowlisted. Self-test: an injected `new Function('x')`, a `constructor.constructor` recovery, `eval('1')` and a `node:vm` import must each be found |
+| `node test/no-host-eval.mjs` (Guard A) | any `Function`/`eval`/`AsyncFunction`-recovery/`node:vm` in `dist/oaiy.mjs`, `dist/oaiy-zipp-worker.mjs` or `dist/oaiy-script-worker.mjs` (expected counts 1/1, 0/0, 0/0 — the envelope's `new Function`/`eval` are guest program text inside string literals) beyond two sites allowlisted by argument shape: the logger's `import.meta` probe (permanent) and the runtime's in-thread `new Function('host','console',script)` (unreachable from the CLI; expires when Phase 6 removes it — the count is exact, so its removal fails the guard until this entry goes). oaiy-core's package loaders do not survive tree-shaking and are not allowlisted. Self-test: an injected `new Function('x')`, a `constructor.constructor` recovery, `eval('1')` and a `node:vm` import must each be found |
 | `node test/engine-wiring.mjs` | a `createEngine(` or `import { createEngine }` in `cli/src` or `cli/test` outside `createCliEngine`, bar the crash-injection site in `test/zipp-engine.ts` (allowed by shape: a `createZippThreadExecutor` with its own `workerEntry` and `requireScriptExecutor: true`). Self-test: a synthetic stray call and import must be found |
 | `node test/zipp-guard.mjs` (Guards B, C, D) | `fixtures/zipp-canary.json` (all six logic_block branches, a condition expression, a count loop, a subflow, a macro, the Desktop's `(new Function("ctx",decodeURIComponent(…)))(…)` shape) run under `guards/host-eval-tripwire.mjs` — loaded with `node --import`, inherited by every worker, reporting per `threadId` on stderr — counts any host `Function`/`eval`/`vm` call (0 across 4 threads); the probe's five `typeof`s are not all `undefined` (the fifth is `Function('return this')().process`); the token reaches a stream or the result; `while (true) {}` is not stopped by the budget in 10 s (measured ~0.65 s); `--instruction-budget 2000000000 --timeout 3` is not `aborted`/`timeout` in 6 s (measured ~3.15 s); a missing or flipped artifact is not `engine_unavailable` with no job |
 | the same file, non-vacuity | the tripwire must count a script's `new Function`, `eval` and recovered `AsyncFunction` (3) and skip the logger probe; the production bundle must contain neither `__OAIY_TEST_ALLOW_V8__` nor `requireScriptExecutor: false`; a bundle the test builds from the same sources with the build-time define `__OAIY_TEST_ALLOW_V8__: 'true'` (`dist/_v8_oaiy.mjs`; no flag or variable selects it) must run the same canary on the host engine and report `typeof process === 'object'`, read the token, take the condition's false branch and trip the tripwire 5× (the entry, subflow and macro scripts plus the flow's own two `Function` calls). Run once against the previous revision's bundle (b95c592's parent, built in a worktree) the tripwire counted the same 5 and the probe read `["object","undefined","function","object","object"]` and the token |
 | `node test/zipp-limits.mjs` | any case hangs. Everything else is recorded (below), never asserted |
+| `node test/zipp-script.mjs` | `oaiy script --request` does not run a JavaScript job and a Python project on the staged engine, or its response fails `protocol/v1/script-result.schema.json` or names an engine other than `dist/zipp/SOURCE.json`'s; a refused request is not the refusal object with exit 1; a non-JSON file or a missing engine writes an output file; `--serve` does not answer N batches in order over one worker, `pong.instance` does not go 1 → 2 → 3 → 4 across a `resource` error, a watchdog `timeout` (budget + 1500 ms grace, measured ~1.8 s) and the 5000th job while the NEXT job in each batch still runs, a malformed line is not one `invalid_line` error with the stream continuing, any stdout line is not protocol JSON, any result line fails the schema, or `shutdown`/EOF do not exit 0 on their own; `run --profile` does not place the preamble at program top level (a flow reads a name only it defines), does not apply its `instructionSteps`, or fails to refuse — before the flow file is read, with no result file — two budgets, a bad digest, a reserved name (also destructured), a `let` over a guest shim, a non-parsing preamble or an unknown field; `capabilities` does not report `protocols {run, script, profile}` and `script.languages` = the engine list |
+| `node test/cli-asset.mjs` | `scripts/pack-cli-asset.mjs` (what release.yml runs for `oaiy-cli-<v>.tar.gz`) writes into the staged folder instead of a copy, produces a tarball the platform's `tar` cannot extract, an inner `SHA256SUMS` that does not match every file or omits one (`sha256sum -c` is run where present), or an `oaiy-cli.json` that is not byte-for-byte the EXTRACTED CLI's `capabilities --json` with `protocols {run, script, profile}`, a ready engine and the staged digest; or it writes an asset for a staged CLI whose engine does not check — including when the builder's own `OAIY_ZIPP_ASSET_DIR` names a good engine (the copy runs with every `OAIY_*` scrubbed) |
 
 ### ZIPP boundary measurements (zipp.org v0.0.19, web-python; `node test/zipp-limits.mjs`)
 

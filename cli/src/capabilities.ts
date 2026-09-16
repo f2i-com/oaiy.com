@@ -6,8 +6,13 @@
  * Everything in it is either the build's own record or measured now:
  *
  *   * `version`   — cli/package.json's, the one place it is written;
- *   * `protocols` — the `run` payload shape (`success`, `status`, `results`,
- *                   `output`, `error`, `errorCode`, `engine`), version 1;
+ *   * `protocols` — `run`: the `oaiy run` payload shape (`success`, `status`,
+ *                   `results`, `output`, `error`, `errorCode`, `engine`);
+ *                   `script`: the leaf-script envelope `oaiy script` speaks
+ *                   (`protocol/v1/script-{request,result}.schema.json`, and
+ *                   `--serve`'s NDJSON framing, `src/script.ts`); `profile`:
+ *                   the script-profile document `run --profile` accepts
+ *                   (`script-profile.schema.json`). Each version 1;
  *   * `engine`    — the ZIPP release the build was made from (`__ZIPP_ENGINE__`,
  *                   from the installed release's SOURCE.json at build time) and
  *                   whether the staged artifact beside this bundle is that
@@ -17,18 +22,31 @@
  *                   `unavailable` with the reason. Never taken from the define
  *                   alone: a bundle whose artifact was not staged with it says
  *                   so here rather than at the first run;
- *   * `run`       — what THIS host runs. `run.languages` is deliberately not
- *                   `engine.languages`: the bundle can execute JavaScript and
- *                   Python, this CLI runs JavaScript flows only, and a heartbeat
- *                   that read the engine's list would advertise Python before
- *                   any host could run it. The two step figures come from the
- *                   release's PROFILE.json at build time (`__ZIPP_RUN_LIMITS__`).
+ *   * `run`       — what THIS host runs as a WORKFLOW (`oaiy run`, `oaiy
+ *                   worker`, the Desktop's flows). `run.languages` is
+ *                   deliberately not `engine.languages`: the bundle can execute
+ *                   JavaScript and Python, but a flow's logic blocks and
+ *                   conditions compile to JavaScript only until the compilers
+ *                   emit Python (O1), and a heartbeat that read the engine's
+ *                   list would advertise Python flows before any host could run
+ *                   them. The two step figures come from the release's
+ *                   PROFILE.json at build time (`__ZIPP_RUN_LIMITS__`);
+ *   * `script`    — what `oaiy script` runs as a LEAF (one job of the
+ *                   envelope). `script.languages` is the engine's list: a
+ *                   `python-project` job runs on this build's web-python engine
+ *                   today, so saying `['javascript']` here would be the lie the
+ *                   other way. The two figures are the `--serve` watchdog's
+ *                   default per-job budget and the largest `budgetMs` a job may
+ *                   ask for (the schema's ceiling).
  *
- * Imports `./zipp/artifact` and nothing of the engine: the probe must stay
- * cheap, and must not construct a runtime to answer a question about one.
+ * Imports `./zipp/artifact`, the script host's policy constants and nothing of
+ * the engine: the probe must stay cheap, and must not construct a runtime to
+ * answer a question about one.
  */
 import { version } from '../package.json';
+import { SCRIPT_MAX_BUDGET_MS } from 'oaiy-core/src/zipp-script';
 import { loadZippArtifact, zippEngineIdentity, type ZippEngineIdentity } from './zipp/artifact';
+import { SCRIPT_DEFAULT_BUDGET_MS } from './zipp/script-host';
 
 export interface RunLimits {
   defaultInstructionSteps: number;
@@ -37,9 +55,10 @@ export interface RunLimits {
 
 export interface Capabilities {
   version: string;
-  protocols: { run: 1 };
+  protocols: { run: 1; script: 1; profile: 1 };
   engine: ZippEngineIdentity & { status: 'ready' | 'unavailable'; reason?: string };
   run: { languages: ['javascript'] } & RunLimits;
+  script: { languages: string[]; defaultBudgetMs: number; maxBudgetMs: number };
 }
 
 /** The two instruction-step figures the build recorded from PROFILE.json. */
@@ -73,8 +92,11 @@ export async function capabilities(): Promise<Capabilities> {
   }
   return {
     version,
-    protocols: { run: 1 },
+    protocols: { run: 1, script: 1, profile: 1 },
     engine: status,
     run: { languages: ['javascript'], ...runLimits() },
+    // The build's engine record (SOURCE.json via the define), the same list as
+    // `engine.languages`: the envelope decides `unsupported` from exactly it.
+    script: { languages: [...identity.languages], defaultBudgetMs: SCRIPT_DEFAULT_BUDGET_MS, maxBudgetMs: SCRIPT_MAX_BUDGET_MS },
   };
 }

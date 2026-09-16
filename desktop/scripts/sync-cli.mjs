@@ -12,8 +12,10 @@
  * imports, so they stay optional — browser work has its own managed service.
  *
  * Ships the ENGINE too: the CLI runs every flow on the ZIPP VM in a worker
- * thread, so `oaiy-zipp-worker.mjs` and `zipp/` (the wasm, its SOURCE.json and
- * PROFILE.json, the licences) go beside the bundle. Staging is then verified —
+ * thread, so both worker shells — `oaiy-zipp-worker.mjs` (a workflow) and
+ * `oaiy-script-worker.mjs` (the leaf-script engine behind `oaiy script`, which
+ * the Desktop's script host drives) — and `zipp/` (the wasm, its SOURCE.json
+ * and PROFILE.json, the licences) go beside the bundle. Staging is then verified —
  * the wasm against the staged SOURCE.json's digest, the bundle against that
  * same digest, every file against its `cli/dist` source — and a mismatch is a
  * failed build, because a desktop whose bundle cannot find its engine would

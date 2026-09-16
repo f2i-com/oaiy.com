@@ -42,6 +42,7 @@ function writeDist() {
   fs.writeFileSync(path.join(dist, 'zipp', 'PROFILE.json'), '{"limits":{}}');
   fs.writeFileSync(path.join(dist, 'zipp', 'LICENSE-APACHE'), 'Apache-2.0\n');
   fs.writeFileSync(path.join(dist, 'oaiy-zipp-worker.mjs'), 'export {};\n');
+  fs.writeFileSync(path.join(dist, 'oaiy-script-worker.mjs'), 'export {};\n');
   // The bundle carries the wasm digest as the baked define does.
   fs.writeFileSync(path.join(dist, 'oaiy.mjs'), `var __ZIPP_WASM_SHA256__ = "${source.sha256}";\n`);
   return source;
@@ -65,13 +66,16 @@ describe('staging the CLI and its engine', () => {
     expect(missingBuildOutputs(dist)).toEqual([]);
     fs.rmSync(path.join(dist, 'oaiy-zipp-worker.mjs'));
     expect(missingBuildOutputs(dist)).toEqual(['oaiy-zipp-worker.mjs']);
+    fs.rmSync(path.join(dist, 'oaiy-script-worker.mjs'));
+    expect(missingBuildOutputs(dist)).toEqual(['oaiy-zipp-worker.mjs', 'oaiy-script-worker.mjs']);
   });
 
-  it('stages the bundle, the worker and the five engine files, and they verify against dist', () => {
+  it('stages the bundle, both worker shells and the five engine files, and they verify against dist', () => {
     const source = writeDist();
     stageEngine(dist, dest);
     for (const rel of STAGED_FILES) expect(fs.existsSync(path.join(dest, rel)), rel).toBe(true);
-    expect(STAGED_FILES).toHaveLength(7);
+    expect(STAGED_FILES).toHaveLength(8);
+    expect(STAGED_FILES).toContain('oaiy-script-worker.mjs');
     expect(verifyStaged(dest, dist)).toEqual({ release: source.release, wasmSha256: source.sha256 });
   });
 
@@ -81,6 +85,14 @@ describe('staging the CLI and its engine', () => {
     fs.rmSync(path.join(dest, 'oaiy-zipp-worker.mjs'));
     expect(() => verifyStaged(dest, dist)).toThrow(StagingError);
     expect(() => verifyStaged(dest, dist)).toThrow(/missing oaiy-zipp-worker\.mjs/);
+  });
+
+  it('a missing leaf-script worker shell is a failure that names it (the CLI refuses to run without it)', () => {
+    writeDist();
+    stageEngine(dist, dest);
+    fs.rmSync(path.join(dest, 'oaiy-script-worker.mjs'));
+    expect(() => verifyStaged(dest, dist)).toThrow(StagingError);
+    expect(() => verifyStaged(dest, dist)).toThrow(/missing oaiy-script-worker\.mjs/);
   });
 
   it('a tampered wasm is a failure naming the file and both digests', () => {

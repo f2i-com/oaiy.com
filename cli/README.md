@@ -54,8 +54,18 @@ node bin/oaiy.mjs validate flow.json    # parse + structural check
 # anything is read).
 node bin/oaiy.mjs run flow.json --timeout 60 --instruction-budget 200000000
 
+# A script profile (protocol/v1/script-profile.schema.json): its preamble is
+# placed before every flow script, its instructionSteps is the budget. Not
+# together with --instruction-budget (two budgets are refused, not picked from).
+node bin/oaiy.mjs run flow.json --profile profile.json
+
 # What this build is and can run (see "The engine" below).
 node bin/oaiy.mjs capabilities --json
+
+# Leaf scripts without a flow (see "Leaf scripts" below): one request, or a
+# warm engine served over stdin/stdout as NDJSON.
+node bin/oaiy.mjs script --request request.json -o response.json
+node bin/oaiy.mjs script --serve
 ```
 
 Constants (API keys etc.) are also read from `OAIY_CONST_<NAME>` env vars.
@@ -91,20 +101,73 @@ shell too.
 
 ```json
 { "version": "0.2.0",
-  "protocols": { "run": 1 },
+  "protocols": { "run": 1, "script": 1, "profile": 1 },
   "engine": { "name": "zipp", "release": "v0.0.19", "version": "0.0.19", "revision": "…",
               "variant": "javascript-python", "bundle": "zipp-wasm-0.0.19-web-python.zip",
               "wasmSha256": "…", "glueSha256": "…", "languages": ["javascript", "python"],
               "status": "ready" },
-  "run": { "languages": ["javascript"], "defaultInstructionSteps": 50000000, "maxInstructionSteps": 2000000000 } }
+  "run": { "languages": ["javascript"], "defaultInstructionSteps": 50000000, "maxInstructionSteps": 2000000000 },
+  "script": { "languages": ["javascript", "python"], "defaultBudgetMs": 1000, "maxBudgetMs": 60000 } }
 ```
 
-`engine` is the release the build was made from and whether the staged artifact
-is it NOW (`status`, with a `reason` when `unavailable`). `run.languages` is what
-THIS host runs and is deliberately not `engine.languages` (what the bundle
-could): the CLI runs JavaScript flows only. The two step figures are the
-engine's own default per script entry and the ceiling `--instruction-budget`
-accepts, read from the release's `PROFILE.json` at build time.
+`protocols` names what this build speaks: `run`, the `oaiy run` result payload;
+`script`, the leaf-script envelope `oaiy script` runs and `--serve`'s NDJSON
+framing; `profile`, the script-profile document `run --profile` accepts. `engine`
+is the release the build was made from and whether the staged artifact is it NOW
+(`status`, with a `reason` when `unavailable`). `run.languages` is what a
+WORKFLOW may be written in on this host — JavaScript only, because a flow's
+logic blocks and conditions compile to JavaScript — and is deliberately not
+`engine.languages` (what the bundle could). `script.languages` is what a LEAF job
+may be written in: the engine's own list, because a `python-project` job runs on
+the shipped web-python engine today. The two step figures are the engine's own
+default per script entry and the ceiling `--instruction-budget` accepts, read
+from the release's `PROFILE.json` at build time; the two ms figures are the
+`--serve` watchdog's default per-job budget and the largest `budgetMs` a job may
+ask for.
+
+### Leaf scripts (`oaiy script`)
+
+A leaf script is one piece of code with no workflow around it — a logic-block
+body, a condition, an entry function called with arguments, a Python project —
+in the envelope `protocol/v1/script-request.schema.json` describes (the shapes
+live in `oaiy-core/src/zipp-script.ts`). `oaiy script --request <file>` runs one
+request and writes the response (`script-result.schema.json`) to `-o` or stdout:
+exit 0 when every job was attempted (a job's own failure is a result with an
+`errorKind`), 1 for a refused request (the refusal object is still written), and
+1 with NOTHING written for an unreadable file or a missing engine.
+
+`oaiy script --serve` keeps ONE warm engine worker and speaks NDJSON — one JSON
+object per line, both ways — which is what the Desktop's script host drives:
+
+```
+→ {"op":"batch","id":<string|number>,"request":<script-request>}
+← {"op":"result","id":<same>,"result":<script-result>}          the response or the refusal, verbatim
+→ {"op":"ping"}                                                  (an "id", if given, is echoed)
+← {"op":"pong","engine":<identity>,"instance":<n>,"jobs":<n>}   instance = workers spawned so far
+→ {"op":"shutdown"}                                              stop reading, answer what was received, exit 0
+← {"op":"error","id":<id|null>,"error":{"code":"invalid_line","message":…}}   a malformed line; the stream continues
+```
+
+Batches are served one at a time in arrival order and each job runs on a fresh
+Engine. A watchdog on the main thread gives every job `budgetMs` (default 1000)
+plus 1500 ms of grace; past that the worker is terminated, the job is answered
+`errorKind: "timeout"`, and the NEXT job — same batch — runs on a replacement.
+The worker is also replaced after a `resource` or `host` error or a WebAssembly
+trap, when the instance's retained run-time-compiled bytes reach 48 MiB, and
+after 5000 jobs; `pong.instance` goes up each time. EOF on stdin ends the
+session like `shutdown`. stdout carries protocol lines only; the worker's own
+streams go to stderr. Without an engine, `--serve` writes one
+`{"op":"error",…"code":"engine_unavailable"}` line and exits 1.
+
+`run --profile <file>` takes the same profile a request may carry
+(`script-profile.schema.json`: `preamble`, its `preambleSha256`, an optional
+`instructionSteps`): the preamble is emitted at program top level before every
+flow script, after the guest shims, so a body the flow compiles at run time sees
+its names too. The file is checked before the flow is read — digest, a parse of
+the preamble, no top-level declaration of a name the engine, the envelope or the
+wrapper binds (destructuring included), no `let`/`const`/`class` over a guest
+shim — and refused as a usage error otherwise; `instructionSteps` together with
+`--instruction-budget` is refused too.
 
 ### Connectors (`--connector <file>`)
 
