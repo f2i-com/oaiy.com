@@ -43,6 +43,15 @@ export interface CliEngineOptions extends CreateEngineOptions {
  */
 export async function createCliEngine(opts: CliEngineOptions = {}): Promise<JobManager> {
   const { instructionBudgetSteps, ...engineOptions } = opts;
+  // Not in any shipped bundle: `cli/esbuild.mjs` defines this `false`, and
+  // esbuild folds `false && …` to `false` — the call, and the `false` it would
+  // pass, are not in dist/oaiy.mjs (test/zipp-guard.mjs checks). The guard
+  // builds the CLI once more with it `true` so the realm canary is seen to
+  // report the host engine (`typeof process === 'object'`) when a flow does
+  // run on it — which is what makes the production bundle's `'undefined'`
+  // evidence rather than a tautology. No flag, option or variable reaches it.
+  const hostEngine = __OAIY_TEST_ALLOW_V8__ && createEngine({ ...engineOptions, requireScriptExecutor: false });
+  if (hostEngine) return hostEngine;
   const artifact = await loadZippArtifact();
   return createEngine({
     ...engineOptions,

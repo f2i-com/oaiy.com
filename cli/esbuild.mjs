@@ -184,12 +184,35 @@ export function zippIdentity() {
   return zippIdentityCache;
 }
 
+/**
+ * The two instruction-step figures the `run` command exposes, read from the
+ * installed release's PROFILE.json (its `limits`): the engine's own per-entry
+ * default (`lifetimeSteps`) and the ceiling `setInstructionBudget` accepts
+ * (`maxInstructionBudgetSteps`). `--instruction-budget` is validated against
+ * the ceiling and `capabilities --json` reports both. Never literals in source.
+ */
+export function zippRunLimits() {
+  zippIdentity(); // the install must check before any of its files is trusted
+  const profile = JSON.parse(fs.readFileSync(path.join(zippVendor, 'PROFILE.json'), 'utf8'));
+  const limits = profile?.limits ?? {};
+  const figure = (name) => {
+    const n = limits[name];
+    if (!Number.isInteger(n) || n < 1) throw new Error(`PROFILE.json limits.${name} is not a positive integer: ${String(n)}`);
+    return n;
+  };
+  return {
+    defaultInstructionSteps: figure('lifetimeSteps'),
+    maxInstructionSteps: figure('maxInstructionBudgetSteps'),
+  };
+}
+
 /** The identity as esbuild `define`s (src/types/shared-source-globals.d.ts declares them). */
 export function zippDefines() {
   const identity = zippIdentity();
   return {
     __ZIPP_WASM_SHA256__: JSON.stringify(identity.wasmSha256),
     __ZIPP_ENGINE__: JSON.stringify(JSON.stringify(identity)),
+    __ZIPP_RUN_LIMITS__: JSON.stringify(JSON.stringify(zippRunLimits())),
   };
 }
 
@@ -236,6 +259,12 @@ export const commonBuildOptions = {
     // (the CLI, the worker shell, the engine-level tests). Computed when this
     // module loads, so a build without a verified ZIPP install fails here.
     ...zippDefines(),
+    // Build-time only, and false in every bundle this file produces: the one
+    // branch of createCliEngine that runs flows on the host's own engine.
+    // test/zipp-guard.mjs builds a bundle with it set to `true` to prove the
+    // canary can tell the two engines apart. There is no runtime flag, option
+    // or environment variable that reaches that branch; esbuild folds it away.
+    __OAIY_TEST_ALLOW_V8__: 'false',
   },
   // Keep node:sqlite (experimental builtin), Playwright (heavy, ships its own
   // browsers), sharp (optional native image lib) and undici (the SSRF guard's

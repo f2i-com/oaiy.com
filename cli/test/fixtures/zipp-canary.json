@@ -1,0 +1,99 @@
+{
+  "name": "zipp-canary",
+  "description": "Every way flow code reaches the engine, in one project-shaped file: all six logic_block compile branches, a condition expression, a count loop, a subflow, a macro, and a block shaped like the Desktop's app-logic wrapper. The `probe` block reports what the code can see of the process running it. test/zipp-guard.mjs runs this under the host-eval tripwire (test/guards/host-eval-tripwire.mjs) and asserts every node's value.",
+  "flows": [
+    {
+      "id": "canary-entry",
+      "name": "zipp-canary",
+      "graph": {
+        "nodes": [
+          { "id": "expr", "type": "logic_block", "position": { "x": 0, "y": 0 },
+            "data": { "code": "(1 + 1)" } },
+          { "id": "ret_await", "type": "logic_block", "position": { "x": 200, "y": 0 },
+            "data": { "code": "const v = await Utility.memoryRead('canary-k', 'dflt');\nreturn v + '!';" } },
+          { "id": "ret", "type": "logic_block", "position": { "x": 400, "y": 0 },
+            "data": { "code": "function twice(x) { return x * 2; }\nreturn twice(21);" } },
+          { "id": "single", "type": "logic_block", "position": { "x": 600, "y": 0 },
+            "data": { "code": "[1, 2, 3].map(n => n * 2)" } },
+          { "id": "await_noret", "type": "logic_block", "position": { "x": 800, "y": 0 },
+            "data": { "code": "await Utility.memoryWrite('canary-k2', 'stored');\nconst got = await Utility.memoryRead('canary-k2');\ngot" } },
+          { "id": "plain", "type": "logic_block", "position": { "x": 1000, "y": 0 },
+            "data": { "code": "const parts = ['a', 'b'];\nparts.join('-')" } },
+          { "id": "probe", "type": "logic_block", "position": { "x": 1200, "y": 0 },
+            "data": { "code": "// What this code can see of the process running it. On the ZIPP VM in a\n// worker thread every entry is 'undefined' and the token is unreachable.\nreturn {\n  types: [\n    typeof process,\n    typeof require,\n    typeof Buffer,\n    typeof globalThis.__TAURI__,\n    typeof Function('return this')().process\n  ],\n  token: typeof process === 'undefined' ? 'no-process' : process.env.OAIY_SERVER_TOKEN\n};" } },
+          { "id": "cond", "type": "condition", "position": { "x": 1400, "y": 0 },
+            "data": { "expression": "typeof process === 'undefined'" } },
+          { "id": "branch", "type": "logic_block", "position": { "x": 1600, "y": 0 },
+            "data": { "code": "input === null ? 'took-false' : 'took-true'" } },
+          { "id": "loop_start", "type": "loop_start", "position": { "x": 1800, "y": 0 },
+            "data": { "loopMode": "count", "iterations": 3 } },
+          { "id": "loop_body", "type": "logic_block", "position": { "x": 2000, "y": 0 },
+            "data": { "code": "return loop_index * 10;" } },
+          { "id": "loop_end", "type": "loop_end", "position": { "x": 2200, "y": 0 },
+            "data": {} },
+          { "id": "sub", "type": "subflow", "position": { "x": 2400, "y": 0 },
+            "data": { "flowId": "canary-sub", "inputCount": 1 } },
+          { "id": "mac", "type": "macro", "position": { "x": 2600, "y": 0 },
+            "data": { "_macroWorkflowId": "canary-macro", "_macroName": "canary",
+                      "_macroInputs": [{ "id": "in_a", "name": "a" }],
+                      "_macroOutputs": [{ "id": "out_r", "name": "r" }] } },
+          { "id": "applogic", "type": "logic_block", "position": { "x": 2800, "y": 0 },
+            "data": { "code": "(new Function(\"ctx\",decodeURIComponent(\"return%20ctx.a%20%2B%20ctx.b\")))(JSON.parse(decodeURIComponent(\"%7B%22a%22%3A1%2C%22b%22%3A2%7D\")))" } },
+          { "id": "out", "type": "output", "position": { "x": 3000, "y": 0 },
+            "data": { "value": "$nodes.probe" } }
+        ],
+        "edges": [
+          { "id": "e1", "source": "expr", "target": "ret_await" },
+          { "id": "e2", "source": "ret_await", "target": "ret" },
+          { "id": "e3", "source": "ret", "target": "single" },
+          { "id": "e4", "source": "single", "target": "await_noret" },
+          { "id": "e5", "source": "await_noret", "target": "plain" },
+          { "id": "e6", "source": "plain", "target": "probe" },
+          { "id": "e7", "source": "probe", "target": "cond" },
+          { "id": "e8", "source": "cond", "sourceHandle": "true", "target": "branch" },
+          { "id": "e9", "source": "probe", "target": "loop_start" },
+          { "id": "e10", "source": "loop_start", "target": "loop_body" },
+          { "id": "e11", "source": "loop_body", "target": "loop_end" },
+          { "id": "e12", "source": "loop_end", "target": "sub" },
+          { "id": "e13", "source": "expr", "target": "sub", "targetHandle": "input_0" },
+          { "id": "e14", "source": "sub", "target": "mac" },
+          { "id": "e15", "source": "ret", "target": "mac", "targetHandle": "in_a" },
+          { "id": "e16", "source": "mac", "target": "applogic" },
+          { "id": "e17", "source": "applogic", "target": "out" }
+        ]
+      }
+    },
+    {
+      "id": "canary-sub",
+      "name": "canary-sub",
+      "graph": {
+        "nodes": [
+          { "id": "in", "type": "input_text", "position": { "x": 0, "y": 0 }, "data": { "label": "input" } },
+          { "id": "tag", "type": "logic_block", "position": { "x": 200, "y": 0 },
+            "data": { "code": "return 'sub:' + input;" } },
+          { "id": "out", "type": "output", "position": { "x": 400, "y": 0 }, "data": {} }
+        ],
+        "edges": [
+          { "id": "s1", "source": "in", "target": "tag" },
+          { "id": "s2", "source": "tag", "target": "out" }
+        ]
+      }
+    },
+    {
+      "id": "canary-macro",
+      "name": "canary-macro",
+      "graph": {
+        "nodes": [
+          { "id": "a", "type": "macro_input", "position": { "x": 0, "y": 0 }, "data": { "name": "a" } },
+          { "id": "inc", "type": "logic_block", "position": { "x": 200, "y": 0 },
+            "data": { "code": "return input + 1;" } },
+          { "id": "r", "type": "macro_output", "position": { "x": 400, "y": 0 }, "data": { "name": "r" } }
+        ],
+        "edges": [
+          { "id": "m1", "source": "a", "target": "inc" },
+          { "id": "m2", "source": "inc", "target": "r" }
+        ]
+      }
+    }
+  ]
+}

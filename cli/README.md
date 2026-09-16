@@ -48,10 +48,58 @@ node bin/oaiy.mjs run flow.json --connector connector.json
 # Inspect a flow without running it.
 node bin/oaiy.mjs inputs flow.json      # list the inputs it expects
 node bin/oaiy.mjs validate flow.json    # parse + structural check
+
+# Bound a run: wall clock, and the ZIPP instruction budget per script entry
+# (an integer from 1 to the engine's ceiling; out of range is refused before
+# anything is read).
+node bin/oaiy.mjs run flow.json --timeout 60 --instruction-budget 200000000
+
+# What this build is and can run (see "The engine" below).
+node bin/oaiy.mjs capabilities --json
 ```
 
 Constants (API keys etc.) are also read from `OAIY_CONST_<NAME>` env vars.
 Set `OAIY_DEBUG=1` to include the full workflow context + logs in the output.
+
+### The engine
+
+Every flow — `run`, `worker`, the Desktop's background flows — runs on the
+[ZIPP](https://github.com/f2i-com/zipp.org/releases) VM (the web-python bundle of
+one release, verified and installed by `../scripts/fetch-zipp-release.mjs`; the
+`prebuild`/`pretest`/`pretypecheck` hooks run its `--ensure`) in a
+`worker_threads` Worker started with an empty environment. `createCliEngine`
+(`src/engine.ts`) is the only way this package builds a runtime; it attaches the
+ZIPP executor and sets `requireScriptExecutor` last, so no option un-requires it,
+and there is no fallback to Node's own JavaScript. To flow code `process`,
+`require`, `Buffer` and `__TAURI__` are `undefined`; what it can do is what its
+nodes may ask the host for through brokered module calls.
+
+The build (`esbuild.mjs`) checks the installed release, bakes its identity and
+two `PROFILE.json` figures in as defines, stages the `.wasm` and notices to
+`dist/zipp/` and builds the worker shell `dist/oaiy-zipp-worker.mjs`. At run time
+the staged bytes must hash to the build's digest or the run is refused as
+`engine_unavailable` before any job exists. A Desktop that stages only
+`oaiy.mjs` gets exactly that answer until it stages `dist/zipp/` and the worker
+shell too.
+
+`oaiy capabilities --json` (exit 1 when the engine does not check):
+
+```json
+{ "version": "0.2.0",
+  "protocols": { "run": 1 },
+  "engine": { "name": "zipp", "release": "v0.0.18", "version": "0.0.18", "revision": "…",
+              "variant": "javascript-python", "bundle": "zipp-wasm-0.0.18-web-python.zip",
+              "wasmSha256": "…", "glueSha256": "…", "languages": ["javascript", "python"],
+              "status": "ready" },
+  "run": { "languages": ["javascript"], "defaultInstructionSteps": 50000000, "maxInstructionSteps": 2000000000 } }
+```
+
+`engine` is the release the build was made from and whether the staged artifact
+is it NOW (`status`, with a `reason` when `unavailable`). `run.languages` is what
+THIS host runs and is deliberately not `engine.languages` (what the bundle
+could): the CLI runs JavaScript flows only. The two step figures are the
+engine's own default per script entry and the ceiling `--instruction-budget`
+accepts, read from the release's `PROFILE.json` at build time.
 
 ### Connectors (`--connector <file>`)
 
@@ -96,10 +144,16 @@ registered in the same module loader the bundled modules use.
 
 ```json
 { "success": true, "status": "completed", "jobId": "…",
-  "results": { "<nodeId>": <value>, … }, "error": null }
+  "results": { "<nodeId>": <value>, … }, "output": <the OUTPUT node's value>,
+  "error": null, "errorCode": null, "engine": "zipp" }
 ```
 
-`results` maps each node id to its output. stdout is **only** this JSON, so it
+`results` maps each node id to its output; `output` is what the flow's OUTPUT
+node declared. `engine` names the engine the flow ran on (the CLI has one).
+`errorCode` is set when the HOST rather than the flow ended a run that did not
+complete: `timeout` (`--timeout` elapsed; `status: "aborted"`) or
+`engine_unavailable` (the ZIPP artifact could not be had; nothing ran, `jobId`
+is empty). A flow's own failure has no code. stdout is **only** this JSON, so it
 pipes cleanly into `jq`.
 
 ## Status / parity

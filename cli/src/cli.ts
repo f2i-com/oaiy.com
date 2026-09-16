@@ -3,9 +3,11 @@
  *   oaiy run <flow.json>   — execute a flow headlessly, print/save its outputs
  *   oaiy inputs <flow>     — list the inputs a flow expects
  *   oaiy validate <flow>   — parse + structural check, no execution
+ *   oaiy capabilities      — what this build is and can run (--json)
  */
 import { Command, InvalidArgumentError } from 'commander';
 import fs from 'node:fs';
+import { version } from '../package.json';
 import { loadFlowFile, discoverInputs, parseInputs, gatherConstants } from './flow-io';
 import { registerManageCommands } from './manage';
 
@@ -27,11 +29,16 @@ for (const m of ['log', 'info', 'debug'] as const) {
   console[m] = (...args: unknown[]) => console.error(...args);
 }
 
+/** The engine's step ceiling and default, recorded from its PROFILE.json at build time. */
+function runLimits(): { defaultInstructionSteps: number; maxInstructionSteps: number } {
+  return JSON.parse(__ZIPP_RUN_LIMITS__);
+}
+
 const program = new Command();
 program
   .name('oaiy')
   .description('Run oaiy flows headlessly, with no GUI.')
-  .version('0.1.0');
+  .version(version);
 
 program
   .command('run')
@@ -53,6 +60,20 @@ program
     }
     return n;
   })
+  .option(
+    '--instruction-budget <steps>',
+    "ZIPP instruction budget per script entry, in steps (default: the engine's own; see `capabilities --json`)",
+    (v) => {
+      // Refused here, before any flow is read or engine imported: a budget the
+      // engine cannot take must not become a run on some other budget.
+      const { maxInstructionSteps } = runLimits();
+      const n = /^\d+$/.test(v) ? Number(v) : NaN;
+      if (!Number.isSafeInteger(n) || n < 1 || n > maxInstructionSteps) {
+        throw new InvalidArgumentError(`--instruction-budget must be an integer from 1 to ${maxInstructionSteps} (steps)`);
+      }
+      return n;
+    },
+  )
   .option('--quiet', 'suppress progress logs on stderr', false)
   .action(async (flowPath: string, opts: Record<string, any>) => {
     const { runFlow } = await import('./engine');
@@ -77,6 +98,7 @@ program
       availableFlows: flows,
       flowName: name,
       timeoutMs: opts.timeout ? opts.timeout * 1000 : undefined,
+      instructionBudgetSteps: opts.instructionBudget,
     });
 
     const payload: Record<string, unknown> = {
@@ -132,6 +154,24 @@ program
     process.stdout.write(
       `ok: '${name}' parsed — ${graph.nodes.length} nodes, ${graph.edges.length} edges\n`,
     );
+  });
+
+program
+  .command('capabilities')
+  .description('Report what this build is and can run: version, run protocol, engine identity and health')
+  .option('--json', 'machine-readable JSON on stdout (the only form today)', false)
+  .action(async (opts: Record<string, any>) => {
+    if (!opts.json) {
+      throw new Error('capabilities: pass --json (the report has no other form yet)');
+    }
+    // src/capabilities imports the artifact check only, never the engine, so
+    // a probe costs a hash and a compile of the staged .wasm — not a runtime.
+    const { capabilities } = await import('./capabilities');
+    const report = await capabilities();
+    process.stdout.write(JSON.stringify(report, null, 2) + '\n');
+    // The report is printed either way; an unavailable engine is a failed
+    // probe, and the exit code says so to a caller that only checks that.
+    process.exitCode = report.engine.status === 'ready' ? 0 : 1;
   });
 
 program
