@@ -864,6 +864,32 @@ async fn runtime_status(State(st): State<BridgeState>) -> axum::response::Respon
         Some(crate::bridge::worker::CliInvocation::Binary { .. }) => "binary",
         None => "missing",
     };
+    // And what that CLI RUNS flows on. Read from the probe's cache only — a
+    // probe is a child process that hashes and compiles the engine, and this
+    // handler is polled every few seconds by the UI. A cold cache is reported
+    // as `unknown` and filled on a thread of its own (the worker also fills it
+    // at start), so the next poll has the answer.
+    let node_exe = st.node.as_ref().and_then(|n| n.resolve());
+    let engine = cli
+        .as_ref()
+        .map(|c| crate::bridge::worker::cached_engine_probe(c, node_exe.as_deref()));
+    if let (Some(c), Some(None)) = (&cli, &engine) {
+        crate::bridge::worker::warm_engine_probe(c.clone(), node_exe.clone());
+    }
+    let engine_ready = matches!(engine, Some(Some(crate::bridge::worker::EngineProbe::Ready(_))));
+    let engine_json = match &engine {
+        Some(Some(crate::bridge::worker::EngineProbe::Ready(id))) => json!({
+            "name": id.name, "release": id.release, "status": "ready",
+        }),
+        Some(Some(crate::bridge::worker::EngineProbe::Unavailable { reason })) => json!({
+            "name": serde_json::Value::Null, "release": serde_json::Value::Null,
+            "status": "unavailable", "reason": reason,
+        }),
+        // No CLI at all, or a cache still cold: nothing is known yet.
+        _ => json!({
+            "name": serde_json::Value::Null, "release": serde_json::Value::Null, "status": "unknown",
+        }),
+    };
 
     // `failed` is carried here so Overview can point at the run history without
     // paging it — a machine where flows are quietly failing should say so on the
@@ -904,7 +930,11 @@ async fn runtime_status(State(st): State<BridgeState>) -> axum::response::Respon
     // a Node runtime the spawn fails and the run dies with a confusing error.
     let node = st.node.as_ref().map(|n| n.snapshot());
     let node_ok = node.as_ref().map(|n| n.available).unwrap_or(true);
-    let ready = cli.is_some() && node_ok;
+    // Ready means a run would work: a CLI, a Node to start it with, and that
+    // CLI answering that it runs flows on ZIPP. A resolved CLI whose engine is
+    // missing fails every run `runtime_unavailable`; saying "ready" over that
+    // sends the user hunting for a link problem.
+    let ready = cli.is_some() && node_ok && engine_ready;
     (
         StatusCode::OK,
         Json(json!({
@@ -913,15 +943,23 @@ async fn runtime_status(State(st): State<BridgeState>) -> axum::response::Respon
             "flowRuntime": {
                 "cliResolved": cli.is_some(),
                 "cliKind": cli_kind,
+                "engine": engine_json,
                 // The fix, in the response, so a caller does not have to go
                 // looking for what "not resolved" means.
-                // Name the ACTUAL blocker: "no CLI" and "no Node to run it with"
-                // need different fixes, and conflating them sends the user the
-                // wrong way.
+                // Name the ACTUAL blocker: "no CLI", "no Node to run it with"
+                // and "a CLI without its engine" need different fixes, and
+                // conflating them sends the user the wrong way.
                 "detail": if cli.is_none() {
-                    Some("Install the `oaiy` CLI so it is on PATH, or set OAIY_CLI to the path of cli/bin/oaiy.mjs.")
+                    Some("Install the `oaiy` CLI so it is on PATH, or set OAIY_CLI to the path of cli/bin/oaiy.mjs.".to_string())
                 } else if !node_ok {
-                    Some("A Node runtime is required to run the bundled CLI — install it from OAIY Desktop, or put node on PATH.")
+                    Some("A Node runtime is required to run the bundled CLI — install it from OAIY Desktop, or put node on PATH.".to_string())
+                } else if let Some(Some(crate::bridge::worker::EngineProbe::Unavailable { reason })) = &engine {
+                    Some(format!(
+                        "the OAIY CLI does not run user logic on ZIPP: {reason}. {}",
+                        crate::bridge::worker::engine_fix_hint()
+                    ))
+                } else if !engine_ready {
+                    Some("checking which engine the OAIY CLI runs flows on…".to_string())
                 } else {
                     None
                 },

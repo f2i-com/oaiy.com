@@ -16,7 +16,10 @@ import { defineConfig } from 'vitest/config';
 export default defineConfig({
   test: {
     environment: 'jsdom',
-    include: ['src/**/*.{test,spec}.{ts,tsx}'],
+    // The staging script's checks live beside it in scripts/, as plain JS: the
+    // TypeScript build's `include` is `src` only, and an import of an .mjs from
+    // there would need a declaration the build does not have.
+    include: ['src/**/*.{test,spec}.{ts,tsx}', 'scripts/**/*.test.mjs'],
     setupFiles: ['./src/test-setup.ts'],
   },
 });

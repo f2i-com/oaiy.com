@@ -116,6 +116,27 @@ describe('OverviewPanel failure reporting', () => {
     expect(onNavigate).toHaveBeenCalledWith('runs');
   });
 
+  it('says why flows cannot run when the CLI resolved but its engine did not', async () => {
+    // The CLI is there and Node is there — what is missing is the ZIPP engine
+    // the CLI runs flows on. The readiness route puts the probe's reason in
+    // `detail`; the banner must show THAT, not a generic "unavailable".
+    dismissGuide();
+    statusMock.mockResolvedValue({
+      ...runtime(0),
+      ready: false,
+      flowRuntime: {
+        cliResolved: true,
+        cliKind: 'node',
+        engine: { name: null, release: null, status: 'unavailable', reason: 'ZIPP engine unavailable: zipp/zipp_wasm_bg.wasm is missing' },
+        detail: 'the OAIY CLI does not run user logic on ZIPP: ZIPP engine unavailable: zipp/zipp_wasm_bg.wasm is missing. Reinstall OAIY Desktop.',
+      },
+    });
+    await mount();
+    expect(text()).toContain('Flows cannot run on this machine');
+    expect(text()).toContain('zipp_wasm_bg.wasm is missing');
+    expect(text()).toContain('Reinstall OAIY Desktop');
+  });
+
   it('fills the cache key ServicesPanel actually seeds from', async () => {
     // The app opens on Overview, so Overview's poll is what has a chance to warm
     // the Services panel. Writing only the `services` ARRAY meant ServicesPanel —

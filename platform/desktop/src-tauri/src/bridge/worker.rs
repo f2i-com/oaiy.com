@@ -32,14 +32,29 @@
 //! still wins so an operator's own build is never silently overridden. No CLI at
 //! all is a **typed, actionable failure** on each run — `runtime_unavailable`,
 //! naming the fixes — never a silent stall of the queue.
+//!
+//! # The runner has to be ZIPP
+//!
+//! The CLI runs every flow on the ZIPP VM, and this desktop refuses one that
+//! does not. Before the first run through a resolved CLI (and again after the
+//! file changes, or a minute after a refusal) it asks `capabilities --json` and
+//! requires `engine.name == "zipp"` with `engine.status == "ready"`; an
+//! `OAIY_CLI` override pointing at some other build, or a shipped copy staged
+//! without its engine, is `runtime_unavailable` naming the fix — never a run
+//! on whatever JavaScript the host happened to have. Every payload is then read
+//! the same way: one that does not say `engine: "zipp"` is not a result, and
+//! `errorCode` `engine_unavailable`/`timeout` are the host's verdicts, not the
+//! flow's. Nothing here names a release, a digest or a revision: identity comes
+//! from the CLI's own report.
 
 use crate::HiddenCommand as _;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::Value;
 
@@ -151,6 +166,385 @@ pub enum CliInvocation {
     Node { script: PathBuf },
     /// `<binary> run …`.
     Binary { path: PathBuf },
+}
+
+impl CliInvocation {
+    /// The file this resolves to, whichever way it is started.
+    pub fn path(&self) -> &Path {
+        match self {
+            CliInvocation::Node { script } => script,
+            CliInvocation::Binary { path } => path,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The engine probe: is this CLI a ZIPP runner?
+// ---------------------------------------------------------------------------
+
+/// What the CLI says it is, from `capabilities --json`.
+///
+/// Every value is copied from that report. None is written here: the release
+/// and the digest are whatever the staged `SOURCE.json` recorded when the CLI
+/// was built, and a literal in this file would be a second, drifting source.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EngineIdentity {
+    pub name: String,
+    pub release: String,
+    pub version: String,
+    pub revision: String,
+    pub wasm_sha256: String,
+    /// What THIS CLI runs (`run.languages`) — not what the engine bundle could.
+    /// Kept for the heartbeat and for a second language later; nothing reads
+    /// it yet, and nothing here must advertise a language no host runs.
+    pub run_languages: Vec<String>,
+}
+
+/// The answer to "can this CLI run a flow on ZIPP right now?".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EngineProbe {
+    Ready(EngineIdentity),
+    /// It cannot, and `reason` says why in the CLI's own words (or which check
+    /// of the report failed).
+    Unavailable { reason: String },
+}
+
+impl EngineProbe {
+    pub fn is_ready(&self) -> bool {
+        matches!(self, EngineProbe::Ready(_))
+    }
+}
+
+/// Read a `capabilities --json` report. Pure, so the shape is pinned without a
+/// process.
+///
+/// Requires `protocols.run == 1` (the payload shape this file reads),
+/// `engine.name == "zipp"` and `engine.status == "ready"`. An unavailable
+/// engine's `engine.reason` is the error, verbatim: it is the CLI's own account
+/// of what is wrong with its staged artifact, which is what the user needs.
+pub fn parse_capabilities(v: &Value) -> Result<EngineIdentity, String> {
+    let run_protocol = v.pointer("/protocols/run").and_then(Value::as_u64);
+    if run_protocol != Some(1) {
+        return Err(format!(
+            "the CLI speaks run protocol {}, and this desktop reads protocol 1",
+            run_protocol.map_or("(none)".to_string(), |n| n.to_string())
+        ));
+    }
+    let engine = v
+        .get("engine")
+        .filter(|e| e.is_object())
+        .ok_or_else(|| "the CLI's capabilities report names no engine".to_string())?;
+    let text = |key: &str| -> Option<String> {
+        engine.get(key).and_then(Value::as_str).map(str::to_string)
+    };
+    let name = text("name").unwrap_or_default();
+    if name != "zipp" {
+        return Err(format!(
+            "the CLI runs user logic on {}, not on ZIPP",
+            if name.is_empty() { "an unnamed engine".to_string() } else { format!("{name:?}") }
+        ));
+    }
+    match text("status").as_deref() {
+        Some("ready") => {}
+        Some(status) => {
+            return Err(text("reason").unwrap_or_else(|| {
+                format!("the CLI reports its ZIPP engine as {status:?} without saying why")
+            }))
+        }
+        None => return Err("the CLI's capabilities report gives its engine no status".to_string()),
+    }
+    let run_languages = v
+        .pointer("/run/languages")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
+        .unwrap_or_default();
+    Ok(EngineIdentity {
+        name,
+        release: text("release").unwrap_or_default(),
+        version: text("version").unwrap_or_default(),
+        revision: text("revision").unwrap_or_default(),
+        wasm_sha256: text("wasmSha256").unwrap_or_default(),
+        run_languages,
+    })
+}
+
+/// How long `capabilities --json` may take. It hashes and compiles the staged
+/// wasm (~8 MB) — a second or two — and never runs a flow.
+const PROBE_DEADLINE: Duration = Duration::from_secs(15);
+/// How long a refusal is remembered before the CLI is asked again, so a fixed
+/// install recovers without a restart. A `Ready` answer is kept until the CLI
+/// file itself changes.
+const PROBE_TTL: Duration = Duration::from_secs(60);
+
+/// Start `<cli> …` the way a run does: through the resolved Node when the CLI
+/// is a script, directly when it is a binary.
+fn cli_command(cli: &CliInvocation, node_exe: Option<&Path>) -> Command {
+    match cli {
+        CliInvocation::Node { script } => {
+            // Prefer a resolved Node (portable install, else PATH) over the
+            // bare name: a packaged app cannot assume `node` is on PATH.
+            let mut c = Command::new(node_exe.map_or_else(|| PathBuf::from("node"), Path::to_path_buf));
+            c.arg(script);
+            c
+        }
+        CliInvocation::Binary { path } => Command::new(path),
+    }
+}
+
+/// The environment and window discipline every CLI child gets — a flow run and
+/// the probe alike, from one place so the two cannot drift.
+///
+/// Drop known credential env vars before the CLI inherits the rest.
+///
+/// A flow is untrusted code — writable over HTTP, claimable from a linked
+/// provider, and deliberately never graph-validated here — so the same
+/// reasoning that gives plugins an allow-listed environment applies. The CLI
+/// legitimately needs far more than a plugin (it IS the engine: PATH, HOME,
+/// node's own vars), so this is a deny-list of the sensitive names rather
+/// than an allow-list, and it matters because the engine's getSecret() reads
+/// process.env by name BEFORE its own store — an inherited AWS/OpenAI key
+/// would be directly addressable from inside a flow. A flow that genuinely
+/// needs a cloud key should carry it as a constant, not inherit it
+/// ambiently. Reuses the plugin host's list so the two paths cannot drift.
+///
+/// `OAIY_ZIPP_ASSET_DIR` goes too: it points the CLI at an engine folder other
+/// than the one staged beside it. The CLI's digest check makes a wrong folder
+/// inert, but the desktop ships exactly one engine and a child of this process
+/// should not be told to look for another.
+fn harden_child(cmd: &mut Command) {
+    for name in crate::plugins::runner::NEVER_FORWARD {
+        cmd.env_remove(name);
+    }
+    cmd.env_remove("OAIY_ZIPP_ASSET_DIR");
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+}
+
+/// Ask a resolved CLI what it is. One process, `capabilities --json`, no flow,
+/// no server URL or token (it needs neither), same hardening as a run.
+///
+/// The report is read from stdout REGARDLESS of the exit code: the CLI exits 1
+/// for an unavailable engine but still prints the report, and its
+/// `engine.reason` is the one line the user needs. Only an unreadable stdout
+/// falls back to the exit code and the tail of stderr.
+pub fn probe_cli_capabilities(cli: &CliInvocation, node_exe: Option<&Path>) -> EngineProbe {
+    let mut cmd = cli_command(cli, node_exe);
+    cmd.arg("capabilities").arg("--json");
+    harden_child(&mut cmd);
+    // A run is told where this desktop's API is and given its credential; the
+    // probe runs no flow and talks to nobody, so it gets neither — and must not
+    // inherit the headless server's real bearer token from the environment.
+    cmd.env_remove("OAIY_SERVER_URL");
+    cmd.env_remove("OAIY_SERVER_TOKEN");
+    let started = Instant::now();
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            return EngineProbe::Unavailable {
+                reason: format!("the OAIY CLI could not be started to ask what it runs: {e}"),
+            }
+        }
+    };
+    crate::services::job_object::adopt(child.id());
+    let (out, err) = drain_child(&mut child);
+    let deadline = started + PROBE_DEADLINE;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) => {}
+            Err(_) => break None,
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        thread::sleep(CHILD_POLL);
+    };
+    let stdout = out.lock().map(|g| g.clone()).unwrap_or_default();
+    let stderr = err.lock().map(|g| g.clone()).unwrap_or_default();
+    let Some(status) = status else {
+        return EngineProbe::Unavailable {
+            reason: format!(
+                "the OAIY CLI did not answer `capabilities --json` within {}s",
+                PROBE_DEADLINE.as_secs()
+            ),
+        };
+    };
+    log::debug!(
+        "probed {} for its engine in {:?} (exit {})",
+        cli.path().display(),
+        started.elapsed(),
+        status.code().unwrap_or(-1)
+    );
+    match serde_json::from_str::<Value>(&stdout) {
+        Ok(report) => match parse_capabilities(&report) {
+            Ok(identity) => EngineProbe::Ready(identity),
+            Err(reason) => EngineProbe::Unavailable { reason },
+        },
+        Err(_) => EngineProbe::Unavailable {
+            reason: format!(
+                "the OAIY CLI answered `capabilities --json` with something other than a report (exit {}){}",
+                status.code().unwrap_or(-1),
+                match tail_of(&stderr, 600) {
+                    t if t.is_empty() => String::new(),
+                    t => format!(": {t}"),
+                }
+            ),
+        },
+    }
+}
+
+/// Start draining both pipes of a child, from the moment it starts.
+///
+/// The first cut of the flow runner read stderr only after exit and stdout
+/// never — so a CLI that logged more than one OS pipe buffer (~4-64 KB; routine
+/// for a verbose Node process) blocked in write(), could never exit, and was
+/// killed at the deadline as a false `timed_out`.
+fn drain_child(child: &mut std::process::Child) -> (Arc<Mutex<String>>, Arc<Mutex<String>>) {
+    let captured_out = Arc::new(Mutex::new(String::new()));
+    if let Some(out) = child.stdout.take() {
+        let sink = captured_out.clone();
+        thread::spawn(move || drain_capped(out, &sink));
+    }
+    let captured_err = Arc::new(Mutex::new(String::new()));
+    if let Some(err) = child.stderr.take() {
+        let sink = captured_err.clone();
+        thread::spawn(move || drain_capped(err, &sink));
+    }
+    (captured_out, captured_err)
+}
+
+/// What a cached probe answer is FOR: the same file, unchanged, run the same way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProbeKey {
+    cli: CliInvocation,
+    modified: Option<SystemTime>,
+    node_exe: Option<PathBuf>,
+}
+
+impl ProbeKey {
+    fn of(cli: &CliInvocation, node_exe: Option<&Path>) -> Self {
+        ProbeKey {
+            cli: cli.clone(),
+            modified: std::fs::metadata(cli.path()).and_then(|m| m.modified()).ok(),
+            node_exe: node_exe.map(Path::to_path_buf),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ProbeEntry {
+    key: ProbeKey,
+    at: Instant,
+    probe: EngineProbe,
+}
+
+static PROBE: Mutex<Option<ProbeEntry>> = Mutex::new(None);
+/// Set while a background warm-up is probing, so the readiness endpoint starts
+/// at most one.
+static PROBING: AtomicBool = AtomicBool::new(false);
+
+/// Whether a remembered answer still stands for `key` at `now`.
+///
+/// `Ready` is reused for as long as the key matches — the CLI is a file that
+/// does not change while the process runs, short of a reinstall, which
+/// changes its mtime and so the key. A refusal is reused for [`PROBE_TTL`]
+/// only, so an install fixed underneath a running desktop recovers on its own.
+fn reusable(entry: Option<&ProbeEntry>, key: &ProbeKey, now: Instant) -> Option<EngineProbe> {
+    let entry = entry?;
+    if entry.key != *key {
+        return None;
+    }
+    match &entry.probe {
+        EngineProbe::Ready(_) => Some(entry.probe.clone()),
+        EngineProbe::Unavailable { .. } if now.duration_since(entry.at) < PROBE_TTL => {
+            Some(entry.probe.clone())
+        }
+        EngineProbe::Unavailable { .. } => None,
+    }
+}
+
+/// The probe for `cli`, remembered or taken now. The lock is never held across
+/// the child process: a slow probe must not block the readiness endpoint's
+/// cache read.
+pub fn engine_probe(cli: &CliInvocation, node_exe: Option<&Path>) -> EngineProbe {
+    let key = ProbeKey::of(cli, node_exe);
+    if let Ok(cache) = PROBE.lock() {
+        if let Some(p) = reusable(cache.as_ref(), &key, Instant::now()) {
+            return p;
+        }
+    }
+    let probe = probe_cli_capabilities(cli, node_exe);
+    match &probe {
+        EngineProbe::Ready(id) => log::info!(
+            "the OAIY CLI at {} runs user logic on ZIPP {} ({})",
+            cli.path().display(),
+            id.release,
+            &id.wasm_sha256[..id.wasm_sha256.len().min(12)]
+        ),
+        EngineProbe::Unavailable { reason } => log::warn!(
+            "the OAIY CLI at {} does not run user logic on ZIPP: {reason}",
+            cli.path().display()
+        ),
+    }
+    if let Ok(mut cache) = PROBE.lock() {
+        *cache = Some(ProbeEntry {
+            key,
+            at: Instant::now(),
+            probe: probe.clone(),
+        });
+    }
+    probe
+}
+
+/// The remembered probe for `cli`, if there is one that still stands. Never
+/// spawns: this is what the readiness endpoint reads, on every UI poll, inside
+/// an async handler.
+pub fn cached_engine_probe(cli: &CliInvocation, node_exe: Option<&Path>) -> Option<EngineProbe> {
+    let key = ProbeKey::of(cli, node_exe);
+    PROBE
+        .lock()
+        .ok()
+        .and_then(|cache| reusable(cache.as_ref(), &key, Instant::now()))
+}
+
+/// Fill the cache on a thread of its own, at most one at a time. For the
+/// readiness endpoint's cold start: it reports `unknown` now and `ready` (or
+/// the reason) on its next poll.
+pub fn warm_engine_probe(cli: CliInvocation, node_exe: Option<PathBuf>) {
+    if PROBING
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+    thread::spawn(move || {
+        let _ = engine_probe(&cli, node_exe.as_deref());
+        PROBING.store(false, Ordering::Release);
+    });
+}
+
+/// What to do about a CLI that is not a ZIPP runner — the two situations need
+/// different fixes, and the message has to name the right one.
+pub(crate) fn engine_fix_hint() -> &'static str {
+    let overridden = std::env::var("OAIY_CLI")
+        .ok()
+        .is_some_and(|v| !v.trim().is_empty());
+    if overridden {
+        "OAIY_CLI is set: remove the override so the CLI shipped with OAIY Desktop is used, \
+         or point it at a build whose `capabilities --json` reports engine \"zipp\" as ready."
+    } else {
+        "Reinstall OAIY Desktop: the CLI it ships was staged without its ZIPP engine, or the \
+         engine files beside it have been altered."
+    }
 }
 
 /// Candidate locations for the CLI bundle that ships INSIDE the app.
@@ -296,6 +690,13 @@ impl Worker {
     }
 
     fn run_loop(&self) {
+        // Ask the CLI what it runs before the first claim, off the UI's path:
+        // the readiness endpoint reads the cached answer, and a fresh start
+        // should say "ready" (or why not) before anyone queues a run.
+        if let Some(cli) = cli_status() {
+            let node_exe = self.node.as_ref().and_then(|n| n.resolve());
+            let _ = engine_probe(&cli, node_exe.as_deref());
+        }
         while !self.stop.load(Ordering::Relaxed) {
             let claimable = match self.ledger.lock() {
                 Ok(l) => l.claimable_by_worker(3),
@@ -389,6 +790,9 @@ impl Worker {
                 // A locally stored flow talks to nothing on anyone's behalf.
                 connector_path: None,
                 timeout,
+                // The engine's own default: a flow stored here was written
+                // against no provider's policy, and the desktop sets none.
+                instruction_budget: None,
                 node: self.node.as_ref(),
             },
             // Cancellation: the flag the cancel endpoint sets. Observed from
@@ -404,9 +808,30 @@ impl Worker {
         );
 
         let _ = std::fs::remove_dir_all(&scratch);
-        match outcome {
-            CliOutcome::Succeeded(v) => (RunStatus::Succeeded, Some(v), None),
-            CliOutcome::Unreadable(why) => fail(RunErrorCode::Internal, &why),
+        bridge_outcome(outcome, timeout)
+    }
+}
+
+/// How the bridge lane reports what the CLI did. Pure, so every arm is pinned
+/// without a ledger or a process.
+///
+/// A payload IS the flow's own report, and its `success: false` is a failed
+/// run. This lane used to report any parseable payload as `succeeded` — a flow
+/// that said "I failed, here is why" was recorded done, with the reason left
+/// in an output nobody reads. The link's flow runner had fixed this for its
+/// lane; the bridge never had.
+fn bridge_outcome(
+    outcome: CliOutcome,
+    timeout: Duration,
+) -> (RunStatus, Option<Value>, Option<RunError>) {
+    match outcome {
+        CliOutcome::Succeeded(v) if v.get("success") == Some(&Value::Bool(false)) => (
+            RunStatus::Failed,
+            None,
+            Some(RunError::new(RunErrorCode::NodeFailed, flow_failure_message(&v))),
+        ),
+        CliOutcome::Succeeded(v) => (RunStatus::Succeeded, Some(v), None),
+        CliOutcome::Unreadable(why) => fail(RunErrorCode::Internal, &why),
             CliOutcome::Failed { exit_code, detail } => (
                 RunStatus::Failed,
                 None,
@@ -452,8 +877,20 @@ impl Worker {
                 }
                 (RunStatus::Failed, None, Some(e))
             }
-        }
     }
+}
+
+/// The flow's own account of its failure, from a `success: false` payload.
+fn flow_failure_message(v: &Value) -> String {
+    v.get("error")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| match v.get("status").and_then(Value::as_str) {
+            Some(s) => format!("the flow reported {s:?} without saying why"),
+            None => "the flow reported failure without saying why".to_string(),
+        })
 }
 
 /// One CLI invocation, by file: which graph, which inputs, where the result goes.
@@ -470,7 +907,35 @@ pub struct CliRequest<'a> {
     /// `None` for a flow stored on this desktop, which speaks for nobody.
     pub connector_path: Option<&'a Path>,
     pub timeout: Duration,
+    /// ZIPP instruction steps per script entry (`--instruction-budget`), the
+    /// provider's policy from its descriptor. `None` leaves the engine's own
+    /// default; the CLI refuses a value outside the engine's range, which is
+    /// why the descriptor checks it first.
+    pub instruction_budget: Option<u64>,
     pub node: Option<&'a crate::services::node_runtime::NodeHandle>,
+}
+
+/// The CLI's argv for one run, so what is passed is pinned by a test.
+pub fn cli_args(req: &CliRequest) -> Vec<OsString> {
+    let mut args: Vec<OsString> = vec![
+        "run".into(),
+        req.flow_path.into(),
+        "--inputs".into(),
+        req.inputs_path.into(),
+        "-o".into(),
+        req.out_path.into(),
+        "--timeout".into(),
+        req.timeout.as_secs().max(1).to_string().into(),
+    ];
+    if let Some(steps) = req.instruction_budget {
+        args.push("--instruction-budget".into());
+        args.push(steps.to_string().into());
+    }
+    if let Some(connector) = req.connector_path {
+        args.push("--connector".into());
+        args.push(connector.into());
+    }
+    args
 }
 
 /// How a CLI invocation ended.
@@ -522,52 +987,43 @@ pub fn run_flow_cli(req: CliRequest, cancelled: &dyn Fn() -> bool) -> CliOutcome
             retryable: true,
         };
     };
+    let node_exe = req.node.and_then(|n| n.resolve());
+    run_flow_cli_with(&cli, node_exe.as_deref(), req, cancelled)
+}
 
-    let timeout_secs = req.timeout.as_secs().max(1).to_string();
-    let mut cmd = match &cli {
-        CliInvocation::Node { script } => {
-            // Prefer a resolved Node (portable install, else PATH) over the
-            // bare name: a packaged app cannot assume `node` is on PATH.
-            let exe = req
-                .node
-                .and_then(|n| n.resolve())
-                .unwrap_or_else(|| PathBuf::from("node"));
-            let mut c = Command::new(exe);
-            c.arg(script);
-            c
-        }
-        CliInvocation::Binary { path } => Command::new(path),
-    };
-    cmd.arg("run")
-        .arg(req.flow_path)
-        .arg("--inputs")
-        .arg(req.inputs_path)
-        .arg("-o")
-        .arg(req.out_path)
-        .arg("--timeout")
-        .arg(&timeout_secs);
-    if let Some(connector) = req.connector_path {
-        cmd.arg("--connector").arg(connector);
+/// [`run_flow_cli`] with the CLI and Node already chosen.
+///
+/// Split out so a test can hand in a stub CLI: `OAIY_CLI` is process-global,
+/// and under `cargo test` `current_exe()` is `target/debug/deps/…`, from where
+/// the bundled lookup never reaches `src-tauri/resources`.
+///
+/// The engine probe happens here, once per CLI file (cached), before anything
+/// is spawned — so all three lanes that arrive here (the bridge, the link's
+/// flow runner, app logic) refuse the same non-ZIPP runner the same way.
+pub fn run_flow_cli_with(
+    cli: &CliInvocation,
+    node_exe: Option<&Path>,
+    req: CliRequest,
+    cancelled: &dyn Fn() -> bool,
+) -> CliOutcome {
+    if let EngineProbe::Unavailable { reason } = engine_probe(cli, node_exe) {
+        return CliOutcome::Unavailable {
+            message: format!(
+                "the OAIY CLI at {} does not run user logic on ZIPP",
+                cli.path().display()
+            ),
+            detail: Some(format!("{reason}. {}", engine_fix_hint())),
+            // Not retryable: re-driving the same run would meet the same CLI.
+            // The fix is a reinstall or dropping the override, after which the
+            // NEXT claim asks the CLI again (at most once a minute) — nothing
+            // re-queues this one.
+            retryable: false,
+        };
     }
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
 
-    // Drop known credential env vars before the CLI inherits the rest.
-    //
-    // A flow is untrusted code — writable over HTTP, claimable from a linked
-    // provider, and deliberately never graph-validated here — so the same
-    // reasoning that gives plugins an allow-listed environment applies. The CLI
-    // legitimately needs far more than a plugin (it IS the engine: PATH, HOME,
-    // node's own vars), so this is a deny-list of the sensitive names rather
-    // than an allow-list, and it matters because the engine's getSecret() reads
-    // process.env by name BEFORE its own store — an inherited AWS/OpenAI key
-    // would be directly addressable from inside a flow. A flow that genuinely
-    // needs a cloud key should carry it as a constant, not inherit it
-    // ambiently. Reuses the plugin host's list so the two paths cannot drift.
-    for name in crate::plugins::runner::NEVER_FORWARD {
-        cmd.env_remove(name);
-    }
+    let mut cmd = cli_command(cli, node_exe);
+    cmd.args(cli_args(&req));
+    harden_child(&mut cmd);
     // Tell the child where THIS desktop's API is.
     //
     // A connector node that chats, calls a plugin connector or touches a
@@ -590,11 +1046,6 @@ pub fn run_flow_cli(req: CliRequest, cancelled: &dyn Fn() -> bool) -> CliOutcome
     } else {
         cmd.env("OAIY_SERVER_TOKEN", internal);
     }
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-    }
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
@@ -611,22 +1062,10 @@ pub fn run_flow_cli(req: CliRequest, cancelled: &dyn Fn() -> bool) -> CliOutcome
     // left to stop it.
     crate::services::job_object::adopt(child.id());
 
-    // Drain BOTH pipes on their own threads, from the start. The first cut read
-    // stderr only after exit and stdout never — so a CLI that logged more than
-    // one OS pipe buffer (~4-64 KB; routine for a verbose Node process) blocked
-    // in write(), could never exit, and was killed at the deadline as a false
-    // `timed_out`. The review traced the whole chain, and this crate documents
-    // the identical hazard for plugin stderr.
-    let captured_err = Arc::new(std::sync::Mutex::new(String::new()));
-    if let Some(err) = child.stderr.take() {
-        let sink = captured_err.clone();
-        thread::spawn(move || drain_capped(err, &sink));
-    }
-    let captured_out = Arc::new(std::sync::Mutex::new(String::new()));
-    if let Some(out) = child.stdout.take() {
-        let sink = captured_out.clone();
-        thread::spawn(move || drain_capped(out, &sink));
-    }
+    // Drain BOTH pipes on their own threads, from the start — see
+    // `drain_child` for the deadlock this prevents. The review traced the whole
+    // chain, and this crate documents the identical hazard for plugin stderr.
+    let (_captured_out, captured_err) = drain_child(&mut child);
 
     // Grace over the CLI's own timeout so the CLI gets to time out FIRST and
     // report which node was stuck — killing from out here loses that.
@@ -670,13 +1109,13 @@ pub fn run_flow_cli(req: CliRequest, cancelled: &dyn Fn() -> bool) -> CliOutcome
         .ok()
         .and_then(|body| serde_json::from_str::<Value>(&body).ok());
     if let Some(v) = reported {
-        if !st.success() {
+        if !st.success() && !matches!(v.get("success"), Some(Value::Bool(false))) {
             log::warn!(
                 "the OAIY CLI exited {} after writing a result; honouring the result",
                 st.code().unwrap_or(-1)
             );
         }
-        return CliOutcome::Succeeded(v);
+        return classify_result(v);
     }
 
     if st.success() {
@@ -688,6 +1127,65 @@ pub fn run_flow_cli(req: CliRequest, cancelled: &dyn Fn() -> bool) -> CliOutcome
     CliOutcome::Failed {
         exit_code: st.code().unwrap_or(-1),
         detail: tail_of(&capture, 1500),
+    }
+}
+
+/// Read the CLI's result payload as what it says it is. Pure, so every arm is
+/// pinned without a process.
+///
+/// The CLI writes its payload even when the flow never ran: with
+/// `errorCode: "engine_unavailable"` when its ZIPP artifact is missing or
+/// altered, and `errorCode: "timeout"` when its own `--timeout` fired (which it
+/// does before this desktop's deadline, by design, so the CLI can name the
+/// stuck node). Read as a plain result, both were `Succeeded` — the bridge lane
+/// reported a missing engine as a run that worked. So:
+///
+///   * a payload that does not say `engine: "zipp"` is not a result from the
+///     runner this desktop ships; an older or foreign CLI wrote it;
+///   * `engine_unavailable` is the runtime failing, not the flow — reported as
+///     such, with the CLI's own reason, and never retried from here;
+///   * `timeout` is the same outcome as this desktop killing the child, so all
+///     three lanes report `timeout` rather than `node_failed`;
+///   * anything else is the flow's own report, `success` and all, for the lane
+///     to read.
+pub fn classify_result(v: Value) -> CliOutcome {
+    match v.get("engine").and_then(Value::as_str) {
+        Some("zipp") => {}
+        Some(other) => {
+            return CliOutcome::Unavailable {
+                message: format!(
+                    "the OAIY CLI answered with an engine that is not ZIPP ({other:?})"
+                ),
+                detail: Some(engine_fix_hint().to_string()),
+                retryable: false,
+            }
+        }
+        None => {
+            return CliOutcome::Unavailable {
+                message: "the OAIY CLI answered without naming the engine the flow ran on, \
+                          so it is not the runner this desktop ships"
+                    .to_string(),
+                detail: Some(engine_fix_hint().to_string()),
+                retryable: false,
+            }
+        }
+    }
+    match v.get("errorCode").and_then(Value::as_str) {
+        Some("engine_unavailable") => CliOutcome::Unavailable {
+            message: v
+                .get("error")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|m| !m.is_empty())
+                .unwrap_or("the OAIY CLI could not start its ZIPP engine")
+                .to_string(),
+            // Never retried from here: the same CLI would write the same
+            // payload. The user's fix is named in `detail`.
+            detail: Some(engine_fix_hint().to_string()),
+            retryable: false,
+        },
+        Some("timeout") => CliOutcome::TimedOut,
+        _ => CliOutcome::Succeeded(v),
     }
 }
 
@@ -746,6 +1244,7 @@ fn tail_of(s: &str, n: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     // --- CLI resolution order ---------------------------------------------
 
@@ -944,5 +1443,367 @@ mod tests {
         assert!(t.contains("THE ACTUAL ERROR"), "{t}");
         assert!(t.starts_with('…'));
         assert!(tail_of("short", 100) == "short");
+    }
+
+    // --- the runner has to be ZIPP: the capabilities report -----------------
+
+    fn good_capabilities() -> Value {
+        // Shaped like `oaiy capabilities --json`; the values are a fixture's,
+        // not any release's.
+        json!({
+            "version": "0.2.0",
+            "protocols": { "run": 1 },
+            "engine": {
+                "name": "zipp", "status": "ready",
+                "release": "vF.I.X", "version": "F.I.X", "revision": "0123abcd",
+                "wasmSha256": "ab".repeat(32), "languages": ["javascript", "python"]
+            },
+            "run": { "languages": ["javascript"], "defaultInstructionSteps": 50, "maxInstructionSteps": 2000 }
+        })
+    }
+
+    #[test]
+    fn a_good_capabilities_report_is_a_ready_engine_with_what_this_host_runs() {
+        let id = parse_capabilities(&good_capabilities()).unwrap();
+        assert_eq!(id.name, "zipp");
+        assert_eq!(id.release, "vF.I.X");
+        assert_eq!(id.revision, "0123abcd");
+        assert_eq!(id.wasm_sha256, "ab".repeat(32));
+        // `run.languages`, not `engine.languages`: the bundle can run Python,
+        // this CLI does not, and nothing may advertise what no host runs.
+        assert_eq!(id.run_languages, vec!["javascript".to_string()]);
+    }
+
+    #[test]
+    fn an_engine_that_is_not_zipp_is_refused_by_name() {
+        let mut v = good_capabilities();
+        v["engine"]["name"] = json!("v8");
+        let e = parse_capabilities(&v).unwrap_err();
+        assert!(e.contains("\"v8\""), "{e}");
+        assert!(e.contains("not on ZIPP"), "{e}");
+        v["engine"]["name"] = Value::Null;
+        assert!(parse_capabilities(&v).is_err(), "an unnamed engine is not ZIPP either");
+    }
+
+    #[test]
+    fn an_unavailable_engine_is_refused_with_the_clis_own_reason() {
+        let mut v = good_capabilities();
+        v["engine"]["status"] = json!("unavailable");
+        v["engine"]["reason"] = json!("ZIPP engine unavailable: zipp/zipp_wasm_bg.wasm has sha256 dead…, not beef…");
+        let e = parse_capabilities(&v).unwrap_err();
+        assert!(e.contains("sha256 dead"), "the CLI's reason is the error: {e}");
+        // No reason given: still refused, still says what is known.
+        v["engine"].as_object_mut().unwrap().remove("reason");
+        let e = parse_capabilities(&v).unwrap_err();
+        assert!(e.contains("\"unavailable\""), "{e}");
+    }
+
+    #[test]
+    fn a_run_protocol_this_desktop_does_not_read_is_refused() {
+        let mut v = good_capabilities();
+        v["protocols"]["run"] = json!(2);
+        let e = parse_capabilities(&v).unwrap_err();
+        assert!(e.contains("protocol 2"), "{e}");
+        v.as_object_mut().unwrap().remove("protocols");
+        assert!(parse_capabilities(&v).is_err());
+    }
+
+    // --- the cache: reuse rules --------------------------------------------
+
+    #[test]
+    fn a_ready_probe_is_kept_while_the_cli_file_is_the_same_and_a_refusal_expires() {
+        let key = ProbeKey {
+            cli: CliInvocation::Node { script: PathBuf::from("C:/app/resources/cli/oaiy.mjs") },
+            modified: Some(SystemTime::UNIX_EPOCH),
+            node_exe: None,
+        };
+        let now = Instant::now();
+        let ready = ProbeEntry {
+            key: key.clone(),
+            at: now - PROBE_TTL * 10,
+            probe: EngineProbe::Ready(parse_capabilities(&good_capabilities()).unwrap()),
+        };
+        // Ready: reused however old, while the key matches…
+        assert!(reusable(Some(&ready), &key, now).is_some_and(|p| p.is_ready()));
+        // …but not for a CLI file that has since changed (mtime), nor a
+        // different file, nor a different Node.
+        let mut touched = key.clone();
+        touched.modified = Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1));
+        assert!(reusable(Some(&ready), &touched, now).is_none());
+        let mut other = key.clone();
+        other.cli = CliInvocation::Binary { path: PathBuf::from("C:/tools/oaiy.exe") };
+        assert!(reusable(Some(&ready), &other, now).is_none());
+        let mut node = key.clone();
+        node.node_exe = Some(PathBuf::from("C:/node/node.exe"));
+        assert!(reusable(Some(&ready), &node, now).is_none());
+
+        // A refusal is remembered for the TTL, then asked again — so a fixed
+        // install recovers without a restart.
+        let refused = ProbeEntry {
+            key: key.clone(),
+            at: now,
+            probe: EngineProbe::Unavailable { reason: "no engine".into() },
+        };
+        assert!(reusable(Some(&refused), &key, now + PROBE_TTL / 2).is_some());
+        assert!(reusable(Some(&refused), &key, now + PROBE_TTL).is_none());
+        assert!(reusable(None, &key, now).is_none());
+    }
+
+    // --- the payload: what the CLI wrote, read as what it says -------------
+
+    #[test]
+    fn a_timed_out_payload_is_a_timeout_not_a_result() {
+        // The CLI's own --timeout fires before this desktop's deadline (by
+        // design, so it can name the stuck node) and it WRITES the payload.
+        let out = classify_result(json!({
+            "success": false, "status": "aborted", "errorCode": "timeout", "engine": "zipp",
+            "error": "flow timed out after 2s"
+        }));
+        assert!(matches!(out, CliOutcome::TimedOut), "{out:?}");
+    }
+
+    #[test]
+    fn an_engine_unavailable_payload_is_the_runtime_failing_not_a_result() {
+        // The bug that made this PR urgent: the CLI writes this payload when
+        // its ZIPP artifact is missing or altered, and the bridge lane reported
+        // it `succeeded`.
+        let out = classify_result(json!({
+            "success": false, "status": "failed", "jobId": "", "results": {},
+            "error": "ZIPP engine unavailable: zipp/zipp_wasm_bg.wasm is missing",
+            "errorCode": "engine_unavailable", "engine": "zipp"
+        }));
+        match out {
+            CliOutcome::Unavailable { message, detail, retryable } => {
+                assert!(message.contains("ZIPP engine unavailable"), "the CLI's reason: {message}");
+                assert!(detail.is_some_and(|d| d.contains("Reinstall") || d.contains("OAIY_CLI")));
+                assert!(!retryable, "a missing engine is not fixed by re-driving the run");
+            }
+            other => panic!("engine_unavailable must be Unavailable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_payload_from_an_engine_that_is_not_zipp_is_refused() {
+        let out = classify_result(json!({ "success": true, "output": 1, "engine": "v8" }));
+        match out {
+            CliOutcome::Unavailable { message, .. } => assert!(message.contains("\"v8\""), "{message}"),
+            other => panic!("a v8 payload must be Unavailable, got {other:?}"),
+        }
+        // A payload that names no engine at all is from a CLI older than this
+        // convention — and so not the runner this desktop ships.
+        let out = classify_result(json!({ "success": true, "output": 1 }));
+        assert!(matches!(out, CliOutcome::Unavailable { .. }), "{out:?}");
+    }
+
+    #[test]
+    fn a_zipp_payload_is_the_flows_own_report_success_or_not() {
+        let ok = classify_result(json!({ "success": true, "output": {"a": 1}, "engine": "zipp" }));
+        match ok {
+            CliOutcome::Succeeded(v) => assert_eq!(v["output"]["a"], 1),
+            other => panic!("{other:?}"),
+        }
+        // A flow's OWN failure is still its report, for the lane to read.
+        let failed = classify_result(json!({ "success": false, "status": "failed", "error": "boom", "engine": "zipp" }));
+        assert!(matches!(failed, CliOutcome::Succeeded(_)), "{failed:?}");
+    }
+
+    // --- the bridge lane: what a payload becomes in the ledger -------------
+
+    #[test]
+    fn the_bridge_lane_reports_a_flows_own_failure_as_failed_not_succeeded() {
+        // Pre-existing bug, fixed here: any parseable payload was `succeeded`.
+        let (status, output, error) = bridge_outcome(
+            CliOutcome::Succeeded(json!({ "success": false, "status": "failed", "error": "node x threw", "engine": "zipp" })),
+            Duration::from_secs(5),
+        );
+        assert_eq!(status, RunStatus::Failed);
+        assert!(output.is_none());
+        let e = error.expect("a failed run carries its error");
+        assert_eq!(e.code, RunErrorCode::NodeFailed);
+        assert!(e.message.contains("node x threw"), "{}", e.message);
+
+        let (status, output, error) = bridge_outcome(
+            CliOutcome::Succeeded(json!({ "success": true, "output": 7, "engine": "zipp" })),
+            Duration::from_secs(5),
+        );
+        assert_eq!(status, RunStatus::Succeeded);
+        assert_eq!(output.unwrap()["output"], 7);
+        assert!(error.is_none());
+    }
+
+    #[test]
+    fn the_bridge_lane_reports_an_unavailable_runtime_and_a_timeout_by_code() {
+        let (status, _, error) = bridge_outcome(
+            CliOutcome::Unavailable { message: "no ZIPP".into(), detail: Some("fix".into()), retryable: false },
+            Duration::from_secs(5),
+        );
+        assert_eq!(status, RunStatus::Failed);
+        assert_eq!(error.unwrap().code, RunErrorCode::RuntimeUnavailable);
+        let (status, _, error) = bridge_outcome(CliOutcome::TimedOut, Duration::from_secs(5));
+        assert_eq!(status, RunStatus::TimedOut);
+        assert_eq!(error.unwrap().code, RunErrorCode::Timeout);
+    }
+
+    // --- argv: the budget per lane ------------------------------------------
+
+    #[test]
+    fn the_instruction_budget_is_passed_when_a_provider_sets_one_and_omitted_otherwise() {
+        let flow = PathBuf::from("g.json");
+        let inputs = PathBuf::from("i.json");
+        let out = PathBuf::from("r.json");
+        let connector = PathBuf::from("c.json");
+        fn req<'a>(
+            paths: &'a (PathBuf, PathBuf, PathBuf),
+            budget: Option<u64>,
+            connector: Option<&'a Path>,
+        ) -> CliRequest<'a> {
+            CliRequest {
+                flow_path: &paths.0,
+                inputs_path: &paths.1,
+                out_path: &paths.2,
+                connector_path: connector,
+                timeout: Duration::from_secs(300),
+                instruction_budget: budget,
+                node: None,
+            }
+        }
+        let paths = (flow, inputs, out);
+        let strs = |args: Vec<OsString>| -> Vec<String> {
+            args.into_iter().map(|a| a.to_string_lossy().into_owned()).collect()
+        };
+        // The FormLogic lanes: the provider's 200M from its descriptor.
+        let a = strs(cli_args(&req(&paths, Some(200_000_000), Some(&connector))));
+        assert_eq!(
+            a,
+            ["run", "g.json", "--inputs", "i.json", "-o", "r.json", "--timeout", "300",
+             "--instruction-budget", "200000000", "--connector", "c.json"]
+        );
+        // The bridge: no policy, so the engine's own default — no flag at all.
+        let b = strs(cli_args(&req(&paths, None, None)));
+        assert!(!b.iter().any(|s| s.contains("instruction-budget")), "{b:?}");
+        assert_eq!(b, ["run", "g.json", "--inputs", "i.json", "-o", "r.json", "--timeout", "300"]);
+    }
+
+    // --- a stub CLI through the real spawn path ------------------------------
+
+    /// A Node on PATH, or the same skip/fail policy as the app-logic e2e:
+    /// skipped on a box without one, a failure under CI (which stages both).
+    fn node_on_path() -> Option<PathBuf> {
+        let finder = if cfg!(windows) { "where" } else { "which" };
+        let found = Command::new(finder)
+            .arg("node")
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .map(str::trim)
+                    .find(|l| !l.is_empty())
+                    .map(PathBuf::from)
+            });
+        if found.is_none() && std::env::var_os("CI").is_some() {
+            panic!("CI must have node on PATH for the stub-CLI tests");
+        }
+        found
+    }
+
+    /// Write a CLI stand-in: `capabilities --json` prints `caps`; `run … -o F`
+    /// writes `payload` to F and exits 0.
+    fn stub_cli(tag: &str, caps: &Value, payload: &Value) -> (PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("oaiy-stub-cli-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("stub.mjs");
+        std::fs::write(
+            &script,
+            format!(
+                "import fs from 'node:fs';\n\
+                 const a = process.argv.slice(2);\n\
+                 if (a[0] === 'capabilities') {{ process.stdout.write({caps}); process.exit(0); }}\n\
+                 if (a[0] === 'run') {{ fs.writeFileSync(a[a.indexOf('-o') + 1], {payload}); process.exit(0); }}\n\
+                 process.exit(2);\n",
+                caps = serde_json::to_string(&caps.to_string()).unwrap(),
+                payload = serde_json::to_string(&payload.to_string()).unwrap(),
+            ),
+        )
+        .unwrap();
+        (dir, script)
+    }
+
+    fn run_stub(dir: &Path, script: PathBuf, node: &Path) -> CliOutcome {
+        let flow = dir.join("flow.json");
+        let inputs = dir.join("inputs.json");
+        let out = dir.join("result.json");
+        std::fs::write(&flow, "{}").unwrap();
+        std::fs::write(&inputs, "{}").unwrap();
+        run_flow_cli_with(
+            &CliInvocation::Node { script },
+            Some(node),
+            CliRequest {
+                flow_path: &flow,
+                inputs_path: &inputs,
+                out_path: &out,
+                connector_path: None,
+                timeout: Duration::from_secs(20),
+                instruction_budget: None,
+                node: None,
+            },
+            &|| false,
+        )
+    }
+
+    #[test]
+    fn a_cli_whose_engine_is_not_zipp_is_refused_before_any_flow_is_run() {
+        // An `OAIY_CLI` override pointing at some other build: the probe
+        // refuses it, the flow is never handed over, and the failure names the
+        // fix. The stub's `run` would happily "succeed" — the assertion on the
+        // result file not existing is what proves it never ran.
+        let Some(node) = node_on_path() else {
+            eprintln!("no node on PATH — skipping");
+            return;
+        };
+        let mut caps = good_capabilities();
+        caps["engine"]["name"] = json!("v8");
+        let (dir, script) = stub_cli("v8", &caps, &json!({ "success": true, "output": 1, "engine": "v8" }));
+        let outcome = run_stub(&dir, script.clone(), &node);
+        match outcome {
+            CliOutcome::Unavailable { message, detail, retryable } => {
+                assert!(message.contains("does not run user logic on ZIPP"), "{message}");
+                assert!(message.contains(&script.to_string_lossy().to_string()), "names the CLI: {message}");
+                let d = detail.expect("the reason and the fix");
+                assert!(d.contains("\"v8\""), "the probe's reason: {d}");
+                assert!(d.contains("OAIY_CLI") || d.contains("Reinstall"), "the fix: {d}");
+                assert!(!retryable, "a bad OAIY_CLI override is not retryable");
+            }
+            other => panic!("a v8 CLI must be refused, got {other:?}"),
+        }
+        assert!(!dir.join("result.json").exists(), "the flow must never have been handed to the stub");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_cli_that_claims_zipp_but_answers_with_another_engine_is_refused_at_the_payload() {
+        // The second gate, through the real process boundary: the probe
+        // passes, the payload does not say `engine: "zipp"`, and the run is
+        // not a result.
+        let Some(node) = node_on_path() else {
+            eprintln!("no node on PATH — skipping");
+            return;
+        };
+        let (dir, script) = stub_cli(
+            "liar",
+            &good_capabilities(),
+            &json!({ "success": true, "status": "completed", "output": 1, "engine": "v8" }),
+        );
+        let outcome = run_stub(&dir, script, &node);
+        match outcome {
+            CliOutcome::Unavailable { message, .. } => {
+                assert!(message.contains("not ZIPP"), "{message}");
+                assert!(message.contains("\"v8\""), "{message}");
+            }
+            other => panic!("a v8 payload must be refused, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

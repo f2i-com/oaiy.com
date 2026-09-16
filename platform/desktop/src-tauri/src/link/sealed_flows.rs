@@ -538,10 +538,13 @@ mod tests {
             "flow-one",
             json!({"v":1,"flowId":"flow-one","inputs":{"message":"remote echo"}}),
         );
+        // The completion carries the flow's OUTPUT, not the CLI's envelope, so
+        // the graph itself asks the question: a flow on the ZIPP VM has no Node
+        // `process`; one the host ran itself would.
         let graph = json!({"nodes":[
-            {"id":"start","type":"input","position":{"x":0,"y":0},"data":{}},
-            {"id":"out","type":"output","position":{"x":200,"y":0},"data":{"value":"$inputs.message"}}
-        ],"edges":[{"id":"edge","source":"start","target":"out"}]});
+            {"id":"probe","type":"logic_block","position":{"x":0,"y":0},"data":{"code":"return typeof process;"}},
+            {"id":"out","type":"output","position":{"x":200,"y":0},"data":{"value":"$nodes.probe"}}
+        ],"edges":[{"id":"edge","source":"probe","target":"out"}]});
         let (url, server) = server(vec![
             (200, json!({"requests":[request.clone()]})),
             (200, json!({"claimed":true,"request":request})),
@@ -568,6 +571,6 @@ mod tests {
             serde_json::from_str(requests[3].split("\r\n\r\n").nth(1).unwrap()).unwrap();
         let opened = open_result(&identity, completion["resultEnvelope"].as_str().unwrap());
         assert_eq!(completion["status"], "done", "{opened}");
-        assert_eq!(opened["result"], "remote echo");
+        assert_eq!(opened["result"], "undefined", "the flow must have run on ZIPP, where there is no process object: {opened}");
     }
 }

@@ -64,6 +64,7 @@
     "errorBackoffSeconds": 10
   },
   "flows": {
+    "instructionBudget": 200000000,
     "bindingsPath": "/api/v1/flow-bindings",
     "reservePath": "/api/v1/flow-runs",
     "queuedPath": "/api/v1/flow-runs/queued",
@@ -210,6 +211,7 @@
     }
   },
   "appLogic": {
+    "instructionBudget": 200000000,
     "path": "/api/v1/app-logic",
     "eventHook": "onConnectorEvent",
     "submitPath": "/api/v1/forms/{formId}/responses",
