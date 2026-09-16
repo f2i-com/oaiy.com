@@ -289,9 +289,10 @@ parts, each runnable alone against the `dist/` the build just made (a stale
 | the same file, non-vacuity | the tripwire must count a script's `new Function`, `eval` and recovered `AsyncFunction` (3) and skip the logger probe; the production bundle must contain neither `__OAIY_TEST_ALLOW_V8__` nor `requireScriptExecutor: false`; a bundle the test builds from the same sources with the build-time define `__OAIY_TEST_ALLOW_V8__: 'true'` (`dist/_v8_oaiy.mjs`; no flag or variable selects it) must run the same canary on the host engine and report `typeof process === 'object'`, read the token, take the condition's false branch and trip the tripwire 5× (the entry, subflow and macro scripts plus the flow's own two `Function` calls). Run once against the previous revision's bundle (b95c592's parent, built in a worktree) the tripwire counted the same 5 and the probe read `["object","undefined","function","object","object"]` and the token |
 | `node test/zipp-limits.mjs` | any case hangs. Everything else is recorded (below), never asserted |
 
-### ZIPP boundary measurements (zipp.org v0.0.18, web-python; `node test/zipp-limits.mjs`)
+### ZIPP boundary measurements (zipp.org v0.0.19, web-python; `node test/zipp-limits.mjs`)
 
-Recorded 2026-09-17 on Windows 11, Node 24.19. These replace the 1 MiB figure
+Recorded 2026-09-17 on Windows 11, Node 24.19, first on v0.0.18 and again on
+v0.0.19 (same PROFILE limits, every row the same). These replace the 1 MiB figure
 the plan carried for D13; the binding limits are different in each direction.
 
 | Case | Result |

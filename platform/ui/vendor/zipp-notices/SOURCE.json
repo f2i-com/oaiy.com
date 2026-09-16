@@ -1,6 +1,6 @@
 {
   "repository": "https://github.com/f2i-com/zipp.org",
-  "release": "v0.0.18",
+  "release": "v0.0.19",
   "sources": [
     "crates/rustpython-parser-fork/LICENSE",
     "LICENSE-UNICODE"
