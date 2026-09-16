@@ -18,6 +18,7 @@ import {
 } from './runtime/BuiltinModules.js';
 import { runtimeLogger, redactSensitive, formatPathForLog, type LogPathPolicy } from './logger.js';
 import { spawnUntrustedWorker, type UntrustedWorkerFactory } from './untrusted-executor.js';
+import type { ScriptExecutor } from './script-executor.js';
 import { WORKFLOW_TRAMPOLINE } from './workflow-trampoline.js';
 import { parse as acornParse } from 'acorn';
 
@@ -77,6 +78,18 @@ export interface RuntimeConfig {
    * of host globals for no isolation gain.
    */
   runTrustedFlowsInWorker?: boolean;
+  /**
+   * The engine every flow runs on, trusted or hardened, regardless of `Worker`
+   * availability. Set, it preempts both `untrustedWorkerFactory` and the
+   * in-thread path; it fails closed (an executor that throws fails the run).
+   * A Node host supplies one so its flows never reach `new Function`.
+   */
+  scriptExecutor?: ScriptExecutor | null;
+  /**
+   * Refuse to run flow code when no `scriptExecutor` is set, instead of
+   * falling back to in-thread `new Function`. Independent of `Worker`.
+   */
+  requireScriptExecutor?: boolean;
 }
 
 declare global {
@@ -866,6 +879,8 @@ export class OAIYRuntime {
   private useWorkerForUntrusted: boolean = true;
   private untrustedWorkerFactory: UntrustedWorkerFactory | null = null;
   private runTrustedFlowsInWorker: boolean = false;
+  private scriptExecutor: ScriptExecutor | null = null;
+  private requireScriptExecutor: boolean = false;
 
   constructor(configOrOnToken?: RuntimeConfig | StreamCallback, ...legacyArgs: unknown[]) {
     if (configOrOnToken && typeof configOrOnToken === 'object' && !('call' in configOrOnToken)) {
@@ -887,6 +902,12 @@ export class OAIYRuntime {
       }
       if (config.runTrustedFlowsInWorker !== undefined) {
         this.runTrustedFlowsInWorker = config.runTrustedFlowsInWorker;
+      }
+      if (config.scriptExecutor) {
+        this.scriptExecutor = config.scriptExecutor;
+      }
+      if (config.requireScriptExecutor !== undefined) {
+        this.requireScriptExecutor = config.requireScriptExecutor;
       }
       if (config.useWorkerForUntrusted !== undefined) {
         this.useWorkerForUntrusted = config.useWorkerForUntrusted;
@@ -1937,6 +1958,16 @@ export class OAIYRuntime {
     this.runTrustedFlowsInWorker = enabled;
   }
 
+  /** Equivalent to `RuntimeConfig.scriptExecutor`; see that field. */
+  setScriptExecutor(executor: ScriptExecutor | null): void {
+    this.scriptExecutor = executor;
+  }
+
+  /** Equivalent to `RuntimeConfig.requireScriptExecutor`; see that field. */
+  setRequireScriptExecutor(required: boolean): void {
+    this.requireScriptExecutor = required;
+  }
+
   private getModulesShim(): string {
     let shimCode = `
 
@@ -2154,7 +2185,37 @@ function* __run_workflow() {
 
 ${WORKFLOW_TRAMPOLINE}`;
 
+      // ----- Host script engine (preempts every path below) -----
+      //
+      // A host that supplied a `scriptExecutor` gets every flow, trusted or
+      // hardened, on that engine — no `Worker` global needed, so a Node host
+      // can route flows off V8 entirely. The escape scan above still ran for
+      // hardened flows. FAIL CLOSED: a spawn failure fails the run; we never
+      // downgrade to the Worker or in-thread paths.
+      const executor = this.scriptExecutor;
+      if (executor) {
+        try {
+          this.runInWorker(fullScript, host, consoleProxy, fail, executor);
+        } catch (e) {
+          fail(e);
+        }
+        return;
+      }
+      // A host that REQUIRES its engine refuses to run flow code without one,
+      // rather than reaching `new Function` below. Independent of `Worker`.
+      if (this.requireScriptExecutor) {
+        fail(
+          new Error(
+            'Refusing to run flow code: this host requires its configured script engine and none is set',
+          ),
+        );
+        return;
+      }
+
       // ----- Worker path (mandatory for hardened mode when available) -----
+      //
+      // Reached only when the host set neither `scriptExecutor` nor
+      // `requireScriptExecutor` (browser/Tauri and today's Node CLI).
       //
       // For untrusted package workflows we run the compiled script in a
       // Web Worker so a recovered `globalThis` only points at the
@@ -2203,9 +2264,10 @@ ${WORKFLOW_TRAMPOLINE}`;
       // execution in the host realm — on a Node host a recovered realm global yields
       // process/require → RCE. This mirrors the spin-up-failure handling above (which already
       // fails rather than downgrading). It never fires in the current wiring (browser/Tauri
-      // always have Worker; the Node CLI never sets a packageId) — it guards a future
-      // headless-package path. The explicit opt-out useWorkerForUntrusted:false (Node unit
-      // tests) still reaches the in-thread path below by design.
+      // always have Worker; the Node CLI sets `requireScriptExecutor` from PR2a on, so it
+      // is refused above before reaching here) — it guards a future headless-package path
+      // in a host that set neither field. The explicit opt-out useWorkerForUntrusted:false
+      // (Node unit tests) still reaches the in-thread path below by design.
       if (isHardened && this.useWorkerForUntrusted && !workerAvailable) {
         fail(
           new Error(
@@ -2247,8 +2309,11 @@ ${WORKFLOW_TRAMPOLINE}`;
     host: { call: (kind: string, args: unknown[], cb: (res: unknown) => void) => void },
     consoleProxy: { log: (...a: unknown[]) => void; warn: (...a: unknown[]) => void; error: (...a: unknown[]) => void; debug: (...a: unknown[]) => void; info: (...a: unknown[]) => void },
     fail: (err: unknown) => void,
+    // The host's `scriptExecutor` when set; otherwise the Worker factory the
+    // routing above chose. A real `Worker` satisfies `WorkerLike` as-is.
+    spawn: ScriptExecutor = this.untrustedWorkerFactory ?? spawnUntrustedWorker,
   ): void {
-    const { worker, cleanup } = (this.untrustedWorkerFactory ?? spawnUntrustedWorker)();
+    const { worker, cleanup } = spawn();
 
     let terminated = false;
     const tearDown = () => {

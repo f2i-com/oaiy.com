@@ -24,6 +24,7 @@ import type {
 import type { WorkflowGraph, WorkflowInputs, LogEntry, Flow, ProjectSettings, LocalNetworkPermissionRequest, LocalNetworkPermissionResponse, DatabaseRequest, DatabaseResult } from '../types';
 import { createRuntime, OAIYRuntime } from '../runtime';
 import type { UntrustedWorkerFactory } from '../untrusted-executor';
+import type { ScriptExecutor } from '../script-executor';
 import type { ModuleRegistry, LoadedModule } from '../module-types';
 import { createLogger } from '../logger';
 import { MAX_JOB_HISTORY_SIZE, FORCE_ABORT_TIMEOUT_MS, MAX_LOG_ENTRIES_PER_JOB } from '../constants';
@@ -100,6 +101,19 @@ export interface JobManagerOptions {
    * read here applies to the next run without a reload.
    */
   runTrustedFlowsInWorker?: boolean | (() => boolean);
+
+  /**
+   * The engine every job's flow runs on, trusted or hardened, regardless of
+   * `Worker` availability. Forwarded to every runtime this manager creates;
+   * see `RuntimeConfig.scriptExecutor`.
+   */
+  scriptExecutor?: ScriptExecutor | null;
+  /**
+   * Refuse to run a job's flow code when no `scriptExecutor` is set, instead
+   * of falling back to in-thread `new Function`. Applied to every runtime
+   * whether or not a Worker factory was passed.
+   */
+  requireScriptExecutor?: boolean;
 }
 
 /**
@@ -129,6 +143,8 @@ export class JobManager {
   private tauriInvoke?: (cmd: string, args?: Record<string, unknown>) => Promise<unknown>;
   private untrustedWorkerFactory: UntrustedWorkerFactory | null = null;
   private runTrustedFlowsInWorker: boolean | (() => boolean) = false;
+  private scriptExecutor: ScriptExecutor | null = null;
+  private requireScriptExecutor: boolean = false;
 
   // Subscribers
   private stateSubscribers: Set<JobStateCallback> = new Set();
@@ -158,6 +174,8 @@ export class JobManager {
     this.tauriInvoke = options.tauriInvoke;
     this.untrustedWorkerFactory = options.untrustedWorkerFactory ?? null;
     this.runTrustedFlowsInWorker = options.runTrustedFlowsInWorker ?? false;
+    this.scriptExecutor = options.scriptExecutor ?? null;
+    this.requireScriptExecutor = options.requireScriptExecutor ?? false;
     this.config = { ...DEFAULT_CONFIG, ...options.config };
   }
 
@@ -703,6 +721,11 @@ export class JobManager {
         const trusted = this.runTrustedFlowsInWorker;
         runtime.setRunTrustedFlowsInWorker(typeof trusted === 'function' ? trusted() : trusted);
       }
+      // The host's script engine and its fail-closed requirement apply to every
+      // job's runtime UNCONDITIONALLY — outside the factory gate above, so a
+      // host that requires its engine is refused even with no factory set.
+      runtime.setScriptExecutor(this.scriptExecutor);
+      runtime.setRequireScriptExecutor(this.requireScriptExecutor);
 
       // Wire the Tauri invoke broker so workflows submitted via the API can
       // reach native commands (browser_v2_*, terminal, database, etc.). Without
