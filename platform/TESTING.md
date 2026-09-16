@@ -228,7 +228,13 @@ a run never mixes engines; the release's web job re-verifies with
 `cd ui && npm run test:zipp` executes real compiled workflow scripts in both
 installed engines, one process each (`ZIPP_VENDOR=zipp-wasm-python` picks one).
 It covers host round-trips, output, error propagation, instruction limits and
-the guest helpers. It also checks the install against its release, the bundle
+the guest helpers. For trusted flows the guest shims (`setTimeout`, `fetch`,
+`crypto`, …, all throwing stubs or pure helpers) are program-level `var`s, so a
+body the flow compiles at run time — `Function(...)`, indirect eval, the
+Desktop's app-logic wrapper — sees them too; the suite proves on both engines
+that such a `var` overwrites ZIPP's intrinsic, which is the condition the
+placement rests on. Hardened flows keep the shims inside the wrapper and a
+recovered global there stays empty. It also checks the install against its release, the bundle
 checksums for the bindings, WASM and provenance files, the live engine profile
 against `PROFILE.json` and `SOURCE.json`, and that the module links a memory
 maximum above the VM's heap accounting limit.

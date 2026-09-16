@@ -353,12 +353,12 @@ console.log('\nhardened semantics');
 }
 
 // ---------------------------------------------------------------------------
-// 5b. Trusted flows: host-realm shims, and timers that throw instead of trap.
+// 5b. Trusted flows: host-realm shims, and timers that throw instead of silently doing nothing.
 // ---------------------------------------------------------------------------
 // A user's own flow gets no shadow preamble, so this is the surface a code node
 // actually sees under Zipp. The timer case is the one that matters: Zipp's own
-// setTimeout with a delay tries to sleep a thread WebAssembly does not have and
-// panics the instance, so the wrapper has to replace it before user code runs.
+// setTimeout returns undefined and its callback never runs under ZippSession
+// (measured on v0.0.18), so the wrapper has to replace it before user code runs.
 console.log('\ntrusted-flow shims');
 {
   const { value, error } = await runFlow(
@@ -389,7 +389,7 @@ console.log('\ntrusted-flow shims');
        };`,
     { broker: okBroker, hardened: false },
   );
-  check('trusted flow ran (no trap)', !error, error);
+  check('trusted flow ran (no error)', !error, error);
   const p = value?.probe ?? {};
   check('TextEncoder produces UTF-8 bytes', p.utf8Bytes === 11, `bytes=${p.utf8Bytes}`);
   check('TextDecoder round-trips multi-byte text and emoji', p.roundTrip === 'héllo 🌍', p.roundTrip);
@@ -398,7 +398,7 @@ console.log('\ntrusted-flow shims');
   check('structuredClone clones plain data', JSON.stringify(p.clone) === '{"a":[1,{"b":2}]}', JSON.stringify(p.clone));
   check('performance.now works', p.perfIsNumber === true);
   check('queueMicrotask callbacks run at the next re-entry', p.micro === 'ran', p.micro);
-  check('setTimeout throws a clear error instead of trapping', /not available inside the Zipp sandbox/.test(p.errs?.setTimeout ?? ''), p.errs?.setTimeout);
+  check('setTimeout throws a clear error instead of silently never firing', /not available inside the Zipp sandbox/.test(p.errs?.setTimeout ?? ''), p.errs?.setTimeout);
   check('setInterval throws a clear error', /not available/.test(p.errs?.setInterval ?? ''), p.errs?.setInterval);
   check('fetch throws a clear error naming the alternative', /HTTP Request node/.test(p.errs?.fetch ?? ''), p.errs?.fetch);
   check('crypto does not silently degrade to Math.random', /entropy/.test(p.errs?.crypto ?? ''), p.errs?.crypto);
@@ -416,6 +416,57 @@ console.log('\ntrusted-flow shims');
   check('hardened: fetch is still undefined (preamble wins over shim)', !error && value?.probe?.fetch === 'undefined', JSON.stringify(value?.probe));
   check('hardened: setTimeout is still undefined', value?.probe?.setTimeout === 'undefined');
   check('hardened: pure helpers remain available', value?.probe?.TextEncoder === 'function');
+}
+
+// ---------------------------------------------------------------------------
+// 5c. Trusted flows: the shims are TOP-LEVEL, so dynamic code sees them too.
+// ---------------------------------------------------------------------------
+// A `Function(...)` or indirect-eval body runs at the guest's GLOBAL scope, not
+// inside the wrapper's IIFE — the Desktop's app-logic wrapper is exactly that
+// shape. A shim declared inside the IIFE is invisible there, and the body
+// reaches ZIPP's own `setTimeout`. Measured on v0.0.18 (both installs) that
+// intrinsic returns `undefined` and its callback never runs under
+// `ZippSession`, which only pumps host calls: the script carries on as if its
+// timer had been honoured. So for trusted flows the shims are emitted at
+// program top level, where a `var` overwrites the intrinsic and the body gets
+// the shim's TypeError instead.
+//
+// This is also the permanent record of the gate that decided that placement:
+// it holds only while a top-level `var setTimeout` actually replaces ZIPP's
+// intrinsic (v0.0.18: it does, on both installs). A release that makes the
+// intrinsic non-writable turns the assignment into a silent sloppy-mode no-op
+// and `r` comes back "no throw" — the failure to notice.
+console.log('\ntrusted-flow shims reach dynamic code');
+{
+  const { value, error } = await runFlow(
+    `       let workflow_context = {};
+       yield Utility.httpRequest("x");
+       const g = Function("return this")();
+       let r;
+       try { Function("setTimeout(function(){}, 10)")(); r = "no throw"; } catch (e) { r = e.message; }
+       // The run must FINISH after the throw: another host round trip proves it.
+       const after = yield Utility.httpRequest("after");
+       workflow_context.probe = {
+         r,
+         same: g.setTimeout === setTimeout,
+         recovered: { fetch: typeof g.fetch, Worker: typeof g.Worker, importScripts: typeof g.importScripts, crypto: typeof g.crypto },
+         after: after.body,
+       };`,
+    { broker: okBroker, hardened: false },
+  );
+  console.log(`  observed: error=${JSON.stringify(error)} probe=${JSON.stringify(value?.probe)}`);
+  const p = value?.probe ?? {};
+  check('trusted: a dynamic-code body calling setTimeout gets the shim TypeError, not a silent no-op',
+    /not available inside the Zipp sandbox/.test(p.r ?? ''), JSON.stringify(p.r));
+  check('trusted: the global setTimeout IS the shim the flow body sees (identity)', p.same === true, JSON.stringify(p));
+  check('trusted: the run finishes and the next host call completes after the throw', !error && p.after === 'alpha beta', error ?? JSON.stringify(p));
+  // The browser-visible consequence, stated: a recovered global in a trusted
+  // flow now holds the throwing stubs where it held ZIPP's intrinsics (or
+  // nothing). Hardened flows are unchanged — section 5 asserts `undefined`.
+  check('trusted: a RECOVERED global carries the stubs (fetch/Worker/importScripts/crypto)',
+    p.recovered?.fetch === 'function' && p.recovered?.Worker === 'function'
+      && p.recovered?.importScripts === 'function' && p.recovered?.crypto === 'object',
+    JSON.stringify(p.recovered));
 }
 
 // ---------------------------------------------------------------------------

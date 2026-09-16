@@ -2197,8 +2197,9 @@ mod tests {
         //
         // The scripts below are the shipped ones, trimmed to the parts that
         // decide: a hook that must not fire on the wrong event, a dedup that
-        // must read the storage it was handed, and a throw that must not take
-        // its neighbours down.
+        // must read the storage it was handed, a throw that must not take its
+        // neighbours down, and a timer — which the sandbox has to refuse out
+        // loud, since its own `setTimeout` would silently never fire.
         let Some((node, cli)) = staged_runner() else {
             eprintln!("no staged CLI or no Node on this machine — skipping");
             return;
@@ -2210,6 +2211,8 @@ mod tests {
               "function run(ctx) {\n  var ev = ctx.event || {};\n  if (ev.name !== 'aokie.sms.received') return {};\n  return { effects: [{ type: 'ui.toast', level: 'info', message: 'New SMS' }] };\n}" },
             { "id": "throws", "hook": "onConnectorEvent", "source":
               "function run(ctx) { return nothing.at.all; }" },
+            { "id": "timer", "hook": "onConnectorEvent", "source":
+              "function run(ctx) { setTimeout(function(){}, 10); return {}; }" },
             { "id": "after-the-throw", "hook": "onConnectorEvent", "source":
               "function run(ctx) { return { effects: [{ type: 'ui.toast', message: 'still here' }] }; }" },
             { "id": "unboxable", "hook": "onConnectorEvent", "source":
@@ -2220,7 +2223,7 @@ mod tests {
         let app = AppEntry(json!({ "app": { "id": "app-1" }, "customLogic": { "scripts": raw } }));
         let s = spec();
         let refs = app.event_scripts(&s.catalogue, &s.event_hook);
-        assert_eq!(refs.len(), 5, "every script here runs on the event hook");
+        assert_eq!(refs.len(), 6, "every script here runs on the event hook");
 
         let run = |ctx: Value| -> Vec<Result<Value, String>> {
             let dir = std::env::temp_dir().join(format!(
@@ -2278,14 +2281,22 @@ mod tests {
         assert_eq!(fresh[1].clone().unwrap(), json!({}));
         // A script that throws reports itself…
         assert!(fresh[2].clone().unwrap_err().contains("threw"));
-        // …and does not take the next one with it, which is why the catch lives
+        // …as does one that reaches for a timer: the runner's sandbox replaces
+        // `setTimeout` with a stub that throws, at the GLOBAL scope this
+        // `new Function` body runs in. ZIPP's own `setTimeout` would have
+        // returned quietly and never fired, and this script would have looked
+        // like a success with its work dropped.
+        let timer = fresh[3].clone().unwrap_err();
+        assert!(timer.contains("threw"), "{timer}");
+        assert!(timer.contains("setTimeout"), "{timer}");
+        // …and neither takes the next one with it, which is why the catch lives
         // inside the node instead of around the run.
-        assert_eq!(fresh[3].clone().unwrap()["effects"][0]["message"], "still here");
+        assert_eq!(fresh[4].clone().unwrap()["effects"][0]["message"], "still here");
         // The unboxing hazard, pinned. A record of two fields one of which is
         // called `text` used to come back as the bare text — the write that
         // followed would have been missing every other field, and nothing
         // anywhere would have said so.
-        let boxed = fresh[4].clone().unwrap();
+        let boxed = fresh[5].clone().unwrap();
         assert_eq!(boxed["effects"][0]["answers"]["text"], "body");
         assert_eq!(boxed["effects"][0]["answers"]["url"], "https://example.test");
 

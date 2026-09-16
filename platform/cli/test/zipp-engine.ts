@@ -188,6 +188,61 @@ async function main(): Promise<void> {
       delete process.env.OAIY_SERVER_TOKEN;
     }
 
+    // --- 5b. The Desktop's app-logic shape: a timer throws, the run goes on --
+    // `app_logic.rs` runs each script as
+    // `(new Function("ctx",decodeURIComponent(…)))(JSON.parse(…))` with the
+    // try/catch INSIDE the encoded body. That body evaluates at the guest's
+    // global scope, so it only sees the sandbox shims if they are top-level.
+    // Before that was so, `setTimeout(fn, 10)` reached ZIPP's own timer, whose
+    // callback never runs under the session's pump: the script reported
+    // `ok:true` with its work silently dropped. Now it reports the TypeError,
+    // and the next script still runs.
+    const appLogic = (source: string, ctx: unknown) => {
+      const pct = (s: string) =>
+        Array.from(Buffer.from(s, 'utf8'), (b) => `%${b.toString(16).toUpperCase().padStart(2, '0')}`).join('');
+      const body =
+        `try {\n${source}\n;return JSON.stringify({ ok: true, value: run(ctx) });\n} ` +
+        'catch (e) { return JSON.stringify({ ok: false, error: String((e && e.message) || e) }); }';
+      return `(new Function("ctx",decodeURIComponent("${pct(body)}")))(JSON.parse(decodeURIComponent("${pct(JSON.stringify(ctx))}")))`;
+    };
+    const timerGraph = {
+      nodes: [
+        {
+          id: 'timer',
+          type: 'logic_block',
+          position: { x: 0, y: 0 },
+          data: { code: appLogic('function run(ctx) { setTimeout(function(){}, 10); return {}; }', { event: {} }) },
+        },
+        {
+          id: 'next',
+          type: 'logic_block',
+          position: { x: 200, y: 0 },
+          data: { code: appLogic("function run(ctx) { return { effects: [{ type: 'ui.toast', message: 'still here' }] }; }", {}) },
+        },
+      ],
+      edges: [{ id: 'e', source: 'timer', target: 'next' }],
+    } as WorkflowGraph;
+    const timerRun = await runFlow(timerGraph, { timeoutMs: 30_000 });
+    const parsed = (id: string) => {
+      try {
+        return JSON.parse(String(timerRun.results?.[id])) as { ok?: boolean; error?: string; value?: { effects?: { message?: string }[] } };
+      } catch {
+        return undefined;
+      }
+    };
+    const timerOut = parsed('timer');
+    const nextOut = parsed('next');
+    check(
+      'an app-logic script calling setTimeout reports ok:false with the sandbox TypeError',
+      timerOut?.ok === false && /not available inside the Zipp sandbox/.test(timerOut?.error ?? ''),
+      `status=${timerRun.status} error=${timerRun.error ?? ''} got=${JSON.stringify(timerRun.results?.['timer'])}`,
+    );
+    check(
+      'and the NEXT script in the graph completes (one failing script does not end the run)',
+      timerRun.status === 'completed' && nextOut?.ok === true && nextOut?.value?.effects?.[0]?.message === 'still here',
+      `status=${timerRun.status} error=${timerRun.error ?? ''} got=${JSON.stringify(timerRun.results?.['next'])}`,
+    );
+
     // --- 6. The spread cannot un-require the engine ------------------------
     await loadNodeBundledModules();
     const stubborn = await createCliEngine({
