@@ -327,6 +327,12 @@ async fn main() {
         tokio::spawn(async move {
             shutdown_signal().await;
             log::info!("oaiy-server: shutting down — stopping all services");
+            // The warm script host exits on a line (bounded, then killed);
+            // done on a blocking thread because it waits on a child.
+            let _ = tokio::task::spawn_blocking(|| {
+                oaiy_desktop_lib::bridge::ScriptHost::global().shutdown()
+            })
+            .await;
             // Recover from a poisoned mutex: stopping services on exit matters more
             // than poison-safety — `if let Ok` would silently skip it and orphan every
             // running service (venv-python / llama.cpp / multi-GB loaders).

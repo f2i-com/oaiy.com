@@ -1714,7 +1714,11 @@ pub fn run() {
                 // processes. Done synchronously — the user just clicked
                 // Quit and is waiting; a few hundred ms is fine.
                 RunEvent::Exit => {
-                    // Plugins first: they are lighter to stop than model servers,
+                    // The warm script host first of all: it is one Node child
+                    // that exits on a line, and a plugin event arriving during
+                    // the stops below must not start another.
+                    crate::bridge::ScriptHost::global().shutdown();
+                    // Plugins next: they are lighter to stop than model servers,
                     // and a plugin holding hardware (Aokie's dongle) should get
                     // its graceful shutdown before anything slow runs.
                     if let Some(host) = app_handle.try_state::<std::sync::Arc<crate::plugins::PluginHost>>() {
@@ -1800,6 +1804,10 @@ pub fn build_bridge_state(
     // handle the flow worker below is given, so the two cannot resolve
     // differently on the same machine.
     host.set_node_runtime(node.clone());
+    // And the warm script host, which runs the same CLI as `script --serve`
+    // under the same Node — the third lane on this machine that must not
+    // resolve differently from the other two.
+    bridge::ScriptHost::global().set_node_runtime(node.clone());
     let flows = std::sync::Arc::new(bridge::FlowStore::new(data_dir.join("flows")));
     // Durable pairing tokens under <data>/bridge, so a paired consumer stays
     // paired across restarts.
