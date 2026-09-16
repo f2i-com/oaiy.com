@@ -6,10 +6,19 @@
  *  - `import.meta.env` (ui/src/utils/logger.ts): esbuild.mjs defines it as
  *    `{}` for the Node bundle, so every flag reads as undefined.
  *  - the DOM `Worker`/`Blob`/`URL` globals used by the browser executors
- *    (untrusted-executor.ts, zipp-executor.ts). The CLI never takes those
- *    code paths; the DOM lib is referenced only so the shared sources type.
+ *    (untrusted-executor.ts, the browser shell of zipp-executor.ts). The CLI
+ *    never takes those code paths — its flows run on `worker_threads`
+ *    (src/zipp/) — so the DOM lib is referenced only so the shared sources type.
+ *
+ * And two the CLI's own build adds. `cli/esbuild.mjs` verifies the installed
+ * ZIPP release and defines, from its SOURCE.json: the sha256 of the .wasm the
+ * CLI ships (checked against the staged bytes at run time, src/zipp/artifact.ts)
+ * and the engine identity as a JSON string. Never literals in source.
  */
 /// <reference lib="dom" />
+
+declare const __ZIPP_WASM_SHA256__: string;
+declare const __ZIPP_ENGINE__: string;
 
 interface ImportMeta {
   readonly env: {

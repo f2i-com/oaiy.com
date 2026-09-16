@@ -3,14 +3,53 @@
  * (`ui/src/engine/createEngine`) to the Node host and drives a single job to a
  * terminal state — the Node analogue of the browser's JobQueueProvider +
  * CliWorkflowRunner, minus React.
+ *
+ * Every flow the CLI runs — `run`, `worker`, the tests — runs on the ZIPP VM
+ * in a worker thread, through `createCliEngine`. That is the only way this
+ * package builds a `JobManager`, and it cannot be talked out of it.
  */
 // Side effect: install window.__TAURI__ before any shared code reads it.
 import './node-host/core';
-import { createEngine } from '../../ui/src/engine/createEngine';
-import type { Flow, WorkflowGraph } from 'oaiy-core';
+import { createEngine, type CreateEngineOptions } from '../../ui/src/engine/createEngine';
+import type { Flow, JobManager, WorkflowGraph } from 'oaiy-core';
 import type { WorkflowInputs } from 'oaiy-core';
 import { loadNodeBundledModules } from './generated/bundled-modules';
 import { closeAll as closeBrowserSessions } from './node-host/browser';
+import { loadZippArtifact, EngineUnavailableError } from './zipp/artifact';
+import { createZippThreadExecutor } from './zipp/thread-executor';
+
+export interface CliEngineOptions extends CreateEngineOptions {
+  /**
+   * Instruction budget for a script's top level and every re-entry, in steps
+   * (1 to 2e9). Unset runs on the engine's own default, as the browser does.
+   */
+  instructionBudgetSteps?: number;
+}
+
+/**
+ * The CLI's engine: the shared `createEngine`, with its script engine fixed.
+ *
+ * Loads (and, once per process, verifies and compiles) the staged ZIPP
+ * artifact FIRST — no engine, no `JobManager`, nothing to submit to — then
+ * hands the runtime a `ScriptExecutor` that runs each script on a fresh
+ * `worker_threads` Worker and sets `requireScriptExecutor`. Callers pass
+ * whatever `createEngine` options they need (`config`, `tauriInvoke`, …)
+ * through the spread; the two engine fields come LAST, so no caller can hand
+ * the runtime a different engine, or none, and reach its in-thread path.
+ *
+ * Rejects with `EngineUnavailableError` when the artifact is missing or is
+ * not the one this build was made from, and with `RangeError` for a budget
+ * outside the engine's range — both before any worker exists.
+ */
+export async function createCliEngine(opts: CliEngineOptions = {}): Promise<JobManager> {
+  const { instructionBudgetSteps, ...engineOptions } = opts;
+  const artifact = await loadZippArtifact();
+  return createEngine({
+    ...engineOptions,
+    scriptExecutor: createZippThreadExecutor(artifact, { instructionBudgetSteps }),
+    requireScriptExecutor: true,
+  });
+}
 
 export interface RunOptions {
   inputs?: Record<string, unknown>;
@@ -33,6 +72,8 @@ export interface RunOptions {
    * refuses the flow — which is the correct outcome, not a silent skip.
    */
   connectorPath?: string;
+  /** See `CliEngineOptions.instructionBudgetSteps`. */
+  instructionBudgetSteps?: number;
 }
 
 export interface RunResult {
@@ -55,6 +96,15 @@ export interface RunResult {
    */
   output: unknown;
   error?: string;
+  /**
+   * Why a run did not complete, when the reason is the host's rather than the
+   * flow's: `timeout` when `timeoutMs` elapsed and the job was aborted;
+   * `engine_unavailable` when the ZIPP artifact could not be had, in which
+   * case nothing ran (`jobId` is empty). A flow's own failure has no code.
+   */
+  errorCode?: 'timeout' | 'engine_unavailable';
+  /** The engine the flow ran on. The CLI has exactly one. */
+  engine: 'zipp';
   logs: unknown[];
 }
 
@@ -76,20 +126,43 @@ export async function runFlow(graph: WorkflowGraph, opts: RunOptions = {}): Prom
     await loadConnectorModule(opts.connectorPath);
   }
 
-  const engine = createEngine({
-    // Subflow and macro nodes resolve their target by id out of this list. It was
-    // never passed, so those nodes could not execute headlessly at all.
-    availableFlows: opts.availableFlows,
-    projectConstants: opts.constants,
-    networkPermissionHandler: async () => ({
-      allowed: opts.allowLocalNetwork !== false,
-      remember: false,
-    }),
-  });
+  let engine: JobManager;
+  try {
+    engine = await createCliEngine({
+      // Subflow and macro nodes resolve their target by id out of this list. It was
+      // never passed, so those nodes could not execute headlessly at all.
+      availableFlows: opts.availableFlows,
+      projectConstants: opts.constants,
+      networkPermissionHandler: async () => ({
+        allowed: opts.allowLocalNetwork !== false,
+        remember: false,
+      }),
+      instructionBudgetSteps: opts.instructionBudgetSteps,
+    });
+  } catch (e) {
+    // No engine: the run did not happen. Reported, not thrown, so `run` and
+    // `worker` deliver it the way they deliver any other failed result.
+    if (e instanceof EngineUnavailableError) {
+      return {
+        success: false,
+        status: 'failed',
+        jobId: '',
+        results: {},
+        result: undefined,
+        output: undefined,
+        error: e.message,
+        errorCode: e.code,
+        engine: 'zipp',
+        logs: [],
+      };
+    }
+    throw e;
+  }
 
   try {
     const flowName = opts.flowName ?? 'cli-run';
     const jobId = engine.submit('cli-run', flowName, graph, opts.inputs as WorkflowInputs | undefined);
+    let timedOut = false;
 
     await new Promise<void>((resolve) => {
       let done = false;
@@ -106,6 +179,7 @@ export async function runFlow(graph: WorkflowGraph, opts: RunOptions = {}): Prom
       };
       const unsub = engine.onStateChange(() => check());
       const timer = setTimeout(() => {
+        timedOut = true;
         try {
           engine.abort(jobId);
         } catch {
@@ -132,6 +206,8 @@ export async function runFlow(graph: WorkflowGraph, opts: RunOptions = {}): Prom
       error: success
         ? undefined
         : job?.error ?? (status === 'aborted' ? 'Run aborted (timed out?)' : 'Workflow failed'),
+      errorCode: !success && timedOut ? 'timeout' : undefined,
+      engine: 'zipp',
       logs: job?.logs ?? [],
     };
   } finally {

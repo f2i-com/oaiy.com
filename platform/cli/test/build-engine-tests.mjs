@@ -8,14 +8,17 @@ import esbuild from 'esbuild';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
-import { genBundledModules, commonBuildOptions } from '../esbuild.mjs';
+import { genBundledModules, buildZippAssets, commonBuildOptions } from '../esbuild.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // The engine tests import src/generated/bundled-modules (codegen). Ensure it's fresh.
 genBundledModules();
+// Every engine test runs its flows on ZIPP (createCliEngine), which needs the
+// staged artifact and the worker shell beside the test bundles in dist/.
+await buildZippAssets({ logLevel: 'warning' });
 
-const entries = ['parallel-jobs.ts', 'connector-flow.ts', 'logic-block-scope.ts', 'output-value-refs.ts'];
+const entries = ['parallel-jobs.ts', 'connector-flow.ts', 'logic-block-scope.ts', 'output-value-refs.ts', 'zipp-engine.ts'];
 let failed = false;
 for (const entry of entries) {
   const out = path.join(__dirname, '..', 'dist', `_engine_${entry.replace(/\.ts$/, '')}.mjs`);

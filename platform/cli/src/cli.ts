@@ -88,6 +88,11 @@ program
       // to whoever queued it wants THIS; `results` is this engine's working.
       output: res.output,
       error: res.error,
+      // Why the host, rather than the flow, ended a run that did not complete
+      // (`timeout`, `engine_unavailable`); absent for a flow's own failure.
+      errorCode: res.errorCode,
+      // The engine the flow ran on — the ZIPP VM in a worker thread, always.
+      engine: res.engine,
     };
     if (process.env.OAIY_DEBUG) {
       payload.result = res.result;

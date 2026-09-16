@@ -15,7 +15,7 @@ import '../src/node-host/core'; // installs window.__TAURI__ before shared code 
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { createEngine } from '../../ui/src/engine/createEngine';
+import { createCliEngine } from '../src/engine';
 import { loadNodeBundledModules } from '../src/generated/bundled-modules';
 import { loadConnectorModule } from '../src/connector';
 import { getModuleLoader } from 'oaiy-core';
@@ -141,7 +141,7 @@ async function main(): Promise<void> {
   check('load: bundled node types still resolve', loader.isNodeTypeValid('template'));
   check('load: the module reports what it contributed', built.manifest.nodes.length === CONFIG.nodes.length);
 
-  const engine = createEngine({
+  const engine = await createCliEngine({
     networkPermissionHandler: async () => ({ allowed: true, remember: false }),
     tauriInvoke,
   });
