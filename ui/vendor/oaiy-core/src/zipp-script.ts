@@ -17,6 +17,25 @@
  * is the boundary — how data crosses, what runs where, and what each failure
  * is called.
  *
+ * # Modes
+ *
+ * A Python contract usually wraps the author's text differently depending on
+ * what is being run, and then has to UNDO that wrapping to say which line the
+ * author should look at. A profile may therefore carry `python.modes`: named
+ * wrappings, each a few files, a block file, the text before and after the
+ * author's source, and how many lines that puts in front of it. A job names
+ * modes instead of carrying files, and the runner unfolds one, runs it, and
+ * subtracts the wrapper's lines from every location the engine reports in the
+ * block file before the result leaves.
+ *
+ * The runner has no modes of its own and no opinion about any of them. It
+ * cannot: every byte it emits came from the profile the requester sent with
+ * the request, a mode name is a lookup key and nothing else, and a job naming
+ * a mode the profile does not define is a malformed request. Templating and
+ * arithmetic are OAIY's (a wrapper's line count is arithmetic, and Zipp's
+ * location grammar is OAIY's boundary with Zipp); what a wrapping is FOR
+ * stays with the requester that wrote it.
+ *
  * # How data crosses
  *
  * User data never becomes program text. `globals`, `args` and `source` reach
@@ -99,8 +118,56 @@ export interface ScriptProfile {
   instructionSteps?: number;
   /** Per-lane `prepare` hook names; read by the requester, not by the runner. */
   hooks?: Record<string, { prepare: string }>;
-  /** A Python contract the requester will unfold into jobs. Opaque here. */
-  python?: { contract: string; files: Record<string, string>; entry: string; call: string };
+  /**
+   * A Python contract. `contract`, `files`, `entry` and `call` are the project
+   * every evaluation carries; `modes` are the wrappings a job may name (see
+   * `ScriptPythonMode`). Every string in it is the requester's.
+   */
+  python?: {
+    contract: string;
+    files: Record<string, string>;
+    entry: string;
+    call: string;
+    modes?: ScriptPythonMode[];
+  };
+}
+
+/**
+ * ONE wrapping of a requester's source into a runnable project — the piece a
+ * `files`/`entry`/`call` job cannot carry, because it is per-wrapping rather
+ * than per-project.
+ *
+ * A mode is a template plus arithmetic and nothing else. The runner merges
+ * `files` over `python.files`, writes `before + source + after` to `block`,
+ * runs `python.entry`/`python.call` as any other Python job, and maps
+ * locations the engine reports in `block` back onto the author's lines. It
+ * never reads `name` for meaning, never has a mode of its own, and never
+ * learns what a wrapping is FOR: which mode to run is the requester's choice,
+ * named in the job.
+ */
+export interface ScriptPythonMode {
+  /** How a job names this wrapping. Unique within a profile; opaque to the runner. */
+  name: string;
+  /** Files this wrapping adds to `python.files` (the entry module among them). May not shadow one. */
+  files: Record<string, string>;
+  /** The file the wrapped source is written to. Not a key of `python.files` or of `files`. */
+  block: string;
+  /** Text before the author's source in `block`. */
+  before: string;
+  /** Text after the author's source in `block`. */
+  after: string;
+  /**
+   * Generated lines before the author's first line — the number of newlines in
+   * `before`. Engine line N in `block` is author line N − `lineOffset`.
+   */
+  lineOffset: number;
+  /**
+   * The function to call instead of `python.call`. A wrapping decides what
+   * shape the entry module has and so what there is to call: a contract whose
+   * every mode answers the same way needs none of these, and one with a mode
+   * that only compiles the block needs exactly one.
+   */
+  call?: string;
 }
 
 interface ScriptJobBase {
@@ -149,7 +216,31 @@ export interface ScriptPythonJob extends ScriptJobBase {
   fallbackOnSourceError?: { files: Record<string, string> };
 }
 
-export type ScriptJob = ScriptJsJob | ScriptPythonJob;
+/**
+ * The same Python project, named rather than spelled out: the profile's
+ * `python` contract plus one of its `modes`, with only the author's `source`
+ * carried here.
+ *
+ * `modes` is tried in order and only a `source` failure moves on — the same
+ * rule as `fallbackOnSourceError`, said once per phase instead of once per
+ * file set. The two shapes never mix: a job carries files OR modes.
+ */
+export interface ScriptPythonModeJob extends ScriptJobBase {
+  language: 'python';
+  mode: 'python-project';
+  /** Profile mode names, tried in order; the next is tried only after a `source` failure. */
+  modes: string[];
+  /** The author's text, wrapped by whichever mode is running. */
+  source: string;
+  args?: unknown[];
+}
+
+export type ScriptJob = ScriptJsJob | ScriptPythonJob | ScriptPythonModeJob;
+
+/** Whether a Python job names profile modes rather than carrying its own file set. */
+export function isScriptPythonModeJob(job: ScriptJob): job is ScriptPythonModeJob {
+  return job.mode === 'python-project' && Array.isArray((job as ScriptPythonModeJob).modes);
+}
 
 export interface ScriptRequest {
   v: 1;
@@ -203,6 +294,7 @@ export interface ScriptEngine {
 export type ScriptEngineCtor = new () => ScriptEngine;
 
 export interface ScriptRunOptions {
+  /** The JS preamble for a JS job, and the Python contract and modes a mode job is unfolded from. */
   profile?: ScriptProfile;
   /** The engine's `zippProfile().languages`; decides `unsupported` before any Engine is built. */
   languages: readonly string[];
@@ -244,6 +336,13 @@ export const SCRIPT_MAX_OUTPUT_DEPTH = 8;
 
 const IDENTIFIER = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
 const PYTHON_IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]*$/;
+/** How a profile mode may be named, and how a job may name one. Opaque to the runner. */
+const MODE_NAME = /^[A-Za-z][A-Za-z0-9_-]*$/;
+/** Modes one profile may define, and modes one job may list. Bounds, not judgements. */
+export const SCRIPT_MAX_PROFILE_MODES = 32;
+export const SCRIPT_MAX_JOB_MODES = 8;
+/** The largest `lineOffset` a mode may declare: a wrapper taller than this is not a wrapper. */
+export const SCRIPT_MAX_LINE_OFFSET = 1_000_000;
 const SHA256_HEX = /^[0-9a-f]{64}$/;
 const DANGEROUS_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
 /** ES reserved words: an `entry`/`prepare` of this shape would be a SyntaxError in the program. */
@@ -327,6 +426,14 @@ function optionalInt(obj: Record<string, unknown>, key: string, where: string, m
   return v as number;
 }
 
+function requireInt(obj: Record<string, unknown>, key: string, where: string, min: number, max: number): number {
+  const v = obj[key];
+  if (!Number.isInteger(v) || (v as number) < min || (v as number) > max) {
+    throw new Invalid(`${where}: ${key} must be an integer from ${min} to ${max}, not ${JSON.stringify(v) ?? String(v)}`);
+  }
+  return v as number;
+}
+
 function requireIdentifier(obj: Record<string, unknown>, key: string, where: string, re = IDENTIFIER): string {
   const v = requireString(obj, key, where, 128);
   if (!re.test(v) || (re === IDENTIFIER && RESERVED_WORDS.has(v))) {
@@ -381,15 +488,75 @@ function validateProfile(raw: unknown, sha256: ScriptHostOptions['sha256']): Scr
   if (raw.python !== undefined) {
     const at = `${where}.python`;
     if (!isPlainObject(raw.python)) throw new Invalid(`${at} must be an object`);
-    noExtraKeys(raw.python, ['contract', 'files', 'entry', 'call'], at);
+    noExtraKeys(raw.python, ['contract', 'files', 'entry', 'call', 'modes'], at);
+    const files = requireFiles(raw.python.files, at);
+    const entry = requireString(raw.python, 'entry', at, 128, 1);
     profile.python = {
       contract: requireString(raw.python, 'contract', at, 128, 1),
-      files: requireFiles(raw.python.files, at),
-      entry: requireString(raw.python, 'entry', at, 128, 1),
+      files,
+      entry,
       call: requireString(raw.python, 'call', at, 128, 1),
     };
+    if (raw.python.modes !== undefined) profile.python.modes = validateModes(raw.python.modes, at, files, entry);
   }
   return profile;
+}
+
+/**
+ * The profile's wrappings. Every field is checked here because a mode is
+ * SPENT by the runner without a second look: a `block` that collides with a
+ * contract file would silently replace it, a `lineOffset` that is not a whole
+ * count would name a line that is not a line, and two modes of one name would
+ * make "which wrapping ran" depend on iteration order. Each is refused, and
+ * the refusal names the mode.
+ *
+ * `entry` is held to a Python identifier only HERE, where modes are present:
+ * the runner passes it to `initPythonProject` for a mode job, so a profile
+ * that names a module Python could not import is unusable rather than merely
+ * odd — and a profile without modes keeps the shape it was accepted with.
+ */
+function validateModes(raw: unknown, at: string, contractFiles: Record<string, string>, entry: string): ScriptPythonMode[] {
+  if (!Array.isArray(raw) || raw.length === 0) throw new Invalid(`${at}.modes must be a non-empty array of modes`);
+  if (raw.length > SCRIPT_MAX_PROFILE_MODES) throw new Invalid(`${at}.modes has ${raw.length} modes; at most ${SCRIPT_MAX_PROFILE_MODES}`);
+  if (!PYTHON_IDENTIFIER.test(entry)) {
+    throw new Invalid(`${at}: entry must be a Python module name to unfold a mode, not ${JSON.stringify(entry)}`);
+  }
+  const modes: ScriptPythonMode[] = [];
+  const seen = new Set<string>();
+  raw.forEach((item, index) => {
+    let here = `${at}.modes[${index}]`;
+    if (!isPlainObject(item)) throw new Invalid(`${here} must be an object`);
+    if (typeof item.name === 'string' && item.name !== '') here += ` (name ${JSON.stringify(item.name)})`;
+    noExtraKeys(item, ['name', 'files', 'block', 'before', 'after', 'lineOffset', 'call'], here);
+    const name = requireString(item, 'name', here, 64, 1);
+    if (!MODE_NAME.test(name)) throw new Invalid(`${here}: name must be a letter followed by letters, digits, "_" or "-", not ${JSON.stringify(name)}`);
+    if (seen.has(name)) throw new Invalid(`${at}.modes: two modes are named ${JSON.stringify(name)}`);
+    seen.add(name);
+    const files = requireFiles(item.files, here);
+    const block = requireString(item, 'block', here, 128, 1);
+    for (const file of Object.keys(files)) {
+      if (Object.prototype.hasOwnProperty.call(contractFiles, file)) {
+        throw new Invalid(`${here}: files[${JSON.stringify(file)}] would replace a file of ${at}.files; give it another name`);
+      }
+    }
+    if (Object.prototype.hasOwnProperty.call(files, block) || Object.prototype.hasOwnProperty.call(contractFiles, block)) {
+      throw new Invalid(`${here}: block ${JSON.stringify(block)} is already a file of this project; the wrapped source would replace it`);
+    }
+    const before = requireString(item, 'before', here);
+    const after = requireString(item, 'after', here);
+    const lineOffset = requireInt(item, 'lineOffset', here, 0, SCRIPT_MAX_LINE_OFFSET);
+    // The entry module has to BE in the project: `entry` or `entry.py`. This is
+    // the fault a mode exists to make impossible — a contract that names an
+    // entry no file provides runs nothing on any host but the one that wrote it.
+    const provides = (file: string) => Object.prototype.hasOwnProperty.call(files, file) || Object.prototype.hasOwnProperty.call(contractFiles, file);
+    if (!provides(entry) && !provides(`${entry}.py`)) {
+      throw new Invalid(`${here}: no file is the entry module ${JSON.stringify(entry)} (expected ${JSON.stringify(entry)} or ${JSON.stringify(`${entry}.py`)})`);
+    }
+    const mode: ScriptPythonMode = { name, files, block, before, after, lineOffset };
+    if (item.call !== undefined) mode.call = requireString(item, 'call', here, 128, 1);
+    modes.push(mode);
+  });
+  return modes;
 }
 
 /**
@@ -406,6 +573,44 @@ export function detectPreambleCollision(preamble: string): string | null {
     if (bound.has(m[1])) return m[1];
   }
   return null;
+}
+
+/**
+ * A Python job that names profile modes. It carries the author's `source` and
+ * nothing else about the project: `files`, `entry`, `call` and a second file
+ * set all come from the profile, so passing any of them here is two answers to
+ * one question and is refused rather than resolved (decision 5-1). Whether the
+ * names it lists EXIST is checked once the profile is known — see
+ * `validateScriptRequest`.
+ */
+function validatePythonModeJob(raw: Record<string, unknown>, base: ScriptJobBase, where: string): ScriptPythonModeJob {
+  for (const key of ['files', 'entry', 'call', 'fallbackOnSourceError']) {
+    if (raw[key] !== undefined) {
+      throw new Invalid(`${where}: modes and ${key} are two ways to build one project; pass one or the other`);
+    }
+  }
+  noExtraKeys(raw, ['id', 'language', 'mode', 'modes', 'source', 'args', 'budgetMs', 'instructionSteps'], where);
+  if (!Array.isArray(raw.modes) || raw.modes.length === 0) throw new Invalid(`${where}: modes must be a non-empty array of mode names`);
+  if (raw.modes.length > SCRIPT_MAX_JOB_MODES) throw new Invalid(`${where}: modes lists ${raw.modes.length} modes; at most ${SCRIPT_MAX_JOB_MODES}`);
+  const modes = raw.modes.map((name, i) => {
+    if (typeof name !== 'string' || name.length === 0 || name.length > 64 || !MODE_NAME.test(name)) {
+      throw new Invalid(`${where}: modes[${i}] must be a mode name, not ${JSON.stringify(name)}`);
+    }
+    return name;
+  });
+  const job: ScriptPythonModeJob = {
+    ...base,
+    language: 'python',
+    mode: 'python-project',
+    modes,
+    source: requireString(raw, 'source', where),
+  };
+  if (raw.args !== undefined) {
+    if (!Array.isArray(raw.args)) throw new Invalid(`${where}: args must be an array`);
+    requireJson(raw.args, `${where}: args`);
+    job.args = raw.args;
+  }
+  return job;
 }
 
 function validateJob(raw: unknown, index: number): ScriptJob {
@@ -426,6 +631,8 @@ function validateJob(raw: unknown, index: number): ScriptJob {
 
   if (mode === 'python-project') {
     if (language !== 'python') throw new Invalid(`${where}: mode "python-project" needs language "python"`);
+    if (raw.modes !== undefined) return validatePythonModeJob(raw, base, where);
+    if (raw.source !== undefined) throw new Invalid(`${where}: source is for a job that names modes; a job that carries its own files puts the source in one of them`);
     noExtraKeys(raw, ['id', 'language', 'mode', 'files', 'entry', 'call', 'args', 'fallbackOnSourceError', 'budgetMs', 'instructionSteps'], where);
     const job: ScriptPythonJob = {
       ...base,
@@ -485,6 +692,28 @@ function validateJob(raw: unknown, index: number): ScriptJob {
 }
 
 /**
+ * Every mode a job names must be defined by the request's own profile. A name
+ * with no definition is a malformed REQUEST, not a job that fails: there is
+ * nothing to run and no source of truth to guess from, so it is refused whole,
+ * naming the job and the mode.
+ */
+function checkModeReferences(request: ScriptRequest): void {
+  const defined = new Set((request.profile?.python?.modes ?? []).map((m) => m.name));
+  request.jobs.forEach((job, index) => {
+    if (!isScriptPythonModeJob(job)) return;
+    const where = `jobs[${index}] (id ${JSON.stringify(job.id)})`;
+    for (const name of job.modes) {
+      if (!request.profile?.python) {
+        throw new Invalid(`${where}: names the mode ${JSON.stringify(name)}, and this request carries no profile python contract to define it`);
+      }
+      if (!defined.has(name)) {
+        throw new Invalid(`${where}: names the mode ${JSON.stringify(name)}, which the profile's python.modes does not define`);
+      }
+    }
+  });
+}
+
+/**
  * Check a request structurally and semantically. Any fault refuses the WHOLE
  * request with one message naming the job (4-2): a host either runs every job
  * or none, and a caller reading `results` never has to wonder whether a
@@ -498,6 +727,11 @@ export function validateScriptRequest(input: unknown, opts: { sha256?: ScriptHos
     if (!Array.isArray(input.jobs)) throw new Invalid('request: jobs must be an array');
     const request: ScriptRequest = { v: 1, jobs: input.jobs.map(validateJob) };
     if (input.profile !== undefined) request.profile = validateProfile(input.profile, opts.sha256);
+    // Third pass, once both halves are known: a job may only name a mode this
+    // request also carries the definition of. The order matters — jobs, then
+    // profile, then the join — so a malformed job is still reported as a
+    // malformed job whatever the profile is.
+    checkModeReferences(request);
     return { ok: true, request };
   } catch (e) {
     if (e instanceof Invalid) return { ok: false, error: { code: 'invalid_request', message: e.message } };
@@ -817,6 +1051,130 @@ function runPython(Engine: ScriptEngineCtor, job: ScriptPythonJob, steps: number
   return result;
 }
 
+const escapeRegExp = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+/**
+ * The engine's message with locations in the mode's block file moved onto the
+ * author's own lines.
+ *
+ * Zipp writes a location in a project file four ways, all measured on v0.0.19
+ * web-python: `(block.py:N)`, `(block.py:N:C)` (also bare, as
+ * `Python: block.py:N:C: …`), `File "block.py", line N` in a traceback, and
+ * `block.py: … (at offset K)` for a construct the parser rejects, where K
+ * counts UTF-16 units into the file. Each is renumbered; NOTHING else is
+ * touched. The file keeps its name, frames in other files keep their lines,
+ * and no text is added, dropped or reworded — the message stays the engine's,
+ * with the arithmetic done.
+ *
+ * Which line an engine line means:
+ *
+ *   * BELOW the wrapper (N > lineOffset): `N − lineOffset`, the author's line,
+ *     capped at the author's last line. A location past the end can only be in
+ *     `after`, and `after` is fixed text that compiles on its own — it is
+ *     reached because of what the author wrote, so the author's last line is
+ *     the honest answer.
+ *   * ON the splice line (N === lineOffset), when `before` ends in a newline:
+ *     line 1. Python reports a multi-line statement at the line that OPENS it,
+ *     and a wrapper whose last line opens one (`return (`) is reported there
+ *     for anything inside the author's expression — measured, including an
+ *     error two author lines down. So this is the author's first line, not a
+ *     clamp. When `before` does NOT end in a newline the author's first line
+ *     IS line lineOffset + 1 (the plain subtraction already reaches it) and
+ *     line lineOffset is wrapper prologue, so it falls to the case below.
+ *   * ABOVE it: left exactly as the engine wrote it. Those lines fail on their
+ *     own account — an import, a def header — and nothing the author typed can
+ *     be blamed for them. The runner reports no line rather than the wrong one,
+ *     and never 0 or a negative.
+ *
+ * Columns are left as the engine reported them. A `before` that does not end
+ * in a newline shifts the author's first line sideways, so a column on that
+ * line is the block's; `lineOffset` is the only knob and it is a line count.
+ */
+export function mapAuthorLines(text: string, mode: ScriptPythonMode, source: string): string {
+  const block = escapeRegExp(mode.block);
+  const authorLines = Math.max(1, source.split(/\r\n|\r|\n/).length);
+  // The author's text begins on its own line only when `before` ends with one.
+  const splice = mode.before.endsWith('\n') ? mode.lineOffset : mode.lineOffset + 1;
+  /** null: the location is inside the wrapper and is not the author's to own. */
+  const line = (engineLine: number): number | null =>
+    engineLine < splice ? null : Math.min(authorLines, Math.max(1, engineLine - mode.lineOffset));
+  return text
+    .replace(new RegExp(`(^|\\n)(${block}: .*?) \\(at offset (\\d+)\\)`, 'g'), (whole, lead: string, head: string, k: string) => {
+      const at = Number(k) - mode.before.length;
+      return at < 0 ? whole : `${lead}${head} (at offset ${Math.min(source.length, at)})`;
+    })
+    .replace(new RegExp(`File "${block}", line (\\d+)`, 'g'), (whole, n: string) => {
+      const at = line(Number(n));
+      return at === null ? whole : `File "${mode.block}", line ${at}`;
+    })
+    .replace(new RegExp(`${block}:(\\d+)(?::(\\d+))?`, 'g'), (whole, n: string, col?: string) => {
+      const at = line(Number(n));
+      return at === null ? whole : `${mode.block}:${at}${col ? `:${col}` : ''}`;
+    });
+}
+
+/**
+ * A Python job that names profile modes: unfold, run, and answer in the
+ * author's line numbers.
+ *
+ * Each mode is one whole attempt on its own fresh Engine — the project is the
+ * contract's files, the mode's files over them, and the author's source
+ * wrapped into the mode's block file. The next mode is tried ONLY when the
+ * engine said `source` while the project was initialising, which is the
+ * engine's own word for "nothing of yours ran": the same rule
+ * `fallbackOnSourceError` follows, said per phase instead of per file set.
+ *
+ * What the runner does NOT do: it does not know what any mode MEANS, does not
+ * read `name` for anything but lookup, has no mode of its own, and adds
+ * nothing to the project the profile did not carry. The failure it reports is
+ * the LAST attempt's, with that attempt's own `lineOffset` applied — the
+ * phases have different wrappers, so attributing one phase's error with
+ * another's arithmetic is exactly the bug this closes.
+ */
+function runPythonModes(
+  Engine: ScriptEngineCtor,
+  job: ScriptPythonModeJob,
+  steps: number | undefined,
+  profile: ScriptProfile | undefined,
+  onEngineTrap?: (e: unknown) => void,
+): ScriptJobResult {
+  const contract = profile?.python;
+  // validateScriptRequest refuses this; runScriptJob is also called directly
+  // (the CLI's worker does), so it fails closed here as the HOST's fault —
+  // the job is unrunnable through no fault of the source.
+  if (!contract?.modes?.length) {
+    return { id: job.id, ok: false, errorKind: 'host', error: 'This job names script modes and the runner was given no profile that defines any' };
+  }
+  if (!job.modes.length) {
+    return { id: job.id, ok: false, errorKind: 'host', error: 'This job names no script mode to run' };
+  }
+  const args = JSON.parse(JSON.stringify(job.args ?? [])) as unknown[];
+  let last: { out: Extract<Attempt, { ok: false }>; mode: ScriptPythonMode } | undefined;
+  for (const name of job.modes) {
+    const mode = contract.modes.find((m) => m.name === name);
+    if (!mode) {
+      return { id: job.id, ok: false, errorKind: 'host', error: `The profile defines no script mode named ${JSON.stringify(name)}` };
+    }
+    const files = { ...contract.files, ...mode.files, [mode.block]: mode.before + job.source + mode.after };
+    const out = attempt(
+      Engine,
+      steps,
+      (engine) => { engine.initPythonProject!(files, contract.entry, []); },
+      (engine) => engine.pythonCall!(mode.call ?? contract.call, args),
+      onEngineTrap,
+    );
+    if (out.ok) {
+      const result: ScriptJobResult = { id: job.id, ok: true };
+      if (out.value !== undefined) result.value = sanitizeScriptValue(out.value);
+      return result;
+    }
+    last = { out, mode };
+    if (!(out.phase === 'init' && out.kind === 'source')) break;
+  }
+  const { out, mode } = last!;
+  return { id: job.id, ok: false, errorKind: out.kind, error: mapAuthorLines(out.error, mode, job.source) };
+}
+
 /** Whether the Engine class carries the Python frontend — read off the prototype, so no instance is built to find out. */
 function hasPython(Engine: ScriptEngineCtor): boolean {
   const proto = Engine.prototype as Partial<ScriptEngine> | undefined;
@@ -836,7 +1194,9 @@ export function runScriptJob(Engine: ScriptEngineCtor, job: ScriptJob, opts: Scr
     if (!opts.languages.includes('python') || !hasPython(Engine)) {
       return { id: job.id, ok: false, errorKind: 'unsupported', error: 'This Zipp engine does not run Python' };
     }
-    return runPython(Engine, job, steps, opts.onEngineTrap);
+    return isScriptPythonModeJob(job)
+      ? runPythonModes(Engine, job, steps, opts.profile, opts.onEngineTrap)
+      : runPython(Engine, job, steps, opts.onEngineTrap);
   }
   return runJs(Engine, job, steps, opts.profile, opts.onEngineTrap, opts.parseExpression);
 }

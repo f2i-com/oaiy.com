@@ -161,9 +161,13 @@ streams go to stderr. Without an engine, `--serve` writes one
 
 `run --profile <file>` takes the same profile a request may carry
 (`script-profile.schema.json`: `preamble`, its `preambleSha256`, an optional
-`instructionSteps`): the preamble is emitted at program top level before every
-flow script, after the guest shims, so a body the flow compiles at run time sees
-its names too. The file is checked before the flow is read — digest, a parse of
+`instructionSteps`, and optionally the requester's `hooks` and `python`
+contract): the preamble is emitted at program top level before every flow
+script, after the guest shims, so a body the flow compiles at run time sees its
+names too. A `python` contract carrying `modes` is checked here too, so one file
+is a whole contract for both commands — `oaiy script` unfolds a named mode into
+a `python-project` job and reports the author's own line numbers, and a run
+takes the preamble and the budget from the same document. The file is checked before the flow is read — digest, a parse of
 the preamble, no top-level declaration of a name the engine, the envelope or the
 wrapper binds (destructuring included), no `let`/`const`/`class` over a guest
 shim — and refused as a usage error otherwise; `instructionSteps` together with

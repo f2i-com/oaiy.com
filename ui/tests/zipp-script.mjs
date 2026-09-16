@@ -27,11 +27,15 @@ import {
   buildScriptProgram,
   runScriptJob,
   runScriptRequest,
+  mapAuthorLines,
   scriptEngineIdentity,
   validateScriptRequest,
   SCRIPT_ENVELOPE_GLOBALS,
   SCRIPT_ERROR_KINDS,
   SCRIPT_JS_MODES,
+  SCRIPT_MAX_JOB_MODES,
+  SCRIPT_MAX_LINE_OFFSET,
+  SCRIPT_MAX_PROFILE_MODES,
   SCRIPT_REFUSED_GLOBALS,
 } from '../vendor/oaiy-core/src/zipp-script.ts';
 import { ZIPP_GUEST_SHIMS, ZIPP_MAX_INSTRUCTION_BUDGET_STEPS } from '../vendor/oaiy-core/src/zipp-executor.ts';
@@ -568,6 +572,87 @@ console.log('\nrefusal');
   refuse('profile hook that is not an identifier', { v: 1, profile: { v: 1, preamble: '', preambleSha256: sha256(''), hooks: { lane: { prepare: 'a b' } } }, jobs: [good] }, /hooks\["lane"\]: prepare must be an identifier/);
   refuse('profile.instructionSteps out of range', { v: 1, profile: { v: 1, preamble: '', preambleSha256: sha256(''), instructionSteps: 0 }, jobs: [good] }, /profile: instructionSteps must be an integer/);
   refuse('profile with an unknown field', { v: 1, profile: { v: 1, preamble: '', preambleSha256: sha256(''), extra: 1 }, jobs: [good] }, /profile: unknown field "extra"/);
+
+  // Modes. A mode is SPENT by the runner without a second look — its files are
+  // merged, its block written, its offset subtracted — so every part of one is
+  // checked here, where a fault is still a refusal and not a wrong line number
+  // in somebody's error message. `schemaBlind` marks the faults a JSON Schema
+  // cannot state (a name used twice, a name that must exist elsewhere in the
+  // document, a key that must NOT exist elsewhere).
+  const MODE = {
+    name: 'wrap',
+    files: { 'main.py': 'import blk\n\n\ndef run(ctx):\n    return blk.v\n' },
+    block: 'blk.py',
+    before: 'v = (\n',
+    after: '\n)\n',
+    lineOffset: 1,
+  };
+  const withModes = (modes, python = {}) => ({
+    v: 1,
+    preamble: '',
+    preambleSha256: sha256(''),
+    python: { contract: 'c/1', files: { 'lib.py': 'x = 1\n' }, entry: 'main', call: 'run', modes, ...python },
+  });
+  const mode = (patch) => {
+    const m = { ...MODE, ...patch };
+    for (const [k, val] of Object.entries(patch)) if (val === undefined) delete m[k];
+    return m;
+  };
+  const withMode = (patch, python) => withModes([mode(patch)], python);
+  const modeJob = (patch = {}) => {
+    const j = { id: 'm', language: 'python', mode: 'python-project', modes: ['wrap'], source: '1', ...patch };
+    for (const [k, val] of Object.entries(patch)) if (val === undefined) delete j[k];
+    return j;
+  };
+  const badProfile = (name, profile, expect, opts) => refuse(name, { v: 1, profile, jobs: [good] }, expect, opts);
+  const badModeJob = (name, patch, expect, opts) => refuse(name, { v: 1, profile: withModes([MODE]), jobs: [modeJob(patch)] }, expect, opts);
+
+  badProfile('profile modes that are not an array', withModes({}), /python\.modes must be a non-empty array of modes/);
+  badProfile('profile modes that are empty', withModes([]), /python\.modes must be a non-empty array of modes/);
+  badProfile('more modes than a profile may carry', withModes(Array.from({ length: 33 }, (_, i) => mode({ name: `m${i}` }))), /python\.modes has 33 modes; at most 32/);
+  badProfile('a mode that is not an object', withModes(['wrap']), /python\.modes\[0\] must be an object/);
+  badProfile('a mode with an unknown field', withMode({ wrapper: 1 }), /modes\[0\] \(name "wrap"\): unknown field "wrapper"/);
+  badProfile('a mode with no before', withMode({ before: undefined }), /modes\[0\] \(name "wrap"\): before must be a string/);
+  badProfile('a mode with no after', withMode({ after: undefined }), /modes\[0\] \(name "wrap"\): after must be a string/);
+  badProfile('a mode with no block', withMode({ block: undefined }), /modes\[0\] \(name "wrap"\): block must be a string/);
+  badProfile('a mode with no files', withMode({ files: undefined }), /modes\[0\] \(name "wrap"\): files must be a non-empty object/);
+  badProfile('a mode with an empty block name', withMode({ block: '' }), /modes\[0\] \(name "wrap"\): block must not be empty/);
+  badProfile('a mode with an empty name', withMode({ name: '' }), /modes\[0\]: name must not be empty/);
+  badProfile('a mode whose name is not a name', withMode({ name: 'a b' }), /modes\[0\] \(name "a b"\): name must be a letter followed by/);
+  badProfile('a mode with no lineOffset', withMode({ lineOffset: undefined }), /modes\[0\] \(name "wrap"\): lineOffset must be an integer from 0 to 1000000, not undefined/);
+  badProfile('a mode whose lineOffset is a string', withMode({ lineOffset: '1' }), /lineOffset must be an integer from 0 to 1000000, not "1"/);
+  badProfile('a mode whose lineOffset is fractional', withMode({ lineOffset: 1.5 }), /lineOffset must be an integer from 0 to 1000000, not 1.5/);
+  badProfile('a mode whose lineOffset is negative', withMode({ lineOffset: -1 }), /lineOffset must be an integer from 0 to 1000000, not -1/);
+  badProfile('a mode with an empty call', withMode({ call: '' }), /modes\[0\] \(name "wrap"\): call must not be empty/);
+  badProfile('two modes of one name', withModes([MODE, mode({ block: 'other.py' })]), /python\.modes: two modes are named "wrap"/, { schemaBlind: true });
+  badProfile('a mode whose block would replace a contract file', withMode({ block: 'lib.py' }), /block "lib.py" is already a file of this project/, { schemaBlind: true });
+  badProfile('a mode whose block would replace its own file', withMode({ block: 'main.py' }), /block "main.py" is already a file of this project/, { schemaBlind: true });
+  badProfile('a mode file that shadows a contract file', withMode({ files: { 'lib.py': '', 'main.py': '' } }), /files\["lib.py"\] would replace a file of profile\.python\.files/, { schemaBlind: true });
+  badProfile('a mode whose project has no entry module', withMode({ files: { 'other.py': '' } }), /no file is the entry module "main" \(expected "main" or "main\.py"\)/, { schemaBlind: true });
+  badProfile('a contract entry that is not a module name, with modes', withModes([MODE], { entry: 'main.py' }), /python: entry must be a Python module name to unfold a mode, not "main.py"/, { schemaBlind: true });
+
+  badModeJob('a mode job that also carries files', { files: { 'a.py': '' } }, /modes and files are two ways to build one project; pass one or the other/);
+  badModeJob('a mode job that also carries entry', { entry: 'main' }, /modes and entry are two ways to build one project/);
+  badModeJob('a mode job that also carries call', { call: 'run' }, /modes and call are two ways to build one project/);
+  badModeJob('a mode job that also carries a fallback file set', { fallbackOnSourceError: { files: { 'a.py': '' } } }, /modes and fallbackOnSourceError are two ways to build one project/);
+  badModeJob('a mode job with no source', { source: undefined }, /jobs\[0\] \(id "m"\): source must be a string/);
+  badModeJob('a mode job with an empty mode list', { modes: [] }, /modes must be a non-empty array of mode names/);
+  badModeJob('a mode job listing more modes than it may', { modes: Array.from({ length: 9 }, () => 'wrap') }, /modes lists 9 modes; at most 8/);
+  badModeJob('a mode job naming something that is not a mode name', { modes: ['a b'] }, /modes\[0\] must be a mode name, not "a b"/);
+  badModeJob('a mode job naming a mode the profile does not define', { modes: ['wrap', 'nope'] }, /jobs\[0\] \(id "m"\): names the mode "nope", which the profile's python\.modes does not define/, { schemaBlind: true });
+  badModeJob('a mode job with an unknown field', { emit: 1 }, /jobs\[0\] \(id "m"\): unknown field "emit"/);
+  refuse('a mode job with no profile at all', { v: 1, jobs: [modeJob()] },
+    /jobs\[0\] \(id "m"\): names the mode "wrap", and this request carries no profile python contract to define it/, { schemaBlind: true });
+  refuse('a mode job whose profile carries no python contract', { v: 1, profile: { v: 1, preamble: '', preambleSha256: sha256('') }, jobs: [modeJob()] },
+    /names the mode "wrap", and this request carries no profile python contract to define it/, { schemaBlind: true });
+  refuse('a mode job whose profile defines no modes', { v: 1, profile: { v: 1, preamble: '', preambleSha256: sha256(''), python: { contract: 'c/1', files: { 'main.py': '' }, entry: 'main', call: 'run' } }, jobs: [modeJob()] },
+    /names the mode "wrap", which the profile's python\.modes does not define/, { schemaBlind: true });
+  refuse('source on a job that carries its own files', { v: 1, jobs: [{ id: 'p', language: 'python', mode: 'python-project', files: { 'main.py': '' }, entry: 'main', call: 'run', source: '1' }] },
+    /source is for a job that names modes/);
+  // The refusal names the JOB before it names anything of the profile's: a
+  // malformed job is a malformed job whatever profile arrives with it.
+  refuse('a malformed job beside a malformed profile is still the job',
+    { v: 1, profile: withMode({ lineOffset: -1 }), jobs: [job('bad', 'program', 1)] }, /jobs\[0\] \(id "bad"\): source must be a string/);
   {
     const before = constructions;
     const r = runScriptRequest(CountingEngine, { v: 1, profile: { v: 1, preamble: '', preambleSha256: sha256('') }, jobs: [good] }, { engine: identity });
@@ -643,7 +728,247 @@ if (HAS_PYTHON) {
 }
 
 // ---------------------------------------------------------------------------
-// 6. The schemas agree with the code on every fixture this file sent.
+// 6. Python modes: the runner unfolds a wrapping the PROFILE carried, and
+//    answers in the author's line numbers.
+//
+//    Everything here is a contract this file invents, except the last block,
+//    which is a real one vendored from a consumer. Nothing in `zipp-script.ts`
+//    knows either.
+// ---------------------------------------------------------------------------
+console.log('\npython modes');
+const MODE_CONTRACT = {
+  contract: 'oaiy-test/1',
+  files: { 'shared.py': 'ctx = None\n\n\ndef bind(c):\n    global ctx\n    ctx = c\n\n\ndef twice(n):\n    return n * 2\n' },
+  entry: 'main',
+  call: 'run',
+};
+// `expr` wraps the source as one parenthesised expression (3 generated lines,
+// the last of which OPENS the statement the source finishes); `stmt` runs it as
+// a module (1 generated line). The pair is the two-phase shape: statements
+// cannot be parenthesised, so `expr` fails to COMPILE and `stmt` answers.
+const EXPR_MODE = {
+  name: 'expr',
+  files: { 'main.py': 'import shared\n\n\ndef run(c):\n    shared.bind(c)\n    import blk\n    return blk.value()\n' },
+  block: 'blk.py',
+  before: 'from shared import *\ndef value():\n    return (\n',
+  after: '\n    )\n',
+  lineOffset: 3,
+};
+const STMT_MODE = {
+  name: 'stmt',
+  files: { 'main.py': 'import shared\n\n\ndef run(c):\n    shared.bind(c)\n    import blk\n    return getattr(blk, "result", None)\n' },
+  block: 'blk.py',
+  before: 'from shared import *\n',
+  after: '',
+  lineOffset: 1,
+};
+// A wrapper whose FIRST line can fail on its own account: nothing the author
+// wrote can be blamed for it.
+const PROLOGUE_MODE = {
+  name: 'prologue',
+  files: { 'main.py': 'def run(ctx):\n    import blk\n    return blk.result\n' },
+  block: 'blk.py',
+  before: 'import nosuchmodule\nresult = None\n',
+  after: '',
+  lineOffset: 2,
+};
+const QUIET_MODE = {
+  name: 'quiet',
+  files: { 'main.py': 'def never():\n    import blk\n' },
+  block: 'blk.py',
+  before: '',
+  after: '',
+  lineOffset: 0,
+  call: 'never',
+};
+const MODE_PROFILE = {
+  v: 1,
+  preamble: '',
+  preambleSha256: sha256(''),
+  python: { ...MODE_CONTRACT, modes: [EXPR_MODE, STMT_MODE, PROLOGUE_MODE, QUIET_MODE] },
+};
+const modeOne = (modes, source, extra = {}, profile = MODE_PROFILE) => {
+  const r = send({ v: 1, profile, jobs: [{ id: 'm', language: 'python', mode: 'python-project', modes, source, args: [{ n: 21 }], ...extra }] });
+  return 'error' in r ? { refused: r.error } : { ...r.results[0], constructions: r.constructions };
+};
+{
+  // The pure function, so the arithmetic can be read (and mutated) on its own.
+  const m = { ...EXPR_MODE };
+  check('mapAuthorLines: a line below the wrapper is the author\'s',
+    mapAuthorLines('KeyError (blk.py:5)', m, 'a\nb\nc\nd') === 'KeyError (blk.py:2)');
+  check('mapAuthorLines: the splice line is the author\'s first line',
+    mapAuthorLines('KeyError (blk.py:3)', m, 'a\nb') === 'KeyError (blk.py:1)');
+  check('mapAuthorLines: a line past the author\'s last is capped at it',
+    mapAuthorLines('SyntaxError (blk.py:5:4)', m, 'a') === 'SyntaxError (blk.py:1:4)');
+  check('mapAuthorLines: a line above the splice is left byte-for-byte',
+    mapAuthorLines('ImportError (blk.py:1)\n  File "blk.py", line 2, in <module>', m, 'a')
+      === 'ImportError (blk.py:1)\n  File "blk.py", line 2, in <module>');
+  check('mapAuthorLines: a traceback frame is renumbered, and only in the block file',
+    mapAuthorLines('  File "main.py", line 5, in run\n  File "blk.py", line 5, in value', m, 'a\nb')
+      === '  File "main.py", line 5, in run\n  File "blk.py", line 2, in value');
+  check('mapAuthorLines: a character offset is rebased by the wrapper\'s length',
+    mapAuthorLines(`blk.py: Python: nope (at offset ${m.before.length + 1})`, m, 'a\nb') === 'blk.py: Python: nope (at offset 1)');
+  check('mapAuthorLines: an offset inside the wrapper is left alone',
+    mapAuthorLines('blk.py: Python: nope (at offset 3)', m, 'a\nb') === 'blk.py: Python: nope (at offset 3)');
+  check('mapAuthorLines: nothing it writes is line 0 or negative',
+    [3, 4, 5, 6].every(n => /blk\.py:[1-9]\d*\b/.test(mapAuthorLines(`x (blk.py:${n})`, m, 'a'))));
+  // A `before` that does NOT end in a newline: the author's first line shares
+  // engine line lineOffset + 1, which the plain subtraction already reaches, so
+  // line lineOffset is wrapper prologue like any line above it and is left
+  // alone. Blaming the author for it is exactly what the rule is here to stop.
+  const joined = { ...EXPR_MODE, before: 'import shared\nimport other\nvalue = (', lineOffset: 2 };
+  check('mapAuthorLines: with a wrapper that does not end a line, the author\'s first line is lineOffset + 1',
+    mapAuthorLines('x (blk.py:3)', joined, 'a\nb') === 'x (blk.py:1)' && mapAuthorLines('x (blk.py:4)', joined, 'a\nb') === 'x (blk.py:2)');
+  check('… and its last line, which the author\'s code does NOT continue, is left alone',
+    mapAuthorLines('ImportError (blk.py:2)', joined, 'a\nb') === 'ImportError (blk.py:2)');
+  check('mapAuthorLines: a mode that generates nothing changes nothing',
+    mapAuthorLines('x (blk.py:7)\n  File "blk.py", line 7, in f', QUIET_MODE, 'a\n'.repeat(9))
+      === 'x (blk.py:7)\n  File "blk.py", line 7, in f');
+}
+if (HAS_PYTHON) {
+  const expr = modeOne(['expr', 'stmt'], 'twice(ctx["n"]) if False else 7');
+  check('a mode job runs the first mode and returns its value', expr.ok === true && expr.value === 7, show(expr));
+  check('… on exactly one Engine', expr.constructions === 1, String(expr.constructions));
+  const merged = modeOne(['expr'], 'twice(4)');
+  check('the mode\'s files are merged over the contract\'s, so the entry sees both', merged.ok === true && merged.value === 8, show(merged));
+  const fell = modeOne(['expr', 'stmt'], 'a = 1\nresult = a + 1');
+  check('a source error moves to the next mode in the list', fell.ok === true && fell.value === 2, show(fell));
+  check('… on a second fresh Engine', fell.constructions === 2, String(fell.constructions));
+  const single = modeOne(['stmt'], 'result = 3');
+  check('one mode is a list of one', single.ok === true && single.value === 3 && single.constructions === 1, show(single));
+  const guestStop = modeOne(['expr', 'stmt'], 'ctx["missing"]');
+  check('a guest error does NOT move to the next mode', guestStop.ok === false && guestStop.errorKind === 'guest' && guestStop.constructions === 1, show(guestStop));
+  const bothBad = modeOne(['expr', 'stmt'], 'if');
+  check('both phases failing reports the LAST one, tried once each', bothBad.ok === false && bothBad.errorKind === 'source' && bothBad.constructions === 2, show(bothBad));
+  const ownCall = modeOne(['quiet'], 'x = 1\n', { args: [] });
+  check('a mode may name its own call, so a compile-only wrapping needs no shared entry point', ownCall.ok === true && ownCall.value === null, show(ownCall));
+  const quietBad = modeOne(['quiet'], 'def f(:\n', { args: [] });
+  check('… and the block is still compiled: a syntax error is `source` at line 1', quietBad.ok === false && quietBad.errorKind === 'source' && /blk\.py:1:/.test(quietBad.error), show(quietBad));
+
+  // Line attribution — the runner's promise.
+  const atLine = (r) => (r.error ?? '').match(/blk\.py:(\d+)/)?.[1];
+  const first = modeOne(['stmt'], 'result = ctx["missing"]');
+  check('an error on the author\'s FIRST line says line 1', first.ok === false && atLine(first) === '1', show(first));
+  const later = modeOne(['stmt'], 'a = 1\nb = 2\nresult = ctx["missing"]');
+  check('an error on a LATER line says that line', atLine(later) === '3', show(later));
+  const nested = modeOne(['stmt'], 'def f():\n    return ctx["missing"]\nresult = f()');
+  check('a nested call renumbers every frame, in the traceback\'s order',
+    nested.ok === false && /\(blk\.py:2\)/.test(nested.error) && /blk\.py", line 3[\s\S]*blk\.py", line 2/.test(nested.error), show(nested));
+  const spliced = modeOne(['expr'], 'ctx["missing"]');
+  check('the splice line is the author\'s first line, not line 0', atLine(spliced) === '1', show(spliced));
+  const phase = modeOne(['expr', 'stmt'], 'a = 1\nb = ctx["missing"]');
+  check('the FALLBACK phase is attributed with the fallback\'s own offset', atLine(phase) === '2', show(phase));
+  check('… which the first phase\'s offset would have got wrong', 2 - EXPR_MODE.lineOffset < 1 && 2 === 3 - STMT_MODE.lineOffset + 0);
+  const tail = modeOne(['expr'], 'ctx[');
+  check('a compile error pointing into the wrapper\'s TAIL is capped at the author\'s last line', atLine(tail) === '1', show(tail));
+  // The underflow the owner asked about: an import on the wrapper's FIRST line
+  // fails on its own account. The runner reports no author line rather than the
+  // wrong one — the text is the engine's, unchanged.
+  const prologue = modeOne(['prologue'], 'x = 1\n');
+  const rawPrologue = modeOne(['prologue'], 'x = 1\n', {}, { ...MODE_PROFILE, python: { ...MODE_PROFILE.python, modes: [{ ...PROLOGUE_MODE, lineOffset: 0 }] } });
+  check('a failure ABOVE the author\'s code is not mapped at all, byte for byte',
+    prologue.ok === false && prologue.error === rawPrologue.error && /blk\.py:1\b/.test(prologue.error), show(prologue));
+  check('… and no line 0 or negative appears anywhere in it', !/line (0|-\d)|:(0|-\d)\b/.test(prologue.error), show(prologue));
+
+  // The regression guard: nothing about a job that carries its own files
+  // changed, with or without a profile that carries modes.
+  const FILES_JOB = { id: 'p', language: 'python', mode: 'python-project', files: { 'main.py': 'def run(ctx):\n    return ctx["n"] * 2\n' }, entry: 'main', call: 'run', args: [{ n: 21 }] };
+  const plain = send({ v: 1, jobs: [FILES_JOB] }).results[0];
+  const beside = send({ v: 1, profile: MODE_PROFILE, jobs: [FILES_JOB] }).results[0];
+  check('a files job is untouched by a profile that carries modes', same(plain, beside) && plain.value === 42, show([plain, beside]));
+  const legacyFallback = send({ v: 1, profile: MODE_PROFILE, jobs: [{ ...FILES_JOB, files: { 'main.py': 'def run(ctx:\n' }, fallbackOnSourceError: { files: { 'main.py': 'def run(ctx):\n    return "old shape"\n' } } }] }).results[0];
+  check('fallbackOnSourceError still behaves exactly as it did', legacyFallback.ok === true && legacyFallback.value === 'old shape', show(legacyFallback));
+  const unmapped = send({ v: 1, profile: MODE_PROFILE, jobs: [{ ...FILES_JOB, files: { 'main.py': 'def run(ctx):\n    return ctx["missing"]\n' } }] }).results[0];
+  check('a files job\'s lines are NOT rewritten: there is no wrapper to subtract', /main\.py:2/.test(unmapped.error), show(unmapped));
+
+  // Called directly, with no profile to unfold from: a result, not a throw.
+  const before = constructions;
+  const orphan = runScriptJob(CountingEngine, { id: 'm', language: 'python', mode: 'python-project', modes: ['expr'], source: '1' }, { languages: identity.languages });
+  check('a mode job handed straight to the runner with no profile fails closed as `host`',
+    orphan.ok === false && orphan.errorKind === 'host' && /no profile that defines any/.test(orphan.error) && constructions === before, show(orphan));
+  const missing = runScriptJob(CountingEngine, { id: 'm', language: 'python', mode: 'python-project', modes: ['nope'], source: '1' }, { languages: identity.languages, profile: MODE_PROFILE });
+  check('… and one naming a mode the profile lacks says which mode',
+    missing.ok === false && missing.errorKind === 'host' && /defines no script mode named "nope"/.test(missing.error) && constructions === before, show(missing));
+} else {
+  const r = modeOne(['expr'], '1');
+  check('a mode job on a JavaScript-only install is `unsupported`', r.ok === false && r.errorKind === 'unsupported', show(r));
+  check('… and was never attempted (no Engine built)', r.constructions === 0, String(r.constructions));
+}
+
+// ---------------------------------------------------------------------------
+// 7. A real consumer's contract, vendored: the profile is ALL a host gets.
+// ---------------------------------------------------------------------------
+console.log('\npython modes: a vendored contract');
+{
+  const FIXTURE = JSON.parse(fs.readFileSync(path.join(HERE, 'fixtures', 'formlogic-python-contract.json'), 'utf8'));
+  const vendored = { v: 1, preamble: '', preambleSha256: sha256(''), python: FIXTURE.python };
+  const checked = validateScriptRequest({ v: 1, profile: vendored, jobs: [] }, { sha256 });
+  check('the vendored contract is a valid profile', checked.ok === true, checked.ok ? '' : checked.error.message);
+  check('it carries five wrappings, three file names and one entry point',
+    FIXTURE.python.modes.length === 5
+    && new Set(FIXTURE.python.modes.map(m => m.block)).size === 1
+    && new Set(FIXTURE.python.modes.flatMap(m => Object.keys(m.files))).size === 1
+    && new Set(FIXTURE.python.modes.map(m => m.lineOffset)).size === 2,
+    show(FIXTURE.python.modes.map(m => [m.name, m.lineOffset])));
+  check('its provenance says where it came from and at which commit',
+    /^[0-9a-f]{40}$/.test(FIXTURE.vendoredFrom.commit) && Object.keys(FIXTURE.vendoredFrom.blobs).length === 6
+    && Object.values(FIXTURE.vendoredFrom.blobs).every(b => /^[0-9a-f]{40}$/.test(b)));
+  // Provenance that is CHECKED, not asserted: every case either names a case of
+  // the vendored corpus (whose own id list is recorded here, at that blob) or
+  // says it is this repo's own and why. A case cannot quietly become an
+  // invention with somebody else's id on it.
+  {
+    const corpusIds = new Set(FIXTURE.vendoredFrom.corpusCaseIds);
+    const orphans = FIXTURE.cases.filter(c => (c.formlogicId ? !corpusIds.has(c.formlogicId) : typeof c.addedByOaiy !== 'string'));
+    check(`every case is a corpus case by id or says it is ours (${FIXTURE.cases.length} cases, ${corpusIds.size} corpus ids)`,
+      orphans.length === 0 && corpusIds.size === 58, orphans.map(c => c.id).join(', '));
+    const bothOrNeither = FIXTURE.cases.filter(c => (c.formlogicId === undefined) === (c.addedByOaiy === undefined));
+    check('… and never both at once', bothOrNeither.length === 0, bothOrNeither.map(c => c.id).join(', '));
+  }
+  // The round trip: what the validator hands back is the contract that went in.
+  {
+    const roundTripped = checked.ok ? checked.request.profile.python : null;
+    const fields = ['name', 'files', 'block', 'before', 'after', 'lineOffset', 'call'];
+    const drift = (roundTripped?.modes ?? []).flatMap((m, i) =>
+      fields.filter(f => !same(m[f], FIXTURE.python.modes[i][f])).map(f => `${m.name}.${f}`));
+    check('the validator round-trips every mode field unchanged',
+      roundTripped !== null && roundTripped.modes.length === FIXTURE.python.modes.length && drift.length === 0
+      && roundTripped.contract === FIXTURE.python.contract && roundTripped.entry === FIXTURE.python.entry
+      && roundTripped.call === FIXTURE.python.call && same(roundTripped.files, FIXTURE.python.files),
+      drift.join(', '));
+  }
+  if (HAS_PYTHON) {
+    for (const c of FIXTURE.cases) {
+      const r = send({ v: 1, profile: vendored, jobs: [{ id: c.id, language: 'python', mode: 'python-project', modes: c.modes, source: c.source, args: c.args ?? [c.context ?? FIXTURE.context] }] });
+      const got = 'error' in r ? { refused: r.error } : r.results[0];
+      if ('value' in c.expect) {
+        check(`${c.id}: ${c.proves}`, got.ok === true && same(got.value, c.expect.value), show(got));
+      } else {
+        const lines = (got.error ?? '').match(/logic_block\.py[":,. ]*(?:line )?(\d+)/g)?.map(s => Number(s.match(/(\d+)/)[1])) ?? [];
+        check(`${c.id}: ${c.proves}`,
+          got.ok === false && got.errorKind === c.expect.errorKind && new RegExp(c.expect.error).test(got.error)
+          && (c.expect.authorLines === undefined || same(lines, c.expect.authorLines)),
+          show(got));
+      }
+    }
+    // The point of the whole widening, said once: the profile is the only
+    // thing the host has, and nothing of the requester's is anywhere else.
+    const source = fs.readFileSync(path.join(HERE, '..', 'vendor', 'oaiy-core', 'src', 'zipp-script.ts'), 'utf8');
+    const schemas = ['script-profile.schema.json', 'script-request.schema.json'].map(n => fs.readFileSync(path.join(PROTOCOL, n), 'utf8')).join('\n');
+    const theirs = [
+      FIXTURE.python.contract, FIXTURE.python.call, FIXTURE.python.entry,
+      ...Object.keys(FIXTURE.python.files),
+      ...FIXTURE.python.modes.map(m => m.block),
+      ...FIXTURE.python.modes.flatMap(m => Object.keys(m.files)),
+      ...FIXTURE.python.modes.map(m => m.call).filter(Boolean),
+    ].filter(name => name.length > 4);
+    const leaked = [...new Set(theirs)].filter(name => source.includes(name) || schemas.includes(name));
+    check('not one name of theirs is in the envelope or the schemas', leaked.length === 0, leaked.join(', '));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 8. The schemas agree with the code on every fixture this file sent.
 // ---------------------------------------------------------------------------
 console.log('\nschemas');
 {
@@ -678,6 +1003,17 @@ console.log('\nschemas');
     show(requestSchema.$defs.javascriptJob.properties.globals.propertyNames?.not?.enum));
   check('the schema names the languages the code accepts',
     requestSchema.$defs.javascriptJob.properties.language.const === 'javascript' && requestSchema.$defs.pythonJob.properties.language.const === 'python');
+  // Every bound a mode is held to is stated once, in the code, and repeated in
+  // the schema so a host that validates before it sends gets the same answer.
+  check('the schema mode bounds are the code\'s',
+    profileSchema.properties.python.properties.modes.maxItems === SCRIPT_MAX_PROFILE_MODES
+    && requestSchema.$defs.pythonJob.properties.modes.maxItems === SCRIPT_MAX_JOB_MODES
+    && profileSchema.$defs.pythonMode.properties.lineOffset.maximum === SCRIPT_MAX_LINE_OFFSET
+    && profileSchema.$defs.pythonMode.properties.lineOffset.minimum === 0,
+    `${profileSchema.properties.python.properties.modes.maxItems}/${requestSchema.$defs.pythonJob.properties.modes.maxItems}/${profileSchema.$defs.pythonMode.properties.lineOffset.maximum}`);
+  check('a job names a mode by the same grammar a profile defines one with',
+    requestSchema.$defs.pythonJob.properties.modes.items.$ref === `${profileSchema.$id}#/$defs/pythonModeName`
+    && profileSchema.$defs.pythonMode.properties.name.$ref === '#/$defs/pythonModeName');
 }
 
 /**
@@ -725,6 +1061,7 @@ function makeValidator(schemas) {
     }
     if (Array.isArray(v)) {
       if (schema.minItems !== undefined && v.length < schema.minItems) return false;
+      if (schema.maxItems !== undefined && v.length > schema.maxItems) return false;
       if (schema.items !== undefined && !v.every(x => valid(schema.items, x, root))) return false;
     }
     if (typeOf(v) === 'object') {
