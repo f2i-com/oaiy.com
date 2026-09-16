@@ -31,6 +31,8 @@ use serde_json::{json, Value};
 
 use super::descriptor::FlowsSpec;
 use super::LinkedAccount;
+use crate::bridge::conditions::{self, ConditionJob, ConditionVerdict, ShadowContext, Verdict};
+use crate::bridge::script_host::ScriptBatch;
 
 /// How long a fetched binding list is reused.
 ///
@@ -284,64 +286,85 @@ fn fetch(account: &LinkedAccount, spec: &FlowsSpec) -> Result<Vec<Binding>, Stri
     Ok(reply.bindings)
 }
 
-/// The bindings this event should fire, and why the others were skipped.
-pub fn select<'a>(
-    bindings: &'a [Binding],
-    event_name: &str,
-    envelope: &Value,
-) -> (Vec<&'a Binding>, Vec<(&'a Binding, Skip)>) {
-    let mut fire = Vec::new();
-    let mut skipped = Vec::new();
+/// One matched binding, on its way to a decision.
+#[derive(Debug)]
+pub enum Pending<'a> {
+    /// Out already — disabled, manual, or no flow to run. No condition needed,
+    /// and therefore no engine call.
+    Skipped(&'a Binding, Skip),
+    /// Fires unless its condition says otherwise.
+    Candidate {
+        binding: &'a Binding,
+        /// The expression to decide, or `None` when the binding has no
+        /// condition at all and simply fires.
+        condition: Option<String>,
+        /// Which job in the batch answers this one.
+        job: Option<usize>,
+    },
+}
+
+/// What this event matched, in binding order, before any condition was decided.
+///
+/// Split out of `select` so the conditions can be evaluated with no lock held.
+/// The order of the returned list is the order the bindings appear, which is
+/// what makes [`MAX_BINDINGS_PER_EVENT`] land on a stable set.
+pub fn filter<'a>(bindings: &'a [Binding], event_name: &str) -> Vec<Pending<'a>> {
+    let mut out = Vec::new();
+    let mut next_job = 0usize;
     // Exact name equality, like the local dispatcher. No wildcards: a binding
     // that fires on more than its author named is the dangerous direction.
     for binding in bindings.iter().filter(|b| b.event == event_name) {
-        let reason = if !binding.enabled {
-            Some(Skip::Disabled)
-        } else if binding.mode.as_deref() == Some("manual") {
-            Some(Skip::ManualMode)
-        } else if binding.flow_slug.as_deref().unwrap_or("").is_empty() {
-            Some(Skip::NoFlow)
-        } else {
-            match condition_verdict(binding, envelope) {
-                super::condition::Verdict::True => None,
-                super::condition::Verdict::False => Some(Skip::ConditionFalse),
-                super::condition::Verdict::Unknown(why) => Some(Skip::ConditionUnknown(why)),
+        if !binding.enabled {
+            out.push(Pending::Skipped(binding, Skip::Disabled));
+            continue;
+        }
+        if binding.mode.as_deref() == Some("manual") {
+            out.push(Pending::Skipped(binding, Skip::ManualMode));
+            continue;
+        }
+        if binding.flow_slug.as_deref().unwrap_or("").is_empty() {
+            out.push(Pending::Skipped(binding, Skip::NoFlow));
+            continue;
+        }
+        match condition_source(binding) {
+            Err(skip) => out.push(Pending::Skipped(binding, skip)),
+            Ok(None) => out.push(Pending::Candidate { binding, condition: None, job: None }),
+            Ok(Some(expr)) => {
+                out.push(Pending::Candidate {
+                    binding,
+                    condition: Some(expr),
+                    job: Some(next_job),
+                });
+                next_job += 1;
             }
-        };
-        let reason = reason.or_else(|| {
-            (fire.len() >= MAX_BINDINGS_PER_EVENT).then_some(Skip::TooManyBindings)
-        });
-        match reason {
-            Some(r) => skipped.push((binding, r)),
-            None => fire.push(binding),
         }
     }
-    (fire, skipped)
+    out
 }
 
-/// What this binding's condition decides for this event.
+/// The expression this binding's condition asks for, if any.
 ///
 /// The condition arrives as `{"type":"expression","expr":"…"}`, or as a bare
-/// string, or absent. An absent one is not a condition and fires; a shape this
-/// does not recognise is Unknown, which does not.
-fn condition_verdict(binding: &Binding, envelope: &Value) -> super::condition::Verdict {
+/// string, or absent. An absent one — and a blank one — is not a condition: it
+/// fires, and it costs no engine call. A shape this does not recognise is a
+/// skip, because guessing which way it would have gone is the mistake this
+/// whole lane exists to avoid.
+fn condition_source(binding: &Binding) -> Result<Option<String>, Skip> {
     let Some(raw) = binding.condition.as_ref() else {
-        return super::condition::Verdict::True;
+        return Ok(None);
     };
     let expr = match raw {
-        Value::Null => return super::condition::Verdict::True,
+        Value::Null => return Ok(None),
         Value::String(s) => s.clone(),
-        Value::Object(o) if o.is_empty() => return super::condition::Verdict::True,
+        Value::Object(o) if o.is_empty() => return Ok(None),
         Value::Object(o) => match o.get("expr").and_then(Value::as_str) {
             Some(e) => e.to_string(),
             None => {
-                return super::condition::Verdict::Unknown(
-                    "the condition names no expression".into(),
-                )
+                return Err(Skip::ConditionUnknown("the condition names no expression".into()))
             }
         },
         other => {
-            return super::condition::Verdict::Unknown(format!(
+            return Err(Skip::ConditionUnknown(format!(
                 "the condition is a {} rather than an expression",
                 match other {
                     Value::Bool(_) => "boolean",
@@ -349,10 +372,123 @@ fn condition_verdict(binding: &Binding, envelope: &Value) -> super::condition::V
                     Value::Array(_) => "list",
                     _ => "value",
                 }
-            ))
+            )))
         }
     };
-    super::condition::evaluate(&expr, envelope)
+    Ok(Some(expr.trim().to_string()).filter(|e| !e.is_empty()))
+}
+
+/// The batch this event sends: ONE request, one job per condition.
+///
+/// `event` is bound to the ENVELOPE, not to this desktop's internal event —
+/// conditions are authored against `event.data.*` as it appears on the wire,
+/// which is exactly what the Rust grammar read.
+pub fn condition_jobs(pending: &[Pending<'_>], envelope: &Value) -> Vec<ConditionJob> {
+    let mut jobs: Vec<Option<ConditionJob>> = Vec::new();
+    for p in pending {
+        let Pending::Candidate { condition: Some(expr), job: Some(n), .. } = p else {
+            continue;
+        };
+        if jobs.len() <= *n {
+            jobs.resize_with(n + 1, || None);
+        }
+        jobs[*n] = Some(ConditionJob {
+            id: ConditionJob::id_for(*n),
+            source: expr.clone(),
+            globals: json!({ "event": envelope }),
+        });
+    }
+    jobs.into_iter().flatten().collect()
+}
+
+/// The bindings this event should fire, why the others were skipped, and any
+/// `condition-shadow` lines the two grammars produced.
+#[derive(Debug, Default)]
+pub struct Selection<'a> {
+    pub fire: Vec<&'a Binding>,
+    pub skipped: Vec<(&'a Binding, Skip)>,
+    /// Already logged; kept so a test can read them without capturing the log.
+    pub shadow: Vec<String>,
+}
+
+/// Fold ZIPP's answers back into the matched list.
+///
+/// Pure: no engine, no lock, no clock. `answers` is what
+/// [`crate::bridge::conditions::decide`] returned for [`condition_jobs`], in the
+/// same order; a candidate whose answer is missing is Unknown, which does not
+/// fire.
+pub fn decide<'a>(
+    pending: Vec<Pending<'a>>,
+    answers: &[ConditionVerdict],
+    event_name: &str,
+    source: &str,
+    envelope: &Value,
+) -> Selection<'a> {
+    let idempotency_key = envelope
+        .get("idempotencyKey")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let mut sel = Selection::default();
+    for p in pending {
+        let (binding, reason) = match p {
+            Pending::Skipped(binding, skip) => (binding, Some(skip)),
+            Pending::Candidate { binding, condition: None, .. } => (binding, None),
+            Pending::Candidate { binding, condition: Some(expr), job } => {
+                let answer = job.and_then(|n| answers.get(n));
+                let verdict = match answer {
+                    Some(a) => a.verdict.clone(),
+                    None => Verdict::Unknown(
+                        "its condition was not evaluated before this dispatch".into(),
+                    ),
+                };
+                if answer.map(|a| a.answered).unwrap_or(false) {
+                    let rust = super::condition::shadow_verdict(&expr, envelope);
+                    let ctx = ShadowContext {
+                        lane: "flows",
+                        binding: &binding.id,
+                        event: event_name,
+                        source,
+                        idempotency_key,
+                        expr: &expr,
+                    };
+                    if let Some(line) = conditions::shadow_line(&ctx, &verdict, &rust) {
+                        log::warn!("{line}");
+                        sel.shadow.push(line);
+                    }
+                }
+                let reason = match verdict {
+                    Verdict::True => None,
+                    Verdict::False => Some(Skip::ConditionFalse),
+                    Verdict::Unknown(why) => Some(Skip::ConditionUnknown(why)),
+                };
+                (binding, reason)
+            }
+        };
+        let reason = reason.or_else(|| {
+            (sel.fire.len() >= MAX_BINDINGS_PER_EVENT).then_some(Skip::TooManyBindings)
+        });
+        match reason {
+            Some(r) => sel.skipped.push((binding, r)),
+            None => sel.fire.push(binding),
+        }
+    }
+    sel
+}
+
+/// The bindings this event should fire, and why the others were skipped.
+///
+/// Conditions are decided on ZIPP, in ONE batch, before anything is reserved.
+pub fn select<'a>(
+    host: &dyn ScriptBatch,
+    bindings: &'a [Binding],
+    event_name: &str,
+    source: &str,
+    envelope: &Value,
+) -> Selection<'a> {
+    let pending = filter(bindings, event_name);
+    let jobs = condition_jobs(&pending, envelope);
+    let answers = conditions::decide(host, &jobs);
+    decide(pending, &answers, event_name, source, envelope)
 }
 
 /// The exact idempotency key every runtime uses for a binding-fired run.
@@ -683,7 +819,18 @@ mod tests {
     }
 
     fn envelope(data: Value) -> Value {
-        json!({ "name": "aokie.call.ended", "data": data })
+        json!({ "name": "aokie.call.ended", "idempotencyKey": "evt-1", "data": data })
+    }
+
+    use crate::bridge::conditions::testing::{guest, FakeHost};
+
+    /// Every condition answers `value`.
+    fn answering(value: Value) -> FakeHost {
+        FakeHost::always(value)
+    }
+
+    fn fire_ids<'a>(sel: &Selection<'a>) -> Vec<&'a str> {
+        sel.fire.iter().map(|b| b.id.as_str()).collect()
     }
 
     #[test]
@@ -694,13 +841,14 @@ mod tests {
             binding("b3", "aokie.call.ended"),
         ];
         let e = envelope(json!({}));
-        let (fire, skipped) = select(&all, "aokie.call.ended", &e);
-        assert_eq!(fire.iter().map(|b| b.id.as_str()).collect::<Vec<_>>(), ["b1", "b3"]);
-        assert!(skipped.is_empty());
+        let host = answering(json!(true));
+        let sel = select(&host, &all, "aokie.call.ended", "aokie", &e);
+        assert_eq!(fire_ids(&sel), ["b1", "b3"]);
+        assert!(sel.skipped.is_empty());
         // No wildcards or prefixes: firing on more than the author named is the
         // dangerous direction.
-        assert!(select(&all, "aokie.call", &e).0.is_empty());
-        assert!(select(&all, "aokie.call.ended.extra", &e).0.is_empty());
+        assert!(select(&host, &all, "aokie.call", "aokie", &e).fire.is_empty());
+        assert!(select(&host, &all, "aokie.call.ended.extra", "aokie", &e).fire.is_empty());
     }
 
     #[test]
@@ -708,42 +856,47 @@ mod tests {
         // The live blocker this fixes: the flows that record a call's
         // transcript are bound with a condition, so refusing every condition
         // meant the console showed "no transcript recorded" for every call.
+        let expr = "event && event.data ? Number(event.data.durationSeconds || 0) > 5 : false";
         let mut b = binding("b1", "aokie.call.transcript.settled");
-        b.condition = Some(json!({
-            "type": "expression",
-            "expr": "event && event.data ? Number(event.data.durationSeconds || 0) > 5 : false",
-        }));
+        b.condition = Some(json!({ "type": "expression", "expr": expr }));
         let all = vec![b];
 
-        let long = envelope(json!({ "durationSeconds": 33 }));
-        assert_eq!(select(&all, "aokie.call.transcript.settled", &long).0.len(), 1);
+        let long = answering(json!(true));
+        assert_eq!(
+            select(&long, &all, "aokie.call.transcript.settled", "aokie", &envelope(json!({ "durationSeconds": 33 }))).fire.len(),
+            1
+        );
 
-        let short = envelope(json!({ "durationSeconds": 2 }));
-        let (fire, skipped) = select(&all, "aokie.call.transcript.settled", &short);
-        assert!(fire.is_empty());
+        let short = answering(json!(false));
+        let sel = select(&short, &all, "aokie.call.transcript.settled", "aokie", &envelope(json!({ "durationSeconds": 2 })));
+        assert!(sel.fire.is_empty());
         // False is a DECISION, and reads differently from "not understood".
-        assert_eq!(skipped[0].1, Skip::ConditionFalse);
-        assert!(skipped[0].1.message().contains("evaluated false"));
+        assert_eq!(sel.skipped[0].1, Skip::ConditionFalse);
+        assert!(sel.skipped[0].1.message().contains("evaluated false"));
     }
 
     #[test]
     fn a_condition_that_is_not_understood_still_refuses_to_fire() {
         // The safe direction is unchanged: understood-and-true is the only path
-        // to firing, so a shape the evaluator cannot read never sends the SMS.
+        // to firing, so a condition that throws never sends the SMS.
         let mut b = binding("b1", "aokie.call.ended");
         b.condition = Some(json!({ "type": "expression", "expr": "event.data.from.includes('+44')" }));
-        let (fire, skipped) = select(std::slice::from_ref(&b), "aokie.call.ended", &envelope(json!({})));
-        assert!(fire.is_empty());
-        assert!(matches!(skipped[0].1, Skip::ConditionUnknown(_)));
+        let throwing = FakeHost::by_source(|_| Err(guest("TypeError: cannot read 'includes' of undefined")));
+        let sel = select(&throwing, std::slice::from_ref(&b), "aokie.call.ended", "aokie", &envelope(json!({})));
+        assert!(sel.fire.is_empty());
+        assert!(matches!(sel.skipped[0].1, Skip::ConditionUnknown(_)));
         // …and it says WHY, so an author is not left guessing.
-        assert!(skipped[0].1.message().contains("could not be evaluated"));
+        assert!(sel.skipped[0].1.message().contains("could not be evaluated"));
 
-        // A condition of an unexpected SHAPE is equally refused.
+        // A condition of an unexpected SHAPE is refused without an engine at
+        // all: there is no expression to send.
         let mut odd = binding("b2", "aokie.call.ended");
         odd.condition = Some(json!([1, 2, 3]));
-        let (fire, skipped) = select(std::slice::from_ref(&odd), "aokie.call.ended", &envelope(json!({})));
-        assert!(fire.is_empty());
-        assert!(matches!(skipped[0].1, Skip::ConditionUnknown(_)));
+        let host = answering(json!(true));
+        let sel = select(&host, std::slice::from_ref(&odd), "aokie.call.ended", "aokie", &envelope(json!({})));
+        assert!(sel.fire.is_empty());
+        assert!(matches!(sel.skipped[0].1, Skip::ConditionUnknown(_)));
+        assert_eq!(host.calls(), 0, "a shape with no expression is not a job");
     }
 
     #[test]
@@ -761,37 +914,132 @@ mod tests {
         conditional.condition = Some(json!("event.data.from.startsWith('+44')"));
 
         let all = vec![disabled, manual, no_flow, conditional];
-        let (fire, skipped) = select(&all, "e", &envelope(json!({})));
-        assert!(fire.is_empty(), "none of these may fire");
-        assert!(matches!(skipped[0].1, Skip::Disabled));
-        assert!(matches!(skipped[1].1, Skip::ManualMode));
-        assert!(matches!(skipped[2].1, Skip::NoFlow));
-        assert!(matches!(skipped[3].1, Skip::ConditionUnknown(_)));
-        assert!(skipped.iter().all(|(_, s)| !s.message().is_empty()));
+        let throwing = FakeHost::by_source(|_| Err(guest("TypeError")));
+        let sel = select(&throwing, &all, "e", "aokie", &envelope(json!({})));
+        assert!(sel.fire.is_empty(), "none of these may fire");
+        assert!(matches!(sel.skipped[0].1, Skip::Disabled));
+        assert!(matches!(sel.skipped[1].1, Skip::ManualMode));
+        assert!(matches!(sel.skipped[2].1, Skip::NoFlow));
+        assert!(matches!(sel.skipped[3].1, Skip::ConditionUnknown(_)));
+        assert!(sel.skipped.iter().all(|(_, s)| !s.message().is_empty()));
     }
 
     #[test]
-    fn an_absent_condition_is_not_a_condition() {
-        // null, "" and {} all mean the author wrote no condition. Reading any
-        // of them as one would skip a binding that should have fired — the
-        // opposite mistake, and just as invisible.
+    fn an_absent_condition_is_not_a_condition_and_costs_no_engine() {
+        // null, "", "   " and {} all mean the author wrote no condition. Reading
+        // any of them as one would skip a binding that should have fired — the
+        // opposite mistake, and just as invisible. And none of them may reach
+        // the script host: the first conditioned event after boot spawns a
+        // child, and an unconditioned workspace must never pay for one.
         for empty in [json!(null), json!(""), json!("   "), json!({})] {
             let mut b = binding("b", "e");
             b.condition = Some(empty.clone());
-            assert_eq!(
-                select(std::slice::from_ref(&b), "e", &envelope(json!({}))).0.len(),
-                1,
-                "{empty:?} is not a condition and must not block the binding"
-            );
+            let host = answering(json!(false));
+            let sel = select(&host, std::slice::from_ref(&b), "e", "aokie", &envelope(json!({})));
+            assert_eq!(sel.fire.len(), 1, "{empty:?} is not a condition and must not block the binding");
+            assert_eq!(host.calls(), 0, "{empty:?} must not become a job");
         }
     }
 
     #[test]
     fn one_event_cannot_become_an_unbounded_number_of_runs() {
         let all: Vec<Binding> = (0..9).map(|i| binding(&format!("b{i}"), "e")).collect();
-        let (fire, skipped) = select(&all, "e", &envelope(json!({})));
-        assert_eq!(fire.len(), MAX_BINDINGS_PER_EVENT);
-        assert!(skipped.iter().all(|(_, s)| *s == Skip::TooManyBindings));
-        assert_eq!(skipped.len(), 9 - MAX_BINDINGS_PER_EVENT);
+        let host = answering(json!(true));
+        let sel = select(&host, &all, "e", "aokie", &envelope(json!({})));
+        assert_eq!(sel.fire.len(), MAX_BINDINGS_PER_EVENT);
+        assert!(sel.skipped.iter().all(|(_, s)| *s == Skip::TooManyBindings));
+        assert_eq!(sel.skipped.len(), 9 - MAX_BINDINGS_PER_EVENT);
+    }
+
+    // -- on ZIPP ------------------------------------------------------------
+
+    fn conditional(id: &str, expr: &str) -> Binding {
+        let mut b = binding(id, "aokie.call.ended");
+        b.condition = Some(json!({ "type": "expression", "expr": expr }));
+        b
+    }
+
+    #[test]
+    fn every_condition_of_one_event_travels_in_one_batch_bound_to_the_envelope() {
+        let all = vec![
+            conditional("b1", "event.data.n === 1"),
+            binding("b2", "aokie.call.ended"),
+            conditional("b3", "event.data.n === 2"),
+        ];
+        let host = answering(json!(true));
+        let e = envelope(json!({ "n": 1 }));
+        select(&host, &all, "aokie.call.ended", "aokie", &e);
+
+        let request = host.only_request();
+        let jobs = request["jobs"].as_array().expect("jobs");
+        assert_eq!(jobs.len(), 2, "the unconditioned binding is not a job");
+        assert_eq!(jobs[0]["source"], "event.data.n === 1");
+        assert_eq!(jobs[1]["source"], "event.data.n === 2");
+        // The ENVELOPE, not this desktop's internal event: conditions are
+        // authored against `event.data.*` as it appears on the wire, which is
+        // exactly what the Rust grammar read.
+        assert_eq!(jobs[0]["globals"], json!({ "event": e }));
+    }
+
+    #[test]
+    fn zipps_verdict_is_the_one_used_not_the_rust_grammars() {
+        // `event.data.n > 1` is a condition BOTH grammars understand, and the
+        // Rust one says true for n = 5. ZIPP says false, and ZIPP decides.
+        let all = vec![conditional("b1", "event.data.n > 1")];
+        let e = envelope(json!({ "n": 5 }));
+
+        let zipp_says_no = answering(json!(false));
+        let sel = select(&zipp_says_no, &all, "aokie.call.ended", "aokie", &e);
+        assert!(sel.fire.is_empty(), "ZIPP said false, so the binding does not fire");
+        assert_eq!(sel.skipped[0].1, Skip::ConditionFalse);
+        assert_eq!(sel.shadow.len(), 1, "and the disagreement is on the record");
+        assert!(sel.shadow[0].contains("zipp=false rust=true"), "{}", sel.shadow[0]);
+
+        // And the other way: an expression the Rust grammar REFUSES — it knows
+        // `String` and `Number` and no other call — which ZIPP evaluates
+        // perfectly well, and which now fires.
+        let method = vec![conditional("b1", "event.data.tags.includes('vip')")];
+        let zipp_says_yes = answering(json!(true));
+        let sel = select(&zipp_says_yes, &method, "aokie.call.ended", "aokie", &envelope(json!({ "tags": ["vip"] })));
+        assert_eq!(fire_ids(&sel), ["b1"], "a method call is legal JavaScript");
+        assert_eq!(sel.shadow.len(), 1);
+        assert!(sel.shadow[0].contains("refused=rust"), "{}", sel.shadow[0]);
+    }
+
+    #[test]
+    fn agreement_leaves_no_shadow_line() {
+        let all = vec![conditional("b1", "event.data.n > 1")];
+        let host = answering(json!(true));
+        let sel = select(&host, &all, "aokie.call.ended", "aokie", &envelope(json!({ "n": 5 })));
+        assert_eq!(fire_ids(&sel), ["b1"]);
+        assert!(sel.shadow.is_empty(), "a shadow line means the two disagreed");
+    }
+
+    #[test]
+    fn a_host_outage_skips_every_conditioned_binding_and_shadows_nothing() {
+        // Fail closed: the Rust grammar does NOT take over, because a fallback
+        // that decided would change semantics under the user mid-outage — in
+        // the firing direction. And an outage is not a disagreement, so it must
+        // not fill the shadow log that PR9's deletion gate reads.
+        let all = vec![conditional("b1", "event.data.n > 1"), binding("b2", "aokie.call.ended")];
+        let down = FakeHost::down("no engine on this machine");
+        let sel = select(&down, &all, "aokie.call.ended", "aokie", &envelope(json!({ "n": 5 })));
+
+        assert_eq!(fire_ids(&sel), ["b2"], "an unconditioned binding is unaffected");
+        assert!(matches!(sel.skipped[0].1, Skip::ConditionUnknown(_)));
+        assert!(sel.skipped[0].1.message().contains("no engine on this machine"));
+        assert!(sel.shadow.is_empty(), "an outage is an outage, not a semantic disagreement");
+    }
+
+    #[test]
+    fn a_verdict_nobody_produced_does_not_fire() {
+        // `decide` is pure and takes whatever answers it is given. A candidate
+        // with no answer at all must read as unknown, never as true.
+        let all = vec![conditional("b1", "event.data.n > 1")];
+        let e = envelope(json!({ "n": 5 }));
+        let pending = filter(&all, "aokie.call.ended");
+        let sel = decide(pending, &[], "aokie.call.ended", "aokie", &e);
+        assert!(sel.fire.is_empty());
+        assert!(matches!(sel.skipped[0].1, Skip::ConditionUnknown(_)));
     }
 }

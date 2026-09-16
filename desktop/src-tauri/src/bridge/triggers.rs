@@ -18,27 +18,39 @@
 //! resolves to *skip*, and every skip is recorded with a reason rather than
 //! silently dropped.
 //!
-//! # Conditions are evaluated in a restricted evaluator, not a JS engine
+//! # Conditions are evaluated on ZIPP, not in a grammar of our own
 //!
-//! FormLogic ran conditions in QuickJS. Embedding a JS engine here to evaluate
-//! `event.data.flowId === 'abc'` would be a large amount of attack surface for
-//! the shape of expression the trigger editor actually emits.
+//! [`eval_condition`] used to decide them: a deliberately small language of
+//! selector comparisons joined by `&&` / `||`, which **refused what it could not
+//! parse**. Refusing is the safe direction, but the author wrote JavaScript and
+//! the browser runs JavaScript — so a pair of parentheses was enough to make
+//! this desktop disagree with the web app about the same binding.
 //!
-//! So [`eval_condition`] understands a deliberately small language: selector
-//! comparisons against literals, joined by `&&` / `||`. Anything it cannot parse
-//! is **refused, not guessed** — and refusal means the binding does not fire.
-//! That is the safe direction, and it is loud: the skip reason names the
-//! expression, so an author sees "I cannot evaluate this" rather than a trigger
-//! that mysteriously never runs.
+//! The condition now goes to ZIPP through the warm script host
+//! ([`super::conditions`]), and ZIPP's answer is the one used. `eval_condition`
+//! runs alongside it for ONE release as a shadow, so every disagreement is
+//! logged as a `condition-shadow` line and classified; PR9 deletes it.
 //!
-//! The one thing this must never do is treat an unparseable or erroring
-//! condition as true, which would turn a typo into a binding that fires on
-//! everything.
+//! The one thing this must never do is treat an unparseable, erroring or
+//! UNEVALUATED condition as true, which would turn a typo — or an engine that
+//! is not running — into a binding that fires on everything.
+//!
+//! # Verdicts are decided BEFORE the ledger is locked
+//!
+//! [`dispatch`] runs under the ledger lock, because the reserve calls must be
+//! serialised. Evaluating a condition there would put the whole plugin system
+//! behind a script host that may be starting a child process. So the caller
+//! decides every condition first — [`evaluate_conditions`], one batch, no locks
+//! held — and hands [`dispatch`] the answers.
+
+use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 
+use super::conditions::{self, ConditionJob, ShadowContext, Verdict};
 use super::ledger::{Ledger, LineageRef, ReserveOutcome, RunRecord, RunRequest};
+use super::script_host::ScriptBatch;
 
 /// Maximum bindings one event may fire. Bounded so a misconfigured workspace
 /// cannot turn a single event into hundreds of runs.
@@ -141,10 +153,19 @@ pub struct Event {
 /// Takes `&mut Ledger` rather than the handle so the caller controls the lock
 /// scope: dispatching several bindings under one lock keeps the guard bookkeeping
 /// consistent, and it is the reserve calls themselves that must be serialized.
+///
+/// `verdicts` are the conditions, ALREADY DECIDED — see [`evaluate_conditions`].
+/// This function evaluates nothing: it holds the ledger lock, and the script
+/// host takes a process-wide lock of its own and may spawn a child, so asking it
+/// anything from in here would serialise every plugin event in the process
+/// behind a script host that is starting. A binding whose condition is missing
+/// from `verdicts` is skipped, not fired — an unevaluated condition is exactly
+/// as unsafe as an unevaluatable one.
 pub fn dispatch(
     ledger: &mut Ledger,
     bindings: &[TriggerBinding],
     event: &Event,
+    verdicts: &Verdicts,
 ) -> Vec<DispatchOutcome> {
     let mut matched: Vec<&TriggerBinding> = bindings
         .iter()
@@ -180,20 +201,25 @@ pub fn dispatch(
             continue;
         }
 
-        if let Some(expr) = b.condition.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-            match eval_condition(expr, event) {
-                Ok(true) => {}
-                Ok(false) => {
+        if let Some(expr) = condition_of(b) {
+            let verdict = verdicts.get(&b.id).cloned().unwrap_or_else(|| {
+                // Nobody decided this one. Fail towards not running: the
+                // alternative is firing on a condition nothing has read.
+                Verdict::Unknown("its condition was not evaluated before this dispatch".into())
+            });
+            match verdict {
+                Verdict::True => {}
+                Verdict::False => {
                     out.push(DispatchOutcome::Skipped {
                         binding_id: b.id.clone(),
                         reason: SkipReason::ConditionFalse,
                     });
                     continue;
                 }
-                Err(why) => {
+                Verdict::Unknown(why) => {
                     // The important branch. An unevaluatable condition must never
-                    // read as true — that turns a typo into a binding that fires
-                    // on everything.
+                    // read as true — that turns a typo, or an engine that is not
+                    // running, into a binding that fires on everything.
                     out.push(DispatchOutcome::Skipped {
                         binding_id: b.id.clone(),
                         reason: SkipReason::ConditionUnevaluatable {
@@ -261,6 +287,265 @@ pub fn dispatch(
     out
 }
 
+/// The trimmed, non-empty condition of a binding, or `None` when it has none.
+///
+/// A blank condition is not a condition: it must fire, and it must cost no
+/// engine call at all.
+pub fn condition_of(b: &TriggerBinding) -> Option<&str> {
+    b.condition.as_deref().map(str::trim).filter(|s| !s.is_empty())
+}
+
+/// Every condition of one dispatch, decided.
+///
+/// Built by [`evaluate_conditions`] with no lock held, then handed to
+/// [`dispatch`], which holds the ledger lock and asks nothing.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Verdicts {
+    by_binding: BTreeMap<String, Verdict>,
+    /// `condition-shadow` lines this dispatch produced. Already logged; kept so
+    /// a test can read them without capturing the log.
+    pub shadow: Vec<String>,
+}
+
+impl Verdicts {
+    /// Verdicts from `(binding id, verdict)` pairs.
+    pub fn from_pairs<I: IntoIterator<Item = (String, Verdict)>>(pairs: I) -> Self {
+        Verdicts { by_binding: pairs.into_iter().collect(), shadow: Vec::new() }
+    }
+
+    pub fn get(&self, binding_id: &str) -> Option<&Verdict> {
+        self.by_binding.get(binding_id)
+    }
+
+    pub fn len(&self) -> usize {
+        self.by_binding.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.by_binding.is_empty()
+    }
+}
+
+/// The names a trigger condition may read.
+///
+/// `event` and `$event` are the SAME object. The old grammar accepted both
+/// spellings ([`operand`] maps a bare `event.…` to `$event.…`), and the trigger
+/// editor emits the undollared one, so both have to exist or half the stored
+/// conditions stop resolving.
+pub fn event_globals(event: &Event) -> Value {
+    let e = json!({
+        "name": event.name,
+        "source": event.source,
+        "correlationId": event.correlation_id,
+        "idempotencyKey": event.idempotency_key,
+        "data": event.data,
+    });
+    json!({ "event": e, "$event": e })
+}
+
+/// The bindings whose conditions this event has to decide, in dispatch order.
+///
+/// A superset of what the old in-line evaluation reached: [`dispatch`] checked
+/// [`MAX_BINDINGS_PER_EVENT`] before the condition, so once five had RESERVED it
+/// stopped evaluating. Nothing here knows yet which will reserve — a duplicate
+/// or a guard refusal does not count against the cap — so every matching,
+/// enabled, non-manual, conditioned binding is evaluated. That is already the
+/// old code's worst case (an event where nothing reserves evaluated all of
+/// them), and it buys the property that matters: `dispatch` asks no engine.
+fn conditioned<'a>(bindings: &'a [TriggerBinding], event: &Event) -> Vec<&'a TriggerBinding> {
+    let mut matched: Vec<&TriggerBinding> = bindings
+        .iter()
+        .filter(|b| b.event == event.name && b.enabled && b.mode != BindingMode::Manual)
+        .filter(|b| condition_of(b).is_some())
+        .collect();
+    matched.sort_by(|a, b| a.sort_order.cmp(&b.sort_order).then(a.id.cmp(&b.id)));
+    matched
+}
+
+/// The batch this event sends: ONE request, one job per condition.
+pub fn condition_jobs(bindings: &[TriggerBinding], event: &Event) -> Vec<ConditionJob> {
+    jobs_for(&conditioned(bindings, event), event)
+}
+
+/// One job per binding in `matched`, in that order — so the `n`th answer is the
+/// `n`th binding's, structurally rather than by two functions agreeing.
+fn jobs_for(matched: &[&TriggerBinding], event: &Event) -> Vec<ConditionJob> {
+    if matched.is_empty() {
+        return Vec::new();
+    }
+    let globals = event_globals(event);
+    matched
+        .iter()
+        .enumerate()
+        .map(|(i, b)| ConditionJob {
+            id: ConditionJob::id_for(i),
+            source: condition_of(b).unwrap_or_default().to_string(),
+            globals: globals.clone(),
+        })
+        .collect()
+}
+
+/// Decide every condition of this event on ZIPP, and shadow each answer against
+/// the Rust grammar.
+///
+/// Call this with NO lock held. It takes the script host's process-wide batch
+/// lock and may spawn a child; [`dispatch`] then runs under the ledger lock with
+/// the answers already in hand.
+pub fn evaluate_conditions(
+    host: &dyn ScriptBatch,
+    bindings: &[TriggerBinding],
+    event: &Event,
+) -> Verdicts {
+    let matched = conditioned(bindings, event);
+    let jobs = jobs_for(&matched, event);
+    let answers = conditions::decide(host, &jobs);
+    let mut out = Verdicts::default();
+    for (b, answer) in matched.iter().zip(answers) {
+        let expr = condition_of(b).unwrap_or_default();
+        if answer.answered {
+            let rust = rust_shadow(expr, event);
+            let ctx = ShadowContext {
+                lane: "triggers",
+                binding: &b.id,
+                event: &event.name,
+                source: &event.source,
+                idempotency_key: &event.idempotency_key,
+                expr,
+            };
+            if let Some(line) = conditions::shadow_line(&ctx, &answer.verdict, &rust) {
+                log::warn!("{line}");
+                out.shadow.push(line);
+            }
+        }
+        out.by_binding.insert(b.id.clone(), answer.verdict);
+    }
+    out
+}
+
+/// The Rust grammar's reading, as a [`Verdict`] — for the shadow log only.
+fn rust_shadow(expr: &str, event: &Event) -> Verdict {
+    match eval_condition(expr, event) {
+        Ok(true) => Verdict::True,
+        Ok(false) => Verdict::False,
+        Err(why) => Verdict::Unknown(why),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The one-time `$event` migration
+// ---------------------------------------------------------------------------
+
+/// One condition rewritten by [`migrate_bindings`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConditionRewrite {
+    pub binding_id: String,
+    pub before: String,
+    pub after: String,
+}
+
+/// The tokens that meant `event.data` to the Rust grammar and mean the whole
+/// envelope to ZIPP. Longest first, so `$event` is recognised as one token.
+const BARE_EVENT_TOKENS: [&str; 2] = ["$event", "event"];
+
+fn ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'$'
+}
+
+/// Rewrite a bare `event` / `$event` operand to `<token>.data`.
+///
+/// [`resolve_selector`] answers `$event` alone with `event.data` (the `None`
+/// arm), and [`operand`] routes a bare `event` to that same arm. Under ZIPP the
+/// `event` global is the whole envelope, which is truthy even when `data` is not
+/// — the FIRING direction, so this is not a difference that can be left to
+/// settle. The stored text is rewritten once, on load, and the old reading is
+/// kept nowhere.
+///
+/// Returns `None` when there is nothing to change, which is what leaves an
+/// already-migrated file byte-identical: no rewrite, no write, no `.bak`.
+///
+/// **Idempotent by construction.** The rewritten token is followed by `.`, and a
+/// token followed by `.` is not bare, so a second pass matches nothing.
+///
+/// Quoting follows [`split_top`] exactly — a `'` or `"` opens a span the scan
+/// steps over, with no escape handling — so this and the evaluator always agree
+/// about which bytes are code.
+pub fn migrate_condition(expr: &str) -> Option<String> {
+    let bytes = expr.as_bytes();
+    let mut out = String::new();
+    let mut last = 0usize;
+    let mut i = 0usize;
+    let mut quote: Option<u8> = None;
+    let mut rewrote = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = quote {
+            if b == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        if b == b'\'' || b == b'"' {
+            quote = Some(b);
+            i += 1;
+            continue;
+        }
+        let mut end = None;
+        for token in BARE_EVENT_TOKENS {
+            let t = token.as_bytes();
+            if !bytes[i..].starts_with(t) {
+                continue;
+            }
+            // Bare means: not part of a longer name, and not a property read.
+            let before_ok = i == 0 || !(ident_byte(bytes[i - 1]) || bytes[i - 1] == b'.');
+            let after = i + t.len();
+            let after_ok = after >= bytes.len() || !(ident_byte(bytes[after]) || bytes[after] == b'.');
+            if before_ok && after_ok {
+                end = Some(after);
+                break;
+            }
+        }
+        match end {
+            Some(end) => {
+                out.push_str(&expr[last..end]);
+                out.push_str(".data");
+                last = end;
+                i = end;
+                rewrote = true;
+            }
+            None => i += 1,
+        }
+    }
+    if !rewrote {
+        return None;
+    }
+    out.push_str(&expr[last..]);
+    Some(out)
+}
+
+/// Apply [`migrate_condition`] to every binding, in place.
+///
+/// Only the CONDITION text moves. `inputMap` selectors keep the Rust semantics
+/// (`$event` alone is `event.data`) because they are resolved by
+/// [`resolve_selector`] and never by an engine — rewriting them would change
+/// what a flow receives for no reason at all.
+pub fn migrate_bindings(bindings: &mut [TriggerBinding]) -> Vec<ConditionRewrite> {
+    let mut rewrites = Vec::new();
+    for b in bindings.iter_mut() {
+        let Some(before) = b.condition.clone() else {
+            continue;
+        };
+        // The stored string as stored, untrimmed: a migration must not also
+        // reformat, or "already migrated" stops meaning "byte-identical".
+        let Some(after) = migrate_condition(&before) else {
+            continue;
+        };
+        b.condition = Some(after.clone());
+        rewrites.push(ConditionRewrite { binding_id: b.id.clone(), before, after });
+    }
+    rewrites
+}
+
 /// Resolve a binding's `inputMap` against an event.
 ///
 /// A selector that resolves to nothing yields JSON `null` rather than being
@@ -317,36 +602,18 @@ pub fn resolve_selector(selector: &str, event: &Event) -> Option<Value> {
     }
 }
 
-/// Evaluate a restricted condition expression.
+/// The Rust grammar's reading of a condition — a SHADOW, for one release.
 ///
 /// Supported: `<selector-or-literal> <op> <selector-or-literal>` where op is one
 /// of `===`, `!==`, `==`, `!=`, joined by `&&` or `||`. A bare selector is
-/// truthy-tested. Everything else is an error, and an error means do not fire.
+/// truthy-tested. Everything else is an error.
 ///
 /// `&&` binds tighter than `||`, as in JS, so `a || b && c` is `a || (b && c)`.
-/// Can this condition be evaluated at all?
 ///
-/// The restricted evaluator's errors are all SYNTACTIC — an unknown token,
-/// parentheses, a missing operand — and a selector that resolves to nothing is
-/// `null` rather than an error. So parseability can be decided against a probe
-/// event with no data, which means an author can be told at SAVE time.
-///
-/// That matters because the fail-safe direction is "do not fire". A binding
-/// whose condition will never parse is accepted, looks correct in the list, and
-/// silently does nothing — the trigger bug that is hardest to find. Refusing it
-/// at the moment it is written puts the error where the mistake is.
-pub fn condition_is_evaluatable(expr: &str) -> Result<(), String> {
-    let probe = Event {
-        name: String::new(),
-        source: String::new(),
-        correlation_id: String::new(),
-        idempotency_key: String::new(),
-        data: Value::Null,
-        origin_run: None,
-    };
-    eval_condition(expr, &probe).map(|_| ())
-}
-
+/// Nothing decides anything on this any more: [`evaluate_conditions`] calls it
+/// only to compare with ZIPP's answer. PR9 deletes it, together with
+/// [`split_top`], [`operand`] and [`values_equal`], once every
+/// `condition-shadow` line from the shadow release has been classified.
 pub fn eval_condition(expr: &str, event: &Event) -> Result<bool, String> {
     let expr = expr.trim();
     if expr.is_empty() {
@@ -504,43 +771,7 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    // --- save-time validation ------------------------------------------------
-
-    #[test]
-    fn an_unparseable_condition_is_caught_without_an_event() {
-        // Each of these is a real authoring mistake. Accepting them produces a
-        // binding that looks right and never fires.
-        for bad in [
-            "$event.data.x ==== 1",
-            "(a === 1) && (b === 2)",
-            "$event.data.x ===",
-            "flowId === 'abc'",
-            "",
-        ] {
-            assert!(
-                condition_is_evaluatable(bad).is_err(),
-                "{bad:?} should be refused at save time"
-            );
-        }
-    }
-
-    #[test]
-    fn a_valid_condition_passes_even_though_the_probe_has_no_data() {
-        // A selector resolving to nothing is null, not an error — so validation
-        // must not depend on the event carrying the fields the author names.
-        for good in [
-            "$event.data.callerNumber === '+61400000000'",
-            "event.data.known === true",
-            "event.data.attempts !== 0 && event.name === 'x'",
-            "$event.data.flag",
-        ] {
-            assert!(
-                condition_is_evaluatable(good).is_ok(),
-                "{good:?} should be accepted: {:?}",
-                condition_is_evaluatable(good)
-            );
-        }
-    }
+    // --- fixtures ---------------------------------------------------------
 
     fn event() -> Event {
         Event {
@@ -558,6 +789,23 @@ mod tests {
             }),
             origin_run: None,
         }
+    }
+
+    /// Dispatch with the conditions read the way the RUST grammar reads them.
+    ///
+    /// The ledger, lineage, guard and cap tests below are about `dispatch`, not
+    /// about where its verdicts came from, so this keeps every one of their
+    /// expectations exactly as it was.
+    fn dispatch_rust(
+        l: &mut Ledger,
+        bs: &[TriggerBinding],
+        e: &Event,
+    ) -> Vec<DispatchOutcome> {
+        let verdicts = Verdicts::from_pairs(
+            bs.iter()
+                .filter_map(|b| condition_of(b).map(|expr| (b.id.clone(), rust_shadow(expr, e)))),
+        );
+        dispatch(l, bs, e, &verdicts)
     }
 
     fn binding(id: &str, cond: Option<&str>) -> TriggerBinding {
@@ -762,7 +1010,7 @@ mod tests {
     #[test]
     fn a_matching_binding_reserves_a_run() {
         let mut l = Ledger::new();
-        let out = dispatch(&mut l, &[binding("b1", None)], &event());
+        let out = dispatch_rust(&mut l, &[binding("b1", None)], &event());
         assert_eq!(out.len(), 1);
         match &out[0] {
             DispatchOutcome::Reserved { binding_id, run } => {
@@ -781,7 +1029,7 @@ mod tests {
         let mut l = Ledger::new();
         let mut e = event();
         e.name = "aokie.call.ended".into();
-        assert!(dispatch(&mut l, &[binding("b1", None)], &e).is_empty());
+        assert!(dispatch_rust(&mut l, &[binding("b1", None)], &e).is_empty());
     }
 
     #[test]
@@ -790,8 +1038,8 @@ mod tests {
         // event runs the flow again.
         let mut l = Ledger::new();
         let bs = [binding("b1", None)];
-        let first = dispatch(&mut l, &bs, &event());
-        let second = dispatch(&mut l, &bs, &event());
+        let first = dispatch_rust(&mut l, &bs, &event());
+        let second = dispatch_rust(&mut l, &bs, &event());
         assert!(matches!(first[0], DispatchOutcome::Reserved { .. }));
         assert!(matches!(
             second[0],
@@ -805,7 +1053,7 @@ mod tests {
         let mut l = Ledger::new();
         let mut b = binding("b1", None);
         b.enabled = false;
-        match &dispatch(&mut l, &[b], &event())[0] {
+        match &dispatch_rust(&mut l, &[b], &event())[0] {
             DispatchOutcome::Skipped { reason, .. } => assert_eq!(*reason, SkipReason::Disabled),
             other => panic!("{other:?}"),
         }
@@ -816,7 +1064,7 @@ mod tests {
         let mut l = Ledger::new();
         let mut b = binding("b1", None);
         b.mode = BindingMode::Manual;
-        match &dispatch(&mut l, &[b], &event())[0] {
+        match &dispatch_rust(&mut l, &[b], &event())[0] {
             DispatchOutcome::Skipped { reason, .. } => assert_eq!(*reason, SkipReason::ManualMode),
             other => panic!("{other:?}"),
         }
@@ -827,7 +1075,7 @@ mod tests {
     fn a_false_condition_skips() {
         let mut l = Ledger::new();
         let b = binding("b1", Some("event.data.flowId === 'nope'"));
-        match &dispatch(&mut l, &[b], &event())[0] {
+        match &dispatch_rust(&mut l, &[b], &event())[0] {
             DispatchOutcome::Skipped { reason, .. } => {
                 assert_eq!(*reason, SkipReason::ConditionFalse)
             }
@@ -841,7 +1089,7 @@ mod tests {
         // Fail-safe, and loud: an author must be able to see why nothing fired.
         let mut l = Ledger::new();
         let b = binding("b1", Some("someFunction(event) && whatever"));
-        match &dispatch(&mut l, &[b], &event())[0] {
+        match &dispatch_rust(&mut l, &[b], &event())[0] {
             DispatchOutcome::Skipped {
                 reason: SkipReason::ConditionUnevaluatable { expression, .. },
                 ..
@@ -860,7 +1108,7 @@ mod tests {
         for (i, c) in [Some(""), Some("   "), None].into_iter().enumerate() {
             let mut b = binding("b1", c);
             b.id = format!("blank-{i}");
-            let out = dispatch(&mut l, &[b], &event());
+            let out = dispatch_rust(&mut l, &[b], &event());
             assert!(
                 matches!(out[0], DispatchOutcome::Reserved { .. }),
                 "{c:?} -> {out:?}"
@@ -878,7 +1126,7 @@ mod tests {
                 b
             })
             .collect();
-        let out = dispatch(&mut l, &bs, &event());
+        let out = dispatch_rust(&mut l, &bs, &event());
         let reserved: Vec<&str> = out
             .iter()
             .filter_map(|o| match o {
@@ -909,7 +1157,7 @@ mod tests {
         // b1 starts a run from the call event...
         let mut call = event();
         call.name = "aokie.call.incoming".into();
-        let started = match &dispatch(&mut l, &[binding("b1", None)], &call)[0] {
+        let started = match &dispatch_rust(&mut l, &[binding("b1", None)], &call)[0] {
             DispatchOutcome::Reserved { run, .. } => run.clone(),
             other => panic!("{other:?}"),
         };
@@ -925,7 +1173,7 @@ mod tests {
             depth: 1,
         });
 
-        match &dispatch(&mut l, &bs, &outcome)[0] {
+        match &dispatch_rust(&mut l, &bs, &outcome)[0] {
             DispatchOutcome::Skipped { reason: SkipReason::Guard(r), .. } => {
                 assert!(r.contains("b1"), "{r}")
             }
@@ -943,7 +1191,7 @@ mod tests {
             binding_id: Some("upstream".into()),
             depth: 7,
         });
-        match &dispatch(&mut l, &[binding("b1", None)], &e)[0] {
+        match &dispatch_rust(&mut l, &[binding("b1", None)], &e)[0] {
             DispatchOutcome::Reserved { run, .. } => {
                 assert_eq!(run.lineage.depth, 8, "each hop must increment");
                 assert_eq!(run.lineage.root_run_id.as_deref(), Some("root"));
@@ -973,7 +1221,7 @@ mod tests {
                 binding_id: Some("other".into()),
                 depth,
             });
-            let out = dispatch(&mut l, &bs, &e);
+            let out = dispatch_rust(&mut l, &bs, &e);
             match &out[0] {
                 DispatchOutcome::Reserved { .. } => reserved += 1,
                 DispatchOutcome::Skipped { reason: SkipReason::Guard(_), .. } => break,
@@ -984,6 +1232,7 @@ mod tests {
         }
         assert!(reserved > 0 && reserved <= 17, "reserved {reserved}");
     }
+
 
     #[test]
     fn every_skip_reason_explains_itself() {
@@ -1002,5 +1251,282 @@ mod tests {
             let m = r.message();
             assert!(m.len() > 15, "too terse: {m:?}");
         }
+    }
+
+    // --- conditions on ZIPP -----------------------------------------------
+
+    use crate::bridge::conditions::testing::{guest, FakeHost};
+
+    fn cond(id: &str, expr: &str) -> TriggerBinding {
+        binding(id, Some(expr))
+    }
+
+    #[test]
+    fn every_condition_of_one_event_travels_in_one_batch() {
+        // The host serialises one batch at a time process-wide, so sending a
+        // batch per condition would queue this event's own conditions behind
+        // each other — for conditions that take microseconds.
+        let bs = vec![
+            cond("b1", "event.data.known === true"),
+            binding("b2", None),
+            cond("b3", "event.data.attempts === 2"),
+        ];
+        let host = FakeHost::always(json!(true));
+        evaluate_conditions(&host, &bs, &event());
+
+        let request = host.only_request();
+        assert_eq!(request["v"], 1);
+        let jobs = request["jobs"].as_array().expect("jobs");
+        assert_eq!(jobs.len(), 2, "the unconditioned binding is not a job");
+        assert_eq!(jobs[0]["id"], "c0");
+        assert_eq!(jobs[0]["mode"], "program");
+        assert_eq!(jobs[0]["source"], "event.data.known === true");
+        assert_eq!(jobs[0]["budgetMs"], 250);
+        assert_eq!(jobs[1]["source"], "event.data.attempts === 2");
+    }
+
+    #[test]
+    fn the_condition_sees_the_event_under_both_of_its_names() {
+        // The old grammar accepted `event.…` and `$event.…` alike, and the
+        // trigger editor emits the undollared one. Both names must exist, and
+        // they must be the SAME object, or half the stored conditions stop
+        // resolving and the other half read something different.
+        let host = FakeHost::always(json!(true));
+        let e = event();
+        evaluate_conditions(&host, &[cond("b1", "event.data.known")], &e);
+
+        let globals = host.only_request()["jobs"][0]["globals"].clone();
+        assert_eq!(globals["event"], globals["$event"]);
+        assert_eq!(
+            globals["event"],
+            json!({
+                "name": "aokie.call.incoming",
+                "source": "aokie",
+                "correlationId": "call_1",
+                "idempotencyKey": "aokie:call_1:incoming:v1",
+                "data": e.data,
+            })
+        );
+    }
+
+    #[test]
+    fn only_a_binding_that_could_still_fire_is_evaluated() {
+        let mut disabled = cond("b1", "event.data.known");
+        disabled.enabled = false;
+        let mut manual = cond("b2", "event.data.known");
+        manual.mode = BindingMode::Manual;
+        let mut other_event = cond("b3", "event.data.known");
+        other_event.event = "aokie.call.ended".into();
+        let blank = binding("b4", Some("   "));
+
+        let host = FakeHost::always(json!(true));
+        let verdicts = evaluate_conditions(&host, &[disabled, manual, other_event, blank], &event());
+        assert!(verdicts.is_empty());
+        assert_eq!(host.calls(), 0, "none of these can fire, so none of them costs an engine");
+    }
+
+    #[test]
+    fn zipps_verdict_is_the_one_used_not_the_rust_grammars() {
+        let mut l = Ledger::new();
+        let bs = [cond("b1", "event.data.known === true")];
+
+        // The Rust grammar reads this as TRUE. ZIPP says false, and ZIPP decides.
+        let no = FakeHost::always(json!(false));
+        let verdicts = evaluate_conditions(&no, &bs, &event());
+        match &dispatch(&mut l, &bs, &event(), &verdicts)[0] {
+            DispatchOutcome::Skipped { reason, .. } => assert_eq!(*reason, SkipReason::ConditionFalse),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(l.len(), 0);
+
+        // And an expression the Rust grammar REFUSES outright — parentheses —
+        // which ZIPP evaluates, now fires.
+        let parens = [cond("b2", "(event.data.known === true) && event.data.attempts === 2")];
+        let yes = FakeHost::always(json!(true));
+        let verdicts = evaluate_conditions(&yes, &parens, &event());
+        assert!(matches!(
+            dispatch(&mut l, &parens, &event(), &verdicts)[0],
+            DispatchOutcome::Reserved { .. }
+        ));
+    }
+
+    #[test]
+    fn agreement_leaves_no_shadow_line() {
+        let host = FakeHost::always(json!(true));
+        let verdicts = evaluate_conditions(&host, &[cond("b1", "event.data.known === true")], &event());
+        assert_eq!(verdicts.get("b1"), Some(&Verdict::True));
+        assert!(verdicts.shadow.is_empty(), "a shadow line means the two disagreed");
+    }
+
+    #[test]
+    fn each_class_of_disagreement_produces_its_own_line() {
+        let e = event();
+
+        // (i)/(ii) — a Rust-grammar REFUSAL that ZIPP evaluates. Parentheses are
+        // the commonest: the old evaluator would not group, so it refused.
+        let host = FakeHost::always(json!(true));
+        let v = evaluate_conditions(&host, &[cond("b1", "(event.data.known === true)")], &e);
+        assert_eq!(v.shadow.len(), 1);
+        let line = &v.shadow[0];
+        assert!(line.starts_with("condition-shadow: lane=triggers "), "{line}");
+        assert!(line.contains(r#"binding="b1""#), "{line}");
+        assert!(line.contains("zipp=true rust=unknown refused=rust"), "{line}");
+        assert!(line.contains(r#"expr="(event.data.known === true)""#), "{line}");
+        assert!(line.contains("parentheses"), "the reason has to be classifiable: {line}");
+        assert!(
+            line.contains(r#"key="aokie:call_1:incoming:v1""#),
+            "and the occurrence findable: {line}"
+        );
+
+        // (iii) — a real semantic change. `==` coerced in JavaScript; the Rust
+        // grammar compared JSON values, so `2 == '2'` was FALSE.
+        let v = evaluate_conditions(&host, &[cond("b2", "event.data.attempts == '2'")], &e);
+        assert_eq!(v.shadow.len(), 1);
+        assert!(v.shadow[0].contains("zipp=true rust=false refused=none"), "{}", v.shadow[0]);
+
+        // A condition ZIPP itself refuses, which the Rust grammar read.
+        let throwing = FakeHost::by_source(|_| Err(guest("ReferenceError: x is not defined")));
+        let v = evaluate_conditions(&throwing, &[cond("b3", "event.data.known === true")], &e);
+        assert_eq!(v.shadow.len(), 1);
+        assert!(v.shadow[0].contains("zipp=unknown rust=true refused=zipp"), "{}", v.shadow[0]);
+    }
+
+    #[test]
+    fn a_host_outage_skips_every_conditioned_binding_and_shadows_nothing() {
+        // Fail closed. The Rust grammar is NOT the fallback: it would change
+        // semantics under the user mid-outage, in the firing direction, and it
+        // would fill the shadow log with lines nobody can classify — and any
+        // unclassified line blocks PR9 from deleting the grammar at all.
+        let mut l = Ledger::new();
+        let bs = [cond("b1", "event.data.known === true"), binding("b2", None)];
+        let down = FakeHost::down("the CLI is not installed");
+        let verdicts = evaluate_conditions(&down, &bs, &event());
+
+        assert!(verdicts.shadow.is_empty(), "an outage is an outage, not a disagreement");
+        let out = dispatch(&mut l, &bs, &event(), &verdicts);
+        match &out[0] {
+            DispatchOutcome::Skipped {
+                reason: SkipReason::ConditionUnevaluatable { why, .. },
+                ..
+            } => assert!(why.contains("the CLI is not installed"), "{why}"),
+            other => panic!("a conditioned binding must not fire during an outage: {other:?}"),
+        }
+        assert!(
+            matches!(out[1], DispatchOutcome::Reserved { .. }),
+            "a binding with no condition is unaffected — it never needed the engine"
+        );
+    }
+
+    #[test]
+    fn a_condition_nobody_decided_does_not_fire() {
+        // `dispatch` evaluates nothing, by construction — it holds the ledger
+        // lock. A verdict that never arrived must read as unknown, never true.
+        let mut l = Ledger::new();
+        let bs = [cond("b1", "event.data.known === true")];
+        let out = dispatch(&mut l, &bs, &event(), &Verdicts::default());
+        assert!(matches!(
+            &out[0],
+            DispatchOutcome::Skipped { reason: SkipReason::ConditionUnevaluatable { .. }, .. }
+        ));
+        assert_eq!(l.len(), 0);
+    }
+
+    // --- the one-time `$event` migration ----------------------------------
+
+    #[test]
+    fn a_bare_event_operand_gains_the_data_it_always_meant() {
+        // `resolve_selector` answers `$event` alone with `event.data`, and
+        // `operand` routes a bare `event` to the same arm. ZIPP binds `event` to
+        // the whole envelope, which is truthy even when `data` is not — so
+        // leaving this alone would fire bindings that used to skip.
+        assert_eq!(migrate_condition("$event").as_deref(), Some("$event.data"));
+        assert_eq!(migrate_condition("event").as_deref(), Some("event.data"));
+        assert_eq!(
+            migrate_condition("event && event.data.known === true").as_deref(),
+            Some("event.data && event.data.known === true")
+        );
+        assert_eq!(
+            migrate_condition("$event.data.x === 1 || $event").as_deref(),
+            Some("$event.data.x === 1 || $event.data")
+        );
+    }
+
+    #[test]
+    fn a_condition_already_in_the_new_form_is_not_touched() {
+        // This is what leaves an already-migrated file byte-identical: nothing
+        // changes, so nothing is written and no `.bak` is made.
+        for untouched in [
+            "$event.data",
+            "event.data.known === true",
+            "$event.data.x === 1 && $event.name === 'y'",
+            "$eventually === 1",
+            "event.data.msg === 'event'",
+            "event.data.msg === \"$event\"",
+            "eventCount === 2",
+            "x.event === 1",
+        ] {
+            assert_eq!(migrate_condition(untouched), None, "{untouched:?} must be left alone");
+        }
+    }
+
+    #[test]
+    fn the_migration_is_idempotent() {
+        // It runs on every load. Running it twice must change nothing the
+        // second time, or a user's condition grows a `.data` per boot.
+        for before in [
+            "$event",
+            "event",
+            "event && event.data.known",
+            "$event === null || event",
+            "  event  ",
+            "!event",
+        ] {
+            let once = migrate_condition(before).expect("the first pass rewrites");
+            assert_eq!(migrate_condition(&once), None, "{before:?} -> {once:?} is not stable");
+        }
+    }
+
+    #[test]
+    fn a_quoted_event_is_text_not_an_operand() {
+        // The scan follows `split_top`'s quoting exactly, so the migration and
+        // the evaluator can never disagree about which bytes are code.
+        assert_eq!(migrate_condition("event.data.msg === 'event'"), None);
+        assert_eq!(migrate_condition("event.data.msg === '$event'"), None);
+        assert_eq!(
+            migrate_condition("event === 'event'").as_deref(),
+            Some("event.data === 'event'"),
+            "the operand moves and the literal does not"
+        );
+    }
+
+    #[test]
+    fn migrate_bindings_reports_what_changed_and_leaves_the_rest_alone() {
+        let mut bs = vec![
+            cond("b1", "event && event.data.known"),
+            cond("b2", "event.data.known === true"),
+            binding("b3", None),
+        ];
+        let rewrites = migrate_bindings(&mut bs);
+        assert_eq!(rewrites.len(), 1, "only the binding that changed is reported");
+        assert_eq!(rewrites[0].binding_id, "b1");
+        assert_eq!(rewrites[0].before, "event && event.data.known");
+        assert_eq!(rewrites[0].after, "event.data && event.data.known");
+        assert_eq!(bs[0].condition.as_deref(), Some("event.data && event.data.known"));
+        assert_eq!(bs[1].condition.as_deref(), Some("event.data.known === true"));
+        assert!(bs[2].condition.is_none());
+        // Idempotent at the collection level too.
+        assert!(migrate_bindings(&mut bs).is_empty());
+    }
+
+    #[test]
+    fn input_map_selectors_keep_their_meaning() {
+        // `$event` in an inputMap is resolved by `resolve_selector`, never by an
+        // engine, so `$event` alone still means the data. Rewriting it would
+        // change what a flow receives for no reason at all.
+        let e = event();
+        assert_eq!(resolve_selector("$event", &e), Some(e.data.clone()));
+        let mut map = std::collections::BTreeMap::new();
+        map.insert("all".to_string(), "$event".to_string());
+        assert_eq!(resolve_inputs(&map, &e)["all"], e.data);
     }
 }
