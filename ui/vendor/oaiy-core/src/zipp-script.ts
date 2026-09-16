@@ -23,10 +23,31 @@
  * the guest only as `JSON.stringify` literals, parsed or compiled INSIDE the
  * engine, so a value can never close a string and continue as code. Globals
  * are installed by a bootstrap that keeps only own keys that are identifiers,
- * do not start with `__` and are not `__proto__`/`constructor`/`prototype`.
+ * do not start with `__` and are not `__proto__`/`constructor`/`prototype`;
+ * a key that would shadow a name the envelope's own program uses
+ * (`SCRIPT_REFUSED_GLOBALS`) is refused as `invalid_request` rather than
+ * failing the job as the script's fault.
  * The result comes back through `evalInContext`'s JSON projection and is then
  * sanitised (depth 8, the same three keys dropped, non-JSON → null), so what a
  * host receives is inert data whatever the guest built.
+ *
+ * # What a result is evidence OF
+ *
+ * `ok`, `value` and `error` are what the guest program put in `__replies`, and
+ * `__replies` is an ordinary array at the guest's global scope. A script can
+ * push `{ok: true, value: "forged"}` and then throw, and the host reports
+ * success; it can replace `__emit` outright. `evalInContext` offers no slot
+ * the guest cannot reach, so there is nowhere better to put the channel.
+ *
+ * That is a script lying about ITSELF, inside the sandbox it already owns, so
+ * it is not a boundary being crossed: a requester that supplied the source
+ * cannot be misled about the source by the source. It matters for a requester
+ * that treats `ok: false` as a trustworthy signal about something else — a
+ * condition lane reading "this condition was false" out of a failure, say.
+ * That reading is not supported. What IS host-side, and cannot be forged from
+ * the guest: `errorKind` (from `lastErrorKind`, a trap, or the envelope's own
+ * classification), the engine identity, and the refusal of a malformed
+ * request.
  *
  * # Fail closed
  *
@@ -97,11 +118,14 @@ export interface ScriptJsJob extends ScriptJobBase {
    *   * `body`     `new Function(source)()`: a function body, `return` gives the value
    *   * `auto`     decided by PARSING: a script takes the `program` path, else a function body
    *   * `entry`    `source` declares `entry`; it is called with `args`
-   *   * `parse`    `new Function("return (" + source + ")")`, never invoked
+   *   * `parse`    one expression, never invoked. Parsed by the host's
+   *                  `parseExpression` when it has one, and compiled by the
+   *                  engine as `new Function("return (" + source + ")")`
+   *                  either way
    */
   mode: ScriptJsMode;
   source: string;
-  /** Installed as guest globals (filtered), for every mode. */
+  /** Installed as guest globals (filtered), for every mode. `SCRIPT_REFUSED_GLOBALS` are not allowed. */
   globals?: Record<string, unknown>;
   /** `entry` mode only: the function `source` declares. */
   entry?: string;
@@ -169,6 +193,8 @@ export interface ScriptEngine {
   lastErrorKind(): string;
   setInstructionBudget?(steps: number): boolean;
   renewInstructionBudget?(): boolean;
+  /** Drains the engine's console buffer. Called once per job, for its emptying side effect only. */
+  takeOutput?(): unknown;
   dispose(): void;
   initPythonProject?(files: Record<string, string>, entry: string, argv: string[]): unknown;
   pythonCall?(name: string, args: unknown[]): unknown;
@@ -182,6 +208,26 @@ export interface ScriptRunOptions {
   languages: readonly string[];
   /** A WebAssembly trap poisoned the instance: retire the Worker/instance, not just the Engine. */
   onEngineTrap?: (error: unknown) => void;
+  /**
+   * Parse `source` as ONE expression and throw if it is not; mode `parse`
+   * only.
+   *
+   * Mode `parse` answers "is this a valid expression?", and the engine-side
+   * wrapper cannot answer it: the source is concatenated into
+   * `return (` + source + `)`, so `1); globalThis.pwned = (1` closes the
+   * parenthesis, adds a statement and compiles — `{ok: true, value: null}` for
+   * source that is not an expression at all. (Inert: the function is never
+   * invoked. Wrong, all the same, and a condition lane reading `ok` as "this
+   * expression is well-formed" is reading something that was never checked.)
+   * No purely textual wrapper fixes it — a comma survives every bracket — so
+   * the answer is a parser.
+   *
+   * A host that has one supplies it (`oaiy script` does, from `acorn`); a host
+   * that does not gets the engine's compile alone, and the doc for mode
+   * `parse` says which check it got. A throw is the JOB's failure, `guest`,
+   * never a refusal of the request: answering "no" is what this mode is FOR.
+   */
+  parseExpression?: (source: string) => void;
 }
 
 export interface ScriptHostOptions {
@@ -189,6 +235,8 @@ export interface ScriptHostOptions {
   /** Verifies `profile.preambleSha256`. Without it a request carrying a profile is refused. */
   sha256?: (text: string) => string;
   onEngineTrap?: (error: unknown) => void;
+  /** Passed through to every job: see `ScriptRunOptions.parseExpression`. */
+  parseExpression?: (source: string) => void;
 }
 
 /** Output depth kept; deeper levels become null. */
@@ -206,7 +254,44 @@ const RESERVED_WORDS = new Set([
   'while', 'with', 'yield',
 ]);
 /** Names the envelope's own program binds; a preamble redeclaring one would break the reply channel. */
-export const SCRIPT_ENVELOPE_GLOBALS: readonly string[] = ['__replies', '__emit', '__out', '__ctx', '__args', '__k', '__fn', '__asBody'];
+export const SCRIPT_ENVELOPE_GLOBALS: readonly string[] = [
+  '__replies', '__emit', '__out', '__ctx', '__args', '__k', '__fn', '__asBody',
+  // The intrinsics the envelope snapshots before any requester code runs — see
+  // EMIT_PREAMBLE.
+  '__jsonParse', '__isArray', '__hasOwn',
+];
+
+/**
+ * `globals` keys a request may NOT use.
+ *
+ * `globals` are installed as guest globals, so a key that names something the
+ * envelope's OWN program uses does not shadow it for the script alone — it
+ * shadows it for the envelope. That failed the job as `guest`, and `guest`
+ * means the script's own fault (see the `errorKind` list above), so a
+ * requester was told its script was broken when its REQUEST was:
+ *
+ *   * `{JSON: 1}` — "undefined is not a function", because the bootstrap
+ *     parses `globals` and `args` with it;
+ *   * `{eval: 1}`, `{Function: 1}` — the mode body cannot compile the source;
+ *   * `{Object: 1, b: 2}` — the install loop's own `hasOwnProperty` died
+ *     mid-loop, so `b` was never installed either. `{b: 2, Object: 1}`
+ *     survived only because `Object` happened to be installed last: whether
+ *     the job ran at all depended on key order.
+ *
+ * So they are refused as `invalid_request`, before any Engine exists, in the
+ * same breath as every other malformed request — and the envelope stops
+ * depending on names a guest could reach anyway (EMIT_PREAMBLE's snapshots),
+ * so a `prepare` hook or a profile preamble cannot do it either.
+ *
+ * `protocol/v1/script-request.schema.json` carries the same list, and
+ * `ui/tests/zipp-script.mjs` fails if the two drift.
+ */
+export const SCRIPT_REFUSED_GLOBALS: readonly string[] = [
+  // The envelope's own program depends on these.
+  'Array', 'Function', 'JSON', 'Object', 'RegExp', 'String', 'eval', 'globalThis',
+  // The engine's preamble and the guest shims bind these.
+  'console', 'db', 'host', 'localStorage', 'navigator', 'print', 'window',
+];
 /** The largest `budgetMs` a job may ask a host watchdog for (the schema's ceiling). */
 export const SCRIPT_MAX_BUDGET_MS = 60_000;
 
@@ -374,6 +459,11 @@ function validateJob(raw: unknown, index: number): ScriptJob {
   if (raw.globals !== undefined) {
     if (!isPlainObject(raw.globals)) throw new Invalid(`${where}: globals must be a plain object`);
     requireJson(raw.globals, `${where}: globals`);
+    for (const key of Object.keys(raw.globals)) {
+      if (SCRIPT_REFUSED_GLOBALS.includes(key)) {
+        throw new Invalid(`${where}: globals may not shadow ${JSON.stringify(key)}, which the guest program itself uses`);
+      }
+    }
     job.globals = raw.globals;
   }
   if (mode === 'entry') {
@@ -419,16 +509,48 @@ export function validateScriptRequest(input: unknown, opts: { sha256?: ScriptHos
 // The JS program.
 // ---------------------------------------------------------------------------
 
-/** The reply channel, plus stubs so a guest cannot write anywhere the host reads. */
+/**
+ * The reply channel, the intrinsics the envelope will need later, and the
+ * output stubs.
+ *
+ * `print` IS stubbed: a call reaches this function and writes nothing.
+ * `console` is NOT, whatever this assignment looks like. Measured on v0.0.19:
+ * after it, `String(console.log)` reads back as the stub, and
+ * `console.log("x")` still puts "x" in the engine's own output buffer, where
+ * `takeOutput()` finds it. `zipp-executor.ts`'s module comment says the same
+ * of the intrinsic from the other side. So the assignment is kept for what it
+ * does do — a guest reading or replacing `console` sees the stub, not Zipp's
+ * object — and NOT described as something it does not.
+ *
+ * Nothing crosses to the host either way: the envelope never calls
+ * `takeOutput()` for a result, and `attempt` drains and discards the buffer
+ * once the job has run. What a chatty script DOES hit is the engine's
+ * `lifetimeOutputBytes` (8 MiB on v0.0.19), which draining does not reset —
+ * measured, not assumed: nine 1 MiB rounds with a drain after each still ended
+ * in `RangeError: script exceeded its output budget`, reported as `resource`.
+ * Each job gets a fresh Engine, so the ceiling is per job and a job that hits
+ * it fails on its own account.
+ *
+ * The snapshots are taken HERE, first, before the guest shims, before a
+ * profile preamble, before a `prepare` hook and long before `globals` are
+ * installed — so the bootstrap that parses the request's data and the loop
+ * that installs it hold their own references rather than reading a global
+ * name that anything downstream could have replaced. `SCRIPT_REFUSED_GLOBALS`
+ * already refuses the request that did this; this is what makes the envelope
+ * not depend on that refusal being complete.
+ */
 const EMIT_PREAMBLE = `var __replies = [];
 function __emit(o) { __replies.push(o); }
+var __jsonParse = JSON.parse;
+var __isArray = Array.isArray;
+var __hasOwn = Object.prototype.hasOwnProperty;
 globalThis.print = function () {};
 globalThis.console = { log: function(){}, warn: function(){}, error: function(){}, info: function(){}, debug: function(){} };
 `;
 
 /** Installs `__ctx`'s safe own keys as globals. Same rule as the module comment states. */
 const INSTALL_GLOBALS = `  for (var __k in __ctx) {
-    if (Object.prototype.hasOwnProperty.call(__ctx, __k)
+    if (__hasOwn.call(__ctx, __k)
         && /^[a-zA-Z_$][a-zA-Z0-9_$]*$/.test(__k)
         && __k !== "__proto__" && __k !== "constructor" && __k !== "prototype"
         && __k.indexOf("__") !== 0) {
@@ -459,8 +581,12 @@ function modeBody(job: ScriptJsJob): string {
       return `  var __fn = new Function(${src} + "\\nreturn typeof ${job.entry} === 'function' ? ${job.entry} : null;")();
   __out = {ok: true, value: (typeof __fn === 'function') ? __fn.apply(undefined, __args) : undefined};`;
     case 'parse':
-      // Parsed standalone and never invoked: an unbalanced `}` is a
-      // SyntaxError, not an escape, and a side-effecting expression stays inert.
+      // Compiled by the engine and never invoked: an unbalanced `}` is a
+      // SyntaxError, not an escape, and a side-effecting expression stays
+      // inert. It does NOT prove the source is one expression — the source is
+      // concatenated into this wrapper, so `1); globalThis.pwned = (1` becomes
+      // two perfectly legal statements and compiles. That is what
+      // `ScriptRunOptions.parseExpression` is for, and it runs before this.
       return `  new Function("return (" + ${src} + "\\n);");
   __out = {ok: true, value: null};`;
   }
@@ -489,11 +615,11 @@ export function buildScriptProgram(job: ScriptJsJob, profile?: ScriptProfile): s
 ${profile?.preamble ?? ''}
 var __out;
 try {
-  var __ctx; try { __ctx = JSON.parse(${globals}); } catch (e) { __ctx = {}; }
-  var __args; try { __args = JSON.parse(${args}); } catch (e) { __args = []; }
+  var __ctx; try { __ctx = __jsonParse(${globals}); } catch (e) { __ctx = {}; }
+  var __args; try { __args = __jsonParse(${args}); } catch (e) { __args = []; }
 ${prepare}  if (!__out) {
     if (__ctx === null || typeof __ctx !== 'object') __ctx = {};
-    if (!Array.isArray(__args)) __args = [__args];
+    if (!__isArray(__args)) __args = [__args];
 ${INSTALL_GLOBALS}${modeBody(job)}
   }
 } catch (e) { __out = {ok: false, error: String((e && e.message) || e)}; }
@@ -577,9 +703,27 @@ function attempt(
       }
     }
     init(engine);
+    // Drop whatever the job wrote to the engine's console, and do it HERE:
+    // a JS job's program IS its source, so the guest has already run by the
+    // time `init` returns (measured), and nothing downstream ever reads the
+    // buffer. This does not raise the engine's 8 MiB output ceiling — that is
+    // a lifetime total a drain does not reset — it keeps a job's output from
+    // outliving the job on an engine a host chose to keep.
+    try {
+      engine.takeOutput?.();
+    } catch {
+      // an engine without one, or one already torn down: not the job's problem
+    }
     phase = 'run';
-    // The call is a re-entry: it gets the job's whole budget, not what init left.
-    engine.renewInstructionBudget?.();
+    // The call is a re-entry: it gets the job's whole budget, not what init
+    // left. The engine ANSWERS that request — `false` for a budget already
+    // spent, or a disposed engine — and the answer used to be dropped. The
+    // job would then have run on whatever was left, and failed `resource` on
+    // an entry that had every right to succeed. A renewal that did not happen
+    // is the host's problem and is reported as one.
+    if (engine.renewInstructionBudget && !engine.renewInstructionBudget()) {
+      return { ok: false, kind: 'host', error: 'Zipp would not renew the instruction budget for this call', phase };
+    }
     return { ok: true, value: run(engine) };
   } catch (e) {
     if (isTrap(e)) {
@@ -602,7 +746,24 @@ function attempt(
   }
 }
 
-function runJs(Engine: ScriptEngineCtor, job: ScriptJsJob, steps: number | undefined, profile: ScriptProfile | undefined, onEngineTrap?: (e: unknown) => void): ScriptJobResult {
+function runJs(
+  Engine: ScriptEngineCtor,
+  job: ScriptJsJob,
+  steps: number | undefined,
+  profile: ScriptProfile | undefined,
+  onEngineTrap?: (e: unknown) => void,
+  parseExpression?: (source: string) => void,
+): ScriptJobResult {
+  // Mode `parse`'s real check, when the host has a parser. Before the Engine,
+  // because a source that is not one expression has already failed and there
+  // is nothing to compile it for.
+  if (job.mode === 'parse' && parseExpression) {
+    try {
+      parseExpression(job.source);
+    } catch (e) {
+      return { id: job.id, ok: false, errorKind: 'guest', error: errText(e) };
+    }
+  }
   const program = buildScriptProgram(job, profile);
   const out = attempt(
     Engine,
@@ -677,7 +838,7 @@ export function runScriptJob(Engine: ScriptEngineCtor, job: ScriptJob, opts: Scr
     }
     return runPython(Engine, job, steps, opts.onEngineTrap);
   }
-  return runJs(Engine, job, steps, opts.profile, opts.onEngineTrap);
+  return runJs(Engine, job, steps, opts.profile, opts.onEngineTrap, opts.parseExpression);
 }
 
 /**
@@ -695,6 +856,7 @@ export function runScriptRequest(Engine: ScriptEngineCtor, input: unknown, opts:
   const run: ScriptRunOptions = {
     profile,
     languages: opts.engine.languages,
+    parseExpression: opts.parseExpression,
     onEngineTrap: (e) => {
       trapped = true;
       opts.onEngineTrap?.(e);

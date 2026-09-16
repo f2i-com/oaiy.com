@@ -27,6 +27,10 @@
  * host recycles on; `usage.trapped` is set once a WebAssembly trap has poisoned
  * the instance, after which nothing more should run here.
  *
+ * This shell also supplies the one host-side check the envelope cannot make
+ * for itself: `parseExpression`, which decides mode `parse` with a real parser
+ * rather than a string wrapper (`parseOneExpression`).
+ *
  * The request was validated on the main thread; a job that reaches this thread
  * is well-formed. Whatever else goes wrong — the engine throwing where the
  * envelope did not expect it, a message this shell does not understand — is
@@ -35,6 +39,7 @@
  */
 import { parentPort, workerData } from 'node:worker_threads';
 import { format } from 'node:util';
+import { parseExpressionAt } from 'acorn';
 import { Engine, initSync, zippInstanceUsage, zippProfile } from '../../../ui/vendor/zipp-wasm-python/zipp_wasm.js';
 import {
   runScriptJob,
@@ -94,6 +99,32 @@ function usage(): ScriptWorkerUsage {
 
 const errText = (e: unknown): string => (typeof e === 'string' ? e : e instanceof Error ? e.message || String(e) : String(e));
 
+/**
+ * Mode `parse`'s real check: is `source` ONE expression and nothing else?
+ *
+ * The engine-side wrapper cannot answer that — it concatenates the source into
+ * `return (` + source + `)`, so `1); globalThis.pwned = (1` closes the
+ * parenthesis, adds a statement and compiles, and the job came back
+ * `{ok: true, value: null}` for source that is not an expression at all. No
+ * textual wrapper fixes it (a comma survives every bracket shape), so this
+ * parses.
+ *
+ * `parseExpressionAt` at offset 0, then everything after `node.end` must be
+ * blank: that is what rejects a trailing `; statement`, a stray `)` and a
+ * second comma-joined expression, while leaving a legitimate expression with
+ * trailing whitespace or a newline alone. Acorn parses; it never evaluates,
+ * and Guard A scans the shell it lands in.
+ */
+function parseOneExpression(source: string): void {
+  // `preserveParens`, or `node.end` stops short of a wrapping `)` and a
+  // perfectly ordinary `(function () {})` is reported as two things.
+  const node = parseExpressionAt(source, 0, { ecmaVersion: 'latest', preserveParens: true }) as { end: number };
+  const rest = source.slice(node.end);
+  if (rest.trim() !== '') {
+    throw new SyntaxError(`expected one expression, and ${JSON.stringify(rest.trim().slice(0, 40))} follows it`);
+  }
+}
+
 port.on('message', (raw: unknown) => {
   const message = raw as { type?: unknown; seq?: unknown; job?: ScriptJob; profile?: ScriptProfile } | null;
   if (!message || typeof message !== 'object' || message.type !== 'job') return;
@@ -109,6 +140,7 @@ port.on('message', (raw: unknown) => {
       result = runScriptJob(EngineCtor, message.job, {
         profile: message.profile,
         languages: engine.languages,
+        parseExpression: parseOneExpression,
         onEngineTrap: () => {
           trapped = true;
         },

@@ -934,6 +934,12 @@ async fn runtime_status(State(st): State<BridgeState>) -> axum::response::Respon
     // CLI answering that it runs flows on ZIPP. A resolved CLI whose engine is
     // missing fails every run `runtime_unavailable`; saying "ready" over that
     // sends the user hunting for a link problem.
+    //
+    // The probe's `Ready` answer is not kept for ever on this claim's account:
+    // a RUN that comes back `Unavailable` replaces it (worker.rs,
+    // `remember_run_refusal`), so an engine that broke under an unchanged
+    // `oaiy.mjs` — a quarantined or half-replaced wasm — turns this to
+    // `unavailable` on the next poll rather than at the next restart.
     let ready = cli.is_some() && node_ok && engine_ready;
     (
         StatusCode::OK,

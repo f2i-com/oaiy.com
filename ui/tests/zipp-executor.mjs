@@ -470,6 +470,92 @@ console.log('\ntrusted-flow shims reach dynamic code');
 }
 
 // ---------------------------------------------------------------------------
+// 5d. Trusted flows: Zipp's own sync host bridge is shadowed too.
+// ---------------------------------------------------------------------------
+// `__zippHostCall` is bound by the ENGINE's preamble at global scope (it is in
+// `ZIPP_PREAMBLE_GLOBALS`). The wrapper's `var __zippHostCall = undefined`
+// lives inside the IIFE, so it covered the flow's own program and nothing
+// else: a body compiled at run time runs at global scope and reached the real
+// bridge, and the `__z*` queue internals beside it. Denied today — the
+// embedder never calls `setSyncHostCapabilities`, so a call comes back as a
+// guest-catchable "unknown host call" — which makes it a misleading
+// affordance now and a boundary the day a host installs a sync capability.
+//
+// This is the GATE that decided the placement, kept as the permanent record,
+// the same way 5c keeps `setTimeout`'s. The risk was specific and not
+// reasonable to argue: if the engine's own host.call / queue machinery
+// resolved `__zippHostCall` by free-variable lookup at call time, a top-level
+// `var` of that name would break EVERY trusted flow. So the three things that
+// had to hold, on both installs, before it shipped:
+//
+//   A. an ordinary `host.call` round trip still completes and the pump loop
+//      still finishes with the right value;
+//   B. a body compiled AT RUN TIME that itself makes a host call still works
+//      — the whole reason trusted flows get top-level shims;
+//   C. the shadow actually took: a dynamically compiled body, and a recovered
+//      global, read `undefined` rather than a function. (A non-writable
+//      intrinsic would leave the assignment a silent sloppy-mode no-op, which
+//      is exactly the failure 5c was written to notice.)
+//
+// A release that made the bridge resolve the name late, or made it
+// non-writable, fails HERE rather than in a flow.
+console.log('\ntrusted-flow sync host bridge is shadowed');
+{
+  const { value, error, calls } = await runFlow(
+    `       let workflow_context = {};
+       const a = yield Utility.httpRequest("https://one.test");
+       workflow_context.a = a.body;
+       // B: a body compiled at run time that does a host call of its own.
+       Function("host", "host.call('__system.console', ['log', JSON.stringify(['dyn'])], undefined); return 1;")(host);
+       workflow_context.dyn = "called";
+       // A: the pump keeps working after it.
+       const b = yield Utility.httpRequest("after");
+       workflow_context.b = b.body;
+       // C: is the name shadowed where a dynamic body would find it?
+       const g = Function("return this")();
+       workflow_context.probe = {
+         dynamic: Function("return typeof __zippHostCall")(),
+         recovered: typeof g.__zippHostCall,
+         lexical: typeof __zippHostCall,
+       };`,
+    { broker: okBroker, hardened: false },
+  );
+  console.log(`  observed: error=${JSON.stringify(error)} calls=${calls} probe=${JSON.stringify(value?.probe)}`);
+  const p = value?.probe ?? {};
+  check('trusted: A — the pump loop still completes end to end with the bridge shadowed',
+    !error && value?.a === 'alpha beta' && value?.b === 'alpha beta' && calls >= 2,
+    `${error ?? ''} calls=${calls} ${JSON.stringify(value)}`);
+  check('trusted: B — a runtime-compiled body making a host call still works',
+    value?.dyn === 'called', JSON.stringify(value?.dyn));
+  check('trusted: C — a runtime-compiled body reads __zippHostCall as undefined',
+    p.dynamic === 'undefined', JSON.stringify(p.dynamic));
+  check('trusted: C — a RECOVERED global carries undefined, not the bridge',
+    p.recovered === 'undefined', JSON.stringify(p.recovered));
+  check('trusted: C — the flow\'s own program sees it undefined, as it always did',
+    p.lexical === 'undefined', JSON.stringify(p.lexical));
+  // What this does NOT cover, stated rather than implied: the queue internals
+  // beside the bridge (`__zPeekHostCalls`, `__zCommitHostCalls`,
+  // `__zRejectHostCall`, `__zResolveHostCall`, `__zCancelHostCall`,
+  // `__zHostCbs`, `__zHostQueue`, `__zHostPending`) are still on a recovered
+  // global, as are `db`, `host`, `localStorage`, `window` and `navigator`.
+  // They are the engine's own machinery, they let a guest corrupt only its own
+  // queue (host_result ids are the worker loop's counter), and shadowing them
+  // has not been gated. Recorded, not asserted away.
+  const reach = await runFlow(
+    `       let workflow_context = {};
+       yield Utility.httpRequest("x");
+       const g = Function("return this")();
+       workflow_context.names = Object.getOwnPropertyNames(g)
+         .filter(k => /^__z|^(db|host|localStorage|window|navigator)$/.test(k)).sort();`,
+    { broker: okBroker, hardened: false },
+  );
+  console.log(`  still reachable from a recovered global: ${JSON.stringify(reach.value?.names)}`);
+  check('trusted: the shadow covers __zippHostCall and claims nothing about the rest',
+    Array.isArray(reach.value?.names) && !reach.value.names.includes('__zippHostCall'),
+    JSON.stringify(reach.value?.names));
+}
+
+// ---------------------------------------------------------------------------
 // 6. A runaway script stops on its own.
 // ---------------------------------------------------------------------------
 // The V8 path has no equivalent: an infinite loop there pins the Worker until

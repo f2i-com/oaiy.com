@@ -190,6 +190,42 @@ try {
   assert.deepEqual(response.results.map((r) => r.id), request.jobs.map((j) => j.id), 'results keep request order');
   console.log('PASS: script --request runs JavaScript and a Python project on the staged engine; the response validates and names the staged engine');
 
+  // mode `parse` answers with a PARSER, not a string wrapper.
+  //
+  // The engine-side wrapper compiles `return (` + source + `)`, so a source
+  // that closes the parenthesis and adds a statement compiles and the job
+  // came back `{ok: true, value: null}` for source that is not an expression
+  // at all. Inert — the function is never invoked — but a condition lane
+  // reading `ok` as "this expression is well-formed" was reading something
+  // nobody had checked. `script-worker.ts` supplies `parseExpressionAt`.
+  const parseReq = await writeJson('parse-request.json', { v: 1, jobs: [
+    { id: 'ok', mode: 'parse', source: 'inputs.n > 5' },
+    { id: 'parens', mode: 'parse', source: '(function () { return 1; })' },
+    { id: 'object', mode: 'parse', source: '{ a: 1, b: [2, 3] }' },
+    { id: 'injected', mode: 'parse', source: '1); globalThis.pwned = (1' },
+    { id: 'two', mode: 'parse', source: '1; 2' },
+    { id: 'trailing', mode: 'parse', source: '1), (2' },
+    { id: 'garbage', mode: 'parse', source: '}' },
+    // Nothing a `parse` job names may RUN, whatever the parser says.
+    { id: 'inert', mode: 'parse', source: 'globalThis.parseRan = 1' },
+    { id: 'after', mode: 'program', source: 'typeof globalThis.parseRan' },
+  ] });
+  const parsed = await run(['script', '--request', parseReq]);
+  assert.equal(parsed.code, 0, `script failed: ${parsed.stderr}`);
+  const parseResp = JSON.parse(parsed.stdout);
+  assert.ok(validResult(parseResp), `the response does not validate: ${parsed.stdout}`);
+  const p = Object.fromEntries(parseResp.results.map((r) => [r.id, r]));
+  for (const id of ['ok', 'parens', 'object', 'inert']) {
+    assert.deepEqual(p[id], { id, ok: true, value: null }, `${id} is one expression`);
+  }
+  for (const id of ['injected', 'two', 'trailing', 'garbage']) {
+    assert.equal(p[id].ok, false, `${id} is not one expression: ${JSON.stringify(p[id])}`);
+    assert.equal(p[id].errorKind, 'guest', `${id} is the script's fault, not a refusal: ${JSON.stringify(p[id])}`);
+  }
+  assert.match(p.injected.error, /follows it/, `the injected statement is named: ${p.injected.error}`);
+  assert.deepEqual(p.after, { id: 'after', ok: true, value: 'undefined' }, 'a parse job never runs its source');
+  console.log('PASS: mode parse accepts one expression and refuses an injected statement as guest, without running either');
+
   // -o writes the same response and leaves stdout empty.
   const outFile = path.join(dir, 'response.json');
   const toFile = await run(['script', '--request', reqFile, '-o', outFile]);

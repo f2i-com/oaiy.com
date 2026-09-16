@@ -11,6 +11,8 @@ import fs from 'node:fs';
 import { version } from '../package.json';
 import { loadFlowFile, discoverInputs, parseInputs, gatherConstants } from './flow-io';
 import { registerManageCommands } from './manage';
+// Node builtins only (see its imports), so a `--help` still costs nothing.
+import { EngineUnavailableError } from './zipp/artifact';
 
 // Make stdout/stderr writes blocking so an explicit process.exit() never
 // truncates buffered output (on Windows, writes to a pipe are async). The
@@ -30,8 +32,25 @@ for (const m of ['log', 'info', 'debug'] as const) {
   console[m] = (...args: unknown[]) => console.error(...args);
 }
 
-/** The engine's step ceiling and default, recorded from its PROFILE.json at build time. */
+/**
+ * The engine's step ceiling and default, recorded from its PROFILE.json at
+ * build time.
+ *
+ * `typeof` first, exactly as `capabilities.ts` and `artifact.ts` guard their
+ * own defines. This read the define bare, so a bundle built outside
+ * `cli/esbuild.mjs` threw a ReferenceError out of an argument parser: exit 1,
+ * no result file, and the Desktop's bridge lane reporting a retryable
+ * `Failed{}` with a stderr tail for a build that simply has no engine.
+ * `capabilities.ts` OWNS this figure, but that module pulls the script host in
+ * with it and this is a `--help`-weight argument parser, so the read stays
+ * here and only the guard is shared.
+ */
 function runLimits(): { defaultInstructionSteps: number; maxInstructionSteps: number } {
+  if (typeof __ZIPP_RUN_LIMITS__ !== 'string') {
+    throw new EngineUnavailableError(
+      'ZIPP engine unavailable: this build recorded no run limits (not built by cli/esbuild.mjs)',
+    );
+  }
   return JSON.parse(__ZIPP_RUN_LIMITS__);
 }
 

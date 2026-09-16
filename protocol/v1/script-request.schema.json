@@ -91,14 +91,35 @@
             "entry",
             "parse"
           ],
-          "description": "`program`: indirect eval, completion value. `body`: `new Function(source)()`. `auto`: decided by parsing, a script or else a function body. `entry`: `source` declares `entry`, called with `args`. `parse`: compiled as an expression, never invoked."
+          "description": "`program`: indirect eval, completion value. `body`: `new Function(source)()`. `auto`: decided by parsing, a script or else a function body. `entry`: `source` declares `entry`, called with `args`. `parse`: ONE expression, never invoked — parsed by the runner (`oaiy script` uses acorn, so `1); x = (1` is `ok: false`) and compiled by the engine."
         },
         "source": {
           "type": "string"
         },
         "globals": {
           "type": "object",
-          "description": "Installed as guest globals: own keys that are identifiers, do not start with `__` and are not `__proto__`/`constructor`/`prototype`."
+          "propertyNames": {
+            "not": {
+              "enum": [
+                "Array",
+                "Function",
+                "JSON",
+                "Object",
+                "RegExp",
+                "String",
+                "eval",
+                "globalThis",
+                "console",
+                "db",
+                "host",
+                "localStorage",
+                "navigator",
+                "print",
+                "window"
+              ]
+            }
+          },
+          "description": "Installed as guest globals: own keys that are identifiers, do not start with `__` and are not `__proto__`/`constructor`/`prototype`. A key that would shadow a name the runner's own guest program uses is refused as `invalid_request` — the request is malformed, not the script — and the list here is `SCRIPT_REFUSED_GLOBALS` in `zipp-script.ts`, which a test holds to this one."
         },
         "entry": {
           "$ref": "#/$defs/identifier"

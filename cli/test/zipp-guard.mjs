@@ -146,6 +146,30 @@ try {
   assert.deepEqual(armedReport.summary, [{ threadId: 0, count: 3 }]);
   console.log('PASS: the tripwire counts new Function, eval and a recovered AsyncFunction, and skips the logger probe');
 
+  // --- B0b. The two ways a string becomes code WITHOUT asking Function ----
+  // A review walked both past this guard. A `worker_threads` Worker with
+  // `{ eval: true }` compiles its source in another thread, which never asks
+  // this process for `Function`; `process.binding('contextify')` hands back
+  // the compiler itself. Both are now recorded — and an ordinary Worker, by
+  // path, still is NOT, which is what keeps the canary's "0 calls" meaningful,
+  // since the CLI spawns its own ZIPP and script workers exactly that way.
+  const trips2 = path.join(dir, 'trips2.mjs');
+  const plainWorker = path.join(dir, 'plain-worker.mjs');
+  await fs.writeFile(plainWorker, 'process.exit(0);\n');
+  await fs.writeFile(trips2, [
+    "import { Worker } from 'node:worker_threads';",
+    "await new Promise((r) => { const w = new Worker('1 + 1', { eval: true }); w.on('exit', r); });",
+    `await new Promise((r) => { const w = new Worker(${JSON.stringify(plainWorker)}); w.on('exit', r); });`,
+    "try { process.binding('contextify'); } catch {}",
+  ].join('\n') + '\n');
+  const armed2 = await node(['--import', pathToFileURL(tripwire).href, trips2]);
+  assert.equal(armed2.code, 0, `the tripwire broke the program it watched: ${armed2.stderr}`);
+  const report2 = tripwireReport(armed2.stderr);
+  const main2 = report2.calls.filter((c) => c.threadId === 0).map((c) => c.what);
+  assert.deepEqual(main2, ['new Worker({ eval: true })', 'process.binding()'],
+    `the tripwire counted ${JSON.stringify(report2.calls)}`);
+  console.log('PASS: the tripwire counts a worker_threads Worker with eval: true and process.binding, and not a Worker spawned by path');
+
   // --- B + C. The canary, under the tripwire, with the token in the env ---
   const outFile = path.join(dir, 'canary.json');
   const res = await run(cli, canary, ['--timeout', '30', '-o', outFile], { OAIY_SERVER_TOKEN: CANARY }, { tripwire: true, killAfterMs: 60_000 });

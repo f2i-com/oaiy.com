@@ -58,6 +58,18 @@ export async function createCliEngine(opts: CliEngineOptions = {}): Promise<JobM
   // report the host engine (`typeof process === 'object'`) when a flow does
   // run on it — which is what makes the production bundle's `'undefined'`
   // evidence rather than a tautology. No flag, option or variable reaches it.
+  // `typeof` first, as `artifact.ts` guards its own two defines. Without it, a
+  // bundle built outside `cli/esbuild.mjs`'s `commonBuildOptions` threw a bare
+  // ReferenceError from here: `runFlow` rethrows anything that is not an
+  // `EngineUnavailableError`, so the CLI exited 1 with no result file and the
+  // Desktop's bridge lane reported `Failed{}` — retryable, with a stderr tail
+  // — for a build that has no engine at all. Fail-closed either way, but under
+  // the wrong code and wrongly worth retrying.
+  if (typeof __OAIY_TEST_ALLOW_V8__ !== 'boolean') {
+    throw new EngineUnavailableError(
+      'ZIPP engine unavailable: this build carries no engine wiring (not built by cli/esbuild.mjs)',
+    );
+  }
   const hostEngine = __OAIY_TEST_ALLOW_V8__ && createEngine({ ...engineOptions, requireScriptExecutor: false });
   if (hostEngine) return hostEngine;
   const artifact = await loadZippArtifact();
