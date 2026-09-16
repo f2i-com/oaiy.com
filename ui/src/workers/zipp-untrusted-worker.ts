@@ -6,12 +6,15 @@
  * own flows as-is. The `hardened` flag on the init message is the only
  * difference the engine sees; see `buildZippScript`.
  *
- * It is a shell. Everything interesting — the script wrapper and the pump loop
- * Zipp leaves to its embedder — lives in `oaiy-core/src/zipp-executor.ts`, so
- * it can be tested under Node against the real WebAssembly module without a
- * browser (see `ui/tests/zipp-executor.mjs`). What this file adds is the two
- * things only the bundler can provide: the module URL of the engine glue and
- * the URL of the `.wasm` beside it.
+ * It is a shell. Everything interesting lives in oaiy-core, so it can be
+ * tested under Node against the real WebAssembly module without a browser
+ * (see `ui/tests/zipp-executor.mjs`): the script wrapper and the pump loop
+ * Zipp leaves to its embedder in `zipp-executor.ts`, and the worker side of
+ * the message protocol — init once, `host_call`/`host_result` bookkeeping,
+ * abort, `ready` — in `zipp-worker-loop.ts`, which the Node CLI's
+ * `worker_threads` shell serves over the same loop. What this file adds is
+ * the two things only the bundler can provide: the module URL of the engine
+ * glue and the URL of the `.wasm` beside it.
  *
  * The protocol is `untrusted-executor.ts`'s, unchanged, so the main thread does
  * not know or care which engine answered:
@@ -49,105 +52,22 @@
 
 import init, { Engine } from '../../vendor/zipp-wasm/zipp_wasm.js';
 import wasmUrl from '../../vendor/zipp-wasm/zipp_wasm_bg.wasm?url';
-import {
-  buildZippScript,
-  ZippSession,
-  type ZippConsoleLevel,
-  type ZippEngine,
-} from 'oaiy-core/src/zipp-executor';
+import { type ZippEngine } from 'oaiy-core/src/zipp-executor';
+import { serveZippWorkflow } from 'oaiy-core/src/zipp-worker-loop';
 
-interface InitMessage {
-  type: 'init';
-  script: string;
-  hardened?: boolean;
-}
-
-type Incoming =
-  | InitMessage
-  | { type: 'host_result'; id: number; result: unknown }
-  | { type: 'abort' };
-
-/** Resolvers for `host_call`s awaiting a `host_result` from the main thread. */
-const pending = new Map<number, (result: unknown) => void>();
-let nextCallId = 1;
-let session: ZippSession | null = null;
-let started = false;
-
-function post(message: unknown): void {
-  (self as unknown as Worker).postMessage(message);
-}
-
-/**
- * Round-trip one module call to the main thread's broker. Never rejects: a
- * broker failure comes back as `{ __error__ }`, which `__step` turns into a
- * throw at the guest's `await` site. Rejecting here instead would surface as a
- * trapped workflow rather than a catchable error inside the script.
- */
-function callHost(kind: string, args: string[]): Promise<unknown> {
-  return new Promise(resolve => {
-    const id = nextCallId++;
-    pending.set(id, resolve);
-    post({ type: 'host_call', id, kind, args });
-  });
-}
-
-self.addEventListener('message', (event: MessageEvent<Incoming>) => {
-  const message = event.data;
-  if (!message || typeof message !== 'object') return;
-
-  if (message.type === 'host_result') {
-    const resolve = pending.get(message.id);
-    if (resolve) {
-      pending.delete(message.id);
-      resolve(message.result);
-    }
-    return;
-  }
-
-  if (message.type === 'abort') {
-    session?.abort();
-    return;
-  }
-
-  if (message.type === 'init') {
-    // The main thread posts `init` exactly once per Worker. Guard anyway: a
-    // second compile would run a second workflow against the same host bridge
-    // and interleave two sets of results into one flow.
-    if (started) return;
-    started = true;
-    void run(message);
-  }
-});
-
-async function run(message: InitMessage): Promise<void> {
-  let engine: Engine | null = null;
-  try {
+// The handler is registered synchronously, here at module evaluation: the
+// main thread posts `init` the moment the Worker exists and nothing waits for
+// `ready`, so the WebAssembly module is loaded inside `createEngine` — after
+// `init` has arrived — rather than behind a top-level await in front of the
+// listener. No instruction budget is passed: the browser runs on the engine's
+// default, as it always has.
+serveZippWorkflow(
+  {
+    post: message => (self as unknown as Worker).postMessage(message),
+    onMessage: callback => self.addEventListener('message', event => callback(event.data)),
+  },
+  async () => {
     await init({ module_or_path: wasmUrl });
-    engine = new Engine();
-
-    session = new ZippSession(engine as unknown as ZippEngine, {
-      onHostCall: callHost,
-      onConsole: (level: ZippConsoleLevel, args: string[]) =>
-        post({ type: 'console', level, args }),
-      onFinish: (value: unknown) => post({ type: 'finish', value }),
-      onError: (msg: string) => post({ type: 'finish_error', message: msg }),
-    });
-
-    await session.run(buildZippScript(message.script, message.hardened !== false));
-  } catch (e) {
-    post({
-      type: 'finish_error',
-      message: `Zipp worker failed: ${e instanceof Error ? e.message : String(e)}`,
-    });
-  } finally {
-    // Best-effort: a trapped Engine throws here, and there is nothing useful to
-    // do about it — the main thread terminates this Worker either way.
-    try {
-      engine?.dispose();
-    } catch {
-      /* trapped instance; the Worker is discarded next */
-    }
-  }
-}
-
-post({ type: 'ready' });
+    return new Engine() as unknown as ZippEngine;
+  },
+);

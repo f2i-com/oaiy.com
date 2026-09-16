@@ -32,6 +32,9 @@ import {
   detectZippPreambleCollision,
   ZippSession,
 } from '../vendor/oaiy-core/src/zipp-executor.ts';
+// The mirrored engine limits, through the namespace so a build without them
+// fails its own check below rather than the whole file's import.
+import * as executor from '../vendor/oaiy-core/src/zipp-executor.ts';
 // The REAL trampoline, not a copy. A copy is how the `__gen.throw` resume bug
 // stayed invisible: the test agreed with itself.
 import { WORKFLOW_TRAMPOLINE } from '../vendor/oaiy-core/src/workflow-trampoline.ts';
@@ -211,7 +214,7 @@ ${WORKFLOW_TRAMPOLINE}
  * Run one workflow the way the Worker does. `broker` receives (kind, args) and
  * may be async — the round trip is what proves the guest survives a real await.
  */
-async function runFlow(body, { broker, hardened = true, shim, abortAfter } = {}) {
+async function runFlow(body, { broker, hardened = true, shim, abortAfter, instructionBudgetSteps } = {}) {
   const engine = new Engine();
   const logs = [];
   let value, error;
@@ -227,7 +230,7 @@ async function runFlow(body, { broker, hardened = true, shim, abortAfter } = {})
     onConsole: (level, args) => logs.push(`${level}:${args.join(' ')}`),
     onFinish: v => { value = v; },
     onError: m => { error = m; },
-  });
+  }, { instructionBudgetSteps });
 
   try {
     await session.run(buildZippScript(fullScript(body, { shim, hardened }), hardened));
@@ -436,6 +439,96 @@ console.log('\ninstruction budget');
 }
 
 // ---------------------------------------------------------------------------
+// 6b. A host-set instruction budget.
+// ---------------------------------------------------------------------------
+// The browser runs on the engine's default; the CLI (and FormLogic's lanes
+// through it) size the budget per run. The session sets it BEFORE initScript,
+// and the engine's renewal restores that size — so it bounds every step, not
+// the top level alone and not the whole workflow.
+//
+// Iteration counts below come from measuring the engine: one `while` iteration
+// costs about 7 steps on both installs, so 2M steps is roughly 285k iterations.
+// 200k (~1.4M) fits one step with margin; two of them (~2.8M) need the renewal;
+// 600k (~4.2M) must fail under 2M but fits the 50M default; 3M (~21M) fails
+// under 2M and completes under the default.
+console.log('\ninstruction budget (host-set)');
+{
+  check('the mirrored maximum is the running engine\'s maxInstructionBudgetSteps',
+    executor.ZIPP_MAX_INSTRUCTION_BUDGET_STEPS === profile.limits?.maxInstructionBudgetSteps,
+    `${executor.ZIPP_MAX_INSTRUCTION_BUDGET_STEPS} vs ${profile.limits?.maxInstructionBudgetSteps}`);
+  const hooks = { onHostCall: async () => ({}), onConsole: () => {}, onFinish: () => {}, onError: () => {} };
+  const refused = steps => {
+    const engine = new Engine();
+    try {
+      new ZippSession(engine, hooks, { instructionBudgetSteps: steps });
+      return false;
+    } catch (e) {
+      return e instanceof RangeError;
+    } finally {
+      try { engine.dispose(); } catch { /* ignore */ }
+    }
+  };
+  // The engine clamps these silently (0 to one step, above the maximum to the
+  // maximum, NaN to the default); the session refuses them instead.
+  check('a budget of 0 is refused', refused(0));
+  check('a budget above the maximum is refused', refused(profile.limits.maxInstructionBudgetSteps + 1));
+  check('a fractional budget is refused', refused(1.5));
+  check('a budget of 1 is accepted', !refused(1));
+  check('the maximum itself is accepted', !refused(profile.limits.maxInstructionBudgetSteps));
+
+  const spin = n => `for (let i = 0; i < ${n}; i++) {}`;
+  const started = Date.now();
+  const bounded = await runFlow(
+    `       let workflow_context = {};
+       yield Utility.httpRequest("x");
+       ${spin(3_000_000)}
+       workflow_context.done = true;`,
+    { broker: okBroker, instructionBudgetSteps: 2_000_000 },
+  );
+  check('a 3M-iteration step is stopped under a 2M-step budget', !!bounded.error && /budget/i.test(bounded.error), bounded.error ?? JSON.stringify(bounded.value));
+  check('stopped promptly', Date.now() - started < 30_000, `${Date.now() - started}ms`);
+
+  const unbounded = await runFlow(
+    `       let workflow_context = {};
+       yield Utility.httpRequest("x");
+       ${spin(3_000_000)}
+       workflow_context.done = true;`,
+    { broker: okBroker },
+  );
+  check('the same step completes on the engine default when no budget is set', !unbounded.error && unbounded.value?.done === true, unbounded.error);
+
+  const renewed = await runFlow(
+    `       let workflow_context = {};
+       yield Utility.httpRequest("x");
+       ${spin(200_000)}
+       console.log("s1");
+       yield Utility.httpRequest("y");
+       ${spin(200_000)}
+       console.log("s2");
+       yield Utility.httpRequest("z");
+       workflow_context.done = true;`,
+    { broker: okBroker, instructionBudgetSteps: 2_000_000 },
+  );
+  check('two consecutive steps that together exceed the budget complete (it is renewed per step)',
+    !renewed.error && renewed.value?.done === true && renewed.logs.join('|') === 'log:s1|log:s2',
+    renewed.error ?? renewed.logs.join('|'));
+
+  const restored = await runFlow(
+    `       let workflow_context = {};
+       yield Utility.httpRequest("x");
+       ${spin(200_000)}
+       console.log("s1");
+       yield Utility.httpRequest("y");
+       ${spin(600_000)}
+       workflow_context.done = true;`,
+    { broker: okBroker, instructionBudgetSteps: 2_000_000 },
+  );
+  check('renewal restores the host\'s size, not the default: a later over-budget step still stops',
+    !!restored.error && /budget/i.test(restored.error) && restored.logs.join('|') === 'log:s1',
+    restored.error ?? JSON.stringify(restored.value));
+}
+
+// ---------------------------------------------------------------------------
 // 7. Guards.
 // ---------------------------------------------------------------------------
 console.log('\nguards');
@@ -462,6 +555,188 @@ check(
   try { engine.dispose(); } catch { /* ignore */ }
   check('a script that never signals completion is reported, not hung',
     !!error && /stalled/i.test(error), error);
+}
+
+// ---------------------------------------------------------------------------
+// 8. A drain the engine cuts short is finished, not mistaken for a stall.
+// ---------------------------------------------------------------------------
+// One drain pass is bounded in requests and in bytes of work. Console lines
+// ride the same queue and never wait for an answer, so a burst of large lines
+// between two awaits fills the pass with console calls: the pump forwards them
+// all, re-enters nothing, and finds `pending` empty while the guest's real
+// `host.call` is still behind the cut — "Workflow stalled", with a workflow
+// that was doing exactly what it should. The status-bearing drain says
+// `hasMore`; the session has to keep going.
+//
+// The cut is by BYTES here, not count: `hostCallQueue` and
+// `hostCallDrainRequests` are both 4096, so 10,000 short lines would hit the
+// guest queue ceiling as a resource error before any truncation. 20 KiB lines
+// reach the work-bytes ceiling at 1,635 per pass on both installs (measured;
+// `stopReason: 'work-limit'`), so N = 2000 is comfortably past it and under
+// the queue ceiling.
+console.log('\nbounded drain');
+const BURST_LINES = 2000;
+const BURST_LINE = 'var s = "x"; while (s.length < 20480) s += s; s = s.slice(0, 20480);';
+{
+  check('the mirrored attempt ceiling is the running engine\'s hostCallDrainAttempts',
+    executor.ZIPP_HOST_CALL_DRAIN_ATTEMPTS === profile.limits?.hostCallDrainAttempts,
+    `${executor.ZIPP_HOST_CALL_DRAIN_ATTEMPTS} vs ${profile.limits?.hostCallDrainAttempts}`);
+
+  // The shape the session reads, from the real engine rather than the `.d.ts`
+  // (which says `any`): `{ calls, hasMore, stopReason }`.
+  const engine = new Engine();
+  engine.initScript('host.call("a", ["1"], function(){});');
+  const status = engine.drainPendingHostCallsStatus();
+  check('drainPendingHostCallsStatus returns { calls, hasMore, stopReason }',
+    Array.isArray(status?.calls) && status.calls.length === 1 && status.calls[0].kind === 'a'
+      && status.hasMore === false && status.stopReason === 'empty',
+    JSON.stringify(status));
+  try { engine.dispose(); } catch { /* ignore */ }
+
+  // The burst really is cut: the first pass delivers fewer than N and says so.
+  // (A fresh engine: one initScript per instance.)
+  const burst = new Engine();
+  burst.initScript(`${BURST_LINE}
+    for (var i = 0; i < ${BURST_LINES}; i++) host.call("__system.console", ["log", JSON.stringify([s])], undefined);`);
+  const first = burst.drainPendingHostCallsStatus();
+  check(`a pass over ${BURST_LINES} x 20 KiB console lines is cut short (bytes, not count)`,
+    first?.hasMore === true && first.calls.length < BURST_LINES && first.calls.length < profile.limits.hostCallDrainRequests,
+    `delivered ${first?.calls?.length} of ${BURST_LINES}, hasMore ${first?.hasMore}, stopReason ${first?.stopReason}`);
+  let passes = 1;
+  while (burst.drainPendingHostCallsStatus().hasMore) passes++;
+  try { burst.dispose(); } catch { /* ignore */ }
+  console.log(`  (first pass delivered ${first.calls.length} lines; ${passes + 1} passes to empty)`);
+
+  const { value, error, logs } = await runFlow(
+    `       let workflow_context = {};
+       yield Utility.httpRequest("x");
+       ${BURST_LINE}
+       for (let i = 0; i < ${BURST_LINES}; i++) console.log(s);
+       const r = yield Utility.httpRequest("y");
+       workflow_context.after = r.body;`,
+    { broker: okBroker },
+  );
+  check('a workflow whose console burst overran one drain pass completes', !error && value?.after === 'alpha beta', error);
+  check('every line of the burst was forwarded', logs.length === BURST_LINES, `${logs.length} lines`);
+}
+
+// ---------------------------------------------------------------------------
+// 9. The worker loop, over an in-memory port.
+// ---------------------------------------------------------------------------
+// `serveZippWorkflow` is the worker side of the protocol, shared by the browser
+// Worker shell and the CLI's worker_threads shell. Driven here with a port
+// that is two functions, against the real engine: the same bytes that cross a
+// `postMessage` cross here.
+console.log('\nworker loop');
+let serveZippWorkflow;
+try {
+  ({ serveZippWorkflow } = await import('../vendor/oaiy-core/src/zipp-worker-loop.ts'));
+  check('zipp-worker-loop.ts loads under Node', typeof serveZippWorkflow === 'function');
+} catch (e) {
+  check('zipp-worker-loop.ts loads under Node', false, e.message);
+}
+if (serveZippWorkflow) {
+  const tick = (ms = 0) => new Promise(r => setTimeout(r, ms));
+  /** An in-memory port: what the loop posts lands in `out`; `send` is the main thread. */
+  function memoryPort() {
+    const out = [];
+    let handler = null;
+    const port = { post: m => out.push(m), onMessage: cb => { handler = cb; } };
+    const send = m => handler(m);
+    const waitFor = async (pred, timeoutMs = 30_000) => {
+      const until = Date.now() + timeoutMs;
+      while (!pred(out)) {
+        if (Date.now() > until) throw new Error(`timed out waiting; got ${JSON.stringify(out.map(m => m.type))}`);
+        await tick(1);
+      }
+    };
+    return { port, out, send, waitFor, types: () => out.map(m => m.type) };
+  }
+  const answer = { status: 200, body: 'alpha beta' };
+
+  {
+    const { port, out, send, waitFor, types } = memoryPort();
+    serveZippWorkflow(port, () => new Engine());
+    check('ready is posted synchronously, before any init', types().join() === 'ready');
+    send({ type: 'init', script: fullScript(`       let workflow_context = {};
+       console.log("hello");
+       const a = yield Utility.httpRequest("https://one.test");
+       workflow_context.a = a.body;`), hardened: true });
+    await waitFor(o => o.some(m => m.type === 'host_call'));
+    const call = out.find(m => m.type === 'host_call');
+    check('init leads to a host_call with id, kind and JSON args',
+      call.id === 1 && call.kind === 'Utility.httpRequest' && JSON.parse(call.args[0])[0] === 'https://one.test',
+      JSON.stringify(call));
+    check('console output arrives as a console message before the call', types().join() === 'ready,console,host_call'
+      && out[1].level === 'log' && out[1].args.join() === 'hello', types().join());
+    send({ type: 'host_result', id: call.id, result: answer });
+    await waitFor(o => o.some(m => m.type === 'finish'));
+    const fin = out.find(m => m.type === 'finish');
+    check('host_result resumes the guest and the run ends in finish', fin.value?.a === 'alpha beta', JSON.stringify(fin));
+    await tick(20);
+    check('nothing follows finish', types().join() === 'ready,console,host_call,finish', types().join());
+  }
+
+  {
+    const { port, out, send, waitFor, types } = memoryPort();
+    serveZippWorkflow(port, () => new Engine());
+    send({ type: 'init', script: fullScript(`       let workflow_context = {};
+       const a = yield Utility.httpRequest("one");
+       const b = yield Utility.httpRequest("two");
+       workflow_context.b = b.body;`), hardened: true });
+    await waitFor(o => o.some(m => m.type === 'host_call'));
+    send({ type: 'abort' });
+    send({ type: 'host_result', id: out.find(m => m.type === 'host_call').id, result: answer });
+    await tick(50);
+    check('after abort, a late host_result issues no further host_call and no finish',
+      types().join() === 'ready,host_call', types().join());
+  }
+
+  {
+    const { port, out, send, waitFor, types } = memoryPort();
+    serveZippWorkflow(port, () => new Engine());
+    send({ type: 'init', script: fullScript(`       let workflow_context = { which: "first" };
+       yield Utility.httpRequest("x");`), hardened: true });
+    send({ type: 'init', script: fullScript(`       let workflow_context = { which: "second" };
+       yield Utility.httpRequest("x");`), hardened: true });
+    await waitFor(o => o.some(m => m.type === 'host_call'));
+    for (const call of out.filter(m => m.type === 'host_call')) send({ type: 'host_result', id: call.id, result: answer });
+    await waitFor(o => o.some(m => m.type === 'finish'));
+    await tick(50);
+    const finishes = out.filter(m => m.type === 'finish');
+    check('a second init is ignored: one host_call, one finish, from the first script',
+      finishes.length === 1 && finishes[0].value?.which === 'first' && out.filter(m => m.type === 'host_call').length === 1,
+      types().join());
+  }
+
+  {
+    // The browser shell's shape: the module is loaded inside createEngine.
+    const { port, out, send, waitFor } = memoryPort();
+    serveZippWorkflow(port, async () => { await tick(5); return new Engine(); });
+    send({ type: 'init', script: fullScript(`       let workflow_context = { ok: 1 };`), hardened: false });
+    await waitFor(o => o.some(m => m.type === 'finish'));
+    check('an asynchronous createEngine is awaited', out.find(m => m.type === 'finish').value?.ok === 1);
+  }
+
+  {
+    // The CLI's shape: the budget option reaches the session.
+    const { port, out, send, waitFor } = memoryPort();
+    serveZippWorkflow(port, () => new Engine(), { instructionBudgetSteps: 2_000_000 });
+    send({ type: 'init', script: fullScript(`       let workflow_context = {};
+       for (let i = 0; i < 3000000; i++) {}`), hardened: true });
+    await waitFor(o => o.some(m => m.type === 'finish_error'));
+    const err = out.find(m => m.type === 'finish_error');
+    check('instructionBudgetSteps passes through to the run', /budget/i.test(err.message), err.message);
+  }
+
+  {
+    const { port, out, send, waitFor } = memoryPort();
+    serveZippWorkflow(port, () => { throw new Error('no engine here'); });
+    send({ type: 'init', script: 'var x = 1;', hardened: true });
+    await waitFor(o => o.some(m => m.type === 'finish_error'));
+    check('a createEngine failure is reported as finish_error, never swallowed',
+      out.find(m => m.type === 'finish_error').message === 'Zipp worker failed: no engine here');
+  }
 }
 
 // ---------------------------------------------------------------------------
