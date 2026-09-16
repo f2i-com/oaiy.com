@@ -10,15 +10,23 @@
  *    never takes those code paths — its flows run on `worker_threads`
  *    (src/zipp/) — so the DOM lib is referenced only so the shared sources type.
  *
- * And two the CLI's own build adds. `cli/esbuild.mjs` verifies the installed
+ * And those the CLI's own build adds. `cli/esbuild.mjs` verifies the installed
  * ZIPP release and defines, from its SOURCE.json: the sha256 of the .wasm the
  * CLI ships (checked against the staged bytes at run time, src/zipp/artifact.ts)
- * and the engine identity as a JSON string. Never literals in source.
+ * and the engine identity as a JSON string; and from its PROFILE.json the two
+ * instruction-step figures `run` exposes (`__ZIPP_RUN_LIMITS__`, a JSON string
+ * `{ defaultInstructionSteps, maxInstructionSteps }`). Never literals in source.
+ *
+ * `__OAIY_TEST_ALLOW_V8__` is `false` in every bundle cli/esbuild.mjs builds;
+ * only test/zipp-guard.mjs builds one with it `true`, to prove the realm canary
+ * distinguishes the ZIPP worker from the host engine (src/engine.ts).
  */
 /// <reference lib="dom" />
 
 declare const __ZIPP_WASM_SHA256__: string;
 declare const __ZIPP_ENGINE__: string;
+declare const __ZIPP_RUN_LIMITS__: string;
+declare const __OAIY_TEST_ALLOW_V8__: boolean;
 
 interface ImportMeta {
   readonly env: {

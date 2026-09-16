@@ -206,7 +206,8 @@ jobs:
       - working-directory: cli
         run: npm run build
       # The COMPLETE CLI test script (module isolation, SSRF guard, connector
-      # module, engine suites) plus the typecheck — release.yml used to run
+      # module, engine suites, the ZIPP process-boundary suite and the four
+      # engine guards below) plus the typecheck — release.yml used to run
       # only the HTTPS shutdown check (OAI-01).
       - working-directory: cli
         run: npm test
@@ -215,6 +216,25 @@ jobs:
       - name: Check CLI HTTPS shutdown
         working-directory: cli
         run: node test/cli-http-exit.mjs
+      # The ZIPP engine guards, each on its own so a failure is named in the
+      # log. They are also part of `npm test` above; here they run against the
+      # bundle `npm run build` just made, which every one of them spawns or
+      # reads (a stale dist/ would pass them for the wrong revision).
+      - name: ZIPP guard — the CLI runs flows on the ZIPP VM (process boundary)
+        working-directory: cli
+        run: node test/zipp-cli.mjs
+      - name: ZIPP guard A — no host eval in the bundles
+        working-directory: cli
+        run: node test/no-host-eval.mjs
+      - name: ZIPP guard — every runtime goes through createCliEngine
+        working-directory: cli
+        run: node test/engine-wiring.mjs
+      - name: ZIPP guards B, C, D — canary under the host-eval tripwire, realm, budget, timeout, engine_unavailable
+        working-directory: cli
+        run: node test/zipp-guard.mjs
+      - name: ZIPP boundary measurements (recorded, never hang)
+        working-directory: cli
+        run: node test/zipp-limits.mjs
 
   desktop:
     name: Desktop Vitest + native tests (${{ matrix.label }})

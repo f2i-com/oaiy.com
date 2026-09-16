@@ -94,22 +94,15 @@ function loadPackage(file: string, fallbackName: string): LoadedFlow {
 
   const flowData = JSON.parse(strFromU8(flowRaw));
   const graph = normalizeGraph(flowData);
-  // A .oaiy is a DISTRIBUTABLE artifact and may be untrusted. The browser app runs its
-  // code in a Web Worker realm; the Node CLI has no such realm, so a logic_block node in
-  // a package runs with THIS process's full privileges (fs, child_process, env). Warn
-  // loud so an operator doesn't run a package they don't actually trust expecting it to
-  // be sandboxed. (Custom-node packages are already refused above.)
-  const nodes = (graph as { nodes?: Array<{ type?: string }> }).nodes;
-  const codeNodes = Array.isArray(nodes)
-    ? nodes.filter((n) => n && n.type === 'logic_block').length
-    : 0;
-  if (codeNodes > 0) {
-    process.stderr.write(
-      `WARNING: this .oaiy package contains ${codeNodes} code (logic_block) node(s) that run with ` +
-        `this process's full privileges — the CLI cannot sandbox package code the way the desktop app ` +
-        `does. Only run .oaiy packages you trust.\n`,
-    );
-  }
+  // A .oaiy is a DISTRIBUTABLE artifact and may be untrusted. Its code nodes run
+  // where every flow the CLI runs does: on the ZIPP VM in a worker thread with an
+  // empty environment (src/engine.ts, createCliEngine), where `process`,
+  // `require`, `Buffer` and `__TAURI__` do not exist and every capability is a
+  // brokered host call. What the package can still do is what its nodes are
+  // allowed to ask the host for — the same module calls a flow of your own may
+  // make (files under the configured roots, HTTP, the media tools) — so a
+  // package is trusted with those, not with the process. Custom-node packages
+  // are refused above: the CLI does not compile them.
   return { graph, name: manifest.name || fallbackName };
 }
 
