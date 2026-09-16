@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://oaiy.com/schemas/script/v1/script-request.schema.json",
   "title": "Leaf-script request",
-  "description": "One batch of leaf scripts to run on the Zipp engine without a workflow graph: `oaiy script` reads it, `oaiy script --serve` reads one per `batch` line, and the Desktop's script host sends it. Every job runs on its own fresh Engine, in order; the reply is `script-result.schema.json` with one entry per job in the same order. A request with ANY malformed job is refused WHOLE (`{v, error}`), nothing runs. The requester supplies every file, entry point and hook name; OAIY names none. Data (`globals`, `args`, `source`, `files`) crosses into the guest only as JSON literals, never as program text.",
+  "description": "One batch of leaf scripts to run on the Zipp engine without a workflow graph: `oaiy script` reads it, `oaiy script --serve` reads one per `batch` line, and the Desktop's script host sends it. Every job runs on its own fresh Engine, in order; the reply is `script-result.schema.json` with one entry per job in the same order. A request with ANY malformed job is refused WHOLE (`{v, error}`), nothing runs. The requester supplies every file, entry point, hook name and wrapping; OAIY names none. Data (`globals`, `args`, `source`, `files`) crosses into the guest only as JSON literals, never as program text. A Python job may name `modes` of the request's `profile` instead of carrying a file set: the runner then builds the project from the profile and reports the author's own line numbers, still with nothing of its own in it.",
   "type": "object",
   "required": [
     "v",
@@ -190,13 +190,61 @@
     },
     "pythonJob": {
       "type": "object",
+      "description": "A Python project, spelled out (`files`, `entry`, `call`) or named (`modes` plus the author's `source`, unfolded by the runner from the request's profile). Never both: two ways to build one project is an ambiguity, and it is refused rather than resolved.",
       "required": [
         "id",
         "language",
-        "mode",
-        "files",
-        "entry",
-        "call"
+        "mode"
+      ],
+      "allOf": [
+        {
+          "if": {
+            "required": [
+              "modes"
+            ]
+          },
+          "then": {
+            "required": [
+              "source"
+            ],
+            "not": {
+              "anyOf": [
+                {
+                  "required": [
+                    "files"
+                  ]
+                },
+                {
+                  "required": [
+                    "entry"
+                  ]
+                },
+                {
+                  "required": [
+                    "call"
+                  ]
+                },
+                {
+                  "required": [
+                    "fallbackOnSourceError"
+                  ]
+                }
+              ]
+            }
+          },
+          "else": {
+            "required": [
+              "files",
+              "entry",
+              "call"
+            ],
+            "not": {
+              "required": [
+                "source"
+              ]
+            }
+          }
+        }
       ],
       "properties": {
         "id": {
@@ -207,6 +255,19 @@
         },
         "mode": {
           "const": "python-project"
+        },
+        "modes": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 8,
+          "items": {
+            "$ref": "https://oaiy.com/schemas/script/v1/script-profile.schema.json#/$defs/pythonModeName"
+          },
+          "description": "Modes of the request's `profile.python.modes`, tried in order on their own fresh Engines; the next is tried only when the engine reported `source` while the project initialised. The failure reported is the last attempt's, with THAT mode's `lineOffset` applied. A name the profile does not define refuses the whole request."
+        },
+        "source": {
+          "type": "string",
+          "description": "The author's text, wrapped by whichever mode is running. `modes` only."
         },
         "files": {
           "$ref": "#/$defs/files"
@@ -233,7 +294,7 @@
             }
           },
           "additionalProperties": false,
-          "description": "Tried once, on a fresh Engine, when `files` fails to compile or its top level raises (the engine's `source` kind). Same `entry` and `call`."
+          "description": "Tried once, on a fresh Engine, when `files` fails to compile or its top level raises (the engine's `source` kind). Same `entry` and `call`. A job that names `modes` says the same thing as a second mode in the list, and gets the second phase's own line arithmetic with it; this shape carries a whole replacement file set and no arithmetic, and stays exactly as it was for the jobs that use it."
         },
         "budgetMs": {
           "$ref": "#/$defs/budgetMs"

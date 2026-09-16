@@ -11,7 +11,12 @@
  *   * the document must be the profile shape exactly — checked by the same
  *     validator `oaiy script` runs on a request's `profile`, so the two
  *     commands cannot drift on what a profile is (the digest is verified and
- *     a preamble redeclaring an engine or envelope name is refused there);
+ *     a preamble redeclaring an engine or envelope name is refused there).
+ *     That validator rules on the WHOLE document, `hooks` and a `python`
+ *     contract with its `modes` included, so one file is a requester's whole
+ *     prelude for both commands: a run takes the preamble and the budget from
+ *     it, and `oaiy script` unfolds its modes. Nothing here reads either —
+ *     they are carried, checked and passed on;
  *   * the preamble must PARSE, and none of its top-level declarations may be
  *     a name the engine's preamble, the envelope or the workflow wrapper binds.
  *     The envelope's own check is a text scan (it has no parser); the CLI has

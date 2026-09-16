@@ -1,0 +1,465 @@
+{
+  "what": [
+    "A real consumer's Python contract, as a script profile's `python` section, vendored so OAIY",
+    "can prove that a host holding ONLY the profile builds the right project and reports the",
+    "author's own line numbers — without depending on that consumer's repository.",
+    "",
+    "This is the shape the widening exists for. Before `modes`, a profile could carry one file set,",
+    "one entry and one call; this contract has FIVE entry modules, two of which are the two phases",
+    "of one evaluation, each with its own wrapper and its own line arithmetic. A profile that could",
+    "not say that validated perfectly and was useless to anyone but the product that wrote it.",
+    "",
+    "OAIY names nothing in here. Every file name, every wrapper, every offset and the contract id",
+    "are the requester's, and they appear in this fixture and in the test that reads it — never in",
+    "`zipp-script.ts`, the schemas or a refusal message."
+  ],
+  "vendoredFrom": {
+    "repo": "formlogic.com (sibling checkout; OAIY does not depend on it)",
+    "contract": "formlogic-python/1",
+    "commit": "ab1ab6b252db3aeed1c1926cb964ba526d8bc1f7",
+    "source": "formlogic/ui/src/lib/formlogic/python/pythonContract.ts",
+    "sourceBlob": "553476e14e6cdeb3a612518864223e60436b71ea",
+    "corpus": "docs/contracts/formlogic-python-logic-corpus.json",
+    "corpusBlob": "1067e8fe0877d618b211e6ef323e3aa739c70926",
+    "blobs": {
+      "formlogic.py": "d0470af84518a24508e231921e8309ff996aff10",
+      "entry-flow-expression.py": "cfccd99bce92e7e576c696bf33d1e26d1e3951c2",
+      "entry-flow-module.py": "3ce877665599fb579b132dd05354c9c2fdd000ae",
+      "entry-condition.py": "c6473650bbf55c6d73bc86a709b527b3fcdaf22e",
+      "entry-applogic.py": "63f3d44e205d8eb334a545eac116f231ce9fea02",
+      "entry-syntax.py": "0554d20fa94646f9130231f90a136b53057a5234"
+    },
+    "takenOn": "2026-09-17",
+    "readOnly": "Read with `git -C ../formlogic.com show HEAD:<path>`; nothing in that checkout was written.",
+    "corpusCaseIds": [
+      "flow-expression",
+      "flow-expression-concat",
+      "flow-multiline-expression-with-comment",
+      "flow-multiline-dict-literal",
+      "flow-print-expression-is-none",
+      "flow-trap-expression-lines-join",
+      "flow-module-result",
+      "flow-module-loop-and-helper",
+      "flow-module-without-result-is-none",
+      "flow-single-line-statement",
+      "flow-two-calls-run-as-module",
+      "flow-comment-only-is-none",
+      "flow-empty-is-none",
+      "flow-future-import-after-header",
+      "flow-runs-once-module",
+      "flow-runs-once-expression",
+      "flow-runs-once-one-line-statements",
+      "flow-context-names",
+      "flow-context-values-are-dicts",
+      "flow-helpers",
+      "flow-builtins-not-shadowed",
+      "flow-javascript-globals-absent",
+      "flow-eval-absent",
+      "flow-no-network-modules",
+      "zipp-defect-cross-module-setattr",
+      "flow-result-normalized",
+      "flow-plain-non-finite-in-guest",
+      "flow-result-safe-integer",
+      "flow-result-big-integer",
+      "flow-result-set",
+      "flow-result-generator",
+      "flow-result-object",
+      "flow-result-function",
+      "flow-result-nested-40",
+      "flow-result-nested-70",
+      "flow-syntax-error-author-line",
+      "flow-top-level-return",
+      "flow-runtime-error-author-line",
+      "flow-expression-runtime-error-author-line",
+      "flow-raise-author-line",
+      "flow-no-driver-frames",
+      "flow-await-unsupported",
+      "flow-instruction-budget",
+      "flow-print-is-quiet",
+      "condition-true",
+      "condition-python-truthiness",
+      "condition-truthy-value",
+      "condition-multiline",
+      "condition-statement-refused",
+      "condition-runtime-error-author-line",
+      "condition-multiline-error-reports-first-line",
+      "applogic-run",
+      "applogic-reject",
+      "applogic-without-run-is-none",
+      "applogic-runtime-error-author-line",
+      "syntax-runs-nothing",
+      "syntax-accepts-statements",
+      "syntax-error"
+    ]
+  },
+  "taken": [
+    "VERBATIM: the five entry modules, and the five wrappers and line offsets of BLOCK_WRAPPERS /",
+    "LINE_OFFSETS (pythonContract.ts:60-72). `lineOffset` is the newline count of `before`, which is",
+    "how LINE_OFFSETS derives it. The entry file name (`main.py`), the block file name",
+    "(`logic_block.py`), the entry module (`main`) and the call (`__formlogic_run__`) are",
+    "ENTRY_MODULE / ENTRY_FUNCTION / BLOCK_FILE of the same file.",
+    "",
+    "REDUCED: `formlogic.py` is 479 lines there — the context binding, a no-op print, a value",
+    "normalizer and a port of a JavaScript helper prelude. Kept here: the six context names, `_bind`",
+    "with the same `global` statement (v0.0.18 could not set another module's attributes, so the",
+    "contract binds this way and the shape matters), the no-op `print`, and `_plain` as the identity.",
+    "The cases below produce bool, dict, str and None, which `_plain` returns unchanged — softn.com",
+    "already holds the real `_plain` to FormLogic's value corpus, and re-vendoring 479 lines to",
+    "re-prove value conversion would test that repo's normalizer, not this repo's profile. The two",
+    "corpus cases whose applogic value needs the helper prelude (applogic-run, applogic-reject) are",
+    "left out for the same reason, and one addedByOaiy case covers what they would have shown here.",
+    "",
+    "The `syntax` mode's entry defines `__formlogic_never__`, not `__formlogic_run__`, because a",
+    "syntax check is meant to compile the block and run nothing. That is why it carries the mode's",
+    "own `call`: without one, the only signal of success would be the shared call failing.",
+    "",
+    "Every case carries `formlogicId`, and its `source` and `context` are that corpus case's,",
+    "VERBATIM — `corpusCaseIds` above is the corpus's own id list at that blob, and the test fails",
+    "if a `formlogicId` is not in it. A case with `addedByOaiy` instead is this repo’s own and says",
+    "why. What is rewritten is only the `expect`: the corpus states the message FormLogic produces",
+    "after its own naming and frame-dropping (`line 2`), and this states the location as the RUNNER",
+    "leaves it (`logic_block.py:2`) — the same arithmetic, one step earlier."
+  ],
+  "leftOut": [
+    "The other 48 corpus cases are about value conversion, the bound context, engine limits and",
+    "Python dialect: they exercise FormLogic's guest code and ZIPP's Python frontend, neither of",
+    "which this repo owns. softn.com vendors the value-conversion subset for the same reason in",
+    "reverse."
+  ],
+  "python": {
+    "contract": "formlogic-python/1",
+    "entry": "main",
+    "call": "__formlogic_run__",
+    "files": {
+      "formlogic.py": "# Reduced from formlogic.py of formlogic-python/1 — see `taken` above.\ninputs = None\nevent = None\napp = None\nnodes = None\nupstream = None\nkv = None\n\n\ndef _bind(ctx):\n    global inputs, event, app, nodes, upstream, kv\n    inputs = ctx.get(\"inputs\")\n    event = ctx.get(\"event\")\n    app = ctx.get(\"app\")\n    nodes = ctx.get(\"nodes\")\n    upstream = ctx.get(\"upstream\")\n    kv = ctx.get(\"kv\")\n\n\ndef print(*args, **kwargs):\n    pass\n\n\ndef _plain(value):\n    return value\n"
+    },
+    "modes": [
+      {
+        "name": "flowExpression",
+        "files": {
+          "main.py": "# formlogic-python/1 entry: a flow logic_block written as one expression.\nimport formlogic as _fl\n\n\ndef __formlogic_run__(ctx):\n    _fl._bind(ctx)\n    import logic_block\n    return _fl._plain(logic_block.__formlogic_value__())\n"
+        },
+        "block": "logic_block.py",
+        "before": "from formlogic import *\ndef __formlogic_value__():\n    return (\n",
+        "after": "\n    )\n",
+        "lineOffset": 3
+      },
+      {
+        "name": "flowModule",
+        "files": {
+          "main.py": "# formlogic-python/1 entry: a flow logic_block written as statements. Its top-level\n# `result` is the value, None when it never sets one.\nimport formlogic as _fl\n\n\ndef __formlogic_run__(ctx):\n    _fl._bind(ctx)\n    import logic_block\n    return _fl._plain(getattr(logic_block, \"result\", None))\n"
+        },
+        "block": "logic_block.py",
+        "before": "from formlogic import *\n",
+        "after": "",
+        "lineOffset": 1
+      },
+      {
+        "name": "condition",
+        "files": {
+          "main.py": "# formlogic-python/1 entry: a flow condition, one expression judged by Python truthiness.\nimport formlogic as _fl\n\n\ndef __formlogic_run__(ctx):\n    _fl._bind(ctx)\n    import logic_block\n    return bool(logic_block.__formlogic_condition__())\n"
+        },
+        "block": "logic_block.py",
+        "before": "from formlogic import *\ndef __formlogic_condition__():\n    return bool((\n",
+        "after": "\n    ))\n",
+        "lineOffset": 3
+      },
+      {
+        "name": "applogic",
+        "files": {
+          "main.py": "# formlogic-python/1 entry: an app-logic script. The value is run(ctx)'s return, None when\n# the script defines no run.\nimport formlogic as _fl\n\n\ndef __formlogic_run__(ctx):\n    import logic_block\n    run = getattr(logic_block, \"run\", None)\n    return _fl._plain(run(ctx)) if callable(run) else None\n"
+        },
+        "block": "logic_block.py",
+        "before": "from formlogic import *\n",
+        "after": "",
+        "lineOffset": 1
+      },
+      {
+        "name": "syntax",
+        "files": {
+          "main.py": "# formlogic-python/1 entry: a syntax check. A project module is compiled when the project\n# initializes even if only a function that never runs imports it, so this compiles\n# logic_block and runs none of it.\ndef __formlogic_never__():\n    import logic_block\n"
+        },
+        "block": "logic_block.py",
+        "before": "from formlogic import *\n",
+        "after": "",
+        "lineOffset": 1,
+        "call": "__formlogic_never__"
+      }
+    ]
+  },
+  "context": {
+    "inputs": {
+      "from": "+61491570156",
+      "durationSeconds": 12
+    },
+    "event": null,
+    "app": null,
+    "nodes": {
+      "customers": [
+        {
+          "id": "r1",
+          "answers": {
+            "phone": "+61400000000",
+            "name": "Other"
+          }
+        },
+        {
+          "id": "r2",
+          "answers": {
+            "phone": "+61491570156",
+            "name": "Ada"
+          }
+        }
+      ]
+    },
+    "upstream": null,
+    "kv": {
+      "greeting": "Hello"
+    }
+  },
+  "cases": [
+    {
+      "id": "flow-expression",
+      "formlogicId": "flow-expression",
+      "modes": [
+        "flowExpression",
+        "flowModule"
+      ],
+      "source": "inputs[\"durationSeconds\"] > 5",
+      "expect": {
+        "value": true
+      },
+      "proves": "the first phase: one parenthesised expression, and the value is the expression's"
+    },
+    {
+      "id": "flow-module-result",
+      "formlogicId": "flow-module-result",
+      "modes": [
+        "flowExpression",
+        "flowModule"
+      ],
+      "source": "c = next((r for r in nodes[\"customers\"] if r[\"answers\"][\"phone\"] == inputs[\"from\"]), None)\nresult = {\"found\": c is not None, \"name\": c[\"answers\"][\"name\"] if c else None}",
+      "expect": {
+        "value": {
+          "found": true,
+          "name": "Ada"
+        }
+      },
+      "proves": "the SECOND phase: statements cannot be parenthesised, so phase one fails to compile and the module wrapper answers"
+    },
+    {
+      "id": "flow-expression-runtime-error-author-line",
+      "formlogicId": "flow-expression-runtime-error-author-line",
+      "modes": [
+        "flowExpression",
+        "flowModule"
+      ],
+      "source": "nodes[\"missing\"][\"x\"]",
+      "expect": {
+        "errorKind": "guest",
+        "error": "^KeyError: 'missing' \\(logic_block\\.py:1\\)",
+        "authorLines": [
+          1,
+          1
+        ]
+      },
+      "proves": "the splice line: the engine names the wrapper's `return (` line for the whole expression, and that is the author's line 1"
+    },
+    {
+      "id": "flow-runtime-error-author-line",
+      "formlogicId": "flow-runtime-error-author-line",
+      "modes": [
+        "flowExpression",
+        "flowModule"
+      ],
+      "source": "a = 1\nb = nodes[\"missing\"]",
+      "expect": {
+        "errorKind": "guest",
+        "error": "^KeyError: 'missing' \\(logic_block\\.py:2\\)",
+        "authorLines": [
+          2,
+          2
+        ]
+      },
+      "proves": "the fallback phase's OWN offset (1, not 3): the same subtraction on the first phase's offset would say line 0"
+    },
+    {
+      "id": "flow-no-driver-frames",
+      "formlogicId": "flow-no-driver-frames",
+      "modes": [
+        "flowExpression",
+        "flowModule"
+      ],
+      "source": "def f():\n    return nodes[\"missing\"]\nresult = f()",
+      "expect": {
+        "errorKind": "guest",
+        "error": "^KeyError: 'missing' \\(logic_block\\.py:2\\)[\\s\\S]*logic_block\\.py\", line 3[\\s\\S]*logic_block\\.py\", line 2",
+        "authorLines": [
+          2,
+          3,
+          2
+        ]
+      },
+      "proves": "a nested call: every frame in the block file is renumbered, in the order the traceback has them"
+    },
+    {
+      "id": "flow-syntax-error-author-line",
+      "formlogicId": "flow-syntax-error-author-line",
+      "modes": [
+        "flowExpression",
+        "flowModule"
+      ],
+      "source": "x = 1\nif x\n    result = 2",
+      "expect": {
+        "errorKind": "source",
+        "error": "^SyntaxError: .*\\(logic_block\\.py:2:\\d+\\)$",
+        "authorLines": [
+          2
+        ]
+      },
+      "proves": "a compile failure in the fallback phase keeps its column and gets the fallback's line"
+    },
+    {
+      "id": "flow-await-unsupported",
+      "formlogicId": "flow-await-unsupported",
+      "modes": [
+        "flowExpression",
+        "flowModule"
+      ],
+      "source": "x = 1\nawait x",
+      "expect": {
+        "errorKind": "source",
+        "error": "await[\\s\\S]*\\(at offset 6\\)$"
+      },
+      "proves": "a character offset is rebased by the wrapper's length: 6 is the `await` in the author's own text"
+    },
+    {
+      "id": "condition-runtime-error-author-line",
+      "formlogicId": "condition-runtime-error-author-line",
+      "modes": [
+        "condition"
+      ],
+      "source": "inputs[\"durationSeconds\"] > 5 and nodes[\"missing\"]",
+      "expect": {
+        "errorKind": "guest",
+        "error": "^KeyError: 'missing' \\(logic_block\\.py:1\\)",
+        "authorLines": [
+          1,
+          1
+        ]
+      },
+      "proves": "the condition wrapper has the expression wrapper's offset and the same splice-line answer"
+    },
+    {
+      "id": "condition-truthy-value",
+      "formlogicId": "condition-truthy-value",
+      "modes": [
+        "condition"
+      ],
+      "source": "nodes[\"customers\"]",
+      "expect": {
+        "value": true
+      },
+      "proves": "`bool((...))`: a list of dicts answers True, not the list — the wrapper decides the TYPE"
+    },
+    {
+      "id": "condition-python-truthiness",
+      "formlogicId": "condition-python-truthiness",
+      "modes": [
+        "condition"
+      ],
+      "source": "[]",
+      "expect": {
+        "value": false
+      },
+      "proves": "an empty list is False by Python truthiness, and a false condition is a value, not a failure"
+    },
+    {
+      "id": "applogic-runtime-error-author-line",
+      "formlogicId": "applogic-runtime-error-author-line",
+      "modes": [
+        "applogic"
+      ],
+      "source": "def run(ctx):\n    return ctx[\"missing\"]",
+      "context": {
+        "hook": "onAppStart"
+      },
+      "expect": {
+        "errorKind": "guest",
+        "error": "^KeyError: 'missing' \\(logic_block\\.py:2\\)",
+        "authorLines": [
+          2,
+          2
+        ]
+      },
+      "proves": "the third entry module: run(ctx) is called with the context and the error is the author's line 2"
+    },
+    {
+      "id": "applogic-without-run-is-none",
+      "formlogicId": "applogic-without-run-is-none",
+      "modes": [
+        "applogic"
+      ],
+      "source": "x = 1",
+      "context": {
+        "hook": "onAppStart"
+      },
+      "expect": {
+        "value": null
+      },
+      "proves": "the applogic entry looks run up and answers None when the block defines none"
+    },
+    {
+      "id": "applogic-context-is-the-argument",
+      "addedByOaiy": "The corpus applogic cases that RETURN a value (applogic-run, applogic-reject) call prelude helpers this reduced formlogic.py leaves out. This shows the same thing with nothing but the contract.",
+      "modes": [
+        "applogic"
+      ],
+      "source": "def run(ctx):\n    return ctx[\"kv\"][\"greeting\"]",
+      "context": {
+        "inputs": null,
+        "event": null,
+        "app": null,
+        "nodes": null,
+        "upstream": null,
+        "kv": {
+          "greeting": "Hello"
+        }
+      },
+      "expect": {
+        "value": "Hello"
+      },
+      "proves": "applogic takes the context as run's argument, not as bound names"
+    },
+    {
+      "id": "syntax-error",
+      "formlogicId": "syntax-error",
+      "modes": [
+        "syntax"
+      ],
+      "source": "def f(:\n  pass",
+      "args": [],
+      "expect": {
+        "errorKind": "source",
+        "error": "^SyntaxError: .*\\(logic_block\\.py:1:\\d+\\)$",
+        "authorLines": [
+          1
+        ]
+      },
+      "proves": "the fifth entry module: the block is compiled at init, so a syntax check needs no call"
+    },
+    {
+      "id": "syntax-accepts-statements",
+      "formlogicId": "syntax-accepts-statements",
+      "modes": [
+        "syntax"
+      ],
+      "source": "x = 1\nresult = x",
+      "args": [],
+      "expect": {
+        "value": null
+      },
+      "proves": "a block that compiles runs nothing: the mode's own `call` is the entry's never-run function"
+    }
+  ]
+}

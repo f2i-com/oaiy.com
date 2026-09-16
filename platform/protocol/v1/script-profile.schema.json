@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://oaiy.com/schemas/script/v1/script-profile.schema.json",
   "title": "Leaf-script profile",
-  "description": "A requester's prelude for the jobs of one leaf-script request (`script-request.schema.json`). `preamble` is program text emitted after the engine's guest shims and before every JavaScript job's own source; `preambleSha256` is its lower-case hex sha256 and is verified by the host before anything runs. A preamble that declares a name the engine or the envelope binds is refused. `hooks` names per-lane `prepare` functions the preamble defines; `python` carries a Python contract the requester unfolds into `python-project` jobs itself. Both are read by requesters, never by the runner.",
+  "description": "A requester's prelude for the jobs of one leaf-script request (`script-request.schema.json`). `preamble` is program text emitted after the engine's guest shims and before every JavaScript job's own source; `preambleSha256` is its lower-case hex sha256 and is verified by the host before anything runs. A preamble that declares a name the engine or the envelope binds is refused. `hooks` names per-lane `prepare` functions the preamble defines, and is read by requesters, never by the runner. `python` carries a Python contract: a requester may unfold it into `python-project` jobs itself, or — where it carries `modes` — name a mode in the job and have the runner unfold it. Every byte of it is the requester's; the runner has no contract, no files and no modes of its own.",
   "type": "object",
   "required": [
     "v",
@@ -56,25 +56,28 @@
           "maxLength": 128
         },
         "files": {
-          "type": "object",
-          "minProperties": 1,
-          "propertyNames": {
-            "minLength": 1,
-            "maxLength": 128
-          },
-          "additionalProperties": {
-            "type": "string"
-          }
+          "$ref": "#/$defs/pythonFiles",
+          "description": "The files every evaluation of this contract carries, whatever the mode."
         },
         "entry": {
           "type": "string",
           "minLength": 1,
-          "maxLength": 128
+          "maxLength": 128,
+          "description": "The module whose top level runs. With `modes`, it must also be a Python module name and some file of the unfolded project must be it (`entry` or `entry.py`)."
         },
         "call": {
           "type": "string",
           "minLength": 1,
           "maxLength": 128
+        },
+        "modes": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 32,
+          "items": {
+            "$ref": "#/$defs/pythonMode"
+          },
+          "description": "The wrappings a job may name. Optional and purely additive: a profile without `modes` is the same profile it was, and a job without `modes` is the same job. Two modes of one name, a `block` that collides with a file, a `files` key that shadows `python.files`, or a mode whose project has no entry module are refused by the host (a JSON Schema cannot say them)."
         }
       },
       "additionalProperties": false
@@ -82,6 +85,72 @@
   },
   "additionalProperties": false,
   "$defs": {
+    "pythonFiles": {
+      "type": "object",
+      "minProperties": 1,
+      "propertyNames": {
+        "minLength": 1,
+        "maxLength": 128
+      },
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "pythonModeName": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[A-Za-z][A-Za-z0-9_-]*$"
+    },
+    "pythonMode": {
+      "type": "object",
+      "description": "One wrapping of a job's `source` into a project. The runner merges `files` over `python.files`, writes `before` + the job's `source` + `after` to `block`, runs `python.entry`/`python.call`, and maps locations the engine reports in `block` back to the author's lines with `lineOffset`. It reads `name` as a lookup key and nothing else.",
+      "required": [
+        "name",
+        "files",
+        "block",
+        "before",
+        "after",
+        "lineOffset"
+      ],
+      "properties": {
+        "name": {
+          "$ref": "#/$defs/pythonModeName",
+          "description": "How a job names this wrapping. Unique within the profile."
+        },
+        "files": {
+          "$ref": "#/$defs/pythonFiles",
+          "description": "Files this wrapping adds to `python.files` — the entry module among them. May not shadow a `python.files` key."
+        },
+        "block": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "The file the wrapped source is written to, and the name the engine uses for it in a location. Not a key of `python.files` or of this mode's `files`."
+        },
+        "before": {
+          "type": "string",
+          "description": "Text placed before the job's `source` in `block`. May be empty."
+        },
+        "after": {
+          "type": "string",
+          "description": "Text placed after the job's `source` in `block`. May be empty."
+        },
+        "lineOffset": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000000,
+          "description": "Generated lines before the author's first line — the number of newlines in `before`. Engine line N in `block` is author line N - lineOffset, capped at the author's last line. Where `before` ends in a newline, N == lineOffset is author line 1 as well, because Python reports a multi-line statement at the line that opens it. Any line above that is left exactly as the engine wrote it: those lines are the wrapper's own and are not the author's to answer for. Columns are never adjusted (a `before` that does not end in a newline shifts the author's first line sideways, so a column there is the block's), and a character offset in a `(at offset K)` location is rebased by the UTF-16 length of `before`."
+        },
+        "call": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "The function to call for this mode instead of `python.call`. A wrapping decides what the entry module defines: omit it where every mode answers the same way."
+        }
+      },
+      "additionalProperties": false
+    },
     "reservedWord": {
       "enum": [
         "await",

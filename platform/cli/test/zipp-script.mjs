@@ -26,8 +26,15 @@
 //     `instructionSteps` together with `--instruction-budget` is refused
 //     BEFORE the flow file is read (no result file); a bad digest, a preamble
 //     declaring an engine or envelope name (also by destructuring, which the
-//     envelope's text scan cannot see), a `let` over a guest shim and a
-//     preamble that does not parse are each refused.
+//     envelope's text scan cannot see), a `let` over a guest shim, a preamble
+//     that does not parse and a malformed `python.modes` entry are each
+//     refused.
+//   * profile modes: one profile document carries a whole Python contract
+//     through BOTH commands — `run --profile` accepts it and applies its
+//     preamble, and `script --request` unfolds a named mode on the staged
+//     engine, taking the second mode on a compile failure and attributing each
+//     phase with its own `lineOffset`. A job naming a mode the profile does not
+//     define, or naming one with no profile at all, is refused whole.
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -86,6 +93,41 @@ const PY_FILES = {
   'lib.py': 'def twice(n):\n    return n * 2\n',
 };
 const pyJob = (id, n) => ({ id, language: 'python', mode: 'python-project', files: PY_FILES, entry: 'main', call: 'run', args: [{ n }], budgetMs: 20_000 });
+
+// A profile that carries modes: `loadScriptProfile` must accept one (a
+// requester's whole contract travels in the file `run --profile` reads), and
+// `script --request` must unfold one on the staged engine. `expr` wraps the
+// source as an expression over three generated lines; `stmt` runs it as a
+// module over one, so the pair is a two-phase compile with two different line
+// offsets — the thing a consumer cannot express without modes.
+const MODE = {
+  name: 'wrap',
+  files: { 'main.py': 'import shared\n\n\ndef run(c):\n    shared.bind(c)\n    import blk\n    return blk.value()\n' },
+  block: 'blk.py',
+  before: 'from shared import *\ndef value():\n    return (\n',
+  after: '\n    )\n',
+  lineOffset: 3,
+};
+const STMT_MODE = {
+  name: 'stmt',
+  files: { 'main.py': 'import shared\n\n\ndef run(c):\n    shared.bind(c)\n    import blk\n    return getattr(blk, "result", None)\n' },
+  block: 'blk.py',
+  before: 'from shared import *\n',
+  after: '',
+  lineOffset: 1,
+};
+const modeProfile = (patch) => {
+  const mode = { ...MODE, ...patch };
+  if (patch) for (const [k, v] of Object.entries(patch)) if (v === undefined) delete mode[k];
+  const preamble = 'var fromProfile = 1;';
+  return {
+    v: 1,
+    preamble,
+    preambleSha256: sha256(preamble),
+    python: { contract: 'oaiy-test/1', files: { 'shared.py': 'ctx = None\n\n\ndef bind(c):\n    global ctx\n    ctx = c\n\n\ndef twice(n):\n    return n * 2\n' }, entry: 'main', call: 'run', modes: [mode, STMT_MODE] },
+  };
+};
+const modeJob = (id, modes, source) => ({ id, language: 'python', mode: 'python-project', modes, source, args: [{ n: 21 }], budgetMs: 20_000 });
 /** A loop only the wall clock stops: the instruction budget at its ceiling, a small `budgetMs`. */
 const loopJob = (id, budgetMs) => ({ id, mode: 'program', source: 'while (true) {}', instructionSteps: 2_000_000_000, budgetMs });
 /** A loop the instruction budget stops: `resource`. */
@@ -303,6 +345,22 @@ try {
   assert.equal(pongN.jobs, N * 2, 'pong.jobs counts the jobs the worker served');
   console.log(`PASS: --serve answers ${N} batches (JS + Python) over one worker, in order; pong reports instance 1 and ${N * 2} jobs`);
 
+  // A mode job over the NDJSON path: the profile arrives per batch, crosses to
+  // the worker with the job, and the fallback phase's own lineOffset comes back.
+  s.send({ op: 'batch', id: 'modes', request: { v: 1, profile: modeProfile(), jobs: [
+    modeJob('v', ['wrap', 'stmt'], 'twice(ctx["n"])'),
+    modeJob('fell', ['wrap', 'stmt'], 'a = 1\nb = ctx["missing"]'),
+  ] } });
+  const modeLine = await s.next((l) => l.op === 'result' && l.id === 'modes', 60_000, 'result modes');
+  assert.ok(validResult(modeLine.result), JSON.stringify(modeLine));
+  assert.deepEqual(modeLine.result.results[0], { id: 'v', ok: true, value: 42 }, 'a served mode job built its project from the batch profile');
+  assert.equal(modeLine.result.results[1].ok, false);
+  assert.match(modeLine.result.results[1].error, /blk\.py:2\b/, `served fallback attribution: ${modeLine.result.results[1].error}`);
+  s.send({ op: 'batch', id: 'modes-bad', request: { v: 1, jobs: [modeJob('x', ['wrap'], '1')] } });
+  const modeRefusal = await s.next((l) => l.op === 'result' && l.id === 'modes-bad', 30_000, 'result modes-bad');
+  assert.match(modeRefusal.result.error.message, /carries no profile python contract to define it/, JSON.stringify(modeRefusal));
+  console.log('PASS: --serve carries a batch profile to the worker: a mode job runs, its fallback phase keeps its own lineOffset, and a mode job with no profile is refused');
+
   // (a) A resource error recycles the worker; the next job in the batch runs on the replacement.
   s.send({ op: 'batch', id: 'res', request: { v: 1, jobs: [budgetJob('burn'), { id: 'next', mode: 'program', source: '"alive"' }] } });
   const res = await s.next((l) => l.op === 'result' && l.id === 'res', 60_000, 'result res');
@@ -464,6 +522,9 @@ try {
     ['a `let` over the guest shim `setTimeout`', { v: 1, preamble: 'let setTimeout = 1;', preambleSha256: sha256('let setTimeout = 1;') }, /redeclares the guest shim "setTimeout"/],
     ['a preamble that does not parse', { v: 1, preamble: 'function (', preambleSha256: sha256('function (') }, /does not parse/],
     ['a profile with an unknown field', { v: 1, preamble, preambleSha256: sha256(preamble), extra: 1 }, /unknown field "extra"/],
+    ['a profile whose mode has a negative lineOffset', modeProfile({ lineOffset: -1 }), /lineOffset must be an integer from 0 to 1000000, not -1/],
+    ['a profile whose mode has no block', modeProfile({ block: undefined }), /block must be a string/],
+    ['a profile with two modes of one name', { ...modeProfile(), python: { ...modeProfile().python, modes: [MODE, { ...MODE, block: 'other.py' }] } }, /two modes are named "wrap"/],
   ];
   for (const [i, [label, doc, why]] of refusals.entries()) {
     const file = await writeJson(`refuse-${i}.json`, doc);
@@ -481,7 +542,50 @@ try {
   const replaced = await run(['run', readsFetch, '--quiet', '--timeout', '30', '--profile', varShimFile]);
   assert.equal(replaced.code, 0, replaced.stderr);
   assert.equal(JSON.parse(replaced.stdout).output, 'mine', 'a var in the preamble replaces the throwing shim');
-  console.log(`PASS: ${refusals.length} profile refusals (digest, engine/envelope/wrapper names incl. destructuring, a let over a shim, a parse error, an unknown field) exit 1 before the flow is read; a var over a shim is accepted`);
+  console.log(`PASS: ${refusals.length} profile refusals (digest, engine/envelope/wrapper names incl. destructuring, a let over a shim, a parse error, an unknown field, three malformed modes) exit 1 before the flow is read; a var over a shim is accepted`);
+
+  // A profile carrying modes goes through `loadScriptProfile` intact: the same
+  // document drives a workflow run (where only the preamble is used) and a
+  // leaf request (where the modes are). One file, both commands, no drift.
+  const modesFile = await writeJson('profile-modes.json', modeProfile());
+  const readsProfile = await writeJson('reads-profile.json', flow('return fromProfile + 41;'));
+  const withModes = await run(['run', readsProfile, '--quiet', '--timeout', '30', '--profile', modesFile]);
+  assert.equal(withModes.code, 0, withModes.stderr);
+  assert.equal(JSON.parse(withModes.stdout).output, 42, 'a profile carrying modes still applies its preamble to a run');
+  console.log('PASS: run --profile accepts a profile carrying python.modes and applies its preamble unchanged');
+
+  const modeRequest = await writeJson('request-modes.json', {
+    v: 1,
+    profile: modeProfile(),
+    jobs: [
+      modeJob('value', ['wrap', 'stmt'], 'twice(ctx["n"])'),
+      modeJob('second-phase', ['wrap', 'stmt'], 'a = 2\nresult = twice(a)'),
+      modeJob('author-line', ['wrap', 'stmt'], 'a = 1\nb = ctx["missing"]'),
+      modeJob('first-phase-line', ['wrap'], 'ctx["missing"]'),
+    ],
+  });
+  const modeRun = await run(['script', '--request', modeRequest]);
+  assert.equal(modeRun.code, 0, `script --request with modes failed: ${modeRun.stderr}`);
+  const modeResponse = JSON.parse(modeRun.stdout);
+  assert.ok(validResult(modeResponse), `the mode response does not validate: ${modeRun.stdout}`);
+  const modeById = Object.fromEntries(modeResponse.results.map((r) => [r.id, r]));
+  assert.deepEqual(modeById.value, { id: 'value', ok: true, value: 42 }, 'the first mode built the project from the profile alone');
+  assert.deepEqual(modeById['second-phase'], { id: 'second-phase', ok: true, value: 4 }, 'a source error fell through to the second mode');
+  assert.equal(modeById['author-line'].ok, false);
+  assert.match(modeById['author-line'].error, /blk\.py:2\b/, `the fallback phase's own offset: ${modeById['author-line'].error}`);
+  assert.equal(modeById['first-phase-line'].ok, false);
+  assert.match(modeById['first-phase-line'].error, /blk\.py:1\b/, `the first phase's splice line: ${modeById['first-phase-line'].error}`);
+  console.log('PASS: script --request unfolds profile modes on the staged engine — both phases, each attributed with its own lineOffset');
+
+  const unknownMode = await writeJson('request-unknown-mode.json', { v: 1, profile: modeProfile(), jobs: [modeJob('x', ['nope'], '1')] });
+  const refusedMode = await run(['script', '--request', unknownMode]);
+  assert.equal(refusedMode.code, 1, 'a job naming an undefined mode should exit 1');
+  assert.match(JSON.parse(refusedMode.stdout).error.message, /names the mode "nope", which the profile's python\.modes does not define/);
+  const noProfileMode = await writeJson('request-no-profile-mode.json', { v: 1, jobs: [modeJob('x', ['wrap'], '1')] });
+  const refusedNoProfile = await run(['script', '--request', noProfileMode]);
+  assert.equal(refusedNoProfile.code, 1, 'a mode job with no profile should exit 1');
+  assert.match(JSON.parse(refusedNoProfile.stdout).error.message, /carries no profile python contract to define it/);
+  console.log('PASS: a job naming a mode the profile does not define, and one with no profile at all, are refused whole at the process boundary');
 
   // =========================================================================
   // 4. capabilities: the script protocol and its languages.
