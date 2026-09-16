@@ -1,0 +1,159 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oaiy.com/schemas/script/v1/script-result.schema.json",
+  "title": "Leaf-script result",
+  "description": "The reply to one `script-request.schema.json`. Either every job ran (`results`, one entry per job in request order, each `ok` with an optional `value` or a failure with an `errorKind`) or the whole request was refused (`error`) and nothing ran. `engine` identifies the running engine from its own profile and the install record, never from a literal. `value` is sanitised data: depth 8, `__proto__`/`constructor`/`prototype` dropped, non-JSON values null; an `undefined` result has no `value`.",
+  "oneOf": [
+    {
+      "type": "object",
+      "required": [
+        "v",
+        "engine",
+        "results"
+      ],
+      "properties": {
+        "v": {
+          "const": 1
+        },
+        "engine": {
+          "$ref": "#/$defs/engine"
+        },
+        "results": {
+          "type": "array",
+          "items": {
+            "oneOf": [
+              {
+                "$ref": "#/$defs/ok"
+              },
+              {
+                "$ref": "#/$defs/failed"
+              }
+            ]
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": [
+        "v",
+        "error"
+      ],
+      "properties": {
+        "v": {
+          "const": 1
+        },
+        "error": {
+          "type": "object",
+          "required": [
+            "code",
+            "message"
+          ],
+          "properties": {
+            "code": {
+              "const": "invalid_request"
+            },
+            "message": {
+              "type": "string",
+              "description": "Names the job (`jobs[i] (id \"...\")`) and the field."
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    }
+  ],
+  "$defs": {
+    "engine": {
+      "type": "object",
+      "required": [
+        "name",
+        "release",
+        "version",
+        "revision",
+        "wasmSha256",
+        "languages"
+      ],
+      "properties": {
+        "name": {
+          "const": "zipp"
+        },
+        "release": {
+          "type": "string",
+          "pattern": "^v\\d+\\.\\d+\\.\\d+$"
+        },
+        "version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "revision": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        },
+        "wasmSha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "languages": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "ok": {
+      "type": "object",
+      "required": [
+        "id",
+        "ok"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "ok": {
+          "const": true
+        },
+        "value": {}
+      },
+      "additionalProperties": false
+    },
+    "failed": {
+      "type": "object",
+      "required": [
+        "id",
+        "ok",
+        "errorKind",
+        "error"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "ok": {
+          "const": false
+        },
+        "errorKind": {
+          "enum": [
+            "guest",
+            "resource",
+            "timeout",
+            "host",
+            "prepare",
+            "source",
+            "unsupported"
+          ],
+          "description": "`guest`: the script threw or would not parse. `resource`: an engine ceiling (instruction budget, heap, dynamic-code size) or a WebAssembly trap. `timeout`: a host watchdog deadline. `host`: the host or engine misbehaved. `prepare`: the prepare hook is missing, not a function, or threw. `source`: the program failed to compile or its top level threw before any call. `unsupported`: a language or mode this engine does not run."
+        },
+        "error": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}
