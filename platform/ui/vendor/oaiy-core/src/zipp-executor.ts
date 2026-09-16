@@ -68,10 +68,46 @@
 export interface ZippEngine {
   initScript(source: string): unknown;
   drainPendingHostCalls(): unknown;
+  /**
+   * The status-bearing drain: `{ calls, hasMore, stopReason }`. Optional so a
+   * build without it still runs — `drainInto` then falls back to the single
+   * legacy pass, with the stall that pass cannot avoid (see `drainInto`).
+   */
+  drainPendingHostCallsStatus?(): unknown;
   resolveHostCallback(callId: number, result: unknown): void;
   renewInstructionBudget(): boolean;
+  /** Host-only: size the budget before `initScript`; renewal restores that size. */
+  setInstructionBudget?(steps: number): boolean;
   takeOutput(): unknown;
   dispose(): void;
+}
+
+/**
+ * Two of the engine's own limits, mirrored here because `oaiy-core` cannot
+ * read the installed `PROFILE.json` from a browser. `zipp-executor.mjs`
+ * asserts each against the running engine's profile, so a release that moves
+ * one fails a test instead of drifting silently.
+ *
+ *   * `hostCallDrainAttempts` — how many bounded drain passes one `drainInto`
+ *     may take before yielding to the pump. The engine applies the same figure
+ *     to its own peeks within a pass.
+ *   * `maxInstructionBudgetSteps` — the ceiling `setInstructionBudget` clamps
+ *     to. The engine clamps silently (zero and negatives to one step, above
+ *     the maximum to the maximum, a non-finite number to the default);
+ *     `ZippSession` refuses instead, because a host that asks for a budget it
+ *     cannot have should hear about it rather than run on another.
+ */
+export const ZIPP_HOST_CALL_DRAIN_ATTEMPTS = 64;
+export const ZIPP_MAX_INSTRUCTION_BUDGET_STEPS = 2_000_000_000;
+
+export interface ZippSessionOptions {
+  /**
+   * The instruction budget for the top level and for every re-entry, in
+   * steps. Unset leaves the engine's own default (50M, `lifetimeSteps` in
+   * PROFILE.json), which is what the browser runs on. Must be an integer in
+   * `1..ZIPP_MAX_INSTRUCTION_BUDGET_STEPS`.
+   */
+  instructionBudgetSteps?: number;
 }
 
 /** One `host.call` the guest queued, as Zipp hands it back. */
@@ -358,12 +394,22 @@ export class ZippSession {
   private readonly engine: ZippEngine;
   private readonly hooks: ZippSessionHooks;
   private readonly pending: ZippHostCall[] = [];
+  private readonly instructionBudgetSteps: number | undefined;
   private settled = false;
   private aborted = false;
 
-  constructor(engine: ZippEngine, hooks: ZippSessionHooks) {
+  constructor(engine: ZippEngine, hooks: ZippSessionHooks, opts: ZippSessionOptions = {}) {
     this.engine = engine;
     this.hooks = hooks;
+    const steps = opts.instructionBudgetSteps;
+    if (steps !== undefined) {
+      if (!Number.isInteger(steps) || steps < 1 || steps > ZIPP_MAX_INSTRUCTION_BUDGET_STEPS) {
+        throw new RangeError(
+          `instructionBudgetSteps must be an integer from 1 to ${ZIPP_MAX_INSTRUCTION_BUDGET_STEPS}, not ${String(steps)}`,
+        );
+      }
+    }
+    this.instructionBudgetSteps = steps;
   }
 
   /**
@@ -372,6 +418,23 @@ export class ZippSession {
    * matching the callback shape the Worker protocol already uses.
    */
   async run(script: string): Promise<void> {
+    // Sized BEFORE initScript so the allowance governs the top level as well
+    // as every re-entry: `renewInstructionBudget` restores the size set here
+    // rather than the engine's default. A host that asked for a budget must
+    // get it — an engine that cannot take one, or refuses (it returns false
+    // once budget has been spent), fails the run rather than running on the
+    // default.
+    if (this.instructionBudgetSteps !== undefined) {
+      if (typeof this.engine.setInstructionBudget !== 'function') {
+        this.fail('This Zipp engine cannot take an instruction budget (no setInstructionBudget)');
+        return;
+      }
+      if (!this.engine.setInstructionBudget(this.instructionBudgetSteps)) {
+        this.fail('Zipp refused the instruction budget: the engine has already spent budget');
+        return;
+      }
+    }
+
     try {
       this.engine.initScript(script);
     } catch (e) {
@@ -454,10 +517,42 @@ export class ZippSession {
     }
   }
 
+  /**
+   * Move everything the guest has queued into `pending`.
+   *
+   * A drain is bounded — per pass the engine delivers at most
+   * `hostCallDrainRequests` calls and a ceiling of bytes/work — and reports
+   * the cut through `hasMore` on the status-bearing form. That matters here
+   * because console lines travel on the same queue and cost no round trip:
+   * a burst of large lines between two awaits fills a whole pass with
+   * console calls, the pump forwards them all without re-entering the guest,
+   * and then finds `pending` empty while the guest's real `host.call` — the
+   * one it is waiting on — is still sitting behind the cut. With the single
+   * legacy pass that is reported as "Workflow stalled". So: keep draining
+   * while the engine says there is more, up to the engine's own attempt
+   * ceiling; anything beyond that waits for the next `drainInto`, after the
+   * next re-entry (unreachable in practice — the guest queue holds 4096, one
+   * pass delivers over 1600 at 20 KiB each).
+   *
+   * Without `drainPendingHostCallsStatus` there is one pass and no signal,
+   * which is exactly the legacy behaviour above.
+   */
   private drainInto(): void {
-    const calls = asHostCalls(this.engine.drainPendingHostCalls());
-    for (const call of calls) this.pending.push(call);
+    for (let attempt = 0; attempt < ZIPP_HOST_CALL_DRAIN_ATTEMPTS; attempt++) {
+      const status = this.drainOnce();
+      for (const call of status.calls) this.pending.push(call);
+      if (!status.hasMore) break;
+    }
     this.drainEngineOutput();
+  }
+
+  private drainOnce(): { calls: ZippHostCall[]; hasMore: boolean } {
+    if (typeof this.engine.drainPendingHostCallsStatus !== 'function') {
+      return { calls: asHostCalls(this.engine.drainPendingHostCalls()), hasMore: false };
+    }
+    const raw = this.engine.drainPendingHostCallsStatus();
+    const status = raw && typeof raw === 'object' ? (raw as { calls?: unknown; hasMore?: unknown }) : {};
+    return { calls: asHostCalls(status.calls), hasMore: status.hasMore === true };
   }
 
   /**
