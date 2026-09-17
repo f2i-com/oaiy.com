@@ -274,7 +274,7 @@ fn asset_for_platform() -> Result<(String, String, bool), String> {
 }
 
 /// Reject an archive member whose path escapes the extraction root. Note what
-/// this rejects beyond `..`: an absolute path, and on Windows a drive or UNC
+/// this rejects beyond `..`: an absolute path, and a drive or UNC
 /// prefix — a member named `C:/Windows/...` joined onto the destination lands
 /// back at the drive root without a `..` anywhere in it. `python.rs` shares
 /// this rather than keeping its own, weaker, copy.
@@ -286,6 +286,21 @@ pub(super) fn safe_member(path: &Path) -> bool {
     // is skipped. Everything after it must still be Normal: no `..`, no root,
     // and no Windows drive/UNC prefix (`C:evil` has a Prefix component and is
     // NOT absolute, so `is_absolute()` alone would let it through).
+    // The drive and UNC forms are judged as TEXT, because `Prefix` is a
+    // Windows-only parse: on Unix `C:evil.dll` is one ordinary file name
+    // and `C:\Windows\evil.dll` is another, so leaving them to
+    // `components()` would accept on Linux exactly what it rejects on
+    // Windows. What an archive holds is decided by whoever built it, not
+    // by the host that opens it, and such a member is inert on Linux but
+    // an escape the moment that same archive is unpacked on Windows — so
+    // the name is read the same way on both. No member of a Node or
+    // Python runtime archive carries a backslash honestly.
+    let text = path.to_string_lossy();
+    let drive_prefixed = matches!(text.as_bytes(), [d, b':', ..] if d.is_ascii_alphabetic());
+    if drive_prefixed || text.contains('\\') {
+        return false;
+    }
+
     let mut components = path.components().peekable();
     if matches!(components.peek(), Some(Component::CurDir)) {
         components.next();
@@ -443,8 +458,14 @@ mod tests {
         assert!(!safe_member(Path::new("/etc/passwd")));
         // A Windows drive-relative prefix is NOT absolute, so `is_absolute()`
         // alone would wave it through — `join` on it replaces the whole base.
+        // These hold on Linux too, where no `Prefix` component is ever
+        // produced and `C:evil.dll` would otherwise read as one ordinary
+        // file name — accepted there, an escape when the same archive is
+        // unpacked on Windows.
         assert!(!safe_member(Path::new("C:evil.dll")));
         assert!(!safe_member(Path::new(r"C:\Windows\System32\evil.dll")));
+        assert!(!safe_member(Path::new(r"\\server\share\evil.dll")));
+        assert!(!safe_member(Path::new(r"python\..\..\evil")));
         // An INTERIOR `.` needs no special handling: Rust's `components()`
         // normalises it away, so this is already just `python/bin`. Only a
         // LEADING one survives as a component, which is why the skip is a
