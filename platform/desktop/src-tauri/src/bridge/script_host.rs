@@ -132,8 +132,21 @@ pub const RESTART_BACKOFF: Duration = Duration::from_secs(5);
 pub const DEFAULT_JOB_BUDGET_MS: u64 = 1000;
 /// The child's watchdog grace over a job's budget (`SCRIPT_WATCHDOG_GRACE_MS`).
 pub const JOB_GRACE_MS: u64 = 1500;
-/// Ceiling on one batch's deadline: the app-logic lane's own run timeout.
+/// Ceiling on one batch's deadline, and so on how much work one batch may
+/// carry. Both lanes that build batches — app logic and conditions — plan
+/// against it through [`batch_ranges`].
 pub const MAX_BATCH_DEADLINE: Duration = Duration::from_secs(60);
+/// Milliseconds of one batch's deadline left unspent.
+///
+/// [`MAX_BATCH_DEADLINE`] is a hard ceiling: a batch whose jobs could take
+/// longer has its deadline capped, and when the cap passes the host KILLS the
+/// child and replaces it — losing every answer in the batch, the jobs that had
+/// already finished included. So batches are assembled to finish inside the
+/// ceiling with room to spare, because the child also constructs one engine per
+/// job and that time is not in any job's budget.
+pub const BATCH_HEADROOM_MS: u64 = 5_000;
+/// Bytes of [`MAX_REQUEST_BYTES`] reserved for the envelope around the jobs.
+pub const REQUEST_HEADROOM_BYTES: usize = 4_096;
 /// How long a freshly spawned child has to answer its first ping. It loads and
 /// compiles the engine before reading a line, the same work as the probe.
 pub const START_DEADLINE: Duration = worker::PROBE_DEADLINE;
@@ -333,6 +346,65 @@ pub fn batch_deadline(request: &Value) -> Duration {
         .unwrap_or(0);
     Duration::from_millis(sum_ms.max(JOB_GRACE_MS)).min(MAX_BATCH_DEADLINE)
 }
+
+/// Where each batch of `jobs` starts and ends.
+///
+/// Contiguous and in order, so the caller can send them one after another and
+/// read each reply back by job id.
+///
+/// Two ceilings, both this host's:
+///
+/// * **Time.** A batch's deadline is the sum of its jobs' budgets plus a grace
+///   each, capped at [`MAX_BATCH_DEADLINE`]. Past the cap the deadline is a
+///   promise the child cannot keep, and a timeout is met by killing the child —
+///   which loses every answer in the batch, the jobs that had already finished
+///   included. At the app-logic budget (1000 ms + 1500 ms grace) that is 22 jobs
+///   to a batch with [`BATCH_HEADROOM_MS`] left over; at the condition budget
+///   (250 ms) it is 31.
+/// * **Size.** [`MAX_REQUEST_BYTES`] bounds the whole request, and every job
+///   carries its own copy of its context — each job is a fresh engine, so there
+///   is nothing to share it through. One app's markers, or one event's data
+///   repeated across many conditions, can be large, so a few jobs are enough to
+///   reach the cap. `prelude_bytes` comes off that budget FIRST: the provider's
+///   standard library rides on every batch and is several times
+///   [`REQUEST_HEADROOM_BYTES`], so a batch packed to the old budget would
+///   arrive over the ceiling and be refused whole.
+///
+/// More jobs than one batch can carry are therefore SPLIT rather than truncated
+/// or over-committed: every job still runs, in order, and no batch is ever
+/// bigger than what this host can promise. A single job over a ceiling on its
+/// own still forms a batch — it fails on its own account, with a reason, instead
+/// of taking its neighbours down with it.
+pub fn batch_ranges(jobs: &[Value], prelude_bytes: usize) -> Vec<std::ops::Range<usize>> {
+    let deadline_budget = MAX_BATCH_DEADLINE.as_secs() * 1000 - BATCH_HEADROOM_MS;
+    let byte_budget = MAX_REQUEST_BYTES
+        .saturating_sub(REQUEST_HEADROOM_BYTES)
+        .saturating_sub(prelude_bytes);
+    let mut ranges = Vec::new();
+    let (mut start, mut ms, mut bytes) = (0usize, 0u64, 0usize);
+    for (i, job) in jobs.iter().enumerate() {
+        let cost = job
+            .get("budgetMs")
+            .and_then(Value::as_u64)
+            .unwrap_or(DEFAULT_JOB_BUDGET_MS)
+            .saturating_add(JOB_GRACE_MS);
+        let size = serde_json::to_vec(job).map(|b| b.len() + 1).unwrap_or(usize::MAX);
+        let over = ms.saturating_add(cost) > deadline_budget || bytes.saturating_add(size) > byte_budget;
+        if over && i > start {
+            ranges.push(start..i);
+            start = i;
+            ms = 0;
+            bytes = 0;
+        }
+        ms = ms.saturating_add(cost);
+        bytes = bytes.saturating_add(size);
+    }
+    if start < jobs.len() {
+        ranges.push(start..jobs.len());
+    }
+    ranges
+}
+
 
 // ---------------------------------------------------------------------------
 // The demultiplexer: pure, so every routing rule is pinned without a process
