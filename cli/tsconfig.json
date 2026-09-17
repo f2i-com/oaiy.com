@@ -14,6 +14,12 @@
     "types": ["node"],
     "baseUrl": ".",
     "paths": {
+      // `../ui/**` files import these, and Node resolution walks up from THEIR
+      // directory — never into `cli/node_modules` — so a checkout that installed
+      // only this workspace cannot resolve them. `cli` declares both itself, so
+      // point at its own copies rather than making CI install the ui tree.
+      "acorn": ["./node_modules/acorn"],
+      "uuid": ["./node_modules/uuid"],
       "oaiy-core": ["../ui/vendor/oaiy-core/src/index.ts"],
       "oaiy-core/modules/*": ["../ui/src/bundled-modules/*"],
       "oaiy-core/*": ["../ui/vendor/oaiy-core/*"],
