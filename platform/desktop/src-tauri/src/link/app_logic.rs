@@ -8,7 +8,7 @@
 //!
 //! ```text
 //!   plugin event ──► GET {path}  (apps, their forms, their scripts)
-//!                      └─► one logic_block per script ──► `oaiy run` ──► effects
+//!                      └─► one `entry` job per script ──► warm script host ──► effects
 //!                                                            └─► POST/PUT records
 //!                                                            └─► storage marker
 //!                                                            └─► connector command
@@ -17,10 +17,27 @@
 //! # Four rules everything here follows
 //!
 //! **There is no second script engine.** The scripts are JavaScript, and this
-//! crate does not embed a JS runtime to run them. They are wrapped into a
-//! one-node-per-script graph and handed to the same bundled CLI that executes
-//! flows — the identical reasoning as `bridge/worker.rs`: a second engine kept
-//! "in sync" is the failure this architecture exists to avoid.
+//! crate does not embed a JS runtime to run them. Each one becomes a leaf-script
+//! `entry` job on the warm script host ([`crate::bridge::script_host`]), which
+//! is the same ZIPP engine the flow runner uses — the identical reasoning as
+//! `bridge/worker.rs`: a second engine kept "in sync" is the failure this
+//! architecture exists to avoid.
+//!
+//! **One batch per event, not one process per app.** The lane used to wrap an
+//! app's scripts into a one-node-per-script graph and spawn the CLI for it, so
+//! every plugin event carrying app logic cost a Node start-up per app. Now every
+//! script of every app of one event goes to the host in ONE batch (split only
+//! when it would not fit — see [`batch_ranges`]), which is the third and last
+//! batch an event sends: trigger conditions, then flow-binding conditions after
+//! the provider fetch, then this. They are not merged: they are decided at
+//! different moments by different owners, and they serialise on the host's own
+//! process-wide lock anyway.
+//!
+//! Because the batch runs first and the effects are applied afterwards, every
+//! app's markers are read BEFORE any script runs. That is the same snapshot
+//! every script of one app already saw; markers are per app and an app is
+//! refused if the provider lists it twice, so no script can observe another's
+//! writes either way.
 //!
 //! **The provider is data.** Effect TYPE names, the field names inside an
 //! effect, and every path come from [`AppLogicSpec`]. Nothing below knows a
@@ -46,7 +63,10 @@ use serde_json::{json, Map, Value};
 
 use super::descriptor::{AppLogicCatalogue, AppLogicOperation, AppLogicSpec};
 use super::LinkedAccount;
-use crate::bridge::worker::{run_flow_cli, CliOutcome, CliRequest};
+use crate::bridge::script_host::{
+    batch_request, HostError, JobError, ScriptBatch, DEFAULT_JOB_BUDGET_MS, JOB_GRACE_MS,
+    MAX_BATCH_DEADLINE, MAX_REQUEST_BYTES,
+};
 
 /// How long a fetched script set is reused.
 ///
@@ -55,13 +75,6 @@ use crate::bridge::worker::{run_flow_cli, CliOutcome, CliRequest};
 /// large — it carries every script of every installed app. Short enough that
 /// reinstalling an app is picked up while somebody is still watching.
 const CATALOG_TTL: Duration = Duration::from_secs(120);
-
-/// Wall-clock budget for one event's scripts.
-///
-/// They are pure transforms with no I/O of their own, so this is a guard against
-/// a runaway loop rather than a work budget. The CLI gets the same number and
-/// times out first, so the error names the script that stuck.
-const RUN_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Keys one app's storage keeps before the oldest are dropped.
 ///
@@ -118,6 +131,12 @@ impl AppEntry {
     }
 
     /// The scripts that run on an event, in publication order.
+    ///
+    /// A script the author switched OFF is not one of them. The flag reads as
+    /// "not disabled" — the key is usually absent, and absent means a script
+    /// that runs — so only an explicit `false` skips it. Without this the
+    /// desktop would keep running headlessly what the browser had stopped
+    /// running, and the author would have no way to tell.
     fn event_scripts<'a>(&'a self, c: &AppLogicCatalogue, hook: &str) -> Vec<ScriptRef<'a>> {
         self.0
             .get(&c.logic_block)
@@ -127,6 +146,7 @@ impl AppEntry {
                 scripts
                     .iter()
                     .filter(|s| s.get(&c.script_hook).and_then(Value::as_str) == Some(hook))
+                    .filter(|s| s.get(&c.script_enabled).and_then(Value::as_bool) != Some(false))
                     .filter_map(|s| {
                         let source = s.get(&c.script_source).and_then(Value::as_str)?;
                         if source.trim().is_empty() {
@@ -516,13 +536,19 @@ impl StorageStore {
 /// effect attempted plus one for anything that went wrong before the effects
 /// were reached. Never an error — this lane is best effort by construction, and
 /// the caller has already dispatched the event locally.
+///
+/// Three passes, in this order: collect every app's scripts and markers; run
+/// them all on the script host; then perform each app's effects. The middle
+/// pass is the only one that touches the engine, and an event whose apps carry
+/// no event scripts never reaches it — which is what keeps a quiet account from
+/// spawning a script host it has no use for.
 pub fn handle_event(
     account: &LinkedAccount,
     spec: &AppLogicSpec,
     apps: &[AppEntry],
     storage: &StorageStore,
     envelope: &Value,
-    node: Option<&crate::services::node_runtime::NodeHandle>,
+    host: &dyn ScriptBatch,
     connector: &ConnectorFn,
 ) -> Vec<Outcome> {
     let mut out = Vec::new();
@@ -531,8 +557,99 @@ pub fn handle_event(
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
-    let mut ran: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
 
+    let runs = collect(spec, apps, storage, envelope, &mut out);
+    if runs.is_empty() {
+        return out;
+    }
+
+    // The provider names the function its scripts declare. There is no default
+    // here on purpose: guessing one would mean a provider whose scripts declare
+    // something else runs nothing at all while every event reports success.
+    let Some(entry_function) = spec.entry_function.as_deref().filter(|f| !f.is_empty()) else {
+        for run in &runs {
+            out.push(Outcome::err(
+                run.app,
+                "-",
+                "lane",
+                "this provider's descriptor names no entryFunction, so there is no function to \
+                 call in its scripts and none of them were run",
+            ));
+        }
+        return out;
+    };
+
+    let replies = run_on_host(host, spec, entry_function, &runs);
+
+    for (i, run) in runs.iter().enumerate() {
+        if let Some(why) = replies.lane.get(&i) {
+            // ONE line for the app, not one per script: the scripts did nothing
+            // wrong, the engine was not there.
+            out.push(Outcome::err(run.app, "-", "lane", why.clone()));
+            continue;
+        }
+        for (j, script) in run.scripts.iter().enumerate() {
+            let name = if script.id.is_empty() {
+                "(unnamed script)"
+            } else {
+                script.id
+            };
+            let value = match replies.by_job.get(&job_id(i, j)) {
+                Some(Ok(v)) => v,
+                Some(Err(e)) => {
+                    out.push(Outcome::err(run.app, name, "script", e.clone()));
+                    continue;
+                }
+                None => {
+                    out.push(Outcome::err(
+                        run.app,
+                        name,
+                        "script",
+                        "the script host answered the batch without this script, so nothing it \
+                         asked for was performed",
+                    ));
+                    continue;
+                }
+            };
+            let effects = match effects_of(spec, value) {
+                Ok(list) => list,
+                Err(e) => {
+                    out.push(Outcome::err(run.app, name, "script", e));
+                    continue;
+                }
+            };
+            if effects.is_empty() {
+                continue;
+            }
+            out.extend(apply_effects(
+                account, spec, run.entry, run.app, name, effects, storage, &event_key, connector,
+            ));
+        }
+    }
+    out
+}
+
+/// One app's scripts and the context they run against.
+struct AppRun<'a> {
+    app: &'a str,
+    entry: &'a AppEntry,
+    ctx: Value,
+    scripts: Vec<ScriptRef<'a>>,
+}
+
+/// Resolve every app that has work on this event, with its markers read.
+///
+/// Anything that stops an app before its scripts — no id, listed twice, markers
+/// that would not read — is pushed onto `out` here and the app is left out.
+fn collect<'a>(
+    spec: &AppLogicSpec,
+    apps: &'a [AppEntry],
+    storage: &StorageStore,
+    envelope: &Value,
+    out: &mut Vec<Outcome>,
+) -> Vec<AppRun<'a>> {
+    let mut runs = Vec::new();
+    let mut ran: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
     for entry in apps {
         let Some(app) = entry.key(&spec.catalogue) else {
             // Without an id there is nowhere to keep this app's markers, so its
@@ -564,7 +681,6 @@ pub fn handle_event(
             ));
             continue;
         }
-
         let seen = match storage.values(app) {
             Ok(v) => v,
             // Not "start from empty": every script dedups on these keys, so
@@ -583,47 +699,226 @@ pub fn handle_event(
                 continue;
             }
         };
-        let ctx = json!({
-            "event": envelope,
-            "storage": seen,
+        runs.push(AppRun {
+            app,
+            entry,
+            ctx: json!({ "event": envelope, "storage": seen }),
+            scripts,
         });
-        let results = match run_scripts(&scripts, &ctx, node, spec.instruction_budget) {
-            Ok(r) => r,
-            Err(e) => {
-                out.push(Outcome::err(app, "-", "lane", e));
-                continue;
-            }
-        };
+    }
+    runs
+}
 
-        for (script, result) in scripts.iter().zip(results) {
-            let name = if script.id.is_empty() {
-                "(unnamed script)"
-            } else {
-                script.id
-            };
-            let value = match result {
-                Ok(v) => v,
-                Err(e) => {
-                    out.push(Outcome::err(app, name, "script", e));
-                    continue;
-                }
-            };
-            let effects = match effects_of(spec, &value) {
-                Ok(list) => list,
-                Err(e) => {
-                    out.push(Outcome::err(app, name, "script", e));
-                    continue;
-                }
-            };
-            if effects.is_empty() {
+// --- running the scripts on the warm script host ---------------------------
+
+/// The largest source one script may carry.
+///
+/// EVERY JavaScript mode of the leaf-script envelope compiles the author's text
+/// inside the guest — `entry` wraps it in a `Function` — so the engine's
+/// dynamic-code ceiling (`limits.dynamicCodeSourceBytes`) bounds an app-logic
+/// script whichever mode it runs in. Over it, the job comes back `resource`
+/// with a message about dynamic code that names neither the script nor what to
+/// do about it.
+///
+/// So an oversized script is refused HERE, by name and by size, and its
+/// neighbours in the same event still run. There is nowhere earlier to refuse
+/// it: this desktop neither authors nor saves app-logic scripts — it runs
+/// whatever the provider published, which can grow past the ceiling between two
+/// fetches — so "refuse at save" is not a move this side can make.
+///
+/// Compared in UTF-8 bytes, which is never fewer than the UTF-16 units the
+/// engine counts, so this refuses nothing the engine would have run.
+/// `the_source_ceiling_is_the_engines_own` pins the figure against the STAGED
+/// `zipp/PROFILE.json`, so a release that moves it fails a test rather than
+/// drifting into a lane that quietly stops running long scripts.
+pub const MAX_SCRIPT_SOURCE_BYTES: usize = 65_536;
+
+/// Milliseconds of one batch's deadline left unspent.
+///
+/// [`MAX_BATCH_DEADLINE`] is a hard ceiling: a batch whose jobs could take
+/// longer has its deadline capped, and when the cap passes the host KILLS the
+/// child and replaces it — losing every answer in the batch, the scripts that
+/// had already finished included. So batches are assembled to finish inside the
+/// ceiling with room to spare, because the child also constructs one engine per
+/// job and that time is not in any job's budget.
+const BATCH_HEADROOM_MS: u64 = 5_000;
+
+/// Bytes of [`MAX_REQUEST_BYTES`] reserved for the envelope around the jobs.
+const REQUEST_HEADROOM_BYTES: usize = 4_096;
+
+/// The job id for the `script`th script of the `app`th run of one event.
+///
+/// Synthetic, not `<app>/<script>`: both of those are the provider's strings,
+/// the request schema bounds a job id at 1..128 characters, and an id that
+/// varies with the provider's naming is an id that can collide.
+fn job_id(app: usize, script: usize) -> String {
+    format!("a{app}s{script}")
+}
+
+/// One script as `protocol/v1/script-request.schema.json` describes it.
+///
+/// `entry` mode: the source is compiled as written, the function the provider
+/// names is looked up in it, and it is called with the context as its one
+/// argument. Nothing is rewritten on the way — no unboxing, no `return`
+/// rewriting, no encoding — because nothing between here and the engine reads
+/// the source as anything but source.
+///
+/// `budgetMs` and `instructionSteps` are the provider's two budgets and are
+/// OMITTED when it names neither: the wall-clock default belongs to the CLI and
+/// the step default to the engine, and inventing either here would put a figure
+/// in this file that nothing else agrees with.
+fn script_job(id: &str, spec: &AppLogicSpec, entry_function: &str, script: &ScriptRef, ctx: &Value) -> Value {
+    let mut job = json!({
+        "id": id,
+        "mode": "entry",
+        "entry": entry_function,
+        "source": script.source,
+        "args": [ctx],
+    });
+    if let Some(ms) = spec.budget_ms {
+        job["budgetMs"] = json!(ms);
+    }
+    if let Some(steps) = spec.instruction_budget {
+        job["instructionSteps"] = json!(steps);
+    }
+    job
+}
+
+/// What the host said about one event's scripts.
+#[derive(Debug, Default)]
+struct Replies {
+    /// Per job id: the value its entry function returned, or why it did not.
+    by_job: BTreeMap<String, Result<Value, String>>,
+    /// Per app index: the batch carrying its scripts was never served.
+    lane: BTreeMap<usize, String>,
+}
+
+/// Where each batch of `jobs` starts and ends.
+///
+/// Contiguous and in order, so the caller can send them one after another and
+/// read each reply back by job id.
+///
+/// Two ceilings, both the host's:
+///
+/// * **Time.** The host's deadline for a batch is the sum of its jobs' budgets
+///   plus a grace each, capped at [`MAX_BATCH_DEADLINE`]. Past the cap the
+///   deadline is a promise the child cannot keep, and the host meets a
+///   timeout by killing the child. At the shipped budget (1000 ms + 1500 ms grace)
+///   that is 22 scripts to a batch with [`BATCH_HEADROOM_MS`] left over.
+/// * **Size.** [`MAX_REQUEST_BYTES`] bounds the whole request, and every job
+///   carries its own copy of the context — each job is a fresh engine, so there
+///   is nothing to share it through. One app's markers can be large, so a few
+///   scripts of one app are enough to reach the cap.
+///
+/// A graph with more scripts than one batch can carry is therefore SPLIT rather
+/// than truncated or over-committed: every script still runs, in publication
+/// order, and no batch is ever bigger than what the host can promise. A single
+/// job over a ceiling on its own still forms a batch — it fails on its own
+/// account, with a reason, instead of taking the event's other scripts with it.
+fn batch_ranges(jobs: &[Value]) -> Vec<std::ops::Range<usize>> {
+    let deadline_budget = MAX_BATCH_DEADLINE.as_secs() * 1000 - BATCH_HEADROOM_MS;
+    let byte_budget = MAX_REQUEST_BYTES - REQUEST_HEADROOM_BYTES;
+    let mut ranges = Vec::new();
+    let (mut start, mut ms, mut bytes) = (0usize, 0u64, 0usize);
+    for (i, job) in jobs.iter().enumerate() {
+        let cost = job
+            .get("budgetMs")
+            .and_then(Value::as_u64)
+            .unwrap_or(DEFAULT_JOB_BUDGET_MS)
+            .saturating_add(JOB_GRACE_MS);
+        let size = serde_json::to_vec(job).map(|b| b.len() + 1).unwrap_or(usize::MAX);
+        let over = ms.saturating_add(cost) > deadline_budget || bytes.saturating_add(size) > byte_budget;
+        if over && i > start {
+            ranges.push(start..i);
+            start = i;
+            ms = 0;
+            bytes = 0;
+        }
+        ms = ms.saturating_add(cost);
+        bytes = bytes.saturating_add(size);
+    }
+    if start < jobs.len() {
+        ranges.push(start..jobs.len());
+    }
+    ranges
+}
+
+/// Run every script of this event on the host, in as few batches as fit.
+fn run_on_host(
+    host: &dyn ScriptBatch,
+    spec: &AppLogicSpec,
+    entry_function: &str,
+    runs: &[AppRun],
+) -> Replies {
+    let mut replies = Replies::default();
+    let mut jobs: Vec<Value> = Vec::new();
+    // Which app each job belongs to, so a batch that is never served can be
+    // reported once per app rather than once per script.
+    let mut owner: Vec<usize> = Vec::new();
+    for (i, run) in runs.iter().enumerate() {
+        for (j, script) in run.scripts.iter().enumerate() {
+            let id = job_id(i, j);
+            if script.source.len() > MAX_SCRIPT_SOURCE_BYTES {
+                replies.by_job.insert(
+                    id,
+                    Err(format!(
+                        "this script is {} bytes of source and the engine compiles at most {} \
+                         ({} too many), so it was not run — split it or shorten it",
+                        script.source.len(),
+                        MAX_SCRIPT_SOURCE_BYTES,
+                        script.source.len() - MAX_SCRIPT_SOURCE_BYTES
+                    )),
+                );
                 continue;
             }
-            out.extend(apply_effects(
-                account, spec, entry, app, name, effects, storage, &event_key, connector,
-            ));
+            jobs.push(script_job(&id, spec, entry_function, script, &run.ctx));
+            owner.push(i);
         }
     }
-    out
+    for range in batch_ranges(&jobs) {
+        let batch = batch_request(jobs[range.clone()].to_vec());
+        match host.run(&batch) {
+            Ok(response) => {
+                for job in &jobs[range] {
+                    let Some(id) = job.get("id").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    if let Some(result) = response.result(id) {
+                        replies
+                            .by_job
+                            .insert(id.to_string(), result.outcome.clone().map_err(job_failure));
+                    }
+                }
+            }
+            Err(e) => {
+                let why = host_failure(&e);
+                for app in &owner[range] {
+                    replies.lane.entry(*app).or_insert_with(|| why.clone());
+                }
+            }
+        }
+    }
+    replies
+}
+
+/// Why one script did not produce a value.
+///
+/// `guest` is the script's own doing — it threw, or it does not compile — and
+/// keeps the word the lane has always used for it. Every other kind is the
+/// engine or the wiring rather than the script, and says so, because the fix is
+/// somewhere else entirely.
+fn job_failure(e: JobError) -> String {
+    match e.kind.as_str() {
+        "guest" => format!("the script threw: {}", e.message),
+        "timeout" => format!("the script ran past its time budget and was stopped: {}", e.message),
+        "resource" => format!("the script exceeded an engine ceiling: {}", e.message),
+        other => format!("the script could not be run ({other}): {}", e.message),
+    }
+}
+
+/// Why a whole batch was never served.
+fn host_failure(e: &HostError) -> String {
+    format!("{e}; this app's scripts were not run for this event")
 }
 
 /// The effects a script asked for, out of whatever it returned.
@@ -664,281 +959,6 @@ fn type_name(v: &Value) -> &'static str {
         Value::Array(_) => "list",
         Value::Object(_) => "object",
     }
-}
-
-/// Wrap every script into one graph and hand it to the bundled CLI.
-///
-/// One node per script, chained, so the CLI runs them all in a defined order in
-/// ONE process — a process per script would put a Node start-up between every
-/// line of a transcript.
-///
-/// Returns one result per script, in the same order, each either the value its
-/// `run(ctx)` produced or the reason it threw. A script that fails is its own
-/// failure and must not take its neighbours with it, so the throw is caught
-/// INSIDE the generated node rather than out here.
-fn run_scripts(
-    scripts: &[ScriptRef],
-    ctx: &Value,
-    node: Option<&crate::services::node_runtime::NodeHandle>,
-    instruction_budget: Option<u64>,
-) -> Result<Vec<Result<Value, String>>, String> {
-    let graph = build_graph(scripts, ctx)?;
-
-    // Everything travels by file: the context holds whatever the event carried,
-    // and argv is visible to every process lister on the machine.
-    // Process id and a counter, not a timestamp: two runs in the same
-    // millisecond would share a directory, and the second would read the
-    // first's result file as its own.
-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let scratch = std::env::temp_dir().join(format!(
-        "oaiy-app-logic-{}-{}",
-        std::process::id(),
-        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    ));
-    let _ = std::fs::remove_dir_all(&scratch);
-    std::fs::create_dir_all(&scratch)
-        .map_err(|e| format!("could not create a working directory for the scripts: {e}"))?;
-    let result = run_graph_in(&scratch, &graph, scripts.len(), node, instruction_budget);
-    let _ = std::fs::remove_dir_all(&scratch);
-    result
-}
-
-fn node_id(i: usize) -> String {
-    format!("s{i}")
-}
-
-/// The graph: one code node per script, chained.
-///
-/// Chained rather than left as loose roots because an unconnected node is not
-/// obviously a node the runner has to visit, and a script that is never visited
-/// records nothing while reporting nothing either.
-fn build_graph(scripts: &[ScriptRef], ctx: &Value) -> Result<Value, String> {
-    let mut nodes = Vec::with_capacity(scripts.len());
-    let mut edges = Vec::new();
-    for (i, script) in scripts.iter().enumerate() {
-        let code = script_node_code(script.source, ctx)?;
-        nodes.push(json!({
-            "id": node_id(i),
-            "type": "logic_block",
-            "position": { "x": (i as i64) * 240, "y": 0 },
-            "data": { "code": code },
-        }));
-        if i > 0 {
-            edges.push(json!({ "source": node_id(i - 1), "target": node_id(i) }));
-        }
-    }
-    Ok(json!({ "nodes": nodes, "edges": edges }))
-}
-
-fn run_graph_in(
-    scratch: &Path,
-    graph: &Value,
-    count: usize,
-    node: Option<&crate::services::node_runtime::NodeHandle>,
-    instruction_budget: Option<u64>,
-) -> Result<Vec<Result<Value, String>>, String> {
-    let graph_path = scratch.join("graph.json");
-    let inputs_path = scratch.join("inputs.json");
-    let out_path = scratch.join("result.json");
-    std::fs::write(&graph_path, graph.to_string())
-        .map_err(|e| format!("could not write {}: {e}", graph_path.display()))?;
-    // The scripts read their context from inside their own node, so the run has
-    // no inputs — but the CLI still expects a file where one is named.
-    std::fs::write(&inputs_path, "{}")
-        .map_err(|e| format!("could not write {}: {e}", inputs_path.display()))?;
-
-    let outcome = run_flow_cli(
-        CliRequest {
-            flow_path: &graph_path,
-            inputs_path: &inputs_path,
-            out_path: &out_path,
-            // These scripts speak to nobody: every effect they ask for is
-            // performed out here, by this module, against the linked account.
-            connector_path: None,
-            timeout: RUN_TIMEOUT,
-            // The provider's policy, from its descriptor: it sized its scripts.
-            instruction_budget,
-            node,
-        },
-        // Nothing cancels an event's scripts; the budget does.
-        &|| false,
-    );
-
-    let report = match outcome {
-        CliOutcome::Succeeded(v) => v,
-        CliOutcome::Unreadable(why) => return Err(why),
-        CliOutcome::Failed { exit_code, detail } => {
-            return Err(if detail.is_empty() {
-                format!("the scripts could not be run (CLI exit {exit_code})")
-            } else {
-                format!("the scripts could not be run (CLI exit {exit_code}): {detail}")
-            })
-        }
-        CliOutcome::TimedOut => {
-            return Err(format!(
-                "the scripts exceeded their {}s budget and were killed",
-                RUN_TIMEOUT.as_secs()
-            ))
-        }
-        CliOutcome::Cancelled => return Err("the script run was cancelled".to_string()),
-        CliOutcome::Unavailable {
-            message, detail, ..
-        } => {
-            return Err(match detail {
-                Some(d) => format!("{message}. {d}"),
-                None => message,
-            })
-        }
-    };
-
-    parse_report(&report, count)
-}
-
-/// One result per script, from what the runner wrote.
-///
-/// Separate from the spawning so the shape the runner reports can be pinned
-/// against the real thing without a process, and so a script that threw is told
-/// apart from a script the runner never reached — those need different fixes.
-fn parse_report(report: &Value, count: usize) -> Result<Vec<Result<Value, String>>, String> {
-    if report.get("success").and_then(Value::as_bool) == Some(false) {
-        let why = report
-            .get("error")
-            .and_then(Value::as_str)
-            .unwrap_or("no reason given");
-        return Err(format!("the scripts could not be run: {why}"));
-    }
-
-    let results = report.get("results").cloned().unwrap_or(Value::Null);
-    Ok((0..count)
-        .map(|i| {
-            let slot = match results.get(node_id(i)) {
-                None | Some(Value::Null) => {
-                    return Err(
-                        "the runner produced no result for this script, so nothing it asked \
-                         for was performed"
-                            .to_string(),
-                    )
-                }
-                // A JSON string, deliberately — see `script_node_code` for why
-                // an object would be silently rewritten on the way out.
-                Some(Value::String(s)) => serde_json::from_str::<Value>(s).map_err(|e| {
-                    format!("the script's answer was not readable JSON ({e}): {s}")
-                })?,
-                Some(other) => {
-                    return Err(format!(
-                        "the runner answered with a {} rather than the script's own report, so \
-                         nothing it asked for was performed",
-                        type_name(other)
-                    ))
-                }
-            };
-            if slot.get("ok").and_then(Value::as_bool) == Some(true) {
-                Ok(slot.get("value").cloned().unwrap_or(Value::Null))
-            } else {
-                Err(format!(
-                    "the script threw: {}",
-                    slot.get("error").and_then(Value::as_str).unwrap_or("no message")
-                ))
-            }
-        })
-        .collect())
-}
-
-/// The code for one script's node.
-///
-/// # Why the source is encoded rather than pasted in
-///
-/// The runner's code-block compiler rewrites the text of a block line by line,
-/// turning every `return X;` it can see into an assignment plus a `break`. That
-/// is fine for a block someone typed into a node; it is fatal for a script that
-/// defines a FUNCTION, because the rewritten `break` lands inside a function
-/// body and the whole run dies at compile with "Illegal break statement" — the
-/// first thing this lane hit against the real scripts.
-///
-/// So the source never appears as source. It is percent-encoded — every byte,
-/// so the result is `%` and uppercase hex and nothing else — and decoded at run
-/// time inside a `Function`. That also keeps the node's code free of `;` and of
-/// newlines, which is what makes the compiler treat it as a single expression
-/// and simply assign its value, instead of taking one of the rewriting paths.
-///
-/// The three checks at the end are not decoration: each one is a way the code
-/// would silently take a different compiler branch and produce nothing.
-///
-/// # Why the answer comes back as a string
-///
-/// The runner "unboxes" a node's result: any object of one or two keys carrying
-/// one of a handful of value-ish names — `text`, `result`, `url`, `output` — is
-/// replaced by that key's contents, all the way down. That is helpful for a
-/// node returning `{ result: … }` and catastrophic here: a record of two fields
-/// one of which is called `text` arrives as the bare text, and the write that
-/// follows is missing every other field. Caught against a real transcript
-/// script, whose record is exactly that shape.
-///
-/// A string is not an object, so it is passed through untouched. The effects
-/// therefore travel back as JSON text and are parsed out here.
-fn script_node_code(source: &str, ctx: &Value) -> Result<String, String> {
-    // The try/catch is INSIDE the encoded body, where the compiler cannot see
-    // it, so a script that throws reports itself rather than failing the run.
-    let body = format!(
-        "try {{\n{source}\n;return JSON.stringify({{ ok: true, value: run(ctx) }});\n}} \
-         catch (e) {{ return JSON.stringify({{ ok: false, error: String((e && e.message) || e) }}); }}"
-    );
-    let code = format!(
-        "(new Function(\"ctx\",decodeURIComponent(\"{}\")))(JSON.parse(decodeURIComponent(\"{}\")))",
-        percent_encode(&body),
-        percent_encode(&ctx.to_string())
-    );
-    for (what, bad) in [("a semicolon", code.contains(';')), ("a newline", code.contains('\n'))] {
-        if bad {
-            return Err(format!(
-                "the generated script node contains {what}, which would make the runner \
-                 rewrite it instead of evaluating it"
-            ));
-        }
-    }
-    if contains_word(&code, "return") {
-        return Err(
-            "the generated script node contains a bare `return`, which the runner would \
-             rewrite into an illegal break"
-                .to_string(),
-        );
-    }
-    Ok(code)
-}
-
-/// Every byte as `%XX`, uppercase.
-///
-/// Deliberately not "encode what has to be encoded": encoding EVERYTHING is what
-/// guarantees the output is drawn from `%0-9A-F` alone, and therefore that it
-/// can contain neither a semicolon, nor a newline, nor the lowercase word the
-/// compiler rewrites on.
-fn percent_encode(s: &str) -> String {
-    const HEX: &[u8; 16] = b"0123456789ABCDEF";
-    let mut out = String::with_capacity(s.len() * 3);
-    for b in s.as_bytes() {
-        out.push('%');
-        out.push(HEX[usize::from(b >> 4)] as char);
-        out.push(HEX[usize::from(b & 0x0f)] as char);
-    }
-    out
-}
-
-/// Whether `needle` appears in `haystack` at word boundaries.
-fn contains_word(haystack: &str, needle: &str) -> bool {
-    let is_word = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '$';
-    let bytes = haystack.as_bytes();
-    let mut from = 0;
-    while let Some(rel) = haystack[from..].find(needle) {
-        let start = from + rel;
-        let end = start + needle.len();
-        let before_ok = start == 0 || !is_word(bytes[start - 1] as char);
-        let after_ok = end == haystack.len() || !is_word(bytes[end] as char);
-        if before_ok && after_ok {
-            return true;
-        }
-        from = start + 1;
-    }
-    false
 }
 
 // --- performing the effects ------------------------------------------------
@@ -1378,6 +1398,7 @@ fn idempotency_key(event_key: &str, script: &str, index: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bridge::conditions::testing::FakeHost;
 
     fn spec() -> AppLogicSpec {
         super::super::descriptor::find(std::path::Path::new("/nonexistent"), "formlogic")
@@ -1482,61 +1503,351 @@ mod tests {
     // --- the generated node ------------------------------------------------
 
     #[test]
-    fn a_script_that_defines_a_function_survives_the_code_block_compiler() {
-        // The failure this whole encoding exists for. The compiler rewrites
-        // every `return X;` it can SEE into an assignment plus `break`, so a
-        // script defining `function run(ctx) { … return {}; }` compiled to a
-        // `break` inside a function body and the run died outright with
-        // "Illegal break statement" — nothing ran, for any app.
-        let code = script_node_code(
-            "function run(ctx) { if (!ctx.event) return {}; return { effects: [] }; }",
-            &json!({ "event": { "name": "x" }, "storage": {} }),
-        )
-        .unwrap();
-        assert!(!contains_word(&code, "return"), "{code}");
-        assert!(!code.contains(';'), "a semicolon sends the compiler down another branch");
-        assert!(!code.contains('\n'));
-        // …and the payload really is only the safe alphabet.
-        let blobs: Vec<&str> = code.split('"').filter(|s| s.starts_with('%')).collect();
-        assert_eq!(blobs.len(), 2, "the source and the context, both encoded");
-        for blob in blobs {
+    fn a_scripts_source_reaches_its_job_exactly_as_the_provider_published_it() {
+        // The one property the old lane could not have: the source is not
+        // wrapped, encoded, or scanned for words the compiler would rewrite. It
+        // is the job's `source`, byte for byte, and the function the descriptor
+        // names is called with the context as its one argument.
+        //
+        // Anything less was a real failure once: the graph compiler rewrote
+        // `return` inside a function body into an illegal break and killed
+        // EVERY script of EVERY app.
+        let s = spec();
+        let source = "function run(ctx) {\n  return { effects: [] }; // ; and a \"quote\"\n}";
+        let script = ScriptRef { id: "one", source };
+        let ctx = json!({ "event": { "name": "x" }, "storage": {} });
+        let job = script_job("a0s0", &s, "run", &script, &ctx);
+        assert_eq!(job["source"], json!(source), "verbatim, not re-encoded");
+        assert_eq!(job["mode"], "entry");
+        assert_eq!(job["entry"], "run");
+        assert_eq!(job["args"], json!([ctx]), "the context is the one argument");
+        assert_eq!(job["budgetMs"], json!(1000), "the provider's clock");
+        assert_eq!(job["instructionSteps"], json!(200_000_000), "the provider's step budget");
+    }
+
+    #[test]
+    fn a_provider_that_names_neither_budget_leaves_both_defaults_where_they_live() {
+        // The wall clock belongs to the CLI and the step ceiling to the engine.
+        // Writing either figure here would put a number in this file that
+        // nothing else agrees with.
+        let mut s = spec();
+        s.budget_ms = None;
+        s.instruction_budget = None;
+        let job = script_job("a0s0", &s, "run", &ScriptRef { id: "one", source: "x" }, &json!({}));
+        assert!(job.get("budgetMs").is_none(), "{job}");
+        assert!(job.get("instructionSteps").is_none(), "{job}");
+    }
+
+    #[test]
+    fn one_event_is_one_batch_and_every_script_of_every_app_is_in_it() {
+        // The third batch of an event, after the trigger conditions and the
+        // flow bindings — not one batch per app, and certainly not one PROCESS
+        // per app, which is what every event used to cost.
+        let s = spec();
+        let app = |id: &str| {
+            AppEntry(json!({
+                "app": { "id": id },
+                "customLogic": { "scripts": [
+                    { "id": "a", "hook": "onConnectorEvent", "source": "function run(ctx) { return {}; }" },
+                    { "id": "b", "hook": "onConnectorEvent", "source": "function run(ctx) { return {}; }" }
+                ] },
+                "forms": []
+            }))
+        };
+        let apps = vec![app("app-1"), app("app-2")];
+        let (storage, dir) = store("onebatch");
+        let host = FakeHost::always(json!({}));
+        let out = handle_event(
+            &account("http://provider.invalid".into()),
+            &s,
+            &apps,
+            &storage,
+            &json!({ "name": "x", "idempotencyKey": "evt-1" }),
+            &host,
+            &no_connector(),
+        );
+        assert!(out.is_empty(), "{out:?}");
+        let request = host.only_request();
+        let jobs = request["jobs"].as_array().unwrap();
+        assert_eq!(jobs.len(), 4, "two apps, two scripts each, one batch: {request}");
+        assert_eq!(
+            jobs.iter().map(|j| j["id"].as_str().unwrap()).collect::<Vec<_>>(),
+            vec!["a0s0", "a0s1", "a1s0", "a1s1"],
+            "ids are synthetic and in publication order"
+        );
+        // Each app's scripts see THEIR app's markers, so the context cannot be
+        // shared between jobs — every job carries its own.
+        assert_eq!(jobs[0]["args"], jobs[1]["args"]);
+        assert_eq!(request["v"], 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_event_with_no_scripts_never_reaches_the_host() {
+        // Load-bearing: this runs on every plugin event, and the host is
+        // spawned by the first job it is asked to serve. An account whose apps
+        // carry no event logic must not start one.
+        let s = spec();
+        let apps = vec![AppEntry(json!({
+            "app": { "id": "app-1" },
+            "customLogic": { "scripts": [{ "id": "s", "hook": "onInstall", "source": "x" }] },
+            "forms": []
+        }))];
+        let (storage, dir) = store("nobatch");
+        let host = FakeHost::always(json!({}));
+        let out = handle_event(
+            &account("http://provider.invalid".into()),
+            &s,
+            &apps,
+            &storage,
+            &json!({ "name": "x", "idempotencyKey": "evt-1" }),
+            &host,
+            &no_connector(),
+        );
+        assert!(out.is_empty());
+        assert_eq!(host.calls(), 0, "no scripts, no batch, no host");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_script_the_author_switched_off_is_not_run_headlessly() {
+        // The browser stops running a disabled script; without this the desktop
+        // would go on running it on every event and the author would have no
+        // way to tell. Only an explicit `false` disables — the key is usually
+        // absent, and absent is a script that runs.
+        let s = spec();
+        let app = AppEntry(json!({ "app": { "id": "app-1" }, "customLogic": { "scripts": [
+            { "id": "on",      "hook": "onConnectorEvent", "source": "function run(){}", "enabled": true },
+            { "id": "default", "hook": "onConnectorEvent", "source": "function run(){}" },
+            { "id": "off",     "hook": "onConnectorEvent", "source": "function run(){}", "enabled": false }
+        ] } }));
+        let ids: Vec<&str> = app
+            .event_scripts(&s.catalogue, &s.event_hook)
+            .iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(ids, vec!["on", "default"]);
+    }
+
+    #[test]
+    fn a_script_over_the_engines_dynamic_code_ceiling_is_refused_by_name_and_its_neighbours_run() {
+        // Every JS mode compiles the source inside the guest, so the engine's
+        // dynamic-code ceiling bounds an app-logic script whatever the mode. The
+        // engine's own answer is `resource` with a message about dynamic code,
+        // which names neither the script nor what to do — and this desktop does
+        // not save these scripts, so there is no earlier moment to refuse one.
+        let s = spec();
+        let big = format!("function run(ctx) {{ /* {} */ return {{}}; }}", "x".repeat(MAX_SCRIPT_SOURCE_BYTES));
+        assert!(big.len() > MAX_SCRIPT_SOURCE_BYTES);
+        let apps = vec![AppEntry(json!({
+            "app": { "id": "app-1" },
+            "customLogic": { "scripts": [
+                { "id": "huge",  "hook": "onConnectorEvent", "source": big },
+                { "id": "small", "hook": "onConnectorEvent", "source": "function run(ctx) { return {}; }" }
+            ] },
+            "forms": []
+        }))];
+        let (storage, dir) = store("toobig");
+        let host = FakeHost::always(json!({}));
+        let out = handle_event(
+            &account("http://provider.invalid".into()),
+            &s,
+            &apps,
+            &storage,
+            &json!({ "name": "x", "idempotencyKey": "evt-1" }),
+            &host,
+            &no_connector(),
+        );
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(out[0].script, "huge");
+        let why = out[0].detail.clone().unwrap_err();
+        assert!(why.contains("65536"), "{why}");
+        assert!(why.contains(&big.len().to_string()), "{why}");
+        // And it never reached the engine: the neighbour is the only job sent.
+        let jobs = host.only_request()["jobs"].as_array().unwrap().len();
+        assert_eq!(jobs, 1, "the oversized script is refused before the batch is built");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_source_ceiling_is_the_engines_own() {
+        // Read from the STAGED engine's profile, never written down twice: a
+        // release that moves `dynamicCodeSourceBytes` fails here instead of
+        // leaving a lane that quietly refuses scripts the engine would run (or,
+        // worse, sends ones it will not).
+        // Through `staged_runner`, so "no profile" is a skip on a dev box and a
+        // FAILURE under CI — the same policy as every other staged-CLI test
+        // here. A silent no-op is how a pinned figure stops being pinned.
+        if staged_runner().is_none() {
+            eprintln!("no staged CLI or no Node on this machine — skipping");
+            return;
+        }
+        let profile = staged_cli_dir().join("zipp").join("PROFILE.json");
+        let profile: Value = serde_json::from_str(&std::fs::read_to_string(&profile).unwrap()).unwrap();
+        assert_eq!(
+            profile["limits"]["dynamicCodeSourceBytes"].as_u64(),
+            Some(MAX_SCRIPT_SOURCE_BYTES as u64),
+            "the staged engine's dynamic-code ceiling moved"
+        );
+    }
+
+    #[test]
+    fn a_graph_with_more_scripts_than_one_batch_can_carry_is_split_not_truncated() {
+        // The host caps ONE batch at 60 s and kills the child when the cap
+        // passes — losing every answer in the batch, the scripts that had
+        // already finished included. So a long graph becomes consecutive
+        // batches: every script still runs, in order, and no batch is bigger
+        // than what the host can promise.
+        let job = |ms: u64| json!({ "id": "x", "budgetMs": ms, "source": "s" });
+        let jobs: Vec<Value> = (0..50).map(|_| job(1000)).collect();
+        let ranges = batch_ranges(&jobs);
+        assert!(ranges.len() > 1, "50 scripts do not fit one batch");
+        assert_eq!(ranges.first().unwrap().start, 0);
+        assert_eq!(ranges.last().unwrap().end, jobs.len(), "nothing is dropped");
+        for pair in ranges.windows(2) {
+            assert_eq!(pair[0].end, pair[1].start, "the batches are contiguous");
+        }
+        for range in &ranges {
+            let batch = batch_request(jobs[range.clone()].to_vec());
             assert!(
-                blob.chars().all(|c| c == '%' || c.is_ascii_digit() || ('A'..='F').contains(&c)),
-                "an unencoded byte leaked into {blob}"
+                crate::bridge::script_host::batch_deadline(&batch) < MAX_BATCH_DEADLINE,
+                "a batch must finish inside the host's ceiling, not at it: {range:?}"
             );
+        }
+        // Everything that fits stays in ONE batch — splitting a short graph
+        // would pay a round trip per chunk for nothing.
+        assert_eq!(batch_ranges(&(0..5).map(|_| job(1000)).collect::<Vec<_>>()).len(), 1);
+        // And one job that is too big all by itself still goes, alone, rather
+        // than taking the event's other scripts down with it.
+        assert_eq!(batch_ranges(&[job(60_000), job(1000)]), vec![0..1, 1..2]);
+    }
+
+    #[test]
+    fn a_batch_is_split_on_bytes_as_well_as_on_time() {
+        // Every job carries its own copy of the context — each one is a fresh
+        // engine, so there is nothing to share it through — and one app's
+        // markers can be large. Four scripts of one app are then enough to pass
+        // the host's request cap, which it refuses whole, unsent.
+        let fat = "v".repeat(1_500_000);
+        let jobs: Vec<Value> = (0..4).map(|_| json!({ "id": "x", "budgetMs": 1000, "args": [fat] })).collect();
+        let ranges = batch_ranges(&jobs);
+        assert!(ranges.len() > 1, "six megabytes of context cannot be one request");
+        for range in &ranges {
+            let bytes = serde_json::to_vec(&batch_request(jobs[range.clone()].to_vec())).unwrap().len();
+            assert!(bytes <= MAX_REQUEST_BYTES, "{bytes} bytes in one batch");
         }
     }
 
     #[test]
-    fn a_context_full_of_hazards_still_produces_one_expression() {
-        // Real transcript text carries semicolons, quotes, newlines, backslashes
-        // and non-ASCII. Any one of them pasted in raw would either break the
-        // string or push the compiler onto a rewriting path.
-        let code = script_node_code(
-            "function run(ctx) { return { effects: [] }; }",
-            &json!({
-                "event": { "data": { "text": "he said \"stop\"; then\nleft — 90% sure\\done" } },
-                "storage": { "seen-\u{1f600}": 1 },
-            }),
-        )
-        .unwrap();
-        assert!(!code.contains(';') && !code.contains('\n'));
-        assert!(!contains_word(&code, "return"));
+    fn a_host_that_cannot_serve_is_one_line_for_the_app_not_one_per_script() {
+        // The scripts did not disagree about anything; the engine was not
+        // there. One line names the app and says its scripts did not run.
+        let s = spec();
+        let apps = vec![AppEntry(json!({
+            "app": { "id": "app-1" },
+            "customLogic": { "scripts": [
+                { "id": "a", "hook": "onConnectorEvent", "source": "function run(){}" },
+                { "id": "b", "hook": "onConnectorEvent", "source": "function run(){}" }
+            ] },
+            "forms": []
+        }))];
+        let (storage, dir) = store("hostdown");
+        let out = handle_event(
+            &account("http://provider.invalid".into()),
+            &s,
+            &apps,
+            &storage,
+            &json!({ "name": "x", "idempotencyKey": "evt-1" }),
+            &FakeHost::down("no engine on this machine"),
+            &no_connector(),
+        );
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(out[0].effect, "lane");
+        let why = out[0].detail.clone().unwrap_err();
+        assert!(why.contains("no engine on this machine"), "{why}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn word_matching_does_not_fire_on_a_substring() {
-        // The guard must not reject a legitimate node, and must not miss a real
-        // one. `returned` is not `return`; `x=return` is.
-        assert!(contains_word("a return b", "return"));
-        assert!(contains_word("return", "return"));
-        assert!(contains_word("}return{", "return"));
-        assert!(!contains_word("returned", "return"));
-        assert!(!contains_word("prereturn", "return"));
-        assert!(!contains_word("no_return_here", "return"));
+    fn a_script_that_threw_is_its_own_failure_and_the_next_one_still_runs() {
+        // The isolation the encoded try/catch used to provide, now the
+        // envelope's: one fresh engine per job, so a throw cannot reach a
+        // neighbour and cannot fail the batch.
+        let s = spec();
+        let apps = vec![AppEntry(json!({
+            "app": { "id": "app-1" },
+            "customLogic": { "scripts": [
+                { "id": "throws", "hook": "onConnectorEvent", "source": "function run(){ boom(); }" },
+                { "id": "after",  "hook": "onConnectorEvent", "source": "function run(){ return {}; }" }
+            ] },
+            "forms": []
+        }))];
+        let (storage, dir) = store("throws");
+        let host = FakeHost::by_source(|source| {
+            if source.contains("boom") {
+                Err(JobError { kind: "guest".into(), message: "boom is not defined".into() })
+            } else {
+                Ok(json!({}))
+            }
+        });
+        let out = handle_event(
+            &account("http://provider.invalid".into()),
+            &s,
+            &apps,
+            &storage,
+            &json!({ "name": "x", "idempotencyKey": "evt-1" }),
+            &host,
+            &no_connector(),
+        );
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(out[0].script, "throws");
+        let why = out[0].detail.clone().unwrap_err();
+        assert!(why.contains("threw") && why.contains("boom is not defined"), "{why}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // --- effects: the closed set and the loud refusals ---------------------
+    #[test]
+    fn a_kind_that_is_not_the_scripts_fault_says_so_rather_than_blaming_the_script() {
+        // "The script threw" sends the author to read a script that is fine.
+        assert!(job_failure(JobError { kind: "guest".into(), message: "x".into() }).contains("threw"));
+        for (kind, word) in [("timeout", "time budget"), ("resource", "engine ceiling"), ("host", "could not be run")] {
+            let why = job_failure(JobError { kind: kind.into(), message: "x".into() });
+            assert!(why.contains(word), "{kind}: {why}");
+            assert!(!why.contains("threw"), "{kind}: {why}");
+        }
+    }
+
+    #[test]
+    fn a_provider_that_names_no_entry_function_disables_the_lane_and_says_which_app_stopped() {
+        // No "run" default in this crate: a provider whose scripts declare
+        // something else would otherwise run nothing at all while every event
+        // reported success.
+        let mut s = spec();
+        s.entry_function = None;
+        let apps = vec![AppEntry(json!({
+            "app": { "id": "app-1" },
+            "customLogic": { "scripts": [
+                { "id": "a", "hook": "onConnectorEvent", "source": "function run(){}" }
+            ] },
+            "forms": []
+        }))];
+        let (storage, dir) = store("noentry");
+        let host = FakeHost::always(json!({}));
+        let out = handle_event(
+            &account("http://provider.invalid".into()),
+            &s,
+            &apps,
+            &storage,
+            &json!({ "name": "x", "idempotencyKey": "evt-1" }),
+            &host,
+            &no_connector(),
+        );
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(out[0].app, "app-1");
+        assert!(out[0].detail.clone().unwrap_err().contains("entryFunction"));
+        assert_eq!(host.calls(), 0, "nothing is sent without a function to call");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn an_effect_the_connector_does_not_map_is_refused_by_name() {
@@ -2128,40 +2439,12 @@ mod tests {
             &apps,
             &storage,
             &json!({ "name": "x", "idempotencyKey": "evt-1" }),
-            None,
+            &FakeHost::always(json!({})),
             &no_connector(),
         );
         assert_eq!(out.len(), 1);
         assert!(out[0].detail.clone().unwrap_err().contains("nowhere to remember"));
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn a_report_tells_a_script_that_threw_from_one_the_runner_never_reached() {
-        // Two different fixes: the first is the script author's, the second is
-        // this desktop's. Flattening them would send everyone to the wrong one.
-        let report = json!({
-            "success": true,
-            "results": {
-                "s0": r#"{"ok":true,"value":{"effects":[]}}"#,
-                "s1": r#"{"ok":false,"error":"d is not defined"}"#,
-                "s3": { "ok": true, "value": {} },
-            }
-        });
-        let parsed = parse_report(&report, 4).unwrap();
-        assert_eq!(parsed[0].clone().unwrap()["effects"], json!([]));
-        assert!(parsed[1].clone().unwrap_err().contains("d is not defined"));
-        assert!(parsed[2].clone().unwrap_err().contains("no result"));
-        // An OBJECT is the shape the runner produces after it has rewritten the
-        // answer, which is exactly the corruption the string exists to dodge —
-        // so it is refused rather than half-read.
-        assert!(parsed[3].clone().unwrap_err().contains("rather than the script's own report"));
-
-        // A run that failed outright is one failure, not N.
-        let dead = json!({ "success": false, "error": "Illegal break statement" });
-        assert!(parse_report(&dead, 2)
-            .unwrap_err()
-            .contains("Illegal break statement"));
     }
 
     // --- against the real runner -------------------------------------------
@@ -2275,7 +2558,7 @@ mod tests {
     }
 
     #[test]
-    fn the_real_scripts_run_in_the_real_runner_and_return_their_effects() {
+    fn the_real_scripts_run_on_the_real_engine_and_return_their_effects() {
         // The test that matters. Everything else here is about shapes; this is
         // the one that would have caught "Illegal break statement", which broke
         // EVERY script of EVERY app and produced an empty transcript with a
@@ -2306,57 +2589,42 @@ mod tests {
             { "id": "no-host", "hook": "onConnectorEvent", "source":
               "function run(ctx) { return { host: typeof process }; }" }
         ]);
-        // Through the same reader the lane uses, so this really is the graph an
-        // event would build.
+        // Through the same reader the lane uses, so these really are the jobs
+        // an event would build.
         let app = AppEntry(json!({ "app": { "id": "app-1" }, "customLogic": { "scripts": raw } }));
         let s = spec();
         let refs = app.event_scripts(&s.catalogue, &s.event_hook);
         assert_eq!(refs.len(), 7, "every script here runs on the event hook");
 
-        // Through the SAME spawn path the lane uses — the engine probe, the
-        // hardened child, the payload read — with the staged CLI handed in
-        // directly (OAIY_CLI is process-global, and under cargo test the
-        // bundled lookup never reaches src-tauri/resources). This is the one
-        // test that proves the probe accepts the CLI this desktop ships and the
-        // payload it writes is read as a result.
+        // ONE warm child for the whole test, handed the staged CLI directly:
+        // `OAIY_CLI` is process-global and races the other tests, and under
+        // cargo test the bundled lookup never reaches src-tauri/resources.
+        let host = crate::bridge::script_host::ScriptHost::with_cli(
+            crate::bridge::worker::CliInvocation::Node { script: cli },
+            Some(node),
+        );
         let run = |ctx: Value| -> Vec<Result<Value, String>> {
-            let dir = std::env::temp_dir().join(format!(
-                "oaiy-app-logic-e2e-{}-{}",
-                std::process::id(),
-                ctx.to_string().len()
-            ));
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).unwrap();
-            let graph = build_graph(&refs, &ctx).unwrap();
-            let graph_path = dir.join("graph.json");
-            let inputs_path = dir.join("inputs.json");
-            let out_path = dir.join("result.json");
-            std::fs::write(&graph_path, graph.to_string()).unwrap();
-            std::fs::write(&inputs_path, "{}").unwrap();
-            let outcome = crate::bridge::worker::run_flow_cli_with(
-                &crate::bridge::worker::CliInvocation::Node { script: cli.clone() },
-                Some(&node),
-                CliRequest {
-                    flow_path: &graph_path,
-                    inputs_path: &inputs_path,
-                    out_path: &out_path,
-                    connector_path: None,
-                    timeout: RUN_TIMEOUT,
-                    instruction_budget: spec().instruction_budget,
-                    node: None,
-                },
-                &|| false,
-            );
-            let report = match outcome {
-                CliOutcome::Succeeded(v) => v,
-                other => panic!("the staged CLI must be accepted and run the graph, got {other:?}"),
-            };
-            // The runner says what it ran on, and it is the engine this
-            // desktop ships — not the host's own JavaScript.
-            assert_eq!(report["engine"], "zipp", "{report}");
-            let parsed = parse_report(&report, refs.len()).unwrap();
-            let _ = std::fs::remove_dir_all(&dir);
-            parsed
+            let jobs: Vec<Value> = refs
+                .iter()
+                .enumerate()
+                .map(|(i, script)| script_job(&job_id(0, i), &s, "run", script, &ctx))
+                .collect();
+            let response = host
+                .evaluate(&batch_request(jobs))
+                .unwrap_or_else(|e| panic!("the staged CLI must serve the batch: {e}"));
+            // The engine that answered is the one this desktop ships — not the
+            // host's own JavaScript.
+            assert_eq!(response.engine["name"], "zipp", "{:?}", response.engine);
+            (0..refs.len())
+                .map(|i| {
+                    response
+                        .result(&job_id(0, i))
+                        .unwrap_or_else(|| panic!("no answer for script {i}"))
+                        .outcome
+                        .clone()
+                        .map_err(job_failure)
+                })
+                .collect()
         };
 
         let fresh = run(json!({
@@ -2369,9 +2637,9 @@ mod tests {
         }));
         let effects = fresh[0].clone().unwrap();
         assert_eq!(effects["effects"][0]["formKey"], "transcript-turns");
-        // The hazardous text survives the encoding intact — semicolons, quotes,
-        // a backslash and a multi-byte dash, all of which would otherwise end
-        // the string or send the compiler down a rewriting path.
+        // The hazardous text survives intact — semicolons, quotes, a backslash
+        // and a multi-byte dash. It crosses as a JSON literal now rather than a
+        // percent-encoded blob, and it still has to arrive unchanged.
         assert_eq!(effects["effects"][0]["answers"]["text"], "hello; \"there\" — ok\\done");
         assert_eq!(effects["effects"][0]["answers"]["turn_key"], "c1:3");
         assert_eq!(effects["effects"][1]["key"], "seen-evt-1");
@@ -2379,27 +2647,26 @@ mod tests {
         assert_eq!(fresh[1].clone().unwrap(), json!({}));
         // A script that throws reports itself…
         assert!(fresh[2].clone().unwrap_err().contains("threw"));
-        // …as does one that reaches for a timer: the runner's sandbox replaces
-        // `setTimeout` with a stub that throws, at the GLOBAL scope this
-        // `new Function` body runs in. ZIPP's own `setTimeout` would have
-        // returned quietly and never fired, and this script would have looked
-        // like a success with its work dropped.
+        // …as does one that reaches for a timer: the guest shims replace
+        // `setTimeout` with a stub that throws, at the GLOBAL scope the entry
+        // source is compiled in. ZIPP's own `setTimeout` would have returned
+        // quietly and never fired, and this script would have looked like a
+        // success with its work dropped.
         let timer = fresh[3].clone().unwrap_err();
         assert!(timer.contains("threw"), "{timer}");
         assert!(timer.contains("setTimeout"), "{timer}");
-        // …and neither takes the next one with it, which is why the catch lives
-        // inside the node instead of around the run.
+        // …and neither takes the next one with it: one fresh engine per job.
         assert_eq!(fresh[4].clone().unwrap()["effects"][0]["message"], "still here");
-        // The unboxing hazard, pinned. A record of two fields one of which is
-        // called `text` used to come back as the bare text — the write that
-        // followed would have been missing every other field, and nothing
-        // anywhere would have said so.
+        // The old unboxing hazard, still pinned. A record of two fields one of
+        // which is called `text` used to come back as the bare text, because the
+        // flow runner unboxed a node's result. Nothing unboxes an `entry` job's
+        // return value, and this says so rather than assuming it.
         let boxed = fresh[5].clone().unwrap();
         assert_eq!(boxed["effects"][0]["answers"]["text"], "body");
         assert_eq!(boxed["effects"][0]["answers"]["url"], "https://example.test");
-        // And the scripts ran inside the ZIPP VM: there is no Node `process`
-        // in the scope a script's `new Function` body sees. A runner that ran
-        // them on the host would answer "object" here.
+        // And the scripts ran inside the ZIPP VM: there is no Node `process` in
+        // the scope a script sees. A host that ran them itself would answer
+        // "object" here.
         assert_eq!(fresh[6].clone().unwrap()["host"], "undefined");
 
         // The dedup: the SAME event with the marker already stored does nothing
@@ -2414,6 +2681,39 @@ mod tests {
             "storage": { "seen-evt-1": 1 },
         }));
         assert_eq!(seen[0].clone().unwrap(), json!({}), "a stored marker must suppress the write");
+
+        // Both events were served by ONE child, kept warm between them — the
+        // whole point of the lane moving off a process per event.
+        let health = host.health();
+        assert_eq!(health.children, 1, "one child served both events");
+        host.shutdown();
+    }
+
+    #[test]
+    fn the_real_engine_refuses_a_source_over_its_dynamic_code_ceiling() {
+        // The backstop behind the local refusal: if the ceiling is ever read
+        // wrong here, this is what the lane would actually get back — and it is
+        // a `resource` kind, not a script that threw, so it is not reported as
+        // the author's bug.
+        let Some((node, cli)) = staged_runner() else {
+            eprintln!("no staged CLI or no Node on this machine — skipping");
+            return;
+        };
+        let host = crate::bridge::script_host::ScriptHost::with_cli(
+            crate::bridge::worker::CliInvocation::Node { script: cli },
+            Some(node),
+        );
+        let big = format!(
+            "function run(ctx) {{ /* {} */ return {{}}; }}",
+            "x".repeat(MAX_SCRIPT_SOURCE_BYTES)
+        );
+        let script = ScriptRef { id: "huge", source: &big };
+        let job = script_job("a0s0", &spec(), "run", &script, &json!({}));
+        let response = host.evaluate(&batch_request(vec![job])).expect("the batch is served");
+        let outcome = response.result("a0s0").expect("answered").outcome.clone();
+        let e = outcome.expect_err("a source over the ceiling cannot compile");
+        assert_eq!(e.kind, "resource", "{e:?}");
+        host.shutdown();
     }
 
     #[test]
@@ -2454,9 +2754,7 @@ mod tests {
             &apps,
             &storage,
             &json!({ "name": "x", "idempotencyKey": "evt-1" }),
-            // No Node: the first copy fails at the runner, which is fine — the
-            // assertion is about the SECOND one never getting that far.
-            None,
+            &FakeHost::always(json!({})),
             &no_connector(),
         );
         let duplicate = out
@@ -2487,7 +2785,7 @@ mod tests {
             &apps,
             &storage,
             &json!({ "name": "x", "idempotencyKey": "evt-1" }),
-            None,
+            &FakeHost::always(json!({})),
             &no_connector(),
         );
         assert_eq!(out.len(), 1);
@@ -2518,7 +2816,7 @@ mod tests {
             &apps,
             &storage,
             &json!({ "name": "x", "idempotencyKey": "evt-1" }),
-            None,
+            &FakeHost::always(json!({})),
             &no_connector(),
         );
         assert!(out.is_empty());

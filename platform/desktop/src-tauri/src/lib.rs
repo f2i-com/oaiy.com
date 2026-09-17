@@ -1799,14 +1799,10 @@ pub fn build_bridge_state(
         env!("CARGO_PKG_VERSION").to_string(),
         plugin_development_mode(std::env::var("OAIY_PLUGIN_DEV_MODE").ok().as_deref(), cfg!(debug_assertions)),
     );
-    // The account's app logic scripts run through the bundled CLI, which runs
-    // under Node — and a packaged install cannot assume one is on PATH. Same
-    // handle the flow worker below is given, so the two cannot resolve
-    // differently on the same machine.
-    host.set_node_runtime(node.clone());
-    // And the warm script host, which runs the same CLI as `script --serve`
-    // under the same Node — the third lane on this machine that must not
-    // resolve differently from the other two.
+    // The warm script host runs the bundled CLI as `script --serve`, under Node
+    // — and a packaged install cannot assume one is on PATH. Same handle the
+    // flow worker below is given, so the two lanes that reach the engine cannot
+    // resolve differently on the same machine.
     bridge::ScriptHost::global().set_node_runtime(node.clone());
     let flows = std::sync::Arc::new(bridge::FlowStore::new(data_dir.join("flows")));
     // Durable pairing tokens under <data>/bridge, so a paired consumer stays

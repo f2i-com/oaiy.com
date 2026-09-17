@@ -172,11 +172,29 @@ pub struct AppLogicSpec {
     /// in terms this desktop can actually perform.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub effects: Vec<AppLogicEffectSpec>,
-    /// ZIPP instruction steps each script may spend, handed to the CLI as
-    /// `--instruction-budget`. The provider's policy, not this desktop's: it
-    /// sized its scripts. Absent means the engine's own default.
+    /// ZIPP instruction steps each script may spend, sent as the job's
+    /// `instructionSteps`. The provider's policy, not this desktop's: it sized
+    /// its scripts. Absent means the engine's own default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instruction_budget: Option<u64>,
+    /// The function a script declares and this desktop calls, with the context
+    /// as its one argument.
+    ///
+    /// The provider's convention, not this desktop's, and deliberately WITHOUT
+    /// a default: a script is remote input, and guessing a name here would mean
+    /// a provider whose scripts declare something else silently runs nothing at
+    /// all while every event reports success. Absent disables the lane, loudly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry_function: Option<String>,
+    /// Wall-clock milliseconds one script may spend on the script host.
+    ///
+    /// The provider's policy beside [`Self::instruction_budget`], which is the
+    /// engine's step ceiling: a script can idle inside its steps, and a lane
+    /// with no clock would wait out the host's whole batch deadline for it.
+    /// Absent leaves the CLI's own default in force (the key is then omitted
+    /// from the job, rather than a number being invented here).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_ms: Option<u64>,
 }
 
 fn default_app_logic_scan() -> u32 {
@@ -286,6 +304,10 @@ pub struct AppLogicCatalogue {
     pub script_id: String,
     pub script_hook: String,
     pub script_source: String,
+    /// On one script: the flag that turns it off. Read as "not disabled" — the
+    /// key is usually absent, and a missing flag means a script that runs, so
+    /// only an explicit `false` skips it.
+    pub script_enabled: String,
     /// On an app: its forms, a form's own id, and the portable key the app's
     /// scripts name that form by.
     pub forms: String,
@@ -295,7 +317,7 @@ pub struct AppLogicCatalogue {
 
 impl AppLogicCatalogue {
     /// Every name, labelled, for the "nothing may be blank" rule.
-    fn all(&self) -> [(&'static str, &str); 12] {
+    fn all(&self) -> [(&'static str, &str); 13] {
         [
             ("apps", self.apps.as_str()),
             ("appBlock", self.app_block.as_str()),
@@ -306,6 +328,7 @@ impl AppLogicCatalogue {
             ("scriptId", self.script_id.as_str()),
             ("scriptHook", self.script_hook.as_str()),
             ("scriptSource", self.script_source.as_str()),
+            ("scriptEnabled", self.script_enabled.as_str()),
             ("forms", self.forms.as_str()),
             ("formId", self.form_id.as_str()),
             ("formKey", self.form_key.as_str()),
@@ -776,6 +799,27 @@ pub struct HeartbeatSpec {
     /// Body field carrying a human label, when the provider shows one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device_name_field: Option<String>,
+    /// Body field carrying the list of capability tokens this desktop declares.
+    ///
+    /// A provider that names none gets no capabilities at all — the field is
+    /// omitted from the body rather than sent empty, which is what a provider
+    /// built before the vocabulary expects to see.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capabilities_field: Option<String>,
+    /// What a token naming a logic language this desktop runs looks like: this
+    /// prefix followed by the language id (`javascript`, and `python` once the
+    /// CLI reports it).
+    ///
+    /// The vocabulary is the PROVIDER's, so it is data. Nothing in this app
+    /// spells a provider's token, and a provider with another spelling needs no
+    /// release.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language_capability_prefix: Option<String>,
+    /// The token that says this desktop can run logic RIGHT NOW — sent only
+    /// while the engine probe and the script host both say so, and dropped the
+    /// moment either stops.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine_capability: Option<String>,
 }
 
 fn default_heartbeat_interval() -> u64 {
@@ -791,6 +835,46 @@ fn default_heartbeat_interval() -> u64 {
 /// a stderr tail, and nothing would point at the one line in the descriptor
 /// that caused it.
 const MAX_INSTRUCTION_BUDGET_STEPS: u64 = 2_000_000_000;
+
+/// Whether `s` is a plain JavaScript identifier — the same rule the leaf-script
+/// envelope applies to an `entry` name (`/^[A-Za-z_$][A-Za-z0-9_$]*$/`), so a
+/// descriptor is refused HERE rather than by the CLI on every event.
+///
+/// Deliberately not a reserved-word check as well: the envelope's own validator
+/// makes that judgement, and two lists of reserved words would drift.
+fn is_js_identifier(s: &str) -> bool {
+    let mut bytes = s.bytes();
+    match bytes.next() {
+        Some(b) if b.is_ascii_alphabetic() || matches!(b, b'_' | b'$') => {}
+        _ => return false,
+    }
+    bytes.all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'$'))
+}
+
+/// The longest a job's wall-clock budget may be.
+///
+/// The schema allows 1..60000, but this desktop cannot honour the top of that
+/// range: it gives a batch the sum of its jobs' budgets plus the child's own
+/// watchdog grace each, capped at the host's batch ceiling — so a job budgeted
+/// for the whole ceiling would be killed by the DESKTOP, child and all, a grace
+/// before the child's own watchdog answered for it. Derived from the two
+/// figures rather than written down, so a host that changes either is followed
+/// here.
+///
+/// Checked at all for the same reason the step budget is: the CLI refuses the
+/// whole request when a budget is out of range, so every event of that lane
+/// would fail with nothing pointing at the one line in the descriptor.
+const MAX_JOB_BUDGET_MS: u64 =
+    crate::bridge::script_host::MAX_BATCH_DEADLINE.as_secs() * 1000 - crate::bridge::script_host::JOB_GRACE_MS;
+
+fn check_budget_ms(id: &str, lane: &str, budget: Option<u64>) -> Result<(), String> {
+    match budget {
+        Some(n) if n == 0 || n > MAX_JOB_BUDGET_MS => Err(format!(
+            "connector {id:?} {lane} budgetMs {n} is out of range (1..{MAX_JOB_BUDGET_MS} ms — the              script host's batch ceiling, less the grace its child adds to every job)"
+        )),
+        _ => Ok(()),
+    }
+}
 
 fn check_instruction_budget(id: &str, lane: &str, budget: Option<u64>) -> Result<(), String> {
     match budget {
@@ -851,6 +935,28 @@ impl ConnectorDescriptor {
                     "connector {:?} heartbeat interval {} is out of range (1..3600s)",
                     self.id, h.interval_seconds
                 ));
+            }
+            // A vocabulary with nowhere to put it. Without the field name the
+            // tokens are computed on every beat and dropped on the floor, and
+            // the provider goes on believing this desktop declares nothing —
+            // which reads as a build from before the vocabulary, not as one
+            // whose engine is down.
+            for (label, token) in [
+                ("languageCapabilityPrefix", &h.language_capability_prefix),
+                ("engineCapability", &h.engine_capability),
+            ] {
+                if token.is_some() && h.capabilities_field.is_none() {
+                    return Err(format!(
+                        "connector {:?} heartbeat {label} needs a capabilitiesField to send it in",
+                        self.id
+                    ));
+                }
+                if token.as_ref().is_some_and(|t| t.trim().is_empty()) {
+                    return Err(format!("connector {:?} heartbeat {label} is blank", self.id));
+                }
+            }
+            if h.capabilities_field.as_ref().is_some_and(|f| f.trim().is_empty()) {
+                return Err(format!("connector {:?} heartbeat capabilitiesField is blank", self.id));
             }
         }
         if self.desktop_flows.is_some()
@@ -1069,6 +1175,19 @@ impl ConnectorDescriptor {
         }
         if let Some(a) = &self.app_logic {
             check_instruction_budget(&self.id, "appLogic", a.instruction_budget)?;
+            check_budget_ms(&self.id, "appLogic", a.budget_ms)?;
+            // The name is concatenated into the program the engine compiles, so
+            // anything but an identifier is a syntax error inside the guest —
+            // reported as a script that will not compile, on every event, with
+            // nothing naming the descriptor line that caused it.
+            if let Some(entry) = &a.entry_function {
+                if !is_js_identifier(entry) {
+                    return Err(format!(
+                        "connector {:?} appLogic entryFunction {entry:?} is not a JavaScript identifier",
+                        self.id
+                    ));
+                }
+            }
             for (label, path) in [
                 ("path", &a.path),
                 ("submitPath", &a.submit_path),
@@ -1297,6 +1416,112 @@ mod tests {
         let d = builtin().remove(0);
         assert_eq!(d.flows.as_ref().unwrap().instruction_budget, Some(200_000_000));
         assert_eq!(d.app_logic.as_ref().unwrap().instruction_budget, Some(200_000_000));
+    }
+
+    #[test]
+    fn the_shipped_provider_names_the_entry_function_and_the_clock_its_scripts_run_under() {
+        // Both are the provider's convention and both are absent from this
+        // crate's code. `run` is what FormLogic's own app-logic host calls;
+        // 1000 ms is the budget that host gives one script
+        // (ui/src/client-runtime/logic/appLogicHost.ts DEFAULT_BUDGET_MS).
+        let a = builtin().remove(0).app_logic.unwrap();
+        assert_eq!(a.entry_function.as_deref(), Some("run"));
+        assert_eq!(a.budget_ms, Some(1000));
+        assert!(a.budget_ms.is_some_and(|ms| ms <= MAX_JOB_BUDGET_MS));
+        // And the flag that turns one script off, so a disabled script is not
+        // run headlessly after its author switched it off in the browser.
+        assert_eq!(a.catalogue.script_enabled, "enabled");
+    }
+
+    #[test]
+    fn an_entry_function_that_is_not_an_identifier_is_refused_here_not_inside_the_engine() {
+        // The name is concatenated into the program the engine compiles, so
+        // anything else is a syntax error inside the guest, on every event,
+        // with nothing naming the descriptor line that caused it.
+        for bad in ["", "run()", "1run", "run me", "ctx.run"] {
+            let mut d: ConnectorDescriptor = serde_json::from_str(BUILTIN[0]).unwrap();
+            d.app_logic.as_mut().unwrap().entry_function = Some(bad.to_string());
+            let e = d.validate().unwrap_err();
+            assert!(e.contains("entryFunction"), "{bad:?}: {e}");
+        }
+        for good in ["run", "_run", "$run", "run2"] {
+            let mut d: ConnectorDescriptor = serde_json::from_str(BUILTIN[0]).unwrap();
+            d.app_logic.as_mut().unwrap().entry_function = Some(good.to_string());
+            d.validate().unwrap_or_else(|e| panic!("{good:?}: {e}"));
+        }
+    }
+
+    #[test]
+    fn a_job_budget_outside_the_hosts_range_is_refused_here_not_at_run_time() {
+        // Same reasoning as the instruction budget: the CLI refuses the WHOLE
+        // request when a job's budgetMs is out of range, so every event of the
+        // lane would fail with nothing pointing at the descriptor. The ceiling
+        // is this desktop's, not the schema's — see MAX_JOB_BUDGET_MS.
+        for bad in [0u64, MAX_JOB_BUDGET_MS + 1] {
+            let mut d: ConnectorDescriptor = serde_json::from_str(BUILTIN[0]).unwrap();
+            d.app_logic.as_mut().unwrap().budget_ms = Some(bad);
+            let e = d.validate().unwrap_err();
+            assert!(e.contains("budgetMs"), "{bad}: {e}");
+        }
+    }
+
+    #[test]
+    fn the_shipped_provider_names_the_capability_vocabulary_it_reads() {
+        // The exact strings FormLogic keys on, as DATA. A mismatch of one
+        // character here silently disables deferral: the provider reads the
+        // token set, finds no language token, and files this desktop as a build
+        // from before the vocabulary — which then keeps getting JavaScript work
+        // whether or not its engine is up.
+        //
+        // Where the provider spells them (read-only):
+        //   backend/src/Services/Flows/FlowLogicLanguages.php
+        //     :48 CAPABILITY_PREFIX  = 'logic-language:'
+        //     :55 ENGINE_CAPABILITY  = 'logic-engine:zipp'
+        //   ui/src/client-runtime/flows/nodes.ts
+        //     :117 LOGIC_LANGUAGE_CAPABILITY_PREFIX
+        //     :124 DESKTOP_ENGINE_CAPABILITY
+        // and the body field is `capabilities`
+        // (FlowService::upsertDesktopConnection, sanitizeStringList(…, 64, 128)).
+        let h = builtin().remove(0).heartbeat.unwrap();
+        assert_eq!(h.capabilities_field.as_deref(), Some("capabilities"));
+        assert_eq!(h.language_capability_prefix.as_deref(), Some("logic-language:"));
+        assert_eq!(h.engine_capability.as_deref(), Some("logic-engine:zipp"));
+    }
+
+    #[test]
+    fn a_capability_vocabulary_with_nowhere_to_send_it_is_refused() {
+        // Tokens computed on every beat and dropped on the floor look exactly
+        // like a desktop that declares nothing — the one state a typo must not
+        // be able to reach.
+        let mut d: ConnectorDescriptor = serde_json::from_str(BUILTIN[0]).unwrap();
+        d.heartbeat.as_mut().unwrap().capabilities_field = None;
+        let e = d.validate().unwrap_err();
+        assert!(e.contains("capabilitiesField"), "{e}");
+
+        let mut d: ConnectorDescriptor = serde_json::from_str(BUILTIN[0]).unwrap();
+        let h = d.heartbeat.as_mut().unwrap();
+        h.capabilities_field = None;
+        h.language_capability_prefix = None;
+        let e = d.validate().unwrap_err();
+        assert!(e.contains("engineCapability"), "{e}");
+
+        // Naming none of the three is legal: a provider without the vocabulary.
+        let mut d: ConnectorDescriptor = serde_json::from_str(BUILTIN[0]).unwrap();
+        let h = d.heartbeat.as_mut().unwrap();
+        h.capabilities_field = None;
+        h.language_capability_prefix = None;
+        h.engine_capability = None;
+        d.validate().unwrap();
+
+        // A blank one is not a name.
+        for blank in ["", "  "] {
+            let mut d: ConnectorDescriptor = serde_json::from_str(BUILTIN[0]).unwrap();
+            d.heartbeat.as_mut().unwrap().capabilities_field = Some(blank.to_string());
+            assert!(d.validate().is_err(), "a blank capabilitiesField must be refused");
+            let mut d: ConnectorDescriptor = serde_json::from_str(BUILTIN[0]).unwrap();
+            d.heartbeat.as_mut().unwrap().engine_capability = Some(blank.to_string());
+            assert!(d.validate().is_err(), "a blank engineCapability must be refused");
+        }
     }
 
     #[test]

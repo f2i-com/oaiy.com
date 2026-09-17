@@ -778,18 +778,38 @@ fn fetch_graph(
         )
     })?;
 
-    let found = select_flow(&reply.flows, run).ok_or_else(|| {
-        Failure::new(
-            FailureCode::InvalidFlow,
-            format!(
-                "the account has no flow matching this run ({})",
-                run.flow_definition_id
-                    .as_deref()
-                    .or(run.flow.as_deref())
-                    .unwrap_or("unnamed")
-            ),
-        )
-    })?;
+    let named = || {
+        run.flow_definition_id
+            .as_deref()
+            .or(run.flow.as_deref())
+            .unwrap_or("unnamed")
+            .to_string()
+    };
+    let found = match select_flow(&reply.flows, run) {
+        Some(f) => f,
+        // An EMPTY listing is not "this flow does not exist". A provider lists
+        // what the CALLER can run, and one that has decided this desktop cannot
+        // run logic right now hands it nothing at all — every flow, not just
+        // the ones with code. Reading that as a broken graph would file a
+        // permanent failure against an automation that is fine and send its
+        // author looking for a step to fix, when the fix is on this machine and
+        // another runtime could take the run as it stands.
+        None if reply.flows.is_empty() => {
+            return Err(Failure::new(
+                FailureCode::RunnerUnavailable,
+                format!(
+                    "the provider listed no flows for this desktop, so the graph for {} could                      not be fetched — this desktop may not be reporting an engine the provider                      will hand work to",
+                    named()
+                ),
+            ))
+        }
+        None => {
+            return Err(Failure::new(
+                FailureCode::InvalidFlow,
+                format!("the account has no flow matching this run ({})", named()),
+            ))
+        }
+    };
 
     // The CLI reads `{ nodes, edges }`. Anything else is a flow this desktop
     // cannot execute, and saying so beats handing the engine a shape it will
@@ -1433,6 +1453,44 @@ mod tests {
             complete_raw.contains("oaiy-test"),
             "the completion must present the same instance as the claim: {complete_raw}"
         );
+    }
+
+    #[test]
+    fn an_empty_flow_list_is_a_runtime_that_was_handed_nothing_not_a_broken_flow() {
+        // A provider lists what the CALLER can run, so a desktop it has decided
+        // cannot run logic right now is handed NO flows at all — every flow,
+        // not just the ones with code. Filing that as `invalid_flow` would mark
+        // a working automation permanently broken and send its author looking
+        // for a step to fix, when the fix is on this machine.
+        //
+        // `runner_unavailable` is the provider's own word for "nothing was
+        // available to run it", which is exactly what happened.
+        const NO_FLOWS: &str = r#"{"flows":[]}"#;
+        let (base, rx) = stub_provider(ONE_RUN, NO_FLOWS, "200 OK", "200 OK");
+        let (handled, _) =
+            poll_once(&account(base), &spec(), &Lane::of(&spec()).unwrap(), "oaiy-test", None)
+                .unwrap();
+        assert_eq!(handled, 1);
+        let complete_raw = rx
+            .iter()
+            .find(|(line, _)| line.starts_with("PATCH /runs/r1 "))
+            .expect("the run is reported")
+            .1;
+        assert!(complete_raw.contains("runner_unavailable"), "{complete_raw}");
+        assert!(!complete_raw.contains("invalid_flow"), "{complete_raw}");
+        assert!(complete_raw.contains("listed no flows"), "{complete_raw}");
+
+        // A list that HAS flows and does not have this one is still a broken
+        // run: that flow really is gone, and saying "runner unavailable" would
+        // hide it behind a retry that can never work.
+        let (base, rx) = stub_provider(ONE_RUN, NO_MATCHING_FLOW, "200 OK", "200 OK");
+        poll_once(&account(base), &spec(), &Lane::of(&spec()).unwrap(), "oaiy-test", None).unwrap();
+        let complete_raw = rx
+            .iter()
+            .find(|(line, _)| line.starts_with("PATCH /runs/r1 "))
+            .expect("the run is reported")
+            .1;
+        assert!(complete_raw.contains("invalid_flow"), "{complete_raw}");
     }
 
     #[test]

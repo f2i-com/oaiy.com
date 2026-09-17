@@ -212,6 +212,8 @@
   },
   "appLogic": {
     "instructionBudget": 200000000,
+    "entryFunction": "run",
+    "budgetMs": 1000,
     "path": "/api/v1/app-logic",
     "eventHook": "onConnectorEvent",
     "submitPath": "/api/v1/forms/{formId}/responses",
@@ -248,6 +250,7 @@
       "scriptId": "id",
       "scriptHook": "hook",
       "scriptSource": "source",
+      "scriptEnabled": "enabled",
       "forms": "forms",
       "formId": "id",
       "formKey": "packFormId"
@@ -293,6 +296,9 @@
     "path": "/api/v1/desktop-connections",
     "intervalSeconds": 45,
     "instanceIdField": "desktopInstanceId",
-    "deviceNameField": "deviceName"
+    "deviceNameField": "deviceName",
+    "capabilitiesField": "capabilities",
+    "languageCapabilityPrefix": "logic-language:",
+    "engineCapability": "logic-engine:zipp"
   }
 }

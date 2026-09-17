@@ -501,14 +501,11 @@ pub struct PluginHost {
     flow_bindings: crate::link::flows::FlowBindings,
     /// The account's apps and their logic scripts, cached between events.
     app_logic: crate::link::app_logic::Catalog,
-    /// Resolves the Node runtime the bundled CLI runs under, for the logic
-    /// scripts. Set after construction like the link, and for the same reason.
-    node: Mutex<Option<crate::services::node_runtime::NodeHandle>>,
-    /// What decides trigger and binding conditions.
+    /// What runs this event's conditions and app-logic scripts.
     ///
     /// The process-wide warm script host, unless a test has substituted its own
-    /// — conditions are the one thing on the event thread that reaches a child
-    /// process, and a unit test must be able to answer them without one.
+    /// — the engine is the one thing on the event thread that reaches a child
+    /// process, and a unit test must be able to answer without one.
     scripts: Mutex<std::sync::Arc<dyn crate::bridge::script_host::ScriptBatch>>,
 }
 
@@ -553,7 +550,6 @@ impl PluginHost {
             link: Mutex::new(None),
             flow_bindings: crate::link::flows::FlowBindings::new(),
             app_logic: crate::link::app_logic::Catalog::new(),
-            node: Mutex::new(None),
             scripts: Mutex::new(std::sync::Arc::new(crate::bridge::script_host::GlobalHost)),
         });
 
@@ -1098,9 +1094,10 @@ impl PluginHost {
     /// transcript stays empty.
     ///
     /// Best effort and non-fatal, on the same terms as the flow fan-out. It is
-    /// also the most expensive thing on this thread — the scripts run in the
-    /// bundled CLI, which is a process — so an account whose apps carry no
-    /// event scripts must and does cost nothing here.
+    /// also the most expensive thing on this thread — every script of every app
+    /// runs on the warm script host, in the third and last batch this event
+    /// sends — so an account whose apps carry no event scripts must and does
+    /// cost nothing here, not even a batch.
     fn fan_out_to_app_logic(&self, event: &crate::bridge::triggers::Event, envelope: &Value) {
         let link = {
             let guard = self.link.lock().unwrap_or_else(|e| e.into_inner());
@@ -1125,7 +1122,6 @@ impl PluginHost {
             }
         };
         let storage = crate::link::app_logic::StorageStore::open(link.data_dir());
-        let node = self.node.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let connector = |connector_id: &str,
                          command: &str,
                          payload: Option<Value>,
@@ -1146,7 +1142,13 @@ impl PluginHost {
                 })
         };
         for outcome in crate::link::app_logic::handle_event(
-            &account, &spec, &apps, &storage, envelope, node.as_ref(), &connector,
+            &account,
+            &spec,
+            &apps,
+            &storage,
+            envelope,
+            self.script_evaluator().as_ref(),
+            &connector,
         ) {
             // Every outcome, always. A script that quietly records nothing is
             // the hardest kind of failure to find — the install looks fine and
@@ -1277,15 +1279,6 @@ impl PluginHost {
         // its logic scripts would write the previous account's records.
         self.flow_bindings.invalidate();
         self.app_logic.invalidate();
-    }
-
-    /// Give the host the Node runtime the bundled CLI runs under.
-    ///
-    /// The app's logic scripts are executed through that CLI, and a packaged
-    /// install cannot assume `node` is on PATH — without this they would fail
-    /// `runtime_unavailable` on a machine where flows run perfectly well.
-    pub fn set_node_runtime(&self, node: Option<crate::services::node_runtime::NodeHandle>) {
-        *self.node.lock().unwrap_or_else(|e| e.into_inner()) = node;
     }
 
     /// Broker a companion admission for the plugin that hosts the WebRTC peer.
