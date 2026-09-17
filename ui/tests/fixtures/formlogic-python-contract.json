@@ -16,9 +16,9 @@
   "vendoredFrom": {
     "repo": "formlogic.com (sibling checkout; OAIY does not depend on it)",
     "contract": "formlogic-python/1",
-    "commit": "ab1ab6b252db3aeed1c1926cb964ba526d8bc1f7",
+    "commit": "560f8a25e86554db2263d20d8ecb37d22094bfbf",
     "source": "formlogic/ui/src/lib/formlogic/python/pythonContract.ts",
-    "sourceBlob": "553476e14e6cdeb3a612518864223e60436b71ea",
+    "sourceBlob": "da89098bb098f2dd7df262068a75e61f4e090d7c",
     "corpus": "docs/contracts/formlogic-python-logic-corpus.json",
     "corpusBlob": "1067e8fe0877d618b211e6ef323e3aa739c70926",
     "blobs": {
@@ -27,7 +27,7 @@
       "entry-flow-module.py": "3ce877665599fb579b132dd05354c9c2fdd000ae",
       "entry-condition.py": "c6473650bbf55c6d73bc86a709b527b3fcdaf22e",
       "entry-applogic.py": "63f3d44e205d8eb334a545eac116f231ce9fea02",
-      "entry-syntax.py": "0554d20fa94646f9130231f90a136b53057a5234"
+      "entry-syntax.py": "984940ae5205cf2aa7551e533eaca8f0886ec3c9"
     },
     "takenOn": "2026-09-17",
     "readOnly": "Read with `git -C ../formlogic.com show HEAD:<path>`; nothing in that checkout was written.",
@@ -109,9 +109,12 @@
     "corpus cases whose applogic value needs the helper prelude (applogic-run, applogic-reject) are",
     "left out for the same reason, and one addedByOaiy case covers what they would have shown here.",
     "",
-    "The `syntax` mode's entry defines `__formlogic_never__`, not `__formlogic_run__`, because a",
-    "syntax check is meant to compile the block and run nothing. That is why it carries the mode's",
-    "own `call`: without one, the only signal of success would be the shared call failing.",
+    "The `syntax` mode's entry defines `__formlogic_compiled__`, not `__formlogic_run__`, because a",
+    "syntax check is meant to compile the block and run nothing. The project compiles every module",
+    "something imports even from a function that is never reached, so the `import logic_block` lives",
+    "in a second function nothing calls and the one a runner DOES call returns None — a `call` that",
+    "imported the block would make the check run the code it is checking. That is why the mode carries",
+    "its own `call`: without one, the only signal of success would be the shared call failing.",
     "",
     "Every case carries `formlogicId`, and its `source` and `context` are that corpus case's,",
     "VERBATIM — `corpusCaseIds` above is the corpus's own id list at that blob, and the test fails",
@@ -177,13 +180,13 @@
       {
         "name": "syntax",
         "files": {
-          "main.py": "# formlogic-python/1 entry: a syntax check. A project module is compiled when the project\n# initializes even if only a function that never runs imports it, so this compiles\n# logic_block and runs none of it.\ndef __formlogic_never__():\n    import logic_block\n"
+          "main.py": "# formlogic-python/1 entry: a syntax check - does the author's block COMPILE?\n#\n# The compile IS the check, and the project does it: ZIPP compiles every project module\n# something in the project imports, even from a function that never runs (an import that is\n# never reached still names the module), and it EXECUTES a module only when an import of it\n# actually runs. So a block that does not parse fails while the project is being set up, with\n# a `source` error on the author's own line; a block that parses leaves nothing left to check;\n# and in neither case has a statement of the block run. The import at the foot of this module\n# is what makes that true - delete it and every block compiles clean - so a corpus case pins it.\n#\n# Which is why the function a caller reaches is NOT the one that imports it. FormLogic's own\n# host calls nothing here - it builds the project and stops - but a consumer unfolding the\n# served profile calls this mode's `call` as it calls every other mode's, and an\n# `import logic_block` in THAT function would execute the author's top level: a syntax check\n# with side effects, which is the one thing this mode exists not to have. The import therefore\n# lives where it is compiled and never run, and the call answers the same None the host does.\ndef __formlogic_compiled__():\n    return None\n\n\ndef _compiles_logic_block():\n    import logic_block\n"
         },
         "block": "logic_block.py",
         "before": "from formlogic import *\n",
         "after": "",
         "lineOffset": 1,
-        "call": "__formlogic_never__"
+        "call": "__formlogic_compiled__"
       }
     ]
   },
@@ -459,7 +462,20 @@
       "expect": {
         "value": null
       },
-      "proves": "a block that compiles runs nothing: the mode's own `call` is the entry's never-run function"
+      "proves": "a block that compiles passes: the mode's own `call` answers None, so a clean check is a null value"
+    },
+    {
+      "id": "syntax-runs-nothing",
+      "formlogicId": "syntax-runs-nothing",
+      "modes": [
+        "syntax"
+      ],
+      "source": "raise SystemExit(1)",
+      "args": [],
+      "expect": {
+        "value": null
+      },
+      "proves": "a syntax check compiles the block and runs none of it; this block exits if anything runs it"
     }
   ]
 }
