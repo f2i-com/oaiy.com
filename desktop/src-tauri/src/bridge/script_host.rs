@@ -150,8 +150,15 @@ const EXIT_POLL: Duration = Duration::from_millis(25);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Health {
     /// No child has proven itself yet: none has been asked for, or one is
-    /// being started. Not a failure — the heartbeat treats it as "not
-    /// unavailable".
+    /// being started.
+    ///
+    /// Not a failure, and not health either. The heartbeat does NOT declare the
+    /// engine capability in this state: the token means "this desktop can run
+    /// logic right now", and a host that has never answered has promised
+    /// nothing. Being wrong in that direction hands a provider work that then
+    /// fails; being wrong the other way only means the provider runs it itself,
+    /// which is what it does anyway. `ScriptHost::warm` is what moves a host
+    /// out of this state on a desktop nobody has sent work to.
     Starting,
     /// A child is up and has answered.
     Ready,
@@ -557,10 +564,31 @@ struct Inner {
     /// at once would have the second's deadline running while the first's batch
     /// executes — a false kill of a healthy child. Pings do not take it.
     batch: Mutex<()>,
+    /// Set while a background warm-up is bringing a child up, so a heartbeat
+    /// that ticks every few seconds starts at most one.
+    warming: AtomicBool,
     state: Mutex<State>,
 }
 
+/// A resolved CLI's remembered probe, with "there is no CLI" as an ANSWER.
+///
+/// Pure in the part that matters, so the distinction is pinned without a
+/// machine that has no CLI on it: `None` means only that nobody has probed
+/// this CLI yet, which is a reason for a caller to go and find out. A machine
+/// with nothing to probe has been asked and has answered, and a caller that
+/// read that as silence would go looking, every time, forever.
+fn remembered_probe(source: Result<(CliInvocation, Option<PathBuf>), String>) -> Option<EngineProbe> {
+    match source {
+        Ok((cli, node_exe)) => worker::cached_engine_probe(&cli, node_exe.as_deref()),
+        Err(reason) => Some(EngineProbe::Unavailable { reason }),
+    }
+}
+
 /// The warm script host. See the module doc.
+///
+/// A handle, not the host: cloning it shares one child, one batch lock and one
+/// health record, which is what lets a warm-up run on a thread of its own.
+#[derive(Clone)]
 pub struct ScriptHost {
     inner: Arc<Inner>,
 }
@@ -575,6 +603,7 @@ impl ScriptHost {
                 node: Mutex::new(None),
                 backoff,
                 batch: Mutex::new(()),
+                warming: AtomicBool::new(false),
                 state: Mutex::new(State {
                     child: None,
                     health: Health::Starting,
@@ -672,6 +701,67 @@ impl ScriptHost {
             // and recorded why.
             Err(RecvTimeoutError::Disconnected) => Err(self.unavailable()),
         }
+    }
+
+    /// The remembered probe for the CLI this host would spawn.
+    ///
+    /// The same resolution the host itself uses — the same CLI file, the same
+    /// Node — because two places resolving that separately is exactly how they
+    /// come to disagree about whether this desktop has an engine. Never spawns
+    /// a process: this is read on a timer.
+    ///
+    /// `None` means ONE thing: nobody has probed yet. A machine with no CLI to
+    /// probe answers `Unavailable` instead, because a caller deciding whether
+    /// to go and find out has to be able to tell "not asked" from "asked, and
+    /// there is nothing there".
+    pub fn engine_probe(&self) -> Option<EngineProbe> {
+        remembered_probe(self.command_source())
+    }
+
+    /// Bring a child up if there is none. Blocking; returns the state after.
+    ///
+    /// The host is spawned by the first job it is asked to serve, which is
+    /// right for a lane that may never have one — but it leaves a standoff on a
+    /// desktop nobody sends work to: the heartbeat will not say the engine is
+    /// healthy until a child has answered, and a provider will not hand over
+    /// work until the heartbeat says so, so no first job ever arrives. This is
+    /// the side that breaks it.
+    pub fn warm(&self) -> HealthSnapshot {
+        {
+            let _one_at_a_time = self.inner.batch.lock().unwrap_or_else(|e| e.into_inner());
+            let _ = self.ensure_child();
+        }
+        self.health()
+    }
+
+    /// [`warm`](Self::warm) on a thread of its own, at most one at a time.
+    ///
+    /// For a caller on a timer: bringing a child up loads and compiles the
+    /// engine, which is [`START_DEADLINE`] in the worst case, and a heartbeat
+    /// that waited that out would make this desktop look offline while it was
+    /// making itself useful.
+    pub fn warm_in_background(&self) {
+        if self
+            .inner
+            .warming
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let host = self.clone();
+        thread::spawn(move || {
+            // Cleared however the thread ends, a panic included: nothing else
+            // clears it, and a stuck flag would mean no warm-up ever again.
+            struct Clear(Arc<Inner>);
+            impl Drop for Clear {
+                fn drop(&mut self) {
+                    self.0.warming.store(false, Ordering::Release);
+                }
+            }
+            let _clear = Clear(host.inner.clone());
+            host.warm();
+        });
     }
 
     /// Ask the running child for its `pong`. `None` when there is no child or it
@@ -1673,6 +1763,54 @@ rl.on('close', () => {{ if (!IGNORE_SHUTDOWN) queue.then(() => process.exit(0));
             panic!("CI must stage the CLI (node desktop/scripts/sync-cli.mjs) and have node on PATH before cargo test");
         }
         found
+    }
+
+    #[test]
+    fn a_machine_with_no_cli_has_answered_and_one_nobody_probed_has_not() {
+        // The two readings a caller must not confuse. "Nobody has probed this
+        // yet" is a reason to go and take the probe — which is what warming
+        // does on its way to a child, and on a headless install it is the ONLY
+        // thing that ever fills the cache. "There is no CLI here" is an answer,
+        // and a caller that heard it as silence would spawn a resolution and a
+        // warning every cycle for the life of the process.
+        let absent = remembered_probe(Err("the OAIY CLI is not available on this machine".into()));
+        assert!(
+            matches!(absent, Some(EngineProbe::Unavailable { ref reason }) if reason.contains("not available")),
+            "{absent:?}"
+        );
+        let never_probed = remembered_probe(Ok((
+            CliInvocation::Node { script: PathBuf::from("/nonexistent/never-probed.mjs") },
+            None,
+        )));
+        assert!(never_probed.is_none(), "{never_probed:?}");
+    }
+
+    #[test]
+    fn the_real_host_can_be_warmed_into_readiness_without_a_job() {
+        // The mechanism the heartbeat's engine token rests on. A host is spawned
+        // by the first job it is asked to serve, and a desktop nobody sends work
+        // to has no first job — so unless something can bring one up on demand,
+        // `health()` stays `Starting`, the beat never carries the engine token,
+        // and a provider that reads that token never sends the job that would
+        // have started it. This is the call that breaks the standoff.
+        let Some((node, cli)) = staged_runner() else {
+            eprintln!("no staged CLI or no Node on this machine — skipping");
+            return;
+        };
+        let host = ScriptHost::with_cli(CliInvocation::Node { script: cli }, Some(node));
+        assert!(matches!(host.health().health, Health::Starting), "nothing asked of it yet");
+        let after = host.warm();
+        assert!(matches!(after.health, Health::Ready), "{:?}", after.health);
+        assert_eq!(after.children, 1, "one child, and warming again does not add another");
+        // The identity came from the probe `spawn` took on the way, confirmed by
+        // the child's own first `pong` — so warming ANSWERS the question the
+        // heartbeat asks, on a machine where nothing else ever would. (Whether
+        // the process-wide probe cache still holds that answer a moment later is
+        // not asserted here: it is one slot, and the suite probes several CLIs
+        // in parallel. `worker`'s own tests pin the remembering.)
+        assert!(after.engine.is_some(), "a warmed host knows what it is serving");
+        assert_eq!(host.warm().children, 1);
+        host.shutdown();
     }
 
     #[test]
