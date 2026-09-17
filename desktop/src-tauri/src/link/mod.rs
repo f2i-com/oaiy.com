@@ -26,6 +26,7 @@ pub mod ops;
 pub mod relay;
 pub mod result_actions;
 pub mod routes;
+pub mod script_profile;
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -517,6 +518,11 @@ impl LinkStore {
         // Withdrawn in the same action that forgot the link: a provider we are
         // no longer linked to must not keep reaching this machine.
         set_linked_origin(None);
+        // And the provider's PRELUDE goes with it. The next link may be another
+        // account on another deployment, whose standard library is its own —
+        // keeping this one would run one account's helpers inside another's
+        // scripts, which is worse than having none.
+        script_profile::ProfileCache::global().invalidate(&self.data_dir);
         self.status()
     }
 

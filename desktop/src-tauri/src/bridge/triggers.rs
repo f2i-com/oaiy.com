@@ -50,7 +50,7 @@ use serde_json::{json, Value};
 
 use super::conditions::{self, ConditionJob, ShadowContext, Verdict};
 use super::ledger::{Ledger, LineageRef, ReserveOutcome, RunRecord, RunRequest};
-use super::script_host::ScriptBatch;
+use super::script_host::{Prelude, ScriptBatch};
 
 /// Maximum bindings one event may fire. Bounded so a misconfigured workspace
 /// cannot turn a single event into hundreds of runs.
@@ -395,10 +395,11 @@ pub fn evaluate_conditions(
     host: &dyn ScriptBatch,
     bindings: &[TriggerBinding],
     event: &Event,
+    prelude: Prelude<'_>,
 ) -> Verdicts {
     let matched = conditioned(bindings, event);
     let jobs = jobs_for(&matched, event);
-    let answers = conditions::decide(host, &jobs);
+    let answers = conditions::decide(host, &jobs, prelude);
     let mut out = Verdicts::default();
     for (b, answer) in matched.iter().zip(answers) {
         let expr = condition_of(b).unwrap_or_default();
@@ -1272,7 +1273,7 @@ mod tests {
             cond("b3", "event.data.attempts === 2"),
         ];
         let host = FakeHost::always(json!(true));
-        evaluate_conditions(&host, &bs, &event());
+        evaluate_conditions(&host, &bs, &event(), Prelude::None);
 
         let request = host.only_request();
         assert_eq!(request["v"], 1);
@@ -1293,7 +1294,7 @@ mod tests {
         // resolving and the other half read something different.
         let host = FakeHost::always(json!(true));
         let e = event();
-        evaluate_conditions(&host, &[cond("b1", "event.data.known")], &e);
+        evaluate_conditions(&host, &[cond("b1", "event.data.known")], &e, Prelude::None);
 
         let globals = host.only_request()["jobs"][0]["globals"].clone();
         assert_eq!(globals["event"], globals["$event"]);
@@ -1320,7 +1321,7 @@ mod tests {
         let blank = binding("b4", Some("   "));
 
         let host = FakeHost::always(json!(true));
-        let verdicts = evaluate_conditions(&host, &[disabled, manual, other_event, blank], &event());
+        let verdicts = evaluate_conditions(&host, &[disabled, manual, other_event, blank], &event(), Prelude::None);
         assert!(verdicts.is_empty());
         assert_eq!(host.calls(), 0, "none of these can fire, so none of them costs an engine");
     }
@@ -1332,7 +1333,7 @@ mod tests {
 
         // The Rust grammar reads this as TRUE. ZIPP says false, and ZIPP decides.
         let no = FakeHost::always(json!(false));
-        let verdicts = evaluate_conditions(&no, &bs, &event());
+        let verdicts = evaluate_conditions(&no, &bs, &event(), Prelude::None);
         match &dispatch(&mut l, &bs, &event(), &verdicts)[0] {
             DispatchOutcome::Skipped { reason, .. } => assert_eq!(*reason, SkipReason::ConditionFalse),
             other => panic!("{other:?}"),
@@ -1343,7 +1344,7 @@ mod tests {
         // which ZIPP evaluates, now fires.
         let parens = [cond("b2", "(event.data.known === true) && event.data.attempts === 2")];
         let yes = FakeHost::always(json!(true));
-        let verdicts = evaluate_conditions(&yes, &parens, &event());
+        let verdicts = evaluate_conditions(&yes, &parens, &event(), Prelude::None);
         assert!(matches!(
             dispatch(&mut l, &parens, &event(), &verdicts)[0],
             DispatchOutcome::Reserved { .. }
@@ -1353,7 +1354,7 @@ mod tests {
     #[test]
     fn agreement_leaves_no_shadow_line() {
         let host = FakeHost::always(json!(true));
-        let verdicts = evaluate_conditions(&host, &[cond("b1", "event.data.known === true")], &event());
+        let verdicts = evaluate_conditions(&host, &[cond("b1", "event.data.known === true")], &event(), Prelude::None);
         assert_eq!(verdicts.get("b1"), Some(&Verdict::True));
         assert!(verdicts.shadow.is_empty(), "a shadow line means the two disagreed");
     }
@@ -1365,7 +1366,7 @@ mod tests {
         // (i)/(ii) — a Rust-grammar REFUSAL that ZIPP evaluates. Parentheses are
         // the commonest: the old evaluator would not group, so it refused.
         let host = FakeHost::always(json!(true));
-        let v = evaluate_conditions(&host, &[cond("b1", "(event.data.known === true)")], &e);
+        let v = evaluate_conditions(&host, &[cond("b1", "(event.data.known === true)")], &e, Prelude::None);
         assert_eq!(v.shadow.len(), 1);
         let line = &v.shadow[0];
         assert!(line.starts_with("condition-shadow: lane=triggers "), "{line}");
@@ -1380,13 +1381,13 @@ mod tests {
 
         // (iii) — a real semantic change. `==` coerced in JavaScript; the Rust
         // grammar compared JSON values, so `2 == '2'` was FALSE.
-        let v = evaluate_conditions(&host, &[cond("b2", "event.data.attempts == '2'")], &e);
+        let v = evaluate_conditions(&host, &[cond("b2", "event.data.attempts == '2'")], &e, Prelude::None);
         assert_eq!(v.shadow.len(), 1);
         assert!(v.shadow[0].contains("zipp=true rust=false refused=none"), "{}", v.shadow[0]);
 
         // A condition ZIPP itself refuses, which the Rust grammar read.
         let throwing = FakeHost::by_source(|_| Err(guest("ReferenceError: x is not defined")));
-        let v = evaluate_conditions(&throwing, &[cond("b3", "event.data.known === true")], &e);
+        let v = evaluate_conditions(&throwing, &[cond("b3", "event.data.known === true")], &e, Prelude::None);
         assert_eq!(v.shadow.len(), 1);
         assert!(v.shadow[0].contains("zipp=unknown rust=true refused=zipp"), "{}", v.shadow[0]);
     }
@@ -1400,7 +1401,7 @@ mod tests {
         let mut l = Ledger::new();
         let bs = [cond("b1", "event.data.known === true"), binding("b2", None)];
         let down = FakeHost::down("the CLI is not installed");
-        let verdicts = evaluate_conditions(&down, &bs, &event());
+        let verdicts = evaluate_conditions(&down, &bs, &event(), Prelude::None);
 
         assert!(verdicts.shadow.is_empty(), "an outage is an outage, not a disagreement");
         let out = dispatch(&mut l, &bs, &event(), &verdicts);

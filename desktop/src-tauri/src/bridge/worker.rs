@@ -912,6 +912,10 @@ impl Worker {
                 // The engine's own default: a flow stored here was written
                 // against no provider's policy, and the desktop sets none.
                 instruction_budget: None,
+                // And against no provider's standard library either. A flow
+                // stored on this desktop speaks for nobody, so it gets nobody's
+                // prelude — the same reason it gets no connector config.
+                profile_path: None,
                 node: self.node.as_ref(),
             },
             // Cancellation: the flag the cancel endpoint sets. Observed from
@@ -1030,8 +1034,31 @@ pub struct CliRequest<'a> {
     /// provider's policy from its descriptor. `None` leaves the engine's own
     /// default; the CLI refuses a value outside the engine's range, which is
     /// why the descriptor checks it first.
+    ///
+    /// Must be `None` when `profile_path` names a profile that carries
+    /// `instructionSteps` — see [`instruction_budget_for`].
     pub instruction_budget: Option<u64>,
+    /// A script profile (`--profile`), when the provider publishes one: its
+    /// preamble is placed at the top of every flow script, so the provider's
+    /// own helpers resolve inside a flow exactly as they do in its browser.
+    pub profile_path: Option<&'a Path>,
     pub node: Option<&'a crate::services::node_runtime::NodeHandle>,
+}
+
+/// The instruction budget to pass ALONGSIDE a profile.
+///
+/// The CLI refuses `--profile` carrying `instructionSteps` together with
+/// `--instruction-budget` — two budgets is an ambiguity it will not resolve
+/// silently — and the refusal is exit 1 with no result file, which would fail
+/// EVERY run of the lane. The provider sets both figures, so this is not a
+/// conflict anybody can fix from here: the profile's is the later word and the
+/// descriptor's stands in only where the profile names none.
+pub fn instruction_budget_for(descriptor_budget: Option<u64>, profile_steps: Option<u64>) -> Option<u64> {
+    if profile_steps.is_some() {
+        None
+    } else {
+        descriptor_budget
+    }
 }
 
 /// The CLI's argv for one run, so what is passed is pinned by a test.
@@ -1049,6 +1076,10 @@ pub fn cli_args(req: &CliRequest) -> Vec<OsString> {
     if let Some(steps) = req.instruction_budget {
         args.push("--instruction-budget".into());
         args.push(steps.to_string().into());
+    }
+    if let Some(profile) = req.profile_path {
+        args.push("--profile".into());
+        args.push(profile.into());
     }
     if let Some(connector) = req.connector_path {
         args.push("--connector".into());
@@ -1931,6 +1962,7 @@ mod tests {
             paths: &'a (PathBuf, PathBuf, PathBuf),
             budget: Option<u64>,
             connector: Option<&'a Path>,
+            profile: Option<&'a Path>,
         ) -> CliRequest<'a> {
             CliRequest {
                 flow_path: &paths.0,
@@ -1939,6 +1971,7 @@ mod tests {
                 connector_path: connector,
                 timeout: Duration::from_secs(300),
                 instruction_budget: budget,
+                profile_path: profile,
                 node: None,
             }
         }
@@ -1947,16 +1980,77 @@ mod tests {
             args.into_iter().map(|a| a.to_string_lossy().into_owned()).collect()
         };
         // The FormLogic lanes: the provider's 200M from its descriptor.
-        let a = strs(cli_args(&req(&paths, Some(200_000_000), Some(&connector))));
+        let a = strs(cli_args(&req(&paths, Some(200_000_000), Some(&connector), None)));
         assert_eq!(
             a,
             ["run", "g.json", "--inputs", "i.json", "-o", "r.json", "--timeout", "300",
              "--instruction-budget", "200000000", "--connector", "c.json"]
         );
         // The bridge: no policy, so the engine's own default — no flag at all.
-        let b = strs(cli_args(&req(&paths, None, None)));
+        let b = strs(cli_args(&req(&paths, None, None, None)));
         assert!(!b.iter().any(|s| s.contains("instruction-budget")), "{b:?}");
         assert_eq!(b, ["run", "g.json", "--inputs", "i.json", "-o", "r.json", "--timeout", "300"]);
+    }
+
+
+    #[test]
+    fn a_profile_replaces_the_descriptors_budget_rather_than_joining_it() {
+        // The CLI refuses `--profile` carrying instructionSteps TOGETHER with
+        // `--instruction-budget` — exit 1, no result file — so passing both
+        // would fail every run of the lane rather than one.
+        assert_eq!(instruction_budget_for(Some(200_000_000), Some(200_000_000)), None);
+        assert_eq!(instruction_budget_for(Some(200_000_000), None), Some(200_000_000));
+        // Even when the two figures differ: the profile is the later word.
+        assert_eq!(instruction_budget_for(Some(1_000), Some(9_000)), None);
+        assert_eq!(instruction_budget_for(None, None), None);
+
+        let paths = (PathBuf::from("g.json"), PathBuf::from("i.json"), PathBuf::from("r.json"));
+        let profile = PathBuf::from("p.json");
+        let connector = PathBuf::from("c.json");
+        let strs = |args: Vec<OsString>| -> Vec<String> {
+            args.into_iter().map(|a| a.to_string_lossy().into_owned()).collect()
+        };
+        fn req<'a>(
+            paths: &'a (PathBuf, PathBuf, PathBuf),
+            budget: Option<u64>,
+            connector: Option<&'a Path>,
+            profile: Option<&'a Path>,
+        ) -> CliRequest<'a> {
+            CliRequest {
+                flow_path: &paths.0,
+                inputs_path: &paths.1,
+                out_path: &paths.2,
+                connector_path: connector,
+                timeout: Duration::from_secs(300),
+                instruction_budget: budget,
+                profile_path: profile,
+                node: None,
+            }
+        }
+        // A provider that publishes a prelude: the profile, no budget flag.
+        let a = strs(cli_args(&req(
+            &paths,
+            instruction_budget_for(Some(200_000_000), Some(200_000_000)),
+            Some(&connector),
+            Some(&profile),
+        )));
+        assert_eq!(
+            a,
+            ["run", "g.json", "--inputs", "i.json", "-o", "r.json", "--timeout", "300",
+             "--profile", "p.json", "--connector", "c.json"]
+        );
+        // A profile with no figure of its own leaves the descriptor's standing.
+        let b = strs(cli_args(&req(
+            &paths,
+            instruction_budget_for(Some(200_000_000), None),
+            None,
+            Some(&profile),
+        )));
+        assert_eq!(
+            b,
+            ["run", "g.json", "--inputs", "i.json", "-o", "r.json", "--timeout", "300",
+             "--instruction-budget", "200000000", "--profile", "p.json"]
+        );
     }
 
     // --- a stub CLI through the real spawn path ------------------------------
@@ -2022,6 +2116,7 @@ mod tests {
                 connector_path: None,
                 timeout: Duration::from_secs(20),
                 instruction_budget: None,
+                profile_path: None,
                 node: None,
             },
             &|| false,

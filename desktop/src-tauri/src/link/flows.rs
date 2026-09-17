@@ -32,7 +32,7 @@ use serde_json::{json, Value};
 use super::descriptor::FlowsSpec;
 use super::LinkedAccount;
 use crate::bridge::conditions::{self, ConditionJob, ConditionVerdict, ShadowContext, Verdict};
-use crate::bridge::script_host::ScriptBatch;
+use crate::bridge::script_host::{Prelude, ScriptBatch};
 
 /// How long a fetched binding list is reused.
 ///
@@ -477,17 +477,22 @@ pub fn decide<'a>(
 
 /// The bindings this event should fire, and why the others were skipped.
 ///
-/// Conditions are decided on ZIPP, in ONE batch, before anything is reserved.
+/// Conditions are decided on ZIPP, in ONE batch, before anything is reserved,
+/// under the provider's own prelude — these are the PROVIDER's conditions,
+/// authored in its editor against its standard library, and a `Missing`
+/// prelude skips every one of them rather than deciding it in a language half
+/// of which is absent.
 pub fn select<'a>(
     host: &dyn ScriptBatch,
     bindings: &'a [Binding],
     event_name: &str,
     source: &str,
     envelope: &Value,
+    prelude: Prelude<'_>,
 ) -> Selection<'a> {
     let pending = filter(bindings, event_name);
     let jobs = condition_jobs(&pending, envelope);
-    let answers = conditions::decide(host, &jobs);
+    let answers = conditions::decide(host, &jobs, prelude);
     decide(pending, &answers, event_name, source, envelope)
 }
 
@@ -842,13 +847,13 @@ mod tests {
         ];
         let e = envelope(json!({}));
         let host = answering(json!(true));
-        let sel = select(&host, &all, "aokie.call.ended", "aokie", &e);
+        let sel = select(&host, &all, "aokie.call.ended", "aokie", &e, Prelude::None);
         assert_eq!(fire_ids(&sel), ["b1", "b3"]);
         assert!(sel.skipped.is_empty());
         // No wildcards or prefixes: firing on more than the author named is the
         // dangerous direction.
-        assert!(select(&host, &all, "aokie.call", "aokie", &e).fire.is_empty());
-        assert!(select(&host, &all, "aokie.call.ended.extra", "aokie", &e).fire.is_empty());
+        assert!(select(&host, &all, "aokie.call", "aokie", &e, Prelude::None).fire.is_empty());
+        assert!(select(&host, &all, "aokie.call.ended.extra", "aokie", &e, Prelude::None).fire.is_empty());
     }
 
     #[test]
@@ -863,12 +868,12 @@ mod tests {
 
         let long = answering(json!(true));
         assert_eq!(
-            select(&long, &all, "aokie.call.transcript.settled", "aokie", &envelope(json!({ "durationSeconds": 33 }))).fire.len(),
+            select(&long, &all, "aokie.call.transcript.settled", "aokie", &envelope(json!({ "durationSeconds": 33 })), Prelude::None).fire.len(),
             1
         );
 
         let short = answering(json!(false));
-        let sel = select(&short, &all, "aokie.call.transcript.settled", "aokie", &envelope(json!({ "durationSeconds": 2 })));
+        let sel = select(&short, &all, "aokie.call.transcript.settled", "aokie", &envelope(json!({ "durationSeconds": 2 })), Prelude::None);
         assert!(sel.fire.is_empty());
         // False is a DECISION, and reads differently from "not understood".
         assert_eq!(sel.skipped[0].1, Skip::ConditionFalse);
@@ -882,7 +887,7 @@ mod tests {
         let mut b = binding("b1", "aokie.call.ended");
         b.condition = Some(json!({ "type": "expression", "expr": "event.data.from.includes('+44')" }));
         let throwing = FakeHost::by_source(|_| Err(guest("TypeError: cannot read 'includes' of undefined")));
-        let sel = select(&throwing, std::slice::from_ref(&b), "aokie.call.ended", "aokie", &envelope(json!({})));
+        let sel = select(&throwing, std::slice::from_ref(&b), "aokie.call.ended", "aokie", &envelope(json!({})), Prelude::None);
         assert!(sel.fire.is_empty());
         assert!(matches!(sel.skipped[0].1, Skip::ConditionUnknown(_)));
         // …and it says WHY, so an author is not left guessing.
@@ -893,7 +898,7 @@ mod tests {
         let mut odd = binding("b2", "aokie.call.ended");
         odd.condition = Some(json!([1, 2, 3]));
         let host = answering(json!(true));
-        let sel = select(&host, std::slice::from_ref(&odd), "aokie.call.ended", "aokie", &envelope(json!({})));
+        let sel = select(&host, std::slice::from_ref(&odd), "aokie.call.ended", "aokie", &envelope(json!({})), Prelude::None);
         assert!(sel.fire.is_empty());
         assert!(matches!(sel.skipped[0].1, Skip::ConditionUnknown(_)));
         assert_eq!(host.calls(), 0, "a shape with no expression is not a job");
@@ -915,7 +920,7 @@ mod tests {
 
         let all = vec![disabled, manual, no_flow, conditional];
         let throwing = FakeHost::by_source(|_| Err(guest("TypeError")));
-        let sel = select(&throwing, &all, "e", "aokie", &envelope(json!({})));
+        let sel = select(&throwing, &all, "e", "aokie", &envelope(json!({})), Prelude::None);
         assert!(sel.fire.is_empty(), "none of these may fire");
         assert!(matches!(sel.skipped[0].1, Skip::Disabled));
         assert!(matches!(sel.skipped[1].1, Skip::ManualMode));
@@ -935,7 +940,7 @@ mod tests {
             let mut b = binding("b", "e");
             b.condition = Some(empty.clone());
             let host = answering(json!(false));
-            let sel = select(&host, std::slice::from_ref(&b), "e", "aokie", &envelope(json!({})));
+            let sel = select(&host, std::slice::from_ref(&b), "e", "aokie", &envelope(json!({})), Prelude::None);
             assert_eq!(sel.fire.len(), 1, "{empty:?} is not a condition and must not block the binding");
             assert_eq!(host.calls(), 0, "{empty:?} must not become a job");
         }
@@ -945,7 +950,7 @@ mod tests {
     fn one_event_cannot_become_an_unbounded_number_of_runs() {
         let all: Vec<Binding> = (0..9).map(|i| binding(&format!("b{i}"), "e")).collect();
         let host = answering(json!(true));
-        let sel = select(&host, &all, "e", "aokie", &envelope(json!({})));
+        let sel = select(&host, &all, "e", "aokie", &envelope(json!({})), Prelude::None);
         assert_eq!(sel.fire.len(), MAX_BINDINGS_PER_EVENT);
         assert!(sel.skipped.iter().all(|(_, s)| *s == Skip::TooManyBindings));
         assert_eq!(sel.skipped.len(), 9 - MAX_BINDINGS_PER_EVENT);
@@ -968,7 +973,7 @@ mod tests {
         ];
         let host = answering(json!(true));
         let e = envelope(json!({ "n": 1 }));
-        select(&host, &all, "aokie.call.ended", "aokie", &e);
+        select(&host, &all, "aokie.call.ended", "aokie", &e, Prelude::None);
 
         let request = host.only_request();
         let jobs = request["jobs"].as_array().expect("jobs");
@@ -989,7 +994,7 @@ mod tests {
         let e = envelope(json!({ "n": 5 }));
 
         let zipp_says_no = answering(json!(false));
-        let sel = select(&zipp_says_no, &all, "aokie.call.ended", "aokie", &e);
+        let sel = select(&zipp_says_no, &all, "aokie.call.ended", "aokie", &e, Prelude::None);
         assert!(sel.fire.is_empty(), "ZIPP said false, so the binding does not fire");
         assert_eq!(sel.skipped[0].1, Skip::ConditionFalse);
         assert_eq!(sel.shadow.len(), 1, "and the disagreement is on the record");
@@ -1000,17 +1005,64 @@ mod tests {
         // perfectly well, and which now fires.
         let method = vec![conditional("b1", "event.data.tags.includes('vip')")];
         let zipp_says_yes = answering(json!(true));
-        let sel = select(&zipp_says_yes, &method, "aokie.call.ended", "aokie", &envelope(json!({ "tags": ["vip"] })));
+        let sel = select(&zipp_says_yes, &method, "aokie.call.ended", "aokie", &envelope(json!({ "tags": ["vip"] })), Prelude::None);
         assert_eq!(fire_ids(&sel), ["b1"], "a method call is legal JavaScript");
         assert_eq!(sel.shadow.len(), 1);
         assert!(sel.shadow[0].contains("refused=rust"), "{}", sel.shadow[0]);
+    }
+
+
+    #[test]
+    fn the_providers_prelude_travels_with_the_binding_conditions() {
+        let preamble = "var validators = { email: function (v) { return /@/.test(v); } };";
+        let doc = json!({
+            "v": 1,
+            "preamble": preamble,
+            "preambleSha256": crate::link::script_profile::sha256_hex(preamble),
+        });
+        let all = vec![conditional("b1", "validators.email(event.data.to)")];
+        let host = answering(json!(true));
+        let sel = select(
+            &host,
+            &all,
+            "aokie.call.ended",
+            "aokie",
+            &envelope(json!({ "to": "a@b.co" })),
+            Prelude::Profile(&doc),
+        );
+        assert_eq!(fire_ids(&sel), ["b1"]);
+        assert_eq!(host.only_request()["profile"], doc);
+    }
+
+    #[test]
+    fn without_the_providers_prelude_no_conditioned_binding_fires_and_nothing_is_sent() {
+        // And an UNCONDITIONED binding still fires: it reads no helper, so
+        // there is nothing about it the missing library could change.
+        let all = vec![
+            conditional("b1", "validators.email(event.data.to)"),
+            binding("b2", "aokie.call.ended"),
+        ];
+        let host = answering(json!(true));
+        let sel = select(
+            &host,
+            &all,
+            "aokie.call.ended",
+            "aokie",
+            &envelope(json!({ "to": "a@b.co" })),
+            Prelude::Missing("the provider's prelude could not be read"),
+        );
+        assert_eq!(host.calls(), 0);
+        assert_eq!(fire_ids(&sel), ["b2"]);
+        assert!(matches!(sel.skipped[0].1, Skip::ConditionUnknown(_)));
+        assert!(sel.skipped[0].1.message().contains("could not be read"));
+        assert!(sel.shadow.is_empty(), "an absent prelude is not a grammar disagreement");
     }
 
     #[test]
     fn agreement_leaves_no_shadow_line() {
         let all = vec![conditional("b1", "event.data.n > 1")];
         let host = answering(json!(true));
-        let sel = select(&host, &all, "aokie.call.ended", "aokie", &envelope(json!({ "n": 5 })));
+        let sel = select(&host, &all, "aokie.call.ended", "aokie", &envelope(json!({ "n": 5 })), Prelude::None);
         assert_eq!(fire_ids(&sel), ["b1"]);
         assert!(sel.shadow.is_empty(), "a shadow line means the two disagreed");
     }
@@ -1023,7 +1075,7 @@ mod tests {
         // not fill the shadow log that PR9's deletion gate reads.
         let all = vec![conditional("b1", "event.data.n > 1"), binding("b2", "aokie.call.ended")];
         let down = FakeHost::down("no engine on this machine");
-        let sel = select(&down, &all, "aokie.call.ended", "aokie", &envelope(json!({ "n": 5 })));
+        let sel = select(&down, &all, "aokie.call.ended", "aokie", &envelope(json!({ "n": 5 })), Prelude::None);
 
         assert_eq!(fire_ids(&sel), ["b2"], "an unconditioned binding is unaffected");
         assert!(matches!(sel.skipped[0].1, Skip::ConditionUnknown(_)));

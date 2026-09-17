@@ -1049,12 +1049,18 @@ impl PluginHost {
         // The envelope, not the internal event: conditions are authored against
         // `event.data.*` as it appears on the wire. Nothing is locked here
         // either — this lane never held the ledger — so the batch simply runs.
+        // The provider's prelude, resolved ONCE for this lane. Its conditions
+        // are the provider's, written against the provider's own helpers, so a
+        // prelude this desktop has not got skips every one of them rather than
+        // deciding them in half a language.
+        let held = crate::link::script_profile::resolve(&account, link.data_dir());
         let selection = crate::link::flows::select(
             self.script_evaluator().as_ref(),
             &bindings,
             &event.name,
             &event.source,
             envelope,
+            held.prelude(),
         );
         for (binding, reason) in &selection.skipped {
             log::info!(
@@ -1121,6 +1127,7 @@ impl PluginHost {
                 return;
             }
         };
+        let held = crate::link::script_profile::resolve(&account, link.data_dir());
         let storage = crate::link::app_logic::StorageStore::open(link.data_dir());
         let connector = |connector_id: &str,
                          command: &str,
@@ -1148,6 +1155,7 @@ impl PluginHost {
             &storage,
             envelope,
             self.script_evaluator().as_ref(),
+            held.prelude(),
             &connector,
         ) {
             // Every outcome, always. A script that quietly records nothing is
@@ -1262,6 +1270,25 @@ impl PluginHost {
     /// test that substitutes one substitutes it for every lane at once.
     pub fn script_evaluator(&self) -> std::sync::Arc<dyn crate::bridge::script_host::ScriptBatch> {
         self.scripts.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// The linked provider's prelude, if this desktop is linked at all.
+    ///
+    /// Unlinked is [`Held::NotRequired`] rather than `Missing`: a desktop with
+    /// no account has no provider to be missing a prelude FROM, and its own
+    /// trigger bindings are none the worse for it.
+    fn linked_prelude(&self) -> crate::link::script_profile::Held {
+        let link = {
+            let guard = self.link.lock().unwrap_or_else(|e| e.into_inner());
+            match guard.as_ref() {
+                Some(l) => l.clone(),
+                None => return crate::link::script_profile::Held::NotRequired,
+            }
+        };
+        match link.account() {
+            Some(account) => crate::link::script_profile::resolve(&account, link.data_dir()),
+            None => crate::link::script_profile::Held::NotRequired,
+        }
     }
 
     /// Let a binary supply the companion broker once its HTTP surface exists.
@@ -1630,8 +1657,15 @@ impl PluginHost {
         //
         // An event whose bindings carry no conditions sends no batch and starts
         // no child: `conditions::decide` returns early on an empty job list.
-        let verdicts =
-            crate::bridge::triggers::evaluate_conditions(self.script_evaluator().as_ref(), &bindings, event);
+        // This desktop's OWN bindings, so the prelude is taken when there is
+        // one and its absence is not a refusal: nobody else decides these.
+        let held = self.linked_prelude();
+        let verdicts = crate::bridge::triggers::evaluate_conditions(
+            self.script_evaluator().as_ref(),
+            &bindings,
+            event,
+            held.prelude_or_bare(),
+        );
 
         let results = match self.ledger.lock() {
             Ok(mut ledger) => dispatch(&mut ledger, &bindings, event, &verdicts),

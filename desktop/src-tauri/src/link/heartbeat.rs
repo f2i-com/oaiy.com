@@ -38,6 +38,16 @@
 //!   language token and no engine token takes NOTHING — which is the state a
 //!   desktop with no working engine should be in.
 //!
+//! * A provider that publishes the PRELUDE its scripts are written against
+//!   adds a third condition to the engine token, and it is not about the
+//!   engine at all: a desktop that cannot read that prelude cannot run the
+//!   provider's logic CORRECTLY, only confidently. Every helper the library
+//!   defines would throw, a condition that should fire would come back unknown,
+//!   and the provider would never know it had handed the work to a runtime
+//!   missing half the language. Withholding the token is what makes refusing
+//!   those lanes free: the provider reads a desktop that takes nothing and runs
+//!   the work in its own runtime, where the prelude is.
+//!
 //! The two clauses are not symmetric on purpose. Dropping the engine token is
 //! immediate, because a desktop whose engine has gone must stop being given
 //! work at once. Adding it waits for the host's health to have HELD
@@ -46,7 +56,8 @@
 
 use std::time::{Duration, Instant};
 
-use super::descriptor::{self, HeartbeatSpec};
+use super::descriptor::{self, HeartbeatSpec, ScriptProfileSpec};
+use super::script_profile::ProfileCache;
 use super::{LinkHandle, LinkedAccount};
 use crate::bridge::script_host::{Health, HealthSnapshot, ScriptHost};
 use crate::bridge::worker::EngineProbe;
@@ -108,7 +119,10 @@ pub fn spawn(store: LinkHandle) {
                 last_tokens = None;
                 continue;
             };
-            let Some(spec) = heartbeat_spec(&store, &account) else {
+            let Some(descriptor) = descriptor::find(store.data_dir(), &account.connector_id) else {
+                continue;
+            };
+            let Some(spec) = descriptor.heartbeat else {
                 continue;
             };
             let interval = Duration::from_secs(spec.interval_seconds);
@@ -116,7 +130,6 @@ pub fn spawn(store: LinkHandle) {
             let host = ScriptHost::global();
             let probe = host.engine_probe();
             let health = host.health();
-            let tokens = capability_tokens(&spec, probe.as_ref(), &health, Instant::now());
 
             if should_warm(&spec, probe.as_ref(), &health, last_warm, Instant::now()) {
                 last_warm = Some(Instant::now());
@@ -138,6 +151,21 @@ pub fn spawn(store: LinkHandle) {
                 last_tokens = None;
                 continue;
             }
+
+            // Keeping the provider's prelude current is done HERE, and it is
+            // deliberate: this thread already holds the account and the
+            // descriptor, it already does HTTP of its own, and it is the one
+            // thread whose answer to the provider depends on whether the fetch
+            // worked. Doing it on the event thread instead would put a network
+            // timeout in front of every plugin event; doing it nowhere would
+            // leave an idle desktop waiting for a job it would then refuse.
+            //
+            // After the seeding branch above, so the first tick after a link
+            // seeds the schedule promptly and this runs on the second — the
+            // beat that first says something then says something true.
+            let prelude = poll_prelude(&store, &account, descriptor.script_profile.as_ref());
+            let tokens = capability_tokens(&spec, probe.as_ref(), &health, prelude, Instant::now());
+
             if !beat_due(interval, last_beat.as_ref(), last_tokens.as_deref(), &tokens, Instant::now())
             {
                 continue;
@@ -248,6 +276,7 @@ pub fn capability_tokens(
     spec: &HeartbeatSpec,
     probe: Option<&EngineProbe>,
     host: &HealthSnapshot,
+    prelude: PreludeState,
     now: Instant,
 ) -> Vec<String> {
     if spec.capabilities_field.is_none() {
@@ -260,11 +289,49 @@ pub fn capability_tokens(
         }
     }
     if let Some(engine) = &spec.engine_capability {
-        if engine_is_up(probe, host, now) {
+        if engine_is_up(probe, host, now) && prelude != PreludeState::Missing {
             tokens.push(engine.clone());
         }
     }
     tokens
+}
+
+/// What this desktop holds of the provider's prelude, as one beat sees it.
+///
+/// A third state rather than a boolean because the two ways of not holding one
+/// mean opposite things: a provider that publishes none is perfectly served by
+/// this desktop, and a provider that publishes one this desktop has not got is
+/// not served at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreludeState {
+    /// The provider publishes none — nothing to be missing.
+    NotRequired,
+    Held,
+    /// Published, and not held. Every lane that runs this provider's source is
+    /// refusing while this is true, so the engine token must not be sent.
+    Missing,
+}
+
+/// Keep the provider's prelude current, and say what this beat should claim.
+///
+/// Cheap on most ticks: the cache answers from memory until its own TTL, and a
+/// failed fetch is left alone for a while rather than retried every five
+/// seconds against a provider that is down.
+fn poll_prelude(
+    store: &LinkHandle,
+    account: &LinkedAccount,
+    spec: Option<&ScriptProfileSpec>,
+) -> PreludeState {
+    let Some(spec) = spec else {
+        return PreludeState::NotRequired;
+    };
+    let cache = ProfileCache::global();
+    cache.poll(account, spec, store.data_dir());
+    if cache.current().is_some() {
+        PreludeState::Held
+    } else {
+        PreludeState::Missing
+    }
 }
 
 /// The logic languages this desktop declares.
@@ -305,10 +372,6 @@ fn engine_is_up(probe: Option<&EngineProbe>, host: &HealthSnapshot, now: Instant
     probe.is_some_and(runs_scripts)
         && matches!(host.health, Health::Ready)
         && now.saturating_duration_since(host.since) >= HEALTH_SETTLE
-}
-
-fn heartbeat_spec(store: &LinkHandle, account: &LinkedAccount) -> Option<HeartbeatSpec> {
-    descriptor::find(store.data_dir(), &account.connector_id)?.heartbeat
 }
 
 /// One beat. Blocking; the worker thread exists for this.
@@ -449,7 +512,15 @@ mod tests {
     }
 
     fn tokens(probe: Option<&EngineProbe>, host: &HealthSnapshot) -> Vec<String> {
-        capability_tokens(&spec(), probe, host, Instant::now())
+        tokens_with(probe, host, PreludeState::NotRequired)
+    }
+
+    fn tokens_with(
+        probe: Option<&EngineProbe>,
+        host: &HealthSnapshot,
+        prelude: PreludeState,
+    ) -> Vec<String> {
+        capability_tokens(&spec(), probe, host, prelude, Instant::now())
     }
 
     #[test]
@@ -552,7 +623,47 @@ mod tests {
         s.capabilities_field = None;
         s.language_capability_prefix = None;
         s.engine_capability = None;
-        assert!(capability_tokens(&s, Some(&ready_probe()), &settled(Health::Ready), Instant::now()).is_empty());
+        assert!(capability_tokens(&s, Some(&ready_probe()), &settled(Health::Ready), PreludeState::Held, Instant::now()).is_empty());
+    }
+
+
+    #[test]
+    fn a_desktop_that_cannot_read_the_providers_prelude_does_not_advertise_an_engine() {
+        // The clause that makes refusing those lanes free. A desktop whose
+        // engine is perfect but whose standard library is missing runs the
+        // provider's logic WRONGLY, not slowly — so it must read to the
+        // provider exactly like a desktop with no engine, and the provider's
+        // own runtime does the work.
+        assert_eq!(
+            tokens_with(Some(&ready_probe()), &settled(Health::Ready), PreludeState::Missing),
+            vec!["logic-language:javascript"],
+            "the language token stays: this is still a build from the ZIPP era"
+        );
+        // With it, the same desktop advertises the engine.
+        assert_eq!(
+            tokens_with(Some(&ready_probe()), &settled(Health::Ready), PreludeState::Held),
+            vec!["logic-language:javascript", "logic-engine:zipp"]
+        );
+        // And a provider that publishes no prelude is unaffected.
+        assert_eq!(
+            tokens_with(Some(&ready_probe()), &settled(Health::Ready), PreludeState::NotRequired),
+            vec!["logic-language:javascript", "logic-engine:zipp"]
+        );
+    }
+
+    #[test]
+    fn a_profile_does_not_make_this_desktop_claim_a_language_it_cannot_run() {
+        // The profile carries a Python contract with its modes. Nothing on this
+        // desktop unfolds one yet, so the languages come from the PROBE and
+        // from nowhere else — a token for python here would have the provider
+        // hand over work that has no runner (O1).
+        for state in [PreludeState::Held, PreludeState::NotRequired, PreludeState::Missing] {
+            let out = tokens_with(Some(&ready_probe()), &settled(Health::Ready), state);
+            assert!(
+                !out.iter().any(|t| t.contains("python")),
+                "{out:?} claims a language no lane on this desktop runs"
+            );
+        }
     }
 
     // --- bringing the host up ----------------------------------------------

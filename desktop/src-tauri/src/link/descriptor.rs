@@ -127,6 +127,38 @@ pub struct ConnectorDescriptor {
     /// a lane separate from flows. Omitted for a provider with no such notion.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub app_logic: Option<AppLogicSpec>,
+    /// Where this provider publishes the PRELUDE its own scripts are written
+    /// against. Omitted for a provider whose scripts stand alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub script_profile: Option<ScriptProfileSpec>,
+}
+
+/// The provider's leaf-script profile: its prelude, its digest, and the Python
+/// contract it would unfold (`protocol/v1/script-profile.schema.json`).
+///
+/// Declaring this block is the provider SAYING that its conditions and its app
+/// scripts are written against a prelude it serves — `validators.email(x)` is
+/// not JavaScript, it is FormLogic's, and a desktop that runs the same source
+/// without it does not refuse, it silently disagrees with the browser. So the
+/// block is also the switch that makes the linked lanes refuse rather than run
+/// half a language: see [`crate::link::script_profile`].
+///
+/// A provider that declares none runs exactly as it did before this existed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ScriptProfileSpec {
+    /// GET, under the same read scope as the rest of the provider's logic.
+    pub path: String,
+    /// How long a fetched profile is used before it is REVALIDATED — not how
+    /// long it is kept. A revalidation that fails leaves the last good copy in
+    /// place, because a preamble does not rot and the alternative is the very
+    /// "no prelude" state this block exists to remove.
+    #[serde(default = "default_profile_ttl")]
+    pub ttl_seconds: u64,
+}
+
+fn default_profile_ttl() -> u64 {
+    300
 }
 
 /// The account's app-logic lane: scripts the provider's apps carry, which turn
@@ -959,6 +991,23 @@ impl ConnectorDescriptor {
                 return Err(format!("connector {:?} heartbeat capabilitiesField is blank", self.id));
             }
         }
+        if let Some(p) = &self.script_profile {
+            if !p.path.starts_with('/') {
+                return Err(format!(
+                    "connector {:?} scriptProfile path must begin with '/', got {:?}",
+                    self.id, p.path
+                ));
+            }
+            // Zero would refetch on every read, and a day is longer than a
+            // deploy: the profile is how this desktop and the provider's browser
+            // agree on one language, and drifting for a day is drifting.
+            if p.ttl_seconds == 0 || p.ttl_seconds > 86_400 {
+                return Err(format!(
+                    "connector {:?} scriptProfile ttlSeconds {} is out of range (1..86400s)",
+                    self.id, p.ttl_seconds
+                ));
+            }
+        }
         if self.desktop_flows.is_some()
             && (self.desktop_ai.is_none() || self.flows.as_ref().and_then(|f| f.graph_path.as_ref()).is_none())
         {
@@ -1449,6 +1498,40 @@ mod tests {
             d.app_logic.as_mut().unwrap().entry_function = Some(good.to_string());
             d.validate().unwrap_or_else(|e| panic!("{good:?}: {e}"));
         }
+    }
+
+
+    #[test]
+    fn the_builtin_names_where_its_provider_publishes_its_prelude() {
+        // Without this block the connector's conditions and app scripts run
+        // without the standard library they were written against, and every
+        // helper call throws on this desktop while passing in the browser.
+        let d = builtin().remove(0);
+        let p = d.script_profile.expect("this provider publishes one");
+        assert!(p.path.starts_with('/'), "{}", p.path);
+        // Matches the provider's own `Cache-Control: private, max-age=300`.
+        assert_eq!(p.ttl_seconds, 300);
+    }
+
+    #[test]
+    fn a_script_profile_path_and_ttl_are_checked_before_anything_uses_them() {
+        let base = builtin().remove(0);
+        let mut bad_path = base.clone();
+        bad_path.script_profile.as_mut().unwrap().path = "api/v1/script-profile".into();
+        assert!(bad_path.validate().is_err(), "a path with no leading slash");
+
+        let mut zero = base.clone();
+        zero.script_profile.as_mut().unwrap().ttl_seconds = 0;
+        assert!(zero.validate().is_err(), "a zero TTL would refetch on every read");
+
+        let mut forever = base.clone();
+        forever.script_profile.as_mut().unwrap().ttl_seconds = 86_401;
+        assert!(forever.validate().is_err(), "longer than a day is drifting, not caching");
+
+        // And a provider that publishes none is perfectly valid.
+        let mut none = base;
+        none.script_profile = None;
+        assert!(none.validate().is_ok());
     }
 
     #[test]
