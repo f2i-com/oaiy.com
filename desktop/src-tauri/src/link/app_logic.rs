@@ -64,8 +64,7 @@ use serde_json::{json, Map, Value};
 use super::descriptor::{AppLogicCatalogue, AppLogicOperation, AppLogicSpec};
 use super::LinkedAccount;
 use crate::bridge::script_host::{
-    batch_request_with, HostError, JobError, Prelude, ScriptBatch, DEFAULT_JOB_BUDGET_MS,
-    JOB_GRACE_MS, MAX_BATCH_DEADLINE, MAX_REQUEST_BYTES,
+    batch_ranges, batch_request_with, HostError, JobError, Prelude, ScriptBatch,
 };
 
 /// How long a fetched script set is reused.
@@ -748,19 +747,6 @@ fn collect<'a>(
 /// drifting into a lane that quietly stops running long scripts.
 pub const MAX_SCRIPT_SOURCE_BYTES: usize = 65_536;
 
-/// Milliseconds of one batch's deadline left unspent.
-///
-/// [`MAX_BATCH_DEADLINE`] is a hard ceiling: a batch whose jobs could take
-/// longer has its deadline capped, and when the cap passes the host KILLS the
-/// child and replaces it — losing every answer in the batch, the scripts that
-/// had already finished included. So batches are assembled to finish inside the
-/// ceiling with room to spare, because the child also constructs one engine per
-/// job and that time is not in any job's budget.
-const BATCH_HEADROOM_MS: u64 = 5_000;
-
-/// Bytes of [`MAX_REQUEST_BYTES`] reserved for the envelope around the jobs.
-const REQUEST_HEADROOM_BYTES: usize = 4_096;
-
 /// The job id for the `script`th script of the `app`th run of one event.
 ///
 /// Synthetic, not `<app>/<script>`: both of those are the provider's strings,
@@ -806,61 +792,6 @@ struct Replies {
     by_job: BTreeMap<String, Result<Value, String>>,
     /// Per app index: the batch carrying its scripts was never served.
     lane: BTreeMap<usize, String>,
-}
-
-/// Where each batch of `jobs` starts and ends.
-///
-/// Contiguous and in order, so the caller can send them one after another and
-/// read each reply back by job id.
-///
-/// Two ceilings, both the host's:
-///
-/// * **Time.** The host's deadline for a batch is the sum of its jobs' budgets
-///   plus a grace each, capped at [`MAX_BATCH_DEADLINE`]. Past the cap the
-///   deadline is a promise the child cannot keep, and the host meets a
-///   timeout by killing the child. At the shipped budget (1000 ms + 1500 ms grace)
-///   that is 22 scripts to a batch with [`BATCH_HEADROOM_MS`] left over.
-/// * **Size.** [`MAX_REQUEST_BYTES`] bounds the whole request, and every job
-///   carries its own copy of the context — each job is a fresh engine, so there
-///   is nothing to share it through. One app's markers can be large, so a few
-///   scripts of one app are enough to reach the cap. `prelude_bytes` comes off
-///   that budget FIRST: the provider's standard library rides on every batch
-///   and is several times [`REQUEST_HEADROOM_BYTES`], so a batch packed to the
-///   old budget would arrive over the ceiling and be refused whole.
-///
-/// A graph with more scripts than one batch can carry is therefore SPLIT rather
-/// than truncated or over-committed: every script still runs, in publication
-/// order, and no batch is ever bigger than what the host can promise. A single
-/// job over a ceiling on its own still forms a batch — it fails on its own
-/// account, with a reason, instead of taking the event's other scripts with it.
-fn batch_ranges(jobs: &[Value], prelude_bytes: usize) -> Vec<std::ops::Range<usize>> {
-    let deadline_budget = MAX_BATCH_DEADLINE.as_secs() * 1000 - BATCH_HEADROOM_MS;
-    let byte_budget = MAX_REQUEST_BYTES
-        .saturating_sub(REQUEST_HEADROOM_BYTES)
-        .saturating_sub(prelude_bytes);
-    let mut ranges = Vec::new();
-    let (mut start, mut ms, mut bytes) = (0usize, 0u64, 0usize);
-    for (i, job) in jobs.iter().enumerate() {
-        let cost = job
-            .get("budgetMs")
-            .and_then(Value::as_u64)
-            .unwrap_or(DEFAULT_JOB_BUDGET_MS)
-            .saturating_add(JOB_GRACE_MS);
-        let size = serde_json::to_vec(job).map(|b| b.len() + 1).unwrap_or(usize::MAX);
-        let over = ms.saturating_add(cost) > deadline_budget || bytes.saturating_add(size) > byte_budget;
-        if over && i > start {
-            ranges.push(start..i);
-            start = i;
-            ms = 0;
-            bytes = 0;
-        }
-        ms = ms.saturating_add(cost);
-        bytes = bytes.saturating_add(size);
-    }
-    if start < jobs.len() {
-        ranges.push(start..jobs.len());
-    }
-    ranges
 }
 
 /// Run every script of this event on the host, in as few batches as fit.
@@ -1420,6 +1351,9 @@ fn idempotency_key(event_key: &str, script: &str, index: usize) -> String {
 mod tests {
     use super::*;
     use crate::bridge::conditions::testing::FakeHost;
+    // The two ceilings the planner moved to `script_host` plans against. Only
+    // the tests here still name them; the lane itself asks `batch_ranges`.
+    use crate::bridge::script_host::{MAX_BATCH_DEADLINE, MAX_REQUEST_BYTES};
 
     fn spec() -> AppLogicSpec {
         super::super::descriptor::find(std::path::Path::new("/nonexistent"), "formlogic")

@@ -37,7 +37,9 @@
 
 use serde_json::{json, Value};
 
-use super::script_host::{batch_request, batch_request_with, HostError, JobResult, Prelude, ScriptBatch};
+use super::script_host::{
+    batch_ranges, batch_request, batch_request_with, HostError, JobResult, Prelude, ScriptBatch,
+};
 
 /// Per-condition wall-clock budget. Conditions are property reads and
 /// comparisons; anything that needs longer has already gone wrong, and the
@@ -148,7 +150,7 @@ pub fn build_batch(jobs: &[ConditionJob], prelude: Prelude<'_>) -> Value {
     batch_request_with(jobs.iter().map(ConditionJob::to_json).collect(), prelude.profile())
 }
 
-/// Decide every condition of one dispatch, in one batch.
+/// Decide every condition of one dispatch, in as few batches as fit.
 ///
 /// Never panics and never returns short: there is exactly one
 /// [`ConditionVerdict`] per input job, in the same order, whatever the host did.
@@ -174,32 +176,48 @@ pub fn decide(
     }
     if let Some(why) = prelude.missing() {
         log::warn!(
-            "condition-host: {} condition(s) were not evaluated ({why}); every one of them is              unknown, so nothing fires",
+            "condition-host: {} condition(s) were not evaluated ({why}); every one of them is unknown, so nothing fires",
             jobs.len()
         );
         return jobs.iter().map(|_| ConditionVerdict::outage(why.to_string())).collect();
     }
-    let request = build_batch(jobs, prelude);
-    let response = match host.run(&request) {
-        Ok(r) => r,
-        Err(e) => {
-            // ONE line for the outage, not one per binding: the bindings did not
-            // disagree about anything, the engine was not there.
-            log::warn!(
-                "condition-host: {} condition(s) could not be evaluated ({e}); every one of them is unknown, so nothing fires",
-                jobs.len()
-            );
-            return jobs.iter().map(|_| ConditionVerdict::outage(e.to_string())).collect();
+    // SPLIT, not one batch. Every job carries its own copy of the event, and
+    // each costs its budget plus a grace against the host's one-minute ceiling,
+    // so one event's conditioned bindings can pass either ceiling. Past the
+    // size cap the whole request is refused unsent; past the time cap the
+    // deadline is capped to a promise the child cannot keep and the host meets
+    // the timeout by killing it, losing the answers it had already given. Both
+    // ended the same way: every binding on that event unanswered, nothing
+    // fired, and a user's automation silently idle. Planned in ranges, each
+    // batch is one this host can promise.
+    let all: Vec<Value> = jobs.iter().map(ConditionJob::to_json).collect();
+    let mut verdicts: Vec<ConditionVerdict> = Vec::with_capacity(jobs.len());
+    for range in batch_ranges(&all, prelude.request_bytes()) {
+        let batch = &jobs[range];
+        let request = build_batch(batch, prelude);
+        match host.run(&request) {
+            Ok(response) => verdicts.extend(batch.iter().map(|job| {
+                match response.result(&job.id) {
+                    Some(result) => verdict_from(result),
+                    None => ConditionVerdict::outage(
+                        "the script host answered the batch without this condition".to_string(),
+                    ),
+                }
+            })),
+            Err(e) => {
+                // ONE line for the outage, not one per binding: the bindings did
+                // not disagree about anything, the engine was not there. Scoped to
+                // THIS batch, because a sibling batch the host DID serve keeps its
+                // answers — which is the whole point of splitting.
+                log::warn!(
+                    "condition-host: {} condition(s) could not be evaluated ({e}); every one of them is unknown, so nothing fires",
+                    batch.len()
+                );
+                verdicts.extend(batch.iter().map(|_| ConditionVerdict::outage(e.to_string())));
+            }
         }
-    };
-    jobs.iter()
-        .map(|job| match response.result(&job.id) {
-            Some(result) => verdict_from(result),
-            None => ConditionVerdict::outage(
-                "the script host answered the batch without this condition".to_string(),
-            ),
-        })
-        .collect()
+    }
+    verdicts
 }
 
 /// One job's result as a verdict.
@@ -440,7 +458,7 @@ pub mod testing {
         }
 
         /// The one request it was handed. Panics on any other count — which is
-        /// the assertion, for "one dispatch is one batch".
+        /// the assertion, for a dispatch small enough to travel as one batch.
         pub fn only_request(&self) -> Value {
             let seen = self.requests();
             assert_eq!(seen.len(), 1, "expected exactly one batch, got {}", seen.len());
@@ -480,12 +498,131 @@ mod tests {
         }
     }
 
+    /// A condition whose copy of the event data is `bytes` long on its own.
+    fn fat_job(id: &str, bytes: usize) -> ConditionJob {
+        ConditionJob {
+            id: id.to_string(),
+            source: "event.data.n === 1".to_string(),
+            globals: json!({ "event": { "data": { "n": 1, "blob": "x".repeat(bytes) } } }),
+        }
+    }
+
+    /// Every job of `request`, answered `true`.
+    fn all_true(request: &Value) -> ScriptResponse {
+        let results = request["jobs"]
+            .as_array()
+            .map(|jobs| {
+                jobs.iter()
+                    .map(|j| JobResult {
+                        id: j["id"].as_str().unwrap_or_default().to_string(),
+                        outcome: Ok(json!(true)),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        ScriptResponse { engine: json!({ "name": "zipp" }), results }
+    }
+
+    /// Answers `true`, and refuses a request past the cap the way the real host
+    /// does: locally, unsent, with nothing spawned.
+    fn sizing_host() -> FakeHost {
+        FakeHost::raw(|request| {
+            let bytes = serde_json::to_vec(request).map(|b| b.len()).unwrap_or(0);
+            if bytes > crate::bridge::script_host::MAX_REQUEST_BYTES {
+                return Err(HostError::RequestTooLarge {
+                    bytes,
+                    cap: crate::bridge::script_host::MAX_REQUEST_BYTES,
+                });
+            }
+            Ok(all_true(request))
+        })
+    }
+
+    // -- batches this host can actually promise ------------------------------
+
+    #[test]
+    fn an_event_with_more_conditions_than_one_batch_can_carry_is_split_not_lost() {
+        // Forty conditions, each costing its budget plus a grace, is past the
+        // host's one-minute ceiling. Sent whole, the deadline would be capped to
+        // a promise the child cannot keep, and a timeout is met by killing the
+        // child — so every binding on the event went unanswered, nothing fired,
+        // and the user's automation sat idle with no error against it.
+        let jobs: Vec<ConditionJob> =
+            (0..40).map(|n| job(&ConditionJob::id_for(n), "event.data.n === 1")).collect();
+        let host = FakeHost::always(json!(true));
+        let verdicts = decide(&host, &jobs, Prelude::None);
+
+        assert!(host.calls() > 1, "expected a split, got {} batch(es)", host.calls());
+        assert_eq!(verdicts.len(), jobs.len(), "one verdict per condition, in order");
+        assert!(
+            verdicts.iter().all(|v| v.answered && v.verdict == Verdict::True),
+            "{verdicts:?}"
+        );
+        for request in host.requests() {
+            assert!(
+                crate::bridge::script_host::batch_deadline(&request)
+                    < crate::bridge::script_host::MAX_BATCH_DEADLINE,
+                "a batch was planned past the ceiling the host promises against"
+            );
+        }
+    }
+
+    #[test]
+    fn a_condition_too_large_to_send_fails_alone_and_its_neighbours_still_decide() {
+        // The case the split exists for. One binding's copy of the event passes
+        // the request cap on its own; packed with its neighbours the WHOLE
+        // request is refused unsent and every condition on the event reads
+        // unknown — including the two that would have decided perfectly well.
+        let jobs = vec![
+            job("c0", "event.data.n === 1"),
+            fat_job("c1", crate::bridge::script_host::MAX_REQUEST_BYTES),
+            job("c2", "event.data.n === 1"),
+        ];
+        let verdicts = decide(&sizing_host(), &jobs, Prelude::None);
+
+        assert_eq!(verdicts.len(), 3);
+        assert!(verdicts[0].answered && verdicts[0].verdict == Verdict::True, "{:?}", verdicts[0]);
+        assert!(!verdicts[1].answered, "the oversized condition is the one that cannot be served");
+        assert!(verdicts[2].answered && verdicts[2].verdict == Verdict::True, "{:?}", verdicts[2]);
+    }
+
+    #[test]
+    fn an_outage_on_one_batch_leaves_the_other_batches_answers_alone() {
+        // A child that dies mid-event takes its own batch's conditions with it
+        // and nothing else: a batch already served keeps its answers, which is
+        // the whole reason the outage is reported per batch rather than per
+        // event.
+        let jobs: Vec<ConditionJob> =
+            (0..40).map(|n| job(&ConditionJob::id_for(n), "event.data.n === 1")).collect();
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let host = FakeHost::raw(move |request| {
+            if calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                return Err(HostError::Unavailable {
+                    reason: "the child died".to_string(),
+                    retry_after: None,
+                });
+            }
+            Ok(all_true(request))
+        });
+        let verdicts = decide(&host, &jobs, Prelude::None);
+
+        assert_eq!(verdicts.len(), jobs.len());
+        let answered = verdicts.iter().filter(|v| v.answered).count();
+        assert!(
+            answered > 0 && answered < jobs.len(),
+            "only the batch that was never served is unanswered, got {answered} of {}",
+            jobs.len()
+        );
+    }
+
     // -- the batch shape ----------------------------------------------------
 
     #[test]
-    fn one_dispatch_is_one_batch_carrying_every_condition() {
+    fn conditions_that_fit_travel_together_rather_than_one_batch_each() {
         // The host serialises one batch at a time process-wide, so a batch per
         // condition would queue an event's own conditions behind each other.
+        // Splitting happens only at the host's ceilings; below them a dispatch
+        // still travels whole.
         let host = FakeHost::always(json!(true));
         let jobs = vec![job("c0", "a"), job("c1", "b"), job("c2", "c")];
         let out = decide(&host, &jobs, Prelude::None);
