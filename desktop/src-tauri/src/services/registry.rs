@@ -3099,7 +3099,15 @@ mod tests {
 
         // The venv interpreter exists (a partial install creates it at step 1) BUT no marker →
         // must read as NOT installed (this is the whole point of the marker).
-        let interp = data.join("venvs/svc/Scripts/python.exe");
+        //
+        // Through `os_fix_path`, because the template hardcodes the Windows
+        // venv layout and Unix rewrites it to `bin/python`. Writing the
+        // literal path puts the file where the code under test will not
+        // look, and the backfill below then finds no install to restore a
+        // marker for.
+        let interp = PathBuf::from(os_fix_path(
+            data.join("venvs/svc/Scripts/python.exe").display().to_string(),
+        ));
         std::fs::create_dir_all(interp.parent().unwrap()).unwrap();
         std::fs::write(&interp, "").unwrap();
         assert!(
