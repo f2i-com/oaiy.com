@@ -292,6 +292,10 @@
     "protocolMin": 1,
     "protocolMax": 1
   },
+  "scriptProfile": {
+    "path": "/api/v1/script-profile",
+    "ttlSeconds": 300
+  },
   "heartbeat": {
     "path": "/api/v1/desktop-connections",
     "intervalSeconds": 45,

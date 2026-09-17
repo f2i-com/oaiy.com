@@ -261,6 +261,7 @@ pub fn spawn(store: LinkHandle, node: Option<NodeHandle>) {
                         node.as_ref(),
                         flow_id,
                         inputs,
+                        store.data_dir(),
                     )
                 },
             );
@@ -561,7 +562,17 @@ mod tests {
             &identity,
             &|| true,
             &|id, inputs| {
-                super::super::flow_runner::execute_sealed(&account, &flows, None, id, inputs)
+                super::super::flow_runner::execute_sealed(
+                    &account,
+                    &flows,
+                    None,
+                    id,
+                    inputs,
+                    // No descriptor in this temp dir names a script
+                    // profile, so the run carries none — the same
+                    // state as a provider that publishes none.
+                    &std::env::temp_dir(),
+                )
             },
         )
         .unwrap();

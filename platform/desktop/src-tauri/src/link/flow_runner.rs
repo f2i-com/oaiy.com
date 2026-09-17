@@ -32,7 +32,7 @@
 //! into the config file the CLI reads. Nothing here knows a provider's name or
 //! any of its node-type names, and nothing here should ever learn one.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -41,7 +41,8 @@ use serde_json::{json, Value};
 use super::descriptor::{self, FlowsSpec};
 use super::result_actions;
 use super::{LinkHandle, LinkedAccount};
-use crate::bridge::worker::{run_flow_cli, CliOutcome, CliRequest};
+use crate::bridge::worker::{instruction_budget_for, run_flow_cli, CliOutcome, CliRequest};
+use super::script_profile::Held;
 
 /// How long to wait after finding the queue empty.
 ///
@@ -273,8 +274,12 @@ fn spawn_inner(store: LinkHandle, node: Option<crate::services::node_runtime::No
             continue;
         };
         let instance = store.instance_id();
+        // Resolved on the way IN to the poll, so a run is never claimed that
+        // this desktop could not prepare (a claimed run is one no other runtime
+        // will touch).
+        let held = super::script_profile::resolve(&account, store.data_dir());
 
-        match poll_once(&account, &spec, &lane, &instance, node.as_ref()) {
+        match poll_once(&account, &spec, &lane, &instance, node.as_ref(), &held) {
             Ok((handled, trouble)) => {
                 let stumbled = trouble.is_some();
                 store.note_flow_run(trouble);
@@ -319,6 +324,7 @@ fn poll_once(
     lane: &Lane,
     instance: &str,
     node: Option<&crate::services::node_runtime::NodeHandle>,
+    held: &Held,
 ) -> Result<(usize, Option<String>), String> {
     let http = client(Duration::from_secs(30))?;
     let resp = http
@@ -350,7 +356,7 @@ fn poll_once(
         return Ok((0, None));
     };
 
-    match serve(account, spec, lane, instance, node, &run) {
+    match serve(account, spec, lane, instance, node, &run, held) {
         Ok(taken) => Ok((usize::from(taken), None)),
         Err(e) => {
             log::warn!("flow run {} could not be served: {e}", run.id);
@@ -370,7 +376,22 @@ fn serve(
     instance: &str,
     node: Option<&crate::services::node_runtime::NodeHandle>,
     run: &QueuedRun,
+    held: &Held,
 ) -> Result<bool, String> {
+    // BEFORE the claim, and before anything with a side effect.
+    //
+    // A queued run and a claimed one are not the same kind of thing to leave
+    // behind. A run left QUEUED is still offered to every other runtime on the
+    // account — the provider's own browser polls for claimable queued runs and
+    // takes them, with the prelude, which is the whole point of dropping the
+    // engine token in the same state. A run this desktop CLAIMED and could not
+    // start is one nobody else is offered until something sweeps it up.
+    //
+    // So: refuse before the claim, and go on polling. The reason reaches the
+    // link status through the caller, which is where an operator would look.
+    if let Held::Missing(why) = held {
+        return Err(why.clone());
+    }
     let http = client(Duration::from_secs(30))?;
 
     // Claim FIRST — before fetching the graph, before writing a file, before
@@ -416,7 +437,7 @@ fn serve(
 
     // From here the run is OURS and the provider has it marked running. Every
     // path below ends at report().
-    let outcome = execute(account, spec, lane, node, run);
+    let outcome = execute(account, spec, lane, node, run, held);
     if let Err(f) = &outcome {
         log::info!("flow run {} failed ({:?}): {}", run.id, f.code, f.message);
     }
@@ -556,6 +577,7 @@ pub(super) fn execute_sealed(
     node: Option<&crate::services::node_runtime::NodeHandle>,
     flow_id: &str,
     inputs: Value,
+    data_dir: &Path,
 ) -> Result<Value, String> {
     let graph = spec.graph_path.as_deref().ok_or("this provider has no flow graph endpoint")?;
     let lane = Lane { queued: "", claim: "", complete: "", graph };
@@ -569,7 +591,11 @@ pub(super) fn execute_sealed(
         idempotency_key: None,
         input_snapshot: inputs,
     };
-    execute(account, spec, &lane, node, &run).map_err(|e| e.message)
+    // The provider's prelude is resolved here rather than by the caller: a
+    // sealed run is not claimed from a queue, so there is no earlier moment at
+    // which refusing would save anything.
+    let held = super::script_profile::resolve(account, data_dir);
+    execute(account, spec, &lane, node, &run, &held).map_err(|e| e.message)
 }
 
 fn execute(
@@ -578,7 +604,15 @@ fn execute(
     lane: &Lane,
     node: Option<&crate::services::node_runtime::NodeHandle>,
     run: &QueuedRun,
+    held: &Held,
 ) -> Result<Value, Failure> {
+    if let Held::Missing(why) = held {
+        // The graph's own script nodes are the provider's JavaScript, written
+        // against the provider's standard library. Running them without it
+        // would not fail the run cleanly — it would produce a WRONG one, every
+        // helper call throwing inside a node that then reports its own failure.
+        return Err(Failure::new(FailureCode::RunnerUnavailable, why.clone()));
+    }
     let graph = fetch_graph(account, lane, run)?;
 
     // Everything travels by file. Values can be large and the connector config
@@ -593,10 +627,39 @@ fn execute(
         )
     })?;
 
-    let result = run_in(&scratch, account, spec, node, run, &graph);
+    let result = run_in(&scratch, account, spec, node, run, &graph, held);
     // Removed on every path: the connector config in here holds the credential.
     let _ = std::fs::remove_dir_all(&scratch);
     result
+}
+
+/// What the provider's prelude costs this run on the command line: the file
+/// `--profile` points at, and the instruction budget that may still be passed
+/// beside it.
+///
+/// Its own function so both halves are pinned by a test without a CLI, a
+/// provider or a graph — and because getting the second half wrong is not a
+/// wrong answer but a run that never starts.
+fn profile_legs(
+    scratch: &Path,
+    held: &Held,
+    descriptor_budget: Option<u64>,
+) -> Result<(Option<PathBuf>, Option<u64>), Failure> {
+    let Some(profile) = held.profile() else {
+        return Ok((None, descriptor_budget));
+    };
+    // Written into the RUN's own directory rather than shared from the cache:
+    // a refresh renaming over a file this child has open is a failure on
+    // Windows, and a run should finish on the prelude it was prepared with even
+    // if the provider publishes another one while it is going.
+    let path = scratch.join("profile.json");
+    profile
+        .write_to(&path)
+        .map_err(|e| Failure::new(FailureCode::RunnerUnavailable, e))?;
+    // The descriptor's budget is DROPPED when the profile carries its own: the
+    // CLI refuses the pair rather than picking one, and that refusal is exit 1
+    // with no result file, so it would fail every run of this lane.
+    Ok((Some(path), instruction_budget_for(descriptor_budget, profile.instruction_steps())))
 }
 
 fn run_in(
@@ -606,6 +669,7 @@ fn run_in(
     node: Option<&crate::services::node_runtime::NodeHandle>,
     run: &QueuedRun,
     graph: &Value,
+    held: &Held,
 ) -> Result<Value, Failure> {
     let graph_path = scratch.join("graph.json");
     let inputs_path = scratch.join("inputs.json");
@@ -622,6 +686,13 @@ fn run_in(
     // The credential is in that file. Same treatment as the stored link.
     super::restrict_to_owner(&connector_path);
 
+    // Written into the RUN's own directory rather than shared from the cache:
+    // a refresh renaming over a file this child has open is a failure on
+    // Windows, and a run should finish on the prelude it was prepared with even
+    // if the provider publishes another one while it is going.
+    let (profile_path, instruction_budget) =
+        profile_legs(scratch, held, spec.instruction_budget)?;
+
     let outcome = run_flow_cli(
         CliRequest {
             flow_path: &graph_path,
@@ -629,8 +700,8 @@ fn run_in(
             out_path: &out_path,
             connector_path: Some(&connector_path),
             timeout: RUN_TIMEOUT,
-            // The provider's policy, from its descriptor: it sized its flows.
-            instruction_budget: spec.instruction_budget,
+            instruction_budget,
+            profile_path: profile_path.as_deref(),
             node,
         },
         // Nothing cancels a provider's run from this side; the budget does.
@@ -1423,6 +1494,82 @@ mod tests {
     /// ever reached — which is what these sequence tests are about.
     const NO_MATCHING_FLOW: &str = r#"{"flows":[{"id":"other","slug":"other","flowJson":{"nodes":[],"edges":[]}}]}"#;
 
+
+
+    #[test]
+    fn a_run_carries_the_providers_prelude_and_drops_the_budget_that_would_refuse_it() {
+        // Both halves of what `--profile` costs a run, pinned without a CLI.
+        // The second half is not a wrong answer if it is wrong: `--profile`
+        // carrying instructionSteps beside `--instruction-budget` is exit 1 with
+        // no result file, so EVERY run of the lane would fail.
+        let preamble = "var helper = 1;";
+        let doc = json!({
+            "v": 1,
+            "preamble": preamble,
+            "preambleSha256": crate::link::script_profile::sha256_hex(preamble),
+            "instructionSteps": 200_000_000u64,
+            // Carried untouched all the way to the runner, for the modes this
+            // desktop does not name yet (O1).
+            "python": {
+                "contract": "c/1", "files": { "c.py": "x = 1\n" }, "entry": "main", "call": "run",
+                "modes": [{
+                    "name": "condition", "files": { "main.py": "" }, "block": "b.py",
+                    "before": "", "after": "", "lineOffset": 0,
+                }],
+            },
+        });
+        let profile = std::sync::Arc::new(crate::link::script_profile::verify(doc.clone()).unwrap());
+        let scratch = std::env::temp_dir().join(format!("oaiy-legs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&scratch);
+        std::fs::create_dir_all(&scratch).unwrap();
+
+        let held = crate::link::script_profile::Held::Ready(profile);
+        let (path, budget) = profile_legs(&scratch, &held, Some(200_000_000)).expect("prepared");
+        let path = path.expect("the run points --profile at a file");
+        assert_eq!(
+            serde_json::from_str::<Value>(&std::fs::read_to_string(&path).unwrap()).unwrap(),
+            doc,
+            "the document reaches the runner byte for byte, python modes included"
+        );
+        assert!(path.starts_with(&scratch), "inside the run's own directory: {}", path.display());
+        assert_eq!(budget, None, "the profile's figure is the run's; passing both is a refusal");
+
+        // A provider that publishes none: exactly what this lane did before.
+        let (none, budget) =
+            profile_legs(&scratch, &crate::link::script_profile::Held::NotRequired, Some(200_000_000))
+                .expect("prepared");
+        assert!(none.is_none());
+        assert_eq!(budget, Some(200_000_000));
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn a_run_is_not_claimed_when_the_providers_prelude_is_missing() {
+        // A claim is a promise: a claimed run is one no other runtime will
+        // touch until the provider's reaper returns it. Without the library
+        // this provider's flow scripts are written against, this desktop cannot
+        // keep that promise — so the run is left in the queue, where the
+        // provider's own runtime can still have it.
+        let (base, rx) = stub_provider(ONE_RUN, NO_MATCHING_FLOW, "200 OK", "200 OK");
+        let (handled, trouble) = poll_once(
+            &account(base),
+            &spec(),
+            &Lane::of(&spec()).unwrap(),
+            "oaiy-test",
+            None,
+            &Held::Missing("the provider's prelude could not be read".into()),
+        )
+        .unwrap();
+        assert_eq!(handled, 1, "the run was seen");
+        let why = trouble.expect("and refused out loud");
+        assert!(why.contains("could not be read"), "{why}");
+
+        // The queue was read; nothing was claimed.
+        let (queue, _) = rx.recv().unwrap();
+        assert!(queue.starts_with("GET /runs/queued "), "{queue}");
+        assert!(rx.try_recv().is_err(), "no claim, no graph fetch, no report");
+    }
+
     #[test]
     fn a_run_is_claimed_before_any_work_and_is_always_reported() {
         // The two rules of the module in one sequence: the claim comes first,
@@ -1430,7 +1577,7 @@ mod tests {
         // silence would leave it at `running` for everyone else.
         let (base, rx) = stub_provider(ONE_RUN, NO_MATCHING_FLOW, "200 OK", "200 OK");
         let (handled, trouble) =
-            poll_once(&account(base), &spec(), &Lane::of(&spec()).unwrap(), "oaiy-test", None)
+            poll_once(&account(base), &spec(), &Lane::of(&spec()).unwrap(), "oaiy-test", None, &Held::NotRequired)
                 .unwrap();
         assert_eq!(handled, 1);
         assert_eq!(trouble, None, "a flow that cannot run is not a failing lane");
@@ -1468,7 +1615,7 @@ mod tests {
         const NO_FLOWS: &str = r#"{"flows":[]}"#;
         let (base, rx) = stub_provider(ONE_RUN, NO_FLOWS, "200 OK", "200 OK");
         let (handled, _) =
-            poll_once(&account(base), &spec(), &Lane::of(&spec()).unwrap(), "oaiy-test", None)
+            poll_once(&account(base), &spec(), &Lane::of(&spec()).unwrap(), "oaiy-test", None, &Held::NotRequired)
                 .unwrap();
         assert_eq!(handled, 1);
         let complete_raw = rx
@@ -1484,7 +1631,7 @@ mod tests {
         // run: that flow really is gone, and saying "runner unavailable" would
         // hide it behind a retry that can never work.
         let (base, rx) = stub_provider(ONE_RUN, NO_MATCHING_FLOW, "200 OK", "200 OK");
-        poll_once(&account(base), &spec(), &Lane::of(&spec()).unwrap(), "oaiy-test", None).unwrap();
+        poll_once(&account(base), &spec(), &Lane::of(&spec()).unwrap(), "oaiy-test", None, &Held::NotRequired).unwrap();
         let complete_raw = rx
             .iter()
             .find(|(line, _)| line.starts_with("PATCH /runs/r1 "))
@@ -1500,7 +1647,7 @@ mod tests {
         // running the flow anyway would execute it twice.
         let (base, rx) = stub_provider(ONE_RUN, NO_MATCHING_FLOW, "409 Conflict", "200 OK");
         let (handled, trouble) =
-            poll_once(&account(base), &spec(), &Lane::of(&spec()).unwrap(), "oaiy-test", None)
+            poll_once(&account(base), &spec(), &Lane::of(&spec()).unwrap(), "oaiy-test", None, &Held::NotRequired)
                 .unwrap();
         assert_eq!(handled, 0, "a run we did not take was not handled");
         assert_eq!(trouble, None, "losing a race is not a fault");
@@ -1520,7 +1667,7 @@ mod tests {
         // provider's site the run sits queued forever.
         let (base, _rx) = stub_provider(ONE_RUN, NO_MATCHING_FLOW, "500 Internal Server Error", "200 OK");
         let (handled, trouble) =
-            poll_once(&account(base), &spec(), &Lane::of(&spec()).unwrap(), "oaiy-test", None)
+            poll_once(&account(base), &spec(), &Lane::of(&spec()).unwrap(), "oaiy-test", None, &Held::NotRequired)
                 .unwrap();
         assert_eq!(handled, 1);
         let reported = trouble.expect("a refused claim must reach the status");
@@ -1577,6 +1724,7 @@ mod tests {
             &Lane::of(&spec()).unwrap(),
             "oaiy-test",
             None,
+            &Held::NotRequired,
         )
         .unwrap();
         assert_eq!(handled, 1);
@@ -1613,7 +1761,7 @@ mod tests {
         // finalising work it never took.
         let (base, rx) = stub_provider(ONE_RUN, NO_MATCHING_FLOW, "400 Bad Request", "200 OK");
         let (_, trouble) =
-            poll_once(&account(base), &spec(), &Lane::of(&spec()).unwrap(), "oaiy-test", None)
+            poll_once(&account(base), &spec(), &Lane::of(&spec()).unwrap(), "oaiy-test", None, &Held::NotRequired)
                 .unwrap();
         assert!(trouble.is_some_and(|t| t.contains("400")));
 
@@ -1636,7 +1784,7 @@ mod tests {
             "500 Internal Server Error",
             "200 OK",
         );
-        let _ = poll_once(&account(base), &spec(), &Lane::of(&spec()).unwrap(), "oaiy-test", None)
+        let _ = poll_once(&account(base), &spec(), &Lane::of(&spec()).unwrap(), "oaiy-test", None, &Held::NotRequired)
             .unwrap();
 
         let mut released = false;
@@ -1661,7 +1809,7 @@ mod tests {
             "500 Internal Server Error",
         );
         let (handled, trouble) =
-            poll_once(&account(base), &spec(), &Lane::of(&spec()).unwrap(), "oaiy-test", None)
+            poll_once(&account(base), &spec(), &Lane::of(&spec()).unwrap(), "oaiy-test", None, &Held::NotRequired)
                 .unwrap();
         assert_eq!(handled, 1);
         let reported = trouble.expect("a lost completion must reach the status");
@@ -1683,7 +1831,7 @@ mod tests {
         // repeat the refusal, and this desktop has nothing left to say.
         let (base, rx) = stub_provider(ONE_RUN, NO_MATCHING_FLOW, "200 OK", "409 Conflict");
         let (_, trouble) =
-            poll_once(&account(base), &spec(), &Lane::of(&spec()).unwrap(), "oaiy-test", None)
+            poll_once(&account(base), &spec(), &Lane::of(&spec()).unwrap(), "oaiy-test", None, &Held::NotRequired)
                 .unwrap();
         assert_eq!(trouble, None, "a run finalised elsewhere is not a fault");
 
@@ -1701,7 +1849,7 @@ mod tests {
         // Four separate requests; a bearer missing on any one turns into a 401
         // that reads as a dead link.
         let (base, rx) = stub_provider(ONE_RUN, NO_MATCHING_FLOW, "200 OK", "200 OK");
-        poll_once(&account(base), &spec(), &Lane::of(&spec()).unwrap(), "oaiy-test", None).unwrap();
+        poll_once(&account(base), &spec(), &Lane::of(&spec()).unwrap(), "oaiy-test", None, &Held::NotRequired).unwrap();
 
         for leg in ["queue", "claim", "graph", "complete"] {
             let (line, raw) = rx.recv().unwrap();
@@ -1737,6 +1885,7 @@ mod tests {
             &Lane::of(&spec()).unwrap(),
             "oaiy-test",
             None,
+            &Held::NotRequired,
         )
         .unwrap_err();
         assert!(err.contains("link again"), "{err}");

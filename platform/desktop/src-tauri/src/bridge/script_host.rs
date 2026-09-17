@@ -257,7 +257,65 @@ impl ScriptResponse {
 /// the schema says (`id`, `mode`, `source`, `globals`, `entry`, `args`,
 /// `budgetMs`, …); nothing here inspects them.
 pub fn batch_request(jobs: Vec<Value>) -> Value {
-    json!({ "v": 1, "jobs": jobs })
+    batch_request_with(jobs, None)
+}
+
+/// The same envelope carrying a requester's PROFILE — the document from
+/// `protocol/v1/script-profile.schema.json`, verbatim, which the runner places
+/// at the top of every job's program.
+///
+/// Carried, never built: the runner verifies the whole document again (digest,
+/// shape, preamble declarations) and refuses the batch if anything about it has
+/// been touched, so a field rebuilt on the way through is a batch refused.
+pub fn batch_request_with(jobs: Vec<Value>, profile: Option<&Value>) -> Value {
+    match profile {
+        Some(p) => json!({ "v": 1, "profile": p, "jobs": jobs }),
+        None => json!({ "v": 1, "jobs": jobs }),
+    }
+}
+
+/// What prelude a lane's batch carries, and what it means when there is none.
+///
+/// Three states, not two, because "no profile" is two different situations and
+/// treating them alike is the bug this type exists to prevent: a requester that
+/// publishes no prelude is served exactly as it always was, and one that
+/// publishes a prelude this desktop has not got must NOT be served at all —
+/// its source is written in a language this desktop is missing half of.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Prelude<'a> {
+    /// The requester publishes none. Jobs travel bare.
+    None,
+    /// The requester's profile document, to travel with the batch.
+    Profile(&'a Value),
+    /// The requester publishes one and this desktop does not hold it. Nothing
+    /// is sent; this is why.
+    Missing(&'a str),
+}
+
+impl<'a> Prelude<'a> {
+    /// The document to put in the request, if a batch may be sent at all.
+    pub fn profile(&self) -> Option<&'a Value> {
+        match self {
+            Prelude::Profile(p) => Some(p),
+            _ => None,
+        }
+    }
+
+    /// Why no batch may be sent, if that is the state.
+    pub fn missing(&self) -> Option<&'a str> {
+        match self {
+            Prelude::Missing(why) => Some(why),
+            _ => None,
+        }
+    }
+
+    /// What carrying it costs a request, in bytes.
+    pub fn request_bytes(&self) -> usize {
+        self.profile()
+            .and_then(|p| serde_json::to_vec(p).ok())
+            .map(|b| b.len())
+            .unwrap_or(0)
+    }
 }
 
 /// The desktop's deadline for `request` (see the module doc): Σ over the jobs of
@@ -1786,6 +1844,22 @@ rl.on('close', () => {{ if (!IGNORE_SHUTDOWN) queue.then(() => process.exit(0));
     }
 
     #[test]
+    fn no_provider_name_or_prelude_literal_is_written_into_this_module() {
+        // The seam every lane's batch goes through. A provider's name here, or
+        // one identifier of a provider's standard library, would make this
+        // desktop a client of ONE provider — and the profile exists precisely
+        // so that none of that has to be written down anywhere.
+        let source = include_str!("script_host.rs").replace("
+", "
+");
+        let code_only = source.split("#[cfg(test)]
+mod tests").next().unwrap().to_string();
+        for forbidden in ["formlogic", "FormLogic", "aokie", "validators", "isEmpty"] {
+            assert!(!code_only.contains(forbidden), "{forbidden:?} must not appear outside the tests");
+        }
+    }
+
+    #[test]
     fn the_real_host_can_be_warmed_into_readiness_without_a_job() {
         // The mechanism the heartbeat's engine token rests on. A host is spawned
         // by the first job it is asked to serve, and a desktop nobody sends work
@@ -1882,9 +1956,105 @@ rl.on('close', () => {{ if (!IGNORE_SHUTDOWN) queue.then(() => process.exit(0));
     /// here is that ZIPP agrees with it, expression for expression and case for
     /// case — that is what makes the shadow release a measurement rather than a
     /// gamble, and what PR9 is allowed to delete the grammar on.
+
+    /// The provider's published standard library, in the document it publishes
+    /// it in. Two helpers lifted verbatim from the served artifact — enough to
+    /// prove the mechanism against the real engine without vendoring a
+    /// provider's file into this repo (which would drift the day they change
+    /// one line of it, and would put its name in this tree).
+    fn published_profile() -> Value {
+        let preamble = "function __isArr(a) { return typeof a == \"object\" && a != null && typeof a.length == \"number\"; }\nvar validators = {\n  email: function(value) {\n    if (typeof value != \"string\") { return false; }\n    return /^[a-zA-Z0-9._%+\\-]+@[a-zA-Z0-9.\\-]+\\.[a-zA-Z]{2,}$/.test(value);\n  }\n};\nfunction sum(arr) {\n  if (!__isArr(arr)) { return 0; }\n  let total = 0;\n  let i = 0;\n  while (i < arr.length) {\n    if (typeof arr[i] == \"number\") { total = total + arr[i]; }\n    i = i + 1;\n  }\n  return total;\n}\n";
+        json!({
+            "v": 1,
+            "preamble": preamble,
+            "preambleSha256": crate::link::script_profile::sha256_hex(preamble),
+            "instructionSteps": 200_000_000u64,
+        })
+    }
+
+    #[test]
+    fn the_real_conditions_can_call_the_providers_helpers_only_when_its_prelude_travels() {
+        // THE release blocker, measured. The conditions below are ordinary
+        // authored conditions: they call the standard library the provider
+        // publishes, which its browser compiles ahead of every expression.
+        // Until this release the desktop sent the same text with nothing in
+        // front of it — so `validators.email(...)` was a ReferenceError here
+        // and a working condition there, and the binding silently stopped
+        // firing on the machine the provider had handed the work to.
+        use crate::bridge::conditions::{decide, ConditionJob, Verdict};
+
+        let Some((node, cli)) = staged_runner() else {
+            eprintln!("no staged CLI or no node — skipping");
+            return;
+        };
+        let host = host_for(cli, &node);
+
+        // (expression, event data, what its author meant)
+        let table: Vec<(&str, Value, bool)> = vec![
+            ("validators.email(event.data.to)", json!({ "to": "someone@example.com" }), true),
+            ("validators.email(event.data.to)", json!({ "to": "not-an-address" }), false),
+            ("validators.email(event.data.to)", json!({}), false),
+            ("sum(event.data.amounts) > 100", json!({ "amounts": [60, 41] }), true),
+            ("sum(event.data.amounts) > 100", json!({ "amounts": [1, 2] }), false),
+            // A condition that touches nothing of the library still works, with
+            // the prelude and without it — the majority case, unchanged.
+            ("event.data.n === 1", json!({ "n": 1 }), true),
+        ];
+        let jobs: Vec<ConditionJob> = table
+            .iter()
+            .enumerate()
+            .map(|(i, (expr, data, _))| ConditionJob {
+                id: ConditionJob::id_for(i),
+                source: (*expr).to_string(),
+                globals: json!({ "event": { "name": "aokie.call.ended", "data": data } }),
+            })
+            .collect();
+
+        // BEFORE: exactly what this desktop shipped until now.
+        let started = Instant::now();
+        let bare = decide(&host, &jobs, Prelude::None);
+        eprintln!("without the prelude: {} conditions in {:?}", jobs.len(), started.elapsed());
+        for (answer, (expr, data, _)) in bare.iter().zip(&table).take(5) {
+            let Verdict::Unknown(why) = &answer.verdict else {
+                panic!("{expr} with {data} decided {:?} without the library it calls", answer.verdict);
+            };
+            assert!(
+                why.contains("is not defined") || why.contains("not defined"),
+                "{expr}: {why}"
+            );
+            assert!(answer.answered, "the engine ran it and it threw — that IS an answer");
+        }
+        assert_eq!(bare[5].verdict, Verdict::True, "a condition calling nothing is unaffected");
+
+        // AFTER: the provider's own prelude in front of every one of them.
+        let profile = published_profile();
+        let started = Instant::now();
+        let out = decide(&host, &jobs, Prelude::Profile(&profile));
+        eprintln!("with the prelude: {} conditions in {:?}", jobs.len(), started.elapsed());
+        for (answer, (expr, data, expected)) in out.iter().zip(&table) {
+            let want = if *expected { Verdict::True } else { Verdict::False };
+            assert!(answer.answered, "{expr} / {data} was not answered: {answer:?}");
+            assert_eq!(answer.verdict, want, "{expr}\n  with {data}");
+        }
+
+        // And the checks that stop a bad prelude reaching the engine at all are
+        // the runner's too, not just this desktop's: a digest that does not
+        // match refuses the WHOLE batch rather than running the preamble.
+        let mut tampered = profile.clone();
+        tampered["preamble"] = json!("var validators = { email: function () { return true; } };");
+        let refused = decide(&host, &jobs[..1], Prelude::Profile(&tampered));
+        assert!(
+            !refused[0].answered,
+            "the runner must refuse a profile whose digest does not match: {refused:?}"
+        );
+
+        host.shutdown();
+    }
+
     #[test]
     fn the_real_aokie_conditions_decide_the_same_way_on_zipp() {
         use crate::bridge::conditions::{decide, ConditionJob, Verdict};
+        use crate::bridge::script_host::Prelude;
 
         let Some((node, cli)) = staged_runner() else {
             eprintln!("no staged CLI or no node — skipping");
@@ -1945,7 +2115,7 @@ rl.on('close', () => {{ if (!IGNORE_SHUTDOWN) queue.then(() => process.exit(0));
             .collect();
 
         let started = Instant::now();
-        let out = decide(&host, &jobs);
+        let out = decide(&host, &jobs, Prelude::None);
         eprintln!("the real engine decided {} conditions in {:?}", jobs.len(), started.elapsed());
 
         for (answer, (expr, data, expected)) in out.iter().zip(&table) {

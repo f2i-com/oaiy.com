@@ -37,7 +37,7 @@
 
 use serde_json::{json, Value};
 
-use super::script_host::{batch_request, HostError, JobResult, ScriptBatch};
+use super::script_host::{batch_request, batch_request_with, HostError, JobResult, Prelude, ScriptBatch};
 
 /// Per-condition wall-clock budget. Conditions are property reads and
 /// comparisons; anything that needs longer has already gone wrong, and the
@@ -142,23 +142,44 @@ impl ConditionVerdict {
     }
 }
 
-/// The request this dispatch sends: ONE batch, one job per condition.
-pub fn build_batch(jobs: &[ConditionJob]) -> Value {
-    batch_request(jobs.iter().map(ConditionJob::to_json).collect())
+/// The request this dispatch sends: ONE batch, one job per condition, under the
+/// requester's own prelude.
+pub fn build_batch(jobs: &[ConditionJob], prelude: Prelude<'_>) -> Value {
+    batch_request_with(jobs.iter().map(ConditionJob::to_json).collect(), prelude.profile())
 }
 
 /// Decide every condition of one dispatch, in one batch.
 ///
 /// Never panics and never returns short: there is exactly one
 /// [`ConditionVerdict`] per input job, in the same order, whatever the host did.
-pub fn decide(host: &dyn ScriptBatch, jobs: &[ConditionJob]) -> Vec<ConditionVerdict> {
+///
+/// A [`Prelude::Missing`] decides nothing and sends nothing. The author wrote
+/// their condition against a standard library the requester publishes, so
+/// running the same text without it is not a stricter reading of the condition —
+/// it is a different program, one whose helper calls all throw. Every condition
+/// is `Unknown` and UNANSWERED, which skips the binding and — because only an
+/// answered condition may produce one — writes no `condition-shadow` line: an
+/// absent prelude is not a disagreement between two grammars, and a shadow log
+/// full of them would block the deletion gate those lines exist for.
+pub fn decide(
+    host: &dyn ScriptBatch,
+    jobs: &[ConditionJob],
+    prelude: Prelude<'_>,
+) -> Vec<ConditionVerdict> {
     if jobs.is_empty() {
         // The load-bearing case. An event whose bindings carry no conditions
         // must not cost a script host — which, on the first such event, would
         // mean spawning one.
         return Vec::new();
     }
-    let request = build_batch(jobs);
+    if let Some(why) = prelude.missing() {
+        log::warn!(
+            "condition-host: {} condition(s) were not evaluated ({why}); every one of them is              unknown, so nothing fires",
+            jobs.len()
+        );
+        return jobs.iter().map(|_| ConditionVerdict::outage(why.to_string())).collect();
+    }
+    let request = build_batch(jobs, prelude);
     let response = match host.run(&request) {
         Ok(r) => r,
         Err(e) => {
@@ -305,6 +326,11 @@ pub enum CheckOutcome {
 }
 
 /// The request the save-time check sends: one `parse`-mode job.
+///
+/// No profile, deliberately. `parse` compiles the source and never invokes it,
+/// so a prelude changes nothing it could decide — and this request is sent
+/// while somebody is typing. Carrying the provider's whole standard library on
+/// every keystroke would buy an answer that is already correct.
 ///
 /// `parse` compiles the source and never invokes it, and the CLI runs a real
 /// single-expression parse (acorn, `cli/src/zipp/script-worker.ts`) before the
@@ -462,7 +488,7 @@ mod tests {
         // condition would queue an event's own conditions behind each other.
         let host = FakeHost::always(json!(true));
         let jobs = vec![job("c0", "a"), job("c1", "b"), job("c2", "c")];
-        let out = decide(&host, &jobs);
+        let out = decide(&host, &jobs, Prelude::None);
 
         assert_eq!(out.len(), 3);
         let request = host.only_request();
@@ -477,7 +503,7 @@ mod tests {
 
     #[test]
     fn a_job_is_a_program_over_json_globals_with_a_small_budget() {
-        let request = build_batch(&[job("c0", "event.data.n === 1")]);
+        let request = build_batch(&[job("c0", "event.data.n === 1")], Prelude::None);
         assert_eq!(
             request["jobs"][0],
             json!({
@@ -497,7 +523,7 @@ mod tests {
         // Load-bearing: the first conditioned event after boot spawns a child.
         // An event whose bindings carry no conditions must never pay for one.
         let host = FakeHost::always(json!(true));
-        assert!(decide(&host, &[]).is_empty());
+        assert!(decide(&host, &[], Prelude::None).is_empty());
         assert_eq!(host.calls(), 0, "an empty job list must not reach the host");
     }
 
@@ -520,7 +546,7 @@ mod tests {
             "no" => Ok(json!("")),
             _ => Err(guest("ReferenceError: nope is not defined")),
         });
-        let out = decide(&host, &[job("c0", "yes"), job("c1", "no"), job("c2", "boom")]);
+        let out = decide(&host, &[job("c0", "yes"), job("c1", "no"), job("c2", "boom")], Prelude::None);
         assert_eq!(out[0].verdict, Verdict::True);
         assert_eq!(out[1].verdict, Verdict::False);
         assert!(matches!(out[2].verdict, Verdict::Unknown(_)));
@@ -532,7 +558,7 @@ mod tests {
         // The whole point: a host that cannot serve must not read as agreement,
         // and must not read as a disagreement either.
         let host = FakeHost::down("no engine");
-        let out = decide(&host, &[job("c0", "a"), job("c1", "b")]);
+        let out = decide(&host, &[job("c0", "a"), job("c1", "b")], Prelude::None);
         assert_eq!(out.len(), 2);
         for v in &out {
             assert!(matches!(v.verdict, Verdict::Unknown(_)));
@@ -549,7 +575,7 @@ mod tests {
                 results: vec![JobResult { id: "c0".into(), outcome: Ok(json!(true)) }],
             })
         });
-        let out = decide(&host, &[job("c0", "a"), job("c1", "b")]);
+        let out = decide(&host, &[job("c0", "a"), job("c1", "b")], Prelude::None);
         assert_eq!(out[0].verdict, Verdict::True);
         assert!(matches!(out[1].verdict, Verdict::Unknown(_)));
         assert!(!out[1].answered);
@@ -573,6 +599,75 @@ mod tests {
             assert!(matches!(v.verdict, Verdict::Unknown(_)), "{kind}");
             assert!(!v.answered, "{kind} is the engine, not the condition");
         }
+    }
+
+
+    // --- the requester's prelude -------------------------------------------
+
+    fn profile_doc() -> Value {
+        // Shaped exactly like the served document, small enough to read.
+        let preamble = "var validators = { email: function (v) { return /@/.test(v); } };";
+        json!({
+            "v": 1,
+            "preamble": preamble,
+            "preambleSha256": crate::link::script_profile::sha256_hex(preamble),
+            "instructionSteps": 200_000_000u64,
+        })
+    }
+
+    #[test]
+    fn the_requesters_prelude_travels_with_the_batch_verbatim() {
+        // Without this, `validators.email(x)` is a ReferenceError on this
+        // desktop and a working condition in the requester's browser.
+        let host = FakeHost::always(json!(true));
+        let doc = profile_doc();
+        let jobs = vec![job("c0", "validators.email(event.data.to)")];
+        decide(&host, &jobs, Prelude::Profile(&doc));
+
+        let request = host.only_request();
+        assert_eq!(request["v"], 1);
+        assert_eq!(request["profile"], doc, "the document goes as it came, field for field");
+        // And the job itself is untouched by the prelude travelling with it.
+        assert_eq!(request["jobs"][0]["source"], "validators.email(event.data.to)");
+        // Exactly three keys: the runner refuses an unknown one.
+        let mut keys: Vec<&str> = request.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["jobs", "profile", "v"]);
+    }
+
+    #[test]
+    fn a_requester_with_no_prelude_sends_exactly_what_it_always_did() {
+        let host = FakeHost::always(json!(true));
+        decide(&host, &[job("c0", "event.data.n === 1")], Prelude::None);
+        let request = host.only_request();
+        assert!(
+            request.get("profile").is_none(),
+            "a requester that publishes none must not be given an empty one: {request}"
+        );
+    }
+
+    #[test]
+    fn a_prelude_that_is_missing_decides_nothing_and_sends_nothing() {
+        // The load-bearing refusal. Running the same text without the library
+        // it was written against is not a stricter reading of the condition —
+        // it is a different program, and every helper call in it throws.
+        let host = FakeHost::always(json!(true));
+        let out = decide(
+            &host,
+            &[job("c0", "validators.email(event.data.to)"), job("c1", "event.data.n === 1")],
+            Prelude::Missing("the provider's prelude could not be read"),
+        );
+        assert_eq!(host.calls(), 0, "nothing is sent without the prelude it needs");
+        assert_eq!(out.len(), 2);
+        for v in &out {
+            assert!(matches!(v.verdict, Verdict::Unknown(_)), "{v:?}");
+            assert!(!v.verdict.fires(), "an unknown condition never fires");
+            // UNANSWERED, so no shadow line: an absent prelude is not a
+            // disagreement between two grammars, and a log full of them would
+            // block the gate those lines exist for.
+            assert!(!v.answered, "{v:?}");
+        }
+        assert!(out[0].verdict.why().unwrap().contains("could not be read"));
     }
 
     // -- the shadow log -----------------------------------------------------

@@ -64,8 +64,8 @@ use serde_json::{json, Map, Value};
 use super::descriptor::{AppLogicCatalogue, AppLogicOperation, AppLogicSpec};
 use super::LinkedAccount;
 use crate::bridge::script_host::{
-    batch_request, HostError, JobError, ScriptBatch, DEFAULT_JOB_BUDGET_MS, JOB_GRACE_MS,
-    MAX_BATCH_DEADLINE, MAX_REQUEST_BYTES,
+    batch_request_with, HostError, JobError, Prelude, ScriptBatch, DEFAULT_JOB_BUDGET_MS,
+    JOB_GRACE_MS, MAX_BATCH_DEADLINE, MAX_REQUEST_BYTES,
 };
 
 /// How long a fetched script set is reused.
@@ -549,6 +549,7 @@ pub fn handle_event(
     storage: &StorageStore,
     envelope: &Value,
     host: &dyn ScriptBatch,
+    prelude: Prelude<'_>,
     connector: &ConnectorFn,
 ) -> Vec<Outcome> {
     let mut out = Vec::new();
@@ -579,7 +580,21 @@ pub fn handle_event(
         return out;
     };
 
-    let replies = run_on_host(host, spec, entry_function, &runs);
+    // The provider's scripts are written against the provider's standard
+    // library. Without it the same source is a different program — every helper
+    // call throws — so nothing is sent and every app is told why. Refusing is
+    // not a loss here: the beat that carries this desktop's engine token is
+    // dropped in the same state, so the provider's own runtime runs these
+    // scripts correctly instead of handing them to a desktop missing half the
+    // language.
+    if let Some(why) = prelude.missing() {
+        for run in &runs {
+            out.push(Outcome::err(run.app, "-", "lane", why.to_string()));
+        }
+        return out;
+    }
+
+    let replies = run_on_host(host, spec, entry_function, &runs, prelude);
 
     for (i, run) in runs.iter().enumerate() {
         if let Some(why) = replies.lane.get(&i) {
@@ -808,16 +823,21 @@ struct Replies {
 /// * **Size.** [`MAX_REQUEST_BYTES`] bounds the whole request, and every job
 ///   carries its own copy of the context — each job is a fresh engine, so there
 ///   is nothing to share it through. One app's markers can be large, so a few
-///   scripts of one app are enough to reach the cap.
+///   scripts of one app are enough to reach the cap. `prelude_bytes` comes off
+///   that budget FIRST: the provider's standard library rides on every batch
+///   and is several times [`REQUEST_HEADROOM_BYTES`], so a batch packed to the
+///   old budget would arrive over the ceiling and be refused whole.
 ///
 /// A graph with more scripts than one batch can carry is therefore SPLIT rather
 /// than truncated or over-committed: every script still runs, in publication
 /// order, and no batch is ever bigger than what the host can promise. A single
 /// job over a ceiling on its own still forms a batch — it fails on its own
 /// account, with a reason, instead of taking the event's other scripts with it.
-fn batch_ranges(jobs: &[Value]) -> Vec<std::ops::Range<usize>> {
+fn batch_ranges(jobs: &[Value], prelude_bytes: usize) -> Vec<std::ops::Range<usize>> {
     let deadline_budget = MAX_BATCH_DEADLINE.as_secs() * 1000 - BATCH_HEADROOM_MS;
-    let byte_budget = MAX_REQUEST_BYTES - REQUEST_HEADROOM_BYTES;
+    let byte_budget = MAX_REQUEST_BYTES
+        .saturating_sub(REQUEST_HEADROOM_BYTES)
+        .saturating_sub(prelude_bytes);
     let mut ranges = Vec::new();
     let (mut start, mut ms, mut bytes) = (0usize, 0u64, 0usize);
     for (i, job) in jobs.iter().enumerate() {
@@ -849,6 +869,7 @@ fn run_on_host(
     spec: &AppLogicSpec,
     entry_function: &str,
     runs: &[AppRun],
+    prelude: Prelude<'_>,
 ) -> Replies {
     let mut replies = Replies::default();
     let mut jobs: Vec<Value> = Vec::new();
@@ -875,8 +896,8 @@ fn run_on_host(
             owner.push(i);
         }
     }
-    for range in batch_ranges(&jobs) {
-        let batch = batch_request(jobs[range.clone()].to_vec());
+    for range in batch_ranges(&jobs, prelude.request_bytes()) {
+        let batch = batch_request_with(jobs[range.clone()].to_vec(), prelude.profile());
         match host.run(&batch) {
             Ok(response) => {
                 for job in &jobs[range] {
@@ -1444,6 +1465,134 @@ mod tests {
 
     // --- the descriptor is the whole vocabulary ----------------------------
 
+
+    // --- the provider's prelude --------------------------------------------
+
+    fn profile_doc() -> Value {
+        let preamble = "var validators = { email: function (v) { return /@/.test(v); } };";
+        json!({
+            "v": 1,
+            "preamble": preamble,
+            "preambleSha256": crate::link::script_profile::sha256_hex(preamble),
+            "instructionSteps": 200_000_000u64,
+        })
+    }
+
+    #[test]
+    fn the_providers_prelude_travels_with_the_app_logic_batch() {
+        let s = spec();
+        let apps = vec![AppEntry(json!({
+            "app": { "id": "app-1", "slug": "a" },
+            "customLogic": { "scripts": [
+                { "id": "s1", "hook": "onConnectorEvent", "source": "function run(ctx) { return {}; }" }
+            ] },
+            "forms": []
+        }))];
+        let (storage, dir) = store("prelude");
+        let host = FakeHost::always(json!({}));
+        let doc = profile_doc();
+        let out = handle_event(
+            &account("http://provider.invalid".into()),
+            &s,
+            &apps,
+            &storage,
+            &json!({ "name": "x", "idempotencyKey": "evt-1" }),
+            &host,
+            Prelude::Profile(&doc),
+            &no_connector(),
+        );
+        assert!(out.is_empty(), "{out:?}");
+        let request = host.only_request();
+        assert_eq!(request["profile"], doc, "verbatim, beside the jobs");
+        assert_eq!(request["jobs"].as_array().unwrap().len(), 1);
+        drop(dir);
+    }
+
+    #[test]
+    fn app_logic_without_the_providers_prelude_runs_nothing_and_says_so_per_app() {
+        // Every script of this provider is written against a library it
+        // publishes. Running them without it fails each one separately with a
+        // ReferenceError the author cannot act on; refusing the lane says the
+        // one true thing once per app.
+        let s = spec();
+        let apps = vec![
+            AppEntry(json!({
+                "app": { "id": "app-1", "slug": "a" },
+                "customLogic": { "scripts": [
+                    { "id": "s1", "hook": "onConnectorEvent", "source": "function run(ctx) { return {}; }" }
+                ] },
+                "forms": []
+            })),
+            AppEntry(json!({
+                "app": { "id": "app-2", "slug": "b" },
+                "customLogic": { "scripts": [
+                    { "id": "s2", "hook": "onConnectorEvent", "source": "function run(ctx) { return {}; }" }
+                ] },
+                "forms": []
+            })),
+        ];
+        let (storage, dir) = store("noprelude");
+        let host = FakeHost::always(json!({}));
+        let out = handle_event(
+            &account("http://provider.invalid".into()),
+            &s,
+            &apps,
+            &storage,
+            &json!({ "name": "x", "idempotencyKey": "evt-1" }),
+            &host,
+            Prelude::Missing("the prelude could not be read".into()),
+            &no_connector(),
+        );
+        assert_eq!(host.calls(), 0, "no batch is sent at all");
+        assert_eq!(out.len(), 2, "one line per app, not one per script: {out:?}");
+        for o in &out {
+            assert_eq!(o.effect, "lane");
+            assert!(o.detail.clone().unwrap_err().contains("could not be read"));
+        }
+        drop(dir);
+    }
+
+    #[test]
+    fn a_batch_leaves_room_for_the_prelude_it_will_carry() {
+        // The prelude rides on EVERY batch and is several times the headroom
+        // the planner used to keep. Packed to the old budget, a batch would
+        // arrive over the host's request cap and be refused whole — every
+        // script in it lost, with nothing saying why.
+        let fat = "v".repeat(400_000);
+        let jobs: Vec<Value> =
+            (0..12).map(|_| json!({ "id": "x", "budgetMs": 1000, "args": [fat] })).collect();
+        let prelude = "p".repeat(300_000);
+        let doc = json!({
+            "v": 1,
+            "preamble": prelude,
+            "preambleSha256": crate::link::script_profile::sha256_hex(&prelude),
+        });
+        let bytes = serde_json::to_vec(&doc).unwrap().len();
+
+        let with = batch_ranges(&jobs, bytes);
+        let without = batch_ranges(&jobs, 0);
+        assert_ne!(with, without, "the prelude has to come off the budget, not be hoped for");
+
+        // The old plan, sent carrying the prelude it now has to carry, is over
+        // the cap — which is the failure this charge exists to prevent.
+        let overflowed =
+            serde_json::to_vec(&batch_request_with(jobs[without[0].clone()].to_vec(), Some(&doc)))
+                .unwrap()
+                .len();
+        assert!(
+            overflowed > MAX_REQUEST_BYTES,
+            "{overflowed} bytes: this test no longer demonstrates anything"
+        );
+        // The new one fits, batch for batch, and still carries every job.
+        for range in &with {
+            let request = batch_request_with(jobs[range.clone()].to_vec(), Some(&doc));
+            let sent = serde_json::to_vec(&request).unwrap().len();
+            assert!(sent <= MAX_REQUEST_BYTES, "{sent} bytes in one batch");
+        }
+        assert_eq!(with.first().unwrap().start, 0);
+        assert_eq!(with.last().unwrap().end, jobs.len(), "nothing is dropped");
+    }
+
     #[test]
     fn no_provider_name_or_effect_type_is_written_into_this_module() {
         // The single most important constraint, asserted against the source
@@ -1564,6 +1713,7 @@ mod tests {
             &storage,
             &json!({ "name": "x", "idempotencyKey": "evt-1" }),
             &host,
+            Prelude::None,
             &no_connector(),
         );
         assert!(out.is_empty(), "{out:?}");
@@ -1602,6 +1752,7 @@ mod tests {
             &storage,
             &json!({ "name": "x", "idempotencyKey": "evt-1" }),
             &host,
+            Prelude::None,
             &no_connector(),
         );
         assert!(out.is_empty());
@@ -1656,6 +1807,7 @@ mod tests {
             &storage,
             &json!({ "name": "x", "idempotencyKey": "evt-1" }),
             &host,
+            Prelude::None,
             &no_connector(),
         );
         assert_eq!(out.len(), 1, "{out:?}");
@@ -1700,7 +1852,7 @@ mod tests {
         // than what the host can promise.
         let job = |ms: u64| json!({ "id": "x", "budgetMs": ms, "source": "s" });
         let jobs: Vec<Value> = (0..50).map(|_| job(1000)).collect();
-        let ranges = batch_ranges(&jobs);
+        let ranges = batch_ranges(&jobs, 0);
         assert!(ranges.len() > 1, "50 scripts do not fit one batch");
         assert_eq!(ranges.first().unwrap().start, 0);
         assert_eq!(ranges.last().unwrap().end, jobs.len(), "nothing is dropped");
@@ -1708,7 +1860,7 @@ mod tests {
             assert_eq!(pair[0].end, pair[1].start, "the batches are contiguous");
         }
         for range in &ranges {
-            let batch = batch_request(jobs[range.clone()].to_vec());
+            let batch = batch_request_with(jobs[range.clone()].to_vec(), None);
             assert!(
                 crate::bridge::script_host::batch_deadline(&batch) < MAX_BATCH_DEADLINE,
                 "a batch must finish inside the host's ceiling, not at it: {range:?}"
@@ -1716,10 +1868,10 @@ mod tests {
         }
         // Everything that fits stays in ONE batch — splitting a short graph
         // would pay a round trip per chunk for nothing.
-        assert_eq!(batch_ranges(&(0..5).map(|_| job(1000)).collect::<Vec<_>>()).len(), 1);
+        assert_eq!(batch_ranges(&(0..5).map(|_| job(1000)).collect::<Vec<_>>(), 0).len(), 1);
         // And one job that is too big all by itself still goes, alone, rather
         // than taking the event's other scripts down with it.
-        assert_eq!(batch_ranges(&[job(60_000), job(1000)]), vec![0..1, 1..2]);
+        assert_eq!(batch_ranges(&[job(60_000), job(1000)], 0), vec![0..1, 1..2]);
     }
 
     #[test]
@@ -1730,10 +1882,10 @@ mod tests {
         // the host's request cap, which it refuses whole, unsent.
         let fat = "v".repeat(1_500_000);
         let jobs: Vec<Value> = (0..4).map(|_| json!({ "id": "x", "budgetMs": 1000, "args": [fat] })).collect();
-        let ranges = batch_ranges(&jobs);
+        let ranges = batch_ranges(&jobs, 0);
         assert!(ranges.len() > 1, "six megabytes of context cannot be one request");
         for range in &ranges {
-            let bytes = serde_json::to_vec(&batch_request(jobs[range.clone()].to_vec())).unwrap().len();
+            let bytes = serde_json::to_vec(&batch_request_with(jobs[range.clone()].to_vec(), None)).unwrap().len();
             assert!(bytes <= MAX_REQUEST_BYTES, "{bytes} bytes in one batch");
         }
     }
@@ -1759,6 +1911,7 @@ mod tests {
             &storage,
             &json!({ "name": "x", "idempotencyKey": "evt-1" }),
             &FakeHost::down("no engine on this machine"),
+            Prelude::None,
             &no_connector(),
         );
         assert_eq!(out.len(), 1, "{out:?}");
@@ -1797,6 +1950,7 @@ mod tests {
             &storage,
             &json!({ "name": "x", "idempotencyKey": "evt-1" }),
             &host,
+            Prelude::None,
             &no_connector(),
         );
         assert_eq!(out.len(), 1, "{out:?}");
@@ -1840,6 +1994,7 @@ mod tests {
             &storage,
             &json!({ "name": "x", "idempotencyKey": "evt-1" }),
             &host,
+            Prelude::None,
             &no_connector(),
         );
         assert_eq!(out.len(), 1, "{out:?}");
@@ -2440,6 +2595,7 @@ mod tests {
             &storage,
             &json!({ "name": "x", "idempotencyKey": "evt-1" }),
             &FakeHost::always(json!({})),
+            Prelude::None,
             &no_connector(),
         );
         assert_eq!(out.len(), 1);
@@ -2610,7 +2766,7 @@ mod tests {
                 .map(|(i, script)| script_job(&job_id(0, i), &s, "run", script, &ctx))
                 .collect();
             let response = host
-                .evaluate(&batch_request(jobs))
+                .evaluate(&batch_request_with(jobs, None))
                 .unwrap_or_else(|e| panic!("the staged CLI must serve the batch: {e}"));
             // The engine that answered is the one this desktop ships — not the
             // host's own JavaScript.
@@ -2689,6 +2845,66 @@ mod tests {
         host.shutdown();
     }
 
+
+    #[test]
+    fn the_real_app_scripts_can_call_the_providers_helpers_only_when_its_prelude_travels() {
+        // The same blocker on the other lane, and the more expensive one: an
+        // app script that throws writes no record at all, so the install looks
+        // healthy and the transcript is simply empty.
+        let Some((node, cli)) = staged_runner() else {
+            eprintln!("no staged CLI or no Node on this machine — skipping");
+            return;
+        };
+        let preamble = "function __isArr(a) { return typeof a == \"object\" && a != null && typeof a.length == \"number\"; }\nvar validators = {\n  email: function(value) {\n    if (typeof value != \"string\") { return false; }\n    return /^[a-zA-Z0-9._%+\\-]+@[a-zA-Z0-9.\\-]+\\.[a-zA-Z]{2,}$/.test(value);\n  }\n};\nfunction sum(arr) {\n  if (!__isArr(arr)) { return 0; }\n  let total = 0;\n  let i = 0;\n  while (i < arr.length) {\n    if (typeof arr[i] == \"number\") { total = total + arr[i]; }\n    i = i + 1;\n  }\n  return total;\n}\n";
+        let profile = json!({
+            "v": 1,
+            "preamble": preamble,
+            "preambleSha256": crate::link::script_profile::sha256_hex(preamble),
+            "instructionSteps": 200_000_000u64,
+        });
+
+        // An ordinary app script, written the way the provider's editor teaches
+        // it: the standard library, then an effect.
+        let raw = json!([{ "id": "s1", "hook": "onConnectorEvent", "source":
+            "function run(ctx) {\n  var d = (ctx.event || {}).data || {};\n  if (!validators.email(d.to)) return {};\n  return { effects: [{ type: 'storage.set', key: 'seen', value: sum(d.amounts) }] };\n}" }]);
+        let app = AppEntry(json!({ "app": { "id": "app-1" }, "customLogic": { "scripts": raw } }));
+        let s = spec();
+        let refs = app.event_scripts(&s.catalogue, &s.event_hook);
+        let ctx = json!({
+            "event": { "name": "x", "idempotencyKey": "evt-1", "data": { "to": "a@b.co", "amounts": [2, 40] } },
+            "storage": {},
+        });
+        let jobs: Vec<Value> =
+            refs.iter().enumerate().map(|(i, r)| script_job(&job_id(0, i), &s, "run", r, &ctx)).collect();
+
+        let host = crate::bridge::script_host::ScriptHost::with_cli(
+            crate::bridge::worker::CliInvocation::Node { script: cli },
+            Some(node),
+        );
+
+        // BEFORE.
+        let started = Instant::now();
+        let bare = host
+            .evaluate(&batch_request_with(jobs.clone(), None))
+            .expect("the batch is served");
+        eprintln!("app logic without the prelude: {:?}", started.elapsed());
+        let why = bare.result(&job_id(0, 0)).unwrap().outcome.clone().unwrap_err();
+        assert_eq!(why.kind, "guest", "{why:?}");
+        assert!(why.message.contains("not defined"), "{}", why.message);
+
+        // AFTER.
+        let started = Instant::now();
+        let with = host
+            .evaluate(&batch_request_with(jobs, Some(&profile)))
+            .expect("the batch is served");
+        eprintln!("app logic with the prelude: {:?}", started.elapsed());
+        let value = with.result(&job_id(0, 0)).unwrap().outcome.clone().expect("the script ran");
+        assert_eq!(value["effects"][0]["type"], "storage.set");
+        assert_eq!(value["effects"][0]["value"], 42, "and the helper computed the real answer");
+
+        host.shutdown();
+    }
+
     #[test]
     fn the_real_engine_refuses_a_source_over_its_dynamic_code_ceiling() {
         // The backstop behind the local refusal: if the ceiling is ever read
@@ -2709,7 +2925,7 @@ mod tests {
         );
         let script = ScriptRef { id: "huge", source: &big };
         let job = script_job("a0s0", &spec(), "run", &script, &json!({}));
-        let response = host.evaluate(&batch_request(vec![job])).expect("the batch is served");
+        let response = host.evaluate(&batch_request_with(vec![job], None)).expect("the batch is served");
         let outcome = response.result("a0s0").expect("answered").outcome.clone();
         let e = outcome.expect_err("a source over the ceiling cannot compile");
         assert_eq!(e.kind, "resource", "{e:?}");
@@ -2755,6 +2971,7 @@ mod tests {
             &storage,
             &json!({ "name": "x", "idempotencyKey": "evt-1" }),
             &FakeHost::always(json!({})),
+            Prelude::None,
             &no_connector(),
         );
         let duplicate = out
@@ -2786,6 +3003,7 @@ mod tests {
             &storage,
             &json!({ "name": "x", "idempotencyKey": "evt-1" }),
             &FakeHost::always(json!({})),
+            Prelude::None,
             &no_connector(),
         );
         assert_eq!(out.len(), 1);
@@ -2817,6 +3035,7 @@ mod tests {
             &storage,
             &json!({ "name": "x", "idempotencyKey": "evt-1" }),
             &FakeHost::always(json!({})),
+            Prelude::None,
             &no_connector(),
         );
         assert!(out.is_empty());
