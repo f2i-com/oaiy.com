@@ -16,9 +16,10 @@ mod http;
 
 use std::net::{SocketAddr, TcpListener};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use dsv41::tokenizer::Tokenizer;
 use dsv41_cuda::{GpuModel, GpuOptions};
@@ -132,12 +133,37 @@ impl Default for Options {
 pub struct Running {
     addr: SocketAddr,
     accept: JoinHandle<()>,
+    activity: Arc<Activity>,
+}
+
+/// Requests under way, and when the last one ended.
+struct Activity {
+    active: AtomicUsize,
+    /// Milliseconds after `epoch`.
+    last: AtomicU64,
+    epoch: Instant,
+}
+
+impl Activity {
+    fn now(&self) -> u64 {
+        self.epoch.elapsed().as_millis() as u64
+    }
 }
 
 impl Running {
     /// Where it listens (the port the OS picked, for `port: 0`).
     pub fn addr(&self) -> SocketAddr {
         self.addr
+    }
+
+    /// How long since a request last ended (zero while one runs), for a
+    /// host that stops an idle server.
+    pub fn idle_for(&self) -> Duration {
+        let a = &self.activity;
+        if a.active.load(Ordering::Relaxed) > 0 {
+            return Duration::ZERO;
+        }
+        Duration::from_millis(a.now().saturating_sub(a.last.load(Ordering::Relaxed)))
     }
 
     /// Serve until the process ends.
@@ -150,6 +176,13 @@ impl Running {
 /// profile) and start serving. Returns once requests can be served; a busy
 /// port fails before the model loads.
 pub fn start(o: Options) -> nrob::Result<Running> {
+    start_listening(o, |_| {})
+}
+
+/// [`start`], telling `listening` where the server listens as soon as it
+/// does (before the model loads: a client may connect at once, and its
+/// requests wait until the model is there).
+pub fn start_listening(o: Options, listening: impl FnOnce(SocketAddr)) -> nrob::Result<Running> {
     if o.model.as_os_str().is_empty() {
         return Err(nrob::Error::Arg("no checkpoint directory given".into()));
     }
@@ -160,6 +193,7 @@ pub fn start(o: Options) -> nrob::Result<Running> {
     };
     let listener = TcpListener::bind((o.host.as_str(), o.port))?;
     let addr = listener.local_addr()?;
+    listening(addr);
 
     let devices = if o.devices.is_empty() { (0..dsv41_cuda::gpu::device_count()?.min(2)).collect() } else { o.devices.clone() };
     let t = Instant::now();
@@ -228,17 +262,23 @@ pub fn start(o: Options) -> nrob::Result<Running> {
         jobs: Mutex::new(tx),
     });
     log(format!("serving {} at http://{addr}/v1", o.name));
+    let activity = Arc::new(Activity { active: AtomicUsize::new(0), last: AtomicU64::new(0), epoch: Instant::now() });
+    let requests = Arc::clone(&activity);
     let accept = std::thread::Builder::new()
         .name("accept".into())
         .spawn(move || {
             for conn in listener.incoming() {
                 let Ok(stream) = conn else { continue };
                 let server = Arc::clone(&server);
+                let requests = Arc::clone(&requests);
                 let peer = stream.peer_addr().map(|p| p.to_string()).unwrap_or_default();
                 std::thread::spawn(move || {
                     http::serve(stream, |req, w| {
                         let t = Instant::now();
+                        requests.active.fetch_add(1, Ordering::Relaxed);
                         let keep = server.handle(req, w);
+                        requests.last.store(requests.now(), Ordering::Relaxed);
+                        requests.active.fetch_sub(1, Ordering::Relaxed);
                         if request_log && req.path != "/health" {
                             eprintln!("{peer} {} {} ({:.1}s)", req.method, req.path, t.elapsed().as_secs_f64());
                         }
@@ -248,5 +288,5 @@ pub fn start(o: Options) -> nrob::Result<Running> {
             }
         })
         .map_err(nrob::Error::Io)?;
-    Ok(Running { addr, accept })
+    Ok(Running { addr, accept, activity })
 }
