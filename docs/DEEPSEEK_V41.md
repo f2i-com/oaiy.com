@@ -489,6 +489,13 @@ Measured (both GPUs, 140 GB RAM tier):
   what longer ones had learned: the RAM warm-up fell from 7,596 queued experts to 850.
   The model now counts every routed expert it runs (prompt and reply) and merges the
   counts into the file, older counts halving every 200,000 tokens.
+- **Whole requests, before and after** (`generate`, a 1,327-token code-review prompt,
+  200 tokens, three runs in one process, same starting profile): prompt 120.4 / 71.4 /
+  63.2 s before, 111.0 / 48.4 / 47.7 s after; decode 3.68 / 7.19 / 6.72 tok/s before,
+  4.10 / 5.50 / 6.33 after. Requests are 9–15% faster overall, but decode right after
+  a repeated prompt is 6–23% slower: VRAM no longer takes the prompt's experts (the old
+  admission was mostly churn, but some of it served the reply). Next: token-weighted
+  VRAM admission for experts many prompt tokens used.
 - **Token by token vs layered, re-measured with the fixed pass** (RAM full): layered
   1,000 tokens in 43.1 s, 2,000 in 65.8 s (about 20 s + 23 ms a token); token by token
   at its warm best 69 ms a token (much slower on a new topic). They cross near 450
