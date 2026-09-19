@@ -314,7 +314,9 @@ impl Engine {
         // chat with the same system prompt; the latest turn re-rendered)
         let user = self.tok.special("<｜User｜>");
         let turns: Vec<usize> = (start + 1..prompt.len()).filter(|&p| Some(prompt[p]) == user).collect();
-        let first_turn = turns.first().copied();
+        // where the conversation's first user message begins (the system
+        // prompt and tools before it), if this prompt still has to run it
+        let first_turn = prompt.iter().position(|&t| Some(t) == user).filter(|&p| p > start);
         let mut ends: Vec<usize> = [turns.first(), turns.last()].into_iter().flatten().copied().collect();
         ends.push(prompt.len());
         ends.dedup();
