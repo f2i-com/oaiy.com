@@ -41,6 +41,10 @@ const HELP: &str = "nrob-server: DeepSeek-V4.1-Flash behind an OpenAI-compatible
   --vram-headroom-gb F VRAM kept free for activations; the rest caches experts
                        (default 2)
   --checkpoints N      prefix-cache checkpoints kept (~10 MB each, default 256)
+  --prompt-cache DIR   keep prompt states in DIR between runs, so a restart does
+                       not read a system prompt (or a conversation it resumes)
+                       again (default: not kept)
+  --prompt-cache-gb F  disk the prompt states may take (default 4)
   --cpu-threads N      CPU threads for experts that miss VRAM (default 24; 0 = off)
   --no-vision          skip the vision tower (saves ~1 GB of VRAM; images are refused)
   --local-images on|off  let requests name image files on this machine (paths,
@@ -84,6 +88,8 @@ fn parse_args() -> Result<Options, String> {
             "--layered-max" => a.layered_max = num(val()?)?,
             "--vram-headroom-gb" => a.headroom_gb = val()?.parse().map_err(|_| "--vram-headroom-gb: not a number".to_string())?,
             "--checkpoints" => a.checkpoints = num(val()?)?,
+            "--prompt-cache" => a.prompt_cache = Some(val()?.into()),
+            "--prompt-cache-gb" => a.prompt_cache_gb = val()?.parse().map_err(|_| "--prompt-cache-gb: not a number".to_string())?,
             "--cpu-threads" => {
                 let n = num(val()?)?;
                 a.cpu_threads = if n == 0 { None } else { Some(n) };

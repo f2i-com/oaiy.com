@@ -28,5 +28,5 @@ pub mod model;
 pub mod vision;
 
 pub use gpu::Gpu;
-pub use model::{Checkpoint, GpuModel, GpuOptions, ImageSpan, PassStats};
+pub use model::{Checkpoint, GpuModel, GpuOptions, ImageSpan, PassStats, Snapshot};
 pub use vision::GpuVision;

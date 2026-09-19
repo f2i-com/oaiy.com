@@ -175,6 +175,12 @@ OpenAI's.
   resumes from the live state or from a checkpoint (taken every 256 prompt tokens and at
   user-turn boundaries), so a turn only runs its new tokens. A new chat with the same
   system prompt skips it too.
+- **Prompt states on disk** (`--prompt-cache DIR`): the state where a conversation's
+  first user message begins (the system prompt and tools) and the state at the end of
+  each prompt are also written to disk (tens of MB each: the window rings, the
+  compressed rows and index keys so far), and a new process starts from them, so a
+  restart does not read a system prompt, or a conversation it resumes, again.
+  `--prompt-cache-gb` caps the disk they take (default 4).
 - **Long prompts** run layer by layer: every expert is read once for the whole prompt
   instead of once per chunk (~6× faster here than chunked prefill).
 - **Images:** `image_url` parts with base64 `data:` URLs (PNG or JPEG), or local file

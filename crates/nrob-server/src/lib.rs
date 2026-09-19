@@ -10,6 +10,7 @@
 #![forbid(unsafe_code)]
 
 mod api;
+mod disk;
 mod engine;
 mod http;
 
@@ -21,6 +22,10 @@ use std::time::Instant;
 
 use dsv41::tokenizer::Tokenizer;
 use dsv41_cuda::{GpuModel, GpuOptions};
+
+/// Bump when what a prompt state holds changes: older files are then left
+/// alone.
+const STATE_FORMAT: u8 = 1;
 
 /// How to run the server; [`Options::default`] gives the binary's defaults,
 /// apart from the checkpoint directory, which the caller always names.
@@ -67,6 +72,12 @@ pub struct Options {
     pub headroom_gb: f64,
     /// Prefix-cache checkpoints kept (~10 MB each).
     pub checkpoints: usize,
+    /// Where prompt states are kept between runs, so that a new process
+    /// does not read a system prompt (or a conversation it resumes) again.
+    /// `None`: not kept.
+    pub prompt_cache: Option<PathBuf>,
+    /// Disk the prompt states may take, in GB.
+    pub prompt_cache_gb: f64,
     /// CPU threads for experts that miss VRAM (`None`: upload every miss).
     pub cpu_threads: Option<usize>,
     /// Load the vision tower.
@@ -103,6 +114,8 @@ impl Default for Options {
             layered_max: 8192,
             headroom_gb: 2.0,
             checkpoints: 256,
+            prompt_cache: None,
+            prompt_cache_gb: 4.0,
             cpu_threads: Some(24),
             vision: true,
             local_images: None,
@@ -177,6 +190,21 @@ pub fn start(o: Options) -> nrob::Result<Running> {
     let request_log = !o.quiet && !o.silent;
     let mut engine = engine::Engine::new(model, Arc::clone(&tok), o.chunk, o.step_below, o.layered_max, o.checkpoints, o.usage.clone(), request_log);
     engine.warn = !o.silent;
+    if let Some(dir) = &o.prompt_cache {
+        // states belong to this model (its config and weight map) and to
+        // this state format
+        let mut fingerprint = disk::fnv(&[STATE_FORMAT], 0);
+        for name in ["config.json", "model.safetensors.index.json"] {
+            fingerprint = disk::fnv(&std::fs::read(o.model.join(name)).unwrap_or_default(), fingerprint);
+        }
+        match disk::DiskCache::open(dir, fingerprint, (o.prompt_cache_gb * 1e9) as u64) {
+            Ok(cache) => {
+                log(format!("{} prompt states on disk in {}", cache.len(), dir.display()));
+                engine.disk = Some(cache);
+            }
+            Err(e) => log(format!("prompt states are not kept ({}: {e})", dir.display())),
+        }
+    }
     std::thread::Builder::new().name("model".into()).spawn(move || engine.run(rx)).map_err(nrob::Error::Io)?;
 
     let server = Arc::new(api::Server {

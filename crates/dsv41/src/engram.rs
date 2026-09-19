@@ -89,6 +89,18 @@ impl NgramHasher {
     /// the history as DEAD, so no n-gram reaches into or across an image
     /// span (the reference's `token_mask`); their own hashes are all-pad
     /// ones, whose rows the caller gates off.
+    /// Take a restored sequence's token history: `ids` are its tokens from
+    /// position 0 (text only).
+    pub fn set_history(&mut self, ids: &[u32]) -> Result<()> {
+        if ids.len() > self.cache.len() {
+            return Err(Error::Arg("sequence longer than the n-gram history".into()));
+        }
+        for (slot, &id) in self.cache.iter_mut().zip(ids) {
+            *slot = *self.token_map.get(id as usize).ok_or_else(|| Error::Arg(format!("token {id} outside the vocabulary")))?;
+        }
+        Ok(())
+    }
+
     pub fn forward_masked(&mut self, ids: &[u32], start_pos: usize, image: Option<&[bool]>) -> Result<Vec<i64>> {
         if start_pos + ids.len() > self.cache.len() {
             return Err(Error::Arg("sequence longer than the n-gram history".into()));

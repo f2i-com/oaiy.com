@@ -216,6 +216,14 @@ impl Gpu {
         cu(self.stream.clone_dtoh(dev))
     }
 
+    /// The first `n` values of `dev`.
+    pub fn download_part<T: DeviceRepr + Default + Clone>(&self, dev: &CudaSlice<T>, n: usize) -> Result<Vec<T>> {
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        cu(self.stream.clone_dtoh(&dev.slice(..n)))
+    }
+
     pub fn zeros<T: DeviceRepr + ValidAsZeroBits>(&self, n: usize) -> Result<CudaSlice<T>> {
         cu(self.stream.alloc_zeros::<T>(n.max(1)))
     }

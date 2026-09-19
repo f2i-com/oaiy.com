@@ -158,6 +158,83 @@ impl Checkpoint {
     }
 }
 
+/// All the state a sequence leaves up to a position: a [`Checkpoint`]'s
+/// window rings and partial groups, plus the compressed rows and index keys
+/// written so far (which a checkpoint leaves in place, as nothing before its
+/// position is rewritten). What carries a sequence to another process
+/// ([`GpuModel::snapshot`], [`GpuModel::restore_snapshot`], and as bytes
+/// [`Snapshot::encode`], [`Snapshot::decode`]).
+pub struct Snapshot {
+    pos: usize,
+    /// Per layer: window ring, partial group (kv, score), compressed rows,
+    /// index keys; `None` where the layer has no such buffer.
+    layers: Vec<[Option<Vec<f32>>; 5]>,
+}
+
+impl Snapshot {
+    /// Tokens the state covers.
+    pub fn pos(&self) -> usize {
+        self.pos
+    }
+
+    /// Size in bytes of the encoded snapshot.
+    pub fn encoded_len(&self) -> usize {
+        12 + self.layers.iter().flatten().map(|p| 1 + p.as_ref().map_or(0, |v| 8 + 4 * v.len())).sum::<usize>()
+    }
+
+    /// Append the snapshot's bytes (little-endian).
+    pub fn encode(&self, out: &mut Vec<u8>) {
+        out.reserve(self.encoded_len());
+        out.extend((self.pos as u64).to_le_bytes());
+        out.extend((self.layers.len() as u32).to_le_bytes());
+        for part in self.layers.iter().flatten() {
+            match part {
+                None => out.push(0),
+                Some(v) => {
+                    out.push(1);
+                    out.extend((v.len() as u64).to_le_bytes());
+                    for x in v {
+                        out.extend(x.to_le_bytes());
+                    }
+                }
+            }
+        }
+    }
+
+    /// Read [`encode`](Self::encode)'s bytes (all of them).
+    pub fn decode(bytes: &[u8]) -> Result<Snapshot> {
+        let bad = || Error::Format("damaged snapshot".into());
+        let mut at = 0usize;
+        let mut take = |n: usize| -> Result<&[u8]> {
+            let s = bytes.get(at..at.checked_add(n).ok_or_else(bad)?).ok_or_else(bad)?;
+            at += n;
+            Ok(s)
+        };
+        let u64_of = |s: &[u8]| u64::from_le_bytes(s.try_into().expect("8 bytes"));
+        let pos = u64_of(take(8)?) as usize;
+        let n_layers = u32::from_le_bytes(take(4)?.try_into().expect("4 bytes")) as usize;
+        if n_layers > 1024 {
+            return Err(bad());
+        }
+        let mut layers = Vec::with_capacity(n_layers);
+        for _ in 0..n_layers {
+            let mut parts: [Option<Vec<f32>>; 5] = Default::default();
+            for part in &mut parts {
+                if take(1)?[0] == 1 {
+                    let n = u64_of(take(8)?) as usize;
+                    let raw = take(n.checked_mul(4).ok_or_else(bad)?)?;
+                    *part = Some(raw.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().expect("4 bytes"))).collect());
+                }
+            }
+            layers.push(parts);
+        }
+        if at != bytes.len() {
+            return Err(bad());
+        }
+        Ok(Snapshot { pos, layers })
+    }
+}
+
 /// Wall time per phase, summed over forwards (seconds). Enabled by
 /// [`GpuModel::enable_profile`] (the generate example: `DSV41_PROFILE=1`);
 /// each phase boundary then synchronizes the device, so profiled runs are a
@@ -1124,6 +1201,64 @@ impl GpuModel {
             layers.push((g.download(&st.window)?, copy(&st.kv_state)?, copy(&st.score_state)?));
         }
         Ok(Checkpoint { pos, layers })
+    }
+
+    /// All the state up to `pos` (the tokens run so far), to carry the
+    /// sequence to another process.
+    pub fn snapshot(&self, pos: usize) -> Result<Snapshot> {
+        let (hd, ihd) = (self.cfg.head_dim, self.cfg.index_head_dim);
+        let mut layers = Vec::with_capacity(self.states.len());
+        for (l, st) in self.states.iter().enumerate() {
+            let g = &self.devs[self.layers[l].dev].g;
+            // rows are written a whole group at a time
+            let rows = pos / self.layers[l].ratio.max(1);
+            let whole = |s: &Option<CudaSlice<f32>>| s.as_ref().map(|s| g.download(s)).transpose();
+            let part = |s: &Option<CudaSlice<f32>>, n: usize| {
+                s.as_ref()
+                    .map(|s| if n <= s.len() { g.download_part(s, n) } else { Err(Error::Arg(format!("layer {l}: {pos} tokens are past the context"))) })
+                    .transpose()
+            };
+            layers.push([Some(g.download(&st.window)?), whole(&st.kv_state)?, whole(&st.score_state)?, part(&st.compress_kv, rows * hd)?, part(&st.index_k, rows * ihd)?]);
+        }
+        Ok(Snapshot { pos, layers })
+    }
+
+    /// Continue the sequence a [`snapshot`](Self::snapshot) was taken of,
+    /// whatever ran since (in this process or another one of the same
+    /// model): `ids` are its tokens (text only). The next forward starts at
+    /// its position.
+    pub fn restore_snapshot(&mut self, snap: &Snapshot, ids: &[u32]) -> Result<()> {
+        let (hd, ihd) = (self.cfg.head_dim, self.cfg.index_head_dim);
+        if snap.layers.len() != self.states.len() || ids.len() != snap.pos || snap.pos >= self.max_seq {
+            return Err(Error::Arg("the snapshot does not fit this model".into()));
+        }
+        for (l, parts) in snap.layers.iter().enumerate() {
+            let rows = snap.pos / self.layers[l].ratio.max(1);
+            let g = &self.devs[self.layers[l].dev].g;
+            let st = &mut self.states[l];
+            let slots = [Some(&mut st.window), st.kv_state.as_mut(), st.score_state.as_mut(), st.compress_kv.as_mut(), st.index_k.as_mut()];
+            let wants = |k: usize, have: usize| match k {
+                3 => rows * hd,
+                4 => rows * ihd,
+                _ => have,
+            };
+            for (k, (part, slot)) in parts.iter().zip(slots).enumerate() {
+                match (part, slot) {
+                    (None, None) => {}
+                    (Some(src), Some(dst)) if src.len() == wants(k, dst.len()) && src.len() <= dst.len() => {
+                        if !src.is_empty() {
+                            g.write(src, &mut dst.slice_mut(..src.len()))?;
+                        }
+                    }
+                    _ => return Err(Error::Arg(format!("the snapshot's layer {l} does not fit this model"))),
+                }
+            }
+        }
+        self.hasher.set_history(ids)?;
+        for d in &self.devs {
+            d.g.sync()?;
+        }
+        Ok(())
     }
 
     /// Return to a [`checkpoint`](Self::checkpoint): the next forward may

@@ -273,6 +273,47 @@ fn gpu_chunked_prefill_and_checkpoints() {
     assert_eq!(replay, own, "reply after restoring the prompt checkpoint differs");
 }
 
+/// A snapshot carries a sequence through a detour that overwrites all of
+/// the state (another prompt from position 0), as a restart does: taken
+/// mid-prompt, through its bytes and back, the rest of the prompt gives the
+/// logits and the reply it gave before. A checkpoint alone does not survive
+/// the detour (the compressed rows and the n-gram history are gone).
+#[test]
+#[ignore]
+fn gpu_snapshots_carry_a_sequence() {
+    let Some((g, mut model)) = setup() else { return };
+    let prompt: Vec<u32> = g.read_i64("prompt_ids").unwrap().iter().map(|&v| v as u32).collect();
+    let n = prompt.len();
+    // mid-way, off a compressor group boundary, at least 2 tokens each side
+    let at = ((n / 2) | 1).clamp(2, n - 2);
+    let _ = model.forward(&prompt[..at], 0).unwrap();
+    let mut bytes = Vec::new();
+    model.snapshot(at).unwrap().encode(&mut bytes);
+    let ck = model.checkpoint(at).unwrap();
+    let logits = model.forward(&prompt[at..], at).unwrap();
+    let own = greedy(&mut model, argmax(&logits), n, 6);
+
+    let detour: Vec<u32> = prompt.iter().rev().copied().collect();
+    let _ = model.forward(&detour, 0).unwrap();
+    model.restore(&ck).unwrap();
+    let stale = model.forward(&prompt[at..], at).unwrap();
+    let rel_stale = rel_l2(&logits, &stale);
+
+    let _ = model.forward(&detour, 0).unwrap();
+    let snap = dsv41_cuda::Snapshot::decode(&bytes).unwrap();
+    assert_eq!(snap.pos(), at);
+    assert_eq!(bytes.len(), snap.encoded_len());
+    model.restore_snapshot(&snap, &prompt[..at]).unwrap();
+    let again = model.forward(&prompt[at..], at).unwrap();
+    let rel = rel_l2(&logits, &again);
+    eprintln!("snapshot at {at} of {n} ({} MB): rel-L2 {rel:.2e}; a checkpoint alone after the detour {rel_stale:.2e}", bytes.len() >> 20);
+    assert!(rel_stale > 1e-3, "the detour left the prompt's state in place: the test proves nothing");
+    assert!(rel < 1e-4, "the snapshot did not carry the sequence: {rel}");
+    let replay = greedy(&mut model, argmax(&again), n, 6);
+    assert_eq!(replay, own, "reply after the snapshot differs");
+    assert!(dsv41_cuda::Snapshot::decode(&bytes[..bytes.len() - 1]).is_err());
+}
+
 /// The layer-by-layer prefill (every layer over the whole prompt, routed
 /// experts fetched once) must give the logits of the same sub-chunks run
 /// with `forward`, from position 0 and continuing a sequence, and the

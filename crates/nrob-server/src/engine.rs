@@ -14,6 +14,11 @@
 //!   earlier (a re-rendered reply, an edited history, a new chat with the
 //!   same system prompt) restores the latest checkpoint before the
 //!   divergence and runs only the rest;
+//! - with a prompt cache directory, the state where a conversation's first
+//!   user message begins and the state at the end of each prompt also go to
+//!   disk ([`crate::disk`]), and a prompt that disk covers more of than the
+//!   worker does starts from there: a new process does not read the system
+//!   prompt again, nor a conversation it resumes;
 //! - what is left runs token by token through the decode path when short
 //!   (its experts mostly sit in VRAM and RAM already), and layer by layer
 //!   when long ([`GpuModel::prefill_layered`]: every expert read once for
@@ -102,6 +107,8 @@ pub struct Engine {
     pub log: bool,
     /// Report failures that have no request to go to (on by default).
     pub warn: bool,
+    /// Prompt states kept on disk between runs.
+    pub disk: Option<crate::disk::DiskCache>,
     /// What the state covers, one key per position: the token id, or for
     /// image positions a key from the image's content and the offset.
     tokens: Vec<u64>,
@@ -135,6 +142,7 @@ impl Engine {
             usage,
             log,
             warn: true,
+            disk: None,
             tokens: Vec::new(),
             checkpoints: Vec::new(),
         }
@@ -168,6 +176,16 @@ impl Engine {
     fn resume(&mut self, prompt: &[u64]) -> nrob::Result<usize> {
         let common = self.tokens.iter().zip(prompt).take_while(|(a, b)| a == b).count();
         let limit = common.min(prompt.len().saturating_sub(1));
+        // what this process has (the live state, or a checkpoint), unless
+        // disk has more
+        let here = if self.tokens.len() <= limit {
+            self.tokens.len()
+        } else {
+            self.checkpoints.iter().rev().find(|c| c.pos() <= limit).map_or(0, |c| c.pos())
+        };
+        if let Some(pos) = self.restore_from_disk(prompt, here)? {
+            return Ok(pos);
+        }
         if self.tokens.len() <= limit {
             return Ok(self.tokens.len());
         }
@@ -185,6 +203,56 @@ impl Engine {
                 self.checkpoints.clear();
                 self.tokens.clear();
                 Ok(0)
+            }
+        }
+    }
+
+    /// Load the longest prompt state on disk that covers more of `prompt`
+    /// than `here`: where the prompt then starts.
+    fn restore_from_disk(&mut self, prompt: &[u64], here: usize) -> nrob::Result<Option<usize>> {
+        let Some(disk) = self.disk.as_mut() else {
+            return Ok(None);
+        };
+        let Some((i, len)) = disk.best(prompt, prompt.len().saturating_sub(1)).filter(|&(_, len)| len > here) else {
+            return Ok(None);
+        };
+        let t = Instant::now();
+        let (keys, snap) = match disk.load(i) {
+            Ok(got) => got,
+            Err(e) => {
+                if self.warn {
+                    eprintln!("nrob-server: a prompt state on disk could not be read: {e}");
+                }
+                return Ok(None);
+            }
+        };
+        let ids: Vec<u32> = keys.iter().map(|&k| k as u32).collect();
+        self.model.restore_snapshot(&snap, &ids)?;
+        self.tokens = keys;
+        self.checkpoints = vec![self.model.checkpoint(len)?];
+        if self.log {
+            eprintln!("  prompt state for {len} tokens loaded from disk in {:.2}s", t.elapsed().as_secs_f64());
+        }
+        Ok(Some(len))
+    }
+
+    /// Keep the state after the first `pos` tokens on disk (`base`: where a
+    /// conversation's first user message begins), unless it is there
+    /// already or the prompt has images.
+    fn persist(&mut self, pos: usize, base: bool) {
+        let Some(disk) = self.disk.as_mut() else {
+            return;
+        };
+        let keys = &self.tokens[..pos];
+        if keys.iter().any(|k| k >> 63 == 1) || disk.has(keys) {
+            return;
+        }
+        match self.model.snapshot(pos) {
+            Ok(snap) => disk.save(keys.to_vec(), snap, base),
+            Err(e) => {
+                if self.warn {
+                    eprintln!("nrob-server: keeping the prompt state failed: {e}");
+                }
             }
         }
     }
@@ -246,6 +314,7 @@ impl Engine {
         // chat with the same system prompt; the latest turn re-rendered)
         let user = self.tok.special("<｜User｜>");
         let turns: Vec<usize> = (start + 1..prompt.len()).filter(|&p| Some(prompt[p]) == user).collect();
+        let first_turn = turns.first().copied();
         let mut ends: Vec<usize> = [turns.first(), turns.last()].into_iter().flatten().copied().collect();
         ends.push(prompt.len());
         ends.dedup();
@@ -316,7 +385,17 @@ impl Engine {
                 }
                 pos = end;
                 self.save_checkpoint(pos)?;
+                if Some(pos) == first_turn {
+                    // the system prompt and tools: where the next process's
+                    // chats start
+                    self.persist(pos, true);
+                }
             }
+        }
+        // (a one-token request reads a prompt ahead of its turn: the end of
+        // that prompt is not worth keeping)
+        if job.max_tokens > 1 && prompt.len() > start {
+            self.persist(prompt.len(), false);
         }
         let prefill_s = started.elapsed().as_secs_f64();
         let _ = job.events.send(Event::Prefilled { cached: start });
