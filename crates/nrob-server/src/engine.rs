@@ -165,6 +165,13 @@ impl ThinkBudget {
     }
 }
 
+/// How much of a `left`-token stretch the next layered pass takes: all of
+/// it, or an equal share when it needs more than one pass of at most
+/// `max` tokens.
+fn pass_len(left: usize, max: usize) -> usize {
+    left.div_ceil(left.div_ceil(max.max(1)))
+}
+
 /// Prefix-cache keys of a prompt: token ids, image positions keyed by
 /// their image (ids stay below 2^32, image keys above).
 fn prompt_keys(prompt: &[u32], images: &[JobImage]) -> Vec<u64> {
@@ -409,8 +416,10 @@ impl Engine {
                 } else {
                     // a long one layer by layer: every expert is read once for
                     // the whole stretch (a chunk of a few hundred tokens
-                    // already touches nearly all of them)
-                    let end = pos + left.min(self.layered_max);
+                    // already touches nearly all of them); one longer than a
+                    // pass splits into equal passes (not full ones and a short
+                    // rest, which would go token by token)
+                    let end = pos + pass_len(left, self.layered_max);
                     // every layer takes the whole stretch a step further
                     let (events, before, len) = (job.events.clone(), pos - start, end - pos);
                     self.model.set_layer_progress(Some(Box::new(move |layers_done, layers| {
@@ -562,6 +571,23 @@ pub fn sample(logits: &[f32], s: &Sampling, rng: &mut u64) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_long_stretch_splits_into_equal_layered_passes() {
+        assert_eq!(pass_len(5_000, 8_192), 5_000);
+        assert_eq!(pass_len(8_192, 8_192), 8_192);
+        // 16,844 tokens: three passes of ~5,615, not 8,192 + 8,192 + 460
+        // (whose rest would run token by token)
+        assert_eq!(pass_len(16_844, 8_192), 5_615);
+        let mut left = 16_844;
+        let mut passes = Vec::new();
+        while left > 0 {
+            let n = pass_len(left, 8_192);
+            passes.push(n);
+            left -= n;
+        }
+        assert_eq!(passes, [5_615, 5_615, 5_614]);
+    }
 
     #[test]
     fn reasoning_is_closed_at_its_budget() {
