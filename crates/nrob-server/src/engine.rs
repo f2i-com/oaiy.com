@@ -424,6 +424,8 @@ impl Engine {
                     // pass splits into equal passes (not full ones and a short
                     // rest, which would go token by token)
                     let end = pos + pass_len(left, self.layered_max);
+                    // a clean state to come back to if the pass fails
+                    self.save_checkpoint(pos)?;
                     // every layer takes the whole stretch a step further
                     let (events, before, len) = (job.events.clone(), pos - start, end - pos);
                     self.model.set_layer_progress(Some(Box::new(move |layers_done, layers| {
@@ -438,6 +440,16 @@ impl Engine {
                             self.rollback(pos)?;
                             let _ = job.events.send(Event::Done { finish: Finish::Stop, completion_tokens: 0 });
                             return Ok(());
+                        }
+                        // a pass too long for the VRAM left for activations:
+                        // back to its start, and shorter passes from now on
+                        Err(e) if e.to_string().contains("OUT_OF_MEMORY") && (end - pos) / 2 > self.step_below => {
+                            self.rollback(pos)?;
+                            self.layered_max = (end - pos) / 2;
+                            if self.warn {
+                                eprintln!("nrob-server: a {}-token layered pass ran out of VRAM; passes of up to {} tokens from now on", end - pos, self.layered_max);
+                            }
+                            continue;
                         }
                         Err(e) => return Err(e),
                     }

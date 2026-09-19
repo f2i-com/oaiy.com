@@ -186,7 +186,10 @@ OpenAI's.
   restart does not read a system prompt, or a conversation it resumes, again.
   `--prompt-cache-gb` caps the disk they take (default 4).
 - **Long prompts** run layer by layer: every expert is read once for the whole prompt
-  instead of once per chunk (~6× faster here than chunked prefill).
+  instead of once per chunk (~6× faster here than chunked prefill), up to 20,480 tokens a
+  pass (`--layered-max`); a longer prompt splits into equal passes, and a pass that runs out
+  of VRAM is redone in halves. One pass over 16,800 tokens took 152 s (83 GB from the drive)
+  where three passes of 5,600 took 238 s (257 GB).
 - **Images:** `image_url` parts with base64 `data:` URLs (PNG or JPEG), or local file
   paths when the server listens on loopback only. See [Vision](#vision).
 

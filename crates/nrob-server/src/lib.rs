@@ -66,7 +66,10 @@ pub struct Options {
     pub chunk: usize,
     /// Prompt stretches shorter than this run one token at a time.
     pub step_below: usize,
-    /// Longer stretches run layer by layer, up to this many tokens a pass.
+    /// Longer stretches run layer by layer, up to this many tokens a pass
+    /// (each pass reads the experts once; its activations take VRAM, and a
+    /// pass that runs out halves this for the rest of the run). 20,480 fits
+    /// two 32 GB cards with the default headroom; 32,768 does not.
     pub layered_max: usize,
     /// VRAM kept free for activations, in GB; the rest caches experts.
     pub headroom_gb: f64,
@@ -111,7 +114,7 @@ impl Default for Options {
             top_p: 0.95,
             chunk: 1024,
             step_below: 512,
-            layered_max: 8192,
+            layered_max: 20_480,
             headroom_gb: 2.0,
             checkpoints: 256,
             prompt_cache: None,

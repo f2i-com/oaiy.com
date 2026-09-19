@@ -36,7 +36,8 @@ const HELP: &str = "nrob-server: DeepSeek-V4.1-Flash behind an OpenAI-compatible
   --step-below N       prompt stretches shorter than this run one token at a
                        time through the decode path (default 512)
   --layered-max N      longer stretches run layer by layer, every expert read
-                       once per pass, up to N tokens a pass (default 8192)
+                       once per pass, up to N tokens a pass (default 20480;
+                       halved if a pass runs out of VRAM)
   --chunk N            attention sub-chunk of a layered pass (default 1024)
   --vram-headroom-gb F VRAM kept free for activations; the rest caches experts
                        (default 2)

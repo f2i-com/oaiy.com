@@ -9,7 +9,11 @@
 //! DSV41_USAGE); DSV41_RUNS repeats the prompt (the later runs show warm
 //! caches); DSV41_PROFILE adds a per-phase breakdown (with extra syncs);
 //! DSV41_WAIT_WARM=1 lets the background RAM fill finish first (a server
-//! that has been up a while).
+//! that has been up a while); DSV41_HEADROOM_GB sets the VRAM kept for
+//! activations (default 2, as nrob-server's).
+//!
+//! DSV41_LAYERED=1 runs layer by layer; DSV41_PASS=N splits that into passes
+//! of N tokens, as nrob-server does a stretch longer than its layered_max.
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -60,7 +64,8 @@ fn main() -> nrob::Result<()> {
     ids.truncate(n_tokens);
 
     let t = Instant::now();
-    let opts = GpuOptions { devices: devices.clone(), max_seq: ids.len() + 16, expert_cache_bytes: ram_gb << 30, direct_io: true, vram_expert_bytes: None, vram_headroom_bytes: 1 << 30, cpu_expert_threads: Some(24), vision: false };
+    let headroom_gb: f64 = std::env::var("DSV41_HEADROOM_GB").ok().and_then(|v| v.parse().ok()).unwrap_or(2.0);
+    let opts = GpuOptions { devices: devices.clone(), max_seq: ids.len() + 16, expert_cache_bytes: ram_gb << 30, direct_io: true, vram_expert_bytes: None, vram_headroom_bytes: (headroom_gb * (1u64 << 30) as f64) as usize, cpu_expert_threads: Some(24), vision: false };
     let mut model = GpuModel::load(&model_dir, &golden.join("engram_meta.safetensors"), &opts)?;
     eprintln!("[loaded in {:.1}s on cuda:{devices:?}]", t.elapsed().as_secs_f64());
     let usage = std::env::var_os("DSV41_USAGE").map(PathBuf::from).unwrap_or_else(|| r"E:\deepseek\expert_usage.txt".into());
@@ -102,10 +107,18 @@ fn main() -> nrob::Result<()> {
             continue;
         }
         if layered {
-            eprintln!("\n[run {} of {runs}: {} tokens layer by layer, attention sub-chunks of {chunk}]", run + 1, ids.len());
+            let pass: usize = std::env::var("DSV41_PASS").ok().and_then(|v| v.parse().ok()).unwrap_or(ids.len()).max(1);
+            eprintln!("\n[run {} of {runs}: {} tokens layer by layer in passes of up to {pass}, attention sub-chunks of {chunk}]", run + 1, ids.len());
             let host0 = model.expert_cache().stats();
             let t = Instant::now();
-            model.prefill_layered(&ids, 0, chunk, None)?;
+            let mut at = 0;
+            while at < ids.len() {
+                let end = (at + pass).min(ids.len());
+                let tp = Instant::now();
+                model.prefill_layered(&ids[at..end], at, chunk, None)?;
+                eprintln!("  pass {at}..{end}: {:.1}s", tp.elapsed().as_secs_f64());
+                at = end;
+            }
             let s = t.elapsed().as_secs_f64();
             let host = model.expert_cache().stats();
             eprintln!(
