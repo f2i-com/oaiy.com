@@ -95,7 +95,10 @@ pub struct Engine {
     pub layered_max: usize,
     pub max_checkpoints: usize,
     pub usage: Option<PathBuf>,
+    /// Log each request's timings.
     pub log: bool,
+    /// Report failures that have no request to go to (on by default).
+    pub warn: bool,
     /// What the state covers, one key per position: the token id, or for
     /// image positions a key from the image's content and the offset.
     tokens: Vec<u64>,
@@ -128,6 +131,7 @@ impl Engine {
             max_checkpoints,
             usage,
             log,
+            warn: true,
             tokens: Vec::new(),
             checkpoints: Vec::new(),
         }
@@ -147,7 +151,7 @@ impl Engine {
                 let _ = job.events.send(Event::Error(e.to_string()));
             }
             if let Some(path) = &self.usage {
-                if let Err(e) = self.model.save_usage(path) {
+                if let (Err(e), true) = (self.model.save_usage(path), self.warn) {
                     eprintln!("nrob-server: saving the expert usage profile failed: {e}");
                 }
             }

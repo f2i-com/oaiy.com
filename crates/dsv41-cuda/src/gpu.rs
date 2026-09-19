@@ -156,6 +156,11 @@ fn elems_cfg(n: usize) -> LaunchConfig {
     LaunchConfig { grid_dim: (n.div_ceil(256) as u32, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 }
 }
 
+/// How many CUDA devices this machine has.
+pub fn device_count() -> Result<usize> {
+    Ok(cu(CudaContext::device_count())?.max(0) as usize)
+}
+
 impl Gpu {
     /// Open device `ordinal` and compile the kernels (--fmad=false: the CPU
     /// reference never contracts a*b+c, so the GPU must not either).

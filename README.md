@@ -146,8 +146,14 @@ isolation, every GPU kernel tested against its CPU counterpart.
 
 ```sh
 cargo build --release -p nrob-server
-nrob-server --model D:\deepseek\model --ctx 65536   # then point a harness at http://127.0.0.1:8000/v1
+nrob-server --model <checkpoint dir> --usage <profile file>   # then point a harness at http://127.0.0.1:8000/v1
 ```
+
+`--model` names the checkpoint directory; nothing is assumed about where it lives. The
+Engram precompute (`engram_meta.safetensors`, from `tools/dsv41/oracle.py`) is read from
+that directory unless `--engram-meta` names the file, and `--usage` (optional) keeps an
+expert usage profile that warms the caches at start. `nrob_server::start` runs the same
+server inside another program: `coder-cli` carries the model that way.
 
 Any OpenAI-compatible client or coding harness (Aider, Cline, Continue, OpenCode, ...)
 works with base URL `http://127.0.0.1:8000/v1`, model `deepseek-v4.1-flash`, and any API

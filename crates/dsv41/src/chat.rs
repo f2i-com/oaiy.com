@@ -678,10 +678,12 @@ fn parse_tool_calls(text: &str, mut i: usize) -> Result<(usize, Vec<ToolCall>)> 
         }
         let (next, head, mut stop) = read_until(text, i, &[&param_start, &invoke_end]);
         i = next;
+        // an invoke without parameters is `name="x">` and an empty line (as
+        // `encode` writes it), with parameters `name="x">` and one newline
         let name = head
-            .trim_start()
+            .trim()
             .strip_prefix("name=\"")
-            .and_then(|r| r.strip_suffix("\">\n"))
+            .and_then(|r| r.strip_suffix("\">"))
             .ok_or_else(|| format_err(format!("tool name format: {head:?}")))?;
         let mut params: Vec<(String, String, bool)> = Vec::new();
         while stop == Some(0) {
@@ -916,6 +918,26 @@ mod tests {
         let mut p = StreamParser::new(Mode::Chat);
         assert!(p.push("a\n\n<").iter().all(|d| d == &Delta::Content("a".into())));
         assert_eq!(p.finish().0, vec![Delta::Content("\n\n<".into())]);
+    }
+
+    #[test]
+    fn calls_without_parameters_parse_as_encode_writes_them() {
+        // encode writes a parameterless invoke with an empty line inside; the
+        // model copies that, and the parser has to take it back
+        let text = format!(
+            "\n\n<{DSML} calls>\n<{DSML} invoke name=\"workspace_info\">\n\n</{DSML} invoke>\n<{DSML} invoke name=\"read_file\">\n<{DSML} parameter name=\"path\" string=\"true\">src/lib.rs</{DSML} parameter>\n</{DSML} invoke>\n</{DSML} calls>"
+        );
+        let mut p = StreamParser::new(Mode::Chat);
+        assert!(p.push(&text).is_empty());
+        let (rest, calls) = p.finish();
+        assert!(rest.is_empty(), "{rest:?}");
+        assert_eq!(
+            calls,
+            vec![
+                ToolCall { name: "workspace_info".into(), namespace: None, arguments: "{}".into() },
+                ToolCall { name: "read_file".into(), namespace: None, arguments: r#"{"path": "src/lib.rs"}"#.into() },
+            ]
+        );
     }
 
     fn golden() -> Option<Json> {
