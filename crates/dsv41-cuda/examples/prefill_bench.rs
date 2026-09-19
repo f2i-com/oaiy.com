@@ -7,7 +7,9 @@
 //! Defaults: 4096 tokens in chunks of 1024 on cuda:1,0. Environment as for
 //! the generate example (DSV41_MODEL, DSV41_GOLDEN_DIR, DSV41_RAM_GB,
 //! DSV41_USAGE); DSV41_RUNS repeats the prompt (the later runs show warm
-//! caches); DSV41_PROFILE adds a per-phase breakdown (with extra syncs).
+//! caches); DSV41_PROFILE adds a per-phase breakdown (with extra syncs);
+//! DSV41_WAIT_WARM=1 lets the background RAM fill finish first (a server
+//! that has been up a while).
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -67,13 +69,38 @@ fn main() -> nrob::Result<()> {
         let (vram, queued) = model.warm(&usage, 4)?;
         eprintln!("[warmed {vram} experts into VRAM in {:.1}s; {queued} queued for RAM]", t.elapsed().as_secs_f64());
     }
+    if std::env::var_os("DSV41_WAIT_WARM").is_some() {
+        let t = Instant::now();
+        while let Some((done, false)) = model.warming() {
+            eprint!("\r[RAM fill: {done} records]");
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        }
+        eprintln!("\n[RAM fill finished in {:.0}s; RAM holds {} records]", t.elapsed().as_secs_f64(), model.expert_cache().len());
+    }
     if std::env::var_os("DSV41_PROFILE").is_some() {
         model.enable_profile();
     }
 
-    // DSV41_LAYERED=1: one layer-by-layer pass over all the tokens instead
+    // DSV41_LAYERED=1: one layer-by-layer pass over all the tokens instead;
+    // DSV41_STEP=1: token by token through the decode path, as a server
+    // feeds a short prompt (DSV41_HEAD=1: with the output head every token)
     let layered = std::env::var_os("DSV41_LAYERED").is_some();
+    let step = std::env::var_os("DSV41_STEP").is_some();
+    let head = std::env::var_os("DSV41_HEAD").is_some();
     for run in 0..runs {
+        if step {
+            let t = Instant::now();
+            for (p, id) in ids.iter().enumerate() {
+                if head || p + 1 == ids.len() {
+                    model.forward(&[*id], p)?;
+                } else {
+                    model.advance_with(&[*id], p, &[])?;
+                }
+            }
+            let s = t.elapsed().as_secs_f64();
+            eprintln!("[run {}: {} tokens one by one{} in {s:.1}s = {:.2} tok/s]", run + 1, ids.len(), if head { " (head every token)" } else { "" }, ids.len() as f64 / s);
+            continue;
+        }
         if layered {
             eprintln!("\n[run {} of {runs}: {} tokens layer by layer, attention sub-chunks of {chunk}]", run + 1, ids.len());
             let host0 = model.expert_cache().stats();
@@ -88,6 +115,16 @@ fn main() -> nrob::Result<()> {
                 ids.len() as f64 / s,
                 host.misses - host0.misses,
                 (host.bytes_read - host0.bytes_read) as f64 / 1e9
+            );
+            let ps = model.pass_stats();
+            eprintln!(
+                "[experts used {}: resident at the start {} ({:.0}%), when their layer ran {} (VRAM {}); read from the drive {}]",
+                ps.used,
+                ps.resident_at_start,
+                100.0 * ps.resident_at_start as f64 / ps.used.max(1) as f64,
+                ps.resident_at_use,
+                ps.vram_at_use,
+                ps.reads
             );
             if let Some(p) = model.profile() {
                 eprintln!("[routed experts: fetch {:.1}s (SSD/RAM reads and uploads), compute {:.1}s; the rest {:.1}s]", p.fetch, p.experts, s - p.fetch - p.experts);

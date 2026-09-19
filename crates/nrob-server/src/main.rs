@@ -70,7 +70,7 @@ const HELP: &str = "nrob-server: DeepSeek-V4.1-Flash behind an OpenAI-compatible
   --temperature F      default temperature (default 0.6)
   --top-p F            default top-p (default 0.95)
   --step-below N       prompt stretches shorter than this run one token at a
-                       time through the decode path (default 2048)
+                       time through the decode path (default 512)
   --layered-max N      longer stretches run layer by layer, every expert read
                        once per pass, up to N tokens a pass (default 8192)
   --chunk N            attention sub-chunk of a layered pass (default 1024)
@@ -108,7 +108,7 @@ fn parse_args() -> Result<Args, String> {
         temperature: 0.6,
         top_p: 0.95,
         chunk: 1024,
-        step_below: 2048,
+        step_below: 512,
         layered_max: 8192,
         headroom_gb: 2.0,
         checkpoints: 256,

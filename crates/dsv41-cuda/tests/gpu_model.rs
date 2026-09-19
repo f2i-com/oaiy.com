@@ -146,6 +146,35 @@ fn greedy(model: &mut GpuModel, first: u32, pos: usize, n: usize) -> Vec<u32> {
     got
 }
 
+/// A prompt fed token by token ends in the same logits whether the tokens
+/// before the last run the output head ([`GpuModel::forward`]) or skip it
+/// ([`GpuModel::advance_with`], what the server does): the head leaves the
+/// state alone. Bit for bit unless CPU experts share the decode (their sums
+/// differ from the GPU's in the last bits, and which experts run where
+/// depends on the cache state).
+#[test]
+#[ignore]
+fn gpu_advance_matches_forward() {
+    let Some((g, mut model)) = setup() else { return };
+    let prompt: Vec<u32> = g.read_i64("prompt_ids").unwrap().iter().map(|&v| v as u32).collect();
+    let n = prompt.len().min(64);
+    let mut with_head = Vec::new();
+    for p in 0..n {
+        with_head = model.forward(&prompt[p..p + 1], p).unwrap();
+    }
+    for p in 0..n - 1 {
+        model.advance_with(&prompt[p..p + 1], p, &[]).unwrap();
+    }
+    let advanced = model.forward(&prompt[n - 1..n], n - 1).unwrap();
+    let e = rel_l2(&advanced, &with_head);
+    eprintln!("{n} tokens: advance_with vs forward, last logits rel-L2 {e:.2e}");
+    if std::env::var("DSV41_CPU_THREADS").is_ok() {
+        assert!(e < 1e-2, "rel-L2 {e}");
+    } else {
+        assert_eq!(advanced, with_head, "advance_with changed the state");
+    }
+}
+
 /// Serving continues a conversation from where the cache stopped: the
 /// prompt run as a prefill plus chunks continuing it (split at odd
 /// positions, so compressor groups straddle chunks, and with a chunk longer

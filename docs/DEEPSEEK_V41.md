@@ -463,6 +463,38 @@ Measured (both GPUs, 140 GB RAM tier):
     the rest 69 s (attention, hyper-connections, the shared experts, and the residual
     stream's trips over PCIe).
   - A pool of 4 readers now pulls a layer's experts into RAM ahead of the compute loop.
+- **Prefill ate its own future (fixed 2026-09-19).** `prefill_bench` now counts, per
+  pass, the experts used, those resident when the pass began and when their layer ran,
+  and the drive reads (`GpuModel::pass_stats`, no syncs). A second 5,560-token pass
+  with a full RAM tier used 13,593 experts; 10,198 were resident at the start, but only
+  2,640 when their layer ran, and it read 11,058 (208 GB), the same as the first pass.
+  - Why: a pass uses each layer's experts once, so every record it reads is the least
+    used around. RAM's LFRU then evicts, for it, a record of a layer the pass has yet
+    to reach. VRAM did the same to everything but its seeded experts (unseeded, not one
+    expert was in place when its layer ran, even on a second pass).
+  - Fix: `Ecache::set_scan_layer`. During a prefill at layer L, room in RAM comes from
+    layers below L first (done until the next pass). In VRAM, prefill does not admit
+    at all: misses go through one staging slot per device
+    (`DeviceExpertCache::get_transient`), and the decode hot set stays put.
+  - Same pass, RAM full: **3,230 reads (61 GB) instead of 11,058 (208 GB); 121.7 s
+    instead of 178.5 s (45.7 tok/s instead of 31.2)**. 10,364 of the 10,612 experts
+    resident at the start were still there when used.
+  - Where the time goes, profiled on a 148 s variant of the pass (no VRAM warm-up,
+    5,969 reads): expert fetch ~68 s (drive reads, and uploads of RAM-resident experts
+    over PCIe), expert compute ~30 s (GEMV-style FP4 kernels at ~3 TFLOPS), the rest
+    ~50 s. In the 122 s pass the fetch share is ~40 s (3,230 reads, ~31 s of drive
+    time, plus ~10 s of uploads); compute and the rest are the same.
+- **The usage profile no longer shrinks.** The server rewrote `expert_usage.txt` after
+  every request with only that process's (aged) VRAM counts. A short session replaced
+  what longer ones had learned: the RAM warm-up fell from 7,596 queued experts to 850.
+  The model now counts every routed expert it runs (prompt and reply) and merges the
+  counts into the file, older counts halving every 200,000 tokens.
+- **Token by token vs layered, re-measured with the fixed pass** (RAM full): layered
+  1,000 tokens in 43.1 s, 2,000 in 65.8 s (about 20 s + 23 ms a token); token by token
+  at its warm best 69 ms a token (much slower on a new topic). They cross near 450
+  tokens, so `nrob-server --step-below` now defaults to 512 (was 2,048).
+- **Prompt tokens fed one by one skip the output head** (`GpuModel::advance_with`):
+  warm, 13.98 → 14.54 tok/s (3 ms a token); only the last prompt token needs logits.
 - **VRAM frequency aging:** the VRAM cache halves its usage counts every 128 decode
   tokens, and a saved profile seeds at most 64.
   - Before, the seeded counts from an old profile (median 47, max 11,512) kept the
@@ -542,6 +574,10 @@ Each phase ends in something measurable. Effort figures are rough.
   continuation, checkpoints, layered prefill, the OpenAI-compatible server.
 - **G — vision (done, 2026-09-19; see Status, "Vision").**
 - **F — next.**
+  - Prefill: a bf16 tensor-core GEMM for routed and shared experts and the trunk
+    projections (FP4 and FP8 values, and their power-of-two scales, are exact in bf16,
+    so only fp32 summation order changes); overlap uploads with compute on a copy
+    stream; choose token-by-token vs layered by measured cost, not a fixed threshold.
   - A longer oracle golden (≥2K tokens) to verify long contexts.
   - Stripe the SSD-tier experts over both drives.
   - CUDA graphs for decode, then DSpark speculation.

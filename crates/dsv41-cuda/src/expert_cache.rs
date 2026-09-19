@@ -10,6 +10,12 @@
 //! order alone guarantees the upload lands before the kernels that read it,
 //! and that no kernel still reading a victim's bytes is overtaken by the
 //! upload that replaces them (both happen on one stream, in issue order).
+//!
+//! A prefill does not admit: it uses each of a pass's experts once, so its
+//! misses go through one staging slot ([`DeviceExpertCache::get_transient`])
+//! and leave the decode hot set alone. (Admitting them evicted, measured,
+//! every uploaded expert before its next use and much of the warm set: a
+//! pass over 13.6K experts found none of an unseeded cache's in place.)
 
 use std::collections::HashMap;
 
@@ -53,6 +59,8 @@ struct Slot {
 
 pub struct DeviceExpertCache {
     pool: CudaSlice<u8>,
+    /// One record for prefill's misses (see `get_transient`).
+    stage: CudaSlice<u8>,
     record: usize,
     slots: Vec<Slot>,
     index: HashMap<(u32, u32), usize>,
@@ -72,6 +80,7 @@ impl DeviceExpertCache {
     pub fn new(g: &Gpu, slots: usize, record: usize) -> Result<DeviceExpertCache> {
         Ok(DeviceExpertCache {
             pool: g.zeros::<u8>(slots.max(1) * record)?,
+            stage: g.zeros::<u8>(record)?,
             record,
             slots: (0..slots).map(|_| Slot { key: None, freq: 0, last: 0, batch: 0 }).collect(),
             index: HashMap::with_capacity(slots),
@@ -125,6 +134,21 @@ impl DeviceExpertCache {
         let lease = host.acquire(layer, expert, store)?;
         let i = self.place(g, (layer, expert), &lease)?;
         Ok(self.view(i))
+    }
+
+    /// Prefill's access: the resident slot on a hit, else the record from
+    /// the host cache (or the drive) in the staging slot, for this one use;
+    /// the cache itself is left as it was. The staging slot is reused by the
+    /// next call: stream order puts that upload after the kernels issued on
+    /// this one.
+    pub fn get_transient(&mut self, g: &Gpu, layer: u32, expert: u32, host: &Ecache, store: &dyn WeightStore) -> Result<CudaView<'_, u8>> {
+        if let Some(i) = self.touch(layer, expert) {
+            return Ok(self.view(i));
+        }
+        let lease = host.acquire(layer, expert, store)?;
+        cu(g.stream.memcpy_htod(&*lease, &mut self.stage.slice_mut(..)))?;
+        self.stats.bytes_uploaded += self.record as u64;
+        Ok(self.stage.slice(..))
     }
 
     /// Decode-time lookup that never uploads: the slot on a hit (pinned for

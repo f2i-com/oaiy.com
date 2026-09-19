@@ -161,6 +161,10 @@ No downloads are needed for `cargo test --workspace`:
   - A ≥2K-token oracle golden, to verify long contexts.
   - Striping the SSD tier over both drives (the drive throttles to 0.5 GB/s).
   - CUDA graphs for the decode step (launch overhead is ~10 ms of a ~35 ms token).
+  - Prefill: bf16 tensor-core GEMMs (expert compute is ~30 s of a 122 s pass at
+    ~3 TFLOPS), upload/compute overlap, and a cost-based choice between token-by-token
+    and layered prefill (the fixed 512-token threshold is a measured average; the
+    right one depends on how warm the caches are).
 - **GGUF:**
   - Expert streaming for more MoE architectures (Gemma 4 MoE, Qwen3.5-MoE).
   - Hybrid CPU experts on the GGUF path.

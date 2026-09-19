@@ -178,6 +178,44 @@ pub struct Profile {
     pub head: f64,
 }
 
+/// Tokens over which a saved usage profile's older counts halve (see
+/// [`GpuModel::save_usage`]).
+pub const USAGE_HALF_LIFE: u64 = 200_000;
+
+/// `layer expert count` lines of a usage profile.
+fn parse_usage(text: &str) -> impl Iterator<Item = (usize, usize, u64)> + '_ {
+    text.lines().filter(|l| !l.starts_with('#')).filter_map(|line| {
+        let v: Vec<u64> = line.split_whitespace().filter_map(|s| s.parse().ok()).collect();
+        match v[..] {
+            [l, e, n] => Some((l as usize, e as usize, n)),
+            _ => None,
+        }
+    })
+}
+
+/// Count each token's routed experts of layer `l` into `usage`.
+fn note_usage(usage: &mut [u32], n_exp: usize, l: usize, routes: &[Route]) {
+    for r in routes {
+        for &e in &r.experts {
+            let c = &mut usage[l * n_exp + e as usize];
+            *c = c.saturating_add(1);
+        }
+    }
+}
+
+/// Where a layered pass's routed experts came from, counted without
+/// synchronizing (for benchmarks): experts used (distinct (layer, expert)
+/// pairs), how many of them were in VRAM or RAM when the pass began and
+/// when their layer ran, and the records read from the drive meanwhile.
+#[derive(Clone, Debug, Default)]
+pub struct PassStats {
+    pub used: usize,
+    pub resident_at_start: usize,
+    pub resident_at_use: usize,
+    pub vram_at_use: usize,
+    pub reads: u64,
+}
+
 /// A decode step's experts on the CPU: none, still to run on this thread
 /// (profiling, so their time is their own), or already handed to the CPU
 /// pool, whose rows the reduction reads from the device's hand-off.
@@ -337,6 +375,12 @@ pub struct GpuModel {
     image_mask: Vec<bool>,
     /// Images for [`Backbone::forward_traced`] (whose signature has none).
     trace_images: Vec<ImageSpan>,
+    /// The last layered pass's expert sources.
+    pass_stats: PassStats,
+    /// Routed-expert uses since the profile was last saved, `[layer][expert]`,
+    /// and the tokens they came from.
+    usage: Vec<u32>,
+    usage_tokens: u64,
     // cross-layer hand-offs (reference SharedAttentionRuntime)
     shared: Shared,
     compress_src: Option<usize>,
@@ -518,6 +562,9 @@ impl GpuModel {
             vision,
             image_mask: Vec::new(),
             trace_images: Vec::new(),
+            pass_stats: PassStats::default(),
+            usage: vec![0; cfg.n_layers * cfg.n_routed_experts],
+            usage_tokens: 0,
             shared: Shared::default(),
             compress_src: None,
             index_k_src: None,
@@ -548,14 +595,29 @@ impl GpuModel {
     /// Write how often each routed expert has been used (every device's
     /// counts, one `layer expert count` line each) for [`warm`](Self::warm)
     /// to start a later run from.
-    pub fn save_usage(&self, path: &Path) -> Result<()> {
-        let mut ents: Vec<((u32, u32), u64)> = self.devs.iter().flat_map(|d| d.dcache.usage()).collect();
-        ents.sort_unstable();
+    pub fn save_usage(&mut self, path: &Path) -> Result<()> {
+        // merged, not replaced: one short session must not erase what many
+        // longer ones learned (older counts fade over USAGE_HALF_LIFE tokens)
+        let n_exp = self.cfg.n_routed_experts;
+        let decay = 0.5f64.powf(self.usage_tokens as f64 / USAGE_HALF_LIFE as f64);
+        let mut counts: Vec<f64> = self.usage.iter().map(|&c| f64::from(c)).collect();
+        if let Ok(old) = std::fs::read_to_string(path) {
+            for (l, e, n) in parse_usage(&old) {
+                if l < self.cfg.n_layers && e < n_exp {
+                    counts[l * n_exp + e] += n as f64 * decay;
+                }
+            }
+        }
         let mut text = String::from("# dsv41 routed-expert usage: layer expert count\n");
-        for ((l, e), n) in ents {
-            text.push_str(&format!("{l} {e} {n}\n"));
+        for (i, &c) in counts.iter().enumerate() {
+            let n = c.round() as u64;
+            if n > 0 {
+                text.push_str(&format!("{} {} {n}\n", i / n_exp, i % n_exp));
+            }
         }
         std::fs::write(path, text)?;
+        self.usage.fill(0);
+        self.usage_tokens = 0;
         Ok(())
     }
 
@@ -570,16 +632,9 @@ impl GpuModel {
     /// Returns (records now in VRAM, records queued for the host cache).
     pub fn warm(&mut self, path: &Path, threads: usize) -> Result<(usize, usize)> {
         let text = std::fs::read_to_string(path)?;
-        let (n_layers, n_experts) = (self.cfg.n_layers as u32, self.cfg.n_routed_experts as u32);
-        let mut ents: Vec<(u64, u32, u32)> = Vec::new();
-        for line in text.lines().filter(|l| !l.starts_with('#') && !l.trim().is_empty()) {
-            let v: Vec<u64> = line.split_whitespace().filter_map(|s| s.parse().ok()).collect();
-            if let [l, e, n] = v[..] {
-                if l < n_layers as u64 && e < n_experts as u64 {
-                    ents.push((n, l as u32, e as u32));
-                }
-            }
-        }
+        let (n_layers, n_experts) = (self.cfg.n_layers, self.cfg.n_routed_experts);
+        let mut ents: Vec<(u64, u32, u32)> =
+            parse_usage(&text).filter(|&(l, e, _)| l < n_layers && e < n_experts).map(|(l, e, n)| (n, l as u32, e as u32)).collect();
         ents.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
 
         // each device's share: the hottest of its layers, up to its slots
@@ -697,6 +752,14 @@ impl GpuModel {
         self.run(ids, start_pos, None, None, &[])
     }
 
+    /// Run `ids` at `start_pos` for their effect on the state only: no final
+    /// norm, output head or logits download. A prompt fed token by token
+    /// needs logits only from its last token; the head (a 129K-row GEMV and
+    /// a device-to-host copy) is wasted on every other one.
+    pub fn advance_with(&mut self, ids: &[u32], start_pos: usize, images: &[ImageSpan]) -> Result<()> {
+        self.run_as(ids, start_pos, None, None, images, false).map(|_| ())
+    }
+
     /// [`forward`](Self::forward) over a stretch that may hold image tokens
     /// (the spans need not lie inside it, nor start at 0).
     pub fn forward_with(&mut self, ids: &[u32], start_pos: usize, images: &[ImageSpan]) -> Result<Vec<f32>> {
@@ -707,6 +770,12 @@ impl GpuModel {
     /// ([`Backbone::forward_traced`]) run with.
     pub fn set_trace_images(&mut self, images: Vec<ImageSpan>) {
         self.trace_images = images;
+    }
+
+    /// Where the last [`prefill_layered`](Self::prefill_layered) pass's
+    /// routed experts came from.
+    pub fn pass_stats(&self) -> &PassStats {
+        &self.pass_stats
     }
 
     /// Whether the vision tower is loaded ([`GpuOptions::vision`] and a
@@ -766,6 +835,7 @@ impl GpuModel {
         let mask: Vec<bool> = img_rows.iter().map(Option::is_some).collect();
         let any_image = mask.contains(&true);
         self.image_mask.clear();
+        self.usage_tokens += t as u64;
         let hashes = self.hasher.forward_masked(ids, start_pos, any_image.then_some(&mask[..]))?;
         let mut h_host = vec![0.0f32; t * HC * d];
         for (i, &id) in ids.iter().enumerate() {
@@ -801,6 +871,17 @@ impl GpuModel {
                 })
             })
             .collect();
+
+        // which experts VRAM or RAM hold as the pass begins
+        let n_exp = self.cfg.n_routed_experts;
+        let start_resident: Vec<bool> = (0..self.cfg.n_layers * n_exp)
+            .map(|i| {
+                let (l, e) = ((i / n_exp) as u32, (i % n_exp) as u32);
+                self.devs[self.layers[l as usize].dev].dcache.contains(l, e) || self.cache.probe(l, e)
+            })
+            .collect();
+        let reads0 = self.cache.stats().misses;
+        let mut ps = PassStats::default();
 
         let subs: Vec<(usize, usize)> = (0..t).step_by(sub).map(|a| (a, (a + sub).min(t))).collect();
         // the lists index layers hand to later layers, per sub-chunk
@@ -856,6 +937,17 @@ impl GpuModel {
             let Dev { g, dcache, .. } = &mut self.devs[self.cur];
             let logits = g.download(&ly.gate.forward(g, &x2_all.as_view(), t, Out::F32)?)?;
             let routes = route_mixed(&self.cfg, &logits, &ly.bias, image_bias(ly, &mask), t);
+            note_usage(&mut self.usage, n_exp, l, &routes);
+            let mut used: Vec<u32> = routes.iter().flat_map(|r| r.experts.iter().copied()).collect();
+            used.sort_unstable();
+            used.dedup();
+            for &e in &used {
+                ps.used += 1;
+                ps.resident_at_start += usize::from(start_resident[l * n_exp + e as usize]);
+                let in_vram = dcache.contains(l as u32, e);
+                ps.vram_at_use += usize::from(in_vram);
+                ps.resident_at_use += usize::from(in_vram || self.cache.probe(l as u32, e));
+            }
             let prof = self.profile.is_some();
             let (y, fetch, experts) = routed_sum(g, dcache, &self.cache, self.store.as_ref(), l, &x2_all.as_view(), t, &routes, lim, prof)?;
             if let Some(p) = self.profile.as_mut() {
@@ -884,6 +976,9 @@ impl GpuModel {
             // the ffn mix is the next layer's pre-mix
             std::mem::swap(&mut pre_host, &mut mix_host);
         }
+
+        ps.reads = self.cache.stats().misses - reads0;
+        self.pass_stats = ps;
 
         // the last token through the final norm and the head
         let out_dev = self.devs.len() - 1;
@@ -940,11 +1035,17 @@ impl GpuModel {
     }
 
     fn run(&mut self, ids: &[u32], start_pos: usize, teacher: Option<Teacher<'_>>, trace: Option<Trace<'_>>, images: &[ImageSpan]) -> Result<Vec<f32>> {
+        self.run_as(ids, start_pos, teacher, trace, images, true)
+    }
+
+    /// [`run`](Self::run); `logits: false` stops after the last layer (no
+    /// final norm, head or download) and returns nothing.
+    fn run_as(&mut self, ids: &[u32], start_pos: usize, teacher: Option<Teacher<'_>>, trace: Option<Trace<'_>>, images: &[ImageSpan], logits: bool) -> Result<Vec<f32>> {
         let prefill = ids.len() > 1;
         if prefill {
             self.demand.prefill.store(true, std::sync::atomic::Ordering::Relaxed);
         }
-        let out = self.run_inner(ids, start_pos, teacher, trace, images);
+        let out = self.run_inner(ids, start_pos, teacher, trace, images, logits);
         if prefill {
             self.demand.prefill.store(false, std::sync::atomic::Ordering::Relaxed);
         } else {
@@ -956,7 +1057,7 @@ impl GpuModel {
         out
     }
 
-    fn run_inner(&mut self, ids: &[u32], start_pos: usize, teacher: Option<Teacher<'_>>, mut trace: Option<Trace<'_>>, images: &[ImageSpan]) -> Result<Vec<f32>> {
+    fn run_inner(&mut self, ids: &[u32], start_pos: usize, teacher: Option<Teacher<'_>>, mut trace: Option<Trace<'_>>, images: &[ImageSpan], want_logits: bool) -> Result<Vec<f32>> {
         let (d, t) = (self.cfg.dim, ids.len());
         if t == 0 || start_pos + t > self.max_seq {
             return Err(Error::Arg(format!("{t} tokens at {start_pos}: past max_seq {}", self.max_seq)));
@@ -966,6 +1067,7 @@ impl GpuModel {
         let any_image = mask.contains(&true);
         // the router (moe) reads it; set before anything can fail half-way
         self.image_mask = if any_image { mask.clone() } else { Vec::new() };
+        self.usage_tokens += t as u64;
         let hashes = self.hasher.forward_masked(ids, start_pos, any_image.then_some(&mask[..]))?;
         let mut emb = vec![0.0f32; t * d];
         for (i, &id) in ids.iter().enumerate() {
@@ -1037,6 +1139,12 @@ impl GpuModel {
                 tr(&format!("layer{l:02}.out"), &self.devs[self.cur].g.download(&h)?);
                 tr(&format!("layer{l:02}.pre_mix"), &self.pre_of(&pre_mix)?);
             }
+        }
+        if !want_logits {
+            if let Some(p) = self.profile.as_mut() {
+                p.forwards += 1;
+            }
+            return Ok(Vec::new());
         }
 
         let out_dev = self.devs.len() - 1;
@@ -1427,6 +1535,7 @@ impl GpuModel {
             (g.download(&ly.gate.forward(g, &x.as_view(), t, Out::F32)?)?, None)
         };
         let routes = route_mixed(&self.cfg, &logits, &ly.bias, image_bias(ly, &self.image_mask), t);
+        note_usage(&mut self.usage, n_exp, l, &routes);
         let prof = self.profile.is_some();
         let elapsed = |t0: Option<Instant>| -> Result<f64> {
             match t0 {
@@ -1629,6 +1738,16 @@ fn routed_sum(
     prof: bool,
 ) -> Result<(CudaSlice<f32>, f64, f64)> {
     let (mut fetch, mut compute) = (0.0, 0.0);
+    // a prefill uses each layer's experts once per pass: the RAM tier makes
+    // room from the layers already done, not from the ones coming up
+    struct Scan<'a>(&'a Ecache);
+    impl Drop for Scan<'_> {
+        fn drop(&mut self) {
+            self.0.set_scan_layer(None);
+        }
+    }
+    host.set_scan_layer(Some(l as u32));
+    let _scan = Scan(host);
     let mut y = g.zeros::<f32>(t * DIM)?;
     let mut used: Vec<u32> = routes.iter().flat_map(|r| r.experts.iter().copied()).collect();
     used.sort_unstable();
@@ -1687,20 +1806,26 @@ fn compute_experts(
             None => Ok(0.0),
         }
     };
-    for &e in used {
-        let (mut toks, mut ws) = (Vec::new(), Vec::new());
-        for (i, r) in routes.iter().enumerate() {
-            if let Some(k) = r.experts.iter().position(|&x| x == e) {
-                toks.push(i as i32);
-                ws.push(r.weights[k]);
-            }
+    // every expert's tokens (in token order) and weights, in one pass
+    let mut slot = std::collections::HashMap::with_capacity(used.len());
+    for (i, &e) in used.iter().enumerate() {
+        slot.insert(e, i);
+    }
+    let mut buckets: Vec<(Vec<i32>, Vec<f32>)> = vec![(Vec::new(), Vec::new()); used.len()];
+    for (i, r) in routes.iter().enumerate() {
+        for (&e, &w) in r.experts.iter().zip(&r.weights) {
+            let b = &mut buckets[slot[&e]];
+            b.0.push(i as i32);
+            b.1.push(w);
         }
+    }
+    for (&e, (toks, ws)) in used.iter().zip(buckets) {
         let tf = if prof { g.sync()?; Some(Instant::now()) } else { None };
         // each prefill expert is its own batch: its kernels are issued
         // before the next fetch, and one stream orders that fetch's
         // upload after them, so only the slot in use needs pinning
         dcache.begin_batch();
-        let rec = dcache.get(g, l as u32, e, host, store)?;
+        let rec = dcache.get_transient(g, l as u32, e, host, store)?;
         *fetch += elapsed(tf)?;
         let tc = if prof { Some(Instant::now()) } else { None };
         let nt = toks.len();

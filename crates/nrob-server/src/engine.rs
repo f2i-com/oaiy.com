@@ -257,7 +257,17 @@ impl Engine {
                     // path, whose experts mostly sit in VRAM and RAM
                     let end = pos + left.min(256);
                     for p in pos..end {
-                        logits = self.model.forward_with(&prompt[p..p + 1], p, &spans)?;
+                        if job.cancel.load(Ordering::Relaxed) {
+                            // the state is whole up to p: keep it
+                            let _ = job.events.send(Event::Done { finish: Finish::Stop, completion_tokens: 0 });
+                            return Ok(());
+                        }
+                        // only the prompt's last token needs logits
+                        if p + 1 == prompt.len() {
+                            logits = self.model.forward_with(&prompt[p..p + 1], p, &spans)?;
+                        } else {
+                            self.model.advance_with(&prompt[p..p + 1], p, &spans)?;
+                        }
                         self.tokens.push(keys[p]);
                     }
                     (end, "token by token")

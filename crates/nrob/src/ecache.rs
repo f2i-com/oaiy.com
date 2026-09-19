@@ -15,6 +15,14 @@
 //! cache holds no more records than the draw size, every record is
 //! considered.
 //!
+//! **Passes.** A prefill runs the layers in order and uses each layer's
+//! experts once, so a record it reads is the least used one around, and
+//! plain LFRU evicts, for it, a record of a layer the pass has yet to reach:
+//! the pass eats its own future (measured on DeepSeek-V4.1: a full RAM tier
+//! served 2.6K of the 10.2K records it held that a 5.6K-token prompt
+//! needed). [`Ecache::set_scan_layer`] tells the cache where a pass is;
+//! victims then come from the layers below it first.
+//!
 //! **Leases.** [`Ecache::acquire`] hands out a [`HostLease`], a shared
 //! handle to the record's immutable bytes. A hit copies nothing, and a
 //! record with a live lease is never chosen for eviction, so a caller can
@@ -119,6 +127,8 @@ struct Book {
     rng: u64,
     stats: CacheStats,
     spare: Vec<Vec<u8>>,
+    /// A pass through the layers is at this one (see `set_scan_layer`).
+    scan: Option<u32>,
 }
 
 impl Book {
@@ -145,6 +155,15 @@ impl Book {
             .min()
             .map(|(_, k)| k)
         };
+        if let Some(floor) = self.scan {
+            // the layers below the pass are done with until the next pass;
+            // the rest are about to be used (a full scan: a pass evicts a few
+            // thousand times, against minutes of reading)
+            let mut done = self.resident.iter().copied().filter(|k| k.0 < floor);
+            if let Some(k) = lowest(self, &mut done) {
+                return Some(k);
+            }
+        }
         if n > SAMPLES {
             let mut draw = [(0, 0); SAMPLES];
             for d in &mut draw {
@@ -232,6 +251,7 @@ impl Ecache {
                 rng: 0x9E37_79B9_7F4A_7C15,
                 stats: CacheStats::default(),
                 spare: Vec::new(),
+                scan: None,
             }),
             read_done: Condvar::new(),
             rec_bytes,
@@ -333,6 +353,14 @@ impl Ecache {
         Ok(())
     }
 
+    /// A pass through the layers in order (a prefill) is at `layer`; `None`
+    /// when it ends. Meanwhile room is made from the layers below it first,
+    /// which the pass is done with, instead of from the records it is about
+    /// to use; the usual policy applies when none of those can go.
+    pub fn set_scan_layer(&self, layer: Option<u32>) {
+        self.book().scan = layer;
+    }
+
     /// The record for `(layer, expert)`, read through `store` on a miss.
     pub fn acquire(&self, layer: u32, expert: u32, store: &dyn WeightStore) -> Result<HostLease> {
         let key = (layer, expert);
@@ -431,6 +459,53 @@ impl Ecache {
             g.publish(key, Arc::new(record));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod scan_tests {
+    use super::*;
+
+    struct Store;
+    impl WeightStore for Store {
+        fn record_bytes(&self) -> usize {
+            4
+        }
+        fn shape(&self) -> (u32, u32) {
+            (8, 8)
+        }
+        fn fetch(&self, layer: u32, expert: u32, dst: &mut [u8]) -> Result<()> {
+            dst.copy_from_slice(&[layer as u8, expert as u8, 0, 0]);
+            Ok(())
+        }
+    }
+
+    /// A pass over layers 0..4, three experts each, through a full cache
+    /// holding two of each layer's: with the scan hint room comes from the
+    /// layers done, so only layer 0's miss (nothing is done yet) costs a
+    /// record the pass needs later; without it, every miss does.
+    #[test]
+    fn a_pass_keeps_the_records_it_is_about_to_use() {
+        let run = |hint: bool| {
+            let c = Ecache::new(8 * 4, 4, CachePolicy::Lfru);
+            // resident before the pass: two experts of every layer
+            for l in 0..4 {
+                for e in 0..2 {
+                    c.acquire(l, e, &Store).unwrap();
+                }
+            }
+            let before = c.stats();
+            for l in 0..4 {
+                c.set_scan_layer(hint.then_some(l));
+                for e in 0..3 {
+                    c.acquire(l, e, &Store).unwrap();
+                }
+            }
+            c.set_scan_layer(None);
+            c.stats().hits - before.hits
+        };
+        assert_eq!(run(true), 7);
+        assert_eq!(run(false), 2);
     }
 }
 
