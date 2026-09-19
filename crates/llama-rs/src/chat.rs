@@ -1,0 +1,326 @@
+//! Chat-template helpers for instruction-tuned models.
+//!
+//! Each supported architecture has its own role-marker convention. This module
+//! formats `[ChatMessage]` into the raw string that the model's tokenizer can
+//! then encode. We hard-code the standard format per arch family rather than
+//! parse the GGUF's Jinja `tokenizer.chat_template` — the per-arch formats are
+//! stable enough that hard-coding gives us reliable results without dragging
+//! in a Jinja interpreter.
+//!
+//! For unrecognized architectures, falls back to a simple `role: content`
+//! concatenation that won't match any specific instruct format but is at least
+//! deterministic.
+
+use crate::Architecture;
+
+#[derive(Debug, Clone)]
+pub struct ChatMessage {
+    pub role:    Role,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    System,
+    User,
+    Assistant,
+}
+
+impl Role {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::System    => "system",
+            Self::User      => "user",
+            Self::Assistant => "assistant",
+        }
+    }
+}
+
+impl ChatMessage {
+    pub fn system(content: impl Into<String>)    -> Self { Self { role: Role::System,    content: content.into() } }
+    pub fn user(content: impl Into<String>)      -> Self { Self { role: Role::User,      content: content.into() } }
+    pub fn assistant(content: impl Into<String>) -> Self { Self { role: Role::Assistant, content: content.into() } }
+}
+
+/// Format `messages` into the raw prompt string for `arch`. When `add_assistant`
+/// is true (the typical case for inference), appends an open assistant turn so
+/// the model continues from there.
+///
+/// The returned string is meant to be passed straight to the model's tokenizer.
+/// BOS handling: each per-arch format includes the BOS marker as a string the
+/// tokenizer will recognize. Pass `add_bos=false` when calling the encoder
+/// (or strip the leading BOS yourself) to avoid double-BOS.
+pub fn apply_chat_template(arch: &Architecture, messages: &[ChatMessage], add_assistant: bool) -> String {
+    match arch {
+        // Gemma 3 and 3n share the `<start_of_turn>` / `<end_of_turn>` format.
+        Architecture::Gemma3 | Architecture::Gemma3n => gemma3_template(messages, add_assistant),
+        // Gemma 4 introduced new `<|turn>` / `<turn|>` markers.
+        Architecture::Gemma4 => gemma4_template(messages, add_assistant),
+        Architecture::Qwen2 => chatml_template(messages, add_assistant, false),
+        // Qwen3 ships with "thinking mode" enabled by default. To get a normal
+        // (non-thinking) chat response, the official template appends
+        // `<think>\n\n</think>\n\n` after the assistant turn opener — that
+        // satisfies the model's expectation that thinking has already happened.
+        Architecture::Qwen3 => chatml_template(messages, add_assistant, true),
+        // Qwen3.5 reuses ChatML (`<|im_start|>...<|im_end|>`) but introduced
+        // a thinking-channel wrapper that we don't emit by default, so the
+        // simple no-thinking ChatML form works as the default chat template.
+        Architecture::Qwen35 | Architecture::Qwen3Moe | Architecture::Qwen3VlMoe |
+        Architecture::Qwen35Moe | Architecture::Qwen36MoeVl =>
+            chatml_template(messages, add_assistant, false),
+        Architecture::Llama => llama3_template(messages, add_assistant),
+        Architecture::Mistral => mistral_template(messages, add_assistant),
+        Architecture::Unsupported(_) => fallback_template(messages, add_assistant),
+    }
+}
+
+/// Gemma 3 / Gemma 2 turn-based format. Notes:
+///   * Gemma uses "model" instead of "assistant" for the model role.
+///   * No system role; system messages get prepended to the first user turn.
+///   * `<bos>` at the start (the tokenizer's BOS will tokenize this).
+fn gemma3_template(messages: &[ChatMessage], add_assistant: bool) -> String {
+    let mut out = String::with_capacity(messages.iter().map(|m| m.content.len()).sum::<usize>() + 64);
+    out.push_str("<bos>");
+
+    // Coalesce a leading system message into the first user message, since
+    // Gemma's chat template doesn't have a separate system turn.
+    let mut pending_system: Option<&str> = None;
+    for m in messages {
+        match m.role {
+            Role::System => pending_system = Some(&m.content),
+            Role::User => {
+                out.push_str("<start_of_turn>user\n");
+                if let Some(sys) = pending_system.take() {
+                    out.push_str(sys);
+                    out.push_str("\n\n");
+                }
+                out.push_str(&m.content);
+                out.push_str("<end_of_turn>\n");
+            }
+            Role::Assistant => {
+                out.push_str("<start_of_turn>model\n");
+                out.push_str(&m.content);
+                out.push_str("<end_of_turn>\n");
+            }
+        }
+    }
+    if add_assistant {
+        out.push_str("<start_of_turn>model\n");
+    }
+    out
+}
+
+/// Gemma 4 chat format. New marker scheme vs Gemma 3:
+///   * `<|turn>{role}\n{content}<turn|>\n` per message.
+///   * Role for assistant is `model`. System messages get their own turn (not
+///     coalesced into the user turn like Gemma 3 / 3n).
+///   * `<bos>` at the start.
+fn gemma4_template(messages: &[ChatMessage], add_assistant: bool) -> String {
+    let mut out = String::with_capacity(messages.iter().map(|m| m.content.len()).sum::<usize>() + 128);
+    out.push_str("<bos>");
+    for m in messages {
+        let role = match m.role {
+            Role::System    => "system",
+            Role::User      => "user",
+            Role::Assistant => "model",
+        };
+        out.push_str("<|turn>");
+        out.push_str(role);
+        out.push('\n');
+        out.push_str(&m.content);
+        out.push_str("<turn|>\n");
+    }
+    if add_assistant {
+        out.push_str("<|turn>model\n");
+    }
+    out
+}
+
+/// ChatML format used by Qwen 2 / Qwen 3 / many other modern instruct models.
+///   * System messages get their own turn.
+///   * `<|im_start|>{role}\n{content}<|im_end|>\n` per message.
+///
+/// `skip_thinking`: appends `<think>\n\n</think>\n\n` after the assistant turn
+/// opener — required for Qwen3 (which has thinking mode on by default) to
+/// produce a normal direct response.
+fn chatml_template(messages: &[ChatMessage], add_assistant: bool, skip_thinking: bool) -> String {
+    let mut out = String::with_capacity(messages.iter().map(|m| m.content.len()).sum::<usize>() + 64);
+    for m in messages {
+        out.push_str("<|im_start|>");
+        out.push_str(m.role.as_str());
+        out.push('\n');
+        out.push_str(&m.content);
+        out.push_str("<|im_end|>\n");
+    }
+    if add_assistant {
+        out.push_str("<|im_start|>assistant\n");
+        if skip_thinking {
+            out.push_str("<think>\n\n</think>\n\n");
+        }
+    }
+    out
+}
+
+/// Llama 3 instruct format with header_id markers.
+///   * `<|begin_of_text|>` at the start.
+///   * `<|start_header_id|>{role}<|end_header_id|>\n\n{content}<|eot_id|>` per message.
+fn llama3_template(messages: &[ChatMessage], add_assistant: bool) -> String {
+    let mut out = String::with_capacity(messages.iter().map(|m| m.content.len()).sum::<usize>() + 128);
+    out.push_str("<|begin_of_text|>");
+    for m in messages {
+        out.push_str("<|start_header_id|>");
+        out.push_str(m.role.as_str());
+        out.push_str("<|end_header_id|>\n\n");
+        out.push_str(&m.content);
+        out.push_str("<|eot_id|>");
+    }
+    if add_assistant {
+        out.push_str("<|start_header_id|>assistant<|end_header_id|>\n\n");
+    }
+    out
+}
+
+/// Mistral / Llama 2 `[INST] ... [/INST]` format.
+///   * No system role; system messages get prepended to the first user turn.
+///   * `<s>[INST] {user} [/INST] {assistant}</s>` per turn pair.
+fn mistral_template(messages: &[ChatMessage], add_assistant: bool) -> String {
+    let mut out = String::with_capacity(messages.iter().map(|m| m.content.len()).sum::<usize>() + 64);
+    out.push_str("<s>");
+
+    let mut pending_system: Option<&str> = None;
+    let mut i = 0;
+    while i < messages.len() {
+        let m = &messages[i];
+        match m.role {
+            Role::System => { pending_system = Some(&m.content); i += 1; }
+            Role::User => {
+                out.push_str("[INST] ");
+                if let Some(sys) = pending_system.take() {
+                    out.push_str(sys);
+                    out.push_str("\n\n");
+                }
+                out.push_str(&m.content);
+                out.push_str(" [/INST]");
+                i += 1;
+            }
+            Role::Assistant => {
+                out.push(' ');
+                out.push_str(&m.content);
+                out.push_str("</s>");
+                if i + 1 < messages.len() && matches!(messages[i + 1].role, Role::User) {
+                    out.push_str("<s>");
+                }
+                i += 1;
+            }
+        }
+    }
+    let _ = add_assistant; // open turn is implicit after [/INST] in this format
+    out
+}
+
+/// Stop tokens that signal "the assistant turn is over" for each arch's chat
+/// format. These are in addition to the tokenizer's regular EOS — many chat
+/// models emit a turn marker (`<end_of_turn>`, `<|im_end|>`, `<|eot_id|>`)
+/// rather than the global EOS to end an assistant response.
+///
+/// Returns the literal token strings; pair with `Tokenizer::token_id()` to
+/// resolve them in the model's vocabulary.
+pub fn chat_stop_tokens(arch: &Architecture) -> &'static [&'static str] {
+    match arch {
+        Architecture::Gemma3 | Architecture::Gemma3n => &["<end_of_turn>"],
+        Architecture::Gemma4 => &["<turn|>"],
+        Architecture::Qwen2 | Architecture::Qwen3 | Architecture::Qwen35 |
+        Architecture::Qwen3Moe | Architecture::Qwen3VlMoe |
+        Architecture::Qwen35Moe | Architecture::Qwen36MoeVl => &["<|im_end|>"],
+        Architecture::Llama => &["<|eot_id|>", "<|end_of_text|>"],
+        Architecture::Mistral => &["</s>"],
+        Architecture::Unsupported(_) => &[],
+    }
+}
+
+/// Generic fallback for unknown architectures. Just dumps role: content per line.
+fn fallback_template(messages: &[ChatMessage], add_assistant: bool) -> String {
+    let mut out = String::new();
+    for m in messages {
+        out.push_str(m.role.as_str());
+        out.push_str(": ");
+        out.push_str(&m.content);
+        out.push('\n');
+    }
+    if add_assistant {
+        out.push_str("assistant: ");
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gemma3_simple_user_assistant() {
+        let msgs = [ChatMessage::user("Hi"), ChatMessage::assistant("Hello!")];
+        let out = apply_chat_template(&Architecture::Gemma3, &msgs, true);
+        assert_eq!(
+            out,
+            "<bos><start_of_turn>user\nHi<end_of_turn>\n<start_of_turn>model\nHello!<end_of_turn>\n<start_of_turn>model\n"
+        );
+    }
+
+    #[test]
+    fn gemma3_coalesces_system_into_user() {
+        let msgs = [ChatMessage::system("You are helpful."), ChatMessage::user("Hi")];
+        let out = apply_chat_template(&Architecture::Gemma3, &msgs, true);
+        // System content appears before the user content in the same turn.
+        assert!(out.contains("<start_of_turn>user\nYou are helpful.\n\nHi<end_of_turn>"));
+    }
+
+    #[test]
+    fn chatml_qwen2_basic() {
+        let msgs = [ChatMessage::system("S"), ChatMessage::user("U")];
+        let out = apply_chat_template(&Architecture::Qwen2, &msgs, true);
+        assert_eq!(
+            out,
+            "<|im_start|>system\nS<|im_end|>\n<|im_start|>user\nU<|im_end|>\n<|im_start|>assistant\n"
+        );
+    }
+
+    /// Qwen3 needs `<think>\n\n</think>\n\n` after the assistant opener so the
+    /// model treats this as a direct response (skip thinking mode).
+    #[test]
+    fn chatml_qwen3_skips_thinking() {
+        let msgs = [ChatMessage::user("U")];
+        let out = apply_chat_template(&Architecture::Qwen3, &msgs, true);
+        assert!(
+            out.ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"),
+            "got: {out:?}"
+        );
+    }
+
+    #[test]
+    fn llama3_header_ids() {
+        let msgs = [ChatMessage::user("Hello")];
+        let out = apply_chat_template(&Architecture::Llama, &msgs, true);
+        assert_eq!(
+            out,
+            "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\nHello<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+        );
+    }
+
+    #[test]
+    fn mistral_inst_brackets() {
+        let msgs = [ChatMessage::user("Hi")];
+        let out = apply_chat_template(&Architecture::Mistral, &msgs, true);
+        assert_eq!(out, "<s>[INST] Hi [/INST]");
+    }
+
+    #[test]
+    fn no_assistant_marker_when_disabled() {
+        let msgs = [ChatMessage::user("Hi")];
+        let out = apply_chat_template(&Architecture::Qwen2, &msgs, false);
+        assert!(!out.ends_with("<|im_start|>assistant\n"));
+        // Also: the Qwen3 thinking-skip block must not appear when add_assistant=false.
+        let out3 = apply_chat_template(&Architecture::Qwen3, &msgs, false);
+        assert!(!out3.contains("<think>"));
+    }
+}

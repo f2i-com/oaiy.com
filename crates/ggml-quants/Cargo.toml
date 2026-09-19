@@ -1,0 +1,15 @@
+[package]
+name        = "ggml-quants"
+version     = "0.0.1"
+edition     = "2021"
+license     = "MIT OR Apache-2.0"
+description = "Block quantization formats compatible with ggml / llama.cpp."
+
+[dependencies]
+bytemuck   = { version = "1.16", features = ["derive"] }
+half       = { version = "2.4", features = ["bytemuck", "num-traits"] }
+num-traits = "0.2"
+thiserror  = "1.0"
+
+[lints.rust]
+non_camel_case_types = "allow"

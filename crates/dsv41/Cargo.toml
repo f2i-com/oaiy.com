@@ -1,0 +1,11 @@
+[package]
+name = "dsv41"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "DeepSeek-V4.1 for nrob: in-place safetensors expert store, FP4/FP8 formats, forward pass"
+
+# std-only like the engine core (CONVENTIONS.md): the one dependency is nrob
+# itself, for WeightStore / Ecache / json / Error.
+[dependencies]
+nrob = { path = "../nrob" }

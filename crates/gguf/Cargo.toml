@@ -1,0 +1,15 @@
+[package]
+name        = "gguf"
+version     = "0.0.1"
+edition     = "2021"
+license     = "MIT OR Apache-2.0"
+description = "Pure-Rust GGUF v3 reader / writer."
+
+[dependencies]
+ggml-quants = { path = "../ggml-quants", version = "0.0.1" }
+byteorder   = "1.5"
+memmap2     = "0.9"
+thiserror   = "1.0"
+
+[dev-dependencies]
+tempfile = "3"

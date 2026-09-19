@@ -1,0 +1,25 @@
+# Build output
+/target
+
+# Model weights: never commit them
+*.gguf
+*.safetensors
+*.bin
+
+# Logs and scratch
+*.log
+
+# Python tooling (tools/dsv41)
+__pycache__/
+
+# Editor / IDE cruft
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS cruft
+.DS_Store
+Thumbs.db
+desktop.ini

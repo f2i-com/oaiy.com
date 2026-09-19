@@ -1,0 +1,15 @@
+NOTICE
+======
+
+nrob — NVMe · RAM · On-GPU · Broker
+Copyright 2026 F2i
+
+The crates under crates/nrob, crates/nrob-cli, crates/dsv41 and
+crates/dsv41-cuda are licensed under the Apache License, Version 2.0 (see
+LICENSE-APACHE).
+
+The crates under crates/gguf, crates/ggml-quants, crates/ggml-rs,
+crates/ggml-rs-cuda, crates/tokenizer, and crates/llama-rs are vendored
+from the author's own pure-Rust GGUF compute subsystem (see
+crates/VENDORED.md), licensed MIT OR Apache-2.0 (see LICENSE-MIT and
+LICENSE-APACHE).

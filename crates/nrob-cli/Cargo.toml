@@ -1,0 +1,28 @@
+[package]
+name = "nrob-cli"
+version = "0.7.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "nrob command line: run GGUF models, experts streamed NVMe -> RAM -> GPU"
+
+[[bin]]
+name = "nrob"
+path = "src/main.rs"
+
+# The nrob core plus the workspace's own GGUF stack (crates/VENDORED.md),
+# which carries its own dependencies.
+[dependencies]
+nrob = { path = "../nrob" }
+llama-rs = { path = "../llama-rs" }
+ggml-rs = { path = "../ggml-rs" }
+gguf = { path = "../gguf" }
+tokenizer = { path = "../tokenizer" }
+# CUDA backend for `nrob run --cuda`, behind the `cuda` feature. cudarc
+# links CUDA dynamically; the default build needs no CUDA toolchain.
+ggml-rs-cuda = { path = "../ggml-rs-cuda", optional = true }
+
+[features]
+default = []
+# GPU inference: `nrob run model.gguf --cuda`. Needs the CUDA toolkit at
+# build time.
+cuda = ["llama-rs/cuda", "dep:ggml-rs-cuda"]

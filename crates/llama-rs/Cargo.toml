@@ -1,0 +1,53 @@
+[package]
+name        = "llama-rs"
+version     = "0.0.1"
+edition     = "2021"
+license     = "MIT OR Apache-2.0"
+description = "Top-level pure-Rust LLM inference crate. Loads GGUF, runs Llama-family forward pass."
+
+[dependencies]
+gguf         = { path = "../gguf", version = "0.0.1" }
+ggml-quants  = { path = "../ggml-quants", version = "0.0.1" }
+ggml-rs      = { path = "../ggml-rs", version = "0.0.1" }
+ggml-rs-cuda = { path = "../ggml-rs-cuda", version = "0.0.1", optional = true }
+tokenizer    = { path = "../tokenizer", version = "0.0.1" }
+# VENDORED-LOCAL: streaming expert backend (src/expert_stream.rs) reuses
+# nrob's bounded expert cache (`Ecache`) and `WeightStore` seam. Workspace-
+# internal, no dependency cycle (nrob does not depend on llama-rs).
+nrob         = { path = "../nrob" }
+half         = { version = "2.4", features = ["bytemuck", "num-traits"] }
+image        = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+rayon        = "1.10"
+thiserror    = "1.0"
+
+[features]
+default = []
+cuda    = ["dep:ggml-rs-cuda"]
+
+[[example]]
+name = "inspect_gguf"
+path = "examples/inspect_gguf.rs"
+
+[[example]]
+name = "generate"
+path = "examples/generate.rs"
+
+[[example]]
+name = "inspect_mmproj"
+path = "examples/inspect_mmproj.rs"
+
+[[example]]
+name = "gemma_vlm"
+path = "examples/gemma_vlm.rs"
+
+[[example]]
+name = "probe_image_tokens"
+path = "examples/probe_image_tokens.rs"
+
+[[example]]
+name = "gemma4_vlm"
+path = "examples/gemma4_vlm.rs"
+
+[[example]]
+name = "inspect_qwen35"
+path = "examples/inspect_qwen35.rs"

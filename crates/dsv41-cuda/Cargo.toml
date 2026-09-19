@@ -1,0 +1,17 @@
+[package]
+name = "dsv41-cuda"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "CUDA path for DeepSeek-V4.1 on nrob: NVRTC kernels mirroring the dsv41 CPU reference"
+
+# Needs a CUDA toolchain at build time (cudarc dynamic-linking), so like
+# ggml-rs-cuda it is a workspace member but not a default member. cudarc's
+# version and features match ggml-rs-cuda's exactly so Cargo unifies them.
+# This crate holds the reviewed `unsafe` boundary for DeepSeek-V4.1 (kernel
+# launches, pinned device-mapped memory, the feature-checked AVX-512 call);
+# `dsv41` itself stays std-only with `forbid(unsafe_code)`.
+[dependencies]
+dsv41 = { path = "../dsv41" }
+nrob = { path = "../nrob" }
+cudarc = { version = "0.19", features = ["cuda-version-from-build-system", "driver", "nvrtc", "cublas", "dynamic-linking"], default-features = false }

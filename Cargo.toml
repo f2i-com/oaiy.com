@@ -1,0 +1,52 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/nrob",
+    "crates/nrob-cli",
+    # DeepSeek-V4.1 support (docs/DEEPSEEK_V41.md); std-only like the core.
+    "crates/dsv41",
+    # Its CUDA path (and the hybrid CPU/GPU decode). Like ggml-rs-cuda: a
+    # member, not a default member (needs a CUDA toolchain); holds the
+    # reviewed unsafe (kernel launches, pinned mappings, AVX-512 dispatch).
+    "crates/dsv41-cuda",
+    # Vendored GGUF compute subsystem (see crates/VENDORED.md). These keep
+    # their own identity and external deps; the std-only rule below does
+    # not apply to them.
+    "crates/gguf",
+    "crates/ggml-quants",
+    "crates/ggml-rs",
+    "crates/tokenizer",
+    "crates/llama-rs",
+    # Vendored CUDA backend (see crates/VENDORED.md). A member so its tests
+    # run under `--workspace`, but kept out of `default-members`: building it
+    # needs a CUDA toolchain (cudarc dynamic-linking), so the default build
+    # stays CPU-only. Opt in with `cargo build -p nrob-cli --features cuda`.
+    "crates/ggml-rs-cuda",
+]
+default-members = [
+    "crates/nrob",
+    "crates/nrob-cli",
+    "crates/dsv41",
+    "crates/gguf",
+    "crates/ggml-quants",
+    "crates/ggml-rs",
+    "crates/tokenizer",
+    "crates/llama-rs",
+]
+
+[workspace.package]
+edition = "2021"
+license = "Apache-2.0"
+
+# Hard rule for nrob and dsv41: std-only, no external crates.
+# Do not add a [workspace.dependencies] table.
+# Exception: the vendored GGUF subsystem members (crates/gguf,
+# ggml-quants, ggml-rs, tokenizer, llama-rs, ggml-rs-cuda — see
+# crates/VENDORED.md) carry their own explicit external dependencies and
+# do not inherit from this workspace.
+
+[profile.release]
+# rustc 1.92.0 (stable MSVC) crashes with STATUS_ACCESS_VIOLATION compiling
+# ggml-rs-cuda's tests/cpu_vs_cuda.rs at the default codegen-units=16;
+# a single codegen unit avoids it (and matches the vendored llm workspace).
+codegen-units = 1

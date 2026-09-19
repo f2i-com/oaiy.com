@@ -1,0 +1,11 @@
+[package]
+name        = "tokenizer"
+version     = "0.0.1"
+edition     = "2021"
+license     = "MIT OR Apache-2.0"
+description = "BPE / SPM tokenizer fed by GGUF metadata."
+
+[dependencies]
+gguf      = { path = "../gguf", version = "0.0.1" }
+regex     = "1.10"
+thiserror = "1.0"

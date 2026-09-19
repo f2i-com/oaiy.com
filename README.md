@@ -1,0 +1,223 @@
+<div align="center">
+
+# NROB
+
+### **N**VMe · **R**AM · **O**n-GPU · **B**roker
+
+**Your model doesn't fit on your GPU. nrob robs the NVMe for it.**
+
+![Rust](https://img.shields.io/badge/rust-stable-orange?logo=rust)
+![Core dependencies](https://img.shields.io/badge/core_dependencies-0-brightgreen)
+![Unsafe](https://img.shields.io/badge/unsafe-forbidden_in_core-blue)
+![CUDA](https://img.shields.io/badge/CUDA-optional-76B900?logo=nvidia)
+![Weights](https://img.shields.io/badge/weights-GGUF%20%7C%20safetensors-purple)
+![License](https://img.shields.io/badge/license-Apache--2.0%20%7C%20MIT-lightgrey)
+
+</div>
+
+nrob is a Rust inference engine for language models far bigger than your VRAM. The
+weights stay on disk, in the files you downloaded: **GGUF** or **safetensors**, no
+conversion step and no special format. For every token, nrob steals exactly the
+experts it needs, stashes the hot ones in RAM and on the GPU, and brokers every move
+between the three tiers so the next token finds its loot close at hand.
+
+> **The big job:** DeepSeek-V4.1-Flash, a **510 GB, 552-billion-parameter** mixture of
+> experts, decoding at **~29 tokens/s on one desktop** (Ryzen 9 9950X3D, 192 GB RAM,
+> 2× RTX 5090), read straight from its safetensors.
+> [How it was pulled off →](docs/DEEPSEEK_V41.md)
+
+## The heist
+
+Every token is a small, well-planned job:
+
+| | Tier | Role in the job |
+|:-:|---|---|
+| **N** | **NVMe** | *The vault.* Every weight lives here, in its original file. nrob only breaks in for what the current token needs: a few positioned reads per expert. |
+| **R** | **RAM** | *The safe house.* Experts it has already lifted wait in an LFRU cache, so the next token doesn't have to go back to the vault. |
+| **O** | **On-GPU** | *The getaway car.* The hottest experts ride in VRAM, and the always-needed trunk (attention, router, shared experts) never leaves it. |
+| **B** | **Broker** | *The fence.* Decides what's hot, what gets promoted, and who does the work: the GPU, or the CPU straight from RAM when that beats the trip over PCIe. |
+
+```
+      NVMe (the vault)          RAM (the safe house)          GPU (the getaway car)
+   ┌────────────────────┐    ┌────────────────────────┐    ┌──────────────────────┐
+   │ .gguf/.safetensors │ ─▶ │ LFRU expert cache      │ ─▶ │ trunk + hot experts  │
+   │ read in place      │    │ CPU computes misses    │    │ grouped MoE kernels  │
+   └────────────────────┘    └────────────────────────┘    └──────────────────────┘
+                 ▲                         the broker                  │
+                 └──── usage counts, promotion, who computes what ─────┘
+```
+
+## Features
+
+- **DeepSeek-V4.1-Flash from safetensors, end to end.** The checkpoint's shards are
+  indexed in place (51 ms, headers only) and each expert is served with two positioned
+  reads. Hybrid CPU/GPU decode across two GPUs, per-GPU VRAM expert caches, an AVX-512
+  CPU expert kernel, and caches that stay warm across runs. Token-identical to the
+  reference implementation on the golden prompts. See [below](#deepseek-v41-flash).
+- **Any GGUF.** Llama, Qwen2/3/3.5, Gemma 3/3n/4, Mixtral, Qwen3-MoE and more, through
+  our own pure-Rust GGUF stack (`gguf`, `ggml-quants`, `ggml-rs`, `tokenizer`,
+  `llama-rs`; no llama.cpp, no C++). Chat templates per architecture, and vision towers
+  for several of them.
+- **MoE experts streamed straight from the `.gguf`.** `--budget 12G` loads only the
+  trunk and reads routed experts on demand, with parallel positioned reads, into a
+  bounded RAM cache. The same quantized kernels run on the streamed bytes, so the output
+  is token-identical to loading everything.
+- **CUDA.** `--cuda` runs GGUF models on the GPU, with GPU-side routing, grouped MoE
+  kernels and a VRAM expert cache (`--vram-cache`) for streamed models. Token ids are
+  bit-identical to the CPU path on every tested model. The default build is CPU-only
+  and needs nothing beyond Rust.
+- **Std-only core.** `nrob` and `dsv41` have zero external dependencies and
+  `#![forbid(unsafe_code)]`. The JSON parser, the expert cache and the thread pool are
+  all hand-rolled.
+
+## Quickstart
+
+Requires a recent stable Rust. The default build is CPU-only:
+
+```sh
+cargo build --release
+```
+
+Run any GGUF model:
+
+```sh
+nrob run model.gguf "What is the capital of France?" -n 64
+nrob chat model.gguf --system "You are concise."
+nrob info model.gguf
+```
+
+A MoE model bigger than your RAM or VRAM? Rob it one expert at a time:
+
+```sh
+nrob run Qwen3-30B-A3B-Q4_K_M.gguf "Explain rainbows." --budget 8G --stats
+```
+
+`--budget` caps resident weights plus the RAM expert cache; `--stats` prints tokens/s
+and the cache's hit rate. Other subcommands: `bench` (timings plus a JSON result
+schema), `tokenize`, `detokenize` (see `nrob --help`).
+
+GPU build (needs the CUDA toolkit at build time, a driver at run time):
+
+```sh
+cargo build --release -p nrob-cli --features cuda
+nrob run model.gguf "prompt" --cuda
+nrob run big-moe.gguf "prompt" --cuda --budget 16G --vram-cache 20G
+```
+
+## DeepSeek-V4.1-Flash
+
+The biggest job so far: `DeepSeek-V4.1-Flash` (FP8),
+510 GB of FP8 trunk and MXFP4 experts (40 layers × 384 routed experts, 6 active per
+token), plus hyper-connections, compressed sparse attention and Engram n-gram memory.
+The checkpoint is used as-is: `dsv41` reads the safetensors headers and serves each
+expert with two positioned reads.
+
+```sh
+# prompt → token ids (the reference chat encoding; a Rust encoder is still to come)
+python tools/dsv41/encode.py "Explain how rainbows form." > prompt.ids
+
+# decode on both GPUs: layers 0-19 on cuda:1, 20-39 on cuda:0
+cargo run -p dsv41-cuda --release --example generate -- prompt.ids 256 1,0
+```
+
+`generate` streams the text and prints per-token timing and cache hit rates. Useful
+environment variables: `DSV41_MODEL` (checkpoint directory), `DSV41_RAM_GB` (RAM tier,
+default 140), `DSV41_USAGE` (the saved expert-usage profile that warms the tiers at
+start), `DSV41_RUNS` (answer the prompt several times in one process, as a server
+would), and `DSV41_PROFILE` (per-phase timing).
+
+| On a 9950X3D, 192 GB DDR5, 2× RTX 5090 | Decode |
+|---|---:|
+| Warm (RAM and VRAM tiers filled; any long-lived process) | **~29 tok/s** |
+| First answer of a fresh process, warm-started from the usage profile | 2–6 tok/s (bound by the SSD) |
+
+How it gets there, what it cost, and what limits it now (RAM bandwidth, kernel-launch
+overhead, and the SSD for cold starts) is written up in
+[docs/DEEPSEEK_V41.md](docs/DEEPSEEK_V41.md). Correctness is gated on golden files from
+the reference implementation: greedy tokens identical, every layer checked in
+isolation, every GPU kernel tested against its CPU counterpart.
+
+## Benchmarks
+
+Measured on the development machine (RTX 5090, 32 GB VRAM; the "~24 GiB" below is the
+peak VRAM *in use* during GPU-resident runs, not the card's capacity). Streamed runs
+read experts from the model file under the stated RAM budget; output is
+token-identical to the resident path.
+
+| Model | CPU tok/s | GPU resident tok/s | Streaming peak RAM |
+|---|---:|---:|---:|
+| DeepSeek-V4.1-Flash (510 GB safetensors, hybrid CPU + 2 GPUs) | — | **~29** (warm) | 140 GiB RAM tier |
+| Qwen3-30B-A3B Q4_K_M (18.5 GB) | 0.25 | 16.9 | 3.64 GiB @ 256 MiB cache |
+| qwen3-0.6b Q4_K_M | 1.67 | 79 | — |
+| stories15M q8_0 | 55 | 455 | — |
+
+On Qwen3-30B-A3B the expert-cache hit rate climbs from 11% at a 256 MiB cache to 69% at
+4 GiB (81% at 12 GiB); GPU-resident peaks at ~24 GiB VRAM. The GGUF CPU path is limited
+by compute (dequantize per matmul), not by the disk: streamed and resident runs decode
+at the same speed.
+
+## Workspace layout
+
+```
+crates/
+  nrob/          core library (std-only): expert-store seam, LFRU RAM expert cache,
+                 thread pool, JSON reader
+  nrob-cli/      `nrob` binary: run / chat / bench / info / tokenize for GGUF models
+  dsv41/         DeepSeek-V4.1 from safetensors: in-place expert store, CPU reference
+                 model, CPU experts (std-only, forbid(unsafe_code))
+  dsv41-cuda/    DeepSeek-V4.1 on CUDA: kernels, VRAM expert cache, hybrid decode
+  gguf, ggml-quants, ggml-rs, ggml-rs-cuda, tokenizer, llama-rs
+                 our pure-Rust GGUF stack: reader, quant kernels, CPU and CUDA
+                 backends, tokenizers, model architectures, expert streaming
+tools/dsv41/     Python oracle (the reference model, streamed) and helpers
+docs/            DEEPSEEK_V41.md (the port), ROADMAP.md (streaming roadmap)
+```
+
+`PLAN.md` is the system plan and phase log; `CONVENTIONS.md` is the engineering contract
+(std-only rules, naming, error handling); `crates/VENDORED.md` documents where the GGUF
+stack comes from.
+
+## Testing
+
+```sh
+cargo test --workspace
+```
+
+240+ tests. Correctness rests on synthetic GGUF models built in Rust (no downloads
+needed), golden fixtures, and known-answer tests: the CLI tests write tiny llama and
+Qwen3-MoE GGUFs and check that streamed experts give the same tokens as resident ones.
+CUDA tests skip when no GPU is reachable.
+
+The DeepSeek-V4.1 golden gates need the checkpoint and the oracle's golden files, so
+they are `#[ignore]`d by default:
+
+```sh
+DSV41_CUDA_DEVICES=1,0 cargo test -p dsv41-cuda --release --test gpu_model -- --ignored --nocapture --test-threads=1
+```
+
+## Status and caveats
+
+- The GGUF CPU path is slow on big models (Qwen3-30B-A3B: ~0.2 tok/s on CPU against
+  16.9 on one GPU); use `--cuda`. The DeepSeek-V4.1 path has its own AVX-512 expert
+  kernel.
+- GGUF expert streaming covers the Qwen3-MoE and Mixtral families; other MoE
+  architectures load resident.
+- **Direct I/O** (page-cache bypass) is used by `dsv41`; GGUF streaming reads through
+  the OS page cache.
+- DeepSeek-V4.1 runs through the `dsv41-cuda` example; `nrob-cli` takes GGUF files.
+  A Rust chat encoder for it is still to come.
+- The CLI is text-only. Vision towers live in `llama-rs` (see its examples).
+
+## Provenance
+
+nrob is written from scratch in Rust. The GGUF stack (`gguf`, `ggml-quants`, `ggml-rs`,
+`ggml-rs-cuda`, `tokenizer`, `llama-rs`) is the repo author's own Rust code, vendored
+from their `llm` workspace (see `crates/VENDORED.md`).
+
+## License
+
+`nrob`, `nrob-cli`, `dsv41` and `dsv41-cuda` are licensed under **Apache-2.0**
+(`LICENSE-APACHE`; see `NOTICE`).
+
+The GGUF stack crates are dual-licensed **MIT OR Apache-2.0** (`LICENSE-MIT`,
+`LICENSE-APACHE`).
