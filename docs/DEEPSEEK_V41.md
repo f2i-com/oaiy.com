@@ -536,6 +536,61 @@ Measured (both GPUs, 140 GB RAM tier):
     wrong experts in VRAM: a new topic stayed at 22–29% VRAM hits.
   - With aging, the coding prompt's three runs went 42% → 67% → 77% VRAM hits and
     2.6 → 8.5 → **12.1 tok/s** (7.2 before).
+- **Uploads go through pinned memory** (`Gpu::write`). `bench_h2d`: from pageable
+  memory an upload ran at 2–4 GB/s, from pinned 14.3 GB/s on the x4 card and 7.2 on
+  the x2 one (downloads from pageable memory were fine: 12.3 and 6.9). Copies of 1 MB
+  and up now pass through four 4 MB pinned, write-combined buffers per device, each
+  chunk's copy queued asynchronously and marked by an event that the buffer's next use
+  waits for. The 5,560-token pass (RAM full) spent 28.5 s in uploads instead of 34.0,
+  but it took the same time (77.3 s, 76.6–77.2 before): the drive was now the limit,
+  and waiting for bytes went from 12.9 to 17.2 s.
+- **The next layer's experts are read ahead** (`Speculative`, `Prefetched`). When a
+  layer's experts are done and the last layer used at least 60% of its experts (a long
+  prompt: 89% at 5.6K tokens), two readers start on the next layer's experts that
+  neither VRAM nor RAM holds, most used first, while its attention runs. They read into
+  a pool of at most 160 records (~3 GB) outside the RAM tier; a record moves into RAM
+  only when its layer uses it, and what the layer leaves is dropped.
+  - Admitting the guesses straight into RAM: 72.2 s, but 4,637 drive reads; each guess
+    evicted a record a later pass needed.
+  - Starting the next layer's reads while this layer's own were still going: 81.6–83.1 s.
+    The two split the drive.
+  - As built: **73.1 s, 76.1 tok/s**, 3,876 reads.
+  - What is left in that pass: ~200 GB of uploads over PCIe (at least 21 s at the
+    cards' rates), the drive's reads, and ~29 s of attention, hyper-connections and the
+    residual stream's trips.
+- **Engram rows were read one at a time.** A token needs 24 rows from each Engram
+  layer's table (layers 1 and 14), each row two small reads at random places in a
+  101 GB shard. `bench_engram` (new rows each run): a decode step's 48 rows took
+  12.9 ms from the T9 with 16 or 24 threads alike, and a 2,000-token prompt's rows
+  20.3 s. Windows serializes reads through one synchronous file handle, and the
+  threads shared one per table.
+  - Now each table has 24 reader threads with their own handles, living as long as the
+    table (spawning threads per lookup cost 0.9 ms a layer even with every row in the
+    page cache). A row several tokens share is read once, and the first Engram layer's
+    rows are read before the second's, which are not needed until layer 14.
+  - A decode step's rows: **2.2 ms** (0.28 ms from the page cache). The 2,000-token
+    prompt's: **3.1 s**.
+  - A 5,560-token prompt the model had never seen (tokio's sources, so none of its rows
+    were in the page cache): layer 1 waited **23.9 s** for its rows in a 152.2 s pass.
+    Another unseen prompt (aho-corasick's sources) with the fix: **1.2 s** in 130.6 s,
+    with about the same drive reads.
+  - Decode: see the table below.
+  - Expert reads did not have the problem: large direct reads already overlap on one
+    handle (`bench_ssd` with four handles per shard: the same 1.8 GB/s from the T9,
+    2.6–3.0 GB/s from the internal drive). With the fix the internal drive serves Engram
+    rows as fast as the T9 (3.0 ms a step); before, 23–155 ms.
+- **Decode with the Engram fix** (`generate`, the rainbow prompt, 256 tokens, three
+  runs in one process from the same starting profile; readers still spawned per lookup):
+
+  | Run | Engram wait, before → after | Decode, before → after |
+  |---|---|---|
+  | 1 | 5.9 → 1.5 ms a token | 2.88 → 3.05 tok/s |
+  | 2 | 5.7 → 1.8 ms a token | 9.24 → 10.11 tok/s |
+  | 3 | 2.9 → 1.3 ms a token | 11.46 → 12.26 tok/s |
+
+  VRAM hits were the same in each pair (45%, 76%, 85%), so the gain is the rows'. The
+  persistent readers take another ~0.75 ms off a step in `bench_engram` (not yet
+  measured in `generate`).
 
 ### Vision (Phase G)
 

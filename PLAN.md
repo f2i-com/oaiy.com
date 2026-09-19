@@ -165,10 +165,12 @@ No downloads are needed for `cargo test --workspace`:
     its experts counts in the thousands, which decode's admission then cannot beat for
     ~900 tokens of aging. Measure decode after a 5.6K prompt; cap the prefill weight
     if it hurts.
-  - Prefill: upload/compute overlap (a copy stream and a pinned staging ring),
-    tensor cores for the bf16 projections, and a cost-based choice between
-    token-by-token and layered prefill (the fixed 512-token threshold is a measured
-    average; the right one depends on how warm the caches are).
+  - Prefill: what a 5.6K-token pass has left is ~200 GB of expert uploads over PCIe,
+    the drive's reads, and ~29 s of everything else, of which keeping the residual
+    stream on the GPU between layers would save some. Also tensor cores for the bf16
+    projections, and a cost-based choice between token-by-token and layered prefill
+    (the fixed 512-token threshold is a measured average; the right one depends on
+    how warm the caches are).
 - **GGUF:**
   - Expert streaming for more MoE architectures (Gemma 4 MoE, Qwen3.5-MoE).
   - Hybrid CPU experts on the GGUF path.

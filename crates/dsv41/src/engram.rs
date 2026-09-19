@@ -19,6 +19,7 @@
 
 use std::fs::File;
 use std::path::Path;
+use std::sync::mpsc;
 
 use nrob::{Error, Result};
 
@@ -127,13 +128,59 @@ impl NgramHasher {
     }
 }
 
-/// One layer's table, read row by row from its shard.
-struct Table {
-    weight: File,
-    scale: File,
+/// Reader threads per table, each with its own file handles. Windows
+/// serializes the reads on one synchronous handle (positioned reads from
+/// several threads through one `File` wait for each other), so a shared
+/// handle sends the drive one row at a time: measured on the T9, a decode
+/// step's rows took 12.9 ms that way and 3.0 ms with a handle per reader; a
+/// 2,000-token prompt's 20.3 s and 2.8-3.5 s (16-32 readers). The readers
+/// live as long as the table: spawning them for every lookup cost 0.9 ms a
+/// layer, even when the page cache held every row.
+const READERS: usize = 24;
+
+/// Where one layer's table lies in its shards.
+#[derive(Clone, Copy)]
+struct Layout {
     w_start: u64,
     s_start: u64,
     rows: u64,
+    dim: usize,
+}
+
+/// One reader's own handles on a table.
+struct Reader {
+    weight: File,
+    scale: File,
+    at: Layout,
+}
+
+impl Reader {
+    /// Row `r`, dequantized and rounded to bf16 like the reference lookup.
+    fn row(&self, r: i64, dst: &mut [f32]) -> Result<()> {
+        let at = &self.at;
+        let r = u64::try_from(r).ok().filter(|&r| r < at.rows).ok_or_else(|| Error::Format(format!("engram row {r} out of range")))?;
+        let mut w = vec![0u8; at.dim];
+        let mut s = vec![0u8; at.dim / 32];
+        read_exact_at(&self.weight, &mut w, at.w_start + r * at.dim as u64)?;
+        read_exact_at(&self.scale, &mut s, at.s_start + r * (at.dim / 32) as u64)?;
+        for (j, (d, &q)) in dst.iter_mut().zip(&w).enumerate() {
+            *d = to_bf16(fp8_e4m3_to_f32(q) * e8m0_to_f32(s[j / 32]));
+        }
+        Ok(())
+    }
+}
+
+/// A reader's share of one lookup: its rows, and where their values go.
+struct Job {
+    rows: Vec<i64>,
+    part: usize,
+    reply: mpsc::Sender<(usize, Result<Vec<f32>>)>,
+}
+
+/// One layer's table, read row by row by [`READERS`] threads, which stop
+/// when the table is dropped.
+struct Table {
+    readers: Vec<mpsc::Sender<Job>>,
     dim: usize,
 }
 
@@ -144,27 +191,46 @@ impl Table {
         if w.dtype != Dtype::F8E4M3 || s.dtype != Dtype::F8E8M0 || w.shape != [w.shape[0], dim] || s.shape != [w.shape[0], dim / 32] {
             return Err(Error::Format(format!("layer {layer}: unexpected engram table layout")));
         }
-        Ok(Table {
-            weight: File::open(idx.shard_path(w.shard))?,
-            scale: File::open(idx.shard_path(s.shard))?,
-            w_start: w.start,
-            s_start: s.start,
-            rows: w.shape[0] as u64,
-            dim,
-        })
+        let at = Layout { w_start: w.start, s_start: s.start, rows: w.shape[0] as u64, dim };
+        let readers = (0..READERS)
+            .map(|_| -> Result<mpsc::Sender<Job>> {
+                let reader = Reader { weight: File::open(idx.shard_path(w.shard))?, scale: File::open(idx.shard_path(s.shard))?, at };
+                let (tx, rx) = mpsc::channel::<Job>();
+                std::thread::Builder::new().name(format!("engram {layer}")).spawn(move || {
+                    for job in rx {
+                        let mut out = vec![0.0f32; job.rows.len() * reader.at.dim];
+                        let res = job.rows.iter().zip(out.chunks_exact_mut(reader.at.dim)).try_for_each(|(&r, dst)| reader.row(r, dst)).map(|()| out);
+                        // a lookup that has failed already stopped listening
+                        let _ = job.reply.send((job.part, res));
+                    }
+                })?;
+                Ok(tx)
+            })
+            .collect::<Result<_>>()?;
+        Ok(Table { readers, dim })
     }
 
-    /// Row `r`, dequantized and rounded to bf16 like the reference lookup.
-    fn row(&self, r: i64, dst: &mut [f32]) -> Result<()> {
-        let r = u64::try_from(r).ok().filter(|&r| r < self.rows).ok_or_else(|| Error::Format(format!("engram row {r} out of range")))?;
-        let mut w = vec![0u8; self.dim];
-        let mut s = vec![0u8; self.dim / 32];
-        read_exact_at(&self.weight, &mut w, self.w_start + r * self.dim as u64)?;
-        read_exact_at(&self.scale, &mut s, self.s_start + r * (self.dim / 32) as u64)?;
-        for (j, (d, &q)) in dst.iter_mut().zip(&w).enumerate() {
-            *d = to_bf16(fp8_e4m3_to_f32(q) * e8m0_to_f32(s[j / 32]));
+    /// Rows `uniq`, `[len][dim]`, split among the readers.
+    fn read(&self, uniq: &[i64]) -> Result<Vec<f32>> {
+        let mut got = vec![0.0f32; uniq.len() * self.dim];
+        if uniq.is_empty() {
+            return Ok(got);
         }
-        Ok(())
+        let gone = || Error::Io(std::io::Error::other("engram reader thread exited"));
+        let per = uniq.len().div_ceil(READERS);
+        let (tx, rx) = mpsc::channel();
+        let mut parts = 0;
+        for (part, (rows, reader)) in uniq.chunks(per).zip(&self.readers).enumerate() {
+            reader.send(Job { rows: rows.to_vec(), part, reply: tx.clone() }).map_err(|_| gone())?;
+            parts += 1;
+        }
+        drop(tx);
+        for _ in 0..parts {
+            let (part, vals) = rx.recv().map_err(|_| gone())?;
+            let vals = vals?;
+            got[part * per * self.dim..][..vals.len()].copy_from_slice(&vals);
+        }
+        Ok(got)
     }
 }
 
@@ -200,28 +266,24 @@ impl Engram {
     /// The table rows for `hashes`, dequantized to bf16 values, `[len][head_dim]`.
     ///
     /// Each row is two small positioned reads (264 bytes) at a random spot in
-    /// a 101 GB shard, so they are latency-bound: issue them from a handful
-    /// of threads at once rather than one after another (an NVMe drive serves
-    /// dozens of such reads in about the time of one).
+    /// a 101 GB shard, so they are latency-bound: the table's [`READERS`]
+    /// threads issue them at once rather than one after another (a drive
+    /// serves dozens of such reads in about the time of one). A row that
+    /// several tokens share (a repeated n-gram, the all-pad ones at the
+    /// start) is read once.
     pub fn rows(&self, hashes: &[i64], head_dim: usize) -> Result<Vec<f32>> {
+        if head_dim != self.table.dim {
+            return Err(Error::Arg(format!("engram rows are {} wide, not {head_dim}", self.table.dim)));
+        }
+        let mut uniq = hashes.to_vec();
+        uniq.sort_unstable();
+        uniq.dedup();
+        let got = self.table.read(&uniq)?;
         let mut emb = vec![0.0f32; hashes.len() * head_dim];
-        let threads = hashes.len().clamp(1, 16);
-        let per = hashes.len().div_ceil(threads);
-        std::thread::scope(|s| {
-            let handles: Vec<_> = hashes
-                .chunks(per)
-                .zip(emb.chunks_mut(per * head_dim))
-                .map(|(hs, out)| {
-                    s.spawn(move || -> Result<()> {
-                        for (row, dst) in hs.iter().zip(out.chunks_exact_mut(head_dim)) {
-                            self.table.row(*row, dst)?;
-                        }
-                        Ok(())
-                    })
-                })
-                .collect();
-            handles.into_iter().try_for_each(|h| h.join().unwrap_or_else(|_| Err(Error::Io(std::io::Error::other("engram read thread panicked")))))
-        })?;
+        for (h, dst) in hashes.iter().zip(emb.chunks_exact_mut(head_dim)) {
+            let i = uniq.binary_search(h).expect("every hash has its row");
+            dst.copy_from_slice(&got[i * head_dim..(i + 1) * head_dim]);
+        }
         Ok(emb)
     }
 

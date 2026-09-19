@@ -97,6 +97,7 @@ fn main() -> nrob::Result<()> {
         let t = Instant::now();
         let mut next = argmax(&model.forward(&prompt, 0)?);
         eprintln!("[prefill {} tokens: {:.1}s]", prompt.len(), t.elapsed().as_secs_f64());
+        let ew0 = model.engram_wait_s();
 
         let (mut pending, mut times) = (Vec::new(), Vec::new());
         let mut out = std::io::stdout();
@@ -150,6 +151,7 @@ fn main() -> nrob::Result<()> {
         // background warm-up reads count as host-cache misses too; leave them out
         let bg = model.warming().map_or(0, |(done, _)| done as u64) - bg0;
         let (hh, hm) = (h.hits - host0.hits, (h.misses - host0.misses).saturating_sub(bg));
+        eprintln!("[waited for Engram rows: {:.1} ms a token]", 1e3 * (model.engram_wait_s() - ew0) / times.len().max(1) as f64);
         eprintln!(
             "\n[{} tokens: {:.2} tok/s overall; first half {:.2}s/token, second half {:.2}s/token ({:.2} tok/s)]",
             times.len(),

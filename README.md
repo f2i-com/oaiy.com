@@ -177,8 +177,8 @@ NVMe throttles to 0.51 GB/s under sustained reads; an external Samsung T9 (USB
 
 | Harness request | From the T9 |
 |---|---:|
-| First request, 5.6K-token system prompt + tools | ~3 min prompt (31 tok/s; 22 from the internal drive) |
-| A long prompt whose experts an earlier pass left in RAM | ~76 s for 5.6K tokens (73 tok/s; was 31): only what is not resident is read, and the math runs on tensor cores |
+| First request, a 5.6K-token prompt it has never seen | ~2.2 min prompt (42 tok/s; was ~3 min) |
+| A long prompt whose experts an earlier pass left in RAM | ~73 s for 5.6K tokens (76 tok/s; was 31): only what is not resident is read, and the math runs on tensor cores |
 | New chat, same system prompt | prompt cached (5,560 of 5,580 tokens) |
 | Next turn of a conversation | only the new tokens |
 | Decode on a new topic | ~3 tok/s at first, 8.5 then 12 tok/s as VRAM adapts to it |

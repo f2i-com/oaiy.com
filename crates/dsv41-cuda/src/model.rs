@@ -129,6 +129,13 @@ fn engram_rows(eg: &Engram, hashes: &[i64], head_dim: usize, cols: usize, skip: 
     Ok(out)
 }
 
+/// A layer's pending Engram rows, from [`GpuModel::start_engram_rows`].
+type PendingRows = std::sync::mpsc::Receiver<Result<Vec<f32>>>;
+
+fn wait_engram_rows(pending: &PendingRows) -> Result<Vec<f32>> {
+    pending.recv().map_err(|_| Error::Io(std::io::Error::other("engram read thread panicked")))?
+}
+
 /// VRAM uploads a hybrid decode step may make per layer: each is a
 /// synchronous PCIe copy of 18.8 MB (1.3-2.6 ms on the dev machine).
 pub const PROMOTE_PER_LAYER: usize = 1;
@@ -214,6 +221,14 @@ pub struct PassStats {
     pub resident_at_use: usize,
     pub vram_at_use: usize,
     pub reads: u64,
+    /// Wall seconds: the whole pass; the routed experts (fetch, upload,
+    /// kernel issue); within those, waiting for bytes and in upload calls.
+    pub total_s: f64,
+    pub experts_s: f64,
+    pub wait_s: f64,
+    pub upload_s: f64,
+    /// Wall seconds layers waited for their Engram rows.
+    pub engram_s: f64,
 }
 
 /// A decode step's experts on the CPU: none, still to run on this thread
@@ -401,6 +416,8 @@ pub struct GpuModel {
     /// When the background fill must give way to demand reads.
     demand: Arc<Demand>,
     profile: Option<Profile>,
+    /// Seconds forwards spent waiting for Engram rows (host clock, no syncs).
+    engram_wait_s: f64,
 }
 
 impl GpuModel {
@@ -562,6 +579,7 @@ impl GpuModel {
             devs,
             cur: 0,
             profile: None,
+            engram_wait_s: 0.0,
             layers,
             states,
             max_seq: opts.max_seq,
@@ -784,6 +802,42 @@ impl GpuModel {
         &self.pass_stats
     }
 
+    /// Every Engram layer's rows for `t` tokens (`hashes` `[t][engram
+    /// layer][cols]`; `skip` marks image tokens), read on one background
+    /// thread in layer order, indexed by layer. The first Engram layer's rows
+    /// are wanted almost at once and a later one's long after, and the drive
+    /// serves the first sooner alone than alongside the next.
+    fn start_engram_rows(&self, hashes: &[i64], t: usize, skip: Option<Vec<bool>>) -> Vec<Option<PendingRows>> {
+        let (cols, n_eng, head_dim) = (self.hasher.cols(), self.cfg.engram_layer_ids.len(), self.cfg.engram_head_dim);
+        let mut jobs = Vec::new();
+        let pending = self
+            .layers
+            .iter()
+            .map(|ly| {
+                ly.engram.as_ref().map(|(eg, _, _)| {
+                    let hs: Vec<i64> = (0..t)
+                        .flat_map(|i| hashes[(i * n_eng + eg.hash_index) * cols..(i * n_eng + eg.hash_index + 1) * cols].iter().copied())
+                        .collect();
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    jobs.push((Arc::clone(eg), hs, tx));
+                    rx
+                })
+            })
+            .collect();
+        std::thread::spawn(move || {
+            for (eg, hs, tx) in jobs {
+                // a forward that failed has dropped its receivers: nothing to do
+                let _ = tx.send(engram_rows(&eg, &hs, head_dim, cols, skip.as_deref()));
+            }
+        });
+        pending
+    }
+
+    /// Seconds forwards have waited for Engram rows so far.
+    pub fn engram_wait_s(&self) -> f64 {
+        self.engram_wait_s
+    }
+
     /// Whether the vision tower is loaded ([`GpuOptions::vision`] and a
     /// checkpoint that has one).
     pub fn has_vision(&self) -> bool {
@@ -828,6 +882,8 @@ impl GpuModel {
     pub fn prefill_layered_with(&mut self, ids: &[u32], start_pos: usize, sub: usize, cancel: Option<&std::sync::atomic::AtomicBool>, images: &[ImageSpan]) -> Result<Vec<f32>> {
         self.demand.prefill.store(true, std::sync::atomic::Ordering::Relaxed);
         let out = self.layered_inner(ids, start_pos, sub.max(2), cancel, images);
+        // a pass that ended early may leave the scan hint set
+        self.cache.set_scan_layer(None);
         self.demand.prefill.store(false, std::sync::atomic::Ordering::Relaxed);
         if out.is_ok() {
             self.admit_prefill_experts()?;
@@ -874,21 +930,7 @@ impl GpuModel {
             pre_host[i * MIXW] = 1.0;
         }
         // engram rows for every token, read while the first layers run
-        let (cols, n_eng, head_dim) = (self.hasher.cols(), self.cfg.engram_layer_ids.len(), self.cfg.engram_head_dim);
-        let mut engram_rows: Vec<Option<std::thread::JoinHandle<Result<Vec<f32>>>>> = self
-            .layers
-            .iter()
-            .map(|ly| {
-                ly.engram.as_ref().map(|(eg, _, _)| {
-                    let eg = Arc::clone(eg);
-                    let hs: Vec<i64> = (0..t)
-                        .flat_map(|i| hashes[(i * n_eng + eg.hash_index) * cols..(i * n_eng + eg.hash_index + 1) * cols].iter().copied())
-                        .collect();
-                    let skip = any_image.then(|| mask.clone());
-                    std::thread::spawn(move || engram_rows(&eg, &hs, head_dim, cols, skip.as_deref()))
-                })
-            })
-            .collect();
+        let mut engram_rows = self.start_engram_rows(&hashes, t, any_image.then(|| mask.clone()));
 
         // which experts VRAM or RAM hold as the pass begins
         let n_exp = self.cfg.n_routed_experts;
@@ -900,6 +942,8 @@ impl GpuModel {
             .collect();
         let reads0 = self.cache.stats().misses;
         let mut ps = PassStats::default();
+        let pass_t = Instant::now();
+        let dev0: Vec<(f64, f64)> = self.devs.iter().map(|d| (d.dcache.stats.wait_s, d.dcache.stats.upload_s)).collect();
 
         let subs: Vec<(usize, usize)> = (0..t).step_by(sub).map(|a| (a, (a + sub).min(t))).collect();
         // the lists index layers hand to later layers, per sub-chunk
@@ -910,16 +954,24 @@ impl GpuModel {
         let mut h1_host = vec![0.0f32; t * HC * d];
         let mut mix_host = vec![0.0f32; t * MIXW];
 
+        // the next layer's reads, started once a layer's experts are done
+        let pool = Arc::new(Prefetched::new(RECORD_BYTES));
+        let mut spec: Option<Speculative> = None;
+        // the share of its experts the last layer used (the first layer
+        // judges by its own)
+        let mut last_share = 0.0f64;
         #[allow(clippy::needless_range_loop)] // l indexes layers and the pending engram reads alike
         for l in 0..self.cfg.n_layers {
             if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) {
                 return Err(Error::Arg("prefill cancelled".into()));
             }
             self.cur = self.layers[l].dev;
+            let tw = Instant::now();
             let rows_host = match engram_rows[l].take() {
-                Some(pending) => Some(pending.join().map_err(|_| Error::Io(std::io::Error::other("engram read thread panicked")))??),
+                Some(pending) => Some(wait_engram_rows(&pending)?),
                 None => None,
             };
+            ps.engram_s += tw.elapsed().as_secs_f64();
             let mut x2_all = self.devs[self.cur].g.alloc::<f32>(t * d)?;
             for (s, &(a, b)) in subs.iter().enumerate() {
                 let ts = b - a;
@@ -950,7 +1002,20 @@ impl GpuModel {
                 mix_host[a * MIXW..b * MIXW].copy_from_slice(&g.download(&ffn_mix)?);
             }
 
-            // the routed experts over every token at once
+            // the routed experts over every token at once (the speculative
+            // reads for this layer stop; its own readers take over)
+            drop(spec.take());
+            // a long pass: once this layer's reads are done, read the next
+            // layer's missing experts (known before its routing: at this
+            // length nearly all of a layer's experts are used)
+            let next_missing: Option<(u32, Vec<u32>)> = (l + 1 < self.cfg.n_layers && last_share >= SPEC_MIN_USED).then(|| {
+                let nl = l + 1;
+                let dc = &self.devs[self.layers[nl].dev].dcache;
+                let mut list: Vec<u32> = (0..n_exp as u32).filter(|&e| !dc.contains(nl as u32, e) && !self.cache.probe(nl as u32, e)).collect();
+                // most-used first: the ones the layer will not use come last, and are seldom reached
+                list.sort_by_key(|&e| std::cmp::Reverse(dc.freq(nl as u32, e)));
+                (nl as u32, list)
+            });
             let ly = &self.layers[l];
             let Dev { g, dcache, .. } = &mut self.devs[self.cur];
             let logits = g.download(&ly.gate.forward(g, &x2_all.as_view(), t, Out::F32)?)?;
@@ -959,6 +1024,7 @@ impl GpuModel {
             let mut used: Vec<u32> = routes.iter().flat_map(|r| r.experts.iter().copied()).collect();
             used.sort_unstable();
             used.dedup();
+            last_share = used.len() as f64 / n_exp as f64;
             for &e in &used {
                 ps.used += 1;
                 ps.resident_at_start += usize::from(start_resident[l * n_exp + e as usize]);
@@ -967,7 +1033,11 @@ impl GpuModel {
                 ps.resident_at_use += usize::from(in_vram || self.cache.probe(l as u32, e));
             }
             let prof = self.profile.is_some();
-            let (y, fetch, experts) = routed_sum(g, dcache, &self.cache, self.store.as_ref(), l, &x2_all.as_view(), t, &routes, lim, prof)?;
+            let te = Instant::now();
+            let (y, fetch, experts) = routed_sum(g, dcache, &self.cache, self.store.as_ref(), l, &x2_all.as_view(), t, &routes, lim, prof, Some(&pool))?;
+            // what this layer's read-ahead did not use goes
+            pool.clear(l as u32);
+            ps.experts_s += te.elapsed().as_secs_f64();
             if let Some(p) = self.profile.as_mut() {
                 p.fetch += fetch;
                 p.experts += experts;
@@ -993,9 +1063,21 @@ impl GpuModel {
             }
             // the ffn mix is the next layer's pre-mix
             std::mem::swap(&mut pre_host, &mut mix_host);
+
+            // the next layer's reads go on during its attention (starting them
+            // while this layer's own reads ran was slower: they split the drive)
+            if let Some((nl, list)) = next_missing.filter(|(_, list)| !list.is_empty()) {
+                spec = Some(Speculative::start(Arc::clone(&self.cache), Arc::clone(&self.store), Arc::clone(&pool), nl, list));
+            }
         }
+        drop(spec);
 
         ps.reads = self.cache.stats().misses - reads0;
+        ps.total_s = pass_t.elapsed().as_secs_f64();
+        for (d, (w0, u0)) in self.devs.iter().zip(dev0) {
+            ps.wait_s += d.dcache.stats.wait_s - w0;
+            ps.upload_s += d.dcache.stats.upload_s - u0;
+        }
         self.pass_stats = ps;
 
         // the last token through the final norm and the head
@@ -1111,21 +1193,7 @@ impl GpuModel {
 
         // Engram rows depend on the token ids alone: start every engram
         // layer's reads now, so the drive works while the layers before it run
-        let (cols, n_eng, head_dim) = (self.hasher.cols(), self.cfg.engram_layer_ids.len(), self.cfg.engram_head_dim);
-        let mut engram_rows: Vec<Option<std::thread::JoinHandle<Result<Vec<f32>>>>> = self
-            .layers
-            .iter()
-            .map(|ly| {
-                ly.engram.as_ref().map(|(eg, _, _)| {
-                    let eg = Arc::clone(eg);
-                    let hs: Vec<i64> = (0..t)
-                        .flat_map(|i| hashes[(i * n_eng + eg.hash_index) * cols..(i * n_eng + eg.hash_index + 1) * cols].iter().copied())
-                        .collect();
-                    let skip = any_image.then(|| mask.clone());
-                    std::thread::spawn(move || engram_rows(&eg, &hs, head_dim, cols, skip.as_deref()))
-                })
-            })
-            .collect();
+        let mut engram_rows = self.start_engram_rows(&hashes, t, any_image.then(|| mask.clone()));
         #[allow(clippy::needless_range_loop)] // l indexes layers, states and the pending engram reads alike
         for l in 0..self.cfg.n_layers {
             let dev = self.layers[l].dev;
@@ -1144,7 +1212,9 @@ impl GpuModel {
             }
             let t0 = self.tick()?;
             if let (Some((_, wkv, qk)), Some(pending)) = (&self.layers[l].engram, engram_rows[l].take()) {
-                let host_rows = pending.join().map_err(|_| Error::Io(std::io::Error::other("engram read thread panicked")))??;
+                let tw = Instant::now();
+                let host_rows = wait_engram_rows(&pending)?;
+                self.engram_wait_s += tw.elapsed().as_secs_f64();
                 let g = &self.devs[self.cur].g;
                 let rows = g.upload(&host_rows)?;
                 let kv = wkv.forward(g, &rows.as_view(), t, Out::Bf16)?;
@@ -1674,7 +1744,7 @@ impl GpuModel {
             compute += elapsed(tc)?;
             (Some(xq), MoeOut::Grouped(outs, nexp), cpu_part)
         } else {
-            let (y, f, c) = routed_sum(g, dcache, &self.cache, self.store.as_ref(), l, &x.as_view(), t, &routes, lim, prof)?;
+            let (y, f, c) = routed_sum(g, dcache, &self.cache, self.store.as_ref(), l, &x.as_view(), t, &routes, lim, prof, None)?;
             fetch += f;
             compute += c;
             (None, MoeOut::Summed(y), CpuPart::None)
@@ -1761,6 +1831,7 @@ fn routed_sum(
     routes: &[Route],
     lim: f32,
     prof: bool,
+    pool: Option<&Prefetched>,
 ) -> Result<(CudaSlice<f32>, f64, f64)> {
     let (mut fetch, mut compute) = (0.0, 0.0);
     // a prefill uses each layer's experts once per pass: the RAM tier makes
@@ -1790,12 +1861,16 @@ fn routed_sum(
                 use std::sync::atomic::Ordering::Relaxed;
                 while !stop.load(Relaxed) {
                     let Some(&e) = ahead.get(next.fetch_add(1, Relaxed)) else { break };
+                    // read ahead of the layer already: into RAM now, as if just read
+                    if let Some(p) = pool {
+                        let _ = p.admit(host, l as u32, e);
+                    }
                     // an error here resurfaces when the loop reads it itself
                     let _ = host.acquire(l as u32, e, store);
                 }
             });
         }
-        let out = compute_experts(g, dcache, host, store, l, x, routes, &used, lim, prof, &mut y, &mut fetch, &mut compute);
+        let out = compute_experts(g, dcache, host, store, l, x, routes, &used, lim, prof, &mut y, &mut fetch, &mut compute, pool);
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         out
     })?;
@@ -1804,6 +1879,135 @@ fn routed_sum(
 
 /// Readers fetching a prefill layer's experts ahead of use.
 const PREFETCH_READERS: usize = 4;
+
+/// Readers of the next layer's experts during a long layered pass, and the
+/// share of a layer's experts the pass must use for them to start (so few
+/// reads go unused).
+const SPEC_READERS: usize = 2;
+const SPEC_MIN_USED: f64 = 0.6;
+
+/// A read-ahead record by `(layer, expert)`; `None` while its read is under way.
+type Slots = std::collections::HashMap<(u32, u32), Option<Vec<u8>>>;
+
+/// Records read ahead of their layer in a long layered pass, held outside the
+/// RAM tier until the layer uses them: admitting a guess would evict a record
+/// the next pass needs (measured: admitting them raised a repeated pass's
+/// drive reads by a third). A slot is `None` while its read is under way.
+struct Prefetched {
+    slots: std::sync::Mutex<Slots>,
+    ready: std::sync::Condvar,
+    rec_bytes: usize,
+}
+
+/// Records the read-ahead pool holds at most (~3 GB).
+const PREFETCH_POOL: usize = 160;
+
+impl Prefetched {
+    fn new(rec_bytes: usize) -> Prefetched {
+        Prefetched { slots: std::sync::Mutex::new(std::collections::HashMap::new()), ready: std::sync::Condvar::new(), rec_bytes }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Slots> {
+        self.slots.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Read `(layer, expert)` into the pool, unless it is there, being read,
+    /// or already in RAM. False when the pool is full (the reader stops).
+    fn read(&self, cache: &Ecache, store: &dyn WeightStore, layer: u32, expert: u32) -> bool {
+        let key = (layer, expert);
+        {
+            let mut m = self.lock();
+            if m.contains_key(&key) || cache.probe(layer, expert) {
+                return true;
+            }
+            if m.len() >= PREFETCH_POOL {
+                return false;
+            }
+            m.insert(key, None);
+        }
+        let mut buf = vec![0u8; self.rec_bytes];
+        let ok = store.fetch(layer, expert, &mut buf).is_ok();
+        let mut m = self.lock();
+        if ok {
+            m.insert(key, Some(buf));
+        } else {
+            // the layer reads it itself, and meets the error there
+            m.remove(&key);
+        }
+        drop(m);
+        self.ready.notify_all();
+        true
+    }
+
+    /// Move `(layer, expert)` into the RAM tier if it was read ahead
+    /// (waiting for a read under way), as if the layer had just read it.
+    fn admit(&self, cache: &Ecache, layer: u32, expert: u32) -> Result<()> {
+        let mut m = self.lock();
+        loop {
+            match m.get(&(layer, expert)) {
+                None => return Ok(()),
+                Some(None) => m = self.ready.wait(m).unwrap_or_else(|p| p.into_inner()),
+                Some(Some(_)) => {
+                    let buf = m.remove(&(layer, expert)).flatten().expect("ready slot");
+                    drop(m);
+                    return cache.admit_owned(layer, expert, buf);
+                }
+            }
+        }
+    }
+
+    /// Drop what `layer` did not use (waiting for its reads to finish).
+    fn clear(&self, layer: u32) {
+        let mut m = self.lock();
+        while m.iter().any(|(k, v)| k.0 <= layer && v.is_none()) {
+            m = self.ready.wait(m).unwrap_or_else(|p| p.into_inner());
+        }
+        m.retain(|k, _| k.0 > layer);
+    }
+}
+
+/// Reads of the next layer's experts into the [`Prefetched`] pool while the
+/// next one's attention runs. In a long prefill nearly every expert of a
+/// layer is used (89% at 5.6K tokens), and without these the drive would
+/// idle until the next layer's routing is known (measured: busy 46% of a
+/// pass). Dropping stops the readers and waits for the reads in flight.
+struct Speculative {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    handles: Vec<std::thread::JoinHandle<()>>,
+}
+
+impl Speculative {
+    fn start(cache: Arc<Ecache>, store: Arc<dyn WeightStore>, pool: Arc<Prefetched>, layer: u32, experts: Vec<u32>) -> Speculative {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
+        let stop = Arc::new(AtomicBool::new(false));
+        let next = Arc::new(AtomicUsize::new(0));
+        let experts = Arc::new(experts);
+        let handles = (0..SPEC_READERS.min(experts.len()))
+            .map(|_| {
+                let (cache, store, pool, stop, next, experts) =
+                    (Arc::clone(&cache), Arc::clone(&store), Arc::clone(&pool), Arc::clone(&stop), Arc::clone(&next), Arc::clone(&experts));
+                std::thread::spawn(move || {
+                    while !stop.load(Relaxed) {
+                        let Some(&e) = experts.get(next.fetch_add(1, Relaxed)) else { break };
+                        if !pool.read(&cache, store.as_ref(), layer, e) {
+                            break;
+                        }
+                    }
+                })
+            })
+            .collect();
+        Speculative { stop, handles }
+    }
+}
+
+impl Drop for Speculative {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        for h in self.handles.drain(..) {
+            let _ = h.join();
+        }
+    }
+}
 
 /// The per-expert loop of [`routed_sum`].
 #[allow(clippy::too_many_arguments)]
@@ -1821,6 +2025,7 @@ fn compute_experts(
     y: &mut CudaSlice<f32>,
     fetch: &mut f64,
     compute: &mut f64,
+    pool: Option<&Prefetched>,
 ) -> Result<()> {
     let elapsed = |t0: Option<Instant>| -> Result<f64> {
         match t0 {
@@ -1850,6 +2055,9 @@ fn compute_experts(
         // before the next fetch, and one stream orders that fetch's
         // upload after them, so only the slot in use needs pinning
         dcache.begin_batch();
+        if let (Some(p), false) = (pool, dcache.contains(l as u32, e)) {
+            p.admit(host, l as u32, e)?;
+        }
         let rec = dcache.get_prefill(g, l as u32, e, toks.len() as u64, host, store)?;
         *fetch += elapsed(tf)?;
         let tc = if prof { Some(Instant::now()) } else { None };

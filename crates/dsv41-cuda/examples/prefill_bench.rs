@@ -126,6 +126,15 @@ fn main() -> nrob::Result<()> {
                 ps.vram_at_use,
                 ps.reads
             );
+            eprintln!(
+                "[pass {:.1}s: routed experts {:.1}s (waiting for bytes {:.1}s, in uploads {:.1}s), Engram rows {:.1}s, the rest {:.1}s]",
+                ps.total_s,
+                ps.experts_s,
+                ps.wait_s,
+                ps.upload_s,
+                ps.engram_s,
+                ps.total_s - ps.experts_s - ps.engram_s
+            );
             if let Some(p) = model.profile() {
                 eprintln!("[routed experts: fetch {:.1}s (SSD/RAM reads and uploads), compute {:.1}s; the rest {:.1}s]", p.fetch, p.experts, s - p.fetch - p.experts);
             }

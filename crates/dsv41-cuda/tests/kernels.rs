@@ -230,6 +230,27 @@ fn expert_matches_cpu() {
     assert!(rel < 5e-3, "expert rel-L2 {rel}");
 }
 
+/// Large host-to-device copies go through the pinned staging buffers: every
+/// byte arrives, at any size and offset, with back-to-back copies reusing the
+/// buffers before the earlier ones have landed.
+#[test]
+fn staged_uploads_round_trip() {
+    let Some(g) = gpu() else { return };
+    for n in [(1 << 20) / 4 + 3, 3 * (1 << 20) + 17, 5 * (4 << 20) / 4 + 1] {
+        let a: Vec<f32> = (0..n).map(|i| i as f32 * 0.5 - 7.0).collect();
+        let b: Vec<f32> = (0..n).map(|i| -(i as f32)).collect();
+        let d = g.upload(&a).unwrap();
+        let mut e = g.zeros::<f32>(n + 1000).unwrap();
+        g.write(&b, &mut e.slice_mut(1000..)).unwrap();
+        g.write(&a, &mut e.slice_mut(..n)).unwrap();
+        g.write(&b, &mut e.slice_mut(1000..)).unwrap();
+        exact("staged upload", &g.download(&d).unwrap(), &a);
+        let back = g.download(&e).unwrap();
+        exact("staged write at an offset", &back[1000..], &b);
+        exact("staged write, the part before the offset", &back[..1000], &a[..1000]);
+    }
+}
+
 /// The tensor-core FP4 GEMM against the GEMV it replaces in prefill: the
 /// same products, fp32 sums in another order (held to a small fraction of a
 /// bf16 step before rounding), and every token's outputs bit-identical

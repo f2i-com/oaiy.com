@@ -27,7 +27,7 @@ use nrob::ecache::Ecache;
 use nrob::store::WeightStore;
 use nrob::Result;
 
-use crate::gpu::{cu, Gpu};
+use crate::gpu::Gpu;
 
 /// Every frequency halves after this many decode tokens: LFU without aging
 /// keeps an old topic's experts in VRAM forever, and a new topic's never
@@ -50,6 +50,11 @@ pub struct DeviceCacheStats {
     /// Misses left out of VRAM by [`DeviceExpertCache::worth_admitting`]
     /// (served elsewhere, e.g. on the CPU).
     pub declined: u64,
+    /// Prefill: wall seconds waiting for a missing expert's bytes (RAM, or
+    /// the drive through the readers), and in the host-to-device copy calls
+    /// (which also wait for the stream's earlier work). Host clocks, no syncs.
+    pub wait_s: f64,
+    pub upload_s: f64,
 }
 
 struct Slot {
@@ -120,6 +125,12 @@ impl DeviceExpertCache {
         }
     }
 
+    /// How often `(layer, expert)` has been used here (token-weighted, aged,
+    /// seeded from the usage profile).
+    pub fn freq(&self, layer: u32, expert: u32) -> u64 {
+        self.freq.get(&(layer, expert)).copied().unwrap_or(0)
+    }
+
     pub fn contains(&self, layer: u32, expert: u32) -> bool {
         self.index.contains_key(&(layer, expert))
     }
@@ -153,8 +164,12 @@ impl DeviceExpertCache {
             return Ok(self.view(i));
         }
         self.pending.push((layer, expert));
+        let t = std::time::Instant::now();
         let lease = host.acquire(layer, expert, store)?;
-        cu(g.stream.memcpy_htod(&*lease, &mut self.stage.slice_mut(..)))?;
+        let t1 = std::time::Instant::now();
+        g.write(&lease, &mut self.stage.slice_mut(..))?;
+        self.stats.wait_s += (t1 - t).as_secs_f64();
+        self.stats.upload_s += t1.elapsed().as_secs_f64();
         self.stats.bytes_uploaded += self.record as u64;
         Ok(self.stage.slice(..))
     }
@@ -289,7 +304,7 @@ impl DeviceExpertCache {
             self.index.remove(&old);
             self.stats.evictions += 1;
         }
-        cu(g.stream.memcpy_htod(record, &mut self.pool.slice_mut(i * self.record..(i + 1) * self.record)))?;
+        g.write(record, &mut self.pool.slice_mut(i * self.record..(i + 1) * self.record))?;
         self.stats.bytes_uploaded += self.record as u64;
         let freq = self.freq.get(&key).copied().unwrap_or(1);
         self.slots[i] = Slot { key: Some(key), freq, last: self.clock, batch: self.batch };

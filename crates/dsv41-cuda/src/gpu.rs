@@ -12,11 +12,11 @@
 //! is `unsafe`.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use cudarc::driver::{
-    CudaContext, CudaFunction, CudaSlice, CudaStream, CudaView, CudaViewMut, DeviceRepr, LaunchConfig,
-    PushKernelArg, ValidAsZeroBits,
+    sys, CudaContext, CudaEvent, CudaFunction, CudaSlice, CudaStream, CudaView, CudaViewMut, DevicePtrMut, DeviceRepr,
+    LaunchConfig, PushKernelArg, ValidAsZeroBits,
 };
 use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
 use nrob::{Error, Result};
@@ -80,7 +80,67 @@ pub enum Pos<'a> {
     Linear { base: usize, per: usize },
 }
 
+/// Host-to-device copies of at least this many bytes go through [`Staging`].
+const STAGE_MIN: usize = 1 << 20;
+/// Bytes per pinned staging buffer, and how many a device keeps.
+const STAGE_CHUNK: usize = 4 << 20;
+const STAGE_BUFS: usize = 4;
+
+/// Pinned buffers that large host-to-device copies pass through. From
+/// pageable memory the driver stages a copy itself at a fraction of the link
+/// (measured here: 4.2 vs 14.3 GB/s on the x4 card, 2.1 vs 7.2 on the x2
+/// one; device-to-host is fine either way). A copy goes in chunks, each
+/// written into the next buffer while earlier ones cross the link; a
+/// buffer's event marks when its last copy has left it.
+struct Staging {
+    bufs: Vec<StageBuf>,
+    next: usize,
+}
+
+struct StageBuf {
+    ctx: Arc<CudaContext>,
+    ptr: *mut u8,
+    event: CudaEvent,
+}
+
+// SAFETY: `ptr` is an allocation this buffer alone owns; it is only touched
+// by the thread holding the device's staging lock.
+unsafe impl Send for StageBuf {}
+
+impl StageBuf {
+    fn new(ctx: &Arc<CudaContext>) -> Result<StageBuf> {
+        cu(ctx.bind_to_thread())?;
+        let mut p: *mut std::ffi::c_void = std::ptr::null_mut();
+        // SAFETY: cuMemHostAlloc writes the address of STAGE_CHUNK pinned bytes
+        // into `p` (write-combined: the host only writes them); the result is
+        // checked before `p` is used.
+        cu(unsafe { sys::cuMemHostAlloc(&mut p, STAGE_CHUNK, sys::CU_MEMHOSTALLOC_WRITECOMBINED) }.result())?;
+        let event = match ctx.new_event(None) {
+            Ok(e) => e,
+            Err(e) => {
+                // SAFETY: `p` came from cuMemHostAlloc above and nothing refers to it.
+                unsafe { sys::cuMemFreeHost(p) };
+                return Err(Error::Unsupported(format!("cuda: {e:?}")));
+            }
+        };
+        Ok(StageBuf { ctx: Arc::clone(ctx), ptr: p as *mut u8, event })
+    }
+}
+
+impl Drop for StageBuf {
+    fn drop(&mut self) {
+        // the last copy out of the buffer must have finished before it goes
+        let _ = self.event.synchronize();
+        let _ = self.ctx.bind_to_thread();
+        // SAFETY: `ptr` came from cuMemHostAlloc in `new`, this is its only owner,
+        // and no copy reads it any more (event synchronized above).
+        unsafe { sys::cuMemFreeHost(self.ptr as *mut std::ffi::c_void) };
+    }
+}
+
 pub struct Gpu {
+    /// Declared first so it is freed while the context is still current.
+    staging: Mutex<Staging>,
     pub ordinal: usize,
     ctx: Arc<CudaContext>,
     pub stream: Arc<CudaStream>,
@@ -130,15 +190,21 @@ impl Gpu {
         for &k in KERNELS {
             funcs.insert(k, cu(module.load_function(k))?);
         }
-        Ok(Gpu { ordinal, ctx, stream, funcs })
+        let bufs = (0..STAGE_BUFS).map(|_| StageBuf::new(&ctx)).collect::<Result<Vec<_>>>()?;
+        Ok(Gpu { staging: Mutex::new(Staging { bufs, next: 0 }), ordinal, ctx, stream, funcs })
     }
 
     fn f(&self, name: &'static str) -> &CudaFunction {
         &self.funcs[name]
     }
 
-    pub fn upload<T: DeviceRepr>(&self, host: &[T]) -> Result<CudaSlice<T>> {
-        cu(self.stream.clone_htod(host))
+    pub fn upload<T: DeviceRepr + ValidAsZeroBits>(&self, host: &[T]) -> Result<CudaSlice<T>> {
+        if std::mem::size_of_val(host) < STAGE_MIN {
+            return cu(self.stream.clone_htod(host));
+        }
+        let mut dst = self.alloc::<T>(host.len())?;
+        self.write(host, &mut dst.slice_mut(..))?;
+        Ok(dst)
     }
 
     pub fn download<T: DeviceRepr + Default + Clone>(&self, dev: &CudaSlice<T>) -> Result<Vec<T>> {
@@ -161,9 +227,38 @@ impl Gpu {
         cu(unsafe { self.stream.alloc::<T>(n.max(1)) })
     }
 
-    /// Overwrite `dst[..host.len()]` from the host.
+    /// Overwrite `dst[..host.len()]` from the host (large copies through the
+    /// pinned staging buffers). On return `host` may be reused: its bytes are
+    /// in pinned memory or on the device.
     pub fn write<T: DeviceRepr>(&self, host: &[T], dst: &mut CudaViewMut<'_, T>) -> Result<()> {
-        cu(self.stream.memcpy_htod(host, dst))
+        let bytes = std::mem::size_of_val(host);
+        if bytes < STAGE_MIN {
+            return cu(self.stream.memcpy_htod(host, dst));
+        }
+        assert!(dst.len() >= host.len(), "write: destination too small");
+        // SAFETY: T is a DeviceRepr, a plain copyable value type (f32, u8, u16,
+        // i32, ...), so its memory is `bytes` initialized bytes.
+        let src = unsafe { std::slice::from_raw_parts(host.as_ptr() as *const u8, bytes) };
+        // the raw copy below runs in whatever context is current: make it this device's
+        cu(self.ctx.bind_to_thread())?;
+        let (dptr, _record) = dst.device_ptr_mut(&self.stream);
+        let mut st = self.staging.lock().unwrap_or_else(|p| p.into_inner());
+        for (i, chunk) in src.chunks(STAGE_CHUNK).enumerate() {
+            let k = st.next;
+            st.next = (k + 1) % st.bufs.len();
+            let b = &st.bufs[k];
+            // the buffer's previous copy has left it
+            cu(b.event.synchronize())?;
+            // SAFETY: `ptr` holds STAGE_CHUNK >= chunk.len() pinned bytes owned by
+            // this buffer, and no copy reads them now (event synchronized above).
+            unsafe { std::slice::from_raw_parts_mut(b.ptr, chunk.len()) }.copy_from_slice(chunk);
+            // SAFETY: the destination range [dptr + i * STAGE_CHUNK, + chunk.len())
+            // lies inside `dst` (length asserted above); the source stays alive and
+            // unwritten until the event recorded next marks the copy done.
+            cu(unsafe { sys::cuMemcpyHtoDAsync_v2(dptr + (i * STAGE_CHUNK) as u64, b.ptr as *const _, chunk.len(), self.stream.cu_stream()) }.result())?;
+            cu(b.event.record(&self.stream))?;
+        }
+        Ok(())
     }
 
     pub fn context(&self) -> &Arc<CudaContext> {
