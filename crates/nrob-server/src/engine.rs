@@ -64,6 +64,9 @@ pub struct Job {
     pub prompt: Vec<u32>,
     pub images: Vec<JobImage>,
     pub max_tokens: usize,
+    /// Reasoning tokens the reply may spend before it has to answer (when
+    /// the prompt opens a `<think>` block); `None`: no limit.
+    pub think_budget: Option<usize>,
     pub sampling: Sampling,
     /// Set by the request side to stop early (a stop string, a closed
     /// connection).
@@ -113,6 +116,43 @@ pub struct Engine {
     /// image positions a key from the image's content and the offset.
     tokens: Vec<u64>,
     checkpoints: Vec<Checkpoint>,
+}
+
+/// Holds a reply's reasoning to its budget: counts the tokens sampled
+/// inside the `<think>` block the prompt opens and, once they reach the
+/// budget, puts `</think>` in place of the next one, so a model going round
+/// in circles (re-deriving what it has already checked) stops and acts.
+struct ThinkBudget {
+    end: u32,
+    /// Tokens left while the reply is still reasoning.
+    left: Option<usize>,
+}
+
+impl ThinkBudget {
+    fn new(opens_thinking: bool, end: Option<u32>, budget: Option<usize>) -> ThinkBudget {
+        match (opens_thinking, end, budget) {
+            (true, Some(end), Some(budget)) => ThinkBudget { end, left: Some(budget) },
+            _ => ThinkBudget { end: 0, left: None },
+        }
+    }
+
+    /// The token to take in place of `sampled`, and whether the budget
+    /// forced it.
+    fn pass(&mut self, sampled: u32) -> (u32, bool) {
+        let Some(left) = self.left.as_mut() else {
+            return (sampled, false);
+        };
+        if sampled == self.end {
+            self.left = None;
+            return (sampled, false);
+        }
+        if *left == 0 {
+            self.left = None;
+            return (self.end, true);
+        }
+        *left -= 1;
+        (sampled, false)
+    }
 }
 
 /// Prefix-cache keys of a prompt: token ids, image positions keyed by
@@ -404,9 +444,14 @@ impl Engine {
 
         let mut rng = job.sampling.seed ^ 0x9E37_79B9_7F4A_7C15;
         let (mut pending, mut n) = (Vec::new(), 0usize);
+        let think_start = self.tok.special(dsv41::chat::THINK_START);
+        let mut budget = ThinkBudget::new(think_start.is_some() && prompt.last().copied() == think_start, self.tok.special(dsv41::chat::THINK_END), job.think_budget);
         let decode = Instant::now();
         let finish = loop {
-            let next = sample(&logits, &job.sampling, &mut rng);
+            let (next, forced) = budget.pass(sample(&logits, &job.sampling, &mut rng));
+            if forced && self.log {
+                eprintln!("  reasoning ended at its budget ({} tokens)", job.think_budget.unwrap_or(0));
+            }
             if next == self.eos {
                 break Finish::Stop;
             }
@@ -503,6 +548,22 @@ pub fn sample(logits: &[f32], s: &Sampling, rng: &mut u64) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reasoning_is_closed_at_its_budget() {
+        const END: u32 = 9;
+        let mut b = ThinkBudget::new(true, Some(END), Some(2));
+        let got: Vec<(u32, bool)> = [1, 2, 3, 4].iter().map(|&t| b.pass(t)).collect();
+        assert_eq!(got, [(1, false), (2, false), (END, true), (4, false)]);
+        // a reply that closes its reasoning itself is left alone
+        let mut b = ThinkBudget::new(true, Some(END), Some(2));
+        assert_eq!([1, END, 3, 4].map(|t| b.pass(t).0), [1, END, 3, 4]);
+        // no budget, or a prompt that does not open reasoning: nothing forced
+        let mut b = ThinkBudget::new(true, Some(END), None);
+        assert_eq!([1, 2, 3].map(|t| b.pass(t).0), [1, 2, 3]);
+        let mut b = ThinkBudget::new(false, Some(END), Some(0));
+        assert_eq!([1, 2].map(|t| b.pass(t).0), [1, 2]);
+    }
 
     #[test]
     fn sampling_respects_temperature_top_k_and_top_p() {

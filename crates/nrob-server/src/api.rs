@@ -320,7 +320,23 @@ impl Server {
         Ok((ids, images))
     }
 
-    fn submit(&self, prompt: Vec<u32>, images: Vec<JobImage>, sampling: Sampling, max_tokens: usize) -> Result<(mpsc::Receiver<Event>, Arc<AtomicBool>), ApiError> {
+    /// Reasoning tokens a reply may spend before it has to answer:
+    /// `thinking.budget_tokens` when the request gives it (0: no limit),
+    /// else by effort: low 2,048, medium and high 8,192, 76-99 16,384, max
+    /// none. A model that goes round in circles then stops and acts.
+    fn think_budget(body: &Json, effort: u32) -> Option<usize> {
+        if let Some(n) = body.get("thinking").and_then(|t| t.get("budget_tokens")).and_then(Json::as_i64) {
+            return (n > 0).then_some(n as usize);
+        }
+        match effort {
+            100.. => None,
+            76..=99 => Some(16_384),
+            51..=75 => Some(8_192),
+            _ => Some(2_048),
+        }
+    }
+
+    fn submit(&self, prompt: Vec<u32>, images: Vec<JobImage>, sampling: Sampling, max_tokens: usize, think_budget: Option<usize>) -> Result<(mpsc::Receiver<Event>, Arc<AtomicBool>), ApiError> {
         if prompt.len() + 1 > self.cfg.max_seq {
             return Err(ApiError {
                 status: 400,
@@ -331,7 +347,7 @@ impl Server {
         let max_tokens = max_tokens.min(self.cfg.max_seq - prompt.len());
         let (tx, rx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
-        let job = Job { prompt, images, max_tokens, sampling, cancel: Arc::clone(&cancel), events: tx };
+        let job = Job { prompt, images, max_tokens, think_budget, sampling, cancel: Arc::clone(&cancel), events: tx };
         self.jobs
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -355,7 +371,8 @@ impl Server {
         let n_prompt = prompt.len();
         let stream = body.get("stream").and_then(Json::as_bool).unwrap_or(false);
         let include_usage = body.get("stream_options").and_then(|o| o.get("include_usage")).and_then(Json::as_bool).unwrap_or(false);
-        let (rx, cancel) = self.submit(prompt, images, sampling, max_tokens)?;
+        let think_budget = if mode == Mode::Thinking { Self::think_budget(&body, effort) } else { None };
+        let (rx, cancel) = self.submit(prompt, images, sampling, max_tokens, think_budget)?;
         let peer = w.try_clone().ok();
         let id = random_id("chatcmpl-");
         let created = now();
@@ -622,7 +639,7 @@ impl Server {
         }
         let n_prompt = prompt.len();
         let stream = body.get("stream").and_then(Json::as_bool).unwrap_or(false);
-        let (rx, cancel) = self.submit(prompt, Vec::new(), sampling, max_tokens)?;
+        let (rx, cancel) = self.submit(prompt, Vec::new(), sampling, max_tokens, None)?;
         let peer = w.try_clone().ok();
         let id = random_id("cmpl-");
         let created = now();
@@ -783,6 +800,18 @@ mod tests {
         let mut f = StopFilter::new(vec!["STOP".into()]);
         assert_eq!(f.push("abc ST").0, "abc ");
         assert_eq!(f.finish(), "ST");
+    }
+
+    #[test]
+    fn reasoning_budgets_follow_the_effort_unless_the_request_gives_one() {
+        let none = Json::parse(br#"{}"#).unwrap();
+        assert_eq!(Server::think_budget(&none, 50), Some(2_048));
+        assert_eq!(Server::think_budget(&none, 75), Some(8_192));
+        assert_eq!(Server::think_budget(&none, 100), None);
+        let given = Json::parse(br#"{"thinking":{"type":"enabled","budget_tokens":500}}"#).unwrap();
+        assert_eq!(Server::think_budget(&given, 50), Some(500));
+        let unlimited = Json::parse(br#"{"thinking":{"budget_tokens":0}}"#).unwrap();
+        assert_eq!(Server::think_budget(&unlimited, 50), None);
     }
 
     #[test]

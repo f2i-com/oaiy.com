@@ -166,7 +166,10 @@ OpenAI's.
   as `tool_calls` (parallel calls included).
 - **Reasoning:** answers directly by default. `reasoning_effort` (or DeepSeek's
   `thinking: {type: enabled}`) turns reasoning on and streams it as
-  `reasoning_content`. `--thinking` makes it the default.
+  `reasoning_content`. `--thinking` makes it the default. The reasoning has a budget,
+  by effort (low 2,048 tokens, medium and high 8,192, 76-99 16,384, max none) or from
+  the request's `thinking.budget_tokens` (0: none): past it the server writes
+  `</think>` itself, so a model going round in circles stops and answers.
 - **Progress:** a streamed request also gets chunks with no `choices` (OpenAI clients
   skip them): `nrob_progress: {prompt_done, prompt_total}` while the prompt is read,
   and `nrob_tool: {calls, name, parameter, chars, tail}` a few times a second while a
