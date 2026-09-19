@@ -18,6 +18,10 @@
 //!   (its experts mostly sit in VRAM and RAM already), and layer by layer
 //!   when long ([`GpuModel::prefill_layered`]: every expert read once for
 //!   the whole stretch).
+//!
+//! Images run through the vision tower when the prompt reaches them (a
+//! cached prefix keeps its images' state); every image position carries the
+//! same token id, so the prefix cache compares image content, not ids.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -26,7 +30,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use dsv41::tokenizer::Tokenizer;
-use dsv41_cuda::{Checkpoint, GpuModel};
+use dsv41::vision::Prepared;
+use dsv41_cuda::{Checkpoint, GpuModel, ImageSpan};
 
 #[derive(Clone, Debug)]
 pub struct Sampling {
@@ -42,8 +47,17 @@ pub struct Sampling {
 /// a full sort of the 129k vocabulary per token is not).
 const CANDIDATES: usize = 512;
 
+/// An image of a prompt, sized for the tower; its span starts at `start`.
+pub struct JobImage {
+    pub start: usize,
+    pub prep: Prepared,
+    /// Of the encoded bytes: the prefix cache's notion of "the same image".
+    pub hash: u64,
+}
+
 pub struct Job {
     pub prompt: Vec<u32>,
+    pub images: Vec<JobImage>,
     pub max_tokens: usize,
     pub sampling: Sampling,
     /// Set by the request side to stop early (a stop string, a closed
@@ -82,8 +96,22 @@ pub struct Engine {
     pub max_checkpoints: usize,
     pub usage: Option<PathBuf>,
     pub log: bool,
-    tokens: Vec<u32>,
+    /// What the state covers, one key per position: the token id, or for
+    /// image positions a key from the image's content and the offset.
+    tokens: Vec<u64>,
     checkpoints: Vec<Checkpoint>,
+}
+
+/// Prefix-cache keys of a prompt: token ids, image positions keyed by
+/// their image (ids stay below 2^32, image keys above).
+fn prompt_keys(prompt: &[u32], images: &[JobImage]) -> Vec<u64> {
+    let mut keys: Vec<u64> = prompt.iter().map(|&t| u64::from(t)).collect();
+    for img in images {
+        for (k, key) in keys[img.start..img.start + img.prep.n_tokens()].iter_mut().enumerate() {
+            *key = (img.hash.rotate_left(17) ^ (k as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)) | 1 << 63;
+        }
+    }
+    keys
 }
 
 impl Engine {
@@ -130,7 +158,7 @@ impl Engine {
     /// prompt, else the latest checkpoint inside the common prefix, else 0.
     /// At least one prompt token is always left to run (its logits start
     /// the reply).
-    fn resume(&mut self, prompt: &[u32]) -> nrob::Result<usize> {
+    fn resume(&mut self, prompt: &[u64]) -> nrob::Result<usize> {
         let common = self.tokens.iter().zip(prompt).take_while(|(a, b)| a == b).count();
         let limit = common.min(prompt.len().saturating_sub(1));
         if self.tokens.len() <= limit {
@@ -194,7 +222,18 @@ impl Engine {
             return Err(nrob::Error::Arg("empty prompt".into()));
         }
         let started = Instant::now();
-        let start = self.resume(prompt)?;
+        let keys = prompt_keys(prompt, &job.images);
+        let start = self.resume(&keys)?;
+        // the images the uncached part reaches, through the vision tower
+        let mut spans = Vec::new();
+        for img in job.images.iter().filter(|i| i.start + i.prep.n_tokens() > start) {
+            let t = Instant::now();
+            spans.push(ImageSpan { start: img.start, rows: self.model.encode_image(&img.prep)? });
+            if self.log {
+                let (h, w) = (img.prep.n_vit_h * 14, img.prep.n_vit_w * 14);
+                eprintln!("  image at {} ({w}x{h}, {} tokens) encoded in {:.2}s", img.start, img.prep.n_tokens(), t.elapsed().as_secs_f64());
+            }
+        }
         // stretches end at the first and the last user turn too, so a
         // checkpoint lands where the next request is likely to diverge (a new
         // chat with the same system prompt; the latest turn re-rendered)
@@ -218,8 +257,8 @@ impl Engine {
                     // path, whose experts mostly sit in VRAM and RAM
                     let end = pos + left.min(256);
                     for p in pos..end {
-                        logits = self.model.forward(&prompt[p..p + 1], p)?;
-                        self.tokens.push(prompt[p]);
+                        logits = self.model.forward_with(&prompt[p..p + 1], p, &spans)?;
+                        self.tokens.push(keys[p]);
                     }
                     (end, "token by token")
                 } else {
@@ -227,7 +266,7 @@ impl Engine {
                     // the whole stretch (a chunk of a few hundred tokens
                     // already touches nearly all of them)
                     let end = pos + left.min(self.layered_max);
-                    match self.model.prefill_layered(&prompt[pos..end], pos, self.chunk, Some(&job.cancel)) {
+                    match self.model.prefill_layered_with(&prompt[pos..end], pos, self.chunk, Some(&job.cancel), &spans) {
                         Ok(l) => logits = l,
                         Err(_) if job.cancel.load(Ordering::Relaxed) => {
                             // abandoned part-way: back to the last clean state
@@ -237,7 +276,7 @@ impl Engine {
                         }
                         Err(e) => return Err(e),
                     }
-                    self.tokens.extend_from_slice(&prompt[pos..end]);
+                    self.tokens.extend_from_slice(&keys[pos..end]);
                     (end, "layered")
                 };
                 if self.log {
@@ -279,7 +318,7 @@ impl Engine {
                 break Finish::Stop;
             }
             logits = self.model.forward(&[next], pos)?;
-            self.tokens.push(next);
+            self.tokens.push(u64::from(next));
             pos += 1;
         };
         if !pending.is_empty() {

@@ -5,7 +5,8 @@ edition = "2021"
 license = "Apache-2.0"
 description = "DeepSeek-V4.1 for nrob: in-place safetensors expert store, FP4/FP8 formats, forward pass"
 
-# std-only like the engine core (CONVENTIONS.md): the one dependency is nrob
-# itself, for WeightStore / Ecache / json / Error.
+# std-only like the engine core (CONVENTIONS.md): the dependencies are nrob
+# itself, for WeightStore / Ecache / json / Error, and nrob-image for vision.
 [dependencies]
 nrob = { path = "../nrob" }
+nrob-image = { path = "../nrob-image" }

@@ -167,6 +167,8 @@ OpenAI's.
   system prompt skips it too.
 - **Long prompts** run layer by layer: every expert is read once for the whole prompt
   instead of once per chunk (~6× faster here than chunked prefill).
+- **Images:** `image_url` parts with base64 `data:` URLs (PNG or JPEG), or local file
+  paths when the server listens on loopback only. See [Vision](#vision).
 
 What to expect on this machine. The model is 510 GB; RAM and VRAM hold about two thirds
 of the experts, and the rest come from the drive, so the drive matters. The internal
@@ -180,6 +182,41 @@ NVMe throttles to 0.51 GB/s under sustained reads; an external Samsung T9 (USB
 | Next turn of a conversation | only the new tokens |
 | Decode on a new topic | ~3 tok/s at first, 8.5 then 12 tok/s as VRAM adapts to it |
 | Warm, same topic | up to ~29 tok/s (measured with `generate`) |
+
+### Vision
+
+The checkpoint carries a 32-layer ViT and an aligner, and nrob runs them:
+
+```sh
+python - <<'EOF'
+import base64, json, urllib.request
+img = base64.b64encode(open("chart.png", "rb").read()).decode()
+body = {"model": "deepseek-v4.1-flash", "messages": [{"role": "user", "content": [
+    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img}"}},
+    {"type": "text", "text": "What does this chart show?"}]}]}
+req = urllib.request.Request("http://127.0.0.1:8000/v1/chat/completions", json.dumps(body).encode(),
+                             {"Content-Type": "application/json"})
+print(json.load(urllib.request.urlopen(req))["choices"][0]["message"]["content"])
+EOF
+```
+
+- **Decoding is ours.** `nrob-image` is a std-only PNG decoder (with its own inflate)
+  and JPEG decoder (baseline and progressive). It decodes to the same pixels as Pillow,
+  which the reference uses, on all 111 test images: every PNG colour type, bit depth
+  and interlace; JPEG 4:4:4, 4:2:2, 4:2:0, grey and CMYK, restart markers, odd sizes.
+  The resize and pad are Pillow's too, pixel-exact.
+- **Preprocessing** (sizing, padding, normalization, patches) is bit-exact to the
+  reference's `load_image` on every test image, and its sizing plan on 5,712 sizes.
+- **The vision tower** runs on the first GPU: about 1 GB of weights, 60 ms for a
+  typical image (1,521 patches), 160 ms for 3,672. Its output is within 1.6–2.5% of the
+  reference's (the reference differs from itself by as much across torch backends).
+- **In the model:** image tokens take the tower's rows, route with the checkpoint's
+  vision bias (`bias_vl`) and are kept out of Engram's n-grams, as in the reference.
+  Every layer matches the reference in isolation, and an image may sit anywhere in a
+  conversation: the prefix cache keys it by content.
+- **Measured:** a chart image (254 tokens) reads back its title and all four values.
+  Image tokens run at 3–9 tok/s depending on how warm the caches are; a follow-up
+  question about the same image reuses it from the prefix cache.
 
 ## Benchmarks
 
@@ -210,7 +247,9 @@ crates/
   dsv41/         DeepSeek-V4.1 from safetensors: in-place expert store, CPU reference
                  model, CPU experts (std-only, forbid(unsafe_code))
   dsv41-cuda/    DeepSeek-V4.1 on CUDA: kernels, VRAM expert cache, hybrid decode,
-                 chunk continuation, checkpoints, layer-by-layer prefill
+                 chunk continuation, checkpoints, layer-by-layer prefill, vision tower
+  nrob-image/    image decoding (std-only): PNG with its own inflate, JPEG, Pillow's
+                 resize — pixel-exact to Pillow
   nrob-server/   OpenAI-compatible HTTP server for DeepSeek-V4.1 (std-only)
   gguf, ggml-quants, ggml-rs, ggml-rs-cuda, tokenizer, llama-rs
                  our pure-Rust GGUF stack: reader, quant kernels, CPU and CUDA
@@ -241,6 +280,16 @@ they are `#[ignore]`d by default:
 DSV41_CUDA_DEVICES=1,0 cargo test -p dsv41-cuda --release --test gpu_model -- --ignored --nocapture --test-threads=1
 ```
 
+Vision has its own golden files (`tools/dsv41/vision_golden.py` for decoding,
+preprocessing and the tower; `oracle.py --image` for a whole image prompt):
+
+```sh
+cargo test -p nrob-image --release            # decoders and resize against Pillow
+cargo test -p dsv41 --release --test vision_golden -- --include-ignored
+cargo test -p dsv41-cuda --release --test gpu_vision -- --ignored --nocapture
+cargo test -p dsv41-cuda --release --test gpu_vision_model -- --ignored --nocapture --test-threads=1
+```
+
 ## Status and caveats
 
 - The GGUF CPU path is slow on big models (Qwen3-30B-A3B: ~0.2 tok/s on CPU against
@@ -256,9 +305,12 @@ DSV41_CUDA_DEVICES=1,0 cargo test -p dsv41-cuda --release --test gpu_model -- --
   65,536). nrob's caches cost ~7 KB a token, so `--ctx` can go far (65,536 by default).
   Verified against the reference oracle up to 247 tokens; longer contexts run the same
   code, but candidate filtering only engages past ~32K tokens and is unverified there.
-- **DeepSeek-V4.1 vision:** the checkpoint includes its 32-layer vision encoder, and the
-  chat format already handles image blocks, but the encoder is not ported yet. The
-  server answers image requests with an error.
+- **DeepSeek-V4.1 vision:** PNG and JPEG only (GIF, WebP and BMP are refused with a
+  clear error), and no `http(s)` image URLs (a std-only build has no TLS; send
+  `data:` URLs). An image prompt is numerically touchy: one bf16 rounding step on 1%
+  of an image's inputs moves the model's final logits by ~25%. So replies match the
+  reference in substance and mostly in wording, not token for token (each layer
+  matches as tightly as for text: 0.5% of routes differ, text prompts 0.4%).
 - On a 192 GB machine the drive sets the pace for new prompts and topics: run from a
   drive that sustains its speed (the T9 does, the internal one throttles). More RAM
   would help most of all.
@@ -270,11 +322,13 @@ nrob is written from scratch in Rust. The GGUF stack (`gguf`, `ggml-quants`, `gg
 `ggml-rs-cuda`, `tokenizer`, `llama-rs`) is the repo author's own Rust code, vendored
 from their `llm` workspace (see `crates/VENDORED.md`). The DeepSeek-V4.1 engine
 follows DeepSeek's reference implementation and chat encoding, published under the MIT
-License (see `NOTICE`).
+License (see `NOTICE`). `nrob-image` is our own code; to decode to the same pixels as
+the reference's Pillow, it follows the arithmetic of Pillow's resampling and of
+libjpeg-turbo's IDCT, upsampling and colour conversion (see `NOTICE`).
 
 ## License
 
-`nrob`, `nrob-cli`, `dsv41` and `dsv41-cuda` are licensed under **Apache-2.0**
+`nrob`, `nrob-cli`, `nrob-image`, `nrob-server`, `dsv41` and `dsv41-cuda` are licensed under **Apache-2.0**
 (`LICENSE-APACHE`; see `NOTICE`).
 
 The GGUF stack crates are dual-licensed **MIT OR Apache-2.0** (`LICENSE-MIT`,

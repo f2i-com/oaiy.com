@@ -81,12 +81,23 @@ impl NgramHasher {
 
     /// Hash ids for `ids` at positions `start_pos..`: `[t][engram layer][cols]`, flattened.
     pub fn forward(&mut self, ids: &[u32], start_pos: usize) -> Result<Vec<i64>> {
+        self.forward_masked(ids, start_pos, None)
+    }
+
+    /// [`forward`](Self::forward) with image tokens (`image[i]`): they enter
+    /// the history as DEAD, so no n-gram reaches into or across an image
+    /// span (the reference's `token_mask`); their own hashes are all-pad
+    /// ones, whose rows the caller gates off.
+    pub fn forward_masked(&mut self, ids: &[u32], start_pos: usize, image: Option<&[bool]>) -> Result<Vec<i64>> {
         if start_pos + ids.len() > self.cache.len() {
             return Err(Error::Arg("sequence longer than the n-gram history".into()));
         }
+        if image.is_some_and(|m| m.len() != ids.len()) {
+            return Err(Error::Arg("image mask length differs from the tokens'".into()));
+        }
         for (i, &id) in ids.iter().enumerate() {
             let c = *self.token_map.get(id as usize).ok_or_else(|| Error::Arg(format!("token {id} outside the vocabulary")))?;
-            self.cache[start_pos + i] = c;
+            self.cache[start_pos + i] = if image.is_some_and(|m| m[i]) { DEAD } else { c };
         }
         let cols = self.cols();
         let mut out = Vec::with_capacity(ids.len() * self.n_layers * cols);

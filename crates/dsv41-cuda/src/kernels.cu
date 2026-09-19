@@ -1108,4 +1108,153 @@ __global__ void engram_gate(const float* h, const float* kv, const float* qk, fl
     for (int k = threadIdx.x; k < d; k += blockDim.x) o[k] = to_bf16(hs[k] + g * value[k]);
 }
 
+// ---------------------------------------------------------------- vision tower
+
+// The ViT and aligner (dsv41::vision). No bit-exact target here: the
+// reference runs cuBLAS bf16 GEMMs and fused attention, so these kernels use
+// fused multiply-adds (fmaf, which --fmad=false leaves alone) and match the
+// CPU tower to tolerance.
+
+// y[t][n] = bf16?(x[t][k] . w[n][k] + bias[n]), w in bf16 bits: a bf16
+// nn.Linear. A 64x64 output tile per 256-thread block, 4x4 outputs a thread,
+// k in steps of 16 through shared memory.
+__global__ void gemm_bf16(const float* x, const unsigned short* w, const float* bias, float* y, int t, int n, int k, int round) {
+    __shared__ __align__(16) float xs[16][68];
+    __shared__ __align__(16) float ws[16][68];
+    int tx = threadIdx.x & 15, ty = threadIdx.x >> 4;
+    int m0 = blockIdx.y * 64, n0 = blockIdx.x * 64;
+    float acc[4][4];
+#pragma unroll
+    for (int i = 0; i < 4; i++)
+#pragma unroll
+        for (int j = 0; j < 4; j++) acc[i][j] = 0.0f;
+    for (int k0 = 0; k0 < k; k0 += 16) {
+        for (int e = threadIdx.x; e < 1024; e += 256) {
+            int r = e >> 4, c = e & 15, gc = k0 + c;
+            int xr = m0 + r, wr = n0 + r;
+            xs[c][r] = (xr < t && gc < k) ? x[(long)xr * k + gc] : 0.0f;
+            ws[c][r] = (wr < n && gc < k) ? bf16_val(w[(long)wr * k + gc]) : 0.0f;
+        }
+        __syncthreads();
+#pragma unroll
+        for (int kk = 0; kk < 16; kk++) {
+            float4 a = *(const float4*)&xs[kk][ty * 4];
+            float4 b = *(const float4*)&ws[kk][tx * 4];
+            float av[4] = {a.x, a.y, a.z, a.w}, bv[4] = {b.x, b.y, b.z, b.w};
+#pragma unroll
+            for (int i = 0; i < 4; i++)
+#pragma unroll
+                for (int j = 0; j < 4; j++) acc[i][j] = fmaf(av[i], bv[j], acc[i][j]);
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+        int r = m0 + ty * 4 + i;
+        if (r >= t) continue;
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+            int c = n0 + tx * 4 + j;
+            if (c >= n) continue;
+            float v = acc[i][j] + bias[c];
+            y[(long)r * n + c] = round ? to_bf16(v) : v;
+        }
+    }
+}
+
+// vision::attention's rotation: q and k of qkv [n][3][heads][hd] turned in
+// place by the 2-D tables [n][hd/2] (pairs c, c + hd/2), rounded to bf16.
+__global__ void vit_rope(float* qkv, const float* cosv, const float* sinv, int n, int heads, int hd) {
+    int half = hd / 2;
+    long total = (long)n * 2 * heads * half;
+    long e = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= total) return;
+    int c = (int)(e % half);
+    long rest = e / half;
+    int h = (int)(rest % heads);
+    rest /= heads;
+    int which = (int)(rest % 2);
+    long i = rest / 2;
+    float* x = qkv + i * 3 * heads * hd + (long)which * heads * hd + (long)h * hd;
+    float cs = cosv[i * half + c], sn = sinv[i * half + c];
+    float x1 = x[c], x2 = x[c + half];
+    x[c] = to_bf16(x1 * cs - x2 * sn);
+    x[c + half] = to_bf16(x2 * cs + x1 * sn);
+}
+
+// Full (bidirectional) attention over one image, head size 64: qkv
+// [n][3][heads][64] (q, k rotated), out [n][heads * 64] in bf16. One thread
+// per query, 128 queries a block, keys through shared memory 32 at a time,
+// online softmax in f32.
+__global__ void vit_attn(const float* qkv, float* out, int n, int heads, float scale) {
+    __shared__ float ks[32][64];
+    __shared__ float vs[32][64];
+    int h = blockIdx.y, d = heads * 64;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    bool live = i < n;
+    float q[64], o[64];
+#pragma unroll
+    for (int c = 0; c < 64; c++) {
+        q[c] = live ? qkv[(long)i * 3 * d + h * 64 + c] * scale : 0.0f;
+        o[c] = 0.0f;
+    }
+    float m = -INF, l = 0.0f;
+    for (int j0 = 0; j0 < n; j0 += 32) {
+        __syncthreads();
+        for (int e = threadIdx.x; e < 32 * 64; e += blockDim.x) {
+            int r = e >> 6, c = e & 63, j = j0 + r;
+            ks[r][c] = j < n ? qkv[(long)j * 3 * d + d + h * 64 + c] : 0.0f;
+            vs[r][c] = j < n ? qkv[(long)j * 3 * d + 2 * d + h * 64 + c] : 0.0f;
+        }
+        __syncthreads();
+        int nj = min(32, n - j0);
+        float s[32];
+        float mt = m;
+#pragma unroll
+        for (int r = 0; r < 32; r++) {
+            float acc = 0.0f;
+#pragma unroll
+            for (int c = 0; c < 64; c++) acc = fmaf(q[c], ks[r][c], acc);
+            s[r] = r < nj ? acc : -INF;
+            mt = fmaxf(mt, s[r]);
+        }
+        float corr = expf(m - mt);
+        l *= corr;
+#pragma unroll
+        for (int c = 0; c < 64; c++) o[c] *= corr;
+#pragma unroll
+        for (int r = 0; r < 32; r++) {
+            float p = expf(s[r] - mt);
+            l += p;
+#pragma unroll
+            for (int c = 0; c < 64; c++) o[c] = fmaf(p, vs[r][c], o[c]);
+        }
+        m = mt;
+    }
+    if (live) {
+#pragma unroll
+        for (int c = 0; c < 64; c++) out[(long)i * d + h * 64 + c] = to_bf16(o[c] / l);
+    }
+}
+
+// The ViT MLP's gate: m[i][j] = bf16(bf16(silu(g)) * u), g = gu[i][j],
+// u = gu[i][inter + j].
+__global__ void silu_mul(const float* gu, float* m, int inter, long total) {
+    long e = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= total) return;
+    long i = e / inter;
+    int j = (int)(e % inter);
+    float g = gu[i * 2 * inter + j], u = gu[i * 2 * inter + inter + j];
+    m[e] = to_bf16(to_bf16(g / (1.0f + expf(-g))) * u);
+}
+
+// x = bf16(gelu(x)), the exact (erf) GELU.
+__global__ void gelu_round(float* x, long n) {
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float v = x[i];
+        x[i] = to_bf16(v * 0.5f * (1.0f + erff(v * 0.70710678118654752f)));
+    }
+}
+
 }  // extern "C"

@@ -56,6 +56,11 @@ const KERNELS: &[&str] = &[
     "index_scores",
     "compress_pool",
     "engram_gate",
+    "gemm_bf16",
+    "vit_rope",
+    "vit_attn",
+    "silu_mul",
+    "gelu_round",
 ];
 
 /// Map any CUDA error into the engine's error type.
@@ -852,6 +857,72 @@ impl Gpu {
         // SAFETY: engram_gate(const float* h, const float* kv, const float* qk, float* out, int d,
         // float eps, float scale); block per (token, copy), 3*256 floats of shared memory.
         cu(unsafe { b.launch(cfg) })?;
+        Ok(())
+    }
+
+    // ------------------------------------------------------------ vision tower
+
+    /// `y[t][n] = bf16?(x[t][k] . w[n][k] + bias[n])`: a bf16 `nn.Linear`
+    /// over many rows (the ViT, the aligner), tiled; `round` = bf16 output.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_bf16(&self, x: &CudaView<'_, f32>, w: &CudaSlice<u16>, bias: &CudaSlice<f32>, y: &mut CudaSlice<f32>, t: usize, n: usize, k: usize, round: bool) -> Result<()> {
+        assert!(x.len() >= t * k && w.len() >= n * k && bias.len() >= n && y.len() >= t * n);
+        let (ti, ni, ki, ri) = (t as i32, n as i32, k as i32, round as i32);
+        let cfg = LaunchConfig { grid_dim: (n.div_ceil(64) as u32, t.div_ceil(64) as u32, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+        let mut b = self.stream.launch_builder(self.f("gemm_bf16"));
+        b.arg(x).arg(w).arg(bias).arg(y).arg(&ti).arg(&ni).arg(&ki).arg(&ri);
+        // SAFETY: gemm_bf16(const float* x, const u16* w, const float* bias, float* y, int t, int n,
+        // int k, int round); every load and store is guarded by t/n/k, lengths asserted above.
+        cu(unsafe { b.launch(cfg) })?;
+        Ok(())
+    }
+
+    /// Rotate q and k of `qkv` (`[n][3][heads][hd]`) in place with the 2-D
+    /// tables (`[n][hd/2]`), rounding to bf16.
+    pub fn vit_rope(&self, qkv: &mut CudaSlice<f32>, cos: &CudaSlice<f32>, sin: &CudaSlice<f32>, n: usize, heads: usize, hd: usize) -> Result<()> {
+        assert!(qkv.len() >= n * 3 * heads * hd && cos.len() >= n * hd / 2 && sin.len() >= n * hd / 2);
+        let (ni, hi, di) = (n as i32, heads as i32, hd as i32);
+        let mut b = self.stream.launch_builder(self.f("vit_rope"));
+        b.arg(qkv).arg(cos).arg(sin).arg(&ni).arg(&hi).arg(&di);
+        // SAFETY: vit_rope(float* qkv, const float* cos, const float* sin, int n, int heads, int hd);
+        // one thread per rotated pair, bounded by n * 2 * heads * hd/2.
+        cu(unsafe { b.launch(elems_cfg(n * heads * hd)) })?;
+        Ok(())
+    }
+
+    /// Full attention over one image (head size 64): `qkv` `[n][3][heads][64]`
+    /// to `out` `[n][heads * 64]`, bf16.
+    pub fn vit_attn(&self, qkv: &CudaSlice<f32>, out: &mut CudaSlice<f32>, n: usize, heads: usize) -> Result<()> {
+        assert!(qkv.len() >= n * 3 * heads * 64 && out.len() >= n * heads * 64);
+        let (ni, hi, scale) = (n as i32, heads as i32, 0.125f32);
+        let cfg = LaunchConfig { grid_dim: (n.div_ceil(128) as u32, heads as u32, 1), block_dim: (128, 1, 1), shared_mem_bytes: 0 };
+        let mut b = self.stream.launch_builder(self.f("vit_attn"));
+        b.arg(qkv).arg(out).arg(&ni).arg(&hi).arg(&scale);
+        // SAFETY: vit_attn(const float* qkv, float* out, int n, int heads, float scale); queries past
+        // n compute but never store, key tiles past n load zeros and score -inf.
+        cu(unsafe { b.launch(cfg) })?;
+        Ok(())
+    }
+
+    /// `m[i][j] = bf16(bf16(silu(g)) * u)` over `gu` = `[t][gate inter | up inter]`.
+    pub fn silu_mul(&self, gu: &CudaSlice<f32>, m: &mut CudaSlice<f32>, inter: usize, t: usize) -> Result<()> {
+        assert!(gu.len() >= 2 * inter * t && m.len() >= inter * t);
+        let (ii, total) = (inter as i32, (inter * t) as i64);
+        let mut b = self.stream.launch_builder(self.f("silu_mul"));
+        b.arg(gu).arg(m).arg(&ii).arg(&total);
+        // SAFETY: silu_mul(const float* gu, float* m, int inter, long total); one thread per output.
+        cu(unsafe { b.launch(elems_cfg(inter * t)) })?;
+        Ok(())
+    }
+
+    /// `x = bf16(gelu(x))` (exact GELU) over `n` values.
+    pub fn gelu_round(&self, x: &mut CudaSlice<f32>, n: usize) -> Result<()> {
+        assert!(x.len() >= n);
+        let nl = n as i64;
+        let mut b = self.stream.launch_builder(self.f("gelu_round"));
+        b.arg(x).arg(&nl);
+        // SAFETY: gelu_round(float* x, long n); one thread per value, bounded by n.
+        cu(unsafe { b.launch(elems_cfg(n)) })?;
         Ok(())
     }
 }

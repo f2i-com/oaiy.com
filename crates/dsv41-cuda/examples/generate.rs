@@ -68,7 +68,7 @@ fn main() -> nrob::Result<()> {
         Ok(v) => Some(v.parse().map_err(|_| nrob::Error::Arg(format!("bad DSV41_CPU_THREADS {v:?}")))?),
         Err(_) => Some(24),
     };
-    let opts = GpuOptions { devices: devices.clone(), max_seq: 4096, expert_cache_bytes: ram_gb << 30, direct_io: true, vram_expert_bytes: None, vram_headroom_bytes: 1 << 30, cpu_expert_threads };
+    let opts = GpuOptions { devices: devices.clone(), max_seq: 4096, expert_cache_bytes: ram_gb << 30, direct_io: true, vram_expert_bytes: None, vram_headroom_bytes: 1 << 30, cpu_expert_threads, vision: false };
     let mut model = GpuModel::load(&model_dir, &golden.join("engram_meta.safetensors"), &opts)?;
     let slots: Vec<usize> = model.device_caches().map(|c| c.slots()).collect();
     eprintln!("[loaded in {:.1}s on cuda:{devices:?}, VRAM expert slots {slots:?}, RAM expert slots {}]", t.elapsed().as_secs_f64(), model.expert_cache().n_slots());

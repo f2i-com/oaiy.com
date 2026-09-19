@@ -6,6 +6,11 @@
 //! `tools` and `response_format` attach to the system message, reasoning
 //! comes back as `reasoning_content` (as DeepSeek's own API does), and the
 //! model's DSML tool calls come back as OpenAI `tool_calls`.
+//!
+//! Images (`image_url` parts: base64 `data:` URLs, or local paths when the
+//! server allows them) are decoded and sized here, on the request's thread,
+//! with the reference's preprocessing; the worker runs them through the
+//! vision tower.
 
 use std::io;
 use std::net::TcpStream;
@@ -16,10 +21,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use dsv41::chat::{self, Delta, Mode};
+use dsv41::config::VisionConfig;
 use dsv41::tokenizer::Tokenizer;
+use dsv41::vision;
 use nrob::json::Json;
 
-use crate::engine::{Event, Finish, Job, Sampling};
+use crate::engine::{Event, Finish, Job, JobImage, Sampling};
 use crate::http::{respond, Request, Stream};
 
 pub struct Config {
@@ -32,6 +39,12 @@ pub struct Config {
     pub max_tokens: usize,
     pub temperature: f32,
     pub top_p: f32,
+    /// The vision tower's config when it is loaded (else images are refused).
+    pub vision: Option<VisionConfig>,
+    pub image_token_id: u32,
+    /// Whether an image may name a file on this machine (a path or file://
+    /// URL); off unless the server only listens on loopback.
+    pub local_images: bool,
 }
 
 pub struct Server {
@@ -265,7 +278,28 @@ impl Server {
         Ok(msgs)
     }
 
-    fn submit(&self, prompt: Vec<u32>, sampling: Sampling, max_tokens: usize) -> Result<(mpsc::Receiver<Event>, Arc<AtomicBool>), ApiError> {
+    /// Decode and size a request's images and expand their placeholders in
+    /// the prompt into image spans.
+    fn prepare_images(&self, records: &[Json], prompt: Vec<u32>) -> Result<(Vec<u32>, Vec<JobImage>), ApiError> {
+        let Some(vc) = &self.cfg.vision else {
+            return Err(bad("this server runs without the vision tower (started with --no-vision); images are not supported"));
+        };
+        let mut preps = Vec::with_capacity(records.len());
+        let mut hashes = Vec::with_capacity(records.len());
+        for (i, rec) in records.iter().enumerate() {
+            let bytes = vision::image_bytes(rec, self.cfg.local_images).map_err(|e| bad(format!("image {}: {e}", i + 1)))?;
+            let prep = vision::load_image(&bytes, vc).map_err(|e| bad(format!("image {}: {e}", i + 1)))?;
+            let mut h = std::hash::DefaultHasher::new();
+            std::hash::Hasher::write(&mut h, &bytes);
+            hashes.push(std::hash::Hasher::finish(&h));
+            preps.push(prep);
+        }
+        let (ids, starts) = vision::expand_placeholders(&prompt, self.cfg.image_token_id, &preps).map_err(|e| bad(e.to_string()))?;
+        let images = preps.into_iter().zip(starts).zip(hashes).map(|((prep, start), hash)| JobImage { start, prep, hash }).collect();
+        Ok((ids, images))
+    }
+
+    fn submit(&self, prompt: Vec<u32>, images: Vec<JobImage>, sampling: Sampling, max_tokens: usize) -> Result<(mpsc::Receiver<Event>, Arc<AtomicBool>), ApiError> {
         if prompt.len() + 1 > self.cfg.max_seq {
             return Err(ApiError {
                 status: 400,
@@ -276,7 +310,7 @@ impl Server {
         let max_tokens = max_tokens.min(self.cfg.max_seq - prompt.len());
         let (tx, rx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
-        let job = Job { prompt, max_tokens, sampling, cancel: Arc::clone(&cancel), events: tx };
+        let job = Job { prompt, images, max_tokens, sampling, cancel: Arc::clone(&cancel), events: tx };
         self.jobs
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -292,14 +326,15 @@ impl Server {
         let (mode, effort) = self.mode(&body)?;
         let msgs = Self::messages(&body)?;
         let encoded = chat::encode(&msgs, &chat::Options { mode, effort, drop_thinking: true }).map_err(|e| bad(e.to_string()))?;
-        if !encoded.images.is_empty() {
-            return Err(bad("images are not supported by this server yet"));
-        }
         let prompt = self.tok.encode(&encoded.prompt);
+        let (prompt, images) = if encoded.images.is_empty() { (prompt, Vec::new()) } else { self.prepare_images(&encoded.images, prompt)? };
+        if images.is_empty() && prompt.contains(&self.cfg.image_token_id) {
+            return Err(bad("the prompt holds an image placeholder but no image"));
+        }
         let n_prompt = prompt.len();
         let stream = body.get("stream").and_then(Json::as_bool).unwrap_or(false);
         let include_usage = body.get("stream_options").and_then(|o| o.get("include_usage")).and_then(Json::as_bool).unwrap_or(false);
-        let (rx, cancel) = self.submit(prompt, sampling, max_tokens)?;
+        let (rx, cancel) = self.submit(prompt, images, sampling, max_tokens)?;
         let peer = w.try_clone().ok();
         let id = random_id("chatcmpl-");
         let created = now();
@@ -517,9 +552,12 @@ impl Server {
         if prompt.is_empty() {
             return Err(bad("prompt is empty"));
         }
+        if prompt.contains(&self.cfg.image_token_id) {
+            return Err(bad("raw completions take no images; send them to /v1/chat/completions"));
+        }
         let n_prompt = prompt.len();
         let stream = body.get("stream").and_then(Json::as_bool).unwrap_or(false);
-        let (rx, cancel) = self.submit(prompt, sampling, max_tokens)?;
+        let (rx, cancel) = self.submit(prompt, Vec::new(), sampling, max_tokens)?;
         let peer = w.try_clone().ok();
         let id = random_id("cmpl-");
         let created = now();

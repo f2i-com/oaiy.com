@@ -4,9 +4,9 @@ NOTICE
 nrob — NVMe · RAM · On-GPU · Broker
 Copyright 2026 F2i
 
-The crates under crates/nrob, crates/nrob-cli, crates/dsv41 and
-crates/dsv41-cuda are licensed under the Apache License, Version 2.0 (see
-LICENSE-APACHE).
+The crates under crates/nrob, crates/nrob-cli, crates/nrob-image,
+crates/nrob-server, crates/dsv41 and crates/dsv41-cuda are licensed under
+the Apache License, Version 2.0 (see LICENSE-APACHE).
 
 crates/dsv41 and crates/dsv41-cuda implement DeepSeek-V4.1 following
 DeepSeek's reference inference code (inference/model.py) and chat
@@ -14,6 +14,15 @@ encoding (encoding/encoding.py); crates/dsv41/src/chat.rs ports the
 encoding rule for rule, including its prompt templates. That reference
 code and the model weights are published by DeepSeek under the MIT
 License.
+
+crates/nrob-image decodes and resizes images to the same pixels as Pillow,
+which the reference model's preprocessing uses. Its code is written from
+scratch, but it follows Pillow's resampling arithmetic (libImaging/
+Resample.c; Pillow is under the MIT-CMU license, Copyright (c) 1997-2011 by
+Secret Labs AB, Copyright (c) 1995-2011 by Fredrik Lundh and contributors)
+and libjpeg-turbo's integer IDCT, chroma upsampling and colour conversion
+(IJG and BSD licenses). This software is based in part on the work of the
+Independent JPEG Group.
 
 The crates under crates/gguf, crates/ggml-quants, crates/ggml-rs,
 crates/ggml-rs-cuda, crates/tokenizer, and crates/llama-rs are vendored

@@ -1,0 +1,11 @@
+[package]
+name = "nrob-image"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Image decoding for nrob's vision models: PNG (with its own inflate) and JPEG, decoded and resized the way Pillow does"
+
+# std-only like the engine core (CONVENTIONS.md): the one dependency is nrob
+# itself, for Error.
+[dependencies]
+nrob = { path = "../nrob" }

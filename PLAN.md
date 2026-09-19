@@ -130,6 +130,13 @@ prefix cache that resumes each harness turn. Long prompts run layer by layer at
     chunked rate on this SSD.
   - Exclusive VRAM/RAM tiers.
   - `nrob-server`, new code, with a prefix cache for coding harnesses.
+- **Phase 10 (2026-09-19): DeepSeek-V4.1 vision.**
+  - `nrob-image`: our own PNG (with inflate) and JPEG decoders and Pillow's resize,
+    pixel-exact to Pillow on 111 test images.
+  - The reference's preprocessing, bit-exact; the ViT and aligner on CPU (the oracle)
+    and GPU (60–160 ms an image).
+  - Image spans in the model (vision routing bias, Engram masking, any position,
+    chunked and layered), and images in `nrob-server`.
 
 ## Testing strategy
 
@@ -147,8 +154,10 @@ No downloads are needed for `cargo test --workspace`:
 ## Next
 
 - **DeepSeek-V4.1:**
-  - Vision: the 32-layer encoder is in the checkpoint; port it and splice image
-    features at `<｜deepseek_image｜>`.
+  - Vision: GIF/WebP decoding; a tensor-core GEMM for the ViT (it is SIMT now,
+    fine at one image a request); send large images (past ~500 tokens) through the
+    layered prefill when the caches are cold (token by token runs 2.7 tok/s cold,
+    8.5 warm).
   - A ≥2K-token oracle golden, to verify long contexts.
   - Striping the SSD tier over both drives (the drive throttles to 0.5 GB/s).
   - CUDA graphs for the decode step (launch overhead is ~10 ms of a ~35 ms token).

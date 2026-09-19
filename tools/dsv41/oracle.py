@@ -17,7 +17,13 @@ Outputs (in --out):
   <golden>.run.json        prompt text, decoded completion, timings, expert-cache stats,
                            and any test-only config overrides
 
+With --image, the prompt is an image (or several) followed by the text, run through the
+reference's vision tower; the golden then also holds `prompt_types` (the reference's token types,
+-1 for text) and `prefill.embed_vl` (the input embeddings after the image spans are merged in).
+
 Usage: python oracle.py --prompt "What is the capital of France?" --new-tokens 16
+       python oracle.py --image E:\deepseek\model\mascot.png --prompt "Describe this image." \
+                        --golden-name golden_image.safetensors
        python oracle.py --prompt-file prompts/long.txt --golden-name golden_long.safetensors \
                         --index-topk 32 --candidate-topk-blocks 4 --new-tokens 8
 """
@@ -178,6 +184,7 @@ def main():
     ap.add_argument("--expert-cache-gb", type=float, default=14.0)
     ap.add_argument("--fixture-layer", type=int, default=3)
     ap.add_argument("--prompt-file", help="read the user message from a UTF-8 file instead of --prompt")
+    ap.add_argument("--image", action="append", default=[], help="an image before the text (repeatable)")
     ap.add_argument("--golden-name", default="golden.safetensors")
     # Test-only overrides. The real limits (top 512 positions, 2048 candidate
     # blocks) only bite past ~1k tokens, which a CPU reference cannot prefill in
@@ -206,7 +213,8 @@ def main():
     with open(os.path.join(REF, "inference", "config.json")) as f:
         args = M.ModelArgs(**json.load(f))
     args.max_batch_size, args.max_seq_len, args.temperature = 1, args_cli.max_seq_len, 0.0
-    args.vision_n_layers = 0  # text only: no ViT, no VL routing bias
+    if not args_cli.image:
+        args.vision_n_layers = 0  # text only: no ViT, no VL routing bias
     args.dspark_block_size = 0  # no MTP / DSpark draft layers
     overrides = {}
     if args_cli.index_topk is not None:
@@ -303,13 +311,30 @@ def main():
     eh.forward = hash_fwd
     model.embed.register_forward_hook(lambda m, i, o: cap.__setitem__(f"{tag['phase']}.embed", o[0].detach().cpu()))
 
-    prompt = encode_messages([{"role": "user", "content": args_cli.prompt}], thinking_mode="chat")
-    ids = tokenizer.encode(prompt)
+    if args_cli.image:
+        from image_processor import prepare_vl_inputs
+
+        orig_merge = model.merge_image_embeddings
+
+        def merge(images, h):
+            orig_merge(images, h)
+            cap["prefill.embed_vl"] = h[0].detach().cpu()
+
+        model.merge_image_embeddings = merge
+        content = [{"type": "image", "url": path} for path in args_cli.image] + [{"type": "text", "text": args_cli.prompt}]
+        prompt, media = encode_messages([{"role": "user", "content": content}], thinking_mode="chat", return_multi_modal_data=True)
+        ids, types, image_inputs = prepare_vl_inputs(prompt, media["images"], tokenizer, args)
+        cap["prompt_types"] = torch.tensor(types, dtype=torch.int64)
+        forward_kw = {"images": [image_inputs], "token_types": torch.tensor([types], dtype=torch.long)}
+    else:
+        prompt = encode_messages([{"role": "user", "content": args_cli.prompt}], thinking_mode="chat")
+        ids = tokenizer.encode(prompt)
+        forward_kw = {}
     print(f"prompt: {len(ids)} tokens", flush=True)
     tokens = torch.tensor([ids], dtype=torch.long)
 
     t0 = time.perf_counter()
-    next_id, logits, _ = model.forward(tokens, 0)
+    next_id, logits, _ = model.forward(tokens, 0, **forward_kw)
     t_prefill = time.perf_counter() - t0
     cap["prefill.logits"] = logits[0].float().cpu()
     out_ids = [int(next_id[0])]
@@ -346,6 +371,7 @@ def main():
         "golden": args_cli.golden_name,
         "overrides": overrides,
         "prompt": args_cli.prompt,
+        "images": args_cli.image,
         "encoded_prompt": prompt,
         "completion": completion,
         "prompt_tokens": len(ids),

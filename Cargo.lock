@@ -121,6 +121,7 @@ name = "dsv41"
 version = "0.1.0"
 dependencies = [
  "nrob",
+ "nrob-image",
 ]
 
 [[package]]
@@ -360,6 +361,13 @@ dependencies = [
  "llama-rs",
  "nrob",
  "tokenizer",
+]
+
+[[package]]
+name = "nrob-image"
+version = "0.1.0"
+dependencies = [
+ "nrob",
 ]
 
 [[package]]

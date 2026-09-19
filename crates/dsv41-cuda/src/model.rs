@@ -45,12 +45,14 @@ use dsv41::expert::{SafetensorsExpertStore, DIM, INTER, RECORD_BYTES, S1, S2, S3
 use dsv41::hc::{HcParams, HC};
 use dsv41::linear::{load_vec, Out, Weight};
 use dsv41::model::{Backbone, Teacher, Trace};
-use dsv41::moe::{route, Route};
+use dsv41::moe::{route_mixed, Route};
 use dsv41::ops::Rope;
 use dsv41::safetensors::StIndex;
+use dsv41::vision::Prepared;
 
 use crate::expert_cache::DeviceExpertCache;
 use crate::gpu::{Gpu, Pos};
+use crate::vision::GpuVision;
 
 pub struct GpuOptions {
     /// CUDA device ordinals; layers are split evenly across them in order
@@ -75,6 +77,56 @@ pub struct GpuOptions {
     /// [`PROMOTE_PER_LAYER`] per layer per token). `None`: every miss is
     /// uploaded. `Some(0)`: one thread per hardware thread.
     pub cpu_expert_threads: Option<usize>,
+    /// Load the vision tower (about 1 GB on the first device, taken before
+    /// its expert cache is sized) so prompts can hold images.
+    pub vision: bool,
+}
+
+/// An image in the sequence: from absolute position `start`, `rows.len() /
+/// dim` tokens take these rows as their input embedding in place of their
+/// token's ([`GpuModel::encode_image`] makes them), route with the vision
+/// bias and take no part in Engram n-grams. A span may begin before a
+/// stretch and end after it; each forward uses the part it covers.
+#[derive(Clone, Debug)]
+pub struct ImageSpan {
+    pub start: usize,
+    pub rows: Vec<f32>,
+}
+
+/// Each token's image row for positions `start..start + t`, where it is one.
+fn image_rows(images: &[ImageSpan], start: usize, t: usize, d: usize) -> Result<Vec<Option<&[f32]>>> {
+    let mut rows = vec![None; t];
+    for sp in images {
+        if sp.rows.len() % d != 0 {
+            return Err(Error::Arg("image span rows are not whole embeddings".into()));
+        }
+        let n = sp.rows.len() / d;
+        for p in sp.start.max(start)..(sp.start + n).min(start + t) {
+            rows[p - start] = Some(&sp.rows[(p - sp.start) * d..(p - sp.start + 1) * d]);
+        }
+    }
+    Ok(rows)
+}
+
+/// An Engram layer's rows for a stretch (`hashes` `[t][cols]`) with the
+/// image tokens' left zero: the reference shuts their gate, and a zero row
+/// makes the gate here add exactly nothing (its key and value are 0).
+fn engram_rows(eg: &Engram, hashes: &[i64], head_dim: usize, cols: usize, skip: Option<&[bool]>) -> Result<Vec<f32>> {
+    let Some(skip) = skip else { return eg.rows(hashes, head_dim) };
+    let text: Vec<i64> = hashes.chunks_exact(cols).zip(skip).filter(|(_, &s)| !s).flat_map(|(h, _)| h.iter().copied()).collect();
+    let w = cols * head_dim;
+    let mut out = vec![0.0f32; skip.len() * w];
+    if text.is_empty() {
+        return Ok(out);
+    }
+    let rows = eg.rows(&text, head_dim)?;
+    let mut next = rows.chunks_exact(w);
+    for (dst, &s) in out.chunks_exact_mut(w).zip(skip) {
+        if !s {
+            dst.copy_from_slice(next.next().expect("one row per text token"));
+        }
+    }
+    Ok(out)
 }
 
 /// VRAM uploads a hybrid decode step may make per layer: each is a
@@ -225,6 +277,8 @@ struct GLayer {
     hc_ffn: HcDev,
     gate: DW,
     bias: Vec<f32>,
+    /// The routing bias for image tokens (`gate.bias_vl`).
+    bias_vl: Option<Vec<f32>>,
     shared: [DW; 3],
     engram: Option<(Arc<Engram>, DW, CudaSlice<f32>)>,
 }
@@ -278,6 +332,11 @@ pub struct GpuModel {
     states: Vec<GState>,
     hasher: NgramHasher,
     max_seq: usize,
+    vision: Option<GpuVision>,
+    /// The running forward's image tokens (empty: none).
+    image_mask: Vec<bool>,
+    /// Images for [`Backbone::forward_traced`] (whose signature has none).
+    trace_images: Vec<ImageSpan>,
     // cross-layer hand-offs (reference SharedAttentionRuntime)
     shared: Shared,
     compress_src: Option<usize>,
@@ -402,6 +461,14 @@ impl GpuModel {
                 hc_ffn: hcp("ffn")?,
                 gate: DW::load(g, &idx, &format!("{p}.ffn.gate"))?,
                 bias: load_vec(&idx, &format!("{p}.ffn.gate.bias"))?,
+                bias_vl: {
+                    let name = format!("{p}.ffn.gate.bias_vl");
+                    if idx.info(&name).is_ok() {
+                        Some(load_vec(&idx, &name)?)
+                    } else {
+                        None
+                    }
+                },
                 shared: [
                     DW::load(g, &idx, &format!("{p}.ffn.shared_experts.w1"))?,
                     DW::load(g, &idx, &format!("{p}.ffn.shared_experts.w2"))?,
@@ -416,6 +483,8 @@ impl GpuModel {
         let norm = vec(last, "norm.weight")?;
         let rope = |orig, theta| Rope::new(cfg.rope_head_dim, opts.max_seq, orig, theta, cfg.rope_factor, cfg.beta_fast, cfg.beta_slow);
         let (rw, rc) = (rope(0, cfg.rope_theta), rope(cfg.original_seq_len, cfg.compress_rope_theta));
+        // the vision tower before the expert caches size themselves from what is free
+        let vision = if opts.vision && cfg.vision.is_some() { Some(GpuVision::load(&gpus[0], &idx, &cfg)?) } else { None };
         let mut devs = Vec::with_capacity(n_dev);
         for g in gpus {
             let up = |r: &Rope| -> Result<(CudaSlice<f32>, CudaSlice<f32>)> {
@@ -446,6 +515,9 @@ impl GpuModel {
             layers,
             states,
             max_seq: opts.max_seq,
+            vision,
+            image_mask: Vec::new(),
+            trace_images: Vec::new(),
             shared: Shared::default(),
             compress_src: None,
             index_k_src: None,
@@ -622,7 +694,32 @@ impl GpuModel {
     /// `start_pos` must already have been run, or restored with
     /// [`restore`](Self::restore)).
     pub fn forward(&mut self, ids: &[u32], start_pos: usize) -> Result<Vec<f32>> {
-        self.run(ids, start_pos, None, None)
+        self.run(ids, start_pos, None, None, &[])
+    }
+
+    /// [`forward`](Self::forward) over a stretch that may hold image tokens
+    /// (the spans need not lie inside it, nor start at 0).
+    pub fn forward_with(&mut self, ids: &[u32], start_pos: usize, images: &[ImageSpan]) -> Result<Vec<f32>> {
+        self.run(ids, start_pos, None, None, images)
+    }
+
+    /// Image spans the golden checks' traced forwards
+    /// ([`Backbone::forward_traced`]) run with.
+    pub fn set_trace_images(&mut self, images: Vec<ImageSpan>) {
+        self.trace_images = images;
+    }
+
+    /// Whether the vision tower is loaded ([`GpuOptions::vision`] and a
+    /// checkpoint that has one).
+    pub fn has_vision(&self) -> bool {
+        self.vision.is_some()
+    }
+
+    /// A prepared image's span embeddings, `[n_tokens][dim]` (the delimiters'
+    /// learned rows around the aligner's), for an [`ImageSpan`].
+    pub fn encode_image(&self, img: &Prepared) -> Result<Vec<f32>> {
+        let v = self.vision.as_ref().ok_or_else(|| Error::Unsupported("the vision tower is not loaded".into()))?;
+        v.span(&self.devs[0].g, img)
     }
 
     /// Longest sequence the caches hold.
@@ -648,25 +745,38 @@ impl GpuModel {
     /// the state is then partly updated, so restore a checkpoint taken at
     /// or before `start_pos` before running anything else.
     pub fn prefill_layered(&mut self, ids: &[u32], start_pos: usize, sub: usize, cancel: Option<&std::sync::atomic::AtomicBool>) -> Result<Vec<f32>> {
+        self.prefill_layered_with(ids, start_pos, sub, cancel, &[])
+    }
+
+    /// [`prefill_layered`](Self::prefill_layered) over a stretch that may
+    /// hold image tokens.
+    pub fn prefill_layered_with(&mut self, ids: &[u32], start_pos: usize, sub: usize, cancel: Option<&std::sync::atomic::AtomicBool>, images: &[ImageSpan]) -> Result<Vec<f32>> {
         self.demand.prefill.store(true, std::sync::atomic::Ordering::Relaxed);
-        let out = self.layered_inner(ids, start_pos, sub.max(2), cancel);
+        let out = self.layered_inner(ids, start_pos, sub.max(2), cancel, images);
         self.demand.prefill.store(false, std::sync::atomic::Ordering::Relaxed);
         out
     }
 
-    fn layered_inner(&mut self, ids: &[u32], start_pos: usize, sub: usize, cancel: Option<&std::sync::atomic::AtomicBool>) -> Result<Vec<f32>> {
+    fn layered_inner(&mut self, ids: &[u32], start_pos: usize, sub: usize, cancel: Option<&std::sync::atomic::AtomicBool>, images: &[ImageSpan]) -> Result<Vec<f32>> {
         let (d, t) = (self.cfg.dim, ids.len());
         if t == 0 || start_pos + t > self.max_seq {
             return Err(Error::Arg(format!("{t} tokens at {start_pos}: past max_seq {}", self.max_seq)));
         }
-        let hashes = self.hasher.forward(ids, start_pos)?;
+        let img_rows = image_rows(images, start_pos, t, d)?;
+        let mask: Vec<bool> = img_rows.iter().map(Option::is_some).collect();
+        let any_image = mask.contains(&true);
+        self.image_mask.clear();
+        let hashes = self.hasher.forward_masked(ids, start_pos, any_image.then_some(&mask[..]))?;
         let mut h_host = vec![0.0f32; t * HC * d];
         for (i, &id) in ids.iter().enumerate() {
             if id as usize >= self.cfg.vocab_size {
                 return Err(Error::Arg(format!("token {id} outside the vocabulary")));
             }
             let row = &mut h_host[i * HC * d..(i + 1) * HC * d];
-            self.embed.row(id as usize, &mut row[..d]);
+            match img_rows[i] {
+                Some(r) => row[..d].copy_from_slice(r),
+                None => self.embed.row(id as usize, &mut row[..d]),
+            }
             for c in 1..HC {
                 row.copy_within(..d, c * d);
             }
@@ -686,7 +796,8 @@ impl GpuModel {
                     let hs: Vec<i64> = (0..t)
                         .flat_map(|i| hashes[(i * n_eng + eg.hash_index) * cols..(i * n_eng + eg.hash_index + 1) * cols].iter().copied())
                         .collect();
-                    std::thread::spawn(move || eg.rows(&hs, head_dim))
+                    let skip = any_image.then(|| mask.clone());
+                    std::thread::spawn(move || engram_rows(&eg, &hs, head_dim, cols, skip.as_deref()))
                 })
             })
             .collect();
@@ -744,7 +855,7 @@ impl GpuModel {
             let ly = &self.layers[l];
             let Dev { g, dcache, .. } = &mut self.devs[self.cur];
             let logits = g.download(&ly.gate.forward(g, &x2_all.as_view(), t, Out::F32)?)?;
-            let routes = route(&self.cfg, &logits, &ly.bias, t);
+            let routes = route_mixed(&self.cfg, &logits, &ly.bias, image_bias(ly, &mask), t);
             let prof = self.profile.is_some();
             let (y, fetch, experts) = routed_sum(g, dcache, &self.cache, self.store.as_ref(), l, &x2_all.as_view(), t, &routes, lim, prof)?;
             if let Some(p) = self.profile.as_mut() {
@@ -828,12 +939,12 @@ impl GpuModel {
         Ok(())
     }
 
-    fn run(&mut self, ids: &[u32], start_pos: usize, teacher: Option<Teacher<'_>>, trace: Option<Trace<'_>>) -> Result<Vec<f32>> {
+    fn run(&mut self, ids: &[u32], start_pos: usize, teacher: Option<Teacher<'_>>, trace: Option<Trace<'_>>, images: &[ImageSpan]) -> Result<Vec<f32>> {
         let prefill = ids.len() > 1;
         if prefill {
             self.demand.prefill.store(true, std::sync::atomic::Ordering::Relaxed);
         }
-        let out = self.run_inner(ids, start_pos, teacher, trace);
+        let out = self.run_inner(ids, start_pos, teacher, trace, images);
         if prefill {
             self.demand.prefill.store(false, std::sync::atomic::Ordering::Relaxed);
         } else {
@@ -845,18 +956,26 @@ impl GpuModel {
         out
     }
 
-    fn run_inner(&mut self, ids: &[u32], start_pos: usize, teacher: Option<Teacher<'_>>, mut trace: Option<Trace<'_>>) -> Result<Vec<f32>> {
+    fn run_inner(&mut self, ids: &[u32], start_pos: usize, teacher: Option<Teacher<'_>>, mut trace: Option<Trace<'_>>, images: &[ImageSpan]) -> Result<Vec<f32>> {
         let (d, t) = (self.cfg.dim, ids.len());
         if t == 0 || start_pos + t > self.max_seq {
             return Err(Error::Arg(format!("{t} tokens at {start_pos}: past max_seq {}", self.max_seq)));
         }
-        let hashes = self.hasher.forward(ids, start_pos)?;
+        let img_rows = image_rows(images, start_pos, t, d)?;
+        let mask: Vec<bool> = img_rows.iter().map(Option::is_some).collect();
+        let any_image = mask.contains(&true);
+        // the router (moe) reads it; set before anything can fail half-way
+        self.image_mask = if any_image { mask.clone() } else { Vec::new() };
+        let hashes = self.hasher.forward_masked(ids, start_pos, any_image.then_some(&mask[..]))?;
         let mut emb = vec![0.0f32; t * d];
         for (i, &id) in ids.iter().enumerate() {
             if id as usize >= self.cfg.vocab_size {
                 return Err(Error::Arg(format!("token {id} outside the vocabulary")));
             }
-            self.embed.row(id as usize, &mut emb[i * d..(i + 1) * d]);
+            match img_rows[i] {
+                Some(r) => emb[i * d..(i + 1) * d].copy_from_slice(r),
+                None => self.embed.row(id as usize, &mut emb[i * d..(i + 1) * d]),
+            }
         }
         if let Some(tr) = trace.as_mut() {
             tr("engram_hashes", &hashes.iter().map(|&v| v as f32).collect::<Vec<_>>());
@@ -879,7 +998,8 @@ impl GpuModel {
                     let hs: Vec<i64> = (0..t)
                         .flat_map(|i| hashes[(i * n_eng + eg.hash_index) * cols..(i * n_eng + eg.hash_index + 1) * cols].iter().copied())
                         .collect();
-                    std::thread::spawn(move || eg.rows(&hs, head_dim))
+                    let skip = any_image.then(|| mask.clone());
+                    std::thread::spawn(move || engram_rows(&eg, &hs, head_dim, cols, skip.as_deref()))
                 })
             })
             .collect();
@@ -1306,7 +1426,7 @@ impl GpuModel {
         } else {
             (g.download(&ly.gate.forward(g, &x.as_view(), t, Out::F32)?)?, None)
         };
-        let routes = route(&self.cfg, &logits, &ly.bias, t);
+        let routes = route_mixed(&self.cfg, &logits, &ly.bias, image_bias(ly, &self.image_mask), t);
         let prof = self.profile.is_some();
         let elapsed = |t0: Option<Instant>| -> Result<f64> {
             match t0 {
@@ -1476,6 +1596,15 @@ impl GpuModel {
             p.cpu_uses += cpu_uses;
         }
         Ok((out, routes))
+    }
+}
+
+/// The vision routing bias and the image mask, when the stretch holds image
+/// tokens and the layer has the bias.
+fn image_bias<'a>(ly: &'a GLayer, mask: &'a [bool]) -> Option<(&'a [f32], &'a [bool])> {
+    match &ly.bias_vl {
+        Some(vl) if !mask.is_empty() => Some((vl, mask)),
+        _ => None,
     }
 }
 
@@ -1715,6 +1844,9 @@ impl Backbone for GpuModel {
         &mut self.cfg
     }
     fn forward_traced(&mut self, ids: &[u32], start_pos: usize, teacher: Option<Teacher<'_>>, trace: Trace<'_>) -> Result<Vec<f32>> {
-        self.run(ids, start_pos, teacher, Some(trace))
+        let images = std::mem::take(&mut self.trace_images);
+        let out = self.run(ids, start_pos, teacher, Some(trace), &images);
+        self.trace_images = images;
+        out
     }
 }

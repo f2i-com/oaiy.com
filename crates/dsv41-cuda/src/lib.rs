@@ -12,6 +12,7 @@
 //!   its one `unsafe` call is the feature-checked dispatch)
 //! - [`handoff`] — pinned, device-mapped memory for the CPU/GPU exchanges
 //!   of a decode step (launch-ahead hand-off, router mailbox)
+//! - [`vision`] — the ViT and aligner (images to LLM input rows)
 //!
 //! `unsafe` lives in three places, each block with its SAFETY argument: the
 //! kernel launches and context setup (`gpu`), the pinned mappings (`handoff`)
@@ -24,6 +25,8 @@ pub mod expert_cache;
 pub mod gpu;
 pub mod handoff;
 pub mod model;
+pub mod vision;
 
 pub use gpu::Gpu;
-pub use model::{Checkpoint, GpuModel, GpuOptions};
+pub use model::{Checkpoint, GpuModel, GpuOptions, ImageSpan};
+pub use vision::GpuVision;

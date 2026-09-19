@@ -17,6 +17,8 @@
 //! - [`cpu_experts`] — decode-time routed experts on a CPU thread pool (hybrid tier)
 //! - [`engram`] — n-gram hash memory
 //! - [`model`] — the backbone forward pass
+//! - [`vision`] — image preprocessing (bit-exact to the reference's Pillow
+//!   pipeline) and the ViT + aligner on the CPU
 
 #![forbid(unsafe_code)]
 
@@ -38,3 +40,4 @@ pub mod ops;
 pub mod safetensors;
 pub mod tokenizer;
 pub mod unicode;
+pub mod vision;

@@ -43,6 +43,8 @@ struct Args {
     headroom_gb: f64,
     checkpoints: usize,
     cpu_threads: Option<usize>,
+    vision: bool,
+    local_images: Option<bool>,
     quiet: bool,
 }
 
@@ -76,6 +78,9 @@ const HELP: &str = "nrob-server: DeepSeek-V4.1-Flash behind an OpenAI-compatible
                        (default 2)
   --checkpoints N      prefix-cache checkpoints kept (~10 MB each, default 256)
   --cpu-threads N      CPU threads for experts that miss VRAM (default 24; 0 = off)
+  --no-vision          skip the vision tower (saves ~1 GB of VRAM; images are refused)
+  --local-images on|off  let requests name image files on this machine (paths,
+                       file:// URLs); default on when listening on loopback only
   --quiet              no per-request log
 ";
 
@@ -108,6 +113,8 @@ fn parse_args() -> Result<Args, String> {
         headroom_gb: 2.0,
         checkpoints: 256,
         cpu_threads: Some(24),
+        vision: true,
+        local_images: None,
         quiet: false,
     };
     let mut it = std::env::args().skip(1);
@@ -148,6 +155,14 @@ fn parse_args() -> Result<Args, String> {
                 let n = num(val()?)?;
                 a.cpu_threads = if n == 0 { None } else { Some(n) };
             }
+            "--no-vision" => a.vision = false,
+            "--local-images" => {
+                a.local_images = match val()?.as_str() {
+                    "on" => Some(true),
+                    "off" => Some(false),
+                    v => return Err(format!("--local-images: {v:?} is not on or off")),
+                }
+            }
             "--quiet" => a.quiet = true,
             other => return Err(format!("unknown option {other} (try --help)")),
         }
@@ -180,6 +195,7 @@ fn run(a: Args) -> nrob::Result<()> {
         vram_expert_bytes: None,
         vram_headroom_bytes: (a.headroom_gb * (1u64 << 30) as f64) as usize,
         cpu_expert_threads: a.cpu_threads,
+        vision: a.vision,
     };
     let mut model = GpuModel::load(&a.model, &a.golden.join("engram_meta.safetensors"), &opts)?;
     eprintln!("nrob-server: model loaded on cuda:{:?} in {:.1}s ({} token context)", a.devices, t.elapsed().as_secs_f64(), a.ctx);
@@ -189,6 +205,12 @@ fn run(a: Args) -> nrob::Result<()> {
         eprintln!("nrob-server: warmed {vram} experts into VRAM in {:.1}s; {queued} more loading into RAM in the background", t.elapsed().as_secs_f64());
     }
 
+    let vision = if model.has_vision() { model.cfg.vision.clone() } else { None };
+    let image_token_id = model.cfg.image_token_id;
+    if vision.is_some() {
+        eprintln!("nrob-server: vision tower loaded; chat requests may carry images");
+    }
+    let loopback = a.host == "localhost" || a.host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback());
     let (tx, rx) = mpsc::channel();
     let engine = engine::Engine::new(model, Arc::clone(&tok), a.chunk, a.step_below, a.layered_max, a.checkpoints, a.usage.clone(), !a.quiet);
     std::thread::Builder::new().name("model".into()).spawn(move || engine.run(rx)).map_err(nrob::Error::Io)?;
@@ -203,6 +225,9 @@ fn run(a: Args) -> nrob::Result<()> {
             max_tokens: a.max_tokens,
             temperature: a.temperature,
             top_p: a.top_p,
+            vision,
+            image_token_id,
+            local_images: a.local_images.unwrap_or(loopback),
         },
         tok,
         jobs: Mutex::new(tx),

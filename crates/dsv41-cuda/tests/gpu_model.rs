@@ -40,7 +40,7 @@ fn setup() -> Option<(StIndex, GpuModel)> {
     // DSV41_CPU_THREADS: hybrid decode (VRAM misses on the CPU); with a small
     // DSV41_VRAM_EXPERT_GB most decode experts then take the CPU path
     let cpu_expert_threads = std::env::var("DSV41_CPU_THREADS").ok().and_then(|v| v.parse().ok());
-    let opts = GpuOptions { devices: devices.clone(), max_seq: 1024, expert_cache_bytes: 24 << 30, direct_io: false, vram_expert_bytes, vram_headroom_bytes: 1 << 30, cpu_expert_threads };
+    let opts = GpuOptions { devices: devices.clone(), max_seq: 1024, expert_cache_bytes: 24 << 30, direct_io: false, vram_expert_bytes, vram_headroom_bytes: 1 << 30, cpu_expert_threads, vision: false };
     let mut model = match GpuModel::load(&model_dir, &meta, &opts) {
         Ok(m) => m,
         // only a missing device may skip; kernels that do not compile fail
@@ -163,7 +163,7 @@ fn gpu_chunked_prefill_and_checkpoints() {
     // every chunk at least 2 tokens: a 1-token forward is a decode step,
     // whose MoE path (CPU experts in hybrid mode) sums in another order
     let mut cuts: Vec<usize> = Vec::new();
-    for c in [(n / 7).max(2) | 1, n / 2 | 1, n - 2] {
+    for c in [(n / 7).max(2) | 1, (n / 2) | 1, n - 2] {
         if c >= cuts.last().copied().unwrap_or(0) + 2 && c + 2 <= n {
             cuts.push(c);
         }

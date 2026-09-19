@@ -470,6 +470,61 @@ Measured (both GPUs, 140 GB RAM tier):
   - With aging, the coding prompt's three runs went 42% → 67% → 77% VRAM hits and
     2.6 → 8.5 → **12.1 tok/s** (7.2 before).
 
+### Vision (Phase G)
+
+The reference (`image_processor.py`, `vision.py`) decodes with Pillow, pads to a
+14-pixel grid with bicubic resampling, runs a 32-block ViT (dim 1024, 2-D RoPE) and a
+3×3 aligner into LLM rows, and fills an image span `[START] (IMAGE×w NEWLINE)×h [END]`
+whose positions all carry `<｜deepseek_image｜>`.
+
+- **Decoding, our own:** `crates/nrob-image` (std-only, no `unsafe`).
+  - PNG with its own inflate: every colour type, bit depth, Adam7, every filter,
+    stored, fixed and dynamic deflate blocks.
+  - JPEG: baseline and progressive, libjpeg-turbo's integer IDCT, fancy upsampling
+    and colour tables; CMYK/YCCK through Pillow's `CMYK;I` conversion.
+  - Pillow's quirks kept: alpha dropped without compositing, 16-bit samples keep the
+    high byte, 16-bit grey clips at 255, no EXIF rotation.
+  - **Pixel-exact to Pillow on all 111 test images**
+    (`tools/dsv41/vision_golden.py`). Truncated and bit-flipped files return errors,
+    never panics.
+- **Preprocessing:** Pillow's two-pass fixed-point resampling and `ImageOps.pad`
+  (Python's half-to-even rounding included), then the f32 normalization. The patches
+  are **bit-exact** to the reference's on 9 images, and the sizing plan on 5,712 sizes.
+- **The tower** (`dsv41::vision::VisionTower` on the CPU as the oracle,
+  `dsv41_cuda::GpuVision` on the GPU): about 1 GB of bf16 weights on the first device,
+  loaded before the expert cache sizes itself.
+  - Each block alone is within ~1e-3 of the reference.
+  - End to end, 1.6–2.5% (rel-L2, GPU). bf16 noise compounds through the blocks from
+    12 on, which grow outlier activations (up to ~1,800). torch's own CPU bf16 run is
+    3.2% from its GPU run, exact fp32 4.8%.
+  - 60 ms for 1,521 patches, 160 ms for 3,672, with a SIMT GEMM and a
+    one-thread-per-query attention.
+- **In the model:** `GpuModel::forward_with` / `prefill_layered_with` take image
+  spans (absolute positions, any chunking).
+  - Image tokens take the span rows as embeddings and route with `gate.bias_vl`.
+  - They enter the n-gram history as DEAD, and their Engram rows are zero, so the gate
+    adds exactly nothing.
+  - A split inside an image, and layered prefill, agree with one prefill bit for bit.
+- **Against the oracle** (`oracle.py --image`, the mascot plus "Describe this image in
+  one sentence.", 196 tokens):
+  - Teacher-forced, every layer's p95 is ≤ 1.3e-2, and 38 of 7,840 token-routes differ
+    (near-ties). Final logits are within 5.9e-3.
+  - Free-running, the prompt is chaotic: one bf16 ulp on 1% of the image rows moves our
+    own final logits by 24%, about as far as we land from the oracle (27%). The replies
+    agree in substance:
+    - oracle: *"The image shows a minimalist, dark-themed icon of a stylized robot with
+      a smiling face, antenna, and boxy…"*
+    - nrob, own pipeline end to end: *"The image displays a minimalist, line-art icon
+      of a stylized robot with a smiling face, antenna, and boxy…"*
+- **Serving:** `image_url` parts (base64 `data:` URLs, or local paths on a loopback
+  server) are decoded and sized on the request thread. The worker encodes only the
+  images the uncached part of the prompt reaches, and the prefix cache keys image
+  positions by content.
+  - A chart (254 image tokens) read back exactly: title, four values, bar colours.
+  - A follow-up turn reused 363 cached tokens, image included (prompt 6.8 s).
+  - Image tokens run token by token like other short stretches: 2.7 tok/s cold (the
+    vision-biased experts are not cached yet), 8.5 tok/s warm.
+
 ## Phases
 
 Each phase ends in something measurable. Effort figures are rough.
@@ -485,9 +540,8 @@ Each phase ends in something measurable. Effort figures are rough.
   overlap (launch-ahead), warm tiers across runs; ~29 tok/s warm.
 - **E — usable (done, 2026-09-19).** Rust tokenizer and chat format, chunk
   continuation, checkpoints, layered prefill, the OpenAI-compatible server.
+- **G — vision (done, 2026-09-19; see Status, "Vision").**
 - **F — next.**
-  - Vision: port the 32-layer encoder (`vision.py`, `image_processor.py`) and splice
-    its features at `<｜deepseek_image｜>`.
   - A longer oracle golden (≥2K tokens) to verify long contexts.
   - Stripe the SSD-tier experts over both drives.
   - CUDA graphs for decode, then DSpark speculation.

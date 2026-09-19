@@ -58,7 +58,7 @@ fn main() -> nrob::Result<()> {
     ids.truncate(n_tokens);
 
     let t = Instant::now();
-    let opts = GpuOptions { devices: devices.clone(), max_seq: ids.len() + 16, expert_cache_bytes: ram_gb << 30, direct_io: true, vram_expert_bytes: None, vram_headroom_bytes: 1 << 30, cpu_expert_threads: Some(24) };
+    let opts = GpuOptions { devices: devices.clone(), max_seq: ids.len() + 16, expert_cache_bytes: ram_gb << 30, direct_io: true, vram_expert_bytes: None, vram_headroom_bytes: 1 << 30, cpu_expert_threads: Some(24), vision: false };
     let mut model = GpuModel::load(&model_dir, &golden.join("engram_meta.safetensors"), &opts)?;
     eprintln!("[loaded in {:.1}s on cuda:{devices:?}]", t.elapsed().as_secs_f64());
     let usage = std::env::var_os("DSV41_USAGE").map(PathBuf::from).unwrap_or_else(|| r"E:\deepseek\expert_usage.txt".into());

@@ -64,9 +64,20 @@ impl Moe {
 /// the bias picks the top experts, the unbiased `sqrt(softplus)` scores
 /// weight them (normalized, times `route_scale`). Ties: lower id first.
 pub fn route(cfg: &Config, logits: &[f32], bias: &[f32], t: usize) -> Vec<Route> {
+    route_mixed(cfg, logits, bias, None, t)
+}
+
+/// [`route`] where image tokens (`image_bias.1[i]`) pick their experts with
+/// the vision correction bias `image_bias.0` (the checkpoint's `bias_vl`,
+/// the reference `Gate`'s `image_mask` path).
+pub fn route_mixed(cfg: &Config, logits: &[f32], bias: &[f32], image_bias: Option<(&[f32], &[bool])>, t: usize) -> Vec<Route> {
     let n = bias.len();
     (0..t)
         .map(|i| {
+            let bias = match image_bias {
+                Some((vl, mask)) if mask[i] => vl,
+                _ => bias,
+            };
             let scores: Vec<f32> = logits[i * n..(i + 1) * n].iter().map(|&v| softplus(v).sqrt()).collect();
             let mut order: Vec<usize> = (0..n).collect();
             order.sort_by(|&a, &b| (scores[b] + bias[b]).total_cmp(&(scores[a] + bias[a])).then(a.cmp(&b)));

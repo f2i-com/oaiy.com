@@ -5,6 +5,9 @@ members = [
     "crates/nrob-cli",
     # DeepSeek-V4.1 support (docs/DEEPSEEK_V41.md); std-only like the core.
     "crates/dsv41",
+    # Image decoding for the vision models (PNG, JPEG, Pillow-exact resize);
+    # std-only like the core.
+    "crates/nrob-image",
     # Its CUDA path (and the hybrid CPU/GPU decode). Like ggml-rs-cuda: a
     # member, not a default member (needs a CUDA toolchain); holds the
     # reviewed unsafe (kernel launches, pinned mappings, AVX-512 dispatch).
@@ -30,6 +33,7 @@ default-members = [
     "crates/nrob",
     "crates/nrob-cli",
     "crates/dsv41",
+    "crates/nrob-image",
     "crates/gguf",
     "crates/ggml-quants",
     "crates/ggml-rs",
@@ -41,7 +45,7 @@ default-members = [
 edition = "2021"
 license = "Apache-2.0"
 
-# Hard rule for nrob and dsv41: std-only, no external crates.
+# Hard rule for nrob, nrob-image and dsv41: std-only, no external crates.
 # Do not add a [workspace.dependencies] table.
 # Exception: the vendored GGUF subsystem members (crates/gguf,
 # ggml-quants, ggml-rs, tokenizer, llama-rs, ggml-rs-cuda — see

@@ -61,6 +61,29 @@ pub struct Config {
     // tokens
     pub bos_token_id: u32,
     pub eos_token_id: u32,
+    /// The id every position of an image span carries (`<｜deepseek_image｜>`).
+    pub image_token_id: u32,
+    /// The vision tower, when the checkpoint has one.
+    pub vision: Option<VisionConfig>,
+}
+
+/// `vision_config`: the ViT, its aligner and how images are sized for it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct VisionConfig {
+    pub n_layers: usize,
+    pub dim: usize,
+    pub n_heads: usize,
+    pub inter_dim: usize,
+    pub patch_size: usize,
+    pub rope_theta: f32,
+    /// The aligner merges `downsample x downsample` patches into one token.
+    pub downsample: usize,
+    /// Most LLM tokens one image may take, delimiters included.
+    pub max_tokens: usize,
+    /// Smaller images are scaled up to at least this many pixels.
+    pub min_pixels: usize,
+    /// Wider images are squeezed to this aspect ratio (none in V4.1).
+    pub max_wh_ratio: Option<usize>,
 }
 
 impl Config {
@@ -141,6 +164,11 @@ impl Config {
             engram_head_dim: int("engram_head_dim")?,
             bos_token_id: int_or(&root, "bos_token_id", 0) as u32,
             eos_token_id: int_or(&root, "eos_token_id", 1) as u32,
+            image_token_id: int_or(&root, "image_token_id", 129264) as u32,
+            vision: match root.get("vision_config") {
+                Some(v) if int_or(v, "num_hidden_layers", 0) > 0 => Some(VisionConfig::parse(v)?),
+                _ => None,
+            },
         };
         cfg.validate()?;
         Ok(cfg)
@@ -177,6 +205,41 @@ impl Config {
     }
 }
 
+impl VisionConfig {
+    fn parse(v: &Json) -> Result<VisionConfig> {
+        let int = |key: &str| -> Result<usize> {
+            v.get(key)
+                .and_then(Json::as_i64)
+                .and_then(|x| usize::try_from(x).ok())
+                .filter(|&x| x > 0)
+                .ok_or_else(|| Error::Format(format!("config.json: vision_config.{key} missing or not a count")))
+        };
+        let cfg = VisionConfig {
+            n_layers: int("num_hidden_layers")?,
+            dim: int("hidden_size")?,
+            n_heads: int("num_attention_heads")?,
+            inter_dim: int("intermediate_size")?,
+            patch_size: int("patch_size")?,
+            rope_theta: v.get("rope_theta").and_then(Json::as_f64).unwrap_or(10000.0) as f32,
+            downsample: int("downsample_ratio")?,
+            max_tokens: int("max_image_tokens")?,
+            min_pixels: int("min_pixels")?,
+            max_wh_ratio: v.get("max_wh_ratio").and_then(Json::as_i64).and_then(|x| usize::try_from(x).ok()).filter(|&x| x > 0),
+        };
+        if !cfg.dim.is_multiple_of(cfg.n_heads) || !(cfg.dim / cfg.n_heads).is_multiple_of(4) {
+            return Err(Error::Format("config.json: vision head size must split into two rotary halves".into()));
+        }
+        if cfg.max_tokens < 3 * cfg.downsample {
+            return Err(Error::Format("config.json: vision max_image_tokens too small".into()));
+        }
+        Ok(cfg)
+    }
+
+    pub fn head_dim(&self) -> usize {
+        self.dim / self.n_heads
+    }
+}
+
 fn d_ok(x: f32) -> bool {
     x.is_finite()
 }
@@ -197,6 +260,10 @@ mod tests {
         assert_eq!(c.candidate_source_layer, Some(20));
         assert_eq!(c.engram_cols(), 24);
         assert_eq!(c.norm_eps, 1e-20);
+        assert_eq!(c.image_token_id, 129264);
+        let v = c.vision.expect("vision_config");
+        assert_eq!((v.n_layers, v.dim, v.n_heads, v.inter_dim, v.patch_size), (32, 1024, 16, 2816, 14));
+        assert_eq!((v.downsample, v.max_tokens, v.min_pixels, v.max_wh_ratio), (3, 1024, 544 * 544, None));
     }
 
     #[test]
