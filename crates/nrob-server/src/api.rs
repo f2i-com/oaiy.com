@@ -460,6 +460,27 @@ impl Server {
                     }
                 }
                 Event::Prefilled { cached: c } => cached = c,
+                Event::Thinking { used, budget, done } => {
+                    if let Some(s) = sse.as_mut() {
+                        let mut c = chunk(Json::obj::<&str>([]), None);
+                        if let Json::Obj(fields) = &mut c {
+                            for (k, v) in fields.iter_mut() {
+                                if k == "choices" {
+                                    *v = Json::Arr(Vec::new());
+                                }
+                            }
+                            fields.push((
+                                "nrob_thinking".into(),
+                                Json::obj([
+                                    ("used", Json::Int(used as i64)),
+                                    ("budget", budget.map_or(Json::Null, |b| Json::Int(b as i64))),
+                                    ("done", Json::Bool(done)),
+                                ]),
+                            ));
+                        }
+                        let _ = s.send(format!("data: {}\n\n", c.to_json()).as_bytes());
+                    }
+                }
                 Event::Text(t) => {
                     if stop.hit {
                         continue;

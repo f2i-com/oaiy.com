@@ -88,6 +88,10 @@ pub enum Event {
     Progress { done: usize, total: usize },
     /// The prompt is in: `cached` of its tokens came from the prefix cache.
     Prefilled { cached: usize },
+    /// How far the reply's reasoning has got: `used` tokens of its `budget`
+    /// (`None`: no limit); `done` once it has closed (sent every
+    /// [`THINKING_EVERY`] tokens, and at the end).
+    Thinking { used: usize, budget: Option<usize>, done: bool },
     /// More reply text (whole UTF-8 characters).
     Text(String),
     Done { finish: Finish, completion_tokens: usize },
@@ -124,33 +128,39 @@ pub struct Engine {
 /// in circles (re-deriving what it has already checked) stops and acts.
 struct ThinkBudget {
     end: u32,
-    /// Tokens left while the reply is still reasoning.
-    left: Option<usize>,
+    /// Still inside the `<think>` block.
+    thinking: bool,
+    /// Reasoning tokens so far.
+    used: usize,
+    budget: Option<usize>,
 }
+
+/// Reasoning progress goes to the client every this many tokens.
+const THINKING_EVERY: usize = 16;
 
 impl ThinkBudget {
     fn new(opens_thinking: bool, end: Option<u32>, budget: Option<usize>) -> ThinkBudget {
-        match (opens_thinking, end, budget) {
-            (true, Some(end), Some(budget)) => ThinkBudget { end, left: Some(budget) },
-            _ => ThinkBudget { end: 0, left: None },
+        match end {
+            Some(end) if opens_thinking => ThinkBudget { end, thinking: true, used: 0, budget },
+            _ => ThinkBudget { end: 0, thinking: false, used: 0, budget: None },
         }
     }
 
     /// The token to take in place of `sampled`, and whether the budget
     /// forced it.
     fn pass(&mut self, sampled: u32) -> (u32, bool) {
-        let Some(left) = self.left.as_mut() else {
-            return (sampled, false);
-        };
-        if sampled == self.end {
-            self.left = None;
+        if !self.thinking {
             return (sampled, false);
         }
-        if *left == 0 {
-            self.left = None;
+        if sampled == self.end {
+            self.thinking = false;
+            return (sampled, false);
+        }
+        if self.budget.is_some_and(|b| self.used >= b) {
+            self.thinking = false;
             return (self.end, true);
         }
-        *left -= 1;
+        self.used += 1;
         (sampled, false)
     }
 }
@@ -448,9 +458,13 @@ impl Engine {
         let mut budget = ThinkBudget::new(think_start.is_some() && prompt.last().copied() == think_start, self.tok.special(dsv41::chat::THINK_END), job.think_budget);
         let decode = Instant::now();
         let finish = loop {
+            let was_thinking = budget.thinking;
             let (next, forced) = budget.pass(sample(&logits, &job.sampling, &mut rng));
             if forced && self.log {
                 eprintln!("  reasoning ended at its budget ({} tokens)", job.think_budget.unwrap_or(0));
+            }
+            if was_thinking && (!budget.thinking || budget.used.is_multiple_of(THINKING_EVERY)) {
+                let _ = job.events.send(Event::Thinking { used: budget.used, budget: budget.budget, done: !budget.thinking });
             }
             if next == self.eos {
                 break Finish::Stop;

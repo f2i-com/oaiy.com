@@ -172,8 +172,9 @@ OpenAI's.
   `</think>` itself, so a model going round in circles stops and answers.
 - **Progress:** a streamed request also gets chunks with no `choices` (OpenAI clients
   skip them): `nrob_progress: {prompt_done, prompt_total}` while the prompt is read,
-  and `nrob_tool: {calls, name, parameter, chars, tail}` a few times a second while a
-  tool call is being written, so a harness can show the work before the call is whole.
+  `nrob_tool: {calls, name, parameter, chars, tail}` a few times a second while a
+  tool call is being written, so a harness can show the work before the call is whole,
+  and `nrob_thinking: {used, budget, done}` every 16 reasoning tokens.
 - **Prefix cache:** a harness resends the whole conversation every turn. The server
   resumes from the live state or from a checkpoint (taken every 256 prompt tokens and at
   user-turn boundaries), so a turn only runs its new tokens. A new chat with the same
