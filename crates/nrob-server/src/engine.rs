@@ -14,11 +14,13 @@
 //!   earlier (a re-rendered reply, an edited history, a new chat with the
 //!   same system prompt) restores the latest checkpoint before the
 //!   divergence and runs only the rest;
-//! - with a prompt cache directory, the state where a conversation's first
-//!   user message begins and the state at the end of each prompt also go to
-//!   disk ([`crate::disk`]), and a prompt that disk covers more of than the
+//! - with a prompt cache directory, states also go to disk
+//!   ([`crate::disk`]): where a conversation's first user message begins,
+//!   after each layered pass, where the newest user message begins, and at
+//!   the end of each prompt. A prompt that disk covers more of than the
 //!   worker does starts from there: a new process does not read the system
-//!   prompt again, nor a conversation it resumes;
+//!   prompt again, nor a conversation it resumes, and a long read stopped
+//!   part-way carries on where it stopped;
 //! - what is left runs token by token through the decode path when short
 //!   (its experts mostly sit in VRAM and RAM already), and layer by layer
 //!   when long ([`GpuModel::prefill_layered`]: every expert read once for
@@ -374,6 +376,8 @@ impl Engine {
         // where the conversation's first user message begins (the system
         // prompt and tools before it), if this prompt still has to run it
         let first_turn = prompt.iter().position(|&t| Some(t) == user).filter(|&p| p > start);
+        // where the newest user message begins: the conversation before it
+        let last_turn = turns.last().copied();
         let mut ends: Vec<usize> = [turns.first(), turns.last()].into_iter().flatten().copied().collect();
         ends.push(prompt.len());
         ends.dedup();
@@ -450,6 +454,12 @@ impl Engine {
                     // the system prompt and tools: where the next process's
                     // chats start
                     self.persist(pos, true);
+                } else if how == "layered" || Some(pos) == last_turn {
+                    // a long read keeps what it has read so far (a restart,
+                    // or a request stopped part-way, carries on from here),
+                    // and the conversation up to its newest message is what
+                    // a resumed session starts from (read-aheads included)
+                    self.persist(pos, false);
                 }
             }
         }

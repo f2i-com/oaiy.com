@@ -5,8 +5,10 @@
 //! An entry is a [`Snapshot`] of the model's state after a prompt prefix,
 //! with that prefix's keys (see `engine::prompt_keys`; prompts with images
 //! are not kept). The engine saves one where a conversation's first user
-//! message begins (the system prompt and tools) and one at the end of each
-//! prompt; a prompt's entry replaces its conversation's shorter ones. When a
+//! message begins (the system prompt and tools), and for the conversation
+//! after each layered pass, where its newest user message begins and at the
+//! end of each prompt; a newer entry replaces its conversation's shorter
+//! ones. When a
 //! prompt comes that the model's own state and checkpoints cover less of
 //! than an entry does, the entry is loaded instead.
 //!
