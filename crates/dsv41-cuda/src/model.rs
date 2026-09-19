@@ -271,7 +271,13 @@ impl DW {
         match self {
             DW::Fp8 { w, s, n, k } => {
                 let xq = g.act_quant_fp8_to(x)?;
-                g.gemv_fp8(&xq.as_view(), w, s, &mut y.slice_mut(..), *n, *k, t, true)?;
+                // several tokens (prefill) on tensor cores: a token's result
+                // does not depend on how many share the launch
+                if t > 1 && k % 32 == 0 {
+                    g.gemm_fp8(&xq.as_view(), w, s, &mut y.slice_mut(..), *n, *k, t, true)?;
+                } else {
+                    g.gemv_fp8(&xq.as_view(), w, s, &mut y.slice_mut(..), *n, *k, t, true)?;
+                }
             }
             DW::Bf16 { w, n, k } => g.gemv_bf16(x, w, &mut y.slice_mut(..), *n, *k, t, out == Out::Bf16, 0, 0)?,
         }
@@ -823,7 +829,19 @@ impl GpuModel {
         self.demand.prefill.store(true, std::sync::atomic::Ordering::Relaxed);
         let out = self.layered_inner(ids, start_pos, sub.max(2), cancel, images);
         self.demand.prefill.store(false, std::sync::atomic::Ordering::Relaxed);
+        if out.is_ok() {
+            self.admit_prefill_experts()?;
+        }
         out
+    }
+
+    /// After a prefill, each device takes the experts the prompt used most
+    /// that it lacked (see [`DeviceExpertCache::admit_pending`]).
+    fn admit_prefill_experts(&mut self) -> Result<()> {
+        for d in &mut self.devs {
+            d.dcache.admit_pending(&d.g, &self.cache, self.store.as_ref())?;
+        }
+        Ok(())
     }
 
     fn layered_inner(&mut self, ids: &[u32], start_pos: usize, sub: usize, cancel: Option<&std::sync::atomic::AtomicBool>, images: &[ImageSpan]) -> Result<Vec<f32>> {
@@ -1048,6 +1066,9 @@ impl GpuModel {
         let out = self.run_inner(ids, start_pos, teacher, trace, images, logits);
         if prefill {
             self.demand.prefill.store(false, std::sync::atomic::Ordering::Relaxed);
+            if out.is_ok() {
+                self.admit_prefill_experts()?;
+            }
         } else {
             // decode tokens age the VRAM caches' usage counts
             for d in &mut self.devs {
@@ -1392,7 +1413,11 @@ impl GpuModel {
         let (groups, orank) = (self.cfg.o_groups, self.cfg.o_lora_rank);
         let gd = nh * hd / groups;
         let mut og = g.alloc::<f32>(t * groups * orank)?;
-        g.gemv_fp8w(&o.as_view(), &ly.wo_a.0, &ly.wo_a.1, &mut og.slice_mut(..), groups * orank, gd, t, true, orank, nh * hd)?;
+        if t > 1 && gd % 32 == 0 && orank % 64 == 0 {
+            g.gemm_fp8w(&o.as_view(), &ly.wo_a.0, &ly.wo_a.1, &mut og.slice_mut(..), groups * orank, gd, t, true, orank, nh * hd)?;
+        } else {
+            g.gemv_fp8w(&o.as_view(), &ly.wo_a.0, &ly.wo_a.1, &mut og.slice_mut(..), groups * orank, gd, t, true, orank, nh * hd)?;
+        }
         ly.wo_b.forward(g, &og.as_view(), t, Out::Bf16)
     }
 
@@ -1825,7 +1850,7 @@ fn compute_experts(
         // before the next fetch, and one stream orders that fetch's
         // upload after them, so only the slot in use needs pinning
         dcache.begin_batch();
-        let rec = dcache.get_transient(g, l as u32, e, host, store)?;
+        let rec = dcache.get_prefill(g, l as u32, e, toks.len() as u64, host, store)?;
         *fetch += elapsed(tf)?;
         let tc = if prof { Some(Instant::now()) } else { None };
         let nt = toks.len();
@@ -1834,13 +1859,15 @@ fn compute_experts(
         g.gather_rows(x, &tok_idx, &mut xs, DIM, nt)?;
         g.act_quant_fp8(&mut xs.slice_mut(..))?;
         let (mut gate, mut up) = (g.alloc::<f32>(nt * INTER)?, g.alloc::<f32>(nt * INTER)?);
-        g.gemv_fp4(&xs.as_view(), &rec.slice(W1), &rec.slice(S1), &mut gate.slice_mut(..), INTER, DIM, nt, true)?;
-        g.gemv_fp4(&xs.as_view(), &rec.slice(W3), &rec.slice(S3), &mut up.slice_mut(..), INTER, DIM, nt, true)?;
+        // tensor cores for every prefill expert, however few its tokens: a
+        // token's result must not depend on how many share the launch
+        g.gemm_fp4(&xs.as_view(), &rec.slice(W1), &rec.slice(S1), &mut gate.slice_mut(..), INTER, DIM, nt, true)?;
+        g.gemm_fp4(&xs.as_view(), &rec.slice(W3), &rec.slice(S3), &mut up.slice_mut(..), INTER, DIM, nt, true)?;
         let mut hbuf = g.alloc::<f32>(nt * INTER)?;
         g.swiglu(&gate, &up, Some(&g.upload(&ws)?), &mut hbuf, INTER, nt, lim)?;
         g.act_quant_fp8(&mut hbuf.slice_mut(..))?;
         let mut out = g.alloc::<f32>(nt * DIM)?;
-        g.gemv_fp4(&hbuf.as_view(), &rec.slice(W2), &rec.slice(S2), &mut out.slice_mut(..), DIM, INTER, nt, true)?;
+        g.gemm_fp4(&hbuf.as_view(), &rec.slice(W2), &rec.slice(S2), &mut out.slice_mut(..), DIM, INTER, nt, true)?;
         g.scatter_add_rows(y, &out, &tok_idx, DIM, nt)?;
         *compute += elapsed(tc)?;
     }

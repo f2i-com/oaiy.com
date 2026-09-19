@@ -61,6 +61,9 @@ const KERNELS: &[&str] = &[
     "vit_attn",
     "silu_mul",
     "gelu_round",
+    "gemm_fp4",
+    "gemm_fp8",
+    "gemm_fp8w",
 ];
 
 /// Map any CUDA error into the engine's error type.
@@ -386,6 +389,93 @@ impl Gpu {
         b.arg(xq).arg(w).arg(s).arg(y).arg(&ni).arg(&ki).arg(&ti).arg(&ri);
         // SAFETY: gemv_fp4(const float* x, const u8* w, const u8* s, float* y, int n, int k, int nt, int round).
         cu(unsafe { b.launch(rows_cfg(n)) })?;
+        Ok(())
+    }
+
+    /// [`gemv_fp4`](Self::gemv_fp4) for many tokens, on tensor cores: the
+    /// same products (every operand is exact in bf16), fp32 sums in another
+    /// order; `n` a multiple of 64, `k` of 32. A token's outputs do not
+    /// depend on `nt`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_fp4(
+        &self,
+        xq: &CudaView<'_, f32>,
+        w: &CudaView<'_, u8>,
+        s: &CudaView<'_, u8>,
+        y: &mut CudaViewMut<'_, f32>,
+        n: usize,
+        k: usize,
+        nt: usize,
+        round: bool,
+    ) -> Result<()> {
+        assert!(k.is_multiple_of(32) && n.is_multiple_of(64) && w.len() >= n * k / 2 && s.len() >= n * k / 32 && y.len() >= n * nt && xq.len() >= nt * k);
+        let (ni, ki, ti, ri) = (n as i32, k as i32, nt as i32, i32::from(round));
+        let cfg = LaunchConfig { grid_dim: ((n / 64) as u32, nt.div_ceil(64) as u32, 1), block_dim: (128, 1, 1), shared_mem_bytes: 0 };
+        let mut b = self.stream.launch_builder(self.f("gemm_fp4"));
+        b.arg(xq).arg(w).arg(s).arg(y).arg(&ti).arg(&ni).arg(&ki).arg(&ri);
+        // SAFETY: gemm_fp4(const float* x, const u8* w, const u8* s, float* y, int t, int n, int k,
+        // int round); rows past t and columns past n are neither read nor written, lengths asserted.
+        cu(unsafe { b.launch(cfg) })?;
+        Ok(())
+    }
+
+    /// [`gemv_fp8`](Self::gemv_fp8) for many tokens, on tensor cores (see
+    /// [`gemm_fp4`](Self::gemm_fp4)); `k` a multiple of 32.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_fp8(
+        &self,
+        xq: &CudaView<'_, f32>,
+        w: &CudaSlice<u8>,
+        s: &CudaSlice<u8>,
+        y: &mut CudaViewMut<'_, f32>,
+        n: usize,
+        k: usize,
+        nt: usize,
+        round: bool,
+    ) -> Result<()> {
+        assert!(k.is_multiple_of(32) && w.len() >= n * k && s.len() >= n.div_ceil(32) * (k / 32) && y.len() >= n * nt && xq.len() >= nt * k);
+        let (ni, ki, ti, ri) = (n as i32, k as i32, nt as i32, i32::from(round));
+        let cfg = LaunchConfig { grid_dim: (n.div_ceil(64) as u32, nt.div_ceil(64) as u32, 1), block_dim: (128, 1, 1), shared_mem_bytes: 0 };
+        let mut b = self.stream.launch_builder(self.f("gemm_fp8"));
+        b.arg(xq).arg(w).arg(s).arg(y).arg(&ti).arg(&ni).arg(&ki).arg(&ri);
+        // SAFETY: gemm_fp8(const float* x, const u8* w, const u8* s, float* y, int t, int n, int k,
+        // int round); rows past t and columns past n are neither read nor written, the weight rows
+        // are read as 4-byte words (k % 32 == 0 keeps them aligned), lengths asserted.
+        cu(unsafe { b.launch(cfg) })?;
+        Ok(())
+    }
+
+    /// [`gemv_fp8w`](Self::gemv_fp8w) for many tokens, on tensor cores (x
+    /// must hold bf16 values, as the attention output does); `k` a multiple
+    /// of 32, `group_rows` 0 or a multiple of 64.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_fp8w(
+        &self,
+        x: &CudaView<'_, f32>,
+        w: &CudaSlice<u8>,
+        s: &CudaSlice<u8>,
+        y: &mut CudaViewMut<'_, f32>,
+        n: usize,
+        k: usize,
+        nt: usize,
+        round: bool,
+        group_rows: usize,
+        x_stride: usize,
+    ) -> Result<()> {
+        let xs = if group_rows > 0 { x_stride } else { k };
+        let groups = if group_rows > 0 { n.div_ceil(group_rows) } else { 1 };
+        assert!(k.is_multiple_of(32) && group_rows.is_multiple_of(64));
+        assert!(w.len() >= n * k && s.len() >= n.div_ceil(32) * (k / 32) && y.len() >= nt * n);
+        let need = if group_rows > 0 { (nt - 1) * xs + groups * k } else { nt * k };
+        assert!(x.len() >= need && (group_rows == 0 || groups * k <= xs));
+        let (ti, ni, ki, ro, gi, xi) = (nt as i32, n as i32, k as i32, i32::from(round), group_rows as i32, x_stride as i32);
+        let cfg = LaunchConfig { grid_dim: (n.div_ceil(64) as u32, nt.div_ceil(64) as u32, 1), block_dim: (128, 1, 1), shared_mem_bytes: 0 };
+        let mut b = self.stream.launch_builder(self.f("gemm_fp8w"));
+        b.arg(x).arg(w).arg(s).arg(y).arg(&ti).arg(&ni).arg(&ki).arg(&ro).arg(&gi).arg(&xi);
+        // SAFETY: gemm_fp8w(const float* x, const u8* w, const u8* s, float* y, int t, int n, int k,
+        // int round, int group_rows, int x_stride); x is read as rows of x_stride from group * k,
+        // lengths asserted above; rows past t and columns past n untouched.
+        cu(unsafe { b.launch(cfg) })?;
         Ok(())
     }
 

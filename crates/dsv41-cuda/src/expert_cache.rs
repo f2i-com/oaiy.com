@@ -11,11 +11,14 @@
 //! and that no kernel still reading a victim's bytes is overtaken by the
 //! upload that replaces them (both happen on one stream, in issue order).
 //!
-//! A prefill does not admit: it uses each of a pass's experts once, so its
-//! misses go through one staging slot ([`DeviceExpertCache::get_transient`])
-//! and leave the decode hot set alone. (Admitting them evicted, measured,
-//! every uploaded expert before its next use and much of the warm set: a
-//! pass over 13.6K experts found none of an unseeded cache's in place.)
+//! Frequencies count tokens: a prefill expert used by 300 prompt tokens
+//! counts 300, as 300 decode steps would. During a prefill, misses go
+//! through one staging slot ([`DeviceExpertCache::get_prefill`]); when it
+//! ends, the ones used most move in where they beat what they would replace
+//! ([`DeviceExpertCache::admit_pending`]), from RAM. (Admitting every miss
+//! as it came evicted, measured, each upload before its next use and much
+//! of the warm set; admitting mid-pass by frequency still evicted experts
+//! the same pass needed later; admitting none cost the reply some speed.)
 
 use std::collections::HashMap;
 
@@ -72,6 +75,8 @@ pub struct DeviceExpertCache {
     freq: HashMap<(u32, u32), u64>,
     /// Decode tokens seen (for aging).
     tokens: u64,
+    /// Prefill misses since the last [`admit_pending`](Self::admit_pending).
+    pending: Vec<(u32, u32)>,
     pub stats: DeviceCacheStats,
 }
 
@@ -88,6 +93,7 @@ impl DeviceExpertCache {
             batch: 1,
             freq: HashMap::new(),
             tokens: 0,
+            pending: Vec::new(),
             stats: DeviceCacheStats::default(),
         })
     }
@@ -136,19 +142,46 @@ impl DeviceExpertCache {
         Ok(self.view(i))
     }
 
-    /// Prefill's access: the resident slot on a hit, else the record from
-    /// the host cache (or the drive) in the staging slot, for this one use;
-    /// the cache itself is left as it was. The staging slot is reused by the
-    /// next call: stream order puts that upload after the kernels issued on
-    /// this one.
-    pub fn get_transient(&mut self, g: &Gpu, layer: u32, expert: u32, host: &Ecache, store: &dyn WeightStore) -> Result<CudaView<'_, u8>> {
-        if let Some(i) = self.touch(layer, expert) {
+    /// Prefill's access for an expert `tokens` prompt tokens use: the
+    /// resident slot on a hit; on a miss the record from the host cache (or
+    /// the drive) in the staging slot, for this one use, noted for
+    /// [`admit_pending`](Self::admit_pending). The staging slot is reused by
+    /// the next call: stream order puts that upload after the kernels issued
+    /// on this one.
+    pub fn get_prefill(&mut self, g: &Gpu, layer: u32, expert: u32, tokens: u64, host: &Ecache, store: &dyn WeightStore) -> Result<CudaView<'_, u8>> {
+        if let Some(i) = self.touch_by(layer, expert, tokens) {
             return Ok(self.view(i));
         }
+        self.pending.push((layer, expert));
         let lease = host.acquire(layer, expert, store)?;
         cu(g.stream.memcpy_htod(&*lease, &mut self.stage.slice_mut(..)))?;
         self.stats.bytes_uploaded += self.record as u64;
         Ok(self.stage.slice(..))
+    }
+
+    /// After a prefill: move the experts it missed that it used most into
+    /// VRAM, each while its token-weighted frequency beats the victim's, and
+    /// only from RAM (nothing is read from the drive here). Returns how many.
+    pub fn admit_pending(&mut self, g: &Gpu, host: &Ecache, store: &dyn WeightStore) -> Result<usize> {
+        let mut keys = std::mem::take(&mut self.pending);
+        keys.sort_unstable();
+        keys.dedup();
+        keys.sort_by_key(|k| std::cmp::Reverse(self.freq.get(k).copied().unwrap_or(0)));
+        self.begin_batch();
+        let mut admitted = 0;
+        for key in keys {
+            if self.index.contains_key(&key) || !host.probe(key.0, key.1) {
+                continue;
+            }
+            // most-used first: once one does not beat the victim, none will
+            if !self.beats_victim(self.freq.get(&key).copied().unwrap_or(0)) {
+                break;
+            }
+            let lease = host.acquire(key.0, key.1, store)?;
+            self.place(g, key, &lease)?;
+            admitted += 1;
+        }
+        Ok(admitted)
     }
 
     /// Decode-time lookup that never uploads: the slot on a hit (pinned for
@@ -165,14 +198,20 @@ impl DeviceExpertCache {
     /// cache (each swap is a PCIe copy). Counts a refusal in `declined`.
     pub fn worth_admitting(&mut self, layer: u32, expert: u32) -> bool {
         let freq = self.freq.get(&(layer, expert)).copied().unwrap_or(0);
-        let ok = match self.victim() {
-            None => false,
-            Some(i) => self.slots[i].key.is_none() || self.slots[i].freq < freq,
-        };
+        let ok = self.beats_victim(freq);
         if !ok {
             self.stats.declined += 1;
         }
         ok
+    }
+
+    /// Whether a record used `freq` times would displace nothing, or only a
+    /// record used less.
+    fn beats_victim(&self, freq: u64) -> bool {
+        match self.victim() {
+            None => false,
+            Some(i) => self.slots[i].key.is_none() || self.slots[i].freq < freq,
+        }
     }
 
     /// Upload a record the caller already holds (a miss it decided to admit).
@@ -206,10 +245,15 @@ impl DeviceExpertCache {
 
     /// Count an access; on a hit refresh and pin the slot and return it.
     fn touch(&mut self, layer: u32, expert: u32) -> Option<usize> {
+        self.touch_by(layer, expert, 1)
+    }
+
+    /// [`touch`](Self::touch) for an access by `tokens` tokens at once.
+    fn touch_by(&mut self, layer: u32, expert: u32, tokens: u64) -> Option<usize> {
         self.clock += 1;
         let key = (layer, expert);
         let f = self.freq.entry(key).or_insert(0);
-        *f += 1;
+        *f += tokens.max(1);
         let freq = *f;
         match self.index.get(&key) {
             Some(&i) => {

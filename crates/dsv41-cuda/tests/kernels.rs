@@ -230,6 +230,76 @@ fn expert_matches_cpu() {
     assert!(rel < 5e-3, "expert rel-L2 {rel}");
 }
 
+/// The tensor-core FP4 GEMM against the GEMV it replaces in prefill: the
+/// same products, fp32 sums in another order (held to a small fraction of a
+/// bf16 step before rounding), and every token's outputs bit-identical
+/// whether it runs alone or with others (so chunking cannot change them).
+#[test]
+fn gemm_fp4_matches_gemv() {
+    let Some(g) = gpu() else { return };
+    let mut rec = bytes(RECORD_BYTES, 11, |b| b);
+    for r in [S1, S2, S3] {
+        for (i, b) in rec[r].iter_mut().enumerate() {
+            *b = 118 + (i % 7) as u8;
+        }
+    }
+    let recd = g.upload(&rec).unwrap();
+    for (w, sc, n, k) in [(W1, S1, INTER, DIM), (W2, S2, DIM, INTER)] {
+        for t in [1usize, 3, 17, 64, 100] {
+            let mut xq = g.upload(&values(t * k, 12 + t as u64, 3.0)).unwrap();
+            g.act_quant_fp8(&mut xq.slice_mut(..)).unwrap();
+            let (mut a, mut b) = (g.zeros::<f32>(t * n).unwrap(), g.zeros::<f32>(t * n).unwrap());
+            g.gemv_fp4(&xq.as_view(), &recd.slice(w.clone()), &recd.slice(sc.clone()), &mut a.slice_mut(..), n, k, t, false).unwrap();
+            g.gemm_fp4(&xq.as_view(), &recd.slice(w.clone()), &recd.slice(sc.clone()), &mut b.slice_mut(..), n, k, t, false).unwrap();
+            close(&format!("gemm_fp4 [{t}x{k}] x [{n}x{k}]"), &g.download(&b).unwrap(), &g.download(&a).unwrap(), 0.25);
+            // the last token alone gives the same bits
+            let last = g.dup(&xq.slice((t - 1) * k..t * k)).unwrap();
+            let mut one = g.zeros::<f32>(n).unwrap();
+            g.gemm_fp4(&last.as_view(), &recd.slice(w.clone()), &recd.slice(sc.clone()), &mut one.slice_mut(..), n, k, 1, false).unwrap();
+            exact(&format!("gemm_fp4 token {} alone vs among {t}", t - 1), &g.download(&one).unwrap(), &g.download(&b).unwrap()[(t - 1) * n..]);
+        }
+    }
+}
+
+/// The tensor-core FP8 GEMM against gemv_fp8, as gemm_fp4 against gemv_fp4.
+#[test]
+fn gemm_fp8_matches_gemv() {
+    let Some(g) = gpu() else { return };
+    for (n, k) in [(1536, 5120), (576, 1024), (100, 256)] {
+        let w = g.upload(&bytes(n * k, 21 + n as u64, |b| if b & 0x7f == 0x7f { 0x3c } else { b })).unwrap();
+        let s = g.upload(&bytes(n.div_ceil(32) * (k / 32), 22, |b| 118 + b % 9)).unwrap();
+        for t in [2usize, 5, 64, 77] {
+            let mut xq = g.upload(&values(t * k, 23 + t as u64, 3.0)).unwrap();
+            g.act_quant_fp8(&mut xq.slice_mut(..)).unwrap();
+            let (mut a, mut b) = (g.zeros::<f32>(t * n).unwrap(), g.zeros::<f32>(t * n).unwrap());
+            g.gemv_fp8(&xq.as_view(), &w, &s, &mut a.slice_mut(..), n, k, t, false).unwrap();
+            g.gemm_fp8(&xq.as_view(), &w, &s, &mut b.slice_mut(..), n, k, t, false).unwrap();
+            close(&format!("gemm_fp8 [{t}x{k}] x [{n}x{k}]"), &g.download(&b).unwrap(), &g.download(&a).unwrap(), 0.25);
+            let last = g.dup(&xq.slice((t - 1) * k..t * k)).unwrap();
+            let mut one = g.zeros::<f32>(n).unwrap();
+            g.gemm_fp8(&last.as_view(), &w, &s, &mut one.slice_mut(..), n, k, 1, false).unwrap();
+            exact(&format!("gemm_fp8 token {} alone vs among {t}", t - 1), &g.download(&one).unwrap(), &g.download(&b).unwrap()[(t - 1) * n..]);
+        }
+    }
+}
+
+/// The grouped tensor-core GEMM (wo_a) against gemv_fp8w.
+#[test]
+fn gemm_fp8w_matches_gemv() {
+    let Some(g) = gpu() else { return };
+    let (groups, orank, gd) = (4usize, 128usize, 256usize);
+    let (n, k, xs) = (groups * orank, gd, groups * gd);
+    let w = g.upload(&bytes(n * k, 31, |b| if b & 0x7f == 0x7f { 0x3c } else { b })).unwrap();
+    let s = g.upload(&bytes(n.div_ceil(32) * (k / 32), 32, |b| 118 + b % 9)).unwrap();
+    for t in [2usize, 7, 70] {
+        let x = g.upload(&values(t * xs, 33 + t as u64, 3.0)).unwrap();
+        let (mut a, mut b) = (g.zeros::<f32>(t * n).unwrap(), g.zeros::<f32>(t * n).unwrap());
+        g.gemv_fp8w(&x.as_view(), &w, &s, &mut a.slice_mut(..), n, k, t, false, orank, xs).unwrap();
+        g.gemm_fp8w(&x.as_view(), &w, &s, &mut b.slice_mut(..), n, k, t, false, orank, xs).unwrap();
+        close(&format!("gemm_fp8w {groups} groups [{t}x{gd}] x [{orank}x{gd}]"), &g.download(&b).unwrap(), &g.download(&a).unwrap(), 0.25);
+    }
+}
+
 /// Decode's grouped path: every routed expert of a token in one launch per
 /// stage, reading records by address, then the expert-order sum plus the
 /// shared output with one bf16 round (as `Moe::forward`).

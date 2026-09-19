@@ -1257,4 +1257,160 @@ __global__ void gelu_round(float* x, long n) {
     }
 }
 
+// ---------------------------------------------------------------- tensor cores
+
+// Two values as the bf16 pair of one mma register (lower index in the low half).
+__device__ __forceinline__ unsigned int pack_bf16(float lo, float hi) {
+    return (__float_as_uint(to_bf16(lo)) >> 16) | (__float_as_uint(to_bf16(hi)) & 0xffff0000u);
+}
+
+// bf16 elements per shared-memory tile row: 32 + 8, so the fragment loads
+// of a warp fall in 32 different banks
+#define MMA_LD 40
+
+}  // extern "C": the tile loop is a template, which needs C++ linkage
+
+// The shared tile loop of the tensor-core GEMMs: y[t][n] = bf16?(x[t][k] .
+// W[n][k]) with W's 32-value slices dequantized to bf16: FP4 = e2m1 nibbles
+// with an e8m0 scale per 32 of a row, else e4m3 bytes with one per 32x32
+// tile. Every operand is exact in bf16 (fp8 /
+// e2m1 values times power-of-two scales, activations fp8-quantized), so
+// mma.sync (bf16 in, fp32 accumulate) forms the reference's products; only
+// the order of the fp32 sum differs. An output depends only on its own rows
+// of x and W, so a token gets the same bits however many share the launch
+// (chunked and layered prefill stay identical). A 64x64 tile per block of 4
+// warps (32x32 each, 2x4 m16n8k16 tiles), k in steps of 32.
+// x rows are `x_ld` apart; with `group_rows` > 0 (a multiple of 64) the
+// weight is block-diagonal: output row r reads x columns (r / group_rows) * k
+// onward (wo_a: each group of heads projects on its own).
+template <bool FP4W>
+__device__ __forceinline__ void mma_tiles(const float* x, int x_ld, int group_rows, const unsigned char* w, const unsigned char* s, float* y, int t, int n, int k, int round) {
+    __shared__ __align__(16) unsigned short sa[64 * MMA_LD];
+    __shared__ __align__(16) unsigned short sb[64 * MMA_LD];
+    __shared__ float lut[16];
+    if (FP4W && threadIdx.x < 16) lut[threadIdx.x] = FP4[threadIdx.x];
+    __syncthreads();
+    int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    int gq = lane >> 2, tq = lane & 3;
+    int wm = (warp >> 1) * 32, wn = (warp & 1) * 32;
+    int m0 = blockIdx.y * 64, n0 = blockIdx.x * 64;
+    float acc[2][4][4];
+#pragma unroll
+    for (int i = 0; i < 2; i++)
+#pragma unroll
+        for (int j = 0; j < 4; j++)
+#pragma unroll
+            for (int r = 0; r < 4; r++) acc[i][j][r] = 0.0f;
+    int row = threadIdx.x >> 1, half = threadIdx.x & 1;
+    long xoff = group_rows > 0 ? (long)(n0 / group_rows) * k : 0;
+    for (int k0 = 0; k0 < k; k0 += 32) {
+        // A: 64 token rows x 32 values, half a row a thread
+        {
+            unsigned int* dst = (unsigned int*)&sa[row * MMA_LD + half * 16];
+            int gr = m0 + row;
+            if (gr < t) {
+                const float* src = x + (long)gr * x_ld + xoff + k0 + half * 16;
+#pragma unroll
+                for (int i = 0; i < 8; i++) dst[i] = pack_bf16(src[2 * i], src[2 * i + 1]);
+            } else {
+#pragma unroll
+                for (int i = 0; i < 8; i++) dst[i] = 0u;
+            }
+        }
+        // B: 64 weight rows x 32 values, half a row a thread
+        {
+            unsigned int* dst = (unsigned int*)&sb[row * MMA_LD + half * 16];
+            int gn = n0 + row;
+            if (gn < n && FP4W) {
+                const unsigned char* src = w + (long)gn * (k / 2) + k0 / 2 + half * 8;
+                float sc = e8m0_val(s[(long)gn * (k / 32) + k0 / 32]);
+#pragma unroll
+                for (int i = 0; i < 8; i++) {
+                    unsigned int b = src[i];
+                    dst[i] = pack_bf16(lut[b & 0xf] * sc, lut[b >> 4] * sc);
+                }
+            } else if (gn < n) {
+                const unsigned int* src = (const unsigned int*)(w + (long)gn * k + k0 + half * 16);
+                float sc = e8m0_val(s[(long)(gn / 32) * (k / 32) + k0 / 32]);
+#pragma unroll
+                for (int i = 0; i < 4; i++) {
+                    unsigned int word = src[i];
+                    float a, b, c, d;
+                    fp8x2(word, a, b);
+                    fp8x2(word >> 16, c, d);
+                    dst[2 * i] = pack_bf16(a * sc, b * sc);
+                    dst[2 * i + 1] = pack_bf16(c * sc, d * sc);
+                }
+            } else {
+#pragma unroll
+                for (int i = 0; i < 8; i++) dst[i] = 0u;
+            }
+        }
+        __syncthreads();
+#pragma unroll
+        for (int kk = 0; kk < 32; kk += 16) {
+            unsigned int a[2][4], b[4][2];
+#pragma unroll
+            for (int i = 0; i < 2; i++) {
+                const unsigned short* p = &sa[(wm + i * 16 + gq) * MMA_LD + kk + tq * 2];
+                a[i][0] = *(const unsigned int*)p;
+                a[i][1] = *(const unsigned int*)(p + 8 * MMA_LD);
+                a[i][2] = *(const unsigned int*)(p + 8);
+                a[i][3] = *(const unsigned int*)(p + 8 * MMA_LD + 8);
+            }
+#pragma unroll
+            for (int j = 0; j < 4; j++) {
+                const unsigned short* p = &sb[(wn + j * 8 + gq) * MMA_LD + kk + tq * 2];
+                b[j][0] = *(const unsigned int*)p;
+                b[j][1] = *(const unsigned int*)(p + 8);
+            }
+#pragma unroll
+            for (int i = 0; i < 2; i++)
+#pragma unroll
+                for (int j = 0; j < 4; j++)
+                    asm volatile(
+                        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                        : "+f"(acc[i][j][0]), "+f"(acc[i][j][1]), "+f"(acc[i][j][2]), "+f"(acc[i][j][3])
+                        : "r"(a[i][0]), "r"(a[i][1]), "r"(a[i][2]), "r"(a[i][3]), "r"(b[j][0]), "r"(b[j][1]));
+        }
+        __syncthreads();
+    }
+    // c0, c1: row gq, columns 2 tq, 2 tq + 1; c2, c3: row gq + 8
+#pragma unroll
+    for (int i = 0; i < 2; i++)
+#pragma unroll
+        for (int j = 0; j < 4; j++)
+#pragma unroll
+            for (int h = 0; h < 2; h++) {
+                int r = m0 + wm + i * 16 + gq + h * 8;
+                if (r >= t) continue;
+#pragma unroll
+                for (int c = 0; c < 2; c++) {
+                    int col = n0 + wn + j * 8 + tq * 2 + c;
+                    if (col >= n) continue;
+                    float v = acc[i][j][h * 2 + c];
+                    y[(long)r * n + col] = round ? to_bf16(v) : v;
+                }
+            }
+}
+
+extern "C" {
+
+// gemv_fp4 for many tokens: e2m1 weights, one e8m0 scale per 32 of a row.
+__global__ void gemm_fp4(const float* x, const unsigned char* w, const unsigned char* s, float* y, int t, int n, int k, int round) {
+    mma_tiles<true>(x, k, 0, w, s, y, t, n, k, round);
+}
+
+// gemv_fp8 for many tokens: e4m3 weights, one e8m0 scale per 32x32 tile.
+__global__ void gemm_fp8(const float* x, const unsigned char* w, const unsigned char* s, float* y, int t, int n, int k, int round) {
+    mma_tiles<false>(x, k, 0, w, s, y, t, n, k, round);
+}
+
+// gemv_fp8w for many tokens: e4m3 weights times their scales against an
+// unquantized (bf16-valued) x, optionally block-diagonal (see mma_tiles).
+__global__ void gemm_fp8w(const float* x, const unsigned char* w, const unsigned char* s, float* y, int t, int n, int k, int round,
+                          int group_rows, int x_stride) {
+    mma_tiles<false>(x, group_rows > 0 ? x_stride : k, group_rows, w, s, y, t, n, k, round);
+}
+
 }  // extern "C"

@@ -489,13 +489,41 @@ Measured (both GPUs, 140 GB RAM tier):
   what longer ones had learned: the RAM warm-up fell from 7,596 queued experts to 850.
   The model now counts every routed expert it runs (prompt and reply) and merges the
   counts into the file, older counts halving every 200,000 tokens.
+- **Tensor cores for prefill.** The prompt's routed experts (`gemm_fp4`), its fp8
+  projections (`gemm_fp8`) and the grouped `wo_a` (`gemm_fp8w`) run as bf16
+  `mma.sync` tiles instead of GEMVs. Every operand is exact in bf16 (e2m1 and e4m3
+  values times power-of-two scales, fp8-quantized or bf16 activations), so the products
+  are the reference's; only fp32 summation order changes. A token's outputs do not
+  depend on how many tokens share the launch, so chunked, layered and one-shot prefill
+  stay bit-identical. 5,560-token pass, RAM full: **76.0 s, 73.2 tok/s** (121.7 s
+  before, 178.5 s at the start of the day).
+- **VRAM learns from prompts at the end of the pass.** Frequencies count tokens (an
+  expert 300 prompt tokens used counts 300); prefill misses go through the staging slot
+  and, when the pass ends, the most-used ones move in from RAM where they beat the
+  victim (`DeviceExpertCache::admit_pending`). Admitting mid-pass evicted experts the
+  same pass needed later; admitting none cost the reply.
 - **Whole requests, before and after** (`generate`, a 1,327-token code-review prompt,
-  200 tokens, three runs in one process, same starting profile): prompt 120.4 / 71.4 /
-  63.2 s before, 111.0 / 48.4 / 47.7 s after; decode 3.68 / 7.19 / 6.72 tok/s before,
-  4.10 / 5.50 / 6.33 after. Requests are 9–15% faster overall, but decode right after
-  a repeated prompt is 6–23% slower: VRAM no longer takes the prompt's experts (the old
-  admission was mostly churn, but some of it served the reply). Next: token-weighted
-  VRAM admission for experts many prompt tokens used.
+  200 tokens, three runs in one process, the same starting profile each time):
+
+  | Run | Prompt, before → after | Reply, before → after |
+  |---|---|---|
+  | 1 | 120.4 → 101.9 s | 3.68 → 5.37 tok/s |
+  | 2 | 71.4 → 34.8 s | 7.19 → 8.42 tok/s |
+  | 3 | 63.2 → 34.1 s | 6.72 → 9.36 tok/s |
+
+  The three requests take 253 s instead of 367 s. (Staging alone, before the tensor
+  cores and the end-of-pass admission: 292 s. The reply figures isolate the admission,
+  since decode runs the same kernels: its third reply was 5.83 tok/s, now 9.36.)
+- **The long golden's greedy tokens** flip at one step (the 6th of 8, 1.0-logit margin)
+  with the tensor-core prefill. Its free-running logits are 0.175 rel-L2 from the
+  oracle's, the GEMVs' 0.216 (they happened to match all 8); the two kernels' outputs
+  differ by well under a quarter bf16 step, so this is the image prompt's sub-ulp
+  sensitivity again, not a kernel error. In isolation the logits got closer (3.70e-3,
+  was 5.05e-3) while a few more near-tie routes resolved the other way (long golden
+  48 of 9,880, was 37; image prompt 56 of 7,840, was 38). The greedy gate now takes
+  exact tokens, or else logits within 0.25 and at most one teacher-forced disagreement
+  under 1.5 logits (calibrated bounds; the kernel tests and isolation rank above it);
+  the chunked and layered tests compare with one prefill's reply, not the oracle's.
 - **Token by token vs layered, re-measured with the fixed pass** (RAM full): layered
   1,000 tokens in 43.1 s, 2,000 in 65.8 s (about 20 s + 23 ms a token); token by token
   at its warm best 69 ms a token (much slower on a new topic). They cross near 450
@@ -581,10 +609,10 @@ Each phase ends in something measurable. Effort figures are rough.
   continuation, checkpoints, layered prefill, the OpenAI-compatible server.
 - **G — vision (done, 2026-09-19; see Status, "Vision").**
 - **F — next.**
-  - Prefill: a bf16 tensor-core GEMM for routed and shared experts and the trunk
-    projections (FP4 and FP8 values, and their power-of-two scales, are exact in bf16,
-    so only fp32 summation order changes); overlap uploads with compute on a copy
-    stream; choose token-by-token vs layered by measured cost, not a fixed threshold.
+  - Prefill: overlap expert uploads with compute on a copy stream (about 7,000 RAM
+    experts cross PCIe a pass, GPU 0 on a x2 link); tensor cores for the bf16
+    projections too; choose token-by-token vs layered by measured cost, not a fixed
+    threshold.
   - A longer oracle golden (≥2K tokens) to verify long contexts.
   - Stripe the SSD-tier experts over both drives.
   - CUDA graphs for decode, then DSpark speculation.

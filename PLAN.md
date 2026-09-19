@@ -161,13 +161,14 @@ No downloads are needed for `cargo test --workspace`:
   - A ≥2K-token oracle golden, to verify long contexts.
   - Striping the SSD tier over both drives (the drive throttles to 0.5 GB/s).
   - CUDA graphs for the decode step (launch overhead is ~10 ms of a ~35 ms token).
-  - VRAM admission weighted by prompt tokens: prefill no longer admits (it churned),
-    and decode right after a repeated prompt lost 6-23%; admit experts many prompt
-    tokens used, when they beat the victim.
-  - Prefill: bf16 tensor-core GEMMs (expert compute is ~30 s of a 122 s pass at
-    ~3 TFLOPS), upload/compute overlap, and a cost-based choice between token-by-token
-    and layered prefill (the fixed 512-token threshold is a measured average; the
-    right one depends on how warm the caches are).
+  - Token-weighted VRAM frequencies after a very long prompt: a 5.6K-token pass gives
+    its experts counts in the thousands, which decode's admission then cannot beat for
+    ~900 tokens of aging. Measure decode after a 5.6K prompt; cap the prefill weight
+    if it hurts.
+  - Prefill: upload/compute overlap (a copy stream and a pinned staging ring),
+    tensor cores for the bf16 projections, and a cost-based choice between
+    token-by-token and layered prefill (the fixed 512-token threshold is a measured
+    average; the right one depends on how warm the caches are).
 - **GGUF:**
   - Expert streaming for more MoE architectures (Gemma 4 MoE, Qwen3.5-MoE).
   - Hybrid CPU experts on the GGUF path.
