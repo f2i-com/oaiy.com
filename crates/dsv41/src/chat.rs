@@ -780,6 +780,20 @@ pub enum Delta {
     Content(String),
 }
 
+/// What a tool-calls block being written says so far (see
+/// [`StreamParser::call_preview`]).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CallPreview {
+    /// Calls begun so far (1 while the first is being written).
+    pub calls: usize,
+    /// The tool the latest call is for.
+    pub name: String,
+    /// The parameter being written, once one has begun.
+    pub parameter: Option<String>,
+    /// That parameter's value so far.
+    pub value: String,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Phase {
     Reasoning,
@@ -843,6 +857,32 @@ impl StreamParser {
                 Phase::ToolCalls => return out,
             }
         }
+    }
+
+    /// While a tool-calls block is being written, what it says so far: the
+    /// calls come whole at the end, and this lets a client show one taking
+    /// shape (a file's content, a command). `None` before a call begins.
+    pub fn call_preview(&self) -> Option<CallPreview> {
+        if self.phase != Phase::ToolCalls {
+            return None;
+        }
+        let invoke = format!("<{DSML} invoke name=\"");
+        let at = self.calls.rfind(&invoke)?;
+        let rest = &self.calls[at + invoke.len()..];
+        let name = rest.split('"').next().unwrap_or_default().to_string();
+        let param = format!("<{DSML} parameter name=\"");
+        let (parameter, value) = match rest.rfind(&param) {
+            Some(p) => {
+                let after = &rest[p + param.len()..];
+                let pname = after.split('"').next().unwrap_or_default().to_string();
+                let value = after.find('>').map_or("", |g| &after[g + 1..]);
+                let close = format!("</{DSML} parameter");
+                let value = value.split(close.as_str()).next().unwrap_or(value);
+                (Some(pname), value.to_string())
+            }
+            None => (None, String::new()),
+        };
+        Some(CallPreview { calls: self.calls.matches(&invoke).count(), name, parameter, value })
     }
 
     /// End of generation: the held-back text, and the tool calls if the
@@ -918,6 +958,20 @@ mod tests {
         let mut p = StreamParser::new(Mode::Chat);
         assert!(p.push("a\n\n<").iter().all(|d| d == &Delta::Content("a".into())));
         assert_eq!(p.finish().0, vec![Delta::Content("\n\n<".into())]);
+    }
+
+    #[test]
+    fn a_call_being_written_can_be_previewed() {
+        let mut p = StreamParser::new(Mode::Chat);
+        assert!(p.push("Writing it.").iter().all(|d| matches!(d, Delta::Content(_))));
+        assert_eq!(p.call_preview(), None);
+        p.push(&format!("\n\n<{DSML} calls>\n<{DSML} invoke name=\"write_file\">\n"));
+        let preview = p.call_preview().unwrap();
+        assert_eq!((preview.calls, preview.name.as_str(), preview.parameter), (1, "write_file", None));
+        p.push(&format!("<{DSML} parameter name=\"path\" string=\"true\">a.rs</{DSML} parameter>\n<{DSML} parameter name=\"content\" string=\"true\">fn main() {{\n    pri"));
+        let preview = p.call_preview().unwrap();
+        assert_eq!(preview.parameter.as_deref(), Some("content"));
+        assert_eq!(preview.value, "fn main() {\n    pri");
     }
 
     #[test]

@@ -7,6 +7,14 @@
 //! comes back as `reasoning_content` (as DeepSeek's own API does), and the
 //! model's DSML tool calls come back as OpenAI `tool_calls`.
 //!
+//! A streamed chat reply starts at once: while the prompt goes in (minutes,
+//! for a long one on cold caches) chunks with no choices carry
+//! `nrob_progress: {prompt_done, prompt_total}` (tokens the prefix cache did
+//! not hold), which OpenAI clients skip. A tool call comes whole at the end
+//! of the reply; while one is being written, such chunks carry
+//! `nrob_tool: {calls, name, parameter, chars, tail}` (the last lines of
+//! the parameter being written), a few times a second.
+//!
 //! Images (`image_url` parts: base64 `data:` URLs, or local paths when the
 //! server allows them) are decoded and sized here, on the request's thread,
 //! with the reference's preprocessing; the worker runs them through the
@@ -16,7 +24,7 @@ use std::io;
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -82,6 +90,19 @@ fn random_id(prefix: &str) -> String {
 /// a comment line on an event stream, or a check that the client is still
 /// connected. A long prompt takes minutes, and harnesses time out on silence.
 const KEEPALIVE: Duration = Duration::from_secs(10);
+
+/// How often a tool call being written is previewed, and how much of it.
+const PREVIEW_EVERY: Duration = Duration::from_millis(300);
+const PREVIEW_LINES: usize = 8;
+const PREVIEW_CHARS: usize = 800;
+
+/// The last `lines` lines of `text`, at most `max_chars` characters.
+fn tail_of(text: &str, lines: usize, max_chars: usize) -> &str {
+    let start = text.rmatch_indices('\n').nth(lines.saturating_sub(1)).map_or(0, |(i, _)| i + 1);
+    let tail = &text[start..];
+    let skip = tail.chars().count().saturating_sub(max_chars);
+    tail.char_indices().nth(skip).map_or(tail, |(i, _)| &tail[i..])
+}
 
 /// Whether the client is still connected (has not closed its end).
 fn client_alive(s: &TcpStream) -> bool {
@@ -400,8 +421,27 @@ impl Server {
         let (mut finish, mut completion_tokens, mut cached) = (Finish::Stop, 0usize, 0usize);
         let mut error = None;
         let mut gone = false;
+        let mut last_preview = Instant::now() - PREVIEW_EVERY;
         while let Some(ev) = next_event(&rx, &mut sse, peer.as_ref(), &cancel, &mut gone) {
             match ev {
+                Event::Progress { done, total } => {
+                    if let Some(s) = sse.as_mut() {
+                        let mut c = chunk(Json::obj::<&str>([]), None);
+                        if let Json::Obj(fields) = &mut c {
+                            for (k, v) in fields.iter_mut() {
+                                if k == "choices" {
+                                    *v = Json::Arr(Vec::new());
+                                }
+                            }
+                            fields.push((
+                                "nrob_progress".into(),
+                                Json::obj([("prompt_done", Json::Int(done as i64)), ("prompt_total", Json::Int(total as i64))]),
+                            ));
+                        }
+                        // a client that has gone shows up at the next text
+                        let _ = s.send(format!("data: {}\n\n", c.to_json()).as_bytes());
+                    }
+                }
                 Event::Prefilled { cached: c } => cached = c,
                 Event::Text(t) => {
                     if stop.hit {
@@ -409,6 +449,31 @@ impl Server {
                     }
                     for d in parser.push(&t) {
                         emit(d, &mut sse, &mut stop, &cancel);
+                    }
+                    // a tool call being written shows as it takes shape
+                    if let (Some(s), Some(p)) = (sse.as_mut(), parser.call_preview()) {
+                        if last_preview.elapsed() >= PREVIEW_EVERY {
+                            last_preview = Instant::now();
+                            let mut c = chunk(Json::obj::<&str>([]), None);
+                            if let Json::Obj(fields) = &mut c {
+                                for (k, v) in fields.iter_mut() {
+                                    if k == "choices" {
+                                        *v = Json::Arr(Vec::new());
+                                    }
+                                }
+                                fields.push((
+                                    "nrob_tool".into(),
+                                    Json::obj([
+                                        ("calls", Json::Int(p.calls as i64)),
+                                        ("name", Json::Str(p.name)),
+                                        ("parameter", p.parameter.map_or(Json::Null, Json::Str)),
+                                        ("chars", Json::Int(p.value.chars().count() as i64)),
+                                        ("tail", Json::str(tail_of(&p.value, PREVIEW_LINES, PREVIEW_CHARS))),
+                                    ]),
+                                ));
+                            }
+                            let _ = s.send(format!("data: {}\n\n", c.to_json()).as_bytes());
+                        }
                     }
                 }
                 Event::Done { finish: f, completion_tokens: n } => {

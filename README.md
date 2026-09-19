@@ -167,6 +167,10 @@ OpenAI's.
 - **Reasoning:** answers directly by default. `reasoning_effort` (or DeepSeek's
   `thinking: {type: enabled}`) turns reasoning on and streams it as
   `reasoning_content`. `--thinking` makes it the default.
+- **Progress:** a streamed request also gets chunks with no `choices` (OpenAI clients
+  skip them): `nrob_progress: {prompt_done, prompt_total}` while the prompt is read,
+  and `nrob_tool: {calls, name, parameter, chars, tail}` a few times a second while a
+  tool call is being written, so a harness can show the work before the call is whole.
 - **Prefix cache:** a harness resends the whole conversation every turn. The server
   resumes from the live state or from a checkpoint (taken every 256 prompt tokens and at
   user-turn boundaries), so a turn only runs its new tokens. A new chat with the same

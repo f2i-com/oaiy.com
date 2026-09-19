@@ -418,7 +418,12 @@ pub struct GpuModel {
     profile: Option<Profile>,
     /// Seconds forwards spent waiting for Engram rows (host clock, no syncs).
     engram_wait_s: f64,
+    /// Told `(layers done, layers)` as a layered pass goes.
+    layer_progress: Option<LayerProgress>,
 }
+
+/// What [`GpuModel::set_layer_progress`] takes.
+pub type LayerProgress = Box<dyn FnMut(usize, usize) + Send>;
 
 impl GpuModel {
     pub fn load(model_dir: &Path, engram_meta: &Path, opts: &GpuOptions) -> Result<GpuModel> {
@@ -580,6 +585,7 @@ impl GpuModel {
             cur: 0,
             profile: None,
             engram_wait_s: 0.0,
+            layer_progress: None,
             layers,
             states,
             max_seq: opts.max_seq,
@@ -833,6 +839,13 @@ impl GpuModel {
         pending
     }
 
+    /// Call `f(layers done, layers)` after each layer of the layered passes
+    /// that follow (a long prompt takes minutes: a server can show how far
+    /// it has got); `None` stops it.
+    pub fn set_layer_progress(&mut self, f: Option<LayerProgress>) {
+        self.layer_progress = f;
+    }
+
     /// Seconds forwards have waited for Engram rows so far.
     pub fn engram_wait_s(&self) -> f64 {
         self.engram_wait_s
@@ -1068,6 +1081,9 @@ impl GpuModel {
             // while this layer's own reads ran was slower: they split the drive)
             if let Some((nl, list)) = next_missing.filter(|(_, list)| !list.is_empty()) {
                 spec = Some(Speculative::start(Arc::clone(&self.cache), Arc::clone(&self.store), Arc::clone(&pool), nl, list));
+            }
+            if let Some(f) = self.layer_progress.as_mut() {
+                f(l + 1, self.cfg.n_layers);
             }
         }
         drop(spec);

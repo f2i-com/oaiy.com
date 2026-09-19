@@ -75,6 +75,9 @@ pub enum Finish {
 }
 
 pub enum Event {
+    /// How far the prompt has got: `done` of the `total` tokens the prefix
+    /// cache did not have (sent as it goes, the first time with `done` 0).
+    Progress { done: usize, total: usize },
     /// The prompt is in: `cached` of its tokens came from the prefix cache.
     Prefilled { cached: usize },
     /// More reply text (whole UTF-8 characters).
@@ -248,6 +251,9 @@ impl Engine {
         ends.dedup();
         let mut pos = start;
         let mut logits = Vec::new();
+        let total = prompt.len() - start;
+        let _ = job.events.send(Event::Progress { done: 0, total });
+        let mut reported = Instant::now();
         for stop in ends {
             while pos < stop {
                 if job.cancel.load(Ordering::Relaxed) {
@@ -273,6 +279,10 @@ impl Engine {
                             self.model.advance_with(&prompt[p..p + 1], p, &spans)?;
                         }
                         self.tokens.push(keys[p]);
+                        if reported.elapsed().as_secs_f64() >= 0.5 {
+                            let _ = job.events.send(Event::Progress { done: p + 1 - start, total });
+                            reported = Instant::now();
+                        }
                     }
                     (end, "token by token")
                 } else {
@@ -280,7 +290,14 @@ impl Engine {
                     // the whole stretch (a chunk of a few hundred tokens
                     // already touches nearly all of them)
                     let end = pos + left.min(self.layered_max);
-                    match self.model.prefill_layered_with(&prompt[pos..end], pos, self.chunk, Some(&job.cancel), &spans) {
+                    // every layer takes the whole stretch a step further
+                    let (events, before, len) = (job.events.clone(), pos - start, end - pos);
+                    self.model.set_layer_progress(Some(Box::new(move |layers_done, layers| {
+                        let _ = events.send(Event::Progress { done: before + len * layers_done / layers, total });
+                    })));
+                    let pass = self.model.prefill_layered_with(&prompt[pos..end], pos, self.chunk, Some(&job.cancel), &spans);
+                    self.model.set_layer_progress(None);
+                    match pass {
                         Ok(l) => logits = l,
                         Err(_) if job.cancel.load(Ordering::Relaxed) => {
                             // abandoned part-way: back to the last clean state
