@@ -400,6 +400,76 @@ spins on CPU experts, ~17 ms of kernels, ~10 ms idle between them.
   24-token prompt takes ~3 s warm); routing prefill misses to the CPU as decode
   does is the next step for time-to-first-token.
 
+**Phase E — serving (2026-09-19).**
+
+- **Rust tokenizer** (`dsv41::tokenizer`): the checkpoint's byte-level BPE, with the
+  added-token split, the three regex pre-tokenizer splits (hand-written, Unicode classes
+  from a generated table), and rank-ordered merges.
+  - It matches the reference `PreTrainedTokenizerFast` on all 3,638 cases of
+    `tools/dsv41/tokenizer_golden.py` (667K tokens: this repo's code, CJK, digits,
+    whitespace edge cases, special tokens, random Unicode).
+- **Rust chat format** (`dsv41::chat`): `encoding.py` ported rule for rule, covering
+  tools, DSML calls, thinking modes, effort, tasks and images.
+  - It matches the reference on all 420 cases of `tools/dsv41/chat_golden.py`,
+    including the 17 inputs the reference rejects.
+  - A streaming parser splits a reply into reasoning, content and tool calls as it
+    arrives.
+- **Chunk continuation:** `forward(ids, start_pos)` now takes any number of tokens at
+  any position.
+  - Attention reads [window ring ++ the chunk's own keys], oldest first, as decode does.
+  - Compressor groups straddle chunks; each query sees the compressed rows its own token
+    completes.
+  - A prompt in chunks gives the logits of one prefill *bit for bit* (rel-L2 0.0 on the
+    long golden, cuts at odd positions and one chunk wider than the ring). Greedy tokens
+    match the oracle.
+- **Checkpoints** (`checkpoint` / `restore`, ~10 MB in host RAM): only the window rings
+  and partial compressor groups need saving. The compressed caches below the checkpoint
+  never change, and above it they are rewritten before being read. Restoring replays
+  exactly.
+- **Layer-by-layer prefill** (`prefill_layered`): every layer runs over the whole
+  stretch before the next starts. Attention goes in continuing sub-chunks, the routed
+  experts run over all tokens at once, and the residual stream waits in host RAM.
+  - Each expert is read once per stretch, not once per chunk. Bit-exact to chunked
+    prefill.
+- **Exclusive tiers:** after the warm start, the VRAM-resident experts leave the RAM
+  tier, whose ~2,900 freed places go to the next-hottest experts. That is about 10,400
+  experts resident instead of about 8,000 once the fill completes.
+- **`nrob-server`**: an OpenAI-compatible API (chat completions, streaming, tools,
+  reasoning) over one model worker.
+  - A prefix cache: the live state plus checkpoints every 256 prompt tokens, at
+    user-turn boundaries and at the end of each layered pass.
+  - Short prompt stretches run token by token through the decode path, long ones layer
+    by layer.
+  - The background cache fill waits for idle time.
+
+Measured (both GPUs, 140 GB RAM tier):
+
+- **The SSD is the wall, and it is thermal.** `bench_ssd` reads 1.7–2.0 GB/s for the
+  first ~15–20 GB, then settles at **0.51 GB/s**.
+  - A 1,024-token chunk touches nearly all 15,360 experts: 8,683 SSD reads (163 GB),
+    286 s, **3.6 tok/s**.
+- **Layered prefill:** 5,560 tokens (a harness-style system prompt with tools) in
+  251 s, **22 tok/s**, about 6× the chunked rate.
+- **Prefix cache:** a new chat with the same system prompt reused 5,560 of 5,580 tokens
+  (10 s instead of ~4.5 min). A tool-result follow-up reused 360 of 392.
+- **Decode on a new topic:** 1.4–8 tok/s while the tiers adapt (VRAM hit 22% on a
+  coding prompt whose usage profile came from prose). Warm and on topic, it is still
+  ~29 tok/s.
+- **External Samsung T9** (USB 20 Gbps, the model copied in 11 min): `bench_ssd` holds
+  **1.95 GB/s over 75 GB** where the internal drive falls to 0.51.
+  - Layered prefill of 5,560 tokens: **181 s, 30.7 tok/s** (22.2 from the internal
+    drive).
+  - That pass reads 10,894 experts (205 GB): expert fetch 81 s, expert compute 31 s,
+    the rest 69 s (attention, hyper-connections, the shared experts, and the residual
+    stream's trips over PCIe).
+  - A pool of 4 readers now pulls a layer's experts into RAM ahead of the compute loop.
+- **VRAM frequency aging:** the VRAM cache halves its usage counts every 128 decode
+  tokens, and a saved profile seeds at most 64.
+  - Before, the seeded counts from an old profile (median 47, max 11,512) kept the
+    wrong experts in VRAM: a new topic stayed at 22–29% VRAM hits.
+  - With aging, the coding prompt's three runs went 42% → 67% → 77% VRAM hits and
+    2.6 → 8.5 → **12.1 tok/s** (7.2 before).
+
 ## Phases
 
 Each phase ends in something measurable. Effort figures are rough.
@@ -413,17 +483,25 @@ Each phase ends in something measurable. Effort figures are rough.
   speed and measured hit rates (route traces).
 - **D — hybrid CPU experts (done, except SSD-tier striping).** AVX-512 kernel, CPU/GPU
   overlap (launch-ahead), warm tiers across runs; ~29 tok/s warm.
-- **E — usable (~1 week).**
-  - Chat template and thinking modes in Rust; a streaming server; KV/session reuse;
-    chunked prefill.
-  - Then DSpark speculation, and vision.
+- **E — usable (done, 2026-09-19).** Rust tokenizer and chat format, chunk
+  continuation, checkpoints, layered prefill, the OpenAI-compatible server.
+- **F — next.**
+  - Vision: port the 32-layer encoder (`vision.py`, `image_processor.py`) and splice
+    its features at `<｜deepseek_image｜>`.
+  - A longer oracle golden (≥2K tokens) to verify long contexts.
+  - Stripe the SSD-tier experts over both drives.
+  - CUDA graphs for decode, then DSpark speculation.
 
 ## Hardware changes, by impact on this model
 
 1. **256 GB RAM** (4×64 GB DDR5). Takes the SSD out of the decode path and most of the
    prefill path. The biggest single win.
-2. **More SSD bandwidth.** Stripe the SSD-tier experts over both drives, or add a
-   faster Gen5 drive for the expert store.
+2. **More SSD bandwidth.** The E: drive throttles to 0.51 GB/s after ~15–20 GB of
+   sustained reads, a quarter of its cool speed.
+   - A heatsink or airflow on that M.2 slot.
+   - Striping the SSD-tier experts over both drives (C: has room for about half the
+     expert shards).
+   - A faster Gen5 drive for the expert store.
 3. **GPU links.** Two GPUs on AM5 can get at most **x8/x8** (16 CPU graphics lanes), not
    x16/x16. x2 and x4 are below even that. To fix:
    - Reseat both cards and use a sag bracket; a riser cable is the prime suspect.

@@ -363,6 +363,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "nrob-server"
+version = "0.7.0"
+dependencies = [
+ "dsv41",
+ "dsv41-cuda",
+ "nrob",
+]
+
+[[package]]
 name = "num-traits"
 version = "0.2.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -23,7 +23,9 @@ nrob/                       workspace root
     nrob-cli/               `nrob` binary for GGUF models: run / chat / bench / info / tokenize
     dsv41/                  DeepSeek-V4.1 from safetensors: expert store, CPU reference model,
                             CPU experts (std-only)
-    dsv41-cuda/             DeepSeek-V4.1 on CUDA: kernels, VRAM expert cache, hybrid decode
+    dsv41-cuda/             DeepSeek-V4.1 on CUDA: kernels, VRAM expert cache, hybrid decode,
+                            chunk continuation, checkpoints, layer-by-layer prefill
+    nrob-server/            OpenAI-compatible HTTP server for DeepSeek-V4.1 (std-only)
     gguf/                   GGUF reader; FileSource streams tensor bytes from the file
     ggml-quants/, ggml-rs/, ggml-rs-cuda/, tokenizer/
                             quant kernels, CPU/CUDA backends, tokenizers
@@ -37,7 +39,7 @@ their `llm` workspace (see `crates/VENDORED.md`).
 
 - **std-only core.** No external crates in `nrob` or `dsv41`. The JSON reader, the
   cache and the thread pool are hand-rolled.
-- `#![forbid(unsafe_code)]` in `nrob`, `nrob-cli` and `dsv41`. `dsv41-cuda` holds the
+- `#![forbid(unsafe_code)]` in `nrob`, `nrob-cli`, `nrob-server` and `dsv41`. `dsv41-cuda` holds the
   DeepSeek path's `unsafe` (kernel launches, pinned mappings, AVX-512 dispatch), each
   with a SAFETY note. The GGUF stack keeps its own style: `unsafe` for the CUDA backend,
   the mmap and a couple of byte views.
@@ -80,7 +82,11 @@ resident.
 
 **Safetensors (DeepSeek-V4.1-Flash, 510 GB):** hybrid CPU/GPU decode across two RTX
 5090s at ~29 tok/s warm; a fresh process's first answer runs at 2–6 tok/s (SSD-bound).
-It passes every golden gate. Details are in `docs/DEEPSEEK_V41.md`.
+It passes every golden gate.
+
+It is served by `nrob-server`: an OpenAI-compatible API with tools and reasoning, and a
+prefix cache that resumes each harness turn. Long prompts run layer by layer at
+~22 tok/s. Details are in `docs/DEEPSEEK_V41.md`.
 
 ## Phase log
 
@@ -116,6 +122,14 @@ It passes every golden gate. Details are in `docs/DEEPSEEK_V41.md`.
   - GGUF streaming reads experts straight from the `.gguf` (`gguf::FileSource`,
     `Model::open_streaming`) instead of from an xdb copy.
   - `nrob-cli` is now a GGUF client of llama-rs.
+- **Phase 9 (2026-09-19): serving DeepSeek-V4.1.**
+  - Rust tokenizer and chat format, exact against the reference on 3,638 and 420
+    golden cases.
+  - Chunk continuation and checkpoints, bit-exact to one prefill.
+  - Layer-by-layer prefill: each expert is read once per long stretch, ~6× the
+    chunked rate on this SSD.
+  - Exclusive VRAM/RAM tiers.
+  - `nrob-server`, new code, with a prefix cache for coding harnesses.
 
 ## Testing strategy
 
@@ -133,15 +147,16 @@ No downloads are needed for `cargo test --workspace`:
 ## Next
 
 - **DeepSeek-V4.1:**
-  - A Rust chat encoder, so prompts don't need `tools/dsv41/encode.py`.
-  - Chunked prefill, with prefill misses computed on the CPU.
+  - Vision: the 32-layer encoder is in the checkpoint; port it and splice image
+    features at `<｜deepseek_image｜>`.
+  - A ≥2K-token oracle golden, to verify long contexts.
+  - Striping the SSD tier over both drives (the drive throttles to 0.5 GB/s).
   - CUDA graphs for the decode step (launch overhead is ~10 ms of a ~35 ms token).
-  - Striping the SSD tier over both drives.
 - **GGUF:**
   - Expert streaming for more MoE architectures (Gemma 4 MoE, Qwen3.5-MoE).
   - Hybrid CPU experts on the GGUF path.
   - Direct I/O for streamed reads.
-- **Serving:** an OpenAI-compatible server over both engines, with KV/session reuse.
+- **Serving:** GGUF models in `nrob-server` too; the Anthropic messages API.
 
 ## Non-goals (for now)
 

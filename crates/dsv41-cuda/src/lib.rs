@@ -26,4 +26,4 @@ pub mod handoff;
 pub mod model;
 
 pub use gpu::Gpu;
-pub use model::{GpuModel, GpuOptions};
+pub use model::{Checkpoint, GpuModel, GpuOptions};

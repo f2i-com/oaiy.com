@@ -7,8 +7,14 @@
 //! at [`MAX_DEPTH`] and every failure is an `Error::Format` naming the byte
 //! offset, never a panic.
 //!
-//! Numbers are held as `f64`, which is exact for every integer up to 2^53.
-//! That is far past any tensor offset or shape a checkpoint can hold.
+//! Integer literals that fit an `i64` stay integers ([`Json::Int`]); every
+//! other number is an `f64` ([`Json::Num`]). Keeping the two apart lets a
+//! value be written back as it was read: `5` stays `5`, `5.0` stays `5.0`.
+//!
+//! Two writers: [`Json::to_json`] is compact JSON, and
+//! [`Json::to_python_json`] matches Python's `json.dumps(value,
+//! ensure_ascii=False)` byte for byte (`", "` and `": "` separators, float
+//! repr), which prompt templates written in Python embed in their text.
 
 use crate::error::{Error, Result};
 
@@ -21,6 +27,9 @@ pub const MAX_DEPTH: usize = 128;
 pub enum Json {
     Null,
     Bool(bool),
+    /// An integer literal within `i64`.
+    Int(i64),
+    /// Any other number.
     Num(f64),
     Str(String),
     Arr(Vec<Json>),
@@ -101,18 +110,132 @@ impl Json {
     pub fn as_f64(&self) -> Option<f64> {
         match self {
             Json::Num(v) => Some(*v),
+            Json::Int(v) => Some(*v as f64),
             _ => None,
         }
     }
 
-    /// A number with no fractional part that `f64` holds exactly (|v| up to
-    /// 2^53). `1e3` is 1000; `1.5` and `1e300` are `None`.
+    /// An integer, or a number with no fractional part that `f64` holds
+    /// exactly (|v| up to 2^53). `1e3` is 1000; `1.5` and `1e300` are `None`.
     pub fn as_i64(&self) -> Option<i64> {
         const EXACT: f64 = 9_007_199_254_740_992.0; // 2^53
         match self {
+            Json::Int(v) => Some(*v),
             Json::Num(v) if v.fract() == 0.0 && v.abs() <= EXACT => Some(*v as i64),
             _ => None,
         }
+    }
+
+    /// Compact JSON text.
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        write_value(self, &mut out, false);
+        out
+    }
+
+    /// JSON text as Python's `json.dumps(value, ensure_ascii=False)` writes
+    /// it.
+    pub fn to_python_json(&self) -> String {
+        let mut out = String::new();
+        write_value(self, &mut out, true);
+        out
+    }
+
+    /// A string value.
+    pub fn str(s: impl Into<String>) -> Json {
+        Json::Str(s.into())
+    }
+
+    /// An object from `(key, value)` pairs, in order.
+    pub fn obj<K: Into<String>>(members: impl IntoIterator<Item = (K, Json)>) -> Json {
+        Json::Obj(members.into_iter().map(|(k, v)| (k.into(), v)).collect())
+    }
+}
+
+/// Append `s` as a JSON string literal. Non-ASCII is written as is; quotes,
+/// backslashes and control characters are escaped the way Python does.
+pub fn write_str(s: &str, out: &mut String) {
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{8}' => out.push_str("\\b"),
+            '\u{c}' => out.push_str("\\f"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+}
+
+fn write_value(v: &Json, out: &mut String, python: bool) {
+    let (comma, colon) = if python { (", ", ": ") } else { (",", ":") };
+    match v {
+        Json::Null => out.push_str("null"),
+        Json::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+        Json::Int(i) => out.push_str(&i.to_string()),
+        Json::Num(f) => out.push_str(&float_repr(*f)),
+        Json::Str(s) => write_str(s, out),
+        Json::Arr(items) => {
+            out.push('[');
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(comma);
+                }
+                write_value(item, out, python);
+            }
+            out.push(']');
+        }
+        Json::Obj(members) => {
+            out.push('{');
+            for (i, (k, item)) in members.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(comma);
+                }
+                write_str(k, out);
+                out.push_str(colon);
+                write_value(item, out, python);
+            }
+            out.push('}');
+        }
+    }
+}
+
+/// A float the way Python's `repr` writes it: the shortest digits that read
+/// back to the same value, positional for exponents -4..16 (`0.0001`,
+/// `100.0`), scientific outside (`1e-05`, `1.5e+16`). JSON has no NaN or
+/// infinity; those are written as `null`.
+pub fn float_repr(v: f64) -> String {
+    if !v.is_finite() {
+        return "null".into();
+    }
+    if v == 0.0 {
+        return if v.is_sign_negative() { "-0.0" } else { "0.0" }.into();
+    }
+    // shortest round-trip digits and exponent, from Rust's `{:e}`
+    let sci = format!("{:e}", v.abs());
+    let (mant, exp) = sci.split_once('e').unwrap_or((&sci, "0"));
+    let exp: i32 = exp.parse().unwrap_or(0);
+    let digits: String = mant.chars().filter(char::is_ascii_digit).collect();
+    let sign = if v < 0.0 { "-" } else { "" };
+    if (-4..16).contains(&exp) {
+        let n = digits.len() as i32;
+        let body = if exp < 0 {
+            format!("0.{}{digits}", "0".repeat((-exp - 1) as usize))
+        } else if exp + 1 >= n {
+            format!("{digits}{}.0", "0".repeat((exp + 1 - n) as usize))
+        } else {
+            let (a, b) = digits.split_at((exp + 1) as usize);
+            format!("{a}.{b}")
+        };
+        format!("{sign}{body}")
+    } else {
+        let m = if digits.len() > 1 { format!("{}.{}", &digits[..1], &digits[1..]) } else { digits };
+        format!("{sign}{m}e{}{:02}", if exp < 0 { '-' } else { '+' }, exp.abs())
     }
 }
 
@@ -164,7 +287,7 @@ impl Parser<'_> {
             Some(b't') => self.word(b"true", Json::Bool(true)),
             Some(b'f') => self.word(b"false", Json::Bool(false)),
             Some(b'n') => self.word(b"null", Json::Null),
-            Some(b'-' | b'0'..=b'9') => Ok(Json::Num(self.number()?)),
+            Some(b'-' | b'0'..=b'9') => self.number(),
             Some(_) => Err(self.fail("expected a value")),
             None => Err(self.fail("expected a value, found the end")),
         }
@@ -308,7 +431,7 @@ impl Parser<'_> {
     }
 
     /// `-? (0 | [1-9][0-9]*) (. [0-9]+)? ([eE] [+-]? [0-9]+)?`
-    fn number(&mut self) -> Result<f64> {
+    fn number(&mut self) -> Result<Json> {
         let start = self.pos;
         let digits = |p: &mut Self| {
             let n = p.src[p.pos..].iter().take_while(|b| b.is_ascii_digit()).count();
@@ -342,7 +465,12 @@ impl Parser<'_> {
         }
         // the slice is ASCII by construction
         let text = std::str::from_utf8(&self.src[start..self.pos]).unwrap_or("");
-        text.parse::<f64>().map_err(|_| self.fail("bad number"))
+        if !text.contains(['.', 'e', 'E']) {
+            if let Ok(i) = text.parse::<i64>() {
+                return Ok(Json::Int(i));
+            }
+        }
+        text.parse::<f64>().map(Json::Num).map_err(|_| self.fail("bad number"))
     }
 }
 
@@ -360,7 +488,10 @@ mod tests {
         assert_eq!(p(" true "), Json::Bool(true));
         assert_eq!(p("false"), Json::Bool(false));
         assert_eq!(p("-12.5e1"), Json::Num(-125.0));
-        assert_eq!(p("0"), Json::Num(0.0));
+        assert_eq!(p("0"), Json::Int(0));
+        assert_eq!(p("-7"), Json::Int(-7));
+        assert_eq!(p("5.0"), Json::Num(5.0));
+        assert_eq!(p("99999999999999999999"), Json::Num(1e20));
         assert_eq!(p("\"hi\""), Json::Str("hi".into()));
     }
 
@@ -418,6 +549,20 @@ mod tests {
             assert!(Json::parse(bad.as_bytes()).is_err(), "{bad:?} parsed");
         }
         assert!(Json::parse(b"\"\xff\"").is_err(), "invalid UTF-8 accepted");
+    }
+
+    #[test]
+    fn writers_match_python_and_round_trip() {
+        let v = p(r#"{"a": [1, 2.5, -0.0, 1e-05, 100.0, 1.5e+16, 0.0001], "b": {"s": "q\"\\\n\t\u0001é😀/"}, "c": null, "d": true}"#);
+        assert_eq!(
+            v.to_python_json(),
+            r#"{"a": [1, 2.5, -0.0, 1e-05, 100.0, 1.5e+16, 0.0001], "b": {"s": "q\"\\\n\t\u0001é😀/"}, "c": null, "d": true}"#
+        );
+        assert_eq!(p(&v.to_json()), v);
+        assert!(v.to_json().starts_with(r#"{"a":[1,2.5,"#));
+        for (f, want) in [(0.1, "0.1"), (1e16, "1e+16"), (123.456, "123.456"), (1e-4, "0.0001"), (-2.0, "-2.0"), (1e300, "1e+300"), (1.2345678901234567e19, "1.2345678901234567e+19")] {
+            assert_eq!(float_repr(f), want);
+        }
     }
 
     #[test]

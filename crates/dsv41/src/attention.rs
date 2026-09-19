@@ -420,15 +420,15 @@ pub fn select_compressed(
     role: CandidateRole,
     shared: &mut Shared,
 ) -> Result<Vec<Vec<i32>>> {
-    let end_pos = start_pos + t;
-    let compress_len = |i: usize| if start_pos == 0 { (i + 1) / ratio } else { end_pos / ratio };
+    // query i (at start_pos + i) sees the groups completed up to and
+    // including its own token; later ones are masked (a no-op for a single
+    // decode token, which sees them all)
+    let compress_len = |i: usize| (start_pos + i + 1) / ratio;
     let mut rows: Vec<Vec<f32>> = (0..t)
         .map(|i| {
             let cl = compress_len(i);
             let mut sc = scores[i * n_t..(i + 1) * n_t].to_vec();
-            if start_pos == 0 {
-                sc.iter_mut().skip(cl).for_each(|s| *s = f32::NEG_INFINITY);
-            }
+            sc.iter_mut().skip(cl).for_each(|s| *s = f32::NEG_INFINITY);
             sc
         })
         .collect();
@@ -518,12 +518,13 @@ pub fn pool(kv: &[f32], score: &[f32], r: usize, hd: usize) -> Vec<f32> {
 }
 
 /// Position a compressed latent rotates at: group j stands for its first token.
+///
+/// The latents a call produces are for consecutive groups, starting with
+/// the group `start_pos` falls in (it completes first): `start_pos / ratio +
+/// j`. That covers a prefill from 0 (group `j`), one decode token (the group
+/// it completes) and a chunk continuing a sequence alike.
 pub fn compressed_pos(start_pos: usize, j: usize, ratio: usize) -> usize {
-    if start_pos == 0 {
-        j * ratio
-    } else {
-        start_pos + 1 - ratio
-    }
+    (start_pos / ratio + j) * ratio
 }
 
 /// One query head over its gathered positions (-1 skipped), with the sink

@@ -1,0 +1,374 @@
+//! The model worker: one thread owns the GPU model and runs requests one at
+//! a time, reusing whatever prefix of the new prompt the model has already
+//! seen.
+//!
+//! A coding harness resends the whole conversation every turn, and the
+//! prompt is the slow part: a stretch of a few hundred tokens already
+//! touches nearly all 15,360 experts, and a 192 GB machine holds only about
+//! two thirds of them in RAM and VRAM, the rest on the SSD. So:
+//!
+//! - the worker keeps the token sequence its state covers, plus checkpoints
+//!   (every 256 prompt tokens, at the end of every layered pass, and at the
+//!   first and last user turn): a request that extends the last
+//!   conversation continues from the live state, and one that diverges
+//!   earlier (a re-rendered reply, an edited history, a new chat with the
+//!   same system prompt) restores the latest checkpoint before the
+//!   divergence and runs only the rest;
+//! - what is left runs token by token through the decode path when short
+//!   (its experts mostly sit in VRAM and RAM already), and layer by layer
+//!   when long ([`GpuModel::prefill_layered`]: every expert read once for
+//!   the whole stretch).
+
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, Sender};
+use std::sync::Arc;
+use std::time::Instant;
+
+use dsv41::tokenizer::Tokenizer;
+use dsv41_cuda::{Checkpoint, GpuModel};
+
+#[derive(Clone, Debug)]
+pub struct Sampling {
+    /// 0 = greedy.
+    pub temperature: f32,
+    pub top_p: f32,
+    /// 0 = no limit (up to [`CANDIDATES`]).
+    pub top_k: usize,
+    pub seed: u64,
+}
+
+/// Tokens considered when sampling (the tail beyond is negligible mass and
+/// a full sort of the 129k vocabulary per token is not).
+const CANDIDATES: usize = 512;
+
+pub struct Job {
+    pub prompt: Vec<u32>,
+    pub max_tokens: usize,
+    pub sampling: Sampling,
+    /// Set by the request side to stop early (a stop string, a closed
+    /// connection).
+    pub cancel: Arc<AtomicBool>,
+    pub events: Sender<Event>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Finish {
+    /// End of sequence (or cancelled).
+    Stop,
+    /// `max_tokens` or the context limit.
+    Length,
+}
+
+pub enum Event {
+    /// The prompt is in: `cached` of its tokens came from the prefix cache.
+    Prefilled { cached: usize },
+    /// More reply text (whole UTF-8 characters).
+    Text(String),
+    Done { finish: Finish, completion_tokens: usize },
+    Error(String),
+}
+
+pub struct Engine {
+    pub model: GpuModel,
+    pub tok: Arc<Tokenizer>,
+    pub eos: u32,
+    /// Attention sub-chunk of the layered prefill (tokens).
+    pub chunk: usize,
+    /// Prompt stretches this short run one token at a time instead.
+    pub step_below: usize,
+    /// Longer stretches run layer by layer, at most this many tokens a pass.
+    pub layered_max: usize,
+    pub max_checkpoints: usize,
+    pub usage: Option<PathBuf>,
+    pub log: bool,
+    tokens: Vec<u32>,
+    checkpoints: Vec<Checkpoint>,
+}
+
+impl Engine {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(model: GpuModel, tok: Arc<Tokenizer>, chunk: usize, step_below: usize, layered_max: usize, max_checkpoints: usize, usage: Option<PathBuf>, log: bool) -> Engine {
+        let eos = model.cfg.eos_token_id;
+        Engine {
+            model,
+            tok,
+            eos,
+            chunk: chunk.max(2),
+            step_below,
+            layered_max: layered_max.max(2),
+            max_checkpoints,
+            usage,
+            log,
+            tokens: Vec::new(),
+            checkpoints: Vec::new(),
+        }
+    }
+
+    /// Serve jobs until every sender is gone.
+    pub fn run(mut self, jobs: Receiver<Job>) {
+        for job in jobs {
+            // the background cache fill waits for idle time
+            self.model.set_busy(true);
+            let result = self.generate(&job);
+            self.model.set_busy(false);
+            if let Err(e) = result {
+                // the state is unknown after a failure: start clean
+                self.tokens.clear();
+                self.checkpoints.clear();
+                let _ = job.events.send(Event::Error(e.to_string()));
+            }
+            if let Some(path) = &self.usage {
+                if let Err(e) = self.model.save_usage(path) {
+                    eprintln!("nrob-server: saving the expert usage profile failed: {e}");
+                }
+            }
+        }
+    }
+
+    /// Where the prompt can start: the live state if it is a prefix of the
+    /// prompt, else the latest checkpoint inside the common prefix, else 0.
+    /// At least one prompt token is always left to run (its logits start
+    /// the reply).
+    fn resume(&mut self, prompt: &[u32]) -> nrob::Result<usize> {
+        let common = self.tokens.iter().zip(prompt).take_while(|(a, b)| a == b).count();
+        let limit = common.min(prompt.len().saturating_sub(1));
+        if self.tokens.len() <= limit {
+            return Ok(self.tokens.len());
+        }
+        let at = self.checkpoints.iter().rposition(|c| c.pos() <= limit);
+        match at {
+            Some(i) => {
+                let pos = self.checkpoints[i].pos();
+                self.model.restore(&self.checkpoints[i])?;
+                // later checkpoints belong to the old continuation
+                self.checkpoints.truncate(i + 1);
+                self.tokens.truncate(pos);
+                Ok(pos)
+            }
+            None => {
+                self.checkpoints.clear();
+                self.tokens.clear();
+                Ok(0)
+            }
+        }
+    }
+
+    /// The state past `pos` is half-written: restore the latest checkpoint at
+    /// or before it (or forget everything when there is none).
+    fn rollback(&mut self, pos: usize) -> nrob::Result<()> {
+        match self.checkpoints.iter().rposition(|c| c.pos() <= pos) {
+            Some(i) => {
+                let at = self.checkpoints[i].pos();
+                self.model.restore(&self.checkpoints[i])?;
+                self.checkpoints.truncate(i + 1);
+                self.tokens.truncate(at);
+            }
+            None => {
+                self.checkpoints.clear();
+                self.tokens.clear();
+            }
+        }
+        Ok(())
+    }
+
+    fn save_checkpoint(&mut self, pos: usize) -> nrob::Result<()> {
+        if self.max_checkpoints == 0 || self.checkpoints.last().is_some_and(|c| c.pos() >= pos) {
+            return Ok(());
+        }
+        self.checkpoints.push(self.model.checkpoint(pos)?);
+        if self.checkpoints.len() > self.max_checkpoints {
+            // thin out: drop the checkpoint closest to its predecessor, so
+            // the rest stay spread over the sequence (the latest is kept)
+            let n = self.checkpoints.len();
+            let gap = |i: usize| self.checkpoints[i].pos() - if i == 0 { 0 } else { self.checkpoints[i - 1].pos() };
+            let drop = (0..n - 1).min_by_key(|&i| gap(i)).unwrap_or(0);
+            self.checkpoints.remove(drop);
+        }
+        Ok(())
+    }
+
+    fn generate(&mut self, job: &Job) -> nrob::Result<()> {
+        let prompt = &job.prompt;
+        if prompt.is_empty() {
+            return Err(nrob::Error::Arg("empty prompt".into()));
+        }
+        let started = Instant::now();
+        let start = self.resume(prompt)?;
+        // stretches end at the first and the last user turn too, so a
+        // checkpoint lands where the next request is likely to diverge (a new
+        // chat with the same system prompt; the latest turn re-rendered)
+        let user = self.tok.special("<｜User｜>");
+        let turns: Vec<usize> = (start + 1..prompt.len()).filter(|&p| Some(prompt[p]) == user).collect();
+        let mut ends: Vec<usize> = [turns.first(), turns.last()].into_iter().flatten().copied().collect();
+        ends.push(prompt.len());
+        ends.dedup();
+        let mut pos = start;
+        let mut logits = Vec::new();
+        for stop in ends {
+            while pos < stop {
+                if job.cancel.load(Ordering::Relaxed) {
+                    let _ = job.events.send(Event::Done { finish: Finish::Stop, completion_tokens: 0 });
+                    return Ok(());
+                }
+                let t = Instant::now();
+                let left = stop - pos;
+                let (end, how) = if left <= self.step_below {
+                    // a short stretch: one token at a time through the decode
+                    // path, whose experts mostly sit in VRAM and RAM
+                    let end = pos + left.min(256);
+                    for p in pos..end {
+                        logits = self.model.forward(&prompt[p..p + 1], p)?;
+                        self.tokens.push(prompt[p]);
+                    }
+                    (end, "token by token")
+                } else {
+                    // a long one layer by layer: every expert is read once for
+                    // the whole stretch (a chunk of a few hundred tokens
+                    // already touches nearly all of them)
+                    let end = pos + left.min(self.layered_max);
+                    match self.model.prefill_layered(&prompt[pos..end], pos, self.chunk, Some(&job.cancel)) {
+                        Ok(l) => logits = l,
+                        Err(_) if job.cancel.load(Ordering::Relaxed) => {
+                            // abandoned part-way: back to the last clean state
+                            self.rollback(pos)?;
+                            let _ = job.events.send(Event::Done { finish: Finish::Stop, completion_tokens: 0 });
+                            return Ok(());
+                        }
+                        Err(e) => return Err(e),
+                    }
+                    self.tokens.extend_from_slice(&prompt[pos..end]);
+                    (end, "layered")
+                };
+                if self.log {
+                    let s = t.elapsed().as_secs_f64();
+                    eprintln!("  prompt {pos}..{end} {how}: {s:.1}s ({:.1} tok/s)", (end - pos) as f64 / s);
+                }
+                pos = end;
+                self.save_checkpoint(pos)?;
+            }
+        }
+        let prefill_s = started.elapsed().as_secs_f64();
+        let _ = job.events.send(Event::Prefilled { cached: start });
+
+        let mut rng = job.sampling.seed ^ 0x9E37_79B9_7F4A_7C15;
+        let (mut pending, mut n) = (Vec::new(), 0usize);
+        let decode = Instant::now();
+        let finish = loop {
+            let next = sample(&logits, &job.sampling, &mut rng);
+            if next == self.eos {
+                break Finish::Stop;
+            }
+            n += 1;
+            pending.extend_from_slice(self.tok.token_bytes(next));
+            let valid = match std::str::from_utf8(&pending) {
+                Ok(s) => s.len(),
+                Err(e) => e.valid_up_to(),
+            };
+            if valid > 0 {
+                let text = String::from_utf8_lossy(&pending[..valid]).into_owned();
+                pending.drain(..valid);
+                if job.events.send(Event::Text(text)).is_err() {
+                    break Finish::Stop; // nobody is listening
+                }
+            }
+            if n >= job.max_tokens || pos + 1 >= self.model.max_seq() {
+                break Finish::Length;
+            }
+            if job.cancel.load(Ordering::Relaxed) {
+                break Finish::Stop;
+            }
+            logits = self.model.forward(&[next], pos)?;
+            self.tokens.push(next);
+            pos += 1;
+        };
+        if !pending.is_empty() {
+            let _ = job.events.send(Event::Text(String::from_utf8_lossy(&pending).into_owned()));
+        }
+        let decode_s = decode.elapsed().as_secs_f64();
+        if self.log {
+            eprintln!(
+                "  {} prompt tokens ({start} cached) in {prefill_s:.1}s; {n} generated in {decode_s:.1}s ({:.1} tok/s)",
+                prompt.len(),
+                n as f64 / decode_s.max(1e-9)
+            );
+        }
+        let _ = job.events.send(Event::Done { finish, completion_tokens: n });
+        Ok(())
+    }
+}
+
+fn splitmix(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// Pick the next token: greedy at temperature 0, else temperature, top-k
+/// and top-p (nucleus) sampling over the leading candidates.
+pub fn sample(logits: &[f32], s: &Sampling, rng: &mut u64) -> u32 {
+    let greedy = || {
+        logits.iter().enumerate().fold((0usize, f32::NEG_INFINITY), |b, (i, &v)| if v > b.1 { (i, v) } else { b }).0 as u32
+    };
+    if s.temperature <= 0.0 || logits.is_empty() {
+        return greedy();
+    }
+    let k = if s.top_k > 0 { s.top_k.min(CANDIDATES) } else { CANDIDATES }.min(logits.len());
+    let mut idx: Vec<u32> = (0..logits.len() as u32).collect();
+    let desc = |a: &u32, b: &u32| logits[*b as usize].partial_cmp(&logits[*a as usize]).unwrap_or(std::cmp::Ordering::Equal);
+    if k < idx.len() {
+        idx.select_nth_unstable_by(k - 1, desc);
+        idx.truncate(k);
+    }
+    idx.sort_unstable_by(desc);
+    let top = logits[idx[0] as usize];
+    let mut probs: Vec<f64> = idx.iter().map(|&i| (((logits[i as usize] - top) / s.temperature) as f64).exp()).collect();
+    let total: f64 = probs.iter().sum();
+    let mut keep = probs.len();
+    if s.top_p < 1.0 {
+        let mut acc = 0.0;
+        for (i, p) in probs.iter().enumerate() {
+            acc += p / total;
+            if acc >= s.top_p as f64 {
+                keep = i + 1;
+                break;
+            }
+        }
+    }
+    probs.truncate(keep);
+    let total: f64 = probs.iter().sum();
+    let mut r = (splitmix(rng) >> 11) as f64 / (1u64 << 53) as f64 * total;
+    for (i, p) in probs.iter().enumerate() {
+        r -= p;
+        if r <= 0.0 {
+            return idx[i];
+        }
+    }
+    idx[keep - 1]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sampling_respects_temperature_top_k_and_top_p() {
+        let logits = vec![0.0, 5.0, 4.0, -1.0, 4.9];
+        let mut rng = 1;
+        let greedy = Sampling { temperature: 0.0, top_p: 1.0, top_k: 0, seed: 0 };
+        assert_eq!(sample(&logits, &greedy, &mut rng), 1);
+        let top1 = Sampling { temperature: 1.0, top_p: 1.0, top_k: 1, seed: 0 };
+        for _ in 0..50 {
+            assert_eq!(sample(&logits, &top1, &mut rng), 1);
+        }
+        // top-p 0.5 keeps the best two (5.0, 4.9: ~0.47 then ~0.9 of the mass)
+        let nucleus = Sampling { temperature: 1.0, top_p: 0.5, top_k: 0, seed: 0 };
+        let mut seen = [0usize; 5];
+        for _ in 0..2000 {
+            seen[sample(&logits, &nucleus, &mut rng) as usize] += 1;
+        }
+        assert!(seen[1] > 0 && seen[4] > 0 && seen[0] + seen[2] + seen[3] == 0, "{seen:?}");
+    }
+}

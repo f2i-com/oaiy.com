@@ -8,6 +8,13 @@ The crates under crates/nrob, crates/nrob-cli, crates/dsv41 and
 crates/dsv41-cuda are licensed under the Apache License, Version 2.0 (see
 LICENSE-APACHE).
 
+crates/dsv41 and crates/dsv41-cuda implement DeepSeek-V4.1 following
+DeepSeek's reference inference code (inference/model.py) and chat
+encoding (encoding/encoding.py); crates/dsv41/src/chat.rs ports the
+encoding rule for rule, including its prompt templates. That reference
+code and the model weights are published by DeepSeek under the MIT
+License.
+
 The crates under crates/gguf, crates/ggml-quants, crates/ggml-rs,
 crates/ggml-rs-cuda, crates/tokenizer, and crates/llama-rs are vendored
 from the author's own pure-Rust GGUF compute subsystem (see

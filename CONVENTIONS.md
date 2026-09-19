@@ -2,15 +2,16 @@
 
 This workspace is a Rust (edition 2021) inference engine, `nrob`, that reads GGUF and
 safetensors weights in place. This file is the contract every change to the engine
-crates (`nrob`, `nrob-cli`, `dsv41`, `dsv41-cuda`) is held to.
+crates (`nrob`, `nrob-cli`, `nrob-server`, `dsv41`, `dsv41-cuda`) is held to.
 
 ## Hard rules
 
-- **std-only.** No external crates in `nrob` or `dsv41`: no serde, no tokio, nothing.
+- **std-only.** No external crates in `nrob`, `dsv41` or `nrob-server`: no serde, no
+  tokio, nothing.
   The core is zero-dependency by design. Do not add a dependency "just for this one
   thing"; write the 30 lines instead. (`dsv41-cuda` depends on cudarc for the GPU; the
   GGUF stack is covered below.)
-- **No `unsafe`** in `nrob`, `nrob-cli` or `dsv41`: their crate roots say
+- **No `unsafe`** in `nrob`, `nrob-cli`, `nrob-server` or `dsv41`: their crate roots say
   `#![forbid(unsafe_code)]`. `dsv41-cuda` may use it for kernel launches, pinned
   memory and SIMD dispatch, with a `SAFETY:` comment on every block explaining why safe
   Rust cannot express it and what makes it sound.

@@ -54,6 +54,10 @@ Every token is a small, well-planned job:
   reads. Hybrid CPU/GPU decode across two GPUs, per-GPU VRAM expert caches, an AVX-512
   CPU expert kernel, and caches that stay warm across runs. Token-identical to the
   reference implementation on the golden prompts. See [below](#deepseek-v41-flash).
+- **An OpenAI-compatible server for coding harnesses.** `nrob-server` serves
+  DeepSeek-V4.1 on `/v1/chat/completions` with streaming, tool calls, reasoning
+  (`reasoning_content`), and a prefix cache that resumes each turn where the last one
+  left off. See [Serving](#serving-an-openai-compatible-api).
 - **Any GGUF.** Llama, Qwen2/3/3.5, Gemma 3/3n/4, Mixtral, Qwen3-MoE and more, through
   our own pure-Rust GGUF stack (`gguf`, `ggml-quants`, `ggml-rs`, `tokenizer`,
   `llama-rs`; no llama.cpp, no C++). Chat templates per architecture, and vision towers
@@ -113,13 +117,14 @@ The checkpoint is used as-is: `dsv41` reads the safetensors headers and serves e
 expert with two positioned reads.
 
 ```sh
-# prompt → token ids (the reference chat encoding; a Rust encoder is still to come)
-python tools/dsv41/encode.py "Explain how rainbows form." > prompt.ids
+echo Explain how rainbows form. > prompt.txt
 
 # decode on both GPUs: layers 0-19 on cuda:1, 20-39 on cuda:0
-cargo run -p dsv41-cuda --release --example generate -- prompt.ids 256 1,0
+cargo run -p dsv41-cuda --release --example generate -- prompt.txt 256 1,0
 ```
 
+The prompt goes through nrob's own Rust tokenizer and chat format, both matched
+exactly against the reference (3,638 tokenizer cases, 420 chat-format cases).
 `generate` streams the text and prints per-token timing and cache hit rates. Useful
 environment variables: `DSV41_MODEL` (checkpoint directory), `DSV41_RAM_GB` (RAM tier,
 default 140), `DSV41_USAGE` (the saved expert-usage profile that warms the tiers at
@@ -136,6 +141,45 @@ overhead, and the SSD for cold starts) is written up in
 [docs/DEEPSEEK_V41.md](docs/DEEPSEEK_V41.md). Correctness is gated on golden files from
 the reference implementation: greedy tokens identical, every layer checked in
 isolation, every GPU kernel tested against its CPU counterpart.
+
+### Serving: an OpenAI-compatible API
+
+```sh
+cargo build --release -p nrob-server
+nrob-server --model D:\deepseek\model --ctx 65536   # then point a harness at http://127.0.0.1:8000/v1
+```
+
+Any OpenAI-compatible client or coding harness (Aider, Cline, Continue, OpenCode, ...)
+works with base URL `http://127.0.0.1:8000/v1`, model `deepseek-v4.1-flash`, and any API
+key (or the one set with `--api-key`). Claude Code speaks Anthropic's API, not
+OpenAI's.
+
+- **Endpoints:** `POST /v1/chat/completions` (streamed or whole), `POST /v1/completions`,
+  `GET /v1/models`.
+- **Tools:** OpenAI `tools` become the model's DSML tool format and its calls come back
+  as `tool_calls` (parallel calls included).
+- **Reasoning:** answers directly by default. `reasoning_effort` (or DeepSeek's
+  `thinking: {type: enabled}`) turns reasoning on and streams it as
+  `reasoning_content`. `--thinking` makes it the default.
+- **Prefix cache:** a harness resends the whole conversation every turn. The server
+  resumes from the live state or from a checkpoint (taken every 256 prompt tokens and at
+  user-turn boundaries), so a turn only runs its new tokens. A new chat with the same
+  system prompt skips it too.
+- **Long prompts** run layer by layer: every expert is read once for the whole prompt
+  instead of once per chunk (~6× faster here than chunked prefill).
+
+What to expect on this machine. The model is 510 GB; RAM and VRAM hold about two thirds
+of the experts, and the rest come from the drive, so the drive matters. The internal
+NVMe throttles to 0.51 GB/s under sustained reads; an external Samsung T9 (USB
+20 Gbps) holds 1.95 GB/s.
+
+| Harness request | From the T9 |
+|---|---:|
+| First request, 5.6K-token system prompt + tools | ~3 min prompt (31 tok/s; 22 from the internal drive) |
+| New chat, same system prompt | prompt cached (5,560 of 5,580 tokens) |
+| Next turn of a conversation | only the new tokens |
+| Decode on a new topic | ~3 tok/s at first, 8.5 then 12 tok/s as VRAM adapts to it |
+| Warm, same topic | up to ~29 tok/s (measured with `generate`) |
 
 ## Benchmarks
 
@@ -165,7 +209,9 @@ crates/
   nrob-cli/      `nrob` binary: run / chat / bench / info / tokenize for GGUF models
   dsv41/         DeepSeek-V4.1 from safetensors: in-place expert store, CPU reference
                  model, CPU experts (std-only, forbid(unsafe_code))
-  dsv41-cuda/    DeepSeek-V4.1 on CUDA: kernels, VRAM expert cache, hybrid decode
+  dsv41-cuda/    DeepSeek-V4.1 on CUDA: kernels, VRAM expert cache, hybrid decode,
+                 chunk continuation, checkpoints, layer-by-layer prefill
+  nrob-server/   OpenAI-compatible HTTP server for DeepSeek-V4.1 (std-only)
   gguf, ggml-quants, ggml-rs, ggml-rs-cuda, tokenizer, llama-rs
                  our pure-Rust GGUF stack: reader, quant kernels, CPU and CUDA
                  backends, tokenizers, model architectures, expert streaming
@@ -204,15 +250,27 @@ DSV41_CUDA_DEVICES=1,0 cargo test -p dsv41-cuda --release --test gpu_model -- --
   architectures load resident.
 - **Direct I/O** (page-cache bypass) is used by `dsv41`; GGUF streaming reads through
   the OS page cache.
-- DeepSeek-V4.1 runs through the `dsv41-cuda` example; `nrob-cli` takes GGUF files.
-  A Rust chat encoder for it is still to come.
+- DeepSeek-V4.1 runs through `nrob-server` or the `dsv41-cuda` example; `nrob-cli`
+  takes GGUF files.
+- **DeepSeek-V4.1 context:** the model is trained for 1,048,576 tokens (YaRN ×16 over
+  65,536). nrob's caches cost ~7 KB a token, so `--ctx` can go far (65,536 by default).
+  Verified against the reference oracle up to 247 tokens; longer contexts run the same
+  code, but candidate filtering only engages past ~32K tokens and is unverified there.
+- **DeepSeek-V4.1 vision:** the checkpoint includes its 32-layer vision encoder, and the
+  chat format already handles image blocks, but the encoder is not ported yet. The
+  server answers image requests with an error.
+- On a 192 GB machine the drive sets the pace for new prompts and topics: run from a
+  drive that sustains its speed (the T9 does, the internal one throttles). More RAM
+  would help most of all.
 - The CLI is text-only. Vision towers live in `llama-rs` (see its examples).
 
 ## Provenance
 
 nrob is written from scratch in Rust. The GGUF stack (`gguf`, `ggml-quants`, `ggml-rs`,
 `ggml-rs-cuda`, `tokenizer`, `llama-rs`) is the repo author's own Rust code, vendored
-from their `llm` workspace (see `crates/VENDORED.md`).
+from their `llm` workspace (see `crates/VENDORED.md`). The DeepSeek-V4.1 engine
+follows DeepSeek's reference implementation and chat encoding, published under the MIT
+License (see `NOTICE`).
 
 ## License
 

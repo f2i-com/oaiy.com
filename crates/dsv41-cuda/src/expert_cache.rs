@@ -20,6 +20,17 @@ use nrob::Result;
 
 use crate::gpu::{cu, Gpu};
 
+/// Every frequency halves after this many decode tokens: LFU without aging
+/// keeps an old topic's experts in VRAM forever, and a new topic's never
+/// collect enough uses to displace them. (Counted in tokens, not accesses:
+/// a long prefill touches nearly every expert and would age the counts away.)
+const AGE_TOKENS: u64 = 128;
+
+/// Largest frequency a saved usage profile seeds: the profile picks which
+/// experts start in VRAM, but should not shield them from this run's usage
+/// for thousands of tokens.
+const SEED_CAP: u64 = 64;
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DeviceCacheStats {
     pub hits: u64,
@@ -51,6 +62,8 @@ pub struct DeviceExpertCache {
     /// Access counts survive eviction, so a returning hot expert is not
     /// judged as new (a cheap frequency sketch; ~15k entries at most).
     freq: HashMap<(u32, u32), u64>,
+    /// Decode tokens seen (for aging).
+    tokens: u64,
     pub stats: DeviceCacheStats,
 }
 
@@ -65,6 +78,7 @@ impl DeviceExpertCache {
             clock: 0,
             batch: 1,
             freq: HashMap::new(),
+            tokens: 0,
             stats: DeviceCacheStats::default(),
         })
     }
@@ -83,6 +97,7 @@ impl DeviceExpertCache {
     /// Start `(layer, expert)`'s frequency at `freq` (a warm start from a
     /// saved profile), so recorded-hot experts are not the first victims.
     pub fn seed(&mut self, layer: u32, expert: u32, freq: u64) {
+        let freq = freq.min(SEED_CAP);
         let f = self.freq.entry((layer, expert)).or_insert(0);
         *f = (*f).max(freq);
         if let Some(&i) = self.index.get(&(layer, expert)) {
@@ -144,6 +159,25 @@ impl DeviceExpertCache {
 
     fn view(&self, i: usize) -> CudaView<'_, u8> {
         self.pool.slice(i * self.record..(i + 1) * self.record)
+    }
+
+    /// One decode token has run; every [`AGE_TOKENS`] halve the frequencies.
+    pub fn tick_token(&mut self) {
+        self.tokens += 1;
+        if self.tokens.is_multiple_of(AGE_TOKENS) {
+            self.age();
+        }
+    }
+
+    /// Halve every frequency.
+    fn age(&mut self) {
+        self.freq.retain(|_, f| {
+            *f /= 2;
+            *f > 0
+        });
+        for s in &mut self.slots {
+            s.freq /= 2;
+        }
     }
 
     /// Count an access; on a hit refresh and pin the slot and return it.

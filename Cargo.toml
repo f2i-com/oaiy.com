@@ -9,6 +9,9 @@ members = [
     # member, not a default member (needs a CUDA toolchain); holds the
     # reviewed unsafe (kernel launches, pinned mappings, AVX-512 dispatch).
     "crates/dsv41-cuda",
+    # The OpenAI-compatible server for it (needs CUDA too, so not a default
+    # member either).
+    "crates/nrob-server",
     # Vendored GGUF compute subsystem (see crates/VENDORED.md). These keep
     # their own identity and external deps; the std-only rule below does
     # not apply to them.

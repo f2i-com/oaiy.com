@@ -160,12 +160,17 @@ impl Book {
     }
 
     fn evict(&mut self, k: Key) {
-        let e = self.entries.remove(&k).expect("victim is cached");
+        self.drop_entry(k);
+        self.stats.evictions += 1;
+    }
+
+    /// Take a resident record out, keeping its buffer for reuse.
+    fn drop_entry(&mut self, k: Key) {
+        let e = self.entries.remove(&k).expect("resident key is cached");
         self.resident.swap_remove(e.slot);
         if let Some(&moved) = self.resident.get(e.slot) {
             self.entries.get_mut(&moved).expect("resident key is cached").slot = e.slot;
         }
-        self.stats.evictions += 1;
         if let Some(Ok(buf)) = e.bytes.map(Arc::try_unwrap) {
             if self.spare.len() < SPARE_BUFFERS {
                 self.spare.push(buf);
@@ -298,6 +303,19 @@ impl Ecache {
     /// ranking; a record still being read reports false.
     pub fn probe(&self, layer: u32, expert: u32) -> bool {
         self.book().entries.get(&(layer, expert)).is_some_and(Entry::loaded)
+    }
+
+    /// Drop `(layer, expert)` to free its place (another tier holds it now,
+    /// say). A leased or still-loading record stays. Returns whether it was
+    /// dropped. Not counted as an eviction.
+    pub fn remove(&self, layer: u32, expert: u32) -> bool {
+        let mut g = self.book();
+        let key = (layer, expert);
+        if !g.entries.get(&key).is_some_and(Entry::evictable) {
+            return false;
+        }
+        g.drop_entry(key);
+        true
     }
 
     /// Copy the record into `dst` (at least [`rec_bytes`](Self::rec_bytes)
@@ -552,6 +570,22 @@ mod tests {
         c.acquire(0, 3, &s).unwrap();
         assert!(!c.probe(0, 0) && c.probe(0, 3));
         assert_eq!(&*b, &s.record(0, 1)[..]);
+    }
+
+    #[test]
+    fn remove_frees_a_place_but_not_a_leased_record() {
+        let s = Store::new(8);
+        let c = Ecache::new(2 * 8, 8, CachePolicy::Lfru);
+        c.acquire(0, 0, &s).unwrap();
+        let held = c.acquire(0, 1, &s).unwrap();
+        assert!(!c.remove(0, 1), "a leased record was removed");
+        assert!(c.remove(0, 0));
+        assert!(!c.remove(0, 0), "removed twice");
+        assert_eq!((c.len(), c.stats().evictions), (1, 0));
+        // the freed place takes a new record without evicting
+        c.acquire(0, 2, &s).unwrap();
+        assert!(c.probe(0, 1) && c.probe(0, 2));
+        drop(held);
     }
 
     #[test]

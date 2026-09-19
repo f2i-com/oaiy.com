@@ -1,8 +1,11 @@
 //! Greedy generation on one or more GPUs (hybrid CPU/GPU decode), streaming
 //! text, with per-token timing and cache statistics.
 //!
-//!   python tools/dsv41/encode.py "Explain how rainbows form." > prompt.ids
-//!   cargo run -p dsv41-cuda --release --example generate -- prompt.ids [max_new_tokens] [devices]
+//!   echo Explain how rainbows form. > prompt.txt
+//!   cargo run -p dsv41-cuda --release --example generate -- prompt.txt [max_new_tokens] [devices]
+//!
+//! The prompt file holds a user message (encoded with the chat format, chat
+//! mode) or token ids, comma or space separated.
 //!
 //! `devices` is a comma-separated list of CUDA ordinals (default "1"); "1,0"
 //! splits the layers across both cards, each caching its own layers' experts.
@@ -38,11 +41,18 @@ fn main() -> nrob::Result<()> {
     let model_dir = std::env::var_os("DSV41_MODEL").map(PathBuf::from).unwrap_or_else(|| r"E:\deepseek\model".into());
     let golden = std::env::var_os("DSV41_GOLDEN_DIR").map(PathBuf::from).unwrap_or_else(|| r"E:\deepseek\golden".into());
 
-    let prompt: Vec<u32> = std::fs::read_to_string(ids_file)?
-        .split(|c: char| c == ',' || c.is_whitespace())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.parse().map_err(|_| nrob::Error::Arg(format!("bad token id {s:?}"))))
-        .collect::<nrob::Result<_>>()?;
+    // token ids (comma or space separated), or else the text of a user
+    // message, encoded here with the chat format (chat mode) and tokenizer
+    let text = std::fs::read_to_string(ids_file)?;
+    let ids: Result<Vec<u32>, _> = text.split(|c: char| c == ',' || c.is_whitespace()).filter(|s| !s.is_empty()).map(str::parse).collect();
+    let prompt: Vec<u32> = match ids {
+        Ok(ids) if !ids.is_empty() => ids,
+        _ => {
+            let user = nrob::json::Json::obj([("role", nrob::json::Json::str("user")), ("content", nrob::json::Json::str(text.trim()))]);
+            let enc = dsv41::chat::encode(&[user], &dsv41::chat::Options::default())?;
+            dsv41::tokenizer::Tokenizer::load(&model_dir)?.encode(&enc.prompt)
+        }
+    };
     let detok = Detokenizer::load(&model_dir)?;
 
     let ram_gb: usize = std::env::var("DSV41_RAM_GB").ok().and_then(|v| v.parse().ok()).unwrap_or(140);
@@ -58,7 +68,7 @@ fn main() -> nrob::Result<()> {
         Ok(v) => Some(v.parse().map_err(|_| nrob::Error::Arg(format!("bad DSV41_CPU_THREADS {v:?}")))?),
         Err(_) => Some(24),
     };
-    let opts = GpuOptions { devices: devices.clone(), max_seq: 4096, expert_cache_bytes: ram_gb << 30, direct_io: true, vram_expert_bytes: None, cpu_expert_threads };
+    let opts = GpuOptions { devices: devices.clone(), max_seq: 4096, expert_cache_bytes: ram_gb << 30, direct_io: true, vram_expert_bytes: None, vram_headroom_bytes: 1 << 30, cpu_expert_threads };
     let mut model = GpuModel::load(&model_dir, &golden.join("engram_meta.safetensors"), &opts)?;
     let slots: Vec<usize> = model.device_caches().map(|c| c.slots()).collect();
     eprintln!("[loaded in {:.1}s on cuda:{devices:?}, VRAM expert slots {slots:?}, RAM expert slots {}]", t.elapsed().as_secs_f64(), model.expert_cache().n_slots());

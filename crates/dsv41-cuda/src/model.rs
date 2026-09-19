@@ -63,8 +63,12 @@ pub struct GpuOptions {
     /// Bypass the page cache for expert reads.
     pub direct_io: bool,
     /// VRAM for each device's expert cache; `None` = whatever that device's
-    /// share of the trunk leaves free, minus 1 GiB of headroom.
+    /// share of the trunk leaves free, minus `vram_headroom_bytes`.
     pub vram_expert_bytes: Option<usize>,
+    /// VRAM left free for activations when `vram_expert_bytes` is `None`
+    /// (1 GiB suits decode and 1k-token prefill chunks; layered prefill of
+    /// long prompts wants more).
+    pub vram_headroom_bytes: usize,
     /// Hybrid decode: a routed expert that misses VRAM runs on this many CPU
     /// threads straight from the host cache, unless it is used more often
     /// than the VRAM victim (then it is uploaded, at most
@@ -76,6 +80,24 @@ pub struct GpuOptions {
 /// VRAM uploads a hybrid decode step may make per layer: each is a
 /// synchronous PCIe copy of 18.8 MB (1.3-2.6 ms on the dev machine).
 pub const PROMOTE_PER_LAYER: usize = 1;
+
+/// The per-sequence state after some tokens (see
+/// [`GpuModel::checkpoint`]): each layer's window ring and, on
+/// ratio-2 compressors, its partial group, held in host memory (~10 MB).
+pub struct Checkpoint {
+    pos: usize,
+    layers: Vec<LayerSnapshot>,
+}
+
+/// One layer's window ring, and its compressor's partial group (kv, score).
+type LayerSnapshot = (Vec<f32>, Option<Vec<f32>>, Option<Vec<f32>>);
+
+impl Checkpoint {
+    /// Tokens the state covers.
+    pub fn pos(&self) -> usize {
+        self.pos
+    }
+}
 
 /// Wall time per phase, summed over forwards (seconds). Enabled by
 /// [`GpuModel::enable_profile`] (the generate example: `DSV41_PROFILE=1`);
@@ -404,7 +426,7 @@ impl GpuModel {
             // expert slots from whatever this device's share of the trunk left free
             let vram = match opts.vram_expert_bytes {
                 Some(b) => b,
-                None => g.mem_info()?.0.saturating_sub(1 << 30),
+                None => g.mem_info()?.0.saturating_sub(opts.vram_headroom_bytes),
             };
             let dcache = DeviceExpertCache::new(&g, (vram / RECORD_BYTES).max(1), RECORD_BYTES)?;
             let handoff = Arc::new(crate::handoff::Handoff::new(&g, cfg.n_activated_experts, cfg.dim)?);
@@ -512,10 +534,17 @@ impl GpuModel {
             dev.g.sync()?;
             dev.dcache.stats = Default::default();
         }
+        // The tiers are exclusive: what VRAM holds, RAM need not (a VRAM hit
+        // never reaches the host cache), so its places go to the next-hottest
+        // experts instead: ~2,900 more experts resident than with copies in
+        // both. An expert later evicted from VRAM is read again if needed.
+        for &(l, e) in &all {
+            self.cache.remove(l, e);
+        }
 
         // the rest of the host cache, in the background: experts used more
         // than once, hottest first, leaving room for this run's own misses
-        let room = self.cache.n_slots().saturating_sub(all.len() + self.cache.n_slots() / 20);
+        let room = self.cache.n_slots().saturating_sub(self.cache.n_slots() / 20);
         let rest: Vec<(u32, u32)> = ents.iter().filter(|&&(n, l, e)| n > 1 && !in_vram.contains(&(l, e))).map(|&(_, l, e)| (l, e)).take(room).collect();
         let queued = rest.len();
         if let Some(w) = self.warming.take() {
@@ -523,6 +552,13 @@ impl GpuModel {
         }
         self.warming = Some(Warming::spawn(Arc::clone(&self.cache), Arc::clone(&self.store), rest, Arc::clone(&self.demand)));
         Ok((vram, queued))
+    }
+
+    /// Keep the background warm-up off the drive (`true`) or let it resume.
+    /// A server sets this while it handles a request, so the fill runs only
+    /// when idle.
+    pub fn set_busy(&self, busy: bool) {
+        self.demand.busy.store(busy, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Records the background warm-up has read so far, and whether it is done.
@@ -581,9 +617,215 @@ impl GpuModel {
         Ok(())
     }
 
-    /// Last position's logits for `ids` at `start_pos` (prefill at 0, then one token at a time).
+    /// Last position's logits for `ids` at `start_pos`: a prefill at 0, one
+    /// decode token, or a chunk continuing the sequence (positions before
+    /// `start_pos` must already have been run, or restored with
+    /// [`restore`](Self::restore)).
     pub fn forward(&mut self, ids: &[u32], start_pos: usize) -> Result<Vec<f32>> {
         self.run(ids, start_pos, None, None)
+    }
+
+    /// Longest sequence the caches hold.
+    pub fn max_seq(&self) -> usize {
+        self.max_seq
+    }
+
+    /// Prefill `ids` at `start_pos` layer by layer: each layer runs over the
+    /// whole stretch before the next starts, with the residual stream held
+    /// in host memory. Attention goes in sub-chunks of `sub` tokens, each
+    /// continuing the last; the routed experts run over all the tokens at
+    /// once, so each expert is fetched once for the stretch instead of once
+    /// per chunk. When the RAM tier cannot hold every expert (a chunk of a
+    /// few hundred tokens already touches nearly all 15,360), a long prompt
+    /// then costs about one pass over the experts. Returns the last token's
+    /// logits, as [`forward`](Self::forward) over the same sub-chunks would.
+    ///
+    /// Memory beyond `forward`'s: two `[len][dim]` f32 buffers on the device
+    /// (40 KB a token) and two `[len][4 * dim]` in host RAM (160 KB a token),
+    /// so callers split very long prompts into several stretches.
+    ///
+    /// `cancel`, checked before each layer, abandons the pass with an error;
+    /// the state is then partly updated, so restore a checkpoint taken at
+    /// or before `start_pos` before running anything else.
+    pub fn prefill_layered(&mut self, ids: &[u32], start_pos: usize, sub: usize, cancel: Option<&std::sync::atomic::AtomicBool>) -> Result<Vec<f32>> {
+        self.demand.prefill.store(true, std::sync::atomic::Ordering::Relaxed);
+        let out = self.layered_inner(ids, start_pos, sub.max(2), cancel);
+        self.demand.prefill.store(false, std::sync::atomic::Ordering::Relaxed);
+        out
+    }
+
+    fn layered_inner(&mut self, ids: &[u32], start_pos: usize, sub: usize, cancel: Option<&std::sync::atomic::AtomicBool>) -> Result<Vec<f32>> {
+        let (d, t) = (self.cfg.dim, ids.len());
+        if t == 0 || start_pos + t > self.max_seq {
+            return Err(Error::Arg(format!("{t} tokens at {start_pos}: past max_seq {}", self.max_seq)));
+        }
+        let hashes = self.hasher.forward(ids, start_pos)?;
+        let mut h_host = vec![0.0f32; t * HC * d];
+        for (i, &id) in ids.iter().enumerate() {
+            if id as usize >= self.cfg.vocab_size {
+                return Err(Error::Arg(format!("token {id} outside the vocabulary")));
+            }
+            let row = &mut h_host[i * HC * d..(i + 1) * HC * d];
+            self.embed.row(id as usize, &mut row[..d]);
+            for c in 1..HC {
+                row.copy_within(..d, c * d);
+            }
+        }
+        let mut pre_host = vec![0.0f32; t * MIXW];
+        for i in 0..t {
+            pre_host[i * MIXW] = 1.0;
+        }
+        // engram rows for every token, read while the first layers run
+        let (cols, n_eng, head_dim) = (self.hasher.cols(), self.cfg.engram_layer_ids.len(), self.cfg.engram_head_dim);
+        let mut engram_rows: Vec<Option<std::thread::JoinHandle<Result<Vec<f32>>>>> = self
+            .layers
+            .iter()
+            .map(|ly| {
+                ly.engram.as_ref().map(|(eg, _, _)| {
+                    let eg = Arc::clone(eg);
+                    let hs: Vec<i64> = (0..t)
+                        .flat_map(|i| hashes[(i * n_eng + eg.hash_index) * cols..(i * n_eng + eg.hash_index + 1) * cols].iter().copied())
+                        .collect();
+                    std::thread::spawn(move || eg.rows(&hs, head_dim))
+                })
+            })
+            .collect();
+
+        let subs: Vec<(usize, usize)> = (0..t).step_by(sub).map(|a| (a, (a + sub).min(t))).collect();
+        // the lists index layers hand to later layers, per sub-chunk
+        let mut topk: Vec<Vec<Vec<i32>>> = vec![Vec::new(); subs.len()];
+        let mut shared: Vec<Shared> = (0..subs.len()).map(|_| Shared::default()).collect();
+        let (lim, eps) = (self.cfg.swiglu_limit, self.cfg.norm_eps);
+        let inter = self.cfg.moe_inter_dim;
+        let mut h1_host = vec![0.0f32; t * HC * d];
+        let mut mix_host = vec![0.0f32; t * MIXW];
+
+        #[allow(clippy::needless_range_loop)] // l indexes layers and the pending engram reads alike
+        for l in 0..self.cfg.n_layers {
+            if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) {
+                return Err(Error::Arg("prefill cancelled".into()));
+            }
+            self.cur = self.layers[l].dev;
+            let rows_host = match engram_rows[l].take() {
+                Some(pending) => Some(pending.join().map_err(|_| Error::Io(std::io::Error::other("engram read thread panicked")))??),
+                None => None,
+            };
+            let mut x2_all = self.devs[self.cur].g.alloc::<f32>(t * d)?;
+            for (s, &(a, b)) in subs.iter().enumerate() {
+                let ts = b - a;
+                let mut h = self.devs[self.cur].g.upload(&h_host[a * HC * d..b * HC * d])?;
+                let pm = self.devs[self.cur].g.upload(&pre_host[a * MIXW..b * MIXW])?;
+                if let (Some((_, wkv, qk)), Some(rows)) = (&self.layers[l].engram, &rows_host) {
+                    let g = &self.devs[self.cur].g;
+                    let w = rows.len() / t;
+                    let r = g.upload(&rows[a * w..b * w])?;
+                    let kv = wkv.forward(g, &r.as_view(), ts, Out::Bf16)?;
+                    let mut out = g.alloc::<f32>(ts * HC * d)?;
+                    g.engram_gate(&h, &kv, qk, &mut out, d, ts, eps, (d as f32).powf(-0.5))?;
+                    h = out;
+                }
+                std::mem::swap(&mut self.topk, &mut topk[s]);
+                std::mem::swap(&mut self.shared, &mut shared[s]);
+                let attn_mix = self.mixes(&h, l, false, ts)?;
+                let x = self.hc_pre(&h, &pm, &self.layers[l].attn_norm, ts)?;
+                let attn = self.attention(l, &x, ts, start_pos + a)?;
+                let h1 = self.hc_post(&attn, &h, &attn_mix, ts)?;
+                let ffn_mix = self.mixes(&h1, l, true, ts)?;
+                let x2 = self.hc_pre(&h1, &attn_mix, &self.layers[l].ffn_norm, ts)?;
+                std::mem::swap(&mut self.topk, &mut topk[s]);
+                std::mem::swap(&mut self.shared, &mut shared[s]);
+                let g = &self.devs[self.cur].g;
+                g.copy(&x2.as_view(), &mut x2_all.slice_mut(a * d..b * d))?;
+                h1_host[a * HC * d..b * HC * d].copy_from_slice(&g.download(&h1)?);
+                mix_host[a * MIXW..b * MIXW].copy_from_slice(&g.download(&ffn_mix)?);
+            }
+
+            // the routed experts over every token at once
+            let ly = &self.layers[l];
+            let Dev { g, dcache, .. } = &mut self.devs[self.cur];
+            let logits = g.download(&ly.gate.forward(g, &x2_all.as_view(), t, Out::F32)?)?;
+            let routes = route(&self.cfg, &logits, &ly.bias, t);
+            let prof = self.profile.is_some();
+            let (y, fetch, experts) = routed_sum(g, dcache, &self.cache, self.store.as_ref(), l, &x2_all.as_view(), t, &routes, lim, prof)?;
+            if let Some(p) = self.profile.as_mut() {
+                p.fetch += fetch;
+                p.experts += experts;
+            }
+
+            // shared expert and the residual update, per sub-chunk
+            let [w1, w2, w3] = &ly.shared;
+            for &(a, b) in &subs {
+                let ts = b - a;
+                let xs = x2_all.slice(a * d..b * d);
+                let (gate, up) = (w1.forward(g, &xs, ts, Out::Bf16)?, w3.forward(g, &xs, ts, Out::Bf16)?);
+                let mut hbuf = g.alloc::<f32>(ts * inter)?;
+                g.swiglu(&gate, &up, None, &mut hbuf, inter, ts, lim)?;
+                let sh = w2.forward(g, &hbuf.as_view(), ts, Out::Bf16)?;
+                let ys = g.dup(&y.slice(a * d..b * d))?;
+                let mut m = g.alloc::<f32>(ts * d)?;
+                g.add_round(&ys, &sh.as_view(), &mut m, ts * d)?;
+                let h1 = g.upload(&h1_host[a * HC * d..b * HC * d])?;
+                let mix = g.upload(&mix_host[a * MIXW..b * MIXW])?;
+                let mut h2 = g.alloc::<f32>(ts * HC * d)?;
+                g.hc_post(&m, &h1, &mix, &mut h2, d, ts)?;
+                h_host[a * HC * d..b * HC * d].copy_from_slice(&g.download(&h2)?);
+            }
+            // the ffn mix is the next layer's pre-mix
+            std::mem::swap(&mut pre_host, &mut mix_host);
+        }
+
+        // the last token through the final norm and the head
+        let out_dev = self.devs.len() - 1;
+        self.cur = out_dev;
+        let g = &self.devs[out_dev].g;
+        let last = t - 1;
+        let hl = g.upload(&h_host[last * HC * d..t * HC * d])?;
+        let pl = g.upload(&pre_host[last * MIXW..t * MIXW])?;
+        let mut x = g.alloc::<f32>(d)?;
+        g.hc_pre(&hl, &pl.as_view(), &mut x, d, 1, MIXW)?;
+        let mut xn = g.alloc::<f32>(d)?;
+        g.rmsnorm(&x.as_view(), &self.norm, &mut xn.slice_mut(..), 1, d, self.cfg.norm_eps)?;
+        g.download(&self.head.forward(g, &xn.as_view(), 1, Out::F32)?)
+    }
+
+    /// Snapshot the state after `pos` tokens, to come back to with
+    /// [`restore`](Self::restore) and continue from `pos` with different
+    /// tokens (a new reply to the same prompt, say). Only the sliding-window
+    /// rings and the compressors' partial groups need copying (~10 MB, to
+    /// host memory): the compressed caches below `pos` are never rewritten
+    /// by later tokens, and above it they are rewritten before being read.
+    pub fn checkpoint(&self, pos: usize) -> Result<Checkpoint> {
+        let mut layers = Vec::with_capacity(self.states.len());
+        for (l, st) in self.states.iter().enumerate() {
+            let g = &self.devs[self.layers[l].dev].g;
+            let copy = |s: &Option<CudaSlice<f32>>| s.as_ref().map(|s| g.download(s)).transpose();
+            layers.push((g.download(&st.window)?, copy(&st.kv_state)?, copy(&st.score_state)?));
+        }
+        Ok(Checkpoint { pos, layers })
+    }
+
+    /// Return to a [`checkpoint`](Self::checkpoint): the next forward may
+    /// start at its position. Checkpoints taken after it (at a later
+    /// position, of other tokens) are no longer valid once new tokens run.
+    pub fn restore(&mut self, ck: &Checkpoint) -> Result<()> {
+        if ck.layers.len() != self.states.len() {
+            return Err(Error::Arg("checkpoint is from another model".into()));
+        }
+        for (l, (window, kvs, scs)) in ck.layers.iter().enumerate() {
+            let g = &self.devs[self.layers[l].dev].g;
+            let st = &mut self.states[l];
+            g.write(window, &mut st.window.slice_mut(..))?;
+            if let (Some(src), Some(dst)) = (kvs, st.kv_state.as_mut()) {
+                g.write(src, &mut dst.slice_mut(..))?;
+            }
+            if let (Some(src), Some(dst)) = (scs, st.score_state.as_mut()) {
+                g.write(src, &mut dst.slice_mut(..))?;
+            }
+        }
+        for d in &self.devs {
+            d.g.sync()?;
+        }
+        Ok(())
     }
 
     fn run(&mut self, ids: &[u32], start_pos: usize, teacher: Option<Teacher<'_>>, trace: Option<Trace<'_>>) -> Result<Vec<f32>> {
@@ -594,14 +836,19 @@ impl GpuModel {
         let out = self.run_inner(ids, start_pos, teacher, trace);
         if prefill {
             self.demand.prefill.store(false, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            // decode tokens age the VRAM caches' usage counts
+            for d in &mut self.devs {
+                d.dcache.tick_token();
+            }
         }
         out
     }
 
     fn run_inner(&mut self, ids: &[u32], start_pos: usize, teacher: Option<Teacher<'_>>, mut trace: Option<Trace<'_>>) -> Result<Vec<f32>> {
         let (d, t) = (self.cfg.dim, ids.len());
-        if t == 0 || start_pos + t > self.max_seq || (start_pos > 0 && t != 1) {
-            return Err(Error::Arg(format!("{t} tokens at {start_pos}: prefill at 0 then one token at a time, within max_seq {}", self.max_seq)));
+        if t == 0 || start_pos + t > self.max_seq {
+            return Err(Error::Arg(format!("{t} tokens at {start_pos}: past max_seq {}", self.max_seq)));
         }
         let hashes = self.hasher.forward(ids, start_pos)?;
         let mut emb = vec![0.0f32; t * d];
@@ -769,9 +1016,10 @@ impl GpuModel {
         let ratio = self.layers[l].ratio;
         let (has_comp, has_idx) = (self.layers[l].compressor.is_some(), self.layers[l].indexer.is_some());
         // queries, sliding-window kv, window cache and index lists; `fresh`
-        // is this prefill's own kv (attended directly), None at decode (the
-        // window cache is attended where it lives)
-        let (q, qr, fresh, mut idxs) = {
+        // is the kv attended directly (a prefill's own, or ring + chunk for a
+        // chunk continuing the sequence), None at decode (the window cache is
+        // attended where it lives); `offset` is where compressed rows start
+        let (q, qr, fresh, mut idxs, offset) = {
             let dv = &self.devs[self.cur];
             let g = &dv.g;
             let ly = &self.layers[l];
@@ -802,17 +1050,48 @@ impl GpuModel {
                         (0..t.min(win)).map(|j| if lo + j > i { -1 } else { (lo + j) as i32 }).collect()
                     })
                     .collect();
-                (q, qr, Some(kv), idxs)
-            } else {
+                (q, qr, Some(kv), idxs, t)
+            } else if t == 1 {
                 // decode: norm, rope, act-quant and the window write in one launch
                 let slot = start_pos % win;
                 g.kv_finish(&kv0.as_view(), &ly.kv_norm, cos, sin, start_pos, rd / 2, &mut window.slice_mut(slot * hd..(slot + 1) * hd), hd, eps)?;
                 let oldest = slot + 1;
                 let ring = (oldest..win).chain(0..oldest).map(|s| if s > start_pos { -1 } else { s as i32 }).collect();
-                (q, qr, None, vec![ring])
+                (q, qr, None, vec![ring], win)
+            } else {
+                // a chunk continuing the sequence: each query's window reaches
+                // back into the ring, so attend over [ring ++ this chunk's kv],
+                // positions oldest first as decode does
+                let mut kv = g.alloc::<f32>(t * hd)?;
+                g.rmsnorm(&kv0.as_view(), &ly.kv_norm, &mut kv.slice_mut(..), t, hd, eps)?;
+                g.rope(&mut kv.slice_mut(..), cos, sin, Pos::Linear { base: start_pos, per: 1 }, t, hd, hd - rd, rd / 2, false)?;
+                g.act_quant_fp8(&mut kv.slice_mut(..))?;
+                let mut both = g.alloc::<f32>((win + t) * hd)?;
+                g.copy(&window.as_view(), &mut both.slice_mut(..win * hd))?;
+                g.copy(&kv.as_view(), &mut both.slice_mut(win * hd..))?;
+                // then the ring takes the chunk's last positions (slot = pos % win)
+                let m = t.min(win);
+                let first = start_pos + t - m;
+                let (a, run) = (first % win, m.min(win - first % win));
+                g.copy(&kv.slice((t - m) * hd..(t - m + run) * hd), &mut window.slice_mut(a * hd..(a + run) * hd))?;
+                if run < m {
+                    g.copy(&kv.slice((t - m + run) * hd..t * hd), &mut window.slice_mut(..(m - run) * hd))?;
+                }
+                let idxs: Vec<Vec<i32>> = (0..t)
+                    .map(|i| {
+                        let p = start_pos + i;
+                        (0..win)
+                            .map(|j| match (p + 1 + j).checked_sub(win) {
+                                None => -1,
+                                Some(q) if q >= start_pos => (win + q - start_pos) as i32,
+                                Some(q) => (q % win) as i32,
+                            })
+                            .collect()
+                    })
+                    .collect();
+                (q, qr, Some(both), idxs, win + t)
             }
         };
-        let offset = if fresh.is_some() { t } else { win };
 
         // compressed positions: this layer's own latent, the index hand-off, the shared cache
         let mut comp: Option<(usize, usize)> = None; // (source layer, compressed rows)
@@ -906,14 +1185,32 @@ impl GpuModel {
         let score = c.wgate.as_ref().expect("ratio > 1 has wgate").forward(g, &x.as_view(), t, Out::F32)?;
         let st = &mut self.states[l];
         let (kvs, scs) = (st.kv_state.as_mut().expect("ratio-2 state"), st.score_state.as_mut().expect("ratio-2 state"));
-        let (src_kv, src_sc, groups) = if start_pos == 0 {
-            let rem = t % r;
-            let cutoff = t - rem;
+        // a chunk continuing the sequence: the partial group in the state
+        // (start_pos % r rows) comes first, then the chunk's rows
+        let (kv, score) = if start_pos > 0 && t > 1 {
+            let p = start_pos % r;
+            let (mut ckv, mut csc) = (g.alloc::<f32>((p + t) * hd)?, g.alloc::<f32>((p + t) * hd)?);
+            if p > 0 {
+                g.copy(&kvs.slice(..p * hd), &mut ckv.slice_mut(..p * hd))?;
+                g.copy(&scs.slice(..p * hd), &mut csc.slice_mut(..p * hd))?;
+            }
+            g.copy(&kv.as_view(), &mut ckv.slice_mut(p * hd..))?;
+            g.copy(&score.as_view(), &mut csc.slice_mut(p * hd..))?;
+            (ckv, csc)
+        } else {
+            (kv, score)
+        };
+        let (src_kv, src_sc, groups) = if start_pos == 0 || t > 1 {
+            // rows from the first token of a group: complete groups are pooled,
+            // the rest waits in the state
+            let n = kv.len() / hd;
+            let rem = n % r;
+            let cutoff = n - rem;
             if rem > 0 {
                 g.copy(&kv.slice(cutoff * hd..), &mut kvs.slice_mut(..rem * hd))?;
                 g.copy(&score.slice(cutoff * hd..), &mut scs.slice_mut(..rem * hd))?;
             }
-            if t < r {
+            if n < r {
                 return Ok(None);
             }
             (kv.slice(..cutoff * hd), score.slice(..cutoff * hd), cutoff / r)
@@ -1123,42 +1420,9 @@ impl GpuModel {
             compute += elapsed(tc)?;
             (Some(xq), MoeOut::Grouped(outs, nexp), cpu_part)
         } else {
-            let mut y = g.zeros::<f32>(t * d)?;
-            let mut used: Vec<u32> = routes.iter().flat_map(|r| r.experts.iter().copied()).collect();
-            used.sort_unstable();
-            used.dedup();
-            for e in used {
-                let (mut toks, mut ws) = (Vec::new(), Vec::new());
-                for (i, r) in routes.iter().enumerate() {
-                    if let Some(k) = r.experts.iter().position(|&x| x == e) {
-                        toks.push(i as i32);
-                        ws.push(r.weights[k]);
-                    }
-                }
-                let tf = if prof { g.sync()?; Some(Instant::now()) } else { None };
-                // each prefill expert is its own batch: its kernels are issued
-                // before the next fetch, and one stream orders that fetch's
-                // upload after them, so only the slot in use needs pinning
-                dcache.begin_batch();
-                let rec = dcache.get(g, l as u32, e, &self.cache, self.store.as_ref())?;
-                fetch += elapsed(tf)?;
-                let tc = if prof { Some(Instant::now()) } else { None };
-                let nt = toks.len();
-                let tok_idx = g.upload(&toks)?;
-                let mut xs = g.alloc::<f32>(nt * DIM)?;
-                g.gather_rows(&x.as_view(), &tok_idx, &mut xs, DIM, nt)?;
-                g.act_quant_fp8(&mut xs.slice_mut(..))?;
-                let (mut gate, mut up) = (g.alloc::<f32>(nt * INTER)?, g.alloc::<f32>(nt * INTER)?);
-                g.gemv_fp4(&xs.as_view(), &rec.slice(W1), &rec.slice(S1), &mut gate.slice_mut(..), INTER, DIM, nt, true)?;
-                g.gemv_fp4(&xs.as_view(), &rec.slice(W3), &rec.slice(S3), &mut up.slice_mut(..), INTER, DIM, nt, true)?;
-                let mut hbuf = g.alloc::<f32>(nt * INTER)?;
-                g.swiglu(&gate, &up, Some(&g.upload(&ws)?), &mut hbuf, INTER, nt, lim)?;
-                g.act_quant_fp8(&mut hbuf.slice_mut(..))?;
-                let mut out = g.alloc::<f32>(nt * DIM)?;
-                g.gemv_fp4(&hbuf.as_view(), &rec.slice(W2), &rec.slice(S2), &mut out.slice_mut(..), DIM, INTER, nt, true)?;
-                g.scatter_add_rows(&mut y, &out, &tok_idx, DIM, nt)?;
-                compute += elapsed(tc)?;
-            }
+            let (y, f, c) = routed_sum(g, dcache, &self.cache, self.store.as_ref(), l, &x.as_view(), t, &routes, lim, prof)?;
+            fetch += f;
+            compute += c;
             (None, MoeOut::Summed(y), CpuPart::None)
         };
         let ts = if prof { Some(Instant::now()) } else { None };
@@ -1217,6 +1481,118 @@ impl GpuModel {
 
 /// Read `keys` into the host cache, `threads` at a time (skipping resident
 /// ones), stopping early when `stop` is raised. Returns how many were read.
+/// Prefill's routed experts: each expert used by the `t` tokens of `x` is
+/// fetched once (VRAM, else RAM or disk, uploaded) and run over all of its
+/// tokens; the weighted results are summed per token (in expert-id order).
+/// Returns the sum and the seconds spent fetching and computing (measured
+/// only when `prof`, which synchronizes).
+#[allow(clippy::too_many_arguments)]
+fn routed_sum(
+    g: &Gpu,
+    dcache: &mut DeviceExpertCache,
+    host: &Ecache,
+    store: &dyn WeightStore,
+    l: usize,
+    x: &CudaView<'_, f32>,
+    t: usize,
+    routes: &[Route],
+    lim: f32,
+    prof: bool,
+) -> Result<(CudaSlice<f32>, f64, f64)> {
+    let (mut fetch, mut compute) = (0.0, 0.0);
+    let mut y = g.zeros::<f32>(t * DIM)?;
+    let mut used: Vec<u32> = routes.iter().flat_map(|r| r.experts.iter().copied()).collect();
+    used.sort_unstable();
+    used.dedup();
+    // Readers pull the experts VRAM lacks into the host cache, in the order
+    // the loop below uses them, so the drive works (several reads deep)
+    // while the GPU computes; the loop then finds them in RAM, or waits for
+    // the read already under way.
+    let ahead: Vec<u32> = used.iter().copied().filter(|&e| !dcache.contains(l as u32, e)).collect();
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    std::thread::scope(|s| {
+        for _ in 0..PREFETCH_READERS.min(ahead.len()) {
+            s.spawn(|| {
+                use std::sync::atomic::Ordering::Relaxed;
+                while !stop.load(Relaxed) {
+                    let Some(&e) = ahead.get(next.fetch_add(1, Relaxed)) else { break };
+                    // an error here resurfaces when the loop reads it itself
+                    let _ = host.acquire(l as u32, e, store);
+                }
+            });
+        }
+        let out = compute_experts(g, dcache, host, store, l, x, routes, &used, lim, prof, &mut y, &mut fetch, &mut compute);
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        out
+    })?;
+    Ok((y, fetch, compute))
+}
+
+/// Readers fetching a prefill layer's experts ahead of use.
+const PREFETCH_READERS: usize = 4;
+
+/// The per-expert loop of [`routed_sum`].
+#[allow(clippy::too_many_arguments)]
+fn compute_experts(
+    g: &Gpu,
+    dcache: &mut DeviceExpertCache,
+    host: &Ecache,
+    store: &dyn WeightStore,
+    l: usize,
+    x: &CudaView<'_, f32>,
+    routes: &[Route],
+    used: &[u32],
+    lim: f32,
+    prof: bool,
+    y: &mut CudaSlice<f32>,
+    fetch: &mut f64,
+    compute: &mut f64,
+) -> Result<()> {
+    let elapsed = |t0: Option<Instant>| -> Result<f64> {
+        match t0 {
+            Some(t0) => {
+                g.sync()?;
+                Ok(t0.elapsed().as_secs_f64())
+            }
+            None => Ok(0.0),
+        }
+    };
+    for &e in used {
+        let (mut toks, mut ws) = (Vec::new(), Vec::new());
+        for (i, r) in routes.iter().enumerate() {
+            if let Some(k) = r.experts.iter().position(|&x| x == e) {
+                toks.push(i as i32);
+                ws.push(r.weights[k]);
+            }
+        }
+        let tf = if prof { g.sync()?; Some(Instant::now()) } else { None };
+        // each prefill expert is its own batch: its kernels are issued
+        // before the next fetch, and one stream orders that fetch's
+        // upload after them, so only the slot in use needs pinning
+        dcache.begin_batch();
+        let rec = dcache.get(g, l as u32, e, host, store)?;
+        *fetch += elapsed(tf)?;
+        let tc = if prof { Some(Instant::now()) } else { None };
+        let nt = toks.len();
+        let tok_idx = g.upload(&toks)?;
+        let mut xs = g.alloc::<f32>(nt * DIM)?;
+        g.gather_rows(x, &tok_idx, &mut xs, DIM, nt)?;
+        g.act_quant_fp8(&mut xs.slice_mut(..))?;
+        let (mut gate, mut up) = (g.alloc::<f32>(nt * INTER)?, g.alloc::<f32>(nt * INTER)?);
+        g.gemv_fp4(&xs.as_view(), &rec.slice(W1), &rec.slice(S1), &mut gate.slice_mut(..), INTER, DIM, nt, true)?;
+        g.gemv_fp4(&xs.as_view(), &rec.slice(W3), &rec.slice(S3), &mut up.slice_mut(..), INTER, DIM, nt, true)?;
+        let mut hbuf = g.alloc::<f32>(nt * INTER)?;
+        g.swiglu(&gate, &up, Some(&g.upload(&ws)?), &mut hbuf, INTER, nt, lim)?;
+        g.act_quant_fp8(&mut hbuf.slice_mut(..))?;
+        let mut out = g.alloc::<f32>(nt * DIM)?;
+        g.gemv_fp4(&hbuf.as_view(), &rec.slice(W2), &rec.slice(S2), &mut out.slice_mut(..), DIM, INTER, nt, true)?;
+        g.scatter_add_rows(y, &out, &tok_idx, DIM, nt)?;
+        *compute += elapsed(tc)?;
+    }
+    Ok(())
+}
+
 fn read_into(cache: &Ecache, store: &dyn WeightStore, keys: &[(u32, u32)], threads: usize, stop: Option<&std::sync::atomic::AtomicBool>) -> Result<usize> {
     use std::sync::atomic::{AtomicUsize, Ordering};
     let (next, read) = (AtomicUsize::new(0), AtomicUsize::new(0));
@@ -1249,6 +1625,9 @@ fn read_into(cache: &Ecache, store: &dyn WeightStore, keys: &[(u32, u32)], threa
 struct Demand {
     /// A prefill is running (it reads many records back to back).
     prefill: std::sync::atomic::AtomicBool,
+    /// The owner asked the fill to stay off the drive (a server handling a
+    /// request: its decode misses should not queue behind fill reads).
+    busy: std::sync::atomic::AtomicBool,
     /// Milliseconds since `epoch` of the latest demand read's start or end.
     last: std::sync::atomic::AtomicU64,
     epoch: Instant,
@@ -1259,7 +1638,8 @@ impl Demand {
     const QUIET_MS: u64 = 50;
 
     fn new() -> Demand {
-        Demand { prefill: std::sync::atomic::AtomicBool::new(false), last: std::sync::atomic::AtomicU64::new(0), epoch: Instant::now() }
+        use std::sync::atomic::{AtomicBool, AtomicU64};
+        Demand { prefill: AtomicBool::new(false), busy: AtomicBool::new(false), last: AtomicU64::new(0), epoch: Instant::now() }
     }
 
     fn now(&self) -> u64 {
@@ -1272,7 +1652,7 @@ impl Demand {
 
     fn recent(&self) -> bool {
         use std::sync::atomic::Ordering::Relaxed;
-        self.prefill.load(Relaxed) || self.now().saturating_sub(self.last.load(Relaxed)) < Self::QUIET_MS
+        self.prefill.load(Relaxed) || self.busy.load(Relaxed) || self.now().saturating_sub(self.last.load(Relaxed)) < Self::QUIET_MS
     }
 }
 

@@ -21,6 +21,7 @@
 #![forbid(unsafe_code)]
 
 pub mod attention;
+pub mod chat;
 pub mod config;
 pub mod cpu_experts;
 pub mod detok;
@@ -35,3 +36,5 @@ pub mod model;
 pub mod moe;
 pub mod ops;
 pub mod safetensors;
+pub mod tokenizer;
+pub mod unicode;

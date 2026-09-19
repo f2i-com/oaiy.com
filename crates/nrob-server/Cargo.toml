@@ -1,0 +1,16 @@
+[package]
+name = "nrob-server"
+version = "0.7.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "OpenAI-compatible HTTP server for DeepSeek-V4.1-Flash on nrob"
+
+[[bin]]
+name = "nrob-server"
+path = "src/main.rs"
+
+# std-only apart from the workspace crates (dsv41-cuda brings CUDA).
+[dependencies]
+nrob = { path = "../nrob" }
+dsv41 = { path = "../dsv41" }
+dsv41-cuda = { path = "../dsv41-cuda" }
