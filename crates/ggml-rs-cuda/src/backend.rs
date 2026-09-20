@@ -1016,6 +1016,73 @@ impl Backend for CudaBackend {
         self.make_tensor(y, a.shape().to_vec())
     }
 
+    // VENDORED-LOCAL: GLM-5.3-Flash clamped SwiGLU.
+    fn swiglu_clamped(&self, gate: &Tensor, up: &Tensor, limit: f32, after_silu: bool) -> Tensor {
+        let n = gate.numel();
+        debug_assert_eq!(n, up.numel());
+        let g_in = self.cuda_input(gate);
+        let u_in = self.cuda_input(up);
+        let mut out = self.alloc(n);
+
+        let block = 256u32;
+        let cfg = LaunchConfig {
+            grid_dim: (((n as u32) + block - 1) / block, 1, 1),
+            block_dim: (block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let n_i = n as i32;
+        let after = i32::from(after_silu);
+        unsafe {
+            self.stream
+                .launch_builder(self.func("swiglu_clamped_f32"))
+                .arg(g_in.as_ref())
+                .arg(u_in.as_ref())
+                .arg(&mut out)
+                .arg(&n_i)
+                .arg(&limit)
+                .arg(&after)
+                .launch(cfg)
+                .expect("swiglu_clamped launch");
+        }
+        self.make_tensor(out, gate.shape().to_vec())
+    }
+
+    // VENDORED-LOCAL: GLM-5.3-Flash clamped SwiGLU, fused layout.
+    fn swiglu_clamped_split(
+        &self,
+        fused: &Tensor,
+        ff: usize,
+        limit: f32,
+        after_silu: bool,
+    ) -> Tensor {
+        let seq = fused.numel() / (2 * ff);
+        let f_in = self.cuda_input(fused);
+        let mut out = self.alloc(seq * ff);
+
+        let block_x = 256u32.min(ff as u32).max(1);
+        let cfg = LaunchConfig {
+            grid_dim: (((ff as u32) + block_x - 1) / block_x, seq as u32, 1),
+            block_dim: (block_x, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let seq_i = seq as i32;
+        let ff_i = ff as i32;
+        let after = i32::from(after_silu);
+        unsafe {
+            self.stream
+                .launch_builder(self.func("swiglu_clamped_split_f32"))
+                .arg(f_in.as_ref())
+                .arg(&mut out)
+                .arg(&seq_i)
+                .arg(&ff_i)
+                .arg(&limit)
+                .arg(&after)
+                .launch(cfg)
+                .expect("swiglu_clamped_split launch");
+        }
+        self.make_tensor(out, vec![seq, ff])
+    }
+
     fn silu_mul_split(&self, fused: &Tensor, ff: usize) -> Tensor {
         let seq = fused.dim(0);
         debug_assert_eq!(fused.dim(fused.rank() - 1), 2 * ff);

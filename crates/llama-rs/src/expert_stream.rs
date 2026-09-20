@@ -634,7 +634,9 @@ impl LayerStream {
     // record instead of `get` copying 3 MB into a fresh Vec on every
     // dispatch. The lease moves into the `RecordView`s below, so the pinned
     // buffer outlives the packed matvec; reconstruction stays zero-copy.
-    fn expert_weights(&self, e: u32) -> Result<(FfnPair, Weight), String> {
+    // VENDORED-LOCAL: pub(crate) so glm5next's device path can reuse the
+    // cached reconstruction instead of re-reading and re-uploading per token.
+    pub(crate) fn expert_weights(&self, e: u32) -> Result<(FfnPair, Weight), String> {
         let layout = self.shared.store.layout();
         let l = self.layer as usize;
         let lease = self

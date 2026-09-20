@@ -357,6 +357,31 @@ impl FfnPair {
         }
     }
 
+    // VENDORED-LOCAL: GLM-5.3-Flash.
+    /// As [`Self::swiglu`], but clamped at `limit`. `after_silu` picks which side
+    /// of the activation the gate clamp lands on — see
+    /// [`Backend::swiglu_clamped`]. Stays on the device for both layouts.
+    pub fn swiglu_clamped(
+        &self,
+        backend: &dyn Backend,
+        xn: &Tensor,
+        limit: f32,
+        after_silu: bool,
+    ) -> Tensor {
+        match self {
+            Self::Split { gate, up } => {
+                let g = gate.linear(backend, xn);
+                let u = up.linear(backend, xn);
+                backend.swiglu_clamped(&g, &u, limit, after_silu)
+            }
+            Self::Fused(w) => {
+                let fused = w.linear(backend, xn);
+                let ff = fused.dim(fused.rank() - 1) / 2;
+                backend.swiglu_clamped_split(&fused, ff, limit, after_silu)
+            }
+        }
+    }
+
     /// SwiGLU FFN intermediate: `silu(gate(xn)) * up(xn)` -> `[seq, ff]`.
     /// Caller follows up with the down projection.
     pub fn swiglu(&self, backend: &dyn Backend, xn: &Tensor) -> Tensor {

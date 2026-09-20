@@ -334,6 +334,84 @@ pub trait Backend: Send + Sync + Debug + 'static {
     /// the slice + `silu_mul` pair when gate and up share the same input — cuts
     /// the FFN matmul count from 2→1 plus eliminates one slice. Default impl
     /// is the host fallback; CUDA backend overrides with a single kernel.
+    // VENDORED-LOCAL: GLM-5.3-Flash. Clamped SwiGLU, both orders.
+    /// `out = silu(gate) * up` with a clamp at `limit`.
+    ///
+    /// `after_silu` picks which side of the activation the gate clamp lands on,
+    /// because glm5next uses **both**:
+    ///
+    /// ```text
+    /// after_silu = true   clamp(silu(gate), -inf, limit) * clamp(up, -limit, limit)
+    /// after_silu = false  silu(clamp(gate, -inf, limit)) * clamp(up, -limit, limit)
+    /// ```
+    ///
+    /// The text FFN clamps the activation (llama.cpp `build_ffn`, callback
+    /// `ffn_silu_clamped`); the vision tower clamps the pre-activation
+    /// (`FFN_SILU_CLAMP`, callback `ffn_gate_clamped`). `limit <= 0` disables the
+    /// clamp and gives a plain SwiGLU.
+    ///
+    /// Default impl runs on the host; CUDA overrides it. Fusing this matters less
+    /// for the arithmetic than for the round trip: without it every routed
+    /// expert has to bring its gate/up pair back to the host mid-FFN.
+    fn swiglu_clamped(&self, gate: &Tensor, up: &Tensor, limit: f32, after_silu: bool) -> Tensor {
+        let g = self.to_host(gate.clone());
+        let u = self.to_host(up.clone());
+        let (gd, ud) = (g.data(), u.data());
+        debug_assert_eq!(gd.len(), ud.len());
+        let clamped = limit > 0.0;
+        let mut out = Vec::with_capacity(gd.len());
+        for (&gv, &uv) in gd.iter().zip(ud.iter()) {
+            let mut a = gv;
+            if clamped && !after_silu && a > limit {
+                a = limit;
+            }
+            a /= 1.0 + (-a).exp();
+            if clamped && after_silu && a > limit {
+                a = limit;
+            }
+            let b = if clamped { uv.clamp(-limit, limit) } else { uv };
+            out.push(a * b);
+        }
+        self.to_device(Tensor::from_vec(out, gate.shape().to_vec()))
+    }
+
+    // VENDORED-LOCAL: GLM-5.3-Flash. Clamped SwiGLU over a FUSED gate/up row.
+    /// As [`Self::swiglu_clamped`], but the input is one `[seq, 2 * ff]` tensor
+    /// laid out `gate` then `up` per row — the layout the expert loader prefers,
+    /// because it halves the matmul launch count.
+    fn swiglu_clamped_split(
+        &self,
+        fused: &Tensor,
+        ff: usize,
+        limit: f32,
+        after_silu: bool,
+    ) -> Tensor {
+        let seq = fused.numel() / (2 * ff);
+        let h = self.to_host(fused.clone());
+        let d = h.data();
+        let clamped = limit > 0.0;
+        let mut out = Vec::with_capacity(seq * ff);
+        for s in 0..seq {
+            let row = &d[s * 2 * ff..(s + 1) * 2 * ff];
+            for j in 0..ff {
+                let mut a = row[j];
+                if clamped && !after_silu && a > limit {
+                    a = limit;
+                }
+                a /= 1.0 + (-a).exp();
+                if clamped && after_silu && a > limit {
+                    a = limit;
+                }
+                let mut b = row[ff + j];
+                if clamped {
+                    b = b.clamp(-limit, limit);
+                }
+                out.push(a * b);
+            }
+        }
+        self.to_device(Tensor::from_vec(out, vec![seq, ff]))
+    }
+
     fn silu_mul_split(&self, fused: &Tensor, ff: usize) -> Tensor {
         let seq = fused.dim(0);
         debug_assert_eq!(fused.dim(fused.rank() - 1), 2 * ff);

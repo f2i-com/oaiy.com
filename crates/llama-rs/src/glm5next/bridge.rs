@@ -507,6 +507,95 @@ mod tests {
     const RELEASED: &str =
         r"D:\glm5.3_flash\Q4_K_M\GLM-5.3-Flash-Q4_K_M-00001-of-00005.gguf";
 
+    /// How much does a KDA layer actually remember?
+    ///
+    /// A 192-token generation looped a sentence verbatim, which is what a
+    /// recurrent state with ~one token of memory looks like. The decay per step is
+    /// `exp(g)` where
+    /// `g = gate_lower_bound * sigmoid(-(ssm_a * (f_b(f_a(x)) + dt_bias)))`, so
+    /// `g` near the bound (-5) means `exp(-5) = 0.0067` -- near-total forgetting
+    /// every token -- and `g` near 0 means full retention.
+    ///
+    /// This measures it on real weights, which decides whether the repetition is
+    /// the recurrence or something else.
+    #[test]
+    #[ignore = "needs the released model on disk"]
+    fn probe_the_kda_decay_on_real_weights() {
+        let g = GgufFile::open_streaming(RELEASED).expect("open");
+        let cfg = ModelConfig::from_gguf(&g).expect("cfg");
+        let glm = Glm5NextConfig::from_gguf(&g, &cfg).expect("glm");
+        let idx = TensorIndex::new(&g);
+
+        let n_embd = cfg.embedding_dim;
+        let nh = cfg.n_heads;
+        let hd = glm.kda_head_dim;
+        let di = nh * hd;
+
+        // A plausible post-attn_norm hidden state: a real token embedding, RMS
+        // normalised to unit scale, which is what the norm produces.
+        let embd = idx.take("token_embd.weight", &[]).expect("embd");
+        let tokid = 5000usize;
+        let mut x: Vec<f32> = embd.data()[tokid * n_embd..(tokid + 1) * n_embd].to_vec();
+        let inv = 1.0 / (x.iter().map(|v| v * v).sum::<f32>() / n_embd as f32 + glm.rms_eps).sqrt();
+        for v in x.iter_mut() {
+            *v *= inv;
+        }
+
+        let mut worst_ret = 1.0f32;
+        for il in [0usize, 1, 10, 20, 44] {
+            if glm.layer_kinds[il] != LayerKind::Kda {
+                continue;
+            }
+            let f_a = idx.take(&format!("blk.{il}.ssm_f_a.weight"), &[]).expect("f_a");
+            let f_b = idx.take(&format!("blk.{il}.ssm_f_b.weight"), &[]).expect("f_b");
+            let a = idx.take(&format!("blk.{il}.ssm_a"), &[]).expect("a");
+            let dtb = idx.take(&format!("blk.{il}.ssm_dt.bias"), &[]).expect("dt");
+
+            let mut fa = vec![0.0f32; hd];
+            forward::matvec(f_a.data(), &x, &mut fa).expect("f_a");
+            let mut raw = vec![0.0f32; di];
+            forward::matvec(f_b.data(), &fa, &mut raw).expect("f_b");
+
+            let sig = |z: f32| 1.0 / (1.0 + (-z).exp());
+            let mut decays = Vec::with_capacity(di);
+            for h in 0..nh {
+                for i in 0..hd {
+                    let k = h * hd + i;
+                    let t = (raw[k] + dtb.data()[k]) * a.data()[h];
+                    let glog = glm.kda_gate_lower_bound * sig(-t);
+                    decays.push(glog.exp());
+                }
+            }
+            decays.sort_by(|p, q| p.partial_cmp(q).unwrap());
+            let mean = decays.iter().sum::<f32>() / decays.len() as f32;
+            let med = decays[decays.len() / 2];
+            let p90 = decays[decays.len() * 9 / 10];
+            // Effective memory in tokens: how long until a contribution decays
+            // to 1/e.
+            let half = if med > 0.0 && med < 1.0 {
+                -1.0 / med.ln()
+            } else {
+                f32::INFINITY
+            };
+            println!(
+                "blk.{il}: ssm_a[0]={:+.4}  decay min {:.4} med {:.4} mean {:.4} p90 {:.4}                   memory ~{:.1} tokens",
+                a.data()[0],
+                decays[0],
+                med,
+                mean,
+                p90,
+                half
+            );
+            worst_ret = worst_ret.min(med);
+        }
+
+        println!();
+        println!("gate_lower_bound = {}", glm.kda_gate_lower_bound);
+        println!("exp(lower_bound) = {:.5} (total forgetting)", glm.kda_gate_lower_bound.exp());
+        println!("median decay across probed layers: {worst_ret:.4}");
+        assert!(worst_ret > 0.0, "decay must be positive");
+    }
+
     /// The expert source alone, on real weights: one ranged read per projection
     /// out of a 1.2 TB-if-materialised tensor.
     #[test]

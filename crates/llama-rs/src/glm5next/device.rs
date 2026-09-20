@@ -52,6 +52,7 @@ use ggml_rs::{Backend, Tensor};
 use gguf::GgufFile;
 
 use super::bridge::PartRef;
+use crate::expert_stream::{ExpertLayout, GgufExpertStore, LayerStream, StreamShared};
 use super::forward::{
     self, AttnW, ExpertFfn, FfnW, HcW, IndexerW, KdaW, LayerW, Mat, MlaW, ModelW, MoeW, Shape,
 };
@@ -150,6 +151,101 @@ impl ExpertFfn for DeviceExperts {
     }
 }
 
+/// Routed experts through `expert_stream`: an LFRU RAM cache, a batched
+/// thread-pool read for a layer's misses, and optionally a VRAM expert cache.
+///
+/// [`DeviceExperts`] re-reads and re-uploads every expert on every dispatch,
+/// which the profiler showed costs about 2.96 s a token: 1008 projections at
+/// 4.7 MB each is **4.76 GB read per token**, at 2.74 GB/s because the reads are
+/// one-at-a-time with no queue depth. That is essentially the whole token.
+///
+/// This path exists to remove that. The same weights are reconstructed through
+/// `Ecache`, so a re-read only happens on a miss, and
+/// [`StreamShared::enable_device_cache`] keeps the hot set in VRAM so a hit does
+/// not cross PCIe either.
+pub struct StreamExperts {
+    shared: Arc<StreamShared>,
+    backend: Arc<dyn Backend>,
+    /// One handle per MoE ordinal.
+    layers: Vec<LayerStream>,
+    n_embd: usize,
+}
+
+impl StreamExperts {
+    /// `cache_budget_bytes` is the RAM the expert cache may use. One record is
+    /// gate+up+down for a single expert, about 14 MB here, and the whole model
+    /// has `n_moe * n_expert` of them — so the budget sets the hit rate directly.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        g: &GgufFile,
+        backend: Arc<dyn Backend>,
+        first_moe: usize,
+        n_moe: usize,
+        n_expert: usize,
+        n_embd: usize,
+        cache_budget_bytes: usize,
+    ) -> Result<Self> {
+        let layout = ExpertLayout::resolve_range(g, first_moe, n_moe, n_expert)?;
+        let expert_bytes = layout.total_expert_bytes();
+        let total: u64 = g.tensors().iter().map(|t| t.nbytes()).sum();
+        let resident_est = total.saturating_sub(expert_bytes);
+        let store = GgufExpertStore::new(g.clone(), layout)?;
+        let shared = StreamShared::new(store, cache_budget_bytes, resident_est)?;
+        let layers = (0..n_moe).map(|o| shared.layer(o as u32)).collect();
+        Ok(Self { shared, backend, layers, n_embd })
+    }
+
+    /// The shared cache state, so a caller can turn on the VRAM tier.
+    pub fn shared(&self) -> &Arc<StreamShared> {
+        &self.shared
+    }
+
+    pub fn record_bytes(&self) -> usize {
+        self.shared.record_bytes()
+    }
+}
+
+impl ExpertFfn for StreamExperts {
+    fn apply(&self, ord: usize, e: usize, x: &[f32], limit: f32, out: &mut [f32]) -> Result<()> {
+        let ls = self.layers.get(ord).ok_or_else(|| {
+            LlamaError::Config(format!(
+                "device: MoE layer {ord} out of range (have {})",
+                self.layers.len()
+            ))
+        })?;
+        if x.len() != self.n_embd || out.len() != self.n_embd {
+            return Err(LlamaError::Config(format!(
+                "device: expert FFN got x {} / out {}, expected n_embd {}",
+                x.len(),
+                out.len(),
+                self.n_embd
+            )));
+        }
+        // Cached reconstruction: a hit costs no disk read, and with the VRAM tier
+        // on, no upload either.
+        let (pair, down) = ls
+            .expert_weights(e as u32)
+            .map_err(|err| LlamaError::Config(format!("device: expert ({ord}, {e}): {err}")))?;
+
+        let xd = self
+            .backend
+            .to_device(Tensor::from_vec(x.to_vec(), vec![1, self.n_embd]));
+        // The clamp is fused, so the gate/up pair never leaves the device.
+        let h = pair.swiglu_clamped(&*self.backend, &xd, limit, true);
+        let o = down.linear(&*self.backend, &h);
+        let oh = self.backend.to_host(o);
+        if oh.data().len() != out.len() {
+            return Err(LlamaError::Config(format!(
+                "device: expert output is {} values, expected {}",
+                oh.data().len(),
+                out.len()
+            )));
+        }
+        out.copy_from_slice(oh.data());
+        Ok(())
+    }
+}
+
 /// A released glm5next model with its matrices on a backend.
 pub struct DeviceModel {
     shape: Shape,
@@ -158,21 +254,45 @@ pub struct DeviceModel {
     /// Vectors and the 3-D MLA absorb tensors, host f32: the stages index these
     /// directly rather than multiplying by them.
     v: BTreeMap<String, Tensor>,
-    experts: DeviceExperts,
+    experts: StreamExperts,
 }
 
 impl DeviceModel {
+    /// RAM the expert cache gets when a caller does not say. One record is about
+    /// 14 MB, so this buys roughly 4 600 of the model's 12 096 experts.
+    pub const DEFAULT_EXPERT_CACHE: usize = 64 << 30;
+
     /// Open a released model. `path` may name any shard of a split GGUF.
     pub fn open(
         path: impl AsRef<Path>,
         max_len: usize,
         backend: Arc<dyn Backend>,
     ) -> Result<Self> {
-        let g = GgufFile::open_streaming(path)?;
-        Self::from_gguf(&g, max_len, backend)
+        Self::open_with_cache(path, max_len, backend, Self::DEFAULT_EXPERT_CACHE)
     }
 
-    pub fn from_gguf(g: &GgufFile, max_len: usize, backend: Arc<dyn Backend>) -> Result<Self> {
+    /// As [`Self::open`], with an explicit expert-cache budget in bytes.
+    pub fn open_with_cache(
+        path: impl AsRef<Path>,
+        max_len: usize,
+        backend: Arc<dyn Backend>,
+        cache_budget_bytes: usize,
+    ) -> Result<Self> {
+        let g = GgufFile::open_streaming(path)?;
+        Self::from_gguf(&g, max_len, backend, cache_budget_bytes)
+    }
+
+    /// The expert cache, so a caller can enable the VRAM tier.
+    pub fn experts(&self) -> &StreamExperts {
+        &self.experts
+    }
+
+    pub fn from_gguf(
+        g: &GgufFile,
+        max_len: usize,
+        backend: Arc<dyn Backend>,
+        cache_budget_bytes: usize,
+    ) -> Result<Self> {
         let cfg = ModelConfig::from_gguf(g)?;
         let glm = Glm5NextConfig::from_gguf(g, &cfg)?;
         let idx = TensorIndex::new(g);
@@ -290,14 +410,14 @@ impl DeviceModel {
         }
 
         let n_moe = glm.n_layer - glm.n_dense_lead;
-        let experts = DeviceExperts::new(
+        let experts = StreamExperts::new(
             g,
             backend.clone(),
             glm.n_dense_lead,
             n_moe,
             glm.n_expert,
-            glm.n_ff_exp,
             cfg.embedding_dim,
+            cache_budget_bytes,
         )?;
 
         let shape = super::bridge::shape_from(&cfg, &glm, max_len);
@@ -628,6 +748,16 @@ mod tests {
     /// (`n_select` = 2051), so attention takes the **dense** path here — the same
     /// choice llama.cpp makes at this context size. The sparse path needs a
     /// longer context to engage.
+    ///
+    /// **Sampled, not greedy.** This model ships `general.sampling.temp = 1.0`
+    /// and `top_p = 0.95`, which `SampleParams::default()` already matches.
+    /// Greedy decoding was tried first and cycled: it produced one correct
+    /// sentence of reasoning and then repeated it verbatim nine times over 192
+    /// tokens. That is a known property of temperature-0 decoding on a reasoning
+    /// model with no repetition penalty, not a defect in the trunk — the KDA
+    /// decay was measured healthy on real weights at the same time
+    /// (`bridge::tests::probe_the_kda_decay_on_real_weights`: median retention
+    /// 0.85 to 0.97, so 6 to 30 tokens of memory).
     #[cfg(feature = "cuda")]
     #[test]
     #[ignore = "needs the released model on disk; generates on the GPU"]
@@ -639,7 +769,8 @@ mod tests {
         let g = GgufFile::open_streaming(RELEASED).expect("open");
         let tok = tokenizer::Tokenizer::from_gguf(&g).expect("tokenizer");
         let t0 = std::time::Instant::now();
-        let m = DeviceModel::from_gguf(&g, 512, backend).expect("load");
+        let m = DeviceModel::from_gguf(&g, 512, backend, DeviceModel::DEFAULT_EXPERT_CACHE)
+            .expect("load");
         println!("load {:.1}s on {}", t0.elapsed().as_secs_f64(), m.backend_name());
 
         let sh = m.shape().clone();
@@ -655,22 +786,14 @@ mod tests {
         println!("prompt: {} tokens", ids.len());
         assert!(!ids.is_empty(), "the chat template must tokenize");
 
-        let argmax = |v: &[f32]| -> u32 {
-            let mut best = f32::NEG_INFINITY;
-            let mut bi = 0usize;
-            for (i, &x) in v.iter().enumerate() {
-                if x > best {
-                    best = x;
-                    bi = i;
-                }
-            }
-            bi as u32
-        };
+        let mut sampler =
+            crate::sampler::Sampler::new(crate::sampler::SampleParams::default());
 
         let t1 = std::time::Instant::now();
         let mut logits = Vec::new();
         for &t in &ids {
             logits = forward::forward_token(&sh, &w, &mut st, t).expect("prefill");
+            sampler.observe(t);
         }
         println!(
             "prefill {:.1}s ({:.2}s/token)",
@@ -686,13 +809,15 @@ mod tests {
 
         let t2 = std::time::Instant::now();
         let mut produced: Vec<u32> = Vec::new();
-        for _ in 0..192 {
-            let next = argmax(&logits);
+        for _ in 0..128 {
+            let lt = Tensor::from_vec(logits.clone(), vec![1, sh.n_vocab]);
+            let next = sampler.sample(&lt);
             if stops.contains(&next) {
                 println!("(stop token {next})");
                 break;
             }
             produced.push(next);
+            sampler.observe(next);
             logits = forward::forward_token(&sh, &w, &mut st, next).expect("decode");
         }
         let secs = t2.elapsed().as_secs_f64();
@@ -715,6 +840,11 @@ mod tests {
         println!("(escaped: {})", text.escape_debug());
 
         assert!(!produced.is_empty(), "nothing was generated");
+        let distinct: std::collections::BTreeSet<u32> = produced.iter().copied().collect();
+        assert!(
+            distinct.len() > 1,
+            "generation collapsed to one repeated token: {produced:?}"
+        );
         // Coherence, robustly: real text is mostly printable ASCII with spaces
         // between words. Noise from a broken trunk is neither.
         let printable = text
@@ -736,14 +866,207 @@ mod tests {
             "output should have word breaks; {spaces} spaces in {} chars looks like noise",
             text.chars().count()
         );
+
+        // Degeneracy: a cycling decode reuses a handful of tokens. The greedy run
+        // that prompted the switch to sampling had 24 distinct tokens in 192 --
+        // 12% -- so this threshold separates the two.
+        let distinct_frac = distinct.len() as f64 / produced.len() as f64;
+        println!(
+            "{} distinct of {} tokens ({:.0}%)",
+            distinct.len(),
+            produced.len(),
+            distinct_frac * 100.0
+        );
+        assert!(
+            distinct_frac > 0.25 || produced.len() < 24,
+            "only {:.0}% distinct tokens -- the decode is cycling",
+            distinct_frac * 100.0
+        );
         // Degenerate output is the failure mode worth catching: a single token
         // repeated means the state or the routing is not advancing.
-        let distinct: std::collections::BTreeSet<u32> = produced.iter().copied().collect();
-        assert!(
-            distinct.len() > 1,
-            "generation collapsed to one repeated token: {produced:?}"
-        );
         assert!(!text.is_empty(), "detokenized to nothing");
+    }
+
+    /// Where a token actually goes. Splits the routed-expert path into its three
+    /// phases so optimisation targets the dominant one rather than a guess.
+    ///
+    /// A token routes `n_expert_used` experts in each of 42 MoE layers, three
+    /// projections each, so the counts below multiply by 8 * 3 * 42 = 1008.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "needs the released model on disk"]
+    fn profile_the_expert_path() {
+        let Some(backend) = cuda_backend() else { return };
+        let g = GgufFile::open_streaming(RELEASED).expect("open");
+        let cfg = ModelConfig::from_gguf(&g).expect("cfg");
+        let glm = Glm5NextConfig::from_gguf(&g, &cfg).expect("glm");
+        let n_moe = glm.n_layer - glm.n_dense_lead;
+
+        let de = DeviceExperts::new(
+            &g,
+            backend.clone(),
+            glm.n_dense_lead,
+            n_moe,
+            glm.n_expert,
+            glm.n_ff_exp,
+            cfg.embedding_dim,
+        )
+        .expect("experts");
+
+        let per = de.layers[0][0].per();
+        let projections_per_token = glm.n_expert_used * 3 * n_moe;
+        println!(
+            "{} bytes per expert projection, {projections_per_token} projections per token              ({:.2} GB)",
+            per,
+            (per * projections_per_token) as f64 / 1e9
+        );
+
+        let n = 96usize;
+        let pick = |i: usize| (i % n_moe, (i * 37) % glm.n_expert);
+
+        // 1. raw ranged reads only -- pure disk I/O.
+        let t = std::time::Instant::now();
+        for i in 0..n {
+            let (ord, e) = pick(i);
+            let pr = &de.layers[ord][i % 3];
+            let mut buf = de.bytes.borrow_mut();
+            let raw = &mut buf[..pr.per()];
+            pr.read_raw(&de.file, e, raw).expect("read");
+        }
+        let read = t.elapsed().as_secs_f64() / n as f64;
+
+        // 2. read + dequantise.
+        let mut floats = vec![0.0f32; glm.n_ff_exp * cfg.embedding_dim];
+        let t = std::time::Instant::now();
+        for i in 0..n {
+            let (ord, e) = pick(i);
+            let pr = &de.layers[ord][i % 3];
+            let mut buf = de.bytes.borrow_mut();
+            let raw = &mut buf[..pr.per()];
+            pr.read_raw(&de.file, e, raw).expect("read");
+            ggml_quants::dequantize(pr.dtype(), raw, &mut floats).expect("dequant");
+        }
+        let read_dequant = t.elapsed().as_secs_f64() / n as f64;
+
+        // 3. the whole device projection: read, quantised upload, matmul.
+        let x = backend.to_device(Tensor::from_vec(
+            vec![0.01f32; cfg.embedding_dim],
+            vec![1, cfg.embedding_dim],
+        ));
+        let t = std::time::Instant::now();
+        for i in 0..n {
+            let (ord, _e) = pick(i);
+            let pr = &de.layers[ord][0];
+            let _ = de
+                .linear_part(pr, (i * 37) % glm.n_expert, &x, vec![glm.n_ff_exp, cfg.embedding_dim])
+                .expect("linear");
+        }
+        backend.synchronize();
+        let full = t.elapsed().as_secs_f64() / n as f64;
+
+        let gbs = per as f64 / read / 1e9;
+        println!("per projection:");
+        println!("  raw read          {:8.3} ms   ({gbs:.2} GB/s)", read * 1e3);
+        println!("  + dequantise      {:8.3} ms", read_dequant * 1e3);
+        println!("  + upload + matmul {:8.3} ms", full * 1e3);
+        println!("extrapolated to one token ({projections_per_token} projections):");
+        println!("  read alone        {:8.2} s", read * projections_per_token as f64);
+        println!("  whole expert path {:8.2} s", full * projections_per_token as f64);
+        println!(
+            "  (a token was measured at ~2.7 s end to end, so the expert path is \
+             {:.0}% of it)",
+            100.0 * full * projections_per_token as f64 / 2.7
+        );
+        assert!(read > 0.0 && full > 0.0);
+    }
+
+    /// Decode throughput, cold cache then warm.
+    ///
+    /// The profiler showed a token is essentially its 1008 expert projections:
+    /// 4.76 GB read at 2.74 GB/s, about 2.96 s. Every one of those reads used to
+    /// happen on every token. With `Ecache` in front, a repeat is a hit and costs
+    /// nothing on disk, so the warm number is the one that matters.
+    ///
+    /// 20 tok/s needs ~50 ms a token, which needs the expert bytes to come from
+    /// RAM or VRAM rather than NVMe -- 4.76 GB a token is 94 GB/s at that rate,
+    /// and no SSD does that.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "needs the released model on disk; measures throughput"]
+    fn measure_decode_throughput() {
+        let Some(backend) = cuda_backend() else { return };
+
+        // A large RAM cache: one record is gate+up+down for one expert, and the
+        // model has 42 * 288 = 12096 of them.
+        let ram: usize = 96 << 30;
+        let t0 = std::time::Instant::now();
+        let m = DeviceModel::open_with_cache(RELEASED, 512, backend.clone(), ram).expect("load");
+
+        // VRAM tier. The non-expert matrices already hold ~24 GB of the card, so
+        // only a few GB are left -- about 3% of the 12096 expert records, which
+        // measured as noise. Getting a useful hit rate here needs the second GPU.
+        match ggml_rs_cuda::CudaBackend::new(0) {
+            Ok(dev) => {
+                let vram: usize = 6 << 30;
+                match m.experts().shared().enable_device_cache(Arc::new(dev), vram) {
+                    Ok(()) => println!("VRAM expert cache: {} GB", vram >> 30),
+                    Err(e) => println!("VRAM expert cache unavailable: {e}"),
+                }
+            }
+            Err(e) => println!("second CUDA handle failed: {e}"),
+        }
+        println!(
+            "load {:.1}s, backend {}, record {:.1} MB, cache budget {} GB",
+            t0.elapsed().as_secs_f64(),
+            m.backend_name(),
+            m.experts().record_bytes() as f64 / 1e6,
+            ram >> 30
+        );
+
+        let sh = m.shape().clone();
+        let w = m.view();
+        let mut st = forward::State::new(&sh).expect("state");
+
+        let mut logits = forward::forward_token(&sh, &w, &mut st, 154822).expect("first");
+        let next = |lg: &Vec<f32>| -> u32 {
+            let mut best = f32::NEG_INFINITY;
+            let mut bi = 0usize;
+            for (i, &x) in lg.iter().enumerate() {
+                if x > best {
+                    best = x;
+                    bi = i;
+                }
+            }
+            bi as u32
+        };
+
+        // Cold: the cache is empty, so most dispatches miss and hit the disk.
+        let n_cold = 8usize;
+        let t = std::time::Instant::now();
+        for _ in 0..n_cold {
+            let t_ = next(&logits);
+            logits = forward::forward_token(&sh, &w, &mut st, t_).expect("cold");
+        }
+        let cold = t.elapsed().as_secs_f64() / n_cold as f64;
+
+        // Warm: the same prefix again, so the routed experts are the ones already
+        // resident. A fresh State replays the positions; the expert cache carries
+        // over because it lives in the model, not the state.
+        let mut st2 = forward::State::new(&sh).expect("state");
+        let mut lg2 = forward::forward_token(&sh, &w, &mut st2, 154822).expect("first");
+        let t = std::time::Instant::now();
+        for _ in 0..n_cold {
+            let t_ = next(&lg2);
+            lg2 = forward::forward_token(&sh, &w, &mut st2, t_).expect("warm");
+        }
+        let warm = t.elapsed().as_secs_f64() / n_cold as f64;
+
+        println!();
+        println!("cold  {:.3} s/token   ({:.2} tok/s)", cold, 1.0 / cold);
+        println!("warm  {:.3} s/token   ({:.2} tok/s)", warm, 1.0 / warm);
+        println!("speedup from the cache: {:.2}x", cold / warm);
+        println!("target is 20 tok/s = 0.050 s/token");
+        assert!(cold > 0.0 && warm > 0.0);
     }
 
     /// The released model, with its matrices on the backend. On a CUDA build this

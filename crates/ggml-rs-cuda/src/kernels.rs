@@ -1335,6 +1335,44 @@ __global__ void gelu_approx_mul_f32(const float* __restrict__ a,
 // silu_mul_split: out[s, j] = silu(fused[s, j]) * fused[s, ff + j].
 // `fused` is [seq, 2*ff] (output of one matmul against stacked [gate; up]
 // weights). Replaces split + silu_mul. 2D grid: ff along x, seq along y.
+// VENDORED-LOCAL: GLM-5.3-Flash clamped SwiGLU. after_silu != 0 clamps the
+// activation (the text FFN); == 0 clamps the pre-activation (the vision tower).
+// limit <= 0 disables the clamp.
+__global__ void swiglu_clamped_f32(const float* __restrict__ gate,
+                                   const float* __restrict__ up,
+                                   float* __restrict__ y,
+                                   int n, float limit, int after_silu) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float a = gate[i];
+    float b = up[i];
+    const bool clamped = limit > 0.0f;
+    if (clamped && after_silu == 0 && a > limit) a = limit;
+    a = a / (1.0f + expf(-a));
+    if (clamped && after_silu != 0 && a > limit) a = limit;
+    if (clamped) b = fminf(fmaxf(b, -limit), limit);
+    y[i] = a * b;
+}
+
+// VENDORED-LOCAL: GLM-5.3-Flash clamped SwiGLU over a fused gate|up row.
+__global__ void swiglu_clamped_split_f32(const float* __restrict__ fused,
+                                         float* __restrict__ out,
+                                         int seq, int ff,
+                                         float limit, int after_silu) {
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    int s = blockIdx.y;
+    if (j >= ff || s >= seq) return;
+    int in_off = s * 2 * ff;
+    float a = fused[in_off + j];
+    float b = fused[in_off + ff + j];
+    const bool clamped = limit > 0.0f;
+    if (clamped && after_silu == 0 && a > limit) a = limit;
+    a = a / (1.0f + __expf(-a));
+    if (clamped && after_silu != 0 && a > limit) a = limit;
+    if (clamped) b = fminf(fmaxf(b, -limit), limit);
+    out[s * ff + j] = a * b;
+}
+
 __global__ void silu_mul_split_f32(const float* __restrict__ fused,
                                     float* __restrict__ out,
                                     int seq, int ff) {
@@ -2688,6 +2726,9 @@ pub const KERNEL_NAMES: &[&str] = &[
     "gelu_approx_f32",
     "gelu_approx_mul_f32",
     "silu_mul_split_f32",
+    // VENDORED-LOCAL: GLM-5.3-Flash.
+    "swiglu_clamped_f32",
+    "swiglu_clamped_split_f32",
     "gelu_approx_mul_split_f32",
     "tanh_inplace_f32",
     "gaussian_topk_inplace_f32",

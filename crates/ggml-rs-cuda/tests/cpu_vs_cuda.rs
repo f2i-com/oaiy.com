@@ -1389,3 +1389,49 @@ fn delta_net_step_prefill_seq_matches_cpu() {
     assert_tensors_close(&conv_state_b, &conv_state_a, 1e-4);
     assert_tensors_close(&state_b, &state_a, 1e-3);
 }
+
+// VENDORED-LOCAL: GLM-5.3-Flash clamped SwiGLU.
+/// Both clamp orders, against the CPU backend. glm5next needs both: the text FFN
+/// clamps the activation, the vision tower clamps the pre-activation, and values
+/// astride the limit are where they disagree.
+#[test]
+fn swiglu_clamped_matches_cpu() {
+    let Some(cuda) = try_cuda() else { return };
+    let cpu = CpuBackend::new();
+
+    let n = 1024usize;
+    // Spread well past the limit on both sides so the clamp actually bites.
+    let gate: Vec<f32> = (0..n).map(|i| ((i % 97) as f32 - 48.0) / 3.0).collect();
+    let up: Vec<f32> = (0..n).map(|i| ((i % 61) as f32 - 30.0) / 2.0).collect();
+
+    for &limit in &[10.0f32, 2.0, 0.0] {
+        for &after in &[true, false] {
+            let gc = cuda.to_device(Tensor::from_vec(gate.clone(), vec![1, n]));
+            let uc = cuda.to_device(Tensor::from_vec(up.clone(), vec![1, n]));
+            let got = cuda.swiglu_clamped(&gc, &uc, limit, after);
+
+            let gh = Tensor::from_vec(gate.clone(), vec![1, n]);
+            let uh = Tensor::from_vec(up.clone(), vec![1, n]);
+            let want = cpu.swiglu_clamped(&gh, &uh, limit, after);
+
+            assert_tensors_close(&got, &want, 1e-5);
+        }
+    }
+
+    // And the two orders must genuinely differ where the gate exceeds the limit,
+    // or the flag is not doing anything.
+    let gc = cuda.to_device(Tensor::from_vec(vec![5.0f32; 8], vec![1, 8]));
+    let uc = cuda.to_device(Tensor::from_vec(vec![1.0f32; 8], vec![1, 8]));
+    let a = cuda.swiglu_clamped(&gc, &uc, 2.0, true).to_host();
+    let b = cuda.swiglu_clamped(&gc, &uc, 2.0, false).to_host();
+    assert!(
+        (a.data()[0] - b.data()[0]).abs() > 0.2,
+        "the clamp order must matter: {} vs {}",
+        a.data()[0],
+        b.data()[0]
+    );
+    // after_silu: silu(5) = 4.967 -> clamped to 2.0
+    assert!((a.data()[0] - 2.0).abs() < 1e-4, "got {}", a.data()[0]);
+    // pre-activation: silu(clamp(5)=2) = 1.7616
+    assert!((b.data()[0] - 1.7616).abs() < 1e-3, "got {}", b.data()[0]);
+}
