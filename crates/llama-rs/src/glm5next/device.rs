@@ -419,6 +419,29 @@ impl StreamExperts {
         Ok(())
     }
 
+    /// Read every expert record once, so the RAM tier is as full as its budget
+    /// allows before anything is timed.
+    ///
+    /// This is what "fully loaded" means for a model whose experts are 182 GB: not
+    /// that they are all in memory -- the tier is smaller than that -- but that
+    /// nothing is left to discover on the drive that the tier had room for. Layers
+    /// are read in order and each layer's experts in one batch, so the reads go out
+    /// at the queue depth `fetch_many` was built for.
+    ///
+    /// Returns how many records were requested. Compare with
+    /// [`StreamShared::resident_records`] to see how many the tier kept.
+    pub fn prewarm_all(&self) -> Result<usize> {
+        let n_expert = self.shared.n_experts();
+        let mut asked = 0usize;
+        for (ord, ls) in self.layers.iter().enumerate() {
+            let ids: Vec<u32> = (0..n_expert as u32).collect();
+            ls.prewarm(&ids)
+                .map_err(|e| LlamaError::Config(format!("device: prewarm layer {ord}: {e}")))?;
+            asked += ids.len();
+        }
+        Ok(asked)
+    }
+
     /// Which card runs MoE layer `ord`, and how many layers each card holds.
     pub fn card_layout(&self) -> (&[usize], usize) {
         (&self.card_of, self.backends.len())
@@ -1816,6 +1839,411 @@ mod tests {
             println!("left for experts  none: the trunk alone is over budget by {:.1} ms", -left * 1e3);
         }
         assert!(trunk > 0.0);
+    }
+
+    /// Two templated prompts, greedy, side by side.
+    ///
+    /// Greedy so there is no sampling to blame. If the id streams share a long prefix
+    /// then the prompt genuinely is not steering generation and the earlier
+    /// observation was right; if they diverge immediately it was not, and the drifting
+    /// text is the model rather than the plumbing.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "needs the released model on disk"]
+    fn two_prompts_generate_differently() {
+        use crate::chat::{apply_chat_template, ChatMessage, Role};
+        use crate::config::Architecture;
+
+        let Some(backend) = cuda_backend() else { return };
+        let g = GgufFile::open_streaming(RELEASED).expect("open");
+        let tok = tokenizer::Tokenizer::from_gguf(&g).expect("tokenizer");
+        drop(g);
+        let m = DeviceModel::open_with_cache(RELEASED, 512, backend.clone(), 24 << 30)
+            .expect("load");
+        let sh = m.shape().clone();
+        let w = m.view();
+
+        let gen = |content: &str| -> Vec<u32> {
+            let msgs = [ChatMessage { role: Role::User, content: content.to_string() }];
+            let p = apply_chat_template(&Architecture::Glm5Next, &msgs, true);
+            let ids = tok.encode(&p, false).expect("encode");
+            let mut st = forward::State::new_on(&sh, m.backend()).expect("state");
+            let mut lg = Vec::new();
+            for &t in &ids {
+                lg = forward::forward_token(&sh, &w, &mut st, t).expect("prefill");
+            }
+            let mut out = Vec::new();
+            for _ in 0..24 {
+                let next = lg
+                    .iter()
+                    .enumerate()
+                    .fold((0usize, f32::NEG_INFINITY), |(bi, bv), (i, &x)| {
+                        if x > bv { (i, x) } else { (bi, bv) }
+                    })
+                    .0 as u32;
+                out.push(next);
+                lg = forward::forward_token(&sh, &w, &mut st, next).expect("decode");
+            }
+            out
+        };
+
+        let a = gen("What is the capital of France? Answer in one short sentence.");
+        let b = gen("Write a Python function that reverses a string.");
+        println!();
+        println!("A ids: {a:?}");
+        println!("A txt: {:?}", tok.decode(&a));
+        println!("B ids: {b:?}");
+        println!("B txt: {:?}", tok.decode(&b));
+        let shared = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
+        println!("shared leading tokens: {shared} of {}", a.len());
+        assert!(
+            shared < 8,
+            "the two answers share {shared} leading tokens: the prompt is not steering generation"
+        );
+    }
+
+    /// Does anything in the state grow without bound as the sequence advances?
+    ///
+    /// A generation that collapses to the same text whatever the prompt, while an
+    /// 8-token prefill clearly does condition the logits, says something degrades
+    /// with position. The KDA recurrence is the candidate: its state is multiplied by
+    /// `exp(g_log)` every token, so a single channel with a positive `g_log` diverges
+    /// geometrically and after a few dozen tokens swamps everything else.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "needs the released model on disk"]
+    fn the_state_stays_bounded_as_the_sequence_grows() {
+        let Some(backend) = cuda_backend() else { return };
+        let m = DeviceModel::open_with_cache(RELEASED, 512, backend.clone(), 24 << 30)
+            .expect("load");
+        let sh = m.shape().clone();
+        let w = m.view();
+        // Host state, so the KDA tensors can be inspected directly.
+        let mut st = forward::State::new(&sh).expect("state");
+
+        println!();
+        println!(" pos   max|logit|   max|kda state|   max|latent|");
+        let mut tok = 154822u32;
+        for pos in 0..96usize {
+            let lg = forward::forward_token(&sh, &w, &mut st, tok).expect("forward");
+            let mx = lg.iter().fold(0.0f32, |a, v| a.max(v.abs()));
+            let ks = st.kda_max_abs();
+            let ls = st.latent_max_abs();
+            if pos < 4 || pos % 12 == 11 {
+                println!("{pos:4}   {mx:9.3}   {ks:15.4}   {ls:12.4}");
+            }
+            assert!(mx.is_finite(), "logits went non-finite at pos {pos}");
+            assert!(ks.is_finite(), "the KDA state went non-finite at pos {pos}");
+            // greedy, so this is deterministic
+            tok = lg
+                .iter()
+                .enumerate()
+                .fold((0usize, f32::NEG_INFINITY), |(bi, bv), (i, &x)| {
+                    if x > bv { (i, x) } else { (bi, bv) }
+                })
+                .0 as u32;
+        }
+        let ks = st.kda_max_abs();
+        println!();
+        println!("after 96 tokens the KDA state peaks at {ks:.4}");
+        assert!(
+            ks < 1e4,
+            "the KDA state reached {ks} after 96 tokens: the recurrence is diverging"
+        );
+    }
+
+    /// What the chat template actually hands the model.
+    ///
+    /// Printed rather than asserted, because a generation that ignored its prompt
+    /// while raw token ids clearly did not is most easily explained by the prompt
+    /// never containing the question.
+    #[test]
+    #[ignore = "needs the released model on disk (for the tokenizer)"]
+    fn show_the_templated_prompt() {
+        use crate::chat::{apply_chat_template, ChatMessage, Role};
+        use crate::config::Architecture;
+
+        let g = GgufFile::open_streaming(RELEASED).expect("open");
+        let tok = tokenizer::Tokenizer::from_gguf(&g).expect("tokenizer");
+
+        for content in [
+            "What is the capital of France? Answer in one short sentence.",
+            "Write a Python function to sort a list.",
+        ] {
+            let msgs = [ChatMessage { role: Role::User, content: content.to_string() }];
+            let p = apply_chat_template(&Architecture::Glm5Next, &msgs, true);
+            let ids = tok.encode(&p, false).expect("encode");
+            println!();
+            println!("content: {content:?}");
+            println!("template ({} chars): {p:?}", p.len());
+            println!("ids ({}): {:?}", ids.len(), ids);
+            println!("round trip: {:?}", tok.decode(&ids));
+            assert!(
+                p.contains("France") || p.contains("Python"),
+                "the templated prompt does not contain the user content at all"
+            );
+        }
+    }
+
+    /// Does the prompt reach the logits at all?
+    ///
+    /// Two unrelated prompts of the same length, each prefilled into a fresh state,
+    /// then the next-token distribution compared. If attention is working these
+    /// diverge sharply -- different questions predict different continuations. If
+    /// they come back the same, the model is generating unconditionally and
+    /// something in the attention or the KV cache is not carrying the prompt.
+    ///
+    /// This exists because a 600-token generation drifted without ever answering,
+    /// and two different prompts produced the same opening -- which no amount of
+    /// sampling temperature explains.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "needs the released model on disk"]
+    fn the_prompt_changes_the_logits() {
+        let Some(backend) = cuda_backend() else { return };
+        let m = DeviceModel::open_with_cache(RELEASED, 512, backend.clone(), 24 << 30)
+            .expect("load");
+        let sh = m.shape().clone();
+        let w = m.view();
+
+        // Same length, wildly different content.
+        let a: Vec<u32> = vec![154822, 3838, 374, 279, 6722, 315, 9621, 30];
+        let b: Vec<u32> = vec![154822, 7985, 264, 13027, 729, 311, 3378, 264];
+        assert_eq!(a.len(), b.len());
+
+        let last = |ids: &[u32]| -> Vec<f32> {
+            let mut st = forward::State::new_on(&sh, m.backend()).expect("state");
+            let mut lg = Vec::new();
+            for &t in ids {
+                lg = forward::forward_token(&sh, &w, &mut st, t).expect("prefill");
+            }
+            lg
+        };
+        let la = last(&a);
+        let lb = last(&b);
+
+        let argmax = |v: &[f32]| -> usize {
+            v.iter()
+                .enumerate()
+                .fold((0usize, f32::NEG_INFINITY), |(bi, bv), (i, &x)| {
+                    if x > bv { (i, x) } else { (bi, bv) }
+                })
+                .0
+        };
+        let mut worst = 0.0f32;
+        for (p, q) in la.iter().zip(lb.iter()) {
+            worst = worst.max((p - q).abs());
+        }
+        let scale = la.iter().fold(0.0f32, |m, v| m.max(v.abs())).max(1.0);
+        println!("prompt A argmax {} ({:.3})", argmax(&la), la[argmax(&la)]);
+        println!("prompt B argmax {} ({:.3})", argmax(&lb), lb[argmax(&lb)]);
+        println!("max |A - B| over {} logits: {worst:.4} (scale {scale:.3})", la.len());
+
+        // Also: does the LAST prompt token matter? Same prefix, different final token.
+        let mut c = a.clone();
+        *c.last_mut().unwrap() = 13027;
+        let lc = last(&c);
+        let mut w_ac = 0.0f32;
+        for (p, q) in la.iter().zip(lc.iter()) {
+            w_ac = w_ac.max((p - q).abs());
+        }
+        println!("max |A - A-with-last-token-swapped|: {w_ac:.4}");
+
+        assert!(
+            worst > 0.1 * scale,
+            "two unrelated prompts give the same logits ({worst} at scale {scale}): \
+             the prompt is not reaching the output"
+        );
+        assert!(w_ac > 0.01 * scale, "changing the last prompt token changed nothing");
+    }
+
+    /// End to end on the released model: a real prompt through the chat template,
+    /// both cards, the RAM tier sized from the machine, the CPU tier on -- and an
+    /// explicit account of how much of the model is actually resident.
+    ///
+    /// Runs the same prompt twice. The first answer pays for filling the tiers; the
+    /// second is the steady state, which is the number that describes using this
+    /// thing. `GLM5_PREWARM=1` reads every expert record once first, which is what
+    /// "fully loaded" means and takes about two minutes at the drive's speed.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "needs the released model on disk; the end-to-end measurement"]
+    fn measure_end_to_end() {
+        use crate::chat::{apply_chat_template, chat_stop_tokens, ChatMessage, Role};
+        use crate::config::Architecture;
+
+        let n_gpus: usize = std::env::var("GLM5_GPUS").ok().and_then(|v| v.parse().ok()).unwrap_or(2);
+        let max_new: usize = std::env::var("GLM5_MAX_NEW").ok().and_then(|v| v.parse().ok()).unwrap_or(96);
+
+        let g = GgufFile::open_streaming(RELEASED).expect("open");
+        let tok = tokenizer::Tokenizer::from_gguf(&g).expect("tokenizer");
+        drop(g);
+
+        let t0 = std::time::Instant::now();
+        let m = match DeviceModel::open_tiered(RELEASED, 2048, n_gpus, 0, 0) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("tiered open failed ({e}); skipping");
+                return;
+            }
+        };
+        let load = t0.elapsed().as_secs_f64();
+
+        // ---- is it all here? ----
+        let rec = m.experts().record_bytes();
+        let (card_of, n_cards) = m.experts().card_layout();
+        let n_moe = card_of.len();
+        let n_records = n_moe * m.shape().n_expert;
+        let vram_slots: usize = m.experts().vram_budgets().iter().map(|b| b / rec).sum();
+        let ram = m.experts().shared().cache_budget_bytes();
+        let ram_records = ram / rec;
+        let (dev_bytes, host_bytes, stragglers) = m.residency();
+
+        println!();
+        println!("=== what is loaded ===");
+        println!("load {load:.1}s, {n_cards} card(s)");
+        println!(
+            "  trunk            {:.2} GB on the backend, {:.2} GB host, {} straggler(s)",
+            dev_bytes as f64 / 1e9,
+            host_bytes as f64 / 1e9,
+            stragglers.len()
+        );
+        println!(
+            "  routed experts   {n_records} records of {:.2} MB = {:.1} GB",
+            rec as f64 / 1e6,
+            n_records as f64 * rec as f64 / 1e9
+        );
+        println!(
+            "  VRAM tier        {vram_slots} slots ({:.0}%)   budgets {:?} GB",
+            100.0 * vram_slots as f64 / n_records as f64,
+            m.experts().vram_budgets().iter().map(|b| b >> 30).collect::<Vec<_>>()
+        );
+        println!(
+            "  RAM tier         {ram_records} records ({:.0}%)   {:.0} GB",
+            100.0 * ram_records as f64 / n_records as f64,
+            ram as f64 / 1e9
+        );
+        let cover = (vram_slots + ram_records).min(n_records);
+        println!(
+            "  capacity, if the tiers were exclusive: {cover} of {n_records} ({:.0}%)",
+            100.0 * cover as f64 / n_records as f64
+        );
+        println!(
+            "  they are not exclusive today, so a VRAM record is also held in RAM: {} ({:.0}%)",
+            ram_records.min(n_records),
+            100.0 * ram_records.min(n_records) as f64 / n_records as f64
+        );
+
+        if std::env::var("GLM5_PREWARM").ok().as_deref() == Some("1") {
+            let t = std::time::Instant::now();
+            let n = m.experts().prewarm_all().expect("prewarm");
+            let st = m.experts().shared().cache_stats();
+            println!(
+                "  prewarmed {n} records in {:.1}s, {:.1} GB off the drive, tier now holds {}",
+                t.elapsed().as_secs_f64(),
+                st.bytes_read as f64 / 1e9,
+                m.experts().shared().resident_records()
+            );
+        }
+
+        let sh = m.shape().clone();
+        let w = m.view();
+        let msgs = [ChatMessage {
+            role: Role::User,
+            content: "Explain, in one short paragraph, why mixture-of-experts models \
+                      are cheaper to run than dense models of the same size."
+                .to_string(),
+        }];
+        let prompt = apply_chat_template(&Architecture::Glm5Next, &msgs, true);
+        let ids = tok.encode(&prompt, false).expect("encode");
+        let stops: Vec<u32> = chat_stop_tokens(&Architecture::Glm5Next)
+            .iter()
+            .filter_map(|s| tok.token_id(s))
+            .collect();
+
+        let run = |label: &str| -> (f64, f64, usize, String) {
+            let mut st = forward::State::new_on(&sh, m.backend()).expect("state");
+            let mut sampler = crate::sampler::Sampler::new(crate::sampler::SampleParams::default());
+            let before = m.experts().shared().cache_stats();
+
+            let t = std::time::Instant::now();
+            let mut logits = Vec::new();
+            for &t_ in &ids {
+                logits = forward::forward_token(&sh, &w, &mut st, t_).expect("prefill");
+                sampler.observe(t_);
+            }
+            let pre = t.elapsed().as_secs_f64();
+
+            // GLM5_GREEDY=1: argmax instead of sampling. `SampleParams::default()` is
+            // temp 1.0 / top_p 0.95, and inside a "Reasoning Effort: Max" block that
+            // drifts and never closes `</think>`; greedy stays on topic.
+            let greedy = std::env::var("GLM5_GREEDY").ok().as_deref() == Some("1");
+            let t = std::time::Instant::now();
+            let mut produced: Vec<u32> = Vec::new();
+            for _ in 0..max_new {
+                let lt = Tensor::from_vec(logits.clone(), vec![1, sh.n_vocab]);
+                let next = if greedy {
+                    logits
+                        .iter()
+                        .enumerate()
+                        .fold((0usize, f32::NEG_INFINITY), |(bi, bv), (i, &x)| {
+                            if x > bv { (i, x) } else { (bi, bv) }
+                        })
+                        .0 as u32
+                } else {
+                    sampler.sample(&lt)
+                };
+                if stops.contains(&next) {
+                    break;
+                }
+                produced.push(next);
+                sampler.observe(next);
+                logits = forward::forward_token(&sh, &w, &mut st, next).expect("decode");
+            }
+            let dec = t.elapsed().as_secs_f64();
+            let after = m.experts().shared().cache_stats();
+            let n = produced.len().max(1);
+            println!();
+            println!("--- {label} ---");
+            println!(
+                "prefill {} tokens in {pre:.2}s ({:.1} tok/s)",
+                ids.len(),
+                ids.len() as f64 / pre
+            );
+            println!("decode  {} tokens in {dec:.2}s ({:.2} tok/s)", produced.len(), n as f64 / dec);
+            println!(
+                "off the drive during this answer: {:.2} GB",
+                (after.bytes_read - before.bytes_read) as f64 / 1e9
+            );
+            (pre, dec / n as f64, produced.len(), tok.decode(&produced))
+        };
+
+        let (_, _, _, first_text) = run("first answer, tiers filling");
+        crate::glm5next::cpu_experts::reset_stats();
+        let (_, warm_per_tok, n_warm, warm_text) = run("second answer, tiers warm");
+
+        let (recs, _, secs) = crate::glm5next::cpu_experts::stats();
+        if recs > 0 {
+            println!(
+                "CPU tier on the warm answer: {recs} records, {secs:.2}s ({:.1} a token)",
+                recs as f64 / n_warm.max(1) as f64
+            );
+        }
+        for (i, s) in m.experts().shared().shard_stats().iter().enumerate() {
+            let look = s.hits + s.misses;
+            println!(
+                "  card {i}: {:.1}% VRAM hits, {:.1} GB uploaded",
+                100.0 * s.hits as f64 / look.max(1) as f64,
+                s.h2d_bytes as f64 / 1e9
+            );
+        }
+
+        println!();
+        println!("=== {:.2} tok/s warm ===", 1.0 / warm_per_tok);
+        println!();
+        println!("{}", warm_text.trim());
+        assert!(!first_text.is_empty() && !warm_text.is_empty(), "no text came out");
+        assert!(n_warm > 4, "only {n_warm} tokens; generation stopped too early");
     }
 
     /// The CPU expert tier against the GPU, on the real model.

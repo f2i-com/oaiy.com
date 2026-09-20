@@ -675,6 +675,26 @@ impl State {
         }
     }
 
+    /// Largest magnitude anywhere in the KDA recurrent state. Host state only.
+    ///
+    /// For watching whether the recurrence is stable as a sequence grows: the state
+    /// is scaled by `exp(g_log)` every token, so a positive `g_log` on any channel
+    /// shows up here as geometric growth.
+    pub fn kda_max_abs(&self) -> f32 {
+        self.kda
+            .iter()
+            .flat_map(|s| s.iter())
+            .fold(0.0f32, |a, v| a.max(v.abs()))
+    }
+
+    /// Largest magnitude in the cached MLA latents.
+    pub fn latent_max_abs(&self) -> f32 {
+        self.latents
+            .iter()
+            .flat_map(|s| s.iter())
+            .fold(0.0f32, |a, v| a.max(v.abs()))
+    }
+
     /// Whether the recurrent state is resident on a backend.
     pub fn kda_on_device(&self) -> bool {
         self.kda_dev.is_some()

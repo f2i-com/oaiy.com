@@ -596,6 +596,17 @@ pub struct StreamShared {
     shards: Mutex<Vec<Arc<device_cache::DeviceCache>>>,
     #[cfg(feature = "cuda")]
     shard_of: Mutex<Vec<usize>>,
+    /// VENDORED-LOCAL: GLM-5.3-Flash. Whether the RAM tier drops what VRAM takes.
+    ///
+    /// Off, a record admitted to VRAM stays in RAM too, so the two tiers hold
+    /// overlapping sets and total distinct coverage is whichever is larger. On, they
+    /// are exclusive and coverage is the sum -- which for this machine is the
+    /// difference between holding 82% of the 12 096 expert records and holding all
+    /// of them.
+    ///
+    /// The cost is that a VRAM eviction becomes a drive read rather than a RAM hit,
+    /// so it is a real trade and it is measured rather than assumed. GLM5_EXCLUSIVE_TIERS=1.
+    exclusive_tiers: bool,
 }
 
 impl StreamShared {
@@ -634,6 +645,7 @@ impl StreamShared {
             shards: Mutex::new(Vec::new()),
             #[cfg(feature = "cuda")]
             shard_of: Mutex::new(Vec::new()),
+            exclusive_tiers: std::env::var("GLM5_EXCLUSIVE_TIERS").ok().as_deref() == Some("1"),
         }))
     }
 
@@ -797,6 +809,16 @@ impl StreamShared {
     // VENDORED-LOCAL: GLM-5.3-Flash. The record layout, for the CPU expert path.
     pub fn layout(&self) -> &ExpertLayout {
         self.store.layout()
+    }
+
+    /// Whether the RAM tier drops records the VRAM tier has taken.
+    pub fn exclusive_tiers(&self) -> bool {
+        self.exclusive_tiers
+    }
+
+    /// How many expert records the RAM tier is holding right now.
+    pub fn resident_records(&self) -> usize {
+        self.cache.len()
     }
 
     pub fn cache_stats(&self) -> nrob::ecache::CacheStats {
@@ -1081,6 +1103,15 @@ impl LayerStream {
     // and re-surfaces when the dispatch loop acquires the same expert and
     // is recorded there, exactly as without the prewarm (the failed slot is
     // not cached, so the loop's acquire retries the read once).
+    /// Pull these experts into the RAM tier, batched. For a deliberate warm-up.
+    pub fn prewarm(&self, experts: &[u32]) -> Result<(), String> {
+        self.prewarm_host(experts);
+        match self.shared.error() {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
     fn prewarm_host(&self, experts: &[u32]) {
         let misses: Vec<u32> = experts
             .iter()
@@ -1477,6 +1508,16 @@ impl DeviceDispatch {
         match self.dc.stage_and_admit(ls.layer, e, &lease, &plan) {
             Ok(en) => {
                 self.leases.insert(e, en);
+                // VENDORED-LOCAL: GLM-5.3-Flash. Exclusive tiers.
+                //
+                // VRAM owns this record now, so RAM need not. `stage_and_admit`
+                // copied the bytes into the pinned slot before returning, so the
+                // lease has done its job -- and it has to be dropped first, because
+                // `Ecache::remove` refuses an entry something still holds.
+                if ls.shared.exclusive_tiers {
+                    drop(lease);
+                    ls.shared.cache.remove(ls.layer, e);
+                }
             }
             Err(_) => self.dc.note_stage_failure(),
         }
