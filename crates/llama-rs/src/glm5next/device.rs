@@ -1841,6 +1841,75 @@ mod tests {
         assert!(trunk > 0.0);
     }
 
+    /// Does the model still see the start of a long prompt?
+    ///
+    /// Output that is coherent for ~24 tokens and then collapses into repetition,
+    /// under greedy as well as sampling, is what attention losing its grip on
+    /// distance looks like. So: take one prompt, change a token near the *front*, and
+    /// see whether the next-token logits move at all -- then do the same near the
+    /// back as a control.
+    ///
+    /// If a front edit does nothing while a back edit does a lot, the context window
+    /// is effectively a handful of tokens and the bug is in MLA (the sparse indexer
+    /// or the mask) rather than anywhere else.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "needs the released model on disk"]
+    fn early_prompt_tokens_still_matter() {
+        let Some(backend) = cuda_backend() else { return };
+        let m = DeviceModel::open_with_cache(RELEASED, 512, backend.clone(), 24 << 30)
+            .expect("load");
+        let sh = m.shape().clone();
+        let w = m.view();
+
+        // A long-ish run of ordinary ids, deterministic.
+        let base: Vec<u32> = std::iter::once(154822u32)
+            .chain((0..79u32).map(|i| 1000 + (i * 37) % 4000))
+            .collect();
+        let n = base.len();
+
+        let last = |ids: &[u32]| -> Vec<f32> {
+            let mut st = forward::State::new_on(&sh, m.backend()).expect("state");
+            let mut lg = Vec::new();
+            for &t in ids {
+                lg = forward::forward_token(&sh, &w, &mut st, t).expect("forward");
+            }
+            lg
+        };
+        let l0 = last(&base);
+        let scale = l0.iter().fold(0.0f32, |a, v| a.max(v.abs())).max(1.0);
+
+        println!();
+        println!("prompt of {n} tokens; changing one token and re-running:");
+        println!("  position   max |logit change|   as % of scale");
+        for &pos in &[1usize, 5, 20, 40, 60, n - 10, n - 2, n - 1] {
+            let mut ids = base.clone();
+            // a different, still-ordinary id
+            ids[pos] = ids[pos].wrapping_add(917) % 5000 + 1000;
+            let l = last(&ids);
+            let d = l0
+                .iter()
+                .zip(&l)
+                .fold(0.0f32, |a, (p, q)| a.max((p - q).abs()));
+            println!("  {pos:8}   {d:18.4}   {:11.1}%", 100.0 * d / scale);
+        }
+
+        // The decisive pair.
+        let mut front = base.clone();
+        front[3] = 4242;
+        let mut back = base.clone();
+        back[n - 2] = 4242;
+        let df = l0.iter().zip(&last(&front)).fold(0.0f32, |a, (p, q)| a.max((p - q).abs()));
+        let db = l0.iter().zip(&last(&back)).fold(0.0f32, |a, (p, q)| a.max((p - q).abs()));
+        println!();
+        println!("front edit (pos 3): {df:.4}   back edit (pos {}): {db:.4}", n - 2);
+        assert!(
+            df > 0.01 * scale,
+            "editing token 3 of {n} changed the logits by only {df} (scale {scale}): \
+             the model is not attending to the start of the prompt"
+        );
+    }
+
     /// Two templated prompts, greedy, side by side.
     ///
     /// Greedy so there is no sampling to blame. If the id streams share a long prefix
