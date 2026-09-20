@@ -376,7 +376,12 @@ version = "0.7.0"
 dependencies = [
  "dsv41",
  "dsv41-cuda",
+ "ggml-rs",
+ "ggml-rs-cuda",
+ "gguf",
+ "llama-rs",
  "nrob",
+ "tokenizer",
 ]
 
 [[package]]

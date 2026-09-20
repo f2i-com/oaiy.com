@@ -14,3 +14,12 @@ path = "src/main.rs"
 nrob = { path = "../nrob" }
 dsv41 = { path = "../dsv41" }
 dsv41-cuda = { path = "../dsv41-cuda" }
+# VENDORED-LOCAL: GLM-5.3-Flash is served through llama-rs rather than dsv41-cuda,
+# so a second engine sits beside the DeepSeek one (see src/glm.rs). The CUDA
+# feature is not optional here: this server has never built without CUDA, because
+# dsv41-cuda is unconditional above.
+llama-rs = { path = "../llama-rs", features = ["cuda"] }
+tokenizer = { path = "../tokenizer" }
+gguf = { path = "../gguf" }
+ggml-rs = { path = "../ggml-rs" }
+ggml-rs-cuda = { path = "../ggml-rs-cuda" }

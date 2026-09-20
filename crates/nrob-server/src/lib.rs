@@ -12,6 +12,8 @@
 mod api;
 mod disk;
 mod engine;
+// VENDORED-LOCAL: GLM-5.3-Flash served through the same job/event contract.
+pub mod glm;
 mod http;
 
 use std::net::{SocketAddr, TcpListener};
