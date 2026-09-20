@@ -1841,6 +1841,85 @@ mod tests {
         assert!(trunk > 0.0);
     }
 
+    /// The same paragraph twice: does the second copy get easier?
+    ///
+    /// This is the controlled version of "perplexity rises with position". Content
+    /// difficulty is held exactly constant -- the two halves are the same tokens -- so
+    /// the only difference is that the second copy has already been seen.
+    ///
+    /// A working transformer is extremely good at this. Induction is the first thing
+    /// these models learn: shown `A B C ... A B`, they predict `C` with near-certainty.
+    /// A healthy model drops to a perplexity near 1 on an exact repeat. If the second
+    /// copy is no easier than the first, the model is not using its context, and that
+    /// is a bug in attention rather than a property of the finetune -- no amount of
+    /// fine-tuning damage or quantisation loss removes induction.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "needs the released model on disk"]
+    fn an_exact_repeat_is_easier_the_second_time() {
+        let Some(backend) = cuda_backend() else { return };
+        let g = GgufFile::open_streaming(RELEASED).expect("open");
+        let tok = tokenizer::Tokenizer::from_gguf(&g).expect("tokenizer");
+        drop(g);
+        let m = DeviceModel::open_with_cache(RELEASED, 512, backend.clone(), 32 << 30)
+            .expect("load");
+        let sh = m.shape().clone();
+        let w = m.view();
+        let mut st = forward::State::new_on(&sh, m.backend()).expect("state");
+
+        let para = "The Industrial Revolution began in Britain in the late eighteenth \
+century and spread across Europe and North America over the following hundred years. \
+Before it, most people lived in the countryside and worked on the land. Cloth was spun \
+and woven at home, by hand, and a single family might take a week to produce what a \
+machine would later make in an hour. The first factories were built beside rivers, \
+because water wheels drove the machinery.";
+        let one = tok.encode(para, false).expect("encode");
+        let n = one.len();
+        // The same tokens, twice.
+        let ids: Vec<u32> = one.iter().chain(one.iter()).copied().collect();
+        println!();
+        println!("{n} tokens, fed twice ({} total)", ids.len());
+
+        let nll_of = |from: usize, to: usize, nlls: &[f64]| -> f64 {
+            let slice = &nlls[from..to];
+            (slice.iter().sum::<f64>() / slice.len() as f64).exp()
+        };
+
+        let mut nlls = vec![0.0f64; ids.len()];
+        let mut logits = forward::forward_token(&sh, &w, &mut st, ids[0]).expect("first");
+        for i in 1..ids.len() {
+            let target = ids[i] as usize;
+            let max = logits.iter().fold(f32::NEG_INFINITY, |a, &v| a.max(v));
+            let mut denom = 0.0f64;
+            for &v in &logits {
+                denom += ((v - max) as f64).exp();
+            }
+            nlls[i] = -((logits[target] - max) as f64 - denom.ln());
+            logits = forward::forward_token(&sh, &w, &mut st, ids[i]).expect("forward");
+        }
+
+        // Skip the first few of each copy: the very start of a passage is genuinely
+        // hard, and the start of the second copy needs a token or two to lock on.
+        let skip = 8usize;
+        let first = nll_of(skip, n, &nlls);
+        let second = nll_of(n + skip, ids.len(), &nlls);
+        println!();
+        println!("  first copy,  tokens {skip}-{}:   perplexity {first:8.2}", n - 1);
+        println!("  second copy, tokens {}-{}:   perplexity {second:8.2}", n + skip, ids.len() - 1);
+        println!("  ratio: {:.2}x easier", first / second.max(1e-9));
+        println!();
+        println!("a working model predicts an exact repeat near-perfectly, so the second");
+        println!("copy should be several times easier -- often perplexity under 2. If it is");
+        println!("not, attention is not carrying the context.");
+        assert!(second.is_finite() && first.is_finite());
+        assert!(
+            second < first / 2.0,
+            "the second copy of an identical paragraph scored {second:.2} against the \
+             first at {first:.2}: induction is not working, so the model is not using \
+             its context"
+        );
+    }
+
     /// The sampling the model itself recommends, read out of the file.
     ///
     /// GLM-5.3-Flash ships `general.sampling.temp = 1.0` and
