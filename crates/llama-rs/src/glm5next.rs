@@ -136,6 +136,8 @@
 //!      patch-merger + SwiGLU projector.
 
 pub mod bridge;
+// VENDORED-LOCAL: GLM-5.3-Flash. The CPU tier of the expert hierarchy.
+pub mod cpu_experts;
 pub mod device;
 pub mod forward;
 pub mod hc;

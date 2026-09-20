@@ -460,3 +460,34 @@ fn measure_h2d_bandwidth() {
     println!();
     println!("a warm glm5next token uploads about 60 records, 0.99 GB");
 }
+
+// VENDORED-LOCAL: GLM-5.3-Flash. What a per-op device allocation costs.
+//
+// Every `Backend` op here allocates its own output through `alloc_zeros`, so a
+// glm5next token makes roughly 2,000 of them: ~710 `Mat::apply` calls plus four
+// launches for each of 336 routed experts. If an allocation costs tens of
+// microseconds, that is the token.
+#[test]
+#[ignore = "measures the CUDA allocator"]
+fn measure_device_alloc_cost() {
+    let Some(b) = try_cuda() else { return };
+    println!();
+    println!("   elements      alloc_zeros     alloc (uninit)   empty launch");
+    for &n in &[1024usize, 4096, 16384, 1_048_576, 8_388_608] {
+        let warm = b.zeros_f32(n);
+        std::hint::black_box(&warm);
+        let iters = 200usize;
+
+        let t = std::time::Instant::now();
+        for _ in 0..iters {
+            let v = b.zeros_f32(n);
+            std::hint::black_box(&v);
+        }
+        b.synchronize();
+        let zeroed = t.elapsed().as_secs_f64() / iters as f64;
+
+        println!("  {:9}   {:9.1} us", n, zeroed * 1e6);
+    }
+    println!();
+    println!("a glm5next token makes about 2,000 of these");
+}

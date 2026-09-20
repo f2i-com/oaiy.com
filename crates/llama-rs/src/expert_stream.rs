@@ -167,6 +167,20 @@ pub struct ExpertLayout {
     first_layer: u32,
 }
 
+// VENDORED-LOCAL: GLM-5.3-Flash.
+/// One part of one layer's expert record: where it is, how long, and how packed.
+#[derive(Clone, Copy, Debug)]
+pub struct PartView {
+    /// Byte offset of this part's region inside the record.
+    pub region: usize,
+    /// Bytes this layer actually uses. Never more than the region, which is sized
+    /// to the largest layer.
+    pub len: usize,
+    pub dtype: GgmlType,
+    /// `[rows, k]` in loader convention: rows is the output dimension.
+    pub shape: [usize; 2],
+}
+
 /// Loader-convention shape of a stacked `[n_experts, a, b]` or per-expert
 /// `[a, b]` tensor's expert slice: GGUF stores dims fastest-varying-first,
 /// so reversing gives `[n_experts, a, b]` and the expert shape is `[a, b]`.
@@ -292,6 +306,38 @@ impl ExpertLayout {
 
     /// VENDORED-LOCAL: the model block index of MoE layer 0.
     pub fn first_layer(&self) -> u32 { self.first_layer }
+
+    // VENDORED-LOCAL: GLM-5.3-Flash. What the CPU expert path needs to read a
+    // record without knowing how `PartLayout` is put together.
+    /// Where each of a layer's three parts sits inside a record, and how to read it.
+    ///
+    /// A record is gate, up and down end to end, each region padded to the
+    /// model-wide maximum for that part, so the offsets are constant and the used
+    /// length is per layer. Order is gate, up, down.
+    pub fn part_views(&self, layer: usize) -> [PartView; 3] {
+        let g = self.gate.max_per_expert_bytes;
+        let u = self.up.max_per_expert_bytes;
+        [
+            PartView {
+                region: 0,
+                len: self.gate.per_expert_bytes[layer],
+                dtype: self.gate.dtypes[layer],
+                shape: self.gate.shape,
+            },
+            PartView {
+                region: g,
+                len: self.up.per_expert_bytes[layer],
+                dtype: self.up.dtypes[layer],
+                shape: self.up.shape,
+            },
+            PartView {
+                region: g + u,
+                len: self.down.per_expert_bytes[layer],
+                dtype: self.down.dtypes[layer],
+                shape: self.down.shape,
+            },
+        ]
+    }
 
     /// Fixed record size: the per-part region maxima summed. Mixed-quant
     /// layers pad their smaller parts inside their regions; reconstruction
@@ -748,6 +794,11 @@ impl StreamShared {
         self.cache.set_scan_layer(layer);
     }
 
+    // VENDORED-LOCAL: GLM-5.3-Flash. The record layout, for the CPU expert path.
+    pub fn layout(&self) -> &ExpertLayout {
+        self.store.layout()
+    }
+
     pub fn cache_stats(&self) -> nrob::ecache::CacheStats {
         self.cache.stats()
     }
@@ -835,6 +886,77 @@ impl LayerStream {
     // host records the device is missing, stage those uploads on the transfer
     // stream before the layer's first matvec, then hand back one entry per
     // expert. A hit costs zero H2D bytes.
+    // VENDORED-LOCAL: GLM-5.3-Flash. Resolve a layer with a CPU tier behind it.
+    /// As [`Self::resolve_experts`], but a VRAM miss becomes CPU work rather than
+    /// an upload -- at most `promote` of them are admitted to VRAM per call.
+    ///
+    /// This is `dsv41-cuda`'s `PROMOTE_PER_LAYER` rule. Some promotion has to
+    /// happen or the VRAM tier freezes at whatever it held after the first pass and
+    /// can never take on a new working set; but every promotion is a PCIe copy that
+    /// also evicts something, so it is one a layer and it goes to the miss with the
+    /// highest surviving frequency rather than to whichever was routed first.
+    ///
+    /// Everything else comes back as [`ResolvedExpert::Cpu`], holding the RAM
+    /// lease. The caller computes those while the GPU runs the resident ones.
+    pub(crate) fn resolve_experts_hybrid(
+        &self,
+        experts: &[u32],
+        // Only the VRAM tier promotes, so without `cuda` there is nothing to
+        // promote into.
+        #[cfg_attr(not(feature = "cuda"), allow(unused_variables))] promote: usize,
+    ) -> Result<Vec<ResolvedExpert>, String> {
+        #[cfg(feature = "cuda")]
+        if let Some(dc) = self.shared.device_cache_for(self.layer) {
+            let mut distinct = experts.to_vec();
+            distinct.sort_unstable();
+            distinct.dedup();
+
+            let mut d = DeviceDispatch::new(dc.clone());
+            // Counts the accesses and tells us which are resident.
+            let misses = d.lookup_all(self.layer, &distinct);
+            self.prewarm_host(&misses);
+
+            // Rank the misses by how often they have been wanted, and admit the top
+            // `promote`. `freq` survives eviction, so a returning hot expert is
+            // ranked on what it earned.
+            let mut ranked = misses.clone();
+            ranked.sort_by_key(|&e| std::cmp::Reverse(dc.freq(self.layer, e)));
+            let admit: Vec<u32> = ranked.into_iter().take(promote).collect();
+            if !admit.is_empty() {
+                d.stage_misses(self, &admit)?;
+            }
+
+            let mut out = Vec::with_capacity(experts.len());
+            for &e in experts {
+                if misses.contains(&e) && !admit.contains(&e) {
+                    out.push(ResolvedExpert::Cpu(self.host_record(e)?));
+                    continue;
+                }
+                match d.resolve(self, e)? {
+                    Some(en) => out.push(ResolvedExpert::Device(en)),
+                    // Staging declined: the CPU can still have it.
+                    None => out.push(ResolvedExpert::Cpu(self.host_record(e)?)),
+                }
+            }
+            return Ok(out);
+        }
+
+        // No VRAM tier: everything the CPU can take, it takes.
+        self.prewarm_host(experts);
+        experts
+            .iter()
+            .map(|&e| self.host_record(e).map(ResolvedExpert::Cpu))
+            .collect()
+    }
+
+    /// This expert's record from the RAM tier, reading it in on a miss.
+    pub(crate) fn host_record(&self, e: u32) -> Result<nrob::ecache::HostLease, String> {
+        self.shared
+            .cache
+            .acquire(self.layer, e, &self.shared.store)
+            .map_err(|err| format!("expert {e} of layer {}: {err}", self.layer))
+    }
+
     pub(crate) fn resolve_experts(&self, experts: &[u32]) -> Result<Vec<ResolvedExpert>, String> {
         // No `set_scan_layer` here, deliberately -- see [`StreamShared::set_scan_layer`].
         #[cfg(feature = "cuda")]
@@ -1272,22 +1394,28 @@ pub(crate) enum ResolvedExpert {
     #[cfg(feature = "cuda")]
     Device(Arc<device_cache::DeviceEntry>),
     Host { pair: FfnPair, down: Weight },
+    /// VENDORED-LOCAL: GLM-5.3-Flash. A VRAM miss whose record is in RAM, left
+    /// there on purpose: computing it on the CPU costs less than the PCIe copy
+    /// that would move it, and it runs while the GPU works on the resident ones.
+    Cpu(nrob::ecache::HostLease),
 }
 
 impl ResolvedExpert {
-    pub(crate) fn pair(&self) -> &FfnPair {
+    /// The GPU-side weights, or `None` for an expert bound for the CPU.
+    pub(crate) fn gpu(&self) -> Option<(&FfnPair, &Weight)> {
         match self {
             #[cfg(feature = "cuda")]
-            Self::Device(en) => &en.pair,
-            Self::Host { pair, .. } => pair,
+            Self::Device(en) => Some((&en.pair, &en.down)),
+            Self::Host { pair, down } => Some((pair, down)),
+            Self::Cpu(_) => None,
         }
     }
 
-    pub(crate) fn down(&self) -> &Weight {
+    /// The leased record, for an expert bound for the CPU.
+    pub(crate) fn cpu_lease(&self) -> Option<&nrob::ecache::HostLease> {
         match self {
-            #[cfg(feature = "cuda")]
-            Self::Device(en) => &en.down,
-            Self::Host { down, .. } => down,
+            Self::Cpu(l) => Some(l),
+            _ => None,
         }
     }
 }

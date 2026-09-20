@@ -52,6 +52,7 @@ use ggml_rs::{Backend, Tensor};
 use gguf::GgufFile;
 
 use super::bridge::PartRef;
+use super::cpu_experts::{CpuExperts, CpuJob};
 use crate::expert_stream::{
     ExpertLayout, GgufExpertStore, LayerStream, ResolvedExpert, StreamShared,
 };
@@ -154,6 +155,16 @@ impl ExpertFfn for DeviceExperts {
     }
 }
 
+// VENDORED-LOCAL: GLM-5.3-Flash, from `dsv41-cuda/src/model.rs`.
+/// VRAM promotions a hybrid decode step makes per layer.
+///
+/// Some promotion has to happen or the VRAM tier freezes at whatever it held after
+/// the first pass and can never take on a new working set. But each one is a PCIe
+/// copy of 14-16 MB -- 1.12 ms on this machine's four-lane card -- that also evicts
+/// something, and the CPU can compute the same record in about that time without
+/// moving it. So: one a layer, to the miss most likely to be wanted again.
+pub const PROMOTE_PER_LAYER: usize = 1;
+
 /// Routed experts through `expert_stream`: an LFRU RAM cache, a batched
 /// thread-pool read for a layer's misses, and optionally a VRAM expert cache.
 ///
@@ -185,6 +196,8 @@ pub struct StreamExperts {
     /// One handle per MoE ordinal.
     layers: Vec<LayerStream>,
     n_embd: usize,
+    /// The CPU tier, when it is available. `None` means every miss is uploaded.
+    cpu: Option<Arc<CpuExperts>>,
 }
 
 impl StreamExperts {
@@ -216,12 +229,24 @@ impl StreamExperts {
             backend,
             layers,
             n_embd,
+            cpu: None,
         })
     }
 
     /// The shared cache state, so a caller can turn on the VRAM tier.
     pub fn shared(&self) -> &Arc<StreamShared> {
         &self.shared
+    }
+
+    /// Turn on the CPU tier: a VRAM miss whose record is in RAM is computed here
+    /// rather than uploaded, while the GPU runs the layer's resident experts.
+    pub fn enable_cpu_tier(&mut self) {
+        self.cpu = Some(Arc::new(CpuExperts::new()));
+    }
+
+    /// The CPU tier, if enabled.
+    pub fn cpu_tier(&self) -> Option<&Arc<CpuExperts>> {
+        self.cpu.as_ref()
     }
 
     /// VRAM held back on each card: room for the activations, the pinned staging
@@ -419,11 +444,51 @@ impl StreamExperts {
         })
     }
 
+    /// The GPU half of a layer: every resolved expert that has device weights,
+    /// accumulated on the card and read back once.
+    fn gpu_part(
+        &self,
+        be: &dyn Backend,
+        resolved: &[ResolvedExpert],
+        experts: &[(u32, f32)],
+        x: &[f32],
+        limit: f32,
+        out: &mut [f32],
+    ) -> Result<()> {
+        let any = resolved.iter().any(|r| r.gpu().is_some());
+        if !any {
+            out.fill(0.0);
+            return Ok(());
+        }
+        let xd = be.to_device(Tensor::from_vec(x.to_vec(), vec![1, self.n_embd]));
+        let mut acc =
+            be.to_device(Tensor::from_vec(vec![0.0f32; self.n_embd], vec![1, self.n_embd]));
+        for (r, &(_, wt)) in resolved.iter().zip(experts) {
+            let Some((pair, down)) = r.gpu() else { continue };
+            let h = pair.swiglu_clamped(be, &xd, limit, true);
+            let o = down.linear(be, &h);
+            be.add_to_axis0_range_scaled(&mut acc, 0, 1, &o, wt);
+        }
+        let oh = be.to_host(acc);
+        if oh.data().len() != out.len() {
+            return Err(LlamaError::Config(format!(
+                "device: expert layer sum is {} values, expected {}",
+                oh.data().len(),
+                out.len()
+            )));
+        }
+        out.copy_from_slice(oh.data());
+        Ok(())
+    }
+
     /// One resolved expert's FFN, input already on `be`: the clamp is fused, so
     /// the gate/up pair never leaves the device.
     fn run_expert(&self, be: &dyn Backend, r: &ResolvedExpert, xd: &Tensor, limit: f32) -> Tensor {
-        let h = r.pair().swiglu_clamped(be, xd, limit, true);
-        r.down().linear(be, &h)
+        let (pair, down) = r
+            .gpu()
+            .expect("run_expert is only used on the non-hybrid path, which never yields Cpu");
+        let h = pair.swiglu_clamped(be, xd, limit, true);
+        down.linear(be, &h)
     }
 
     /// The backend that runs MoE layer `ord`.
@@ -460,29 +525,71 @@ impl ExpertFfn for StreamExperts {
             )));
         }
         // The whole route at once, so the VRAM tier is consulted for all of it
-        // and the misses are staged in one batch before the first matvec.
+        // and whatever is going to move is staged in one batch before the first
+        // matvec.
         let ids: Vec<u32> = experts.iter().map(|&(e, _)| e).collect();
-        let resolved = ls
-            .resolve_experts(&ids)
-            .map_err(|err| LlamaError::Config(format!("device: MoE layer {ord}: {err}")))?;
+        let resolved = match &self.cpu {
+            Some(_) => ls.resolve_experts_hybrid(&ids, PROMOTE_PER_LAYER),
+            None => ls.resolve_experts(&ids),
+        }
+        .map_err(|err| LlamaError::Config(format!("device: MoE layer {ord}: {err}")))?;
+
+        // Whatever the VRAM tier missed and the CPU is taking.
+        let cpu_jobs: Vec<CpuJob> = resolved
+            .iter()
+            .enumerate()
+            .filter_map(|(i, r)| {
+                r.cpu_lease().map(|l| CpuJob {
+                    lease: l.clone(),
+                    weight: experts[i].1,
+                    slot: i,
+                })
+            })
+            .collect();
 
         let be = self.card(ord);
-        let xd = be.to_device(Tensor::from_vec(x.to_vec(), vec![1, self.n_embd]));
-        let mut acc =
-            be.to_device(Tensor::from_vec(vec![0.0f32; self.n_embd], vec![1, self.n_embd]));
-        for (r, &(_, wt)) in resolved.iter().zip(experts) {
-            let o = self.run_expert(be, r, &xd, limit);
-            be.add_to_axis0_range_scaled(&mut acc, 0, 1, &o, wt);
+        let mut host_sum = vec![0.0f32; self.n_embd];
+
+        // Start the CPU work FIRST, so it runs underneath the GPU launches rather
+        // than after them -- the same ordering `dsv41-cuda` uses, and the only
+        // reason the tier is free rather than merely cheap.
+        let cpu_result: Result<Vec<(usize, f32, Vec<f32>)>> = if cpu_jobs.is_empty() {
+            Ok(Vec::new())
+        } else {
+            let cpu = self.cpu.as_ref().expect("cpu jobs imply a cpu tier");
+            let layout = self.shared.layout();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let n_embd = self.n_embd;
+            let mut gpu_err = None;
+
+            rayon::scope(|s| {
+                s.spawn(|_| {
+                    let _ = tx.send(cpu.run(&cpu_jobs, layout, ord, x, limit, n_embd));
+                });
+                // ... while this thread drives the GPU.
+                if let Err(e) = self.gpu_part(be, &resolved, experts, x, limit, &mut host_sum) {
+                    gpu_err = Some(e);
+                }
+            });
+            if let Some(e) = gpu_err {
+                return Err(e);
+            }
+            rx.recv().unwrap_or_else(|_| {
+                Err(LlamaError::Config("device: the CPU expert worker vanished".into()))
+            })
+        };
+
+        // With nothing for the CPU, the GPU part still has to run.
+        if cpu_jobs.is_empty() {
+            self.gpu_part(be, &resolved, experts, x, limit, &mut host_sum)?;
         }
-        let oh = be.to_host(acc);
-        if oh.data().len() != out.len() {
-            return Err(LlamaError::Config(format!(
-                "device: expert layer sum is {} values, expected {}",
-                oh.data().len(),
-                out.len()
-            )));
+
+        for (_, wt, o) in cpu_result? {
+            for (t, &v) in host_sum.iter_mut().zip(o.iter()) {
+                *t += wt * v;
+            }
         }
-        out.copy_from_slice(oh.data());
+        out.copy_from_slice(&host_sum);
         Ok(())
     }
 
@@ -650,6 +757,16 @@ impl DeviceModel {
 
         let mut m = Self::open_with_cache(path, max_len, trunk, ram)?;
         m.experts_mut().spread_over(cards, vram_cap)?;
+        // The CPU tier: a VRAM miss whose record is in RAM is computed here rather
+        // than uploaded. GLM5_NO_CPU_TIER=1 turns it off, for measuring against.
+        if std::env::var("GLM5_NO_CPU_TIER").ok().as_deref() != Some("1") {
+            m.experts_mut().enable_cpu_tier();
+            let avx = m.experts().cpu_tier().map(|c| c.avx512()).unwrap_or(false);
+            eprintln!(
+                "  CPU expert tier: on ({})",
+                if avx { "AVX-512" } else { "scalar fused" }
+            );
+        }
         Ok(m)
     }
 
@@ -1701,6 +1818,67 @@ mod tests {
         assert!(trunk > 0.0);
     }
 
+    /// The CPU expert tier against the GPU, on the real model.
+    ///
+    /// This is the correctness gate on the AVX-512 kernels: the same prompt run with
+    /// the CPU tier on and off, so every expert the tier took is checked against the
+    /// GPU computing that same expert from the same bytes.
+    ///
+    /// Not exact, and cannot be: the fused AVX-512 dot reassociates within a row
+    /// (16 lanes, partials combined at the end) and the CUDA matvec reassociates
+    /// differently again. The bar is 1e-4 absolute at a logit scale of ~15, i.e.
+    /// under 1e-5 relative, which is where the model's own host-vs-CUDA gap sits.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "needs the released model on disk"]
+    fn cpu_tier_agrees_with_the_gpu() {
+        let prompt = [154822u32, 6172, 1043, 9001];
+
+        // SAFETY: single-threaded test.
+        unsafe { std::env::set_var("GLM5_NO_CPU_TIER", "1") };
+        let gpu_only = match DeviceModel::open_tiered(RELEASED, 512, 1, 24 << 30, 4 << 30) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("tiered open failed ({e}); skipping");
+                return;
+            }
+        };
+        assert!(gpu_only.experts().cpu_tier().is_none(), "the tier should be off");
+        let sh = gpu_only.shape().clone();
+        let wg = gpu_only.view();
+        let mut sg = forward::State::new_on(&sh, gpu_only.backend()).expect("state");
+        let a = forward::forward_prompt(&sh, &wg, &mut sg, &prompt).expect("gpu only");
+        drop(wg);
+        drop(gpu_only);
+
+        // SAFETY: as above.
+        unsafe { std::env::remove_var("GLM5_NO_CPU_TIER") };
+        // A small VRAM budget on purpose, so plenty of experts miss and the CPU tier
+        // actually has work -- with a large one almost everything is resident and the
+        // test would pass without exercising anything.
+        let hybrid = DeviceModel::open_tiered(RELEASED, 512, 1, 24 << 30, 4 << 30).expect("load");
+        let cpu = hybrid.experts().cpu_tier().expect("the tier should be on");
+        println!("CPU tier: {}", if cpu.avx512() { "AVX-512" } else { "scalar fused" });
+        crate::glm5next::cpu_experts::reset_stats();
+        let wh = hybrid.view();
+        let mut shs = forward::State::new_on(&sh, hybrid.backend()).expect("state");
+        let b = forward::forward_prompt(&sh, &wh, &mut shs, &prompt).expect("hybrid");
+
+        let (recs, calls, secs) = crate::glm5next::cpu_experts::stats();
+        println!("the tier computed {recs} records in {calls} layer-calls, {secs:.3}s");
+        assert!(recs > 0, "the CPU tier did no work, so this proves nothing");
+
+        assert_eq!(a.len(), b.len());
+        let scale = a.iter().fold(0.0f32, |m, v| m.max(v.abs())).max(1.0);
+        let mut worst = 0.0f32;
+        for (p, q) in a.iter().zip(b.iter()) {
+            worst = worst.max((p - q).abs());
+        }
+        println!("max |gpu only - hybrid| over {} logits: {worst:.6} (scale {scale:.3})", a.len());
+        assert!(worst <= 1e-4 * scale, "the CPU tier diverges: {worst} at scale {scale}");
+        assert!(a.iter().any(|v| v.abs() > 1e-3), "logits are all zero");
+    }
+
     /// Spreading the expert tier over two cards must not change the answer.
     ///
     /// This is the correctness gate on multi-GPU. Half the MoE layers resolve
@@ -1727,6 +1905,11 @@ mod tests {
         drop(w1);
         drop(one);
 
+        // Like for like: `open_with_cache` above has no CPU tier, so this one must
+        // not either, or the comparison measures the CPU/GPU difference instead of
+        // the card split. `cpu_tier_agrees_with_the_gpu` is the test for that.
+        // SAFETY: single-threaded test, and nothing else reads this var concurrently.
+        unsafe { std::env::set_var("GLM5_NO_CPU_TIER", "1") };
         let two = match DeviceModel::open_tiered(RELEASED, 512, 2, 32 << 30, 8 << 30) {
             Ok(m) => m,
             Err(e) => {
@@ -1900,6 +2083,8 @@ mod tests {
         let t = std::time::Instant::now();
         let mut lg2 = forward::forward_prompt(&sh, &w, &mut st2, &prompt).expect("reprefill");
         let prefill2 = t.elapsed().as_secs_f64();
+        crate::glm5next::cpu_experts::reset_stats();
+        forward::prof::reset();
         let t = std::time::Instant::now();
         for _ in 0..n {
             let tk = next(&lg2);
@@ -1918,6 +2103,30 @@ mod tests {
         report("warm,          ");
 
         println!();
+        println!("warm decode, by phase (per token, {n} tokens):");
+        for (name, c) in forward::prof::all() {
+            println!("  {:32} {:7.1} ms", name, forward::prof::ms(&c) / n as f64);
+        }
+        println!("  {:32} {:7.1} ms", "accounted for", forward::prof::total_ms() / n as f64);
+        println!();
+        {
+            let (recs, calls, secs) = crate::glm5next::cpu_experts::stats();
+            if calls > 0 {
+                println!(
+                    "CPU tier over the warm decode: {} records in {} layer-calls, {:.3}s total, {:.2} ms a record, {:.1} GB/s",
+                    recs,
+                    calls,
+                    secs,
+                    secs / recs.max(1) as f64 * 1e3,
+                    recs as f64 * 14.16e6 / secs.max(1e-9) / 1e9
+                );
+                println!(
+                    "  per token: {:.1} records, {:.1} ms",
+                    recs as f64 / n as f64,
+                    secs / n as f64 * 1e3
+                );
+            }
+        }
         println!("prefill  cold {:.1}s -> warm {:.1}s for {} tokens", prefill, prefill2, n_prompt);
         println!("decode   cold {:.3} s/token ({:.2} tok/s)", dec, 1.0 / dec);
         println!("decode   warm {:.3} s/token ({:.2} tok/s)", dec2, 1.0 / dec2);

@@ -81,7 +81,7 @@
 //! not assumed.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use ggml_quants::GgmlType;
@@ -153,9 +153,14 @@ pub struct DeviceEntry {
     /// shared through `Arc` and `Send+Sync` must hold by construction.
     tickets: Mutex<Vec<UploadTicket>>,
     /// LFRU frequency term (mutated only under the cache's inner lock).
-    freq: std::cell::Cell<u32>,
+    // VENDORED-LOCAL: GLM-5.3-Flash. Atomics rather than Cells, so an entry is
+    // `Sync` and a `ResolvedExpert` holding one can cross into a scope that also
+    // runs CPU experts. Both are only ever touched under the cache's own mutex, so
+    // Relaxed is all the ordering they need -- the atomicity is for the type, not
+    // for the synchronisation.
+    freq: AtomicU32,
     /// LFRU recency term (the cache's logical clock).
-    last: std::cell::Cell<u64>,
+    last: AtomicU64,
     /// The backend that owns the streams the tensors were uploaded with;
     /// used only by `drop` for free ordering (see the struct docs).
     backend: Arc<CudaBackend>,
@@ -308,8 +313,8 @@ impl DeviceCache {
             Some(en) => {
                 self.hits.fetch_add(1, Ordering::Relaxed);
                 self.bytes_hit.fetch_add(en.bytes as u64, Ordering::Relaxed);
-                en.freq.set(freq);
-                en.last.set(clock);
+                en.freq.store(freq, Ordering::Relaxed);
+                en.last.store(clock, Ordering::Relaxed);
                 Some(Arc::clone(en))
             }
             None => {
@@ -333,12 +338,24 @@ impl DeviceCache {
             *f > 0
         });
         for en in g.map.values() {
-            en.freq.set(en.freq.get() / 2);
+            en.freq.store(en.freq.load(Ordering::Relaxed) / 2, Ordering::Relaxed);
         }
     }
 
     /// How many `(layer, expert)` pairs this cache has ever been asked for, and
     /// how many it holds. The gap is what aging and admission act on.
+    // VENDORED-LOCAL: GLM-5.3-Flash.
+    /// How often `(layer, expert)` has been asked for, surviving eviction.
+    ///
+    /// The hybrid dispatch promotes at most one miss a layer into VRAM and sends
+    /// the rest to the CPU; this is what it ranks them by, so the slot goes to the
+    /// expert most likely to be wanted again rather than to whichever happened to
+    /// be routed first.
+    pub fn freq(&self, layer: u32, expert: u32) -> u32 {
+        let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        g.seen.get(&(layer, expert)).copied().unwrap_or(0)
+    }
+
     pub fn tracked(&self) -> (usize, usize) {
         let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         (g.seen.len(), g.map.len())
@@ -425,14 +442,14 @@ impl DeviceCache {
             bytes,
             tickets: Mutex::new(tickets),
             // Whatever this key was worth before it was last evicted.
-            freq: std::cell::Cell::new(seed_freq),
-            last: std::cell::Cell::new(0),
+            freq: AtomicU32::new(seed_freq),
+            last: AtomicU64::new(0),
             backend: Arc::clone(&self.backend),
         });
 
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         g.clock += 1;
-        entry.last.set(g.clock);
+        entry.last.store(g.clock, Ordering::Relaxed);
         self.evict_until(&mut g, entry.bytes);
         if g.bytes_used + entry.bytes <= self.budget {
             g.bytes_used += entry.bytes;
@@ -487,7 +504,7 @@ impl DeviceCache {
                 .map
                 .iter()
                 .filter(|(_, en)| Arc::strong_count(en) == 1)
-                .min_by_key(|(_, en)| (en.freq.get(), en.last.get()))
+                .min_by_key(|(_, en)| (en.freq.load(Ordering::Relaxed), en.last.load(Ordering::Relaxed)))
                 .map(|(k, _)| *k);
             let Some(k) = victim else { break };
             let en = g.map.remove(&k).expect("victim key came from the map");
