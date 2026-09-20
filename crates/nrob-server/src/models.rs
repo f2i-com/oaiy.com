@@ -149,8 +149,14 @@ impl Flavour {
                     };
                     out.push(llama_rs::ChatMessage { role, content });
                 }
+                // The mode decides which generation prompt: `Thinking` opens
+                // `<think>` for the model to reason in, `Chat` pre-fills
+                // `<think></think>` so it answers directly. Ignoring this was worth
+                // the difference between "Paris." and two hundred tokens of
+                // deliberation that never finished.
+                let thinking = opts.mode == dsv41::chat::Mode::Thinking;
                 Ok(dsv41::chat::Encoded {
-                    prompt: llama_rs::glm5next_template_with(&out, true, effort),
+                    prompt: llama_rs::glm5next_template_full(&out, true, effort, thinking),
                     images: Vec::new(),
                 })
             }

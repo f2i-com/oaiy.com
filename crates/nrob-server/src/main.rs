@@ -25,6 +25,12 @@ const HELP: &str = "nrob-server: DeepSeek-V4.1-Flash behind an OpenAI-compatible
   --usage FILE         expert usage profile: warms the caches at start, updated
                        after every request (default: none)
   --name NAME          model name clients use (default deepseek-v4.1-flash)
+  --also NAME=PATH     another model a client may ask for by name; repeatable.
+                       A .gguf (or a directory holding one) is served through
+                       llama-rs, anything else as a DeepSeek checkpoint. Only one
+                       is resident: asking for another unloads the current one,
+                       which takes as long as a load. /v1/models says which is
+                       loaded.
   --api-key KEY        require `Authorization: Bearer KEY`
   --thinking           reason before answering unless a request says otherwise
                        (default: answer directly; requests turn reasoning on with
@@ -78,6 +84,17 @@ fn parse_args() -> Result<Options, String> {
                 a.usage = if v == "off" { None } else { Some(v.into()) };
             }
             "--name" => a.name = val()?,
+            // VENDORED-LOCAL: more than one model, switched on demand.
+            "--also" => {
+                let spec = val()?;
+                let (name, path) = spec.split_once('=').ok_or_else(|| {
+                    format!("--also wants NAME=PATH, got {spec}")
+                })?;
+                if name.is_empty() || path.is_empty() {
+                    return Err(format!("--also wants NAME=PATH, got {spec}"));
+                }
+                a.extra_models.push((name.to_string(), path.into()));
+            }
             "--api-key" => a.api_key = Some(val()?),
             "--thinking" => a.thinking = true,
             "--effort" => a.effort = num(val()?)?.clamp(1, 100) as u32,
