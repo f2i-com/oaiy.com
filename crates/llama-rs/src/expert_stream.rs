@@ -655,6 +655,19 @@ impl StreamShared {
         }
     }
 
+    // VENDORED-LOCAL: GLM-5.3-Flash. The RAM tier's phase hint.
+    /// Tell the RAM tier which layer a pass has reached, so its eviction victims
+    /// come from the layers already done rather than the ones coming up.
+    ///
+    /// A pass over the layers uses each layer's experts once, which makes the
+    /// record just read the least-used one around -- so plain LFRU evicts a
+    /// record the same pass has yet to reach, and the pass eats its own future.
+    /// Measured on DeepSeek-V4.1: a full RAM tier served 2.6K of the 10.2K
+    /// records it held that a 5.6K-token prompt needed.
+    pub fn set_scan_layer(&self, layer: Option<u32>) {
+        self.cache.set_scan_layer(layer);
+    }
+
     pub fn cache_stats(&self) -> nrob::ecache::CacheStats {
         self.cache.stats()
     }
@@ -743,6 +756,19 @@ impl LayerStream {
     // stream before the layer's first matvec, then hand back one entry per
     // expert. A hit costs zero H2D bytes.
     pub(crate) fn resolve_experts(&self, experts: &[u32]) -> Result<Vec<ResolvedExpert>, String> {
+        // Both glm5next's prefill and its decode are one pass over the layers per
+        // token, so the hint applies to either: inside a token, layer 3's experts
+        // are wanted before layer 40's, and taking layer 40's record to make room
+        // for layer 3's costs the same token a read.
+        struct Scan<'a>(&'a StreamShared);
+        impl Drop for Scan<'_> {
+            fn drop(&mut self) {
+                self.0.set_scan_layer(None);
+            }
+        }
+        self.shared.set_scan_layer(Some(self.layer));
+        let _scan = Scan(&self.shared);
+
         #[cfg(feature = "cuda")]
         if let Some(dc) = self.shared.device_cache_for(self.layer) {
             let mut distinct = experts.to_vec();

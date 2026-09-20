@@ -1734,10 +1734,41 @@ mod tests {
         let dec = t.elapsed().as_secs_f64() / n as f64;
         println!();
         report("after decode, ");
+
+        // Second pass over the same document. The tiers now hold the working set,
+        // so this is the steady state -- the number that says what the hierarchy
+        // is worth once it is warm, as against the cost of filling it. DeepSeek
+        // reports 2-6 tok/s for a fresh process and 29 for its third answer for
+        // exactly this reason.
+        let before = m.experts().shared().cache_stats();
+        let mut st2 = forward::State::new(&sh).expect("state");
+        let t = std::time::Instant::now();
+        let mut lg2 = forward::forward_prompt(&sh, &w, &mut st2, &prompt).expect("reprefill");
+        let prefill2 = t.elapsed().as_secs_f64();
+        let t = std::time::Instant::now();
+        for _ in 0..n {
+            let tk = next(&lg2);
+            lg2 = forward::forward_token(&sh, &w, &mut st2, tk).expect("decode warm");
+        }
+        let dec2 = t.elapsed().as_secs_f64() / n as f64;
+        let after = m.experts().shared().cache_stats();
+        let (h, ms) = (after.hits - before.hits, after.misses - before.misses);
         println!();
-        println!("decode {:.3} s/token   ({:.2} tok/s)", dec, 1.0 / dec);
+        println!(
+            "second pass: RAM {:.1}% hits ({h} / {}), {:.1} GB more off the SSD",
+            100.0 * h as f64 / (h + ms).max(1) as f64,
+            h + ms,
+            (after.bytes_read - before.bytes_read) as f64 / 1e9
+        );
+        report("warm,          ");
+
+        println!();
+        println!("prefill  cold {:.1}s -> warm {:.1}s for {} tokens", prefill, prefill2, n_prompt);
+        println!("decode   cold {:.3} s/token ({:.2} tok/s)", dec, 1.0 / dec);
+        println!("decode   warm {:.3} s/token ({:.2} tok/s)", dec2, 1.0 / dec2);
         println!("target is 20 tok/s = 0.050 s/token");
-        assert!(dec > 0.0);
+        println!("the trunk is ~103 ms of that; warm experts are ~{:.0} ms", (dec2 - 0.1027).max(0.0) * 1e3);
+        assert!(dec > 0.0 && dec2 > 0.0);
     }
 
     /// The whole hierarchy: both cards' VRAM, RAM behind them, the GGUF behind
