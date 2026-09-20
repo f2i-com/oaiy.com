@@ -144,6 +144,9 @@ pub struct Gpu {
     pub ordinal: usize,
     ctx: Arc<CudaContext>,
     pub stream: Arc<CudaStream>,
+    /// Host-to-device copies that should cross while `stream` computes
+    /// ([`Gpu::write_staged_async`]). Nothing orders the two but events.
+    copy: Arc<CudaStream>,
     funcs: HashMap<&'static str, CudaFunction>,
 }
 
@@ -196,7 +199,8 @@ impl Gpu {
             funcs.insert(k, cu(module.load_function(k))?);
         }
         let bufs = (0..STAGE_BUFS).map(|_| StageBuf::new(&ctx)).collect::<Result<Vec<_>>>()?;
-        Ok(Gpu { staging: Mutex::new(Staging { bufs, next: 0 }), ordinal, ctx, stream, funcs })
+        let copy = cu(ctx.new_stream())?;
+        Ok(Gpu { staging: Mutex::new(Staging { bufs, next: 0 }), ordinal, ctx, stream, copy, funcs })
     }
 
     fn f(&self, name: &'static str) -> &CudaFunction {
@@ -244,9 +248,42 @@ impl Gpu {
     /// pinned staging buffers). On return `host` may be reused: its bytes are
     /// in pinned memory or on the device.
     pub fn write<T: DeviceRepr>(&self, host: &[T], dst: &mut CudaViewMut<'_, T>) -> Result<()> {
+        self.write_on(host, dst, &self.stream)
+    }
+
+    /// A new event on this device, recorded by nothing yet. Waiting on an
+    /// unrecorded event is a no-op, which is what a first use wants.
+    pub fn new_event(&self) -> Result<CudaEvent> {
+        cu(self.ctx.new_event(None))
+    }
+
+    /// Mark the compute stream's work so far, for a later copy to wait on.
+    pub fn record_compute(&self, e: &CudaEvent) -> Result<()> {
+        cu(e.record(&self.stream))
+    }
+
+    /// Hold the compute stream until `e` (bytes a copy is still landing).
+    pub fn compute_wait(&self, e: &CudaEvent) -> Result<()> {
+        cu(self.stream.wait(e))
+    }
+
+    /// As [`write`](Self::write), but on the copy stream, so the bytes cross
+    /// while the compute stream works. It waits for `after` first (the
+    /// kernels that last read `dst`, or nothing on a first use) and records
+    /// `filled` once the bytes are in place - whoever reads them must
+    /// [`compute_wait`](Self::compute_wait) on that.
+    pub fn write_staged_async<T: DeviceRepr>(&self, host: &[T], dst: &mut CudaViewMut<'_, T>, after: Option<&CudaEvent>, filled: &CudaEvent) -> Result<()> {
+        if let Some(e) = after {
+            cu(self.copy.wait(e))?;
+        }
+        self.write_on(host, dst, &self.copy)?;
+        cu(filled.record(&self.copy))
+    }
+
+    fn write_on<T: DeviceRepr>(&self, host: &[T], dst: &mut CudaViewMut<'_, T>, stream: &Arc<CudaStream>) -> Result<()> {
         let bytes = std::mem::size_of_val(host);
         if bytes < STAGE_MIN {
-            return cu(self.stream.memcpy_htod(host, dst));
+            return cu(stream.memcpy_htod(host, dst));
         }
         assert!(dst.len() >= host.len(), "write: destination too small");
         // SAFETY: T is a DeviceRepr, a plain copyable value type (f32, u8, u16,
@@ -254,7 +291,7 @@ impl Gpu {
         let src = unsafe { std::slice::from_raw_parts(host.as_ptr() as *const u8, bytes) };
         // the raw copy below runs in whatever context is current: make it this device's
         cu(self.ctx.bind_to_thread())?;
-        let (dptr, _record) = dst.device_ptr_mut(&self.stream);
+        let (dptr, _record) = dst.device_ptr_mut(stream);
         let mut st = self.staging.lock().unwrap_or_else(|p| p.into_inner());
         for (i, chunk) in src.chunks(STAGE_CHUNK).enumerate() {
             let k = st.next;
@@ -268,8 +305,8 @@ impl Gpu {
             // SAFETY: the destination range [dptr + i * STAGE_CHUNK, + chunk.len())
             // lies inside `dst` (length asserted above); the source stays alive and
             // unwritten until the event recorded next marks the copy done.
-            cu(unsafe { sys::cuMemcpyHtoDAsync_v2(dptr + (i * STAGE_CHUNK) as u64, b.ptr as *const _, chunk.len(), self.stream.cu_stream()) }.result())?;
-            cu(b.event.record(&self.stream))?;
+            cu(unsafe { sys::cuMemcpyHtoDAsync_v2(dptr + (i * STAGE_CHUNK) as u64, b.ptr as *const _, chunk.len(), stream.cu_stream()) }.result())?;
+            cu(b.event.record(stream))?;
         }
         Ok(())
     }
@@ -279,6 +316,8 @@ impl Gpu {
     }
 
     pub fn sync(&self) -> Result<()> {
+        // both, or a sync says nothing about the copies in flight
+        cu(self.copy.synchronize())?;
         cu(self.stream.synchronize())
     }
 

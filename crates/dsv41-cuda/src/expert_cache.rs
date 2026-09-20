@@ -10,10 +10,13 @@
 //! order alone guarantees the upload lands before the kernels that read it,
 //! and that no kernel still reading a victim's bytes is overtaken by the
 //! upload that replaces them (both happen on one stream, in issue order).
+//! Prefill's own misses are the exception: they cross on the copy stream,
+//! into two staging slots, so an upload runs while the last expert computes.
+//! Events stand in for stream order there (see `get_prefill`).
 //!
 //! Frequencies count tokens: a prefill expert used by 300 prompt tokens
 //! counts 300, as 300 decode steps would. During a prefill, misses go
-//! through one staging slot ([`DeviceExpertCache::get_prefill`]); when it
+//! through staging slots ([`DeviceExpertCache::get_prefill`]); when it
 //! ends, the ones used most move in where they beat what they would replace
 //! ([`DeviceExpertCache::admit_pending`]), from RAM. (Admitting every miss
 //! as it came evicted, measured, each upload before its next use and much
@@ -22,12 +25,17 @@
 
 use std::collections::HashMap;
 
-use cudarc::driver::{CudaSlice, CudaView};
+use cudarc::driver::{CudaEvent, CudaSlice, CudaView};
 use nrob::ecache::Ecache;
 use nrob::store::WeightStore;
 use nrob::Result;
 
 use crate::gpu::Gpu;
+
+/// Staging slots a prefill hands out in turn. Two is enough to overlap:
+/// the next expert's bytes land in one while this one's kernels read the
+/// other.
+const STAGE_SLOTS: usize = 2;
 
 /// Every frequency halves after this many decode tokens: LFU without aging
 /// keeps an old topic's experts in VRAM forever, and a new topic's never
@@ -67,8 +75,19 @@ struct Slot {
 
 pub struct DeviceExpertCache {
     pool: CudaSlice<u8>,
-    /// One record for prefill's misses (see `get_transient`).
-    stage: CudaSlice<u8>,
+    /// Records for prefill's misses, handed out in turn. Two, so the next
+    /// expert's upload crosses while this one's kernels run; with one, the
+    /// upload had to wait for them.
+    stage: Vec<CudaSlice<u8>>,
+    next_stage: usize,
+    /// Per stage slot: the bytes are in place, and the kernels that read
+    /// them are done - the second only once it has been recorded.
+    filled: Vec<CudaEvent>,
+    used: Vec<CudaEvent>,
+    used_valid: Vec<bool>,
+    /// The slot handed out last. Its readers are issued by the time the
+    /// caller asks for another expert, which is when `used` is recorded.
+    live: Option<usize>,
     record: usize,
     slots: Vec<Slot>,
     index: HashMap<(u32, u32), usize>,
@@ -90,7 +109,12 @@ impl DeviceExpertCache {
     pub fn new(g: &Gpu, slots: usize, record: usize) -> Result<DeviceExpertCache> {
         Ok(DeviceExpertCache {
             pool: g.zeros::<u8>(slots.max(1) * record)?,
-            stage: g.zeros::<u8>(record)?,
+            stage: (0..STAGE_SLOTS).map(|_| g.zeros::<u8>(record)).collect::<Result<Vec<_>>>()?,
+            next_stage: 0,
+            filled: (0..STAGE_SLOTS).map(|_| g.new_event()).collect::<Result<Vec<_>>>()?,
+            used: (0..STAGE_SLOTS).map(|_| g.new_event()).collect::<Result<Vec<_>>>()?,
+            used_valid: vec![false; STAGE_SLOTS],
+            live: None,
             record,
             slots: (0..slots).map(|_| Slot { key: None, freq: 0, last: 0, batch: 0 }).collect(),
             index: HashMap::with_capacity(slots),
@@ -160,6 +184,12 @@ impl DeviceExpertCache {
     /// the next call: stream order puts that upload after the kernels issued
     /// on this one.
     pub fn get_prefill(&mut self, g: &Gpu, layer: u32, expert: u32, tokens: u64, host: &Ecache, store: &dyn WeightStore) -> Result<CudaView<'_, u8>> {
+        // asking again means the kernels reading the slot handed out last
+        // are issued: mark where they end, for whoever takes that slot next
+        if let Some(k) = self.live.take() {
+            g.record_compute(&self.used[k])?;
+            self.used_valid[k] = true;
+        }
         if let Some(i) = self.touch_by(layer, expert, tokens) {
             return Ok(self.view(i));
         }
@@ -167,11 +197,17 @@ impl DeviceExpertCache {
         let t = std::time::Instant::now();
         let lease = host.acquire(layer, expert, store)?;
         let t1 = std::time::Instant::now();
-        g.write(&lease, &mut self.stage.slice_mut(..))?;
+        let k = self.next_stage;
+        self.next_stage = (k + 1) % self.stage.len();
+        let after = self.used_valid[k].then_some(&self.used[k]);
+        g.write_staged_async(&lease, &mut self.stage[k].slice_mut(..), after, &self.filled[k])?;
+        // the kernels this expert is about to get read those bytes
+        g.compute_wait(&self.filled[k])?;
+        self.live = Some(k);
         self.stats.wait_s += (t1 - t).as_secs_f64();
         self.stats.upload_s += t1.elapsed().as_secs_f64();
         self.stats.bytes_uploaded += self.record as u64;
-        Ok(self.stage.slice(..))
+        Ok(self.stage[k].slice(..))
     }
 
     /// After a prefill: move the experts it missed that it used most into
