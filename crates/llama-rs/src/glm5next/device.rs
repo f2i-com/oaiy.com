@@ -451,6 +451,22 @@ impl DeviceModel {
         }
     }
 
+    /// As [`Self::view`], with the routed experts replaced.
+    ///
+    /// Measuring the dense trunk on its own needs an [`ExpertFfn`] that costs
+    /// nothing; what is left is attention, the shared expert, the
+    /// hyper-connections and the head. That number is a floor no amount of
+    /// expert tiering can get under.
+    pub fn view_with_experts<'a>(&'a self, experts: &'a dyn ExpertFfn) -> ModelW<'a> {
+        let mut w = self.view();
+        for l in &mut w.layers {
+            if let FfnW::Moe(moe) = &mut l.ffn {
+                moe.experts = experts;
+            }
+        }
+        w
+    }
+
     /// Borrow the weights as the view [`super::forward`] takes.
     pub fn view(&self) -> ModelW<'_> {
         let sh = &self.shape;
@@ -546,6 +562,8 @@ impl DeviceModel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::forward::matvec;
+    use ggml_quants::q4_k;
 
     const RELEASED: &str =
         r"D:\glm5.3_flash\Q4_K_M\GLM-5.3-Flash-Q4_K_M-00001-of-00005.gguf";
@@ -978,6 +996,188 @@ mod tests {
             100.0 * full * projections_per_token as f64 / 2.7
         );
         assert!(read > 0.0 && full > 0.0);
+    }
+
+    /// What one expert record costs on the CPU today, at the released shapes.
+    ///
+    /// A routed expert is gate and up of `[n_ff_exp, n_embd]` and down of
+    /// `[n_embd, n_ff_exp]`, all Q4_K: 4 718 592 bytes each, 8 388 608 weights
+    /// each. The CPU tier of the expert hierarchy only pays off if this beats a
+    /// PCIe upload of the same record, which the DeepSeek notes measured at
+    /// 1.3 ms over x4 and 2.6 ms over x2.
+    ///
+    /// Synthetic bytes: Q4_K dequantisation is data-independent, and the
+    /// arithmetic and the memory traffic are what is being timed.
+    #[test]
+    #[ignore = "measures the host expert path"]
+    fn measure_host_record_cost() {
+        let (n_embd, n_ff) = (4096usize, 2048usize);
+        let per = n_embd * n_ff / 256 * 144;
+        let raw: Vec<u8> = (0..per).map(|i| (i * 31 % 251) as u8).collect();
+        let x: Vec<f32> = (0..n_embd).map(|i| ((i % 17) as f32 - 8.0) / 8.0).collect();
+        let mut w = vec![0.0f32; n_embd * n_ff];
+        let mut h = vec![0.0f32; n_ff];
+        let mut out = vec![0.0f32; n_embd];
+
+        // one pass to fault the buffers in
+        q4_k::dequantize(&raw, &mut w);
+        matvec(&w, &x, &mut h).expect("warm");
+        std::hint::black_box(&h);
+
+        let n = 5usize;
+        let (mut deq, mut mv) = (0.0f64, 0.0f64);
+        for _ in 0..n {
+            let t = std::time::Instant::now();
+            for _ in 0..3 {
+                q4_k::dequantize(&raw, &mut w);
+            }
+            deq += t.elapsed().as_secs_f64();
+            let t = std::time::Instant::now();
+            matvec(&w, &x, &mut h).expect("gate");
+            std::hint::black_box(&h);
+            matvec(&w, &x, &mut h).expect("up");
+            std::hint::black_box(&h);
+            matvec(&w, &h, &mut out).expect("down");
+            std::hint::black_box(&out);
+            mv += t.elapsed().as_secs_f64();
+        }
+        let (deq, mv) = (deq / n as f64, mv / n as f64);
+        let rec = 3 * per;
+        println!();
+        println!("one expert record, {:.2} MB, 25.2 M weights, single thread:", rec as f64 / 1e6);
+        println!("  dequantise      {:8.2} ms   ({:.1} GB/s of Q4_K in)", deq * 1e3, rec as f64 / deq / 1e9);
+        println!("  three matvecs   {:8.2} ms", mv * 1e3);
+        println!("  total           {:8.2} ms", (deq + mv) * 1e3);
+        println!("  over 32 threads {:8.2} ms   (perfect scaling, which it will not get)", (deq + mv) * 1e3 / 32.0);
+        println!();
+        println!("The f32 detour is most of it: dequantising writes {:.0} MB and the", 3.0 * (n_embd * n_ff) as f64 * 4.0 / 1e6);
+        println!("matvecs read it back. A fused Q4_K dot would touch the {:.1} MB once.", rec as f64 / 1e6);
+        println!("to beat: a PCIe upload of the same record, 1.3 ms over x4");
+        println!("budget: 20 tok/s over 42 layers is 1.19 ms a layer, for every");
+        println!("routed expert of that layer not already resident in VRAM");
+        assert!(deq > 0.0 && mv > 0.0);
+    }
+
+    /// Why the trunk costs what it does: [`Mat::apply`] round-trips the host on
+    /// every matrix.
+    ///
+    /// `to_device` uploads x, `linear` launches, `to_host` synchronises. If a
+    /// 1x64 matvec costs about what a 4096x4096 one costs, the trunk is not
+    /// doing arithmetic, it is paying driver latency — the same 35-50 us per
+    /// synchronisation on Windows that `dsv41-cuda/src/handoff.rs` was written
+    /// to avoid.
+    ///
+    /// The trunk runs about 710 of these per token (9 per KDA layer, 8 per MLA
+    /// layer, 2 hyper-connection mixes, the router and shared expert, the head).
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "measures device round-trip latency"]
+    fn measure_mat_apply_latency() {
+        let Some(backend) = cuda_backend() else { return };
+        println!();
+        println!("     shape        per apply     implied GB/s of weights");
+        for &(o, k) in &[(1usize, 64usize), (64, 64), (512, 512), (2048, 4096), (4096, 4096)] {
+            let raw: Vec<f32> = (0..o * k).map(|i| ((i % 19) as f32 - 9.0) / 9.0).collect();
+            let w = Weight::Dense(backend.to_device(Tensor::from_vec(raw, vec![o, k])));
+            let m = Mat::Device { w: &w, backend: &*backend };
+            let x: Vec<f32> = (0..k).map(|i| ((i % 7) as f32 - 3.0) / 3.0).collect();
+            let mut out = vec![0.0f32; o];
+            m.apply(&x, &mut out).expect("warm");
+
+            let n = 200usize;
+            let t = std::time::Instant::now();
+            for _ in 0..n {
+                m.apply(&x, &mut out).expect("apply");
+            }
+            let per = t.elapsed().as_secs_f64() / n as f64;
+            println!(
+                "  {:5} x {:5}   {:7.1} us    {:8.1}",
+                o,
+                k,
+                per * 1e6,
+                (o * k * 4) as f64 / per / 1e9
+            );
+        }
+        println!();
+        println!("A trunk token is about 710 of these. Multiply the small-matrix");
+        println!("number by 710 to see the floor that latency alone imposes.");
+    }
+
+    /// The trunk floor: a token with the routed experts stubbed out to zeros.
+    ///
+    /// 20 tok/s is 50 ms a token. Whatever attention, the shared expert, the
+    /// hyper-connections and the head cost comes off that before a single
+    /// routed expert is fetched, so this bounds everything else.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "needs the released model on disk; measures the trunk"]
+    fn measure_trunk_floor() {
+        struct Zeros;
+        impl ExpertFfn for Zeros {
+            fn apply(
+                &self,
+                _ord: usize,
+                _e: usize,
+                _x: &[f32],
+                _limit: f32,
+                out: &mut [f32],
+            ) -> Result<()> {
+                out.fill(0.0);
+                Ok(())
+            }
+        }
+
+        let Some(backend) = cuda_backend() else { return };
+        let m = DeviceModel::open_with_cache(RELEASED, 512, backend.clone(), 8 << 30).expect("load");
+        let sh = m.shape().clone();
+        let zeros = Zeros;
+        let w = m.view_with_experts(&zeros);
+        let mut st = forward::State::new(&sh).expect("state");
+        let _ = forward::forward_token(&sh, &w, &mut st, 154822).expect("warmup");
+
+        let n = 8usize;
+        let t = std::time::Instant::now();
+        for i in 0..n {
+            let _ = forward::forward_token(&sh, &w, &mut st, 1000 + i as u32).expect("trunk");
+        }
+        let trunk = t.elapsed().as_secs_f64() / n as f64;
+        let n_moe = sh.n_layer - sh.n_dense_lead;
+
+        // Where it went. One more token, profiled.
+        forward::prof::reset();
+        let _ = forward::forward_token(&sh, &w, &mut st, 2000).expect("profiled");
+        println!();
+        println!("one trunk token by phase (routed experts stubbed to zeros):");
+        for (name, c) in forward::prof::all() {
+            let v = forward::prof::ms(&c);
+            println!("  {:32} {:7.1} ms   {:4.1}%", name, v, 100.0 * v / forward::prof::total_ms());
+        }
+        println!("  {:32} {:7.1} ms", "accounted for", forward::prof::total_ms());
+        println!();
+        println!("inside the two attention kinds:");
+        for (name, c) in forward::prof::inner() {
+            println!("  {:32} {:7.1} ms", name, forward::prof::ms(&c));
+        }
+        let n_kda = sh.layer_kinds[..sh.n_layer].iter().filter(|k| matches!(k, crate::glm5next::LayerKind::Kda)).count();
+        let n_mla = sh.n_layer - n_kda;
+        println!();
+        println!("shapes: n_embd {}, n_head {}, kda_head_dim {}, d_inner {}", sh.n_embd, sh.n_head, sh.kda_head_dim, sh.d_inner());
+        println!("        kv_lora {}, qk_head {}, v_head {}, q_lora {}", sh.kv_lora, sh.qk_head, sh.v_head, sh.q_lora);
+        println!("        {} KDA layers, {} MLA layers", n_kda, n_mla);
+        println!("host f32 weights read per token, per MLA layer:");
+        println!("        k_b {:.1} MB, v_b {:.1} MB", (sh.n_head * sh.kv_lora * sh.qk_head * 4) as f64 / 1e6, (sh.n_head * sh.v_head * sh.kv_lora * 4) as f64 / 1e6);
+        println!("KDA recurrent state per layer: {:.1} MB", (sh.n_head * sh.kda_head_dim * sh.kda_head_dim * 4) as f64 / 1e6);
+
+        println!();
+        println!("trunk only        {:7.1} ms a token   ({:.1} tok/s if experts were free)", trunk * 1e3, 1.0 / trunk);
+        println!("budget, 20 tok/s  {:7.1} ms a token", 50.0);
+        let left = 0.050 - trunk;
+        if left > 0.0 {
+            println!("left for experts  {:7.1} ms, over {} MoE layers = {:.2} ms a layer", left * 1e3, n_moe, left * 1e3 / n_moe as f64);
+        } else {
+            println!("left for experts  none: the trunk alone is over budget by {:.1} ms", -left * 1e3);
+        }
+        assert!(trunk > 0.0);
     }
 
     /// Decode throughput, cold cache then warm.

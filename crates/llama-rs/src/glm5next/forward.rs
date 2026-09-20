@@ -526,13 +526,16 @@ fn kda_layer(
     let cd = 3 * di;
 
     // q‖k‖v from the layer input.
+    let t = std::time::Instant::now();
     let mut qkv = vec![0.0f32; cd];
     w.q.apply(x, &mut qkv[0..di])?;
     w.k.apply(x, &mut qkv[di..2 * di])?;
     w.v.apply(x, &mut qkv[2 * di..cd])?;
+    prof::add(&prof::KDA_PROJ, t);
 
     // One depthwise conv over the whole concatenation, SiLU on its output (not
     // on the projections). The three weights concatenate in q, k, v order.
+    let t = std::time::Instant::now();
     let mut conv_out = vec![0.0f32; cd];
     for c in 0..cd {
         let (third, ch) = (c / di, c % di);
@@ -559,6 +562,8 @@ fn kda_layer(
         }
     }
 
+    prof::add(&prof::KDA_CONV, t);
+
     let mut q: Vec<f32> = conv_out[0..di].to_vec();
     let mut k: Vec<f32> = conv_out[di..2 * di].to_vec();
     let v: Vec<f32> = conv_out[2 * di..cd].to_vec();
@@ -572,6 +577,7 @@ fn kda_layer(
     // g = lower_bound * sigmoid(-(ssm_a * (f_b(f_a(x)) + dt_bias))), per channel.
     // `ssm_a` holds -exp(A_log), so the negation inside the sigmoid recovers the
     // reference's `sigmoid(exp(A_log) * ...)`.
+    let t = std::time::Instant::now();
     let mut fa = vec![0.0f32; hd];
     w.f_a.apply(x, &mut fa)?;
     let mut g_log = vec![0.0f32; di];
@@ -590,8 +596,12 @@ fn kda_layer(
         *b = sigmoid(*b);
     }
 
+    prof::add(&prof::KDA_GATE, t);
+
+    let t = std::time::Instant::now();
     let mut scan = vec![0.0f32; di];
     kda::step(state, &q, &k, &v, &g_log, &beta, nh, hd, &mut scan)?;
+    prof::add(&prof::KDA_STEP, t);
 
     // Per-head RMSNorm by ssm_norm, gated by a PLAIN sigmoid of g_b(g_a(x)) --
     // not the SiLU a FusedRMSNormGated would default to.
@@ -626,9 +636,12 @@ fn mla_layer(
     let len = pos + 1;
 
     // (a) the shared query root.
+    let t = std::time::Instant::now();
     let mut qr = vec![0.0f32; sh.q_lora];
     w.q_a.apply(x, &mut qr)?;
     rms_norm(&mut qr, w.q_a_norm, sh.rms_eps)?;
+    prof::add(&prof::MLA_PROJ, t);
+    let t_ix = std::time::Instant::now();
 
     // (b) store this cell's indexer key and compressor gate. Unconditional: the
     // reference stores on the dense path too, or cells written below the
@@ -693,7 +706,10 @@ fn mla_layer(
             None
         };
 
+    prof::add(&prof::MLA_INDEX, t_ix);
+
     // (e) the latent, cached before attending so the token sees itself.
+    let t = std::time::Instant::now();
     let mut latent = vec![0.0f32; sh.kv_lora];
     w.kv_a_mqa.apply(x, &mut latent)?;
     rms_norm(&mut latent, w.kv_a_norm, sh.rms_eps)?;
@@ -702,12 +718,16 @@ fn mla_layer(
     // (f) absorbed attention over the candidate set.
     let mut q = vec![0.0f32; nh * sh.qk_head];
     w.q_b.apply(&qr, &mut q)?;
+    prof::add(&prof::MLA_PROJ, t);
+    let t = std::time::Instant::now();
     let mut q_abs = vec![0.0f32; nh * sh.kv_lora];
     mla::absorb_query(w.k_b, &q, nh, sh.kv_lora, sh.qk_head, &mut q_abs)?;
+    prof::add(&prof::MLA_ABSORB, t);
 
     let mut mask = vec![0.0f32; len];
     mla::attn_mask(pos, len, r, selected.as_deref(), &mut mask)?;
 
+    let t = std::time::Instant::now();
     let mut attn = vec![0.0f32; nh * sh.v_head];
     mla::attend(
         &q_abs,
@@ -721,6 +741,7 @@ fn mla_layer(
         len,
         &mut attn,
     )?;
+    prof::add(&prof::MLA_ATTEND, t);
 
     w.out.apply(&attn, out)
 }
@@ -789,6 +810,89 @@ fn ffn_layer(sh: &Shape, w: &FfnW<'_>, il: usize, x: &[f32], out: &mut [f32]) ->
 /// Run one token through the trunk and return its logits, advancing `state`.
 ///
 /// `state.len` must be the token's position, and grows by one on success.
+/// Wall time per phase of a forward pass, so a slow token can be attributed
+/// rather than guessed at.
+///
+/// Always compiled: it is one [`std::time::Instant::now`] per phase per layer,
+/// about 250 calls a token against a token measured in milliseconds. Nothing
+/// synchronises the device here, so a phase that only launches kernels will
+/// look cheap and the phase that next reads a result will carry the wait --
+/// which is the honest picture for a host-driven forward, where every
+/// [`Mat::apply`] reads its own result back.
+pub mod prof {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Nanoseconds in each phase since the last [`reset`].
+    pub static HC: AtomicU64 = AtomicU64::new(0);
+    pub static KDA: AtomicU64 = AtomicU64::new(0);
+    pub static MLA: AtomicU64 = AtomicU64::new(0);
+    pub static FFN: AtomicU64 = AtomicU64::new(0);
+    pub static HEAD: AtomicU64 = AtomicU64::new(0);
+
+    /// Inside [`KDA`]: the projections, the depthwise conv and its state shift,
+    /// the decay gate, and the delta-rule recurrence.
+    pub static KDA_PROJ: AtomicU64 = AtomicU64::new(0);
+    pub static KDA_CONV: AtomicU64 = AtomicU64::new(0);
+    pub static KDA_GATE: AtomicU64 = AtomicU64::new(0);
+    pub static KDA_STEP: AtomicU64 = AtomicU64::new(0);
+
+    /// Inside [`MLA`]: the projections, the sparse indexer, the query absorb
+    /// through `k_b`, and the attention through `v_b`.
+    pub static MLA_PROJ: AtomicU64 = AtomicU64::new(0);
+    pub static MLA_INDEX: AtomicU64 = AtomicU64::new(0);
+    pub static MLA_ABSORB: AtomicU64 = AtomicU64::new(0);
+    pub static MLA_ATTEND: AtomicU64 = AtomicU64::new(0);
+
+    /// The five top-level phases, in forward order. These sum to the token.
+    pub fn all() -> [(&'static str, &'static AtomicU64); 5] {
+        [
+            ("hyper-connections", &HC),
+            ("KDA attention", &KDA),
+            ("MLA attention", &MLA),
+            ("FFN (router, shared, routed)", &FFN),
+            ("output head", &HEAD),
+        ]
+    }
+
+    /// Sub-phases of [`KDA`] and [`MLA`]. These sum to less than their parents:
+    /// what is left over is the projections and glue not counted here.
+    pub fn inner() -> [(&'static str, &'static AtomicU64); 8] {
+        [
+            ("  KDA q/k/v projections", &KDA_PROJ),
+            ("  KDA depthwise conv + shift", &KDA_CONV),
+            ("  KDA decay gate", &KDA_GATE),
+            ("  KDA delta-rule recurrence", &KDA_STEP),
+            ("  MLA projections", &MLA_PROJ),
+            ("  MLA sparse indexer", &MLA_INDEX),
+            ("  MLA absorb through k_b", &MLA_ABSORB),
+            ("  MLA attend through v_b", &MLA_ATTEND),
+        ]
+    }
+
+    pub fn reset() {
+        for (_, c) in all() {
+            c.store(0, Ordering::Relaxed);
+        }
+        for (_, c) in inner() {
+            c.store(0, Ordering::Relaxed);
+        }
+    }
+
+    /// Add the time since `t` to `c`.
+    pub fn add(c: &AtomicU64, t: std::time::Instant) {
+        c.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    pub fn ms(c: &AtomicU64) -> f64 {
+        c.load(Ordering::Relaxed) as f64 / 1e6
+    }
+
+    /// Total over every phase.
+    pub fn total_ms() -> f64 {
+        all().iter().map(|(_, c)| ms(c)).sum()
+    }
+}
+
 pub fn forward_token(
     sh: &Shape,
     w: &ModelW<'_>,
@@ -836,18 +940,23 @@ pub fn forward_token(
         let lw = &w.layers[il];
 
         // --- attention half -------------------------------------------------
+        let t_hc = std::time::Instant::now();
         let residual = stream.clone();
         let mix = hc_mixes(&stream, &lw.hc_attn, sh)?;
         let mut cur = hc::collapse(&stream, &mix.pre);
         rms_norm(&mut cur, lw.attn_norm, sh.rms_eps)?;
+        prof::add(&prof::HC, t_hc);
 
         match &lw.attn {
             AttnW::Kda(kw) => {
+                let t = std::time::Instant::now();
                 let ord = sh.kda_ordinal(il);
                 let (kst, cst) = (&mut state.kda[ord], &mut state.conv[ord]);
                 kda_layer(sh, kw, kst, cst, &cur, &mut sub_out)?;
+                prof::add(&prof::KDA, t);
             }
             AttnW::Mla(mw) => {
+                let t = std::time::Instant::now();
                 let ord = sh.mla_ordinal(il);
                 // Split the borrow: latents is per-layer, kpool is shared.
                 let lat = &mut state.latents[ord];
@@ -861,8 +970,10 @@ pub fn forward_token(
                     &cur,
                     &mut sub_out,
                 )?;
+                prof::add(&prof::MLA, t);
             }
         }
+        let t_hc = std::time::Instant::now();
         stream = hc::combine(&sub_out, &residual, &mix);
 
         // --- FFN half -------------------------------------------------------
@@ -870,18 +981,25 @@ pub fn forward_token(
         let mix = hc_mixes(&stream, &lw.hc_ffn, sh)?;
         let mut cur = hc::collapse(&stream, &mix.pre);
         rms_norm(&mut cur, lw.ffn_norm, sh.rms_eps)?;
+        prof::add(&prof::HC, t_hc);
 
+        let t = std::time::Instant::now();
         ffn_layer(sh, &lw.ffn, il, &cur, &mut sub_out)?;
+        prof::add(&prof::FFN, t);
+        let t_hc = std::time::Instant::now();
         stream = hc::combine(&sub_out, &residual, &mix);
+        prof::add(&prof::HC, t_hc);
     }
 
     // The trunk collapses with an UNWEIGHTED mean, not DeepSeek-V4.1's learned
     // gated head; glm5next ships no hc_head_* tensors.
+    let t = std::time::Instant::now();
     let mut x = hc::mean(&stream);
     rms_norm(&mut x, w.output_norm, sh.rms_eps)?;
 
     let mut logits = vec![0.0f32; sh.n_vocab];
     w.output.apply(&x, &mut logits)?;
+    prof::add(&prof::HEAD, t);
 
     state.len = pos + 1;
     Ok(logits)
