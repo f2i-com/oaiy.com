@@ -7,7 +7,10 @@
 //! Defaults: 4096 tokens in chunks of 1024 on cuda:1,0. Environment as for
 //! the generate example (DSV41_MODEL, DSV41_GOLDEN_DIR, DSV41_RAM_GB,
 //! DSV41_USAGE); DSV41_RUNS repeats the prompt (the later runs show warm
-//! caches); DSV41_PROFILE adds a per-phase breakdown (with extra syncs);
+//! caches); DSV41_PROFILE adds a per-phase breakdown, whose syncs both slow
+//! the pass and move time between its lines — the uploads it reports read
+//! 24s where the same pass unprofiled reports 32.5s, so compare a profiled
+//! run only with another profiled run;
 //! DSV41_WAIT_WARM=1 lets the background RAM fill finish first (a server
 //! that has been up a while); DSV41_HEADROOM_GB sets the VRAM kept for
 //! activations (default 2, as nrob-server's).

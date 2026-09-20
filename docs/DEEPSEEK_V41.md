@@ -446,6 +446,19 @@ Measured (both GPUs, 140 GB RAM tier):
 
 - **The SSD is the wall, and it is thermal.** `bench_ssd` reads 1.7–2.0 GB/s for the
   first ~15–20 GB, then settles at **0.51 GB/s**.
+  - It recovers completely: after ~8 minutes idle the same drive reads **1.94 GB/s at
+    queue depth 1 and 2.89 GB/s at depth 8** again (2026-09-20). Back-to-back runs
+    measure a throttled drive, not the model.
+- **PCIe width is not the prefill limiter (2026-09-20).** Both cards had trained
+  narrow — GPU 0 at x2, GPU 1 at x4 — from GPU sag; laying the case on its side took
+  them to x4 and x8. The same 16,800-token layered pass from the T9 ran **151.8 s
+  before and 150.0 s after**, with uploads 32.7 s → 32.5 s. A pass uploads ~165 GB in
+  ~32 s, about 5 GB/s aggregate, where even the narrow links carried ~24 GB/s: the
+  uploads are bound by the host side (RAM-tier reads, staging, per-record overhead),
+  not by the bus. Measure host-side work before spending anything on lanes.
+  - Two traps when re-measuring: `DSV41_MODEL` defaults to the internal drive while
+    these numbers come from the T9 (`D:\deepseek\model`), and `DSV41_PROFILE` moves
+    time between the lines it prints (see `prefill_bench`'s header).
   - A 1,024-token chunk touches nearly all 15,360 experts: 8,683 SSD reads (163 GB),
     286 s, **3.6 tok/s**.
 - **Layered prefill:** 5,560 tokens (a harness-style system prompt with tools) in
