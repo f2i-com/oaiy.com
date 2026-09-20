@@ -466,6 +466,259 @@ mod tests {
         assert!(a.iter().any(|&v| v.abs() > 1e-6));
     }
 
+    // --- CUDA -------------------------------------------------------------
+    // These are the same checks as above, on a real device. They skip rather
+    // than fail when no GPU is reachable, matching how ggml-rs-cuda gates its
+    // own tests.
+
+    #[cfg(feature = "cuda")]
+    fn cuda_backend() -> Option<Arc<dyn Backend>> {
+        match ggml_rs_cuda::CudaBackend::new(0) {
+            Ok(b) => Some(Arc::new(b) as Arc<dyn Backend>),
+            Err(e) => {
+                eprintln!("no CUDA device ({e}); skipping");
+                None
+            }
+        }
+    }
+
+    /// The `Mat` seam on an actual GPU: a device matmul must agree with the host
+    /// dot product. If this drifts, every glm5next number on CUDA is suspect.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn matrices_agree_on_cuda() {
+        let Some(backend) = cuda_backend() else { return };
+        let (out_dim, in_dim) = (64usize, 128usize);
+        let raw: Vec<f32> = (0..out_dim * in_dim)
+            .map(|i| ((i * 37 % 199) as f32 - 99.0) / 99.0)
+            .collect();
+        let x: Vec<f32> = (0..in_dim).map(|i| ((i % 31) as f32 - 15.0) / 15.0).collect();
+
+        let mut host = vec![0.0f32; out_dim];
+        Mat::Host(&raw).apply(&x, &mut host).expect("host");
+
+        let w = Weight::Dense(
+            backend.to_device(Tensor::from_vec(raw.clone(), vec![out_dim, in_dim])),
+        );
+        let mut dev = vec![0.0f32; out_dim];
+        Mat::Device { w: &w, backend: &*backend }
+            .apply(&x, &mut dev)
+            .expect("cuda");
+
+        let mut worst = 0.0f32;
+        for (a, b) in host.iter().zip(dev.iter()) {
+            worst = worst.max((a - b).abs());
+        }
+        println!("cuda vs host, {out_dim}x{in_dim}: max diff {worst:.3e}");
+        assert!(worst < 1e-3, "cuda disagrees with host by {worst}");
+        assert!(host.iter().any(|v| v.abs() > 1e-6));
+    }
+
+    /// A quantised expert upload, on the GPU: the path a routed expert takes
+    /// every dispatch.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "needs the released model on disk"]
+    fn a_real_expert_runs_on_cuda() {
+        let Some(backend) = cuda_backend() else { return };
+        let g = GgufFile::open_streaming(RELEASED).expect("open");
+        let cfg = ModelConfig::from_gguf(&g).expect("cfg");
+        let glm = Glm5NextConfig::from_gguf(&g, &cfg).expect("glm");
+
+        let dev = DeviceExperts::new(
+            &g,
+            backend,
+            glm.n_dense_lead,
+            4,
+            glm.n_expert,
+            glm.n_ff_exp,
+            cfg.embedding_dim,
+        )
+        .expect("device experts");
+        let host = super::super::bridge::GgufExperts::new(
+            &g,
+            glm.n_dense_lead,
+            4,
+            glm.n_expert,
+            glm.n_ff_exp,
+            cfg.embedding_dim,
+        )
+        .expect("host experts");
+
+        let x: Vec<f32> = (0..cfg.embedding_dim)
+            .map(|i| ((i % 17) as f32 - 8.0) / 80.0)
+            .collect();
+        let mut a = vec![0.0f32; cfg.embedding_dim];
+        let mut b = vec![0.0f32; cfg.embedding_dim];
+
+        for (ord, e) in [(0usize, 0usize), (2, 150)] {
+            dev.apply(ord, e, &x, 10.0, &mut a).expect("cuda expert");
+            host.apply(ord, e, &x, 10.0, &mut b).expect("host expert");
+            let worst = a
+                .iter()
+                .zip(b.iter())
+                .fold(0.0f32, |m, (p, q)| m.max((p - q).abs()));
+            let scale = b.iter().fold(0.0f32, |m, q| m.max(q.abs()));
+            println!("expert ({ord}, {e}): max diff {worst:.3e}, scale {scale:.3e}");
+            assert!(a.iter().all(|v| v.is_finite()));
+            assert!(
+                worst <= 1e-3 * scale.max(1.0),
+                "cuda expert differs from host by {worst} at scale {scale}"
+            );
+        }
+    }
+
+    /// The whole model on the GPU, and its logits against the host reference.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "needs the released model on disk; loads it twice"]
+    fn released_model_agrees_with_host_on_cuda() {
+        use super::super::bridge::HostModel;
+        let Some(backend) = cuda_backend() else { return };
+
+        let t0 = std::time::Instant::now();
+        let dm = DeviceModel::open(RELEASED, 512, backend).expect("cuda load");
+        println!(
+            "cuda load in {:.1}s, backend {}",
+            t0.elapsed().as_secs_f64(),
+            dm.backend_name()
+        );
+        let ds = dm.shape().clone();
+        let dv = dm.view();
+        let mut d_state = forward::State::new(&ds).expect("state");
+        let t1 = std::time::Instant::now();
+        let d = forward::forward_token(&ds, &dv, &mut d_state, 154822).expect("cuda forward");
+        let cuda_secs = t1.elapsed().as_secs_f64();
+        println!("cuda: one token in {cuda_secs:.1}s");
+        drop(dv);
+        drop(dm);
+
+        let hm = HostModel::open(RELEASED, 512).expect("host load");
+        let hs = hm.shape().clone();
+        let hv = hm.view();
+        let mut h_state = forward::State::new(&hs).expect("state");
+        let t2 = std::time::Instant::now();
+        let h = forward::forward_token(&hs, &hv, &mut h_state, 154822).expect("host forward");
+        println!("host: one token in {:.1}s", t2.elapsed().as_secs_f64());
+
+        assert_eq!(h.len(), d.len());
+        let worst = h
+            .iter()
+            .zip(d.iter())
+            .fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
+        let scale = h.iter().fold(0.0f32, |m, a| m.max(a.abs()));
+        let n = h.len();
+        println!("max |host - cuda| over {n} logits: {worst:.5} (scale {scale:.3})");
+        assert!(d.iter().all(|v| v.is_finite()), "cuda logits must be finite");
+        // Same dequantised bytes either side; only accumulation order differs.
+        assert!(
+            worst < 0.05 * scale.max(1.0),
+            "cuda and host disagree by {worst} at scale {scale}"
+        );
+    }
+
+    /// Greedy generation on the GPU, with the real tokenizer and chat format.
+    ///
+    /// This is the strongest end-to-end signal short of a numerical diff against
+    /// llama.cpp: coherent text means the layer map, both attention kinds, the
+    /// routing, the hyper-connections and the KDA recurrence are all essentially
+    /// right, because almost any error in them degrades into noise.
+    ///
+    /// Note `max_len` of 512 is below the indexer threshold
+    /// (`n_select` = 2051), so attention takes the **dense** path here — the same
+    /// choice llama.cpp makes at this context size. The sparse path needs a
+    /// longer context to engage.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "needs the released model on disk; generates on the GPU"]
+    fn generates_text_on_cuda() {
+        use crate::chat::{apply_chat_template, chat_stop_tokens, ChatMessage, Role};
+        use crate::config::Architecture;
+
+        let Some(backend) = cuda_backend() else { return };
+        let g = GgufFile::open_streaming(RELEASED).expect("open");
+        let tok = tokenizer::Tokenizer::from_gguf(&g).expect("tokenizer");
+        let t0 = std::time::Instant::now();
+        let m = DeviceModel::from_gguf(&g, 512, backend).expect("load");
+        println!("load {:.1}s on {}", t0.elapsed().as_secs_f64(), m.backend_name());
+
+        let sh = m.shape().clone();
+        let w = m.view();
+        let mut st = forward::State::new(&sh).expect("state");
+
+        let msgs = [ChatMessage {
+            role: Role::User,
+            content: "What is the capital of France? Answer in one short sentence.".to_string(),
+        }];
+        let prompt = apply_chat_template(&Architecture::Glm5Next, &msgs, true);
+        let ids = tok.encode(&prompt, false).expect("encode");
+        println!("prompt: {} tokens", ids.len());
+        assert!(!ids.is_empty(), "the chat template must tokenize");
+
+        let argmax = |v: &[f32]| -> u32 {
+            let mut best = f32::NEG_INFINITY;
+            let mut bi = 0usize;
+            for (i, &x) in v.iter().enumerate() {
+                if x > best {
+                    best = x;
+                    bi = i;
+                }
+            }
+            bi as u32
+        };
+
+        let t1 = std::time::Instant::now();
+        let mut logits = Vec::new();
+        for &t in &ids {
+            logits = forward::forward_token(&sh, &w, &mut st, t).expect("prefill");
+        }
+        println!(
+            "prefill {:.1}s ({:.2}s/token)",
+            t1.elapsed().as_secs_f64(),
+            t1.elapsed().as_secs_f64() / ids.len() as f64
+        );
+
+        let stops: Vec<u32> = chat_stop_tokens(&Architecture::Glm5Next)
+            .iter()
+            .filter_map(|s| tok.token_id(s))
+            .collect();
+        println!("stop ids: {stops:?}");
+
+        let t2 = std::time::Instant::now();
+        let mut produced: Vec<u32> = Vec::new();
+        for _ in 0..24 {
+            let next = argmax(&logits);
+            if stops.contains(&next) {
+                println!("(stop token {next})");
+                break;
+            }
+            produced.push(next);
+            logits = forward::forward_token(&sh, &w, &mut st, next).expect("decode");
+        }
+        let secs = t2.elapsed().as_secs_f64();
+        println!(
+            "decode {:.1}s for {} tokens ({:.2}s/token)",
+            secs,
+            produced.len(),
+            secs / produced.len().max(1) as f64
+        );
+
+        let text = tok.decode(&produced);
+        println!("--- generated ---");
+        println!("{text}");
+        println!("--- end ---");
+
+        assert!(!produced.is_empty(), "nothing was generated");
+        // Degenerate output is the failure mode worth catching: a single token
+        // repeated means the state or the routing is not advancing.
+        let distinct: std::collections::BTreeSet<u32> = produced.iter().copied().collect();
+        assert!(
+            distinct.len() > 1,
+            "generation collapsed to one repeated token: {produced:?}"
+        );
+        assert!(!text.is_empty(), "detokenized to nothing");
+    }
+
     /// The released model, with its matrices on the backend. On a CUDA build this
     /// is the GPU path; on a CPU build it exercises the same plumbing.
     #[test]
