@@ -140,34 +140,53 @@ fn gemma4_template(messages: &[ChatMessage], add_assistant: bool) -> String {
 
 // VENDORED-LOCAL: GLM-5.3-Flash.
 /// GLM-5.3-Flash (`glm5next`). `[gMASK]<sop>` opens the sequence, then each turn
-/// is a role marker followed by a newline and the content, with no closing
-/// marker — a turn ends where the next role marker begins.
+/// is a role marker followed **directly** by its content — no separator.
 ///
-/// Token ids, from this model's own vocab: `[gMASK]` 154822, `<sop>` 154824,
+/// Transcribed from the GGUF `tokenizer.chat_template`, after a generation run
+/// showed the model emitting a bare `</think>`. Three things that template does
+/// which are easy to get wrong:
+///
+///   * **The generation prompt pre-fills the thinking block.** It ends
+///     `<|assistant|>{{- '<think>' -}}`, so the assistant turn opens *inside*
+///     `<think>`. Omitting it makes a reasoning model close a block nobody
+///     opened, which is exactly the stray `</think>` that found this.
+///   * **No newline after a role marker.** The template is
+///     `<|user|>{{ visible_text(m.content) }}`, not `<|user|>''...`.
+///   * **A reasoning-effort preamble.** `effective_reasoning_effort` defaults to
+///     `max` when the caller does not set it, and is emitted as
+///     `<|system|>Reasoning Effort: Max`.
+///
+/// Token ids, from this model own vocab: `[gMASK]` 154822, `<sop>` 154824,
 /// `<|system|>` 154826, `<|user|>` 154827, `<|assistant|>` 154828,
-/// `<|observation|>` 154829.
+/// `<|observation|>` 154829, `<think>` 154841, `</think>` 154842.
 ///
-/// **Not yet emitted**, all of which the GGUF's Jinja template can produce:
-/// the `<|system|>Reasoning Effort: {Low,High,Max}` preamble, the `# Tools`
-/// system block with `<tools>` signatures, and `<think>` / `</think>` (154841 /
-/// 154842) reasoning spans. Plain chat is exact without them; tool calling and
-/// reasoning-effort control are not.
+/// **Not yet emitted**: the `# Tools` system block with `<tools>` signatures, and
+/// a caller-selectable reasoning effort (this always requests the default,
+/// `Max`). A prior assistant turn is given an empty `<think></think>` pair, which
+/// is what the template does when that turn carries no `reasoning_content`.
 fn glm5next_template(messages: &[ChatMessage], add_assistant: bool) -> String {
     let mut out = String::with_capacity(
         messages.iter().map(|m| m.content.len()).sum::<usize>() + 128,
     );
     out.push_str("[gMASK]<sop>");
+    // The template emits this whenever an effort is set, and the default is max.
+    out.push_str("<|system|>Reasoning Effort: Max");
     for m in messages {
-        out.push_str(match m.role {
-            Role::System    => "<|system|>",
-            Role::User      => "<|user|>",
-            Role::Assistant => "<|assistant|>",
-        });
-        out.push('\n');
+        match m.role {
+            Role::System => out.push_str("<|system|>"),
+            Role::User => out.push_str("<|user|>"),
+            Role::Assistant => {
+                out.push_str("<|assistant|>");
+                // A history turn with no recorded reasoning gets an empty pair.
+                out.push_str("<think></think>");
+            }
+        }
         out.push_str(&m.content);
     }
     if add_assistant {
-        out.push_str("<|assistant|>\n");
+        // The opener the template pre-fills, so the model continues inside the
+        // thinking block instead of closing one that was never opened.
+        out.push_str("<|assistant|><think>");
     }
     out
 }
@@ -297,6 +316,49 @@ fn fallback_template(messages: &[ChatMessage], add_assistant: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // VENDORED-LOCAL: GLM-5.3-Flash.
+    /// Golden strings for the glm5next chat format.
+    ///
+    /// **These were rendered from the GGUF own `tokenizer.chat_template`** with
+    /// Jinja (`jinja2`, with the `loopcontrols` extension the template needs for
+    /// its `break`) and compared byte for byte, so this is a check against the
+    /// reference rather than against itself.
+    ///
+    /// A generation run is what prompted it: the model emitted a bare `</think>`,
+    /// which turned out to be three separate errors -- a missing pre-filled
+    /// `<think>` opener, a spurious newline after each role marker, and a missing
+    /// reasoning-effort preamble.
+    #[test]
+    fn glm5next_template_matches_the_reference_jinja() {
+        let u = |c: &str| ChatMessage { role: Role::User, content: c.into() };
+        let a = |c: &str| ChatMessage { role: Role::Assistant, content: c.into() };
+        let sy = |c: &str| ChatMessage { role: Role::System, content: c.into() };
+
+        // One user turn, asking for a generation prompt.
+        assert_eq!(
+            apply_chat_template(&Architecture::Glm5Next, &[u("a")], true),
+            "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>a<|assistant|><think>"
+        );
+        // No generation prompt: no assistant opener at all.
+        assert_eq!(
+            apply_chat_template(&Architecture::Glm5Next, &[u("a")], false),
+            "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>a"
+        );
+        // A system turn comes after the effort preamble, not instead of it.
+        assert_eq!(
+            apply_chat_template(&Architecture::Glm5Next, &[sy("S"), u("a")], true),
+            "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>S<|user|>a<|assistant|><think>"
+        );
+        // A history assistant turn carries an empty think pair.
+        assert_eq!(
+            apply_chat_template(&Architecture::Glm5Next, &[u("a"), a("b"), u("c")], true),
+            concat!(
+                "[gMASK]<sop><|system|>Reasoning Effort: Max",
+                "<|user|>a<|assistant|><think></think>b<|user|>c<|assistant|><think>"
+            )
+        );
+    }
 
     #[test]
     fn gemma3_simple_user_assistant() {

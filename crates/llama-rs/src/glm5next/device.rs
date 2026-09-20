@@ -686,7 +686,7 @@ mod tests {
 
         let t2 = std::time::Instant::now();
         let mut produced: Vec<u32> = Vec::new();
-        for _ in 0..24 {
+        for _ in 0..192 {
             let next = argmax(&logits);
             if stops.contains(&next) {
                 println!("(stop token {next})");
@@ -704,11 +704,38 @@ mod tests {
         );
 
         let text = tok.decode(&produced);
+        println!("ids: {produced:?}");
+        for &t in &produced {
+            print!("[{}]", tok.decode(&[t]).escape_debug());
+        }
+        println!();
         println!("--- generated ---");
         println!("{text}");
         println!("--- end ---");
+        println!("(escaped: {})", text.escape_debug());
 
         assert!(!produced.is_empty(), "nothing was generated");
+        // Coherence, robustly: real text is mostly printable ASCII with spaces
+        // between words. Noise from a broken trunk is neither.
+        let printable = text
+            .chars()
+            .filter(|c| c.is_ascii_graphic() || *c == ' ' || *c == '\n')
+            .count();
+        let spaces = text.chars().filter(|c| *c == ' ').count();
+        println!(
+            "{} chars, {printable} printable, {spaces} spaces",
+            text.chars().count()
+        );
+        assert!(
+            printable * 10 >= text.chars().count() * 9,
+            "output should be mostly printable ASCII, got {printable}/{}",
+            text.chars().count()
+        );
+        assert!(
+            spaces * 12 >= text.chars().count(),
+            "output should have word breaks; {spaces} spaces in {} chars looks like noise",
+            text.chars().count()
+        );
         // Degenerate output is the failure mode worth catching: a single token
         // repeated means the state or the routing is not advancing.
         let distinct: std::collections::BTreeSet<u32> = produced.iter().copied().collect();
