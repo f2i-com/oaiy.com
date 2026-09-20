@@ -636,6 +636,59 @@ impl LayerStream {
     // buffer outlives the packed matvec; reconstruction stays zero-copy.
     // VENDORED-LOCAL: pub(crate) so glm5next's device path can reuse the
     // cached reconstruction instead of re-reading and re-uploading per token.
+    // VENDORED-LOCAL: GLM-5.3-Flash. The per-layer resolve, and the only path
+    // that consults the VRAM tier outside `forward_with_logits`.
+    //
+    // `expert_weights` below reconstructs over the *host* record and never looks
+    // at the device cache, so a caller using it directly gets no VRAM tier at
+    // all -- which is what glm5next was doing: sweeping the cache over 0, 8 and
+    // 24 GB moved the warm token by under a millisecond, because nothing was
+    // ever asking it.
+    //
+    // With a device cache attached this mirrors `forward_with_logits`: look every
+    // routed expert up at once (counting hits and misses), batch-prewarm only the
+    // host records the device is missing, stage those uploads on the transfer
+    // stream before the layer's first matvec, then hand back one entry per
+    // expert. A hit costs zero H2D bytes.
+    pub(crate) fn resolve_experts(&self, experts: &[u32]) -> Result<Vec<ResolvedExpert>, String> {
+        #[cfg(feature = "cuda")]
+        if let Some(dc) = self.shared.device_cache() {
+            let mut distinct = experts.to_vec();
+            distinct.sort_unstable();
+            distinct.dedup();
+
+            let mut d = DeviceDispatch::new(dc);
+            if d.eager() {
+                let misses = d.lookup_all(self.layer, &distinct);
+                self.prewarm_host(&misses);
+                d.stage_misses(self, &misses)?;
+            } else {
+                self.prewarm_host(&distinct);
+            }
+
+            let mut out = Vec::with_capacity(experts.len());
+            for &e in experts {
+                match d.resolve(self, e)? {
+                    Some(en) => out.push(ResolvedExpert::Device(en)),
+                    // Staging declined or failed: the host record still works.
+                    None => {
+                        let (pair, down) = self.expert_weights(e)?;
+                        out.push(ResolvedExpert::Host { pair, down });
+                    }
+                }
+            }
+            return Ok(out);
+        }
+        self.prewarm_host(experts);
+        experts
+            .iter()
+            .map(|&e| {
+                self.expert_weights(e)
+                    .map(|(pair, down)| ResolvedExpert::Host { pair, down })
+            })
+            .collect()
+    }
+
     pub(crate) fn expert_weights(&self, e: u32) -> Result<(FfnPair, Weight), String> {
         let layout = self.shared.store.layout();
         let l = self.layer as usize;
@@ -1022,6 +1075,35 @@ impl LayerStream {
 /// this forward, so the cache sees each distinct expert at most once per
 /// layer-forward.
 #[cfg(feature = "cuda")]
+/// VENDORED-LOCAL: GLM-5.3-Flash. One expert of one layer, resolved.
+///
+/// `Device` is a VRAM-cache entry: its tensors are already on the card, so the
+/// matvec launches with zero host-to-device bytes. `Host` is a reconstruction
+/// over the leased RAM record, which is what every dispatch used to be.
+pub(crate) enum ResolvedExpert {
+    #[cfg(feature = "cuda")]
+    Device(Arc<device_cache::DeviceEntry>),
+    Host { pair: FfnPair, down: Weight },
+}
+
+impl ResolvedExpert {
+    pub(crate) fn pair(&self) -> &FfnPair {
+        match self {
+            #[cfg(feature = "cuda")]
+            Self::Device(en) => &en.pair,
+            Self::Host { pair, .. } => pair,
+        }
+    }
+
+    pub(crate) fn down(&self) -> &Weight {
+        match self {
+            #[cfg(feature = "cuda")]
+            Self::Device(en) => &en.down,
+            Self::Host { down, .. } => down,
+        }
+    }
+}
+
 struct DeviceDispatch {
     dc: Arc<device_cache::DeviceCache>,
     leases: std::collections::HashMap<u32, Arc<device_cache::DeviceEntry>>,

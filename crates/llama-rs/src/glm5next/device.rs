@@ -52,7 +52,9 @@ use ggml_rs::{Backend, Tensor};
 use gguf::GgufFile;
 
 use super::bridge::PartRef;
-use crate::expert_stream::{ExpertLayout, GgufExpertStore, LayerStream, StreamShared};
+use crate::expert_stream::{
+    ExpertLayout, GgufExpertStore, LayerStream, ResolvedExpert, StreamShared,
+};
 use super::forward::{
     self, AttnW, Bat, ExpertFfn, FfnW, HcW, IndexerW, KdaW, LayerW, Mat, MlaW, ModelW, MoeW, Shape,
 };
@@ -215,21 +217,11 @@ impl StreamExperts {
         })
     }
 
-    /// One expert FFN, with the input already on the device: the clamp is fused,
-    /// so the gate/up pair never leaves it.
-    fn expert_on_device(
-        &self,
-        ls: &LayerStream,
-        ord: usize,
-        e: u32,
-        xd: &Tensor,
-        limit: f32,
-    ) -> Result<Tensor> {
-        let (pair, down) = ls
-            .expert_weights(e)
-            .map_err(|err| LlamaError::Config(format!("device: expert ({ord}, {e}): {err}")))?;
-        let h = pair.swiglu_clamped(&*self.backend, xd, limit, true);
-        Ok(down.linear(&*self.backend, &h))
+    /// One resolved expert's FFN, input already on the device: the clamp is
+    /// fused, so the gate/up pair never leaves it.
+    fn run_expert(&self, r: &ResolvedExpert, xd: &Tensor, limit: f32) -> Tensor {
+        let h = r.pair().swiglu_clamped(&*self.backend, xd, limit, true);
+        r.down().linear(&*self.backend, &h)
     }
 }
 
@@ -259,14 +251,21 @@ impl ExpertFfn for StreamExperts {
                 self.n_embd
             )));
         }
+        // The whole route at once, so the VRAM tier is consulted for all of it
+        // and the misses are staged in one batch before the first matvec.
+        let ids: Vec<u32> = experts.iter().map(|&(e, _)| e).collect();
+        let resolved = ls
+            .resolve_experts(&ids)
+            .map_err(|err| LlamaError::Config(format!("device: MoE layer {ord}: {err}")))?;
+
         let xd = self
             .backend
             .to_device(Tensor::from_vec(x.to_vec(), vec![1, self.n_embd]));
         let mut acc = self
             .backend
             .to_device(Tensor::from_vec(vec![0.0f32; self.n_embd], vec![1, self.n_embd]));
-        for &(e, wt) in experts {
-            let o = self.expert_on_device(ls, ord, e, &xd, limit)?;
+        for (r, &(_, wt)) in resolved.iter().zip(experts) {
+            let o = self.run_expert(r, &xd, limit);
             self.backend.add_to_axis0_range_scaled(&mut acc, 0, 1, &o, wt);
         }
         let oh = self.backend.to_host(acc);
@@ -293,10 +292,13 @@ impl ExpertFfn for StreamExperts {
         }
         // Cached reconstruction: a hit costs no disk read, and with the VRAM tier
         // on, no upload either.
+        let resolved = ls
+            .resolve_experts(&[e as u32])
+            .map_err(|err| LlamaError::Config(format!("device: expert ({ord}, {e}): {err}")))?;
         let xd = self
             .backend
             .to_device(Tensor::from_vec(x.to_vec(), vec![1, self.n_embd]));
-        let o = self.expert_on_device(ls, ord, e as u32, &xd, limit)?;
+        let o = self.run_expert(&resolved[0], &xd, limit);
         let oh = self.backend.to_host(o);
         if oh.data().len() != out.len() {
             return Err(LlamaError::Config(format!(
@@ -555,6 +557,40 @@ impl DeviceModel {
             }
         }
         w
+    }
+
+    /// What actually ended up on the backend.
+    ///
+    /// `Weight::try_to_device` silently degrades to host residency when the
+    /// device is short of room (that is the point of its safety margin), so a
+    /// load that succeeds says nothing about where the trunk is. Returns
+    /// `(device bytes, host bytes, host-resident names)` over the matrix map and
+    /// the 3-D absorb tensors.
+    pub fn residency(&self) -> (u64, u64, Vec<String>) {
+        let mut on_dev = 0u64;
+        let mut on_host = 0u64;
+        let mut stragglers = Vec::new();
+        let mut note = |name: &str, bytes: u64, dev: bool| {
+            if dev {
+                on_dev += bytes;
+            } else {
+                on_host += bytes;
+                stragglers.push(format!("{name} ({:.1} MB)", bytes as f64 / 1e6));
+            }
+        };
+        for (name, w) in &self.w {
+            let (bytes, dev) = match w {
+                Weight::Dense(t) => (t.numel() as u64 * 4, t.is_device()),
+                Weight::Quant(qt) => (qt.nbytes() as u64, qt.is_device()),
+                // The tied embedding is indexed by row on the host by design.
+                Weight::TiedEmbed(t) => (t.numel() as u64 * 4, t.is_device()),
+            };
+            note(name, bytes, dev);
+        }
+        for (name, t) in &self.b3 {
+            note(name, t.numel() as u64 * 4, t.is_device());
+        }
+        (on_dev, on_host, stragglers)
     }
 
     /// Borrow the weights as the view [`super::forward`] takes.
@@ -1220,6 +1256,21 @@ mod tests {
         let Some(backend) = cuda_backend() else { return };
         let m = DeviceModel::open_with_cache(RELEASED, 512, backend.clone(), 8 << 30).expect("load");
         let sh = m.shape().clone();
+
+        // Where the trunk actually is. A successful load does not mean the
+        // matrices reached the card.
+        let (dev, host, stragglers) = m.residency();
+        println!();
+        println!("trunk residency: {:.2} GB on the backend, {:.2} GB left on the host", dev as f64 / 1e9, host as f64 / 1e9);
+        if stragglers.is_empty() {
+            println!("  every trunk matrix is on the backend");
+        } else {
+            println!("  {} host-resident, first few:", stragglers.len());
+            for n in stragglers.iter().take(6) {
+                println!("    {n}");
+            }
+        }
+
         let zeros = Zeros;
         let w = m.view_with_experts(&zeros);
         let mut st = forward::State::new(&sh).expect("state");
@@ -1292,12 +1343,18 @@ mod tests {
         let t0 = std::time::Instant::now();
         let m = DeviceModel::open_with_cache(RELEASED, 512, backend.clone(), ram).expect("load");
 
-        // VRAM tier. The non-expert matrices already hold ~24 GB of the card, so
-        // only a few GB are left -- about 3% of the 12096 expert records, which
-        // measured as noise. Getting a useful hit rate here needs the second GPU.
+        // VRAM tier. The trunk measures 5.97 GB on the card (see `residency`), so
+        // a 32 GB 5090 has ~25 GB spare -- about 1530 slots at the 16.32 MB a
+        // record needs, 13% of the 12096. Set GLM5_VRAM_GB to sweep it; the point
+        // of the sweep is to find out whether the record uploads are what the
+        // warm token is actually spending its time on.
+        let vram_gb: usize = std::env::var("GLM5_VRAM_GB")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(6);
         match ggml_rs_cuda::CudaBackend::new(0) {
             Ok(dev) => {
-                let vram: usize = 6 << 30;
+                let vram: usize = vram_gb << 30;
                 match m.experts().shared().enable_device_cache(Arc::new(dev), vram) {
                     Ok(()) => println!("VRAM expert cache: {} GB", vram >> 30),
                     Err(e) => println!("VRAM expert cache unavailable: {e}"),
@@ -1352,6 +1409,18 @@ mod tests {
         let warm = t.elapsed().as_secs_f64() / n_cold as f64;
 
         println!();
+        if let Some(st) = m.experts().shared().device_cache_stats() {
+            let n = st.hits + st.misses;
+            println!(
+                "VRAM tier: {} hits / {} lookups = {:.1}%, {:.1} GB served resident, {:.1} GB uploaded, {} evictions",
+                st.hits,
+                n,
+                100.0 * st.hits as f64 / n.max(1) as f64,
+                st.bytes_hit as f64 / 1e9,
+                st.h2d_bytes as f64 / 1e9,
+                st.evictions
+            );
+        }
         println!("cold  {:.3} s/token   ({:.2} tok/s)", cold, 1.0 / cold);
         println!("warm  {:.3} s/token   ({:.2} tok/s)", warm, 1.0 / warm);
         println!("speedup from the cache: {:.2}x", cold / warm);
