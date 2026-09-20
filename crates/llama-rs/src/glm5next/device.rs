@@ -165,6 +165,25 @@ impl ExpertFfn for DeviceExperts {
 /// moving it. So: one a layer, to the miss most likely to be wanted again.
 pub const PROMOTE_PER_LAYER: usize = 1;
 
+/// How many of a layer's VRAM misses to promote into the cache, per token.
+///
+/// A promotion is an upload: 14.16 MB over PCIe, on the critical path, and once
+/// the cache is full it also evicts. At a steady 87.5% hit rate the promotions are
+/// 347 MB a token -- about 20 ms of the routed experts' 47.8 -- and they buy
+/// nothing at the margin, because what they admit is what they evict.
+///
+/// The alternative for a miss is the CPU tier, which measured 0.64 ms a record
+/// against 0.83 ms to upload one, and runs while the GPU works on the resident
+/// experts rather than ahead of it. So the right number here is an empirical
+/// question, and `GLM5_PROMOTE_PER_LAYER` is how it gets asked: 0 leaves the
+/// cache as the prewarm left it and sends every miss to the CPU.
+fn promote_per_layer() -> usize {
+    std::env::var("GLM5_PROMOTE_PER_LAYER")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(PROMOTE_PER_LAYER)
+}
+
 /// Routed experts through `expert_stream`: an LFRU RAM cache, a batched
 /// thread-pool read for a layer's misses, and optionally a VRAM expert cache.
 ///
@@ -720,7 +739,7 @@ impl ExpertFfn for StreamExperts {
         // matvec.
         let ids: Vec<u32> = experts.iter().map(|&(e, _)| e).collect();
         let resolved = match &self.cpu {
-            Some(_) => ls.resolve_experts_hybrid(&ids, PROMOTE_PER_LAYER),
+            Some(_) => ls.resolve_experts_hybrid(&ids, promote_per_layer()),
             None => ls.resolve_experts(&ids),
         }
         .map_err(|err| LlamaError::Config(format!("device: MoE layer {ord}: {err}")))?;

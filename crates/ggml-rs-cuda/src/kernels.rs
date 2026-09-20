@@ -2639,17 +2639,41 @@ __device__ __forceinline__ void moe_q4k_row_accum(float* acc,
             int qs_off = (is >> 1) * 32;
             const unsigned char* qsp = qs_sb + qs_off;
             const float* xp = x + b * 256 + is * 32;
+            // VENDORED-LOCAL: PERF — four weights a load rather than one.
+            //
+            // A sub-block is 32 quant bytes and 32 activations; taken one byte at a
+            // time that is 32 loads, 32 converts and 32 FMAs a thread, and with
+            // `sb_per_thd` sub-blocks each the scalar work is what this kernel is
+            // actually limited by: ~44 G instructions a token against 4.2 GB of
+            // reads the cards could serve in 2.3 ms. `qs` is 32-byte aligned
+            // (`bp + 16` plus a multiple of 32) and `xp` 128-byte aligned, so both
+            // take vector loads.
+            //
+            // The FMAs stay in index order into the same accumulator, so this is
+            // bit-identical to the scalar form -- fewer loads, not different
+            // arithmetic. Reassociating into several accumulators would buy more
+            // ILP and is a separate question from this one.
+            const unsigned int* qw = (const unsigned int*)qsp;
+            const float4* xv = (const float4*)xp;
             if ((is & 1) == 0) {
                 #pragma unroll
-                for (int l = 0; l < 32; ++l) {
-                    float qv = (float)(qsp[l] & 0x0F);
-                    *acc += xp[l] * (dq * qv - mq);
+                for (int g = 0; g < 8; ++g) {
+                    unsigned int p = qw[g];
+                    float4 xq = xv[g];
+                    *acc += xq.x * (dq * (float)((p >>  0) & 0x0Fu) - mq);
+                    *acc += xq.y * (dq * (float)((p >>  8) & 0x0Fu) - mq);
+                    *acc += xq.z * (dq * (float)((p >> 16) & 0x0Fu) - mq);
+                    *acc += xq.w * (dq * (float)((p >> 24) & 0x0Fu) - mq);
                 }
             } else {
                 #pragma unroll
-                for (int l = 0; l < 32; ++l) {
-                    float qv = (float)((qsp[l] >> 4) & 0x0F);
-                    *acc += xp[l] * (dq * qv - mq);
+                for (int g = 0; g < 8; ++g) {
+                    unsigned int p = qw[g];
+                    float4 xq = xv[g];
+                    *acc += xq.x * (dq * (float)((p >>  4) & 0x0Fu) - mq);
+                    *acc += xq.y * (dq * (float)((p >> 12) & 0x0Fu) - mq);
+                    *acc += xq.z * (dq * (float)((p >> 20) & 0x0Fu) - mq);
+                    *acc += xq.w * (dq * (float)((p >> 28) & 0x0Fu) - mq);
                 }
             }
         }

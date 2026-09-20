@@ -1045,6 +1045,7 @@ fn ffn_layer(sh: &Shape, w: &FfnW<'_>, il: usize, x: &[f32], out: &mut [f32]) ->
         FfnW::Moe(m) => {
             let ne = sh.n_expert;
             let mut logits = vec![0.0f32; ne];
+            let t_router = std::time::Instant::now();
             m.router.apply(x, &mut logits)?;
             let (ids, weights) = routing::route_token(
                 &logits,
@@ -1058,8 +1059,12 @@ fn ffn_layer(sh: &Shape, w: &FfnW<'_>, il: usize, x: &[f32], out: &mut [f32]) ->
             // [`ExpertFfn::apply_layer`].
             let route: Vec<(u32, f32)> =
                 ids.iter().copied().zip(weights.iter().copied()).collect();
+            prof::add(&prof::FFN_ROUTER, t_router);
+            let t_routed = std::time::Instant::now();
             m.experts
                 .apply_layer(m.ord, &route, x, sh.swiglu_clamp_exp[il], out)?;
+            prof::add(&prof::FFN_ROUTED, t_routed);
+            let t_shared = std::time::Instant::now();
 
             // The shared expert is added unscaled: expert_weights_scale applies
             // to the routed weights only.
@@ -1074,6 +1079,7 @@ fn ffn_layer(sh: &Shape, w: &FfnW<'_>, il: usize, x: &[f32], out: &mut [f32]) ->
             for (o, &sv) in out.iter_mut().zip(s_out.iter()) {
                 *o += sv;
             }
+            prof::add(&prof::FFN_SHARED, t_shared);
             Ok(())
         }
     }
@@ -1114,6 +1120,14 @@ pub mod prof {
 
     /// Inside [`MLA`]: the projections, the sparse indexer, the query absorb
     /// through `k_b`, and the attention through `v_b`.
+    // VENDORED-LOCAL: GLM-5.3-Flash. The FFN's three parts. Two rounds of
+    // optimising the routed experts moved the FFN 88.6 -> 57.5 ms, which is a lot
+    // less than the arithmetic said it should, so the question of which part of an
+    // FFN layer the time is in has to be measured rather than reasoned about.
+    pub static FFN_ROUTER: AtomicU64 = AtomicU64::new(0);
+    pub static FFN_ROUTED: AtomicU64 = AtomicU64::new(0);
+    pub static FFN_SHARED: AtomicU64 = AtomicU64::new(0);
+
     pub static MLA_PROJ: AtomicU64 = AtomicU64::new(0);
     pub static MLA_INDEX: AtomicU64 = AtomicU64::new(0);
     pub static MLA_ABSORB: AtomicU64 = AtomicU64::new(0);
@@ -1132,8 +1146,11 @@ pub mod prof {
 
     /// Sub-phases of [`KDA`] and [`MLA`]. These sum to less than their parents:
     /// what is left over is the projections and glue not counted here.
-    pub fn inner() -> [(&'static str, &'static AtomicU64); 8] {
+    pub fn inner() -> [(&'static str, &'static AtomicU64); 11] {
         [
+            ("  FFN router", &FFN_ROUTER),
+            ("  FFN routed experts", &FFN_ROUTED),
+            ("  FFN shared expert", &FFN_SHARED),
             ("  KDA q/k/v projections", &KDA_PROJ),
             ("  KDA depthwise conv + shift", &KDA_CONV),
             ("  KDA decay gate", &KDA_GATE),
