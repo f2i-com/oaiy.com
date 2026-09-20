@@ -78,6 +78,95 @@ __global__ void linear_f32_gemv_coop(const float* __restrict__ x,
 // same block — perfectly coalesced. Works for any K%32==0 (every Q8_0 weight
 // satisfies this by construction). Block geometry: blockDim=(32, 8, 1) packs
 // 8 output rows per block.
+// VENDORED-LOCAL: GLM-5.3-Flash. Split-K GEMV for a SHORT, WIDE weight.
+//
+// The coop kernels put one warp on each output row and walk the whole reduction
+// in it, which is fine while there are rows to go round: 8192 rows is 8192 warps.
+// glm5next has the opposite shape all over its trunk --
+//
+//   hc_attn_fn / hc_ffn_fn   [16384 -> 24]    90 a token
+//   ssm_beta                 [ 4096 -> 64]    34 a token
+//   ssm_f_a / ssm_g_a        [ 4096 -> 128]   68 a token
+//
+// -- and 24 rows is 24 warps, which is 3 blocks on a 170-SM card. Measured: a
+// [24, 16384] f32 matvec took 86 us to read 1.57 MB, about 18 GB/s, while a
+// [512, 512] one took 12 us. It is not bandwidth, it is that almost nothing is
+// running.
+//
+// So split the reduction instead: one warp per (row, split), partials to a
+// scratch buffer, then a second pass sums each row's splits IN ORDER, which keeps
+// the result deterministic (an atomicAdd version would not be).
+__global__ void gemv_split_q8_0_f32(const float* __restrict__ x,
+                                    const unsigned char* __restrict__ w,
+                                    float* __restrict__ partials,
+                                    int N, int K, int splits) {
+    int n = blockIdx.x * blockDim.y + threadIdx.y;
+    int s = blockIdx.y;
+    if (n >= N || s >= splits) return;
+    int t = threadIdx.x;
+    int n_blocks  = K / 32;
+    int per       = (n_blocks + splits - 1) / splits;
+    int b0        = s * per;
+    int b1        = b0 + per;
+    if (b1 > n_blocks) b1 = n_blocks;
+    int row_bytes = n_blocks * 34;
+    const unsigned char* w_row = w + (long)n * row_bytes;
+
+    float acc = 0.0f;
+    for (int b = b0; b < b1; ++b) {
+        const unsigned char* bp = w_row + b * 34;
+        unsigned short scale_bits = (unsigned short)bp[0] | ((unsigned short)bp[1] << 8);
+        float d = f16_to_f32(scale_bits);
+        const signed char* qs = (const signed char*)(bp + 2);
+        const float* xb = x + b * 32;
+        acc += xb[t] * (float)qs[t] * d;
+    }
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        acc += __shfl_xor_sync(0xffffffff, acc, offset);
+    }
+    if (t == 0) partials[(long)n * splits + s] = acc;
+}
+
+// As above for a dense f32 weight. Lanes stride K by 32 so the reads coalesce.
+__global__ void gemv_split_f32(const float* __restrict__ x,
+                               const float* __restrict__ w,
+                               float* __restrict__ partials,
+                               int N, int K, int splits) {
+    int n = blockIdx.x * blockDim.y + threadIdx.y;
+    int s = blockIdx.y;
+    if (n >= N || s >= splits) return;
+    int t = threadIdx.x;
+    int per = (K + splits - 1) / splits;
+    int k0  = s * per;
+    int k1  = k0 + per;
+    if (k1 > K) k1 = K;
+    const float* w_row = w + (long)n * K;
+
+    float acc = 0.0f;
+    for (int k = k0 + t; k < k1; k += 32) {
+        acc += x[k] * w_row[k];
+    }
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        acc += __shfl_xor_sync(0xffffffff, acc, offset);
+    }
+    if (t == 0) partials[(long)n * splits + s] = acc;
+}
+
+// Sum each row's splits, in split order, so the result does not depend on how
+// the blocks happened to be scheduled.
+__global__ void gemv_split_reduce_f32(const float* __restrict__ partials,
+                                      float* __restrict__ y,
+                                      int N, int splits) {
+    int n = blockIdx.x * blockDim.x + threadIdx.x;
+    if (n >= N) return;
+    const float* p = partials + (long)n * splits;
+    float acc = 0.0f;
+    for (int s = 0; s < splits; ++s) acc += p[s];
+    y[n] = acc;
+}
+
 __global__ void linear_q8_0_gemv_coop_f32(const float* __restrict__ x,
                                            const unsigned char* __restrict__ w,
                                            float* __restrict__ y,
@@ -2802,6 +2891,9 @@ pub const KERNEL_NAMES: &[&str] = &[
     "batched_gemv_f32",
     // VENDORED-LOCAL: GLM-5.3-Flash.
     "kda_delta_step_f32",
+    "gemv_split_q8_0_f32",
+    "gemv_split_f32",
+    "gemv_split_reduce_f32",
     "gelu_approx_mul_split_f32",
     "tanh_inplace_f32",
     "gaussian_topk_inplace_f32",

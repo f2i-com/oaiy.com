@@ -248,6 +248,35 @@ impl CudaBackend {
         self.funcs.get(name).unwrap_or_else(|| panic!("CUDA kernel `{name}` not loaded"))
     }
 
+    // VENDORED-LOCAL: GLM-5.3-Flash. Which shapes take the split-K GEMV.
+    ///
+    /// Short and wide only: with `out` rows there are `out` warps, so below a few
+    /// hundred rows the card sits idle while a long reduction runs in each one.
+    /// Ordinary transformer weights are thousands of rows and keep the existing
+    /// path, which is deliberate -- this must not move any other model's numbers.
+    fn split_gemv_kernel(dtype: GgmlType, out: usize, in_: usize) -> Option<&'static str> {
+        const MAX_OUT: usize = 320;
+        const MIN_IN: usize = 2048;
+        if out > MAX_OUT || in_ < MIN_IN {
+            return None;
+        }
+        match dtype {
+            GgmlType::Q8_0 if in_ % 32 == 0 => Some("gemv_split_q8_0_f32"),
+            GgmlType::F32 => Some("gemv_split_f32"),
+            _ => None,
+        }
+    }
+
+    /// How many ways to split the reduction: enough warps to fill the card,
+    /// without making each one so short that the launch dominates.
+    fn gemv_splits(dtype: GgmlType, in_: usize) -> usize {
+        let units = match dtype {
+            GgmlType::Q8_0 => in_ / 32, // Q8_0 blocks
+            _ => in_ / 32,              // one 32-wide strip per lane sweep
+        };
+        (units / 32).clamp(2, 32)
+    }
+
     fn alloc(&self, n: usize) -> CudaSlice<f32> {
         self.stream.alloc_zeros::<f32>(n).expect("alloc failed")
     }
@@ -573,6 +602,49 @@ impl Backend for CudaBackend {
         // is the naive 16×16 kernel which only has 1 productive thread per warp
         // at M=1; the coop version uses all 32. Used by Qwen3.6 27B's F32
         // ssm_ba matmul (96×5120, 48× per token).
+        // VENDORED-LOCAL: GLM-5.3-Flash. Short and wide: split the reduction, or
+        // `out` warps is all the parallelism the card gets. glm5next's F32 router
+        // is [4096 -> 288], 42 a token.
+        if m_rows == 1 {
+            if let Some(split_kernel) = Self::split_gemv_kernel(GgmlType::F32, out, in_) {
+                let splits = Self::gemv_splits(GgmlType::F32, in_);
+                const OUT_PER_BLOCK: u32 = 8;
+                let mut partials = self.alloc(out * splits);
+                let cfg = LaunchConfig {
+                    grid_dim: ((out as u32).div_ceil(OUT_PER_BLOCK), splits as u32, 1),
+                    block_dim: (32, OUT_PER_BLOCK, 1),
+                    shared_mem_bytes: 0,
+                };
+                let (n_i, k_i, s_i) = (out as i32, in_ as i32, splits as i32);
+                unsafe {
+                    self.stream
+                        .launch_builder(self.func_dyn(split_kernel))
+                        .arg(a.as_ref())
+                        .arg(b.as_ref())
+                        .arg(&mut partials)
+                        .arg(&n_i)
+                        .arg(&k_i)
+                        .arg(&s_i)
+                        .launch(cfg)
+                        .expect("split GEMV launch");
+                }
+                let rcfg = LaunchConfig::for_num_elems(out as u32);
+                unsafe {
+                    self.stream
+                        .launch_builder(self.func("gemv_split_reduce_f32"))
+                        .arg(&partials)
+                        .arg(&mut c)
+                        .arg(&n_i)
+                        .arg(&s_i)
+                        .launch(rcfg)
+                        .expect("split GEMV reduce launch");
+                }
+                let mut shape = x.shape().to_vec();
+                *shape.last_mut().unwrap() = out;
+                return self.make_tensor(c, shape);
+            }
+        }
+
         if m_rows == 1 && in_ % 32 == 0 {
             const OUT_PER_BLOCK: u32 = 8;
             let block = (32u32, OUT_PER_BLOCK, 1u32);
@@ -700,6 +772,50 @@ impl Backend for CudaBackend {
                 GgmlType::Q8_0 if in_ % 32  == 0  => Some("linear_q8_0_gemv_coop_f32"),
                 _ => None,
             };
+            // VENDORED-LOCAL: GLM-5.3-Flash. A short, wide weight leaves the
+            // coop kernels with almost no warps to run; split the reduction.
+            // Only these shapes, so no other architecture's numerics move.
+            if let Some(split_kernel) = Self::split_gemv_kernel(w.dtype(), out, in_) {
+                let splits = Self::gemv_splits(w.dtype(), in_);
+                const OUT_PER_BLOCK: u32 = 8;
+                let mut partials = self.alloc(out * splits);
+                let cfg = LaunchConfig {
+                    grid_dim: (
+                        (out as u32).div_ceil(OUT_PER_BLOCK),
+                        splits as u32,
+                        1,
+                    ),
+                    block_dim: (32, OUT_PER_BLOCK, 1),
+                    shared_mem_bytes: 0,
+                };
+                let (n_i, k_i, s_i) = (out as i32, in_ as i32, splits as i32);
+                unsafe {
+                    self.stream
+                        .launch_builder(self.func_dyn(split_kernel))
+                        .arg(x_in.as_ref())
+                        .arg(w_in.as_ref())
+                        .arg(&mut partials)
+                        .arg(&n_i)
+                        .arg(&k_i)
+                        .arg(&s_i)
+                        .launch(cfg)
+                        .expect("split GEMV launch");
+                }
+                let rcfg = LaunchConfig::for_num_elems(out as u32);
+                unsafe {
+                    self.stream
+                        .launch_builder(self.func("gemv_split_reduce_f32"))
+                        .arg(&partials)
+                        .arg(&mut c)
+                        .arg(&n_i)
+                        .arg(&s_i)
+                        .launch(rcfg)
+                        .expect("split GEMV reduce launch");
+                }
+                let mut shape = x.shape().to_vec();
+                *shape.last_mut().unwrap() = out;
+                return self.make_tensor(c, shape);
+            }
             if let Some(kernel) = coop_kernel {
                 const OUT_PER_BLOCK: u32 = 8;
                 let block = (32u32, OUT_PER_BLOCK, 1u32);

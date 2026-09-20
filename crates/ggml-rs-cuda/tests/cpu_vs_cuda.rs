@@ -1406,6 +1406,62 @@ fn delta_net_step_prefill_seq_matches_cpu() {
 /// CUDA version reduces in a warp rather than in index order, so any difference
 /// feeds back into the state and compounds. Sixteen steps at the released shapes
 /// says whether it compounds to anything that matters.
+/// VENDORED-LOCAL: GLM-5.3-Flash. The split-K GEMV against the CPU backend, at
+/// the short-wide shapes it is chosen for and either side of the thresholds.
+///
+/// `[16384 -> 24]` is `hc_attn_fn`, `[4096 -> 64]` is `ssm_beta`, `[4096 -> 128]`
+/// is `ssm_f_a`. The last two entries are above `MAX_OUT` and below `MIN_IN`, so
+/// they take the ordinary path and check this did not disturb it.
+#[test]
+fn split_gemv_matches_cpu() {
+    let Some(cuda) = try_cuda() else { return };
+    let cpu = CpuBackend::new();
+
+    for &(out, in_) in &[
+        (24usize, 16384usize),
+        (64, 4096),
+        (128, 4096),
+        (288, 4096),
+        (4096, 4096),
+        (24, 1024),
+    ] {
+        let w: Vec<f32> = (0..out * in_)
+            .map(|i| (((i * 43) % 89) as f32 - 44.0) / 440.0)
+            .collect();
+        let x: Vec<f32> = (0..in_)
+            .map(|i| (((i * 59) % 97) as f32 - 48.0) / 48.0)
+            .collect();
+        let xt = Tensor::from_vec(x, vec![1, in_]);
+        let wt = Tensor::from_vec(w, vec![out, in_]);
+
+        // dense f32 both sides
+        let want = cpu.to_host(cpu.linear(&cpu.to_device(xt.clone()), &cpu.to_device(wt.clone())));
+        let got = cuda.to_host(cuda.linear(&cuda.to_device(xt.clone()), &cuda.to_device(wt.clone())));
+        assert_eq!(want.data().len(), out);
+        let scale = want.data().iter().fold(0.0f32, |a, v| a.max(v.abs())).max(1.0);
+        for (i, (p, q)) in want.data().iter().zip(got.data()).enumerate() {
+            assert!(
+                (p - q).abs() <= 3e-5 * scale,
+                "f32 [{out} x {in_}] row {i}: cpu {p} vs cuda {q}"
+            );
+        }
+
+        // and through Q8_0, which is what the real hc / ssm weights are
+        let (q, _dense) = make_q8_0_weight(out, in_, 0xC0FFEE ^ (out as u64));
+        let wq = cuda.to_device_quant(q.clone());
+        let a = cpu.to_host(cpu.linear_q(&cpu.to_device(xt.clone()), &q));
+        let b = cuda.to_host(cuda.linear_q(&cuda.to_device(xt.clone()), &wq));
+        let scale = a.data().iter().fold(0.0f32, |m, v| m.max(v.abs())).max(1.0);
+        for (i, (p, qv)) in a.data().iter().zip(b.data()).enumerate() {
+            assert!(
+                (p - qv).abs() <= 3e-5 * scale,
+                "q8_0 [{out} x {in_}] row {i}: cpu {p} vs cuda {qv}"
+            );
+        }
+        assert!(a.data().iter().any(|v| v.abs() > 1e-4), "[{out} x {in_}] all zero");
+    }
+}
+
 #[test]
 fn kda_delta_step_matches_cpu() {
     let Some(cuda) = try_cuda() else { return };

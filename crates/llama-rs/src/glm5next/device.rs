@@ -1499,6 +1499,53 @@ mod tests {
                 (o * k * 4) as f64 / per / 1e9
             );
         }
+        // Split an apply into its three parts, at the hyper-connection shape:
+        // hc_attn_fn is [24, 16384] and its input is the whole 4 x 4096 stream.
+        println!();
+        println!("one apply, taken apart (x of 16384 floats, the hc_mixes shape):");
+        let big: Vec<f32> = (0..16384).map(|i| (i % 13) as f32 / 13.0).collect();
+        let small = Tensor::from_vec(vec![1.0f32; 24], vec![1, 24]);
+        let sd = backend.to_device(small);
+        let n = 300usize;
+
+        let t = std::time::Instant::now();
+        for _ in 0..n {
+            let d = backend.to_device(Tensor::from_vec(big.clone(), vec![1, 16384]));
+            std::hint::black_box(&d);
+        }
+        let up = t.elapsed().as_secs_f64() / n as f64;
+
+        let t = std::time::Instant::now();
+        for _ in 0..n {
+            let h = backend.to_host(sd.clone());
+            std::hint::black_box(&h);
+        }
+        let down = t.elapsed().as_secs_f64() / n as f64;
+
+        let t = std::time::Instant::now();
+        for _ in 0..n {
+            std::hint::black_box(big.clone());
+        }
+        let clone = t.elapsed().as_secs_f64() / n as f64;
+
+        let hw: Vec<f32> = (0..24 * 16384).map(|i| ((i % 17) as f32 - 8.0) / 80.0).collect();
+        let hwt = Weight::Dense(backend.to_device(Tensor::from_vec(hw, vec![24, 16384])));
+        let hm = Mat::Device { w: &hwt, backend: &*backend };
+        let mut hout = vec![0.0f32; 24];
+        hm.apply(&big, &mut hout).expect("warm");
+        let t = std::time::Instant::now();
+        for _ in 0..n {
+            hm.apply(&big, &mut hout).expect("hc apply");
+        }
+        let full = t.elapsed().as_secs_f64() / n as f64;
+
+        println!("  host Vec clone of x   {:7.1} us", clone * 1e6);
+        println!("  to_device(x)          {:7.1} us", up * 1e6);
+        println!("  to_host(24 floats)    {:7.1} us", down * 1e6);
+        println!("  whole apply           {:7.1} us", full * 1e6);
+        println!("  unaccounted (matmul)  {:7.1} us", (full - up - down) * 1e6);
+        println!("  x 90 calls a token    {:7.2} ms", full * 90.0 * 1e3);
+
         println!();
         println!("A trunk token is about 710 of these. Multiply the small-matrix");
         println!("number by 710 to see the floor that latency alone imposes.");
@@ -1817,7 +1864,7 @@ mod tests {
         println!("decode   cold {:.3} s/token ({:.2} tok/s)", dec, 1.0 / dec);
         println!("decode   warm {:.3} s/token ({:.2} tok/s)", dec2, 1.0 / dec2);
         println!("target is 20 tok/s = 0.050 s/token");
-        println!("the trunk is ~87 ms of that; warm experts are ~{:.0} ms", (dec2 - 0.0869).max(0.0) * 1e3);
+        println!("the trunk is ~60 ms of that; warm experts are ~{:.0} ms", (dec2 - 0.0604).max(0.0) * 1e3);
         assert!(dec > 0.0 && dec2 > 0.0);
     }
 
@@ -1963,7 +2010,7 @@ mod tests {
         println!("warm  {:.3} s/token   ({:.2} tok/s)", warm, 1.0 / warm);
         println!("target is 20 tok/s = 0.050 s/token");
         // `measure_trunk_floor`, with the routed experts stubbed to zeros.
-        let trunk = 0.0869;
+        let trunk = 0.0604;
         println!(
             "the trunk alone is {:.0} ms of that warm token; experts are {:.0} ms",
             trunk * 1e3,

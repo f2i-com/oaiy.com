@@ -1152,15 +1152,21 @@ pub fn forward_token(
     let mut stream = hc::init(embd);
 
     let mut sub_out = vec![0.0f32; n_embd];
+    // Reused across all 45 layers and both halves: the hyper-connection path used
+    // to allocate a collapsed vector, a combined stream and a clone of the stream
+    // twice a layer -- 270 allocations a token, on the critical path.
+    let mut cur = vec![0.0f32; n_embd];
+    let mut residual = vec![0.0f32; hc::HC * n_embd];
+    let mut next = vec![0.0f32; hc::HC * n_embd];
 
     for il in 0..sh.n_layer {
         let lw = &w.layers[il];
 
         // --- attention half -------------------------------------------------
         let t_hc = std::time::Instant::now();
-        let residual = stream.clone();
+        residual.copy_from_slice(&stream);
         let mix = hc_mixes(&stream, &lw.hc_attn, sh)?;
-        let mut cur = hc::collapse(&stream, &mix.pre);
+        hc::collapse_into(&stream, &mix.pre, &mut cur);
         rms_norm(&mut cur, lw.attn_norm, sh.rms_eps)?;
         prof::add(&prof::HC, t_hc);
 
@@ -1200,12 +1206,13 @@ pub fn forward_token(
             }
         }
         let t_hc = std::time::Instant::now();
-        stream = hc::combine(&sub_out, &residual, &mix);
+        hc::combine_into(&sub_out, &residual, &mix, &mut next);
+        std::mem::swap(&mut stream, &mut next);
 
         // --- FFN half -------------------------------------------------------
-        let residual = stream.clone();
+        residual.copy_from_slice(&stream);
         let mix = hc_mixes(&stream, &lw.hc_ffn, sh)?;
-        let mut cur = hc::collapse(&stream, &mix.pre);
+        hc::collapse_into(&stream, &mix.pre, &mut cur);
         rms_norm(&mut cur, lw.ffn_norm, sh.rms_eps)?;
         prof::add(&prof::HC, t_hc);
 
@@ -1213,7 +1220,8 @@ pub fn forward_token(
         ffn_layer(sh, &lw.ffn, il, &cur, &mut sub_out)?;
         prof::add(&prof::FFN, t);
         let t_hc = std::time::Instant::now();
-        stream = hc::combine(&sub_out, &residual, &mix);
+        hc::combine_into(&sub_out, &residual, &mix, &mut next);
+        std::mem::swap(&mut stream, &mut next);
         prof::add(&prof::HC, t_hc);
     }
 
