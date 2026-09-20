@@ -544,6 +544,9 @@ pub struct Glm5NextModel {
     pub glm: Glm5NextConfig,
     pub tokenizer: Tokenizer,
     /// `n_layer_all` entries: the trunk, then the NextN block if present.
+    ///
+    /// Empty on the streaming path, where the weights live in the device model
+    /// instead — see [`Weights`].
     pub blocks: Vec<Glm5NextBlock>,
     pub tok_embd: Arc<Tensor>,
     pub output_norm: Tensor,
@@ -552,6 +555,33 @@ pub struct Glm5NextModel {
     /// VENDORED-LOCAL: shared streaming-expert state when opened with
     /// `from_gguf_streaming`. `None` for the resident load.
     pub stream_shared: Option<Arc<crate::expert_stream::StreamShared>>,
+    // VENDORED-LOCAL: GLM-5.3-Flash. The path that actually decodes.
+    /// The optimised representation, when the model was opened streaming.
+    ///
+    /// Two representations existed side by side for a while and only one of them
+    /// could run: `blocks` above expands every trunk tensor to f32 in host memory,
+    /// which is 35.7 GB for the released model, and `device::DeviceModel` keeps
+    /// them quantised on the backend at 5.97 GB with the experts streamed. Loading
+    /// both would spend 35.7 GB of host memory that the expert cache needs — it
+    /// wants 165 GB of the 190 — so the streaming constructor builds only this one
+    /// and leaves `blocks` empty.
+    decoder: Option<Decoder>,
+}
+
+// VENDORED-LOCAL: GLM-5.3-Flash.
+/// The device model plus the recurrent state a sequence carries.
+///
+/// The state is a `Mutex` because [`Glm5NextModel::forward`] takes `&self` — the
+/// signature every other architecture in this crate uses, where all the state a
+/// forward mutates arrives in the `KvCache` argument. glm5next's state does not
+/// fit that: a `KvCache` has per-layer K and V plus the two SSM slots, and this
+/// architecture also needs the MLA latent cache and the sparse indexer's pooled
+/// keys and gates, which have no home there. Rather than widen a type every other
+/// architecture shares, the state lives here and `forward` documents that it
+/// ignores the argument.
+struct Decoder {
+    model: Box<device::DeviceModel>,
+    state: std::sync::Mutex<forward::State>,
 }
 
 impl std::fmt::Debug for Glm5NextModel {
@@ -592,7 +622,58 @@ impl Glm5NextModel {
         backend: Arc<dyn Backend>,
         shared: Arc<crate::expert_stream::StreamShared>,
     ) -> Result<Self> {
-        Self::from_gguf_impl(g, backend, Some(shared))
+        Self::from_gguf_streaming_with(g, backend, shared, Self::DEFAULT_CONTEXT)
+    }
+
+    /// Context length the streaming path allocates state for when the caller does
+    /// not say. The MLA latent cache is `max_len * kv_lora` per MLA layer — 2 MB a
+    /// layer per 1 000 tokens here — so this is cheap to raise and not free.
+    pub const DEFAULT_CONTEXT: usize = 8192;
+
+    // VENDORED-LOCAL: GLM-5.3-Flash. The constructor that can decode.
+    /// As [`Self::from_gguf_streaming`], with an explicit context length.
+    ///
+    /// Builds the device model rather than expanding the trunk to f32, so
+    /// [`Self::forward`] works. `blocks` is left empty: see [`Self::blocks`].
+    pub fn from_gguf_streaming_with(
+        g: &GgufFile,
+        backend: Arc<dyn Backend>,
+        shared: Arc<crate::expert_stream::StreamShared>,
+        max_len: usize,
+    ) -> Result<Self> {
+        let config = ModelConfig::from_gguf(g)?;
+        let glm = Glm5NextConfig::from_gguf(g, &config)?;
+        let tokenizer = Tokenizer::from_gguf(g)?;
+        let max_len = max_len.clamp(1, config.context_length.max(1));
+
+        let model = device::DeviceModel::from_gguf(
+            g,
+            max_len,
+            Arc::clone(&backend),
+            shared.cache_budget_bytes(),
+        )?;
+        let state = forward::State::new_on(model.shape(), Arc::clone(&backend))?;
+
+        let idx = TensorIndex::new(g);
+        let tok_embd = Arc::new(idx.take("token_embd.weight", &["tok_embeddings.weight"])?);
+        let output_norm = idx.take("output_norm.weight", &["norm.weight"])?;
+        let output = load_lm_head_or_tied(&idx, &tok_embd)?;
+
+        Ok(Self {
+            config,
+            glm,
+            tokenizer,
+            blocks: Vec::new(),
+            tok_embd,
+            output_norm,
+            output,
+            backend,
+            stream_shared: Some(shared),
+            decoder: Some(Decoder {
+                model: Box::new(model),
+                state: std::sync::Mutex::new(state),
+            }),
+        })
     }
 
     fn from_gguf_impl(
@@ -864,36 +945,111 @@ impl Glm5NextModel {
             output,
             backend,
             stream_shared,
+            // The resident representation cannot decode: see `Weights` on the
+            // struct, and `forward` below.
+            decoder: None,
         })
     }
 
     /// How many trunk layers run each attention kind — cheap sanity readout for
     /// `nrob info`, and what the streamed-vs-resident tests assert on.
     pub fn layer_census(&self) -> (usize, usize) {
-        let kda = self
-            .blocks
+        // From the layer map rather than from `blocks`, which the streaming path
+        // leaves empty.
+        let kda = self.glm.layer_kinds[..self.glm.n_layer]
             .iter()
-            .take(self.glm.n_layer)
-            .filter(|b| b.kind() == LayerKind::Kda)
+            .filter(|k| **k == LayerKind::Kda)
             .count();
         (kda, self.glm.n_layer - kda)
     }
 
-    /// Not yet implemented. The loader and the layer map are complete and
-    /// validated; the forward pass needs the four pieces listed in the module
-    /// docs, of which the KDA scan is the only genuinely new kernel.
-    pub fn forward(&self, _tokens: &[u32], _kv: &mut crate::kv_cache::KvCache) -> Result<Tensor> {
-        let (kda, mla) = self.layer_census();
-        Err(LlamaError::Config(format!(
-            "glm5next loads but does not decode yet ({kda} KDA + {mla} MLA trunk layers, \
-             {} experts top-{}). Pending: (1) the KDA scan — per-channel low-rank decay, so \
-             qwen35's per-head delta_net_step does not apply; (2) hyper-connections, portable \
-             from dsv41::hc; (3) absorbed MLA + the sparse indexer, portable from \
-             dsv41::attention minus the query rotation (glm5next is NoPE); (4) sigmoid MoE \
-             routing with exp_probs_b biasing selection only. See \
-             crates/llama-rs/src/glm5next.rs.",
-            self.glm.n_expert, self.glm.n_expert_used,
-        )))
+    /// Whether this model can run [`Self::forward`].
+    ///
+    /// True when opened with [`Self::from_gguf_streaming`]. The resident
+    /// [`Self::from_gguf`] load holds the trunk as f32 for inspection and tests and
+    /// has no decoder attached.
+    pub fn can_decode(&self) -> bool {
+        self.decoder.is_some()
+    }
+
+    /// How many tokens of state the decoder was built for.
+    pub fn max_len(&self) -> usize {
+        self.decoder
+            .as_ref()
+            .map(|d| d.model.shape().max_len)
+            .unwrap_or(0)
+    }
+
+    /// Forget the sequence: the next [`Self::forward`] starts from position 0.
+    pub fn reset(&self) {
+        if let Some(d) = &self.decoder {
+            d.state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .reset();
+        }
+    }
+
+    // VENDORED-LOCAL: GLM-5.3-Flash. The generic entry point, wired to the
+    // optimised path.
+    /// Run `tokens` and return the last position's logits, `[1, n_vocab]`.
+    ///
+    /// **`kv` is not used, and that is deliberate.** Every other architecture here
+    /// keeps all of a sequence's state in the `KvCache` it is handed, which works
+    /// because their state is per-layer K and V. glm5next carries four other things:
+    /// a `[n_head, head_dim, head_dim]` KDA recurrence per KDA layer, that layer's
+    /// depthwise-conv ring, the MLA latent cache that serves as both K and V, and
+    /// the sparse indexer's pooled keys and gates. Only the first two have anywhere
+    /// to live in a `KvCache`. So the state belongs to the model, `reset` clears it,
+    /// and the argument is accepted to keep one signature across the enum in
+    /// `lib.rs` rather than quietly writing into something that cannot hold it.
+    ///
+    /// Requires a model opened with [`Self::from_gguf_streaming`]; the resident load
+    /// has no decoder. Positions continue from wherever the last call left off, so
+    /// prefill is this in a loop and decode is this one token at a time.
+    pub fn forward(&self, tokens: &[u32], kv: &mut crate::kv_cache::KvCache) -> Result<Tensor> {
+        let Some(d) = &self.decoder else {
+            let (kda, mla) = self.layer_census();
+            return Err(LlamaError::Config(format!(
+                "glm5next: this model was opened resident ({kda} KDA + {mla} MLA layers, \
+                 the trunk expanded to f32) and has no decoder. Open it with \
+                 `Model::open_streaming` — the released checkpoint is 193 GB and the \
+                 routed experts would be about 1.2 TB expanded, so streaming is the \
+                 only way it fits."
+            )));
+        };
+        if tokens.is_empty() {
+            return Err(LlamaError::Config("glm5next: forward got no tokens".into()));
+        }
+
+        let sh = d.model.shape();
+        let w = d.model.view();
+        let mut st = d.state.lock().unwrap_or_else(|e| e.into_inner());
+
+        // One thing does cross from the argument: a caller that has reset the cache
+        // is starting a new sequence, and `nrob-cli` does exactly that between turns.
+        // Mirroring it here means the generic contract works without the caller
+        // knowing this architecture keeps its own state.
+        if kv.len == 0 && st.len != 0 {
+            st.reset();
+        }
+        if st.len + tokens.len() > sh.max_len {
+            return Err(LlamaError::Config(format!(
+                "glm5next: {} tokens at position {} exceeds the {}-token state this                  model was opened with",
+                tokens.len(),
+                st.len,
+                sh.max_len
+            )));
+        }
+
+        let mut logits = Vec::new();
+        for &t in tokens {
+            logits = forward::forward_token(sh, &w, &mut st, t)?;
+        }
+        // And report the position back, so a caller watching `kv.len` for its context
+        // limit sees the truth rather than a cache that never fills.
+        kv.len = st.len;
+        Ok(Tensor::from_vec(logits, vec![1, sh.n_vocab]))
     }
 }
 

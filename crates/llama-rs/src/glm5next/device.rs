@@ -1920,6 +1920,88 @@ because water wheels drove the machinery.";
         );
     }
 
+    /// GLM through the generic `Model` API, which is the path `nrob-cli` takes.
+    ///
+    /// `Model::open_streaming` -> `Model::forward(tokens, &mut kv)` -> logits, with no
+    /// glm5next-specific code at the call site. This used to return an error saying
+    /// the architecture loaded but could not decode, so `Model::forward` panicked for
+    /// GLM and nothing generic could run it.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "needs the released model on disk"]
+    fn glm_runs_through_the_generic_model_api() {
+        let Some(backend) = cuda_backend() else { return };
+
+        let t0 = std::time::Instant::now();
+        // Exactly what nrob-cli does.
+        let model = crate::Model::open_streaming(RELEASED, backend, 64 << 30)
+            .expect("open_streaming");
+        println!();
+        println!("opened in {:.1}s", t0.elapsed().as_secs_f64());
+        println!("arch      {:?}", model.config().arch);
+        println!("tokenizer {} tokens", model.tokenizer().vocab_size());
+
+        let crate::Model::Glm5Next(glm) = &model else {
+            panic!("the released file should open as Glm5Next");
+        };
+        assert!(glm.can_decode(), "the streaming path must attach a decoder");
+        assert!(
+            glm.blocks.is_empty(),
+            "the streaming path must not also expand the trunk to f32: {} blocks loaded",
+            glm.blocks.len()
+        );
+        let (kda, mla) = glm.layer_census();
+        println!("layers    {kda} KDA + {mla} MLA, state for {} tokens", glm.max_len());
+        assert_eq!(kda + mla, 45);
+
+        let mut kv = model.new_kv_cache(256);
+        let ids = model
+            .tokenizer()
+            .encode("The capital of France is", false)
+            .expect("encode");
+        println!("prompt    {} tokens", ids.len());
+
+        let t = std::time::Instant::now();
+        let logits = model.forward(&ids, &mut kv);
+        println!("forward   {:.1}s for {} tokens", t.elapsed().as_secs_f64(), ids.len());
+
+        assert_eq!(logits.shape(), &[1, model.config().vocab_size]);
+        let d = logits.data();
+        assert!(d.iter().all(|v| v.is_finite()), "the logits are not finite");
+        let best = d
+            .iter()
+            .enumerate()
+            .fold((0usize, f32::NEG_INFINITY), |(bi, bv), (i, &x)| {
+                if x > bv { (i, x) } else { (bi, bv) }
+            })
+            .0;
+        println!("next      {best} {:?}", model.tokenizer().decode(&[best as u32]));
+
+        // Continue: the state carries, so one more token is one more forward.
+        let after = model.forward(&[best as u32], &mut kv);
+        assert_eq!(after.shape(), &[1, model.config().vocab_size]);
+        assert!(after.data().iter().all(|v| v.is_finite()));
+        // And a different continuation gives different logits, i.e. the state moved.
+        let moved = after
+            .data()
+            .iter()
+            .zip(d.iter())
+            .fold(0.0f32, |a, (p, q)| a.max((p - q).abs()));
+        println!("state moved by {moved:.3} between the two calls");
+        assert!(moved > 0.1, "the second forward returned the same logits: state is stuck");
+
+        // `reset` puts it back to position 0.
+        glm.reset();
+        let again = model.forward(&ids, &mut kv);
+        let d2 = again.data();
+        let same = d2
+            .iter()
+            .zip(d.iter())
+            .fold(0.0f32, |a, (p, q)| a.max((p - q).abs()));
+        println!("after reset, same prompt differs by {same:.5}");
+        assert!(same < 1e-3, "reset did not restore position 0: {same}");
+    }
+
     /// The sampling the model itself recommends, read out of the file.
     ///
     /// GLM-5.3-Flash ships `general.sampling.temp = 1.0` and
