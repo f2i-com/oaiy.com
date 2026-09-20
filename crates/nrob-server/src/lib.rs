@@ -14,17 +14,17 @@ mod disk;
 mod engine;
 // VENDORED-LOCAL: GLM-5.3-Flash served through the same job/event contract.
 pub mod glm;
+// VENDORED-LOCAL: the configured models, and swapping between them.
+pub mod models;
 mod http;
 
 use std::net::{SocketAddr, TcpListener};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use dsv41::tokenizer::Tokenizer;
-use dsv41_cuda::{GpuModel, GpuOptions};
 
 /// Bump when what a prompt state holds changes: older files are then left
 /// alone.
@@ -55,6 +55,14 @@ pub struct Options {
     pub usage: Option<PathBuf>,
     /// The model name clients use.
     pub name: String,
+    // VENDORED-LOCAL: more than one model, switched on demand.
+    /// Further models a client may ask for by name, as `(name, path)`. The
+    /// `model`/`name` pair above is the default and is always available.
+    ///
+    /// A `.gguf` (or a directory holding one) is served through llama-rs; anything
+    /// else is taken for a DeepSeek checkpoint directory. Only one is ever resident:
+    /// asking for another unloads the current one first.
+    pub extra_models: Vec<(String, std::path::PathBuf)>,
     /// Require `Authorization: Bearer KEY`.
     pub api_key: Option<String>,
     /// Reason before answering unless a request says otherwise.
@@ -109,6 +117,7 @@ impl Default for Options {
             engram_meta: None,
             usage: None,
             name: "deepseek-v4.1-flash".into(),
+            extra_models: Vec::new(),
             api_key: None,
             thinking: false,
             effort: 75,
@@ -188,8 +197,11 @@ pub fn start_listening(o: Options, listening: impl FnOnce(SocketAddr)) -> nrob::
     if o.model.as_os_str().is_empty() {
         return Err(nrob::Error::Arg("no checkpoint directory given".into()));
     }
-    let log = |m: String| {
-        if !o.silent {
+    // Copied out of `o` because it moves into `Models` below, which owns the
+    // settings a later load needs.
+    let silent = o.silent;
+    let log = move |m: String| {
+        if !silent {
             eprintln!("nrob-server: {m}");
         }
     };
@@ -197,75 +209,50 @@ pub fn start_listening(o: Options, listening: impl FnOnce(SocketAddr)) -> nrob::
     let addr = listener.local_addr()?;
     listening(addr);
 
-    let devices = if o.devices.is_empty() { (0..dsv41_cuda::gpu::device_count()?.min(2)).collect() } else { o.devices.clone() };
-    let t = Instant::now();
-    let tok = Arc::new(Tokenizer::load(&o.model)?);
-    let opts = GpuOptions {
-        devices: devices.clone(),
-        max_seq: o.ctx,
-        expert_cache_bytes: o.ram_gb << 30,
-        direct_io: true,
-        vram_expert_bytes: None,
-        vram_headroom_bytes: (o.headroom_gb * (1u64 << 30) as f64) as usize,
-        cpu_expert_threads: o.cpu_threads,
-        vision: o.vision,
-        // the free VRAM decides, pass by pass
-        residual_on_device: None,
-    };
-    let engram_meta = o.engram_meta.clone().unwrap_or_else(|| o.model.join("engram_meta.safetensors"));
-    let mut model = GpuModel::load(&o.model, &engram_meta, &opts)?;
-    log(format!("model loaded on cuda:{devices:?} in {:.1}s ({} token context)", t.elapsed().as_secs_f64(), o.ctx));
-    if let Some(path) = o.usage.as_ref().filter(|p| p.exists()) {
-        let t = Instant::now();
-        let (vram, queued) = model.warm(path, 4)?;
-        log(format!("warmed {vram} experts into VRAM in {:.1}s; {queued} more loading into RAM in the background", t.elapsed().as_secs_f64()));
-    }
-
-    let vision = if model.has_vision() { model.cfg.vision.clone() } else { None };
-    let image_token_id = model.cfg.image_token_id;
-    if vision.is_some() {
-        log("vision tower loaded; chat requests may carry images".into());
-    }
-    let loopback = o.host == "localhost" || o.host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback());
-    let (tx, rx) = mpsc::channel();
+    // VENDORED-LOCAL: the configured models, loaded one at a time.
+    //
+    // Everything a load needs moved into `models.rs`, because a switch has to be
+    // able to do it again later: the DeepSeek path (GpuModel, the usage warm-up, the
+    // prompt-state cache) and the GGUF path (llama-rs) are both there, chosen by what
+    // is on disk. Only one model is ever resident.
+    let loopback = o.host == "localhost"
+        || o.host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback());
     let request_log = !o.quiet && !o.silent;
-    let mut engine = engine::Engine::new(model, Arc::clone(&tok), o.chunk, o.step_below, o.layered_max, o.checkpoints, o.usage.clone(), request_log);
-    engine.warn = !o.silent;
-    if let Some(dir) = &o.prompt_cache {
-        // states belong to this model (its config and weight map) and to
-        // this state format
-        let mut fingerprint = disk::fnv(&[STATE_FORMAT], 0);
-        for name in ["config.json", "model.safetensors.index.json"] {
-            fingerprint = disk::fnv(&std::fs::read(o.model.join(name)).unwrap_or_default(), fingerprint);
-        }
-        match disk::DiskCache::open(dir, fingerprint, (o.prompt_cache_gb * 1e9) as u64) {
-            Ok(cache) => {
-                log(format!("{} prompt states on disk in {}", cache.len(), dir.display()));
-                engine.disk = Some(cache);
-            }
-            Err(e) => log(format!("prompt states are not kept ({}: {e})", dir.display())),
-        }
+    let ctx = o.ctx;
+    let api_key = o.api_key.clone();
+    let local_images = o.local_images.unwrap_or(loopback);
+    let default_name = o.name.clone();
+    let configured = {
+        let mut names = vec![o.name.clone()];
+        names.extend(o.extra_models.iter().map(|(n, _)| n.clone()));
+        names
+    };
+
+    let t = Instant::now();
+    let models = Arc::new(models::Models::new(o, loopback)?);
+    // Load the default now rather than on the first request, so a start-up failure
+    // is a start-up failure and not a 400 an hour later.
+    models
+        .activate(None)
+        .map_err(|e| nrob::Error::Arg(e))?;
+    log(format!(
+        "{default_name} loaded in {:.1}s ({ctx} token context)",
+        t.elapsed().as_secs_f64()
+    ));
+    if configured.len() > 1 {
+        log(format!(
+            "switchable models: {} — naming another in a request unloads the current one",
+            configured.join(", ")
+        ));
     }
-    std::thread::Builder::new().name("model".into()).spawn(move || engine.run(rx)).map_err(nrob::Error::Io)?;
 
     let server = Arc::new(api::Server {
-        cfg: api::Config {
-            model_name: o.name.clone(),
-            api_key: o.api_key.clone(),
-            max_seq: o.ctx,
-            thinking: o.thinking,
-            effort: o.effort,
-            max_tokens: o.max_tokens,
-            temperature: o.temperature,
-            top_p: o.top_p,
-            vision,
-            image_token_id,
-            local_images: o.local_images.unwrap_or(loopback),
-        },
-        tok,
-        jobs: Mutex::new(tx),
+        models: Arc::clone(&models),
+        api_key,
+        local_images,
+        ctx,
     });
-    log(format!("serving {} at http://{addr}/v1", o.name));
+    log(format!("serving {default_name} at http://{addr}/v1"));
     let activity = Arc::new(Activity { active: AtomicUsize::new(0), last: AtomicU64::new(0), epoch: Instant::now() });
     let requests = Arc::clone(&activity);
     let accept = std::thread::Builder::new()

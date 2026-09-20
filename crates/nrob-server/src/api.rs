@@ -23,14 +23,13 @@
 use std::io;
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, RecvTimeoutError, Sender};
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use dsv41::chat::{self, Delta, Mode};
 use dsv41::config::VisionConfig;
-use dsv41::tokenizer::Tokenizer;
 use dsv41::vision;
 use nrob::json::Json;
 
@@ -56,9 +55,16 @@ pub struct Config {
 }
 
 pub struct Server {
-    pub cfg: Config,
-    pub tok: Arc<Tokenizer>,
-    pub jobs: Mutex<Sender<Job>>,
+    // VENDORED-LOCAL: more than one configured model, switched on demand.
+    /// The configured models and whichever is loaded. A request naming a different
+    /// one unloads the current model first — see [`crate::models::Models::activate`].
+    pub models: Arc<crate::models::Models>,
+    /// Server-wide, not per model.
+    pub api_key: Option<String>,
+    pub local_images: bool,
+    /// The configured context cap, for `/v1/models`. What a model actually allows
+    /// is in its own `Config` once it is loaded.
+    pub ctx: usize,
 }
 
 struct ApiError {
@@ -164,7 +170,7 @@ impl Server {
         if path == "/health" || path == "/" {
             return json_response(w, 200, &Json::obj([("status", Json::str("ok"))]));
         }
-        if let Some(key) = &self.cfg.api_key {
+        if let Some(key) = &self.api_key {
             let ok = req.header("authorization").and_then(|v| v.strip_prefix("Bearer ")).is_some_and(|v| v.trim() == key);
             if !ok {
                 return error_response(w, &ApiError { status: 401, message: "missing or wrong API key".into(), code: "invalid_api_key" });
@@ -185,20 +191,41 @@ impl Server {
         }
     }
 
+    /// Every configured model, with the loaded one marked.
     fn models(&self) -> Json {
-        Json::obj([
-            ("object", Json::str("list")),
-            (
-                "data",
-                Json::Arr(vec![Json::obj([
-                    ("id", Json::str(&self.cfg.model_name)),
+        let loaded = self.models.loaded();
+        let data: Vec<Json> = self
+            .models
+            .names()
+            .into_iter()
+            .map(|name| {
+                let is_loaded = loaded.as_deref() == Some(name.as_str());
+                Json::obj([
+                    ("id", Json::str(&name)),
                     ("object", Json::str("model")),
                     ("created", Json::Int(now() as i64)),
                     ("owned_by", Json::str("nrob")),
-                    ("context_length", Json::Int(self.cfg.max_seq as i64)),
-                ])]),
-            ),
-        ])
+                    ("context_length", Json::Int(self.ctx as i64)),
+                    // Not OpenAI's, but a client switching models wants to know
+                    // which one is resident: the others cost a load.
+                    ("loaded", Json::Bool(is_loaded)),
+                ])
+            })
+            .collect();
+        Json::obj([("object", Json::str("list")), ("data", Json::Arr(data))])
+    }
+
+    /// The model a request asks for, loading it if it is not the live one.
+    ///
+    /// A switch unloads the current model first, so this can take as long as a load
+    /// — which is why `/v1/models` says which one is already resident.
+    fn active(&self, body: &Json) -> Result<crate::models::Active, ApiError> {
+        let want = body.get("model").and_then(Json::as_str).filter(|s| !s.is_empty());
+        self.models.activate(want).map_err(|message| ApiError {
+            status: 400,
+            message,
+            code: "model_not_found",
+        })
     }
 
     fn parse_body(req: &Request) -> Result<Json, ApiError> {
@@ -209,16 +236,16 @@ impl Server {
         Ok(body)
     }
 
-    fn sampling(&self, body: &Json) -> Result<(Sampling, usize), ApiError> {
+    fn sampling(&self, a: &crate::models::Active, body: &Json) -> Result<(Sampling, usize), ApiError> {
         let num = |k: &str| body.get(k).filter(|v| !matches!(v, Json::Null)).map(|v| v.as_f64().ok_or_else(|| bad(format!("{k} must be a number")))).transpose();
-        let temperature = num("temperature")?.map_or(self.cfg.temperature, |v| v as f32);
-        let top_p = num("top_p")?.map_or(self.cfg.top_p, |v| v as f32);
+        let temperature = num("temperature")?.map_or(a.cfg.temperature, |v| v as f32);
+        let top_p = num("top_p")?.map_or(a.cfg.top_p, |v| v as f32);
         if !((0.0..=2.0).contains(&temperature) && top_p > 0.0 && top_p <= 1.0) {
             return Err(bad("temperature must be in [0, 2] and top_p in (0, 1]"));
         }
         let top_k = num("top_k")?.map_or(0, |v| v.max(0.0) as usize);
         let seed = num("seed")?.map_or_else(|| SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64), |v| v as u64);
-        let max_tokens = num("max_completion_tokens")?.or(num("max_tokens")?).map_or(self.cfg.max_tokens, |v| v.max(1.0) as usize);
+        let max_tokens = num("max_completion_tokens")?.or(num("max_tokens")?).map_or(a.cfg.max_tokens, |v| v.max(1.0) as usize);
         if body.get("n").and_then(Json::as_i64).is_some_and(|n| n != 1) {
             return Err(bad("n > 1 is not supported"));
         }
@@ -238,11 +265,11 @@ impl Server {
     /// Thinking mode and effort: `reasoning_effort` ("none"/"minimal" turn
     /// it off; "low".."max" or 1-100 turn it on), or DeepSeek's
     /// `thinking: {"type": "enabled"|"disabled"}`, else the server default.
-    fn mode(&self, body: &Json) -> Result<(Mode, u32), ApiError> {
-        let default = (if self.cfg.thinking { Mode::Thinking } else { Mode::Chat }, self.cfg.effort);
+    fn mode(&self, a: &crate::models::Active, body: &Json) -> Result<(Mode, u32), ApiError> {
+        let default = (if a.cfg.thinking { Mode::Thinking } else { Mode::Chat }, a.cfg.effort);
         if let Some(e) = body.get("reasoning_effort").filter(|v| !matches!(v, Json::Null)) {
             if matches!(e.as_str(), Some("none" | "minimal")) {
-                return Ok((Mode::Chat, self.cfg.effort));
+                return Ok((Mode::Chat, a.cfg.effort));
             }
             let effort = chat::parse_effort(e).ok_or_else(|| bad("reasoning_effort must be none, low, medium, high, max or 1-100"))?;
             return Ok((Mode::Thinking, effort));
@@ -301,21 +328,21 @@ impl Server {
 
     /// Decode and size a request's images and expand their placeholders in
     /// the prompt into image spans.
-    fn prepare_images(&self, records: &[Json], prompt: Vec<u32>) -> Result<(Vec<u32>, Vec<JobImage>), ApiError> {
-        let Some(vc) = &self.cfg.vision else {
+    fn prepare_images(&self, a: &crate::models::Active, records: &[Json], prompt: Vec<u32>) -> Result<(Vec<u32>, Vec<JobImage>), ApiError> {
+        let Some(vc) = &a.cfg.vision else {
             return Err(bad("this server runs without the vision tower (started with --no-vision); images are not supported"));
         };
         let mut preps = Vec::with_capacity(records.len());
         let mut hashes = Vec::with_capacity(records.len());
         for (i, rec) in records.iter().enumerate() {
-            let bytes = vision::image_bytes(rec, self.cfg.local_images).map_err(|e| bad(format!("image {}: {e}", i + 1)))?;
+            let bytes = vision::image_bytes(rec, self.local_images).map_err(|e| bad(format!("image {}: {e}", i + 1)))?;
             let prep = vision::load_image(&bytes, vc).map_err(|e| bad(format!("image {}: {e}", i + 1)))?;
             let mut h = std::hash::DefaultHasher::new();
             std::hash::Hasher::write(&mut h, &bytes);
             hashes.push(std::hash::Hasher::finish(&h));
             preps.push(prep);
         }
-        let (ids, starts) = vision::expand_placeholders(&prompt, self.cfg.image_token_id, &preps).map_err(|e| bad(e.to_string()))?;
+        let (ids, starts) = vision::expand_placeholders(&prompt, a.cfg.image_token_id, &preps).map_err(|e| bad(e.to_string()))?;
         let images = preps.into_iter().zip(starts).zip(hashes).map(|((prep, start), hash)| JobImage { start, prep, hash }).collect();
         Ok((ids, images))
     }
@@ -336,21 +363,24 @@ impl Server {
         }
     }
 
-    fn submit(&self, prompt: Vec<u32>, images: Vec<JobImage>, sampling: Sampling, max_tokens: usize, think_budget: Option<usize>) -> Result<(mpsc::Receiver<Event>, Arc<AtomicBool>), ApiError> {
-        if prompt.len() + 1 > self.cfg.max_seq {
+    fn submit(&self, a: &crate::models::Active, prompt: Vec<u32>, images: Vec<JobImage>, sampling: Sampling, max_tokens: usize, think_budget: Option<usize>) -> Result<(mpsc::Receiver<Event>, Arc<AtomicBool>), ApiError> {
+        if prompt.len() + 1 > a.cfg.max_seq {
             return Err(ApiError {
                 status: 400,
-                message: format!("the prompt is {} tokens; this server's context is {}", prompt.len(), self.cfg.max_seq),
+                message: format!(
+                    "the prompt is {} tokens; {}'s context here is {}",
+                    prompt.len(),
+                    a.cfg.model_name,
+                    a.cfg.max_seq
+                ),
                 code: "context_length_exceeded",
             });
         }
-        let max_tokens = max_tokens.min(self.cfg.max_seq - prompt.len());
+        let max_tokens = max_tokens.min(a.cfg.max_seq - prompt.len());
         let (tx, rx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
         let job = Job { prompt, images, max_tokens, think_budget, sampling, cancel: Arc::clone(&cancel), events: tx };
-        self.jobs
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
+        a.jobs
             .send(job)
             .map_err(|_| ApiError { status: 503, message: "the model worker has stopped".into(), code: "unavailable" })?;
         Ok((rx, cancel))
@@ -358,25 +388,31 @@ impl Server {
 
     fn chat(&self, req: &Request, w: &mut TcpStream) -> Result<bool, ApiError> {
         let body = Self::parse_body(req)?;
-        let (sampling, max_tokens) = self.sampling(&body)?;
+        // Before anything else: which model, loading it if it is not the live one.
+        let a = self.active(&body)?;
+        let (sampling, max_tokens) = self.sampling(&a, &body)?;
         let stops = Self::stops(&body)?;
-        let (mode, effort) = self.mode(&body)?;
+        let (mode, effort) = self.mode(&a, &body)?;
         let msgs = Self::messages(&body)?;
-        let encoded = chat::encode(&msgs, &chat::Options { mode, effort, drop_thinking: true }).map_err(|e| bad(e.to_string()))?;
-        let prompt = self.tok.encode(&encoded.prompt);
-        let (prompt, images) = if encoded.images.is_empty() { (prompt, Vec::new()) } else { self.prepare_images(&encoded.images, prompt)? };
-        if images.is_empty() && prompt.contains(&self.cfg.image_token_id) {
+        // Each model's own template.
+        let encoded = a
+            .flavour
+            .chat_prompt(&msgs, &chat::Options { mode, effort, drop_thinking: true })
+            .map_err(bad)?;
+        let prompt = a.flavour.encode(&encoded.prompt);
+        let (prompt, images) = if encoded.images.is_empty() { (prompt, Vec::new()) } else { self.prepare_images(&a, &encoded.images, prompt)? };
+        if images.is_empty() && prompt.contains(&a.cfg.image_token_id) {
             return Err(bad("the prompt holds an image placeholder but no image"));
         }
         let n_prompt = prompt.len();
         let stream = body.get("stream").and_then(Json::as_bool).unwrap_or(false);
         let include_usage = body.get("stream_options").and_then(|o| o.get("include_usage")).and_then(Json::as_bool).unwrap_or(false);
         let think_budget = if mode == Mode::Thinking { Self::think_budget(&body, effort) } else { None };
-        let (rx, cancel) = self.submit(prompt, images, sampling, max_tokens, think_budget)?;
+        let (rx, cancel) = self.submit(&a, prompt, images, sampling, max_tokens, think_budget)?;
         let peer = w.try_clone().ok();
         let id = random_id("chatcmpl-");
         let created = now();
-        let model = self.cfg.model_name.clone();
+        let model = a.cfg.model_name.clone();
 
         let chunk = |delta: Json, finish: Option<&str>| -> Json {
             Json::obj([
@@ -648,19 +684,20 @@ impl Server {
     /// Raw completion of a text prompt (no chat template).
     fn completions(&self, req: &Request, w: &mut TcpStream) -> Result<bool, ApiError> {
         let body = Self::parse_body(req)?;
-        let (sampling, max_tokens) = self.sampling(&body)?;
+        let a = self.active(&body)?;
+        let (sampling, max_tokens) = self.sampling(&a, &body)?;
         let stops = Self::stops(&body)?;
         let text = body.get("prompt").and_then(Json::as_str).ok_or_else(|| bad("prompt must be a string"))?;
-        let prompt = self.tok.encode(text);
+        let prompt = a.flavour.encode(text);
         if prompt.is_empty() {
             return Err(bad("prompt is empty"));
         }
-        if prompt.contains(&self.cfg.image_token_id) {
+        if prompt.contains(&a.cfg.image_token_id) {
             return Err(bad("raw completions take no images; send them to /v1/chat/completions"));
         }
         let n_prompt = prompt.len();
         let stream = body.get("stream").and_then(Json::as_bool).unwrap_or(false);
-        let (rx, cancel) = self.submit(prompt, Vec::new(), sampling, max_tokens, None)?;
+        let (rx, cancel) = self.submit(&a, prompt, Vec::new(), sampling, max_tokens, None)?;
         let peer = w.try_clone().ok();
         let id = random_id("cmpl-");
         let created = now();
@@ -669,7 +706,7 @@ impl Server {
                 ("id", Json::str(&id)),
                 ("object", Json::str("text_completion")),
                 ("created", Json::Int(created as i64)),
-                ("model", Json::str(&self.cfg.model_name)),
+                ("model", Json::str(&a.cfg.model_name)),
                 (
                     "choices",
                     Json::Arr(vec![Json::obj([

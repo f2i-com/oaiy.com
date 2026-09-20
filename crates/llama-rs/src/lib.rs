@@ -47,6 +47,9 @@ pub mod expert_stream;
 use std::sync::Arc;
 
 pub use chat::{apply_chat_template, chat_stop_tokens, ChatMessage, Role};
+// VENDORED-LOCAL: GLM-5.3-Flash. Its template takes a reasoning effort and a
+// choice of thinking or not, which a server needs to pass through.
+pub use chat::{glm5next_template_full, glm5next_template_with, ReasoningEffort};
 pub use config::{Architecture, LlamaConfig, ModelConfig};
 pub use gemma3::Gemma3Model;
 pub use gemma3n::Gemma3nModel;

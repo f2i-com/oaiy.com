@@ -1,0 +1,472 @@
+//! VENDORED-LOCAL: the configured models, and swapping between them.
+//!
+//! The server used to load one model for the life of the process. It can now hold
+//! a list and switch on demand, which is what a client asking for a different
+//! `model` means: the running engine is dropped — freeing its VRAM and its host
+//! expert cache — and the requested one is loaded in its place.
+//!
+//! # Why dropping is enough
+//!
+//! Each engine runs on its own thread with `for job in jobs`, so closing the job
+//! channel ends the loop, the thread returns, and the engine and its model are
+//! dropped with it. That releases the device allocations and the expert cache
+//! without this module knowing anything about either. [`Models::activate`] joins
+//! the thread before loading the replacement, so the two models are never resident
+//! at once — which matters when each is ~190 GB across VRAM, RAM and the drive.
+//!
+//! # What differs per model, and what does not
+//!
+//! Very little differs. `api.rs` and `http.rs` never mention an engine: a request
+//! becomes a [`Job`] on a channel and the reply is a stream of `Event`s. Of the
+//! model-specific surface, `api.rs` touches exactly two things — turning messages
+//! into a prompt string, and turning that string into tokens — so [`Flavour`]
+//! carries those and everything else is shared, including the SSE plumbing, the
+//! sampling defaults, the stop handling, and the `<think>` stream parser (GLM and
+//! DeepSeek both use `<think>` / `</think>`, so it needs no variant).
+
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::Sender;
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
+
+use nrob::{Error, Result};
+
+use crate::engine::Job;
+use crate::{api, disk, engine, glm, Options, STATE_FORMAT};
+
+/// Which runtime serves a model, decided by what is on disk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    /// `dsv41-cuda`: a safetensors checkpoint directory with Engram tables.
+    Deepseek,
+    /// `llama-rs`: a GGUF file, or a directory holding one.
+    Gguf,
+}
+
+impl Kind {
+    /// A `.gguf` (or a directory containing one) is served through llama-rs;
+    /// anything else is taken for a DeepSeek checkpoint directory, which is what
+    /// this server has always assumed.
+    pub fn detect(path: &Path) -> Kind {
+        if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("gguf")) {
+            return Kind::Gguf;
+        }
+        if path.is_dir() {
+            let has_gguf = std::fs::read_dir(path).ok().is_some_and(|d| {
+                d.filter_map(|e| e.ok()).any(|e| {
+                    e.path()
+                        .extension()
+                        .is_some_and(|x| x.eq_ignore_ascii_case("gguf"))
+                })
+            });
+            if has_gguf {
+                return Kind::Gguf;
+            }
+        }
+        Kind::Deepseek
+    }
+
+    /// The first shard of a split GGUF in `dir`, or `dir` itself when it is a file.
+    ///
+    /// `gguf`'s reader follows `-00002-of-00005` onwards from whichever shard it is
+    /// given, so naming the lowest one is enough.
+    fn gguf_path(path: &Path) -> Result<PathBuf> {
+        if path.is_file() {
+            return Ok(path.to_path_buf());
+        }
+        let mut shards: Vec<PathBuf> = std::fs::read_dir(path)
+            .map_err(Error::Io)?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| {
+                p.extension()
+                    .is_some_and(|x| x.eq_ignore_ascii_case("gguf"))
+            })
+            .collect();
+        shards.sort();
+        shards.into_iter().next().ok_or_else(|| {
+            Error::Arg(format!("no .gguf in {}", path.display()))
+        })
+    }
+}
+
+/// One configured model: the name a client asks for, and where it is.
+#[derive(Clone, Debug)]
+pub struct Spec {
+    pub name: String,
+    pub path: PathBuf,
+    pub kind: Kind,
+}
+
+/// The model-specific half of turning a request into tokens.
+pub enum Flavour {
+    Deepseek(Arc<dsv41::tokenizer::Tokenizer>),
+    Gguf(Arc<tokenizer::Tokenizer>),
+}
+
+impl Flavour {
+    pub fn encode(&self, text: &str) -> Vec<u32> {
+        match self {
+            Self::Deepseek(t) => t.encode(text),
+            // llama-rs applies BOS through the template, so not again here.
+            Self::Gguf(t) => t.encode(text, false).unwrap_or_default(),
+        }
+    }
+
+    /// The prompt for a chat request, in this model's own template.
+    ///
+    /// Both templates put the reply inside a `<think>` block the prompt opens, so
+    /// the reply parser downstream needs no variant.
+    pub fn chat_prompt(
+        &self,
+        msgs: &[nrob::json::Json],
+        opts: &dsv41::chat::Options,
+    ) -> std::result::Result<dsv41::chat::Encoded, String> {
+        match self {
+            Self::Deepseek(_) => {
+                dsv41::chat::encode(msgs, opts).map_err(|e| e.to_string())
+            }
+            Self::Gguf(_) => {
+                // The same messages through llama-rs's GLM template. `reasoning
+                // effort` maps onto the three the reference Jinja accepts; the
+                // DeepSeek options carry a 1-100 scale, so it is banded.
+                let effort = match opts.effort {
+                    0..=33 => llama_rs::ReasoningEffort::Low,
+                    34..=66 => llama_rs::ReasoningEffort::High,
+                    _ => llama_rs::ReasoningEffort::Max,
+                };
+                let mut out = Vec::new();
+                for m in msgs {
+                    let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("user");
+                    let content = m
+                        .get("content")
+                        .and_then(|c| c.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    let role = match role {
+                        "system" => llama_rs::Role::System,
+                        "assistant" => llama_rs::Role::Assistant,
+                        _ => llama_rs::Role::User,
+                    };
+                    out.push(llama_rs::ChatMessage { role, content });
+                }
+                Ok(dsv41::chat::Encoded {
+                    prompt: llama_rs::glm5next_template_with(&out, true, effort),
+                    images: Vec::new(),
+                })
+            }
+        }
+    }
+}
+
+/// A model that is loaded and serving.
+pub struct Active {
+    pub jobs: Sender<Job>,
+    pub cfg: Arc<api::Config>,
+    pub flavour: Arc<Flavour>,
+}
+
+struct Live {
+    name: String,
+    jobs: Sender<Job>,
+    thread: JoinHandle<()>,
+    cfg: Arc<api::Config>,
+    flavour: Arc<Flavour>,
+}
+
+/// The configured models, and whichever one is currently loaded.
+pub struct Models {
+    specs: Vec<Spec>,
+    default_name: String,
+    opts: Options,
+    loopback: bool,
+    live: Mutex<Option<Live>>,
+}
+
+impl Models {
+    pub fn new(opts: Options, loopback: bool) -> Result<Models> {
+        let mut specs = vec![Spec {
+            name: opts.name.clone(),
+            path: opts.model.clone(),
+            kind: Kind::detect(&opts.model),
+        }];
+        for (name, path) in &opts.extra_models {
+            if specs.iter().any(|s| &s.name == name) {
+                return Err(Error::Arg(format!("two models are both called {name}")));
+            }
+            specs.push(Spec {
+                name: name.clone(),
+                path: path.clone(),
+                kind: Kind::detect(path),
+            });
+        }
+        Ok(Models {
+            default_name: specs[0].name.clone(),
+            specs,
+            opts,
+            loopback,
+            live: Mutex::new(None),
+        })
+    }
+
+    pub fn names(&self) -> Vec<String> {
+        self.specs.iter().map(|s| s.name.clone()).collect()
+    }
+
+    pub fn default_name(&self) -> &str {
+        &self.default_name
+    }
+
+    /// Which model is loaded right now, if any.
+    pub fn loaded(&self) -> Option<String> {
+        self.live
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .map(|l| l.name.clone())
+    }
+
+    /// Make `want` the running model and hand back what a request needs.
+    ///
+    /// Already running: this is a lock and three clones. Otherwise the current
+    /// engine is shut down and joined *before* the replacement loads, so the two
+    /// models are never resident together.
+    pub fn activate(&self, want: Option<&str>) -> std::result::Result<Active, String> {
+        let want = want.unwrap_or(&self.default_name);
+        let spec = self
+            .specs
+            .iter()
+            .find(|s| s.name == want)
+            .ok_or_else(|| {
+                format!(
+                    "no model called {want}; this server has {}",
+                    self.names().join(", ")
+                )
+            })?
+            .clone();
+
+        let mut live = self.live.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(l) = live.as_ref() {
+            if l.name == spec.name {
+                return Ok(Active {
+                    jobs: l.jobs.clone(),
+                    cfg: Arc::clone(&l.cfg),
+                    flavour: Arc::clone(&l.flavour),
+                });
+            }
+        }
+
+        // Unload first. Dropping the sender ends the engine's `for job in jobs`
+        // loop; joining waits for the model to be dropped with the thread, which
+        // is what frees the VRAM and the expert cache.
+        if let Some(l) = live.take() {
+            self.say(format!("unloading {}", l.name));
+            drop(l.jobs);
+            let _ = l.thread.join();
+            self.say(format!("{} unloaded", l.name));
+        }
+
+        let t = std::time::Instant::now();
+        self.say(format!("loading {} from {}", spec.name, spec.path.display()));
+        let next = match spec.kind {
+            Kind::Deepseek => self.load_deepseek(&spec),
+            Kind::Gguf => self.load_gguf(&spec),
+        }
+        .map_err(|e| format!("loading {}: {e}", spec.name))?;
+        self.say(format!(
+            "{} ready in {:.1}s",
+            spec.name,
+            t.elapsed().as_secs_f64()
+        ));
+
+        let active = Active {
+            jobs: next.jobs.clone(),
+            cfg: Arc::clone(&next.cfg),
+            flavour: Arc::clone(&next.flavour),
+        };
+        *live = Some(next);
+        Ok(active)
+    }
+
+    fn say(&self, msg: String) {
+        if !self.opts.silent {
+            eprintln!("{msg}");
+        }
+    }
+
+    fn base_cfg(&self, spec: &Spec, max_seq: usize) -> api::Config {
+        let o = &self.opts;
+        api::Config {
+            model_name: spec.name.clone(),
+            api_key: o.api_key.clone(),
+            max_seq,
+            thinking: o.thinking,
+            effort: o.effort,
+            max_tokens: o.max_tokens,
+            temperature: o.temperature,
+            top_p: o.top_p,
+            vision: None,
+            image_token_id: 0,
+            local_images: o.local_images.unwrap_or(self.loopback),
+        }
+    }
+
+    // ---------------------------------------------------------------- DeepSeek
+    fn load_deepseek(&self, spec: &Spec) -> Result<Live> {
+        use dsv41_cuda::{GpuModel, GpuOptions};
+
+        let o = &self.opts;
+        let devices = if o.devices.is_empty() {
+            (0..dsv41_cuda::gpu::device_count()?.min(2)).collect()
+        } else {
+            o.devices.clone()
+        };
+        let tok = Arc::new(dsv41::tokenizer::Tokenizer::load(&spec.path)?);
+        let gopts = GpuOptions {
+            devices,
+            max_seq: o.ctx,
+            expert_cache_bytes: o.ram_gb << 30,
+            direct_io: true,
+            vram_expert_bytes: None,
+            vram_headroom_bytes: (o.headroom_gb * (1u64 << 30) as f64) as usize,
+            cpu_expert_threads: o.cpu_threads,
+            vision: o.vision,
+            residual_on_device: None,
+        };
+        let engram_meta = o
+            .engram_meta
+            .clone()
+            .unwrap_or_else(|| spec.path.join("engram_meta.safetensors"));
+        let mut model = GpuModel::load(&spec.path, &engram_meta, &gopts)?;
+        if let Some(path) = o.usage.as_ref().filter(|p| p.exists()) {
+            let (vram, queued) = model.warm(path, 4)?;
+            self.say(format!(
+                "warmed {vram} experts into VRAM; {queued} more loading into RAM in the background"
+            ));
+        }
+
+        let mut cfg = self.base_cfg(spec, o.ctx);
+        if model.has_vision() {
+            cfg.vision = model.cfg.vision.clone();
+            self.say("vision tower loaded; chat requests may carry images".into());
+        }
+        cfg.image_token_id = model.cfg.image_token_id;
+
+        let (jobs, rx) = std::sync::mpsc::channel();
+        let request_log = !o.quiet && !o.silent;
+        let mut e = engine::Engine::new(
+            model,
+            Arc::clone(&tok),
+            o.chunk,
+            o.step_below,
+            o.layered_max,
+            o.checkpoints,
+            o.usage.clone(),
+            request_log,
+        );
+        e.warn = !o.silent;
+        if let Some(dir) = &o.prompt_cache {
+            // States belong to this model (its config and weight map) and to this
+            // state format.
+            let mut fingerprint = disk::fnv(&[STATE_FORMAT], 0);
+            for name in ["config.json", "model.safetensors.index.json"] {
+                fingerprint =
+                    disk::fnv(&std::fs::read(spec.path.join(name)).unwrap_or_default(), fingerprint);
+            }
+            match disk::DiskCache::open(dir, fingerprint, (o.prompt_cache_gb * 1e9) as u64) {
+                Ok(cache) => {
+                    self.say(format!("{} prompt states on disk in {}", cache.len(), dir.display()));
+                    e.disk = Some(cache);
+                }
+                Err(err) => {
+                    self.say(format!("prompt states are not kept ({}: {err})", dir.display()))
+                }
+            }
+        }
+        let thread = std::thread::Builder::new()
+            .name("model".into())
+            .spawn(move || e.run(rx))
+            .map_err(Error::Io)?;
+
+        Ok(Live {
+            name: spec.name.clone(),
+            jobs,
+            thread,
+            cfg: Arc::new(cfg),
+            flavour: Arc::new(Flavour::Deepseek(tok)),
+        })
+    }
+
+    // ---------------------------------------------------------------- GGUF
+    fn load_gguf(&self, spec: &Spec) -> Result<Live> {
+        let o = &self.opts;
+        let path = Kind::gguf_path(&spec.path)?;
+        let backend: Arc<dyn ggml_rs::Backend> = Arc::new(
+            ggml_rs_cuda::CudaBackend::new(o.devices.first().copied().unwrap_or(0))
+                .map_err(|e| Error::Arg(format!("cuda: {e}")))?,
+        );
+        let model = llama_rs::Model::open_streaming(&path, backend, (o.ram_gb as u64) << 30)
+            .map_err(|e| Error::Arg(e.to_string()))?;
+        let tok = Arc::new(model.tokenizer().clone());
+
+        // The state the model was opened with bounds the context, whatever was
+        // asked for.
+        let max_seq = match &model {
+            llama_rs::Model::Glm5Next(g) => g.max_len().min(o.ctx),
+            _ => o.ctx,
+        };
+        let cfg = self.base_cfg(spec, max_seq);
+
+        let (jobs, rx) = std::sync::mpsc::channel();
+        let e = glm::GlmEngine::new(model, Arc::clone(&tok), max_seq, !o.quiet && !o.silent);
+        let thread = std::thread::Builder::new()
+            .name("model".into())
+            .spawn(move || e.run(rx))
+            .map_err(Error::Io)?;
+
+        Ok(Live {
+            name: spec.name.clone(),
+            jobs,
+            thread,
+            cfg: Arc::new(cfg),
+            flavour: Arc::new(Flavour::Gguf(tok)),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The runtime is chosen by what is on disk, not by configuration, so a
+    /// mis-set `kind` cannot send a GGUF to the DeepSeek loader.
+    #[test]
+    fn kind_comes_from_the_path() {
+        let d = std::env::temp_dir().join("nrob-kind-test");
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("gguf")).unwrap();
+        std::fs::create_dir_all(d.join("checkpoint")).unwrap();
+        std::fs::write(d.join("gguf").join("m-00001-of-00002.gguf"), b"x").unwrap();
+        std::fs::write(d.join("gguf").join("m-00002-of-00002.gguf"), b"x").unwrap();
+        std::fs::write(d.join("checkpoint").join("config.json"), b"{}").unwrap();
+
+        assert_eq!(Kind::detect(&d.join("gguf")), Kind::Gguf);
+        assert_eq!(Kind::detect(&d.join("gguf").join("m-00001-of-00002.gguf")), Kind::Gguf);
+        assert_eq!(Kind::detect(&d.join("checkpoint")), Kind::Deepseek);
+        assert_eq!(Kind::detect(Path::new("nothing-here")), Kind::Deepseek);
+
+        // A split GGUF is opened at its lowest shard; the reader follows the rest.
+        let first = Kind::gguf_path(&d.join("gguf")).unwrap();
+        assert!(first.ends_with("m-00001-of-00002.gguf"), "got {}", first.display());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Two models may not share a name, or `activate` could not tell them apart.
+    #[test]
+    fn duplicate_names_are_refused() {
+        let mut o = Options::default();
+        o.name = "same".into();
+        o.extra_models = vec![("same".into(), PathBuf::from("elsewhere"))];
+        let err = Models::new(o, true).map(|_| ()).unwrap_err().to_string();
+        assert!(err.contains("both called same"), "got {err}");
+    }
+}
