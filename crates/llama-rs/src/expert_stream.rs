@@ -480,6 +480,18 @@ pub struct StreamShared {
     /// after open, before generation; read per layer-forward.
     #[cfg(feature = "cuda")]
     device: Mutex<Option<Arc<device_cache::DeviceCache>>>,
+    /// VENDORED-LOCAL: GLM-5.3-Flash. One VRAM expert cache per GPU, and which
+    /// one each layer uses.
+    ///
+    /// A cache lives on exactly one card, and a kernel can only read the card it
+    /// was launched on, so spanning two GPUs means partitioning by layer: a
+    /// layer's experts are cached on the card that runs that layer's expert FFN.
+    /// `shard_of[layer]` indexes `shards`. Empty means the single-cache path
+    /// above, which is what every other architecture here uses.
+    #[cfg(feature = "cuda")]
+    shards: Mutex<Vec<Arc<device_cache::DeviceCache>>>,
+    #[cfg(feature = "cuda")]
+    shard_of: Mutex<Vec<usize>>,
 }
 
 impl StreamShared {
@@ -514,6 +526,10 @@ impl StreamShared {
             error: Mutex::new(None),
             #[cfg(feature = "cuda")]
             device: Mutex::new(None),
+            #[cfg(feature = "cuda")]
+            shards: Mutex::new(Vec::new()),
+            #[cfg(feature = "cuda")]
+            shard_of: Mutex::new(Vec::new()),
         }))
     }
 
@@ -531,6 +547,75 @@ impl StreamShared {
         let dc = device_cache::DeviceCache::new(backend, budget_bytes, self.store.record_bytes())?;
         *self.device.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(dc));
         Ok(())
+    }
+
+    // VENDORED-LOCAL: GLM-5.3-Flash. Span the expert tier over several GPUs.
+    /// One VRAM expert cache per backend in `backends`, each with
+    /// `budget_bytes_each`, and `shard_of[layer]` naming which card runs that
+    /// layer -- so a layer's experts are cached on the card that computes them.
+    ///
+    /// Two RTX 5090s hold 32 GB each. The trunk measures 5.97 GB and sits on card
+    /// 0, so card 0 can spare ~24 GB and card 1 nearly all of its 32: roughly
+    /// 3 400 records of the 12 096 at 16.32 MB a slot, against ~1 500 on one
+    /// card. Partitioning contiguously also means each card sees the same layers
+    /// on every token, so its LFRU set converges instead of thrashing.
+    #[cfg(feature = "cuda")]
+    pub fn enable_device_shards(
+        &self,
+        backends: &[Arc<ggml_rs_cuda::CudaBackend>],
+        budget_bytes_each: usize,
+        shard_of: Vec<usize>,
+    ) -> Result<(), String> {
+        if backends.is_empty() {
+            return Err("expert stream: no backends for the VRAM tier".into());
+        }
+        if let Some(&bad) = shard_of.iter().find(|&&s| s >= backends.len()) {
+            return Err(format!(
+                "expert stream: layer assigned to card {bad}, only {} given",
+                backends.len()
+            ));
+        }
+        let rec = self.store.record_bytes();
+        let mut built = Vec::with_capacity(backends.len());
+        for b in backends {
+            built.push(Arc::new(device_cache::DeviceCache::new(
+                Arc::clone(b),
+                budget_bytes_each,
+                rec,
+            )?));
+        }
+        // The first shard also answers `device_cache()`, so anything that has not
+        // learned about sharding keeps working.
+        *self.device.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&built[0]));
+        *self.shards.lock().unwrap_or_else(|e| e.into_inner()) = built;
+        *self.shard_of.lock().unwrap_or_else(|e| e.into_inner()) = shard_of;
+        Ok(())
+    }
+
+    /// The VRAM expert cache that serves `layer`.
+    #[cfg(feature = "cuda")]
+    pub fn device_cache_for(&self, layer: u32) -> Option<Arc<device_cache::DeviceCache>> {
+        let map = self.shard_of.lock().unwrap_or_else(|e| e.into_inner());
+        match map.get(layer as usize).copied() {
+            Some(i) => self
+                .shards
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(i)
+                .map(Arc::clone),
+            None => self.device_cache(),
+        }
+    }
+
+    /// Per-card VRAM tier statistics, in card order. Empty when not sharded.
+    #[cfg(feature = "cuda")]
+    pub fn shard_stats(&self) -> Vec<device_cache::DeviceCacheStats> {
+        self.shards
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|d| d.stats())
+            .collect()
     }
 
     /// Test hook: attach an already-built cache (lets tests force the
@@ -652,7 +737,7 @@ impl LayerStream {
     // expert. A hit costs zero H2D bytes.
     pub(crate) fn resolve_experts(&self, experts: &[u32]) -> Result<Vec<ResolvedExpert>, String> {
         #[cfg(feature = "cuda")]
-        if let Some(dc) = self.shared.device_cache() {
+        if let Some(dc) = self.shared.device_cache_for(self.layer) {
             let mut distinct = experts.to_vec();
             distinct.sort_unstable();
             distinct.dedup();

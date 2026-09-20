@@ -167,7 +167,18 @@ impl ExpertFfn for DeviceExperts {
 /// not cross PCIe either.
 pub struct StreamExperts {
     shared: Arc<StreamShared>,
+    /// Card 0. The trunk lives here and `DeviceModel` reports its name.
     backend: Arc<dyn Backend>,
+    /// One per GPU the expert tier spans; `[backend]` when it spans one.
+    ///
+    /// A kernel reads only the card it was launched on, so a layer whose experts
+    /// are cached on card 1 must have its expert FFN launched on card 1. That is
+    /// free here: `apply_layer` takes host `x` and returns host `out`, so the
+    /// hidden state crosses cards through the host copy the `Mat` seam already
+    /// makes, with nothing extra to transfer.
+    backends: Vec<Arc<dyn Backend>>,
+    /// MoE ordinal -> index into `backends`.
+    card_of: Vec<usize>,
     /// One handle per MoE ordinal.
     layers: Vec<LayerStream>,
     n_embd: usize,
@@ -194,12 +205,62 @@ impl StreamExperts {
         let store = GgufExpertStore::new(g.clone(), layout)?;
         let shared = StreamShared::new(store, cache_budget_bytes, resident_est)?;
         let layers = (0..n_moe).map(|o| shared.layer(o as u32)).collect();
-        Ok(Self { shared, backend, layers, n_embd })
+        Ok(Self {
+            shared,
+            backends: vec![Arc::clone(&backend)],
+            card_of: vec![0; n_moe],
+            backend,
+            layers,
+            n_embd,
+        })
     }
 
     /// The shared cache state, so a caller can turn on the VRAM tier.
     pub fn shared(&self) -> &Arc<StreamShared> {
         &self.shared
+    }
+
+    /// Spread the expert tier over several GPUs: one VRAM cache per card with
+    /// `vram_each` bytes, MoE layers dealt out in contiguous runs.
+    ///
+    /// Contiguous rather than round-robin so each card sees the same layers on
+    /// every token and its LFRU set converges, and so the hidden state crosses
+    /// between cards once per boundary instead of on every layer.
+    #[cfg(feature = "cuda")]
+    pub fn spread_over(
+        &mut self,
+        cards: Vec<Arc<ggml_rs_cuda::CudaBackend>>,
+        vram_each: usize,
+    ) -> Result<()> {
+        if cards.is_empty() {
+            return Err(LlamaError::Config("device: no GPUs for the expert tier".into()));
+        }
+        let n_moe = self.layers.len();
+        let n = cards.len();
+        // Contiguous runs, the remainder spread over the first few cards.
+        let per = n_moe / n;
+        let extra = n_moe % n;
+        let mut card_of = Vec::with_capacity(n_moe);
+        for c in 0..n {
+            let count = per + usize::from(c < extra);
+            card_of.extend(std::iter::repeat_n(c, count));
+        }
+        debug_assert_eq!(card_of.len(), n_moe);
+
+        self.shared
+            .enable_device_shards(&cards, vram_each, card_of.clone())
+            .map_err(|e| LlamaError::Config(format!("device: VRAM tier: {e}")))?;
+        self.backends = cards
+            .into_iter()
+            .map(|c| c as Arc<dyn Backend>)
+            .collect();
+        self.card_of = card_of;
+        Ok(())
+    }
+
+    /// Which card runs MoE layer `ord`, and how many layers each card holds.
+    pub fn card_layout(&self) -> (&[usize], usize) {
+        (&self.card_of, self.backends.len())
     }
 
     pub fn record_bytes(&self) -> usize {
@@ -217,11 +278,17 @@ impl StreamExperts {
         })
     }
 
-    /// One resolved expert's FFN, input already on the device: the clamp is
-    /// fused, so the gate/up pair never leaves it.
-    fn run_expert(&self, r: &ResolvedExpert, xd: &Tensor, limit: f32) -> Tensor {
-        let h = r.pair().swiglu_clamped(&*self.backend, xd, limit, true);
-        r.down().linear(&*self.backend, &h)
+    /// One resolved expert's FFN, input already on `be`: the clamp is fused, so
+    /// the gate/up pair never leaves the device.
+    fn run_expert(&self, be: &dyn Backend, r: &ResolvedExpert, xd: &Tensor, limit: f32) -> Tensor {
+        let h = r.pair().swiglu_clamped(be, xd, limit, true);
+        r.down().linear(be, &h)
+    }
+
+    /// The backend that runs MoE layer `ord`.
+    fn card(&self, ord: usize) -> &dyn Backend {
+        let i = self.card_of.get(ord).copied().unwrap_or(0);
+        &*self.backends[i.min(self.backends.len() - 1)]
     }
 }
 
@@ -258,17 +325,15 @@ impl ExpertFfn for StreamExperts {
             .resolve_experts(&ids)
             .map_err(|err| LlamaError::Config(format!("device: MoE layer {ord}: {err}")))?;
 
-        let xd = self
-            .backend
-            .to_device(Tensor::from_vec(x.to_vec(), vec![1, self.n_embd]));
-        let mut acc = self
-            .backend
-            .to_device(Tensor::from_vec(vec![0.0f32; self.n_embd], vec![1, self.n_embd]));
+        let be = self.card(ord);
+        let xd = be.to_device(Tensor::from_vec(x.to_vec(), vec![1, self.n_embd]));
+        let mut acc =
+            be.to_device(Tensor::from_vec(vec![0.0f32; self.n_embd], vec![1, self.n_embd]));
         for (r, &(_, wt)) in resolved.iter().zip(experts) {
-            let o = self.run_expert(r, &xd, limit);
-            self.backend.add_to_axis0_range_scaled(&mut acc, 0, 1, &o, wt);
+            let o = self.run_expert(be, r, &xd, limit);
+            be.add_to_axis0_range_scaled(&mut acc, 0, 1, &o, wt);
         }
-        let oh = self.backend.to_host(acc);
+        let oh = be.to_host(acc);
         if oh.data().len() != out.len() {
             return Err(LlamaError::Config(format!(
                 "device: expert layer sum is {} values, expected {}",
@@ -295,11 +360,10 @@ impl ExpertFfn for StreamExperts {
         let resolved = ls
             .resolve_experts(&[e as u32])
             .map_err(|err| LlamaError::Config(format!("device: expert ({ord}, {e}): {err}")))?;
-        let xd = self
-            .backend
-            .to_device(Tensor::from_vec(x.to_vec(), vec![1, self.n_embd]));
-        let o = self.run_expert(&resolved[0], &xd, limit);
-        let oh = self.backend.to_host(o);
+        let be = self.card(ord);
+        let xd = be.to_device(Tensor::from_vec(x.to_vec(), vec![1, self.n_embd]));
+        let o = self.run_expert(be, &resolved[0], &xd, limit);
+        let oh = be.to_host(o);
         if oh.data().len() != out.len() {
             return Err(LlamaError::Config(format!(
                 "device: expert output is {} values, expected {}",
@@ -356,6 +420,42 @@ impl DeviceModel {
     /// The expert cache, so a caller can enable the VRAM tier.
     pub fn experts(&self) -> &StreamExperts {
         &self.experts
+    }
+
+    /// Mutable, for [`StreamExperts::spread_over`].
+    pub fn experts_mut(&mut self) -> &mut StreamExperts {
+        &mut self.experts
+    }
+
+    /// Open the released model with the expert tier spread over every visible
+    /// GPU: the trunk on card 0, a VRAM expert cache of `vram_each` bytes on each
+    /// card, and `ram_budget` bytes of RAM cache behind them.
+    ///
+    /// This is the full hierarchy: VRAM for the hot experts, RAM for the rest,
+    /// the GGUF on the SSD for what neither holds.
+    #[cfg(feature = "cuda")]
+    pub fn open_tiered(
+        path: impl AsRef<Path>,
+        max_len: usize,
+        n_gpus: usize,
+        ram_budget: usize,
+        vram_each: usize,
+    ) -> Result<Self> {
+        let mut cards = Vec::new();
+        for i in 0..n_gpus.max(1) {
+            match ggml_rs_cuda::CudaBackend::new(i) {
+                Ok(b) => cards.push(Arc::new(b)),
+                Err(e) if i == 0 => {
+                    return Err(LlamaError::Config(format!("device: no CUDA device 0: {e}")))
+                }
+                // Fewer cards than asked for is a smaller tier, not a failure.
+                Err(_) => break,
+            }
+        }
+        let trunk: Arc<dyn Backend> = Arc::clone(&cards[0]) as Arc<dyn Backend>;
+        let mut m = Self::open_with_cache(path, max_len, trunk, ram_budget)?;
+        m.experts_mut().spread_over(cards, vram_each)?;
+        Ok(m)
     }
 
     pub fn from_gguf(
@@ -1319,6 +1419,214 @@ mod tests {
             println!("left for experts  none: the trunk alone is over budget by {:.1} ms", -left * 1e3);
         }
         assert!(trunk > 0.0);
+    }
+
+    /// Spreading the expert tier over two cards must not change the answer.
+    ///
+    /// This is the correctness gate on multi-GPU. Half the MoE layers resolve
+    /// their experts from card 1 and run the FFN there, so a mistake in the
+    /// card/cache pairing -- a kernel launched on one card reading another card's
+    /// slot, or a `card_of` off by one -- shows up as garbage logits rather than
+    /// as an error. Compared against the same model on one card: both are CUDA,
+    /// the arithmetic is identical, so this should be exact.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "needs the released model on disk"]
+    fn two_cards_agree_with_one() {
+        let Some(backend) = cuda_backend() else { return };
+
+        // Two tokens in, so the KV cache and the KDA state are both non-trivial.
+        let prompt = [154822u32, 6172, 1043];
+
+        let one = DeviceModel::open_with_cache(RELEASED, 512, backend.clone(), 32 << 30)
+            .expect("one-card load");
+        let sh = one.shape().clone();
+        let w1 = one.view();
+        let mut s1 = forward::State::new(&sh).expect("state");
+        let a = forward::forward_prompt(&sh, &w1, &mut s1, &prompt).expect("one card");
+        drop(w1);
+        drop(one);
+
+        let two = match DeviceModel::open_tiered(RELEASED, 512, 2, 32 << 30, 8 << 30) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("no second card ({e}); skipping");
+                return;
+            }
+        };
+        let (card_of, n_cards) = two.experts().card_layout();
+        if n_cards < 2 {
+            eprintln!("only {n_cards} card visible; skipping");
+            return;
+        }
+        // The split has to actually split, or this test proves nothing.
+        assert!(
+            card_of.iter().any(|&c| c == 0) && card_of.iter().any(|&c| c == 1),
+            "both cards must own MoE layers, got {card_of:?}"
+        );
+        let w2 = two.view();
+        let mut s2 = forward::State::new(&sh).expect("state");
+        let b = forward::forward_prompt(&sh, &w2, &mut s2, &prompt).expect("two cards");
+
+        assert_eq!(a.len(), b.len());
+        let scale = a.iter().fold(0.0f32, |m, v| m.max(v.abs())).max(1.0);
+        let mut worst = 0.0f32;
+        for (p, q) in a.iter().zip(b.iter()) {
+            worst = worst.max((p - q).abs());
+        }
+        println!(
+            "max |one card - two cards| over {} logits: {:.5} (scale {:.3})",
+            a.len(),
+            worst,
+            scale
+        );
+        assert!(
+            worst <= 1e-4 * scale,
+            "two-card logits diverge: {worst} at scale {scale}"
+        );
+        assert!(a.iter().any(|&v| v.abs() > 1e-3), "logits are all zero");
+    }
+
+    /// The whole hierarchy: both cards' VRAM, RAM behind them, the GGUF behind
+    /// that.
+    ///
+    /// ```text
+    ///   SSD (192.97 GB of GGUF)
+    ///     -> RAM cache, LFRU with leases        GLM5_RAM_GB, default 128
+    ///        -> VRAM cache per card, LFRU       GLM5_VRAM_GB each, default 26
+    ///           -> the matvec, zero H2D on a hit
+    /// ```
+    ///
+    /// Experts are 182.44 GB of the model and a token routes 336 of the 12 096
+    /// records, 5.07 GB. At 20 tok/s that is 101 GB/s, which no SSD and no single
+    /// DDR5 channel pair can serve -- so the question the tiers answer is not how
+    /// fast bytes move but how few of them have to.
+    ///
+    /// Two 5090s hold 32 GB each. The trunk is 5.97 GB on card 0, so ~26 GB a
+    /// card is ~3 250 records, 27% of the model, against ~1 500 on one card.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "needs the released model on disk; measures the full tier stack"]
+    fn measure_tiered_throughput() {
+        let ram_gb: usize = std::env::var("GLM5_RAM_GB")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(128);
+        let vram_gb: usize = std::env::var("GLM5_VRAM_GB")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(26);
+        let n_gpus: usize = std::env::var("GLM5_GPUS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2);
+
+        let t0 = std::time::Instant::now();
+        let m = match DeviceModel::open_tiered(
+            RELEASED,
+            512,
+            n_gpus,
+            ram_gb << 30,
+            vram_gb << 30,
+        ) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("tiered open failed ({e}); skipping");
+                return;
+            }
+        };
+        let (card_of, n_cards) = m.experts().card_layout();
+        let mut per_card = vec![0usize; n_cards];
+        for &c in card_of {
+            per_card[c] += 1;
+        }
+        println!();
+        println!(
+            "load {:.1}s: {} card(s), {} GB VRAM each, {} GB RAM, record {:.2} MB",
+            t0.elapsed().as_secs_f64(),
+            n_cards,
+            vram_gb,
+            ram_gb,
+            m.experts().record_bytes() as f64 / 1e6
+        );
+        println!("  MoE layers per card: {per_card:?}");
+        let (dev, host, _) = m.residency();
+        println!(
+            "  trunk: {:.2} GB on card 0, {:.2} GB host",
+            dev as f64 / 1e9,
+            host as f64 / 1e9
+        );
+        println!(
+            "  VRAM expert slots: {} per card, {} total, {:.0}% of the 12096 records",
+            (vram_gb << 30) / m.experts().record_bytes(),
+            n_cards * ((vram_gb << 30) / m.experts().record_bytes()),
+            100.0 * (n_cards * ((vram_gb << 30) / m.experts().record_bytes())) as f64 / 12096.0
+        );
+
+        let sh = m.shape().clone();
+        let w = m.view();
+        let mut st = forward::State::new(&sh).expect("state");
+        let mut logits = forward::forward_token(&sh, &w, &mut st, 154822).expect("first");
+        let next = |lg: &Vec<f32>| -> u32 {
+            let mut best = f32::NEG_INFINITY;
+            let mut bi = 0usize;
+            for (i, &x) in lg.iter().enumerate() {
+                if x > best {
+                    best = x;
+                    bi = i;
+                }
+            }
+            bi as u32
+        };
+
+        let n = 8usize;
+        let t = std::time::Instant::now();
+        for _ in 0..n {
+            let tk = next(&logits);
+            logits = forward::forward_token(&sh, &w, &mut st, tk).expect("cold");
+        }
+        let cold = t.elapsed().as_secs_f64() / n as f64;
+
+        let mut st2 = forward::State::new(&sh).expect("state");
+        let mut lg2 = forward::forward_token(&sh, &w, &mut st2, 154822).expect("first");
+        let t = std::time::Instant::now();
+        for _ in 0..n {
+            let tk = next(&lg2);
+            lg2 = forward::forward_token(&sh, &w, &mut st2, tk).expect("warm");
+        }
+        let warm = t.elapsed().as_secs_f64() / n as f64;
+
+        println!();
+        for (i, st) in m.experts().shared().shard_stats().iter().enumerate() {
+            let look = st.hits + st.misses;
+            println!(
+                "  card {i}: {} hits / {} lookups = {:.1}%, {:.1} GB resident, {:.1} GB uploaded, {} evictions",
+                st.hits,
+                look,
+                100.0 * st.hits as f64 / look.max(1) as f64,
+                st.bytes_hit as f64 / 1e9,
+                st.h2d_bytes as f64 / 1e9,
+                st.evictions
+            );
+        }
+        let rc = m.experts().shared().cache_stats();
+        println!(
+            "  RAM tier: {:.1}% hits ({} / {})",
+            100.0 * rc.hits as f64 / (rc.hits + rc.misses).max(1) as f64,
+            rc.hits,
+            rc.hits + rc.misses
+        );
+        println!();
+        println!("cold  {:.3} s/token   ({:.2} tok/s)", cold, 1.0 / cold);
+        println!("warm  {:.3} s/token   ({:.2} tok/s)", warm, 1.0 / warm);
+        println!("target is 20 tok/s = 0.050 s/token");
+        let trunk = 0.1027;
+        println!(
+            "the trunk alone is {:.0} ms of that warm token; experts are {:.0} ms",
+            trunk * 1e3,
+            (warm - trunk).max(0.0) * 1e3
+        );
+        assert!(cold > 0.0 && warm > 0.0);
     }
 
     /// Decode throughput, cold cache then warm.
