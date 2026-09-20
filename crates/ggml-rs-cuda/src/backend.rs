@@ -427,9 +427,13 @@ impl Backend for CudaBackend {
     }
 
     fn vram_status(&self) -> Option<(usize, usize)> {
-        // cuMemGetInfo returns free + total bytes for the current context.
+        // cuMemGetInfo returns free + total bytes for the CURRENT context, so on
+        // a multi-GPU box it answers for whichever card this thread last touched
+        // unless we bind first. Without the bind, two 5090s both reported 22 GB
+        // free even though only one of them was holding the 5.97 GB trunk.
         // Cheap call (~1µs) so loaders can poll per-tensor without measurable
         // overhead.
+        self.ctx.bind_to_thread().ok()?;
         cudarc::driver::result::mem_get_info().ok()
     }
 

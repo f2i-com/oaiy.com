@@ -179,6 +179,8 @@ pub struct StreamExperts {
     backends: Vec<Arc<dyn Backend>>,
     /// MoE ordinal -> index into `backends`.
     card_of: Vec<usize>,
+    /// The VRAM budget each card's expert cache got, in card order.
+    vram_budgets: Vec<usize>,
     /// One handle per MoE ordinal.
     layers: Vec<LayerStream>,
     n_embd: usize,
@@ -209,6 +211,7 @@ impl StreamExperts {
             shared,
             backends: vec![Arc::clone(&backend)],
             card_of: vec![0; n_moe],
+            vram_budgets: Vec::new(),
             backend,
             layers,
             n_embd,
@@ -220,20 +223,82 @@ impl StreamExperts {
         &self.shared
     }
 
-    /// Spread the expert tier over several GPUs: one VRAM cache per card with
-    /// `vram_each` bytes, MoE layers dealt out in contiguous runs.
+    /// VRAM held back on each card: room for the activations, the pinned staging
+    /// ring, cuBLAS workspaces and the driver's own overhead.
+    ///
+    /// Decode activations are tiny -- a 4 x 4096 residual stream is 64 KB, the
+    /// widest FFN intermediate 8 KB -- but a matvec still needs somewhere to put
+    /// its output, and the pinned staging ring is three records. Override with
+    /// GLM5_VRAM_HEADROOM_MB.
+    pub const VRAM_HEADROOM: usize = 2 << 30;
+
+    /// Fraction of the remaining VRAM the expert cache may be *charged*.
+    ///
+    /// The cache counts the bytes it uploads, but each admitted expert is two or
+    /// three separate `device_slot` allocations of about 4.7 MB, and CUDA rounds
+    /// every one up to its allocation granularity. Measured on a 192-token
+    /// document: a cache charged 23 GB had the card at 24.4 GB, about 6% over --
+    /// and with only a 1 GB headroom the next staging slot hit
+    /// CUDA_ERROR_OUT_OF_MEMORY partway through the prefill. 0.88 leaves room for
+    /// that rounding and for the driver's own growth.
+    pub const VRAM_CHARGE_FRACTION: f64 = 0.88;
+
+    fn vram_headroom() -> usize {
+        std::env::var("GLM5_VRAM_HEADROOM_MB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .map(|mb| mb << 20)
+            .unwrap_or(Self::VRAM_HEADROOM)
+    }
+
+    /// Spread the expert tier over several GPUs, MoE layers dealt out in
+    /// contiguous runs, each card's cache sized to what is actually free on it.
     ///
     /// Contiguous rather than round-robin so each card sees the same layers on
     /// every token and its LFRU set converges, and so the hidden state crosses
     /// between cards once per boundary instead of on every layer.
+    ///
+    /// Sizes differ between cards because their loads do: card 0 carries the
+    /// 5.97 GB trunk, the others carry nothing, so asking every card for the same
+    /// budget leaves several GB unused on every card but the first. `cap` bounds
+    /// each card if a caller wants to hold some back; 0 means take what is free.
     #[cfg(feature = "cuda")]
     pub fn spread_over(
         &mut self,
         cards: Vec<Arc<ggml_rs_cuda::CudaBackend>>,
-        vram_each: usize,
+        cap: usize,
     ) -> Result<()> {
         if cards.is_empty() {
             return Err(LlamaError::Config("device: no GPUs for the expert tier".into()));
+        }
+        // What each card can actually give, measured on the card.
+        let rec = self.shared.record_bytes();
+        let head = Self::vram_headroom();
+        let mut budgets = Vec::with_capacity(cards.len());
+        for c in &cards {
+            let free = match c.vram_status() {
+                Some((free, total)) => {
+                    eprintln!(
+                        "  card: {:.1} GB free of {:.1} GB, holding back {:.1} GB",
+                        free as f64 / 1e9,
+                        total as f64 / 1e9,
+                        head as f64 / 1e9
+                    );
+                    free.saturating_sub(head)
+                }
+                // No query: fall back to the cap, or a conservative slice.
+                None => {
+                    if cap > 0 {
+                        cap
+                    } else {
+                        8 << 30
+                    }
+                }
+            };
+            let usable = (free as f64 * Self::VRAM_CHARGE_FRACTION) as usize;
+            let b = if cap > 0 { usable.min(cap) } else { usable };
+            // A cache smaller than a layer's route cannot hold one, so skip it.
+            budgets.push(if b / rec.max(1) >= 8 { b } else { 0 });
         }
         let n_moe = self.layers.len();
         let n = cards.len();
@@ -248,8 +313,9 @@ impl StreamExperts {
         debug_assert_eq!(card_of.len(), n_moe);
 
         self.shared
-            .enable_device_shards(&cards, vram_each, card_of.clone())
+            .enable_device_shards(&cards, &budgets, card_of.clone())
             .map_err(|e| LlamaError::Config(format!("device: VRAM tier: {e}")))?;
+        self.vram_budgets = budgets;
         self.backends = cards
             .into_iter()
             .map(|c| c as Arc<dyn Backend>)
@@ -261,6 +327,11 @@ impl StreamExperts {
     /// Which card runs MoE layer `ord`, and how many layers each card holds.
     pub fn card_layout(&self) -> (&[usize], usize) {
         (&self.card_of, self.backends.len())
+    }
+
+    /// The VRAM expert-cache budget each card ended up with, in card order.
+    pub fn vram_budgets(&self) -> &[usize] {
+        &self.vram_budgets
     }
 
     pub fn record_bytes(&self) -> usize {
@@ -427,19 +498,57 @@ impl DeviceModel {
         &mut self.experts
     }
 
+    /// Host RAM left for everything else when the RAM tier sizes itself.
+    ///
+    /// The tier is a hard cap the cache never exceeds, but the process also holds
+    /// the trunk's host copies, the tokenizer, the activations and the OS's own
+    /// working set, and Windows will start paging long before it reports no free
+    /// memory. Override with GLM5_RAM_RESERVE_GB.
+    pub const RAM_RESERVE: usize = 24 << 30;
+
+    /// The RAM-tier budget: everything free except [`Self::RAM_RESERVE`], capped
+    /// at what the experts could possibly need (the tier never benefits from
+    /// being larger than the whole expert set).
+    #[cfg(feature = "cuda")]
+    fn auto_ram_budget(expert_bytes: u64) -> usize {
+        let reserve = std::env::var("GLM5_RAM_RESERVE_GB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .map(|gb| gb << 30)
+            .unwrap_or(Self::RAM_RESERVE);
+        let free = match ggml_rs_cuda::host_memory() {
+            Some((free, total)) => {
+                eprintln!(
+                    "  host RAM: {:.1} GB free of {:.1} GB, reserving {:.1} GB",
+                    free as f64 / 1e9,
+                    total as f64 / 1e9,
+                    reserve as f64 / 1e9
+                );
+                free
+            }
+            // No reader for this platform: a conservative fixed tier.
+            None => {
+                eprintln!("  host RAM: unknown, using a 32 GB tier");
+                (32 << 30) + reserve
+            }
+        };
+        free.saturating_sub(reserve).min(expert_bytes as usize)
+    }
+
     /// Open the released model with the expert tier spread over every visible
-    /// GPU: the trunk on card 0, a VRAM expert cache of `vram_each` bytes on each
-    /// card, and `ram_budget` bytes of RAM cache behind them.
+    /// GPU: the trunk on card 0, a VRAM expert cache on each card sized to what
+    /// is free there, and a RAM cache behind them.
     ///
     /// This is the full hierarchy: VRAM for the hot experts, RAM for the rest,
-    /// the GGUF on the SSD for what neither holds.
+    /// the GGUF on the SSD for what neither holds. `ram_budget` of 0 sizes the
+    /// RAM tier from free host memory, `vram_cap` of 0 takes what each card has.
     #[cfg(feature = "cuda")]
     pub fn open_tiered(
         path: impl AsRef<Path>,
         max_len: usize,
         n_gpus: usize,
         ram_budget: usize,
-        vram_each: usize,
+        vram_cap: usize,
     ) -> Result<Self> {
         let mut cards = Vec::new();
         for i in 0..n_gpus.max(1) {
@@ -453,8 +562,24 @@ impl DeviceModel {
             }
         }
         let trunk: Arc<dyn Backend> = Arc::clone(&cards[0]) as Arc<dyn Backend>;
-        let mut m = Self::open_with_cache(path, max_len, trunk, ram_budget)?;
-        m.experts_mut().spread_over(cards, vram_each)?;
+
+        // The RAM tier wants sizing against the expert bytes, which needs the
+        // layout, which needs the file open. One cheap pass for the header.
+        let ram = if ram_budget > 0 {
+            ram_budget
+        } else {
+            let g = GgufFile::open_streaming(path.as_ref())?;
+            let expert_bytes: u64 = g
+                .tensors()
+                .iter()
+                .filter(|t| t.name.contains("_exps"))
+                .map(|t| t.nbytes())
+                .sum();
+            Self::auto_ram_budget(expert_bytes)
+        };
+
+        let mut m = Self::open_with_cache(path, max_len, trunk, ram)?;
+        m.experts_mut().spread_over(cards, vram_cap)?;
         Ok(m)
     }
 
@@ -1487,6 +1612,134 @@ mod tests {
         assert!(a.iter().any(|&v| v.abs() > 1e-3), "logits are all zero");
     }
 
+    /// The tier stack against a working set that does not fit one card.
+    ///
+    /// [`measure_tiered_throughput`] replays a short prefix, so a few hundred
+    /// distinct experts serve the whole run and one card's cache holds all of
+    /// them -- which makes the second card, the RAM tier and the SSD look free.
+    /// They are not; they are idle. DeepSeek measured its comparable 62.7% hit
+    /// rate over a 247-token document for the same reason.
+    ///
+    /// So: prefill a varied prompt first, which routes over a real spread of
+    /// experts and fills the tiers the way a prompt would, then time decode. The
+    /// numbers that matter are the per-card hit rates and how much came off the
+    /// SSD, not just the token time.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "needs the released model on disk; prefills a document first"]
+    fn measure_tiered_on_a_document() {
+        // 0 = size the RAM tier from free host memory.
+        let ram_gb: usize = std::env::var("GLM5_RAM_GB")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        let n_prompt: usize = std::env::var("GLM5_PROMPT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(192);
+        let n_gpus: usize = std::env::var("GLM5_GPUS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2);
+
+        let m = match DeviceModel::open_tiered(RELEASED, 512, n_gpus, ram_gb << 30, 0) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("tiered open failed ({e}); skipping");
+                return;
+            }
+        };
+        let sh = m.shape().clone();
+        let rec = m.experts().record_bytes();
+        let slots: Vec<usize> = m.experts().vram_budgets().iter().map(|b| b / rec).collect();
+        let total: usize = slots.iter().sum();
+        let ram = m.experts().shared().cache_budget_bytes();
+        println!();
+        println!(
+            "{} card(s), VRAM slots {:?} = {} total ({:.0}% of 12096 records)",
+            slots.len(),
+            slots,
+            total,
+            100.0 * total as f64 / 12096.0
+        );
+        println!(
+            "RAM tier {:.0} GB = {} records ({:.0}% of 12096); experts are 182.4 GB on the SSD",
+            ram as f64 / 1e9,
+            ram / rec,
+            100.0 * (ram / rec) as f64 / 12096.0
+        );
+
+        // A prompt that actually varies: a cheap LCG over the vocabulary, so the
+        // router sees genuinely different inputs rather than one token repeated.
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let prompt: Vec<u32> = (0..n_prompt)
+            .map(|_| {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                ((seed >> 33) % sh.n_vocab as u64) as u32
+            })
+            .collect();
+
+        let w = m.view();
+        let mut st = forward::State::new(&sh).expect("state");
+        let t = std::time::Instant::now();
+        let mut logits = forward::forward_prompt(&sh, &w, &mut st, &prompt).expect("prefill");
+        let prefill = t.elapsed().as_secs_f64();
+        println!(
+            "prefill {} tokens in {:.1}s ({:.2} tok/s, one at a time)",
+            n_prompt,
+            prefill,
+            n_prompt as f64 / prefill
+        );
+
+        let report = |label: &str| {
+            for (i, s) in m.experts().shared().shard_stats().iter().enumerate() {
+                let look = s.hits + s.misses;
+                println!(
+                    "  {label} card {i}: {:.1}% VRAM hits ({} / {}), {:.1} GB uploaded, {} evictions",
+                    100.0 * s.hits as f64 / look.max(1) as f64,
+                    s.hits,
+                    look,
+                    s.h2d_bytes as f64 / 1e9,
+                    s.evictions
+                );
+            }
+            let r = m.experts().shared().cache_stats();
+            println!(
+                "  {label} RAM: {:.1}% hits ({} / {}), {:.1} GB read from the SSD",
+                100.0 * r.hits as f64 / (r.hits + r.misses).max(1) as f64,
+                r.hits,
+                r.hits + r.misses,
+                r.bytes_read as f64 / 1e9
+            );
+        };
+        report("after prefill,");
+
+        let next = |lg: &Vec<f32>| -> u32 {
+            let mut best = f32::NEG_INFINITY;
+            let mut bi = 0usize;
+            for (i, &x) in lg.iter().enumerate() {
+                if x > best {
+                    best = x;
+                    bi = i;
+                }
+            }
+            bi as u32
+        };
+        let n = 16usize;
+        let t = std::time::Instant::now();
+        for _ in 0..n {
+            let tk = next(&logits);
+            logits = forward::forward_token(&sh, &w, &mut st, tk).expect("decode");
+        }
+        let dec = t.elapsed().as_secs_f64() / n as f64;
+        println!();
+        report("after decode, ");
+        println!();
+        println!("decode {:.3} s/token   ({:.2} tok/s)", dec, 1.0 / dec);
+        println!("target is 20 tok/s = 0.050 s/token");
+        assert!(dec > 0.0);
+    }
+
     /// The whole hierarchy: both cards' VRAM, RAM behind them, the GGUF behind
     /// that.
     ///
@@ -1556,11 +1809,19 @@ mod tests {
             dev as f64 / 1e9,
             host as f64 / 1e9
         );
+        let rec = m.experts().record_bytes();
+        let slots: Vec<usize> = m.experts().vram_budgets().iter().map(|b| b / rec).collect();
+        let total: usize = slots.iter().sum();
         println!(
-            "  VRAM expert slots: {} per card, {} total, {:.0}% of the 12096 records",
-            (vram_gb << 30) / m.experts().record_bytes(),
-            n_cards * ((vram_gb << 30) / m.experts().record_bytes()),
-            100.0 * (n_cards * ((vram_gb << 30) / m.experts().record_bytes())) as f64 / 12096.0
+            "  VRAM budgets: {:?} GB -> slots {:?}, {} total = {:.0}% of the 12096 records",
+            m.experts()
+                .vram_budgets()
+                .iter()
+                .map(|b| b >> 30)
+                .collect::<Vec<_>>(),
+            slots,
+            total,
+            100.0 * total as f64 / 12096.0
         );
 
         let sh = m.shape().clone();

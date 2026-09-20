@@ -563,11 +563,18 @@ impl StreamShared {
     pub fn enable_device_shards(
         &self,
         backends: &[Arc<ggml_rs_cuda::CudaBackend>],
-        budget_bytes_each: usize,
+        budgets: &[usize],
         shard_of: Vec<usize>,
     ) -> Result<(), String> {
         if backends.is_empty() {
             return Err("expert stream: no backends for the VRAM tier".into());
+        }
+        if budgets.len() != backends.len() {
+            return Err(format!(
+                "expert stream: {} budgets for {} cards",
+                budgets.len(),
+                backends.len()
+            ));
         }
         if let Some(&bad) = shard_of.iter().find(|&&s| s >= backends.len()) {
             return Err(format!(
@@ -577,10 +584,10 @@ impl StreamShared {
         }
         let rec = self.store.record_bytes();
         let mut built = Vec::with_capacity(backends.len());
-        for b in backends {
+        for (b, &budget) in backends.iter().zip(budgets) {
             built.push(Arc::new(device_cache::DeviceCache::new(
                 Arc::clone(b),
-                budget_bytes_each,
+                budget,
                 rec,
             )?));
         }
