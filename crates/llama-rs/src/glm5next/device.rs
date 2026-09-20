@@ -205,14 +205,84 @@ impl StreamExperts {
     }
 }
 
-impl ExpertFfn for StreamExperts {
-    fn apply(&self, ord: usize, e: usize, x: &[f32], limit: f32, out: &mut [f32]) -> Result<()> {
-        let ls = self.layers.get(ord).ok_or_else(|| {
+impl StreamExperts {
+    fn layer(&self, ord: usize) -> Result<&LayerStream> {
+        self.layers.get(ord).ok_or_else(|| {
             LlamaError::Config(format!(
                 "device: MoE layer {ord} out of range (have {})",
                 self.layers.len()
             ))
-        })?;
+        })
+    }
+
+    /// One expert FFN, with the input already on the device: the clamp is fused,
+    /// so the gate/up pair never leaves it.
+    fn expert_on_device(
+        &self,
+        ls: &LayerStream,
+        ord: usize,
+        e: u32,
+        xd: &Tensor,
+        limit: f32,
+    ) -> Result<Tensor> {
+        let (pair, down) = ls
+            .expert_weights(e)
+            .map_err(|err| LlamaError::Config(format!("device: expert ({ord}, {e}): {err}")))?;
+        let h = pair.swiglu_clamped(&*self.backend, xd, limit, true);
+        Ok(down.linear(&*self.backend, &h))
+    }
+}
+
+impl ExpertFfn for StreamExperts {
+    /// The whole layer in one host round trip.
+    ///
+    /// The input is uploaded once, every expert's output is accumulated into a
+    /// device-resident sum through the fused
+    /// [`Backend::add_to_axis0_range_scaled`], and only that sum comes back. The
+    /// per-expert path below did `n_expert_used` uploads and the same number of
+    /// synchronising reads; at 32 us a round trip and 336 dispatches a token,
+    /// that was ~21 ms of pure latency.
+    fn apply_layer(
+        &self,
+        ord: usize,
+        experts: &[(u32, f32)],
+        x: &[f32],
+        limit: f32,
+        out: &mut [f32],
+    ) -> Result<()> {
+        let ls = self.layer(ord)?;
+        if x.len() != self.n_embd || out.len() != self.n_embd {
+            return Err(LlamaError::Config(format!(
+                "device: expert layer got x {} / out {}, expected n_embd {}",
+                x.len(),
+                out.len(),
+                self.n_embd
+            )));
+        }
+        let xd = self
+            .backend
+            .to_device(Tensor::from_vec(x.to_vec(), vec![1, self.n_embd]));
+        let mut acc = self
+            .backend
+            .to_device(Tensor::from_vec(vec![0.0f32; self.n_embd], vec![1, self.n_embd]));
+        for &(e, wt) in experts {
+            let o = self.expert_on_device(ls, ord, e, &xd, limit)?;
+            self.backend.add_to_axis0_range_scaled(&mut acc, 0, 1, &o, wt);
+        }
+        let oh = self.backend.to_host(acc);
+        if oh.data().len() != out.len() {
+            return Err(LlamaError::Config(format!(
+                "device: expert layer sum is {} values, expected {}",
+                oh.data().len(),
+                out.len()
+            )));
+        }
+        out.copy_from_slice(oh.data());
+        Ok(())
+    }
+
+    fn apply(&self, ord: usize, e: usize, x: &[f32], limit: f32, out: &mut [f32]) -> Result<()> {
+        let ls = self.layer(ord)?;
         if x.len() != self.n_embd || out.len() != self.n_embd {
             return Err(LlamaError::Config(format!(
                 "device: expert FFN got x {} / out {}, expected n_embd {}",
@@ -223,16 +293,10 @@ impl ExpertFfn for StreamExperts {
         }
         // Cached reconstruction: a hit costs no disk read, and with the VRAM tier
         // on, no upload either.
-        let (pair, down) = ls
-            .expert_weights(e as u32)
-            .map_err(|err| LlamaError::Config(format!("device: expert ({ord}, {e}): {err}")))?;
-
         let xd = self
             .backend
             .to_device(Tensor::from_vec(x.to_vec(), vec![1, self.n_embd]));
-        // The clamp is fused, so the gate/up pair never leaves the device.
-        let h = pair.swiglu_clamped(&*self.backend, &xd, limit, true);
-        let o = down.linear(&*self.backend, &h);
+        let o = self.expert_on_device(ls, ord, e as u32, &xd, limit)?;
         let oh = self.backend.to_host(o);
         if oh.data().len() != out.len() {
             return Err(LlamaError::Config(format!(

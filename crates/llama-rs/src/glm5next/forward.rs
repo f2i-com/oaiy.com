@@ -228,6 +228,40 @@ pub trait ExpertFfn {
         limit: f32,
         out: &mut [f32],
     ) -> Result<()>;
+
+    /// The whole routed half of one MoE layer: every selected expert, scaled by
+    /// its routing weight and summed into `out`.
+    ///
+    /// **The dispatch granularity matters more than it looks.** DeepSeek's decode
+    /// step is per *layer*, not per expert (`dsv41-cuda/src/model.rs`), and an
+    /// implementation that sees the whole route at once can do four things the
+    /// per-expert call cannot: look every expert up in the VRAM cache together
+    /// and pin the slots for the batch, launch one grouped kernel over the
+    /// resident ones, hand the misses to the CPU while that runs, and pay one
+    /// host round trip instead of `n_expert_used` of them. At 42 MoE layers x 8
+    /// experts that last one alone is 336 round trips a token against 42, and a
+    /// round trip measured 32 us.
+    ///
+    /// `experts` is `(expert id, routing weight)`. The default does exactly what
+    /// the per-expert path always did, so an implementation need not override it.
+    fn apply_layer(
+        &self,
+        ord: usize,
+        experts: &[(u32, f32)],
+        x: &[f32],
+        limit: f32,
+        out: &mut [f32],
+    ) -> Result<()> {
+        out.fill(0.0);
+        let mut e_out = vec![0.0f32; out.len()];
+        for &(e, wt) in experts {
+            self.apply(ord, e as usize, x, limit, &mut e_out)?;
+            for (o, &ev) in out.iter_mut().zip(e_out.iter()) {
+                *o += wt * ev;
+            }
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -875,15 +909,12 @@ fn ffn_layer(sh: &Shape, w: &FfnW<'_>, il: usize, x: &[f32], out: &mut [f32]) ->
                 sh.expert_weights_scale,
             );
 
-            out.fill(0.0);
-            let mut e_out = vec![0.0f32; sh.n_embd];
-            let limit = sh.swiglu_clamp_exp[il];
-            for (&e, &wt) in ids.iter().zip(weights.iter()) {
-                m.experts.apply(m.ord, e as usize, x, limit, &mut e_out)?;
-                for (o, &ev) in out.iter_mut().zip(e_out.iter()) {
-                    *o += wt * ev;
-                }
-            }
+            // One call for the layer, not one per expert: see
+            // [`ExpertFfn::apply_layer`].
+            let route: Vec<(u32, f32)> =
+                ids.iter().copied().zip(weights.iter().copied()).collect();
+            m.experts
+                .apply_layer(m.ord, &route, x, sh.swiglu_clamp_exp[il], out)?;
 
             // The shared expert is added unscaled: expert_weights_scale applies
             // to the routed weights only.
