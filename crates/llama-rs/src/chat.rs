@@ -211,6 +211,28 @@ pub fn glm5next_template_with(
     add_assistant: bool,
     effort: ReasoningEffort,
 ) -> String {
+    glm5next_template_full(messages, add_assistant, effort, true)
+}
+
+// VENDORED-LOCAL: GLM-5.3-Flash.
+/// [`glm5next_template_with`], and `thinking` chooses which generation prompt.
+///
+/// The reference Jinja always opens `<think>` for `add_generation_prompt`, so
+/// `thinking = true` is what the shipped template does and what the golden tests
+/// check. But the same Jinja writes `<think></think>` -- opened and immediately
+/// closed -- for an assistant turn that did not reason, so the closed form is a
+/// shape this model was trained on. Prefilling it asks for a direct answer instead
+/// of a reasoning block, which is how GLM deployments usually expose a
+/// "non-thinking" mode.
+///
+/// Worth knowing rather than guessing at: at `ReasoningEffort::Max` a one-line
+/// factual question spends hundreds of tokens deliberating first.
+pub fn glm5next_template_full(
+    messages: &[ChatMessage],
+    add_assistant: bool,
+    effort: ReasoningEffort,
+    thinking: bool,
+) -> String {
     let mut out = String::with_capacity(
         messages.iter().map(|m| m.content.len()).sum::<usize>() + 128,
     );
@@ -234,7 +256,15 @@ pub fn glm5next_template_with(
     if add_assistant {
         // The opener the template pre-fills, so the model continues inside the
         // thinking block instead of closing one that was never opened.
-        out.push_str("<|assistant|><think>");
+        //
+        // The closed form is the same shape the Jinja writes for an assistant turn
+        // that did not reason, so it is trained; pre-filling it asks for a direct
+        // answer. See `glm5next_template_full`.
+        out.push_str(if thinking {
+            "<|assistant|><think>"
+        } else {
+            "<|assistant|><think></think>"
+        });
     }
     out
 }
