@@ -129,6 +129,27 @@ The crossing is free, which is the one place the current design helps:
 passes through a host copy between layers. The same round trip that costs the
 trunk 32 us an apply is what makes multi-GPU need no transfer code at all.
 
+Layers are dealt out in proportion to each card's cache, not evenly. An even
+21/21 over budgets of 1,312 and 1,635 slots gave card 0's layers 62 slots each and
+card 1's 78, and the hit rates followed exactly that — what a layer needs is slots
+for its own 288 experts, so the thing to equalise is slots per layer. 19/23 gives
+69 and 71.
+
+Two policy gaps against `expert_cache.rs` cost more than anything else in the
+tier, and both are now closed:
+
+- **Frequencies died with the entry.** A new admission started at `freq = 1`, so an
+  expert squeezed out under churn returned as a newcomer, was immediately the
+  cheapest victim again, and thrashed — 27,035 evictions against 2,947 slots over
+  one document. `Inner::seen` is DeepSeek's surviving count, so a returning expert
+  is admitted at the weight it earned.
+- **Nothing aged.** `AGE_TOKENS = 128` halves every frequency, counted in tokens
+  not accesses, because a prefill touches nearly every expert and would age the
+  counts away. The boundary is MoE ordinal 0, and every shard ages on it.
+
+Together: warm decode **0.311 -> 0.190 s/token**, warm expert time **209 -> 87 ms**,
+uploads 457 -> 380 GB.
+
 Sizing is per card, from that card's own free memory, and deliberately unequal —
 card 0 carries the trunk, card 1 carries nothing. Two bugs had to be fixed first:
 
@@ -154,9 +175,16 @@ least-used one around and plain LFRU evicts one the same pass has not reached �
 the pass eats its own future. Measured on DeepSeek: a full RAM tier served 2.6K of
 the 10.2K records it held that a 5.6K-token prompt needed.
 
-glm5next runs its MoE through `Ecache` but **does not call `set_scan_layer` yet**.
-That is a one-line hook in the prefill loop and is the cheapest thing left on this
-list.
+glm5next runs its MoE through `Ecache` and **deliberately does not call
+`set_scan_layer`**. `Ecache` reads the hint as "every layer below this one is
+finished with for this pass" and makes room from those first, which is true of a
+**layer-major** pass — `dsv41-cuda`'s `routed_sum` on its `t > 1` path, one layer
+at a time across the whole prompt. glm5next's `forward_prompt` is **token-major**,
+so at layer 44 of token 0, layer 0 is not finished; it is wanted again a moment
+later, and the hint would prefer evicting exactly that. It was added, measured as a
+no-op, and taken back out — the no-op was luck, because the RAM tier never filled
+during the test. It becomes correct the day glm5next has a chunked layer-major
+prefill.
 
 The budget sizes itself from `ggml_rs_cuda::host_memory()` (the companion to
 `vram_status`): everything free except `RAM_RESERVE = 24 GB`, capped at the expert
@@ -238,21 +266,32 @@ tier and the SSD look free when they are merely idle. It reports 92% VRAM hits.
 `measure_tiered_on_a_document` prefills a varied prompt first. 192 tokens:
 
 ```
-  2 cards, VRAM slots [1312, 1635] = 2947 (24% of 12096 records)
-  RAM tier 161 GB = 9845 records (81%); experts are 182.4 GB on the SSD
+  MoE layers [19, 23] over budgets [19, 24] GB -> slots a layer [69, 71]
+  VRAM slots [1312, 1635] = 2947 (24% of 12096 records)
+  RAM tier 161 GB = 9882 records (82%); experts are 182.4 GB on the SSD
 
-  card 0: 69.9% VRAM hits, 158.4 GB uploaded, 9080 evictions
-  card 1: 81.1% VRAM hits, 100.1 GB uploaded, 4846 evictions
-  RAM:    69.2% hits, 124.2 GB read from the SSD
+  cold   decode 0.302 s/token (3.31 tok/s)
+  warm   card 0 76.3% hits, 225.7 GB uploaded, 13581 evictions
+         card 1 86.7% hits, 154.3 GB uploaded,  8423 evictions
+         RAM 100% hits on the second pass, 0.0 GB more off the SSD
+         decode 0.190 s/token (5.27 tok/s)
 
-  decode 0.409 s/token (2.45 tok/s)
+  prefill 192 tokens: cold 166.9s -> warm 47.3s
 ```
 
-All three tiers carry real traffic there. That is the number to design against —
-though the prompt is drawn from an LCG over the vocabulary, so it maximises expert
-diversity and is nearer a worst case than a typical one. Real text routes with far
-more locality, so the true figure is between 2.45 and 7.19, and a tokenised
-document should decide it.
+All three tiers carry real traffic on the cold pass. The prompt is drawn from an
+LCG over the vocabulary, so it maximises expert diversity and is nearer a worst
+case than a typical one — real text routes with far more locality, so a tokenised
+document is what should set the expected figure.
+
+**The SSD is already out of steady state.** The second pass reports 100% RAM hits
+and no further reads: 161 GB of RAM covers this document's working set on its own,
+and the 124 GB read is a one-time fill. So making the RAM and VRAM tiers
+*exclusive* — which the slot arithmetic allows, 9,882 + 2,947 > 12,096 — would
+raise total distinct coverage that is not currently the constraint. What is the
+constraint is VRAM at 24% of records: 13-24% of lookups still miss, 380 GB is
+uploaded over the warm pass, and that is the ~87 ms of the 190 ms warm token which
+is not trunk. Exclusivity adds no VRAM slots, so it does not touch that.
 
 Correctness, unchanged throughout: host vs CUDA is 2e-5 over 154,880 logits at
 scale 30, one card vs two cards is **exact**, and 128 sampled tokens come out with
@@ -262,9 +301,9 @@ scale 30, one card vs two cards is **exact**, and 128 sampled tokens come out wi
 
     50 ms  =  trunk (<= 20 ms)  +  experts (<= 30 ms)
 
-On the short-prefix measurement the split is already **103 ms trunk / 36 ms
-experts** — the trunk is the whole problem. On the document measurement experts
-are still ~300 ms, so both halves are live depending on the working set.
+A warm token is now **~103 ms trunk / ~87 ms experts**, so the trunk is 54% of it
+and is the larger problem on any workload with locality. On a cold, maximally
+diverse pass experts still dominate.
 
 Ranked by measured milliseconds per unit of work:
 
@@ -277,7 +316,22 @@ Ranked by measured milliseconds per unit of work:
 4. **`set_scan_layer` during prefill.** One hook, already built; it is what stops
    a prefill evicting the records it is about to need.
 5. **Port `vec_dot_q4_K_q8_K` to `ggml-quants`, AVX-512.** Gates the CPU tier, and
-   removes the f32 detour from every host path. Lower priority than it looked at a
-   92% VRAM hit rate; back up the list at the document's 70-81%.
-6. **A usage profile saved across runs** (`save_usage`/`warm`), so a fresh process
+   removes the f32 detour from every host path. This is what the remaining 380 GB
+   of uploads needs, because these cards are in **x4 and x8 slots** (of 16) —
+   nvidia-smi `pcie.link.width.current` — the same narrow-link situation
+   `dsv41/src/cpu_experts.rs` was written against. At those widths a 16.32 MB
+   upload is ~2.3 ms and the same record on 32 Zen 5 threads with a fused dot
+   should be ~0.2-0.5 ms.
+6. **Use the grouped-MoE kernels already in `ggml-rs-cuda/src/moe.rs`** instead of
+   looping eight experts in Rust. The missing piece is glm5next's clamped SwiGLU
+   semantics in the grouped gate/up kernel; routing can stay on the host and upload
+   only 8 ids and 8 weights.
+7. **A usage profile saved across runs** (`save_usage`/`warm`), so a fresh process
    does not start cold — DeepSeek's first answer is 2-6 tok/s and its third is 29.
+8. **Balance the layer split on measured cost**, not slots: card 1 is still 10
+   points ahead of card 0 at equal slots per layer, so
+   `cost(layer) = distinct experts x miss probability x record bytes` is the right
+   quantity, and it needs a route trace to measure.
+
+Also worth noting outside the code: moving those two cards into x16 slots would
+roughly double the expert bandwidth for nothing.
