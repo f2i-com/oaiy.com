@@ -614,6 +614,17 @@ impl StreamShared {
         }
     }
 
+    /// Every VRAM shard, for the per-token frequency aging.
+    #[cfg(feature = "cuda")]
+    pub fn shards_for_aging(&self) -> Vec<Arc<device_cache::DeviceCache>> {
+        let shards = self.shards.lock().unwrap_or_else(|e| e.into_inner());
+        if !shards.is_empty() {
+            return shards.iter().map(Arc::clone).collect();
+        }
+        drop(shards);
+        self.device_cache().into_iter().collect()
+    }
+
     /// Per-card VRAM tier statistics, in card order. Empty when not sharded.
     #[cfg(feature = "cuda")]
     pub fn shard_stats(&self) -> Vec<device_cache::DeviceCacheStats> {
@@ -770,6 +781,14 @@ impl LayerStream {
         // No `set_scan_layer` here, deliberately -- see [`StreamShared::set_scan_layer`].
         #[cfg(feature = "cuda")]
         if let Some(dc) = self.shared.device_cache_for(self.layer) {
+            // MoE ordinal 0 is reached exactly once per token, which is the token
+            // boundary the frequency aging needs. Every shard ages on it, not just
+            // the one that owns layer 0, or the other cards would never age.
+            if self.layer == 0 {
+                for d in self.shared.shards_for_aging() {
+                    d.tick_token();
+                }
+            }
             let mut distinct = experts.to_vec();
             distinct.sort_unstable();
             distinct.dedup();

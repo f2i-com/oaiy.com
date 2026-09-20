@@ -121,6 +121,15 @@ pub struct DeviceCacheStats {
     pub budget_bytes: u64,
 }
 
+// VENDORED-LOCAL: GLM-5.3-Flash, from `dsv41-cuda/src/expert_cache.rs`.
+/// Every frequency halves after this many decode tokens.
+///
+/// LFU without aging keeps an old topic's experts in VRAM forever and never lets
+/// a new topic's collect enough uses to displace them. Counted in tokens rather
+/// than accesses on purpose: a prefill touches nearly every expert and would age
+/// the counts away.
+const AGE_TOKENS: u64 = 128;
+
 /// One cached expert: kernel-ready device tensors plus the upload tickets
 /// that must be waited before first compute use.
 ///
@@ -200,6 +209,19 @@ struct Inner {
     bytes_used: usize,
     /// Logical clock for the LFRU recency term.
     clock: u64,
+    // VENDORED-LOCAL: GLM-5.3-Flash. Aging, and frequencies that outlive
+    // eviction -- both from `dsv41-cuda/src/expert_cache.rs`.
+    /// Access counts that survive eviction, so a hot expert that was squeezed
+    /// out is not judged a newcomer when it comes back.
+    ///
+    /// Without this, an expert evicted under churn returns with `freq = 1`, is
+    /// immediately the cheapest victim again, and thrashes: measured on a
+    /// 192-token document, 16 067 and 10 968 evictions against 2 947 slots, which
+    /// is every slot turned over five times. Bounded by the record count
+    /// (12 096 here), so a few hundred kB.
+    seen: HashMap<(u32, u32), u32>,
+    /// Decode tokens observed, for [`AGE_TOKENS`].
+    tokens: u64,
 }
 
 impl std::fmt::Debug for DeviceCache {
@@ -237,6 +259,8 @@ impl DeviceCache {
             budget: budget_bytes,
             eager,
             inner: Mutex::new(Inner {
+                seen: HashMap::new(),
+                tokens: 0,
                 map: HashMap::new(),
                 bytes_used: 0,
                 clock: 0,
@@ -276,12 +300,16 @@ impl DeviceCache {
     pub fn acquire(&self, layer: u32, expert: u32) -> Option<Arc<DeviceEntry>> {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         g.clock += 1;
+        let f = g.seen.entry((layer, expert)).or_insert(0);
+        *f = f.saturating_add(1);
+        let freq = *f;
+        let clock = g.clock;
         match g.map.get(&(layer, expert)) {
             Some(en) => {
                 self.hits.fetch_add(1, Ordering::Relaxed);
                 self.bytes_hit.fetch_add(en.bytes as u64, Ordering::Relaxed);
-                en.freq.set(en.freq.get() + 1);
-                en.last.set(g.clock);
+                en.freq.set(freq);
+                en.last.set(clock);
                 Some(Arc::clone(en))
             }
             None => {
@@ -289,6 +317,31 @@ impl DeviceCache {
                 None
             }
         }
+    }
+
+    // VENDORED-LOCAL: GLM-5.3-Flash.
+    /// One decode token has run. Every [`AGE_TOKENS`] tokens, halve every
+    /// frequency so a cooling expert can actually be displaced.
+    pub fn tick_token(&self) {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        g.tokens += 1;
+        if g.tokens % AGE_TOKENS != 0 {
+            return;
+        }
+        g.seen.retain(|_, f| {
+            *f /= 2;
+            *f > 0
+        });
+        for en in g.map.values() {
+            en.freq.set(en.freq.get() / 2);
+        }
+    }
+
+    /// How many `(layer, expert)` pairs this cache has ever been asked for, and
+    /// how many it holds. The gap is what aging and admission act on.
+    pub fn tracked(&self) -> (usize, usize) {
+        let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        (g.seen.len(), g.map.len())
     }
 
     /// Upload one host record into a new entry and admit it under the byte
@@ -360,12 +413,19 @@ impl DeviceCache {
             plan.down.3.to_vec(),
         )?);
 
+        // Frequencies outlive eviction (see `Inner::seen`), so a returning hot
+        // expert is admitted at the weight it earned rather than as a newcomer.
+        let seed_freq = {
+            let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            g.seen.get(&(layer, expert)).copied().unwrap_or(1).max(1)
+        };
         let entry = Arc::new(DeviceEntry {
             pair,
             down,
             bytes,
             tickets: Mutex::new(tickets),
-            freq: std::cell::Cell::new(1),
+            // Whatever this key was worth before it was last evicted.
+            freq: std::cell::Cell::new(seed_freq),
             last: std::cell::Cell::new(0),
             backend: Arc::clone(&self.backend),
         });
