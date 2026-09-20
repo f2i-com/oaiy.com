@@ -274,6 +274,23 @@ impl GlmEngine {
                 n as f64 / decode_s.max(1e-9)
             );
         }
+        // GLM5_PROF=1 breaks the request down by forward phase, so the thing being
+        // optimised is measured on the path that serves rather than in a test. The
+        // counters are process-global and cover prefill and decode together, which
+        // is why they are reset per request.
+        if std::env::var("GLM5_PROF").ok().as_deref() == Some("1") {
+            use llama_rs::glm5next::forward::prof;
+            let passes = (prompt.len() - start + n).max(1) as f64;
+            eprintln!("  profile over {passes:.0} forward passes, ms a pass:");
+            for (name, c) in prof::all() {
+                eprintln!("    {name:<30} {:7.2}", prof::ms(c) / passes);
+            }
+            for (name, c) in prof::inner() {
+                eprintln!("    {name:<30} {:7.2}", prof::ms(c) / passes);
+            }
+            eprintln!("    {:<30} {:7.2}", "counted total", prof::total_ms() / passes);
+            prof::reset();
+        }
         let _ = job.events.send(Event::Done {
             finish,
             completion_tokens: n,
