@@ -51,6 +51,7 @@ fn setup() -> Option<(StIndex, GpuModel)> {
         vram_headroom_bytes: 1 << 30,
         cpu_expert_threads: None,
         vision: true,
+        residual_on_device: None,
     };
     let t = Instant::now();
     let model = GpuModel::load(&model_dir, &meta, &opts).expect("GPU model");

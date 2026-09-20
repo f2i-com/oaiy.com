@@ -207,6 +207,8 @@ pub fn start_listening(o: Options, listening: impl FnOnce(SocketAddr)) -> nrob::
         vram_headroom_bytes: (o.headroom_gb * (1u64 << 30) as f64) as usize,
         cpu_expert_threads: o.cpu_threads,
         vision: o.vision,
+        // the free VRAM decides, pass by pass
+        residual_on_device: None,
     };
     let engram_meta = o.engram_meta.clone().unwrap_or_else(|| o.model.join("engram_meta.safetensors"));
     let mut model = GpuModel::load(&o.model, &engram_meta, &opts)?;

@@ -80,6 +80,52 @@ pub struct GpuOptions {
     /// Load the vision tower (about 1 GB on the first device, taken before
     /// its expert cache is sized) so prompts can hold images.
     pub vision: bool,
+    /// Keep a layered pass's residual stream on the device between layers
+    /// that share one, instead of a host round trip per layer and attention
+    /// sub-chunk. It costs `2 * HC * dim * 4` bytes a token (2.8 GB for
+    /// 16,800), so it wants [`vram_headroom_bytes`](Self::vram_headroom_bytes)
+    /// to cover it. `None` looks at the free VRAM when a pass starts and
+    /// leaves the residual on the host when there is none.
+    pub residual_on_device: Option<bool>,
+}
+
+/// A layered pass's residual stream and its mixes, held on one device for as
+/// long as consecutive layers share it (see
+/// [`GpuOptions::residual_on_device`]). Without it every layer uploads `h`
+/// and downloads the result once per attention sub-chunk: about 170 GB each
+/// way over a 16,800-token pass, and worse than the bytes, [`Gpu::download`]
+/// blocks until the kernel queue drains, so the card stands still some 2,000
+/// times a pass. The host arrays remain the home - the residual goes back
+/// through them when it changes device, and stays there when a card has no
+/// room to spare.
+struct Carry {
+    dev: usize,
+    h: CudaSlice<f32>,
+    pre: CudaSlice<f32>,
+    h1: CudaSlice<f32>,
+    mix: CudaSlice<f32>,
+}
+
+impl Carry {
+    /// The residual on `dev`, seeded from the host arrays; `None` when
+    /// `want` refuses, or when it defers and the card would be left with
+    /// under half a gigabyte.
+    fn new(g: &Gpu, dev: usize, t: usize, d: usize, h_host: &[f32], pre_host: &[f32], want: Option<bool>) -> Result<Option<Carry>> {
+        let need = (2 * t * HC * d + 2 * t * MIXW) * std::mem::size_of::<f32>();
+        match want {
+            Some(false) => return Ok(None),
+            None if g.mem_info()?.0 < need + (512 << 20) => return Ok(None),
+            _ => {}
+        }
+        Ok(Some(Carry {
+            dev,
+            h: g.upload(h_host)?,
+            pre: g.upload(pre_host)?,
+            // every token's rows are written each layer before they are read
+            h1: g.alloc::<f32>(t * HC * d)?,
+            mix: g.alloc::<f32>(t * MIXW)?,
+        }))
+    }
 }
 
 /// An image in the sequence: from absolute position `start`, `rows.len() /
@@ -468,6 +514,8 @@ pub struct GpuModel {
     states: Vec<GState>,
     hasher: NgramHasher,
     max_seq: usize,
+    /// See [`GpuOptions::residual_on_device`].
+    residual_on_device: Option<bool>,
     vision: Option<GpuVision>,
     /// The running forward's image tokens (empty: none).
     image_mask: Vec<bool>,
@@ -666,6 +714,7 @@ impl GpuModel {
             layers,
             states,
             max_seq: opts.max_seq,
+            residual_on_device: opts.residual_on_device,
             vision,
             image_mask: Vec::new(),
             trace_images: Vec::new(),
@@ -1043,6 +1092,8 @@ impl GpuModel {
         let inter = self.cfg.moe_inter_dim;
         let mut h1_host = vec![0.0f32; t * HC * d];
         let mut mix_host = vec![0.0f32; t * MIXW];
+        // the residual on whichever device the layers running now share
+        let mut carry: Option<Carry> = None;
 
         // the next layer's reads, started once a layer's experts are done
         let pool = Arc::new(Prefetched::new(RECORD_BYTES));
@@ -1056,6 +1107,19 @@ impl GpuModel {
                 return Err(Error::Arg("prefill cancelled".into()));
             }
             self.cur = self.layers[l].dev;
+            // the residual changes device: the host arrays take it across
+            if let Some(c) = &carry {
+                if c.dev != self.cur {
+                    let g = &self.devs[c.dev].g;
+                    h_host.copy_from_slice(&g.download(&c.h)?);
+                    pre_host.copy_from_slice(&g.download(&c.pre)?);
+                    carry = None;
+                }
+            }
+            if carry.is_none() {
+                // a card with no room leaves it on the host; the next may have some
+                carry = Carry::new(&self.devs[self.cur].g, self.cur, t, d, &h_host, &pre_host, self.residual_on_device)?;
+            }
             let tw = Instant::now();
             let rows_host = match engram_rows[l].take() {
                 Some(pending) => Some(wait_engram_rows(&pending)?),
@@ -1065,8 +1129,12 @@ impl GpuModel {
             let mut x2_all = self.devs[self.cur].g.alloc::<f32>(t * d)?;
             for (s, &(a, b)) in subs.iter().enumerate() {
                 let ts = b - a;
-                let mut h = self.devs[self.cur].g.upload(&h_host[a * HC * d..b * HC * d])?;
-                let pm = self.devs[self.cur].g.upload(&pre_host[a * MIXW..b * MIXW])?;
+                let gh = &self.devs[self.cur].g;
+                let (mut h, pm) = match &carry {
+                    // a copy on the card, not a trip over PCIe
+                    Some(c) => (gh.dup(&c.h.slice(a * HC * d..b * HC * d))?, gh.dup(&c.pre.slice(a * MIXW..b * MIXW))?),
+                    None => (gh.upload(&h_host[a * HC * d..b * HC * d])?, gh.upload(&pre_host[a * MIXW..b * MIXW])?),
+                };
                 if let (Some((_, wkv, qk)), Some(rows)) = (&self.layers[l].engram, &rows_host) {
                     let g = &self.devs[self.cur].g;
                     let w = rows.len() / t;
@@ -1088,8 +1156,16 @@ impl GpuModel {
                 std::mem::swap(&mut self.shared, &mut shared[s]);
                 let g = &self.devs[self.cur].g;
                 g.copy(&x2.as_view(), &mut x2_all.slice_mut(a * d..b * d))?;
-                h1_host[a * HC * d..b * HC * d].copy_from_slice(&g.download(&h1)?);
-                mix_host[a * MIXW..b * MIXW].copy_from_slice(&g.download(&ffn_mix)?);
+                match &mut carry {
+                    Some(c) => {
+                        g.copy(&h1.as_view(), &mut c.h1.slice_mut(a * HC * d..b * HC * d))?;
+                        g.copy(&ffn_mix.as_view(), &mut c.mix.slice_mut(a * MIXW..b * MIXW))?;
+                    }
+                    None => {
+                        h1_host[a * HC * d..b * HC * d].copy_from_slice(&g.download(&h1)?);
+                        mix_host[a * MIXW..b * MIXW].copy_from_slice(&g.download(&ffn_mix)?);
+                    }
+                }
             }
 
             // the routed experts over every token at once (the speculative
@@ -1145,14 +1221,22 @@ impl GpuModel {
                 let ys = g.dup(&y.slice(a * d..b * d))?;
                 let mut m = g.alloc::<f32>(ts * d)?;
                 g.add_round(&ys, &sh.as_view(), &mut m, ts * d)?;
-                let h1 = g.upload(&h1_host[a * HC * d..b * HC * d])?;
-                let mix = g.upload(&mix_host[a * MIXW..b * MIXW])?;
+                let (h1, mix) = match &carry {
+                    Some(c) => (g.dup(&c.h1.slice(a * HC * d..b * HC * d))?, g.dup(&c.mix.slice(a * MIXW..b * MIXW))?),
+                    None => (g.upload(&h1_host[a * HC * d..b * HC * d])?, g.upload(&mix_host[a * MIXW..b * MIXW])?),
+                };
                 let mut h2 = g.alloc::<f32>(ts * HC * d)?;
                 g.hc_post(&m, &h1, &mix, &mut h2, d, ts)?;
-                h_host[a * HC * d..b * HC * d].copy_from_slice(&g.download(&h2)?);
+                match &mut carry {
+                    Some(c) => g.copy(&h2.as_view(), &mut c.h.slice_mut(a * HC * d..b * HC * d))?,
+                    None => h_host[a * HC * d..b * HC * d].copy_from_slice(&g.download(&h2)?),
+                }
             }
             // the ffn mix is the next layer's pre-mix
-            std::mem::swap(&mut pre_host, &mut mix_host);
+            match &mut carry {
+                Some(c) => std::mem::swap(&mut c.pre, &mut c.mix),
+                None => std::mem::swap(&mut pre_host, &mut mix_host),
+            }
 
             // the next layer's reads go on during its attention (starting them
             // while this layer's own reads ran was slower: they split the drive)
@@ -1178,8 +1262,14 @@ impl GpuModel {
         self.cur = out_dev;
         let g = &self.devs[out_dev].g;
         let last = t - 1;
-        let hl = g.upload(&h_host[last * HC * d..t * HC * d])?;
-        let pl = g.upload(&pre_host[last * MIXW..t * MIXW])?;
+        let (hl, pl) = match &carry {
+            Some(c) if c.dev == out_dev => (g.dup(&c.h.slice(last * HC * d..t * HC * d))?, g.dup(&c.pre.slice(last * MIXW..t * MIXW))?),
+            Some(c) => {
+                let src = &self.devs[c.dev].g;
+                (g.upload(&src.download(&c.h)?[last * HC * d..t * HC * d])?, g.upload(&src.download(&c.pre)?[last * MIXW..t * MIXW])?)
+            }
+            None => (g.upload(&h_host[last * HC * d..t * HC * d])?, g.upload(&pre_host[last * MIXW..t * MIXW])?),
+        };
         let mut x = g.alloc::<f32>(d)?;
         g.hc_pre(&hl, &pl.as_view(), &mut x, d, 1, MIXW)?;
         let mut xn = g.alloc::<f32>(d)?;

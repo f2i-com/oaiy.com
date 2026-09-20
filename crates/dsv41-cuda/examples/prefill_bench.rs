@@ -17,6 +17,8 @@
 //!
 //! DSV41_LAYERED=1 runs layer by layer; DSV41_PASS=N splits that into passes
 //! of N tokens, as nrob-server does a stretch longer than its layered_max.
+//! DSV41_CARRY=0/1 forces the residual onto the host or the device, where
+//! the default lets the free VRAM decide (`GpuOptions::residual_on_device`).
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -68,7 +70,7 @@ fn main() -> nrob::Result<()> {
 
     let t = Instant::now();
     let headroom_gb: f64 = std::env::var("DSV41_HEADROOM_GB").ok().and_then(|v| v.parse().ok()).unwrap_or(2.0);
-    let opts = GpuOptions { devices: devices.clone(), max_seq: ids.len() + 16, expert_cache_bytes: ram_gb << 30, direct_io: true, vram_expert_bytes: None, vram_headroom_bytes: (headroom_gb * (1u64 << 30) as f64) as usize, cpu_expert_threads: Some(24), vision: false };
+    let opts = GpuOptions { devices: devices.clone(), max_seq: ids.len() + 16, expert_cache_bytes: ram_gb << 30, direct_io: true, vram_expert_bytes: None, vram_headroom_bytes: (headroom_gb * (1u64 << 30) as f64) as usize, cpu_expert_threads: Some(24), vision: false, residual_on_device: std::env::var("DSV41_CARRY").ok().map(|v| v != "0") };
     let mut model = GpuModel::load(&model_dir, &golden.join("engram_meta.safetensors"), &opts)?;
     eprintln!("[loaded in {:.1}s on cuda:{devices:?}]", t.elapsed().as_secs_f64());
     let usage = std::env::var_os("DSV41_USAGE").map(PathBuf::from).unwrap_or_else(|| r"E:\deepseek\expert_usage.txt".into());
@@ -115,13 +117,19 @@ fn main() -> nrob::Result<()> {
             let host0 = model.expert_cache().stats();
             let t = Instant::now();
             let mut at = 0;
+            let mut logits = Vec::new();
             while at < ids.len() {
                 let end = (at + pass).min(ids.len());
                 let tp = Instant::now();
-                model.prefill_layered(&ids[at..end], at, chunk, None)?;
+                logits = model.prefill_layered(&ids[at..end], at, chunk, None)?;
                 eprintln!("  pass {at}..{end}: {:.1}s", tp.elapsed().as_secs_f64());
                 at = end;
             }
+            // the last pass's logits, to compare runs that should agree
+            // (DSV41_CARRY on and off, say) over every sub-chunk
+            let top = logits.iter().enumerate().fold((0usize, f32::NEG_INFINITY), |b, (i, &v)| if v > b.1 { (i, v) } else { b });
+            let sum: f64 = logits.iter().map(|&v| v as f64).sum();
+            eprintln!("[logits: argmax {} at {:.6}, sum {sum:.6}, n {}]", top.0, top.1, logits.len());
             let s = t.elapsed().as_secs_f64();
             let host = model.expert_cache().stats();
             eprintln!(

@@ -466,6 +466,28 @@ Measured (both GPUs, 140 GB RAM tier):
     the staged rates), but the real cost is that `download` is `clone_dtoh`, which
     blocks until the whole kernel queue drains: 17 sub-chunks x 2 loops x 60 layers is
     ~2,000 pipeline stalls a pass.
+  - **Lever (1) done, 2026-09-20: 24% off a long pass.** `GpuOptions::residual_on_device`
+    keeps `h`, the mixes and `h1` on the card between layers that share one, so the
+    residual crosses PCIe once a pass instead of sixty times. Same 16,800 tokens from
+    the T9, 6 GB headroom in both runs, nothing else changed:
+
+    | | residual on the host | on the device |
+    | --- | --- | --- |
+    | pass | 151.0 s (111.2 tok/s) | **121.7 s (138.0 tok/s)** |
+    | "the rest" | 107.3 s | **73.3 s** |
+    | routed experts | 37.2 s | 40.8 s |
+    | drive reads | 4,850 | 4,849 |
+
+    The 34 s came out of "the rest", which is where the round trip lived. The logits
+    agree to the bit (argmax 204 at 31.117918, sum 108290.638676), as do the golden
+    gates and `prefill_bench`'s 4,096-token four-sub-chunk comparison.
+  - **It needs headroom to engage.** At `layered_max` 20,480 the carry wants
+    `2 * HC * dim * 4` a token = 3.36 GB, and `None` declines unless the card keeps
+    half a gigabyte spare besides, so the server's default `headroom_gb = 2.0` leaves
+    it on the host. `--vram-headroom-gb 6` turns it on and costs ~457 VRAM expert
+    slots (drive reads went 4,402 to 4,850, +8.4 GB) - worth it here, and worth less
+    on a drive that reads at 0.5 GB/s rather than the T9's 1.95. Sizing the carry into
+    the expert cache at load, instead of asking headroom to cover it, is the follow-up.
   - **Next levers, in order:** (1) keep the residual on the device across consecutive
     layers that share one, round-tripping only at the device boundary - one transfer a
     pass instead of sixty, for ~2.8 GB of VRAM at 16,800 tokens, so make it fall back

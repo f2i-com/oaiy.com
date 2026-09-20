@@ -40,7 +40,7 @@ fn setup() -> Option<(StIndex, GpuModel)> {
     // DSV41_CPU_THREADS: hybrid decode (VRAM misses on the CPU); with a small
     // DSV41_VRAM_EXPERT_GB most decode experts then take the CPU path
     let cpu_expert_threads = std::env::var("DSV41_CPU_THREADS").ok().and_then(|v| v.parse().ok());
-    let opts = GpuOptions { devices: devices.clone(), max_seq: 1024, expert_cache_bytes: 24 << 30, direct_io: false, vram_expert_bytes, vram_headroom_bytes: 1 << 30, cpu_expert_threads, vision: false };
+    let opts = GpuOptions { devices: devices.clone(), max_seq: 1024, expert_cache_bytes: 24 << 30, direct_io: false, vram_expert_bytes, vram_headroom_bytes: 1 << 30, cpu_expert_threads, vision: false, residual_on_device: None };
     let mut model = match GpuModel::load(&model_dir, &meta, &opts) {
         Ok(m) => m,
         // only a missing device may skip; kernels that do not compile fail
