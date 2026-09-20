@@ -4,7 +4,7 @@
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use memmap2::Mmap;
@@ -32,6 +32,16 @@ impl Backing {
     }
 }
 
+// VENDORED-LOCAL: one shard of a split GGUF beyond the first. The primary
+// shard's bytes stay in `GgufInner::backing` so the single-file path is
+// untouched.
+#[derive(Debug)]
+struct ShardBacking {
+    backing:           Backing,
+    tensor_data_start: u64,
+    source:            Option<Arc<dyn TensorBytes>>,
+}
+
 /// A loaded GGUF file. Cheap to clone (`Arc` internally).
 #[derive(Clone, Debug)]
 pub struct GgufFile {
@@ -52,15 +62,99 @@ struct GgufInner {
     // `backing`, which then holds only the header bytes (header + metadata
     // KV + tensor index + padding).
     source:            Option<Arc<dyn TensorBytes>>,
+    // VENDORED-LOCAL: split GGUF. `tensor_shard[i]` is which shard
+    // `tensors[i]`'s body lives in: 0 for `backing`, otherwise `extra[n - 1]`.
+    // A parallel vector rather than a field on `TensorInfo` so the public
+    // struct — and every literal that builds one in tests — stays unchanged.
+    tensor_shard:      Vec<u32>,
+    extra:             Vec<ShardBacking>,
 }
 
 impl GgufFile {
     /// Memory-map the file at `path` and parse its header / tensor table.
+    ///
+    /// VENDORED-LOCAL: if the file declares `split.count > 1` this follows the
+    /// sibling shards and presents them as one logical file — `tensors()` spans
+    /// all of them and `tensor_by_name` resolves across them. Any shard may be
+    /// named; the primary (`split.no == 0`) is always the one whose metadata is
+    /// kept, since the others carry only their own `split.*` keys.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let file = File::open(path.as_ref())?;
+        Self::open_following_splits(path.as_ref(), false)
+    }
+
+    /// Parse exactly one file, following no splits.
+    fn open_one(path: &Path, streaming: bool) -> Result<GgufInner> {
+        let file = File::open(path)?;
         // Safety: GGUF files we read are not concurrently mutated.
         let mmap = unsafe { Mmap::map(&file)? };
-        Self::from_backing(Backing::Mmap(mmap))
+        if !streaming {
+            return parse(Backing::Mmap(mmap));
+        }
+        // Streaming: keep only the header resident and serve bodies by
+        // positioned reads. Each shard gets its own source, whose offsets are
+        // relative to that shard own data start.
+        let probe = parse(Backing::Mmap(mmap))?;
+        let start = probe.tensor_data_start;
+        let header = probe.backing.as_slice()[..start as usize].to_vec();
+        drop(probe);
+        let source = crate::source::FileSource::open(path, start)?;
+        let mut inner = parse(Backing::Bytes(header))?;
+        inner.source = Some(Arc::new(source));
+        Ok(inner)
+    }
+
+    fn open_following_splits(path: &Path, streaming: bool) -> Result<Self> {
+        let probe = Self::open_one(path, streaming)?;
+        let count = probe
+            .metadata
+            .get("split.count")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        if count <= 1 {
+            return Ok(Self { inner: Arc::new(probe) });
+        }
+        let paths = split_shard_paths(path, count as usize).ok_or_else(|| {
+            GgufError::Split(format!(
+                "{} declares split.count {count} but its name does not follow the \
+                 <prefix>-%05d-of-%05d.gguf convention, so the siblings cannot be found",
+                path.display()
+            ))
+        })?;
+        let no = probe
+            .metadata
+            .get("split.no")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+
+        // The primary shard carries the full metadata KV, so it has to be the
+        // one we keep even when the caller named a later shard.
+        let mut inner = if no == 0 {
+            probe
+        } else {
+            drop(probe);
+            Self::open_one(&paths[0], streaming)?
+        };
+
+        for sp in paths.iter().skip(1) {
+            let shard = Self::open_one(sp, streaming)?;
+            inner.merge_shard(shard, sp)?;
+        }
+
+        if let Some(total) = inner
+            .metadata
+            .get("split.tensors.count")
+            .and_then(|v| v.as_u64())
+        {
+            if inner.tensors.len() as u64 != total {
+                return Err(GgufError::Split(format!(
+                    "split.tensors.count is {total} but {} tensors were found across \
+                     {count} shards",
+                    inner.tensors.len()
+                )));
+            }
+        }
+
+        Ok(Self { inner: Arc::new(inner) })
     }
 
     /// Parse from an in-memory buffer. Useful for tests / pipelines.
@@ -89,12 +183,8 @@ impl GgufFile {
     /// of a mapping: only the header is held in memory. This is how a model
     /// streams its experts from disk.
     pub fn open_streaming(path: impl AsRef<Path>) -> Result<Self> {
-        let probe = Self::open(path.as_ref())?;
-        let start = probe.tensor_data_start();
-        let header = probe.raw_slice(0, start as usize).to_vec();
-        drop(probe);
-        let source = crate::source::FileSource::open(path.as_ref(), start)?;
-        Self::from_bytes_with_source(header, Arc::new(source))
+        // VENDORED-LOCAL: split-aware, and each shard gets its own FileSource.
+        Self::open_following_splits(path.as_ref(), true)
     }
 
     /// The external tensor-byte source, if this file was opened with
@@ -109,10 +199,82 @@ impl GgufFile {
     /// source on a source-backed file. Prefer this over [`tensor_data`] in
     /// code that should work for both.
     pub fn tensor_bytes(&self, t: &TensorInfo) -> Result<Cow<'_, [u8]>> {
-        match &self.inner.source {
+        // VENDORED-LOCAL: resolve the shard first; each has its own source.
+        match self.shard_source(self.shard_of(t)) {
             Some(src) => Ok(Cow::Owned(src.read_tensor(t)?)),
             None => Ok(Cow::Borrowed(self.tensor_data(t))),
         }
+    }
+
+    // VENDORED-LOCAL: shard resolution for a split GGUF. All of these collapse
+    // to the single-file behaviour when `extra` is empty.
+
+    /// Which shard holds this tensor body. Looked up by name, which is the
+    /// authoritative mapping; a `TensorInfo` from some other file falls back to
+    /// the primary shard.
+    pub fn shard_of(&self, t: &TensorInfo) -> usize {
+        self.inner
+            .tensors_by_name
+            .get(&t.name)
+            .and_then(|&i| self.inner.tensor_shard.get(i))
+            .copied()
+            .unwrap_or(0) as usize
+    }
+
+    /// Number of shards backing this file: 1 unless it is a split GGUF.
+    pub fn n_shards(&self) -> usize {
+        1 + self.inner.extra.len()
+    }
+
+    fn shard_slice(&self, shard: usize) -> &[u8] {
+        if shard == 0 {
+            self.inner.backing.as_slice()
+        } else {
+            self.inner.extra[shard - 1].backing.as_slice()
+        }
+    }
+
+    fn shard_start(&self, shard: usize) -> u64 {
+        if shard == 0 {
+            self.inner.tensor_data_start
+        } else {
+            self.inner.extra[shard - 1].tensor_data_start
+        }
+    }
+
+    fn shard_source(&self, shard: usize) -> Option<&Arc<dyn TensorBytes>> {
+        if shard == 0 {
+            self.inner.source.as_ref()
+        } else {
+            self.inner.extra[shard - 1].source.as_ref()
+        }
+    }
+
+    /// The byte source for one shard, if that shard is source-backed. On a
+    /// split GGUF each shard has its own, so a tensor body must be read through
+    /// the source for *its* shard — [`Self::tensor_source`] is only the primary.
+    pub fn shard_source_at(&self, shard: usize) -> Option<&Arc<dyn TensorBytes>> {
+        self.shard_source(shard)
+    }
+
+    /// Whether one shard serves bodies through a source rather than a mapping.
+    pub fn shard_is_source_backed(&self, shard: usize) -> bool {
+        self.shard_source(shard).is_some()
+    }
+
+    /// The source for this tensor own shard.
+    pub fn tensor_source_of(&self, t: &TensorInfo) -> Option<&Arc<dyn TensorBytes>> {
+        self.shard_source(self.shard_of(t))
+    }
+
+    /// Zero-copy slice into a specific shard backing. [`Self::raw_slice`] is
+    /// this with `shard = 0`.
+    pub fn raw_slice_shard(&self, shard: usize, offset: usize, len: usize) -> &[u8] {
+        assert!(
+            self.shard_source(shard).is_none(),
+            "raw_slice_shard() on a source-backed shard; use tensor_source()"
+        );
+        &self.shard_slice(shard)[offset..offset + len]
     }
 
     /// Total length of the backing byte buffer in bytes.
@@ -143,19 +305,23 @@ impl GgufFile {
     pub fn tensor_data(&self, t: &TensorInfo) -> &[u8] {
         // VENDORED-LOCAL: fail loudly instead of slicing past the header.
         assert!(
-            self.inner.source.is_none(),
+            self.shard_source(self.shard_of(t)).is_none(),
             "tensor_data() on a source-backed GgufFile; use tensor_bytes()"
         );
-        let start = (self.inner.tensor_data_start + t.offset) as usize;
+        let shard = self.shard_of(t);
+        let start = (self.shard_start(shard) + t.offset) as usize;
         let end   = start + t.nbytes() as usize;
-        &self.inner.backing.as_slice()[start..end]
+        &self.shard_slice(shard)[start..end]
     }
 
     /// Absolute file offset of `t`'s data body. Combine with [`raw_slice`] to
     /// build long-lived zero-copy views of the mmap (so a clone of the
     /// `GgufFile` can keep the slice alive past a lookup-by-name borrow).
+    /// VENDORED-LOCAL: for a split GGUF this is the offset within the tensor
+    /// own shard, so it pairs with [`Self::raw_slice_shard`] and
+    /// [`Self::shard_of`], not with [`Self::raw_slice`].
     pub fn tensor_data_offset(&self, t: &TensorInfo) -> usize {
-        (self.inner.tensor_data_start + t.offset) as usize
+        (self.shard_start(self.shard_of(t)) + t.offset) as usize
     }
 
     /// Zero-copy slice into the file backing. Caller is responsible for the
@@ -423,6 +589,9 @@ fn parse(backing: Backing) -> Result<GgufInner> {
     let unaligned = c.pos as u64;
     let tensor_data_start = align_up(unaligned, alignment);
 
+    // VENDORED-LOCAL: a freshly parsed file is one shard, so every tensor is 0.
+    let tensor_shard = vec![0u32; tensors.len()];
+
     Ok(GgufInner {
         backing,
         version,
@@ -432,7 +601,75 @@ fn parse(backing: Backing) -> Result<GgufInner> {
         tensor_data_start,
         alignment,
         source: None, // VENDORED-LOCAL: set by from_bytes_with_source
+        tensor_shard,
+        extra: Vec::new(),
     })
+}
+
+// VENDORED-LOCAL: split-GGUF helpers.
+
+impl GgufInner {
+    /// Fold another shard tensor table into this one. Bodies stay in that
+    /// shard own backing; only the index is merged.
+    fn merge_shard(&mut self, other: GgufInner, path: &Path) -> Result<()> {
+        if other.alignment != self.alignment {
+            return Err(GgufError::Split(format!(
+                "{} has alignment {} but the primary shard has {}",
+                path.display(),
+                other.alignment,
+                self.alignment
+            )));
+        }
+        let idx = (self.extra.len() + 1) as u32;
+        for t in other.tensors {
+            if self.tensors_by_name.contains_key(&t.name) {
+                return Err(GgufError::Split(format!(
+                    "tensor {} appears in more than one shard (second in {})",
+                    t.name,
+                    path.display()
+                )));
+            }
+            self.tensors_by_name.insert(t.name.clone(), self.tensors.len());
+            self.tensors.push(t);
+            self.tensor_shard.push(idx);
+        }
+        self.extra.push(ShardBacking {
+            backing: other.backing,
+            tensor_data_start: other.tensor_data_start,
+            source: other.source,
+        });
+        Ok(())
+    }
+}
+
+/// Sibling paths for a split GGUF, given any one shard and the shard count.
+///
+/// llama.cpp names shards `<prefix>-%05d-of-%05d.gguf`, so the prefix is
+/// recovered by stripping that suffix. Returns the full set in shard order
+/// (index 0 is `-00001-of-`), or `None` if the name does not match, which the
+/// caller reports rather than guessing.
+fn split_shard_paths(path: &Path, count: usize) -> Option<Vec<PathBuf>> {
+    if count == 0 {
+        return None;
+    }
+    let name = path.file_name()?.to_str()?;
+    let stem = name.strip_suffix(".gguf")?;
+    let (head, total) = stem.rsplit_once("-of-")?;
+    let (prefix, cur) = head.rsplit_once('-')?;
+    let five = |s: &str| s.len() == 5 && s.bytes().all(|b| b.is_ascii_digit());
+    if !five(total) || !five(cur) {
+        return None;
+    }
+    // Trust the metadata count over the filename, but they should agree.
+    if total.parse::<usize>().ok()? != count {
+        return None;
+    }
+    let dir = path.parent()?;
+    Some(
+        (1..=count)
+            .map(|i| dir.join(format!("{prefix}-{i:05}-of-{count:05}.gguf")))
+            .collect(),
+    )
 }
 
 #[inline]
@@ -601,6 +838,130 @@ mod tests {
 
     /// VENDORED-LOCAL: a streaming open serves the same metadata and tensor
     /// bytes through positioned reads as the mmap does.
+    // VENDORED-LOCAL: split-GGUF tests.
+
+    /// Build a two-shard split GGUF on disk and read it back as one file.
+    #[test]
+    fn split_shards_present_as_one_file() {
+        use crate::tensor::GgmlType;
+
+        let dir = std::env::temp_dir().join(format!("gguf_split_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+
+        let mk = |no: u32, names: &[&str]| -> Vec<u8> {
+            let mut md = BTreeMap::new();
+            md.insert("general.architecture".to_string(), Value::String("llama".into()));
+            md.insert("split.no".to_string(), Value::U16(no as u16));
+            md.insert("split.count".to_string(), Value::U16(2));
+            md.insert("split.tensors.count".to_string(), Value::I32(4));
+            let mut ts: Vec<(TensorInfo, Vec<u8>)> = Vec::new();
+            for (k, n) in names.iter().enumerate() {
+                // Distinct bytes per tensor so a mis-attributed shard shows up.
+                let body: Vec<u8> = (0..16u32)
+                    .map(|i| (i as u8).wrapping_add((no * 100 + k as u32) as u8))
+                    .collect();
+                ts.push((
+                    TensorInfo {
+                        name: (*n).to_string(),
+                        shape: vec![4],
+                        dtype: GgmlType::F32,
+                        offset: 0,
+                    },
+                    body,
+                ));
+            }
+            crate::reader::write_to_vec(&md, &ts, 32).expect("write shard")
+        };
+
+        let p0 = dir.join("m-00001-of-00002.gguf");
+        let p1 = dir.join("m-00002-of-00002.gguf");
+        std::fs::write(&p0, mk(0, &["a", "b"])).expect("write 0");
+        std::fs::write(&p1, mk(1, &["c", "d"])).expect("write 1");
+
+        let f = GgufFile::open(&p0).expect("open split");
+        assert_eq!(f.n_shards(), 2);
+        assert_eq!(f.tensors().len(), 4, "the index spans both shards");
+        for n in ["a", "b", "c", "d"] {
+            assert!(f.tensor_by_name(n).is_some(), "{n} must resolve");
+        }
+        // Shard attribution, and bodies read from the right file.
+        assert_eq!(f.shard_of(f.tensor_by_name("a").unwrap()), 0);
+        assert_eq!(f.shard_of(f.tensor_by_name("d").unwrap()), 1);
+        let d = f.tensor_data(f.tensor_by_name("d").unwrap());
+        // shard 1, tensor index 1 -> base 101
+        assert_eq!(d[0], 101u8, "shard 1 bodies must come from shard 1");
+        let a = f.tensor_data(f.tensor_by_name("a").unwrap());
+        assert_eq!(a[0], 0u8);
+
+        // Opening a LATER shard must still give the whole model, because the
+        // primary carries the metadata.
+        let f2 = GgufFile::open(&p1).expect("open from shard 2");
+        assert_eq!(f2.tensors().len(), 4);
+        assert_eq!(f2.architecture().unwrap(), "llama");
+
+        // Streaming follows splits too, with one source per shard.
+        let fs = GgufFile::open_streaming(&p0).expect("open split streaming");
+        assert_eq!(fs.n_shards(), 2);
+        let td = fs.tensor_bytes(fs.tensor_by_name("d").unwrap()).expect("bytes");
+        assert_eq!(td[0], 101u8, "streamed shard-1 body");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A declared split whose siblings cannot be named is an error, not a
+    /// silently truncated model.
+    #[test]
+    fn a_split_with_an_unparseable_name_is_rejected() {
+        use crate::tensor::GgmlType;
+        let dir = std::env::temp_dir().join(format!("gguf_split_bad_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+
+        let mut md = BTreeMap::new();
+        md.insert("general.architecture".to_string(), Value::String("llama".into()));
+        md.insert("split.count".to_string(), Value::U16(3));
+        let ts = vec![(
+            TensorInfo {
+                name: "a".into(),
+                shape: vec![4],
+                dtype: GgmlType::F32,
+                offset: 0,
+            },
+            vec![0u8; 16],
+        )];
+        let raw = crate::reader::write_to_vec(&md, &ts, 32).expect("write");
+        let bad = dir.join("not-a-split.gguf");
+        std::fs::write(&bad, raw).expect("write bad");
+
+        let err = GgufFile::open(&bad).expect_err("must refuse");
+        assert!(
+            matches!(err, GgufError::Split(_)),
+            "expected a Split error, got {err:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A single-file GGUF keeps exactly its old behaviour.
+    #[test]
+    fn a_single_file_reports_one_shard() {
+        use crate::tensor::GgmlType;
+        let mut md = BTreeMap::new();
+        md.insert("general.architecture".to_string(), Value::String("llama".into()));
+        let ts = vec![(
+            TensorInfo {
+                name: "a".into(),
+                shape: vec![4],
+                dtype: GgmlType::F32,
+                offset: 0,
+            },
+            vec![7u8; 16],
+        )];
+        let raw = crate::reader::write_to_vec(&md, &ts, 32).expect("write");
+        let f = GgufFile::from_bytes(raw).expect("parse");
+        assert_eq!(f.n_shards(), 1);
+        assert_eq!(f.shard_of(f.tensor_by_name("a").unwrap()), 0);
+        assert_eq!(f.tensor_data(f.tensor_by_name("a").unwrap())[0], 7u8);
+    }
+
     #[test]
     fn open_streaming_matches_mmap() {
         let dir = tempfile::tempdir().unwrap();

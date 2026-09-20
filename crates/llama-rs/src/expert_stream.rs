@@ -104,6 +104,10 @@ struct PartLayout {
     /// Per-layer base offset (GGUF data-section frame) of this part's
     /// expert-0 bytes.
     base_offsets: Vec<u64>,
+    // VENDORED-LOCAL: which shard of a split GGUF each layer's bytes live in.
+    // `base_offsets` are relative to that shard's own data section, so the read
+    // has to go through that shard's source.
+    shards: Vec<u32>,
     /// Per-layer bytes per expert slice (the stride between experts; within
     /// a layer the stacked split is uniform — checked at resolve).
     per_expert_bytes: Vec<usize>,
@@ -136,6 +140,12 @@ pub struct ExpertLayout {
     down: PartLayout,
     n_layers:  u32,
     n_experts: u32,
+    // VENDORED-LOCAL: index of the first block that HAS experts. 0 for
+    // qwen3moe/mixtral, where every block is MoE; 3 for glm5next, whose
+    // `leading_dense_block_count` blocks have a dense FFN and no expert
+    // tensors at all. Records stay addressed by MoE-relative layer, so a
+    // `(layer, expert)` key means "the layer'th MoE block", not "block layer".
+    first_layer: u32,
 }
 
 /// Loader-convention shape of a stacked `[n_experts, a, b]` or per-expert
@@ -170,22 +180,37 @@ impl ExpertLayout {
     /// Every layer must agree on dtype, per-expert bytes, and per-expert
     /// shape for all three parts; anything else is rejected.
     pub fn resolve(g: &GgufFile, n_layers: usize, n_experts: usize) -> crate::Result<Self> {
+        Self::resolve_range(g, 0, n_layers, n_experts)
+    }
+
+    /// VENDORED-LOCAL: as [`Self::resolve`], but the MoE blocks start at
+    /// `first_layer` instead of block 0, and `n_layers` counts MoE blocks rather
+    /// than the model's depth. glm5next needs this: its blocks 0..=2 are dense,
+    /// so probing `blk.0.ffn_gate_exps.weight` finds nothing and the unoffset
+    /// path failed with a MissingTensor on a perfectly good file.
+    pub fn resolve_range(
+        g: &GgufFile,
+        first_layer: usize,
+        n_layers: usize,
+        n_experts: usize,
+    ) -> crate::Result<Self> {
         if n_layers == 0 || n_experts == 0 {
             return Err(crate::LlamaError::Config(
                 "expert layout: n_layers and n_experts must be > 0".into(),
             ));
         }
         let stacked = g
-            .tensor_by_name("blk.0.ffn_gate_exps.weight")
+            .tensor_by_name(&format!("blk.{first_layer}.ffn_gate_exps.weight"))
             .is_some();
 
         let parts = |part: &str| -> crate::Result<PartLayout> {
             let mut base_offsets = Vec::with_capacity(n_layers);
+            let mut shards = Vec::with_capacity(n_layers);
             let mut per_expert_bytes = Vec::with_capacity(n_layers);
             let mut dtypes = Vec::with_capacity(n_layers);
             let mut max_per = 0usize;
             let mut shape: Option<[usize; 2]> = None;
-            for l in 0..n_layers {
+            for l in first_layer..first_layer + n_layers {
                 let name = if stacked {
                     format!("blk.{l}.ffn_{part}_exps.weight")
                 } else {
@@ -211,7 +236,7 @@ impl ExpertLayout {
                     Some(prev) if prev != sh => {
                         return Err(crate::LlamaError::Config(format!(
                             "expert part '{part}' of layer {l} has shape {sh:?}, \
-                             layer 0 has {prev:?}; non-uniform expert shapes \
+                             layer {first_layer} has {prev:?}; non-uniform expert shapes \
                              cannot stream as fixed-size records"
                         )));
                     }
@@ -221,9 +246,11 @@ impl ExpertLayout {
                 per_expert_bytes.push(per);
                 dtypes.push(info.dtype);
                 base_offsets.push(info.offset);
+                shards.push(g.shard_of(info) as u32);
             }
             Ok(PartLayout {
                 base_offsets,
+                shards,
                 per_expert_bytes,
                 dtypes,
                 max_per_expert_bytes: max_per,
@@ -240,8 +267,12 @@ impl ExpertLayout {
             down,
             n_layers: n_layers as u32,
             n_experts: n_experts as u32,
+            first_layer: first_layer as u32,
         })
     }
+
+    /// VENDORED-LOCAL: the model block index of MoE layer 0.
+    pub fn first_layer(&self) -> u32 { self.first_layer }
 
     /// Fixed record size: the per-part region maxima summed. Mixed-quant
     /// layers pad their smaller parts inside their regions; reconstruction
@@ -284,14 +315,26 @@ impl std::fmt::Debug for GgufExpertStore {
     }
 }
 
+impl PartLayout {
+    /// VENDORED-LOCAL: the shard a layer's bytes live in.
+    fn shard(&self, layer: usize) -> usize {
+        self.shards[layer] as usize
+    }
+}
+
 impl GgufExpertStore {
     pub fn new(file: GgufFile, layout: ExpertLayout) -> crate::Result<Self> {
-        if file.tensor_source().is_none() {
-            return Err(crate::LlamaError::Config(
-                "GgufExpertStore needs a TensorBytes source (GgufFile::open_streaming, \
-                 or an explicit source); a bare mmap'd GGUF has none"
-                    .into(),
-            ));
+        // VENDORED-LOCAL: every shard must be source-backed, not just the
+        // primary: on a split GGUF the experts are spread across all of them.
+        for shard in 0..file.n_shards() {
+            if !file.shard_is_source_backed(shard) {
+                return Err(crate::LlamaError::Config(format!(
+                    "GgufExpertStore needs a TensorBytes source for every shard \
+                     (GgufFile::open_streaming, or an explicit source); shard {shard} \
+                     of {} has none",
+                    file.n_shards()
+                )));
+            }
         }
         Ok(Self { file, layout })
     }
@@ -394,9 +437,6 @@ impl WeightStore for GgufExpertStore {
                 self.record_bytes()
             )));
         }
-        let src = self.file.tensor_source().ok_or_else(|| {
-            io_err("expert store lost its TensorBytes source".into())
-        })?;
         let (l, e) = (layer as usize, expert as usize);
         let g = self.layout.gate.max_per_expert_bytes;
         let u = self.layout.up.max_per_expert_bytes;
@@ -407,6 +447,11 @@ impl WeightStore for GgufExpertStore {
         ];
         for (part, region_off) in parts {
             let (off, len) = part.range(l, e);
+            // VENDORED-LOCAL: the source for THIS part's shard.
+            let src = self
+                .file
+                .shard_source_at(part.shard(l))
+                .ok_or_else(|| io_err("expert store lost its TensorBytes source".into()))?;
             src.read_range(off, &mut dst[region_off..region_off + len])
                 .map_err(|err| {
                     io_err(format!(
@@ -1174,20 +1219,22 @@ impl crate::Model {
         ram_budget_bytes: u64,
     ) -> crate::Result<Self> {
         use crate::config::{Architecture, ModelConfig};
-        use crate::{LlamaError, MixtralModel, Qwen3MoeModel};
+        use crate::{Glm5NextModel, LlamaError, MixtralModel, Qwen3MoeModel};
         let g = GgufFile::open_streaming(gguf_path)?;
         let arch_str = g.architecture()?.to_string();
         let arch = Architecture::from_str(&arch_str);
 
         let is_qwen3moe = matches!(arch, Architecture::Qwen3Moe | Architecture::Qwen3VlMoe);
+        // VENDORED-LOCAL: glm5next streams too, but its first 3 blocks are dense.
+        let is_glm5next = matches!(arch, Architecture::Glm5Next);
         let is_mixtral = matches!(
             arch,
             Architecture::Llama | Architecture::Mistral | Architecture::Qwen2
         ) && g.get_u64(&format!("{arch_str}.expert_count")).unwrap_or(0) > 0;
-        if !is_qwen3moe && !is_mixtral {
+        if !is_qwen3moe && !is_mixtral && !is_glm5next {
             return Err(LlamaError::UnsupportedArch(format!(
                 "{arch_str}: streaming experts are implemented for qwen3moe and \
-                 mixtral-family MoE models only"
+                 mixtral-family and glm5next MoE models only"
             )));
         }
 
@@ -1197,7 +1244,22 @@ impl crate::Model {
             .map(|v| v as usize)
             .map_err(|_| LlamaError::Config(format!("missing {arch_str}.expert_count")))?;
 
-        let layout = ExpertLayout::resolve(&g, config.n_layers, n_experts)?;
+        // VENDORED-LOCAL: glm5next's experts start at `leading_dense_block_count`,
+        // so the layout covers blocks first_moe..n_layers, not 0..n_layers. Every
+        // other arch here is MoE from block 0 and keeps the unoffset call.
+        let first_moe = if is_glm5next {
+            g.get_u64(&format!("{arch_str}.leading_dense_block_count")).unwrap_or(0) as usize
+        } else {
+            0
+        };
+        if first_moe >= config.n_layers {
+            return Err(LlamaError::Config(format!(
+                "leading_dense_block_count ({first_moe}) leaves no MoE blocks in {}",
+                config.n_layers
+            )));
+        }
+        let n_moe_layers = config.n_layers - first_moe;
+        let layout = ExpertLayout::resolve_range(&g, first_moe, n_moe_layers, n_experts)?;
         let total_tensor_bytes: u64 = g.tensors().iter().map(|t| t.nbytes()).sum();
         let resident_est = total_tensor_bytes.saturating_sub(layout.total_expert_bytes());
         if ram_budget_bytes <= resident_est {
@@ -1211,7 +1273,9 @@ impl crate::Model {
         let store = GgufExpertStore::new(g.clone(), layout)?;
         let shared = StreamShared::new(store, cache_budget, resident_est)?;
 
-        if is_qwen3moe {
+        if is_glm5next {
+            Ok(Self::Glm5Next(Glm5NextModel::from_gguf_streaming(&g, backend, shared)?))
+        } else if is_qwen3moe {
             Ok(Self::Qwen3Moe(Qwen3MoeModel::from_gguf_streaming(&g, backend, shared)?))
         } else {
             Ok(Self::Mixtral(MixtralModel::from_gguf_streaming(&g, backend, shared)?))

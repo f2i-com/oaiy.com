@@ -48,6 +48,24 @@ pub enum Architecture {
     /// vision tower. Three-way pending: MoE loader (#85), vision tower (#84),
     /// integration of both into the qwen35 dense path.
     Qwen36MoeVl,
+    // VENDORED-LOCAL: GLM-5.3-Flash (`glm5next`).
+    /// GLM-5.3-Flash — `arch=glm5next`, 313B-A17B (46 blocks, 288 experts,
+    /// top-8 + 1 shared). Three things no other arch here has at once:
+    ///   * **Hybrid attention by per-layer array**, not a modular interval.
+    ///     `attention.head_count_kv` is a 0/1 array: 0 = KDA linear-attention
+    ///     layer, 1 = full MLA. 34 KDA + 11 MLA over a 45-layer trunk.
+    ///   * **MLA + a sparse "lightning indexer"** (`top_k=2048`, `kpool=4`)
+    ///     that scores pooled key groups and gathers the winning cells. NoPE:
+    ///     `rope.dimension_count = 0` for the whole text tower.
+    ///   * **Hyper-connections** — the residual stream is 4 parallel copies,
+    ///     mixed per sublayer through a Sinkhorn-normalised 4x4. Same
+    ///     formulation as DeepSeek-V4.1 (`dsv41::hc`), whose reference
+    ///     `glm5next` inherits from verbatim.
+    ///
+    /// `block_count` is 46 but the trunk is 45: `blk.45` is the NextN/MTP
+    /// draft block, which is why `hc_*` stops at `blk.44`. Loaded and
+    /// validated; forward lands with the KDA scan (see `glm5next.rs`).
+    Glm5Next,
     /// Architectures recognized but not yet implemented.
     Unsupported(String),
 }
@@ -67,6 +85,7 @@ impl Architecture {
             "qwen3vlmoe"   => Self::Qwen3VlMoe,
             "qwen35moe"    => Self::Qwen35Moe,
             "qwen36moevl"  => Self::Qwen36MoeVl,
+            "glm5next"     => Self::Glm5Next,
             other          => Self::Unsupported(other.to_string()),
         }
     }
@@ -87,6 +106,7 @@ impl Architecture {
             Self::Qwen3VlMoe  => "qwen3vlmoe",
             Self::Qwen35Moe   => "qwen35moe",
             Self::Qwen36MoeVl => "qwen36moevl",
+            Self::Glm5Next    => "glm5next",
             Self::Unsupported(s) => s.as_str(),
         }
     }
@@ -102,6 +122,11 @@ impl Architecture {
             Self::Qwen2 | Self::Qwen3 | Self::Qwen35 | Self::Qwen35Moe | Self::Qwen3Moe |
             Self::Qwen3VlMoe | Self::Qwen36MoeVl |
             Self::Gemma3 | Self::Gemma3n | Self::Gemma4 => RopeType::NeoX,
+            // VENDORED-LOCAL: glm5next is NoPE — `rope.dimension_count` is 0 and
+            // the GGUF carries no rope tensors, so this value is never applied.
+            // It is reported rather than left to the fallback so `nrob info`
+            // does not imply a rotation the arch never performs.
+            Self::Glm5Next => RopeType::NeoX,
             Self::Unsupported(_) => RopeType::NeoX,
         }
     }
@@ -147,6 +172,13 @@ pub struct ModelConfig {
     /// of the target sparsity). Finite values trigger Gaussian-top-k masking on the FFN
     /// gate; `-inf` (the upstream sentinel for "no sparsity") means skip.
     pub activation_sparsity_scale: Option<Vec<f32>>,
+    // VENDORED-LOCAL: glm5next per-layer attention kind.
+    /// glm5next: per-layer recurrent mask, decoded from the
+    /// `attention.head_count_kv` **array** (0 = KDA linear attention, 1 = full
+    /// MLA). `true` = this layer is recurrent/linear. Covers all `block_count`
+    /// entries including the trailing NextN block. `None` for every arch that
+    /// stores `head_count_kv` as a scalar.
+    pub recurrent_layers: Option<Vec<bool>>,
 }
 
 /// Backwards-compat alias for the v0 name.
@@ -187,7 +219,39 @@ impl ModelConfig {
         // scalar — the stub loader doesn't use the value, so 0 is a safe sentinel.
         let ff_dim         = get_u64("feed_forward_length").map(|v| v as usize).unwrap_or(0);
         let n_heads        = get_u64("attention.head_count")? as usize;
-        let n_kv_heads     = get_u64_or("attention.head_count_kv", n_heads as u64) as usize;
+
+        // VENDORED-LOCAL: glm5next stores `attention.head_count_kv` as a 0/1
+        // array (0 = KDA linear-attention layer, 1 = full MLA), not a scalar.
+        // Read the array form FIRST: the scalar read below fails on an array and
+        // would silently fall back to `n_heads`, claiming 64 KV heads for a model
+        // whose attention layers are absorbed-MLA MQA with a single latent row.
+        let recurrent_layers: Option<Vec<bool>> = if arch != Architecture::Glm5Next {
+            // gemma4 also stores this key as an array, but its entries are real
+            // per-layer KV head counts, not a 0/1 recurrent mask. Only glm5next
+            // means "0 = this layer is recurrent" by it.
+            None
+        } else {
+            g.metadata()
+            .get(&format!("{ns}.attention.head_count_kv"))
+            .and_then(|v| v.as_array())
+            .and_then(|a| match a {
+                Array::U32(v) => Some(v.iter().map(|&x| x == 0).collect()),
+                Array::I32(v) => Some(v.iter().map(|&x| x == 0).collect()),
+                Array::U64(v) => Some(v.iter().map(|&x| x == 0).collect()),
+                Array::I64(v) => Some(v.iter().map(|&x| x == 0).collect()),
+                _ => None,
+            })
+        };
+
+        // With the per-layer array, the KV head count is the array's maximum: the
+        // full-attention layers are MQA over one latent row. Layers marked 0 keep
+        // no KV cache at all — they carry a recurrent state instead.
+        let n_kv_heads = match &recurrent_layers {
+            Some(mask) if mask.iter().any(|&r| !r) => 1,
+            Some(_) => return Err(LlamaError::Config(
+                "attention.head_count_kv array marks every layer recurrent; the arch needs \n                 at least one full-attention layer".into())),
+            None => get_u64_or("attention.head_count_kv", n_heads as u64) as usize,
+        };
         let rms_eps        = get_f32("attention.layer_norm_rms_epsilon").unwrap_or(1e-5);
         let rope_theta     = get_f32("rope.freq_base").unwrap_or(10000.0);
 
@@ -285,6 +349,7 @@ impl ModelConfig {
             rope_theta_swa,
             rope_dim_swa,
             activation_sparsity_scale,
+            recurrent_layers,
         })
     }
 

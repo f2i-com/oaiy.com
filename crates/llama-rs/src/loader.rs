@@ -48,13 +48,17 @@ pub fn load_tensor_f32(g: &GgufFile, info: &TensorInfo) -> Result<Tensor> {
 /// fallback without writing eviction logic ourselves).
 struct MmapView {
     file:   GgufFile,
+    // VENDORED-LOCAL: which shard of a split GGUF `offset` is relative to.
+    // `tensor_data_offset` is shard-relative, so pairing it with shard 0 would
+    // read shards 2+ out of the wrong file.
+    shard:  usize,
     offset: usize,
     len:    usize,
 }
 
 impl ggml_rs::quantized::QuantizedHostBytes for MmapView {
     fn as_bytes(&self) -> &[u8] {
-        self.file.raw_slice(self.offset, self.len)
+        self.file.raw_slice_shard(self.shard, self.offset, self.len)
     }
 }
 
@@ -65,12 +69,16 @@ fn load_tensor_packed(g: &GgufFile, info: &TensorInfo) -> Result<QuantizedTensor
     if shape.is_empty() { shape.push(info.numel() as usize); }
     // VENDORED-LOCAL: a source-backed (streaming) file has no mmap to view into —
     // materialize owned bytes instead. Same bytes, same dtype, same kernels.
-    if let Some(src) = g.tensor_source() {
+    // VENDORED-LOCAL: per-shard, not per-file: on a split GGUF one shard may be
+    // source-backed while the view offsets belong to another.
+    let shard = g.shard_of(info);
+    if let Some(src) = g.tensor_source_of(info) {
         let bytes = src.read_tensor(info)?;
         return Ok(QuantizedTensor::from_bytes_cpu(bytes, shape, info.dtype));
     }
     let view = MmapView {
         file:   g.clone(),
+        shard,
         offset: g.tensor_data_offset(info),
         len:    info.nbytes() as usize,
     };

@@ -283,7 +283,8 @@ pub fn load_per_layer_experts_compat(
 /// Load all of layer `layer`'s expert weights, fusing each expert's gate+up
 /// pair into one stacked weight (`FfnPair::Fused`) when dtype/shape allow.
 /// Cuts the per-expert matmul launch count from 3→2 at decode time.
-fn load_per_layer_experts_pair(
+// VENDORED-LOCAL: pub(crate) so glm5next.rs can reuse the stacked-expert loader.
+pub(crate) fn load_per_layer_experts_pair(
     idx: &TensorIndex<'_>,
     layer: usize,
     n_experts: usize,

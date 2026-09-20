@@ -57,6 +57,8 @@ pub fn apply_chat_template(arch: &Architecture, messages: &[ChatMessage], add_as
         // Gemma 4 introduced new `<|turn>` / `<turn|>` markers.
         Architecture::Gemma4 => gemma4_template(messages, add_assistant),
         Architecture::Qwen2 => chatml_template(messages, add_assistant, false),
+        // VENDORED-LOCAL: GLM-5.3-Flash.
+        Architecture::Glm5Next => glm5next_template(messages, add_assistant),
         // Qwen3 ships with "thinking mode" enabled by default. To get a normal
         // (non-thinking) chat response, the official template appends
         // `<think>\n\n</think>\n\n` after the assistant turn opener — that
@@ -132,6 +134,40 @@ fn gemma4_template(messages: &[ChatMessage], add_assistant: bool) -> String {
     }
     if add_assistant {
         out.push_str("<|turn>model\n");
+    }
+    out
+}
+
+// VENDORED-LOCAL: GLM-5.3-Flash.
+/// GLM-5.3-Flash (`glm5next`). `[gMASK]<sop>` opens the sequence, then each turn
+/// is a role marker followed by a newline and the content, with no closing
+/// marker — a turn ends where the next role marker begins.
+///
+/// Token ids, from this model's own vocab: `[gMASK]` 154822, `<sop>` 154824,
+/// `<|system|>` 154826, `<|user|>` 154827, `<|assistant|>` 154828,
+/// `<|observation|>` 154829.
+///
+/// **Not yet emitted**, all of which the GGUF's Jinja template can produce:
+/// the `<|system|>Reasoning Effort: {Low,High,Max}` preamble, the `# Tools`
+/// system block with `<tools>` signatures, and `<think>` / `</think>` (154841 /
+/// 154842) reasoning spans. Plain chat is exact without them; tool calling and
+/// reasoning-effort control are not.
+fn glm5next_template(messages: &[ChatMessage], add_assistant: bool) -> String {
+    let mut out = String::with_capacity(
+        messages.iter().map(|m| m.content.len()).sum::<usize>() + 128,
+    );
+    out.push_str("[gMASK]<sop>");
+    for m in messages {
+        out.push_str(match m.role {
+            Role::System    => "<|system|>",
+            Role::User      => "<|user|>",
+            Role::Assistant => "<|assistant|>",
+        });
+        out.push('\n');
+        out.push_str(&m.content);
+    }
+    if add_assistant {
+        out.push_str("<|assistant|>\n");
     }
     out
 }
@@ -232,6 +268,11 @@ pub fn chat_stop_tokens(arch: &Architecture) -> &'static [&'static str] {
         Architecture::Qwen2 | Architecture::Qwen3 | Architecture::Qwen35 |
         Architecture::Qwen3Moe | Architecture::Qwen3VlMoe |
         Architecture::Qwen35Moe | Architecture::Qwen36MoeVl => &["<|im_end|>"],
+        // VENDORED-LOCAL: GLM-5.3-Flash. Resolved from the GGUF vocab, not guessed:
+        // eos 154820 = `<|endoftext|>`, eot 154827 = `<|user|>`, eom 154829 =
+        // `<|observation|>`. GLM ends an assistant turn by emitting the *next*
+        // role marker, so `<|user|>` is a stop token rather than a prompt-only one.
+        Architecture::Glm5Next => &["<|endoftext|>", "<|user|>", "<|observation|>"],
         Architecture::Llama => &["<|eot_id|>", "<|end_of_text|>"],
         Architecture::Mistral => &["</s>"],
         Architecture::Unsupported(_) => &[],

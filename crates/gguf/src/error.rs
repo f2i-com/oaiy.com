@@ -31,6 +31,10 @@ pub enum GgufError {
     #[error("expected metadata key `{0}` was not found")]
     MissingKey(String),
 
+    // VENDORED-LOCAL: split-GGUF shard handling.
+    #[error("split GGUF: {0}")]
+    Split(String),
+
     #[error("metadata key `{key}` had wrong type: expected {expected}, got {actual}")]
     TypeMismatch {
         key: String,

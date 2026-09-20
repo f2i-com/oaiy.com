@@ -33,6 +33,7 @@ pub mod moe;
 #[cfg(feature = "cuda")]
 mod moe_cuda;
 pub mod qwen3;
+pub mod glm5next; // VENDORED-LOCAL: GLM-5.3-Flash
 pub mod qwen3moe;
 pub mod qwen35;
 pub mod qwen35moe;
@@ -59,6 +60,8 @@ pub use loader::{
 };
 pub use qwen3::Qwen3Model;
 pub use qwen3moe::{Qwen3MoeBlock, Qwen3MoeModel};
+// VENDORED-LOCAL: GLM-5.3-Flash
+pub use glm5next::{Glm5NextBlock, Glm5NextConfig, Glm5NextModel, LayerKind};
 pub use qwen35::{Qwen35Block, Qwen35Model, SsmConfig};
 pub use qwen35moe::{Qwen35MoeBlock, Qwen35MoeModel};
 pub use sampler::{SampleParams, Sampler};
@@ -124,6 +127,11 @@ pub enum Model {
     /// Qwen3-MoE — Qwen3 attention backbone + Mixture-of-Experts FFN.
     /// Targets Qwen3-30B-A3B / Qwen3.6-30B-A3B (typically 128 experts, top-8).
     Qwen3Moe(Qwen3MoeModel),
+    // VENDORED-LOCAL: GLM-5.3-Flash (`glm5next`). 45-layer trunk of 34 KDA
+    /// linear-attention + 11 MLA layers, 288 experts top-8 + 1 shared, and a
+    /// 4-stream hyper-connection residual. Loads and validates; `forward`
+    /// reports the pending pieces. See `glm5next.rs`.
+    Glm5Next(Glm5NextModel),
     /// Mixtral (8x7B / 8x22B) — `arch=llama` in GGUF + `expert_count > 0` in
     /// metadata. Standard Llama attention + per-block MoE FFN.
     Mixtral(MixtralModel),
@@ -166,6 +174,8 @@ impl Model {
             }
             Architecture::Qwen35 => Ok(Self::Qwen35(Qwen35Model::from_gguf(g, backend)?)),
             Architecture::Qwen3Moe => Ok(Self::Qwen3Moe(Qwen3MoeModel::from_gguf(g, backend)?)),
+            // VENDORED-LOCAL: glm5next loads fully; `forward` is the stub.
+            Architecture::Glm5Next => Ok(Self::Glm5Next(Glm5NextModel::from_gguf(g, backend)?)),
             // Qwen3-VL-MoE has the same per-block structure as qwen3moe (full
             // attention + per-block routed MoE, no shared expert), so it routes
             // to the same Qwen3MoeModel — Qwen3MoeModel reads metadata under
@@ -193,6 +203,7 @@ impl Model {
             Self::Gemma4(m)   => &m.config,
             Self::Qwen35(m)   => &m.config,
             Self::Qwen3Moe(m) => &m.config,
+            Self::Glm5Next(m) => &m.config,
             Self::Mixtral(m)  => &m.config,
             Self::Gemma4Moe(m) => &m.config,
             Self::Qwen35Moe(m) => &m.config,
@@ -208,6 +219,7 @@ impl Model {
             Self::Gemma4(m)   => &m.tokenizer,
             Self::Qwen35(m)   => &m.tokenizer,
             Self::Qwen3Moe(m) => &m.tokenizer,
+            Self::Glm5Next(m) => &m.tokenizer,
             Self::Mixtral(m)  => &m.tokenizer,
             Self::Gemma4Moe(m) => &m.tokenizer,
             Self::Qwen35Moe(m) => &m.tokenizer,
@@ -223,6 +235,7 @@ impl Model {
             Self::Gemma4(m)   => &m.backend,
             Self::Qwen35(m)   => &m.backend,
             Self::Qwen3Moe(m) => &m.backend,
+            Self::Glm5Next(m) => &m.backend,
             Self::Mixtral(m)  => &m.backend,
             Self::Gemma4Moe(m) => &m.backend,
             Self::Qwen35Moe(m) => &m.backend,
@@ -238,6 +251,7 @@ impl Model {
             Self::Gemma4(m)   => m.forward(tokens, kv),
             Self::Qwen35(m)   => m.forward(tokens, kv).expect("Qwen3.5 forward error"),
             Self::Qwen3Moe(m) => m.forward(tokens, kv),
+            Self::Glm5Next(m) => m.forward(tokens, kv).unwrap_or_else(|e| panic!("{e}")),
             Self::Mixtral(m)  => m.forward(tokens, kv),
             Self::Gemma4Moe(m) => m.forward(tokens, kv),
             Self::Qwen35Moe(m) => m.forward(tokens, kv).expect("Qwen3.6-MoE forward error"),
@@ -289,6 +303,7 @@ impl Model {
     pub fn stream_shared(&self) -> Option<&Arc<expert_stream::StreamShared>> {
         match self {
             Self::Qwen3Moe(m) => m.stream_shared.as_ref(),
+            Self::Glm5Next(m) => m.stream_shared.as_ref(),
             Self::Mixtral(m)  => m.stream_shared.as_ref(),
             _ => None,
         }

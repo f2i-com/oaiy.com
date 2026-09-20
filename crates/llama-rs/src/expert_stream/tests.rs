@@ -709,3 +709,77 @@ fn prewarm_reads_each_cold_expert_once() {
     assert_eq!(st.misses, 6);
     assert!(st.hits > 0);
 }
+
+// VENDORED-LOCAL: glm5next's first blocks are dense, so MoE layer 0 is not block 0.
+
+/// Leading dense blocks in the offset fixture. glm5next ships 3.
+const N_DENSE: usize = 3;
+
+/// The same stacked Q8_0 expert tensors as [`stacked_fixture`], but every expert
+/// tensor is named `blk.{l + N_DENSE}` — the layout glm5next has, where
+/// `leading_dense_block_count` blocks carry a dense FFN and no expert tensors at
+/// all. `records` stays indexed MoE-relative, which is what the store addresses.
+fn dense_lead_fixture() -> Fixture {
+    let (mut metadata, tensors, records, rec_bytes) = fixture_tensors();
+    metadata.insert(
+        "general.architecture".to_string(),
+        Value::String("glm5next".to_string()),
+    );
+    metadata.insert("glm5next.expert_count".to_string(), Value::U32(N_EXPERTS as u32));
+    metadata.insert(
+        "glm5next.leading_dense_block_count".to_string(),
+        Value::U32(N_DENSE as u32),
+    );
+
+    let shifted: Vec<(TensorInfo, Vec<u8>)> = tensors
+        .into_iter()
+        .map(|(mut info, bytes)| {
+            let rest = info.name.strip_prefix("blk.").expect("blk-prefixed name");
+            let (l, tail) = rest.split_once('.').expect("blk.<n>.<tail>");
+            let l: usize = l.parse().expect("layer index");
+            info.name = format!("blk.{}.{tail}", l + N_DENSE);
+            (info, bytes)
+        })
+        .collect();
+
+    let raw = gguf::reader::write_to_vec(&metadata, &shifted, 32).expect("write gguf");
+    let probe = GgufFile::from_bytes(raw.clone()).expect("parse gguf");
+    let data_start = probe.tensor_data_start() as usize;
+    let source = Arc::new(VecSource { data: raw[data_start..].to_vec() });
+    let file = GgufFile::from_bytes_with_source(raw, source).expect("parse gguf with source");
+
+    Fixture { file, records, rec_bytes }
+}
+
+/// The unoffset resolve probes `blk.0.ffn_gate_exps.weight`. A model with
+/// leading dense blocks has no such tensor, so it must fail rather than
+/// half-resolve — this is the shape glm5next hit before `resolve_range`.
+#[test]
+fn resolve_rejects_leading_dense_blocks() {
+    let fx = dense_lead_fixture();
+    assert!(ExpertLayout::resolve(&fx.file, N_LAYERS, N_EXPERTS).is_err());
+}
+
+/// With the offset, the layout resolves and every record still reads back
+/// byte-identical to what the fixture wrote.
+#[test]
+fn resolve_range_streams_experts_after_the_dense_blocks() {
+    let fx = dense_lead_fixture();
+    let layout = ExpertLayout::resolve_range(&fx.file, N_DENSE, N_LAYERS, N_EXPERTS)
+        .expect("resolve offset layout");
+    assert_eq!(layout.first_layer(), N_DENSE as u32);
+    assert_eq!(layout.record_bytes(), fx.rec_bytes);
+
+    let store = GgufExpertStore::new(fx.file.clone(), layout).expect("store");
+    // shape() counts MoE layers, not the model's depth.
+    assert_eq!(store.shape(), (N_LAYERS as u32, N_EXPERTS as u32));
+
+    // Keys are MoE-relative: (0, e) is block N_DENSE's expert e.
+    let mut got = vec![0u8; fx.rec_bytes];
+    for l in 0..N_LAYERS {
+        for e in 0..N_EXPERTS {
+            store.fetch(l as u32, e as u32, &mut got).expect("fetch record");
+            assert_eq!(got, fx.records[l][e], "record ({l}, {e}) mismatch");
+        }
+    }
+}
