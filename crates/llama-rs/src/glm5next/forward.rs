@@ -187,6 +187,48 @@ pub(crate) fn batched_gemv_host(
     Ok(())
 }
 
+/// Two projections that share an input, as one matrix where the loader could
+/// stack them and as two where it could not.
+///
+/// glm5next has three of these per layer whose halves have the same dtype and the
+/// same input, so the GGUF rows can be concatenated and the pair done in one
+/// matmul: `attn_q`+`attn_k` (Q4_K, `attn_v` is Q6_K so it stays out),
+/// `ssm_f_a`+`ssm_g_a` (Q8_0), and `ffn_gate_shexp`+`ffn_up_shexp` (Q4_K). That is
+/// 110 of the ~710 `Mat::apply` calls a token, each carrying a ~32 us
+/// synchronisation whatever its size.
+///
+/// The arithmetic is unchanged either way: every output row is an independent dot
+/// product over the same `x`, so a stacked matvec is exactly the two separate ones
+/// concatenated, bit for bit.
+///
+/// `Split` exists because [`bridge::HostModel`](super::bridge) holds its weights
+/// as f32 and stacking them there would copy about 9 GB. The host oracle keeps two
+/// matrices; the device path fuses.
+pub enum Pair<'a> {
+    Fused(Mat<'a>),
+    Split(Mat<'a>, Mat<'a>),
+}
+
+impl Pair<'_> {
+    /// `out` is the two results end to end, the first `split` values then the rest.
+    pub fn apply(&self, x: &[f32], split: usize, out: &mut [f32]) -> Result<()> {
+        if split > out.len() {
+            return Err(LlamaError::Config(format!(
+                "forward: pair split {split} past the {}-value output",
+                out.len()
+            )));
+        }
+        match self {
+            Self::Fused(m) => m.apply(x, out),
+            Self::Split(a, b) => {
+                let (lo, hi) = out.split_at_mut(split);
+                a.apply(x, lo)?;
+                b.apply(x, hi)
+            }
+        }
+    }
+}
+
 impl Mat<'_> {
     /// `out = W @ x`, with `W` of `[out.len(), x.len()]`.
     pub fn apply(&self, x: &[f32], out: &mut [f32]) -> Result<()> {
@@ -387,8 +429,8 @@ pub struct HcW<'a> {
 
 pub struct KdaW<'a> {
     /// `[d_inner, n_embd]` each.
-    pub q: Mat<'a>,
-    pub k: Mat<'a>,
+    /// `attn_q` and `attn_k` -- the same dtype, so the device path fuses them.
+    pub qk: Pair<'a>,
     pub v: Mat<'a>,
     /// `[d_inner, 1, d_conv]` each — depthwise, so row `c` is
     /// `conv[c*d_conv..(c+1)*d_conv]`.
@@ -396,10 +438,9 @@ pub struct KdaW<'a> {
     pub conv_k: &'a [f32],
     pub conv_v: &'a [f32],
     /// `[head_dim, n_embd]` then `[d_inner, head_dim]`: the low-rank decay.
-    pub f_a: Mat<'a>,
+    /// `ssm_f_a` and `ssm_g_a`: both Q8_0, both applied to the layer input.
+    pub fga: Pair<'a>,
     pub f_b: Mat<'a>,
-    /// Same shapes: the low-rank output gate.
-    pub g_a: Mat<'a>,
     pub g_b: Mat<'a>,
     /// `[n_head, n_embd]`
     pub beta: Mat<'a>,
@@ -465,8 +506,8 @@ pub struct MoeW<'a> {
     pub ord: usize,
     /// `[n_ff_shexp, n_embd]`, `[n_ff_shexp, n_embd]`, `[n_embd, n_ff_shexp]`.
     /// The shared expert is always active, so it stays resident.
-    pub sh_gate: Mat<'a>,
-    pub sh_up: Mat<'a>,
+    /// `ffn_gate_shexp` and `ffn_up_shexp`, fused on the device path.
+    pub sh_gate_up: Pair<'a>,
     pub sh_down: Mat<'a>,
 }
 
@@ -720,8 +761,7 @@ fn kda_layer(
     // q‖k‖v from the layer input.
     let t = std::time::Instant::now();
     let mut qkv = vec![0.0f32; cd];
-    w.q.apply(x, &mut qkv[0..di])?;
-    w.k.apply(x, &mut qkv[di..2 * di])?;
+    w.qk.apply(x, di, &mut qkv[0..2 * di])?;
     w.v.apply(x, &mut qkv[2 * di..cd])?;
     prof::add(&prof::KDA_PROJ, t);
 
@@ -770,10 +810,12 @@ fn kda_layer(
     // `ssm_a` holds -exp(A_log), so the negation inside the sigmoid recovers the
     // reference's `sigmoid(exp(A_log) * ...)`.
     let t = std::time::Instant::now();
-    let mut fa = vec![0.0f32; hd];
-    w.f_a.apply(x, &mut fa)?;
+    // f_a and g_a share x, so one matmul gives both roots; g_a's half is used by
+    // the output gate further down.
+    let mut roots = vec![0.0f32; 2 * hd];
+    w.fga.apply(x, hd, &mut roots)?;
     let mut g_log = vec![0.0f32; di];
-    w.f_b.apply(&fa, &mut g_log)?;
+    w.f_b.apply(&roots[..hd], &mut g_log)?;
     for h in 0..nh {
         for i in 0..hd {
             let idx = h * hd + i;
@@ -820,10 +862,8 @@ fn kda_layer(
 
     // Per-head RMSNorm by ssm_norm, gated by a PLAIN sigmoid of g_b(g_a(x)) --
     // not the SiLU a FusedRMSNormGated would default to.
-    let mut ga = vec![0.0f32; hd];
-    w.g_a.apply(x, &mut ga)?;
     let mut gate = vec![0.0f32; di];
-    w.g_b.apply(&ga, &mut gate)?;
+    w.g_b.apply(&roots[hd..], &mut gate)?;
     for h in 0..nh {
         let head = &mut scan[h * hd..(h + 1) * hd];
         rms_norm(head, w.o_norm, sh.rms_eps)?;
@@ -1004,12 +1044,11 @@ fn ffn_layer(sh: &Shape, w: &FfnW<'_>, il: usize, x: &[f32], out: &mut [f32]) ->
             // The shared expert is added unscaled: expert_weights_scale applies
             // to the routed weights only.
             let sff = sh.n_ff_shexp;
-            let mut sg = vec![0.0f32; sff];
-            let mut su = vec![0.0f32; sff];
+            let mut sgu = vec![0.0f32; 2 * sff];
+            m.sh_gate_up.apply(x, sff, &mut sgu)?;
+            let (sg, su) = sgu.split_at(sff);
             let mut sh_h = vec![0.0f32; sff];
-            m.sh_gate.apply(x, &mut sg)?;
-            m.sh_up.apply(x, &mut su)?;
-            swiglu_clamped(&sg, &su, sh.swiglu_clamp_shexp[il], &mut sh_h)?;
+            swiglu_clamped(sg, su, sh.swiglu_clamp_shexp[il], &mut sh_h)?;
             let mut s_out = vec![0.0f32; sh.n_embd];
             m.sh_down.apply(&sh_h, &mut s_out)?;
             for (o, &sv) in out.iter_mut().zip(s_out.iter()) {
@@ -1468,15 +1507,13 @@ mod tests {
         for il in 0..sh.n_layer {
             let attn = match sh.layer_kinds[il] {
                 LayerKind::Kda => AttnW::Kda(KdaW {
-                    q: mh(il, "q"),
-                    k: mh(il, "k"),
+                    qk: Pair::Split(mh(il, "q"), mh(il, "k")),
                     v: mh(il, "v"),
                     conv_q: g(il, "conv_q"),
                     conv_k: g(il, "conv_k"),
                     conv_v: g(il, "conv_v"),
-                    f_a: mh(il, "f_a"),
+                    fga: Pair::Split(mh(il, "f_a"), mh(il, "g_a")),
                     f_b: mh(il, "f_b"),
-                    g_a: mh(il, "g_a"),
                     g_b: mh(il, "g_b"),
                     beta: mh(il, "beta"),
                     a: g(il, "a"),
@@ -1518,8 +1555,7 @@ mod tests {
                         .as_ref()
                         .expect("a MoE layer needs an expert source"),
                     ord: 0,
-                    sh_gate: mh(il, "sh_gate"),
-                    sh_up: mh(il, "sh_up"),
+                    sh_gate_up: Pair::Split(mh(il, "sh_gate"), mh(il, "sh_up")),
                     sh_down: mh(il, "sh_down"),
                 })
             };

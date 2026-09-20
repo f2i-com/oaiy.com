@@ -36,7 +36,7 @@ use ggml_rs::Tensor;
 use gguf::{GgufFile, TensorInfo};
 
 use super::forward::{
-    self, AttnW, Bat, ExpertFfn, FfnW, HcW, IndexerW, KdaW, LayerW, Mat, MlaW, ModelW, MoeW, Shape,
+    self, AttnW, Bat, ExpertFfn, FfnW, HcW, IndexerW, KdaW, LayerW, Mat, Pair, MlaW, ModelW, MoeW, Shape,
 };
 use super::{Glm5NextConfig, LayerKind};
 use crate::config::ModelConfig;
@@ -415,15 +415,13 @@ impl HostModel {
             let m = |s: &str| Mat::Host(self.g(&format!("blk.{il}.{s}")));
             let attn = match sh.layer_kinds[il] {
                 LayerKind::Kda => AttnW::Kda(KdaW {
-                    q: m("attn_q.weight"),
-                    k: m("attn_k.weight"),
+                    qk: Pair::Split(m("attn_q.weight"), m("attn_k.weight")),
                     v: m("attn_v.weight"),
                     conv_q: b("ssm_conv1d_q.weight"),
                     conv_k: b("ssm_conv1d_k.weight"),
                     conv_v: b("ssm_conv1d_v.weight"),
-                    f_a: m("ssm_f_a.weight"),
+                    fga: Pair::Split(m("ssm_f_a.weight"), m("ssm_g_a.weight")),
                     f_b: m("ssm_f_b.weight"),
-                    g_a: m("ssm_g_a.weight"),
                     g_b: m("ssm_g_b.weight"),
                     beta: m("ssm_beta.weight"),
                     a: b("ssm_a"),
@@ -463,8 +461,7 @@ impl HostModel {
                     probs_b: b("exp_probs_b.bias"),
                     experts: &self.experts,
                     ord: il - sh.n_dense_lead,
-                    sh_gate: m("ffn_gate_shexp.weight"),
-                    sh_up: m("ffn_up_shexp.weight"),
+                    sh_gate_up: Pair::Split(m("ffn_gate_shexp.weight"), m("ffn_up_shexp.weight")),
                     sh_down: m("ffn_down_shexp.weight"),
                 })
             };

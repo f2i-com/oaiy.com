@@ -1205,12 +1205,6 @@ impl LayerStream {
     }
 }
 
-/// VENDORED-LOCAL (CACHE-02 / STREAM-01): per-layer-forward device dispatch
-/// state. Holds the VRAM cache plus this forward's leases: an entry looked
-/// up or staged once is reused for every token routed to the same expert in
-/// this forward, so the cache sees each distinct expert at most once per
-/// layer-forward.
-#[cfg(feature = "cuda")]
 /// VENDORED-LOCAL: GLM-5.3-Flash. One expert of one layer, resolved.
 ///
 /// `Device` is a VRAM-cache entry: its tensors are already on the card, so the
@@ -1240,6 +1234,12 @@ impl ResolvedExpert {
     }
 }
 
+/// VENDORED-LOCAL (CACHE-02 / STREAM-01): per-layer-forward device dispatch
+/// state. Holds the VRAM cache plus this forward's leases: an entry looked
+/// up or staged once is reused for every token routed to the same expert in
+/// this forward, so the cache sees each distinct expert at most once per
+/// layer-forward.
+#[cfg(feature = "cuda")]
 struct DeviceDispatch {
     dc: Arc<device_cache::DeviceCache>,
     leases: std::collections::HashMap<u32, Arc<device_cache::DeviceEntry>>,

@@ -56,7 +56,8 @@ use crate::expert_stream::{
     ExpertLayout, GgufExpertStore, LayerStream, ResolvedExpert, StreamShared,
 };
 use super::forward::{
-    self, AttnW, Bat, ExpertFfn, FfnW, HcW, IndexerW, KdaW, LayerW, Mat, MlaW, ModelW, MoeW, Shape,
+    self, AttnW, Bat, ExpertFfn, FfnW, HcW, IndexerW, KdaW, LayerW, Mat, MlaW, ModelW, MoeW, Pair,
+    Shape,
 };
 use super::{Glm5NextConfig, LayerKind};
 use crate::config::ModelConfig;
@@ -243,6 +244,7 @@ impl StreamExperts {
     /// that rounding and for the driver's own growth.
     pub const VRAM_CHARGE_FRACTION: f64 = 0.88;
 
+    #[cfg(feature = "cuda")]
     fn vram_headroom() -> usize {
         std::env::var("GLM5_VRAM_HEADROOM_MB")
             .ok()
@@ -633,6 +635,15 @@ impl DeviceModel {
         let glm = Glm5NextConfig::from_gguf(g, &cfg)?;
         let idx = TensorIndex::new(g);
 
+        // Pairs to stack into one matrix. Collected here and built after the
+        // per-tensor closures go out of scope, because `Weight::stack_axis0` needs
+        // both halves still host-resident and the closures hold `w` mutably.
+        //
+        // Each pair shares an input and a dtype, so the GGUF rows concatenate and
+        // the pair becomes one matvec -- 110 fewer `Mat::apply` calls a token, each
+        // of which carries a ~32 us synchronisation whatever its size.
+        let mut fuse: Vec<(String, String, String)> = Vec::new();
+
         let mut w: BTreeMap<String, Weight> = BTreeMap::new();
         let mut v: BTreeMap<String, Tensor> = BTreeMap::new();
         let mut b3: BTreeMap<String, Tensor> = BTreeMap::new();
@@ -682,14 +693,23 @@ impl DeviceModel {
 
             match glm.layer_kinds[il] {
                 LayerKind::Kda => {
+                    // attn_q + attn_k are both Q4_K; attn_v is Q6_K, so it stays
+                    // on its own. ssm_f_a + ssm_g_a are both Q8_0 over the layer
+                    // input.
+                    fuse.push((
+                        format!("blk.{il}.attn_qk"),
+                        format!("blk.{il}.attn_q.weight"),
+                        format!("blk.{il}.attn_k.weight"),
+                    ));
+                    fuse.push((
+                        format!("blk.{il}.ssm_fga"),
+                        format!("blk.{il}.ssm_f_a.weight"),
+                        format!("blk.{il}.ssm_g_a.weight"),
+                    ));
                     for s in [
-                        "attn_q.weight",
-                        "attn_k.weight",
                         "attn_v.weight",
                         "attn_output.weight",
-                        "ssm_f_a.weight",
                         "ssm_f_b.weight",
-                        "ssm_g_a.weight",
                         "ssm_g_b.weight",
                         "ssm_beta.weight",
                     ] {
@@ -743,12 +763,14 @@ impl DeviceModel {
                     mat(format!("blk.{il}.{s}"))?;
                 }
             } else {
-                for s in [
-                    "ffn_gate_inp.weight",
-                    "ffn_gate_shexp.weight",
-                    "ffn_up_shexp.weight",
-                    "ffn_down_shexp.weight",
-                ] {
+                // The shared expert's gate and up are both Q4_K over the layer
+                // input, so they stack into one matvec.
+                fuse.push((
+                    format!("blk.{il}.ffn_shexp_gate_up"),
+                    format!("blk.{il}.ffn_gate_shexp.weight"),
+                    format!("blk.{il}.ffn_up_shexp.weight"),
+                ));
+                for s in ["ffn_gate_inp.weight", "ffn_down_shexp.weight"] {
                     mat(format!("blk.{il}.{s}"))?;
                 }
                 vec_(format!("blk.{il}.exp_probs_b.bias"))?;
@@ -765,6 +787,17 @@ impl DeviceModel {
             cfg.embedding_dim,
             cache_budget_bytes,
         )?;
+
+        // Now the closures are out of scope, so `w` is free: stack each collected
+        // pair while both halves are still host-resident, then send the result to
+        // the card. `stack_axis0` byte-concatenates same-dtype quantised rows, so
+        // the fused matrix holds exactly the bytes the two did.
+        for (dst, a, b) in fuse {
+            let wa = idx.take_weight(&a, &[])?;
+            let wb = idx.take_weight(&b, &[])?;
+            let fused = Weight::stack_axis0(vec![wa, wb]);
+            w.insert(dst, fused.try_to_device(&*backend, MARGIN));
+        }
 
         let shape = super::bridge::shape_from(&cfg, &glm, max_len);
         Ok(Self { shape, w, v, b3, experts })
@@ -873,15 +906,13 @@ impl DeviceModel {
             let m = |s: &str| self.mat_of(&format!("blk.{il}.{s}"));
             let attn = match sh.layer_kinds[il] {
                 LayerKind::Kda => AttnW::Kda(KdaW {
-                    q: m("attn_q.weight"),
-                    k: m("attn_k.weight"),
+                    qk: Pair::Fused(m("attn_qk")),
                     v: m("attn_v.weight"),
                     conv_q: b("ssm_conv1d_q.weight"),
                     conv_k: b("ssm_conv1d_k.weight"),
                     conv_v: b("ssm_conv1d_v.weight"),
-                    f_a: m("ssm_f_a.weight"),
+                    fga: Pair::Fused(m("ssm_fga")),
                     f_b: m("ssm_f_b.weight"),
-                    g_a: m("ssm_g_a.weight"),
                     g_b: m("ssm_g_b.weight"),
                     beta: m("ssm_beta.weight"),
                     a: b("ssm_a"),
@@ -921,8 +952,7 @@ impl DeviceModel {
                     probs_b: b("exp_probs_b.bias"),
                     experts: &self.experts,
                     ord: il - sh.n_dense_lead,
-                    sh_gate: m("ffn_gate_shexp.weight"),
-                    sh_up: m("ffn_up_shexp.weight"),
+                    sh_gate_up: Pair::Fused(m("ffn_shexp_gate_up")),
                     sh_down: m("ffn_down_shexp.weight"),
                 })
             };
