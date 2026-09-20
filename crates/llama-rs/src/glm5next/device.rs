@@ -314,6 +314,34 @@ impl StreamExperts {
         // so about 69 and 71 slots a layer, which is the point: what a layer needs
         // is slots for *its own* 288 experts, so the thing to equalise is slots per
         // layer, not layers per card.
+        // An explicit split, for sweeping the boundary: GLM5_MOE_SPLIT=19,23.
+        //
+        // Slots per layer is not the whole story. Card 0 carries the earlier
+        // layers, which route more diversely (23.7% miss against 13.3% on equal
+        // slots), and it is on four PCIe lanes rather than eight, so a record
+        // costs it 1.12 ms against 0.81. Both push the boundary away from it.
+        if let Some(spec) = std::env::var("GLM5_MOE_SPLIT").ok() {
+            let want: Vec<usize> = spec
+                .split(',')
+                .filter_map(|v| v.trim().parse().ok())
+                .collect();
+            if want.len() == n && want.iter().sum::<usize>() == n_moe {
+                let mut card_of = Vec::with_capacity(n_moe);
+                for (c, &count) in want.iter().enumerate() {
+                    card_of.extend(std::iter::repeat_n(c, count));
+                }
+                self.shared
+                    .enable_device_shards(&cards, &budgets, card_of.clone())
+                    .map_err(|e| LlamaError::Config(format!("device: VRAM tier: {e}")))?;
+                eprintln!("  MoE layers {want:?} (GLM5_MOE_SPLIT)");
+                self.backends = cards.into_iter().map(|c| c as Arc<dyn Backend>).collect();
+                self.card_of = card_of;
+                self.vram_budgets = budgets;
+                return Ok(());
+            }
+            eprintln!("  GLM5_MOE_SPLIT={spec} does not sum to {n_moe} over {n} cards; ignoring");
+        }
+
         let total: usize = budgets.iter().sum();
         let mut counts = vec![0usize; n];
         if total == 0 {

@@ -68,7 +68,26 @@ pub const MIN_CACHE_RECORDS: usize = 8;
 
 /// Most threads [`GgufExpertStore::fetch_many`] reads a batch with. An NVMe
 /// drive saturates at a modest queue depth; more threads only add spawns.
-const FETCH_WORKERS: usize = 8;
+// VENDORED-LOCAL: GLM-5.3-Flash. How deep the cold read batch goes.
+//
+// Measured on the machine this was written for, a Samsung T9 over USB holding a
+// 193 GB split GGUF, reading fresh 6 MB ranges:
+//
+//   queue depth 1    1.09 GB/s
+//   queue depth 8    1.98 GB/s   (the drive's rated speed)
+//
+// and the loader was getting about 1.0 GB/s, because a layer's batch is at most
+// `n_expert_used` records and each record was read as three ranged reads one
+// after another inside one worker -- so a worker had one request outstanding and
+// idled between parts. Splitting per part triples the work items, and this raises
+// the ceiling on how many run at once. Override with NROB_FETCH_WORKERS.
+fn fetch_workers() -> usize {
+    std::env::var("NROB_FETCH_WORKERS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(24)
+}
 
 /// Zero-copy view over a byte range of a cache-leased record, handed to
 /// [`QuantizedTensor::from_mmap`] so a cached expert's packed bytes are read
@@ -372,26 +391,65 @@ impl GgufExpertStore {
                 )));
             }
         }
-        // One positioned read per part, from a small scoped pool so a
-        // layer's cold batch reaches real SSD queue depth; a single record
-        // is read inline. Chunks are joined in order, so the error returned
-        // is the lowest-index failure.
-        let workers = keys.len().min(nrob::backend::hardware_concurrency()).min(FETCH_WORKERS);
-        if workers < 2 {
-            for (&(layer, expert), buf) in keys.iter().zip(bufs.iter_mut()) {
-                self.fetch(layer, expert, buf)?;
-            }
-            return Ok(());
+        if keys.len() == 1 {
+            let (layer, expert) = keys[0];
+            return self.fetch(layer, expert, &mut bufs[0]);
         }
-        let chunk = keys.len().div_ceil(workers);
+
+        // VENDORED-LOCAL: GLM-5.3-Flash. One job per PART, not per record.
+        //
+        // A record is gate, up and down: three ranged reads, previously issued one
+        // after another inside a single worker, so a worker had one request in
+        // flight and the drive saw at most `keys.len()` of them. Flattening to
+        // parts triples the outstanding requests for the same batch, which is what
+        // takes a layer's cold read from the drive's queue-depth-1 rate to its
+        // rated one.
+        let g = self.layout.gate.max_per_expert_bytes;
+        let u = self.layout.up.max_per_expert_bytes;
+        let mut jobs: Vec<(usize, u64, &mut [u8])> = Vec::with_capacity(keys.len() * 3);
+        for (&(layer, expert), buf) in keys.iter().zip(bufs.iter_mut()) {
+            let (l, e) = (layer as usize, expert as usize);
+            let (head, tail) = buf.split_at_mut(g);
+            let (mid, rest) = tail.split_at_mut(u);
+            for (part, slice) in [
+                (&self.layout.gate, head),
+                (&self.layout.up, mid),
+                (&self.layout.down, rest),
+            ] {
+                let (off, len) = part.range(l, e);
+                jobs.push((part.shard(l) as usize, off, &mut slice[..len]));
+            }
+        }
+
+        let workers = jobs
+            .len()
+            .min(nrob::backend::hardware_concurrency())
+            .min(fetch_workers());
+        // Round-robin, so a record's three parts land on three different workers
+        // and are in flight together rather than one after another.
+        let mut buckets: Vec<Vec<(usize, u64, &mut [u8])>> =
+            (0..workers.max(1)).map(|_| Vec::new()).collect();
+        for (i, job) in jobs.into_iter().enumerate() {
+            buckets[i % workers.max(1)].push(job);
+        }
+
+        let io_err = |msg: String| Error::Io(std::io::Error::new(std::io::ErrorKind::Other, msg));
         std::thread::scope(|s| {
-            let handles: Vec<_> = keys
-                .chunks(chunk)
-                .zip(bufs.chunks_mut(chunk))
-                .map(|(ks, bs)| {
+            let handles: Vec<_> = buckets
+                .into_iter()
+                .map(|bucket| {
                     s.spawn(move || -> nrob::Result<()> {
-                        for (&(layer, expert), buf) in ks.iter().zip(bs.iter_mut()) {
-                            self.fetch(layer, expert, buf)?;
+                        for (shard, off, dst) in bucket {
+                            let src = self.file.shard_source_at(shard).ok_or_else(|| {
+                                Error::Io(std::io::Error::other(
+                                    "expert store lost its TensorBytes source",
+                                ))
+                            })?;
+                            src.read_range(off, dst).map_err(|err| {
+                                Error::Io(std::io::Error::other(format!(
+                                    "expert part in shard {shard} at {off}: ranged read failed: {err}"
+                                )))
+                            })?;
                         }
                         Ok(())
                     })
@@ -400,7 +458,7 @@ impl GgufExpertStore {
             let mut first = Ok(());
             for h in handles {
                 let r = h.join().unwrap_or_else(|_| {
-                    Err(Error::Arg("fetch_many: a read worker panicked".into()))
+                    Err(io_err("fetch_many: a read worker panicked".into()))
                 });
                 if first.is_ok() {
                     first = r;

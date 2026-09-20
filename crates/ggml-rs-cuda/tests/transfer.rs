@@ -8,6 +8,7 @@
 
 use std::time::{Duration, Instant};
 
+use ggml_quants::GgmlType;
 use ggml_rs::{Backend, Tensor};
 use ggml_rs_cuda::{CudaBackend, UploadTicket};
 
@@ -401,4 +402,61 @@ fn bench_h2d_pageable_vs_pinned_3mib() {
     // not that the code regressed.
     assert!(pinned_bw > 0.5, "pinned H2D implausibly slow: {pinned_bw}");
     assert!(pageable_bw > 0.3, "pageable H2D implausibly slow: {pageable_bw}");
+}
+
+// VENDORED-LOCAL: GLM-5.3-Flash. What the host-to-device link actually does.
+//
+// glm5next's warm token spends ~86 ms moving routed experts the VRAM tier missed,
+// which works out at about 11.3 GB/s. Two RTX 5090s on Gen5 x4 and x8 should be
+// good for roughly 16 and 32 GB/s, so either the transfers are not overlapping or
+// the links are not running at Gen5. This separates the two: a plain
+// `memcpy_stod` from an ordinary Vec, and the pinned staging ring the expert
+// cache actually uses, at the 16.32 MB a record costs.
+#[test]
+#[ignore = "measures the PCIe link"]
+fn measure_h2d_bandwidth() {
+    const REC: usize = 16_320_000;
+    for dev in 0..2usize {
+        let Ok(b) = CudaBackend::new(dev) else {
+            eprintln!("card {dev} unavailable; skipping");
+            continue;
+        };
+        let bytes = vec![7u8; REC];
+        let n = 24usize;
+
+        // unpinned: what a to_device on a plain Vec costs
+        let t = std::time::Instant::now();
+        for _ in 0..n {
+            let q = b.upload_quantized(&bytes, vec![4096, 2048], GgmlType::Q4_K);
+            std::hint::black_box(&q);
+        }
+        b.synchronize();
+        let plain = t.elapsed().as_secs_f64() / n as f64;
+
+        // pinned + transfer stream: the path the VRAM expert cache takes
+        let pool = b.pinned_pool(3, REC).expect("pinned pool");
+        let t = std::time::Instant::now();
+        let mut tickets = Vec::new();
+        for _ in 0..n {
+            let mut slot = pool.checkout(REC).expect("checkout");
+            slot.fill(&bytes);
+            let dev_slot = b.device_slot(REC);
+            let (q, ticket) =
+                b.upload_quantized_async(&slot, dev_slot, GgmlType::Q4_K, vec![4096, 2048]);
+            std::hint::black_box(&q);
+            tickets.push(ticket);
+        }
+        b.synchronize();
+        let pinned = t.elapsed().as_secs_f64() / n as f64;
+
+        println!(
+            "card {dev}: unpinned {:5.1} GB/s ({:5.2} ms a record), pinned {:5.1} GB/s ({:5.2} ms)",
+            REC as f64 / plain / 1e9,
+            plain * 1e3,
+            REC as f64 / pinned / 1e9,
+            pinned * 1e3
+        );
+    }
+    println!();
+    println!("a warm glm5next token uploads about 60 records, 0.99 GB");
 }
