@@ -488,14 +488,38 @@ Measured (both GPUs, 140 GB RAM tier):
     slots (drive reads went 4,402 to 4,850, +8.4 GB) - worth it here, and worth less
     on a drive that reads at 0.5 GB/s rather than the T9's 1.95. Sizing the carry into
     the expert cache at load, instead of asking headroom to cover it, is the follow-up.
-  - **Next levers, in order:** (1) keep the residual on the device across consecutive
-    layers that share one, round-tripping only at the device boundary - one transfer a
-    pass instead of sixty, for ~2.8 GB of VRAM at 16,800 tokens, so make it fall back
-    to the host path when the card has no room; (2) give expert uploads their own copy
-    stream and a second staging slot - `get_prefill` has one slot and `Gpu::write`
-    issues on the compute stream, so DMA and maths never overlap (`expert_cache.rs:162`,
-    `gpu.rs:246`); (3) the contiguous layer split means only one card computes at a
-    time, which caps occupancy near 50% before anything else.
+  - **Lever (2) done: expert uploads on a copy stream.** `get_prefill` had one staging
+    slot, uploaded on the compute stream, so an upload could not start until the last
+    expert's kernels had finished. Two slots and a copy stream, ordered by events,
+    took the pass 121.7 s to **117.3 s** (138 to 143 tok/s), uploads 33.6 s to 26.8 s.
+    Logits identical over 14,628 expert uses; the gates unchanged.
+  - **What the cards are doing now: the same 22%.** After both levers GPU 0 averages
+    23.5% and GPU 1 20.0% across the pass, idle in 62-68% of samples. That is
+    arithmetic, not a fault: kernel work is ~55 GPU-seconds and 55 / (2 x 117) is 23%.
+    The levers removed stalls rather than adding parallelism, so the pass shrank
+    around the same maths.
+  - **Three that did not pay, measured.** Same 16,800-token pass, logits identical
+    every time:
+    - Staging ring 4 x 4 MB to 6 x 8 MB, so an 18.8 MB record stops wrapping it
+      mid-copy: 119.1 s against 117.3 s. Reverted - once the copy has a stream of its
+      own, the host is not waiting on that ring.
+    - Attention sub-chunks of 2,048: 119.6 s ("the rest" 75.3 s). Of 4,096: 124.5 s
+      (78.0 s). "The rest" grows with the sub-chunk, so it is attention widening and
+      not host overhead; 1,024 is already the right size.
+  - **`DW::forward` has no GEMM for bf16 weights** (`model.rs:409`). FP8 weights go to
+    `gemm_fp8` on tensor cores whenever a call carries more than one token; bf16
+    always takes `gemv_bf16`, one warp per output row looping over all `nt` tokens
+    inside the kernel. Over a 16,800-token pass that is an untiled gemv replayed
+    16,800 times - the nsys window put it at 10.9 ms a call (one at 134 ms) and ~8
+    GPU-seconds a pass. A `gemm_bf16` closes it, at the cost of an accumulation order
+    that has to stay inside the oracle bounds.
+  - **Next levers, in order:** (1) a `gemm_bf16` for multi-token calls, worth ~8
+    GPU-seconds a pass; (2) `sparse_attn`, 39% of kernel time at 26.6 ms a call and the
+    largest single cost left; (3) the contiguous layer split, which lets one card
+    compute at a time and caps average occupancy at 50%. Note (3) fights the
+    layer-major order that reads each expert once a pass: pipelining two token stages
+    across the two layer groups would read the experts twice (+36 s) to recover about
+    as much compute, so it needs more than the obvious version to pay.
 - **PCIe width is not the prefill limiter (2026-09-20).** Both cards had trained
   narrow — GPU 0 at x2, GPU 1 at x4 — from GPU sag; laying the case on its side took
   them to x4 and x8. The same 16,800-token layered pass from the T9 ran **151.8 s
