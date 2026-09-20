@@ -449,6 +449,31 @@ Measured (both GPUs, 140 GB RAM tier):
   - It recovers completely: after ~8 minutes idle the same drive reads **1.94 GB/s at
     queue depth 1 and 2.89 GB/s at depth 8** again (2026-09-20). Back-to-back runs
     measure a throttled drive, not the model.
+- **Where a layered pass actually goes (nsys, 2026-09-20).** A 40 s window inside a
+  16,800-token pass on both cards, which offers 80 GPU-seconds:
+  - **Kernels: 14.6 GPU-s, ~18% occupancy.** `sparse_attn` 5.7 s (39%, 215 calls at
+    26.6 ms), `gemm_fp4` 3.4 s (13,068 calls), `gemv_bf16` 2.1 s (192 calls, one of
+    them 134 ms), `index_scores` 1.7 s (45 calls at 37 ms), `gemm_fp8` 1.1 s.
+  - **Copies: 8.6 GPU-s, and more of it leaves the card than arrives** — 691
+    device-to-host copies at 6.5 ms average (4.5 s) against 4.1 s host-to-device.
+  - **The cards are idle ~60% of the pass** (`nvidia-smi` over the whole pass: GPU 0
+    25.9%, GPU 1 18.9%, memory controller 0.5%). Expert *compute* is ~16 s of a 150 s
+    pass; the experts are not the problem.
+  - **The residual stream's host round-trip is.** `layered_inner` keeps `h`, `h1` and
+    the mixes in host `Vec`s and, for every layer and every attention sub-chunk,
+    uploads them and downloads the result (`model.rs:1068`, `:1091`, `:1152`). At
+    `HC * DIM * 4` = 80 KB a token that is ~170 GB each way per pass (~21 s of DMA at
+    the staged rates), but the real cost is that `download` is `clone_dtoh`, which
+    blocks until the whole kernel queue drains: 17 sub-chunks x 2 loops x 60 layers is
+    ~2,000 pipeline stalls a pass.
+  - **Next levers, in order:** (1) keep the residual on the device across consecutive
+    layers that share one, round-tripping only at the device boundary - one transfer a
+    pass instead of sixty, for ~2.8 GB of VRAM at 16,800 tokens, so make it fall back
+    to the host path when the card has no room; (2) give expert uploads their own copy
+    stream and a second staging slot - `get_prefill` has one slot and `Gpu::write`
+    issues on the compute stream, so DMA and maths never overlap (`expert_cache.rs:162`,
+    `gpu.rs:246`); (3) the contiguous layer split means only one card computes at a
+    time, which caps occupancy near 50% before anything else.
 - **PCIe width is not the prefill limiter (2026-09-20).** Both cards had trained
   narrow — GPU 0 at x2, GPU 1 at x4 — from GPU sag; laying the case on its side took
   them to x4 and x8. The same 16,800-token layered pass from the T9 ran **151.8 s
