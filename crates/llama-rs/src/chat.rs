@@ -164,13 +164,61 @@ fn gemma4_template(messages: &[ChatMessage], add_assistant: bool) -> String {
 /// a caller-selectable reasoning effort (this always requests the default,
 /// `Max`). A prior assistant turn is given an empty `<think></think>` pair, which
 /// is what the template does when that turn carries no `reasoning_content`.
+// VENDORED-LOCAL: GLM-5.3-Flash.
+/// How much the model is asked to think before answering.
+///
+/// The reference Jinja reads `reasoning_effort`, accepts `'low'` and `'high'`, and
+/// falls back to `'max'` for anything else including the unset case -- so `Max` is
+/// the default the shipped template gives, and it is the most verbose one. A short
+/// factual question answered at Max spends hundreds of tokens deliberating before it
+/// closes `</think>`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ReasoningEffort {
+    Low,
+    High,
+    #[default]
+    Max,
+}
+
+impl ReasoningEffort {
+    /// The word the template capitalises into the system line.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "Low",
+            Self::High => "High",
+            Self::Max => "Max",
+        }
+    }
+
+    /// Parse `low` / `high` / `max`, case-insensitively. Anything else is `Max`,
+    /// which is what the Jinja does with an unrecognised value.
+    pub fn parse(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "low" => Self::Low,
+            "high" => Self::High,
+            _ => Self::Max,
+        }
+    }
+}
+
 fn glm5next_template(messages: &[ChatMessage], add_assistant: bool) -> String {
+    glm5next_template_with(messages, add_assistant, ReasoningEffort::default())
+}
+
+/// [`glm5next_template`] at a chosen reasoning effort.
+pub fn glm5next_template_with(
+    messages: &[ChatMessage],
+    add_assistant: bool,
+    effort: ReasoningEffort,
+) -> String {
     let mut out = String::with_capacity(
         messages.iter().map(|m| m.content.len()).sum::<usize>() + 128,
     );
     out.push_str("[gMASK]<sop>");
-    // The template emits this whenever an effort is set, and the default is max.
-    out.push_str("<|system|>Reasoning Effort: Max");
+    // The template emits this whenever an effort is set, and an unset or unknown
+    // value means max.
+    out.push_str("<|system|>Reasoning Effort: ");
+    out.push_str(effort.as_str());
     for m in messages {
         match m.role {
             Role::System => out.push_str("<|system|>"),

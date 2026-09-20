@@ -1841,6 +1841,156 @@ mod tests {
         assert!(trunk > 0.0);
     }
 
+    /// The sampling the model itself recommends, read out of the file.
+    ///
+    /// GLM-5.3-Flash ships `general.sampling.temp = 1.0` and
+    /// `general.sampling.top_p = 0.95`. This pins that we use those rather than a
+    /// number someone picked -- including me, who lowered the temperature to 0.6 on a
+    /// hunch and then found the file had said 1.0 all along.
+    #[test]
+    #[ignore = "needs the released model on disk"]
+    fn sampling_comes_from_the_model() {
+        let g = GgufFile::open_streaming(RELEASED).expect("open");
+        let p = crate::sampler::SampleParams::from_gguf(&g);
+        println!();
+        println!("general.sampling.temp  -> temperature {}", p.temperature);
+        println!("general.sampling.top_p -> top_p       {:?}", p.top_p);
+        println!("top_k {:?}, min_p {:?}, repeat {:?}", p.top_k, p.min_p, p.repeat_penalty);
+        assert!(
+            (p.temperature - 1.0).abs() < 1e-6,
+            "expected the file temp of 1.0, got {}",
+            p.temperature
+        );
+        assert!(
+            p.top_p.is_some_and(|v| (v - 0.95).abs() < 1e-3),
+            "expected the file top_p of 0.95, got {:?}",
+            p.top_p
+        );
+        // Nothing records a repetition penalty, so it must stay off.
+        assert!(p.repeat_penalty.is_none(), "a penalty appeared from nowhere");
+    }
+
+    /// Perplexity and top-1 accuracy on ordinary English.
+    ///
+    /// The one quantitative check on *quality* that does not need llama.cpp. A
+    /// correct 313B-parameter model, even at Q4_K_M, predicts ordinary prose well:
+    /// perplexity in the single digits and top-1 accuracy around half. A subtly wrong
+    /// axis somewhere produces exactly what this branch's generations look like --
+    /// locally fluent, globally adrift -- and it shows up here as a perplexity in the
+    /// tens or worse, because the model is guessing more than it should.
+    ///
+    /// So this separates the two explanations that every other test in this file
+    /// leaves open: a real bug in the implementation, or a finetune that is simply
+    /// like this. It does not identify *which* axis; it says whether to go looking.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "needs the released model on disk"]
+    fn measure_perplexity_on_english() {
+        let Some(backend) = cuda_backend() else { return };
+        let g = GgufFile::open_streaming(RELEASED).expect("open");
+        let tok = tokenizer::Tokenizer::from_gguf(&g).expect("tokenizer");
+        drop(g);
+        let m = DeviceModel::open_with_cache(RELEASED, 512, backend.clone(), 32 << 30)
+            .expect("load");
+        let sh = m.shape().clone();
+        let w = m.view();
+        let mut st = forward::State::new_on(&sh, m.backend()).expect("state");
+
+        // Plain, unremarkable prose. Nothing here should surprise a large model.
+        let text = "The Industrial Revolution began in Britain in the late eighteenth \
+century and spread across Europe and North America over the following hundred years. \
+Before it, most people lived in the countryside and worked on the land. Cloth was spun \
+and woven at home, by hand, and a single family might take a week to produce what a \
+machine would later make in an hour. The first factories were built beside rivers, \
+because water wheels drove the machinery. Later, steam engines burned coal, and so \
+factories could be built anywhere, and towns grew quickly around them. Working \
+conditions were often dangerous, hours were long, and children were employed from an \
+early age. Over time, laws were passed to limit the working day and to require that \
+children attend school instead.";
+        let ids = tok.encode(text, false).expect("encode");
+        println!();
+        println!("{} tokens of ordinary English", ids.len());
+        assert!(ids.len() > 60, "need a decent run of text");
+
+        // Teacher-forced: feed the real tokens, score the real next token each step.
+        const BUCKETS: usize = 6;
+        let mut bucket_nll = [0.0f64; BUCKETS];
+        let mut bucket_n = [0usize; BUCKETS];
+        let mut sum_logp = 0.0f64;
+        let mut top1 = 0usize;
+        let mut top5 = 0usize;
+        let mut scored = 0usize;
+        let mut logits = forward::forward_token(&sh, &w, &mut st, ids[0]).expect("first");
+        for i in 1..ids.len() {
+            let target = ids[i] as usize;
+            // log softmax at the target, in a numerically safe order
+            let max = logits.iter().fold(f32::NEG_INFINITY, |a, &v| a.max(v));
+            let mut denom = 0.0f64;
+            for &v in &logits {
+                denom += ((v - max) as f64).exp();
+            }
+            let logp = (logits[target] - max) as f64 - denom.ln();
+            sum_logp += logp;
+
+            // rank of the target
+            let better = logits.iter().filter(|&&v| v > logits[target]).count();
+            if better == 0 {
+                top1 += 1;
+            }
+            if better < 5 {
+                top5 += 1;
+            }
+            scored += 1;
+
+            bucket_nll[i * BUCKETS / ids.len()] -= logp;
+            bucket_n[i * BUCKETS / ids.len()] += 1;
+
+            logits = forward::forward_token(&sh, &w, &mut st, ids[i]).expect("forward");
+        }
+
+        // Does prediction get worse the further in we are? A bug that compounds shows
+        // up as a rising curve; a model that is simply this good is flat. Position 0
+        // is excluded from the comparison because the first few tokens of any text are
+        // genuinely hard -- there is nothing to condition on yet.
+        println!();
+        println!("  by position:");
+        for b in 0..BUCKETS {
+            if bucket_n[b] == 0 {
+                continue;
+            }
+            let n = bucket_n[b] as f64;
+            let ppl_b = (bucket_nll[b] / n).exp();
+            println!(
+                "    tokens {:3}-{:3}   perplexity {:7.2}",
+                b * ids.len() / BUCKETS,
+                (b + 1) * ids.len() / BUCKETS - 1,
+                ppl_b
+            );
+        }
+        let first = (bucket_nll[1] / bucket_n[1].max(1) as f64).exp();
+        let last = (bucket_nll[BUCKETS - 1] / bucket_n[BUCKETS - 1].max(1) as f64).exp();
+        println!("  second bucket {first:.2} -> last bucket {last:.2}");
+
+        let mean_nll = -sum_logp / scored as f64;
+        let ppl = mean_nll.exp();
+        println!();
+        println!("scored {scored} positions");
+        println!("  mean NLL      {mean_nll:.4} nats");
+        println!("  perplexity    {ppl:.2}");
+        println!("  top-1         {:.1}%", 100.0 * top1 as f64 / scored as f64);
+        println!("  top-5         {:.1}%", 100.0 * top5 as f64 / scored as f64);
+        println!();
+        println!("a healthy model of this size on prose like this: perplexity under ~12,");
+        println!("top-1 around 45-65%. Much worse means the forward pass is wrong, not the");
+        println!("finetune.");
+        assert!(ppl.is_finite(), "perplexity is not finite");
+        assert!(
+            ppl < 50.0,
+            "perplexity {ppl:.1} on ordinary English: the forward pass is predicting \
+             far worse than a model this size should, so something in it is wrong"
+        );
+    }
+
     /// Does the model still see the start of a long prompt?
     ///
     /// Output that is coherent for ~24 tokens and then collapses into repetition,
@@ -2144,9 +2294,10 @@ mod tests {
         let n_gpus: usize = std::env::var("GLM5_GPUS").ok().and_then(|v| v.parse().ok()).unwrap_or(2);
         let max_new: usize = std::env::var("GLM5_MAX_NEW").ok().and_then(|v| v.parse().ok()).unwrap_or(96);
 
-        let g = GgufFile::open_streaming(RELEASED).expect("open");
-        let tok = tokenizer::Tokenizer::from_gguf(&g).expect("tokenizer");
-        drop(g);
+        // Kept open: `SampleParams::from_gguf` reads the model's own recommended
+        // sampling out of it.
+        let gg = GgufFile::open_streaming(RELEASED).expect("open");
+        let tok = tokenizer::Tokenizer::from_gguf(&gg).expect("tokenizer");
 
         let t0 = std::time::Instant::now();
         let m = match DeviceModel::open_tiered(RELEASED, 2048, n_gpus, 0, 0) {
@@ -2217,13 +2368,25 @@ mod tests {
 
         let sh = m.shape().clone();
         let w = m.view();
-        let msgs = [ChatMessage {
-            role: Role::User,
-            content: "Explain, in one short paragraph, why mixture-of-experts models \
-                      are cheaper to run than dense models of the same size."
-                .to_string(),
-        }];
-        let prompt = apply_chat_template(&Architecture::Glm5Next, &msgs, true);
+        let content = std::env::var("GLM5_PROMPT_TEXT").unwrap_or_else(|_| {
+            "Explain, in one short paragraph, why mixture-of-experts models are \
+             cheaper to run than dense models of the same size."
+                .to_string()
+        });
+        let msgs = [ChatMessage { role: Role::User, content }];
+        // GLM5_EFFORT=low|high|max. The shipped template defaults to Max, its most
+        // verbose mode: a one-line question at Max spends hundreds of tokens
+        // deliberating before it closes `</think>`.
+        let effort = crate::chat::ReasoningEffort::parse(
+            &std::env::var("GLM5_EFFORT").unwrap_or_else(|_| "max".into()),
+        );
+        let prompt = crate::chat::glm5next_template_with(&msgs, true, effort);
+        let _ = apply_chat_template(&Architecture::Glm5Next, &msgs, true);
+        let base = crate::sampler::SampleParams::from_gguf(&gg);
+        println!(
+            "sampling from the file: temp {:.2}, top_p {:?}, top_k {:?}, repeat {:?}   effort {effort:?}",
+            base.temperature, base.top_p, base.top_k, base.repeat_penalty
+        );
         let ids = tok.encode(&prompt, false).expect("encode");
         let stops: Vec<u32> = chat_stop_tokens(&Architecture::Glm5Next)
             .iter()
@@ -2232,7 +2395,35 @@ mod tests {
 
         let run = |label: &str| -> (f64, f64, usize, String) {
             let mut st = forward::State::new_on(&sh, m.backend()).expect("state");
-            let mut sampler = crate::sampler::Sampler::new(crate::sampler::SampleParams::default());
+            // `SampleParams::default()` is temperature 1.0 with no repetition
+            // penalty, which inside this template's "Reasoning Effort: Max" block
+            // wanders and never closes `</think>`. GLM's own guidance is nearer 0.6,
+            // and a reasoning model needs a repetition penalty or it loops.
+            let mut sp = crate::sampler::SampleParams {
+                temperature: std::env::var("GLM5_TEMP")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0.6),
+                top_p: Some(
+                    std::env::var("GLM5_TOP_P")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(0.95),
+                ),
+                repeat_penalty: Some(
+                    std::env::var("GLM5_REPEAT_PENALTY")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(1.1),
+                ),
+                ..Default::default()
+            };
+            if let Ok(seed) = std::env::var("GLM5_SEED") {
+                if let Ok(v) = seed.parse() {
+                    sp.seed = v;
+                }
+            }
+            let mut sampler = crate::sampler::Sampler::new(sp);
             let before = m.experts().shared().cache_stats();
 
             let t = std::time::Instant::now();

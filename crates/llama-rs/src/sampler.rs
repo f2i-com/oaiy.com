@@ -51,6 +51,52 @@ pub struct SampleParams {
     pub seed:        u64,
 }
 
+impl SampleParams {
+    // VENDORED-LOCAL: GLM-5.3-Flash. The model's own recommended sampling.
+    /// Start from [`Self::default`] and override with whatever the GGUF recommends.
+    ///
+    /// Converters write `general.sampling.temp`, `general.sampling.top_p`,
+    /// `general.sampling.top_k` and `general.sampling.min_p` when the source
+    /// repository ships a `generation_config.json`, and those are the numbers the
+    /// people who trained the model chose. GLM-5.3-Flash carries
+    /// `temp = 1.0, top_p = 0.95`, so guessing lower "to stop it drifting" is
+    /// second-guessing the model rather than fixing anything.
+    ///
+    /// Keys the file does not carry keep this crate's defaults, which is why the
+    /// repetition penalty is untouched here: it is a decoder-side choice no
+    /// converter records.
+    pub fn from_gguf(g: &gguf::GgufFile) -> Self {
+        let mut p = Self::default();
+        let mut found = Vec::new();
+        if let Ok(v) = g.get_f32("general.sampling.temp") {
+            if v > 0.0 {
+                p.temperature = v;
+                found.push(format!("temp={v}"));
+            }
+        }
+        if let Ok(v) = g.get_f32("general.sampling.top_p") {
+            if v > 0.0 && v <= 1.0 {
+                p.top_p = Some(v);
+                found.push(format!("top_p={v}"));
+            }
+        }
+        if let Ok(v) = g.get_u64("general.sampling.top_k") {
+            if v > 0 {
+                p.top_k = Some(v as usize);
+                found.push(format!("top_k={v}"));
+            }
+        }
+        if let Ok(v) = g.get_f32("general.sampling.min_p") {
+            if v > 0.0 {
+                p.min_p = Some(v);
+                found.push(format!("min_p={v}"));
+            }
+        }
+        let _ = found;
+        p
+    }
+}
+
 impl Default for SampleParams {
     fn default() -> Self {
         Self {
