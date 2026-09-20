@@ -1026,6 +1026,30 @@ impl Glm5NextModel {
         (d.model.experts().vram_budgets().to_vec(), per)
     }
 
+    /// Where the expert work went: the RAM cache, each card's VRAM cache, the CPU
+    /// tier, and how much of it the grouped dispatch took.
+    ///
+    /// `None` for a resident model, which has no tiers. The counters are cumulative
+    /// and process-global; a caller reporting per-token figures resets them itself.
+    #[allow(clippy::type_complexity)]
+    pub fn tier_stats(
+        &self,
+    ) -> Option<(
+        nrob::ecache::CacheStats,
+        Vec<crate::expert_stream::device_cache::DeviceCacheStats>,
+        (u64, u64, f64),
+        (u64, u64, u64),
+    )> {
+        let d = self.decoder.as_ref()?;
+        let shared = d.model.experts().shared();
+        Some((
+            shared.cache_stats(),
+            shared.shard_stats(),
+            cpu_experts::stats(),
+            device::grouped_stats::get(),
+        ))
+    }
+
     /// Whether this model can run [`Self::forward`].
     ///
     /// True when opened with [`Self::from_gguf_streaming`]. The resident
