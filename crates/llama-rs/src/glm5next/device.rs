@@ -774,6 +774,12 @@ impl DeviceModel {
         &self.shape
     }
 
+    /// The backend the trunk lives on (card 0). `State::new_on` wants it, so the
+    /// KDA recurrent state is resident on the same card as the matrices feeding it.
+    pub fn backend(&self) -> Arc<dyn Backend> {
+        Arc::clone(&self.experts.backend)
+    }
+
     pub fn backend_name(&self) -> String {
         // The experts hold the backend handle.
         self.experts.backend.name().to_string()
@@ -1114,7 +1120,11 @@ mod tests {
         );
         let ds = dm.shape().clone();
         let dv = dm.view();
-        let mut d_state = forward::State::new(&ds).expect("state");
+        // `new_on`, not `new`: the recurrent state goes on the card so this gate
+        // compares the CUDA `kda_delta_step` kernel against the host `kda::step`
+        // oracle, which is the comparison worth making.
+        let mut d_state = forward::State::new_on(&ds, dm.backend()).expect("state");
+        assert!(d_state.kda_on_device(), "the KDA state should be resident");
         let t1 = std::time::Instant::now();
         let d = forward::forward_token(&ds, &dv, &mut d_state, 154822).expect("cuda forward");
         let cuda_secs = t1.elapsed().as_secs_f64();
@@ -1184,7 +1194,7 @@ mod tests {
 
         let sh = m.shape().clone();
         let w = m.view();
-        let mut st = forward::State::new(&sh).expect("state");
+        let mut st = forward::State::new_on(&sh, m.backend()).expect("state");
 
         let msgs = [ChatMessage {
             role: Role::User,
@@ -1538,7 +1548,7 @@ mod tests {
 
         let zeros = Zeros;
         let w = m.view_with_experts(&zeros);
-        let mut st = forward::State::new(&sh).expect("state");
+        let mut st = forward::State::new_on(&sh, backend.clone()).expect("state");
         let _ = forward::forward_token(&sh, &w, &mut st, 154822).expect("warmup");
 
         let n = 8usize;
@@ -1607,7 +1617,7 @@ mod tests {
             .expect("one-card load");
         let sh = one.shape().clone();
         let w1 = one.view();
-        let mut s1 = forward::State::new(&sh).expect("state");
+        let mut s1 = forward::State::new_on(&sh, backend.clone()).expect("state");
         let a = forward::forward_prompt(&sh, &w1, &mut s1, &prompt).expect("one card");
         drop(w1);
         drop(one);
@@ -1630,7 +1640,7 @@ mod tests {
             "both cards must own MoE layers, got {card_of:?}"
         );
         let w2 = two.view();
-        let mut s2 = forward::State::new(&sh).expect("state");
+        let mut s2 = forward::State::new_on(&sh, backend.clone()).expect("state");
         let b = forward::forward_prompt(&sh, &w2, &mut s2, &prompt).expect("two cards");
 
         assert_eq!(a.len(), b.len());
@@ -1720,7 +1730,7 @@ mod tests {
             .collect();
 
         let w = m.view();
-        let mut st = forward::State::new(&sh).expect("state");
+        let mut st = forward::State::new_on(&sh, m.backend()).expect("state");
         let t = std::time::Instant::now();
         let mut logits = forward::forward_prompt(&sh, &w, &mut st, &prompt).expect("prefill");
         let prefill = t.elapsed().as_secs_f64();
@@ -1781,7 +1791,7 @@ mod tests {
         // reports 2-6 tok/s for a fresh process and 29 for its third answer for
         // exactly this reason.
         let before = m.experts().shared().cache_stats();
-        let mut st2 = forward::State::new(&sh).expect("state");
+        let mut st2 = forward::State::new_on(&sh, m.backend()).expect("state");
         let t = std::time::Instant::now();
         let mut lg2 = forward::forward_prompt(&sh, &w, &mut st2, &prompt).expect("reprefill");
         let prefill2 = t.elapsed().as_secs_f64();
@@ -1807,7 +1817,7 @@ mod tests {
         println!("decode   cold {:.3} s/token ({:.2} tok/s)", dec, 1.0 / dec);
         println!("decode   warm {:.3} s/token ({:.2} tok/s)", dec2, 1.0 / dec2);
         println!("target is 20 tok/s = 0.050 s/token");
-        println!("the trunk is ~103 ms of that; warm experts are ~{:.0} ms", (dec2 - 0.1027).max(0.0) * 1e3);
+        println!("the trunk is ~87 ms of that; warm experts are ~{:.0} ms", (dec2 - 0.0869).max(0.0) * 1e3);
         assert!(dec > 0.0 && dec2 > 0.0);
     }
 
@@ -1897,7 +1907,7 @@ mod tests {
 
         let sh = m.shape().clone();
         let w = m.view();
-        let mut st = forward::State::new(&sh).expect("state");
+        let mut st = forward::State::new_on(&sh, m.backend()).expect("state");
         let mut logits = forward::forward_token(&sh, &w, &mut st, 154822).expect("first");
         let next = |lg: &Vec<f32>| -> u32 {
             let mut best = f32::NEG_INFINITY;
@@ -1919,7 +1929,7 @@ mod tests {
         }
         let cold = t.elapsed().as_secs_f64() / n as f64;
 
-        let mut st2 = forward::State::new(&sh).expect("state");
+        let mut st2 = forward::State::new_on(&sh, m.backend()).expect("state");
         let mut lg2 = forward::forward_token(&sh, &w, &mut st2, 154822).expect("first");
         let t = std::time::Instant::now();
         for _ in 0..n {
@@ -1952,7 +1962,8 @@ mod tests {
         println!("cold  {:.3} s/token   ({:.2} tok/s)", cold, 1.0 / cold);
         println!("warm  {:.3} s/token   ({:.2} tok/s)", warm, 1.0 / warm);
         println!("target is 20 tok/s = 0.050 s/token");
-        let trunk = 0.1027;
+        // `measure_trunk_floor`, with the routed experts stubbed to zeros.
+        let trunk = 0.0869;
         println!(
             "the trunk alone is {:.0} ms of that warm token; experts are {:.0} ms",
             trunk * 1e3,
@@ -2012,7 +2023,7 @@ mod tests {
 
         let sh = m.shape().clone();
         let w = m.view();
-        let mut st = forward::State::new(&sh).expect("state");
+        let mut st = forward::State::new_on(&sh, backend.clone()).expect("state");
 
         let mut logits = forward::forward_token(&sh, &w, &mut st, 154822).expect("first");
         let next = |lg: &Vec<f32>| -> u32 {
@@ -2039,7 +2050,7 @@ mod tests {
         // Warm: the same prefix again, so the routed experts are the ones already
         // resident. A fresh State replays the positions; the expert cache carries
         // over because it lives in the model, not the state.
-        let mut st2 = forward::State::new(&sh).expect("state");
+        let mut st2 = forward::State::new_on(&sh, backend.clone()).expect("state");
         let mut lg2 = forward::forward_token(&sh, &w, &mut st2, 154822).expect("first");
         let t = std::time::Instant::now();
         for _ in 0..n_cold {
@@ -2085,7 +2096,7 @@ mod tests {
         let sh = m.shape().clone();
         assert_eq!(sh.n_layer, 45);
         let w = m.view();
-        let mut st = forward::State::new(&sh).expect("state");
+        let mut st = forward::State::new_on(&sh, m.backend()).expect("state");
 
         let t1 = std::time::Instant::now();
         let logits = forward::forward_token(&sh, &w, &mut st, 154822).expect("forward");
@@ -2122,7 +2133,9 @@ mod tests {
         let dm = DeviceModel::open(RELEASED, 512, ggml_rs::default_backend()).expect("dev load");
         let ds = dm.shape().clone();
         let dv = dm.view();
-        let mut d_state = forward::State::new(&ds).expect("state");
+        // On the CPU backend this pits `Backend::kda_delta_step`'s host default
+        // against `kda::step`, which is the other half of the recurrence check.
+        let mut d_state = forward::State::new_on(&ds, dm.backend()).expect("state");
         let d = forward::forward_token(&ds, &dv, &mut d_state, 154822).expect("device forward");
 
         assert_eq!(h.len(), d.len());

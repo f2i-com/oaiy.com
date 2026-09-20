@@ -1394,6 +1394,54 @@ __global__ void batched_gemv_f32(const float* __restrict__ w,
     if (lane == 0) y[(size_t)b * (size_t)M + m] = acc;
 }
 
+// VENDORED-LOCAL: GLM-5.3-Flash. One KDA delta-rule step, one warp per state
+// row. state is [H, D, D], qkvg is [4, H*D] (q, k, v, g_log), beta is [H],
+// out is [H*D]. Rows are independent, so there is no scan here at all.
+__global__ void kda_delta_step_f32(float* __restrict__ state,
+                                   const float* __restrict__ qkvg,
+                                   const float* __restrict__ beta,
+                                   float* __restrict__ out,
+                                   int n_head, int hd, float scale) {
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int warps = blockDim.x >> 5;
+    const int row = blockIdx.x * warps + warp;
+    const int n = n_head * hd;
+    if (row >= n) return;
+    const int h = row / hd;
+
+    float* st = state + (size_t)row * (size_t)hd;
+    const float* q = qkvg;
+    const float* k = qkvg + (size_t)n;
+    const float* v = qkvg + (size_t)2 * n;
+    const float* g = qkvg + (size_t)3 * n;
+    const float* kh = k + (size_t)h * hd;
+    const float* qh = q + (size_t)h * hd;
+
+    const float decay = __expf(g[row]);
+    // pass 1: decay the row in place, then dot it with k
+    float acc = 0.0f;
+    for (int j = lane; j < hd; j += 32) {
+        float r = st[j] * decay;
+        st[j] = r;
+        acc += r * kh[j];
+    }
+    for (int o = 16; o > 0; o >>= 1) acc += __shfl_down_sync(0xffffffff, acc, o);
+    acc = __shfl_sync(0xffffffff, acc, 0);
+    // the delta rule: write only the part of v the state does not predict
+    const float d = (v[row] - acc) * beta[h];
+
+    // pass 2: rank-1 update, then dot with q
+    float o2 = 0.0f;
+    for (int j = lane; j < hd; j += 32) {
+        float r = st[j] + d * kh[j];
+        st[j] = r;
+        o2 += r * qh[j];
+    }
+    for (int o = 16; o > 0; o >>= 1) o2 += __shfl_down_sync(0xffffffff, o2, o);
+    if (lane == 0) out[row] = o2 * scale;
+}
+
 __global__ void silu_mul_split_f32(const float* __restrict__ fused,
                                     float* __restrict__ out,
                                     int seq, int ff) {
@@ -2752,6 +2800,8 @@ pub const KERNEL_NAMES: &[&str] = &[
     "swiglu_clamped_split_f32",
     // VENDORED-LOCAL: GLM-5.3-Flash.
     "batched_gemv_f32",
+    // VENDORED-LOCAL: GLM-5.3-Flash.
+    "kda_delta_step_f32",
     "gelu_approx_mul_split_f32",
     "tanh_inplace_f32",
     "gaussian_topk_inplace_f32",

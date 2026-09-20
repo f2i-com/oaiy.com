@@ -447,6 +447,86 @@ pub trait Backend: Send + Sync + Debug + 'static {
         self.to_device(Tensor::from_vec(out, vec![b, m]))
     }
 
+    // VENDORED-LOCAL: GLM-5.3-Flash. One step of the KDA delta rule.
+    /// Advance a Kimi Delta Attention state by one token, in place, and return
+    /// this token's output.
+    ///
+    /// `state` is `[n_head, head_dim, head_dim]`, `qkvg` is `[4, n_head*head_dim]`
+    /// holding q, k, v and `g_log` in that order, `beta` is `[n_head]`. The result
+    /// is `[n_head * head_dim]`.
+    ///
+    /// Per state row `(h, i)`, with the decay on the vo axis:
+    ///
+    /// ```text
+    ///   row  *= exp(g_log[h,i])
+    ///   d     = (v[h,i] - dot(row, k[h])) * beta[h]
+    ///   row  += d * k[h]
+    ///   out   = dot(row, q[h]) / sqrt(head_dim)
+    /// ```
+    ///
+    /// Every row is independent, which is what makes this a kernel rather than a
+    /// scan: 64 heads x 128 rows is 8 192 independent rows of 128 columns.
+    ///
+    /// The state is `&mut` and stays wherever it already is. That is the whole
+    /// point — it is 4.2 MB per layer and 34 layers deep, so a version that
+    /// shipped it to the host and back each token would cost more in transfers
+    /// than the scalar loop it replaces.
+    ///
+    /// The default runs on the host, summing in index order, and is the oracle.
+    /// CUDA reduces in a warp, so its sums are reassociated; because this is a
+    /// *recurrence*, that difference compounds across tokens, which
+    /// `kda_delta_step_matches_cpu` measures over a run of steps rather than one.
+    fn kda_delta_step(
+        &self,
+        state: &mut Tensor,
+        qkvg: &Tensor,
+        beta: &Tensor,
+        n_head: usize,
+        head_dim: usize,
+    ) -> Tensor {
+        let hd = head_dim;
+        let n = n_head * hd;
+        let qh = self.to_host(qkvg.clone());
+        let bh = self.to_host(beta.clone());
+        let (qd, bd) = (qh.data(), bh.data());
+        let (q, k, v, g) = (&qd[0..n], &qd[n..2 * n], &qd[2 * n..3 * n], &qd[3 * n..4 * n]);
+
+        let mut sh = self.to_host(state.clone());
+        let st = sh.data_mut();
+        let scale = 1.0 / (hd as f32).sqrt();
+        let mut out = vec![0.0f32; n];
+        let mut d = vec![0.0f32; hd];
+
+        for h in 0..n_head {
+            let base = h * hd * hd;
+            for i in 0..hd {
+                let decay = g[h * hd + i].exp();
+                let row = &mut st[base + i * hd..base + (i + 1) * hd];
+                let mut acc = 0.0f32;
+                for (rj, &kj) in row.iter_mut().zip(&k[h * hd..(h + 1) * hd]) {
+                    *rj *= decay;
+                    acc += *rj * kj;
+                }
+                d[i] = (v[h * hd + i] - acc) * bd[h];
+            }
+            for i in 0..hd {
+                let row = &mut st[base + i * hd..base + (i + 1) * hd];
+                let di = d[i];
+                let mut acc = 0.0f32;
+                for (rj, (&kj, &qj)) in row
+                    .iter_mut()
+                    .zip(k[h * hd..(h + 1) * hd].iter().zip(&q[h * hd..(h + 1) * hd]))
+                {
+                    *rj += di * kj;
+                    acc += *rj * qj;
+                }
+                out[h * hd + i] = acc * scale;
+            }
+        }
+        *state = self.to_device(sh);
+        self.to_device(Tensor::from_vec(out, vec![n]))
+    }
+
     fn silu_mul_split(&self, fused: &Tensor, ff: usize) -> Tensor {
         let seq = fused.dim(0);
         debug_assert_eq!(fused.dim(fused.rank() - 1), 2 * ff);

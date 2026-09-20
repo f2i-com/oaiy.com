@@ -1400,6 +1400,72 @@ fn delta_net_step_prefill_seq_matches_cpu() {
 /// `k_b` is `[64, 512, 256]` and `v_b` is `[64, 256, 512]`; the small cases check
 /// an `m` that is not a multiple of the 8 rows a block covers, and a `k` shorter
 /// than one warp.
+/// VENDORED-LOCAL: GLM-5.3-Flash. The KDA delta rule against the host default.
+///
+/// Run over a sequence of steps, not one, because this is a **recurrence**: the
+/// CUDA version reduces in a warp rather than in index order, so any difference
+/// feeds back into the state and compounds. Sixteen steps at the released shapes
+/// says whether it compounds to anything that matters.
+#[test]
+fn kda_delta_step_matches_cpu() {
+    let Some(cuda) = try_cuda() else { return };
+    let host = CpuBackend::new();
+
+    // released: 64 heads of 128; plus a head_dim below one warp and a ragged one
+    for &(nh, hd) in &[(64usize, 128usize), (2, 16), (3, 40)] {
+        let n = nh * hd;
+        let mut sh = host.to_device(Tensor::from_vec(
+            (0..n * hd)
+                .map(|i| (((i * 31) % 71) as f32 - 35.0) / 350.0)
+                .collect(),
+            vec![nh, hd, hd],
+        ));
+        let mut sc = cuda.to_device(host.to_host(sh.clone()));
+        let beta_h = host.to_device(Tensor::from_vec(
+            (0..nh).map(|i| 0.3 + 0.4 * (i % 3) as f32 / 3.0).collect(),
+            vec![nh],
+        ));
+        let beta_c = cuda.to_device(host.to_host(beta_h.clone()));
+
+        let mut worst = 0.0f32;
+        for step in 0..16 {
+            // q, k, v, g_log packed; g_log is negative, as the gate produces
+            let raw: Vec<f32> = (0..4 * n)
+                .map(|i| {
+                    let t = (((i + step * 7) * 53) % 101) as f32 / 101.0 - 0.5;
+                    if i >= 3 * n {
+                        -0.05 - 0.2 * (t + 0.5)
+                    } else {
+                        t
+                    }
+                })
+                .collect();
+            let qh = host.to_device(Tensor::from_vec(raw.clone(), vec![4, n]));
+            let qc = cuda.to_device(Tensor::from_vec(raw, vec![4, n]));
+
+            let a = host.to_host(host.kda_delta_step(&mut sh, &qh, &beta_h, nh, hd));
+            let b = cuda.to_host(cuda.kda_delta_step(&mut sc, &qc, &beta_c, nh, hd));
+            assert_eq!(a.data().len(), n);
+            let scale = a.data().iter().fold(0.0f32, |m, v| m.max(v.abs())).max(1e-3);
+            for (p, q) in a.data().iter().zip(b.data()) {
+                worst = worst.max((p - q).abs() / scale);
+            }
+        }
+        // The state itself, after sixteen steps of compounding.
+        let sa = host.to_host(sh);
+        let sb = cuda.to_host(sc);
+        let sscale = sa.data().iter().fold(0.0f32, |m, v| m.max(v.abs())).max(1e-3);
+        let mut sworst = 0.0f32;
+        for (p, q) in sa.data().iter().zip(sb.data()) {
+            sworst = sworst.max((p - q).abs() / sscale);
+        }
+        println!("[{nh}x{hd}] over 16 steps: out {worst:.2e}, state {sworst:.2e} relative");
+        assert!(worst < 2e-4, "[{nh}x{hd}] output drifted {worst}");
+        assert!(sworst < 2e-4, "[{nh}x{hd}] state drifted {sworst}");
+        assert!(sa.data().iter().any(|v| v.abs() > 1e-4), "[{nh}x{hd}] state is zero");
+    }
+}
+
 #[test]
 fn batched_gemv_matches_cpu() {
     let Some(cuda) = try_cuda() else { return };

@@ -1117,6 +1117,48 @@ impl Backend for CudaBackend {
         self.make_tensor(out, vec![b, m])
     }
 
+    // VENDORED-LOCAL: GLM-5.3-Flash. One KDA delta-rule step, state in place.
+    fn kda_delta_step(
+        &self,
+        state: &mut Tensor,
+        qkvg: &Tensor,
+        beta: &Tensor,
+        n_head: usize,
+        head_dim: usize,
+    ) -> Tensor {
+        let n = n_head * head_dim;
+        debug_assert_eq!(state.numel(), n * head_dim);
+        debug_assert_eq!(qkvg.numel(), 4 * n);
+        let qk_in = self.cuda_input(qkvg);
+        let b_in = self.cuda_input(beta);
+        let mut out = self.alloc(n);
+        let st = self.cuda_input_mut(state);
+
+        const BLOCK: u32 = 256;
+        let warps = BLOCK / 32;
+        let cfg = LaunchConfig {
+            grid_dim: ((n as u32).div_ceil(warps), 1, 1),
+            block_dim: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let (nh, hd) = (n_head as i32, head_dim as i32);
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        unsafe {
+            self.stream
+                .launch_builder(self.func("kda_delta_step_f32"))
+                .arg(st)
+                .arg(qk_in.as_ref())
+                .arg(b_in.as_ref())
+                .arg(&mut out)
+                .arg(&nh)
+                .arg(&hd)
+                .arg(&scale)
+                .launch(cfg)
+                .expect("kda_delta_step launch");
+        }
+        self.make_tensor(out, vec![n])
+    }
+
     fn silu_mul_split(&self, fused: &Tensor, ff: usize) -> Tensor {
         let seq = fused.dim(0);
         debug_assert_eq!(fused.dim(fused.rank() - 1), 2 * ff);

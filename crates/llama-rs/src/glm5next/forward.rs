@@ -62,6 +62,7 @@
 //! `.gguf` per dispatch. `Glm5NextModel::forward` itself is still the stub: that
 //! path wants the device implementation, not this one.
 
+use std::sync::Arc;
 use ggml_rs::{Backend, Tensor};
 
 use super::{hc, indexer, kda, kpool, mla, routing};
@@ -565,8 +566,17 @@ impl Shape {
 /// Everything that persists between tokens.
 pub struct State {
     pub len: usize,
-    /// Per KDA layer, `[n_head * head_dim * head_dim]`.
+    /// Per KDA layer, `[n_head * head_dim * head_dim]`. Used when the state is
+    /// on the host; empty when [`Self::kda_dev`] holds it instead.
     kda: Vec<Vec<f32>>,
+    /// VENDORED-LOCAL: GLM-5.3-Flash. The same state, resident on a backend.
+    ///
+    /// 34 KDA layers x 4.2 MB is 143 MB that the recurrence touches twice per
+    /// token. Keeping it here is what makes a kernel worth having: a version that
+    /// uploaded and downloaded it each layer would move 285 MB a token, which at
+    /// the ~11 GB/s this machine's x4/x8 links manage is slower than the scalar
+    /// loop it replaces.
+    kda_dev: Option<(Vec<Tensor>, Arc<dyn Backend>)>,
     /// Per KDA layer, `[(d_conv - 1) * 3 * d_inner]` — the last `d_conv - 1`
     /// **pre-conv** `q‖k‖v` vectors, which is what the reference's conv state
     /// holds so a rollback restores one block.
@@ -590,6 +600,7 @@ impl State {
         Ok(Self {
             len: 0,
             kda: vec![vec![0.0f32; sh.n_head * hd * hd]; n_kda],
+            kda_dev: None,
             conv: vec![vec![0.0f32; (sh.d_conv - 1) * 3 * sh.d_inner()]; n_kda],
             latents: vec![vec![0.0f32; sh.max_len * sh.kv_lora]; n_mla],
             kpool: kpool::KpoolCache::new(n_mla, sh.max_len, sh.d_idx)?,
@@ -597,8 +608,46 @@ impl State {
         })
     }
 
+    /// As [`Self::new`], with the KDA recurrent state resident on `backend`.
+    ///
+    /// Everything else stays on the host: the conv ring is small, and the latents
+    /// and indexer caches are read by host code that has not moved yet.
+    pub fn new_on(sh: &Shape, backend: Arc<dyn Backend>) -> Result<Self> {
+        let mut st = Self::new(sh)?;
+        let hd = sh.kda_head_dim;
+        let n = sh.n_head * hd * hd;
+        let dev = st
+            .kda
+            .iter()
+            .map(|_| backend.to_device(Tensor::from_vec(vec![0.0f32; n], vec![sh.n_head, hd, hd])))
+            .collect();
+        st.kda = Vec::new();
+        st.kda_dev = Some((dev, backend));
+        Ok(st)
+    }
+
+    /// How many KDA layers this state covers, whichever side it lives on.
+    pub fn n_kda(&self) -> usize {
+        match &self.kda_dev {
+            Some((d, _)) => d.len(),
+            None => self.kda.len(),
+        }
+    }
+
+    /// Whether the recurrent state is resident on a backend.
+    pub fn kda_on_device(&self) -> bool {
+        self.kda_dev.is_some()
+    }
+
     pub fn reset(&mut self) {
         self.len = 0;
+        if let Some((dev, backend)) = &mut self.kda_dev {
+            for t in dev.iter_mut() {
+                let shape = t.shape().to_vec();
+                let n = t.numel();
+                *t = backend.to_device(Tensor::from_vec(vec![0.0f32; n], shape));
+            }
+        }
         for s in self.kda.iter_mut() {
             s.fill(0.0);
         }
@@ -643,10 +692,23 @@ fn hc_mixes(stream: &[f32], w: &HcW<'_>, sh: &Shape) -> Result<hc::Mix> {
 /// One KDA linear-attention layer. `x` is the post-`attn_norm` input; every
 /// projection here reads it, including `f`, `g` and `beta` — the reference is
 /// explicit that those read the layer input and **not** the convolved `q‖k‖v`.
+/// One KDA layer's recurrent state, on whichever side it lives.
+///
+/// The [`Mat`] seam for the recurrence: `Host` runs [`kda::step`], the oracle,
+/// and `Device` runs [`Backend::kda_delta_step`] against a state that never
+/// leaves the card.
+pub enum KdaSt<'a> {
+    Host(&'a mut [f32]),
+    Device {
+        t: &'a mut Tensor,
+        backend: &'a dyn Backend,
+    },
+}
+
 fn kda_layer(
     sh: &Shape,
     w: &KdaW<'_>,
-    state: &mut [f32],
+    state: KdaSt<'_>,
     conv_state: &mut [f32],
     x: &[f32],
     out: &mut [f32],
@@ -730,7 +792,30 @@ fn kda_layer(
 
     let t = std::time::Instant::now();
     let mut scan = vec![0.0f32; di];
-    kda::step(state, &q, &k, &v, &g_log, &beta, nh, hd, &mut scan)?;
+    match state {
+        KdaSt::Host(st) => kda::step(st, &q, &k, &v, &g_log, &beta, nh, hd, &mut scan)?,
+        KdaSt::Device { t: st, backend } => {
+            // q, k, v and g_log go up as one [4, di] tensor rather than four, so a
+            // layer costs two uploads and one download instead of six crossings.
+            let mut packed = Vec::with_capacity(4 * di);
+            packed.extend_from_slice(&q);
+            packed.extend_from_slice(&k);
+            packed.extend_from_slice(&v);
+            packed.extend_from_slice(&g_log);
+            let qkvg = backend.to_device(Tensor::from_vec(packed, vec![4, di]));
+            let bt = backend.to_device(Tensor::from_vec(beta.clone(), vec![nh]));
+            let o = backend.kda_delta_step(st, &qkvg, &bt, nh, hd);
+            let oh = backend.to_host(o);
+            if oh.data().len() != scan.len() {
+                return Err(LlamaError::Config(format!(
+                    "forward: kda step returned {} values, expected {}",
+                    oh.data().len(),
+                    scan.len()
+                )));
+            }
+            scan.copy_from_slice(oh.data());
+        }
+    }
     prof::add(&prof::KDA_STEP, t);
 
     // Per-head RMSNorm by ssm_norm, gated by a PLAIN sigmoid of g_b(g_a(x)) --
@@ -1083,7 +1168,16 @@ pub fn forward_token(
             AttnW::Kda(kw) => {
                 let t = std::time::Instant::now();
                 let ord = sh.kda_ordinal(il);
-                let (kst, cst) = (&mut state.kda[ord], &mut state.conv[ord]);
+                // Split the borrow: conv is host, the recurrent state may not be.
+                let State { conv, kda, kda_dev, .. } = &mut *state;
+                let cst = &mut conv[ord];
+                let kst = match kda_dev {
+                    Some((dev, backend)) => KdaSt::Device {
+                        t: &mut dev[ord],
+                        backend: &**backend,
+                    },
+                    None => KdaSt::Host(&mut kda[ord]),
+                };
                 kda_layer(sh, kw, kst, cst, &cur, &mut sub_out)?;
                 prof::add(&prof::KDA, t);
             }
