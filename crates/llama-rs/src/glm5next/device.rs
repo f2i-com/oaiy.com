@@ -302,15 +302,55 @@ impl StreamExperts {
         }
         let n_moe = self.layers.len();
         let n = cards.len();
-        // Contiguous runs, the remainder spread over the first few cards.
-        let per = n_moe / n;
-        let extra = n_moe % n;
+
+        // Contiguous runs, sized in proportion to each card's cache rather than
+        // evenly, because the caches are not equal: card 0 carries the trunk.
+        //
+        // An even 21/21 split over budgets of 1312 and 1635 slots gave each of
+        // card 0's layers 62 slots and each of card 1's 78, and the hit rates
+        // followed exactly that -- 69.9% against 81.1%. Proportional gives 19/23,
+        // so about 69 and 71 slots a layer, which is the point: what a layer needs
+        // is slots for *its own* 288 experts, so the thing to equalise is slots per
+        // layer, not layers per card.
+        let total: usize = budgets.iter().sum();
+        let mut counts = vec![0usize; n];
+        if total == 0 {
+            // No usable cache anywhere: fall back to an even split.
+            for (c, slot) in counts.iter_mut().enumerate() {
+                *slot = n_moe / n + usize::from(c < n_moe % n);
+            }
+        } else {
+            // Largest-remainder, so the counts sum to n_moe exactly and every card
+            // with a cache gets at least one layer.
+            let mut rema: Vec<(f64, usize)> = Vec::with_capacity(n);
+            let mut used = 0usize;
+            for (c, &b) in budgets.iter().enumerate() {
+                let exact = n_moe as f64 * b as f64 / total as f64;
+                let floor = exact.floor() as usize;
+                counts[c] = floor;
+                used += floor;
+                rema.push((exact - floor as f64, c));
+            }
+            rema.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+            for i in 0..(n_moe - used) {
+                counts[rema[i % rema.len()].1] += 1;
+            }
+        }
         let mut card_of = Vec::with_capacity(n_moe);
-        for c in 0..n {
-            let count = per + usize::from(c < extra);
+        for (c, &count) in counts.iter().enumerate() {
             card_of.extend(std::iter::repeat_n(c, count));
         }
         debug_assert_eq!(card_of.len(), n_moe);
+        eprintln!(
+            "  MoE layers {:?} over budgets {:?} GB -> slots a layer {:?}",
+            counts,
+            budgets.iter().map(|b| b >> 30).collect::<Vec<_>>(),
+            counts
+                .iter()
+                .zip(&budgets)
+                .map(|(&c, &b)| if c > 0 { b / rec.max(1) / c } else { 0 })
+                .collect::<Vec<_>>()
+        );
 
         self.shared
             .enable_device_shards(&cards, &budgets, card_of.clone())

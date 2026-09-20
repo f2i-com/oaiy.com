@@ -655,15 +655,26 @@ impl StreamShared {
         }
     }
 
-    // VENDORED-LOCAL: GLM-5.3-Flash. The RAM tier's phase hint.
-    /// Tell the RAM tier which layer a pass has reached, so its eviction victims
-    /// come from the layers already done rather than the ones coming up.
+    // VENDORED-LOCAL: GLM-5.3-Flash. The RAM tier's phase hint -- exposed, but
+    // NOT used by the glm5next path, and that is the point of this comment.
+    /// Tell the RAM tier which layer a pass has reached.
     ///
-    /// A pass over the layers uses each layer's experts once, which makes the
-    /// record just read the least-used one around -- so plain LFRU evicts a
-    /// record the same pass has yet to reach, and the pass eats its own future.
-    /// Measured on DeepSeek-V4.1: a full RAM tier served 2.6K of the 10.2K
-    /// records it held that a 5.6K-token prompt needed.
+    /// `Ecache` reads this as *"every layer below `layer` is finished with for
+    /// this pass"* and makes room from those first. That is true of a
+    /// **layer-major** pass, which is what `dsv41-cuda`'s `routed_sum` does on its
+    /// `t > 1` path: one layer at a time over the whole prompt, so by layer 20
+    /// layers 0-19 really are done.
+    ///
+    /// glm5next's `forward_prompt` is **token-major** -- every layer for token 0,
+    /// then every layer for token 1 -- so at layer 44 of token 0, layer 0 is not
+    /// finished at all; it is wanted again a moment later. Setting the hint here
+    /// would tell the cache to prefer evicting exactly the records the next token
+    /// needs first. It measured as a no-op only because the RAM tier never filled
+    /// during the test (7 519 misses against 9 875 records), which is luck, not
+    /// safety.
+    ///
+    /// So this stays available and unused until glm5next has a chunked,
+    /// layer-major prefill, at which point it becomes correct and worth the call.
     pub fn set_scan_layer(&self, layer: Option<u32>) {
         self.cache.set_scan_layer(layer);
     }
@@ -756,19 +767,7 @@ impl LayerStream {
     // stream before the layer's first matvec, then hand back one entry per
     // expert. A hit costs zero H2D bytes.
     pub(crate) fn resolve_experts(&self, experts: &[u32]) -> Result<Vec<ResolvedExpert>, String> {
-        // Both glm5next's prefill and its decode are one pass over the layers per
-        // token, so the hint applies to either: inside a token, layer 3's experts
-        // are wanted before layer 40's, and taking layer 40's record to make room
-        // for layer 3's costs the same token a read.
-        struct Scan<'a>(&'a StreamShared);
-        impl Drop for Scan<'_> {
-            fn drop(&mut self) {
-                self.0.set_scan_layer(None);
-            }
-        }
-        self.shared.set_scan_layer(Some(self.layer));
-        let _scan = Scan(&self.shared);
-
+        // No `set_scan_layer` here, deliberately -- see [`StreamShared::set_scan_layer`].
         #[cfg(feature = "cuda")]
         if let Some(dc) = self.shared.device_cache_for(self.layer) {
             let mut distinct = experts.to_vec();
