@@ -83,6 +83,31 @@ impl MoeRoutingDevice {
     }
 }
 
+impl MoeRoutingDevice {
+    /// VENDORED-LOCAL: GLM-5.3-Flash. A routing built from host ids and weights.
+    ///
+    /// `moe_route_device` computes the route on the card from the router logits,
+    /// which is what the generic MoE path does. glm5next routes on the host --
+    /// its router sits inside a hyper-connection pass that never leaves host
+    /// memory -- so its ids and weights are uploaded instead: two copies of
+    /// `top_k` values, against the eight 14 MB expert records the kernels then
+    /// read without leaving the card.
+    ///
+    /// `ids` are whatever the pointer table is indexed by, so a table built over
+    /// routing slots wants `0..k` here rather than the real expert ids.
+    pub fn from_host(backend: &CudaBackend, ids: &[u32], weights: &[f32]) -> Self {
+        assert_eq!(ids.len(), weights.len(), "MoeRoutingDevice: ids/weights length mismatch");
+        assert!(!ids.is_empty(), "MoeRoutingDevice: empty route");
+        Self {
+            ids: backend.stream.memcpy_stod(ids).expect("h2d moe ids"),
+            weights: backend.stream.memcpy_stod(weights).expect("h2d moe weights"),
+            stream: Arc::clone(&backend.stream),
+            seq: 1,
+            top_k: ids.len(),
+        }
+    }
+}
+
 /// Per-layer tables for the grouped MoE kernels: one device pointer per
 /// expert weight allocation, plus dtype/geometry the launcher checks once at
 /// plan build. `ptrs` is `[gate_up entries | down entries]`, `ntab` entries
@@ -98,6 +123,10 @@ pub struct MoeDevicePlan {
     pub ff:     usize,
     pub hidden: usize,
     pub use_gelu: bool,
+    /// VENDORED-LOCAL: GLM-5.3-Flash. The SwiGLU clamp, 0 for none.
+    pub limit: f32,
+    /// Whether that clamp applies after the SiLU rather than before it.
+    pub after_silu: bool,
 }
 
 impl std::fmt::Debug for MoeDevicePlan {
@@ -147,7 +176,19 @@ impl MoeDevicePlan {
             ff,
             hidden,
             use_gelu,
+            limit: 0.0,
+            after_silu: false,
         }
+    }
+
+    /// VENDORED-LOCAL: GLM-5.3-Flash. Clamp the activation, as
+    /// `Backend::swiglu_clamped` does. `limit <= 0` leaves it unclamped, which is
+    /// what every other model here wants, so this is a step off the plain `new`
+    /// rather than an argument on it.
+    pub fn with_clamp(mut self, limit: f32, after_silu: bool) -> Self {
+        self.limit = limit;
+        self.after_silu = after_silu;
+        self
     }
 }
 
@@ -261,6 +302,8 @@ impl CudaBackend {
         let k_gate_i = hidden as i32; // gate_up inner dim = model hidden
         let k_down_i = ff as i32;     // down inner dim = expert ff
         let gelu_i: i32 = if plan.use_gelu { 1 } else { 0 };
+        let limit_f: f32 = plan.limit;
+        let after_silu_i: i32 = if plan.after_silu { 1 } else { 0 };
         let has_scales_i: i32 = if plan.scales.is_some() { 1 } else { 0 };
         let ntab_i = plan.ntab as i32;
 
@@ -287,6 +330,8 @@ impl CudaBackend {
                 .arg(&k_gate_i)
                 .arg(&gelu_i)
                 .arg(&0i32) // idx_base: resident tables index by expert id
+                .arg(&limit_f)
+                .arg(&after_silu_i)
                 .launch(gu_cfg)
                 .expect("moe gate_up launch");
         }

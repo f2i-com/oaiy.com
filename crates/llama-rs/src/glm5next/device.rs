@@ -200,6 +200,46 @@ pub struct StreamExperts {
     cpu: Option<Arc<CpuExperts>>,
 }
 
+/// VENDORED-LOCAL: GLM-5.3-Flash. How much of the expert work the grouped
+/// dispatch took.
+///
+/// Without this a test cannot tell "the two paths agreed" from "the grouped path
+/// never ran", and which it is moves with the VRAM hit rate: a slot the tier
+/// missed is computed on the CPU or uploaded per matvec, and neither can join a
+/// grouped call.
+pub mod grouped_stats {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    static SLOTS: AtomicU64 = AtomicU64::new(0);
+    static PER_EXPERT: AtomicU64 = AtomicU64::new(0);
+
+    pub(super) fn took(slots: usize) {
+        CALLS.fetch_add(1, Ordering::Relaxed);
+        SLOTS.fetch_add(slots as u64, Ordering::Relaxed);
+    }
+
+    pub(super) fn fell_through() {
+        PER_EXPERT.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Grouped layer-calls, the slots they covered, and layer-calls that ran the
+    /// per-expert loop for the whole route instead.
+    pub fn get() -> (u64, u64, u64) {
+        (
+            CALLS.load(Ordering::Relaxed),
+            SLOTS.load(Ordering::Relaxed),
+            PER_EXPERT.load(Ordering::Relaxed),
+        )
+    }
+
+    pub fn reset() {
+        CALLS.store(0, Ordering::Relaxed);
+        SLOTS.store(0, Ordering::Relaxed);
+        PER_EXPERT.store(0, Ordering::Relaxed);
+    }
+}
+
 impl StreamExperts {
     /// `cache_budget_bytes` is the RAM the expert cache may use. One record is
     /// gate+up+down for a single expert, about 14 MB here, and the whole model
@@ -469,6 +509,110 @@ impl StreamExperts {
 
     /// The GPU half of a layer: every resolved expert that has device weights,
     /// accumulated on the card and read back once.
+    /// VENDORED-LOCAL: GLM-5.3-Flash. The whole VRAM-resident part of a route in
+    /// four launches, instead of four or five per expert.
+    ///
+    /// The grouped kernels the generic streaming MoE path uses (MOE-02) read their
+    /// weights through a pointer table, so a layer's routed experts run as
+    /// gate_up+act -> down+scale -> reduce whatever addresses they sit at. That
+    /// path builds its table over expert ids and drives it from a device-computed
+    /// route; neither fits here, because glm5next routes on the host and only some
+    /// of a route is VRAM-resident. So the table is built over **routing slots** --
+    /// `ntab == n_device`, ids `0..n_device` -- which the kernels already support,
+    /// and the route weights are uploaded rather than computed.
+    ///
+    /// `None` means this layer cannot be grouped (no device-resident expert, a
+    /// split gate/up pair, mixed dtypes, or geometry the kernels do not cover) and
+    /// the caller should run every slot through the per-expert loop. The slots this
+    /// does cover are exactly the `Device` ones, so the caller skips those.
+    ///
+    /// GLM5_NO_GROUPED=1 turns it off, for measuring against and for bisecting a
+    /// numerical doubt.
+    #[cfg(feature = "cuda")]
+    fn try_grouped(
+        &self,
+        be: &dyn Backend,
+        resolved: &[ResolvedExpert],
+        experts: &[(u32, f32)],
+        x: &[f32],
+        limit: f32,
+    ) -> Option<Tensor> {
+        if std::env::var("GLM5_NO_GROUPED").ok().as_deref() == Some("1") {
+            return None;
+        }
+        let cuda = be.as_any().downcast_ref::<ggml_rs_cuda::CudaBackend>()?;
+
+        let mut gu_tab = Vec::with_capacity(resolved.len());
+        let mut dn_tab = Vec::with_capacity(resolved.len());
+        let mut weights = Vec::with_capacity(resolved.len());
+        let mut gu_dt: Option<gguf::GgmlType> = None;
+        let mut dn_dt: Option<gguf::GgmlType> = None;
+        let mut ff = 0usize;
+        for (r, &(_, wt)) in resolved.iter().zip(experts) {
+            let Some(en) = r.device_entry() else { continue };
+            // Only a fused gate||up pair has one address to hand the table; the
+            // split form is two tensors and a restack, and never arises for these
+            // weights (gate and up share a dtype on every layer).
+            let crate::loader::FfnPair::Fused(crate::loader::Weight::Quant(gu)) = &en.pair else {
+                return None;
+            };
+            let crate::loader::Weight::Quant(dn) = &en.down else { return None };
+            if gu.shape().len() != 2 || dn.shape().len() != 2 || gu.dim(0) % 2 != 0 {
+                return None;
+            }
+            let f = gu.dim(0) / 2;
+            if gu.dim(1) != self.n_embd || dn.dim(0) != self.n_embd || dn.dim(1) != f {
+                return None;
+            }
+            match ff {
+                0 => ff = f,
+                seen if seen != f => return None,
+                _ => {}
+            }
+            match gu_dt {
+                Some(dt) if dt != gu.dtype() => return None,
+                None => gu_dt = Some(gu.dtype()),
+                _ => {}
+            }
+            match dn_dt {
+                Some(dt) if dt != dn.dtype() => return None,
+                None => dn_dt = Some(dn.dtype()),
+                _ => {}
+            }
+            let (Some(gup), Some(dnp)) =
+                (ggml_rs_cuda::quant_device_ptr(gu), ggml_rs_cuda::quant_device_ptr(dn))
+            else {
+                return None;
+            };
+            gu_tab.push(gup);
+            dn_tab.push(dnp);
+            weights.push(wt);
+        }
+        if gu_tab.is_empty() {
+            return None;
+        }
+        let (gu_dt, dn_dt) = (gu_dt?, dn_dt?);
+        if !ggml_rs_cuda::grouped_kernel_covers(gu_dt, self.n_embd)
+            || !ggml_rs_cuda::grouped_kernel_covers(dn_dt, ff)
+        {
+            return None;
+        }
+
+        let ids: Vec<u32> = (0..gu_tab.len() as u32).collect();
+        let plan = ggml_rs_cuda::MoeDevicePlan::new(
+            cuda, &gu_tab, &dn_tab, None, gu_dt, dn_dt, ff, self.n_embd, false,
+        )
+        // glm5next clamps the activation, and after the SiLU: see
+        // `swiglu_clamp_exp` and `Pair::swiglu_clamped`.
+        .with_clamp(limit, true);
+        let routing = ggml_rs_cuda::MoeRoutingDevice::from_host(cuda, &ids, &weights);
+        let x_in = Tensor::from_vec(x.to_vec(), vec![1, self.n_embd]);
+        grouped_stats::took(gu_tab.len());
+        // `resolved` owns the entry Arcs and outlives this call, so the reads the
+        // launches queue cannot race a cache eviction freeing the weights.
+        Some(cuda.moe_grouped_ffn(&x_in, &plan, &routing))
+    }
+
     fn gpu_part(
         &self,
         be: &dyn Backend,
@@ -483,10 +627,34 @@ impl StreamExperts {
             out.fill(0.0);
             return Ok(());
         }
+        // The VRAM-resident slots in four launches, when they can be. Whatever is
+        // left -- a `Host` expert whose weights upload as they are read, or a layer
+        // the kernels do not cover -- follows through the per-expert loop into the
+        // same accumulator.
+        #[cfg(feature = "cuda")]
+        let grouped = self.try_grouped(be, resolved, experts, x, limit);
+        #[cfg(not(feature = "cuda"))]
+        let grouped: Option<Tensor> = None;
+
+        // Whether the grouped call consumed the `Device` slots, recorded before
+        // `grouped` is moved into the accumulator.
+        let grouped_ran = grouped.is_some();
+        #[cfg(feature = "cuda")]
+        if !grouped_ran {
+            grouped_stats::fell_through();
+        }
         let xd = be.to_device(Tensor::from_vec(x.to_vec(), vec![1, self.n_embd]));
-        let mut acc =
-            be.to_device(Tensor::from_vec(vec![0.0f32; self.n_embd], vec![1, self.n_embd]));
+        let mut acc = match grouped {
+            Some(sum) => sum,
+            None => {
+                be.to_device(Tensor::from_vec(vec![0.0f32; self.n_embd], vec![1, self.n_embd]))
+            }
+        };
         for (r, &(_, wt)) in resolved.iter().zip(experts) {
+            #[cfg(feature = "cuda")]
+            if grouped_ran && r.device_entry().is_some() {
+                continue; // already in `acc`
+            }
             let Some((pair, down)) = r.gpu() else { continue };
             let h = pair.swiglu_clamped(be, &xd, limit, true);
             let o = down.linear(be, &h);
@@ -2774,6 +2942,88 @@ children attend school instead.";
         println!("max |gpu only - hybrid| over {} logits: {worst:.6} (scale {scale:.3})", a.len());
         assert!(worst <= 1e-4 * scale, "the CPU tier diverges: {worst} at scale {scale}");
         assert!(a.iter().any(|v| v.abs() > 1e-3), "logits are all zero");
+    }
+
+    /// The grouped expert dispatch against the per-expert loop.
+    ///
+    /// This is the correctness gate on the grouped MoE kernels for this model. The
+    /// grouped call computes a whole route in four launches through a pointer
+    /// table, so a mistake in the table, the slot indexing, the clamp, or the route
+    /// weights shows up as wrong logits rather than as an error -- and every one of
+    /// those is new code on this path.
+    ///
+    /// The CPU tier is off for both runs, so a VRAM miss uploads and stays a
+    /// `Device` expert: that puts the whole route in the grouped path's reach,
+    /// which is what makes the comparison cover anything. `grouped_stats` then says
+    /// it really did run, because "the paths agree" is worthless if one never fired.
+    ///
+    /// Not exact, and cannot be: the grouped gate_up warp-reduces its two dots in a
+    /// different order from the per-expert matvec, and the down projection sums
+    /// slots in a fixed order where the loop accumulates them one at a time. The
+    /// bar is the same 1e-4 absolute at a logit scale of ~15 that the CPU tier is
+    /// held to -- under 1e-5 relative, where this model's own host-vs-CUDA gap sits.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "needs the released model on disk"]
+    fn grouped_dispatch_agrees_with_the_per_expert_loop() {
+        let prompt = [154822u32, 6172, 1043, 9001];
+
+        // SAFETY: single-threaded test.
+        unsafe { std::env::set_var("GLM5_NO_CPU_TIER", "1") };
+        unsafe { std::env::set_var("GLM5_NO_GROUPED", "1") };
+        let loop_model = match DeviceModel::open_tiered(RELEASED, 512, 1, 24 << 30, 8 << 30) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("tiered open failed ({e}); skipping");
+                return;
+            }
+        };
+        grouped_stats::reset();
+        let sh = loop_model.shape().clone();
+        let wl = loop_model.view();
+        let mut sl = forward::State::new_on(&sh, loop_model.backend()).expect("state");
+        let a = forward::forward_prompt(&sh, &wl, &mut sl, &prompt).expect("per-expert loop");
+        let (calls, _, fell) = grouped_stats::get();
+        assert_eq!(calls, 0, "GLM5_NO_GROUPED=1 still grouped {calls} layer-calls");
+        assert!(fell > 0, "the per-expert run did no expert work at all");
+        drop(wl);
+        drop(loop_model);
+
+        // SAFETY: as above.
+        unsafe { std::env::remove_var("GLM5_NO_GROUPED") };
+        let grouped = DeviceModel::open_tiered(RELEASED, 512, 1, 24 << 30, 8 << 30).expect("load");
+        grouped_stats::reset();
+        let wg = grouped.view();
+        let mut sg = forward::State::new_on(&sh, grouped.backend()).expect("state");
+        let b = forward::forward_prompt(&sh, &wg, &mut sg, &prompt).expect("grouped");
+        let (calls, slots, fell) = grouped_stats::get();
+        println!(
+            "grouped {calls} layer-calls over {slots} slots ({:.1} a call); {fell} fell through",
+            slots as f64 / calls.max(1) as f64
+        );
+        assert!(calls > 0, "the grouped path never ran, so this proves nothing");
+
+        // SAFETY: as above.
+        unsafe { std::env::remove_var("GLM5_NO_CPU_TIER") };
+
+        assert_eq!(a.len(), b.len());
+        let scale = a.iter().fold(0.0f32, |m, v| m.max(v.abs())).max(1.0);
+        let mut worst = 0.0f32;
+        for (p, q) in a.iter().zip(b.iter()) {
+            worst = worst.max((p - q).abs());
+        }
+        println!("max |loop - grouped| over {} logits: {worst:.6} (scale {scale:.3})", a.len());
+        assert!(worst <= 1e-4 * scale, "the grouped dispatch diverges: {worst} at scale {scale}");
+        assert!(a.iter().any(|v| v.abs() > 1e-3), "logits are all zero");
+
+        // The same argmax is the thing that decides whether generation differs.
+        let top = |v: &[f32]| {
+            v.iter()
+                .enumerate()
+                .fold((0usize, f32::NEG_INFINITY), |m, (i, &x)| if x > m.1 { (i, x) } else { m })
+                .0
+        };
+        assert_eq!(top(&a), top(&b), "the two paths pick different tokens");
     }
 
     /// Spreading the expert tier over two cards must not change the answer.

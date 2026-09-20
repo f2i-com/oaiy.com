@@ -1443,6 +1443,20 @@ impl ResolvedExpert {
     }
 
     /// The leased record, for an expert bound for the CPU.
+    /// The VRAM-cache entry, when this expert has one.
+    ///
+    /// Narrower than [`Self::gpu`], which also answers for `Host`: a `Host`
+    /// expert's matvec runs on the card but its weights are in RAM and upload as
+    /// they are read, so it has no device address and cannot join a grouped
+    /// dispatch. Only `Device` can.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn device_entry(&self) -> Option<&Arc<device_cache::DeviceEntry>> {
+        match self {
+            Self::Device(en) => Some(en),
+            _ => None,
+        }
+    }
+
     pub(crate) fn cpu_lease(&self) -> Option<&nrob::ecache::HostLease> {
         match self {
             Self::Cpu(l) => Some(l),

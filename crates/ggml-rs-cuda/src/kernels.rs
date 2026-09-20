@@ -2763,12 +2763,19 @@ __device__ __forceinline__ float moe_warp_reduce(float v) {
 // read). use_gelu: 0 = silu (SwiGLU), 1 = tanh-approx gelu (GeGLU, Gemma 4
 // MoE). Activation formulas replicate silu_mul_split_f32 /
 // gelu_approx_mul_split_f32 exactly.
+// VENDORED-LOCAL: GLM-5.3-Flash. `limit > 0` adds the clamped SwiGLU, which
+// glm5next needs on every routed expert (`swiglu_clamp_exp` is 10.0 a layer):
+// the three clamps and their order are `swiglu_clamped_f32`'s, so the grouped
+// and per-expert paths compute the same thing. The clamped branch uses `expf`
+// rather than `__expf` to match that kernel exactly; the unclamped branch keeps
+// `__expf`, so no existing caller's numerics move.
 #define MOE_GATE_UP_ACT(NAME, ACCUM, ROW_BYTES_EXPR)                                \
 __global__ void NAME(const float* __restrict__ x,                                   \
                      const unsigned long long* __restrict__ wtab,                   \
                      const unsigned int* __restrict__ expert_ids,                   \
                      float* __restrict__ act,                                       \
-                     int ff, int K, int use_gelu, int idx_base) {                   \
+                     int ff, int K, int use_gelu, int idx_base,                     \
+                     float limit, int after_silu) {                                 \
     int slot = blockIdx.y;                                                          \
     int j = blockIdx.x * blockDim.y + threadIdx.y;                                  \
     if (j >= ff) return;                                                            \
@@ -2782,16 +2789,22 @@ __global__ void NAME(const float* __restrict__ x,                               
     accg = moe_warp_reduce(accg);                                                   \
     accu = moe_warp_reduce(accu);                                                   \
     if (t == 0) {                                                                   \
-        float a;                                                                    \
+        const bool clamped = limit > 0.0f;                                          \
+        float a = accg, b = accu;                                                   \
+        if (clamped && after_silu == 0 && a > limit) a = limit;                     \
         if (use_gelu) {                                                             \
             const float SQRT_2_OVER_PI = 0.7978845608028654f;                       \
             const float COEFF = 0.044715f;                                          \
-            float inner = SQRT_2_OVER_PI * (accg + COEFF * accg * accg * accg);     \
-            a = 0.5f * accg * (1.0f + tanhf(inner));                                \
+            float inner = SQRT_2_OVER_PI * (a + COEFF * a * a * a);                 \
+            a = 0.5f * a * (1.0f + tanhf(inner));                                   \
+        } else if (clamped) {                                                       \
+            a = a / (1.0f + expf(-a));                                              \
         } else {                                                                    \
-            a = accg / (1.0f + __expf(-accg));                                      \
+            a = a / (1.0f + __expf(-a));                                            \
         }                                                                           \
-        act[slot * ff + j] = a * accu;                                              \
+        if (clamped && after_silu != 0 && a > limit) a = limit;                     \
+        if (clamped) b = fminf(fmaxf(b, -limit), limit);                            \
+        act[slot * ff + j] = a * b;                                                 \
     }                                                                               \
 }
 
