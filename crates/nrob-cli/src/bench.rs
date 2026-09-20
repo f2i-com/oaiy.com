@@ -464,7 +464,7 @@ fn bench_gguf(o: &Opts) -> i32 {
     let vram0 = backend.vram_status();
 
     let t_load = Instant::now();
-    let model = match load_model(o, backend) {
+    let mut model = match load_model(o, backend) {
         Ok(m) => m,
         Err(m) => {
             eprintln!("{m}");
@@ -502,7 +502,7 @@ fn bench_gguf(o: &Opts) -> i32 {
 
     // Attach the VRAM expert cache (no-op unless streaming on CUDA; see
     // maybe_enable_vram_cache for the budget default).
-    maybe_enable_vram_cache(o, &lb, &model);
+    maybe_enable_vram_cache(o, &lb, &mut model);
     #[cfg(feature = "cuda")]
     let dstats0 = model.device_cache_stats();
 

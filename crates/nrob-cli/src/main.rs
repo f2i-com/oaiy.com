@@ -288,9 +288,48 @@ fn llama_backend(o: &Opts) -> Result<LlamaBackend, String> {
 /// N` (`0` disables); without the flag the default is min(2 GiB, 25% of
 /// free VRAM) when the model streams on CUDA, disabled otherwise. No-op for
 /// resident loads and CPU runs.
-pub(crate) fn maybe_enable_vram_cache(o: &Opts, lb: &LlamaBackend, model: &Model) {
+///
+/// VENDORED-LOCAL: GLM-5.3-Flash takes the tiered form of this instead — every
+/// card, sized on the card, plus the CPU tier — because its experts are 182 GB
+/// and a 2 GiB slice of one card holds 140 of 12,096 records. The two are
+/// mutually exclusive: both put a cache on card 0, which would charge its VRAM
+/// twice and split the hits between them.
+pub(crate) fn maybe_enable_vram_cache(o: &Opts, lb: &LlamaBackend, model: &mut Model) {
     #[cfg(feature = "cuda")]
     {
+        if let Model::Glm5Next(g) = model {
+            // `--vram-cache 0` still means "no VRAM tier at all".
+            if o.vram_cache == Some(0) {
+                return;
+            }
+            let Some(cuda) = &lb.cuda else {
+                if !o.quiet {
+                    eprintln!("nrob: the GLM expert tier needs --cuda");
+                }
+                return;
+            };
+            // Card 0 is the trunk's own backend; the rest are opened here.
+            let mut cards = vec![Arc::clone(cuda)];
+            cards.extend(llama_rs::glm5next::device::extra_cards(0));
+            let cap = o.vram_cache.unwrap_or(0) as usize;
+            match g.enable_tiering(cards, cap) {
+                Ok(()) => {
+                    if !o.quiet {
+                        let (budgets, layers) = g.tier_layout();
+                        let gb: Vec<String> =
+                            budgets.iter().map(|b| format!("{:.1}", *b as f64 / 1e9)).collect();
+                        eprintln!(
+                            "nrob: expert tier {} card(s), VRAM {} GB, MoE layers {:?}",
+                            budgets.len(),
+                            gb.join("+"),
+                            layers
+                        );
+                    }
+                }
+                Err(e) => eprintln!("nrob: GLM expert tier unavailable: {e}"),
+            }
+            return;
+        }
         let Some(shared) = model.stream_shared() else {
             if o.vram_cache.is_some() && !o.quiet {
                 eprintln!("nrob: --vram-cache applies to streamed MoE models (--budget)");
@@ -351,7 +390,7 @@ fn open_model(o: &Opts) -> Result<Model, i32> {
         eprintln!("{m}");
         2
     })?;
-    let model = load_model(o, lb.backend.clone()).map_err(|m| {
+    let mut model = load_model(o, lb.backend.clone()).map_err(|m| {
         eprintln!("{m}");
         1
     })?;
@@ -369,7 +408,7 @@ fn open_model(o: &Opts) -> Result<Model, i32> {
             );
         }
     }
-    maybe_enable_vram_cache(o, &lb, &model);
+    maybe_enable_vram_cache(o, &lb, &mut model);
     Ok(model)
 }
 

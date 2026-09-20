@@ -750,17 +750,7 @@ impl DeviceModel {
         ram_budget: usize,
         vram_cap: usize,
     ) -> Result<Self> {
-        let mut cards = Vec::new();
-        for i in 0..n_gpus.max(1) {
-            match ggml_rs_cuda::CudaBackend::new(i) {
-                Ok(b) => cards.push(Arc::new(b)),
-                Err(e) if i == 0 => {
-                    return Err(LlamaError::Config(format!("device: no CUDA device 0: {e}")))
-                }
-                // Fewer cards than asked for is a smaller tier, not a failure.
-                Err(_) => break,
-            }
-        }
+        let cards = open_cards(&(0..n_gpus.max(1)).collect::<Vec<_>>())?;
         let trunk: Arc<dyn Backend> = Arc::clone(&cards[0]) as Arc<dyn Backend>;
 
         // The RAM tier wants sizing against the expert bytes, which needs the
@@ -1152,6 +1142,58 @@ impl DeviceModel {
             layers,
         }
     }
+}
+
+/// Open every card after `first`, for a caller that already holds card `first`.
+///
+/// Probing stops at the first ordinal that will not open, and nothing here fails:
+/// a one-card machine gets an empty list and a one-card tier. Use this when the
+/// trunk backend already exists — reopening its device would compile the kernels
+/// a second time — and put the card you hold at the front of the list yourself.
+#[cfg(feature = "cuda")]
+pub fn extra_cards(first: usize) -> Vec<Arc<ggml_rs_cuda::CudaBackend>> {
+    const PROBE_LIMIT: usize = 8;
+    let mut cards = Vec::new();
+    for i in (first + 1)..PROBE_LIMIT {
+        match ggml_rs_cuda::CudaBackend::new(i) {
+            Ok(b) => cards.push(Arc::new(b)),
+            Err(_) => break,
+        }
+    }
+    cards
+}
+
+/// Open the CUDA cards an expert tier should spread over, in the order given.
+///
+/// `devices` is tried in order; **the first one must open**, because it is the
+/// card the trunk goes on, and a card after it that will not open ends the list
+/// rather than failing — asking for two on a one-card machine gets one. An empty
+/// slice means "every card this machine has", probed upward from 0.
+///
+/// The returned `cards[0]` is what the caller should hand to the model as its
+/// trunk backend, so that the trunk and the card-0 expert shard are the *same*
+/// backend instance: a second `CudaBackend::new` on one device recompiles the
+/// kernels and opens a second stream and BLAS handle for no gain.
+#[cfg(feature = "cuda")]
+pub fn open_cards(devices: &[usize]) -> Result<Vec<Arc<ggml_rs_cuda::CudaBackend>>> {
+    // A machine with more than this many cards can name them explicitly.
+    const PROBE_LIMIT: usize = 8;
+    let wanted: Vec<usize> = if devices.is_empty() {
+        (0..PROBE_LIMIT).collect()
+    } else {
+        devices.to_vec()
+    };
+    let mut cards = Vec::new();
+    for (n, &i) in wanted.iter().enumerate() {
+        match ggml_rs_cuda::CudaBackend::new(i) {
+            Ok(b) => cards.push(Arc::new(b)),
+            Err(e) if n == 0 => {
+                return Err(LlamaError::Config(format!("device: no CUDA device {i}: {e}")))
+            }
+            Err(_) => break,
+        }
+    }
+    Ok(cards)
 }
 
 #[cfg(test)]

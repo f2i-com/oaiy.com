@@ -963,6 +963,69 @@ impl Glm5NextModel {
         (kda, self.glm.n_layer - kda)
     }
 
+    // VENDORED-LOCAL: GLM-5.3-Flash. The expert hierarchy, on a streamed model.
+    /// Spread the routed experts over `cards` and turn on the CPU tier.
+    ///
+    /// [`crate::Model::open_streaming`] gives the plain single-card arrangement:
+    /// the trunk on one backend, every routed expert behind the RAM cache, and **no
+    /// VRAM expert cache at all**. That is the slowest configuration this model has
+    /// — 0.686 s a token against 0.139 with the tiers on, because every expert of
+    /// every route crosses PCIe on every token. A caller opening the model through
+    /// the generic API cannot ask for better, so this is how it asks.
+    ///
+    /// `cards[0]` **must be the backend the model was opened on**: it is the card
+    /// the trunk is resident on, and its expert shard shares that one instance
+    /// rather than opening a second context on the same device. Build the list with
+    /// [`device::open_cards`] and hand `cards[0]` to `open_streaming`.
+    ///
+    /// `cap` bounds each card's expert cache in bytes; 0 takes what is free, less
+    /// the headroom `spread_over` holds back. `GLM5_NO_CPU_TIER=1` leaves the CPU
+    /// tier off, for measuring against.
+    ///
+    /// See `docs/GLM5NEXT_PERF.md` for what each tier is worth.
+    #[cfg(feature = "cuda")]
+    pub fn enable_tiering(
+        &mut self,
+        cards: Vec<Arc<ggml_rs_cuda::CudaBackend>>,
+        cap: usize,
+    ) -> Result<()> {
+        let Some(d) = self.decoder.as_mut() else {
+            return Err(LlamaError::Config(
+                "glm5next: this model has no streamed expert tier to spread; open it                  with Model::open_streaming"
+                    .into(),
+            ));
+        };
+        d.model.experts_mut().spread_over(cards, cap)?;
+        // The CPU tier: a VRAM miss whose record is already in RAM is computed here
+        // rather than uploaded, while the GPU runs the layer's resident experts.
+        if std::env::var("GLM5_NO_CPU_TIER").ok().as_deref() != Some("1") {
+            d.model.experts_mut().enable_cpu_tier();
+            let avx = d.model.experts().cpu_tier().map(|c| c.avx512()).unwrap_or(false);
+            eprintln!(
+                "  CPU expert tier: on ({})",
+                if avx { "AVX-512" } else { "scalar fused" }
+            );
+        }
+        Ok(())
+    }
+
+    /// The VRAM each card's expert cache holds, in bytes, and how many MoE layers
+    /// each card runs — in card order, for a status line.
+    ///
+    /// Before [`Self::enable_tiering`] the budgets are empty and every MoE layer
+    /// belongs to the one backend the model was opened on.
+    pub fn tier_layout(&self) -> (Vec<usize>, Vec<usize>) {
+        let Some(d) = &self.decoder else { return (Vec::new(), Vec::new()) };
+        let (card_of, n_cards) = d.model.experts().card_layout();
+        let mut per = vec![0usize; n_cards];
+        for &c in card_of {
+            if let Some(slot) = per.get_mut(c) {
+                *slot += 1;
+            }
+        }
+        (d.model.experts().vram_budgets().to_vec(), per)
+    }
+
     /// Whether this model can run [`Self::forward`].
     ///
     /// True when opened with [`Self::from_gguf_streaming`]. The resident

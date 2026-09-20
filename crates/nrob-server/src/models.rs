@@ -406,12 +406,36 @@ impl Models {
     fn load_gguf(&self, spec: &Spec) -> Result<Live> {
         let o = &self.opts;
         let path = Kind::gguf_path(&spec.path)?;
-        let backend: Arc<dyn ggml_rs::Backend> = Arc::new(
-            ggml_rs_cuda::CudaBackend::new(o.devices.first().copied().unwrap_or(0))
-                .map_err(|e| Error::Arg(format!("cuda: {e}")))?,
-        );
-        let model = llama_rs::Model::open_streaming(&path, backend, (o.ram_gb as u64) << 30)
+        // Every card `--devices` names, in that order: the first carries the trunk
+        // and the rest take a share of the MoE layers. `open_cards` hands back the
+        // same instances the expert tier will use, so the trunk and card 0's expert
+        // shard share one CUDA context rather than opening a second on that device.
+        let cards = llama_rs::glm5next::device::open_cards(&o.devices)
             .map_err(|e| Error::Arg(e.to_string()))?;
+        let backend: Arc<dyn ggml_rs::Backend> = Arc::clone(&cards[0]) as Arc<dyn ggml_rs::Backend>;
+        let mut model = llama_rs::Model::open_streaming(&path, backend, (o.ram_gb as u64) << 30)
+            .map_err(|e| Error::Arg(e.to_string()))?;
+
+        // The expert hierarchy. `open_streaming` leaves a streamed model with its
+        // RAM cache only -- no VRAM expert cache, one card, no CPU tier -- which for
+        // GLM-5.3-Flash is 0.686 s a token against 0.139 tiered, because then every
+        // routed expert of every token crosses PCIe. Nothing else served here needs
+        // asking, so the arch decides.
+        if let llama_rs::Model::Glm5Next(g) = &mut model {
+            g.enable_tiering(cards, 0).map_err(|e| Error::Arg(e.to_string()))?;
+            if !o.quiet && !o.silent {
+                let (budgets, layers) = g.tier_layout();
+                let gb: Vec<String> =
+                    budgets.iter().map(|b| format!("{:.1}", *b as f64 / 1e9)).collect();
+                eprintln!(
+                    "  expert tier: {} card(s), VRAM {} GB, MoE layers {:?}",
+                    budgets.len(),
+                    gb.join("+"),
+                    layers
+                );
+            }
+        }
+        let model = model;
         let tok = Arc::new(model.tokenizer().clone());
 
         // The state the model was opened with bounds the context, whatever was
