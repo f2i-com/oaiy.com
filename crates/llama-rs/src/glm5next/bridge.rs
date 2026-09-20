@@ -36,7 +36,7 @@ use ggml_rs::Tensor;
 use gguf::{GgufFile, TensorInfo};
 
 use super::forward::{
-    self, AttnW, ExpertFfn, FfnW, HcW, IndexerW, KdaW, LayerW, Mat, MlaW, ModelW, MoeW, Shape,
+    self, AttnW, Bat, ExpertFfn, FfnW, HcW, IndexerW, KdaW, LayerW, Mat, MlaW, ModelW, MoeW, Shape,
 };
 use super::{Glm5NextConfig, LayerKind};
 use crate::config::ModelConfig;
@@ -437,8 +437,8 @@ impl HostModel {
                     q_b: m("attn_q_b.weight"),
                     kv_a_mqa: m("attn_kv_a_mqa.weight"),
                     kv_a_norm: b("attn_kv_a_norm.weight"),
-                    k_b: b("attn_k_b.weight"),
-                    v_b: b("attn_v_b.weight"),
+                    k_b: Bat::Host(b("attn_k_b.weight")),
+                    v_b: Bat::Host(b("attn_v_b.weight")),
                     out: m("attn_output.weight"),
                     indexer: IndexerW {
                         attn_k: m("indexer.attn_k.weight"),

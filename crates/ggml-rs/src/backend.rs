@@ -412,6 +412,41 @@ pub trait Backend: Send + Sync + Debug + 'static {
         self.to_device(Tensor::from_vec(out, vec![seq, ff]))
     }
 
+    // VENDORED-LOCAL: GLM-5.3-Flash. A per-head stack of matvecs.
+    /// `y[i] = W[i] @ x[i]` for `i` in `0..b`: `w` is `[b, m, k]` row-major,
+    /// `x` is `[b, k]`, the result is `[b, m]`.
+    ///
+    /// Absorbed MLA needs exactly this twice per layer. `k_b` is
+    /// `[n_head, kv_lora, qk_head]` and turns each head's query into the latent
+    /// space; `v_b` is `[n_head, v_head, kv_lora]` and turns each head's context
+    /// back out of it. Both are the largest weights in the glm5next trunk --
+    /// 8.39 M values each -- and neither is a flat matrix, because `x` differs
+    /// per head. Doing them as `b` separate `linear` calls would pay `b` launch
+    /// latencies; doing them as one padded matmul would read `w` `b` times.
+    ///
+    /// The default runs on the host, summing each row in index order. CUDA
+    /// overrides it with a warp per output row, so its sums are reassociated and
+    /// agree only to f32 rounding -- the same trade every other reduction here
+    /// makes.
+    fn batched_gemv(&self, w: &Tensor, x: &Tensor, b: usize, m: usize, k: usize) -> Tensor {
+        let wh = self.to_host(w.clone());
+        let xh = self.to_host(x.clone());
+        let (wd, xd) = (wh.data(), xh.data());
+        debug_assert_eq!(wd.len(), b * m * k);
+        debug_assert_eq!(xd.len(), b * k);
+        let mut out = vec![0.0f32; b * m];
+        for i in 0..b {
+            let wi = &wd[i * m * k..(i + 1) * m * k];
+            let xi = &xd[i * k..(i + 1) * k];
+            let oi = &mut out[i * m..(i + 1) * m];
+            for (r, o) in oi.iter_mut().enumerate() {
+                let row = &wi[r * k..(r + 1) * k];
+                *o = row.iter().zip(xi).map(|(a, c)| a * c).sum();
+            }
+        }
+        self.to_device(Tensor::from_vec(out, vec![b, m]))
+    }
+
     fn silu_mul_split(&self, fused: &Tensor, ff: usize) -> Tensor {
         let seq = fused.dim(0);
         debug_assert_eq!(fused.dim(fused.rank() - 1), 2 * ff);

@@ -1373,6 +1373,27 @@ __global__ void swiglu_clamped_split_f32(const float* __restrict__ fused,
     out[s * ff + j] = a * b;
 }
 
+// VENDORED-LOCAL: GLM-5.3-Flash. One warp per output row of a batched GEMV:
+// w is [B, M, K] row-major, x is [B, K], y is [B, M]. Lanes stride K by 32 so
+// the reads of w coalesce, then reduce in the warp.
+__global__ void batched_gemv_f32(const float* __restrict__ w,
+                                 const float* __restrict__ x,
+                                 float* __restrict__ y,
+                                 int B, int M, int K) {
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int warps = blockDim.x >> 5;
+    const int b = blockIdx.y;
+    const int m = blockIdx.x * warps + warp;
+    if (b >= B || m >= M) return;
+    const float* wrow = w + ((size_t)b * M + m) * (size_t)K;
+    const float* xrow = x + (size_t)b * (size_t)K;
+    float acc = 0.0f;
+    for (int i = lane; i < K; i += 32) acc += wrow[i] * xrow[i];
+    for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffff, acc, off);
+    if (lane == 0) y[(size_t)b * (size_t)M + m] = acc;
+}
+
 __global__ void silu_mul_split_f32(const float* __restrict__ fused,
                                     float* __restrict__ out,
                                     int seq, int ff) {
@@ -2729,6 +2750,8 @@ pub const KERNEL_NAMES: &[&str] = &[
     // VENDORED-LOCAL: GLM-5.3-Flash.
     "swiglu_clamped_f32",
     "swiglu_clamped_split_f32",
+    // VENDORED-LOCAL: GLM-5.3-Flash.
+    "batched_gemv_f32",
     "gelu_approx_mul_split_f32",
     "tanh_inplace_f32",
     "gaussian_topk_inplace_f32",

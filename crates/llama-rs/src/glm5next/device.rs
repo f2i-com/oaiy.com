@@ -54,7 +54,7 @@ use gguf::GgufFile;
 use super::bridge::PartRef;
 use crate::expert_stream::{ExpertLayout, GgufExpertStore, LayerStream, StreamShared};
 use super::forward::{
-    self, AttnW, ExpertFfn, FfnW, HcW, IndexerW, KdaW, LayerW, Mat, MlaW, ModelW, MoeW, Shape,
+    self, AttnW, Bat, ExpertFfn, FfnW, HcW, IndexerW, KdaW, LayerW, Mat, MlaW, ModelW, MoeW, Shape,
 };
 use super::{Glm5NextConfig, LayerKind};
 use crate::config::ModelConfig;
@@ -251,9 +251,14 @@ pub struct DeviceModel {
     shape: Shape,
     /// Matrices, resident on the backend.
     w: BTreeMap<String, Weight>,
-    /// Vectors and the 3-D MLA absorb tensors, host f32: the stages index these
-    /// directly rather than multiplying by them.
+    /// Vectors, host f32: the stages index these directly rather than
+    /// multiplying by them.
     v: BTreeMap<String, Tensor>,
+    /// The 3-D absorbed-MLA weights, dense f32 on the backend. They are not flat
+    /// matrices -- each head takes its own input -- so they go through
+    /// [`Bat`] rather than [`Mat`]. 11 MLA layers x 2 x 33.6 MB is 739 MB of
+    /// VRAM, against the 61.7 ms a token they cost as host f32.
+    b3: BTreeMap<String, Tensor>,
     experts: StreamExperts,
 }
 
@@ -299,6 +304,7 @@ impl DeviceModel {
 
         let mut w: BTreeMap<String, Weight> = BTreeMap::new();
         let mut v: BTreeMap<String, Tensor> = BTreeMap::new();
+        let mut b3: BTreeMap<String, Tensor> = BTreeMap::new();
 
         // Leave a little headroom so a tight VRAM budget degrades to host
         // residency rather than failing the load.
@@ -311,6 +317,12 @@ impl DeviceModel {
         let mut vec_ = |name: String| -> Result<()> {
             let t = idx.take(&name, &[])?;
             v.insert(name, t);
+            Ok(())
+        };
+        // A 3-D absorb weight: dequantised once at load, then resident.
+        let mut bat_ = |name: String| -> Result<()> {
+            let t = idx.take(&name, &[])?;
+            b3.insert(name, backend.to_device(t));
             Ok(())
         };
 
@@ -376,13 +388,16 @@ impl DeviceModel {
                     ] {
                         mat(format!("blk.{il}.{s}"))?;
                     }
-                    // k_b / v_b are indexed per head by the absorb step, not
-                    // multiplied as a flat matrix, so they stay host f32.
+                    // k_b / v_b take a different input per head, so they are a
+                    // stack of matvecs rather than one matrix -- but they are
+                    // still multiplied by, and they are the trunk's largest
+                    // weights, so they belong on the backend.
+                    for s in ["attn_k_b.weight", "attn_v_b.weight"] {
+                        bat_(format!("blk.{il}.{s}"))?;
+                    }
                     for s in [
                         "attn_q_a_norm.weight",
                         "attn_kv_a_norm.weight",
-                        "attn_k_b.weight",
-                        "attn_v_b.weight",
                         "indexer.k_norm.weight",
                         "indexer.k_norm.bias",
                         "indexer_compressor_ape.weight",
@@ -421,7 +436,7 @@ impl DeviceModel {
         )?;
 
         let shape = super::bridge::shape_from(&cfg, &glm, max_len);
-        Ok(Self { shape, w, v, experts })
+        Ok(Self { shape, w, v, b3, experts })
     }
 
     pub fn shape(&self) -> &Shape {
@@ -438,6 +453,17 @@ impl DeviceModel {
             .get(name)
             .unwrap_or_else(|| panic!("device: vector {name} was not loaded"))
             .data()
+    }
+
+    fn bat_of(&self, name: &str) -> Bat<'_> {
+        let t = self
+            .b3
+            .get(name)
+            .unwrap_or_else(|| panic!("device: absorb tensor {name} was not loaded"));
+        Bat::Device {
+            t,
+            backend: &*self.experts.backend,
+        }
     }
 
     fn mat_of(&self, name: &str) -> Mat<'_> {
@@ -498,8 +524,8 @@ impl DeviceModel {
                     q_b: m("attn_q_b.weight"),
                     kv_a_mqa: m("attn_kv_a_mqa.weight"),
                     kv_a_norm: b("attn_kv_a_norm.weight"),
-                    k_b: b("attn_k_b.weight"),
-                    v_b: b("attn_v_b.weight"),
+                    k_b: self.bat_of(&format!("blk.{il}.attn_k_b.weight")),
+                    v_b: self.bat_of(&format!("blk.{il}.attn_v_b.weight")),
                     out: m("attn_output.weight"),
                     indexer: IndexerW {
                         attn_k: m("indexer.attn_k.weight"),

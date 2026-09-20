@@ -90,6 +90,102 @@ pub enum Mat<'a> {
     },
 }
 
+/// A per-head stack of matrices, `[b, m, k]`, applied as `b` independent
+/// matvecs: the [`Mat`] seam for a weight that is not one flat matrix.
+///
+/// Absorbed MLA has two of these per layer and they are the largest weights in
+/// the trunk: `k_b` is `[n_head, kv_lora, qk_head]`, `v_b` is
+/// `[n_head, v_head, kv_lora]`, 8.39 M values each at the released shapes.
+/// Profiling found them costing 61.7 ms of a 159.8 ms token, 39% of the trunk,
+/// purely because they were host f32 and every token read 739 MB of them
+/// through scalar code. On the device the same read is HBM.
+pub enum Bat<'a> {
+    Host(&'a [f32]),
+    Device {
+        /// A dense f32 `[b, m, k]` tensor on `backend`.
+        t: &'a Tensor,
+        backend: &'a dyn Backend,
+    },
+}
+
+impl Bat<'_> {
+    /// `out[i] = W[i] @ x[i]` for `i` in `0..b`.
+    pub fn apply(
+        &self,
+        x: &[f32],
+        b: usize,
+        m: usize,
+        k: usize,
+        out: &mut [f32],
+    ) -> Result<()> {
+        if x.len() != b * k || out.len() != b * m {
+            return Err(LlamaError::Config(format!(
+                "forward: batched gemv got x {} / out {}, expected {} / {} for [{b}, {m}, {k}]",
+                x.len(),
+                out.len(),
+                b * k,
+                b * m
+            )));
+        }
+        match self {
+            Bat::Host(w) => batched_gemv_host(w, x, b, m, k, out),
+            Bat::Device { t, backend } => {
+                if t.numel() != b * m * k {
+                    return Err(LlamaError::Config(format!(
+                        "forward: batched gemv weight has {} values, expected {} for [{b}, {m}, {k}]",
+                        t.numel(),
+                        b * m * k
+                    )));
+                }
+                let xd = backend.to_device(Tensor::from_vec(x.to_vec(), vec![b, k]));
+                let yd = backend.batched_gemv(t, &xd, b, m, k);
+                let yh = backend.to_host(yd);
+                let got = yh.data();
+                if got.len() != out.len() {
+                    return Err(LlamaError::Config(format!(
+                        "forward: batched gemv returned {} values, expected {}",
+                        got.len(),
+                        out.len()
+                    )));
+                }
+                out.copy_from_slice(got);
+                Ok(())
+            }
+        }
+    }
+}
+
+/// `out[i] = W[i] @ x[i]` on the host, each row summed in index order.
+///
+/// This is the oracle the CUDA kernel is checked against, and the arithmetic
+/// [`mla::absorb_query`](super::mla::absorb_query) has always done.
+pub(crate) fn batched_gemv_host(
+    w: &[f32],
+    x: &[f32],
+    b: usize,
+    m: usize,
+    k: usize,
+    out: &mut [f32],
+) -> Result<()> {
+    if w.len() != b * m * k {
+        return Err(LlamaError::Config(format!(
+            "forward: batched gemv weight is {} wide, expected {} for [{b}, {m}, {k}]",
+            w.len(),
+            b * m * k
+        )));
+    }
+    for i in 0..b {
+        let wi = &w[i * m * k..(i + 1) * m * k];
+        let xi = &x[i * k..(i + 1) * k];
+        let oi = &mut out[i * m..(i + 1) * m];
+        for (r, o) in oi.iter_mut().enumerate() {
+            let row = &wi[r * k..(r + 1) * k];
+            *o = row.iter().zip(xi).map(|(a, c)| a * c).sum();
+        }
+    }
+    Ok(())
+}
+
 impl Mat<'_> {
     /// `out = W @ x`, with `W` of `[out.len(), x.len()]`.
     pub fn apply(&self, x: &[f32], out: &mut [f32]) -> Result<()> {
@@ -310,9 +406,9 @@ pub struct MlaW<'a> {
     /// `[kv_lora]`
     pub kv_a_norm: &'a [f32],
     /// `[n_head, kv_lora, qk_head]`
-    pub k_b: &'a [f32],
+    pub k_b: Bat<'a>,
     /// `[n_head, v_head, kv_lora]`
-    pub v_b: &'a [f32],
+    pub v_b: Bat<'a>,
     /// `[n_embd, n_head * v_head]`
     pub out: Mat<'a>,
     pub indexer: IndexerW<'a>,
@@ -721,26 +817,31 @@ fn mla_layer(
     prof::add(&prof::MLA_PROJ, t);
     let t = std::time::Instant::now();
     let mut q_abs = vec![0.0f32; nh * sh.kv_lora];
-    mla::absorb_query(w.k_b, &q, nh, sh.kv_lora, sh.qk_head, &mut q_abs)?;
+    w.k_b
+        .apply(&q, nh, sh.kv_lora, sh.qk_head, &mut q_abs)?;
     prof::add(&prof::MLA_ABSORB, t);
 
     let mut mask = vec![0.0f32; len];
     mla::attn_mask(pos, len, r, selected.as_deref(), &mut mask)?;
 
+    // Softmax and the weighted sum stay on the host: they only touch the
+    // latents, which are at most `len * kv_lora`. The absorb back out of latent
+    // space is the expensive half, and it is a batched gemv.
     let t = std::time::Instant::now();
-    let mut attn = vec![0.0f32; nh * sh.v_head];
-    mla::attend(
+    let mut ctx = vec![0.0f32; nh * sh.kv_lora];
+    mla::attend_latent(
         &q_abs,
         &latents[..len * sh.kv_lora],
         &mask,
-        w.v_b,
         mla::kq_scale(sh.qk_head),
         nh,
         sh.kv_lora,
-        sh.v_head,
         len,
-        &mut attn,
+        &mut ctx,
     )?;
+    let mut attn = vec![0.0f32; nh * sh.v_head];
+    w.v_b
+        .apply(&ctx, nh, sh.v_head, sh.kv_lora, &mut attn)?;
     prof::add(&prof::MLA_ATTEND, t);
 
     w.out.apply(&attn, out)
@@ -1256,8 +1357,8 @@ mod tests {
                     q_b: mh(il, "q_b"),
                     kv_a_mqa: mh(il, "kv_a_mqa"),
                     kv_a_norm: g(il, "kv_a_norm"),
-                    k_b: g(il, "k_b"),
-                    v_b: g(il, "v_b"),
+                    k_b: Bat::Host(g(il, "k_b")),
+                    v_b: Bat::Host(g(il, "v_b")),
                     out: mh(il, "attn_out"),
                     indexer: IndexerW {
                         attn_k: mh(il, "idx_attn_k"),

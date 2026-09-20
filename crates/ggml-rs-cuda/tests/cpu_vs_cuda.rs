@@ -1394,6 +1394,70 @@ fn delta_net_step_prefill_seq_matches_cpu() {
 /// Both clamp orders, against the CPU backend. glm5next needs both: the text FFN
 /// clamps the activation, the vision tower clamps the pre-activation, and values
 /// astride the limit are where they disagree.
+/// VENDORED-LOCAL: GLM-5.3-Flash. The batched GEMV against the host default, at
+/// the released absorbed-MLA shapes and a few awkward ones.
+///
+/// `k_b` is `[64, 512, 256]` and `v_b` is `[64, 256, 512]`; the small cases check
+/// an `m` that is not a multiple of the 8 rows a block covers, and a `k` shorter
+/// than one warp.
+#[test]
+fn batched_gemv_matches_cpu() {
+    let Some(cuda) = try_cuda() else { return };
+    let host = CpuBackend::new();
+
+    for &(b, m, k) in &[
+        (64usize, 512usize, 256usize),
+        (64, 256, 512),
+        (3, 13, 7),
+        (1, 1, 1),
+        (5, 9, 32),
+    ] {
+        let w: Vec<f32> = (0..b * m * k)
+            .map(|i| (((i * 37) % 97) as f32 - 48.0) / 48.0)
+            .collect();
+        let x: Vec<f32> = (0..b * k)
+            .map(|i| (((i * 53) % 89) as f32 - 44.0) / 44.0)
+            .collect();
+
+        let wt = Tensor::from_vec(w, vec![b, m, k]);
+        let xt = Tensor::from_vec(x, vec![b, k]);
+
+        let want = host.to_host(host.batched_gemv(
+            &host.to_device(wt.clone()),
+            &host.to_device(xt.clone()),
+            b,
+            m,
+            k,
+        ));
+        let got = cuda.to_host(cuda.batched_gemv(
+            &cuda.to_device(wt),
+            &cuda.to_device(xt),
+            b,
+            m,
+            k,
+        ));
+        assert_eq!(want.data().len(), b * m);
+        assert_eq!(got.data().len(), b * m);
+
+        let scale = want
+            .data()
+            .iter()
+            .fold(0.0f32, |a, v| a.max(v.abs()))
+            .max(1.0);
+        for (i, (p, q)) in want.data().iter().zip(got.data()).enumerate() {
+            assert!(
+                (p - q).abs() <= 2e-5 * scale,
+                "[{b},{m},{k}] row {i}: host {p} vs cuda {q}"
+            );
+        }
+        // and not trivially zero
+        assert!(
+            want.data().iter().any(|v| v.abs() > 1e-3),
+            "[{b},{m},{k}] all zero"
+        );
+    }
+}
+
 #[test]
 fn swiglu_clamped_matches_cpu() {
     let Some(cuda) = try_cuda() else { return };

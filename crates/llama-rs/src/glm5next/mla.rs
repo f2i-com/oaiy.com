@@ -214,6 +214,110 @@ pub fn attn_mask(
 /// * `out` — `[n_head * v_head]`, the concatenated per-head outputs, ready for
 ///   `wo`.
 #[allow(clippy::too_many_arguments)]
+/// The latent-space context of absorbed MLA: scores, softmax, weighted sum.
+///
+/// This is [`attend`] without its last step. `out` is `[n_head, kv_lora]`, still
+/// in latent space; the caller absorbs `v_b` to get back to `v_head`, which is a
+/// batched gemv and belongs on the device.
+///
+/// A head with nothing visible writes zeros, which is what [`attend`] does by
+/// filling its output and skipping the absorb -- `v_b @ 0` is `0` either way.
+#[allow(clippy::too_many_arguments)]
+pub fn attend_latent(
+    q_abs: &[f32],
+    latents: &[f32],
+    mask: &[f32],
+    scale: f32,
+    n_head: usize,
+    kv_lora: usize,
+    len: usize,
+    out: &mut [f32],
+) -> Result<()> {
+    if n_head == 0 || kv_lora == 0 {
+        return Err(LlamaError::Config(
+            "mla: n_head and kv_lora must be > 0".into(),
+        ));
+    }
+    if q_abs.len() != n_head * kv_lora {
+        return Err(LlamaError::Config(format!(
+            "mla: q_abs is {} wide, expected n_head*kv_lora = {}",
+            q_abs.len(),
+            n_head * kv_lora
+        )));
+    }
+    if latents.len() < len * kv_lora {
+        return Err(LlamaError::Config(format!(
+            "mla: latents is {} wide, need len*kv_lora = {}",
+            latents.len(),
+            len * kv_lora
+        )));
+    }
+    if mask.len() < len {
+        return Err(LlamaError::Config(format!(
+            "mla: mask is {} wide, need len = {len}",
+            mask.len()
+        )));
+    }
+    if out.len() != n_head * kv_lora {
+        return Err(LlamaError::Config(format!(
+            "mla: out is {} wide, expected n_head*kv_lora = {}",
+            out.len(),
+            n_head * kv_lora
+        )));
+    }
+
+    let mut p = vec![0.0f32; len];
+
+    for h in 0..n_head {
+        let qh = &q_abs[h * kv_lora..(h + 1) * kv_lora];
+        let ctx = &mut out[h * kv_lora..(h + 1) * kv_lora];
+        ctx.fill(0.0);
+
+        // Scores against the single head of latent keys (absorbed MLA is MQA).
+        let mut max = f32::NEG_INFINITY;
+        for t in 0..len {
+            let m = mask[t];
+            // Any non-finite entry counts as masked. Catching +inf and NaN here
+            // too keeps `exp(s - max)` from becoming NaN on a malformed mask.
+            if !m.is_finite() {
+                p[t] = f32::NEG_INFINITY;
+                continue;
+            }
+            let row = &latents[t * kv_lora..(t + 1) * kv_lora];
+            let s = qh.iter().zip(row).map(|(a, b)| a * b).sum::<f32>() * scale + m;
+            p[t] = s;
+            if s > max {
+                max = s;
+            }
+        }
+
+        // A query with nothing visible contributes nothing rather than NaNs.
+        if !max.is_finite() {
+            continue;
+        }
+
+        let mut sum = 0.0f32;
+        for s in p.iter_mut() {
+            *s = if s.is_finite() { (*s - max).exp() } else { 0.0 };
+            sum += *s;
+        }
+        let inv = 1.0 / sum;
+
+        // V is the same latent row as K, so the context is in latent space.
+        for t in 0..len {
+            let w = p[t] * inv;
+            if w == 0.0 {
+                continue;
+            }
+            let row = &latents[t * kv_lora..(t + 1) * kv_lora];
+            for (c, &r) in ctx.iter_mut().zip(row) {
+                *c += w * r;
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn attend(
     q_abs: &[f32],
     latents: &[f32],
@@ -330,6 +434,86 @@ pub fn attend(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The split must be exact, not merely close.
+    ///
+    /// `mla_layer` no longer calls [`attend`]: it calls [`attend_latent`] and
+    /// then absorbs `v_b` as a batched gemv, because that half is 33.6 MB a layer
+    /// and belongs on the device. `attend` stays as the oracle, so this is the
+    /// test that says the two compose back into it -- bit for bit, since both
+    /// sum the same products in the same order.
+    #[test]
+    fn attend_latent_then_absorb_is_attend() {
+        let (nh, kv, vh) = (5usize, 7usize, 3usize);
+        for &len in &[1usize, 2, 6] {
+            let q: Vec<f32> = (0..nh * kv)
+                .map(|i| (((i * 31) % 47) as f32 - 23.0) / 23.0)
+                .collect();
+            let lat: Vec<f32> = (0..len * kv)
+                .map(|i| (((i * 17) % 41) as f32 - 20.0) / 20.0)
+                .collect();
+            let vb: Vec<f32> = (0..nh * vh * kv)
+                .map(|i| (((i * 13) % 53) as f32 - 26.0) / 26.0)
+                .collect();
+
+            // three masks: dense, one position masked out, and a head with
+            // nothing visible at all (the branch that used to short-circuit)
+            for case in 0..3 {
+                let mask: Vec<f32> = (0..len)
+                    .map(|t| match case {
+                        0 => 0.0,
+                        1 if t == 0 && len > 1 => f32::NEG_INFINITY,
+                        1 => 0.0,
+                        _ => f32::NEG_INFINITY,
+                    })
+                    .collect();
+
+                let mut want = vec![0.0f32; nh * vh];
+                attend(
+                    &q, &lat, &mask, &vb, 0.25, nh, kv, vh, len, &mut want,
+                )
+                .expect("attend");
+
+                let mut ctx = vec![0.0f32; nh * kv];
+                attend_latent(&q, &lat, &mask, 0.25, nh, kv, len, &mut ctx)
+                    .expect("attend_latent");
+                let mut got = vec![0.0f32; nh * vh];
+                crate::glm5next::forward::batched_gemv_host(&vb, &ctx, nh, vh, kv, &mut got)
+                    .expect("absorb");
+
+                assert_eq!(
+                    want, got,
+                    "len {len}, mask case {case}: the split is not bit-identical"
+                );
+            }
+            // and the dense case is not trivially zero
+            let mask = vec![0.0f32; len];
+            let mut want = vec![0.0f32; nh * vh];
+            attend(&q, &lat, &mask, &vb, 0.25, nh, kv, vh, len, &mut want).expect("attend");
+            assert!(want.iter().any(|v| v.abs() > 1e-6), "len {len}: all zero");
+        }
+    }
+
+    /// [`absorb_query`] and the batched gemv are the same operation, so the
+    /// device path through `Bat` is the same arithmetic the reference had.
+    #[test]
+    fn absorb_query_is_a_batched_gemv() {
+        let (nh, kv, qk) = (6usize, 5usize, 4usize);
+        let wk: Vec<f32> = (0..nh * kv * qk)
+            .map(|i| (((i * 29) % 43) as f32 - 21.0) / 21.0)
+            .collect();
+        let q: Vec<f32> = (0..nh * qk)
+            .map(|i| (((i * 19) % 37) as f32 - 18.0) / 18.0)
+            .collect();
+
+        let mut want = vec![0.0f32; nh * kv];
+        absorb_query(&wk, &q, nh, kv, qk, &mut want).expect("absorb_query");
+        let mut got = vec![0.0f32; nh * kv];
+        crate::glm5next::forward::batched_gemv_host(&wk, &q, nh, kv, qk, &mut got)
+            .expect("batched_gemv_host");
+        assert_eq!(want, got);
+        assert!(want.iter().any(|v| v.abs() > 1e-6));
+    }
 
     /// The scale is over the MLA head size, not the absorbed latent width.
     #[test]

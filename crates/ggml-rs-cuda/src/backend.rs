@@ -1083,6 +1083,36 @@ impl Backend for CudaBackend {
         self.make_tensor(out, vec![seq, ff])
     }
 
+    // VENDORED-LOCAL: GLM-5.3-Flash. A per-head stack of matvecs.
+    fn batched_gemv(&self, w: &Tensor, x: &Tensor, b: usize, m: usize, k: usize) -> Tensor {
+        let w_in = self.cuda_input(w);
+        let x_in = self.cuda_input(x);
+        let mut out = self.alloc(b * m);
+
+        // 256 threads is 8 warps, so one block covers 8 output rows.
+        const BLOCK: u32 = 256;
+        let warps = BLOCK / 32;
+        let cfg = LaunchConfig {
+            grid_dim: ((m as u32).div_ceil(warps), b as u32, 1),
+            block_dim: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let (bi, mi, ki) = (b as i32, m as i32, k as i32);
+        unsafe {
+            self.stream
+                .launch_builder(self.func("batched_gemv_f32"))
+                .arg(w_in.as_ref())
+                .arg(x_in.as_ref())
+                .arg(&mut out)
+                .arg(&bi)
+                .arg(&mi)
+                .arg(&ki)
+                .launch(cfg)
+                .expect("batched_gemv launch");
+        }
+        self.make_tensor(out, vec![b, m])
+    }
+
     fn silu_mul_split(&self, fused: &Tensor, ff: usize) -> Tensor {
         let seq = fused.dim(0);
         debug_assert_eq!(fused.dim(fused.rank() - 1), 2 * ff);
