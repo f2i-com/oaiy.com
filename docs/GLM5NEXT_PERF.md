@@ -91,7 +91,7 @@ way down.
 ```
                        +---- hot experts ---------> VRAM, both cards
                        |
-SSD -> phase-aware ----+---- CPU AVX-512 execution        (not built)
+SSD -> phase-aware ----+---- CPU AVX-512 execution        (built)
        RAM cache       |
                        +---- pinned H2D staging --> GPU
 ```
@@ -190,7 +190,7 @@ The budget sizes itself from `ggml_rs_cuda::host_memory()` (the companion to
 `vram_status`): everything free except `RAM_RESERVE = 24 GB`, capped at the expert
 bytes. On this machine, 161 GB — 9,845 of 12,096 records, **81%**.
 
-### 2.3 Tier 2 — CPU execution: not built, and why
+### 2.3 Tier 2 — CPU execution, AVX-512
 
 From `dsv41/src/cpu_experts.rs`:
 
@@ -202,20 +202,54 @@ the GPU works on the layer's resident experts. `dsv41-cuda/src/model.rs` caps
 uploads at `PROMOTE_PER_LAYER = 1`, admits that one only if `worth_admitting` says
 it beats the LFRU victim, and launches the CPU job **before** the GPU work.
 
-glm5next cannot do this yet. One record on the host today
-(`measure_host_record_cost`, 14.16 MB, 25.2 M weights, single thread):
+This is built. Getting there took three steps, and the first measurement is why
+the tier looked impossible:
 
-    dequantise      3.23 ms   (4.4 GB/s in)
-    three matvecs   8.77 ms
-    total          12.00 ms
+    one record on the host, the old way (14.16 MB, 25.2 M weights, one thread)
+      dequantise      3.23 ms
+      three matvecs   8.77 ms
+      total          12.00 ms
 
-The arithmetic is not the problem — the f32 detour is. Dequantising writes 101 MB
-that the matvecs read back, so **202 MB of DRAM traffic sets a ~2.5 ms floor per
-record whatever the thread count**. Against a 1.3 ms PCIe upload, the CPU *loses*.
-A fused Q4_K dot touches 14.16 MB once: ~0.18 ms at 80 GB/s. That is the kernel
-DeepSeek has (`avx512::fp4_rows`, a safe `#[target_feature]` function, bit-identical
-to the portable path); `ggml-quants` has only `dequantize`. **Porting
-`vec_dot_q4_K_q8_K` gates this tier**, and the 9950X3D has the AVX-512 for it.
+The arithmetic was never the problem — the f32 detour was. Dequantising writes
+101 MB that the matvecs read straight back, so 202 MB of DRAM traffic per record set
+a ~2.5 ms floor whatever the thread count, against 1.12 ms to upload it. The CPU
+lost.
+
+**1. Fused, scalar, bit-identical.** `q4_k::dot_rows` and `q6_k::dot_rows` never
+materialise the f32. Each row accumulates in exactly the order `dequantize` writes
+and a sequential dot then reads, so they are bit-identical to the path they replace
+— `assert_eq!` on the bits, not a tolerance, because a routed expert's output is
+summed with experts computed on the GPU. Q6_K needed care: it writes a block out of
+order, so index-order summation means four passes over the same 32 bytes.
+
+Only 1.3x, though: the strict order is exactly what stops it vectorising, and it is
+compute-bound at ~1.85 cycles a weight.
+
+**2. AVX-512.** Sixteen lanes along the reduction, four accumulator chains (an FMA
+has ~4 cycles of latency and two issue per cycle), nibbles widened by
+`cvtepu8_epi32`, the sub-block min folded into the first FMA.
+
+    one projection, [2048, 4096] Q4_K, 4.72 MB, one thread
+      scalar fused    3.46 ms   ( 1.36 GB/s)
+      AVX-512         0.46 ms   (10.28 GB/s)   7.5x
+    ffn_down [4096, 2048] Q6_K
+      AVX-512         0.56 ms   (12.38 GB/s)   9.0x
+
+This one reassociates, deliberately: partials are combined in a written-down order
+so it is deterministic, but it is not the scalar result. Measured difference 5e-8 of
+`sum |w x|` — f32 unit roundoff, and better conditioned than the oracle it is
+compared against. The bit-identical alternative puts the lanes across *rows*, which
+needs a 16x32 byte transpose per sub-block; `dsv41`'s MXFP4 kernel took that route
+and it is more work.
+
+**3. Rows, not records.** The first dispatch mapped over records and halved the PCIe
+traffic without moving the token at all: a layer sends two to four records to the
+CPU, so that used two to four of 32 threads. Splitting the output rows gives every
+record the whole pool.
+
+Measured on the real model (`cpu_tier_agrees_with_the_gpu`, small VRAM budget so
+experts actually miss): **1 136 records, 0.53 ms each, 26.7 GB/s aggregate**, and
+logits within 7e-6 absolute of the GPU-only run at a scale of 14 — 5e-7 relative.
 
 ### 2.4 Tier 3 — SSD, and pinned staging
 
@@ -297,6 +331,29 @@ Correctness, unchanged throughout: host vs CUDA is 2e-5 over 154,880 logits at
 scale 30, one card vs two cards is **exact**, and 128 sampled tokens come out with
 72 distinct.
 
+### 3.1 The warm token at a real context length
+
+Every trunk number above is measured at a context of 8 tokens, which understates one
+phase badly. Profiling a warm decode after a 192-token prefill:
+
+| phase | at len 8 | at len ~200 |
+|---|---:|---:|
+| hyper-connections | 6.4 ms | 6.4 ms |
+| KDA attention | 34.0 ms | 32.6 ms |
+| **MLA attention** | **10.4 ms** | **37.6 ms** |
+| **FFN (router, shared, routed)** | **9.4 ms** | **62.6 ms** |
+| output head | 0.6 ms | 0.6 ms |
+| total | — | **139.8 ms** |
+
+**MLA attention scales with context** and nothing else here does. `attend_latent` is
+a host loop of `n_head * len * kv_lora` — at len 200 that is 72 M MACs a token over
+11 layers, which is the 27 ms it gained. It is the only item on this list that gets
+*worse* as the prompt grows, which on a 1 M-context model matters more than its
+current size.
+
+The FFN's jump is the routed experts appearing (the trunk measurement stubs them to
+zero), and at a 96% VRAM hit rate that ~50 ms is launch overhead rather than bytes.
+
 ## 4. The budget, and what is next
 
     50 ms  =  trunk (<= 20 ms)  +  experts (<= 30 ms)
@@ -315,17 +372,18 @@ Ranked by measured milliseconds per unit of work:
    and depthwise conv into kernels (12.6 ms together).
 4. **`set_scan_layer` during prefill.** One hook, already built; it is what stops
    a prefill evicting the records it is about to need.
-5. **Port `vec_dot_q4_K_q8_K` to `ggml-quants`, AVX-512.** Gates the CPU tier, and
-   removes the f32 detour from every host path. This is what the remaining 380 GB
-   of uploads needs, because these cards are in **x4 and x8 slots** (of 16) —
-   nvidia-smi `pcie.link.width.current` — the same narrow-link situation
-   `dsv41/src/cpu_experts.rs` was written against. At those widths a 16.32 MB
-   upload is ~2.3 ms and the same record on 32 Zen 5 threads with a fused dot
-   should be ~0.2-0.5 ms.
+5. ~~Port the AVX-512 Q4_K dot~~ — **done**, see §2.3. It halved the cold pass's
+   PCIe traffic (380 → 179 GB) and cut evictions from 22 004 to 8 692, and it is
+   what stops a cold start or a topic change from being upload-bound. It is *not* a
+   warm-decode speedup, because once warm the VRAM tier serves ~96% of the route and
+   the tier only sees 3.1 records a token.
 6. **Use the grouped-MoE kernels already in `ggml-rs-cuda/src/moe.rs`** instead of
-   looping eight experts in Rust. The missing piece is glm5next's clamped SwiGLU
-   semantics in the grouped gate/up kernel; routing can stay on the host and upload
-   only 8 ids and 8 weights.
+   looping eight experts in Rust. This is now the largest single item: the routed
+   experts cost ~50 ms of a warm token at a 96% hit rate, which is ~150 us a
+   dispatch for three or four launches over weights already in VRAM — launch
+   overhead, not bandwidth. ~3 launches a layer instead of ~32. The missing piece is
+   glm5next's clamped SwiGLU in the grouped gate/up kernel; routing can stay on the
+   host and upload only 8 ids and 8 weights.
 7. **A usage profile saved across runs** (`save_usage`/`warm`), so a fresh process
    does not start cold — DeepSeek's first answer is 2-6 tok/s and its third is 29.
 8. **Balance the layer split on measured cost**, not slots: card 1 is still 10
