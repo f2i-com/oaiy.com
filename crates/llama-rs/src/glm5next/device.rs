@@ -717,6 +717,146 @@ impl ExpertFfn for StreamExperts {
     /// per-expert path below did `n_expert_used` uploads and the same number of
     /// synchronising reads; at 32 us a round trip and 336 dispatches a token,
     /// that was ~21 ms of pure latency.
+    // VENDORED-LOCAL: GLM-5.3-Flash. A chunk of tokens, one read an expert.
+    /// The routed half of one MoE layer for several tokens at once.
+    ///
+    /// Per token this layer costs ~1.2 ms and almost none of it is arithmetic: the
+    /// promoted records' pinned copies, the PCIe the compute stream waits on, the
+    /// CPU tier. Every one of those is paid **per distinct expert**, so the point of
+    /// a chunk is that its tokens share them. Eight experts over 64 tokens is 512
+    /// resolutions where the union is nearer 200, and each of those 200 reads its
+    /// weights once and applies them to every token that chose it -- a small GEMM
+    /// rather than one GEMV a token.
+    ///
+    /// The route weights are applied on the way out, per (expert, token), because
+    /// the same expert carries a different weight for each token that picked it.
+    fn apply_batch(
+        &self,
+        ord: usize,
+        routes: &[Vec<(u32, f32)>],
+        xs: &[f32],
+        n_embd: usize,
+        limit: f32,
+        outs: &mut [f32],
+    ) -> Result<()> {
+        let n = routes.len();
+        if n * n_embd != xs.len() || xs.len() != outs.len() || n_embd != self.n_embd {
+            return Err(LlamaError::Config(format!(
+                "device: expert batch has {} routes, {} inputs, {} outputs at n_embd \
+                 {n_embd} (model {})",
+                n,
+                xs.len(),
+                outs.len(),
+                self.n_embd
+            )));
+        }
+        // One token is decode, and the per-token path is better at it: it overlaps
+        // the CPU tier with the GPU and runs the whole route through one grouped
+        // kernel, neither of which a chunk of one would gain anything from.
+        if n == 1 {
+            return self.apply_layer(ord, &routes[0], xs, limit, outs);
+        }
+        let ls = self.layer(ord)?;
+
+        // The union of the chunk's routes, and for each of them the tokens that
+        // chose it with the weight each gave it.
+        let mut distinct: Vec<u32> = routes.iter().flatten().map(|&(e, _)| e).collect();
+        distinct.sort_unstable();
+        distinct.dedup();
+        let mut users: Vec<Vec<(usize, f32)>> = vec![Vec::new(); distinct.len()];
+        for (t, route) in routes.iter().enumerate() {
+            for &(e, wt) in route {
+                match distinct.binary_search(&e) {
+                    Ok(i) => users[i].push((t, wt)),
+                    Err(_) => {
+                        return Err(LlamaError::Config(format!(
+                            "device: expert {e} of layer {ord} vanished from the union"
+                        )))
+                    }
+                }
+            }
+        }
+
+        // One resolve for the chunk: this is what is being amortised.
+        let t_resolve = std::time::Instant::now();
+        let resolved = match &self.cpu {
+            Some(_) => ls.resolve_experts_hybrid(&distinct, promote_per_layer()),
+            None => ls.resolve_experts(&distinct),
+        }
+        .map_err(|err| LlamaError::Config(format!("device: MoE layer {ord}: {err}")))?;
+        crate::glm5next::forward::prof::add(&crate::glm5next::forward::prof::FFN_RESOLVE, t_resolve);
+
+        let t_dispatch = std::time::Instant::now();
+        outs.fill(0.0);
+        let be = self.card(ord);
+
+        // The GPU half: one expert, one gather, one pass, one scatter.
+        let mut gathered: Vec<f32> = Vec::with_capacity(n * n_embd);
+        for (i, r) in resolved.iter().enumerate() {
+            let toks = &users[i];
+            if toks.is_empty() {
+                continue;
+            }
+            let Some((pair, down)) = r.gpu() else { continue };
+            gathered.clear();
+            for &(t, _) in toks {
+                gathered.extend_from_slice(&xs[t * n_embd..(t + 1) * n_embd]);
+            }
+            let xg = be.to_device(Tensor::from_vec(gathered.clone(), vec![toks.len(), n_embd]));
+            // Both of these take a [rows, k] input and give a [rows, m] result:
+            // `swiglu_clamped_split` reads the row count off the tensor.
+            let h = pair.swiglu_clamped(be, &xg, limit, true);
+            let o = down.linear(be, &h);
+            let oh = be.to_host(o);
+            let d = oh.data();
+            if d.len() != toks.len() * n_embd {
+                return Err(LlamaError::Config(format!(
+                    "device: expert {} of layer {ord} returned {} values for {} tokens",
+                    distinct[i],
+                    d.len(),
+                    toks.len()
+                )));
+            }
+            for (row, &(t, wt)) in toks.iter().enumerate() {
+                let src = &d[row * n_embd..(row + 1) * n_embd];
+                for (acc, &v) in outs[t * n_embd..(t + 1) * n_embd].iter_mut().zip(src) {
+                    *acc += wt * v;
+                }
+            }
+        }
+
+        // The CPU half, grouped by token because `CpuExperts::run` takes one `x` for
+        // the jobs it is given. The leases are already held, so nothing is re-read.
+        if let Some(cpu) = &self.cpu {
+            let layout = self.shared.layout();
+            for t in 0..n {
+                let jobs: Vec<CpuJob> = resolved
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, r)| {
+                        let lease = r.cpu_lease()?;
+                        let wt = users[i].iter().find(|&&(tt, _)| tt == t).map(|&(_, w)| w)?;
+                        Some(CpuJob { lease: lease.clone(), weight: wt, slot: i })
+                    })
+                    .collect();
+                if jobs.is_empty() {
+                    continue;
+                }
+                let done = cpu.run(&jobs, layout, ord, &xs[t * n_embd..(t + 1) * n_embd], limit, n_embd)?;
+                for (_, wt, o) in done {
+                    for (acc, &v) in outs[t * n_embd..(t + 1) * n_embd].iter_mut().zip(o.iter()) {
+                        *acc += wt * v;
+                    }
+                }
+            }
+        }
+        crate::glm5next::forward::prof::add(
+            &crate::glm5next::forward::prof::FFN_DISPATCH,
+            t_dispatch,
+        );
+        Ok(())
+    }
+
     fn apply_layer(
         &self,
         ord: usize,
@@ -3050,6 +3190,72 @@ children attend school instead.";
                 .0
         };
         assert_eq!(top(&a), top(&b), "the two paths pick different tokens");
+    }
+
+    /// A batched prefill chunk against the one-token loop, on the real weights.
+    ///
+    /// This is the correctness gate on `forward_chunk` plus `apply_batch`. The
+    /// scaffolding has a bit-identical synthetic test; this one covers what the
+    /// device path does differently: a chunk resolves the union of its routes once
+    /// and runs each expert over the several tokens that chose it as one small GEMM,
+    /// where the per-token path runs a route through the grouped kernel a token at a
+    /// time. Different shapes reassociate differently, so the bar is the same 1e-4
+    /// absolute at a logit scale of ~15 the other gates use.
+    ///
+    /// The last token's logits are what a prompt is for, so they are what is
+    /// compared -- and they depend on every token before them through the KDA
+    /// recurrence and the MLA cache, which makes this a check on the whole chunk
+    /// rather than on one position.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "needs the released model on disk"]
+    fn a_prefill_chunk_agrees_with_the_one_token_loop() {
+        // Long enough that a chunk has several tokens sharing experts, short enough
+        // to load twice in a test.
+        let prompt = [154822u32, 6172, 1043, 9001, 271, 3025, 18, 6172, 1043, 9001];
+
+        let m = match DeviceModel::open_tiered(RELEASED, 512, 1, 24 << 30, 8 << 30) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("tiered open failed ({e}); skipping");
+                return;
+            }
+        };
+        let sh = m.shape().clone();
+        let w = m.view();
+
+        // SAFETY: single-threaded test.
+        unsafe { std::env::set_var("GLM5_PREFILL_CHUNK", "1") };
+        let mut one = forward::State::new_on(&sh, m.backend()).expect("state");
+        let seq = forward::forward_prompt(&sh, &w, &mut one, &prompt).expect("one at a time");
+
+        unsafe { std::env::remove_var("GLM5_PREFILL_CHUNK") };
+        let mut many = forward::State::new_on(&sh, m.backend()).expect("state");
+        let bat = forward::forward_chunk(&sh, &w, &mut many, &prompt).expect("chunk");
+
+        assert_eq!(one.len, many.len, "the two paths left different positions");
+        assert_eq!(seq.len(), bat.len());
+        let scale = seq.iter().fold(0.0f32, |acc, v| acc.max(v.abs())).max(1.0);
+        let mut worst = 0.0f32;
+        for (p, q) in seq.iter().zip(bat.iter()) {
+            worst = worst.max((p - q).abs());
+        }
+        println!(
+            "max |one at a time - chunk of {}| over {} logits: {worst:.6} (scale {scale:.3})",
+            prompt.len(),
+            seq.len()
+        );
+        assert!(worst <= 1e-4 * scale, "a prefill chunk diverges: {worst} at scale {scale}");
+        assert!(seq.iter().any(|v| v.abs() > 1e-3), "logits are all zero");
+
+        // The same token wins, which is what decides the reply.
+        let top = |v: &[f32]| {
+            v.iter()
+                .enumerate()
+                .fold((0usize, f32::NEG_INFINITY), |m, (i, &x)| if x > m.1 { (i, x) } else { m })
+                .0
+        };
+        assert_eq!(top(&seq), top(&bat), "the two paths pick different tokens");
     }
 
     /// Spreading the expert tier over two cards must not change the answer.

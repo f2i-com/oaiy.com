@@ -1129,9 +1129,26 @@ impl Glm5NextModel {
             )));
         }
 
+        // VENDORED-LOCAL: GLM-5.3-Flash. A prompt goes through in chunks.
+        //
+        // One token at a time, a prompt costs what a generated token costs -- about
+        // 100 ms here -- because each one reads all eight routed experts of all 42
+        // MoE layers for itself. A coder-cli system prompt of a few thousand tokens
+        // is then minutes before the first reply, which is what this fixes:
+        // `forward_chunk` walks the layers once for a chunk and its tokens share
+        // each expert read. The attention inside still runs token by token, in
+        // order, because KDA is a recurrence.
+        //
+        // A single token takes the one-token path: it has nothing to share, and that
+        // path overlaps the CPU tier with the GPU and runs a route through one
+        // grouped kernel. GLM5_PREFILL_CHUNK=1 makes every prompt take it too.
         let mut logits = Vec::new();
-        for &t in tokens {
-            logits = forward::forward_token(sh, &w, &mut st, t)?;
+        if tokens.len() == 1 {
+            logits = forward::forward_token(sh, &w, &mut st, tokens[0])?;
+        } else {
+            for part in tokens.chunks(forward::prefill_chunk()) {
+                logits = forward::forward_chunk(sh, &w, &mut st, part)?;
+            }
         }
         // And report the position back, so a caller watching `kv.len` for its context
         // limit sees the truth rather than a cache that never fills.
