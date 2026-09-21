@@ -210,6 +210,27 @@ pub enum Pair<'a> {
 }
 
 impl Pair<'_> {
+    /// The backend this pair lives on, or `None` for host weights.
+    ///
+    /// `Split` answers `None` even on a device: it exists because the host oracle
+    /// holds its halves separately, and concatenating two device results to make
+    /// the fused layout back would cost more than the hop it saves. Every
+    /// device-side pair in this model is `Fused` -- see the type's own note.
+    pub fn device(&self) -> Option<&dyn Backend> {
+        match self {
+            Self::Fused(m) => m.device(),
+            Self::Split(..) => None,
+        }
+    }
+
+    /// The two results as one device tensor, `[.., 2 * split]`, left on the card.
+    pub fn linear_dev(&self, xd: &Tensor) -> Option<Tensor> {
+        match self {
+            Self::Fused(m) => m.linear_dev(xd),
+            Self::Split(..) => None,
+        }
+    }
+
     /// `out` is the two results end to end, the first `split` values then the rest.
     pub fn apply(&self, x: &[f32], split: usize, out: &mut [f32]) -> Result<()> {
         if split > out.len() {
@@ -230,6 +251,35 @@ impl Pair<'_> {
 }
 
 impl Mat<'_> {
+    // VENDORED-LOCAL: PERF. The device-resident seam.
+    //
+    // `apply` below is upload, launch, download-and-synchronise. Measured, a token
+    // makes 1319 of those round trips at 29.2 us each -- 38.5 ms of a 114 ms token
+    // -- while the cards sit at 2-18% busy with their memory controllers at 0-6%.
+    // The maths they exist for is 2.3 ms of that token.
+    //
+    // These two let a caller that has its input on the card already keep the result
+    // there, so a chain of projections is a chain of launches rather than a
+    // stop-start per link. `None` means this weight is host f32 (the
+    // `bridge::HostModel` oracle), and the caller keeps the host path -- which is
+    // also what makes that oracle still an oracle.
+
+    /// The backend this weight lives on, or `None` for a host weight.
+    pub fn device(&self) -> Option<&dyn Backend> {
+        match self {
+            Mat::Host(_) => None,
+            Mat::Device { backend, .. } => Some(*backend),
+        }
+    }
+
+    /// `W @ x` with `x` already on this weight's device, result left there.
+    pub fn linear_dev(&self, xd: &Tensor) -> Option<Tensor> {
+        match self {
+            Mat::Host(_) => None,
+            Mat::Device { w, backend } => Some(w.linear(*backend, xd)),
+        }
+    }
+
     /// `out = W @ x`, with `W` of `[out.len(), x.len()]`.
     pub fn apply(&self, x: &[f32], out: &mut [f32]) -> Result<()> {
         match self {
@@ -1027,6 +1077,96 @@ fn mla_layer(
 }
 
 /// The FFN half of a layer: a plain clamped SwiGLU on the leading dense blocks,
+/// VENDORED-LOCAL: PERF. One MoE layer with the activations kept on the card.
+///
+/// The host arm of [`ffn_layer`] costs eight round trips a layer: the router, the
+/// routed experts, the shared expert's two halves, and a host-side SwiGLU between
+/// them, each an upload, a launch and a synchronising download. This costs three,
+/// and two of those are inside the expert tier's own seam.
+///
+/// What is left is one genuine hop: the 288 router logits. Picking the top eight
+/// with a bias, a normalisation and a scale is a host decision, and the expert
+/// cache is indexed on the host, so the ids have to exist here. That is the floor
+/// for this layer, not an omission.
+///
+/// The shared expert never touches the host: gate||up, the clamped SwiGLU
+/// (`swiglu_clamped_split`, which CUDA does in one kernel) and down chain on the
+/// card. Its result is added unscaled, because `expert_weights_scale` applies to
+/// the routed weights only.
+fn ffn_moe_device(
+    sh: &Shape,
+    m: &MoeW<'_>,
+    il: usize,
+    be: &dyn Backend,
+    x: &[f32],
+    out: &mut [f32],
+) -> Result<()> {
+    // One upload for the layer: the router and the shared expert read the same x.
+    let xd = be.to_device(Tensor::from_vec(x.to_vec(), vec![1, sh.n_embd]));
+
+    let t_router = std::time::Instant::now();
+    let logits_d = m
+        .router
+        .linear_dev(&xd)
+        .ok_or_else(|| LlamaError::Config("forward: device router lost its device".into()))?;
+    let logits_h = be.to_host(logits_d);
+    if logits_h.numel() != sh.n_expert {
+        return Err(LlamaError::Config(format!(
+            "forward: router produced {} logits, expected {}",
+            logits_h.numel(),
+            sh.n_expert
+        )));
+    }
+    let (ids, weights) = routing::route_token(
+        logits_h.data(),
+        Some(m.probs_b),
+        sh.n_expert_used,
+        sh.expert_weights_norm,
+        sh.expert_weights_scale,
+    );
+    prof::add(&prof::FFN_ROUTER, t_router);
+
+    // The routed experts keep the host seam: it is where the three tiers live, and
+    // a miss may be computed on the CPU from a record in RAM.
+    let t_routed = std::time::Instant::now();
+    let route: Vec<(u32, f32)> = ids.iter().copied().zip(weights.iter().copied()).collect();
+    m.experts
+        .apply_layer(m.ord, &route, x, sh.swiglu_clamp_exp[il], out)?;
+    prof::add(&prof::FFN_ROUTED, t_routed);
+
+    let t_shared = std::time::Instant::now();
+    let sff = sh.n_ff_shexp;
+    let gu = m
+        .sh_gate_up
+        .linear_dev(&xd)
+        .ok_or_else(|| LlamaError::Config("forward: device shared pair lost its device".into()))?;
+    if gu.numel() != 2 * sff {
+        return Err(LlamaError::Config(format!(
+            "forward: shared gate||up produced {} values, expected {}",
+            gu.numel(),
+            2 * sff
+        )));
+    }
+    let h = be.swiglu_clamped_split(&gu, sff, sh.swiglu_clamp_shexp[il], true);
+    let s_out = m
+        .sh_down
+        .linear_dev(&h)
+        .ok_or_else(|| LlamaError::Config("forward: device shared down lost its device".into()))?;
+    let s_host = be.to_host(s_out);
+    if s_host.numel() != sh.n_embd {
+        return Err(LlamaError::Config(format!(
+            "forward: shared expert produced {} values, expected {}",
+            s_host.numel(),
+            sh.n_embd
+        )));
+    }
+    for (o, &sv) in out.iter_mut().zip(s_host.data()) {
+        *o += sv;
+    }
+    prof::add(&prof::FFN_SHARED, t_shared);
+    Ok(())
+}
+
 /// or routed experts plus an **unscaled** shared expert after them.
 fn ffn_layer(sh: &Shape, w: &FfnW<'_>, il: usize, x: &[f32], out: &mut [f32]) -> Result<()> {
     match w {
@@ -1043,6 +1183,12 @@ fn ffn_layer(sh: &Shape, w: &FfnW<'_>, il: usize, x: &[f32], out: &mut [f32]) ->
             down.apply(&h, out)
         }
         FfnW::Moe(m) => {
+            // VENDORED-LOCAL: PERF. With the weights on a card, this layer's chain
+            // runs there: see `ffn_moe_device`. The host arm below stays because
+            // `bridge::HostModel` is the oracle both are checked against.
+            if let (Some(be), Some(_)) = (m.router.device(), m.sh_gate_up.device()) {
+                return ffn_moe_device(sh, m, il, be, x, out);
+            }
             let ne = sh.n_expert;
             let mut logits = vec![0.0f32; ne];
             let t_router = std::time::Instant::now();
