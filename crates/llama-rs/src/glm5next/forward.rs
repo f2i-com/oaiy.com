@@ -718,6 +718,19 @@ pub struct State {
     /// Per MLA layer, `[max_len * kv_lora]` — the cached latent, serving as both
     /// K and V.
     latents: Vec<Vec<f32>>,
+    /// VENDORED-LOCAL: GLM-5.3-Flash. The same cache, mirrored on a backend.
+    ///
+    /// `[max_len, 1, kv_lora]` per MLA layer. The attention over it is O(len) work a
+    /// token -- n_head dot products kv_lora wide against every cached row, twice --
+    /// which made a prompt O(n^2) and, on the host, 124 ms a token at position 1740
+    /// while both cards sat idle. Doing it on the card means the cache has to live
+    /// there: uploading `len * kv_lora` a token instead would be the same quadratic
+    /// cost over PCIe.
+    ///
+    /// A mirror, not a move: `latents` stays authoritative, so snapshots and the
+    /// host oracle are unchanged, and a row costs one extra device-side copy of
+    /// `kv_lora` floats when it is written.
+    latents_dev: Option<(Vec<Tensor>, Arc<dyn Backend>)>,
     /// Indexer key / gate / pooled, per MLA layer.
     kpool: kpool::KpoolCache,
     max_len: usize,
@@ -737,6 +750,7 @@ impl State {
             kda_dev: None,
             conv: vec![vec![0.0f32; (sh.d_conv - 1) * 3 * sh.d_inner()]; n_kda],
             latents: vec![vec![0.0f32; sh.max_len * sh.kv_lora]; n_mla],
+            latents_dev: None,
             kpool: kpool::KpoolCache::new(n_mla, sh.max_len, sh.d_idx)?,
             max_len: sh.max_len,
         })
@@ -755,8 +769,22 @@ impl State {
             .iter()
             .map(|_| backend.to_device(Tensor::from_vec(vec![0.0f32; n], vec![sh.n_head, hd, hd])))
             .collect();
+        // The latent cache is mirrored too, `[max_len, 1, kv_lora]` a layer: one KV
+        // head, which is what absorbed MLA is, and what lets `bmm_qkt`/`bmm_av`
+        // serve it without broadcasting the rows to every query head.
+        let lat = st
+            .latents
+            .iter()
+            .map(|l| {
+                backend.to_device(Tensor::from_vec(
+                    vec![0.0f32; l.len()],
+                    vec![sh.max_len, 1, sh.kv_lora],
+                ))
+            })
+            .collect();
         st.kda = Vec::new();
-        st.kda_dev = Some((dev, backend));
+        st.kda_dev = Some((dev, Arc::clone(&backend)));
+        st.latents_dev = Some((lat, backend));
         Ok(st)
     }
 
@@ -774,6 +802,18 @@ impl State {
     /// is scaled by `exp(g_log)` every token, so a positive `g_log` on any channel
     /// shows up here as geometric growth.
     pub fn kda_max_abs(&self) -> f32 {
+        // The state is usually on a card, where `kda` is empty -- reading only the
+        // host copy reported 0.0 for every device model, which makes the diagnostic
+        // useless exactly where it is wanted.
+        if let Some((dev, backend)) = &self.kda_dev {
+            return dev.iter().fold(0.0f32, |a, t| {
+                backend
+                    .to_host(t.clone())
+                    .data()
+                    .iter()
+                    .fold(a, |b, v| b.max(v.abs()))
+            });
+        }
         self.kda
             .iter()
             .flat_map(|s| s.iter())
@@ -810,6 +850,15 @@ impl State {
         }
         for l in self.latents.iter_mut() {
             l.fill(0.0);
+        }
+        // The mirror as well: a stale row past `len` would be a previous
+        // conversation's, and the mask only hides rows it knows about.
+        if let Some((dev, backend)) = &mut self.latents_dev {
+            for t in dev.iter_mut() {
+                let shape = t.shape().to_vec();
+                let n = t.numel();
+                *t = backend.to_device(Tensor::from_vec(vec![0.0f32; n], shape));
+            }
         }
         self.kpool.reset();
     }
@@ -994,6 +1043,9 @@ fn mla_layer(
     sh: &Shape,
     w: &MlaW<'_>,
     latents: &mut [f32],
+    // VENDORED-LOCAL: GLM-5.3-Flash. The latent cache on a card, when there is one,
+    // so the attention over it runs there: see `mla::attend_latent_device`.
+    latents_dev: Option<(&mut Tensor, &dyn Backend)>,
     kp: &mut kpool::KpoolCache,
     kp_layer: usize,
     pos: usize,
@@ -1082,6 +1134,17 @@ fn mla_layer(
     w.kv_a_mqa.apply(x, &mut latent)?;
     rms_norm(&mut latent, w.kv_a_norm, sh.rms_eps)?;
     latents[pos * sh.kv_lora..(pos + 1) * sh.kv_lora].copy_from_slice(&latent);
+    // And into the mirror, if there is one: a device-side copy of `kv_lora` floats
+    // into row `pos`, which is what lets the attention read the whole cache without
+    // it crossing PCIe every token.
+    let latents_dev = match latents_dev {
+        Some((cache, be)) => {
+            let row = be.to_device(Tensor::from_vec(latent.clone(), vec![1, 1, sh.kv_lora]));
+            be.copy_axis0_into(cache, pos, &row);
+            Some((&*cache, be))
+        }
+        None => None,
+    };
 
     // (f) absorbed attention over the candidate set.
     let mut q = vec![0.0f32; nh * sh.qk_head];
@@ -1096,21 +1159,39 @@ fn mla_layer(
     let mut mask = vec![0.0f32; len];
     mla::attn_mask(pos, len, r, selected.as_deref(), &mut mask)?;
 
-    // Softmax and the weighted sum stay on the host: they only touch the
-    // latents, which are at most `len * kv_lora`. The absorb back out of latent
-    // space is the expensive half, and it is a batched gemv.
+    // On the card when the cache is there, and on the host otherwise -- which is
+    // the host oracle's path, and the one `bridge::HostModel` is checked against.
+    //
+    // This used to say that the softmax and the weighted sum "stay on the host: they
+    // only touch the latents, which are at most len * kv_lora". That reasoning was
+    // wrong about which part is expensive: `len * kv_lora` grows with the prompt, so
+    // it is O(len) work a token and O(n^2) over a prompt, and it measured 124.25 ms
+    // a token at position 1740 against the absorb's 3.76.
     let t = std::time::Instant::now();
     let mut ctx = vec![0.0f32; nh * sh.kv_lora];
-    mla::attend_latent(
-        &q_abs,
-        &latents[..len * sh.kv_lora],
-        &mask,
-        mla::kq_scale(sh.qk_head),
-        nh,
-        sh.kv_lora,
-        len,
-        &mut ctx,
-    )?;
+    match latents_dev {
+        Some((cache, be)) => mla::attend_latent_device(
+            be,
+            &q_abs,
+            cache,
+            &mask,
+            mla::kq_scale(sh.qk_head),
+            nh,
+            sh.kv_lora,
+            len,
+            &mut ctx,
+        )?,
+        None => mla::attend_latent(
+            &q_abs,
+            &latents[..len * sh.kv_lora],
+            &mask,
+            mla::kq_scale(sh.qk_head),
+            nh,
+            sh.kv_lora,
+            len,
+            &mut ctx,
+        )?,
+    }
     let mut attn = vec![0.0f32; nh * sh.v_head];
     w.v_b
         .apply(&ctx, nh, sh.v_head, sh.kv_lora, &mut attn)?;
@@ -1463,18 +1544,14 @@ pub fn forward_token(
             AttnW::Mla(mw) => {
                 let t = std::time::Instant::now();
                 let ord = sh.mla_ordinal(il);
-                // Split the borrow: latents is per-layer, kpool is shared.
-                let lat = &mut state.latents[ord];
-                mla_layer(
-                    sh,
-                    mw,
-                    lat,
-                    &mut state.kpool,
-                    ord,
-                    pos,
-                    &cur,
-                    &mut sub_out,
-                )?;
+                // Split the borrow: latents and its mirror are per-layer, kpool is
+                // shared, and the mirror's backend comes out of the same field.
+                let State { latents, latents_dev, kpool, .. } = &mut *state;
+                let lat = &mut latents[ord];
+                let dev = latents_dev
+                    .as_mut()
+                    .map(|(t, be)| (&mut t[ord], &**be as &dyn Backend));
+                mla_layer(sh, mw, lat, dev, kpool, ord, pos, &cur, &mut sub_out)?;
                 prof::add(&prof::MLA, t);
             }
         }
@@ -1642,8 +1719,12 @@ pub fn forward_chunk(
                 AttnW::Mla(mw) => {
                     let tm = std::time::Instant::now();
                     let ord = sh.mla_ordinal(il);
-                    let lat = &mut state.latents[ord];
-                    mla_layer(sh, mw, lat, &mut state.kpool, ord, base + t, x, out)?;
+                    let State { latents, latents_dev, kpool, .. } = &mut *state;
+                    let lat = &mut latents[ord];
+                    let dev = latents_dev
+                        .as_mut()
+                        .map(|(dt, be)| (&mut dt[ord], &**be as &dyn Backend));
+                    mla_layer(sh, mw, lat, dev, kpool, ord, base + t, x, out)?;
                     prof::add(&prof::MLA, tm);
                 }
             }
@@ -1986,6 +2067,13 @@ impl State {
             }
             dst[..src.len()].copy_from_slice(src);
             dst[src.len()..].fill(0.0);
+        }
+        // And the device mirror, from what was just put back.
+        if let Some((dev, backend)) = &mut self.latents_dev {
+            for (t, src) in dev.iter_mut().zip(&self.latents) {
+                let shape = t.shape().to_vec();
+                *t = backend.to_device(Tensor::from_vec(src.clone(), shape));
+            }
         }
         self.kpool.restore_rows(&snap.kpool)?;
         self.len = snap.len;

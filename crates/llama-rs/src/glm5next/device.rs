@@ -226,6 +226,7 @@ pub struct StreamExperts {
 /// never ran", and which it is moves with the VRAM hit rate: a slot the tier
 /// missed is computed on the CPU or uploaded per matvec, and neither can join a
 /// grouped call.
+#[cfg(feature = "cuda")]
 pub mod grouped_stats {
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -657,6 +658,7 @@ impl StreamExperts {
 
         // Whether the grouped call consumed the `Device` slots, recorded before
         // `grouped` is moved into the accumulator.
+        #[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
         let grouped_ran = grouped.is_some();
         #[cfg(feature = "cuda")]
         if !grouped_ran {
@@ -3271,6 +3273,227 @@ children attend school instead.";
             n as f64 / one
         );
         println!("best chunk {} at {:.1}x", best.0, one / best.1);
+    }
+
+    /// The same, on real text rather than random ids.
+    ///
+    /// The random-id version measures what the gates do on gibberish, which is not
+    /// what a prompt looks like and may not be what a prompt does. This tokenises
+    /// English of the shape that actually failed -- an agent system prompt -- and
+    /// reports the state as it goes, using the public API so the tokenizer comes
+    /// with the model.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "diagnostic: needs the released model on disk"]
+    fn measure_state_growth_on_real_text() {
+        let backend = match cuda_backend() {
+            Some(b) => b,
+            None => return,
+        };
+        let model = match crate::Model::open_streaming(RELEASED, backend, 64 << 30) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("open failed ({e}); skipping");
+                return;
+            }
+        };
+        let para = "You are a careful software engineer working in a terminal. Prefer \
+                    small, verifiable steps. When you change code, say what you changed \
+                    and why, and how it was checked. Use shell commands for verification. \
+                    Do not speculate about performance; measure it. ";
+        let text = para.repeat(12);
+        let ids = model.tokenizer().encode(&text, true).expect("encode");
+        let crate::Model::Glm5Next(g) = &model else {
+            eprintln!("not a glm5next model; skipping");
+            return;
+        };
+        println!();
+        println!("real text, {} tokens", ids.len());
+        println!("   pos   max|KDA state|   max|latent|");
+        let mut kv = model.new_kv_cache(4096);
+        let mut at = 0usize;
+        for stop in [1usize, 8, 32, 128, 256, 512, ids.len()] {
+            if stop <= at || stop > ids.len() {
+                continue;
+            }
+            let _ = g.forward(&ids[at..stop], &mut kv).expect("forward");
+            at = stop;
+            let snap = g.snapshot_state().expect("snapshot");
+            let kda = snap.kda.iter().flatten().fold(0.0f32, |a, v| a.max(v.abs()));
+            let lat = snap.latents.iter().flatten().fold(0.0f32, |a, v| a.max(v.abs()));
+            println!("  {stop:5}   {kda:13.4}   {lat:12.4}");
+        }
+    }
+
+    /// How the recurrent state and the latent cache grow with position.
+    ///
+    /// Output quality falls off with prompt length -- fine at 73 tokens, repetitive
+    /// at 187, collapsed into "You are a software engineer." by 1257 -- and that
+    /// held with batching off, with the sparse indexer off, and with warm tiers. A
+    /// smooth decline with length in a model that is 34/45 linear-attention layers
+    /// points at the recurrence: KDA carries state token to token, so an error in
+    /// its decay accumulates instead of showing up at once.
+    ///
+    /// This prints what the state actually does. A decay that is too weak grows it
+    /// without bound; one that is too strong collapses it towards zero and the model
+    /// forgets its prompt, which is what repeating a phrase looks like.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "diagnostic: needs the released model on disk"]
+    fn measure_state_growth_over_a_prompt() {
+        let n = 1024usize;
+        let prompt: Vec<u32> = (0..n).map(|i| ((i * 7919 + 1543) % 150000) as u32).collect();
+
+        let m = match DeviceModel::open_tiered(RELEASED, 2048, 1, 24 << 30, 8 << 30) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("tiered open failed ({e}); skipping");
+                return;
+            }
+        };
+        let sh = m.shape().clone();
+        let w = m.view();
+        let mut st = forward::State::new_on(&sh, m.backend()).expect("state");
+
+        println!();
+        println!("   pos   max|KDA state|   max|latent|   max|logit|");
+        let mut at = 0usize;
+        for stop in [1usize, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024] {
+            let logits = forward::forward_prompt(&sh, &w, &mut st, &prompt[at..stop])
+                .expect("prefill");
+            at = stop;
+            let top = logits.iter().fold(0.0f32, |a, v| a.max(v.abs()));
+            println!(
+                "  {:5}   {:13.4}   {:12.4}   {:11.4}",
+                stop,
+                st.kda_max_abs(),
+                st.latent_max_abs(),
+                top
+            );
+        }
+    }
+
+    /// What a chunked prefill then GENERATES, against the one-token loop.
+    ///
+    /// The gates below compare the prefill's last logits. That is not the same as
+    /// comparing what comes out: a state that is subtly wrong can leave the last
+    /// logits agreeing and then diverge over a reply, which is exactly the failure
+    /// this was written for -- a coder-cli session whose first answer degenerated
+    /// into "1. 1. 1." while every prefill gate passed.
+    ///
+    /// So this greedily generates after the prefill and compares the token
+    /// sequences. Greedy on purpose: any difference is the model, not the sampler.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "needs the released model on disk"]
+    fn a_chunked_prefill_generates_the_same_tokens() {
+        let n = 200usize;
+        let prompt: Vec<u32> = (0..n).map(|i| ((i * 7919 + 1543) % 150000) as u32).collect();
+        let want = 16usize;
+
+        let m = match DeviceModel::open_tiered(RELEASED, 512, 1, 24 << 30, 8 << 30) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("tiered open failed ({e}); skipping");
+                return;
+            }
+        };
+        let sh = m.shape().clone();
+        let w = m.view();
+        let argmax = |v: &[f32]| {
+            v.iter()
+                .enumerate()
+                .fold((0u32, f32::NEG_INFINITY), |acc, (i, &x)| {
+                    if x > acc.1 { (i as u32, x) } else { acc }
+                })
+                .0
+        };
+
+        // One token at a time, then greedy.
+        let mut st = forward::State::new_on(&sh, m.backend()).expect("state");
+        let mut logits = forward::forward_prompt(&sh, &w, &mut st, &prompt).expect("prefill");
+        let mut seq = Vec::with_capacity(want);
+        for _ in 0..want {
+            let t = argmax(&logits);
+            seq.push(t);
+            logits = forward::forward_token(&sh, &w, &mut st, t).expect("decode");
+        }
+
+        // Chunks of 64, then the same greedy walk.
+        let mut st2 = forward::State::new_on(&sh, m.backend()).expect("state");
+        let mut logits2 = Vec::new();
+        for part in prompt.chunks(64) {
+            logits2 = forward::forward_chunk(&sh, &w, &mut st2, part).expect("chunk");
+        }
+        let mut bat = Vec::with_capacity(want);
+        for _ in 0..want {
+            let t = argmax(&logits2);
+            bat.push(t);
+            logits2 = forward::forward_token(&sh, &w, &mut st2, t).expect("decode");
+        }
+
+        println!("one at a time: {seq:?}");
+        println!("chunked:       {bat:?}");
+        let agree = seq.iter().zip(&bat).take_while(|(a, b)| a == b).count();
+        println!("{agree} of {want} tokens agree");
+        assert_eq!(seq, bat, "a chunked prefill generated different tokens");
+    }
+
+    /// Several chunks against the one-token loop, on the real weights.
+    ///
+    /// The single-chunk test below covers one pass through `forward_chunk`. This
+    /// covers what a real prompt does: many of them, each continuing the state the
+    /// last left. A coder-cli system prompt is thousands of tokens, so dozens of
+    /// chunks, and the first thing seen from one was degenerate output -- which the
+    /// ten-token gate could not have caught, because ten tokens is one chunk.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "needs the released model on disk"]
+    fn many_prefill_chunks_agree_with_the_one_token_loop() {
+        // Deterministic ids across the vocabulary, long enough for several chunks.
+        let n = 200usize;
+        let prompt: Vec<u32> = (0..n).map(|i| ((i * 7919 + 1543) % 150000) as u32).collect();
+
+        let m = match DeviceModel::open_tiered(RELEASED, 512, 1, 24 << 30, 8 << 30) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("tiered open failed ({e}); skipping");
+                return;
+            }
+        };
+        let sh = m.shape().clone();
+        let w = m.view();
+
+        let mut one = forward::State::new_on(&sh, m.backend()).expect("state");
+        let seq = forward::forward_prompt(&sh, &w, &mut one, &prompt).expect("one at a time");
+
+        // In chunks of 64, as the server does.
+        let mut many = forward::State::new_on(&sh, m.backend()).expect("state");
+        let mut bat = Vec::new();
+        for part in prompt.chunks(64) {
+            bat = forward::forward_chunk(&sh, &w, &mut many, part).expect("chunk");
+        }
+
+        assert_eq!(one.len, many.len, "the two paths left different positions");
+        let scale = seq.iter().fold(0.0f32, |acc, v| acc.max(v.abs())).max(1.0);
+        let mut worst = 0.0f32;
+        for (p, q) in seq.iter().zip(bat.iter()) {
+            worst = worst.max((p - q).abs());
+        }
+        println!(
+            "max |one at a time - {} chunks of 64| over {} logits: {worst:.6} (scale {scale:.3})",
+            n.div_ceil(64),
+            seq.len()
+        );
+        assert!(worst <= 1e-4 * scale, "chunked prefill diverges: {worst} at scale {scale}");
+
+        let top = |v: &[f32]| {
+            v.iter()
+                .enumerate()
+                .fold((0usize, f32::NEG_INFINITY), |m, (i, &x)| if x > m.1 { (i, x) } else { m })
+                .0
+        };
+        assert_eq!(top(&seq), top(&bat), "the two paths pick different tokens");
     }
 
     /// A batched prefill chunk against the one-token loop, on the real weights.

@@ -70,6 +70,8 @@
 //! layer loop that calls them is still to come.
 
 use super::kpool;
+use ggml_rs::{Backend, Tensor};
+
 use crate::{LlamaError, Result};
 
 /// `1 / sqrt(qk_head_dim)` — the MLA head size, **not** the absorbed
@@ -223,6 +225,80 @@ pub fn attn_mask(
 /// A head with nothing visible writes zeros, which is what [`attend`] does by
 /// filling its output and skipping the absorb -- `v_b @ 0` is `0` either way.
 #[allow(clippy::too_many_arguments)]
+/// VENDORED-LOCAL: GLM-5.3-Flash. [`attend_latent`] on the card.
+///
+/// The same arithmetic, as four device ops instead of a host loop over every cached
+/// row. On the host this is O(len) work a token and measured 124.25 ms a token at
+/// position 1740 -- the largest single item in the forward pass, and the reason a
+/// prompt is O(n^2).
+///
+/// The shape trick is that **the query heads are the sequence**. Absorbed MLA is
+/// MQA: one head of latent keys serves every query head, and the latent row is both
+/// K and V. So `q` goes in as `[n_head, 1, kv_lora]` -- n_head "positions", one KV
+/// head -- and the cache as `[len, 1, kv_lora]`. `bmm_qkt` and `bmm_av` then do
+/// exactly this, with no broadcasting of the rows to every head and no new kernel.
+///
+/// `past` is `len`, which makes `bmm_qkt`'s own causal mask reach past every row it
+/// could see, so it masks nothing. All the masking is `mask`: the indexer's
+/// selection, and the rows beyond `len`.
+///
+/// `cache` is the whole `[max_len, 1, kv_lora]` buffer; only its first `len` rows
+/// are read.
+#[allow(clippy::too_many_arguments)]
+pub fn attend_latent_device(
+    backend: &dyn Backend,
+    q_abs: &[f32],
+    cache: &Tensor,
+    mask: &[f32],
+    scale: f32,
+    n_head: usize,
+    kv_lora: usize,
+    len: usize,
+    out: &mut [f32],
+) -> Result<()> {
+    if q_abs.len() != n_head * kv_lora || out.len() != n_head * kv_lora {
+        return Err(LlamaError::Config(format!(
+            "mla: device attend got q_abs {} / out {}, expected n_head*kv_lora = {}",
+            q_abs.len(),
+            out.len(),
+            n_head * kv_lora
+        )));
+    }
+    if mask.len() < len {
+        return Err(LlamaError::Config(format!(
+            "mla: device attend got a {}-wide mask for {len} rows",
+            mask.len()
+        )));
+    }
+    if cache.rank() != 3 || cache.dim(1) != 1 || cache.dim(2) != kv_lora || cache.dim(0) < len {
+        return Err(LlamaError::Config(format!(
+            "mla: device attend got a {:?} cache, expected [>= {len}, 1, {kv_lora}]",
+            cache.shape()
+        )));
+    }
+
+    // The live prefix. A device-side copy of `len * kv_lora`, which is what keeps
+    // the scores from covering rows nothing has written.
+    let live = backend.slice_axis0(cache, len);
+    let q = backend.to_device(Tensor::from_vec(q_abs.to_vec(), vec![n_head, 1, kv_lora]));
+    // `past = len` so nothing is masked here; `mask` does all of it.
+    let mut scores = backend.bmm_qkt(&q, &live, scale, len);
+    let m = backend.to_device(Tensor::from_vec(mask[..len].to_vec(), vec![len]));
+    backend.add_inplace_broadcast_last(&mut scores, &m);
+    backend.softmax_last(&mut scores);
+    let ctx = backend.bmm_av(&scores, &live);
+    let host = backend.to_host(ctx);
+    if host.numel() != out.len() {
+        return Err(LlamaError::Config(format!(
+            "mla: device attend returned {} values, expected {}",
+            host.numel(),
+            out.len()
+        )));
+    }
+    out.copy_from_slice(host.data());
+    Ok(())
+}
+
 pub fn attend_latent(
     q_abs: &[f32],
     latents: &[f32],

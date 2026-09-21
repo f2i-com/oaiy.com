@@ -1032,6 +1032,7 @@ impl Glm5NextModel {
     /// `None` for a resident model, which has no tiers. The counters are cumulative
     /// and process-global; a caller reporting per-token figures resets them itself.
     #[allow(clippy::type_complexity)]
+    #[cfg(feature = "cuda")]
     pub fn tier_stats(
         &self,
     ) -> Option<(
