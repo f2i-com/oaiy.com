@@ -256,64 +256,59 @@ __device__ __forceinline__ void q4k_unpack_scale_min(int j, const unsigned char*
 // scatter across distinct rows. Requires K % 1024 == 0 (true for our 4096,
 // 8192, 12288 hidden / ff dims). Block shape: (32, OUT_PER_BLOCK, 1) — each
 // warp handles one output, OUT_PER_BLOCK warps per block.
+// VENDORED-LOCAL: PERF. Element-per-thread, so the warp's loads coalesce.
+//
+// This used to give each thread a contiguous run of sub-blocks, reading its
+// quantised bytes one at a time. A warp therefore touched 32 places spread over
+// the whole row per load instruction, and measured 156 GB/s at [4096, 4096] against
+// 637 GB/s for `linear_q6_k_gemv_coop_f32` on the same geometry -- a 4x gap on the
+// dtype Q4_K_M uses for nearly everything, which is KDA's projections, MLA's, the
+// shared expert and the output head.
+//
+// Thread t now takes element t of each 32-wide sub-block, which is exactly the
+// partition the Q6_K kernel above uses: every quantised load is 32 consecutive
+// bytes and so is every activation load. The scales are unpacked inline for the two
+// sub-blocks a thread's byte covers, rather than precomputed into registers for all
+// eight -- that precompute was tried first and cost more than the coalescing saved.
+//
+// Each thread now sums a strided subset of the row instead of a contiguous one, so
+// the partials differ in their last bits before the warp reduce. Still fully
+// deterministic. `moe_q4k_row_accum` is changed the same way to keep the two in
+// step, and glm5next holds the whole model to 1e-4 absolute at a logit scale of 14
+// -- where its host-vs-CUDA gap already sits.
 __global__ void linear_q4_k_gemv_coop_f32(const float* __restrict__ x,
                                            const unsigned char* __restrict__ w,
                                            float* __restrict__ y,
                                            int N, int K) {
     int n = blockIdx.x * blockDim.y + threadIdx.y;
     if (n >= N) return;
-    int t = threadIdx.x;          // [0, 32)
-    int n_blocks    = K / 256;
-    int total_sb    = n_blocks * 8;
-    int sb_per_thd  = total_sb / 32;     // 4 / 8 / 12 for K = 4096 / 8192 / 12288
-    int sb_start    = t * sb_per_thd;
-    int sb_end      = sb_start + sb_per_thd;
-    int row_bytes   = n_blocks * 144;
+    int t = threadIdx.x;          // [0, 32) — the element within each sub-block
+    int n_blocks  = K / 256;
+    int row_bytes = n_blocks * 144;
     const unsigned char* w_row = w + (long)n * row_bytes;
 
-    // Cache the most recent superblock header across consecutive sub-blocks.
-    int last_b = -1;
-    float d_sb = 0.0f, min_sb = 0.0f;
-    const unsigned char* qs_sb = nullptr;
-    const unsigned char* sc_sb = nullptr;
-
     float acc = 0.0f;
-    for (int sb = sb_start; sb < sb_end; ++sb) {
-        int b  = sb >> 3;             // / 8
-        int is = sb & 7;              // % 8
-        if (b != last_b) {
-            const unsigned char* bp = w_row + b * 144;
-            unsigned short d_bits = (unsigned short)bp[0] | ((unsigned short)bp[1] << 8);
-            unsigned short m_bits = (unsigned short)bp[2] | ((unsigned short)bp[3] << 8);
-            d_sb   = f16_to_f32(d_bits);
-            min_sb = f16_to_f32(m_bits);
-            sc_sb  = bp + 4;
-            qs_sb  = bp + 16;
-            last_b = b;
-        }
-        unsigned char sc_byte, mm_byte;
-        q4k_unpack_scale_min(is, sc_sb, &sc_byte, &mm_byte);
-        float dq  = d_sb   * (float)sc_byte;
-        float mq  = min_sb * (float)mm_byte;
-        // sub-block `is` covers elements [is*32..(is+1)*32) of the superblock.
-        // Quantized bytes for this sub-block: qs_sb[(is/2)*32..(is/2)*32+32].
-        // Even is → low nibbles, odd is → high nibbles.
-        int qs_off = (is >> 1) * 32;
-        int x_off  = b * 256 + is * 32;
-        const unsigned char* qsp = qs_sb + qs_off;
-        const float* xp = x + x_off;
-        if ((is & 1) == 0) {
-            #pragma unroll
-            for (int l = 0; l < 32; ++l) {
-                float qv = (float)(qsp[l] & 0x0F);
-                acc += xp[l] * (dq * qv - mq);
-            }
-        } else {
-            #pragma unroll
-            for (int l = 0; l < 32; ++l) {
-                float qv = (float)((qsp[l] >> 4) & 0x0F);
-                acc += xp[l] * (dq * qv - mq);
-            }
+    for (int b = 0; b < n_blocks; ++b) {
+        const unsigned char* bp = w_row + b * 144;
+        unsigned short d_bits = (unsigned short)bp[0] | ((unsigned short)bp[1] << 8);
+        unsigned short m_bits = (unsigned short)bp[2] | ((unsigned short)bp[3] << 8);
+        float d   = f16_to_f32(d_bits);
+        float dmn = f16_to_f32(m_bits);
+        const unsigned char* sc = bp + 4;
+        const unsigned char* qs = bp + 16;
+        const float* xb = x + b * 256;
+
+        // Four groups of 32 bytes. Byte `j*32 + t` holds one weight of sub-block
+        // 2j in its low nibble and one of sub-block 2j+1 in its high nibble.
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            unsigned char q = qs[j * 32 + t];
+            int lo = 2 * j, hi = lo + 1;
+            unsigned char scl, mml, sch, mmh;
+            q4k_unpack_scale_min(lo, sc, &scl, &mml);
+            q4k_unpack_scale_min(hi, sc, &sch, &mmh);
+            acc += xb[lo * 32 + t] * (d * (float)scl * (float)(q & 0x0F) - dmn * (float)mml);
+            acc += xb[hi * 32 + t] * (d * (float)sch * (float)(q >> 4)   - dmn * (float)mmh);
         }
     }
 
@@ -324,6 +319,7 @@ __global__ void linear_q4_k_gemv_coop_f32(const float* __restrict__ x,
     }
     if (t == 0) y[n] = acc;
 }
+
 
 __global__ void linear_q4_k_f32(const float* __restrict__ x,
                                  const unsigned char* __restrict__ w,
@@ -2603,117 +2599,39 @@ __global__ void moe_topk_softmax_f32(const float* __restrict__ logits,
 
 // ---- per-quant row-dot helpers (warp-cooperative, acc by reference) --------
 
-// Q4_K: identical loop nest + header caching as linear_q4_k_gemv_coop_f32
-// when total_sb % 32 == 0 (bit-exact with it); deterministic strided
-// sub-block partition otherwise.
+// Q4_K: element-per-thread, the same partition as linear_q4_k_gemv_coop_f32 above
+// (bit-exact with it), so the grouped MoE dispatch and the plain matvec agree.
+//
+// VENDORED-LOCAL: PERF. See that kernel for why the partition changed: a
+// contiguous run of sub-blocks per thread had a warp reading 32 places spread over
+// the row and measured 156 GB/s against Q6_K's 637 on the same geometry. Element t
+// of each 32-wide sub-block makes every load 32 consecutive bytes.
 __device__ __forceinline__ void moe_q4k_row_accum(float* acc,
         const float* __restrict__ x, const unsigned char* __restrict__ w_row,
         int K, int t) {
     int n_blocks = K / 256;
-    int total_sb = n_blocks * 8;
-    if (total_sb % 32 == 0) {
-        int sb_per_thd = total_sb / 32;
-        int sb_start   = t * sb_per_thd;
-        int sb_end     = sb_start + sb_per_thd;
-        int last_b = -1;
-        float d_sb = 0.0f, min_sb = 0.0f;
-        const unsigned char* qs_sb = nullptr;
-        const unsigned char* sc_sb = nullptr;
-        for (int sb = sb_start; sb < sb_end; ++sb) {
-            int b  = sb >> 3;
-            int is = sb & 7;
-            if (b != last_b) {
-                const unsigned char* bp = w_row + b * 144;
-                unsigned short d_bits = (unsigned short)bp[0] | ((unsigned short)bp[1] << 8);
-                unsigned short m_bits = (unsigned short)bp[2] | ((unsigned short)bp[3] << 8);
-                d_sb   = f16_to_f32(d_bits);
-                min_sb = f16_to_f32(m_bits);
-                sc_sb  = bp + 4;
-                qs_sb  = bp + 16;
-                last_b = b;
-            }
-            unsigned char sc_byte, mm_byte;
-            q4k_unpack_scale_min(is, sc_sb, &sc_byte, &mm_byte);
-            float dq = d_sb   * (float)sc_byte;
-            float mq = min_sb * (float)mm_byte;
-            int qs_off = (is >> 1) * 32;
-            const unsigned char* qsp = qs_sb + qs_off;
-            const float* xp = x + b * 256 + is * 32;
-            // VENDORED-LOCAL: PERF — four weights a load rather than one.
-            //
-            // A sub-block is 32 quant bytes and 32 activations; taken one byte at a
-            // time that is 32 loads, 32 converts and 32 FMAs a thread, and with
-            // `sb_per_thd` sub-blocks each the scalar work is what this kernel is
-            // actually limited by: ~44 G instructions a token against 4.2 GB of
-            // reads the cards could serve in 2.3 ms. `qs` is 32-byte aligned
-            // (`bp + 16` plus a multiple of 32) and `xp` 128-byte aligned, so both
-            // take vector loads.
-            //
-            // The FMAs stay in index order into the same accumulator, so this is
-            // bit-identical to the scalar form -- fewer loads, not different
-            // arithmetic. Reassociating into several accumulators would buy more
-            // ILP and is a separate question from this one.
-            const unsigned int* qw = (const unsigned int*)qsp;
-            const float4* xv = (const float4*)xp;
-            if ((is & 1) == 0) {
-                #pragma unroll
-                for (int g = 0; g < 8; ++g) {
-                    unsigned int p = qw[g];
-                    float4 xq = xv[g];
-                    *acc += xq.x * (dq * (float)((p >>  0) & 0x0Fu) - mq);
-                    *acc += xq.y * (dq * (float)((p >>  8) & 0x0Fu) - mq);
-                    *acc += xq.z * (dq * (float)((p >> 16) & 0x0Fu) - mq);
-                    *acc += xq.w * (dq * (float)((p >> 24) & 0x0Fu) - mq);
-                }
-            } else {
-                #pragma unroll
-                for (int g = 0; g < 8; ++g) {
-                    unsigned int p = qw[g];
-                    float4 xq = xv[g];
-                    *acc += xq.x * (dq * (float)((p >>  4) & 0x0Fu) - mq);
-                    *acc += xq.y * (dq * (float)((p >> 12) & 0x0Fu) - mq);
-                    *acc += xq.z * (dq * (float)((p >> 20) & 0x0Fu) - mq);
-                    *acc += xq.w * (dq * (float)((p >> 28) & 0x0Fu) - mq);
-                }
-            }
-        }
-    } else {
-        // Strided fallback: thread t takes sub-blocks t, t+32, ... — no
-        // header caching (consecutive sub-blocks rarely share a super-block),
-        // same per-sub-block math as above.
-        for (int sb = t; sb < total_sb; sb += 32) {
-            int b  = sb >> 3;
-            int is = sb & 7;
-            const unsigned char* bp = w_row + b * 144;
-            unsigned short d_bits = (unsigned short)bp[0] | ((unsigned short)bp[1] << 8);
-            unsigned short m_bits = (unsigned short)bp[2] | ((unsigned short)bp[3] << 8);
-            float d_sb   = f16_to_f32(d_bits);
-            float min_sb = f16_to_f32(m_bits);
-            unsigned char sc_byte, mm_byte;
-            q4k_unpack_scale_min(is, bp + 4, &sc_byte, &mm_byte);
-            float dq = d_sb   * (float)sc_byte;
-            float mq = min_sb * (float)mm_byte;
-            const unsigned char* qsp = bp + 16 + (is >> 1) * 32;
-            const float* xp = x + b * 256 + is * 32;
-            if ((is & 1) == 0) {
-                #pragma unroll
-                for (int l = 0; l < 32; ++l) {
-                    float qv = (float)(qsp[l] & 0x0F);
-                    *acc += xp[l] * (dq * qv - mq);
-                }
-            } else {
-                #pragma unroll
-                for (int l = 0; l < 32; ++l) {
-                    float qv = (float)((qsp[l] >> 4) & 0x0F);
-                    *acc += xp[l] * (dq * qv - mq);
-                }
-            }
+    for (int b = 0; b < n_blocks; ++b) {
+        const unsigned char* bp = w_row + b * 144;
+        unsigned short d_bits = (unsigned short)bp[0] | ((unsigned short)bp[1] << 8);
+        unsigned short m_bits = (unsigned short)bp[2] | ((unsigned short)bp[3] << 8);
+        float d   = f16_to_f32(d_bits);
+        float dmn = f16_to_f32(m_bits);
+        const unsigned char* sc = bp + 4;
+        const unsigned char* qs = bp + 16;
+        const float* xb = x + b * 256;
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            unsigned char q = qs[j * 32 + t];
+            int lo = 2 * j, hi = lo + 1;
+            unsigned char scl, mml, sch, mmh;
+            q4k_unpack_scale_min(lo, sc, &scl, &mml);
+            q4k_unpack_scale_min(hi, sc, &sch, &mmh);
+            *acc += xb[lo * 32 + t] * (d * (float)scl * (float)(q & 0x0F) - dmn * (float)mml);
+            *acc += xb[hi * 32 + t] * (d * (float)sch * (float)(q >> 4)   - dmn * (float)mmh);
         }
     }
 }
 
-// Q6_K: identical partitioning to linear_q6_k_gemv_coop_f32 (thread t owns
-// inner step l=t in both outer iters of every super-block) — bit-exact.
 __device__ __forceinline__ void moe_q6k_row_accum(float* acc,
         const float* __restrict__ x, const unsigned char* __restrict__ w_row,
         int K, int t) {
