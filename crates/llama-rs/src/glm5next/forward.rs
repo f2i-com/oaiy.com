@@ -1273,6 +1273,12 @@ pub mod prof {
     pub static FFN_ROUTER: AtomicU64 = AtomicU64::new(0);
     pub static FFN_ROUTED: AtomicU64 = AtomicU64::new(0);
     pub static FFN_SHARED: AtomicU64 = AtomicU64::new(0);
+    // Inside the routed experts: resolving a route (three cache tiers, the LFRU
+    // ranking, the staging) against actually computing it. The routed experts are
+    // 48.8 ms of a 98.7 ms token and the parts that are accounted for -- ~20 ms of
+    // PCIe stall and ~12 ms of CPU tier -- do not add up to it.
+    pub static FFN_RESOLVE: AtomicU64 = AtomicU64::new(0);
+    pub static FFN_DISPATCH: AtomicU64 = AtomicU64::new(0);
 
     pub static MLA_PROJ: AtomicU64 = AtomicU64::new(0);
     pub static MLA_INDEX: AtomicU64 = AtomicU64::new(0);
@@ -1292,10 +1298,12 @@ pub mod prof {
 
     /// Sub-phases of [`KDA`] and [`MLA`]. These sum to less than their parents:
     /// what is left over is the projections and glue not counted here.
-    pub fn inner() -> [(&'static str, &'static AtomicU64); 11] {
+    pub fn inner() -> [(&'static str, &'static AtomicU64); 13] {
         [
             ("  FFN router", &FFN_ROUTER),
             ("  FFN routed experts", &FFN_ROUTED),
+            ("    of which: resolve", &FFN_RESOLVE),
+            ("    of which: dispatch", &FFN_DISPATCH),
             ("  FFN shared expert", &FFN_SHARED),
             ("  KDA q/k/v projections", &KDA_PROJ),
             ("  KDA depthwise conv + shift", &KDA_CONV),

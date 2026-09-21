@@ -16,5 +16,8 @@ ggml-quants = { path = "../ggml-quants", version = "0.0.1" }
 cudarc      = { version = "0.19", features = ["cuda-version-from-build-system", "driver", "nvrtc", "cublas", "dynamic-linking"], default-features = false }
 thiserror   = "1.0"
 
+# VENDORED-LOCAL: PERF — parallel pinned-buffer fills (src/transfer.rs).
+rayon = "1.10"
+
 [dev-dependencies]
 half = { version = "2.4", features = ["bytemuck", "num-traits"] }

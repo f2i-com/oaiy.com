@@ -738,11 +738,14 @@ impl ExpertFfn for StreamExperts {
         // and whatever is going to move is staged in one batch before the first
         // matvec.
         let ids: Vec<u32> = experts.iter().map(|&(e, _)| e).collect();
+        let t_resolve = std::time::Instant::now();
         let resolved = match &self.cpu {
             Some(_) => ls.resolve_experts_hybrid(&ids, promote_per_layer()),
             None => ls.resolve_experts(&ids),
         }
         .map_err(|err| LlamaError::Config(format!("device: MoE layer {ord}: {err}")))?;
+        crate::glm5next::forward::prof::add(&crate::glm5next::forward::prof::FFN_RESOLVE, t_resolve);
+        let t_dispatch = std::time::Instant::now();
 
         // Whatever the VRAM tier missed and the CPU is taking.
         let cpu_jobs: Vec<CpuJob> = resolved
@@ -800,6 +803,10 @@ impl ExpertFfn for StreamExperts {
             }
         }
         out.copy_from_slice(&host_sum);
+        crate::glm5next::forward::prof::add(
+            &crate::glm5next::forward::prof::FFN_DISPATCH,
+            t_dispatch,
+        );
         Ok(())
     }
 

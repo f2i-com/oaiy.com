@@ -154,6 +154,18 @@ impl PinnedSlot {
     /// Copy `data` into the buffer. Blocks until any previously-issued H2D
     /// copy out of this buffer has completed (cudarc event sync inside
     /// `PinnedHostSlice::as_mut_slice`) — that wait is the ring backpressure.
+    /// VENDORED-LOCAL: PERF. Filled by several threads, because one is too slow.
+    ///
+    /// An async H2D has to read from pinned memory, so a record living in the RAM
+    /// expert cache is copied here first. For GLM-5.3-Flash that is 14.16 MB a
+    /// promoted expert and one promotion a MoE layer, so 595 MB of host-to-host
+    /// copying a token -- and single-threaded it measured as 21.8 ms of a 98.7 ms
+    /// token, hidden inside what the profile called "resolve".
+    ///
+    /// A copy this size is memory-bandwidth work that one core cannot saturate: the
+    /// machine has dual-channel DDR5 and 32 threads. Chunked across a few of them it
+    /// is bandwidth-bound instead of core-bound. The threshold keeps small fills --
+    /// the ones where a rayon fork would cost more than the copy -- on this thread.
     pub fn fill(&mut self, data: &[u8]) {
         assert!(
             data.len() <= self.capacity(),
@@ -167,7 +179,21 @@ impl PinnedSlot {
             .expect("pinned slot")
             .as_mut_slice()
             .expect("pinned buffer access");
-        dst[..data.len()].copy_from_slice(data);
+        let dst = &mut dst[..data.len()];
+
+        // Below this, a single memcpy wins: one 1 MB copy is ~50 us and a rayon
+        // fork-join is a few us, so the split only pays on the multi-MB records.
+        const PARALLEL_ABOVE: usize = 1 << 20;
+        // Chunks big enough that each thread's copy is still a streaming one.
+        const CHUNK: usize = 2 << 20;
+        if data.len() <= PARALLEL_ABOVE {
+            dst.copy_from_slice(data);
+        } else {
+            use rayon::prelude::*;
+            dst.par_chunks_mut(CHUNK)
+                .zip(data.par_chunks(CHUNK))
+                .for_each(|(d, s)| d.copy_from_slice(s));
+        }
         self.filled = data.len();
     }
 

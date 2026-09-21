@@ -467,6 +467,45 @@ fn measure_h2d_bandwidth() {
 // glm5next token makes roughly 2,000 of them: ~710 `Mat::apply` calls plus four
 // launches for each of 336 routed experts. If an allocation costs tens of
 // microseconds, that is the token.
+/// How long it takes to fill a pinned slot, which is what a promotion pays before
+/// its async upload can start.
+///
+/// A record is 14.16 MB and a token promotes one an MoE layer, so 595 MB of
+/// host-to-host copying a token. Whether that is 20 ms or 2 ms decides whether it
+/// is worth caring about, and the profile cannot say because it is buried inside
+/// what "resolve" measures.
+#[test]
+#[ignore = "measures the pinned staging copy"]
+fn measure_pinned_fill_cost() {
+    let Some(b) = try_cuda() else { return };
+    println!();
+    println!("      bytes        fill      GB/s   x42 a token");
+    for &n in &[4_718_592usize, 9_437_184, 14_155_776] {
+        let src = vec![0xA5u8; n];
+        let pool = b.pinned_pool(2, n).expect("pinned pool");
+        // Warm the ring so the first checkout is not an allocation.
+        {
+            let mut slot = pool.checkout(n).expect("checkout");
+            slot.fill(&src);
+        }
+        let iters = 50usize;
+        let t = std::time::Instant::now();
+        for _ in 0..iters {
+            let mut slot = pool.checkout(n).expect("checkout");
+            slot.fill(&src);
+            std::hint::black_box(slot.as_slice()[0]);
+        }
+        let per = t.elapsed().as_secs_f64() / iters as f64;
+        println!(
+            "  {:9.2} MB   {:7.2} ms   {:6.1}   {:7.1} ms",
+            n as f64 / 1e6,
+            per * 1e3,
+            n as f64 / per / 1e9,
+            per * 42.0 * 1e3
+        );
+    }
+}
+
 /// What a single quantised matvec actually achieves, in GB/s.
 ///
 /// Everything else in this file measures the plumbing. This measures the thing the
