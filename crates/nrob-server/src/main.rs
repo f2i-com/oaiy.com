@@ -18,7 +18,12 @@ const HELP: &str = "nrob-server: DeepSeek-V4.1-Flash behind an OpenAI-compatible
   --devices 1,0        CUDA devices; layers split across them (default: the
                        visible ones in order, at most two)
   --ctx N              context length in tokens, prompt + reply (default 65536)
-  --ram-gb N           host RAM for the expert cache (default 140)
+  --ram-gb N           host RAM for the expert cache (default: 80% of what is
+                       free, so it leaves a fifth for everything else)
+  --start NAME         which configured model to load at start (default: the one
+                       --model names). Only one is resident, and a load costs 10s
+                       for a GGUF or 65s for a DeepSeek checkpoint, so naming the
+                       one you will ask for saves loading another to unload it
   --model DIR          checkpoint directory (required)
   --engram-meta FILE   the Engram precompute, engram_meta.safetensors (default: in
                        the checkpoint directory)

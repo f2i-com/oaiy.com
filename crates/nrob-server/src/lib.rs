@@ -44,6 +44,8 @@ pub struct Options {
     /// Context length in tokens, prompt and reply together.
     pub ctx: usize,
     /// Host RAM for the expert cache, in GB.
+    /// Host RAM for the expert cache, in GB. **0 means decide from what is free**:
+    /// see [`Options::expert_cache_bytes`].
     pub ram_gb: usize,
     /// Checkpoint directory (required: no default).
     pub model: PathBuf,
@@ -63,6 +65,12 @@ pub struct Options {
     /// else is taken for a DeepSeek checkpoint directory. Only one is ever resident:
     /// asking for another unloads the current one first.
     pub extra_models: Vec<(String, std::path::PathBuf)>,
+    /// Which configured model to load at start, by name. `None` takes `name`.
+    ///
+    /// Only one model is resident, and loading one takes 10 s for GLM-5.3-Flash and
+    /// 65 s for DeepSeek-V4.1-Flash, so starting with the one that will be asked for
+    /// saves loading a model only to unload it.
+    pub start_model: Option<String>,
     /// Require `Authorization: Bearer KEY`.
     pub api_key: Option<String>,
     /// Reason before answering unless a request says otherwise.
@@ -105,6 +113,28 @@ pub struct Options {
     pub silent: bool,
 }
 
+impl Options {
+    /// The expert cache's RAM, in bytes.
+    ///
+    /// `ram_gb` when it is set, and otherwise 80% of what is free. A fixed default
+    /// is right only on the machine it was picked on: 140 GB left this one (190 GB)
+    /// with the OS and the caller's own tools competing for the rest, and would
+    /// refuse to start on a smaller one. 80% of free leaves a fifth for everything
+    /// else, which is what "most of it" ought to mean.
+    ///
+    /// 32 GB when the machine will not say -- small enough to start anywhere, and
+    /// `--ram-gb` is there for a caller who knows better.
+    pub fn expert_cache_bytes(&self) -> u64 {
+        if self.ram_gb > 0 {
+            return (self.ram_gb as u64) << 30;
+        }
+        match ggml_rs_cuda::host_memory() {
+            Some((free, _total)) => (free as f64 * 0.8) as u64,
+            None => 32u64 << 30,
+        }
+    }
+}
+
 impl Default for Options {
     fn default() -> Options {
         Options {
@@ -112,12 +142,15 @@ impl Default for Options {
             port: 8000,
             devices: Vec::new(),
             ctx: 65536,
-            ram_gb: 140,
+            // Decided at load from what the machine actually has free, rather than
+            // a number that is right for one machine: see `expert_cache_bytes`.
+            ram_gb: 0,
             model: PathBuf::new(),
             engram_meta: None,
             usage: None,
             name: "deepseek-v4.1-flash".into(),
             extra_models: Vec::new(),
+            start_model: None,
             api_key: None,
             thinking: false,
             effort: 75,
@@ -221,7 +254,10 @@ pub fn start_listening(o: Options, listening: impl FnOnce(SocketAddr)) -> nrob::
     let ctx = o.ctx;
     let api_key = o.api_key.clone();
     let local_images = o.local_images.unwrap_or(loopback);
-    let default_name = o.name.clone();
+    // The model actually being served, which is the one `--start` names when it
+    // names one -- reporting `--model`'s name while another is loaded is how the
+    // wrong model gets blamed for the wait.
+    let default_name = o.start_model.clone().unwrap_or_else(|| o.name.clone());
     let configured = {
         let mut names = vec![o.name.clone()];
         names.extend(o.extra_models.iter().map(|(n, _)| n.clone()));
@@ -229,11 +265,15 @@ pub fn start_listening(o: Options, listening: impl FnOnce(SocketAddr)) -> nrob::
     };
 
     let t = Instant::now();
+    // Taken before `o` moves: which model to start with, so the one a caller is
+    // going to ask for is the one that loads, rather than loading another and
+    // unloading it.
+    let start_model = o.start_model.clone();
     let models = Arc::new(models::Models::new(o, loopback)?);
-    // Load the default now rather than on the first request, so a start-up failure
-    // is a start-up failure and not a 400 an hour later.
+    // Load it now rather than on the first request, so a start-up failure is a
+    // start-up failure and not a 400 an hour later.
     models
-        .activate(None)
+        .activate(start_model.as_deref())
         .map_err(|e| nrob::Error::Arg(e))?;
     log(format!(
         "{default_name} loaded in {:.1}s ({ctx} token context)",

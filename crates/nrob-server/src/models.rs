@@ -330,7 +330,7 @@ impl Models {
         let gopts = GpuOptions {
             devices,
             max_seq: o.ctx,
-            expert_cache_bytes: o.ram_gb << 30,
+            expert_cache_bytes: o.expert_cache_bytes() as usize,
             direct_io: true,
             vram_expert_bytes: None,
             vram_headroom_bytes: (o.headroom_gb * (1u64 << 30) as f64) as usize,
@@ -413,7 +413,14 @@ impl Models {
         let cards = llama_rs::glm5next::device::open_cards(&o.devices)
             .map_err(|e| Error::Arg(e.to_string()))?;
         let backend: Arc<dyn ggml_rs::Backend> = Arc::clone(&cards[0]) as Arc<dyn ggml_rs::Backend>;
-        let mut model = llama_rs::Model::open_streaming(&path, backend, (o.ram_gb as u64) << 30)
+        let budget = o.expert_cache_bytes();
+        if o.ram_gb == 0 {
+            self.say(format!(
+                "expert cache: {:.0} GB of host RAM (80% of what is free; --ram-gb pins it)",
+                budget as f64 / 1e9
+            ));
+        }
+        let mut model = llama_rs::Model::open_streaming(&path, backend, budget)
             .map_err(|e| Error::Arg(e.to_string()))?;
 
         // The expert hierarchy. `open_streaming` leaves a streamed model with its
