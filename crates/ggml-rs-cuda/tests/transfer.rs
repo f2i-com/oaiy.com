@@ -472,15 +472,17 @@ fn measure_h2d_bandwidth() {
 fn measure_device_alloc_cost() {
     let Some(b) = try_cuda() else { return };
     println!();
-    println!("   elements      alloc_zeros     alloc (uninit)   empty launch");
+    println!("   elements      alloc_zeros");
     for &n in &[1024usize, 4096, 16384, 1_048_576, 8_388_608] {
-        let warm = b.zeros_f32(n);
+        // `alloc_zeros` takes a shape, not a count: `zeros_f32` never existed on
+        // this backend, so this file has not compiled since it was written.
+        let warm = ggml_rs::Backend::alloc_zeros(&b, vec![n]);
         std::hint::black_box(&warm);
         let iters = 200usize;
 
         let t = std::time::Instant::now();
         for _ in 0..iters {
-            let v = b.zeros_f32(n);
+            let v = ggml_rs::Backend::alloc_zeros(&b, vec![n]);
             std::hint::black_box(&v);
         }
         b.synchronize();

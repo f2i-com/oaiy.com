@@ -103,6 +103,8 @@ struct TierCounters {
     vram_hits: u64,
     vram_misses: u64,
     h2d_bytes: u64,
+    waits_free: u64,
+    waits_pending: u64,
     cpu_records: u64,
     cpu_secs: f64,
     grouped_calls: u64,
@@ -121,6 +123,8 @@ impl TierCounters {
             vram_hits: self.vram_hits.saturating_sub(then.vram_hits),
             vram_misses: self.vram_misses.saturating_sub(then.vram_misses),
             h2d_bytes: self.h2d_bytes.saturating_sub(then.h2d_bytes),
+            waits_free: self.waits_free.saturating_sub(then.waits_free),
+            waits_pending: self.waits_pending.saturating_sub(then.waits_pending),
             cpu_records: self.cpu_records.saturating_sub(then.cpu_records),
             cpu_secs: (self.cpu_secs - then.cpu_secs).max(0.0),
             grouped_calls: self.grouped_calls.saturating_sub(then.grouped_calls),
@@ -360,6 +364,8 @@ impl GlmEngine {
             vram_hits: shards.iter().map(|s| s.hits).sum(),
             vram_misses: shards.iter().map(|s| s.misses).sum(),
             h2d_bytes: shards.iter().map(|s| s.h2d_bytes).sum(),
+            waits_free: shards.iter().map(|s| s.waits_free).sum(),
+            waits_pending: shards.iter().map(|s| s.waits_pending).sum(),
             cpu_records: cpu.0,
             cpu_secs: cpu.2,
             grouped_calls: grouped.0,
@@ -375,6 +381,17 @@ impl GlmEngine {
             100.0 * d.vram_hits as f64 / look as f64,
             (d.vram_hits + d.vram_misses) as f64 / passes,
             d.h2d_bytes as f64 / passes / 1e6,
+        );
+        // Whether the async H2D actually hid: a `waits_free` is a transfer that
+        // had finished before its expert was needed, a `waits_pending` one the
+        // compute stream had to be ordered behind. The second kind is the only
+        // way the upload bytes reach the clock.
+        let waits = (d.waits_free + d.waits_pending).max(1);
+        eprintln!(
+            "  uploads: {:.1}% had landed before they were needed ({:.1} of {:.1} a pass stalled)",
+            100.0 * d.waits_free as f64 / waits as f64,
+            d.waits_pending as f64 / passes,
+            (d.waits_free + d.waits_pending) as f64 / passes,
         );
         eprintln!(
             "  CPU tier: {:.1} records a pass, {:.1} ms a pass",
