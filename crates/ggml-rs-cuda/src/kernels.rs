@@ -1503,11 +1503,15 @@ __global__ void kda_delta_step_f32(float* __restrict__ state,
     const float* kh = k + (size_t)h * hd;
     const float* qh = q + (size_t)h * hd;
 
-    const float decay = __expf(g[row]);
+    // The decay is on the kq axis: it varies along the row, so it is indexed by j
+    // and not by `row`. Indexing it by `row` -- one factor for the whole row -- is
+    // the transpose, and being a per-token multiply it compounds; see the module
+    // docs on `llama_rs::glm5next::kda`.
+    const float* gh = g + (size_t)h * hd;
     // pass 1: decay the row in place, then dot it with k
     float acc = 0.0f;
     for (int j = lane; j < hd; j += 32) {
-        float r = st[j] * decay;
+        float r = st[j] * __expf(gh[j]);
         st[j] = r;
         acc += r * kh[j];
     }

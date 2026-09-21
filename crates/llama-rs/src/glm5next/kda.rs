@@ -34,26 +34,45 @@
 //! same, only the physical layout differs. Do not "fix" one to look like the
 //! other.
 //!
-//! **The decay is on `vo`.** In ggml, `g` reshapes to `[1, S, H, n_seqs]` and so
-//! multiplies along dim1 — the same axis `v` and the output live on, not the one
-//! `k` and `q` index. In this module's layout that makes it a **per-row** scale.
-//! Derivation, from `build_delta_net_autoregressive`:
+//! **The decay is on `kq`.** Settled against the reference kernel, not derived:
+//! `ggml_compute_forward_gated_delta_net_one_chunk` in `ggml/src/ggml-cpu/ops.cpp`
+//! stores the state transposed (`s_out[j*S + i] == S[i][j]`, its own comment) and
+//! does
 //!
-//! ```text
-//! sk  = sum_rows(s * k)      // k broadcasts on dim0 => sk survives on dim1
-//! d   = v - transpose(sk)    // v's axis == sk's surviving axis == dim1
-//! s   = s * g                // g is [1, S, ...] => also dim1
+//! ```c
+//! for (i) delta[i] = expf(g_d[i]);
+//! for (j) ggml_vec_mul_f32(S, &s_out[j*S], &s_out[j*S], delta);  // M[j][i] *= exp(g[i])
+//! for (j) delta[j] = (v_d[j] - dot(&s_out[j*S], k_d)) * beta;    // k contracts over i
 //! ```
 //!
-//! [`decay_axis_is_the_output_axis`] pins this; if a greedy-token comparison
-//! against llama.cpp ever disagrees, that test is where the one-line fix goes.
+//! `k` contracts over its `i` and `v` is indexed by its `j`, so `i` is `kq` and `j`
+//! is `vo` — and the decay varies along `i`. In this module's layout, where a row
+//! is `vo` and a column is `kq`, that is a **per-column** scale: every row is
+//! multiplied by the same `exp(g)` vector.
+//!
+//! This read `vo` until 2026-09-21, from `g` reshaping to `[1, S, H, n_seqs]` and
+//! so multiplying along dim1. That shape is the **scalar-gate** case. `ggml.h`
+//! gives both: `g : [1, H_v, n_tokens, n_seqs] (scalar gate) or [S_v, H_v,
+//! n_tokens, n_seqs] (KDA)`, and `glm5next.cpp` takes the second --
+//! `ggml_reshape_3d(g, head_dim, n_head, n_tokens)`, channel on dim0. Reading the
+//! scalar shape for the KDA one transposed the decay.
+//!
+//! It cost a day, because of how it fails. The state is multiplied by this once per
+//! token, so the wrong axis is a small error that compounds: a 32-token prompt is
+//! answered correctly and a 287-token one degenerates into quoting its own context
+//! back. That reads as a long-prompt bug, and sent the search through batched
+//! prefill, the prompt cache, the chat template, the sparse indexer, the CUDA
+//! kernels and the sampler -- all of which compared this port's two paths against
+//! each other, which cannot catch a mistake they share. Both had this one.
+//!
+//! [`decay_axis_is_the_kq_axis`] pins it now.
 //!
 //! ## The step
 //!
 //! Per head, per token, with `S = kda.head_dim` (128):
 //!
 //! ```text
-//! s[i][j] *= exp(g[i])                      // g is LOG-decay, exp'd HERE
+//! s[i][j] *= exp(g[j])                      // g is LOG-decay, exp'd HERE
 //! sk[i]    = sum_j s[i][j] * k[j]
 //! d[i]     = (v[i] - sk[i]) * beta          // beta is one scalar per head
 //! s[i][j] += d[i] * k[j]                    // outer product
@@ -86,7 +105,7 @@ use crate::{LlamaError, Result};
 ///   * `state` — `s[head][vo][kq]`, updated in place.
 ///   * `q`, `k` — L2-normed, `q` unscaled.
 ///   * `v`
-///   * `g_log` — log-decay per `vo` channel. For a gated-delta-net-style scalar
+///   * `g_log` — log-decay per `kq` channel. For a gated-delta-net-style scalar
 ///     decay, repeat the head's value across its channels.
 ///   * `beta` — one per head, already sigmoid'd.
 ///   * `out` — `o[head][vo]`, overwritten.
@@ -134,6 +153,9 @@ pub fn step(
     let scale = 1.0 / (hd as f32).sqrt();
 
     let mut d = vec![0.0f32; hd];
+    // The per-channel decay, exp'd once a head rather than once a row: it is on the
+    // `kq` axis, so every row is scaled by the same vector.
+    let mut dec = vec![0.0f32; hd];
 
     for h in 0..n_head {
         let hs = &mut state[h * hd * hd..(h + 1) * hd * hd];
@@ -143,13 +165,18 @@ pub fn step(
         let gh = &g_log[h * hd..(h + 1) * hd];
         let bh = beta[h];
 
+        for (dj, &gj) in dec.iter_mut().zip(gh.iter()) {
+            *dj = gj.exp();
+        }
+
         for i in 0..hd {
-            // Per-row decay: g is on the vo axis. See the module docs.
-            let decay = gh[i].exp();
+            // Per-column decay: g is on the kq axis, so it varies *within* a row
+            // rather than between rows. See the module docs -- this was the other
+            // way round, and being wrong here is a per-token error that compounds.
             let row = &mut hs[i * hd..(i + 1) * hd];
             let mut acc = 0.0f32;
-            for (rj, &kj) in row.iter_mut().zip(kh.iter()) {
-                *rj *= decay;
+            for ((rj, &kj), &dj) in row.iter_mut().zip(kh.iter()).zip(dec.iter()) {
+                *rj *= dj;
                 acc += *rj * kj;
             }
             // The delta rule: write only the part of v the state does not
@@ -308,14 +335,16 @@ mod tests {
         }
     }
 
-    /// The decay is on the **output** axis, so a killed channel must clear a
-    /// state **row**, leaving the other rows intact. `beta = 0` suppresses the
+    /// The decay is on the **`kq`** axis, so a killed channel must clear a state
+    /// **column**, leaving the other columns intact. `beta = 0` suppresses the
     /// write so only the decay is observed.
     ///
-    /// If a real-weights comparison against llama.cpp ever disagrees, flip the
-    /// index here and in [`step`] together.
+    /// This asserted the transpose -- a cleared row -- and passed, because the
+    /// assertion was derived from the same misreading as the code. The reference
+    /// kernel is quoted in the module docs; it is the authority here, not a
+    /// derivation from tensor shapes.
     #[test]
-    fn decay_axis_is_the_output_axis() {
+    fn decay_axis_is_the_kq_axis() {
         let hd = 4;
         let n_head = 1;
         let dead = 2usize;
@@ -332,11 +361,11 @@ mod tests {
 
         step(&mut state, &q, &k, &v, &g, &beta, n_head, hd, &mut out).expect("step");
 
-        for j in 0..hd {
-            assert_eq!(state[dead * hd + j], 0.0, "row {dead} col {j} must be cleared");
+        for i in 0..hd {
+            assert_eq!(state[i * hd + dead], 0.0, "row {i} col {dead} must be cleared");
         }
-        for i in (0..hd).filter(|&i| i != dead) {
-            for j in 0..hd {
+        for i in 0..hd {
+            for j in (0..hd).filter(|&j| j != dead) {
                 assert!(
                     (state[i * hd + j] - 1.0).abs() < 1e-6,
                     "row {i} col {j} must survive, got {}",

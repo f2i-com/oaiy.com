@@ -1741,6 +1741,320 @@ mod tests {
         );
     }
 
+    /// The same words, raw versus chat-formatted, side by side.
+    ///
+    /// The raw completion of "…alpha bravo charlie delta echo" continues the NATO
+    /// alphabet correctly, and the identical request through the chat template comes
+    /// back having dropped the first two words. Same model, same weights, same
+    /// engine -- so this prints both prompts' ids and continuations together, which
+    /// says whether the template's text is the problem or something around it.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "diagnostic: raw versus chat-formatted"]
+    fn print_raw_and_chat_continuations() {
+        let backend = match cuda_backend() {
+            Some(b) => b,
+            None => return,
+        };
+        let model = match crate::Model::open_streaming(RELEASED, backend, 64 << 30) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("open failed ({e}); skipping");
+                return;
+            }
+        };
+        let crate::Model::Glm5Next(g) = &model else { return };
+        let body = "Repeat the following words exactly, in order, and nothing else:\n\
+                    alpha bravo charlie delta echo";
+
+        // What the chat path actually sends, built by this crate's own template.
+        let msgs = [crate::ChatMessage {
+            role: crate::Role::User,
+            content: body.to_owned(),
+        }];
+        let chat = crate::glm5next_template_full(&msgs, true, crate::ReasoningEffort::Low, true);
+
+        for (label, text, special) in [("raw", body.to_owned(), true), ("chat", chat, false)] {
+            let ids = model.tokenizer().encode(&text, special).expect("encode");
+            println!("\n--- {label} ---");
+            println!("text: {text:?}");
+            println!("{} ids: {:?}", ids.len(), ids);
+            g.reset();
+            let mut kv = model.new_kv_cache(512);
+            let mut logits = g.forward(&ids, &mut kv).expect("prefill");
+            let mut out = Vec::new();
+            for _ in 0..20 {
+                let d = logits.data();
+                let t = d
+                    .iter()
+                    .enumerate()
+                    .fold((0u32, f32::NEG_INFINITY), |m, (i, &x)| {
+                        if x > m.1 { (i as u32, x) } else { m }
+                    })
+                    .0;
+                out.push(t);
+                logits = g.forward(&[t], &mut kv).expect("decode");
+            }
+            println!("greedy: {:?}", model.tokenizer().decode(&out));
+        }
+    }
+
+    /// VENDORED-LOCAL: GLM-5.3-Flash. Chunking, or length? One prompt, three ways.
+    ///
+    /// The 2x2 in [`print_both_generation_prompts`] showed a 32-id prompt answering
+    /// correctly and a 287-id one degenerating, under either generation prompt. So the
+    /// chat template is not the fault and something grows with the prompt. But 32 is
+    /// also under `prefill_chunk()`'s default 64, so that prompt is a single chunk and
+    /// never crosses a boundary, while 287 is five chunks. Length and chunk count are
+    /// confounded.
+    ///
+    /// `GLM5_PREFILL_CHUNK=1` was read as ruling batching out. It does not: `forward`
+    /// dispatches to `forward_token` only for `tokens.len() == 1`, so a chunk size of 1
+    /// still runs `forward_chunk`, once per token. A fault inside `forward_chunk` that
+    /// does not depend on the chunk width survives that test untouched.
+    ///
+    /// These three do separate it, on one prompt:
+    ///
+    ///   * chunks of 64 -- what serving does.
+    ///   * one chunk of the whole prompt -- batched, no boundary.
+    ///   * `forward_token` per token -- no batching at all, the oldest path.
+    ///
+    /// If only the first is wrong, the fault is at a chunk boundary. If the first two
+    /// are wrong and the third is right, it is in `forward_chunk` itself. If all three
+    /// are wrong, it is neither, and length alone is doing it.
+    #[test]
+    #[ignore = "needs the released weights and a card"]
+    fn print_long_prompt_three_ways() {
+        let backend = match cuda_backend() {
+            Some(b) => b,
+            None => return,
+        };
+        let model = match crate::Model::open_streaming(RELEASED, backend, 64 << 30) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("open failed ({e}); skipping");
+                return;
+            }
+        };
+        let crate::Model::Glm5Next(g) = &model else { return };
+
+        let body = concat!(
+            "The survey party reached the northern ridge shortly after dawn, later than planned, ",
+            "because the track above the river crossing had washed out in the night. ",
+            "Instruments were unpacked on the flat stone below the cairn and levelled against ",
+            "a benchmark cut in 1954, which the party found intact though heavily lichened. ",
+            "Cloud sat on the summit until mid-morning and the first sightings were taken blind, ",
+            "by compass alone, with the theodolite kept covered against the drizzle. ",
+            "By eleven the cloud lifted enough to shoot the eastern trig, and three rounds were ",
+            "closed with a misclosure of four seconds, well inside tolerance. ",
+            "The afternoon was spent on the traverse down the western spur, where the ground is ",
+            "broken and the chain had to be broken into short bays. ",
+            "Two of the bays were measured twice because a reading was doubted, and the second ",
+            "measurement stood. Water was running in the gully that the older sheets show dry, ",
+            "which the party noted for the revision. A shepherd met on the descent said the ",
+            "gully had run every winter since the forestry road was cut above it, and that the ",
+            "old ford was no longer passable to vehicles. Light failed before the last station ",
+            "could be occupied, so it was left for the following day. ",
+            "Question: in one sentence, what kind of document is the text above, and what is it about?"
+        );
+        let msgs = [crate::ChatMessage {
+            role: crate::Role::User,
+            content: body.to_owned(),
+        }];
+        let text = crate::glm5next_template_full(&msgs, true, crate::ReasoningEffort::Low, true);
+        let ids = model.tokenizer().encode(&text, false).expect("encode");
+        println!("prompt is {} ids, chunk default {}", ids.len(), forward::prefill_chunk());
+
+        // (label, chunk width) -- 0 means "one token at a time through forward_token".
+        for (label, chunk) in [
+            ("chunks of 64 (what serving does)", 64usize),
+            ("one chunk, no boundary", ids.len() + 8),
+            ("forward_token, one token at a time", 0),
+        ] {
+            if chunk == 0 {
+                std::env::remove_var("GLM5_PREFILL_CHUNK");
+            } else {
+                std::env::set_var("GLM5_PREFILL_CHUNK", chunk.to_string());
+            }
+            g.reset();
+            let mut kv = model.new_kv_cache(1024);
+            let mut logits = if chunk == 0 {
+                // Every call a single token, which is the only way to reach
+                // `forward_token`: `forward` checks `tokens.len() == 1`.
+                let mut last = None;
+                for &t in &ids {
+                    last = Some(g.forward(&[t], &mut kv).expect("prefill"));
+                }
+                last.expect("a non-empty prompt")
+            } else {
+                g.forward(&ids, &mut kv).expect("prefill")
+            };
+            let mut out = Vec::new();
+            for _ in 0..40 {
+                let d = logits.data();
+                let t = d
+                    .iter()
+                    .enumerate()
+                    .fold((0u32, f32::NEG_INFINITY), |m, (i, &x)| {
+                        if x > m.1 { (i as u32, x) } else { m }
+                    })
+                    .0;
+                out.push(t);
+                logits = g.forward(&[t], &mut kv).expect("decode");
+            }
+            println!("\n--- {label} ---\n{:?}", model.tokenizer().decode(&out));
+        }
+        std::env::remove_var("GLM5_PREFILL_CHUNK");
+    }
+
+    /// VENDORED-LOCAL: GLM-5.3-Flash. Does the generation prompt decide coherence?
+    ///
+    /// The shipped Jinja has exactly one form for `add_generation_prompt`:
+    ///
+    /// ```jinja
+    /// {%- if add_generation_prompt -%}
+    /// <|assistant|>{{- '<think>' -}}
+    /// ```
+    ///
+    /// There is no non-thinking variant. `<think></think>` appears in that template
+    /// only for a *history* turn that recorded no reasoning -- never as a sequence the
+    /// model is asked to continue from. This port invented a second form for a
+    /// "non-thinking" mode and `nrob-server` defaults to it, so every request
+    /// coder-cli has made asked the model to continue from something it was never
+    /// trained to continue: off-distribution, which on a reasoning model degenerates
+    /// into the repetition this has been chased for a day.
+    ///
+    /// So: one prompt, both generation prompts, short and long. If the closed form is
+    /// the fault, the `<think>` column answers and the `<think></think>` column does
+    /// not, and the long prompt makes it worse rather than causing it.
+    #[test]
+    #[ignore = "needs the released weights and a card"]
+    fn print_both_generation_prompts() {
+        let backend = match cuda_backend() {
+            Some(b) => b,
+            None => return,
+        };
+        let model = match crate::Model::open_streaming(RELEASED, backend, 64 << 30) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("open failed ({e}); skipping");
+                return;
+            }
+        };
+        let crate::Model::Glm5Next(g) = &model else { return };
+
+        let short = "Repeat the following words exactly, in order, and nothing else:\nalpha bravo charlie delta echo";
+        // Long, and deliberately not one paragraph repeated: earlier reproductions
+        // stacked copies of a single paragraph, which confounds length with
+        // repetition, and a model will happily carry on repeating what it was fed.
+        let long = concat!(
+            "The survey party reached the northern ridge shortly after dawn, later than planned, ",
+            "because the track above the river crossing had washed out in the night. ",
+            "Instruments were unpacked on the flat stone below the cairn and levelled against ",
+            "a benchmark cut in 1954, which the party found intact though heavily lichened. ",
+            "Cloud sat on the summit until mid-morning and the first sightings were taken blind, ",
+            "by compass alone, with the theodolite kept covered against the drizzle. ",
+            "By eleven the cloud lifted enough to shoot the eastern trig, and three rounds were ",
+            "closed with a misclosure of four seconds, well inside tolerance. ",
+            "The afternoon was spent on the traverse down the western spur, where the ground is ",
+            "broken and the chain had to be broken into short bays. ",
+            "Two of the bays were measured twice because a reading was doubted, and the second ",
+            "measurement stood. Water was running in the gully that the older sheets show dry, ",
+            "which the party noted for the revision. A shepherd met on the descent said the ",
+            "gully had run every winter since the forestry road was cut above it, and that the ",
+            "old ford was no longer passable to vehicles. Light failed before the last station ",
+            "could be occupied, so it was left for the following day. ",
+            "Question: in one sentence, what kind of document is the text above, and what is it about?"
+        );
+
+        for (name, body) in [("short", short), ("long", long)] {
+            let msgs = [crate::ChatMessage {
+                role: crate::Role::User,
+                content: body.to_owned(),
+            }];
+            for (form, thinking) in [("<think>", true), ("<think></think>", false)] {
+                let text = crate::glm5next_template_full(
+                    &msgs,
+                    true,
+                    crate::ReasoningEffort::Low,
+                    thinking,
+                );
+                let ids = model.tokenizer().encode(&text, false).expect("encode");
+                g.reset();
+                let mut kv = model.new_kv_cache(1024);
+                let mut logits = g.forward(&ids, &mut kv).expect("prefill");
+                let mut out = Vec::new();
+                for _ in 0..48 {
+                    let d = logits.data();
+                    let t = d
+                        .iter()
+                        .enumerate()
+                        .fold((0u32, f32::NEG_INFINITY), |m, (i, &x)| {
+                            if x > m.1 { (i as u32, x) } else { m }
+                        })
+                        .0;
+                    out.push(t);
+                    logits = g.forward(&[t], &mut kv).expect("decode");
+                }
+                println!(
+                    "\n--- {name} ({} ids), generation prompt {form} ---\n{:?}",
+                    ids.len(),
+                    model.tokenizer().decode(&out)
+                );
+            }
+        }
+    }
+
+    /// The raw greedy continuation of a fixed prompt, for diffing against llama.cpp.
+    ///
+    /// The reference, built from the pinned commit, answers a 369-token prompt
+    /// correctly where this engine produces word salad -- so the weights are sound
+    /// and the fault is here. Everything compared so far compares this port's own
+    /// paths against each other, which cannot catch a mistake they share.
+    ///
+    /// This prints ids and text for a plain completion -- no chat template, nothing
+    /// the two implementations could disagree about except the model -- so the first
+    /// token that differs from llama.cpp's is where to start looking.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "diagnostic: prints a greedy continuation to diff against llama.cpp"]
+    fn print_greedy_continuation() {
+        let backend = match cuda_backend() {
+            Some(b) => b,
+            None => return,
+        };
+        let model = match crate::Model::open_streaming(RELEASED, backend, 64 << 30) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("open failed ({e}); skipping");
+                return;
+            }
+        };
+        let text = "Repeat the following words exactly, in order, and nothing else:\n\
+                    alpha bravo charlie delta echo";
+        let ids = model.tokenizer().encode(text, true).expect("encode");
+        let crate::Model::Glm5Next(g) = &model else { return };
+        println!("prompt {} ids: {:?}", ids.len(), ids);
+
+        let mut kv = model.new_kv_cache(512);
+        let mut logits = g.forward(&ids, &mut kv).expect("prefill");
+        let mut out = Vec::new();
+        for _ in 0..24 {
+            let d = logits.data();
+            let t = d
+                .iter()
+                .enumerate()
+                .fold((0u32, f32::NEG_INFINITY), |m, (i, &x)| {
+                    if x > m.1 { (i as u32, x) } else { m }
+                })
+                .0;
+            out.push(t);
+            logits = g.forward(&[t], &mut kv).expect("decode");
+        }
+        println!("greedy ids: {out:?}");
+        println!("greedy text: {:?}", model.tokenizer().decode(&out));
+    }
+
     /// Host against CUDA over MANY tokens, not one.
     ///
     /// `released_model_agrees_with_host_on_cuda` compares a single forward pass, so

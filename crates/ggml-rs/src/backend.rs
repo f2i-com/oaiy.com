@@ -455,10 +455,14 @@ pub trait Backend: Send + Sync + Debug + 'static {
     /// holding q, k, v and `g_log` in that order, `beta` is `[n_head]`. The result
     /// is `[n_head * head_dim]`.
     ///
-    /// Per state row `(h, i)`, with the decay on the vo axis:
+    /// Per state row `(h, i)`, with the decay on the **kq** axis -- so it varies
+    /// along the row, and every row of a head is scaled by the same vector. See
+    /// `llama_rs::glm5next::kda` for the reference kernel this is read off; having
+    /// it transposed here is a per-token error that compounds, and reads as a
+    /// long-prompt bug rather than a wrong one.
     ///
     /// ```text
-    ///   row  *= exp(g_log[h,i])
+    ///   row  *= exp(g_log[h,:])
     ///   d     = (v[h,i] - dot(row, k[h])) * beta[h]
     ///   row  += d * k[h]
     ///   out   = dot(row, q[h]) / sqrt(head_dim)
@@ -497,14 +501,21 @@ pub trait Backend: Send + Sync + Debug + 'static {
         let mut out = vec![0.0f32; n];
         let mut d = vec![0.0f32; hd];
 
+        let mut dec = vec![0.0f32; hd];
         for h in 0..n_head {
             let base = h * hd * hd;
+            for (dj, &gj) in dec.iter_mut().zip(&g[h * hd..(h + 1) * hd]) {
+                *dj = gj.exp();
+            }
             for i in 0..hd {
-                let decay = g[h * hd + i].exp();
                 let row = &mut st[base + i * hd..base + (i + 1) * hd];
                 let mut acc = 0.0f32;
-                for (rj, &kj) in row.iter_mut().zip(&k[h * hd..(h + 1) * hd]) {
-                    *rj *= decay;
+                for ((rj, &kj), &dj) in row
+                    .iter_mut()
+                    .zip(&k[h * hd..(h + 1) * hd])
+                    .zip(dec.iter())
+                {
+                    *rj *= dj;
                     acc += *rj * kj;
                 }
                 d[i] = (v[h * hd + i] - acc) * bd[h];
