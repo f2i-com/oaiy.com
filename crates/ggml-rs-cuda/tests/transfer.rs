@@ -467,6 +467,69 @@ fn measure_h2d_bandwidth() {
 // glm5next token makes roughly 2,000 of them: ~710 `Mat::apply` calls plus four
 // launches for each of 336 routed experts. If an allocation costs tens of
 // microseconds, that is the token.
+/// The cost of one host -> kernel -> host round trip, which is what a glm5next
+/// token is made of 1319 of.
+///
+/// GLM5_PROF=1 counts 642.6 D2H and 676.6 H2D a token, moving 35 MB in ~27 KB
+/// pieces, while the cards sit at 2-18% busy. 114 ms over 1319 trips is 86 us
+/// each, but that average includes all the real work. This isolates the trip:
+/// upload a vector, launch one small kernel, read it back. Whatever that costs,
+/// times 1319, is what device-resident activations would be reclaiming.
+#[test]
+#[ignore = "measures the round-trip latency"]
+fn measure_round_trip_latency() {
+    use ggml_rs::Backend;
+    let Some(b) = try_cuda() else { return };
+    println!();
+    println!("  values   upload+kernel+download   upload only   kernel only");
+    // 4096 is glm5next's hidden size; the rest bracket it.
+    for &n in &[288usize, 4096, 8192] {
+        let host = ggml_rs::tensor::Tensor::from_vec(vec![0.5f32; n], vec![1, n]);
+        let iters = 500usize;
+
+        // Warm the allocator and the module so the first trip is not the slow one.
+        for _ in 0..20 {
+            let d = b.to_device(host.clone());
+            let mut y = d;
+            b.mul_scalar_inplace(&mut y, 2.0);
+            std::hint::black_box(b.to_host(y));
+        }
+
+        let t = std::time::Instant::now();
+        for _ in 0..iters {
+            let d = b.to_device(host.clone());
+            let mut y = d;
+            b.mul_scalar_inplace(&mut y, 2.0);
+            std::hint::black_box(b.to_host(y));
+        }
+        let full = t.elapsed().as_secs_f64() / iters as f64;
+
+        let t = std::time::Instant::now();
+        for _ in 0..iters {
+            std::hint::black_box(b.to_device(host.clone()));
+        }
+        let up = t.elapsed().as_secs_f64() / iters as f64;
+
+        let mut d = b.to_device(host.clone());
+        let t = std::time::Instant::now();
+        for _ in 0..iters {
+            b.mul_scalar_inplace(&mut d, 2.0);
+        }
+        b.synchronize();
+        let kern = t.elapsed().as_secs_f64() / iters as f64;
+
+        println!(
+            "  {:6}   {:12.1} us      {:8.1} us   {:8.1} us",
+            n,
+            full * 1e6,
+            up * 1e6,
+            kern * 1e6
+        );
+    }
+    println!();
+    println!("a glm5next token makes 1319 of these; multiply the first column by 1319");
+}
+
 #[test]
 #[ignore = "measures the CUDA allocator"]
 fn measure_device_alloc_cost() {
