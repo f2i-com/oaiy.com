@@ -778,9 +778,18 @@ impl ExpertFfn for StreamExperts {
         }
 
         // One resolve for the chunk: this is what is being amortised.
+        // Promotions are per resolve call, and a chunk makes one call where the
+        // per-token path made `n`. Asking for one would fill the VRAM tier `n` times
+        // slower than decode does -- measured as caches stuck at 3.3 and 10.5 GB of
+        // a 20.4 and 26.7 GB budget, creeping up 32 MiB at a time, with almost every
+        // expert going to the CPU and both cards idle. So the budget scales with the
+        // chunk: the same promotions a token as before. `resolve_experts_hybrid`
+        // takes the top `promote` of the misses, so this is bounded by how many
+        // there actually are.
         let t_resolve = std::time::Instant::now();
+        let promote = promote_per_layer().saturating_mul(n);
         let resolved = match &self.cpu {
-            Some(_) => ls.resolve_experts_hybrid(&distinct, promote_per_layer()),
+            Some(_) => ls.resolve_experts_hybrid(&distinct, promote),
             None => ls.resolve_experts(&distinct),
         }
         .map_err(|err| LlamaError::Config(format!("device: MoE layer {ord}: {err}")))?;
