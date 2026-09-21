@@ -266,55 +266,72 @@ pub fn attend_latent(
         )));
     }
 
-    let mut p = vec![0.0f32; len];
+    // VENDORED-LOCAL: PERF. One head a thread.
+    //
+    // This is O(len) work a token -- `n_head` dot products `kv_lora` wide against
+    // every cached latent, twice -- so a prompt is O(n^2) in it. Measured through
+    // the server it is 7.2 ms a token at position 256 and 124.25 ms at 1740, which
+    // at 1740 tokens made it the largest single item in the forward pass and left
+    // both cards at 0-1% busy while one core did this.
+    //
+    // The heads are independent: each reads the same latents and writes its own
+    // `kv_lora` slice of `out`, so this is the same arithmetic in the same order
+    // within a head, on 32 threads instead of one. The scratch row of scores moves
+    // inside, one `len`-wide allocation a head against `len * kv_lora` multiplies.
+    //
+    // Doing it on the card would be better still and the backend has the pieces
+    // (`bmm_qkt`, `bmm_av`, `attention`); this is the cheap half of that.
+    use rayon::prelude::*;
+    out.par_chunks_mut(kv_lora)
+        .enumerate()
+        .take(n_head)
+        .for_each(|(h, ctx)| {
+            let qh = &q_abs[h * kv_lora..(h + 1) * kv_lora];
+            ctx.fill(0.0);
+            let mut p = vec![0.0f32; len];
 
-    for h in 0..n_head {
-        let qh = &q_abs[h * kv_lora..(h + 1) * kv_lora];
-        let ctx = &mut out[h * kv_lora..(h + 1) * kv_lora];
-        ctx.fill(0.0);
-
-        // Scores against the single head of latent keys (absorbed MLA is MQA).
-        let mut max = f32::NEG_INFINITY;
-        for t in 0..len {
-            let m = mask[t];
-            // Any non-finite entry counts as masked. Catching +inf and NaN here
-            // too keeps `exp(s - max)` from becoming NaN on a malformed mask.
-            if !m.is_finite() {
-                p[t] = f32::NEG_INFINITY;
-                continue;
+            // Scores against the single head of latent keys (absorbed MLA is MQA).
+            let mut max = f32::NEG_INFINITY;
+            for t in 0..len {
+                let m = mask[t];
+                // Any non-finite entry counts as masked. Catching +inf and NaN here
+                // too keeps `exp(s - max)` from becoming NaN on a malformed mask.
+                if !m.is_finite() {
+                    p[t] = f32::NEG_INFINITY;
+                    continue;
+                }
+                let row = &latents[t * kv_lora..(t + 1) * kv_lora];
+                let s = qh.iter().zip(row).map(|(a, b)| a * b).sum::<f32>() * scale + m;
+                p[t] = s;
+                if s > max {
+                    max = s;
+                }
             }
-            let row = &latents[t * kv_lora..(t + 1) * kv_lora];
-            let s = qh.iter().zip(row).map(|(a, b)| a * b).sum::<f32>() * scale + m;
-            p[t] = s;
-            if s > max {
-                max = s;
-            }
-        }
 
-        // A query with nothing visible contributes nothing rather than NaNs.
-        if !max.is_finite() {
-            continue;
-        }
-
-        let mut sum = 0.0f32;
-        for s in p.iter_mut() {
-            *s = if s.is_finite() { (*s - max).exp() } else { 0.0 };
-            sum += *s;
-        }
-        let inv = 1.0 / sum;
-
-        // V is the same latent row as K, so the context is in latent space.
-        for t in 0..len {
-            let w = p[t] * inv;
-            if w == 0.0 {
-                continue;
+            // A query with nothing visible contributes nothing rather than NaNs.
+            if !max.is_finite() {
+                return;
             }
-            let row = &latents[t * kv_lora..(t + 1) * kv_lora];
-            for (c, &r) in ctx.iter_mut().zip(row) {
-                *c += w * r;
+
+            let mut sum = 0.0f32;
+            for s in p.iter_mut() {
+                *s = if s.is_finite() { (*s - max).exp() } else { 0.0 };
+                sum += *s;
             }
-        }
-    }
+            let inv = 1.0 / sum;
+
+            // V is the same latent row as K, so the context is in latent space.
+            for t in 0..len {
+                let w = p[t] * inv;
+                if w == 0.0 {
+                    continue;
+                }
+                let row = &latents[t * kv_lora..(t + 1) * kv_lora];
+                for (c, &r) in ctx.iter_mut().zip(row) {
+                    *c += w * r;
+                }
+            }
+        });
     Ok(())
 }
 
