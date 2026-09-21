@@ -1741,6 +1741,72 @@ mod tests {
         );
     }
 
+    /// Host against CUDA over MANY tokens, not one.
+    ///
+    /// `released_model_agrees_with_host_on_cuda` compares a single forward pass, so
+    /// it cannot see an error that accumulates: the trunk is 34 KDA layers, and KDA
+    /// is a recurrence whose state carries from token to token. A kernel that is
+    /// slightly wrong per step looks perfect at one token and ruins a long prompt.
+    ///
+    /// And a long prompt is ruined: coherent at 73 tokens, and at ~2000 the model
+    /// emits word salad in several languages at the model's own sampling settings,
+    /// or repeats one line forever at temperature 0. Both are one fault seen through
+    /// two samplers -- a broken distribution.
+    ///
+    /// The host path is ~13.5 s a token, so this is deliberately short. Even 32
+    /// tokens is 32 steps of accumulation, which is 32x more than the gate above.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "slow: the host path is ~13.5s a token"]
+    fn host_and_cuda_agree_over_many_tokens() {
+        use super::super::bridge::HostModel;
+        let n = std::env::var("GLM5_HOST_TOKENS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(32);
+        // Real ids, deterministic: a sentence's worth of ordinary tokens.
+        let prompt: Vec<u32> = (0..n).map(|i| (1000 + (i * 37) % 60000) as u32).collect();
+
+        let Some(backend) = cuda_backend() else { return };
+        let dm = DeviceModel::open(RELEASED, 512, backend).expect("cuda load");
+        let ds = dm.shape().clone();
+        let dv = dm.view();
+        let mut d_state = forward::State::new_on(&ds, dm.backend()).expect("state");
+        assert!(d_state.kda_on_device(), "the KDA state should be resident");
+        let d = forward::forward_prompt(&ds, &dv, &mut d_state, &prompt).expect("cuda");
+        let d_kda = d_state.kda_max_abs();
+        drop(dv);
+        drop(dm);
+
+        let hm = HostModel::open(RELEASED, 512).expect("host load");
+        let hs = hm.shape().clone();
+        let hv = hm.view();
+        let mut h_state = forward::State::new(&hs).expect("state");
+        let t = std::time::Instant::now();
+        let h = forward::forward_prompt(&hs, &hv, &mut h_state, &prompt).expect("host");
+        println!("host: {n} tokens in {:.0}s", t.elapsed().as_secs_f64());
+
+        let scale = h.iter().fold(0.0f32, |m, a| m.max(a.abs())).max(1.0);
+        let worst = h
+            .iter()
+            .zip(d.iter())
+            .fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
+        println!("max |host - cuda| after {n} tokens: {worst:.6} (scale {scale:.3})");
+        println!("max|KDA state|: host {:.4}, cuda {:.4}", h_state.kda_max_abs(), d_kda);
+        let top = |v: &[f32]| {
+            v.iter()
+                .enumerate()
+                .fold((0usize, f32::NEG_INFINITY), |m, (i, &x)| if x > m.1 { (i, x) } else { m })
+                .0
+        };
+        println!("argmax: host {}, cuda {}", top(&h), top(&d));
+        assert!(d.iter().all(|v| v.is_finite()), "cuda logits must be finite");
+        assert!(
+            worst < 0.05 * scale,
+            "host and cuda diverge by {worst} at scale {scale} after {n} tokens"
+        );
+    }
+
     /// Greedy generation on the GPU, with the real tokenizer and chat format.
     ///
     /// This is the strongest end-to-end signal short of a numerical diff against
