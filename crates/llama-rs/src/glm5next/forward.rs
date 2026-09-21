@@ -1789,6 +1789,140 @@ fn ffn_chunk(
     }
 }
 
+/// VENDORED-LOCAL: GLM-5.3-Flash. Everything a prompt leaves behind, as plain f32.
+///
+/// A prompt is the expensive part of a request and a harness sends the same one
+/// every time: coder-cli's system prompt is thousands of tokens, and reading it
+/// takes minutes. This is what lets a later process start where an earlier one
+/// finished instead of reading it again -- the same trick `dsv41_cuda::Snapshot`
+/// does for DeepSeek, whose states `nrob-server` already keeps on disk.
+///
+/// The recurrent state is fixed-size (34 layers x 4.2 MB) and has to be kept whole.
+/// The caches are not: `latents` and the indexer buffers are allocated for
+/// `max_len` and written from the front, so only the first `len` tokens' rows mean
+/// anything and the rest would be zeros on disk.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StateSnapshot {
+    /// Tokens this state covers.
+    pub len: usize,
+    /// Per KDA layer, the delta-rule state.
+    pub kda: Vec<Vec<f32>>,
+    /// Per KDA layer, the depthwise conv's pre-conv window.
+    pub conv: Vec<Vec<f32>>,
+    /// Per MLA layer, the cached latent rows for `len` tokens.
+    pub latents: Vec<Vec<f32>>,
+    /// Per MLA layer, the indexer rows for `len` tokens.
+    pub kpool: Vec<Vec<f32>>,
+}
+
+impl State {
+    /// VENDORED-LOCAL: GLM-5.3-Flash. Copy this state out, for disk or another
+    /// process.
+    ///
+    /// Downloads the recurrent state when it lives on a card: 143 MB, once per
+    /// snapshot rather than once per layer per token, which is why the state is
+    /// kept there in the first place.
+    pub fn snapshot(&self, kv_lora: usize) -> Result<StateSnapshot> {
+        let kda = match &self.kda_dev {
+            Some((tensors, backend)) => tensors
+                .iter()
+                .map(|t| backend.to_host(t.clone()).data().to_vec())
+                .collect(),
+            None => self.kda.clone(),
+        };
+        let keep = self.len * kv_lora;
+        Ok(StateSnapshot {
+            len: self.len,
+            kda,
+            conv: self.conv.clone(),
+            latents: self
+                .latents
+                .iter()
+                .map(|l| l.get(..keep.min(l.len())).unwrap_or(l).to_vec())
+                .collect(),
+            kpool: self.kpool.rows_upto(self.len),
+        })
+    }
+
+    /// Put a snapshot back, so the next token continues from it.
+    ///
+    /// Everything past `len` is zeroed rather than left alone: a state being
+    /// restored may be shorter than whatever this one held, and the difference has
+    /// to read as "not written yet" and not as another prompt's rows.
+    pub fn restore(&mut self, snap: &StateSnapshot, kv_lora: usize) -> Result<()> {
+        if snap.len > self.max_len {
+            return Err(LlamaError::Config(format!(
+                "forward: restoring {} tokens into a {}-token state",
+                snap.len, self.max_len
+            )));
+        }
+        if snap.kda.len() != self.conv.len()
+            || snap.conv.len() != self.conv.len()
+            || snap.latents.len() != self.latents.len()
+        {
+            return Err(LlamaError::Config(format!(
+                "forward: snapshot has {} KDA / {} conv / {} MLA layers, state has {} / {}",
+                snap.kda.len(),
+                snap.conv.len(),
+                snap.latents.len(),
+                self.conv.len(),
+                self.latents.len()
+            )));
+        }
+        match &mut self.kda_dev {
+            Some((tensors, backend)) => {
+                for (t, src) in tensors.iter_mut().zip(&snap.kda) {
+                    let want = t.numel();
+                    if src.len() != want {
+                        return Err(LlamaError::Config(format!(
+                            "forward: restoring {} KDA values into {want}",
+                            src.len()
+                        )));
+                    }
+                    *t = backend.to_device(Tensor::from_vec(src.clone(), t.shape().to_vec()));
+                }
+            }
+            None => {
+                for (dst, src) in self.kda.iter_mut().zip(&snap.kda) {
+                    if src.len() != dst.len() {
+                        return Err(LlamaError::Config(format!(
+                            "forward: restoring {} KDA values into {}",
+                            src.len(),
+                            dst.len()
+                        )));
+                    }
+                    dst.copy_from_slice(src);
+                }
+            }
+        }
+        for (dst, src) in self.conv.iter_mut().zip(&snap.conv) {
+            if src.len() != dst.len() {
+                return Err(LlamaError::Config(format!(
+                    "forward: restoring {} conv values into {}",
+                    src.len(),
+                    dst.len()
+                )));
+            }
+            dst.copy_from_slice(src);
+        }
+        let _ = kv_lora;
+        for (dst, src) in self.latents.iter_mut().zip(&snap.latents) {
+            if src.len() > dst.len() {
+                return Err(LlamaError::Config(format!(
+                    "forward: restoring {} latent values into {}",
+                    src.len(),
+                    dst.len()
+                )));
+            }
+            dst[..src.len()].copy_from_slice(src);
+            dst[src.len()..].fill(0.0);
+        }
+        self.kpool.restore_rows(&snap.kpool)?;
+        self.len = snap.len;
+        Ok(())
+    }
+}
+
 /// Run a whole prompt, returning the last token's logits. Prefill is this loop —
 /// the reference's own autoregressive path, one token at a time.
 pub fn forward_prompt(
@@ -2181,6 +2315,72 @@ mod tests {
         let mut b = State::new(&sh).unwrap();
         let got = forward_chunk(&sh, &m, &mut b, &[3]).unwrap();
         assert_eq!(got, want);
+    }
+
+    /// A restored snapshot continues a sequence exactly as the original would.
+    ///
+    /// This is the gate on the prompt cache: the point of keeping a prompt's state
+    /// is that the tokens after it come out the same, so what is checked is not the
+    /// snapshot's bytes but the next token's logits.
+    #[test]
+    fn a_restored_snapshot_continues_the_sequence() {
+        let sh = shape();
+        let o = weights(&sh);
+        let m = model(&sh, &o);
+        let prompt = [1u32, 4, 2, 7];
+        let after = [3u32, 5];
+
+        // Straight through: prompt, then two more tokens.
+        let mut direct = State::new(&sh).unwrap();
+        forward_prompt(&sh, &m, &mut direct, &prompt).unwrap();
+        let mut want = Vec::new();
+        for &t in &after {
+            want = forward_token(&sh, &m, &mut direct, t).unwrap();
+        }
+
+        // The same, but the prompt's state came off a snapshot.
+        let mut taken = State::new(&sh).unwrap();
+        forward_prompt(&sh, &m, &mut taken, &prompt).unwrap();
+        let snap = taken.snapshot(sh.kv_lora).unwrap();
+        assert_eq!(snap.len, prompt.len());
+
+        let mut fresh = State::new(&sh).unwrap();
+        fresh.restore(&snap, sh.kv_lora).unwrap();
+        assert_eq!(fresh.len, prompt.len());
+        let mut got = Vec::new();
+        for &t in &after {
+            got = forward_token(&sh, &m, &mut fresh, t).unwrap();
+        }
+
+        assert_eq!(got, want, "a restored state diverged from one built in place");
+    }
+
+    /// Restoring over a longer state must not leave its rows behind.
+    #[test]
+    fn restoring_a_shorter_state_clears_what_was_there() {
+        let sh = shape();
+        let o = weights(&sh);
+        let m = model(&sh, &o);
+
+        // A short snapshot.
+        let mut short = State::new(&sh).unwrap();
+        forward_prompt(&sh, &m, &mut short, &[1u32, 4]).unwrap();
+        let snap = short.snapshot(sh.kv_lora).unwrap();
+
+        // A state that has seen more, then restored back to the short one.
+        let mut long = State::new(&sh).unwrap();
+        forward_prompt(&sh, &m, &mut long, &[7u32, 0, 3, 5, 2, 6]).unwrap();
+        long.restore(&snap, sh.kv_lora).unwrap();
+
+        // It must now behave exactly like the short one.
+        let mut a = long;
+        let mut b = State::new(&sh).unwrap();
+        b.restore(&snap, sh.kv_lora).unwrap();
+        assert_eq!(
+            forward_token(&sh, &m, &mut a, 3).unwrap(),
+            forward_token(&sh, &m, &mut b, 3).unwrap(),
+            "rows from the longer sequence survived the restore"
+        );
     }
 
     #[test]

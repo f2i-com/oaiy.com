@@ -293,6 +293,43 @@ pub struct KpoolCache {
 }
 
 impl KpoolCache {
+    // VENDORED-LOCAL: GLM-5.3-Flash. For snapshotting a prompt's state to disk.
+    /// The per-layer buffers, truncated to what `len` tokens have written.
+    ///
+    /// The buffers are allocated for `max_len` and filled from the front, so beyond
+    /// `len` they are zeros nobody has read yet -- keeping them would make a
+    /// snapshot several times bigger for nothing.
+    pub fn rows_upto(&self, len: usize) -> Vec<Vec<f32>> {
+        let keep = len.min(self.max_len) * self.d_idx;
+        self.layers
+            .iter()
+            .map(|l| l.get(..keep.min(l.len())).unwrap_or(l).to_vec())
+            .collect()
+    }
+
+    /// Put `rows` back, zeroing whatever lies past them.
+    pub fn restore_rows(&mut self, rows: &[Vec<f32>]) -> Result<()> {
+        if rows.len() != self.layers.len() {
+            return Err(LlamaError::Config(format!(
+                "kpool: restoring {} layers into {}",
+                rows.len(),
+                self.layers.len()
+            )));
+        }
+        for (dst, src) in self.layers.iter_mut().zip(rows) {
+            if src.len() > dst.len() {
+                return Err(LlamaError::Config(format!(
+                    "kpool: restoring {} values into a {}-value layer",
+                    src.len(),
+                    dst.len()
+                )));
+            }
+            dst[..src.len()].copy_from_slice(src);
+            dst[src.len()..].fill(0.0);
+        }
+        Ok(())
+    }
+
     /// `mla_layers` is the number of full-attention layers, indexed densely:
     /// callers map a block index to its MLA-layer ordinal.
     pub fn new(mla_layers: usize, max_len: usize, d_idx: usize) -> Result<Self> {
