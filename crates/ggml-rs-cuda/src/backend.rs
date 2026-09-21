@@ -490,12 +490,18 @@ impl Backend for CudaBackend {
                    s.device_name(), self.name);
         }
         // Was CPU — upload.
+        crate::xfer::device(t.data().len() * 4);
         let slice = self.upload_f32(t.data());
         self.make_tensor(slice, t.shape().to_vec())
     }
 
     fn to_host(&self, t: Tensor) -> Tensor {
-        if t.is_cpu() { t } else { t.to_host() }
+        if t.is_cpu() {
+            return t;
+        }
+        // Every one of these is a synchronisation point: see `crate::xfer`.
+        crate::xfer::host(t.numel() * 4);
+        t.to_host()
     }
 
     fn embed_lookup(&self, table: &Tensor, tokens: &[u32], embedding_dim: usize) -> Tensor {

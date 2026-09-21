@@ -333,6 +333,19 @@ impl GlmEngine {
             }
             eprintln!("    {:<30} {:7.2}", "counted total", prof::total_ms() / passes);
             prof::reset();
+            // Host<->device round trips. A D2H of something the GPU just wrote is a
+            // synchronisation, and the cards measured 2-18% busy with their memory
+            // controllers at 0-6% -- starved, not slow. This says by how much.
+            let (dh, dhb, hd, hdb) = ggml_rs_cuda::xfer::get();
+            eprintln!(
+                "    {:<30} {:7.1} D2H ({:.2} MB), {:.1} H2D ({:.2} MB)",
+                "round trips a pass",
+                dh as f64 / passes,
+                dhb as f64 / passes / 1e6,
+                hd as f64 / passes,
+                hdb as f64 / passes / 1e6,
+            );
+            ggml_rs_cuda::xfer::reset();
             self.tier_report(passes);
         }
         let _ = job.events.send(Event::Done {

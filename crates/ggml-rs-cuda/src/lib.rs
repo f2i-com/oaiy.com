@@ -32,6 +32,48 @@ pub mod moe;
 // overlap APIs for the streaming-MoE pipeline.
 pub mod transfer;
 
+/// VENDORED-LOCAL: PERF. Host<->device round trips, counted.
+///
+/// A `to_host` of a tensor the GPU just wrote is a synchronisation: the host waits,
+/// and the card has nothing queued behind it. Sampled during a GLM decode the cards
+/// sat at 2-18% with their memory controllers at 0-6%, which is what being starved
+/// by these looks like rather than being slow at the maths. Counting them turns
+/// "probably the round trips" into a number, and a number into a target.
+pub mod xfer {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TO_HOST: AtomicU64 = AtomicU64::new(0);
+    static TO_HOST_BYTES: AtomicU64 = AtomicU64::new(0);
+    static TO_DEVICE: AtomicU64 = AtomicU64::new(0);
+    static TO_DEVICE_BYTES: AtomicU64 = AtomicU64::new(0);
+
+    pub(crate) fn host(bytes: usize) {
+        TO_HOST.fetch_add(1, Ordering::Relaxed);
+        TO_HOST_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    pub(crate) fn device(bytes: usize) {
+        TO_DEVICE.fetch_add(1, Ordering::Relaxed);
+        TO_DEVICE_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    /// `(d2h calls, d2h bytes, h2d calls, h2d bytes)`, cumulative.
+    pub fn get() -> (u64, u64, u64, u64) {
+        (
+            TO_HOST.load(Ordering::Relaxed),
+            TO_HOST_BYTES.load(Ordering::Relaxed),
+            TO_DEVICE.load(Ordering::Relaxed),
+            TO_DEVICE_BYTES.load(Ordering::Relaxed),
+        )
+    }
+
+    pub fn reset() {
+        for c in [&TO_HOST, &TO_HOST_BYTES, &TO_DEVICE, &TO_DEVICE_BYTES] {
+            c.store(0, Ordering::Relaxed);
+        }
+    }
+}
+
 pub use backend::{CudaBackend, CudaError};
 
 // VENDORED-LOCAL: GLM-5.3-Flash. Host RAM, alongside `Backend::vram_status`.
