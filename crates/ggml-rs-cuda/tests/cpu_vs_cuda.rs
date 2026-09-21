@@ -1463,6 +1463,60 @@ fn split_gemv_matches_cpu() {
 }
 
 #[test]
+fn kda_delta_step_decay_is_on_the_kq_axis() {
+    let Some(cuda) = try_cuda() else { return };
+    let (nh, hd) = (2usize, 8usize);
+    let n = nh * hd;
+    let dead = 3usize;
+
+    let mut state = cuda.to_device(Tensor::from_vec(
+        vec![1.0f32; nh * hd * hd],
+        vec![nh, hd, hd],
+    ));
+    // q, k, v, g_log packed as [4, n]; only g matters here.
+    let mut raw = vec![0.0f32; 4 * n];
+    for (i, x) in raw.iter_mut().enumerate() {
+        *x = if i < 3 * n { 0.5 } else { 0.0 };
+    }
+    for h in 0..nh {
+        raw[3 * n + h * hd + dead] = -1000.0; // exp -> 0
+    }
+    let qkvg = cuda.to_device(Tensor::from_vec(raw, vec![4, n]));
+    let beta = cuda.to_device(Tensor::from_vec(vec![0.0f32; nh], vec![nh]));
+
+    let _ = cuda.kda_delta_step(&mut state, &qkvg, &beta, nh, hd);
+
+    let got = cuda.to_host(state);
+    let d = got.data();
+    for h in 0..nh {
+        let base = h * hd * hd;
+        for i in 0..hd {
+            assert_eq!(
+                d[base + i * hd + dead], 0.0,
+                "head {h} row {i} col {dead} must be cleared: the decay is on kq"
+            );
+            for j in (0..hd).filter(|&j| j != dead) {
+                assert!(
+                    (d[base + i * hd + j] - 1.0).abs() < 1e-6,
+                    "head {h} row {i} col {j} must survive, got {}",
+                    d[base + i * hd + j]
+                );
+            }
+        }
+    }
+}
+
+/// The CUDA kernel's decay is on the `kq` axis: a killed channel must clear a
+/// state **column**, not a row.
+///
+/// [`kda_delta_step_matches_cpu`] cannot catch this on its own. It checks the
+/// kernel against `Backend`'s host fallback, and both had the decay transposed, so
+/// it passed before the fix and after it. A wrong axis the two paths share is
+/// invisible to any test that only compares them -- which is how this survived to
+/// ship. So the test above asserts the arithmetic itself, against the reference
+/// kernel quoted in `llama_rs::glm5next::kda`. `beta = 0` suppresses the rank-1
+/// write, leaving only the decay observable.
+#[test]
 fn kda_delta_step_matches_cpu() {
     let Some(cuda) = try_cuda() else { return };
     let host = CpuBackend::new();

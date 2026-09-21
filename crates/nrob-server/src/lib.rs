@@ -28,7 +28,13 @@ use std::time::{Duration, Instant};
 
 /// Bump when what a prompt state holds changes: older files are then left
 /// alone.
-const STATE_FORMAT: u8 = 1;
+///
+/// 2: the glm5next KDA decay was on the wrong axis until 2026-09-21, so every
+/// state written before then holds a recurrent state built with a transposed
+/// decay. Reusing one puts the model straight back into the degeneration the fix
+/// removed -- and it would look like the fix not working, on exactly the prompts a
+/// harness repeats. See `llama_rs::glm5next::kda`.
+const STATE_FORMAT: u8 = 2;
 
 /// How to run the server; [`Options::default`] gives the binary's defaults,
 /// apart from the checkpoint directory, which the caller always names.

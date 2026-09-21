@@ -100,6 +100,11 @@ fn parse_args() -> Result<Options, String> {
                 }
                 a.extra_models.push((name.to_string(), path.into()));
             }
+            // VENDORED-LOCAL: which of them to load at start. `--help` has
+            // documented this since the option was added for coder-cli's daemon,
+            // but the arm never landed here, so a direct invocation was told
+            // "unknown option --start" while the documented behaviour existed.
+            "--start" => a.start_model = Some(val()?),
             "--api-key" => a.api_key = Some(val()?),
             "--thinking" => a.thinking = true,
             "--effort" => a.effort = num(val()?)?.clamp(1, 100) as u32,

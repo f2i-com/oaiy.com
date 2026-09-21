@@ -225,6 +225,21 @@ pub fn glm5next_template_with(
 /// of a reasoning block, which is how GLM deployments usually expose a
 /// "non-thinking" mode.
 ///
+/// Measured, not assumed: `print_both_generation_prompts` in
+/// `glm5next::device`'s tests runs one prompt through both forms. They agree --
+/// short prompts answer correctly under either, long ones under either. So the
+/// closed form is a deviation from the reference (which emits only `<think>` for
+/// `add_generation_prompt`, `glm5next.cpp` line 255) but a sound one, and keeping
+/// it is a latency decision: at ~13 tok/s a forced reasoning block costs seconds
+/// on every coder-cli turn for a question that does not need one.
+///
+/// That 2x2 is worth keeping for a second reason. This pair was the prime suspect
+/// for a day, because `nrob-server` defaults to `thinking = false` and so every
+/// request a harness made took the off-reference branch -- which made the closed
+/// form correlate perfectly with output that degenerated. It was not the cause;
+/// the KDA decay axis was (see `glm5next::kda`). A correlation with the one thing
+/// that differs from the reference is not evidence that it is the fault.
+///
 /// Worth knowing rather than guessing at: at `ReasoningEffort::Max` a one-line
 /// factual question spends hundreds of tokens deliberating first.
 pub fn glm5next_template_full(
