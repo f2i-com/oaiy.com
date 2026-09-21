@@ -467,6 +467,84 @@ fn measure_h2d_bandwidth() {
 // glm5next token makes roughly 2,000 of them: ~710 `Mat::apply` calls plus four
 // launches for each of 336 routed experts. If an allocation costs tens of
 // microseconds, that is the token.
+/// What a single quantised matvec actually achieves, in GB/s.
+///
+/// Everything else in this file measures the plumbing. This measures the thing the
+/// plumbing exists for, because the profile keeps implying it is slow and that
+/// deserves a direct answer rather than a subtraction:
+///
+///   * glm5next's KDA projections read ~15 MB a layer and take 370 us -> 40 GB/s
+///   * its routed experts read 4.16 GB a token and take 47.8 ms -> 87 GB/s
+///
+/// against cards that do ~1.8 TB/s. If a lone matvec on a resident weight also
+/// lands near 40-90 GB/s then the kernel is the constraint and the round trips are
+/// a side show; if it lands near the card's bandwidth then the forward pass is
+/// losing it somewhere else and this file is looking in the wrong place.
+///
+/// Shapes are glm5next's: the fused q||k projection is [8192, 4096] and one
+/// expert's gate||up is [4096, 4096] with a [4096, 2048] down.
+#[test]
+#[ignore = "measures the quantised matvec"]
+fn measure_quantized_matvec_bandwidth() {
+    use ggml_rs::Backend;
+    let Some(b) = try_cuda() else { return };
+    println!();
+    println!("     rows x cols   dtype     bytes      time      GB/s");
+    for &(rows, cols, dt) in &[
+        (8192usize, 4096usize, ggml_quants::GgmlType::Q4_K),
+        (4096, 4096, ggml_quants::GgmlType::Q4_K),
+        (4096, 2048, ggml_quants::GgmlType::Q4_K),
+        (4096, 4096, ggml_quants::GgmlType::Q6_K),
+    ] {
+        // A quantised weight of the right shape, uploaded once.
+        // Block-shaped random bytes: the kernel's speed depends on the layout and
+        // the byte count, not on the values.
+        let per_block = match dt {
+            ggml_quants::GgmlType::Q4_K => 144usize,
+            ggml_quants::GgmlType::Q6_K => 210,
+            _ => unreachable!("only the two super-block types are measured here"),
+        };
+        let mut raw = vec![0u8; rows * cols / 256 * per_block];
+        let mut seed = 1234u64;
+        for byte in raw.iter_mut() {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            *byte = (seed >> 33) as u8;
+        }
+        let bytes = raw.len();
+        let host_w = ggml_rs::QuantizedTensor::from_bytes_cpu(raw, vec![rows, cols], dt);
+        let w = b.to_device_quant(host_w);
+        let x = b.to_device(ggml_rs::tensor::Tensor::from_vec(
+            vec![0.01f32; cols],
+            vec![1, cols],
+        ));
+
+        for _ in 0..20 {
+            std::hint::black_box(b.linear_q(&x, &w));
+        }
+        b.synchronize();
+
+        let iters = 200usize;
+        let t = std::time::Instant::now();
+        for _ in 0..iters {
+            std::hint::black_box(b.linear_q(&x, &w));
+        }
+        b.synchronize();
+        let per = t.elapsed().as_secs_f64() / iters as f64;
+
+        println!(
+            "  {:5} x {:5}   {:6}   {:6.2} MB   {:7.1} us   {:7.1}",
+            rows,
+            cols,
+            format!("{dt:?}"),
+            bytes as f64 / 1e6,
+            per * 1e6,
+            bytes as f64 / per / 1e9
+        );
+    }
+    println!();
+    println!("these cards do about 1.8 TB/s; a matvec is bandwidth-bound and should approach it");
+}
+
 /// The cost of one host -> kernel -> host round trip, which is what a glm5next
 /// token is made of 1319 of.
 ///
