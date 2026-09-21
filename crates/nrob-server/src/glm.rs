@@ -91,6 +91,14 @@ pub struct GlmEngine {
     eos: Vec<u32>,
     /// The tier counters as of the last report, so each one covers its own request.
     tiers: TierCounters,
+    /// VENDORED-LOCAL: GLM-5.3-Flash. Prompt states kept between runs.
+    ///
+    /// A prompt is the expensive part of a request here -- 1740 tokens measured at
+    /// 585 s, because MLA's attention is O(n) a token -- and a harness sends the
+    /// same system prompt every time. Without this the daemon re-reads it on every
+    /// start.
+    pub disk: Option<crate::disk::DiskCache<llama_rs::glm5next::forward::StateSnapshot>>,
+    pub warn: bool,
     pub log: bool,
 }
 
@@ -160,6 +168,8 @@ impl GlmEngine {
             think_end,
             eos,
             tiers: TierCounters::default(),
+            disk: None,
+            warn: log,
             log,
         }
     }
@@ -181,6 +191,80 @@ impl GlmEngine {
             n
         } else {
             0
+        }
+    }
+
+    /// The longest prompt state on disk that covers more of `prompt` than `here`,
+    /// restored; the position the prompt then starts from.
+    ///
+    /// Only a prefix is any use: the state is a recurrence, so there is no rewinding
+    /// part of it -- the same reason `reusable` insists on a whole-prefix match.
+    fn restore_from_disk(&mut self, prompt: &[u32], here: usize) -> Option<usize> {
+        let keys: Vec<u64> = prompt.iter().map(|&t| u64::from(t)).collect();
+        let disk = self.disk.as_mut()?;
+        // Never the whole prompt: a state covering all of it would leave nothing to
+        // run, and the caller needs one forward pass to have logits to sample from.
+        let (i, len) = disk
+            .best(&keys, prompt.len().saturating_sub(1))
+            .filter(|&(_, len)| len > here)?;
+        let t = std::time::Instant::now();
+        let (keys, snap) = match disk.load(i) {
+            Ok(got) => got,
+            Err(e) => {
+                if self.warn {
+                    eprintln!("nrob-server: a prompt state on disk could not be read: {e}");
+                }
+                return None;
+            }
+        };
+        let Model::Glm5Next(g) = &self.model else { return None };
+        if let Err(e) = g.restore_state(&snap) {
+            if self.warn {
+                eprintln!("nrob-server: a prompt state on disk did not fit this model: {e}");
+            }
+            // The state is now of unknown length: start clean rather than guess.
+            self.reset();
+            return None;
+        }
+        self.covered = keys.iter().map(|&k| k as u32).collect();
+        self.kv.len = self.covered.len();
+        if self.log {
+            eprintln!(
+                "  prompt state for {len} tokens loaded from disk in {:.2}s",
+                t.elapsed().as_secs_f64()
+            );
+        }
+        Some(len)
+    }
+
+    /// Keep the state after the first `pos` tokens, unless it is there already.
+    ///
+    /// `base` marks where a conversation's first user message begins -- the system
+    /// prompt and tools, the part every request shares and the one worth keeping
+    /// longest.
+    fn persist(&mut self, pos: usize, base: bool) {
+        let Some(disk) = self.disk.as_mut() else { return };
+        let keys: Vec<u64> = self.covered[..pos].iter().map(|&t| u64::from(t)).collect();
+        if disk.has(&keys) {
+            return;
+        }
+        let Model::Glm5Next(g) = &self.model else { return };
+        match g.snapshot_state() {
+            Ok(snap) if snap.len == pos => disk.save(keys, snap, base),
+            Ok(snap) => {
+                if self.warn {
+                    eprintln!(
+                        "nrob-server: not keeping a prompt state for {pos} tokens; the \
+                         model is at {}",
+                        snap.len
+                    );
+                }
+            }
+            Err(e) => {
+                if self.warn {
+                    eprintln!("nrob-server: keeping the prompt state failed: {e}");
+                }
+            }
         }
     }
 
@@ -217,8 +301,12 @@ impl GlmEngine {
         }
 
         let started = std::time::Instant::now();
-        let start = self.reusable(prompt);
-        if start == 0 {
+        let mut start = self.reusable(prompt);
+        // Disk may hold more of this prompt than the state does -- a fresh daemon's
+        // state holds none of it, and the system prompt is the same every time.
+        if let Some(len) = self.restore_from_disk(prompt, start) {
+            start = len;
+        } else if start == 0 {
             self.reset();
         }
         let total = prompt.len() - start;
@@ -236,7 +324,17 @@ impl GlmEngine {
         let mut logits;
         let mut pos = start;
         let step = llama_rs::glm5next::forward::prefill_chunk().max(1);
-        loop {
+        // All but the last token, then the state is kept, then the last one.
+        //
+        // The state is kept one token short on purpose. A restore has to leave at
+        // least one token to run -- the logits a reply is sampled from come from a
+        // forward pass, and a state covering the whole prompt has already consumed
+        // it -- which is why `DiskCache::best` will not return an entry as long as
+        // the prompt. Saved at full length, an entry could never serve the prompt it
+        // came from, only a longer one that starts with it. Saved a token short it
+        // serves both.
+        let keep_at = prompt.len() - 1;
+        while pos < keep_at {
             if job.cancel.load(Ordering::Relaxed) {
                 let _ = job.events.send(Event::Done {
                     finish: Finish::Stop,
@@ -244,18 +342,30 @@ impl GlmEngine {
                 });
                 return Ok(());
             }
-            let take = step.min(prompt.len() - pos);
-            logits = self.forward_many(&prompt[pos..pos + take])?;
+            let take = step.min(keep_at - pos);
+            self.forward_many(&prompt[pos..pos + take])?;
             self.covered.extend_from_slice(&prompt[pos..pos + take]);
             pos += take;
             let _ = job.events.send(Event::Progress {
                 done: pos - start,
                 total,
             });
-            if pos == prompt.len() {
-                break;
-            }
         }
+        // `base` marks a prompt read from nothing: the system prompt every later
+        // request shares, and so the entry worth protecting from eviction.
+        if keep_at > start {
+            self.persist(keep_at, start == 0);
+        }
+        if job.cancel.load(Ordering::Relaxed) {
+            let _ = job.events.send(Event::Done {
+                finish: Finish::Stop,
+                completion_tokens: 0,
+            });
+            return Ok(());
+        }
+        logits = self.forward_many(&prompt[keep_at..])?;
+        self.covered.extend_from_slice(&prompt[keep_at..]);
+        let _ = job.events.send(Event::Progress { done: total, total });
         let prefill_s = started.elapsed().as_secs_f64();
         let _ = job.events.send(Event::Prefilled { cached: start });
 

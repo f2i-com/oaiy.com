@@ -447,7 +447,51 @@ impl Models {
         let cfg = self.base_cfg(spec, max_seq);
 
         let (jobs, rx) = std::sync::mpsc::channel();
-        let e = glm::GlmEngine::new(model, Arc::clone(&tok), max_seq, !o.quiet && !o.silent);
+        let mut e = glm::GlmEngine::new(model, Arc::clone(&tok), max_seq, !o.quiet && !o.silent);
+        // VENDORED-LOCAL: GLM-5.3-Flash. Prompt states on disk, as DeepSeek has.
+        //
+        // This matters more here than it does there: MLA's attention is O(n) a
+        // token, so a 1740-token prompt measured at 585 s, and a harness sends the
+        // same system prompt on every request. Without this a daemon re-reads it
+        // from nothing every time it starts.
+        //
+        // The fingerprint is what stops a state being restored into weights it did
+        // not come from. DeepSeek hashes config.json and the weight index; a GGUF
+        // has neither, and hashing 193 GB of shards is not an option, so it is the
+        // shard names and sizes plus the state format -- which moves if a shard is
+        // replaced or the file re-quantised, and is cheap to compute.
+        if let Some(dir) = &o.prompt_cache {
+            let mut fingerprint = disk::fnv(&[STATE_FORMAT], 0);
+            fingerprint = disk::fnv(path.as_os_str().as_encoded_bytes(), fingerprint);
+            if let Ok(entries) = std::fs::read_dir(path.parent().unwrap_or(&path)) {
+                let mut shards: Vec<(String, u64)> = entries
+                    .filter_map(|e| e.ok())
+                    .filter(|e| e.path().extension().is_some_and(|x| x == "gguf"))
+                    .filter_map(|e| {
+                        let len = e.metadata().ok()?.len();
+                        Some((e.file_name().to_string_lossy().into_owned(), len))
+                    })
+                    .collect();
+                shards.sort();
+                for (name, len) in shards {
+                    fingerprint = disk::fnv(name.as_bytes(), fingerprint);
+                    fingerprint = disk::fnv(&len.to_le_bytes(), fingerprint);
+                }
+            }
+            match disk::DiskCache::open(dir, fingerprint, (o.prompt_cache_gb * 1e9) as u64) {
+                Ok(cache) => {
+                    self.say(format!(
+                        "{} prompt states on disk in {}",
+                        cache.len(),
+                        dir.display()
+                    ));
+                    e.disk = Some(cache);
+                }
+                Err(err) => {
+                    self.say(format!("prompt states are not kept ({}: {err})", dir.display()))
+                }
+            }
+        }
         let thread = std::thread::Builder::new()
             .name("model".into())
             .spawn(move || e.run(rx))

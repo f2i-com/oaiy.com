@@ -1050,6 +1050,34 @@ impl Glm5NextModel {
         ))
     }
 
+    // VENDORED-LOCAL: GLM-5.3-Flash. The prompt state, out and back.
+    /// Copy out the state as it stands, for a caller keeping prompts on disk.
+    ///
+    /// Reading a prompt is the expensive part of a request and a harness sends the
+    /// same one every time; this is what lets a later process start where an earlier
+    /// one finished. See [`forward::StateSnapshot`] for what it holds and why the
+    /// caches are truncated to the tokens actually written.
+    pub fn snapshot_state(&self) -> Result<forward::StateSnapshot> {
+        let d = self.decoder.as_ref().ok_or_else(|| {
+            LlamaError::Config("glm5next: a resident model has no prompt state".into())
+        })?;
+        let st = d.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.snapshot(d.model.shape().kv_lora)
+    }
+
+    /// Put a state back. The next [`Self::forward`] continues from it.
+    ///
+    /// The caller is trusting that the snapshot came from these weights: a state
+    /// from another model would decode and restore and then produce nonsense, which
+    /// is why the cache that stores them keys every file to a fingerprint.
+    pub fn restore_state(&self, snap: &forward::StateSnapshot) -> Result<()> {
+        let d = self.decoder.as_ref().ok_or_else(|| {
+            LlamaError::Config("glm5next: a resident model has no prompt state".into())
+        })?;
+        let mut st = d.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.restore(snap, d.model.shape().kv_lora)
+    }
+
     /// Whether this model can run [`Self::forward`].
     ///
     /// True when opened with [`Self::from_gguf_streaming`]. The resident
