@@ -467,6 +467,68 @@ fn measure_h2d_bandwidth() {
 // glm5next token makes roughly 2,000 of them: ~710 `Mat::apply` calls plus four
 // launches for each of 336 routed experts. If an allocation costs tens of
 // microseconds, that is the token.
+/// How a quantised matmul scales with its row count.
+///
+/// Decode is one row and has a tuned cooperative kernel. A batched prefill is not:
+/// a chunk of 256 tokens over 288 experts gives each expert about 7 rows, and the
+/// shared expert and the projections get the whole chunk. Whether the general
+/// many-row kernel is any good at those shapes decides whether batching the rest of
+/// the forward pass is worth writing, so it is measured rather than assumed.
+///
+/// The weight is read once whatever the row count, so GB/s here is weight bytes over
+/// time: flat means every extra row is nearly free, and falling means the kernel is
+/// doing the work again per row.
+#[test]
+#[ignore = "measures the quantised matmul by row count"]
+fn measure_quantized_matmul_rows() {
+    use ggml_rs::Backend;
+    let Some(b) = try_cuda() else { return };
+    let (rows_out, cols) = (4096usize, 4096usize);
+    let per_block = 144usize;
+    let mut raw = vec![0u8; rows_out * cols / 256 * per_block];
+    let mut seed = 99u64;
+    for byte in raw.iter_mut() {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        *byte = (seed >> 33) as u8;
+    }
+    let wb = raw.len();
+    let w = b.to_device_quant(ggml_rs::QuantizedTensor::from_bytes_cpu(
+        raw,
+        vec![rows_out, cols],
+        ggml_quants::GgmlType::Q4_K,
+    ));
+
+    println!();
+    println!("  Q4_K [{rows_out}, {cols}], {:.2} MB of weight", wb as f64 / 1e6);
+    println!("   rows      time    us a row   weight GB/s");
+    for &n in &[1usize, 2, 4, 8, 16, 32, 64, 128, 256] {
+        let x = b.to_device(ggml_rs::tensor::Tensor::from_vec(
+            vec![0.01f32; n * cols],
+            vec![n, cols],
+        ));
+        for _ in 0..10 {
+            std::hint::black_box(b.linear_q(&x, &w));
+        }
+        b.synchronize();
+        let iters = if n > 64 { 30 } else { 100 };
+        let t = std::time::Instant::now();
+        for _ in 0..iters {
+            std::hint::black_box(b.linear_q(&x, &w));
+        }
+        b.synchronize();
+        let per = t.elapsed().as_secs_f64() / iters as f64;
+        println!(
+            "  {:5}   {:7.1} us   {:8.1}   {:11.1}",
+            n,
+            per * 1e6,
+            per * 1e6 / n as f64,
+            wb as f64 / per / 1e9
+        );
+    }
+    println!();
+    println!("flat GB/s means extra rows are free; falling us-a-row is the win from batching");
+}
+
 /// How long it takes to fill a pinned slot, which is what a promotion pays before
 /// its async upload can start.
 ///
