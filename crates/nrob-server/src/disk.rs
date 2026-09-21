@@ -23,7 +23,56 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Sender};
 use std::time::SystemTime;
 
-use dsv41_cuda::Snapshot;
+/// VENDORED-LOCAL: GLM-5.3-Flash. What a state has to do to live on disk.
+///
+/// This file was written around `dsv41_cuda::Snapshot`. GLM-5.3-Flash keeps a
+/// different state -- a delta-rule recurrence and a latent cache rather than window
+/// rings and compressed rows -- but it wants exactly this: the prefix a harness
+/// sends every time, kept so a later process does not read it again. So the cache is
+/// generic over the state and both models' snapshots implement this.
+pub trait PromptState: Send + 'static {
+    /// Tokens the state covers. Checked against the entry's key count on load,
+    /// which is what catches a file from another build.
+    fn pos(&self) -> usize;
+    /// Size of what `encode` will write.
+    fn encoded_len(&self) -> usize;
+    /// Append the state's bytes.
+    fn encode(&self, out: &mut Vec<u8>);
+    /// Read back what `encode` wrote.
+    fn decode(bytes: &[u8]) -> nrob::Result<Self>
+    where
+        Self: Sized;
+}
+
+impl PromptState for dsv41_cuda::Snapshot {
+    fn pos(&self) -> usize {
+        self.pos()
+    }
+    fn encoded_len(&self) -> usize {
+        self.encoded_len()
+    }
+    fn encode(&self, out: &mut Vec<u8>) {
+        self.encode(out)
+    }
+    fn decode(bytes: &[u8]) -> nrob::Result<Self> {
+        dsv41_cuda::Snapshot::decode(bytes)
+    }
+}
+
+impl PromptState for llama_rs::glm5next::forward::StateSnapshot {
+    fn pos(&self) -> usize {
+        self.len
+    }
+    fn encoded_len(&self) -> usize {
+        self.encoded_len()
+    }
+    fn encode(&self, out: &mut Vec<u8>) {
+        self.encode(out)
+    }
+    fn decode(bytes: &[u8]) -> nrob::Result<Self> {
+        Self::decode(bytes).map_err(|e| nrob::Error::Format(e.to_string()))
+    }
+}
 
 const MAGIC: &[u8; 8] = b"NROBPRM1";
 const EXT: &str = "nrobstate";
@@ -37,17 +86,17 @@ struct Entry {
     base: bool,
 }
 
-enum Job {
-    Write { path: PathBuf, header: Vec<u8>, snap: Snapshot },
+enum Job<S> {
+    Write { path: PathBuf, header: Vec<u8>, snap: S },
     Delete(PathBuf),
 }
 
-pub struct DiskCache {
+pub struct DiskCache<S: PromptState> {
     dir: PathBuf,
     fingerprint: u64,
     budget: u64,
     entries: Vec<Entry>,
-    writer: Sender<Job>,
+    writer: Sender<Job<S>>,
 }
 
 /// FNV-1a, for file names and fingerprints (not security).
@@ -89,9 +138,9 @@ fn read_header(r: &mut impl Read, fingerprint: u64) -> Option<(bool, Vec<u64>, u
     Some((head[16] == 1, keys, 25 + raw.len() as u64))
 }
 
-impl DiskCache {
+impl<S: PromptState> DiskCache<S> {
     /// Open (or make) the directory and index this model's entries.
-    pub fn open(dir: &Path, fingerprint: u64, budget_bytes: u64) -> nrob::Result<DiskCache> {
+    pub fn open(dir: &Path, fingerprint: u64, budget_bytes: u64) -> nrob::Result<DiskCache<S>> {
         fs::create_dir_all(dir)?;
         let mut entries = Vec::new();
         for item in fs::read_dir(dir)?.flatten() {
@@ -104,7 +153,7 @@ impl DiskCache {
             let meta = item.metadata()?;
             entries.push(Entry { path, keys, bytes: meta.len(), used: meta.modified().unwrap_or(SystemTime::UNIX_EPOCH), base });
         }
-        let (writer, jobs) = channel::<Job>();
+        let (writer, jobs) = channel::<Job<S>>();
         std::thread::Builder::new()
             .name("prompt cache".into())
             .spawn(move || {
@@ -147,13 +196,13 @@ impl DiskCache {
 
     /// Read entry `i`: its keys and snapshot. A damaged or missing file is
     /// forgotten.
-    pub fn load(&mut self, i: usize) -> nrob::Result<(Vec<u64>, Snapshot)> {
-        let read = || -> nrob::Result<(Vec<u64>, Snapshot)> {
+    pub fn load(&mut self, i: usize) -> nrob::Result<(Vec<u64>, S)> {
+        let read = || -> nrob::Result<(Vec<u64>, S)> {
             let mut file = File::open(&self.entries[i].path)?;
             let (_, keys, _) = read_header(&mut file, self.fingerprint).ok_or_else(|| nrob::Error::Format("not a prompt state of this model".into()))?;
             let mut rest = Vec::new();
             file.read_to_end(&mut rest)?;
-            let snap = Snapshot::decode(&rest)?;
+            let snap = S::decode(&rest)?;
             if snap.pos() != keys.len() {
                 return Err(nrob::Error::Format("damaged prompt state".into()));
             }
@@ -184,7 +233,7 @@ impl DiskCache {
     /// Keep `snap`, the state after `keys` (`base`: a system prompt's).
     /// Shorter entries of the same conversation go, and then the least
     /// recently used while the entries pass the budget.
-    pub fn save(&mut self, keys: Vec<u64>, snap: Snapshot, base: bool) {
+    pub fn save(&mut self, keys: Vec<u64>, snap: S, base: bool) {
         let path = self.dir.join(format!("{:016x}-{:016x}.{EXT}", self.fingerprint, keys_hash(&keys)));
         let header = header(self.fingerprint, base, &keys);
         let bytes = (header.len() + snap.encoded_len()) as u64;
@@ -210,10 +259,10 @@ mod tests {
 
     /// A snapshot of `pos` tokens with no layers (what the cache stores
     /// does not matter here).
-    fn snap(pos: usize) -> Snapshot {
+    fn snap(pos: usize) -> dsv41_cuda::Snapshot {
         let mut bytes = (pos as u64).to_le_bytes().to_vec();
         bytes.extend(0u32.to_le_bytes());
-        Snapshot::decode(&bytes).unwrap()
+        dsv41_cuda::Snapshot::decode(&bytes).unwrap()
     }
 
     fn written(dir: &Path, n: usize) -> bool {
@@ -231,7 +280,7 @@ mod tests {
     fn states_outlive_the_process_and_a_conversation_keeps_its_newest() {
         let dir = std::env::temp_dir().join(format!("nrob-prompt-cache-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
-        let mut cache = DiskCache::open(&dir, 7, 1 << 30).unwrap();
+        let mut cache: DiskCache<dsv41_cuda::Snapshot> = DiskCache::open(&dir, 7, 1 << 30).unwrap();
         cache.save(vec![1, 2, 3], snap(3), true);
         cache.save(vec![1, 2, 3, 4, 5], snap(5), false);
         cache.save(vec![1, 2, 3, 4, 5, 6, 7], snap(7), false);
@@ -245,15 +294,18 @@ mod tests {
         assert!(written(&dir, 2));
 
         // another process of the same model finds them; another model does not
-        let mut again = DiskCache::open(&dir, 7, 1 << 30).unwrap();
+        let mut again: DiskCache<dsv41_cuda::Snapshot> = DiskCache::open(&dir, 7, 1 << 30).unwrap();
         assert_eq!(again.len(), 2);
         let (i, len) = again.best(&[1, 2, 3, 4, 5, 6, 7, 8], 7).unwrap();
         let (keys, state) = again.load(i).unwrap();
         assert_eq!((keys, state.pos(), len), (vec![1, 2, 3, 4, 5, 6, 7], 7, 7));
-        assert_eq!(DiskCache::open(&dir, 8, 1 << 30).unwrap().len(), 0);
+        assert_eq!(
+            DiskCache::<dsv41_cuda::Snapshot>::open(&dir, 8, 1 << 30).unwrap().len(),
+            0
+        );
 
         // over the budget the least recently used go
-        let mut small = DiskCache::open(&dir, 7, 150).unwrap();
+        let mut small: DiskCache<dsv41_cuda::Snapshot> = DiskCache::open(&dir, 7, 150).unwrap();
         small.save(vec![9; 8], snap(8), true);
         assert_eq!(small.len(), 1);
         assert!(small.has(&[9; 8]));

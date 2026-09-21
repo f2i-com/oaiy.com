@@ -224,11 +224,18 @@ impl GlmEngine {
         let total = prompt.len() - start;
         let _ = job.events.send(Event::Progress { done: 0, total });
 
-        // Prefill the tail, a token at a time, reporting as it goes: at ~6 tok/s a
-        // long prompt is minutes, and a caller with no progress cannot tell the
-        // difference between that and a hang.
+        // Prefill the tail in chunks, reporting after each: a long prompt is still
+        // tens of seconds, and a caller with no progress cannot tell that from a
+        // hang.
+        //
+        // VENDORED-LOCAL: GLM-5.3-Flash. A chunk, not a token. This loop used to
+        // hand `forward` one token at a time so it could report between them, which
+        // meant the batched prefill inside it never engaged -- `forward` only
+        // chunks what it is given, and it was given one. A chunk of 64 is one
+        // batched pass and one progress event, which is frequent enough to watch.
         let mut logits;
         let mut pos = start;
+        let step = llama_rs::glm5next::forward::prefill_chunk().max(1);
         loop {
             if job.cancel.load(Ordering::Relaxed) {
                 let _ = job.events.send(Event::Done {
@@ -237,15 +244,14 @@ impl GlmEngine {
                 });
                 return Ok(());
             }
-            logits = self.forward_one(prompt[pos])?;
-            self.covered.push(prompt[pos]);
-            pos += 1;
-            if pos.is_multiple_of(16) || pos == prompt.len() {
-                let _ = job.events.send(Event::Progress {
-                    done: pos - start,
-                    total,
-                });
-            }
+            let take = step.min(prompt.len() - pos);
+            logits = self.forward_many(&prompt[pos..pos + take])?;
+            self.covered.extend_from_slice(&prompt[pos..pos + take]);
+            pos += take;
+            let _ = job.events.send(Event::Progress {
+                done: pos - start,
+                total,
+            });
             if pos == prompt.len() {
                 break;
             }
@@ -430,7 +436,13 @@ impl GlmEngine {
     }
 
     fn forward_one(&mut self, id: u32) -> Result<Vec<f32>> {
-        let t = self.model.forward(&[id], &mut self.kv);
+        self.forward_many(&[id])
+    }
+
+    /// Several tokens in one call, so `forward` can batch them. Returns the last
+    /// one's logits, which is all a prompt needs.
+    fn forward_many(&mut self, ids: &[u32]) -> Result<Vec<f32>> {
+        let t = self.model.forward(ids, &mut self.kv);
         Ok(t.data().to_vec())
     }
 }

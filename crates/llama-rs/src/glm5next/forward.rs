@@ -1815,6 +1815,76 @@ pub struct StateSnapshot {
     pub kpool: Vec<Vec<f32>>,
 }
 
+impl StateSnapshot {
+    /// Size of [`Self::encode`]'s output.
+    pub fn encoded_len(&self) -> usize {
+        let group = |g: &Vec<Vec<f32>>| 4 + g.iter().map(|v| 8 + 4 * v.len()).sum::<usize>();
+        8 + group(&self.kda) + group(&self.conv) + group(&self.latents) + group(&self.kpool)
+    }
+
+    /// Append the snapshot's bytes, little-endian.
+    ///
+    /// Four groups of per-layer f32, each length-prefixed, after the token count.
+    /// Plain and self-describing on purpose: a state that cannot be read back is
+    /// worse than one that was never kept, and the reader checks every length
+    /// against the state it is filling anyway.
+    pub fn encode(&self, out: &mut Vec<u8>) {
+        out.reserve(self.encoded_len());
+        out.extend((self.len as u64).to_le_bytes());
+        for group in [&self.kda, &self.conv, &self.latents, &self.kpool] {
+            out.extend((group.len() as u32).to_le_bytes());
+            for v in group {
+                out.extend((v.len() as u64).to_le_bytes());
+                for &f in v {
+                    out.extend(f.to_le_bytes());
+                }
+            }
+        }
+    }
+
+    /// Read back what [`Self::encode`] wrote.
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let bad = || LlamaError::Config("forward: damaged prompt state".into());
+        let mut at = 0usize;
+        let mut take = |n: usize| -> Result<&[u8]> {
+            let end = at.checked_add(n).ok_or_else(bad)?;
+            let s = bytes.get(at..end).ok_or_else(bad)?;
+            at = end;
+            Ok(s)
+        };
+        let len = u64::from_le_bytes(take(8)?.try_into().map_err(|_| bad())?) as usize;
+        let mut groups: Vec<Vec<Vec<f32>>> = Vec::with_capacity(4);
+        for _ in 0..4 {
+            let n = u32::from_le_bytes(take(4)?.try_into().map_err(|_| bad())?) as usize;
+            let mut group = Vec::with_capacity(n);
+            for _ in 0..n {
+                let count = u64::from_le_bytes(take(8)?.try_into().map_err(|_| bad())?) as usize;
+                let raw = take(count.checked_mul(4).ok_or_else(bad)?)?;
+                group.push(
+                    raw.chunks_exact(4)
+                        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                        .collect(),
+                );
+            }
+            groups.push(group);
+        }
+        if at != bytes.len() {
+            return Err(LlamaError::Config(format!(
+                "forward: prompt state has {} trailing bytes",
+                bytes.len() - at
+            )));
+        }
+        let mut it = groups.into_iter();
+        Ok(Self {
+            len,
+            kda: it.next().ok_or_else(bad)?,
+            conv: it.next().ok_or_else(bad)?,
+            latents: it.next().ok_or_else(bad)?,
+            kpool: it.next().ok_or_else(bad)?,
+        })
+    }
+}
+
 impl State {
     /// VENDORED-LOCAL: GLM-5.3-Flash. Copy this state out, for disk or another
     /// process.
@@ -2381,6 +2451,30 @@ mod tests {
             forward_token(&sh, &m, &mut b, 3).unwrap(),
             "rows from the longer sequence survived the restore"
         );
+    }
+
+    /// The wire format round-trips, and refuses damage.
+    #[test]
+    fn a_snapshot_survives_encoding() {
+        let sh = shape();
+        let o = weights(&sh);
+        let m = model(&sh, &o);
+        let mut st = State::new(&sh).unwrap();
+        forward_prompt(&sh, &m, &mut st, &[1u32, 4, 2]).unwrap();
+        let snap = st.snapshot(sh.kv_lora).unwrap();
+
+        let mut bytes = Vec::new();
+        snap.encode(&mut bytes);
+        assert_eq!(bytes.len(), snap.encoded_len(), "encoded_len disagrees with encode");
+        let back = StateSnapshot::decode(&bytes).expect("decode");
+        assert_eq!(back, snap);
+
+        // A truncated state is rejected rather than half-read.
+        assert!(StateSnapshot::decode(&bytes[..bytes.len() - 4]).is_err());
+        // So are trailing bytes, which would mean a format mismatch.
+        let mut extra = bytes.clone();
+        extra.push(0);
+        assert!(StateSnapshot::decode(&extra).is_err());
     }
 
     #[test]

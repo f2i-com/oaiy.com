@@ -117,7 +117,7 @@ pub struct Engine {
     /// Report failures that have no request to go to (on by default).
     pub warn: bool,
     /// Prompt states kept on disk between runs.
-    pub disk: Option<crate::disk::DiskCache>,
+    pub disk: Option<crate::disk::DiskCache<dsv41_cuda::Snapshot>>,
     /// What the state covers, one key per position: the token id, or for
     /// image positions a key from the image's content and the offset.
     tokens: Vec<u64>,
