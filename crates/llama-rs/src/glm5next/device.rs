@@ -3192,6 +3192,78 @@ children attend school instead.";
         assert_eq!(top(&a), top(&b), "the two paths pick different tokens");
     }
 
+    /// What batching a prefill is worth, on the real weights, warm.
+    ///
+    /// One model load and both paths, so the tiers are in the same state for each:
+    /// a cold server spends most of a first prompt reading 92 GB off the drive,
+    /// which swamps the thing being measured. The prompt runs once to warm, then
+    /// each path runs it from a fresh state.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "measures batched prefill on the released model"]
+    fn measure_prefill_batching() {
+        // Long enough for a chunk to have real sharing.
+        let n = std::env::var("GLM5_BENCH_TOKENS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(256);
+        let prompt: Vec<u32> = (0..n).map(|i| ((i * 7919 + 1543) % 150000) as u32).collect();
+
+        let m = match DeviceModel::open_tiered(RELEASED, 2048, 2, 0, 0) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("tiered open failed ({e}); skipping");
+                return;
+            }
+        };
+        let sh = m.shape().clone();
+        let w = m.view();
+
+        // Warm: the first pass fills the RAM and VRAM tiers off the drive.
+        {
+            let mut st = forward::State::new_on(&sh, m.backend()).expect("state");
+            let t = std::time::Instant::now();
+            forward::forward_chunk(&sh, &w, &mut st, &prompt).expect("warm");
+            println!("warm-up pass: {:.1}s", t.elapsed().as_secs_f64());
+        }
+
+        // SAFETY: single-threaded test.
+        unsafe { std::env::set_var("GLM5_PREFILL_CHUNK", "1") };
+        let one = {
+            let mut st = forward::State::new_on(&sh, m.backend()).expect("state");
+            let t = std::time::Instant::now();
+            forward::forward_prompt(&sh, &w, &mut st, &prompt).expect("one at a time");
+            t.elapsed().as_secs_f64()
+        };
+        unsafe { std::env::remove_var("GLM5_PREFILL_CHUNK") };
+
+        let mut best = (0usize, f64::MAX);
+        for chunk in [32usize, 64, 128, 256] {
+            if chunk > n {
+                continue;
+            }
+            let mut st = forward::State::new_on(&sh, m.backend()).expect("state");
+            let t = std::time::Instant::now();
+            for part in prompt.chunks(chunk) {
+                forward::forward_chunk(&sh, &w, &mut st, part).expect("chunk");
+            }
+            let secs = t.elapsed().as_secs_f64();
+            println!(
+                "  chunk {chunk:4}: {secs:6.1}s for {n} tokens -> {:6.1} tok/s  ({:.2}x)",
+                n as f64 / secs,
+                one / secs
+            );
+            if secs < best.1 {
+                best = (chunk, secs);
+            }
+        }
+        println!(
+            "  one at a time: {one:6.1}s for {n} tokens -> {:6.1} tok/s",
+            n as f64 / one
+        );
+        println!("best chunk {} at {:.1}x", best.0, one / best.1);
+    }
+
     /// A batched prefill chunk against the one-token loop, on the real weights.
     ///
     /// This is the correctness gate on `forward_chunk` plus `apply_batch`. The
