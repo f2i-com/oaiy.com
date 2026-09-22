@@ -420,51 +420,61 @@ pub fn select_compressed(
     role: CandidateRole,
     shared: &mut Shared,
 ) -> Result<Vec<Vec<i32>>> {
-    // query i (at start_pos + i) sees the groups completed up to and
-    // including its own token; later ones are masked (a no-op for a single
-    // decode token, which sees them all)
-    let compress_len = |i: usize| (start_pos + i + 1) / ratio;
-    let mut rows: Vec<Vec<f32>> = (0..t)
-        .map(|i| {
-            let cl = compress_len(i);
-            let mut sc = scores[i * n_t..(i + 1) * n_t].to_vec();
-            sc.iter_mut().skip(cl).for_each(|s| *s = f32::NEG_INFINITY);
-            sc
-        })
-        .collect();
-    match role {
-        CandidateRole::Source => {
-            shared.candidates = rows
-                .iter()
-                .enumerate()
-                .map(|(i, sc)| candidate_mask(sc, compress_len(i), cfg.candidate_topk_blocks, cfg.candidate_block_size))
-                .collect();
-        }
-        CandidateRole::User => {
-            if shared.candidates.len() != t {
-                return Err(Error::Format("candidate mask missing".into()));
-            }
-            for (sc, cand) in rows.iter_mut().zip(&shared.candidates) {
-                for (s, &keep) in sc.iter_mut().zip(cand) {
+    if ratio == 0 || t.checked_mul(n_t) != Some(scores.len()) {
+        return Err(Error::Format("invalid compressed score geometry".into()));
+    }
+    if matches!(role, CandidateRole::User)
+        && (shared.candidates.len() != t || shared.candidates.iter().any(|r| r.len() != n_t))
+    {
+        return Err(Error::Format(
+            "candidate mask missing or wrong shape".into(),
+        ));
+    }
+    if matches!(role, CandidateRole::Source) {
+        shared.candidates.clear();
+        shared.candidates.reserve(t);
+    }
+    // A prefill score table is large. Reuse one masked row and index workspace
+    // instead of cloning the complete table before selecting its sparse rows.
+    // Keep masked -infinity entries in the selection: the reference tie rule
+    // can select them when fewer than k valid positions exist.
+    let mut row = Vec::with_capacity(n_t);
+    let mut order = Vec::with_capacity(n_t);
+    let mut out = Vec::with_capacity(t);
+    for i in 0..t {
+        let cl = (start_pos + i + 1) / ratio;
+        row.clear();
+        row.extend_from_slice(&scores[i * n_t..(i + 1) * n_t]);
+        row.iter_mut().skip(cl).for_each(|s| *s = f32::NEG_INFINITY);
+        match role {
+            CandidateRole::Source => shared.candidates.push(candidate_mask(
+                &row,
+                cl,
+                cfg.candidate_topk_blocks,
+                cfg.candidate_block_size,
+            )),
+            CandidateRole::User => {
+                for (s, &keep) in row.iter_mut().zip(&shared.candidates[i]) {
                     if !keep {
                         *s = f32::NEG_INFINITY;
                     }
                 }
             }
+            CandidateRole::None => {}
         }
-        CandidateRole::None => {}
+        partition_topk(&row, cfg.index_topk, &mut order);
+        // Attention consumes position order, not score order. Sort only the
+        // selected k positions, avoiding both a full sort and a redundant
+        // score-order sort of those k entries.
+        order.sort_unstable();
+        out.push(
+            order
+                .iter()
+                .map(|&p| if p < cl { (p + offset) as i32 } else { -1 })
+                .collect(),
+        );
     }
-    let k = cfg.index_topk.min(n_t);
-    Ok(rows
-        .iter()
-        .enumerate()
-        .map(|(i, sc)| {
-            let cl = compress_len(i);
-            let mut pick = topk_indices(sc, k);
-            pick.sort_unstable();
-            pick.into_iter().map(|p| if p < cl { (p + offset) as i32 } else { -1 }).collect()
-        })
-        .collect())
+    Ok(out)
 }
 
 impl Compressor {
@@ -552,25 +562,53 @@ pub fn sparse_attend(q: &[f32], kv: &[f32], hd: usize, idxs: &[i32], sink: f32, 
 
 /// Indices of the `k` largest scores (ties: lower index first).
 pub fn topk_indices(scores: &[f32], k: usize) -> Vec<usize> {
-    let mut order: Vec<usize> = (0..scores.len()).collect();
-    order.sort_by(|&a, &b| scores[b].total_cmp(&scores[a]).then(a.cmp(&b)));
-    order.truncate(k);
+    let mut order = Vec::new();
+    partition_topk(scores, k, &mut order);
+    order.sort_unstable_by(|&a, &b| scores[b].total_cmp(&scores[a]).then(a.cmp(&b)));
     order
+}
+
+/// Exact selection under the same total order as the reference full sort.
+/// Including the index in the comparator makes ties deterministic even though
+/// the partition itself is unstable. Handles NaNs and signed zero identically.
+fn partition_topk(scores: &[f32], k: usize, order: &mut Vec<usize>) {
+    order.clear();
+    let k = k.min(scores.len());
+    if k == 0 {
+        return;
+    }
+    order.extend(0..scores.len());
+    if k < order.len() {
+        order.select_nth_unstable_by(k, |&a, &b| scores[b].total_cmp(&scores[a]).then(a.cmp(&b)));
+        order.truncate(k);
+    }
 }
 
 /// Reference `select_candidate_blocks` for one query: keep the `topk_blocks`
 /// best blocks (by their best position), always keeping the block that holds
 /// the query's newest reachable position.
-pub fn candidate_mask(scores: &[f32], compress_len: usize, topk_blocks: usize, bs: usize) -> Vec<bool> {
+pub fn candidate_mask(
+    scores: &[f32],
+    compress_len: usize,
+    topk_blocks: usize,
+    bs: usize,
+) -> Vec<bool> {
     let nb = scores.len().div_ceil(bs);
     let mut block: Vec<f32> = (0..nb)
-        .map(|b| scores[b * bs..((b + 1) * bs).min(scores.len())].iter().copied().fold(f32::NEG_INFINITY, f32::max))
+        .map(|b| {
+            scores[b * bs..((b + 1) * bs).min(scores.len())]
+                .iter()
+                .copied()
+                .fold(f32::NEG_INFINITY, f32::max)
+        })
         .collect();
     if compress_len > 0 {
         block[(compress_len - 1) / bs] = f32::INFINITY;
     }
     let mut keep = vec![false; nb];
-    for b in topk_indices(&block, topk_blocks.min(nb)) {
+    let mut selected = Vec::new();
+    partition_topk(&block, topk_blocks, &mut selected);
+    for b in selected {
         keep[b] = block[b] > f32::NEG_INFINITY;
     }
     (0..scores.len()).map(|p| keep[p / bs]).collect()
@@ -579,6 +617,203 @@ pub fn candidate_mask(scores: &[f32], compress_len: usize, topk_blocks: usize, b
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sorted_reference(scores: &[f32], k: usize) -> Vec<usize> {
+        let mut order: Vec<_> = (0..scores.len()).collect();
+        order.sort_by(|&a, &b| scores[b].total_cmp(&scores[a]).then(a.cmp(&b)));
+        order.truncate(k);
+        order
+    }
+
+    #[test]
+    fn partial_topk_matches_full_sort_including_float_edge_cases() {
+        let mut seed = 7u64;
+        for n in [0, 1, 2, 7, 511, 512, 513, 4096, 131072] {
+            let scores: Vec<_> = (0..n)
+                .map(|i| {
+                    seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    match i % 19 {
+                        0 => f32::NAN,
+                        1 => -f32::NAN,
+                        2 => f32::INFINITY,
+                        3 => f32::NEG_INFINITY,
+                        4 => -0.0,
+                        5 => 0.0,
+                        _ => ((seed >> 32) % 257) as f32 - 128.0,
+                    }
+                })
+                .collect();
+            for k in [0, 1, 7, 512, n, n + 1] {
+                assert_eq!(
+                    topk_indices(&scores, k),
+                    sorted_reference(&scores, k),
+                    "n={n}, k={k}"
+                );
+            }
+        }
+    }
+
+    fn selection_cfg() -> Config {
+        Config {
+            vocab_size: 8,
+            dim: 8,
+            moe_inter_dim: 8,
+            n_layers: 1,
+            n_heads: 1,
+            head_dim: 8,
+            rope_head_dim: 4,
+            q_lora_rank: 4,
+            o_lora_rank: 4,
+            o_groups: 1,
+            norm_eps: 1e-6,
+            swiglu_limit: 10.0,
+            rope_theta: 10000.0,
+            compress_rope_theta: 160000.0,
+            rope_factor: 16.0,
+            beta_fast: 32.0,
+            beta_slow: 1.0,
+            original_seq_len: 65536,
+            n_routed_experts: 2,
+            n_activated_experts: 1,
+            route_scale: 1.0,
+            window_size: 8,
+            compress_ratios: vec![2],
+            kv_source_layers: vec![0],
+            index_source_layers: vec![0],
+            index_n_heads: 1,
+            index_head_dim: 4,
+            index_topk: 5,
+            candidate_source_layer: Some(0),
+            candidate_topk_blocks: 2,
+            candidate_block_size: 4,
+            hc_mult: 4,
+            hc_sinkhorn_iters: 20,
+            hc_eps: 1e-6,
+            engram_layer_ids: vec![],
+            engram_num_embeddings: vec![],
+            engram_max_ngram_size: 4,
+            engram_n_heads: 1,
+            engram_head_dim: 8,
+            bos_token_id: 0,
+            eos_token_id: 1,
+            image_token_id: 2,
+            vision: None,
+        }
+    }
+
+    #[test]
+    fn streamed_selection_matches_full_table_reference_and_masks() {
+        let mut cfg = selection_cfg();
+        for (t, start, ratio) in [(1, 0, 2), (7, 0, 2), (7, 50, 2), (8, 63, 1)] {
+            let n = (start + t) / ratio;
+            let scores: Vec<_> = (0..t * n)
+                .map(|i| {
+                    if i % 13 == 0 {
+                        f32::NEG_INFINITY
+                    } else {
+                        (i % 17) as f32
+                    }
+                })
+                .collect();
+            for limit in [0, 1, 5, n, n + 1] {
+                cfg.index_topk = limit;
+                let mut shared = Shared::default();
+                let mut masks = Vec::new();
+                for role in [
+                    CandidateRole::None,
+                    CandidateRole::Source,
+                    CandidateRole::User,
+                ] {
+                    let mut want = Vec::new();
+                    for i in 0..t {
+                        let cl = (start + i + 1) / ratio;
+                        let mut row = scores[i * n..(i + 1) * n].to_vec();
+                        row.iter_mut().skip(cl).for_each(|s| *s = f32::NEG_INFINITY);
+                        if matches!(role, CandidateRole::Source) {
+                            // Independent full-sort reference for candidate block choice.
+                            let mut blocks: Vec<f32> = row
+                                .chunks(4)
+                                .map(|c| c.iter().copied().fold(f32::NEG_INFINITY, f32::max))
+                                .collect();
+                            if cl > 0 {
+                                blocks[(cl - 1) / 4] = f32::INFINITY;
+                            }
+                            let mut keep = vec![false; blocks.len()];
+                            for b in sorted_reference(&blocks, 2) {
+                                keep[b] = blocks[b] > f32::NEG_INFINITY;
+                            }
+                            masks.push((0..n).map(|p| keep[p / 4]).collect::<Vec<_>>());
+                        } else if matches!(role, CandidateRole::User) {
+                            for (s, &keep) in row.iter_mut().zip(&masks[i]) {
+                                if !keep {
+                                    *s = f32::NEG_INFINITY;
+                                }
+                            }
+                        }
+                        let mut pick = sorted_reference(&row, limit);
+                        pick.sort_unstable();
+                        want.push(
+                            pick.into_iter()
+                                .map(|p| if p < cl { (p + 11) as i32 } else { -1 })
+                                .collect::<Vec<_>>(),
+                        );
+                    }
+                    assert_eq!(
+                        select_compressed(&cfg, &scores, t, n, start, ratio, 11, role, &mut shared)
+                            .unwrap(),
+                        want
+                    );
+                    if matches!(role, CandidateRole::Source) {
+                        assert_eq!(shared.candidates, masks);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn compressed_selection_rejects_malformed_shapes() {
+        let cfg = selection_cfg();
+        let mut shared = Shared::default();
+        assert!(select_compressed(
+            &cfg,
+            &[1.0],
+            1,
+            1,
+            0,
+            0,
+            0,
+            CandidateRole::None,
+            &mut shared
+        )
+        .is_err());
+        assert!(select_compressed(
+            &cfg,
+            &[1.0],
+            2,
+            1,
+            0,
+            1,
+            0,
+            CandidateRole::None,
+            &mut shared
+        )
+        .is_err());
+        shared.candidates = vec![vec![]];
+        assert!(select_compressed(
+            &cfg,
+            &[1.0],
+            1,
+            1,
+            0,
+            1,
+            0,
+            CandidateRole::User,
+            &mut shared
+        )
+        .is_err());
+    }
+
 
     #[test]
     fn all_invalid_query_attends_to_nothing() {
