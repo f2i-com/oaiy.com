@@ -26,6 +26,10 @@ between the three tiers so the next token finds its loot close at hand.
 > 2× RTX 5090), read straight from its safetensors.
 > [How it was pulled off →](docs/DEEPSEEK_V41.md)
 
+An opt-in [ternary-expert research backend](docs/TERNARY_EXPERTS.md) also supports
+original MXFP4 experts during generated tool calls and local routing logs. It is
+experimental; broad quality and paired speed comparisons remain unestablished.
+
 ## The heist
 
 Every token is a small, well-planned job:

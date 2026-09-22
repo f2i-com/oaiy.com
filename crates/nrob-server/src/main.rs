@@ -36,6 +36,9 @@ const HELP: &str = "nrob-server: DeepSeek-V4.1-Flash behind an OpenAI-compatible
                        is resident: asking for another unloads the current one,
                        which takes as long as a load. /v1/models says which is
                        loaded.
+  --tools-experts DIR  original MXFP4 experts during generated DSML tool calls;
+                       ternary elsewhere, trunk stays loaded (experimental)
+  --expert-trace FILE  write JSONL token/layer/expert/precision routing records
   --api-key KEY        require `Authorization: Bearer KEY`
   --thinking           reason before answering unless a request says otherwise
                        (default: answer directly; requests turn reasoning on with
@@ -105,6 +108,8 @@ fn parse_args() -> Result<Options, String> {
             // but the arm never landed here, so a direct invocation was told
             // "unknown option --start" while the documented behaviour existed.
             "--start" => a.start_model = Some(val()?),
+            "--tools-experts" => a.tools_experts = Some(val()?.into()),
+            "--expert-trace" => a.expert_trace = Some(val()?.into()),
             "--api-key" => a.api_key = Some(val()?),
             "--thinking" => a.thinking = true,
             "--effort" => a.effort = num(val()?)?.clamp(1, 100) as u32,

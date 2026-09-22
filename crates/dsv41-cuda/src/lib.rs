@@ -25,6 +25,7 @@ pub mod expert_cache;
 pub mod gpu;
 pub mod handoff;
 pub mod model;
+mod route_log;
 pub mod vision;
 
 pub use gpu::Gpu;

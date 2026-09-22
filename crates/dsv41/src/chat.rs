@@ -773,6 +773,8 @@ pub fn parse_reply(text: &str, mode: Mode) -> Result<Reply> {
 
 // ---- streaming ------------------------------------------------------------------
 
+mod runtime_dsml;
+
 /// A piece of a reply as it streams.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Delta {
@@ -808,17 +810,19 @@ pub struct StreamParser {
     phase: Phase,
     pending: String,
     calls: String,
+    completed: Option<Vec<ToolCall>>,
 }
 
 impl StreamParser {
     /// `mode` is the prompt's: thinking mode starts inside the reasoning.
     pub fn new(mode: Mode) -> StreamParser {
         let phase = if mode == Mode::Thinking { Phase::Reasoning } else { Phase::Content };
-        StreamParser { phase, pending: String::new(), calls: String::new() }
+        StreamParser { phase, pending: String::new(), calls: String::new(), completed: None }
     }
 
     /// Feed more text; returns what can be shown now.
     pub fn push(&mut self, text: &str) -> Vec<Delta> {
+        if self.completed.is_some() { return Vec::new(); }
         let mut out = Vec::new();
         match self.phase {
             Phase::ToolCalls => self.calls.push_str(text),
@@ -839,24 +843,45 @@ impl StreamParser {
                         return out;
                     }
                 },
-                Phase::Content => match self.pending.find(TOOL_CALLS_START) {
+                Phase::Content => match self.pending.find(&format!("<{DSML} calls")) {
                     Some(p) => {
-                        emit(&mut out, Delta::Content(self.pending[..p].to_string()));
-                        self.calls = self.pending[p + 2..].to_string();
+                        let content = self.pending[..p].strip_suffix("\n\n").unwrap_or(&self.pending[..p]);
+                        emit(&mut out, Delta::Content(content.to_string()));
+                        self.calls = self.pending[p..].to_string();
                         self.pending.clear();
                         self.phase = Phase::ToolCalls;
+                        self.try_complete();
                         return out;
                     }
                     None => {
-                        let keep = held(&self.pending, TOOL_CALLS_START);
+                        let keep = held(&self.pending, TOOL_CALLS_START).max(held(&self.pending, &format!("<{DSML} calls")));
                         let shown: String = self.pending.drain(..self.pending.len() - keep).collect();
                         emit(&mut out, Delta::Content(shown));
                         return out;
                     }
                 },
-                Phase::ToolCalls => return out,
+                Phase::ToolCalls => { self.try_complete(); return out; },
             }
         }
+    }
+
+    fn try_complete(&mut self) {
+        if self.calls.contains(&format!("</{DSML}")) {
+            if let Ok((_,calls)) = runtime_dsml::parse(&self.calls) {
+                // The model must yield here for real tool results. Do not accept
+                // invented results or another batch generated after this envelope.
+                self.completed = Some(calls);
+            }
+        }
+    }
+
+    /// A validated, closed tool envelope is ready for the caller to dispatch.
+    pub fn tool_calls_ready(&self) -> bool { self.completed.is_some() }
+
+    /// At end of generation, let an API distinguish rejected DSML from prose.
+    pub fn tool_call_error(&self) -> Option<String> {
+        if self.phase != Phase::ToolCalls || self.completed.is_some() { return None; }
+        runtime_dsml::parse(self.calls.trim_end_matches(EOS)).err().map(|e|e.to_string())
     }
 
     /// While a tool-calls block is being written, what it says so far: the
@@ -886,9 +911,10 @@ impl StreamParser {
     }
 
     /// End of generation: the held-back text, and the tool calls if the
-    /// reply made any. A tool-calls block that does not parse is returned
+    /// reply made any. The first complete envelope terminates the turn. A block that does not parse is returned
     /// as content, so nothing the model wrote is lost.
     pub fn finish(mut self) -> (Vec<Delta>, Vec<ToolCall>) {
+        if let Some(calls) = self.completed.take() { return (Vec::new(),calls); }
         let mut out = Vec::new();
         let rest = std::mem::take(&mut self.pending);
         match self.phase {
@@ -896,10 +922,8 @@ impl StreamParser {
             Phase::Content => emit(&mut out, Delta::Content(rest)),
             Phase::ToolCalls => {
                 let block = self.calls.trim_end_matches(EOS);
-                let opening = format!("<{DSML} calls");
-                let parsed = block.strip_prefix(&opening).map(|_| parse_tool_calls(block, opening.len()));
-                match parsed {
-                    Some(Ok((end, calls))) if block[end..].trim().is_empty() => return (out, calls),
+                match runtime_dsml::parse(block) {
+                    Ok((_, calls)) => return (out, calls),
                     _ => emit(&mut out, Delta::Content(format!("\n\n{block}"))),
                 }
             }
@@ -929,6 +953,71 @@ fn held(s: &str, marker: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_handles_reported_mixed_tags_and_stops_before_invented_results() {
+        let block=format!("<{DSML} calls>\n<{DSML} invoke name=\"workspace_info\">\n\n</{DSML} invoke>\n<{DSML} invoke name=\"list_files\">\n<parameter name=\"path\" string=\"true\">.</parameter>\n</invoke>\n</{DSML} calls>");
+        for prefix in ["", "\n", "Ready.\n\n"] {
+            for step in [1,2,3,7,10000] {
+                let text=format!("{prefix}{block}Invented results. {block}");
+                let mut p=StreamParser::new(Mode::Chat);let mut shown=String::new();
+                let chars:Vec<char>=text.chars().collect();
+                for chunk in chars.chunks(step) {
+                    for d in p.push(&chunk.iter().collect::<String>()) {
+                        if let Delta::Content(s)=d {shown.push_str(&s);}
+                    }
+                }
+                assert!(p.tool_calls_ready());
+                let (rest,calls)=p.finish();assert!(rest.is_empty());
+                assert_eq!(calls.len(),2);assert_eq!(calls[0].name,"workspace_info");
+                assert_eq!(calls[0].arguments,"{}");assert_eq!(calls[1].arguments,r#"{"path": "."}"#);
+                assert!(!shown.contains("Invented"));assert!(!shown.contains(DSML));
+            }
+        }
+    }
+
+    #[test]
+    fn runtime_whitespace_and_attributes_preserve_raw_parameter_contents() {
+        let value=format!("  <parameter name=\"x\">example</parameter>\n</{DSML} calls>\n  ");
+        let block=format!("<{DSML} calls >\r\n\t<invoke name = \"write_file\" >\r\n<{DSML} parameter string = \"true\" name = \"content\" >{value}</{DSML} parameter >\r\n<parameter name=\"flag\" string=\"false\">false</parameter>\n</invoke >\r\n</{DSML} calls >");
+        let mut p=StreamParser::new(Mode::Chat);
+        for c in block.chars() {p.push(&c.to_string());}
+        assert!(p.tool_calls_ready());
+        let (_,calls)=p.finish();assert_eq!(calls.len(),1);
+        let args=Json::parse(calls[0].arguments.as_bytes()).unwrap();
+        assert_eq!(args.get("content").and_then(Json::as_str),Some(value.as_str()));
+        assert_eq!(args.get("flag"),Some(&Json::Bool(false)));
+    }
+
+    #[test]
+    fn runtime_never_repairs_unclosed_invalid_or_duplicate_arguments() {
+        let open=format!("<{DSML} calls><invoke name=\"f\">");
+        let close=format!("</invoke></{DSML} calls>");
+        let good="<parameter name=\"x\" string=\"true\">a</parameter>";
+        for body in [
+            format!("{open}{good}"),
+            format!("{open}{good}{good}{close}"),
+            format!("{open}<parameter name=\"x\" string=\"false\">oops</parameter>{close}"),
+            format!("{open}<parameter name=\"x\" string=\"maybe\">a</parameter>{close}"),
+            format!("<{DSML} calls><invoke name=\"f\" name=\"g\">{close}"),
+            format!("<{DSML} calls><invoke name=\"f\">{good}</{DSML} calls>"),
+        ] {
+            let mut p=StreamParser::new(Mode::Chat);p.push(&body);
+            assert!(!p.tool_calls_ready(),"{body}");assert!(p.tool_call_error().is_some());assert!(p.finish().1.is_empty());
+        }
+        let plain="<calls><invoke name=\"f\"></invoke></calls>";
+        let mut p=StreamParser::new(Mode::Chat);
+        assert_eq!(p.push(plain),vec![Delta::Content(plain.into())]);
+        assert!(p.finish().1.is_empty());
+    }
+
+    #[test]
+    fn runtime_reports_the_live_missing_string_attribute_instead_of_guessing() {
+        let text=format!("<{DSML} calls>\n<{DSML} invoke name=\"workspace_info\">\n<{DSML} parameter name=\"string\">true</{DSML} parameter>\n</{DSML} invoke>\n</{DSML} calls>");
+        let mut p=StreamParser::new(Mode::Chat);p.push(&text);
+        assert!(!p.tool_calls_ready());assert!(p.tool_call_error().is_some());
+        assert!(p.finish().1.is_empty());
+    }
 
     #[test]
     fn stream_parser_splits_reasoning_content_and_calls() {

@@ -29,6 +29,7 @@ pub mod cpu_experts;
 pub mod detok;
 pub mod engram;
 pub mod expert;
+pub mod ternary;
 pub mod formats;
 pub mod golden;
 pub mod hc;

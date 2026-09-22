@@ -268,6 +268,43 @@ pub mod avx512 {
         _mm512_setr_ps(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9], a[10], a[11], a[12], a[13], a[14], a[15])
     }
 
+
+    #[target_feature(enable = "avx512f,avx512bw")]
+    pub fn ternary_rows(x: &[f32], w: &[u8], s: &[u8], k: usize, r0: usize, out: &mut [f32]) {
+        assert!(k.is_multiple_of(128) && x.len()>=k && w.len()>=(r0+out.len())*k/4 && s.len()>=(r0+out.len())*k/64);
+        let mask = _mm512_set1_epi32(3);
+        for (g, dst) in out.chunks_mut(16).enumerate() {
+            let r=r0+g*16; let n=dst.len();
+            let mut acc=_mm512_setzero_ps();
+            for b in 0..k/64 {
+                let mut rr=[_mm_setzero_si128();16];
+                for lane in 0..n { rr[lane]=load16(&w[(r+lane)*k/4+b*16..][..16]); }
+                let cols=transpose(&rr);
+                let mut sc=[0.0f32;16];
+                for lane in 0..n {
+                    let off=((r+lane)*k/128+b/2)*2;
+                    sc[lane]=crate::formats::f16_to_f32(u16::from_le_bytes([s[off],s[off+1]]));
+                }
+                for half in 0..2 {
+                    let mut part=_mm512_setzero_ps();
+                    for i in 0..8 {
+                        let q=_mm512_cvtepu8_epi32(cols[half*8+i]);
+                        let codes=[q,_mm512_srli_epi32::<2>(q),_mm512_srli_epi32::<4>(q),_mm512_srli_epi32::<6>(q)];
+                        for pair in 0..2 {
+                            let c=b*64+half*32+i*4+pair*2;
+                            let a=_mm512_cvtepi32_ps(_mm512_sub_epi32(_mm512_and_si512(codes[pair*2],mask),_mm512_set1_epi32(1)));
+                            let z=_mm512_cvtepi32_ps(_mm512_sub_epi32(_mm512_and_si512(codes[pair*2+1],mask),_mm512_set1_epi32(1)));
+                            let v=_mm512_add_ps(_mm512_mul_ps(_mm512_set1_ps(x[c]),a),_mm512_mul_ps(_mm512_set1_ps(x[c+1]),z));
+                            part=_mm512_add_ps(part,v);
+                        }
+                    }
+                    acc=_mm512_add_ps(acc,_mm512_mul_ps(part,from_lanes(&sc)));
+                }
+            }
+            dst.copy_from_slice(&lanes(acc)[..n]);
+        }
+    }
+
     /// [`super::fp4_rows`], 16 rows per register.
     ///
     /// # Safety
@@ -356,12 +393,17 @@ impl CpuExperts {
 
     /// [`new`](Self::new) with a faster row kernel (same results).
     pub fn with_kernel(threads: usize, kernel: RowKernel) -> CpuExperts {
+        Self::with_format(threads, kernel, RECORD_BYTES)
+    }
+
+    pub fn with_format(threads: usize, kernel: RowKernel, record_bytes: usize) -> CpuExperts {
+        assert!(record_bytes == RECORD_BYTES || record_bytes == crate::ternary::RECORD_BYTES);
         let threads = if threads == 0 { std::thread::available_parallelism().map_or(1, |n| n.get()) } else { threads };
         let (tx, rx) = channel::<Request>();
         let coordinator = std::thread::Builder::new()
             .name("dsv41-experts".into())
             .spawn(move || {
-                let engine = Engine { pool: Pool::new(threads), threads, kernel };
+                let engine = Engine { pool: Pool::new(threads), threads, kernel, record_bytes };
                 while let Ok(req) = rx.recv() {
                     let Request { records, weights, x, swiglu_limit, done } = req;
                     let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| engine.forward(&records, &weights, &x, swiglu_limit)))
@@ -410,13 +452,14 @@ struct Engine {
     pool: Pool,
     threads: usize,
     kernel: RowKernel,
+    record_bytes: usize,
 }
 
 impl Engine {
     fn forward(&self, records: &[Arc<Vec<u8>>], weights: &[f32], x: &[f32], swiglu_limit: f32) -> Vec<Vec<f32>> {
         assert_eq!(records.len(), weights.len());
         assert_eq!(x.len(), DIM);
-        assert!(records.iter().all(|r| r.len() == RECORD_BYTES));
+        assert!(records.iter().all(|r| r.len() == self.record_bytes));
         let m = records.len();
         if m == 0 {
             return Vec::new();
@@ -434,8 +477,8 @@ impl Engine {
                 spans.push((e, r0));
                 jobs.push(Box::new(move || {
                     let (mut g, mut u) = (vec![0.0f32; len], vec![0.0f32; len]);
-                    fp4_rows(&xq, &rec[W1], &rec[S1], DIM, r0, &mut g);
-                    fp4_rows(&xq, &rec[W3], &rec[S3], DIM, r0, &mut u);
+                    fp4_rows(&xq, &rec[if rec.len() == crate::ternary::RECORD_BYTES { crate::ternary::W1 } else { W1 }], &rec[if rec.len() == crate::ternary::RECORD_BYTES { crate::ternary::S1 } else { S1 }], DIM, r0, &mut g);
+                    fp4_rows(&xq, &rec[if rec.len() == crate::ternary::RECORD_BYTES { crate::ternary::W3 } else { W3 }], &rec[if rec.len() == crate::ternary::RECORD_BYTES { crate::ternary::S3 } else { S3 }], DIM, r0, &mut u);
                     let h = g
                         .iter()
                         .zip(&u)
@@ -468,7 +511,7 @@ impl Engine {
                 spans.push((e, r0));
                 jobs.push(Box::new(move || {
                     let mut y = vec![0.0f32; len];
-                    fp4_rows(&hq[e * INTER..(e + 1) * INTER], &rec[W2], &rec[S2], INTER, r0, &mut y);
+                    fp4_rows(&hq[e * INTER..(e + 1) * INTER], &rec[if rec.len() == crate::ternary::RECORD_BYTES { crate::ternary::W2 } else { W2 }], &rec[if rec.len() == crate::ternary::RECORD_BYTES { crate::ternary::S2 } else { S2 }], INTER, r0, &mut y);
                     (id, y.into_iter().map(to_bf16).collect())
                 }));
             }

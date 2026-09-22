@@ -34,6 +34,15 @@ use nrob::{Error, Result};
 use crate::engine::Job;
 use crate::{api, disk, engine, glm, Options, STATE_FORMAT};
 
+pub(crate) fn needs_tool_precision(body: &nrob::json::Json) -> bool {
+    use nrob::json::Json;
+    let nonempty=|v: Option<&Json>|v.and_then(Json::as_array).is_some_and(|a|!a.is_empty());
+    (body.get("tool_choice").and_then(Json::as_str)!=Some("none") && nonempty(body.get("tools"))) ||
+        body.get("messages").and_then(Json::as_array).is_some_and(|messages|messages.iter().any(|m|
+            matches!(m.get("role").and_then(Json::as_str),Some("tool"|"function")) ||
+            nonempty(m.get("tool_calls")) || nonempty(m.get("tools"))))
+}
+
 /// Which runtime serves a model, decided by what is on disk.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
@@ -343,7 +352,10 @@ impl Models {
             .clone()
             .unwrap_or_else(|| spec.path.join("engram_meta.safetensors"));
         let mut model = GpuModel::load(&spec.path, &engram_meta, &gopts)?;
-        if let Some(path) = o.usage.as_ref().filter(|p| p.exists()) {
+        let tool_experts = o.tools_experts.is_some() && spec.name == self.default_name;
+        if tool_experts { model.enable_tool_experts(o.tools_experts.as_ref().unwrap())?; }
+        if let Some(path) = &o.expert_trace { model.enable_route_log(path)?; }
+        if let Some(path) = o.usage.as_ref().filter(|p| !tool_experts && p.exists()) {
             let (vram, queued) = model.warm(path, 4)?;
             self.say(format!(
                 "warmed {vram} experts into VRAM; {queued} more loading into RAM in the background"
@@ -370,7 +382,13 @@ impl Models {
             request_log,
         );
         e.warn = !o.silent;
+        e.tool_experts = tool_experts;
+        if tool_experts {
+            self.say("DSML boundary precision: ternary prompt/prose; MXFP4 tool payload; 80/20 expert cache budgets; trunk retained".into());
+        }
         if let Some(dir) = &o.prompt_cache {
+            let isolated = if tool_experts {dir.join("dsml-boundary-v1-ternary-prompts")} else {dir.clone()};
+            let dir = &isolated;
             // States belong to this model (its config and weight map) and to this
             // state format.
             let mut fingerprint = disk::fnv(&[STATE_FORMAT], 0);
@@ -378,6 +396,7 @@ impl Models {
                 fingerprint =
                     disk::fnv(&std::fs::read(spec.path.join(name)).unwrap_or_default(), fingerprint);
             }
+            if tool_experts { fingerprint = disk::fnv(b"dsml-boundary-v1-ternary-prompts", fingerprint); }
             match disk::DiskCache::open(dir, fingerprint, (o.prompt_cache_gb * 1e9) as u64) {
                 Ok(cache) => {
                     self.say(format!("{} prompt states on disk in {}", cache.len(), dir.display()));
@@ -517,6 +536,18 @@ impl Models {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_phase_policy_requires_tools_or_tool_history() {
+        use nrob::json::Json;
+        for body in [r#"{"tools":[{}]}"#, r#"{"messages":[{"role":"tool","content":"ok"}]}"#,
+            r#"{"messages":[{"role":"assistant","tool_calls":[{}]}]}"#] {
+            assert!(needs_tool_precision(&Json::parse(body.as_bytes()).unwrap()));
+        }
+        for body in [r#"{}"#, r#"{"tools":[]}"#, r#"{"tools":[{}],"tool_choice":"none"}"#] {
+            assert!(!needs_tool_precision(&Json::parse(body.as_bytes()).unwrap()));
+        }
+    }
 
     /// The runtime is chosen by what is on disk, not by configuration, so a
     /// mis-set `kind` cannot send a GGUF to the DeepSeek loader.

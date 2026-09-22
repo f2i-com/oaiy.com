@@ -21,7 +21,7 @@ use cudarc::driver::{
 use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
 use nrob::{Error, Result};
 
-const SRC: &str = include_str!("kernels.cu");
+const SRC: &str = concat!(include_str!("kernels.cu"), "\nextern \"C\" {\n", include_str!("ternary.cuh"), "\n}\n");
 const KERNELS: &[&str] = &[
     "act_quant_fp8",
     "act_quant_fp8_to",
@@ -33,6 +33,9 @@ const KERNELS: &[&str] = &[
     "gemv_fp8w",
     "gemv_f32",
     "gemv_fp4",
+    "gemv_ternary",
+    "moe_gate_up_ternary",
+    "moe_down_ternary",
     "swiglu",
     "moe_gate_up",
     "moe_down",
@@ -694,6 +697,56 @@ impl Gpu {
         cu(unsafe { b.launch(rows_cfg((nexp * dim).div_ceil(2))) })?;
         Ok(())
     }
+
+    pub fn gemv_ternary(
+        &self,
+        xq: &CudaView<'_, f32>,
+        w: &CudaView<'_, u8>,
+        s: &CudaView<'_, u8>,
+        y: &mut CudaViewMut<'_, f32>,
+        n: usize,
+        k: usize,
+        nt: usize,
+        round: bool,
+    ) -> Result<()> {
+        assert!(k.is_multiple_of(128) && w.len() >= n * k / 4 && s.len() >= n * k / 64 && xq.len() >= k * nt && y.len() >= n * nt);
+        let (ni, ki, ti, ri) = (n as i32, k as i32, nt as i32, i32::from(round));
+        let mut b = self.stream.launch_builder(self.f("gemv_ternary"));
+        b.arg(xq).arg(w).arg(s).arg(y).arg(&ni).arg(&ki).arg(&ti).arg(&ri);
+        // SAFETY: gemv_ternary(const float* x, const u8* w, const u8* s, float* y, int n, int k, int nt, int round).
+        cu(unsafe { b.launch(rows_cfg(n)) })?;
+        Ok(())
+    }
+
+
+    pub fn moe_gate_up_ternary(&self, xq: &CudaView<'_, f32>, tab: &CudaSlice<u64>, h: &mut CudaSlice<f32>, nexp: usize, inter: usize, dim: usize, lim: f32) -> Result<()> {
+        assert!(xq.len() >= dim && tab.len() >= 3 * nexp && h.len() >= nexp * inter);
+        assert!(dim.is_multiple_of(32) && inter.is_multiple_of(32));
+        let (ni, ii, di) = (nexp as i32, inter as i32, dim as i32);
+        let mut b = self.stream.launch_builder(self.f("moe_gate_up_ternary"));
+        b.arg(xq).arg(tab).arg(h).arg(&ni).arg(&ii).arg(&di).arg(&lim);
+        // SAFETY: moe_gate_up_ternary(const float* xq, const u64* tab, float* h, int nexp, int inter, int dim, float lim);
+        // every address in tab points at a whole record in a live allocation on this device, pinned
+        // for the batch, and only this stream writes those slots, in order.
+        cu(unsafe { b.launch(rows_cfg(nexp * inter)) })?;
+        Ok(())
+    }
+
+    /// Grouped decode stage 2: row `r` of every expert's w2 against its
+    /// quantized `hq` row, written to output row `tab[nexp + s]` of `out`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_down_ternary(&self, hq: &CudaSlice<f32>, tab: &CudaSlice<u64>, out: &mut CudaSlice<f32>, nexp: usize, rows: usize, inter: usize, dim: usize) -> Result<()> {
+        assert!(hq.len() >= nexp * inter && tab.len() >= 3 * nexp && out.len() >= rows * dim);
+        let (ni, ii, di) = (nexp as i32, inter as i32, dim as i32);
+        let mut b = self.stream.launch_builder(self.f("moe_down_ternary"));
+        b.arg(hq).arg(tab).arg(out).arg(&ni).arg(&ii).arg(&di);
+        // SAFETY: moe_down_ternary(const float* hq, const u64* tab, float* out, int nexp, int inter, int dim);
+        // record addresses as in moe_gate_up_ternary; the caller's table holds output rows < `rows`.
+        // A half-warp per row: 16 rows per 256-thread block, whole warps.
+        cu(unsafe { b.launch(rows_cfg((nexp * dim).div_ceil(2))) })?;
+        Ok(())
+    }
+
 
     /// The host table for [`moe_gate_up`](Self::moe_gate_up) / [`moe_down`](Self::moe_down):
     /// record addresses, then output rows, then route-weight bits.

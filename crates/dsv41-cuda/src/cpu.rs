@@ -35,3 +35,14 @@ fn fp4_rows_avx512(x: &[f32], w: &[u8], s: &[u8], k: usize, r0: usize, out: &mut
     // intrinsics), so nothing else is assumed.
     unsafe { dsv41::cpu_experts::avx512::fp4_rows(x, w, s, k, r0, out) }
 }
+
+pub fn ternary_row_kernel() -> RowKernel {
+    #[cfg(target_arch="x86_64")]
+    if std::arch::is_x86_feature_detected!("avx512f") && std::arch::is_x86_feature_detected!("avx512bw") { return ternary_avx512; }
+    dsv41::ternary::rows
+}
+#[cfg(target_arch="x86_64")]
+fn ternary_avx512(x:&[f32],w:&[u8],s:&[u8],k:usize,r0:usize,out:&mut[f32]) {
+    // SAFETY: this private wrapper is returned only after checking both CPU features.
+    unsafe { dsv41::cpu_experts::avx512::ternary_rows(x,w,s,k,r0,out) }
+}

@@ -41,7 +41,7 @@ use dsv41::attention::{compressed_pos, select_compressed, CandidateRole, Shared}
 use dsv41::config::Config;
 use dsv41::cpu_experts::CpuExperts;
 use dsv41::engram::{Engram, NgramHasher};
-use dsv41::expert::{SafetensorsExpertStore, DIM, INTER, RECORD_BYTES, S1, S2, S3, W1, W2, W3};
+use dsv41::expert::{SafetensorsExpertStore, DIM, INTER, S1, S2, S3, W1, W2, W3};
 use dsv41::hc::{HcParams, HC};
 use dsv41::linear::{load_vec, Out, Weight};
 use dsv41::model::{Backbone, Teacher, Trace};
@@ -500,6 +500,7 @@ struct Dev {
     rope_window: (CudaSlice<f32>, CudaSlice<f32>),
     rope_compress: (CudaSlice<f32>, CudaSlice<f32>),
     dcache: DeviceExpertCache,
+    alternate_dcache: Option<DeviceExpertCache>,
 }
 
 pub struct GpuModel {
@@ -534,6 +535,14 @@ pub struct GpuModel {
     topk: Vec<Vec<i32>>,
     // experts
     store: Arc<dyn WeightStore>,
+    ternary: bool,
+    alternate_store: Option<Arc<dyn WeightStore>>,
+    alternate_cache: Option<Arc<Ecache>>,
+    route_log: Option<crate::route_log::RouteLog>,
+    route_position: usize,
+    expert_cache_budget: usize,
+    expert_cpu_threads: Option<usize>,
+    expert_switch_failed: bool,
     cache: Arc<Ecache>,
     cpu: Option<CpuExperts>,
     /// Background fill of the host cache started by [`warm`](Self::warm).
@@ -554,6 +563,12 @@ impl GpuModel {
     pub fn load(model_dir: &Path, engram_meta: &Path, opts: &GpuOptions) -> Result<GpuModel> {
         let cfg = Config::load(model_dir)?;
         let idx = StIndex::open(model_dir)?;
+        let ternary_dir = std::env::var_os("DSV41_TERNARY_DIR");
+        let ternary = ternary_dir.is_some();
+        let store: Arc<dyn WeightStore> = if let Some(dir)=ternary_dir {
+            Arc::new(dsv41::ternary::TernaryStore::open(Path::new(&dir),model_dir,cfg.n_layers as u32,cfg.n_routed_experts as u32,opts.direct_io)?)
+        } else { Arc::new(SafetensorsExpertStore::open(&idx,cfg.n_layers as u32,cfg.n_routed_experts as u32,opts.direct_io)?) };
+        let record_bytes=store.record_bytes();
         if opts.devices.is_empty() {
             return Err(Error::Arg("no CUDA devices given".into()));
         }
@@ -694,13 +709,12 @@ impl GpuModel {
                 Some(b) => b,
                 None => g.mem_info()?.0.saturating_sub(opts.vram_headroom_bytes),
             };
-            let dcache = DeviceExpertCache::new(&g, (vram / RECORD_BYTES).max(1), RECORD_BYTES)?;
+            let dcache = DeviceExpertCache::new(&g, (vram / record_bytes).max(1), record_bytes)?;
             let handoff = Arc::new(crate::handoff::Handoff::new(&g, cfg.n_activated_experts, cfg.dim)?);
             let inbox = crate::handoff::Inbox::new(&g, cfg.n_routed_experts + cfg.dim)?;
             let mix_counter = g.zeros::<u32>(opts.max_seq)?;
-            devs.push(Dev { handoff, cpu_seq: 0, inbox, inbox_seq: 0, mix_counter, g, rope_window, rope_compress, dcache });
+            devs.push(Dev { handoff, cpu_seq: 0, inbox, inbox_seq: 0, mix_counter, g, rope_window, rope_compress, dcache, alternate_dcache: None });
         }
-        let store = SafetensorsExpertStore::open(&idx, cfg.n_layers as u32, cfg.n_routed_experts as u32, opts.direct_io)?;
         Ok(GpuModel {
             embed: Weight::load(&idx, "embed")?,
             norm,
@@ -725,13 +739,89 @@ impl GpuModel {
             compress_src: None,
             index_k_src: None,
             topk: Vec::new(),
-            store: Arc::new(store),
-            cache: Arc::new(Ecache::new(opts.expert_cache_bytes, RECORD_BYTES, CachePolicy::Lfru)),
+            store,
+            ternary,
+            alternate_store: None,
+            alternate_cache: None,
+            route_log: None,
+            route_position: 0,
+            expert_cache_budget: opts.expert_cache_bytes,
+            expert_cpu_threads: opts.cpu_expert_threads,
+            expert_switch_failed: false,
+            cache: Arc::new(Ecache::new(opts.expert_cache_bytes, record_bytes, CachePolicy::Lfru)),
             warming: None,
             demand: Arc::new(Demand::new()),
-            cpu: opts.cpu_expert_threads.map(|n| CpuExperts::with_kernel(n, crate::cpu::row_kernel())),
+            cpu: opts.cpu_expert_threads.map(|n| CpuExperts::with_format(n, if ternary {crate::cpu::ternary_row_kernel()} else {crate::cpu::row_kernel()},record_bytes)),
             cfg,
         })
+    }
+
+    /// Open only the original expert index, leaving the loaded trunk intact.
+    pub fn enable_tool_experts(&mut self, original: &Path) -> Result<()> {
+        if !self.ternary || self.alternate_store.is_some() {
+            return Err(Error::Arg("tool experts require an initial ternary model".into()));
+        }
+        let idx = StIndex::open(original)?;
+        let store = SafetensorsExpertStore::open(&idx, self.cfg.n_layers as u32,
+            self.cfg.n_routed_experts as u32, self.store.direct_io())?;
+        // Validate the complete original expert layout before changing allocations.
+        let fp4_record = store.record_bytes();
+        let ternary_record = self.store.record_bytes();
+        if let Some(w) = self.warming.take() { w.stop(); }
+        for d in &mut self.devs {
+            d.g.sync()?;
+            let budget = d.dcache.slots() * ternary_record;
+            let fp4_slots = (budget / 5 / fp4_record).max(1);
+            let ternary_slots = ((budget - fp4_slots * fp4_record) / ternary_record).max(1);
+            // Release the initially empty full-size allocation before repartitioning.
+            let placeholder = DeviceExpertCache::new(&d.g, 1, ternary_record)?;
+            drop(std::mem::replace(&mut d.dcache, placeholder));
+            d.dcache = DeviceExpertCache::new(&d.g, ternary_slots, ternary_record)?;
+            d.alternate_dcache = Some(DeviceExpertCache::new(&d.g, fp4_slots, fp4_record)?);
+        }
+        let fp4_budget = self.expert_cache_budget / 5;
+        self.cache = Arc::new(Ecache::new(self.expert_cache_budget - fp4_budget, ternary_record, CachePolicy::Lfru));
+        self.alternate_cache = Some(Arc::new(Ecache::new(fp4_budget, fp4_record, CachePolicy::Lfru)));
+        self.alternate_store = Some(Arc::new(store));
+        Ok(())
+    }
+
+    pub fn uses_ternary_experts(&self) -> bool { self.ternary }
+
+    /// Change only the expert source and kernels; caches retain both formats.
+    /// Preserves attention state for the explicit mixed-precision experiment.
+    /// This never reloads layers or reads expert records.
+    pub fn select_tool_experts(&mut self, original: bool) -> Result<bool> {
+        if self.expert_switch_failed {
+            return Err(Error::Arg("expert precision switch failed; restart the worker".into()));
+        }
+        if self.alternate_store.is_none() || self.ternary != original { return Ok(false); }
+        // Fail closed if a device/cache reset fails part way through.
+        self.expert_switch_failed = true;
+        if let Some(w) = self.warming.take() { w.stop(); }
+        for d in &self.devs { d.g.sync()?; }
+        self.cpu = None; // join every CPU expert worker before changing its format
+        let record = self.alternate_store.as_ref().unwrap().record_bytes();
+        for d in &mut self.devs { std::mem::swap(&mut d.dcache, d.alternate_dcache.as_mut().unwrap()); }
+        std::mem::swap(&mut self.cache, self.alternate_cache.as_mut().unwrap());
+        std::mem::swap(&mut self.store, self.alternate_store.as_mut().unwrap());
+        self.ternary = !original;
+        self.cpu = self.expert_cpu_threads.map(|n| CpuExperts::with_format(n,
+            if self.ternary {crate::cpu::ternary_row_kernel()} else {crate::cpu::row_kernel()}, record));
+        self.expert_switch_failed = false;
+        Ok(true)
+    }
+
+    pub fn enable_route_log(&mut self, path: &Path) -> Result<()> {
+        self.route_log = Some(crate::route_log::RouteLog::open(path)?);
+        Ok(())
+    }
+    pub fn trace_phase(&mut self, request: u64, phase: &str, token: Option<u32>, text: &str) {
+        if let Some(log) = &mut self.route_log { log.context(request, phase, token, text); }
+    }
+    pub fn flush_route_log(&mut self) -> Result<()> {
+        if let Some(log) = &mut self.route_log { log.flush()?; }
+        Ok(())
     }
 
     pub fn expert_cache(&self) -> &Ecache {
@@ -1096,7 +1186,7 @@ impl GpuModel {
         let mut carry: Option<Carry> = None;
 
         // the next layer's reads, started once a layer's experts are done
-        let pool = Arc::new(Prefetched::new(RECORD_BYTES));
+        let pool = Arc::new(Prefetched::new(self.store.record_bytes()));
         let mut spec: Option<Speculative> = None;
         // the share of its experts the last layer used (the first layer
         // judges by its own)
@@ -1186,6 +1276,7 @@ impl GpuModel {
             let Dev { g, dcache, .. } = &mut self.devs[self.cur];
             let logits = g.download(&ly.gate.forward(g, &x2_all.as_view(), t, Out::F32)?)?;
             let routes = route_mixed(&self.cfg, &logits, &ly.bias, image_bias(ly, &mask), t);
+            if let Some(log) = &mut self.route_log { log.routes(l, start_pos, &routes, self.ternary)?; }
             note_usage(&mut self.usage, n_exp, l, &routes);
             let mut used: Vec<u32> = routes.iter().flat_map(|r| r.experts.iter().copied()).collect();
             used.sort_unstable();
@@ -1382,6 +1473,7 @@ impl GpuModel {
     /// [`run`](Self::run); `logits: false` stops after the last layer (no
     /// final norm, head or download) and returns nothing.
     fn run_as(&mut self, ids: &[u32], start_pos: usize, teacher: Option<Teacher<'_>>, trace: Option<Trace<'_>>, images: &[ImageSpan], logits: bool) -> Result<Vec<f32>> {
+        self.route_position = start_pos;
         let prefill = ids.len() > 1;
         if prefill {
             self.demand.prefill.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1871,6 +1963,7 @@ impl GpuModel {
             (g.download(&ly.gate.forward(g, &x.as_view(), t, Out::F32)?)?, None)
         };
         let routes = route_mixed(&self.cfg, &logits, &ly.bias, image_bias(ly, &self.image_mask), t);
+        if let Some(log) = &mut self.route_log { log.routes(l, self.route_position, &routes, self.ternary)?; }
         note_usage(&mut self.usage, n_exp, l, &routes);
         let prof = self.profile.is_some();
         let elapsed = |t0: Option<Instant>| -> Result<f64> {
@@ -1978,9 +2071,9 @@ impl GpuModel {
                 let ng = recs.len();
                 let tab = g.upload(&Gpu::moe_table(&recs, &rows, &ws))?;
                 let mut hbuf = g.alloc::<f32>(ng * INTER)?;
-                g.moe_gate_up(&xq.as_view(), &tab, &mut hbuf, ng, INTER, DIM, lim)?;
+                if self.ternary { g.moe_gate_up_ternary(&xq.as_view(), &tab, &mut hbuf, ng, INTER, DIM, lim)?; } else { g.moe_gate_up(&xq.as_view(), &tab, &mut hbuf, ng, INTER, DIM, lim)?; }
                 g.act_quant_fp8(&mut hbuf.slice_mut(..))?;
-                g.moe_down(&hbuf, &tab, &mut outs, ng, nexp, INTER, DIM)?;
+                if self.ternary { g.moe_down_ternary(&hbuf, &tab, &mut outs, ng, nexp, INTER, DIM)?; } else { g.moe_down(&hbuf, &tab, &mut outs, ng, nexp, INTER, DIM)?; }
             }
             compute += elapsed(tc)?;
             (Some(xq), MoeOut::Grouped(outs, nexp), cpu_part)
@@ -2310,13 +2403,13 @@ fn compute_experts(
         let (mut gate, mut up) = (g.alloc::<f32>(nt * INTER)?, g.alloc::<f32>(nt * INTER)?);
         // tensor cores for every prefill expert, however few its tokens: a
         // token's result must not depend on how many share the launch
-        g.gemm_fp4(&xs.as_view(), &rec.slice(W1), &rec.slice(S1), &mut gate.slice_mut(..), INTER, DIM, nt, true)?;
-        g.gemm_fp4(&xs.as_view(), &rec.slice(W3), &rec.slice(S3), &mut up.slice_mut(..), INTER, DIM, nt, true)?;
+        if store.record_bytes() == dsv41::ternary::RECORD_BYTES { g.gemv_ternary(&xs.as_view(), &rec.slice(dsv41::ternary::W1), &rec.slice(dsv41::ternary::S1), &mut gate.slice_mut(..), INTER, DIM, nt, true)?; } else { g.gemm_fp4(&xs.as_view(), &rec.slice(W1), &rec.slice(S1), &mut gate.slice_mut(..), INTER, DIM, nt, true)?; }
+        if store.record_bytes() == dsv41::ternary::RECORD_BYTES { g.gemv_ternary(&xs.as_view(), &rec.slice(dsv41::ternary::W3), &rec.slice(dsv41::ternary::S3), &mut up.slice_mut(..), INTER, DIM, nt, true)?; } else { g.gemm_fp4(&xs.as_view(), &rec.slice(W3), &rec.slice(S3), &mut up.slice_mut(..), INTER, DIM, nt, true)?; }
         let mut hbuf = g.alloc::<f32>(nt * INTER)?;
         g.swiglu(&gate, &up, Some(&g.upload(&ws)?), &mut hbuf, INTER, nt, lim)?;
         g.act_quant_fp8(&mut hbuf.slice_mut(..))?;
         let mut out = g.alloc::<f32>(nt * DIM)?;
-        g.gemm_fp4(&hbuf.as_view(), &rec.slice(W2), &rec.slice(S2), &mut out.slice_mut(..), DIM, INTER, nt, true)?;
+        if store.record_bytes() == dsv41::ternary::RECORD_BYTES { g.gemv_ternary(&hbuf.as_view(), &rec.slice(dsv41::ternary::W2), &rec.slice(dsv41::ternary::S2), &mut out.slice_mut(..), DIM, INTER, nt, true)?; } else { g.gemm_fp4(&hbuf.as_view(), &rec.slice(W2), &rec.slice(S2), &mut out.slice_mut(..), DIM, INTER, nt, true)?; }
         g.scatter_add_rows(y, &out, &tok_idx, DIM, nt)?;
         *compute += elapsed(tc)?;
     }

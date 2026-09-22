@@ -363,7 +363,7 @@ impl Server {
         }
     }
 
-    fn submit(&self, a: &crate::models::Active, prompt: Vec<u32>, images: Vec<JobImage>, sampling: Sampling, max_tokens: usize, think_budget: Option<usize>) -> Result<(mpsc::Receiver<Event>, Arc<AtomicBool>), ApiError> {
+    fn submit(&self, a: &crate::models::Active, prompt: Vec<u32>, images: Vec<JobImage>, sampling: Sampling, max_tokens: usize, think_budget: Option<usize>, tool_precision: bool) -> Result<(mpsc::Receiver<Event>, Arc<AtomicBool>), ApiError> {
         if prompt.len() + 1 > a.cfg.max_seq {
             return Err(ApiError {
                 status: 400,
@@ -379,7 +379,7 @@ impl Server {
         let max_tokens = max_tokens.min(a.cfg.max_seq - prompt.len());
         let (tx, rx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
-        let job = Job { prompt, images, max_tokens, think_budget, sampling, cancel: Arc::clone(&cancel), events: tx };
+        let job = Job { tool_precision, prompt, images, max_tokens, think_budget, sampling, cancel: Arc::clone(&cancel), events: tx };
         a.jobs
             .send(job)
             .map_err(|_| ApiError { status: 503, message: "the model worker has stopped".into(), code: "unavailable" })?;
@@ -408,7 +408,7 @@ impl Server {
         let stream = body.get("stream").and_then(Json::as_bool).unwrap_or(false);
         let include_usage = body.get("stream_options").and_then(|o| o.get("include_usage")).and_then(Json::as_bool).unwrap_or(false);
         let think_budget = if mode == Mode::Thinking { Self::think_budget(&body, effort) } else { None };
-        let (rx, cancel) = self.submit(&a, prompt, images, sampling, max_tokens, think_budget)?;
+        let (rx, cancel) = self.submit(&a, prompt, images, sampling, max_tokens, think_budget, crate::models::needs_tool_precision(&body))?;
         let peer = w.try_clone().ok();
         let id = random_id("chatcmpl-");
         let created = now();
@@ -524,6 +524,11 @@ impl Server {
                     for d in parser.push(&t) {
                         emit(d, &mut sse, &mut stop, &cancel);
                     }
+                    if parser.tool_calls_ready() {
+                        // Stop generation at the completed call envelope so the
+                        // client can execute tools before the model continues.
+                        cancel.store(true, Ordering::Relaxed);
+                    }
                     // a tool call being written shows as it takes shape
                     if let (Some(s), Some(p)) = (sse.as_mut(), parser.call_preview()) {
                         if last_preview.elapsed() >= PREVIEW_EVERY {
@@ -561,8 +566,14 @@ impl Server {
                 }
             }
         }
+        let malformed_tools = parser.tool_call_error();
+        if error.is_none() && !stop.hit {
+            if let Some(detail) = &malformed_tools {
+                error = Some(format!("Model generated an invalid DSML tool call ({detail}); no tool was executed. Please start a fresh turn."));
+            }
+        }
         let (rest, calls) = parser.finish();
-        if !stop.hit {
+        if !stop.hit && malformed_tools.is_none() {
             for d in rest {
                 emit(d, &mut sse, &mut stop, &cancel);
             }
@@ -697,7 +708,7 @@ impl Server {
         }
         let n_prompt = prompt.len();
         let stream = body.get("stream").and_then(Json::as_bool).unwrap_or(false);
-        let (rx, cancel) = self.submit(&a, prompt, Vec::new(), sampling, max_tokens, None)?;
+        let (rx, cancel) = self.submit(&a, prompt, Vec::new(), sampling, max_tokens, None, false)?;
         let peer = w.try_clone().ok();
         let id = random_id("cmpl-");
         let created = now();

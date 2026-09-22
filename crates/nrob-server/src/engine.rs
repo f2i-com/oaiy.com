@@ -63,6 +63,7 @@ pub struct JobImage {
 }
 
 pub struct Job {
+    pub tool_precision: bool,
     pub prompt: Vec<u32>,
     pub images: Vec<JobImage>,
     pub max_tokens: usize,
@@ -121,6 +122,8 @@ pub struct Engine {
     /// What the state covers, one key per position: the token id, or for
     /// image positions a key from the image's content and the offset.
     tokens: Vec<u64>,
+    pub tool_experts: bool,
+    request_number: u64,
     checkpoints: Vec<Checkpoint>,
 }
 
@@ -203,8 +206,20 @@ impl Engine {
             warn: true,
             disk: None,
             tokens: Vec::new(),
+            tool_experts: false,
+            request_number: 0,
             checkpoints: Vec::new(),
         }
+    }
+
+    fn switch_phase(&mut self, original: bool) -> nrob::Result<()> {
+        if !self.tool_experts { return Ok(()); }
+        let t = Instant::now();
+        if self.model.select_tool_experts(original)? && self.log {
+            eprintln!("expert-only phase switch: {} in {:.3}s; trunk and both expert caches retained",
+                if original {"mxfp4"} else {"w2g128"}, t.elapsed().as_secs_f64());
+        }
+        Ok(())
     }
 
     /// Serve jobs until every sender is gone.
@@ -212,7 +227,14 @@ impl Engine {
         for job in jobs {
             // the background cache fill waits for idle time
             self.model.set_busy(true);
-            let result = self.generate(&job);
+            self.request_number += 1;
+            let result = self.switch_phase(false).and_then(|_| self.generate(&job));
+            // Every saved prompt checkpoint used ternary. Never reuse the generated
+            // mixed-precision suffix as if it had been evaluated in ternary.
+            let cleanup = if self.tool_experts {
+                self.switch_phase(false).and_then(|_| self.rollback(job.prompt.len()))
+            } else { Ok(()) };
+            let result = result.and(cleanup).and(self.model.flush_route_log());
             self.model.set_busy(false);
             if let Err(e) = result {
                 // the state is unknown after a failure: start clean
@@ -355,6 +377,7 @@ impl Engine {
         if prompt.is_empty() {
             return Err(nrob::Error::Arg("empty prompt".into()));
         }
+        self.model.trace_phase(self.request_number, "prompt", None, "");
         let started = Instant::now();
         let keys = prompt_keys(prompt, &job.images);
         let start = self.resume(&keys)?;
@@ -488,6 +511,8 @@ impl Engine {
         let think_start = self.tok.special(dsv41::chat::THINK_START);
         let mut budget = ThinkBudget::new(think_start.is_some() && prompt.last().copied() == think_start, self.tok.special(dsv41::chat::THINK_END), job.think_budget);
         let decode = Instant::now();
+        let mut phase = crate::tool_phase::ToolPhase::default();
+        let phase_enabled = self.tool_experts && job.tool_precision;
         let finish = loop {
             let was_thinking = budget.thinking;
             let (next, forced) = budget.pass(sample(&logits, &job.sampling, &mut rng));
@@ -509,6 +534,7 @@ impl Engine {
             if valid > 0 {
                 let text = String::from_utf8_lossy(&pending[..valid]).into_owned();
                 pending.drain(..valid);
+                if phase_enabled { phase.push(&text); }
                 if job.events.send(Event::Text(text)).is_err() {
                     break Finish::Stop; // nobody is listening
                 }
@@ -519,6 +545,10 @@ impl Engine {
             if job.cancel.load(Ordering::Relaxed) {
                 break Finish::Stop;
             }
+            if phase_enabled { self.switch_phase(phase.original())?; }
+            self.model.trace_phase(self.request_number,
+                if phase_enabled && phase.original() {"tool_call"} else {"reply"},
+                Some(next), &String::from_utf8_lossy(self.tok.token_bytes(next)));
             logits = self.model.forward(&[next], pos)?;
             self.tokens.push(u64::from(next));
             pos += 1;

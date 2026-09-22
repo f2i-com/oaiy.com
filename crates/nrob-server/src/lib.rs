@@ -12,6 +12,7 @@
 mod api;
 mod disk;
 mod engine;
+mod tool_phase;
 // VENDORED-LOCAL: GLM-5.3-Flash served through the same job/event contract.
 pub mod glm;
 // VENDORED-LOCAL: the configured models, and swapping between them.
@@ -77,6 +78,9 @@ pub struct Options {
     /// 65 s for DeepSeek-V4.1-Flash, so starting with the one that will be asked for
     /// saves loading a model only to unload it.
     pub start_model: Option<String>,
+    /// Original MXFP4 expert source for tool turns; trunk stays resident.
+    pub tools_experts: Option<std::path::PathBuf>,
+    pub expert_trace: Option<std::path::PathBuf>,
     /// Require `Authorization: Bearer KEY`.
     pub api_key: Option<String>,
     /// Reason before answering unless a request says otherwise.
@@ -157,6 +161,8 @@ impl Default for Options {
             name: "deepseek-v4.1-flash".into(),
             extra_models: Vec::new(),
             start_model: None,
+            tools_experts: None,
+            expert_trace: None,
             api_key: None,
             thinking: false,
             effort: 75,
