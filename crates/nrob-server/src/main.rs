@@ -41,6 +41,7 @@ const HELP: &str = "nrob-server: DeepSeek-V4.1-Flash behind an OpenAI-compatible
   --also-tools-experts NAME=DIR original experts for that model's tool payloads
   --tools-experts DIR  original MXFP4 experts during generated DSML tool calls;
                        ternary elsewhere, trunk stays loaded (experimental)
+  --repetition-guard on|off  stop repeated prose/reasoning blocks (default on)
   --expert-trace FILE  write JSONL token/layer/expert/precision routing records
   --api-key KEY        require `Authorization: Bearer KEY`
   --thinking           reason before answering unless a request says otherwise
@@ -129,6 +130,10 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Options, Stri
                 sources.insert(name.into(), path.into());
             }
             "--tools-experts" => a.tools_experts = Some(val()?.into()),
+            "--repetition-guard" => a.repetition_guard = match val()?.as_str() {
+                "on" => true, "off" => false,
+                _ => return Err("--repetition-guard wants on or off".into()),
+            },
             "--expert-trace" => a.expert_trace = Some(val()?.into()),
             "--api-key" => a.api_key = Some(val()?),
             "--thinking" => a.thinking = true,

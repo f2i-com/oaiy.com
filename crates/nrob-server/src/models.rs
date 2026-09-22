@@ -401,6 +401,7 @@ impl Models {
         );
         e.warn = !o.silent;
         e.tool_experts = tool_experts;
+        e.repetition_guard = o.repetition_guard;
         if tool_experts {
             self.say("DSML boundary precision: ternary prompt/prose; MXFP4 tool payload; 80/20 expert cache budgets; trunk retained".into());
         }

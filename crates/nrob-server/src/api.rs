@@ -625,7 +625,7 @@ impl Server {
                 }
                 let mut send = |v: Json| s.send(format!("data: {}\n\n", v.to_json()).as_bytes());
                 if let Some(e) = &error {
-                    let _ = send(Json::obj([("error", Json::obj([("message", Json::str(e)), ("type", Json::str("server_error"))]))]));
+                    let _ = send(Json::obj([("error", Json::obj([("message", Json::str(e)), ("type", Json::str("server_error")), ("code", Json::str(if e.contains(crate::repetition::CODE) { crate::repetition::CODE } else { "server_error" }))]))]));
                 } else {
                     if !tool_calls.is_empty() {
                         send(chunk(Json::obj([("tool_calls", Json::Arr(tool_calls))]), None)).map_err(io_err)?;
@@ -653,7 +653,9 @@ impl Server {
                     return Ok(false);
                 }
                 if let Some(e) = error {
-                    return Err(ApiError { status: 500, message: e, code: "server_error" });
+                    let repetition = e.contains(crate::repetition::CODE);
+                    return Err(ApiError { status: if repetition { 422 } else { 500 }, message: e,
+                        code: if repetition { crate::repetition::CODE } else { "server_error" } });
                 }
                 let mut message = vec![
                     ("role".to_string(), Json::str("assistant")),

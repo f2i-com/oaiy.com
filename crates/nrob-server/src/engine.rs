@@ -123,6 +123,7 @@ pub struct Engine {
     /// image positions a key from the image's content and the offset.
     tokens: Vec<u64>,
     pub tool_experts: bool,
+    pub repetition_guard: bool,
     request_number: u64,
     checkpoints: Vec<Checkpoint>,
 }
@@ -206,7 +207,7 @@ impl Engine {
             warn: true,
             disk: None,
             tokens: Vec::new(),
-            tool_experts: false,
+            tool_experts: false, repetition_guard: true,
             request_number: 0,
             checkpoints: Vec::new(),
         }
@@ -512,6 +513,7 @@ impl Engine {
         let mut budget = ThinkBudget::new(think_start.is_some() && prompt.last().copied() == think_start, self.tok.special(dsv41::chat::THINK_END), job.think_budget);
         let decode = Instant::now();
         let mut phase = crate::tool_phase::ToolPhase::default();
+        let mut repetition = crate::repetition::Guard::default();
         let phase_enabled = self.tool_experts && job.tool_precision;
         let finish = loop {
             let was_thinking = budget.thinking;
@@ -534,10 +536,13 @@ impl Engine {
             if valid > 0 {
                 let text = String::from_utf8_lossy(&pending[..valid]).into_owned();
                 pending.drain(..valid);
-                if phase_enabled { phase.push(&text); }
+                phase.push(&text); // also identifies payloads exempt from the prose repetition guard
                 if job.events.send(Event::Text(text)).is_err() {
                     break Finish::Stop; // nobody is listening
                 }
+            }
+            if self.repetition_guard && repetition.push(next, phase.original()) {
+                return Err(nrob::Error::Format(format!("{}: stopped repeated prose/reasoning blocks; generation did not complete. No tool from this incomplete reply was executed. Start a fresh turn or select the original model; automatic retry is disabled.", crate::repetition::CODE)));
             }
             if n >= job.max_tokens || pos + 1 >= self.model.max_seq() {
                 break Finish::Length;

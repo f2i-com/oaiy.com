@@ -13,6 +13,7 @@ mod api;
 mod disk;
 mod engine;
 mod tool_phase;
+mod repetition;
 // VENDORED-LOCAL: GLM-5.3-Flash served through the same job/event contract.
 pub mod glm;
 // VENDORED-LOCAL: the configured models, and swapping between them.
@@ -85,6 +86,8 @@ pub struct Options {
     /// Original experts used inside tool payloads for a named ternary model.
     pub tool_expert_sources: std::collections::BTreeMap<String, PathBuf>,
     pub expert_trace: Option<std::path::PathBuf>,
+    /// Stop long repeated prose/reasoning blocks; does not apply inside tool payloads.
+    pub repetition_guard: bool,
     /// Require `Authorization: Bearer KEY`.
     pub api_key: Option<String>,
     /// Reason before answering unless a request says otherwise.
@@ -169,6 +172,7 @@ impl Default for Options {
             ternary_experts: std::collections::BTreeMap::new(),
             tool_expert_sources: std::collections::BTreeMap::new(),
             expert_trace: None,
+            repetition_guard: true,
             api_key: None,
             thinking: false,
             effort: 75,

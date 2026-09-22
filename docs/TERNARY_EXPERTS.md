@@ -80,3 +80,18 @@ distinct bytes for identical expert IDs across banks and reuse on return; it doe
 not substitute for the model-level smoke. Original golden-model gates remain
 separate and ignored by default. See nca_research/docs/DEEPSEEK_TOOL_PRECISION.md
 and its archived run reports for raw development outcomes and unexecuted checks.
+
+## Repeated reasoning
+
+DeepSeek generation stops with `generation_repetition` when it emits four
+consecutive identical blocks of 48–256 tokens outside DSML tool payloads.
+The detector stores at most 1,024 token IDs. Tool payloads reset the detector
+and are exempt to preserve legitimate repeated code/data. Streaming chat emits
+an error code; non-streaming chat returns HTTP422. Clients should not retry this
+error automatically. Failed generation clears live prompt checkpoints through
+the normal error cleanup; it does not claim successful execution.
+
+This bounded heuristic limits exact loops; it does not establish their cause or
+restore ternary quality. Near-repetitions can escape it, and intentional repeated
+prose can trigger it. It defaults on; use `--repetition-guard off` (or the library
+Options field) for controlled comparisons. No new sampling penalty is applied.
