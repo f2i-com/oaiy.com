@@ -561,12 +561,18 @@ pub type LayerProgress = Box<dyn FnMut(usize, usize) + Send>;
 
 impl GpuModel {
     pub fn load(model_dir: &Path, engram_meta: &Path, opts: &GpuOptions) -> Result<GpuModel> {
+        let ternary_dir = std::env::var_os("DSV41_TERNARY_DIR");
+        Self::load_with_expert_source(model_dir, engram_meta, opts, ternary_dir.as_deref().map(Path::new))
+    }
+
+    /// Explicit expert selection for multi-model callers. None always means
+    /// original safetensors, regardless of the process environment.
+    pub fn load_with_expert_source(model_dir: &Path, engram_meta: &Path, opts: &GpuOptions, ternary_dir: Option<&Path>) -> Result<GpuModel> {
         let cfg = Config::load(model_dir)?;
         let idx = StIndex::open(model_dir)?;
-        let ternary_dir = std::env::var_os("DSV41_TERNARY_DIR");
         let ternary = ternary_dir.is_some();
         let store: Arc<dyn WeightStore> = if let Some(dir)=ternary_dir {
-            Arc::new(dsv41::ternary::TernaryStore::open(Path::new(&dir),model_dir,cfg.n_layers as u32,cfg.n_routed_experts as u32,opts.direct_io)?)
+            Arc::new(dsv41::ternary::TernaryStore::open(dir,model_dir,cfg.n_layers as u32,cfg.n_routed_experts as u32,opts.direct_io)?)
         } else { Arc::new(SafetensorsExpertStore::open(&idx,cfg.n_layers as u32,cfg.n_routed_experts as u32,opts.direct_io)?) };
         let record_bytes=store.record_bytes();
         if opts.devices.is_empty() {

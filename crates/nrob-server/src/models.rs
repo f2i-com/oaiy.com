@@ -214,6 +214,16 @@ impl Models {
                 kind: Kind::detect(path),
             });
         }
+        for name in opts.ternary_experts.keys().chain(opts.tool_expert_sources.keys()) {
+            if !specs.iter().any(|s| &s.name == name && s.kind == Kind::Deepseek) {
+                return Err(Error::Arg(format!("expert source {name} must name a configured DeepSeek model")));
+            }
+        }
+        for name in opts.tool_expert_sources.keys().chain(opts.tools_experts.iter().map(|_| &opts.name)) {
+            if !opts.ternary_experts.contains_key(name) {
+                return Err(Error::Arg(format!("tool expert source {name} requires a ternary expert source")));
+            }
+        }
         Ok(Models {
             default_name: specs[0].name.clone(),
             specs,
@@ -221,6 +231,13 @@ impl Models {
             loopback,
             live: Mutex::new(None),
         })
+    }
+
+    fn expert_sources(&self, name: &str) -> (Option<&Path>, Option<&Path>) {
+        let ternary = self.opts.ternary_experts.get(name).map(PathBuf::as_path);
+        let tools = self.opts.tool_expert_sources.get(name).map(PathBuf::as_path)
+            .or_else(|| if name == self.default_name { self.opts.tools_experts.as_deref() } else { None });
+        (ternary, tools)
     }
 
     pub fn names(&self) -> Vec<String> {
@@ -351,9 +368,10 @@ impl Models {
             .engram_meta
             .clone()
             .unwrap_or_else(|| spec.path.join("engram_meta.safetensors"));
-        let mut model = GpuModel::load(&spec.path, &engram_meta, &gopts)?;
-        let tool_experts = o.tools_experts.is_some() && spec.name == self.default_name;
-        if tool_experts { model.enable_tool_experts(o.tools_experts.as_ref().unwrap())?; }
+        let (ternary_source, tool_source) = self.expert_sources(&spec.name);
+        let mut model = GpuModel::load_with_expert_source(&spec.path, &engram_meta, &gopts, ternary_source)?;
+        let tool_experts = tool_source.is_some();
+        if let Some(source) = tool_source { model.enable_tool_experts(source)?; }
         if let Some(path) = &o.expert_trace { model.enable_route_log(path)?; }
         if let Some(path) = o.usage.as_ref().filter(|p| !tool_experts && p.exists()) {
             let (vram, queued) = model.warm(path, 4)?;
@@ -387,11 +405,15 @@ impl Models {
             self.say("DSML boundary precision: ternary prompt/prose; MXFP4 tool payload; 80/20 expert cache budgets; trunk retained".into());
         }
         if let Some(dir) = &o.prompt_cache {
-            let isolated = if tool_experts {dir.join("dsml-boundary-v1-ternary-prompts")} else {dir.clone()};
+            // Different expert banks must never share prompt states, including
+            // two variants built from the same retained tensor index.
+            let identity = format!("{:?}|{:?}|{:?}|ctx={}|dsml-v1", spec.path, ternary_source, tool_source, o.ctx);
+            let precision = disk::fnv(identity.as_bytes(), 0);
+            let isolated = dir.join(format!("model-{precision:016x}"));
             let dir = &isolated;
             // States belong to this model (its config and weight map) and to this
             // state format.
-            let mut fingerprint = disk::fnv(&[STATE_FORMAT], 0);
+            let mut fingerprint = disk::fnv(&[STATE_FORMAT], precision);
             for name in ["config.json", "model.safetensors.index.json"] {
                 fingerprint =
                     disk::fnv(&std::fs::read(spec.path.join(name)).unwrap_or_default(), fingerprint);
@@ -536,6 +558,20 @@ impl Models {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn expert_sources_are_scoped_to_the_requested_model() {
+        let mut o = Options::default();
+        o.extra_models = vec![("original".into(), "source".into()), ("ternary".into(), "copy".into())];
+        o.ternary_experts.insert("ternary".into(), "packed".into());
+        o.tool_expert_sources.insert("ternary".into(), "source".into());
+        let models = Models::new(o.clone(), true).unwrap();
+        assert_eq!(models.expert_sources("original"), (None, None));
+        assert_eq!(models.expert_sources(&o.name), (None, None));
+        assert_eq!(models.expert_sources("ternary"), (Some(Path::new("packed")), Some(Path::new("source"))));
+        o.ternary_experts.clear();
+        assert!(Models::new(o, true).is_err());
+    }
 
     #[test]
     fn tool_phase_policy_requires_tools_or_tool_history() {

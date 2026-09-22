@@ -17,11 +17,18 @@ checks format, source config, record sizes and all-layer expert coverage.
 ## Running the server
 
 ```powershell
-$env:DSV41_TERNARY_DIR = 'D:\bitnet\MODEL\experts'
-cargo run --release -p nrob-server -- --model 'D:\bitnet\MODEL\model' --name deepseek-v4.1-flash --devices 0,1 --ram-gb 140 --ctx 16384 --no-vision --port 18002 --tools-experts 'D:\deepseek\model' --expert-trace 'expert-routing-NEW.jsonl'
+cargo run --release -p nrob-server -- --model 'D:\bitnet\MODEL\model' --ternary-experts 'D:\bitnet\MODEL\experts' --name deepseek-v4.1-flash --devices 0,1 --ram-gb 140 --ctx 16384 --no-vision --port 18002 --tools-experts 'D:\deepseek\model' --expert-trace 'expert-routing-NEW.jsonl'
 ```
 
-Without `DSV41_TERNARY_DIR`, ordinary original-model inference remains available.
+Without a ternary mapping, ordinary original-model inference remains available.
+`--also-ternary NAME=DIR` and `--also-tools-experts NAME=DIR` configure named
+alternatives registered with `--also NAME=MODEL_DIR`. The library Options carry
+model-specific source maps; the server calls an explicit GPU loader, so original
+or GGUF alternatives never inherit another model's ternary bank. The legacy
+DSV41_TERNARY_DIR variable is recognized only by the standalone CLI for its
+default model (and legacy single-model example loaders), not the embedded server.
+Prompt-cache identity includes model/expert paths, precision policy and context
+capacity. Unknown model names and tool sources without ternary banks are errors.
 `--tools-experts` requires an initially ternary model and the matching original
 checkpoint. It opens the original expert index without loading another trunk.
 The file passed to `--expert-trace` must not exist; logs stay local and can include

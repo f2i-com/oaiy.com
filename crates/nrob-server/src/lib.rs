@@ -80,6 +80,10 @@ pub struct Options {
     pub start_model: Option<String>,
     /// Original MXFP4 expert source for tool turns; trunk stays resident.
     pub tools_experts: Option<std::path::PathBuf>,
+    /// Explicit routed expert sources, keyed by configured model name.
+    pub ternary_experts: std::collections::BTreeMap<String, PathBuf>,
+    /// Original experts used inside tool payloads for a named ternary model.
+    pub tool_expert_sources: std::collections::BTreeMap<String, PathBuf>,
     pub expert_trace: Option<std::path::PathBuf>,
     /// Require `Authorization: Bearer KEY`.
     pub api_key: Option<String>,
@@ -162,6 +166,8 @@ impl Default for Options {
             extra_models: Vec::new(),
             start_model: None,
             tools_experts: None,
+            ternary_experts: std::collections::BTreeMap::new(),
+            tool_expert_sources: std::collections::BTreeMap::new(),
             expert_trace: None,
             api_key: None,
             thinking: false,

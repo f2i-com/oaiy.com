@@ -36,6 +36,9 @@ const HELP: &str = "nrob-server: DeepSeek-V4.1-Flash behind an OpenAI-compatible
                        is resident: asking for another unloads the current one,
                        which takes as long as a load. /v1/models says which is
                        loaded.
+  --ternary-experts DIR packed experts for the default model (experimental)
+  --also-ternary NAME=DIR  packed experts for a named --also model
+  --also-tools-experts NAME=DIR original experts for that model's tool payloads
   --tools-experts DIR  original MXFP4 experts during generated DSML tool calls;
                        ternary elsewhere, trunk stays loaded (experimental)
   --expert-trace FILE  write JSONL token/layer/expert/precision routing records
@@ -68,8 +71,17 @@ const HELP: &str = "nrob-server: DeepSeek-V4.1-Flash behind an OpenAI-compatible
 ";
 
 fn parse_args() -> Result<Options, String> {
+    let mut a = parse_args_from(std::env::args().skip(1))?;
+    // Compatibility for older one-model launchers; never inherited by extras.
+    if let Some(path) = std::env::var_os("DSV41_TERNARY_DIR").filter(|p| !p.is_empty()) {
+        a.ternary_experts.entry(a.name.clone()).or_insert(path.into());
+    }
+    Ok(a)
+}
+
+fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Options, String> {
     let mut a = Options::default();
-    let mut it = std::env::args().skip(1);
+    let mut default_ternary = None;
     while let Some(flag) = it.next() {
         let mut val = || it.next().ok_or_else(|| format!("{flag} needs a value"));
         let num = |v: String| v.trim().parse::<usize>().map_err(|_| format!("{flag}: {v:?} is not a number"));
@@ -108,6 +120,14 @@ fn parse_args() -> Result<Options, String> {
             // but the arm never landed here, so a direct invocation was told
             // "unknown option --start" while the documented behaviour existed.
             "--start" => a.start_model = Some(val()?),
+            "--ternary-experts" => default_ternary = Some(std::path::PathBuf::from(val()?)),
+            "--also-ternary" | "--also-tools-experts" => {
+                let value = val()?;
+                let (name, path) = value.split_once('=').filter(|(n, p)| !n.is_empty() && !p.is_empty())
+                    .ok_or_else(|| format!("{flag} wants NAME=DIR"))?;
+                let sources = if flag == "--also-ternary" { &mut a.ternary_experts } else { &mut a.tool_expert_sources };
+                sources.insert(name.into(), path.into());
+            }
             "--tools-experts" => a.tools_experts = Some(val()?.into()),
             "--expert-trace" => a.expert_trace = Some(val()?.into()),
             "--api-key" => a.api_key = Some(val()?),
@@ -139,10 +159,26 @@ fn parse_args() -> Result<Options, String> {
             other => return Err(format!("unknown option {other} (try --help)")),
         }
     }
+    if let Some(path) = default_ternary { a.ternary_experts.insert(a.name.clone(), path); }
     if a.model.as_os_str().is_empty() {
         return Err("--model DIR is required: the checkpoint directory (try --help)".into());
     }
     Ok(a)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn named_expert_flags_keep_paths_and_default_name() {
+        let a = parse_args_from(["--model", "copy", "--ternary-experts", "packed with spaces", "--name", "default",
+            "--also", "other=copy2", "--also-ternary", "other=packed2", "--also-tools-experts", "other=source"]
+            .into_iter().map(str::to_owned)).unwrap();
+        assert_eq!(a.ternary_experts["default"], std::path::PathBuf::from("packed with spaces"));
+        assert_eq!(a.ternary_experts["other"], std::path::PathBuf::from("packed2"));
+        assert_eq!(a.tool_expert_sources["other"], std::path::PathBuf::from("source"));
+        assert!(parse_args_from(["--model", "copy", "--also-ternary", "bad"].into_iter().map(str::to_owned)).is_err());
+    }
 }
 
 fn main() {
