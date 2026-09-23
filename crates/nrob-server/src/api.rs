@@ -48,6 +48,7 @@ pub struct Config {
     pub top_p: f32,
     /// The vision tower's config when it is loaded (else images are refused).
     pub vision: Option<VisionConfig>,
+    pub qwen_vision: Option<llama_rs::MmProjConfig>,
     pub image_token_id: u32,
     /// Whether an image may name a file on this machine (a path or file://
     /// URL); off unless the server only listens on loopback.
@@ -178,6 +179,7 @@ impl Server {
         }
         let result = match (req.method.as_str(), path) {
             ("GET", "/v1/models") => return json_response(w, 200, &self.models()),
+            ("GET", "/v1/model-status") => return json_response(w, 200, &self.models.status()),
             ("POST", "/v1/chat/completions") => self.chat(req, w),
             ("POST", "/v1/completions") => self.completions(req, w),
             (_, "/v1/models" | "/v1/chat/completions" | "/v1/completions") => {
@@ -334,6 +336,9 @@ impl Server {
     /// Decode and size a request's images and expand their placeholders in
     /// the prompt into image spans.
     fn prepare_images(&self, a: &crate::models::Active, records: &[Json], prompt: Vec<u32>) -> Result<(Vec<u32>, Vec<JobImage>), ApiError> {
+        if let Some(vc) = &a.cfg.qwen_vision {
+            return crate::qwen::prepare_images(records, prompt, a.cfg.image_token_id, vc, self.local_images, a.cfg.max_seq).map_err(bad);
+        }
         let Some(vc) = &a.cfg.vision else {
             return Err(bad("this server runs without the vision tower (started with --no-vision); images are not supported"));
         };
@@ -348,7 +353,7 @@ impl Server {
             preps.push(prep);
         }
         let (ids, starts) = vision::expand_placeholders(&prompt, a.cfg.image_token_id, &preps).map_err(|e| bad(e.to_string()))?;
-        let images = preps.into_iter().zip(starts).zip(hashes).map(|((prep, start), hash)| JobImage { start, prep, hash }).collect();
+        let images = preps.into_iter().zip(starts).zip(hashes).map(|((prep, start), hash)| JobImage { start, prep: crate::engine::ImagePrep::Deepseek(prep), hash }).collect();
         Ok((ids, images))
     }
 
@@ -368,7 +373,7 @@ impl Server {
         }
     }
 
-    fn submit(&self, a: &crate::models::Active, prompt: Vec<u32>, images: Vec<JobImage>, sampling: Sampling, max_tokens: usize, think_budget: Option<usize>, tool_precision: bool, observer_context: String) -> Result<(mpsc::Receiver<Event>, Arc<AtomicBool>), ApiError> {
+    fn submit(&self, a: &crate::models::Active, prompt: Vec<u32>, images: Vec<JobImage>, sampling: Sampling, max_tokens: usize, think_budget: Option<usize>, tool_precision: bool, observer_context: String, tools: Vec<Json>) -> Result<(mpsc::Receiver<Event>, Arc<AtomicBool>), ApiError> {
         if prompt.len() + 1 > a.cfg.max_seq {
             return Err(ApiError {
                 status: 400,
@@ -384,7 +389,7 @@ impl Server {
         let max_tokens = max_tokens.min(a.cfg.max_seq - prompt.len());
         let (tx, rx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
-        let job = Job { tool_precision, observer_context, prompt, images, max_tokens, think_budget, sampling, cancel: Arc::clone(&cancel), events: tx };
+        let job = Job { tools, tool_precision, observer_context, prompt, images, max_tokens, think_budget, sampling, cancel: Arc::clone(&cancel), events: tx };
         a.jobs
             .send(job)
             .map_err(|_| ApiError { status: 503, message: "the model worker has stopped".into(), code: "unavailable" })?;
@@ -421,7 +426,9 @@ impl Server {
         let stream = body.get("stream").and_then(Json::as_bool).unwrap_or(false);
         let include_usage = body.get("stream_options").and_then(|o| o.get("include_usage")).and_then(Json::as_bool).unwrap_or(false);
         let think_budget = if mode == Mode::Thinking { Self::think_budget(&body, effort) } else { None };
-        let (rx, cancel) = self.submit(&a, prompt, images, sampling, max_tokens, think_budget, crate::models::needs_tool_precision(&body), observer_context(&body))?;
+        let request_clock = Instant::now();
+        let mut prefilled_at = None;
+        let (rx, cancel) = self.submit(&a, prompt, images, sampling, max_tokens, think_budget, crate::models::needs_tool_precision(&body), observer_context(&body), body.get("tools").and_then(Json::as_array).unwrap_or(&[]).to_vec())?;
         let peer = w.try_clone().ok();
         let id = random_id("chatcmpl-");
         let created = now();
@@ -557,7 +564,7 @@ impl Server {
                         let _ = s.send(format!("data: {}\n\n", c.to_json()).as_bytes());
                     }
                 }
-                Event::Prefilled { cached: c } => cached = c,
+                Event::Prefilled { cached: c } => { cached = c; prefilled_at = Some(Instant::now()); },
                 Event::Thinking { used, budget, done } => {
                     if done { for d in parser.end_reasoning() { emit(d, &mut sse, &mut stop, &cancel); } }
                     if let Some(s) = sse.as_mut() {
@@ -638,6 +645,11 @@ impl Server {
                     error = Some(e);
                     break;
                 }
+            }
+        }
+        if error.is_none() && !gone {
+            if let Some(at) = prefilled_at {
+                self.models.record_request(&model,n_prompt,cached,completion_tokens,at.duration_since(request_clock).as_secs_f64(),at.elapsed().as_secs_f64());
             }
         }
         let malformed_tools = parser.tool_call_error();
@@ -791,7 +803,7 @@ impl Server {
         }
         let n_prompt = prompt.len();
         let stream = body.get("stream").and_then(Json::as_bool).unwrap_or(false);
-        let (rx, cancel) = self.submit(&a, prompt, Vec::new(), sampling, max_tokens, None, false, String::new())?;
+        let (rx, cancel) = self.submit(&a, prompt, Vec::new(), sampling, max_tokens, None, false, String::new(), Vec::new())?;
         let peer = w.try_clone().ok();
         let id = random_id("cmpl-");
         let created = now();

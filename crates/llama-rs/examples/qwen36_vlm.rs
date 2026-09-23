@@ -114,7 +114,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut kv = model.new_kv_cache(8192);
     eprintln!("Prefill ...");
     let t3 = Instant::now();
-    let logits = qwen35.forward_embeds(&embeds, tokens.len(), &mut kv)?;
+    let start = tokens.iter().position(|&t| t == QWEN36_IMAGE_PAD_TOKEN_ID).unwrap();
+    let side = (soft_tokens.dim(0) as f64).sqrt() as usize;
+    let mut positions = Vec::new();
+    positions.extend((0..start).map(|p| [p as u32; 3]));
+    positions.extend((0..side*side).map(|p| [start as u32, (start+p/side) as u32, (start+p%side) as u32]));
+    let next = start + side;
+    positions.extend((0..tokens.len()-start-side*side).map(|p| [(next+p) as u32; 3]));
+    let mut next_position = positions.last().unwrap().iter().copied().max().unwrap() + 1;
+    let logits = qwen35.forward_embeds_positions(&embeds, tokens.len(), &mut kv, Some(&positions))?;
     let dt_prefill = t3.elapsed();
     let n_prompt = tokens.len();
     eprintln!("  prefill: {} tokens in {:.2?} ({:.0} tok/s)",
@@ -152,7 +160,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         produced += 1;
         if produced >= max_new { break; }
 
-        let logits = qwen35.forward(&[tok], &mut kv)?;
+        let e = qwen35.embed_text(&[tok]);
+        let logits = qwen35.forward_embeds_positions(&e, 1, &mut kv, Some(&[[next_position;3]]))?;
+        next_position += 1;
         let logits_host = model.last_logits(&logits);
         tok = sampler.sample(&logits_host);
     }

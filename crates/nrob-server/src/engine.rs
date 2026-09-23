@@ -59,12 +59,26 @@ const CANDIDATES: usize = 512;
 /// An image of a prompt, sized for the tower; its span starts at `start`.
 pub struct JobImage {
     pub start: usize,
-    pub prep: Prepared,
+    pub prep: ImagePrep,
     /// Of the encoded bytes: the prefix cache's notion of "the same image".
     pub hash: u64,
 }
 
+pub enum ImagePrep {
+    Deepseek(Prepared),
+    Qwen { pixels: ggml_rs::Tensor, side: usize },
+}
+impl ImagePrep {
+    pub fn n_tokens(&self) -> usize {
+        match self { Self::Deepseek(p) => p.n_tokens(), Self::Qwen { side, .. } => side * side }
+    }
+    fn deepseek(&self) -> nrob::Result<&Prepared> {
+        match self { Self::Deepseek(p) => Ok(p), _ => Err(nrob::Error::Arg("Qwen image sent to DeepSeek worker".into())) }
+    }
+}
+
 pub struct Job {
+    pub tools: Vec<nrob::json::Json>,
     pub tool_precision: bool,
     pub observer_context: String,
     pub prompt: Vec<u32>,
@@ -513,9 +527,10 @@ impl Engine {
         let mut spans = Vec::new();
         for img in job.images.iter().filter(|i| i.start + i.prep.n_tokens() > start) {
             let t = Instant::now();
-            spans.push(ImageSpan { start: img.start, rows: self.model.encode_image(&img.prep)? });
+            spans.push(ImageSpan { start: img.start, rows: self.model.encode_image(img.prep.deepseek()?)? });
             if self.log {
-                let (h, w) = (img.prep.n_vit_h * 14, img.prep.n_vit_w * 14);
+                let prep = img.prep.deepseek()?;
+                let (h, w) = (prep.n_vit_h * 14, prep.n_vit_w * 14);
                 eprintln!("  image at {} ({w}x{h}, {} tokens) encoded in {:.2}s", img.start, img.prep.n_tokens(), t.elapsed().as_secs_f64());
             }
         }

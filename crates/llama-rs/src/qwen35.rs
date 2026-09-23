@@ -374,6 +374,11 @@ impl Qwen35Model {
     /// vision soft tokens can be spliced into the embedding sequence before
     /// running the LM. `seq` must equal `embeds.dim(0)`.
     pub fn forward_embeds(&self, embeds: &Tensor, seq: usize, kv: &mut KvCache) -> Result<Tensor> {
+        self.forward_embeds_positions(embeds, seq, kv, None)
+    }
+
+    /// Explicit MRoPE coordinates for image patches and subsequent text.
+    pub fn forward_embeds_positions(&self, embeds: &Tensor, seq: usize, kv: &mut KvCache, multimodal: Option<&[[u32; 3]]>) -> Result<Tensor> {
         let cfg = &self.config;
         let backend = &*self.backend;
         let past = kv.len;
@@ -421,7 +426,10 @@ impl Qwen35Model {
                     // only 25%, leaves the back 192 dims untouched). MRoPE
                     // (mrope_section=[11,11,10]) collapses to standard NeoX RoPE for
                     // text-only inference (no image positions).
-                    if cfg.rope_dim < head_dim {
+                    if let Some(positions) = multimodal {
+                        crate::multimodal_rope::text(backend, &mut q, positions, cfg.rope_dim, cfg.rope_theta);
+                        crate::multimodal_rope::text(backend, &mut k, positions, cfg.rope_dim, cfg.rope_theta);
+                    } else if cfg.rope_dim < head_dim {
                         backend.rope_partial_neox(&mut q, &positions, head_dim, cfg.rope_dim, cfg.rope_theta);
                         backend.rope_partial_neox(&mut k, &positions, head_dim, cfg.rope_dim, cfg.rope_theta);
                     } else {

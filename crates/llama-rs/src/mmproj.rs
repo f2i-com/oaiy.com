@@ -1411,9 +1411,12 @@ fn qwen3vl_block_forward(
     // 3-way splitter — no host round-trip on CUDA.
     let (q, k, v) = b.split_qkv_3way(&qkv, d);
 
-    let q3 = q.reshape(vec![n_seq, n_h, hd]).expect("Q reshape");
-    let k3 = k.reshape(vec![n_seq, n_h, hd]).expect("K reshape");
+    let mut q3 = q.reshape(vec![n_seq, n_h, hd]).expect("Q reshape");
+    let mut k3 = k.reshape(vec![n_seq, n_h, hd]).expect("K reshape");
     let v3 = v.reshape(vec![n_seq, n_h, hd]).expect("V reshape");
+
+    crate::multimodal_rope::vision(b, &mut q3, cfg.image_size / cfg.patch_size);
+    crate::multimodal_rope::vision(b, &mut k3, cfg.image_size / cfg.patch_size);
 
     // Bidirectional via past = n_seq.
     let attn = b.attention(&q3, &k3, &v3, n_seq, scale, n_seq, None);

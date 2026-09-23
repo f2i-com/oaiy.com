@@ -121,6 +121,11 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Options, Stri
             // but the arm never landed here, so a direct invocation was told
             // "unknown option --start" while the documented behaviour existed.
             "--start" => a.start_model = Some(val()?),
+            "--vision-projector" => {
+                let value=val()?;
+                let (name,path)=value.split_once('=').filter(|(n,p)|!n.is_empty() && !p.is_empty()).ok_or("--vision-projector wants NAME=PATH")?;
+                a.vision_projectors.insert(name.into(),path.into());
+            }
             "--ternary-experts" => default_ternary = Some(std::path::PathBuf::from(val()?)),
             "--also-ternary" | "--also-tools-experts" => {
                 let value = val()?;

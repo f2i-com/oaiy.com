@@ -110,6 +110,7 @@ pub struct Spec {
 pub enum Flavour {
     Deepseek(Arc<dsv41::tokenizer::Tokenizer>),
     Gguf(Arc<tokenizer::Tokenizer>),
+    Qwen(Arc<tokenizer::Tokenizer>),
 }
 
 impl Flavour {
@@ -117,7 +118,7 @@ impl Flavour {
         match self {
             Self::Deepseek(t) => t.encode(text),
             // llama-rs applies BOS through the template, so not again here.
-            Self::Gguf(t) => t.encode(text, false).unwrap_or_default(),
+            Self::Gguf(t) | Self::Qwen(t) => t.encode(text, false).unwrap_or_default(),
         }
     }
 
@@ -134,6 +135,7 @@ impl Flavour {
             Self::Deepseek(_) => {
                 dsv41::chat::encode(msgs, opts).map_err(|e| e.to_string())
             }
+            Self::Qwen(_) => crate::qwen::chat_prompt(msgs, opts),
             Self::Gguf(_) => {
                 // The same messages through llama-rs's GLM template. `reasoning
                 // effort` maps onto the three the reference Jinja accepts; the
@@ -195,6 +197,7 @@ pub struct Models {
     opts: Options,
     loopback: bool,
     live: Mutex<Option<Live>>,
+    timings: Mutex<std::collections::BTreeMap<String, nrob::json::Json>>,
 }
 
 impl Models {
@@ -219,6 +222,11 @@ impl Models {
                 return Err(Error::Arg(format!("expert source {name} must name a configured DeepSeek model")));
             }
         }
+        for name in opts.vision_projectors.keys() {
+            if !specs.iter().any(|s| &s.name==name && s.kind==Kind::Gguf) {
+                return Err(Error::Arg(format!("vision projector {name} must name a configured GGUF model")));
+            }
+        }
         for name in opts.tool_expert_sources.keys().chain(opts.tools_experts.iter().map(|_| &opts.name)) {
             if !opts.ternary_experts.contains_key(name) {
                 return Err(Error::Arg(format!("tool expert source {name} requires a ternary expert source")));
@@ -230,6 +238,7 @@ impl Models {
             opts,
             loopback,
             live: Mutex::new(None),
+            timings: Mutex::new(Default::default()),
         })
     }
 
@@ -246,6 +255,38 @@ impl Models {
 
     pub fn default_name(&self) -> &str {
         &self.default_name
+    }
+
+    /// Measurements survive model unloading; asking for status never loads one.
+    pub fn status(&self) -> nrob::json::Json {
+        use nrob::json::Json;
+        let loaded = self.loaded();
+        let timings = self.timings.lock().unwrap_or_else(|p|p.into_inner());
+        let models = self.specs.iter().map(|s| Json::obj([
+            ("model",Json::str(&s.name)),
+            ("loaded",Json::Bool(loaded.as_deref()==Some(&s.name))),
+            ("vision_configured",Json::Bool(self.opts.vision && (s.kind==Kind::Deepseek || self.opts.vision_projectors.contains_key(&s.name)))),
+            ("timing",timings.get(&s.name).cloned().unwrap_or(Json::Null)),
+        ])).collect();
+        Json::obj([("models",Json::Arr(models)),("resident_model_limit",Json::Int(1)),
+            ("routing_note",Json::str("Model names are allowlisted. Changing model unloads the current worker and its GPU state before loading the replacement. Compare load time plus uncached prompt and output time; keep short related actions on the same model. Measurements are observed, not guarantees."))])
+    }
+
+    pub fn record_request(&self, name: &str, prompt: usize, cached: usize, output: usize, prefill_secs: f64, decode_secs: f64) {
+        use nrob::json::Json;
+        let mut timings=self.timings.lock().unwrap_or_else(|p|p.into_inner());
+        let entry=timings.entry(name.into()).or_insert_with(||Json::Obj(vec![]));
+        if let Json::Obj(fields)=entry {
+            fields.retain(|(k,_)|k=="load_seconds");
+            fields.extend([
+                ("uncached_prompt_tokens".into(),Json::Int(prompt.saturating_sub(cached) as i64)),
+                ("prefill_seconds_including_queue_and_vision".into(),Json::Num(prefill_secs)),
+                ("prefill_tokens_per_second".into(),Json::Num(prompt.saturating_sub(cached) as f64/prefill_secs.max(0.001))),
+                ("output_tokens".into(),Json::Int(output as i64)),
+                ("decode_seconds".into(),Json::Num(decode_secs)),
+                ("decode_tokens_per_second".into(),Json::Num(output as f64/decode_secs.max(0.001))),
+            ]);
+        }
     }
 
     /// Which model is loaded right now, if any.
@@ -304,6 +345,12 @@ impl Models {
             Kind::Gguf => self.load_gguf(&spec),
         }
         .map_err(|e| format!("loading {}: {e}", spec.name))?;
+        {
+            use nrob::json::Json;
+            let mut timings=self.timings.lock().unwrap_or_else(|p|p.into_inner());
+            let entry=timings.entry(spec.name.clone()).or_insert_with(||Json::Obj(vec![]));
+            if let Json::Obj(fields)=entry { fields.retain(|(k,_)| k!="load_seconds"); fields.push(("load_seconds".into(),Json::Num(t.elapsed().as_secs_f64()))); }
+        }
         self.say(format!(
             "{} ready in {:.1}s",
             spec.name,
@@ -337,6 +384,7 @@ impl Models {
             temperature: o.temperature,
             top_p: o.top_p,
             vision: None,
+            qwen_vision: None,
             image_token_id: 0,
             local_images: o.local_images.unwrap_or(self.loopback),
         }
@@ -467,6 +515,31 @@ impl Models {
         let cards = llama_rs::glm5next::device::open_cards(&o.devices)
             .map_err(|e| Error::Arg(e.to_string()))?;
         let backend: Arc<dyn ggml_rs::Backend> = Arc::clone(&cards[0]) as Arc<dyn ggml_rs::Backend>;
+        let gguf = gguf::GgufFile::open(&path).map_err(|e| Error::Arg(e.to_string()))?;
+        if gguf.get_str("general.architecture").ok() == Some("qwen35") {
+            let model = llama_rs::Model::load(&gguf, Arc::clone(&backend)).map_err(|e| Error::Arg(e.to_string()))?;
+            let tok = Arc::new(model.tokenizer().clone());
+            // Dense Qwen fits one card; bound the initial KV allocation.
+            let max_seq = o.ctx.min(model.config().context_length).min(16384);
+            let mut cfg = self.base_cfg(spec, max_seq);
+            cfg.image_token_id = tok.token_id("<|image_pad|>").ok_or_else(|| Error::Arg("Qwen tokenizer lacks image_pad".into()))?;
+            let projector = if o.vision {
+                o.vision_projectors.get(&spec.name).map(|p| {
+                    let file = gguf::GgufFile::open(p).map_err(|e| Error::Arg(e.to_string()))?;
+                    let mm = llama_rs::MmProj::from_gguf(&file, Arc::clone(&backend)).map_err(|e| Error::Arg(e.to_string()))?;
+                    if !matches!(&mm, llama_rs::MmProj::Qwen3Vl(q) if q.projector.mm2.shape()[0] == model.config().embedding_dim) {
+                        return Err(Error::Arg("Qwen vision projector does not match the text model".into()));
+                    }
+                    Ok(mm)
+                }).transpose()?
+            } else { None };
+            cfg.qwen_vision = projector.as_ref().map(|p|p.config().clone());
+            let (jobs,rx) = std::sync::mpsc::channel();
+            let e = crate::qwen::QwenEngine::new(model,projector,max_seq,!o.quiet && !o.silent);
+            let thread = std::thread::Builder::new().name("qwen-model".into()).spawn(move || e.run(rx)).map_err(Error::Io)?;
+            return Ok(Live {name:spec.name.clone(),jobs,thread,cfg:Arc::new(cfg),flavour:Arc::new(Flavour::Qwen(tok))});
+        }
+        drop(gguf);
         let budget = o.expert_cache_bytes();
         if o.ram_gb == 0 {
             self.say(format!(

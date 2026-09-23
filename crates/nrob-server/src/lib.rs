@@ -20,6 +20,7 @@ pub mod glm;
 // VENDORED-LOCAL: the configured models, and swapping between them.
 pub mod models;
 mod http;
+mod qwen;
 
 use std::net::{SocketAddr, TcpListener};
 use std::path::PathBuf;
@@ -74,6 +75,8 @@ pub struct Options {
     /// else is taken for a DeepSeek checkpoint directory. Only one is ever resident:
     /// asking for another unloads the current one first.
     pub extra_models: Vec<(String, std::path::PathBuf)>,
+    /// Native GGUF vision projectors, keyed by configured model name.
+    pub vision_projectors: std::collections::BTreeMap<String, PathBuf>,
     /// Which configured model to load at start, by name. `None` takes `name`.
     ///
     /// Only one model is resident, and loading one takes 10 s for GLM-5.3-Flash and
@@ -166,6 +169,7 @@ impl Default for Options {
             usage: None,
             name: "deepseek-v4.1-flash".into(),
             extra_models: Vec::new(),
+            vision_projectors: std::collections::BTreeMap::new(),
             start_model: None,
             tools_experts: None,
             ternary_experts: std::collections::BTreeMap::new(),
