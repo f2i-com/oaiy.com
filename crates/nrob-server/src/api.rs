@@ -485,6 +485,7 @@ impl Server {
         };
 
         let (mut finish, mut completion_tokens, mut cached) = (Finish::Stop, 0usize, 0usize);
+        let mut reuse = None;
         let mut error = None;
         let mut gone = false;
         let mut last_preview = Instant::now() - PREVIEW_EVERY;
@@ -529,6 +530,10 @@ impl Server {
                         if s.send(format!("data: {}\n\n", c.to_json()).as_bytes()).is_err() { cancel.store(true, Ordering::Relaxed); }
                     }
                 }
+                Event::CacheReuse { cached: c, source, common } => {
+                    cached = c;
+                    reuse = Some((c, source, common));
+                }
                 Event::Progress { done, total } => {
                     if let Some(s) = sse.as_mut() {
                         let mut c = chunk(Json::obj::<&str>([]), None);
@@ -540,7 +545,12 @@ impl Server {
                             }
                             fields.push((
                                 "nrob_progress".into(),
-                                Json::obj([("prompt_done", Json::Int(done as i64)), ("prompt_total", Json::Int(total as i64))]),
+                                Json::obj([
+                                    ("prompt_done", Json::Int(done as i64)), ("prompt_total", Json::Int(total as i64)),
+                                    ("cached_tokens", reuse.map_or(Json::Null, |(n,_,_)| Json::Int(n as i64))),
+                                    ("cache_source", reuse.map_or(Json::Null, |(_,s,_)| Json::str(s))),
+                                    ("previous_prefix_tokens", reuse.map_or(Json::Null, |(_,_,n)| Json::Int(n as i64))),
+                                ]),
                             ));
                         }
                         // a client that has gone shows up at the next text

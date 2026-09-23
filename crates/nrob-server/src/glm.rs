@@ -204,19 +204,9 @@ impl GlmEngine {
         let disk = self.disk.as_mut()?;
         // Never the whole prompt: a state covering all of it would leave nothing to
         // run, and the caller needs one forward pass to have logits to sample from.
-        let (i, len) = disk
-            .best(&keys, prompt.len().saturating_sub(1))
-            .filter(|&(_, len)| len > here)?;
         let t = std::time::Instant::now();
-        let (keys, snap) = match disk.load(i) {
-            Ok(got) => got,
-            Err(e) => {
-                if self.warn {
-                    eprintln!("nrob-server: a prompt state on disk could not be read: {e}");
-                }
-                return None;
-            }
-        };
+        let (keys, snap) = disk.load_best(&keys, prompt.len().saturating_sub(1), here, self.warn)?;
+        let len = keys.len();
         let Model::Glm5Next(g) = &self.model else { return None };
         if let Err(e) = g.restore_state(&snap) {
             if self.warn {
@@ -302,13 +292,17 @@ impl GlmEngine {
 
         let started = std::time::Instant::now();
         let mut start = self.reusable(prompt);
+        let common = self.covered.iter().zip(prompt).take_while(|(a,b)| a == b).count();
+        let mut source = if start > 0 { "memory" } else { "none" };
         // Disk may hold more of this prompt than the state does -- a fresh daemon's
         // state holds none of it, and the system prompt is the same every time.
         if let Some(len) = self.restore_from_disk(prompt, start) {
             start = len;
+            source = "disk";
         } else if start == 0 {
             self.reset();
         }
+        let _ = job.events.send(Event::CacheReuse { cached: start, source, common });
         let total = prompt.len() - start;
         let _ = job.events.send(Event::Progress { done: 0, total });
 

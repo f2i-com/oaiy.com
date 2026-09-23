@@ -94,6 +94,8 @@ pub enum Event {
     Progress { done: usize, total: usize },
     /// The prompt is in: `cached` of its tokens came from the prefix cache.
     Prefilled { cached: usize },
+    /// Sent before processing the uncached tail; no prompt text is exposed.
+    CacheReuse { cached: usize, source: &'static str, common: usize },
     /// How far the reply's reasoning has got: `used` tokens of its `budget`
     /// (`None`: no limit); `done` once it has closed (sent every
     /// [`THINKING_EVERY`] tokens, and at the end).
@@ -277,7 +279,7 @@ impl Engine {
     /// prompt, else the latest checkpoint inside the common prefix, else 0.
     /// At least one prompt token is always left to run (its logits start
     /// the reply).
-    fn resume(&mut self, prompt: &[u64]) -> nrob::Result<usize> {
+    fn resume(&mut self, prompt: &[u64]) -> nrob::Result<(usize, &'static str, usize)> {
         let common = self.tokens.iter().zip(prompt).take_while(|(a, b)| a == b).count();
         let limit = common.min(prompt.len().saturating_sub(1));
         // what this process has (the live state, or a checkpoint), unless
@@ -288,10 +290,10 @@ impl Engine {
             self.checkpoints.iter().rev().find(|c| c.pos() <= limit).map_or(0, |c| c.pos())
         };
         if let Some(pos) = self.restore_from_disk(prompt, here)? {
-            return Ok(pos);
+            return Ok((pos, "disk", common));
         }
         if self.tokens.len() <= limit {
-            return Ok(self.tokens.len());
+            return Ok((self.tokens.len(), if self.tokens.is_empty() { "none" } else { "memory" }, common));
         }
         let at = self.checkpoints.iter().rposition(|c| c.pos() <= limit);
         match at {
@@ -301,12 +303,12 @@ impl Engine {
                 // later checkpoints belong to the old continuation
                 self.checkpoints.truncate(i + 1);
                 self.tokens.truncate(pos);
-                Ok(pos)
+                Ok((pos, "checkpoint", common))
             }
             None => {
                 self.checkpoints.clear();
                 self.tokens.clear();
-                Ok(0)
+                Ok((0, "none", common))
             }
         }
     }
@@ -317,19 +319,11 @@ impl Engine {
         let Some(disk) = self.disk.as_mut() else {
             return Ok(None);
         };
-        let Some((i, len)) = disk.best(prompt, prompt.len().saturating_sub(1)).filter(|&(_, len)| len > here) else {
+        let t = Instant::now();
+        let Some((keys, snap)) = disk.load_best(prompt, prompt.len().saturating_sub(1), here, self.warn) else {
             return Ok(None);
         };
-        let t = Instant::now();
-        let (keys, snap) = match disk.load(i) {
-            Ok(got) => got,
-            Err(e) => {
-                if self.warn {
-                    eprintln!("nrob-server: a prompt state on disk could not be read: {e}");
-                }
-                return Ok(None);
-            }
-        };
+        let len = keys.len();
         let ids: Vec<u32> = keys.iter().map(|&k| k as u32).collect();
         self.model.restore_snapshot(&snap, &ids)?;
         self.tokens = keys;
@@ -510,7 +504,11 @@ impl Engine {
         self.model.trace_phase(self.request_number, "prompt", None, "");
         let started = Instant::now();
         let keys = prompt_keys(prompt, &job.images);
-        let start = self.resume(&keys)?;
+        let (start, source, common) = self.resume(&keys)?;
+        let _ = job.events.send(Event::CacheReuse { cached: start, source, common });
+        if self.log {
+            eprintln!("  prompt cache: {start}/{} reused from {source}; {} to process; {common} tokens match prior in-memory history", prompt.len(), prompt.len() - start);
+        }
         // the images the uncached part reaches, through the vision tower
         let mut spans = Vec::new();
         for img in job.images.iter().filter(|i| i.start + i.prep.n_tokens() > start) {
@@ -552,7 +550,9 @@ impl Engine {
                     let end = pos + left.min(256);
                     for p in pos..end {
                         if job.cancel.load(Ordering::Relaxed) {
-                            // the state is whole up to p: keep it
+                            // the state is whole up to p: keep it, including on disk.
+                            self.save_checkpoint(p)?;
+                            self.persist(p, false);
                             let _ = job.events.send(Event::Done { finish: Finish::Stop, completion_tokens: 0 });
                             return Ok(());
                         }

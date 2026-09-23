@@ -20,6 +20,7 @@ use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Sender};
+use std::sync::{Arc, atomic::{AtomicU8, Ordering}};
 use std::time::SystemTime;
 
 /// VENDORED-LOCAL: GLM-5.3-Flash. What a state has to do to live on disk.
@@ -83,10 +84,12 @@ struct Entry {
     used: SystemTime,
     /// A system prompt's (not replaced by the conversations that follow).
     base: bool,
+    // 0: writer pending; 1: atomically published; 2: failed (may retry).
+    ready: Arc<AtomicU8>,
 }
 
 enum Job<S> {
-    Write { path: PathBuf, header: Vec<u8>, snap: S },
+    Write { path: PathBuf, header: Vec<u8>, snap: S, ready: Arc<AtomicU8> },
     Delete(PathBuf),
 }
 
@@ -150,7 +153,7 @@ impl<S: PromptState> DiskCache<S> {
             let Ok(mut file) = File::open(&path) else { continue };
             let Some((base, keys, _)) = read_header(&mut file, fingerprint) else { continue };
             let meta = item.metadata()?;
-            entries.push(Entry { path, keys, bytes: meta.len(), used: meta.modified().unwrap_or(SystemTime::UNIX_EPOCH), base });
+            entries.push(Entry { path, keys, bytes: meta.len(), used: meta.modified().unwrap_or(SystemTime::UNIX_EPOCH), base, ready: Arc::new(AtomicU8::new(1)) });
         }
         let (writer, jobs) = channel::<Job<S>>();
         std::thread::Builder::new()
@@ -158,7 +161,7 @@ impl<S: PromptState> DiskCache<S> {
             .spawn(move || {
                 for job in jobs {
                     match job {
-                        Job::Write { path, header, snap } => {
+                        Job::Write { path, header, snap, ready } => {
                             let tmp = path.with_extension("tmp");
                             let mut bytes = header;
                             snap.encode(&mut bytes);
@@ -166,6 +169,7 @@ impl<S: PromptState> DiskCache<S> {
                             if wrote.is_err() {
                                 let _ = fs::remove_file(&tmp);
                             }
+                            ready.store(if wrote.is_ok() { 1 } else { 2 }, Ordering::Release);
                         }
                         Job::Delete(path) => {
                             let _ = fs::remove_file(path);
@@ -188,7 +192,7 @@ impl<S: PromptState> DiskCache<S> {
         self.entries
             .iter()
             .enumerate()
-            .filter(|(_, e)| e.keys.len() <= limit && prompt.starts_with(&e.keys))
+            .filter(|(_, e)| e.ready.load(Ordering::Acquire) == 1 && e.keys.len() <= limit && prompt.starts_with(&e.keys))
             .max_by_key(|(_, e)| e.keys.len())
             .map(|(i, e)| (i, e.keys.len()))
     }
@@ -224,9 +228,22 @@ impl<S: PromptState> DiskCache<S> {
         }
     }
 
+    /// Try successively shorter exact prefixes if a published file is damaged
+    /// or was removed externally. Pending writes are never selected or deleted.
+    pub fn load_best(&mut self, prompt: &[u64], limit: usize, after: usize, warn: bool) -> Option<(Vec<u64>, S)> {
+        while let Some((i, _)) = self.best(prompt, limit).filter(|&(_, len)| len > after) {
+            match self.load(i) {
+                Ok(state) => return Some(state),
+                Err(e) if warn => eprintln!("nrob-server: skipping unavailable prompt checkpoint: {e}"),
+                Err(_) => {},
+            }
+        }
+        None
+    }
+
     /// Whether an entry holds exactly these keys.
     pub fn has(&self, keys: &[u64]) -> bool {
-        self.entries.iter().any(|e| e.keys == keys)
+        self.entries.iter().any(|e| e.ready.load(Ordering::Acquire) != 2 && e.keys == keys)
     }
 
     /// Keep `snap`, the state after `keys` (`base`: a system prompt's).
@@ -240,8 +257,10 @@ impl<S: PromptState> DiskCache<S> {
         // change its suffix, making an older prefix the longest usable state.
         // The existing byte-budget LRU bounds storage. Deduplicate exact keys.
         if self.has(&keys) { return; }
-        let _ = self.writer.send(Job::Write { path: path.clone(), header, snap });
-        self.entries.push(Entry { path, keys, bytes, used: SystemTime::now(), base });
+        self.entries.retain(|e| e.ready.load(Ordering::Acquire) != 2);
+        let ready = Arc::new(AtomicU8::new(0));
+        if self.writer.send(Job::Write { path: path.clone(), header, snap, ready: ready.clone() }).is_err() { return; }
+        self.entries.push(Entry { path, keys, bytes, used: SystemTime::now(), base, ready });
         while self.entries.iter().map(|e| e.bytes).sum::<u64>() > self.budget && self.entries.len() > 1 {
             let oldest = (0..self.entries.len() - 1).min_by_key(|&i| (self.entries[i].base, self.entries[i].used)).expect("two entries or more");
             let gone = self.entries.remove(oldest);
@@ -281,6 +300,12 @@ mod tests {
         cache.save(vec![1, 2, 3], snap(3), true);
         cache.save(vec![1, 2, 3, 4, 5], snap(5), false);
         cache.save(vec![1, 2, 3, 4, 5, 6, 7], snap(7), false);
+        assert!(written(&dir, 3));
+        // Publication status follows the rename; wait for the worker marker too.
+        for _ in 0..200 {
+            if cache.entries.iter().all(|e| e.ready.load(Ordering::Acquire) == 1) { break; }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         // Keep both shorter and longer conversation prefixes within the budget.
         assert_eq!(cache.len(), 3);
         assert!(cache.has(&[1, 2, 3]) && cache.has(&[1, 2, 3, 4, 5]));
@@ -307,5 +332,100 @@ mod tests {
         assert_eq!(small.len(), 1);
         assert!(small.has(&[9; 8]));
         let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+
+#[cfg(test)]
+mod publication_tests {
+    use super::*;
+    use std::sync::{Mutex, mpsc::Receiver};
+    struct State {
+        pos: usize,
+        gate: Option<(Sender<()>, Mutex<Receiver<()>>)>,
+    }
+    impl PromptState for State {
+        fn pos(&self) -> usize { self.pos }
+        fn encoded_len(&self) -> usize { 8 }
+        fn encode(&self, out: &mut Vec<u8>) {
+            if let Some((started, release)) = &self.gate {
+                let _ = started.send(());
+                let _ = release.lock().unwrap().recv();
+            }
+            out.extend((self.pos as u64).to_le_bytes());
+        }
+        fn decode(bytes: &[u8]) -> nrob::Result<Self> {
+            let b: [u8; 8] = bytes.try_into().map_err(|_| nrob::Error::Format("bad fixture".into()))?;
+            Ok(Self { pos: u64::from_le_bytes(b) as usize, gate: None })
+        }
+    }
+    fn state(pos: usize) -> State { State { pos, gate: None } }
+    fn directory(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("nrob-cache-{name}-{}-{}", std::process::id(), SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos()));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+    fn settled(c: &DiskCache<State>) {
+        for _ in 0..500 {
+            if c.entries.iter().all(|e| e.ready.load(Ordering::Acquire) != 0) { return; }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("cache writer did not finish");
+    }
+
+    #[test]
+    fn pending_write_keeps_older_checkpoint_and_is_not_deleted() {
+        let dir = directory("pending");
+        let mut cache = DiskCache::open(&dir, 1, 10000).unwrap();
+        cache.save(vec![1,2], state(2), true);
+        settled(&cache);
+        let (started, rx) = channel();
+        let (release, gate) = channel();
+        cache.save(vec![1,2,3,4], State { pos: 4, gate: Some((started, Mutex::new(gate))) }, false);
+        rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        assert!(cache.has(&[1,2,3,4])); // suppress duplicate queued snapshots
+        assert_eq!(cache.load_best(&[1,2,3,4,5], 4, 0, false).unwrap().0, [1,2]);
+        assert_eq!(cache.len(), 2); // no deletion of the unpublished file
+        release.send(()).unwrap();
+        settled(&cache);
+        assert_eq!(cache.load_best(&[1,2,3,4,5], 4, 0, false).unwrap().0, [1,2,3,4]);
+        let mut reopened: DiskCache<State> = DiskCache::open(&dir, 1, 10000).unwrap();
+        assert_eq!(reopened.load_best(&[1,2,3,4,5], 4, 0, false).unwrap().1.pos(), 4);
+        drop(reopened); drop(cache);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn damaged_and_missing_longest_prefix_fall_back_without_reprocessing_all_history() {
+        let dir = directory("fallback");
+        let mut cache = DiskCache::open(&dir, 1, 10000).unwrap();
+        for n in [2,4,6] { cache.save((1..=n).collect(), state(n as usize), false); }
+        settled(&cache);
+        fs::write(&cache.entries[2].path, b"broken").unwrap();
+        assert_eq!(cache.load_best(&[1,2,3,4,5,6,7], 6, 0, false).unwrap().0, [1,2,3,4]);
+        fs::remove_file(&cache.entries[1].path).unwrap();
+        assert_eq!(cache.load_best(&[1,2,3,4,5,6,7], 6, 0, false).unwrap().0, [1,2]);
+        assert!(cache.load_best(&[1,2,3], 2, 2, false).is_none()); // never replace a better live state
+        assert!(cache.load_best(&[9,2,3], 2, 0, false).is_none()); // never reuse a different prefix
+        drop(cache);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn failed_publication_can_be_saved_again() {
+        let dir = directory("retry");
+        let mut cache = DiskCache::open(&dir, 1, 10000).unwrap();
+        let path = dir.join(format!("{:016x}-{:016x}.{EXT}", 1, keys_hash(&[1,2])));
+        fs::create_dir(&path).unwrap(); // atomic rename fails against this directory
+        cache.save(vec![1,2], state(2), false);
+        settled(&cache);
+        assert!(!cache.has(&[1,2]));
+        assert!(cache.best(&[1,2,3], 2).is_none());
+        fs::remove_dir(path).unwrap();
+        cache.save(vec![1,2], state(2), false);
+        settled(&cache);
+        assert_eq!(cache.load_best(&[1,2,3], 2, 0, false).unwrap().0, [1,2]);
+        drop(cache);
+        fs::remove_dir_all(dir).unwrap();
     }
 }
