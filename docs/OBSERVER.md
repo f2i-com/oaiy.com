@@ -111,3 +111,40 @@ Original tool probe: 182.188 seconds, 1 returned calls, repair used False, 0 API
 
 
 Local default updated at user request: settings.toml now points the default model to D:\deepseek\model, and the default alias has no ternary/tool-expert overrides. The deepseek-ternary named alias retains its explicit source maps. E:\nrob_projects3 selects deepseek-original in its default/profile settings. The local RAM ceiling remains 170 GiB with available-memory clamping. This changes this machine's defaults, not generic repository model paths. No model argument is needed in start.bat for the original default.
+
+
+## Tool-context continuation correction (2026-09-23)
+
+The first context-refresh implementation discarded the unexecuted tool batch
+after each newly selected tool header. In a user session, DeepSeek repeated a
+tool schema as prose and regenerated earlier calls. The logged request was
+eventually cancelled after 347.4 seconds; it did not establish successful tool
+execution. This was observed with the original MXFP4 experts, not just ternary.
+
+Context refresh now preserves the exact generated token IDs through the selected
+header, including earlier calls and arguments. Guidance is inserted before the
+whole unexecuted envelope, then the preserved envelope is prefetched and only
+the remaining arguments continue generating. Generation, precision tracking
+and display parsers are seeded from that prefix. Already displayed tool text is
+not emitted again, and refreshed references are not included in accepted output.
+The UI reports continuing arguments instead of restarting the draft. The eight
+distinct-tool limit, context/output limits, schema checks and observer approval
+remain. Guidance still takes prefill work and can add latency; this does not
+guarantee that every model-generated argument is valid.
+
+Affected library verification: 47 tests passed, seven ignored by default. The
+new ignored tokenizer test was separately run against D:\deepseek\model and
+passed on CPU, preserving exact IDs and two parallel calls. An initial test
+assumed compact JSON whitespace; its assertion was corrected to inspect parsed
+arguments. Both release builds passed. No tokenizer, weight data, precision
+policy or NCA training protocol changed. The live two-tool probe and its limits
+are recorded in the research tool-refresh-resume-20260923 report.
+
+
+Live follow-up: the original model returned workspace_info {} and list_files
+with path "." exactly once each, after two context refreshes. Each tool header
+streamed once, no schema appeared in the answer, no API/transport error occurred,
+and the observer accepted without repair. Request elapsed 326.313 seconds,
+including 179.4 seconds of initial cold prefill; this remains slow, and no
+speedup is established. The API probe captured calls without executing them.
+Coder-cli was reopened against the already loaded corrected daemon.
