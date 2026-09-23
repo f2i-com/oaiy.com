@@ -44,6 +44,8 @@ use dsv41_cuda::{Checkpoint, GpuModel, ImageSpan};
 pub struct Sampling {
     /// 0 = greedy.
     pub temperature: f32,
+    pub reasoning_repeat_penalty: f32,
+    pub reasoning_repeat_last_n: usize,
     pub top_p: f32,
     /// 0 = no limit (up to [`CANDIDATES`]).
     pub top_k: usize,
@@ -99,6 +101,10 @@ pub enum Event {
     /// More reply text (whole UTF-8 characters).
     Text(String),
     Observer(String),
+    ReasoningPreview(String),
+    ContentPreview(String),
+    ObserverDelta { text: String, thinking: bool, start: bool },
+    ToolPreview { text: String, start: bool },
     ObserverProgress { action: String, comment: String },
     Done { finish: Finish, completion_tokens: usize },
     Error(String),
@@ -238,7 +244,7 @@ impl Engine {
             self.request_number += 1;
             let result = self.switch_phase(false).and_then(|_| {
                 if self.observer.is_some() && job.tool_precision { self.reviewed_generate(&mut job) }
-                else { self.generate(&job, &mut Vec::new(), 0, false) }
+                else { self.generate(&job, &mut Vec::new(), 0, false, None) }
             });
             // Every saved prompt checkpoint used ternary. Never reuse the generated
             // mixed-precision suffix as if it had been evaluated in ternary.
@@ -386,17 +392,18 @@ impl Engine {
 
 
     /// Capture unapproved output while continuing to forward progress/comments.
-    /// The relay owns a bounded text buffer; no tool/text event escapes early.
-    fn capture(&mut self, job: &mut Job, q4: usize, comments: bool) -> nrob::Result<(Vec<u32>, Vec<Event>)> {
+    /// Display previews stream immediately; executable/accepted events stay buffered.
+    fn capture(&mut self, job: &mut Job, q4: usize, comments: bool, fresh: Option<&std::collections::BTreeSet<String>>) -> nrob::Result<(Vec<u32>, Vec<Event>)> {
         let (tx, rx) = std::sync::mpsc::channel();
         let destination = std::mem::replace(&mut job.events, tx);
         let forward = destination.clone();
         let cancel = Arc::clone(&job.cancel);
+        let preview_mode = if job.prompt.last().copied() == self.tok.special(dsv41::chat::THINK_START) { dsv41::chat::Mode::Thinking } else { dsv41::chat::Mode::Chat };
         let relay = std::thread::spawn(move || {
-            hold_observer_events(rx, forward, cancel)
+            hold_observer_events(rx, forward, cancel, Some(preview_mode))
         });
         let mut ids = Vec::new();
-        let result = self.generate(job, &mut ids, q4, comments);
+        let result = self.generate(job, &mut ids, q4, comments, fresh);
         drop(std::mem::replace(&mut job.events, destination));
         let (kept, size) = relay.join().map_err(|_| nrob::Error::Format("observer event relay failed".into()))?;
         result?;
@@ -405,16 +412,59 @@ impl Engine {
         Ok((ids, kept))
     }
 
+    /// Pause at a named tool header, then replay from before the tool envelope
+    /// with its current declaration freshly in context. No text is inserted in arguments.
+    fn capture_with_tool_context(&mut self,job:&mut Job)->nrob::Result<(Vec<u32>,Vec<Event>)> {
+        let context=nrob::json::Json::parse(job.observer_context.as_bytes()).ok();
+        if context.as_ref().and_then(|c|c.get("tool_context")).and_then(nrob::json::Json::as_bool)!=Some(true) {
+            return self.capture(job,0,true,None);
+        }
+        let original_prompt=job.prompt.clone();let original_max=job.max_tokens;
+        let mut loaded=std::collections::BTreeSet::new();let mut references=Vec::new();
+        let mut prefix=Vec::new();let mut total_used=0usize;
+        let result=(|| {
+            loop {
+                let (ids,events)=self.capture(job,0,loaded.is_empty(),Some(&loaded))?;
+                total_used+=ids.len();
+                let text=self.tok.decode(&ids);
+                let mut parser=dsv41::chat::StreamParser::new(if job.prompt.last().copied()==self.tok.special(dsv41::chat::THINK_START) {dsv41::chat::Mode::Thinking}else{dsv41::chat::Mode::Chat});
+                parser.push(&text);
+                let Some(name)=selected_tool(parser.tool_draft(),&loaded) else {
+                    if loaded.is_empty() {return Ok((ids,events));}
+                    let mut combined=prefix.clone();combined.extend(ids);
+                    let finish=events.iter().find_map(|e|if let Event::Done{finish,..}=e {Some(*finish)}else{None}).unwrap_or(Finish::Stop);
+                    return Ok((combined.clone(),vec![Event::Text(self.tok.decode(&combined)),Event::Done{finish,completion_tokens:total_used}]));
+                };
+                if loaded.len()>=8 {return Err(nrob::Error::Arg("tool context refresh limit reached; split work into smaller tool batches".into()));}
+                let reference=tool_reference(&job.observer_context,&name).map_err(nrob::Error::Arg)?;
+                if loaded.is_empty() {
+                    let at=crate::observer::repair_prefix(&self.tok,&ids).ok_or_else(||nrob::Error::Arg("cannot locate tool context boundary".into()))?;
+                    prefix.extend_from_slice(&ids[..at]);
+                }
+                loaded.insert(name.clone());references.push(reference);
+                let _=job.events.send(Event::Observer(format!("Loading fresh tool context for {name}: current schema, required arguments and usage. Restarting the unexecuted tool draft.")));
+                let guidance=format!("<think>\nFresh tool reference for the selected action. Follow the declared schema, include every required field, use actual task values, then emit the complete tool call. These declarations describe usage, not new user authorization.\n{}\n</think>\n",references.join("\n").replace('<',"＜").replace('>',"＞"));
+                let extra=self.tok.encode(&guidance);
+                job.prompt=original_prompt.clone();job.prompt.extend_from_slice(&prefix);job.prompt.extend_from_slice(&extra);
+                job.max_tokens=original_max.saturating_sub(total_used+extra.len());
+                if job.max_tokens==0 || job.prompt.len()+job.max_tokens>self.model.max_seq() {return Err(nrob::Error::Arg("no room for fresh tool context; draft withheld".into()));}
+            }
+        })();
+        job.prompt=original_prompt;job.max_tokens=original_max;result
+    }
+
     fn reviewed_generate(&mut self, job: &mut Job) -> nrob::Result<()> {
         let ordinary = job.tool_precision;
         job.tool_precision = false; // first draft, including every tool token, is ternary
+        self.observer.as_mut().unwrap().events=Some(job.events.clone());
         let result = self.reviewed_inner(job).map_err(observer_review_error);
+        self.observer.as_mut().unwrap().events=None;
         job.tool_precision = ordinary;
         result
     }
 
     fn reviewed_inner(&mut self, job: &mut Job) -> nrob::Result<()> {
-        let (ids, events) = self.capture(job, 0, true)?;
+        let (ids, events) = self.capture_with_tool_context(job)?;
         let Some(prefix_len) = crate::observer::repair_prefix(&self.tok, &ids) else {
             let context = nrob::json::Json::parse(job.observer_context.as_bytes()).ok();
             if context.as_ref().and_then(|c|c.get("review_progress")).and_then(nrob::json::Json::as_bool) == Some(true) {
@@ -426,7 +476,7 @@ impl Engine {
             return Ok(()); // no tools: don't charge a review for ordinary conversation
         };
         let draft = self.tok.decode(&ids);
-        let _ = job.events.send(Event::Observer("Reviewing the ternary tool draft before execution...".into()));
+        let _ = job.events.send(Event::Observer("Reviewing the tool draft before execution...".into()));
         let structural = crate::observer::validate_tools(&job.observer_context, &draft).err();
         let decision = if let Some(error) = structural {
             crate::observer::Decision { retry: true, q4_tokens: 32, progress: None, comment: format!("Tool contract error: {error}. Follow the declared tool schema; do not pass intentionally invalid arguments.") }
@@ -438,7 +488,7 @@ impl Engine {
             for event in events { let _ = job.events.send(event); }
             return Ok(());
         }
-        if !self.tool_experts && decision.q4_tokens > 0 {
+        if needs_original_source(self.model.uses_ternary_experts(),self.tool_experts,decision.q4_tokens) {
             return Err(nrob::Error::Arg("observer requested Q4 but no original expert source is configured; draft withheld".into()));
         }
         // Only the unexecuted tool suffix is regenerated. Preserve the exact
@@ -456,7 +506,7 @@ impl Engine {
             job.prompt = original_prompt; job.max_tokens = original_max;
             return Err(nrob::Error::Arg("no room for observer suffix repair; draft withheld".into()));
         }
-        let repaired = self.capture(job, decision.q4_tokens, false);
+        let repaired = self.capture(job, decision.q4_tokens, false, None);
         job.prompt = original_prompt;
         job.max_tokens = original_max;
         let (suffix, repaired_events) = repaired?;
@@ -471,8 +521,8 @@ impl Engine {
             .map_err(|e|nrob::Error::Format(format!("repair still violates the tool contract: {e}; no tool executed")))?;
         let _ = job.events.send(Event::Observer("Checking the repaired tool draft (one retry maximum)...".into()));
         let check = self.observer.as_mut().unwrap().review(&job.observer_context, &text, &job.cancel)?;
-        let _ = job.events.send(Event::Observer(check.comment));
-        if check.retry { return Err(nrob::Error::Format("observer rejected the repair; retry budget exhausted, no tool executed".into())); }
+        let _ = job.events.send(Event::Observer(check.comment.clone()));
+        if check.retry { return Err(nrob::Error::Format(format!("observer rejected the repair: {}; retry budget exhausted, no tool executed",check.comment))); }
         if job.cancel.load(Ordering::Relaxed) { return Err(nrob::Error::Arg("observer repair cancelled".into())); }
         let _ = job.events.send(Event::Text(text));
         for event in repaired_events {
@@ -484,7 +534,7 @@ impl Engine {
         Ok(())
     }
 
-    fn generate(&mut self, job: &Job, generated: &mut Vec<u32>, q4_tokens: usize, comments: bool) -> nrob::Result<()> {
+    fn generate(&mut self, job: &Job, generated: &mut Vec<u32>, q4_tokens: usize, comments: bool, fresh: Option<&std::collections::BTreeSet<String>>) -> nrob::Result<()> {
         let prompt = &job.prompt;
         if prompt.is_empty() {
             return Err(nrob::Error::Arg("empty prompt".into()));
@@ -628,6 +678,8 @@ impl Engine {
         } else { dsv41::chat::Mode::Chat });
         let decode = Instant::now();
         let mut phase = crate::tool_phase::ToolPhase::default();
+        let mut complete_tools = dsv41::chat::StreamParser::new(if budget.thinking { dsv41::chat::Mode::Thinking } else { dsv41::chat::Mode::Chat });
+        let mut reasoning_history = std::collections::VecDeque::new();
         let mut commented = false;
         let mut reasoning_commented = false;
         let mut repetition = crate::repetition::Guard::default();
@@ -635,7 +687,14 @@ impl Engine {
         let phase_enabled = self.tool_experts && job.tool_precision;
         let finish = loop {
             let was_thinking = budget.thinking;
+            if budget.thinking && !phase.original() {
+                penalize_reasoning(&mut logits, &reasoning_history, job.sampling.reasoning_repeat_penalty);
+            } else { reasoning_history.clear(); }
             let (next, forced) = budget.pass(sample(&logits, &job.sampling, &mut rng));
+            if was_thinking && !phase.original() && !forced && !self.tok.is_special(next) {
+                reasoning_history.push_back(next);
+                while reasoning_history.len() > job.sampling.reasoning_repeat_last_n { reasoning_history.pop_front(); }
+            }
             if forced && self.log {
                 eprintln!("  reasoning ended by budget/repetition control after {} tokens", budget.used);
             }
@@ -653,6 +712,7 @@ impl Engine {
             if valid > 0 {
                 let text = String::from_utf8_lossy(&pending[..valid]).into_owned();
                 pending.drain(..valid);
+                complete_tools.push(&text);
                 let was_tool = phase.original();
                 phase.push(&text); // also identifies payloads exempt from the prose repetition guard
                 if !was_tool && !phase.original() {
@@ -677,6 +737,11 @@ impl Engine {
                     break Finish::Stop; // nobody is listening
                 }
             }
+            // Stop an entire completed call envelope before generating post-tool
+            // prose. Observer capture withholds output, so the API cannot cancel
+            // generation at this boundary for us.
+            if fresh.is_some_and(|loaded|selected_tool(complete_tools.tool_draft(),loaded).is_some()) {break Finish::Stop;}
+            if complete_tools.tool_calls_ready() { break Finish::Stop; }
             if self.repetition_guard && (prose_repeated || repetition.push(next, phase.original())) {
                 return Err(nrob::Error::Format(format!("{}: stopped repeated prose/reasoning blocks; generation did not complete. No tool from this incomplete reply was executed. Start a fresh turn or select the original model; automatic retry is disabled.", crate::repetition::CODE)));
             }
@@ -784,17 +849,86 @@ fn reviewed_generation_preserves_repetition_failure_without_blaming_observer() {
     assert!(rejected.contains(crate::observer::CODE));
 }
 
-fn hold_observer_events(rx: Receiver<Event>, forward: Sender<Event>, cancel: Arc<AtomicBool>) -> (Vec<Event>, usize) {
+fn selected_tool(draft:&str,loaded:&std::collections::BTreeSet<String>)->Option<String> {
+    for marker in ["<｜DSML｜ invoke name=\"","<｜DSML｜invoke name=\""] {
+        for rest in draft.split(marker).skip(1) {
+            let (name,tail)=rest.split_once('"')?;
+            if tail.starts_with('>') && !name.is_empty() && !loaded.contains(name) {return Some(name.into());}
+        }
+    }
+    None
+}
+fn tool_reference(context:&str,name:&str)->std::result::Result<String,String> {
+    let context=nrob::json::Json::parse(context.as_bytes()).map_err(|e|e.to_string())?;
+    let function=context.get("tools").and_then(nrob::json::Json::as_array).into_iter().flatten()
+        .filter_map(|t|t.get("function")).find(|f|f.get("name").and_then(nrob::json::Json::as_str)==Some(name))
+        .ok_or_else(||format!("unknown selected tool {name}; no context or execution available"))?;
+    let reference=function.to_json();
+    if reference.len()>16*1024 {return Err(format!("tool reference for {name} exceeds 16 KiB context-refresh limit"));}
+    let no_arguments=function.get("parameters").is_some_and(|schema|schema.get("properties")==Some(&nrob::json::Json::Obj(vec![])) && schema.get("additionalProperties")==Some(&nrob::json::Json::Bool(false)));
+    Ok(if no_arguments {format!("{reference}\nThis is a zero-argument tool. Emit an empty invoke body with no parameter elements. The JSON object {{}} is not a parameter name. No args element is needed.")} else {reference})
+}
+#[test]
+fn tool_context_is_selected_at_complete_header_and_comes_from_current_catalog() {
+    let mut loaded=std::collections::BTreeSet::new();
+    assert!(selected_tool("<｜DSML｜ invoke name=\"write_f",&loaded).is_none());
+    assert_eq!(selected_tool("<｜DSML｜ invoke name=\"write_file\">",&loaded).as_deref(),Some("write_file"));
+    loaded.insert("write_file".into());
+    assert!(selected_tool("<｜DSML｜ invoke name=\"write_file\">",&loaded).is_none());
+    let context=r#"{"tools":[{"function":{"name":"write_file","description":"Write relative to workspace","parameters":{"type":"object","required":["path","content"]}}}]}"#;
+    let reference=tool_reference(context,"write_file").unwrap();
+    assert!(reference.contains("path"));assert!(reference.contains("content"));assert!(reference.contains("relative to workspace"));
+    assert!(tool_reference(context,"unknown").is_err());
+}
+
+fn hold_observer_events(rx: Receiver<Event>, forward: Sender<Event>, cancel: Arc<AtomicBool>, mode: Option<dsv41::chat::Mode>) -> (Vec<Event>, usize) {
+            let mut preview = mode.map(dsv41::chat::StreamParser::new);
             let mut kept = Vec::new();
             let mut size = 0usize;
+            let mut tool_shown = 0usize;
             for event in rx {
                 match event {
                     Event::Text(ref text) => {
+                        if let Some(parser) = preview.as_mut() {
+                            for delta in parser.push(text) {
+                                let event = match delta {
+                                    dsv41::chat::Delta::Reasoning(text) => Event::ReasoningPreview(text),
+                                    dsv41::chat::Delta::Content(text) => Event::ContentPreview(text),
+                                };
+                                let _ = forward.send(event);
+                            }
+                            let draft = parser.tool_draft();
+                            if draft.len() > tool_shown {
+                                let _ = forward.send(Event::ToolPreview {text:draft[tool_shown..].into(),start:tool_shown==0});
+                                tool_shown=draft.len();
+                            }
+                        }
                         size += text.len();
                         if size > 1024 * 1024 { cancel.store(true, Ordering::Relaxed); }
                         else { kept.push(event); }
                     }
-                    Event::Done {..} | Event::Thinking {done:true,..} => kept.push(event),
+                    Event::Thinking {done:true,..} => {
+                        if let Some(parser) = preview.as_mut() {
+                            for delta in parser.end_reasoning() {
+                                if let dsv41::chat::Delta::Reasoning(text) = delta { let _ = forward.send(Event::ReasoningPreview(text)); }
+                            }
+                        }
+                        kept.push(event);
+                    }
+                    Event::Done {..} => {
+                        if let Some(parser) = preview.take() {
+                            // Tool text is already visible; only flush a held prose marker tail.
+                            if parser.tool_draft().is_empty() {
+                                for delta in parser.finish().0 {
+                                    let _ = forward.send(match delta {
+                                        dsv41::chat::Delta::Reasoning(text) => Event::ReasoningPreview(text),
+                                        dsv41::chat::Delta::Content(text) => Event::ContentPreview(text),
+                                    });
+                                }
+                            }
+                        }
+                        kept.push(event);
+                    },
                     other => { let _ = forward.send(other); }
                 }
             }
@@ -818,8 +952,56 @@ fn advice_handoff_is_attributed_and_cannot_close_reasoning_or_enter_tools() {
     assert!(advice.contains("Observer advice"));
 }
 
+fn needs_original_source(ternary:bool,has_source:bool,budget:usize)->bool {
+    ternary && !has_source && budget>0
+}
+#[test]
+fn original_weight_review_repairs_do_not_require_a_second_original_bank() {
+    assert!(!needs_original_source(false,false,32));
+    assert!(needs_original_source(true,false,32));
+    assert!(!needs_original_source(true,true,32));
+}
+
 fn observer_q4_forward(generated: usize, budget: usize) -> bool {
     budget > 0 && generated > 0 && generated <= budget.min(crate::observer::MAX_Q4)
+}
+
+fn penalize_reasoning(logits: &mut [f32], history: &std::collections::VecDeque<u32>, penalty: f32) {
+    if penalty <= 1.0 { return; }
+    let unique: std::collections::HashSet<_> = history.iter().copied().collect();
+    for id in unique {
+        if let Some(value) = logits.get_mut(id as usize) {
+            *value = if *value < 0.0 { *value * penalty } else { *value / penalty };
+        }
+    }
+}
+#[test]
+fn repetition_penalty_is_sign_aware_once_per_recent_token_and_disabled_at_one() {
+    let history = std::collections::VecDeque::from(vec![0, 0, 1]);
+    let original = vec![2.0, -2.0, 1.5];
+    let mut logits = original.clone();
+    penalize_reasoning(&mut logits, &history, 1.0); assert_eq!(logits, original);
+    penalize_reasoning(&mut logits, &history, 2.0); assert_eq!(logits, vec![1.0,-4.0,1.5]);
+}
+#[test]
+fn observer_streams_all_draft_channels_without_releasing_executable_events() {
+    use dsv41::chat::Mode;
+    let input="first λ</think>Writing now.<think>recheck</think><｜DSML｜ calls><｜DSML｜ invoke name=\"write_file\"><｜DSML｜ parameter name=\"content\" string=\"true\">CODE λ</｜DSML｜ parameter></｜DSML｜ invoke></｜DSML｜ calls>";
+    let (tx,rx)=std::sync::mpsc::channel(); let (out,visible)=std::sync::mpsc::channel();
+    for ch in input.chars() { tx.send(Event::Text(ch.to_string())).unwrap(); }
+    drop(tx);
+    let (held,_) = hold_observer_events(rx,out,Arc::new(AtomicBool::new(false)),Some(Mode::Thinking));
+    assert_eq!(held.len(),input.chars().count());
+    let (mut reasoning,mut content,mut tools)=(String::new(),String::new(),String::new());
+    let mut starts=0;
+    for event in visible.try_iter() { match event {
+        Event::ReasoningPreview(s)=>reasoning.push_str(&s),
+        Event::ContentPreview(s)=>content.push_str(&s),
+        Event::ToolPreview{text,start}=>{starts+=usize::from(start);tools.push_str(&text);},
+        _=>panic!("only display previews may escape before review"),
+    }}
+    assert_eq!(reasoning,"first λrecheck"); assert_eq!(content,"Writing now.");
+    assert_eq!(tools,input[input.find("<｜DSML｜ calls>").unwrap()..]);assert_eq!(starts,1);
 }
 
 fn splitmix(state: &mut u64) -> u64 {
@@ -960,7 +1142,7 @@ mod tests {
         tx.send(Event::Observer("a provisional note".into())).unwrap();
         tx.send(Event::Done { finish: Finish::Stop, completion_tokens: 3 }).unwrap();
         drop(tx);
-        let (held, _) = hold_observer_events(rx, out, Arc::new(AtomicBool::new(false)));
+        let (held, _) = hold_observer_events(rx, out, Arc::new(AtomicBool::new(false)), None);
         assert_eq!(held.len(), 2);
         let shown: Vec<_> = visible.try_iter().collect();
         assert_eq!(shown.len(), 1);
@@ -975,7 +1157,7 @@ mod tests {
         tx.send(Event::Thinking {used:10,budget:Some(20),done:true}).unwrap();
         tx.send(Event::Text("</think>answer".into())).unwrap();
         drop(tx);
-        let (held,_)=hold_observer_events(rx,out,Arc::new(AtomicBool::new(false)));
+        let (held,_)=hold_observer_events(rx,out,Arc::new(AtomicBool::new(false)),None);
         assert_eq!(visible.try_iter().count(),0);
         let mut parser=dsv41::chat::StreamParser::new(dsv41::chat::Mode::Thinking);
         let mut deltas=Vec::new();
@@ -1002,17 +1184,28 @@ mod tests {
     }
 
     #[test]
+    fn tool_completion_boundary_waits_for_the_whole_parallel_envelope() {
+        let mut parser=dsv41::chat::StreamParser::new(dsv41::chat::Mode::Thinking);
+        parser.push("Inspect first.</think><｜DSML｜ calls><｜DSML｜ invoke name=\"workspace_info\"></｜DSML｜ invoke>");
+        assert!(!parser.tool_calls_ready());
+        parser.push("<｜DSML｜ invoke name=\"list_files\"><｜DSML｜ parameter name=\"path\" string=\"true\">.</｜DSML｜ parameter></｜DSML｜ invoke>");
+        assert!(!parser.tool_calls_ready());
+        parser.push("</｜DSML｜ calls>");
+        assert!(parser.tool_calls_ready());
+        assert_eq!(parser.finish().1.len(),2);
+    }
+    #[test]
     fn sampling_respects_temperature_top_k_and_top_p() {
         let logits = vec![0.0, 5.0, 4.0, -1.0, 4.9];
         let mut rng = 1;
-        let greedy = Sampling { temperature: 0.0, top_p: 1.0, top_k: 0, seed: 0 };
+        let greedy = Sampling { temperature: 0.0, top_p: 1.0, top_k: 0, seed: 0, reasoning_repeat_penalty: 1.0, reasoning_repeat_last_n: 256 };
         assert_eq!(sample(&logits, &greedy, &mut rng), 1);
-        let top1 = Sampling { temperature: 1.0, top_p: 1.0, top_k: 1, seed: 0 };
+        let top1 = Sampling { temperature: 1.0, top_p: 1.0, top_k: 1, seed: 0, reasoning_repeat_penalty: 1.0, reasoning_repeat_last_n: 256 };
         for _ in 0..50 {
             assert_eq!(sample(&logits, &top1, &mut rng), 1);
         }
         // top-p 0.5 keeps the best two (5.0, 4.9: ~0.47 then ~0.9 of the mass)
-        let nucleus = Sampling { temperature: 1.0, top_p: 0.5, top_k: 0, seed: 0 };
+        let nucleus = Sampling { temperature: 1.0, top_p: 0.5, top_k: 0, seed: 0, reasoning_repeat_penalty: 1.0, reasoning_repeat_last_n: 256 };
         let mut seen = [0usize; 5];
         for _ in 0..2000 {
             seen[sample(&logits, &nucleus, &mut rng) as usize] += 1;

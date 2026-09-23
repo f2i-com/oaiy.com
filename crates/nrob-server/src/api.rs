@@ -249,7 +249,12 @@ impl Server {
         if body.get("n").and_then(Json::as_i64).is_some_and(|n| n != 1) {
             return Err(bad("n > 1 is not supported"));
         }
-        Ok((Sampling { temperature, top_p, top_k, seed }, max_tokens))
+        let reasoning_repeat_penalty = num("reasoning_repeat_penalty")?.unwrap_or(1.0);
+        let reasoning_repeat_last_n = num("reasoning_repeat_last_n")?.unwrap_or(256.0);
+        if !(1.0..=2.0).contains(&reasoning_repeat_penalty) || !(0.0..=4096.0).contains(&reasoning_repeat_last_n) || reasoning_repeat_last_n.fract()!=0.0 {
+            return Err(bad("reasoning_repeat_penalty must be in [1,2]; reasoning_repeat_last_n must be an integer in [0,4096]"));
+        }
+        Ok((Sampling { temperature, top_p, top_k, seed, reasoning_repeat_penalty: reasoning_repeat_penalty as f32, reasoning_repeat_last_n: reasoning_repeat_last_n as usize }, max_tokens))
     }
 
     fn stops(body: &Json) -> Result<Vec<String>, ApiError> {
@@ -475,8 +480,35 @@ impl Server {
         let mut error = None;
         let mut gone = false;
         let mut last_preview = Instant::now() - PREVIEW_EVERY;
+        let mut live_tool_preview = false;
+        let mut tool_shown = 0usize;
         while let Some(ev) = next_event(&rx, &mut sse, peer.as_ref(), &cancel, &mut gone) {
             match ev {
+                Event::ReasoningPreview(text) => {
+                    if let Some(s) = sse.as_mut() {
+                        let c = Json::obj([("nrob_reasoning_preview",Json::str(text))]);
+                        if s.send(format!("data: {}\n\n",c.to_json()).as_bytes()).is_err() { cancel.store(true,Ordering::Relaxed); }
+                    }
+                }
+                Event::ObserverDelta {text,thinking,start} => {
+                    if let Some(s)=sse.as_mut() {
+                        let c=Json::obj([("nrob_observer_delta",Json::obj([("text",Json::str(text)),("thinking",Json::Bool(thinking)),("start",Json::Bool(start))]))]);
+                        if s.send(format!("data: {}\n\n",c.to_json()).as_bytes()).is_err() {cancel.store(true,Ordering::Relaxed);}
+                    }
+                }
+                Event::ContentPreview(text) => {
+                    if let Some(s) = sse.as_mut() {
+                        let c=Json::obj([("nrob_content_preview",Json::str(text))]);
+                        if s.send(format!("data: {}\n\n",c.to_json()).as_bytes()).is_err() {cancel.store(true,Ordering::Relaxed);}
+                    }
+                }
+                Event::ToolPreview {text,start} => {
+                    live_tool_preview=true;
+                    if let Some(s) = sse.as_mut() {
+                        let c=Json::obj([("nrob_tool_preview",Json::obj([("text",Json::str(text)),("start",Json::Bool(start))]))]);
+                        if s.send(format!("data: {}\n\n",c.to_json()).as_bytes()).is_err() {cancel.store(true,Ordering::Relaxed);}
+                    }
+                }
                 Event::ObserverProgress {action,comment} => {
                     if let Some(s) = sse.as_mut() {
                         let c = Json::obj([("nrob_observer_progress",Json::obj([("action",Json::str(action)),("comment",Json::str(comment))]))]);
@@ -541,6 +573,16 @@ impl Server {
                         // Stop generation at the completed call envelope so the
                         // client can execute tools before the model continues.
                         cancel.store(true, Ordering::Relaxed);
+                    }
+                    // Also stream every raw tool character without an observer.
+                    // Accepted observer replay must not duplicate the live draft.
+                    if !live_tool_preview && parser.tool_draft().len()>tool_shown {
+                        let draft=parser.tool_draft();
+                        if let Some(s)=sse.as_mut() {
+                            let c=Json::obj([("nrob_tool_preview",Json::obj([("text",Json::str(&draft[tool_shown..])),("start",Json::Bool(tool_shown==0))]))]);
+                            if s.send(format!("data: {}\n\n",c.to_json()).as_bytes()).is_err() {cancel.store(true,Ordering::Relaxed);}
+                        }
+                        tool_shown=draft.len();
                     }
                     // a tool call being written shows as it takes shape
                     if let (Some(s), Some(p)) = (sse.as_mut(), parser.call_preview()) {
@@ -926,5 +968,6 @@ fn observer_context(body: &Json) -> String {
             ("content_excerpt",Json::str(m.get("content").map(Json::to_json).unwrap_or_default().chars().take(800).collect::<String>()))])).collect();
     Json::obj([("latest_user_request", task), ("tools", body.get("tools").cloned().unwrap_or(Json::Null)),
         ("review_progress",body.get("nrob_review_progress").cloned().unwrap_or(Json::Bool(false))),
+        ("tool_context",body.get("nrob_tool_context").cloned().unwrap_or(Json::Bool(false))),
         ("recent_context",Json::Arr(recent))]).to_json()
 }

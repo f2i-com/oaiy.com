@@ -923,6 +923,10 @@ impl StreamParser {
     /// Current channel, including reasoning reopened during an answer.
     pub fn is_reasoning(&self) -> bool { self.phase == Phase::Reasoning }
 
+    /// Display-only raw tool draft, including incomplete syntax. Never dispatch it.
+    pub fn tool_draft(&self) -> &str { &self.calls }
+
+
     fn try_complete(&mut self) {
         if self.calls.contains(&format!("</{DSML}")) {
             if let Ok((_,calls)) = runtime_dsml::parse(&self.calls) {

@@ -240,6 +240,8 @@ impl Tokenizer {
         self.added_ids.get(content).copied()
     }
 
+    pub fn is_special(&self, id: u32) -> bool { self.added_ids.values().any(|&v| v == id) }
+
     /// The bytes token `id` stands for (empty if unknown). A token can end
     /// inside a UTF-8 sequence.
     pub fn token_bytes(&self, id: u32) -> &[u8] {

@@ -372,6 +372,7 @@ impl Models {
             vision: o.vision,
             residual_on_device: None,
         };
+        self.say(format!("expert host cache: {:.2} GiB effective (configured ceiling {} GiB; capped by available RAM)",gopts.expert_cache_bytes as f64 / (1u64<<30) as f64,o.ram_gb));
         let engram_meta = o
             .engram_meta
             .clone()
@@ -412,7 +413,7 @@ impl Models {
         e.observer = observer;
         e.repetition_guard = o.repetition_guard;
         if e.observer.is_some() {
-            self.say("Observer mode: ternary tool drafts; bounded MXFP4 suffix repairs; tools withheld until review".into());
+            self.say(if e.model.uses_ternary_experts() {"Observer mode: ternary tool drafts; bounded MXFP4 suffix repairs; tools withheld until review"} else {"Observer mode: original MXFP4 experts throughout; tools withheld until review"}.into());
         } else if tool_experts {
             self.say("DSML boundary precision: ternary prompt/prose; MXFP4 tool payload; 80/20 expert cache budgets; trunk retained".into());
         }
