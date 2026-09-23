@@ -413,7 +413,7 @@ impl Models {
         e.observer = observer;
         e.repetition_guard = o.repetition_guard;
         if e.observer.is_some() {
-            self.say(if e.model.uses_ternary_experts() {"Observer mode: ternary tool drafts; bounded MXFP4 suffix repairs; tools withheld until review"} else {"Observer mode: original MXFP4 experts throughout; tools withheld until review"}.into());
+            self.say("Observer available: review off by default; opt in to a single approval gate with nrob_observer_review=blocking".into());
         } else if tool_experts {
             self.say("DSML boundary precision: ternary prompt/prose; MXFP4 tool payload; 80/20 expert cache budgets; trunk retained".into());
         }

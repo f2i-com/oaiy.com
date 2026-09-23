@@ -1,5 +1,7 @@
 # Packed-weight observer experiment
 
+Current default is **observer off**. The final section below supersedes the historical automatic-review/repair behavior.
+
 The optional observer reviews DeepSeek tool drafts before clients receive executable calls. When the ternary model is selected, the first draft uses ternary routed experts. With the original model selected, original MXFP4 experts are used throughout. An observer may request one suffix regeneration with a bounded window of original MXFP4 expert forwards, then review it again. This is experimental mixed-precision inference, not trained BitNet or original-model equivalence.
 
 ## Configuration
@@ -148,3 +150,67 @@ and the observer accepted without repair. Request elapsed 326.313 seconds,
 including 179.4 seconds of initial cold prefill; this remains slow, and no
 speedup is established. The API probe captured calls without executing them.
 Coder-cli was reopened against the already loaded corrected daemon.
+
+
+## Current default: direct tools, observer opt-in (2026-09-23)
+
+Observer loading is now disabled unless explicitly enabled. This machine's
+private settings also set observer_enabled=false. The original DeepSeek default,
+both GPUs and the 170 GiB host-cache ceiling are retained. Standard tool calls
+use the schemas already present in the prompt: no selected-tool context reload,
+no Qwen consultation, and no Qwen GPU allocation in the default run. The client
+also omits duplicated per-tool usage boilerplate unless context refresh is
+explicitly requested. Original tool schemas/descriptions remain intact.
+
+Use `start.bat E:\nrob_projects3 -Observer` to load the configured observer and
+enable a single blocking approval gate. It reviews the existing completed batch:
+accept releases those exact calls, rejection stops with a reason. There is no
+automatic suffix repair, precision-window rewrite or second review. The legacy
+wire decision action `retry` is treated as a veto, not a request to regenerate;
+its q4_tokens field no longer triggers model work. Partial-draft/reasoning and
+progress consultations are skipped in this gate mode. Its existing review budget
+and bounded paged reader remain, so opt-in review can still take time.
+
+`-ObserverReview off|blocking|auto` overrides review behavior. The default is off;
+`-Observer` (or `-ObserverModel`) selects blocking unless explicitly overridden.
+Auto reviews ternary experts only; explicit blocking without a loaded observer
+fails rather than silently bypassing the requested review. API callers use
+`nrob_observer_review`, default off. The selected-tool refresh experiment remains
+explicitly available via `nrob_tool_context=true` in review mode, but ordinary
+coder-cli requests no longer enable it.
+
+Both direct and reviewed tool batches require deterministic DSML/schema
+validation. Unknown tools, missing required fields and wrong argument types
+produce a non-retryable tool_contract_error before calls are dispatched. Existing
+client permissions still apply. The model may batch independent related actions
+when their inputs are known, and must wait for results before dependent actions.
+Existing write calls remain sequential; read-only batching and per-tool results
+are retained. This is optional batching, not speculative execution of dependencies.
+
+Affected checks: 49 native, 28 provider, 119 runtime and 23 bootstrap tests pass
+(219 total; seven native tests ignored by default). Both release builds pass.
+Launcher dry runs confirm off by default, blocking with -Observer, and scoped
+environment restoration. An old context-opt-in test needed an explicit blocking
+policy after the default changed. A launcher environment-reset argument typo
+was caught by dry run and corrected before installation. No model weights or
+training protocol changed. Live no-observer findings are recorded in the research
+observer-direct-tools-20260923 report.
+
+
+Live no-observer check passed in 90.578 seconds: workspace_info {} and list_files
+with path "." were returned once each, without observer events, context refresh,
+schema echo or errors. Native prompt cache restored 383 tokens; the remaining
+69 prompt tokens took 61.3 seconds. The prior blocking-review check took 326.313
+seconds with different cache/residency conditions, so this does not isolate a
+speedup factor. The API probe captured calls without executing them. Coder-cli
+was reopened with -NoObserver after the successful check.
+
+
+Installation follow-up: the first reopened client reported incompatible daemon
+settings because it compared an inactive saved observer VRAM budget with the
+test daemon's absent observer options. Compatibility now ignores device/budget
+only when no observer model is configured. Enabled observer settings still alter
+identity. Five targeted daemon tests pass, including one new regression (220
+affected passing checks in total). The client was rebuilt without unloading the
+existing DeepSeek process/cache. The full client connection check is recorded in
+the research report, separate from the API-only tool probe.

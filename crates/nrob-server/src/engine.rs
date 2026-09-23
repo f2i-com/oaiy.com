@@ -243,7 +243,12 @@ impl Engine {
             self.model.set_busy(true);
             self.request_number += 1;
             let result = self.switch_phase(false).and_then(|_| {
-                if self.observer.is_some() && job.tool_precision { self.reviewed_generate(&mut job) }
+                if job.tool_precision && blocking_observer_review(&job.observer_context, self.model.uses_ternary_experts()) {
+                    if self.observer.is_none() {
+                        return Err(nrob::Error::Arg("observer_review_failed: blocking review requested but no observer is loaded; no tool executed".into()));
+                    }
+                    self.reviewed_generate(&mut job)
+                }
                 else { self.generate(&job, &mut Vec::new(), 0, false, None, "") }
             });
             // Every saved prompt checkpoint used ternary. Never reuse the generated
@@ -418,7 +423,7 @@ impl Engine {
     fn capture_with_tool_context(&mut self, job: &mut Job) -> nrob::Result<(Vec<u32>, Vec<Event>)> {
         let context = nrob::json::Json::parse(job.observer_context.as_bytes()).ok();
         if context.as_ref().and_then(|c| c.get("tool_context")).and_then(nrob::json::Json::as_bool) != Some(true) {
-            return self.capture(job, 0, true, None, "");
+            return self.capture(job, 0, false, None, "");
         }
         let original_prompt = job.prompt.clone();
         let original_max = job.max_tokens;
@@ -432,7 +437,7 @@ impl Engine {
         let result = (|| {
             loop {
                 let tool_prefix = boundary.map(|at| self.tok.decode(&draft[at..])).unwrap_or_default();
-                let (ids, events) = self.capture(job, 0, loaded.is_empty(), Some(&loaded), &tool_prefix)?;
+                let (ids, events) = self.capture(job, 0, false, Some(&loaded), &tool_prefix)?;
                 draft.extend(ids);
                 let text = self.tok.decode(&draft);
                 if text.len() > 1024 * 1024 {
@@ -484,73 +489,17 @@ impl Engine {
 
     fn reviewed_inner(&mut self, job: &mut Job) -> nrob::Result<()> {
         let (ids, events) = self.capture_with_tool_context(job)?;
-        let Some(prefix_len) = crate::observer::repair_prefix(&self.tok, &ids) else {
-            let context = nrob::json::Json::parse(job.observer_context.as_bytes()).ok();
-            if context.as_ref().and_then(|c|c.get("review_progress")).and_then(nrob::json::Json::as_bool) == Some(true) {
-                let _ = job.events.send(Event::Observer("Checking whether unfinished work really needs user input...".into()));
-                let decision = self.observer.as_mut().unwrap().progress(&job.observer_context, &self.tok.decode(&ids), &job.cancel)?;
-                let _ = job.events.send(Event::ObserverProgress {action:decision.progress.unwrap().into(),comment:decision.comment});
-            }
-            for event in events { let _ = job.events.send(event); }
-            return Ok(()); // no tools: don't charge a review for ordinary conversation
-        };
         let draft = self.tok.decode(&ids);
-        let _ = job.events.send(Event::Observer("Reviewing the tool draft before execution...".into()));
-        let structural = crate::observer::validate_tools(&job.observer_context, &draft).err();
-        let decision = if let Some(error) = structural {
-            crate::observer::Decision { retry: true, q4_tokens: 32, progress: None, comment: format!("Tool contract error: {error}. Follow the declared tool schema; do not pass intentionally invalid arguments.") }
-        } else {
-            self.observer.as_mut().unwrap().review(&job.observer_context, &draft, &job.cancel)?
-        };
-        let _ = job.events.send(Event::Observer(decision.comment.clone()));
-        if !decision.retry {
+        if crate::observer::repair_prefix(&self.tok, &ids).is_none() {
             for event in events { let _ = job.events.send(event); }
             return Ok(());
         }
-        if needs_original_source(self.model.uses_ternary_experts(),self.tool_experts,decision.q4_tokens) {
-            return Err(nrob::Error::Arg("observer requested Q4 but no original expert source is configured; draft withheld".into()));
-        }
-        // Only the unexecuted tool suffix is regenerated. Preserve the exact
-        // draft token prefix, restore a ternary checkpoint, and replay its tail.
-        self.switch_phase(false)?;
-        let original_prompt = job.prompt.clone();
-        let original_max = job.max_tokens;
-        let advice = format!("<think>\nObserver suggestion (advisory, may be mistaken): {}\n</think>\n",
-            decision.comment.replace('<', "＜").replace('>', "＞"));
-        let mut accepted = ids[..prefix_len].to_vec();
-        accepted.extend(self.tok.encode(&advice));
-        job.prompt.extend_from_slice(&accepted);
-        job.max_tokens = original_max.saturating_sub(accepted.len());
-        if job.max_tokens == 0 || job.prompt.len() + job.max_tokens > self.model.max_seq() {
-            job.prompt = original_prompt; job.max_tokens = original_max;
-            return Err(nrob::Error::Arg("no room for observer suffix repair; draft withheld".into()));
-        }
-        let repaired = self.capture(job, decision.q4_tokens, false, None, "");
-        job.prompt = original_prompt;
-        job.max_tokens = original_max;
-        let (suffix, repaired_events) = repaired?;
-        accepted.extend_from_slice(&suffix);
-        let text = self.tok.decode(&accepted);
-        let mut parser = dsv41::chat::StreamParser::new(dsv41::chat::Mode::Chat);
-        parser.push(&text);
-        if parser.tool_call_error().is_some() || !parser.tool_calls_ready() {
-            return Err(nrob::Error::Format("observer repair did not produce complete valid tool calls; withheld".into()));
-        }
-        crate::observer::validate_tools(&job.observer_context, &text)
-            .map_err(|e|nrob::Error::Format(format!("repair still violates the tool contract: {e}; no tool executed")))?;
-        let _ = job.events.send(Event::Observer("Checking the repaired tool draft (one retry maximum)...".into()));
-        let check = self.observer.as_mut().unwrap().review(&job.observer_context, &text, &job.cancel)?;
-        let _ = job.events.send(Event::Observer(check.comment.clone()));
-        if check.retry { return Err(nrob::Error::Format(format!("observer rejected the repair: {}; retry budget exhausted, no tool executed",check.comment))); }
-        if job.cancel.load(Ordering::Relaxed) { return Err(nrob::Error::Arg("observer repair cancelled".into())); }
-        let _ = job.events.send(Event::Text(text));
-        for event in repaired_events {
-            if let Event::Done { finish, .. } = event {
-                // Usage includes discarded draft and repair compute, not only accepted text.
-                let _ = job.events.send(Event::Done {finish, completion_tokens: ids.len() + suffix.len()});
-            }
-        }
-        Ok(())
+        crate::observer::validate_tools(&job.observer_context, &draft)
+            .map_err(|e| nrob::Error::Format(format!("tool_contract_error: {e}; no tool executed")))?;
+        let _ = job.events.send(Event::Observer("Checking the proposed calls once before execution...".into()));
+        let decision = self.observer.as_mut().unwrap().review(&job.observer_context, &draft, &job.cancel)?;
+        let _ = job.events.send(Event::Observer(decision.comment.clone()));
+        release_reviewed_events(&decision, events, &job.events, &job.cancel)
     }
 
     fn generate(&mut self, job: &Job, generated: &mut Vec<u32>, q4_tokens: usize, comments: bool, fresh: Option<&std::collections::BTreeSet<String>>, tool_prefix: &str) -> nrob::Result<()> {
@@ -873,6 +822,30 @@ fn reviewed_generation_preserves_repetition_failure_without_blaming_observer() {
     assert!(rejected.contains(crate::observer::CODE));
 }
 
+// Automatic review follows the loaded expert representation, never a model name.
+fn blocking_observer_review(context: &str, ternary: bool) -> bool {
+    let context = nrob::json::Json::parse(context.as_bytes()).ok();
+    match context.as_ref().and_then(|c| c.get("review_policy")).and_then(nrob::json::Json::as_str) {
+        Some("blocking") => true,
+        Some("off") => false,
+        Some("auto") => ternary,
+        _ => false,
+    }
+}
+
+#[test]
+fn automatic_observer_review_is_for_ternary_and_explicit_modes_override_it() {
+    for context in [r#"{"review_policy":"auto"}"#] {
+        assert!(!blocking_observer_review(context, false));
+        assert!(blocking_observer_review(context, true));
+    }
+    for ternary in [false, true] {
+        assert!(!blocking_observer_review("{}", ternary));
+        assert!(blocking_observer_review(r#"{"review_policy":"blocking"}"#, ternary));
+        assert!(!blocking_observer_review(r#"{"review_policy":"off"}"#, ternary));
+    }
+}
+
 fn resumed_tool_prompt(original: &[u32], draft: &[u32], boundary: usize, guidance: &[u32]) -> Vec<u32> {
     let mut prompt = original.to_vec();
     prompt.extend_from_slice(&draft[..boundary]);
@@ -988,14 +961,36 @@ fn advice_handoff_is_attributed_and_cannot_close_reasoning_or_enter_tools() {
     assert!(advice.contains("Observer advice"));
 }
 
-fn needs_original_source(ternary:bool,has_source:bool,budget:usize)->bool {
-    ternary && !has_source && budget>0
+// Approval releases exactly the existing buffered calls; a veto does not
+// regenerate, repair or invoke any model again.
+fn release_reviewed_events(decision: &crate::observer::Decision, events: Vec<Event>, target: &Sender<Event>, cancel: &AtomicBool) -> nrob::Result<()> {
+    if cancel.load(Ordering::Relaxed) {
+        return Err(nrob::Error::Arg("observer review cancelled; no tool executed".into()));
+    }
+    if decision.retry {
+        return Err(nrob::Error::Format(format!("observer rejected the proposed calls: {}; no tool executed or automatically rewritten", decision.comment)));
+    }
+    for event in events { let _ = target.send(event); }
+    Ok(())
 }
+
 #[test]
-fn original_weight_review_repairs_do_not_require_a_second_original_bank() {
-    assert!(!needs_original_source(false,false,32));
-    assert!(needs_original_source(true,false,32));
-    assert!(!needs_original_source(true,true,32));
+fn observer_yes_releases_the_same_calls_and_no_releases_nothing() {
+    for reject in [false, true] {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let decision = crate::observer::Decision {retry:reject, q4_tokens:64, comment:"Concrete reason".into(), progress:None};
+        let original = "EXACT_ORIGINAL_TOOL_BATCH";
+        let result = release_reviewed_events(&decision, vec![Event::Text(original.into()), Event::Done {finish:Finish::Stop, completion_tokens:12}], &tx, &AtomicBool::new(false));
+        if reject {
+            assert!(result.unwrap_err().to_string().contains("no tool executed or automatically rewritten"));
+            assert!(rx.try_recv().is_err());
+        } else {
+            assert!(result.is_ok());
+            assert!(matches!(rx.try_recv().unwrap(), Event::Text(text) if text == original));
+            assert!(matches!(rx.try_recv().unwrap(), Event::Done {completion_tokens:12,..}));
+            assert!(rx.try_recv().is_err());
+        }
+    }
 }
 
 fn observer_q4_forward(generated: usize, budget: usize) -> bool {

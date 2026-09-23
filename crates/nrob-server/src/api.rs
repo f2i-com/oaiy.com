@@ -393,7 +393,9 @@ impl Server {
 
     fn chat(&self, req: &Request, w: &mut TcpStream) -> Result<bool, ApiError> {
         let body = Self::parse_body(req)?;
-        // Before anything else: which model, loading it if it is not the live one.
+        observer_review_policy(&body)?;
+        // Before loading a model: validate the observer request policy.
+        // Which model, loading it if it is not the live one.
         let a = self.active(&body)?;
         let (sampling, max_tokens) = self.sampling(&a, &body)?;
         let stops = Self::stops(&body)?;
@@ -627,6 +629,11 @@ impl Server {
                 error = Some(format!("Model generated an invalid DSML tool call ({detail}); no tool was executed. Please start a fresh turn."));
             }
         }
+        if error.is_none() && !stop.hit && parser.tool_calls_ready() {
+            if let Err(detail) = validate_completed_tool_contract(&body, parser.tool_draft()) {
+                error = Some(detail);
+            }
+        }
         let (rest, calls) = parser.finish();
         if !stop.hit && malformed_tools.is_none() {
             for d in rest {
@@ -680,7 +687,7 @@ impl Server {
                 }
                 let mut send = |v: Json| s.send(format!("data: {}\n\n", v.to_json()).as_bytes());
                 if let Some(e) = &error {
-                    let _ = send(Json::obj([("error", Json::obj([("message", Json::str(e)), ("type", Json::str("server_error")), ("code", Json::str(if e.contains(crate::repetition::CODE) { crate::repetition::CODE } else if e.contains(crate::observer::CODE) { crate::observer::CODE } else { "server_error" }))]))]));
+                    let _ = send(Json::obj([("error", Json::obj([("message", Json::str(e)), ("type", Json::str("server_error")), ("code", Json::str(if e.contains(TOOL_CONTRACT_CODE) { TOOL_CONTRACT_CODE } else if e.contains(crate::repetition::CODE) { crate::repetition::CODE } else if e.contains(crate::observer::CODE) { crate::observer::CODE } else { "server_error" }))]))]));
                 } else {
                     if !tool_calls.is_empty() {
                         send(chunk(Json::obj([("tool_calls", Json::Arr(tool_calls))]), None)).map_err(io_err)?;
@@ -710,8 +717,9 @@ impl Server {
                 if let Some(e) = error {
                     let repetition = e.contains(crate::repetition::CODE);
                     let observer = e.contains(crate::observer::CODE);
-                    return Err(ApiError { status: if repetition || observer { 422 } else { 500 }, message: e,
-                        code: if repetition { crate::repetition::CODE } else if observer { crate::observer::CODE } else { "server_error" } });
+                    let tool_contract = e.contains(TOOL_CONTRACT_CODE);
+                    return Err(ApiError { status: if repetition || observer || tool_contract { 422 } else { 500 }, message: e,
+                        code: if tool_contract { TOOL_CONTRACT_CODE } else if repetition { crate::repetition::CODE } else if observer { crate::observer::CODE } else { "server_error" } });
                 }
                 let mut message = vec![
                     ("role".to_string(), Json::str("assistant")),
@@ -958,6 +966,37 @@ mod tests {
     }
 }
 
+const TOOL_CONTRACT_CODE: &str = "tool_contract_error";
+
+fn observer_review_policy(body: &Json) -> Result<(), ApiError> {
+    match body.get("nrob_observer_review") {
+        None => Ok(()),
+        Some(Json::Str(policy)) if matches!(policy.as_str(), "auto" | "blocking" | "off") => Ok(()),
+        _ => Err(bad("nrob_observer_review must be auto, blocking, or off")),
+    }
+}
+
+fn validate_completed_tool_contract(body: &Json, draft: &str) -> Result<(), String> {
+    crate::observer::validate_tools(&observer_context(body), draft)
+        .map_err(|e| format!("{TOOL_CONTRACT_CODE}: {e}; no tool from this batch was executed"))
+}
+
+#[test]
+fn direct_tool_calls_still_require_declared_names_and_valid_arguments() {
+    let body = Json::parse(br#"{"nrob_observer_review":"off","tools":[{"function":{"name":"list_files","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"],"additionalProperties":false}}}]}"#).unwrap();
+    let draft = |name: &str, params: &str| format!("<｜DSML｜ calls><｜DSML｜ invoke name=\"{name}\">{params}</｜DSML｜ invoke></｜DSML｜ calls>");
+    let parameter = "<｜DSML｜ parameter name=\"path\" string=\"true\">.</｜DSML｜ parameter>";
+    assert!(validate_completed_tool_contract(&body, &draft("list_files", parameter)).is_ok());
+    for invalid in [draft("list_files", ""), draft("unlisted", parameter), draft("list_files", "<｜DSML｜ parameter name=\"path\" string=\"false\">123</｜DSML｜ parameter>")] {
+        assert!(validate_completed_tool_contract(&body, &invalid).unwrap_err().starts_with(TOOL_CONTRACT_CODE));
+    }
+    for policy in ["auto", "blocking", "off"] {
+        assert!(observer_review_policy(&Json::obj([("nrob_observer_review", Json::str(policy))])).is_ok());
+    }
+    assert!(observer_review_policy(&Json::obj([("nrob_observer_review", Json::str("skip-everything"))])).is_err());
+    assert!(observer_review_policy(&Json::obj([("nrob_observer_review", Json::Bool(false))])).is_err());
+}
+
 fn observer_context(body: &Json) -> String {
     let task = body.get("messages").and_then(Json::as_array).and_then(|m| m.iter().rev()
         .find(|m| m.get("role").and_then(Json::as_str) == Some("user")))
@@ -969,5 +1008,6 @@ fn observer_context(body: &Json) -> String {
     Json::obj([("latest_user_request", task), ("tools", body.get("tools").cloned().unwrap_or(Json::Null)),
         ("review_progress",body.get("nrob_review_progress").cloned().unwrap_or(Json::Bool(false))),
         ("tool_context",body.get("nrob_tool_context").cloned().unwrap_or(Json::Bool(false))),
+        ("review_policy",body.get("nrob_observer_review").cloned().unwrap_or(Json::str("off"))),
         ("recent_context",Json::Arr(recent))]).to_json()
 }
