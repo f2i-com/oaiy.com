@@ -408,7 +408,7 @@ impl Engine {
     fn reviewed_generate(&mut self, job: &mut Job) -> nrob::Result<()> {
         let ordinary = job.tool_precision;
         job.tool_precision = false; // first draft, including every tool token, is ternary
-        let result = self.reviewed_inner(job).map_err(|e| nrob::Error::Format(format!("{}: {e}", crate::observer::CODE)));
+        let result = self.reviewed_inner(job).map_err(observer_review_error);
         job.tool_precision = ordinary;
         result
     }
@@ -761,6 +761,27 @@ impl Engine {
         let _ = job.events.send(Event::Done { finish, completion_tokens: n });
         Ok(())
     }
+}
+
+// A main-model repetition stop is not a reviewer failure. Keep its original
+// code/message so the client can explain the cause without suggesting Qwen failed.
+fn observer_review_error(error: nrob::Error) -> nrob::Error {
+    if error.to_string().contains(crate::repetition::CODE) {
+        error
+    } else {
+        nrob::Error::Format(format!("{}: {error}", crate::observer::CODE))
+    }
+}
+
+#[test]
+fn reviewed_generation_preserves_repetition_failure_without_blaming_observer() {
+    let error = nrob::Error::Format(format!("{}: stopped repeated prose; no tool executed", crate::repetition::CODE));
+    let original = error.to_string();
+    let reported = observer_review_error(error).to_string();
+    assert_eq!(reported, original);
+    assert!(!reported.contains(crate::observer::CODE));
+    let rejected = observer_review_error(nrob::Error::Format("observer rejected the repair".into())).to_string();
+    assert!(rejected.contains(crate::observer::CODE));
 }
 
 fn hold_observer_events(rx: Receiver<Event>, forward: Sender<Event>, cancel: Arc<AtomicBool>) -> (Vec<Event>, usize) {
