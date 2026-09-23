@@ -11,7 +11,7 @@
 
 use nrob_server::Options;
 
-const HELP: &str = "nrob-server: DeepSeek-V4.1-Flash behind an OpenAI-compatible API
+const HELP: &str = "Observer: --observer-model FILE.gguf --observer-device auto|INDEX --observer-vram-gb N (optional; packed weights budget defaults to 16 GiB)\n\nnrob-server: DeepSeek-V4.1-Flash behind an OpenAI-compatible API
 
   --host ADDR          listen address (default 127.0.0.1; 0.0.0.0 for the network)
   --port N             port (default 8000)
@@ -134,6 +134,9 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Options, Stri
                 "on" => true, "off" => false,
                 _ => return Err("--repetition-guard wants on or off".into()),
             },
+            "--observer-model" => a.observer_model = Some(val()?.into()),
+            "--observer-vram-gb" => a.observer_vram_gb = num(val()?)?,
+            "--observer-device" => a.observer_device = { let v = val()?; if v == "auto" { usize::MAX } else { num(v)? } },
             "--expert-trace" => a.expert_trace = Some(val()?.into()),
             "--api-key" => a.api_key = Some(val()?),
             "--thinking" => a.thinking = true,

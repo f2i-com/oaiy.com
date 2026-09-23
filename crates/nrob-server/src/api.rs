@@ -363,7 +363,7 @@ impl Server {
         }
     }
 
-    fn submit(&self, a: &crate::models::Active, prompt: Vec<u32>, images: Vec<JobImage>, sampling: Sampling, max_tokens: usize, think_budget: Option<usize>, tool_precision: bool) -> Result<(mpsc::Receiver<Event>, Arc<AtomicBool>), ApiError> {
+    fn submit(&self, a: &crate::models::Active, prompt: Vec<u32>, images: Vec<JobImage>, sampling: Sampling, max_tokens: usize, think_budget: Option<usize>, tool_precision: bool, observer_context: String) -> Result<(mpsc::Receiver<Event>, Arc<AtomicBool>), ApiError> {
         if prompt.len() + 1 > a.cfg.max_seq {
             return Err(ApiError {
                 status: 400,
@@ -379,7 +379,7 @@ impl Server {
         let max_tokens = max_tokens.min(a.cfg.max_seq - prompt.len());
         let (tx, rx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
-        let job = Job { tool_precision, prompt, images, max_tokens, think_budget, sampling, cancel: Arc::clone(&cancel), events: tx };
+        let job = Job { tool_precision, observer_context, prompt, images, max_tokens, think_budget, sampling, cancel: Arc::clone(&cancel), events: tx };
         a.jobs
             .send(job)
             .map_err(|_| ApiError { status: 503, message: "the model worker has stopped".into(), code: "unavailable" })?;
@@ -408,7 +408,7 @@ impl Server {
         let stream = body.get("stream").and_then(Json::as_bool).unwrap_or(false);
         let include_usage = body.get("stream_options").and_then(|o| o.get("include_usage")).and_then(Json::as_bool).unwrap_or(false);
         let think_budget = if mode == Mode::Thinking { Self::think_budget(&body, effort) } else { None };
-        let (rx, cancel) = self.submit(&a, prompt, images, sampling, max_tokens, think_budget, crate::models::needs_tool_precision(&body))?;
+        let (rx, cancel) = self.submit(&a, prompt, images, sampling, max_tokens, think_budget, crate::models::needs_tool_precision(&body), observer_context(&body))?;
         let peer = w.try_clone().ok();
         let id = random_id("chatcmpl-");
         let created = now();
@@ -477,6 +477,18 @@ impl Server {
         let mut last_preview = Instant::now() - PREVIEW_EVERY;
         while let Some(ev) = next_event(&rx, &mut sse, peer.as_ref(), &cancel, &mut gone) {
             match ev {
+                Event::ObserverProgress {action,comment} => {
+                    if let Some(s) = sse.as_mut() {
+                        let c = Json::obj([("nrob_observer_progress",Json::obj([("action",Json::str(action)),("comment",Json::str(comment))]))]);
+                        if s.send(format!("data: {}\n\n",c.to_json()).as_bytes()).is_err() {cancel.store(true,Ordering::Relaxed);}
+                    }
+                }
+                Event::Observer(comment) => {
+                    if let Some(s) = sse.as_mut() {
+                        let c = Json::obj([("nrob_observer", Json::str(comment))]);
+                        if s.send(format!("data: {}\n\n", c.to_json()).as_bytes()).is_err() { cancel.store(true, Ordering::Relaxed); }
+                    }
+                }
                 Event::Progress { done, total } => {
                     if let Some(s) = sse.as_mut() {
                         let mut c = chunk(Json::obj::<&str>([]), None);
@@ -497,6 +509,7 @@ impl Server {
                 }
                 Event::Prefilled { cached: c } => cached = c,
                 Event::Thinking { used, budget, done } => {
+                    if done { for d in parser.end_reasoning() { emit(d, &mut sse, &mut stop, &cancel); } }
                     if let Some(s) = sse.as_mut() {
                         let mut c = chunk(Json::obj::<&str>([]), None);
                         if let Json::Obj(fields) = &mut c {
@@ -625,7 +638,7 @@ impl Server {
                 }
                 let mut send = |v: Json| s.send(format!("data: {}\n\n", v.to_json()).as_bytes());
                 if let Some(e) = &error {
-                    let _ = send(Json::obj([("error", Json::obj([("message", Json::str(e)), ("type", Json::str("server_error")), ("code", Json::str(if e.contains(crate::repetition::CODE) { crate::repetition::CODE } else { "server_error" }))]))]));
+                    let _ = send(Json::obj([("error", Json::obj([("message", Json::str(e)), ("type", Json::str("server_error")), ("code", Json::str(if e.contains(crate::repetition::CODE) { crate::repetition::CODE } else if e.contains(crate::observer::CODE) { crate::observer::CODE } else { "server_error" }))]))]));
                 } else {
                     if !tool_calls.is_empty() {
                         send(chunk(Json::obj([("tool_calls", Json::Arr(tool_calls))]), None)).map_err(io_err)?;
@@ -654,8 +667,9 @@ impl Server {
                 }
                 if let Some(e) = error {
                     let repetition = e.contains(crate::repetition::CODE);
-                    return Err(ApiError { status: if repetition { 422 } else { 500 }, message: e,
-                        code: if repetition { crate::repetition::CODE } else { "server_error" } });
+                    let observer = e.contains(crate::observer::CODE);
+                    return Err(ApiError { status: if repetition || observer { 422 } else { 500 }, message: e,
+                        code: if repetition { crate::repetition::CODE } else if observer { crate::observer::CODE } else { "server_error" } });
                 }
                 let mut message = vec![
                     ("role".to_string(), Json::str("assistant")),
@@ -710,7 +724,7 @@ impl Server {
         }
         let n_prompt = prompt.len();
         let stream = body.get("stream").and_then(Json::as_bool).unwrap_or(false);
-        let (rx, cancel) = self.submit(&a, prompt, Vec::new(), sampling, max_tokens, None, false)?;
+        let (rx, cancel) = self.submit(&a, prompt, Vec::new(), sampling, max_tokens, None, false, String::new())?;
         let peer = w.try_clone().ok();
         let id = random_id("cmpl-");
         let created = now();
@@ -900,4 +914,17 @@ mod tests {
         let body = Json::parse(br#"{"messages":[{"role":"user","content":"hi"}],"tool_choice":"none","tools":[{"type":"function","function":{"name":"f"}}]}"#).unwrap();
         assert_eq!(Server::messages(&body).ok().unwrap().len(), 1);
     }
+}
+
+fn observer_context(body: &Json) -> String {
+    let task = body.get("messages").and_then(Json::as_array).and_then(|m| m.iter().rev()
+        .find(|m| m.get("role").and_then(Json::as_str) == Some("user")))
+        .and_then(|m|m.get("content")).cloned().unwrap_or(Json::Null);
+    let recent: Vec<Json> = body.get("messages").and_then(Json::as_array).into_iter().flatten()
+        .filter(|m|m.get("role").and_then(Json::as_str)!=Some("system")).rev().take(6)
+        .map(|m|Json::obj([("role",m.get("role").cloned().unwrap_or(Json::Null)),
+            ("content_excerpt",Json::str(m.get("content").map(Json::to_json).unwrap_or_default().chars().take(800).collect::<String>()))])).collect();
+    Json::obj([("latest_user_request", task), ("tools", body.get("tools").cloned().unwrap_or(Json::Null)),
+        ("review_progress",body.get("nrob_review_progress").cloned().unwrap_or(Json::Bool(false))),
+        ("recent_context",Json::Arr(recent))]).to_json()
 }

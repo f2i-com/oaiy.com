@@ -777,8 +777,7 @@ impl GpuModel {
         for d in &mut self.devs {
             d.g.sync()?;
             let budget = d.dcache.slots() * ternary_record;
-            let fp4_slots = (budget / 5 / fp4_record).max(1);
-            let ternary_slots = ((budget - fp4_slots * fp4_record) / ternary_record).max(1);
+            let (ternary_slots, fp4_slots) = hybrid_device_slots(budget, ternary_record, fp4_record);
             // Release the initially empty full-size allocation before repartitioning.
             let placeholder = DeviceExpertCache::new(&d.g, 1, ternary_record)?;
             drop(std::mem::replace(&mut d.dcache, placeholder));
@@ -804,7 +803,8 @@ impl GpuModel {
         if self.alternate_store.is_none() || self.ternary != original { return Ok(false); }
         // Fail closed if a device/cache reset fails part way through.
         self.expert_switch_failed = true;
-        if let Some(w) = self.warming.take() { w.stop(); }
+        // The warmer owns its own cache and store Arcs. Keep filling the
+        // ternary bank while Q4 tool turns briefly use the alternate bank.
         for d in &self.devs { d.g.sync()?; }
         self.cpu = None; // join every CPU expert worker before changing its format
         let record = self.alternate_store.as_ref().unwrap().record_bytes();
@@ -2548,5 +2548,24 @@ impl Backbone for GpuModel {
         let out = self.run(ids, start_pos, teacher, Some(trace), &images);
         self.trace_images = images;
         out
+    }
+}
+
+// Both banks need one slot even when the nominal cache budget is tiny.
+fn hybrid_device_slots(budget: usize, ternary_record: usize, fp4_record: usize) -> (usize,usize) {
+    let fp4 = (budget / 5 / fp4_record).max(1);
+    ((budget.saturating_sub(fp4 * fp4_record) / ternary_record).max(1), fp4)
+}
+
+#[cfg(test)]
+mod observer_cache_budget_tests {
+    #[test]
+    fn tiny_hybrid_budget_does_not_wrap() {
+        let ternary_record = dsv41::ternary::RECORD_BYTES;
+        let fp4_record = dsv41::expert::RECORD_BYTES;
+        let budget = ternary_record;
+        let (ternary_slots, fp4_slots) = super::hybrid_device_slots(budget, ternary_record, fp4_record);
+        assert_eq!(ternary_slots, 1);
+        assert_eq!(fp4_slots, 1);
     }
 }

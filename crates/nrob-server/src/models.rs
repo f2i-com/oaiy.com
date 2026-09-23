@@ -347,11 +347,19 @@ impl Models {
         use dsv41_cuda::{GpuModel, GpuOptions};
 
         let o = &self.opts;
-        let devices = if o.devices.is_empty() {
-            (0..dsv41_cuda::gpu::device_count()?.min(2)).collect()
-        } else {
-            o.devices.clone()
-        };
+        let count = dsv41_cuda::gpu::device_count()?;
+        let devices = available_devices(&o.devices, count)?;
+        if !o.devices.is_empty() && devices != o.devices {
+            self.say(format!("available GPU selection: {:?} (requested {:?})", devices, o.devices));
+        }
+        let observer_device = if o.observer_device < count { o.observer_device }
+            else { *devices.last().ok_or_else(||nrob::Error::Arg("no CUDA device available".into()))? };
+        // Load the reviewer FIRST, so DeepSeek sizes its caches from the VRAM
+        // genuinely remaining. Both stay resident; model routing is unchanged.
+        let observer = o.observer_model.as_deref().map(|path| {
+            self.say(format!("loading resident observer {} on GPU {}", path.display(), observer_device));
+            crate::observer::Observer::load_shared(path, observer_device, o.observer_vram_gb, devices.contains(&observer_device))
+        }).transpose()?;
         let tok = Arc::new(dsv41::tokenizer::Tokenizer::load(&spec.path)?);
         let gopts = GpuOptions {
             devices,
@@ -373,10 +381,10 @@ impl Models {
         let tool_experts = tool_source.is_some();
         if let Some(source) = tool_source { model.enable_tool_experts(source)?; }
         if let Some(path) = &o.expert_trace { model.enable_route_log(path)?; }
-        if let Some(path) = o.usage.as_ref().filter(|p| !tool_experts && p.exists()) {
+        if let Some((path, bank)) = startup_warm_profile(o.usage.as_deref(), tool_experts) {
             let (vram, queued) = model.warm(path, 4)?;
             self.say(format!(
-                "warmed {vram} experts into VRAM; {queued} more loading into RAM in the background"
+                "warmed {vram} {bank} experts into VRAM; {queued} more loading into RAM in the background"
             ));
         }
 
@@ -401,8 +409,11 @@ impl Models {
         );
         e.warn = !o.silent;
         e.tool_experts = tool_experts;
+        e.observer = observer;
         e.repetition_guard = o.repetition_guard;
-        if tool_experts {
+        if e.observer.is_some() {
+            self.say("Observer mode: ternary tool drafts; bounded MXFP4 suffix repairs; tools withheld until review".into());
+        } else if tool_experts {
             self.say("DSML boundary precision: ternary prompt/prose; MXFP4 tool payload; 80/20 expert cache budgets; trunk retained".into());
         }
         if let Some(dir) = &o.prompt_cache {
@@ -556,9 +567,27 @@ impl Models {
     }
 }
 
+/// A hybrid model starts with its ternary expert bank selected. Its Q4 bank
+/// can still fill on demand, but the usage profile should warm the bank that
+/// serves prompt and prose turns immediately after startup.
+fn startup_warm_profile(usage: Option<&Path>, tool_experts: bool) -> Option<(&Path, &'static str)> {
+    usage.filter(|p| p.is_file())
+        .map(|p| (p, if tool_experts { "ternary" } else { "model" }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hybrid_startup_warms_its_ternary_bank_from_an_existing_profile() {
+        let path = std::env::temp_dir().join(format!("nrob-warm-{}.txt", std::process::id()));
+        std::fs::write(&path, b"# profile\n20 1 5\n").unwrap();
+        assert_eq!(startup_warm_profile(Some(&path), true), Some((path.as_path(), "ternary")));
+        assert_eq!(startup_warm_profile(Some(&path), false), Some((path.as_path(), "model")));
+        std::fs::remove_file(&path).unwrap();
+        assert!(startup_warm_profile(Some(&path), true).is_none());
+    }
 
     #[test]
     fn expert_sources_are_scoped_to_the_requested_model() {
@@ -618,4 +647,19 @@ mod tests {
         let err = Models::new(o, true).map(|_| ()).unwrap_err().to_string();
         assert!(err.contains("both called same"), "got {err}");
     }
+}
+
+fn available_devices(requested: &[usize], count: usize) -> Result<Vec<usize>> {
+    if count == 0 { return Err(nrob::Error::Arg("DeepSeek currently requires a CUDA GPU for its trunk and state".into())); }
+    let mut devices: Vec<usize> = requested.iter().copied().filter(|&d|d<count).collect();
+    devices.dedup();
+    if devices.is_empty() { devices.extend(0..count.min(2)); }
+    Ok(devices)
+}
+#[test]
+fn gpu_selection_adapts_to_single_device() {
+    assert_eq!(available_devices(&[0,1],1).unwrap(),vec![0]);
+    assert_eq!(available_devices(&[],2).unwrap(),vec![0,1]);
+    assert_eq!(available_devices(&[1],1).unwrap(),vec![0]);
+    assert!(available_devices(&[],0).is_err());
 }

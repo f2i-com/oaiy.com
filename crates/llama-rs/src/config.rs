@@ -214,7 +214,12 @@ impl ModelConfig {
 
         let context_length = get_u64("context_length")? as usize;
         let embedding_dim  = get_u64("embedding_length")? as usize;
-        let n_layers       = get_u64("block_count")? as usize;
+        let stored_layers = get_u64("block_count")? as usize;
+        // Qwen GGUFs include NextN/MTP blocks after the ordinary trunk. They
+        // predict future tokens and must not run as extra sequential layers.
+        let n_layers = if arch == Architecture::Qwen35 {
+            qwen_trunk_layers(stored_layers, get_u64_or("nextn_predict_layers", 0) as usize)?
+        } else { stored_layers };
         // Gemma 3n stores `feed_forward_length` as a per-layer array, not a
         // scalar — the stub loader doesn't use the value, so 0 is a safe sentinel.
         let ff_dim         = get_u64("feed_forward_length").map(|v| v as usize).unwrap_or(0);
@@ -396,4 +401,21 @@ impl ModelConfig {
     }
 
     pub fn n_rep(&self) -> usize { self.n_heads / self.n_kv_heads }
+}
+
+fn qwen_trunk_layers(stored: usize, prediction: usize) -> Result<usize> {
+    stored.checked_sub(prediction).filter(|&n| n > 0)
+        .ok_or_else(|| LlamaError::Config("invalid Qwen NextN/trunk layer count".into()))
+}
+
+#[cfg(test)]
+mod observer_config_tests {
+    use super::*;
+    #[test]
+    fn nextn_is_not_a_sequential_trunk_layer() {
+        assert_eq!(qwen_trunk_layers(65, 1).unwrap(), 64);
+        assert_eq!(qwen_trunk_layers(64, 0).unwrap(), 64);
+        assert!(qwen_trunk_layers(1, 1).is_err());
+        assert!(qwen_trunk_layers(1, 2).is_err());
+    }
 }

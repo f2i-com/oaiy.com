@@ -803,6 +803,41 @@ enum Phase {
     ToolCalls,
 }
 
+/// Streaming code-span/fence tracker: quoted markers are data.
+#[derive(Default)]
+struct LiteralCode {
+    delimiter: Option<(char, usize)>,
+    run: Option<(char, usize)>,
+    escaped: bool,
+}
+impl LiteralCode {
+    fn flush_run(&mut self) {
+        let Some((ch, n)) = self.run.take() else { return; };
+        match self.delimiter {
+            None if ch == '`' || n >= 3 => self.delimiter = Some((ch, n)),
+            Some((old, len)) if ch == old && (n == len || len >= 3 && n >= len) => self.delimiter = None,
+            _ => {}
+        }
+    }
+    fn push(&mut self, text: &str) {
+        for ch in text.chars() {
+            if self.escaped { self.escaped = false; continue; }
+            if matches!(ch, '`' | '~') {
+                if self.run.is_some_and(|(old, _)| old != ch) { self.flush_run(); }
+                let run = self.run.get_or_insert((ch, 0));
+                run.1 += 1;
+            } else {
+                self.flush_run();
+                if ch == '\\' && self.delimiter.is_none() { self.escaped = true; }
+            }
+        }
+    }
+    fn contains_next_marker(&mut self) -> bool {
+        self.flush_run();
+        self.delimiter.is_some() || self.escaped
+    }
+}
+
 /// Splits streamed completion text into reasoning and content, holding back
 /// any tail that might be the start of `</think>` or a tool-calls block,
 /// and collects the tool-calls block for [`finish`](Self::finish).
@@ -811,13 +846,14 @@ pub struct StreamParser {
     pending: String,
     calls: String,
     completed: Option<Vec<ToolCall>>,
+    literal: LiteralCode,
 }
 
 impl StreamParser {
     /// `mode` is the prompt's: thinking mode starts inside the reasoning.
     pub fn new(mode: Mode) -> StreamParser {
         let phase = if mode == Mode::Thinking { Phase::Reasoning } else { Phase::Content };
-        StreamParser { phase, pending: String::new(), calls: String::new(), completed: None }
+        StreamParser { phase, pending: String::new(), calls: String::new(), completed: None, literal: LiteralCode::default() }
     }
 
     /// Feed more text; returns what can be shown now.
@@ -830,40 +866,62 @@ impl StreamParser {
         }
         loop {
             match self.phase {
-                Phase::Reasoning => match self.pending.find(THINK_END) {
-                    Some(p) => {
-                        emit(&mut out, Delta::Reasoning(self.pending[..p].to_string()));
-                        self.pending.drain(..p + THINK_END.len());
-                        self.phase = Phase::Content;
-                    }
-                    None => {
-                        let keep = held(&self.pending, THINK_END);
+                Phase::Reasoning | Phase::Content => {
+                    let calls_start = format!("<{DSML} calls");
+                    let markers: Vec<&str> = if self.phase == Phase::Content {
+                        vec![THINK_START, THINK_END, &calls_start]
+                    } else { vec![THINK_START, THINK_END] };
+                    let found = markers.iter().filter_map(|marker|
+                        self.pending.find(marker).map(|p| (p, *marker))
+                    ).min_by_key(|(p, _)| *p);
+                    let Some((p, marker)) = found else {
+                        let mut keep = markers.iter().map(|m| held(&self.pending, m)).max().unwrap_or(0);
+                        if self.phase == Phase::Content { keep = keep.max(held(&self.pending, TOOL_CALLS_START)); }
                         let shown: String = self.pending.drain(..self.pending.len() - keep).collect();
-                        emit(&mut out, Delta::Reasoning(shown));
+                        self.literal.push(&shown);
+                        emit(&mut out, if self.phase == Phase::Reasoning { Delta::Reasoning(shown) } else { Delta::Content(shown) });
                         return out;
-                    }
-                },
-                Phase::Content => match self.pending.find(&format!("<{DSML} calls")) {
-                    Some(p) => {
-                        let content = self.pending[..p].strip_suffix("\n\n").unwrap_or(&self.pending[..p]);
-                        emit(&mut out, Delta::Content(content.to_string()));
+                    };
+                    let prefix = self.pending[..p].to_string();
+                    self.literal.push(&prefix);
+                    let literal = self.literal.contains_next_marker();
+                    let shown = if !literal && marker == calls_start {
+                        prefix.strip_suffix("\n\n").unwrap_or(&prefix).to_string()
+                    } else { prefix };
+                    emit(&mut out, if self.phase == Phase::Reasoning { Delta::Reasoning(shown) } else { Delta::Content(shown) });
+                    if literal {
+                        self.literal.push(marker);
+                        emit(&mut out, if self.phase == Phase::Reasoning { Delta::Reasoning(marker.to_string()) } else { Delta::Content(marker.to_string()) });
+                        self.pending.drain(..p + marker.len());
+                    } else if marker == calls_start {
                         self.calls = self.pending[p..].to_string();
                         self.pending.clear();
                         self.phase = Phase::ToolCalls;
                         self.try_complete();
                         return out;
+                    } else {
+                        // Idempotent boundaries; later openings allow rethinking.
+                        self.phase = if marker == THINK_START { Phase::Reasoning } else { Phase::Content };
+                        self.pending.drain(..p + marker.len());
                     }
-                    None => {
-                        let keep = held(&self.pending, TOOL_CALLS_START).max(held(&self.pending, &format!("<{DSML} calls")));
-                        let shown: String = self.pending.drain(..self.pending.len() - keep).collect();
-                        emit(&mut out, Delta::Content(shown));
-                        return out;
-                    }
-                },
+                }
                 Phase::ToolCalls => { self.try_complete(); return out; },
             }
         }
     }
+
+    /// An explicit inference budget can close even an unfinished quoted span.
+    pub fn end_reasoning(&mut self) -> Vec<Delta> {
+        if self.phase != Phase::Reasoning { return Vec::new(); }
+        self.phase = Phase::Content;
+        self.literal = LiteralCode::default();
+        let mut out = Vec::new();
+        emit(&mut out, Delta::Reasoning(std::mem::take(&mut self.pending)));
+        out
+    }
+
+    /// Current channel, including reasoning reopened during an answer.
+    pub fn is_reasoning(&self) -> bool { self.phase == Phase::Reasoning }
 
     fn try_complete(&mut self) {
         if self.calls.contains(&format!("</{DSML}")) {
@@ -953,6 +1011,61 @@ fn held(s: &str, marker: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn thinking_can_reopen_and_redundant_closes_are_boundaries() {
+        let text = "first</think>draft<think>recheck</think></think>revised";
+        for step in [1, 2, 7, 1000] {
+            let mut parser = StreamParser::new(Mode::Thinking);
+            let mut pieces = Vec::new();
+            for chunk in text.as_bytes().chunks(step) {
+                pieces.extend(parser.push(std::str::from_utf8(chunk).unwrap()));
+            }
+            let (rest, calls) = parser.finish(); pieces.extend(rest);
+            assert!(calls.is_empty());
+            let reasoning: String = pieces.iter().filter_map(|d| if let Delta::Reasoning(s)=d {Some(s.as_str())} else {None}).collect();
+            let content: String = pieces.iter().filter_map(|d| if let Delta::Content(s)=d {Some(s.as_str())} else {None}).collect();
+            assert_eq!(reasoning, "firstrecheck");
+            assert_eq!(content, "draftrevised");
+        }
+    }
+
+    #[test]
+    fn reopening_preserves_delta_order_and_forced_close_can_end_a_code_span() {
+        let mut parser = StreamParser::new(Mode::Chat);
+        assert_eq!(parser.push("draft<think>recheck</think>revised"), vec![
+            Delta::Content("draft".into()), Delta::Reasoning("recheck".into()), Delta::Content("revised".into())]);
+        parser.push("<think>`unfinished");
+        assert!(parser.is_reasoning());
+        parser.end_reasoning();
+        assert!(!parser.is_reasoning());
+        assert_eq!(parser.push("</think>answer"), vec![Delta::Content("answer".into())]);
+    }
+
+    #[test]
+    fn thinking_tags_inside_tool_parameters_are_data() {
+        let body = format!("<{DSML} calls>\n<{DSML} invoke name=\"write_file\">\n<{DSML} parameter name=\"content\" string=\"true\"><think>x</think></{DSML} parameter>\n</{DSML} invoke>\n</{DSML} calls>");
+        let mut parser = StreamParser::new(Mode::Chat);
+        for ch in body.chars() { parser.push(&ch.to_string()); }
+        let (_, calls) = parser.finish();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(Json::parse(calls[0].arguments.as_bytes()).unwrap().get("content").and_then(Json::as_str), Some("<think>x</think>"));
+    }
+
+    #[test]
+    fn literal_thinking_markers_survive_code_spans_and_fences() {
+        for text in ["Use `</think>` here.", "```xml\n<think>x</think>\n```", "~~~xml\n</think>\n~~~", "``a ` </think> b``"] {
+            let mut parser = StreamParser::new(Mode::Chat);
+            let mut shown = String::new();
+            for ch in text.chars() {
+                for delta in parser.push(&ch.to_string()) {
+                    if let Delta::Content(s) = delta { shown.push_str(&s); } else { panic!("literal became reasoning"); }
+                }
+            }
+            for delta in parser.finish().0 { if let Delta::Content(s)=delta {shown.push_str(&s);} }
+            assert_eq!(shown, text);
+        }
+    }
 
     #[test]
     fn runtime_handles_reported_mixed_tags_and_stops_before_invented_results() {

@@ -264,6 +264,14 @@ impl Model {
     pub fn new_kv_cache(&self, max_len: usize) -> KvCache {
         let cfg = self.config();
         let len = max_len.min(cfg.context_length);
+        // Recurrent Qwen blocks use ssm_state/ssm_conv, never attention K/V.
+        // Keep tiny nonzero placeholders (CUDA does not require zero-byte allocs)
+        // and allocate full K/V only for actual attention layers.
+        if let Self::Qwen35(m) = self {
+            let heads: Vec<usize> = m.attention_layers.iter().map(|&a| if a {cfg.n_kv_heads} else {1}).collect();
+            let dims: Vec<usize> = m.attention_layers.iter().map(|&a| if a {cfg.head_dim} else {1}).collect();
+            return KvCache::new_per_layer_kv(self.backend().as_ref(), len, &heads, &dims);
+        }
         // Gemma 4 MoE (26B-A4B): per-layer n_kv_heads varies (SWA=8, global=2)
         // AND per-layer head_dim varies. Read both from each layer's loaded
         // tensors so the cache matches the model exactly.

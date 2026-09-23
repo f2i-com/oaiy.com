@@ -145,6 +145,9 @@ impl DeviceStorage for CudaStorage {
 // ----- Backend --------------------------------------------------------------
 
 pub struct CudaBackend {
+    weight_budget: usize,
+    weight_resident: std::sync::atomic::AtomicUsize,
+    streamed_bytes: std::sync::atomic::AtomicU64,
     // VENDORED-LOCAL: GPU-02 — `ctx`/`stream`/`name` widened to pub(crate) so
     // the transfer module (pinned staging + H2D overlap) can build on them.
     pub(crate) ctx:    Arc<CudaContext>,
@@ -220,6 +223,9 @@ impl CudaBackend {
         unsafe { ctx.disable_event_tracking() };
 
         Ok(Self {
+            weight_budget: usize::MAX,
+            weight_resident: Default::default(),
+            streamed_bytes: Default::default(),
             ctx,
             stream,
             module,
@@ -231,6 +237,13 @@ impl CudaBackend {
         })
     }
 
+    /// Bound persistent packed weights; other mapped weights upload on demand.
+    /// Dense activations/norms and temporary staging are outside this budget.
+    pub fn with_weight_budget(mut self, bytes: usize) -> Self { self.weight_budget = bytes; self }
+    pub fn weight_stats(&self) -> (usize, u64) {
+        (self.weight_resident.load(std::sync::atomic::Ordering::Relaxed),
+         self.streamed_bytes.load(std::sync::atomic::Ordering::Relaxed))
+    }
     // VENDORED-LOCAL: GPU-02 — the H2D transfer stream, created on first use
     // (see the `h2d` field comment for why this must not happen in `new`).
     pub(crate) fn h2d(&self) -> &Arc<CudaStream> {
@@ -310,6 +323,40 @@ impl CudaBackend {
         )
     }
 
+    /// Stream output-row tiles without expanding the packed weight matrix.
+    /// Only the small result is assembled on host; subsequent ops upload it.
+    fn linear_q_tiled(&self, x: &Tensor, w: &QuantizedTensor, tile_rows: usize) -> Tensor {
+        let input = w.dim(1);
+        let output = w.dim(0);
+        let batch = x.numel() / input;
+        let row_bytes = input / w.dtype().block_size() * w.dtype().type_size();
+        let mut values = vec![0.0; batch * output];
+        let mut first = 0;
+        let mut rows = tile_rows.max(1);
+        while first < output {
+            let count = rows.min(output - first);
+            let bytes = &w.bytes()[first * row_bytes..(first + count) * row_bytes];
+            let device = match self.stream.memcpy_stod(bytes) {
+                Ok(device) => device,
+                Err(_) if count > 1 => { rows = (count / 2).max(1); continue; }
+                Err(e) => panic!("insufficient VRAM even for one packed weight row; model state/activations must fit: {e:?}"),
+            };
+            self.streamed_bytes.fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            let tile = QuantizedTensor::from_device(Box::new(CudaQuantStorage {
+                bytes: device, dtype: w.dtype(), stream: self.stream.clone(), name: self.name.clone(),
+            }), vec![count, input]);
+            let result = self.linear_q(x, &tile).to_host();
+            for b in 0..batch {
+                values[b * output + first..b * output + first + count]
+                    .copy_from_slice(&result.data()[b * count..(b + 1) * count]);
+            }
+            first += count;
+        }
+        let mut shape = x.shape().to_vec();
+        *shape.last_mut().unwrap() = output;
+        Tensor::from_vec(values, shape)
+    }
+
     /// Borrow `&CudaSlice<u8>` for a quantized tensor that may be on host or
     /// device. Mirrors `cuda_input` for F32 tensors.
     fn cuda_quant_input<'a>(&self, w: &'a QuantizedTensor) -> CudaQuantInput<'a> {
@@ -319,6 +366,7 @@ impl CudaBackend {
             }
             panic!("QuantizedTensor on `{}` passed to CudaBackend", s.device_name());
         }
+        self.streamed_bytes.fetch_add(w.nbytes() as u64, std::sync::atomic::Ordering::Relaxed);
         let bytes = self.stream.memcpy_stod(w.bytes()).expect("h2d quant input");
         CudaQuantInput::Owned(bytes)
     }
@@ -430,6 +478,7 @@ impl<'a> CudaQuantInput<'a> {
 // ----- Backend impl ---------------------------------------------------------
 
 impl Backend for CudaBackend {
+    fn streams_weights(&self) -> bool { self.weight_budget != usize::MAX }
     fn name(&self) -> &str { &self.name }
 
     // VENDORED-LOCAL: MOE-01 — downcast support for the grouped-MoE fast
@@ -474,10 +523,26 @@ impl Backend for CudaBackend {
             panic!("to_device_quant: tensor is on `{}`, can't migrate to `{}`",
                    s.device_name(), self.name);
         }
-        let bytes = w.bytes().to_vec();
+        // A configured cap is an upper bound, not permission to exhaust VRAM.
+        // Preserve 2 GiB for this model's state/temporary uploads at load time.
+        if self.streams_weights() && self.vram_status().is_some_and(|(free,_)|
+            free < w.nbytes().saturating_add(2usize << 30)) { return w; }
+        if !reserve_weight(&self.weight_resident, self.weight_budget, w.nbytes()) { return w; }
         let shape = w.shape().to_vec();
         let dtype = w.dtype();
-        self.upload_quantized(&bytes, shape, dtype)
+        // A concurrent GPU user can consume memory after the free-space check.
+        // Keep the mapped packed tensor if its permanent upload no longer fits.
+        let bytes = match self.stream.memcpy_stod(w.bytes()) {
+            Ok(bytes) => bytes,
+            Err(_) if self.streams_weights() => {
+                self.weight_resident.fetch_sub(w.nbytes(), std::sync::atomic::Ordering::Relaxed);
+                return w;
+            }
+            Err(e) => panic!("h2d quant: {e:?}"),
+        };
+        QuantizedTensor::from_device(Box::new(CudaQuantStorage {
+            bytes, dtype, stream: self.stream.clone(), name: self.name.clone(),
+        }), shape)
     }
 
     fn to_device(&self, t: Tensor) -> Tensor {
@@ -729,6 +794,20 @@ impl Backend for CudaBackend {
         let out = w.dim(0);
         debug_assert_eq!(w.dim(1), in_);
         let m_rows = x.numel() / in_;
+
+        // For offloaded weights, do not require the largest matrix to fit
+        // in one allocation. Bound the temporary packed upload by free VRAM.
+        if self.streams_weights() && w.is_cpu() && in_ % w.dtype().block_size() == 0 {
+            if let Some((free, _)) = self.vram_status() {
+                let scratch = (x.numel() + m_rows * out).saturating_mul(4).saturating_add(256 << 20);
+                let room = free.saturating_sub(scratch) / 2;
+                if w.nbytes() > room {
+                    let row_bytes = in_ / w.dtype().block_size() * w.dtype().type_size();
+                    let rows = (room.min(64 << 20) / row_bytes).max(1).min(out);
+                    return self.linear_q_tiled(x, w, rows);
+                }
+            }
+        }
 
         let kernel_name = match w.dtype() {
             GgmlType::Q8_0 => "linear_q8_0_f32",
@@ -2201,5 +2280,44 @@ impl Backend for CudaBackend {
                 .expect("argmax launch");
         }
         self.stream.memcpy_dtov(&out).expect("d2h argmax")
+    }
+}
+
+fn reserve_weight(used: &std::sync::atomic::AtomicUsize, limit: usize, bytes: usize) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    used.fetch_update(Relaxed, Relaxed, |n| n.checked_add(bytes).filter(|&n|n <= limit)).is_ok()
+}
+#[cfg(test)]
+mod observer_weight_budget_tests {
+    use super::*;
+    #[test]
+    #[ignore = "explicit CUDA packed-tile regression"]
+    fn streamed_q4_tiles_match_resident_weights() {
+        let backend = CudaBackend::new(0).unwrap().with_weight_budget(0);
+        let mut bytes = vec![0u8; 7 * 4 * 144];
+        for (i, block) in bytes.chunks_mut(144).enumerate() {
+            block[..2].copy_from_slice(&0x3c00u16.to_le_bytes());
+            block[4..16].fill(1);
+            block[16..].fill((i % 13 + 1) as u8);
+        }
+        let w = QuantizedTensor::from_bytes_cpu(bytes.clone(),vec![7,1024],GgmlType::Q4_K);
+        for batch in [1,3] {
+            let x = Tensor::from_vec((0..batch*1024).map(|i|(i%17) as f32/17.0).collect(),vec![batch,1024]);
+            let resident = backend.upload_quantized(w.bytes(),w.shape().to_vec(),w.dtype());
+            let expected = backend.linear_q(&x,&resident).to_host();
+            let actual = backend.linear_q_tiled(&x,&w,2);
+            assert_eq!(actual.shape(),expected.shape());
+            for (a,b) in actual.data().iter().zip(expected.data()) { assert!((a-b).abs() <= 1e-4 * b.abs().max(1.0)); }
+        }
+        assert_eq!(w.bytes(),bytes.as_slice());
+    }
+    #[test]
+    fn packed_weight_reservation_never_exceeds_budget() {
+        let used = std::sync::atomic::AtomicUsize::new(0);
+        assert!(reserve_weight(&used, 100, 60));
+        assert!(!reserve_weight(&used, 100, 41));
+        assert!(reserve_weight(&used, 100, 40));
+        assert!(!reserve_weight(&used, 100, usize::MAX));
+        assert_eq!(used.load(std::sync::atomic::Ordering::Relaxed), 100);
     }
 }

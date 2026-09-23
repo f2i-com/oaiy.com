@@ -23,6 +23,8 @@ pub enum RopeType {
 /// Operations needed by a transformer forward pass.
 pub trait Backend: Send + Sync + Debug + 'static {
     fn name(&self) -> &str;
+    /// Keep unfused mapped weights available for host/SSD streaming.
+    fn streams_weights(&self) -> bool { false }
 
     // VENDORED-LOCAL: MOE-01 — downcast support so model code can reach
     // backend-specific fast paths (the CUDA grouped-MoE kernels) without

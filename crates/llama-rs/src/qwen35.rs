@@ -160,7 +160,8 @@ pub struct Qwen35Model {
     pub attention_layers: Vec<bool>,
     pub tokenizer: Tokenizer,
     pub blocks:    Vec<Qwen35Block>,
-    pub tok_embd:  Arc<Tensor>,
+    pub tok_embd: Option<Arc<Tensor>>,
+    pub packed_tok_embd: Option<QuantizedTensor>,
     pub output_norm: Tensor,
     pub output:    Weight,
     pub backend:   Arc<dyn Backend>,
@@ -209,9 +210,20 @@ impl Qwen35Model {
             .collect();
 
         // ----- Common embeddings + LM head -----------------------------
-        let tok_embd    = Arc::new(idx.take("token_embd.weight",  &["tok_embeddings.weight"])?);
+        // Keep an untied packed embedding table mapped, decoding only selected
+        // token rows. A 248k-vocabulary table must not become a permanent FP32 copy.
+        let packed = g.tensor_by_name("token_embd.weight").filter(|info|
+            crate::loader::dtype_supports_packed_matmul(info.dtype) &&
+            config.embedding_dim % info.dtype.block_size() == 0 && g.tensor_by_name("output.weight").is_some());
+        let (tok_embd, packed_tok_embd, output) = if let Some(info) = packed {
+            let Weight::Quant(q) = Weight::load(g, info)? else { unreachable!() };
+            (None, Some(q), idx.take_weight("output.weight", &[])?)
+        } else {
+            let table = Arc::new(idx.take("token_embd.weight", &["tok_embeddings.weight"])?);
+            let output = load_lm_head_or_tied(&idx, &table)?;
+            (Some(table), None, output)
+        };
         let output_norm = idx.take("output_norm.weight", &["norm.weight"])?;
-        let output = load_lm_head_or_tied(&idx, &tok_embd)?;
 
         // ----- Per-layer block tensors ---------------------------------
         let mut blocks = Vec::with_capacity(config.n_layers);
@@ -229,7 +241,7 @@ impl Qwen35Model {
                     ffn_pair:    {
                         let g = idx.take_weight(&format!("blk.{i}.ffn_gate.weight"), &[])?;
                         let u = idx.take_weight(&format!("blk.{i}.ffn_up.weight"),   &[])?;
-                        FfnPair::from_halves(g, u)
+                        if backend.streams_weights() { FfnPair::Split {gate:g, up:u} } else { FfnPair::from_halves(g, u) }
                     },
                     ffn_down:    idx.take_weight(&format!("blk.{i}.ffn_down.weight"), &[])?,
                 }
@@ -251,7 +263,7 @@ impl Qwen35Model {
                     ffn_pair:    {
                         let g = idx.take_weight(&format!("blk.{i}.ffn_gate.weight"), &[])?;
                         let u = idx.take_weight(&format!("blk.{i}.ffn_up.weight"),   &[])?;
-                        FfnPair::from_halves(g, u)
+                        if backend.streams_weights() { FfnPair::Split {gate:g, up:u} } else { FfnPair::from_halves(g, u) }
                     },
                     ffn_down:    idx.take_weight(&format!("blk.{i}.ffn_down.weight"), &[])?,
                 }
@@ -260,7 +272,10 @@ impl Qwen35Model {
         }
 
         // Move embeddings + LM head onto the backend (tied path shares Arc).
-        let (tok_embd, output) = upload_tok_embd_and_lm_head(&*backend, tok_embd, output);
+        let (tok_embd, output) = if let Some(table) = tok_embd {
+            let (table, head) = upload_tok_embd_and_lm_head(&*backend, table, output);
+            (Some(table), head)
+        } else { (None, output) };
         let output_norm = backend.to_device(output_norm);
         let output      = output.to_device(&*backend);
         let blocks: Vec<Qwen35Block> = blocks.into_iter().map(|b| upload_block(b, &*backend)).collect();
@@ -268,7 +283,7 @@ impl Qwen35Model {
         Ok(Self {
             config, ssm_cfg, attention_layers,
             tokenizer, blocks,
-            tok_embd, output_norm, output,
+            tok_embd, packed_tok_embd, output_norm, output,
             backend,
         })
     }
@@ -301,7 +316,12 @@ impl Qwen35Model {
     /// vision-language splice path; standard text-only callers can stay on
     /// [`forward`] and don't need to touch this directly.
     pub fn embed_text(&self, tokens: &[u32]) -> Tensor {
-        self.backend.embed_lookup(&self.tok_embd, tokens, self.config.embedding_dim)
+        if let Some(packed) = &self.packed_tok_embd {
+            let rows = packed_embedding_rows(packed, tokens);
+            self.backend.to_device(rows)
+        } else {
+            self.backend.embed_lookup(self.tok_embd.as_ref().expect("embedding table"), tokens, self.config.embedding_dim)
+        }
     }
 
     pub fn forward(&self, tokens: &[u32], kv: &mut KvCache) -> Result<Tensor> {
@@ -896,5 +916,36 @@ fn upload_block(b: Qwen35Block, backend: &dyn Backend) -> Qwen35Block {
             ffn_pair:    ffn_pair.try_to_device(backend, m),
             ffn_down:    ffn_down.try_to_device(backend, m),
         },
+    }
+}
+
+fn packed_embedding_rows(table: &QuantizedTensor, tokens: &[u32]) -> Tensor {
+    let width = table.dim(1);
+    let row_bytes = width / table.dtype().block_size() * table.dtype().type_size();
+    let bytes = table.bytes();
+    let mut output = vec![0.0; tokens.len() * width];
+    for (i, &token) in tokens.iter().enumerate() {
+        assert!((token as usize) < table.dim(0), "embedding token outside vocabulary");
+        let offset = token as usize * row_bytes;
+        ggml_quants::dequantize(table.dtype(), &bytes[offset..offset + row_bytes],
+            &mut output[i * width..(i+1)*width]).expect("validated packed embedding");
+    }
+    Tensor::from_vec(output, vec![tokens.len(), width])
+}
+#[cfg(test)]
+mod packed_embedding_tests {
+    use super::*;
+    #[test]
+    fn packed_rows_match_full_dequantization_in_requested_order() {
+        let dtype = ggml_quants::GgmlType::Q4_0;
+        let mut bytes = vec![0u8; 3 * 18];
+        for row in 0..3 { bytes[row*18..row*18+2].copy_from_slice(&[0,60]);
+            bytes[row*18+2..(row+1)*18].fill((row as u8+1)*17); }
+        let mut full = vec![0.0;96];
+        ggml_quants::dequantize(dtype, &bytes, &mut full).unwrap();
+        let table = QuantizedTensor::from_bytes_cpu(bytes.clone(), vec![3,32], dtype);
+        let selected = packed_embedding_rows(&table,&[2,0,2]);
+        assert_eq!(selected.data(), [&full[64..96],&full[..32],&full[64..96]].concat());
+        assert_eq!(table.bytes(),bytes); // original packed source unchanged
     }
 }

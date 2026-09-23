@@ -64,6 +64,7 @@ pub struct JobImage {
 
 pub struct Job {
     pub tool_precision: bool,
+    pub observer_context: String,
     pub prompt: Vec<u32>,
     pub images: Vec<JobImage>,
     pub max_tokens: usize,
@@ -97,6 +98,8 @@ pub enum Event {
     Thinking { used: usize, budget: Option<usize>, done: bool },
     /// More reply text (whole UTF-8 characters).
     Text(String),
+    Observer(String),
+    ObserverProgress { action: String, comment: String },
     Done { finish: Finish, completion_tokens: usize },
     Error(String),
 }
@@ -124,6 +127,7 @@ pub struct Engine {
     tokens: Vec<u64>,
     pub tool_experts: bool,
     pub repetition_guard: bool,
+    pub observer: Option<crate::observer::Observer>,
     request_number: u64,
     checkpoints: Vec<Checkpoint>,
 }
@@ -139,6 +143,7 @@ struct ThinkBudget {
     /// Reasoning tokens so far.
     used: usize,
     budget: Option<usize>,
+    repetition: Option<crate::repetition::ShortReasoningGuard>,
 }
 
 /// Reasoning progress goes to the client every this many tokens.
@@ -147,8 +152,8 @@ const THINKING_EVERY: usize = 16;
 impl ThinkBudget {
     fn new(opens_thinking: bool, end: Option<u32>, budget: Option<usize>) -> ThinkBudget {
         match end {
-            Some(end) if opens_thinking => ThinkBudget { end, thinking: true, used: 0, budget },
-            _ => ThinkBudget { end: 0, thinking: false, used: 0, budget: None },
+            Some(end) => ThinkBudget { end, thinking: opens_thinking, used: 0, budget, repetition: None },
+            _ => ThinkBudget { end: 0, thinking: false, used: 0, budget: None, repetition: None },
         }
     }
 
@@ -162,7 +167,9 @@ impl ThinkBudget {
             self.thinking = false;
             return (sampled, false);
         }
-        if self.budget.is_some_and(|b| self.used >= b) {
+        if self.budget.is_some_and(|b| self.used >= b)
+            || self.repetition.as_mut().is_some_and(|guard| guard.push(sampled))
+        {
             self.thinking = false;
             return (self.end, true);
         }
@@ -207,7 +214,7 @@ impl Engine {
             warn: true,
             disk: None,
             tokens: Vec::new(),
-            tool_experts: false, repetition_guard: true,
+            tool_experts: false, repetition_guard: true, observer: None,
             request_number: 0,
             checkpoints: Vec::new(),
         }
@@ -225,11 +232,14 @@ impl Engine {
 
     /// Serve jobs until every sender is gone.
     pub fn run(mut self, jobs: Receiver<Job>) {
-        for job in jobs {
+        for mut job in jobs {
             // the background cache fill waits for idle time
             self.model.set_busy(true);
             self.request_number += 1;
-            let result = self.switch_phase(false).and_then(|_| self.generate(&job));
+            let result = self.switch_phase(false).and_then(|_| {
+                if self.observer.is_some() && job.tool_precision { self.reviewed_generate(&mut job) }
+                else { self.generate(&job, &mut Vec::new(), 0, false) }
+            });
             // Every saved prompt checkpoint used ternary. Never reuse the generated
             // mixed-precision suffix as if it had been evaluated in ternary.
             let cleanup = if self.tool_experts {
@@ -238,6 +248,7 @@ impl Engine {
             let result = result.and(cleanup).and(self.model.flush_route_log());
             self.model.set_busy(false);
             if let Err(e) = result {
+                if self.warn { eprintln!("nrob-server: request {} failed: {e}", self.request_number); }
                 // the state is unknown after a failure: start clean
                 self.tokens.clear();
                 self.checkpoints.clear();
@@ -373,7 +384,107 @@ impl Engine {
         Ok(())
     }
 
-    fn generate(&mut self, job: &Job) -> nrob::Result<()> {
+
+    /// Capture unapproved output while continuing to forward progress/comments.
+    /// The relay owns a bounded text buffer; no tool/text event escapes early.
+    fn capture(&mut self, job: &mut Job, q4: usize, comments: bool) -> nrob::Result<(Vec<u32>, Vec<Event>)> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let destination = std::mem::replace(&mut job.events, tx);
+        let forward = destination.clone();
+        let cancel = Arc::clone(&job.cancel);
+        let relay = std::thread::spawn(move || {
+            hold_observer_events(rx, forward, cancel)
+        });
+        let mut ids = Vec::new();
+        let result = self.generate(job, &mut ids, q4, comments);
+        drop(std::mem::replace(&mut job.events, destination));
+        let (kept, size) = relay.join().map_err(|_| nrob::Error::Format("observer event relay failed".into()))?;
+        result?;
+        if size > 1024 * 1024 { return Err(nrob::Error::Format("observer draft exceeded 1 MiB; withheld".into())); }
+        if job.cancel.load(Ordering::Relaxed) { return Err(nrob::Error::Arg("observer draft cancelled; withheld".into())); }
+        Ok((ids, kept))
+    }
+
+    fn reviewed_generate(&mut self, job: &mut Job) -> nrob::Result<()> {
+        let ordinary = job.tool_precision;
+        job.tool_precision = false; // first draft, including every tool token, is ternary
+        let result = self.reviewed_inner(job).map_err(|e| nrob::Error::Format(format!("{}: {e}", crate::observer::CODE)));
+        job.tool_precision = ordinary;
+        result
+    }
+
+    fn reviewed_inner(&mut self, job: &mut Job) -> nrob::Result<()> {
+        let (ids, events) = self.capture(job, 0, true)?;
+        let Some(prefix_len) = crate::observer::repair_prefix(&self.tok, &ids) else {
+            let context = nrob::json::Json::parse(job.observer_context.as_bytes()).ok();
+            if context.as_ref().and_then(|c|c.get("review_progress")).and_then(nrob::json::Json::as_bool) == Some(true) {
+                let _ = job.events.send(Event::Observer("Checking whether unfinished work really needs user input...".into()));
+                let decision = self.observer.as_mut().unwrap().progress(&job.observer_context, &self.tok.decode(&ids), &job.cancel)?;
+                let _ = job.events.send(Event::ObserverProgress {action:decision.progress.unwrap().into(),comment:decision.comment});
+            }
+            for event in events { let _ = job.events.send(event); }
+            return Ok(()); // no tools: don't charge a review for ordinary conversation
+        };
+        let draft = self.tok.decode(&ids);
+        let _ = job.events.send(Event::Observer("Reviewing the ternary tool draft before execution...".into()));
+        let structural = crate::observer::validate_tools(&job.observer_context, &draft).err();
+        let decision = if let Some(error) = structural {
+            crate::observer::Decision { retry: true, q4_tokens: 32, progress: None, comment: format!("Tool contract error: {error}. Follow the declared tool schema; do not pass intentionally invalid arguments.") }
+        } else {
+            self.observer.as_mut().unwrap().review(&job.observer_context, &draft, &job.cancel)?
+        };
+        let _ = job.events.send(Event::Observer(decision.comment.clone()));
+        if !decision.retry {
+            for event in events { let _ = job.events.send(event); }
+            return Ok(());
+        }
+        if !self.tool_experts && decision.q4_tokens > 0 {
+            return Err(nrob::Error::Arg("observer requested Q4 but no original expert source is configured; draft withheld".into()));
+        }
+        // Only the unexecuted tool suffix is regenerated. Preserve the exact
+        // draft token prefix, restore a ternary checkpoint, and replay its tail.
+        self.switch_phase(false)?;
+        let original_prompt = job.prompt.clone();
+        let original_max = job.max_tokens;
+        let advice = format!("<think>\nObserver suggestion (advisory, may be mistaken): {}\n</think>\n",
+            decision.comment.replace('<', "＜").replace('>', "＞"));
+        let mut accepted = ids[..prefix_len].to_vec();
+        accepted.extend(self.tok.encode(&advice));
+        job.prompt.extend_from_slice(&accepted);
+        job.max_tokens = original_max.saturating_sub(accepted.len());
+        if job.max_tokens == 0 || job.prompt.len() + job.max_tokens > self.model.max_seq() {
+            job.prompt = original_prompt; job.max_tokens = original_max;
+            return Err(nrob::Error::Arg("no room for observer suffix repair; draft withheld".into()));
+        }
+        let repaired = self.capture(job, decision.q4_tokens, false);
+        job.prompt = original_prompt;
+        job.max_tokens = original_max;
+        let (suffix, repaired_events) = repaired?;
+        accepted.extend_from_slice(&suffix);
+        let text = self.tok.decode(&accepted);
+        let mut parser = dsv41::chat::StreamParser::new(dsv41::chat::Mode::Chat);
+        parser.push(&text);
+        if parser.tool_call_error().is_some() || !parser.tool_calls_ready() {
+            return Err(nrob::Error::Format("observer repair did not produce complete valid tool calls; withheld".into()));
+        }
+        crate::observer::validate_tools(&job.observer_context, &text)
+            .map_err(|e|nrob::Error::Format(format!("repair still violates the tool contract: {e}; no tool executed")))?;
+        let _ = job.events.send(Event::Observer("Checking the repaired tool draft (one retry maximum)...".into()));
+        let check = self.observer.as_mut().unwrap().review(&job.observer_context, &text, &job.cancel)?;
+        let _ = job.events.send(Event::Observer(check.comment));
+        if check.retry { return Err(nrob::Error::Format("observer rejected the repair; retry budget exhausted, no tool executed".into())); }
+        if job.cancel.load(Ordering::Relaxed) { return Err(nrob::Error::Arg("observer repair cancelled".into())); }
+        let _ = job.events.send(Event::Text(text));
+        for event in repaired_events {
+            if let Event::Done { finish, .. } = event {
+                // Usage includes discarded draft and repair compute, not only accepted text.
+                let _ = job.events.send(Event::Done {finish, completion_tokens: ids.len() + suffix.len()});
+            }
+        }
+        Ok(())
+    }
+
+    fn generate(&mut self, job: &Job, generated: &mut Vec<u32>, q4_tokens: usize, comments: bool) -> nrob::Result<()> {
         let prompt = &job.prompt;
         if prompt.is_empty() {
             return Err(nrob::Error::Arg("empty prompt".into()));
@@ -511,38 +622,91 @@ impl Engine {
         let (mut pending, mut n) = (Vec::new(), 0usize);
         let think_start = self.tok.special(dsv41::chat::THINK_START);
         let mut budget = ThinkBudget::new(think_start.is_some() && prompt.last().copied() == think_start, self.tok.special(dsv41::chat::THINK_END), job.think_budget);
+        if self.repetition_guard { budget.repetition = Some(Default::default()); }
+        let mut channel = dsv41::chat::StreamParser::new(if budget.thinking {
+            dsv41::chat::Mode::Thinking
+        } else { dsv41::chat::Mode::Chat });
         let decode = Instant::now();
         let mut phase = crate::tool_phase::ToolPhase::default();
+        let mut commented = false;
+        let mut reasoning_commented = false;
         let mut repetition = crate::repetition::Guard::default();
+        let mut prose = crate::repetition::ProseGuard::default();
         let phase_enabled = self.tool_experts && job.tool_precision;
         let finish = loop {
             let was_thinking = budget.thinking;
             let (next, forced) = budget.pass(sample(&logits, &job.sampling, &mut rng));
             if forced && self.log {
-                eprintln!("  reasoning ended at its budget ({} tokens)", job.think_budget.unwrap_or(0));
-            }
-            if was_thinking && (!budget.thinking || budget.used.is_multiple_of(THINKING_EVERY)) {
-                let _ = job.events.send(Event::Thinking { used: budget.used, budget: budget.budget, done: !budget.thinking });
+                eprintln!("  reasoning ended by budget/repetition control after {} tokens", budget.used);
             }
             if next == self.eos {
                 break Finish::Stop;
             }
             n += 1;
+            generated.push(next);
             pending.extend_from_slice(self.tok.token_bytes(next));
             let valid = match std::str::from_utf8(&pending) {
                 Ok(s) => s.len(),
                 Err(e) => e.valid_up_to(),
             };
+            let mut prose_repeated = false;
             if valid > 0 {
                 let text = String::from_utf8_lossy(&pending[..valid]).into_owned();
                 pending.drain(..valid);
+                let was_tool = phase.original();
                 phase.push(&text); // also identifies payloads exempt from the prose repetition guard
+                if !was_tool && !phase.original() {
+                    if forced { channel.end_reasoning(); }
+                    for delta in channel.push(&text) {
+                        match delta {
+                            dsv41::chat::Delta::Content(text) => {
+                                if self.repetition_guard { prose_repeated |= prose.push(&text); }
+                            }
+                            dsv41::chat::Delta::Reasoning(_) => prose.clear(),
+                        }
+                    }
+                    budget.thinking = channel.is_reasoning();
+                    if !was_thinking && budget.thinking && self.repetition_guard {
+                        budget.repetition = Some(Default::default());
+                    }
+                } else { budget.thinking = false; prose.clear(); }
+                if was_thinking != budget.thinking || budget.thinking && budget.used.is_multiple_of(THINKING_EVERY) {
+                    let _ = job.events.send(Event::Thinking { used: budget.used, budget: budget.budget, done: !budget.thinking });
+                }
                 if job.events.send(Event::Text(text)).is_err() {
                     break Finish::Stop; // nobody is listening
                 }
             }
-            if self.repetition_guard && repetition.push(next, phase.original()) {
+            if self.repetition_guard && (prose_repeated || repetition.push(next, phase.original())) {
                 return Err(nrob::Error::Format(format!("{}: stopped repeated prose/reasoning blocks; generation did not complete. No tool from this incomplete reply was executed. Start a fresh turn or select the original model; automatic retry is disabled.", crate::repetition::CODE)));
+            }
+            let mut advice_to_inject = None;
+            // A single consultation at a complete reasoning line. Never inject
+            // into tool arguments or a partial UTF-8/token-markup fragment.
+            let tail = self.tok.token_bytes(next);
+            if comments && !reasoning_commented && safe_reasoning_consultation(
+                budget.thinking,phase.original(),pending.is_empty(),tail,budget.used) {
+                reasoning_commented = true;
+                if let Some(observer) = self.observer.as_mut() {
+                    let _ = job.events.send(Event::Observer("Helping DeepSeek with its current reasoning...".into()));
+                    match observer.advise_reasoning(&job.observer_context,&self.tok.decode(generated),&job.cancel) {
+                        Ok(note) => { advice_to_inject = Some(note); }
+                        Err(_) => { let _ = job.events.send(Event::Observer("Reasoning advice unavailable; DeepSeek is continuing.".into())); }
+                    }
+                }
+            }
+            // One provisional note at a natural tool-writing checkpoint. Both
+            // models stay resident, but compute is scheduled sequentially.
+            if comments && !commented && n >= 512 && phase.original() {
+                commented = true;
+                let draft = self.tok.decode(generated);
+                if let Some(observer) = self.observer.as_mut() {
+                    let _ = job.events.send(Event::Observer("Looking over the unfinished tool draft...".into()));
+                    match observer.comment(&job.observer_context, &draft, &job.cancel) {
+                        Ok(note) => { let _ = job.events.send(Event::Observer(format!("Draft note (provisional; automatically resuming DeepSeek): {note}"))); }
+                        Err(_) => { let _ = job.events.send(Event::Observer("Draft note unavailable; completed tools still require review.".into())); }
+                    }
+                }
             }
             if n >= job.max_tokens || pos + 1 >= self.model.max_seq() {
                 break Finish::Length;
@@ -550,13 +714,38 @@ impl Engine {
             if job.cancel.load(Ordering::Relaxed) {
                 break Finish::Stop;
             }
-            if phase_enabled { self.switch_phase(phase.original())?; }
+            if q4_tokens > 0 { self.switch_phase(observer_q4_forward(n, q4_tokens))?; }
+            else if phase_enabled { self.switch_phase(phase.original())?; }
             self.model.trace_phase(self.request_number,
-                if phase_enabled && phase.original() {"tool_call"} else {"reply"},
+                if q4_tokens > 0 && n <= q4_tokens {"observer_q4_window"} else if phase_enabled && phase.original() {"tool_call"} else {"reply"},
                 Some(next), &String::from_utf8_lossy(self.tok.token_bytes(next)));
             logits = self.model.forward(&[next], pos)?;
             self.tokens.push(u64::from(next));
             pos += 1;
+            if let Some(note) = advice_to_inject {
+                let advice = reasoning_advice(&note);
+                let advice_ids = self.tok.encode(&advice);
+                let remaining = job.max_tokens.saturating_sub(n)
+                    .min(self.model.max_seq().saturating_sub(pos + 1))
+                    .min(budget.budget.map_or(usize::MAX,|b|b.saturating_sub(budget.used)));
+                if advice_ids.len().saturating_add(32) <= remaining {
+                    for &id in &advice_ids {
+                        if job.cancel.load(Ordering::Relaxed) { return Err(nrob::Error::Arg("cancelled while handing off observer advice".into())); }
+                        self.model.trace_phase(self.request_number,"observer_reasoning_advice",Some(id),&String::from_utf8_lossy(self.tok.token_bytes(id)));
+                        logits = self.model.forward(&[id],pos)?;
+                        self.tokens.push(u64::from(id)); pos += 1;
+                    }
+                    n += advice_ids.len();
+                    budget.used += advice_ids.len();
+                    generated.extend_from_slice(&advice_ids);
+                    phase.push(&advice);
+                    let _ = channel.push(&advice);
+                    let _ = job.events.send(Event::Text(advice));
+                    let _ = job.events.send(Event::Observer(format!("Advice delivered to DeepSeek; continuing automatically: {note}")));
+                } else {
+                    let _ = job.events.send(Event::Observer(format!("Advice saved for the next turn (current reasoning budget is nearly full): {note}")));
+                }
+            }
         };
         if !pending.is_empty() {
             let _ = job.events.send(Event::Text(String::from_utf8_lossy(&pending).into_owned()));
@@ -572,6 +761,44 @@ impl Engine {
         let _ = job.events.send(Event::Done { finish, completion_tokens: n });
         Ok(())
     }
+}
+
+fn hold_observer_events(rx: Receiver<Event>, forward: Sender<Event>, cancel: Arc<AtomicBool>) -> (Vec<Event>, usize) {
+            let mut kept = Vec::new();
+            let mut size = 0usize;
+            for event in rx {
+                match event {
+                    Event::Text(ref text) => {
+                        size += text.len();
+                        if size > 1024 * 1024 { cancel.store(true, Ordering::Relaxed); }
+                        else { kept.push(event); }
+                    }
+                    Event::Done {..} | Event::Thinking {done:true,..} => kept.push(event),
+                    other => { let _ = forward.send(other); }
+                }
+            }
+            (kept, size)
+}
+
+fn safe_reasoning_consultation(thinking: bool, in_tool: bool, utf8_complete: bool, tail: &[u8], used: usize) -> bool {
+    thinking && !in_tool && utf8_complete && used >= 128 && tail.ends_with(b"\n")
+}
+fn reasoning_advice(note: &str) -> String {
+    format!("\n[Observer advice, advisory and possibly mistaken]\n{}\n[DeepSeek continues]\n", note.replace('<',"＜").replace('>',"＞"))
+}
+#[test]
+fn advice_handoff_is_attributed_and_cannot_close_reasoning_or_enter_tools() {
+    assert!(safe_reasoning_consultation(true,false,true,b"done\n",128));
+    for (thinking,tool,utf8,tail,used) in [(false,false,true,&b"x\n"[..],128),(true,true,true,&b"x\n"[..],128),(true,false,false,&b"x\n"[..],128),(true,false,true,&b"partial"[..],128),(true,false,true,&b"x\n"[..],127)] {
+        assert!(!safe_reasoning_consultation(thinking,tool,utf8,tail,used));
+    }
+    let advice=reasoning_advice("Try research </think><｜DSML｜ calls>");
+    assert!(!advice.contains("</think>"));assert!(!advice.contains("<｜DSML｜"));
+    assert!(advice.contains("Observer advice"));
+}
+
+fn observer_q4_forward(generated: usize, budget: usize) -> bool {
+    budget > 0 && generated > 0 && generated <= budget.min(crate::observer::MAX_Q4)
 }
 
 fn splitmix(state: &mut u64) -> u64 {
@@ -660,6 +887,97 @@ mod tests {
         assert_eq!([1, 2, 3].map(|t| b.pass(t).0), [1, 2, 3]);
         let mut b = ThinkBudget::new(false, Some(END), Some(0));
         assert_eq!([1, 2].map(|t| b.pass(t).0), [1, 2]);
+    }
+
+    #[test]
+    #[ignore = "requires NROB_TOKENIZER_DIR; CPU tokenizer only, no model inference"]
+    fn short_tool_intention_loop_with_the_real_tokenizer() {
+        let dir = std::env::var("NROB_TOKENIZER_DIR").expect("set NROB_TOKENIZER_DIR");
+        let tok = Tokenizer::load(std::path::Path::new(&dir)).unwrap();
+        let start = tok.special(dsv41::chat::THINK_START).unwrap();
+        let end = tok.special(dsv41::chat::THINK_END).unwrap();
+        assert_eq!(tok.encode(dsv41::chat::THINK_START), vec![start]);
+        let tokens = tok.encode(&"Let's call web_search.\n\nLet's call.\n\n".repeat(20));
+        let mut b = ThinkBudget::new(true, Some(end), Some(2048));
+        b.repetition = Some(Default::default());
+        let forced = tokens.iter().position(|&t| b.pass(t) == (end, true));
+        assert!(forced.is_some_and(|i| i < 376), "must close the repeated intention loop");
+        println!("real tokenizer: reasoning closed at generated token {}", forced.unwrap() + 1);
+    }
+
+    #[test]
+    fn short_repetition_closes_thinking_once_without_touching_the_answer() {
+        const END: u32 = 1000;
+        let mut b = ThinkBudget::new(true, Some(END), Some(2048));
+        b.repetition = Some(Default::default());
+        for i in 0..71 { assert_eq!(b.pass(i % 9), (i % 9, false)); }
+        assert_eq!(b.pass(8), (END, true));
+        assert!(!b.thinking);
+        for _ in 0..100 { assert_eq!(b.pass(8), (8, false)); }
+        let mut disabled = ThinkBudget::new(true, Some(END), None);
+        for _ in 0..100 { assert_eq!(disabled.pass(8), (8, false)); }
+    }
+
+    #[test]
+    fn reopened_thinking_uses_the_same_total_budget_and_end_token() {
+        const END: u32 = 1000;
+        let mut b = ThinkBudget::new(false, Some(END), Some(2));
+        b.thinking = true; // parser sees a later <think>
+        assert_eq!(b.pass(7), (7, false));
+        assert_eq!(b.pass(END), (END, false));
+        assert_eq!(b.pass(8), (8, false)); // answer tokens do not count
+        b.thinking = true;
+        assert_eq!(b.pass(9), (9, false));
+        assert_eq!(b.pass(10), (END, true));
+    }
+
+    #[test]
+    fn observer_withholds_all_draft_text_and_completion() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (out, visible) = std::sync::mpsc::channel();
+        tx.send(Event::Text("<tool draft>".into())).unwrap();
+        tx.send(Event::Observer("a provisional note".into())).unwrap();
+        tx.send(Event::Done { finish: Finish::Stop, completion_tokens: 3 }).unwrap();
+        drop(tx);
+        let (held, _) = hold_observer_events(rx, out, Arc::new(AtomicBool::new(false)));
+        assert_eq!(held.len(), 2);
+        let shown: Vec<_> = visible.try_iter().collect();
+        assert_eq!(shown.len(), 1);
+        assert!(matches!(&shown[0], Event::Observer(_)));
+    }
+
+    #[test]
+    fn observer_does_not_close_reasoning_ahead_of_buffered_text() {
+        let (tx,rx)=std::sync::mpsc::channel();
+        let (out,visible)=std::sync::mpsc::channel();
+        tx.send(Event::Text("initial thought".into())).unwrap();
+        tx.send(Event::Thinking {used:10,budget:Some(20),done:true}).unwrap();
+        tx.send(Event::Text("</think>answer".into())).unwrap();
+        drop(tx);
+        let (held,_)=hold_observer_events(rx,out,Arc::new(AtomicBool::new(false)));
+        assert_eq!(visible.try_iter().count(),0);
+        let mut parser=dsv41::chat::StreamParser::new(dsv41::chat::Mode::Thinking);
+        let mut deltas=Vec::new();
+        for event in held {
+            match event {
+                Event::Text(text)=>deltas.extend(parser.push(&text)),
+                Event::Thinking {done:true,..}=>deltas.extend(parser.end_reasoning()),
+                _=>{},
+            }
+        }
+        deltas.extend(parser.finish().0);
+        assert!(deltas.iter().any(|d|matches!(d,dsv41::chat::Delta::Reasoning(t) if t.contains("initial thought"))));
+        assert!(!deltas.iter().any(|d|matches!(d,dsv41::chat::Delta::Content(t) if t.contains("initial thought"))));
+    }
+
+    #[test]
+    fn observer_q4_window_is_bounded_and_returns_to_ternary() {
+        for budget in [0, 1, 12, 64, 256, 1000] {
+            let active = (0..1200).filter(|&n|observer_q4_forward(n,budget)).count();
+            assert_eq!(active, budget.min(crate::observer::MAX_Q4));
+            assert!(!observer_q4_forward(0,budget));
+            assert!(!observer_q4_forward(257,budget));
+        }
     }
 
     #[test]

@@ -12,6 +12,7 @@
 mod api;
 mod disk;
 mod engine;
+pub mod observer;
 mod tool_phase;
 mod repetition;
 // VENDORED-LOCAL: GLM-5.3-Flash served through the same job/event contract.
@@ -85,6 +86,10 @@ pub struct Options {
     pub ternary_experts: std::collections::BTreeMap<String, PathBuf>,
     /// Original experts used inside tool payloads for a named ternary model.
     pub tool_expert_sources: std::collections::BTreeMap<String, PathBuf>,
+    /// Optional resident GGUF reviewer. No observer is loaded unless configured.
+    pub observer_model: Option<PathBuf>,
+    pub observer_device: usize,
+    pub observer_vram_gb: usize,
     pub expert_trace: Option<std::path::PathBuf>,
     /// Stop long repeated prose/reasoning blocks; does not apply inside tool payloads.
     pub repetition_guard: bool,
@@ -142,13 +147,7 @@ impl Options {
     /// 32 GB when the machine will not say -- small enough to start anywhere, and
     /// `--ram-gb` is there for a caller who knows better.
     pub fn expert_cache_bytes(&self) -> u64 {
-        if self.ram_gb > 0 {
-            return (self.ram_gb as u64) << 30;
-        }
-        match ggml_rs_cuda::host_memory() {
-            Some((free, _total)) => (free as f64 * 0.8) as u64,
-            None => 32u64 << 30,
-        }
+        host_cache_budget(self.ram_gb, ggml_rs_cuda::host_memory().map(|(free, _)| free as u64))
     }
 }
 
@@ -171,6 +170,9 @@ impl Default for Options {
             tools_experts: None,
             ternary_experts: std::collections::BTreeMap::new(),
             tool_expert_sources: std::collections::BTreeMap::new(),
+            observer_model: None,
+            observer_device: usize::MAX,
+            observer_vram_gb: 16,
             expert_trace: None,
             repetition_guard: true,
             api_key: None,
@@ -342,4 +344,16 @@ pub fn start_listening(o: Options, listening: impl FnOnce(SocketAddr)) -> nrob::
         })
         .map_err(nrob::Error::Io)?;
     Ok(Running { addr, accept, activity })
+}
+
+fn host_cache_budget(requested_gib: usize, available: Option<u64>) -> u64 {
+    let safe = available.map(|n|n / 5 * 4).unwrap_or(32u64 << 30);
+    if requested_gib == 0 { safe } else { (requested_gib as u64).saturating_mul(1u64 << 30).min(safe) }
+}
+#[test]
+fn ram_cache_clamps_to_actual_available_memory() {
+    let gib = 1u64 << 30;
+    assert_eq!(host_cache_budget(140,Some(10*gib)),8*gib);
+    assert_eq!(host_cache_budget(4,Some(10*gib)),4*gib);
+    assert_eq!(host_cache_budget(0,Some(10*gib)),8*gib);
 }
