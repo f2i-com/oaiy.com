@@ -7,8 +7,7 @@
 //! are not kept). The engine saves one where a conversation's first user
 //! message begins (the system prompt and tools), and for the conversation
 //! after each layered pass, where its newest user message begins and at the
-//! end of each prompt; a newer entry replaces its conversation's shorter
-//! ones. When a
+//! end of each prompt; earlier prefixes remain reusable when a rendered turn changes its suffix. When a
 //! prompt comes that the model's own state and checkpoints cover less of
 //! than an entry does, the entry is loaded instead.
 //!
@@ -231,22 +230,20 @@ impl<S: PromptState> DiskCache<S> {
     }
 
     /// Keep `snap`, the state after `keys` (`base`: a system prompt's).
-    /// Shorter entries of the same conversation go, and then the least
-    /// recently used while the entries pass the budget.
+    /// Prefix entries remain useful for branches and re-rendered tool messages;
+    /// least recently used entries go when the byte budget is exceeded.
     pub fn save(&mut self, keys: Vec<u64>, snap: S, base: bool) {
         let path = self.dir.join(format!("{:016x}-{:016x}.{EXT}", self.fingerprint, keys_hash(&keys)));
         let header = header(self.fingerprint, base, &keys);
         let bytes = (header.len() + snap.encoded_len()) as u64;
-        // a conversation's newest state covers its earlier ones
-        let superseded: Vec<usize> = (0..self.entries.len()).filter(|&i| !self.entries[i].base && !base && keys.starts_with(&self.entries[i].keys)).collect();
-        for i in superseded.into_iter().rev() {
-            let gone = self.entries.remove(i);
-            let _ = self.writer.send(Job::Delete(gone.path));
-        }
+        // Preserve prefix checkpoints: rendering a completed reply/tool call can
+        // change its suffix, making an older prefix the longest usable state.
+        // The existing byte-budget LRU bounds storage. Deduplicate exact keys.
+        if self.has(&keys) { return; }
         let _ = self.writer.send(Job::Write { path: path.clone(), header, snap });
         self.entries.push(Entry { path, keys, bytes, used: SystemTime::now(), base });
         while self.entries.iter().map(|e| e.bytes).sum::<u64>() > self.budget && self.entries.len() > 1 {
-            let oldest = (0..self.entries.len() - 1).min_by_key(|&i| self.entries[i].used).expect("two entries or more");
+            let oldest = (0..self.entries.len() - 1).min_by_key(|&i| (self.entries[i].base, self.entries[i].used)).expect("two entries or more");
             let gone = self.entries.remove(oldest);
             let _ = self.writer.send(Job::Delete(gone.path));
         }
@@ -277,25 +274,25 @@ mod tests {
     }
 
     #[test]
-    fn states_outlive_the_process_and_a_conversation_keeps_its_newest() {
+    fn states_outlive_the_process_and_keep_reusable_prefixes() {
         let dir = std::env::temp_dir().join(format!("nrob-prompt-cache-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let mut cache: DiskCache<dsv41_cuda::Snapshot> = DiskCache::open(&dir, 7, 1 << 30).unwrap();
         cache.save(vec![1, 2, 3], snap(3), true);
         cache.save(vec![1, 2, 3, 4, 5], snap(5), false);
         cache.save(vec![1, 2, 3, 4, 5, 6, 7], snap(7), false);
-        // the system prompt's stays; the conversation keeps its newest
-        assert_eq!(cache.len(), 2);
-        assert!(cache.has(&[1, 2, 3]) && !cache.has(&[1, 2, 3, 4, 5]));
+        // Keep both shorter and longer conversation prefixes within the budget.
+        assert_eq!(cache.len(), 3);
+        assert!(cache.has(&[1, 2, 3]) && cache.has(&[1, 2, 3, 4, 5]));
         assert_eq!(cache.best(&[1, 2, 3, 4, 5, 6, 7, 8], 7).map(|b| b.1), Some(7));
         assert_eq!(cache.best(&[1, 2, 3, 9], 3).map(|b| b.1), Some(3));
-        assert_eq!(cache.best(&[1, 2, 3, 4, 5, 6, 7], 6).map(|b| b.1), Some(3));
+        assert_eq!(cache.best(&[1, 2, 3, 4, 5, 6, 7], 6).map(|b| b.1), Some(5));
         assert_eq!(cache.best(&[2, 3], 1), None);
-        assert!(written(&dir, 2));
+        assert!(written(&dir, 3));
 
         // another process of the same model finds them; another model does not
         let mut again: DiskCache<dsv41_cuda::Snapshot> = DiskCache::open(&dir, 7, 1 << 30).unwrap();
-        assert_eq!(again.len(), 2);
+        assert_eq!(again.len(), 3);
         let (i, len) = again.best(&[1, 2, 3, 4, 5, 6, 7, 8], 7).unwrap();
         let (keys, state) = again.load(i).unwrap();
         assert_eq!((keys, state.pos(), len), (vec![1, 2, 3, 4, 5, 6, 7], 7, 7));

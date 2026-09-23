@@ -530,7 +530,6 @@ impl Engine {
         // prompt and tools before it), if this prompt still has to run it
         let first_turn = prompt.iter().position(|&t| Some(t) == user).filter(|&p| p > start);
         // where the newest user message begins: the conversation before it
-        let last_turn = turns.last().copied();
         let mut ends: Vec<usize> = [turns.first(), turns.last()].into_iter().flatten().copied().collect();
         ends.push(prompt.len());
         ends.dedup();
@@ -619,7 +618,7 @@ impl Engine {
                     // the system prompt and tools: where the next process's
                     // chats start
                     self.persist(pos, true);
-                } else if how == "layered" || Some(pos) == last_turn {
+                } else {
                     // a long read keeps what it has read so far (a restart,
                     // or a request stopped part-way, carries on from here),
                     // and the conversation up to its newest message is what
@@ -760,6 +759,12 @@ impl Engine {
             logits = self.model.forward(&[next], pos)?;
             self.tokens.push(u64::from(next));
             pos += 1;
+            // Only single-precision state is valid for a later prompt. Save
+            // committed forwards (never the last sampled, unconsumed token).
+            if cache_generated_state(self.tool_experts, pos, prompt.len(), false) {
+                self.save_checkpoint(pos)?;
+                self.persist(pos, false);
+            }
             if let Some(note) = advice_to_inject {
                 let advice = reasoning_advice(&note);
                 let advice_ids = self.tok.encode(&advice);
@@ -785,6 +790,10 @@ impl Engine {
                 }
             }
         };
+        if cache_generated_state(self.tool_experts, pos, prompt.len(), true) {
+            self.save_checkpoint(pos)?;
+            self.persist(pos, false);
+        }
         if !pending.is_empty() {
             let _ = job.events.send(Event::Text(String::from_utf8_lossy(&pending).into_owned()));
         }
@@ -1302,4 +1311,20 @@ fn refreshed_parallel_tool_prompt_preserves_real_token_ids_and_excludes_guidance
     assert_eq!(parser.finish().1.len(), 2);
     draft.extend(tok.encode(suffix));
     assert!(!tok.decode(&draft).contains("PRIVATE_REFERENCE_ONLY"));
+}
+
+// Bound device snapshot overhead to one checkpoint per 256 committed reply
+// tokens, plus the final prefix. Hybrid expert state must never leak into a
+// ternary prompt cache. A changed prompt still requires exact prefix matching.
+fn cache_generated_state(hybrid: bool, pos: usize, prompt_len: usize, final_prefix: bool) -> bool {
+    !hybrid && pos > prompt_len && (final_prefix || (pos - prompt_len).is_multiple_of(256))
+}
+
+#[test]
+fn generated_cache_uses_only_committed_single_precision_prefixes() {
+    assert!(!cache_generated_state(false, 100, 100, true));
+    assert!(!cache_generated_state(false, 355, 100, false));
+    assert!(cache_generated_state(false, 356, 100, false));
+    assert!(cache_generated_state(false, 110, 100, true));
+    assert!(!cache_generated_state(true, 356, 100, true));
 }
