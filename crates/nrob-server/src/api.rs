@@ -394,6 +394,12 @@ impl Server {
     fn chat(&self, req: &Request, w: &mut TcpStream) -> Result<bool, ApiError> {
         let body = Self::parse_body(req)?;
         observer_review_policy(&body)?;
+        if body.get("nrob_file_write_yield").is_some_and(|v| !matches!(v, Json::Bool(_))) {
+            return Err(bad("nrob_file_write_yield must be a boolean"));
+        }
+        // Observer approval is for the full proposed batch; never cut it short.
+        let yield_files = matches!(body.get("nrob_file_write_yield"), Some(Json::Bool(true)))
+            && body.get("nrob_observer_review").and_then(Json::as_str).unwrap_or("off") == "off";
         // Before loading a model: validate the observer request policy.
         // Which model, loading it if it is not the live one.
         let a = self.active(&body)?;
@@ -571,6 +577,7 @@ impl Server {
                     for d in parser.push(&t) {
                         emit(d, &mut sse, &mut stop, &cancel);
                     }
+                    if yield_files { parser.yield_completed_file(); }
                     if parser.tool_calls_ready() {
                         // Stop generation at the completed call envelope so the
                         // client can execute tools before the model continues.

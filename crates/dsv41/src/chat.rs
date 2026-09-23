@@ -846,6 +846,7 @@ pub struct StreamParser {
     pending: String,
     calls: String,
     completed: Option<Vec<ToolCall>>,
+    file_scan: usize,
     literal: LiteralCode,
 }
 
@@ -853,7 +854,7 @@ impl StreamParser {
     /// `mode` is the prompt's: thinking mode starts inside the reasoning.
     pub fn new(mode: Mode) -> StreamParser {
         let phase = if mode == Mode::Thinking { Phase::Reasoning } else { Phase::Content };
-        StreamParser { phase, pending: String::new(), calls: String::new(), completed: None, literal: LiteralCode::default() }
+        StreamParser { phase, pending: String::new(), calls: String::new(), completed: None, file_scan: 0, literal: LiteralCode::default() }
     }
 
     /// Feed more text; returns what can be shown now.
@@ -935,6 +936,31 @@ impl StreamParser {
                 self.completed = Some(calls);
             }
         }
+    }
+
+    /// Opt-in file delivery boundary. Close only the outer envelope after a
+    /// fully parsed file operation; parameter contents are never synthesized.
+    /// This ends the generation so the client can approve/write this file before
+    /// requesting the next. Read-only batches remain unchanged.
+    pub fn yield_completed_file(&mut self) -> bool {
+        if self.phase != Phase::ToolCalls { return false; }
+        let close = format!("</{DSML} invoke>");
+        while let Some(at) = self.calls[self.file_scan..].find(&close) {
+            let end = self.file_scan + at + close.len();
+            self.file_scan = end;
+            let envelope = format!("{}\n</{DSML} calls>", &self.calls[..end]);
+            let Ok((_, calls)) = runtime_dsml::parse(&envelope) else { continue; };
+            if calls.last().is_some_and(|call| matches!(call.name.as_str(),
+                "write_file" | "edit_file" | "edit_block" | "edit_lines" | "apply_patch")) {
+                self.calls = envelope;
+                self.completed = Some(calls);
+                return true;
+            }
+        }
+        // Only scan newly arrived text, keeping enough tail for a split close.
+        self.file_scan = self.calls.len().saturating_sub(close.len());
+        while !self.calls.is_char_boundary(self.file_scan) { self.file_scan -= 1; }
+        false
     }
 
     /// A validated, closed tool envelope is ready for the caller to dispatch.
@@ -1273,5 +1299,51 @@ mod tests {
         assert!(cases.len() > 400);
         assert!(failures.is_empty(), "{} of {} cases differ:\n{}", failures.len(), cases.len(), failures[..failures.len().min(6)].join("\n"));
         eprintln!("{} reference chat cases match", cases.len());
+    }
+}
+
+#[cfg(test)]
+mod file_delivery_tests {
+    use super::*;
+
+    #[test]
+    fn file_delivery_yields_exact_first_file_without_waiting_for_batch_end() {
+        let raw = format!("{TOOL_CALLS_START}>\n<{DSML} invoke name=\"write_file\"><{DSML} parameter name=\"path\" string=\"true\">a.html</{DSML} parameter><{DSML} parameter name=\"content\" string=\"true\"><div>λ\n  exact spacing</div></{DSML} parameter></{DSML} invoke>");
+        let mut parser = StreamParser::new(Mode::Chat);
+        let chars: Vec<_> = raw.chars().collect();
+        for (i,ch) in chars.iter().enumerate() {
+            parser.push(&ch.to_string());
+            let yielded = parser.yield_completed_file();
+            assert_eq!(yielded, i + 1 == chars.len());
+        }
+        let calls = parser.finish().1;
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "write_file");
+        assert!(calls[0].arguments.contains("exact spacing"));
+        assert_eq!(runtime_dsml::parse(&format!("{raw}</{DSML} calls>")).unwrap().1[0].arguments, calls[0].arguments);
+    }
+
+    #[test]
+    fn file_delivery_keeps_only_the_first_complete_file_in_a_large_chunk() {
+        let first = format!("<{DSML} invoke name=\"write_file\"><{DSML} parameter name=\"path\" string=\"true\">one</{DSML} parameter><{DSML} parameter name=\"content\" string=\"true\">exact</{DSML} parameter></{DSML} invoke>");
+        let second = first.replace("one", "two");
+        let mut parser = StreamParser::new(Mode::Chat);
+        parser.push(&format!("{TOOL_CALLS_START}>{first}{second}</{DSML} calls>"));
+        assert!(parser.yield_completed_file());
+        let calls = parser.finish().1;
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].arguments.contains("one"));
+        assert!(!calls[0].arguments.contains("two"));
+    }
+
+    #[test]
+    fn file_delivery_does_not_yield_read_batches_or_incomplete_values() {
+        let mut parser = StreamParser::new(Mode::Chat);
+        parser.push(&format!("{TOOL_CALLS_START}><{DSML} invoke name=\"list_files\"></{DSML} invoke>"));
+        assert!(!parser.yield_completed_file());
+        assert!(!parser.tool_calls_ready());
+        parser.push(&format!("<{DSML} invoke name=\"write_file\"><{DSML} parameter name=\"content\" string=\"true\">quoted </{DSML} invoke>"));
+        assert!(!parser.yield_completed_file());
+        assert!(!parser.tool_calls_ready());
     }
 }
