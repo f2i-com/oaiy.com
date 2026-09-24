@@ -15,7 +15,7 @@ New-Item -ItemType Directory -Path $run -Force | Out-Null
 $requestPath = Join-Path $run 'request.json'
 $request = @{
     base = $cfg.base
-    transformer = $(if ($Weights -eq 'gguf') { $cfg.transformer } else { Join-Path $cfg.base 'transformer' })
+    transformer = $(if ($Weights -eq 'gguf') { $cfg.transformer } elseif ($cfg.safetensors_transformer) { $cfg.safetensors_transformer } else { Join-Path $cfg.base 'transformer' })
     adapter = $cfg.adapter
     output_dir = (Join-Path $run 'images')
     prompt = $Prompt

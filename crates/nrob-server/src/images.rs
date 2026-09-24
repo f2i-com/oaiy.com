@@ -17,6 +17,7 @@ pub struct Config {
     pub worker: PathBuf,
     pub base: PathBuf,
     pub transformer: PathBuf,
+    pub safetensors_transformer: Option<PathBuf>,
     pub adapter: Option<PathBuf>,
     pub output_root: PathBuf,
     pub controller_name: String,
@@ -46,6 +47,11 @@ impl Config {
             worker: s("worker")?.into(),
             base: s("base")?.into(),
             transformer: s("transformer")?.into(),
+            safetensors_transformer: match j.get("safetensors_transformer") {
+                None | Some(Json::Null) => None,
+                Some(v) => Some(v.as_str().filter(|s| !s.trim().is_empty())
+                    .ok_or("safetensors_transformer must be a nonempty path")?.into()),
+            },
             adapter: j.get("adapter").and_then(Json::as_str).map(PathBuf::from),
             output_root: s("output_root")?.into(),
             controller_name: s("controller_name")?,
@@ -60,6 +66,7 @@ impl Config {
         for p in [&c.worker, &c.base, &c.transformer, &c.controller_path]
             .into_iter()
             .chain(c.adapter.iter())
+            .chain(c.safetensors_transformer.iter())
             .chain(c.video_config.iter())
         {
             if !p.is_absolute() || !p.exists() {
@@ -618,7 +625,7 @@ fn prepare(c: &Config, body: &Json) -> Result<Json, String> {
     };
     let transformer = match weights {
         "gguf" => c.transformer.clone(),
-        "safetensors" => c.base.join("transformer"),
+        "safetensors" => c.safetensors_transformer.clone().unwrap_or_else(|| c.base.join("transformer")),
         _ => return Err("weights must be gguf or safetensors".into()),
     };
     if turbo && c.adapter.is_none() {
@@ -797,6 +804,7 @@ mod tests {
             worker: "worker".into(),
             base: "base".into(),
             transformer: "model.gguf".into(),
+            safetensors_transformer: None,
             adapter: Some("turbo.safetensors".into()),
             output_root: std::env::temp_dir()
                 .join(format!("nrob-image-test-{}", std::process::id())),
@@ -858,7 +866,7 @@ mod tests {
     }
     #[test]
     fn batch_parameters_and_server_owned_paths_are_preserved() {
-        let cfg = config();
+        let mut cfg = config();
         let turbo = prepare(&cfg, &Json::parse(br#"{"prompt":"x"}"#).unwrap()).unwrap();
         assert_eq!(turbo.get("steps").and_then(Json::as_i64), Some(6));
         assert_eq!(
@@ -881,6 +889,42 @@ mod tests {
         .unwrap();
         assert_eq!(base.get("adapter"), Some(&Json::Null));
         assert_eq!(base.get("steps").and_then(Json::as_i64), Some(40));
+        cfg.safetensors_transformer = Some("custom.safetensors".into());
+        let custom = prepare(&cfg, &Json::parse(br#"{"prompt":"x","weights":"safetensors","transformer":"untrusted","safetensors_transformer":"untrusted"}"#).unwrap()).unwrap();
+        assert_eq!(custom.get("transformer").and_then(Json::as_str), Some("custom.safetensors"));
+        let gguf = prepare(&cfg, &Json::parse(br#"{"prompt":"x","weights":"gguf"}"#).unwrap()).unwrap();
+        assert_eq!(gguf.get("transformer").and_then(Json::as_str), Some("model.gguf"));
         std::fs::remove_dir_all(&cfg.output_root).unwrap();
+    }
+    #[test]
+    fn configured_safetensors_override_is_optional_and_validated() {
+        let root = std::env::temp_dir().join(format!("nrob-safe-config-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let checkpoint = root.join("custom.safetensors");
+        std::fs::write(&checkpoint, b"fixture").unwrap();
+        let config_path = root.join("config.json");
+        for (value, valid) in [
+            (Json::Null, true),
+            (Json::str(checkpoint.to_string_lossy()), true),
+            (Json::Int(1), false),
+            (Json::str(""), false),
+            (Json::str("relative.safetensors"), false),
+            (Json::str(root.join("missing.safetensors").to_string_lossy()), false),
+        ] {
+            let body = Json::obj([
+                ("worker", Json::str(checkpoint.to_string_lossy())),
+                ("base", Json::str(root.to_string_lossy())),
+                ("transformer", Json::str(checkpoint.to_string_lossy())),
+                ("safetensors_transformer", value),
+                ("output_root", Json::str(root.to_string_lossy())),
+                ("controller_name", Json::str("controller")),
+                ("controller_path", Json::str(checkpoint.to_string_lossy())),
+                ("controller_device", Json::Int(0)),
+                ("image_device", Json::Int(1)),
+            ]);
+            std::fs::write(&config_path, body.to_json()).unwrap();
+            assert_eq!(Config::read(&config_path).is_ok(), valid);
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
