@@ -197,6 +197,14 @@ OpenAI's.
   compressed rows and index keys so far), and a new process starts from them, so a
   restart does not read a system prompt, or a conversation it resumes, again.
   `--prompt-cache-gb` caps the disk they take (default 4).
+- **Qwen hybrid prompt cache:** the native `qwen35` controller also checkpoints
+  attention, delta-net and convolution state before the first user message and
+  the current assistant reply. Re-rendered reasoning or tool calls reuse the
+  matching prefix instead of starting over. Up to three host checkpoints are
+  retained, with a 1 GiB target (one larger checkpoint is allowed). Text-only
+  states use `--prompt-cache` across restarts; image-conditioned states stay in
+  memory. An identical retry leaves one token to recompute the sampling logits.
+  The initial uncached prompt still needs a full prefill.
 - **Long prompts** run layer by layer: every expert is read once for the whole prompt
   instead of once per chunk (~6× faster here than chunked prefill), up to 20,480 tokens a
   pass (`--layered-max`); a longer prompt splits into equal passes, and a pass that runs out

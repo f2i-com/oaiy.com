@@ -2,6 +2,9 @@
 use std::sync::{mpsc::Receiver, atomic::Ordering};
 use dsv41::chat::{Encoded, Mode, Options, DSML};
 use ggml_rs::Tensor;
+use std::sync::Arc;
+use crate::qwen_cache::Snapshot;
+use crate::disk::PromptState;
 use llama_rs::{Model, MmProj, MmProjConfig, KvCache};
 use nrob::json::Json;
 use crate::engine::{Event, Finish, ImagePrep, Job, JobImage, sample};
@@ -159,12 +162,14 @@ pub struct QwenEngine {
     covered: Vec<u64>,
     vision_cache: std::collections::VecDeque<(u64, Tensor)>,
     log: bool,
+    checkpoints: Vec<(Vec<u64>, Arc<Snapshot>, bool)>,
+    pub disk: Option<crate::disk::DiskCache<Arc<Snapshot>>>,
 }
 
 impl QwenEngine {
     pub fn new(model: Model, projector: Option<MmProj>, max_seq: usize, log: bool) -> Self {
         let kv = model.new_kv_cache(max_seq);
-        Self { model, projector, kv, covered: Vec::new(), vision_cache: Default::default(), log }
+        Self { model, projector, kv, covered: Vec::new(), vision_cache: Default::default(), log, checkpoints: Vec::new(), disk: None }
     }
     pub fn run(mut self, jobs: Receiver<Job>) {
         for job in jobs {
@@ -180,8 +185,28 @@ impl QwenEngine {
         let mut keys: Vec<_> = job.prompt.iter().map(|&t| t as u64).collect();
         for image in &job.images { for (offset,k) in keys[image.start..image.start+image.prep.n_tokens()].iter_mut().enumerate() { *k = image.hash.rotate_left(17) ^ (offset as u64) ^ (1<<63); } }
         let common = self.covered.iter().zip(&keys).take_while(|(a,b)| a==b).count();
-        let start = if common == self.covered.len() && common < keys.len() { common } else { self.kv.reset(); self.covered.clear(); 0 };
-        let _ = job.events.send(Event::CacheReuse { cached: start, source: if start>0 { "memory" } else { "none" }, common });
+        let mut start = if common == self.covered.len() && common < keys.len() { common } else { 0 };
+        let mut source = if start > 0 { "memory" } else { "none" };
+        if let Some((saved, snap, _)) = self.checkpoints.iter().filter(|(saved, _, _)|
+            saved.len() > start && saved.len() < keys.len() && keys.starts_with(saved)
+        ).max_by_key(|(saved, _, _)| saved.len()) {
+            snap.restore(&mut self.kv, &model.attention_layers, model.ssm_cfg, model.backend.as_ref())?;
+            self.covered = saved.clone(); start = saved.len(); source = "checkpoint";
+        }
+        // Image states remain in RAM: an SSD state would also need to identify
+        // the projector and its preprocessing version, not just the text model.
+        if job.images.is_empty() {
+            if let Some((saved, snap)) = self.disk.as_mut().and_then(|d| d.load_best(&keys, keys.len()-1, start, self.log)) {
+                match snap.restore(&mut self.kv, &model.attention_layers, model.ssm_cfg, model.backend.as_ref()) {
+                    Ok(()) => { self.covered = saved; start = snap.pos; source = "disk"; }
+                    Err(e) => { if self.log { eprintln!("Qwen checkpoint skipped: {e}"); } }
+                }
+            }
+        }
+        if start == 0 { self.kv.reset(); self.covered.clear(); }
+        let _ = job.events.send(Event::CacheReuse { cached: start, source, common });
+        if self.log { eprintln!("  Qwen cache: {start}/{} tokens from {source} (common {common})", keys.len()); }
+        let stops = checkpoint_positions(&job.prompt, model.tokenizer.token_id("<|im_start|>"));
         let total = keys.len()-start;
         let _ = job.events.send(Event::Progress { done: 0, total });
         let clock = std::time::Instant::now();
@@ -199,9 +224,10 @@ impl QwenEngine {
             soft.push((image.start,t));
         }
         let mut logits = None;
-        for pos in (start..keys.len()).step_by(128) {
+        let mut pos = start;
+        while pos < keys.len() {
             if job.cancel.load(Ordering::Relaxed) { return Ok(()); }
-            let end = (pos+128).min(keys.len());
+            let end = (pos+128).min(keys.len()).min(stops.iter().copied().find(|&s| s > pos).unwrap_or(keys.len()));
             let mut embeds = model.embed_text(&job.prompt[pos..end]).to_host();
             let width = model.config.embedding_dim;
             for (at,t) in &soft {
@@ -213,6 +239,22 @@ impl QwenEngine {
             logits = Some(out.to_host());
             self.covered.extend_from_slice(&keys[pos..end]);
             let _ = job.events.send(Event::Progress { done: end-start, total });
+            pos = end;
+            if stops.contains(&pos) && !self.checkpoints.iter().any(|(saved, _, _)| saved == &keys[..pos]) {
+                let snap = Arc::new(Snapshot::capture(&self.kv, &model.attention_layers, model.backend.as_ref()));
+                let base = stops.first() == Some(&pos);
+                if job.images.is_empty() {
+                    if let Some(disk) = &mut self.disk { disk.save(keys[..pos].to_vec(), Arc::clone(&snap), base); }
+                }
+                self.checkpoints.push((keys[..pos].to_vec(), snap, base));
+                // Keep the system prefix plus recent conversation boundaries.
+                // Host storage avoids competing with media for VRAM.
+                while self.checkpoints.len() > 1 && (self.checkpoints.len() > 3 ||
+                    self.checkpoints.iter().map(|(_, s, _)| s.encoded_len()).sum::<usize>() > 1024 * 1024 * 1024) {
+                    let remove = (0..self.checkpoints.len()-1).min_by_key(|&i| (self.checkpoints[i].2, i)).unwrap();
+                    self.checkpoints.remove(remove);
+                }
+            }
         }
         let prefill_secs = clock.elapsed().as_secs_f64();
         let _ = job.events.send(Event::Prefilled { cached: start });
@@ -247,6 +289,19 @@ impl QwenEngine {
     }
 }
 
+/// Save before the first user message, before the current assistant header
+/// (thinking/tool rendering changes its suffix), and one token short of the
+/// entire prompt so an identical retry still runs a token to recover logits.
+fn checkpoint_positions(prompt: &[u32], im_start: Option<u32>) -> Vec<usize> {
+    let boundaries: Vec<_> = prompt.iter().enumerate().filter_map(|(i, &t)|
+        (i > 0 && Some(t) == im_start).then_some(i)).collect();
+    let mut stops = vec![prompt.len().saturating_sub(1)];
+    stops.extend(boundaries.first().copied());
+    stops.extend(boundaries.last().copied());
+    stops.retain(|&p| p > 0 && p < prompt.len());
+    stops.sort_unstable(); stops.dedup(); stops
+}
+
 fn positions(job: &Job) -> Result<(Vec<[u32;3]>,u32),String> {
     let mut positions = Vec::with_capacity(job.prompt.len()); let mut at=0usize; let mut next=0u32;
     for image in &job.images {
@@ -263,6 +318,17 @@ fn positions(job: &Job) -> Result<(Vec<[u32;3]>,u32),String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn checkpoints_survive_changed_assistant_suffix_and_leave_logits_token() {
+        // 1 is im_start; later reasoning and tool XML need not match.
+        let first = [1, 10, 11, 1, 20, 21, 1, 30, 31, 32];
+        let next = [1, 10, 11, 1, 20, 21, 1, 30, 40, 41, 1, 50];
+        let stops = checkpoint_positions(&first, Some(1));
+        assert_eq!(stops, [3, 6, 9]);
+        assert_eq!(stops.iter().copied().filter(|&p| next.starts_with(&first[..p])).max(), Some(6));
+        assert_eq!(checkpoint_positions(&[1], Some(1)), []);
+        assert_eq!(checkpoint_positions(&[7, 8, 9], None), [2]);
+    }
     fn tools() -> Vec<Json> { vec![Json::parse(br#"{"function":{"name":"computer","parameters":{"type":"object","properties":{"action":{"type":"string"},"keys":{"type":"array"}},"required":["action"]}}}"#).unwrap()] }
     #[test]
     fn native_calls_preserve_types_and_reject_partial_or_unknown_calls() {

@@ -21,6 +21,7 @@ pub mod glm;
 pub mod models;
 mod http;
 mod qwen;
+mod qwen_cache;
 pub mod images;
 mod media_catalog;
 

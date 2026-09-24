@@ -571,7 +571,25 @@ impl Models {
             } else { None };
             cfg.qwen_vision = projector.as_ref().map(|p|p.config().clone());
             let (jobs,rx) = std::sync::mpsc::channel();
-            let e = crate::qwen::QwenEngine::new(model,projector,max_seq,!o.quiet && !o.silent);
+            let mut e = crate::qwen::QwenEngine::new(model,projector,max_seq,!o.quiet && !o.silent);
+            if let Some(dir) = &o.prompt_cache {
+                // Separate format/implementation namespace; replacing weights
+                // in place also invalidates states via size and modification time.
+                let mut fingerprint = disk::fnv(b"qwen35-hybrid-state-v1", 0);
+                fingerprint = disk::fnv(path.as_os_str().as_encoded_bytes(), fingerprint);
+                let metadata = std::fs::metadata(&path)?;
+                fingerprint = disk::fnv(&metadata.len().to_le_bytes(), fingerprint);
+                if let Ok(modified) = metadata.modified().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).map_err(std::io::Error::other)) {
+                    fingerprint = disk::fnv(&modified.as_nanos().to_le_bytes(), fingerprint);
+                }
+                match disk::DiskCache::open(dir, fingerprint, (o.prompt_cache_gb * 1e9) as u64) {
+                    Ok(cache) => {
+                        self.say(format!("{} Qwen prompt states on disk in {}", cache.len(), dir.display()));
+                        e.disk = Some(cache);
+                    }
+                    Err(err) => self.say(format!("Qwen prompt states are not kept ({}: {err})", dir.display())),
+                }
+            }
             let thread = std::thread::Builder::new().name("qwen-model".into()).spawn(move || e.run(rx)).map_err(Error::Io)?;
             return Ok(Live {name:spec.name.clone(),jobs,thread,cfg:Arc::new(cfg),flavour:Arc::new(Flavour::Qwen(tok))});
         }
