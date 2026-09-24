@@ -484,7 +484,8 @@ fn prepare_video(c: &Config, body: &Json) -> Result<Json, String> {
     let seed = number("seed", 0, 0, i64::MAX)?;
     number("steps", 8, 8, 8)?;
     number("n", 1, 1, 1)?;
-    let image = video_reference_path(body, true)?;
+    let image = video_reference_path(body, "image", true)?;
+    let end_image = video_reference_path(body, "end_image", true)?;
     for key in ["images", "audio", "adapter"] {
         if body.get(key).is_some_and(|v| !matches!(v, Json::Null)) {
             return Err(format!("{key} is not supported for video; use image for one starting frame"));
@@ -510,6 +511,7 @@ fn prepare_video(c: &Config, body: &Json) -> Result<Json, String> {
     let mut fields = vec![
         ("kind".into(), Json::str("video")),
         ("image".into(), image.unwrap_or(Json::Null)),
+        ("end_image".into(), end_image.unwrap_or(Json::Null)),
         ("model".into(), Json::str(model)),
         ("prompt".into(), Json::str(prompt)),
         ("width".into(), Json::Int(width)),
@@ -666,8 +668,8 @@ fn prepare(c: &Config, body: &Json) -> Result<Json, String> {
 }
 
 /// Shares the server's existing opt-in policy for reading local image paths.
-pub(crate) fn video_reference_path(body: &Json, allow_local: bool) -> Result<Option<Json>, String> {
-    match body.get("image") {
+pub(crate) fn video_reference_path(body: &Json, key: &str, allow_local: bool) -> Result<Option<Json>, String> {
+    match body.get(key) {
         None | Some(Json::Null) => Ok(None),
         Some(image) => {
             let wrapper = Json::obj([("images", Json::Arr(vec![image.clone()]))]);
@@ -758,11 +760,17 @@ mod tests {
         assert_eq!(r.get("device").and_then(Json::as_i64), Some(1));
         assert!(r.get("cache_dir").and_then(Json::as_str).unwrap().ends_with(".ltx-prompt-cache"));
         assert!(prepare_video(&cfg, &valid(r#", "prompt_cache":false"#)).unwrap().get("cache_dir").is_none());
-        let reference = Json::obj([("image", Json::str(weight.to_string_lossy()))]);
-        assert!(video_reference_path(&reference, false).is_err());
-        assert!(video_reference_path(&reference, true).unwrap().is_some());
-        for invalid in [Json::Int(1), Json::str("relative.png"), Json::str("")] {
-            assert!(video_reference_path(&Json::obj([("image", invalid)]), true).is_err());
+        for key in ["image", "end_image"] {
+            let reference = Json::obj([(key, Json::str(weight.to_string_lossy()))]);
+            assert!(video_reference_path(&reference, key, false).is_err());
+            let expected = video_reference_path(&reference, key, true).unwrap().unwrap();
+            let mut body = valid("");
+            if let Json::Obj(fields) = &mut body { fields.push((key.into(), Json::str(weight.to_string_lossy()))); }
+            assert_eq!(prepare_video(&cfg, &body).unwrap().get(key).unwrap().to_json(), expected.to_json());
+            assert!(video_reference_path(&Json::obj([(key, Json::Null)]), key, false).unwrap().is_none());
+            for invalid in [Json::Int(1), Json::str("relative.png"), Json::str("")] {
+                assert!(video_reference_path(&Json::obj([(key, invalid)]), key, true).is_err());
+            }
         }
         assert_eq!(
             r.get("transformer").and_then(Json::as_str),

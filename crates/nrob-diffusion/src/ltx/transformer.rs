@@ -16,6 +16,7 @@ fn rms(x: &Tensor, weight: &Tensor, eps: f64) -> Result<Tensor> {
 pub struct Rope {
     cos: Tensor,
     sin: Tensor,
+    first_frame_tokens: usize,
 }
 impl Rope {
     pub fn positions(positions: &[Vec<f32>], maxima: &[f32], dev: &Device) -> Result<Self> {
@@ -42,6 +43,7 @@ impl Rope {
         }
         let shape = (1, positions.len(), 32, 64);
         Ok(Self {
+            first_frame_tokens: 0,
             cos: Tensor::from_vec(cos, shape, dev)?
                 .transpose(1, 2)?
                 .to_dtype(DType::BF16)?,
@@ -50,11 +52,22 @@ impl Rope {
                 .to_dtype(DType::BF16)?,
         })
     }
+    #[cfg(test)]
     pub fn video(
         frames: usize,
         height: usize,
         width: usize,
         fps: usize,
+        dev: &Device,
+    ) -> Result<Self> {
+        Self::video_with_end(frames, height, width, fps, false, dev)
+    }
+    pub fn video_with_end(
+        frames: usize,
+        height: usize,
+        width: usize,
+        fps: usize,
+        end_image: bool,
         dev: &Device,
     ) -> Result<Self> {
         let mut positions = Vec::new();
@@ -71,7 +84,21 @@ impl Rope {
                 }
             }
         }
-        Self::positions(&positions, &[20., 2048., 2048.], dev)
+        if end_image {
+            let frame_index = (frames - 1) * 8;
+            for y in 0..height {
+                for x in 0..width {
+                    positions.push(vec![
+                        (frame_index as f32 + 0.5) / fps as f32,
+                        (y as f32 + 0.5) * 32.,
+                        (x as f32 + 0.5) * 32.,
+                    ]);
+                }
+            }
+        }
+        let mut rope = Self::positions(&positions, &[20., 2048., 2048.], dev)?;
+        rope.first_frame_tokens = height * width;
+        Ok(rope)
     }
     fn apply(&self, x: &Tensor) -> Result<Tensor> {
         let a = x.narrow(3, 0, 64)?;
@@ -241,6 +268,8 @@ pub struct Transformer {
     require_gpu: bool,
     #[cfg(test)]
     last_hidden: Option<Tensor>,
+    #[cfg(test)]
+    first_hidden: Option<Tensor>,
 }
 
 #[cfg(test)]
@@ -249,14 +278,19 @@ mod tests {
     #[test]
     #[ignore = "requires the complete official transformer reference; NROB_LTX_GOLDEN"]
     fn full_video_transformer_matches_reference() -> Result<()> {
-        full_reference(0)
+        full_reference(0, false)
     }
     #[test]
     #[ignore = "requires official per-token timestep reference; NROB_LTX_GOLDEN"]
     fn image_conditioned_transformer_matches_reference() -> Result<()> {
-        full_reference(4)
+        full_reference(4, false)
     }
-    fn full_reference(conditioned_tokens: usize) -> Result<()> {
+    #[test]
+    #[ignore = "requires official start/end-keyframe reference; NROB_LTX_GOLDEN"]
+    fn endpoint_conditioned_transformer_matches_reference() -> Result<()> {
+        full_reference(16, true)
+    }
+    fn full_reference(conditioned_tokens: usize, end_frame: bool) -> Result<()> {
         let root = std::path::PathBuf::from(
             std::env::var("NROB_LTX_GOLDEN").map_err(candle_core::Error::wrap)?,
         );
@@ -270,45 +304,85 @@ mod tests {
         let read = |name: &str, shape: &[usize]| -> Result<Tensor> {
             Tensor::from_raw_buffer(&std::fs::read(root.join(name))?, DType::F32, shape, &dev)
         };
-        let prefix = if conditioned_tokens == 0 {
+        let tokens = if end_frame { 48 } else { 16 };
+        let end_tokens = if end_frame { 16 } else { 0 };
+        let prefix = if end_frame {
+            "end-transformer"
+        } else if conditioned_tokens == 0 {
             "transformer"
         } else {
             "i2v-transformer"
         };
-        let x = read(&format!("{prefix}-input.f32"), &[1, 16, 128])?.to_dtype(DType::BF16)?;
+        let x = read(&format!("{prefix}-input.f32"), &[1, tokens, 128])?.to_dtype(DType::BF16)?;
         let context =
             read(&format!("{prefix}-context.f32"), &[1, 8, 4096])?.to_dtype(DType::BF16)?;
         let expected = read(
-            if conditioned_tokens == 0 {
+            if end_frame {
+                "end-transformer-output.f32"
+            } else if conditioned_tokens == 0 {
                 "transformer-output.f32"
             } else {
                 "i2v-transformer-output.f32"
             },
-            &[1, 16, 128],
+            &[1, tokens, 128],
         )?;
         let store = Store::open(std::path::Path::new(&weights), 0)?;
         let mut model = Transformer::new(store, &dev, 26 << 30, true)?;
-        let rope = Rope::video(1, 4, 4, 24, &dev)?;
+        let rope = Rope::video_with_end(if end_frame { 2 } else { 1 }, 4, 4, 24, end_frame, &dev)?;
         let actual = model
-            .forward(&x, &context, 0.725, &rope, conditioned_tokens, |_| {})?
+            .forward(
+                &x,
+                &context,
+                0.725,
+                &rope,
+                conditioned_tokens,
+                end_tokens,
+                |_| {},
+            )?
             .to_dtype(DType::F32)?;
+        if end_frame {
+            let first = model.first_hidden.as_ref().unwrap().to_dtype(DType::F32)?;
+            let reference = read("end-first-block.f32", &[1, tokens, 4096])?;
+            let error = ((first - &reference)?
+                .sqr()?
+                .mean_all()?
+                .to_scalar::<f32>()?
+                / reference.sqr()?.mean_all()?.to_scalar::<f32>()?)
+            .sqrt();
+            println!("First video block relative RMS error: {error}");
+            assert!(error < 0.005, "first block relative RMS {error}");
+        }
+        let mut hidden_error = 0.;
         if conditioned_tokens > 0 {
             let hidden = model.last_hidden.as_ref().unwrap().to_dtype(DType::F32)?;
-            let reference = read("i2v-hidden.f32", &[1, 16, 4096])?;
+            let reference = read(
+                if end_frame {
+                    "end-hidden.f32"
+                } else {
+                    "i2v-hidden.f32"
+                },
+                &[1, tokens, 4096],
+            )?;
             let relative = ((hidden - &reference)?
                 .sqr()?
                 .mean_all()?
                 .to_scalar::<f32>()?
                 / reference.sqr()?.mean_all()?.to_scalar::<f32>()?)
             .sqrt();
-            assert!(
-                relative < 0.04,
-                "conditioned hidden-state relative RMS {relative}"
-            );
+            println!("Final hidden-state relative RMS error: {relative}");
+            hidden_error = relative;
         }
         // Clean-frame velocities are discarded by masked Euler sampling.
-        let actual = actual.narrow(1, conditioned_tokens, 16 - conditioned_tokens)?;
-        let expected = expected.narrow(1, conditioned_tokens, 16 - conditioned_tokens)?;
+        let actual = actual.narrow(
+            1,
+            conditioned_tokens,
+            tokens - conditioned_tokens - end_tokens,
+        )?;
+        let expected = expected.narrow(
+            1,
+            conditioned_tokens,
+            tokens - conditioned_tokens - end_tokens,
+        )?;
         let error = (&actual - &expected)?
             .sqr()?
             .mean_all()?
@@ -319,10 +393,26 @@ mod tests {
             "Complete video transformer relative RMS error: {}",
             error / scale
         );
+        // LTX 2.5's learned marker changes the activation distribution. Its
+        // BF16 backends accumulate more error across 48 layers; separately
+        // require the first conditioned block to agree within 0.5% above.
+        let keyframe_embedding = model
+            .global
+            .tensors
+            .contains_key("keyframes_abs_pos_embedding");
+        let (hidden_limit, velocity_limit) = if end_frame && keyframe_embedding {
+            (0.05, 0.12)
+        } else {
+            (0.04, if conditioned_tokens == 0 { 0.05 } else { 0.10 })
+        };
+        assert!(
+            hidden_error < hidden_limit,
+            "conditioned hidden-state relative RMS {hidden_error}"
+        );
         assert!(
             // Mixed zero/noisy timesteps amplify small BF16 backend differences
             // in the final projection; also bound the pre-projection state above.
-            error / scale < if conditioned_tokens == 0 { 0.05 } else { 0.10 },
+            error / scale < velocity_limit,
             "full transformer relative RMS error {}",
             error / scale
         );
@@ -406,6 +496,7 @@ impl Transformer {
                 || k.starts_with("prompt_adaln_single.")
                 || k.starts_with("proj_out.")
                 || k == "scale_shift_table"
+                || k == "keyframes_abs_pos_embedding"
         })?;
         Ok(Self {
             store,
@@ -416,6 +507,8 @@ impl Transformer {
             require_gpu,
             #[cfg(test)]
             last_hidden: None,
+            #[cfg(test)]
+            first_hidden: None,
         })
     }
     pub fn stats(&self) -> (u64, u64, u64) {
@@ -428,27 +521,34 @@ impl Transformer {
         sigma: f64,
         rope: &Rope,
         conditioned_tokens: usize,
+        end_tokens: usize,
         mut progress: impl FnMut(usize),
     ) -> Result<Tensor> {
         let dev = latent.device();
         let tokens = latent.dim(1)?;
-        if conditioned_tokens >= tokens {
+        if conditioned_tokens + end_tokens >= tokens {
             candle_core::bail!("conditioning must leave generated video tokens");
         }
         let (mut modulation, mut embedded) =
             time_embedding(&self.global, "adaln_single", sigma, dev)?;
-        if conditioned_tokens > 0 {
-            // Only two distinct timesteps: clean first frame and noisy video.
+        if conditioned_tokens > 0 || end_tokens > 0 {
+            // Only two distinct timesteps: clean endpoint images and noisy video.
             let (clean_modulation, clean_embedded) =
                 time_embedding(&self.global, "adaln_single", 0., dev)?;
             let expand = |clean: &Tensor, noisy: &Tensor| -> Result<Tensor> {
-                Tensor::cat(
-                    &[
-                        clean.broadcast_as((1, conditioned_tokens, clean.dim(2)?))?,
-                        noisy.broadcast_as((1, tokens - conditioned_tokens, noisy.dim(2)?))?,
-                    ],
+                let mut parts = Vec::new();
+                if conditioned_tokens > 0 {
+                    parts.push(clean.broadcast_as((1, conditioned_tokens, clean.dim(2)?))?);
+                }
+                parts.push(noisy.broadcast_as((
                     1,
-                )
+                    tokens - conditioned_tokens - end_tokens,
+                    noisy.dim(2)?,
+                ))?);
+                if end_tokens > 0 {
+                    parts.push(clean.broadcast_as((1, end_tokens, clean.dim(2)?))?);
+                }
+                Tensor::cat(&parts, 1)
             };
             modulation = expand(&clean_modulation, &modulation)?;
             embedded = expand(&clean_embedded, &embedded)?;
@@ -468,6 +568,19 @@ impl Transformer {
             None
         };
         let mut x = self.global.linear("patchify_proj", latent)?;
+        if let Some(embedding) = self.global.tensors.get("keyframes_abs_pos_embedding") {
+            // LTX 2.5 marks the first video latent (one pixel frame). Supplied
+            // end-keyframe tokens remain unmarked in the official conditioner.
+            let n = rope.first_frame_tokens;
+            if n > 0 {
+                let first = x.narrow(1, 0, n)?.broadcast_add(embedding)?;
+                x = if n == tokens {
+                    first
+                } else {
+                    Tensor::cat(&[first, x.narrow(1, n, tokens - n)?], 1)?
+                };
+            }
+        }
         for i in 0..48 {
             let temporary;
             let w = if let Some(w) = self.resident[i].as_ref() {
@@ -491,6 +604,10 @@ impl Transformer {
                 }
             };
             x = block(w, x, context, &modulation, prompt.as_ref(), rope)?;
+            #[cfg(test)]
+            if i == 0 {
+                self.first_hidden = Some(x.clone());
+            }
             progress(i + 1);
         }
         #[cfg(test)]

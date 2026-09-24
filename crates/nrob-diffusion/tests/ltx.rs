@@ -11,6 +11,7 @@ fn request(extra: &str) -> Json {
 #[test]
 fn rejects_invalid_video_geometry_and_unsupported_modes() {
     assert!(Request::parse(&request("")).is_ok());
+    assert!(Request::parse(&request(r#", "image":null, "end_image":null"#)).is_ok());
     for extra in [
         r#", "frames":48"#,
         r#", "width":129"#,
@@ -18,9 +19,37 @@ fn rejects_invalid_video_geometry_and_unsupported_modes() {
         r#", "memory":"unbounded""#,
         r#", "fps":0"#,
         r#", "images":["x.png"]"#,
+        r#", "end_image":42"#,
+        r#", "end_image":"""#,
+        r#", "end_image":"relative.png""#,
     ] {
         assert!(Request::parse(&request(extra)).is_err(), "{extra}");
     }
+}
+#[test]
+fn optional_endpoints_accept_existing_absolute_files() {
+    let path = std::env::temp_dir().join(format!("nrob-video-endpoint-{}.png", std::process::id()));
+    std::fs::write(&path, b"fixture").unwrap();
+    for keys in [
+        &["image"][..],
+        &["end_image"][..],
+        &["image", "end_image"][..],
+    ] {
+        let extra = keys
+            .iter()
+            .map(|key| {
+                format!(
+                    ", {}:{}",
+                    Json::str(*key).to_json(),
+                    Json::str(path.to_string_lossy()).to_json()
+                )
+            })
+            .collect::<String>();
+        let parsed = Request::parse(&request(&extra)).unwrap();
+        assert_eq!(parsed.image.is_some(), keys.contains(&"image"));
+        assert_eq!(parsed.end_image.is_some(), keys.contains(&"end_image"));
+    }
+    std::fs::remove_file(path).unwrap();
 }
 #[test]
 fn conv3d_causal_and_symmetric_boundary_values() -> candle_core::Result<()> {

@@ -12,7 +12,7 @@ fn main() {
 fn run() -> candle_core::Result<()> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     if args.first().is_some_and(|a| a == "--help") {
-        println!("nrob-diffusion --request request.json | --stdin\nNative Rust Qwen Image 2.1 and LTX video. JSON: base, transformer, adapter (optional), prompt or prompts, output_dir, n, width, height, steps, seed, device, cfg.\nTurbo: 6 steps by default (4 supported), CFG=1. Base: 40 steps, CFG=6.\nVideo: kind=video, model=ltx-2.3|ltx-2.5|sulphur-2, transformer, text_encoder, tokenizer (Gemma 3), vae, prompt, output_dir, optional image (starting frame) and cache_dir (bounded prompt cache). Eight steps; memory=auto|gpu|ram|ssd, ram_gb, vram_gb.");
+        println!("nrob-diffusion --request request.json | --stdin\nNative Rust Qwen Image 2.1 and LTX video. JSON: base, transformer, adapter (optional), prompt or prompts, output_dir, n, width, height, steps, seed, device, cfg.\nTurbo: 6 steps by default (4 supported), CFG=1. Base: 40 steps, CFG=6.\nVideo: kind=video, model=ltx-2.3|ltx-2.5|sulphur-2, transformer, text_encoder, tokenizer (Gemma 3), vae, prompt, output_dir, optional image (starting frame), end_image (final-frame guidance) and cache_dir (bounded prompt cache). Eight steps; memory=auto|gpu|ram|ssd, ram_gb, vram_gb.");
         return Ok(());
     }
     let bytes = match args.first().map(String::as_str) {

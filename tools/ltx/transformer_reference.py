@@ -14,6 +14,7 @@ parser.add_argument('--reference-deps')
 parser.add_argument('--output', default='target/ltx-golden')
 parser.add_argument('--device', default='cuda:0')
 parser.add_argument('--conditioned-tokens', type=int, default=0)
+parser.add_argument('--end-frame', action='store_true')
 args = parser.parse_args()
 if not 0 <= args.conditioned_tokens < 16:
     parser.error('--conditioned-tokens must be in 0..15')
@@ -44,14 +45,39 @@ positions = torch.tensor([[[0., 1. / 24], [y * 32, (y + 1) * 32], [x * 32, (x + 
                          device=args.device, dtype=torch.float32).permute(1, 0, 2).unsqueeze(0)
 timesteps = torch.full((1, 16), .725, device=args.device)
 timesteps[:, :args.conditioned_tokens] = 0
+prefix = 'i2v-transformer' if args.conditioned_tokens else 'transformer'
+hidden_name = 'i2v-hidden.f32'
+marker = torch.ones((1, 16, 1), device=args.device)
+if args.end_frame:
+    from ltx_core.tools import VideoLatentTools
+    from ltx_core.types import VideoLatentShape
+    from ltx_core.components.patchifiers import VideoLatentPatchifier
+    from ltx_core.conditioning.types.keyframe_cond import VideoConditionByKeyframeIndex
+    tools = VideoLatentTools(VideoLatentPatchifier(1), VideoLatentShape(1, 128, 2, 4, 4), 24.)
+    pixels = (torch.sin(torch.arange(32 * 128, device=args.device) * .013)
+              .reshape(1, 2, 4, 4, 128).permute(0, 4, 1, 2, 3).to(torch.bfloat16))
+    state = tools.create_initial_state(args.device, torch.bfloat16, pixels)
+    state.denoise_mask[:, :16] = 0
+    end = (torch.cos(torch.arange(16 * 128, device=args.device) * .019)
+           .reshape(1, 1, 4, 4, 128).permute(0, 4, 1, 2, 3).to(torch.bfloat16))
+    state = VideoConditionByKeyframeIndex(end, frame_idx=8, strength=1.).apply_to(state, tools)
+    x = state.latent * state.denoise_mask + state.clean_latent * (1 - state.denoise_mask)
+    x = x.to(torch.bfloat16)
+    positions = state.positions
+    timesteps = state.denoise_mask.squeeze(-1) * .725
+    marker = state.keyframes_mask
+    prefix = 'end-transformer'
+    hidden_name = 'end-hidden.f32'
 video = Modality(latent=x, sigma=torch.tensor([.725], device=args.device),
-                 timesteps=timesteps,
-                 positions=positions, context=context)
-if args.conditioned_tokens:
+                 timesteps=timesteps, positions=positions, context=context, keyframes_mask=marker)
+if args.end_frame:
+    model.transformer_blocks[0].register_forward_hook(
+        lambda m, a, o: o[0].x.float().cpu().numpy().tofile(out / 'end-first-block.f32'))
+if args.conditioned_tokens or args.end_frame:
     model.transformer_blocks[-1].register_forward_hook(
-        lambda m, a, o: o[0].x.float().cpu().numpy().tofile(out/'i2v-hidden.f32'))
+        lambda m, a, o: o[0].x.float().cpu().numpy().tofile(out / hidden_name))
 with torch.inference_mode():
     result, _ = model(video, None, None)
 for name, value in [('input', x), ('context', context), ('output', result)]:
-    value.float().cpu().numpy().tofile(out / (('i2v-transformer-' if args.conditioned_tokens else 'transformer-') + name + '.f32'))
+    value.float().cpu().numpy().tofile(out / (prefix + '-' + name + '.f32'))
 print('Official transformer RMS', result.float().square().mean().sqrt().item(), flush=True)
