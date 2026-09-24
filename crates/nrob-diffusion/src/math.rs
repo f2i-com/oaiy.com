@@ -93,6 +93,103 @@ pub fn unheads(x: &Tensor) -> Result<Tensor> {
     x.transpose(1, 2)?.contiguous()?.reshape((b, s, n * d))
 }
 
+/// Causal text segments and bidirectional reference blocks can see their prefix,
+/// never a later segment. Flash's causal mask is bottom-right aligned.
+pub fn block_attention(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    segments: &[(usize, bool)],
+) -> Result<Tensor> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    for &(len, causal) in segments {
+        if len == 0 {
+            continue;
+        }
+        let end = start + len;
+        parts.push(prefix_attention(
+            &q.narrow(2, start, len)?,
+            &k.narrow(2, 0, end)?,
+            &v.narrow(2, 0, end)?,
+            causal,
+        )?);
+        start = end;
+    }
+    Tensor::cat(&parts, 2)
+}
+pub fn prefix_attention(q: &Tensor, k: &Tensor, v: &Tensor, causal: bool) -> Result<Tensor> {
+    if !causal {
+        return attention(q, k, v, 0);
+    }
+    let (_, _, nq, d) = q.dims4()?;
+    let nk = k.dim(2)?;
+    #[cfg(feature = "flash-attn")]
+    if q.device().is_cuda()
+        && matches!(q.dtype(), DType::BF16 | DType::F16)
+        && (8..=256).contains(&d)
+        && d % 8 == 0
+    {
+        return candle_flash_attn::flash_attn(
+            &q.transpose(1, 2)?,
+            &k.transpose(1, 2)?,
+            &v.transpose(1, 2)?,
+            1. / (d as f32).sqrt(),
+            true,
+        )?
+        .transpose(1, 2);
+    }
+    let mut parts = Vec::new();
+    for start in (0..nq).step_by(128) {
+        let n = 128.min(nq - start);
+        let scores = (q
+            .narrow(2, start, n)?
+            .contiguous()?
+            .matmul(&k.transpose(2, 3)?.contiguous()?)?
+            / (d as f64).sqrt())?
+        .to_dtype(DType::F32)?;
+        let mask = (start..start + n)
+            .flat_map(|i| {
+                (0..nk).map(move |j| {
+                    if j > nk - nq + i {
+                        f32::NEG_INFINITY
+                    } else {
+                        0.
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        let scores = scores.broadcast_add(&Tensor::from_vec(mask, (1, 1, n, nk), q.device())?)?;
+        parts.push(
+            candle_nn::ops::softmax_last_dim(&scores)?
+                .to_dtype(q.dtype())?
+                .matmul(&v.contiguous()?)?,
+        );
+    }
+    Tensor::cat(&parts, 2)
+}
+#[test]
+fn references_are_bidirectional_with_causal_text_between() -> Result<()> {
+    let q = Tensor::zeros((1, 1, 7, 1), DType::F32, &candle_core::Device::Cpu)?;
+    let v = Tensor::from_vec(
+        vec![0f32, 2., 4., 6., 8., 10., 12.],
+        (1, 1, 7, 1),
+        q.device(),
+    )?;
+    let y = block_attention(
+        &q,
+        &q,
+        &v,
+        &[(1, true), (2, false), (1, true), (2, false), (1, true)],
+    )?
+    .flatten_all()?
+    .to_vec1::<f32>()?;
+    for (a, b) in y.iter().zip([0., 2., 2., 3., 5., 5., 6.]) {
+        assert!((a - b).abs() < 1e-5);
+    }
+    Ok(())
+}
+
 pub fn swiglu(
     x: &Tensor,
     gate: &crate::weights::Linear,
@@ -187,5 +284,17 @@ fn flash_matches_reference_for_causal_mixed_and_image_attention() -> Result<()> 
             );
         }
     }
+    let segments = [(3, true), (51, false), (7, true), (47, false), (31, true)];
+    let expected = block_attention(&q, &k, &v, &segments)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    let actual = block_attention(&gq, &gk, &gv, &segments)?
+        .to_dtype(DType::F32)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    assert!(actual
+        .iter()
+        .zip(&expected)
+        .all(|(a, b)| (a - b).abs() < 0.008));
     Ok(())
 }

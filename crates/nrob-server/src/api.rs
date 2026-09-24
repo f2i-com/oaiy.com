@@ -180,7 +180,10 @@ impl Server {
         }
         let result = match (req.method.as_str(), path) {
             ("POST", "/v1/images/generations") => {
-                match Self::parse_body(req).and_then(|body|self.images.submit(&body).map_err(bad)) {
+                match Self::parse_body(req).and_then(|body| {
+                    crate::images::reference_paths(&body,self.local_images).map_err(bad)?;
+                    self.images.submit(&body).map_err(bad)
+                }) {
                     Ok(job)=>return json_response(w,202,&job),Err(e)=>Err(e),
                 }
             }

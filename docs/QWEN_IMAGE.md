@@ -1,6 +1,6 @@
 # Native Qwen Image 2.1
 
-NROB implements text-to-image inference in Rust: Qwen3-VL-8B text conditioning,
+NROB implements text-to-image and reference-image editing in Rust: Qwen3-VL-8B conditioning,
 the 32-layer single-stream image transformer, FlowMatch Euler and the RGBA VAE.
 The compute worker uses Candle tensor primitives; it does not launch Python,
 ComfyUI or stable-diffusion.cpp. The server and existing core remain std-only.
@@ -70,6 +70,37 @@ contain exactly `n` prompts. Use `action: "status"` to inspect progress and
 results, `cancel` to terminate the worker and free its VRAM, and `release` after
 image work is finished to restore normal language-model selection. Release does
 not immediately reload DeepSeek; the next chat request chooses the model.
+
+Reference images are optional. Omit `images` (or pass `[]`) for text-to-image.
+Pass one, two, or three ordered paths for editing or composition, and describe
+the desired change in the prompt. The same references are reused for every image
+in a batch. Inputs are opened for reading; results always go into a new batch folder.
+
+```json
+{"action":"generate","prompt":"Change the robot in image 1 to blue; preserve the scene.","images":["robot.png"],"output_dir":"edits"}
+```
+
+```json
+{"action":"generate","prompt":"Place the character from image 1 in the setting from image 2, using the colors of image 3.","images":["character.png","setting.jpg","palette.webp"],"n":10,"output_dir":"compositions"}
+```
+
+The agent tool resolves relative references against its workspace. HTTP callers
+must use absolute paths accessible on the NROB server. PNG, JPEG, and WebP are
+supported, with a 32 MiB limit per file and bounded decoding. The server's existing
+`--local-images` policy also governs these inputs (enabled by default on loopback,
+disabled by default when listening remotely). Up to three references are supported
+in both base and turbo modes. Six-step turbo remains the default for both editing
+and text-to-image.
+
+`reference_size` defaults to 1024: each reference retains its aspect ratio and is
+resized to approximately that squared pixel area, rounded to multiples of 32.
+Set it to 512 for faster reference encoding and less memory. Allowed values are
+256–1024 in multiples of 32; reference aspect ratios must stay between 1:8 and 8:1.
+Output `width` and `height` remain independent (default 1024×1024).
+The VAE preserves alpha; the Qwen3-VL vision tower sees RGB composited over white.
+Reference/text conditioning keys and values are cached across sampling steps and
+reused across images sharing a prompt. Reference encoding and model loading add
+setup time before the first output.
 
 The tool queues work and returns immediately. A queued/running job is **not** a
 successful generation. Wait for `completed` and inspect `result.data` for paths.
@@ -146,7 +177,7 @@ not merged into low-precision weights. Six-step nodes are
 Both receive the resolution-dependent exponential shift; turbo disables
 terminal stretching and CFG (`cfg=1`). Base mode (`turbo:false` / no standalone
 adapter) defaults to 40 steps, CFG 6 and the base terminal shift of .02.
-Image editing and reference-image conditioning are not implemented here.
+Both sampling modes support the optional ordered reference images above.
 
 - [Qwen Image 2.1](https://huggingface.co/Qwen/Qwen-Image-2.1)
 - Requested GGUF weights and checksums
@@ -158,6 +189,33 @@ The Rust architecture port follows the Apache-2.0 Qwen/Hugging Face reference.
 Model weights retain their own Qwen Research License.
 
 ## Local validation (2026-09-24)
+
+Optional-reference validation, 1024×1024 output, six-step turbo on RTX 5090:
+
+| Input | Weights | Sampling + decode + save |
+| --- | --- | ---: |
+| No references (`images: []`) | Q4_K_M | 4.4 s |
+| One reference, orange robot recolored blue | Q4_K_M | 4.7 s |
+| Two references, both robots composed together | Q4_K_M | 5.1–5.3 s |
+| Three references, ordered triptych composition | Q4_K_M | 5.7 s |
+| Two references, both robots composed together | BF16 safetensors | 4.9 s |
+
+These times exclude reference/text encoding, model loading, and condition-cache
+preparation. Complete reference jobs took 21–61 seconds depending on loading/cache
+state. The two-reference Q4 batch produced two distinct seeded outputs. Inputs'
+SHA-256 hashes were unchanged. Outputs were visually inspected for the requested
+edits/composition. Three-reference, text-only, and BF16 jobs used the HTTP endpoint
+with the Qwen 27B controller resident on GPU 0. The controller returned a valid
+`image_generate` call containing the requested reference path during generation.
+
+Tests cover optional/empty and one-to-three reference forwarding, rejection of
+four references, local-file permissions, protected agent paths, PNG/JPEG/WebP,
+alpha handling, patch ordering, temporal VAE shortcuts, and block attention.
+The GPU attention comparison also checks causal text interleaved between reference
+blocks against the F32 CPU result. All 11 diffusion tests passed with GPU tests enabled.
+The affected coder-cli library suites passed 268 tests (15 explicitly ignored).
+The final NROB workspace suite passed 507 tests (77 explicitly ignored), with
+the diffusion GPU test also run separately as noted above.
 
 After the FlashAttention optimization, on RTX 5090 at 1024x1024, six steps,
 CFG 1, including VAE decode and PNG writing:

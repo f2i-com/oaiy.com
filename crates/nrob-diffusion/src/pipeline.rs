@@ -1,3 +1,4 @@
+use crate::{reference::Reference, vision::VisionEncoder};
 use crate::{schedule, text::TextEncoder, transformer::Transformer, vae::Vae};
 use candle_core::{DType, Device, Result, Tensor};
 use nrob::json::Json;
@@ -22,6 +23,8 @@ pub struct Request {
     pub seed: u64,
     pub device: usize,
     pub cfg: f64,
+    pub images: Vec<PathBuf>,
+    pub reference_size: usize,
 }
 impl Request {
     pub fn parse(j: &Json) -> std::result::Result<Self, String> {
@@ -70,6 +73,21 @@ impl Request {
             Some(v) => v.as_f64().ok_or("cfg must be a number")?,
         };
         let r = Self {
+            images: match j.get("images") {
+                None => Vec::new(),
+                Some(v) => v
+                    .as_array()
+                    .ok_or("images must be an array of up to three local paths")?
+                    .iter()
+                    .map(|v| {
+                        v.as_str()
+                            .filter(|s| !s.trim().is_empty())
+                            .map(PathBuf::from)
+                            .ok_or_else(|| "images must contain nonempty local paths".to_owned())
+                    })
+                    .collect::<std::result::Result<_, _>>()?,
+            },
+            reference_size: number("reference_size", 1024)?,
             base: string("base")?.into(),
             transformer: string("transformer")?.into(),
             adapter,
@@ -94,6 +112,17 @@ impl Request {
         Ok(r)
     }
     pub fn validate(&self) -> std::result::Result<(), String> {
+        if self.images.len() > 3 {
+            return Err("images accepts zero, one, two, or three references".into());
+        }
+        if !(256..=1024).contains(&self.reference_size) || self.reference_size % 32 != 0 {
+            return Err("reference_size must be a multiple of 32 between 256 and 1024".into());
+        }
+        for p in &self.images {
+            if !p.is_file() {
+                return Err(format!("reference image not found: {}", p.display()));
+            }
+        }
         if !(1..=1000).contains(&self.count) {
             return Err("n must be between 1 and 1000".into());
         }
@@ -173,25 +202,53 @@ pub fn generate(r: &Request, mut event: impl FnMut(Json)) -> Result<Json> {
         .write(true)
         .open(out.join("manifest.jsonl"))?;
     let t = Instant::now();
+    let mut references = Vec::new();
+    let mut features = Vec::new();
+    if !r.images.is_empty() {
+        event(Json::obj([("stage", Json::str("encoding_references"))]));
+        let images = r
+            .images
+            .iter()
+            .map(|p| Reference::load(p, r.reference_size))
+            .collect::<Result<Vec<_>>>()?;
+        let encoder = Vae::load_encoder(&r.base, &dev, dtype)?;
+        for image in &images {
+            references.push((
+                encoder.encode(&image.pixels(&dev, dtype)?)?,
+                image.h / 16,
+                image.w / 16,
+            ));
+        }
+        drop(encoder);
+        let vision = VisionEncoder::load(&r.base, &dev, dtype)?;
+        for image in &images {
+            features.push(vision.encode(image)?);
+        }
+        drop(vision);
+    }
+    dev.synchronize()?;
+    let reference_encoding_seconds = t.elapsed().as_secs_f64();
     event(Json::obj([("stage", Json::str("loading_text_encoder"))]));
+    let text_load_start = Instant::now();
     let encoder = TextEncoder::load(&r.base, &dev, dtype)?;
     dev.synchronize()?;
-    let text_load_seconds = t.elapsed().as_secs_f64();
+    let text_load_seconds = text_load_start.elapsed().as_secs_f64();
     let encoding_start = Instant::now();
     let mut embeddings = Vec::new();
     for (i, prompt) in r.prompts.iter().enumerate() {
-        embeddings.push(encoder.encode(prompt)?);
+        embeddings.push(encoder.encode(prompt, &features)?);
         event(Json::obj([
             ("stage", Json::str("encoding")),
             ("completed", Json::Int((i + 1) as i64)),
         ]));
     }
     let negative = if r.cfg > 1. {
-        Some(encoder.encode("")?)
+        Some(encoder.encode(" ", &features)?)
     } else {
         None
     };
     drop(encoder);
+    drop(features);
     dev.synchronize()?;
     let encoding_seconds = encoding_start.elapsed().as_secs_f64();
     event(Json::obj([("stage", Json::str("loading_transformer"))]));
@@ -208,7 +265,20 @@ pub fn generate(r: &Request, mut event: impl FnMut(Json)) -> Result<Json> {
     let sigmas =
         schedule::sigmas(r.steps, h * w, r.adapter.is_some()).map_err(candle_core::Error::Msg)?;
     let mut files = Vec::new();
+    let mut prefix = None;
+    let negative_prefix = negative
+        .as_ref()
+        .map(|n| model.prepare(n, &references))
+        .transpose()?;
     for i in 0..r.count {
+        if prefix.is_none() || embeddings.len() > 1 {
+            drop(prefix.take());
+            event(Json::obj([("stage", Json::str("preparing_conditioning"))]));
+            prefix = Some(model.prepare(
+                &embeddings[if embeddings.len() == 1 { 0 } else { i }],
+                &references,
+            )?);
+        }
         let image_start = Instant::now();
         let pi = if embeddings.len() == 1 { 0 } else { i };
         let seed = r.seed + i as u64;
@@ -216,9 +286,10 @@ pub fn generate(r: &Request, mut event: impl FnMut(Json)) -> Result<Json> {
             Tensor::from_vec(noise(seed, h * w * 64), (1, h * w, 64), &dev)?.to_dtype(dtype)?;
         for (step, pair) in sigmas.windows(2).enumerate() {
             let step_start = Instant::now();
-            let mut velocity = model.forward(&latent, &embeddings[pi], pair[0], h, w)?;
-            if let Some(neg) = &negative {
-                let uncond = model.forward(&latent, neg, pair[0], h, w)?;
+            let mut velocity =
+                model.conditioned(&latent, prefix.as_ref().unwrap(), pair[0], h, w)?;
+            if let Some(neg) = &negative_prefix {
+                let uncond = model.conditioned(&latent, neg, pair[0], h, w)?;
                 velocity = (&uncond + ((velocity - &uncond)? * r.cfg)?)?;
             }
             latent = (latent.to_dtype(DType::F32)?
@@ -258,6 +329,15 @@ pub fn generate(r: &Request, mut event: impl FnMut(Json)) -> Result<Json> {
             ("path", Json::str(path.to_string_lossy())),
             ("seed", Json::Int(seed as i64)),
             ("prompt", Json::str(&r.prompts[pi])),
+            (
+                "images",
+                Json::Arr(
+                    r.images
+                        .iter()
+                        .map(|p| Json::str(p.to_string_lossy()))
+                        .collect(),
+                ),
+            ),
             ("steps", Json::Int(r.steps as i64)),
             ("sampling_seconds", Json::Num(sampling_seconds)),
             ("decode_seconds", Json::Num(decode_seconds)),
@@ -302,6 +382,10 @@ pub fn generate(r: &Request, mut event: impl FnMut(Json)) -> Result<Json> {
         ("seconds", Json::Num(t.elapsed().as_secs_f64())),
         ("text_load_seconds", Json::Num(text_load_seconds)),
         ("encoding_seconds", Json::Num(encoding_seconds)),
+        (
+            "reference_encoding_seconds",
+            Json::Num(reference_encoding_seconds),
+        ),
         (
             "transformer_load_seconds",
             Json::Num(transformer_load_seconds),

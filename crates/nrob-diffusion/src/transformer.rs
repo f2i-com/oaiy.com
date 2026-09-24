@@ -1,11 +1,17 @@
 //! Native port of the Qwen Image 2.1 single-stream transformer (Apache-2.0,
 //! Qwen/Hugging Face). Text tokens are causal and conditioned at time zero.
+use crate::text::Conditioning;
 use crate::{
     math::*,
     weights::{Linear, Weights},
 };
 use candle_core::{DType, Device, Result, Tensor};
 use std::path::Path;
+
+pub struct Prefix {
+    kv: Vec<(Tensor, Tensor)>,
+    position: usize,
+}
 
 struct Block {
     q: Linear,
@@ -33,6 +39,129 @@ pub struct Transformer {
     dtype: DType,
 }
 impl Transformer {
+    /// Reference/text tokens are time-zero conditions. Their per-layer keys and
+    /// values are independent of the seed and all six denoising timesteps.
+    pub fn prepare(&self, text: &Conditioning, refs: &[(Tensor, usize, usize)]) -> Result<Prefix> {
+        if text.spans.len() != refs.len() {
+            candle_core::bail!("conditioning/reference count mismatch");
+        }
+        let projected = self.text2.forward(
+            &self
+                .text1
+                .forward(&rms(&text.states, &self.text_norm, 1e-6)?)?
+                .gelu()?,
+        )?;
+        let mut parts = Vec::new();
+        let mut segments = Vec::new();
+        let mut positions = Vec::new();
+        let mut cursor = 0;
+        let mut position = 0;
+        for (&(start, len), (latent, h, w)) in text.spans.iter().zip(refs) {
+            if latent.dim(1)? != h * w || len * 4 != h * w {
+                candle_core::bail!("reference latent/vision grid mismatch");
+            }
+            if start > cursor {
+                let n = start - cursor;
+                parts.push(projected.narrow(1, cursor, n)?);
+                segments.push((n, true));
+                positions.extend((position..position + n).map(|p| [p as f64; 3]));
+                position += n;
+            }
+            parts.push(self.img.forward(latent)?);
+            segments.push((h * w, false));
+            image_positions(&mut positions, position, *h, *w);
+            position += h.max(w);
+            cursor = start + len;
+        }
+        let n = projected.dim(1)? - cursor;
+        if n > 0 {
+            parts.push(projected.narrow(1, cursor, n)?);
+            segments.push((n, true));
+            positions.extend((position..position + n).map(|p| [p as f64; 3]));
+            position += n;
+        }
+        let mut x = Tensor::cat(&parts, 1)?;
+        let (cos, sin) = position_rope(&positions, &self.device, self.dtype)?;
+        let time = self.time(0.)?;
+        let mods = self
+            .modulation
+            .forward(&candle_nn::ops::silu(&time)?)?
+            .unsqueeze(0)?;
+        let mut kv = Vec::new();
+        for b in &self.blocks {
+            let norm = layer_norm(&x)?.broadcast_mul(&(mods.narrow(2, 0, 4096)? + 1.)?)?;
+            let rotate = |v: Tensor| candle_nn::rotary_emb::rope_i(&v.contiguous()?, &cos, &sin);
+            let q = rotate(rms(&heads(&b.q.forward(&norm)?, 32)?, &b.qn, 1e-6)?)?;
+            let k = rotate(rms(&heads(&b.k.forward(&norm)?, 32)?, &b.kn, 1e-6)?)?;
+            let v = heads(&b.v.forward(&norm)?, 32)?;
+            x = (x + b
+                .o
+                .forward(&unheads(&block_attention(&q, &k, &v, &segments)?)?)?
+                .broadcast_mul(&mods.narrow(2, 4096, 4096)?.tanh()?)?)?;
+            let norm = layer_norm(&x)?.broadcast_mul(&(mods.narrow(2, 8192, 4096)? + 1.)?)?;
+            x = (x + swiglu(&norm, &b.gate, &b.up, &b.down)?
+                .broadcast_mul(&mods.narrow(2, 12288, 4096)?.tanh()?)?)?;
+            kv.push((k, v));
+        }
+        Ok(Prefix { kv, position })
+    }
+    fn time(&self, sigma: f64) -> Result<Tensor> {
+        let mut values = Vec::new();
+        for kind in 0..2 {
+            for j in 0..128 {
+                let a = 1000. * sigma / 10000f64.powf(j as f64 / 128.);
+                values.push(if kind == 0 {
+                    a.cos() as f32
+                } else {
+                    a.sin() as f32
+                });
+            }
+        }
+        self.time2
+            .forward(&candle_nn::ops::silu(&self.time1.forward(
+                &Tensor::from_vec(values, (1, 256), &self.device)?.to_dtype(self.dtype)?,
+            )?)?)
+    }
+    pub fn conditioned(
+        &self,
+        latent: &Tensor,
+        prefix: &Prefix,
+        sigma: f64,
+        h: usize,
+        w: usize,
+    ) -> Result<Tensor> {
+        let mut positions = Vec::new();
+        image_positions(&mut positions, prefix.position, h, w);
+        let (cos, sin) = position_rope(&positions, &self.device, self.dtype)?;
+        let time = self.time(sigma)?;
+        let mods = self
+            .modulation
+            .forward(&candle_nn::ops::silu(&time)?)?
+            .unsqueeze(0)?;
+        let mut x = self.img.forward(latent)?;
+        for (b, (pk, pv)) in self.blocks.iter().zip(&prefix.kv) {
+            let norm = layer_norm(&x)?.broadcast_mul(&(mods.narrow(2, 0, 4096)? + 1.)?)?;
+            let rotate = |v: Tensor| candle_nn::rotary_emb::rope_i(&v.contiguous()?, &cos, &sin);
+            let q = rotate(rms(&heads(&b.q.forward(&norm)?, 32)?, &b.qn, 1e-6)?)?;
+            let k = rotate(rms(&heads(&b.k.forward(&norm)?, 32)?, &b.kn, 1e-6)?)?;
+            let v = heads(&b.v.forward(&norm)?, 32)?;
+            let k = Tensor::cat(&[pk, &k], 2)?;
+            let v = Tensor::cat(&[pv, &v], 2)?;
+            x = (x + b
+                .o
+                .forward(&unheads(&attention(&q, &k, &v, 0)?)?)?
+                .broadcast_mul(&mods.narrow(2, 4096, 4096)?.tanh()?)?)?;
+            let norm = layer_norm(&x)?.broadcast_mul(&(mods.narrow(2, 8192, 4096)? + 1.)?)?;
+            x = (x + swiglu(&norm, &b.gate, &b.up, &b.down)?
+                .broadcast_mul(&mods.narrow(2, 12288, 4096)?.tanh()?)?)?;
+        }
+        let scale = (self
+            .norm_out
+            .forward(&candle_nn::ops::silu(&time)?)?
+            .unsqueeze(0)?
+            + 1.)?;
+        self.out.forward(&layer_norm(&x)?.broadcast_mul(&scale)?)
+    }
     pub fn load(
         path: &Path,
         adapter: Option<&Path>,
@@ -180,6 +309,34 @@ impl Transformer {
         self.out
             .forward(&layer_norm(&x.narrow(1, nt, ni)?)?.broadcast_mul(&scale)?)
     }
+}
+
+fn image_positions(positions: &mut Vec<[f64; 3]>, position: usize, h: usize, w: usize) {
+    for y in 0..h {
+        for x in 0..w {
+            positions.push([
+                position as f64,
+                y as f64 - (h - h / 2) as f64,
+                x as f64 - (w - w / 2) as f64,
+            ]);
+        }
+    }
+}
+fn position_rope(positions: &[[f64; 3]], dev: &Device, dtype: DType) -> Result<(Tensor, Tensor)> {
+    let (mut cos, mut sin) = (Vec::new(), Vec::new());
+    for pos in positions {
+        for (axis, dim) in [16, 56, 56].into_iter().enumerate() {
+            for j in 0..dim / 2 {
+                let a = pos[axis] / 10000f64.powf((j * 2) as f64 / dim as f64);
+                cos.push(a.cos() as f32);
+                sin.push(a.sin() as f32);
+            }
+        }
+    }
+    Ok((
+        Tensor::from_vec(cos, (positions.len(), 64), dev)?.to_dtype(dtype)?,
+        Tensor::from_vec(sin, (positions.len(), 64), dev)?.to_dtype(dtype)?,
+    ))
 }
 
 fn rope(nt: usize, h: usize, w: usize, dev: &Device, dtype: DType) -> Result<(Tensor, Tensor)> {

@@ -1,4 +1,4 @@
-//! Image specialization of the released Qwen Image 2.1 RGBA VAE decoder.
+//! Image specialization of the released Qwen Image 2.1 RGBA VAE encoder/decoder.
 //! Temporal upsampling skips time_conv for the first (only) frame.
 use crate::{math, weights::Weights};
 use candle_core::{DType, Device, Result, Tensor};
@@ -11,10 +11,21 @@ pub struct Vae {
 }
 impl Vae {
     pub fn load(root: &Path, dev: &Device, dtype: DType) -> Result<Self> {
+        Self::load_part(root, dev, dtype, false)
+    }
+    pub fn load_encoder(root: &Path, dev: &Device, dtype: DType) -> Result<Self> {
+        Self::load_part(root, dev, dtype, true)
+    }
+    fn load_part(root: &Path, dev: &Device, dtype: DType, encode: bool) -> Result<Self> {
         let mut w = Weights::open(&root.join("vae"))?;
         let mut tensors = HashMap::new();
         for name in w.names() {
-            if (name.starts_with("decoder.") || name.starts_with("post_quant_conv."))
+            if (name.starts_with(if encode { "encoder." } else { "decoder." })
+                || name.starts_with(if encode {
+                    "quant_conv."
+                } else {
+                    "post_quant_conv."
+                }))
                 && !name.contains("time_conv")
             {
                 tensors.insert(name.clone(), w.tensor(&name, dev, dtype)?);
@@ -149,4 +160,80 @@ impl Vae {
             "decoder.conv_out",
         )
     }
+    pub fn encode(&self, pixels: &Tensor) -> Result<Tensor> {
+        let mut x = self.conv(pixels, "encoder.conv_in")?;
+        for i in 0..5 {
+            let before = x.clone();
+            for j in 0..2 {
+                x = self.residual(&x, &format!("encoder.down_blocks.{i}.resnets.{j}"))?;
+            }
+            if i < 4 {
+                let p = format!("encoder.down_blocks.{i}.downsampler.resample.1");
+                let b = self.tensor(&format!("{p}.bias"))?;
+                x = x
+                    .pad_with_zeros(2, 0, 1)?
+                    .pad_with_zeros(3, 0, 1)?
+                    .conv2d(self.tensor(&format!("{p}.weight"))?, 0, 2, 1, 1)?
+                    .broadcast_add(&b.reshape((1, b.elem_count(), 1, 1))?)?;
+            }
+            x = (&x
+                + average_shortcut(
+                    &before,
+                    x.dim(1)?,
+                    if (1..4).contains(&i) { 2 } else { 1 },
+                    if i < 4 { 2 } else { 1 },
+                )?)?;
+        }
+        x = self.residual(&x, "encoder.mid_block.resnets.0")?;
+        let p = "encoder.mid_block.attentions.0";
+        let qkv = self.conv(
+            &self.norm(&x, &format!("{p}.norm"))?,
+            &format!("{p}.to_qkv"),
+        )?;
+        let (_, c, h, w) = x.dims4()?;
+        let part = |start| {
+            qkv.narrow(1, start, c)?
+                .reshape((1, 1, c, h * w))?
+                .transpose(2, 3)?
+                .contiguous()
+        };
+        let attended = math::attention(&part(0)?, &part(c)?, &part(2 * c)?, 0)?
+            .transpose(2, 3)?
+            .contiguous()?
+            .reshape((1, c, h, w))?;
+        x = (x + self.conv(&attended, &format!("{p}.proj"))?)?;
+        x = self.residual(&x, "encoder.mid_block.resnets.1")?;
+        x = self.conv(
+            &candle_nn::ops::silu(&self.norm(&x, "encoder.norm_out")?)?,
+            "encoder.conv_out",
+        )?;
+        self.conv(&x, "quant_conv")?
+            .narrow(1, 0, 64)?
+            .broadcast_sub(&self.mean)?
+            .broadcast_div(&self.std)?
+            .reshape((1, 64, h * w))?
+            .transpose(1, 2)?
+            .contiguous()
+    }
+}
+
+fn average_shortcut(x: &Tensor, cout: usize, ft: usize, fs: usize) -> Result<Tensor> {
+    let (b, c, h, w) = x.dims4()?;
+    let x = x.unsqueeze(2)?.pad_with_zeros(2, ft - 1, 0)?;
+    x.reshape(&[b, c, ft, h / fs, fs, w / fs, fs])?
+        .permute(&[0, 1, 2, 4, 6, 3, 5][..])?
+        .contiguous()?
+        .reshape((b, cout, c * ft * fs * fs / cout, h / fs, w / fs))?
+        .mean(2)
+}
+#[test]
+fn first_frame_shortcut_keeps_zero_temporal_padding() -> Result<()> {
+    let x = Tensor::new(&[[[[2f32, 4.], [6., 8.]]]], &Device::Cpu)?;
+    assert_eq!(
+        average_shortcut(&x, 1, 2, 2)?
+            .flatten_all()?
+            .to_vec1::<f32>()?,
+        vec![2.5]
+    );
+    Ok(())
 }

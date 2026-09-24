@@ -345,6 +345,7 @@ impl Images {
 }
 
 fn prepare(c: &Config, body: &Json) -> Result<Json, String> {
+    let images = reference_paths(body, true)?;
     let prompt = body.get("prompt").cloned();
     let prompts = body.get("prompts").cloned();
     if prompt.is_none() && prompts.is_none() {
@@ -373,6 +374,10 @@ fn prepare(c: &Config, body: &Json) -> Result<Json, String> {
     let n = number("n", 1, 1, 1000)?;
     let width = number("width", 1024, 256, 2048)?;
     let height = number("height", 1024, 256, 2048)?;
+    let reference_size = number("reference_size", 1024, 256, 1024)?;
+    if reference_size % 32 != 0 {
+        return Err("reference_size must be a multiple of 32".into());
+    }
     if width % 32 != 0 || height % 32 != 0 {
         return Err("image dimensions must be multiples of 32".into());
     }
@@ -457,6 +462,8 @@ fn prepare(c: &Config, body: &Json) -> Result<Json, String> {
         ("height".into(), Json::Int(height)),
         ("steps".into(), Json::Int(steps)),
         ("seed".into(), Json::Int(seed)),
+        ("images".into(), Json::Arr(images)),
+        ("reference_size".into(), Json::Int(reference_size)),
     ];
     if let Some(p) = prompt {
         fields.push(("prompt".into(), p));
@@ -469,6 +476,46 @@ fn prepare(c: &Config, body: &Json) -> Result<Json, String> {
         return Err("image request exceeds 2 MiB".into());
     }
     Ok(request)
+}
+
+/// Shares the server's existing opt-in policy for reading local image paths.
+pub(crate) fn reference_paths(body: &Json, allow_local: bool) -> Result<Vec<Json>, String> {
+    let Some(value) = body.get("images") else {
+        return Ok(Vec::new());
+    };
+    let paths = value
+        .as_array()
+        .ok_or("images must be an array of up to three local paths")?;
+    if paths.len() > 3 {
+        return Err("images accepts at most three reference images".into());
+    }
+    if !paths.is_empty() && !allow_local {
+        return Err(
+            "local reference images are disabled; enable --local-images on a trusted server".into(),
+        );
+    }
+    paths
+        .iter()
+        .map(|p| {
+            let p = p
+                .as_str()
+                .filter(|s| !s.trim().is_empty())
+                .ok_or("reference paths must be nonempty strings")?;
+            let path = Path::new(p);
+            if !path.is_absolute() {
+                return Err("reference images must use absolute local paths".into());
+            }
+            let meta = std::fs::metadata(path).map_err(|e| format!("reference image {p}: {e}"))?;
+            if !meta.is_file() || meta.len() > 32 * 1024 * 1024 {
+                return Err("each reference must be a regular file of at most 32 MiB".into());
+            }
+            Ok(Json::str(
+                path.canonicalize()
+                    .map_err(|e| e.to_string())?
+                    .to_string_lossy(),
+            ))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -499,6 +546,11 @@ mod tests {
             r#"{"prompt":"x","output_dir":"../escape"}"#,
             r#"{"prompts":["a","b"],"n":3}"#,
             r#"{"prompt":"x","weights":3}"#,
+            r#"{"prompt":"x","images":["a","b","c","d"]}"#,
+            r#"{"prompt":"x","images":"file.png"}"#,
+            r#"{"prompt":"x","images":[null]}"#,
+            r#"{"prompt":"x","images":["relative.png"]}"#,
+            r#"{"prompt":"x","reference_size":1025}"#,
         ] {
             assert!(
                 prepare(&cfg, &Json::parse(json.as_bytes()).unwrap()).is_err(),
@@ -507,11 +559,40 @@ mod tests {
         }
     }
     #[test]
+    fn optional_references_obey_local_file_policy_and_preserve_order() {
+        assert!(reference_paths(&Json::obj([] as [(&str, Json); 0]), false)
+            .unwrap()
+            .is_empty());
+        assert!(
+            reference_paths(&Json::obj([("images", Json::Arr(vec![]))]), false)
+                .unwrap()
+                .is_empty()
+        );
+        let path = std::env::temp_dir().join(format!("nrob-reference-{}.png", std::process::id()));
+        std::fs::write(&path, b"fixture").unwrap();
+        for count in 1..=3 {
+            let body = Json::obj([(
+                "images",
+                Json::Arr(
+                    (0..count)
+                        .map(|_| Json::str(path.to_string_lossy()))
+                        .collect(),
+                ),
+            )]);
+            assert!(reference_paths(&body, false).is_err());
+            assert_eq!(reference_paths(&body, true).unwrap().len(), count);
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+    #[test]
     fn batch_parameters_and_server_owned_paths_are_preserved() {
         let cfg = config();
         let turbo = prepare(&cfg, &Json::parse(br#"{"prompt":"x"}"#).unwrap()).unwrap();
         assert_eq!(turbo.get("steps").and_then(Json::as_i64), Some(6));
-        assert_eq!(turbo.get("adapter").and_then(Json::as_str), Some("turbo.safetensors"));
+        assert_eq!(
+            turbo.get("adapter").and_then(Json::as_str),
+            Some("turbo.safetensors")
+        );
         let r=prepare(&cfg,&Json::parse(br#"{"prompt":"x","n":100,"steps":4,"weights":"safetensors","base":"untrusted","device":99}"#).unwrap()).unwrap();
         assert_eq!(r.get("n").and_then(Json::as_i64), Some(100));
         assert_eq!(r.get("steps").and_then(Json::as_i64), Some(4));
