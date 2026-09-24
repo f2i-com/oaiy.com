@@ -204,7 +204,11 @@ pub struct Models {
 
 impl Models {
     pub fn new(opts: Options, loopback: bool) -> Result<Models> {
-        let image_config = opts.image_config.as_deref().map(crate::images::Config::read).transpose().map_err(Error::Arg)?;
+        let mut image_config = opts.image_config.as_deref().map(crate::images::Config::read).transpose().map_err(Error::Arg)?;
+        if let Some(root) = &opts.media_output_root {
+            if !root.is_absolute() { return Err(Error::Arg("media output root must be absolute".into())); }
+            if let Some(config) = &mut image_config { config.output_root = root.clone(); }
+        }
         let mut specs = vec![Spec {
             name: opts.name.clone(),
             path: opts.model.clone(),

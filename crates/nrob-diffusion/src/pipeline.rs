@@ -13,6 +13,8 @@ use std::{
 pub struct Request {
     pub base: PathBuf,
     pub transformer: PathBuf,
+    pub text_encoder: Option<PathBuf>,
+    pub model: Option<String>,
     pub adapter: Option<PathBuf>,
     pub output: PathBuf,
     pub prompts: Vec<String>,
@@ -90,6 +92,8 @@ impl Request {
             reference_size: number("reference_size", 1024)?,
             base: string("base")?.into(),
             transformer: string("transformer")?.into(),
+            text_encoder: match j.get("text_encoder") { None | Some(Json::Null) => None, _ => Some(string("text_encoder")?.into()) },
+            model: j.get("model").and_then(Json::as_str).map(str::to_owned),
             adapter,
             output: string("output_dir")?.into(),
             prompts,
@@ -163,7 +167,7 @@ impl Request {
         }
         for path in [&self.base, &self.transformer]
             .into_iter()
-            .chain(self.adapter.iter())
+            .chain(self.adapter.iter()).chain(self.text_encoder.iter())
         {
             if !path.exists() {
                 return Err(format!("missing weights: {}", path.display()));
@@ -220,7 +224,7 @@ pub fn generate(r: &Request, mut event: impl FnMut(Json)) -> Result<Json> {
             ));
         }
         drop(encoder);
-        let vision = VisionEncoder::load(&r.base, &dev, dtype)?;
+        let vision = VisionEncoder::load(r.text_encoder.as_deref().unwrap_or(&r.base.join("text_encoder")), &dev, dtype)?;
         for image in &images {
             features.push(vision.encode(image)?);
         }
@@ -230,7 +234,7 @@ pub fn generate(r: &Request, mut event: impl FnMut(Json)) -> Result<Json> {
     let reference_encoding_seconds = t.elapsed().as_secs_f64();
     event(Json::obj([("stage", Json::str("loading_text_encoder"))]));
     let text_load_start = Instant::now();
-    let encoder = TextEncoder::load(&r.base, &dev, dtype)?;
+    let encoder = TextEncoder::load(&r.base, r.text_encoder.as_deref(), &dev, dtype)?;
     dev.synchronize()?;
     let text_load_seconds = text_load_start.elapsed().as_secs_f64();
     let encoding_start = Instant::now();
@@ -350,6 +354,8 @@ pub fn generate(r: &Request, mut event: impl FnMut(Json)) -> Result<Json> {
                 Json::Num(image_start.elapsed().as_secs_f64()),
             ),
             ("transformer", Json::str(r.transformer.to_string_lossy())),
+            ("text_encoder", Json::str(r.text_encoder.clone().unwrap_or_else(||r.base.join("text_encoder")).to_string_lossy())),
+            ("model", r.model.as_ref().map(Json::str).unwrap_or(Json::Null)),
             (
                 "adapter",
                 r.adapter

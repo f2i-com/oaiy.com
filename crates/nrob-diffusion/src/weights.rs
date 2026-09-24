@@ -61,9 +61,37 @@ impl Weights {
     }
 
     pub fn tensor(&mut self, name: &str, dev: &Device, dtype: DType) -> Result<Tensor> {
+        // Comfy's fused Qwen 2.1 MLP stores gate rows followed by up rows.
+        // Read only the requested half, preserving the original logical LoRA keys.
+        if !self.has(name) {
+            for (suffix, half) in [("img_mlp.gate_layer.weight", 0), ("img_mlp.proj.weight", 1)] {
+                if let Some(prefix) = name.strip_suffix(suffix) {
+                    let key = self.resolve(&format!("{prefix}img_mlp.gate_up.weight"))?;
+                    if let Self::Safe(s) = self {
+                        use std::io::{Read, Seek, SeekFrom};
+                        let info = s.info(&key).map_err(candle_core::Error::wrap)?;
+                        if info.shape.len() != 2 || info.shape[0] % 2 != 0 {
+                            candle_core::bail!("invalid fused gate/up shape for {key}");
+                        }
+                        let kind = match info.dtype {
+                            Dtype::F16 => DType::F16, Dtype::BF16 => DType::BF16,
+                            Dtype::F32 => DType::F32,
+                            _ => candle_core::bail!("unsupported fused gate/up dtype for {key}"),
+                        };
+                        let len = usize::try_from(info.nbytes / 2).map_err(candle_core::Error::wrap)?;
+                        let mut bytes = vec![0; len];
+                        let mut file = File::open(s.shard_path(info.shard))?;
+                        file.seek(SeekFrom::Start(info.start + half * info.nbytes / 2))?;
+                        file.read_exact(&mut bytes)?;
+                        return Tensor::from_raw_buffer(&bytes, kind, &[info.shape[0]/2, info.shape[1]], dev)?.to_dtype(dtype);
+                    }
+                }
+            }
+        }
         let name = self.resolve(name)?;
         let t = match self {
             Self::Safe(s) => {
+                if let Some(t) = crate::comfy_quant::load(s, &name, dev, dtype)? { return Ok(t); }
                 let info = s.info(&name).map_err(candle_core::Error::wrap)?;
                 let kind = match info.dtype {
                     Dtype::F32 => DType::F32,
@@ -88,7 +116,8 @@ impl Weights {
         dtype: DType,
         lora: &mut Option<Weights>,
     ) -> Result<Linear> {
-        let key = self.resolve(&format!("{name}.weight"))?;
+        let key = format!("{name}.weight");
+        let key = if matches!(self, Self::Gguf { .. }) { self.resolve(&key)? } else { key };
         let weight = match self {
             Self::Gguf { content, file } => {
                 Weight::Quant(QMatMul::from_qtensor(content.tensor(file, &key, dev)?)?)

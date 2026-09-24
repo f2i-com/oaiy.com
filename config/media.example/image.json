@@ -1,0 +1,21 @@
+{
+  "base": "D:\\Qwen-Image-2.1",
+  "transformer": "E:\\deepseek\\nrob\\models\\qwen-image-2.1\\qwen-image-2.1-Q4_K_M.gguf",
+  "adapter": "E:\\deepseek\\nrob\\models\\qwen-image-2.1\\viggle-v0.2.1-r128.safetensors",
+  "default_weights": "safetensors",
+  "enabled": true,
+  "default_model": "redqwen21",
+  "models": {
+    "redqwen21": {
+      "safetensors_transformer": "E:/stuff/REDQwen21.safetensors",
+      "text_encoder": "E:/stuff/qwen3vl_8b_w4a8.safetensors"
+    },
+    "realism": {
+      "safetensors_transformer": "E:/stuff/RealismQwen21.safetensors"
+    },
+    "realism-w4a8": {
+      "safetensors_transformer": "E:/stuff/RealismQwen21.safetensors",
+      "text_encoder": "E:/stuff/qwen3vl_8b_w4a8.safetensors"
+    }
+  }
+}

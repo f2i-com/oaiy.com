@@ -22,6 +22,7 @@ pub mod models;
 mod http;
 mod qwen;
 pub mod images;
+mod media_catalog;
 
 use std::net::{SocketAddr, TcpListener};
 use std::path::PathBuf;
@@ -47,6 +48,8 @@ const STATE_FORMAT: u8 = 2;
 pub struct Options {
     /// Native image worker configuration; disabled unless explicitly configured.
     pub image_config: Option<PathBuf>,
+    /// Trusted host override for project-owned generated media and caches.
+    pub media_output_root: Option<PathBuf>,
     /// Listen address (loopback by default).
     pub host: String,
     /// Port; 0 lets the OS pick one ([`Running::addr`] tells which).
@@ -161,6 +164,7 @@ impl Default for Options {
     fn default() -> Options {
         Options {
             image_config: None,
+            media_output_root: None,
             host: "127.0.0.1".into(),
             port: 8000,
             devices: Vec::new(),

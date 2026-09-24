@@ -36,15 +36,15 @@ pub struct TextEncoder {
 }
 
 impl TextEncoder {
-    pub fn load(root: &Path, device: &Device, dtype: DType) -> Result<Self> {
+    pub fn load(root: &Path, checkpoint: Option<&Path>, device: &Device, dtype: DType) -> Result<Self> {
         let config =
             nrob::json::Json::parse(&std::fs::read(root.join("text_encoder/config.json"))?)
                 .map_err(candle_core::Error::wrap)?;
         if config.get("model_type").and_then(|x| x.as_str()) != Some("qwen3_vl") {
             candle_core::bail!("expected Qwen3-VL text encoder");
         }
-        let mut w = Weights::open(&root.join("text_encoder"))?;
-        let p = "model.language_model";
+        let mut w = Weights::open(checkpoint.unwrap_or(&root.join("text_encoder")))?;
+        let p = if w.has("model.language_model.embed_tokens.weight") { "model.language_model" } else { "model" };
         let embedding = w.tensor(&format!("{p}.embed_tokens.weight"), device, dtype)?;
         let mut blocks = Vec::new();
         for i in 0..36 {

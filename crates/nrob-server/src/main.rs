@@ -25,7 +25,8 @@ const HELP: &str = "Observer: --observer-model FILE.gguf --observer-device auto|
                        for a GGUF or 65s for a DeepSeek checkpoint, so naming the
                        one you will ask for saves loading another to unload it
   --model DIR          checkpoint directory (required)
-  --image-config FILE  native image/video worker and controller JSON configuration
+  --media-output-root DIR  project-local generated media and worker caches
+  --image-config PATH  image/video JSON configuration or live media catalog directory
   --engram-meta FILE   the Engram precompute, engram_meta.safetensors (default: in
                        the checkpoint directory)
   --usage FILE         expert usage profile: warms the caches at start, updated
@@ -94,6 +95,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Options, Stri
             }
             "--host" => a.host = val()?,
             "--image-config" => a.image_config = Some(val()?.into()),
+            "--media-output-root" => a.media_output_root = Some(val()?.into()),
             "--port" => a.port = val()?.parse().map_err(|_| "--port: not a port number".to_string())?,
             "--devices" => {
                 a.devices = val()?.split(',').map(|d| d.trim().parse().map_err(|_| format!("--devices: bad ordinal {d:?}"))).collect::<Result<_, _>>()?

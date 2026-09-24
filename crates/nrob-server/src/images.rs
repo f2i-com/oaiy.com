@@ -14,6 +14,10 @@ use std::{
 
 #[derive(Clone, Debug)]
 pub struct Config {
+    pub media_dir: Option<PathBuf>,
+    pub default_weights: String,
+    pub image_model: Option<String>,
+    pub text_encoder: Option<PathBuf>,
     pub worker: PathBuf,
     pub base: PathBuf,
     pub transformer: PathBuf,
@@ -28,6 +32,7 @@ pub struct Config {
 }
 impl Config {
     pub fn read(path: &Path) -> Result<Self, String> {
+        if path.is_dir() { return crate::media_catalog::read_directory(path); }
         let j = Json::parse(&std::fs::read(path).map_err(|e| e.to_string())?)
             .map_err(|e| e.to_string())?;
         let s = |k: &str| {
@@ -44,6 +49,10 @@ impl Config {
                 .ok_or_else(|| format!("image config: invalid {k}"))
         };
         let c = Self {
+            media_dir: None,
+            default_weights: "gguf".into(),
+            image_model: None,
+            text_encoder: None,
             worker: s("worker")?.into(),
             base: s("base")?.into(),
             transformer: s("transformer")?.into(),
@@ -136,13 +145,15 @@ impl Images {
     pub fn status(&self) -> Json {
         let job = self.job.lock().unwrap_or_else(|p| p.into_inner());
         let config = self.models.image_config();
+        let capabilities = config.map(Config::capabilities).unwrap_or(Json::Null);
         Json::obj([
             ("configured", Json::Bool(config.is_some())),
             (
                 "video_configured",
-                Json::Bool(config.and_then(|c| c.video_config.as_ref()).is_some()),
+                Json::Bool(capabilities.get("video").and_then(|v| v.get("available")).and_then(Json::as_bool).unwrap_or(false)),
             ),
             ("video_models", video_models(config)),
+            ("media", capabilities),
             (
                 "controller_model",
                 config.map_or(Json::Null, |c| Json::str(&c.controller_name)),
@@ -383,10 +394,7 @@ impl Images {
 }
 
 fn video_models(config: Option<&Config>) -> Json {
-    let manifest = config
-        .and_then(|c| c.video_config.as_ref())
-        .and_then(|p| std::fs::read(p).ok())
-        .and_then(|b| Json::parse(&b).ok());
+    let manifest = config.and_then(|c| crate::media_catalog::video(c).ok());
     Json::Arr(
         manifest
             .as_ref()
@@ -447,14 +455,9 @@ fn output_directory(c: &Config, body: &Json, default: &str) -> Result<PathBuf, S
 }
 
 fn prepare_video(c: &Config, body: &Json) -> Result<Json, String> {
-    let path = c
-        .video_config
-        .as_ref()
-        .ok_or("video generation is disabled; set video_config in the image config")?;
-    let config = Json::parse(&std::fs::read(path).map_err(|e| format!("video config: {e}"))?)
-        .map_err(|e| e.to_string())?;
+    let config = crate::media_catalog::video(c)?;
     let model = match body.get("model") {
-        None => "ltx-2.3",
+        None => config.get("default_model").and_then(Json::as_str).unwrap_or("ltx-2.3"),
         Some(v) => v.as_str().ok_or("model must be a string")?,
     };
     if !["ltx-2.3", "ltx-2.5", "sulphur-2"].contains(&model) {
@@ -568,6 +571,12 @@ fn prepare_video(c: &Config, body: &Json) -> Result<Json, String> {
 }
 
 fn prepare(c: &Config, body: &Json) -> Result<Json, String> {
+    let selected = match body.get("model") {
+        None => None,
+        Some(v) => Some(v.as_str().filter(|s| !s.trim().is_empty()).ok_or("model must be a nonempty configured name")?),
+    };
+    let current = crate::media_catalog::image(c, selected)?;
+    let c = &current;
     let images = reference_paths(body, true)?;
     let prompt = body.get("prompt").cloned();
     let prompts = body.get("prompts").cloned();
@@ -620,7 +629,7 @@ fn prepare(c: &Config, body: &Json) -> Result<Json, String> {
         Some(v) => v.as_bool().ok_or("turbo must be boolean")?,
     };
     let weights = match body.get("weights") {
-        None => "gguf",
+        None => &c.default_weights,
         Some(v) => v.as_str().ok_or("weights must be a string")?,
     };
     let transformer = match weights {
@@ -628,6 +637,9 @@ fn prepare(c: &Config, body: &Json) -> Result<Json, String> {
         "safetensors" => c.safetensors_transformer.clone().unwrap_or_else(|| c.base.join("transformer")),
         _ => return Err("weights must be gguf or safetensors".into()),
     };
+    if c.media_dir.is_some() && !transformer.exists() {
+        return Err(format!("selected image weights are missing: {}", transformer.display()));
+    }
     if turbo && c.adapter.is_none() {
         return Err("turbo adapter is not configured".into());
     }
@@ -661,6 +673,8 @@ fn prepare(c: &Config, body: &Json) -> Result<Json, String> {
         ("images".into(), Json::Arr(images)),
         ("reference_size".into(), Json::Int(reference_size)),
     ];
+    if let Some(p) = &c.text_encoder { fields.push(("text_encoder".into(), Json::str(p.to_string_lossy()))); }
+    if let Some(name) = &c.image_model { fields.push(("model".into(), Json::str(name))); }
     if let Some(p) = prompt {
         fields.push(("prompt".into(), p));
     }
@@ -727,6 +741,75 @@ pub(crate) fn reference_paths(body: &Json, allow_local: bool) -> Result<Vec<Json
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn live_catalog_add_remove_disable_and_defaults() {
+        let root = std::env::temp_dir().join(format!("nrob-live-media-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("weights.safetensors"), b"fixture").unwrap();
+        std::fs::write(root.join("other.gguf"), b"fixture").unwrap();
+        let write = |name: &str, j: Json| std::fs::write(root.join(name), j.to_json()).unwrap();
+        write("controller.json", Json::obj([
+            ("worker", Json::str("other.gguf")), ("controller_path", Json::str("other.gguf")),
+            ("controller_name", Json::str("qwen")), ("controller_device", Json::Int(0)),
+            ("image_device", Json::Int(1)), ("output_root", Json::str("outputs")),
+        ]));
+        let cfg = Config::read(&root).unwrap();
+        let request = Json::obj([("prompt", Json::str("a fox"))]);
+        let available = |kind: &str| cfg.capabilities().get(kind).unwrap().get("available").unwrap().as_bool().unwrap();
+        assert!(!available("image") && !available("video"));
+        assert!(prepare(&cfg, &request).is_err());
+        write("image.json", Json::obj([
+            ("base", Json::str(".")), ("transformer", Json::str("other.gguf")),
+            ("safetensors_transformer", Json::str("weights.safetensors")),
+            ("adapter", Json::str("weights.safetensors")), ("default_weights", Json::str("safetensors")),
+        ]));
+        assert!(available("image"));
+        let queued = prepare(&cfg, &request).unwrap();
+        assert!(queued.get("transformer").unwrap().as_str().unwrap().ends_with("weights.safetensors"));
+        assert_eq!(queued.get("steps").and_then(Json::as_i64), Some(6));
+        write("image.json", Json::obj([
+            ("base", Json::str(".")), ("default_weights", Json::str("safetensors")),
+            ("adapter", Json::str("weights.safetensors")), ("default_model", Json::str("red")),
+            ("models", Json::obj([
+                ("red", Json::obj([("safetensors_transformer", Json::str("weights.safetensors"))])),
+                ("realism", Json::obj([("safetensors_transformer", Json::str("other.gguf")), ("text_encoder", Json::str("weights.safetensors"))])),
+                ("off", Json::obj([("enabled", Json::Bool(false))])),
+            ])),
+        ]));
+        let default = prepare(&cfg, &request).unwrap();
+        assert_eq!(default.get("model").and_then(Json::as_str), Some("red"));
+        let named = prepare(&cfg, &Json::obj([
+            ("prompt",Json::str("fox")), ("model",Json::str("realism")),
+            ("text_encoder",Json::str("untrusted")),
+        ])).unwrap();
+        assert!(named.get("transformer").unwrap().as_str().unwrap().ends_with("other.gguf"));
+        assert!(named.get("text_encoder").unwrap().as_str().unwrap().ends_with("weights.safetensors"));
+        assert_eq!(cfg.capabilities().get("image").unwrap().get("models").unwrap().as_array().unwrap().len(),3);
+        for name in ["off", "missing", "../../weights.safetensors", ""] {
+            assert!(prepare(&cfg,&Json::obj([("prompt",Json::str("fox")),("model",Json::str(name))])).is_err());
+        }
+        write("image.json", Json::obj([("enabled", Json::Bool(false))]));
+        assert!(!available("image"));
+        assert!(prepare(&cfg, &request).is_err());
+        // Prepared jobs retain their snapshot even when the catalog changes.
+        assert!(queued.get("transformer").unwrap().as_str().unwrap().ends_with("weights.safetensors"));
+        let weights = Json::obj(["transformer", "text_encoder", "vae", "tokenizer"].map(|k| (k, Json::str("weights.safetensors"))));
+        write("video.json", Json::obj([
+            ("default_model", Json::str("sulphur-2")),
+            ("models", Json::obj([("sulphur-2", weights)])),
+        ]));
+        assert!(available("video"));
+        let video = prepare_video(&cfg, &request).unwrap();
+        assert_eq!(video.get("model").and_then(Json::as_str), Some("sulphur-2"));
+        assert!(Path::new(video.get("transformer").unwrap().as_str().unwrap()).is_absolute());
+        std::fs::remove_file(root.join("video.json")).unwrap();
+        assert!(!available("video"));
+        assert!(prepare_video(&cfg, &request).is_err());
+        std::fs::write(root.join("image.json"), b"invalid JSON").unwrap();
+        assert!(!available("image"));
+        assert!(Config::read(&root).is_ok()); // a broken optional manifest does not prevent chat startup
+        std::fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn video_requests_use_trusted_paths_and_bounded_memory() {
         let root = std::env::temp_dir().join(format!("nrob-video-config-{}", std::process::id()));
@@ -801,6 +884,10 @@ mod tests {
     }
     fn config() -> Config {
         Config {
+            media_dir: None,
+            default_weights: "gguf".into(),
+            image_model: None,
+            text_encoder: None,
             worker: "worker".into(),
             base: "base".into(),
             transformer: "model.gguf".into(),

@@ -74,7 +74,7 @@ pub struct VisionEncoder {
 }
 impl VisionEncoder {
     pub fn load(root: &Path, d: &Device, ty: DType) -> Result<Self> {
-        let mut w = Weights::open(&root.join("text_encoder"))?;
+        let mut w = Weights::open(root)?;
         let p = "model.visual";
         let patch = w
             .tensor(&format!("{p}.patch_embed.proj.weight"), d, ty)?

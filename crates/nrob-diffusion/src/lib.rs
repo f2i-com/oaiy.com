@@ -11,4 +11,5 @@ pub mod transformer;
 pub mod vae;
 pub mod vision;
 pub mod weights;
+mod comfy_quant;
 pub mod ltx;

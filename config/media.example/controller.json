@@ -1,0 +1,8 @@
+{
+  "worker": "E:\\deepseek\\nrob\\target\\release\\nrob-diffusion.exe",
+  "output_root": "E:\\deepseek\\nrob\\generated-images",
+  "controller_path": "D:\\Qwen3.8-27B-Q4_K_M.gguf",
+  "controller_device": 0,
+  "image_device": 1,
+  "controller_name": "qwen-desktop"
+}
