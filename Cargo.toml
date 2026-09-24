@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/nrob-diffusion",
     "crates/nrob",
     "crates/nrob-cli",
     # DeepSeek-V4.1 support (docs/DEEPSEEK_V41.md); std-only like the core.

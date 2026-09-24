@@ -1,0 +1,305 @@
+use crate::{schedule, text::TextEncoder, transformer::Transformer, vae::Vae};
+use candle_core::{DType, Device, Result, Tensor};
+use nrob::json::Json;
+use std::{
+    fs::{File, OpenOptions},
+    io::Write,
+    path::{Path, PathBuf},
+    time::Instant,
+};
+
+#[derive(Clone, Debug)]
+pub struct Request {
+    pub base: PathBuf,
+    pub transformer: PathBuf,
+    pub adapter: Option<PathBuf>,
+    pub output: PathBuf,
+    pub prompts: Vec<String>,
+    pub count: usize,
+    pub width: usize,
+    pub height: usize,
+    pub steps: usize,
+    pub seed: u64,
+    pub device: usize,
+    pub cfg: f64,
+}
+impl Request {
+    pub fn parse(j: &Json) -> std::result::Result<Self, String> {
+        let string = |key: &str| {
+            j.get(key)
+                .and_then(Json::as_str)
+                .filter(|s| !s.trim().is_empty())
+                .map(str::to_owned)
+                .ok_or_else(|| format!("{key} must be a nonempty string"))
+        };
+        let number = |key: &str, default: i64| -> std::result::Result<usize, String> {
+            let n = match j.get(key) {
+                None => default,
+                Some(v) => v
+                    .as_i64()
+                    .ok_or_else(|| format!("{key} must be an integer"))?,
+            };
+            usize::try_from(n).map_err(|_| format!("{key} must be nonnegative"))
+        };
+        let adapter = match j.get("adapter") {
+            None | Some(Json::Null) => None,
+            Some(_) => Some(PathBuf::from(string("adapter")?)),
+        };
+        let prompts = if let Some(v) = j.get("prompts") {
+            v.as_array()
+                .ok_or("prompts must be an array")?
+                .iter()
+                .map(|p| {
+                    p.as_str()
+                        .filter(|s| !s.trim().is_empty())
+                        .map(str::to_owned)
+                        .ok_or("prompts must contain nonempty strings".to_owned())
+                })
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        } else {
+            vec![string("prompt")?]
+        };
+        let cfg = match j.get("cfg") {
+            None => {
+                if adapter.is_some() {
+                    1.
+                } else {
+                    6.
+                }
+            }
+            Some(v) => v.as_f64().ok_or("cfg must be a number")?,
+        };
+        let r = Self {
+            base: string("base")?.into(),
+            transformer: string("transformer")?.into(),
+            adapter,
+            output: string("output_dir")?.into(),
+            prompts,
+            count: number("n", 1)?,
+            width: number("width", 1024)?,
+            height: number("height", 1024)?,
+            steps: number(
+                "steps",
+                if j.get("adapter").and_then(Json::as_str).is_some() {
+                    6
+                } else {
+                    40
+                },
+            )?,
+            seed: number("seed", 0)? as u64,
+            device: number("device", 0)?,
+            cfg,
+        };
+        r.validate()?;
+        Ok(r)
+    }
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        if !(1..=1000).contains(&self.count) {
+            return Err("n must be between 1 and 1000".into());
+        }
+        if self.prompts.is_empty() || (self.prompts.len() != 1 && self.prompts.len() != self.count)
+        {
+            return Err("provide one reusable prompt or exactly n prompts".into());
+        }
+        if self
+            .prompts
+            .iter()
+            .any(|s| s.len() > 16_384 || s.trim().is_empty())
+        {
+            return Err("prompts must contain 1..16384 bytes".into());
+        }
+        if [self.width, self.height]
+            .iter()
+            .any(|n| !(256..=2048).contains(n) || n % 32 != 0)
+        {
+            return Err("width and height must be multiples of 32 between 256 and 2048".into());
+        }
+        if !self.cfg.is_finite()
+            || !(1. ..=10.).contains(&self.cfg)
+            || (self.adapter.is_some() && self.cfg != 1.)
+        {
+            return Err("CFG must be 1 for turbo, or between 1 and 10 for base".into());
+        }
+        schedule::sigmas(
+            self.steps,
+            self.width * self.height / 256,
+            self.adapter.is_some(),
+        )?;
+        if self
+            .seed
+            .checked_add(self.count as u64 - 1)
+            .is_none_or(|s| s > i64::MAX as u64)
+        {
+            return Err("seed range exceeds signed 64-bit range".into());
+        }
+        for path in [&self.base, &self.transformer]
+            .into_iter()
+            .chain(self.adapter.iter())
+        {
+            if !path.exists() {
+                return Err(format!("missing weights: {}", path.display()));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Prompt encoding and diffusion are sequential to bound peak VRAM. All images
+/// in a batch reuse one transformer and VAE; completed images survive failure.
+pub fn generate(r: &Request, mut event: impl FnMut(Json)) -> Result<Json> {
+    r.validate().map_err(candle_core::Error::Msg)?;
+    #[cfg(feature = "cuda")]
+    let dev = Device::new_cuda(r.device)?;
+    #[cfg(not(feature = "cuda"))]
+    let dev = Device::Cpu;
+    let dtype = if dev.is_cuda() {
+        DType::BF16
+    } else {
+        DType::F32
+    };
+    std::fs::create_dir_all(&r.output)?;
+    let id = format!(
+        "batch-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(candle_core::Error::wrap)?
+            .as_nanos()
+    );
+    let out = r.output.join(id);
+    std::fs::create_dir(&out)?;
+    let mut manifest = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(out.join("manifest.jsonl"))?;
+    let t = Instant::now();
+    event(Json::obj([("stage", Json::str("loading_text_encoder"))]));
+    let encoder = TextEncoder::load(&r.base, &dev, dtype)?;
+    let mut embeddings = Vec::new();
+    for (i, prompt) in r.prompts.iter().enumerate() {
+        embeddings.push(encoder.encode(prompt)?);
+        event(Json::obj([
+            ("stage", Json::str("encoding")),
+            ("completed", Json::Int((i + 1) as i64)),
+        ]));
+    }
+    let negative = if r.cfg > 1. {
+        Some(encoder.encode("")?)
+    } else {
+        None
+    };
+    drop(encoder);
+    dev.synchronize()?;
+    event(Json::obj([("stage", Json::str("loading_transformer"))]));
+    let model = Transformer::load(&r.transformer, r.adapter.as_deref(), &dev, dtype)?;
+    event(Json::obj([("stage", Json::str("loading_vae"))]));
+    let vae = Vae::load(&r.base, &dev, dtype)?;
+    let (h, w) = (r.height / 16, r.width / 16);
+    let sigmas =
+        schedule::sigmas(r.steps, h * w, r.adapter.is_some()).map_err(candle_core::Error::Msg)?;
+    let mut files = Vec::new();
+    for i in 0..r.count {
+        let pi = if embeddings.len() == 1 { 0 } else { i };
+        let seed = r.seed + i as u64;
+        let mut latent =
+            Tensor::from_vec(noise(seed, h * w * 64), (1, h * w, 64), &dev)?.to_dtype(dtype)?;
+        for (step, pair) in sigmas.windows(2).enumerate() {
+            let mut velocity = model.forward(&latent, &embeddings[pi], pair[0], h, w)?;
+            if let Some(neg) = &negative {
+                let uncond = model.forward(&latent, neg, pair[0], h, w)?;
+                velocity = (&uncond + ((velocity - &uncond)? * r.cfg)?)?;
+            }
+            latent = (latent.to_dtype(DType::F32)?
+                + (velocity.to_dtype(DType::F32)? * (pair[1] - pair[0]))?)?
+                .to_dtype(dtype)?;
+            dev.synchronize()?;
+            event(Json::obj([
+                ("stage", Json::str("sampling")),
+                ("image", Json::Int((i + 1) as i64)),
+                ("step", Json::Int((step + 1) as i64)),
+                ("steps", Json::Int(r.steps as i64)),
+            ]));
+        }
+        let rgba = vae
+            .decode(&latent, h, w)?
+            .to_dtype(DType::F32)?
+            .squeeze(0)?
+            .permute((1, 2, 0))?
+            .contiguous()?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        if rgba.iter().any(|x| !x.is_finite()) {
+            candle_core::bail!("non-finite VAE output for image {}", i + 1);
+        }
+        let bytes: Vec<u8> = rgba
+            .into_iter()
+            .map(|x| ((x.clamp(-1., 1.) + 1.) * 127.5).round() as u8)
+            .collect();
+        let path = out.join(format!("image-{:04}.png", i + 1));
+        save_png(&path, &bytes, r.width as u32, r.height as u32)?;
+        let record = Json::obj([
+            ("path", Json::str(path.to_string_lossy())),
+            ("seed", Json::Int(seed as i64)),
+            ("prompt", Json::str(&r.prompts[pi])),
+            ("steps", Json::Int(r.steps as i64)),
+            ("transformer", Json::str(r.transformer.to_string_lossy())),
+            (
+                "adapter",
+                r.adapter
+                    .as_ref()
+                    .map_or(Json::Null, |p| Json::str(p.to_string_lossy())),
+            ),
+        ]);
+        writeln!(manifest, "{}", record.to_json())?;
+        manifest.flush()?;
+        event(Json::obj([
+            ("stage", Json::str("image_saved")),
+            ("image", Json::Int((i + 1) as i64)),
+            ("path", Json::str(path.to_string_lossy())),
+        ]));
+        files.push(Json::obj([
+            ("path", Json::str(path.to_string_lossy())),
+            ("seed", Json::Int(seed as i64)),
+            ("steps", Json::Int(r.steps as i64)),
+        ]));
+    }
+    Ok(Json::obj([
+        ("data", Json::Arr(files)),
+        ("output_dir", Json::str(out.to_string_lossy())),
+        ("seconds", Json::Num(t.elapsed().as_secs_f64())),
+    ]))
+}
+fn save_png(path: &Path, bytes: &[u8], width: u32, height: u32) -> Result<()> {
+    use image::ImageEncoder;
+    let file = File::options().create_new(true).write(true).open(path)?;
+    image::codecs::png::PngEncoder::new(file)
+        .write_image(bytes, width, height, image::ExtendedColorType::Rgba8)
+        .map_err(candle_core::Error::wrap)
+}
+fn noise(seed: u64, n: usize) -> Vec<f32> {
+    let mut state = seed;
+    let mut uniform = || {
+        state = state.wrapping_add(0x9e3779b97f4a7c15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
+        z ^= z >> 31;
+        ((z >> 11) as f64 + 0.5) / (1u64 << 53) as f64
+    };
+    let mut out = Vec::with_capacity(n);
+    while out.len() < n {
+        let radius = (-2. * uniform().ln()).sqrt();
+        let angle = std::f64::consts::TAU * uniform();
+        out.push((radius * angle.cos()) as f32);
+        if out.len() < n {
+            out.push((radius * angle.sin()) as f32);
+        }
+    }
+    out
+}
+#[test]
+fn seeds_are_repeatable_and_distinct() {
+    assert_eq!(noise(7, 13), noise(7, 13));
+    assert_ne!(noise(7, 13), noise(8, 13));
+    assert!(noise(0, 10000).iter().all(|x| x.is_finite()));
+}

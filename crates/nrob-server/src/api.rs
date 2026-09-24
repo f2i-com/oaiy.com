@@ -56,6 +56,7 @@ pub struct Config {
 }
 
 pub struct Server {
+    pub images: Arc<crate::images::Images>,
     // VENDORED-LOCAL: more than one configured model, switched on demand.
     /// The configured models and whichever is loaded. A request naming a different
     /// one unloads the current model first — see [`crate::models::Models::activate`].
@@ -178,6 +179,16 @@ impl Server {
             }
         }
         let result = match (req.method.as_str(), path) {
+            ("POST", "/v1/images/generations") => {
+                match Self::parse_body(req).and_then(|body|self.images.submit(&body).map_err(bad)) {
+                    Ok(job)=>return json_response(w,202,&job),Err(e)=>Err(e),
+                }
+            }
+            ("GET", "/v1/images/status") => return json_response(w,200,&self.images.status()),
+            ("POST", "/v1/images/cancel") => {self.images.cancel();return json_response(w,200,&self.images.status());}
+            ("POST", "/v1/images/release") => {
+                match self.images.release(){Ok(())=>return json_response(w,200,&Json::obj([("released",Json::Bool(true))])),Err(e)=>Err(bad(e))}
+            }
             ("GET", "/v1/models") => return json_response(w, 200, &self.models()),
             ("GET", "/v1/model-status") => return json_response(w, 200, &self.models.status()),
             ("POST", "/v1/chat/completions") => self.chat(req, w),

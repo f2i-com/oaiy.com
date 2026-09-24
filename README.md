@@ -53,6 +53,10 @@ Every token is a small, well-planned job:
 
 ## Features
 
+- **Native Rust Qwen Image 2.1 generation.** GGUF Q4 or safetensors, four-/six-step
+  Viggle turbo, queued multi-image batches, and a memory handoff from DeepSeek to
+  a smaller Qwen controller. See [setup and agent usage](docs/QWEN_IMAGE.md).
+
 - **DeepSeek-V4.1-Flash from safetensors, end to end.** The checkpoint's shards are
   indexed in place (51 ms, headers only) and each expert is served with two positioned
   reads. Hybrid CPU/GPU decode across two GPUs, per-GPU VRAM expert caches, an AVX-512

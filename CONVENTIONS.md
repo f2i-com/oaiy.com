@@ -52,7 +52,16 @@ crates (`nrob`, `nrob-cli`, `nrob-server`, `nrob-image`, `dsv41`, `dsv41-cuda`) 
   up after themselves.
 - A change to the DeepSeek path also passes its golden gates (README, "Testing").
 
-## GGUF stack exception
+## Diffusion compute boundary
+
+`nrob-diffusion` is a separate, opt-in Rust compute worker. It uses Candle core/nn
+tensor primitives (and CUDA kernels), the Rust tokenizer and PNG encoder. Its
+architecture, weight loading, scheduler and batch loop live in this workspace;
+it does not invoke Python or a C++ diffusion engine. It forbids unsafe Rust.
+The server supervises it through a std-only subprocess protocol, so these
+dependencies do not enter `nrob-server`, `nrob`, `nrob-image` or `dsv41`.
+
+## GGUF stack dependencies
 
 The crates `gguf`, `ggml-quants`, `ggml-rs`, `ggml-rs-cuda`, `tokenizer` and
 `llama-rs` are the author's own Rust GGUF stack, vendored from their `llm` workspace

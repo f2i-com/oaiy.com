@@ -1,5 +1,9 @@
 # Build output
 /target
+/generated-images
+/config/*.local.json
+/models
+/tools/qwen-image-reference
 
 # Model weights: never commit them
 *.gguf

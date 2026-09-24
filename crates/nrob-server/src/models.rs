@@ -192,6 +192,8 @@ struct Live {
 
 /// The configured models, and whichever one is currently loaded.
 pub struct Models {
+    image_config: Option<crate::images::Config>,
+    image_route: Mutex<Option<String>>,
     specs: Vec<Spec>,
     default_name: String,
     opts: Options,
@@ -202,6 +204,7 @@ pub struct Models {
 
 impl Models {
     pub fn new(opts: Options, loopback: bool) -> Result<Models> {
+        let image_config = opts.image_config.as_deref().map(crate::images::Config::read).transpose().map_err(Error::Arg)?;
         let mut specs = vec![Spec {
             name: opts.name.clone(),
             path: opts.model.clone(),
@@ -216,6 +219,11 @@ impl Models {
                 path: path.clone(),
                 kind: Kind::detect(path),
             });
+        }
+        if let Some(c) = &image_config {
+            if let Some(spec) = specs.iter().find(|s|s.name==c.controller_name) {
+                if spec.path != c.controller_path {return Err(Error::Arg("image controller name already points at different weights".into()));}
+            } else {specs.push(Spec{name:c.controller_name.clone(),path:c.controller_path.clone(),kind:Kind::Gguf});}
         }
         for name in opts.ternary_experts.keys().chain(opts.tool_expert_sources.keys()) {
             if !specs.iter().any(|s| &s.name == name && s.kind == Kind::Deepseek) {
@@ -233,6 +241,8 @@ impl Models {
             }
         }
         Ok(Models {
+            image_config,
+            image_route: Mutex::new(None),
             default_name: specs[0].name.clone(),
             specs,
             opts,
@@ -304,6 +314,27 @@ impl Models {
     /// engine is shut down and joined *before* the replacement loads, so the two
     /// models are never resident together.
     pub fn activate(&self, want: Option<&str>) -> std::result::Result<Active, String> {
+        if let Some(want)=want {if !self.specs.iter().any(|s|s.name==want){return Err(format!("no configured model called {want}"));}}
+        let route = self.image_route.lock().unwrap_or_else(|p|p.into_inner());
+        // During image work all chat turns stay on the controller. The route
+        // persists after a batch so its next tool turn cannot reload DeepSeek.
+        self.activate_inner(route.as_deref().or(want))
+    }
+
+    pub fn image_config(&self) -> Option<&crate::images::Config> { self.image_config.as_ref() }
+
+    pub fn begin_images(&self) -> std::result::Result<(), String> {
+        let cfg=self.image_config.as_ref().ok_or("image generation is not configured")?;
+        let mut route=self.image_route.lock().unwrap_or_else(|p|p.into_inner());
+        // Only publish the route after a successful unload-and-load handoff.
+        drop(self.activate_inner(Some(&cfg.controller_name))?);
+        *route=Some(cfg.controller_name.clone());
+        Ok(())
+    }
+
+    pub fn release_images(&self) { *self.image_route.lock().unwrap_or_else(|p|p.into_inner())=None; }
+
+    fn activate_inner(&self, want: Option<&str>) -> std::result::Result<Active, String> {
         let want = want.unwrap_or(&self.default_name);
         let spec = self
             .specs
@@ -512,7 +543,8 @@ impl Models {
         // and the rest take a share of the MoE layers. `open_cards` hands back the
         // same instances the expert tier will use, so the trunk and card 0's expert
         // shard share one CUDA context rather than opening a second on that device.
-        let cards = llama_rs::glm5next::device::open_cards(&o.devices)
+        let devices = self.image_config.as_ref().filter(|c|c.controller_name==spec.name).map(|c|vec![c.controller_device]).unwrap_or_else(||o.devices.clone());
+        let cards = llama_rs::glm5next::device::open_cards(&devices)
             .map_err(|e| Error::Arg(e.to_string()))?;
         let backend: Arc<dyn ggml_rs::Backend> = Arc::clone(&cards[0]) as Arc<dyn ggml_rs::Backend>;
         let gguf = gguf::GgufFile::open(&path).map_err(|e| Error::Arg(e.to_string()))?;

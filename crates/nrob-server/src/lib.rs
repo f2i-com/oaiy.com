@@ -21,6 +21,7 @@ pub mod glm;
 pub mod models;
 mod http;
 mod qwen;
+pub mod images;
 
 use std::net::{SocketAddr, TcpListener};
 use std::path::PathBuf;
@@ -44,6 +45,8 @@ const STATE_FORMAT: u8 = 2;
 /// apart from the checkpoint directory, which the caller always names.
 #[derive(Clone, Debug)]
 pub struct Options {
+    /// Native image worker configuration; disabled unless explicitly configured.
+    pub image_config: Option<PathBuf>,
     /// Listen address (loopback by default).
     pub host: String,
     /// Port; 0 lets the OS pick one ([`Running::addr`] tells which).
@@ -157,6 +160,7 @@ impl Options {
 impl Default for Options {
     fn default() -> Options {
         Options {
+            image_config: None,
             host: "127.0.0.1".into(),
             port: 8000,
             devices: Vec::new(),
@@ -206,6 +210,7 @@ pub struct Running {
     addr: SocketAddr,
     accept: JoinHandle<()>,
     activity: Arc<Activity>,
+    images: Arc<images::Images>,
 }
 
 /// Requests under way, and when the last one ended.
@@ -232,7 +237,7 @@ impl Running {
     /// host that stops an idle server.
     pub fn idle_for(&self) -> Duration {
         let a = &self.activity;
-        if a.active.load(Ordering::Relaxed) > 0 {
+        if a.active.load(Ordering::Relaxed) > 0 || self.images.busy() {
             return Duration::ZERO;
         }
         Duration::from_millis(a.now().saturating_sub(a.last.load(Ordering::Relaxed)))
@@ -314,7 +319,9 @@ pub fn start_listening(o: Options, listening: impl FnOnce(SocketAddr)) -> nrob::
         ));
     }
 
+    let images = Arc::new(images::Images::new(Arc::clone(&models)));
     let server = Arc::new(api::Server {
+        images: Arc::clone(&images),
         models: Arc::clone(&models),
         api_key,
         local_images,
@@ -347,7 +354,7 @@ pub fn start_listening(o: Options, listening: impl FnOnce(SocketAddr)) -> nrob::
             }
         })
         .map_err(nrob::Error::Io)?;
-    Ok(Running { addr, accept, activity })
+    Ok(Running { addr, accept, activity, images })
 }
 
 fn host_cache_budget(requested_gib: usize, available: Option<u64>) -> u64 {

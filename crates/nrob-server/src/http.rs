@@ -119,6 +119,7 @@ pub fn read_request(r: &mut BufReader<TcpStream>, writer: &mut TcpStream) -> Res
 fn reason(status: u16) -> &'static str {
     match status {
         200 => "OK",
+        202 => "Accepted",
         204 => "No Content",
         400 => "Bad Request",
         401 => "Unauthorized",

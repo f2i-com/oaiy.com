@@ -1,0 +1,11 @@
+{
+  "worker": "E:/deepseek/nrob/target/release/nrob-diffusion.exe",
+  "base": "D:/Qwen-Image-2.1",
+  "transformer": "E:/deepseek/nrob/models/qwen-image-2.1/qwen-image-2.1-Q4_K_M.gguf",
+  "adapter": "E:/deepseek/nrob/models/qwen-image-2.1/viggle-v0.2.1-r128.safetensors",
+  "output_root": "E:/deepseek/nrob/generated-images",
+  "controller_name": "qwen3.8-27b",
+  "controller_path": "D:/Qwen3.8-27B-Q4_K_M.gguf",
+  "controller_device": 0,
+  "image_device": 1
+}

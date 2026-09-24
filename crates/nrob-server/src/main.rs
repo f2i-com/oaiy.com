@@ -25,6 +25,7 @@ const HELP: &str = "Observer: --observer-model FILE.gguf --observer-device auto|
                        for a GGUF or 65s for a DeepSeek checkpoint, so naming the
                        one you will ask for saves loading another to unload it
   --model DIR          checkpoint directory (required)
+  --image-config FILE  native Qwen Image 2.1 worker/controller JSON configuration
   --engram-meta FILE   the Engram precompute, engram_meta.safetensors (default: in
                        the checkpoint directory)
   --usage FILE         expert usage profile: warms the caches at start, updated
@@ -92,6 +93,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Options, Stri
                 std::process::exit(0);
             }
             "--host" => a.host = val()?,
+            "--image-config" => a.image_config = Some(val()?.into()),
             "--port" => a.port = val()?.parse().map_err(|_| "--port: not a port number".to_string())?,
             "--devices" => {
                 a.devices = val()?.split(',').map(|d| d.trim().parse().map_err(|_| format!("--devices: bad ordinal {d:?}"))).collect::<Result<_, _>>()?
