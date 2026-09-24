@@ -85,6 +85,53 @@ fn video_decoder_matches_official_reference() -> candle_core::Result<()> {
     Ok(())
 }
 #[test]
+#[ignore = "requires LTX VAE weights and official reference activations; NROB_LTX_GOLDEN"]
+fn starting_image_encoder_matches_official_reference() -> candle_core::Result<()> {
+    let root = std::path::PathBuf::from(
+        std::env::var("NROB_LTX_GOLDEN").map_err(candle_core::Error::wrap)?,
+    );
+    let path = std::env::var("NROB_LTX_CHECKPOINT").map_err(candle_core::Error::wrap)?;
+    let dev = Device::new_cuda(
+        std::env::var("NROB_LTX_TEST_DEVICE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
+    )?;
+    let model = nrob_diffusion::ltx::vae::LtxVideoEncoder::load(
+        std::path::Path::new(&path),
+        LtxVaeConfig::ltx_2_3_22b(),
+        &dev,
+        DType::BF16,
+    )?;
+    let input = Tensor::from_raw_buffer(
+        &std::fs::read(root.join("encoder-input.f32"))?,
+        DType::F32,
+        &[1, 3, 1, 128, 128],
+        &dev,
+    )?
+    .to_dtype(DType::BF16)?;
+    let expected = Tensor::from_raw_buffer(
+        &std::fs::read(root.join("encoder-output.f32"))?,
+        DType::F32,
+        &[1, 128, 1, 4, 4],
+        &dev,
+    )?;
+    let actual = model.encode_means(&input)?.to_dtype(DType::F32)?;
+    let error = (actual - &expected)?
+        .sqr()?
+        .mean_all()?
+        .to_scalar::<f32>()?
+        .sqrt();
+    let scale = expected.sqr()?.mean_all()?.to_scalar::<f32>()?.sqrt();
+    println!("VAE relative RMS error: {}", error / scale);
+    assert!(
+        error / scale < 0.04,
+        "VAE differs from official encoder: {}",
+        error / scale
+    );
+    Ok(())
+}
+#[test]
 #[ignore = "requires a real LTX convolutional VAE checkpoint and CUDA; set NROB_LTX_VAE"]
 fn real_video_decoder_geometry_and_finite_pixels() -> candle_core::Result<()> {
     let path = std::env::var("NROB_LTX_VAE").map_err(candle_core::Error::wrap)?;

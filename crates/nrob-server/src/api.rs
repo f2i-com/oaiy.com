@@ -188,7 +188,10 @@ impl Server {
                 }
             }
             ("POST", "/v1/videos/generations") => {
-                match Self::parse_body(req).and_then(|body| self.images.submit_video(&body).map_err(bad)) {
+                match Self::parse_body(req).and_then(|body| {
+                    crate::images::video_reference_path(&body, self.local_images).map_err(bad)?;
+                    self.images.submit_video(&body).map_err(bad)
+                }) {
                     Ok(job) => return json_response(w,202,&job), Err(e) => Err(e),
                 }
             }

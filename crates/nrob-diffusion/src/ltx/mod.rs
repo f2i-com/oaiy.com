@@ -1,4 +1,5 @@
-//! Native Rust text-to-video for LTX 2.3/2.5 and compatible distilled checkpoints.
+//! Native Rust text/image-to-video for LTX 2.3/2.5 and compatible distilled checkpoints.
+mod cache;
 mod store;
 mod text;
 mod transformer;
@@ -27,6 +28,8 @@ pub struct Request {
     pub vae: PathBuf,
     pub output: PathBuf,
     pub prompt: String,
+    pub image: Option<PathBuf>,
+    pub cache_dir: Option<PathBuf>,
     pub width: usize,
     pub height: usize,
     pub frames: usize,
@@ -64,6 +67,16 @@ impl Request {
             vae: s("vae")?.into(),
             output: s("output_dir")?.into(),
             prompt: s("prompt")?,
+            cache_dir: j.get("cache_dir").and_then(Json::as_str).map(PathBuf::from),
+            image: match j.get("image") {
+                None | Some(Json::Null) => None,
+                Some(v) => Some(
+                    v.as_str()
+                        .filter(|s| !s.trim().is_empty())
+                        .ok_or("image must be an absolute local path")?
+                        .into(),
+                ),
+            },
             width: n("width", 512)?,
             height: n("height", 320)?,
             frames: n("frames", 49)?,
@@ -96,9 +109,11 @@ impl Request {
         if j.get("n").is_some_and(|v| v.as_i64() != Some(1)) || j.get("prompts").is_some() {
             return Err("video requests generate one prompt at a time".into());
         }
-        for k in ["images", "image", "audio", "adapter"] {
+        for k in ["images", "audio", "adapter"] {
             if j.get(k).is_some_and(|v| !matches!(v, Json::Null)) {
-                return Err(format!("{k} is not supported by the text-to-video worker"));
+                return Err(format!(
+                    "{k} is not supported by the video worker; use image for one starting frame"
+                ));
             }
         }
         Ok(r)
@@ -130,6 +145,12 @@ impl Request {
         }
         if self.prompt.trim().is_empty() {
             return Err("prompt must not be empty".into());
+        }
+        if let Some(path) = &self.image {
+            let meta = std::fs::metadata(path).map_err(|e| format!("starting image: {e}"))?;
+            if !path.is_absolute() || !meta.is_file() || meta.len() > 32 * 1024 * 1024 {
+                return Err("image must be an absolute local file of at most 32 MiB".into());
+            }
         }
         Ok(())
     }
@@ -219,27 +240,89 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
             candle_core::bail!("unsupported LTX architecture at {name}: {:?}", info.shape);
         }
     }
-    report(event("encoding_video_prompt", 0, 48));
+    let image_started = Instant::now();
+    let starting_latent = if let Some(path) = &r.image {
+        report(event("encoding_starting_image", 0, 1));
+        let mut reader = image::ImageReader::open(path)?
+            .with_guessed_format()
+            .map_err(candle_core::Error::wrap)?;
+        let mut limits = image::Limits::default();
+        limits.max_image_width = Some(16384);
+        limits.max_image_height = Some(16384);
+        limits.max_alloc = Some(256 * 1024 * 1024);
+        reader.limits(limits);
+        let pixels = reader
+            .decode()
+            .map_err(candle_core::Error::wrap)?
+            .resize_to_fill(
+                r.width as u32,
+                r.height as u32,
+                image::imageops::FilterType::Lanczos3,
+            )
+            .to_rgb8();
+        let values: Vec<f32> = pixels
+            .as_raw()
+            .iter()
+            .map(|&v| v as f32 / 127.5 - 1.)
+            .collect();
+        let pixels = Tensor::from_vec(values, (1, 1, r.height, r.width, 3), &dev)?
+            .permute((0, 4, 1, 2, 3))?
+            .contiguous()?
+            .to_dtype(DType::BF16)?;
+        let encoder = vae::LtxVideoEncoder::load(
+            &r.vae,
+            vae::LtxVaeConfig::ltx_2_3_22b(),
+            &dev,
+            DType::BF16,
+        )?;
+        let latent = encoder
+            .encode_means(&pixels)?
+            .permute((0, 2, 3, 4, 1))?
+            .contiguous()?
+            .reshape((1, r.height / 32 * (r.width / 32), 128))?
+            .to_dtype(DType::F32)?;
+        drop(encoder);
+        dev.synchronize()?;
+        Some(latent)
+    } else {
+        None
+    };
+    let image_seconds = image_started.elapsed().as_secs_f64();
     let encode_started = Instant::now();
-    let features = text::encode(
-        &r.text_encoder,
-        r.tokenizer.as_deref(),
-        &mut store,
-        &r.prompt,
-        r.model == "ltx-2.5",
-        &dev,
-        |n| report(event("encoding_video_prompt", n, 48)),
-    )?;
-    dev.synchronize()?;
-    let text_encoder_seconds = encode_started.elapsed().as_secs_f64();
-    report(event("video_text_connector", 0, 8));
-    let connector_started = Instant::now();
-    let context = transformer::connector(&mut store, &features, &dev, |n| {
-        report(event("video_text_connector", n, 8))
-    })?;
-    drop(features);
-    dev.synchronize()?;
-    let connector_seconds = connector_started.elapsed().as_secs_f64();
+    let prompt_cache = cache::PromptCache::new(r);
+    let cached = prompt_cache.as_ref().and_then(|c| c.load(&dev));
+    let prompt_cache_hit = cached.is_some();
+    let mut text_encoder_seconds = 0.;
+    let mut connector_seconds = 0.;
+    let context = if let Some(context) = cached {
+        report(event("cached_video_prompt", 1, 1));
+        context
+    } else {
+        report(event("encoding_video_prompt", 0, 48));
+        let features = text::encode(
+            &r.text_encoder,
+            r.tokenizer.as_deref(),
+            &mut store,
+            &r.prompt,
+            r.model == "ltx-2.5",
+            &dev,
+            |n| report(event("encoding_video_prompt", n, 48)),
+        )?;
+        dev.synchronize()?;
+        text_encoder_seconds = encode_started.elapsed().as_secs_f64();
+        report(event("video_text_connector", 0, 8));
+        let connector_started = Instant::now();
+        let context = transformer::connector(&mut store, &features, &dev, |n| {
+            report(event("video_text_connector", n, 8))
+        })?;
+        drop(features);
+        dev.synchronize()?;
+        connector_seconds = connector_started.elapsed().as_secs_f64();
+        if let Some(cache) = &prompt_cache {
+            let _ = cache.save(&context);
+        }
+        context
+    };
     let text_seconds = encode_started.elapsed().as_secs_f64();
     let gpu_budget = if r.memory == "ram" || r.memory == "ssd" {
         0
@@ -263,6 +346,7 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
     let rope = transformer::Rope::video(f, h, w, r.fps, &dev)?;
     let noise = crate::pipeline::noise(r.seed, f * h * w * 128);
     let mut latent = Tensor::from_vec(noise, (1, f * h * w, 128), &dev)?;
+    latent = condition_first_frame(latent, starting_latent.as_ref())?;
     let denoise_started = Instant::now();
     for step in 0..8 {
         let velocity = model.forward(
@@ -270,9 +354,11 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
             &context,
             SIGMAS[step],
             &rope,
+            if starting_latent.is_some() { h * w } else { 0 },
             |n| report(event("video_denoising", step * 48 + n, 8 * 48)),
         )?;
         latent = (latent + (velocity.to_dtype(DType::F32)? * (SIGMAS[step + 1] - SIGMAS[step]))?)?;
+        latent = condition_first_frame(latent, starting_latent.as_ref())?;
     }
     let (gpu, host, disk) = model.stats();
     dev.synchronize()?;
@@ -423,6 +509,15 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
         ("width", Json::Int(r.width as i64)),
         ("height", Json::Int(r.height as i64)),
         ("prompt", Json::str(&r.prompt)),
+        (
+            "image",
+            r.image
+                .as_ref()
+                .map(|p| Json::str(p.to_string_lossy()))
+                .unwrap_or(Json::Null),
+        ),
+        ("image_seconds", Json::Num(image_seconds)),
+        ("prompt_cache_hit", Json::Bool(prompt_cache_hit)),
         ("text_seconds", Json::Num(text_seconds)),
         ("text_encoder_seconds", Json::Num(text_encoder_seconds)),
         ("connector_seconds", Json::Num(connector_seconds)),
@@ -444,6 +539,37 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
     ]);
     std::fs::write(path.with_extension("json"), result.to_json())?;
     Ok(result)
+}
+fn condition_first_frame(latent: Tensor, image: Option<&Tensor>) -> Result<Tensor> {
+    match image {
+        None => Ok(latent),
+        Some(image) => {
+            let n = image.dim(1)?;
+            Tensor::cat(&[image, &latent.narrow(1, n, latent.dim(1)? - n)?], 1)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn starting_frame_is_exact_after_each_euler_update() -> Result<()> {
+        let clean = Tensor::from_vec(vec![1f32, 2., 3., 4.], (1, 2, 2), &Device::Cpu)?;
+        let mut latent = Tensor::zeros((1, 6, 2), DType::F32, &Device::Cpu)?;
+        for _ in 0..8 {
+            latent = condition_first_frame((latent + 0.25)?, Some(&clean))?;
+            assert_eq!(
+                latent.narrow(1, 0, 2)?.flatten_all()?.to_vec1::<f32>()?,
+                vec![1., 2., 3., 4.]
+            );
+        }
+        assert_eq!(
+            latent.narrow(1, 2, 4)?.flatten_all()?.to_vec1::<f32>()?,
+            vec![2.; 8]
+        );
+        Ok(())
+    }
 }
 fn inference_device(index: usize) -> Result<Device> {
     #[cfg(feature = "cuda")]

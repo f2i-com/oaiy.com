@@ -1,12 +1,17 @@
 use super::store::{Group, Store};
-use crate::math::{attention, heads, layer_norm, rms, unheads};
+use crate::math::{attention, heads, layer_norm, unheads};
 use candle_core::{DType, Device, Result, Tensor, D};
 
 pub const PREFIX: &str = "model.diffusion_model.";
 pub fn norm(x: &Tensor) -> Result<Tensor> {
-    let f = x.to_dtype(DType::F32)?;
-    f.broadcast_div(&(f.sqr()?.mean_keepdim(D::Minus1)? + 1e-6)?.sqrt()?)?
-        .to_dtype(x.dtype())
+    rms(
+        x,
+        &Tensor::ones(x.dim(D::Minus1)?, x.dtype(), x.device())?,
+        1e-6,
+    )
+}
+fn rms(x: &Tensor, weight: &Tensor, eps: f64) -> Result<Tensor> {
+    candle_nn::ops::rms_norm(&x.contiguous()?, &weight.contiguous()?, eps as f32)
 }
 pub struct Rope {
     cos: Tensor,
@@ -212,7 +217,7 @@ fn block(
     rope: &Rope,
 ) -> Result<Tensor> {
     let m = modulation.broadcast_add(w.get("scale_shift_table")?)?;
-    let slot = |j| m.narrow(1, j, 1);
+    let slot = |j| m.narrow(2, j, 1)?.squeeze(2);
     let h = affine(&norm(&x)?, &slot(0)?, &slot(1)?)?;
     x = (x + attn(w, "attn1", &h, &h, Some(rope))?.broadcast_mul(&slot(2)?)?)?;
     let mut pm = w.get("prompt_scale_shift_table")?.unsqueeze(0)?;
@@ -234,6 +239,8 @@ pub struct Transformer {
     pub gpu_bytes: u64,
     gpu_budget: u64,
     require_gpu: bool,
+    #[cfg(test)]
+    last_hidden: Option<Tensor>,
 }
 
 #[cfg(test)]
@@ -242,6 +249,14 @@ mod tests {
     #[test]
     #[ignore = "requires the complete official transformer reference; NROB_LTX_GOLDEN"]
     fn full_video_transformer_matches_reference() -> Result<()> {
+        full_reference(0)
+    }
+    #[test]
+    #[ignore = "requires official per-token timestep reference; NROB_LTX_GOLDEN"]
+    fn image_conditioned_transformer_matches_reference() -> Result<()> {
+        full_reference(4)
+    }
+    fn full_reference(conditioned_tokens: usize) -> Result<()> {
         let root = std::path::PathBuf::from(
             std::env::var("NROB_LTX_GOLDEN").map_err(candle_core::Error::wrap)?,
         );
@@ -255,15 +270,45 @@ mod tests {
         let read = |name: &str, shape: &[usize]| -> Result<Tensor> {
             Tensor::from_raw_buffer(&std::fs::read(root.join(name))?, DType::F32, shape, &dev)
         };
-        let x = read("transformer-input.f32", &[1, 16, 128])?.to_dtype(DType::BF16)?;
-        let context = read("transformer-context.f32", &[1, 8, 4096])?.to_dtype(DType::BF16)?;
-        let expected = read("transformer-output.f32", &[1, 16, 128])?;
+        let prefix = if conditioned_tokens == 0 {
+            "transformer"
+        } else {
+            "i2v-transformer"
+        };
+        let x = read(&format!("{prefix}-input.f32"), &[1, 16, 128])?.to_dtype(DType::BF16)?;
+        let context =
+            read(&format!("{prefix}-context.f32"), &[1, 8, 4096])?.to_dtype(DType::BF16)?;
+        let expected = read(
+            if conditioned_tokens == 0 {
+                "transformer-output.f32"
+            } else {
+                "i2v-transformer-output.f32"
+            },
+            &[1, 16, 128],
+        )?;
         let store = Store::open(std::path::Path::new(&weights), 0)?;
         let mut model = Transformer::new(store, &dev, 26 << 30, true)?;
         let rope = Rope::video(1, 4, 4, 24, &dev)?;
         let actual = model
-            .forward(&x, &context, 0.725, &rope, |_| {})?
+            .forward(&x, &context, 0.725, &rope, conditioned_tokens, |_| {})?
             .to_dtype(DType::F32)?;
+        if conditioned_tokens > 0 {
+            let hidden = model.last_hidden.as_ref().unwrap().to_dtype(DType::F32)?;
+            let reference = read("i2v-hidden.f32", &[1, 16, 4096])?;
+            let relative = ((hidden - &reference)?
+                .sqr()?
+                .mean_all()?
+                .to_scalar::<f32>()?
+                / reference.sqr()?.mean_all()?.to_scalar::<f32>()?)
+            .sqrt();
+            assert!(
+                relative < 0.04,
+                "conditioned hidden-state relative RMS {relative}"
+            );
+        }
+        // Clean-frame velocities are discarded by masked Euler sampling.
+        let actual = actual.narrow(1, conditioned_tokens, 16 - conditioned_tokens)?;
+        let expected = expected.narrow(1, conditioned_tokens, 16 - conditioned_tokens)?;
         let error = (&actual - &expected)?
             .sqr()?
             .mean_all()?
@@ -275,7 +320,9 @@ mod tests {
             error / scale
         );
         assert!(
-            error / scale < 0.05,
+            // Mixed zero/noisy timesteps amplify small BF16 backend differences
+            // in the final projection; also bound the pre-projection state above.
+            error / scale < if conditioned_tokens == 0 { 0.05 } else { 0.10 },
             "full transformer relative RMS error {}",
             error / scale
         );
@@ -299,7 +346,7 @@ mod tests {
         };
         let x = read("dit-input.f32", &[1, 16, 4096])?.to_dtype(DType::BF16)?;
         let context = read("dit-context.f32", &[1, 8, 4096])?.to_dtype(DType::BF16)?;
-        let m = read("dit-modulation.f32", &[1, 9, 4096])?.to_dtype(DType::BF16)?;
+        let m = read("dit-modulation.f32", &[1, 1, 9, 4096])?.to_dtype(DType::BF16)?;
         let pm = read("dit-prompt.f32", &[1, 2, 4096])?.to_dtype(DType::BF16)?;
         let rope = Rope::video(1, 4, 4, 24, &dev)?;
         let expected = read("dit-output.f32", &[1, 16, 4096])?;
@@ -367,6 +414,8 @@ impl Transformer {
             gpu_bytes: 0,
             gpu_budget,
             require_gpu,
+            #[cfg(test)]
+            last_hidden: None,
         })
     }
     pub fn stats(&self) -> (u64, u64, u64) {
@@ -378,11 +427,33 @@ impl Transformer {
         context: &Tensor,
         sigma: f64,
         rope: &Rope,
+        conditioned_tokens: usize,
         mut progress: impl FnMut(usize),
     ) -> Result<Tensor> {
         let dev = latent.device();
-        let (modulation, embedded) = time_embedding(&self.global, "adaln_single", sigma, dev)?;
-        let modulation = modulation.reshape((1, 9, 4096))?;
+        let tokens = latent.dim(1)?;
+        if conditioned_tokens >= tokens {
+            candle_core::bail!("conditioning must leave generated video tokens");
+        }
+        let (mut modulation, mut embedded) =
+            time_embedding(&self.global, "adaln_single", sigma, dev)?;
+        if conditioned_tokens > 0 {
+            // Only two distinct timesteps: clean first frame and noisy video.
+            let (clean_modulation, clean_embedded) =
+                time_embedding(&self.global, "adaln_single", 0., dev)?;
+            let expand = |clean: &Tensor, noisy: &Tensor| -> Result<Tensor> {
+                Tensor::cat(
+                    &[
+                        clean.broadcast_as((1, conditioned_tokens, clean.dim(2)?))?,
+                        noisy.broadcast_as((1, tokens - conditioned_tokens, noisy.dim(2)?))?,
+                    ],
+                    1,
+                )
+            };
+            modulation = expand(&clean_modulation, &modulation)?;
+            embedded = expand(&clean_embedded, &embedded)?;
+        }
+        let modulation = modulation.reshape((1, modulation.dim(1)?, 9, 4096))?;
         let prompt = if self
             .global
             .tensors
@@ -422,14 +493,23 @@ impl Transformer {
             x = block(w, x, context, &modulation, prompt.as_ref(), rope)?;
             progress(i + 1);
         }
+        #[cfg(test)]
+        {
+            self.last_hidden = Some(x.clone());
+        }
         let m = self
             .global
             .get("scale_shift_table")?
             .unsqueeze(0)?
-            .broadcast_add(&embedded)?;
+            .unsqueeze(0)?
+            .broadcast_add(&embedded.unsqueeze(2)?)?;
         self.global.linear(
             "proj_out",
-            &affine(&layer_norm(&x)?, &m.narrow(1, 0, 1)?, &m.narrow(1, 1, 1)?)?,
+            &affine(
+                &layer_norm(&x)?,
+                &m.narrow(2, 0, 1)?.squeeze(2)?,
+                &m.narrow(2, 1, 1)?.squeeze(2)?,
+            )?,
         )
     }
 }

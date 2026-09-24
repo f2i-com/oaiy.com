@@ -484,9 +484,10 @@ fn prepare_video(c: &Config, body: &Json) -> Result<Json, String> {
     let seed = number("seed", 0, 0, i64::MAX)?;
     number("steps", 8, 8, 8)?;
     number("n", 1, 1, 1)?;
-    for key in ["images", "image", "audio", "adapter"] {
+    let image = video_reference_path(body, true)?;
+    for key in ["images", "audio", "adapter"] {
         if body.get(key).is_some_and(|v| !matches!(v, Json::Null)) {
-            return Err(format!("{key} is not supported for text-to-video"));
+            return Err(format!("{key} is not supported for video; use image for one starting frame"));
         }
     }
     let memory = match body.get("memory") {
@@ -508,6 +509,7 @@ fn prepare_video(c: &Config, body: &Json) -> Result<Json, String> {
         .clamp(0, 192);
     let mut fields = vec![
         ("kind".into(), Json::str("video")),
+        ("image".into(), image.unwrap_or(Json::Null)),
         ("model".into(), Json::str(model)),
         ("prompt".into(), Json::str(prompt)),
         ("width".into(), Json::Int(width)),
@@ -526,6 +528,14 @@ fn prepare_video(c: &Config, body: &Json) -> Result<Json, String> {
             Json::Int(number("vram_gb", vram_limit, 0, vram_limit)?),
         ),
     ];
+    let prompt_cache = match body.get("prompt_cache") {
+        None => true,
+        Some(v) => v.as_bool().ok_or("prompt_cache must be a boolean")?,
+    };
+    if prompt_cache {
+        let cache_request = Json::obj([("output_dir", Json::str(".ltx-prompt-cache"))]);
+        fields.push(("cache_dir".into(), Json::str(output_directory(c, &cache_request, "videos")?.to_string_lossy())));
+    }
     for key in ["transformer", "text_encoder", "vae", "tokenizer"] {
         let value = selected.get(key).and_then(Json::as_str);
         if key == "tokenizer" && model == "ltx-2.5" && value.is_none() {
@@ -656,6 +666,16 @@ fn prepare(c: &Config, body: &Json) -> Result<Json, String> {
 }
 
 /// Shares the server's existing opt-in policy for reading local image paths.
+pub(crate) fn video_reference_path(body: &Json, allow_local: bool) -> Result<Option<Json>, String> {
+    match body.get("image") {
+        None | Some(Json::Null) => Ok(None),
+        Some(image) => {
+            let wrapper = Json::obj([("images", Json::Arr(vec![image.clone()]))]);
+            Ok(reference_paths(&wrapper, allow_local)?.into_iter().next())
+        }
+    }
+}
+
 pub(crate) fn reference_paths(body: &Json, allow_local: bool) -> Result<Vec<Json>, String> {
     let Some(value) = body.get("images") else {
         return Ok(Vec::new());
@@ -736,6 +756,14 @@ mod tests {
         assert_eq!(r.get("kind").and_then(Json::as_str), Some("video"));
         assert_eq!(r.get("memory").and_then(Json::as_str), Some("ssd"));
         assert_eq!(r.get("device").and_then(Json::as_i64), Some(1));
+        assert!(r.get("cache_dir").and_then(Json::as_str).unwrap().ends_with(".ltx-prompt-cache"));
+        assert!(prepare_video(&cfg, &valid(r#", "prompt_cache":false"#)).unwrap().get("cache_dir").is_none());
+        let reference = Json::obj([("image", Json::str(weight.to_string_lossy()))]);
+        assert!(video_reference_path(&reference, false).is_err());
+        assert!(video_reference_path(&reference, true).unwrap().is_some());
+        for invalid in [Json::Int(1), Json::str("relative.png"), Json::str("")] {
+            assert!(video_reference_path(&Json::obj([("image", invalid)]), true).is_err());
+        }
         assert_eq!(
             r.get("transformer").and_then(Json::as_str),
             Some(weight.to_str().unwrap())

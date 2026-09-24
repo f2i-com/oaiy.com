@@ -152,9 +152,8 @@ fn hidden_features(
 ) -> Result<Tensor> {
     // Masked left-padding need not traverse 48 layers. Preserve its position
     // offset so the BF16 rotary angles match the padded reference encoder.
-    let embedding = store.tensor("model.embed_tokens.weight", dev, false)?;
+    let embedding = store.rows("model.embed_tokens.weight", ids, dev)?;
     let mut x = embedding
-        .index_select(&Tensor::new(ids, dev)?, 0)?
         .unsqueeze(0)?
         .broadcast_mul(&Tensor::new(3840f32.sqrt(), dev)?.to_dtype(DType::BF16)?)?;
     drop(embedding);

@@ -6,6 +6,28 @@ use std::{
     path::Path,
 };
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn embedding_rows_preserve_order_and_check_bounds() -> Result<()> {
+        let path = std::env::temp_dir().join(format!("nrob-rows-{}-{}.safetensors", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let header = br#"{"embedding":{"dtype":"F32","shape":[3,2],"data_offsets":[0,24]}}"#;
+        let mut file = Vec::new();
+        file.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        file.extend_from_slice(header);
+        file.extend((1..=6).flat_map(|n| (n as f32).to_le_bytes()));
+        std::fs::write(&path, file)?;
+        let mut store = Store::open(&path, 0)?;
+        let selected = store.rows("embedding", &[2, 0, 2], &Device::Cpu)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+        assert_eq!(selected, vec![5., 6., 1., 2., 5., 6.]);
+        assert!(store.rows("embedding", &[3], &Device::Cpu).is_err());
+        assert_eq!(store.disk_bytes, 24);
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+}
+
 pub struct Store {
     pub index: StIndex,
     host: HashMap<String, Vec<u8>>,
@@ -56,6 +78,44 @@ impl Store {
             self.host.insert(key.to_owned(), bytes);
         }
         Ok(t)
+    }
+    /// Fetch only prompt vocabulary rows, avoiding a multi-gigabyte embedding upload.
+    pub fn rows(&mut self, key: &str, ids: &[u32], dev: &Device) -> Result<Tensor> {
+        use std::io::{Read, Seek, SeekFrom};
+        let info = self.index.info(key).map_err(candle_core::Error::wrap)?;
+        if info.shape.len() != 2 || ids.iter().any(|&i| i as usize >= info.shape[0]) {
+            candle_core::bail!("invalid embedding row selection for {key}");
+        }
+        let dtype = match info.dtype {
+            Dtype::BF16 => DType::BF16,
+            Dtype::F16 => DType::F16,
+            Dtype::F32 => DType::F32,
+            _ => candle_core::bail!("unsupported embedding dtype"),
+        };
+        let width = info.shape[1];
+        let row_bytes = width
+            .checked_mul(dtype.size_in_bytes())
+            .ok_or_else(|| candle_core::Error::Msg("embedding row overflow".into()))?;
+        let size = ids
+            .len()
+            .checked_mul(row_bytes)
+            .ok_or_else(|| candle_core::Error::Msg("embedding selection overflow".into()))?;
+        let mut bytes = vec![0u8; size];
+        let mut file = std::fs::File::open(self.index.shard_path(info.shard))?;
+        for (i, &id) in ids.iter().enumerate() {
+            let offset = (id as u64)
+                .checked_mul(row_bytes as u64)
+                .ok_or_else(|| candle_core::Error::Msg("embedding offset overflow".into()))?;
+            if offset + row_bytes as u64 > info.nbytes {
+                candle_core::bail!("embedding row outside tensor");
+            }
+            file.seek(SeekFrom::Start(info.start.checked_add(offset).ok_or_else(
+                || candle_core::Error::Msg("embedding file offset overflow".into()),
+            )?))?;
+            file.read_exact(&mut bytes[i * row_bytes..(i + 1) * row_bytes])?;
+        }
+        self.disk_bytes += size as u64;
+        Tensor::from_raw_buffer(&bytes, dtype, &[ids.len(), width], dev)?.to_dtype(DType::BF16)
     }
     pub fn group_bytes(&self, prefix: &str, select: impl Fn(&str) -> bool) -> Result<u64> {
         let mut bytes = 0;

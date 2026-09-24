@@ -1,15 +1,15 @@
 # Native LTX video
 
-The `nrob-diffusion` worker implements silent text-to-video for distilled
+The `nrob-diffusion` worker implements silent text-to-video and starting-image-to-video for distilled
 LTX 2.3, LTX 2.5 and Sulphur-2 checkpoints in Rust. Candle supplies tensor
 operations and CUDA kernels. Gemma text encoding, the video transformer,
 eight-step Euler sampling and the convolutional VAE run inside the worker.
 FFmpeg only encodes the decoded pixels into an H.264 MP4; it does not run models.
 The server and inference core remain std-only and forbid unsafe Rust.
 
-Sulphur-2 has been validated end to end locally. Complete LTX 2.5 generation
-validation is still pending the remaining checkpoint downloads; its Gemma 4
-attention layers and convolutional decoder have passed reference checks.
+Sulphur-2 and LTX 2.5 have been validated end to end locally in both text-to-video
+and image-to-video modes. The original LTX 2.3 checkpoint is still downloading;
+Sulphur validates the shared LTX 2.3 architecture.
 
 ## Models
 
@@ -76,10 +76,32 @@ Requests generate one clip. Dimensions must be multiples of 32, from 128 to
 1024. Frame counts must be `8k+1`, from 9 to 121; 49 frames at 24 fps is about
 two seconds. Distilled sampling uses the trained eight-step schedule. Qwen
 Image's six-step setting does not apply to LTX. This video path currently
-accepts text only and does not generate audio or use reference images.
+accepts an optional `image` containing one absolute local image path. Omit it
+for text-to-video. Multiple reference images, ending keyframes, and audio are
+not supported by this video path.
+
+For image-to-video, add
+`"image": "E:/images/fox.png"` to the request. The worker center-crops and resizes
+the image to the requested dimensions, encodes it with the native VAE, and holds
+its first-frame latent fixed throughout sampling. Conditioned tokens receive a
+zero timestep; generated tokens receive the current noise timestep. The first
+output frame is a VAE reconstruction of the image, so pixel-perfect reproduction
+is not guaranteed. PNG, JPEG and WebP are supported, with a 32 MiB input-file limit
+and bounded decoded-image allocation. Existing local-file policy applies: enabled
+by default on loopback, disabled on non-loopback listeners unless explicitly
+enabled with `--local-images on`; `--local-images off` disables it everywhere.
+
+Repeated prompts reuse the final text conditioning by default, including across
+text-to-video and image-to-video jobs with different seeds or dimensions. The
+cache is keyed by the exact prompt, model, weight/tokenizer paths, sizes,
+modification times and cache format version. Its eight entries occupy roughly
+128 MiB under `output_root/.ltx-prompt-cache`, with least-recently-used eviction.
+No model weights are duplicated. Set `"prompt_cache": false` to bypass it; deleting
+this cache is safe. A cache miss or corrupt entry simply recomputes conditioning.
+The standalone worker enables this cache only when given `cache_dir`.
 
 Completed jobs return an MP4 path, a middle-frame PNG preview, dimensions,
-frame rate, seed, stage timings and weight-residency statistics. A JSON sidecar
+frame rate, seed, stage timings, `prompt_cache_hit`, and weight-residency statistics. A JSON sidecar
 records the prompt and generation details. Output folders stay under the
 server's configured output root. Model and executable paths come from trusted
 server configuration, never from the generation request.
@@ -113,6 +135,18 @@ and seed. These are individual measurements with warm file caches and concurrent
 model downloads, not guaranteed latency. GPU denoising took about 14 seconds;
 text encoding remained a substantial part of total time. Clips are silent.
 
+A repeated-prompt image-to-video run after these changes took 17.7 seconds for
+512×320, 49 frames on the second RTX 5090: 0.51 seconds for the starting image,
+0.010 seconds for cached prompt conditioning, 15.3 seconds for denoising, and
+1.06 seconds for decoding. This is a warm file-cache measurement with concurrent
+model downloads; new prompts still require Gemma and the text connector.
+Cached and uncached conditioning produced byte-identical MP4s at the same seed.
+LTX 2.5 also generated both modes locally; a cached 512×320, 49-frame text-to-video
+run took 20.4 seconds. Its first Gemma 4 prompt was substantially slower (about
+70 seconds for conditioning during concurrent compilation).
+The worker also uses fused RMS normalization and reads only the prompt's Gemma
+vocabulary rows, avoiding the complete embedding-table upload on cache misses.
+
 The reported `gpu_weight_bytes`/`ram_weight_bytes` refer to transformer block
 residency. `weight_bytes_read` counts checkpoint bytes requested by that store,
 including conditioning projections/connectors; it is not physical disk traffic
@@ -137,6 +171,9 @@ The complete 48-layer text-feature reference uses
 The complete video-transformer reference uses
 `tools/ltx/transformer_reference.py --checkpoint <distilled-file> --source
 <official-LTX-2-checkout>` and needs about 26 GiB of free GPU memory.
+For the image-conditioning reference, run it again with `--conditioned-tokens 4`.
+The starting-image encoder reference uses the VAE script with `--encoder` and
+the Sulphur checkpoint.
 Gemma 4 uses `tools/ltx/gemma4_reference.py --gemma <Gemma-4-file>` with both
 `--mode blocks` and `--mode features`. It requires Transformers 5.17 or newer;
 `--reference-deps` can point to an isolated installation for these offline checks.
@@ -146,7 +183,10 @@ and also accepts an isolated dependency directory through `--reference-deps`.
 
 On the local RTX 5090 checks, complete Gemma 3 features differed from the official
 BF16 encoder by about 0.7% relative RMS; the complete Sulphur video transformer
-differed by 4.2%, and LTX 2.5 convolutional VAE pixels differed by 1.44%.
+differed by 3.4% after fused normalization. The synthetic mixed-timestep
+image-conditioning check differed by 2.7% before the final projection and 7.8%
+in generated-token velocities; the first-frame VAE encoder differed by 0.97%.
+LTX 2.5 convolutional VAE pixels differed by 1.44%.
 These compare numerical components, not end-to-end video quality.
 
 Set `NROB_LTX_GOLDEN`, `NROB_LTX_GEMMA`, `NROB_LTX_GEMMA4`, `NROB_LTX_CHECKPOINT`, `NROB_LTX_VAE`,

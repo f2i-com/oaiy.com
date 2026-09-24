@@ -13,7 +13,12 @@ parser.add_argument('--source', required=True)
 parser.add_argument('--reference-deps')
 parser.add_argument('--output', default='target/ltx-golden')
 parser.add_argument('--device', default='cuda:0')
+parser.add_argument('--conditioned-tokens', type=int, default=0)
 args = parser.parse_args()
+if not 0 <= args.conditioned_tokens < 16:
+    parser.error('--conditioned-tokens must be in 0..15')
+out = pathlib.Path(args.output)
+out.mkdir(parents=True, exist_ok=True)
 sys.path.insert(0, str(pathlib.Path(args.source) / 'packages/ltx-core/src'))
 if args.reference_deps:
     sys.path.insert(0, args.reference_deps)
@@ -37,13 +42,16 @@ context = torch.sin(torch.arange(8 * 4096, device=args.device) * .021).reshape(1
 positions = torch.tensor([[[0., 1. / 24], [y * 32, (y + 1) * 32], [x * 32, (x + 1) * 32]]
                           for y in range(4) for x in range(4)],
                          device=args.device, dtype=torch.float32).permute(1, 0, 2).unsqueeze(0)
+timesteps = torch.full((1, 16), .725, device=args.device)
+timesteps[:, :args.conditioned_tokens] = 0
 video = Modality(latent=x, sigma=torch.tensor([.725], device=args.device),
-                 timesteps=torch.full((1, 16), .725, device=args.device),
+                 timesteps=timesteps,
                  positions=positions, context=context)
+if args.conditioned_tokens:
+    model.transformer_blocks[-1].register_forward_hook(
+        lambda m, a, o: o[0].x.float().cpu().numpy().tofile(out/'i2v-hidden.f32'))
 with torch.inference_mode():
     result, _ = model(video, None, None)
-out = pathlib.Path(args.output)
-out.mkdir(parents=True, exist_ok=True)
 for name, value in [('input', x), ('context', context), ('output', result)]:
-    value.float().cpu().numpy().tofile(out / ('transformer-' + name + '.f32'))
+    value.float().cpu().numpy().tofile(out / (('i2v-transformer-' if args.conditioned_tokens else 'transformer-') + name + '.f32'))
 print('Official transformer RMS', result.float().square().mean().sqrt().item(), flush=True)
