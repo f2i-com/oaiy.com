@@ -1,4 +1,4 @@
-//! Native Rust diffusion subprocess supervision. The worker owns all image
+//! Native Rust diffusion subprocess supervision. The worker owns all media
 //! allocations: exit (including cancellation) releases its CUDA context.
 use nrob::json::Json;
 use std::{
@@ -23,6 +23,7 @@ pub struct Config {
     pub controller_path: PathBuf,
     pub controller_device: usize,
     pub image_device: usize,
+    pub video_config: Option<PathBuf>,
 }
 impl Config {
     pub fn read(path: &Path) -> Result<Self, String> {
@@ -51,10 +52,15 @@ impl Config {
             controller_path: s("controller_path")?.into(),
             controller_device: n("controller_device")?,
             image_device: n("image_device")?,
+            video_config: j
+                .get("video_config")
+                .and_then(Json::as_str)
+                .map(PathBuf::from),
         };
         for p in [&c.worker, &c.base, &c.transformer, &c.controller_path]
             .into_iter()
             .chain(c.adapter.iter())
+            .chain(c.video_config.iter())
         {
             if !p.is_absolute() || !p.exists() {
                 return Err(format!(
@@ -77,6 +83,7 @@ impl Config {
 
 struct Job {
     id: u64,
+    kind: &'static str,
     state: String,
     progress: Json,
     result: Json,
@@ -125,6 +132,11 @@ impl Images {
         Json::obj([
             ("configured", Json::Bool(config.is_some())),
             (
+                "video_configured",
+                Json::Bool(config.and_then(|c| c.video_config.as_ref()).is_some()),
+            ),
+            ("video_models", video_models(config)),
+            (
                 "controller_model",
                 config.map_or(Json::Null, |c| Json::str(&c.controller_name)),
             ),
@@ -133,6 +145,7 @@ impl Images {
                 job.as_ref().map_or(Json::Null, |j| {
                     Json::obj([
                         ("id", Json::Int(j.id as i64)),
+                        ("kind", Json::str(j.kind)),
                         ("state", Json::str(&j.state)),
                         ("progress", j.progress.clone()),
                         ("result", j.result.clone()),
@@ -156,18 +169,28 @@ impl Images {
             .as_ref()
             .is_some_and(|j| matches!(j.state.as_str(), "queued" | "running" | "cancelling"))
         {
-            return Err("cancel or finish the image batch before releasing the controller".into());
+            return Err("cancel or finish the media job before releasing the controller".into());
         }
         self.models.release_images();
         Ok(())
     }
     pub fn submit(self: &Arc<Self>, body: &Json) -> Result<Json, String> {
+        self.submit_kind(body, false)
+    }
+    pub fn submit_video(self: &Arc<Self>, body: &Json) -> Result<Json, String> {
+        self.submit_kind(body, true)
+    }
+    fn submit_kind(self: &Arc<Self>, body: &Json, video: bool) -> Result<Json, String> {
         let cfg = self
             .models
             .image_config()
             .ok_or("image generation is disabled; configure --image-config")?
             .clone();
-        let request = prepare(&cfg, body)?;
+        let request = if video {
+            prepare_video(&cfg, body)?
+        } else {
+            prepare(&cfg, body)?
+        };
         let cancel = Arc::new(AtomicBool::new(false));
         let id = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -179,10 +202,11 @@ impl Images {
                 .as_ref()
                 .is_some_and(|j| matches!(j.state.as_str(), "queued" | "running" | "cancelling"))
             {
-                return Err("an image batch is already active".into());
+                return Err("an image or video job is already active".into());
             }
             *job = Some(Job {
                 id,
+                kind: if video { "video" } else { "image" },
                 state: "queued".into(),
                 progress: Json::Null,
                 result: Json::Null,
@@ -231,7 +255,14 @@ impl Images {
         Ok(Json::obj([
             ("id", Json::Int(id as i64)),
             ("state", Json::str("queued")),
-            ("status_url", Json::str("/v1/images/status")),
+            (
+                "status_url",
+                Json::str(if video {
+                    "/v1/videos/status"
+                } else {
+                    "/v1/images/status"
+                }),
+            ),
             (
                 "controller_model",
                 Json::str(&self.models.image_config().unwrap().controller_name),
@@ -344,6 +375,179 @@ impl Images {
     }
 }
 
+fn video_models(config: Option<&Config>) -> Json {
+    let manifest = config
+        .and_then(|c| c.video_config.as_ref())
+        .and_then(|p| std::fs::read(p).ok())
+        .and_then(|b| Json::parse(&b).ok());
+    Json::Arr(
+        manifest
+            .as_ref()
+            .and_then(|j| j.get("models"))
+            .and_then(Json::as_object)
+            .unwrap_or(&[])
+            .iter()
+            .map(|(name, model)| {
+                let mut keys = vec!["transformer", "text_encoder", "vae"];
+                if name != "ltx-2.5" {
+                    keys.push("tokenizer");
+                }
+                let ready = keys.iter().all(|k| {
+                    model
+                        .get(k)
+                        .and_then(Json::as_str)
+                        .is_some_and(|p| Path::new(p).is_file())
+                });
+                Json::obj([
+                    ("model", Json::str(name)),
+                    ("weights_ready", Json::Bool(ready)),
+                ])
+            })
+            .collect(),
+    )
+}
+
+fn output_directory(c: &Config, body: &Json, default: &str) -> Result<PathBuf, String> {
+    let folder = match body.get("output_dir") {
+        None => default,
+        Some(v) => v
+            .as_str()
+            .ok_or("output_dir must be a relative folder name")?,
+    };
+    let folder = Path::new(folder);
+    if folder.as_os_str().is_empty()
+        || folder
+            .components()
+            .any(|p| !matches!(p, Component::Normal(_)))
+    {
+        return Err("output_dir must stay under the configured output root".into());
+    }
+    std::fs::create_dir_all(&c.output_root).map_err(|e| e.to_string())?;
+    let root = c.output_root.canonicalize().map_err(|e| e.to_string())?;
+    let mut out = root.clone();
+    for part in folder.components() {
+        out.push(part.as_os_str());
+        if out.exists() {
+            out = out.canonicalize().map_err(|e| e.to_string())?;
+            if !out.starts_with(&root) {
+                return Err("output directory escapes root through a link".into());
+            }
+        } else {
+            std::fs::create_dir(&out).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(out)
+}
+
+fn prepare_video(c: &Config, body: &Json) -> Result<Json, String> {
+    let path = c
+        .video_config
+        .as_ref()
+        .ok_or("video generation is disabled; set video_config in the image config")?;
+    let config = Json::parse(&std::fs::read(path).map_err(|e| format!("video config: {e}"))?)
+        .map_err(|e| e.to_string())?;
+    let model = match body.get("model") {
+        None => "ltx-2.3",
+        Some(v) => v.as_str().ok_or("model must be a string")?,
+    };
+    if !["ltx-2.3", "ltx-2.5", "sulphur-2"].contains(&model) {
+        return Err("unsupported video model".into());
+    }
+    let selected = config
+        .get("models")
+        .and_then(|j| j.get(model))
+        .ok_or_else(|| format!("video model {model} is not configured"))?;
+    let prompt = body
+        .get("prompt")
+        .and_then(Json::as_str)
+        .filter(|s| !s.trim().is_empty() && s.len() <= 16384)
+        .ok_or("prompt must contain 1..16384 bytes")?;
+    let number = |key: &str, default: i64, min: i64, max: i64| -> Result<i64, String> {
+        let value = match body.get(key) {
+            None => default,
+            Some(v) => v
+                .as_i64()
+                .ok_or_else(|| format!("{key} must be an integer"))?,
+        };
+        if !(min..=max).contains(&value) {
+            return Err(format!("{key} must be in {min}..{max}"));
+        }
+        Ok(value)
+    };
+    let width = number("width", 512, 128, 1024)?;
+    let height = number("height", 320, 128, 1024)?;
+    let frames = number("frames", 49, 9, 121)?;
+    if width % 32 != 0 || height % 32 != 0 || (frames - 1) % 8 != 0 {
+        return Err("video dimensions must be multiples of 32; frames must be 8k+1".into());
+    }
+    let fps = number("fps", 24, 1, 60)?;
+    let seed = number("seed", 0, 0, i64::MAX)?;
+    number("steps", 8, 8, 8)?;
+    number("n", 1, 1, 1)?;
+    for key in ["images", "image", "audio", "adapter"] {
+        if body.get(key).is_some_and(|v| !matches!(v, Json::Null)) {
+            return Err(format!("{key} is not supported for text-to-video"));
+        }
+    }
+    let memory = match body.get("memory") {
+        None => "auto",
+        Some(v) => v.as_str().ok_or("memory must be a string")?,
+    };
+    if !["auto", "gpu", "ram", "ssd"].contains(&memory) {
+        return Err("memory must be auto, gpu, ram or ssd".into());
+    }
+    let ram_limit = config
+        .get("ram_gb")
+        .and_then(Json::as_i64)
+        .unwrap_or(48)
+        .clamp(0, 512);
+    let vram_limit = config
+        .get("vram_gb")
+        .and_then(Json::as_i64)
+        .unwrap_or(26)
+        .clamp(0, 192);
+    let mut fields = vec![
+        ("kind".into(), Json::str("video")),
+        ("model".into(), Json::str(model)),
+        ("prompt".into(), Json::str(prompt)),
+        ("width".into(), Json::Int(width)),
+        ("height".into(), Json::Int(height)),
+        ("frames".into(), Json::Int(frames)),
+        ("fps".into(), Json::Int(fps)),
+        ("seed".into(), Json::Int(seed)),
+        ("device".into(), Json::Int(c.image_device as i64)),
+        ("memory".into(), Json::str(memory)),
+        (
+            "ram_gb".into(),
+            Json::Int(number("ram_gb", ram_limit, 0, ram_limit)?),
+        ),
+        (
+            "vram_gb".into(),
+            Json::Int(number("vram_gb", vram_limit, 0, vram_limit)?),
+        ),
+    ];
+    for key in ["transformer", "text_encoder", "vae", "tokenizer"] {
+        let value = selected.get(key).and_then(Json::as_str);
+        if key == "tokenizer" && model == "ltx-2.5" && value.is_none() {
+            continue;
+        }
+        let value = value.ok_or_else(|| format!("video config missing {model}.{key}"))?;
+        let path = Path::new(value);
+        if !path.is_absolute() || !path.is_file() {
+            return Err(format!("video weights are not ready: {}", path.display()));
+        }
+        fields.push((key.into(), Json::str(value)));
+    }
+    if let Some(ffmpeg) = config.get("ffmpeg").and_then(Json::as_str) {
+        fields.push(("ffmpeg".into(), Json::str(ffmpeg)));
+    }
+    fields.push((
+        "output_dir".into(),
+        Json::str(output_directory(c, body, "videos")?.to_string_lossy()),
+    ));
+    Ok(Json::Obj(fields))
+}
+
 fn prepare(c: &Config, body: &Json) -> Result<Json, String> {
     let images = reference_paths(body, true)?;
     let prompt = body.get("prompt").cloned();
@@ -413,34 +617,7 @@ fn prepare(c: &Config, body: &Json) -> Result<Json, String> {
         return Err("turbo steps must be 4 or 6".into());
     }
     let seed = number("seed", 0, 0, i64::MAX - n)?;
-    let folder = match body.get("output_dir") {
-        None => "images",
-        Some(v) => v
-            .as_str()
-            .ok_or("output_dir must be a relative folder name")?,
-    };
-    let folder = Path::new(folder);
-    if folder.as_os_str().is_empty()
-        || folder
-            .components()
-            .any(|p| !matches!(p, Component::Normal(_)))
-    {
-        return Err("output_dir must stay under the configured output root".into());
-    }
-    std::fs::create_dir_all(&c.output_root).map_err(|e| e.to_string())?;
-    let root = c.output_root.canonicalize().map_err(|e| e.to_string())?;
-    let mut out = root.clone();
-    for part in folder.components() {
-        out.push(part.as_os_str());
-        if out.exists() {
-            out = out.canonicalize().map_err(|e| e.to_string())?;
-            if !out.starts_with(&root) {
-                return Err("output directory escapes root through a link".into());
-            }
-        } else {
-            std::fs::create_dir(&out).map_err(|e| e.to_string())?;
-        }
-    }
+    let out = output_directory(c, body, "images")?;
     let mut fields = vec![
         ("base".into(), Json::str(c.base.to_string_lossy())),
         (
@@ -521,6 +698,64 @@ pub(crate) fn reference_paths(body: &Json, allow_local: bool) -> Result<Vec<Json
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn video_requests_use_trusted_paths_and_bounded_memory() {
+        let root = std::env::temp_dir().join(format!("nrob-video-config-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let weight = root.join("fixture.safetensors");
+        std::fs::write(&weight, b"fixture").unwrap();
+        let model = Json::obj(
+            ["transformer", "text_encoder", "vae", "tokenizer"]
+                .map(|k| (k, Json::str(weight.to_string_lossy()))),
+        );
+        let manifest = root.join("video.json");
+        std::fs::write(
+            &manifest,
+            Json::obj([
+                ("models", Json::obj([("sulphur-2", model)])),
+                ("ram_gb", Json::Int(4)),
+                ("vram_gb", Json::Int(8)),
+            ])
+            .to_json(),
+        )
+        .unwrap();
+        let mut cfg = config();
+        cfg.output_root = root.join("output");
+        cfg.video_config = Some(manifest);
+        let valid = |extra: &str| {
+            Json::parse(
+                format!(r#"{{"model":"sulphur-2","prompt":"A bird in flight"{extra}}}"#).as_bytes(),
+            )
+            .unwrap()
+        };
+        let r = prepare_video(
+            &cfg,
+            &valid(r#", "memory":"ssd", "transformer":"untrusted", "device":99"#),
+        )
+        .unwrap();
+        assert_eq!(r.get("kind").and_then(Json::as_str), Some("video"));
+        assert_eq!(r.get("memory").and_then(Json::as_str), Some("ssd"));
+        assert_eq!(r.get("device").and_then(Json::as_i64), Some(1));
+        assert_eq!(
+            r.get("transformer").and_then(Json::as_str),
+            Some(weight.to_str().unwrap())
+        );
+        for extra in [
+            r#", "ram_gb":5"#,
+            r#", "vram_gb":9"#,
+            r#", "frames":48"#,
+            r#", "steps":6"#,
+            r#", "output_dir":"../outside""#,
+            r#", "images":["x.png"]"#,
+        ] {
+            assert!(prepare_video(&cfg, &valid(extra)).is_err(), "{extra}");
+        }
+        std::fs::remove_file(weight).unwrap();
+        assert!(prepare_video(&cfg, &valid(""))
+            .unwrap_err()
+            .contains("not ready"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
     fn config() -> Config {
         Config {
             worker: "worker".into(),
@@ -533,6 +768,7 @@ mod tests {
             controller_path: "controller.gguf".into(),
             controller_device: 0,
             image_device: 1,
+            video_config: None,
         }
     }
     #[test]

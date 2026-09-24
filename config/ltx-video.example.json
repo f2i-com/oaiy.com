@@ -1,0 +1,24 @@
+{
+  "ffmpeg": "ffmpeg",
+  "ram_gb": 48,
+  "vram_gb": 26,
+  "models": {
+    "ltx-2.3": {
+      "transformer": "E:/models/ltx-2.3/ltx-2.3-22b-distilled-1.1.safetensors",
+      "text_encoder": "E:/models/gemma-3/gemma_3_12B_it.safetensors",
+      "tokenizer": "E:/models/gemma-3/tokenizer.json",
+      "vae": "E:/models/ltx-2.3/ltx-2.3-22b-distilled-1.1.safetensors"
+    },
+    "sulphur-2": {
+      "transformer": "E:/models/sulphur-2/sulphur_distil_bf16.safetensors",
+      "text_encoder": "E:/models/gemma-3/gemma_3_12B_it.safetensors",
+      "tokenizer": "E:/models/gemma-3/tokenizer.json",
+      "vae": "E:/models/sulphur-2/sulphur_distil_bf16.safetensors"
+    },
+    "ltx-2.5": {
+      "transformer": "E:/models/ltx-2.5/diffusion_models/ltx-2.5-22b-distilled-transformer-bf16.safetensors",
+      "text_encoder": "E:/models/ltx-2.5/text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors",
+      "vae": "E:/models/ltx-2.5/vae/ltx-2.5-video-vae-conv-bf16.safetensors"
+    }
+  }
+}

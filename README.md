@@ -57,6 +57,10 @@ Every token is a small, well-planned job:
   Viggle turbo, queued multi-image batches, and a memory handoff from DeepSeek to
   a smaller Qwen controller. See [setup and agent usage](docs/QWEN_IMAGE.md).
 
+- **Native Rust LTX video inference.** Distilled LTX 2.3, LTX 2.5 and Sulphur-2,
+  with a shared media queue, agent tool, RAM offloading and direct SSD weight
+  streaming. See [video configuration and current limits](docs/LTX_VIDEO.md).
+
 - **DeepSeek-V4.1-Flash from safetensors, end to end.** The checkpoint's shards are
   indexed in place (51 ms, headers only) and each expert is served with two positioned
   reads. Hybrid CPU/GPU decode across two GPUs, per-GPU VRAM expert caches, an AVX-512

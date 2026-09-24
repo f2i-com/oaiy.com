@@ -400,7 +400,7 @@ fn save_png(path: &Path, bytes: &[u8], width: u32, height: u32) -> Result<()> {
         .write_image(bytes, width, height, image::ExtendedColorType::Rgba8)
         .map_err(candle_core::Error::wrap)
 }
-fn noise(seed: u64, n: usize) -> Vec<f32> {
+pub(crate) fn noise(seed: u64, n: usize) -> Vec<f32> {
     let mut state = seed;
     let mut uniform = || {
         state = state.wrapping_add(0x9e3779b97f4a7c15);

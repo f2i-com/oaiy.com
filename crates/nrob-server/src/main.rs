@@ -25,7 +25,7 @@ const HELP: &str = "Observer: --observer-model FILE.gguf --observer-device auto|
                        for a GGUF or 65s for a DeepSeek checkpoint, so naming the
                        one you will ask for saves loading another to unload it
   --model DIR          checkpoint directory (required)
-  --image-config FILE  native Qwen Image 2.1 worker/controller JSON configuration
+  --image-config FILE  native image/video worker and controller JSON configuration
   --engram-meta FILE   the Engram precompute, engram_meta.safetensors (default: in
                        the checkpoint directory)
   --usage FILE         expert usage profile: warms the caches at start, updated

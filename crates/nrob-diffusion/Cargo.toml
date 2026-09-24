@@ -3,7 +3,7 @@ name = "nrob-diffusion"
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
-description = "Native Rust Qwen Image 2.1 inference worker for NROB"
+description = "Native Rust Qwen Image and LTX video inference worker for NROB"
 
 [dependencies]
 nrob = { path = "../nrob" }

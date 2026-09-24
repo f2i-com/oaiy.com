@@ -187,9 +187,14 @@ impl Server {
                     Ok(job)=>return json_response(w,202,&job),Err(e)=>Err(e),
                 }
             }
-            ("GET", "/v1/images/status") => return json_response(w,200,&self.images.status()),
-            ("POST", "/v1/images/cancel") => {self.images.cancel();return json_response(w,200,&self.images.status());}
-            ("POST", "/v1/images/release") => {
+            ("POST", "/v1/videos/generations") => {
+                match Self::parse_body(req).and_then(|body| self.images.submit_video(&body).map_err(bad)) {
+                    Ok(job) => return json_response(w,202,&job), Err(e) => Err(e),
+                }
+            }
+            ("GET", "/v1/images/status" | "/v1/videos/status") => return json_response(w,200,&self.images.status()),
+            ("POST", "/v1/images/cancel" | "/v1/videos/cancel") => {self.images.cancel();return json_response(w,200,&self.images.status());}
+            ("POST", "/v1/images/release" | "/v1/videos/release") => {
                 match self.images.release(){Ok(())=>return json_response(w,200,&Json::obj([("released",Json::Bool(true))])),Err(e)=>Err(bad(e))}
             }
             ("GET", "/v1/models") => return json_response(w, 200, &self.models()),
