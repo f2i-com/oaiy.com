@@ -18,6 +18,39 @@ pub fn layer_norm(x: &Tensor) -> Result<Tensor> {
 /// bidirectional image suffix. Query chunking bounds the score allocation.
 pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor, text_len: usize) -> Result<Tensor> {
     let (_, _, nq, dim) = q.dims4()?;
+    #[cfg(feature = "flash-attn")]
+    if q.device().is_cuda()
+        && matches!(q.dtype(), DType::F16 | DType::BF16)
+        && (8..=256).contains(&dim)
+        && dim % 8 == 0
+    {
+        // Qwen's text prefix is causal; image queries may attend to all keys.
+        // Two flash calls express this mask without materializing S x S scores.
+        let q = q.transpose(1, 2)?;
+        let k = k.transpose(1, 2)?;
+        let v = v.transpose(1, 2)?;
+        let scale = 1. / (dim as f32).sqrt();
+        let mut parts = Vec::new();
+        if text_len > 0 {
+            parts.push(candle_flash_attn::flash_attn(
+                &q.narrow(1, 0, text_len)?,
+                &k.narrow(1, 0, text_len)?,
+                &v.narrow(1, 0, text_len)?,
+                scale,
+                true,
+            )?);
+        }
+        if text_len < nq {
+            parts.push(candle_flash_attn::flash_attn(
+                &q.narrow(1, text_len, nq - text_len)?,
+                &k,
+                &v,
+                scale,
+                false,
+            )?);
+        }
+        return Tensor::cat(&parts, 1)?.transpose(1, 2);
+    }
     let nk = k.dim(2)?;
     let kt = k.transpose(2, 3)?.contiguous()?;
     let v = v.contiguous()?;
@@ -89,5 +122,70 @@ fn norms_use_the_channel_axis() -> Result<()> {
     assert_eq!(norm[1], vec![0., 0.]);
     let r = rms(&x, &Tensor::ones(2, DType::F32, &dev)?, 1e-6)?.to_vec2::<f32>()?;
     assert!((r[1][0] - 1.).abs() < 1e-6);
+    Ok(())
+}
+
+#[test]
+fn causal_mask_and_image_suffix_cross_chunk_boundary() -> Result<()> {
+    let dev = candle_core::Device::Cpu;
+    let n = 1031;
+    let q = Tensor::zeros((1, 1, n, 1), DType::F32, &dev)?;
+    let v = Tensor::from_vec((0..n).map(|i| i as f32).collect(), (1, 1, n, 1), &dev)?;
+    let out = attention(&q, &q, &v, 1027)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    for (i, actual) in out.into_iter().enumerate() {
+        let expected = if i < 1027 {
+            i as f32 / 2.
+        } else {
+            (n - 1) as f32 / 2.
+        };
+        assert!(
+            (actual - expected).abs() < 0.002,
+            "query {i}: {actual} vs {expected}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+#[cfg(feature = "flash-attn")]
+#[ignore = "requires an NVIDIA GPU; set NROB_TEST_GPU to its ordinal"]
+fn flash_matches_reference_for_causal_mixed_and_image_attention() -> Result<()> {
+    let ordinal = std::env::var("NROB_TEST_GPU")
+        .unwrap_or_else(|_| "0".into())
+        .parse::<usize>()
+        .map_err(candle_core::Error::wrap)?;
+    let gpu = candle_core::Device::new_cuda(ordinal)?;
+    let cpu = candle_core::Device::Cpu;
+    // Match Qwen's 128-wide heads. Non-aligned sequence length exercises tails.
+    let shape = (2, 2, 139, 128);
+    let tensor = |phase: f32| {
+        Tensor::from_vec(
+            (0..2 * 2 * 139 * 128)
+                .map(|i| (i as f32 * 0.17 + phase).sin() * 0.5)
+                .collect(),
+            shape,
+            &cpu,
+        )
+    };
+    let (q, k, v) = (tensor(0.)?, tensor(0.7)?, tensor(1.4)?);
+    let to_gpu = |t: &Tensor| t.to_device(&gpu)?.to_dtype(DType::BF16);
+    let (gq, gk, gv) = (to_gpu(&q)?, to_gpu(&k)?, to_gpu(&v)?);
+    for prefix in [0, 17, 139] {
+        let expected = attention(&q, &k, &v, prefix)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let actual = attention(&gq, &gk, &gv, prefix)?
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        for (i, (a, b)) in actual.iter().zip(&expected).enumerate() {
+            assert!(
+                (a - b).abs() < 0.008,
+                "prefix {prefix}, element {i}: {a} vs {b}"
+            );
+        }
+    }
     Ok(())
 }

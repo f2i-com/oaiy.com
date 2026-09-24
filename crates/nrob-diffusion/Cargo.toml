@@ -10,9 +10,11 @@ nrob = { path = "../nrob" }
 dsv41 = { path = "../dsv41" }
 candle-core = "0.11.0"
 candle-nn = "0.11.0"
+candle-flash-attn = { version = "0.11.0", optional = true }
 tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 
 [features]
 default = []
 cuda = ["candle-core/cuda", "candle-nn/cuda"]
+flash-attn = ["cuda", "dep:candle-flash-attn"]

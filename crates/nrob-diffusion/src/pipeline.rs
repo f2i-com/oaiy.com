@@ -175,6 +175,9 @@ pub fn generate(r: &Request, mut event: impl FnMut(Json)) -> Result<Json> {
     let t = Instant::now();
     event(Json::obj([("stage", Json::str("loading_text_encoder"))]));
     let encoder = TextEncoder::load(&r.base, &dev, dtype)?;
+    dev.synchronize()?;
+    let text_load_seconds = t.elapsed().as_secs_f64();
+    let encoding_start = Instant::now();
     let mut embeddings = Vec::new();
     for (i, prompt) in r.prompts.iter().enumerate() {
         embeddings.push(encoder.encode(prompt)?);
@@ -190,20 +193,29 @@ pub fn generate(r: &Request, mut event: impl FnMut(Json)) -> Result<Json> {
     };
     drop(encoder);
     dev.synchronize()?;
+    let encoding_seconds = encoding_start.elapsed().as_secs_f64();
     event(Json::obj([("stage", Json::str("loading_transformer"))]));
+    let load_start = Instant::now();
     let model = Transformer::load(&r.transformer, r.adapter.as_deref(), &dev, dtype)?;
+    dev.synchronize()?;
+    let transformer_load_seconds = load_start.elapsed().as_secs_f64();
     event(Json::obj([("stage", Json::str("loading_vae"))]));
+    let load_start = Instant::now();
     let vae = Vae::load(&r.base, &dev, dtype)?;
+    dev.synchronize()?;
+    let vae_load_seconds = load_start.elapsed().as_secs_f64();
     let (h, w) = (r.height / 16, r.width / 16);
     let sigmas =
         schedule::sigmas(r.steps, h * w, r.adapter.is_some()).map_err(candle_core::Error::Msg)?;
     let mut files = Vec::new();
     for i in 0..r.count {
+        let image_start = Instant::now();
         let pi = if embeddings.len() == 1 { 0 } else { i };
         let seed = r.seed + i as u64;
         let mut latent =
             Tensor::from_vec(noise(seed, h * w * 64), (1, h * w, 64), &dev)?.to_dtype(dtype)?;
         for (step, pair) in sigmas.windows(2).enumerate() {
+            let step_start = Instant::now();
             let mut velocity = model.forward(&latent, &embeddings[pi], pair[0], h, w)?;
             if let Some(neg) = &negative {
                 let uncond = model.forward(&latent, neg, pair[0], h, w)?;
@@ -218,8 +230,11 @@ pub fn generate(r: &Request, mut event: impl FnMut(Json)) -> Result<Json> {
                 ("image", Json::Int((i + 1) as i64)),
                 ("step", Json::Int((step + 1) as i64)),
                 ("steps", Json::Int(r.steps as i64)),
+                ("seconds", Json::Num(step_start.elapsed().as_secs_f64())),
             ]));
         }
+        let sampling_seconds = image_start.elapsed().as_secs_f64();
+        let decode_start = Instant::now();
         let rgba = vae
             .decode(&latent, h, w)?
             .to_dtype(DType::F32)?
@@ -228,6 +243,8 @@ pub fn generate(r: &Request, mut event: impl FnMut(Json)) -> Result<Json> {
             .contiguous()?
             .flatten_all()?
             .to_vec1::<f32>()?;
+        let decode_seconds = decode_start.elapsed().as_secs_f64();
+        let save_start = Instant::now();
         if rgba.iter().any(|x| !x.is_finite()) {
             candle_core::bail!("non-finite VAE output for image {}", i + 1);
         }
@@ -242,6 +259,16 @@ pub fn generate(r: &Request, mut event: impl FnMut(Json)) -> Result<Json> {
             ("seed", Json::Int(seed as i64)),
             ("prompt", Json::str(&r.prompts[pi])),
             ("steps", Json::Int(r.steps as i64)),
+            ("sampling_seconds", Json::Num(sampling_seconds)),
+            ("decode_seconds", Json::Num(decode_seconds)),
+            (
+                "save_seconds",
+                Json::Num(save_start.elapsed().as_secs_f64()),
+            ),
+            (
+                "image_seconds",
+                Json::Num(image_start.elapsed().as_secs_f64()),
+            ),
             ("transformer", Json::str(r.transformer.to_string_lossy())),
             (
                 "adapter",
@@ -256,6 +283,12 @@ pub fn generate(r: &Request, mut event: impl FnMut(Json)) -> Result<Json> {
             ("stage", Json::str("image_saved")),
             ("image", Json::Int((i + 1) as i64)),
             ("path", Json::str(path.to_string_lossy())),
+            ("sampling_seconds", Json::Num(sampling_seconds)),
+            ("decode_seconds", Json::Num(decode_seconds)),
+            (
+                "image_seconds",
+                Json::Num(image_start.elapsed().as_secs_f64()),
+            ),
         ]));
         files.push(Json::obj([
             ("path", Json::str(path.to_string_lossy())),
@@ -267,6 +300,13 @@ pub fn generate(r: &Request, mut event: impl FnMut(Json)) -> Result<Json> {
         ("data", Json::Arr(files)),
         ("output_dir", Json::str(out.to_string_lossy())),
         ("seconds", Json::Num(t.elapsed().as_secs_f64())),
+        ("text_load_seconds", Json::Num(text_load_seconds)),
+        ("encoding_seconds", Json::Num(encoding_seconds)),
+        (
+            "transformer_load_seconds",
+            Json::Num(transformer_load_seconds),
+        ),
+        ("vae_load_seconds", Json::Num(vae_load_seconds)),
     ]))
 }
 fn save_png(path: &Path, bytes: &[u8], width: u32, height: u32) -> Result<()> {

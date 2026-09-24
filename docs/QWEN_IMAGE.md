@@ -12,7 +12,7 @@ file or the sharded `transformer` directory can supply the image weights.
 
 ## Build and configuration
 
-On Windows with CUDA and Visual Studio C++ build tools:
+On Windows with CUDA 12.8 and Visual Studio 2022 C++ build tools:
 
 ```powershell
 ./tools/qwen-image/build.ps1
@@ -21,9 +21,16 @@ On Windows with CUDA and Visual Studio C++ build tools:
 On a configured CUDA development shell, the equivalent commands are:
 
 ```sh
-cargo build --release -p nrob-diffusion --features cuda
+cargo build --release -p nrob-diffusion --features flash-attn
 cargo build --release -p nrob-server
 ```
+
+The first FlashAttention build compiles CUDA kernels and downloads the pinned
+NVIDIA CUTLASS headers; it can take several minutes. `--features cuda` remains
+available for GPUs/build environments without FlashAttention. The optimized
+path targets Ampere or newer NVIDIA GPUs and preserves the causal text prefix
+by evaluating it separately from bidirectional image queries. The VAE's wider
+attention head uses the bounded reference implementation.
 
 Copy `config/qwen-image.example.json` to a local configuration and set the paths
 and device ordinals. The integrated controller configuration currently requires
@@ -107,6 +114,30 @@ Progress is JSONL on stderr; stdout contains one final JSON result. Dropping the
 process releases all image allocations. CPU builds support reference tests, but
 full model inference is intended for a CUDA build.
 
+## Performance measurement
+
+Six-step turbo remains the default. Sampling events include per-step `seconds`;
+each saved image and manifest record includes `sampling_seconds`,
+`decode_seconds` and `image_seconds`. The final result separates text loading,
+prompt encoding, transformer loading and VAE loading from the batch total.
+
+```powershell
+./tools/qwen-image/benchmark.ps1 -Count 4 -Size 1024
+./tools/qwen-image/benchmark.ps1 -Count 4 -Size 1024 -Weights safetensors
+```
+
+This standalone benchmark uses the configured image GPU and writes its request,
+events, results and PNGs below `target/qwen-image-bench`. It reports the first
+image separately and the median of subsequent images. It does not load the
+language controller. Avoid concurrent GPU workloads or compilation when timing.
+
+NROB shares a `.cuda-cache` directory under the configured output root between
+jobs. The standalone worker defaults to `.cuda-cache` under its output directory.
+An explicit `CUDA_CACHE_PATH` or `CUDA_CACHE_MAXSIZE` takes precedence; otherwise
+the worker allows a 1 GiB compiled-kernel cache. The initial run still compiles
+kernels and every worker invocation loads model weights. Use one batch for many
+images to amortize setup; warm per-image timing is not first-request latency.
+
 ## Turbo and source references
 
 Viggle v0.2.1 rank-128/256 adapters are applied at runtime with alpha/rank = 1,
@@ -128,6 +159,33 @@ Model weights retain their own Qwen Research License.
 
 ## Local validation (2026-09-24)
 
+After the FlashAttention optimization, on RTX 5090 at 1024x1024, six steps,
+CFG 1, including VAE decode and PNG writing:
+
+| Weights | Warm image time |
+| --- | ---: |
+| Q4_K_M, original attention | 7.8 s |
+| Q4_K_M, FlashAttention | 4.5 s |
+| BF16 safetensors, FlashAttention | 4.4 s |
+
+The optimized Q4 and BF16 results were verified with the Qwen 27B controller
+resident on GPU 0 and diffusion on GPU 1. An API request omitting `steps`
+generated three images at six steps; warm images took 4.52 and 4.53 seconds.
+The controller answered a chat request during the job. That whole job took
+33.1 seconds including setup and first-image initialization, so the warm timings
+do not describe cold first-image latency. Reusing the compiled-kernel cache
+reduced prompt encoding from approximately 25 seconds to 0.7 seconds.
+
+The GPU regression compares FlashAttention with the F32 reference for causal,
+mixed-prefix and bidirectional attention, including multiple batches and
+non-aligned sequence lengths. All six diffusion tests passed with the GPU test
+explicitly enabled. Generated Q4 and BF16 images were also visually inspected.
+The full workspace suite with `--features nrob-diffusion/flash-attn` passed:
+501 tests passed, zero failed, 77 explicitly ignored (the GPU attention test
+was then run separately with `--include-ignored`).
+
+Initial implementation smoke tests:
+
 - Native GGUF six-step, 512x512: coherent apple image, 66.9 seconds including load.
 - Native BF16 safetensors four-step, 512x512: coherent robot/umbrella image, 58.4 seconds.
 - Two 1024x1024 images in one six-step GGUF batch with the controller resident:
@@ -144,5 +202,6 @@ Model weights retain their own Qwen Research License.
 
 These are smoke tests on two RTX 5090 cards, not numerical parity certification
 against Diffusers. A full 100-image batch was not run; the batch interface accepts
-100 and was exercised with two real images and a cancelled 100-image request.
+100 and was exercised with two-, three- and four-image batches and a cancelled
+100-image request.
 The local D: checkpoint is BF16; separate F16 weights were not available to test.

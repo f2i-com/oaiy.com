@@ -252,6 +252,12 @@ impl Images {
             return Err("cancelled after controller handoff".into());
         }
         let mut command = Command::new(&cfg.worker);
+        if std::env::var_os("CUDA_CACHE_PATH").is_none() {
+            // Share compiled CUDA kernels across all output folders and jobs.
+            let cache = cfg.output_root.join(".cuda-cache");
+            std::fs::create_dir_all(&cache).map_err(|e| format!("CUDA cache: {e}"))?;
+            command.env("CUDA_CACHE_PATH", cache);
+        }
         command
             .arg("--stdin")
             .stdin(Stdio::piped())
@@ -503,6 +509,9 @@ mod tests {
     #[test]
     fn batch_parameters_and_server_owned_paths_are_preserved() {
         let cfg = config();
+        let turbo = prepare(&cfg, &Json::parse(br#"{"prompt":"x"}"#).unwrap()).unwrap();
+        assert_eq!(turbo.get("steps").and_then(Json::as_i64), Some(6));
+        assert_eq!(turbo.get("adapter").and_then(Json::as_str), Some("turbo.safetensors"));
         let r=prepare(&cfg,&Json::parse(br#"{"prompt":"x","n":100,"steps":4,"weights":"safetensors","base":"untrusted","device":99}"#).unwrap()).unwrap();
         assert_eq!(r.get("n").and_then(Json::as_i64), Some(100));
         assert_eq!(r.get("steps").and_then(Json::as_i64), Some(4));

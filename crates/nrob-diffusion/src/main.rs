@@ -31,6 +31,19 @@ fn run() -> candle_core::Result<()> {
     }
     let j = Json::parse(&bytes).map_err(candle_core::Error::wrap)?;
     let r = nrob_diffusion::pipeline::Request::parse(&j).map_err(candle_core::Error::Msg)?;
+    #[cfg(feature = "cuda")]
+    {
+        // Configure the driver before CUDA or tokenizer threads are started.
+        // A writable cache avoids recompiling PTX on every worker invocation.
+        if std::env::var_os("CUDA_CACHE_PATH").is_none() {
+            let cache = r.output.join(".cuda-cache");
+            std::fs::create_dir_all(&cache)?;
+            std::env::set_var("CUDA_CACHE_PATH", cache.canonicalize()?);
+        }
+        if std::env::var_os("CUDA_CACHE_MAXSIZE").is_none() {
+            std::env::set_var("CUDA_CACHE_MAXSIZE", "1073741824");
+        }
+    }
     let result = nrob_diffusion::pipeline::generate(&r, |event| {
         eprintln!("{}", event.to_json());
     })?;
