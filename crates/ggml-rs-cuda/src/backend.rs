@@ -172,6 +172,9 @@ pub struct CudaBackend {
     // multi-stream bookkeeping entirely.)
     h2d:                   std::sync::OnceLock<Arc<CudaStream>>,
     pub(crate) event_pool: crate::transfer::EventPool,
+    // VENDORED-LOCAL: a private stream for recording graphs, never for running
+    // inference. Its mutex prevents overlapping capture across projections.
+    capture: std::sync::OnceLock<std::sync::Mutex<Arc<CudaStream>>>,
     pub(crate) name:   String,
 }
 
@@ -249,6 +252,7 @@ impl CudaBackend {
             blas,
             h2d: Default::default(), // created lazily — see the field comment
             event_pool: Default::default(),
+            capture: Default::default(),
             name: format!("cuda:{device_ordinal}"),
         })
     }
@@ -266,6 +270,11 @@ impl CudaBackend {
         self.h2d.get_or_init(|| {
             self.ctx.new_stream().expect("h2d transfer stream")
         })
+    }
+
+    pub(crate) fn capture_stream(&self) -> std::sync::MutexGuard<'_, Arc<CudaStream>> {
+        self.capture.get_or_init(|| std::sync::Mutex::new(self.ctx.new_stream().expect("graph capture stream")))
+            .lock().unwrap_or_else(|e|e.into_inner())
     }
 
     pub fn context(&self) -> &Arc<CudaContext> { &self.ctx }

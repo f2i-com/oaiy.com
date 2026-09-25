@@ -10,7 +10,7 @@
 //!
 //! Build requirements:
 //!   * NVIDIA GPU + driver
-//!   * CUDA Toolkit (we tested with 12.8) on PATH so `nvrtc` is reachable
+//!   * CUDA Toolkit 12 or newer (we tested with 12.8) on PATH so `nvrtc` is reachable
 //!
 //! Usage:
 //!

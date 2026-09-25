@@ -25,10 +25,12 @@ mod runtime_tests {
         let model = load(&path, devices).unwrap();
         let mut kv = model.new_kv_cache(260000);
         let token = model.tokenizer().encode("Hello", false).unwrap()[0];
-        for _ in 0..3 { let _ = model.forward(&[token], &mut kv).to_host(); }
+        for _ in 0..16 { let _ = model.forward(&[token], &mut kv).to_host(); }
         let start = std::time::Instant::now();
-        for _ in 0..32 { let _ = model.forward(&[token], &mut kv).to_host(); }
-        eprintln!("32 decode steps: {:.3}s, {:.2} tokens/s", start.elapsed().as_secs_f64(), 32.0/start.elapsed().as_secs_f64());
+        const STEPS: usize = 128;
+        for _ in 0..STEPS { let _ = model.forward(&[token], &mut kv).to_host(); }
+        let seconds=start.elapsed().as_secs_f64();
+        eprintln!("{STEPS} decode steps: {seconds:.3}s, {:.2} tokens/s", STEPS as f64/seconds);
     }
     #[test]
     #[ignore = "requires downloaded OrcaSAQ and two 32GB CUDA devices"]

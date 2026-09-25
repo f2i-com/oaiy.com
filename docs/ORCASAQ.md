@@ -53,7 +53,12 @@ it explicitly. No separate Python/vLLM server is needed.
   directly using cooperative tile reads, split-K reductions fused with the
   output transform, and specialized bit-rate kernels. On capable GPUs DP4A
   computes the codebook byte sum exactly, and aligned bit windows reduce
-  shift operations. Fully overwritten scratch buffers skip redundant clearing.
+  shift operations. Decode caches scratch buffers and replays each projection's
+  three kernels as a CUDA graph, updating its input/output pointers per call.
+  Recording uses a separate private stream; execution stays on the ordered
+  compute stream. Each result owns its storage, including concurrent callers.
+  This graph path requires CUDA Toolkit 12 or newer (tested with 12.8).
+  Fully overwritten scratch buffers skip redundant clearing.
   Prefill reconstructs one projection into temporary FP32 scratch;
   the vocabulary head runs only for the last row. This initial implementation
   is **not verified to fit 16 GB GPUs**.
@@ -75,17 +80,19 @@ it explicitly. No separate Python/vLLM server is needed.
   byte copy, and writer backpressure bounds pending snapshots. At 260K a
   checkpoint is about 34 GB: coder-cli's configured 96 GB budget holds recent
   prefixes. Model changes and different prompts correctly invalidate reuse.
-- On this machine's two RTX 5090s, the final native decoder generated
-  128 tokens in **2.98 / 2.86 seconds (43.0 / 44.8 tokens/s)** in two runs
-  through coder-cli's Nrob daemon, versus **15.47 seconds (8.3 tokens/s)**
-  before optimization. Both generated the same text as the baseline on the
-  deterministic short compiler-explanation prompt. A separate model-only
-  32-step decode benchmark measured **46.5 tokens/s**. These are measured
-  short-context results, not a claim of 50 tokens/s or 260K-context throughput.
-  Generation timings exclude loading and prompt processing. The warm request
-  took 2.98 seconds overall; 38/39 prompt tokens restored from disk and one
-  token was processed in 0.02 seconds. Loading took 11.7 seconds in this run.
-  No claim of BF16/reference-model token identity is made.
+- On this machine's two RTX 5090s, the graph decoder generated 128 tokens in
+  **2.73 seconds on the first request (46.9 tokens/s)** and **2.50 seconds
+  after warm-up (51.2 tokens/s)** through coder-cli's Nrob daemon. The prior
+  optimized build took 2.86 seconds (44.8 tokens/s) warm, and the original
+  implementation took 15.47 seconds (8.3 tokens/s). Both graph responses
+  matched the original text on the same deterministic compiler-explanation
+  prompt. A separate model-only benchmark, with 16 warm-up steps and 128
+  measured steps, reached **51.4 tokens/s**.
+  These are short-context results; long contexts and other workloads will
+  differ. Generation timings exclude model loading and prompt processing.
+  The warm request took 2.61 seconds overall; 38/39 prompt tokens restored
+  from disk and one token was processed in 0.02 seconds. Loading took 9.8
+  seconds. No claim of BF16/reference-model token identity is made.
 
 Client sampling remains controlled by Nrob's settings and request parameters.
 The model card recommends temperature 1.0, top_p 0.95 and top_k 20.
@@ -105,10 +112,13 @@ The CUDA test uses independently packed synthetic trellises and checks every
 decoded weight plus GEMV, prefill and channel permutations for every supported
 EXL3 rate (1 through 8 bits, including supported half-bit rates). A model-width
 comparison also checks the optimized 2/3/3.5/4/6-bit decode against the scalar
-CUDA layout across split counts 1/2/4/8/16/32. Recurrent-layer tests compare
+CUDA layout across split counts 1/2/4/8/16/32. Tests retain earlier outputs
+while reusing/resizing scratch, alternate inputs, and run concurrent callers
+against the same projection to check graph parameter and output isolation. Recurrent-layer tests compare
 16 consecutive decode steps with the CPU, including convolution and recurrent
 state. Loader tests check format detection and grouped/tiled head mapping.
-A real-model test reserves all 260,000 KV positions with weights resident,
+A real-model test reserves all 260,000 KV positions with weights and decode
+graph scratch resident,
 compares distributed versus local logits and verifies checkpoint restoration.
 Attention separately checks a 260,000-token input; a full 260K text prefill and
 long-context quality benchmark have not been run.

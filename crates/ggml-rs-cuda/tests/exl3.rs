@@ -80,17 +80,61 @@ fn tiled_decode_matches_scalar_layout_at_model_width() {
                 .collect(),
             vec![1, k],
         ));
-        let expected = w.linear_reference(&x).to_host();
-        for splits in [1, 2, 4, 8, 16, 32] {
-            let actual = w.linear_with_splits(&x, splits).to_host();
+        let negative = b.to_device(Tensor::from_vec(
+            (0..k)
+                .map(|i| -((i * 17 % 73) as f32 - 36.0) / 37.0)
+                .collect(),
+            vec![1, k],
+        ));
+        let expected = [
+            w.linear_reference(&x).to_host(),
+            w.linear_reference(&negative).to_host(),
+        ];
+        // Keep earlier results alive while scratch is reused and resized.
+        // Alternating inputs would expose an accidentally aliased output.
+        let held: Vec<_> = [1, 2, 4, 8, 16, 32, 1]
+            .into_iter()
+            .enumerate()
+            .map(|(i, splits)| {
+                let sign = i % 2;
+                (
+                    sign,
+                    splits,
+                    w.linear_with_splits(if sign == 0 { &x } else { &negative }, splits),
+                )
+            })
+            .collect();
+        for (sign, splits, result) in held {
+            let actual = result.to_host();
             let error = actual
                 .data()
                 .iter()
-                .zip(expected.data())
+                .zip(expected[sign].data())
                 .map(|(a, b)| (a - b).abs())
                 .fold(0.0f32, f32::max);
             assert!(error <= 0.003, "tw={tw} splits={splits}: {error}");
         }
+        // Concurrent replay must serialize graph parameter updates and scratch
+        // use without mixing callers' inputs or outputs.
+        std::thread::scope(|scope| {
+            for sign in 0..2 {
+                let w = &w;
+                let x = if sign == 0 { &x } else { &negative };
+                let expected = &expected[sign];
+                scope.spawn(move || {
+                    for _ in 0..4 {
+                        let actual = w.linear(x).to_host();
+                        let error = actual
+                            .data()
+                            .iter()
+                            .zip(expected.data())
+                            .map(|(a, b)| (a - b).abs())
+                            .fold(0.0f32, f32::max);
+                        assert!(error <= 0.003, "concurrent tw={tw} sign={sign}: {error}");
+                    }
+                });
+            }
+        });
     }
 }
 fn had(x: &mut [f32]) {
