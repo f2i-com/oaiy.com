@@ -103,8 +103,8 @@ image-conversation quality benchmark.
 
 Observed validation on the two RTX 5090s:
 
-- Original vision embeddings versus the HF FP32 oracle: RMS error `9.29e-6`,
-  maximum absolute error `0.00343` over 576x5120 values.
+- Original vision embeddings versus the HF FP32 oracle: RMS error `9.27e-6`,
+  maximum absolute error `0.00361` over 576x5120 values (optimized CUDA path).
 - Correct shape/colour descriptions, `ORCA 42` OCR, `PROJECT: VISION 73` OCR
   on a wide image, multi-image comparison and a follow-up colour question.
 - After a process restart, **597/598** image-prompt tokens restored from disk
@@ -117,6 +117,27 @@ Observed validation on the two RTX 5090s:
   it correctly. A leading request to read text from a blank image also produced
   a spurious character once. No stop-token suppression or hidden retries were
   added to conceal these model outputs.
+
+The optimized image encoder uses GPU axial/interleaved position rotations and
+cuBLAS batched full-attention products. The score scratch is bounded to 384 MiB
+(324 MiB for this tower); causal/long-context attention keeps its existing path.
+Qwen prompt processing uses batches of up to 512 tokens, reducing repeated EXL3
+weight reconstruction. The 260K capacity test also exercises this image batch.
+Image resolution, weights and number of image tokens are unchanged.
+
+With the process warmed up, three image encodings took **0.108 seconds each**,
+versus **0.831 / 0.839 / 0.840 seconds** before optimization (about 7.8x faster).
+The first isolated call still includes CUDA initialization (5.27 seconds in
+this run). These encoder timings exclude language-model prompt processing.
+
+For complete requests, three fresh-image OCR requests averaged **2.25 seconds**
+(2.21 / 2.27 / 2.27), versus **3.76 seconds** (3.62 / 3.71 / 3.95) on the previous
+build: about **40% less time**. Each used identical pixels, 609 prompt tokens,
+11 cached text-prefix tokens and a five-token `ORCA 42` answer. PNG metadata
+varied to prevent image-state/embedding cache hits without changing pixels.
+Model loading and the first warm-up request are excluded. Fresh descriptions,
+wide-image OCR and two-image comparisons also passed. The text-only 128-token
+benchmark still generated at **51.0 tokens/s** (2.51 seconds).
 
 ### Text runtime
 

@@ -99,6 +99,13 @@ mod runtime_tests {
             let out=vision.forward(&pixels).unwrap().to_host();
             assert_eq!(out.shape(),[576,5120]);
             assert!(out.data().iter().all(|x|x.is_finite()));
+            let Model::Qwen35(m)=&model else { unreachable!() };
+            let rows=crate::qwen::PREFILL_CHUNK.min(576);
+            let embeds=m.backend.to_device(Tensor::from_vec(out.data()[..rows*5120].to_vec(),vec![rows,5120]));
+            let positions:Vec<_>=(0..rows).map(|i|[4,4+(i/24) as u32,4+(i%24) as u32]).collect();
+            let logits=m.forward_embeds_positions(&embeds,rows,&mut kv,Some(&positions)).unwrap().to_host();
+            assert!(logits.data().iter().all(|x|x.is_finite()));
+            eprintln!("{rows}-token image prefill also fits alongside the full KV allocation");
             eprintln!("vision encoding also verified with all 260000 KV slots resident");
         }
         eprintln!(

@@ -53,6 +53,45 @@ fn deterministic_floats(n: usize, scale: f32, seed: u64) -> Vec<f32> {
     out
 }
 
+// VENDORED-LOCAL: partial/interleaved image positions, including a long-context
+// offset. Unrotated head dimensions must remain exactly unchanged.
+#[test]
+fn axial_rope_matches_cpu() {
+    let Some(gpu)=try_cuda() else { return };
+    let cpu=CpuBackend::new();
+    for (width,rotated,frequency_dim,positions,eps) in [
+        (72,72,36,vec![[0,0,0],[0,0,47],[0,47,0],[0,47,47]],1e-5),
+        (256,64,64,vec![[17,17,18],[17,40,40],[41,41,41]],1e-5),
+        (256,64,64,vec![[259950,259970,259990],[260000;3]],0.02),
+    ] {
+        let axes:Vec<_>=(0..rotated/2).map(|i|if rotated==72 { if i<18 {1}else{2} } else if i%3==1 {1}else if i%3==2 && i<30 {2}else{0}).collect();
+        let frequencies:Vec<_>=(0..rotated/2).map(|i|if rotated==72 {i%18}else{i}).collect();
+        let input=Tensor::from_vec(deterministic_floats(positions.len()*3*width,1.0,99),vec![positions.len(),3,width]);
+        let mut expected=input.clone();
+        let mut actual=gpu.to_device(input.clone());
+        let theta=if rotated==72 {10000.0}else{10000000.0};
+        cpu.rope_axes(&mut expected,&positions,rotated,theta,&axes,&frequencies,frequency_dim);
+        gpu.rope_axes(&mut actual,&positions,rotated,theta,&axes,&frequencies,frequency_dim);
+        assert_tensors_close(&actual,&expected,eps);
+        let actual=actual.to_host();
+        for row in 0..positions.len()*3 { assert_eq!(&actual.data()[row*width+rotated..(row+1)*width],&input.data()[row*width+rotated..(row+1)*width]); }
+    }
+}
+
+#[test]
+fn bidirectional_batched_attention_matches_cpu() {
+    let Some(gpu)=try_cuda() else { return };
+    let cpu=CpuBackend::new();
+    for (seq,heads,hd,past) in [(129,3,12,129),(193,4,72,193),(129,3,12,0)] {
+        let make=|seed|Tensor::from_vec(deterministic_floats(seq*heads*hd,1.0,seed),vec![seq,heads,hd]);
+        let (q,k,v)=(make(5),make(16),make(29));
+        let scale=1.0/(hd as f32).sqrt();
+        let expected=cpu.attention(&q,&k,&v,seq,scale,past,None);
+        let actual=gpu.attention(&gpu.to_device(q),&gpu.to_device(k),&gpu.to_device(v),seq,scale,past,None);
+        assert_tensors_close(&actual,&expected,2e-5);
+    }
+}
+
 #[test]
 fn linear_matches_cpu() {
     let Some(cuda) = try_cuda() else { return };

@@ -10,6 +10,9 @@ use nrob::json::Json;
 use crate::engine::{Event, Finish, ImagePrep, Job, JobImage, sample};
 
 const IMAGE: &str = "<|vision_start|><|image_pad|><|vision_end|>";
+// Amortize EXL3 weight reconstruction across more image/prompt rows. Bounded
+// to keep activations small alongside the configured long-context KV cache.
+pub(crate) const PREFILL_CHUNK: usize = 512;
 
 fn content(value: Option<&Json>, images: &mut Vec<Json>) -> Result<String, String> {
     match value {
@@ -229,7 +232,7 @@ impl QwenEngine {
         let mut pos = start;
         while pos < keys.len() {
             if job.cancel.load(Ordering::Relaxed) { return Ok(()); }
-            let end = (pos+128).min(keys.len()).min(stops.iter().copied().find(|&s| s > pos).unwrap_or(keys.len()));
+            let end = (pos+PREFILL_CHUNK).min(keys.len()).min(stops.iter().copied().find(|&s| s > pos).unwrap_or(keys.len()));
             let mut embeds = model.embed_text(&job.prompt[pos..end]).to_host();
             let width = model.config.embedding_dim;
             for (at,t) in &soft {

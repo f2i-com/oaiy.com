@@ -6,6 +6,19 @@
 //! don't shuttle every op through host memory.
 
 pub const KERNEL_SRC: &str = r#"
+// VENDORED-LOCAL: arbitrary axial NeoX frequency/position mapping.
+extern "C" __global__ void rope_axes_f32(float* x, const unsigned int* positions,
+    const unsigned int* map, int count, int heads, int width, int half,
+    float theta, float frequency_dim) {
+    int i=blockIdx.x*blockDim.x+threadIdx.x;
+    if(i>=count) return;
+    int k=i%half, token_head=i/half, row=token_head/heads;
+    float angle=(float)positions[row*3+map[k*2]] * powf(theta,-2.f*(float)map[k*2+1]/frequency_dim);
+    float s,c; sincosf(angle,&s,&c);
+    int a=token_head*width+k,b=a+half;
+    float va=x[a],vb=x[b];
+    x[a]=va*c-vb*s; x[b]=va*s+vb*c;
+}
 // NVRTC doesn't include <math.h> by default, so we re-define a few constants.
 #ifndef INFINITY
 #define INFINITY __int_as_float(0x7f800000)
@@ -2811,6 +2824,7 @@ __global__ void moe_reduce_slots_f32(const float* __restrict__ partial,
 "#;
 
 pub const KERNEL_NAMES: &[&str] = &[
+    "rope_axes_f32",
     "exl3_had", "exl3_had_reduce", "exl3_reconstruct", "exl3_tile_32", "exl3_tile_48", "exl3_tile_56", "exl3_tile_64", "exl3_tile_96",
     "exl3_gemv_generic", "exl3_gemv_32", "exl3_gemv_48", "exl3_gemv_56", "exl3_gemv_64", "exl3_gemv_96",
     "linear_q8_0_f32",

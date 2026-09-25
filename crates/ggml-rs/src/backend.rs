@@ -721,6 +721,33 @@ pub trait Backend: Send + Sync + Debug + 'static {
         *x = self.to_device(host);
     }
 
+    /// VENDORED-LOCAL: axial/interleaved NeoX rotations. Keep the host math as
+    /// the reference; GPU backends can avoid materializing attention tensors.
+    fn rope_axes(&self, x: &mut Tensor, positions: &[[u32;3]], rotated: usize,
+        theta: f32, axes: &[usize], frequencies: &[usize], frequency_dim: usize) {
+        assert_eq!(x.rank(),3);
+        assert_eq!(positions.len(),x.dim(0));
+        assert_eq!(axes.len(),rotated/2);
+        assert_eq!(axes.len(),frequencies.len());
+        assert!(rotated<=x.dim(2) && rotated%2==0 && frequency_dim>0);
+        assert!(axes.iter().all(|&a|a<3));
+        let (heads,width)=(x.dim(1),x.dim(2));
+        let mut host=x.to_host();
+        let data=host.data_mut();
+        for (row,pos) in positions.iter().enumerate() {
+            for k in 0..rotated/2 {
+                let angle=pos[axes[k]] as f32*theta.powf(-2.0*frequencies[k] as f32/frequency_dim as f32);
+                let (sin,cos)=angle.sin_cos();
+                for head in 0..heads {
+                    let a=(row*heads+head)*width+k;
+                    let c=a+rotated/2;
+                    (data[a],data[c])=(data[a]*cos-data[c]*sin,data[a]*sin+data[c]*cos);
+                }
+            }
+        }
+        *x=self.to_device(host);
+    }
+
     /// Run one or more autoregressive steps of Qwen3.5 / qwen3next gated
     /// delta-net: depthwise conv1d + per-head autoregressive update + norm-gated
     /// output. Updates `conv_state` and `state` in place; returns the per-token

@@ -3,26 +3,8 @@
 use ggml_rs::{Backend, Tensor};
 
 pub fn rotate(b: &dyn Backend, x: &mut Tensor, positions: &[[u32; 3]], rotated: usize, theta: f32, axes: &[usize], frequencies: &[usize], frequency_dim: usize) {
-    assert_eq!(x.rank(), 3);
-    assert_eq!(positions.len(), x.dim(0));
-    assert_eq!(axes.len(), rotated / 2);
-    assert_eq!(frequencies.len(), axes.len());
-    assert!(rotated <= x.dim(2));
-    let (heads, width) = (x.dim(1), x.dim(2));
-    let mut host = x.to_host();
-    let data = host.data_mut();
-    for (row, pos) in positions.iter().enumerate() {
-        for k in 0..rotated / 2 {
-            let angle = pos[axes[k]] as f32 * theta.powf(-2.0 * frequencies[k] as f32 / frequency_dim as f32);
-            let (sin, cos) = angle.sin_cos();
-            for head in 0..heads {
-                let a = (row * heads + head) * width + k;
-                let c = a + rotated / 2;
-                (data[a], data[c]) = (data[a] * cos - data[c] * sin, data[a] * sin + data[c] * cos);
-            }
-        }
-    }
-    *x = b.to_device(host);
+    // VENDORED-LOCAL: dispatch to the resident GPU path, with a CPU reference fallback.
+    b.rope_axes(x, positions, rotated, theta, axes, frequencies, frequency_dim);
 }
 
 pub fn text(b: &dyn Backend, x: &mut Tensor, positions: &[[u32; 3]], rotated: usize, theta: f32) {

@@ -13,7 +13,7 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use cudarc::cublas::{CudaBlas, Gemm, GemmConfig};
+use cudarc::cublas::{CudaBlas, Gemm, GemmConfig, StridedBatchedConfig};
 use cudarc::cublas::sys::cublasOperation_t;
 use cudarc::driver::{
     CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, LaunchConfig, PushKernelArg,
@@ -1632,6 +1632,32 @@ impl Backend for CudaBackend {
         }
     }
 
+    // VENDORED-LOCAL: image positions stay on the GPU for vision and LM prefill.
+    fn rope_axes(&self, x: &mut Tensor, positions: &[[u32;3]], rotated: usize,
+        theta: f32, axes: &[usize], frequencies: &[usize], frequency_dim: usize) {
+        assert_eq!(x.rank(),3);
+        assert_eq!(positions.len(),x.dim(0));
+        assert_eq!(axes.len(),rotated/2);
+        assert_eq!(axes.len(),frequencies.len());
+        assert!(rotated<=x.dim(2) && rotated%2==0 && frequency_dim>0);
+        assert!(axes.iter().all(|&a|a<3));
+        if x.numel()==0 || rotated==0 { return; }
+        let pos=self.upload_u32(&positions.iter().flatten().copied().collect::<Vec<_>>());
+        let map=self.upload_u32(&axes.iter().zip(frequencies).flat_map(|(&a,&f)|[a as u32,f as u32]).collect::<Vec<_>>());
+        let (heads,width,half)=(x.dim(1) as i32,x.dim(2) as i32,(rotated/2) as i32);
+        let count=(x.dim(0)*x.dim(1)*(rotated/2)) as i32;
+        let freq_dim=frequency_dim as f32;
+        let xd=self.cuda_input_mut(x);
+        // SAFETY: each thread owns one disjoint rotation pair. Position/map
+        // lengths and axes are validated above; buffers live on this stream.
+        unsafe {
+            self.stream.launch_builder(self.func("rope_axes_f32"))
+                .arg(xd).arg(&pos).arg(&map).arg(&count).arg(&heads).arg(&width)
+                .arg(&half).arg(&theta).arg(&freq_dim)
+                .launch(LaunchConfig::for_num_elems(count as u32)).expect("axial rope");
+        }
+    }
+
     fn delta_net_step(
         &self,
         mixed_qkv:   &Tensor,
@@ -1993,6 +2019,42 @@ impl Backend for CudaBackend {
         debug_assert_eq!(v_buffer.dim(2), hd);
         debug_assert!(kv_len <= max_kv_len);
         debug_assert_eq!(n_h_q % n_h_kv, 0, "n_h_q must be a multiple of n_h_kv");
+
+        // VENDORED-LOCAL: full bidirectional vision attention. A bounded score
+        // matrix lets cuBLAS reuse tiles instead of rereading K/V per query.
+        // Never select this path for causal decoding or long-context attention.
+        if seq>=128 && seq==kv_len && n_h_q==n_h_kv && past>=kv_len
+            && sliding_window.is_none() && seq.checked_mul(seq).and_then(|n|n.checked_mul(n_h_q)).is_some_and(|n|n<=96*1024*1024) {
+            let q=self.cuda_input(q);
+            let k=self.cuda_input(k_buffer);
+            let v=self.cuda_input(v_buffer);
+            // SAFETY: both GEMMs fully write their outputs with beta=0.
+            let mut scores=unsafe { self.stream.alloc::<f32>(seq*seq*n_h_q) }.expect("vision scores");
+            // SAFETY: PV GEMM writes every output element with beta=0.
+            let mut out=unsafe { self.stream.alloc::<f32>(seq*n_h_q*hd) }.expect("vision attention output");
+            let cfg=StridedBatchedConfig {
+                gemm:GemmConfig {transa:cublasOperation_t::CUBLAS_OP_T,transb:cublasOperation_t::CUBLAS_OP_N,
+                    m:seq as i32,n:seq as i32,k:hd as i32,alpha:scale,beta:0.0,
+                    lda:(n_h_q*hd) as i32,ldb:(n_h_q*hd) as i32,ldc:seq as i32},
+                batch_size:n_h_q as i32,stride_a:hd as i64,stride_b:hd as i64,stride_c:(seq*seq) as i64,
+            };
+            // SAFETY: input views are [head_dim,seq] columns with interleaved
+            // heads; each output head owns seq*seq contiguous score elements.
+            unsafe { self.blas.gemm_strided_batched(cfg,k.as_ref(),q.as_ref(),&mut scores).expect("vision QK GEMM"); }
+            let mut scores=self.make_tensor(scores,vec![n_h_q,seq,seq]);
+            self.softmax_last(&mut scores);
+            let scores=self.cuda_input(&scores);
+            let cfg=StridedBatchedConfig {
+                gemm:GemmConfig {transa:cublasOperation_t::CUBLAS_OP_N,transb:cublasOperation_t::CUBLAS_OP_N,
+                    m:hd as i32,n:seq as i32,k:seq as i32,alpha:1.0,beta:0.0,
+                    lda:(n_h_q*hd) as i32,ldb:seq as i32,ldc:(n_h_q*hd) as i32},
+                batch_size:n_h_q as i32,stride_a:hd as i64,stride_b:(seq*seq) as i64,stride_c:hd as i64,
+            };
+            // SAFETY: head h writes columns at row*heads*hd+h*hd. Heads own
+            // disjoint elements even though their column spans interleave.
+            unsafe { self.blas.gemm_strided_batched(cfg,v.as_ref(),scores.as_ref(),&mut out).expect("vision PV GEMM"); }
+            return self.make_tensor(out,vec![seq,n_h_q,hd]);
+        }
 
         let bs = pow2_ceil_u32(hd.min(256).max(32) as u32);
         let smem_bytes = (kv_len as u32 + bs) * 4;
