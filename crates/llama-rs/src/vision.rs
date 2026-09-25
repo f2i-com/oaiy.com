@@ -96,6 +96,24 @@ pub fn preprocess_image_bytes(bytes: &[u8], cfg: &VisionConfig) -> Result<Tensor
     preprocess_dynamic_image(img, cfg)
 }
 
+/// VENDORED-LOCAL: bounded Qwen image input. Preserve all content and aspect
+/// ratio in a white square canvas rather than distorting/cropping screenshots.
+/// This first path uses 576 visual tokens; dynamic-resolution tiling is separate.
+pub fn preprocess_image_letterboxed(bytes: &[u8], cfg: &VisionConfig) -> Result<Tensor> {
+    if cfg.image_size == 0 || cfg.image_size > 4096 || cfg.std.iter().any(|s|!s.is_finite() || *s<=0.0) {
+        return Err(LlamaError::Config("invalid image preprocessing configuration".into()));
+    }
+    let img=image::load_from_memory(bytes).map_err(|e|LlamaError::Config(format!("failed to decode image: {e}")))?.to_rgb8();
+    let size=cfg.image_size as u32;
+    let scale=(size as f64/img.width() as f64).min(size as f64/img.height() as f64);
+    let w=((img.width() as f64*scale).round() as u32).clamp(1,size);
+    let h=((img.height() as f64*scale).round() as u32).clamp(1,size);
+    let resized=image::imageops::resize(&img,w,h,FilterType::CatmullRom);
+    let mut canvas=image::RgbImage::from_pixel(size,size,image::Rgb([255,255,255]));
+    image::imageops::replace(&mut canvas,&resized,((size-w)/2) as i64,((size-h)/2) as i64);
+    preprocess_dynamic_image(image::DynamicImage::ImageRgb8(canvas),cfg)
+}
+
 fn preprocess_dynamic_image(img: image::DynamicImage, cfg: &VisionConfig) -> Result<Tensor> {
     let size = cfg.image_size as u32;
     // Bilinear resize to the target square. `Triangle` is the image crate's
@@ -131,6 +149,20 @@ fn preprocess_dynamic_image(img: image::DynamicImage, cfg: &VisionConfig) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn letterbox_keeps_edges_and_aspect_ratio() {
+        let img=image::RgbImage::from_pixel(8,4,image::Rgb([255,0,0]));
+        let mut bytes=std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(img).write_to(&mut bytes,image::ImageFormat::Png).unwrap();
+        let cfg=VisionConfig { image_size:8,patch_size:2,mean:[0.5;3],std:[0.5;3] };
+        let pixels=preprocess_image_letterboxed(bytes.get_ref(),&cfg).unwrap();
+        let green=&pixels.data()[64..128];
+        assert!(green[..16].iter().all(|&x|x==1.0));
+        assert!(green[16..48].iter().all(|&x|x== -1.0));
+        assert!(green[48..].iter().all(|&x|x==1.0));
+        assert!(preprocess_image_letterboxed(b"not an image",&cfg).is_err());
+    }
 
     #[test]
     fn config_n_patches() {

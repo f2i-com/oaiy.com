@@ -1380,11 +1380,25 @@ impl Qwen3VlMmProj {
         // ----- 6. mm.0 → GELU → mm.2 -----------------------------------
         let mut h0 = self.projector.mm0.linear(backend, &h);
         backend.add_inplace_broadcast_last(&mut h0, &self.projector.mm0_b);
-        h = backend.gelu_approx(&h0);
+        // VENDORED-LOCAL: HF's patch merger uses erf GELU; its ViT blocks
+        // use tanh GELU. Evaluate this once per image on host (not per token).
+        h = qwen_merger_gelu(backend, &h0);
         let mut out = self.projector.mm2.linear(backend, &h);
         backend.add_inplace_broadcast_last(&mut out, &self.projector.mm2_b);
         Ok(out)
     }
+}
+
+fn qwen_merger_gelu(b: &dyn Backend, x: &Tensor) -> Tensor {
+    let mut host=x.to_host();
+    for v in host.data_mut() {
+        // Abramowitz-Stegun 7.1.26: absolute erf error below 1.5e-7.
+        let z=*v*std::f32::consts::FRAC_1_SQRT_2;
+        let t=1.0/(1.0+0.3275911*z.abs());
+        let erf=1.0-(((((1.061405429*t-1.453152027)*t)+1.421413741)*t-0.284496736)*t+0.254829592)*t*(-z*z).exp();
+        *v *= 0.5*(1.0+erf.copysign(z));
+    }
+    b.to_device(host)
 }
 
 /// Pre-LN attention + FFN block for the Qwen3-VL ViT. Fused QKV split into

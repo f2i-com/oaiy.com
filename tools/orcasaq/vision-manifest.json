@@ -1,0 +1,36 @@
+{
+  "repo": "Qwen/Qwen3.8-27B",
+  "revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
+  "files": [
+    {
+      "name": "LICENSE",
+      "size": 11544,
+      "sha256": null,
+      "git_blob": "f938136e3adacfd92be087f6e113b5d6d97f678f"
+    },
+    {
+      "name": "README.md",
+      "size": 65012,
+      "sha256": null,
+      "git_blob": "bc8aa0e396cd029c21cd773cca21830d0ded28ec"
+    },
+    {
+      "name": "config.json",
+      "size": 4312,
+      "sha256": null,
+      "git_blob": "706cebd746c4b6f2b1d1f892630867acfdfd3df8"
+    },
+    {
+      "name": "model-00001-of-00018.safetensors",
+      "size": 3966730552,
+      "sha256": "ba0ce20aae489ad196733da5064bcdf159a1fe84f53336648196e1ebb7751b1c",
+      "git_blob": "79b73cdd69afeca931d181f5d1e21ad2d73bb7b7"
+    },
+    {
+      "name": "preprocessor_config.json",
+      "size": 390,
+      "sha256": null,
+      "git_blob": "2ea84a437d448ff71b08df68fdd949d5cc4ebb64"
+    }
+  ]
+}

@@ -45,6 +45,81 @@ it explicitly. No separate Python/vLLM server is needed.
 
 ## Implementation and limits
 
+### Optional image reading
+
+The Orca release omits vision. Nrob can pair its text weights with the original
+vision encoder and trained merger from `Qwen/Qwen3.8-27B`, pinned to revision
+`1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0`:
+
+```powershell
+python tools/orcasaq/download.py --vision
+```
+
+This verifies the publisher's hashes and downloads one unmodified 3.97 GB
+safetensors shard plus its configuration/license into `models/OrcaSAQ-2-27B/vision`.
+The shard also contains some text weights; only `model.visual.*` is loaded.
+No conversion, retraining, Python runtime, or separate inference server is used.
+
+Configure coder-cli (the value names a directory, not a GGUF file):
+
+```toml
+[nrob.vision_projectors]
+'orcasaq-2-27b' = '../nrob/models/OrcaSAQ-2-27B/vision'
+```
+
+The standalone equivalent is `--vision-projector orcasaq-2-27b=models/OrcaSAQ-2-27B/vision`.
+`--no-vision` disables it. An invalid configured tower is an explicit load error.
+Send ordinary chat `image_url` content blocks containing base64 data URLs or
+permitted local image paths; multiple images and follow-up questions are supported.
+
+This initial still-image path fits the whole image onto a white 768x768 canvas,
+preserving aspect ratio, and consumes **576 visual tokens per image** plus framing.
+It does not implement dynamic-resolution tiling or video. Small screenshot text
+may need a closer crop. Vision tensors are expanded from the original BF16 to
+FP32 in memory; on the tested two-GPU setup the last cache GPU runs the tower,
+while the first retains the EXL3 text weights. The published **3.21 bpw** still
+describes the text checkpoint, not the combined model.
+
+Image prompt states use the selected project's existing disk cache. Its namespace
+includes the vision shard/config metadata and preprocessing version; prefix keys
+include image content, so changing an image invalidates its cached suffix. Visual
+embeddings are also retained in a bounded in-memory cache. A restart can restore
+the prompt state without running its cached images through the tower again.
+
+For independent numerical validation, `tools/orcasaq/vision_reference.py` runs
+the official Transformers Qwen3.5-family vision implementation on the original
+weights (tested with Transformers 5.17.0). It writes a synthetic image and FP32
+oracle under `target/orca-vision-research`. Then run:
+
+```powershell
+cargo test --release -p nrob-server original_vision_matches -- --ignored --nocapture
+$env:NROB_TEST_VISION='1'
+cargo test --release -p nrob-server real_model_distributed_cache -- --ignored --nocapture
+```
+
+The latter reserves all 260,000 KV slots with vision resident and runs image
+encoding while that allocation is live. It is a capacity test, not a full 260K
+image-conversation quality benchmark.
+
+Observed validation on the two RTX 5090s:
+
+- Original vision embeddings versus the HF FP32 oracle: RMS error `9.29e-6`,
+  maximum absolute error `0.00343` over 576x5120 values.
+- Correct shape/colour descriptions, `ORCA 42` OCR, `PROJECT: VISION 73` OCR
+  on a wide image, multi-image comparison and a follow-up colour question.
+- After a process restart, **597/598** image-prompt tokens restored from disk
+  and returned the same `ORCA 42` answer.
+- Full 260K cache capacity and vision encoding passed together. The text-only
+  128-token speed prompt took **2.44 seconds (52.5 tokens/s)** with vision loaded.
+- This is experimental image support, not a vision-quality benchmark. One
+  combined description/OCR prompt with no system message returned immediate EOS
+  at temperature zero; normal sampling or ordinary chat instructions answered
+  it correctly. A leading request to read text from a blank image also produced
+  a spurious character once. No stop-token suppression or hidden retries were
+  added to conceal these model outputs.
+
+### Text runtime
+
 - The safetensors configuration selects the native Qwen hybrid runtime.
   EXL3 weights remain packed on one CUDA device (the first configured device).
   Two 32 GB RTX 5090 GPUs are the tested configuration at 260,000 tokens.

@@ -147,9 +147,9 @@ pub fn prepare_images(records: &[Json], prompt: Vec<u32>, image_id: u32, cfg: &M
     for id in prompt {
         if id != image_id { ids.push(id); continue; }
         let bytes = dsv41::vision::image_bytes(records.next().unwrap(), local).map_err(|e| e.to_string())?;
-        let pixels = llama_rs::preprocess_image_bytes(&bytes, &vc).map_err(|e| e.to_string())?;
-        let mut h = std::hash::DefaultHasher::new(); std::hash::Hasher::write(&mut h, &bytes);
-        images.push(JobImage { start: ids.len(), prep: ImagePrep::Qwen { pixels, side }, hash: std::hash::Hasher::finish(&h) });
+        let pixels = llama_rs::vision::preprocess_image_letterboxed(&bytes, &vc).map_err(|e| e.to_string())?;
+        let hash=crate::disk::fnv(&bytes,0);
+        images.push(JobImage { start: ids.len(), prep: ImagePrep::Qwen { pixels, side }, hash });
         ids.extend(std::iter::repeat_n(image_id, side*side));
     }
     Ok((ids, images))
@@ -164,12 +164,14 @@ pub struct QwenEngine {
     log: bool,
     checkpoints: Vec<(Vec<u64>, Arc<Snapshot>, bool)>,
     pub disk: Option<crate::disk::DiskCache<Arc<Snapshot>>>,
+    /// Only enable when the disk namespace fingerprints the vision pipeline.
+    pub image_disk_cache: bool,
 }
 
 impl QwenEngine {
     pub fn new(model: Model, projector: Option<MmProj>, max_seq: usize, log: bool) -> Self {
         let kv = model.new_kv_cache(max_seq);
-        Self { model, projector, kv, covered: Vec::new(), vision_cache: Default::default(), log, checkpoints: Vec::new(), disk: None }
+        Self { model, projector, kv, covered: Vec::new(), vision_cache: Default::default(), log, checkpoints: Vec::new(), disk: None, image_disk_cache:false }
     }
     pub fn run(mut self, jobs: Receiver<Job>) {
         for job in jobs {
@@ -193,9 +195,9 @@ impl QwenEngine {
             snap.restore(&mut self.kv, &model.attention_layers, model.ssm_cfg, model.backend.as_ref())?;
             self.covered = saved.clone(); start = saved.len(); source = "checkpoint";
         }
-        // Image states remain in RAM: an SSD state would also need to identify
-        // the projector and its preprocessing version, not just the text model.
-        if job.images.is_empty() {
+        // Persist images only when the caller identifies both the projector and
+        // preprocessing version. The prompt keys also include the image bytes.
+        if job.images.is_empty() || self.image_disk_cache {
             if let Some((saved, snap)) = self.disk.as_mut().and_then(|d| d.load_best(&keys, keys.len()-1, start, self.log)) {
                 match snap.restore(&mut self.kv, &model.attention_layers, model.ssm_cfg, model.backend.as_ref()) {
                     Ok(()) => { self.covered = saved; start = snap.pos; source = "disk"; }
@@ -244,7 +246,7 @@ impl QwenEngine {
                 if self.log { eprintln!("  Qwen checkpoint: {pos} tokens; disk={}", self.disk.is_some()); }
                 let snap = Arc::new(Snapshot::capture(&self.kv, &model.attention_layers, model.backend.as_ref()));
                 let base = stops.first() == Some(&pos);
-                if job.images.is_empty() {
+                if job.images.is_empty() || self.image_disk_cache {
                     if let Some(disk) = &mut self.disk { disk.save(keys[..pos].to_vec(), Arc::clone(&snap), base); }
                 }
                 self.checkpoints.push((keys[..pos].to_vec(), snap, base));

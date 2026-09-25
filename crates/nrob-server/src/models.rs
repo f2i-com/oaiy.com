@@ -237,8 +237,8 @@ impl Models {
             }
         }
         for name in opts.vision_projectors.keys() {
-            if !specs.iter().any(|s| &s.name==name && s.kind==Kind::Gguf) {
-                return Err(Error::Arg(format!("vision projector {name} must name a configured GGUF model")));
+            if !specs.iter().any(|s| &s.name==name && matches!(s.kind,Kind::Gguf | Kind::OrcaSaq)) {
+                return Err(Error::Arg(format!("vision projector {name} must name a configured GGUF or OrcaSAQ model")));
             }
         }
         for name in opts.tool_expert_sources.keys().chain(opts.tools_experts.iter().map(|_| &opts.name)) {
@@ -548,14 +548,34 @@ impl Models {
         let model=crate::orcasaq::load(&spec.path,&o.devices)?;
         let tok=Arc::new(model.tokenizer().clone());
         let max_seq=o.ctx.min(model.config().context_length);
-        let cfg=self.base_cfg(spec,max_seq);
+        let mut cfg=self.base_cfg(spec,max_seq);
+        cfg.image_token_id=tok.token_id("<|image_pad|>").ok_or_else(||Error::Arg("Orca tokenizer lacks image_pad".into()))?;
+        let vision_path=o.vision.then(||o.vision_projectors.get(&spec.name)).flatten();
+        let projector=if let Some(path)=vision_path {
+            let llama_rs::Model::Qwen35(m)=&model else { return Err(Error::Arg("Orca requires Qwen hybrid runtime".into())); };
+            // Use the last configured cache device: the first already holds
+            // the text weights. Image embeddings cross back through host RAM.
+            let backend=m.cache_backends.last().unwrap_or(&m.backend).clone();
+            let mm=crate::qwen_vision::load(path,backend,model.config().embedding_dim)?;
+            cfg.qwen_vision=Some(mm.config().clone());
+            self.say("OrcaSAQ: original Qwen vision tower loaded (576 tokens/image)".into());
+            Some(mm)
+        } else { None };
         let (jobs,rx)=std::sync::mpsc::channel();
-        let mut e=crate::qwen::QwenEngine::new(model,None,max_seq,!o.quiet && !o.silent);
+        let mut e=crate::qwen::QwenEngine::new(model,projector,max_seq,!o.quiet && !o.silent);
+        e.image_disk_cache=vision_path.is_some();
         if let Some(dir)=&o.prompt_cache {
             let mut fp=disk::fnv(b"orcasaq2-exl3-qwen-state-v1",0);
             fp=disk::fnv(spec.path.as_os_str().as_encoded_bytes(),fp);
             let mut files:Vec<_>=std::fs::read_dir(&spec.path)?.filter_map(|e|e.ok().map(|e|e.path())).filter(|p|
                 p.extension().is_some_and(|x|x=="safetensors" || x=="json")).collect();
+            if let Some(path)=vision_path {
+                // Include tower weights/config and preprocessing semantics:
+                // a state from a different vision pipeline is never reusable.
+                fp=disk::fnv(b"qwen38-vision-letterbox768-erfgelu-v1",fp);
+                files.extend(std::fs::read_dir(path)?.filter_map(|e|e.ok().map(|e|e.path())).filter(|p|
+                    p.extension().is_some_and(|x|x=="safetensors" || x=="json")));
+            }
             files.sort();
             for p in files {
                 let meta=std::fs::metadata(&p)?;
@@ -739,6 +759,22 @@ fn startup_warm_profile(usage: Option<&Path>, tool_experts: bool) -> Option<(&Pa
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn orcasaq_vision_configuration_is_accepted_and_scoped() {
+        let root=std::env::temp_dir().join(format!("nrob-orca-vision-config-{}",std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("config.json"),br#"{"model_type":"qwen3_5","quantization_config":{"quant_method":"exl3"}}"#).unwrap();
+        let mut o=Options::default();
+        o.name="orca".into(); o.model=root.clone();
+        o.vision_projectors.insert("orca".into(),root.join("vision"));
+        let models=Models::new(o.clone(),true).unwrap();
+        assert_eq!(models.specs[0].kind,Kind::OrcaSaq);
+        o.vision_projectors.insert("unknown".into(),root.join("other"));
+        assert!(Models::new(o,true).is_err());
+        std::fs::remove_file(root.join("config.json")).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
 
     #[test]
     fn hybrid_startup_warms_its_ternary_bank_from_an_existing_profile() {

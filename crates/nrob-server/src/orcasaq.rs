@@ -37,6 +37,10 @@ mod runtime_tests {
     fn real_model_distributed_cache_restores_and_reserves_260000() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models/OrcaSAQ-2-27B");
         let mut model = load(&path, &[0, 1]).unwrap();
+        let vision = if std::env::var_os("NROB_TEST_VISION").is_some() {
+            let Model::Qwen35(m)=&model else { unreachable!() };
+            Some(crate::qwen_vision::load(&path.join("vision"),m.cache_backends.last().unwrap().clone(),5120).unwrap())
+        } else { None };
         let tokens = model
             .tokenizer()
             .encode("The capital of France is", false)
@@ -90,6 +94,13 @@ mod runtime_tests {
         // Preserved prefix remains usable after growth to the full capacity.
         let logits = model.forward(&tokens[..1], &mut kv).to_host();
         assert!(logits.data().iter().all(|x| x.is_finite()));
+        if let Some(vision)=vision {
+            let pixels=Tensor::from_vec(vec![0.0;3*768*768],vec![3,768,768]);
+            let out=vision.forward(&pixels).unwrap().to_host();
+            assert_eq!(out.shape(),[576,5120]);
+            assert!(out.data().iter().all(|x|x.is_finite()));
+            eprintln!("vision encoding also verified with all 260000 KV slots resident");
+        }
         eprintln!(
             "260000-token capacity: {} bytes; distributed/restored logits verified",
             kv.size_bytes()

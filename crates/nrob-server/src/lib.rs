@@ -23,6 +23,7 @@ mod http;
 mod qwen;
 mod orcasaq;
 mod qwen_cache;
+mod qwen_vision;
 pub mod images;
 mod media_catalog;
 
@@ -83,7 +84,8 @@ pub struct Options {
     /// else is taken for a DeepSeek checkpoint directory. Only one is ever resident:
     /// asking for another unloads the current one first.
     pub extra_models: Vec<(String, std::path::PathBuf)>,
-    /// Native GGUF vision projectors, keyed by configured model name.
+    /// Vision projectors keyed by model name: GGUF files, or original Qwen
+    /// safetensors directories for OrcaSAQ (tools/orcasaq/download.py --vision).
     pub vision_projectors: std::collections::BTreeMap<String, PathBuf>,
     /// Which configured model to load at start, by name. `None` takes `name`.
     ///

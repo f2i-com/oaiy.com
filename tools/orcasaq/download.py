@@ -23,9 +23,14 @@ def main():
     parser.add_argument("--directory", type=pathlib.Path,
                         default=pathlib.Path(__file__).resolve().parents[2] / "models/OrcaSAQ-2-27B")
     parser.add_argument("--verify-only", action="store_true")
+    parser.add_argument("--vision", action="store_true",
+                        help="download the matching original Qwen vision shard into vision/")
     args = parser.parse_args()
-    manifest = json.loads(pathlib.Path(__file__).with_name("manifest.json").read_text(encoding="utf-8-sig"))
+    manifest = json.loads(pathlib.Path(__file__).with_name(
+        "vision-manifest.json" if args.vision else "manifest.json").read_text(encoding="utf-8-sig"))
     root = args.directory.resolve()
+    if args.vision:
+        root /= "vision"
     root.mkdir(parents=True, exist_ok=True)
     for record in manifest["files"]:
         path = (root / record["name"]).resolve()

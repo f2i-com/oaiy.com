@@ -3,8 +3,8 @@
 //! the conversations it may resume.
 //!
 //! An entry is a [`Snapshot`] of the model's state after a prompt prefix,
-//! with that prefix's keys (see `engine::prompt_keys`; prompts with images
-//! are not kept). The engine saves one where a conversation's first user
+//! with that prefix's keys. Image prompts are kept only by engines whose
+//! namespace also identifies the vision weights and preprocessing. The engine saves one where a conversation's first user
 //! message begins (the system prompt and tools), and for the conversation
 //! after each layered pass, where its newest user message begins and at the
 //! end of each prompt; earlier prefixes remain reusable when a rendered turn changes its suffix. When a

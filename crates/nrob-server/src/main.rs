@@ -67,7 +67,8 @@ const HELP: &str = "Observer: --observer-model FILE.gguf --observer-device auto|
                        again (default: not kept)
   --prompt-cache-gb F  disk the prompt states may take (default 4)
   --cpu-threads N      CPU threads for experts that miss VRAM (default 24; 0 = off)
-  --no-vision          skip the vision tower (saves ~1 GB of VRAM; images are refused)
+  --vision-projector NAME=PATH  GGUF projector, or original Qwen vision directory for Orca
+  --no-vision          skip the vision tower (images are refused)
   --local-images on|off  let requests name image files on this machine (paths,
                        file:// URLs); default on when listening on loopback only
   --quiet              no per-request log

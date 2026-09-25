@@ -28,6 +28,13 @@ pub fn rotate(b: &dyn Backend, x: &mut Tensor, positions: &[[u32; 3]], rotated: 
 pub fn text(b: &dyn Backend, x: &mut Tensor, positions: &[[u32; 3]], rotated: usize, theta: f32) {
     // Qwen3.5/3.6/3.8 dense uses mrope_section=[11,11,10].
     assert_eq!(rotated, 64, "unsupported Qwen MRoPE dimension");
+    // VENDORED-LOCAL: generated text after an image has equal spatial axes.
+    // Use the resident GPU kernel with the multimodal offset, avoiding two
+    // device/host transfers per attention layer on every generated token.
+    if positions.iter().all(|p|p[0]==p[1] && p[1]==p[2]) {
+        b.rope_partial_neox(x,&positions.iter().map(|p|p[0]).collect::<Vec<_>>(),x.dim(2),rotated,theta);
+        return;
+    }
     let axes: Vec<_> = (0..32).map(|i| if i % 3 == 1 && i < 33 { 1 } else if i % 3 == 2 && i < 30 { 2 } else { 0 }).collect();
     rotate(b, x, positions, rotated, theta, &axes, &(0..32).collect::<Vec<_>>(), rotated);
 }
