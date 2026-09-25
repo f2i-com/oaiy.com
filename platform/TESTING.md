@@ -207,10 +207,10 @@ network. One case repacks the engines `ui/vendor` holds to run the real glue
 through the same checks, so install them first (`npm test` in `ui` does); outside
 CI that case is skipped, with the reason, when there are none.
 
-The web-python bundle ships no notices for the RustPython and Unicode code it
-compiles in, so the install takes OAIY's curated copy in `ui/vendor/zipp-notices/`,
-whose `SOURCE.json` names the ZIPP release it was generated from. A newer release
-installs with a warning (an annotation in GitHub Actions) to check what it
+The web-python bundle ships no notices for the Unicode data it compiles in, so
+the install takes OAIY's curated copy in `ui/vendor/zipp-notices/`, whose
+`SOURCE.json` names the ZIPP release it was generated from. A newer or older
+release installs with a warning (an annotation in GitHub Actions) to check what it
 compiles in and regenerate the copy; see `ui/vendor/zipp-notices/README.md`.
 
 `ui`'s `dev`, `typecheck`, `test`, `test:zipp` and `build` hooks run
@@ -299,10 +299,10 @@ parts, each runnable alone against the `dist/` the build just made (a stale
 | `node test/zipp-script.mjs` | `oaiy script --request` does not run a JavaScript job and a Python project on the staged engine, or its response fails `protocol/v1/script-result.schema.json` or names an engine other than `dist/zipp/SOURCE.json`'s; a refused request is not the refusal object with exit 1; a non-JSON file or a missing engine writes an output file; `--serve` does not answer N batches in order over one worker, `pong.instance` does not go 1 → 2 → 3 → 4 across a `resource` error, a watchdog `timeout` (budget + 1500 ms grace, measured ~1.8 s) and the 5000th job while the NEXT job in each batch still runs, a malformed line is not one `invalid_line` error with the stream continuing, any stdout line is not protocol JSON, any result line fails the schema, or `shutdown`/EOF do not exit 0 on their own; `run --profile` does not place the preamble at program top level (a flow reads a name only it defines), does not apply its `instructionSteps`, or fails to refuse — before the flow file is read, with no result file — two budgets, a bad digest, a reserved name (also destructured), a `let` over a guest shim, a non-parsing preamble, an unknown field or a malformed `python.modes` entry, and does not accept a profile that carries modes; `script --request` does not unfold a named mode on the staged engine, does not take the next mode on a compile failure, or attributes a phase with another phase's `lineOffset`; a job naming a mode the profile does not define, or naming one with no profile, is not refused whole; `capabilities` does not report `protocols {run, script, profile}` and `script.languages` = the engine list |
 | `node test/cli-asset.mjs` | `scripts/pack-cli-asset.mjs` (what release.yml runs for `oaiy-cli-<v>.tar.gz`) writes into the staged folder instead of a copy, produces a tarball the platform's `tar` cannot extract, an inner `SHA256SUMS` that does not match every file or omits one (`sha256sum -c` is run where present), or an `oaiy-cli.json` that is not byte-for-byte the EXTRACTED CLI's `capabilities --json` with `protocols {run, script, profile}`, a ready engine and the staged digest; or it writes an asset for a staged CLI whose engine does not check — including when the builder's own `OAIY_ZIPP_ASSET_DIR` names a good engine (the copy runs with every `OAIY_*` scrubbed) |
 
-### ZIPP boundary measurements (zipp.org v0.0.19, web-python; `node test/zipp-limits.mjs`)
+### ZIPP boundary measurements (zipp.org v0.0.21, web-python; `node test/zipp-limits.mjs`)
 
 Recorded 2026-09-17 on Windows 11, Node 24.19, first on v0.0.18 and again on
-v0.0.19 (same PROFILE limits, every row the same). These replace the 1 MiB figure
+v0.0.19, and on 2026-09-26 on v0.0.21 (same PROFILE limits, every row the same). These replace the 1 MiB figure
 the plan carried for D13; the binding limits are different in each direction.
 
 | Case | Result |

@@ -1,10 +1,9 @@
 {
   "repository": "https://github.com/f2i-com/zipp.org",
-  "release": "v0.0.19",
+  "release": "v0.0.21",
   "sources": [
-    "crates/rustpython-parser-fork/LICENSE",
     "LICENSE-UNICODE"
   ],
   "file": "THIRD_PARTY_LICENSES.txt",
-  "sha256": "7626c68307e5a7efdc3e405ca0d02031589801576c0e94cee41fccc81eb2cd4c"
+  "sha256": "d446f547fb21b6d9d95d7e3df7de7da5489f16684ba4a9eaf289fbde6bfc9834"
 }

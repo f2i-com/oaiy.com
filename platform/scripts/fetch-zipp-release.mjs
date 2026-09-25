@@ -31,9 +31,9 @@
  * the bundle's own SHA256SUMS, BUILD-INFO.txt must describe that variant, both
  * bundles must name the same commit, and each module must report it. Nothing
  * is post-processed: a changed byte breaks that chain. The web-python bundle
- * ships no third-party notices, so the RustPython and Unicode notices come from
+ * ships no third-party notices, so the Unicode notices come from
  * ui/vendor/zipp-notices/ ('oaiy-curated') until it does. That folder's
- * SOURCE.json names the release they were generated from; a newer release is
+ * SOURCE.json names the release they were generated from; any other release is
  * installed with a warning to regenerate them (scripts/regen-zipp-notices.mjs).
  *
  * Node built-ins only (the zip reader is below): the CLI and Desktop CI lanes
@@ -54,7 +54,7 @@ export const CACHE_DIR = path.join(ROOT, '.zipp-release');
 
 export const NOTICES = 'THIRD_PARTY_LICENSES.txt';
 export const CURATED = 'oaiy-curated';
-/** The two bundles of a release OAIY installs. Only the Python engine redistributes RustPython and Unicode data. */
+/** The two bundles of a release OAIY installs. Only the Python engine redistributes third-party (Unicode) data. */
 export const VARIANTS = [
   { folder: 'zipp-wasm', suffix: 'web', variant: 'javascript', languages: ['javascript'], stackBytes: 1048576, needsNotices: false },
   { folder: 'zipp-wasm-python', suffix: 'web-python', variant: 'javascript-python', languages: ['javascript', 'python'], stackBytes: 16777216, needsNotices: true },
@@ -698,9 +698,13 @@ async function installReleaseLocked({ vendorDir, tag, latest, releaseDir, cacheD
   for (const variant of VARIANTS) zips[variant.suffix] = await loadBundle({ release, sums, variant, releaseDir, cacheDir, fetch: fetchImpl });
   const installs = await verifyRelease({ release, sums, zips, expectSumsSha256, curatedNotices });
   // Nothing redistributes the Python engine before O1, so drift is a prompt, not a refusal.
+  // An older release can need more than the notices name, too: releases before v0.0.21 compile in RustPython.
   const curatedFrom = installs.find((i) => i.curatedFrom)?.curatedFrom;
-  if (curatedFrom && compareReleases(release, curatedFrom) > 0) {
-    const note = `ZIPP ${release} is newer than ${curatedFrom}, the release ${rel(curatedNotices)} was generated from; if it compiles in more third-party code, regenerate the notices: node scripts/regen-zipp-notices.mjs <zipp.org checkout> ${release}`;
+  const drift = curatedFrom ? compareReleases(release, curatedFrom) : 0;
+  if (drift) {
+    const note = drift > 0
+      ? `ZIPP ${release} is newer than ${curatedFrom}, the release ${rel(curatedNotices)} was generated from; if it compiles in more third-party code, regenerate the notices: node scripts/regen-zipp-notices.mjs <zipp.org checkout> ${release}`
+      : `ZIPP ${release} is older than ${curatedFrom}, the release ${rel(curatedNotices)} was generated from; if it compiles in third-party code that release no longer does, regenerate the notices: node scripts/regen-zipp-notices.mjs <zipp.org checkout> ${release}`;
     if (process.env.GITHUB_ACTIONS === 'true') log(`::warning::${note}`);
     else warn(note);
   }

@@ -18,15 +18,25 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import { fileURLToPath } from 'node:url';
-import { CURATED_NOTICES, NOTICES, REPOSITORY, isReleaseTag, sha256 } from './fetch-zipp-release.mjs';
+import { CURATED_NOTICES, NOTICES, REPOSITORY, compareReleases, isReleaseTag, sha256 } from './fetch-zipp-release.mjs';
 
-/** The zipp.org files the notices are made of, by their paths from the repository root. */
-export const NOTICE_SOURCES = { rustpython: 'crates/rustpython-parser-fork/LICENSE', unicode: 'LICENSE-UNICODE' };
+/**
+ * The first release that parses Python with ZIPP's own zipp-pyparse, which
+ * carries no RustPython code; crates/rustpython-parser-fork is gone from it. Its
+ * Unicode identifier and name tables remain.
+ */
+export const PYPARSE_RELEASE = 'v0.0.21';
+
+/** The zipp.org files the notices of `release` are made of, by their paths from the repository root. */
+export const noticeSources = (release) => ({
+  ...(compareReleases(release, PYPARSE_RELEASE) < 0 ? { rustpython: 'crates/rustpython-parser-fork/LICENSE' } : {}),
+  unicode: 'LICENSE-UNICODE',
+});
 
 /** The notices from those files' texts, each as it is, its own final newline included. */
 export const noticesText = ({ rustpython, unicode }) => `${[
   'ZIPP engine: Apache-2.0. See the source repository for its complete notices.',
-  `RustPython parser (MIT):\n${rustpython}`,
+  ...(rustpython === undefined ? [] : [`RustPython parser (MIT):\n${rustpython}`]),
   `Unicode data:\n${unicode}`,
 ].join('\n\n').trimEnd()}\n`;
 
@@ -34,7 +44,7 @@ export const noticesText = ({ rustpython, unicode }) => `${[
 export const noticesRecord = (release, text) => ({
   repository: REPOSITORY,
   release,
-  sources: Object.values(NOTICE_SOURCES),
+  sources: Object.values(noticeSources(release)),
   file: NOTICES,
   sha256: sha256(Buffer.from(text)),
 });
@@ -44,7 +54,7 @@ export const noticesRecord = (release, text) => ({
  * text at that tag; with `check`, write nothing and return what differs.
  */
 export function regenerate({ read, release, dir = path.dirname(CURATED_NOTICES), check = false }) {
-  const text = noticesText({ rustpython: read(NOTICE_SOURCES.rustpython), unicode: read(NOTICE_SOURCES.unicode) });
+  const text = noticesText(Object.fromEntries(Object.entries(noticeSources(release)).map(([name, file]) => [name, read(file)])));
   const record = noticesRecord(release, text);
   const noticesFile = path.join(dir, NOTICES);
   const recordFile = path.join(dir, 'SOURCE.json');
