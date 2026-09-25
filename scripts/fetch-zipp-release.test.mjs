@@ -26,7 +26,7 @@ import {
   BUNDLE_FILES, CURATED_NOTICES, REPOSITORY, VARIANTS, VENDOR_DIR, ZippReleaseError,
   bundleName, checkInstalls, checkInstallsOnline, ensureInstalls, installRelease, installedFiles, readCuratedNotices, removeStaleLock, resolveRelease, sha256, unzip, verifyRelease, withInstallLock, writeInstalls,
 } from './fetch-zipp-release.mjs';
-import { NOTICE_SOURCES, noticesRecord, regenerate } from './regen-zipp-notices.mjs';
+import { noticeSources, noticesRecord, regenerate } from './regen-zipp-notices.mjs';
 
 const SCRIPT = fileURLToPath(new URL('./fetch-zipp-release.mjs', import.meta.url));
 const VERSION = '1.2.3';
@@ -243,7 +243,7 @@ test('a release that checks all the way down installs both bundles as exactly th
     assert.ok(fs.readFileSync(path.join(dir, 'RELEASE-SHA256SUMS')).equals(folder.top), 'ZIPP\'s top-level SHA256SUMS, verbatim');
     for (const name of BUNDLE_FILES) assert.ok(fs.readFileSync(path.join(dir, name)).equals(files.get(name)), `${variant.folder}/${name} byte for byte`);
   }
-  // Only the Python engine compiles in RustPython and Unicode data; the bundle ships no notices, so the curated copy is installed and says so.
+  // Only the Python engine compiles in Unicode data; the bundle ships no notices, so the curated copy is installed and says so.
   assert.equal(readSource(path.join(out, WEB.folder)).notices, null);
   const notices = readSource(path.join(out, PYTHON.folder)).notices;
   assert.deepEqual(notices, { file: 'THIRD_PARTY_LICENSES.txt', source: 'oaiy-curated', sha256: sha256(fs.readFileSync(CURATED_NOTICES)) });
@@ -948,7 +948,7 @@ test('the zip reader takes stored and deflated entries and refuses a damaged one
   }
 });
 
-test('the curated notices must be the file their SOURCE.json records, and a release newer than they were generated from installs with a prompt to regenerate them', async (t) => {
+test('the curated notices must be the file their SOURCE.json records, and a release newer or older than the one they were generated from installs with a prompt to regenerate them', async (t) => {
   // In process the prompt goes to `warn` wherever this runs; the GitHub Actions form is checked through the command line below.
   const actions = process.env.GITHUB_ACTIONS;
   delete process.env.GITHUB_ACTIONS;
@@ -970,7 +970,11 @@ test('the curated notices must be the file their SOURCE.json records, and a rele
   const older = await warned({ release: 'v1.2.2' });
   assert.equal(older.length, 1, older.join('\n'));
   assert.match(older[0], /^ZIPP v1\.2\.3 is newer than v1\.2\.2, the release .*THIRD_PARTY_LICENSES\.txt was generated from; if it compiles in more third-party code, regenerate the notices: node scripts\/regen-zipp-notices\.mjs <zipp\.org checkout> v1\.2\.3$/);
-  for (const release of [TAG, 'v1.2.4']) assert.deepEqual(await warned({ release }), [], `generated from ${release}`);
+  // Older than the notices can need more than they name as well (releases before v0.0.21 compile in RustPython).
+  const newer = await warned({ release: 'v1.2.4' });
+  assert.equal(newer.length, 1, newer.join('\n'));
+  assert.match(newer[0], /^ZIPP v1\.2\.3 is older than v1\.2\.4, the release .*THIRD_PARTY_LICENSES\.txt was generated from; if it compiles in third-party code that release no longer does, regenerate the notices: node scripts\/regen-zipp-notices\.mjs <zipp\.org checkout> v1\.2\.3$/);
+  assert.deepEqual(await warned({ release: TAG }), [], `generated from ${TAG}`);
 
   const refusedWith = (pattern) => assert.rejects(installRelease({ vendorDir: outDir(t), releaseDir: folder.dir, curatedNotices, log: quiet, warn: quiet }), (error) => error instanceof ZippReleaseError && pattern.test(error.message));
   recordAs({ sha256: 'e'.repeat(64) });
@@ -993,14 +997,22 @@ test('the curated notices must be the file their SOURCE.json records, and a rele
 test('the curated notices regenerate from zipp.org\'s sources by one recipe, and the committed pair is what it gives', (t) => {
   assert.deepEqual(JSON.parse(fs.readFileSync(CURATED_RECORD, 'utf8')), noticesRecord(JSON.parse(fs.readFileSync(CURATED_RECORD, 'utf8')).release, fs.readFileSync(CURATED_NOTICES, 'utf8')), 'SOURCE.json records the committed notices');
   // Each source as it is, final newline included, and the whole trimmed once: Softn's recipe, byte for byte.
-  const sources = { [NOTICE_SOURCES.rustpython]: 'MIT License\n\nCopyright (c) 2020 RustPython Team\n', [NOTICE_SOURCES.unicode]: 'UNICODE LICENSE V3\n\nSPDX-License-Identifier: Unicode-3.0\n' };
+  const sources = { 'crates/rustpython-parser-fork/LICENSE': 'MIT License\n\nCopyright (c) 2020 RustPython Team\n', 'LICENSE-UNICODE': 'UNICODE LICENSE V3\n\nSPDX-License-Identifier: Unicode-3.0\n' };
   const read = (file) => sources[file];
-  const text = 'ZIPP engine: Apache-2.0. See the source repository for its complete notices.\n\nRustPython parser (MIT):\nMIT License\n\nCopyright (c) 2020 RustPython Team\n\n\nUnicode data:\nUNICODE LICENSE V3\n\nSPDX-License-Identifier: Unicode-3.0\n';
+  // Releases before v0.0.21 compiled in the RustPython parser fork, and their notices carry its licence.
+  assert.deepEqual(noticeSources(TAG), { unicode: 'LICENSE-UNICODE' });
+  assert.deepEqual(noticeSources('v0.0.20'), { rustpython: 'crates/rustpython-parser-fork/LICENSE', unicode: 'LICENSE-UNICODE' });
+  const older = tempDir(t, 'zipp-notices-');
+  assert.deepEqual(regenerate({ read, release: 'v0.0.20', dir: older }), []);
+  const olderText = 'ZIPP engine: Apache-2.0. See the source repository for its complete notices.\n\nRustPython parser (MIT):\nMIT License\n\nCopyright (c) 2020 RustPython Team\n\n\nUnicode data:\nUNICODE LICENSE V3\n\nSPDX-License-Identifier: Unicode-3.0\n';
+  assert.equal(fs.readFileSync(path.join(older, 'THIRD_PARTY_LICENSES.txt'), 'utf8'), olderText);
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(older, 'SOURCE.json'), 'utf8')).sources, ['crates/rustpython-parser-fork/LICENSE', 'LICENSE-UNICODE']);
+  const text = 'ZIPP engine: Apache-2.0. See the source repository for its complete notices.\n\nUnicode data:\nUNICODE LICENSE V3\n\nSPDX-License-Identifier: Unicode-3.0\n';
   const dir = tempDir(t, 'zipp-notices-');
   const notices = path.join(dir, 'THIRD_PARTY_LICENSES.txt');
   assert.deepEqual(regenerate({ read, release: TAG, dir }), []);
   assert.equal(fs.readFileSync(notices, 'utf8'), text);
-  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(dir, 'SOURCE.json'), 'utf8')), { repository: REPOSITORY, release: TAG, sources: ['crates/rustpython-parser-fork/LICENSE', 'LICENSE-UNICODE'], file: 'THIRD_PARTY_LICENSES.txt', sha256: sha256(Buffer.from(text)) });
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(dir, 'SOURCE.json'), 'utf8')), { repository: REPOSITORY, release: TAG, sources: ['LICENSE-UNICODE'], file: 'THIRD_PARTY_LICENSES.txt', sha256: sha256(Buffer.from(text)) });
   assert.deepEqual(readCuratedNotices(notices), { bytes: Buffer.from(text), release: TAG }, 'what the installer takes');
   assert.deepEqual(regenerate({ read, release: TAG, dir, check: true }), []);
   assert.deepEqual(regenerate({ read, release: 'v1.2.4', dir, check: true }), ['SOURCE.json does not record v1.2.4 and that file\'s SHA-256']);

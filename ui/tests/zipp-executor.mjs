@@ -150,8 +150,11 @@ function wasmMemoryMaxBytes(bytes) {
     if (id === 5 && leb() > 0) return limits();
     if (id === 2) {
       for (let n = leb(); n > 0; n--) {
-        at += leb();
-        at += leb();
+        // Module and field names: the length first, so `at` has moved past it before the skip (`at += leb()` would not).
+        for (let name = 0; name < 2; name++) {
+          const length = leb();
+          at += length;
+        }
         const kind = bytes[at++];
         if (kind === 2) return limits();
         if (kind === 0) leb();
