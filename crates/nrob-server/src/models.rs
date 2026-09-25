@@ -327,8 +327,8 @@ impl Models {
     pub fn activate(&self, want: Option<&str>) -> std::result::Result<Active, String> {
         if let Some(want)=want {if !self.specs.iter().any(|s|s.name==want){return Err(format!("no configured model called {want}"));}}
         let route = self.image_route.lock().unwrap_or_else(|p|p.into_inner());
-        // During image work all chat turns stay on the controller. The route
-        // persists after a batch so its next tool turn cannot reload DeepSeek.
+        // During image work all chat turns stay on the controller. The media
+        // supervisor clears this route after its worker has released memory.
         self.activate_inner(route.as_deref().or(want))
     }
 

@@ -241,6 +241,10 @@ impl Images {
                 }))
                 .unwrap_or_else(|_| Err("image supervisor panicked".into()));
                 let mut job = this.job.lock().unwrap_or_else(|p| p.into_inner());
+                // run() has dropped/reaped the worker, freeing its CUDA memory.
+                // Clear the temporary route before publishing completion; the
+                // next chat request can return to its chosen model and context.
+                this.models.release_images();
                 if let Some(j) = job.as_mut() {
                     match result {
                         Ok(value) => {

@@ -679,7 +679,7 @@ impl Server {
         let malformed_tools = parser.tool_call_error();
         if error.is_none() && !stop.hit {
             if let Some(detail) = &malformed_tools {
-                error = Some(format!("Model generated an invalid DSML tool call ({detail}); no tool was executed. Please start a fresh turn."));
+                error = Some(format!("{TOOL_CONTRACT_CODE}: invalid DSML tool call ({detail}); no tool from this batch was executed"));
             }
         }
         if error.is_none() && !stop.hit && parser.tool_calls_ready() {

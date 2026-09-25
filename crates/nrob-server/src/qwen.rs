@@ -346,7 +346,8 @@ impl QwenEngine {
             self.covered.push(next as u64);
         }
         let raw = tok.decode(&generated);
-        let text = stream.push(&raw, &job.tools, true)?;
+        let text = stream.push(&raw, &job.tools, true)
+            .map_err(|e| format!("tool_contract_error: {e}; no tool from this batch was executed"))?;
         if self.log { eprintln!("  Qwen: {} prompt tokens ({} cached) in {:.2}s; {} generated in {:.2}s", job.prompt.len(),start,prefill_secs,generated.len(),decode_clock.elapsed().as_secs_f64()); }
         if !text.is_empty() { let _ = job.events.send(Event::Text(text)); }
         let _ = job.events.send(Event::Done { finish, completion_tokens: generated.len() });
@@ -391,6 +392,26 @@ fn positions(job: &Job) -> Result<(Vec<[u32;3]>,u32),String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_file_call_round_trip_preserves_literal_content() {
+        let tools = vec![Json::parse(br#"{"function":{"name":"write_file","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}}"#).unwrap()];
+        let content = "\n<style>\n  :root { --bg: #000; }\n  body::before { background: var(--bg); content: 'λ 😀'; }\n</style>\n<script>const x = a < b && b > 0;</script>\n\n";
+        let raw = format!("<tool_call>\n<function=write_file>\n<parameter=path>\nsite/index.html\n</parameter>\n<parameter=content>\n{content}\n</parameter>\n</function>\n</tool_call>");
+        let mut stream = NativeStream::default();
+        let mut parser = dsv41::chat::StreamParser::new(Mode::Chat);
+        for end in raw.char_indices().map(|(at,c)| at+c.len_utf8()) {
+            parser.push(&stream.push(&raw[..end], &tools, false).unwrap());
+            assert!(!parser.tool_calls_ready());
+        }
+        parser.push(&stream.push(&raw, &tools, true).unwrap());
+        assert!(parser.tool_call_error().is_none());
+        let (_, calls) = parser.finish();
+        assert_eq!(calls.len(), 1);
+        let args = Json::parse(calls[0].arguments.as_bytes()).unwrap();
+        assert_eq!(args.get("content").and_then(Json::as_str), Some(content));
+        assert_eq!(args.get("path").and_then(Json::as_str), Some("site/index.html"));
+    }
+
     #[test]
     fn native_stream_releases_reasoning_and_prose_before_completion() {
         let mut stream = NativeStream::default();
