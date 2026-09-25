@@ -18,6 +18,7 @@ pub struct Config {
     pub default_weights: String,
     pub image_model: Option<String>,
     pub text_encoder: Option<PathBuf>,
+    pub sdxl: Option<Json>,
     pub worker: PathBuf,
     pub base: PathBuf,
     pub transformer: PathBuf,
@@ -53,6 +54,7 @@ impl Config {
             default_weights: "gguf".into(),
             image_model: None,
             text_encoder: None,
+            sdxl: None,
             worker: s("worker")?.into(),
             base: s("base")?.into(),
             transformer: s("transformer")?.into(),
@@ -574,6 +576,63 @@ fn prepare_video(c: &Config, body: &Json) -> Result<Json, String> {
     Ok(Json::Obj(fields))
 }
 
+fn prepare_sdxl(c: &Config, settings: &Json, body: &Json) -> Result<Json, String> {
+    // Only catalog paths can select weights. Validate before unloading the LLM.
+    let value = |key| body.get(key).or_else(|| settings.get(key));
+    let integer = |key, default, min, max| -> Result<i64, String> {
+        let n = match value(key) { None => default, Some(v) => v.as_i64().ok_or_else(|| format!("{key} must be an integer"))? };
+        if !(min..=max).contains(&n) { return Err(format!("{key} must be between {min} and {max}")); }
+        Ok(n)
+    };
+    let n = integer("n", 1, 1, 1000)?;
+    let width = integer("width", 1024, 256, 2048)?;
+    let height = integer("height", 1024, 256, 2048)?;
+    if width % 64 != 0 || height % 64 != 0 { return Err("SDXL dimensions must be multiples of 64".into()); }
+    let valid_prompt = |v: &Json| v.as_str().is_some_and(|s| !s.trim().is_empty() && s.len() <= 16384);
+    match body.get("prompts") {
+        Some(v) => {
+            let a = v.as_array().ok_or("prompts must be an array")?;
+            if (a.len() != 1 && a.len() != n as usize) || a.iter().any(|v| !valid_prompt(v)) {
+                return Err("provide one prompt or n nonempty prompts up to 16384 bytes each".into());
+            }
+        }
+        None => if !body.get("prompt").is_some_and(valid_prompt) { return Err("prompt must be a nonempty string up to 16384 bytes".into()); },
+    }
+    for key in ["image", "images", "adapter"] {
+        if body.get(key).is_some_and(|v| !matches!(v, Json::Null) && !v.as_array().is_some_and(|a| a.is_empty())) {
+            return Err("SDXL currently supports text-to-image without reference images or LoRA".into());
+        }
+    }
+    if body.get("turbo").is_some_and(|v| v.as_bool() != Some(false)) { return Err("SDXL does not use Qwen turbo".into()); }
+    if body.get("weights").is_some_and(|v| v.as_str() != Some("safetensors")) { return Err("SDXL requires safetensors weights".into()); }
+    for (key, expected) in [("sampler", "dpmpp_2m"), ("scheduler", "karras")] {
+        if value(key).is_some_and(|v| v.as_str() != Some(expected)) { return Err(format!("SDXL {key} must be {expected}")); }
+    }
+    let cfg = match value("cfg") { None => 2.5, Some(v) => v.as_f64().ok_or("cfg must be numeric")? };
+    if !cfg.is_finite() || !(1.0..=30.0).contains(&cfg) { return Err("cfg must be between 1 and 30".into()); }
+    let negative = match value("negative_prompt") { None => "", Some(v) => v.as_str().filter(|s| s.len() <= 16384).ok_or("negative_prompt must be a string up to 16384 bytes")? };
+    let mut fields = vec![
+        ("architecture".into(), Json::str("sdxl")),
+        ("checkpoint".into(), settings.get("checkpoint").cloned().ok_or("missing SDXL checkpoint")?),
+        ("tokenizer".into(), settings.get("tokenizer").cloned().ok_or("missing SDXL tokenizer")?),
+        ("device".into(), Json::Int(c.image_device as i64)),
+        ("n".into(), Json::Int(n)), ("width".into(), Json::Int(width)), ("height".into(), Json::Int(height)),
+        ("steps".into(), Json::Int(integer("steps", 16, 2, 100)?)),
+        ("seed".into(), Json::Int(integer("seed", 0, 0, i64::MAX - n)?)),
+        ("clip_skip".into(), Json::Int(integer("clip_skip", 1, 1, 11)?)),
+        ("cfg".into(), Json::Num(cfg)), ("negative_prompt".into(), Json::str(negative)),
+        ("sampler".into(), Json::str("dpmpp_2m")), ("scheduler".into(), Json::str("karras")),
+        ("output_dir".into(), Json::str(output_directory(c, body, "images")?.to_string_lossy())),
+    ];
+    if let Some(model) = &c.image_model { fields.push(("model".into(), Json::str(model))); }
+    for key in ["prompt", "prompts"] {
+        if let Some(v) = body.get(key) { fields.push((key.into(), v.clone())); }
+    }
+    let request = Json::Obj(fields);
+    if request.to_json().len() > 2 * 1024 * 1024 { return Err("image request exceeds 2 MiB".into()); }
+    Ok(request)
+}
+
 fn prepare(c: &Config, body: &Json) -> Result<Json, String> {
     let selected = match body.get("model") {
         None => None,
@@ -581,6 +640,9 @@ fn prepare(c: &Config, body: &Json) -> Result<Json, String> {
     };
     let current = crate::media_catalog::image(c, selected)?;
     let c = &current;
+    if let Some(settings) = &c.sdxl {
+        return prepare_sdxl(c, settings, body);
+    }
     let images = reference_paths(body, true)?;
     let prompt = body.get("prompt").cloned();
     let prompts = body.get("prompts").cloned();
@@ -746,6 +808,49 @@ pub(crate) fn reference_paths(body: &Json, allow_local: bool) -> Result<Vec<Json
 mod tests {
     use super::*;
     #[test]
+    fn sdxl_catalog_routes_checkpoint_and_validates_before_handoff() {
+        let root = std::env::temp_dir().join(format!("nrob-sdxl-catalog-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let fixture = root.join("checkpoint.safetensors");
+        std::fs::write(&fixture, b"fixture").unwrap();
+        let write = |name: &str, j: Json| std::fs::write(root.join(name), j.to_json()).unwrap();
+        write("controller.json", Json::obj([
+            ("worker", Json::str("checkpoint.safetensors")), ("controller_path", Json::str("checkpoint.safetensors")),
+            ("controller_name", Json::str("qwen")), ("controller_device", Json::Int(0)),
+            ("image_device", Json::Int(1)), ("output_root", Json::str("outputs")),
+        ]));
+        write("image.json", Json::obj([
+            // Missing shared Qwen files must not prevent selecting SDXL.
+            ("base", Json::str("missing-qwen")), ("adapter", Json::str("missing-adapter")),
+            ("default_model", Json::str("anime")),
+            ("models", Json::obj([("anime", Json::obj([
+                ("architecture", Json::str("sdxl")), ("checkpoint", Json::str("checkpoint.safetensors")),
+                ("tokenizer", Json::str("checkpoint.safetensors")), ("steps", Json::Int(20)), ("cfg", Json::Num(3.0)),
+            ]))])),
+        ]));
+        let cfg = Config::read(&root).unwrap();
+        let request = |extra: &str| Json::parse(format!(r#"{{"prompt":"anime fox"{extra}}}"#).as_bytes()).unwrap();
+        let prepared = prepare(&cfg, &request("")).unwrap();
+        assert_eq!(prepared.get("architecture").and_then(Json::as_str), Some("sdxl"));
+        assert_eq!(prepared.get("steps").and_then(Json::as_i64), Some(20));
+        assert_eq!(prepared.get("cfg").and_then(Json::as_f64), Some(3.0));
+        assert!(prepared.get("adapter").is_none());
+        assert_eq!(prepared.get("device").and_then(Json::as_i64), Some(1));
+        let overridden = prepare(&cfg, &request(r#", "steps":16,"cfg":2.5,"negative_prompt":"blurry","checkpoint":"untrusted.safetensors""#)).unwrap();
+        assert_eq!(overridden.get("steps").and_then(Json::as_i64), Some(16));
+        assert_eq!(overridden.get("checkpoint"), prepared.get("checkpoint"));
+        assert_eq!(overridden.get("negative_prompt").and_then(Json::as_str), Some("blurry"));
+        assert_eq!(cfg.capabilities().get("image").unwrap().get("available").and_then(Json::as_bool), Some(true));
+        for extra in [r#", "width":544"#, r#", "cfg":0"#, r#", "cfg":"2.5""#, r#", "turbo":true"#,
+            r#", "images":["x.png"]"#, r#", "weights":"gguf""#, r#", "sampler":"euler""#,
+            r#", "scheduler":"normal""#, r#", "clip_skip":0"#, r#", "steps":1"#, r#", "prompts":[]"#,
+            r#", "negative_prompt":3"#, r#", "output_dir":"../escape""#,
+        ] { assert!(prepare(&cfg, &request(extra)).is_err(), "{extra}"); }
+        std::fs::remove_file(fixture).unwrap();
+        assert!(prepare(&cfg, &request("")).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
     fn live_catalog_add_remove_disable_and_defaults() {
         let root = std::env::temp_dir().join(format!("nrob-live-media-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
@@ -892,6 +997,7 @@ mod tests {
             default_weights: "gguf".into(),
             image_model: None,
             text_encoder: None,
+            sdxl: None,
             worker: "worker".into(),
             base: "base".into(),
             transformer: "model.gguf".into(),

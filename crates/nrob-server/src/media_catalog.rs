@@ -71,6 +71,7 @@ pub(crate) fn read_directory(root: &Path) -> Result<Config, String> {
         default_weights: "gguf".into(),
         image_model: None,
         text_encoder: None,
+        sdxl: None,
     };
     if c.controller_device == c.image_device {
         return Err("image and controller devices must differ".into());
@@ -113,6 +114,30 @@ pub(crate) fn image(c: &Config, selected: Option<&str>) -> Result<Config, String
         snapshot.image_model = Some(name);
     } else if selected.is_some() {
         return Err("image catalog has no named models".into());
+    }
+    match j.get("architecture").and_then(Json::as_str).unwrap_or("qwen-image") {
+        "sdxl" => {
+            let checkpoint = required_path(root, &j, "checkpoint")?;
+            let tokenizer = required_path(root, &j, "tokenizer")?;
+            if !checkpoint.is_file() || !tokenizer.is_file() {
+                return Err("SDXL checkpoint and tokenizer must be files".into());
+            }
+            let mut fields = vec![
+                ("checkpoint".into(), Json::str(checkpoint.to_string_lossy())),
+                ("tokenizer".into(), Json::str(tokenizer.to_string_lossy())),
+            ];
+            for key in ["steps", "cfg", "clip_skip", "sampler", "scheduler", "negative_prompt"] {
+                if let Some(value) = j.get(key) { fields.push((key.into(), value.clone())); }
+            }
+            snapshot.sdxl = Some(Json::Obj(fields));
+            snapshot.safetensors_transformer = Some(checkpoint);
+            snapshot.default_weights = "safetensors".into();
+            snapshot.adapter = None;
+            snapshot.text_encoder = None;
+            return Ok(snapshot);
+        }
+        "qwen-image" => snapshot.sdxl = None,
+        _ => return Err("unsupported image architecture; use qwen-image or sdxl".into()),
     }
     snapshot.text_encoder = optional_path(root, &j, "text_encoder")?;
     snapshot.base = required_path(root, &j, "base")?;
@@ -274,10 +299,19 @@ fn image_models(c: &Config) -> Json {
     Json::Arr(
         entries
             .iter()
-            .map(|(name, _)| {
+            .map(|(name, entry)| {
                 let ready = image(c, Some(name));
                 Json::obj([
                     ("model", Json::str(name)),
+                    ("architecture", entry.get("architecture").cloned().unwrap_or_else(|| Json::str("qwen-image"))),
+                    ("defaults", if entry.get("architecture").and_then(Json::as_str) == Some("sdxl") {
+                        Json::obj([
+                            ("steps", entry.get("steps").cloned().unwrap_or(Json::Int(16))),
+                            ("cfg", entry.get("cfg").cloned().unwrap_or(Json::Num(2.5))),
+                            ("sampler", Json::str("dpmpp_2m")), ("scheduler", Json::str("karras")),
+                            ("clip_skip", entry.get("clip_skip").cloned().unwrap_or(Json::Int(1))),
+                        ])
+                    } else { Json::Null }),
                     ("weights_ready", Json::Bool(ready.is_ok())),
                     ("error", ready.err().map(Json::str).unwrap_or(Json::Null)),
                 ])
