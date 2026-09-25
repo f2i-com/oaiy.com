@@ -22,6 +22,7 @@ pub mod models;
 mod http;
 mod qwen;
 mod orcasaq;
+mod lora;
 mod qwen_cache;
 mod qwen_vision;
 pub mod images;
@@ -87,6 +88,8 @@ pub struct Options {
     /// Vision projectors keyed by model name: GGUF files, or original Qwen
     /// safetensors directories for OrcaSAQ (tools/orcasaq/download.py --vision).
     pub vision_projectors: std::collections::BTreeMap<String, PathBuf>,
+    /// One PEFT adapter directory per Orca model alias.
+    pub lora_adapters: std::collections::BTreeMap<String, PathBuf>,
     /// Which configured model to load at start, by name. `None` takes `name`.
     ///
     /// Only one model is resident, and loading one takes 10 s for GLM-5.3-Flash and
@@ -182,6 +185,7 @@ impl Default for Options {
             name: "deepseek-v4.1-flash".into(),
             extra_models: Vec::new(),
             vision_projectors: std::collections::BTreeMap::new(),
+            lora_adapters: std::collections::BTreeMap::new(),
             start_model: None,
             tools_experts: None,
             ternary_experts: std::collections::BTreeMap::new(),

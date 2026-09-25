@@ -51,7 +51,13 @@ mod runtime_tests {
     #[ignore = "requires downloaded OrcaSAQ and two 32GB CUDA devices"]
     fn real_model_distributed_cache_restores_and_reserves_260000() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models/OrcaSAQ-2-27B");
-        let mut model = load(&path, &[0, 1]).unwrap();
+        let adapter=std::env::var_os("NROB_TEST_LORA").map(|p|crate::lora::Adapter::open(Path::new(&p)).unwrap());
+        let baseline=adapter.as_ref().map(|_| {
+            let base=load(&path,&[0,1]).unwrap();
+            let tokens=base.tokenizer().encode("The capital of France is",false).unwrap();
+            base.forward(&tokens,&mut base.new_kv_cache(260000)).to_host().data().to_vec()
+        });
+        let mut model = load_with_adapter(&path, &[0, 1],adapter.as_ref()).unwrap();
         let vision = if std::env::var_os("NROB_TEST_VISION").is_some() {
             let Model::Qwen35(m)=&model else { unreachable!() };
             Some(crate::qwen_vision::load(&path.join("vision"),m.cache_backends.last().unwrap().clone(),5120).unwrap())
@@ -62,6 +68,11 @@ mod runtime_tests {
             .unwrap();
         let mut kv = model.new_kv_cache(260000);
         let distributed = model.forward(&tokens, &mut kv).to_host();
+        if let Some(baseline)=baseline {
+            let difference=baseline.iter().zip(distributed.data()).map(|(a,b)|(a-b).abs()).fold(0.0f32,f32::max);
+            assert!(difference>1e-3,"nonzero adapter must affect real-model logits");
+            eprintln!("LoRA changes real-model logits: max delta {difference}");
+        }
         let Model::Qwen35(m) = &mut model else {
             unreachable!()
         };
@@ -152,11 +163,12 @@ pub fn detect(path: &Path) -> bool {
     })
 }
 
-struct Loader {
+struct Loader<'a> {
+    lora: Option<&'a crate::lora::Adapter>,
     idx: StIndex,
     backend: Arc<CudaBackend>,
 }
-impl Loader {
+impl Loader<'_> {
     fn tensor(
         &self,
         name: &str,
@@ -222,12 +234,11 @@ impl Loader {
             suh,
             svh,
             tile_words: tw,
-            input_map: input.unwrap_or_else(|| (0..k as u32).collect()),
-            output_map: output.unwrap_or_else(|| (0..n as u32).collect()),
+            input_map: input.clone().unwrap_or_else(|| (0..k as u32).collect()),
+            output_map: output.clone().unwrap_or_else(|| (0..n as u32).collect()),
         };
-        Ok(Weight::Packed(Arc::new(
-            Exl3Matrix::upload(self.backend.clone(), data).map_err(bad)?,
-        )))
+        let base=Weight::Packed(Arc::new(Exl3Matrix::upload(self.backend.clone(), data).map_err(bad)?));
+        if let Some(adapter)=self.lora {adapter.wrap(name,base,self.backend.clone(),input.as_deref(),output.as_deref())} else {Ok(base)}
     }
 }
 
@@ -382,6 +393,9 @@ mod tests {
 }
 
 pub fn load(path: &Path, devices: &[usize]) -> Result<Model> {
+    load_with_adapter(path,devices,None)
+}
+pub(crate) fn load_with_adapter(path: &Path, devices: &[usize], lora:Option<&crate::lora::Adapter>) -> Result<Model> {
     let raw = json(&path.join("config.json"))?;
     if !detect(path) {
         return Err(bad("not a Qwen3.5-family EXL3 checkpoint"));
@@ -458,6 +472,7 @@ pub fn load(path: &Path, devices: &[usize]) -> Result<Model> {
         }
     }
     let l = Loader {
+        lora,
         idx: StIndex::open(path)?,
         backend: backend.clone(),
     };
@@ -522,12 +537,13 @@ pub fn load(path: &Path, devices: &[usize]) -> Result<Model> {
             Some("linear_attention") => {
                 attention_layers.push(false);
                 let a = format!("{p}.linear_attn");
-                let beta = l
-                    .tensor(&format!("{a}.in_proj_b.weight"), &[nv, h], false, Some(&hm))?
-                    .to_host();
-                let alpha = l
-                    .tensor(&format!("{a}.in_proj_a.weight"), &[nv, h], false, Some(&hm))?
-                    .to_host();
+                let dense = |suffix:&str| -> Result<Tensor> {
+                    let name=format!("{a}.{suffix}");
+                    let base=l.tensor(&format!("{name}.weight"), &[nv,h],false,Some(&hm))?;
+                    Ok(if let Some(adapter)=lora {adapter.merge_dense(&name,base,backend.as_ref(),Some(&hm))?} else {base}.to_host())
+                };
+                let beta=dense("in_proj_b")?;
+                let alpha=dense("in_proj_a")?;
                 let ba = Tensor::from_vec([beta.data(), alpha.data()].concat(), vec![2 * nv, h]);
                 let mut av = l.idx.read_f32(&format!("{a}.A_log"))?;
                 if av.len() != nv {
@@ -578,6 +594,7 @@ pub fn load(path: &Path, devices: &[usize]) -> Result<Model> {
             _ => return Err(bad("unsupported layer type")),
         }
     }
+    if let Some(adapter)=lora {adapter.finish()?;}
     let mut attention_index = 0;
     let cache_backends = attention_layers
         .iter()

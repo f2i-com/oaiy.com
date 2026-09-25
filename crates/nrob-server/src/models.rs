@@ -236,6 +236,11 @@ impl Models {
                 return Err(Error::Arg(format!("expert source {name} must name a configured DeepSeek model")));
             }
         }
+        for name in opts.lora_adapters.keys() {
+            if !specs.iter().any(|s| &s.name==name && s.kind==Kind::OrcaSaq) {
+                return Err(Error::Arg(format!("LoRA {name} must name a configured OrcaSAQ model")));
+            }
+        }
         for name in opts.vision_projectors.keys() {
             if !specs.iter().any(|s| &s.name==name && matches!(s.kind,Kind::Gguf | Kind::OrcaSaq)) {
                 return Err(Error::Arg(format!("vision projector {name} must name a configured GGUF or OrcaSAQ model")));
@@ -545,7 +550,9 @@ impl Models {
     fn load_orcasaq(&self, spec: &Spec) -> Result<Live> {
         let o=&self.opts;
         self.say(format!("loading {}: native EXL3 mixed precision",spec.name));
-        let model=crate::orcasaq::load(&spec.path,&o.devices)?;
+        let adapter=o.lora_adapters.get(&spec.name).map(|path|crate::lora::Adapter::open(path)).transpose()?;
+        let model=if let Some(adapter)=&adapter {crate::orcasaq::load_with_adapter(&spec.path,&o.devices,Some(adapter))?} else {crate::orcasaq::load(&spec.path,&o.devices)?};
+        if let Some(adapter)=&adapter {self.say(format!("OrcaSAQ: loaded LoRA for {} text projections",adapter.len()));}
         let tok=Arc::new(model.tokenizer().clone());
         let max_seq=o.ctx.min(model.config().context_length);
         let mut cfg=self.base_cfg(spec,max_seq);
@@ -567,6 +574,7 @@ impl Models {
         if let Some(dir)=&o.prompt_cache {
             let mut fp=disk::fnv(b"orcasaq2-exl3-qwen-state-v1",0);
             fp=disk::fnv(spec.path.as_os_str().as_encoded_bytes(),fp);
+            if let Some(adapter)=&adapter {fp=disk::fnv(&adapter.fingerprint.to_le_bytes(),fp);}
             let mut files:Vec<_>=std::fs::read_dir(&spec.path)?.filter_map(|e|e.ok().map(|e|e.path())).filter(|p|
                 p.extension().is_some_and(|x|x=="safetensors" || x=="json")).collect();
             if let Some(path)=vision_path {

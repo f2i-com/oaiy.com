@@ -179,6 +179,71 @@ card and correctly answered `LEK 427`; neither the filename nor the prompt
 contained that code. Nrob's workspace suite passed 537 tests (93 ignored),
 in addition to the manual full-capacity and release CUDA comparisons.
 
+### Optional LoRA adapters
+
+Native inference supports one PEFT LoRA or rsLoRA adapter per Orca model alias.
+Use an adapter trained for `Qwen/Qwen3.8-27B`, containing
+`adapter_config.json` and `adapter_model.safetensors`. Nrob reads those files
+directly; the packed 3.21-bpw base weights remain unchanged. Adapter matrices
+are held in FP32 on the text GPU. Dropout is disabled for inference, and scaling
+uses `alpha/r` for LoRA or `alpha/sqrt(r)` for rsLoRA.
+
+In the selected project's `.coder-cli/config.toml`:
+
+```toml
+[nrob.lora_adapters]
+'orcasaq-2-27b' = '.coder-cli/adapters/my-adapter'
+```
+
+Workspace paths resolve from the project root. In the shared `settings.toml`,
+relative paths resolve from that settings file's directory. Set the entry to
+an empty string to disable an inherited adapter. A new coder-cli session
+detects changed adapter settings and restarts its daemon when idle. Standalone:
+
+```powershell
+nrob-server --model models/OrcaSAQ-2-27B --name orcasaq-2-27b --devices 0,1 --ctx 260000 --lora orcasaq-2-27b=PATH_TO_ADAPTER
+```
+
+Attention and FFN adapters run as a separate low-rank contribution alongside
+the packed projection. Qwen's recurrent input/output channel permutations are
+also applied to the adapter branch. The small, already-FP32 `in_proj_a/b`
+projections combine their deltas at load time in GPU memory. Vision weights
+remain unchanged. Every adapter tensor must be recognized and consumed:
+unsupported targets or shapes fail loading rather than silently losing part
+of an adapter. DoRA, trained biases, per-layer rank/alpha patterns, embedding
+adapters, `modules_to_save`, and multiple simultaneous adapters are unsupported.
+This implements inference, not adapter training or merging checkpoint files.
+
+Prompt-cache namespaces include the complete adapter config and weight bytes.
+Changing or disabling an adapter cannot reuse a prefix computed by a different
+adapter. Both KV and recurrent states are still saved in the project's cache.
+Quantization can affect adapter quality; an adapter trained on BF16 is not
+guaranteed to reproduce the BF16 model's answers on the compressed checkpoint.
+
+The selected `Qwen3.8-27B-LoRA` was verified at
+revision `00db3147c218504b368bb8eb98d6291c95b5b2e0`. Its 933,975,024-byte weight
+file has SHA-256 `2174bb16b757942f96decb2f4f2cffa0e2ebef5884478be5d2f4f18ade1cd210`.
+It uses rank 64, alpha 32 and rsLoRA (scale 4), spanning 496 text projections.
+CPU/CUDA tests compare adapter outputs and channel permutations with a direct
+dense equation. To test full capacity and checkpoint restoration with an adapter:
+
+```powershell
+$env:NROB_TEST_LORA='PATH_TO_ADAPTER'
+$env:NROB_TEST_VISION='1'
+cargo test --release -p nrob-server real_model_distributed_cache -- --ignored --nocapture
+```
+
+With this adapter active on the two RTX 5090s, 128 generated tokens took
+**4.59 seconds (27.9 tokens/s)** versus about 51 tokens/s without an adapter.
+The additional rank-64 projections across almost every text layer add compute
+and launch overhead. A fresh 609-token image prompt returned `PXH 448` in
+2.89 seconds; repeating it reused 608 tokens and took 0.31 seconds. Its follow-up
+colour question reused 615/638 tokens and correctly answered red. Arithmetic
+and a structured `read_file` tool call also passed. The real-model test verifies
+changed logits, exact cache restoration, and image prefill with all 260K slots
+allocated. Workspace validation passed 541 tests (93 ignored); coder-cli's
+config/provider/bootstrap suites passed 93 tests.
+
 ### Text runtime
 
 - The safetensors configuration selects the native Qwen hybrid runtime.

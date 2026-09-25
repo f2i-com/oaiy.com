@@ -67,6 +67,7 @@ const HELP: &str = "Observer: --observer-model FILE.gguf --observer-device auto|
                        again (default: not kept)
   --prompt-cache-gb F  disk the prompt states may take (default 4)
   --cpu-threads N      CPU threads for experts that miss VRAM (default 24; 0 = off)
+  --lora NAME=DIR             PEFT LoRA/rsLoRA adapter for an Orca model alias
   --vision-projector NAME=PATH  GGUF projector, or original Qwen vision directory for Orca
   --no-vision          skip the vision tower (images are refused)
   --local-images on|off  let requests name image files on this machine (paths,
@@ -126,6 +127,11 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Options, Stri
             // but the arm never landed here, so a direct invocation was told
             // "unknown option --start" while the documented behaviour existed.
             "--start" => a.start_model = Some(val()?),
+            "--lora" => {
+                let value=val()?;
+                let (name,path)=value.split_once('=').filter(|(n,p)|!n.is_empty() && !p.is_empty()).ok_or("--lora wants NAME=DIR")?;
+                a.lora_adapters.insert(name.into(),path.into());
+            }
             "--vision-projector" => {
                 let value=val()?;
                 let (name,path)=value.split_once('=').filter(|(n,p)|!n.is_empty() && !p.is_empty()).ok_or("--vision-projector wants NAME=PATH")?;
