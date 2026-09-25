@@ -5,7 +5,7 @@ code it compiles in from elsewhere: the Unicode data (Unicode licence) behind
 its Python identifier and `\N{...}` name tables. OAIY installs that engine into
 `ui/vendor/zipp-wasm-python/` for its CLI, Desktop and headless server, and
 whatever redistributes it has to carry those notices, so OAIY keeps them here.
-The JavaScript-only web bundle compiles in neither.
+The JavaScript-only web bundle compiles in none of it.
 
 Releases before v0.0.21 also compiled in a fork of the RustPython parser (MIT),
 and these notices carried its licence too. v0.0.21 parses Python with ZIPP's
