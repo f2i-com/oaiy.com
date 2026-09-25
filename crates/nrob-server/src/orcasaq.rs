@@ -17,27 +17,37 @@ fn bad(s: impl Into<String>) -> Error {
 #[cfg(test)]
 mod runtime_tests {
     use super::*;
+    fn model_path() -> std::path::PathBuf {
+        std::env::var_os("NROB_TEST_ORCA").map(std::path::PathBuf::from)
+            .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models/OrcaSAQ-2-27B"))
+    }
     #[test]
     #[ignore = "manual real-model prefill timing/profiling, requires downloaded weights"]
     fn benchmark_real_model_prefill() {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models/OrcaSAQ-2-27B");
-        let model = load(&path, &[0, 1]).unwrap();
+        let path = model_path();
+        let adapter=std::env::var_os("NROB_TEST_LORA").map(|p|crate::lora::Adapter::open(Path::new(&p)).unwrap());
+        let model = load_with_adapter(&path, &[0, 1], adapter.as_ref()).unwrap();
         let token = model.tokenizer().encode("Hello", false).unwrap()[0];
-        let tokens = vec![token; crate::qwen::PREFILL_CHUNK];
-        for run in 0..4 {
+        let sizes = std::env::var("NROB_BENCH_PREFILL_SIZES").ok().map(|s|s.split(',').map(|n|n.parse::<usize>().unwrap()).collect::<Vec<_>>())
+            .unwrap_or_else(||vec![crate::qwen::PREFILL_CHUNK]);
+        for size in sizes {
+          let tokens = vec![token; size];
+          for run in 0..2 {
             let mut kv = model.new_kv_cache(260000);
             let start = std::time::Instant::now();
             let logits = model.forward(&tokens, &mut kv).to_host();
             assert!(logits.data().iter().all(|v| v.is_finite()));
             eprintln!("prefill run {run}: {} tokens in {:.3}s", tokens.len(), start.elapsed().as_secs_f64());
+          }
         }
     }
     #[test]
     #[ignore = "manual real-model decode timing/profiling, requires downloaded weights"]
     fn benchmark_real_model_decode() {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models/OrcaSAQ-2-27B");
+        let path = model_path();
         let devices: &[usize] = if std::env::var_os("NROB_BENCH_LOCAL_KV").is_some() { &[0] } else { &[0, 1] };
-        let model = load(&path, devices).unwrap();
+        let adapter=std::env::var_os("NROB_TEST_LORA").map(|p|crate::lora::Adapter::open(Path::new(&p)).unwrap());
+        let model = load_with_adapter(&path, devices, adapter.as_ref()).unwrap();
         let mut kv = model.new_kv_cache(260000);
         let token = model.tokenizer().encode("Hello", false).unwrap()[0];
         for _ in 0..16 { let _ = model.forward(&[token], &mut kv).to_host(); }
@@ -50,7 +60,7 @@ mod runtime_tests {
     #[test]
     #[ignore = "requires downloaded OrcaSAQ and two 32GB CUDA devices"]
     fn real_model_distributed_cache_restores_and_reserves_260000() {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models/OrcaSAQ-2-27B");
+        let path = model_path();
         let adapter=std::env::var_os("NROB_TEST_LORA").map(|p|crate::lora::Adapter::open(Path::new(&p)).unwrap());
         let baseline=adapter.as_ref().map(|_| {
             let base=load(&path,&[0,1]).unwrap();
@@ -94,6 +104,7 @@ mod runtime_tests {
         m.cache_backends = placement;
         let snap =
             crate::qwen_cache::Snapshot::capture(&kv, &m.attention_layers, m.backend.as_ref());
+        let recurrent = crate::qwen_cache::RecurrentSnapshot::capture(&kv);
         let next = model.forward(&tokens[..1], &mut kv).to_host();
         let Model::Qwen35(m) = &model else {
             unreachable!()
@@ -106,6 +117,10 @@ mod runtime_tests {
             restored.data(),
             "restored recurrence and both GPUs must match"
         );
+        let Model::Qwen35(m) = &model else { unreachable!() };
+        recurrent.restore(&mut kv, snap.pos, &m.attention_layers, m.ssm_cfg, m.backend.as_ref()).unwrap();
+        let rewound = model.forward(&tokens[..1], &mut kv).to_host();
+        assert_eq!(next.data(), rewound.data(), "recurrent-only rewind must preserve exact real-model logits");
         let Model::Qwen35(m) = &model else {
             unreachable!()
         };

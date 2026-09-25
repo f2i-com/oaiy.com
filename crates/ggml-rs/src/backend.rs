@@ -147,6 +147,14 @@ pub trait Backend: Send + Sync + Debug + 'static {
     /// `x` shape: `[..., in]`. `w` shape: `[out, in]`. Result: `[..., out]`.
     fn linear(&self, x: &Tensor, w: &Tensor) -> Tensor;
 
+    /// VENDORED-LOCAL: add an unquantized low-rank adapter to a projection.
+    /// Backends may fuse the update without materializing a full-size delta.
+    fn add_lora(&self, y: &mut Tensor, x: &Tensor, a: &Tensor, b: &Tensor) {
+        let low = self.linear(x, a);
+        let delta = self.linear(&low, b);
+        self.add_inplace(y, &delta);
+    }
+
     /// Same as `linear` but `w` is in packed quantized form. The default
     /// implementation dequantizes `w` to F32 and calls `linear`. GPU backends
     /// should override with a kernel that reads the packed bytes directly,

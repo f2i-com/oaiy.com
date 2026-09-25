@@ -10,6 +10,32 @@ pub struct Snapshot {
     layers: Vec<[Option<Tensor>; 4]>, // K, V, delta-net, convolution
 }
 
+/// Conversation checkpoints reuse the append-only attention prefix already on
+/// the GPUs. Only recurrent/conv state needs a separate copy at each boundary.
+/// Unlike a disk snapshot, this is usable only while that prefix is still live.
+pub struct RecurrentSnapshot(Snapshot);
+
+impl RecurrentSnapshot {
+    pub fn from_snapshot(snapshot: &Snapshot) -> Self {
+        Self(Snapshot { pos: snapshot.pos, layers: snapshot.layers.iter()
+            .map(|layer| [None, None, layer[2].clone(), layer[3].clone()]).collect() })
+    }
+    pub fn capture(kv: &KvCache) -> Self {
+        Self(Snapshot { pos: kv.len, layers: kv.ssm_state.iter().zip(&kv.ssm_conv)
+            .map(|(s,c)| [None, None, s.as_ref().map(Tensor::to_host), c.as_ref().map(Tensor::to_host)])
+            .collect() })
+    }
+    pub fn bytes(&self) -> usize {
+        self.0.layers.iter().flatten().flatten().map(|t| t.numel()*4).sum()
+    }
+    pub fn restore(&self, kv: &mut KvCache, common_prefix: usize, attention: &[bool], ssm: SsmConfig, backend: &dyn Backend) -> Result<(), String> {
+        if self.0.pos > common_prefix || self.0.pos > kv.len {
+            return Err("Qwen recurrent checkpoint no longer has a live attention prefix".into());
+        }
+        self.0.restore_inner(kv, attention, ssm, backend, true)
+    }
+}
+
 impl Snapshot {
     pub fn capture(kv: &KvCache, attention: &[bool], backend: &dyn Backend) -> Self {
         let layers = attention.iter().enumerate().map(|(i, &attn)| {
@@ -26,6 +52,10 @@ impl Snapshot {
     }
 
     pub fn restore(&self, kv: &mut KvCache, attention: &[bool], ssm: SsmConfig, backend: &dyn Backend) -> Result<(), String> {
+        self.restore_inner(kv, attention, ssm, backend, false)
+    }
+
+    fn restore_inner(&self, kv: &mut KvCache, attention: &[bool], ssm: SsmConfig, backend: &dyn Backend, reuse_attention: bool) -> Result<(), String> {
         if self.pos == 0 || self.pos > kv.max_len || self.layers.len() != attention.len() {
             return Err("incompatible Qwen checkpoint dimensions".into());
         }
@@ -33,7 +63,9 @@ impl Snapshot {
         let conv = 2 * ssm.state_size * ssm.group_count + ssm.inner_size;
         // Validate every tensor before touching the live state.
         for (i, (layer, &attn)) in self.layers.iter().zip(attention).enumerate() {
-            let expected = if attn {
+            let expected = if attn && reuse_attention {
+                [None, None, None, None]
+            } else if attn {
                 let shape = vec![self.pos, kv.n_kv_heads_per_layer[i], kv.head_dims[i]];
                 [Some(shape.clone()), Some(shape), None, None]
             } else {
@@ -43,7 +75,7 @@ impl Snapshot {
                 return Err("incompatible Qwen checkpoint tensor shape".into());
             }
         }
-        kv.reset();
+        if !reuse_attention { kv.reset(); }
         for (i, layer) in self.layers.iter().enumerate() {
             if let (Some(k), Some(v)) = (&layer[0], &layer[1]) {
                 let placed = kv.layer_backends.get(i).cloned();
@@ -140,6 +172,31 @@ impl crate::disk::PromptState for Arc<Snapshot> {
 mod tests {
     use super::*;
     use crate::disk::PromptState;
+
+    #[test]
+    fn recurrent_checkpoint_rewinds_live_attention_but_rejects_overwritten_prefix() {
+        let backend = ggml_rs::CpuBackend::new();
+        let mut kv = KvCache::new(&backend, 2, 16, 1, 2);
+        kv.len = 3;
+        kv.k[0].data_mut()[..6].fill(2.0);
+        kv.v[0].data_mut()[..6].fill(3.0);
+        kv.ssm_state[1] = Some(Tensor::from_vec(vec![4.0; 4], vec![1, 2, 2]));
+        kv.ssm_conv[1] = Some(Tensor::from_vec(vec![5.0; 12], vec![2, 6]));
+        let snap = RecurrentSnapshot::capture(&kv);
+        assert_eq!(snap.bytes(), 64, "attention storage is not copied into RAM checkpoints");
+        kv.len = 7;
+        kv.ssm_state[1].as_mut().unwrap().data_mut().fill(99.0);
+        let config = SsmConfig { conv_kernel: 3, group_count: 1, inner_size: 2, state_size: 2, time_step_rank: 1 };
+        assert!(snap.restore(&mut kv, 2, &[true, false], config, &backend).is_err());
+        assert_eq!(kv.len, 7);
+        assert_eq!(kv.ssm_state[1].as_ref().unwrap().data(), &[99.0; 4]);
+        snap.restore(&mut kv, 3, &[true, false], config, &backend).unwrap();
+        assert_eq!(kv.len, 3);
+        assert_eq!(&kv.k[0].data()[..6], &[2.0; 6]);
+        assert_eq!(&kv.v[0].data()[..6], &[3.0; 6]);
+        assert_eq!(kv.ssm_state[1].as_ref().unwrap().data(), &[4.0; 4]);
+        assert_eq!(kv.ssm_conv[1].as_ref().unwrap().data(), &[5.0; 12]);
+    }
 
     #[test]
     fn lazy_growth_and_restore_preserve_prefix() {

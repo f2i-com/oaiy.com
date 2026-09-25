@@ -338,9 +338,7 @@ impl PackedLinear for LoraLinear {
     }
     fn linear(&self, x: &Tensor) -> Tensor {
         let mut y = self.base.linear(self.backend.as_ref(), x);
-        let low = self.backend.linear(x, &self.a);
-        let delta = self.backend.linear(&low, &self.b);
-        self.backend.add_inplace(&mut y, &delta);
+        self.backend.add_lora(&mut y, x, &self.a, &self.b);
         y
     }
 }

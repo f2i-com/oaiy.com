@@ -3,8 +3,7 @@ use std::sync::{mpsc::Receiver, atomic::Ordering};
 use dsv41::chat::{Encoded, Mode, Options, DSML};
 use ggml_rs::Tensor;
 use std::sync::Arc;
-use crate::qwen_cache::Snapshot;
-use crate::disk::PromptState;
+use crate::qwen_cache::{Snapshot, RecurrentSnapshot};
 use llama_rs::{Model, MmProj, MmProjConfig, KvCache};
 use nrob::json::Json;
 use crate::engine::{Event, Finish, ImagePrep, Job, JobImage, sample};
@@ -140,6 +139,39 @@ pub fn normalize(text: &str, tools: &[Json]) -> Result<String, String> {
     Ok(out)
 }
 
+/// Stream prose and reasoning as tokens arrive. Native tool XML stays buffered
+/// until the existing strict parser validates the complete call. A token may
+/// end halfway through a UTF-8 character or the opening tool tag.
+#[derive(Default)]
+struct NativeStream { sent: String, tool_sent: String }
+
+impl NativeStream {
+    fn tool_preview(&mut self, decoded: &str) -> Result<Option<(String, bool)>, String> {
+        let Some(at) = decoded.find("<tool_call>") else { return Ok(None) };
+        let draft = decoded[at..].trim_end_matches('\u{fffd}');
+        let delta = draft.strip_prefix(&self.tool_sent).ok_or("Qwen tool preview changed after streaming")?;
+        if delta.is_empty() { return Ok(None); }
+        let update = (delta.to_owned(), self.tool_sent.is_empty());
+        self.tool_sent = draft.to_owned();
+        Ok(Some(update))
+    }
+
+    fn push(&mut self, decoded: &str, tools: &[Json], complete: bool) -> Result<String, String> {
+        let text = if complete { normalize(decoded, tools)? } else {
+            if decoded.contains(DSML) { return Err("unexpected DSML in Qwen output".into()); }
+            const TAG: &str = "<tool_call>";
+            let end = decoded.find("<tool_call").unwrap_or_else(|| {
+                let held = (1..TAG.len()).rev().find(|&n| decoded.ends_with(&TAG[..n])).unwrap_or(0);
+                decoded.len()-held
+            });
+            decoded[..end].trim_end_matches('\u{fffd}').to_owned()
+        };
+        let delta = text.strip_prefix(&self.sent).ok_or("Qwen decoded text changed after streaming")?.to_owned();
+        self.sent = text;
+        Ok(delta)
+    }
+}
+
 pub fn prepare_images(records: &[Json], prompt: Vec<u32>, image_id: u32, cfg: &MmProjConfig, local: bool, max_seq: usize) -> Result<(Vec<u32>, Vec<JobImage>), String> {
     let count = prompt.iter().filter(|&&t| t == image_id).count();
     if count != records.len() { return Err("image placeholder count does not match image blocks".into()); }
@@ -165,7 +197,7 @@ pub struct QwenEngine {
     covered: Vec<u64>,
     vision_cache: std::collections::VecDeque<(u64, Tensor)>,
     log: bool,
-    checkpoints: Vec<(Vec<u64>, Arc<Snapshot>, bool)>,
+    checkpoints: Vec<(Vec<u64>, RecurrentSnapshot, bool)>,
     pub disk: Option<crate::disk::DiskCache<Arc<Snapshot>>>,
     /// Only enable when the disk namespace fingerprints the vision pipeline.
     pub image_disk_cache: bool,
@@ -189,29 +221,42 @@ impl QwenEngine {
         let (positions, mut next_position) = positions(job)?;
         let mut keys: Vec<_> = job.prompt.iter().map(|&t| t as u64).collect();
         for image in &job.images { for (offset,k) in keys[image.start..image.start+image.prep.n_tokens()].iter_mut().enumerate() { *k = image.hash.rotate_left(17) ^ (offset as u64) ^ (1<<63); } }
+        let stops = checkpoint_positions(&job.prompt, model.tokenizer.token_id("<|im_start|>"));
+        let cache_clock = std::time::Instant::now();
         let common = self.covered.iter().zip(&keys).take_while(|(a,b)| a==b).count();
+        // An attention suffix overwritten by a different branch cannot support
+        // a recurrent-only checkpoint, even if a later request matches its keys.
+        self.checkpoints.retain(|(saved,_,_)| saved.len() <= common && keys.starts_with(saved));
         let mut start = if common == self.covered.len() && common < keys.len() { common } else { 0 };
         let mut source = if start > 0 { "memory" } else { "none" };
         if let Some((saved, snap, _)) = self.checkpoints.iter().filter(|(saved, _, _)|
             saved.len() > start && saved.len() < keys.len() && keys.starts_with(saved)
         ).max_by_key(|(saved, _, _)| saved.len()) {
-            snap.restore(&mut self.kv, &model.attention_layers, model.ssm_cfg, model.backend.as_ref())?;
+            snap.restore(&mut self.kv, common, &model.attention_layers, model.ssm_cfg, model.backend.as_ref())?;
             self.covered = saved.clone(); start = saved.len(); source = "checkpoint";
+            self.checkpoints.retain(|(saved,_,_)| saved.len() <= start);
         }
         // Persist images only when the caller identifies both the projector and
         // preprocessing version. The prompt keys also include the image bytes.
         if job.images.is_empty() || self.image_disk_cache {
             if let Some((saved, snap)) = self.disk.as_mut().and_then(|d| d.load_best(&keys, keys.len()-1, start, self.log)) {
                 match snap.restore(&mut self.kv, &model.attention_layers, model.ssm_cfg, model.backend.as_ref()) {
-                    Ok(()) => { self.covered = saved; start = snap.pos; source = "disk"; }
+                    Ok(()) => {
+                        // A disk restore replaces the attention buffers. Even
+                        // matching token keys may have different rounding from
+                        // another batching history, so old recurrent-only states
+                        // must not be mixed with this attention snapshot.
+                        self.checkpoints.clear();
+                        self.checkpoints.push((saved.clone(), RecurrentSnapshot::from_snapshot(&snap), stops.first() == Some(&snap.pos)));
+                        self.covered = saved; start = snap.pos; source = "disk";
+                    }
                     Err(e) => { if self.log { eprintln!("Qwen checkpoint skipped: {e}"); } }
                 }
             }
         }
-        if start == 0 { self.kv.reset(); self.covered.clear(); }
+        if start == 0 { self.kv.reset(); self.covered.clear(); self.checkpoints.clear(); }
         let _ = job.events.send(Event::CacheReuse { cached: start, source, common });
-        if self.log { eprintln!("  Qwen cache: {start}/{} tokens from {source} (common {common})", keys.len()); }
-        let stops = checkpoint_positions(&job.prompt, model.tokenizer.token_id("<|im_start|>"));
+        if self.log { eprintln!("  Qwen cache: {start}/{} tokens from {source} (common {common}) in {:.3}s", keys.len(), cache_clock.elapsed().as_secs_f64()); }
         let total = keys.len()-start;
         let _ = job.events.send(Event::Progress { done: 0, total });
         let clock = std::time::Instant::now();
@@ -247,19 +292,20 @@ impl QwenEngine {
             pos = end;
             if stops.contains(&pos) && !self.checkpoints.iter().any(|(saved, _, _)| saved == &keys[..pos]) {
                 if self.log { eprintln!("  Qwen checkpoint: {pos} tokens; disk={}", self.disk.is_some()); }
-                let snap = Arc::new(Snapshot::capture(&self.kv, &model.attention_layers, model.backend.as_ref()));
                 let base = stops.first() == Some(&pos);
                 if job.images.is_empty() || self.image_disk_cache {
-                    if let Some(disk) = &mut self.disk { disk.save(keys[..pos].to_vec(), Arc::clone(&snap), base); }
+                    if let Some(disk) = &mut self.disk {
+                        if !disk.has(&keys[..pos]) {
+                            let snap = Arc::new(Snapshot::capture(&self.kv, &model.attention_layers, model.backend.as_ref()));
+                            disk.save(keys[..pos].to_vec(), snap, base);
+                        }
+                    }
                 }
+                let snap = RecurrentSnapshot::capture(&self.kv);
                 self.checkpoints.push((keys[..pos].to_vec(), snap, base));
                 // Keep the system prefix plus recent conversation boundaries.
                 // Host storage avoids competing with media for VRAM.
-                while self.checkpoints.len() > 1 && (self.checkpoints.len() > 3 ||
-                    self.checkpoints.iter().map(|(_, s, _)| s.encoded_len()).sum::<usize>() > 1024 * 1024 * 1024) {
-                    let remove = (0..self.checkpoints.len()-1).min_by_key(|&i| (self.checkpoints[i].2, i)).unwrap();
-                    self.checkpoints.remove(remove);
-                }
+                trim_checkpoints(&mut self.checkpoints);
             }
         }
         let prefill_secs = clock.elapsed().as_secs_f64();
@@ -270,6 +316,7 @@ impl QwenEngine {
         let think_end = tok.token_id("</think>");
         let mut thinking = job.think_budget.is_some();
         let mut generated = Vec::new(); let mut think_used = 0usize;
+        let mut stream = NativeStream::default();
         let mut rng = job.sampling.seed ^ 0x9E3779B97F4A7C15;
         let mut logits = logits.unwrap();
         let mut finish = Finish::Length;
@@ -279,7 +326,19 @@ impl QwenEngine {
             if thinking && job.think_budget.is_some_and(|n|think_used >= n) { if let Some(end) = think_end { next = end; } }
             if next == eos || Some(next) == tok.eos() { finish = Finish::Stop; break; }
             generated.push(next);
-            if thinking { think_used += 1; if Some(next)==think_end { thinking=false; } }
+            let decoded = tok.decode(&generated);
+            let delta = stream.push(&decoded, &job.tools, false)?;
+            if !delta.is_empty() { let _ = job.events.send(Event::Text(delta)); }
+            if let Some((text,start)) = stream.tool_preview(&decoded)? {
+                let _ = job.events.send(Event::ToolPreview { text, start });
+            }
+            if thinking {
+                think_used += 1;
+                if Some(next)==think_end {
+                    thinking=false;
+                    let _ = job.events.send(Event::Thinking { used: think_used, budget: job.think_budget, done: true });
+                }
+            }
             if thinking && generated.len() % 16 == 0 { let _ = job.events.send(Event::Thinking { used: think_used, budget: job.think_budget, done: false }); }
             let embeds = model.embed_text(&[next]);
             logits = model.forward_embeds_positions(&embeds,1,&mut self.kv,(!job.images.is_empty()).then_some(&[[next_position;3]])).map_err(|e|e.to_string())?.to_host();
@@ -287,11 +346,19 @@ impl QwenEngine {
             self.covered.push(next as u64);
         }
         let raw = tok.decode(&generated);
-        let text = normalize(&raw, &job.tools)?;
+        let text = stream.push(&raw, &job.tools, true)?;
         if self.log { eprintln!("  Qwen: {} prompt tokens ({} cached) in {:.2}s; {} generated in {:.2}s", job.prompt.len(),start,prefill_secs,generated.len(),decode_clock.elapsed().as_secs_f64()); }
-        let _ = job.events.send(Event::Text(text));
+        if !text.is_empty() { let _ = job.events.send(Event::Text(text)); }
         let _ = job.events.send(Event::Done { finish, completion_tokens: generated.len() });
         Ok(())
+    }
+}
+
+fn trim_checkpoints(checkpoints: &mut Vec<(Vec<u64>, RecurrentSnapshot, bool)>) {
+    while checkpoints.len() > 1 && (checkpoints.len() > 3 ||
+        checkpoints.iter().map(|(_, s, _)| s.bytes()).sum::<usize>() > 1024 * 1024 * 1024) {
+        let remove = (0..checkpoints.len()-1).min_by_key(|&i| (checkpoints[i].2, i)).unwrap();
+        checkpoints.remove(remove);
     }
 }
 
@@ -324,6 +391,39 @@ fn positions(job: &Job) -> Result<(Vec<[u32;3]>,u32),String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_stream_releases_reasoning_and_prose_before_completion() {
+        let mut stream = NativeStream::default();
+        let mut parser = dsv41::chat::StreamParser::new(Mode::Thinking);
+        let first = stream.push("Let me check", &[], false).unwrap();
+        assert!(matches!(&parser.push(&first)[..], [dsv41::chat::Delta::Reasoning(t)] if t == "Let me check"));
+        let next = stream.push("Let me check</think>Hello", &[], false).unwrap();
+        assert!(parser.push(&next).iter().any(|d| matches!(d,dsv41::chat::Delta::Content(t) if t == "Hello")));
+        assert!(stream.push("Let me check</think>Hello", &[], true).unwrap().is_empty());
+        let mut utf8 = NativeStream::default();
+        assert_eq!(utf8.push("Hi \u{fffd}", &[], false).unwrap(), "Hi ");
+        assert_eq!(utf8.push("Hi 😀", &[], false).unwrap(), "😀");
+    }
+
+    #[test]
+    fn native_stream_never_exposes_partial_or_invalid_tool_calls() {
+        let raw = "Checking. <tool_call>\n<function=computer>\n<parameter=action>\nkeyboard_sequence\n</parameter>\n<parameter=keys>\n[]\n</parameter>\n</function>\n</tool_call>";
+        let mut stream = NativeStream::default();
+        let mut emitted = String::new();
+        for end in 1..=raw.len() { emitted.push_str(&stream.push(&raw[..end], &tools(), false).unwrap()); }
+        assert_eq!(emitted, "Checking. ");
+        let (preview,start) = stream.tool_preview(raw).unwrap().unwrap();
+        assert!(start && preview.starts_with("<tool_call>"));
+        assert!(stream.tool_preview(raw).unwrap().is_none());
+        emitted.push_str(&stream.push(raw, &tools(), true).unwrap());
+        assert_eq!(emitted, normalize(raw, &tools()).unwrap());
+        for invalid in [raw.replace("function=computer", "function=unknown"), raw.replace("</tool_call>", "")] {
+            let mut stream = NativeStream::default();
+            assert_eq!(stream.push(&invalid, &tools(), false).unwrap(), "Checking. ");
+            assert!(stream.push(&invalid, &tools(), true).is_err());
+        }
+    }
+
     #[test]
     fn checkpoints_survive_changed_assistant_suffix_and_leave_logits_token() {
         // 1 is im_start; later reasoning and tool XML need not match.

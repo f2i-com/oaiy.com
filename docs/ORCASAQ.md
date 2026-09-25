@@ -228,12 +228,13 @@ CPU/CUDA tests compare adapter outputs and channel permutations with a direct
 dense equation. To test full capacity and checkpoint restoration with an adapter:
 
 ```powershell
+$env:NROB_TEST_ORCA='E:/models/OrcaSAQ-2-27B' # optional override for relocated weights
 $env:NROB_TEST_LORA='PATH_TO_ADAPTER'
 $env:NROB_TEST_VISION='1'
 cargo test --release -p nrob-server real_model_distributed_cache -- --ignored --nocapture
 ```
 
-With this adapter active on the two RTX 5090s, 128 generated tokens took
+With the initial adapter implementation on the two RTX 5090s, 128 generated tokens took
 **4.59 seconds (27.9 tokens/s)** versus about 51 tokens/s without an adapter.
 The additional rank-64 projections across almost every text layer add compute
 and launch overhead. A fresh 609-token image prompt returned `PXH 448` in
@@ -243,6 +244,23 @@ and a structured `read_file` tool call also passed. The real-model test verifies
 changed logits, exact cache restoration, and image prefill with all 260K slots
 allocated. Workspace validation passed 541 tests (93 ignored); coder-cli's
 config/provider/bootstrap suites passed 93 tests.
+
+The decode adapter now uses two CUDA kernels: a split reduction for A*x, then
+a fused B*(A*x) and addition into the base projection. This removes intermediate
+output tensors and redundant clears. Original FP32 adapter values and rsLoRA
+scaling are preserved; batched prefill retains the dense matrix implementation.
+CPU/CUDA tests cover rank and dimension tails, batches and nonzero base outputs.
+On the same approximately 5,600-token prompt, the identical 111-token reply improved
+from 7.02 to 5.81 seconds (15.8 to 19.1 tokens/s). Short arithmetic reasoning
+replies generated 51 tokens in 1.36–1.52 seconds (33.6–37.5 tokens/s). These are measured
+decode times, not a claim of 50 tokens/s with the adapter or at longer contexts.
+
+Replies and reasoning now stream during generation. In the conversation test,
+the first visible text arrived in 1.48 seconds after a fresh read-ahead; the previous
+implementation held it until the entire 8.8-second request completed. An identical
+retry using a RAM checkpoint began streaming in 0.13 seconds. Thinking
+is emitted as `reasoning_content` when enabled. Native tool XML is previewed as
+an inert draft and becomes an executable API call only after full validation.
 
 ### Text runtime
 
@@ -268,14 +286,20 @@ config/provider/bootstrap suites passed 93 tests.
 - The checkpoint tokenizer uses NFC normalization, combining-mark-aware words
   and individual digits. Its 140-case test corpus matches Hugging Face tokenizers.
 - Text, reasoning, XML function calls, model switching and Qwen prompt caching
-  use the existing server API. This checkpoint is text-only. Vision and MTP
-  speculative decoding are not implemented for this loader.
+  use the existing server API. The published checkpoint is text-only; the
+  separately configured original vision tower supplies image support above.
+  MTP speculative decoding is not implemented for this loader.
 - The configured **260,000-token context** is below the architecture's 262,144
   limit. FP32 KV buffers grow on demand and attention layers are distributed
   across the configured GPUs. Full capacity is about 34.08 GB total, plus
   weights, recurrent state and scratch. Split-K attention bounds scratch
   without replicating GQA keys/values. Smaller `--ctx` values are respected.
-- Prompt reuse restores attention, delta-net and convolution state together.
+- RAM checkpoints save delta-net and convolution state while reusing the matching
+  attention prefix already resident on the GPUs. A divergent or overwritten
+  prefix invalidates these lightweight checkpoints before any restore. Three
+  recent boundaries fit below the existing 1 GiB RAM cap; the old full snapshots
+  approached that cap individually at about 6,500 tokens, evicting useful state.
+  Disk restores include attention and are promoted into RAM for later requests.
   Matching prefixes remain in memory and on disk; a changed suffix may need
   replaying. Project checkpoints stream to/from disk without a second complete
   byte copy, and writer backpressure bounds pending snapshots. At 260K a

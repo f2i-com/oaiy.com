@@ -814,6 +814,44 @@ impl Backend for CudaBackend {
         self.make_tensor(c, shape)
     }
 
+    // VENDORED-LOCAL: eliminate two output allocations, their zero fills, and
+    // a separate add for each decode-time adapter. Prefill retains cuBLAS GEMM.
+    fn add_lora(&self, y: &mut Tensor, x: &Tensor, a: &Tensor, b: &Tensor) {
+        let k = a.dim(1);
+        let rank = a.dim(0);
+        let n = b.dim(0);
+        if x.numel() != k || rank > 1024 {
+            let low = self.linear(x, a);
+            let delta = self.linear(&low, b);
+            self.add_inplace(y, &delta);
+            return;
+        }
+        assert_eq!(b.shape(), &[n, rank]);
+        assert_eq!(y.numel(), n);
+        let input = self.cuda_input(x);
+        let down = self.cuda_input(a);
+        let up = self.cuda_input(b);
+        let output = self.cuda_input_mut(y);
+        let splits = k.div_ceil(1024).clamp(1, 16);
+        let (ki, ri, ni, si) = (k as i32, rank as i32, n as i32, splits as i32);
+        // SAFETY: the down kernel writes every rank*splits element, then the
+        // up kernel reads it on the same ordered stream. Output is initialized
+        // by the base projection; all tensors outlive both launches.
+        unsafe {
+            let mut partial = self.stream.alloc::<f32>(rank*splits).expect("LoRA scratch");
+            self.stream.launch_builder(self.func("lora_down_f32"))
+                .arg(input.as_ref()).arg(down.as_ref()).arg(&mut partial)
+                .arg(&ki).arg(&ri).arg(&si)
+                .launch(LaunchConfig { grid_dim: (rank as u32, splits as u32, 1), block_dim: (256,1,1), shared_mem_bytes: 0 })
+                .expect("LoRA down projection");
+            self.stream.launch_builder(self.func("lora_up_add_f32"))
+                .arg(&partial).arg(up.as_ref()).arg(output)
+                .arg(&ni).arg(&ri).arg(&si)
+                .launch(LaunchConfig { grid_dim: (n.div_ceil(4) as u32,1,1), block_dim: (128,1,1), shared_mem_bytes: (rank*4) as u32 })
+                .expect("LoRA up projection and add");
+        }
+    }
+
     fn linear_q(&self, x: &Tensor, w: &QuantizedTensor) -> Tensor {
         let in_ = x.dim(x.rank() - 1);
         let out = w.dim(0);

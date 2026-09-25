@@ -53,6 +53,24 @@ fn deterministic_floats(n: usize, scale: f32, seed: u64) -> Vec<f32> {
     out
 }
 
+// VENDORED-LOCAL: rank/tail/split coverage plus the batched fallback; compare
+// against the unfused CPU equation, including a nonzero base projection.
+#[test]
+fn lora_update_matches_cpu_with_rank_and_dimension_tails() {
+    let Some(cuda) = try_cuda() else { return };
+    let cpu = CpuBackend::new();
+    for (m,k,n,r) in [(1,513,137,7),(1,5120,5120,64),(1,17408,5120,64),(1,97,131,128),(3,81,67,5)] {
+        let x = Tensor::from_vec(deterministic_floats(m*k,0.5,11),vec![m,k]);
+        let a = Tensor::from_vec(deterministic_floats(r*k,0.1,12),vec![r,k]);
+        let b = Tensor::from_vec(deterministic_floats(n*r,0.1,13),vec![n,r]);
+        let mut expected = Tensor::from_vec(deterministic_floats(m*n,0.5,14),vec![m,n]);
+        let mut actual = cuda.to_device(expected.clone());
+        cpu.add_lora(&mut expected,&x,&a,&b);
+        cuda.add_lora(&mut actual,&cuda.to_device(x),&cuda.to_device(a),&cuda.to_device(b));
+        assert_tensors_close(&actual,&expected,2e-5);
+    }
+}
+
 // VENDORED-LOCAL: partial/interleaved image positions, including a long-context
 // offset. Unrotated head dimensions must remain exactly unchanged.
 #[test]

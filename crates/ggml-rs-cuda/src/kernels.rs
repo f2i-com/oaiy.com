@@ -6,6 +6,39 @@
 //! don't shuttle every op through host memory.
 
 pub const KERNEL_SRC: &str = r#"
+// VENDORED-LOCAL: two-pass LoRA decode. Split A*x across the card, then
+// reduce its tiny partials and add B*(A*x) directly to the packed projection.
+extern "C" __global__ void lora_down_f32(
+    const float* x, const float* a, float* partial, int k, int rank, int splits) {
+    int row=blockIdx.x, split=blockIdx.y, tid=threadIdx.x;
+    float sum=0.f;
+    for(int i=split*blockDim.x+tid;i<k;i+=splits*blockDim.x) sum+=x[i]*a[row*k+i];
+    for(int d=16;d>0;d>>=1) sum+=__shfl_down_sync(0xffffffff,sum,d);
+    __shared__ float warps[8];
+    if((tid&31)==0) warps[tid/32]=sum;
+    __syncthreads();
+    if(tid<32) {
+        sum=tid<8?warps[tid]:0.f;
+        for(int d=16;d>0;d>>=1) sum+=__shfl_down_sync(0xffffffff,sum,d);
+        if(tid==0) partial[row*splits+split]=sum;
+    }
+}
+extern "C" __global__ void lora_up_add_f32(
+    const float* partial, const float* b, float* y, int n, int rank, int splits) {
+    extern __shared__ float low[];
+    for(int i=threadIdx.x;i<rank;i+=blockDim.x) {
+        float v=0.f;
+        for(int s=0;s<splits;++s) v+=partial[i*splits+s];
+        low[i]=v;
+    }
+    __syncthreads();
+    int row=blockIdx.x*4+threadIdx.x/32, lane=threadIdx.x&31;
+    float sum=0.f;
+    if(row<n) for(int i=lane;i<rank;i+=32) sum+=b[row*rank+i]*low[i];
+    for(int d=16;d>0;d>>=1) sum+=__shfl_down_sync(0xffffffff,sum,d);
+    if(row<n && lane==0) y[row]+=sum;
+}
+
 // VENDORED-LOCAL: a warp owns one 128-wide recurrent state row. Coalesced
 // state access and four registers per lane replace a serial 128-element dot
 // product and block barriers at every token. Normalization follows separately
@@ -2882,6 +2915,8 @@ __global__ void moe_reduce_slots_f32(const float* __restrict__ partial,
 "#;
 
 pub const KERNEL_NAMES: &[&str] = &[
+    "lora_down_f32",
+    "lora_up_add_f32",
     "rope_axes_f32",
     "exl3_had", "exl3_had_reduce", "exl3_reconstruct", "exl3_tile_32", "exl3_tile_48", "exl3_tile_56", "exl3_tile_64", "exl3_tile_96",
     "exl3_gemv_generic", "exl3_gemv_32", "exl3_gemv_48", "exl3_gemv_56", "exl3_gemv_64", "exl3_gemv_96",
