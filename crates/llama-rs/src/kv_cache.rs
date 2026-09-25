@@ -8,9 +8,12 @@
 //! good GPU perf, since it eliminates two ops (slice + repeat_kv) per layer.
 
 use ggml_rs::{Backend, Tensor};
+use std::sync::Arc;
 
 #[derive(Debug)]
 pub struct KvCache {
+    /// VENDORED-LOCAL: optional per-layer placement. These caches grow as tokens arrive.
+    pub layer_backends: Vec<Arc<dyn Backend>>,
     pub k:           Vec<Tensor>,
     pub v:           Vec<Tensor>,
     pub len:         usize,
@@ -86,6 +89,7 @@ impl KvCache {
         // sees a safe upper bound. The per-layer source-of-truth is the vec.
         let n_kv_max = n_kv_heads_per_layer.iter().copied().max().unwrap_or(0);
         Self {
+            layer_backends: Vec::new(),
             k, v, len: 0, max_len,
             n_kv_heads: n_kv_max,
             n_kv_heads_per_layer: n_kv_heads_per_layer.to_vec(),
@@ -99,6 +103,35 @@ impl KvCache {
         self.len = 0;
         for s in &mut self.ssm_state { *s = None; }
         for c in &mut self.ssm_conv  { *c = None; }
+    }
+
+    pub fn new_lazy_per_layer_kv(backends: Vec<Arc<dyn Backend>>, max_len: usize,
+        heads: &[usize], dims: &[usize]) -> Self {
+        assert_eq!(backends.len(), heads.len());
+        assert_eq!(heads.len(), dims.len());
+        let allocate = || backends.iter().zip(heads).zip(dims)
+            .map(|((b, &h), &d)| b.alloc_zeros(vec![max_len.min(256).max(1), h, d])).collect();
+        Self { k: allocate(), v: allocate(), len: 0, max_len,
+            n_kv_heads: heads.iter().copied().max().unwrap_or(0),
+            n_kv_heads_per_layer: heads.to_vec(), head_dims: dims.to_vec(),
+            ssm_state: (0..heads.len()).map(|_| None).collect(),
+            ssm_conv: (0..heads.len()).map(|_| None).collect(), layer_backends: backends }
+    }
+
+    pub fn reserve_layer(&mut self, backend: &dyn Backend, layer: usize, needed: usize) {
+        assert!(needed <= self.max_len, "kv cache overflow");
+        if needed <= self.k[layer].dim(0) { return; }
+        let capacity = needed.next_power_of_two().min(self.max_len);
+        let shape = vec![capacity, self.n_kv_heads_per_layer[layer], self.head_dims[layer]];
+        // Replace one buffer at a time to bound peak device memory during growth.
+        for buffer in [&mut self.k[layer], &mut self.v[layer]] {
+            let mut grown = backend.alloc_zeros(shape.clone());
+            if self.len != 0 {
+                let prefix = backend.slice_axis0(buffer, self.len);
+                backend.copy_axis0_into(&mut grown, 0, &prefix);
+            }
+            *buffer = grown;
+        }
     }
 
     pub fn size_bytes(&self) -> usize {
@@ -119,7 +152,7 @@ impl KvCache {
         let nkv = self.n_kv_heads_per_layer[layer];
         debug_assert_eq!(new_k.shape(), &[seq, nkv, hd]);
         debug_assert_eq!(new_v.shape(), &[seq, nkv, hd]);
-        debug_assert!(self.len + seq <= self.max_len, "kv cache overflow");
+        self.reserve_layer(backend, layer, self.len + seq);
         backend.copy_axis0_into(&mut self.k[layer], self.len, new_k);
         backend.copy_axis0_into(&mut self.v[layer], self.len, new_v);
     }

@@ -4,6 +4,7 @@
 /config/*.local.json
 /models
 /tools/qwen-image-reference
+/tools/orcasaq/reference
 
 # Model weights: never commit them
 *.gguf

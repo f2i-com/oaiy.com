@@ -1264,7 +1264,7 @@ fn delta_net_decode_step_full_size_matches_cpu() {
                                  vec![2 * num_v_heads]);
     let cw    = Tensor::from_vec(deterministic_floats(conv_dim * conv_kernel, 0.2, 60004),
                                  vec![conv_dim, conv_kernel]);
-    let sa    = Tensor::from_vec(deterministic_floats(num_v_heads, 0.5, 60005),
+    let sa    = Tensor::from_vec(deterministic_floats(num_v_heads, 0.5, 60005).into_iter().map(|v| -v.abs()).collect(),
                                  vec![num_v_heads]);
     let dt    = Tensor::from_vec(deterministic_floats(num_v_heads, 0.1, 60006),
                                  vec![num_v_heads]);
@@ -1276,29 +1276,22 @@ fn delta_net_decode_step_full_size_matches_cpu() {
 
     let mut conv_state_a = conv_state_cpu.clone();
     let mut state_a      = state_cpu.clone();
-    let out_cpu = cpu.delta_net_step(
-        &mqkv, &z, &ba, &cw, &sa, &dt, &nm,
-        &mut conv_state_a, &mut state_a,
-        1, num_v_heads, num_k_heads, head_v_dim, head_k_dim, v_per_k, scale_q, eps,
-    );
-
     let mut conv_state_b = cuda.to_device(conv_state_cpu);
-    let mut state_b      = cuda.to_device(state_cpu);
-    let out_cuda = cuda.delta_net_step(
-        &cuda.to_device(mqkv),
-        &cuda.to_device(z),
-        &cuda.to_device(ba),
-        &cuda.to_device(cw),
-        &cuda.to_device(sa),
-        &cuda.to_device(dt),
-        &cuda.to_device(nm),
-        &mut conv_state_b, &mut state_b,
-        1, num_v_heads, num_k_heads, head_v_dim, head_k_dim, v_per_k, scale_q, eps,
-    );
-
-    assert_tensors_close(&out_cuda, &out_cpu, 1e-3);
-    assert_tensors_close(&conv_state_b, &conv_state_a, 1e-4);
-    assert_tensors_close(&state_b, &state_a, 1e-3);
+    let mut state_b = cuda.to_device(state_cpu);
+    let gpu: Vec<_> = [&mqkv,&z,&ba,&cw,&sa,&dt,&nm].into_iter().map(|t| cuda.to_device(t.clone())).collect();
+    // VENDORED-LOCAL: exercise recurrent state over multiple decode calls, not
+    // just the zero-state first token. All three outputs must track the CPU.
+    for _ in 0..16 {
+        let out_cpu = cpu.delta_net_step(
+            &mqkv,&z,&ba,&cw,&sa,&dt,&nm,&mut conv_state_a,&mut state_a,
+            1,num_v_heads,num_k_heads,head_v_dim,head_k_dim,v_per_k,scale_q,eps);
+        let out_cuda = cuda.delta_net_step(
+            &gpu[0],&gpu[1],&gpu[2],&gpu[3],&gpu[4],&gpu[5],&gpu[6],&mut conv_state_b,&mut state_b,
+            1,num_v_heads,num_k_heads,head_v_dim,head_k_dim,v_per_k,scale_q,eps);
+        assert_tensors_close(&out_cuda,&out_cpu,1e-3);
+        assert_tensors_close(&conv_state_b,&conv_state_a,1e-4);
+        assert_tensors_close(&state_b,&state_a,1e-3);
+    }
 }
 
 #[test]

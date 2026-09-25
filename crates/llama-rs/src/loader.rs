@@ -114,6 +114,8 @@ pub(crate) fn dtype_supports_packed_matmul(dtype: GgmlType) -> bool {
 /// both reference the *same* on-device storage — no dequantize duplication.
 /// On big-vocab models (Qwen3.6 vocab=248k × hidden=5120) this saves ~5 GB.
 pub enum Weight {
+    // VENDORED-LOCAL: device-owned original packed formats such as EXL3.
+    Packed(Arc<dyn ggml_rs::exl3::PackedLinear>),
     Dense(Tensor),
     Quant(QuantizedTensor),
     TiedEmbed(Arc<Tensor>),
@@ -122,6 +124,7 @@ pub enum Weight {
 impl std::fmt::Debug for Weight {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Packed(w) => write!(f, "Packed({w:?})"),
             Self::Dense(t) => write!(f, "Dense({:?})", t),
             Self::Quant(qt) => write!(f, "Quant({:?})", qt),
             Self::TiedEmbed(t) => write!(f, "TiedEmbed({:?})", t),
@@ -148,6 +151,7 @@ impl Weight {
     /// [`upload_tok_embd_with_tied`].
     pub fn to_device(self, backend: &dyn Backend) -> Self {
         match self {
+            Self::Packed(w) => Self::Packed(w),
             Self::Dense(t) => Self::Dense(backend.to_device(t)),
             Self::Quant(qt) => Self::Quant(backend.to_device_quant(qt)),
             Self::TiedEmbed(arc) => Self::TiedEmbed(arc),
@@ -161,6 +165,7 @@ impl Weight {
     /// run models larger than VRAM by mixing placement.
     pub fn try_to_device(self, backend: &dyn Backend, safety_margin_bytes: usize) -> Self {
         match self {
+            Self::Packed(w) => Self::Packed(w),
             Self::Dense(t) => Self::Dense(backend.try_to_device(t, safety_margin_bytes)),
             Self::Quant(qt) => Self::Quant(backend.try_to_device_quant(qt, safety_margin_bytes)),
             Self::TiedEmbed(arc) => Self::TiedEmbed(arc),
@@ -170,6 +175,7 @@ impl Weight {
     /// Dispatch a `linear` call: `y = x · W^T`.
     pub fn linear(&self, backend: &dyn Backend, x: &Tensor) -> Tensor {
         match self {
+            Self::Packed(w) => w.linear(x),
             Self::Dense(w) => backend.linear(x, w),
             Self::Quant(qw) => backend.linear_q(x, qw),
             Self::TiedEmbed(w) => backend.linear(x, w),
@@ -178,6 +184,7 @@ impl Weight {
 
     pub fn shape(&self) -> &[usize] {
         match self {
+            Self::Packed(w) => w.shape(),
             Self::Dense(t) => t.shape(),
             Self::Quant(qt) => qt.shape(),
             Self::TiedEmbed(t) => t.shape(),
@@ -197,6 +204,7 @@ impl Weight {
         let inner: usize = first.shape().iter().skip(1).product();
         // Validate all parts have the same kind, dtype, and inner shape.
         match first {
+            Self::Packed(_) => panic!("packed projections must remain separate"),
             Self::Dense(_) => {
                 let mut total_rows = 0usize;
                 for p in &parts {
@@ -464,6 +472,7 @@ impl FfnPair {
 /// rows because per-row block alignment is preserved by the byte split.
 fn split_weight_axis0_halves(w: Weight) -> (Weight, Weight) {
     match w {
+        Weight::Packed(_) => panic!("packed projections must remain separate"),
         Weight::Dense(t) => {
             let total_rows = t.dim(0);
             assert!(total_rows % 2 == 0, "split_weight_axis0_halves: odd row count {total_rows}");

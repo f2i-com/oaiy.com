@@ -55,6 +55,25 @@ pub fn split_llama3(text: &str) -> Vec<&str> {
     out
 }
 
+/// VENDORED-LOCAL: Qwen3.8's regex, with its whitespace lookahead expressed
+/// explicitly because Rust regex does not support lookaround.
+pub fn split_qwen3(text:&str)->Vec<&str>{
+    static R:OnceLock<Regex>=OnceLock::new();
+    let re=R.get_or_init(||Regex::new(r#"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+"#).expect("Qwen regex"));
+    let mut pieces=vec![];let mut pos=0;
+    while pos<text.len(){
+        let Some(m)=re.find_at(text,pos) else {pieces.push(&text[pos..]);break;};
+        if m.start()>pos{pieces.push(&text[pos..m.start()]);}
+        let mut end=m.end();let span=m.as_str();
+        if end<text.len() && span.chars().all(char::is_whitespace) && !span.ends_with(['\r','\n']) && span.chars().count()>1 {
+            // \s+(?!\S) keeps all but the last whitespace before a non-space.
+            end-=span.chars().last().unwrap().len_utf8();
+        }
+        pieces.push(&text[m.start()..end]);pos=end;
+    }
+    pieces
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

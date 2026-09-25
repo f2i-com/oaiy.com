@@ -168,5 +168,6 @@ mod host_memory_tests {
         }
     }
 }
+pub mod exl3;
 pub use moe::{grouped_kernel_covers, quant_device_ptr, MoeDevicePlan, MoeRoutingDevice};
 pub use transfer::{DeviceSlot, PinnedPool, PinnedSlot, UploadTicket};

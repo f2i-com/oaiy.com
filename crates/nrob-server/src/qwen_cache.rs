@@ -14,6 +14,7 @@ impl Snapshot {
     pub fn capture(kv: &KvCache, attention: &[bool], backend: &dyn Backend) -> Self {
         let layers = attention.iter().enumerate().map(|(i, &attn)| {
             if attn {
+                let backend = kv.layer_backends.get(i).map(|b| b.as_ref()).unwrap_or(backend);
                 [Some(backend.slice_axis0(&kv.k[i], kv.len).to_host()),
                  Some(backend.slice_axis0(&kv.v[i], kv.len).to_host()), None, None]
             } else {
@@ -45,6 +46,9 @@ impl Snapshot {
         kv.reset();
         for (i, layer) in self.layers.iter().enumerate() {
             if let (Some(k), Some(v)) = (&layer[0], &layer[1]) {
+                let placed = kv.layer_backends.get(i).cloned();
+                let backend = placed.as_ref().map(|b| b.as_ref()).unwrap_or(backend);
+                kv.reserve_layer(backend, i, self.pos);
                 backend.copy_axis0_into(&mut kv.k[i], 0, &backend.to_device(k.clone()));
                 backend.copy_axis0_into(&mut kv.v[i], 0, &backend.to_device(v.clone()));
             }
@@ -72,34 +76,62 @@ impl crate::disk::PromptState for Arc<Snapshot> {
             }
         }
     }
-    fn decode(mut bytes: &[u8]) -> nrob::Result<Self> {
-        fn bad() -> nrob::Error { nrob::Error::Format("damaged Qwen prompt state".into()) }
-        fn number(bytes: &mut &[u8]) -> nrob::Result<usize> {
-            let raw = bytes.get(..8).ok_or_else(bad)?;
-            let n = u64::from_le_bytes(raw.try_into().map_err(|_| bad())?);
-            *bytes = &bytes[8..];
-            usize::try_from(n).map_err(|_| bad())
+    fn write_to(&self, out: &mut dyn std::io::Write) -> std::io::Result<()> {
+        out.write_all(&(self.pos as u64).to_le_bytes())?;
+        out.write_all(&(self.layers.len() as u64).to_le_bytes())?;
+        let mut buffer = Vec::with_capacity(65536);
+        for t in self.layers.iter().flatten() {
+            out.write_all(&(t.as_ref().map_or(0, Tensor::rank) as u64).to_le_bytes())?;
+            if let Some(t) = t {
+                for &dim in t.shape() { out.write_all(&(dim as u64).to_le_bytes())?; }
+                for chunk in t.data().chunks(16384) {
+                    buffer.clear();
+                    for &v in chunk { buffer.extend(v.to_le_bytes()); }
+                    out.write_all(&buffer)?;
+                }
+            }
         }
-        let pos = number(&mut bytes)?;
-        let count = number(&mut bytes)?;
+        Ok(())
+    }
+    fn decode(mut bytes: &[u8]) -> nrob::Result<Self> {
+        let len = bytes.len() as u64;
+        Self::read_from(&mut bytes, len)
+    }
+    fn read_from(input: &mut dyn std::io::Read, mut remaining: u64) -> nrob::Result<Self> {
+        fn bad() -> nrob::Error { nrob::Error::Format("damaged Qwen prompt state".into()) }
+        fn number(input: &mut dyn std::io::Read, remaining: &mut u64) -> nrob::Result<usize> {
+            *remaining = remaining.checked_sub(8).ok_or_else(bad)?;
+            let mut raw = [0u8; 8];
+            input.read_exact(&mut raw)?;
+            usize::try_from(u64::from_le_bytes(raw)).map_err(|_| bad())
+        }
+        let pos = number(input, &mut remaining)?;
+        let count = number(input, &mut remaining)?;
         if pos == 0 || count > 256 { return Err(bad()); }
         let mut layers = Vec::with_capacity(count);
+        let mut buffer = vec![0u8; 65536];
         for _ in 0..count {
             let mut layer = [None, None, None, None];
             for t in &mut layer {
-                let rank = number(&mut bytes)?;
+                let rank = number(input, &mut remaining)?;
                 if rank == 0 { continue; }
                 if rank > 3 { return Err(bad()); }
-                let shape = (0..rank).map(|_| number(&mut bytes)).collect::<nrob::Result<Vec<_>>>()?;
+                let shape = (0..rank).map(|_| number(input, &mut remaining)).collect::<nrob::Result<Vec<_>>>()?;
                 let size = shape.iter().try_fold(4usize, |a, &b| a.checked_mul(b)).ok_or_else(bad)?;
-                let raw = bytes.get(..size).ok_or_else(bad)?;
-                let data = raw.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
+                remaining = remaining.checked_sub(size as u64).ok_or_else(bad)?;
+                let mut data = Vec::with_capacity(size / 4);
+                let mut left = size;
+                while left > 0 {
+                    let n = left.min(buffer.len());
+                    input.read_exact(&mut buffer[..n])?;
+                    data.extend(buffer[..n].chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])));
+                    left -= n;
+                }
                 *t = Some(Tensor::from_vec(data, shape));
-                bytes = &bytes[size..];
             }
             layers.push(layer);
         }
-        if !bytes.is_empty() { return Err(bad()); }
+        if remaining != 0 { return Err(bad()); }
         Ok(Arc::new(Snapshot { pos, layers }))
     }
 }
@@ -108,6 +140,25 @@ impl crate::disk::PromptState for Arc<Snapshot> {
 mod tests {
     use super::*;
     use crate::disk::PromptState;
+
+    #[test]
+    fn lazy_growth_and_restore_preserve_prefix() {
+        let backend: Arc<dyn Backend> = Arc::new(ggml_rs::CpuBackend::new());
+        let mut kv = KvCache::new_lazy_per_layer_kv(vec![backend.clone()], 1024, &[1], &[2]);
+        let first = Tensor::from_vec(vec![2.0; 400], vec![200, 1, 2]);
+        let second = Tensor::from_vec(vec![3.0; 400], vec![200, 1, 2]);
+        kv.append(backend.as_ref(), 0, &first, &first); kv.commit(200);
+        kv.append(backend.as_ref(), 0, &second, &second); kv.commit(200);
+        assert_eq!(kv.k[0].dim(0), 512);
+        assert_eq!(&kv.k[0].data()[..400], first.data());
+        let snapshot = Snapshot::capture(&kv, &[true], backend.as_ref());
+        let mut restored = KvCache::new_lazy_per_layer_kv(vec![backend.clone()], 1024, &[1], &[2]);
+        let ssm = SsmConfig { conv_kernel: 3, group_count: 1, inner_size: 2, state_size: 2, time_step_rank: 1 };
+        snapshot.restore(&mut restored, &[true], ssm, backend.as_ref()).unwrap();
+        assert_eq!(restored.len, 400);
+        assert_eq!(restored.k[0].dim(0), 512);
+        assert_eq!(&restored.k[0].data()[..800], &kv.k[0].data()[..800]);
+    }
 
     #[test]
     fn round_trip_restores_attention_recurrence_and_conv_after_divergence() {
@@ -120,6 +171,8 @@ mod tests {
         kv.ssm_conv[1] = Some(Tensor::from_vec(vec![5.0; 12], vec![2, 6]));
         let snap = Arc::new(Snapshot::capture(&kv, &[true, false], &backend));
         let mut bytes = Vec::new(); snap.encode(&mut bytes);
+        let mut streamed = Vec::new(); snap.write_to(&mut streamed).unwrap();
+        assert_eq!(bytes, streamed);
         assert_eq!(bytes.len(), snap.encoded_len());
         let decoded = Arc::<Snapshot>::decode(&bytes).unwrap();
         kv.k[0].data_mut().fill(99.0); kv.ssm_state[1].as_mut().unwrap().data_mut().fill(99.0);

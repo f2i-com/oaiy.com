@@ -162,6 +162,10 @@ pub struct Qwen35Model {
     pub blocks:    Vec<Qwen35Block>,
     pub tok_embd: Option<Arc<Tensor>>,
     pub packed_tok_embd: Option<QuantizedTensor>,
+    /// VENDORED-LOCAL: row-scaled original int8 embedding, gathered on demand.
+    pub int8_tok_embd: Option<(Vec<u8>, Vec<f32>)>,
+    /// Optional KV placement across devices; weights stay on `backend`.
+    pub cache_backends: Vec<Arc<dyn Backend>>,
     pub output_norm: Tensor,
     pub output:    Weight,
     pub backend:   Arc<dyn Backend>,
@@ -283,7 +287,7 @@ impl Qwen35Model {
         Ok(Self {
             config, ssm_cfg, attention_layers,
             tokenizer, blocks,
-            tok_embd, packed_tok_embd, output_norm, output,
+            tok_embd, packed_tok_embd, int8_tok_embd: None, cache_backends: Vec::new(), output_norm, output,
             backend,
         })
     }
@@ -316,7 +320,15 @@ impl Qwen35Model {
     /// vision-language splice path; standard text-only callers can stay on
     /// [`forward`] and don't need to touch this directly.
     pub fn embed_text(&self, tokens: &[u32]) -> Tensor {
-        if let Some(packed) = &self.packed_tok_embd {
+        if let Some((bytes,scales)) = &self.int8_tok_embd {
+            let width=self.config.embedding_dim;
+            let mut data=Vec::with_capacity(tokens.len()*width);
+            for &id in tokens {
+                let row=id as usize;
+                data.extend(bytes[row*width..(row+1)*width].iter().map(|&b|(b as i8) as f32*scales[row]));
+            }
+            self.backend.to_device(Tensor::from_vec(data,vec![tokens.len(),width]))
+        } else if let Some(packed) = &self.packed_tok_embd {
             let rows = packed_embedding_rows(packed, tokens);
             self.backend.to_device(rows)
         } else {
@@ -438,12 +450,22 @@ impl Qwen35Model {
                         ops::rope(backend, &mut k, &positions, head_dim, rope_type, cfg.rope_theta);
                     }
 
-                    kv.append(backend, layer, &k, &v_3d);
                     let kv_len = kv.len + seq;
-                    let attn_out = ops::attention(
-                        backend, &q, kv.k_buffer(layer), kv.v_buffer(layer),
-                        kv_len, scale, past,
-                    );
+                    let cache_backend = kv.layer_backends.get(layer).cloned();
+                    let remote = cache_backend.as_ref().filter(|b| !Arc::ptr_eq(b, &self.backend));
+                    let attn_out = if let Some(b) = remote {
+                        // Explicit host staging: CUDA tensors from distinct devices
+                        // must never be passed to kernels on the model's device.
+                        let q = b.to_device(q.to_host());
+                        let k = b.to_device(k.to_host());
+                        let v = b.to_device(v_3d.to_host());
+                        kv.append(b.as_ref(), layer, &k, &v);
+                        let out = ops::attention(b.as_ref(), &q, kv.k_buffer(layer), kv.v_buffer(layer), kv_len, scale, past);
+                        backend.to_device(out.to_host())
+                    } else {
+                        kv.append(backend, layer, &k, &v_3d);
+                        ops::attention(backend, &q, kv.k_buffer(layer), kv.v_buffer(layer), kv_len, scale, past)
+                    };
 
                     // Gate the attention output: `attn_out *= sigmoid(q_gate)`,
                     // fused into a single kernel.
@@ -574,6 +596,7 @@ pub fn fuse_alpha_beta(beta: Weight, alpha: Weight) -> Weight {
 
 fn weight_kind(w: &Weight) -> &'static str {
     match w {
+        Weight::Packed(_) => "Packed",
         Weight::Dense(_) => "Dense(f32)",
         Weight::Quant(_) => "Quant",
         Weight::TiedEmbed(_) => "TiedEmbed",

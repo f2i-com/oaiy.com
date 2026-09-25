@@ -46,6 +46,8 @@ pub(crate) fn needs_tool_precision(body: &nrob::json::Json) -> bool {
 /// Which runtime serves a model, decided by what is on disk.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
+    /// Qwen hybrid with original EXL3 trellis safetensors.
+    OrcaSaq,
     /// `dsv41-cuda`: a safetensors checkpoint directory with Engram tables.
     Deepseek,
     /// `llama-rs`: a GGUF file, or a directory holding one.
@@ -53,10 +55,10 @@ pub enum Kind {
 }
 
 impl Kind {
-    /// A `.gguf` (or a directory containing one) is served through llama-rs;
-    /// anything else is taken for a DeepSeek checkpoint directory, which is what
-    /// this server has always assumed.
+    /// Recognize EXL3 Qwen checkpoints by config, GGUF by extension, then
+    /// fall back to the existing DeepSeek checkpoint loader.
     pub fn detect(path: &Path) -> Kind {
+        if crate::orcasaq::detect(path) { return Kind::OrcaSaq; }
         if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("gguf")) {
             return Kind::Gguf;
         }
@@ -378,6 +380,7 @@ impl Models {
         let next = match spec.kind {
             Kind::Deepseek => self.load_deepseek(&spec),
             Kind::Gguf => self.load_gguf(&spec),
+            Kind::OrcaSaq => self.load_orcasaq(&spec),
         }
         .map_err(|e| format!("loading {}: {e}", spec.name))?;
         {
@@ -537,6 +540,36 @@ impl Models {
             cfg: Arc::new(cfg),
             flavour: Arc::new(Flavour::Deepseek(tok)),
         })
+    }
+
+    fn load_orcasaq(&self, spec: &Spec) -> Result<Live> {
+        let o=&self.opts;
+        self.say(format!("loading {}: native EXL3 mixed precision",spec.name));
+        let model=crate::orcasaq::load(&spec.path,&o.devices)?;
+        let tok=Arc::new(model.tokenizer().clone());
+        let max_seq=o.ctx.min(model.config().context_length);
+        let cfg=self.base_cfg(spec,max_seq);
+        let (jobs,rx)=std::sync::mpsc::channel();
+        let mut e=crate::qwen::QwenEngine::new(model,None,max_seq,!o.quiet && !o.silent);
+        if let Some(dir)=&o.prompt_cache {
+            let mut fp=disk::fnv(b"orcasaq2-exl3-qwen-state-v1",0);
+            fp=disk::fnv(spec.path.as_os_str().as_encoded_bytes(),fp);
+            let mut files:Vec<_>=std::fs::read_dir(&spec.path)?.filter_map(|e|e.ok().map(|e|e.path())).filter(|p|
+                p.extension().is_some_and(|x|x=="safetensors" || x=="json")).collect();
+            files.sort();
+            for p in files {
+                let meta=std::fs::metadata(&p)?;
+                fp=disk::fnv(p.as_os_str().as_encoded_bytes(),fp);
+                fp=disk::fnv(&meta.len().to_le_bytes(),fp);
+                if let Ok(t)=meta.modified().and_then(|t|t.duration_since(std::time::UNIX_EPOCH).map_err(std::io::Error::other)) {fp=disk::fnv(&t.as_nanos().to_le_bytes(),fp);}
+            }
+            match disk::DiskCache::open(dir,fp,(o.prompt_cache_gb*1e9)as u64){
+                Ok(cache)=>{self.say(format!("OrcaSAQ prompt cache: {} entries in {}",cache.len(),dir.display())); e.disk=Some(cache);},
+                Err(err)=>self.say(format!("OrcaSAQ prompt cache unavailable: {err}")),
+            }
+        }
+        let thread=std::thread::Builder::new().name("orcasaq-model".into()).spawn(move||e.run(rx))?;
+        Ok(Live{name:spec.name.clone(),jobs,thread,cfg:Arc::new(cfg),flavour:Arc::new(Flavour::Qwen(tok))})
     }
 
     // ---------------------------------------------------------------- GGUF

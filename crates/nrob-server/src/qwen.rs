@@ -241,6 +241,7 @@ impl QwenEngine {
             let _ = job.events.send(Event::Progress { done: end-start, total });
             pos = end;
             if stops.contains(&pos) && !self.checkpoints.iter().any(|(saved, _, _)| saved == &keys[..pos]) {
+                if self.log { eprintln!("  Qwen checkpoint: {pos} tokens; disk={}", self.disk.is_some()); }
                 let snap = Arc::new(Snapshot::capture(&self.kv, &model.attention_layers, model.backend.as_ref()));
                 let base = stops.first() == Some(&pos);
                 if job.images.is_empty() {

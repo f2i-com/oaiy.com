@@ -9,3 +9,5 @@ description = "BPE / SPM tokenizer fed by GGUF metadata."
 gguf      = { path = "../gguf", version = "0.0.1" }
 regex     = "1.10"
 thiserror = "1.0"
+# VENDORED-LOCAL: Qwen3.8's published tokenizer normalizes ordinary text to NFC.
+unicode-normalization = "0.1.25"

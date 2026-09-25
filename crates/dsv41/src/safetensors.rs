@@ -32,6 +32,7 @@ pub enum Dtype {
     F16,
     BF16,
     I8,
+    I16,
     U8,
     I32,
     I64,
@@ -48,6 +49,7 @@ impl Dtype {
             "F16" => Self::F16,
             "BF16" => Self::BF16,
             "I8" => Self::I8,
+            "I16" => Self::I16,
             "U8" => Self::U8,
             "I32" => Self::I32,
             "I64" => Self::I64,
@@ -61,7 +63,7 @@ impl Dtype {
     pub fn size(self) -> usize {
         match self {
             Self::I8 | Self::U8 | Self::F8E4M3 | Self::F8E8M0 => 1,
-            Self::F16 | Self::BF16 => 2,
+            Self::F16 | Self::BF16 | Self::I16 => 2,
             Self::F32 | Self::I32 => 4,
             Self::I64 => 8,
         }

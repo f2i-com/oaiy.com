@@ -12,6 +12,7 @@
 #![allow(non_camel_case_types)]
 
 pub mod backend;
+pub mod exl3;
 pub mod cpu;
 pub mod ops;
 pub mod quantized;

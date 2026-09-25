@@ -2811,6 +2811,8 @@ __global__ void moe_reduce_slots_f32(const float* __restrict__ partial,
 "#;
 
 pub const KERNEL_NAMES: &[&str] = &[
+    "exl3_had", "exl3_had_reduce", "exl3_reconstruct", "exl3_tile_32", "exl3_tile_48", "exl3_tile_56", "exl3_tile_64", "exl3_tile_96",
+    "exl3_gemv_generic", "exl3_gemv_32", "exl3_gemv_48", "exl3_gemv_56", "exl3_gemv_64", "exl3_gemv_96",
     "linear_q8_0_f32",
     "linear_q8_0_gemv_coop_f32",
     "linear_iq4_nl_f32",
@@ -2874,6 +2876,8 @@ pub const KERNEL_NAMES: &[&str] = &[
     "bmm_qkt_f32",
     "bmm_av_f32",
     "attention_f32",
+    "attention_partition_f32",
+    "attention_merge_f32",
     "delta_net_conv1d_decode_f32",
     "delta_net_decode_step_f32",
     "delta_net_conv1d_loop_f32",

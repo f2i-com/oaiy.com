@@ -18,7 +18,7 @@ use cudarc::cublas::sys::cublasOperation_t;
 use cudarc::driver::{
     CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, LaunchConfig, PushKernelArg,
 };
-use cudarc::nvrtc::compile_ptx;
+use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
 use ggml_quants::GgmlType;
 use ggml_rs::backend::{Backend, RopeType};
 use ggml_rs::quantized::{QuantizedDeviceStorage, QuantizedTensor};
@@ -92,9 +92,9 @@ impl QuantizedDeviceStorage for CudaQuantStorage {
     fn as_any_mut(&mut self) -> &mut dyn Any { self }
 
     fn clone_to_device(&self) -> Box<dyn QuantizedDeviceStorage> {
-        let mut new_slice = self.stream
-            .alloc_zeros::<u8>(self.bytes.len())
-            .expect("alloc failed");
+        // VENDORED-LOCAL: SAFETY: the following same-stream D2D copy initializes
+        // every byte before the cloned storage can be read.
+        let mut new_slice = unsafe { self.stream.alloc::<u8>(self.bytes.len()) }.expect("alloc failed");
         self.stream
             .memcpy_dtod(&self.bytes, &mut new_slice)
             .expect("d2d failed");
@@ -128,9 +128,9 @@ impl DeviceStorage for CudaStorage {
     fn as_any_mut(&mut self) -> &mut dyn Any { self }
 
     fn clone_to_device(&self) -> Box<dyn DeviceStorage> {
-        let mut new_slice = self.stream
-            .alloc_zeros::<f32>(self.slice.len())
-            .expect("alloc failed");
+        // VENDORED-LOCAL: SAFETY: the following same-stream D2D copy initializes
+        // every element before the cloned storage can be read.
+        let mut new_slice = unsafe { self.stream.alloc::<f32>(self.slice.len()) }.expect("alloc failed");
         self.stream
             .memcpy_dtod(&self.slice, &mut new_slice)
             .expect("d2d failed");
@@ -188,7 +188,23 @@ impl CudaBackend {
         let ctx = CudaContext::new(device_ordinal)?;
         let stream = ctx.default_stream();
 
-        let ptx = compile_ptx(KERNEL_SRC)?;
+        // VENDORED-LOCAL: target the installed GPU so EXL3 can sum four
+        // codebook bytes with one DP4A instruction. Older devices keep the
+        // scalar fallback; no relaxed floating-point compiler flags are used.
+        let arch = match ctx.compute_capability()? {
+            (12, 0) => Some("compute_120"),
+            (10, 0) => Some("compute_100"),
+            (9, 0) => Some("compute_90"),
+            (8, 9) => Some("compute_89"),
+            (8, 6) => Some("compute_86"),
+            (8, 0) => Some("compute_80"),
+            (7, 5) => Some("compute_75"),
+            (7, 0) => Some("compute_70"),
+            (6, 1) => Some("compute_61"),
+            _ => None,
+        };
+        let ptx = compile_ptx_with_opts(format!("{}\n{}\n{}", KERNEL_SRC, include_str!("exl3.cu"), include_str!("long_attention.cu")),
+            CompileOptions { arch, ..Default::default() })?;
         let module = ctx.load_module(ptx)?;
 
         let mut funcs = HashMap::with_capacity(KERNEL_NAMES.len());
@@ -965,7 +981,9 @@ impl Backend for CudaBackend {
         let n_rows = x.numel() / last;
         let x_in = self.cuda_input(x);
         let w_in = self.cuda_input(weight);
-        let mut y = self.alloc(x.numel());
+        // VENDORED-LOCAL: SAFETY: the kernel below overwrites every output
+        // element on this stream before it is exposed to a consumer.
+        let mut y = unsafe { self.stream.alloc::<f32>(x.numel()) }.expect("output allocation");
 
         let bs = Self::pow2_ceil(last.min(256)) as u32;
         let cfg = LaunchConfig {
@@ -995,7 +1013,9 @@ impl Backend for CudaBackend {
         let y_in = self.cuda_input(y);
         let w_in = self.cuda_input(weight);
         let x_dev = self.cuda_input_mut(x);
-        let mut out = self.alloc(n_rows * last);
+        // VENDORED-LOCAL: SAFETY: the kernel below overwrites every output
+        // element on this stream before it is exposed to a consumer.
+        let mut out = unsafe { self.stream.alloc::<f32>(n_rows * last) }.expect("output allocation");
 
         let bs = Self::pow2_ceil(last.min(256)) as u32;
         let cfg = LaunchConfig {
@@ -1142,7 +1162,9 @@ impl Backend for CudaBackend {
         let n = a.numel();
         let a_in = self.cuda_input(a);
         let b_in = self.cuda_input(b);
-        let mut y = self.alloc(n);
+        // VENDORED-LOCAL: SAFETY: the kernel below overwrites every output
+        // element on this stream before it is exposed to a consumer.
+        let mut y = unsafe { self.stream.alloc::<f32>(n) }.expect("output allocation");
         let cfg = LaunchConfig::for_num_elems(n as u32);
         let n_i = n as i32;
         unsafe {
@@ -1636,8 +1658,12 @@ impl Backend for CudaBackend {
         // Allocate intermediate conv_out for ALL seq tokens (the loop kernels
         // write/read the full [seq, conv_dim] buffer rather than reusing one
         // token's worth — keeps the kernels single-launch).
-        let mut conv_out = self.alloc(seq * conv_dim);
-        let mut output   = self.alloc(seq * num_v_heads * head_v_dim);
+        // VENDORED-LOCAL: SAFETY: the kernel below overwrites every output
+        // element on this stream before it is exposed to a consumer.
+        let mut conv_out = unsafe { self.stream.alloc::<f32>(seq * conv_dim) }.expect("output allocation");
+        // VENDORED-LOCAL: SAFETY: the kernel below overwrites every output
+        // element on this stream before it is exposed to a consumer.
+        let mut output = unsafe { self.stream.alloc::<f32>(seq * num_v_heads * head_v_dim) }.expect("output allocation");
 
         let block_x: u32 = 256;
         let grid_x = ((conv_dim as u32) + block_x - 1) / block_x;
@@ -1736,8 +1762,12 @@ impl Backend for CudaBackend {
         let seq = q_full.dim(0);
         debug_assert_eq!(q_full.numel(), seq * n_heads * 2 * head_dim);
         let q_in = self.cuda_input(q_full);
-        let mut q_only = self.alloc(seq * n_heads * head_dim);
-        let mut q_gate = self.alloc(seq * n_heads * head_dim);
+        // VENDORED-LOCAL: SAFETY: the kernel below overwrites every output
+        // element on this stream before it is exposed to a consumer.
+        let mut q_only = unsafe { self.stream.alloc::<f32>(seq * n_heads * head_dim) }.expect("output allocation");
+        // VENDORED-LOCAL: SAFETY: the kernel below overwrites every output
+        // element on this stream before it is exposed to a consumer.
+        let mut q_gate = unsafe { self.stream.alloc::<f32>(seq * n_heads * head_dim) }.expect("output allocation");
 
         let total = (seq * n_heads * head_dim) as u32;
         let block: u32 = 256;
@@ -1958,33 +1988,35 @@ impl Backend for CudaBackend {
         let bs = pow2_ceil_u32(hd.min(256).max(32) as u32);
         let smem_bytes = (kv_len as u32 + bs) * 4;
 
-        // Out-of-shared-memory fallback: walk the default trait impl, which
-        // applies the sliding-window mask on the host. Slow but correct.
         if smem_bytes > 48 * 1024 {
-            let n_rep = n_h_q / n_h_kv;
-            let k_pref = self.slice_axis0(k_buffer, kv_len);
-            let v_pref = self.slice_axis0(v_buffer, kv_len);
-            let k_full = self.repeat_kv(&k_pref, n_rep);
-            let v_full = self.repeat_kv(&v_pref, n_rep);
-            let mut scores = self.bmm_qkt(q, &k_full, scale, past);
-            if let Some(w) = sliding_window {
-                // Pull scores to host, apply mask, push back.
-                let mut host = scores.to_host();
-                let data = host.data_mut();
-                for s in 0..seq {
-                    let q_pos = past + s;
-                    let lo = q_pos.saturating_sub(w - 1);
-                    for h in 0..n_h_q {
-                        let row_off = (s * n_h_q + h) * kv_len;
-                        for t in 0..lo.min(kv_len) {
-                            data[row_off + t] = f32::NEG_INFINITY;
-                        }
-                    }
-                }
-                scores = self.to_device(host);
+            let parts = kv_len.div_ceil(4096);
+            let q_in = self.cuda_input(q);
+            let k_in = self.cuda_input(k_buffer);
+            let v_in = self.cuda_input(v_buffer);
+            let mut partial = self.alloc(seq * n_h_q * parts * (hd + 2));
+            let mut out = self.alloc(seq * n_h_q * hd);
+            let (seq_i, nh_i, nk_i, len_i, hd_i, past_i, sw_i) =
+                (seq as i32, n_h_q as i32, n_h_kv as i32, kv_len as i32,
+                 hd as i32, past as i32, sliding_window.unwrap_or(0) as i32);
+            let rows_i = (seq * n_h_q) as i32;
+            let parts_i = parts as i32;
+            // SAFETY: buffers belong to this context, sizes and grids match the
+            // partition/merge layouts; both launches use the same ordered stream.
+            unsafe {
+                self.stream.launch_builder(self.func("attention_partition_f32"))
+                    .arg(q_in.as_ref()).arg(k_in.as_ref()).arg(v_in.as_ref()).arg(&mut partial)
+                    .arg(&seq_i).arg(&nh_i).arg(&nk_i).arg(&len_i).arg(&hd_i)
+                    .arg(&scale).arg(&past_i).arg(&sw_i)
+                    .launch(LaunchConfig { grid_dim: (n_h_q as u32, seq as u32, parts as u32),
+                        block_dim: (bs, 1, 1), shared_mem_bytes: (4096 + bs) * 4 })
+                    .expect("partition attention launch");
+                self.stream.launch_builder(self.func("attention_merge_f32"))
+                    .arg(&partial).arg(&mut out).arg(&rows_i).arg(&parts_i).arg(&hd_i)
+                    .launch(LaunchConfig { grid_dim: (rows_i as u32, 1, 1),
+                        block_dim: (bs, 1, 1), shared_mem_bytes: 0 })
+                    .expect("merge attention launch");
             }
-            self.softmax_last(&mut scores);
-            return self.bmm_av(&scores, &v_full);
+            return self.make_tensor(out, vec![seq, n_h_q, hd]);
         }
 
         let q_in = self.cuda_input(q);

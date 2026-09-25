@@ -1387,6 +1387,7 @@ impl DeviceModel {
         };
         for (name, w) in &self.w {
             let (bytes, dev) = match w {
+                Weight::Packed(w) => (w.nbytes() as u64, true),
                 Weight::Dense(t) => (t.numel() as u64 * 4, t.is_device()),
                 Weight::Quant(qt) => (qt.nbytes() as u64, qt.is_device()),
                 // The tied embedding is indexed by row on the host by design.

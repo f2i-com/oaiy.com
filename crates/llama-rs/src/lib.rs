@@ -271,6 +271,9 @@ impl Model {
         if let Self::Qwen35(m) = self {
             let heads: Vec<usize> = m.attention_layers.iter().map(|&a| if a {cfg.n_kv_heads} else {1}).collect();
             let dims: Vec<usize> = m.attention_layers.iter().map(|&a| if a {cfg.head_dim} else {1}).collect();
+            if !m.cache_backends.is_empty() {
+                return KvCache::new_lazy_per_layer_kv(m.cache_backends.clone(), len, &heads, &dims);
+            }
             return KvCache::new_per_layer_kv(self.backend().as_ref(), len, &heads, &dims);
         }
         // Gemma 4 MoE (26B-A4B): per-layer n_kv_heads varies (SWA=8, global=2)

@@ -53,6 +53,11 @@ Every token is a small, well-planned job:
 
 ## Features
 
+- **OrcaSAQ2 27B from original EXL3 safetensors.** Native Rust/CUDA loading of
+  mixed 3/3.5/4-bit decoder projections, a 6-bit head and int8 embeddings,
+  with Qwen reasoning, XML tool calls and prompt caching. See
+  [download, setup and current limits](docs/ORCASAQ.md).
+
 - **Native Rust Qwen Image 2.1 generation.** GGUF Q4 or safetensors, four-/six-step
   Viggle turbo, queued multi-image batches, and a memory handoff from DeepSeek to
   a smaller Qwen controller. See [setup and agent usage](docs/QWEN_IMAGE.md).

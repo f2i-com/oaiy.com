@@ -365,6 +365,7 @@ pub fn split_stacked_experts(w: Weight, n_experts: usize) -> Result<Vec<Weight>>
             }
             Ok(out)
         }
+        Weight::Packed(_) => Err(LlamaError::Config("packed projection cannot be split into experts".into())),
         Weight::TiedEmbed(_) => Err(LlamaError::Config(
             "split_stacked_experts: TiedEmbed is LM-head-only".into(),
         )),
@@ -421,6 +422,7 @@ pub fn split_axis0_2d(w: Weight, n_chunks: usize) -> Result<Vec<Weight>> {
             }
             Ok(out)
         }
+        Weight::Packed(_) => Err(LlamaError::Config("packed projection cannot be split into experts".into())),
         Weight::TiedEmbed(_) => Err(LlamaError::Config(
             "split_axis0_2d: TiedEmbed is LM-head-only".into(),
         )),

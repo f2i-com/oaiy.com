@@ -54,6 +54,8 @@ pub enum TokenizerModel {
 
 #[derive(Debug, Clone)]
 pub struct Tokenizer {
+    // VENDORED-LOCAL: HF Qwen3.8 uses NFC, combining marks and single digits.
+    qwen3_pre: bool,
     model: TokenizerModel,
 
     /// Token strings, indexed by token id.
@@ -92,6 +94,19 @@ pub struct Tokenizer {
 }
 
 impl Tokenizer {
+    /// VENDORED-LOCAL: construct the same byte BPE from a HF checkpoint.
+    pub fn from_qwen3_bpe_parts(tokens: Vec<String>, merges: Vec<(String,String)>,
+        special_ids: Vec<u32>, eos: u32) -> Result<Self> {
+        if eos as usize >= tokens.len() || special_ids.iter().any(|&i|i as usize>=tokens.len()) {
+            return Err(TokenizerError::MissingMetadata("valid special token IDs"));
+        }
+        let token_to_id=tokens.iter().enumerate().map(|(i,t)|(t.clone(),i as u32)).collect();
+        let merges_rank=merges.into_iter().enumerate().map(|(i,m)|(m,i as u32)).collect();
+        let mut special_tokens:Vec<_>=special_ids.into_iter().map(|i|(tokens[i as usize].clone(),i)).collect();
+        special_tokens.sort_by(|a,b|b.0.len().cmp(&a.0.len()));
+        Ok(Self{qwen3_pre:true,model:TokenizerModel::Gpt2,tokens,token_to_id,scores:None,token_types:None,
+            merges_rank,bos:None,eos:Some(eos),unk:None,pad:None,special_tokens})
+    }
     pub fn from_gguf(gguf: &GgufFile) -> Result<Self> {
         let model = match gguf.get_str("tokenizer.ggml.model").unwrap_or("llama") {
             "gpt2" => TokenizerModel::Gpt2,
@@ -164,6 +179,7 @@ impl Tokenizer {
         special_tokens.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
 
         Ok(Self {
+            qwen3_pre: false,
             model,
             tokens,
             token_to_id,

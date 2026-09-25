@@ -1,0 +1,102 @@
+{
+  "files": [
+    {
+      "size": 14771,
+      "name": "README.md",
+      "git_blob": "823c7c6cdc6d28e13f56c1aa100bb33ff3727969",
+      "sha256": null
+    },
+    {
+      "size": 8952,
+      "name": "chat_template.jinja",
+      "git_blob": "c0c686f9c38d70d179fb7b5f5aa7530bc913dda3",
+      "sha256": null
+    },
+    {
+      "size": 6151,
+      "name": "config.json",
+      "git_blob": "c607dfecd8a497ceae0226639f5bf2eabae8a169",
+      "sha256": null
+    },
+    {
+      "size": 202,
+      "name": "generation_config.json",
+      "git_blob": "023756cfadf88e5bf69eefeee3e172f38c448d64",
+      "sha256": null
+    },
+    {
+      "size": 3353259,
+      "name": "merges.txt",
+      "git_blob": "a494e019ca1502219fd0128658b979e5f05ae8e8",
+      "sha256": null
+    },
+    {
+      "size": 3992179840,
+      "name": "model-00001-of-00004.safetensors",
+      "git_blob": "2f35be15028d0b7bc8956db96d266fe51c43a3ec",
+      "sha256": "25353d254848dba68557344a6f484a49b21e005669efd41927fe14b2a877d00d"
+    },
+    {
+      "size": 3986581108,
+      "name": "model-00002-of-00004.safetensors",
+      "git_blob": "33674d1fc769f6e40de70c0b7b59918985e4f631",
+      "sha256": "155c4d6ecda09f1864f5aec92afd49d6c343613a54724bb7cfecb7d818d8f61c"
+    },
+    {
+      "size": 3125485096,
+      "name": "model-00003-of-00004.safetensors",
+      "git_blob": "5322c890c9fbede7372257d9d5f87986e6192ff5",
+      "sha256": "1c1fc0805f18fc7284f958df99b92bf72307b27bc358f8979d58179aae88b9aa"
+    },
+    {
+      "size": 1166189360,
+      "name": "model-00004-of-00004.safetensors",
+      "git_blob": "c00d9b1e91c0319c03b14d63c075f211959cfc2f",
+      "sha256": "36ddf6c9dc0ca408f92a415a9d910a93b1805c2d5ae6da1e1316d3bc9764174f"
+    },
+    {
+      "size": 197638,
+      "name": "model.safetensors.index.json",
+      "git_blob": "9020f09bd450a3ce49662d0fe4d13f2f28befc38",
+      "sha256": null
+    },
+    {
+      "size": 390,
+      "name": "preprocessor_config.json",
+      "git_blob": "2ea84a437d448ff71b08df68fdd949d5cc4ebb64",
+      "sha256": null
+    },
+    {
+      "size": 629308,
+      "name": "quantization_config.json",
+      "git_blob": "48c3a9f672ec2f8e4560abc3e9d94359475d1f84",
+      "sha256": null
+    },
+    {
+      "size": 12809320,
+      "name": "tokenizer.json",
+      "git_blob": "9328ce9c41e80f6dd7bc2c66d8ae1fc93bf87440",
+      "sha256": "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3"
+    },
+    {
+      "size": 17928,
+      "name": "tokenizer_config.json",
+      "git_blob": "5de744b3fca2129d7186979ae47c06be33903243",
+      "sha256": null
+    },
+    {
+      "size": 385,
+      "name": "video_preprocessor_config.json",
+      "git_blob": "3ba673a5ad7d4d13f54155ecd38b2a94a6dac8fe",
+      "sha256": null
+    },
+    {
+      "size": 6722759,
+      "name": "vocab.json",
+      "git_blob": "0aa0ce0658d60ac4a5d609f4eadb0e8e43514176",
+      "sha256": null
+    }
+  ],
+  "repo": "orcarouter/OrcaSAQ-2-27B",
+  "revision": "15d20d7e9ae4fd89d1a47878f69381760169445b"
+}

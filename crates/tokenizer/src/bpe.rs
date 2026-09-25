@@ -70,7 +70,12 @@ fn encode_text_segment(tok: &Tokenizer, text: &str, out: &mut Vec<u32>) -> Resul
     if text.is_empty() { return Ok(()); }
     let merges = tok.merges_rank();
 
-    for piece in pretokenizer::split_llama3(text) {
+    // VENDORED-LOCAL: preserve added-token matching before NFC normalization.
+    use unicode_normalization::UnicodeNormalization;
+    let normalized;
+    let text = if tok.qwen3_pre { normalized=text.nfc().collect::<String>(); &normalized } else {text};
+    let pieces=if tok.qwen3_pre {pretokenizer::split_qwen3(text)} else {pretokenizer::split_llama3(text)};
+    for piece in pieces {
         let visible = bytes_to_visible(piece.as_bytes());
         let mut tokens: Vec<String> = visible.chars().map(|c| c.to_string()).collect();
 

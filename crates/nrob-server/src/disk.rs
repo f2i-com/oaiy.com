@@ -19,7 +19,7 @@
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{channel, Sender};
+use std::sync::mpsc::{sync_channel, SyncSender};
 use std::sync::{Arc, atomic::{AtomicU8, Ordering}};
 use std::time::SystemTime;
 
@@ -38,10 +38,21 @@ pub trait PromptState: Send + 'static {
     fn encoded_len(&self) -> usize;
     /// Append the state's bytes.
     fn encode(&self, out: &mut Vec<u8>);
+    /// Override for large states to avoid a second full in-memory copy.
+    fn write_to(&self, out: &mut dyn Write) -> std::io::Result<()> {
+        let mut bytes = Vec::with_capacity(self.encoded_len());
+        self.encode(&mut bytes);
+        out.write_all(&bytes)
+    }
     /// Read back what `encode` wrote.
     fn decode(bytes: &[u8]) -> nrob::Result<Self>
     where
         Self: Sized;
+    fn read_from(input: &mut dyn Read, length: u64) -> nrob::Result<Self> where Self: Sized {
+        let mut bytes = Vec::new();
+        input.take(length).read_to_end(&mut bytes)?;
+        Self::decode(&bytes)
+    }
 }
 
 impl PromptState for dsv41_cuda::Snapshot {
@@ -98,7 +109,7 @@ pub struct DiskCache<S: PromptState> {
     fingerprint: u64,
     budget: u64,
     entries: Vec<Entry>,
-    writer: Sender<Job<S>>,
+    writer: SyncSender<Job<S>>,
 }
 
 /// FNV-1a, for file names and fingerprints (not security).
@@ -155,7 +166,8 @@ impl<S: PromptState> DiskCache<S> {
             let meta = item.metadata()?;
             entries.push(Entry { path, keys, bytes: meta.len(), used: meta.modified().unwrap_or(SystemTime::UNIX_EPOCH), base, ready: Arc::new(AtomicU8::new(1)) });
         }
-        let (writer, jobs) = channel::<Job<S>>();
+        // Backpressure bounds retained snapshots if storage falls behind inference.
+        let (writer, jobs) = sync_channel::<Job<S>>(1);
         std::thread::Builder::new()
             .name("prompt cache".into())
             .spawn(move || {
@@ -163,10 +175,12 @@ impl<S: PromptState> DiskCache<S> {
                     match job {
                         Job::Write { path, header, snap, ready } => {
                             let tmp = path.with_extension("tmp");
-                            let mut bytes = header;
-                            snap.encode(&mut bytes);
-                            let wrote = File::create(&tmp).and_then(|mut f| f.write_all(&bytes)).and_then(|()| fs::rename(&tmp, &path));
-                            if wrote.is_err() {
+                            let wrote = File::create(&tmp).and_then(|mut f| {
+                                f.write_all(&header)?;
+                                snap.write_to(&mut f)
+                            }).and_then(|()| fs::rename(&tmp, &path));
+                            if let Err(error) = &wrote {
+                                eprintln!("nrob-server: writing prompt checkpoint {} failed: {error}", path.display());
                                 let _ = fs::remove_file(&tmp);
                             }
                             ready.store(if wrote.is_ok() { 1 } else { 2 }, Ordering::Release);
@@ -202,10 +216,9 @@ impl<S: PromptState> DiskCache<S> {
     pub fn load(&mut self, i: usize) -> nrob::Result<(Vec<u64>, S)> {
         let read = || -> nrob::Result<(Vec<u64>, S)> {
             let mut file = File::open(&self.entries[i].path)?;
-            let (_, keys, _) = read_header(&mut file, self.fingerprint).ok_or_else(|| nrob::Error::Format("not a prompt state of this model".into()))?;
-            let mut rest = Vec::new();
-            file.read_to_end(&mut rest)?;
-            let snap = S::decode(&rest)?;
+            let (_, keys, header_len) = read_header(&mut file, self.fingerprint).ok_or_else(|| nrob::Error::Format("not a prompt state of this model".into()))?;
+            let remaining = file.metadata()?.len().saturating_sub(header_len);
+            let snap = S::read_from(&mut file, remaining)?;
             if snap.pos() != keys.len() {
                 return Err(nrob::Error::Format("damaged prompt state".into()));
             }
@@ -339,7 +352,7 @@ mod tests {
 #[cfg(test)]
 mod publication_tests {
     use super::*;
-    use std::sync::{Mutex, mpsc::Receiver};
+    use std::sync::{Mutex, mpsc::{Receiver, Sender, channel}};
     struct State {
         pos: usize,
         gate: Option<(Sender<()>, Mutex<Receiver<()>>)>,
