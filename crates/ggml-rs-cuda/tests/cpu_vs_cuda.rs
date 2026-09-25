@@ -1359,67 +1359,114 @@ fn split_q_and_gate_matches_cpu() {
 
 #[test]
 fn delta_net_step_prefill_seq_matches_cpu() {
-    // Multi-token prefill path (seq=4): exercises the per-token loop in both
+    // Multi-token prefill exercises the recurrence in both
     // CPU + CUDA delta_net_step impls. Both must update conv_state and state
     // sequentially across the seq tokens and produce identical outputs.
     let Some(cuda) = try_cuda() else { return };
     let cpu = CpuBackend::new();
 
-    let seq         = 4;
-    let num_v_heads = 8;
-    let num_k_heads = 4;
-    let head_v_dim  = 32;
-    let head_k_dim  = 32;
-    let v_per_k     = num_v_heads / num_k_heads;
-    let conv_kernel = 4;
-    let conv_dim    = 2 * num_k_heads * head_k_dim + num_v_heads * head_v_dim;
-    let scale_q     = 1.0 / (head_v_dim as f32).sqrt();
-    let eps         = 1e-6f32;
+    // VENDORED-LOCAL: generic fallback, short full-width batch and a real
+    // prefill-length recurrence, with nonzero initial state in every case.
+    for (seq, num_v_heads, num_k_heads, head_v_dim) in
+        [(4, 8, 4, 32), (3, 6, 2, 128), (512, 6, 2, 128)]
+    {
+        let head_k_dim = head_v_dim;
+        let v_per_k = num_v_heads / num_k_heads;
+        let conv_kernel = 4;
+        let conv_dim = 2 * num_k_heads * head_k_dim + num_v_heads * head_v_dim;
+        let scale_q = 1.0 / (head_v_dim as f32).sqrt();
+        let eps = 1e-6f32;
 
-    let mqkv  = Tensor::from_vec(deterministic_floats(seq * conv_dim, 0.5, 70001),
-                                 vec![seq, conv_dim]);
-    let z     = Tensor::from_vec(deterministic_floats(seq * num_v_heads * head_v_dim, 0.5, 70002),
-                                 vec![seq, num_v_heads * head_v_dim]);
-    let ba    = Tensor::from_vec(deterministic_floats(seq * 2 * num_v_heads, 0.3, 70003),
-                                 vec![seq, 2 * num_v_heads]);
-    let cw    = Tensor::from_vec(deterministic_floats(conv_dim * conv_kernel, 0.2, 70004),
-                                 vec![conv_dim, conv_kernel]);
-    let sa    = Tensor::from_vec(deterministic_floats(num_v_heads, 0.5, 70005),
-                                 vec![num_v_heads]);
-    let dt    = Tensor::from_vec(deterministic_floats(num_v_heads, 0.1, 70006),
-                                 vec![num_v_heads]);
-    let nm    = Tensor::from_vec(deterministic_floats(head_v_dim, 0.4, 70007),
-                                 vec![head_v_dim]);
+        let mqkv = Tensor::from_vec(
+            deterministic_floats(seq * conv_dim, 0.5, 70001),
+            vec![seq, conv_dim],
+        );
+        let z = Tensor::from_vec(
+            deterministic_floats(seq * num_v_heads * head_v_dim, 0.5, 70002),
+            vec![seq, num_v_heads * head_v_dim],
+        );
+        let ba = Tensor::from_vec(
+            deterministic_floats(seq * 2 * num_v_heads, 0.3, 70003),
+            vec![seq, 2 * num_v_heads],
+        );
+        let cw = Tensor::from_vec(
+            deterministic_floats(conv_dim * conv_kernel, 0.2, 70004),
+            vec![conv_dim, conv_kernel],
+        );
+        let sa = Tensor::from_vec(
+            deterministic_floats(num_v_heads, 0.5, 70005)
+                .into_iter()
+                .map(|v| -v.abs())
+                .collect(),
+            vec![num_v_heads],
+        );
+        let dt = Tensor::from_vec(
+            deterministic_floats(num_v_heads, 0.1, 70006),
+            vec![num_v_heads],
+        );
+        let nm = Tensor::from_vec(
+            deterministic_floats(head_v_dim, 0.4, 70007),
+            vec![head_v_dim],
+        );
 
-    let conv_state_cpu = Tensor::zeros(vec![conv_kernel - 1, conv_dim]);
-    let state_cpu      = Tensor::zeros(vec![num_v_heads, head_v_dim, head_v_dim]);
+        let conv_state_cpu = Tensor::from_vec(
+            deterministic_floats((conv_kernel - 1) * conv_dim, 0.2, 70008),
+            vec![conv_kernel - 1, conv_dim],
+        );
+        let state_cpu = Tensor::from_vec(
+            deterministic_floats(num_v_heads * head_v_dim * head_v_dim, 0.1, 70009),
+            vec![num_v_heads, head_v_dim, head_v_dim],
+        );
 
-    let mut conv_state_a = conv_state_cpu.clone();
-    let mut state_a      = state_cpu.clone();
-    let out_cpu = cpu.delta_net_step(
-        &mqkv, &z, &ba, &cw, &sa, &dt, &nm,
-        &mut conv_state_a, &mut state_a,
-        seq, num_v_heads, num_k_heads, head_v_dim, head_k_dim, v_per_k, scale_q, eps,
-    );
+        let mut conv_state_a = conv_state_cpu.clone();
+        let mut state_a = state_cpu.clone();
+        let out_cpu = cpu.delta_net_step(
+            &mqkv,
+            &z,
+            &ba,
+            &cw,
+            &sa,
+            &dt,
+            &nm,
+            &mut conv_state_a,
+            &mut state_a,
+            seq,
+            num_v_heads,
+            num_k_heads,
+            head_v_dim,
+            head_k_dim,
+            v_per_k,
+            scale_q,
+            eps,
+        );
 
-    let mut conv_state_b = cuda.to_device(conv_state_cpu);
-    let mut state_b      = cuda.to_device(state_cpu);
-    let out_cuda = cuda.delta_net_step(
-        &cuda.to_device(mqkv),
-        &cuda.to_device(z),
-        &cuda.to_device(ba),
-        &cuda.to_device(cw),
-        &cuda.to_device(sa),
-        &cuda.to_device(dt),
-        &cuda.to_device(nm),
-        &mut conv_state_b, &mut state_b,
-        seq, num_v_heads, num_k_heads, head_v_dim, head_k_dim, v_per_k, scale_q, eps,
-    );
+        let mut conv_state_b = cuda.to_device(conv_state_cpu);
+        let mut state_b = cuda.to_device(state_cpu);
+        let out_cuda = cuda.delta_net_step(
+            &cuda.to_device(mqkv),
+            &cuda.to_device(z),
+            &cuda.to_device(ba),
+            &cuda.to_device(cw),
+            &cuda.to_device(sa),
+            &cuda.to_device(dt),
+            &cuda.to_device(nm),
+            &mut conv_state_b,
+            &mut state_b,
+            seq,
+            num_v_heads,
+            num_k_heads,
+            head_v_dim,
+            head_k_dim,
+            v_per_k,
+            scale_q,
+            eps,
+        );
 
-    assert_eq!(out_cuda.shape(), &[seq, num_v_heads * head_v_dim]);
-    assert_tensors_close(&out_cuda, &out_cpu, 1e-3);
-    assert_tensors_close(&conv_state_b, &conv_state_a, 1e-4);
-    assert_tensors_close(&state_b, &state_a, 1e-3);
+        assert_eq!(out_cuda.shape(), &[seq, num_v_heads * head_v_dim]);
+        assert_tensors_close(&out_cuda, &out_cpu, 1e-4);
+        assert_tensors_close(&conv_state_b, &conv_state_a, 1e-4);
+        assert_tensors_close(&state_b, &state_a, 1e-4);
+    }
 }
 
 // VENDORED-LOCAL: GLM-5.3-Flash clamped SwiGLU.

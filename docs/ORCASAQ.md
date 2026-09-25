@@ -139,6 +139,46 @@ Model loading and the first warm-up request are excluded. Fresh descriptions,
 wide-image OCR and two-image comparisons also passed. The text-only 128-token
 benchmark still generated at **51.0 tokens/s** (2.51 seconds).
 
+The next prefill optimization distributes each 128-wide recurrent state row
+over a CUDA warp, then normalizes the output in a separate kernel. It retains
+FP32 arithmetic and the existing fused single-token decoder. Three warm
+512-token model-only prefills took **1.114 / 1.111 / 1.114 seconds**, compared
+with **1.231 / 1.231 / 1.227 seconds** before this change (about 9.5% less time).
+These timings exclude vision encoding, checkpoint copies and response generation.
+CPU comparisons cover nonzero initial states and 3/512-token full-width batches,
+with absolute/relative tolerance `1e-4` for outputs and recurrent state; the
+generic smaller-head fallback is also covered. The full 260K allocation plus
+512-token image prefill and exact checkpoint restoration still passes.
+On the same fresh-image OCR request used above, three complete requests now
+took **2.06 / 2.06 / 2.07 seconds** (about 8% less time than 2.25 seconds).
+The 128-token text response still took **2.50 seconds (51.2 tokens/s)**.
+
+To verify image grounding independently of familiar demonstration images:
+
+```powershell
+python tools/orcasaq/vision_grounding.py --state PATH_TO_PROJECT_DAEMON_JSON --output target/vision-grounding --font C:/Windows/Fonts/arialbd.ttf
+```
+
+This manual test draws four random codes and different circle/square colours.
+The questions stay identical; answers occur only in the pixels, never the
+request text or filenames. It checks changed images, returning to the first
+image, and blank/no-image controls. Review the saved report's shape-colour
+assignments as well as its keyword checks. Initial controlled OCR returned
+all four previously unseen codes correctly; revisiting the first restored
+608/609 tokens and returned its original code. Blank and no-image controls
+elicited invented numbers at temperature zero, and a combined OCR/colour
+question sometimes omitted the code. Pixel conditioning is verified; these
+experiments do not establish general vision reliability.
+An additional four-card set read three codes exactly, but rendered `JBL 522`
+as `JBL 52`; all four circle/square colour assignments were correct. The
+grounding tool reports that missed digit as a failure instead of hiding it.
+Rebuilding with the previous recurrent kernel and bypassing the image cache
+produced the same `JBL 52` response, confirming this case predates the change.
+A live coder-cli session called `image_read` once on a neutrally named local
+card and correctly answered `LEK 427`; neither the filename nor the prompt
+contained that code. Nrob's workspace suite passed 537 tests (93 ignored),
+in addition to the manual full-capacity and release CUDA comparisons.
+
 ### Text runtime
 
 - The safetensors configuration selects the native Qwen hybrid runtime.
@@ -199,6 +239,7 @@ The model card recommends temperature 1.0, top_p 0.95 and top_k 20.
 cargo test --workspace
 cargo test --release -p ggml-rs-cuda --test exl3 --test long_attention
 cargo test --release -p nrob-server benchmark_real_model_decode -- --ignored --nocapture
+cargo test --release -p nrob-server benchmark_real_model_prefill -- --ignored --nocapture
 cargo test --release -p nrob-server real_model_distributed_cache -- --ignored --nocapture
 cargo test --release -p nrob-server tokenizer_matches_huggingface_oracle -- --ignored
 python tools/orcasaq/download.py --verify-only

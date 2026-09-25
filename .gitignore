@@ -13,6 +13,7 @@
 
 # Logs and scratch
 *.log
+/.coder-cli/
 
 # Python tooling (tools/dsv41)
 __pycache__/

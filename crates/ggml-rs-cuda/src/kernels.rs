@@ -6,6 +6,64 @@
 //! don't shuttle every op through host memory.
 
 pub const KERNEL_SRC: &str = r#"
+// VENDORED-LOCAL: a warp owns one 128-wide recurrent state row. Coalesced
+// state access and four registers per lane replace a serial 128-element dot
+// product and block barriers at every token. Normalization follows separately
+// because it couples the otherwise independent value rows.
+__device__ float delta_warp_sum(float x) {
+    for (int d=16; d>0; d>>=1) x+=__shfl_down_sync(0xffffffff,x,d);
+    return __shfl_sync(0xffffffff,x,0);
+}
+extern "C" __global__ void delta_net_rows_128_f32(
+    const float* conv, const float* ba, const float* ssm_a, const float* bias,
+    float* state, float* core, int seq, int nv, int nk, float scale, float eps) {
+    int lane=threadIdx.x%32, row=blockIdx.y*4+threadIdx.x/32;
+    int hv=blockIdx.x, hk=hv%nk, cd=(2*nk+nv)*128;
+    int base=(hv*128+row)*128;
+    float st[4];
+    #pragma unroll
+    for(int j=0;j<4;++j) st[j]=state[base+lane+j*32];
+    for(int t=0;t<seq;++t) {
+        float q[4], k[4], qq=0.f, kk=0.f;
+        #pragma unroll
+        for(int j=0;j<4;++j) {
+            q[j]=conv[t*cd+hk*128+lane+j*32];
+            k[j]=conv[t*cd+(nk+hk)*128+lane+j*32];
+            qq+=q[j]*q[j]; kk+=k[j]*k[j];
+        }
+        float iq=rsqrtf(delta_warp_sum(qq)+eps)*scale;
+        float ik=rsqrtf(delta_warp_sum(kk)+eps);
+        float alpha=ba[t*2*nv+nv+hv]+bias[hv];
+        float decay=expf((alpha>20.f?alpha:log1pf(expf(alpha)))*ssm_a[hv]);
+        float beta=1.f/(1.f+expf(-ba[t*2*nv+hv]));
+        float dot=0.f;
+        #pragma unroll
+        for(int j=0;j<4;++j) {
+            q[j]*=iq; k[j]*=ik; st[j]*=decay; dot+=st[j]*k[j];
+        }
+        float dv=(conv[t*cd+2*nk*128+hv*128+row]-delta_warp_sum(dot))*beta;
+        float out=0.f;
+        #pragma unroll
+        for(int j=0;j<4;++j) { st[j]+=dv*k[j]; out+=st[j]*q[j]; }
+        out=delta_warp_sum(out);
+        if(lane==0) core[(t*nv+hv)*128+row]=out;
+    }
+    #pragma unroll
+    for(int j=0;j<4;++j) state[base+lane+j*32]=st[j];
+}
+extern "C" __global__ void delta_net_norm_128_f32(
+    const float* core, const float* z, const float* norm, float* out, float eps) {
+    int base=blockIdx.x*128, lane=threadIdx.x;
+    float v[4], ss=0.f;
+    #pragma unroll
+    for(int j=0;j<4;++j) { v[j]=core[base+lane+j*32]; ss+=v[j]*v[j]; }
+    float inv=rsqrtf(delta_warp_sum(ss)/128.f+eps);
+    #pragma unroll
+    for(int j=0;j<4;++j) {
+        int d=lane+j*32; float zv=z[base+d];
+        out[base+d]=v[j]*inv*norm[d]*(zv/(1.f+expf(-zv)));
+    }
+}
 // VENDORED-LOCAL: arbitrary axial NeoX frequency/position mapping.
 extern "C" __global__ void rope_axes_f32(float* x, const unsigned int* positions,
     const unsigned int* map, int count, int heads, int width, int half,
@@ -2896,6 +2954,8 @@ pub const KERNEL_NAMES: &[&str] = &[
     "delta_net_decode_step_f32",
     "delta_net_conv1d_loop_f32",
     "delta_net_step_loop_f32",
+    "delta_net_rows_128_f32",
+    "delta_net_norm_128_f32",
     "split_q_and_gate_f32",
     "split_qkv_3way_f32",
     "linear_q4_k_gemv_coop_f32",

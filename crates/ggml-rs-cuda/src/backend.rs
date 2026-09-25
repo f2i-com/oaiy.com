@@ -1735,6 +1735,52 @@ impl Backend for CudaBackend {
                 .launch(conv_cfg)
                 .expect("delta_net_conv1d_loop launch");
         }
+        // VENDORED-LOCAL: long prefills benefit from distributing state rows
+        // across SMs. Decode retains its single fused launch.
+        if seq > 1 && head_k_dim == 128 && head_v_dim == 128 {
+            // SAFETY: every core/output element and state row has one writer.
+            // Full warps own 128-wide rows; the second launch runs after the
+            // first on this stream, and all buffers outlive both launches.
+            let mut core =
+                unsafe { self.stream.alloc::<f32>(seq * num_v_heads * 128) }.expect("delta core");
+            // SAFETY: launch dimensions cover disjoint rows/elements, and the
+            // ordered stream keeps the initialized core alive for normalization.
+            unsafe {
+                self.stream
+                    .launch_builder(self.func("delta_net_rows_128_f32"))
+                    .arg(&conv_out)
+                    .arg(ba_dev.as_ref())
+                    .arg(sa_dev.as_ref())
+                    .arg(dt_dev.as_ref())
+                    .arg(st_dev)
+                    .arg(&mut core)
+                    .arg(&seq_i)
+                    .arg(&nvh)
+                    .arg(&nkh)
+                    .arg(&scale_q)
+                    .arg(&eps)
+                    .launch(LaunchConfig {
+                        grid_dim: (num_v_heads as u32, 32, 1),
+                        block_dim: (128, 1, 1),
+                        shared_mem_bytes: 0,
+                    })
+                    .expect("delta rows");
+                self.stream
+                    .launch_builder(self.func("delta_net_norm_128_f32"))
+                    .arg(&core)
+                    .arg(z_dev.as_ref())
+                    .arg(nm_dev.as_ref())
+                    .arg(&mut output)
+                    .arg(&eps)
+                    .launch(LaunchConfig {
+                        grid_dim: ((seq * num_v_heads) as u32, 1, 1),
+                        block_dim: (32, 1, 1),
+                        shared_mem_bytes: 0,
+                    })
+                    .expect("delta norm");
+            }
+            return self.make_tensor(output, vec![seq, num_v_heads * head_v_dim]);
+        }
         unsafe {
             self.stream
                 .launch_builder(self.func("delta_net_step_loop_f32"))

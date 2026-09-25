@@ -18,6 +18,21 @@ fn bad(s: impl Into<String>) -> Error {
 mod runtime_tests {
     use super::*;
     #[test]
+    #[ignore = "manual real-model prefill timing/profiling, requires downloaded weights"]
+    fn benchmark_real_model_prefill() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models/OrcaSAQ-2-27B");
+        let model = load(&path, &[0, 1]).unwrap();
+        let token = model.tokenizer().encode("Hello", false).unwrap()[0];
+        let tokens = vec![token; crate::qwen::PREFILL_CHUNK];
+        for run in 0..4 {
+            let mut kv = model.new_kv_cache(260000);
+            let start = std::time::Instant::now();
+            let logits = model.forward(&tokens, &mut kv).to_host();
+            assert!(logits.data().iter().all(|v| v.is_finite()));
+            eprintln!("prefill run {run}: {} tokens in {:.3}s", tokens.len(), start.elapsed().as_secs_f64());
+        }
+    }
+    #[test]
     #[ignore = "manual real-model decode timing/profiling, requires downloaded weights"]
     fn benchmark_real_model_decode() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models/OrcaSAQ-2-27B");
