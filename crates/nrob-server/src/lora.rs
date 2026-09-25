@@ -119,10 +119,13 @@ pub(crate) struct Adapter {
 }
 impl Adapter {
     pub fn open(path: &Path) -> Result<Self> {
-        let config_bytes = std::fs::read(path.join("adapter_config.json"))?;
+        let config_path = path.join("adapter_config.json");
+        let config_bytes = std::fs::read(&config_path)
+            .map_err(|error| bad(format!("reading {}: {error}", config_path.display())))?;
         let config = Config::parse(&Json::parse(&config_bytes)?)?;
         let weights = path.join("adapter_model.safetensors");
-        let index = StIndex::open_file(&weights)?;
+        let index = StIndex::open_file(&weights)
+            .map_err(|error| bad(format!("opening {}: {error}", weights.display())))?;
         let mut pairs = BTreeMap::new();
         for key in index.names() {
             let name = key
@@ -391,6 +394,16 @@ mod tests {
         std::fs::write(dir.join("adapter_model.safetensors"), file).unwrap();
         (a, b)
     }
+    #[test]
+    fn missing_adapter_files_report_the_exact_path() {
+        let dir = Temp::new();
+        let error = Adapter::open(&dir.0).err().unwrap().to_string();
+        assert!(error.contains(&dir.0.join("adapter_config.json").display().to_string()));
+        std::fs::write(dir.0.join("adapter_config.json"), CONFIG).unwrap();
+        let error = Adapter::open(&dir.0).err().unwrap().to_string();
+        assert!(error.contains(&dir.0.join("adapter_model.safetensors").display().to_string()));
+    }
+
     #[test]
     fn scaling_and_unsupported_variants() {
         let c = Json::parse(CONFIG.as_bytes()).unwrap();
