@@ -65,13 +65,18 @@ async function getJson(url: string, init: RequestInit, signal?: AbortSignal): Pr
 }
 
 /** Ask the server how big the model's window is. Null when it does not say. */
-export async function detectContextWindow(provider: ProviderConfig, signal?: AbortSignal): Promise<{ tokens: number; how: string } | null> {
+/**
+ * `guess` marks a number the server did not state for this load (Ollama's
+ * usual default, before the model is loaded): use it, but do not keep it, and
+ * ask again once the model has answered.
+ */
+export async function detectContextWindow(provider: ProviderConfig, signal?: AbortSignal): Promise<{ tokens: number; how: string; guess?: boolean } | null> {
   const model = provider.modelId?.trim();
   if (!model || provider.type === 'anthropic') return null;
   const endpoints = providerEndpoints(provider);
   const headers = providerHeaders(provider);
   const origin = new URL(endpoints.chat).origin;
-  const attempts: Array<() => Promise<{ tokens: number; how: string } | null>> = [];
+  const attempts: Array<() => Promise<{ tokens: number; how: string; guess?: boolean } | null>> = [];
   const isOllama = provider.serverKind === 'ollama' || /:11434$/.test(origin);
   if (isOllama) {
     attempts.push(async () => {
@@ -115,7 +120,7 @@ export async function detectContextWindow(provider: ProviderConfig, signal?: Abo
     const key = Object.keys(body.model_info ?? {}).find((k) => k.endsWith('.context_length'));
     // The model's maximum, but Ollama's default load is smaller: capped at its usual default.
     const tokens = key ? num(body.model_info![key]) : null;
-    return tokens ? { tokens: Math.min(tokens, 4096), how: 'Ollama\'s default load size (the model allows more: set OLLAMA_CONTEXT_LENGTH or num_ctx, then detect again)' } : null;
+    return tokens ? { tokens: Math.min(tokens, 4096), how: 'Ollama\'s usual load size (the model is not loaded yet; checked again once it has answered)', guess: true } : null;
   });
   for (const attempt of attempts) {
     try {

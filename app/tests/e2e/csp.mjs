@@ -51,23 +51,17 @@ try {
     expect(!violations.length, violations.join('\n'));
   });
 
-  await check('script inside an SVG opened from a blob URL does not run', async () => {
-    const ran = await page.evaluate(async () => {
+  await check('script inside an SVG opened from a blob URL in a new tab does not run', async () => {
+    // "Open image in new tab" on an SVG the model wrote: the tab inherits the page's policy.
+    const opened = browser.waitForTarget((t) => t.url().startsWith('blob:'), { timeout: 10_000 });
+    await page.evaluate(() => {
       const svg = '<svg xmlns="http://www.w3.org/2000/svg"><script>window.__svgRan = true</script></svg>';
-      const url = URL.createObjectURL(new Blob([svg], { type: 'image/svg+xml' }));
-      const frame = document.createElement('iframe');
-      frame.src = url;
-      document.body.append(frame);
-      await new Promise((r) => setTimeout(r, 1500));
-      let inside = false;
-      try {
-        inside = frame.contentWindow.__svgRan === true;
-      } catch {
-        inside = false;
-      }
-      frame.remove();
-      return inside;
+      window.open(URL.createObjectURL(new Blob([svg], { type: 'image/svg+xml' })), '_blank');
     });
+    const tab = await (await opened).page();
+    await new Promise((r) => setTimeout(r, 1000));
+    const ran = await tab.evaluate(() => window.__svgRan === true);
+    await tab.close();
     expect(!ran, 'the SVG script ran');
   });
 } finally {

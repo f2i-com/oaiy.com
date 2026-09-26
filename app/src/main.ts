@@ -230,6 +230,9 @@ async function main(): Promise<void> {
     });
     agent.turns = await project.loadChat();
     announce();
+    // The first project is open: the page is usable from here on.
+    header.inert = false;
+    workspace.inert = false;
     tree.setVfs(project.vfs);
     editor.setVfs(project.vfs);
     terminal.setVfs(project.vfs);
@@ -282,6 +285,8 @@ async function main(): Promise<void> {
    * is too small to work in.
    */
   const windowsChecked = new Set<string>();
+  /** Models whose window was only guessed (Ollama before the model was loaded): asked again after a reply. */
+  const windowsGuessed = new Set<string>();
   async function checkWindow(): Promise<void> {
     const p = activeProvider();
     if (!p?.modelId || p.contextTokens) return;
@@ -290,6 +295,10 @@ async function main(): Promise<void> {
     windowsChecked.add(key);
     if (p.type !== 'anthropic' && p.detectedContext?.model !== p.modelId) {
       const found = await detectContextWindow(p, AbortSignal.timeout(5000)).catch(() => null);
+      if (found?.guess) {
+        windowsGuessed.add(key);
+        return;
+      }
       if (found) {
         p.detectedContext = { model: p.modelId, tokens: found.tokens, how: found.how, at: Date.now() };
         await saveProviders(providers, activeId);
@@ -451,6 +460,18 @@ async function main(): Promise<void> {
       await runProject.saveChat(runAgent.turns);
       finish();
       currentRun = null;
+      // The model is loaded now: a window that was only guessed can be read for real.
+      const p = activeProvider();
+      if (p?.modelId && windowsGuessed.has(`${p.id}|${p.modelId}`)) {
+        windowsGuessed.delete(`${p.id}|${p.modelId}`);
+        const found = await detectContextWindow(p, AbortSignal.timeout(8000)).catch(() => null);
+        if (found && !found.guess) {
+          p.detectedContext = { model: p.modelId, tokens: found.tokens, how: found.how, at: Date.now() };
+          await saveProviders(providers, activeId);
+          windowsChecked.delete(`${p.id}|${p.modelId}`);
+          chat.system(`${p.modelId}: ${formatTokens(found.tokens)} tokens of context (from ${found.how}), now that the model is loaded.`);
+        }
+      }
     }
   }
 
@@ -733,8 +754,6 @@ A project can hold several apps, each in its own folder (any folder whose manife
   } else {
     await openProject(meta);
   }
-  header.inert = false;
-  workspace.inert = false;
 
   const sandbox = sandboxAvailable();
   if (!sandbox.ok) chat.system(`The code sandbox is unavailable: ${sandbox.reason}.`, 'error');

@@ -159,6 +159,10 @@ export function openSettings(initial: SettingsResult): Promise<SettingsResult | 
         }
         windowNote.textContent = 'Asking the server…';
         const found = await detectContextWindow(p);
+        if (found?.guess) {
+          windowNote.textContent = `The model is not loaded yet, so its size is not known (Ollama usually loads at ${formatTokens(found.tokens)}). It is read again after the model's first reply; or type the size.`;
+          return;
+        }
         if (found) {
           p.detectedContext = { model: p.modelId, tokens: found.tokens, how: found.how, at: Date.now() };
           showWindow();

@@ -70,6 +70,23 @@ bot.computer can build [SoftN](https://github.com/f2i-com/softn.com) apps and sh
 
 The preview runtime is optional (about 23 MB) and comes from a checksummed softn.com release: `npm run fetch:softn`. Without it, apps can still be written, checked and exported.
 
+## Safe with your work
+
+- **Saving:**
+  - The conversation is saved as a run goes, and everything is written out when the tab is hidden or closed.
+  - Closing the tab while the agent works asks first.
+  - Switching projects mid-run asks, then waits for the run to stop.
+  - Browser storage is requested as persistent, so the browser keeps it rather than clearing it under pressure.
+- **Editing alongside the agent:** if the agent (or the terminal) changes a file while you have unsaved typing in it, the editor asks whether to keep yours or take the new version, instead of overwriting either.
+- **Two tabs:** opening the same project in two tabs shows a warning in both, since each can overwrite the other.
+- **Terminal:** Ctrl+C stops a running command.
+- **Long chats:** a long chat opens at its latest turns, with **Show earlier** for the rest.
+- **Security:**
+  - The page has a Content Security Policy (scripts only from bot.computer itself), which also stops script in an SVG opened in a new tab.
+  - The network gate refuses redirects to this machine or its local network, however the address is written.
+  - Archives are checked before they're unpacked.
+  - Errors reported by a running app are passed to the agent as data, not as your words.
+
 ## Any screen
 
 On a phone or a narrow window, the panes (Files, Editor, Preview, Terminal and Agent) become full-screen views switched from a bottom tab bar. Project actions fold into the ☰ menu.

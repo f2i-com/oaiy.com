@@ -198,6 +198,13 @@ function trackedVfs(vfs: Vfs, record: (path: string) => void): Vfs {
           return result;
         };
       }
+      if (prop === 'copy') {
+        return (from: string, to: string, ...rest: unknown[]) => {
+          const result = fn.call(target, from, to, ...rest);
+          record(normalizePath(to));
+          return result;
+        };
+      }
       if (prop === 'rename') {
         return (from: string, to: string) => {
           const result = fn.call(target, from, to);

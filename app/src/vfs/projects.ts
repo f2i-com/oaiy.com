@@ -143,6 +143,7 @@ export class OpenProject {
   }
 
   private retries = 0;
+  private lastErrorAt = 0;
 
   /** Write everything pending; resolves when it is on disk (or has failed and is queued again). */
   flush(): Promise<void> {
@@ -162,6 +163,8 @@ export class OpenProject {
       // Keep what did not reach the disk (unless something newer replaced it) and try again shortly.
       for (const { change } of failed) if (change.type === 'reset' || !this.pending.has(change.path)) this.pending.set(change.type === 'reset' ? '\u0000reset' : change.path, change);
       this.retries++;
+      if (this.retries > 3 && Date.now() - this.lastErrorAt < 60_000) return;
+      this.lastErrorAt = Date.now();
       this.onError(`Saving ${failed.length === 1 ? failed[0].label : `${failed.length} files`} to this browser's storage failed: ${failed[0].error}.${this.retries <= 3 ? ' Trying again.' : ' Export the project to keep a copy.'}`);
       if (this.retries <= 3 && !this.timer) this.timer = setTimeout(() => void this.flush(), 2000 * this.retries);
     });
