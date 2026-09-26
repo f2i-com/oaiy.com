@@ -11,6 +11,7 @@
  */
 import type { NetGateSettings } from './gate/netgate';
 import type { ProviderConfig } from './agent/providers/types';
+import { EMPTY_MEDIA, type MediaSettings } from './agent/media';
 
 const DB = 'bot.computer';
 const STORE = 'kv';
@@ -91,6 +92,8 @@ export interface Settings {
   gate: NetGateSettings;
   lastProjectId: string | null;
   agent: AgentSettings;
+  /** The image and video service (nrob, or any OpenAI-spec one). */
+  media: MediaSettings;
 }
 
 export async function loadSettings(): Promise<Settings> {
@@ -103,6 +106,12 @@ export async function loadSettings(): Promise<Settings> {
     gate: (await get<NetGateSettings>('gate')) ?? { mode: 'open', allow: [], deny: [] },
     lastProjectId: (await get<string | null>('last-project')) ?? null,
     agent: { ...DEFAULT_AGENT_SETTINGS, ...((await get<Partial<AgentSettings>>('agent-settings')) ?? {}) },
+    media: await (async () => {
+      const stored = await get<Omit<MediaSettings, 'apiKey'> & { apiKeySealed: Sealed | null }>('media');
+      if (!stored) return { ...EMPTY_MEDIA };
+      const { apiKeySealed, ...rest } = stored;
+      return { ...EMPTY_MEDIA, ...rest, apiKey: await open(apiKeySealed) };
+    })(),
   };
 }
 
@@ -115,6 +124,11 @@ export async function saveProviders(providers: ProviderConfig[], activeId: strin
 
 export async function saveAgentSettings(settings: AgentSettings): Promise<void> {
   await put('agent-settings', settings);
+}
+
+export async function saveMedia(media: MediaSettings): Promise<void> {
+  const { apiKey, ...rest } = media;
+  await put('media', { ...rest, apiKeySealed: await seal(apiKey) });
 }
 
 export async function saveGate(settings: NetGateSettings): Promise<void> {

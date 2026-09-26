@@ -5,7 +5,8 @@ A coding agent that runs entirely in your browser.
 - **Your projects stay in the browser.** Files live in the browser's private file system (OPFS). Open a folder from disk, import a `.zip`, export one back, or start from scratch. Everything works offline once the page has loaded (it installs as an app).
 - **AI-written code runs on the [Zipp](https://github.com/f2i-com/zipp.org) VM.** JavaScript and Python run in Zipp's WebAssembly engine inside a Web Worker. The code can reach the project and nothing else, except what the network gate lets through.
 - **A shell, emulated.** The terminal and the agent's `sandbox_shell` are a bash-like shell written in JavaScript on the same sandbox, with `git`, `jq`, `tar`/`zip`, `node` and `python` built in (see [The shell](#the-shell)). There are no real processes, so `npm install` and compilers don't exist here.
-- **Any model.** A server on your own machine (Ollama, LM Studio, llama.cpp, nrob-server — anything OpenAI-compatible), Anthropic's API, or any OpenAI-compatible API.
+- **Any model.** A server on your own machine (Ollama, LM Studio, nrob, llama.cpp — anything OpenAI-compatible), Anthropic's API, or any OpenAI-compatible API.
+- **Images and video.** With nrob, or any service with OpenAI's image and video APIs, the agent can make pictures and short videos straight into the project (see [Images and video](#images-and-video)).
 - **A network gate.** `/internet on | off | allowlist | allow <host> | deny <host> | status` (or `/net`) decides every request made on the model's behalf. Requests to your AI provider are not gated.
 
 ## Context and long work
@@ -28,6 +29,23 @@ A coding agent that runs entirely in your browser.
   - Tasks wait in a queue per model: one at a time for a local server (which usually answers one request at a time), three for an API. Change it under **Agents** in Settings. Stop cancels the waiting tasks as well as the running ones.
   - A task can name the plan step it completes, so the plan updates as tasks finish. The chat shows each task live: queued, working (with what it's doing right now), then done, with its report.
 - **The meter** in the Agent pane's title shows how full the context is. The provider's own token counts calibrate the estimate as it goes.
+
+## Images and video
+
+The agent gets two more tools when an image and video service is set up:
+- `generate_image` saves PNGs: from a prompt, or from reference pictures to edit or combine.
+- `generate_video` saves an MP4: from a prompt, or animating a start image.
+
+The results appear in the chat (a video gets a player) and in the project, where an app can use them.
+
+- **nrob is found on its own.** When the page opens, it asks `http://127.0.0.1:8080/v1/discovery`.
+  - If nrob answers, its image and video models, their limits (sizes, edits, seconds) and its defaults fill **Settings → Images and video**.
+  - nrob is also added as a chat provider if none points at it yet. It becomes the active one only if nothing else is.
+  - Found again later, its model lists are refreshed. Your chosen models and key stay.
+- **nrob has to allow the page.** Without an API key, nrob answers only the origins listed in `gateway.cors_origins` in its config. Add bot.computer's address there (the chat says which one), or set an API key in nrob and type it in Settings. Then press **Find nrob**.
+- **Other services.** Type the address of any OpenAI-spec service (for example `https://api.openai.com/v1`) and its key, then **List models** and choose. Images use `/images/generations` and `/images/edits`. Video uses `/videos` and follows the job until it's done.
+- **While it works.** The chat shows a video's progress. Stopping the agent cancels the job. The models' limits are in the tools' descriptions, so the model asks for sizes and lengths the service can make.
+- **Privacy.** These requests go straight from the page to the service you set up, like requests to your AI provider. They are not behind the network gate. Keys are stored encrypted with the provider keys.
 
 ## Files, images and big files
 
@@ -161,7 +179,7 @@ The shell works on the project's files through the same host calls, so it can't 
 
 ```sh
 npm test           # unit: gate, virtual filesystem, agent loop over both wire formats
-npm run test:e2e   # headless Chrome: the sandbox, shell, git and tools (tests/e2e/run.mjs) and the whole app with a scripted model (tests/e2e/app.mjs)
+npm run test:e2e   # headless Chrome: the sandbox, shell, git and tools (tests/e2e/run.mjs), the whole app with a scripted model (tests/e2e/app.mjs), images and video with a mock nrob (tests/e2e/nrob.mjs)
 ```
 
 The end-to-end tests use a local Chrome or Edge (`CHROME=<path>` to choose one).

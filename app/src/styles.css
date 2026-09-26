@@ -369,6 +369,18 @@ details.msg.compacted pre { white-space: pre-wrap; font-size: 12px; max-height: 
 .agent-settings { display: flex; flex-direction: column; gap: 6px; margin: 4px 0 12px; padding-top: 10px; border-top: 1px solid var(--border); font-size: 13px; }
 .agent-settings label { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 .agent-settings input { width: 70px; }
+.media-settings .provider-form { display: flex; flex-direction: column; gap: 6px; }
+.media-settings .provider-form label { display: grid; grid-template-columns: 90px 1fr; align-items: center; gap: 8px; }
+.media-settings .provider-form input { width: 100%; min-width: 0; }
+.media-settings .window-picker { flex-wrap: nowrap; }
+.media-settings .window-picker input { flex: 1 1 auto; width: auto; }
+.media-settings .window-picker button { flex: none; }
+.media-settings .model-choice { display: block; }
+.media-settings > label input { width: auto; }
+@media (max-width: 700px) {
+  .media-settings .provider-form label { grid-template-columns: 1fr; gap: 4px; }
+  .media-settings .window-picker { flex-wrap: wrap; }
+}
 .chat > .pane-title { display: flex; align-items: center; gap: 8px; }
 
 /* Sub-agent tasks in the chat. */

@@ -4,12 +4,13 @@ import type { ProviderConfig } from './agent/providers/types';
 import { HELP, internetCommand } from './commands';
 import { NetGate } from './gate/netgate';
 import { sandboxAvailable, zippModule } from './sandbox/runner';
-import { loadSettings, saveAgentSettings, saveGate, saveLastProject, saveProviders } from './settings';
+import { loadSettings, saveAgentSettings, saveGate, saveLastProject, saveMedia, saveProviders } from './settings';
+import { NROB_ORIGIN, discoverNrob, mergeDiscovered } from './agent/media';
 import { budgetFor, contextWindow, detectContextWindow, formatTokens } from './agent/context';
 import { ChatPane } from './ui/chat';
 import { clear, h } from './ui/dom';
 import { EditorPane } from './ui/editor';
-import { openSettings } from './ui/settings';
+import { nrobProvider, openSettings } from './ui/settings';
 import { TerminalPane } from './ui/terminal';
 import { SoftnPreview } from './softn/preview';
 import { exampleBundle, exampleCatalogue, warmKnowledge } from './softn/knowledge';
@@ -99,6 +100,7 @@ async function main(): Promise<void> {
   let providers: ProviderConfig[] = settings.providers;
   let activeId = settings.activeProviderId;
   let agentSettings = settings.agent;
+  let media = settings.media;
   const activeProvider = () => providers.find((p) => p.id === activeId) ?? null;
 
   let project!: OpenProject;
@@ -216,6 +218,7 @@ async function main(): Promise<void> {
       projectSummary: () => summarizeProject(project.meta, project.vfs, gate),
       softn: preview,
       compactAt: () => agentSettings.compactAt,
+      media: () => media,
       subAgents: () => {
         const p = activeProvider();
         const window = p ? contextWindow(p).tokens : agentSettings.subAgentTokens;
@@ -269,13 +272,15 @@ async function main(): Promise<void> {
   };
 
   const editSettings = async () => {
-    const result = await openSettings({ providers, activeId, agent: agentSettings });
+    const result = await openSettings({ providers, activeId, agent: agentSettings, media });
     if (!result) return;
     providers = result.providers;
     activeId = result.activeId;
     agentSettings = result.agent;
+    media = result.media;
     await saveProviders(providers, activeId);
     await saveAgentSettings(agentSettings);
+    await saveMedia(media);
     renderChips();
   };
 
@@ -739,6 +744,47 @@ A project can hold several apps, each in its own folder (any folder whose manife
   });
   const announce = () => tabChannel?.postMessage({ type: 'open', tab: tabId, project: project.meta.id });
 
+  /**
+   * nrob on this computer: read its discovery document and set up images,
+   * video and chat from it. A service set up by hand is left alone; one found
+   * before is refreshed (its models may have changed). `?nrob=<address>` looks
+   * somewhere else; automated browsers (the tests) only look when asked to.
+   */
+  async function lookForNrob(): Promise<void> {
+    const asked = new URLSearchParams(location.search).get('nrob');
+    const where = asked ?? (navigator.webdriver ? null : media.discovered?.origin ?? NROB_ORIGIN);
+    if (!where || (media.baseUrl && !media.discovered && !asked)) return;
+    const found = await discoverNrob(where, media.apiKey, undefined, 3000).catch(() => null);
+    if (!found || found.state === 'absent') return;
+    if (found.state !== 'found') {
+      // nrob is there but closed to this page: say how to open it, once per browser.
+      const told = `bot.computer:nrob-told:${found.origin}:${found.state}`;
+      try {
+        if (localStorage.getItem(told)) return;
+        localStorage.setItem(told, '1');
+      } catch {
+        /* storage blocked: say it every time */
+      }
+      chat.system(`${found.message}
+With that done, Settings → Images and video → Find nrob sets it up.`);
+      return;
+    }
+    const first = !media.discovered;
+    media = mergeDiscovered(media, found.media);
+    await saveMedia(media);
+    const chatProvider = nrobProvider(providers, found);
+    if (chatProvider) {
+      providers.push(chatProvider);
+      activeId ??= chatProvider.id;
+      await saveProviders(providers, activeId);
+      renderChips();
+    }
+    if (first || chatProvider) {
+      const can = [media.imageModels.length && `images (${media.imageModel})`, media.videoModels.length && `video (${media.videoModel})`].filter(Boolean).join(' and ');
+      chat.system(`Found ${found.service} ${found.version} at ${found.origin}.${can ? ` The agent can make ${can} with it.` : ''}${chatProvider ? ` It is in the AI providers for chat too${activeId === chatProvider.id ? ', and in use' : ''}.` : ''} Change this in Settings → Images and video.`);
+    }
+  }
+
   // Ask the browser to keep this site's storage (projects live there) rather than clear it under pressure.
   void navigator.storage?.persist?.().catch(() => false);
 
@@ -759,7 +805,8 @@ A project can hold several apps, each in its own folder (any folder whose manife
   const sandbox = sandboxAvailable();
   if (!sandbox.ok) chat.system(`The code sandbox is unavailable: ${sandbox.reason}.`, 'error');
   else void zippModule().catch((error: unknown) => chat.system(`Could not load the Zipp engine: ${(error as Error).message}`, 'error'));
-  if (!activeProvider()) chat.system('Welcome! Set up an AI provider in ⚙ Settings to talk to the agent — a local server (Ollama, LM Studio) keeps everything on this computer. The editor and terminal work without one.');
+  await lookForNrob();
+  if (!activeProvider()) chat.system('Welcome! Set up an AI provider in ⚙ Settings to talk to the agent — a local server (Ollama, LM Studio, nrob) keeps everything on this computer. The editor and terminal work without one.');
   // Leaving the page (closing the tab, reloading, switching away on a phone): save now.
   // pagehide and a hidden page come early enough for the writes to start; the
   // beforeunload prompt covers a run still going.

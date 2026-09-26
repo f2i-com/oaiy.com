@@ -26,6 +26,11 @@ export const LOCAL_SERVERS: Record<LocalServerKind, { label: string; baseUrl: st
     baseUrl: 'http://localhost:1234',
     help: 'Load a model, then start the server in LM Studio’s Developer tab with “Enable CORS” switched on.',
   },
+  nrob: {
+    label: 'nrob',
+    baseUrl: 'http://127.0.0.1:8080',
+    help: 'nrob serves chat, images and video. Without an API key it answers only the pages in gateway.cors_origins in its config: add this site there (or set an API key and enter it here). Settings → Images and video uses the same server.',
+  },
   other: {
     label: 'Another server',
     baseUrl: 'http://localhost:8080',
@@ -220,7 +225,9 @@ export function describeConnectionError(kind: ConnectionErrorKind, context: Erro
       const page = context.pageOrigin ?? 'this site';
       const fix = context.serverKind === 'lmstudio'
         ? 'In LM Studio, open the Developer tab, start the server, and switch on “Enable CORS”.'
-        : context.serverKind === 'other'
+        : context.serverKind === 'nrob'
+          ? `Start nrob, and add ${page} to gateway.cors_origins in its config (or set an API key there and enter it here).`
+          : context.serverKind === 'other'
           ? `Allow requests from ${page} in the server’s CORS settings.`
           : `For Ollama, quit it and start it again with OLLAMA_ORIGINS set to include ${page} (for example OLLAMA_ORIGINS="${page}" ollama serve). LM Studio has an “Enable CORS” switch in its server settings.`;
       return `Studio could not reach ${originOf(context.url)}. Either the server is not running there, or it is blocking requests from this page (CORS). ${fix}`;
@@ -340,6 +347,8 @@ function readModelList(body: unknown): ModelInfo[] | null {
   const models: ModelInfo[] = [];
   for (const item of body.data) {
     if (!isRecord(item) || typeof item.id !== 'string' || !item.id.trim()) continue;
+    // nrob lists its image and video models here too, typed: they cannot chat.
+    if (item.type === 'image' || item.type === 'video') continue;
     models.push({
       id: item.id,
       label: typeof item.display_name === 'string' && item.display_name !== item.id ? item.display_name : undefined,

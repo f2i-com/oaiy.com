@@ -8,6 +8,7 @@ import { LOCAL_SERVERS, defaultBaseUrl, listModels, type ModelInfo } from '../ag
 import type { LocalServerKind, ProviderConfig, ProviderType } from '../agent/providers/types';
 import { contextWindow, detectContextWindow, formatTokens } from '../agent/context';
 import type { AgentSettings } from '../settings';
+import { NROB_ORIGIN, discoverNrob, listMediaModels, mediaReady, mergeDiscovered, originOf, type Discovery, type MediaSettings } from '../agent/media';
 import { newId } from '../vfs/projects';
 import { clear, h } from './dom';
 
@@ -15,19 +16,46 @@ export interface SettingsResult {
   providers: ProviderConfig[];
   activeId: string | null;
   agent: AgentSettings;
+  media: MediaSettings;
+}
+
+/**
+ * The chat provider for an nrob that was found, when none points there yet;
+ * null when one does.
+ */
+export function nrobProvider(providers: ProviderConfig[], found: Extract<Discovery, { state: 'found' }>): ProviderConfig | null {
+  const there = providers.some((p) => {
+    try {
+      return p.baseUrl && originOf(p.baseUrl) === found.origin;
+    } catch {
+      return false;
+    }
+  });
+  if (there || !found.llm.models.length) return null;
+  return {
+    id: newId(),
+    type: 'local',
+    serverKind: 'nrob',
+    name: 'nrob',
+    apiKey: '',
+    baseUrl: found.origin,
+    modelId: found.llm.default,
+    ...(found.llm.contextTokens && found.llm.default ? { detectedContext: { model: found.llm.default, tokens: found.llm.contextTokens, how: 'nrob (/v1/discovery)', at: Date.now() } } : {}),
+  };
 }
 
 const KINDS: Array<{ value: string; label: string; type: ProviderType; serverKind?: LocalServerKind }> = [
   { value: 'ollama', label: 'Ollama (local)', type: 'local', serverKind: 'ollama' },
   { value: 'lmstudio', label: 'LM Studio (local)', type: 'local', serverKind: 'lmstudio' },
-  { value: 'local-other', label: 'Other local OpenAI-compatible server (llama.cpp, nrob-server, vLLM…)', type: 'local', serverKind: 'other' },
+  { value: 'nrob', label: 'nrob (local: chat, images and video)', type: 'local', serverKind: 'nrob' },
+  { value: 'local-other', label: 'Other local OpenAI-compatible server (llama.cpp, vLLM…)', type: 'local', serverKind: 'other' },
   { value: 'anthropic', label: 'Anthropic API', type: 'anthropic' },
   { value: 'openai', label: 'OpenAI API', type: 'openai' },
   { value: 'custom', label: 'Other OpenAI-compatible API (OpenRouter, Groq, …)', type: 'custom' },
 ];
 
 function kindOf(p: ProviderConfig): string {
-  if (p.type === 'local') return p.serverKind === 'lmstudio' ? 'lmstudio' : p.serverKind === 'ollama' ? 'ollama' : 'local-other';
+  if (p.type === 'local') return p.serverKind === 'lmstudio' ? 'lmstudio' : p.serverKind === 'ollama' ? 'ollama' : p.serverKind === 'nrob' ? 'nrob' : 'local-other';
   return p.type;
 }
 
@@ -36,6 +64,7 @@ export function openSettings(initial: SettingsResult): Promise<SettingsResult | 
     let providers = initial.providers.map((p) => ({ ...p }));
     let activeId = initial.activeId;
     const agent = { ...initial.agent };
+    let media: MediaSettings = { ...initial.media, imageModels: [...initial.media.imageModels], videoModels: [...initial.media.videoModels] };
     let editing: ProviderConfig | null = providers.find((p) => p.id === activeId) ?? providers[0] ?? null;
     // Model lists already fetched, by server address and key, so a re-render
     // (typing a name, switching rows) does not lose them.
@@ -202,6 +231,92 @@ export function openSettings(initial: SettingsResult): Promise<SettingsResult | 
       );
     };
 
+    // Images and video: nrob (found by its discovery document) or any OpenAI-spec media service.
+    const mediaSection = h('div.agent-settings.media-settings');
+    const renderMedia = () => {
+      clear(mediaSection);
+      const note = h('div.form-note');
+      const ready = mediaReady(media);
+      const status = media.discovered
+        ? `${media.discovered.service} ${media.discovered.version} at ${media.discovered.origin}`
+        : media.baseUrl ? 'set up by hand' : 'not set up';
+      const address = h('input', { value: media.baseUrl, placeholder: `${NROB_ORIGIN}/v1`, oninput: () => {
+        media.baseUrl = address.value.trim();
+        // A typed address is no longer the discovered one: its routes may differ.
+        if (media.discovered && media.baseUrl && originOf(media.baseUrl) !== media.discovered.origin) {
+          media.discovered = undefined;
+          media.endpoints = undefined;
+        }
+      } }) as HTMLInputElement;
+      const key = h('input', { type: 'password', value: media.apiKey, placeholder: 'usually none', oninput: () => { media.apiKey = key.value.trim(); } }) as HTMLInputElement;
+      const modelInput = (kind: 'image' | 'video') => {
+        const listId = `media-${kind}-models`;
+        const ids = (kind === 'image' ? media.imageModels : media.videoModels).map((m) => m.id);
+        const input = h('input', { list: listId, value: (kind === 'image' ? media.imageModel : media.videoModel) ?? '', placeholder: ids.length ? 'choose or type a model' : 'type a model name', oninput: () => {
+          const v = input.value.trim() || undefined;
+          if (kind === 'image') media.imageModel = v;
+          else media.videoModel = v;
+        } }) as HTMLInputElement;
+        return h('span.model-choice', input, h('datalist', { id: listId }, ...ids.map((id) => h('option', { value: id }))));
+      };
+      const find = h('button', { title: 'Ask nrob for its details (/v1/discovery) and fill everything in', onclick: async () => {
+        note.textContent = 'Looking for nrob…';
+        let where = NROB_ORIGIN;
+        try {
+          if (media.baseUrl) where = originOf(media.baseUrl);
+        } catch {
+          /* the default */
+        }
+        const found = await discoverNrob(where, media.apiKey).catch((error: unknown) => ({ state: 'absent' as const, origin: where, message: (error as Error).message }));
+        if (found.state !== 'found') {
+          note.textContent = found.message;
+          return;
+        }
+        media = mergeDiscovered(media, found.media);
+        const chat = nrobProvider(providers, found);
+        if (chat) {
+          providers.push(chat);
+          activeId ??= chat.id;
+          renderList();
+        }
+        renderMedia();
+        (mediaSection.querySelector('.form-note') as HTMLElement).textContent =
+          `Found ${found.service} ${found.version}: ${found.media.imageModels.length} image and ${found.media.videoModels.length} video models.${chat ? ' It is in the AI providers too, for chat.' : ''}`;
+      } }, 'Find nrob');
+      const listButton = h('button', { title: 'Ask the server which image and video models it has', onclick: async () => {
+        if (!media.baseUrl) {
+          note.textContent = 'Give the address first.';
+          return;
+        }
+        note.textContent = 'Asking the server for its models…';
+        try {
+          const found = await listMediaModels(media);
+          media.imageModels = found.image.map((id) => media.imageModels.find((m) => m.id === id) ?? { id });
+          media.videoModels = found.video.map((id) => media.videoModels.find((m) => m.id === id) ?? { id });
+          media.imageModel ??= found.image[0];
+          media.videoModel ??= found.video[0];
+          renderMedia();
+          (mediaSection.querySelector('.form-note') as HTMLElement).textContent = `${found.image.length} image and ${found.video.length} video models.`;
+        } catch (error) {
+          note.textContent = (error as Error).message;
+        }
+      } }, 'List models');
+      const enabled = h('input', { type: 'checkbox', checked: media.enabled, onchange: () => { media.enabled = enabled.checked; } }) as HTMLInputElement;
+      mediaSection.append(
+        h('strong', 'Images and video'),
+        h('p.muted', `The agent can make pictures and short videos with an image and video service: nrob is found on its own, and any server with OpenAI's /v1/images/generations and /v1/videos works. Now: ${status}${media.baseUrl ? ` (${[ready.image && 'images', ready.video && 'video'].filter(Boolean).join(' and ') || 'no models chosen'})` : ''}.`),
+        h('div.provider-form',
+          h('label', 'Address', h('div.window-picker', address, find, listButton)),
+          h('label', 'API key', key),
+          h('label', 'Images', modelInput('image')),
+          h('label', 'Video', modelInput('video')),
+        ),
+        h('label', enabled, ' Let the agent make images and video (generate_image, generate_video)'),
+        note,
+      );
+    };
+    renderMedia();
+
     dialog.append(
       h('h2', 'AI providers'),
       h('p.muted', 'Keys are stored encrypted in this browser and sent only to their own provider. Sandboxed code never sees them.'),
@@ -225,7 +340,8 @@ export function openSettings(initial: SettingsResult): Promise<SettingsResult | 
           return input;
         })(), ' tokens of context (at most the model\'s window)'),
       ),
-      h('div.dialog-buttons', h('button', { onclick: () => close(null) }, 'Cancel'), h('button.primary', { onclick: () => close({ providers, activeId: providers.some((p) => p.id === activeId) ? activeId : providers[0]?.id ?? null, agent }) }, 'Save')),
+      mediaSection,
+      h('div.dialog-buttons', h('button', { onclick: () => close(null) }, 'Cancel'), h('button.primary', { onclick: () => close({ providers, activeId: providers.some((p) => p.id === activeId) ? activeId : providers[0]?.id ?? null, agent, media }) }, 'Save')),
     );
     document.body.append(dialog);
     renderList();

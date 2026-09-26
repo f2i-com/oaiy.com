@@ -16,6 +16,7 @@ import { appLabel, checkProject, describeApp, findApps, formatFindings, guideFor
 import type { PageReport, PreviewAction, PreviewResult } from '../softn/preview';
 import { describeExample, docsMap, installExample, listExamples, lookupComponents, readTopic, searchKnowledge } from '../softn/knowledge';
 import { DEFAULT_VIEW_SIZE, MAX_VIEW_SIZE, imageMimeFor, imageSize, viewImage, type ImagePart } from './images';
+import { generateImage, generateVideo, mediaReady, type MediaFile, type MediaSettings } from './media';
 
 const READ_LINES = 400;
 const READ_CHARS = 40_000;
@@ -91,6 +92,90 @@ export interface ToolContext {
   signal?: AbortSignal;
   /** False when the model has refused images: view_image then says so instead of sending one. */
   images?: boolean;
+  /** The image and video service, when one is set up: generate_image and generate_video. */
+  media?: () => MediaSettings | null;
+  /** A line for the chat's status while a long tool works ("making the video: 40%"). */
+  progress?: (message: string) => void;
+}
+
+/** A model's abilities in a few words, for the tool descriptions. */
+function describeModels(media: MediaSettings, kind: 'image' | 'video'): string {
+  const chosen = kind === 'image' ? media.imageModel : media.videoModel;
+  const lines = kind === 'image'
+    ? media.imageModels.map((m) => {
+      const bits = [
+        m.defaultSize && `default size ${m.defaultSize}`,
+        m.sizeStep && `sides in steps of ${m.sizeStep}`,
+        m.edits ? `edits: up to ${m.maxReferences ?? 1} reference image${(m.maxReferences ?? 1) === 1 ? '' : 's'}` : m.edits === false ? 'no edits' : '',
+        m.negativePrompt ? 'takes negative_prompt' : '',
+      ].filter(Boolean);
+      return `${m.id}${m.id === chosen ? ' (default)' : ''}${bits.length ? `: ${bits.join(', ')}` : ''}`;
+    })
+    : media.videoModels.map((m) => {
+      const bits = [
+        m.maxSeconds && `up to ${m.maxSeconds} s`,
+        m.fps && `${m.fps} fps`,
+        m.maxSide && `longest side up to ${m.maxSide} px`,
+        m.startImage ? 'can animate a start_image' : m.startImage === false ? 'no start image' : '',
+      ].filter(Boolean);
+      return `${m.id}${m.id === chosen ? ' (default)' : ''}${bits.length ? `: ${bits.join(', ')}` : ''}`;
+    });
+  if (!lines.length) return chosen ? ` Model: ${chosen}.` : '';
+  return ` Models: ${lines.join('; ')}.`;
+}
+
+/** generate_image and generate_video, described for the service that is set up (none when there is none). */
+export function mediaTools(media: MediaSettings | null | undefined): ToolSpec[] {
+  const ready = mediaReady(media);
+  if (!media || (!ready.image && !ready.video)) return [];
+  const where = media.discovered ? `nrob at ${media.discovered.origin}` : new URL(media.baseUrl).host;
+  const tools: ToolSpec[] = [];
+  const ids = (list: Array<{ id: string }>) => (list.length ? { enum: list.map((m) => m.id) } : {});
+  if (ready.image) {
+    tools.push({
+      name: 'generate_image',
+      description:
+        `Create an image from a text prompt with the user's image service (${where}) and save it in the project as a PNG. ` +
+        'Describe the picture concretely: subject, setting, style, lighting, composition. To edit a picture or combine several, give reference_images (project paths) and say what to change, with a model that edits. ' +
+        `It takes seconds to a few minutes. The image is shown to the user in the chat; use view_image to look at it yourself.${describeModels(media, 'image')}`,
+      parameters: {
+        type: 'object',
+        required: ['prompt', 'path'],
+        properties: {
+          prompt: str,
+          path: { type: 'string', description: 'Where to save it in the project, e.g. assets/hero.png. Several images get -1, -2, … added.' },
+          model: { type: 'string', ...ids(media.imageModels) },
+          size: { type: 'string', description: 'WIDTHxHEIGHT, e.g. 1024x1024 or 1344x768' },
+          n: { ...int, minimum: 1, maximum: 4, description: 'How many images (default 1)' },
+          negative_prompt: { type: 'string', description: 'What to keep out of the picture (models that take it)' },
+          seed: int,
+          reference_images: { type: 'array', items: str, description: 'Project paths of pictures to edit or combine' },
+        },
+      },
+    });
+  }
+  if (ready.video) {
+    tools.push({
+      name: 'generate_video',
+      description:
+        `Create a short video (MP4) from a text prompt, or animate a start image, with the user's video service (${where}), and save it in the project. ` +
+        'Describe the motion as well as the scene: what moves, how the camera moves. ' +
+        `It takes minutes; the user sees its progress in the chat, and the finished video gets a player there.${describeModels(media, 'video')}`,
+      parameters: {
+        type: 'object',
+        required: ['prompt', 'path'],
+        properties: {
+          prompt: str,
+          path: { type: 'string', description: 'Where to save it in the project, e.g. media/intro.mp4' },
+          model: { type: 'string', ...ids(media.videoModels) },
+          seconds: { type: 'number', description: 'Length in seconds' },
+          size: { type: 'string', description: 'WIDTHxHEIGHT, e.g. 768x512 or 1024x576' },
+          start_image: { type: 'string', description: 'Project path of a picture to use as the first frame' },
+        },
+      },
+    });
+  }
+  return tools;
 }
 
 const str = { type: 'string' };
@@ -313,6 +398,15 @@ function cut(text: string, max = OUTPUT_CHARS): string {
   const head = text.slice(0, Math.floor(max * 0.7));
   const tail = text.slice(-Math.floor(max * 0.25));
   return `${head}\n\n[... ${text.length - head.length - tail.length} characters omitted ...]\n\n${tail}`;
+}
+
+/** An image in the project, for a reference or a start frame. */
+function projectImage(vfs: Vfs, raw: string): MediaFile {
+  const key = normalizePath(raw);
+  const mime = imageMimeFor(key);
+  if (!mime || mime === 'image/svg+xml') throw new Error(`/${key} is not a picture the service can take (png, jpg, webp, gif)`);
+  if (vfs.stat(`/${key}`)?.type !== 'file') throw new Error(`/${key} does not exist`);
+  return { bytes: vfs.readBytes(`/${key}`), mime, name: key.split('/').pop()! };
 }
 
 function need(input: Record<string, unknown>, key: string): string {
@@ -704,6 +798,54 @@ async function execute(call: ToolCall, ctx: ToolContext, out: ToolOut): Promise<
       const done = plan.items.filter((i) => i.status === 'done').length;
       const next = plan.items.find((i) => i.status === 'active') ?? plan.items.find((i) => i.status === 'pending');
       return done === plan.items.length ? `Plan updated: all ${done} steps done. Check the result, then tell the user what you did.` : `Plan updated: ${done} of ${plan.items.length} done.${next ? ` Next: ${next.text}` : ''}`;
+    }
+    case 'generate_image': {
+      const media = ctx.media?.();
+      if (!media || !mediaReady(media).image) throw new Error('no image service is set up (the user can add one in Settings, under Images and video)');
+      const prompt = need(input, 'prompt');
+      let path = normalizePath(need(input, 'path'));
+      if (!/\.png$/i.test(path)) path = `${path.replace(/\.[a-z0-9]{1,5}$/i, '')}.png`;
+      const references = (Array.isArray(input.reference_images) ? input.reference_images : []).map((r) => projectImage(vfs, String(r)));
+      const n = typeof input.n === 'number' ? Math.min(4, Math.max(1, Math.floor(input.n))) : 1;
+      const model = typeof input.model === 'string' && input.model.trim() ? input.model.trim() : media.imageModel;
+      ctx.progress?.(`${references.length ? 'editing' : 'generating'} ${n > 1 ? `${n} images` : 'an image'}${model ? ` with ${model}` : ''}…`);
+      const result = await generateImage(media, {
+        prompt,
+        model,
+        size: typeof input.size === 'string' && input.size.trim() ? input.size.trim() : undefined,
+        n,
+        negativePrompt: typeof input.negative_prompt === 'string' ? input.negative_prompt : undefined,
+        seed: typeof input.seed === 'number' ? input.seed : undefined,
+        references,
+      }, ctx.signal);
+      const paths = result.images.map((_, i) => (result.images.length === 1 ? path : path.replace(/\.png$/i, `-${i + 1}.png`)));
+      paths.forEach((p, i) => {
+        vfs.writeFile(`/${p}`, result.images[i], { parents: true });
+        out.files.push(p);
+      });
+      const size = await imageSize(result.images[0], 'image/png').catch(() => null);
+      return `Saved ${paths.map((p) => `/${p}`).join(', ')}: ${size ? `${size.width}×${size.height} px` : result.size ?? 'PNG'}, made with ${result.model}. Shown to the user in the chat; use view_image to look at ${paths.length > 1 ? 'them' : 'it'}.`;
+    }
+    case 'generate_video': {
+      const media = ctx.media?.();
+      if (!media || !mediaReady(media).video) throw new Error('no video service is set up (the user can add one in Settings, under Images and video)');
+      const prompt = need(input, 'prompt');
+      let path = normalizePath(need(input, 'path'));
+      if (!/\.mp4$/i.test(path)) path = `${path.replace(/\.[a-z0-9]{1,5}$/i, '')}.mp4`;
+      const startImage = typeof input.start_image === 'string' && input.start_image.trim() ? projectImage(vfs, input.start_image) : undefined;
+      const model = typeof input.model === 'string' && input.model.trim() ? input.model.trim() : media.videoModel;
+      ctx.progress?.(`starting the video${model ? ` with ${model}` : ''}…`);
+      const result = await generateVideo(media, {
+        prompt,
+        model,
+        seconds: typeof input.seconds === 'number' ? input.seconds : typeof input.seconds === 'string' && Number(input.seconds) > 0 ? Number(input.seconds) : undefined,
+        size: typeof input.size === 'string' && input.size.trim() ? input.size.trim() : undefined,
+        startImage,
+      }, (message) => ctx.progress?.(message), ctx.signal);
+      vfs.writeFile(`/${path}`, result.bytes, { parents: true });
+      out.files.push(path);
+      const facts = [result.seconds && `${result.seconds} s`, result.size, `${(result.bytes.byteLength / 1e6).toFixed(1)} MB`].filter(Boolean).join(', ');
+      return `Saved /${path} (${facts}), made with ${result.model}. The user has a player for it in the chat.`;
     }
     case 'present_file': {
       const path = normalizePath(need(input, 'path'));
