@@ -425,6 +425,14 @@ mod tests {
     }
 
     #[test]
+    fn the_shipped_example_configuration_validates() {
+        let mut v = Json::parse(include_bytes!("../../../config/studio.example.json")).unwrap();
+        assert!(!upgrade_routes(&mut v), "the example is already at the current routes_version");
+        merge_defaults(&mut v, &default_json());
+        validate(&v).unwrap();
+    }
+
+    #[test]
     fn defaults_validate_and_survive_a_pretty_round_trip() {
         let v = default_json();
         validate(&v).unwrap();
