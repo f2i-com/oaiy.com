@@ -10,6 +10,8 @@ threads, Zen 5, full-width AVX-512), 189.6 GB RAM, model on `D:`.
 **Model:** GLM-5.3-Flash Q4_K_M, 5 shards, 1412 tensors. 45-layer
 trunk (34 KDA + 11 MLA) plus `blk.45`, the NextN/MTP draft block. 288 experts
 top-8 plus 1 shared, `leading_dense_block_count = 3`, so 42 MoE layers.
+The real-model tests look for the first shard at `GLM5_GGUF` and the vision
+projector at `GLM5_MMPROJ`, falling back to the paths in `glm5next.rs`.
 
 ## The model, by bytes
 

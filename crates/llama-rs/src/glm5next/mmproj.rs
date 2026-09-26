@@ -358,16 +358,16 @@ impl VisionWeights {
 mod tests {
     use super::*;
 
-    /// The released mmproj, if it is on disk. Gated like the repo's other
-    /// real-model tests: run with
-    /// `cargo test -p llama-rs glm5next::mmproj -- --ignored --nocapture`.
+    // The released mmproj, if it is on disk. Gated like the repo's other
+    // real-model tests: run with
+    // `cargo test -p llama-rs glm5next::mmproj -- --ignored --nocapture`.
     // D: is the faster drive; E: holds an identical copy.
-    const MMPROJ: &str = r"D:\glm5.3_flash\mmproj-GLM-5.3-Flash-F16.gguf";
+    use crate::glm5next::test_paths::mmproj;
 
     #[test]
     #[ignore = "needs the real mmproj on disk"]
     fn loads_the_released_mmproj_and_encodes_an_image() {
-        let (sh, w) = VisionWeights::open(MMPROJ).expect("load mmproj");
+        let (sh, w) = VisionWeights::open(mmproj()).expect("load mmproj");
 
         // The released geometry.
         assert_eq!(sh.n_embd, 1024);

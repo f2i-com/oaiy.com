@@ -1548,8 +1548,7 @@ mod tests {
     use super::super::forward::matvec;
     use ggml_quants::q4_k;
 
-    const RELEASED: &str =
-        r"D:\glm5.3_flash\Q4_K_M\GLM-5.3-Flash-Q4_K_M-00001-of-00005.gguf";
+    use crate::glm5next::test_paths::released;
 
     /// The seam itself: a `Mat::Device` over a dense `Weight` must give the same
     /// numbers as `Mat::Host` over the same floats. This is what lets one forward
@@ -1642,7 +1641,7 @@ mod tests {
     #[ignore = "needs the released model on disk"]
     fn a_real_expert_runs_on_cuda() {
         let Some(backend) = cuda_backend() else { return };
-        let g = GgufFile::open_streaming(RELEASED).expect("open");
+        let g = GgufFile::open_streaming(released()).expect("open");
         let cfg = ModelConfig::from_gguf(&g).expect("cfg");
         let glm = Glm5NextConfig::from_gguf(&g, &cfg).expect("glm");
 
@@ -1698,7 +1697,7 @@ mod tests {
         let Some(backend) = cuda_backend() else { return };
 
         let t0 = std::time::Instant::now();
-        let dm = DeviceModel::open(RELEASED, 512, backend).expect("cuda load");
+        let dm = DeviceModel::open(released(), 512, backend).expect("cuda load");
         println!(
             "cuda load in {:.1}s, backend {}",
             t0.elapsed().as_secs_f64(),
@@ -1718,7 +1717,7 @@ mod tests {
         drop(dv);
         drop(dm);
 
-        let hm = HostModel::open(RELEASED, 512).expect("host load");
+        let hm = HostModel::open(released(), 512).expect("host load");
         let hs = hm.shape().clone();
         let hv = hm.view();
         let mut h_state = forward::State::new(&hs).expect("state");
@@ -1757,7 +1756,7 @@ mod tests {
             Some(b) => b,
             None => return,
         };
-        let model = match crate::Model::open_streaming(RELEASED, backend, 64 << 30) {
+        let model = match crate::Model::open_streaming(released(), backend, 64 << 30) {
             Ok(m) => m,
             Err(e) => {
                 eprintln!("open failed ({e}); skipping");
@@ -1830,7 +1829,7 @@ mod tests {
             Some(b) => b,
             None => return,
         };
-        let model = match crate::Model::open_streaming(RELEASED, backend, 64 << 30) {
+        let model = match crate::Model::open_streaming(released(), backend, 64 << 30) {
             Ok(m) => m,
             Err(e) => {
                 eprintln!("open failed ({e}); skipping");
@@ -1935,7 +1934,7 @@ mod tests {
             Some(b) => b,
             None => return,
         };
-        let model = match crate::Model::open_streaming(RELEASED, backend, 64 << 30) {
+        let model = match crate::Model::open_streaming(released(), backend, 64 << 30) {
             Ok(m) => m,
             Err(e) => {
                 eprintln!("open failed ({e}); skipping");
@@ -2024,7 +2023,7 @@ mod tests {
             Some(b) => b,
             None => return,
         };
-        let model = match crate::Model::open_streaming(RELEASED, backend, 64 << 30) {
+        let model = match crate::Model::open_streaming(released(), backend, 64 << 30) {
             Ok(m) => m,
             Err(e) => {
                 eprintln!("open failed ({e}); skipping");
@@ -2083,7 +2082,7 @@ mod tests {
         let prompt: Vec<u32> = (0..n).map(|i| (1000 + (i * 37) % 60000) as u32).collect();
 
         let Some(backend) = cuda_backend() else { return };
-        let dm = DeviceModel::open(RELEASED, 512, backend).expect("cuda load");
+        let dm = DeviceModel::open(released(), 512, backend).expect("cuda load");
         let ds = dm.shape().clone();
         let dv = dm.view();
         let mut d_state = forward::State::new_on(&ds, dm.backend()).expect("state");
@@ -2093,7 +2092,7 @@ mod tests {
         drop(dv);
         drop(dm);
 
-        let hm = HostModel::open(RELEASED, 512).expect("host load");
+        let hm = HostModel::open(released(), 512).expect("host load");
         let hs = hm.shape().clone();
         let hv = hm.view();
         let mut h_state = forward::State::new(&hs).expect("state");
@@ -2151,7 +2150,7 @@ mod tests {
         use crate::config::Architecture;
 
         let Some(backend) = cuda_backend() else { return };
-        let g = GgufFile::open_streaming(RELEASED).expect("open");
+        let g = GgufFile::open_streaming(released()).expect("open");
         let tok = tokenizer::Tokenizer::from_gguf(&g).expect("tokenizer");
         let t0 = std::time::Instant::now();
         let m = DeviceModel::from_gguf(&g, 512, backend, DeviceModel::DEFAULT_EXPERT_CACHE)
@@ -2282,7 +2281,7 @@ mod tests {
     #[ignore = "needs the released model on disk"]
     fn profile_the_expert_path() {
         let Some(backend) = cuda_backend() else { return };
-        let g = GgufFile::open_streaming(RELEASED).expect("open");
+        let g = GgufFile::open_streaming(released()).expect("open");
         let cfg = ModelConfig::from_gguf(&g).expect("cfg");
         let glm = Glm5NextConfig::from_gguf(&g, &cfg).expect("glm");
         let n_moe = glm.n_layer - glm.n_dense_lead;
@@ -2542,7 +2541,7 @@ mod tests {
         }
 
         let Some(backend) = cuda_backend() else { return };
-        let m = DeviceModel::open_with_cache(RELEASED, 512, backend.clone(), 8 << 30).expect("load");
+        let m = DeviceModel::open_with_cache(released(), 512, backend.clone(), 8 << 30).expect("load");
         let sh = m.shape().clone();
 
         // Where the trunk actually is. A successful load does not mean the
@@ -2626,10 +2625,10 @@ mod tests {
     #[ignore = "needs the released model on disk"]
     fn an_exact_repeat_is_easier_the_second_time() {
         let Some(backend) = cuda_backend() else { return };
-        let g = GgufFile::open_streaming(RELEASED).expect("open");
+        let g = GgufFile::open_streaming(released()).expect("open");
         let tok = tokenizer::Tokenizer::from_gguf(&g).expect("tokenizer");
         drop(g);
-        let m = DeviceModel::open_with_cache(RELEASED, 512, backend.clone(), 32 << 30)
+        let m = DeviceModel::open_with_cache(released(), 512, backend.clone(), 32 << 30)
             .expect("load");
         let sh = m.shape().clone();
         let w = m.view();
@@ -2702,7 +2701,7 @@ because water wheels drove the machinery.";
 
         let t0 = std::time::Instant::now();
         // Exactly what nrob-cli does.
-        let model = crate::Model::open_streaming(RELEASED, backend, 64 << 30)
+        let model = crate::Model::open_streaming(released(), backend, 64 << 30)
             .expect("open_streaming");
         println!();
         println!("opened in {:.1}s", t0.elapsed().as_secs_f64());
@@ -2779,7 +2778,7 @@ because water wheels drove the machinery.";
     #[test]
     #[ignore = "needs the released model on disk"]
     fn sampling_comes_from_the_model() {
-        let g = GgufFile::open_streaming(RELEASED).expect("open");
+        let g = GgufFile::open_streaming(released()).expect("open");
         let p = crate::sampler::SampleParams::from_gguf(&g);
         println!();
         println!("general.sampling.temp  -> temperature {}", p.temperature);
@@ -2816,10 +2815,10 @@ because water wheels drove the machinery.";
     #[ignore = "needs the released model on disk"]
     fn measure_perplexity_on_english() {
         let Some(backend) = cuda_backend() else { return };
-        let g = GgufFile::open_streaming(RELEASED).expect("open");
+        let g = GgufFile::open_streaming(released()).expect("open");
         let tok = tokenizer::Tokenizer::from_gguf(&g).expect("tokenizer");
         drop(g);
-        let m = DeviceModel::open_with_cache(RELEASED, 512, backend.clone(), 32 << 30)
+        let m = DeviceModel::open_with_cache(released(), 512, backend.clone(), 32 << 30)
             .expect("load");
         let sh = m.shape().clone();
         let w = m.view();
@@ -2936,7 +2935,7 @@ children attend school instead.";
     #[ignore = "needs the released model on disk"]
     fn early_prompt_tokens_still_matter() {
         let Some(backend) = cuda_backend() else { return };
-        let m = DeviceModel::open_with_cache(RELEASED, 512, backend.clone(), 24 << 30)
+        let m = DeviceModel::open_with_cache(released(), 512, backend.clone(), 24 << 30)
             .expect("load");
         let sh = m.shape().clone();
         let w = m.view();
@@ -3003,10 +3002,10 @@ children attend school instead.";
         use crate::config::Architecture;
 
         let Some(backend) = cuda_backend() else { return };
-        let g = GgufFile::open_streaming(RELEASED).expect("open");
+        let g = GgufFile::open_streaming(released()).expect("open");
         let tok = tokenizer::Tokenizer::from_gguf(&g).expect("tokenizer");
         drop(g);
-        let m = DeviceModel::open_with_cache(RELEASED, 512, backend.clone(), 24 << 30)
+        let m = DeviceModel::open_with_cache(released(), 512, backend.clone(), 24 << 30)
             .expect("load");
         let sh = m.shape().clone();
         let w = m.view();
@@ -3062,7 +3061,7 @@ children attend school instead.";
     #[ignore = "needs the released model on disk"]
     fn the_state_stays_bounded_as_the_sequence_grows() {
         let Some(backend) = cuda_backend() else { return };
-        let m = DeviceModel::open_with_cache(RELEASED, 512, backend.clone(), 24 << 30)
+        let m = DeviceModel::open_with_cache(released(), 512, backend.clone(), 24 << 30)
             .expect("load");
         let sh = m.shape().clone();
         let w = m.view();
@@ -3111,7 +3110,7 @@ children attend school instead.";
         use crate::chat::{apply_chat_template, ChatMessage, Role};
         use crate::config::Architecture;
 
-        let g = GgufFile::open_streaming(RELEASED).expect("open");
+        let g = GgufFile::open_streaming(released()).expect("open");
         let tok = tokenizer::Tokenizer::from_gguf(&g).expect("tokenizer");
 
         for content in [
@@ -3149,7 +3148,7 @@ children attend school instead.";
     #[ignore = "needs the released model on disk"]
     fn the_prompt_changes_the_logits() {
         let Some(backend) = cuda_backend() else { return };
-        let m = DeviceModel::open_with_cache(RELEASED, 512, backend.clone(), 24 << 30)
+        let m = DeviceModel::open_with_cache(released(), 512, backend.clone(), 24 << 30)
             .expect("load");
         let sh = m.shape().clone();
         let w = m.view();
@@ -3225,11 +3224,11 @@ children attend school instead.";
 
         // Kept open: `SampleParams::from_gguf` reads the model's own recommended
         // sampling out of it.
-        let gg = GgufFile::open_streaming(RELEASED).expect("open");
+        let gg = GgufFile::open_streaming(released()).expect("open");
         let tok = tokenizer::Tokenizer::from_gguf(&gg).expect("tokenizer");
 
         let t0 = std::time::Instant::now();
-        let m = match DeviceModel::open_tiered(RELEASED, 2048, n_gpus, 0, 0) {
+        let m = match DeviceModel::open_tiered(released(), 2048, n_gpus, 0, 0) {
             Ok(m) => m,
             Err(e) => {
                 eprintln!("tiered open failed ({e}); skipping");
@@ -3459,7 +3458,7 @@ children attend school instead.";
 
         // SAFETY: single-threaded test.
         unsafe { std::env::set_var("GLM5_NO_CPU_TIER", "1") };
-        let gpu_only = match DeviceModel::open_tiered(RELEASED, 512, 1, 24 << 30, 4 << 30) {
+        let gpu_only = match DeviceModel::open_tiered(released(), 512, 1, 24 << 30, 4 << 30) {
             Ok(m) => m,
             Err(e) => {
                 eprintln!("tiered open failed ({e}); skipping");
@@ -3479,7 +3478,7 @@ children attend school instead.";
         // A small VRAM budget on purpose, so plenty of experts miss and the CPU tier
         // actually has work -- with a large one almost everything is resident and the
         // test would pass without exercising anything.
-        let hybrid = DeviceModel::open_tiered(RELEASED, 512, 1, 24 << 30, 4 << 30).expect("load");
+        let hybrid = DeviceModel::open_tiered(released(), 512, 1, 24 << 30, 4 << 30).expect("load");
         let cpu = hybrid.experts().cpu_tier().expect("the tier should be on");
         println!("CPU tier: {}", if cpu.avx512() { "AVX-512" } else { "scalar fused" });
         crate::glm5next::cpu_experts::reset_stats();
@@ -3529,7 +3528,7 @@ children attend school instead.";
         // SAFETY: single-threaded test.
         unsafe { std::env::set_var("GLM5_NO_CPU_TIER", "1") };
         unsafe { std::env::set_var("GLM5_NO_GROUPED", "1") };
-        let loop_model = match DeviceModel::open_tiered(RELEASED, 512, 1, 24 << 30, 8 << 30) {
+        let loop_model = match DeviceModel::open_tiered(released(), 512, 1, 24 << 30, 8 << 30) {
             Ok(m) => m,
             Err(e) => {
                 eprintln!("tiered open failed ({e}); skipping");
@@ -3549,7 +3548,7 @@ children attend school instead.";
 
         // SAFETY: as above.
         unsafe { std::env::remove_var("GLM5_NO_GROUPED") };
-        let grouped = DeviceModel::open_tiered(RELEASED, 512, 1, 24 << 30, 8 << 30).expect("load");
+        let grouped = DeviceModel::open_tiered(released(), 512, 1, 24 << 30, 8 << 30).expect("load");
         grouped_stats::reset();
         let wg = grouped.view();
         let mut sg = forward::State::new_on(&sh, grouped.backend()).expect("state");
@@ -3601,7 +3600,7 @@ children attend school instead.";
             .unwrap_or(256);
         let prompt: Vec<u32> = (0..n).map(|i| ((i * 7919 + 1543) % 150000) as u32).collect();
 
-        let m = match DeviceModel::open_tiered(RELEASED, 2048, 2, 0, 0) {
+        let m = match DeviceModel::open_tiered(released(), 2048, 2, 0, 0) {
             Ok(m) => m,
             Err(e) => {
                 eprintln!("tiered open failed ({e}); skipping");
@@ -3671,7 +3670,7 @@ children attend school instead.";
             Some(b) => b,
             None => return,
         };
-        let model = match crate::Model::open_streaming(RELEASED, backend, 64 << 30) {
+        let model = match crate::Model::open_streaming(released(), backend, 64 << 30) {
             Ok(m) => m,
             Err(e) => {
                 eprintln!("open failed ({e}); skipping");
@@ -3725,7 +3724,7 @@ children attend school instead.";
         let n = 1024usize;
         let prompt: Vec<u32> = (0..n).map(|i| ((i * 7919 + 1543) % 150000) as u32).collect();
 
-        let m = match DeviceModel::open_tiered(RELEASED, 2048, 1, 24 << 30, 8 << 30) {
+        let m = match DeviceModel::open_tiered(released(), 2048, 1, 24 << 30, 8 << 30) {
             Ok(m) => m,
             Err(e) => {
                 eprintln!("tiered open failed ({e}); skipping");
@@ -3772,7 +3771,7 @@ children attend school instead.";
         let prompt: Vec<u32> = (0..n).map(|i| ((i * 7919 + 1543) % 150000) as u32).collect();
         let want = 16usize;
 
-        let m = match DeviceModel::open_tiered(RELEASED, 512, 1, 24 << 30, 8 << 30) {
+        let m = match DeviceModel::open_tiered(released(), 512, 1, 24 << 30, 8 << 30) {
             Ok(m) => m,
             Err(e) => {
                 eprintln!("tiered open failed ({e}); skipping");
@@ -3835,7 +3834,7 @@ children attend school instead.";
         let n = 200usize;
         let prompt: Vec<u32> = (0..n).map(|i| ((i * 7919 + 1543) % 150000) as u32).collect();
 
-        let m = match DeviceModel::open_tiered(RELEASED, 512, 1, 24 << 30, 8 << 30) {
+        let m = match DeviceModel::open_tiered(released(), 512, 1, 24 << 30, 8 << 30) {
             Ok(m) => m,
             Err(e) => {
                 eprintln!("tiered open failed ({e}); skipping");
@@ -3899,7 +3898,7 @@ children attend school instead.";
         // to load twice in a test.
         let prompt = [154822u32, 6172, 1043, 9001, 271, 3025, 18, 6172, 1043, 9001];
 
-        let m = match DeviceModel::open_tiered(RELEASED, 512, 1, 24 << 30, 8 << 30) {
+        let m = match DeviceModel::open_tiered(released(), 512, 1, 24 << 30, 8 << 30) {
             Ok(m) => m,
             Err(e) => {
                 eprintln!("tiered open failed ({e}); skipping");
@@ -3960,7 +3959,7 @@ children attend school instead.";
         // Two tokens in, so the KV cache and the KDA state are both non-trivial.
         let prompt = [154822u32, 6172, 1043];
 
-        let one = DeviceModel::open_with_cache(RELEASED, 512, backend.clone(), 32 << 30)
+        let one = DeviceModel::open_with_cache(released(), 512, backend.clone(), 32 << 30)
             .expect("one-card load");
         let sh = one.shape().clone();
         let w1 = one.view();
@@ -3974,7 +3973,7 @@ children attend school instead.";
         // the card split. `cpu_tier_agrees_with_the_gpu` is the test for that.
         // SAFETY: single-threaded test, and nothing else reads this var concurrently.
         unsafe { std::env::set_var("GLM5_NO_CPU_TIER", "1") };
-        let two = match DeviceModel::open_tiered(RELEASED, 512, 2, 32 << 30, 8 << 30) {
+        let two = match DeviceModel::open_tiered(released(), 512, 2, 32 << 30, 8 << 30) {
             Ok(m) => m,
             Err(e) => {
                 eprintln!("no second card ({e}); skipping");
@@ -4044,7 +4043,7 @@ children attend school instead.";
             .and_then(|v| v.parse().ok())
             .unwrap_or(2);
 
-        let m = match DeviceModel::open_tiered(RELEASED, 512, n_gpus, ram_gb << 30, 0) {
+        let m = match DeviceModel::open_tiered(released(), 512, n_gpus, ram_gb << 30, 0) {
             Ok(m) => m,
             Err(e) => {
                 eprintln!("tiered open failed ({e}); skipping");
@@ -4235,7 +4234,7 @@ children attend school instead.";
 
         let t0 = std::time::Instant::now();
         let m = match DeviceModel::open_tiered(
-            RELEASED,
+            released(),
             512,
             n_gpus,
             ram_gb << 30,
@@ -4370,7 +4369,7 @@ children attend school instead.";
         // model has 42 * 288 = 12096 of them.
         let ram: usize = 96 << 30;
         let t0 = std::time::Instant::now();
-        let m = DeviceModel::open_with_cache(RELEASED, 512, backend.clone(), ram).expect("load");
+        let m = DeviceModel::open_with_cache(released(), 512, backend.clone(), ram).expect("load");
 
         // VRAM tier. The trunk measures 5.97 GB on the card (see `residency`), so
         // a 32 GB 5090 has ~25 GB spare -- about 1530 slots at the 16.32 MB a
@@ -4464,7 +4463,7 @@ children attend school instead.";
     fn released_model_runs_on_the_backend() {
         let backend = ggml_rs::default_backend();
         let t0 = std::time::Instant::now();
-        let m = DeviceModel::open(RELEASED, 512, backend).expect("load");
+        let m = DeviceModel::open(released(), 512, backend).expect("load");
         println!(
             "device load in {:.1}s, backend {}",
             t0.elapsed().as_secs_f64(),
@@ -4500,7 +4499,7 @@ children attend school instead.";
     fn device_agrees_with_host_on_the_real_model() {
         use super::super::bridge::HostModel;
 
-        let hm = HostModel::open(RELEASED, 512).expect("host load");
+        let hm = HostModel::open(released(), 512).expect("host load");
         let hs = hm.shape().clone();
         let hv = hm.view();
         let mut h_state = forward::State::new(&hs).expect("state");
@@ -4508,7 +4507,7 @@ children attend school instead.";
         drop(hv);
         drop(hm);
 
-        let dm = DeviceModel::open(RELEASED, 512, ggml_rs::default_backend()).expect("dev load");
+        let dm = DeviceModel::open(released(), 512, ggml_rs::default_backend()).expect("dev load");
         let ds = dm.shape().clone();
         let dv = dm.view();
         // On the CPU backend this pits `Backend::kda_delta_step`'s host default

@@ -1,5 +1,7 @@
 fn main() {
-    let p = r"D:\glm5.3_flash\Q4_K_M\GLM-5.3-Flash-Q4_K_M-00001-of-00005.gguf";
+    // The first shard of the released GGUF (GLM5_GGUF overrides the default).
+    let p = std::env::var("GLM5_GGUF").unwrap_or_else(|_| r"D:\glm5.3_flash\Q4_K_M\GLM-5.3-Flash-Q4_K_M-00001-of-00005.gguf".into());
+    let p = p.as_str();
     let g = gguf::GgufFile::open_streaming(p).expect("open");
     let t = tokenizer::Tokenizer::from_gguf(&g).expect("tokenizer");
     for s in ["[gMASK]", "<sop>", "<|system|>", "<|user|>", "<|assistant|>", "<think>", "</think>", "<|observation|>"] {

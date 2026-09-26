@@ -1186,6 +1186,30 @@ impl Glm5NextModel {
     }
 }
 
+
+// VENDORED-LOCAL: real-model test paths come from the environment, so the
+// defaults here need not match any one machine's file names.
+/// Where the real-model tests find the released weights: `GLM5_GGUF` (the
+/// first shard) and `GLM5_MMPROJ`, or these defaults.
+#[cfg(test)]
+pub(crate) mod test_paths {
+    use std::sync::OnceLock;
+
+    fn var(slot: &'static OnceLock<String>, name: &str, default: &str) -> &'static str {
+        slot.get_or_init(|| std::env::var(name).unwrap_or_else(|_| default.to_string()))
+    }
+
+    pub fn released() -> &'static str {
+        static PATH: OnceLock<String> = OnceLock::new();
+        var(&PATH, "GLM5_GGUF", r"D:\glm5.3_flash\Q4_K_M\GLM-5.3-Flash-Q4_K_M-00001-of-00005.gguf")
+    }
+
+    pub fn mmproj() -> &'static str {
+        static PATH: OnceLock<String> = OnceLock::new();
+        var(&PATH, "GLM5_MMPROJ", r"D:\glm5.3_flash\mmproj-GLM-5.3-Flash-F16.gguf")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! Metadata-only fixtures built from the **real** GLM-5.3-Flash header
@@ -1279,18 +1303,17 @@ mod tests {
         GgufFile::from_bytes(raw).expect("parse gguf")
     }
 
-    /// The released model, on the faster drive. Gated like the repo's other
-    /// real-model tests:
-    /// `cargo test -p llama-rs glm5next::tests::released -- --ignored --nocapture`
-    const RELEASED: &str =
-        r"D:\glm5.3_flash\Q4_K_M\GLM-5.3-Flash-Q4_K_M-00001-of-00005.gguf";
+    // The released model, on the faster drive. Gated like the repo's other
+    // real-model tests:
+    // `cargo test -p llama-rs glm5next::tests::released -- --ignored --nocapture`
+    use crate::glm5next::test_paths::released;
 
     /// The first time any of this meets a real tensor: the split reader, the
     /// metadata parse, the layer map and the shape assertions.
     #[test]
     #[ignore = "needs the released 194 GB model on disk"]
     fn released_split_model_opens_and_parses() {
-        let g = GgufFile::open_streaming(RELEASED).expect("open the split model");
+        let g = GgufFile::open_streaming(released()).expect("open the split model");
 
         // The split reader must present all five shards as one file.
         assert_eq!(g.n_shards(), 5, "five shards");
@@ -1382,7 +1405,7 @@ mod tests {
         use crate::Model;
         // Resident (non-expert) weights are ~25 GB; give the cache room on top.
         let budget: u64 = 64 << 30;
-        let model = Model::open_streaming(RELEASED, ggml_rs::default_backend(), budget)
+        let model = Model::open_streaming(released(), ggml_rs::default_backend(), budget)
             .expect("streaming load");
 
         let cfg = model.config();

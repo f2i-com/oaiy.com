@@ -500,9 +500,8 @@ mod tests {
     use super::*;
     use crate::glm5next::forward;
 
-    /// D: is the faster drive; E: holds an identical copy.
-    const RELEASED: &str =
-        r"D:\glm5.3_flash\Q4_K_M\GLM-5.3-Flash-Q4_K_M-00001-of-00005.gguf";
+    // D: is the faster drive; E: holds an identical copy.
+    use crate::glm5next::test_paths::released;
 
     /// How much does a KDA layer actually remember?
     ///
@@ -518,7 +517,7 @@ mod tests {
     #[test]
     #[ignore = "needs the released model on disk"]
     fn probe_the_kda_decay_on_real_weights() {
-        let g = GgufFile::open_streaming(RELEASED).expect("open");
+        let g = GgufFile::open_streaming(released()).expect("open");
         let cfg = ModelConfig::from_gguf(&g).expect("cfg");
         let glm = Glm5NextConfig::from_gguf(&g, &cfg).expect("glm");
         let idx = TensorIndex::new(&g);
@@ -598,7 +597,7 @@ mod tests {
     #[test]
     #[ignore = "needs the released model on disk"]
     fn reads_one_real_expert() {
-        let g = GgufFile::open_streaming(RELEASED).expect("open");
+        let g = GgufFile::open_streaming(released()).expect("open");
         let cfg = ModelConfig::from_gguf(&g).expect("cfg");
         let glm = Glm5NextConfig::from_gguf(&g, &cfg).expect("glm");
 
@@ -643,7 +642,7 @@ mod tests {
     #[test]
     #[ignore = "needs the released model on disk; slow"]
     fn responds_to_a_short_prompt() {
-        let m = HostModel::open(RELEASED, 512).expect("load");
+        let m = HostModel::open(released(), 512).expect("load");
         let sh = m.shape().clone();
         let w = m.view();
         let mut st = forward::State::new(&sh).expect("state");
@@ -679,7 +678,7 @@ mod tests {
     #[ignore = "needs the released model on disk; loads ~34 GB and is slow"]
     fn generates_a_real_token() {
         let t0 = std::time::Instant::now();
-        let m = HostModel::open(RELEASED, 512).expect("load");
+        let m = HostModel::open(released(), 512).expect("load");
         println!(
             "loaded {:.2} GB of non-expert f32 in {:.1}s",
             m.size_bytes() as f64 / 1e9,
