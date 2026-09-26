@@ -348,6 +348,26 @@ export function formatFindings(findings: Finding[]): string {
   return findings.map((f) => `${f.level === 'error' ? 'ERROR' : 'warning'} ${f.file}: ${f.message}`).join('\n');
 }
 
+/** The smallest SoftN app: a page, its logic, and a manifest that lists them. */
+export const SOFTN_BLANK: Array<[string, string]> = [
+  ['manifest.json', `${JSON.stringify({ name: 'App', version: '1.0.0', main: 'ui/main.ui', files: { ui: ['ui/main.ui'], logic: ['logic/main.logic'] } }, null, 2)}\n`],
+  [
+    'ui/main.ui',
+    `<logic src="../logic/main.logic" />
+
+<App theme="dark">
+  <Container size="md">
+    <Stack direction="vertical" gap="lg" padding="xl">
+      <Heading level={1}>{title}</Heading>
+      <Text variant="muted">Ask the agent what to build here.</Text>
+    </Stack>
+  </Container>
+</App>
+`,
+  ],
+  ['logic/main.logic', 'let title = "Hello"\n'],
+];
+
 export const SOFTN_STARTER: Array<[string, string]> = [
   ['manifest.json', `${JSON.stringify({ name: 'Tasks', version: '1.0.0', main: 'ui/main.ui', files: { ui: ['ui/main.ui'], logic: ['logic/main.logic'] } }, null, 2)}\n`],
   [

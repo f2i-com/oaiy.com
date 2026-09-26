@@ -4,6 +4,7 @@
  */
 import { IGNORED_DIRS, type Vfs } from '../vfs/vfs';
 import { clear, h } from './dom';
+import { askText, confirmAction } from './modal';
 
 export class FileTree {
   readonly element = h('nav.tree');
@@ -19,8 +20,8 @@ export class FileTree {
   ) {
     const actions = h(
       'div.tree-actions',
-      h('button.icon', { title: 'New file', onclick: () => this.create('file') }, '+ file'),
-      h('button.icon', { title: 'New folder', onclick: () => this.create('dir') }, '+ folder'),
+      h('button.icon', { title: 'New file', onclick: () => void this.create('file') }, '+ file'),
+      h('button.icon', { title: 'New folder', onclick: () => void this.create('dir') }, '+ folder'),
     );
     this.element.append(h('div.pane-title', 'Files'), actions, this.list);
     this.render();
@@ -59,9 +60,16 @@ export class FileTree {
     return slash < 0 ? '' : key.slice(0, slash);
   }
 
-  private create(kind: 'file' | 'dir'): void {
+  private async create(kind: 'file' | 'dir'): Promise<void> {
     const dir = this.targetDir();
-    const name = prompt(kind === 'file' ? 'New file name (e.g. src/index.js)' : 'New folder name', '');
+    const name = await askText({
+      title: kind === 'file' ? 'New file' : 'New folder',
+      message: `In ${dir ? `/${dir}/` : 'the project root'}.`,
+      label: kind === 'file' ? 'File name' : 'Folder name',
+      placeholder: kind === 'file' ? 'e.g. src/index.js' : 'e.g. assets',
+      ok: 'Create',
+      validate: (value) => (this.vfs.exists(`/${dir ? `${dir}/` : ''}${value.replace(/^\/+/, '')}`) ? `${value} already exists.` : null),
+    });
     if (!name) return;
     const path = `/${dir ? `${dir}/` : ''}${name.replace(/^\/+/, '')}`;
     try {
@@ -80,8 +88,8 @@ export class FileTree {
     }
   }
 
-  private rename(path: string): void {
-    const name = prompt('Rename to (a path from the project root)', path.slice(1));
+  private async rename(path: string): Promise<void> {
+    const name = await askText({ title: 'Rename', message: 'A path from the project root: change the folder part to move it.', label: 'New path', value: path.slice(1), ok: 'Rename' });
     if (!name || `/${name.replace(/^\/+/, '')}` === path) return;
     try {
       this.vfs.rename(path, `/${name.replace(/^\/+/, '')}`);
@@ -90,8 +98,9 @@ export class FileTree {
     }
   }
 
-  private remove(path: string): void {
-    if (!confirm(`Delete ${path}?`)) return;
+  private async remove(path: string): Promise<void> {
+    const dir = this.vfs.stat(path)?.type === 'dir';
+    if (!(await confirmAction({ title: dir ? 'Delete folder' : 'Delete file', message: `Delete ${path}${dir ? ' and everything in it' : ''}?`, ok: 'Delete', danger: true }))) return;
     try {
       this.vfs.remove(path, true);
     } catch (error) {
@@ -134,8 +143,8 @@ export class FileTree {
           h('span.name', entry.name),
           h(
             'span.row-actions',
-            h('button.icon', { title: 'Rename', onclick: (e: Event) => { e.stopPropagation(); this.rename(path); } }, '✎'),
-            h('button.icon', { title: 'Delete', onclick: (e: Event) => { e.stopPropagation(); this.remove(path); } }, '✕'),
+            h('button.icon', { title: 'Rename', onclick: (e: Event) => { e.stopPropagation(); void this.rename(path); } }, '✎'),
+            h('button.icon', { title: 'Delete', onclick: (e: Event) => { e.stopPropagation(); void this.remove(path); } }, '✕'),
           ),
         );
         rows.push(row);

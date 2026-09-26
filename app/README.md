@@ -26,7 +26,7 @@ A coding agent that runs entirely in your browser.
 
 bot.computer can build [SoftN](https://github.com/f2i-com/softn.com) apps and show them running while they're being built.
 
-- **Start one:** use **New SoftN app** (or `/softn new`), or ask the agent for an app. It reads `softn_docs` (SoftN Studio's own writing guide, regenerated with `npm run softn:guide`), writes `manifest.json`, `ui/*.ui` and `logic/*.logic`, and runs `softn_check`.
+- **Start one:** use **New SoftN app** (or `/softn new`), or ask the agent for an app. The dialog starts from a small working task list, a blank page, or one of the example apps, in a new project or in a folder of this one. It reads `softn_docs` (SoftN Studio's own writing guide, regenerated with `npm run softn:guide`), writes `manifest.json`, `ui/*.ui` and `logic/*.logic`, and runs `softn_check`.
 - **Reference for the agent:** SoftN is in its tools, so it doesn't have to guess.
   - `softn_docs` with no arguments gives a map of the writing guide, the published guides, every component and the example apps. It reads any of them by topic (`"guide#mistakes"`, `"xdb-data#operations"`). With `search` it finds a term across all of them, including the example apps' source, and says how to open each hit.
   - `softn_components` gives a component's exact props, events and an example.

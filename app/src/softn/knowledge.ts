@@ -226,3 +226,15 @@ export async function installExample(vfs: Vfs, slug: string, parent: string): Pr
   if (!example) throw new Error(`There is no example "${slug}". The examples: ${list.map((e) => e.slug).join(', ')}.`);
   return importSoftn(vfs, Uint8Array.from(atob(example.softn), (c) => c.charCodeAt(0)), `${example.slug}.softn`, parent);
 }
+
+/** The example apps, for choosing one to start from. */
+export async function exampleCatalogue(): Promise<Array<{ slug: string; name: string; description: string; tags: string[] }>> {
+  return (await examples()).map(({ slug, name, description, tags }) => ({ slug, name, description, tags }));
+}
+
+/** An example app's files, by path inside the app. */
+export async function exampleBundle(slug: string): Promise<Array<[string, Uint8Array]>> {
+  const files = await exampleFiles(slug);
+  if (!files) throw new Error(`There is no example "${slug}".`);
+  return Object.entries(files).filter(([path]) => !path.endsWith('/') && !path.split('/').includes('..'));
+}

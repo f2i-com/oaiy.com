@@ -11,8 +11,10 @@ import { EditorPane } from './ui/editor';
 import { openSettings } from './ui/settings';
 import { TerminalPane } from './ui/terminal';
 import { SoftnPreview } from './softn/preview';
-import { warmKnowledge } from './softn/knowledge';
-import { SOFTN_STARTER, appKey, appLabel, checkProject, describeApp, downloadSoftn, findApps, formatFindings, importSoftn, isSoftnProject, logicSyntax, resolveApp } from './softn/softn';
+import { exampleBundle, exampleCatalogue, warmKnowledge } from './softn/knowledge';
+import { askText, confirmAction } from './ui/modal';
+import { newAppDialog, type NewAppChoice } from './ui/newApp';
+import { SOFTN_BLANK, SOFTN_STARTER, readManifest, appKey, appLabel, checkProject, describeApp, downloadSoftn, findApps, formatFindings, importSoftn, isSoftnProject, logicSyntax, resolveApp } from './softn/softn';
 import { imageForMessage, imageMimeFor, type ImagePart } from './agent/images';
 import type { Attachment } from './agent/protocol';
 import { FileTree } from './ui/tree';
@@ -353,30 +355,69 @@ async function main(): Promise<void> {
     }
   }
 
+  const EXAMPLE_ICONS: Record<string, string> = { notes: '📝', twenty48: '🔢', showcase: '📊', 'three-demo': '🧊', 'gpu-demo': '⚡', 'device-kit': '📷' };
+
   /**
-   * A new SoftN app (Studio's task-list example to start from). With a
-   * folder, it goes into that folder of this project, next to anything else;
-   * without one, into a new project of its own.
+   * A new SoftN app, from the task-list starter, a blank page or one of the
+   * example apps, in a project of its own or a folder of this one. With a
+   * folder (/softn new <folder>) it skips the dialog and uses the starter.
    */
   async function newSoftnApp(folder?: string): Promise<void> {
-    const name = folder ? folder.split('/').filter(Boolean).pop() ?? 'app' : prompt('Name of the new SoftN app', 'Tasks');
-    if (!name) return;
-    let root = '';
+    let choice: NewAppChoice | null;
+    const folderProblem = (dir: string) => {
+      const key = appKey(dir);
+      if (project.vfs.exists(`/${key}/manifest.json`)) return `${dir}/ already holds an app (it has a manifest.json).`;
+      if (project.vfs.stat(`/${key}`)?.type === 'file') return `${dir} is a file.`;
+      return null;
+    };
     if (folder) {
-      root = appKey(folder);
-      if (project.vfs.exists(`/${root}/manifest.json`)) {
-        chat.system(`${appLabel(root)} already has a manifest.json.`, 'error');
+      choice = { name: folder.split('/').filter(Boolean).pop() ?? 'app', start: 'starter', where: 'folder', folder };
+    } else {
+      const catalogue = await exampleCatalogue().catch(() => []);
+      choice = await newAppDialog({
+        projectName: project.meta.name,
+        folderProblem,
+        templates: [
+          { id: 'starter', name: 'Task list', description: 'A small working app: add, tick off and delete tasks.', icon: '☑' },
+          { id: 'blank', name: 'Blank', description: 'One page and an empty logic file.', icon: '◻' },
+        ],
+        examples: catalogue.map((e) => ({ id: e.slug, name: e.name, description: e.description, icon: EXAMPLE_ICONS[e.slug] ?? '◆' })),
+      });
+    }
+    if (!choice) return;
+    let root = '';
+    if (choice.where === 'folder') {
+      const problem = folderProblem(choice.folder);
+      if (problem) {
+        chat.system(problem, 'error');
         return;
       }
+      root = appKey(choice.folder);
     } else {
-      await openProject(await createProject(name));
+      await openProject(await createProject(choice.name));
     }
-    for (const [path, text] of SOFTN_STARTER) project.vfs.writeFile(`/${root ? `${root}/` : ''}${path}`, path === 'manifest.json' ? text.replace('"Tasks"', JSON.stringify(name)) : text, { parents: true });
+    const files: Array<[string, string | Uint8Array]> = choice.start === 'starter' ? SOFTN_STARTER : choice.start === 'blank' ? SOFTN_BLANK : await exampleBundle(choice.start);
+    const prefix = root ? `${root}/` : '';
+    for (const [path, data] of files) {
+      let content = data;
+      if (path === 'manifest.json') {
+        try {
+          const manifest = JSON.parse(typeof data === 'string' ? data : new TextDecoder().decode(data)) as Record<string, unknown>;
+          manifest.name = choice.name;
+          content = `${JSON.stringify(manifest, null, 2)}\n`;
+        } catch {
+          /* keep it as it is */
+        }
+      }
+      project.vfs.writeFile(`/${prefix}${path}`, content, { parents: true });
+    }
     await project.flush();
-    tree.select(`/${root ? `${root}/` : ''}ui/main.ui`);
+    const main = readManifest(project.vfs, root)?.main;
+    tree.select(`/${prefix}${typeof main === 'string' ? main : 'ui/main.ui'}`);
     preview.setApp(root);
     showPane('preview');
-    chat.system(`New SoftN app "${name}" in ${appLabel(root)}: a small task list to start from. Ask the agent to change it into what you want — the preview updates as it works. Export it with /softn export${root ? ` ${root}` : ''}.`);
+    const from = choice.start === 'starter' ? 'a small task list to start from' : choice.start === 'blank' ? 'a blank page to start from' : `a copy of the ${choice.start} example`;
+    chat.system(`New SoftN app "${choice.name}" in ${appLabel(root)}: ${from}. Ask the agent to change it into what you want; the preview updates as it works. Export it with /softn export${root ? ` ${root}` : ''}.`);
   }
 
   function pickApp(folder?: string): string | null {
@@ -463,7 +504,7 @@ A project can hold several apps, each in its own folder (any folder whose manife
     'div.actions',
     { onclick: (e: Event) => { if ((e.target as HTMLElement).closest('button')) closeMenu(); } },
     h('button', { title: 'New empty project', onclick: async () => {
-      const name = prompt('Project name', 'untitled');
+      const name = await askText({ title: 'New project', message: 'An empty project, kept in this browser.', label: 'Project name', value: 'untitled', ok: 'Create' });
       if (name) await openProject(await createProject(name));
     } }, 'New'),
     h('button', { title: 'Open a folder from this computer (a copy is kept in the browser)', onclick: async () => {
@@ -475,18 +516,18 @@ A project can hold several apps, each in its own folder (any folder whose manife
       editor.flush();
       downloadZip(project.meta.name.replace(/[^\w.-]+/g, '-'), project.vfs.files());
     } }, 'Export .zip'),
-    h('button', { title: 'Start a SoftN app in a new project', onclick: () => void newSoftnApp() }, 'New SoftN app'),
+    h('button', { title: 'Start a SoftN app: from a starter, a blank page or an example; in a new project or a folder of this one', onclick: () => newSoftnApp().catch((error: unknown) => chat.system(`Could not start the app: ${(error as Error).message}`, 'error')) }, 'New SoftN app'),
     h('button', { title: 'Unpack a .softn file into a folder of this project', onclick: () => importSoftnFile() }, 'Import .softn…'),
     h('button', { title: 'Download the SoftN app in the preview as a .softn file', onclick: () => void exportSoftn() }, 'Export .softn'),
     h('button', { title: 'Rename this project', onclick: async () => {
-      const name = prompt('Rename project', project.meta.name);
-      if (name) {
+      const name = await askText({ title: 'Rename project', label: 'Project name', value: project.meta.name, ok: 'Rename' });
+      if (name && name !== project.meta.name) {
         project.meta = await renameProject(project.meta, name);
         await renderProjects();
       }
     } }, 'Rename'),
     h('button.danger', { title: 'Delete this project from the browser', onclick: async () => {
-      if (!confirm(`Delete "${project.meta.name}" and all its files from this browser?`)) return;
+      if (!(await confirmAction({ title: 'Delete project', message: `Delete "${project.meta.name}" and all its files from this browser? This cannot be undone (export it as a .zip first to keep a copy).`, ok: 'Delete project', danger: true }))) return;
       const doomed = project.meta.id;
       const others = (await listProjects()).filter((m) => m.id !== doomed);
       const next = others[0] ?? (await createProject('untitled'));

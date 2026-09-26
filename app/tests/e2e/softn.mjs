@@ -107,16 +107,28 @@ try {
   const page = await browser.newPage();
   await page.setViewport({ width: 1400, height: 900 });
   page.on('pageerror', (e) => console.log('  [pageerror]', e.message));
-  page.on('dialog', (d) => d.accept(d.defaultValue()));
+  page.on('dialog', (d) => {
+    console.log(`  [native dialog] ${d.type()}: ${d.message()}`);
+    failures++;
+    d.dismiss();
+  });
   const downloads = mkdtempSync(join(tmpdir(), 'botc-softn-'));
   const cdp = await page.createCDPSession();
   await cdp.send('Browser.setDownloadBehavior', { behavior: 'allow', downloadPath: downloads });
   await page.goto(base);
   await page.waitForSelector('.tree-row', { timeout: 60_000 });
 
-  await check('a new SoftN app renders live in the sandboxed preview', async () => {
+  await check('New SoftN app asks in a modal (not a browser prompt), and the app renders live in the sandboxed preview', async () => {
     await page.type('.chat-input', '/softn new');
     await page.keyboard.press('Enter');
+    await page.waitForSelector('dialog.modal[open] .template-card');
+    const cards = await page.$$eval('dialog.modal .template-card strong', (els) => els.map((e) => e.textContent));
+    expect(cards[0] === 'Task list' && cards.includes('Blank') && cards.includes('Twenty48'), `cards: ${cards}`);
+    if (process.env.SHOT) await page.screenshot({ path: process.env.SHOT.replace('.png', '-new-app.png') });
+    await page.$eval('dialog.modal input[type=text]', (i) => (i.value = ''));
+    await page.type('dialog.modal input[type=text]', 'Tasks');
+    await page.click('dialog.modal button.primary');
+    await page.waitForFunction(() => !document.querySelector('dialog.modal'));
     await waitStatus(page, /live/, 'first render');
     const text = await frameText(page);
     expect(text.includes('Tasks') && text.includes('0 remaining'), text);
@@ -226,6 +238,52 @@ try {
     expect(manifest.main === 'ui/main.ui' && manifest.files.ui.includes('ui/main.ui') && manifest.files.logic.includes('logic/main.logic'), JSON.stringify(manifest));
     expect(Object.keys(entries).every((n) => !n.startsWith('Tasks/')), `entries: ${Object.keys(entries)}`);
     expect(new TextDecoder().decode(entries['ui/main.ui']).includes('Shopping list'), 'stale ui/main.ui');
+  });
+
+  await check('a new app can start from an example, in a folder of this project', async () => {
+    await page.evaluate(() => [...document.querySelectorAll('.actions button')].find((b) => b.textContent === 'New SoftN app').click());
+    await page.waitForSelector('dialog.modal[open] .template-card');
+    expect(!(await page.$eval('dialog.modal details.template-examples', (d) => d.open)), 'the examples start open');
+    await page.click('dialog.modal details.template-examples summary');
+    await page.evaluate(() => [...document.querySelectorAll('dialog.modal .template-card')].find((c) => c.textContent.includes('Twenty48')).click());
+    expect((await page.$eval('dialog.modal input[type=text]', (i) => i.value)) === 'Twenty48', 'the name did not follow the example');
+    await page.evaluate(() => document.querySelector('dialog.modal input[value=folder]').click());
+    // A folder that already holds an app is refused in the dialog.
+    await page.$eval('.folder-field input', (i) => (i.value = ''));
+    await page.type('.folder-field input', '/');
+    await page.click('dialog.modal button.primary');
+    await page.waitForFunction(() => /empty|already holds|Name the folder/.test(document.querySelector('dialog.modal .modal-error')?.textContent ?? ''));
+    await page.$eval('.folder-field input', (i) => (i.value = ''));
+    await page.type('.folder-field input', 'games/2048');
+    await page.click('dialog.modal button.primary');
+    await page.waitForFunction(() => !document.querySelector('dialog.modal'));
+    await page.waitForFunction(() => /New SoftN app "Twenty48"|Could not start/.test(document.querySelector('.chat-log')?.textContent ?? ''), { timeout: 20_000 }).catch(async () => {
+      throw new Error(`no app was made; chat: ${(await page.$eval('.chat-log', (e) => e.textContent)).slice(-200)}`);
+    });
+    await waitStatus(page, /live/, 'the example');
+    const picked = await page.$eval('.preview-app', (s) => ({ value: s.value, options: [...s.options].map((o) => o.value), hidden: s.hidden }));
+    expect(picked.value === 'games/2048', `the preview is not on the new app: ${JSON.stringify(picked)}; chat: ${(await page.$eval('.chat-log', (e) => e.textContent)).slice(-300)}; tree: ${await page.$$eval('.tree-row .name', (els) => els.map((e) => e.textContent).join(','))}`);
+    const manifest = await page.evaluate(() => document.querySelector('.chat-log').textContent);
+    expect(manifest.includes('a copy of the twenty48 example'), manifest.slice(-300));
+  });
+
+  await check('the file tree asks for names and confirmations in modals', async () => {
+    await page.click('button[title="New file"]');
+    await page.waitForSelector('dialog.modal[open] input');
+    await page.type('dialog.modal input', 'notes/todo.md');
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() => /\/notes\/todo\.md$/.test(document.querySelector('.editor-title')?.textContent ?? ''), { timeout: 10_000 }).catch(async () => {
+      throw new Error(`editor title: ${await page.$eval('.editor-title', (e) => e.textContent)}; modal: ${await page.$eval('dialog.modal', (d) => d.textContent).catch(() => 'none')}`);
+    });
+    await page.waitForFunction(() => [...document.querySelectorAll('.tree-row .name')].some((e) => e.textContent === 'todo.md'));
+    await page.$$eval('.tree-row', (rows) => rows.find((r) => r.querySelector('.name')?.textContent === 'todo.md').querySelector('button[title=Delete]').click());
+    await page.waitForSelector('dialog.modal[open] button.danger');
+    await page.keyboard.press('Escape');
+    await page.waitForFunction(() => !document.querySelector('dialog.modal'));
+    expect(await page.$$eval('.tree-row .name', (els) => els.some((e) => e.textContent === 'todo.md')), 'Escape deleted the file');
+    await page.$$eval('.tree-row', (rows) => rows.find((r) => r.querySelector('.name')?.textContent === 'todo.md').querySelector('button[title=Delete]').click());
+    await page.click('dialog.modal button.danger');
+    await page.waitForFunction(() => ![...document.querySelectorAll('.tree-row .name')].some((e) => e.textContent === 'todo.md'));
   });
 } finally {
   await browser.close();
