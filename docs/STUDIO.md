@@ -136,6 +136,7 @@ The **Endpoints** page edits `gateway.routes`. Each route has a `path`, a
 | `completions` | `POST` → `/v1/completions` | — |
 | `models` | the LLM's list plus image and video models (`type`: llm, image, video) | — |
 | `images` | OpenAI Images (below) | nrob-server's job API: `202 {id, status_url}`, `GET …/status`, `POST …/cancel` |
+| `edits` | OpenAI image edits (below) | — |
 | `videos` | OpenAI Videos (below) | the same job API for video |
 | `files` | generated media under the output folder | — |
 | `health` | `{status, llm, media_busy}`, never behind the key | — |
@@ -160,7 +161,24 @@ table that routes the same method and path twice. `gateway.api_key` requires
 | extensions | `seed`, `steps`, `cfg`, `negative_prompt` (SDXL), `turbo`, `weights`, `memory`, `ram_gb`, `vram_gb` |
 
 The reply is `{created, data: [{b64_json | url, revised_prompt}], output_format: "png", size, model}`.
-Multipart bodies (`/images/edits`) are not accepted.
+Generation requests may also carry `images` (below) to edit; the nrob dialect accepts them too.
+
+### OpenAI image edits
+
+`POST /v1/images/edits`, as either:
+
+- `multipart/form-data`, which the OpenAI SDKs send: one to three `image` (or
+  `image[]`) files plus the text fields above (`prompt`, `model`, `n`, `size`,
+  `response_format`, `seed`…);
+- JSON with `images: [{image_url: "data:image/png;base64,…"}]` (or `image`, one or
+  several; plain `data:` strings work too).
+
+Qwen Image conditions on up to three references and edits from the instruction in
+the prompt. `size: auto` (the default for edits) keeps the first image's aspect
+ratio at about a megapixel (a 1920×1080 photo becomes 1376×768). Files are
+recognised by their bytes (PNG, JPEG, WebP), not by their declared type. A `mask`
+is refused rather than ignored, and SDXL models refuse edits: this worker's SDXL is
+text-to-image only. Local paths are accepted only from the UI.
 
 ### OpenAI Videos
 
@@ -230,8 +248,8 @@ sections are:
 - One media job runs at a time; jobs queue. Only one language model is resident
   (nrob-server swaps on request).
 - The job list lives in memory: a restart forgets jobs, not their files.
-- No multipart uploads (`images/edits`, video `input_reference` files): send
-  references as `data:` URLs in JSON.
+- Multipart is accepted on the edits route only; a video's `input_reference`
+  goes as a `data:` URL in JSON. Edits take no mask.
 - RAM-tier uploads use pageable host memory; pinned staging and prefetching the
   next block during compute are the obvious speedups not yet taken.
 
@@ -249,3 +267,6 @@ On two RTX 5090s and 192 GB RAM, with the studio isolated on GPU 1 and its own p
   `?variant=thumbnail` served the MP4 and PNG.
 - A custom route `/my/sdxl` in the nrob dialect ran SDXL staged from the SSD.
 - Killing the studio process left no `nrob-server` behind.
+- `POST /v1/images/edits` as multipart (`curl -F image=@lighthouse.png -F prompt=…`)
+  turned the sunset lighthouse into a snowy night with the beam lit, keeping the
+  composition. A config written before the edits route existed gained it on load.

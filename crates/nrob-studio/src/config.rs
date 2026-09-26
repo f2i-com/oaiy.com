@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 pub const FILE_NAME: &str = "nrob-studio.json";
 
 /// What a gateway route serves.
-pub const TARGETS: [&str; 7] = ["chat", "completions", "models", "images", "videos", "health", "files"];
+pub const TARGETS: [&str; 8] = ["chat", "completions", "models", "images", "edits", "videos", "health", "files"];
 /// The request/response dialect a route speaks. `openai` is the OpenAI API;
 /// `nrob` is nrob-server's own asynchronous media job API (what coder-cli uses).
 pub const SPECS: [&str; 2] = ["openai", "nrob"];
@@ -31,11 +31,13 @@ pub const DEFAULT: &str = r#"{
     "port": 8080,
     "api_key": "",
     "public_url": "",
+    "routes_version": 2,
     "routes": [
       { "path": "/v1/chat/completions", "method": "POST", "target": "chat", "spec": "openai", "enabled": true },
       { "path": "/v1/completions", "method": "POST", "target": "completions", "spec": "openai", "enabled": true },
       { "path": "/v1/models", "method": "GET", "target": "models", "spec": "openai", "enabled": true },
       { "path": "/v1/images/generations", "method": "POST", "target": "images", "spec": "openai", "enabled": true },
+      { "path": "/v1/images/edits", "method": "POST", "target": "edits", "spec": "openai", "enabled": true },
       { "path": "/v1/videos", "method": "POST", "target": "videos", "spec": "openai", "enabled": true },
       { "path": "/files", "method": "GET", "target": "files", "spec": "openai", "enabled": true },
       { "path": "/health", "method": "GET", "target": "health", "spec": "openai", "enabled": true }
@@ -106,6 +108,35 @@ pub fn merge_defaults(v: &mut Json, defaults: &Json) {
     }
 }
 
+/// Routes for targets added after a file was written (`routes_version` records
+/// which it has seen). Returns whether anything changed.
+pub fn upgrade_routes(v: &mut Json) -> bool {
+    const VERSION: i64 = 2;
+    let Json::Obj(top) = v else { return false };
+    let Some((_, gateway)) = top.iter_mut().find(|(k, _)| k == "gateway") else { return false };
+    if int_or(gateway, "routes_version", 1) >= VERSION {
+        return false;
+    }
+    let defaults = default_json();
+    let added: Vec<Json> = defaults.get("gateway").and_then(|g| g.get("routes")).and_then(Json::as_array).unwrap_or(&[]).iter()
+        .filter(|r| str_or(r, "target", "") == "edits").cloned().collect();
+    if let Json::Obj(fields) = gateway {
+        if let Some((_, Json::Arr(routes))) = fields.iter_mut().find(|(k, _)| k == "routes") {
+            for route in added {
+                let taken = routes.iter().any(|r| str_or(r, "target", "") == "edits" || str_or(r, "path", "") == str_or(&route, "path", ""));
+                if !taken {
+                    routes.push(route);
+                }
+            }
+        }
+        match fields.iter_mut().find(|(k, _)| k == "routes_version") {
+            Some((_, n)) => *n = Json::Int(VERSION),
+            None => fields.push(("routes_version".into(), Json::Int(VERSION))),
+        }
+    }
+    true
+}
+
 /// Where the configuration lives: `--config`, else beside the executable.
 pub fn default_path() -> PathBuf {
     exe_dir().join(FILE_NAME)
@@ -127,7 +158,12 @@ pub fn load(path: &Path) -> Result<Json, String> {
     }
     let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let mut v = Json::parse(&bytes).map_err(|e| format!("{}: {e}", path.display()))?;
+    // Before the defaults fill in, so a file without `routes_version` is seen as old.
+    let upgraded = upgrade_routes(&mut v);
     merge_defaults(&mut v, &default_json());
+    if upgraded {
+        save(path, &v)?;
+    }
     validate(&v).map_err(|e| format!("{}: {e}", path.display()))?;
     Ok(v)
 }
@@ -367,6 +403,18 @@ mod tests {
             v = &mut fields.iter_mut().find(|(k, _)| k == key).unwrap().1;
         }
         v
+    }
+
+    #[test]
+    fn older_files_gain_the_edits_route_once() {
+        let mut v = Json::parse(br#"{"gateway":{"routes":[{"path":"/v1/chat/completions","method":"POST","target":"chat"}]}}"#).unwrap();
+        assert!(upgrade_routes(&mut v));
+        merge_defaults(&mut v, &default_json());
+        let routes = v.get("gateway").unwrap().get("routes").unwrap().as_array().unwrap();
+        assert_eq!(routes.len(), 2);
+        assert_eq!(str_or(&routes[1], "path", ""), "/v1/images/edits");
+        assert!(!upgrade_routes(&mut v), "a second load changes nothing");
+        validate(&v).unwrap();
     }
 
     #[test]

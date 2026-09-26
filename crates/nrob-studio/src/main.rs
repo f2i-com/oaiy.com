@@ -17,6 +17,7 @@ mod detect;
 mod gateway;
 mod llm;
 mod media;
+mod multipart;
 mod registry;
 mod system;
 mod util;

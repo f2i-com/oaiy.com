@@ -253,8 +253,33 @@ fn path_field(root: &Path, model: &Json, key: &str) -> Option<String> {
     (!v.is_empty()).then(|| config::resolve(root, v).to_string_lossy().into_owned())
 }
 
-/// The worker request for an image job, and a summary for the job list.
-pub fn image_request(cfg: &Json, root: &Path, output_root: &Path, body: &Json) -> Result<(Json, String, String, usize), String> {
+/// Reference images for editing: `images` (an array) or `image` (one or an
+/// array), each a `data:` URL, `{image_url}`, or (from the local UI) a path.
+fn references(body: &Json, output_root: &Path, allow_local: bool) -> Result<Vec<String>, String> {
+    let mut values: Vec<&Json> = Vec::new();
+    for key in ["images", "image"] {
+        match body.get(key) {
+            None | Some(Json::Null) => {}
+            Some(Json::Arr(items)) => values.extend(items.iter()),
+            Some(one) => values.push(one),
+        }
+    }
+    if values.len() > 3 {
+        return Err("at most three reference images".into());
+    }
+    let mut paths = Vec::new();
+    for v in values {
+        if let Some(p) = reference_image(v, output_root, allow_local)? {
+            paths.push(p);
+        }
+    }
+    Ok(paths)
+}
+
+/// The worker request for an image job, and a summary for the job list. With
+/// reference images (`images`/`image`) the job edits them: Qwen Image conditions
+/// on up to three.
+pub fn image_request(cfg: &Json, root: &Path, output_root: &Path, body: &Json, allow_local: bool) -> Result<(Json, String, String, usize), String> {
     let media = cfg.get("media").ok_or("no media section")?;
     let section = media.get("image").ok_or("no image section")?;
     if !bool_or(section, "enabled", true) {
@@ -268,7 +293,17 @@ pub fn image_request(cfg: &Json, root: &Path, output_root: &Path, body: &Json) -
     };
     let arch = str_or(model, "architecture", "qwen-image");
     let step = if arch == "sdxl" { 64 } else { 32 };
-    let (w, h) = size(body, model, (1024, 1024))?;
+    let refs = references(body, output_root, allow_local)?;
+    if !refs.is_empty() && arch == "sdxl" {
+        return Err(format!("{name} is an SDXL model, which cannot edit images; pick a Qwen Image model"));
+    }
+    // Editing with `size: auto` keeps the first reference's shape at about a megapixel.
+    let auto = matches!(body.get("size").and_then(Json::as_str), None | Some("auto" | ""));
+    let first = refs.first().and_then(|p| std::fs::read(p).ok()).and_then(|b| crate::multipart::image_info(&b));
+    let (w, h) = match (auto && body.get("width").is_none(), first) {
+        (true, Some((_, iw, ih))) => crate::multipart::size_like(iw, ih, step),
+        _ => size(body, model, (1024, 1024))?,
+    };
     if !(256..=2048).contains(&w) || !(256..=2048).contains(&h) {
         return Err("width and height must be between 256 and 2048".into());
     }
@@ -329,6 +364,12 @@ pub fn image_request(cfg: &Json, root: &Path, output_root: &Path, body: &Json) -
         f.push(("adapter".into(), adapter.map_or(Json::Null, Json::str)));
         if let Some(te) = path_field(root, model, "text_encoder") {
             f.push(("text_encoder".into(), Json::str(te)));
+        }
+        if !refs.is_empty() {
+            f.push(("images".into(), Json::Arr(refs.iter().map(Json::str).collect())));
+            if let Some(n) = body.get("reference_size").and_then(Json::as_i64) {
+                f.push(("reference_size".into(), Json::Int(n)));
+            }
         }
     }
     f.extend(residency(body, section, model)?);
@@ -825,7 +866,7 @@ mod tests {
         let c = cfg("", "");
         let root = Path::new("/install");
         let out = Path::new("/install/outputs");
-        let (r, name, size, n) = image_request(&c, root, out, &body(r#"{"prompt":"a fox","n":2,"size":"1536x1024","model":"dall-e-3","seed":5}"#)).unwrap();
+        let (r, name, size, n) = image_request(&c, root, out, &body(r#"{"prompt":"a fox","n":2,"size":"1536x1024","model":"dall-e-3","seed":5}"#), false).unwrap();
         assert_eq!((name.as_str(), size.as_str(), n), ("qwen", "1536x1024", 2));
         assert_eq!(r.get("steps").and_then(Json::as_i64), Some(6));
         assert_eq!(r.get("device").and_then(Json::as_i64), Some(1));
@@ -834,15 +875,36 @@ mod tests {
         assert_eq!((r.get("ram_gb").and_then(Json::as_i64), r.get("vram_gb").and_then(Json::as_i64)), (Some(32), Some(20)));
         assert!(r.get("output_dir").and_then(Json::as_str).unwrap().contains("images"));
         // The SDXL model's own residency applies; requests may lower but not raise caps.
-        let (s, ..) = image_request(&c, root, out, &body(r#"{"prompt":"x","model":"anime","size":"1000x1000","ram_gb":8}"#)).unwrap();
+        let (s, ..) = image_request(&c, root, out, &body(r#"{"prompt":"x","model":"anime","size":"1000x1000","ram_gb":8}"#), false).unwrap();
         assert_eq!(s.get("architecture").and_then(Json::as_str), Some("sdxl"));
         assert_eq!((s.get("width").and_then(Json::as_i64), s.get("steps").and_then(Json::as_i64)), (Some(960), Some(24)));
         assert_eq!(s.get("memory").and_then(Json::as_str), Some("ssd"));
         assert_eq!(s.get("ram_gb").and_then(Json::as_i64), Some(8));
         for bad in [r#"{"prompt":""}"#, r#"{"prompt":"x","n":17}"#, r#"{"prompt":"x","size":"big"}"#, r#"{"prompt":"x","ram_gb":33}"#,
             r#"{"prompt":"x","memory":"disk"}"#, r#"{"prompt":"x","model":"missing"}"#, r#"{"prompt":"x","steps":5}"#, r#"{"prompt":"x","size":"4096x4096"}"#] {
-            assert!(image_request(&c, root, out, &body(bad)).is_err(), "{bad}");
+            assert!(image_request(&c, root, out, &body(bad), false).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn edits_carry_references_and_take_their_shape() {
+        let c = cfg("", "");
+        let out = std::env::temp_dir().join(format!("nrob-studio-edit-{}", std::process::id()));
+        let mut png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+        png.extend(1920u32.to_be_bytes());
+        png.extend(1080u32.to_be_bytes());
+        let url = format!("data:image/png;base64,{}", crate::util::base64_encode(&png));
+        let edit = body(&format!(r#"{{"prompt":"make it night","images":[{{"image_url":"{url}"}}]}}"#));
+        let (r, _, size, _) = image_request(&c, Path::new("/install"), &out, &edit, false).unwrap();
+        assert_eq!(size, "1376x768");
+        let refs = r.get("images").and_then(Json::as_array).unwrap();
+        assert_eq!(std::fs::read(refs[0].as_str().unwrap()).unwrap(), png);
+        let four = body(&format!(r#"{{"prompt":"x","image":["{url}","{url}","{url}","{url}"]}}"#));
+        assert!(image_request(&c, Path::new("/install"), &out, &four, false).unwrap_err().contains("three"));
+        let sdxl = body(&format!(r#"{{"prompt":"x","model":"anime","image":"{url}"}}"#));
+        assert!(image_request(&c, Path::new("/install"), &out, &sdxl, false).unwrap_err().contains("SDXL"));
+        assert!(image_request(&c, Path::new("/install"), &out, &body(r#"{"prompt":"x","image":"C:/private.png"}"#), false).is_err());
+        let _ = std::fs::remove_dir_all(out);
     }
 
     #[test]

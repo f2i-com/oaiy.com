@@ -4,6 +4,8 @@
 //! * `chat`, `completions`, `models`: proxied to nrob-server (OpenAI chat,
 //!   streamed as it arrives -- event streams are never buffered).
 //! * `images` + `openai`: OpenAI Images, synchronous: `{created, data:[{b64_json}|{url}]}`.
+//! * `edits` + `openai`: OpenAI image edits, as `multipart/form-data` (what the
+//!   SDKs send) or JSON with `images: [{image_url}]`; same reply as `images`.
 //! * `videos` + `openai`: OpenAI Videos, asynchronous: `POST P` creates,
 //!   `GET P` lists, `GET P/{id}` polls, `GET P/{id}/content` downloads,
 //!   `DELETE P/{id}` forgets.
@@ -114,7 +116,8 @@ pub fn handle(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, m: Matched
         ("models", _) => models(studio, req, w),
         ("health", _) => json_reply(w, 200, &health(studio)),
         ("files", _) => files(studio, w, m.rest.trim_start_matches('/')),
-        ("images", "openai") if m.rest.is_empty() => send(w, images_openai(studio, req, trusted)),
+        ("images", "openai") if m.rest.is_empty() => send(w, parse_body(req).and_then(|b| images_openai(studio, req, b, trusted))),
+        ("edits", _) if m.rest.is_empty() => send(w, edit_body(studio, req).and_then(|b| images_openai(studio, req, b, trusted))),
         ("images", "nrob") | ("videos", "nrob") => {
             let kind = if m.target == "images" { Kind::Image } else { Kind::Video };
             send(w, nrob_jobs(studio, req, kind, &m.rest, trusted))
@@ -251,12 +254,80 @@ pub fn files(studio: &Studio, w: &mut TcpStream, rel: &str) -> io::Result<bool> 
     }
 }
 
-/// OpenAI Images: generate, wait, and answer with base64 PNGs or URLs.
-fn images_openai(studio: &Arc<Studio>, req: &Request, trusted: bool) -> Result<Reply, Reply> {
+/// An edit request as the JSON an image job takes. Multipart files are saved
+/// under the output root and passed by path; text fields become strings or
+/// numbers. Files can arrive only as files: a text field cannot name a path.
+fn edit_body(studio: &Studio, req: &Request) -> Result<Json, Reply> {
     if req.method != "POST" {
         return Err(fail(405, "use POST"));
     }
-    let body = parse_body(req)?;
+    const NO_MASK: &str = "mask is not supported: Qwen Image edits the whole picture from the instruction in the prompt";
+    let ctype = req.header("content-type").unwrap_or("");
+    let body = if multipart(req) {
+        let parts = crate::multipart::parse(ctype, &req.body).map_err(|e| fail(400, e))?;
+        let dir = studio.output_root().join("inputs");
+        std::fs::create_dir_all(&dir).map_err(|e| fail(500, e.to_string()))?;
+        let mut fields: Vec<(String, Json)> = Vec::new();
+        let mut images = Vec::new();
+        for p in parts {
+            let name = p.name.trim_end_matches("[]").to_string();
+            match name.as_str() {
+                "mask" => return Err(fail(400, NO_MASK)),
+                "image" | "images" => {
+                    let label = p.filename.clone().unwrap_or_else(|| "image".into());
+                    let (ext, ..) = crate::multipart::image_info(&p.data).ok_or_else(|| fail(400, format!("{label}: not a PNG, JPEG or WebP image")))?;
+                    if p.data.len() > 32 << 20 {
+                        return Err(fail(400, "reference images are limited to 32 MiB"));
+                    }
+                    let path = dir.join(format!("{}.{ext}", crate::util::random_id("ref_")));
+                    std::fs::write(&path, &p.data).map_err(|e| fail(500, e.to_string()))?;
+                    images.push(Json::str(path.to_string_lossy()));
+                }
+                _ if p.filename.is_some() => return Err(fail(400, format!("unexpected file field {name}"))),
+                _ => {
+                    let text = String::from_utf8(p.data).map_err(|_| fail(400, format!("{name} is not UTF-8 text")))?;
+                    let t = text.trim();
+                    let value = if name == "prompt" || name == "negative_prompt" {
+                        Json::Str(text.clone())
+                    } else if let Ok(n) = t.parse::<i64>() {
+                        Json::Int(n)
+                    } else if let Ok(x) = t.parse::<f64>() {
+                        Json::Num(x)
+                    } else if t == "true" || t == "false" {
+                        Json::Bool(t == "true")
+                    } else {
+                        Json::Str(text.clone())
+                    };
+                    fields.push((name, value));
+                }
+            }
+        }
+        fields.push(("images".into(), Json::Arr(images)));
+        Json::Obj(fields)
+    } else {
+        let body = parse_body(req)?;
+        if body.get("mask").is_some_and(|m| !matches!(m, Json::Null)) {
+            return Err(fail(400, NO_MASK));
+        }
+        body
+    };
+    let count: usize = ["images", "image"].iter().filter_map(|k| body.get(k)).map(|v| v.as_array().map_or(1, <[Json]>::len)).sum();
+    if count == 0 {
+        return Err(fail(400, "an edit needs at least one image"));
+    }
+    Ok(body)
+}
+
+/// Multipart edits carry files the gateway saved itself, so their paths are safe.
+fn multipart(req: &Request) -> bool {
+    req.header("content-type").is_some_and(|c| c.to_ascii_lowercase().starts_with("multipart/form-data"))
+}
+
+/// OpenAI Images: generate, wait, and answer with base64 PNGs or URLs.
+fn images_openai(studio: &Arc<Studio>, req: &Request, body: Json, trusted: bool) -> Result<Reply, Reply> {
+    if req.method != "POST" {
+        return Err(fail(405, "use POST"));
+    }
     let format = match body.get("response_format").and_then(Json::as_str) {
         None => "b64_json",
         Some(f @ ("b64_json" | "url")) => f,
@@ -265,8 +336,7 @@ fn images_openai(studio: &Arc<Studio>, req: &Request, trusted: bool) -> Result<R
     if body.get("output_format").and_then(Json::as_str).is_some_and(|f| f != "png") {
         return Err(fail(400, "output_format: this server writes png"));
     }
-    let job = submit_image(studio, &body)?;
-    let _ = trusted;
+    let job = submit_image(studio, &body, trusted || multipart(req))?;
     let done = studio.media.wait(&job.id, IMAGE_WAIT).ok_or_else(|| fail(500, "the job disappeared"))?;
     if done.status != "completed" {
         return Err(fail(if done.status == "in_progress" { 504 } else { 500 }, done.error.unwrap_or_else(|| format!("image job {}", done.status))));
@@ -293,10 +363,10 @@ fn images_openai(studio: &Arc<Studio>, req: &Request, trusted: bool) -> Result<R
     ]))
 }
 
-fn submit_image(studio: &Arc<Studio>, body: &Json) -> Result<Job, Reply> {
+fn submit_image(studio: &Arc<Studio>, body: &Json, allow_local: bool) -> Result<Job, Reply> {
     let cfg = studio.config();
     let root = studio.output_root();
-    let (request, model, size, n) = media::image_request(&cfg, &studio.root, &root, body).map_err(|e| fail(400, e))?;
+    let (request, model, size, n) = media::image_request(&cfg, &studio.root, &root, body, allow_local).map_err(|e| fail(400, e))?;
     Ok(studio.media.submit(Kind::Image, request, model, size, n, 0.0, keep_jobs(&cfg)))
 }
 
@@ -396,7 +466,7 @@ fn nrob_jobs(studio: &Arc<Studio>, req: &Request, kind: Kind, rest: &str, truste
     match (req.method.as_str(), rest) {
         ("POST", "") => {
             let body = parse_body(req)?;
-            let job = if kind == Kind::Image { submit_image(studio, &body)? } else { submit_video(studio, &body, trusted)? };
+            let job = if kind == Kind::Image { submit_image(studio, &body, trusted)? } else { submit_video(studio, &body, trusted)? };
             Ok(Reply {
                 status: 202,
                 body: Json::obj([

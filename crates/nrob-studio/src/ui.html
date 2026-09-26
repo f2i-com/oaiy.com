@@ -261,12 +261,14 @@ dialog::backdrop { background: rgba(10, 13, 17, .6); }
             <label class="f"><span>Prompt</span><textarea id="img-prompt" required placeholder="A red fox sitting in fresh snow, photograph"></textarea></label>
             <label class="f"><span>Model</span><select id="img-model"></select></label>
             <div class="grid-f" style="grid-template-columns:1fr 1fr">
-              <label class="f"><span>Size</span><select id="img-size"><option>1024x1024</option><option>1344x768</option><option>768x1344</option><option>1536x1024</option><option>512x512</option></select></label>
+              <label class="f"><span>Size</span><select id="img-size"><option value="auto">Auto</option><option>1024x1024</option><option>1344x768</option><option>768x1344</option><option>1536x1024</option><option>512x512</option></select></label>
               <label class="f"><span>Images</span><input type="number" id="img-n" min="1" max="16" value="1"></label>
               <label class="f"><span>Steps <em class="muted">model default</em></span><input type="number" id="img-steps" min="2" max="100" placeholder="auto"></label>
               <label class="f"><span>Seed</span><input type="number" id="img-seed" min="0" placeholder="random"></label>
             </div>
             <label class="f"><span>Negative prompt (SDXL)</span><input type="text" id="img-neg" placeholder="blurry, low quality"></label>
+            <label class="f"><span>Images to edit (up to 3, Qwen Image)</span><input type="file" id="img-refs" accept="image/png,image/jpeg,image/webp" multiple></label>
+            <div class="row" id="img-ref-preview"></div>
             <div class="f"><span class="small muted">Where the weights live for this job</span><div class="seg" id="img-tier"></div></div>
             <button class="btn go" type="submit" id="img-go">Generate</button>
             <div class="progress" id="img-progress" hidden><div class="meter"><div style="width:0"></div></div><span class="small muted"></span></div>
@@ -735,7 +737,7 @@ function shareNote() {
 }
 
 /* ---------- endpoints ---------- */
-const targets = [["chat", "Chat"], ["completions", "Completions"], ["models", "Model list"], ["images", "Images"], ["videos", "Videos"], ["files", "Generated files"], ["health", "Health"]];
+const targets = [["chat", "Chat"], ["completions", "Completions"], ["models", "Model list"], ["images", "Images"], ["edits", "Image edits"], ["videos", "Videos"], ["files", "Generated files"], ["health", "Health"]];
 function renderRoutes() {
   $("#routes").innerHTML = cfg.gateway.routes.map((r, i) => `<tr>
     <td><input type="checkbox" data-r="${i}|enabled" ${r.enabled !== false ? "checked" : ""} aria-label="Enabled"></td>
@@ -754,10 +756,12 @@ function renderExamples() {
   const base = state?.gateway_url || `http://127.0.0.1:${cfg.gateway.port}`;
   const auth = cfg.gateway.api_key ? ` \\\n  -H "Authorization: Bearer ${cfg.gateway.api_key.replace(/./g, "•")}"` : "";
   const out = [];
-  const chat = routeFor("chat"), img = routeFor("images"), vid = routeFor("videos");
+  const chat = routeFor("chat"), img = routeFor("images"), vid = routeFor("videos"), edit = routeFor("edits");
   const lm = cfg.llm.default_model || cfg.llm.models[0]?.name || "your-model";
   if (chat) out.push(["Chat", `curl ${base}${chat.path}${auth} \\\n  -H "Content-Type: application/json" \\\n  -d '{"model":"${lm}","messages":[{"role":"user","content":"Hello"}],"stream":true}'`]);
   if (img) out.push(["Image", img.spec === "nrob" ? `curl ${base}${img.path}${auth} -d '{"prompt":"a red fox in snow"}'\ncurl ${base}${img.path}/status` : `curl ${base}${img.path}${auth} \\\n  -H "Content-Type: application/json" \\\n  -d '{"prompt":"a red fox in snow","size":"1024x1024","response_format":"url"}'`]);
+  if (edit) out.push(["Image edit", `curl ${base}${edit.path}${auth} \
+  -F image=@photo.png -F prompt="make it a snowy night" -F response_format=url`]);
   if (vid) out.push(["Video", vid.spec === "nrob" ? `curl ${base}${vid.path}${auth} -d '{"prompt":"waves at dusk"}'\ncurl ${base}${vid.path}/status` : `curl ${base}${vid.path}${auth} -H "Content-Type: application/json" -d '{"prompt":"waves at dusk","seconds":"4","size":"1280x720"}'\ncurl ${base}${vid.path}/VIDEO_ID\ncurl -o clip.mp4 ${base}${vid.path}/VIDEO_ID/content`]);
   out.push(["SDKs", `from openai import OpenAI\nclient = OpenAI(base_url="${base}/v1", api_key="${cfg.gateway.api_key ? "YOUR_KEY" : "unused"}")`]);
   $("#examples").innerHTML = out.map(([t, c]) => `<h3>${t}</h3><pre class="example">${esc(c)}</pre>`).join("");
@@ -891,15 +895,22 @@ function watchJob(kind, bar) {
   }, 700);
   return () => { clearInterval(tick); bar.hidden = true; };
 }
+$("#img-refs").onchange = () => {
+  const files = [...$("#img-refs").files].slice(0, 3);
+  $("#img-ref-preview").innerHTML = files.map(f => `<img src="${URL.createObjectURL(f)}" alt="${esc(f.name)}" style="width:64px;height:64px;object-fit:cover;border-radius:4px">`).join("");
+  $("#img-go").textContent = files.length ? "Edit" : "Generate";
+};
 $("#img-form").onsubmit = async e => {
   e.preventDefault();
   const body = {prompt: $("#img-prompt").value, model: $("#img-model").value || undefined, size: $("#img-size").value, n: +$("#img-n").value || 1, memory: imgTier, response_format: "url"};
+  const refs = [...$("#img-refs").files].slice(0, 3);
+  if (refs.length) body.images = await Promise.all(refs.map(async f => ({image_url: await readAsDataUrl(f)})));
   if ($("#img-steps").value) body.steps = +$("#img-steps").value;
   if ($("#img-seed").value) body.seed = +$("#img-seed").value;
   if ($("#img-neg").value) body.negative_prompt = $("#img-neg").value;
   $("#img-go").disabled = true; const stop = watchJob("image", $("#img-progress"));
   try {
-    const r = await api("/api/play/images", {method: "POST", body});
+    const r = await api(refs.length ? "/api/play/edits" : "/api/play/images", {method: "POST", body});
     const g = $("#img-gallery");
     for (const d of r.data.reverse()) g.insertAdjacentHTML("afterbegin", `<figure><a href="${esc(d.url)}" target="_blank"><img src="${esc(d.url)}" alt="${esc(body.prompt)}"></a><figcaption><span>${esc(r.model)}, ${esc(r.size)}</span><a href="${esc(d.url)}" download>Save</a></figcaption></figure>`);
   } catch (err) { toast(err.message, true); }
