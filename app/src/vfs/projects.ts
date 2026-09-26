@@ -25,7 +25,16 @@ async function root(): Promise<FileSystemDirectoryHandle> {
 
 async function dirAt(base: FileSystemDirectoryHandle, path: string, create: boolean): Promise<FileSystemDirectoryHandle> {
   let dir = base;
-  for (const seg of path.split('/').filter(Boolean)) dir = await dir.getDirectoryHandle(seg, { create });
+  for (const seg of path.split('/').filter(Boolean)) {
+    try {
+      dir = await dir.getDirectoryHandle(seg, { create });
+    } catch (error) {
+      // A file where a folder now belongs (its removal never reached the disk): replace it.
+      if (!create || (error as DOMException).name !== 'TypeMismatchError') throw error;
+      await dir.removeEntry(seg);
+      dir = await dir.getDirectoryHandle(seg, { create: true });
+    }
+  }
   return dir;
 }
 
@@ -128,7 +137,14 @@ export class OpenProject {
     this.timer = setTimeout(() => void this.flush(), 300);
   }
 
-  /** Write everything pending; resolves when it is on disk. */
+  /** Whether changes are waiting to be written. */
+  get dirty(): boolean {
+    return this.pending.size > 0 || this.timer !== null;
+  }
+
+  private retries = 0;
+
+  /** Write everything pending; resolves when it is on disk (or has failed and is queued again). */
   flush(): Promise<void> {
     if (this.timer) {
       clearTimeout(this.timer);
@@ -137,37 +153,64 @@ export class OpenProject {
     const batch = [...this.pending.values()];
     this.pending.clear();
     if (!batch.length) return this.flushing;
-    this.flushing = this.flushing.then(() => this.write(batch)).catch((error: unknown) => this.onError(`Saving the project failed: ${(error as Error).message}`));
+    this.flushing = this.flushing.then(async () => {
+      const failed = await this.write(batch);
+      if (!failed.length) {
+        this.retries = 0;
+        return;
+      }
+      // Keep what did not reach the disk (unless something newer replaced it) and try again shortly.
+      for (const { change } of failed) if (change.type === 'reset' || !this.pending.has(change.path)) this.pending.set(change.type === 'reset' ? '\u0000reset' : change.path, change);
+      this.retries++;
+      this.onError(`Saving ${failed.length === 1 ? failed[0].label : `${failed.length} files`} to this browser's storage failed: ${failed[0].error}.${this.retries <= 3 ? ' Trying again.' : ' Export the project to keep a copy.'}`);
+      if (this.retries <= 3 && !this.timer) this.timer = setTimeout(() => void this.flush(), 2000 * this.retries);
+    });
     return this.flushing;
   }
 
-  private async write(batch: VfsChange[]): Promise<void> {
+  /**
+   * Bring the disk in line with the files in memory for each changed path.
+   * Each path is written as it is NOW (a file, a folder, or gone), whatever
+   * the change said, so a change that was replaced before it was written
+   * cannot leave the disk out of step. Returns the paths that failed.
+   */
+  private async write(batch: VfsChange[]): Promise<Array<{ change: VfsChange; label: string; error: string }>> {
+    const failed: Array<{ change: VfsChange; label: string; error: string }> = [];
     const files = await this.dir.getDirectoryHandle('files', { create: true });
     for (const change of batch) {
-      if (change.type === 'reset') {
-        await this.dir.removeEntry('files', { recursive: true }).catch(() => {});
-        const fresh = await this.dir.getDirectoryHandle('files', { create: true });
-        for (const [path, data] of this.vfs.files()) {
-          const slash = path.lastIndexOf('/');
-          await writeBytes(await dirAt(fresh, slash < 0 ? '' : path.slice(0, slash), true), path.slice(slash + 1), data);
+      try {
+        if (change.type === 'reset') {
+          await this.dir.removeEntry('files', { recursive: true }).catch(() => {});
+          const fresh = await this.dir.getDirectoryHandle('files', { create: true });
+          for (const [path, data] of this.vfs.files()) {
+            const slash = path.lastIndexOf('/');
+            await writeBytes(await dirAt(fresh, slash < 0 ? '' : path.slice(0, slash), true), path.slice(slash + 1), data);
+          }
+          for (const e of this.vfs.walk('/', { includeIgnored: true }).entries) if (e.type === 'dir') await dirAt(fresh, e.path, true);
+          continue;
         }
-        for (const e of this.vfs.walk('/', { includeIgnored: true }).entries) if (e.type === 'dir') await dirAt(fresh, e.path, true);
-        continue;
-      }
-      const slash = change.path.lastIndexOf('/');
-      const parentPath = slash < 0 ? '' : change.path.slice(0, slash);
-      const name = change.path.slice(slash + 1);
-      if (change.type === 'remove') {
-        const parent = await dirAt(files, parentPath, false).catch(() => null);
-        await parent?.removeEntry(name, { recursive: true }).catch(() => {});
-      } else if (change.type === 'mkdir') {
-        await dirAt(files, change.path, true);
-      } else if (this.vfs.stat(`/${change.path}`)?.type === 'file') {
-        await writeBytes(await dirAt(files, parentPath, true), name, this.vfs.readBytes(`/${change.path}`));
+        const slash = change.path.lastIndexOf('/');
+        const parentPath = slash < 0 ? '' : change.path.slice(0, slash);
+        const name = change.path.slice(slash + 1);
+        const now = this.vfs.stat(`/${change.path}`);
+        if (!now) {
+          const parent = await dirAt(files, parentPath, false).catch(() => null);
+          await parent?.removeEntry(name, { recursive: true }).catch(() => {});
+        } else if (now.type === 'dir') {
+          await dirAt(files, change.path, true);
+        } else {
+          const parent = await dirAt(files, parentPath, true);
+          // A folder where a file now belongs: replace it.
+          await parent.getDirectoryHandle(name).then(() => parent.removeEntry(name, { recursive: true }), () => {});
+          await writeBytes(parent, name, this.vfs.readBytes(`/${change.path}`));
+        }
+      } catch (error) {
+        failed.push({ change, label: change.type === 'reset' ? 'the project' : change.path, error: (error as Error).message || String(error) });
       }
     }
     this.meta = { ...this.meta, updated: Date.now() };
-    await writeBytes(this.dir, 'project.json', JSON.stringify(this.meta));
+    await writeBytes(this.dir, 'project.json', JSON.stringify(this.meta)).catch(() => {});
+    return failed;
   }
 
   async loadChat(): Promise<Turn[]> {

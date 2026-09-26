@@ -172,8 +172,34 @@ async function main(): Promise<void> {
     for (const meta of list) projectSelect.append(h('option', { value: meta.id, selected: meta.id === project?.meta.id }, meta.name));
   };
 
-  const openProject = async (meta: ProjectMeta) => {
-    if (controller) controller.abort();
+  /** The run in progress, to wait for when it has to stop. */
+  let currentRun: Promise<void> | null = null;
+  /** Project switches happen one at a time. */
+  let opening: Promise<unknown> = Promise.resolve();
+
+  const openProject = (meta: ProjectMeta): Promise<void> => {
+    const next = opening.then(() => openProjectNow(meta));
+    opening = next.catch(() => {});
+    return next;
+  };
+
+  /** Stop the run, if there is one, and wait until it has stopped and saved. */
+  async function stopRun(): Promise<void> {
+    if (!controller) return;
+    controller.abort();
+    chat.setStatus('Stopping the agent…');
+    await currentRun?.catch(() => {});
+  }
+
+  /** Leaving the project while the agent works: ask first. */
+  async function mayLeaveRun(): Promise<boolean> {
+    if (!controller) return true;
+    return confirmAction({ title: 'Stop the agent?', message: 'The agent is still working in this project. Switching stops it; what it has done so far is kept.', ok: 'Stop and switch' });
+  }
+
+  const openProjectNow = async (meta: ProjectMeta) => {
+    if (project && meta.id === project.meta.id) return;
+    await stopRun();
     if (project) {
       editor.flush();
       await project.close();
@@ -220,7 +246,7 @@ async function main(): Promise<void> {
   };
 
   const newProjectFrom = async (imported: Imported | null) => {
-    if (!imported) return;
+    if (!imported || !(await mayLeaveRun())) return;
     const meta = await createProject(imported.name);
     await openProject(meta);
     project.vfs.load(imported.files);
@@ -377,6 +403,19 @@ async function main(): Promise<void> {
     editor.flush();
     chat.setBusy(true);
     controller = new AbortController();
+    const runProject = project;
+    const runAgent = agent;
+    let finish!: () => void;
+    currentRun = new Promise<void>((resolve) => (finish = resolve));
+    // The conversation is saved as it grows, so a closed tab or a crash loses little.
+    let saveTimer: ReturnType<typeof setTimeout> | null = null;
+    const saveSoon = () => {
+      if (saveTimer) return;
+      saveTimer = setTimeout(() => {
+        saveTimer = null;
+        void runProject.saveChat(runAgent.turns).catch(() => {});
+      }, 1500);
+    };
     try {
       await checkWindow();
       let prompt = text;
@@ -392,18 +431,24 @@ async function main(): Promise<void> {
       chat.user(text, attachments);
       // The first check of a run brings the preview forward, so the person sees the app being built.
       let previewShown = false;
-      await agent.run(prompt, (event) => {
+      await runAgent.run(prompt, (event) => {
+        // A run stopped by a project switch finishes quietly: the chat now shows another project.
+        if (project !== runProject) return;
         chat.event(event);
+        if (event.type === 'tool_result' || event.type === 'compact' || event.type === 'nudge') saveSoon();
         if (event.type === 'check' && event.state === 'running' && !previewShown) {
           previewShown = true;
           if (!window.matchMedia('(max-width: 900px)').matches) showPane('preview');
         }
       }, controller.signal, images, attachments);
     } finally {
+      if (saveTimer) clearTimeout(saveTimer);
       controller = null;
-      chat.setBusy(false);
-      await project.flush();
-      await project.saveChat(agent.turns);
+      if (project === runProject) chat.setBusy(false);
+      await runProject.flush();
+      await runProject.saveChat(runAgent.turns);
+      finish();
+      currentRun = null;
     }
   }
 
@@ -446,6 +491,7 @@ async function main(): Promise<void> {
       }
       root = appKey(choice.folder);
     } else {
+      if (!(await mayLeaveRun())) return;
       await openProject(await createProject(choice.name));
     }
     const files: Array<[string, string | Uint8Array]> = choice.start === 'starter' ? SOFTN_STARTER : choice.start === 'blank' ? SOFTN_BLANK : await exampleBundle(choice.start);
@@ -556,6 +602,7 @@ A project can hold several apps, each in its own folder (any folder whose manife
     'div.actions',
     { onclick: (e: Event) => { if ((e.target as HTMLElement).closest('button')) closeMenu(); } },
     h('button', { title: 'New empty project', onclick: async () => {
+      if (!(await mayLeaveRun())) return;
       const name = await askText({ title: 'New project', message: 'An empty project, kept in this browser.', label: 'Project name', value: 'untitled', ok: 'Create' });
       if (name) await openProject(await createProject(name));
     } }, 'New'),
@@ -579,6 +626,7 @@ A project can hold several apps, each in its own folder (any folder whose manife
       }
     } }, 'Rename'),
     h('button.danger', { title: 'Delete this project from the browser', onclick: async () => {
+      if (!(await mayLeaveRun())) return;
       if (!(await confirmAction({ title: 'Delete project', message: `Delete "${project.meta.name}" and all its files from this browser? This cannot be undone (export it as a .zip first to keep a copy).`, ok: 'Delete project', danger: true }))) return;
       const doomed = project.meta.id;
       const others = (await listProjects()).filter((m) => m.id !== doomed);
@@ -601,7 +649,12 @@ A project can hold several apps, each in its own folder (any folder whose manife
   );
   projectSelect.addEventListener('change', async () => {
     const meta = (await listProjects()).find((m) => m.id === projectSelect.value);
-    if (meta) await openProject(meta);
+    if (!meta) return;
+    if (!(await mayLeaveRun())) {
+      projectSelect.value = project.meta.id;
+      return;
+    }
+    await openProject(meta);
   });
 
   // The center shows the editor or the app preview, with the terminal below.
@@ -660,9 +713,21 @@ A project can hold several apps, each in its own folder (any folder whose manife
   if (!sandbox.ok) chat.system(`The code sandbox is unavailable: ${sandbox.reason}.`, 'error');
   else void zippModule().catch((error: unknown) => chat.system(`Could not load the Zipp engine: ${(error as Error).message}`, 'error'));
   if (!activeProvider()) chat.system('Welcome! Set up an AI provider in ⚙ Settings to talk to the agent — a local server (Ollama, LM Studio) keeps everything on this computer. The editor and terminal work without one.');
-  window.addEventListener('beforeunload', () => {
+  // Leaving the page (closing the tab, reloading, switching away on a phone): save now.
+  // pagehide and a hidden page come early enough for the writes to start; the
+  // beforeunload prompt covers a run still going.
+  const saveNow = () => {
     editor.flush();
     void project.flush();
+    void project.saveChat(agent.turns).catch(() => {});
+  };
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') saveNow();
+  });
+  window.addEventListener('pagehide', saveNow);
+  window.addEventListener('beforeunload', (e) => {
+    saveNow();
+    if (controller || project.dirty) e.preventDefault();
   });
   chat.focus();
   // The SoftN reference loads on first use; fetch it now so it is cached for offline use.
