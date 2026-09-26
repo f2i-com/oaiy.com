@@ -220,6 +220,20 @@ export function importSoftn(vfs: Vfs, bytes: Uint8Array, fileName: string, paren
   return { root, files: count, name: manifestName || base };
 }
 
+/**
+ * A short account of an app for the agent: its name, main page and files,
+ * so it can decide what to read before changing or recreating it.
+ */
+export function describeApp(vfs: Vfs, root: string): string {
+  const manifest = readManifest(vfs, root);
+  const files = appFiles(vfs, root);
+  const shown = files.slice(0, 60).map(([path, data]) => `  ${path} (${data.byteLength.toLocaleString()} bytes)`);
+  if (files.length > shown.length) shown.push(`  … and ${files.length - shown.length} more`);
+  const name = typeof manifest?.name === 'string' ? manifest.name : appLabel(root);
+  const main = typeof manifest?.main === 'string' ? manifest.main : '(none)';
+  return [`SoftN app "${name}" in ${appLabel(root)}: main ${main}, ${files.length} files`, ...shown].join('\n');
+}
+
 /** What Studio's validator would say before the app is even rendered. Paths are the app's own. */
 export function checkProject(vfs: Vfs, root = ''): Finding[] {
   const out: Finding[] = [];

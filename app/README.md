@@ -13,7 +13,7 @@ A coding agent that runs entirely in your browser.
 - **Attach** files to a message with 📎, by dropping them on the chat, or by pasting an image.
   - Files are saved in the project under `uploads/`, so the agent can open them with its tools.
   - Images also go to the model with the message, if it can see images. If it can't, the run carries on in text.
-  - A `.softn` file is unpacked as an app folder.
+  - A `.softn` file is unpacked into an app folder of its own, and the original stays in `uploads/`. The agent is told what the app holds. If you ask for changes, it edits that folder. If you ask it to recreate or rebuild the app, or make something like it, it writes a new app in another folder and leaves the original as it is. The `softn_import` tool unpacks any `.softn` in the project again, for a fresh copy.
 - **`view_image`:** shows the model an image scaled to its vision budget. To zoom, it passes a region in the image's original pixels, and that region is shown at up to 2048 px. A small region therefore shows real detail rather than an enlarged thumbnail. `grid: true` overlays labelled coordinates to aim the next zoom.
 - **Large files:**
   - `file_info` gives the size, line count and longest line.

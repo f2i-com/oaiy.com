@@ -18,6 +18,8 @@ function summarizeCall(call: ToolCall): string {
     case 'sandbox_shell': return s('command').split('\n')[0];
     case 'code_run': return `${s('language') || 'javascript'}${s('file') ? ` ${s('file')}` : ''}`;
     case 'web_fetch': return s('url');
+    case 'softn_import': return s('path');
+    case 'softn_check': case 'softn_docs': return s('app');
     default: return '';
   }
 }

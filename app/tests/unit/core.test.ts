@@ -79,3 +79,30 @@ describe('sandbox path helpers', () => {
     expect(relativeTo('/', 'a.py')).toBe('a.py');
   });
 });
+
+describe('softn_import', () => {
+  it('unpacks a .softn from the project into a new folder, never over existing files', async () => {
+    const { zipSync, strToU8 } = await import('fflate');
+    const { runTool } = await import('../../src/agent/tools');
+    const vfs = new Vfs();
+    vfs.writeFile('/uploads/Tasks.softn', zipSync({
+      'manifest.json': strToU8(JSON.stringify({ name: 'Tasks', version: '1.0.0', main: 'ui/main.ui' })),
+      'ui/main.ui': strToU8('<App><Text>hi</Text></App>'),
+      '../escape.txt': strToU8('no'),
+    }), { parents: true });
+    vfs.writeFile('/uploads/notes.softn', 'not a zip', { parents: true });
+    const ctx = { vfs, gate: new NetGate(), reads: new Map(), shell: { cwd: '/', env: {} } };
+    const run = (input: Record<string, unknown>) => runTool({ id: 'c', name: 'softn_import', input }, ctx);
+
+    const first = await run({ path: 'uploads/Tasks.softn' });
+    expect(first.isError).toBe(false);
+    expect(first.content).toContain('into Tasks/ (2 files)');
+    expect(first.content).toContain('main ui/main.ui');
+    const second = await run({ path: '/uploads/Tasks.softn', parent: 'copies' });
+    expect(second.content).toContain('into copies/Tasks/');
+    const third = await run({ path: 'uploads/Tasks.softn' });
+    expect(third.content).toContain('into Tasks-2/');
+    expect(vfs.exists('/escape.txt')).toBe(false);
+    expect((await run({ path: 'uploads/notes.softn' })).isError).toBe(true);
+  });
+});

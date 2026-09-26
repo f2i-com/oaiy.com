@@ -11,7 +11,7 @@ import { EditorPane } from './ui/editor';
 import { openSettings } from './ui/settings';
 import { TerminalPane } from './ui/terminal';
 import { SoftnPreview } from './softn/preview';
-import { SOFTN_STARTER, appKey, appLabel, checkProject, downloadSoftn, findApps, formatFindings, importSoftn, isSoftnProject, logicSyntax, resolveApp } from './softn/softn';
+import { SOFTN_STARTER, appKey, appLabel, checkProject, describeApp, downloadSoftn, findApps, formatFindings, importSoftn, isSoftnProject, logicSyntax, resolveApp } from './softn/softn';
 import { imageForMessage, imageMimeFor, type ImagePart } from './agent/images';
 import { FileTree } from './ui/tree';
 import { OpenProject, createProject, deleteProject, listProjects, renameProject, type ProjectMeta } from './vfs/projects';
@@ -221,18 +221,20 @@ async function main(): Promise<void> {
     const images: ImagePart[] = [];
     for (const file of files) {
       const bytes = new Uint8Array(await file.arrayBuffer());
+      const path = freePath('uploads', file.name);
+      project.vfs.writeFile(path, bytes, { parents: true });
+      // A .softn is unpacked to work on; the original stays in uploads/ to
+      // compare with or unpack again (softn_import).
       if (/\.softn$/i.test(file.name)) {
         try {
           const imported = importSoftn(project.vfs, bytes, file.name);
-          notes.push(`${file.name}: a SoftN app, unpacked into ${imported.root}/ (${imported.files} files)`);
+          notes.push(`${path.slice(1)}: unpacked into ${imported.root}/. ${describeApp(project.vfs, imported.root)}\nTo change this app, edit it in ${imported.root}/; to recreate it (or build something like it), read it and write the new app in another folder, leaving this one as it is.`);
           preview.setApp(imported.root);
         } catch (error) {
-          notes.push(`${file.name}: could not be imported (${(error as Error).message})`);
+          notes.push(`${path.slice(1)} (could not be unpacked as a SoftN app: ${(error as Error).message})`);
         }
         continue;
       }
-      const path = freePath('uploads', file.name);
-      project.vfs.writeFile(path, bytes, { parents: true });
       const mime = imageMimeFor(file.name) ?? (file.type.startsWith('image/') ? file.type : null);
       if (mime) {
         try {

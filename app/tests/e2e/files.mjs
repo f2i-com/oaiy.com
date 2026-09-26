@@ -69,6 +69,7 @@ const script = [
     return { calls: [{ name: 'read_file', input: { path: 'uploads/big.txt', char_start: Number(long?.[1] ?? 0) + 117_990, char_count: 40 } }] };
   },
   { calls: [{ name: 'softn_check', input: { app: 'Imported' } }] },
+  { calls: [{ name: 'softn_import', input: { path: 'uploads/imported.softn', parent: 'copies' } }] },
   { text: 'All done.' },
 ];
 const model = createHttpServer((req, res) => {
@@ -150,7 +151,7 @@ try {
     await page.waitForFunction(() => document.querySelector('.chat-log')?.textContent.includes('All done.'), { timeout: 120_000 });
     const first = JSON.stringify(requests[0].messages.at(-1));
     expect(first.includes('image_url') && first.includes('data:image/'), 'the image did not reach the model');
-    expect(first.includes('uploads/pattern.png') && first.includes('2000×1200') && first.includes('uploads/big.txt') && first.includes('unpacked into Imported/'), first.slice(0, 600));
+    expect(first.includes('uploads/pattern.png') && first.includes('2000×1200') && first.includes('uploads/big.txt') && first.includes('uploads/imported.softn: unpacked into Imported/') && first.includes('main ui/main.ui') && first.includes('logic/main.logic'), first.slice(0, 900));
     const tree = await page.$$eval('.tree-row .name', (els) => els.map((e) => e.textContent));
     expect(tree.includes('uploads') && tree.includes('Imported'), `tree: ${tree}`);
   });
@@ -177,10 +178,17 @@ try {
     if (softnInstalled) expect(tool.includes('rendered without reported errors'), tool);
   });
 
+  await check('the agent unpacks the original .softn again into a folder of its choosing', async () => {
+    const tool = toolText(7);
+    expect(tool.includes('into copies/Imported/ (3 files)') && tool.includes('ui/main.ui'), tool);
+    const apps = await page.$$eval('.preview-app option', (els) => els.map((e) => e.value));
+    expect(apps.includes('copies/Imported'), `apps: ${apps}`);
+  });
+
   await check('a project holds several apps: the preview picks one, export takes a folder', async () => {
     await page.type('.chat-input', '/softn new apps/second');
     await page.keyboard.press('Enter');
-    await page.waitForFunction(() => document.querySelectorAll('.preview-app option').length === 2, { timeout: 20_000 });
+    await page.waitForFunction(() => document.querySelectorAll('.preview-app option').length === 3, { timeout: 20_000 });
     const options = await page.$$eval('.preview-app option', (o) => o.map((x) => x.value));
     expect(options.includes('Imported') && options.includes('apps/second'), `${options}`);
     if (softnInstalled) {

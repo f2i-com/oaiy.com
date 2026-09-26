@@ -12,7 +12,7 @@ import { SandboxHost, globRegex, summarize } from '../sandbox/host';
 import { runInSandbox } from '../sandbox/runner';
 import { VfsError, normalizePath, type Vfs } from '../vfs/vfs';
 import type { ToolCall, ToolResult, ToolSpec } from './protocol';
-import { appLabel, checkProject, findApps, formatFindings, guideFor, logicSyntax, resolveApp } from '../softn/softn';
+import { appLabel, checkProject, describeApp, findApps, formatFindings, guideFor, importSoftn, logicSyntax, resolveApp } from '../softn/softn';
 import type { PreviewResult } from '../softn/preview';
 import { DEFAULT_VIEW_SIZE, MAX_VIEW_SIZE, imageMimeFor, imageSize, viewImage, type ImagePart } from './images';
 
@@ -164,6 +164,11 @@ export const TOOLS: ToolSpec[] = [
     name: 'softn_check',
     description: 'Check a SoftN app: its files (manifest.json, listed files, JSON, permissions, logic syntax) and a real render in the live preview, which switches to show it, returning load and render errors. Run it after every change to a SoftN app, and fix what it reports. With several apps in the project, name the one with `app` (its folder; "/" for the project root).',
     parameters: { type: 'object', properties: { app: { ...str, description: 'The app\'s folder, e.g. "apps/tasks"; optional when the project has one app' } } },
+  },
+  {
+    name: 'softn_import',
+    description: 'Unpack a .softn file (a zipped SoftN app) that is in the project into a new folder of its own, named after the app (never over existing files), and list what it holds. Uploaded .softn files are unpacked already; use this for one that is not, or to get a fresh copy of the original to compare with or start again from. Then change the unpacked app in place, or read it and write a new app in another folder, as the user asks.',
+    parameters: { type: 'object', required: ['path'], properties: { path: { ...str, description: 'The .softn (or .zip) file, e.g. "uploads/Tasks.softn"' }, parent: { ...str, description: 'Folder to unpack under (default: the project root)' } } },
   },
   {
     name: 'web_fetch',
@@ -506,6 +511,11 @@ async function execute(call: ToolCall, ctx: ToolContext): Promise<string> {
         lines.push(result.ok ? 'Render: the app loaded and rendered without reported errors (the user sees it in the preview).' : `Render errors:\n${result.errors.map((e) => `- ${e}`).join('\n')}`);
       }
       return lines.join('\n');
+    }
+    case 'softn_import': {
+      const path = normalizePath(need(input, 'path'));
+      const imported = importSoftn(vfs, vfs.readBytes(path), path.split('/').pop()!, typeof input.parent === 'string' ? normalizePath(input.parent) : '');
+      return `Unpacked /${path} into ${appLabel(imported.root)} (${imported.files} files).\n${describeApp(vfs, imported.root)}\nRun softn_check with app "${imported.root}" to see it in the preview.`;
     }
     case 'web_fetch': {
       const host = new SandboxHost(vfs, ctx.gate, 'web_fetch', 60_000);
