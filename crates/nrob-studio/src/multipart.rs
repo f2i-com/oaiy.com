@@ -10,10 +10,23 @@ pub struct Part {
 }
 
 fn find(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
-    if needle.is_empty() || hay.len() < needle.len() {
+    if needle.is_empty() || hay.len() < needle.len() || from > hay.len() - needle.len() {
         return None;
     }
-    (from..=hay.len() - needle.len()).find(|&i| &hay[i..i + needle.len()] == needle)
+    // Compare only where the first byte matches: image bytes rarely do.
+    let first = needle[0];
+    let mut i = from;
+    while i <= hay.len() - needle.len() {
+        match hay[i..=hay.len() - needle.len()].iter().position(|&b| b == first) {
+            Some(off) => i += off,
+            None => return None,
+        }
+        if &hay[i..i + needle.len()] == needle {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
 }
 
 /// A `key="value"` (or `key=value`) parameter of a header value.

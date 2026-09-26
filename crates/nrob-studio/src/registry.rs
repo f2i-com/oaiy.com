@@ -299,6 +299,141 @@ pub fn add(cfg: &mut Json, path: &Path, name: Option<&str>, target: Option<(&str
     Ok((added, d))
 }
 
+/// Keys holding file paths, per section, for export and import.
+const LLM_PATHS: [&str; 3] = ["path", "vision_projector", "lora"];
+const IMAGE_PATHS: [&str; 7] = ["base", "transformer", "safetensors_transformer", "adapter", "text_encoder", "checkpoint", "tokenizer"];
+const VIDEO_PATHS: [&str; 4] = ["transformer", "text_encoder", "vae", "tokenizer"];
+/// Media settings that travel with the models.
+const MEDIA_SETTINGS: [&str; 4] = ["memory", "ram_gb", "vram_gb", "default_model"];
+
+fn absolute(root: &Path, m: &Json, keys: &[&str]) -> Json {
+    let mut m = m.clone();
+    for key in keys {
+        if let Some(p) = m.get(key).and_then(Json::as_str).filter(|p| !p.trim().is_empty()) {
+            let abs = config::resolve(root, p).to_string_lossy().into_owned();
+            set(&mut m, key, Json::str(abs));
+        }
+    }
+    m
+}
+
+/// Every configured model (language, image, video), with their parts, defaults
+/// and memory settings, as a file another install can import. Paths are made
+/// absolute so the file does not depend on where this studio lives.
+pub fn export(cfg: &Json, root: &Path) -> Json {
+    let llm = cfg.get("llm").cloned().unwrap_or(Json::Null);
+    let llm_models: Vec<Json> = llm.get("models").and_then(Json::as_array).unwrap_or(&[]).iter().map(|m| absolute(root, m, &LLM_PATHS)).collect();
+    let media = |kind: &str, keys: &[&str], extra: &[&str]| {
+        let section = get(cfg, &["media", kind]).cloned().unwrap_or(Json::Null);
+        let models: Vec<(String, Json)> = section.get("models").map(|m| m.members().map(|(n, v)| (n.to_string(), absolute(root, v, keys))).collect()).unwrap_or_default();
+        let mut out: Vec<(String, Json)> = MEDIA_SETTINGS.iter().chain(extra).filter_map(|k| section.get(k).map(|v| (k.to_string(), v.clone()))).collect();
+        out.push(("models".into(), Json::Obj(models)));
+        Json::Obj(out)
+    };
+    Json::obj([
+        ("nrob_models", Json::Int(1)),
+        ("exported_at", Json::Int(crate::util::now() as i64)),
+        ("llm", Json::obj([("default_model", llm.get("default_model").cloned().unwrap_or(Json::str(""))), ("models", Json::Arr(llm_models))])),
+        ("image", media("image", &IMAGE_PATHS, &[])),
+        ("video", media("video", &VIDEO_PATHS, &["fps", "ffmpeg"])),
+    ])
+}
+
+/// Bring an exported file in. `replace` clears the current models first;
+/// otherwise models merge by name (the file's version wins). Entries whose
+/// files are not on this machine come in disabled and are reported, so a file
+/// from another PC imports cleanly and shows what to repoint.
+pub fn import(cfg: &mut Json, doc: &Json, replace: bool) -> Result<Json, String> {
+    if doc.get("nrob_models").and_then(Json::as_i64) != Some(1) {
+        return Err("not an NROB models file (missing \"nrob_models\": 1)".into());
+    }
+    let mut missing = Vec::new();
+    let mut counts = (0, 0, 0);
+    let exists = |p: &str| Path::new(p).exists();
+    let mut check = |section: &str, name: &str, m: &mut Json, keys: &[&str]| {
+        let mut ok = true;
+        for key in keys {
+            if let Some(p) = m.get(key).and_then(Json::as_str).filter(|p| !p.trim().is_empty() && !exists(p)) {
+                missing.push(Json::obj([("section", Json::str(section)), ("model", Json::str(name)), ("field", Json::str(*key)), ("path", Json::str(p))]));
+                ok = false;
+            }
+        }
+        if !ok {
+            set(m, "enabled", Json::Bool(false));
+        }
+    };
+    // Language models: a list keyed by name.
+    if let Some(incoming) = get(doc, &["llm", "models"]).and_then(Json::as_array) {
+        let Some(Json::Arr(models)) = obj_mut(cfg, &["llm", "models"]) else { return Err("no llm section".into()) };
+        if replace {
+            models.clear();
+        }
+        for m in incoming {
+            let name = str_or(m, "name", "").to_string();
+            if name.is_empty() || str_or(m, "path", "").is_empty() {
+                continue;
+            }
+            let mut m = m.clone();
+            check("llm", &name, &mut m, &LLM_PATHS);
+            models.retain(|x| str_or(x, "name", "") != name);
+            models.push(m);
+            counts.0 += 1;
+        }
+    }
+    if let Some(d) = get(doc, &["llm", "default_model"]).and_then(Json::as_str).filter(|d| !d.is_empty()) {
+        let known = get(cfg, &["llm", "models"]).and_then(Json::as_array).is_some_and(|m| m.iter().any(|x| str_or(x, "name", "") == d));
+        if known {
+            set(obj_mut(cfg, &["llm"]).ok_or("no llm section")?, "default_model", Json::str(d));
+        }
+    }
+    for (kind, keys) in [("image", &IMAGE_PATHS[..]), ("video", &VIDEO_PATHS[..])] {
+        let Some(section_in) = doc.get(kind) else { continue };
+        {
+            let Some(Json::Obj(models)) = obj_mut(cfg, &["media", kind, "models"]) else { return Err(format!("no {kind} section")) };
+            if replace {
+                models.clear();
+            }
+            for (name, m) in section_in.get("models").map(|m| m.members().collect::<Vec<_>>()).unwrap_or_default() {
+                let mut m = m.clone();
+                check(kind, name, &mut m, keys);
+                models.retain(|(n, _)| n != name);
+                models.push((name.to_string(), m));
+                if kind == "image" { counts.1 += 1 } else { counts.2 += 1 }
+            }
+        }
+        let section = obj_mut(cfg, &["media", kind]).ok_or("no media section")?;
+        for key in ["memory", "ram_gb", "vram_gb", "fps", "ffmpeg"] {
+            if let Some(v) = section_in.get(key) {
+                set(section, key, v.clone());
+            }
+        }
+        let d = str_or(section_in, "default_model", "").to_string();
+        let known = section.get("models").is_some_and(|m| m.get(&d).is_some());
+        if known {
+            set(section, "default_model", Json::str(&d));
+        } else if replace {
+            set(section, "default_model", Json::str(""));
+        }
+    }
+    if replace {
+        let known: Vec<String> = get(cfg, &["llm", "models"]).and_then(Json::as_array).unwrap_or(&[]).iter().map(|m| str_or(m, "name", "").to_string()).collect();
+        let llm = obj_mut(cfg, &["llm"]).ok_or("no llm section")?;
+        if !known.iter().any(|n| n == str_or(llm, "default_model", "")) {
+            set(llm, "default_model", Json::str(known.first().map_or("", String::as_str)));
+        }
+    }
+    for target in ["chat", "completions", "models", "images", "edits", "videos", "files"] {
+        ensure_route(cfg, target);
+    }
+    config::validate(cfg)?;
+    Ok(Json::obj([
+        ("llm", Json::Int(counts.0)),
+        ("image", Json::Int(counts.1)),
+        ("video", Json::Int(counts.2)),
+        ("missing", Json::Arr(missing)),
+    ]))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -385,6 +520,30 @@ mod tests {
         std::fs::write(d.join("notes.txt"), b"x").unwrap();
         assert!(add(&mut cfg, &d.join("notes.txt"), None, None).is_err());
         config::validate(&cfg).unwrap();
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn exports_round_trip_and_imports_flag_missing_files() {
+        let d = tmp("export");
+        let mut cfg = config::default_json();
+        gguf(&d.join("Chat.gguf"), "qwen3");
+        add(&mut cfg, &d.join("Chat.gguf"), None, None).unwrap();
+        let file = export(&cfg, Path::new("/unused"));
+        assert_eq!(get(&file, &["llm", "models"]).unwrap().len(), 1);
+        // Into a fresh install: the model arrives, enabled, as the default.
+        let mut other = config::default_json();
+        let report = import(&mut other, &file, false).unwrap();
+        assert_eq!(report.get("llm").and_then(Json::as_i64), Some(1));
+        assert_eq!(get(&other, &["llm", "default_model"]).and_then(Json::as_str), Some("chat"));
+        assert!(report.get("missing").unwrap().as_array().unwrap().is_empty());
+        // From a machine where the file is elsewhere: imported, disabled, reported.
+        std::fs::remove_file(d.join("Chat.gguf")).unwrap();
+        let mut third = config::default_json();
+        let report = import(&mut third, &file, true).unwrap();
+        assert_eq!(report.get("missing").unwrap().len(), 1);
+        assert_eq!(get(&third, &["llm", "models"]).unwrap().at(0).unwrap().get("enabled"), Some(&Json::Bool(false)));
+        assert!(import(&mut third, &Json::parse(b"{}").unwrap(), false).is_err());
         std::fs::remove_dir_all(d).unwrap();
     }
 

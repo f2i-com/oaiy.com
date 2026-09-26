@@ -9,7 +9,7 @@
     "port": 8080,
     "api_key": "",
     "public_url": "",
-    "routes_version": 2,
+    "routes_version": 3,
     "routes": [
       {
         "path": "/v1/chat/completions",
@@ -71,6 +71,13 @@
         "path": "/health",
         "method": "GET",
         "target": "health",
+        "spec": "openai",
+        "enabled": true
+      },
+      {
+        "path": "/v1/discovery",
+        "method": "GET",
+        "target": "discovery",
         "spec": "openai",
         "enabled": true
       }

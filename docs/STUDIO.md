@@ -37,6 +37,21 @@ nrob-studio --config D:/ai/studio.json --ui-port 7000 --port 9000 --start-llm
 
 The console accepts `status`, `start`, `stop`, `open`, `jobs` and `quit`.
 
+### The UI
+
+- **Layout:** the UI fills any window. Wide screens get more room; under
+  1180 px the sidebar folds to icons; under 860 px it becomes a scrolling bar
+  along the top; at phone widths forms and the route table stack.
+- **Theme:** light and dark, following the system until you pick one (or add
+  `?theme=light` to the address).
+- **Pages:**
+  - Overview shows what is running now.
+  - The Gallery keeps everything generated this session, with each item's
+    prompt, seed, steps and where its weights lived. Items can be reused,
+    downloaded or removed.
+  - Chat renders Markdown, can stop a reply mid-stream, and takes a system prompt.
+- **Shortcut:** Ctrl+S saves settings.
+
 ### In the notification area (Windows)
 
 `nrob-studio-tray.exe` is the same studio without a console window. It starts
@@ -93,6 +108,17 @@ needs. The studio fills parts itself where it can:
 
 Adding a model also enables the gateway route that serves it, if that route had
 been removed or turned off.
+
+### Saving and moving your model list
+
+Models → **Export models** downloads `nrob-models.json`: every language, image
+and video model with its parts, the defaults, and the memory settings. Paths are
+written absolute, so the file works from any install folder. **Import models**
+reads one back and asks whether to merge (same-named models are updated, others
+kept) or replace the whole list. Entries whose files are not on this machine come
+in switched off and are listed, ready to repoint with Browse. The same operations
+are available to scripts as `GET /api/models/export` and
+`POST /api/models/import?mode=merge|replace` on the control port.
 
 ## Memory: SSD, RAM and GPU
 
@@ -218,6 +244,48 @@ at 121. OpenAI sizes (`1280x720`, `720x1280`, `1792x1024`) scale down to fit LTX
 Local paths are accepted from the UI only, and `file_id` is not supported.
 Extensions: `frames`, `fps`, `seed`, `end_image`, `memory`, `ram_gb`, `vram_gb`.
 
+## Companion apps: discovery
+
+One request tells an app what this studio offers:
+
+```sh
+curl http://127.0.0.1:8080/v1/discovery          # a route, movable like any other
+curl http://127.0.0.1:8080/.well-known/nrob.json # fixed, for probing any host:port
+```
+
+The reply includes:
+
+- `base_url` and `openai_base_url`;
+- `auth` (whether a key is required, and how to send it);
+- `endpoints`: every enabled route, with its full URL, method, dialect, the
+  operations below it (such as `GET /v1/videos/{id}/content`) and the models it
+  serves;
+- `models`: language models (`default`, `loaded`, `vision`), image models
+  (`architecture`, `edits`, `max_references`, `size_step`) and video models
+  (`family`, `fps`, `max_seconds`, `max_side`);
+- `defaults`, the language model's `state` and `runs_on`, and how to ask for
+  incognito.
+
+With a key configured, a caller without it sees only that a key is needed.
+
+## Incognito
+
+The **Incognito** switch (bottom of the sidebar), or `privacy.incognito: true`,
+keeps nothing about any request. A single request can ask for the same with the
+header `X-NROB-Incognito: 1` or a body field `"incognito": true`.
+
+- **Language model:** no prompt state is written to disk, and nrob-server logs
+  nothing about the request. When the request ends, the engine drops its live
+  state and checkpoints, so the next request cannot reuse (or reveal) it. The
+  cost: every prompt is read from the start. The whole-server mode is
+  `nrob-server --incognito`.
+- **Images and video:** the job writes into a private folder under
+  `outputs/.incognito/`, with no video prompt cache and uploads kept inside it. It
+  never appears in the job list, gallery or logs. Images returned as `b64_json`
+  are deleted as soon as they are sent. Files handed out as URLs are deleted after
+  10 minutes (images) or 30 minutes (videos). A studio restart clears whatever is
+  left.
+
 ## The control port
 
 The UI port (`ui.port`, 7860) serves the page, a JSON API under `/api/`, the
@@ -232,6 +300,13 @@ which programs the studio runs, so:
   that key (the page takes it once as `?key=`).
 
 Keep `ui.host` on `127.0.0.1` unless you mean to control the machine remotely.
+Saving a non-loopback `ui.host` is refused until `gateway.api_key` is set.
+
+The gateway is reachable by web pages too, so without an API key it refuses
+browser requests (those carrying `Origin`) from origins not listed in
+`gateway.cors_origins` (`*` allows any). Apps and SDKs outside a browser are
+unaffected. nrob-server is always started with `--local-images off`, so nothing
+reaching the gateway can have the vision model read files from this machine.
 
 `nrob-server` runs on a private loopback port with a random key and is started
 with `--watch-stdin`. The studio holds that pipe, so if the studio dies,
@@ -243,7 +318,8 @@ See [`config/studio.example.json`](../config/studio.example.json). The
 sections are:
 
 - `ui`: `host`, `port`, `open` (`app` | `browser` | `none`).
-- `gateway`: `host`, `port`, `api_key`, `public_url`, `routes`.
+- `gateway`: `host`, `port`, `api_key`, `public_url`, `cors_origins`, `routes`.
+- `privacy`: `incognito`.
 - `llm`: `server`, `server_webgpu`, `backend`, `webgpu_gb`, `models` (`[{name, path, vision_projector?, lora?, enabled}]`),
   `default_model`, `devices`, `ctx`, `ram_gb` (expert cache, 0 = 80% of free),
   `cpu_threads`, `vram_headroom_gb`, `thinking`, `max_tokens`, `temperature`,

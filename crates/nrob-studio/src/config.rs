@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 pub const FILE_NAME: &str = "nrob-studio.json";
 
 /// What a gateway route serves.
-pub const TARGETS: [&str; 8] = ["chat", "completions", "models", "images", "edits", "videos", "health", "files"];
+pub const TARGETS: [&str; 9] = ["chat", "completions", "models", "images", "edits", "videos", "health", "files", "discovery"];
 /// The request/response dialect a route speaks. `openai` is the OpenAI API;
 /// `nrob` is nrob-server's own asynchronous media job API (what coder-cli uses).
 pub const SPECS: [&str; 2] = ["openai", "nrob"];
@@ -31,7 +31,8 @@ pub const DEFAULT: &str = r#"{
     "port": 8080,
     "api_key": "",
     "public_url": "",
-    "routes_version": 2,
+    "cors_origins": [],
+    "routes_version": 3,
     "routes": [
       { "path": "/v1/chat/completions", "method": "POST", "target": "chat", "spec": "openai", "enabled": true },
       { "path": "/v1/completions", "method": "POST", "target": "completions", "spec": "openai", "enabled": true },
@@ -40,9 +41,11 @@ pub const DEFAULT: &str = r#"{
       { "path": "/v1/images/edits", "method": "POST", "target": "edits", "spec": "openai", "enabled": true },
       { "path": "/v1/videos", "method": "POST", "target": "videos", "spec": "openai", "enabled": true },
       { "path": "/files", "method": "GET", "target": "files", "spec": "openai", "enabled": true },
-      { "path": "/health", "method": "GET", "target": "health", "spec": "openai", "enabled": true }
+      { "path": "/health", "method": "GET", "target": "health", "spec": "openai", "enabled": true },
+      { "path": "/v1/discovery", "method": "GET", "target": "discovery", "spec": "openai", "enabled": true }
     ]
   },
+  "privacy": { "incognito": false },
   "llm": {
     "enabled": true,
     "autostart": false,
@@ -114,19 +117,24 @@ pub fn merge_defaults(v: &mut Json, defaults: &Json) {
 /// Routes for targets added after a file was written (`routes_version` records
 /// which it has seen). Returns whether anything changed.
 pub fn upgrade_routes(v: &mut Json) -> bool {
-    const VERSION: i64 = 2;
+    /// The target each routes_version introduced.
+    const ADDED: [(i64, &str); 2] = [(2, "edits"), (3, "discovery")];
+    const VERSION: i64 = 3;
     let Json::Obj(top) = v else { return false };
     let Some((_, gateway)) = top.iter_mut().find(|(k, _)| k == "gateway") else { return false };
-    if int_or(gateway, "routes_version", 1) >= VERSION {
+    let from = int_or(gateway, "routes_version", 1);
+    if from >= VERSION {
         return false;
     }
     let defaults = default_json();
+    let new_targets: Vec<&str> = ADDED.iter().filter(|(v, _)| *v > from).map(|(_, t)| *t).collect();
     let added: Vec<Json> = defaults.get("gateway").and_then(|g| g.get("routes")).and_then(Json::as_array).unwrap_or(&[]).iter()
-        .filter(|r| str_or(r, "target", "") == "edits").cloned().collect();
+        .filter(|r| new_targets.contains(&str_or(r, "target", ""))).cloned().collect();
     if let Json::Obj(fields) = gateway {
         if let Some((_, Json::Arr(routes))) = fields.iter_mut().find(|(k, _)| k == "routes") {
             for route in added {
-                let taken = routes.iter().any(|r| str_or(r, "target", "") == "edits" || str_or(r, "path", "") == str_or(&route, "path", ""));
+                let target = str_or(&route, "target", "").to_string();
+                let taken = routes.iter().any(|r| str_or(r, "target", "") == target || str_or(r, "path", "") == str_or(&route, "path", ""));
                 if !taken {
                     routes.push(route);
                 }
@@ -233,6 +241,18 @@ pub fn validate(v: &Json) -> Result<(), String> {
     port(ui, "ui")?;
     let gateway = object(v, "gateway")?;
     port(gateway, "gateway")?;
+    let loopback = |host: &str| host == "localhost" || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback());
+    // The control port can change which programs run: reachable from other
+    // machines only behind the key (DNS rebinding defeats a name check alone).
+    if !loopback(str_or(ui, "host", "127.0.0.1")) && str_or(gateway, "api_key", "").is_empty() {
+        return Err("set gateway.api_key before serving the control UI beyond this machine (ui.host)".into());
+    }
+    if !gateway.get("cors_origins").is_none_or(|o| o.as_array().is_some_and(|a| a.iter().all(|x| x.as_str().is_some()))) {
+        return Err("gateway.cors_origins must be a list of origins such as http://localhost:3000, or \"*\"".into());
+    }
+    if v.get("privacy").is_some_and(|p| p.as_object().is_none() || p.get("incognito").is_some_and(|i| i.as_bool().is_none())) {
+        return Err("privacy.incognito must be true or false".into());
+    }
     if int_or(ui, "port", 0) != 0 && int_or(ui, "port", 0) == int_or(gateway, "port", 1) && str_or(ui, "host", "") == str_or(gateway, "host", "") {
         return Err("the UI and the gateway need different ports".into());
     }
@@ -413,13 +433,18 @@ mod tests {
     }
 
     #[test]
-    fn older_files_gain_the_edits_route_once() {
+    fn older_files_gain_new_routes_once() {
         let mut v = Json::parse(br#"{"gateway":{"routes":[{"path":"/v1/chat/completions","method":"POST","target":"chat"}]}}"#).unwrap();
         assert!(upgrade_routes(&mut v));
         merge_defaults(&mut v, &default_json());
         let routes = v.get("gateway").unwrap().get("routes").unwrap().as_array().unwrap();
-        assert_eq!(routes.len(), 2);
+        assert_eq!(routes.len(), 3);
         assert_eq!(str_or(&routes[1], "path", ""), "/v1/images/edits");
+        assert_eq!(str_or(&routes[2], "path", ""), "/v1/discovery");
+        // A file already at version 2 gains only the discovery route.
+        let mut v2 = Json::parse(br#"{"gateway":{"routes_version":2,"routes":[]}}"#).unwrap();
+        assert!(upgrade_routes(&mut v2));
+        assert_eq!(v2.get("gateway").unwrap().get("routes").unwrap().len(), 1);
         assert!(!upgrade_routes(&mut v), "a second load changes nothing");
         validate(&v).unwrap();
     }

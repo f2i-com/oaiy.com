@@ -7,32 +7,54 @@
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect x='1' y='2' width='14' height='3' fill='%23E3A63B'/%3E%3Crect x='1' y='6.5' width='14' height='3' fill='%233DB5A6'/%3E%3Crect x='1' y='11' width='14' height='3' fill='%238E7DF2'/%3E%3C/svg%3E">
 <style>
 :root {
+  color-scheme: dark;
   --bg: #1E252E; --panel: #252D38; --panel-2: #2B3441; --line: #343E4C; --line-2: #414D5E;
   --text: #E4E8EE; --muted: #8A94A3; --faint: #677284;
   --ssd: #E3A63B; --ram: #3DB5A6; --gpu: #8E7DF2; --bad: #EF6F6C; --good: #6FCF8E;
+  --well: #181E25; --well-text: #C6CDD7; --media-bg: #151A20; --on-accent: #14121F; --backdrop: rgba(10, 13, 17, .6);
+  --rail-w: 216px; --pad: clamp(16px, 2.6vw, 44px);
   --display: "Bahnschrift", "DIN Alternate", "DIN 2014", "Barlow", system-ui, sans-serif;
   --body: "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, sans-serif;
   --code: "Cascadia Mono", "Cascadia Code", Consolas, "SF Mono", monospace;
   --r: 6px;
 }
+/* Light: the same tiers on paper. Follows the system unless the toggle pins one. */
+:root[data-theme=light] {
+  color-scheme: light;
+  --bg: #F3F5F8; --panel: #FFFFFF; --panel-2: #E9EDF2; --line: #DCE1E8; --line-2: #C4CCD7;
+  --text: #1D2430; --muted: #5E6878; --faint: #8390A2;
+  --ssd: #B7791F; --ram: #1E8C80; --gpu: #6A56E0; --bad: #C8423F; --good: #2E8B57;
+  --well: #EEF1F5; --well-text: #2A3340; --media-bg: #E4E8EE; --on-accent: #FFFFFF; --backdrop: rgba(30, 37, 46, .35);
+}
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme=dark]) {
+    color-scheme: light;
+    --bg: #F3F5F8; --panel: #FFFFFF; --panel-2: #E9EDF2; --line: #DCE1E8; --line-2: #C4CCD7;
+    --text: #1D2430; --muted: #5E6878; --faint: #8390A2;
+    --ssd: #B7791F; --ram: #1E8C80; --gpu: #6A56E0; --bad: #C8423F; --good: #2E8B57;
+    --well: #EEF1F5; --well-text: #2A3340; --media-bg: #E4E8EE; --on-accent: #FFFFFF; --backdrop: rgba(30, 37, 46, .35);
+  }
+}
 * { box-sizing: border-box; }
 html, body { margin: 0; height: 100%; }
-body { background: var(--bg); color: var(--text); font: 14px/1.5 var(--body); -webkit-font-smoothing: antialiased; }
+body { background: var(--bg); color: var(--text); font: clamp(13px, .35vw + 12px, 15px)/1.5 var(--body); -webkit-font-smoothing: antialiased; overflow-x: hidden; }
 button, input, select, textarea { font: inherit; color: inherit; }
 a { color: var(--gpu); }
 :focus-visible { outline: 2px solid var(--gpu); outline-offset: 2px; }
 @media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }
 
 /* frame */
-.app { display: grid; grid-template-columns: 208px 1fr; min-height: 100vh; }
-.rail { border-right: 1px solid var(--line); padding: 20px 14px; display: flex; flex-direction: column; gap: 22px; position: sticky; top: 0; height: 100vh; }
+.app { display: grid; grid-template-columns: var(--rail-w) minmax(0, 1fr); min-height: 100vh; min-height: 100dvh; }
+.rail { border-right: 1px solid var(--line); padding: 20px 14px; display: flex; flex-direction: column; gap: 22px; position: sticky; top: 0; height: 100vh; height: 100dvh; overflow-y: auto; }
 .brand { display: flex; align-items: center; gap: 10px; padding: 0 6px; }
 .brand-mark { display: grid; gap: 3px; width: 22px; }
 .brand-mark i { display: block; height: 4px; border-radius: 1px; }
 .brand-name { font: 600 19px/1 var(--display); letter-spacing: .02em; }
 .brand-name small { display: block; font: 400 12px/1.4 var(--body); color: var(--muted); letter-spacing: 0; margin-top: 3px; }
 nav { display: grid; gap: 2px; }
-nav button { all: unset; cursor: pointer; padding: 8px 10px; border-radius: var(--r); color: var(--muted); display: flex; justify-content: space-between; align-items: center; }
+nav button { all: unset; cursor: pointer; padding: 8px 10px; border-radius: var(--r); color: var(--muted); display: flex; gap: 10px; align-items: center; white-space: nowrap; }
+nav button svg { width: 18px; height: 18px; flex: none; stroke: currentColor; fill: none; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+nav button .count { margin-left: auto; font: 600 11px var(--display); color: var(--on-accent); background: var(--gpu); border-radius: 9px; padding: 0 6px; }
 nav button:hover { color: var(--text); background: var(--panel); }
 nav button[aria-current="page"] { color: var(--text); background: var(--panel-2); }
 nav button:focus-visible { outline: 2px solid var(--gpu); }
@@ -40,15 +62,16 @@ nav button:focus-visible { outline: 2px solid var(--gpu); }
 .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; background: var(--faint); flex: none; }
 .dot.ready { background: var(--good); } .dot.starting { background: var(--ssd); animation: pulse 1.2s infinite; } .dot.failed { background: var(--bad); }
 @keyframes pulse { 50% { opacity: .35; } }
-main { padding: 28px 36px 96px; max-width: 1180px; width: 100%; }
-h1 { font: 600 28px/1.15 var(--display); margin: 0 0 4px; letter-spacing: .01em; }
+main { padding: calc(var(--pad) * .8) var(--pad) 96px; width: 100%; max-width: 1560px; min-width: 0; }
+h1 { font: 600 clamp(22px, 1.2vw + 14px, 30px)/1.15 var(--display); margin: 0 0 4px; letter-spacing: .01em; }
+.theme-toggle { display: flex; align-items: center; gap: 8px; }
 h2 { font: 600 17px/1.3 var(--display); margin: 0 0 12px; letter-spacing: .01em; }
 h3 { font: 600 14px/1.3 var(--display); margin: 0 0 8px; color: var(--muted); letter-spacing: .02em; }
 .lede { color: var(--muted); margin: 0 0 26px; max-width: 70ch; }
 section.view { display: none; } section.view.on { display: block; }
 .block { border-top: 1px solid var(--line); padding: 22px 0 8px; }
 .block:first-of-type { border-top: 0; padding-top: 0; }
-.cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 28px; }
+.cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(300px, 100%), 1fr)); gap: clamp(18px, 2vw, 32px); }
 .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
 .spread { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; flex-wrap: wrap; }
 .muted { color: var(--muted); } .small { font-size: 12px; } .num { font-family: var(--display); font-variant-numeric: tabular-nums; }
@@ -58,12 +81,15 @@ section.view { display: none; } section.view.on { display: block; }
 .btn { border: 1px solid var(--line-2); background: var(--panel-2); border-radius: var(--r); padding: 7px 14px; cursor: pointer; white-space: nowrap; }
 .btn:hover { border-color: var(--muted); }
 .btn:disabled { opacity: .45; cursor: default; }
-.btn.go { background: var(--gpu); border-color: var(--gpu); color: #14121F; font-weight: 600; }
+.btn.go { background: var(--gpu); border-color: var(--gpu); color: var(--on-accent); font-weight: 600; }
 .btn.go:hover { filter: brightness(1.08); }
 .btn.warn { color: var(--bad); }
 .btn.quiet { background: transparent; border-color: transparent; color: var(--muted); padding: 5px 8px; }
 .btn.quiet:hover { color: var(--text); border-color: var(--line-2); }
-label.f { display: grid; gap: 5px; font-size: 12px; color: var(--muted); }
+label.f { display: grid; gap: 5px; font-size: 12px; color: var(--muted); align-content: start; }
+/* Single-column grids size their track to the widest child (an input's
+   intrinsic width) unless told they may shrink: then phones scroll sideways. */
+.drop, .list, .item, .gen-form, label.f, .hw, .detected, .block, .progress { grid-template-columns: minmax(0, 1fr); min-width: 0; }
 label.f > span { display: flex; justify-content: space-between; gap: 8px; }
 input[type=text], input[type=number], input[type=password], select, textarea {
   background: var(--bg); border: 1px solid var(--line-2); border-radius: var(--r); padding: 7px 10px; width: 100%; font-size: 14px; }
@@ -72,9 +98,9 @@ input:focus, select:focus, textarea:focus { border-color: var(--gpu); outline: n
 input[type=checkbox] { accent-color: var(--gpu); width: 16px; height: 16px; }
 input[type=range] { width: 100%; accent-color: var(--gpu); }
 .check { display: flex; gap: 8px; align-items: center; font-size: 13px; cursor: pointer; }
-.grid-f { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 14px; }
-.pathfield { display: flex; gap: 6px; } .pathfield input { font: 12px var(--code); }
-.seg { display: inline-flex; border: 1px solid var(--line-2); border-radius: var(--r); overflow: hidden; }
+.grid-f { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(170px, 100%), 1fr)); gap: 14px; }
+.pathfield { display: flex; gap: 6px; min-width: 0; } .pathfield input { font: 12px var(--code); min-width: 0; }
+.seg { display: inline-flex; border: 1px solid var(--line-2); border-radius: var(--r); overflow: hidden; max-width: 100%; }
 .seg button { all: unset; cursor: pointer; padding: 6px 13px; color: var(--muted); font: 500 13px var(--display); letter-spacing: .02em; }
 .seg button + button { border-left: 1px solid var(--line-2); }
 .seg button[aria-pressed="true"] { background: var(--panel-2); color: var(--text); }
@@ -94,7 +120,7 @@ input[type=range] { width: 100%; accent-color: var(--gpu); }
 .meter { height: 8px; background: var(--bg); border: 1px solid var(--line); border-radius: 4px; overflow: hidden; }
 .meter > div { height: 100%; transition: width .5s ease; }
 .hw { display: grid; gap: 14px; }
-.hw-row { display: grid; grid-template-columns: 150px 1fr 120px; gap: 14px; align-items: center; }
+.hw-row { display: grid; grid-template-columns: minmax(120px, 180px) minmax(0, 1fr) minmax(110px, 150px); gap: 14px; align-items: center; }
 .hw-row .label { font: 600 13px var(--display); } .hw-row .label small { display: block; font: 12px var(--body); color: var(--muted); }
 
 /* lists */
@@ -110,7 +136,8 @@ input[type=range] { width: 100%; accent-color: var(--gpu); }
 .tag.bad { color: var(--bad); border-color: color-mix(in srgb, var(--bad) 45%, transparent); }
 .tag.good { color: var(--good); border-color: color-mix(in srgb, var(--good) 45%, transparent); }
 .empty { color: var(--muted); padding: 18px 0; }
-table.routes { width: 100%; border-collapse: collapse; }
+.table-wrap { overflow-x: auto; }
+table.routes { width: 100%; border-collapse: collapse; min-width: 640px; }
 table.routes th { text-align: left; font: 500 12px var(--body); color: var(--muted); padding: 6px 8px; border-bottom: 1px solid var(--line); }
 table.routes td { padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: middle; }
 table.routes input, table.routes select { padding: 5px 8px; font-size: 13px; }
@@ -126,38 +153,72 @@ table.routes td.path input { font-family: var(--code); }
 .tabs button { all: unset; cursor: pointer; padding: 9px 16px; color: var(--muted); font: 500 14px var(--display); letter-spacing: .02em; border-bottom: 2px solid transparent; margin-bottom: -1px; }
 .tabs button[aria-selected=true] { color: var(--text); border-color: var(--gpu); }
 .tabs button:focus-visible { outline: 2px solid var(--gpu); }
-.chat { display: grid; grid-template-rows: 1fr auto; height: calc(100vh - 250px); min-height: 380px; border: 1px solid var(--line); border-radius: var(--r); }
+.chat { display: grid; grid-template-rows: minmax(0, 1fr) auto; height: calc(100vh - 290px); height: calc(100dvh - 290px); min-height: 340px; border: 1px solid var(--line); border-radius: var(--r); background: var(--panel); }
 .msgs { overflow-y: auto; padding: 18px 20px; display: grid; gap: 18px; align-content: start; }
-.msg { max-width: 76ch; white-space: pre-wrap; word-wrap: break-word; }
-.msg.user { justify-self: end; background: var(--panel-2); padding: 9px 13px; border-radius: var(--r); }
+.msg { max-width: min(80ch, 100%); word-wrap: break-word; position: relative; }
+.msg .body { white-space: normal; } .msg .body p { margin: 0 0 .6em; } .msg .body p:last-child { margin-bottom: 0; }
+.msg .body pre { background: var(--well); color: var(--well-text); border: 1px solid var(--line); border-radius: var(--r); padding: 10px 12px; overflow-x: auto; font: 12.5px/1.5 var(--code); position: relative; margin: .6em 0; white-space: pre; }
+.msg .body code { font: .92em var(--code); background: var(--panel-2); padding: 1px 4px; border-radius: 4px; }
+.msg .body pre code { background: none; padding: 0; }
+.msg .body ul, .msg .body ol { margin: .3em 0 .6em; padding-left: 1.4em; }
+.msg .body h4 { font: 600 1em var(--display); margin: .8em 0 .3em; }
+.copy { position: absolute; top: 6px; right: 6px; font-size: 11px; padding: 2px 8px; opacity: .75; }
+.msg .actions { display: flex; gap: 4px; margin-top: 4px; opacity: 0; transition: opacity .15s; }
+.msg:hover .actions, .msg:focus-within .actions { opacity: 1; }
+.msg.user { justify-self: end; background: var(--panel-2); padding: 9px 13px; border-radius: var(--r); white-space: pre-wrap; }
 .msg .think { color: var(--faint); font-size: 13px; border-left: 2px solid var(--line-2); padding-left: 10px; margin-bottom: 8px; }
 .msg .meta { color: var(--faint); font-size: 12px; margin-top: 6px; }
 .composer { border-top: 1px solid var(--line); padding: 12px; display: grid; grid-template-columns: 1fr auto; gap: 10px; align-items: end; }
-.composer textarea { min-height: 46px; max-height: 200px; border: 0; background: transparent; padding: 6px; }
-.gen { display: grid; grid-template-columns: minmax(280px, 360px) 1fr; gap: 28px; align-items: start; }
+.composer textarea { min-height: 46px; max-height: 38vh; border: 0; background: transparent; padding: 6px; resize: none; }
+.composer .row { flex-wrap: nowrap; }
+.gen { display: grid; grid-template-columns: minmax(260px, 380px) minmax(0, 1fr); gap: clamp(18px, 2.2vw, 36px); align-items: start; }
 .gen-form { display: grid; gap: 14px; }
-.gallery { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 12px; }
+.gallery { display: grid; grid-template-columns: repeat(auto-fill, minmax(clamp(150px, 16vw, 260px), 1fr)); gap: 12px; }
+.gallery figure { cursor: pointer; }
+.gallery .fail { aspect-ratio: 4 / 3; display: grid; place-items: center; padding: 12px; color: var(--bad); font-size: 12px; text-align: center; background: var(--panel-2); }
+.chips { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 14px; }
+.chips button { all: unset; cursor: pointer; padding: 4px 12px; border: 1px solid var(--line-2); border-radius: 14px; color: var(--muted); font-size: 13px; }
+.chips button[aria-pressed=true] { color: var(--text); border-color: var(--gpu); background: color-mix(in srgb, var(--gpu) 14%, transparent); }
+.chips button:focus-visible { outline: 2px solid var(--gpu); }
+.now { display: grid; grid-template-columns: 96px minmax(0, 1fr) auto; gap: 16px; align-items: center; padding: 14px; border: 1px solid var(--line); border-radius: var(--r); background: var(--panel); }
+.now img, .now .ph { width: 96px; height: 72px; object-fit: cover; border-radius: 4px; background: var(--panel-2); }
+.viewer { display: grid; grid-template-columns: minmax(0, 1.6fr) minmax(240px, 1fr); }
+.viewer .media { background: var(--media-bg); display: grid; place-items: center; min-height: 240px; }
+.viewer .media img, .viewer .media video { max-width: 100%; max-height: 72vh; display: block; }
+.viewer .info { padding: 18px 20px; display: grid; gap: 10px; align-content: start; overflow-y: auto; max-height: 72vh; }
+.viewer dl { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 4px 12px; margin: 0; font-size: 13px; }
+.viewer dt { color: var(--muted); } .viewer dd { margin: 0; word-break: break-word; }
+pre.json { max-height: 420px; overflow: auto; }
+.incog { display: flex; align-items: center; gap: 8px; cursor: pointer; font-size: 13px; color: var(--muted); padding: 6px 4px; }
+.incog input { appearance: none; width: 30px; height: 17px; border-radius: 9px; background: var(--line-2); position: relative; cursor: pointer; margin: 0; flex: none; transition: background .15s; }
+.incog input::after { content: ""; position: absolute; top: 2px; left: 2px; width: 13px; height: 13px; border-radius: 50%; background: var(--text); transition: transform .15s; }
+.incog input:checked { background: var(--gpu); } .incog input:checked::after { transform: translateX(13px); background: var(--on-accent); }
+.incog input:focus-visible { outline: 2px solid var(--gpu); outline-offset: 2px; }
+.banner { display: none; align-items: center; gap: 10px; border: 1px solid color-mix(in srgb, var(--gpu) 50%, transparent); background: color-mix(in srgb, var(--gpu) 12%, transparent); border-radius: var(--r); padding: 9px 14px; margin-bottom: 18px; font-size: 13px; }
+body.incognito .banner { display: flex; }
 .gallery figure { margin: 0; background: var(--panel); border-radius: var(--r); overflow: hidden; }
-.gallery img, .gallery video { width: 100%; display: block; background: #151A20; }
+.gallery img, .gallery video { width: 100%; aspect-ratio: 4 / 3; object-fit: cover; display: block; background: var(--media-bg); }
 .gallery figcaption { padding: 7px 10px; font-size: 12px; color: var(--muted); display: flex; justify-content: space-between; gap: 8px; }
 .progress { display: grid; gap: 6px; }
 .progress .meter > div { background: var(--gpu); }
-.job { display: grid; grid-template-columns: 64px 1fr auto; gap: 14px; align-items: center; padding: 10px 0; border-bottom: 1px solid var(--line); }
+.job { display: grid; grid-template-columns: 64px minmax(0, 1fr) auto; gap: 14px; align-items: center; padding: 10px 0; border-bottom: 1px solid var(--line); }
+.job img { cursor: pointer; }
 .job img, .job .ph { width: 64px; height: 48px; object-fit: cover; border-radius: 4px; background: var(--panel-2); }
 .job .p { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.log { background: #181E25; border: 1px solid var(--line); border-radius: var(--r); padding: 12px 14px; height: calc(100vh - 260px); min-height: 300px; overflow: auto; font: 12px/1.55 var(--code); white-space: pre-wrap; word-break: break-all; color: #C6CDD7; }
-.endpoint { display: grid; grid-template-columns: 110px 1fr auto; gap: 10px; align-items: center; padding: 8px 0; border-bottom: 1px solid var(--line); }
+.log { background: var(--well); border: 1px solid var(--line); border-radius: var(--r); padding: 12px 14px; height: calc(100vh - 250px); height: calc(100dvh - 250px); min-height: 280px; overflow: auto; font: 12px/1.55 var(--code); white-space: pre-wrap; word-break: break-all; color: var(--well-text); }
+.endpoint { display: grid; grid-template-columns: minmax(90px, 120px) minmax(0, 1fr) auto; gap: 10px; align-items: center; padding: 8px 0; border-bottom: 1px solid var(--line); }
 .endpoint code { font: 13px var(--code); color: var(--text); word-break: break-all; }
-pre.example { background: #181E25; border: 1px solid var(--line); border-radius: var(--r); padding: 12px 14px; font: 12px/1.55 var(--code); overflow-x: auto; color: #C6CDD7; margin: 8px 0 0; }
+pre.example { background: var(--well); border: 1px solid var(--line); border-radius: var(--r); padding: 12px 14px; font: 12px/1.55 var(--code); overflow-x: auto; color: var(--well-text); margin: 8px 0 0; }
 
 /* save bar, toasts, dialog */
-.savebar { position: fixed; left: 208px; right: 0; bottom: 0; background: var(--panel-2); border-top: 1px solid var(--line-2); padding: 12px 36px; display: none; justify-content: space-between; align-items: center; gap: 12px; z-index: 5; }
+.savebar { position: fixed; left: var(--rail-w); right: 0; bottom: 0; background: var(--panel-2); border-top: 1px solid var(--line-2); padding: 12px 36px; display: none; justify-content: space-between; align-items: center; gap: 12px; z-index: 5; }
 .savebar.on { display: flex; }
-.toasts { position: fixed; right: 20px; top: 20px; display: grid; gap: 8px; z-index: 20; }
-.toast { background: var(--panel-2); border: 1px solid var(--line-2); border-left: 3px solid var(--good); padding: 10px 14px; border-radius: var(--r); max-width: 420px; white-space: pre-wrap; }
+.toasts { position: fixed; right: 20px; top: 20px; display: grid; gap: 8px; z-index: 20; max-width: calc(100vw - 40px); }
+.toast { background: var(--panel-2); border: 1px solid var(--line-2); border-left: 3px solid var(--good); padding: 10px 14px; border-radius: var(--r); max-width: 420px; white-space: pre-wrap; box-shadow: 0 6px 24px rgba(0, 0, 0, .18); }
 .toast.err { border-left-color: var(--bad); }
-dialog { background: var(--panel); color: var(--text); border: 1px solid var(--line-2); border-radius: 8px; padding: 0; width: min(760px, 94vw); }
-dialog::backdrop { background: rgba(10, 13, 17, .6); }
+dialog { background: var(--panel); color: var(--text); border: 1px solid var(--line-2); border-radius: 8px; padding: 0; width: min(760px, 94vw); max-height: 92vh; }
+dialog.wide { width: min(1200px, 96vw); }
+dialog::backdrop { background: var(--backdrop); }
 .dlg-head { padding: 16px 20px 10px; display: grid; gap: 10px; }
 .crumbs { display: flex; gap: 6px; }
 .crumbs input { font: 12px var(--code); }
@@ -168,14 +229,46 @@ dialog::backdrop { background: rgba(10, 13, 17, .6); }
 .files .ic { color: var(--muted); } .files .dir .ic { color: var(--ssd); }
 .files .sz { color: var(--muted); font-size: 12px; font-family: var(--display); }
 .dlg-foot { padding: 12px 20px 16px; display: flex; justify-content: space-between; gap: 10px; align-items: center; }
+/* Wide screens: more room for galleries and forms. */
+@media (min-width: 1700px) { :root { --rail-w: 236px; } }
+/* Medium: the rail folds to its icons. */
+@media (max-width: 1180px) and (min-width: 861px) {
+  :root { --rail-w: 68px; }
+  .rail { padding: 18px 10px; align-items: center; }
+  .brand-name, .rail-foot span:not(.dot), nav button .label, .theme-toggle .label, .incog .label { display: none; }
+  nav button { justify-content: center; padding: 9px; }
+  nav button .count { position: absolute; margin: -18px 0 0 18px; }
+  .rail-foot .row { justify-content: center; }
+}
+@media (max-width: 1080px) { .gen { grid-template-columns: minmax(0, 1fr); } .viewer { grid-template-columns: minmax(0, 1fr); } }
+/* Narrow: a bar across the top, sections scroll sideways. */
 @media (max-width: 860px) {
-  .app { grid-template-columns: 1fr; }
-  .rail { position: static; height: auto; flex-direction: row; flex-wrap: wrap; border-right: 0; border-bottom: 1px solid var(--line); gap: 10px; }
-  nav { display: flex; flex-wrap: wrap; } .rail-foot { display: none; }
-  main { padding: 20px 16px 96px; }
-  .gen { grid-template-columns: 1fr; }
-  .hw-row { grid-template-columns: 1fr; gap: 6px; }
-  .savebar { left: 0; padding: 12px 16px; }
+  :root { --rail-w: 0px; }
+  .app { grid-template-columns: minmax(0, 1fr); }
+  .rail { position: sticky; top: 0; z-index: 6; height: auto; flex-direction: row; align-items: center; border-right: 0; border-bottom: 1px solid var(--line); gap: 12px; padding: 10px var(--pad); background: var(--bg); overflow: visible; }
+  .brand-name small { display: none; }
+  nav { display: flex; flex-wrap: nowrap; overflow-x: auto; scrollbar-width: none; flex: 1; min-width: 0; }
+  nav button { padding: 7px 10px; }
+  .rail-foot { margin: 0; display: flex; gap: 8px; }
+  .rail-foot span:not(.dot), .theme-toggle .label, .incog .label { display: none; }
+  .hw-row { grid-template-columns: minmax(0, 1fr); gap: 6px; }
+  .savebar { left: 0; padding: 12px var(--pad); }
+  .chat { height: calc(100dvh - 330px); }
+}
+/* Phones: stacked cards, full-width dialogs. */
+@media (max-width: 560px) {
+  .brand-name { display: none; }
+  nav button svg { display: none; }
+  .endpoint { grid-template-columns: minmax(0, 1fr) auto; } .endpoint > span { grid-column: 1 / -1; }
+  .now { grid-template-columns: 64px minmax(0, 1fr); } .now > :last-child { grid-column: 1 / -1; }
+  table.routes { min-width: 0; } table.routes thead { display: none; }
+  table.routes tr { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 6px 10px; padding: 10px 0; border-bottom: 1px solid var(--line); }
+  table.routes td { border: 0; padding: 0; } table.routes td.path { grid-column: 2; }
+  table.routes td:nth-child(n+3) { grid-column: 1 / -1; }
+  dialog, dialog.wide { width: 100vw; max-width: 100vw; height: 100dvh; max-height: 100dvh; border-radius: 0; margin: 0; }
+  .files { max-height: calc(100dvh - 190px); }
+  .seg button { padding: 6px 10px; }
+  .grid-f[style] { grid-template-columns: minmax(0, 1fr) !important; }
 }
 </style>
 </head>
@@ -187,21 +280,25 @@ dialog::backdrop { background: rgba(10, 13, 17, .6); }
       <div class="brand-name">NROB Studio<small>NVMe to RAM to GPU</small></div>
     </div>
     <nav aria-label="Sections">
-      <button data-view="overview" aria-current="page">Overview</button>
-      <button data-view="play">Playground</button>
-      <button data-view="models">Models</button>
-      <button data-view="memory">Memory</button>
-      <button data-view="endpoints">Endpoints</button>
-      <button data-view="settings">Settings</button>
-      <button data-view="logs">Logs</button>
+      <button data-view="overview" title="Overview" aria-current="page"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 13h8V3H3zM13 21h8V11h-8zM3 21h8v-6H3zM13 3v6h8V3z"/></svg><span class="label">Overview</span></button>
+      <button data-view="play" title="Playground"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4l14 8-14 8z"/></svg><span class="label">Playground</span></button>
+      <button data-view="gallery" title="Gallery"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="9" cy="10" r="2"/><path d="M21 17l-5-5-9 8"/></svg><span class="label">Gallery</span><span class="count" id="gallery-count" hidden></span></button>
+      <button data-view="models" title="Models"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l9 5-9 5-9-5z"/><path d="M3 13l9 5 9-5"/></svg><span class="label">Models</span></button>
+      <button data-view="memory" title="Memory"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="5" width="18" height="4" rx="1"/><rect x="3" y="10" width="18" height="4" rx="1"/><rect x="3" y="15" width="18" height="4" rx="1"/></svg><span class="label">Memory</span></button>
+      <button data-view="endpoints" title="Endpoints"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 7l-5 5 5 5M16 7l5 5-5 5M14 4l-4 16"/></svg><span class="label">Endpoints</span></button>
+      <button data-view="settings" title="Settings"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 00.3 1.8l.1.1a2 2 0 11-2.8 2.8l-.1-.1a1.7 1.7 0 00-1.8-.3 1.7 1.7 0 00-1 1.5V21a2 2 0 11-4 0v-.1a1.7 1.7 0 00-1.1-1.5 1.7 1.7 0 00-1.8.3l-.1.1a2 2 0 11-2.8-2.8l.1-.1a1.7 1.7 0 00.3-1.8 1.7 1.7 0 00-1.5-1H3a2 2 0 110-4h.1a1.7 1.7 0 001.5-1.1 1.7 1.7 0 00-.3-1.8l-.1-.1a2 2 0 112.8-2.8l.1.1a1.7 1.7 0 001.8.3H9a1.7 1.7 0 001-1.5V3a2 2 0 114 0v.1a1.7 1.7 0 001 1.5 1.7 1.7 0 001.8-.3l.1-.1a2 2 0 112.8 2.8l-.1.1a1.7 1.7 0 00-.3 1.8V9a1.7 1.7 0 001.5 1H21a2 2 0 110 4h-.1a1.7 1.7 0 00-1.5 1z"/></svg><span class="label">Settings</span></button>
+      <button data-view="logs" title="Logs"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h10"/></svg><span class="label">Logs</span></button>
     </nav>
     <div class="rail-foot">
       <div class="row"><span class="dot" id="foot-llm"></span><span id="foot-llm-text">LLM stopped</span></div>
       <div class="row"><span class="dot" id="foot-media"></span><span id="foot-media-text">Media idle</span></div>
+      <label class="incog" title="Incognito: keep nothing about any request (no prompt cache, no history, media deleted after delivery)"><input type="checkbox" id="incognito"><span class="label">Incognito</span></label>
+      <button class="btn quiet theme-toggle" id="theme" title="Switch between light and dark"><svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true" style="stroke:currentColor;fill:none;stroke-width:1.7"><path d="M21 12.8A9 9 0 1111.2 3a7 7 0 009.8 9.8z"/></svg><span class="label" id="theme-label">Theme</span></button>
     </div>
   </aside>
 
   <main>
+    <div class="banner" role="status"><strong>Incognito</strong><span>Nothing about requests is kept: no prompt cache, no history or logs, and generated media is deleted after it is delivered.</span></div>
     <!-- Overview -->
     <section class="view on" id="v-overview">
       <h1>Overview</h1>
@@ -209,6 +306,10 @@ dialog::backdrop { background: rgba(10, 13, 17, .6); }
       <div class="block">
         <div class="spread"><h2>Hardware</h2><span class="muted small" id="hw-note"></span></div>
         <div class="hw" id="hw"></div>
+      </div>
+      <div class="block" id="now-block" hidden>
+        <h2>Now running</h2>
+        <div id="now"></div>
       </div>
       <div class="block cols">
         <div>
@@ -247,11 +348,13 @@ dialog::backdrop { background: rgba(10, 13, 17, .6); }
           <label class="check" style="margin-top:18px"><input type="checkbox" id="chat-think"> Think first</label>
           <button class="btn quiet" id="chat-clear" style="margin-top:18px">Clear conversation</button>
         </div>
+        <details style="margin-bottom:12px"><summary class="muted small" style="cursor:pointer">System prompt</summary>
+          <textarea id="chat-system" rows="2" placeholder="Optional instructions sent before the conversation" style="margin-top:8px"></textarea></details>
         <div class="chat">
           <div class="msgs" id="msgs"><div class="empty" id="chat-empty">Send a message to load the model and start a conversation. The first reply includes load time.</div></div>
           <div class="composer">
             <textarea id="chat-input" rows="2" placeholder="Message the model (Enter sends, Shift+Enter for a new line)"></textarea>
-            <button class="btn go" id="chat-send">Send</button>
+            <div class="row"><button class="btn warn" id="chat-stop" hidden>Stop</button><button class="btn go" id="chat-send">Send</button></div>
           </div>
         </div>
       </div>
@@ -296,6 +399,18 @@ dialog::backdrop { background: rgba(10, 13, 17, .6); }
       </div>
     </section>
 
+    <!-- Gallery -->
+    <section class="view" id="v-gallery">
+      <h1>Gallery</h1>
+      <p class="lede">Everything generated since the studio started. Click one for its prompt and settings, or to reuse the prompt.</p>
+      <div class="chips" id="gallery-filter">
+        <button data-f="all" aria-pressed="true">All</button><button data-f="image" aria-pressed="false">Images</button>
+        <button data-f="video" aria-pressed="false">Videos</button><button data-f="active" aria-pressed="false">In progress</button>
+        <button data-f="failed" aria-pressed="false">Failed</button>
+      </div>
+      <div class="gallery" id="gallery"></div>
+    </section>
+
     <!-- Models -->
     <section class="view" id="v-models">
       <h1>Models</h1>
@@ -310,6 +425,12 @@ dialog::backdrop { background: rgba(10, 13, 17, .6); }
           <div id="add-result"></div>
           <p class="muted small" style="margin:0">Reads GGUF (LLMs, Qwen Image, vision projectors), safetensors (SDXL, Qwen Image, LTX 2.3/2.5, Sulphur, LoRA adapters, text encoders, VAEs), diffusers and EXL3/DeepSeek folders, and tokenizer.json. Pickled .bin/.pt files are refused because loading them can run code.</p>
         </div>
+      </div>
+      <div class="block">
+        <div class="spread"><h2>Your model list</h2><div class="row">
+          <a class="btn" id="export-models" href="/api/models/export" download="nrob-models.json">Export models</a>
+          <label class="btn" style="cursor:pointer">Import models<input type="file" id="import-models" accept="application/json,.json" hidden></label></div></div>
+        <p class="muted small" style="margin:0">Export saves every model with its parts, defaults and memory settings to a file. Import it on this machine or another: models merge by name, or replace the whole list. Paths that do not exist there come in switched off and are listed.</p>
       </div>
       <div class="block"><div class="spread"><h2>Language models</h2><span class="muted small">Served on chat and completions routes</span></div><div class="list" id="m-llm"></div></div>
       <div class="block"><div class="spread"><h2>Image models</h2><span class="muted small">Served on the images route</span></div><div class="list" id="m-image"></div></div>
@@ -358,13 +479,21 @@ dialog::backdrop { background: rgba(10, 13, 17, .6); }
           <label class="f"><span>Port</span><input type="number" data-bind="gateway.port" data-type="int"></label>
           <label class="f"><span>API key (empty = none)</span><input type="password" data-bind="gateway.api_key" autocomplete="off"></label>
           <label class="f"><span>Public URL for file links</span><input type="text" data-bind="gateway.public_url" placeholder="http://my-pc:8080"></label>
+          <label class="f"><span>Allowed web origins (one per line, * for any)</span><textarea data-bind="gateway.cors_origins" data-type="lines" rows="2" placeholder="http://localhost:3000"></textarea></label>
         </div>
+        <p class="muted small">Web pages can reach this port too, so without an API key, browser requests are refused unless their origin is listed. Apps, scripts and SDKs outside a browser are unaffected.</p>
         <p class="muted small">Use 0.0.0.0 to serve your network, and set an API key when you do. Address changes apply the next time the studio starts.</p>
       </div>
       <div class="block">
         <div class="spread"><h2>Routes</h2><div class="row"><button class="btn quiet" id="routes-reset">Restore defaults</button><button class="btn" id="route-add">Add route</button></div></div>
-        <table class="routes"><thead><tr><th>On</th><th>Path</th><th>Method</th><th>Serves</th><th>Dialect</th><th></th></tr></thead><tbody id="routes"></tbody></table>
+        <div class="table-wrap"><table class="routes"><thead><tr><th>On</th><th>Path</th><th>Method</th><th>Serves</th><th>Dialect</th><th></th></tr></thead><tbody id="routes"></tbody></table></div>
         <p class="muted small">Image and video routes also own the paths below them, such as <code>/v1/videos/{id}/content</code> or <code>…/status</code> for the nrob dialect.</p>
+      </div>
+      <div class="block">
+        <div class="spread"><h2>Companion apps</h2><div class="row"><button class="btn quiet" id="disc-copy">Copy JSON</button><button class="btn" id="disc-refresh">Refresh</button></div></div>
+        <p class="muted" style="margin-top:0">One request tells an app everything it needs: each endpoint's URL, method and dialect, the models it serves with their defaults and limits, and whether a key is required. Point the app at either address.</p>
+        <div id="disc-urls"></div>
+        <pre class="example json" id="disc-json">Loading…</pre>
       </div>
       <div class="block"><h2>Try it</h2><div id="examples"></div></div>
     </section>
@@ -439,6 +568,12 @@ dialog::backdrop { background: rgba(10, 13, 17, .6); }
 <div class="savebar" id="savebar"><span>Unsaved changes</span><div class="row"><button class="btn quiet" id="discard">Discard</button><button class="btn go" id="save">Save changes</button></div></div>
 <div class="toasts" id="toasts" aria-live="assertive"></div>
 
+<dialog id="viewer" class="wide" aria-label="Generated media">
+  <div class="viewer"><div class="media" id="viewer-media"></div>
+    <div class="info"><div class="spread"><h2 style="margin:0" id="viewer-title"></h2><button class="btn quiet" id="viewer-close">Close</button></div>
+      <p id="viewer-prompt" style="margin:0"></p><dl id="viewer-meta"></dl><div class="row" id="viewer-actions"></div></div></div>
+</dialog>
+
 <dialog id="picker" aria-label="Choose a file">
   <div class="dlg-head">
     <div class="spread"><h2 style="margin:0" id="pick-title">Choose a model file</h2><button class="btn quiet" id="pick-close" aria-label="Close">Close</button></div>
@@ -455,6 +590,9 @@ const $$ = (s, el = document) => [...el.querySelectorAll(s)];
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const gb = mb => (mb / 1024).toFixed(1);
 const bytesGb = b => (b / 1073741824).toFixed(1);
+const fileUrl = u => !u || !key ? u : u + (u.includes("?") ? "&" : "?") + "key=" + encodeURIComponent(key);
+// Remote control ports need the key on media links too (an <img> sends no header).
+const keyed = jobs => { for (const j of jobs || []) { j.files = (j.files || []).map(fileUrl); j.preview = fileUrl(j.preview); } return jobs; };
 const key = (() => { try { const k = new URLSearchParams(location.search).get("key"); if (k) sessionStorage.setItem("studio-key", k); return sessionStorage.getItem("studio-key") || ""; } catch { return ""; } })();
 
 async function api(path, opts = {}) {
@@ -487,6 +625,48 @@ async function saveConfig() {
 $("#save").onclick = saveConfig;
 $("#discard").onclick = () => { cfg = clone(saved); renderConfig(); dirty(); };
 
+/* ---------- incognito ---------- */
+$("#incognito").onchange = async e => {
+  // A mode, not a draft setting: it applies (and restarts the LLM) at once.
+  try {
+    const next = clone(saved); next.privacy = {...(next.privacy || {}), incognito: e.target.checked};
+    saved = await api("/api/config", {method: "PUT", body: next});
+    cfg.privacy = clone(saved.privacy);
+    document.body.classList.toggle("incognito", !!saved.privacy.incognito);
+    toast(saved.privacy.incognito ? "Incognito on: nothing about requests is kept" : "Incognito off");
+    dirty(); refresh();
+  } catch (err) { e.target.checked = !e.target.checked; toast(err.message, true); }
+};
+$("#import-models").onchange = async e => {
+  const f = e.target.files[0]; e.target.value = ""; if (!f) return;
+  let doc; try { doc = JSON.parse(await f.text()); } catch { return toast("That file is not JSON", true); }
+  const replace = confirm("Replace your whole model list with this file?\n\nOK replaces. Cancel merges (models with the same name are updated, others kept).");
+  try {
+    const r = await api("/api/models/import?mode=" + (replace ? "replace" : "merge"), {method: "POST", body: doc});
+    const miss = r.missing.length ? `\n${r.missing.length} path(s) not found here, switched off: ` + r.missing.slice(0, 4).map(m => `${m.model} ${m.field}`).join(", ") : "";
+    toast(`Imported ${r.llm} language, ${r.image} image and ${r.video} video model(s)` + miss, r.missing.length > 0);
+    await loadConfig();
+  } catch (err) { toast(err.message, true); }
+};
+
+/* ---------- theme ---------- */
+function applyTheme(t) {
+  if (t) document.documentElement.dataset.theme = t; else delete document.documentElement.dataset.theme;
+  const dark = t ? t === "dark" : !matchMedia("(prefers-color-scheme: light)").matches;
+  $("#theme-label").textContent = dark ? "Light theme" : "Dark theme";
+}
+(() => {
+  let t = new URLSearchParams(location.search).get("theme") || "";
+  if (!["light", "dark"].includes(t)) { t = ""; try { t = localStorage.getItem("studio-theme") || ""; } catch {} }
+  applyTheme(t);
+})();
+$("#theme").onclick = () => {
+  const dark = document.documentElement.dataset.theme ? document.documentElement.dataset.theme === "dark" : !matchMedia("(prefers-color-scheme: light)").matches;
+  const next = dark ? "light" : "dark";
+  try { localStorage.setItem("studio-theme", next); } catch {}
+  applyTheme(next);
+};
+
 /* ---------- navigation ---------- */
 function show(view) {
   $$("nav button").forEach(b => b.dataset.view === view ? b.setAttribute("aria-current", "page") : b.removeAttribute("aria-current"));
@@ -494,6 +674,8 @@ function show(view) {
   try { localStorage.setItem("studio-view", view); } catch {}
   if (location.hash !== "#" + view) history.replaceState(null, "", "#" + view);
   if (view === "logs") pollLogs(true);
+  if (view === "gallery") refreshGallery();
+  if (view === "endpoints") renderCompanion();
 }
 $$("nav button").forEach(b => b.onclick = () => show(b.dataset.view));
 $$("#v-play .tabs button").forEach(b => b.onclick = () => {
@@ -524,6 +706,9 @@ function bindFields() {
 }
 
 function renderConfig() {
+  $("#incognito").checked = !!cfg.privacy?.incognito;
+  document.body.classList.toggle("incognito", !!saved?.privacy?.incognito);
+  $("#export-models").href = fileUrl("/api/models/export");
   bindFields(); renderModels(); renderMemory(); renderRoutes(); renderExamples(); renderSelects();
   $("#cfg-path").textContent = state ? "Configuration: " + state.config_path : "";
 }
@@ -745,7 +930,7 @@ function shareNote() {
 }
 
 /* ---------- endpoints ---------- */
-const targets = [["chat", "Chat"], ["completions", "Completions"], ["models", "Model list"], ["images", "Images"], ["edits", "Image edits"], ["videos", "Videos"], ["files", "Generated files"], ["health", "Health"]];
+const targets = [["chat", "Chat"], ["completions", "Completions"], ["models", "Model list"], ["images", "Images"], ["edits", "Image edits"], ["videos", "Videos"], ["files", "Generated files"], ["health", "Health"], ["discovery", "Discovery (for apps)"]];
 function renderRoutes() {
   $("#routes").innerHTML = cfg.gateway.routes.map((r, i) => `<tr>
     <td><input type="checkbox" data-r="${i}|enabled" ${r.enabled !== false ? "checked" : ""} aria-label="Enabled"></td>
@@ -820,10 +1005,25 @@ function renderState() {
     <div><div class="p">${esc(j.prompt)}</div><div class="muted small">${esc(j.model)}, ${esc(j.size)}, ${statusText(j)}</div></div>
     <div class="row">${j.status === "in_progress" || j.status === "queued" ? `<button class="btn quiet warn" data-cancel="${j.id}">Cancel</button>` : j.files[0] ? `<a class="btn quiet" href="${esc(j.files[0])}" target="_blank">Open</a>` : ""}</div></div>`).join("")
     : '<div class="empty">Nothing generated yet. Try the Playground.</div>';
+  $$("#ov-jobs img").forEach((img, i) => img.onclick = () => openViewer(jobs[i].id));
+  const now = state.media.jobs.find(j => j.status === "in_progress") || state.media.jobs.find(j => j.status === "queued");
+  $("#now-block").hidden = !now;
+  if (now) {
+    const active = now;
+    $("#now").innerHTML = `<div class="now"><div class="ph"></div><div><div class="p" style="margin-bottom:6px">${esc(active.prompt)}</div>
+      <div class="meter"><div style="width:${active.progress}%;background:var(--gpu)"></div></div>
+      <div class="muted small" style="margin-top:6px">${esc(active.kind)} on ${esc(active.model)}, ${esc(active.size)}: ${statusText(active)}</div></div>
+      <button class="btn warn" data-cancel="${active.id}">Cancel</button></div>`;
+  }
+  const busy = state.media.jobs.filter(j => j.status === "in_progress" || j.status === "queued").length;
+  $("#gallery-count").hidden = !busy; $("#gallery-count").textContent = busy;
   $$("[data-cancel]").forEach(b => b.onclick = () => api(`/api/jobs/${b.dataset.cancel}/cancel`, {method: "POST"}).then(refresh));
+  if ($("#v-gallery").classList.contains("on")) renderGallery(state.media.jobs);
   $("#cfg-path").textContent = "Configuration: " + state.config_path;
 }
-function statusText(j) {
+// Status lines include worker output: plain text, escaped here once.
+function statusText(j) { return esc(statusRaw(j)); }
+function statusRaw(j) {
   if (j.status === "in_progress") return `${j.progress.toFixed(0)}%, ${j.stage.replace(/_/g, " ")}`;
   if (j.status === "failed") return "failed: " + (j.error || "").slice(0, 140);
   if (j.status === "completed" && j.seconds_taken) return `done in ${j.seconds_taken.toFixed(0)} s`;
@@ -847,23 +1047,58 @@ function renderSelects() {
 let imgTier = "", vidTier = "";
 
 /* ---------- chat ---------- */
-let chatLog = [];
+function md(src) {
+  const blocks = [];
+  let text = esc(src).replace(/```(\w*)\n?([\s\S]*?)(```|$)/g, (_, lang, code) => { blocks.push(code.replace(/\n$/, "")); return `\u0000${blocks.length - 1}\u0000`; });
+  const inline = t => t.replace(/`([^`\n]+)`/g, "<code>$1</code>").replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>").replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<em>$2</em>");
+  const out = [];
+  let list = null;
+  const close = () => { if (list) { out.push(`</${list}>`); list = null; } };
+  for (const para of text.split(/\n{2,}/)) {
+    for (const line of para.split("\n")) {
+      const code = line.match(/^\u0000(\d+)\u0000$/);
+      if (code) { close(); out.push(`<pre><button class="btn quiet copy" data-code="${code[1]}">Copy</button><code>${blocks[+code[1]]}</code></pre>`); continue; }
+      const h = line.match(/^#{1,4}\s+(.*)/);
+      if (h) { close(); out.push(`<h4>${inline(h[1])}</h4>`); continue; }
+      const li = line.match(/^\s*(?:[-*]|(\d+)\.)\s+(.*)/);
+      if (li) { const kind = li[1] ? "ol" : "ul"; if (list !== kind) { close(); out.push(`<${kind}>`); list = kind; } out.push(`<li>${inline(li[2])}</li>`); continue; }
+      close();
+      if (line.trim()) out.push(`<p>${inline(line)}</p>`);
+    }
+    close();
+  }
+  const html = out.join("").replace(/\u0000(\d+)\u0000/g, (_, i) => `<code>${blocks[+i]}</code>`);
+  return {html, blocks};
+}
+function renderReply(el, content) {
+  const {html, blocks} = md(content);
+  const body = $(".body", el);
+  body.innerHTML = html;
+  $$(".copy", body).forEach(b => b.onclick = () => navigator.clipboard.writeText(new DOMParser().parseFromString(blocks[+b.dataset.code], "text/html").documentElement.textContent).then(() => toast("Copied")));
+}
+let chatLog = [], chatAbort = null;
+const autoGrow = () => { const t = $("#chat-input"); t.style.height = "auto"; t.style.height = Math.min(t.scrollHeight, innerHeight * .38) + "px"; };
+$("#chat-input").addEventListener("input", autoGrow);
 function addMsg(role, text = "") {
   $("#chat-empty")?.remove();
   const el = document.createElement("div"); el.className = "msg " + role;
-  el.innerHTML = role === "user" ? esc(text) : '<div class="think" hidden></div><div class="body"></div><div class="meta"></div>';
+  el.innerHTML = role === "user" ? esc(text) : '<div class="think" hidden></div><div class="body"></div><div class="meta"></div><div class="actions"><button class="btn quiet copy-msg">Copy reply</button></div>';
   $("#msgs").append(el); el.scrollIntoView({block: "end"}); return el;
 }
 async function sendChat() {
   const text = $("#chat-input").value.trim(); if (!text) return;
-  $("#chat-input").value = ""; $("#chat-send").disabled = true;
+  $("#chat-input").value = ""; autoGrow(); $("#chat-send").disabled = true;
+  chatAbort = new AbortController(); $("#chat-stop").hidden = false;
   chatLog.push({role: "user", content: text}); addMsg("user", text);
   const el = addMsg("assistant"), body = $(".body", el), think = $(".think", el), meta = $(".meta", el);
   meta.textContent = state?.llm?.state === "ready" ? "Thinking..." : "Loading the model (the first reply takes longer)...";
-  const t0 = performance.now(); let content = "", reasoning = "", tokens = 0;
+  const t0 = performance.now(); let content = "", reasoning = "", tokens = 0, drawn = 0;
+  $(".copy-msg", el).onclick = () => navigator.clipboard.writeText(content).then(() => toast("Copied"));
+  const system = $("#chat-system").value.trim();
+  const messages = system ? [{role: "system", content: system}, ...chatLog] : chatLog;
   try {
-    const r = await fetch("/api/play/chat", {method: "POST", headers: Object.assign({"Content-Type": "application/json"}, key ? {Authorization: "Bearer " + key} : {}),
-      body: JSON.stringify({model: $("#chat-model").value || undefined, messages: chatLog, stream: true, ...($("#chat-think").checked ? {reasoning_effort: "medium"} : {})})});
+    const r = await fetch("/api/play/chat", {method: "POST", signal: chatAbort.signal, headers: Object.assign({"Content-Type": "application/json"}, key ? {Authorization: "Bearer " + key} : {}, saved?.privacy?.incognito ? {"X-NROB-Incognito": "1"} : {}),
+      body: JSON.stringify({model: $("#chat-model").value || undefined, messages, stream: true, ...($("#chat-think").checked ? {reasoning_effort: "medium"} : {})})});
     if (!r.ok) { const e = await r.json().catch(() => ({})); throw new Error(e?.error?.message || r.statusText); }
     const reader = r.body.getReader(), dec = new TextDecoder(); let buf = "";
     for (;;) {
@@ -879,18 +1114,27 @@ async function sendChat() {
           if (j.nrob_progress) meta.textContent = `Reading the prompt: ${j.nrob_progress.prompt_done} / ${j.nrob_progress.prompt_total} tokens`;
           const d = j.choices?.[0]?.delta; if (!d) continue;
           if (d.reasoning_content) { reasoning += d.reasoning_content; think.hidden = false; think.textContent = reasoning; }
-          if (d.content) { content += d.content; body.textContent = content; tokens++; }
+          if (d.content) { content += d.content; tokens++; if (performance.now() - drawn > 60) { renderReply(el, content); drawn = performance.now(); } }
           if (tokens % 8 === 1) el.scrollIntoView({block: "end"});
         }
       }
     }
+    renderReply(el, content);
     const secs = (performance.now() - t0) / 1000;
     meta.textContent = `${secs.toFixed(1)} s, about ${(tokens / secs).toFixed(1)} chunks/s`;
     chatLog.push({role: "assistant", content});
-  } catch (e) { meta.textContent = ""; body.innerHTML = `<span style="color:var(--bad)">${esc(e.message)}</span>`; chatLog.pop(); }
+  } catch (e) {
+    if (e.name === "AbortError") {
+      renderReply(el, content);
+      meta.textContent = "Stopped.";
+      if (content) chatLog.push({role: "assistant", content}); else chatLog.pop();
+    } else { meta.textContent = ""; body.innerHTML = `<span style="color:var(--bad)">${esc(e.message)}</span>`; chatLog.pop(); }
+  }
+  chatAbort = null; $("#chat-stop").hidden = true;
   $("#chat-send").disabled = false; refresh();
 }
 $("#chat-send").onclick = sendChat;
+$("#chat-stop").onclick = () => chatAbort?.abort();
 $("#chat-input").onkeydown = e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendChat(); } };
 $("#chat-clear").onclick = () => { chatLog = []; $("#msgs").innerHTML = '<div class="empty" id="chat-empty">New conversation.</div>'; };
 
@@ -920,7 +1164,8 @@ $("#img-form").onsubmit = async e => {
   try {
     const r = await api(refs.length ? "/api/play/edits" : "/api/play/images", {method: "POST", body});
     const g = $("#img-gallery");
-    for (const d of r.data.reverse()) g.insertAdjacentHTML("afterbegin", `<figure><a href="${esc(d.url)}" target="_blank"><img src="${esc(d.url)}" alt="${esc(body.prompt)}"></a><figcaption><span>${esc(r.model)}, ${esc(r.size)}</span><a href="${esc(d.url)}" download>Save</a></figcaption></figure>`);
+    for (const d of r.data.reverse()) d.url = fileUrl(d.url);
+    for (const d of r.data) g.insertAdjacentHTML("afterbegin", `<figure><a href="${esc(d.url)}" target="_blank"><img src="${esc(d.url)}" alt="${esc(body.prompt)}"></a><figcaption><span>${esc(r.model)}, ${esc(r.size)}</span><a href="${esc(d.url)}" download onclick="event.stopPropagation()">Save</a></figcaption></figure>`);
   } catch (err) { toast(err.message, true); }
   stop(); $("#img-go").disabled = false; refresh();
 };
@@ -944,11 +1189,72 @@ $("#vid-form").onsubmit = async e => {
     if (v.status !== "completed") throw new Error(v.error?.message || "the video failed");
     await refresh();
     const j = state.media.jobs.find(j => j.id === v.id);
-    const src = j?.files?.[0] || `/api/play/videos/${v.id}/content`;
+    const src = j?.files?.[0] || fileUrl(`/api/play/videos/${v.id}/content`);
     $("#vid-gallery").insertAdjacentHTML("afterbegin", `<figure><video src="${esc(src)}" controls loop playsinline poster="${esc(j?.preview || "")}"></video><figcaption><span>${esc(v.model)}, ${esc(v.size)}, ${esc(v.seconds)} s</span><a href="${esc(src)}" download>Save</a></figcaption></figure>`);
   } catch (err) { toast(err.message, true); }
   bar.hidden = true; $("#vid-go").disabled = false;
 };
+
+/* ---------- gallery and viewer ---------- */
+let galleryJobs = [], galleryFilter = "all";
+async function refreshGallery() { try { galleryJobs = keyed((await api("/api/jobs")).jobs); renderGallery(); } catch (e) { toast(e.message, true); } }
+function renderGallery(fresh) {
+  if (fresh) { const byId = new Map(galleryJobs.map(j => [j.id, j])); fresh.forEach(j => byId.set(j.id, j)); galleryJobs = [...byId.values()].sort((a, b) => b.created_at - a.created_at); }
+  const pick = {all: () => true, image: j => j.kind === "image", video: j => j.kind === "video",
+    active: j => j.status === "in_progress" || j.status === "queued", failed: j => j.status === "failed" || j.status === "cancelled"}[galleryFilter];
+  const items = galleryJobs.filter(pick);
+  $("#gallery").innerHTML = items.length ? items.map(j => {
+    const done = j.status === "completed";
+    const media = !done ? `<div class="fail" style="color:${j.status === "failed" ? "var(--bad)" : "var(--muted)"}">${statusText(j)}</div>`
+      : j.kind === "video" ? `<video src="${esc(j.files[0] || "")}" poster="${esc(j.preview || "")}" muted loop playsinline preload="none" onmouseenter="this.play()" onmouseleave="this.pause()"></video>`
+      : `<img src="${esc(j.preview || j.files[0] || "")}" alt="${esc(j.prompt)}" loading="lazy">`;
+    return `<figure data-job="${j.id}">${media}<figcaption><span class="p">${esc(j.prompt.slice(0, 60))}</span><span>${esc(j.kind === "video" ? (j.seconds ? j.seconds.toFixed(1) + " s" : "video") : (j.files.length > 1 ? j.files.length + " images" : j.size))}</span></figcaption></figure>`;
+  }).join("") : '<div class="empty">Nothing here yet. Generate something in the Playground.</div>';
+  $$("#gallery figure").forEach(f => f.onclick = () => openViewer(f.dataset.job));
+}
+$$("#gallery-filter button").forEach(b => b.onclick = () => { galleryFilter = b.dataset.f; $$("#gallery-filter button").forEach(x => x.setAttribute("aria-pressed", x === b)); renderGallery(); });
+function openViewer(id) {
+  const j = galleryJobs.find(j => j.id === id) || state?.media?.jobs?.find(j => j.id === id);
+  if (!j) return;
+  const file = j.files[0];
+  $("#viewer-media").innerHTML = j.status !== "completed" ? `<div class="empty" style="padding:40px">${statusText(j)}</div>`
+    : j.kind === "video" ? `<video src="${esc(file)}" poster="${esc(j.preview || "")}" controls autoplay loop playsinline></video>`
+    : `<img src="${esc(file)}" alt="${esc(j.prompt)}">`;
+  $("#viewer-title").textContent = j.kind === "video" ? "Video" : j.files.length > 1 ? `Image 1 of ${j.files.length}` : "Image";
+  $("#viewer-prompt").textContent = j.prompt;
+  const st = j.settings || {}, r = j.residency?.transformer || j.residency;
+  const rows = [["Model", j.model], ["Size", j.size], ["Seed", st.seed], ["Steps", st.steps], ["Memory", st.memory],
+    ["Placement", r && r.gpu_blocks !== undefined ? `${r.gpu_blocks} GPU, ${r.ram_blocks} RAM, ${r.ssd_blocks} SSD blocks` : r?.mode],
+    ["Length", j.kind === "video" && j.seconds ? j.seconds.toFixed(1) + " s" : null], ["Took", j.seconds_taken ? j.seconds_taken.toFixed(1) + " s" : null],
+    ["Created", new Date(j.created_at * 1000).toLocaleString()], ["Status", j.status], ["Error", j.error]].filter(([, v]) => v !== null && v !== undefined && v !== "");
+  $("#viewer-meta").innerHTML = rows.map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join("");
+  const others = j.files.slice(1).map((f, i) => `<a class="btn quiet" href="${esc(f)}" target="_blank">Image ${i + 2}</a>`).join("");
+  $("#viewer-actions").innerHTML = (file ? `<a class="btn" href="${esc(file)}" target="_blank">Open</a><a class="btn" href="${esc(file)}" download>Download</a>` : "")
+    + `<button class="btn" id="viewer-reuse">Reuse prompt</button><button class="btn quiet warn" id="viewer-delete">Remove from list</button>` + others;
+  $("#viewer-reuse").onclick = () => {
+    const tab = j.kind === "video" ? "video" : "image";
+    $(`#${tab === "video" ? "vid" : "img"}-prompt`).value = j.prompt;
+    $("#viewer").close(); show("play"); $(`#v-play .tabs button[data-tab=${tab}]`).click();
+  };
+  $("#viewer-delete").onclick = async () => { await api(`/api/jobs/${j.id}`, {method: "DELETE"}); galleryJobs = galleryJobs.filter(x => x.id !== j.id); $("#viewer").close(); renderGallery(); refresh(); };
+  $("#viewer").showModal();
+}
+$("#viewer-close").onclick = () => $("#viewer").close();
+$("#viewer").addEventListener("close", () => { $("#viewer-media").innerHTML = ""; });
+
+async function renderCompanion() {
+  const base = state?.gateway_url || "";
+  const route = cfg && routeFor("discovery");
+  const urls = [route ? base + route.path : null, base + "/.well-known/nrob.json"].filter(Boolean);
+  $("#disc-urls").innerHTML = urls.map(u => `<div class="endpoint"><span class="muted">Discovery</span><code>${esc(u)}</code><button class="btn quiet" data-copy="${esc(u)}">Copy</button></div>`).join("");
+  $$("#disc-urls [data-copy]").forEach(b => b.onclick = () => navigator.clipboard.writeText(b.dataset.copy).then(() => toast("Copied")));
+  try { $("#disc-json").textContent = JSON.stringify(await api("/api/discovery"), null, 2); } catch (e) { $("#disc-json").textContent = e.message; }
+}
+$("#disc-refresh").onclick = renderCompanion;
+$("#disc-copy").onclick = () => navigator.clipboard.writeText($("#disc-json").textContent).then(() => toast("Copied"));
+addEventListener("keydown", e => {
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s" && $("#savebar").classList.contains("on")) { e.preventDefault(); saveConfig(); }
+});
 
 /* ---------- logs ---------- */
 let logSource = "studio", logAfter = 0;
@@ -965,7 +1271,7 @@ async function pollLogs(reset) {
 
 /* ---------- polling ---------- */
 async function refresh() {
-  try { state = await api("/api/state"); renderState(); } catch (e) { $("#foot-llm-text").textContent = "Studio unreachable"; }
+  try { state = await api("/api/state"); keyed(state.media.jobs); renderState(); } catch (e) { $("#foot-llm-text").textContent = "Studio unreachable"; }
 }
 async function refreshSystem() { try { sys = await api("/api/system"); renderHardware(); } catch {} }
 (async () => {

@@ -55,6 +55,14 @@ pub struct Job {
     pub preview: Option<PathBuf>,
     pub error: Option<String>,
     cancel: Arc<AtomicBool>,
+    /// Incognito: hidden from lists and logs; its folder is deleted after
+    /// delivery or at `expires_at`.
+    pub incognito: bool,
+    /// The job's private folder (incognito only), removed with the job.
+    pub scratch: Option<PathBuf>,
+    pub expires_at: Option<u64>,
+    /// Deleted while running: forget it as soon as it stops.
+    forget: bool,
 }
 
 impl Job {
@@ -81,6 +89,9 @@ impl Job {
             ("error", self.error.as_ref().map_or(Json::Null, Json::str)),
             ("residency", self.result.get("residency").cloned().unwrap_or(Json::Null)),
             ("seconds_taken", self.result.get("seconds").cloned().unwrap_or(Json::Null)),
+            ("seconds", if self.kind == Kind::Video { Json::Num(self.seconds) } else { Json::Null }),
+            // What a viewer needs to reproduce it; never paths or references.
+            ("settings", Json::obj(["seed", "steps", "memory", "cfg", "negative_prompt", "fps", "frames"].map(|k| (k, self.request.get(k).cloned().unwrap_or(Json::Null))))),
         ])
     }
 }
@@ -98,11 +109,19 @@ pub fn file_url(root: &Path, file: &Path) -> Option<String> {
 /// The file a `/files/...` path names, if it stays under `root` (links included).
 pub fn resolve_file(root: &Path, rel: &str) -> Option<PathBuf> {
     let rel = nrob::http::percent_decode(rel);
-    if rel.split(['/', '\\']).any(|p| p == ".." || p.contains(':')) {
+    // Plain names separated by `/` only. A backslash, drive or UNC prefix would
+    // make `join` replace the root (on Windows `\\\\host\\share` then opens over
+    // SMB and hands the machine's NTLM hash to that host) before any check runs.
+    let parts: Vec<&str> = rel.split('/').filter(|p| !p.is_empty()).collect();
+    if parts.is_empty() || parts.iter().any(|p| matches!(*p, "." | "..") || p.contains(['\\', ':', '\0'])) {
         return None;
     }
     let root = root.canonicalize().ok()?;
-    let path = root.join(rel.trim_start_matches('/')).canonicalize().ok()?;
+    let mut joined = root.clone();
+    for p in &parts {
+        joined.push(p);
+    }
+    let path = joined.canonicalize().ok()?;
     (path.starts_with(&root) && path.is_file()).then_some(path)
 }
 
@@ -485,7 +504,10 @@ pub fn video_request(cfg: &Json, root: &Path, output_root: &Path, body: &Json, a
         }
     }
     if body.get("prompt_cache").and_then(Json::as_bool).unwrap_or(true) {
-        f.push(("cache_dir".into(), Json::str(output_root.join(".ltx-prompt-cache").to_string_lossy())));
+        // Incognito jobs build under `.incognito/`: no prompt cache for them.
+        if !output_root.components().any(|c| c.as_os_str() == ".incognito") {
+            f.push(("cache_dir".into(), Json::str(output_root.join(".ltx-prompt-cache").to_string_lossy())));
+        }
     }
     let mut memory = residency(body, section, model)?;
     // The video worker reads vram_gb as a cap it lowers to what is free.
@@ -549,7 +571,8 @@ impl Media {
     }
 
     /// Queue a prepared job; returns its id.
-    pub fn submit(&self, kind: Kind, request: Json, model: String, size: String, n: usize, seconds: f64, keep: usize) -> Job {
+    #[allow(clippy::too_many_arguments)]
+    pub fn submit(&self, kind: Kind, request: Json, model: String, size: String, n: usize, seconds: f64, keep: usize, scratch: Option<PathBuf>) -> Job {
         let prompt = str_or(&request, "prompt", "").to_string();
         let job = Job {
             id: random_id(if kind == Kind::Image { "img_" } else { "video_" }),
@@ -570,11 +593,18 @@ impl Media {
             preview: None,
             error: None,
             cancel: Arc::new(AtomicBool::new(false)),
+            incognito: scratch.is_some(),
+            scratch,
+            expires_at: None,
+            forget: false,
         };
         let mut jobs = self.lock();
         // Forget the oldest finished jobs beyond `keep` (their files stay on disk).
+        // Not ones that just finished: a synchronous request may still be about
+        // to read its result. Incognito jobs expire on their own.
+        let settled = |j: &Job| j.finished() && !j.incognito && j.completed_at.is_some_and(|t| now().saturating_sub(t) > 120);
         while jobs.len() >= keep.max(1) {
-            match jobs.iter().position(Job::finished) {
+            match jobs.iter().position(settled) {
                 Some(i) => {
                     jobs.remove(i);
                 }
@@ -591,21 +621,63 @@ impl Media {
         self.lock().iter().find(|j| j.id == id).cloned()
     }
 
+    /// Jobs for lists and the gallery: incognito ones never appear.
     pub fn list(&self) -> Vec<Job> {
-        self.lock().iter().rev().cloned().collect()
+        self.lock().iter().rev().filter(|j| !j.incognito).cloned().collect()
+    }
+
+    /// Chat requests holding the LLM right now.
+    pub fn chats_active(&self) -> usize {
+        self.broker.lock().unwrap_or_else(|p| p.into_inner()).chats
+    }
+
+    /// Remove a job and, for incognito ones, everything it wrote.
+    pub fn purge(&self, id: &str) {
+        let gone: Vec<Job> = {
+            let mut jobs = self.lock();
+            let (gone, keep): (Vec<Job>, Vec<Job>) = jobs.drain(..).partition(|j| j.id == id);
+            jobs.extend(keep);
+            gone
+        };
+        for job in gone {
+            if let Some(dir) = &job.scratch {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+        }
+    }
+
+    /// Delete incognito jobs past their expiry, and `forget`-marked ones that
+    /// have finished. Call periodically.
+    pub fn sweep(&self) {
+        let due: Vec<String> = self
+            .lock()
+            .iter()
+            .filter(|j| j.finished() && (j.forget || j.expires_at.is_some_and(|t| now() >= t)))
+            .map(|j| j.id.clone())
+            .collect();
+        for id in due {
+            self.purge(&id);
+        }
     }
 
     pub fn busy(&self) -> bool {
         self.lock().iter().any(|j| !j.finished())
     }
 
-    /// Forget a finished job (its files stay); cancel it first if it runs.
+    /// Forget a job (its files stay, unless incognito). A running one is
+    /// cancelled and forgotten once it stops.
     pub fn remove(&self, id: &str) -> bool {
         self.cancel(id);
-        let mut jobs = self.lock();
-        let before = jobs.len();
-        jobs.retain(|j| !(j.id == id && j.finished()));
-        before != jobs.len()
+        let finished = {
+            let mut jobs = self.lock();
+            let Some(j) = jobs.iter_mut().find(|j| j.id == id) else { return false };
+            j.forget = true;
+            j.finished()
+        };
+        if finished {
+            self.purge(id);
+        }
+        true
     }
 
     pub fn cancel(&self, id: &str) -> bool {
@@ -621,6 +693,9 @@ impl Media {
             j.completed_at = Some(now());
         }
         self.changed.notify_all();
+        // The runner re-checks the queue: if this was the last job, the LLM it
+        // paused comes back.
+        self.queue_signal.notify_all();
         true
     }
 
@@ -674,6 +749,15 @@ impl Media {
                         j.stage = "starting".into();
                         break j.clone();
                     }
+                    // Nothing queued: bring back an LLM that media paused. Here
+                    // rather than after each job, so a batch does not reload it
+                    // between jobs, and a cancelled last job still resumes it.
+                    if studio.llm.paused() {
+                        drop(jobs);
+                        self.resume_llm(studio);
+                        jobs = self.lock();
+                        continue;
+                    }
                     jobs = self.queue_signal.wait(jobs).unwrap_or_else(|p| p.into_inner());
                 }
             };
@@ -682,6 +766,10 @@ impl Media {
             let cancelled = next.cancel.load(Ordering::Relaxed);
             self.update(&next.id, |j| {
                 j.completed_at = Some(now());
+                if j.incognito {
+                    // Delivered and deleted on read, or deleted when this passes.
+                    j.expires_at = Some(now() + if j.kind == Kind::Video { 30 * 60 } else { 10 * 60 });
+                }
                 match outcome {
                     Ok(result) => {
                         j.status = "completed".into();
@@ -705,6 +793,18 @@ impl Media {
                     }
                 }
             });
+            self.sweep();
+        }
+    }
+
+    fn resume_llm(&self, studio: &crate::Studio) {
+        studio.llm.set_paused(false);
+        let cfg = studio.config();
+        if cfg.get("media").is_none_or(|m| bool_or(m, "resume_llm", true)) {
+            self.log.push("restarting the LLM after media jobs");
+            if let Err(e) = studio.llm.start(&cfg, &studio.root) {
+                self.log.push(format!("LLM restart failed: {e}"));
+            }
         }
     }
 
@@ -717,8 +817,16 @@ impl Media {
             let mut b = self.broker.lock().unwrap_or_else(|p| p.into_inner());
             if pause {
                 b.waiting_media = true;
+                // Chats finish, or their streams time out on a client that
+                // stopped reading; either way, not forever.
+                let deadline = std::time::Instant::now() + Duration::from_secs(10 * 60);
                 while b.chats > 0 {
-                    b = self.broker_changed.wait(b).unwrap_or_else(|p| p.into_inner());
+                    let left = deadline.saturating_duration_since(std::time::Instant::now());
+                    if left.is_zero() {
+                        self.log.push("chat requests still running after 10 minutes; starting the media job anyway");
+                        break;
+                    }
+                    b = self.broker_changed.wait_timeout(b, left).unwrap_or_else(|p| p.into_inner()).0;
                 }
             }
             b.media = pause;
@@ -726,7 +834,7 @@ impl Media {
         }
         let paused_llm = pause && studio.llm.is_running();
         if paused_llm {
-            self.log.push(format!("{}: stopping the LLM to free GPU {device}", job.id));
+            self.log.push(format!("stopping the LLM to free GPU {device} for a media job"));
             studio.llm.stop();
             studio.llm.set_paused(true);
         }
@@ -735,17 +843,6 @@ impl Media {
             let mut b = self.broker.lock().unwrap_or_else(|p| p.into_inner());
             b.media = false;
             self.broker_changed.notify_all();
-        }
-        // Resume after the queue drains, so a batch of jobs does not reload the LLM between them.
-        let more = self.lock().iter().any(|j| j.status == "queued");
-        if studio.llm.paused() && !more {
-            studio.llm.set_paused(false);
-            if bool_or(&media, "resume_llm", true) {
-                self.log.push("restarting the LLM after media jobs");
-                if let Err(e) = studio.llm.start(&cfg, &studio.root) {
-                    self.log.push(format!("LLM restart failed: {e}"));
-                }
-            }
         }
         result
     }
@@ -768,7 +865,12 @@ impl Media {
             use std::os::windows::process::CommandExt;
             command.creation_flags(0x0800_0000);
         }
-        self.log.push(format!("{}: {} job on GPU {} ({} {})", job.id, job.kind.name(), int_or(&job.request, "device", 0), job.model, str_or(&job.request, "memory", "auto")));
+        let label = if job.incognito { "incognito job".to_string() } else { job.id.clone() };
+        if job.incognito {
+            self.log.push(format!("incognito {} job on GPU {}", job.kind.name(), int_or(&job.request, "device", 0)));
+        } else {
+            self.log.push(format!("{}: {} job on GPU {} ({} {})", job.id, job.kind.name(), int_or(&job.request, "device", 0), job.model, str_or(&job.request, "memory", "auto")));
+        }
         let mut child = command.spawn().map_err(|e| format!("could not start {}: {e} (is nrob-diffusion built with --features flash-attn? set media.worker)", program.display()))?;
         let payload = job.request.to_json();
         let sent = child.stdin.take().ok_or("worker stdin missing".to_string()).and_then(|mut s| s.write_all(payload.as_bytes()).map_err(|e| e.to_string()));
@@ -783,7 +885,7 @@ impl Media {
             let mut b = Vec::new();
             stdout.take(8 << 20).read_to_end(&mut b).map(|_| b)
         });
-        let (id, kind, n) = (job.id.clone(), job.kind, job.n);
+        let (id, kind, n, incognito) = (job.id.clone(), job.kind, job.n, job.incognito);
         let errors = std::thread::scope(|s| {
             let events = s.spawn(|| {
                 let mut last_error = None;
@@ -800,7 +902,7 @@ impl Media {
                             });
                         }
                     } else {
-                        self.log.push(format!("{id}: {line}"));
+                        if !incognito { self.log.push(format!("{id}: {line}")); }
                     }
                     tail = line.chars().take(4096).collect();
                 }
@@ -828,11 +930,11 @@ impl Media {
         let status = status?;
         let bytes = output.join().map_err(|_| "worker output reader failed")?.map_err(|e| e.to_string())?;
         if !status.success() {
-            self.log.push(format!("{}: worker failed: {tail}", job.id));
+            self.log.push(format!("{label}: worker failed{}", if job.incognito { String::new() } else { format!(": {tail}") }));
             return Err(if tail.is_empty() { format!("worker exited {status}") } else { tail });
         }
         let result = Json::parse(&bytes).map_err(|e| format!("invalid worker result: {e}"))?;
-        self.log.push(format!("{}: done in {:.1}s", job.id, num_or(&result, "seconds", 0.0)));
+        self.log.push(format!("{label}: done in {:.1}s", num_or(&result, "seconds", 0.0)));
         Ok(result)
     }
 }
@@ -961,15 +1063,42 @@ mod tests {
     #[test]
     fn jobs_queue_cancel_and_trim_to_the_kept_count() {
         let m = Media::new();
-        let a = m.submit(Kind::Image, body(r#"{"prompt":"a"}"#), "qwen".into(), "1x1".into(), 1, 0.0, 2);
+        let a = m.submit(Kind::Image, body(r#"{"prompt":"a"}"#), "qwen".into(), "1x1".into(), 1, 0.0, 2, None);
         assert!(m.busy());
         assert!(m.cancel(&a.id));
         assert_eq!(m.get(&a.id).unwrap().status, "cancelled");
-        m.submit(Kind::Image, body(r#"{"prompt":"b"}"#), "qwen".into(), "1x1".into(), 1, 0.0, 2);
-        m.submit(Kind::Video, body(r#"{"prompt":"c"}"#), "v".into(), "1x1".into(), 1, 1.0, 2);
-        assert!(m.get(&a.id).is_none(), "the finished job made room");
+        m.submit(Kind::Image, body(r#"{"prompt":"b"}"#), "qwen".into(), "1x1".into(), 1, 0.0, 2, None);
+        // Just finished: a synchronous caller may still be reading it, so it stays.
+        assert!(m.get(&a.id).is_some());
+        m.update(&a.id, |j| j.completed_at = Some(0));
+        m.submit(Kind::Video, body(r#"{"prompt":"c"}"#), "v".into(), "1x1".into(), 1, 1.0, 2, None);
+        assert!(m.get(&a.id).is_none(), "a settled finished job made room");
         assert_eq!(m.list().len(), 2);
         assert_eq!(m.wait("missing", Duration::ZERO).map(|j| j.id), None);
+    }
+
+    #[test]
+    fn incognito_jobs_stay_out_of_lists_and_leave_nothing_behind() {
+        let m = Media::new();
+        let dir = std::env::temp_dir().join(format!("nrob-studio-incognito-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("images")).unwrap();
+        std::fs::write(dir.join("images").join("a.png"), b"x").unwrap();
+        let job = m.submit(Kind::Image, body(r#"{"prompt":"secret"}"#), "qwen".into(), "1x1".into(), 1, 0.0, 10, Some(dir.clone()));
+        assert!(job.incognito);
+        assert!(m.list().is_empty(), "incognito jobs are not listed");
+        assert!(m.get(&job.id).is_some(), "but their owner can poll them by id");
+        m.cancel(&job.id);
+        m.update(&job.id, |j| j.expires_at = Some(0));
+        m.sweep();
+        assert!(m.get(&job.id).is_none());
+        assert!(!dir.exists(), "its folder is gone");
+        // Deleting a running job forgets it once it stops.
+        let run = m.submit(Kind::Image, body(r#"{"prompt":"x"}"#), "qwen".into(), "1x1".into(), 1, 0.0, 10, None);
+        m.update(&run.id, |j| j.status = "in_progress".into());
+        assert!(m.remove(&run.id));
+        m.update(&run.id, |j| j.status = "cancelled".into());
+        m.sweep();
+        assert!(m.get(&run.id).is_none());
     }
 
     #[test]

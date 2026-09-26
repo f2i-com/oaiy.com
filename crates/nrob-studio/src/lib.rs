@@ -17,6 +17,7 @@
 mod admin;
 mod config;
 mod detect;
+mod discovery;
 mod gateway;
 mod llm;
 mod media;
@@ -60,6 +61,10 @@ pub struct Studio {
     gateway_url: RwLock<String>,
     /// Listener settings changed; they apply at the next start.
     restart_required: RwLock<bool>,
+    /// One save at a time, so the file and memory never disagree.
+    saving: std::sync::Mutex<()>,
+    /// `--ui-port` / `--port`: in effect, never written to the file.
+    port_overrides: (Option<u16>, Option<u16>),
 }
 
 impl Studio {
@@ -75,10 +80,23 @@ impl Studio {
     /// Validate, save and apply a new configuration. A running LLM restarts when
     /// its settings changed; listener changes wait for the next start.
     pub fn set_config(&self, mut next: Json) -> Result<Json, String> {
+        let _one = self.saving.lock().unwrap_or_else(|p| p.into_inner());
         config::merge_defaults(&mut next, &config::default_json());
         config::validate(&next)?;
         let before = self.config();
-        config::save(&self.config_path, &next)?;
+        // Command-line ports stay command-line ports: the file keeps its own.
+        let mut on_disk = next.clone();
+        if let Ok(file) = config::load(&self.config_path) {
+            for (section, over) in [("ui", self.port_overrides.0), ("gateway", self.port_overrides.1)] {
+                let same = next.get(section).and_then(|s| s.get("port")).and_then(Json::as_i64) == over.map(i64::from);
+                if let (true, Some(Json::Obj(fields)), Some(p)) = (same && over.is_some(), on_disk.get(section).cloned(), file.get(section).and_then(|s| s.get("port")).cloned()) {
+                    let mut s = Json::Obj(fields);
+                    util::set(&mut s, "port", p);
+                    util::set(&mut on_disk, section, s);
+                }
+            }
+        }
+        config::save(&self.config_path, &on_disk)?;
         *self.config.write().unwrap_or_else(|p| p.into_inner()) = next.clone();
         let listeners = |v: &Json| {
             ["ui", "gateway"].map(|k| v.get(k).map(|s| (str_or(s, "host", "").to_string(), int_or(s, "port", 0))))
@@ -92,14 +110,18 @@ impl Studio {
             let llm = v.get("llm").cloned().unwrap_or(Json::Null);
             let args = llm::arguments(&llm, &self.root, 0, "", true).map(|(a, _)| a).unwrap_or_default();
             let backend = ["server", "server_webgpu", "backend"].map(|k| str_or(&llm, k, "").to_string());
-            (args, backend, llm.get("webgpu_gb").cloned(), bool_or(&llm, "enabled", true))
+            let incognito = v.get("privacy").is_some_and(|p| bool_or(p, "incognito", false));
+            (args, backend, llm.get("webgpu_gb").cloned(), bool_or(&llm, "enabled", true), incognito)
         };
         let llm_changed = launch(&before) != launch(&next);
         if llm_changed && self.llm.is_running() {
             self.log.push("LLM settings changed: restarting nrob-server");
             self.llm.stop();
             if bool_or(next.get("llm").unwrap_or(&Json::Null), "enabled", true) {
-                self.llm.start(&next, &self.root)?;
+                // Saved either way; a failed restart is reported, not a failed save.
+                if let Err(e) = self.llm.start(&next, &self.root) {
+                    self.log.push(format!("the LLM did not restart: {e}"));
+                }
             }
         }
         self.log.push("configuration saved");
@@ -257,13 +279,34 @@ fn public(studio: &Arc<Studio>, req: &nrob::http::Request, w: &mut std::net::Tcp
     let cfg = studio.config();
     let gateway = cfg.get("gateway").cloned().unwrap_or(Json::Null);
     let routes = gateway.get("routes").and_then(Json::as_array).map(<[Json]>::to_vec).unwrap_or_default();
+    let key = str_or(&gateway, "api_key", "").to_string();
+    let keyed = |req: &nrob::http::Request| key.is_empty() || req.header("authorization").and_then(|v| v.strip_prefix("Bearer ")).map(str::trim) == Some(key.as_str());
+    // A web page the user happens to visit can reach 127.0.0.1 too. Without a
+    // key, browser requests (they carry Origin) are served only to the origins
+    // listed in gateway.cors_origins; apps and scripts send no Origin.
+    if key.is_empty() {
+        if let Some(origin) = req.header("origin") {
+            let allowed = gateway.get("cors_origins").and_then(Json::as_array).unwrap_or(&[]).iter().filter_map(Json::as_str)
+                .any(|o| o == "*" || o.trim_end_matches('/').eq_ignore_ascii_case(origin));
+            if !allowed {
+                return gateway::json_reply(w, 403, &util::error_json(&format!("requests from {origin} are not allowed; add it to gateway.cors_origins, or set an API key"), "permission_error", "origin_not_allowed"));
+            }
+        }
+    }
+    // Discovery answers without the key too, saying only that one is needed.
+    if req.method == "GET" && req.route() == "/.well-known/nrob.json" {
+        return gateway::json_reply(w, 200, &discovery::document(studio, &gateway::public_base(studio, req), keyed(req)));
+    }
     let Some(m) = gateway::route(&routes, &req.method, req.route()) else {
         if req.route() == "/" {
             return gateway::json_reply(w, 200, &gateway::health(studio));
         }
         return gateway::json_reply(w, 404, &util::error_json(&format!("no route {} {}", req.method, req.route()), "invalid_request_error", "not_found"));
     };
-    let key = str_or(&gateway, "api_key", "");
+    if m.target == "discovery" {
+        return gateway::json_reply(w, 200, &discovery::document(studio, &gateway::public_base(studio, req), keyed(req)));
+    }
+    let key = key.as_str();
     if !key.is_empty() && m.target != "health" {
         let given = req.header("authorization").and_then(|v| v.strip_prefix("Bearer ")).map(str::trim);
         // Browsers cannot set headers on <img>/<video>: file links may carry ?key=.
@@ -335,6 +378,8 @@ pub fn launch(args: &Args, quiet: bool) -> Result<Running, String> {
         ui_url: RwLock::new(String::new()),
         gateway_url: RwLock::new(String::new()),
         restart_required: RwLock::new(false),
+        saving: std::sync::Mutex::new(()),
+        port_overrides: (args.ui_port, args.port),
     });
     let ui = cfg.get("ui").cloned().unwrap_or(Json::Null);
     let gw = cfg.get("gateway").cloned().unwrap_or(Json::Null);
@@ -353,13 +398,31 @@ pub fn launch(args: &Args, quiet: bool) -> Result<Running, String> {
         media.run(&runner);
     }).map_err(|e| e.to_string())?;
     // Stop an idle LLM so its memory returns to the machine; the next request loads it again.
+    // Incognito folders left by a crash are gone before anything serves.
+    let _ = std::fs::remove_dir_all(studio.output_root().join(".incognito"));
     let idle = Arc::clone(&studio);
-    std::thread::spawn(move || loop {
-        std::thread::sleep(Duration::from_secs(30));
-        let minutes = idle.config().get("llm").map_or(0, |l| int_or(l, "idle_stop_minutes", 0));
-        if minutes > 0 && idle.llm.state() == llm::State::Ready && idle.llm.idle_for() > Duration::from_secs(minutes as u64 * 60) {
-            idle.log.push(format!("LLM idle for {minutes} min: stopping it to free memory"));
-            idle.llm.stop();
+    std::thread::spawn(move || {
+        let mut ticks = 0u64;
+        loop {
+            std::thread::sleep(Duration::from_secs(30));
+            ticks += 1;
+            idle.media.sweep();
+            let minutes = idle.config().get("llm").map_or(0, |l| int_or(l, "idle_stop_minutes", 0));
+            // Never mid-reply: a long stream updates nothing until it ends.
+            if minutes > 0 && idle.media.chats_active() == 0 && idle.llm.state() == llm::State::Ready && idle.llm.idle_for() > Duration::from_secs(minutes as u64 * 60) {
+                idle.log.push(format!("LLM idle for {minutes} min: stopping it to free memory"));
+                idle.llm.stop();
+            }
+            // Hourly: uploaded reference images older than a day.
+            if ticks % 120 == 1 {
+                let inputs = idle.output_root().join("inputs");
+                for entry in std::fs::read_dir(&inputs).into_iter().flatten().flatten() {
+                    let old = entry.metadata().and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|age| age > Duration::from_secs(86_400));
+                    if old {
+                        let _ = std::fs::remove_file(entry.path());
+                    }
+                }
+            }
         }
     });
     serve(ui_listener, Arc::clone(&studio), true);

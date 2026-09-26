@@ -77,7 +77,7 @@ pub fn handle(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, port: u16)
         return Ok(true);
     }
     if let Some(rel) = route.strip_prefix("/files/") {
-        return gateway::files(studio, w, rel);
+        return gateway::files(studio, req, w, rel);
     }
     if let Some(rest) = route.strip_prefix("/api/play/") {
         // The playground: every target, no key, local references allowed.
@@ -89,8 +89,18 @@ pub fn handle(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, port: u16)
         let m = Matched { target: target.into(), spec: "openai".into(), rest: sub };
         return gateway::handle(studio, req, w, m, true);
     }
+    if method == "GET" && route == "/api/models/export" {
+        let file = registry::export(&cfg, &studio.root);
+        let body = config::pretty(&file, 0);
+        nrob::http::respond_with(w, 200, "application/json", &[("Content-Disposition", "attachment; filename=\"nrob-models.json\"")], body.as_bytes(), true)?;
+        return Ok(true);
+    }
     let result: Result<Json, (u16, String)> = match (method, route.as_str()) {
         ("GET", "/api/state") => Ok(studio.state()),
+        ("GET", "/api/discovery") => {
+            let base = studio.state().get("gateway_url").and_then(Json::as_str).unwrap_or("").to_string();
+            Ok(crate::discovery::document(studio, &base, true))
+        }
         ("GET", "/api/config") => Ok(cfg.clone()),
         ("PUT" | "POST", "/api/config") => body(req).map_err(|e| (400, e)).and_then(|v| studio.set_config(v).map_err(|e| (400, e))),
         ("POST", "/api/config/reset-routes") => {
@@ -102,6 +112,10 @@ pub fn handle(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, port: u16)
                 crate::util::set(&mut next, "gateway", g);
             }
             studio.set_config(next).map_err(|e| (400, e))
+        }
+        ("GET", "/api/jobs") => {
+            let root = studio.output_root();
+            Ok(Json::obj([("jobs", Json::Arr(studio.media.list().iter().map(|j| j.to_json(&root)).collect()))]))
         }
         ("GET", "/api/system") => Ok(Json::obj([("gpus", studio.system.gpus()), ("ram", studio.system.ram())])),
         ("GET", "/api/logs") => {
@@ -146,17 +160,25 @@ pub fn handle(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, port: u16)
                 ("detected", detected.to_json()),
             ]))
         }),
+        ("POST", "/api/models/import") => body(req).map_err(|e| (400, e)).and_then(|doc| {
+            let replace = req.query("mode").as_deref() == Some("replace");
+            let mut next = cfg.clone();
+            let report = registry::import(&mut next, &doc, replace).map_err(|e| (400, e))?;
+            studio.set_config(next).map_err(|e| (400, e))?;
+            studio.log.push(format!("imported models ({})", if replace { "replaced" } else { "merged" }));
+            Ok(report)
+        }),
         ("POST", "/api/models/remove") => body(req).map_err(|e| (400, e)).and_then(|b| {
             let mut next = cfg.clone();
             remove_model(&mut next, str_or(&b, "section", ""), str_or(&b, "name", "")).map_err(|e| (400, e))?;
             studio.set_config(next).map_err(|e| (400, e))
         }),
-        ("POST", r) if r.starts_with("/api/jobs/") && r.ends_with("/cancel") => {
-            let id = &r["/api/jobs/".len()..r.len() - "/cancel".len()];
+        ("POST", r) if r.strip_prefix("/api/jobs/").and_then(|x| x.strip_suffix("/cancel")).is_some_and(|id| !id.is_empty()) => {
+            let id = r.strip_prefix("/api/jobs/").and_then(|x| x.strip_suffix("/cancel")).unwrap_or_default();
             Ok(Json::obj([("cancelled", Json::Bool(studio.media.cancel(id)))]))
         }
-        ("DELETE", r) if r.starts_with("/api/jobs/") => {
-            let id = &r["/api/jobs/".len()..];
+        ("DELETE", r) if r.strip_prefix("/api/jobs/").is_some_and(|id| !id.is_empty() && !id.contains('/')) => {
+            let id = r.strip_prefix("/api/jobs/").unwrap_or_default();
             Ok(Json::obj([("removed", Json::Bool(studio.media.remove(id)))]))
         }
         ("POST", "/api/open-outputs") => {

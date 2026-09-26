@@ -177,7 +177,10 @@ pub fn arguments(llm: &Json, root: &Path, port: u16, key: &str, local_images: bo
     let cores = std::thread::available_parallelism().map_or(8, |n| n.get()) as i64;
     push("--cpu-threads", llm.get("cpu_threads").and_then(Json::as_i64).unwrap_or(cores).to_string());
     push("--vram-headroom-gb", num_or(llm, "vram_headroom_gb", 2.0).to_string());
-    push("--local-images", if local_images { "on" } else { "off" }.into());
+    // Off whatever the host: anything that can reach the gateway (a web page
+    // included) could otherwise have the vision model read this machine's files.
+    let _ = local_images;
+    push("--local-images", "off".into());
     if int_or(llm, "ram_gb", 0) > 0 {
         push("--ram-gb", int_or(llm, "ram_gb", 0).to_string());
     }
@@ -273,6 +276,12 @@ impl Llm {
         if !bool_or(llm, "enabled", true) {
             return Err("the LLM is disabled in the configuration".into());
         }
+        if self.is_running() {
+            return Ok(());
+        }
+        // Probed before taking the lock: nvidia-smi can take a second, and the
+        // UI's status reads wait on this lock.
+        let mut plan = launches(llm, root, nvidia_present());
         let mut g = self.lock();
         if matches!(g.state, State::Starting | State::Ready) {
             return Ok(());
@@ -286,7 +295,10 @@ impl Llm {
             args.push("--webgpu-gb".into());
             args.push(gb.to_string());
         }
-        let mut plan = launches(llm, root, nvidia_present());
+        if cfg.get("privacy").is_some_and(|p| bool_or(p, "incognito", false)) {
+            // No prompt states on disk, no request log, each request forgotten.
+            args.push("--incognito".into());
+        }
         let mut errors = Vec::new();
         let mut child = loop {
             if plan.is_empty() {
@@ -370,7 +382,8 @@ impl Llm {
                     g.lifeline = None;
                     // Died while loading with another launch to try: e.g. the CUDA
                     // build on a machine whose driver it cannot load.
-                    if g.state == State::Starting && !g.fallbacks.is_empty() {
+                    let mut relaunched = false;
+                    while g.state == State::Starting && !g.fallbacks.is_empty() && !relaunched {
                         let next = g.fallbacks.remove(0);
                         self.log.push(format!("studio: nrob-server exited ({status}) while loading; trying {}", next.program.display()));
                         if let Some((args, key, root)) = g.relaunch.clone() {
@@ -379,9 +392,12 @@ impl Llm {
                                 g.child = Some(child);
                                 g.command = shown;
                                 g.started = Some(Instant::now());
-                                continue;
+                                relaunched = true;
                             }
                         }
+                    }
+                    if relaunched {
+                        continue;
                     }
                     g.state = State::Failed;
                     let tail = self.log.tail(12);
@@ -494,7 +510,7 @@ mod tests {
         assert!(joined.starts_with("--model C:/abs/b.gguf --name b --also a="), "{joined}");
         assert!(joined.contains(&format!("a={}", root.join("models/a.gguf").display())));
         assert!(joined.contains("--vision-projector b="));
-        for flag in ["--port 9000", "--api-key secret", "--ctx 4096", "--devices 1", "--thinking", "--no-vision", "--local-images on", "--quiet"] {
+        for flag in ["--port 9000", "--api-key secret", "--ctx 4096", "--devices 1", "--thinking", "--no-vision", "--local-images off", "--quiet"] {
             assert!(joined.contains(flag), "{flag} missing from {joined}");
         }
         assert!(!joined.contains("--prompt-cache"));

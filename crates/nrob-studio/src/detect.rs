@@ -191,7 +191,8 @@ fn read_gguf(path: &Path, max_tensors: usize) -> Result<Gguf, String> {
                     }
                 } else {
                     let s = size(item).ok_or_else(|| bad("nested GGUF arrays are not expected in metadata"))?;
-                    r.seek_relative(s * n as i64).map_err(|e| bad(&e.to_string()))?;
+                    let skip = i64::try_from(n).ok().and_then(|n| n.checked_mul(s)).ok_or_else(|| bad("implausible GGUF array"))?;
+                    r.seek_relative(skip).map_err(|e| bad(&e.to_string()))?;
                 }
                 Json::obj([("array_len", Json::Int(n as i64))])
             }

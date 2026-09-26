@@ -20,6 +20,7 @@ use nrob::http::{fetch, respond, respond_with, Request, Stream};
 use nrob::json::Json;
 use std::io;
 use std::net::TcpStream;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -115,9 +116,22 @@ pub fn handle(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, m: Matched
         ("completions", _) => proxy(studio, req, w, "/v1/completions"),
         ("models", _) => models(studio, req, w),
         ("health", _) => json_reply(w, 200, &health(studio)),
-        ("files", _) => files(studio, w, m.rest.trim_start_matches('/')),
-        ("images", "openai") if m.rest.is_empty() => send(w, parse_body(req).and_then(|b| images_openai(studio, req, b, trusted))),
-        ("edits", _) if m.rest.is_empty() => send(w, edit_body(studio, req).and_then(|b| images_openai(studio, req, b, trusted))),
+        ("discovery", _) => json_reply(w, 200, &crate::discovery::document(studio, &public_base(studio, req), true)),
+        ("files", _) => files(studio, req, w, m.rest.trim_start_matches('/')),
+        ("images", "openai") if m.rest.is_empty() => send(w, parse_body(req).and_then(|b| {
+            let scratch = scratch_for(studio, req, Some(&b));
+            images_openai(studio, req, b, trusted, scratch)
+        })),
+        ("edits", _) if m.rest.is_empty() => {
+            // Multipart bodies carry the flag as a field, so the header or the
+            // global mode decides where uploads land; JSON bodies may set it too.
+            let json = if multipart(req) { None } else { Json::parse(&req.body).ok() };
+            let scratch = scratch_for(studio, req, json.as_ref());
+            send(w, edit_body(studio, req, scratch.as_deref()).and_then(|b| {
+                let scratch = scratch.or_else(|| scratch_for(studio, req, Some(&b)));
+                images_openai(studio, req, b, trusted, scratch)
+            }))
+        }
         ("images", "nrob") | ("videos", "nrob") => {
             let kind = if m.target == "images" { Kind::Image } else { Kind::Video };
             send(w, nrob_jobs(studio, req, kind, &m.rest, trusted))
@@ -155,6 +169,9 @@ fn proxy(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, upstream: &str)
     let mut headers = vec![("Authorization", auth.as_str()), ("Content-Type", ctype.as_str())];
     if let Some(a) = req.header("accept") {
         headers.push(("Accept", a));
+    }
+    if incognito_mode(studio) || req.header("x-nrob-incognito").is_some() {
+        headers.push(("X-NROB-Incognito", "1"));
     }
     let response = match fetch(&endpoint.addr, &req.method, upstream, &headers, &req.body, UPSTREAM_READ) {
         Ok(r) => r,
@@ -239,25 +256,77 @@ fn content_type(path: &std::path::Path) -> &'static str {
     }
 }
 
-pub fn serve_file(w: &mut TcpStream, path: &std::path::Path, download: bool) -> io::Result<bool> {
-    let bytes = std::fs::read(path)?;
-    let name = path.file_name().map(|n| n.to_string_lossy().replace('"', "")).unwrap_or_default();
+/// `bytes=a-b`, `bytes=a-` or `bytes=-n` against a file of `len` bytes, as
+/// `(start, end_inclusive)`; `None` when unsatisfiable or not one range.
+fn byte_range(header: &str, len: u64) -> Option<(u64, u64)> {
+    let spec = header.trim().strip_prefix("bytes=")?;
+    if spec.contains(',') || len == 0 {
+        return None;
+    }
+    let (a, b) = spec.split_once('-')?;
+    let (start, end) = match (a.trim(), b.trim()) {
+        ("", n) => (len.saturating_sub(n.parse().ok()?), len - 1),
+        (a, "") => (a.parse().ok()?, len - 1),
+        (a, b) => (a.parse().ok()?, b.parse::<u64>().ok()?.min(len - 1)),
+    };
+    (start <= end && start < len).then_some((start, end))
+}
+
+/// A file, copied in pieces rather than read whole, with `Range` support so
+/// players can seek in videos.
+pub fn serve_file(w: &mut TcpStream, path: &std::path::Path, download: bool, range: Option<&str>) -> io::Result<bool> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path)?;
+    let len = file.metadata()?.len();
+    let name = path.file_name().map(|n| n.to_string_lossy().replace(['"', '\r', '\n'], "")).unwrap_or_default();
     let disposition = format!("{}; filename=\"{name}\"", if download { "attachment" } else { "inline" });
-    respond_with(w, 200, content_type(path), &[("Content-Disposition", &disposition), ("Cache-Control", "max-age=3600")], &bytes, true)?;
+    let mut extra = vec![("Content-Disposition", disposition), ("Cache-Control", "max-age=3600".into()), ("Accept-Ranges", "bytes".into())];
+    let (status, start, count) = match range.map(|r| byte_range(r, len)) {
+        None => (200, 0, len),
+        Some(Some((a, b))) => {
+            extra.push(("Content-Range", format!("bytes {a}-{b}/{len}")));
+            (206, a, b - a + 1)
+        }
+        Some(None) => {
+            let head = [("Content-Range", format!("bytes */{len}"))];
+            let head: Vec<(&str, &str)> = head.iter().map(|(k, v)| (*k, v.as_str())).collect();
+            respond_with(w, 416, "text/plain", &head, b"", true)?;
+            return Ok(true);
+        }
+    };
+    let extra: Vec<(&str, &str)> = extra.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    nrob::http::respond_head(w, status, content_type(path), &extra, count, true)?;
+    file.seek(SeekFrom::Start(start))?;
+    io::copy(&mut file.take(count), w)?;
+    io::Write::flush(w)?;
     Ok(true)
 }
 
-pub fn files(studio: &Studio, w: &mut TcpStream, rel: &str) -> io::Result<bool> {
+pub fn files(studio: &Studio, req: &Request, w: &mut TcpStream, rel: &str) -> io::Result<bool> {
     match media::resolve_file(&studio.output_root(), rel) {
-        Some(p) => serve_file(w, &p, false),
+        Some(p) => serve_file(w, &p, false, req.header("range")),
         None => send(w, Err(fail(404, "no such file"))),
     }
+}
+
+/// Whether the studio runs in incognito mode (`privacy.incognito`).
+pub fn incognito_mode(studio: &Studio) -> bool {
+    studio.config().get("privacy").is_some_and(|p| bool_or(p, "incognito", false))
+}
+
+/// For an incognito request (global mode, `X-NROB-Incognito: 1`, or
+/// `"incognito": true`), a private folder its job writes everything into and
+/// that is deleted with it; `None` otherwise.
+fn scratch_for(studio: &Studio, req: &Request, body: Option<&Json>) -> Option<PathBuf> {
+    let asked = req.header("x-nrob-incognito").is_some_and(|v| matches!(v.trim(), "1" | "true" | "yes"))
+        || body.and_then(|b| b.get("incognito")).and_then(Json::as_bool) == Some(true);
+    (incognito_mode(studio) || asked).then(|| studio.output_root().join(".incognito").join(crate::util::random_id("")))
 }
 
 /// An edit request as the JSON an image job takes. Multipart files are saved
 /// under the output root and passed by path; text fields become strings or
 /// numbers. Files can arrive only as files: a text field cannot name a path.
-fn edit_body(studio: &Studio, req: &Request) -> Result<Json, Reply> {
+fn edit_body(studio: &Studio, req: &Request, scratch: Option<&std::path::Path>) -> Result<Json, Reply> {
     if req.method != "POST" {
         return Err(fail(405, "use POST"));
     }
@@ -265,7 +334,7 @@ fn edit_body(studio: &Studio, req: &Request) -> Result<Json, Reply> {
     let ctype = req.header("content-type").unwrap_or("");
     let body = if multipart(req) {
         let parts = crate::multipart::parse(ctype, &req.body).map_err(|e| fail(400, e))?;
-        let dir = studio.output_root().join("inputs");
+        let dir = scratch.map_or_else(|| studio.output_root().join("inputs"), |s| s.join("inputs"));
         std::fs::create_dir_all(&dir).map_err(|e| fail(500, e.to_string()))?;
         let mut fields: Vec<(String, Json)> = Vec::new();
         let mut images = Vec::new();
@@ -324,7 +393,7 @@ fn multipart(req: &Request) -> bool {
 }
 
 /// OpenAI Images: generate, wait, and answer with base64 PNGs or URLs.
-fn images_openai(studio: &Arc<Studio>, req: &Request, body: Json, trusted: bool) -> Result<Reply, Reply> {
+fn images_openai(studio: &Arc<Studio>, req: &Request, body: Json, trusted: bool, scratch: Option<PathBuf>) -> Result<Reply, Reply> {
     if req.method != "POST" {
         return Err(fail(405, "use POST"));
     }
@@ -336,9 +405,12 @@ fn images_openai(studio: &Arc<Studio>, req: &Request, body: Json, trusted: bool)
     if body.get("output_format").and_then(Json::as_str).is_some_and(|f| f != "png") {
         return Err(fail(400, "output_format: this server writes png"));
     }
-    let job = submit_image(studio, &body, trusted || multipart(req))?;
+    let job = submit_image(studio, &body, trusted || multipart(req), scratch)?;
     let done = studio.media.wait(&job.id, IMAGE_WAIT).ok_or_else(|| fail(500, "the job disappeared"))?;
     if done.status != "completed" {
+        if done.incognito {
+            studio.media.purge(&done.id);
+        }
         return Err(fail(if done.status == "in_progress" { 504 } else { 500 }, done.error.unwrap_or_else(|| format!("image job {}", done.status))));
     }
     let root = studio.output_root();
@@ -354,6 +426,11 @@ fn images_openai(studio: &Arc<Studio>, req: &Request, body: Json, trusted: bool)
         };
         data.push(Json::obj([item, ("revised_prompt", Json::str(&done.prompt))]));
     }
+    // Incognito images returned inline exist nowhere else now; URLs stay
+    // fetchable until the job expires (ten minutes).
+    if done.incognito && format != "url" {
+        studio.media.purge(&done.id);
+    }
     ok(Json::obj([
         ("created", Json::Int(now() as i64)),
         ("data", Json::Arr(data)),
@@ -363,18 +440,30 @@ fn images_openai(studio: &Arc<Studio>, req: &Request, body: Json, trusted: bool)
     ]))
 }
 
-fn submit_image(studio: &Arc<Studio>, body: &Json, allow_local: bool) -> Result<Job, Reply> {
+fn submit_image(studio: &Arc<Studio>, body: &Json, allow_local: bool, scratch: Option<PathBuf>) -> Result<Job, Reply> {
     let cfg = studio.config();
-    let root = studio.output_root();
-    let (request, model, size, n) = media::image_request(&cfg, &studio.root, &root, body, allow_local).map_err(|e| fail(400, e))?;
-    Ok(studio.media.submit(Kind::Image, request, model, size, n, 0.0, keep_jobs(&cfg)))
+    let root = scratch.clone().unwrap_or_else(|| studio.output_root());
+    let prepared = media::image_request(&cfg, &studio.root, &root, body, allow_local);
+    let (request, model, size, n) = prepared.map_err(|e| {
+        if let Some(s) = &scratch {
+            let _ = std::fs::remove_dir_all(s);
+        }
+        fail(400, e)
+    })?;
+    Ok(studio.media.submit(Kind::Image, request, model, size, n, 0.0, keep_jobs(&cfg), scratch))
 }
 
-fn submit_video(studio: &Arc<Studio>, body: &Json, trusted: bool) -> Result<Job, Reply> {
+fn submit_video(studio: &Arc<Studio>, body: &Json, trusted: bool, scratch: Option<PathBuf>) -> Result<Job, Reply> {
     let cfg = studio.config();
-    let root = studio.output_root();
-    let (request, model, size, seconds) = media::video_request(&cfg, &studio.root, &root, body, trusted).map_err(|e| fail(400, e))?;
-    Ok(studio.media.submit(Kind::Video, request, model, size, 1, seconds, keep_jobs(&cfg)))
+    let root = scratch.clone().unwrap_or_else(|| studio.output_root());
+    let prepared = media::video_request(&cfg, &studio.root, &root, body, trusted);
+    let (request, model, size, seconds) = prepared.map_err(|e| {
+        if let Some(s) = &scratch {
+            let _ = std::fs::remove_dir_all(s);
+        }
+        fail(400, e)
+    })?;
+    Ok(studio.media.submit(Kind::Video, request, model, size, 1, seconds, keep_jobs(&cfg), scratch))
 }
 
 fn keep_jobs(cfg: &Json) -> usize {
@@ -382,7 +471,7 @@ fn keep_jobs(cfg: &Json) -> usize {
 }
 
 /// Where clients reach this gateway: `gateway.public_url`, else the Host they used.
-fn public_base(studio: &Studio, req: &Request) -> String {
+pub fn public_base(studio: &Studio, req: &Request) -> String {
     let cfg = studio.config();
     let configured = cfg.get("gateway").map_or("", |g| str_or(g, "public_url", "")).trim_end_matches('/').to_string();
     if !configured.is_empty() {
@@ -420,16 +509,21 @@ fn videos_openai(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, method:
     let parts: Vec<&str> = rest.trim_start_matches('/').split('/').filter(|p| !p.is_empty()).collect();
     let video = |id: &str| studio.media.get(id).filter(|j| j.kind == Kind::Video);
     match (method, parts.as_slice()) {
-        ("POST", []) => send(w, parse_body(req).and_then(|b| submit_video(studio, &b, trusted)).map(|j| Reply { status: 200, body: video_object(&j) })),
+        ("POST", []) => send(w, parse_body(req).and_then(|b| {
+            let scratch = scratch_for(studio, req, Some(&b));
+            submit_video(studio, &b, trusted, scratch)
+        }).map(|j| Reply { status: 200, body: video_object(&j) })),
         ("GET", []) => {
             let limit = req.query("limit").and_then(|l| l.parse::<usize>().ok()).unwrap_or(20).clamp(1, 100);
-            let data: Vec<Json> = studio.media.list().iter().filter(|j| j.kind == Kind::Video).take(limit).map(video_object).collect();
+            let videos: Vec<Job> = studio.media.list().into_iter().filter(|j| j.kind == Kind::Video).collect();
+            let has_more = videos.len() > limit;
+            let data: Vec<Json> = videos.iter().take(limit).map(video_object).collect();
             let id = |i: Option<&Json>| i.and_then(|v| v.get("id")).cloned().unwrap_or(Json::Null);
             json_reply(w, 200, &Json::obj([
                 ("object", Json::str("list")),
                 ("first_id", id(data.first())),
                 ("last_id", id(data.last())),
-                ("has_more", Json::Bool(false)),
+                ("has_more", Json::Bool(has_more)),
                 ("data", Json::Arr(data)),
             ]))
         }
@@ -449,7 +543,7 @@ fn videos_openai(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, method:
                 other => return send(w, Err(fail(400, format!("variant {other} is not available (video or thumbnail)")))),
             };
             match file.filter(|f| f.is_file()) {
-                Some(f) => serve_file(w, &f, true),
+                Some(f) => serve_file(w, &f, true, req.header("range")),
                 None => send(w, Err(fail(404, "the file is gone"))),
             }
         }
@@ -459,14 +553,15 @@ fn videos_openai(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, method:
 
 /// nrob-server's asynchronous job API.
 fn nrob_jobs(studio: &Arc<Studio>, req: &Request, kind: Kind, rest: &str, trusted: bool) -> Result<Reply, Reply> {
-    let latest = || {
-        let id = req.query("id");
-        studio.media.list().into_iter().find(|j| j.kind == kind && id.as_deref().is_none_or(|i| i == j.id))
+    let latest = || match req.query("id") {
+        Some(id) => studio.media.get(&id).filter(|j| j.kind == kind),
+        None => studio.media.list().into_iter().find(|j| j.kind == kind),
     };
     match (req.method.as_str(), rest) {
         ("POST", "") => {
             let body = parse_body(req)?;
-            let job = if kind == Kind::Image { submit_image(studio, &body, trusted)? } else { submit_video(studio, &body, trusted)? };
+            let scratch = scratch_for(studio, req, Some(&body));
+            let job = if kind == Kind::Image { submit_image(studio, &body, trusted, scratch)? } else { submit_video(studio, &body, trusted, scratch)? };
             Ok(Reply {
                 status: 202,
                 body: Json::obj([
@@ -494,7 +589,10 @@ fn nrob_jobs(studio: &Arc<Studio>, req: &Request, kind: Kind, rest: &str, truste
             ]))
         }
         ("POST", "/cancel") => {
-            let job = studio.media.list().into_iter().find(|j| j.kind == kind && !j.finished());
+            let job = match req.query("id") {
+                Some(id) => studio.media.get(&id).filter(|j| j.kind == kind),
+                None => studio.media.list().into_iter().find(|j| j.kind == kind && !j.finished()),
+            };
             let cancelled = job.is_some_and(|j| studio.media.cancel(&j.id));
             ok(Json::obj([("cancelled", Json::Bool(cancelled))]))
         }
@@ -531,9 +629,20 @@ mod tests {
     }
 
     #[test]
+    fn byte_ranges_follow_rfc_7233() {
+        assert_eq!(byte_range("bytes=0-99", 1000), Some((0, 99)));
+        assert_eq!(byte_range("bytes=500-", 1000), Some((500, 999)));
+        assert_eq!(byte_range("bytes=-100", 1000), Some((900, 999)));
+        assert_eq!(byte_range("bytes=990-2000", 1000), Some((990, 999)));
+        assert_eq!(byte_range("bytes=1000-", 1000), None);
+        assert_eq!(byte_range("bytes=0-1,5-9", 1000), None);
+        assert_eq!(byte_range("items=0-1", 1000), None);
+    }
+
+    #[test]
     fn jobs_render_as_openai_video_objects() {
         let m = crate::media::Media::new();
-        let job = m.submit(Kind::Video, Json::obj([("prompt", Json::str("waves"))]), "ltx".into(), "1024x576".into(), 1, 4.0, 10);
+        let job = m.submit(Kind::Video, Json::obj([("prompt", Json::str("waves"))]), "ltx".into(), "1024x576".into(), 1, 4.0, 10, None);
         let v = video_object(&job);
         assert_eq!(v.get("object").and_then(Json::as_str), Some("video"));
         assert_eq!(v.get("status").and_then(Json::as_str), Some("queued"));
