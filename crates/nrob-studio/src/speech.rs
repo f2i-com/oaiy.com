@@ -89,7 +89,7 @@ pub fn list(dir: &Path) -> Vec<Json> {
         .filter(|v| v.get("nrob_voice").and_then(Json::as_i64) == Some(1))
         .map(|v| summary(&v))
         .collect();
-    out.sort_by(|a, b| str_or(a, "name", "").to_lowercase().cmp(&str_or(b, "name", "").to_lowercase()));
+    out.sort_by_key(|a| str_or(a, "name", "").to_lowercase());
     out
 }
 
@@ -186,8 +186,7 @@ pub fn speech_request(cfg: &Json, root: &Path, output_dir: &Path, body: &Json) -
     let asked = voice_name(body);
     let dir = voices_dir(cfg, root);
     let saved = asked.as_deref().filter(|n| valid_name(n)).map(|n| voice_file(&dir, n)).filter(|p| p.is_file());
-    let label;
-    match saved {
+    let label = match saved {
         Some(path) => {
             // A saved voice: the Base model, prompted with the voice.
             let base = folder(root, model, "base").ok_or_else(|| format!("speech model {name} has no Base model folder, which saved voices need"))?;
@@ -195,7 +194,7 @@ pub fn speech_request(cfg: &Json, root: &Path, output_dir: &Path, body: &Json) -
             f.push(("model_dir".into(), Json::str(base)));
             f.push(("voice_file".into(), Json::str(path.to_string_lossy())));
             f.push(("language".into(), Json::str(language(body, &saved_language)?)));
-            label = asked.unwrap_or_default();
+            asked.unwrap_or_default()
         }
         None => {
             // A voice in words: `instructions`, or a stock voice's description.
@@ -214,9 +213,9 @@ pub fn speech_request(cfg: &Json, root: &Path, output_dir: &Path, body: &Json) -
             f.push(("model_dir".into(), Json::str(design)));
             f.push(("instructions".into(), Json::str(description)));
             f.push(("language".into(), Json::str(language(body, "auto")?)));
-            label = asked.filter(|_| instructions.is_none()).unwrap_or_else(|| "described".into());
+            asked.filter(|_| instructions.is_none()).unwrap_or_else(|| "described".into())
         }
-    }
+    };
     // About 14 characters a second of speech, 12.5 frames a second.
     let frames = (input.chars().count() as f64 / 14.0 * 12.5).ceil().max(12.0) as usize;
     Ok((Json::Obj(f), name, label, frames))

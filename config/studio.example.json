@@ -209,7 +209,6 @@
       "models": {
         "minimax-music3": {
           "path": "models/MiniMax-Music3",
-          "language_model": "models/MiniMax-Music3/language_model-q4_k.gguf",
           "precision": "bf16",
           "steps": 30,
           "enabled": true

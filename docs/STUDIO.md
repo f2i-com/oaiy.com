@@ -49,7 +49,7 @@ The console accepts `status`, `start`, `stop`, `open`, `jobs` and `quit`.
   - The Gallery keeps everything generated this session, with each item's
     prompt, seed, steps and where its weights lived. Items can be reused,
     downloaded or removed.
-  - The Playground has Chat, Image and Video tabs sized to the window. Chat
+  - The Playground has Chat, Image, Speech, Music and Video tabs sized to the window. Chat
     renders Markdown, can stop a reply mid-stream, and takes a system prompt.
     Speech speaks text in a saved voice, an OpenAI voice name, or a voice
     described in words, and **Save this voice…** keeps a described voice
