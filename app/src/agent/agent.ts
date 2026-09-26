@@ -7,9 +7,9 @@
  * a row stops it, and old tool output is trimmed as the conversation grows.
  */
 import type { NetGate } from '../gate/netgate';
-import type { Vfs } from '../vfs/vfs';
 import { AIProviderError } from './providers/aiProvider';
-import { DEFAULT_COMPACT_AT, budgetFor, contextWindow, formatTokens, overflowWindow } from './context';
+import { DEFAULT_COMPACT_AT, budgetFor, contextWindow, formatTokens, outputLimit, overflowWindow } from './context';
+import { normalizePath, type Vfs } from '../vfs/vfs';
 import type { ProviderConfig } from './providers/types';
 import { sendTurn, type Attachment, type Reply, type ToolCall, type ToolResult, type Turn, type Usage } from './protocol';
 import { MAIN_AGENT_ONLY, TOOLS, checkApp, readPlan, readTasks, runTool, type Plan, type SoftnHost, type ToolContext } from './tools';
@@ -151,6 +151,66 @@ function isAppFile(path: string): boolean {
   return /^(manifest\.json|permission\.json|ui\/|logic\/|xdb\/|assets\/|server\/)/.test(path);
 }
 
+/**
+ * The conversation in a shape every provider accepts: each tool call answered
+ * (a run stopped mid-step leaves calls without results), no empty assistant
+ * turns, and no two user turns in a row (strict chat templates refuse them).
+ */
+export function wellFormed(turns: Turn[]): Turn[] {
+  const out: Turn[] = [];
+  for (let i = 0; i < turns.length; i++) {
+    const turn = turns[i];
+    if (turn.role === 'assistant' && !turn.text.trim() && !turn.calls.length && !turn.anthropicContent?.length) continue;
+    if (turn.role === 'tool') {
+      const prev = out[out.length - 1];
+      if (prev?.role !== 'assistant' || !prev.calls.length) continue;
+      const byId = new Map(turn.results.map((r) => [r.id, r]));
+      out.push({ role: 'tool', results: prev.calls.map((c) => byId.get(c.id) ?? { id: c.id, name: c.name, content: 'Error: no result (the run stopped before this call finished)', isError: true }) });
+      continue;
+    }
+    const prev = out[out.length - 1];
+    if (prev?.role === 'assistant' && prev.calls.length) {
+      out.push({ role: 'tool', results: prev.calls.map((c) => ({ id: c.id, name: c.name, content: 'Error: no result (the run stopped before this call ran)', isError: true })) });
+    }
+    const last = out[out.length - 1];
+    if (turn.role === 'user' && last?.role === 'user') {
+      out[out.length - 1] = { ...last, text: `${last.text}\n\n${turn.text}`, images: [...(last.images ?? []), ...(turn.images ?? [])], summary: last.summary || turn.summary };
+      continue;
+    }
+    out.push(turn);
+  }
+  const last = out[out.length - 1];
+  if (last?.role === 'assistant' && last.calls.length) out.push({ role: 'tool', results: last.calls.map((c) => ({ id: c.id, name: c.name, content: 'Error: no result (the run stopped before this call ran)', isError: true })) });
+  return out;
+}
+
+/** The file system as one agent sees it: its own writes are reported to it, nobody else's. */
+function trackedVfs(vfs: Vfs, record: (path: string) => void): Vfs {
+  return new Proxy(vfs, {
+    get(target, prop) {
+      const value = Reflect.get(target, prop, target) as unknown;
+      if (typeof value !== 'function') return value;
+      const fn = value as (...args: unknown[]) => unknown;
+      if (prop === 'writeFile' || prop === 'mkdir' || prop === 'remove') {
+        return (path: string, ...rest: unknown[]) => {
+          const result = fn.call(target, path, ...rest);
+          record(normalizePath(path));
+          return result;
+        };
+      }
+      if (prop === 'rename') {
+        return (from: string, to: string) => {
+          const result = fn.call(target, from, to);
+          record(normalizePath(from));
+          record(normalizePath(to));
+          return result;
+        };
+      }
+      return fn.bind(target);
+    },
+  });
+}
+
 /** Where the model's view starts: the latest summary, or the beginning. */
 function viewStart(turns: Turn[]): number {
   for (let i = turns.length - 1; i >= 0; i--) {
@@ -196,6 +256,13 @@ function trimmed(allTurns: Turn[], images: boolean, maxChars: number): Turn[] {
     });
   let out = shrink(500);
   if (estimateChars(out) > maxChars) out = shrink(120);
+  // Still over: the recent turns hold something huge (a long read, a big search). Cut their tool output too, the latest least.
+  for (const limit of [8000, 3000, 1000]) {
+    if (estimateChars(out) <= maxChars) break;
+    out = out.map((t, i): Turn => (t.role === 'tool' && i < out.length - 1 ? { role: 'tool', results: t.results.map((r) => (r.content.length > limit ? { ...r, content: `${r.content.slice(0, limit)}\n[cut to fit the model's context]` } : r)) } : t));
+    const lastTool = out[out.length - 1];
+    if (estimateChars(out) > maxChars && lastTool?.role === 'tool') out[out.length - 1] = { role: 'tool', results: lastTool.results.map((r) => (r.content.length > limit * 2 ? { ...r, content: `${r.content.slice(0, limit * 2)}\n[cut to fit the model's context: read less at a time]` } : r)) };
+  }
   return out;
 }
 
@@ -215,15 +282,24 @@ export class Agent {
   private charsPerToken = DEFAULT_CHARS_PER_TOKEN;
   /** A window the server stated in an overflow error, smaller than the one configured, for that provider and model. */
   private windowOverride: { key: string; tokens: number } | null = null;
+  /** An output limit the server stated, for that provider and model. */
+  private outputCap: { key: string; tokens: number } | null = null;
+  /** Models (provider|model) that refused images. */
+  private noImages = new Set<string>();
   readonly toolContext: ToolContext;
+  /** Set during a run: records a path this agent's tools wrote. */
+  private onWrite: ((path: string) => void) | null = null;
   running = false;
 
   constructor(private readonly options: AgentOptions) {
-    this.toolContext = { vfs: options.vfs, gate: options.gate, reads: new Map(), shell: { cwd: '/', env: {} }, softn: options.softn };
+    // Writes made through this agent's tools are its changes; another agent's (or the person's) are not.
+    this.toolContext = { vfs: trackedVfs(options.vfs, (path) => this.onWrite?.(path)), gate: options.gate, reads: new Map(), shell: { cwd: '/', env: {} }, softn: options.softn };
   }
 
   reset(): void {
     this.turns = [];
+    this.noImages.clear();
+    this.toolContext.images = true;
     this.plan = null;
     this.failingApps.clear();
     this.toolContext.reads.clear();
@@ -295,8 +371,11 @@ export class Agent {
     return stop;
   }
 
-  /** False once the model has refused images: they are left out from then on. */
-  private imagesAccepted = true;
+  /** False when the current model has refused images: they are left out. */
+  private get imagesAccepted(): boolean {
+    const p = this.options.provider();
+    return !p || !this.noImages.has(`${p.id}|${p.modelId}`);
+  }
 
   /** What the model reads: the latest summary and everything after it. */
   view(): Turn[] {
@@ -455,7 +534,13 @@ export class Agent {
   private budget(provider: ProviderConfig): { window: number; fixed: number; prompt: number; reply: number } {
     const window = this.window(provider);
     const fixed = Math.ceil(this.fixedChars() / this.charsPerToken);
-    return { window, fixed, ...budgetFor(window, fixed) };
+    const b = { window, fixed, ...budgetFor(window, fixed) };
+    const cap = this.outputCap?.key === `${provider.id}|${provider.modelId}` ? this.outputCap.tokens : null;
+    if (cap && cap < b.reply) {
+      b.prompt += b.reply - cap;
+      b.reply = cap;
+    }
+    return b;
   }
 
   /** Tokens the conversation part of the next prompt will take. */
@@ -470,6 +555,8 @@ export class Agent {
    */
   private async fit(provider: ProviderConfig, emit: (e: AgentEvent) => void, signal?: AbortSignal, force = false): Promise<void> {
     const b = this.budget(provider);
+    // Too small to hold the instructions and tools with room to work: say so, rather than fail in circles.
+    if (b.prompt < 1024) throw new Error(`The model's context window (${formatTokens(b.window)} tokens) is too small for bot.computer: its instructions and tools alone take about ${formatTokens(b.fixed)}. Give the model a bigger window (Ollama: OLLAMA_CONTEXT_LENGTH=16384 or more; then Detect in Settings), or set the size in Settings if the detected one is wrong.`);
     const used = this.estimate(this.view());
     emit({ type: 'context', used: used + b.fixed, window: b.window });
     const threshold = b.prompt * (this.options.compactAt?.() ?? DEFAULT_COMPACT_AT);
@@ -567,7 +654,7 @@ export class Agent {
     let overflowRetried = false;
     for (let attempt = 0; attempt < 4; attempt++) {
       const b = this.budget(provider);
-      const sent = trimmed(this.view(), this.imagesAccepted, b.prompt * this.charsPerToken);
+      const sent = wellFormed(trimmed(this.view(), this.imagesAccepted, b.prompt * this.charsPerToken));
       try {
         const reply = await sendTurn(provider, this.systemPrompt, sent, this.tools, {
           maxOutputTokens: b.reply,
@@ -601,9 +688,18 @@ export class Agent {
           await this.compact(provider, this.budget(provider), emit, signal);
           continue;
         }
-        // A model without vision refuses image content: carry on in text.
-        if (this.imagesAccepted && error.kind === 'http' && /image|vision|multimodal|image_url|content.*array/i.test(`${error.message} ${error.detail ?? ''}`) && this.turns.some(hasImages)) {
-          this.imagesAccepted = false;
+        const said = `${error.message} ${error.detail ?? ''}`;
+        // A max_tokens the model cannot give: it usually says what it can.
+        const limit = error.kind === 'http' ? outputLimit(said) : null;
+        if (limit && limit < b.reply) {
+          this.outputCap = { key: `${provider.id}|${provider.modelId}`, tokens: limit };
+          emit({ type: 'status', message: `The model writes at most ${formatTokens(limit)} tokens per reply; retrying with that` });
+          continue;
+        }
+        // A model without vision refuses image content: carry on in text (an image that is too big is not that).
+        if (this.imagesAccepted && error.kind === 'http' && /image|vision|multimodal|image_url|content.*array/i.test(said) && !/too (large|big)|exceeds?|dimension|resolution|megapixel/i.test(said) && this.turns.some(hasImages)) {
+          this.noImages.add(`${provider.id}|${provider.modelId}`);
+          this.toolContext.images = false;
           emit({ type: 'status', message: 'This model does not take images; continuing with text only' });
           continue;
         }
@@ -640,9 +736,13 @@ export class Agent {
     // What each step changes, by the index of the call that changed it.
     let callIndex = -1;
     let changes: Array<{ path: string; index: number }> = [];
-    const unwatch = this.options.vfs.onChange((change) => {
-      if (change.type !== 'reset') changes.push({ path: change.path.replace(/^\/+/, ''), index: callIndex });
-    });
+    this.onWrite = (path) => changes.push({ path, index: callIndex });
+    this.toolContext.images = this.imagesAccepted;
+    const unwatch = () => {
+      this.onWrite = null;
+    };
+    // The results of the step in progress: kept if the run stops part-way.
+    let stepResults: ToolResult[] = [];
     this.sameCheck = { signature: '', count: 0 };
     let planThisRun = false;
     let planNoted = false;
@@ -678,7 +778,19 @@ export class Agent {
           return;
         }
         const results: ToolResult[] = [];
+        stepResults = results;
         changes = [];
+        // A reply cut off at the output limit mid-call: the call is incomplete, so say why rather than run it.
+        if (reply.truncated && reply.calls.some((c) => c.parseError)) {
+          for (const call of reply.calls) {
+            const result: ToolResult = { id: call.id, name: call.name, content: `Error: your reply was cut off at the output limit (about ${formatTokens(this.budget(provider).reply)} tokens) before this call was complete, so it did not run. Keep each call smaller: write a large file in parts (write_file with the first part, then edit_file to add the rest), and keep reasoning short.`, isError: true };
+            results.push(result);
+            emit({ type: 'tool_call', call });
+            emit({ type: 'tool_result', result });
+          }
+          this.turns.push({ role: 'tool', results });
+          continue;
+        }
         for (const [index, call] of reply.calls.entries()) {
           signal?.throwIfAborted();
           callIndex = index;
@@ -735,10 +847,12 @@ export class Agent {
       } else {
         emit({ type: 'error', message: error instanceof Error ? error.message : String(error) });
       }
-      // A turn left waiting for tool results cannot be sent again.
+      // A turn left waiting for tool results cannot be sent again: keep the results
+      // that came in (their changes happened) and mark the rest as not run.
       const last = this.turns[this.turns.length - 1];
       if (last?.role === 'assistant' && last.calls.length) {
-        this.turns.push({ role: 'tool', results: last.calls.map((c) => ({ id: c.id, name: c.name, content: 'Error: the run stopped before this tool ran', isError: true })) });
+        const done = new Map(stepResults.map((r) => [r.id, r]));
+        this.turns.push({ role: 'tool', results: last.calls.map((c) => done.get(c.id) ?? { id: c.id, name: c.name, content: 'Error: the run stopped before this tool ran', isError: true }) });
       }
     } finally {
       unwatch();

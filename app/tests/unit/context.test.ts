@@ -26,8 +26,8 @@ describe('the context window', () => {
     expect(overflowWindow('invalid tools field').overflow).toBe(false);
   });
 
-  it('keeps a quarter of the window (at most the output limit) for the reply', () => {
-    expect(budgetFor(8192, 3000)).toEqual({ reply: 2048, prompt: 3144 });
+  it('keeps a quarter of the window (a fifth of a small one; at most the output limit) for the reply', () => {
+    expect(budgetFor(8192, 3000)).toEqual({ reply: 1638, prompt: 3554 });
     expect(budgetFor(262_144, 5000)).toEqual({ reply: 16_384, prompt: 240_760 });
   });
 });

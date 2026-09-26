@@ -89,6 +89,8 @@ export class Vfs {
   private nodes = new Map<string, Node>([['', { kind: 'dir', mtimeMs: Date.now() }]]);
   private children = new Map<string, Set<string>>([['', new Set()]]);
   private listeners = new Set<(change: VfsChange) => void>();
+  /** Every write gets the next number, so a version is never reused. */
+  private clock = 0;
 
   onChange(listener: (change: VfsChange) => void): () => void {
     this.listeners.add(listener);
@@ -180,7 +182,7 @@ export class Vfs {
       joined.set(bytes, existing.data.byteLength);
       bytes = joined;
     }
-    const version = existing?.kind === 'file' ? existing.version + 1 : 1;
+    const version = ++this.clock;
     this.nodes.set(key, { kind: 'file', data: bytes, mtimeMs: Date.now(), version });
     this.link(key);
     this.emit({ type: 'write', path: key });

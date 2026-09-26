@@ -106,3 +106,11 @@ describe('softn_import', () => {
     expect((await run({ path: 'uploads/notes.softn' })).isError).toBe(true);
   });
 });
+
+describe('local addresses', () => {
+  it('are recognised however they are written', async () => {
+    const { isLocalHost } = await import('../../src/sandbox/host');
+    for (const h of ['localhost', '127.0.0.1', '[::1]', '::ffff:127.0.0.1', '[::ffff:7f00:1]', '::ffff:c0a8:101', '10.1.2.3', '192.168.1.1', '169.254.169.254', 'fe80::1', 'feb0::1', 'fd00::1', 'printer.local', 'x.internal']) expect(isLocalHost(h)).toBe(true);
+    for (const h of ['example.com', '8.8.8.8', '[2606:4700::1111]', '::ffff:808:808', 'fe00.example']) expect(isLocalHost(h)).toBe(false);
+  });
+});

@@ -35,11 +35,32 @@ function base64ToBytes(text: string): Uint8Array {
   return out;
 }
 
+/** A host as the gate compares it: lower case, IPv6 without brackets. */
+function hostKey(host: string): string {
+  return host.toLowerCase().replace(/^\[|\]$/g, '');
+}
+
+/**
+ * An IPv6 address that carries an IPv4 one (::ffff:7f00:1, ::ffff:127.0.0.1,
+ * ::127.0.0.1) as the IPv4 address, so it is judged as what it reaches.
+ */
+function embeddedIPv4(h: string): string | null {
+  const dotted = /^::(?:ffff:(?:0:)?)?(\d+\.\d+\.\d+\.\d+)$/.exec(h);
+  if (dotted) return dotted[1];
+  const hex = /^::(?:ffff:(?:0:)?)?([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(h);
+  if (!hex) return null;
+  const hi = parseInt(hex[1], 16);
+  const lo = parseInt(hex[2], 16);
+  return `${hi >> 8}.${hi & 255}.${lo >> 8}.${lo & 255}`;
+}
+
 /** Hosts that name this machine or its network: reachable only when allowed by name. */
-function isLocalHost(host: string): boolean {
-  const h = host.toLowerCase().replace(/^\[|\]$/g, '');
-  if (h === 'localhost' || h.endsWith('.localhost') || h.endsWith('.local') || h === 'metadata.google.internal') return true;
-  if (h === '::1' || h === '::' || h.startsWith('fe80:') || h.startsWith('fc') || h.startsWith('fd')) return /^[0-9a-f:]+$/.test(h);
+export function isLocalHost(host: string): boolean {
+  let h = hostKey(host);
+  const v4 = h.includes(':') ? embeddedIPv4(h) : null;
+  if (v4) h = v4;
+  if (h === 'localhost' || h.endsWith('.localhost') || h.endsWith('.local') || h.endsWith('.internal') || h === 'metadata.google.internal') return true;
+  if (h.includes(':')) return /^[0-9a-f:.]+$/.test(h) && (h === '::1' || h === '::' || /^fe[89ab]/.test(h) || /^f[cd]/.test(h));
   const m = /^(\d+)\.(\d+)\.(\d+)\.(\d+)$/.exec(h);
   if (!m) return false;
   const [a, b] = [Number(m[1]), Number(m[2])];
@@ -216,7 +237,7 @@ export class SandboxHost implements HostHandler {
     if (url.protocol !== 'http:' && url.protocol !== 'https:') throw new TypeError('fetch failed: only http and https URLs are allowed');
     const host = url.hostname;
     const settings = this.gate.getSettings();
-    if (isLocalHost(host) && !settings.allow.some((h) => h === host.toLowerCase())) {
+    if (isLocalHost(host) && !settings.allow.some((h) => hostKey(h) === hostKey(host))) {
       this.gate.check(host, this.via);
       throw new TypeError(`fetch failed: \`${host}\` is on this machine or its local network; the user can allow it with \`/internet allow ${host}\``);
     }
@@ -241,8 +262,24 @@ export class SandboxHost implements HostHandler {
         credentials: 'omit',
         signal: controller.signal,
       });
+      // A redirect the gate did not see: judge where it ended up before anything is read.
+      if (response.redirected && response.url) {
+        const final = new URL(response.url).hostname;
+        if (isLocalHost(final) && !settings.allow.some((h) => hostKey(h) === hostKey(final))) {
+          clearTimeout(timer);
+          void response.body?.cancel().catch(() => {});
+          throw new TypeError(`fetch failed: ${host} redirected to \`${final}\`, which is on this machine or its local network; not followed`);
+        }
+        const after = this.gate.check(final, this.via);
+        if (!after.ok) {
+          clearTimeout(timer);
+          void response.body?.cancel().catch(() => {});
+          throw new TypeError(`fetch failed: ${host} redirected to ${final}: ${after.reason}`);
+        }
+      }
     } catch (error) {
       clearTimeout(timer);
+      if (error instanceof TypeError && error.message.startsWith('fetch failed:')) throw error;
       const why = controller.signal.aborted
         ? 'timed out'
         : `${(error as Error).message}. From a browser this usually means the site does not allow cross-origin requests (CORS)${open ? '' : ', or it redirected while the gate is restricted'}`;

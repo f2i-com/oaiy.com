@@ -141,6 +141,18 @@ export function overflowWindow(message: string): { overflow: boolean; tokens: nu
   return { overflow: true, tokens: stated ? Number(stated[1]) : null };
 }
 
+/** An error about max_tokens being too high, with the limit it states. */
+export function outputLimit(message: string): number | null {
+  if (!/max_tokens|max_completion_tokens|output tokens|completion tokens|max_new_tokens/i.test(message)) return null;
+  const stated =
+    /valid range of max_tokens is \[\d+,\s*(\d+)\]/i.exec(message) ??
+    /(?:at most|maximum(?: allowed)?(?: number of)?(?: output| completion)? tokens?(?: is| of)?|less than or equal to|<=?)\s*:?\s*(\d{3,7})/i.exec(message) ??
+    /max_tokens:?\s*\d+\s*>\s*(\d{3,7})/i.exec(message) ??
+    /(\d{3,7}) (?:output|completion) tokens/i.exec(message);
+  const n = stated ? Number(stated[1]) : NaN;
+  return Number.isFinite(n) && n >= 256 ? n : null;
+}
+
 /** The share of the window the prompt may reach before compacting. */
 export const DEFAULT_COMPACT_AT = 0.75;
 
@@ -149,7 +161,8 @@ export const DEFAULT_COMPACT_AT = 0.75;
  * at most, and never more than the output limit) and what the prompt may use.
  */
 export function budgetFor(window: number, fixedTokens: number, maxOutput = 16_384): { reply: number; prompt: number } {
-  const reply = Math.max(512, Math.min(maxOutput, Math.floor(window * 0.25)));
+  // A small window keeps less for the reply: the instructions and tools already take a lot of it.
+  const reply = Math.max(512, Math.min(maxOutput, Math.floor(window * (window < 16_384 ? 0.2 : 0.25))));
   return { reply, prompt: Math.max(0, window - reply - fixedTokens) };
 }
 

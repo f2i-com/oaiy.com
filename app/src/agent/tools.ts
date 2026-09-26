@@ -89,6 +89,8 @@ export interface ToolContext {
   /** The live SoftN preview, when the page has one. */
   softn?: SoftnHost;
   signal?: AbortSignal;
+  /** False when the model has refused images: view_image then says so instead of sending one. */
+  images?: boolean;
 }
 
 const str = { type: 'string' };
@@ -267,7 +269,7 @@ export const TOOLS: ToolSpec[] = [
     name: 'softn_examples',
     description:
       'Complete, working SoftN apps to learn from (a notes app with storage, a game, a component and chart showcase, 3D, WebGPU, device permissions). ' +
-      'No arguments: the list. `name`: an app\'s files and manifest. `name` + `file`: read one of its files. `name` + `install_to`: copy the whole app into that folder of the project (it then shows in the preview; start from it or take parts of it).',
+      'No arguments: the list. `name`: an app\'s files and manifest. `name` + `file`: read one of its files. `name` + `install_to`: copy the whole app into the project, in a new folder (named after the app) inside install_to (it then shows in the preview; start from it or take parts of it).',
     parameters: { type: 'object', properties: { name: str, file: str, install_to: str } },
   },
   {
@@ -379,15 +381,21 @@ async function execute(call: ToolCall, ctx: ToolContext, out: ToolOut): Promise<
     case 'list_files': {
       const start = normalizePath(typeof input.path === 'string' ? input.path : '/');
       const depth = typeof input.depth === 'number' ? Math.max(1, input.depth) : 3;
-      const walked = vfs.walk(`/${start}`, { includeIgnored: input.include_ignored === true, limit: 2000 });
+      // Walk wide, then keep the shallow entries: a deep folder must not crowd out the top levels.
+      const walked = vfs.walk(`/${start}`, { includeIgnored: input.include_ignored === true, limit: 50_000 });
       const lines: string[] = [];
+      let more = 0;
       for (const e of walked.entries) {
         const rel = start ? e.path.slice(start.length + 1) : e.path;
         if (rel.split('/').length > depth) continue;
+        if (lines.length >= 2000) {
+          more++;
+          continue;
+        }
         lines.push(e.type === 'dir' ? `${rel}/` : `${rel}  (${e.size} B)`);
       }
       if (!lines.length) return `/${start} is empty`;
-      return lines.join('\n') + (walked.truncated ? '\n[listing truncated]' : '');
+      return lines.join('\n') + (more ? `\n[${more} more entries not shown: list a subfolder, or lower depth]` : walked.truncated ? '\n[listing truncated]' : '');
     }
     case 'read_file': {
       const key = normalizePath(need(input, 'path'));
@@ -398,6 +406,9 @@ async function execute(call: ToolCall, ctx: ToolContext, out: ToolOut): Promise<
         const count = Math.min(Math.max(1, typeof input.char_count === 'number' ? Math.floor(input.char_count) : READ_CHARS), READ_CHARS);
         const slice = text.slice(start, start + count);
         const lineNo = text.slice(0, start).split('\n').length;
+        // A part of the file: enough to edit it, not to replace it.
+        ctx.reads.set(key, vfs.version(`/${key}`));
+        if (start > 0 || start + slice.length < text.length) ctx.reads.set(`${key}#partial`, 1);
         return `[characters ${start}-${start + slice.length} of ${text.length}, starting on line ${lineNo}]\n${slice}${start + slice.length < text.length ? `\n[continue with char_start ${start + slice.length}]` : ''}`;
       }
       const lines = text.split('\n');
@@ -406,15 +417,17 @@ async function execute(call: ToolCall, ctx: ToolContext, out: ToolOut): Promise<
       const slice = lines.slice(offset - 1, offset - 1 + limit);
       let charAt = 0;
       for (let i = 0; i < offset - 1; i++) charAt += lines[i].length + 1;
+      let linesCut = false;
       let body = slice
         .map((l, i) => {
           const at = charAt;
           charAt += l.length + 1;
+          if (l.length > LINE_CHARS) linesCut = true;
           return l.length > LINE_CHARS ? `${offset + i}\t${l.slice(0, LINE_CHARS)} [line continues: ${l.length - LINE_CHARS} more characters; char_start ${at + LINE_CHARS}]` : `${offset + i}\t${l}`;
         })
         .join('\n');
       if (body.length > READ_CHARS) body = `${body.slice(0, READ_CHARS)}\n[cut at ${READ_CHARS} characters]`;
-      const whole = offset === 1 && slice.length === lines.length && body.length <= READ_CHARS;
+      const whole = offset === 1 && slice.length === lines.length && body.length <= READ_CHARS && !linesCut;
       // Editing needs a read; replacing needs the whole file read.
       ctx.reads.set(key, vfs.version(`/${key}`));
       if (!whole) ctx.reads.set(`${key}#partial`, 1);
@@ -501,7 +514,7 @@ async function execute(call: ToolCall, ctx: ToolContext, out: ToolOut): Promise<
         if (count > 100_000) break;
       }
       if (!count) return `no matches in /${key} (${lines.length.toLocaleString()} lines)`;
-      return `${count.toLocaleString()} match${count === 1 ? '' : 'es'} in /${key}${count > max ? ` (showing the first ${max})` : ''}\n\n${out.join('\n\n')}`;
+      return cut(`${count.toLocaleString()} match${count === 1 ? '' : 'es'} in /${key}${count > max ? ` (showing the first ${max})` : ''}\n\n${out.join('\n\n')}`);
     }
     case 'write_file': {
       const key = normalizePath(need(input, 'path'));
@@ -521,13 +534,21 @@ async function execute(call: ToolCall, ctx: ToolContext, out: ToolOut): Promise<
       requireFreshRead(ctx, key, 'edit');
       const text = vfs.readText(`/${key}`);
       if (!oldString) throw new Error('old_string is empty');
-      const count = text.split(oldString).length - 1;
+      let oldText = oldString;
+      let newText = newString;
+      let count = text.split(oldText).length - 1;
+      // A file with Windows line endings: match the model's \n lines against its \r\n.
+      if (count === 0 && text.includes('\r\n') && oldString.includes('\n')) {
+        oldText = oldString.replace(/\r?\n/g, '\r\n');
+        newText = newString.replace(/\r?\n/g, '\r\n');
+        count = text.split(oldText).length - 1;
+      }
       if (count === 0) {
         const near = nearestLines(text, oldString);
         throw new Error(`old_string was not found in /${key}${near ? `. The closest lines are:\n${near}` : ''}`);
       }
       if (count > 1 && input.replace_all !== true) throw new Error(`old_string matches ${count} places in /${key}; add surrounding lines to make it unique, or set replace_all`);
-      const next = input.replace_all === true ? text.split(oldString).join(newString) : text.replace(oldString, () => newString);
+      const next = input.replace_all === true ? text.split(oldText).join(newText) : text.replace(oldText, () => newText);
       vfs.writeFile(`/${key}`, next);
       ctx.reads.set(key, vfs.version(`/${key}`));
       return `edited /${key} (${count} replacement${count === 1 ? '' : 's'})`;
@@ -540,13 +561,14 @@ async function execute(call: ToolCall, ctx: ToolContext, out: ToolOut): Promise<
     }
     case 'grep': {
       const host = new SandboxHost(vfs, ctx.gate, 'grep', 10_000);
+      host.signal = ctx.signal;
       const found = JSON.parse(
         await host.call('fs.grep', [
-          JSON.stringify({ pattern: need(input, 'pattern'), path: typeof input.path === 'string' ? input.path : '/', glob: input.glob ?? null, ignore_case: input.ignore_case === true, max_results: typeof input.max_results === 'number' ? input.max_results : 200 }),
+          JSON.stringify({ pattern: need(input, 'pattern'), path: typeof input.path === 'string' ? input.path : '/', glob: input.glob ?? null, ignore_case: input.ignore_case === true, max_results: typeof input.max_results === 'number' ? Math.min(Math.max(1, input.max_results), 1000) : 200 }),
         ]),
       ) as { matches: Array<{ path: string; line: number; text: string }>; truncated: boolean };
       if (!found.matches.length) return 'no matches';
-      return found.matches.map((m) => `${m.path}:${m.line}: ${m.text}`).join('\n') + (found.truncated ? '\n[more matches not shown]' : '');
+      return cut(found.matches.map((m) => `${m.path}:${m.line}: ${m.text.length > 300 ? `${m.text.slice(0, 300)}…` : m.text}`).join('\n') + (found.truncated ? '\n[more matches not shown]' : ''));
     }
     case 'glob': {
       const pattern = need(input, 'pattern').replace(/^\.?\//, '');
@@ -600,6 +622,7 @@ async function execute(call: ToolCall, ctx: ToolContext, out: ToolOut): Promise<
       return JSON.stringify(report, null, 1);
     }
     case 'view_image': {
+      if (ctx.images === false) throw new Error('this model does not take images, so view_image cannot show it one; use file_info for the size, or ask the user to describe the image');
       const key = normalizePath(need(input, 'path'));
       const mime = imageMimeFor(key);
       if (!mime) throw new Error(`/${key} is not an image this tool can show (png, jpg, gif, webp, svg, bmp, avif)`);
@@ -697,6 +720,7 @@ async function execute(call: ToolCall, ctx: ToolContext, out: ToolOut): Promise<
     }
     case 'web_fetch': {
       const host = new SandboxHost(vfs, ctx.gate, 'web_fetch', 60_000);
+      host.signal = ctx.signal;
       const response = JSON.parse(await host.call('net.fetch', [JSON.stringify({ url: need(input, 'url') })])) as { status: number; url: string; headers: Record<string, string>; body: string; truncated: boolean };
       const max = typeof input.max_chars === 'number' ? Math.min(Math.max(1000, input.max_chars), 100_000) : 20_000;
       let body = response.body;

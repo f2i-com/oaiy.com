@@ -123,7 +123,8 @@ function openAIMessages(system: string, turns: Turn[]): unknown[] {
       continue;
     }
     else if (turn.role === 'assistant') {
-      const message: Record<string, unknown> = { role: 'assistant', content: turn.text || null };
+      // Content may be empty only beside tool calls; some servers refuse null.
+      const message: Record<string, unknown> = { role: 'assistant', content: turn.text || (turn.calls.length ? null : '') };
       if (turn.calls.length) {
         message.tool_calls = turn.calls.map((c) => ({ id: c.id, type: 'function', function: { name: c.name, arguments: JSON.stringify(c.input) } }));
       }
@@ -195,7 +196,7 @@ function decodeOpenAI(data: Record<string, unknown>): Reply {
         parseError = `arguments are not valid JSON (${(error as Error).message})`;
       }
     }
-    calls.push({ id: String(raw.id ?? `call_${i}`), name: String(fn.name ?? ''), input, parseError });
+    calls.push({ id: typeof raw.id === 'string' && raw.id ? raw.id : `call_${Date.now().toString(36)}_${i}`, name: String(fn.name ?? ''), input, parseError });
   }
   const reasoning = typeof message.reasoning_content === 'string' ? message.reasoning_content : typeof message.reasoning === 'string' ? message.reasoning : '';
   const usage = isRecord(data.usage) ? data.usage : {};
