@@ -1,0 +1,155 @@
+// End-to-end through the real UI: a scripted OpenAI-compatible model server
+// (with CORS, as a local Ollama/LM Studio would be) and headless Chrome.
+//   node tests/e2e/app.mjs
+import { existsSync } from 'node:fs';
+import { createServer as createHttpServer } from 'node:http';
+import { createServer } from 'vite';
+import puppeteer from 'puppeteer-core';
+
+const executablePath = [process.env.CHROME, 'C:/Program Files/Google/Chrome/Application/chrome.exe', '/usr/bin/google-chrome', '/usr/bin/chromium', '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'].filter(Boolean).find((p) => existsSync(p));
+if (!executablePath) {
+  console.error('no Chrome found; set CHROME');
+  process.exit(2);
+}
+
+// --- the scripted model -----------------------------------------------------
+const requests = [];
+const script = [
+  { calls: [{ name: 'sandbox_shell', input: { command: 'ls data && tail -n +2 data/weather.csv | wc -l' } }] },
+  { calls: [{ name: 'code_run', input: { language: 'python', code: "import statistics\nwith open('data/weather.csv') as f:\n    t=[int(l.split(',')[1]) for l in f.read().splitlines()[1:]]\nm=statistics.mean(t)\nprint('mean', m)\nwith open('data/mean.txt','w') as f:\n    f.write(str(m))\n" } }] },
+  { text: 'Done: the mean temperature is 19.8 and it is saved in data/mean.txt.' },
+];
+function sse(step, n) {
+  const events = [];
+  for (const piece of step.text?.match(/.{1,6}/gs) ?? []) events.push({ choices: [{ index: 0, delta: { content: piece } }] });
+  (step.calls ?? []).forEach((call, i) => {
+    events.push({ choices: [{ index: 0, delta: { tool_calls: [{ index: i, id: `call_${n}_${i}`, type: 'function', function: { name: call.name, arguments: JSON.stringify(call.input) } }] } }] });
+  });
+  events.push({ choices: [{ index: 0, delta: {}, finish_reason: step.calls ? 'tool_calls' : 'stop' }] });
+  return events.map((e) => `data: ${JSON.stringify(e)}\n\n`).join('') + 'data: [DONE]\n\n';
+}
+const model = createHttpServer((req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Headers', '*');
+  res.setHeader('Access-Control-Allow-Private-Network', 'true');
+  if (req.method === 'OPTIONS') return res.end();
+  if (req.url.endsWith('/models')) {
+    res.setHeader('content-type', 'application/json');
+    return res.end(JSON.stringify({ data: [{ id: 'mock-model' }] }));
+  }
+  let body = '';
+  req.on('data', (c) => (body += c));
+  req.on('end', () => {
+    requests.push(JSON.parse(body));
+    const step = script[requests.length - 1] ?? { text: 'out of script' };
+    res.setHeader('content-type', 'text/event-stream');
+    res.end(sse(step, requests.length));
+  });
+});
+await new Promise((r) => model.listen(0, '127.0.0.1', r));
+const modelUrl = `http://127.0.0.1:${model.address().port}`;
+
+// --- the app -----------------------------------------------------------------
+const server = await createServer({ server: { port: 0, host: '127.0.0.1' }, logLevel: 'error' });
+await server.listen();
+const base = `http://127.0.0.1:${server.httpServer.address().port}`;
+const browser = await puppeteer.launch({ executablePath, headless: true, args: ['--no-first-run'] });
+let failures = 0;
+const check = async (name, fn) => {
+  try {
+    await fn();
+    console.log(`ok   ${name}`);
+  } catch (error) {
+    failures++;
+    console.log(`FAIL ${name}\n     ${String(error.message).split('\n').join('\n     ')}`);
+  }
+};
+const expect = (c, m) => {
+  if (!c) throw new Error(m);
+};
+
+async function terminal(page, command, waitFor) {
+  await page.click('.term-input');
+  await page.type('.term-input', command);
+  await page.keyboard.press('Enter');
+  try {
+    await page.waitForFunction((w) => document.querySelector('.term-out')?.textContent.includes(w), { timeout: 30_000 }, waitFor);
+  } catch {
+    throw new Error(`the terminal never showed "${waitFor}":\n${(await page.$eval('.term-out', (el) => el.textContent)).slice(-600)}`);
+  }
+  return page.$eval('.term-out', (el) => el.textContent);
+}
+
+try {
+  const page = await browser.newPage();
+  page.on('pageerror', (e) => console.log('  [pageerror]', e.message));
+  page.on('dialog', (d) => d.accept());
+  await page.goto(base);
+  await page.waitForSelector('.tree-row', { timeout: 60_000 });
+
+  await check('a first visit opens the welcome project', async () => {
+    const names = await page.$$eval('.tree-row .name', (els) => els.map((e) => e.textContent));
+    expect(names.includes('README.md') && names.includes('hello.py'), `tree: ${names}`);
+    expect((await page.$eval('.editor-title', (e) => e.textContent)) === '/README.md', 'README not open');
+  });
+
+  await check('the terminal runs Python on Zipp against the project', async () => {
+    const out = await terminal(page, 'python hello.py', 'mean temperature');
+    expect(/mean temperature: 19\.8/.test(out), out);
+  });
+
+  await check('an AI provider is set up in Settings', async () => {
+    await page.click('button[title="AI providers"]');
+    await page.waitForSelector('dialog.settings[open]');
+    await page.evaluate(() => [...document.querySelectorAll('dialog.settings button')].find((b) => b.textContent.includes('Add a provider')).click());
+    await page.select('dialog.settings select', 'local-other');
+    await page.evaluate((url) => {
+      const set = (label, value) => {
+        const input = [...document.querySelectorAll('dialog.settings label')].find((l) => l.firstChild.textContent === label).querySelector('input');
+        input.value = value;
+        input.dispatchEvent(new Event('input'));
+      };
+      set('Address', url);
+      set('Model', 'mock-model');
+    }, modelUrl);
+    await page.evaluate(() => [...document.querySelectorAll('dialog.settings button')].find((b) => b.textContent === 'Save').click());
+    await page.waitForFunction(() => document.querySelector('button[title="AI provider"]')?.textContent.includes('mock-model'));
+  });
+
+  await check('the agent runs the shell and Python, and answers', async () => {
+    await page.type('.chat-input', 'What is the mean temperature? Save it.');
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() => document.querySelector('.chat-log')?.textContent.includes('saved in data/mean.txt'), { timeout: 60_000 });
+    const cards = await page.$$eval('details.tool', (els) => els.map((e) => `${e.className}|${e.querySelector('summary').textContent}`));
+    expect(cards.length === 2 && cards.every((c) => c.includes('ok')), `cards: ${cards}`);
+    expect(JSON.stringify(requests[1]).includes('weather.csv') && JSON.stringify(requests[1]).includes('5'), 'shell output not sent back');
+    expect(JSON.stringify(requests[2]).includes('mean 19.8'), 'python output not sent back');
+    const out = await terminal(page, 'cat data/mean.txt', '19.8\n');
+    expect(out.includes('19.8'), out);
+  });
+
+  await check('/internet off closes the gate for the sandbox', async () => {
+    await page.type('.chat-input', '/internet off');
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() => document.querySelector('button[title="Network gate (/internet)"]')?.textContent === 'internet: off');
+    const out = await terminal(page, 'curl -sS https://example.com', 'network gate is closed');
+    expect(out.includes('was not contacted'), out);
+  });
+
+  await check('the project, the conversation and the gate survive a reload', async () => {
+    await new Promise((r) => setTimeout(r, 800));
+    await page.reload();
+    await page.waitForSelector('.tree-row', { timeout: 60_000 });
+    const out = await terminal(page, 'cat data/mean.txt', '19.8');
+    expect(out.includes('19.8'), out);
+    const log = await page.$eval('.chat-log', (e) => e.textContent);
+    expect(log.includes('What is the mean temperature?') && log.includes('saved in data/mean.txt'), `log: ${log.slice(0, 300)}`);
+    expect((await page.$eval('button[title="Network gate (/internet)"]', (e) => e.textContent)) === 'internet: off', 'gate not remembered');
+  });
+} finally {
+  await browser.close();
+  await server.close();
+  model.close();
+}
+console.log(failures ? `\n${failures} failed` : '\nall passed');
+process.exit(failures ? 1 : 0);
