@@ -309,7 +309,12 @@ fn classify_header(h: &Header, path: &Path, format: &'static str) -> Result<Dete
     if let Some(family) = ltx_family(h) {
         // Parts of an LTX release that the worker has no use for.
         if config.contains("\"audio_vae\"") || has(h, "audio_vae.decoder.") {
-            return Err(format!("{label}: LTX audio VAE; nrob makes silent video, so it is not needed"));
+            // LTX 2.5 ships the vocoder with its bandwidth extension beside the decoder.
+            if family == "ltx-2.5" && has(h, "vocoder.bwe_generator.") {
+                return Ok(detected(Role::Component { kind: "audio_vae" }, format,
+                    format!("LTX 2.5 audio VAE and vocoder ({label}); gives LTX 2.5 clips a soundtrack"), vec![("audio_vae", p)]));
+            }
+            return Err(format!("{label}: an LTX {} audio VAE; nrob generates audio with LTX 2.5 models only", &family[4..]));
         }
         if config.contains("CausalDiffusionVAE") || has(h, "decoder.diff_blocks.") {
             return Err(format!("{label}: LTX {} diffusion-decoder VAE, which nrob does not run; use the conv VAE (ltx-2.5-video-vae-conv) instead", &family[4..]));
@@ -426,7 +431,7 @@ fn directory(dir: &Path) -> Result<Detected, String> {
         if let Some(t) = first("diffusion_models") {
             let mut d = safetensors_file(&t)?;
             if let Role::Video { .. } = d.role {
-                for (sub, key, kind) in [("text_encoders", "text_encoder", "video_text_encoder"), ("vae", "vae", "vae")] {
+                for (sub, key, kind) in [("text_encoders", "text_encoder", "video_text_encoder"), ("vae", "vae", "vae"), ("vae", "audio_vae", "audio_vae")] {
                     if let Some(p) = part(sub, kind) {
                         d.fields.retain(|(k, _)| k != key);
                         d.fields.push((key.into(), path_json(&p)));
@@ -647,8 +652,9 @@ mod tests {
         assert_eq!(detect(&gemma).unwrap().kind(), "video_text_encoder");
         // Sorted first in vae/, but neither is a VAE nrob can use.
         let audio = root.join("vae").join("a_audio_vae.safetensors");
-        safetensors(&audio, &format!(r#"{{"__metadata__":{{"model_version":"2.5.0","config":"{{\"audio_vae\":{{}}}}"}},{}}}"#, t("audio_vae.decoder.conv_in.conv.bias", "BF16")));
-        assert!(detect(&audio).unwrap_err().contains("audio VAE"));
+        safetensors(&audio, &format!(r#"{{"__metadata__":{{"model_version":"2.5.0","config":"{{\"audio_vae\":{{}}}}"}},{},{}}}"#,
+            t("audio_vae.decoder.conv_in.conv.bias", "BF16"), t("vocoder.bwe_generator.conv_pre.weight", "BF16")));
+        assert_eq!(detect(&audio).unwrap().kind(), "audio_vae");
         let diffusion = root.join("vae").join("b_video_vae.safetensors");
         safetensors(&diffusion, &format!(r#"{{"__metadata__":{{"model_version":"2.5.0","config":"{{\"vae\":{{\"_class_name\":\"CausalDiffusionVAE\"}}}}"}},{},{}}}"#, t("decoder.conv_in.weight", "BF16"), t("decoder.diff_blocks.0.x", "BF16")));
         assert!(detect(&diffusion).unwrap_err().contains("diffusion-decoder"));
@@ -656,7 +662,8 @@ mod tests {
         assert_eq!(r.role, Role::Video { family: "ltx-2.5" });
         let field = |k: &str| r.fields.iter().find(|(f, _)| f == k).map(|(_, v)| v.as_str().unwrap_or("").to_string());
         assert!(field("text_encoder").unwrap().ends_with("gemma4-int8.safetensors"));
-        assert_eq!(field("vae"), None, "no usable VAE in the folder");
+        assert!(field("audio_vae").unwrap().ends_with("a_audio_vae.safetensors"));
+        assert_eq!(field("vae"), None, "no usable video VAE in the folder");
         assert_eq!(r.missing, vec!["vae".to_string()]);
     }
 }

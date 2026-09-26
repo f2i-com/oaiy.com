@@ -492,6 +492,19 @@ pub fn video_request(cfg: &Json, root: &Path, output_root: &Path, body: &Json, a
             None => return Err(format!("video model {name} needs {key}")),
         }
     }
+    // A soundtrack comes with LTX 2.5 models that have their audio VAE, unless
+    // the request says `"audio": false`.
+    let audio_vae = if family == "ltx-2.5" { path_field(root, model, "audio_vae") } else { None };
+    match body.get("audio") {
+        None | Some(Json::Null) => {}
+        Some(Json::Bool(false)) => f.push(("audio".into(), Json::Bool(false))),
+        Some(Json::Bool(true)) if audio_vae.is_some() => f.push(("audio".into(), Json::Bool(true))),
+        Some(Json::Bool(true)) => return Err(format!("video model {name} has no audio VAE, so it cannot make sound")),
+        Some(_) => return Err("audio must be true or false".into()),
+    }
+    if let Some(p) = audio_vae {
+        f.push(("audio_vae".into(), Json::str(p)));
+    }
     let start = body.get("input_reference").or_else(|| body.get("image"));
     if let Some(v) = start {
         if let Some(p) = reference_image(v, output_root, allow_local)? {

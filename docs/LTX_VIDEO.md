@@ -1,7 +1,8 @@
 # Native LTX video
 
-The `nrob-diffusion` worker implements silent text-to-video and image-to-video with optional start/end images for distilled
-LTX 2.3, LTX 2.5 and Sulphur-2 checkpoints in Rust. Candle supplies tensor
+The `nrob-diffusion` worker implements text-to-video and image-to-video with optional start/end images for distilled
+LTX 2.3, LTX 2.5 and Sulphur-2 checkpoints in Rust. LTX 2.5 clips also get a
+soundtrack generated with the picture (see [Audio](#audio-ltx-25)). Candle supplies tensor
 operations and CUDA kernels. Gemma text encoding, the video transformer,
 eight-step Euler sampling and the convolutional VAE run inside the worker.
 FFmpeg only encodes the decoded pixels into an H.264 MP4; it does not run models.
@@ -34,9 +35,8 @@ directly, without conversion:
 The worker does not apply video LoRAs (merged checkpoints are fine), and does
 not interpret NVFP4 or GGUF video weights. It does not run the LTX 2.5
 diffusion-decoder VAE (`CausalDiffusionVAE`, with `decoder.diff_blocks.*`);
-the conv VAE decodes the same latents. Audio VAEs and latent upscalers that
-ship with a release are not used: output is silent and rendered in one pass
-at the requested size.
+the conv VAE decodes the same latents. Latent upscalers that ship with a
+release are not used: clips render in one pass at the requested size.
 
 For example, the merged
 LTX 2.5 v1.1 fine-tune
@@ -102,8 +102,8 @@ Image's six-step setting does not apply to LTX. This video path currently
 accepts optional `image` (starting frame) and `end_image` (final-frame guidance),
 each containing one absolute local image path. Omit both for text-to-video,
 provide just `image` for ordinary image-to-video, or supply both endpoints.
-An end image alone is also accepted. General reference-image arrays and audio
-are not supported by this video path.
+An end image alone is also accepted. General reference-image arrays are not
+supported, and audio is generated rather than accepted as an input.
 
 For image-to-video, add
 `"image": "E:/images/fox.png"` to the request. The worker center-crops and resizes
@@ -157,8 +157,13 @@ server configuration, never from the generation request.
 
 `ram_gb` and `vram_gb` are weight-cache budgets, not total process memory limits.
 The server caps requested budgets at its configured values. The worker also
-caps GPU residency against current free VRAM with space reserved for activations,
-global projections and a streamed block. OS file caching may service SSD reads
+measures free VRAM before keeping each block on the GPU. A block stays only
+while room remains to stream three more of its size, plus 2 GiB for
+activations. Everything else is served from RAM or the checkpoint, so `auto`
+adapts to whatever card it runs on. With a 4 GiB weight budget, a 2-second
+LTX 2.5 clip with sound peaked at about 8 GiB of VRAM (CUDA context and
+allocator cache included). An 8 GiB card handles short clips; 12 GiB is
+comfortable. OS file caching may service SSD reads
 from RAM; no converted files or secondary weight cache are created.
 
 All modes still need GPU space for an individual block and compute workspace.
@@ -173,7 +178,8 @@ GPU residency, 63 seconds with RAM offload, and 106 seconds with direct weight
 reads. The three modes produced byte-identical MP4 files for the same prompt
 and seed. These are individual measurements with warm file caches and concurrent
 model downloads, not guaranteed latency. GPU denoising took about 14 seconds;
-text encoding remained a substantial part of total time. Clips are silent.
+text encoding remained a substantial part of total time. (Sulphur and LTX 2.3
+clips are silent.)
 
 A repeated-prompt image-to-video run after these changes took 17.7 seconds for
 512×320, 49 frames on the second RTX 5090: 0.51 seconds for the starting image,
@@ -200,6 +206,48 @@ residency. `weight_bytes_read` counts checkpoint bytes requested by that store,
 including conditioning projections/connectors; it is not physical disk traffic
 and excludes the separate Gemma/VAE readers.
 
+## Audio (LTX 2.5)
+
+LTX 2.5 is an audio-video model: every transformer block carries an audio
+stream (2048 wide, 32 heads of 64) next to the video stream. The two streams
+attend to each other both ways. When the request names the model's `audio_vae`,
+the worker generates both streams together:
+
+- **Text:** Gemma 4's `audio_aggregate_embed` and the transformer's
+  `audio_embeddings_connector` produce the audio prompt context. It is cached
+  alongside the video context.
+- **Latent:** a noise latent of 25 frames per second of video, 128 wide,
+  denoised on the same eight-step schedule in the same transformer calls. A
+  starting or ending image conditions only the picture.
+- **Decoding:** the audio VAE decoder produces a stereo log-mel spectrogram. The
+  vocoder turns it into 16 kHz audio, and its bandwidth extension lifts that to
+  48 kHz. The result is trimmed to the clip's exact length and muxed as stereo
+  AAC. All of this runs in F32, as the reference does.
+
+Request fields:
+
+| Field | Meaning |
+|---|---|
+| `audio_vae` | The release's audio VAE file (`audio_vae.*` plus `vocoder.*`, LTX 2.5 layout). |
+| `audio` | `true` or `false`. It defaults to on for `ltx-2.5` whenever `audio_vae` is given. |
+
+The result reports `audio`, `sample_rate` and `audio_seconds`.
+
+Audio adds about 44% to each block's weights (5.6B parameters in all), and the
+VRAM checks above count them. Compute grows by about 12%. Decoding 4 seconds of
+audio takes about 0.6 s on an RTX 5090. A 4-second 768×512 clip with sound took
+70 s end to end there, 26 s of it denoising, with 22 GB of weights resident and
+7 GB streamed from RAM.
+
+Prompts can describe sound as well as picture: speech in quotes, sound
+effects, "unscored" for no music. Fine-tunes trained with an in-context LoRA
+may document `[VISUAL]`, `[SPEECH]` and `[SOUNDS]` sections.
+
+Limits: the official LTX 2.5 pipeline samples its first stage ancestrally and
+refines at a second stage. This worker is single-stage Euler (as for video),
+which may cost some audio fidelity. Audio for LTX 2.3 and Sulphur is not
+implemented.
+
 ## Verification
 
 `cargo test --workspace` covers request constraints, trusted path selection,
@@ -208,6 +256,24 @@ exercise the real convolutional VAE. Opt-in reference tests compare Gemma 3
 local/global attention and a Sulphur video block against the official PyTorch implementations;
 the block test also requires identical RAM-cache and SSD-read results.
 PyTorch is only an offline verification tool, never an inference dependency.
+
+Audio has its own references, from `tools/ltx/audio_reference.py` run against
+the official checkout (strict F32, TF32 off). The opt-in tests are
+`ltx::audio::tests` (audio VAE file) and the `audio_*` tests in
+`ltx::transformer::tests`. Measured relative RMS errors:
+
+| Stage | Error |
+|---|---|
+| Audio VAE decoder | 3e-7 |
+| Vocoder | 9e-6 |
+| Vocoder with bandwidth extension | 1e-5 |
+| First audio-video block (video / audio) | 0.11% / 0.05% |
+| Two-block velocities (video / audio) | 0.41% / 0.26% |
+| Audio text connector | 0.45% |
+
+The last three run the official BF16 transformer as the reference, cut to its
+first two blocks. The video-only path is unchanged by the audio work: the
+existing video tests produce identical numbers before and after.
 
 Quantized weights are covered separately:
 - Unit tests decode fp8 and int8 with scalar and per-row scales, from the RAM

@@ -167,19 +167,23 @@ fn hidden_features(
         states.push(feature_norm(&x)?);
         progress(i + 1);
     }
-    let stacked = (Tensor::stack(&states, 3)?.flatten_from(2)? * (4096f64 / 3840.).sqrt())?;
-    Ok(stacked)
+    // Each stream rescales these by its own width (see `encode`).
+    Tensor::stack(&states, 3)?.flatten_from(2)
 }
 
+/// Prompt features for the video stream, and for the audio stream when
+/// `audio` (LTX 2.5: Gemma 4's `audio_aggregate_embed`).
+#[allow(clippy::too_many_arguments)]
 pub fn encode(
     path: &Path,
     tokenizer: Option<&Path>,
     projection: &mut Store,
     prompt: &str,
     gemma4: bool,
+    audio: bool,
     dev: &Device,
     mut progress: impl FnMut(usize),
-) -> Result<Tensor> {
+) -> Result<(Tensor, Option<Tensor>)> {
     let mut store = Store::open(path, 0)?;
     let bytes = if gemma4 {
         store
@@ -205,7 +209,8 @@ pub fn encode(
         ids.insert(0, 2);
     }
     ids.truncate(1024);
-    let stacked = hidden_features(&mut store, &ids, gemma4, dev, &mut progress)?;
+    let normed = hidden_features(&mut store, &ids, gemma4, dev, &mut progress)?;
+    let stacked = (&normed * (4096f64 / 3840.).sqrt())?;
     let w = if gemma4 {
         store.group("text_embedding_projection.", dev, false, |k| {
             k.starts_with("video_aggregate_embed.")
@@ -215,7 +220,19 @@ pub fn encode(
             k.starts_with("video_aggregate_embed.")
         })?
     };
-    w.linear("video_aggregate_embed", &stacked)
+    let video = w.linear("video_aggregate_embed", &stacked)?;
+    let audio = if audio {
+        if !gemma4 {
+            candle_core::bail!("audio prompt features need the LTX 2.5 Gemma 4 encoder");
+        }
+        let w = store.group("text_embedding_projection.", dev, false, |k| {
+            k.starts_with("audio_aggregate_embed.")
+        })?;
+        Some(w.linear("audio_aggregate_embed", &(&normed * (2048f64 / 3840.).sqrt())?)?)
+    } else {
+        None
+    };
+    Ok((video, audio))
 }
 
 #[cfg(test)]
@@ -268,7 +285,7 @@ mod tests {
         if features {
             let ids: Vec<u32> = std::iter::once(2).chain(100..115).collect();
             return compare(
-                hidden_features(&mut store, &ids, true, &dev, |_| {})?,
+                (hidden_features(&mut store, &ids, true, &dev, |_| {})? * (4096f64 / 3840.).sqrt())?,
                 "gemma4-features.f32",
             );
         }
@@ -304,7 +321,7 @@ mod tests {
         let mut store = Store::open(Path::new(&weights), 0)?;
         let ids: Vec<u32> = std::iter::once(2).chain(100..115).collect();
         let actual =
-            hidden_features(&mut store, &ids, false, &dev, |_| {})?.to_dtype(DType::F32)?;
+            (hidden_features(&mut store, &ids, false, &dev, |_| {})? * (4096f64 / 3840.).sqrt())?.to_dtype(DType::F32)?;
         let expected = Tensor::from_raw_buffer(
             &std::fs::read(root.join("gemma-features.f32"))?,
             DType::F32,

@@ -514,6 +514,7 @@ dialog::backdrop { background: var(--backdrop); }
               <div class="grid-f" style="grid-template-columns:1fr 1fr">
                 <label class="f"><span>Length (seconds)</span><input type="number" id="vid-secs" min="0.5" max="5" step="0.5" value="2"></label>
                 <label class="f"><span>Seed</span><input type="number" id="vid-seed" min="0" placeholder="random"></label>
+                <label class="check" id="vid-sound-row" title="LTX 2.5 models with an audio VAE generate a soundtrack with the picture"><input type="checkbox" id="vid-sound" checked> Sound</label>
               </div>
               <input type="file" id="vid-image" accept="image/png,image/jpeg,image/webp" hidden>
               <div class="dropzone" id="vid-drop" tabindex="0" role="button" aria-label="Drop a start frame here, or click to choose (optional)">
@@ -951,7 +952,7 @@ $("#pick-path").onkeydown = e => { if (e.key === "Enter") browse($("#pick-path")
 
 /* ---------- add model ---------- */
 const kindName = {llm: "Language model", image: "Image model", video: "Video model", vision_projector: "Vision projector", adapter: "LoRA adapter", image_base: "Qwen Image base folder",
-  text_encoder: "Image text encoder", video_text_encoder: "Video text encoder", vae: "VAE", tokenizer: "Gemma tokenizer", clip_tokenizer: "CLIP tokenizer", ffmpeg: "FFmpeg"};
+  text_encoder: "Image text encoder", video_text_encoder: "Video text encoder", vae: "VAE", audio_vae: "Audio VAE", tokenizer: "Gemma tokenizer", clip_tokenizer: "CLIP tokenizer", ffmpeg: "FFmpeg"};
 async function detectPath() {
   const path = $("#add-path").value.trim(); if (!path) return;
   const out = $("#add-result");
@@ -1027,8 +1028,9 @@ function renderModels() {
   const vid = Object.entries(cfg.media.video.models);
   $("#m-video").innerHTML = vid.length ? vid.map(([name, m]) => {
     const miss = missingOf("video", m);
-    const fields = ["transformer", "vae", "text_encoder", "tokenizer"].filter(k => k !== "tokenizer" || m.family !== "ltx-2.5")
-      .map(k => field({transformer: "Transformer", vae: "VAE", text_encoder: "Text encoder (Gemma)", tokenizer: "Gemma tokenizer.json"}[k], "video", name, k, m[k], {missing: miss.includes(k)})).join("");
+    const fields = ["transformer", "vae", "text_encoder", "tokenizer", "audio_vae"]
+      .filter(k => (k !== "tokenizer" || m.family !== "ltx-2.5") && (k !== "audio_vae" || m.family === "ltx-2.5"))
+      .map(k => field({transformer: "Transformer", vae: "VAE", text_encoder: "Text encoder (Gemma)", tokenizer: "Gemma tokenizer.json", audio_vae: "Audio VAE (optional, for sound)"}[k], "video", name, k, m[k], {missing: miss.includes(k)})).join("");
     return mediaItem("video", name, m, (m.family || name).toUpperCase().replace("SULPHUR", "Sulphur"), miss, fields);
   }).join("") : '<div class="empty">No video model yet. Add an LTX 2.3, LTX 2.5 or Sulphur .safetensors file.</div>';
 
@@ -1238,6 +1240,7 @@ function renderSelects() {
   $("#vid-model").innerHTML = opts(Object.keys(cfg.media.video.models).filter(n => cfg.media.video.models[n].enabled !== false), v || cfg.media.video.default_model);
   segment($("#img-tier"), imgTier ||= cfg.media.image.memory || "auto", t => imgTier = t);
   segment($("#vid-tier"), vidTier ||= cfg.media.video.memory || "auto", t => vidTier = t);
+  renderSound();
 }
 let imgTier = "", vidTier = "";
 
@@ -1388,6 +1391,14 @@ function dropzone(k, input, max) {
 }
 const clearImgRefs = dropzone("img", $("#img-refs"), 3);
 const clearVidRef = dropzone("vid", $("#vid-image"), 1);
+// Sound is offered for LTX 2.5 models that have their audio VAE.
+function soundCapable() {
+  const name = $("#vid-model").value || cfg?.media?.video?.default_model;
+  const m = cfg?.media?.video?.models?.[name];
+  return !!(m && m.family === "ltx-2.5" && m.audio_vae);
+}
+function renderSound() { $("#vid-sound-row").hidden = !soundCapable(); }
+$("#vid-model").addEventListener("change", renderSound);
 ["img", "vid"].forEach(k => $(`#${k}-prompt`).addEventListener("keydown", e => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); $(`#${k}-form`).requestSubmit(); } }));
 
 // The stage shows one result large; the strip keeps this session's.
@@ -1455,6 +1466,7 @@ $("#vid-form").onsubmit = async e => {
   e.preventDefault();
   const body = {prompt: $("#vid-prompt").value, model: $("#vid-model").value || undefined, size: $("#vid-size").value, seconds: $("#vid-secs").value, memory: vidTier};
   if ($("#vid-seed").value) body.seed = +$("#vid-seed").value;
+  if (soundCapable() && !$("#vid-sound").checked) body.audio = false;
   const f = $("#vid-image").files[0]; if (f) body.input_reference = {image_url: await readAsDataUrl(f)};
   $("#vid-go").disabled = true; progress("vid", "Starting", 1);
   try {

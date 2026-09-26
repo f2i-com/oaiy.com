@@ -98,6 +98,10 @@ mod tests {
         assert_eq!(store.host_bytes, 4);
         let rows = store.rows("model.diffusion_model.emb.weight", &[1, 0], &Device::Cpu)?;
         assert_eq!(get(rows), vec![31.75, -32.0, 0.25, -0.25]);
+        // Every int8 byte, 0xFF included.
+        let all: Vec<f32> = (0..=255u8).map(|b| b as i8 as f32 * 0.25).collect();
+        let decoded = decode("all.weight", Dtype::I8, &[256], &(0..=255u8).collect::<Vec<_>>(), Some(&[0.25]), &Device::Cpu)?;
+        assert_eq!(get(decoded), all);
         let per_row = store.tensor("model.diffusion_model.rows.weight", &Device::Cpu, false)?;
         assert_eq!(get(per_row), vec![2.0, 4.0, 1.0, 2.0]);
         // Scales are applied, not loaded as weights of their own.
@@ -335,29 +339,35 @@ fn decode(key: &str, dtype: Dtype, shape: &[usize], bytes: &[u8], scale: Option<
 }
 
 fn decode_as(key: &str, dtype: Dtype, shape: &[usize], bytes: &[u8], scale: Option<&[f32]>, dev: &Device, out: DType) -> Result<Tensor> {
+    let quantized = matches!(dtype, Dtype::F8E4M3 | Dtype::I8);
+    if quantized && scale.is_none_or(|s| s.len() == 1) {
+        // Each byte is looked up in a 256-entry table that already carries the
+        // tensor's scale, rounded once to the output type: exact, the same on
+        // every GPU (candle's own fp8 casts are not built for sm_120), and with
+        // no full-precision copy of the weight on the device.
+        let s = scale.map_or(1., |s| s[0]);
+        let values: Vec<f32> = match dtype {
+            Dtype::F8E4M3 => e4m3_table().iter().map(|v| v * s).collect(),
+            _ => (0..=255u8).map(|b| b as i8 as f32 * s).collect(),
+        };
+        let table = Tensor::from_vec(values, 256, dev)?.to_dtype(out)?;
+        // Widened to u32: candle reads an index equal to its type's maximum
+        // (255 for u8) as padding and yields zero, which would erase every
+        // int8 -1 and fp8 0xFF.
+        let codes = Tensor::from_raw_buffer(bytes, DType::U8, &[bytes.len()], dev)?.to_dtype(DType::U32)?;
+        return table.index_select(&codes, 0)?.reshape(shape);
+    }
     let t = match dtype {
         Dtype::BF16 => Tensor::from_raw_buffer(bytes, DType::BF16, shape, dev)?,
         Dtype::F16 => Tensor::from_raw_buffer(bytes, DType::F16, shape, dev)?,
         Dtype::F32 => Tensor::from_raw_buffer(bytes, DType::F32, shape, dev)?,
         Dtype::U8 if scale.is_none() => Tensor::from_raw_buffer(bytes, DType::U8, shape, dev)?,
-        // candle's own fp8 casts are not built for every GPU (sm_120 lacks
-        // them), so each byte is looked up in the E4M3 table instead: exact,
-        // and the same everywhere.
-        Dtype::F8E4M3 => {
-            let lut = Tensor::from_vec(e4m3_table().to_vec(), 256, dev)?;
-            let codes = Tensor::from_raw_buffer(bytes, DType::U8, &[bytes.len()], dev)?;
-            lut.index_select(&codes, 0)?.reshape(shape)?
-        }
-        Dtype::I8 => {
-            let u = Tensor::from_raw_buffer(bytes, DType::U8, shape, dev)?.to_dtype(DType::F32)?;
-            let negative = u.ge(128f64)?.to_dtype(DType::F32)?;
-            (u - (negative * 256.)?)?
-        }
+        // Per-row scales: the unscaled table, then the rows' scales in F32.
+        Dtype::F8E4M3 | Dtype::I8 => decode_as(key, dtype, shape, bytes, None, dev, DType::F32)?,
         other => candle_core::bail!("LTX tensor {key}: unsupported dtype {other:?}"),
     };
     let t = match scale {
         None => t,
-        Some([s]) => t.to_dtype(DType::F32)?.affine(*s as f64, 0.)?,
         Some(rows) if shape.first() == Some(&rows.len()) => {
             let mut dims = vec![1; shape.len()];
             dims[0] = rows.len();

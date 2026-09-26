@@ -81,5 +81,74 @@ def decode():
     dump('audio-wave.f32', wave)
 
 
+def transformer():
+    from ltx_core.model.transformer.model_configurator import LTXModelConfigurator
+    from ltx_core.model.transformer.modality import Modality
+    from ltx_core.text_encoders.gemma.encoders.encoder_configurator import AudioEmbeddings1DConnectorConfigurator
+    w = safe_open(args.checkpoint, framework='pt', device=args.device)
+    keys = set(w.keys())
+
+    def get(k):
+        full = 'model.diffusion_model.' + k
+        return w.get_tensor(full if full in keys else k)
+
+    metadata = w.metadata()
+    metadata['config'] = json.loads(metadata['config'])
+    # The first two blocks exercise every audio path and fit on one GPU.
+    small = json.loads(json.dumps(metadata))
+    small['config']['transformer']['num_layers'] = 2
+    with torch.device('meta'):
+        model = LTXModelConfigurator.from_metadata(small)
+    model.load_state_dict({k: get(k) for k in model.state_dict()}, strict=True, assign=True)
+    print('Loaded a two-block official audio-video transformer', flush=True)
+
+    d = args.device
+    tv, conditioned, ta = 16, 4, 6
+    x = torch.sin(torch.arange(tv * 128, device=d) * .013).reshape(1, tv, 128).to(torch.bfloat16)
+    context = torch.sin(torch.arange(8 * 4096, device=d) * .021).reshape(1, 8, 4096).to(torch.bfloat16)
+    positions = torch.tensor([[[0., 1. / 24], [y * 32, (y + 1) * 32], [x_ * 32, (x_ + 1) * 32]]
+                              for y in range(4) for x_ in range(4)],
+                             device=d, dtype=torch.float32).permute(1, 0, 2).unsqueeze(0)
+    timesteps = torch.full((1, tv), .725, device=d)
+    timesteps[:, :conditioned] = 0
+    ax = torch.cos(torch.arange(ta * 128, device=d) * .017).reshape(1, ta, 128).to(torch.bfloat16)
+    actx = torch.sin(torch.arange(8 * 2048, device=d) * .023).reshape(1, 8, 2048).to(torch.bfloat16)
+    # Latent frame i covers mel frames [max(4i-3, 0), 4i+1) at 100 frames per second.
+    apos = torch.tensor([[max(4 * i - 3, 0) * .01, (4 * i + 1) * .01] for i in range(ta)],
+                        device=d, dtype=torch.float32).reshape(1, 1, ta, 2)
+    sigma = torch.tensor([.725], device=d)
+    video = Modality(latent=x, sigma=sigma, timesteps=timesteps, positions=positions, context=context,
+                     keyframes_mask=torch.ones((1, tv, 1), device=d))
+    audio = Modality(latent=ax, sigma=sigma, timesteps=torch.full((1, ta), .725, device=d),
+                     positions=apos, context=actx)
+    def after_block0(module, inputs, outputs):
+        dump('av-block0-video.f32', outputs[0].x)
+        dump('av-block0-audio.f32', outputs[1].x)
+
+    model.transformer_blocks[0].register_forward_hook(after_block0)
+    with torch.inference_mode():
+        vout, aout = model(video, audio, None)
+    for name, value in [('av-video-input.f32', x), ('av-video-context.f32', context), ('av-audio-input.f32', ax),
+                        ('av-audio-context.f32', actx), ('av-video-output.f32', vout), ('av-audio-output.f32', aout)]:
+        dump(name, value)
+    del model
+
+    connector = AudioEmbeddings1DConnectorConfigurator.from_metadata(metadata)
+    prefix = 'audio_embeddings_connector.'
+    connector.load_state_dict({k: get(prefix + k) for k in connector.state_dict()}, strict=True)
+    connector = connector.to(d, torch.bfloat16).eval()
+    n = 12
+    feats = torch.sin(torch.arange(n * 2048, device=d) * .019).reshape(1, n, 2048).to(torch.bfloat16)
+    padded = torch.cat([feats, torch.zeros(1, 1024 - n, 2048, device=d, dtype=torch.bfloat16)], 1)
+    mask = torch.zeros(1, 1, 1, 1024, device=d, dtype=torch.bfloat16)
+    mask[..., n:] = -torch.finfo(torch.bfloat16).max
+    with torch.inference_mode():
+        out_, _ = connector(padded, mask)
+    dump('audio-connector-input.f32', feats)
+    dump('audio-connector-output.f32', out_)
+
+
 if args.part == 'decode':
     decode()
+else:
+    transformer()

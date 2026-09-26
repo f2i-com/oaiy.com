@@ -135,6 +135,7 @@ fn companion(cfg: &Json, section: &str, entry: &Json, missing: &str, picked: &Pa
         ("image", "tokenizer") => &|d| d.kind() == "clip_tokenizer",
         ("video", "tokenizer") => &|d| d.kind() == "tokenizer",
         ("video", "vae") => &|d| d.kind() == "vae",
+        ("video", "audio_vae") if family == "ltx-2.5" => &|d| d.kind() == "audio_vae",
         ("video", "text_encoder") if family == "ltx-2.5" => &|d| d.kind() == "video_text_encoder" && d.summary.contains("2.5"),
         ("video", "text_encoder") => &|d| d.kind() == "video_text_encoder" && !d.summary.contains("2.5"),
         _ => return None,
@@ -156,6 +157,21 @@ fn attach(cfg: &mut Json, d: &Detected, target: Option<(&str, &str)>) -> Result<
         "clip_tokenizer" => ("image", "tokenizer", Box::new(|m| str_or(m, "architecture", "") == "sdxl")),
         "tokenizer" => ("video", "tokenizer", Box::new(|m| str_or(m, "family", "") != "ltx-2.5")),
         "vae" => ("video", "vae", Box::new(|_| true)),
+        "audio_vae" => {
+            // One vocoder serves every LTX 2.5 model: each that lacks it gets it.
+            let value = field_of(d, "audio_vae").ok_or("detected part has no path")?;
+            let Some(Json::Obj(models)) = obj_mut(cfg, &["media", "video", "models"]) else { return Err("no video models".into()) };
+            let mut named = None;
+            for (n, m) in models.iter_mut() {
+                let chosen = target.is_some_and(|(_, t)| n == t);
+                if str_or(m, "family", "") == "ltx-2.5" && (chosen || str_or(m, "audio_vae", "").trim().is_empty()) {
+                    set(m, "audio_vae", value.clone());
+                    named.get_or_insert_with(|| n.clone());
+                }
+            }
+            let name = named.ok_or_else(|| format!("{}: add an LTX 2.5 model first", d.summary))?;
+            return Ok(Added { section: "video", name, missing: Vec::new(), enabled: true });
+        }
         "video_text_encoder" => {
             let v25 = d.summary.contains("2.5");
             ("video", "text_encoder", Box::new(move |m| (str_or(m, "family", "") == "ltx-2.5") == v25))
@@ -280,6 +296,12 @@ pub fn add(cfg: &mut Json, path: &Path, name: Option<&str>, target: Option<(&str
                     set(&mut entry, &m, v);
                 }
             }
+            if section == "video" && str_or(&entry, "family", "") == "ltx-2.5" && str_or(&entry, "audio_vae", "").is_empty() {
+                // Optional: the soundtrack's decoder, from another LTX 2.5 model or nearby.
+                if let Some(a) = companion(cfg, "video", &entry, "audio_vae", path) {
+                    set(&mut entry, "audio_vae", a);
+                }
+            }
             if section == "image" && str_or(&entry, "architecture", "") == "qwen-image" && str_or(&entry, "adapter", "").is_empty() {
                 // Reuse the turbo adapter another Qwen Image model already runs with.
                 if let Some(a) = companion(cfg, "image", &entry, "adapter", path) {
@@ -312,7 +334,7 @@ pub fn add(cfg: &mut Json, path: &Path, name: Option<&str>, target: Option<(&str
 /// Keys holding file paths, per section, for export and import.
 const LLM_PATHS: [&str; 3] = ["path", "vision_projector", "lora"];
 const IMAGE_PATHS: [&str; 7] = ["base", "transformer", "safetensors_transformer", "adapter", "text_encoder", "checkpoint", "tokenizer"];
-const VIDEO_PATHS: [&str; 4] = ["transformer", "text_encoder", "vae", "tokenizer"];
+const VIDEO_PATHS: [&str; 5] = ["transformer", "text_encoder", "vae", "tokenizer", "audio_vae"];
 /// Media settings that travel with the models.
 const MEDIA_SETTINGS: [&str; 4] = ["memory", "ram_gb", "vram_gb", "default_model"];
 

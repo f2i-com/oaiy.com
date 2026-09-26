@@ -9,8 +9,10 @@ use std::{
     time::UNIX_EPOCH,
 };
 
-const BYTES: usize = 1024 * 4096 * 4;
-const ENTRIES: usize = 8;
+/// Contexts are 1024 tokens of the stream's width, stored as F32.
+const TOKENS: usize = 1024;
+/// A prompt with audio keeps two entries (video and audio).
+const ENTRIES: usize = 16;
 
 fn hash(value: &[u8]) -> u64 {
     let mut h = DefaultHasher::new();
@@ -22,11 +24,20 @@ pub struct PromptCache {
     directory: PathBuf,
     path: PathBuf,
     key: String,
+    width: usize,
 }
 impl PromptCache {
+    /// The video stream's connector output (1024 x 4096).
     pub fn new(r: &Request) -> Option<Self> {
+        Self::stream(r, "nrob-ltx-conditioning-v2", 4096)
+    }
+    /// The audio stream's connector output (1024 x 2048).
+    pub fn audio(r: &Request) -> Option<Self> {
+        Self::stream(r, "nrob-ltx-audio-conditioning-v1", 2048)
+    }
+    fn stream(r: &Request, version: &str, width: usize) -> Option<Self> {
         let directory = r.cache_dir.clone()?;
-        let mut key = format!("nrob-ltx-conditioning-v2\n{}\n{}\n", r.model, r.prompt);
+        let mut key = format!("{version}\n{}\n{}\n", r.model, r.prompt);
         for path in [&r.transformer, &r.text_encoder]
             .into_iter()
             .chain(r.tokenizer.iter())
@@ -49,11 +60,15 @@ impl PromptCache {
             directory,
             path,
             key,
+            width,
         })
+    }
+    fn bytes(&self) -> usize {
+        TOKENS * self.width * 4
     }
     pub fn load(&self, dev: &Device) -> Option<Tensor> {
         let mut f = std::fs::File::open(&self.path).ok()?;
-        if f.metadata().ok()?.len() != (16 + self.key.len() + BYTES) as u64 {
+        if f.metadata().ok()?.len() != (16 + self.key.len() + self.bytes()) as u64 {
             return None;
         }
         let mut header = [0u8; 16];
@@ -68,12 +83,12 @@ impl PromptCache {
         if key != self.key.as_bytes() {
             return None;
         }
-        let mut data = vec![0u8; BYTES];
+        let mut data = vec![0u8; self.bytes()];
         f.read_exact(&mut data).ok()?;
         if hash(&data) != expected {
             return None;
         }
-        let tensor = Tensor::from_raw_buffer(&data, DType::F32, &[1, 1024, 4096], dev)
+        let tensor = Tensor::from_raw_buffer(&data, DType::F32, &[1, TOKENS, self.width], dev)
             .ok()?
             .to_dtype(DType::BF16)
             .ok()?;
@@ -91,7 +106,7 @@ impl PromptCache {
             .to_dtype(DType::F32)?
             .flatten_all()?
             .to_vec1::<f32>()?;
-        if values.len() * 4 != BYTES || values.iter().any(|v| !v.is_finite()) {
+        if values.len() * 4 != self.bytes() || values.iter().any(|v| !v.is_finite()) {
             candle_core::bail!("invalid prompt context cache shape or values");
         }
         let data: Vec<u8> = values.iter().flat_map(|x| x.to_le_bytes()).collect();
@@ -152,6 +167,7 @@ mod tests {
             directory: root.clone(),
             path: root.join("current.ltx-context"),
             key: "exact prompt and model identity".into(),
+            width: 4096,
         };
         let tensor = Tensor::ones((1, 1024, 4096), DType::F32, &Device::Cpu)?;
         cache.save(&tensor)?;
@@ -160,13 +176,14 @@ mod tests {
             directory: root.clone(),
             path: cache.path.clone(),
             key: "different prompt/model stamp!!".into(),
+            width: 4096,
         };
         assert!(wrong.load(&Device::Cpu).is_none());
         let mut data = std::fs::read(&cache.path)?;
         *data.last_mut().unwrap() ^= 1;
         std::fs::write(&cache.path, data)?;
         assert!(cache.load(&Device::Cpu).is_none());
-        for i in 0..10 {
+        for i in 0..20 {
             std::fs::write(root.join(format!("{i}.ltx-context")), b"old")?;
         }
         std::fs::write(root.join("keep.txt"), b"user file")?;

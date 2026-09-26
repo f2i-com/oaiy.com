@@ -506,11 +506,15 @@ fn prepare_video(c: &Config, body: &Json) -> Result<Json, String> {
     number("n", 1, 1, 1)?;
     let image = video_reference_path(body, "image", true)?;
     let end_image = video_reference_path(body, "end_image", true)?;
-    for key in ["images", "audio", "adapter"] {
+    for key in ["images", "adapter"] {
         if body.get(key).is_some_and(|v| !matches!(v, Json::Null)) {
             return Err(format!("{key} is not supported for video; use image for one starting frame"));
         }
     }
+    let audio = match body.get("audio") {
+        None | Some(Json::Null) => None,
+        Some(v) => Some(v.as_bool().ok_or("audio must be true or false")?),
+    };
     let memory = match body.get("memory") {
         None => "auto",
         Some(v) => v.as_str().ok_or("memory must be a string")?,
@@ -569,6 +573,20 @@ fn prepare_video(c: &Config, body: &Json) -> Result<Json, String> {
             return Err(format!("video weights are not ready: {}", path.display()));
         }
         fields.push((key.into(), Json::str(value)));
+    }
+    // LTX 2.5 models with an `audio_vae` generate a soundtrack unless asked not to.
+    let audio_vae = selected.get("audio_vae").and_then(Json::as_str).filter(|_| model == "ltx-2.5");
+    if let Some(value) = audio_vae {
+        let path = Path::new(value);
+        if !path.is_absolute() || !path.is_file() {
+            return Err(format!("audio weights are not ready: {}", path.display()));
+        }
+        fields.push(("audio_vae".into(), Json::str(value)));
+    }
+    match audio {
+        Some(true) if audio_vae.is_none() => return Err(format!("video model {model} has no audio_vae, so it cannot make sound")),
+        Some(on) => fields.push(("audio".into(), Json::Bool(on))),
+        None => {}
     }
     if let Some(ffmpeg) = config.get("ffmpeg").and_then(Json::as_str) {
         fields.push(("ffmpeg".into(), Json::str(ffmpeg)));

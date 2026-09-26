@@ -51,7 +51,9 @@ The console accepts `status`, `start`, `stop`, `open`, `jobs` and `quit`.
     downloaded or removed.
   - The Playground has Chat, Image and Video tabs sized to the window. Chat
     renders Markdown, can stop a reply mid-stream, and takes a system prompt.
-    Image and Video put the controls beside a stage showing the latest result,
+    LTX 2.5 video comes with sound when the model has its audio VAE (a
+    **Sound** switch turns it off). Image and Video put the controls beside a
+    stage showing the latest result,
     with a filmstrip of this session's results under it. The controls include
     shape presets, a drop zone for reference images or a start frame, and where
     the weights live. Ctrl+Enter generates. Link straight to a tab with
@@ -95,7 +97,8 @@ headers, never its weights, and decides what it is:
 | Diffusers folder | `model_index.json` `QwenImage*Pipeline` | an image model, or the *base* of one when it has no transformer weights |
 | SDXL `.safetensors` | `modelspec.architecture` or `conditioner.embedders.*` | an SDXL image model |
 | LTX 2.3 / 2.5, Sulphur | `__metadata__.model_version` and its `config` | a video model (2.3 files carry their own VAE) |
-| LTX 2.5 ComfyUI folder | `diffusion_models/`, `text_encoders/`, `vae/` | a complete video model |
+| LTX 2.5 ComfyUI folder | `diffusion_models/`, `text_encoders/`, `vae/` | a complete video model (with sound when its `vae/` holds the audio VAE) |
+| LTX 2.5 audio VAE | `audio_vae.*` with `vocoder.bwe_generator.*` | the optional audio VAE of every LTX 2.5 model that lacks one |
 | LoRA `.safetensors` | `lora_A`/`lora_B` keys | the turbo adapter of a Qwen Image model |
 | Text encoders | vocabulary size (Qwen3-VL ~152k, Gemma 262k) or `gemma_config` | the encoder of an image or video model |
 | `tokenizer.json` | CLIP or Gemma special tokens | the tokenizer of an SDXL or LTX 2.3 model |
