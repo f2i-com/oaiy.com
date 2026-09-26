@@ -10,6 +10,7 @@
 //! - [`ecache`]: the bounded RAM expert cache (LFRU) over a store
 //! - [`backend`]: the row-parallel pool and platform probes
 //! - [`json`]: a small JSON reader (safetensors headers, configs)
+//! - [`http`]: the minimal HTTP/1.1 server and client the API hosts share
 //! - [`error`], [`types`]: shared error and policy types
 //!
 //! std-only and no `unsafe`; see CONVENTIONS.md at the workspace root.
@@ -19,6 +20,7 @@
 pub mod backend;
 pub mod ecache;
 pub mod error;
+pub mod http;
 pub mod json;
 pub mod store;
 pub mod types;

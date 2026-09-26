@@ -73,6 +73,8 @@ const HELP: &str = "Observer: --observer-model FILE.gguf --observer-device auto|
   --local-images on|off  let requests name image files on this machine (paths,
                        file:// URLs); default on when listening on loopback only
   --quiet              no per-request log
+  --watch-stdin        exit when stdin closes: a supervisor (nrob-studio) holds
+                       the other end, so the server cannot outlive it
 ";
 
 fn parse_args() -> Result<Options, String> {
@@ -180,6 +182,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Options, Stri
                 }
             }
             "--quiet" => a.quiet = true,
+            "--watch-stdin" => watch_stdin(),
             other => return Err(format!("unknown option {other} (try --help)")),
         }
     }
@@ -203,6 +206,17 @@ mod tests {
         assert_eq!(a.tool_expert_sources["other"], std::path::PathBuf::from("source"));
         assert!(parse_args_from(["--model", "copy", "--also-ternary", "bad"].into_iter().map(str::to_owned)).is_err());
     }
+}
+
+/// Exit when stdin reaches end of file: the supervising process has gone
+/// (however it ended), and a model left running would hold its GPUs.
+fn watch_stdin() {
+    std::thread::spawn(|| {
+        let mut sink = [0u8; 256];
+        let mut stdin = std::io::stdin();
+        while std::io::Read::read(&mut stdin, &mut sink).is_ok_and(|n| n > 0) {}
+        std::process::exit(0);
+    });
 }
 
 fn main() {
