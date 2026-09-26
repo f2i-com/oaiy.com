@@ -324,8 +324,8 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
         ("render_seconds", Json::Num(render_seconds)),
         ("seconds", Json::Num(started.elapsed().as_secs_f64())),
         ("seed", Json::Int(r.seed as i64)),
-        ("language_model", lm_report),
-        ("transformer", dit_report),
+        // Where each stage's weights lived (the studio shows the renderer's).
+        ("residency", Json::obj([("language_model", lm_report), ("transformer", dit_report)])),
     ]);
     std::fs::write(path.with_extension("json"), result.to_json())?;
     Ok(result)
