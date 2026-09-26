@@ -225,3 +225,48 @@ describe('the record of failing apps', () => {
     expect(events.at(-1)).toMatchObject({ type: 'done', text: 'Changed b.' });
   });
 });
+
+describe('plan first, and carry on while there is progress', () => {
+  it('a task that changes several files without a plan is asked for one, once', async () => {
+    const fake = fakeProvider('openai', [
+      { calls: [{ name: 'write_file', input: { path: 'a.txt', content: 'a' } }, { name: 'write_file', input: { path: 'b.txt', content: 'b' } }] },
+      (body) => {
+        expect(JSON.stringify(body.messages)).toContain('there is no plan yet. Call update_plan now');
+        return { calls: [{ name: 'write_file', input: { path: 'c.txt', content: 'c' } }] };
+      },
+      { text: 'Wrote three files.' },
+    ]);
+    const { agent, emit } = setup(OPENAI);
+    await agent.run('write three files', emit);
+    expect(JSON.stringify(fake.bodies.at(-1)).match(/there is no plan yet/g)).toHaveLength(1);
+  });
+
+  it('a one-file fix is not asked for a plan', async () => {
+    const fake = fakeProvider('openai', [
+      { calls: [{ name: 'read_file', input: { path: 'src/app.js' } }] },
+      { calls: [{ name: 'edit_file', input: { path: 'src/app.js', old_string: 'hello', new_string: 'hi' } }] },
+      { text: 'Fixed.' },
+    ]);
+    const { agent, emit } = setup(OPENAI);
+    await agent.run('fix the greeting', emit);
+    expect(JSON.stringify(fake.bodies)).not.toContain('there is no plan yet');
+  });
+
+  it('keeps asking to carry on while steps get done, beyond two times', async () => {
+    const step = (done: number) => ({ goal: 'three things', items: [0, 1, 2].map((i) => ({ text: `thing ${i + 1}`, status: i < done ? 'done' : 'pending' })) });
+    fakeProvider('openai', [
+      { calls: [{ name: 'update_plan', input: step(0) }] },
+      { text: 'pausing' },
+      { calls: [{ name: 'update_plan', input: step(1) }] },
+      { text: 'pausing again' },
+      { calls: [{ name: 'update_plan', input: step(2) }] },
+      { text: 'and again' },
+      { calls: [{ name: 'update_plan', input: step(3) }] },
+      { text: 'All three done.' },
+    ]);
+    const { agent, events, emit } = setup(OPENAI);
+    await agent.run('do three things', emit);
+    expect(events.filter((e) => e.type === 'nudge')).toHaveLength(3);
+    expect(events.at(-1)).toMatchObject({ type: 'done', text: 'All three done.' });
+  });
+});

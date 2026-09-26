@@ -41,7 +41,8 @@ export type AgentEvent =
   | { type: 'done'; text: string; steps: number }
   | { type: 'error'; message: string };
 
-export const MAX_STEPS = 60;
+/** Model requests one run may make: enough to see a big plan through. */
+export const MAX_STEPS = 200;
 /** A sub-agent's step limit: a task is smaller than a request. */
 const SUB_AGENT_STEPS = 40;
 /** Sub-agent tasks one run may start. */
@@ -68,8 +69,10 @@ Plan: the steps and which are done.
 Current state: what works, errors still open, and what the agent was about to do next.
 Facts to remember: names, values, paths, commands, ids, anything that would be expensive to find again.
 Be specific and complete. Keep code only where it is essential. At most about 1200 words. Write only the summary.`;
-/** A run that stops short of its goal is asked to carry on at most this many times. */
-const MAX_NUDGES = 2;
+/** A run that stops short of its goal is asked to carry on at most this many times… */
+const MAX_NUDGES = 6;
+/** …and not again after this many in a row with no progress (no step done, no file changed). */
+const MAX_IDLE_NUDGES = 2;
 /** The same automatic-check errors this many times in a row stop the run. */
 const SAME_CHECK_LIMIT = 3;
 /** Images stay in the conversation for this many image-bearing turns. */
@@ -85,7 +88,7 @@ The user's project lives in a virtual filesystem in the browser; "/" is the proj
 - SoftN apps: a SoftN app is a folder whose manifest.json names a .ui page as "main" (with ui/*.ui pages and logic/*.logic or .py). A project can hold several, each in its own folder: to rebuild or learn from an existing app, read its files and write the new one in another folder. A .softn the user attaches is unpacked into its own folder (the original stays in uploads/, and softn_import unpacks any .softn in the project): when they ask for changes, edit that folder; when they ask to recreate, redo or base something on it, write a new app in a new folder and leave the original as it is. The SoftN reference is in your tools, so do not guess the language: softn_docs with no arguments gives the map, topic "guide" is the writing guide (read it before your first app), search finds how something is done across the guides, the components and the example apps; softn_components gives exact props and events; softn_examples has complete working apps to read or copy. Keep manifest.json true. After each step that changes an app, bot.computer checks it automatically (its files, then a real render) and adds the outcome to that step's result: when it reports errors, fix them before anything else. softn_check checks on demand; softn_inspect shows what the page displays; softn_interact uses the app like a person (click, fill, select, press keys) and reports errors the app raises, so test that the app works, not just that it renders. The user watches the app in a live preview as you build it, and can export any app folder as a .softn file.
 - web_fetch, curl, fetch() go through the user's network gate (/internet) and, from a browser, only reach sites that allow cross-origin requests. If the gate refuses a host, say so; the user decides whether to allow it.
 
-Work toward the user's goal. For anything that takes several steps (building or changing an app, a feature, a fix across files), first call update_plan with the goal and 3 to 8 concrete steps, and update it as each step starts and finishes: the user watches that checklist. You are done when every step is done and the result is checked (for an app: it renders without errors and softn_interact shows it working), not before.
+Work toward the user's goal, on your own, until it is reached. When you are given a task (anything that will change files: building or changing an app, a feature, a fix across files), plan first: call update_plan with the goal and 3 to 8 concrete steps that break the task down, before you change anything, and update it as each step starts and finishes; the user watches that checklist. Then carry the plan out step by step without stopping to ask for permission; ask the user only when you truly cannot decide something yourself. You are done when every step is done and the result is checked (for an app: it renders without errors and softn_interact shows it working), not before.
 
 Work in small, verified steps. Prefer running code to check a claim over guessing. When you are done, say briefly what you changed and what you verified.`;
 
@@ -136,6 +139,11 @@ function transcript(turn: Turn): string {
     return `Assistant: ${cutText(turn.text, 3000)}${calls ? `\n${calls}` : ''}`;
   }
   return turn.results.map((r) => `  ← ${r.name}${r.isError ? ' (error)' : ''}: ${cutText(r.content, 1500)}`).join('\n');
+}
+
+/** A file that belongs to an app at the project root (its manifest, pages, logic, data, assets). */
+function isAppFile(path: string): boolean {
+  return /^(manifest\.json|permission\.json|ui\/|logic\/|xdb\/|assets\/|server\/)/.test(path);
 }
 
 /** Where the model's view starts: the latest summary, or the beginning. */
@@ -299,6 +307,10 @@ export class Agent {
 
   private get tools(): ToolSpec[] {
     return this.options.tools ?? TOOLS;
+  }
+
+  private get canPlan(): boolean {
+    return this.tools.some((t) => t.name === 'update_plan');
   }
 
   private get canDelegate(): boolean {
@@ -625,6 +637,11 @@ export class Agent {
     });
     this.sameCheck = { signature: '', count: 0 };
     let planThisRun = false;
+    let planNoted = false;
+    // Progress, for deciding whether asking to carry on is still worth it.
+    const changedThisRun = new Set<string>();
+    let idleNudges = 0;
+    let progressAtNudge = { done: -1, changed: -1 };
     this.checkedRoots.clear();
     this.tasksThisRun = 0;
     let nudges = 0;
@@ -640,7 +657,10 @@ export class Agent {
           if (reply.truncated) emit({ type: 'status', message: 'The reply was cut off at the output limit.' });
           // Stopping short of the goal: ask once or twice to carry on.
           const unfinished = this.unfinished(planThisRun);
-          if (unfinished && nudges < MAX_NUDGES && !reply.truncated) {
+          const progress = { done: this.plan?.items.filter((i) => i.status === 'done').length ?? 0, changed: changedThisRun.size };
+          idleNudges = progress.done > progressAtNudge.done || progress.changed > progressAtNudge.changed ? 0 : idleNudges + 1;
+          progressAtNudge = progress;
+          if (unfinished && nudges < MAX_NUDGES && idleNudges < MAX_IDLE_NUDGES && !reply.truncated) {
             nudges++;
             emit({ type: 'nudge', message: unfinished.split('\n')[0] });
             this.turns.push({ role: 'user', text: `[bot.computer] ${unfinished}`, automatic: true });
@@ -679,6 +699,16 @@ export class Agent {
           lastFailure = result.isError ? result.content : '';
         }
         callIndex = reply.calls.length;
+        for (const c of changes) changedThisRun.add(c.path);
+        // A task: plan before going further (once, and not for a one-file fix).
+        if (!planThisRun && !planNoted && this.canPlan && results.length) {
+          const apps = findApps(this.options.vfs);
+          const touchesApp = [...changedThisRun].some((p) => apps.some((r) => r === '' ? isAppFile(p) : p.startsWith(`${r}/`)));
+          if (changedThisRun.size >= 2 || touchesApp) {
+            planNoted = true;
+            results[results.length - 1].content += '\n\n[bot.computer] This is a task with several steps, and there is no plan yet. Call update_plan now with the goal and the steps that break it down (mark what is already done), then carry on.';
+          }
+        }
         const stop = await this.autoCheck(reply.calls, results, changes, emit);
         this.turns.push({ role: 'tool', results });
         if (stop) {
