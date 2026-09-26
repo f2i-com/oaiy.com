@@ -240,8 +240,8 @@
   class ExitSignal extends Error {}
   const proc = {
     argv: ["node", __coder_file].concat(__coder_argv),
-    env: {},
-    platform: "zipp",
+    env: Object.assign({}, given.env || {}),
+    platform: "linux",
     version: "v0-zipp",
     versions: {},
     exitCode: undefined,
@@ -262,18 +262,164 @@
   };
   define("process", proc);
 
-  const modules = { fs: fs, "fs/promises": fsPromises, path: path, "path/posix": path, process: proc };
-  define("require", function (name) {
-    const key = String(name).replace(/^node:/, "");
-    if (Object.prototype.hasOwnProperty.call(modules, key)) return modules[key];
-    const e = new Error("Cannot find module '" + name + "': the bot.computer sandbox provides fs, fs/promises, path and process (plus global fetch); child_process, net, http and native modules are not available");
+  const util = {
+    format: function () { return Array.prototype.map.call(arguments, (a) => (typeof a === "string" ? a : JSON.stringify(a))).join(" "); },
+    inspect: (v) => { try { return JSON.stringify(v, null, 2); } catch (e) { return String(v); } },
+    promisify: (fn) => function () { const args = Array.prototype.slice.call(arguments); return new Promise((res, rej) => fn.apply(null, args.concat([(err, v) => (err ? rej(err) : res(v))]))); },
+    isDeepStrictEqual: (a, b) => JSON.stringify(a) === JSON.stringify(b),
+    types: {},
+  };
+  const events = (function () {
+    function EventEmitter() { this._events = {}; }
+    EventEmitter.prototype.on = function (n, f) { (this._events[n] = this._events[n] || []).push(f); return this; };
+    EventEmitter.prototype.addListener = EventEmitter.prototype.on;
+    EventEmitter.prototype.once = function (n, f) { const self = this; function g() { self.off(n, g); f.apply(self, arguments); } return this.on(n, g); };
+    EventEmitter.prototype.off = function (n, f) { this._events[n] = (this._events[n] || []).filter((x) => x !== f); return this; };
+    EventEmitter.prototype.removeListener = EventEmitter.prototype.off;
+    EventEmitter.prototype.emit = function (n) { const args = Array.prototype.slice.call(arguments, 1); const list = (this._events[n] || []).slice(); for (const f of list) f.apply(this, args); return list.length > 0; };
+    EventEmitter.prototype.listenerCount = function (n) { return (this._events[n] || []).length; };
+    EventEmitter.EventEmitter = EventEmitter;
+    EventEmitter.default = EventEmitter;
+    return EventEmitter;
+  })();
+  const os = { EOL: "\n", platform: () => "linux", type: () => "Linux", arch: () => "wasm32", cpus: () => [{ model: "zipp", speed: 0 }], homedir: () => "/", tmpdir: () => "/tmp", hostname: () => "sandbox", userInfo: () => ({ username: "sandbox", homedir: "/" }), totalmem: () => 268435456, freemem: () => 134217728, release: () => "zipp", uptime: () => 0 };
+  const assert = function (v, msg) { if (!v) throw new Error(msg || "Assertion failed"); };
+  assert.ok = assert;
+  assert.equal = (a, b, m) => { if (a != b) throw new Error(m || a + " == " + b); };
+  assert.strictEqual = (a, b, m) => { if (a !== b) throw new Error(m || JSON.stringify(a) + " !== " + JSON.stringify(b)); };
+  assert.deepStrictEqual = (a, b, m) => { if (JSON.stringify(a) !== JSON.stringify(b)) throw new Error(m || "Expected values to be deeply equal:\n" + JSON.stringify(a) + "\n" + JSON.stringify(b)); };
+  assert.deepEqual = assert.deepStrictEqual;
+  assert.notStrictEqual = (a, b, m) => { if (a === b) throw new Error(m || JSON.stringify(a) + " === " + JSON.stringify(b)); };
+  assert.throws = (fn, _e, m) => { try { fn(); } catch (e) { return; } throw new Error(m || "Missing expected exception"); };
+  const builtinModules = {
+    fs: fs, "fs/promises": fsPromises, path: path, "path/posix": path, process: proc, util: util, events: events, os: os, assert: assert, "assert/strict": assert,
+  };
+
+  /* ---------- modules: CommonJS, and ES module syntax translated to it ---------- */
+  // import/export lines become require() and module.exports: enough for the
+  // modules a project writes (static imports, named and default exports).
+  function toCommonJS(src) {
+    if (!/^[ \t]*(import[\s{*'"]|export[\s{*])/m.test(src)) return src.replace(/\bimport\.meta\.url\b/g, '("file://" + __filename)').replace(/(^|[^\w$.])import\s*\(/g, (m, pre) => pre + "__import(");
+    const names = [];
+    let out = src.replace(/^([ \t]*)import\s+([\s\S]*?)\s+from\s+(['"])([^'"]+)\3\s*;?/gm, (m, ind, what, q, spec) => {
+      const req = "require(" + JSON.stringify(spec) + ")";
+      what = what.trim();
+      const parts = [];
+      const ns = /^\*\s+as\s+([\w$]+)$/.exec(what);
+      if (ns) return ind + "const " + ns[1] + " = " + req + ";";
+      const braces = /\{([\s\S]*)\}/.exec(what);
+      const def = what.replace(/\{[\s\S]*\}/, "").replace(/,/g, " ").trim();
+      const tmp = "__m" + Math.random().toString(36).slice(2, 8);
+      parts.push("const " + tmp + " = " + req + ";");
+      if (def && !/^\*/.test(def)) parts.push("const " + def + " = " + tmp + " && " + tmp + ".__esModule ? " + tmp + ".default : " + tmp + ";");
+      const star = /\*\s+as\s+([\w$]+)/.exec(def);
+      if (star) parts.push("const " + star[1] + " = " + tmp + ";");
+      if (braces) {
+        const picks = braces[1].split(",").map((x) => x.trim()).filter(Boolean).map((x) => { const a = x.split(/\s+as\s+/); return a.length > 1 ? a[0] + ": " + a[1] : a[0]; });
+        if (picks.length) parts.push("const { " + picks.join(", ") + " } = " + tmp + ";");
+      }
+      return ind + parts.join(" ");
+    });
+    out = out.replace(/^([ \t]*)import\s+(['"])([^'"]+)\2\s*;?/gm, (m, ind, q, spec) => ind + "require(" + JSON.stringify(spec) + ");");
+    out = out.replace(/^([ \t]*)export\s+\*\s+from\s+(['"])([^'"]+)\2\s*;?/gm, (m, ind, q, spec) => ind + "Object.assign(module.exports, require(" + JSON.stringify(spec) + "));");
+    out = out.replace(/^([ \t]*)export\s+\{([^}]*)\}\s+from\s+(['"])([^'"]+)\3\s*;?/gm, (m, ind, list, q, spec) => {
+      const tmp = "__r" + Math.random().toString(36).slice(2, 8);
+      const sets = list.split(",").map((x) => x.trim()).filter(Boolean).map((x) => { const a = x.split(/\s+as\s+/); return "module.exports." + (a[1] || a[0]) + " = " + tmp + "." + a[0] + ";"; });
+      return ind + "const " + tmp + " = require(" + JSON.stringify(spec) + "); " + sets.join(" ");
+    });
+    out = out.replace(/^([ \t]*)export\s+\{([^}]*)\}\s*;?/gm, (m, ind, list) => {
+      for (const x of list.split(",").map((y) => y.trim()).filter(Boolean)) { const a = x.split(/\s+as\s+/); names.push([a[1] || a[0], a[0]]); }
+      return "";
+    });
+    out = out.replace(/^([ \t]*)export\s+default\s+(async\s+function|function|class)\b\s*([\w$]*)/gm, (m, ind, kind, name) => {
+      if (name) { names.push(["default", name]); return ind + kind + " " + name; }
+      return ind + "module.exports.default = " + kind;
+    });
+    out = out.replace(/^([ \t]*)export\s+default\s+/gm, (m, ind) => ind + "module.exports.default = ");
+    out = out.replace(/^([ \t]*)export\s+(async\s+function\*?|function\*?|class|const|let|var)\s+([\w$]+)/gm, (m, ind, kind, name) => {
+      names.push([name, name]);
+      return ind + kind + " " + name;
+    });
+    out = out.replace(/\bimport\.meta\.url\b/g, '("file://" + __filename)');
+    out = out.replace(/(^|[^\w$.])import\s*\(/g, (m, pre) => pre + "__import(");
+    const tail = names.map(([exported, local]) => "Object.defineProperty(module.exports, " + JSON.stringify(exported) + ", { enumerable: true, configurable: true, get: () => " + local + " });").join("\n");
+    return "Object.defineProperty(module.exports, '__esModule', { value: true });\n" + out + "\n" + tail;
+  }
+  const moduleCache = {};
+  const indirectEvalFn = G.eval;
+  function statOf(p) { try { return callJson("fs.stat", p); } catch (e) { return null; } }
+  function resolveFile(base) {
+    const tries = [base, base + ".js", base + ".mjs", base + ".cjs", base + ".json"];
+    for (const t of tries) { const st = statOf(t); if (st && st.type === "file") return t; }
+    const st = statOf(base);
+    if (st && st.type === "dir") {
+      const pkgFile = base + "/package.json";
+      const pst = statOf(pkgFile);
+      if (pst && pst.type === "file") {
+        try {
+          const pkg = JSON.parse(call("fs.read", pkgFile));
+          const main = pkg.main || (typeof pkg.exports === "string" ? pkg.exports : pkg.exports && pkg.exports["."] && (typeof pkg.exports["."] === "string" ? pkg.exports["."] : pkg.exports["."].require || pkg.exports["."].default));
+          if (main) { const r = resolveFile(path.join(base, main)); if (r) return r; }
+        } catch (e) { /* not a usable package.json */ }
+      }
+      for (const idx of ["/index.js", "/index.mjs", "/index.cjs", "/index.json"]) { const f = base + idx; const s2 = statOf(f); if (s2 && s2.type === "file") return f; }
+    }
+    return null;
+  }
+  function notFound(name, from) {
+    const e = new Error("Cannot find module '" + name + "' (from " + from + "). Built in here: " + Object.keys(builtinModules).join(", ") + "; project files by path (./x, ../y); packages in node_modules. child_process, net, http and native modules are not available.");
     e.code = "MODULE_NOT_FOUND";
-    throw e;
-  });
-  define("module", { exports: {} });
+    return e;
+  }
+  function makeRequire(dir) {
+    function req(name) {
+      const spec = String(name);
+      const key = spec.replace(/^node:/, "");
+      if (Object.prototype.hasOwnProperty.call(builtinModules, key)) return builtinModules[key];
+      const file = req.resolve(spec);
+      return loadModule(file);
+    }
+    req.resolve = function (name) {
+      const spec = String(name);
+      if (Object.prototype.hasOwnProperty.call(builtinModules, spec.replace(/^node:/, ""))) return spec;
+      let found = null;
+      if (/^(\.{1,2}(\/|$)|\/)/.test(spec)) found = resolveFile(path.resolve(dir, spec));
+      else {
+        for (let d = dir; ; d = path.dirname(d)) {
+          found = resolveFile(path.join(d, "node_modules", spec));
+          if (found || d === "/") break;
+        }
+      }
+      if (!found) throw notFound(spec, dir);
+      return found;
+    };
+    req.cache = moduleCache;
+    return req;
+  }
+  function loadModule(file) {
+    if (moduleCache[file]) return moduleCache[file].exports;
+    const mod = { exports: {}, id: file, filename: file, loaded: false, children: [], paths: [] };
+    moduleCache[file] = mod;
+    const text = call("fs.read", file);
+    if (/\.json$/i.test(file)) { mod.exports = JSON.parse(text); mod.loaded = true; return mod.exports; }
+    const body = toCommonJS(text.replace(/^#!.*/, ""));
+    const fn = indirectEvalFn("(function (exports, require, module, __filename, __dirname, __import) {" + body + "\n})");
+    const req = makeRequire(path.dirname(file));
+    fn.call(mod.exports, mod.exports, req, mod, file, path.dirname(file), (spec) => { try { return Promise.resolve(req(spec)); } catch (e) { return Promise.reject(e); } });
+    mod.loaded = true;
+    return mod.exports;
+  }
+  const mainFile = "/" + String(__coder_file).replace(/^\/+/, "");
+  const mainRequire = makeRequire(path.dirname(mainFile));
+  define("require", mainRequire);
+  define("module", { exports: {}, id: ".", filename: mainFile, loaded: false });
   define("exports", G.module.exports);
-  define("__filename", "/" + String(__coder_file).replace(/^\/+/, ""));
-  define("__dirname", path.dirname(G.__filename));
+  define("__filename", mainFile);
+  define("__dirname", path.dirname(mainFile));
+  define("__import", (spec) => { try { return Promise.resolve(mainRequire(spec)); } catch (e) { return Promise.reject(e); } });
+  G.module.children = [];
+  mainRequire.main = G.module;
+  define("__coder_to_cjs", toCommonJS);
 
   /* ---------- running the guest, and the outcome the runner reads ---------- */
   let settled = null;
@@ -286,7 +432,7 @@
   }
   const indirectEval = G.eval;
   define("__coder_main", function () {
-    const src = __coder_source;
+    const src = toCommonJS(String(__coder_source).replace(/^#!.*/, ""));
     let value;
     try {
       value = indirectEval(src);

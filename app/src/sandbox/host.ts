@@ -392,6 +392,9 @@ export class SandboxHost implements HostHandler {
       full.files = files;
       full.fileName = entry;
       skip = (path) => path === '.botcomputer' || path.startsWith('.botcomputer/') || aliases.some((a) => path === a || path.startsWith(`${a}/`));
+    } else if (request.lang === 'js') {
+      // The script's absolute path, as Node has it: require() resolves from its folder; code with no file runs in the working folder.
+      full.fileName = entryPath ? `/${normalizePath(entryPath)}` : `${cwd === '/' ? '' : cwd}/${request.fileName ?? '[eval]'}`;
     }
     const outcome = await runInSandbox(full, this, { timeoutMs: remaining, signal: this.signal });
     if (request.lang === 'python' && outcome.result?.vfsChanges) {

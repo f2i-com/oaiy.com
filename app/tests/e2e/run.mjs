@@ -155,6 +155,29 @@ try {
     expect(r.stdlib.stdout === '29 days, 0:00:00\n', say('stdlib'));
     expect(r.hidden.stdout === "['data', 'helper.py', 'main.py', 'read.py']\n", say('hidden'));
   });
+
+  await check('node requires project modules, JSON and node_modules packages, and runs ES modules', async () => {
+    const r = await page.evaluate(async () => {
+      const v = window.__bot.vfs;
+      v.writeFile('/web/lib/math.js', 'module.exports = { twice: (n) => n * 2 };', { parents: true });
+      v.writeFile('/web/config.json', '{"name":"demo"}', { parents: true });
+      v.writeFile('/web/app.js', 'const m = require("./lib/math"); const c = require("./config.json"); console.log(m.twice(21), c.name, process.env.GREETING);', { parents: true });
+      v.writeFile('/web/esm/util.mjs', 'export const k = 3;\nexport default function greet(n) { return "hi " + n; }\n', { parents: true });
+      v.writeFile('/web/esm/main.mjs', 'import greet, { k } from "./util.mjs";\nconsole.log(greet("there"), k);\n', { parents: true });
+      v.writeFile('/node_modules/pad/package.json', '{"main":"lib.js"}', { parents: true });
+      v.writeFile('/node_modules/pad/lib.js', 'module.exports = (s, n) => String(s).padStart(n, "0");', { parents: true });
+      const out = {};
+      out.cjs = (await window.__bot.shell('GREETING=hello node web/app.js')).report;
+      out.fromDir = (await window.__bot.shell('node app.js', '/web')).report;
+      out.esm = (await window.__bot.shell('node web/esm/main.mjs')).report;
+      out.pkg = (await window.__bot.shell('node -e "console.log(require(String.fromCharCode(112,97,100))(7, 3))"')).report;
+      return out;
+    });
+    expect(r.cjs.stdout === '42 demo hello\n', `cjs: ${JSON.stringify(r.cjs)}`);
+    expect(r.fromDir.stdout === '42 demo undefined\n', `fromDir: ${JSON.stringify(r.fromDir)}`);
+    expect(r.esm.stdout === 'hi there 3\n', `esm: ${JSON.stringify(r.esm)}`);
+    expect(r.pkg.stdout === '007\n', `pkg: ${JSON.stringify(r.pkg)}`);
+  });
 } finally {
   await browser.close();
   await server.close();

@@ -26,7 +26,7 @@ export interface RunRequest {
   stdin?: string;
   /** Guest working directory ("/" is the project root). */
   cwd?: string;
-  /** Shell only: exported variables carried between calls. */
+  /** The environment: the shell's exported variables (carried between calls), and a program's. */
   env?: Record<string, string>;
   /** Python only: the files `open()` sees, relative to `cwd`. */
   files?: Record<string, string | { base64: string }>;

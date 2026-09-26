@@ -111,7 +111,7 @@ function isLimit(engine: ZippEngine, message: string): string | undefined {
 
 function jsProgram(request: RunRequest, guest: GuestSources): string {
   const json = (v: unknown) => JSON.stringify(v);
-  return `${HOSTCALL}var __coder_input = ${json({ cwd: request.cwd ?? '/', stdin: request.stdin ?? '' })}, __coder_argv = ${json(request.argv ?? [])}, __coder_file = ${json(request.fileName ?? 'main.js')}, __coder_source = ${json(request.source)};\n${guest.prelude}\n__coder_main();\n`;
+  return `${HOSTCALL}var __coder_input = ${json({ cwd: request.cwd ?? '/', stdin: request.stdin ?? '', env: request.env ?? {} })}, __coder_argv = ${json(request.argv ?? [])}, __coder_file = ${json(request.fileName ?? 'main.js')}, __coder_source = ${json(request.source)};\n${guest.prelude}\n__coder_main();\n`;
 }
 
 function shellProgram(request: RunRequest, guest: GuestSources): string {
