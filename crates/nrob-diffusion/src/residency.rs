@@ -22,7 +22,6 @@ pub const GIB: u64 = 1 << 30;
 
 /// VRAM kept free beside resident weights: one streamed block, the attention and
 /// MLP activations of a 2048x2048 pass, and the VAE that loads after them.
-#[cfg(feature = "cuda")]
 const HEADROOM: u64 = 6 * GIB;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -66,11 +65,13 @@ pub struct Budget {
     pub vram_bytes: Option<u64>,
     /// Host copies of blocks that do not stay on the GPU.
     pub ram_bytes: u64,
+    /// VRAM `Auto` leaves free beside the weights, for the job's activations.
+    pub headroom: u64,
 }
 
 impl Default for Budget {
     fn default() -> Self {
-        Self { memory: Memory::Auto, vram_bytes: None, ram_bytes: 32 * GIB }
+        Self { memory: Memory::Auto, vram_bytes: None, ram_bytes: 32 * GIB, headroom: HEADROOM }
     }
 }
 
@@ -97,6 +98,7 @@ impl Budget {
             memory,
             vram_bytes: gib("vram_gb", 192)?,
             ram_bytes: gib("ram_gb", 512)?.unwrap_or(32 * GIB),
+            headroom: HEADROOM,
         })
     }
 
@@ -112,10 +114,15 @@ impl Budget {
                 .mem_get_info()
                 .map_err(candle_core::Error::wrap)?
                 .0 as u64;
-            return Ok(configured.min(free.saturating_sub(HEADROOM)));
+            return Ok(configured.min(free.saturating_sub(self.headroom)));
         }
         let _ = dev;
         Ok(configured)
+    }
+
+    /// The same budget, keeping `bytes` free for activations instead.
+    pub fn with_headroom(self, bytes: u64) -> Self {
+        Self { headroom: bytes, ..self }
     }
 
     pub fn to_json(&self) -> Json {
@@ -272,18 +279,18 @@ mod tests {
     #[test]
     fn budgets_fill_gpu_then_ram_then_ssd_without_changing_results() -> Result<()> {
         let expected: Vec<f32> = (0..4).map(|i| i as f32 * 256.).collect();
-        let (t, sums) = run(Budget { memory: Memory::Auto, vram_bytes: Some(2048), ram_bytes: 1024 })?;
+        let (t, sums) = run(Budget { memory: Memory::Auto, vram_bytes: Some(2048), ram_bytes: 1024, headroom: HEADROOM })?;
         assert_eq!(t.counts(), (4, 0, 0));
         assert_eq!(sums, expected);
         // On the CPU, RAM is the device: blocks that are loaded stay put.
-        let (t, sums) = run(Budget { memory: Memory::Ram, vram_bytes: None, ram_bytes: 2048 })?;
+        let (t, sums) = run(Budget { memory: Memory::Ram, vram_bytes: None, ram_bytes: 2048, headroom: HEADROOM })?;
         assert_eq!(t.counts(), (4, 0, 0));
         assert_eq!(sums, expected);
-        let (t, sums) = run(Budget { memory: Memory::Ssd, vram_bytes: None, ram_bytes: 1 << 40 })?;
+        let (t, sums) = run(Budget { memory: Memory::Ssd, vram_bytes: None, ram_bytes: 1 << 40, headroom: HEADROOM })?;
         assert_eq!(t.counts(), (0, 0, 4));
         assert_eq!(t.streamed_bytes, 4096);
         assert_eq!(sums, expected);
-        let (t, sums) = run(Budget { memory: Memory::Gpu, vram_bytes: Some(0), ram_bytes: 0 })?;
+        let (t, sums) = run(Budget { memory: Memory::Gpu, vram_bytes: Some(0), ram_bytes: 0, headroom: HEADROOM })?;
         assert_eq!(t.counts(), (4, 0, 0));
         assert_eq!(sums, expected);
         Ok(())

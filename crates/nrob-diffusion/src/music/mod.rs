@@ -7,6 +7,7 @@
 //! a flow-matching transformer and the Flow-VAE decoder render them).
 pub mod acoustic;
 pub mod lm;
+pub mod quant;
 
 use crate::residency::Budget;
 use candle_core::{DType, Device, Result, Tensor};
@@ -169,6 +170,8 @@ pub struct Request {
     pub dtype: DType,
     pub greedy: bool,
     pub budget: Budget,
+    /// A quantized language model (see [`quant`]) instead of the BF16 one.
+    pub language_model: Option<PathBuf>,
 }
 
 impl Request {
@@ -191,6 +194,7 @@ impl Request {
             },
             greedy: j.get("greedy").and_then(Json::as_bool).unwrap_or(false),
             budget: Budget::parse(j)?,
+            language_model: s("language_model").filter(|p| !p.trim().is_empty()).map(PathBuf::from),
         };
         if r.prompt.len() > 20_000 || r.lyrics.len() > 20_000 {
             return Err("music: prompt and lyrics are limited to 20000 bytes each".into());
@@ -263,8 +267,12 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
     let lm_dir = r.model_dir.join("language_model");
     let layers = 36;
     report(event("loading_music_model", 0, layers));
-    let mut model = lm::Lm::load(&lm_dir, &r.budget, &dev, |i| report(event("loading_music_model", i, layers)))?;
+    // The depth decoder and the output rows load first; the layers leave room
+    // for the song's KV cache and the prompt's activations.
     let depth = lm::Depth::load(&r.model_dir.join("rvq_depth_decoder"), &dev)?;
+    let kv = lm::kv_bytes(ids[0].len() + max_frames + 2);
+    let budget = r.budget.with_headroom(kv + (3 << 29));
+    let mut model = lm::Lm::load(&lm_dir, r.language_model.as_deref(), &budget, &dev, |i| report(event("loading_music_model", i, layers)))?;
     let lm_report = model.report();
     let load_seconds = started.elapsed().as_secs_f64();
     let compose_started = Instant::now();
@@ -287,7 +295,8 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
     report(event("loading_renderer", 0, blocks));
     let mut acoustic = acoustic::Acoustic {
         condition: acoustic::ConditionEncoder::load(&r.model_dir.join("condition_encoder"), &dev)?,
-        transformer: acoustic::Transformer::load(&r.model_dir.join("transformer"), r.dtype, &r.budget, &dev, |i| report(event("loading_renderer", i, blocks)))?,
+        // Room for a window's decode (the vocoder runs in F32 at 44.1 kHz).
+        transformer: acoustic::Transformer::load(&r.model_dir.join("transformer"), r.dtype, &r.budget.with_headroom(3 << 30), &dev, |i| report(event("loading_renderer", i, blocks)))?,
         vocoder: acoustic::Vocoder::load(&r.model_dir.join("vocoder"), &dev)?,
         steps: r.steps,
         guidance: r.guidance,

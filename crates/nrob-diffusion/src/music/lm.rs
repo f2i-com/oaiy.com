@@ -11,7 +11,10 @@
 //! and the embedding table is read row by row for the prompt.
 use crate::ltx::store::Store;
 use crate::residency::{Budget, Resident, Tiered};
-use candle_core::{quantized::QMatMul, DType, Device, Module, Result, Tensor, D};
+use candle_core::{
+    quantized::{gguf_file, QMatMul},
+    DType, Device, Module, Result, Tensor, D,
+};
 use std::path::Path;
 
 pub const AUDIO_END: u32 = 151_670;
@@ -141,9 +144,96 @@ fn load_layer(store: &mut Store, i: usize, dev: &Device) -> Result<Layer> {
     })
 }
 
+/// Where the language model's weights come from: the published safetensors
+/// (BF16), or a quantized file made by [`crate::music::quant::convert`].
+enum Source {
+    Safe(Store),
+    Gguf { content: gguf_file::Content, file: std::fs::File },
+}
+
+impl Source {
+    fn layer(&mut self, i: usize, dev: &Device) -> Result<Layer> {
+        match self {
+            Self::Safe(store) => load_layer(store, i, dev),
+            Self::Gguf { content, file } => {
+                let mut proj = |n: &str| -> Result<Proj> { Ok(Proj::Quant(QMatMul::from_qtensor(content.tensor(file, &format!("layers.{i}.{n}"), dev)?)?)) };
+                let (qkv, o, gate_up, down) = (proj("qkv")?, proj("o")?, proj("gate_up")?, proj("down")?);
+                let mut norm = |n: &str| -> Result<Tensor> { content.tensor(file, &format!("layers.{i}.{n}"), dev)?.dequantize(dev)?.to_dtype(DType::BF16) };
+                Ok(Layer { qkv, o, gate_up, down, q_norm: norm("q_norm")?, k_norm: norm("k_norm")?, input_norm: norm("input_norm")?, post_norm: norm("post_norm")? })
+            }
+        }
+    }
+
+    /// A whole small tensor in BF16.
+    fn small(&mut self, safe_key: &str, gguf_key: &str, dev: &Device) -> Result<Tensor> {
+        match self {
+            Self::Safe(store) => store.tensor(safe_key, dev, false),
+            Self::Gguf { content, file } => content.tensor(file, gguf_key, dev)?.dequantize(dev)?.to_dtype(DType::BF16),
+        }
+    }
+
+    /// Embedding rows (BF16), read one by one: from `embed_tokens` in the
+    /// safetensors, or `gguf_key` in the quantized file.
+    fn rows(&mut self, gguf_key: &str, safe_key: &str, ids: &[u32], dev: &Device) -> Result<Tensor> {
+        match self {
+            Self::Safe(store) => store.rows(safe_key, ids, dev),
+            Self::Gguf { content, file } => {
+                use std::io::{Read, Seek, SeekFrom};
+                let info = content.tensor_infos.get(gguf_key).ok_or_else(|| msg(format!("the quantized language model lacks {gguf_key}")))?;
+                let (rows, width) = info.shape.dims2()?;
+                let dtype = info.ggml_dtype;
+                let row_bytes = width / dtype.block_size() * dtype.type_size();
+                let mut bytes = vec![0u8; ids.len() * row_bytes];
+                for (i, &id) in ids.iter().enumerate() {
+                    if id as usize >= rows {
+                        candle_core::bail!("row {id} is outside {gguf_key} in the quantized language model");
+                    }
+                    file.seek(SeekFrom::Start(content.tensor_data_offset + info.offset + id as u64 * row_bytes as u64))?;
+                    file.read_exact(&mut bytes[i * row_bytes..(i + 1) * row_bytes])?;
+                }
+                let q = candle_core::quantized::ggml_file::qtensor_from_ggml(dtype, &bytes, vec![ids.len(), width], &Device::Cpu)?;
+                q.dequantize(&Device::Cpu)?.to_dtype(DType::BF16)?.to_device(dev)
+            }
+        }
+    }
+}
+
+/// The model's shape, from `config.json` or the quantized file's metadata.
+struct Shape {
+    count: usize,
+    heads: usize,
+    kv_heads: usize,
+    head_dim: usize,
+    eps: f32,
+    theta: f64,
+}
+
+pub(crate) fn config_of(dir: &Path) -> Result<nrob::json::Json> {
+    nrob::json::Json::parse(&std::fs::read(dir.join("config.json")).map_err(|e| msg(format!("{}: {e}", dir.display())))?).map_err(candle_core::Error::wrap)
+}
+
+fn shape_of_config(dir: &Path) -> Result<Shape> {
+    let config = config_of(dir)?;
+    let int = |k: &str| config.get(k).and_then(nrob::json::Json::as_i64).map(|v| v as usize).ok_or_else(|| msg(format!("language model config lacks {k}")));
+    Ok(Shape {
+        count: int("num_hidden_layers")?,
+        heads: int("num_attention_heads")?,
+        kv_heads: int("num_key_value_heads")?,
+        head_dim: int("head_dim")?,
+        eps: config.get("rms_norm_eps").and_then(nrob::json::Json::as_f64).unwrap_or(1e-6) as f32,
+        theta: config.get("rope_parameters").and_then(|r| r.get("rope_theta")).or_else(|| config.get("rope_theta")).and_then(nrob::json::Json::as_f64).unwrap_or(1e6),
+    })
+}
+
+/// Device bytes of the KV cache for `positions` (36 layers, keys and values,
+/// two rows, 8 heads of 128, BF16).
+pub fn kv_bytes(positions: usize) -> u64 {
+    positions as u64 * 36 * 2 * 2 * 8 * 128 * 2
+}
+
 /// The global language model (Qwen3, 36 layers).
 pub struct Lm {
-    store: Store,
+    source: Source,
     layers: Tiered<Layer>,
     count: usize,
     norm: Tensor,
@@ -161,36 +251,46 @@ pub struct Lm {
 }
 
 impl Lm {
-    pub fn load(dir: &Path, budget: &Budget, dev: &Device, progress: impl FnMut(usize)) -> Result<Self> {
-        let config = nrob::json::Json::parse(&std::fs::read(dir.join("config.json")).map_err(|e| msg(format!("{}: {e}", dir.display())))?).map_err(candle_core::Error::wrap)?;
-        let int = |k: &str| config.get(k).and_then(nrob::json::Json::as_i64).map(|v| v as usize).ok_or_else(|| msg(format!("language model config lacks {k}")));
-        let (count, heads, kv_heads, head_dim) = (int("num_hidden_layers")?, int("num_attention_heads")?, int("num_key_value_heads")?, int("head_dim")?);
-        let eps = config.get("rms_norm_eps").and_then(nrob::json::Json::as_f64).unwrap_or(1e-6) as f32;
-        let theta = config.get("rope_parameters").and_then(|r| r.get("rope_theta")).or_else(|| config.get("rope_theta")).and_then(nrob::json::Json::as_f64).unwrap_or(1e6);
-        let max_positions = int("max_position_embeddings").unwrap_or(10240);
-        let mut store = Store::open(dir, 0)?;
+    /// `dir`: the `language_model` folder; `quantized`: a file made by
+    /// [`crate::music::quant::convert`] to use instead of its safetensors.
+    pub fn load(dir: &Path, quantized: Option<&Path>, budget: &Budget, dev: &Device, progress: impl FnMut(usize)) -> Result<Self> {
+        let (mut source, shape) = match quantized {
+            None => (Source::Safe(Store::open(dir, 0)?), shape_of_config(dir)?),
+            Some(path) => {
+                let mut file = std::fs::File::open(path).map_err(|e| msg(format!("{}: {e}", path.display())))?;
+                let content = gguf_file::Content::read(&mut file).map_err(|e| msg(format!("{}: {e}", path.display())))?;
+                let u = |k: &str| content.metadata.get(k).and_then(|v| v.to_u32().ok()).map(|v| v as usize).ok_or_else(|| msg(format!("{}: lacks {k}", path.display())));
+                let f = |k: &str| content.metadata.get(k).and_then(|v| v.to_f32().ok()).ok_or_else(|| msg(format!("{}: lacks {k}", path.display())));
+                let shape = Shape { count: u("music3.layers")?, heads: u("music3.heads")?, kv_heads: u("music3.kv_heads")?, head_dim: u("music3.head_dim")?, eps: f("music3.eps")?, theta: f("music3.rope_theta")? as f64 };
+                (Source::Gguf { content, file }, shape)
+            }
+        };
         let code_rows: Vec<u32> = (CODE_OFFSET..CODE_OFFSET + SEMANTIC_CODES as u32).collect();
         let head_rows: Vec<u32> = std::iter::once(AUDIO_END).chain(code_rows.iter().copied()).collect();
-        let head = store.rows("lm_head.weight", &head_rows, dev)?;
-        let codes = store.rows("model.embed_tokens.weight", &code_rows, dev)?;
-        let norm = store.tensor("model.norm.weight", dev, false)?;
-        let layers = Tiered::load(count, budget, dev, |i| load_layer(&mut store, i, dev), progress)?;
-        // RoPE tables in F32, as the reference computes them, then BF16.
+        let (head, codes) = match &mut source {
+            Source::Safe(store) => (store.rows("lm_head.weight", &head_rows, dev)?, store.rows("model.embed_tokens.weight", &code_rows, dev)?),
+            gguf => (gguf.small("", "head", dev)?, gguf.small("", "codes", dev)?),
+        };
+        let norm = source.small("model.norm.weight", "norm", dev)?;
+        let layers = Tiered::load(shape.count, budget, dev, |i| source.layer(i, dev), progress)?;
+        // RoPE tables for the longest prompt and song, in F32 as the reference
+        // computes them, then BF16.
+        let (head_dim, positions) = (shape.head_dim, crate::music::MAX_PROMPT_TOKENS + crate::music::MAX_FRAMES + 2);
         let half = head_dim / 2;
-        let inv: Vec<f32> = (0..half).map(|i| 1. / (theta as f32).powf(2. * i as f32 / head_dim as f32)).collect();
-        let freqs: Vec<f32> = (0..max_positions).flat_map(|p| inv.iter().map(move |f| p as f32 * f)).collect();
-        let freqs = Tensor::from_vec(freqs, (max_positions, half), dev)?;
+        let inv: Vec<f32> = (0..half).map(|i| 1. / (shape.theta as f32).powf(2. * i as f32 / head_dim as f32)).collect();
+        let freqs: Vec<f32> = (0..positions).flat_map(|p| inv.iter().map(move |f| p as f32 * f)).collect();
+        let freqs = Tensor::from_vec(freqs, (positions, half), dev)?;
         Ok(Self {
-            store,
+            source,
             layers,
-            count,
+            count: shape.count,
             norm,
             head,
             codes,
-            heads,
-            kv_heads,
+            heads: shape.heads,
+            kv_heads: shape.kv_heads,
             head_dim,
-            eps,
+            eps: shape.eps,
             cos: freqs.cos()?.to_dtype(DType::BF16)?,
             sin: freqs.sin()?.to_dtype(DType::BF16)?,
             dev: dev.clone(),
@@ -206,7 +306,7 @@ impl Lm {
 
     /// Token embeddings, read from the file row by row: (B, T, 4096).
     pub fn embed(&mut self, ids: &[Vec<u32>]) -> Result<Tensor> {
-        let rows = ids.iter().map(|r| self.store.rows("model.embed_tokens.weight", r, &self.dev)).collect::<Result<Vec<_>>>()?;
+        let rows = ids.iter().map(|r| self.source.rows("text", "model.embed_tokens.weight", r, &self.dev)).collect::<Result<Vec<_>>>()?;
         Tensor::stack(&rows, 0)
     }
 
@@ -232,12 +332,12 @@ impl Lm {
         let sin = self.sin.narrow(0, start, t)?;
         let (hd, nq, nkv, eps) = (self.head_dim, self.heads, self.kv_heads, self.eps);
         let dev = self.dev.clone();
-        let store = &mut self.store;
+        let source = &mut self.source;
         let mut h = x.clone();
         for i in 0..self.count {
             h = self.layers.with(
                 i,
-                |i| load_layer(store, i, &dev),
+                |i| source.layer(i, &dev),
                 |l| {
                     let n = rms(&h, &l.input_norm, eps)?;
                     let qkv = l.qkv.forward(&n)?;
@@ -548,7 +648,15 @@ mod tests {
         let p = nrob::json::Json::parse(&std::fs::read(g.join("prompt.json"))?).map_err(candle_core::Error::wrap)?;
         let ids = crate::music::prompt_ids(&m, p.get("prompt").and_then(nrob::json::Json::as_str).unwrap(), p.get("lyrics").and_then(nrob::json::Json::as_str).unwrap())?;
         let started = std::time::Instant::now();
-        let mut lm = Lm::load(&m.join("language_model"), &Budget::default(), &dev, |_| {})?;
+        let quantized = std::env::var("NROB_MUSIC_LM").ok().map(std::path::PathBuf::from);
+        // A quantized model (NROB_MUSIC_LM) is held to looser bounds: q8_0
+        // roughly doubles BF16's differences, q4_k is ten times them.
+        let (tol, margin) = match quantized.as_deref().and_then(|p| p.to_str()) {
+            None => (1., 0.25),
+            Some(p) if p.contains("q8_0") => (2.5, 1.),
+            Some(_) => (15., 4.),
+        };
+        let mut lm = Lm::load(&m.join("language_model"), quantized.as_deref(), &Budget::default(), &dev, |_| {})?;
         let depth = Depth::load(&m.join("rvq_depth_decoder"), &dev)?;
         println!("loaded in {:.1?}", started.elapsed());
 
@@ -566,7 +674,7 @@ mod tests {
         let hidden = load(&g, "lm_hidden.f32", &dev);
         let err = relative(&last, &hidden.get(0)?);
         println!("prefill hidden: {err:.2e}");
-        assert!(err < 2e-2, "prefill hidden: {err}");
+        assert!(err < 2e-2 * tol, "prefill hidden: {err}");
         // Guided logits over the codes the stage can emit.
         let logits = lm.logits(&last)?.to_vec2::<f32>()?;
         let guided = guide(&logits[0], &logits[1]);
@@ -577,7 +685,7 @@ mod tests {
         let e = Tensor::new(finite.iter().map(|&i| expected[i]).collect::<Vec<_>>(), &Device::Cpu)?;
         let err = relative(&a, &e);
         println!("guided logits ({} candidates): {err:.2e}", finite.len());
-        assert!(err < 2e-2, "guided logits: {err}");
+        assert!(err < 2e-2 * tol, "guided logits: {err}");
 
         let codes = ints(&g, "codes.i32");
         let reference_hidden = {
@@ -602,12 +710,12 @@ mod tests {
             if f > 0 {
                 let h = Tensor::cat(&[&last.narrow(0, 0, 1)?, &depth_hidden], 1)?;
                 let err = relative(&h, &reference_hidden.narrow(0, f - 1, 1)?.to_device(&dev)?);
-                assert!(err < 3e-2, "forced frame {f} hidden: {err}");
+                assert!(err < 3e-2 * tol, "forced frame {f} hidden: {err}");
             }
             last = lm.forward(&feedback, &mut cache)?;
         }
         println!("teacher-forced: {agree} of {total} greedy picks agree; largest margin where they differ {worst:.3}");
-        assert!(worst < 0.25, "a choice differed by {worst}, more than a near tie");
+        assert!(worst < margin, "a choice differed by {worst}, more than a near tie");
 
         // A short greedy song: codes, feedback and frame hiddens.
         let n = 24;
@@ -620,7 +728,7 @@ mod tests {
                 break;
             }
             let err = relative(&f.hidden, &reference_hidden.narrow(0, i, 1)?);
-            assert!(err < 5e-2, "frame {i} hidden: {err}");
+            assert!(err < 5e-2 * tol, "frame {i} hidden: {err}");
             same += 1;
         }
         // Free-running greedy decoding parts ways at the first BF16 near tie
@@ -641,3 +749,4 @@ mod tests {
         Ok(want)
     }
 }
+
