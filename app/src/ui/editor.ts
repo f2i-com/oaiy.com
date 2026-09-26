@@ -14,6 +14,7 @@ import { EditorState, type Extension } from '@codemirror/state';
 import { EditorView, basicSetup } from 'codemirror';
 import type { Vfs } from '../vfs/vfs';
 import { clear, h } from './dom';
+import { formatBytes, mediaElement, mediaKind, type Media } from './media';
 
 function languageFor(path: string): Extension[] {
   const ext = path.slice(path.lastIndexOf('.') + 1).toLowerCase();
@@ -38,6 +39,9 @@ export class EditorPane {
   private dirty = false;
   private saveTimer: ReturnType<typeof setTimeout> | null = null;
   private applying = false;
+  /** The image, audio or video file on show, and its element. */
+  private mediaPath: string | null = null;
+  private media: Media | null = null;
 
   constructor(private vfs: Vfs) {
     this.element.append(this.title, this.body);
@@ -59,8 +63,50 @@ export class EditorPane {
     this.body.append(h('div.empty', h('p', 'Open a file from the tree, or ask the agent to write one.')));
   }
 
-  open(path: string): void {
+  private dropMedia(): void {
+    this.media?.dispose();
+    this.media = null;
+    this.mediaPath = null;
+  }
+
+  /** Show an image or play audio or video; SVG can switch to its source. */
+  private showMedia(path: string): void {
+    this.path = null;
+    this.view?.destroy();
+    this.view = null;
+    this.dropMedia();
+    clear(this.body);
+    const bytes = this.vfs.readBytes(path);
+    const media = mediaElement(path, bytes);
+    if (!media) return;
+    this.media = media;
+    this.mediaPath = path;
+    this.title.textContent = path;
+    const info = h('span.media-info', formatBytes(bytes.byteLength));
+    const bar = h('div.media-bar', info);
+    const img = media.element.querySelector('img');
+    if (img) {
+      img.addEventListener('load', () => (info.textContent = `${img.naturalWidth}×${img.naturalHeight} px · ${formatBytes(bytes.byteLength)}`), { once: true });
+      const zoom = h('button', { title: 'Show at actual size or fit to the pane (or click the image)' }, 'Actual size');
+      const toggle = () => {
+        const actual = media.element.classList.toggle('actual');
+        zoom.textContent = actual ? 'Fit' : 'Actual size';
+      };
+      zoom.addEventListener('click', toggle);
+      img.addEventListener('click', toggle);
+      bar.append(zoom);
+    }
+    if (/\.svg$/i.test(path)) bar.append(h('button', { title: 'Edit the SVG source', onclick: () => this.open(path, { source: true }) }, 'Source'));
+    this.body.append(h('div.media-view', bar, media.element));
+  }
+
+  open(path: string, options: { source?: boolean } = {}): void {
     this.flush();
+    if (mediaKind(path) && !options.source) {
+      this.showMedia(path);
+      return;
+    }
+    this.dropMedia();
     if (!this.vfs.isText(path)) {
       this.path = null;
       this.view?.destroy();
@@ -114,6 +160,11 @@ export class EditorPane {
 
   /** The project changed underneath: reload or close the open file. */
   externalChange(path: string | null): void {
+    if (this.mediaPath && (path === null || `/${path}` === this.mediaPath)) {
+      if (this.vfs.exists(this.mediaPath)) this.showMedia(this.mediaPath);
+      else this.close();
+      return;
+    }
     if (!this.path || (path !== null && `/${path}` !== this.path)) return;
     if (!this.vfs.exists(this.path)) {
       this.close();
@@ -128,6 +179,7 @@ export class EditorPane {
   }
 
   close(): void {
+    this.dropMedia();
     this.view?.destroy();
     this.view = null;
     this.path = null;

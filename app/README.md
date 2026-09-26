@@ -10,6 +10,8 @@ A coding agent that runs entirely in your browser.
 
 ## Files, images and big files
 
+- **Viewer:** opening an image in the file tree shows it (fit or actual size; an SVG can switch to its source). Audio and video files open in a player.
+- **In the chat:** an attached image appears as a thumbnail, and audio or video gets a player. Clicking one opens the file (or, for a `.softn`, previews its app). The agent can hand you a file with `present_file`, such as a sound or image it made, and it shows up the same way.
 - **Attach** files to a message with 📎, by dropping them on the chat, or by pasting an image.
   - Files are saved in the project under `uploads/`, so the agent can open them with its tools.
   - Images also go to the model with the message, if it can see images. If it can't, the run carries on in text.

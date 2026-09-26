@@ -70,6 +70,7 @@ const script = [
   },
   { calls: [{ name: 'softn_check', input: { app: 'Imported' } }] },
   { calls: [{ name: 'softn_import', input: { path: 'uploads/imported.softn', parent: 'copies' } }] },
+  { calls: [{ name: 'present_file', input: { path: 'uploads/tone.wav', caption: 'the tone' } }] },
   { text: 'All done.' },
 ];
 const model = createHttpServer((req, res) => {
@@ -110,6 +111,26 @@ const check = async (name, fn) => {
 const expect = (c, m) => {
   if (!c) throw new Error(m);
 };
+// Half a second of a 440 Hz tone, 16-bit mono PCM.
+function wav(seconds = 0.5, rate = 8000) {
+  const samples = Math.round(seconds * rate);
+  const buf = Buffer.alloc(44 + samples * 2);
+  buf.write('RIFF', 0);
+  buf.writeUInt32LE(36 + samples * 2, 4);
+  buf.write('WAVEfmt ', 8);
+  buf.writeUInt32LE(16, 16);
+  buf.writeUInt16LE(1, 20);
+  buf.writeUInt16LE(1, 22);
+  buf.writeUInt32LE(rate, 24);
+  buf.writeUInt32LE(rate * 2, 28);
+  buf.writeUInt16LE(2, 32);
+  buf.writeUInt16LE(16, 34);
+  buf.write('data', 36);
+  buf.writeUInt32LE(samples * 2, 40);
+  for (let i = 0; i < samples; i++) buf.writeInt16LE(Math.round(Math.sin((2 * Math.PI * 440 * i) / rate) * 12000), 44 + i * 2);
+  return buf;
+}
+writeFileSync(join(dir, 'tone.wav'), wav());
 const toolText = (i) => JSON.stringify(requests[i].messages.filter((m) => m.role === 'tool').at(-1)?.content ?? '');
 
 try {
@@ -144,8 +165,8 @@ try {
 
   await check('files attached in the chat are saved in the project, and the image goes to the model', async () => {
     const input = await page.$('.chat input[type=file]');
-    await input.uploadFile(join(dir, 'pattern.png'), join(dir, 'big.txt'), join(dir, 'imported.softn'));
-    await page.waitForFunction(() => document.querySelectorAll('.attachments .attachment').length === 3);
+    await input.uploadFile(join(dir, 'pattern.png'), join(dir, 'big.txt'), join(dir, 'imported.softn'), join(dir, 'tone.wav'));
+    await page.waitForFunction(() => document.querySelectorAll('.attachments .attachment').length === 4);
     await page.type('.chat-input', 'Look at these.');
     await page.keyboard.press('Enter');
     await page.waitForFunction(() => document.querySelector('.chat-log')?.textContent.includes('All done.'), { timeout: 120_000 });
@@ -154,6 +175,37 @@ try {
     expect(first.includes('uploads/pattern.png') && first.includes('2000×1200') && first.includes('uploads/big.txt') && first.includes('uploads/imported.softn: unpacked into Imported/') && first.includes('main ui/main.ui') && first.includes('logic/main.logic'), first.slice(0, 900));
     const tree = await page.$$eval('.tree-row .name', (els) => els.map((e) => e.textContent));
     expect(tree.includes('uploads') && tree.includes('Imported'), `tree: ${tree}`);
+  });
+
+  await check('attachments show as themselves in the chat: a thumbnail, a player, chips that open', async () => {
+    const shown = await page.$eval('.msg.user .msg-attachments', (el) => ({
+      img: el.querySelector('.media-thumb img')?.naturalWidth ?? 0,
+      audio: !!el.querySelector('audio[controls]'),
+      chips: [...el.querySelectorAll('button.attachment')].map((b) => b.textContent),
+    }));
+    expect(shown.img === 2000 && shown.audio && shown.chips.some((c) => c.includes('big.txt')) && shown.chips.some((c) => c.includes('imported.softn')), JSON.stringify(shown));
+    // The agent's present_file puts a player in the chat too.
+    const presented = await page.$$eval('.msg.presented audio[controls]', (els) => els.length);
+    expect(presented === 1 && toolText(8).includes('Shown to the user in the chat: /uploads/tone.wav'), `presented: ${presented}; ${toolText(8)}`);
+    const duration = await page.$eval('.msg.presented audio', (a) => new Promise((resolve) => (a.readyState >= 1 ? resolve(a.duration) : a.addEventListener('loadedmetadata', () => resolve(a.duration)))));
+    expect(Math.abs(duration - 0.5) < 0.05, `duration ${duration}`);
+  });
+
+  await check('the file viewer shows images and plays audio', async () => {
+    await page.$$eval('.tree-row', (rows) => {
+      if (!rows.some((r) => r.querySelector('.name')?.textContent === 'tone.wav')) rows.find((r) => r.querySelector('.name')?.textContent === 'uploads')?.click();
+    });
+    await page.waitForFunction(() => [...document.querySelectorAll('.tree-row .name')].some((e) => e.textContent === 'tone.wav'));
+    await page.$$eval('.tree-row', (rows) => rows.find((r) => r.querySelector('.name')?.textContent === 'tone.wav').click());
+    await page.waitForSelector('.editor .media-view audio[controls]');
+    await page.$$eval('.tree-row', (rows) => rows.find((r) => r.querySelector('.name')?.textContent === 'pattern.png').click());
+    await page.waitForFunction(() => /2000×1200 px/.test(document.querySelector('.editor .media-info')?.textContent ?? ''));
+    expect(!(await page.$('.editor .media-view audio')), 'the old player is still there');
+    // A thumbnail in the chat opens its file in the viewer.
+    await page.$$eval('.tree-row', (rows) => rows.find((r) => r.querySelector('.name')?.textContent === 'tone.wav').click());
+    await page.waitForSelector('.editor .media-view audio');
+    await page.click('.msg.user .media-thumb img');
+    await page.waitForFunction(() => document.querySelector('.editor-title')?.textContent === '/uploads/pattern.png');
   });
 
   await check('view_image zooms into the original pixels and shows the region to the model', async () => {
@@ -207,6 +259,19 @@ try {
     expect(file === 'Imported.softn', `downloads: ${readdirSync(downloads)}`);
     const entries = Object.keys(unzipSync(readFileSync(join(downloads, file)))).sort();
     expect(JSON.stringify(entries) === JSON.stringify(['logic/main.logic', 'manifest.json', 'ui/main.ui']), `entries: ${entries}`);
+  });
+
+  await check('after a reload the chat shows its attachments again, a .softn chip included', async () => {
+    await page.reload();
+    await page.waitForSelector('.msg.user .msg-attachments', { timeout: 60_000 });
+    const shown = await page.$eval('.msg.user .msg-attachments', (el) => ({
+      thumb: !!el.querySelector('.media-thumb img'),
+      audio: !!el.querySelector('audio'),
+      chips: [...el.querySelectorAll('button.attachment')].map((b) => b.textContent),
+    }));
+    expect(shown.thumb && shown.audio && shown.chips.length === 2 && shown.chips.some((c) => c.includes('imported.softn')), JSON.stringify(shown));
+    expect(!!(await page.$('.msg.presented audio')), 'the presented file is gone after the reload');
+    if (process.env.SHOT) await page.screenshot({ path: process.env.SHOT });
   });
 } finally {
   await browser.close();

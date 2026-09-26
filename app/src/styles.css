@@ -201,3 +201,31 @@ dialog h2 { margin: 0 0 4px; }
   .provider-form label { grid-template-columns: 1fr; gap: 4px; }
   .form-buttons, .dialog-buttons { flex-wrap: wrap; }
 }
+
+/* Media: the file viewer and the chat. */
+.media-view { display: flex; flex-direction: column; height: 100%; min-height: 0; }
+.media-bar { display: flex; align-items: center; gap: 8px; padding: 6px 10px; border-bottom: 1px solid var(--border); font-size: 12px; color: var(--muted); }
+.media-bar button { margin-left: auto; }
+.media-bar button + button { margin-left: 0; }
+.media-view .media { flex: 1; min-height: 0; overflow: auto; display: flex; align-items: center; justify-content: center; padding: 12px; }
+.media-view .media-image { background: repeating-conic-gradient(#8882 0% 25%, transparent 0% 50%) 50% / 16px 16px; }
+.media-view .media-image img { max-width: 100%; max-height: 100%; object-fit: contain; cursor: zoom-in; }
+.media-view .media-image.actual { display: block; }
+.media-view .media-image.actual img { max-width: none; max-height: none; cursor: zoom-out; }
+.media-view .media-audio, .media-view .media-video { flex-direction: column; gap: 10px; }
+.media-view .media-audio audio { width: min(520px, 100%); }
+.media-view .media-video video { max-width: 100%; max-height: 100%; }
+.media-name { font-size: 12px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%; }
+.clickable { cursor: pointer; }
+.media-name.clickable:hover { text-decoration: underline; }
+.msg-attachments .media-thumb img, .presented .media-thumb img { max-width: 220px; max-height: 160px; border-radius: 6px; border: 1px solid var(--border); display: block; }
+.msg-attachments .media.compact, .presented .media.compact { display: flex; flex-direction: column; gap: 2px; max-width: 100%; }
+.msg-attachments audio, .presented audio { width: min(300px, 100%); height: 36px; }
+.msg-attachments video, .presented video { max-width: min(320px, 100%); max-height: 220px; border-radius: 6px; }
+.msg-attachments button.attachment, .presented button.attachment { cursor: pointer; color: inherit; font: inherit; font-size: 12px; }
+.msg.presented { display: flex; flex-wrap: wrap; gap: 8px; background: transparent; border: 0; padding: 2px 0; }
+.media-error { font-size: 12px; color: var(--muted); }
+.msg-attachments, .msg.presented { align-items: flex-start; }
+.media-audio.compact { width: 300px; max-width: 100%; }
+.media-video.compact { width: 320px; max-width: 100%; }
+.msg-attachments audio, .presented audio { width: 100%; }

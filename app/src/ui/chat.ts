@@ -4,8 +4,9 @@
  * commands.
  */
 import type { AgentEvent } from '../agent/agent';
-import type { ToolCall, ToolResult, Turn } from '../agent/protocol';
+import type { Attachment, ToolCall, ToolResult, Turn } from '../agent/protocol';
 import { clear, h } from './dom';
+import { mediaElement, mediaKind, type Media } from './media';
 import { renderMarkdown } from './markdown';
 
 function summarizeCall(call: ToolCall): string {
@@ -18,6 +19,7 @@ function summarizeCall(call: ToolCall): string {
     case 'sandbox_shell': return s('command').split('\n')[0];
     case 'code_run': return `${s('language') || 'javascript'}${s('file') ? ` ${s('file')}` : ''}`;
     case 'web_fetch': return s('url');
+    case 'present_file': case 'view_image': case 'file_info': case 'search_file': return s('path');
     case 'softn_import': return s('path');
     case 'softn_check': case 'softn_docs': return s('app');
     default: return '';
@@ -38,8 +40,19 @@ export class ChatPane {
   private thinking: { box: HTMLElement; text: string } | null = null;
   private cards = new Map<string, HTMLElement>();
   private busy = false;
+  /** Blob URLs behind the media in the log, revoked when it is cleared. */
+  private media: Media[] = [];
 
-  constructor(private readonly handlers: { submit: (text: string, files: File[]) => void; stop: () => void }) {
+  constructor(
+    private readonly handlers: {
+      submit: (text: string, files: File[]) => void;
+      stop: () => void;
+      /** A project file's bytes, for showing it (null when it is gone). */
+      file: (path: string) => Uint8Array | null;
+      /** Open a project file (or, for an unpacked .softn, its app) in the workspace. */
+      open: (path: string, app?: string) => void;
+    },
+  ) {
     this.element.append(h('div.pane-title', 'Agent'), this.log, this.status, this.pending, h('div.chat-compose', this.attachButton, this.input, this.send), this.picker);
     this.attachButton.addEventListener('click', () => this.picker.click());
     this.picker.addEventListener('change', () => {
@@ -135,16 +148,33 @@ export class ChatPane {
   }
 
   clearLog(): void {
+    for (const m of this.media.splice(0)) m.dispose();
     clear(this.log);
     this.cards.clear();
     this.current = null;
     this.thinking = null;
   }
 
-  user(text: string, attachments: string[] = []): void {
+  /**
+   * A project file shown in the log: an image as a thumbnail, audio and
+   * video with a player, anything else as a chip; each opens the file.
+   */
+  private fileView(path: string, name = path.split('/').pop() ?? path, app?: string): HTMLElement {
+    const open = () => this.handlers.open(path, app);
+    const bytes = mediaKind(path) ? this.handlers.file(path) : null;
+    const media = bytes ? mediaElement(path, bytes, { compact: true, onOpen: open }) : null;
+    if (media) {
+      this.media.push(media);
+      return media.element;
+    }
+    const icon = app || /\.softn$/i.test(name) ? '📦' : mediaKind(path) === 'image' ? '🖼' : '📄';
+    return h('button.attachment', { title: app ? `Unpacked into ${app}/: click to preview it` : `${path}: click to open`, onclick: open }, h('span.file-icon', icon), h('span.attachment-name', name));
+  }
+
+  user(text: string, attachments: Attachment[] = []): void {
     this.current = null;
     const box = h('div.msg.user', h('div.msg-body', text || (attachments.length ? '' : ' ')));
-    if (attachments.length) box.append(h('div.msg-attachments', ...attachments.map((name) => h('span.attachment', h('span.file-icon', /\.(png|jpe?g|gif|webp|svg|bmp|avif)$/i.test(name) ? '🖼' : /\.softn$/i.test(name) ? '📦' : '📄'), h('span.attachment-name', name)))));
+    if (attachments.length) box.append(h('div.msg-attachments', ...attachments.map((a) => this.fileView(a.path, a.name, a.app))));
     this.log.append(box);
     this.scroll();
   }
@@ -193,6 +223,11 @@ export class ChatPane {
     if (pre) pre.textContent = result.content;
     for (const image of result.images ?? []) {
       card.append(h('img.tool-image', { src: `data:${image.mediaType};base64,${image.data}`, alt: image.label ?? 'image shown to the model' }));
+    }
+    // A file the agent hands over is shown outside the (collapsed) card.
+    if (result.files?.length) {
+      const shown = h('div.msg.presented', ...result.files.map((path) => this.fileView(path)));
+      card.after(shown);
     }
     this.scroll();
   }
@@ -244,7 +279,9 @@ export class ChatPane {
       if (turn.role === 'user') {
         const text = turn.text.replace(/^<project>[\s\S]*?<\/project>\n\n/, '');
         const attached = /\n\n\[Attached and saved in the project: ([\s\S]*)\]$/.exec(text);
-        this.user(attached ? text.slice(0, attached.index) : text, attached ? attached[1].split('; ').map((n) => n.split(' (')[0]) : []);
+        // Chats saved before attachments were kept on the turn: read them from the note.
+        const fallback = attached ? attached[1].split('; ').map((n) => n.split(/ \(|: /)[0]).filter((p) => /^uploads\/[^\s]+$/.test(p)).map((path) => ({ name: path.split('/').pop()!, path })) : [];
+        this.user(attached ? text.slice(0, attached.index) : text, turn.attachments ?? fallback);
       }
       else if (turn.role === 'assistant') {
         if (turn.text) this.assistantText(turn.text);

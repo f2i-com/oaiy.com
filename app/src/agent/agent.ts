@@ -10,7 +10,7 @@ import type { NetGate } from '../gate/netgate';
 import type { Vfs } from '../vfs/vfs';
 import { AIProviderError } from './providers/aiProvider';
 import type { ProviderConfig } from './providers/types';
-import { sendTurn, type Reply, type ToolCall, type ToolResult, type Turn, type Usage } from './protocol';
+import { sendTurn, type Attachment, type Reply, type ToolCall, type ToolResult, type Turn, type Usage } from './protocol';
 import { TOOLS, runTool, type ToolContext } from './tools';
 import type { ImagePart } from './images';
 
@@ -161,7 +161,7 @@ export class Agent {
   }
 
   /** Run one user request to completion. */
-  async run(prompt: string, emit: (e: AgentEvent) => void, signal?: AbortSignal, images: ImagePart[] = []): Promise<void> {
+  async run(prompt: string, emit: (e: AgentEvent) => void, signal?: AbortSignal, images: ImagePart[] = [], attachments: Attachment[] = []): Promise<void> {
     const provider = this.options.provider();
     if (!provider) {
       emit({ type: 'error', message: 'No AI provider is set up yet. Open Settings to connect a local server (Ollama, LM Studio) or an API.' });
@@ -171,7 +171,7 @@ export class Agent {
     this.toolContext.signal = signal;
     const first = this.turns.length === 0;
     const text = first ? `<project>\n${this.options.projectSummary()}\n</project>\n\n${prompt}` : prompt;
-    this.turns.push(images.length ? { role: 'user', text, images } : { role: 'user', text });
+    this.turns.push({ role: 'user', text, ...(images.length ? { images } : {}), ...(attachments.length ? { attachments } : {}) });
     let failures = 0;
     let lastFailure = '';
     try {

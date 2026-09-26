@@ -31,10 +31,21 @@ export interface ToolResult {
   isError: boolean;
   /** Images the tool shows the model (view_image). */
   images?: ImagePart[];
+  /** Project files the tool shows the person in the chat (present_file); not sent to the model. */
+  files?: string[];
+}
+
+/** A file attached to a user message, as saved in the project; for the chat only. */
+export interface Attachment {
+  name: string;
+  /** Where it was saved, without a leading slash. */
+  path: string;
+  /** For a .softn: the folder it was unpacked into. */
+  app?: string;
 }
 
 export type Turn =
-  | { role: 'user'; text: string; images?: ImagePart[] }
+  | { role: 'user'; text: string; images?: ImagePart[]; attachments?: Attachment[] }
   | { role: 'assistant'; text: string; calls: ToolCall[]; anthropicContent?: unknown[] }
   | { role: 'tool'; results: ToolResult[] };
 

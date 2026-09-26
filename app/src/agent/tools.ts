@@ -83,6 +83,11 @@ export const TOOLS: ToolSpec[] = [
     },
   },
   {
+    name: 'present_file',
+    description: 'Show the user a file from the project in the chat: an image is displayed, audio and video get a player, anything else a link that opens it. Use it to hand over something you made or found (a generated image or sound, a report). It does not show you the file: use view_image or read_file for that.',
+    parameters: { type: 'object', required: ['path'], properties: { path: str, caption: str } },
+  },
+  {
     name: 'view_image',
     description:
       `Look at an image in the project (png, jpg, gif, webp, svg, bmp, avif). The whole image is shown scaled to fit ${DEFAULT_VIEW_SIZE} px (max_size up to ${MAX_VIEW_SIZE}). ` +
@@ -234,6 +239,8 @@ function requireFreshRead(ctx: ToolContext, key: string, what: string): void {
 
 /** Images a tool produced for the model, collected alongside its text. */
 let imagesOut: ImagePart[] = [];
+/** Files present_file shows the person, collected the same way. */
+let filesOut: string[] = [];
 
 async function execute(call: ToolCall, ctx: ToolContext): Promise<string> {
   const input = call.input;
@@ -512,6 +519,15 @@ async function execute(call: ToolCall, ctx: ToolContext): Promise<string> {
       }
       return lines.join('\n');
     }
+    case 'present_file': {
+      const path = normalizePath(need(input, 'path'));
+      const stat = vfs.stat(`/${path}`);
+      if (!stat) throw new Error(`/${path} does not exist`);
+      if (stat.type !== 'file') throw new Error(`/${path} is a folder; present a file`);
+      filesOut.push(path);
+      const caption = typeof input.caption === 'string' && input.caption.trim() ? ` (${input.caption.trim()})` : '';
+      return `Shown to the user in the chat: /${path}, ${stat.size.toLocaleString()} bytes${caption}.`;
+    }
     case 'softn_import': {
       const path = normalizePath(need(input, 'path'));
       const imported = importSoftn(vfs, vfs.readBytes(path), path.split('/').pop()!, typeof input.parent === 'string' ? normalizePath(input.parent) : '');
@@ -543,13 +559,17 @@ function htmlToText(html: string): string {
 export async function runTool(call: ToolCall, ctx: ToolContext): Promise<ToolResult> {
   if (call.parseError) return { id: call.id, name: call.name, content: `Error: the tool call's arguments could not be read: ${call.parseError}`, isError: true };
   imagesOut = [];
+  filesOut = [];
   try {
     const content = await execute(call, ctx);
     let isError = false;
     if ((call.name === 'code_run' || call.name === 'sandbox_shell') && /"exit_code": (?!0\b)-?\d+/.test(content)) isError = true;
-    const images = imagesOut;
+    const result: ToolResult = { id: call.id, name: call.name, content, isError };
+    if (imagesOut.length) result.images = imagesOut;
+    if (filesOut.length) result.files = filesOut;
     imagesOut = [];
-    return images.length ? { id: call.id, name: call.name, content, isError, images } : { id: call.id, name: call.name, content, isError };
+    filesOut = [];
+    return result;
   } catch (error) {
     const message = error instanceof VfsError || error instanceof Error ? error.message : String(error);
     return { id: call.id, name: call.name, content: `Error: ${message}`, isError: true };

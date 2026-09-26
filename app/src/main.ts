@@ -13,6 +13,7 @@ import { TerminalPane } from './ui/terminal';
 import { SoftnPreview } from './softn/preview';
 import { SOFTN_STARTER, appKey, appLabel, checkProject, describeApp, downloadSoftn, findApps, formatFindings, importSoftn, isSoftnProject, logicSyntax, resolveApp } from './softn/softn';
 import { imageForMessage, imageMimeFor, type ImagePart } from './agent/images';
+import type { Attachment } from './agent/protocol';
 import { FileTree } from './ui/tree';
 import { OpenProject, createProject, deleteProject, listProjects, renameProject, type ProjectMeta } from './vfs/projects';
 import { canPickFolder, downloadZip, importFileList, importFolder, importZip, type Imported } from './vfs/transfer';
@@ -100,7 +101,18 @@ async function main(): Promise<void> {
   let controller: AbortController | null = null;
   let unsubscribe: (() => void) | null = null;
 
-  const chat = new ChatPane({ submit: (text, files) => void submit(text, files), stop: () => controller?.abort() });
+  const chat = new ChatPane({
+    submit: (text, files) => void submit(text, files),
+    stop: () => controller?.abort(),
+    file: (path) => {
+      try {
+        return project.vfs.readBytes(`/${path}`);
+      } catch {
+        return null;
+      }
+    },
+    open: (path, app) => openFromChat(path, app),
+  });
   const notice = (message: string) => chat.system(message, 'error');
   const tree = new FileTree(null as unknown as Vfs, (path) => {
     editor.open(path);
@@ -216,18 +228,22 @@ async function main(): Promise<void> {
    * folder for a .softn), so the agent can open them with its tools; images
    * also go to the model with the message, sized for its eyes.
    */
-  async function receiveFiles(files: File[]): Promise<{ notes: string[]; images: ImagePart[] }> {
+  async function receiveFiles(files: File[]): Promise<{ notes: string[]; images: ImagePart[]; attachments: Attachment[] }> {
     const notes: string[] = [];
     const images: ImagePart[] = [];
+    const attachments: Attachment[] = [];
     for (const file of files) {
       const bytes = new Uint8Array(await file.arrayBuffer());
       const path = freePath('uploads', file.name);
       project.vfs.writeFile(path, bytes, { parents: true });
+      const attachment: Attachment = { name: file.name, path: path.slice(1) };
+      attachments.push(attachment);
       // A .softn is unpacked to work on; the original stays in uploads/ to
       // compare with or unpack again (softn_import).
       if (/\.softn$/i.test(file.name)) {
         try {
           const imported = importSoftn(project.vfs, bytes, file.name);
+          attachment.app = imported.root;
           notes.push(`${path.slice(1)}: unpacked into ${imported.root}/. ${describeApp(project.vfs, imported.root)}\nTo change this app, edit it in ${imported.root}/; to recreate it (or build something like it), read it and write the new app in another folder, leaving this one as it is.`);
           preview.setApp(imported.root);
         } catch (error) {
@@ -248,7 +264,25 @@ async function main(): Promise<void> {
       }
       notes.push(`${path.slice(1)} (${bytes.byteLength.toLocaleString()} bytes)`);
     }
-    return { notes, images };
+    return { notes, images, attachments };
+  }
+
+  /** A file (or an unpacked .softn's app) clicked in the chat. */
+  function openFromChat(path: string, app?: string): void {
+    if (app !== undefined && project.vfs.exists(`/${app}`)) {
+      preview.setApp(app);
+      showPane('preview');
+      if (window.matchMedia('(max-width: 900px)').matches) showView('preview');
+      return;
+    }
+    if (!project.vfs.exists(`/${path}`)) {
+      chat.system(`${path} is no longer in the project.`, 'error');
+      return;
+    }
+    showPane('editor');
+    editor.open(`/${path}`);
+    tree.select(`/${path}`);
+    if (window.matchMedia('(max-width: 900px)').matches) showView('editor');
   }
 
   async function submit(text: string, files: File[] = []): Promise<void> {
@@ -276,19 +310,21 @@ async function main(): Promise<void> {
       }
     }
     editor.flush();
-    chat.user(text, files.map((f) => f.name));
     chat.setBusy(true);
     controller = new AbortController();
     try {
       let prompt = text;
       let images: ImagePart[] = [];
+      let attachments: Attachment[] = [];
       if (files.length) {
         const received = await receiveFiles(files);
         images = received.images;
+        attachments = received.attachments;
         await project.flush();
         prompt = `${text || 'I attached some files.'}\n\n[Attached and saved in the project: ${received.notes.join('; ')}]`;
       }
-      await agent.run(prompt, (event) => chat.event(event), controller.signal, images);
+      chat.user(text, attachments);
+      await agent.run(prompt, (event) => chat.event(event), controller.signal, images, attachments);
     } finally {
       controller = null;
       chat.setBusy(false);
