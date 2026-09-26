@@ -22,6 +22,11 @@ A coding agent that runs entirely in your browser.
   - If the old part is too big for the model to read at once, it's summarized in chunks.
   - If no summary can be made, the old turns are reduced to their requests and file changes instead.
   - The chat keeps the whole conversation; only the model reads from the summary on.
+- **Sub-agents:** for a big task, the agent can hand independent parts to sub-agents with `delegate`.
+  - Each task runs in a fresh agent with its own, smaller context (32k tokens by default, set in Settings) and the same tools except `delegate` and `update_plan`.
+  - Each reports back what it did and which files it changed. The main conversation keeps only those reports, not the sub-agents' work.
+  - Tasks wait in a queue per model: one at a time for a local server (which usually answers one request at a time), three for an API. Change it under **Agents** in Settings. Stop cancels the waiting tasks as well as the running ones.
+  - A task can name the plan step it completes, so the plan updates as tasks finish. The chat shows each task live: queued, working (with what it's doing right now), then done, with its report.
 - **The meter** in the Agent pane's title shows how full the context is. The provider's own token counts calibrate the estimate as it goes.
 
 ## Files, images and big files

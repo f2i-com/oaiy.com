@@ -26,6 +26,25 @@ const OUTPUT_CHARS = 30_000;
 const DEFAULT_TIMEOUT_S = 30;
 const MAX_TIMEOUT_S = 300;
 
+/** Tools a sub-agent does not get: it does not delegate further or change the plan. */
+export const MAIN_AGENT_ONLY = new Set(['delegate', 'update_plan']);
+
+/** The tasks of a delegate call, or an error saying what is wrong with them. */
+export function readTasks(input: Record<string, unknown>): Array<{ title: string; instructions: string; planStep?: number }> {
+  const raw = Array.isArray(input.tasks) ? input.tasks : [];
+  const tasks = raw
+    .filter((t): t is Record<string, unknown> => !!t && typeof t === 'object')
+    .map((t) => ({
+      title: String(t.title ?? '').trim().slice(0, 120),
+      instructions: String(t.instructions ?? t.task ?? '').trim(),
+      planStep: typeof t.plan_step === 'number' && t.plan_step >= 1 ? Math.floor(t.plan_step) : undefined,
+    }))
+    .filter((t) => t.instructions);
+  if (!tasks.length) throw new Error('tasks is empty: give each task a title and self-contained instructions, e.g. [{"title": "Write the settings page", "instructions": "..."}]');
+  if (tasks.length > 8) throw new Error(`${tasks.length} tasks in one call; give at most 8 (call delegate again for the rest)`);
+  return tasks.map((t, i) => ({ ...t, title: t.title || `Task ${i + 1}` }));
+}
+
 /** The checklist the person watches: the goal of the request and its steps. */
 export interface Plan {
   goal: string;
@@ -114,6 +133,28 @@ export const TOOLS: ToolSpec[] = [
         ignore_case: { type: 'boolean' },
         literal: { type: 'boolean', description: 'Treat pattern as plain text' },
         max_results: int,
+      },
+    },
+  },
+  {
+    name: 'delegate',
+    description:
+      'Hand parts of the work to sub-agents: each task runs in a fresh agent with its own, smaller context and the same tools (except delegate and update_plan), and reports back what it did. ' +
+      'Use it for work that splits into independent parts (separate files, pages, modules, investigations), so each part gets a clear head and the main conversation stays small. ' +
+      'Each task must be self-contained: say exactly what to do, which files it may change, and what to report; the sub-agent sees nothing of this conversation. Keep tasks on separate files: they may run at the same time. ' +
+      'Tasks wait in a queue and run as many at a time as the model server allows; this call returns when all of them are finished. Give plan_step (the 1-based number of the plan step a task completes) so the plan updates as tasks finish. Up to 8 tasks per call.',
+    parameters: {
+      type: 'object',
+      required: ['tasks'],
+      properties: {
+        tasks: {
+          type: 'array',
+          items: {
+            type: 'object',
+            required: ['title', 'instructions'],
+            properties: { title: str, instructions: str, plan_step: int },
+          },
+        },
       },
     },
   },
@@ -318,14 +359,20 @@ function requireFreshRead(ctx: ToolContext, key: string, what: string): void {
   if (seen !== ctx.vfs.version(`/${key}`)) throw new Error(`/${key} changed since you read it; read it again before you ${what} it`);
 }
 
-/** Images a tool produced for the model, collected alongside its text. */
-let imagesOut: ImagePart[] = [];
-/** Files present_file shows the person, collected the same way. */
-let filesOut: string[] = [];
-/** softn_check's outcome, collected the same way. */
-let checkOut: ToolResult['check'] | null = null;
+/**
+ * What a tool produces besides its text, collected per call (agents run
+ * tools concurrently, so nothing of this is shared between calls).
+ */
+interface ToolOut {
+  /** Images for the model (view_image). */
+  images: ImagePart[];
+  /** Files shown to the person (present_file). */
+  files: string[];
+  /** softn_check's outcome. */
+  check: ToolResult['check'] | null;
+}
 
-async function execute(call: ToolCall, ctx: ToolContext): Promise<string> {
+async function execute(call: ToolCall, ctx: ToolContext, out: ToolOut): Promise<string> {
   const input = call.input;
   const vfs = ctx.vfs;
   switch (call.name) {
@@ -566,7 +613,7 @@ async function execute(call: ToolCall, ctx: ToolContext): Promise<string> {
         grid: input.grid === true,
         label: key,
       });
-      imagesOut.push(view.image);
+      out.images.push(view.image);
       const r = view.region;
       const whole = r.x === 0 && r.y === 0 && r.width === view.width && r.height === view.height;
       const scale = view.shownWidth / r.width;
@@ -609,7 +656,7 @@ async function execute(call: ToolCall, ctx: ToolContext): Promise<string> {
         return `Not a SoftN app yet: ${target.reason}\nFiles in ${root}: ${formatFindings(findings)}`;
       }
       const checked = await checkApp(ctx, target.root);
-      checkOut = { root: target.root, ok: checked.ok, text: checked.text };
+      out.check = { root: target.root, ok: checked.ok, text: checked.text };
       return checked.text;
     }
     case 'softn_inspect': case 'softn_interact': {
@@ -626,6 +673,8 @@ async function execute(call: ToolCall, ctx: ToolContext): Promise<string> {
       if (report.error || report.problems.some((p) => p.level === 'error')) throw new Error(text);
       return text;
     }
+    case 'delegate':
+      throw new Error('delegate is not available here: sub-agents do the work themselves');
     case 'update_plan': {
       const plan = readPlan(input);
       const done = plan.items.filter((i) => i.status === 'done').length;
@@ -637,7 +686,7 @@ async function execute(call: ToolCall, ctx: ToolContext): Promise<string> {
       const stat = vfs.stat(`/${path}`);
       if (!stat) throw new Error(`/${path} does not exist`);
       if (stat.type !== 'file') throw new Error(`/${path} is a folder; present a file`);
-      filesOut.push(path);
+      out.files.push(path);
       const caption = typeof input.caption === 'string' && input.caption.trim() ? ` (${input.caption.trim()})` : '';
       return `Shown to the user in the chat: /${path}, ${stat.size.toLocaleString()} bytes${caption}.`;
     }
@@ -705,20 +754,15 @@ export async function checkApp(ctx: ToolContext, root: string): Promise<{ ok: bo
 
 export async function runTool(call: ToolCall, ctx: ToolContext): Promise<ToolResult> {
   if (call.parseError) return { id: call.id, name: call.name, content: `Error: the tool call's arguments could not be read: ${call.parseError}`, isError: true };
-  imagesOut = [];
-  filesOut = [];
-  checkOut = null;
+  const out: ToolOut = { images: [], files: [], check: null };
   try {
-    const content = await execute(call, ctx);
+    const content = await execute(call, ctx, out);
     let isError = false;
     if ((call.name === 'code_run' || call.name === 'sandbox_shell') && /"exit_code": (?!0\b)-?\d+/.test(content)) isError = true;
     const result: ToolResult = { id: call.id, name: call.name, content, isError };
-    if (imagesOut.length) result.images = imagesOut;
-    if (filesOut.length) result.files = filesOut;
-    if (checkOut) result.check = checkOut;
-    checkOut = null;
-    imagesOut = [];
-    filesOut = [];
+    if (out.images.length) result.images = out.images;
+    if (out.files.length) result.files = out.files;
+    if (out.check) result.check = out.check;
     return result;
   } catch (error) {
     const message = error instanceof VfsError || error instanceof Error ? error.message : String(error);

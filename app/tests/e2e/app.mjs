@@ -18,6 +18,17 @@ const script = [
   { calls: [{ name: 'sandbox_shell', input: { command: 'ls data && tail -n +2 data/weather.csv | wc -l' } }] },
   { calls: [{ name: 'code_run', input: { language: 'python', code: "import statistics\nwith open('data/weather.csv') as f:\n    t=[int(l.split(',')[1]) for l in f.read().splitlines()[1:]]\nm=statistics.mean(t)\nprint('mean', m)\nwith open('data/mean.txt','w') as f:\n    f.write(str(m))\n" } }] },
   { text: 'Done: the mean temperature is 19.8 and it is saved in data/mean.txt.' },
+  // "Write two notes": a plan, two sub-agents one after the other (a local server takes one at a time), then done.
+  { calls: [
+    { name: 'update_plan', input: { goal: 'Two notes', items: [{ text: 'Note A', status: 'pending' }, { text: 'Note B', status: 'pending' }, { text: 'Read them over', status: 'pending' }] } },
+    { name: 'delegate', input: { tasks: [{ title: 'Note A', instructions: 'Write notes/a.txt saying A.', plan_step: 1 }, { title: 'Note B', instructions: 'Write notes/b.txt saying B.', plan_step: 2 }] } },
+  ] },
+  { calls: [{ name: 'write_file', input: { path: 'notes/a.txt', content: 'A' } }] },
+  { text: 'Wrote note A in notes/a.txt.' },
+  { calls: [{ name: 'write_file', input: { path: 'notes/b.txt', content: 'B' } }] },
+  { text: 'Wrote note B in notes/b.txt.' },
+  { calls: [{ name: 'update_plan', input: { goal: 'Two notes', items: [{ text: 'Note A', status: 'done' }, { text: 'Note B', status: 'done' }, { text: 'Read them over', status: 'done' }] } }] },
+  { text: 'Both notes are written.' },
 ];
 function sse(step, n) {
   const events = [];
@@ -96,7 +107,10 @@ try {
   await check('a first visit opens the welcome project', async () => {
     const names = await page.$$eval('.tree-row .name', (els) => els.map((e) => e.textContent));
     expect(names.includes('README.md') && names.includes('hello.py'), `tree: ${names}`);
-    expect((await page.$eval('.editor-title', (e) => e.textContent)) === '/README.md', 'README not open');
+    // README opens once the welcome project is saved, a moment after the tree appears.
+    await page.waitForFunction(() => document.querySelector('.editor-title')?.textContent === '/README.md', { timeout: 10_000 }).catch(() => {
+      throw new Error('README not open');
+    });
   });
 
   await check('the terminal runs Python on Zipp against the project', async () => {
@@ -142,6 +156,22 @@ try {
     expect(!meter.hidden && / \/ 131k$/.test(meter.text), JSON.stringify(meter));
   });
 
+  await check('sub-agents take tasks from a queue, and the chat shows each one live', async () => {
+    await page.type('.chat-input', 'Write two notes.');
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() => document.querySelector('.chat-log')?.textContent.includes('Both notes are written.'), { timeout: 60_000 });
+    const tasks = await page.$$eval('.agent-task', (rows) => rows.map((r) => ({ cls: r.className, title: r.querySelector('.task-title').textContent, report: r.querySelector('.task-report').textContent })));
+    expect(tasks.length === 2 && tasks.every((t) => t.cls.includes('done')) && tasks[0].report === 'Wrote note A in notes/a.txt.', JSON.stringify(tasks));
+    // Each sub-agent had its own conversation: the task, the project, and fewer tools.
+    const sub = requests[4];
+    expect(JSON.stringify(sub.messages).includes('Write notes/a.txt saying A.') && !sub.tools.some((t) => t.function.name === 'delegate'), JSON.stringify(sub).slice(0, 300));
+    expect(JSON.stringify(requests[8].messages).includes('### Task 2: Note B (done)'), 'the report did not reach the main agent');
+    const plan = await page.$eval('.plan', (el) => ({ finished: el.classList.contains('finished'), count: el.querySelector('.plan-count').textContent }));
+    expect(plan.finished && plan.count === '3/3', JSON.stringify(plan));
+    if (process.env.SHOT) await page.screenshot({ path: process.env.SHOT });
+    expect((await terminal(page, 'cat notes/a.txt notes/b.txt', 'AB')).includes('AB'), 'the notes are not there');
+  });
+
   await check('the internet chip toggles the gate off and on', async () => {
     const chip = 'button[role="switch"]';
     await page.click(chip);
@@ -167,6 +197,9 @@ try {
     const log = await page.$eval('.chat-log', (e) => e.textContent);
     expect(log.includes('What is the mean temperature?') && log.includes('saved in data/mean.txt'), `log: ${log.slice(0, 300)}`);
     expect((await page.$eval('button[role="switch"]', (e) => e.textContent)) === 'internet: off', 'gate not remembered');
+    // A saved chat shows its sub-agent tasks with their outcomes.
+    const tasks = await page.$$eval('.agent-task', (rows) => rows.map((r) => r.className));
+    expect(tasks.length === 2 && tasks.every((c) => c.includes('done')), `tasks after reload: ${tasks}`);
   });
   await check('on a phone, a tab bar switches panes and everything still works', async () => {
     const phone = await browser.newPage();

@@ -189,6 +189,11 @@ async function main(): Promise<void> {
       projectSummary: () => summarizeProject(project.meta, project.vfs, gate),
       softn: preview,
       compactAt: () => agentSettings.compactAt,
+      subAgents: () => {
+        const p = activeProvider();
+        const window = p ? contextWindow(p).tokens : agentSettings.subAgentTokens;
+        return { contextTokens: Math.min(agentSettings.subAgentTokens, window), parallel: p?.parallelAgents ?? (p?.type === 'local' ? 1 : 3) };
+      },
       onWindow: (tokens) => {
         const p = activeProvider();
         if (!p?.modelId) return;

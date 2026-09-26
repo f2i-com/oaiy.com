@@ -5,7 +5,7 @@
  */
 import type { AgentEvent } from '../agent/agent';
 import type { Attachment, ToolCall, ToolResult, Turn } from '../agent/protocol';
-import { readPlan, type Plan } from '../agent/tools';
+import { readPlan, readTasks, type Plan } from '../agent/tools';
 import { formatTokens } from '../agent/context';
 import { clear, h } from './dom';
 import { mediaElement, mediaKind, type Media } from './media';
@@ -21,6 +21,7 @@ function summarizeCall(call: ToolCall): string {
     case 'sandbox_shell': return s('command').split('\n')[0];
     case 'code_run': return `${s('language') || 'javascript'}${s('file') ? ` ${s('file')}` : ''}`;
     case 'web_fetch': return s('url');
+    case 'delegate': return Array.isArray(i.tasks) ? `${i.tasks.length} task${i.tasks.length === 1 ? '' : 's'}` : '';
     case 'present_file': case 'view_image': case 'file_info': case 'search_file': return s('path');
     case 'softn_import': return s('path');
     case 'softn_check': case 'softn_inspect': return s('app');
@@ -53,6 +54,8 @@ export class ChatPane {
   private current: { box: HTMLElement; text: string; body: HTMLElement } | null = null;
   private thinking: { box: HTMLElement; text: string } | null = null;
   private cards = new Map<string, HTMLElement>();
+  /** Sub-agent task rows, by task id (the delegate call's id, #, the task's index). */
+  private taskRows = new Map<string, { row: HTMLElement; state: HTMLElement; activity: HTMLElement; report: HTMLElement }>();
   private busy = false;
   /** Blob URLs behind the media in the log, revoked when it is cleared. */
   private media: Media[] = [];
@@ -219,6 +222,7 @@ export class ChatPane {
   private currentPlan: Plan | null = null;
 
   clearLog(): void {
+    this.taskRows.clear();
     this.currentPlan = null;
     this.showPlan(null);
     for (const m of this.media.splice(0)) m.dispose();
@@ -280,6 +284,10 @@ export class ChatPane {
     this.thinking = null;
     // The checklist shows the plan; a card per update would only repeat it.
     if (call.name === 'update_plan') return;
+    if (call.name === 'delegate') {
+      this.delegateCard(call);
+      return;
+    }
     const result = h('pre.tool-result', 'running…');
     const card = h(
       'details.tool',
@@ -291,6 +299,55 @@ export class ChatPane {
     this.cards.set(call.id, card);
     this.log.append(card);
     this.scroll();
+  }
+
+  /** A delegate call: its tasks, each with its state, what it is doing, and its report. */
+  private delegateCard(call: ToolCall): void {
+    let tasks: Array<{ title: string }> = [];
+    try {
+      tasks = readTasks(call.input);
+    } catch {
+      /* the result says what was wrong */
+    }
+    const list = h('ol.agent-tasks');
+    const card = h(
+      'details.tool.delegate',
+      { open: true },
+      h('summary', h('span.tool-name', 'agents'), ' ', h('span.tool-arg', `${tasks.length} task${tasks.length === 1 ? '' : 's'} for sub-agents`)),
+      list,
+      h('pre.tool-result', 'waiting for the tasks…'),
+    );
+    card.classList.add('pending');
+    tasks.forEach((task, i) => this.taskRow(`${call.id}#${i}`, task.title, list));
+    this.cards.set(call.id, card);
+    this.log.append(card);
+    this.scroll();
+  }
+
+  private taskRow(id: string, title: string, list?: HTMLElement): { row: HTMLElement; state: HTMLElement; activity: HTMLElement; report: HTMLElement } {
+    const existing = this.taskRows.get(id);
+    if (existing) return existing;
+    const state = h('span.task-state', 'queued');
+    const activity = h('span.task-activity');
+    const report = h('pre.task-report');
+    const row = h('li.agent-task.queued', h('div.task-head', h('span.task-mark'), h('span.task-title', title), state), activity, h('details.task-more', h('summary', 'report'), report));
+    const target = list ?? this.cards.get(id.split('#')[0])?.querySelector('.agent-tasks');
+    target?.append(row);
+    const entry = { row, state, activity, report };
+    this.taskRows.set(id, entry);
+    return entry;
+  }
+
+  private agentTask(e: Extract<AgentEvent, { type: 'agent_task' }>): void {
+    const entry = this.taskRow(e.id, e.title);
+    entry.row.className = `agent-task ${e.state}`;
+    entry.state.textContent = e.state === 'running' ? 'working' : e.state === 'failed' ? 'not finished' : e.state;
+    if (e.activity) entry.activity.textContent = e.activity;
+    if (e.result !== undefined) {
+      entry.report.textContent = e.result || '(no report)';
+      entry.activity.textContent = e.state === 'done' ? 'finished' : entry.activity.textContent;
+    }
+    if (e.state === 'running') this.setStatus(`sub-agent: ${e.title}: ${e.activity ?? ''}`);
   }
 
   /** The automatic check after the agent changed an app: a card like a tool's. */
@@ -324,6 +381,19 @@ export class ChatPane {
     card.classList.add(result.isError ? 'failed' : 'ok');
     const pre = card.querySelector('.tool-result');
     if (pre) pre.textContent = result.content;
+    // A delegate card replayed from a saved chat: its tasks' outcomes come from the report.
+    if (result.name === 'delegate') {
+      for (const m of result.content.matchAll(/### Task (\d+): .*? \((done|not finished)\)\n([\s\S]*?)(?=\n\n### Task |\n\nApps still failing|\n\nCheck the results|$)/g)) {
+        const entry = this.taskRows.get(`${result.id}#${Number(m[1]) - 1}`);
+        if (!entry || !entry.row.classList.contains('queued')) continue;
+        entry.row.className = `agent-task ${m[2] === 'done' ? 'done' : 'failed'}`;
+        entry.state.textContent = m[2];
+        entry.report.textContent = m[3];
+      }
+      (card as HTMLDetailsElement).open = false;
+      const arg = card.querySelector('summary .tool-arg');
+      if (arg) arg.textContent = result.content.split('\n')[0];
+    }
     for (const image of result.images ?? []) {
       card.append(h('img.tool-image', { src: `data:${image.mediaType};base64,${image.data}`, alt: image.label ?? 'image shown to the model' }));
     }
@@ -376,6 +446,9 @@ export class ChatPane {
         break;
       case 'context':
         this.showContext(e.used, e.window);
+        break;
+      case 'agent_task':
+        this.agentTask(e);
         break;
       case 'compact':
         this.current = null;

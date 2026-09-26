@@ -12,7 +12,9 @@ import { AIProviderError } from './providers/aiProvider';
 import { DEFAULT_COMPACT_AT, budgetFor, contextWindow, formatTokens, overflowWindow } from './context';
 import type { ProviderConfig } from './providers/types';
 import { sendTurn, type Attachment, type Reply, type ToolCall, type ToolResult, type Turn, type Usage } from './protocol';
-import { TOOLS, checkApp, readPlan, runTool, type Plan, type SoftnHost, type ToolContext } from './tools';
+import { MAIN_AGENT_ONLY, TOOLS, checkApp, readPlan, readTasks, runTool, type Plan, type SoftnHost, type ToolContext } from './tools';
+import { queueFor } from './queue';
+import type { ToolSpec } from './protocol';
 import { appLabel, findApps, resolveApp } from '../softn/softn';
 import type { ImagePart } from './images';
 
@@ -26,6 +28,8 @@ export type AgentEvent =
   | { type: 'usage'; usage: Usage }
   /** How full the model's context is: the prompt about to be sent, in tokens, and the window. */
   | { type: 'context'; used: number; window: number }
+  /** A sub-agent's task: waiting in the queue, running (with what it is doing), done or failed. */
+  | { type: 'agent_task'; callId: string; id: string; title: string; state: 'queued' | 'running' | 'done' | 'failed'; activity?: string; result?: string }
   /** Older turns were summarized to make room. */
   | { type: 'compact'; turns: number; before: number; after: number; how: 'summary' | 'trimmed' }
   /** The checklist changed (update_plan). */
@@ -38,6 +42,18 @@ export type AgentEvent =
   | { type: 'error'; message: string };
 
 export const MAX_STEPS = 60;
+/** A sub-agent's step limit: a task is smaller than a request. */
+const SUB_AGENT_STEPS = 40;
+/** Sub-agent tasks one run may start. */
+const MAX_TASKS_PER_RUN = 24;
+
+const DELEGATE_GUIDE = `
+
+Sub-agents: for a big task that splits into independent parts, hand the parts to sub-agents with delegate. Each gets a fresh, smaller context and only the instructions you give it, so write each task to stand on its own (what to do, which files it may change, what to report) and keep tasks on separate files. Plan first, give each task the plan step it completes, then check and join the results yourself. Small tasks are quicker to do directly.`;
+
+const SUB_AGENT_ROLE = `
+
+You are a sub-agent: the main agent gave you one task, below. Do that task and nothing else; other agents may be changing other files at the same time, so change only the files your task is about. You cannot ask the user anything: decide sensibly and say what you assumed. When the task is done (and checked, for an app), reply with a short report for the main agent: what you did, the files you changed, how you checked it, and anything unfinished or wrong.`;
 const KEEP_RECENT_TURNS = 8;
 /** Characters per token until the provider's own counts say otherwise. */
 const DEFAULT_CHARS_PER_TOKEN = 3.5;
@@ -87,6 +103,14 @@ export interface AgentOptions {
   maxContext?: number;
   /** The server stated the window (in an overflow error): remember it for this provider and model. */
   onWindow?: (tokens: number) => void;
+  /** The tools this agent may use (default: all of them). */
+  tools?: ToolSpec[];
+  /** Added to the system prompt: a sub-agent's instructions. */
+  role?: string;
+  /** Model requests one run may make (default MAX_STEPS). */
+  maxSteps?: number;
+  /** How sub-agents work: the context each gets, and how many share the model at once. */
+  subAgents?: () => { contextTokens: number; parallel: number };
 }
 
 function turnChars(t: Turn, charsPerToken = DEFAULT_CHARS_PER_TOKEN): number {
@@ -273,9 +297,142 @@ export class Agent {
     return this.options.maxContext ? Math.min(window, this.options.maxContext) : window;
   }
 
+  private get tools(): ToolSpec[] {
+    return this.options.tools ?? TOOLS;
+  }
+
+  private get canDelegate(): boolean {
+    return this.tools.some((t) => t.name === 'delegate');
+  }
+
+  private get systemPrompt(): string {
+    return `${SYSTEM_PROMPT}${this.canDelegate ? DELEGATE_GUIDE : ''}${this.options.role ?? ''}`;
+  }
+
   /** The prompt's fixed part: the system prompt and the tool definitions. */
   private fixedChars(): number {
-    return SYSTEM_PROMPT.length + JSON.stringify(TOOLS).length;
+    return this.systemPrompt.length + JSON.stringify(this.tools).length;
+  }
+
+  /** Apps checked in the latest run, and whether each passed its last check. */
+  checkedApps(): Array<{ root: string; failing: string | null }> {
+    return [...this.checkedRoots].map((root) => ({ root, failing: this.failingApps.get(root) ?? null }));
+  }
+
+  private tasksThisRun = 0;
+
+  /**
+   * Run a delegate call: each task in its own sub-agent, through the
+   * provider's queue, and one report back. Plan steps named by the tasks
+   * follow them (active, then done), and what the sub-agents found about
+   * apps joins this agent's record.
+   */
+  private async delegate(call: ToolCall, emit: (e: AgentEvent) => void, signal?: AbortSignal): Promise<ToolResult> {
+    const provider = this.options.provider();
+    let tasks: ReturnType<typeof readTasks>;
+    try {
+      tasks = readTasks(call.input);
+      if (!provider) throw new Error('no AI provider');
+      if (this.tasksThisRun + tasks.length > MAX_TASKS_PER_RUN) throw new Error(`this request has already started ${this.tasksThisRun} tasks; at most ${MAX_TASKS_PER_RUN} per request. Do the rest directly.`);
+    } catch (error) {
+      return { id: call.id, name: call.name, content: `Error: ${(error as Error).message}`, isError: true };
+    }
+    this.tasksThisRun += tasks.length;
+    const settings = () => this.options.subAgents?.() ?? { contextTokens: 32_000, parallel: provider.type === 'local' ? 1 : 3 };
+    const queue = queueFor(`${provider.id}|${provider.modelId}`, () => settings().parallel);
+    const setStep = (step: number | undefined, status: 'active' | 'done') => {
+      if (!step || !this.plan || !this.plan.items[step - 1] || this.plan.items[step - 1].status === 'done') return;
+      this.plan = { ...this.plan, items: this.plan.items.map((item, i) => (i === step - 1 ? { ...item, status } : item)) };
+      emit({ type: 'plan', plan: this.plan });
+    };
+    const outcomes = await Promise.all(
+      tasks.map(async (task, i) => {
+        const id = `${call.id}#${i}`;
+        const base = { type: 'agent_task' as const, callId: call.id, id, title: task.title };
+        emit({ ...base, state: 'queued' });
+        try {
+          const outcome = await queue.run(
+            () => this.runSubAgent(task, provider, settings().contextTokens, (activity) => emit({ ...base, state: 'running', activity }), emit, signal),
+            signal,
+            () => {
+              emit({ ...base, state: 'running', activity: 'starting' });
+              setStep(task.planStep, 'active');
+            },
+          );
+          emit({ ...base, state: outcome.ok ? 'done' : 'failed', result: outcome.text });
+          if (outcome.ok) setStep(task.planStep, 'done');
+          return { task, ...outcome };
+        } catch (error) {
+          const text = signal?.aborted ? 'stopped before it finished' : (error as Error).message;
+          emit({ ...base, state: 'failed', result: text });
+          return { task, ok: false, text, files: [] as string[] };
+        }
+      }),
+    );
+    const done = outcomes.filter((o) => o.ok).length;
+    const report = outcomes.map((o, i) => [
+      `### Task ${i + 1}: ${o.task.title} (${o.ok ? 'done' : 'not finished'})`,
+      o.text.length > 4000 ? `${o.text.slice(0, 4000)}\n[report cut]` : o.text || '(no report)',
+      o.files.length ? `Files changed: ${o.files.join(', ')}` : 'Files changed: none',
+    ].join('\n')).join('\n\n');
+    const failing = [...this.failingApps.keys()].filter((root) => this.checkedRoots.has(root));
+    return {
+      id: call.id,
+      name: call.name,
+      isError: done === 0,
+      content: `${tasks.length} task${tasks.length > 1 ? 's' : ''}: ${done} done${done < tasks.length ? `, ${tasks.length - done} not finished` : ''}.\n\n${report}${failing.length ? `\n\nApps still failing their check: ${failing.join(', ')}.` : ''}\n\nCheck the results fit together before you finish.`,
+    };
+  }
+
+  /** One task in a fresh agent with a smaller context; its report, and the files it changed. */
+  private async runSubAgent(
+    task: { title: string; instructions: string },
+    provider: ProviderConfig,
+    contextTokens: number,
+    activity: (text: string) => void,
+    emit: (e: AgentEvent) => void,
+    signal?: AbortSignal,
+  ): Promise<{ ok: boolean; text: string; files: string[] }> {
+    const child = new Agent({
+      ...this.options,
+      provider: () => provider,
+      tools: this.tools.filter((t) => !MAIN_AGENT_ONLY.has(t.name)),
+      role: `${SUB_AGENT_ROLE}\n\nYour task: ${task.title}`,
+      maxSteps: SUB_AGENT_STEPS,
+      maxContext: contextTokens,
+      subAgents: undefined,
+    });
+    const calls = new Map<string, ToolCall>();
+    const files = new Set<string>();
+    let final = '';
+    let failure = '';
+    const goal = this.plan?.goal ? `\n\n(The main agent's goal, for context: ${this.plan.goal})` : '';
+    await child.run(`${task.instructions}${goal}`, (e) => {
+      if (e.type === 'tool_call') {
+        calls.set(e.call.id, e.call);
+        const arg = ['path', 'command', 'pattern', 'app', 'url'].map((k) => e.call.input[k]).find((v) => typeof v === 'string') as string | undefined;
+        activity(`${e.call.name}${arg ? ` ${arg.split('\n')[0].slice(0, 80)}` : ''}`);
+      } else if (e.type === 'tool_result') {
+        const c = calls.get(e.result.id);
+        if (c && !e.result.isError && /^(write_file|edit_file|delete_file)$/.test(c.name) && typeof c.input.path === 'string') files.add(c.input.path.replace(/^\/+/, ''));
+      } else if (e.type === 'check') {
+        emit(e);
+      } else if (e.type === 'compact') {
+        activity(`compacted its context (${e.turns} turns)`);
+      } else if (e.type === 'done') {
+        final = e.text;
+      } else if (e.type === 'error') {
+        failure = e.message;
+      }
+    }, signal);
+    // What the sub-agent learned about apps is now this agent's to act on.
+    for (const app of child.checkedApps()) {
+      this.checkedRoots.add(app.root);
+      if (app.failing) this.failingApps.set(app.root, app.failing);
+      else this.failingApps.delete(app.root);
+    }
+    if (signal?.aborted) return { ok: false, text: 'stopped before it finished', files: [...files] };
+    return { ok: !failure, text: failure ? `${final ? `${final}\n` : ''}It stopped: ${failure}` : final, files: [...files] };
   }
 
   private budget(provider: ProviderConfig): { window: number; fixed: number; prompt: number; reply: number } {
@@ -392,7 +549,7 @@ export class Agent {
       const b = this.budget(provider);
       const sent = trimmed(this.view(), this.imagesAccepted, b.prompt * this.charsPerToken);
       try {
-        const reply = await sendTurn(provider, SYSTEM_PROMPT, sent, TOOLS, {
+        const reply = await sendTurn(provider, this.systemPrompt, sent, this.tools, {
           maxOutputTokens: b.reply,
           signal,
           sink: {
@@ -469,9 +626,11 @@ export class Agent {
     this.sameCheck = { signature: '', count: 0 };
     let planThisRun = false;
     this.checkedRoots.clear();
+    this.tasksThisRun = 0;
     let nudges = 0;
+    const maxSteps = this.options.maxSteps ?? MAX_STEPS;
     try {
-      for (let step = 1; step <= MAX_STEPS; step++) {
+      for (let step = 1; step <= maxSteps; step++) {
         signal?.throwIfAborted();
         await this.fit(provider, emit, signal);
         const reply = await this.request(provider, emit, signal);
@@ -496,7 +655,12 @@ export class Agent {
           signal?.throwIfAborted();
           callIndex = index;
           emit({ type: 'tool_call', call });
-          const result = await runTool(call, this.toolContext);
+          const allowed = this.tools.some((t) => t.name === call.name);
+          const result = !allowed
+            ? { id: call.id, name: call.name, content: `Error: ${call.name} is not one of your tools`, isError: true }
+            : call.name === 'delegate'
+              ? await this.delegate(call, emit, signal)
+              : await runTool(call, this.toolContext);
           results.push(result);
           // softn_check keeps the record of failing apps current, as the automatic check does.
           if (result.check) {
@@ -526,7 +690,7 @@ export class Agent {
           return;
         }
       }
-      emit({ type: 'error', message: `The run reached its ${MAX_STEPS}-step limit. Say "continue" to keep going.` });
+      emit({ type: 'error', message: `The run reached its ${maxSteps}-step limit. Say "continue" to keep going.` });
     } catch (error) {
       if (signal?.aborted || (error instanceof AIProviderError && error.kind === 'cancelled')) {
         emit({ type: 'status', message: 'Stopped.' });

@@ -183,6 +183,13 @@ export function openSettings(initial: SettingsResult): Promise<SettingsResult | 
         h('label', 'API key', key),
         h('label', 'Model', model),
         h('label', 'Context', h('div.window-picker', windowInput, detect, windowNote)),
+        h('label', 'Agents', h('div.window-picker', (() => {
+          const input = h('input', { type: 'number', min: 1, max: 8, value: p.parallelAgents ?? '', placeholder: p.type === 'local' ? '1' : '3', title: 'How many sub-agents may use this model at once. A local server usually answers one request at a time.', oninput: () => {
+            const v = Number(input.value);
+            p.parallelAgents = Number.isFinite(v) && v >= 1 ? Math.min(8, Math.floor(v)) : undefined;
+          } }) as HTMLInputElement;
+          return input;
+        })(), h('span.window-note', 'at once (sub-agents wait in a queue for their turn)'))),
         h('div.form-buttons', fetchModels, test, remove),
         help ? h('p.muted', help) : '',
         note,
@@ -203,6 +210,14 @@ export function openSettings(initial: SettingsResult): Promise<SettingsResult | 
           } }) as HTMLInputElement;
           return input;
         })(), '% of the model\'s context (older turns are summarized; recent ones stay word for word)'),
+        h('label', 'Give each sub-agent ', (() => {
+          const input = h('input', { type: 'number', min: 4096, step: 4096, value: agent.subAgentTokens, oninput: () => {
+            const v = Number(input.value);
+            if (v >= 4096) agent.subAgentTokens = Math.floor(v);
+          } }) as HTMLInputElement;
+          input.style.width = '96px';
+          return input;
+        })(), ' tokens of context (at most the model\'s window)'),
       ),
       h('div.dialog-buttons', h('button', { onclick: () => close(null) }, 'Cancel'), h('button.primary', { onclick: () => close({ providers, activeId: providers.some((p) => p.id === activeId) ? activeId : providers[0]?.id ?? null, agent }) }, 'Save')),
     );

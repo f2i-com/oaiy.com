@@ -229,12 +229,16 @@ export class SoftnPreview {
 
   /** Render `root` unless it is already live and current. */
   private async ready(root?: string): Promise<PreviewResult> {
-    if ((root !== undefined && root !== this.app) || this.stale || !this.frame || this.current.at === 0) return this.check(root);
+    if ((root !== undefined && root !== this.app) || this.stale || !this.frame || this.current.at === 0) return this.checkNow(root);
     return this.current;
   }
 
   /** Describe what the app shows, as text. */
-  async inspect(root?: string): Promise<PageReport> {
+  inspect(root?: string): Promise<PageReport> {
+    return this.exclusive(() => this.inspectNow(root));
+  }
+
+  private async inspectNow(root?: string): Promise<PageReport> {
     const rendered = await this.ready(root);
     if (!this.frame) return { ok: false, page: '', error: rendered.errors.join('; ') || 'nothing is rendered', problems: [] };
     const since = Date.now();
@@ -243,7 +247,11 @@ export class SoftnPreview {
   }
 
   /** Click, fill, choose and press keys in the app, then describe it. */
-  async act(root: string | undefined, actions: PreviewAction[]): Promise<PageReport> {
+  act(root: string | undefined, actions: PreviewAction[]): Promise<PageReport> {
+    return this.exclusive(() => this.actNow(root, actions));
+  }
+
+  private async actNow(root: string | undefined, actions: PreviewAction[]): Promise<PageReport> {
     const rendered = await this.ready(root);
     if (!this.frame) return { ok: false, page: '', error: rendered.errors.join('; ') || 'nothing is rendered', problems: [] };
     const since = Date.now();
@@ -258,8 +266,23 @@ export class SoftnPreview {
     for (const w of this.waiters.splice(0)) w(this.current);
   }
 
+  /**
+   * One check, inspect or act at a time: agents working in parallel would
+   * otherwise switch the preview to their own app under each other.
+   */
+  private lock: Promise<unknown> = Promise.resolve();
+  private exclusive<T>(fn: () => Promise<T>): Promise<T> {
+    const run = this.lock.then(fn, fn);
+    this.lock = run.catch(() => {});
+    return run;
+  }
+
   /** Render now and wait for the outcome (for the agent's softn_check). */
-  async check(root?: string): Promise<PreviewResult> {
+  check(root?: string): Promise<PreviewResult> {
+    return this.exclusive(() => this.checkNow(root));
+  }
+
+  private async checkNow(root?: string): Promise<PreviewResult> {
     if (root !== undefined && root !== this.app) {
       this.app = root;
       this.refreshApps();

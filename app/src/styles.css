@@ -370,3 +370,24 @@ details.msg.compacted pre { white-space: pre-wrap; font-size: 12px; max-height: 
 .agent-settings label { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 .agent-settings input { width: 70px; }
 .chat > .pane-title { display: flex; align-items: center; gap: 8px; }
+
+/* Sub-agent tasks in the chat. */
+.agent-tasks { list-style: none; margin: 0; padding: 6px 10px; display: flex; flex-direction: column; gap: 6px; }
+.agent-task { border: 1px solid var(--border); border-radius: 8px; padding: 6px 8px; background: var(--panel); }
+.task-head { display: flex; align-items: center; gap: 8px; font-size: 13px; }
+.task-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 550; }
+.task-state { font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); border: 1px solid var(--border); border-radius: 999px; padding: 0 7px; flex: none; }
+.task-mark { width: 10px; height: 10px; border-radius: 50%; border: 1.5px solid var(--muted); flex: none; }
+.agent-task.running .task-mark { border-color: var(--accent); border-top-color: transparent; animation: plan-spin 0.9s linear infinite; }
+.agent-task.running .task-state { color: var(--accent); border-color: var(--accent); }
+.agent-task.done .task-mark { background: var(--ok); border-color: var(--ok); }
+.agent-task.done .task-state { color: var(--ok); border-color: var(--ok); }
+.agent-task.failed .task-mark { background: var(--err); border-color: var(--err); }
+.agent-task.failed .task-state { color: var(--err); border-color: var(--err); }
+.task-activity { display: block; font-family: var(--mono); font-size: 11.5px; color: var(--muted); margin: 3px 0 0 18px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.task-activity:empty { display: none; }
+.task-more { margin: 2px 0 0 18px; font-size: 12px; }
+.agent-task.queued .task-more, .agent-task.running .task-more { display: none; }
+.task-more summary { cursor: pointer; color: var(--muted); }
+.task-report { white-space: pre-wrap; font-size: 12px; max-height: 260px; overflow: auto; margin: 4px 0 0; }
+@media (prefers-reduced-motion: reduce) { .agent-task.running .task-mark { animation: none; } }
