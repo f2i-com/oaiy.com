@@ -23,6 +23,7 @@ export class FileTree {
       h('button.icon', { title: 'New file', onclick: () => void this.create('file') }, '+ file'),
       h('button.icon', { title: 'New folder', onclick: () => void this.create('dir') }, '+ folder'),
     );
+    this.list.setAttribute('role', 'tree');
     this.element.append(h('div.pane-title', 'Files'), actions, this.list);
     this.render();
   }
@@ -109,6 +110,7 @@ export class FileTree {
   }
 
   private render(): void {
+    const focused = (document.activeElement as HTMLElement | null)?.closest?.('.tree-row')?.getAttribute('title') ?? null;
     clear(this.list);
     const rows: HTMLElement[] = [];
     const walk = (dir: string, depth: number) => {
@@ -130,6 +132,29 @@ export class FileTree {
             class: [this.selected === path ? 'selected' : '', isDir && IGNORED_DIRS.has(entry.name) ? 'dim' : ''].join(' '),
             style: `padding-left:${8 + depth * 14}px`,
             title: path,
+            role: 'treeitem',
+            tabindex: 0,
+            'aria-level': depth + 1,
+            'aria-selected': String(this.selected === path),
+            ...(isDir ? { 'aria-expanded': String(open) } : {}),
+            onkeydown: (e: KeyboardEvent) => {
+              if (e.target !== e.currentTarget) return;
+              if (e.key === 'Enter' || e.key === ' ') {
+                e.preventDefault();
+                (e.currentTarget as HTMLElement).click();
+              } else if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+                e.preventDefault();
+                const rows = [...this.list.querySelectorAll<HTMLElement>('.tree-row')];
+                const i = rows.indexOf(e.currentTarget as HTMLElement);
+                rows[e.key === 'ArrowDown' ? Math.min(rows.length - 1, i + 1) : Math.max(0, i - 1)]?.focus();
+              } else if (e.key === 'F2') {
+                e.preventDefault();
+                void this.rename(path);
+              } else if (e.key === 'Delete') {
+                e.preventDefault();
+                void this.remove(path);
+              }
+            },
             onclick: () => {
               this.selected = path;
               if (isDir) {
@@ -154,5 +179,6 @@ export class FileTree {
     walk('', 0);
     if (!rows.length) rows.push(h('div.empty', 'Empty project'));
     this.list.append(...rows);
+    if (focused) rows.find((r) => r.getAttribute('title') === focused)?.focus();
   }
 }

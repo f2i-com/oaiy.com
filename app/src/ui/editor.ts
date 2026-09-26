@@ -39,12 +39,16 @@ export class EditorPane {
   private dirty = false;
   private saveTimer: ReturnType<typeof setTimeout> | null = null;
   private applying = false;
+  /** The file changed outside the editor while it had unsaved typing: nothing is saved until the person chooses. */
+  private conflict = false;
+  private readonly conflictBar = h('div.editor-conflict', { role: 'alert' });
   /** The image, audio or video file on show, and its element. */
   private mediaPath: string | null = null;
   private media: Media | null = null;
 
   constructor(private vfs: Vfs) {
-    this.element.append(this.title, this.body);
+    this.conflictBar.hidden = true;
+    this.element.append(this.title, this.conflictBar, this.body);
     this.showEmpty();
   }
 
@@ -102,6 +106,8 @@ export class EditorPane {
 
   open(path: string, options: { source?: boolean } = {}): void {
     this.flush();
+    this.conflict = false;
+    this.conflictBar.hidden = true;
     if (mediaKind(path) && !options.source) {
       this.showMedia(path);
       return;
@@ -148,7 +154,7 @@ export class EditorPane {
       clearTimeout(this.saveTimer);
       this.saveTimer = null;
     }
-    if (!this.dirty || !this.view || !this.path) return;
+    if (!this.dirty || !this.view || !this.path || this.conflict) return;
     try {
       this.vfs.writeFile(this.path, this.view.state.doc.toString(), { parents: true });
       this.dirty = false;
@@ -170,15 +176,54 @@ export class EditorPane {
       this.close();
       return;
     }
-    if (this.dirty || !this.view) return;
+    if (!this.view) return;
     const text = this.vfs.readText(this.path);
     if (text === this.view.state.doc.toString()) return;
+    if (this.dirty) {
+      this.showConflict();
+      return;
+    }
+    this.applying = true;
+    this.view.dispatch({ changes: { from: 0, to: this.view.state.doc.length, insert: text } });
+    this.applying = false;
+  }
+
+  private showConflict(): void {
+    if (this.conflict) return;
+    this.conflict = true;
+    if (this.saveTimer) {
+      clearTimeout(this.saveTimer);
+      this.saveTimer = null;
+    }
+    clear(this.conflictBar);
+    this.conflictBar.append(
+      h('span', 'This file was changed (by the agent or the terminal) while you were editing it.'),
+      h('button', { onclick: () => this.resolve('theirs') }, 'Take the new version'),
+      h('button.primary', { onclick: () => this.resolve('mine') }, 'Keep mine'),
+    );
+    this.conflictBar.hidden = false;
+    this.title.textContent = `${this.path} • (changed elsewhere)`;
+  }
+
+  private resolve(choice: 'mine' | 'theirs'): void {
+    this.conflict = false;
+    this.conflictBar.hidden = true;
+    if (!this.view || !this.path) return;
+    if (choice === 'mine') {
+      this.flush();
+      return;
+    }
+    this.dirty = false;
+    this.title.textContent = this.path;
+    const text = this.vfs.exists(this.path) ? this.vfs.readText(this.path) : '';
     this.applying = true;
     this.view.dispatch({ changes: { from: 0, to: this.view.state.doc.length, insert: text } });
     this.applying = false;
   }
 
   close(): void {
+    this.conflict = false;
+    this.conflictBar.hidden = true;
     this.dropMedia();
     this.view?.destroy();
     this.view = null;

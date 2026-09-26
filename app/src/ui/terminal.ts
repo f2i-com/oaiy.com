@@ -19,6 +19,8 @@ export class TerminalPane {
   private cursor = 0;
   private running = false;
   private queue: string[] = [];
+  /** Stops the command that is running (Ctrl+C). */
+  private stop: AbortController | null = null;
 
   constructor(private vfs: Vfs, private readonly gate: NetGate) {
     this.element.append(
@@ -38,6 +40,11 @@ export class TerminalPane {
         e.preventDefault();
       } else if (e.key === 'l' && e.ctrlKey) {
         this.out.textContent = '';
+        e.preventDefault();
+      } else if (e.key === 'c' && e.ctrlKey && !this.input.value.slice(this.input.selectionStart ?? 0, this.input.selectionEnd ?? 0) && this.running) {
+        this.queue = [];
+        this.stop?.abort();
+        this.write('^C\n', 'term-err');
         e.preventDefault();
       }
     });
@@ -79,10 +86,12 @@ export class TerminalPane {
     }
     this.running = true;
     this.prompt.classList.add('busy');
+    this.stop = new AbortController();
     try {
       const host = new SandboxHost(this.vfs, this.gate, 'terminal', 60_000);
+      host.signal = this.stop.signal;
       const cwd = this.vfs.stat(this.cwd)?.type === 'dir' ? this.cwd : '/';
-      const outcome = await runInSandbox({ lang: 'shell', source: command, cwd, env: this.env, limits: { maxSteps: 2_000_000_000 } }, host, { timeoutMs: 60_000 });
+      const outcome = await runInSandbox({ lang: 'shell', source: command, cwd, env: this.env, limits: { maxSteps: 2_000_000_000 } }, host, { timeoutMs: 60_000, signal: this.stop.signal });
       const shell = outcome.result?.shell;
       if (shell && !outcome.result?.error) {
         this.cwd = shell.cwd;
@@ -100,7 +109,9 @@ export class TerminalPane {
       this.running = false;
       this.prompt.classList.remove('busy');
       this.prompt.textContent = `${this.cwd} $`;
-      this.input.focus();
+      this.stop = null;
+      // Back to the prompt only when the person was typing in the terminal, not somewhere else meanwhile.
+      if (document.activeElement === document.body || this.element.contains(document.activeElement)) this.input.focus();
     }
     const next = this.queue.shift();
     if (next !== undefined) await this.run(next);

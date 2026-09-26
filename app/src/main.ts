@@ -229,6 +229,7 @@ async function main(): Promise<void> {
       },
     });
     agent.turns = await project.loadChat();
+    announce();
     tree.setVfs(project.vfs);
     editor.setVfs(project.vfs);
     terminal.setVfs(project.vfs);
@@ -696,6 +697,29 @@ A project can hold several apps, each in its own folder (any folder whose manife
   app.append(header, workspace, tabs);
   renderChips();
 
+  // Nothing is clickable until the first project is open.
+  header.inert = true;
+  workspace.inert = true;
+
+  // Another tab with the same project open would overwrite this one's work (and the other way round).
+  const tabId = Math.random().toString(36).slice(2);
+  const tabChannel = typeof BroadcastChannel === 'function' ? new BroadcastChannel('bot.computer-tabs') : null;
+  const warned = new Set<string>();
+  const warnTwice = (projectId: string) => {
+    if (warned.has(projectId) || project?.meta.id !== projectId) return;
+    warned.add(projectId);
+    chat.system(`"${project.meta.name}" is also open in another tab. Both save to the same place, so one can overwrite the other's changes: close one of them.`, 'error');
+  };
+  tabChannel?.addEventListener('message', (e: MessageEvent<{ type: string; tab: string; project: string }>) => {
+    if (e.data?.tab === tabId || e.data?.project !== project?.meta.id) return;
+    if (e.data.type === 'open') tabChannel.postMessage({ type: 'here', tab: tabId, project: project.meta.id });
+    warnTwice(e.data.project);
+  });
+  const announce = () => tabChannel?.postMessage({ type: 'open', tab: tabId, project: project.meta.id });
+
+  // Ask the browser to keep this site's storage (projects live there) rather than clear it under pressure.
+  void navigator.storage?.persist?.().catch(() => false);
+
   // Open the last project, or make the welcome one.
   const all = await listProjects();
   let meta = all.find((m) => m.id === settings.lastProjectId) ?? all[0];
@@ -709,6 +733,8 @@ A project can hold several apps, each in its own folder (any folder whose manife
   } else {
     await openProject(meta);
   }
+  header.inert = false;
+  workspace.inert = false;
 
   const sandbox = sandboxAvailable();
   if (!sandbox.ok) chat.system(`The code sandbox is unavailable: ${sandbox.reason}.`, 'error');

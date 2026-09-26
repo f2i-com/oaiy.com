@@ -201,6 +201,49 @@ try {
     const tasks = await page.$$eval('.agent-task', (rows) => rows.map((r) => r.className));
     expect(tasks.length === 2 && tasks.every((c) => c.includes('done')), `tasks after reload: ${tasks}`);
   });
+  await check('typing in a file that changes underneath asks which version to keep, instead of overwriting', async () => {
+    await page.$$eval('.tree-row', (rows) => rows.find((r) => r.querySelector('.name')?.textContent === 'hello.py').click());
+    await page.waitForFunction(() => document.querySelector('.editor-title')?.textContent === '/hello.py');
+    await page.click('.cm-content');
+    await page.keyboard.down('Control');
+    await page.keyboard.press('End');
+    await page.keyboard.up('Control');
+    await page.keyboard.type('\n# mine');
+    // The terminal changes the file before the editor saves (it waits 400 ms).
+    await page.evaluate(() => document.querySelector('.term-input').focus());
+    await page.type('.term-input', 'echo "# theirs" >> hello.py');
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() => !document.querySelector('.editor-conflict')?.hidden, { timeout: 10_000 });
+    expect((await terminal(page, 'tail -n 1 hello.py', 'theirs')).includes('# theirs'), 'the edit was overwritten before a choice');
+    await page.evaluate(() => [...document.querySelectorAll('.editor-conflict button')].find((b) => b.textContent === 'Keep mine').click());
+    await page.waitForFunction(() => document.querySelector('.editor-conflict')?.hidden);
+    expect((await terminal(page, 'tail -n 1 hello.py', 'mine')).includes('# mine'), 'keeping mine did not save it');
+  });
+
+  await check('Ctrl+C stops a runaway command in the terminal', async () => {
+    await page.click('.term-input');
+    await page.type('.term-input', 'python -c "while True: pass"');
+    await page.keyboard.press('Enter');
+    await new Promise((r) => setTimeout(r, 1500));
+    const started = Date.now();
+    await page.keyboard.down('Control');
+    await page.keyboard.press('c');
+    await page.keyboard.up('Control');
+    await page.waitForFunction(() => !document.querySelector('.term-prompt')?.classList.contains('busy'), { timeout: 20_000 });
+    expect(Date.now() - started < 15_000, `took ${Date.now() - started} ms`);
+    expect((await page.$eval('.term-out', (e) => e.textContent)).includes('^C'), 'no ^C shown');
+  });
+
+  await check('the same project open in two tabs is flagged in both', async () => {
+    const other = await browser.newPage();
+    await other.setViewport({ width: 1400, height: 900 });
+    await other.goto(base);
+    await other.waitForSelector('.tree-row', { timeout: 60_000 });
+    await other.waitForFunction(() => document.querySelector('.chat-log')?.textContent.includes('is also open in another tab'), { timeout: 10_000 });
+    await page.waitForFunction(() => document.querySelector('.chat-log')?.textContent.includes('is also open in another tab'), { timeout: 10_000 });
+    await other.close();
+  });
+
   await check('on a phone, a tab bar switches panes and everything still works', async () => {
     const phone = await browser.newPage();
     await phone.setViewport({ width: 390, height: 844, isMobile: true, hasTouch: true });

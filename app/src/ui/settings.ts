@@ -57,7 +57,7 @@ export function openSettings(initial: SettingsResult): Promise<SettingsResult | 
         list.append(
           h(
             'div.provider-row',
-            { class: p === editing ? 'selected' : '', onclick: () => { editing = p; renderList(); renderForm(); } },
+            { class: p === editing ? 'selected' : '', role: 'button', tabindex: 0, 'aria-pressed': String(p === editing), onclick: () => { editing = p; renderList(); renderForm(); }, onkeydown: (e: KeyboardEvent) => { if (e.target === e.currentTarget && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); editing = p; renderList(); renderForm(); } } },
             h('input', { type: 'radio', name: 'active', checked: p.id === activeId, title: 'Use this one', onclick: (e: Event) => { e.stopPropagation(); activeId = p.id; } }),
             h('span', p.name || '(unnamed)'),
             h('span.muted', p.modelId ? ` — ${p.modelId}` : ' — no model'),

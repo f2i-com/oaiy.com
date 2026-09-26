@@ -35,14 +35,14 @@ function summarizeCall(call: ToolCall): string {
 
 export class ChatPane {
   readonly element = h('section.chat');
-  private readonly log = h('div.chat-log');
+  private readonly log = h('div.chat-log', { role: 'log', 'aria-live': 'polite', 'aria-relevant': 'additions' });
   private readonly input = h('textarea.chat-input', { rows: 3, placeholder: 'Ask bot.computer…  (/help for commands)', title: 'Enter sends; Shift+Enter starts a new line' });
   private readonly send = h('button.primary', 'Send');
   private readonly attachButton = h('button.attach', { title: 'Attach files or images (or drop them here, or paste an image)', 'aria-label': 'Attach files' }, '📎');
   private readonly picker = h('input', { type: 'file', multiple: true, style: 'display:none' });
   private readonly pending = h('div.attachments');
   private files: File[] = [];
-  private readonly status = h('div.chat-status');
+  private readonly status = h('div.chat-status', { role: 'status', 'aria-live': 'polite' });
   /** How full the model's context is. */
   private readonly meterFill = h('span.context-fill');
   private readonly meterText = h('span.context-text');
@@ -72,6 +72,9 @@ export class ChatPane {
   ) {
     this.planBox.hidden = true;
     this.meter.hidden = true;
+    this.log.addEventListener('scroll', () => {
+      this.stick = this.log.scrollHeight - this.log.scrollTop - this.log.clientHeight < 60;
+    }, { passive: true });
     this.element.append(h('div.pane-title', 'Agent', this.meter), this.planBox, this.log, this.status, this.pending, h('div.chat-compose', this.attachButton, this.input, this.send), this.picker);
     this.attachButton.addEventListener('click', () => this.picker.click());
     this.picker.addEventListener('change', () => {
@@ -115,10 +118,14 @@ export class ChatPane {
     this.input.focus();
   }
 
+  private pendingUrls: string[] = [];
   private renderPending(): void {
+    for (const url of this.pendingUrls.splice(0)) URL.revokeObjectURL(url);
     clear(this.pending);
     this.files.forEach((file, i) => {
-      const thumb = file.type.startsWith('image/') ? h('img', { src: URL.createObjectURL(file), alt: '' }) : h('span.file-icon', '📄');
+      const url = file.type.startsWith('image/') ? URL.createObjectURL(file) : null;
+      if (url) this.pendingUrls.push(url);
+      const thumb = url ? h('img', { src: url, alt: '' }) : h('span.file-icon', '📄');
       this.pending.append(
         h(
           'span.attachment',
@@ -163,8 +170,16 @@ export class ChatPane {
     this.status.textContent = text;
   }
 
+  /** Follow new output only while the person is at the bottom: scrolled up to read, they stay put. */
+  private stick = true;
+  private scrollQueued = false;
   private scroll(): void {
-    this.log.scrollTop = this.log.scrollHeight;
+    if (!this.stick || this.scrollQueued) return;
+    this.scrollQueued = true;
+    requestAnimationFrame(() => {
+      this.scrollQueued = false;
+      if (this.stick) this.log.scrollTop = this.log.scrollHeight;
+    });
   }
 
   /** How full the context is: `used` tokens of `window`. */
@@ -222,6 +237,8 @@ export class ChatPane {
   private currentPlan: Plan | null = null;
 
   clearLog(): void {
+    this.meter.hidden = true;
+    this.hiddenTurns = [];
     this.taskRows.clear();
     this.currentPlan = null;
     this.showPlan(null);
@@ -250,6 +267,7 @@ export class ChatPane {
 
   user(text: string, attachments: Attachment[] = []): void {
     this.current = null;
+    this.stick = true;
     // A new request gets its own plan.
     this.currentPlan = null;
     this.planOpen = null;
@@ -267,6 +285,7 @@ export class ChatPane {
     this.scroll();
   }
 
+  private renderQueued = false;
   private assistantText(delta: string): void {
     if (!this.current) {
       const body = h('div.msg-body');
@@ -275,8 +294,15 @@ export class ChatPane {
       this.current = { box, text: '', body };
     }
     this.current.text += delta;
-    this.current.body.innerHTML = renderMarkdown(this.current.text);
-    this.scroll();
+    // A long reply streams in many pieces: draw it at most once a frame.
+    if (this.renderQueued) return;
+    this.renderQueued = true;
+    const target = this.current;
+    requestAnimationFrame(() => {
+      this.renderQueued = false;
+      target.body.innerHTML = renderMarkdown(target.text);
+      this.scroll();
+    });
   }
 
   private toolCard(call: ToolCall): void {
@@ -473,9 +499,32 @@ export class ChatPane {
     }
   }
 
-  /** Show a saved conversation. */
-  replay(turns: Turn[]): void {
+  /** Turns of a long saved conversation not drawn yet ("Show earlier"). */
+  private hiddenTurns: Turn[] = [];
+
+  /**
+   * Show a saved conversation. A long one opens at its latest turns, with a
+   * button for the rest: drawing hundreds of tool cards at once is slow.
+   */
+  replay(turns: Turn[], latest = 120): void {
     this.clearLog();
+    let from = Math.max(0, turns.length - latest);
+    while (from > 0 && turns[from]?.role !== 'user') from--;
+    if (from > 0) {
+      this.hiddenTurns = turns.slice(0, from);
+      const more = h('button.show-earlier', { onclick: () => {
+        const all = [...this.hiddenTurns, ...turns.slice(from)];
+        const top = this.log.scrollHeight - this.log.scrollTop;
+        this.replay(all, Infinity);
+        this.stick = false;
+        this.log.scrollTop = this.log.scrollHeight - top;
+      } }, `Show ${from} earlier turns`);
+      this.log.append(more);
+    }
+    this.drawTurns(turns.slice(from));
+  }
+
+  private drawTurns(turns: Turn[]): void {
     for (const turn of turns) {
       if (turn.role === 'user' && turn.summary) {
         this.summaryNote(turn.text, 'Earlier conversation summarized for the model (click to read the summary)');
