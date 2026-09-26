@@ -1449,6 +1449,7 @@ dependencies = [
  "dsv41",
  "image",
  "nrob",
+ "regex",
  "tokenizers 0.21.4",
 ]
 
