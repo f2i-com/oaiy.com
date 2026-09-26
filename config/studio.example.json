@@ -9,7 +9,7 @@
     "port": 8080,
     "api_key": "",
     "public_url": "",
-    "routes_version": 4,
+    "routes_version": 5,
     "routes": [
       {
         "path": "/v1/chat/completions",
@@ -64,6 +64,13 @@
         "path": "/v1/audio/voices",
         "method": "GET",
         "target": "voices",
+        "spec": "openai",
+        "enabled": true
+      },
+      {
+        "path": "/v1/audio/music",
+        "method": "POST",
+        "target": "music",
         "spec": "openai",
         "enabled": true
       },
@@ -189,6 +196,22 @@
         "qwen3-tts": {
           "design": "models/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
           "base": "models/Qwen3-TTS-12Hz-1.7B-Base",
+          "enabled": true
+        }
+      }
+    },
+    "music": {
+      "enabled": true,
+      "default_model": "minimax-music3",
+      "memory": "auto",
+      "ram_gb": 48,
+      "vram_gb": null,
+      "models": {
+        "minimax-music3": {
+          "path": "models/MiniMax-Music3",
+          "language_model": "models/MiniMax-Music3/language_model-q4_k.gguf",
+          "precision": "bf16",
+          "steps": 30,
           "enabled": true
         }
       }

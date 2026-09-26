@@ -74,7 +74,7 @@ fn detected(role: Role, format: &'static str, summary: String, fields: Vec<(&str
 
 /// A path as configuration text. On Windows a path picked with `/` keeps `/`
 /// throughout, rather than gaining `\` where folders were joined onto it.
-fn path_json(p: &Path) -> Json {
+pub(crate) fn path_json(p: &Path) -> Json {
     let s = p.to_string_lossy();
     if cfg!(windows) && s.contains('/') {
         return Json::str(s.replace('\\', "/"));
@@ -229,6 +229,10 @@ fn gguf_file(path: &Path) -> Result<Detected, String> {
     }
     if arch.is_empty() {
         return Err(format!("{}: GGUF without general.architecture", path.display()));
+    }
+    if arch == "music3-lm" {
+        return Ok(detected(Role::Component { kind: "music_lm" }, "gguf",
+            format!("MiniMax Music 3 language model, {} ({label})", get("music3.quant")), vec![("language_model", path_json(path))]));
     }
     Ok(detected(Role::Llm, "gguf", format!("{label} — GGUF LLM ({arch})"), vec![("path", path_json(path))]))
 }
@@ -460,6 +464,15 @@ fn directory(dir: &Path) -> Result<Detected, String> {
         if quant == "exl3" || arch.starts_with("Deepseek") || model_type.starts_with("deepseek") {
             return Ok(detected(Role::Llm, "checkpoint", format!("{label} — {} checkpoint folder ({arch})", if quant == "exl3" { "EXL3" } else { "safetensors" }),
                 vec![("path", path_json(dir))]));
+        }
+        // MiniMax Music 3: the whole pipeline in one folder.
+        if model_type == "minimax_music3" {
+            for part in ["language_model", "rvq_depth_decoder", "condition_encoder", "transformer", "vocoder", "tokenizer"] {
+                if !dir.join(part).is_dir() {
+                    return Err(format!("{label}: a MiniMax Music 3 folder needs its {part}/ folder"));
+                }
+            }
+            return Ok(detected(Role::Component { kind: "music_model" }, "safetensors", format!("MiniMax Music 3: songs from lyrics and a description ({label})"), vec![("path", path_json(dir))]));
         }
         // Qwen3-TTS: VoiceDesign speaks in voices described in words; Base
         // speaks in saved voices. One speech model pairs the two.

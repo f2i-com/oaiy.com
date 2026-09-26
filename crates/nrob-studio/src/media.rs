@@ -24,6 +24,8 @@ pub enum Kind {
     Video,
     /// Text to speech, and designing a voice to save.
     Speech,
+    /// Songs, and making the music model's smaller copy.
+    Music,
 }
 
 impl Kind {
@@ -32,6 +34,7 @@ impl Kind {
             Kind::Image => "image",
             Kind::Video => "video",
             Kind::Speech => "speech",
+            Kind::Music => "music",
         }
     }
 }
@@ -94,11 +97,11 @@ impl Job {
             ("seconds_taken", self.result.get("seconds").cloned().unwrap_or(Json::Null)),
             ("seconds", match self.kind {
                 Kind::Video => Json::Num(self.seconds),
-                Kind::Speech => self.result.get("duration").cloned().unwrap_or(Json::Null),
+                Kind::Speech | Kind::Music => self.result.get("duration").cloned().unwrap_or(Json::Null),
                 Kind::Image => Json::Null,
             }),
             // What a viewer needs to reproduce it; never paths or references.
-            ("settings", Json::obj(["seed", "steps", "memory", "cfg", "negative_prompt", "fps", "frames"].map(|k| (k, self.request.get(k).cloned().unwrap_or(Json::Null))))),
+            ("settings", Json::obj(["seed", "steps", "memory", "cfg", "negative_prompt", "fps", "frames", "lyrics"].map(|k| (k, self.request.get(k).cloned().unwrap_or(Json::Null))))),
         ])
     }
 }
@@ -179,7 +182,7 @@ fn gib_field(request: Option<&Json>, section: &Json, model: &Json, key: &str, ma
 }
 
 /// `memory`, `ram_gb`, `vram_gb` for the worker: request, then model, then section.
-fn residency(body: &Json, section: &Json, model: &Json) -> Result<Vec<(String, Json)>, String> {
+pub(crate) fn residency(body: &Json, section: &Json, model: &Json) -> Result<Vec<(String, Json)>, String> {
     let memory = body.get("memory").or_else(|| model.get("memory")).or_else(|| section.get("memory"));
     let memory = match memory {
         None | Some(Json::Null) => "auto",
@@ -580,6 +583,13 @@ fn progress_of(kind: Kind, n: usize, e: &Json) -> Option<(f64, String)> {
         (Kind::Speech, "designing_voice") => 5.0 + 30.0 * i("current"),
         (Kind::Speech, "decoding_speech") => 95.0,
         (Kind::Speech, _) => 3.0,
+        // `n` holds the most frames the song may have; it may end sooner.
+        (Kind::Music, "loading_music_model") if i("total") > 0.0 => 2.0 + 6.0 * i("current") / i("total"),
+        (Kind::Music, "composing") => 8.0 + 52.0 * i("current") / n,
+        (Kind::Music, "loading_renderer") if i("total") > 0.0 => 60.0 + 4.0 * i("current") / i("total"),
+        (Kind::Music, "rendering") if i("total") > 0.0 => 64.0 + 34.0 * i("current") / i("total"),
+        (Kind::Music, "quantizing") if i("total") > 0.0 => 2.0 + 96.0 * i("current") / i("total"),
+        (Kind::Music, _) => 2.0,
     };
     Some((p, stage))
 }
@@ -605,7 +615,12 @@ impl Media {
     pub fn submit(&self, kind: Kind, request: Json, model: String, size: String, n: usize, seconds: f64, keep: usize, scratch: Option<PathBuf>) -> Job {
         let prompt = str_or(&request, "prompt", "").to_string();
         let job = Job {
-            id: random_id(if kind == Kind::Image { "img_" } else { "video_" }),
+            id: random_id(match kind {
+                Kind::Image => "img_",
+                Kind::Video => "video_",
+                Kind::Speech => "speech_",
+                Kind::Music => "music_",
+            }),
             kind,
             status: "queued".into(),
             progress: 0.0,
@@ -837,11 +852,13 @@ impl Media {
                             Kind::Image => result.get("data").and_then(Json::as_array).unwrap_or(&[]).iter()
                                 .filter_map(|d| d.get("path").and_then(Json::as_str)).map(PathBuf::from).collect(),
                             Kind::Video | Kind::Speech => result.get("path").and_then(Json::as_str).map(PathBuf::from).into_iter().collect(),
+                            // A song; a smaller copy of the model is not a file to show.
+                            Kind::Music => result.get("path").and_then(Json::as_str).map(PathBuf::from).filter(|p| p.extension().is_some_and(|e| e == "wav")).into_iter().collect(),
                         };
                         j.preview = match j.kind {
                             Kind::Image => j.files.first().cloned(),
                             Kind::Video => result.get("preview").and_then(Json::as_str).map(PathBuf::from),
-                            Kind::Speech => None,
+                            Kind::Speech | Kind::Music => None,
                         };
                         j.result = result;
                     }

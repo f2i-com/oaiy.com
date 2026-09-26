@@ -18,7 +18,7 @@ pub struct Added {
     pub enabled: bool,
 }
 
-fn obj_mut<'a>(v: &'a mut Json, path: &[&str]) -> Option<&'a mut Json> {
+pub(crate) fn obj_mut<'a>(v: &'a mut Json, path: &[&str]) -> Option<&'a mut Json> {
     let mut v = v;
     for key in path {
         let Json::Obj(fields) = v else { return None };
@@ -179,6 +179,42 @@ fn attach_speech(cfg: &mut Json, d: &Detected, target: Option<(&str, &str)>) -> 
     Ok(Added { section: "speech", name, missing: Vec::new(), enabled: true })
 }
 
+/// A MiniMax Music 3 folder starts a music model (or fills the chosen one);
+/// a quantized language model goes to the chosen model, else the first
+/// without one.
+fn attach_music(cfg: &mut Json, d: &Detected, target: Option<(&str, &str)>) -> Result<Added, String> {
+    let field = if d.kind() == "music_model" { "path" } else { "language_model" };
+    let value = field_of(d, field).ok_or("detected part has no path")?;
+    let Some(Json::Obj(models)) = obj_mut(cfg, &["media", "music", "models"]) else { return Err("no music section".into()) };
+    let chosen = models.iter().position(|(n, _)| target.is_some_and(|(_, t)| n == t)).or_else(|| {
+        if field == "path" {
+            models.iter().position(|(_, m)| str_or(m, "path", "").trim().is_empty())
+        } else {
+            models.iter().position(|(_, m)| str_or(m, "language_model", "").trim().is_empty() && !str_or(m, "path", "").trim().is_empty())
+        }
+    });
+    let name = match chosen {
+        Some(i) => {
+            set(&mut models[i].1, field, value);
+            set(&mut models[i].1, "enabled", Json::Bool(true));
+            models[i].0.clone()
+        }
+        None if field == "path" => {
+            let taken: Vec<String> = models.iter().map(|(k, _)| k.clone()).collect();
+            let name = unique(&taken, "minimax-music3");
+            models.push((name.clone(), Json::obj([("path", value), ("enabled", Json::Bool(true))])));
+            name
+        }
+        None => return Err(format!("{}: add the MiniMax Music 3 folder first", d.summary)),
+    };
+    let section = obj_mut(cfg, &["media", "music"]).ok_or("no music section")?;
+    if str_or(section, "default_model", "").is_empty() {
+        set(section, "default_model", Json::str(&name));
+    }
+    add_route_if_absent(cfg, "music");
+    Ok(Added { section: "music", name, missing: Vec::new(), enabled: true })
+}
+
 /// Components attach to the first model that lacks them.
 fn attach(cfg: &mut Json, d: &Detected, target: Option<(&str, &str)>) -> Result<Added, String> {
     type Fits = Box<dyn Fn(&Json) -> bool>;
@@ -211,6 +247,7 @@ fn attach(cfg: &mut Json, d: &Detected, target: Option<(&str, &str)>) -> Result<
             ("video", "text_encoder", Box::new(move |m| (str_or(m, "family", "") == "ltx-2.5") == v25))
         }
         "speech_design" | "speech_base" => return attach_speech(cfg, d, target),
+        "music_model" | "music_lm" => return attach_music(cfg, d, target),
         "ffmpeg" => {
             let value = field_of(d, "ffmpeg").unwrap_or(Json::Null);
             set(obj_mut(cfg, &["media", "video"]).ok_or("no video section")?, "ffmpeg", value);
@@ -681,6 +718,47 @@ mod tests {
         std::fs::write(design.join("config.json"), r#"{"model_type":"qwen3_tts","tts_model_type":"custom_voice"}"#).unwrap();
         assert!(add(&mut bad, &design, None, None).is_err());
         config::validate(&cfg).unwrap();
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn a_music_folder_and_its_smaller_language_model_make_one_music_model() {
+        let d = tmp("music");
+        let dir = d.join("MiniMax-Music3");
+        for part in ["language_model", "rvq_depth_decoder", "condition_encoder", "transformer", "vocoder", "tokenizer"] {
+            std::fs::create_dir_all(dir.join(part)).unwrap();
+        }
+        std::fs::write(dir.join("config.json"), r#"{"model_type":"minimax_music3"}"#).unwrap();
+        // A GGUF with only its metadata: general.architecture and music3.quant.
+        let mut g = b"GGUF".to_vec();
+        g.extend(3u32.to_le_bytes());
+        g.extend(0u64.to_le_bytes());
+        g.extend(2u64.to_le_bytes());
+        for (k, v) in [("general.architecture", "music3-lm"), ("music3.quant", "q4_k")] {
+            g.extend((k.len() as u64).to_le_bytes());
+            g.extend(k.as_bytes());
+            g.extend(8u32.to_le_bytes());
+            g.extend((v.len() as u64).to_le_bytes());
+            g.extend(v.as_bytes());
+        }
+        let gguf = dir.join("language_model-q4_k.gguf");
+        std::fs::write(&gguf, g).unwrap();
+        let mut cfg = config::default_json();
+        // The smaller language model alone has nowhere to go yet.
+        assert!(add(&mut cfg.clone(), &gguf, None, None).unwrap_err().contains("folder first"));
+        let (a, _) = add(&mut cfg, &dir, None, None).unwrap();
+        assert_eq!((a.section, a.name.as_str()), ("music", "minimax-music3"));
+        let (b, det) = add(&mut cfg, &gguf, None, None).unwrap();
+        assert_eq!(b.name, "minimax-music3");
+        assert!(det.summary.contains("q4_k"), "{}", det.summary);
+        let m = get(&cfg, &["media", "music", "models", "minimax-music3"]).unwrap();
+        assert!(str_or(m, "path", "").ends_with("MiniMax-Music3") && str_or(m, "language_model", "").ends_with("language_model-q4_k.gguf"));
+        assert_eq!(get(&cfg, &["media", "music", "default_model"]).and_then(Json::as_str), Some("minimax-music3"));
+        let routes = get(&cfg, &["gateway", "routes"]).unwrap().as_array().unwrap();
+        assert!(routes.iter().any(|r| str_or(r, "target", "") == "music"));
+        config::validate(&cfg).unwrap();
+        std::fs::remove_dir_all(dir.join("vocoder")).unwrap();
+        assert!(add(&mut config::default_json(), &dir, None, None).is_err());
         std::fs::remove_dir_all(d).unwrap();
     }
 

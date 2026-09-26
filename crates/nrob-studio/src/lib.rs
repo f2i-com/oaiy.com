@@ -21,6 +21,7 @@ mod discovery;
 mod gateway;
 mod llm;
 mod media;
+mod music;
 mod multipart;
 mod registry;
 mod speech;

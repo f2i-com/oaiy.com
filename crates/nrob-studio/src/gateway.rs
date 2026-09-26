@@ -34,6 +34,8 @@ const UPSTREAM_READ: Duration = Duration::from_secs(30 * 60);
 const IMAGE_WAIT: Duration = Duration::from_secs(60 * 60);
 /// A speech request (or designing a voice) waits this long.
 const SPEECH_WAIT: Duration = Duration::from_secs(30 * 60);
+/// A song asked for through the speech endpoint waits this long.
+const MUSIC_WAIT: Duration = Duration::from_secs(90 * 60);
 
 pub struct Reply {
     status: u16,
@@ -92,7 +94,7 @@ pub fn route(routes: &[Json], method: &str, path: &str) -> Option<Matched> {
     for r in routes.iter().filter(|r| bool_or(r, "enabled", true)) {
         let base = str_or(r, "path", "").trim_end_matches('/');
         let target = str_or(r, "target", "");
-        let prefix_owner = matches!(target, "images" | "videos" | "files" | "voices");
+        let prefix_owner = matches!(target, "images" | "videos" | "files" | "voices" | "music");
         let rest = if path == base {
             ""
         } else if prefix_owner && path.starts_with(base) && path[base.len()..].starts_with('/') {
@@ -101,7 +103,7 @@ pub fn route(routes: &[Json], method: &str, path: &str) -> Option<Matched> {
             continue;
         };
         // The configured method is the primary route's; sub-routes set their own.
-        if rest.is_empty() && !matches!(target, "videos" | "files" | "voices") && !str_or(r, "method", "POST").eq_ignore_ascii_case(method) {
+        if rest.is_empty() && !matches!(target, "videos" | "files" | "voices" | "music") && !str_or(r, "method", "POST").eq_ignore_ascii_case(method) {
             continue;
         }
         return Some(Matched { target: target.into(), spec: str_or(r, "spec", "openai").into(), rest: rest.into() });
@@ -147,6 +149,7 @@ pub fn handle(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, m: Matched
         ("videos", "openai") => videos_openai(studio, req, w, method, &m.rest, trusted),
         ("speech", _) if m.rest.is_empty() => speech_openai(studio, req, w),
         ("voices", _) => voices(studio, req, w, &m.rest),
+        ("music", _) => music_openai(studio, req, w, method, &m.rest),
         _ => send(w, Err(fail(404, format!("no route {} {}", method, req.route())))),
     }
 }
@@ -230,7 +233,7 @@ fn models(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream) -> io::Result<
             }
         }
     }
-    for kind in ["image", "video", "speech"] {
+    for kind in ["image", "video", "speech", "music"] {
         let section = cfg.get("media").and_then(|m| m.get(kind));
         if section.is_some_and(|s| bool_or(s, "enabled", true)) {
             for (name, m) in section.and_then(|s| s.get("models")).map(|m| m.members().collect::<Vec<_>>()).unwrap_or_default() {
@@ -261,6 +264,10 @@ fn content_type(path: &std::path::Path) -> &'static str {
         Some("jpg" | "jpeg") => "image/jpeg",
         Some("webp") => "image/webp",
         Some("mp4") => "video/mp4",
+        Some("wav") => "audio/wav",
+        Some("mp3") => "audio/mpeg",
+        Some("ogg" | "opus") => "audio/ogg",
+        Some("flac") => "audio/flac",
         Some("json" | "jsonl") => "application/json",
         _ => "application/octet-stream",
     }
@@ -496,9 +503,17 @@ fn speech_audio(studio: &Arc<Studio>, req: &Request) -> Result<(Vec<u8>, &'stati
         }
         fail(400, e)
     };
-    let (request, model, voice, frames) = crate::speech::speech_request(&cfg, &studio.root, &media::day_dir(&out, "speech"), &body).map_err(drop_scratch)?;
-    let job = studio.media.submit(Kind::Speech, request, model, voice, frames, 0.0, keep_jobs(&cfg), scratch);
-    let done = studio.media.wait(&job.id, SPEECH_WAIT).ok_or_else(|| fail(500, "the job disappeared"))?;
+    // A music model sings: `input` is the lyrics and `instructions` the style,
+    // as the official Music 3 server takes them.
+    let music = crate::music::names_music_model(&cfg, &body);
+    let (job, wait) = if music {
+        let (request, model, label, frames, seconds) = crate::music::music_request(&cfg, &studio.root, &media::day_dir(&out, "music"), &body).map_err(drop_scratch)?;
+        (studio.media.submit(Kind::Music, request, model, label, frames, seconds, keep_jobs(&cfg), scratch), MUSIC_WAIT)
+    } else {
+        let (request, model, voice, frames) = crate::speech::speech_request(&cfg, &studio.root, &media::day_dir(&out, "speech"), &body).map_err(drop_scratch)?;
+        (studio.media.submit(Kind::Speech, request, model, voice, frames, 0.0, keep_jobs(&cfg), scratch), SPEECH_WAIT)
+    };
+    let done = studio.media.wait(&job.id, wait).ok_or_else(|| fail(500, "the job disappeared"))?;
     let finish = |studio: &Arc<Studio>| {
         if done.incognito {
             if done.finished() { studio.media.purge(&done.id) } else { studio.media.remove(&done.id); }
@@ -506,28 +521,129 @@ fn speech_audio(studio: &Arc<Studio>, req: &Request) -> Result<(Vec<u8>, &'stati
     };
     if done.status != "completed" {
         finish(studio);
-        return Err(fail(if done.status == "in_progress" { 504 } else { 500 }, done.error.clone().unwrap_or_else(|| format!("speech job {}", done.status))));
+        return Err(fail(if done.status == "in_progress" { 504 } else { 500 }, done.error.clone().unwrap_or_else(|| format!("{} job {}", done.kind.name(), done.status))));
     }
-    let wav = done.files.first().cloned().ok_or_else(|| fail(500, "the speech job wrote no audio"))?;
-    let bytes = if format == "wav" && speed == 1.0 {
-        std::fs::read(&wav).map_err(|e| fail(500, e.to_string()))
-    } else {
-        let ffmpeg = crate::config::program(&studio.root, cfg.get("media").and_then(|m| m.get("video")).map_or("ffmpeg", |v| str_or(v, "ffmpeg", "ffmpeg")));
-        let mut command = std::process::Command::new(&ffmpeg);
-        command.args(["-hide_banner", "-loglevel", "error", "-i"]).arg(&wav).args(crate::speech::convert_args(format, speed)).arg("pipe:1");
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            command.creation_flags(0x0800_0000);
-        }
-        match command.output() {
-            Ok(o) if o.status.success() => Ok(o.stdout),
-            Ok(o) => Err(fail(500, format!("FFmpeg could not write {format}: {}", String::from_utf8_lossy(&o.stderr).trim()))),
-            Err(e) => Err(fail(500, format!("FFmpeg ({}) is needed for {format} or speed: {e}", ffmpeg.display()))),
-        }
-    };
+    let wav = done.files.first().cloned().ok_or_else(|| fail(500, "the job wrote no audio"))?;
+    let bytes = convert_audio(studio, &cfg, &wav, format, speed, music);
     finish(studio);
     Ok((bytes?, ctype))
+}
+
+/// The worker's WAV as `format` at `speed` (FFmpeg unless it is WAV at 1x).
+fn convert_audio(studio: &Arc<Studio>, cfg: &Json, wav: &std::path::Path, format: &str, speed: f64, music: bool) -> Result<Vec<u8>, Reply> {
+    if format == "wav" && speed == 1.0 {
+        return std::fs::read(wav).map_err(|e| fail(500, e.to_string()));
+    }
+    let ffmpeg = crate::config::program(&studio.root, cfg.get("media").and_then(|m| m.get("video")).map_or("ffmpeg", |v| str_or(v, "ffmpeg", "ffmpeg")));
+    let args = if music { crate::music::convert_args(format, speed) } else { crate::speech::convert_args(format, speed) };
+    let mut command = std::process::Command::new(&ffmpeg);
+    command.args(["-hide_banner", "-loglevel", "error", "-i"]).arg(wav).args(args).arg("pipe:1");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000);
+    }
+    match command.output() {
+        Ok(o) if o.status.success() => Ok(o.stdout),
+        Ok(o) => Err(fail(500, format!("FFmpeg could not write {format}: {}", String::from_utf8_lossy(&o.stderr).trim()))),
+        Err(e) => Err(fail(500, format!("FFmpeg ({}) is needed for {format} or speed: {e}", ffmpeg.display()))),
+    }
+}
+
+/// A song job as an object shaped like OpenAI's video jobs.
+pub fn music_object(job: &Job) -> Json {
+    let (status, error) = match job.status.as_str() {
+        "cancelled" => ("failed", Json::obj([("code", Json::str("cancelled")), ("message", Json::str("the job was cancelled"))])),
+        "failed" => ("failed", Json::obj([("code", Json::str("generation_failed")), ("message", Json::str(job.error.as_deref().unwrap_or("failed")))])),
+        s => (s, Json::Null),
+    };
+    let r = &job.result;
+    Json::obj([
+        ("id", Json::str(&job.id)),
+        ("object", Json::str("music")),
+        ("model", Json::str(&job.model)),
+        ("status", Json::str(status)),
+        ("progress", Json::Int(job.progress.floor() as i64)),
+        ("created_at", Json::Int(job.created_at as i64)),
+        ("completed_at", job.completed_at.map_or(Json::Null, |t| Json::Int(t as i64))),
+        ("prompt", Json::str(&job.prompt)),
+        ("lyrics", job.request.get("lyrics").cloned().unwrap_or(Json::Null)),
+        // The cap until it is done; then the song's length.
+        ("seconds", r.get("duration").cloned().unwrap_or(Json::Num(job.seconds))),
+        ("finish_reason", r.get("finish_reason").cloned().unwrap_or(Json::Null)),
+        ("seed", job.request.get("seed").cloned().unwrap_or(Json::Null)),
+        ("sample_rate", Json::Int(44_100)),
+        ("channels", Json::Int(2)),
+        ("error", error),
+    ])
+}
+
+/// Songs as asynchronous jobs: create, list, get, delete, download
+/// (`/content?format=mp3|opus|aac|flac|wav|pcm`).
+fn music_openai(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, method: &str, rest: &str) -> io::Result<bool> {
+    let parts: Vec<&str> = rest.trim_start_matches('/').split('/').filter(|p| !p.is_empty()).collect();
+    let song = |id: &str| studio.media.get(id).filter(|j| j.kind == Kind::Music && str_or(&j.request, "kind", "") == "music");
+    match (method, parts.as_slice()) {
+        ("POST", []) => send(w, parse_body(req).and_then(|b| {
+            let cfg = studio.config();
+            let scratch = scratch_for(studio, req, Some(&b));
+            let out = scratch.clone().unwrap_or_else(|| studio.output_root());
+            let (request, model, label, frames, seconds) = crate::music::music_request(&cfg, &studio.root, &media::day_dir(&out, "music"), &b).map_err(|e| {
+                if let Some(s) = &scratch {
+                    let _ = std::fs::remove_dir_all(s);
+                }
+                fail(400, e)
+            })?;
+            let job = studio.media.submit(Kind::Music, request, model, label, frames, seconds, keep_jobs(&cfg), scratch);
+            Ok(Reply { status: 200, body: music_object(&job) })
+        })),
+        ("GET", []) => {
+            let limit = req.query("limit").and_then(|l| l.parse::<usize>().ok()).unwrap_or(20).clamp(1, 100);
+            let songs: Vec<Job> = studio.media.list().into_iter().filter(|j| j.kind == Kind::Music && str_or(&j.request, "kind", "") == "music").collect();
+            let has_more = songs.len() > limit;
+            let data: Vec<Json> = songs.iter().take(limit).map(music_object).collect();
+            let id = |i: Option<&Json>| i.and_then(|v| v.get("id")).cloned().unwrap_or(Json::Null);
+            json_reply(w, 200, &Json::obj([
+                ("object", Json::str("list")),
+                ("first_id", id(data.first())),
+                ("last_id", id(data.last())),
+                ("has_more", Json::Bool(has_more)),
+                ("data", Json::Arr(data)),
+            ]))
+        }
+        ("GET", [id]) => send(w, song(id).map(|j| Reply { status: 200, body: music_object(&j) }).ok_or_else(|| fail(404, "no such song"))),
+        ("DELETE", [id]) => {
+            let deleted = song(id).is_some() && studio.media.remove(id);
+            send(w, Ok(Reply { status: if deleted { 200 } else { 404 }, body: Json::obj([("id", Json::str(*id)), ("object", Json::str("music.deleted")), ("deleted", Json::Bool(deleted))]) }))
+        }
+        ("POST", [id, "cancel"]) => {
+            let cancelled = song(id).is_some() && studio.media.cancel(id);
+            send(w, Ok(Reply { status: if cancelled { 200 } else { 404 }, body: Json::obj([("id", Json::str(*id)), ("cancelled", Json::Bool(cancelled))]) }))
+        }
+        ("GET", [id, "content"]) => {
+            let Some(job) = song(id) else { return send(w, Err(fail(404, "no such song"))) };
+            if job.status != "completed" {
+                return send(w, Err(fail(409, format!("the song is {}", job.status))));
+            }
+            let Some(wav) = job.files.first().filter(|f| f.is_file()).cloned() else { return send(w, Err(fail(404, "the file is gone"))) };
+            let format = req.query("format").unwrap_or_else(|| "wav".into());
+            if format == "wav" {
+                return serve_file(w, &wav, true, req.header("range"));
+            }
+            let Some(ctype) = crate::speech::FORMATS.iter().find(|(f, _)| *f == format).map(|(_, c)| *c) else {
+                return send(w, Err(fail(400, "format must be mp3, opus, aac, flac, wav or pcm")));
+            };
+            let cfg = studio.config();
+            match convert_audio(studio, &cfg, &wav, &format, 1.0, true) {
+                Ok(bytes) => {
+                    respond(w, 200, ctype, &bytes, true)?;
+                    Ok(true)
+                }
+                Err(e) => send(w, Err(e)),
+            }
+        }
+        _ => send(w, Err(fail(405, format!("{method} is not supported here")))),
+    }
 }
 
 /// Saved voices: list, design and save, show, sample clip, delete.

@@ -78,6 +78,14 @@ Every token is a small, well-planned job:
   with a shared media queue, agent tool, RAM offloading and direct SSD weight
   streaming. See [video configuration and current limits](docs/LTX_VIDEO.md).
 
+- **Native Rust speech and music.** Qwen3-TTS speaks in a voice described in
+  words, and a saved voice stays the same from line to line
+  ([Speech](docs/SPEECH.md)). MiniMax Music 3 writes songs with vocals from
+  lyrics and a description, up to six minutes of 44.1 kHz stereo, faster than
+  real time; its 8B language model converts once to q8_0 or q4_k, so an 8 GB
+  GPU can run it ([Music](docs/MUSIC.md)). Both are served on OpenAI-style
+  audio endpoints.
+
 - **DeepSeek-V4.1-Flash from safetensors, end to end.** The checkpoint's shards are
   indexed in place (51 ms, headers only) and each expert is served with two positioned
   reads. Hybrid CPU/GPU decode across two GPUs, per-GPU VRAM expert caches, an AVX-512
@@ -329,7 +337,8 @@ crates/
   nrob-server/   OpenAI-compatible HTTP server for DeepSeek-V4.1 (std-only)
   nrob-studio/   portable host (std-only): supervises nrob-server and nrob-diffusion,
                  control UI, configurable OpenAI-style gateway, model detection
-  nrob-diffusion/ image and video worker (Candle): Qwen Image, SDXL, LTX, with
+  nrob-diffusion/ image, video, speech and music worker (Candle): Qwen Image,
+                 SDXL, LTX, Qwen3-TTS, MiniMax Music 3, with
                  SSD/RAM/GPU block residency
   ggml-rs-wgpu/  WebGPU backend: quantized GGUF matmuls in WGSL, the rest on the CPU
   gguf, ggml-quants, ggml-rs, ggml-rs-cuda, tokenizer, llama-rs

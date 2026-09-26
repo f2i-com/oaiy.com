@@ -302,6 +302,11 @@ pre.example { background: var(--well); border: 1px solid var(--line); border-rad
 .sp-voice .d { color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1 1 120px; min-width: 0; }
 .sp-voice .acts { display: flex; gap: 4px; margin-left: auto; }
 #sp-form .scroll > * { min-width: 0; }
+#mu-form .scroll > * { min-width: 0; }
+.controls textarea.lyrics { min-height: 150px; font: 13px/1.5 var(--mono, ui-monospace, monospace); }
+.sp-item details { font-size: 12px; color: var(--muted); }
+.sp-item details pre { white-space: pre-wrap; margin: 6px 0 0; font: 12px/1.5 var(--mono, ui-monospace, monospace); color: var(--text); }
+.quant-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
 figure .audio-card { display: grid; place-items: center; aspect-ratio: 4 / 3; background: var(--panel-2); color: var(--muted); }
 figure .audio-card svg { width: 40px; height: 40px; stroke: currentColor; fill: none; stroke-width: 1.4; }
 @media (max-width: 1080px) {
@@ -453,6 +458,7 @@ dialog::backdrop { background: var(--backdrop); }
           <button role="tab" aria-selected="true" data-tab="chat"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12a8 8 0 01-11.6 7.1L4 20l1-4.6A8 8 0 1121 12z"/></svg>Chat</button>
           <button role="tab" aria-selected="false" data-tab="image"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="9" cy="10" r="2"/><path d="M21 17l-5-5-9 8"/></svg>Image</button>
           <button role="tab" aria-selected="false" data-tab="speech"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0014 0M12 18v3"/></svg>Speech</button>
+          <button role="tab" aria-selected="false" data-tab="music"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>Music</button>
           <button role="tab" aria-selected="false" data-tab="video"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="6" width="13" height="12" rx="2"/><path d="M16 10l5-3v10l-5-3z"/></svg>Video</button>
         </div>
       </div>
@@ -512,6 +518,36 @@ dialog::backdrop { background: var(--backdrop); }
               <div class="overlay" id="img-progress" hidden><div class="spread small"><span id="img-progress-text">Starting</span><button class="btn quiet warn" type="button" id="img-cancel">Cancel</button></div><div class="meter"><div style="width:0"></div></div></div>
             </div>
             <div class="strip-row" id="img-strip" aria-label="Results this session"></div>
+          </div>
+        </form>
+      </div>
+
+      <div data-panel="music" hidden>
+        <form class="bench" id="mu-form">
+          <div class="controls">
+            <div class="scroll">
+              <label class="f"><span>Describe the music</span><textarea class="prompt" id="mu-prompt" required placeholder="Warm acoustic pop at 96 BPM in C major. Soft, breathy female lead with light harmonies in the chorus. Fingerpicked guitar and piano; brushed drums and upright bass enter in the chorus."></textarea></label>
+              <label class="f"><span>Lyrics</span><textarea class="lyrics" id="mu-lyrics" placeholder="[Verse]&#10;Morning light filtering through the pine&#10;Every quiet street is yours and mine&#10;[Chorus]&#10;Softly the world begins to breathe"></textarea></label>
+              <label class="check"><input type="checkbox" id="mu-instrumental"> Instrumental (no vocals)</label>
+              <div class="grid-f" style="grid-template-columns:repeat(3,minmax(0,1fr))">
+                <label class="f"><span>Length (s)</span><input type="number" id="mu-seconds" min="5" max="360" step="5" value="60"></label>
+                <label class="f"><span>Seed</span><input type="number" id="mu-seed" min="0" placeholder="random"></label>
+                <label class="f"><span>Steps</span><input type="number" id="mu-steps" min="4" max="100" value="30"></label>
+              </div>
+              <label class="f"><span>Model</span><select id="mu-model"></select></label>
+              <p class="muted small" style="margin:0">Put section tags such as [Verse], [Chorus] and [Bridge] on lines of their own. The song may end before the length you set.</p>
+            </div>
+            <div class="go-bar">
+              <button class="btn go" type="submit" id="mu-go">Compose</button>
+              <span class="muted small">Writes the song first, then renders the audio. A minute of music takes about two minutes on a fast GPU.</span>
+            </div>
+          </div>
+          <div class="stagewrap">
+            <div class="stage" id="mu-stage">
+              <div class="placeholder" id="mu-empty"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg><strong>Songs appear here</strong><span>Describe the style, add lyrics (or tick Instrumental), and compose. Each song is 44.1 kHz stereo, up to six minutes.</span></div>
+              <div class="sp-results" id="mu-results" hidden></div>
+              <div class="overlay" id="mu-progress" hidden><div class="spread small"><span id="mu-progress-text">Starting</span><button class="btn quiet warn" type="button" id="mu-cancel">Cancel</button></div><div class="meter"><div style="width:0"></div></div></div>
+            </div>
           </div>
         </form>
       </div>
@@ -587,7 +623,7 @@ dialog::backdrop { background: var(--backdrop); }
       <p class="lede">Recent results from this session (incognito requests are never listed). Click one for its prompt and settings, or to reuse the prompt.</p>
       <div class="chips" id="gallery-filter">
         <button data-f="all" aria-pressed="true">All</button><button data-f="image" aria-pressed="false">Images</button>
-        <button data-f="video" aria-pressed="false">Videos</button><button data-f="speech" aria-pressed="false">Speech</button><button data-f="active" aria-pressed="false">In progress</button>
+        <button data-f="video" aria-pressed="false">Videos</button><button data-f="speech" aria-pressed="false">Speech</button><button data-f="music" aria-pressed="false">Music</button><button data-f="active" aria-pressed="false">In progress</button>
         <button data-f="failed" aria-pressed="false">Failed</button>
       </div>
       <div class="gallery" id="gallery"></div>
@@ -618,6 +654,7 @@ dialog::backdrop { background: var(--backdrop); }
       <div class="block"><div class="spread"><h2>Image models</h2><span class="muted small">Served on the images route</span></div><div class="list" id="m-image"></div></div>
       <div class="block"><div class="spread"><h2>Video models</h2><span class="muted small">Served on the videos route</span></div><div class="list" id="m-video"></div></div>
       <div class="block"><div class="spread"><h2>Speech models</h2><span class="muted small">Served on /v1/audio/speech; saved voices on /v1/audio/voices</span></div><div class="list" id="m-speech"></div></div>
+      <div class="block"><div class="spread"><h2>Music models</h2><span class="muted small">Served on /v1/audio/music, and on /v1/audio/speech by name</span></div><div class="list" id="m-music"></div></div>
     </section>
 
     <!-- Memory -->
@@ -1034,6 +1071,7 @@ function modelObj(section, name) {
 function missingOf(section, m) {
   const empty = k => !(m[k] || "").trim();
   if (section === "speech") return empty("design") && empty("base") ? ["design"] : [];
+  if (section === "music") return empty("path") ? ["path"] : [];
   if (section === "image") return (m.architecture || "qwen-image") === "sdxl" ? ["checkpoint", "tokenizer"].filter(empty)
     : [...(empty("base") ? ["base"] : []), ...(empty("transformer") && empty("safetensors_transformer") ? ["transformer"] : [])];
   return [...["transformer", "text_encoder", "vae"].filter(empty), ...(m.family !== "ltx-2.5" && empty("tokenizer") ? ["tokenizer"] : [])];
@@ -1075,6 +1113,22 @@ function renderModels() {
       + field("Base folder (speaks in saved voices)", "speech", name, "base", m.base, {dir: true});
     return mediaItem("speech", name, m, "Qwen3-TTS", missingOf("speech", m), fields);
   }).join("") : '<div class="empty">No speech model yet. Add a Qwen3-TTS VoiceDesign folder, and its Base folder to save voices.</div>';
+
+  const mu = Object.entries(cfg.media.music?.models || {});
+  $("#m-music").innerHTML = mu.length ? mu.map(([name, m]) => {
+    const fields = field("MiniMax-Music3 folder", "music", name, "path", m.path, {dir: true, missing: !(m.path || "").trim()})
+      + field("Smaller language model (.gguf, optional)", "music", name, "language_model", m.language_model, {placeholder: "Uses the full 16 GB model when empty"})
+      + `<div class="f"><span class="small muted">Make a smaller language model</span><div class="quant-row">
+          <select data-quant="${esc(name)}"><option value="q4_k">q4_k: 4.8 GB, fits 8 GB GPUs</option><option value="q5_k">q5_k: 5.7 GB</option><option value="q6_k">q6_k: 6.6 GB</option><option value="q8_0">q8_0: 8.3 GB, closest to the original</option></select>
+          <button class="btn" type="button" data-quantize="${esc(name)}">Make it</button></div>
+          <span class="muted small">Written beside the model in about a minute, then used for every song. The original stays as it is.</span></div>`;
+    return mediaItem("music", name, m, "MiniMax Music 3", missingOf("music", m), fields);
+  }).join("") : '<div class="empty">No music model yet. Add the MiniMax-Music3 folder.</div>';
+  $$("[data-quantize]").forEach(b => b.onclick = async () => {
+    const name = b.dataset.quantize, quant = $(`[data-quant="${CSS.escape(name)}"]`).value;
+    try { await api("/api/music/quantize", {method: "POST", body: {model: name, quant}}); toast(`Making the ${quant} language model; it is used as soon as it is written.`); refresh(); }
+    catch (e) { toast(e.message, true); }
+  });
 
   const vid = Object.entries(cfg.media.video.models);
   $("#m-video").innerHTML = vid.length ? vid.map(([name, m]) => {
@@ -1291,6 +1345,8 @@ function renderSelects() {
   $("#vid-model").innerHTML = opts(Object.keys(cfg.media.video.models).filter(n => cfg.media.video.models[n].enabled !== false), v || cfg.media.video.default_model);
   const spm = cfg.media.speech?.models || {}, sv = keep("#sp-model");
   $("#sp-model").innerHTML = opts(Object.keys(spm).filter(n => spm[n].enabled !== false), sv || cfg.media.speech?.default_model);
+  const mum = cfg.media.music?.models || {}, mv = keep("#mu-model");
+  $("#mu-model").innerHTML = opts(Object.keys(mum).filter(n => mum[n].enabled !== false), mv || cfg.media.music?.default_model);
   segment($("#img-tier"), imgTier ||= cfg.media.image.memory || "auto", t => imgTier = t);
   segment($("#vid-tier"), vidTier ||= cfg.media.video.memory || "auto", t => vidTier = t);
   renderSound();
@@ -1621,12 +1677,58 @@ $("#sp-form").onsubmit = async e => {
   stop(); $("#sp-go").disabled = false; refresh();
 };
 
+/* ---------- music ---------- */
+const MUSIC_STAGES = {loading_music_model: "Loading the model", composing: "Writing the song", loading_renderer: "Loading the renderer", rendering: "Rendering the audio"};
+let muJobId = null;
+function muProgress(text, pct) {
+  const bar = $("#mu-progress");
+  if (text === null) { bar.hidden = true; return; }
+  bar.hidden = false; $("#mu-progress-text").textContent = text; $(".meter > div", bar).style.width = (pct || 0) + "%";
+}
+$("#mu-instrumental").onchange = () => { $("#mu-lyrics").disabled = $("#mu-instrumental").checked; };
+$("#mu-cancel").onclick = () => muJobId && api(`/api/play/music/${muJobId}/cancel`, {method: "POST"}).then(refresh, e => toast(e.message, true));
+function addSong(song, url) {
+  $("#mu-empty").hidden = true; $("#mu-results").hidden = false;
+  const el = document.createElement("div"); el.className = "sp-item";
+  const len = song.seconds ? `${Math.floor(song.seconds / 60)}:${String(Math.round(song.seconds % 60)).padStart(2, "0")}` : "";
+  el.innerHTML = `<div class="spread small"><span class="muted">${esc(len)}${song.seed !== undefined ? ` · seed ${esc(song.seed)}` : ""}</span><span class="row"><a class="btn quiet" href="${esc(url)}" download="song.wav">Save audio</a></span></div>
+    <div class="t">${esc(song.prompt)}</div><audio controls autoplay src="${esc(url)}"></audio>
+    ${song.lyrics ? `<details><summary>Lyrics</summary><pre>${esc(song.lyrics)}</pre></details>` : ""}`;
+  $("#mu-results").prepend(el);
+}
+$("#mu-form").onsubmit = async e => {
+  e.preventDefault();
+  const instrumental = $("#mu-instrumental").checked, lyrics = $("#mu-lyrics").value.trim();
+  if (!instrumental && !lyrics) return toast("Add lyrics, or tick Instrumental", true);
+  const seed = $("#mu-seed").value ? +$("#mu-seed").value : Math.floor(Math.random() * 2e9);
+  const body = {model: $("#mu-model").value || undefined, prompt: $("#mu-prompt").value.trim(), duration: +$("#mu-seconds").value || 60, seed, steps: +$("#mu-steps").value || 30};
+  if (instrumental) body.instrumental = true; else body.lyrics = lyrics;
+  $("#mu-go").disabled = true; muProgress("Starting", 1);
+  const headers = Object.assign({"Content-Type": "application/json"}, key ? {Authorization: "Bearer " + key} : {}, saved?.privacy?.incognito ? {"X-NROB-Incognito": "1"} : {});
+  try {
+    const r = await fetch("/api/play/music", {method: "POST", headers, body: JSON.stringify(body)});
+    let job = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(job?.error?.message || r.statusText);
+    muJobId = job.id;
+    while (job.status === "queued" || job.status === "in_progress") {
+      await new Promise(ok => setTimeout(ok, 1000));
+      job = await api(`/api/play/music/${job.id}`);
+      const live = [...(state?.media?.jobs || []), ...(state?.media?.private || [])].find(j => j.id === job.id);
+      const stage = live?.stage && MUSIC_STAGES[live.stage];
+      muProgress(job.status === "queued" ? "Waiting for the GPU" : `${job.progress}%${stage ? ", " + stage.toLowerCase() : ""}`, job.progress);
+    }
+    if (job.status !== "completed") throw new Error(job.error?.message || `The song ${job.status}`);
+    addSong(job, fileUrl(`/api/play/music/${job.id}/content`));
+  } catch (err) { toast(err.message, true); }
+  muJobId = null; muProgress(null); $("#mu-go").disabled = false; refresh();
+};
+
 /* ---------- gallery and viewer ---------- */
 let galleryJobs = [], galleryFilter = "all";
 async function refreshGallery() { try { galleryJobs = keyed((await api("/api/jobs")).jobs); renderGallery(); } catch (e) { toast(e.message, true); } }
 function renderGallery(fresh) {
   if (fresh) { const byId = new Map(galleryJobs.map(j => [j.id, j])); fresh.forEach(j => byId.set(j.id, j)); galleryJobs = [...byId.values()].sort((a, b) => b.created_at - a.created_at); }
-  const pick = {all: () => true, image: j => j.kind === "image", video: j => j.kind === "video", speech: j => j.kind === "speech",
+  const pick = {all: () => true, image: j => j.kind === "image", video: j => j.kind === "video", speech: j => j.kind === "speech", music: j => j.kind === "music",
     active: j => j.status === "in_progress" || j.status === "queued", failed: j => j.status === "failed"}[galleryFilter];
   const items = galleryJobs.filter(pick);
   $("#gallery").innerHTML = items.length ? items.map(j => {
@@ -1634,8 +1736,10 @@ function renderGallery(fresh) {
     const media = !done ? `<div class="fail" style="color:${j.status === "failed" ? "var(--bad)" : "var(--muted)"}">${statusText(j)}</div>`
       : j.kind === "video" ? `<video src="${esc(j.files[0] || "")}" poster="${esc(j.preview || "")}" muted loop playsinline preload="none" onmouseenter="this.play()" onmouseleave="this.pause()"></video>`
       : j.kind === "speech" ? `<div class="audio-card"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0014 0M12 18v3"/></svg></div>`
+      : j.kind === "music" && !j.files.length ? `<div class="fail" style="color:var(--muted)">Smaller language model written</div>`
+      : j.kind === "music" ? `<div class="audio-card"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg></div>`
       : `<img src="${esc(j.preview || j.files[0] || "")}" alt="${esc(j.prompt)}" loading="lazy">`;
-    return `<figure data-job="${j.id}">${media}<figcaption><span class="p">${esc(j.prompt.slice(0, 60))}</span><span>${esc(j.kind === "video" || j.kind === "speech" ? (j.seconds ? j.seconds.toFixed(1) + " s" : j.kind) : (j.files.length > 1 ? j.files.length + " images" : j.size))}</span></figcaption></figure>`;
+    return `<figure data-job="${j.id}">${media}<figcaption><span class="p">${esc(j.prompt.slice(0, 60))}</span><span>${esc(j.kind === "video" || j.kind === "speech" || j.kind === "music" ? (j.seconds ? j.seconds.toFixed(1) + " s" : j.kind) : (j.files.length > 1 ? j.files.length + " images" : j.size))}</span></figcaption></figure>`;
   }).join("") : '<div class="empty">Nothing here yet. Generate something in the Playground.</div>';
   $$("#gallery figure").forEach(f => f.onclick = () => openViewer(f.dataset.job));
 }
@@ -1646,22 +1750,23 @@ function openViewer(id) {
   const file = j.files[0];
   $("#viewer-media").innerHTML = j.status !== "completed" ? `<div class="empty" style="padding:40px">${statusText(j)}</div>`
     : j.kind === "video" ? `<video src="${esc(file)}" poster="${esc(j.preview || "")}" controls autoplay loop playsinline></video>`
-    : j.kind === "speech" ? `<div style="padding:40px;width:100%"><audio src="${esc(file)}" controls autoplay style="width:100%"></audio></div>`
+    : j.kind === "speech" || j.kind === "music" ? (file ? `<div style="padding:40px;width:100%"><audio src="${esc(file)}" controls autoplay style="width:100%"></audio>${j.settings?.lyrics ? `<pre style="white-space:pre-wrap;font-size:12px;margin-top:14px">${esc(j.settings.lyrics)}</pre>` : ""}</div>` : `<div class="empty" style="padding:40px">Done</div>`)
     : `<img src="${esc(file)}" alt="${esc(j.prompt)}">`;
-  $("#viewer-title").textContent = j.kind === "video" ? "Video" : j.kind === "speech" ? "Speech" : j.files.length > 1 ? `Image 1 of ${j.files.length}` : "Image";
+  $("#viewer-title").textContent = j.kind === "video" ? "Video" : j.kind === "speech" ? "Speech" : j.kind === "music" ? "Song" : j.files.length > 1 ? `Image 1 of ${j.files.length}` : "Image";
   $("#viewer-prompt").textContent = j.prompt;
   const st = j.settings || {}, r = j.residency?.transformer || j.residency;
   const rows = [["Model", j.model], ["Size", j.size], ["Seed", st.seed], ["Steps", st.steps], ["Memory", st.memory],
     ["Placement", r && r.gpu_blocks !== undefined ? `${r.gpu_blocks} GPU, ${r.ram_blocks} RAM, ${r.ssd_blocks} SSD blocks` : r?.mode],
-    ["Length", j.kind === "video" && j.seconds ? j.seconds.toFixed(1) + " s" : null], ["Took", j.seconds_taken ? j.seconds_taken.toFixed(1) + " s" : null],
+    ["Length", (j.kind === "video" || j.kind === "music") && j.seconds ? j.seconds.toFixed(1) + " s" : null], ["Took", j.seconds_taken ? j.seconds_taken.toFixed(1) + " s" : null],
     ["Created", new Date(j.created_at * 1000).toLocaleString()], ["Status", j.status], ["Error", j.error]].filter(([, v]) => v !== null && v !== undefined && v !== "");
   $("#viewer-meta").innerHTML = rows.map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join("");
   const others = j.files.slice(1).map((f, i) => `<a class="btn quiet" href="${esc(f)}" target="_blank">Image ${i + 2}</a>`).join("");
   $("#viewer-actions").innerHTML = (file ? `<a class="btn" href="${esc(file)}" target="_blank">Open</a><a class="btn" href="${esc(file)}" download>Download</a>` : "")
     + `<button class="btn" id="viewer-reuse">Reuse prompt</button><button class="btn quiet warn" id="viewer-delete">Remove from list</button>` + others;
   $("#viewer-reuse").onclick = () => {
-    const tab = j.kind === "video" ? "video" : j.kind === "speech" ? "speech" : "image";
-    $(tab === "speech" ? "#sp-input" : `#${tab === "video" ? "vid" : "img"}-prompt`).value = j.prompt;
+    const tab = j.kind === "video" ? "video" : j.kind === "speech" ? "speech" : j.kind === "music" ? "music" : "image";
+    $(tab === "speech" ? "#sp-input" : tab === "music" ? "#mu-prompt" : `#${tab === "video" ? "vid" : "img"}-prompt`).value = j.prompt;
+    if (tab === "music" && j.settings?.lyrics) { const inst = j.settings.lyrics === "[Intro]\n(instrumental)"; $("#mu-instrumental").checked = inst; $("#mu-lyrics").disabled = inst; if (!inst) $("#mu-lyrics").value = j.settings.lyrics; }
     $("#viewer").close(); show("play"); $(`#v-play .ptabs button[data-tab=${tab}]`).click();
   };
   if (!j.status.match(/completed|failed|cancelled/)) $("#viewer-delete").textContent = "Cancel and remove";

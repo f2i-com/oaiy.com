@@ -86,7 +86,7 @@ pub fn handle(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, port: u16)
         // The playground: every target, no key, local references allowed.
         let (target, sub) = rest.split_once('/').map_or((rest, String::new()), |(t, s)| (t, format!("/{s}")));
         let target = match target {
-            "chat" | "completions" | "models" | "images" | "edits" | "videos" | "speech" | "voices" | "health" => target,
+            "chat" | "completions" | "models" | "images" | "edits" | "videos" | "speech" | "voices" | "music" | "health" => target,
             _ => return err(w, 404, "unknown playground target"),
         };
         let m = Matched { target: target.into(), spec: "openai".into(), rest: sub };
@@ -184,6 +184,34 @@ pub fn handle(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, port: u16)
             let id = r.strip_prefix("/api/jobs/").unwrap_or_default();
             Ok(Json::obj([("removed", Json::Bool(studio.media.remove(id)))]))
         }
+        ("POST", "/api/music/quantize") => body(req).map_err(|e| (400, e)).and_then(|b| {
+            // Make a music model's smaller language model; when it is written,
+            // the model uses it.
+            let name = str_or(&b, "model", "").to_string();
+            let quant = str_or(&b, "quant", "q4_k").to_string();
+            let (request, out) = crate::music::quantize_request(&cfg, &studio.root, &name, &quant).map_err(|e| (400, e))?;
+            let job = studio.media.submit(crate::media::Kind::Music, request, name.clone(), format!("smaller copy ({quant})"), 1, 0.0, 200, None);
+            let s = Arc::clone(studio);
+            let id = job.id.clone();
+            let reply = Json::obj([("job", Json::str(&job.id)), ("output", Json::str(out.to_string_lossy()))]);
+            std::thread::spawn(move || {
+                let Some(done) = s.media.wait(&id, std::time::Duration::from_secs(4 * 3600)) else { return };
+                if done.status != "completed" {
+                    return;
+                }
+                let mut next = s.config();
+                let set_it = crate::registry::obj_mut(&mut next, &["media", "music", "models", &name]).map(|m| {
+                    crate::util::set(m, "language_model", crate::detect::path_json(&out));
+                });
+                if set_it.is_some() {
+                    match s.set_config(next) {
+                        Ok(_) => s.log.push(format!("music model {name} now uses {}", out.display())),
+                        Err(e) => s.log.push(format!("music model {name}: could not use {}: {e}", out.display())),
+                    }
+                }
+            });
+            Ok(reply)
+        }),
         ("POST", "/api/open-outputs") => {
             let dir = studio.output_root();
             let _ = std::fs::create_dir_all(&dir);
@@ -219,7 +247,7 @@ fn remove_model(cfg: &mut Json, section: &str, name: &str) -> Result<(), String>
             }
             clear_default(llm);
         }
-        "image" | "video" | "speech" => {
+        "image" | "video" | "speech" | "music" => {
             let media = &mut top.iter_mut().find(|(k, _)| k == "media").ok_or("no media")?.1;
             let Json::Obj(media) = media else { return Err("bad media".into()) };
             let sec = &mut media.iter_mut().find(|(k, _)| k == section).ok_or("no section")?.1;
@@ -234,7 +262,7 @@ fn remove_model(cfg: &mut Json, section: &str, name: &str) -> Result<(), String>
             }
             clear_default(sec);
         }
-        _ => return Err("section must be llm, image, video or speech".into()),
+        _ => return Err("section must be llm, image, video, speech or music".into()),
     }
     Ok(())
 }

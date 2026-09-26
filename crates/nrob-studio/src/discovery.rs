@@ -34,8 +34,16 @@ fn operations(target: &str, spec: &str, path: &str) -> Vec<Json> {
         ("speech", _) => vec![sub(
             "POST",
             path.into(),
-            "JSON: input, voice (a saved voice's name, or an OpenAI voice name), instructions (describe any voice), response_format mp3|opus|aac|flac|wav|pcm, speed 0.25-4, language, seed; returns the audio",
+            "JSON: input, voice (a saved voice's name, or an OpenAI voice name), instructions (describe any voice), response_format mp3|opus|aac|flac|wav|pcm, speed 0.25-4, language, seed; returns the audio. With a music model: input is the lyrics and instructions the style (a whole song comes back)",
         )],
+        ("music", _) => vec![
+            sub("POST", path.into(), "create a song job (JSON: prompt (the style), lyrics or instrumental: true, duration 1-360 s, seed, steps)"),
+            sub("GET", path.into(), "list song jobs"),
+            sub("GET", format!("{path}/{{id}}"), "poll a job: status queued | in_progress | completed | failed, progress 0-100"),
+            sub("GET", format!("{path}/{{id}}/content"), "download the song: 44.1 kHz stereo WAV, or ?format=mp3|opus|aac|flac|pcm"),
+            sub("POST", format!("{path}/{{id}}/cancel"), "stop a job"),
+            sub("DELETE", format!("{path}/{{id}}"), "forget a job (files stay on disk)"),
+        ],
         ("voices", _) => vec![
             sub("GET", path.into(), "list saved voices"),
             sub("POST", path.into(), "design and save a voice (JSON: name, description, sample_text?, language?, seed?)"),
@@ -51,12 +59,13 @@ fn describe(target: &str) -> &'static str {
     match target {
         "chat" => "chat completions, streamed as server-sent events with stream: true",
         "completions" => "raw text completions",
-        "models" => "model list; each entry has type llm | image | video",
+        "models" => "model list; each entry has type llm | image | video | speech | music",
         "images" => "text-to-image; add images: [{image_url}] to edit",
         "edits" => "image edits: multipart (image, prompt) or JSON with images",
         "videos" => "text/image-to-video",
         "speech" => "text to speech in a saved or described voice (OpenAI audio.speech)",
         "voices" => "saved voices: design one from a description, then speak in it by name",
+        "music" => "songs with vocals and instruments from lyrics and a description, as asynchronous jobs",
         "files" => "generated media",
         "health" => "liveness, no key needed",
         "discovery" => "this document",
@@ -182,6 +191,21 @@ pub fn document(studio: &Studio, base: &str, authorized: bool) -> Json {
             ])
         })
         .collect();
+    let music = section("music");
+    let music_default = effective(music);
+    let music_models: Vec<Json> = names(music)
+        .into_iter()
+        .map(|(name, m)| {
+            Json::obj([
+                ("id", Json::str(&name)),
+                ("default", Json::Bool(name == music_default)),
+                ("max_seconds", Json::Num(crate::music::MAX_SECONDS)),
+                ("sample_rate", Json::Int(44_100)),
+                ("channels", Json::Int(2)),
+                ("quantized", Json::Bool(!str_or(&m, "language_model", "").is_empty())),
+            ])
+        })
+        .collect();
     let models_for = |target: &str| -> Vec<Json> {
         let ids = |list: &[Json]| list.iter().filter_map(|m| m.get("id").cloned()).collect::<Vec<_>>();
         match target {
@@ -189,7 +213,10 @@ pub fn document(studio: &Studio, base: &str, authorized: bool) -> Json {
             "images" => ids(&image_models),
             "edits" => image_models.iter().filter(|m| m.get("edits") == Some(&Json::Bool(true))).filter_map(|m| m.get("id").cloned()).collect(),
             "videos" => ids(&video_models),
-            "speech" | "voices" => ids(&speech_models),
+            // The speech endpoint also sings, given a music model.
+            "speech" => ids(&speech_models).into_iter().chain(ids(&music_models)).collect(),
+            "voices" => ids(&speech_models),
+            "music" => ids(&music_models),
             _ => Vec::new(),
         }
     };
@@ -220,7 +247,7 @@ pub fn document(studio: &Studio, base: &str, authorized: bool) -> Json {
             if target == "speech" || target == "voices" {
                 e.push(("voices".into(), Json::Arr(voices.iter().filter_map(|v| v.get("name").cloned()).collect())));
             }
-            if !models.is_empty() || matches!(target, "chat" | "completions" | "images" | "edits" | "videos" | "speech") {
+            if !models.is_empty() || matches!(target, "chat" | "completions" | "images" | "edits" | "videos" | "speech" | "music") {
                 e.push(("models".into(), Json::Arr(models)));
             }
             Json::Obj(e)
@@ -231,7 +258,7 @@ pub fn document(studio: &Studio, base: &str, authorized: bool) -> Json {
         ("endpoints".into(), Json::Arr(endpoints)),
         (
             "models".into(),
-            Json::obj([("llm", Json::Arr(llm_models)), ("image", Json::Arr(image_models)), ("video", Json::Arr(video_models)), ("speech", Json::Arr(speech_models))]),
+            Json::obj([("llm", Json::Arr(llm_models)), ("image", Json::Arr(image_models)), ("video", Json::Arr(video_models)), ("speech", Json::Arr(speech_models)), ("music", Json::Arr(music_models))]),
         ),
         (
             "defaults".into(),
@@ -240,6 +267,7 @@ pub fn document(studio: &Studio, base: &str, authorized: bool) -> Json {
                 ("image", Json::str(&image_default)),
                 ("video", Json::str(&video_default)),
                 ("speech", Json::str(&speech_default)),
+                ("music", Json::str(&music_default)),
             ]),
         ),
         (
