@@ -17,6 +17,6 @@ try {
     # The same server without CUDA, for machines that lack it (WebGPU, else CPU).
     cargo build --release -p nrob-server --no-default-features --features webgpu --bin nrob-server-webgpu
     if ($LASTEXITCODE) { throw 'NROB WebGPU server build failed.' }
-    cargo build --release -p nrob-studio
+    cargo build --release -p nrob-studio -p nrob-studio-tray
     if ($LASTEXITCODE) { throw 'NROB Studio build failed.' }
 } finally { Pop-Location }

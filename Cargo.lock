@@ -1482,6 +1482,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "nrob-studio-tray"
+version = "0.1.0"
+dependencies = [
+ "nrob",
+ "nrob-studio",
+ "windows-sys",
+]
+
+[[package]]
 name = "num"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"

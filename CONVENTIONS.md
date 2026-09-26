@@ -52,6 +52,13 @@ crates (`nrob`, `nrob-cli`, `nrob-server`, `nrob-image`, `dsv41`, `dsv41-cuda`) 
   up after themselves.
 - A change to the DeepSeek path also passes its golden gates (README, "Testing").
 
+## The tray app
+
+`nrob-studio-tray` puts the std-only `nrob-studio` library behind a Windows
+notification-area icon. Win32 UI is outside std, so this crate depends on
+`windows-sys` (bindings only). Its `unsafe` is confined to `src/tray.rs`, and
+every block there carries a `SAFETY:` comment, as in `dsv41-cuda`.
+
 ## Diffusion compute boundary
 
 `nrob-diffusion` is a separate, opt-in Rust compute worker. It uses Candle core/nn

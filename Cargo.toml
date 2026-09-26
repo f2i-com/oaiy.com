@@ -19,6 +19,9 @@ members = [
     # The portable host: supervises nrob-server and nrob-diffusion, serves the
     # control UI and the configurable API gateway. std-only, so a default member.
     "crates/nrob-studio",
+    # The studio as a Windows notification-area app (windows-sys; the only
+    # unsafe is its Win32 calls, in src/tray.rs).
+    "crates/nrob-studio-tray",
     # Vendored GGUF compute subsystem (see crates/VENDORED.md). These keep
     # their own identity and external deps; the std-only rule below does
     # not apply to them.
@@ -43,6 +46,7 @@ default-members = [
     "crates/dsv41",
     "crates/nrob-image",
     "crates/nrob-studio",
+    "crates/nrob-studio-tray",
     "crates/gguf",
     "crates/ggml-quants",
     "crates/ggml-rs",

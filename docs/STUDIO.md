@@ -15,7 +15,8 @@ it builds and runs its UI on any machine. The engines need CUDA; see
 Put these in one folder:
 
 ```
-nrob-studio.exe        the host (cargo build --release -p nrob-studio)
+nrob-studio.exe        the host, as a console program (cargo build --release -p nrob-studio)
+nrob-studio-tray.exe   the same host as a notification-area app (Windows)
 nrob-server.exe        language models (tools/qwen-image/build.ps1 builds both)
 nrob-diffusion.exe     images and video (built with --features flash-attn)
 nrob-studio.json       created with defaults on first start
@@ -35,6 +36,26 @@ nrob-studio --config D:/ai/studio.json --ui-port 7000 --port 9000 --start-llm
 ```
 
 The console accepts `status`, `start`, `stop`, `open`, `jobs` and `quit`.
+
+### In the notification area (Windows)
+
+`nrob-studio-tray.exe` is the same studio without a console window. It starts
+in the background, opens the UI window, and puts an icon by the clock. Closing
+the UI window leaves everything serving; click the icon to bring it back.
+Right-click for:
+
+- **Open NROB Studio**, or **Open in the browser**;
+- the language model's state, and **Start** / **Stop** it;
+- **Open the output folder**;
+- **Start with Windows**, which registers it to start at sign-in, silently, in
+  the tray;
+- **Quit**, which stops the language model and any media job, then exits.
+
+The tooltip shows the model's state and media progress, and a notification
+pops up when an image or video finishes (or fails). It takes the same options as
+`nrob-studio`; `--open none` starts it with no window. Starting a second copy
+just opens the running one's UI. Windows 11 puts new icons under the **^**
+overflow at first; drag the icon onto the taskbar to keep it visible.
 
 ## Adding models
 

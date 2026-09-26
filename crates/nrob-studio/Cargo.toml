@@ -5,6 +5,9 @@ edition = "2021"
 license = "Apache-2.0"
 description = "Portable host for nrob: runs the LLM server and the media worker, exposes configurable OpenAI-style endpoints, and serves a local control UI"
 
+[lib]
+path = "src/lib.rs"
+
 [[bin]]
 name = "nrob-studio"
 path = "src/main.rs"
