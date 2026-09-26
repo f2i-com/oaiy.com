@@ -1,16 +1,21 @@
-# Proposal: an application bridge for zipp-wasm
+# Zipp's app bridge
 
-bot.computer's sandbox gives guest programs synchronous file and network access (Node's `fs.readFileSync`, the shell's `cat`, `curl`) by blocking the Worker on a `SharedArrayBuffer` while the page answers. zipp-wasm's synchronous host channel only accepts a fixed set of operations (`db.*`, `ls.*`, `nav.clipboard*`, `accel.*`). So today bot.computer tunnels its calls through `ls.getItem` with a reserved key prefix. That works, and ordinary `localStorage` keys stay inert, but it hides an application protocol inside a storage API.
+bot.computer's sandbox gives guest programs synchronous file and network access (Node's `fs.readFileSync`, the shell's `cat`, `curl`) by blocking the Worker on a `SharedArrayBuffer` while the page answers.
 
-## The change
+## Status
 
-Add one more bridge to `crates/zipp-wasm/src/lib.rs`, following the existing ones:
+The bridge is implemented in zipp.org on the branch `feature/app-host-bridge` (`crates/zipp-wasm`), with the boundary check `tests/node/app-bridge.cjs`. The full boundary suite passes (27 of 27).
 
-- **`Engine.setAppBridge(adapter)`:** `adapter.call(kind: string, args: string[]) => string`, a synchronous, trusted host adapter like the others.
-- **Capability names `app.<kind>`:** each one must match `^app\.[a-z][a-z0-9_.]{0,58}$`. Grant them with `setSyncHostCapabilities(["app.fs.read", …])`.
-  - Unlike the fixed names, their arity is decided by the host adapter, but the existing envelope limits still apply: `MAX_SYNC_BRIDGE_ARGS`, `MAX_SYNC_BRIDGE_BYTES`, and the kind length.
-  - An ungranted `app.*` kind is refused before the adapter is looked up, like every other operation.
-- **Guest side:** `__zippHostCall("app.fs.read", path)`, with a small `app.call(kind, ...args)` wrapper in `preamble.js`.
-- **Errors:** as now, the guest sees an opaque failure when the adapter throws. An adapter that wants to pass an error back returns it as data (`{"err": …}`), which bot.computer already does.
+bot.computer already uses it: the sandbox Worker feature-detects `Engine.prototype.setAppBridge`.
 
-With that in place, bot.computer drops the `ls.getItem` tunnel. The same guest scripts (`prelude.js`, `shell.js`) would then run unchanged on zipp-wasm and on coder-cli's native runner, where `__zippHostCall` is already an open application channel.
+- **An engine with the bridge** answers `host.callSync(kind, …)` through it, with each of the sandbox's operations granted exactly as `app.<kind>`.
+- **The released engine (v0.0.21)** has no bridge, so the same calls ride the synchronous `localStorage.getItem` bridge with a reserved key prefix. Ordinary `localStorage` keys stay inert.
+
+Both paths pass `tests/e2e/run.mjs`. Once a Zipp release includes the bridge, bumping `RELEASE` in `scripts/fetch-zipp.mjs` switches bot.computer over; the tunnel stays as the fallback for older engines.
+
+## The API (zipp-wasm)
+
+- **`Engine.setAppBridge(adapter)`:** `adapter.call(kind: string, args: string[]) => any`, a synchronous, trusted host adapter. The kind arrives without its `app.` prefix. The return value reaches the guest as JSON; a throw reaches it only as an opaque failure, so return errors as data.
+- **Grants:** `setSyncHostCapabilities(["app.fs.read", …])`. Each kind must be a lowercase dotted name (`[a-z][a-z0-9._-]*`, no empty segments, within the 64-byte kind limit). The shape is checked before any lookup, and an ungranted kind is refused before the adapter is touched.
+- **Arguments:** the adapter decides how many an operation takes. The synchronous envelope still bounds the argument count and total bytes in both directions.
+- **Guest side:** `host.callSync(kind, ...args)`. It adds no new global, so a script's own `app` binding is unaffected.

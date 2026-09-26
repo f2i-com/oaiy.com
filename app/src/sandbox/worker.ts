@@ -16,23 +16,34 @@ declare const self: DedicatedWorkerGlobalScope;
 
 const MAGIC = '\u0000bot.computer:';
 
-// Installed ahead of the guest: captures the native host call before any
-// guest code can shadow it, and turns the page's {ok}|{err} reply into a
-// return value or an exception.
-const HOSTCALL = `var __coderHostCall = (function (raw, magic) {
+/** The operations a guest may ask the page for (answered by host.ts). */
+const HOST_KINDS = ['fs.read', 'fs.readb64', 'fs.write', 'fs.append', 'fs.writeb64', 'fs.stat', 'fs.list', 'fs.walk', 'fs.grep', 'fs.mkdir', 'fs.remove', 'fs.rename', 'fs.copy', 'net.fetch', 'proc.run', 'sys.sleep'];
+
+// Installed ahead of the guest: captures the host channel before any guest
+// code can shadow it, and turns the page's {ok}|{err} reply into a return
+// value or an exception. An engine with Zipp's app bridge answers through
+// `host.callSync`; an older one through the `ls.getItem` tunnel.
+function hostCallShim(appBridge: boolean): string {
+  const send = appBridge
+    ? 'var reply = channel.callSync.apply(channel, [String(kind)].concat(args));'
+    : `var reply = JSON.parse(channel("ls.getItem", ${JSON.stringify(MAGIC)} + JSON.stringify({ k: String(kind), a: args })));`;
+  return `var __coderHostCall = (function (channel) {
   return function (kind) {
     var args = [];
     for (var i = 1; i < arguments.length; i++) args.push(String(arguments[i]));
-    var reply = JSON.parse(raw("ls.getItem", magic + JSON.stringify({ k: String(kind), a: args })));
+    ${send}
     if (reply === null || typeof reply !== "object") throw new Error("the sandbox host did not answer");
     if (typeof reply.err === "string") throw new Error(reply.err);
     return String(reply.ok === undefined ? "" : reply.ok);
   };
-})(__zippHostCall, ${JSON.stringify(MAGIC)});
+})(${appBridge ? 'host' : '__zippHostCall'});
 `;
+}
+let HOSTCALL = hostCallShim(false);
 
 interface ZippEngine {
   setLocalStorageBridge(bridge: unknown): void;
+  setAppBridge?(bridge: unknown): void;
   setSyncHostCapabilities(ops: string[]): void;
   setInstructionBudget(steps: number): boolean;
   initScript(source: string): unknown;
@@ -113,28 +124,42 @@ async function run(message: Extract<ToWorker, { type: 'run' }>): Promise<RunResu
   const request = message.request;
   const engine = new glue.Engine();
   const sab = message.sab;
-  engine.setLocalStorageBridge({
-    getItem(key: string) {
-      if (typeof key !== 'string' || !key.startsWith(MAGIC)) return null;
-      let call: { k: string; a: string[] };
-      try {
-        call = JSON.parse(key.slice(MAGIC.length));
-      } catch {
-        return { err: 'TypeError: malformed host call' };
-      }
-      // Never throw from a bridge: Zipp would hand the guest an opaque failure.
-      try {
-        const reply = blockingCall(sab, (m) => self.postMessage(m), { type: 'call', kind: String(call.k), args: (call.a ?? []).map(String) });
-        return JSON.parse(reply);
-      } catch (error) {
-        return { err: `Error: ${errorText(error)}` };
-      }
-    },
-    setItem() {},
-    removeItem() {},
-    clear() {},
-  });
-  engine.setSyncHostCapabilities(['ls.getItem']);
+  // Never throw from a bridge: Zipp would hand the guest an opaque failure.
+  const answer = (kind: string, args: string[]) => {
+    try {
+      const reply = blockingCall(sab, (m) => self.postMessage(m), { type: 'call', kind, args });
+      return JSON.parse(reply);
+    } catch (error) {
+      return { err: `Error: ${errorText(error)}` };
+    }
+  };
+  const appBridge = typeof engine.setAppBridge === 'function';
+  HOSTCALL = hostCallShim(appBridge);
+  if (appBridge) {
+    engine.setAppBridge!({
+      call(kind: string, args: string[]) {
+        return HOST_KINDS.includes(kind) ? answer(kind, Array.from(args, String)) : { err: `TypeError: \`${kind}\` is not available in the bot.computer sandbox` };
+      },
+    });
+    engine.setSyncHostCapabilities(HOST_KINDS.map((k) => `app.${k}`));
+  } else {
+    engine.setLocalStorageBridge({
+      getItem(key: string) {
+        if (typeof key !== 'string' || !key.startsWith(MAGIC)) return null;
+        let call: { k: string; a: string[] };
+        try {
+          call = JSON.parse(key.slice(MAGIC.length));
+        } catch {
+          return { err: 'TypeError: malformed host call' };
+        }
+        return answer(String(call.k), (call.a ?? []).map(String));
+      },
+      setItem() {},
+      removeItem() {},
+      clear() {},
+    });
+    engine.setSyncHostCapabilities(['ls.getItem']);
+  }
   engine.setInstructionBudget(request.limits.maxSteps);
 
   const result: RunResult = { console: [] };

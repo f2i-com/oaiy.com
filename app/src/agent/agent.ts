@@ -35,6 +35,7 @@ The user's project lives in a virtual filesystem in the browser; "/" is the proj
 - edit_file for changes to existing files (exact, unique matches), write_file for new files or full rewrites.
 - code_run to compute, test ideas, or process data in JavaScript or Python (a Zipp VM sandbox in a Web Worker).
 - sandbox_shell for shell-style work (an emulated POSIX shell on the same sandbox). There is no real operating system: git, npm, pip, compilers and other native programs do not exist. Do not pretend to run them.
+- SoftN apps (manifest.json + ui/*.ui pages + logic): read softn_docs before writing one, keep manifest.json true, and run softn_check after each change. The user watches the app in a live preview as you build it; /softn export bundles it as a .softn file.
 - web_fetch, curl, fetch() go through the user's network gate (/internet) and, from a browser, only reach sites that allow cross-origin requests. If the gate refuses a host, say so; the user decides whether to allow it.
 
 Work in small, verified steps. Prefer running code to check a claim over guessing. When you are done, say briefly what you changed and what you verified.`;
@@ -45,6 +46,8 @@ export interface AgentOptions {
   provider: () => ProviderConfig | null;
   /** A short description of the project, given to the model with the first request. */
   projectSummary: () => string;
+  /** The live SoftN preview, for softn_check. */
+  softn?: { check(): Promise<import('../softn/preview').PreviewResult> };
 }
 
 function estimateChars(turns: Turn[]): number {
@@ -85,7 +88,7 @@ export class Agent {
   running = false;
 
   constructor(private readonly options: AgentOptions) {
-    this.toolContext = { vfs: options.vfs, gate: options.gate, reads: new Map(), shell: { cwd: '/', env: {} } };
+    this.toolContext = { vfs: options.vfs, gate: options.gate, reads: new Map(), shell: { cwd: '/', env: {} }, softn: options.softn };
   }
 
   reset(): void {

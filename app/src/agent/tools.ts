@@ -12,6 +12,8 @@ import { SandboxHost, globRegex, summarize } from '../sandbox/host';
 import { runInSandbox } from '../sandbox/runner';
 import { VfsError, normalizePath, type Vfs } from '../vfs/vfs';
 import type { ToolCall, ToolResult, ToolSpec } from './protocol';
+import { checkProject, formatFindings, guideFor, isSoftnProject, logicSyntax } from '../softn/softn';
+import type { PreviewResult } from '../softn/preview';
 
 const READ_LINES = 400;
 const READ_CHARS = 40_000;
@@ -26,6 +28,8 @@ export interface ToolContext {
   reads: Map<string, number>;
   /** The emulated shell's state, kept between calls. */
   shell: { cwd: string; env: Record<string, string> };
+  /** The live SoftN preview, when the page has one. */
+  softn?: { check(): Promise<PreviewResult> };
   signal?: AbortSignal;
 }
 
@@ -95,6 +99,16 @@ export const TOOLS: ToolSpec[] = [
       'Pipes, && || ;, redirects, heredocs, $VAR/$(...)/$((...)), globs, if/for/while/case, and built-in ls cat head tail grep find sed awk sort uniq cut tr wc diff mkdir cp mv rm touch tree xargs tee printf echo, curl/wget (through the /internet gate; CORS applies), node/js and python on Zipp. ' +
       'There are no real processes: git, npm, compilers are not available. The working directory and exported variables persist between calls. Run `help` for details.',
     parameters: { type: 'object', required: ['command'], properties: { command: str, timeout_secs: { ...int, minimum: 1, maximum: MAX_TIMEOUT_S } } },
+  },
+  {
+    name: 'softn_docs',
+    description: 'The SoftN writing guide (from SoftN Studio): the app files, the .ui page language, .logic/.py logic, XDB data, capabilities, common mistakes and a complete example. Read it before writing or changing a SoftN app. Optional `section` returns only the sections whose heading contains it (e.g. "ui page", "logic", "mistakes", "example").',
+    parameters: { type: 'object', properties: { section: str } },
+  },
+  {
+    name: 'softn_check',
+    description: 'Check the SoftN app in this project: the files (manifest.json, listed files, JSON, permissions) and a real render in the live preview, returning load and render errors. Run it after every change to a SoftN app, and fix what it reports.',
+    parameters: { type: 'object', properties: {} },
   },
   {
     name: 'web_fetch',
@@ -287,6 +301,29 @@ async function execute(call: ToolCall, ctx: ToolContext): Promise<string> {
       if (host.changes.written.size) report.files_written = [...host.changes.written];
       if (host.changes.deleted.size) report.files_deleted = [...host.changes.deleted];
       return JSON.stringify(report, null, 1);
+    }
+    case 'softn_docs': {
+      const guide = guideFor(vfs);
+      const want = typeof input.section === 'string' ? input.section.trim().toLowerCase() : '';
+      if (!want) return guide;
+      const sections = guide.split(/\n(?=## )/);
+      const hits = sections.filter((s) => s.split('\n')[0].toLowerCase().includes(want));
+      if (hits.length) return hits.join('\n\n');
+      return `No section heading contains "${want}". Sections: ${sections.map((s) => s.split('\n')[0].replace(/^#+\s*/, '')).join('; ')}`;
+    }
+    case 'softn_check': {
+      const findings = [...checkProject(vfs), ...(await logicSyntax(vfs).catch(() => []))];
+      const lines = [`Files: ${formatFindings(findings)}`];
+      if (!isSoftnProject(vfs)) return `${lines[0]}\nNot rendered: this is not a SoftN app until manifest.json names a "main" .ui page.`;
+      if (findings.some((f) => f.level === 'error')) {
+        lines.push('Render: skipped until the file errors above are fixed.');
+      } else if (!ctx.softn) {
+        lines.push('Render: no live preview in this session.');
+      } else {
+        const result = await ctx.softn.check();
+        lines.push(result.ok ? 'Render: the app loaded and rendered without reported errors (the user sees it in the preview).' : `Render errors:\n${result.errors.map((e) => `- ${e}`).join('\n')}`);
+      }
+      return lines.join('\n');
     }
     case 'web_fetch': {
       const host = new SandboxHost(vfs, ctx.gate, 'web_fetch', 60_000);

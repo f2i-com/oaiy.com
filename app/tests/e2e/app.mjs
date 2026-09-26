@@ -82,6 +82,7 @@ async function terminal(page, command, waitFor) {
 
 try {
   const page = await browser.newPage();
+  await page.setViewport({ width: 1400, height: 900 });
   page.on('pageerror', (e) => console.log('  [pageerror]', e.message));
   page.on('dialog', (d) => d.accept());
   await page.goto(base);
@@ -154,6 +155,24 @@ try {
     const log = await page.$eval('.chat-log', (e) => e.textContent);
     expect(log.includes('What is the mean temperature?') && log.includes('saved in data/mean.txt'), `log: ${log.slice(0, 300)}`);
     expect((await page.$eval('button[role="switch"]', (e) => e.textContent)) === 'internet: off', 'gate not remembered');
+  });
+  await check('on a phone, a tab bar switches panes and everything still works', async () => {
+    const phone = await browser.newPage();
+    await phone.setViewport({ width: 390, height: 844, isMobile: true, hasTouch: true });
+    await phone.goto(base);
+    await phone.waitForSelector('nav.tabs button[data-view="terminal"]', { visible: true, timeout: 60_000 });
+    expect(!(await phone.$eval('.tree', (e) => e.checkVisibility())), 'the file tree should be behind its tab');
+    await phone.tap('nav.tabs button[data-view="terminal"]');
+    await terminal(phone, 'ls', 'hello.py');
+    await phone.tap('nav.tabs button[data-view="files"]');
+    await phone.waitForFunction(() => document.querySelector('.tree')?.checkVisibility());
+    await phone.evaluate(() => [...document.querySelectorAll('.tree-row')].find((r) => r.textContent.includes('hello.py')).click());
+    await phone.waitForFunction(() => document.querySelector('nav.tabs button.active')?.dataset.view === 'editor' && document.querySelector('.editor-title')?.textContent === '/hello.py');
+    await phone.tap('.menu-toggle');
+    await phone.waitForFunction(() => document.querySelector('.actions')?.checkVisibility());
+    const width = await phone.evaluate(() => document.documentElement.scrollWidth);
+    expect(width <= 390, `the page scrolls sideways: ${width}px`);
+    await phone.close();
   });
 } finally {
   await browser.close();

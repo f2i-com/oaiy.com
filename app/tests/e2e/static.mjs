@@ -45,6 +45,7 @@ async function terminal(page, command, waitFor) {
 
 try {
   const page = await browser.newPage();
+  await page.setViewport({ width: 1400, height: 900 });
   page.on('pageerror', (e) => console.log('  [pageerror]', e.message));
   await page.goto(base);
   await check('the service worker makes the page cross-origin isolated (one reload)', async () => {
@@ -61,6 +62,7 @@ try {
     server.close();
     await page.close();
     const offline = await browser.newPage();
+    await offline.setViewport({ width: 1400, height: 900 });
     await offline.goto(base);
     await offline.waitForSelector('.tree-row', { timeout: 30_000 });
     if (!(await offline.evaluate(() => globalThis.crossOriginIsolated))) throw new Error('not isolated offline');

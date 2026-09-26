@@ -8,10 +8,26 @@ A coding agent that runs entirely in your browser.
 - **Any model.** A server on your own machine (Ollama, LM Studio, llama.cpp, nrob-server — anything OpenAI-compatible), Anthropic's API, or any OpenAI-compatible API.
 - **A network gate.** `/internet on | off | allowlist | allow <host> | deny <host> | status` (or `/net`) decides every request made on the model's behalf. Requests to your AI provider are not gated.
 
+## SoftN apps
+
+bot.computer can build [SoftN](https://github.com/f2i-com/softn.com) apps and show them running while they're being built.
+
+- **Start one:** use **New SoftN app** (or `/softn new`), or ask the agent for an app. It reads `softn_docs` (SoftN Studio's own writing guide, regenerated with `npm run softn:guide`), writes `manifest.json`, `ui/*.ui` and `logic/*.logic`, and runs `softn_check`.
+- **Live preview:** the **App preview** tab renders the app with SoftN's hosted runtime, in a sandboxed opaque-origin iframe with its own strict CSP. It re-renders about 0.7 s after edits settle.
+- **Errors:** load and render errors are reported, and `.logic` syntax errors are caught by compiling the logic on Zipp.
+- **Export:** **Export .softn** (or `/softn export`) downloads the app as a `.softn` file. That's a flat zip with `manifest.json` at its root, and the manifest's `main`, `version` and `files` are filled in from the files actually present.
+
+The preview runtime is optional (about 23 MB) and comes from a checksummed softn.com release: `npm run fetch:softn`. Without it, apps can still be written, checked and exported.
+
+## Any screen
+
+On a phone or a narrow window, the panes (Files, Editor, Preview, Terminal and Agent) become full-screen views switched from a bottom tab bar. Project actions fold into the ☰ menu.
+
 ## Run it
 
 ```sh
 npm install        # also fetches and verifies the Zipp engine (public/zipp/, not committed)
+npm run fetch:softn  # optional: SoftN's app preview runtime (public/softn/, not committed)
 npm run dev        # http://localhost:5173
 npm run build      # dist/: a static site; serve it from anywhere
 ```

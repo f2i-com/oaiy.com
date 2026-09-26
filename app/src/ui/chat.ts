@@ -25,7 +25,7 @@ function summarizeCall(call: ToolCall): string {
 export class ChatPane {
   readonly element = h('section.chat');
   private readonly log = h('div.chat-log');
-  private readonly input = h('textarea.chat-input', { rows: 3, placeholder: 'Ask bot.computer… (Enter to send, Shift+Enter for a new line, /help for commands)' });
+  private readonly input = h('textarea.chat-input', { rows: 3, placeholder: 'Ask bot.computer…  (/help for commands)', title: 'Enter sends; Shift+Enter starts a new line' });
   private readonly send = h('button.primary', 'Send');
   private readonly status = h('div.chat-status');
   private current: { box: HTMLElement; text: string; body: HTMLElement } | null = null;

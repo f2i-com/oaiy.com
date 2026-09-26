@@ -9,7 +9,27 @@ const isolation = {
   'Cross-Origin-Embedder-Policy': 'credentialless',
 };
 
+// The SoftN preview is an opaque-origin (sandboxed) iframe: the runtime it
+// loads from /softn/ is a cross-origin fetch from its point of view.
+const softnHeaders = {
+  name: 'softn-runtime-headers',
+  configureServer(server: { middlewares: { use: (fn: (req: { url?: string }, res: { setHeader: (k: string, v: string) => void }, next: () => void) => void) => void } }) {
+    server.middlewares.use(softnMiddleware);
+  },
+  configurePreviewServer(server: { middlewares: { use: (fn: (req: { url?: string }, res: { setHeader: (k: string, v: string) => void }, next: () => void) => void) => void } }) {
+    server.middlewares.use(softnMiddleware);
+  },
+};
+function softnMiddleware(req: { url?: string }, res: { setHeader: (k: string, v: string) => void }, next: () => void): void {
+  if (req.url?.startsWith('/softn/')) {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+  }
+  next();
+}
+
 export default defineConfig({
+  plugins: [softnHeaders],
   server: { headers: isolation },
   preview: { headers: isolation },
   worker: { format: 'es' },

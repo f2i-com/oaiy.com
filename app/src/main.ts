@@ -10,6 +10,8 @@ import { clear, h } from './ui/dom';
 import { EditorPane } from './ui/editor';
 import { openSettings } from './ui/settings';
 import { TerminalPane } from './ui/terminal';
+import { SoftnPreview } from './softn/preview';
+import { SOFTN_STARTER, checkProject, downloadSoftn, formatFindings, isSoftnProject } from './softn/softn';
 import { FileTree } from './ui/tree';
 import { OpenProject, createProject, deleteProject, listProjects, renameProject, type ProjectMeta } from './vfs/projects';
 import { canPickFolder, downloadZip, importFileList, importFolder, importZip, type Imported } from './vfs/transfer';
@@ -102,9 +104,11 @@ async function main(): Promise<void> {
   const tree = new FileTree(null as unknown as Vfs, (path) => {
     editor.open(path);
     tree.select(path);
+    if (window.matchMedia('(max-width: 900px)').matches) showView('editor');
   }, notice);
   const editor = new EditorPane(null as unknown as Vfs);
   const terminal = new TerminalPane(null as unknown as Vfs, gate);
+  const preview = new SoftnPreview(null as unknown as Vfs, () => project?.meta.id ?? 'none');
 
   const projectSelect = h('select.project-select', { title: 'Project' });
   // The chip is the gate's switch: on (open) ⇄ off (blocked). Allowlists and
@@ -149,15 +153,19 @@ async function main(): Promise<void> {
     }
     project = await OpenProject.open(meta);
     project.onError = notice;
-    agent = new Agent({ vfs: project.vfs, gate, provider: activeProvider, projectSummary: () => summarizeProject(project.meta, project.vfs, gate) });
+    agent = new Agent({ vfs: project.vfs, gate, provider: activeProvider, projectSummary: () => summarizeProject(project.meta, project.vfs, gate), softn: preview });
     agent.turns = await project.loadChat();
     tree.setVfs(project.vfs);
     editor.setVfs(project.vfs);
     terminal.setVfs(project.vfs);
+    preview.setVfs(project.vfs);
     unsubscribe = project.vfs.onChange((change) => {
       tree.refresh();
       editor.externalChange('path' in change ? change.path : null);
+      preview.changed('path' in change ? change.path : null);
     });
+    // A SoftN app opens on its preview, so the person sees it being built.
+    if (isSoftnProject(project.vfs)) showPane('preview');
     chat.replay(agent.turns);
     await saveLastProject(meta.id);
     await renderProjects();
@@ -207,6 +215,9 @@ async function main(): Promise<void> {
         case 'help': case '?':
           chat.system(HELP);
           return;
+        case 'softn':
+          await softnCommand(args);
+          return;
         default:
           chat.system(`Unknown command /${command}. ${HELP}`, 'error');
           return;
@@ -226,10 +237,55 @@ async function main(): Promise<void> {
     }
   }
 
-  const header = h(
-    'header.topbar',
-    h('div.brand', h('span.logo', '◆'), ' bot.computer'),
-    projectSelect,
+  async function newSoftnApp(): Promise<void> {
+    const name = prompt('Name of the new SoftN app', 'Tasks');
+    if (!name) return;
+    await openProject(await createProject(name));
+    for (const [path, text] of SOFTN_STARTER) project.vfs.writeFile(`/${path}`, path === 'manifest.json' ? text.replace('"Tasks"', JSON.stringify(name)) : text, { parents: true });
+    await project.flush();
+    tree.select('/ui/main.ui');
+    showPane('preview');
+    chat.system(`New SoftN app "${name}": a small task list to start from. Ask the agent to change it into what you want — the preview updates as it works. /softn export saves it as a .softn file.`);
+  }
+
+  function exportSoftn(): void {
+    editor.flush();
+    if (!isSoftnProject(project.vfs)) {
+      chat.system('This project is not a SoftN app: it needs a manifest.json whose "main" is a .ui page. /softn new starts one.', 'error');
+      return;
+    }
+    const errors = checkProject(project.vfs).filter((f) => f.level === 'error');
+    const name = downloadSoftn(project.vfs, project.meta.name);
+    chat.system(errors.length ? `Exported ${name}, but it has problems that will stop it loading:\n${formatFindings(errors)}` : `Exported ${name}.`, errors.length ? 'error' : 'info');
+  }
+
+  async function softnCommand(args: string[]): Promise<void> {
+    switch ((args[0] ?? '').toLowerCase()) {
+      case 'new':
+        await newSoftnApp();
+        return;
+      case 'export':
+        exportSoftn();
+        return;
+      case 'check': {
+        const result = await preview.check();
+        const files = formatFindings(checkProject(project.vfs));
+        chat.system(`Files: ${files}\nRender: ${result.ok ? 'ok' : result.errors.join('; ')}`, result.ok ? 'info' : 'error');
+        return;
+      }
+      case 'preview':
+        showPane('preview');
+        return;
+      default:
+        chat.system('usage: /softn new | export | check | preview\n  new      start a SoftN app (a small task list) in a new project\n  export   download this app as a .softn file\n  check    check the files and render the app\n  preview  show the live preview');
+    }
+  }
+
+  // Project actions: a row of buttons on a wide screen, a ☰ menu on a phone.
+  const closeMenu = () => header.classList.remove('menu-open');
+  const actions = h(
+    'div.actions',
+    { onclick: (e: Event) => { if ((e.target as HTMLElement).closest('button')) closeMenu(); } },
     h('button', { title: 'New empty project', onclick: async () => {
       const name = prompt('Project name', 'untitled');
       if (name) await openProject(await createProject(name));
@@ -243,6 +299,8 @@ async function main(): Promise<void> {
       editor.flush();
       downloadZip(project.meta.name.replace(/[^\w.-]+/g, '-'), project.vfs.files());
     } }, 'Export .zip'),
+    h('button', { title: 'Start a SoftN app in a new project', onclick: () => void newSoftnApp() }, 'New SoftN app'),
+    h('button', { title: 'Download this SoftN app as a .softn file', onclick: () => exportSoftn() }, 'Export .softn'),
     h('button', { title: 'Rename this project', onclick: async () => {
       const name = prompt('Rename project', project.meta.name);
       if (name) {
@@ -259,21 +317,59 @@ async function main(): Promise<void> {
       await deleteProject(doomed);
       await renderProjects();
     } }, 'Delete'),
+  );
+  const header = h(
+    'header.topbar',
+    h('button.menu-toggle', { title: 'Project menu', 'aria-label': 'Project menu', onclick: () => header.classList.toggle('menu-open') }, '☰'),
+    h('div.brand', h('span.logo', '◆'), h('span.brand-name', ' bot.computer')),
+    projectSelect,
+    actions,
     h('div.spacer'),
     gateChip,
     providerChip,
-    h('button', { title: 'AI providers', onclick: () => void editSettings() }, '⚙ Settings'),
+    h('button.settings-button', { title: 'AI providers', 'aria-label': 'Settings', onclick: () => void editSettings() }, '⚙', h('span.label', ' Settings')),
   );
   projectSelect.addEventListener('change', async () => {
     const meta = (await listProjects()).find((m) => m.id === projectSelect.value);
     if (meta) await openProject(meta);
   });
 
-  clear(app);
-  app.append(
-    header,
-    h('main.workspace', tree.element, h('div.center', editor.element, terminal.element), chat.element),
+  // The center shows the editor or the app preview, with the terminal below.
+  const centerTabs = h(
+    'div.center-tabs',
+    h('button', { 'data-pane': 'editor', onclick: () => showPane('editor') }, 'Editor'),
+    h('button', { 'data-pane': 'preview', onclick: () => showPane('preview') }, 'App preview'),
   );
+  const center = h('div.center', centerTabs, h('div.center-main', editor.element, preview.element), terminal.element);
+  function showPane(pane: 'editor' | 'preview'): void {
+    center.dataset.pane = pane;
+    for (const b of centerTabs.querySelectorAll('button')) b.classList.toggle('active', b.dataset.pane === pane);
+    preview.setVisible(pane === 'preview' || workspace?.dataset.view === 'preview');
+    if (window.matchMedia('(max-width: 900px)').matches && workspace && workspace.dataset.view !== 'agent') showView(pane);
+  }
+
+  // On a narrow screen one pane shows at a time, chosen from a tab bar.
+  const workspace = h('main.workspace', tree.element, center, chat.element);
+  const views = [['files', 'Files'], ['editor', 'Editor'], ['preview', 'Preview'], ['terminal', 'Terminal'], ['agent', 'Agent']] as const;
+  const tabs = h('nav.tabs', ...views.map(([view, label]) => h('button', { 'data-view': view, onclick: () => showView(view) }, label)));
+  function showView(view: (typeof views)[number][0]): void {
+    workspace.dataset.view = view;
+    for (const b of tabs.querySelectorAll('button')) b.classList.toggle('active', b.dataset.view === view);
+    if (view === 'editor' || view === 'preview') {
+      center.dataset.pane = view;
+      for (const b of centerTabs.querySelectorAll('button')) b.classList.toggle('active', b.dataset.pane === view);
+    }
+    preview.setVisible(center.dataset.pane === 'preview' && (view === 'preview' || !window.matchMedia('(max-width: 900px)').matches));
+    if (view === 'agent') chat.focus();
+  }
+  showPane('editor');
+  showView('agent');
+  // A tap anywhere outside the open project menu closes it.
+  document.addEventListener('pointerdown', (e) => {
+    if (header.classList.contains('menu-open') && !header.contains(e.target as Node)) closeMenu();
+  });
+  clear(app);
+  app.append(header, workspace, tabs);
   renderChips();
 
   // Open the last project, or make the welcome one.
