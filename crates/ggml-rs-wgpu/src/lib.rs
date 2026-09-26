@@ -38,6 +38,8 @@ struct Gpu {
     pipeline_layout: wgpu::PipelineLayout,
     pipelines: Mutex<HashMap<GgmlType, Arc<wgpu::ComputePipeline>>>,
     limits: wgpu::Limits,
+    /// Upload bytes written since the queue was last flushed.
+    staged: AtomicU64,
 }
 
 /// A weight matrix on the GPU: its rows in one or more buffers.
@@ -153,6 +155,15 @@ impl Gpu {
             }
             chunks.push((buffer, r as u32, n as u32));
             r += n;
+            // `write_buffer` stages through host-visible memory that is only
+            // recycled after a submission completes: flush as uploads pile up,
+            // or loading a 16 GB model exhausts the staging pool.
+            let pending = self.staged.fetch_add(size, Ordering::Relaxed) + size;
+            if pending >= 256 << 20 {
+                self.staged.store(0, Ordering::Relaxed);
+                self.queue.submit([]);
+                let _ = self.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+            }
         }
         chunks
     }
@@ -264,7 +275,7 @@ impl WgpuBackend {
         });
         Ok(Self {
             cpu: CpuBackend::new(),
-            gpu: Arc::new(Gpu { device, queue, layout, pipeline_layout, pipelines: Mutex::new(HashMap::new()), limits }),
+            gpu: Arc::new(Gpu { device, queue, layout, pipeline_layout, pipelines: Mutex::new(HashMap::new()), limits, staged: AtomicU64::new(0) }),
             budget,
             used: Arc::new(AtomicU64::new(0)),
             summary,

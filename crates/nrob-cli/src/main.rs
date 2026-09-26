@@ -105,6 +105,10 @@ struct Opts {
     raw: bool,
     /// --cuda: run on CUDA device 0 (build with `--features cuda`).
     cuda: bool,
+    /// --webgpu: quantized matmuls on a WebGPU adapter, the rest on the CPU
+    /// (build with `--features webgpu`). `--webgpu-gb N` caps its weights.
+    webgpu: bool,
+    webgpu_gb: Option<u64>,
     /// --vram-cache N: VRAM expert cache budget for a streamed MoE model on
     /// CUDA. Absent = min(2 GiB, 25% free VRAM) when streaming on CUDA;
     /// `0` disables. Ignored on CPU and for resident loads.
@@ -127,7 +131,7 @@ fn opts_init() -> Opts {
 /// Options that take a value.
 const VALUE_FLAGS: &[&str] = &[
     "--budget", "--vram-cache", "--ctx", "-n", "--top-k", "--seed", "--temp", "--top-p",
-    "--file", "--system", "--trace-out", "--json-out",
+    "--file", "--system", "--trace-out", "--json-out", "--webgpu-gb",
 ];
 
 /// An option name, as opposed to a value: `-5` and `-.5` are numbers, and a
@@ -147,6 +151,10 @@ fn parse_opts(args: &[String], o: &mut Opts) -> Result<(), String> {
             match a {
                 "--budget" => o.budget = parse_size(v).ok_or_else(bad)?,
                 "--vram-cache" => o.vram_cache = Some(parse_size(v).ok_or_else(bad)?),
+                "--webgpu-gb" => {
+                    o.webgpu_gb = Some(v.trim().parse().map_err(|_| bad())?);
+                    o.webgpu = true;
+                }
                 "--ctx" => o.ctx = v.trim().parse().map_err(|_| bad())?,
                 "-n" => o.max_tokens = v.trim().parse().map_err(|_| bad())?,
                 "--top-k" => o.top_k = v.trim().parse().map_err(|_| bad())?,
@@ -169,6 +177,7 @@ fn parse_opts(args: &[String], o: &mut Opts) -> Result<(), String> {
             "--raw" => o.raw = true,
             "--stats" => o.stats = true,
             "--cuda" => o.cuda = true,
+            "--webgpu" => o.webgpu = true,
             _ if is_flag(a) => return Err(format!("unknown option {a}")),
             _ if o.pos.len() < 2 => o.pos.push(a.to_string()),
             _ => return Err(format!("unexpected argument {a:?}")),
@@ -262,6 +271,26 @@ pub(crate) struct LlamaBackend {
 }
 
 fn llama_backend(o: &Opts) -> Result<LlamaBackend, String> {
+    if o.webgpu {
+        if o.cuda {
+            return Err("--webgpu and --cuda are alternatives; pick one".into());
+        }
+        #[cfg(feature = "webgpu")]
+        {
+            let b = ggml_rs_wgpu::WgpuBackend::new(o.webgpu_gb.map(|g| g << 30)).map_err(|e| format!("webgpu init: {e}"))?;
+            if !o.quiet {
+                let a = b.adapter();
+                eprintln!("nrob: WebGPU on {} ({}, {}), weights up to {} GiB", a.name, a.backend, a.device_type, b.usage().1 >> 30);
+            }
+            return Ok(LlamaBackend {
+                backend: Arc::new(b),
+                #[cfg(feature = "cuda")]
+                cuda: None,
+            });
+        }
+        #[cfg(not(feature = "webgpu"))]
+        return Err("--webgpu needs a WebGPU build: cargo build --release -p nrob-cli --features webgpu".into());
+    }
     if !o.cuda {
         return Ok(LlamaBackend {
             backend: ggml_rs::default_backend(),
@@ -394,8 +423,13 @@ fn open_model(o: &Opts) -> Result<Model, i32> {
         eprintln!("{m}");
         1
     })?;
-    if o.cuda && !o.quiet {
+    if (o.cuda || o.webgpu) && !o.quiet {
         eprintln!("nrob: backend {}", model.backend().name());
+        #[cfg(feature = "webgpu")]
+        if let Some(w) = model.backend().as_any().downcast_ref::<ggml_rs_wgpu::WgpuBackend>() {
+            let (used, budget) = w.usage();
+            eprintln!("nrob: {} of weights on the GPU (budget {}); the rest runs on the CPU", human(used), human(budget));
+        }
     }
     if let Some(shared) = model.stream_shared() {
         if !o.quiet {
@@ -842,11 +876,14 @@ fn help() {
          \n\
          options: -n N  --temp F  --top-p F  --top-k N  --seed N  --ctx N\n\
          \x20        --system TEXT  --raw  --stats  -q  --json\n\
-         \x20        --budget N  --cuda  --vram-cache N  --trace-out F\n\
+         \x20        --budget N  --cuda  --webgpu  --vram-cache N  --trace-out F\n\
          \x20 --budget 24G   stream a MoE model's experts from the .gguf through\n\
          \x20                a RAM cache, keeping resident weights + cache under\n\
          \x20                24 GB (default: load everything)\n\
          \x20 --cuda         run on CUDA device 0 (build with --features cuda)\n\
+         \x20 --webgpu       quantized matmuls on any WebGPU adapter (D3D12, Vulkan,\n\
+         \x20                Metal), the rest on the CPU (build with --features\n\
+         \x20                webgpu); --webgpu-gb N caps the weights it holds\n\
          \x20 --vram-cache N VRAM expert cache for a streamed model on CUDA\n\
          \x20                (0 disables; default min(2 GiB, 25% free VRAM))\n\
          \x20 --raw          plain continuation, no chat template (the default\n\

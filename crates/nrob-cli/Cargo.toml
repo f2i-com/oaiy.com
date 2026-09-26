@@ -20,9 +20,13 @@ tokenizer = { path = "../tokenizer" }
 # CUDA backend for `nrob run --cuda`, behind the `cuda` feature. cudarc
 # links CUDA dynamically; the default build needs no CUDA toolchain.
 ggml-rs-cuda = { path = "../ggml-rs-cuda", optional = true }
+# WebGPU backend for `nrob run --webgpu`, behind the `webgpu` feature: any
+# D3D12/Vulkan/Metal GPU, no CUDA toolkit.
+ggml-rs-wgpu = { path = "../ggml-rs-wgpu", optional = true }
 
 [features]
 default = []
 # GPU inference: `nrob run model.gguf --cuda`. Needs the CUDA toolkit at
 # build time.
 cuda = ["llama-rs/cuda", "dep:ggml-rs-cuda"]
+webgpu = ["dep:ggml-rs-wgpu"]

@@ -9,6 +9,7 @@
 use rayon::prelude::*;
 
 use crate::backend::{Backend, RopeType};
+use crate::quantized::QuantizedTensor;
 use crate::tensor::Tensor;
 
 #[derive(Debug, Default)]
@@ -68,12 +69,86 @@ impl Backend for CpuBackend {
             y.par_chunks_mut(out)
                 .enumerate()
                 .for_each(|(bi, row)| body(bi, row));
+        } else if out >= 256 {
+            // VENDORED-LOCAL: decode feeds one row; split the outputs instead
+            // (a tied 128k-vocab head is a second of single-thread work a
+            // token). Same products in the same order, so the same bits.
+            for bi in 0..b {
+                let xb = &xd[bi * in_..(bi + 1) * in_];
+                y[bi * out..(bi + 1) * out].par_chunks_mut(64).enumerate().for_each(|(ci, ys)| {
+                    for (j, yo) in ys.iter_mut().enumerate() {
+                        let o = ci * 64 + j;
+                        let wo = &wd[o * in_..(o + 1) * in_];
+                        let mut acc = 0.0f32;
+                        for i in 0..in_ {
+                            acc += xb[i] * wo[i];
+                        }
+                        *yo = acc;
+                    }
+                });
+            }
         } else {
             for (bi, row) in y.chunks_mut(out).enumerate() {
                 body(bi, row);
             }
         }
 
+        let mut shape = x.shape().to_vec();
+        *shape.last_mut().unwrap() = out;
+        Tensor::from_vec(y, shape)
+    }
+
+    // VENDORED-LOCAL: quantized projections without a whole-matrix dequantize.
+    // The trait default inflates the entire weight to F32 on every call (and
+    // `linear` then runs one thread while fewer than 16 rows come in, i.e. every
+    // decode step). This dequantizes one weight row at a time per worker, dots
+    // it with each input row, and splits the output rows across threads. The
+    // per-element products and their order match `linear`'s, so results are
+    // the same bits; the WebGPU backend relies on it for weights left on the host.
+    fn linear_q(&self, x: &Tensor, w: &QuantizedTensor) -> Tensor {
+        let dtype = w.dtype();
+        let in_ = x.dim(x.rank() - 1);
+        let fused = !w.is_device()
+            && w.rank() == 2
+            && w.dim(1) == in_
+            && ggml_quants::is_supported(dtype)
+            && in_ % dtype.block_size() == 0;
+        if !fused {
+            let host = if w.is_device() { w.to_host() } else { w.clone() };
+            let mut dense = vec![0.0f32; host.numel()];
+            ggml_quants::dequantize(dtype, host.bytes(), &mut dense).expect("linear_q: dequantize failed");
+            return self.linear(x, &Tensor::from_vec(dense, host.shape().to_vec()));
+        }
+        let out = w.dim(0);
+        let row_bytes = in_ / dtype.block_size() * dtype.type_size();
+        let bytes = w.bytes();
+        let m = x.numel() / in_;
+        let xd = x.data();
+        // Output rows per task: enough work to amortize the scheduling.
+        const ROWS: usize = 16;
+        let mut yt = vec![0.0f32; out * m]; // [out, m]
+        yt.par_chunks_mut(m * ROWS).enumerate().for_each(|(ci, chunk)| {
+            let mut row = vec![0.0f32; in_];
+            for (ri, ys) in chunk.chunks_mut(m).enumerate() {
+                let o = ci * ROWS + ri;
+                ggml_quants::dequantize(dtype, &bytes[o * row_bytes..(o + 1) * row_bytes], &mut row)
+                    .expect("linear_q: dequantize failed");
+                for (bi, y) in ys.iter_mut().enumerate() {
+                    let xb = &xd[bi * in_..(bi + 1) * in_];
+                    let mut acc = 0.0f32;
+                    for i in 0..in_ {
+                        acc += xb[i] * row[i];
+                    }
+                    *y = acc;
+                }
+            }
+        });
+        let mut y = vec![0.0f32; m * out];
+        for o in 0..out {
+            for bi in 0..m {
+                y[bi * out + o] = yt[o * m + bi];
+            }
+        }
         let mut shape = x.shape().to_vec();
         *shape.last_mut().unwrap() = out;
         Tensor::from_vec(y, shape)
@@ -310,6 +385,32 @@ mod tests {
     use super::*;
 
     fn approx_eq(a: f32, b: f32, eps: f32) -> bool { (a - b).abs() < eps }
+
+    #[test]
+    fn fused_quantized_linear_matches_dequantize_then_linear_exactly() {
+        // VENDORED-LOCAL: the fused path must give the default path's bits.
+        let (rows, k) = (37, 64);
+        let mut bytes = vec![0u8; rows * (k / 32) * 34];
+        let mut s = 0x1234_5678u32;
+        for b in bytes.iter_mut() {
+            s ^= s << 13;
+            s ^= s >> 17;
+            s ^= s << 5;
+            *b = s as u8;
+        }
+        for blk in bytes.chunks_mut(34) {
+            blk[0..2].copy_from_slice(&0x2000u16.to_le_bytes()); // f16 scale ~0.0078
+        }
+        let w = QuantizedTensor::from_bytes_cpu(bytes.clone(), vec![rows, k], ggml_quants::GgmlType::Q8_0);
+        let mut dense = vec![0.0f32; rows * k];
+        ggml_quants::dequantize(ggml_quants::GgmlType::Q8_0, &bytes, &mut dense).unwrap();
+        let dense = Tensor::from_vec(dense, vec![rows, k]);
+        let cpu = CpuBackend::new();
+        for m in [1, 3, 20] {
+            let x = Tensor::from_vec((0..m * k).map(|i| (i as f32 * 0.37).sin()).collect(), vec![m, k]);
+            assert_eq!(cpu.linear_q(&x, &w).data(), cpu.linear(&x, &dense).data(), "m={m}");
+        }
+    }
 
     #[test]
     fn linear_basic() {

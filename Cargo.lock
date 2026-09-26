@@ -1432,6 +1432,7 @@ version = "0.7.0"
 dependencies = [
  "ggml-rs",
  "ggml-rs-cuda",
+ "ggml-rs-wgpu",
  "gguf",
  "llama-rs",
  "nrob",
