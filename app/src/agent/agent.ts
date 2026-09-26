@@ -11,7 +11,8 @@ import type { Vfs } from '../vfs/vfs';
 import { AIProviderError } from './providers/aiProvider';
 import type { ProviderConfig } from './providers/types';
 import { sendTurn, type Attachment, type Reply, type ToolCall, type ToolResult, type Turn, type Usage } from './protocol';
-import { TOOLS, runTool, type ToolContext } from './tools';
+import { TOOLS, checkApp, runTool, type SoftnHost, type ToolContext } from './tools';
+import { appLabel, findApps, resolveApp } from '../softn/softn';
 import type { ImagePart } from './images';
 
 export type AgentEvent =
@@ -22,12 +23,16 @@ export type AgentEvent =
   | { type: 'tool_result'; result: ToolResult }
   | { type: 'status'; message: string }
   | { type: 'usage'; usage: Usage }
+  /** The automatic check of a SoftN app after the agent changed it: running, then its outcome. */
+  | { type: 'check'; id: string; root: string; state: 'running' | 'ok' | 'failed'; text?: string }
   | { type: 'done'; text: string; steps: number }
   | { type: 'error'; message: string };
 
 export const MAX_STEPS = 60;
 const TRIM_OVER_CHARS = 240_000;
 const KEEP_RECENT_TURNS = 8;
+/** The same automatic-check errors this many times in a row stop the run. */
+const SAME_CHECK_LIMIT = 3;
 /** Images stay in the conversation for this many image-bearing turns. */
 const KEEP_IMAGE_TURNS = 3;
 
@@ -38,7 +43,7 @@ The user's project lives in a virtual filesystem in the browser; "/" is the proj
 - edit_file for changes to existing files (exact, unique matches), write_file for new files or full rewrites.
 - code_run to compute, test ideas, or process data in JavaScript or Python (a Zipp VM sandbox in a Web Worker).
 - sandbox_shell for shell-style work (an emulated POSIX shell on the same sandbox). There is no real operating system: git, npm, pip, compilers and other native programs do not exist. Do not pretend to run them.
-- SoftN apps: a SoftN app is a folder whose manifest.json names a .ui page as "main" (with ui/*.ui pages and logic/*.logic or .py). A project can hold several, each in its own folder: to rebuild or learn from an existing app, read its files and write the new one in another folder. A .softn the user attaches is unpacked into its own folder (the original stays in uploads/, and softn_import unpacks any .softn in the project): when they ask for changes, edit that folder; when they ask to recreate, redo or base something on it, write a new app in a new folder and leave the original as it is. The SoftN reference is in your tools, so do not guess the language: softn_docs with no arguments gives the map, topic "guide" is the writing guide (read it before your first app), search finds how something is done across the guides, the components and the example apps; softn_components gives exact props and events; softn_examples has complete working apps to read or copy. Keep manifest.json true, and run softn_check (naming the app folder when there are several) after each change: the user watches that app in a live preview as you build it, and can export any app folder as a .softn file.
+- SoftN apps: a SoftN app is a folder whose manifest.json names a .ui page as "main" (with ui/*.ui pages and logic/*.logic or .py). A project can hold several, each in its own folder: to rebuild or learn from an existing app, read its files and write the new one in another folder. A .softn the user attaches is unpacked into its own folder (the original stays in uploads/, and softn_import unpacks any .softn in the project): when they ask for changes, edit that folder; when they ask to recreate, redo or base something on it, write a new app in a new folder and leave the original as it is. The SoftN reference is in your tools, so do not guess the language: softn_docs with no arguments gives the map, topic "guide" is the writing guide (read it before your first app), search finds how something is done across the guides, the components and the example apps; softn_components gives exact props and events; softn_examples has complete working apps to read or copy. Keep manifest.json true. After each step that changes an app, bot.computer checks it automatically (its files, then a real render) and adds the outcome to that step's result: when it reports errors, fix them before anything else. softn_check checks on demand; softn_inspect shows what the page displays; softn_interact uses the app like a person (click, fill, select, press keys) and reports errors the app raises, so test that the app works, not just that it renders. The user watches the app in a live preview as you build it, and can export any app folder as a .softn file.
 - web_fetch, curl, fetch() go through the user's network gate (/internet) and, from a browser, only reach sites that allow cross-origin requests. If the gate refuses a host, say so; the user decides whether to allow it.
 
 Work in small, verified steps. Prefer running code to check a claim over guessing. When you are done, say briefly what you changed and what you verified.`;
@@ -49,8 +54,8 @@ export interface AgentOptions {
   provider: () => ProviderConfig | null;
   /** A short description of the project, given to the model with the first request. */
   projectSummary: () => string;
-  /** The live SoftN preview, for softn_check. */
-  softn?: { check(root?: string): Promise<import('../softn/preview').PreviewResult> };
+  /** The live SoftN preview: softn_check, softn_inspect, softn_interact and the automatic check. */
+  softn?: SoftnHost;
 }
 
 function estimateChars(turns: Turn[]): number {
@@ -119,6 +124,52 @@ export class Agent {
     this.toolContext.shell = { cwd: '/', env: {} };
   }
 
+  /** Apps whose last check failed, with what it said: the run is not done while any are here. */
+  readonly failingApps = new Map<string, string>();
+  private sameCheck = { signature: '', count: 0 };
+
+  /**
+   * After a step: check each SoftN app the step changed, unless the step
+   * already ran softn_check on it after its last change. The outcome goes
+   * into the step's last result, where every provider carries it.
+   */
+  private async autoCheck(calls: ToolCall[], results: ToolResult[], changes: Array<{ path: string; index: number }>, emit: (e: AgentEvent) => void): Promise<string | null> {
+    if (!changes.length) return null;
+    const vfs = this.options.vfs;
+    const apps = findApps(vfs);
+    const rootOf = (path: string) => apps.filter((r) => r === '' || path === r || path.startsWith(`${r}/`)).sort((a, b) => b.length - a.length)[0];
+    const lastChange = new Map<string, number>();
+    for (const change of changes) {
+      const root = rootOf(change.path);
+      if (root !== undefined) lastChange.set(root, Math.max(lastChange.get(root) ?? -1, change.index));
+    }
+    const lastCheck = new Map<string, number>();
+    calls.forEach((call, index) => {
+      if (call.name !== 'softn_check') return;
+      const target = resolveApp(vfs, call.input.app);
+      if (target.ok) lastCheck.set(target.root, index);
+    });
+    let stop: string | null = null;
+    for (const [root, changed] of lastChange) {
+      if ((lastCheck.get(root) ?? -1) > changed) continue;
+      const id = `check-${Date.now()}-${root}`;
+      emit({ type: 'check', id, root, state: 'running' });
+      const check = await checkApp(this.toolContext, root);
+      emit({ type: 'check', id, root, state: check.ok ? 'ok' : 'failed', text: check.text });
+      const last = results[results.length - 1];
+      last.content += `\n\n[Automatic check of ${appLabel(root)} after this step]\n${check.text}${check.ok ? '' : '\nFix these errors before going on (read the files involved; softn_docs search helps).'}`;
+      if (check.ok) {
+        this.failingApps.delete(root);
+        this.sameCheck = { signature: '', count: 0 };
+        continue;
+      }
+      this.failingApps.set(root, check.text);
+      this.sameCheck = check.signature === this.sameCheck.signature ? { signature: check.signature, count: this.sameCheck.count + 1 } : { signature: check.signature, count: 1 };
+      if (this.sameCheck.count >= SAME_CHECK_LIMIT) stop = `The same errors in ${appLabel(root)} came back ${SAME_CHECK_LIMIT} times after the agent's fixes, so the run stopped rather than keep trying the same thing. Say "continue" to let it try again, or say how to fix it.`;
+    }
+    return stop;
+  }
+
   /** False once the model has refused images: they are left out from then on. */
   private imagesAccepted = true;
 
@@ -174,6 +225,13 @@ export class Agent {
     this.turns.push({ role: 'user', text, ...(images.length ? { images } : {}), ...(attachments.length ? { attachments } : {}) });
     let failures = 0;
     let lastFailure = '';
+    // What each step changes, by the index of the call that changed it.
+    let callIndex = -1;
+    let changes: Array<{ path: string; index: number }> = [];
+    const unwatch = this.options.vfs.onChange((change) => {
+      if (change.type !== 'reset') changes.push({ path: change.path.replace(/^\/+/, ''), index: callIndex });
+    });
+    this.sameCheck = { signature: '', count: 0 };
     try {
       for (let step = 1; step <= MAX_STEPS; step++) {
         signal?.throwIfAborted();
@@ -186,8 +244,10 @@ export class Agent {
           return;
         }
         const results: ToolResult[] = [];
-        for (const call of reply.calls) {
+        changes = [];
+        for (const [index, call] of reply.calls.entries()) {
           signal?.throwIfAborted();
+          callIndex = index;
           emit({ type: 'tool_call', call });
           const result = await runTool(call, this.toolContext);
           results.push(result);
@@ -196,7 +256,13 @@ export class Agent {
           else failures = result.isError ? 1 : 0;
           lastFailure = result.isError ? result.content : '';
         }
+        callIndex = reply.calls.length;
+        const stop = await this.autoCheck(reply.calls, results, changes, emit);
         this.turns.push({ role: 'tool', results });
+        if (stop) {
+          emit({ type: 'error', message: stop });
+          return;
+        }
         if (failures >= 3) {
           emit({ type: 'error', message: 'The same step failed three times in a row, so the run stopped. Say how to proceed.' });
           return;
@@ -215,6 +281,7 @@ export class Agent {
         this.turns.push({ role: 'tool', results: last.calls.map((c) => ({ id: c.id, name: c.name, content: 'Error: the run stopped before this tool ran', isError: true })) });
       }
     } finally {
+      unwatch();
       this.running = false;
     }
   }

@@ -1,4 +1,5 @@
 import { defineConfig } from 'vitest/config';
+import { installBridge } from './scripts/softn-bridge/install.mjs';
 
 // The sandbox blocks a Worker on SharedArrayBuffer + Atomics.wait while the
 // page answers its host calls, which needs a cross-origin isolated page.
@@ -13,6 +14,10 @@ const isolation = {
 // loads from /softn/ is a cross-origin fetch from its point of view.
 const softnHeaders = {
   name: 'softn-runtime-headers',
+  // The runtime in public/softn/ gets bot.computer's bridge (errors, inspect, act).
+  buildStart() {
+    installBridge('public/softn');
+  },
   configureServer(server: { middlewares: { use: (fn: (req: { url?: string }, res: { setHeader: (k: string, v: string) => void }, next: () => void) => void) => void } }) {
     server.middlewares.use(softnMiddleware);
   },

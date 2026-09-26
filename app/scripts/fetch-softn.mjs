@@ -17,6 +17,7 @@ import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { installBridge } from './softn-bridge/install.mjs';
 import { unzipSync } from 'fflate';
 
 const RELEASE = 'v0.0.17';
@@ -41,6 +42,7 @@ function installed() {
 
 async function main() {
   if (process.argv.includes('--ensure') && installed()) {
+    installBridge(out);
     console.log(`SoftN runtime ${RELEASE} is installed in public/softn/`);
     return;
   }
@@ -69,6 +71,7 @@ async function main() {
     count++;
     bytes += data.byteLength;
   }
+  installBridge(out);
   writeFileSync(stamp, JSON.stringify({ release: RELEASE, zip: ZIP, zip_sha256: ZIP_SHA256, files: count, bytes }, null, 2));
   console.log(`installed the SoftN runtime ${RELEASE} into public/softn/ (${count} files, ${(bytes / 1e6).toFixed(1)} MB)`);
 }

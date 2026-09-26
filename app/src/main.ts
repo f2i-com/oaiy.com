@@ -123,6 +123,17 @@ async function main(): Promise<void> {
   const editor = new EditorPane(null as unknown as Vfs);
   const terminal = new TerminalPane(null as unknown as Vfs, gate);
   const preview = new SoftnPreview(null as unknown as Vfs, () => project?.meta.id ?? 'none');
+  // An error while the person uses the app: one click asks the agent to fix it.
+  preview.onFix = (root, problems) => {
+    if (controller) {
+      chat.system('The agent is busy; ask again when it has finished.', 'error');
+      return false;
+    }
+    const list = problems.slice(-8).map((p) => `- ${p.message}`).join('\n');
+    void submit(`The SoftN app in ${appLabel(root)} reported ${problems.length === 1 ? 'this error' : 'these errors'} while I was using it (from the running app):\n${list}\n\nFind the cause in its files and fix it, then check the app again (softn_interact can repeat what I was doing).`);
+    showView('agent');
+    return true;
+  };
 
   const projectSelect = h('select.project-select', { title: 'Project' });
   // The chip is the gate's switch: on (open) ⇄ off (blocked). Allowlists and
@@ -325,7 +336,15 @@ async function main(): Promise<void> {
         prompt = `${text || 'I attached some files.'}\n\n[Attached and saved in the project: ${received.notes.join('; ')}]`;
       }
       chat.user(text, attachments);
-      await agent.run(prompt, (event) => chat.event(event), controller.signal, images, attachments);
+      // The first check of a run brings the preview forward, so the person sees the app being built.
+      let previewShown = false;
+      await agent.run(prompt, (event) => {
+        chat.event(event);
+        if (event.type === 'check' && event.state === 'running' && !previewShown) {
+          previewShown = true;
+          if (!window.matchMedia('(max-width: 900px)').matches) showPane('preview');
+        }
+      }, controller.signal, images, attachments);
     } finally {
       controller = null;
       chat.setBusy(false);

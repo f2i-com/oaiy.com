@@ -13,7 +13,7 @@ import { runInSandbox } from '../sandbox/runner';
 import { VfsError, normalizePath, type Vfs } from '../vfs/vfs';
 import type { ToolCall, ToolResult, ToolSpec } from './protocol';
 import { appLabel, checkProject, describeApp, findApps, formatFindings, guideFor, importSoftn, logicSyntax, resolveApp } from '../softn/softn';
-import type { PreviewResult } from '../softn/preview';
+import type { PageReport, PreviewAction, PreviewResult } from '../softn/preview';
 import { describeExample, docsMap, installExample, listExamples, lookupComponents, readTopic, searchKnowledge } from '../softn/knowledge';
 import { DEFAULT_VIEW_SIZE, MAX_VIEW_SIZE, imageMimeFor, imageSize, viewImage, type ImagePart } from './images';
 
@@ -26,6 +26,13 @@ const OUTPUT_CHARS = 30_000;
 const DEFAULT_TIMEOUT_S = 30;
 const MAX_TIMEOUT_S = 300;
 
+/** The live SoftN preview, as the tools use it. */
+export interface SoftnHost {
+  check(root?: string): Promise<PreviewResult>;
+  inspect(root?: string): Promise<PageReport>;
+  act(root: string | undefined, actions: PreviewAction[]): Promise<PageReport>;
+}
+
 export interface ToolContext {
   vfs: Vfs;
   gate: NetGate;
@@ -34,7 +41,7 @@ export interface ToolContext {
   /** The emulated shell's state, kept between calls. */
   shell: { cwd: string; env: Record<string, string> };
   /** The live SoftN preview, when the page has one. */
-  softn?: { check(root?: string): Promise<PreviewResult> };
+  softn?: SoftnHost;
   signal?: AbortSignal;
 }
 
@@ -185,6 +192,23 @@ export const TOOLS: ToolSpec[] = [
     name: 'softn_check',
     description: 'Check a SoftN app: its files (manifest.json, listed files, JSON, permissions, logic syntax) and a real render in the live preview, which switches to show it, returning load and render errors. Run it after every change to a SoftN app, and fix what it reports. With several apps in the project, name the one with `app` (its folder; "/" for the project root).',
     parameters: { type: 'object', properties: { app: { ...str, description: 'The app\'s folder, e.g. "apps/tasks"; optional when the project has one app' } } },
+  },
+  {
+    name: 'softn_inspect',
+    description: 'Describe what a SoftN app shows in the live preview right now, as text: headings, text, buttons, inputs with their values, checkboxes, selects, links, images and canvases, plus any errors the app reported. Use it to confirm the page looks as intended.',
+    parameters: { type: 'object', properties: { app: { ...str, description: 'The app\'s folder; optional when the project has one app' } } },
+  },
+  {
+    name: 'softn_interact',
+    description:
+      'Use a SoftN app in the live preview the way a person would, to test that it works: a list of actions, run in order, then the page as text and any errors the app raised. ' +
+      'Actions: {"click": "<button or link text or label>"}, {"fill": "<input label or placeholder>", "value": "..."}, {"select": "<select label>", "value": "<option>"}, {"key": "Enter" | "ArrowUp" | "a" …}, {"wait": 500}. Add "nth": 2 to pick the second match. ' +
+      'State carries over between calls until the app is changed or re-rendered.',
+    parameters: {
+      type: 'object',
+      required: ['actions'],
+      properties: { app: { ...str, description: 'The app\'s folder; optional when the project has one app' }, actions: { type: 'array', items: { type: 'object' } } },
+    },
   },
   {
     name: 'softn_import',
@@ -541,18 +565,21 @@ async function execute(call: ToolCall, ctx: ToolContext): Promise<string> {
         const findings = checkProject(vfs, normalizePath(root));
         return `Not a SoftN app yet: ${target.reason}\nFiles in ${root}: ${formatFindings(findings)}`;
       }
-      const root = target.root;
-      const findings = [...checkProject(vfs, root), ...(await logicSyntax(vfs, root).catch(() => []))];
-      const lines = [`App: ${appLabel(root)}`, `Files: ${formatFindings(findings)}`];
-      if (findings.some((f) => f.level === 'error')) {
-        lines.push('Render: skipped until the file errors above are fixed.');
-      } else if (!ctx.softn) {
-        lines.push('Render: no live preview in this session.');
-      } else {
-        const result = await ctx.softn.check(root);
-        lines.push(result.ok ? 'Render: the app loaded and rendered without reported errors (the user sees it in the preview).' : `Render errors:\n${result.errors.map((e) => `- ${e}`).join('\n')}`);
-      }
-      return lines.join('\n');
+      return (await checkApp(ctx, target.root)).text;
+    }
+    case 'softn_inspect': case 'softn_interact': {
+      const target = resolveApp(vfs, input.app);
+      if (!target.ok) throw new Error(target.reason);
+      if (!ctx.softn) throw new Error('there is no live preview in this session');
+      const report = call.name === 'softn_inspect' ? await ctx.softn.inspect(target.root) : await ctx.softn.act(target.root, Array.isArray(input.actions) ? (input.actions as PreviewAction[]) : []);
+      const lines = [`App: ${appLabel(target.root)}`];
+      if (report.done?.length) lines.push(`Done: ${report.done.join('; ')}`);
+      if (report.error) lines.push(`Could not: ${report.error}`);
+      lines.push(formatProblems(report.problems) || 'Errors: none reported.');
+      lines.push('The page now shows:', report.page || '(nothing)');
+      const text = cut(lines.join('\n'));
+      if (report.error || report.problems.some((p) => p.level === 'error')) throw new Error(text);
+      return text;
     }
     case 'present_file': {
       const path = normalizePath(need(input, 'path'));
@@ -589,6 +616,40 @@ function htmlToText(html: string): string {
   } catch {
     return html.replace(/<script[\s\S]*?<\/script>|<style[\s\S]*?<\/style>/gi, '').replace(/<[^>]+>/g, ' ').replace(/\s+\n/g, '\n');
   }
+}
+
+function formatProblems(problems: PageReport['problems']): string {
+  if (!problems.length) return '';
+  const errors = problems.filter((p) => p.level === 'error');
+  const warnings = problems.filter((p) => p.level === 'warning');
+  return [
+    errors.length ? `Errors the app raised (from the running app):\n${errors.slice(0, 8).map((p) => `- ${p.message}`).join('\n')}` : '',
+    warnings.length ? `Warnings:\n${warnings.slice(0, 8).map((p) => `- ${p.message}`).join('\n')}` : '',
+  ].filter(Boolean).join('\n');
+}
+
+/**
+ * Check a SoftN app: the files (manifest, listed files, JSON, permissions,
+ * logic syntax) and a real render in the live preview. Used by softn_check
+ * and by the automatic check after the agent changes an app.
+ */
+export async function checkApp(ctx: ToolContext, root: string): Promise<{ ok: boolean; text: string; signature: string }> {
+  const findings = [...checkProject(ctx.vfs, root), ...(await logicSyntax(ctx.vfs, root).catch(() => []))];
+  const lines = [`App: ${appLabel(root)}`, `Files: ${formatFindings(findings)}`];
+  const problems: string[] = findings.filter((f) => f.level === 'error').map((f) => `${f.file}: ${f.message}`);
+  if (problems.length) {
+    lines.push('Render: skipped until the file errors above are fixed.');
+  } else if (!ctx.softn) {
+    lines.push('Render: no live preview in this session.');
+  } else {
+    const result = await ctx.softn.check(root);
+    problems.push(...result.errors);
+    lines.push(result.ok ? 'Render: the app loaded and rendered without reported errors (the user sees it in the preview).' : `Render errors:\n${result.errors.map((e) => `- ${e}`).join('\n')}`);
+    if (result.warnings?.length) lines.push(`Warnings while it loaded (often a handler or name the logic does not define):\n${[...new Set(result.warnings)].slice(0, 8).map((w) => `- ${w}`).join('\n')}`);
+  }
+  // The same errors again mean the fixes are not working.
+  const signature = problems.map((p) => p.replace(/\d+/g, '#')).sort().join('|');
+  return { ok: !problems.length, text: lines.join('\n'), signature };
 }
 
 export async function runTool(call: ToolCall, ctx: ToolContext): Promise<ToolResult> {

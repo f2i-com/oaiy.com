@@ -21,7 +21,8 @@ function summarizeCall(call: ToolCall): string {
     case 'web_fetch': return s('url');
     case 'present_file': case 'view_image': case 'file_info': case 'search_file': return s('path');
     case 'softn_import': return s('path');
-    case 'softn_check': return s('app');
+    case 'softn_check': case 'softn_inspect': return s('app');
+    case 'softn_interact': return Array.isArray(i.actions) ? i.actions.map((a) => Object.entries(a as Record<string, unknown>).filter(([k]) => k !== 'nth').map(([k, v]) => (k === 'value' ? `"${v}"` : `${k} ${typeof v === 'string' ? `"${v}"` : v}`)).join(' ')).join(', ') : '';
     case 'softn_docs': return s('search') ? `search: ${s('search')}` : s('topic') || s('section') || 'map';
     case 'softn_components': return Array.isArray(i.names) ? i.names.join(', ') : s('names');
     case 'softn_examples': return [s('name'), s('file'), s('install_to') && `→ ${s('install_to')}`].filter(Boolean).join(' ') || 'list';
@@ -217,6 +218,30 @@ export class ChatPane {
     this.scroll();
   }
 
+  /** The automatic check after the agent changed an app: a card like a tool's. */
+  private checkCard(e: Extract<AgentEvent, { type: 'check' }>): void {
+    if (e.state === 'running') {
+      this.current = null;
+      this.thinking = null;
+      this.setStatus(`checking ${e.root || 'the app'}…`);
+      const card = h('details.tool.auto', h('summary', h('span.tool-name', 'automatic check'), ' ', h('span.tool-arg', e.root ? `${e.root}/` : '/')), h('pre.tool-result', 'checking the files and rendering the app…'));
+      card.classList.add('pending');
+      this.cards.set(e.id, card);
+      this.log.append(card);
+      this.scroll();
+      return;
+    }
+    const card = this.cards.get(e.id);
+    if (!card) return;
+    card.classList.remove('pending');
+    card.classList.add(e.state === 'ok' ? 'ok' : 'failed');
+    const pre = card.querySelector('.tool-result');
+    if (pre) pre.textContent = e.text ?? '';
+    // A failed check is worth seeing without a click: the agent fixes it next.
+    if (e.state === 'failed') (card as HTMLDetailsElement).open = true;
+    this.scroll();
+  }
+
   private toolResult(result: ToolResult): void {
     const card = this.cards.get(result.id);
     if (!card) return;
@@ -265,6 +290,9 @@ export class ChatPane {
         this.setStatus(e.message);
         break;
       case 'usage':
+        break;
+      case 'check':
+        this.checkCard(e);
         break;
       case 'done':
         this.current = null;

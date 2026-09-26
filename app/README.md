@@ -33,7 +33,12 @@ bot.computer can build [SoftN](https://github.com/f2i-com/softn.com) apps and sh
   - `softn_examples` lists, reads or installs complete apps from softn.com's catalogue: notes, a 2048 game, a component showcase, 3D, WebGPU and device permissions.
   - All of this is bundled for offline use. Regenerate it with `npm run softn:knowledge`.
 - **Live preview:** the **App preview** tab renders the app with SoftN's hosted runtime, in a sandboxed opaque-origin iframe with its own strict CSP. It re-renders about 0.7 s after edits settle.
-- **Errors:** load and render errors are reported, and `.logic` syntax errors are caught by compiling the logic on Zipp.
+- **Errors the agent sees and fixes:**
+  - After every agent step that changes an app, bot.computer checks it: the files (manifest, listed files, `.logic` syntax compiled on Zipp), then a real render. The outcome goes into that step's result, so the agent fixes what's broken before going on. You see each check as a card in the chat.
+  - If the same errors come back three times in a row, the run stops rather than loop.
+  - A small bridge in the preview frame (`scripts/softn-bridge/`, installed into the runtime by `npm run fetch:softn` and by the dev server and build) reports errors the running app raises, like a handler throwing when you click.
+  - If the app raises an error while you're using it, a banner appears over the preview. **Fix with agent** sends the errors to the agent.
+- **Testing like a person:** `softn_inspect` describes what the page shows as text (headings, text, buttons, inputs and their values). `softn_interact` clicks, fills, selects and presses keys in the running app, then describes the result, so the agent can check that the app actually works.
 - **Export:** **Export .softn** (or `/softn export [folder]`) downloads an app as a `.softn` file. That's a flat zip with `manifest.json` at its root, and the manifest's `main`, `version` and `files` are filled in from the files actually present.
 - **Several apps per project:** any folder whose `manifest.json` has a `.ui` `main` is an app. The preview has a picker, and `/softn new <folder>`, `/softn check <folder>`, `/softn export <folder>` and `/softn apps` take a folder. **Import .softn…** (or attaching a `.softn` in the chat) unpacks an app into a folder, so the agent can read an existing app and recreate or change it in another folder. `softn_check` takes the app's folder and switches the preview to it.
 
@@ -94,12 +99,6 @@ npm run test:e2e   # headless Chrome: the sandbox (tests/e2e/run.mjs) and the wh
 
 The end-to-end tests use a local Chrome or Edge (`CHROME=<path>` to choose one).
 
-## Credits
-
-- The provider layer (`src/agent/providers/`) is adapted from [softn.com](https://github.com/f2i-com/softn.com)'s Studio (Apache-2.0).
-- The guest runtime and shell come from [coder-cli](https://github.com/f2i-com/coder-cli).
-- The engine is [Zipp](https://github.com/f2i-com/zipp.org) (Apache-2.0).
-
-See [NOTICE](NOTICE).
+## License
 
 Licensed under the Apache License, Version 2.0.

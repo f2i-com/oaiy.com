@@ -23,6 +23,16 @@ const script = [
   { calls: [{ name: 'edit_file', input: { path: 'ui/main.ui', old_string: '<Heading level={1}>Groceries</Heading>', new_string: '<Heading level={1}>Shopping list</Heading>' } }] },
   { calls: [{ name: 'softn_check', input: {} }] },
   { text: 'Renamed the heading and checked the app.' },
+  // "Try it": use the app like a person.
+  { calls: [{ name: 'softn_interact', input: { actions: [{ fill: 'What needs to be done?', value: 'Buy bread' }, { click: 'Add' }] } }] },
+  { text: 'Adding a task works.' },
+  // "Add a clear button": a mistake the automatic check catches, then the fix.
+  { calls: [{ name: 'read_file', input: { path: 'logic/main.logic' } }] },
+  { calls: [{ name: 'edit_file', input: { path: 'logic/main.logic', old_string: 'function remaining() {', new_string: 'function clearDone( {\n  tasks = tasks.filter((t) => !t.done)\n}\n\nfunction remaining() {' } }] },
+  { calls: [{ name: 'edit_file', input: { path: 'logic/main.logic', old_string: 'function clearDone( {', new_string: 'function clearDone() {' } }] },
+  { text: 'Added clearDone.' },
+  // "Fix with agent" from the preview.
+  { text: 'Looking at it.' },
 ];
 const model = createHttpServer((req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -161,6 +171,46 @@ try {
     expect(JSON.stringify(requests[4]).includes('rendered without reported errors'), `softn_check said: ${JSON.stringify(requests[4]).slice(-400)}`);
     await waitStatus(page, /live/, 'after the agent');
     expect((await frameText(page)).includes('Shopping list'), await frameText(page));
+  });
+
+  const toolMessages = (i) => JSON.stringify(requests[i].messages.filter((m) => m.role === 'tool'));
+  const ask = async (text, done) => {
+    await page.type('.chat-input', text);
+    await page.keyboard.press('Enter');
+    await page.waitForFunction((d) => document.querySelector('.chat-log')?.textContent.includes(d), { timeout: 90_000 }, done);
+  };
+
+  await check('the agent uses the app in the preview like a person: fills, clicks, reads the page', async () => {
+    await ask('Try adding a task.', 'Adding a task works.');
+    const result = JSON.stringify(requests[6].messages.at(-1));
+    if (process.env.DUMP) console.log(requests[6].messages.at(-1).content);
+    expect(/filled .*Buy bread/.test(result) && /clicked \[button \\"Add\\"\]/.test(result), result.slice(0, 600));
+    expect(result.includes('Buy bread') && result.includes('1 remaining') && result.includes('[button \\"Delete\\"]'), result.slice(0, 1200));
+    expect((await frameText(page)).includes('Buy bread'), 'the task is not in the preview');
+  });
+
+  await check('a mistake is caught by the automatic check after the step, and the fix is checked too', async () => {
+    await ask('Add a way to clear finished tasks.', 'Added clearDone.');
+    const broken = JSON.stringify(requests[9].messages.at(-1));
+    expect(broken.includes('[Automatic check of') && /logic\/main\.logic/.test(broken) && broken.includes('Fix these errors'), broken.slice(0, 900));
+    const fixed = JSON.stringify(requests[10].messages.at(-1));
+    expect(fixed.includes('[Automatic check of') && fixed.includes('rendered without reported errors'), fixed.slice(-600));
+    const cards = await page.$$eval('details.tool.auto', (els) => els.map((e) => e.className));
+    expect(cards.some((c) => c.includes('failed')) && cards.at(-1).includes('ok'), `cards: ${cards}`);
+  });
+
+  await check('an error while the person uses the app shows in the preview, and one click asks the agent to fix it', async () => {
+    const status = await afterRender(page, () => terminal(page, 'sed -i "s/const title = newTask.trim()/throw new Error(\\"boom from addTask\\")/" logic/main.logic'), 'throwing handler');
+    expect(/live/.test(status), status);
+    await appFrame(page).evaluate(() => [...document.querySelectorAll('button')].find((b) => b.textContent.trim() === 'Add').click());
+    await page.waitForFunction(() => !document.querySelector('.preview-problem')?.hidden, { timeout: 15_000 });
+    const banner = await page.$eval('.preview-problem', (e) => e.textContent);
+    expect(banner.includes('boom from addTask'), banner);
+    await page.click('.preview-problem button.primary');
+    await page.waitForFunction(() => document.querySelector('.chat-log')?.textContent.includes('Looking at it.'), { timeout: 60_000 });
+    const sent = JSON.stringify(requests[11].messages.at(-1));
+    expect(sent.includes('boom from addTask') && sent.includes('fix it'), sent.slice(0, 600));
+    await afterRender(page, () => terminal(page, 'sed -i "s/throw new Error(\\"boom from addTask\\")/const title = newTask.trim()/" logic/main.logic'), 'repaired');
   });
 
   await check('Export .softn downloads a flat zip with the manifest at its root', async () => {
