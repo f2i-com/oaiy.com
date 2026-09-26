@@ -1,0 +1,15 @@
+[package]
+name        = "ggml-rs-wgpu"
+version     = "0.0.1"
+edition     = "2021"
+license     = "MIT OR Apache-2.0"
+description = "WebGPU backend for ggml-rs: quantized matmuls in WGSL on any wgpu adapter, the rest on the CPU backend."
+
+[dependencies]
+ggml-rs     = { path = "../ggml-rs", version = "0.0.1" }
+ggml-quants = { path = "../ggml-quants", version = "0.0.1" }
+wgpu        = "30"
+pollster    = "0.4"
+
+[dev-dependencies]
+half = { version = "2.4" }

@@ -32,6 +32,10 @@ members = [
     # needs a CUDA toolchain (cudarc dynamic-linking), so the default build
     # stays CPU-only. Opt in with `cargo build -p nrob-cli --features cuda`.
     "crates/ggml-rs-cuda",
+    # WebGPU backend (VENDORED-LOCAL addition beside ggml-rs-cuda): quantized
+    # matmuls on any wgpu adapter for machines without CUDA. A member, not a
+    # default member: wgpu adds minutes to every default build.
+    "crates/ggml-rs-wgpu",
 ]
 default-members = [
     "crates/nrob",
