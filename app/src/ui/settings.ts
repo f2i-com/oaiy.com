@@ -8,7 +8,7 @@ import { LOCAL_SERVERS, defaultBaseUrl, listModels, type ModelInfo } from '../ag
 import type { LocalServerKind, ProviderConfig, ProviderType } from '../agent/providers/types';
 import { contextWindow, detectContextWindow, formatTokens } from '../agent/context';
 import type { AgentSettings } from '../settings';
-import { NROB_ORIGIN, discoverNrob, listMediaModels, mediaReady, mergeDiscovered, originOf, type Discovery, type MediaSettings } from '../agent/media';
+import { NROB_ORIGIN, discoverNrob, listMediaModels, mediaAbilities, mergeDiscovered, originOf, type Discovery, type MediaSettings } from '../agent/media';
 import { newId } from '../vfs/projects';
 import { clear, h } from './dom';
 
@@ -64,7 +64,7 @@ export function openSettings(initial: SettingsResult): Promise<SettingsResult | 
     let providers = initial.providers.map((p) => ({ ...p }));
     let activeId = initial.activeId;
     const agent = { ...initial.agent };
-    let media: MediaSettings = { ...initial.media, imageModels: [...initial.media.imageModels], videoModels: [...initial.media.videoModels] };
+    let media: MediaSettings = { ...initial.media, imageModels: [...initial.media.imageModels], videoModels: [...initial.media.videoModels], speechModels: [...(initial.media.speechModels ?? [])], musicModels: [...(initial.media.musicModels ?? [])] };
     let editing: ProviderConfig | null = providers.find((p) => p.id === activeId) ?? providers[0] ?? null;
     // Model lists already fetched, by server address and key, so a re-render
     // (typing a name, switching rows) does not lose them.
@@ -231,12 +231,12 @@ export function openSettings(initial: SettingsResult): Promise<SettingsResult | 
       );
     };
 
-    // Images and video: nrob (found by its discovery document) or any OpenAI-spec media service.
+    // Images, video and audio: nrob (found by its discovery document) or any OpenAI-spec media service.
     const mediaSection = h('div.agent-settings.media-settings');
     const renderMedia = () => {
       clear(mediaSection);
       const note = h('div.form-note');
-      const ready = mediaReady(media);
+      const abilities = mediaAbilities(media);
       const status = media.discovered
         ? `${media.discovered.service} ${media.discovered.version} at ${media.discovered.origin}`
         : media.baseUrl ? 'set up by hand' : 'not set up';
@@ -249,13 +249,12 @@ export function openSettings(initial: SettingsResult): Promise<SettingsResult | 
         }
       } }) as HTMLInputElement;
       const key = h('input', { type: 'password', value: media.apiKey, placeholder: 'usually none', oninput: () => { media.apiKey = key.value.trim(); } }) as HTMLInputElement;
-      const modelInput = (kind: 'image' | 'video') => {
+      const modelInput = (kind: 'image' | 'video' | 'speech' | 'music') => {
         const listId = `media-${kind}-models`;
-        const ids = (kind === 'image' ? media.imageModels : media.videoModels).map((m) => m.id);
-        const input = h('input', { list: listId, value: (kind === 'image' ? media.imageModel : media.videoModel) ?? '', placeholder: ids.length ? 'choose or type a model' : 'type a model name', oninput: () => {
-          const v = input.value.trim() || undefined;
-          if (kind === 'image') media.imageModel = v;
-          else media.videoModel = v;
+        const field = `${kind}Model` as 'imageModel' | 'videoModel' | 'speechModel' | 'musicModel';
+        const ids = ((kind === 'image' ? media.imageModels : kind === 'video' ? media.videoModels : kind === 'speech' ? media.speechModels : media.musicModels) ?? []).map((m) => m.id);
+        const input = h('input', { list: listId, value: media[field] ?? '', placeholder: ids.length ? 'choose or type a model' : 'type a model name', oninput: () => {
+          media[field] = input.value.trim() || undefined;
         } }) as HTMLInputElement;
         return h('span.model-choice', input, h('datalist', { id: listId }, ...ids.map((id) => h('option', { value: id }))));
       };
@@ -281,7 +280,7 @@ export function openSettings(initial: SettingsResult): Promise<SettingsResult | 
         }
         renderMedia();
         (mediaSection.querySelector('.form-note') as HTMLElement).textContent =
-          `Found ${found.service} ${found.version}: ${found.media.imageModels.length} image and ${found.media.videoModels.length} video models.${chat ? ' It is in the AI providers too, for chat.' : ''}`;
+          `Found ${found.service} ${found.version}: it can make ${mediaAbilities(media) || 'nothing yet'}.${chat ? ' It is in the AI providers too, for chat.' : ''}`;
       } }, 'Find nrob');
       const listButton = h('button', { title: 'Ask the server which image and video models it has', onclick: async () => {
         if (!media.baseUrl) {
@@ -293,25 +292,31 @@ export function openSettings(initial: SettingsResult): Promise<SettingsResult | 
           const found = await listMediaModels(media);
           media.imageModels = found.image.map((id) => media.imageModels.find((m) => m.id === id) ?? { id });
           media.videoModels = found.video.map((id) => media.videoModels.find((m) => m.id === id) ?? { id });
+          media.speechModels = found.speech.map((id) => media.speechModels?.find((m) => m.id === id) ?? { id });
+          media.musicModels = found.music.map((id) => media.musicModels?.find((m) => m.id === id) ?? { id });
+          media.speechModel ??= found.speech[0];
+          media.musicModel ??= found.music[0];
           media.imageModel ??= found.image[0];
           media.videoModel ??= found.video[0];
           renderMedia();
-          (mediaSection.querySelector('.form-note') as HTMLElement).textContent = `${found.image.length} image and ${found.video.length} video models.`;
+          (mediaSection.querySelector('.form-note') as HTMLElement).textContent = `${found.image.length} image, ${found.video.length} video, ${found.speech.length} speech and ${found.music.length} music models.`;
         } catch (error) {
           note.textContent = (error as Error).message;
         }
       } }, 'List models');
       const enabled = h('input', { type: 'checkbox', checked: media.enabled, onchange: () => { media.enabled = enabled.checked; } }) as HTMLInputElement;
       mediaSection.append(
-        h('strong', 'Images and video'),
-        h('p.muted', `The agent can make pictures and short videos with an image and video service: nrob is found on its own, and any server with OpenAI's /v1/images/generations and /v1/videos works. Now: ${status}${media.baseUrl ? ` (${[ready.image && 'images', ready.video && 'video'].filter(Boolean).join(' and ') || 'no models chosen'})` : ''}.`),
+        h('strong', 'Images, video and audio'),
+        h('p.muted', `The agent can make pictures, short videos, speech and music with a media service: nrob is found on its own, and any server with OpenAI's /v1/images/generations, /v1/videos and /v1/audio/speech works. Now: ${status}${media.baseUrl ? ` (${abilities || 'no models chosen'})` : ''}.`),
         h('div.provider-form',
           h('label', 'Address', h('div.window-picker', address, find, listButton)),
           h('label', 'API key', key),
           h('label', 'Images', modelInput('image')),
           h('label', 'Video', modelInput('video')),
+          h('label', 'Speech', modelInput('speech')),
+          h('label', 'Music', modelInput('music')),
         ),
-        h('label', enabled, ' Let the agent make images and video (generate_image, generate_video)'),
+        h('label', enabled, ' Let the agent make images, video, speech and music'),
         note,
       );
     };

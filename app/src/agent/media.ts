@@ -1,7 +1,7 @@
 /**
- * Images and video for the agent, from an OpenAI-spec media service: nrob
- * (found through its discovery document), or any server with
- * `/images/generations` and `/videos`. The page calls it directly, as it
+ * Images, video, speech and music for the agent, from an OpenAI-spec media
+ * service: nrob (found through its discovery document), or any server with
+ * `/images/generations`, `/videos` and `/audio/speech`. The page calls it directly, as it
  * calls the AI provider: it is the person's own service, set up in Settings,
  * so these requests are not behind the network gate.
  */
@@ -32,6 +32,31 @@ export interface VideoModelInfo {
   startImage?: boolean;
 }
 
+export interface SpeechModelInfo {
+  id: string;
+  default?: boolean;
+  /** Speaks in a voice described in words (`instructions`). */
+  describedVoices?: boolean;
+  /** Speaks in voices saved on the server. */
+  savedVoices?: boolean;
+  sampleRate?: number;
+}
+
+export interface MusicModelInfo {
+  id: string;
+  default?: boolean;
+  maxSeconds?: number;
+  sampleRate?: number;
+  channels?: number;
+}
+
+/** A voice saved on the server (designed once from a description). */
+export interface VoiceInfo {
+  name: string;
+  description?: string;
+  language?: string;
+}
+
 export interface MediaSettings {
   /** The API base (`http://127.0.0.1:8080/v1`). Empty: there is no media service. */
   baseUrl: string;
@@ -42,8 +67,15 @@ export interface MediaSettings {
   videoModel?: string;
   imageModels: ImageModelInfo[];
   videoModels: VideoModelInfo[];
+  speechModel?: string;
+  musicModel?: string;
+  speechModels?: SpeechModelInfo[];
+  musicModels?: MusicModelInfo[];
+  /** Saved voices, and the OpenAI voice names the service also takes. */
+  voices?: VoiceInfo[];
+  openaiVoices?: string[];
   /** Full URLs from a discovery document (nrob's routes are configurable). */
-  endpoints?: { images?: string; edits?: string; videos?: string };
+  endpoints?: { images?: string; edits?: string; videos?: string; speech?: string; voices?: string; music?: string };
   /** Set when the details came from nrob's discovery document. */
   discovered?: { service: string; version: string; origin: string; at: number };
 }
@@ -54,12 +86,21 @@ export const EMPTY_MEDIA: MediaSettings = { baseUrl: '', apiKey: '', enabled: tr
 export const NROB_ORIGIN = 'http://127.0.0.1:8080';
 
 /** What the agent can make with these settings. */
-export function mediaReady(media: MediaSettings | null | undefined): { image: boolean; video: boolean } {
+export function mediaReady(media: MediaSettings | null | undefined): { image: boolean; video: boolean; speech: boolean; music: boolean } {
   const on = !!media && media.enabled && !!media.baseUrl.trim();
   return {
     image: on && !!(media!.imageModel || media!.imageModels.length),
     video: on && !!(media!.videoModel || media!.videoModels.length),
+    speech: on && !!(media!.speechModel || media!.speechModels?.length),
+    music: on && !!(media!.musicModel || media!.musicModels?.length),
   };
+}
+
+/** What the service can make, in words ("images, video and speech"). */
+export function mediaAbilities(media: MediaSettings | null | undefined): string {
+  const ready = mediaReady(media);
+  const can = [ready.image && 'images', ready.video && 'video', ready.speech && 'speech', ready.music && 'music'].filter(Boolean) as string[];
+  return can.length > 1 ? `${can.slice(0, -1).join(', ')} and ${can[can.length - 1]}` : can[0] ?? '';
 }
 
 export class MediaError extends Error {
@@ -78,13 +119,17 @@ export function mediaBase(address: string): string {
   return `${url.origin}${path}`;
 }
 
-function endpointsOf(media: MediaSettings): { images: string; edits: string; videos: string; models: string } {
+function endpointsOf(media: MediaSettings): { images: string; edits: string; videos: string; models: string; speech: string; voices: string; music: string } {
   const base = mediaBase(media.baseUrl);
+  const trim = (url: string) => url.replace(/\/+$/, '');
   return {
     images: media.endpoints?.images ?? `${base}/images/generations`,
     edits: media.endpoints?.edits ?? `${base}/images/edits`,
-    videos: (media.endpoints?.videos ?? `${base}/videos`).replace(/\/+$/, ''),
+    videos: trim(media.endpoints?.videos ?? `${base}/videos`),
     models: `${base}/models`,
+    speech: media.endpoints?.speech ?? `${base}/audio/speech`,
+    voices: trim(media.endpoints?.voices ?? `${base}/audio/voices`),
+    music: trim(media.endpoints?.music ?? `${base}/audio/music`),
   };
 }
 
@@ -143,7 +188,7 @@ async function request(url: string, init: RequestInit & { apiKey: string; what: 
   }
   if (resp.ok) return resp;
   const detail = await detailOf(resp);
-  const hint = resp.status === 401 ? ' The service wants an API key: set it in Settings, under Images and video.' : '';
+  const hint = resp.status === 401 ? ' The service wants an API key: set it in Settings, under Images, video and audio.' : '';
   throw new MediaError(`${what} failed (HTTP ${resp.status})${detail ? `: ${detail}` : ''}.${hint}`, resp.status);
 }
 
@@ -200,6 +245,23 @@ export function readDiscovery(doc: Json, origin: string): Extract<Discovery, { s
     maxSide: num(m.max_side),
     startImage: bool(m.start_image),
   }));
+  const speechModels: SpeechModelInfo[] = list(models.speech).filter((m) => str(m.id)).map((m) => ({
+    id: String(m.id),
+    default: bool(m.default),
+    describedVoices: bool(m.described_voices),
+    savedVoices: bool(m.saved_voices),
+    sampleRate: num(m.sample_rate),
+  }));
+  const musicModels: MusicModelInfo[] = list(models.music).filter((m) => str(m.id)).map((m) => ({
+    id: String(m.id),
+    default: bool(m.default),
+    maxSeconds: num(m.max_seconds),
+    sampleRate: num(m.sample_rate),
+    channels: num(m.channels),
+  }));
+  const voiceDoc = isRecord(doc.voices) ? doc.voices : {};
+  const voices: VoiceInfo[] = list(voiceDoc.saved).map((v) => ({ name: str(v.name) ?? str(v.id) ?? '', description: str(v.description), language: str(v.language) })).filter((v) => v.name);
+  const openaiVoices = Array.isArray(voiceDoc.openai_names) ? voiceDoc.openai_names.filter((n): n is string => typeof n === 'string') : [];
   const base = str(doc.openai_base_url) ?? `${origin}/v1`;
   const llmModels = list(models.llm).map((m) => str(m.id)).filter((id): id is string => !!id);
   const llm = isRecord(doc.llm) ? doc.llm : {};
@@ -213,11 +275,17 @@ export function readDiscovery(doc: Json, origin: string): Extract<Discovery, { s
     media: {
       ...EMPTY_MEDIA,
       baseUrl: base,
-      endpoints: { images: urlOf('images'), edits: urlOf('edits'), videos: urlOf('videos') },
+      endpoints: { images: urlOf('images'), edits: urlOf('edits'), videos: urlOf('videos'), speech: urlOf('speech'), voices: urlOf('voices'), music: urlOf('music') },
       imageModels,
       videoModels,
+      speechModels,
+      musicModels,
+      voices,
+      openaiVoices,
       imageModel: str(defaults.image) ?? imageModels.find((m) => m.default)?.id ?? imageModels[0]?.id,
       videoModel: str(defaults.video) ?? videoModels.find((m) => m.default)?.id ?? videoModels[0]?.id,
+      speechModel: str(defaults.speech) ?? speechModels.find((m) => m.default)?.id ?? speechModels[0]?.id,
+      musicModel: str(defaults.music) ?? musicModels.find((m) => m.default)?.id ?? musicModels[0]?.id,
       discovered: { service, version, origin, at: Date.now() },
     },
     llm: {
@@ -254,7 +322,7 @@ export async function discoverNrob(address = NROB_ORIGIN, apiKey = '', signal?: 
     }
     if (resp.status === 404) continue;
     if (resp.status === 403) return { state: 'forbidden', origin, message: `nrob at ${origin} refused this page: ${(await detailOf(resp)) || 'forbidden'}. ${typeof location === 'undefined' ? '' : `The origin to allow is ${location.origin}.`}` };
-    if (resp.status === 401) return { state: 'needs-key', origin, message: `nrob at ${origin} needs its API key: enter it under Images and video, then Find nrob again.` };
+    if (resp.status === 401) return { state: 'needs-key', origin, message: `nrob at ${origin} needs its API key: enter it under Images, video and audio, then Find nrob again.` };
     if (!resp.ok) return { state: 'absent', origin, message: `${origin}${path} answered HTTP ${resp.status}.` };
     let doc: unknown;
     try {
@@ -267,7 +335,7 @@ export async function discoverNrob(address = NROB_ORIGIN, apiKey = '', signal?: 
     }
     const auth = isRecord(doc.auth) ? doc.auth : {};
     if (auth.required === true && !Array.isArray(doc.endpoints)) {
-      return { state: 'needs-key', origin, message: `nrob at ${origin} needs its API key${apiKey ? ' (the one given was not accepted)' : ''}: enter it under Images and video, then Find nrob again.` };
+      return { state: 'needs-key', origin, message: `nrob at ${origin} needs its API key${apiKey ? ' (the one given was not accepted)' : ''}: enter it under Images, video and audio, then Find nrob again.` };
     }
     return readDiscovery(doc, origin);
   }
@@ -278,23 +346,149 @@ export async function discoverNrob(address = NROB_ORIGIN, apiKey = '', signal?: 
 export function mergeDiscovered(current: MediaSettings, found: MediaSettings): MediaSettings {
   const keepImage = current.imageModel && found.imageModels.some((m) => m.id === current.imageModel) ? current.imageModel : found.imageModel;
   const keepVideo = current.videoModel && found.videoModels.some((m) => m.id === current.videoModel) ? current.videoModel : found.videoModel;
-  return { ...found, apiKey: current.apiKey, enabled: current.baseUrl ? current.enabled : true, imageModel: keepImage, videoModel: keepVideo };
+  const keepSpeech = current.speechModel && found.speechModels?.some((m) => m.id === current.speechModel) ? current.speechModel : found.speechModel;
+  const keepMusic = current.musicModel && found.musicModels?.some((m) => m.id === current.musicModel) ? current.musicModel : found.musicModel;
+  return { ...found, apiKey: current.apiKey, enabled: current.baseUrl ? current.enabled : true, imageModel: keepImage, videoModel: keepVideo, speechModel: keepSpeech, musicModel: keepMusic };
 }
 
-/** The image and video models a server lists: typed (nrob), else guessed from their names. */
-export async function listMediaModels(media: MediaSettings, signal?: AbortSignal): Promise<{ image: string[]; video: string[] }> {
+/** The image, video, speech and music models a server lists: typed (nrob), else guessed from their names. */
+export async function listMediaModels(media: MediaSettings, signal?: AbortSignal): Promise<{ image: string[]; video: string[]; speech: string[]; music: string[] }> {
   const resp = await request(endpointsOf(media).models, { apiKey: media.apiKey, what: 'Listing the models' }, signal ?? AbortSignal.timeout(10_000));
   const body = (await resp.json()) as Json;
-  const image: string[] = [];
-  const video: string[] = [];
+  const found = { image: [] as string[], video: [] as string[], speech: [] as string[], music: [] as string[] };
   for (const m of list(body.data)) {
     const id = str(m.id);
     if (!id) continue;
     const type = str(m.type);
-    if (type === 'image' || (!type && /dall-e|gpt-image|image|flux|sdxl|stable-diffusion/i.test(id))) image.push(id);
-    else if (type === 'video' || (!type && /sora|video|veo|ltx|wan/i.test(id))) video.push(id);
+    if (type === 'image' || (!type && /dall-e|gpt-image|image|flux|sdxl|stable-diffusion/i.test(id))) found.image.push(id);
+    else if (type === 'video' || (!type && /sora|video|veo|ltx|wan/i.test(id))) found.video.push(id);
+    else if (type === 'speech' || (!type && /tts|speech/i.test(id))) found.speech.push(id);
+    else if (type === 'music' || (!type && /music|song/i.test(id))) found.music.push(id);
   }
-  return { image, video };
+  return found;
+}
+
+// --- Jobs ------------------------------------------------------------------
+
+/**
+ * Follow an asynchronous job (a video, a song) until it is done: the status as
+ * it goes, the service's reason when it fails, and the job stopped on the
+ * server if the person stops the agent.
+ */
+async function followJob(
+  media: MediaSettings,
+  base: string,
+  first: Json,
+  what: string,
+  onProgress: (message: string) => void,
+  signal: AbortSignal | undefined,
+  cancel: (id: string) => Promise<unknown>,
+): Promise<{ id: string; job: Json }> {
+  let job = first;
+  const id = str(job.id);
+  if (!id) throw new MediaError(`The ${what} service did not return a job id.`);
+  const started = Date.now();
+  try {
+    while (job.status !== 'completed') {
+      if (job.status === 'failed' || job.status === 'cancelled') {
+        const error = isRecord(job.error) ? str(job.error.message) : str(job.error);
+        throw new MediaError(`The ${what} failed: ${error ?? 'the service gave no reason'}.`);
+      }
+      const progress = num(job.progress);
+      onProgress(job.status === 'queued' ? `${what} queued, waiting for the GPU…` : `making the ${what}${progress !== undefined ? `: ${Math.floor(progress)}%` : '…'}`);
+      if (Date.now() - started > MAX_VIDEO_MS) throw new MediaError(`The ${what} took over an hour; stopped waiting for it.`);
+      await sleep(POLL_MS, signal);
+      job = (await (await request(`${base}/${encodeURIComponent(id)}`, { apiKey: media.apiKey, what: `Checking the ${what}` }, signal)).json()) as Json;
+    }
+    return { id, job };
+  } catch (error) {
+    if (signal?.aborted) void cancel(id).catch(() => undefined);
+    throw error;
+  }
+}
+
+// --- Speech and voices -----------------------------------------------------
+
+export const SPEECH_FORMATS = ['mp3', 'wav', 'opus', 'aac', 'flac'] as const;
+export type SpeechFormat = (typeof SPEECH_FORMATS)[number];
+
+export interface SpeechRequest {
+  /** What to say. */
+  input: string;
+  model?: string;
+  /** A saved voice's name, or an OpenAI voice name. */
+  voice?: string;
+  /** A voice described in words (or how to say it). */
+  instructions?: string;
+  language?: string;
+  speed?: number;
+  seed?: number;
+  format?: SpeechFormat;
+}
+
+/** The speech as audio bytes (the whole clip: the service answers when it is made). */
+export async function generateSpeech(media: MediaSettings, req: SpeechRequest, signal?: AbortSignal): Promise<{ bytes: Uint8Array; mime: string }> {
+  const body: Json = { input: req.input, model: req.model || media.speechModel, response_format: req.format ?? 'mp3' };
+  if (req.voice) body.voice = req.voice;
+  if (req.instructions) body.instructions = req.instructions;
+  if (req.language) body.language = req.language;
+  if (req.speed !== undefined) body.speed = req.speed;
+  if (req.seed !== undefined) body.seed = req.seed;
+  const resp = await request(endpointsOf(media).speech, { method: 'POST', body: JSON.stringify(body), headers: { 'Content-Type': 'application/json' }, apiKey: media.apiKey, what: 'Speaking' }, signal);
+  const bytes = new Uint8Array(await resp.arrayBuffer());
+  if (!bytes.length) throw new MediaError('The speech service answered without audio.');
+  return { bytes, mime: resp.headers.get('content-type') ?? 'audio/mpeg' };
+}
+
+/** Design a voice from a description and save it on the server under `name`. */
+export async function createVoice(media: MediaSettings, req: { name: string; description: string; sampleText?: string; language?: string; seed?: number }, signal?: AbortSignal): Promise<VoiceInfo> {
+  const body: Json = { name: req.name, description: req.description };
+  if (req.sampleText) body.sample_text = req.sampleText;
+  if (req.language) body.language = req.language;
+  if (req.seed !== undefined) body.seed = req.seed;
+  const resp = await request(endpointsOf(media).voices, { method: 'POST', body: JSON.stringify(body), headers: { 'Content-Type': 'application/json' }, apiKey: media.apiKey, what: 'Designing the voice' }, signal);
+  const voice = (await resp.json().catch(() => ({}))) as Json;
+  return { name: str(voice.name) ?? req.name, description: str(voice.description) ?? req.description, language: str(voice.language) ?? req.language };
+}
+
+/** The voices saved on the server. */
+export async function listVoices(media: MediaSettings, signal?: AbortSignal): Promise<VoiceInfo[]> {
+  const resp = await request(endpointsOf(media).voices, { apiKey: media.apiKey, what: 'Listing the voices' }, signal ?? AbortSignal.timeout(10_000));
+  const body = (await resp.json()) as Json;
+  return list(Array.isArray(body) ? body : body.data ?? body.voices).map((v) => ({ name: str(v.name) ?? str(v.id) ?? '', description: str(v.description), language: str(v.language) })).filter((v) => v.name);
+}
+
+// --- Music -----------------------------------------------------------------
+
+export interface MusicRequest {
+  /** The style: genre, instruments, mood, tempo, singer. */
+  prompt: string;
+  /** Lyrics, with [Verse] / [Chorus] sections; none with `instrumental`. */
+  lyrics?: string;
+  instrumental?: boolean;
+  seconds?: number;
+  model?: string;
+  seed?: number;
+  format?: 'wav' | 'mp3' | 'opus' | 'aac' | 'flac';
+}
+
+/** Start a song job, follow it, and download the song. */
+export async function generateMusic(media: MediaSettings, req: MusicRequest, onProgress: (message: string) => void, signal?: AbortSignal): Promise<{ bytes: Uint8Array; seconds?: number; model: string }> {
+  const ep = endpointsOf(media);
+  const model = req.model || media.musicModel;
+  const body: Json = { prompt: req.prompt, model };
+  if (req.instrumental) body.instrumental = true;
+  if (req.lyrics && !req.instrumental) body.lyrics = req.lyrics;
+  if (req.seconds !== undefined) body.duration = req.seconds;
+  if (req.seed !== undefined) body.seed = req.seed;
+  const created = await request(ep.music, { method: 'POST', body: JSON.stringify(body), headers: { 'Content-Type': 'application/json' }, apiKey: media.apiKey, what: 'Starting the song' }, signal);
+  const { id, job } = await followJob(media, ep.music, (await created.json()) as Json, 'song', onProgress, signal, (jobId) =>
+    fetch(`${ep.music}/${encodeURIComponent(jobId)}/cancel`, { method: 'POST', headers: authHeaders(media.apiKey) }));
+  onProgress('downloading the song…');
+  const format = req.format ?? 'wav';
+  const content = await request(`${ep.music}/${encodeURIComponent(id)}/content${format === 'wav' ? '' : `?format=${format}`}`, { apiKey: media.apiKey, what: 'Downloading the song' }, signal);
+  const seconds = num(job.seconds) ?? (str(job.seconds) ? Number(job.seconds) : undefined);
+  return { bytes: new Uint8Array(await content.arrayBuffer()), seconds, model: str(job.model) ?? model ?? 'default' };
 }
 
 // --- Images ----------------------------------------------------------------
@@ -364,7 +558,16 @@ export interface VideoRequest {
   size?: string;
   /** A picture for the first frame: the video animates it. */
   startImage?: MediaFile;
+  /** A picture for the last frame: the video moves from the start to it. */
+  endImage?: MediaFile;
+  /** Words the character says: the service speaks them and the clip's lips follow. */
+  speech?: { input: string; voice?: string; instructions?: string; language?: string; seed?: number };
+  /** A soundtrack (speech, a voice, any audio) the clip follows. */
+  audio?: MediaFile;
 }
+
+/** The audio formats a video soundtrack may come in. */
+export const SOUNDTRACK_FORMATS = ['wav', 'mp3', 'ogg', 'opus', 'flac', 'm4a', 'aac', 'webm'];
 
 export interface VideoResult {
   bytes: Uint8Array;
@@ -392,8 +595,9 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
 export async function generateVideo(media: MediaSettings, req: VideoRequest, onProgress: (message: string) => void, signal?: AbortSignal): Promise<VideoResult> {
   const ep = endpointsOf(media);
   const model = req.model || media.videoModel;
+  if (req.speech && req.audio) throw new MediaError('Give the video speech to say or an audio file to follow, not both.');
   let created: Response;
-  if (req.startImage && !media.discovered) {
+  if (req.startImage && !media.discovered && !req.endImage && !req.speech && !req.audio) {
     const form = new FormData();
     form.set('prompt', req.prompt);
     if (model) form.set('model', model);
@@ -405,30 +609,19 @@ export async function generateVideo(media: MediaSettings, req: VideoRequest, onP
     const body: Json = { prompt: req.prompt, model, size: req.size };
     if (req.seconds !== undefined) body.seconds = String(req.seconds);
     if (req.startImage) body.input_reference = { image_url: dataUrl(req.startImage) };
+    if (req.endImage) body.end_image = { image_url: dataUrl(req.endImage) };
+    if (req.speech) body.speech = Object.fromEntries(Object.entries(req.speech).filter(([, v]) => v !== undefined && v !== ''));
+    if (req.audio) {
+      const format = req.audio.name.split('.').pop()!.toLowerCase();
+      if (!SOUNDTRACK_FORMATS.includes(format)) throw new MediaError(`A soundtrack must be ${SOUNDTRACK_FORMATS.join(', ')}; ${req.audio.name} is not.`);
+      body.input_audio = { data: bytesToBase64(req.audio.bytes), format };
+    }
     created = await request(ep.videos, { method: 'POST', body: JSON.stringify(body), headers: { 'Content-Type': 'application/json' }, apiKey: media.apiKey, what: 'Starting the video' }, signal);
   }
-  let job = (await created.json()) as Json;
-  const id = str(job.id);
-  if (!id) throw new MediaError('The video service did not return a job id.');
-  const started = Date.now();
-  try {
-    while (job.status !== 'completed') {
-      if (job.status === 'failed' || job.status === 'cancelled') {
-        const error = isRecord(job.error) ? str(job.error.message) : str(job.error);
-        throw new MediaError(`The video failed: ${error ?? 'the service gave no reason'}.`);
-      }
-      const progress = num(job.progress);
-      onProgress(job.status === 'queued' ? 'video queued, waiting for the GPU…' : `making the video${progress !== undefined ? `: ${Math.floor(progress)}%` : '…'}`);
-      if (Date.now() - started > MAX_VIDEO_MS) throw new MediaError('The video took over an hour; stopped waiting for it.');
-      await sleep(POLL_MS, signal);
-      job = (await (await request(`${ep.videos}/${encodeURIComponent(id)}`, { apiKey: media.apiKey, what: 'Checking the video' }, signal)).json()) as Json;
-    }
-    onProgress('downloading the video…');
-    const content = await request(`${ep.videos}/${encodeURIComponent(id)}/content`, { apiKey: media.apiKey, what: 'Downloading the video' }, signal);
-    return { bytes: new Uint8Array(await content.arrayBuffer()), id, model: str(job.model) ?? model ?? 'default', seconds: str(job.seconds) ?? (num(job.seconds) !== undefined ? String(job.seconds) : undefined), size: str(job.size) };
-  } catch (error) {
-    // Stopped by the person: cancel the job rather than leave the GPU busy.
-    if (signal?.aborted) void fetch(`${ep.videos}/${encodeURIComponent(id)}`, { method: 'DELETE', headers: authHeaders(media.apiKey) }).catch(() => undefined);
-    throw error;
-  }
+  // Stopped by the person: the job is forgotten on the server rather than left using the GPU.
+  const { id, job } = await followJob(media, ep.videos, (await created.json()) as Json, 'video', onProgress, signal, (jobId) =>
+    fetch(`${ep.videos}/${encodeURIComponent(jobId)}`, { method: 'DELETE', headers: authHeaders(media.apiKey) }));
+  onProgress('downloading the video…');
+  const content = await request(`${ep.videos}/${encodeURIComponent(id)}/content`, { apiKey: media.apiKey, what: 'Downloading the video' }, signal);
+  return { bytes: new Uint8Array(await content.arrayBuffer()), id, model: str(job.model) ?? model ?? 'default', seconds: str(job.seconds) ?? (num(job.seconds) !== undefined ? String(job.seconds) : undefined), size: str(job.size) };
 }

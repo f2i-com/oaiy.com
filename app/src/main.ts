@@ -5,7 +5,7 @@ import { HELP, internetCommand } from './commands';
 import { NetGate } from './gate/netgate';
 import { sandboxAvailable, zippModule } from './sandbox/runner';
 import { loadSettings, saveAgentSettings, saveGate, saveLastProject, saveMedia, saveProviders } from './settings';
-import { NROB_ORIGIN, discoverNrob, mergeDiscovered } from './agent/media';
+import { NROB_ORIGIN, discoverNrob, mediaAbilities, mergeDiscovered } from './agent/media';
 import { budgetFor, contextWindow, detectContextWindow, formatTokens } from './agent/context';
 import { ChatPane } from './ui/chat';
 import { clear, h } from './ui/dom';
@@ -769,7 +769,7 @@ A project can hold several apps, each in its own folder (any folder whose manife
         /* storage blocked: say it every time */
       }
       chat.system(`${found.message}
-With that done, Settings → Images and video → Find nrob sets it up.`);
+With that done, Settings → Images, video and audio → Find nrob sets it up.`);
       return;
     }
     const first = !media.discovered;
@@ -783,8 +783,8 @@ With that done, Settings → Images and video → Find nrob sets it up.`);
       renderChips();
     }
     if (first || chatProvider) {
-      const can = [media.imageModels.length && `images (${media.imageModel})`, media.videoModels.length && `video (${media.videoModel})`].filter(Boolean).join(' and ');
-      chat.system(`Found ${found.service} ${found.version} at ${found.origin}.${can ? ` The agent can make ${can} with it.` : ''}${chatProvider ? ` It is in the AI providers for chat too${activeId === chatProvider.id ? ', and in use' : ''}.` : ''} Change this in Settings → Images and video.`);
+      const can = mediaAbilities(media);
+      chat.system(`Found ${found.service} ${found.version} at ${found.origin}.${can ? ` The agent can make ${can} with it.` : ''}${chatProvider ? ` It is in the AI providers for chat too${activeId === chatProvider.id ? ', and in use' : ''}.` : ''} Change this in Settings → Images, video and audio.`);
     }
   }
 

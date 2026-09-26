@@ -16,7 +16,7 @@ import { appLabel, checkProject, describeApp, findApps, formatFindings, guideFor
 import type { PageReport, PreviewAction, PreviewResult } from '../softn/preview';
 import { describeExample, docsMap, installExample, listExamples, lookupComponents, readTopic, searchKnowledge } from '../softn/knowledge';
 import { DEFAULT_VIEW_SIZE, MAX_VIEW_SIZE, imageMimeFor, imageSize, viewImage, type ImagePart } from './images';
-import { generateImage, generateVideo, mediaReady, type MediaFile, type MediaSettings } from './media';
+import { SOUNDTRACK_FORMATS, SPEECH_FORMATS, createVoice, generateImage, generateMusic, generateSpeech, generateVideo, mediaReady, type MediaFile, type MediaSettings, type SpeechFormat } from './media';
 
 const READ_LINES = 400;
 const READ_CHARS = 40_000;
@@ -99,7 +99,13 @@ export interface ToolContext {
 }
 
 /** A model's abilities in a few words, for the tool descriptions. */
-function describeModels(media: MediaSettings, kind: 'image' | 'video'): string {
+function describeModels(media: MediaSettings, kind: 'image' | 'video' | 'speech' | 'music'): string {
+  if (kind === 'speech' || kind === 'music') {
+    const chosen = kind === 'speech' ? media.speechModel : media.musicModel;
+    const models = (kind === 'speech' ? media.speechModels : media.musicModels) ?? [];
+    if (!models.length) return chosen ? ` Model: ${chosen}.` : '';
+    return ` Models: ${models.map((m) => `${m.id}${m.id === chosen ? ' (default)' : ''}${'maxSeconds' in m && m.maxSeconds ? `: up to ${m.maxSeconds} s` : ''}`).join('; ')}.`;
+  }
   const chosen = kind === 'image' ? media.imageModel : media.videoModel;
   const lines = kind === 'image'
     ? media.imageModels.map((m) => {
@@ -127,7 +133,7 @@ function describeModels(media: MediaSettings, kind: 'image' | 'video'): string {
 /** generate_image and generate_video, described for the service that is set up (none when there is none). */
 export function mediaTools(media: MediaSettings | null | undefined): ToolSpec[] {
   const ready = mediaReady(media);
-  if (!media || (!ready.image && !ready.video)) return [];
+  if (!media || (!ready.image && !ready.video && !ready.speech && !ready.music)) return [];
   const where = media.discovered ? `nrob at ${media.discovered.origin}` : new URL(media.baseUrl).host;
   const tools: ToolSpec[] = [];
   const ids = (list: Array<{ id: string }>) => (list.length ? { enum: list.map((m) => m.id) } : {});
@@ -158,8 +164,11 @@ export function mediaTools(media: MediaSettings | null | undefined): ToolSpec[] 
     tools.push({
       name: 'generate_video',
       description:
-        `Create a short video (MP4) from a text prompt, or animate a start image, with the user's video service (${where}), and save it in the project. ` +
+        `Create a short video (MP4) with the user's video service (${where}) and save it in the project: from a text prompt, or animating a start_image, optionally moving to an end_image. ` +
         'Describe the motion as well as the scene: what moves, how the camera moves. ' +
+        (media.discovered
+          ? 'A character can talk: give `say` (their words; the service speaks them in `voice`, and the lips follow), or `soundtrack` (a speech or audio file in the project to follow). Then without `seconds` the clip is as long as the speech, up to the model\'s limit of a few seconds: keep each line to one short sentence, and make several clips for longer speech. '
+          : '') +
         `It takes minutes; the user sees its progress in the chat, and the finished video gets a player there.${describeModels(media, 'video')}`,
       parameters: {
         type: 'object',
@@ -168,14 +177,89 @@ export function mediaTools(media: MediaSettings | null | undefined): ToolSpec[] 
           prompt: str,
           path: { type: 'string', description: 'Where to save it in the project, e.g. media/intro.mp4' },
           model: { type: 'string', ...ids(media.videoModels) },
-          seconds: { type: 'number', description: 'Length in seconds' },
+          seconds: { type: 'number', description: 'Length in seconds (leave it out to follow `say` or `soundtrack`)' },
           size: { type: 'string', description: 'WIDTHxHEIGHT, e.g. 768x512 or 1024x576' },
           start_image: { type: 'string', description: 'Project path of a picture to use as the first frame' },
+          end_image: { type: 'string', description: 'Project path of a picture to end on: the clip moves from the start to it' },
+          ...(media.discovered
+            ? {
+                say: { type: 'string', description: 'Words the character speaks, with lip movement to match' },
+                voice: { type: 'string', description: `The voice for \`say\`: ${voiceNames(media)}` },
+                voice_description: { type: 'string', description: 'For `say`: a voice described in words, instead of a saved one' },
+                soundtrack: { type: 'string', description: `Project path of audio for the clip to follow (${SOUNDTRACK_FORMATS.join(', ')}), e.g. from generate_speech` },
+              }
+            : {}),
+        },
+      },
+    });
+  }
+  if (ready.speech) {
+    const saved = media.voices ?? [];
+    tools.push({
+      name: 'generate_speech',
+      description:
+        `Speak text aloud with the user's speech service (${where}) and save the audio in the project (mp3, wav, opus, aac or flac, from the path). ` +
+        'Use a saved voice by name, an OpenAI voice name, or describe a voice in `voice_description` (age, gender, accent, tone, pace). For the same character across many lines, save a voice with create_voice once and use its name. ' +
+        `Voices: ${voiceNames(media)}.${saved.length ? ` Saved: ${saved.map((v) => `${v.name}${v.description ? ` (${v.description})` : ''}`).join('; ')}.` : ''}${describeModels(media, 'speech')}`,
+      parameters: {
+        type: 'object',
+        required: ['text', 'path'],
+        properties: {
+          text: { type: 'string', description: 'What to say' },
+          path: { type: 'string', description: 'Where to save it, e.g. audio/line-1.mp3' },
+          voice: { type: 'string', description: 'A saved voice or an OpenAI voice name' },
+          voice_description: { type: 'string', description: 'A voice described in words, or how to say the line' },
+          language: str,
+          speed: { type: 'number', minimum: 0.25, maximum: 4 },
+          seed: int,
+        },
+      },
+    });
+    if (media.discovered) {
+      tools.push({
+        name: 'create_voice',
+        description: 'Design a voice from a description and save it on the speech service under a name, to speak in it again and again (generate_speech, or `voice` in generate_video). It takes a little while; the user can hear its sample in the chat.',
+        parameters: {
+          type: 'object',
+          required: ['name', 'description'],
+          properties: {
+            name: { type: 'string', description: 'A short name, e.g. Captain' },
+            description: { type: 'string', description: 'Who speaks: age, gender, accent, tone, pace, character' },
+            sample_text: { type: 'string', description: 'A line the sample says' },
+            language: str,
+          },
+        },
+      });
+    }
+  }
+  if (ready.music) {
+    tools.push({
+      name: 'generate_music',
+      description:
+        `Make a song or an instrumental with the user's music service (${where}) and save it in the project (wav or mp3, from the path). ` +
+        'Describe the style: genre, instruments, mood, tempo, the singer. Give lyrics with [Verse], [Chorus] and [Bridge] sections, or instrumental: true. ' +
+        `It takes minutes; the user sees its progress in the chat.${describeModels(media, 'music')}`,
+      parameters: {
+        type: 'object',
+        required: ['style', 'path'],
+        properties: {
+          style: { type: 'string', description: 'Genre, instruments, mood, tempo, singer' },
+          lyrics: { type: 'string', description: 'The words, in [Verse] / [Chorus] sections' },
+          instrumental: { type: 'boolean' },
+          seconds: { type: 'number', description: 'Length in seconds' },
+          path: { type: 'string', description: 'Where to save it, e.g. audio/theme.mp3' },
+          seed: int,
         },
       },
     });
   }
   return tools;
+}
+
+/** The voices a speech service takes, in a few words. */
+function voiceNames(media: MediaSettings): string {
+  const names = [...(media.voices ?? []).map((v) => v.name), ...(media.openaiVoices ?? [])];
+  return names.length ? names.join(', ') : 'the service\'s default, or one described in words';
 }
 
 const str = { type: 'string' };
@@ -398,6 +482,14 @@ function cut(text: string, max = OUTPUT_CHARS): string {
   const head = text.slice(0, Math.floor(max * 0.7));
   const tail = text.slice(-Math.floor(max * 0.25));
   return `${head}\n\n[... ${text.length - head.length - tail.length} characters omitted ...]\n\n${tail}`;
+}
+
+/** A file in the project, sent to a service as it is. */
+function projectFile(vfs: Vfs, raw: string): MediaFile {
+  const key = normalizePath(raw);
+  if (vfs.stat(`/${key}`)?.type !== 'file') throw new Error(`/${key} does not exist`);
+  const ext = key.split('.').pop()!.toLowerCase();
+  return { bytes: vfs.readBytes(`/${key}`), mime: ext === 'mp3' ? 'audio/mpeg' : `audio/${ext}`, name: key.split('/').pop()! };
 }
 
 /** An image in the project, for a reference or a start frame. */
@@ -801,7 +893,7 @@ async function execute(call: ToolCall, ctx: ToolContext, out: ToolOut): Promise<
     }
     case 'generate_image': {
       const media = ctx.media?.();
-      if (!media || !mediaReady(media).image) throw new Error('no image service is set up (the user can add one in Settings, under Images and video)');
+      if (!media || !mediaReady(media).image) throw new Error('no image service is set up (the user can add one in Settings, under Images, video and audio)');
       const prompt = need(input, 'prompt');
       let path = normalizePath(need(input, 'path'));
       if (!/\.png$/i.test(path)) path = `${path.replace(/\.[a-z0-9]{1,5}$/i, '')}.png`;
@@ -828,24 +920,99 @@ async function execute(call: ToolCall, ctx: ToolContext, out: ToolOut): Promise<
     }
     case 'generate_video': {
       const media = ctx.media?.();
-      if (!media || !mediaReady(media).video) throw new Error('no video service is set up (the user can add one in Settings, under Images and video)');
+      if (!media || !mediaReady(media).video) throw new Error('no video service is set up (the user can add one in Settings, under Images, video and audio)');
       const prompt = need(input, 'prompt');
       let path = normalizePath(need(input, 'path'));
       if (!/\.mp4$/i.test(path)) path = `${path.replace(/\.[a-z0-9]{1,5}$/i, '')}.mp4`;
-      const startImage = typeof input.start_image === 'string' && input.start_image.trim() ? projectImage(vfs, input.start_image) : undefined;
-      const model = typeof input.model === 'string' && input.model.trim() ? input.model.trim() : media.videoModel;
+      const text = (k: string) => (typeof input[k] === 'string' && (input[k] as string).trim() ? (input[k] as string).trim() : undefined);
+      const startImage = text('start_image') ? projectImage(vfs, text('start_image')!) : undefined;
+      const endImage = text('end_image') ? projectImage(vfs, text('end_image')!) : undefined;
+      const say = text('say');
+      if (say && text('soundtrack')) throw new Error('give `say` or `soundtrack`, not both');
+      const soundtrack = text('soundtrack') ? projectFile(vfs, text('soundtrack')!) : undefined;
+      const model = text('model') ?? media.videoModel;
       ctx.progress?.(`starting the video${model ? ` with ${model}` : ''}…`);
       const result = await generateVideo(media, {
         prompt,
         model,
         seconds: typeof input.seconds === 'number' ? input.seconds : typeof input.seconds === 'string' && Number(input.seconds) > 0 ? Number(input.seconds) : undefined,
-        size: typeof input.size === 'string' && input.size.trim() ? input.size.trim() : undefined,
+        size: text('size'),
         startImage,
+        endImage,
+        speech: say ? { input: say, voice: text('voice'), instructions: text('voice_description') } : undefined,
+        audio: soundtrack,
       }, (message) => ctx.progress?.(message), ctx.signal);
       vfs.writeFile(`/${path}`, result.bytes, { parents: true });
       out.files.push(path);
       const facts = [result.seconds && `${result.seconds} s`, result.size, `${(result.bytes.byteLength / 1e6).toFixed(1)} MB`].filter(Boolean).join(', ');
       return `Saved /${path} (${facts}), made with ${result.model}. The user has a player for it in the chat.`;
+    }
+    case 'generate_speech': {
+      const media = ctx.media?.();
+      if (!media || !mediaReady(media).speech) throw new Error('no speech service is set up (the user can add one in Settings, under Images, video and audio)');
+      const words = need(input, 'text');
+      let path = normalizePath(need(input, 'path'));
+      let format = (path.split('.').pop() ?? '').toLowerCase() as SpeechFormat;
+      if (format === ('ogg' as SpeechFormat)) format = 'opus';
+      if (!SPEECH_FORMATS.includes(format)) {
+        format = 'mp3';
+        path = `${path.replace(/\.[a-z0-9]{1,5}$/i, '')}.mp3`;
+      }
+      const voice = typeof input.voice === 'string' && input.voice.trim() ? input.voice.trim() : undefined;
+      ctx.progress?.(`speaking${voice ? ` as ${voice}` : ''}…`);
+      const result = await generateSpeech(media, {
+        input: words,
+        voice,
+        instructions: typeof input.voice_description === 'string' && input.voice_description.trim() ? input.voice_description.trim() : undefined,
+        language: typeof input.language === 'string' ? input.language : undefined,
+        speed: typeof input.speed === 'number' ? input.speed : undefined,
+        seed: typeof input.seed === 'number' ? input.seed : undefined,
+        format,
+      }, ctx.signal);
+      vfs.writeFile(`/${path}`, result.bytes, { parents: true });
+      out.files.push(path);
+      return `Saved /${path} (${(result.bytes.byteLength / 1024).toFixed(0)} KB ${format}). The user has a player for it in the chat.`;
+    }
+    case 'create_voice': {
+      const media = ctx.media?.();
+      if (!media || !mediaReady(media).speech) throw new Error('no speech service is set up (the user can add one in Settings, under Images, video and audio)');
+      const name = need(input, 'name').trim();
+      ctx.progress?.(`designing the voice ${name}…`);
+      const voice = await createVoice(media, {
+        name,
+        description: need(input, 'description'),
+        sampleText: typeof input.sample_text === 'string' ? input.sample_text : undefined,
+        language: typeof input.language === 'string' ? input.language : undefined,
+      }, ctx.signal);
+      // The next tool descriptions offer it by name.
+      media.voices = [...(media.voices ?? []).filter((v) => v.name !== voice.name), voice];
+      return `Saved the voice "${voice.name}"${voice.description ? ` (${voice.description})` : ''}. Speak in it with voice: "${voice.name}" in generate_speech, or in generate_video with say.`;
+    }
+    case 'generate_music': {
+      const media = ctx.media?.();
+      if (!media || !mediaReady(media).music) throw new Error('no music service is set up (the user can add one in Settings, under Images, video and audio)');
+      const style = need(input, 'style');
+      let path = normalizePath(need(input, 'path'));
+      let format = (path.split('.').pop() ?? '').toLowerCase() as 'wav' | 'mp3';
+      if (format !== 'wav' && format !== 'mp3') {
+        format = 'mp3';
+        path = `${path.replace(/\.[a-z0-9]{1,5}$/i, '')}.mp3`;
+      }
+      const instrumental = input.instrumental === true;
+      const lyrics = typeof input.lyrics === 'string' && input.lyrics.trim() ? input.lyrics : undefined;
+      if (!instrumental && !lyrics) throw new Error('give lyrics (in [Verse] / [Chorus] sections), or instrumental: true');
+      ctx.progress?.('starting the song…');
+      const result = await generateMusic(media, {
+        prompt: style,
+        lyrics,
+        instrumental,
+        seconds: typeof input.seconds === 'number' ? input.seconds : undefined,
+        seed: typeof input.seed === 'number' ? input.seed : undefined,
+        format,
+      }, (message) => ctx.progress?.(message), ctx.signal);
+      vfs.writeFile(`/${path}`, result.bytes, { parents: true });
+      out.files.push(path);
+      return `Saved /${path} (${result.seconds ? `${Math.round(result.seconds)} s, ` : ''}${(result.bytes.byteLength / 1e6).toFixed(1)} MB), made with ${result.model}. The user has a player for it in the chat.`;
     }
     case 'present_file': {
       const path = normalizePath(need(input, 'path'));

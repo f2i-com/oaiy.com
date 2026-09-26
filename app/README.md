@@ -6,7 +6,7 @@ A coding agent that runs entirely in your browser.
 - **AI-written code runs on the [Zipp](https://github.com/f2i-com/zipp.org) VM.** JavaScript and Python run in Zipp's WebAssembly engine inside a Web Worker. The code can reach the project and nothing else, except what the network gate lets through.
 - **A shell, emulated.** The terminal and the agent's `sandbox_shell` are a bash-like shell written in JavaScript on the same sandbox, with `git`, `jq`, `tar`/`zip`, `node` and `python` built in (see [The shell](#the-shell)). There are no real processes, so `npm install` and compilers don't exist here.
 - **Any model.** A server on your own machine (Ollama, LM Studio, nrob, llama.cpp — anything OpenAI-compatible), Anthropic's API, or any OpenAI-compatible API.
-- **Images and video.** With nrob, or any service with OpenAI's image and video APIs, the agent can make pictures and short videos straight into the project (see [Images and video](#images-and-video)).
+- **Images, video and audio.** With nrob, or any service with OpenAI's media APIs, the agent can make pictures, short videos (talking ones too), speech and music straight into the project (see [Images, video and audio](#images-video-and-audio)).
 - **A network gate.** `/internet on | off | allowlist | allow <host> | deny <host> | status` (or `/net`) decides every request made on the model's behalf. Requests to your AI provider are not gated.
 
 ## Context and long work
@@ -30,21 +30,26 @@ A coding agent that runs entirely in your browser.
   - A task can name the plan step it completes, so the plan updates as tasks finish. The chat shows each task live: queued, working (with what it's doing right now), then done, with its report.
 - **The meter** in the Agent pane's title shows how full the context is. The provider's own token counts calibrate the estimate as it goes.
 
-## Images and video
+## Images, video and audio
 
-The agent gets two more tools when an image and video service is set up:
+The agent gets more tools when a media service is set up:
 - `generate_image` saves PNGs: from a prompt, or from reference pictures to edit or combine.
-- `generate_video` saves an MP4: from a prompt, or animating a start image.
+- `generate_video` saves an MP4 from a prompt. It can also:
+  - animate a start image, optionally moving to an end image;
+  - make a character talk, with lip movement: it takes `say` (words to speak in a voice) or `soundtrack` (a speech or audio file to follow). Without a length, the clip is as long as the speech, up to the model's few seconds.
+- `generate_speech` saves spoken audio (mp3, wav, opus, aac, flac) in a saved voice, an OpenAI voice name, or a voice described in words.
+- `create_voice` designs a voice from a description and saves it on nrob, so a character keeps the same voice.
+- `generate_music` saves a song from a style and lyrics (with [Verse] and [Chorus] sections), or an instrumental.
 
-The results appear in the chat (a video gets a player) and in the project, where an app can use them.
+The results appear in the chat (with a player for video and audio) and in the project, where an app can use them.
 
 - **nrob is found on its own.** When the page opens, it asks `http://127.0.0.1:8080/v1/discovery`.
-  - If nrob answers, its image and video models, their limits (sizes, edits, seconds) and its defaults fill **Settings → Images and video**.
+  - If nrob answers, its image, video, speech and music models, their limits (sizes, edits, seconds), its saved voices and its defaults fill **Settings → Images, video and audio**.
   - nrob is also added as a chat provider if none points at it yet. It becomes the active one only if nothing else is.
   - Found again later, its model lists are refreshed. Your chosen models and key stay.
 - **nrob allows bot.computer.** Without an API key, nrob answers only the origins in `gateway.cors_origins` in its config. Its defaults include `https://bot.computer`, `http://localhost:5317` and the desktop app. Serving bot.computer from anywhere else means adding that address there (the chat says which one), or setting an API key in nrob and typing it in Settings. Then press **Find nrob**.
-- **Other services.** Type the address of any OpenAI-spec service (for example `https://api.openai.com/v1`) and its key, then **List models** and choose. Images use `/images/generations` and `/images/edits`. Video uses `/videos` and follows the job until it's done.
-- **While it works.** The chat shows a video's progress. Stopping the agent cancels the job. The models' limits are in the tools' descriptions, so the model asks for sizes and lengths the service can make.
+- **Other services.** Type the address of any OpenAI-spec service (for example `https://api.openai.com/v1`) and its key, then **List models** and choose. Images use `/images/generations` and `/images/edits`. Video uses `/videos` and follows the job until it's done. Speech uses `/audio/speech`.
+- **While it works.** The chat shows the progress of a video or a song. Stopping the agent cancels the job. The models' limits are in the tools' descriptions, so the model asks for sizes and lengths the service can make.
 - **Privacy.** These requests go straight from the page to the service you set up, like requests to your AI provider. They are not behind the network gate. Keys are stored encrypted with the provider keys.
 
 ## Files, images and big files
