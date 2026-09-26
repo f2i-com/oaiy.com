@@ -456,8 +456,9 @@ fn reference_image(value: &Json, output_root: &Path, allow_local: bool) -> Resul
 fn reference_audio(value: &Json, output_root: &Path, allow_local: bool) -> Result<Option<String>, String> {
     const FORMATS: [&str; 8] = ["wav", "mp3", "ogg", "opus", "flac", "m4a", "aac", "webm"];
     let save = |bytes: Vec<u8>, ext: &str| -> Result<Option<String>, String> {
-        if bytes.len() > 64 << 20 {
-            return Err("soundtracks are limited to 64 MiB".into());
+        // A request is at most 64 MiB, and base64 grows it by a third.
+        if bytes.len() > 45 << 20 {
+            return Err("uploaded soundtracks are limited to 45 MiB".into());
         }
         let dir = output_root.join("inputs");
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;

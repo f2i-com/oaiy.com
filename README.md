@@ -84,7 +84,8 @@ Every token is a small, well-planned job:
   lyrics and a description, up to six minutes of 44.1 kHz stereo, faster than
   real time; its 8B language model converts once to q8_0 or q4_k, so an 8 GB
   GPU can run it ([Music](docs/MUSIC.md)). Both are served on OpenAI-style
-  audio endpoints.
+  audio endpoints, and an LTX clip can follow that speech, or any audio file,
+  with mouths moving to it.
 
 - **DeepSeek-V4.1-Flash from safetensors, end to end.** The checkpoint's shards are
   indexed in place (51 ms, headers only) and each expert is served with two positioned
