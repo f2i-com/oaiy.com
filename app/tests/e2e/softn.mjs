@@ -27,9 +27,15 @@ const script = [
   { calls: [{ name: 'softn_interact', input: { actions: [{ fill: 'What needs to be done?', value: 'Buy bread' }, { click: 'Add' }] } }] },
   { text: 'Adding a task works.' },
   // "Add a clear button": a mistake the automatic check catches, then the fix.
-  { calls: [{ name: 'read_file', input: { path: 'logic/main.logic' } }] },
+  { calls: [
+    { name: 'update_plan', input: { goal: 'Clear finished tasks', items: [{ text: 'Read the logic', status: 'active' }, { text: 'Add clearDone()', status: 'pending' }, { text: 'Check the app', status: 'pending' }] } },
+    { name: 'read_file', input: { path: 'logic/main.logic' } },
+  ] },
   { calls: [{ name: 'edit_file', input: { path: 'logic/main.logic', old_string: 'function remaining() {', new_string: 'function clearDone( {\n  tasks = tasks.filter((t) => !t.done)\n}\n\nfunction remaining() {' } }] },
-  { calls: [{ name: 'edit_file', input: { path: 'logic/main.logic', old_string: 'function clearDone( {', new_string: 'function clearDone() {' } }] },
+  { calls: [
+    { name: 'edit_file', input: { path: 'logic/main.logic', old_string: 'function clearDone( {', new_string: 'function clearDone() {' } },
+    { name: 'update_plan', input: { goal: 'Clear finished tasks', items: [{ text: 'Read the logic', status: 'done' }, { text: 'Add clearDone()', status: 'done' }, { text: 'Check the app', status: 'done' }] } },
+  ] },
   { text: 'Added clearDone.' },
   // "Fix with agent" from the preview.
   { text: 'Looking at it.' },
@@ -207,6 +213,16 @@ try {
     expect(broken.includes('[Automatic check of') && /logic\/main\.logic/.test(broken) && broken.includes('Fix these errors'), broken.slice(0, 900));
     const fixed = JSON.stringify(requests[10].messages.at(-1));
     expect(fixed.includes('[Automatic check of') && fixed.includes('rendered without reported errors'), fixed.slice(-600));
+    const plan = await page.$eval('.plan', (el) => ({ hidden: el.hidden, finished: el.classList.contains('finished'), count: el.querySelector('.plan-count').textContent, goal: el.querySelector('.plan-goal').textContent, done: el.querySelectorAll('.plan-item.done').length }));
+    expect(!plan.hidden && plan.finished && plan.count === '3/3' && plan.goal === 'Clear finished tasks' && plan.done === 3, JSON.stringify(plan));
+    // Finished and idle: the steps fold away; a click shows them again.
+    expect(await page.$eval('.plan', (el) => el.classList.contains('collapsed')), 'a finished plan stays open');
+    await page.click('.plan-head');
+    expect(!(await page.$eval('.plan-items', (el) => el.hidden)), 'the steps did not open');
+    expect(!(await page.$$eval('details.tool .tool-name', (els) => els.map((e) => e.textContent))).includes('update_plan'), 'update_plan got a card');
+    if (process.env.SHOT) {
+      await page.screenshot({ path: process.env.SHOT.replace('.png', '-plan.png') });
+    }
     const cards = await page.$$eval('details.tool.auto', (els) => els.map((e) => e.className));
     expect(cards.some((c) => c.includes('failed')) && cards.at(-1).includes('ok'), `cards: ${cards}`);
   });

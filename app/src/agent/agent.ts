@@ -11,7 +11,7 @@ import type { Vfs } from '../vfs/vfs';
 import { AIProviderError } from './providers/aiProvider';
 import type { ProviderConfig } from './providers/types';
 import { sendTurn, type Attachment, type Reply, type ToolCall, type ToolResult, type Turn, type Usage } from './protocol';
-import { TOOLS, checkApp, runTool, type SoftnHost, type ToolContext } from './tools';
+import { TOOLS, checkApp, readPlan, runTool, type Plan, type SoftnHost, type ToolContext } from './tools';
 import { appLabel, findApps, resolveApp } from '../softn/softn';
 import type { ImagePart } from './images';
 
@@ -23,6 +23,10 @@ export type AgentEvent =
   | { type: 'tool_result'; result: ToolResult }
   | { type: 'status'; message: string }
   | { type: 'usage'; usage: Usage }
+  /** The checklist changed (update_plan). */
+  | { type: 'plan'; plan: Plan }
+  /** bot.computer asked the model to carry on (open plan items, a failing app). */
+  | { type: 'nudge'; message: string }
   /** The automatic check of a SoftN app after the agent changed it: running, then its outcome. */
   | { type: 'check'; id: string; root: string; state: 'running' | 'ok' | 'failed'; text?: string }
   | { type: 'done'; text: string; steps: number }
@@ -31,6 +35,8 @@ export type AgentEvent =
 export const MAX_STEPS = 60;
 const TRIM_OVER_CHARS = 240_000;
 const KEEP_RECENT_TURNS = 8;
+/** A run that stops short of its goal is asked to carry on at most this many times. */
+const MAX_NUDGES = 2;
 /** The same automatic-check errors this many times in a row stop the run. */
 const SAME_CHECK_LIMIT = 3;
 /** Images stay in the conversation for this many image-bearing turns. */
@@ -45,6 +51,8 @@ The user's project lives in a virtual filesystem in the browser; "/" is the proj
 - sandbox_shell for shell-style work (an emulated POSIX shell on the same sandbox). There is no real operating system: git, npm, pip, compilers and other native programs do not exist. Do not pretend to run them.
 - SoftN apps: a SoftN app is a folder whose manifest.json names a .ui page as "main" (with ui/*.ui pages and logic/*.logic or .py). A project can hold several, each in its own folder: to rebuild or learn from an existing app, read its files and write the new one in another folder. A .softn the user attaches is unpacked into its own folder (the original stays in uploads/, and softn_import unpacks any .softn in the project): when they ask for changes, edit that folder; when they ask to recreate, redo or base something on it, write a new app in a new folder and leave the original as it is. The SoftN reference is in your tools, so do not guess the language: softn_docs with no arguments gives the map, topic "guide" is the writing guide (read it before your first app), search finds how something is done across the guides, the components and the example apps; softn_components gives exact props and events; softn_examples has complete working apps to read or copy. Keep manifest.json true. After each step that changes an app, bot.computer checks it automatically (its files, then a real render) and adds the outcome to that step's result: when it reports errors, fix them before anything else. softn_check checks on demand; softn_inspect shows what the page displays; softn_interact uses the app like a person (click, fill, select, press keys) and reports errors the app raises, so test that the app works, not just that it renders. The user watches the app in a live preview as you build it, and can export any app folder as a .softn file.
 - web_fetch, curl, fetch() go through the user's network gate (/internet) and, from a browser, only reach sites that allow cross-origin requests. If the gate refuses a host, say so; the user decides whether to allow it.
+
+Work toward the user's goal. For anything that takes several steps (building or changing an app, a feature, a fix across files), first call update_plan with the goal and 3 to 8 concrete steps, and update it as each step starts and finishes: the user watches that checklist. You are done when every step is done and the result is checked (for an app: it renders without errors and softn_interact shows it working), not before.
 
 Work in small, verified steps. Prefer running code to check a claim over guessing. When you are done, say briefly what you changed and what you verified.`;
 
@@ -120,8 +128,27 @@ export class Agent {
 
   reset(): void {
     this.turns = [];
+    this.plan = null;
+    this.failingApps.clear();
     this.toolContext.reads.clear();
     this.toolContext.shell = { cwd: '/', env: {} };
+  }
+
+  /** The checklist from the latest update_plan. */
+  plan: Plan | null = null;
+  private checkedThisRun = false;
+
+  /**
+   * Why the run is not done yet, if the model stopped early: plan items it
+   * set this run and did not finish, or an app whose check still fails.
+   */
+  private unfinished(planThisRun: boolean): string | null {
+    // Only this run's checks count: an old failure should not hold up a question.
+    const failing = this.checkedThisRun ? [...this.failingApps.entries()][0] : undefined;
+    if (failing) return `The last automatic check of ${appLabel(failing[0])} still reports errors:\n${failing[1]}\nFix them and check the app again before you finish. If you cannot, say what is wrong.`;
+    const open = planThisRun && this.plan ? this.plan.items.filter((i) => i.status !== 'done') : [];
+    if (open.length) return `Your plan still has ${open.length} open step${open.length > 1 ? 's' : ''}: ${open.map((i) => `"${i.text}"`).join(', ')}. Carry on with ${open.length > 1 ? 'them' : 'it'}. If a step is no longer needed, or already done, call update_plan to say so. Then finish with a short summary.`;
+    return null;
   }
 
   /** Apps whose last check failed, with what it said: the run is not done while any are here. */
@@ -153,6 +180,7 @@ export class Agent {
     for (const [root, changed] of lastChange) {
       if ((lastCheck.get(root) ?? -1) > changed) continue;
       const id = `check-${Date.now()}-${root}`;
+      this.checkedThisRun = true;
       emit({ type: 'check', id, root, state: 'running' });
       const check = await checkApp(this.toolContext, root);
       emit({ type: 'check', id, root, state: check.ok ? 'ok' : 'failed', text: check.text });
@@ -232,6 +260,9 @@ export class Agent {
       if (change.type !== 'reset') changes.push({ path: change.path.replace(/^\/+/, ''), index: callIndex });
     });
     this.sameCheck = { signature: '', count: 0 };
+    let planThisRun = false;
+    this.checkedThisRun = false;
+    let nudges = 0;
     try {
       for (let step = 1; step <= MAX_STEPS; step++) {
         signal?.throwIfAborted();
@@ -240,6 +271,14 @@ export class Agent {
         this.turns.push({ role: 'assistant', text: reply.text, calls: reply.calls, anthropicContent: provider.type === 'anthropic' ? reply.anthropicContent : undefined });
         if (!reply.calls.length) {
           if (reply.truncated) emit({ type: 'status', message: 'The reply was cut off at the output limit.' });
+          // Stopping short of the goal: ask once or twice to carry on.
+          const unfinished = this.unfinished(planThisRun);
+          if (unfinished && nudges < MAX_NUDGES && !reply.truncated) {
+            nudges++;
+            emit({ type: 'nudge', message: unfinished.split('\n')[0] });
+            this.turns.push({ role: 'user', text: `[bot.computer] ${unfinished}`, automatic: true });
+            continue;
+          }
           emit({ type: 'done', text: reply.text, steps: step });
           return;
         }
@@ -251,6 +290,11 @@ export class Agent {
           emit({ type: 'tool_call', call });
           const result = await runTool(call, this.toolContext);
           results.push(result);
+          if (call.name === 'update_plan' && !result.isError) {
+            this.plan = readPlan(call.input);
+            planThisRun = true;
+            emit({ type: 'plan', plan: this.plan });
+          }
           emit({ type: 'tool_result', result });
           if (result.isError && result.content === lastFailure) failures++;
           else failures = result.isError ? 1 : 0;

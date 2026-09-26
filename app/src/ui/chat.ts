@@ -5,6 +5,7 @@
  */
 import type { AgentEvent } from '../agent/agent';
 import type { Attachment, ToolCall, ToolResult, Turn } from '../agent/protocol';
+import { readPlan, type Plan } from '../agent/tools';
 import { clear, h } from './dom';
 import { mediaElement, mediaKind, type Media } from './media';
 import { renderMarkdown } from './markdown';
@@ -40,6 +41,10 @@ export class ChatPane {
   private readonly pending = h('div.attachments');
   private files: File[] = [];
   private readonly status = h('div.chat-status');
+  /** The agent's checklist for the current request, pinned above the log. */
+  private readonly planBox = h('section.plan', { 'aria-live': 'polite' });
+  /** The person's choice to show or hide the steps; null follows the run (hidden once finished). */
+  private planOpen: boolean | null = null;
   private current: { box: HTMLElement; text: string; body: HTMLElement } | null = null;
   private thinking: { box: HTMLElement; text: string } | null = null;
   private cards = new Map<string, HTMLElement>();
@@ -57,7 +62,8 @@ export class ChatPane {
       open: (path: string, app?: string) => void;
     },
   ) {
-    this.element.append(h('div.pane-title', 'Agent'), this.log, this.status, this.pending, h('div.chat-compose', this.attachButton, this.input, this.send), this.picker);
+    this.planBox.hidden = true;
+    this.element.append(h('div.pane-title', 'Agent'), this.planBox, this.log, this.status, this.pending, h('div.chat-compose', this.attachButton, this.input, this.send), this.picker);
     this.attachButton.addEventListener('click', () => this.picker.click());
     this.picker.addEventListener('change', () => {
       if (this.picker.files) this.addFiles([...this.picker.files]);
@@ -138,6 +144,7 @@ export class ChatPane {
 
   setBusy(busy: boolean): void {
     this.busy = busy;
+    if (this.currentPlan) this.showPlan(this.currentPlan, busy);
     this.send.textContent = busy ? 'Stop' : 'Send';
     this.send.classList.toggle('danger', busy);
     if (!busy) this.setStatus('');
@@ -151,7 +158,46 @@ export class ChatPane {
     this.log.scrollTop = this.log.scrollHeight;
   }
 
+  /** Show the checklist: the goal, progress, and each step's state. */
+  showPlan(plan: Plan | null, running = this.busy): void {
+    clear(this.planBox);
+    if (!plan) {
+      this.planBox.hidden = true;
+      return;
+    }
+    const done = plan.items.filter((i) => i.status === 'done').length;
+    const total = plan.items.length;
+    const finished = done === total;
+    const open = this.planOpen ?? !(finished && !running);
+    this.planBox.hidden = false;
+    this.planBox.classList.toggle('finished', finished);
+    this.planBox.classList.toggle('collapsed', !open);
+    const head = h(
+      'button.plan-head',
+      { title: open ? 'Hide the steps' : 'Show the steps', 'aria-expanded': String(open), onclick: () => {
+        this.planOpen = !open;
+        this.showPlan(plan, running);
+      } },
+      h('span.plan-title', finished ? '✓ Done' : running ? 'Working on' : 'Plan'),
+      h('span.plan-goal', plan.goal || plan.items.find((i) => i.status === 'active')?.text || ''),
+      h('span.plan-count', `${done}/${total}`),
+    );
+    const bar = h('div.plan-bar', h('span', { style: `width:${Math.round((done / total) * 100)}%` }));
+    const list = h(
+      'ol.plan-items',
+      ...plan.items.map((item) =>
+        h(`li.plan-item.${item.status}`, { class: item.status === 'active' && running ? 'running' : '' }, h('span.plan-mark', { 'aria-label': item.status }, item.status === 'done' ? '✓' : item.status === 'active' ? '' : ''), h('span.plan-text', item.text)),
+      ),
+    );
+    list.hidden = !open;
+    this.planBox.append(head, bar, list);
+  }
+
+  private currentPlan: Plan | null = null;
+
   clearLog(): void {
+    this.currentPlan = null;
+    this.showPlan(null);
     for (const m of this.media.splice(0)) m.dispose();
     clear(this.log);
     this.cards.clear();
@@ -177,6 +223,10 @@ export class ChatPane {
 
   user(text: string, attachments: Attachment[] = []): void {
     this.current = null;
+    // A new request gets its own plan.
+    this.currentPlan = null;
+    this.planOpen = null;
+    this.showPlan(null);
     const box = h('div.msg.user', h('div.msg-body', text || (attachments.length ? '' : ' ')));
     if (attachments.length) box.append(h('div.msg-attachments', ...attachments.map((a) => this.fileView(a.path, a.name, a.app))));
     this.log.append(box);
@@ -205,6 +255,8 @@ export class ChatPane {
   private toolCard(call: ToolCall): void {
     this.current = null;
     this.thinking = null;
+    // The checklist shows the plan; a card per update would only repeat it.
+    if (call.name === 'update_plan') return;
     const result = h('pre.tool-result', 'running…');
     const card = h(
       'details.tool',
@@ -294,6 +346,16 @@ export class ChatPane {
       case 'check':
         this.checkCard(e);
         break;
+      case 'plan':
+        if (this.currentPlan?.goal !== e.plan.goal) this.planOpen = null;
+        this.currentPlan = e.plan;
+        this.showPlan(e.plan, true);
+        break;
+      case 'nudge':
+        this.current = null;
+        this.log.append(h('div.msg.nudge', h('span', '↻'), h('span', ` Not finished yet, so the agent carries on: ${e.message}`)));
+        this.scroll();
+        break;
       case 'done':
         this.current = null;
         break;
@@ -307,6 +369,11 @@ export class ChatPane {
   replay(turns: Turn[]): void {
     this.clearLog();
     for (const turn of turns) {
+      if (turn.role === 'user' && turn.automatic) {
+        this.current = null;
+        this.log.append(h('div.msg.nudge', h('span', '↻'), h('span', ` ${turn.text.replace(/^\[bot\.computer\] /, '').split('\n')[0]}`)));
+        continue;
+      }
       if (turn.role === 'user') {
         const text = turn.text.replace(/^<project>[\s\S]*?<\/project>\n\n/, '');
         const attached = /\n\n\[Attached and saved in the project: ([\s\S]*)\]$/.exec(text);
@@ -317,8 +384,18 @@ export class ChatPane {
       else if (turn.role === 'assistant') {
         if (turn.text) this.assistantText(turn.text);
         this.current = null;
-        for (const call of turn.calls) this.toolCard(call);
+        for (const call of turn.calls) {
+          this.toolCard(call);
+          if (call.name === 'update_plan') {
+            try {
+              this.currentPlan = readPlan(call.input);
+            } catch {
+              /* a plan the tool refused */
+            }
+          }
+        }
       } else for (const r of turn.results) this.toolResult(r);
     }
+    this.showPlan(this.currentPlan, false);
   }
 }

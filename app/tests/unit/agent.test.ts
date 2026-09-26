@@ -110,3 +110,67 @@ describe('tool rules', () => {
     expect(events[0]).toMatchObject({ type: 'error' });
   });
 });
+
+describe('the plan and the goal', () => {
+  const plan = (statuses: string[]) => ({ goal: 'A greeting that says hi', items: statuses.map((status, i) => ({ text: `step ${i + 1}`, status })) });
+
+  it('shows the plan, and a run that stops with open steps is asked to carry on', async () => {
+    const fake = fakeProvider('openai', [
+      { calls: [{ name: 'update_plan', input: plan(['active', 'pending']) }] },
+      { text: 'I think that is it.' },
+      (body) => {
+        expect(JSON.stringify(body.messages)).toContain('Your plan still has 2 open steps');
+        return { calls: [{ name: 'update_plan', input: plan(['done', 'done']) }] };
+      },
+      { text: 'All done.' },
+    ]);
+    const { agent, events, emit } = setup(OPENAI);
+    await agent.run('greet', emit);
+    expect(fake.bodies).toHaveLength(4);
+    const plans = events.filter((e) => e.type === 'plan');
+    expect(plans).toHaveLength(2);
+    expect(agent.plan?.items.every((i) => i.status === 'done')).toBe(true);
+    expect(events.filter((e) => e.type === 'nudge')).toHaveLength(1);
+    expect(events.at(-1)).toMatchObject({ type: 'done', text: 'All done.' });
+    expect(agent.turns.some((t) => t.role === 'user' && t.automatic)).toBe(true);
+  });
+
+  it('asks at most twice, then lets the run end', async () => {
+    fakeProvider('openai', [
+      { calls: [{ name: 'update_plan', input: plan(['active', 'pending']) }] },
+      { text: 'stopping' },
+      { text: 'still stopping' },
+      { text: 'really stopping' },
+      { text: 'out of script' },
+    ]);
+    const { agent, events, emit } = setup(OPENAI);
+    await agent.run('greet', emit);
+    expect(events.filter((e) => e.type === 'nudge')).toHaveLength(2);
+    expect(events.at(-1)).toMatchObject({ type: 'done', text: 'really stopping' });
+  });
+
+  it('a plan from an earlier request does not hold up a new one', async () => {
+    fakeProvider('openai', [
+      { calls: [{ name: 'update_plan', input: plan(['active']) }] },
+      { text: 'a' },
+      { text: 'b' },
+      { text: 'c' },
+      { text: 'answer to the question' },
+    ]);
+    const { agent, events, emit } = setup(OPENAI);
+    await agent.run('greet', emit);
+    events.length = 0;
+    await agent.run('what is 2 + 2?', emit);
+    expect(events.filter((e) => e.type === 'nudge')).toHaveLength(0);
+    expect(events.at(-1)).toMatchObject({ type: 'done', text: 'answer to the question' });
+  });
+
+  it('refuses an empty plan', async () => {
+    fakeProvider('openai', [{ calls: [{ name: 'update_plan', input: { items: [] } }] }, { text: 'ok' }]);
+    const { agent, events, emit } = setup(OPENAI);
+    await agent.run('go', emit);
+    const result = events.find((e) => e.type === 'tool_result') as Extract<AgentEvent, { type: 'tool_result' }>;
+    expect(result.result.isError).toBe(true);
+    expect(agent.plan).toBeNull();
+  });
+});

@@ -26,6 +26,33 @@ const OUTPUT_CHARS = 30_000;
 const DEFAULT_TIMEOUT_S = 30;
 const MAX_TIMEOUT_S = 300;
 
+/** The checklist the person watches: the goal of the request and its steps. */
+export interface Plan {
+  goal: string;
+  items: Array<{ text: string; status: 'pending' | 'active' | 'done' }>;
+}
+
+/** A plan from update_plan's arguments, or an error saying what is wrong with them. */
+export function readPlan(input: Record<string, unknown>): Plan {
+  const raw = Array.isArray(input.items) ? input.items : typeof input.items === 'string' ? (() => {
+    try {
+      return JSON.parse(input.items as string) as unknown[];
+    } catch {
+      return [];
+    }
+  })() : [];
+  const items = raw
+    .map((item) => (typeof item === 'string' ? { text: item, status: 'pending' } : (item as Record<string, unknown>)))
+    .filter((item) => typeof item?.text === 'string' && item.text.trim())
+    .map((item) => {
+      const status = String(item.status ?? 'pending').toLowerCase();
+      return { text: String(item.text).trim().slice(0, 200), status: (status === 'done' || status === 'completed' || status === 'complete' ? 'done' : status === 'active' || status === 'in_progress' || status === 'doing' ? 'active' : 'pending') as Plan['items'][number]['status'] };
+    })
+    .slice(0, 12);
+  if (!items.length) throw new Error('items is empty: give the whole checklist, e.g. [{"text": "Write the page", "status": "active"}, {"text": "Check it", "status": "pending"}]');
+  return { goal: typeof input.goal === 'string' ? input.goal.trim().slice(0, 300) : '', items };
+}
+
 /** The live SoftN preview, as the tools use it. */
 export interface SoftnHost {
   check(root?: string): Promise<PreviewResult>;
@@ -87,6 +114,20 @@ export const TOOLS: ToolSpec[] = [
         ignore_case: { type: 'boolean' },
         literal: { type: 'boolean', description: 'Treat pattern as plain text' },
         max_results: int,
+      },
+    },
+  },
+  {
+    name: 'update_plan',
+    description:
+      'Set the checklist the user watches while you work: the goal of their request and 3 to 8 concrete steps to reach it. Call it before you start work that takes several steps (building or changing an app, a feature, a fix across files), ' +
+      'then again whenever a step starts or finishes, sending the whole list each time with each item "pending", "active" (the one you are on) or "done". The work is finished when every item is done and the result is checked.',
+    parameters: {
+      type: 'object',
+      required: ['items'],
+      properties: {
+        goal: { ...str, description: 'What the user asked for, as the outcome to reach, in one sentence' },
+        items: { type: 'array', items: { type: 'object', properties: { text: str, status: { type: 'string', enum: ['pending', 'active', 'done'] } }, required: ['text', 'status'] } },
       },
     },
   },
@@ -580,6 +621,12 @@ async function execute(call: ToolCall, ctx: ToolContext): Promise<string> {
       const text = cut(lines.join('\n'));
       if (report.error || report.problems.some((p) => p.level === 'error')) throw new Error(text);
       return text;
+    }
+    case 'update_plan': {
+      const plan = readPlan(input);
+      const done = plan.items.filter((i) => i.status === 'done').length;
+      const next = plan.items.find((i) => i.status === 'active') ?? plan.items.find((i) => i.status === 'pending');
+      return done === plan.items.length ? `Plan updated: all ${done} steps done. Check the result, then tell the user what you did.` : `Plan updated: ${done} of ${plan.items.length} done.${next ? ` Next: ${next.text}` : ''}`;
     }
     case 'present_file': {
       const path = normalizePath(need(input, 'path'));

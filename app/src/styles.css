@@ -325,3 +325,29 @@ footer.dialog-buttons { flex: none; padding: 12px 22px 16px; border-top: 1px sol
 @media (max-width: 600px) {
   dialog.modal, dialog.modal.wide { height: fit-content; }
 }
+
+/* The agent's plan: pinned above the chat log while it works. */
+.plan { margin: 8px 8px 0; border: 1px solid var(--border); border-radius: 10px; background: var(--panel-2); overflow: hidden; flex: none; }
+.plan[hidden] { display: none; }
+.plan-head { display: flex; align-items: center; gap: 8px; width: 100%; padding: 8px 10px; background: transparent; border: 0; border-radius: 0; text-align: left; }
+.plan-head:hover { border: 0; background: color-mix(in srgb, var(--accent) 6%, transparent); }
+.plan-title { flex: none; font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--accent); font-weight: 600; }
+.plan.finished .plan-title { color: var(--ok); }
+.plan-goal { flex: 1; min-width: 0; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.plan-count { flex: none; font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.plan-bar { height: 3px; background: var(--border); }
+.plan-bar span { display: block; height: 100%; background: var(--accent); transition: width 300ms ease; }
+.plan.finished .plan-bar span { background: var(--ok); }
+.plan-items { list-style: none; margin: 0; padding: 6px 10px 8px; display: flex; flex-direction: column; gap: 3px; max-height: 32vh; overflow-y: auto; }
+.plan-items[hidden] { display: none; }
+.plan-item { display: flex; align-items: flex-start; gap: 8px; font-size: 13px; line-height: 1.4; color: var(--muted); }
+.plan-item.active { color: var(--text); font-weight: 550; }
+.plan-item.done .plan-text { text-decoration: line-through; text-decoration-color: color-mix(in srgb, var(--muted) 60%, transparent); }
+.plan-mark { flex: none; width: 15px; height: 15px; margin-top: 2px; border-radius: 50%; border: 1.5px solid var(--border); display: grid; place-items: center; font-size: 10px; line-height: 1; }
+.plan-item.done .plan-mark { border-color: var(--ok); background: var(--ok); color: #0f1115; font-weight: 700; }
+.plan-item.active .plan-mark { border-color: var(--accent); }
+.plan-item.active.running .plan-mark { border-top-color: transparent; animation: plan-spin 0.9s linear infinite; }
+@keyframes plan-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .plan-item.active.running .plan-mark { animation: none; border-top-color: var(--accent); } }
+.msg.nudge { display: flex; gap: 4px; font-size: 12px; color: var(--muted); background: transparent; border: 1px dashed var(--border); padding: 4px 8px; }
+.plan { margin-bottom: 6px; box-shadow: 0 6px 12px -8px rgba(0, 0, 0, 0.6); position: relative; z-index: 1; }

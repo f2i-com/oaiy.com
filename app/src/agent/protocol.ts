@@ -45,7 +45,7 @@ export interface Attachment {
 }
 
 export type Turn =
-  | { role: 'user'; text: string; images?: ImagePart[]; attachments?: Attachment[] }
+  | { role: 'user'; text: string; images?: ImagePart[]; attachments?: Attachment[]; /** Written by bot.computer (a nudge to finish), not the person. */ automatic?: boolean }
   | { role: 'assistant'; text: string; calls: ToolCall[]; anthropicContent?: unknown[] }
   | { role: 'tool'; results: ToolResult[] };
 
