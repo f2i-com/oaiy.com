@@ -1,0 +1,963 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NROB Studio</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect x='1' y='2' width='14' height='3' fill='%23E3A63B'/%3E%3Crect x='1' y='6.5' width='14' height='3' fill='%233DB5A6'/%3E%3Crect x='1' y='11' width='14' height='3' fill='%238E7DF2'/%3E%3C/svg%3E">
+<style>
+:root {
+  --bg: #1E252E; --panel: #252D38; --panel-2: #2B3441; --line: #343E4C; --line-2: #414D5E;
+  --text: #E4E8EE; --muted: #8A94A3; --faint: #677284;
+  --ssd: #E3A63B; --ram: #3DB5A6; --gpu: #8E7DF2; --bad: #EF6F6C; --good: #6FCF8E;
+  --display: "Bahnschrift", "DIN Alternate", "DIN 2014", "Barlow", system-ui, sans-serif;
+  --body: "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, sans-serif;
+  --code: "Cascadia Mono", "Cascadia Code", Consolas, "SF Mono", monospace;
+  --r: 6px;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; }
+body { background: var(--bg); color: var(--text); font: 14px/1.5 var(--body); -webkit-font-smoothing: antialiased; }
+button, input, select, textarea { font: inherit; color: inherit; }
+a { color: var(--gpu); }
+:focus-visible { outline: 2px solid var(--gpu); outline-offset: 2px; }
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }
+
+/* frame */
+.app { display: grid; grid-template-columns: 208px 1fr; min-height: 100vh; }
+.rail { border-right: 1px solid var(--line); padding: 20px 14px; display: flex; flex-direction: column; gap: 22px; position: sticky; top: 0; height: 100vh; }
+.brand { display: flex; align-items: center; gap: 10px; padding: 0 6px; }
+.brand-mark { display: grid; gap: 3px; width: 22px; }
+.brand-mark i { display: block; height: 4px; border-radius: 1px; }
+.brand-name { font: 600 19px/1 var(--display); letter-spacing: .02em; }
+.brand-name small { display: block; font: 400 12px/1.4 var(--body); color: var(--muted); letter-spacing: 0; margin-top: 3px; }
+nav { display: grid; gap: 2px; }
+nav button { all: unset; cursor: pointer; padding: 8px 10px; border-radius: var(--r); color: var(--muted); display: flex; justify-content: space-between; align-items: center; }
+nav button:hover { color: var(--text); background: var(--panel); }
+nav button[aria-current="page"] { color: var(--text); background: var(--panel-2); }
+nav button:focus-visible { outline: 2px solid var(--gpu); }
+.rail-foot { margin-top: auto; font-size: 12px; color: var(--muted); display: grid; gap: 6px; padding: 0 6px; }
+.dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; background: var(--faint); flex: none; }
+.dot.ready { background: var(--good); } .dot.starting { background: var(--ssd); animation: pulse 1.2s infinite; } .dot.failed { background: var(--bad); }
+@keyframes pulse { 50% { opacity: .35; } }
+main { padding: 28px 36px 96px; max-width: 1180px; width: 100%; }
+h1 { font: 600 28px/1.15 var(--display); margin: 0 0 4px; letter-spacing: .01em; }
+h2 { font: 600 17px/1.3 var(--display); margin: 0 0 12px; letter-spacing: .01em; }
+h3 { font: 600 14px/1.3 var(--display); margin: 0 0 8px; color: var(--muted); letter-spacing: .02em; }
+.lede { color: var(--muted); margin: 0 0 26px; max-width: 70ch; }
+section.view { display: none; } section.view.on { display: block; }
+.block { border-top: 1px solid var(--line); padding: 22px 0 8px; }
+.block:first-of-type { border-top: 0; padding-top: 0; }
+.cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 28px; }
+.row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.spread { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+.muted { color: var(--muted); } .small { font-size: 12px; } .num { font-family: var(--display); font-variant-numeric: tabular-nums; }
+.path { font: 12px/1.4 var(--code); color: var(--muted); word-break: break-all; }
+
+/* controls */
+.btn { border: 1px solid var(--line-2); background: var(--panel-2); border-radius: var(--r); padding: 7px 14px; cursor: pointer; white-space: nowrap; }
+.btn:hover { border-color: var(--muted); }
+.btn:disabled { opacity: .45; cursor: default; }
+.btn.go { background: var(--gpu); border-color: var(--gpu); color: #14121F; font-weight: 600; }
+.btn.go:hover { filter: brightness(1.08); }
+.btn.warn { color: var(--bad); }
+.btn.quiet { background: transparent; border-color: transparent; color: var(--muted); padding: 5px 8px; }
+.btn.quiet:hover { color: var(--text); border-color: var(--line-2); }
+label.f { display: grid; gap: 5px; font-size: 12px; color: var(--muted); }
+label.f > span { display: flex; justify-content: space-between; gap: 8px; }
+input[type=text], input[type=number], input[type=password], select, textarea {
+  background: var(--bg); border: 1px solid var(--line-2); border-radius: var(--r); padding: 7px 10px; width: 100%; font-size: 14px; }
+textarea { resize: vertical; min-height: 84px; line-height: 1.45; }
+input:focus, select:focus, textarea:focus { border-color: var(--gpu); outline: none; }
+input[type=checkbox] { accent-color: var(--gpu); width: 16px; height: 16px; }
+input[type=range] { width: 100%; accent-color: var(--gpu); }
+.check { display: flex; gap: 8px; align-items: center; font-size: 13px; cursor: pointer; }
+.grid-f { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 14px; }
+.pathfield { display: flex; gap: 6px; } .pathfield input { font: 12px var(--code); }
+.seg { display: inline-flex; border: 1px solid var(--line-2); border-radius: var(--r); overflow: hidden; }
+.seg button { all: unset; cursor: pointer; padding: 6px 13px; color: var(--muted); font: 500 13px var(--display); letter-spacing: .02em; }
+.seg button + button { border-left: 1px solid var(--line-2); }
+.seg button[aria-pressed="true"] { background: var(--panel-2); color: var(--text); }
+.seg button:focus-visible { outline: 2px solid var(--gpu); outline-offset: -2px; }
+.seg button[data-tier=gpu][aria-pressed=true] { box-shadow: inset 0 -2px var(--gpu); }
+.seg button[data-tier=ram][aria-pressed=true] { box-shadow: inset 0 -2px var(--ram); }
+.seg button[data-tier=ssd][aria-pressed=true] { box-shadow: inset 0 -2px var(--ssd); }
+.seg button[data-tier=auto][aria-pressed=true] { box-shadow: inset 0 -2px var(--text); }
+
+/* the tier strip */
+.strip { display: flex; height: 34px; border-radius: var(--r); overflow: hidden; border: 1px solid var(--line-2); background: var(--bg); }
+.strip > div { display: flex; align-items: center; padding: 0 10px; font: 600 12px var(--display); letter-spacing: .03em; color: #15181D; white-space: nowrap; overflow: hidden; min-width: 0; transition: flex-grow .35s ease; }
+.strip .t-gpu { background: var(--gpu); } .strip .t-ram { background: var(--ram); }
+.strip .t-ssd { background: repeating-linear-gradient(135deg, var(--ssd) 0 8px, #CF9530 8px 16px); }
+.strip-legend { display: flex; gap: 18px; flex-wrap: wrap; margin-top: 8px; font-size: 12px; color: var(--muted); }
+.key { display: inline-flex; align-items: center; gap: 6px; } .key i { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+.meter { height: 8px; background: var(--bg); border: 1px solid var(--line); border-radius: 4px; overflow: hidden; }
+.meter > div { height: 100%; transition: width .5s ease; }
+.hw { display: grid; gap: 14px; }
+.hw-row { display: grid; grid-template-columns: 150px 1fr 120px; gap: 14px; align-items: center; }
+.hw-row .label { font: 600 13px var(--display); } .hw-row .label small { display: block; font: 12px var(--body); color: var(--muted); }
+
+/* lists */
+.list { display: grid; }
+.item { display: grid; gap: 10px; padding: 14px 0; border-bottom: 1px solid var(--line); }
+.item:last-child { border-bottom: 0; }
+.item-head { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+.item-head strong { font: 600 15px var(--display); letter-spacing: .01em; }
+.tag { font-size: 12px; padding: 1px 8px; border-radius: 10px; border: 1px solid var(--line-2); color: var(--muted); }
+.tag.gpu { color: var(--gpu); border-color: color-mix(in srgb, var(--gpu) 45%, transparent); }
+.tag.ram { color: var(--ram); border-color: color-mix(in srgb, var(--ram) 45%, transparent); }
+.tag.ssd { color: var(--ssd); border-color: color-mix(in srgb, var(--ssd) 45%, transparent); }
+.tag.bad { color: var(--bad); border-color: color-mix(in srgb, var(--bad) 45%, transparent); }
+.tag.good { color: var(--good); border-color: color-mix(in srgb, var(--good) 45%, transparent); }
+.empty { color: var(--muted); padding: 18px 0; }
+table.routes { width: 100%; border-collapse: collapse; }
+table.routes th { text-align: left; font: 500 12px var(--body); color: var(--muted); padding: 6px 8px; border-bottom: 1px solid var(--line); }
+table.routes td { padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: middle; }
+table.routes input, table.routes select { padding: 5px 8px; font-size: 13px; }
+table.routes td.path input { font-family: var(--code); }
+
+/* add model */
+.drop { border: 1px dashed var(--line-2); border-radius: var(--r); padding: 18px; display: grid; gap: 12px; }
+.detected { border-left: 3px solid var(--line-2); padding: 6px 0 6px 14px; display: grid; gap: 4px; }
+.detected.llm { border-color: var(--gpu); } .detected.image { border-color: var(--ram); } .detected.video { border-color: var(--ssd); }
+
+/* playground */
+.tabs { display: flex; gap: 2px; border-bottom: 1px solid var(--line); margin-bottom: 20px; }
+.tabs button { all: unset; cursor: pointer; padding: 9px 16px; color: var(--muted); font: 500 14px var(--display); letter-spacing: .02em; border-bottom: 2px solid transparent; margin-bottom: -1px; }
+.tabs button[aria-selected=true] { color: var(--text); border-color: var(--gpu); }
+.tabs button:focus-visible { outline: 2px solid var(--gpu); }
+.chat { display: grid; grid-template-rows: 1fr auto; height: calc(100vh - 250px); min-height: 380px; border: 1px solid var(--line); border-radius: var(--r); }
+.msgs { overflow-y: auto; padding: 18px 20px; display: grid; gap: 18px; align-content: start; }
+.msg { max-width: 76ch; white-space: pre-wrap; word-wrap: break-word; }
+.msg.user { justify-self: end; background: var(--panel-2); padding: 9px 13px; border-radius: var(--r); }
+.msg .think { color: var(--faint); font-size: 13px; border-left: 2px solid var(--line-2); padding-left: 10px; margin-bottom: 8px; }
+.msg .meta { color: var(--faint); font-size: 12px; margin-top: 6px; }
+.composer { border-top: 1px solid var(--line); padding: 12px; display: grid; grid-template-columns: 1fr auto; gap: 10px; align-items: end; }
+.composer textarea { min-height: 46px; max-height: 200px; border: 0; background: transparent; padding: 6px; }
+.gen { display: grid; grid-template-columns: minmax(280px, 360px) 1fr; gap: 28px; align-items: start; }
+.gen-form { display: grid; gap: 14px; }
+.gallery { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 12px; }
+.gallery figure { margin: 0; background: var(--panel); border-radius: var(--r); overflow: hidden; }
+.gallery img, .gallery video { width: 100%; display: block; background: #151A20; }
+.gallery figcaption { padding: 7px 10px; font-size: 12px; color: var(--muted); display: flex; justify-content: space-between; gap: 8px; }
+.progress { display: grid; gap: 6px; }
+.progress .meter > div { background: var(--gpu); }
+.job { display: grid; grid-template-columns: 64px 1fr auto; gap: 14px; align-items: center; padding: 10px 0; border-bottom: 1px solid var(--line); }
+.job img, .job .ph { width: 64px; height: 48px; object-fit: cover; border-radius: 4px; background: var(--panel-2); }
+.job .p { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.log { background: #181E25; border: 1px solid var(--line); border-radius: var(--r); padding: 12px 14px; height: calc(100vh - 260px); min-height: 300px; overflow: auto; font: 12px/1.55 var(--code); white-space: pre-wrap; word-break: break-all; color: #C6CDD7; }
+.endpoint { display: grid; grid-template-columns: 110px 1fr auto; gap: 10px; align-items: center; padding: 8px 0; border-bottom: 1px solid var(--line); }
+.endpoint code { font: 13px var(--code); color: var(--text); word-break: break-all; }
+pre.example { background: #181E25; border: 1px solid var(--line); border-radius: var(--r); padding: 12px 14px; font: 12px/1.55 var(--code); overflow-x: auto; color: #C6CDD7; margin: 8px 0 0; }
+
+/* save bar, toasts, dialog */
+.savebar { position: fixed; left: 208px; right: 0; bottom: 0; background: var(--panel-2); border-top: 1px solid var(--line-2); padding: 12px 36px; display: none; justify-content: space-between; align-items: center; gap: 12px; z-index: 5; }
+.savebar.on { display: flex; }
+.toasts { position: fixed; right: 20px; top: 20px; display: grid; gap: 8px; z-index: 20; }
+.toast { background: var(--panel-2); border: 1px solid var(--line-2); border-left: 3px solid var(--good); padding: 10px 14px; border-radius: var(--r); max-width: 420px; white-space: pre-wrap; }
+.toast.err { border-left-color: var(--bad); }
+dialog { background: var(--panel); color: var(--text); border: 1px solid var(--line-2); border-radius: 8px; padding: 0; width: min(760px, 94vw); }
+dialog::backdrop { background: rgba(10, 13, 17, .6); }
+.dlg-head { padding: 16px 20px 10px; display: grid; gap: 10px; }
+.crumbs { display: flex; gap: 6px; }
+.crumbs input { font: 12px var(--code); }
+.files { max-height: 52vh; overflow-y: auto; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+.files button { all: unset; box-sizing: border-box; cursor: pointer; width: 100%; display: grid; grid-template-columns: 22px 1fr auto; gap: 10px; padding: 7px 20px; }
+.files button:hover, .files button:focus-visible { background: var(--panel-2); }
+.files button[aria-selected=true] { background: color-mix(in srgb, var(--gpu) 22%, transparent); }
+.files .ic { color: var(--muted); } .files .dir .ic { color: var(--ssd); }
+.files .sz { color: var(--muted); font-size: 12px; font-family: var(--display); }
+.dlg-foot { padding: 12px 20px 16px; display: flex; justify-content: space-between; gap: 10px; align-items: center; }
+@media (max-width: 860px) {
+  .app { grid-template-columns: 1fr; }
+  .rail { position: static; height: auto; flex-direction: row; flex-wrap: wrap; border-right: 0; border-bottom: 1px solid var(--line); gap: 10px; }
+  nav { display: flex; flex-wrap: wrap; } .rail-foot { display: none; }
+  main { padding: 20px 16px 96px; }
+  .gen { grid-template-columns: 1fr; }
+  .hw-row { grid-template-columns: 1fr; gap: 6px; }
+  .savebar { left: 0; padding: 12px 16px; }
+}
+</style>
+</head>
+<body>
+<div class="app">
+  <aside class="rail">
+    <div class="brand">
+      <div class="brand-mark" aria-hidden="true"><i style="background:var(--ssd)"></i><i style="background:var(--ram)"></i><i style="background:var(--gpu)"></i></div>
+      <div class="brand-name">NROB Studio<small>NVMe to RAM to GPU</small></div>
+    </div>
+    <nav aria-label="Sections">
+      <button data-view="overview" aria-current="page">Overview</button>
+      <button data-view="play">Playground</button>
+      <button data-view="models">Models</button>
+      <button data-view="memory">Memory</button>
+      <button data-view="endpoints">Endpoints</button>
+      <button data-view="settings">Settings</button>
+      <button data-view="logs">Logs</button>
+    </nav>
+    <div class="rail-foot">
+      <div class="row"><span class="dot" id="foot-llm"></span><span id="foot-llm-text">LLM stopped</span></div>
+      <div class="row"><span class="dot" id="foot-media"></span><span id="foot-media-text">Media idle</span></div>
+    </div>
+  </aside>
+
+  <main>
+    <!-- Overview -->
+    <section class="view on" id="v-overview">
+      <h1>Overview</h1>
+      <p class="lede">Models run from where their weights live. Hot weights stay on the GPU, warm ones in RAM, and the rest stream from the SSD when needed, so a small machine can run big models.</p>
+      <div class="block">
+        <div class="spread"><h2>Hardware</h2><span class="muted small" id="hw-note"></span></div>
+        <div class="hw" id="hw"></div>
+      </div>
+      <div class="block cols">
+        <div>
+          <div class="spread"><h2>Language model</h2><span id="llm-tag"></span></div>
+          <p class="muted" id="llm-detail">Not running.</p>
+          <div class="row">
+            <button class="btn go" id="llm-start">Start</button>
+            <button class="btn" id="llm-restart">Restart</button>
+            <button class="btn warn" id="llm-stop">Stop</button>
+          </div>
+          <p class="muted small" id="llm-note"></p>
+        </div>
+        <div>
+          <h2>Endpoints</h2>
+          <div id="ov-endpoints"></div>
+        </div>
+      </div>
+      <div class="block">
+        <div class="spread"><h2>Recent media</h2><button class="btn quiet" id="open-outputs">Open output folder</button></div>
+        <div id="ov-jobs"></div>
+      </div>
+    </section>
+
+    <!-- Playground -->
+    <section class="view" id="v-play">
+      <h1>Playground</h1>
+      <p class="lede">Try each endpoint here before pointing another app at it. Requests go through the same routes that other apps use.</p>
+      <div class="tabs" role="tablist">
+        <button role="tab" aria-selected="true" data-tab="chat">Chat</button>
+        <button role="tab" aria-selected="false" data-tab="image">Image</button>
+        <button role="tab" aria-selected="false" data-tab="video">Video</button>
+      </div>
+      <div data-panel="chat">
+        <div class="row" style="margin-bottom:12px">
+          <label class="f" style="min-width:220px"><span>Model</span><select id="chat-model"></select></label>
+          <label class="check" style="margin-top:18px"><input type="checkbox" id="chat-think"> Think first</label>
+          <button class="btn quiet" id="chat-clear" style="margin-top:18px">Clear conversation</button>
+        </div>
+        <div class="chat">
+          <div class="msgs" id="msgs"><div class="empty" id="chat-empty">Send a message to load the model and start a conversation. The first reply includes load time.</div></div>
+          <div class="composer">
+            <textarea id="chat-input" rows="2" placeholder="Message the model (Enter sends, Shift+Enter for a new line)"></textarea>
+            <button class="btn go" id="chat-send">Send</button>
+          </div>
+        </div>
+      </div>
+      <div data-panel="image" hidden>
+        <div class="gen">
+          <form class="gen-form" id="img-form">
+            <label class="f"><span>Prompt</span><textarea id="img-prompt" required placeholder="A red fox sitting in fresh snow, photograph"></textarea></label>
+            <label class="f"><span>Model</span><select id="img-model"></select></label>
+            <div class="grid-f" style="grid-template-columns:1fr 1fr">
+              <label class="f"><span>Size</span><select id="img-size"><option>1024x1024</option><option>1344x768</option><option>768x1344</option><option>1536x1024</option><option>512x512</option></select></label>
+              <label class="f"><span>Images</span><input type="number" id="img-n" min="1" max="16" value="1"></label>
+              <label class="f"><span>Steps <em class="muted">model default</em></span><input type="number" id="img-steps" min="2" max="100" placeholder="auto"></label>
+              <label class="f"><span>Seed</span><input type="number" id="img-seed" min="0" placeholder="random"></label>
+            </div>
+            <label class="f"><span>Negative prompt (SDXL)</span><input type="text" id="img-neg" placeholder="blurry, low quality"></label>
+            <div class="f"><span class="small muted">Where the weights live for this job</span><div class="seg" id="img-tier"></div></div>
+            <button class="btn go" type="submit" id="img-go">Generate</button>
+            <div class="progress" id="img-progress" hidden><div class="meter"><div style="width:0"></div></div><span class="small muted"></span></div>
+          </form>
+          <div><div class="gallery" id="img-gallery"></div></div>
+        </div>
+      </div>
+      <div data-panel="video" hidden>
+        <div class="gen">
+          <form class="gen-form" id="vid-form">
+            <label class="f"><span>Prompt</span><textarea id="vid-prompt" required placeholder="Waves rolling onto a pebble beach at dusk"></textarea></label>
+            <label class="f"><span>Model</span><select id="vid-model"></select></label>
+            <div class="grid-f" style="grid-template-columns:1fr 1fr">
+              <label class="f"><span>Size</span><select id="vid-size"><option>768x512</option><option>1024x576</option><option>576x1024</option><option>512x512</option></select></label>
+              <label class="f"><span>Seconds</span><input type="number" id="vid-secs" min="0.5" max="5" step="0.5" value="2"></label>
+              <label class="f"><span>Seed</span><input type="number" id="vid-seed" min="0" placeholder="random"></label>
+              <label class="f"><span>Start frame</span><input type="file" id="vid-image" accept="image/png,image/jpeg,image/webp"></label>
+            </div>
+            <div class="f"><span class="small muted">Where the weights live for this job</span><div class="seg" id="vid-tier"></div></div>
+            <button class="btn go" type="submit" id="vid-go">Generate video</button>
+            <div class="progress" id="vid-progress" hidden><div class="meter"><div style="width:0"></div></div><span class="small muted"></span></div>
+          </form>
+          <div><div class="gallery" id="vid-gallery"></div></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Models -->
+    <section class="view" id="v-models">
+      <h1>Models</h1>
+      <p class="lede">Pick a file or folder and the studio reads its headers to work out what it is. Language models go to chat, image models to images, video models to videos. Parts such as projectors, adapters, encoders and tokenizers attach to the model that needs them.</p>
+      <div class="block">
+        <div class="drop">
+          <div class="pathfield">
+            <input type="text" id="add-path" placeholder="Path to a .gguf, .safetensors, tokenizer.json or model folder" aria-label="Model path">
+            <button class="btn" id="add-browse">Browse</button>
+            <button class="btn" id="add-detect">Check</button>
+          </div>
+          <div id="add-result"></div>
+          <p class="muted small" style="margin:0">Reads GGUF (LLMs, Qwen Image, vision projectors), safetensors (SDXL, Qwen Image, LTX 2.3/2.5, Sulphur, LoRA adapters, text encoders, VAEs), diffusers and EXL3/DeepSeek folders, and tokenizer.json. Pickled .bin/.pt files are refused because loading them can run code.</p>
+        </div>
+      </div>
+      <div class="block"><div class="spread"><h2>Language models</h2><span class="muted small">Served on chat and completions routes</span></div><div class="list" id="m-llm"></div></div>
+      <div class="block"><div class="spread"><h2>Image models</h2><span class="muted small">Served on the images route</span></div><div class="list" id="m-image"></div></div>
+      <div class="block"><div class="spread"><h2>Video models</h2><span class="muted small">Served on the videos route</span></div><div class="list" id="m-video"></div></div>
+    </section>
+
+    <!-- Memory -->
+    <section class="view" id="v-memory">
+      <h1>Memory</h1>
+      <p class="lede">Choose where weights live for each kind of job. Keeping blocks on the GPU is fastest, keeping them in RAM costs one PCIe copy per block, and streaming from the SSD saves both kinds of memory. The output is identical either way; only speed and memory use change.</p>
+      <div class="block" id="mem-image"></div>
+      <div class="block" id="mem-video"></div>
+      <div class="block">
+        <h2>Sharing GPUs</h2>
+        <div class="grid-f">
+          <label class="f"><span>Media GPU</span><select id="media-device"></select></label>
+          <label class="f"><span>When media needs the LLM's GPU</span><select id="llm-policy">
+            <option value="auto">Pause the LLM only if they share a GPU</option>
+            <option value="pause_llm">Always pause the LLM</option>
+            <option value="coexist">Never pause (both fit)</option></select></label>
+          <label class="check" style="align-self:end"><input type="checkbox" id="resume-llm"> Restart the LLM after media jobs</label>
+        </div>
+        <p class="muted small" id="share-note"></p>
+      </div>
+      <div class="block">
+        <h2>Language model memory</h2>
+        <div class="grid-f">
+          <div class="f"><span class="small muted">GPUs</span><div class="row" id="llm-devices"></div></div>
+          <label class="f"><span>RAM expert cache (GB, 0 = 80% of free)</span><input type="number" min="0" id="llm-ram" data-bind="llm.ram_gb" data-type="int"></label>
+          <label class="f"><span>VRAM headroom (GB)</span><input type="number" min="0" step="0.5" id="llm-headroom" data-bind="llm.vram_headroom_gb" data-type="num"></label>
+          <label class="f"><span>CPU threads for missed experts (empty = all cores)</span><input type="number" min="0" data-bind="llm.cpu_threads" data-type="intnull" placeholder="all cores"></label>
+          <label class="f"><span>Stop when idle (minutes, 0 = never)</span><input type="number" min="0" data-bind="llm.idle_stop_minutes" data-type="int"></label>
+        </div>
+        <p class="muted small">Mixture-of-experts models keep their shared weights on the GPU, cache hot experts in VRAM and RAM, and read the rest from the SSD a token at a time.</p>
+      </div>
+    </section>
+
+    <!-- Endpoints -->
+    <section class="view" id="v-endpoints">
+      <h1>Endpoints</h1>
+      <p class="lede">The API other apps call. Each route maps a path and method to a service and the dialect it speaks: OpenAI, or nrob's job API for tools such as coder-cli.</p>
+      <div class="block">
+        <h2>Server</h2>
+        <div class="grid-f">
+          <label class="f"><span>Listen address</span><input type="text" data-bind="gateway.host" placeholder="127.0.0.1"></label>
+          <label class="f"><span>Port</span><input type="number" data-bind="gateway.port" data-type="int"></label>
+          <label class="f"><span>API key (empty = none)</span><input type="password" data-bind="gateway.api_key" autocomplete="off"></label>
+          <label class="f"><span>Public URL for file links</span><input type="text" data-bind="gateway.public_url" placeholder="http://my-pc:8080"></label>
+        </div>
+        <p class="muted small">Use 0.0.0.0 to serve your network, and set an API key when you do. Address changes apply the next time the studio starts.</p>
+      </div>
+      <div class="block">
+        <div class="spread"><h2>Routes</h2><div class="row"><button class="btn quiet" id="routes-reset">Restore defaults</button><button class="btn" id="route-add">Add route</button></div></div>
+        <table class="routes"><thead><tr><th>On</th><th>Path</th><th>Method</th><th>Serves</th><th>Dialect</th><th></th></tr></thead><tbody id="routes"></tbody></table>
+        <p class="muted small">Image and video routes also own the paths below them, such as <code>/v1/videos/{id}/content</code> or <code>…/status</code> for the nrob dialect.</p>
+      </div>
+      <div class="block"><h2>Try it</h2><div id="examples"></div></div>
+    </section>
+
+    <!-- Settings -->
+    <section class="view" id="v-settings">
+      <h1>Settings</h1>
+      <p class="lede">Engine programs, generation defaults and where outputs go. Relative paths are relative to the folder holding the configuration file, so the whole folder can be moved to another machine.</p>
+      <div class="block">
+        <h2>Language model</h2>
+        <div class="grid-f">
+          <label class="f"><span>Context (tokens)</span><input type="number" data-bind="llm.ctx" data-type="int"></label>
+          <label class="f"><span>Reply limit (tokens)</span><input type="number" data-bind="llm.max_tokens" data-type="int"></label>
+          <label class="f"><span>Temperature</span><input type="number" step="0.05" data-bind="llm.temperature" data-type="num"></label>
+          <label class="f"><span>Top-p</span><input type="number" step="0.01" data-bind="llm.top_p" data-type="num"></label>
+          <label class="f"><span>Prompt cache on disk (GB)</span><input type="number" step="0.5" data-bind="llm.prompt_cache_gb" data-type="num"></label>
+        </div>
+        <div class="row" style="margin-top:14px; gap:22px">
+          <label class="check"><input type="checkbox" data-bind="llm.enabled"> Enabled</label>
+          <label class="check"><input type="checkbox" data-bind="llm.autostart"> Load at startup</label>
+          <label class="check"><input type="checkbox" data-bind="llm.thinking"> Think by default</label>
+          <label class="check"><input type="checkbox" data-bind="llm.prompt_cache"> Keep prompt states between runs</label>
+          <label class="check"><input type="checkbox" data-bind="llm.vision"> Vision</label>
+        </div>
+      </div>
+      <div class="block">
+        <h2>Programs and folders</h2>
+        <div class="grid-f" style="grid-template-columns:1fr">
+          <label class="f"><span>nrob-server</span><div class="pathfield"><input type="text" data-bind="llm.server"><button class="btn" type="button" data-pick="llm.server">Browse</button></div></label>
+          <label class="f"><span>nrob-diffusion</span><div class="pathfield"><input type="text" data-bind="media.worker"><button class="btn" type="button" data-pick="media.worker">Browse</button></div></label>
+          <label class="f"><span>FFmpeg</span><div class="pathfield"><input type="text" data-bind="media.video.ffmpeg"><button class="btn" type="button" data-pick="media.video.ffmpeg">Browse</button></div></label>
+          <label class="f"><span>Output folder</span><div class="pathfield"><input type="text" data-bind="media.output_dir"><button class="btn" type="button" data-pick="media.output_dir" data-dir="1">Browse</button></div></label>
+          <label class="f"><span>Extra nrob-server arguments (one per line)</span><textarea data-bind="llm.extra_args" data-type="lines" rows="2"></textarea></label>
+        </div>
+      </div>
+      <div class="block">
+        <h2>Media</h2>
+        <div class="grid-f">
+          <label class="f"><span>Video frame rate</span><input type="number" data-bind="media.video.fps" data-type="int"></label>
+          <label class="f"><span>Jobs kept in the list</span><input type="number" data-bind="media.keep_jobs" data-type="int"></label>
+          <label class="f"><span>Open the UI as</span><select data-bind="ui.open"><option value="app">App window</option><option value="browser">Browser tab</option><option value="none">Nothing (console)</option></select></label>
+        </div>
+        <div class="row" style="margin-top:14px; gap:22px">
+          <label class="check"><input type="checkbox" data-bind="media.image.enabled"> Image generation</label>
+          <label class="check"><input type="checkbox" data-bind="media.video.enabled"> Video generation</label>
+        </div>
+        <p class="muted small" id="cfg-path"></p>
+      </div>
+    </section>
+
+    <!-- Logs -->
+    <section class="view" id="v-logs">
+      <h1>Logs</h1>
+      <div class="tabs" role="tablist">
+        <button role="tab" aria-selected="true" data-log="studio">Studio</button>
+        <button role="tab" aria-selected="false" data-log="llm">Language model</button>
+        <button role="tab" aria-selected="false" data-log="media">Media</button>
+      </div>
+      <div class="log" id="log" tabindex="0" aria-live="polite"></div>
+    </section>
+  </main>
+</div>
+
+<div class="savebar" id="savebar"><span>Unsaved changes</span><div class="row"><button class="btn quiet" id="discard">Discard</button><button class="btn go" id="save">Save changes</button></div></div>
+<div class="toasts" id="toasts" aria-live="assertive"></div>
+
+<dialog id="picker" aria-label="Choose a file">
+  <div class="dlg-head">
+    <div class="spread"><h2 style="margin:0" id="pick-title">Choose a model file</h2><button class="btn quiet" id="pick-close" aria-label="Close">Close</button></div>
+    <div class="crumbs"><button class="btn" id="pick-up" aria-label="Up one folder">Up</button><input type="text" id="pick-path" aria-label="Folder"><button class="btn" id="pick-go">Go</button></div>
+  </div>
+  <div class="files" id="pick-list" role="listbox"></div>
+  <div class="dlg-foot"><span class="muted small" id="pick-sel">Nothing selected</span><div class="row"><button class="btn" id="pick-folder">Use this folder</button><button class="btn go" id="pick-ok" disabled>Choose</button></div></div>
+</dialog>
+
+<script>
+"use strict";
+const $ = (s, el = document) => el.querySelector(s);
+const $$ = (s, el = document) => [...el.querySelectorAll(s)];
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const gb = mb => (mb / 1024).toFixed(1);
+const bytesGb = b => (b / 1073741824).toFixed(1);
+const key = (() => { try { const k = new URLSearchParams(location.search).get("key"); if (k) sessionStorage.setItem("studio-key", k); return sessionStorage.getItem("studio-key") || ""; } catch { return ""; } })();
+
+async function api(path, opts = {}) {
+  const headers = Object.assign({}, opts.body ? {"Content-Type": "application/json"} : {}, key ? {Authorization: "Bearer " + key} : {});
+  const r = await fetch(path, Object.assign({}, opts, {headers, body: opts.body && typeof opts.body !== "string" ? JSON.stringify(opts.body) : opts.body}));
+  const text = await r.text();
+  let data; try { data = JSON.parse(text); } catch { data = text; }
+  if (!r.ok) throw new Error(data?.error?.message || text || r.statusText);
+  return data;
+}
+function toast(msg, err) {
+  const t = document.createElement("div");
+  t.className = "toast" + (err ? " err" : ""); t.textContent = msg;
+  $("#toasts").append(t); setTimeout(() => t.remove(), err ? 9000 : 3500);
+}
+
+/* ---------- state ---------- */
+let cfg = null, saved = null, state = null, sys = null;
+const clone = v => JSON.parse(JSON.stringify(v));
+function getPath(o, p) { return p.split(".").reduce((a, k) => a?.[k], o); }
+function setPath(o, p, v) { const ks = p.split("."); const last = ks.pop(); ks.reduce((a, k) => a[k] ??= {}, o)[last] = v; }
+function dirty() { $("#savebar").classList.toggle("on", JSON.stringify(cfg) !== JSON.stringify(saved)); }
+function touch() { dirty(); }
+
+async function loadConfig() { saved = await api("/api/config"); cfg = clone(saved); renderConfig(); dirty(); }
+async function saveConfig() {
+  try { saved = await api("/api/config", {method: "PUT", body: cfg}); cfg = clone(saved); renderConfig(); dirty(); toast("Saved"); refresh(); }
+  catch (e) { toast(e.message, true); }
+}
+$("#save").onclick = saveConfig;
+$("#discard").onclick = () => { cfg = clone(saved); renderConfig(); dirty(); };
+
+/* ---------- navigation ---------- */
+function show(view) {
+  $$("nav button").forEach(b => b.dataset.view === view ? b.setAttribute("aria-current", "page") : b.removeAttribute("aria-current"));
+  $$("section.view").forEach(s => s.classList.toggle("on", s.id === "v-" + view));
+  try { localStorage.setItem("studio-view", view); } catch {}
+  if (location.hash !== "#" + view) history.replaceState(null, "", "#" + view);
+  if (view === "logs") pollLogs(true);
+}
+$$("nav button").forEach(b => b.onclick = () => show(b.dataset.view));
+$$("#v-play .tabs button").forEach(b => b.onclick = () => {
+  $$("#v-play .tabs button").forEach(x => x.setAttribute("aria-selected", x === b));
+  $$("#v-play [data-panel]").forEach(p => p.hidden = p.dataset.panel !== b.dataset.tab);
+});
+
+/* ---------- bound fields ---------- */
+function bindFields() {
+  $$("[data-bind]").forEach(el => {
+    const p = el.dataset.bind, type = el.dataset.type;
+    const v = getPath(cfg, p);
+    if (el.type === "checkbox") el.checked = !!v;
+    else if (type === "lines") el.value = (v || []).join("\n");
+    else el.value = v ?? "";
+    el.oninput = el.onchange = () => {
+      let nv = el.type === "checkbox" ? el.checked : el.value;
+      if (type === "int") nv = nv === "" ? 0 : parseInt(nv, 10);
+      if (type === "intnull") nv = nv === "" ? null : parseInt(nv, 10);
+      if (type === "num") nv = nv === "" ? 0 : parseFloat(nv);
+      if (type === "lines") nv = el.value.split("\n").map(s => s.trim()).filter(Boolean);
+      setPath(cfg, p, nv); touch();
+    };
+  });
+  $$("[data-pick]").forEach(b => b.onclick = () => pick({dir: !!b.dataset.dir, title: "Choose " + b.dataset.pick.split(".").pop()}, path => {
+    setPath(cfg, b.dataset.pick, path); bindFields(); touch();
+  }));
+}
+
+function renderConfig() {
+  bindFields(); renderModels(); renderMemory(); renderRoutes(); renderExamples(); renderSelects();
+  $("#cfg-path").textContent = state ? "Configuration: " + state.config_path : "";
+}
+
+/* ---------- file picker ---------- */
+let pickCb = null, pickSel = null, pickDir = "";
+function lastDir() { try { return localStorage.getItem("studio-dir") || ""; } catch { return ""; } }
+async function pick(opts, cb) {
+  pickCb = cb; pickSel = null;
+  $("#pick-title").textContent = opts.title || "Choose a model file";
+  $("#pick-folder").hidden = false;
+  $("#picker").showModal();
+  await browse(opts.start || lastDir());
+}
+async function browse(path) {
+  let listing;
+  try { listing = await api("/api/browse?path=" + encodeURIComponent(path || "")); }
+  catch (e) { toast(e.message, true); if (path) return browse(""); return; }
+  pickDir = listing.path; pickSel = null;
+  try { if (pickDir) localStorage.setItem("studio-dir", pickDir); } catch {}
+  $("#pick-path").value = pickDir; $("#pick-sel").textContent = pickDir ? "Pick a file, or use this folder" : "Pick a drive";
+  $("#pick-ok").disabled = true; $("#pick-up").disabled = !pickDir; $("#pick-folder").disabled = !pickDir;
+  $("#pick-up").dataset.parent = listing.parent ?? "";
+  const list = $("#pick-list");
+  list.innerHTML = listing.entries.length ? "" : '<div class="empty" style="padding:14px 20px">No folders or model files here.</div>';
+  for (const e of listing.entries) {
+    const b = document.createElement("button");
+    b.className = e.dir ? "dir" : "file"; b.setAttribute("role", "option");
+    b.innerHTML = `<span class="ic" aria-hidden="true">${e.dir ? "▸" : "◦"}</span><span>${esc(e.name)}</span><span class="sz">${e.dir ? "" : fmtSize(e.size)}</span>`;
+    b.onclick = () => {
+      if (e.dir) return browse(e.path);
+      $$("#pick-list button").forEach(x => x.setAttribute("aria-selected", x === b));
+      pickSel = e.path; $("#pick-sel").textContent = e.name; $("#pick-ok").disabled = false;
+    };
+    b.ondblclick = () => { if (!e.dir) finishPick(e.path); };
+    list.append(b);
+  }
+}
+function fmtSize(n) { return n >= 1073741824 ? (n / 1073741824).toFixed(1) + " GB" : n >= 1048576 ? (n / 1048576).toFixed(0) + " MB" : Math.max(1, Math.round(n / 1024)) + " KB"; }
+function finishPick(path) { $("#picker").close(); const cb = pickCb; pickCb = null; cb && cb(path); }
+$("#pick-ok").onclick = () => pickSel && finishPick(pickSel);
+$("#pick-folder").onclick = () => pickDir && finishPick(pickDir);
+$("#pick-close").onclick = () => $("#picker").close();
+$("#pick-up").onclick = () => browse($("#pick-up").dataset.parent);
+$("#pick-go").onclick = () => browse($("#pick-path").value);
+$("#pick-path").onkeydown = e => { if (e.key === "Enter") browse($("#pick-path").value); };
+
+/* ---------- add model ---------- */
+const kindName = {llm: "Language model", image: "Image model", video: "Video model", vision_projector: "Vision projector", adapter: "LoRA adapter", image_base: "Qwen Image base folder",
+  text_encoder: "Image text encoder", video_text_encoder: "Video text encoder", vae: "VAE", tokenizer: "Gemma tokenizer", clip_tokenizer: "CLIP tokenizer", ffmpeg: "FFmpeg"};
+async function detectPath() {
+  const path = $("#add-path").value.trim(); if (!path) return;
+  const out = $("#add-result");
+  try {
+    const d = await api("/api/detect", {method: "POST", body: {path}});
+    const where = d.section === "component" ? "Attaches to the model that needs it" : `Adds to ${d.section === "llm" ? "chat" : d.section + "s"}`;
+    out.innerHTML = `<div class="detected ${d.section}"><strong>${esc(kindName[d.kind] || d.kind)}</strong><span>${esc(d.summary)}</span>
+      <span class="muted small">${where}${d.missing.length ? ". It also needs: " + d.missing.map(esc).join(", ") + " (found automatically when possible)" : ""}</span>
+      <div class="row" style="margin-top:6px"><input type="text" id="add-name" placeholder="Name (optional)" style="max-width:240px" ${d.section === "component" ? "hidden" : ""}><button class="btn go" id="add-go">Add ${d.section === "component" ? "part" : "model"}</button></div></div>`;
+    $("#add-go").onclick = () => addModel(path, $("#add-name")?.value);
+  } catch (e) { out.innerHTML = `<div class="detected"><strong>Not recognised</strong><span class="muted">${esc(e.message)}</span></div>`; }
+}
+async function addModel(path, name, target) {
+  try {
+    const r = await api("/api/models/add", {method: "POST", body: Object.assign({path, name: name || undefined}, target || {})});
+    toast(`${r.enabled ? "Added" : "Added (incomplete)"} ${r.name} to ${r.section === "llm" ? "language models" : r.section + " models"}` + (r.missing.length ? `. Still needs ${r.missing.join(", ")}` : ""));
+    $("#add-result").innerHTML = ""; $("#add-path").value = "";
+    await loadConfig();
+  } catch (e) { toast(e.message, true); }
+}
+$("#add-detect").onclick = detectPath;
+$("#add-path").onkeydown = e => { if (e.key === "Enter") detectPath(); };
+$("#add-browse").onclick = () => pick({title: "Choose a model file or folder"}, p => { $("#add-path").value = p; detectPath(); });
+
+/* ---------- model lists ---------- */
+function field(label, section, name, key, value, opts = {}) {
+  const id = `f-${section}-${name}-${key}`.replace(/[^\w-]/g, "_");
+  return `<label class="f"><span>${esc(label)}${opts.missing ? ' <span class="tag bad">needed</span>' : ""}</span><div class="pathfield">
+    <input type="text" id="${id}" value="${esc(value || "")}" data-mfield="${esc(section)}|${esc(name)}|${esc(key)}" placeholder="${esc(opts.placeholder || "")}">
+    <button class="btn" type="button" data-mpick="${esc(section)}|${esc(name)}|${esc(key)}" ${opts.dir ? 'data-dir="1"' : ""}>Browse</button></div></label>`;
+}
+function modelObj(section, name) {
+  if (section === "llm") return cfg.llm.models.find(m => m.name === name);
+  return cfg.media[section].models[name];
+}
+function missingOf(section, m) {
+  const empty = k => !(m[k] || "").trim();
+  if (section === "image") return (m.architecture || "qwen-image") === "sdxl" ? ["checkpoint", "tokenizer"].filter(empty)
+    : [...(empty("base") ? ["base"] : []), ...(empty("transformer") && empty("safetensors_transformer") ? ["transformer"] : [])];
+  return [...["transformer", "text_encoder", "vae"].filter(empty), ...(m.family !== "ltx-2.5" && empty("tokenizer") ? ["tokenizer"] : [])];
+}
+function lastResidency(name) {
+  const j = state?.media?.jobs?.find(j => j.model === name && j.residency && j.residency !== null);
+  if (!j) return "";
+  const r = j.residency.transformer || j.residency;
+  if (r.gpu_blocks !== undefined) return `<span class="tag gpu">${r.gpu_blocks} GPU</span><span class="tag ram">${r.ram_blocks} RAM</span><span class="tag ssd">${r.ssd_blocks} SSD</span>`;
+  if (r.mode) return `<span class="tag ${r.mode === "resident" ? "gpu" : "ram"}">${r.mode === "resident" ? "All on GPU" : "Staged"}</span>`;
+  return "";
+}
+function renderModels() {
+  const llm = cfg.llm.models;
+  $("#m-llm").innerHTML = llm.length ? llm.map(m => `<div class="item">
+    <div class="item-head"><strong>${esc(m.name)}</strong>
+      ${cfg.llm.default_model === m.name || (!cfg.llm.default_model && llm[0] === m) ? '<span class="tag good">Default</span>' : `<button class="btn quiet" data-default="llm|${esc(m.name)}">Make default</button>`}
+      ${state?.llm?.models?.[0] === m.name && state.llm.state === "ready" ? '<span class="tag gpu">Loaded</span>' : ""}
+      <span style="flex:1"></span>
+      <label class="check"><input type="checkbox" data-menable="llm|${esc(m.name)}" ${m.enabled !== false ? "checked" : ""}> Enabled</label>
+      <button class="btn quiet warn" data-remove="llm|${esc(m.name)}">Remove</button></div>
+    <div class="cols" style="gap:12px">${field("Weights", "llm", m.name, "path", m.path)}${field("Vision projector (optional)", "llm", m.name, "vision_projector", m.vision_projector)}${field("LoRA adapter folder (optional)", "llm", m.name, "lora", m.lora, {dir: true})}</div>
+  </div>`).join("") : '<div class="empty">No language model yet. Add a .gguf file or model folder above.</div>';
+
+  const img = Object.entries(cfg.media.image.models);
+  $("#m-image").innerHTML = img.length ? img.map(([name, m]) => {
+    const sdxl = m.architecture === "sdxl", miss = missingOf("image", m);
+    const fields = sdxl
+      ? field("Checkpoint", "image", name, "checkpoint", m.checkpoint, {missing: miss.includes("checkpoint")}) + field("CLIP tokenizer.json", "image", name, "tokenizer", m.tokenizer, {missing: miss.includes("tokenizer")})
+      : field("Base folder (diffusers)", "image", name, "base", m.base, {dir: true, missing: miss.includes("base")}) + field("Transformer (.gguf)", "image", name, "transformer", m.transformer, {missing: miss.includes("transformer")})
+        + field("Transformer (.safetensors)", "image", name, "safetensors_transformer", m.safetensors_transformer) + field("Turbo adapter (optional)", "image", name, "adapter", m.adapter)
+        + field("Text encoder override (optional)", "image", name, "text_encoder", m.text_encoder);
+    return mediaItem("image", name, m, sdxl ? "SDXL" : "Qwen Image", miss, fields);
+  }).join("") : '<div class="empty">No image model yet. Add an SDXL checkpoint, a Qwen Image .gguf or .safetensors file, or a diffusers folder.</div>';
+
+  const vid = Object.entries(cfg.media.video.models);
+  $("#m-video").innerHTML = vid.length ? vid.map(([name, m]) => {
+    const miss = missingOf("video", m);
+    const fields = ["transformer", "vae", "text_encoder", "tokenizer"].filter(k => k !== "tokenizer" || m.family !== "ltx-2.5")
+      .map(k => field({transformer: "Transformer", vae: "VAE", text_encoder: "Text encoder (Gemma)", tokenizer: "Gemma tokenizer.json"}[k], "video", name, k, m[k], {missing: miss.includes(k)})).join("");
+    return mediaItem("video", name, m, (m.family || name).toUpperCase().replace("SULPHUR", "Sulphur"), miss, fields);
+  }).join("") : '<div class="empty">No video model yet. Add an LTX 2.3, LTX 2.5 or Sulphur .safetensors file.</div>';
+
+  $$("[data-mfield]").forEach(el => el.oninput = () => { const [s, n, k] = el.dataset.mfield.split("|"); modelObj(s, n)[k] = el.value; touch(); });
+  $$("[data-mpick]").forEach(b => b.onclick = () => { const [s, n, k] = b.dataset.mpick.split("|");
+    pick({dir: !!b.dataset.dir, title: "Choose " + k.replace(/_/g, " ")}, p => { modelObj(s, n)[k] = p; const miss = s === "llm" ? [] : missingOf(s, modelObj(s, n)); if (s !== "llm" && !miss.length) modelObj(s, n).enabled = true; renderModels(); touch(); }); });
+  $$("[data-menable]").forEach(el => el.onchange = () => { const [s, n] = el.dataset.menable.split("|"); modelObj(s, n).enabled = el.checked; touch(); });
+  $$("[data-default]").forEach(b => b.onclick = () => { const [s, n] = b.dataset.default.split("|"); if (s === "llm") cfg.llm.default_model = n; else cfg.media[s].default_model = n; renderModels(); renderSelects(); touch(); });
+  $$("[data-remove]").forEach(b => b.onclick = async () => { const [section, name] = b.dataset.remove.split("|");
+    if (!confirm(`Remove ${name}? The files stay on disk.`)) return;
+    try { await api("/api/models/remove", {method: "POST", body: {section, name}}); await loadConfig(); toast("Removed " + name); } catch (e) { toast(e.message, true); } });
+}
+function mediaItem(section, name, m, arch, miss, fields) {
+  const isDefault = cfg.media[section].default_model === name;
+  return `<div class="item"><div class="item-head"><strong>${esc(name)}</strong><span class="tag">${esc(arch)}</span>
+    ${isDefault ? '<span class="tag good">Default</span>' : `<button class="btn quiet" data-default="${section}|${esc(name)}">Make default</button>`}
+    ${miss.length ? `<span class="tag bad">Needs ${miss.map(esc).join(", ")}</span>` : lastResidency(name)}
+    <span style="flex:1"></span>
+    <label class="check"><input type="checkbox" data-menable="${section}|${esc(name)}" ${m.enabled !== false ? "checked" : ""} ${miss.length ? "disabled" : ""}> Enabled</label>
+    <button class="btn quiet warn" data-remove="${section}|${esc(name)}">Remove</button></div>
+    <div class="cols" style="gap:12px">${fields}</div></div>`;
+}
+
+/* ---------- memory ---------- */
+const tiers = [["gpu", "GPU"], ["auto", "Auto"], ["ram", "RAM"], ["ssd", "SSD"]];
+function segment(el, value, onpick) {
+  el.innerHTML = tiers.map(([v, l]) => `<button type="button" data-tier="${v}" aria-pressed="${v === value}">${l}</button>`).join("");
+  $$("button", el).forEach(b => b.onclick = () => { $$("button", el).forEach(x => x.setAttribute("aria-pressed", x === b)); onpick(b.dataset.tier); });
+}
+function gpuTotalGb(i) { const g = sys?.gpus?.find(g => g.index === i); return g ? g.memory_total_mb / 1024 : 32; }
+function strip(memory, vramCap, ramCap, modelGb) {
+  // Where a model's blocks land for this mode and budget.
+  const total = Math.max(modelGb, 1);
+  let gpu = 0, ram = 0;
+  if (memory === "gpu") gpu = total;
+  else if (memory === "auto") { gpu = Math.min(total, vramCap); ram = Math.min(total - gpu, ramCap); }
+  else if (memory === "ram") ram = Math.min(total, ramCap);
+  const ssd = Math.max(0, total - gpu - ram);
+  const seg = (cls, v, label) => v > 0.001 ? `<div class="${cls}" style="flex-grow:${v}" title="${label} ${v.toFixed(1)} GB">${v / total > .12 ? label + " " + v.toFixed(1) + " GB" : ""}</div>` : "";
+  return `<div class="strip" role="img" aria-label="GPU ${gpu.toFixed(1)} GB, RAM ${ram.toFixed(1)} GB, SSD ${ssd.toFixed(1)} GB">${seg("t-gpu", gpu, "GPU")}${seg("t-ram", ram, "RAM")}${seg("t-ssd", ssd, "SSD")}</div>
+    <div class="strip-legend"><span class="key"><i style="background:var(--gpu)"></i>Resident on the GPU</span><span class="key"><i style="background:var(--ram)"></i>Copied up from RAM each pass</span><span class="key"><i style="background:var(--ssd)"></i>Read from the SSD each pass</span></div>`;
+}
+const tierHelp = {gpu: "Everything on the GPU: fastest, needs the most VRAM.", auto: "Fill the GPU up to the VRAM cap, keep the overflow in RAM, and stream the rest from the SSD.",
+  ram: "Only the block in use sits on the GPU; the others wait in RAM.", ssd: "Only the block in use is anywhere but the SSD. Slowest; uses the least memory."};
+function renderMemory() {
+  for (const kind of ["image", "video"]) {
+    const s = cfg.media[kind], el = $("#mem-" + kind);
+    const example = kind === "image" ? 20 : 44;
+    const vcap = s.vram_gb ?? Math.max(0, gpuTotalGb(cfg.media.device) - 6);
+    el.innerHTML = `<div class="spread"><h2>${kind === "image" ? "Image" : "Video"} jobs</h2><div class="seg" id="seg-${kind}"></div></div>
+      <p class="muted" style="margin:0 0 12px">${tierHelp[s.memory || "auto"]}</p>
+      ${strip(s.memory || "auto", vcap, s.ram_gb ?? 32, example)}
+      <p class="muted small">Shown for a ${example} GB model (${kind === "image" ? "Qwen Image 2.1 in BF16" : "LTX 2.3 22B in BF16"}). Output is identical in every mode.</p>
+      <div class="grid-f" style="margin-top:6px">
+        <label class="f"><span>VRAM cap <b class="num" id="${kind}-vram-v">${s.vram_gb == null ? "free VRAM" : s.vram_gb + " GB"}</b></span><input type="range" min="0" max="${Math.round(gpuTotalGb(cfg.media.device))}" value="${s.vram_gb ?? Math.round(vcap)}" id="${kind}-vram"></label>
+        <label class="f"><span>RAM for weights <b class="num" id="${kind}-ram-v">${s.ram_gb ?? 32} GB</b></span><input type="range" min="0" max="${Math.max(8, Math.round((state?.ram_total_mb || sys?.ram?.total_mb || 65536) / 1024))}" value="${s.ram_gb ?? 32}" id="${kind}-ram"></label>
+        <label class="check" style="align-self:end"><input type="checkbox" id="${kind}-vram-auto" ${s.vram_gb == null ? "checked" : ""}> Use whatever VRAM is free</label>
+      </div>`;
+    segment($("#seg-" + kind), s.memory || "auto", v => { s.memory = v; renderMemory(); touch(); });
+    $("#" + kind + "-vram").oninput = e => { s.vram_gb = +e.target.value; $("#" + kind + "-vram-auto").checked = false; renderStripOnly(kind); touch(); };
+    $("#" + kind + "-ram").oninput = e => { s.ram_gb = +e.target.value; renderStripOnly(kind); touch(); };
+    $("#" + kind + "-vram-auto").onchange = e => { s.vram_gb = e.target.checked ? null : Math.round(vcap); renderMemory(); touch(); };
+  }
+  $("#llm-policy").value = cfg.media.llm_policy; $("#resume-llm").checked = cfg.media.resume_llm !== false;
+  $("#llm-policy").onchange = e => { cfg.media.llm_policy = e.target.value; touch(); shareNote(); };
+  $("#resume-llm").onchange = e => { cfg.media.resume_llm = e.target.checked; touch(); };
+  renderDevices(); shareNote();
+}
+function renderStripOnly(kind) {
+  // Re-render in place without losing slider focus.
+  const s = cfg.media[kind], el = $("#mem-" + kind);
+  const vcap = s.vram_gb ?? Math.max(0, gpuTotalGb(cfg.media.device) - 6);
+  const holder = document.createElement("div");
+  holder.innerHTML = strip(s.memory || "auto", vcap, s.ram_gb ?? 32, kind === "image" ? 20 : 44);
+  $(".strip", el).replaceWith(holder.firstElementChild);
+  $("#" + kind + "-vram-v").textContent = s.vram_gb == null ? "free VRAM" : s.vram_gb + " GB";
+  $("#" + kind + "-ram-v").textContent = (s.ram_gb ?? 32) + " GB";
+}
+function renderDevices() {
+  const gpus = sys?.gpus?.length ? sys.gpus : [{index: 0, name: "GPU 0"}, {index: 1, name: "GPU 1"}];
+  $("#media-device").innerHTML = gpus.map(g => `<option value="${g.index}" ${g.index === cfg.media.device ? "selected" : ""}>GPU ${g.index}: ${esc(g.name)}</option>`).join("");
+  $("#media-device").onchange = e => { cfg.media.device = +e.target.value; touch(); shareNote(); renderMemory(); };
+  $("#llm-devices").innerHTML = gpus.map(g => `<label class="check"><input type="checkbox" value="${g.index}" ${cfg.llm.devices.includes(g.index) ? "checked" : ""}> GPU ${g.index}</label>`).join("");
+  $$("#llm-devices input").forEach(el => el.onchange = () => { cfg.llm.devices = $$("#llm-devices input").filter(i => i.checked).map(i => +i.value); touch(); shareNote(); });
+}
+function shareNote() {
+  const d = cfg.media.device, devs = cfg.llm.devices, pol = cfg.media.llm_policy;
+  const shares = devs.length ? devs.includes(d) : d < 2;
+  $("#share-note").textContent = pol === "coexist" ? "Media and the LLM run side by side. Make sure both fit in VRAM."
+    : pol === "pause_llm" || shares ? `Media jobs on GPU ${d} stop the LLM first; chat requests wait until the job finishes.`
+    : `GPU ${d} is not one of the LLM's GPUs, so chat and media run at the same time.`;
+}
+
+/* ---------- endpoints ---------- */
+const targets = [["chat", "Chat"], ["completions", "Completions"], ["models", "Model list"], ["images", "Images"], ["videos", "Videos"], ["files", "Generated files"], ["health", "Health"]];
+function renderRoutes() {
+  $("#routes").innerHTML = cfg.gateway.routes.map((r, i) => `<tr>
+    <td><input type="checkbox" data-r="${i}|enabled" ${r.enabled !== false ? "checked" : ""} aria-label="Enabled"></td>
+    <td class="path"><input type="text" data-r="${i}|path" value="${esc(r.path)}" aria-label="Path"></td>
+    <td><select data-r="${i}|method" aria-label="Method">${["GET", "POST", "PUT", "DELETE"].map(m => `<option ${m === (r.method || "POST").toUpperCase() ? "selected" : ""}>${m}</option>`).join("")}</select></td>
+    <td><select data-r="${i}|target" aria-label="Serves">${targets.map(([v, l]) => `<option value="${v}" ${v === r.target ? "selected" : ""}>${l}</option>`).join("")}</select></td>
+    <td><select data-r="${i}|spec" aria-label="Dialect"><option value="openai" ${r.spec !== "nrob" ? "selected" : ""}>OpenAI</option><option value="nrob" ${r.spec === "nrob" ? "selected" : ""} ${["images", "videos"].includes(r.target) ? "" : "disabled"}>nrob jobs</option></select></td>
+    <td><button class="btn quiet warn" data-rdel="${i}" aria-label="Remove route">Remove</button></td></tr>`).join("");
+  $$("[data-r]").forEach(el => el.onchange = el.oninput = () => { const [i, k] = el.dataset.r.split("|"); cfg.gateway.routes[i][k] = el.type === "checkbox" ? el.checked : el.value; if (k === "target") renderRoutes(); renderExamples(); touch(); });
+  $$("[data-rdel]").forEach(b => b.onclick = () => { cfg.gateway.routes.splice(+b.dataset.rdel, 1); renderRoutes(); renderExamples(); touch(); });
+}
+$("#route-add").onclick = () => { cfg.gateway.routes.push({path: "/custom/path", method: "POST", target: "chat", spec: "openai", enabled: true}); renderRoutes(); touch(); };
+$("#routes-reset").onclick = async () => { if (!confirm("Replace the route table with the defaults?")) return; try { saved = await api("/api/config/reset-routes", {method: "POST"}); cfg = clone(saved); renderConfig(); dirty(); toast("Routes restored"); } catch (e) { toast(e.message, true); } };
+function routeFor(target) { return cfg.gateway.routes.find(r => r.target === target && r.enabled !== false); }
+function renderExamples() {
+  const base = state?.gateway_url || `http://127.0.0.1:${cfg.gateway.port}`;
+  const auth = cfg.gateway.api_key ? ` \\\n  -H "Authorization: Bearer ${cfg.gateway.api_key.replace(/./g, "•")}"` : "";
+  const out = [];
+  const chat = routeFor("chat"), img = routeFor("images"), vid = routeFor("videos");
+  const lm = cfg.llm.default_model || cfg.llm.models[0]?.name || "your-model";
+  if (chat) out.push(["Chat", `curl ${base}${chat.path}${auth} \\\n  -H "Content-Type: application/json" \\\n  -d '{"model":"${lm}","messages":[{"role":"user","content":"Hello"}],"stream":true}'`]);
+  if (img) out.push(["Image", img.spec === "nrob" ? `curl ${base}${img.path}${auth} -d '{"prompt":"a red fox in snow"}'\ncurl ${base}${img.path}/status` : `curl ${base}${img.path}${auth} \\\n  -H "Content-Type: application/json" \\\n  -d '{"prompt":"a red fox in snow","size":"1024x1024","response_format":"url"}'`]);
+  if (vid) out.push(["Video", vid.spec === "nrob" ? `curl ${base}${vid.path}${auth} -d '{"prompt":"waves at dusk"}'\ncurl ${base}${vid.path}/status` : `curl ${base}${vid.path}${auth} -H "Content-Type: application/json" -d '{"prompt":"waves at dusk","seconds":"4","size":"1280x720"}'\ncurl ${base}${vid.path}/VIDEO_ID\ncurl -o clip.mp4 ${base}${vid.path}/VIDEO_ID/content`]);
+  out.push(["SDKs", `from openai import OpenAI\nclient = OpenAI(base_url="${base}/v1", api_key="${cfg.gateway.api_key ? "YOUR_KEY" : "unused"}")`]);
+  $("#examples").innerHTML = out.map(([t, c]) => `<h3>${t}</h3><pre class="example">${esc(c)}</pre>`).join("");
+}
+
+/* ---------- overview ---------- */
+function renderHardware() {
+  const hw = $("#hw"), rows = [];
+  for (const g of sys?.gpus || []) {
+    const pct = g.memory_total_mb ? g.memory_used_mb / g.memory_total_mb * 100 : 0;
+    const roles = [];
+    if (cfg && (cfg.llm.devices.length ? cfg.llm.devices.includes(g.index) : g.index < 2) && state?.llm?.state === "ready") roles.push("LLM");
+    if (cfg && cfg.media.device === g.index) roles.push("media");
+    rows.push(`<div class="hw-row"><div class="label">GPU ${g.index}<small>${esc(g.name)}</small></div>
+      <div class="meter" title="${pct.toFixed(0)}% used"><div style="width:${pct}%;background:var(--gpu)"></div></div>
+      <div class="num small">${gb(g.memory_used_mb)} / ${gb(g.memory_total_mb)} GB<br><span class="muted">${roles.length ? "Runs " + roles.join(" and ") : g.utilization + "% busy"}</span></div></div>`);
+  }
+  const ram = sys?.ram;
+  if (ram?.total_mb) {
+    const used = ram.total_mb - ram.available_mb;
+    rows.push(`<div class="hw-row"><div class="label">RAM<small>System memory</small></div>
+      <div class="meter"><div style="width:${used / ram.total_mb * 100}%;background:var(--ram)"></div></div>
+      <div class="num small">${gb(used)} / ${gb(ram.total_mb)} GB</div></div>`);
+  }
+  hw.innerHTML = rows.join("") || '<div class="empty">No NVIDIA GPU reported (nvidia-smi not found). CPU-only builds still run image and video jobs, slowly.</div>';
+  $("#hw-note").textContent = sys?.gpus?.length ? "" : "";
+}
+function renderState() {
+  if (!state) return;
+  const l = state.llm;
+  const label = {stopped: "Stopped", starting: "Loading", ready: "Ready", failed: "Failed"}[l.state];
+  $("#llm-tag").innerHTML = `<span class="tag ${l.state === "ready" ? "good" : l.state === "failed" ? "bad" : ""}">${label}</span>`;
+  $("#llm-detail").textContent = l.state === "ready" ? `Serving ${l.models.join(", ")}. Loaded in ${l.load_seconds?.toFixed(1)} s, idle ${l.idle_seconds} s.`
+    : l.state === "starting" ? `Loading ${l.models[0] || ""}...` : l.state === "failed" ? l.error : l.paused_for_media ? "Paused while a media job uses its GPU." : "Not running. It starts on the first chat request.";
+  $("#llm-start").disabled = l.state === "ready" || l.state === "starting";
+  $("#llm-restart").disabled = l.state !== "ready";
+  $("#llm-stop").disabled = l.state === "stopped";
+  $("#llm-note").textContent = state.restart_required ? "Listener changes apply after the studio restarts." : "";
+  $("#foot-llm").className = "dot " + l.state; $("#foot-llm-text").textContent = "LLM " + label.toLowerCase();
+  const active = state.media.jobs.find(j => j.status === "in_progress");
+  $("#foot-media").className = "dot " + (active ? "starting" : ""); $("#foot-media-text").textContent = active ? `${active.kind} ${active.progress.toFixed(0)}%` : "Media idle";
+  const ep = [["Chat", routeFor("chat")], ["Images", routeFor("images")], ["Videos", routeFor("videos")]].filter(([, r]) => r);
+  $("#ov-endpoints").innerHTML = ep.map(([n, r]) => `<div class="endpoint"><span class="muted">${n}</span><code>${esc(state.gateway_url + r.path)}</code><button class="btn quiet" data-copy="${esc(state.gateway_url + r.path)}">Copy</button></div>`).join("")
+    + `<div class="endpoint"><span class="muted">Base URL</span><code>${esc(state.gateway_url)}/v1</code><button class="btn quiet" data-copy="${esc(state.gateway_url)}/v1">Copy</button></div>`;
+  $$("[data-copy]").forEach(b => b.onclick = () => navigator.clipboard.writeText(b.dataset.copy).then(() => toast("Copied")));
+  const jobs = state.media.jobs.slice(0, 8);
+  $("#ov-jobs").innerHTML = jobs.length ? jobs.map(j => `<div class="job">${j.preview ? `<img src="${esc(j.preview)}" alt="" loading="lazy">` : '<div class="ph"></div>'}
+    <div><div class="p">${esc(j.prompt)}</div><div class="muted small">${esc(j.model)}, ${esc(j.size)}, ${statusText(j)}</div></div>
+    <div class="row">${j.status === "in_progress" || j.status === "queued" ? `<button class="btn quiet warn" data-cancel="${j.id}">Cancel</button>` : j.files[0] ? `<a class="btn quiet" href="${esc(j.files[0])}" target="_blank">Open</a>` : ""}</div></div>`).join("")
+    : '<div class="empty">Nothing generated yet. Try the Playground.</div>';
+  $$("[data-cancel]").forEach(b => b.onclick = () => api(`/api/jobs/${b.dataset.cancel}/cancel`, {method: "POST"}).then(refresh));
+  $("#cfg-path").textContent = "Configuration: " + state.config_path;
+}
+function statusText(j) {
+  if (j.status === "in_progress") return `${j.progress.toFixed(0)}%, ${j.stage.replace(/_/g, " ")}`;
+  if (j.status === "failed") return "failed: " + (j.error || "").slice(0, 140);
+  if (j.status === "completed" && j.seconds_taken) return `done in ${j.seconds_taken.toFixed(0)} s`;
+  return j.status;
+}
+$("#llm-start").onclick = () => api("/api/llm/start", {method: "POST"}).then(refresh).catch(e => toast(e.message, true));
+$("#llm-stop").onclick = () => api("/api/llm/stop", {method: "POST"}).then(refresh);
+$("#llm-restart").onclick = () => api("/api/llm/restart", {method: "POST"}).then(refresh).catch(e => toast(e.message, true));
+$("#open-outputs").onclick = () => api("/api/open-outputs", {method: "POST"});
+
+function renderSelects() {
+  const opts = (names, def) => names.map(n => `<option ${n === def ? "selected" : ""}>${esc(n)}</option>`).join("") || "<option value=''>None configured</option>";
+  const keep = id => $(id).value;
+  const c = keep("#chat-model"), i = keep("#img-model"), v = keep("#vid-model");
+  $("#chat-model").innerHTML = opts(cfg.llm.models.filter(m => m.enabled !== false).map(m => m.name), c || cfg.llm.default_model);
+  $("#img-model").innerHTML = opts(Object.keys(cfg.media.image.models).filter(n => cfg.media.image.models[n].enabled !== false), i || cfg.media.image.default_model);
+  $("#vid-model").innerHTML = opts(Object.keys(cfg.media.video.models).filter(n => cfg.media.video.models[n].enabled !== false), v || cfg.media.video.default_model);
+  segment($("#img-tier"), imgTier ||= cfg.media.image.memory || "auto", t => imgTier = t);
+  segment($("#vid-tier"), vidTier ||= cfg.media.video.memory || "auto", t => vidTier = t);
+}
+let imgTier = "", vidTier = "";
+
+/* ---------- chat ---------- */
+let chatLog = [];
+function addMsg(role, text = "") {
+  $("#chat-empty")?.remove();
+  const el = document.createElement("div"); el.className = "msg " + role;
+  el.innerHTML = role === "user" ? esc(text) : '<div class="think" hidden></div><div class="body"></div><div class="meta"></div>';
+  $("#msgs").append(el); el.scrollIntoView({block: "end"}); return el;
+}
+async function sendChat() {
+  const text = $("#chat-input").value.trim(); if (!text) return;
+  $("#chat-input").value = ""; $("#chat-send").disabled = true;
+  chatLog.push({role: "user", content: text}); addMsg("user", text);
+  const el = addMsg("assistant"), body = $(".body", el), think = $(".think", el), meta = $(".meta", el);
+  meta.textContent = state?.llm?.state === "ready" ? "Thinking..." : "Loading the model (the first reply takes longer)...";
+  const t0 = performance.now(); let content = "", reasoning = "", tokens = 0;
+  try {
+    const r = await fetch("/api/play/chat", {method: "POST", headers: Object.assign({"Content-Type": "application/json"}, key ? {Authorization: "Bearer " + key} : {}),
+      body: JSON.stringify({model: $("#chat-model").value || undefined, messages: chatLog, stream: true, ...($("#chat-think").checked ? {reasoning_effort: "medium"} : {})})});
+    if (!r.ok) { const e = await r.json().catch(() => ({})); throw new Error(e?.error?.message || r.statusText); }
+    const reader = r.body.getReader(), dec = new TextDecoder(); let buf = "";
+    for (;;) {
+      const {value, done} = await reader.read(); if (done) break;
+      buf += dec.decode(value, {stream: true});
+      let i;
+      while ((i = buf.indexOf("\n\n")) >= 0) {
+        const chunk = buf.slice(0, i); buf = buf.slice(i + 2);
+        for (const line of chunk.split("\n")) {
+          if (!line.startsWith("data:")) continue;
+          const data = line.slice(5).trim(); if (data === "[DONE]") continue;
+          let j; try { j = JSON.parse(data); } catch { continue; }
+          if (j.nrob_progress) meta.textContent = `Reading the prompt: ${j.nrob_progress.prompt_done} / ${j.nrob_progress.prompt_total} tokens`;
+          const d = j.choices?.[0]?.delta; if (!d) continue;
+          if (d.reasoning_content) { reasoning += d.reasoning_content; think.hidden = false; think.textContent = reasoning; }
+          if (d.content) { content += d.content; body.textContent = content; tokens++; }
+          if (tokens % 8 === 1) el.scrollIntoView({block: "end"});
+        }
+      }
+    }
+    const secs = (performance.now() - t0) / 1000;
+    meta.textContent = `${secs.toFixed(1)} s, about ${(tokens / secs).toFixed(1)} chunks/s`;
+    chatLog.push({role: "assistant", content});
+  } catch (e) { meta.textContent = ""; body.innerHTML = `<span style="color:var(--bad)">${esc(e.message)}</span>`; chatLog.pop(); }
+  $("#chat-send").disabled = false; refresh();
+}
+$("#chat-send").onclick = sendChat;
+$("#chat-input").onkeydown = e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendChat(); } };
+$("#chat-clear").onclick = () => { chatLog = []; $("#msgs").innerHTML = '<div class="empty" id="chat-empty">New conversation.</div>'; };
+
+/* ---------- image & video ---------- */
+function watchJob(kind, bar) {
+  // The synchronous image call gives no progress; the job list does.
+  const tick = setInterval(() => {
+    const j = state?.media?.jobs?.find(j => j.kind === kind && (j.status === "in_progress" || j.status === "queued"));
+    if (j) { bar.hidden = false; $(".meter > div", bar).style.width = j.progress + "%"; $("span", bar).textContent = j.status === "queued" ? "Waiting for the GPU" : `${j.progress.toFixed(0)}%, ${j.stage.replace(/_/g, " ")}`; }
+  }, 700);
+  return () => { clearInterval(tick); bar.hidden = true; };
+}
+$("#img-form").onsubmit = async e => {
+  e.preventDefault();
+  const body = {prompt: $("#img-prompt").value, model: $("#img-model").value || undefined, size: $("#img-size").value, n: +$("#img-n").value || 1, memory: imgTier, response_format: "url"};
+  if ($("#img-steps").value) body.steps = +$("#img-steps").value;
+  if ($("#img-seed").value) body.seed = +$("#img-seed").value;
+  if ($("#img-neg").value) body.negative_prompt = $("#img-neg").value;
+  $("#img-go").disabled = true; const stop = watchJob("image", $("#img-progress"));
+  try {
+    const r = await api("/api/play/images", {method: "POST", body});
+    const g = $("#img-gallery");
+    for (const d of r.data.reverse()) g.insertAdjacentHTML("afterbegin", `<figure><a href="${esc(d.url)}" target="_blank"><img src="${esc(d.url)}" alt="${esc(body.prompt)}"></a><figcaption><span>${esc(r.model)}, ${esc(r.size)}</span><a href="${esc(d.url)}" download>Save</a></figcaption></figure>`);
+  } catch (err) { toast(err.message, true); }
+  stop(); $("#img-go").disabled = false; refresh();
+};
+const readAsDataUrl = f => new Promise((ok, no) => { const r = new FileReader(); r.onload = () => ok(r.result); r.onerror = no; r.readAsDataURL(f); });
+$("#vid-form").onsubmit = async e => {
+  e.preventDefault();
+  const body = {prompt: $("#vid-prompt").value, model: $("#vid-model").value || undefined, size: $("#vid-size").value, seconds: $("#vid-secs").value, memory: vidTier};
+  if ($("#vid-seed").value) body.seed = +$("#vid-seed").value;
+  const f = $("#vid-image").files[0]; if (f) body.input_reference = {image_url: await readAsDataUrl(f)};
+  $("#vid-go").disabled = true; const bar = $("#vid-progress");
+  try {
+    let v = await api("/api/play/videos", {method: "POST", body});
+    bar.hidden = false;
+    while (v.status === "queued" || v.status === "in_progress") {
+      $(".meter > div", bar).style.width = v.progress + "%";
+      const j = state?.media?.jobs?.find(j => j.id === v.id);
+      $("span", bar).textContent = v.status === "queued" ? "Waiting for the GPU" : `${v.progress}%` + (j ? ", " + j.stage.replace(/_/g, " ") : "");
+      await new Promise(r => setTimeout(r, 1500));
+      v = await api("/api/play/videos/" + v.id);
+    }
+    if (v.status !== "completed") throw new Error(v.error?.message || "the video failed");
+    await refresh();
+    const j = state.media.jobs.find(j => j.id === v.id);
+    const src = j?.files?.[0] || `/api/play/videos/${v.id}/content`;
+    $("#vid-gallery").insertAdjacentHTML("afterbegin", `<figure><video src="${esc(src)}" controls loop playsinline poster="${esc(j?.preview || "")}"></video><figcaption><span>${esc(v.model)}, ${esc(v.size)}, ${esc(v.seconds)} s</span><a href="${esc(src)}" download>Save</a></figcaption></figure>`);
+  } catch (err) { toast(err.message, true); }
+  bar.hidden = true; $("#vid-go").disabled = false;
+};
+
+/* ---------- logs ---------- */
+let logSource = "studio", logAfter = 0;
+$$("#v-logs .tabs button").forEach(b => b.onclick = () => { $$("#v-logs .tabs button").forEach(x => x.setAttribute("aria-selected", x === b)); logSource = b.dataset.log; pollLogs(true); });
+async function pollLogs(reset) {
+  if (reset) { logAfter = 0; $("#log").textContent = ""; }
+  try {
+    const r = await api(`/api/logs?source=${logSource}&after=${logAfter}`);
+    const el = $("#log"), atEnd = el.scrollTop + el.clientHeight >= el.scrollHeight - 30;
+    for (const l of r.lines) { el.append(new Date(l.t).toLocaleTimeString() + "  " + l.line + "\n"); logAfter = l.n; }
+    if (atEnd || reset) el.scrollTop = el.scrollHeight;
+  } catch {}
+}
+
+/* ---------- polling ---------- */
+async function refresh() {
+  try { state = await api("/api/state"); renderState(); } catch (e) { $("#foot-llm-text").textContent = "Studio unreachable"; }
+}
+async function refreshSystem() { try { sys = await api("/api/system"); renderHardware(); } catch {} }
+(async () => {
+  await refresh(); await refreshSystem(); await loadConfig(); renderState(); renderHardware();
+  { let v = location.hash.slice(1); try { v ||= localStorage.getItem("studio-view"); } catch {} if (v && $("#v-" + v)) show(v); }
+  window.addEventListener("hashchange", () => { const v = location.hash.slice(1); if ($("#v-" + v)) show(v); });
+  setInterval(refresh, 1500);
+  setInterval(() => { if ($("#v-overview").classList.contains("on") || $("#v-memory").classList.contains("on")) refreshSystem(); }, 3000);
+  setInterval(() => { if ($("#v-logs").classList.contains("on")) pollLogs(false); }, 1500);
+  window.addEventListener("beforeunload", e => { if (JSON.stringify(cfg) !== JSON.stringify(saved)) e.preventDefault(); });
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,246 @@
+//! The control port: the UI page, its JSON API, a playground that reaches every
+//! gateway target without a key, and the generated files.
+//!
+//! This port can change which programs the studio runs, so it answers only
+//! requests addressed to it by name (a `Host` of this listener: DNS rebinding
+//! cannot reach it) and, for anything but plain page loads, only from its own
+//! origin (another web page open in the same browser cannot drive it).
+
+use crate::gateway::{self, json_reply, Matched};
+use crate::util::{error_json, str_or};
+use crate::{config, registry, Studio};
+use nrob::http::{respond, Request};
+use nrob::json::Json;
+use std::io;
+use std::net::TcpStream;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+const PAGE: &str = include_str!("ui.html");
+
+fn err(w: &mut TcpStream, status: u16, message: &str) -> io::Result<bool> {
+    json_reply(w, status, &error_json(message, "invalid_request_error", "invalid_request"))
+}
+
+fn body(req: &Request) -> Result<Json, String> {
+    Json::parse(&req.body).map_err(|e| format!("request body: {e}"))
+}
+
+/// Hosts this listener answers to: its own address, `localhost` and loopback
+/// on its port, and the configured host.
+pub fn allowed_host(host: &str, port: u16, configured: &str) -> bool {
+    let (name, p) = match host.rsplit_once(':') {
+        Some((n, p)) if !n.ends_with(']') || n.starts_with('[') => (n, p.parse::<u16>().ok()),
+        _ => (host, Some(80)),
+    };
+    if p != Some(port) {
+        return false;
+    }
+    // Listening on every interface: clients arrive by whatever LAN name or
+    // address they use. The API key (required for non-loopback) guards it then.
+    if configured == "0.0.0.0" || configured == "::" {
+        return true;
+    }
+    let name = name.trim_start_matches('[').trim_end_matches(']');
+    ["localhost", "127.0.0.1", "::1", configured].iter().any(|h| h.eq_ignore_ascii_case(name))
+}
+
+pub fn handle(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, port: u16) -> io::Result<bool> {
+    let cfg = studio.config();
+    let ui_host = cfg.get("ui").map_or("127.0.0.1", |u| str_or(u, "host", "127.0.0.1")).to_string();
+    if !req.header("host").is_some_and(|h| allowed_host(h, port, &ui_host)) {
+        return err(w, 403, "unexpected Host header");
+    }
+    if let Some(origin) = req.header("origin") {
+        let own = req.header("host").map(|h| format!("http://{h}"));
+        if own.as_deref() != Some(origin) {
+            return err(w, 403, "cross-origin requests are not accepted on the control port");
+        }
+    }
+    // Reached from another machine: the gateway key guards the controls too.
+    let remote = !(ui_host == "localhost" || ui_host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback()));
+    let key = cfg.get("gateway").map_or("", |g| str_or(g, "api_key", "")).to_string();
+    let route = req.route().to_string();
+    if remote && route != "/" && !key.is_empty() {
+        let given = req.header("authorization").and_then(|v| v.strip_prefix("Bearer ")).map(str::trim).map(str::to_string).or_else(|| req.query("key"));
+        if given.as_deref() != Some(key.as_str()) {
+            return err(w, 401, "this control port needs the gateway API key");
+        }
+    }
+    let method = req.method.as_str();
+    if method == "OPTIONS" {
+        respond(w, 204, "text/plain", b"", true)?;
+        return Ok(true);
+    }
+    if method == "GET" && (route == "/" || route == "/index.html") {
+        respond(w, 200, "text/html; charset=utf-8", PAGE.as_bytes(), true)?;
+        return Ok(true);
+    }
+    if let Some(rel) = route.strip_prefix("/files/") {
+        return gateway::files(studio, w, rel);
+    }
+    if let Some(rest) = route.strip_prefix("/api/play/") {
+        // The playground: every target, no key, local references allowed.
+        let (target, sub) = rest.split_once('/').map_or((rest, String::new()), |(t, s)| (t, format!("/{s}")));
+        let target = match target {
+            "chat" | "completions" | "models" | "images" | "videos" | "health" => target,
+            _ => return err(w, 404, "unknown playground target"),
+        };
+        let m = Matched { target: target.into(), spec: "openai".into(), rest: sub };
+        return gateway::handle(studio, req, w, m, true);
+    }
+    let result: Result<Json, (u16, String)> = match (method, route.as_str()) {
+        ("GET", "/api/state") => Ok(studio.state()),
+        ("GET", "/api/config") => Ok(cfg.clone()),
+        ("PUT" | "POST", "/api/config") => body(req).map_err(|e| (400, e)).and_then(|v| studio.set_config(v).map_err(|e| (400, e))),
+        ("POST", "/api/config/reset-routes") => {
+            let mut next = cfg.clone();
+            let defaults = config::default_json();
+            if let (Some(g), Some(routes)) = (next.get("gateway").cloned(), defaults.get("gateway").and_then(|g| g.get("routes")).cloned()) {
+                let mut g = g;
+                crate::util::set(&mut g, "routes", routes);
+                crate::util::set(&mut next, "gateway", g);
+            }
+            studio.set_config(next).map_err(|e| (400, e))
+        }
+        ("GET", "/api/system") => Ok(Json::obj([("gpus", studio.system.gpus()), ("ram", studio.system.ram())])),
+        ("GET", "/api/logs") => {
+            let after = req.query("after").and_then(|a| a.parse().ok()).unwrap_or(0);
+            let ring = match req.query("source").as_deref() {
+                Some("llm") => &studio.llm.log,
+                Some("media") => &studio.media.log,
+                _ => &studio.log,
+            };
+            Ok(Json::obj([("lines", ring.since(after))]))
+        }
+        ("POST", "/api/llm/start") => studio.llm.start(&cfg, &studio.root).map(|_| studio.llm.status()).map_err(|e| (400, e)),
+        ("POST", "/api/llm/stop") => {
+            studio.llm.stop();
+            Ok(studio.llm.status())
+        }
+        ("POST", "/api/llm/restart") => {
+            studio.llm.stop();
+            studio.llm.start(&cfg, &studio.root).map(|_| studio.llm.status()).map_err(|e| (400, e))
+        }
+        ("GET", "/api/browse") => crate::system::browse(req.query("path").as_deref()).map_err(|e| (400, e)),
+        ("POST", "/api/detect") => body(req).map_err(|e| (400, e)).and_then(|b| {
+            let path = PathBuf::from(str_or(&b, "path", ""));
+            crate::detect::detect(&path).map(|d| d.to_json()).map_err(|e| (400, e))
+        }),
+        ("POST", "/api/models/add") => body(req).map_err(|e| (400, e)).and_then(|b| {
+            let path = PathBuf::from(str_or(&b, "path", "").trim());
+            let target = match (b.get("target_section").and_then(Json::as_str), b.get("target_model").and_then(Json::as_str)) {
+                (Some(s), Some(m)) => Some((s.to_string(), m.to_string())),
+                _ => None,
+            };
+            let mut next = cfg.clone();
+            let (added, detected) = registry::add(&mut next, &path, b.get("name").and_then(Json::as_str), target.as_ref().map(|(s, m)| (s.as_str(), m.as_str())))
+                .map_err(|e| (400, e))?;
+            studio.set_config(next).map_err(|e| (400, e))?;
+            studio.log.push(format!("added {} ({}) as {} model {}", path.display(), detected.summary, added.section, added.name));
+            Ok(Json::obj([
+                ("section", Json::str(added.section)),
+                ("name", Json::str(&added.name)),
+                ("enabled", Json::Bool(added.enabled)),
+                ("missing", Json::Arr(added.missing.iter().map(Json::str).collect())),
+                ("detected", detected.to_json()),
+            ]))
+        }),
+        ("POST", "/api/models/remove") => body(req).map_err(|e| (400, e)).and_then(|b| {
+            let mut next = cfg.clone();
+            remove_model(&mut next, str_or(&b, "section", ""), str_or(&b, "name", "")).map_err(|e| (400, e))?;
+            studio.set_config(next).map_err(|e| (400, e))
+        }),
+        ("POST", r) if r.starts_with("/api/jobs/") && r.ends_with("/cancel") => {
+            let id = &r["/api/jobs/".len()..r.len() - "/cancel".len()];
+            Ok(Json::obj([("cancelled", Json::Bool(studio.media.cancel(id)))]))
+        }
+        ("DELETE", r) if r.starts_with("/api/jobs/") => {
+            let id = &r["/api/jobs/".len()..];
+            Ok(Json::obj([("removed", Json::Bool(studio.media.remove(id)))]))
+        }
+        ("POST", "/api/open-outputs") => {
+            let dir = studio.output_root();
+            let _ = std::fs::create_dir_all(&dir);
+            crate::open_path(&dir.to_string_lossy());
+            Ok(Json::obj([("opened", Json::str(dir.to_string_lossy()))]))
+        }
+        _ => Err((404, format!("no route {method} {route}"))),
+    };
+    match result {
+        Ok(v) => json_reply(w, 200, &v),
+        Err((status, message)) => err(w, status, &message),
+    }
+}
+
+fn remove_model(cfg: &mut Json, section: &str, name: &str) -> Result<(), String> {
+    let clear_default = |sec: &mut Json| {
+        if str_or(sec, "default_model", "") == name {
+            crate::util::set(sec, "default_model", Json::str(""));
+        }
+    };
+    let Json::Obj(top) = cfg else { return Err("bad configuration".into()) };
+    match section {
+        "llm" => {
+            let llm = &mut top.iter_mut().find(|(k, _)| k == "llm").ok_or("no llm")?.1;
+            if let Json::Obj(fields) = llm {
+                if let Some((_, Json::Arr(models))) = fields.iter_mut().find(|(k, _)| k == "models") {
+                    let before = models.len();
+                    models.retain(|m| str_or(m, "name", "") != name);
+                    if models.len() == before {
+                        return Err(format!("no llm model {name}"));
+                    }
+                }
+            }
+            clear_default(llm);
+        }
+        "image" | "video" => {
+            let media = &mut top.iter_mut().find(|(k, _)| k == "media").ok_or("no media")?.1;
+            let Json::Obj(media) = media else { return Err("bad media".into()) };
+            let sec = &mut media.iter_mut().find(|(k, _)| k == section).ok_or("no section")?.1;
+            if let Json::Obj(fields) = sec {
+                if let Some((_, Json::Obj(models))) = fields.iter_mut().find(|(k, _)| k == "models") {
+                    let before = models.len();
+                    models.retain(|(k, _)| k != name);
+                    if models.len() == before {
+                        return Err(format!("no {section} model {name}"));
+                    }
+                }
+            }
+            clear_default(sec);
+        }
+        _ => return Err("section must be llm, image or video".into()),
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_this_listener_s_names_are_answered() {
+        assert!(allowed_host("127.0.0.1:7860", 7860, "127.0.0.1"));
+        assert!(allowed_host("localhost:7860", 7860, "127.0.0.1"));
+        assert!(allowed_host("[::1]:7860", 7860, "127.0.0.1"));
+        assert!(allowed_host("studio.lan:7860", 7860, "studio.lan"));
+        assert!(!allowed_host("evil.example:7860", 7860, "127.0.0.1"));
+        assert!(!allowed_host("127.0.0.1:8080", 7860, "127.0.0.1"));
+        assert!(!allowed_host("localhost", 7860, "127.0.0.1"));
+        assert!(allowed_host("192.168.1.20:7860", 7860, "0.0.0.0"));
+        assert!(!allowed_host("192.168.1.20:9999", 7860, "0.0.0.0"));
+    }
+
+    #[test]
+    fn removing_a_model_clears_it_as_the_default() {
+        let mut cfg = config::default_json();
+        let mut llm = cfg.get("llm").unwrap().clone();
+        crate::util::set(&mut llm, "models", Json::parse(br#"[{"name":"a","path":"a.gguf"}]"#).unwrap());
+        crate::util::set(&mut llm, "default_model", Json::str("a"));
+        crate::util::set(&mut cfg, "llm", llm);
+        remove_model(&mut cfg, "llm", "a").unwrap();
+        assert_eq!(cfg.get("llm").unwrap().get("default_model").and_then(Json::as_str), Some(""));
+        assert!(remove_model(&mut cfg, "llm", "a").is_err());
+        config::validate(&cfg).unwrap();
+    }
+}

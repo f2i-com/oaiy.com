@@ -1,0 +1,414 @@
+//! Supervision of the language model: `nrob-server` as a child process on a
+//! private loopback port with a random key. The gateway proxies to it; nothing
+//! else can reach it.
+//!
+//! A separate process rather than a linked library: nrob-server needs CUDA at
+//! build time and holds GPU memory that only process exit reliably returns, so
+//! stopping it (for a media job that needs its GPU, or after idling) is a kill,
+//! and a crash takes down the model, not the studio.
+
+use crate::config;
+use crate::util::{bool_or, int_or, num_or, random_id, str_or, LogRing};
+use nrob::json::Json;
+use std::io::{BufRead, BufReader, Read};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum State {
+    Stopped,
+    Starting,
+    Ready,
+    Failed,
+}
+
+impl State {
+    fn name(self) -> &'static str {
+        match self {
+            State::Stopped => "stopped",
+            State::Starting => "starting",
+            State::Ready => "ready",
+            State::Failed => "failed",
+        }
+    }
+}
+
+struct Inner {
+    state: State,
+    error: Option<String>,
+    child: Option<Child>,
+    /// Held open for `--watch-stdin`: when the studio exits, however it exits,
+    /// the pipe closes and nrob-server stops, returning its GPU memory.
+    lifeline: Option<std::process::ChildStdin>,
+    addr: String,
+    key: String,
+    /// Bumped on every start and stop, so threads of an older process stand down.
+    generation: u64,
+    started: Option<Instant>,
+    ready_after: Option<f64>,
+    /// Stopped by the broker for a media job (and so restarted after it).
+    paused: bool,
+    last_used: Instant,
+    /// Model names served by the running process, default first.
+    models: Vec<String>,
+    command: String,
+}
+
+pub struct Llm {
+    inner: Mutex<Inner>,
+    changed: Condvar,
+    pub log: Arc<LogRing>,
+}
+
+/// Where a running server can be reached.
+#[derive(Clone, Debug)]
+pub struct Endpoint {
+    pub addr: String,
+    pub key: String,
+}
+
+fn free_port() -> Result<u16, String> {
+    // Bind port 0, read the port the OS picked, release it for the child. The
+    // window between is small, and a clash shows up as a failed start.
+    let l = std::net::TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
+    l.local_addr().map(|a| a.port()).map_err(|e| e.to_string())
+}
+
+/// The nrob-server command line for the `llm` section. `root` resolves relative paths.
+pub fn arguments(llm: &Json, root: &Path, port: u16, key: &str, local_images: bool) -> Result<(Vec<String>, Vec<String>), String> {
+    let models: Vec<&Json> = llm
+        .get("models")
+        .and_then(Json::as_array)
+        .unwrap_or(&[])
+        .iter()
+        .filter(|m| bool_or(m, "enabled", true))
+        .collect();
+    if models.is_empty() {
+        return Err("no language model configured: add a GGUF (or EXL3/DeepSeek folder) under Models".into());
+    }
+    let default = str_or(llm, "default_model", "");
+    let primary = models.iter().position(|m| str_or(m, "name", "") == default).unwrap_or(0);
+    let mut ordered = vec![models[primary]];
+    ordered.extend(models.iter().enumerate().filter(|(i, _)| *i != primary).map(|(_, m)| *m));
+    let path = |m: &Json, key: &str| config::resolve(root, str_or(m, key, "")).to_string_lossy().into_owned();
+    let mut a: Vec<String> = Vec::new();
+    let mut push = |k: &str, v: String| {
+        a.push(k.into());
+        a.push(v);
+    };
+    push("--model", path(ordered[0], "path"));
+    push("--name", str_or(ordered[0], "name", "model").into());
+    for m in &ordered[1..] {
+        push("--also", format!("{}={}", str_or(m, "name", ""), path(m, "path")));
+    }
+    for m in &ordered {
+        let name = str_or(m, "name", "");
+        if !str_or(m, "vision_projector", "").trim().is_empty() {
+            push("--vision-projector", format!("{name}={}", path(m, "vision_projector")));
+        }
+        if !str_or(m, "lora", "").trim().is_empty() {
+            push("--lora", format!("{name}={}", path(m, "lora")));
+        }
+    }
+    push("--host", "127.0.0.1".into());
+    push("--port", port.to_string());
+    push("--api-key", key.into());
+    push("--ctx", int_or(llm, "ctx", 32768).to_string());
+    push("--max-tokens", int_or(llm, "max_tokens", 8192).to_string());
+    push("--temperature", num_or(llm, "temperature", 0.6).to_string());
+    push("--top-p", num_or(llm, "top_p", 0.95).to_string());
+    // Unset: every core the machine has (nrob-server's 24 suits one machine only).
+    let cores = std::thread::available_parallelism().map_or(8, |n| n.get()) as i64;
+    push("--cpu-threads", llm.get("cpu_threads").and_then(Json::as_i64).unwrap_or(cores).to_string());
+    push("--vram-headroom-gb", num_or(llm, "vram_headroom_gb", 2.0).to_string());
+    push("--local-images", if local_images { "on" } else { "off" }.into());
+    if int_or(llm, "ram_gb", 0) > 0 {
+        push("--ram-gb", int_or(llm, "ram_gb", 0).to_string());
+    }
+    let devices: Vec<String> = llm.get("devices").and_then(Json::as_array).unwrap_or(&[]).iter().filter_map(Json::as_i64).map(|d| d.to_string()).collect();
+    if !devices.is_empty() {
+        push("--devices", devices.join(","));
+    }
+    if bool_or(llm, "prompt_cache", true) {
+        push("--prompt-cache", root.join("cache").join("prompt-states").to_string_lossy().into_owned());
+        push("--prompt-cache-gb", num_or(llm, "prompt_cache_gb", 4.0).to_string());
+    }
+    a.push("--watch-stdin".into());
+    if bool_or(llm, "thinking", false) {
+        a.push("--thinking".into());
+    }
+    if !bool_or(llm, "vision", true) {
+        a.push("--no-vision".into());
+    }
+    for extra in llm.get("extra_args").and_then(Json::as_array).unwrap_or(&[]) {
+        if let Some(s) = extra.as_str() {
+            a.push(s.into());
+        }
+    }
+    let names = ordered.iter().map(|m| str_or(m, "name", "").to_string()).collect();
+    Ok((a, names))
+}
+
+impl Llm {
+    pub fn new() -> Llm {
+        Llm {
+            inner: Mutex::new(Inner {
+                state: State::Stopped,
+                error: None,
+                child: None,
+                lifeline: None,
+                addr: String::new(),
+                key: String::new(),
+                generation: 0,
+                started: None,
+                ready_after: None,
+                paused: false,
+                last_used: Instant::now(),
+                models: Vec::new(),
+                command: String::new(),
+            }),
+            changed: Condvar::new(),
+            log: Arc::new(LogRing::new(2000)),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
+        self.inner.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    pub fn state(&self) -> State {
+        self.lock().state
+    }
+
+    pub fn is_running(&self) -> bool {
+        matches!(self.lock().state, State::Starting | State::Ready)
+    }
+
+    pub fn touch(&self) {
+        self.lock().last_used = Instant::now();
+    }
+
+    pub fn idle_for(&self) -> Duration {
+        self.lock().last_used.elapsed()
+    }
+
+    pub fn paused(&self) -> bool {
+        self.lock().paused
+    }
+
+    pub fn set_paused(&self, paused: bool) {
+        self.lock().paused = paused;
+    }
+
+    pub fn endpoint(&self) -> Option<Endpoint> {
+        let g = self.lock();
+        (g.state == State::Ready).then(|| Endpoint { addr: g.addr.clone(), key: g.key.clone() })
+    }
+
+    pub fn models(&self) -> Vec<String> {
+        self.lock().models.clone()
+    }
+
+    /// Start the server for `cfg` (the whole configuration) unless it runs.
+    pub fn start(self: &Arc<Self>, cfg: &Json, root: &Path) -> Result<(), String> {
+        let llm = cfg.get("llm").ok_or("no llm section")?;
+        if !bool_or(llm, "enabled", true) {
+            return Err("the LLM is disabled in the configuration".into());
+        }
+        let mut g = self.lock();
+        if matches!(g.state, State::Starting | State::Ready) {
+            return Ok(());
+        }
+        let port = free_port()?;
+        let key = random_id("sk-studio-");
+        let gateway_host = cfg.get("gateway").map_or("127.0.0.1", |g| str_or(g, "host", "127.0.0.1"));
+        let loopback = gateway_host == "localhost" || gateway_host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback());
+        let (args, names) = arguments(llm, root, port, &key, loopback)?;
+        let program: PathBuf = config::program(root, str_or(llm, "server", "nrob-server"));
+        let mut command = Command::new(&program);
+        command.args(&args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).current_dir(root);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        }
+        let shown: Vec<String> = args.iter().map(|a| if a == &key { "<key>".into() } else { a.clone() }).collect();
+        g.command = format!("{} {}", program.display(), shown.join(" "));
+        self.log.push(format!("studio: starting {}", g.command));
+        let mut child = match command.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                let msg = format!("could not start {}: {e} (is nrob-server built? set llm.server)", program.display());
+                g.state = State::Failed;
+                g.error = Some(msg.clone());
+                self.changed.notify_all();
+                return Err(msg);
+            }
+        };
+        for pipe in [child.stdout.take().map(|p| Box::new(p) as Box<dyn Read + Send>), child.stderr.take().map(|p| Box::new(p) as Box<dyn Read + Send>)].into_iter().flatten() {
+            let log = Arc::clone(&self.log);
+            std::thread::spawn(move || {
+                for line in BufReader::new(pipe).lines().map_while(Result::ok) {
+                    log.push(line);
+                }
+            });
+        }
+        g.generation += 1;
+        let generation = g.generation;
+        g.lifeline = child.stdin.take();
+        g.child = Some(child);
+        g.addr = format!("127.0.0.1:{port}");
+        g.key = key;
+        g.state = State::Starting;
+        g.error = None;
+        g.started = Some(Instant::now());
+        g.ready_after = None;
+        g.models = names;
+        g.last_used = Instant::now();
+        drop(g);
+        self.changed.notify_all();
+        let this = Arc::clone(self);
+        std::thread::Builder::new()
+            .name("llm-watch".into())
+            .spawn(move || this.watch(generation))
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Wait for the process to answer `/health` (which it does once its model has
+    /// loaded), then keep watching for an exit nobody asked for.
+    fn watch(&self, generation: u64) {
+        loop {
+            std::thread::sleep(Duration::from_millis(500));
+            let (addr, ready) = {
+                let mut g = self.lock();
+                if g.generation != generation {
+                    return;
+                }
+                let exited = g.child.as_mut().and_then(|c| c.try_wait().ok().flatten());
+                if let Some(status) = exited {
+                    g.child = None;
+                    g.lifeline = None;
+                    g.state = State::Failed;
+                    let tail = self.log.tail(12);
+                    g.error = Some(format!("nrob-server exited ({status}):\n{tail}"));
+                    self.log.push(format!("studio: nrob-server exited ({status})"));
+                    self.changed.notify_all();
+                    return;
+                }
+                (g.addr.clone(), g.state == State::Ready)
+            };
+            if ready {
+                continue;
+            }
+            let ok = nrob::http::fetch(&addr, "GET", "/health", &[], b"", Duration::from_secs(2)).is_ok_and(|r| r.status == 200);
+            if ok {
+                let mut g = self.lock();
+                if g.generation == generation && g.state == State::Starting {
+                    g.state = State::Ready;
+                    g.ready_after = g.started.map(|s| s.elapsed().as_secs_f64());
+                    self.log.push(format!("studio: nrob-server ready in {:.1}s", g.ready_after.unwrap_or(0.0)));
+                    self.changed.notify_all();
+                }
+            }
+        }
+    }
+
+    pub fn stop(&self) {
+        let mut g = self.lock();
+        g.generation += 1;
+        g.lifeline = None;
+        if let Some(mut child) = g.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+            self.log.push("studio: nrob-server stopped");
+        }
+        g.state = State::Stopped;
+        g.error = None;
+        g.ready_after = None;
+        self.changed.notify_all();
+    }
+
+    /// Start if needed and wait until it serves (or fails, or `timeout` passes).
+    pub fn ensure_ready(self: &Arc<Self>, cfg: &Json, root: &Path, timeout: Duration) -> Result<Endpoint, String> {
+        if matches!(self.state(), State::Stopped | State::Failed) {
+            self.start(cfg, root)?;
+        }
+        let deadline = Instant::now() + timeout;
+        let mut g = self.lock();
+        loop {
+            match g.state {
+                State::Ready => return Ok(Endpoint { addr: g.addr.clone(), key: g.key.clone() }),
+                State::Failed => return Err(g.error.clone().unwrap_or_else(|| "nrob-server failed".into())),
+                State::Stopped => return Err("the language model was stopped".into()),
+                State::Starting => {}
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err("the language model is still loading; try again shortly".into());
+            }
+            g = self.changed.wait_timeout(g, left.min(Duration::from_millis(500))).unwrap_or_else(|p| p.into_inner()).0;
+        }
+    }
+
+    pub fn status(&self) -> Json {
+        let g = self.lock();
+        Json::obj([
+            ("state", Json::str(g.state.name())),
+            ("error", g.error.as_ref().map_or(Json::Null, Json::str)),
+            ("models", Json::Arr(g.models.iter().map(Json::str).collect())),
+            ("paused_for_media", Json::Bool(g.paused)),
+            ("uptime_seconds", g.started.filter(|_| g.state != State::Stopped).map_or(Json::Null, |s| Json::Int(s.elapsed().as_secs() as i64))),
+            ("load_seconds", g.ready_after.map_or(Json::Null, Json::Num)),
+            ("idle_seconds", Json::Int(g.last_used.elapsed().as_secs() as i64)),
+            ("command", Json::str(&g.command)),
+        ])
+    }
+}
+
+impl Drop for Llm {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_default_model_leads_and_extras_follow() {
+        let llm = Json::parse(br#"{
+            "default_model": "b", "ctx": 4096, "devices": [1], "thinking": true, "vision": false, "prompt_cache": false,
+            "extra_args": ["--quiet"],
+            "models": [
+                {"name": "a", "path": "models/a.gguf"},
+                {"name": "b", "path": "C:/abs/b.gguf", "vision_projector": "mmproj.gguf"},
+                {"name": "off", "path": "x.gguf", "enabled": false}
+            ]}"#).unwrap();
+        let root = Path::new("/install");
+        let (args, names) = arguments(&llm, root, 9000, "secret", true).unwrap();
+        assert_eq!(names, ["b", "a"]);
+        let joined = args.join(" ");
+        assert!(joined.starts_with("--model C:/abs/b.gguf --name b --also a="), "{joined}");
+        assert!(joined.contains(&format!("a={}", root.join("models/a.gguf").display())));
+        assert!(joined.contains("--vision-projector b="));
+        for flag in ["--port 9000", "--api-key secret", "--ctx 4096", "--devices 1", "--thinking", "--no-vision", "--local-images on", "--quiet"] {
+            assert!(joined.contains(flag), "{flag} missing from {joined}");
+        }
+        assert!(!joined.contains("--prompt-cache"));
+        let none = Json::parse(br#"{"models": []}"#).unwrap();
+        assert!(arguments(&none, root, 1, "k", true).is_err());
+    }
+
+    #[test]
+    fn a_missing_server_fails_clearly_instead_of_hanging() {
+        let llm = Arc::new(Llm::new());
+        let cfg = Json::parse(br#"{"gateway":{"host":"127.0.0.1"},"llm":{"server":"definitely-missing/nrob-server-x","models":[{"name":"m","path":"m.gguf"}]}}"#).unwrap();
+        let err = llm.ensure_ready(&cfg, &std::env::temp_dir(), Duration::from_secs(5)).unwrap_err();
+        assert!(err.contains("could not start"), "{err}");
+        assert_eq!(llm.state(), State::Failed);
+    }
+}

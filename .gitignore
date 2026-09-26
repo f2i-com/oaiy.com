@@ -30,3 +30,6 @@ __pycache__/
 Thumbs.db
 desktop.ini
 /media/
+
+# NROB Studio: per-machine configuration
+/nrob-studio.json

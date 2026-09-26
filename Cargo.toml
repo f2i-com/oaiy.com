@@ -16,6 +16,9 @@ members = [
     # The OpenAI-compatible server for it (needs CUDA too, so not a default
     # member either).
     "crates/nrob-server",
+    # The portable host: supervises nrob-server and nrob-diffusion, serves the
+    # control UI and the configurable API gateway. std-only, so a default member.
+    "crates/nrob-studio",
     # Vendored GGUF compute subsystem (see crates/VENDORED.md). These keep
     # their own identity and external deps; the std-only rule below does
     # not apply to them.
@@ -35,6 +38,7 @@ default-members = [
     "crates/nrob-cli",
     "crates/dsv41",
     "crates/nrob-image",
+    "crates/nrob-studio",
     "crates/gguf",
     "crates/ggml-quants",
     "crates/ggml-rs",
@@ -46,7 +50,7 @@ default-members = [
 edition = "2021"
 license = "Apache-2.0"
 
-# Hard rule for nrob, nrob-image and dsv41: std-only, no external crates.
+# Hard rule for nrob, nrob-image, nrob-studio and dsv41: std-only, no external crates.
 # Do not add a [workspace.dependencies] table.
 # Exception: the vendored GGUF subsystem members (crates/gguf,
 # ggml-quants, ggml-rs, tokenizer, llama-rs, ggml-rs-cuda — see

@@ -53,6 +53,14 @@ Every token is a small, well-planned job:
 
 ## Features
 
+- **NROB Studio: a portable host for all of it.** One folder with `nrob-studio`,
+  `nrob-server` and `nrob-diffusion`. Pick model files in its UI and it reads their
+  headers to work out what each one is (LLM, image, video, or a part such as a
+  projector, LoRA, encoder or tokenizer), then serves it on the right endpoint.
+  Routes and dialects are configurable (OpenAI chat, Images and Videos, or nrob's
+  job API). Image and video weights sit on the GPU, in RAM or on the SSD per your
+  memory settings, and media jobs pause the LLM only when they need its GPU. See
+  [the studio guide](docs/STUDIO.md).
 - **OrcaSAQ2 27B from original EXL3 safetensors.** Native Rust/CUDA loading of
   mixed 3/3.5/4-bit decoder projections, a 6-bit head and int8 embeddings,
   with Qwen reasoning, XML tool calls and prompt caching. See
@@ -96,6 +104,16 @@ Every token is a small, well-planned job:
   all hand-rolled.
 
 ## Quickstart
+
+The easiest way in is the studio:
+
+```sh
+cargo build --release -p nrob-studio   # std-only; builds anywhere
+powershell tools/qwen-image/build.ps1  # CUDA engines: nrob-diffusion and nrob-server
+target/release/nrob-studio             # opens the control UI; add models from the Models page
+```
+
+To drive the engines directly instead:
 
 Requires a recent stable Rust. The default build is CPU-only:
 
@@ -304,6 +322,10 @@ crates/
   nrob-image/    image decoding (std-only): PNG with its own inflate, JPEG, Pillow's
                  resize — pixel-exact to Pillow
   nrob-server/   OpenAI-compatible HTTP server for DeepSeek-V4.1 (std-only)
+  nrob-studio/   portable host (std-only): supervises nrob-server and nrob-diffusion,
+                 control UI, configurable OpenAI-style gateway, model detection
+  nrob-diffusion/ image and video worker (Candle): Qwen Image, SDXL, LTX, with
+                 SSD/RAM/GPU block residency
   gguf, ggml-quants, ggml-rs, ggml-rs-cuda, tokenizer, llama-rs
                  our pure-Rust GGUF stack: reader, quant kernels, CPU and CUDA
                  backends, tokenizers, model architectures, expert streaming

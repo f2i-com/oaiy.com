@@ -1,0 +1,153 @@
+{
+  "ui": {
+    "host": "127.0.0.1",
+    "port": 7860,
+    "open": "app"
+  },
+  "gateway": {
+    "host": "127.0.0.1",
+    "port": 8080,
+    "api_key": "",
+    "public_url": "",
+    "routes": [
+      {
+        "path": "/v1/chat/completions",
+        "method": "POST",
+        "target": "chat",
+        "spec": "openai",
+        "enabled": true
+      },
+      {
+        "path": "/v1/completions",
+        "method": "POST",
+        "target": "completions",
+        "spec": "openai",
+        "enabled": true
+      },
+      {
+        "path": "/v1/models",
+        "method": "GET",
+        "target": "models",
+        "spec": "openai",
+        "enabled": true
+      },
+      {
+        "path": "/v1/images/generations",
+        "method": "POST",
+        "target": "images",
+        "spec": "openai",
+        "enabled": true
+      },
+      {
+        "path": "/v1/videos",
+        "method": "POST",
+        "target": "videos",
+        "spec": "openai",
+        "enabled": true
+      },
+      {
+        "path": "/nrob/images",
+        "method": "POST",
+        "target": "images",
+        "spec": "nrob",
+        "enabled": true
+      },
+      {
+        "path": "/files",
+        "method": "GET",
+        "target": "files",
+        "spec": "openai",
+        "enabled": true
+      },
+      {
+        "path": "/health",
+        "method": "GET",
+        "target": "health",
+        "spec": "openai",
+        "enabled": true
+      }
+    ]
+  },
+  "llm": {
+    "enabled": true,
+    "autostart": false,
+    "server": "nrob-server",
+    "default_model": "qwen3-8b",
+    "models": [
+      {
+        "name": "qwen3-8b",
+        "path": "models/Qwen3-8B-Q4_K_M.gguf",
+        "vision_projector": "",
+        "enabled": true
+      }
+    ],
+    "devices": [
+      0
+    ],
+    "ctx": 32768,
+    "ram_gb": 0,
+    "cpu_threads": 24,
+    "vram_headroom_gb": 2,
+    "thinking": false,
+    "max_tokens": 8192,
+    "temperature": 0.6,
+    "top_p": 0.95,
+    "prompt_cache": true,
+    "prompt_cache_gb": 4,
+    "vision": true,
+    "idle_stop_minutes": 30,
+    "extra_args": []
+  },
+  "media": {
+    "worker": "nrob-diffusion",
+    "output_dir": "outputs",
+    "device": 1,
+    "llm_policy": "auto",
+    "resume_llm": true,
+    "keep_jobs": 200,
+    "image": {
+      "enabled": true,
+      "default_model": "qwen-image-q4",
+      "memory": "auto",
+      "ram_gb": 32,
+      "vram_gb": null,
+      "models": {
+        "qwen-image-q4": {
+          "architecture": "qwen-image",
+          "base": "models/Qwen-Image-2.1",
+          "transformer": "models/qwen-image-2.1-Q4_K_M.gguf",
+          "adapter": "models/viggle-v0.2.1-r128.safetensors",
+          "enabled": true
+        },
+        "anime-sdxl": {
+          "architecture": "sdxl",
+          "checkpoint": "models/anime-sdxl.safetensors",
+          "tokenizer": "models/clip-tokenizer/tokenizer.json",
+          "steps": 20,
+          "cfg": 4.0,
+          "memory": "ssd",
+          "enabled": true
+        }
+      }
+    },
+    "video": {
+      "enabled": true,
+      "default_model": "sulphur-2",
+      "memory": "auto",
+      "ram_gb": 48,
+      "vram_gb": null,
+      "ffmpeg": "ffmpeg",
+      "fps": 24,
+      "models": {
+        "sulphur-2": {
+          "family": "sulphur-2",
+          "transformer": "models/sulphur_distil_bf16.safetensors",
+          "vae": "models/sulphur_distil_bf16.safetensors",
+          "text_encoder": "models/gemma_3_12B_it.safetensors",
+          "tokenizer": "models/gemma-3/tokenizer.json",
+          "enabled": true
+        }
+      }
+    }
+  }
+}

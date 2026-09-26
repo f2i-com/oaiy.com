@@ -6,12 +6,12 @@ crates (`nrob`, `nrob-cli`, `nrob-server`, `nrob-image`, `dsv41`, `dsv41-cuda`) 
 
 ## Hard rules
 
-- **std-only.** No external crates in `nrob`, `nrob-image`, `dsv41` or `nrob-server`: no serde, no
+- **std-only.** No external crates in `nrob`, `nrob-image`, `dsv41`, `nrob-server` or `nrob-studio`: no serde, no
   tokio, nothing.
   The core is zero-dependency by design. Do not add a dependency "just for this one
   thing"; write the 30 lines instead. (`dsv41-cuda` depends on cudarc for the GPU; the
   GGUF stack is covered below.)
-- **No `unsafe`** in `nrob`, `nrob-cli`, `nrob-server`, `nrob-image` or `dsv41`: their crate roots say
+- **No `unsafe`** in `nrob`, `nrob-cli`, `nrob-server`, `nrob-studio`, `nrob-image` or `dsv41`: their crate roots say
   `#![forbid(unsafe_code)]`. `dsv41-cuda` may use it for kernel launches, pinned
   memory and SIMD dispatch, with a `SAFETY:` comment on every block explaining why safe
   Rust cannot express it and what makes it sound.
