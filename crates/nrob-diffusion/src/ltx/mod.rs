@@ -1,4 +1,11 @@
 //! Native Rust text/image-to-video for LTX 2.3/2.5 and compatible distilled checkpoints.
+//!
+//! A clip can start from an image, end on one, or both. It can come with a
+//! soundtrack generated with the picture, or follow one it is given: an audio
+//! file, or speech made first in the same job (Qwen3-TTS). A given soundtrack
+//! is encoded by the audio VAE and held fixed while the picture is denoised
+//! (the official `a2vid` pipeline's frozen audio), so mouths and motion follow
+//! it; the clip keeps the original audio.
 mod audio;
 mod cache;
 pub(crate) mod store;
@@ -32,6 +39,13 @@ pub struct Request {
     /// soundtrack generated jointly with the picture.
     pub audio_vae: Option<PathBuf>,
     pub audio: bool,
+    /// A soundtrack for the picture to follow (any format FFmpeg reads).
+    pub audio_file: Option<PathBuf>,
+    /// Speech to make first and follow: a `kind: "speech"` worker request.
+    pub speech: Option<Json>,
+    /// No length was asked for: the clip is as long as the soundtrack (up to
+    /// 121 frames).
+    pub frames_from_audio: bool,
     pub output: PathBuf,
     pub prompt: String,
     pub image: Option<PathBuf>,
@@ -78,13 +92,25 @@ impl Request {
                 .filter(|s| !s.trim().is_empty())
                 .map(PathBuf::from),
             // Audio comes with every clip whose model has an audio VAE, unless
-            // the request says `"audio": false`.
+            // the request says `"audio": false`. A given soundtrack needs it.
             audio: match j.get("audio") {
                 None | Some(Json::Null) => {
                     j.get("audio_vae").and_then(Json::as_str).is_some_and(|s| !s.trim().is_empty())
+                        || j.get("audio_file").is_some_and(|v| !matches!(v, Json::Null))
+                        || j.get("speech").is_some_and(|v| !matches!(v, Json::Null))
                 }
                 Some(v) => v.as_bool().ok_or("audio must be true or false")?,
             },
+            audio_file: match j.get("audio_file") {
+                None | Some(Json::Null) => None,
+                Some(v) => Some(v.as_str().filter(|s| !s.trim().is_empty()).ok_or("audio_file must be an absolute local path")?.into()),
+            },
+            speech: match j.get("speech") {
+                None | Some(Json::Null) => None,
+                Some(v @ Json::Obj(_)) => Some(v.clone()),
+                Some(_) => return Err("speech must be a speech request object".into()),
+            },
+            frames_from_audio: j.get("frames").is_none() && (j.get("audio_file").is_some_and(|v| !matches!(v, Json::Null)) || j.get("speech").is_some_and(|v| !matches!(v, Json::Null))),
             output: s("output_dir")?.into(),
             prompt: s("prompt")?,
             cache_dir: j.get("cache_dir").and_then(Json::as_str).map(PathBuf::from),
@@ -108,7 +134,7 @@ impl Request {
             },
             width: n("width", 512)?,
             height: n("height", 320)?,
-            frames: n("frames", 49)?,
+            frames: n("frames", if j.get("frames").is_none() && (j.get("audio_file").is_some() || j.get("speech").is_some()) { 121 } else { 49 })?,
             fps: n("fps", 24)?,
             seed: n("seed", 0)? as u64,
             device: n("device", 0)?,
@@ -175,6 +201,18 @@ impl Request {
         if self.audio && self.audio_vae.is_none() {
             return Err("audio needs the model's audio VAE (audio_vae)".into());
         }
+        if (self.audio_file.is_some() || self.speech.is_some()) && !self.audio {
+            return Err("a soundtrack to follow needs the model's audio stream; leave audio on".into());
+        }
+        if self.audio_file.is_some() && self.speech.is_some() {
+            return Err("give audio_file or speech, not both".into());
+        }
+        if let Some(path) = &self.audio_file {
+            let meta = std::fs::metadata(path).map_err(|e| format!("video soundtrack: {e}"))?;
+            if !path.is_absolute() || !meta.is_file() || meta.len() > 256 * 1024 * 1024 {
+                return Err("audio_file must be an absolute local file of at most 256 MiB".into());
+            }
+        }
         if self.prompt.trim().is_empty() {
             return Err("prompt must not be empty".into());
         }
@@ -208,6 +246,31 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
         candle_core::bail!("FFmpeg is required to write the video container");
     }
     std::fs::create_dir_all(&r.output)?;
+    // The soundtrack to follow: speech made first (its model is freed before
+    // the video's loads), or a file; read as stereo at its own rate.
+    let mut owned = r.clone();
+    let speech_started = Instant::now();
+    if let Some(s) = &r.speech {
+        let tts = crate::tts::Request::parse(s).map_err(candle_core::Error::Msg)?;
+        let spoken = crate::tts::generate(&tts, &mut report)?;
+        let path = spoken.get("path").and_then(Json::as_str).ok_or_else(|| candle_core::Error::Msg("speech wrote no audio".into()))?;
+        owned.audio_file = Some(path.into());
+        owned.speech = None;
+    }
+    let speech_seconds = speech_started.elapsed().as_secs_f64();
+    let soundtrack_in = match &owned.audio_file {
+        Some(path) => {
+            report(event("reading_soundtrack", 0, 1));
+            let (channels, rate) = read_audio(&r.ffmpeg, path)?;
+            if owned.frames_from_audio {
+                owned.frames = frames_for_audio(channels[0].len() as f64 / rate as f64, r.fps);
+            }
+            Some((channels, rate))
+        }
+        None => None,
+    };
+    owned.validate().map_err(candle_core::Error::Msg)?;
+    let r = &owned;
     let dev = inference_device(r.device)?;
     let ram = if r.memory == "ssd" || r.memory == "gpu" {
         0
@@ -329,6 +392,18 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
         (None, None)
     };
     let image_seconds = image_started.elapsed().as_secs_f64();
+    // The given soundtrack as the transformer's audio latent, held fixed.
+    let audio_frames = audio_latent_frames(r.frames, r.fps);
+    let conditioning_audio = match (&soundtrack_in, &r.audio_vae) {
+        (Some((channels, rate)), Some(path)) => {
+            report(event("encoding_soundtrack", 0, 1));
+            let encoder = audio::AudioEncoder::load(path, &dev)?;
+            let latent = encoder.latent(channels, *rate, audio_frames, &dev)?;
+            drop(encoder);
+            Some(latent)
+        }
+        _ => None,
+    };
     let encode_started = Instant::now();
     let prompt_cache = cache::PromptCache::new(r);
     let audio_cache = if r.audio { cache::PromptCache::audio(r) } else { None };
@@ -404,9 +479,8 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
         latent = Tensor::cat(&[&latent, end], 1)?;
     }
     latent = condition_endpoints(latent, starting_latent.as_ref(), ending_latent.as_ref())?;
-    // The soundtrack: its own latent, denoised jointly on the same schedule.
-    // It is never conditioned; an image fixes only the picture.
-    let audio_frames = audio_latent_frames(r.frames, r.fps);
+    // The soundtrack: its own latent, denoised jointly on the same schedule,
+    // or the given one, frozen (sigma 0) while the picture follows it.
     let audio_ropes = if r.audio {
         Some((
             transformer::Rope::audio(audio_frames, &dev)?,
@@ -415,7 +489,10 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
     } else {
         None
     };
-    let mut audio_latent = if r.audio {
+    let frozen_audio = conditioning_audio.is_some();
+    let mut audio_latent = if let Some(latent) = conditioning_audio {
+        Some(latent)
+    } else if r.audio {
         let noise = crate::pipeline::noise(r.seed.wrapping_add(AUDIO_SEED_OFFSET), audio_frames * 128);
         Some(Tensor::from_vec(noise, (1, audio_frames, 128), &dev)?)
     } else {
@@ -426,7 +503,7 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
         let audio_bf16 = audio_latent.as_ref().map(|a| a.to_dtype(DType::BF16)).transpose()?;
         let audio_input = match (&audio_bf16, &audio_context, &audio_ropes) {
             (Some(latent), Some(context), Some((rope, video_cross))) => {
-                Some(transformer::AudioInput { latent, context, rope, video_cross })
+                Some(transformer::AudioInput { latent, context, rope, video_cross, sigma: if frozen_audio { 0. } else { SIGMAS[step] } })
             }
             _ => None,
         };
@@ -443,7 +520,7 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
         let dt = SIGMAS[step + 1] - SIGMAS[step];
         latent = (latent + (velocity.to_dtype(DType::F32)? * dt)?)?;
         latent = condition_endpoints(latent, starting_latent.as_ref(), ending_latent.as_ref())?;
-        if let (Some(a), Some(v)) = (audio_latent.as_mut(), audio_velocity) {
+        if let (Some(a), Some(v), false) = (audio_latent.as_mut(), audio_velocity, frozen_audio) {
             *a = (&*a + (v.to_dtype(DType::F32)? * dt)?)?;
         }
     }
@@ -501,6 +578,15 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
     // to exactly the clip's length.
     let audio_started = Instant::now();
     let soundtrack = match (&audio_latent, &r.audio_vae) {
+        // A given soundtrack is kept as it was (the reference returns the
+        // input audio, not its VAE round trip), cut to the clip.
+        _ if soundtrack_in.is_some() => {
+            let (channels, rate) = soundtrack_in.as_ref().ok_or_else(|| candle_core::Error::Msg("soundtrack missing".into()))?;
+            let samples = (r.frames as f64 / r.fps as f64 * *rate as f64) as usize;
+            let at = |c: &Vec<f32>, i: usize| c.get(i).copied().unwrap_or(0.);
+            let interleaved: Vec<f32> = (0..samples).flat_map(|i| [at(&channels[0], i), at(&channels[1], i)]).collect();
+            Some((interleaved, *rate))
+        }
         (Some(latent), Some(path)) => {
             report(event("decoding_audio", 0, 1));
             let decoder = audio::AudioDecoder::load(path, &dev)?;
@@ -677,6 +763,12 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
         ("fps", Json::Int(r.fps as i64)),
         ("steps", Json::Int(8)),
         ("audio", Json::Bool(soundtrack.is_some())),
+        ("followed_soundtrack", Json::Bool(soundtrack_in.is_some())),
+        (
+            "audio_file",
+            r.audio_file.as_ref().map(|p| Json::str(p.to_string_lossy())).unwrap_or(Json::Null),
+        ),
+        ("speech_seconds", Json::Num(speech_seconds)),
         (
             "sample_rate",
             soundtrack.as_ref().map_or(Json::Null, |(_, rate)| Json::Int(*rate as i64)),
@@ -692,6 +784,41 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
     std::fs::write(path.with_extension("json"), result.to_json())?;
     Ok(result)
 }
+/// The clip length for a soundtrack of `seconds`: whole frames at `fps`,
+/// snapped down to 8k+1 as the reference does, within 9..=121.
+fn frames_for_audio(seconds: f64, fps: usize) -> usize {
+    let raw = ((seconds * fps as f64) as usize).clamp(9, 121);
+    (raw - 1) / 8 * 8 + 1
+}
+
+/// Decode any audio FFmpeg reads to stereo F32 at its own sample rate (mono
+/// is duplicated; more channels are mixed down). At most 60 seconds.
+fn read_audio(ffmpeg: &std::path::Path, path: &std::path::Path) -> Result<([Vec<f32>; 2], usize)> {
+    let out = command(ffmpeg)
+        .args(["-hide_banner", "-nostdin", "-i"])
+        .arg(path)
+        .args(["-t", "60", "-vn", "-ac", "2", "-f", "f32le", "pipe:1"])
+        .stdin(Stdio::null())
+        .output()?;
+    let log = String::from_utf8_lossy(&out.stderr);
+    if !out.status.success() {
+        candle_core::bail!("FFmpeg could not read the soundtrack: {}", log.lines().last().unwrap_or("").trim());
+    }
+    let rate = regex::Regex::new(r"Audio: [^\n]*?, (\d+) Hz")
+        .map_err(candle_core::Error::wrap)?
+        .captures(&log)
+        .and_then(|c| c[1].parse::<usize>().ok())
+        .filter(|r| (1000..=384_000).contains(r))
+        .ok_or_else(|| candle_core::Error::Msg("the soundtrack has no audio stream".into()))?;
+    let samples: Vec<f32> = out.stdout.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
+    if samples.len() < 2 * rate / 10 {
+        candle_core::bail!("the soundtrack is shorter than a tenth of a second");
+    }
+    let left = samples.iter().step_by(2).copied().collect();
+    let right = samples.iter().skip(1).step_by(2).copied().collect();
+    Ok(([left, right], rate))
+}
+
 /// Seeds the audio noise apart from the video noise drawn with the same seed.
 const AUDIO_SEED_OFFSET: u64 = 0x9e37_79b9_7f4a_7c15;
 
@@ -785,6 +912,21 @@ mod tests {
             assert_eq!(&values[12..], &[7.; 4]);
         }
         Ok(())
+    }
+    #[test]
+    fn clips_follow_the_soundtrack_length() {
+        assert_eq!(frames_for_audio(3.2, 24), 73);
+        assert_eq!(frames_for_audio(0.2, 24), 9);
+        assert_eq!(frames_for_audio(30., 24), 121);
+        let base = |extra: &str| {
+            Json::parse(format!(r#"{{"model":"ltx-2.5","transformer":"t","text_encoder":"e","vae":"v","audio_vae":"a","output_dir":"o","prompt":"p"{extra}}}"#).as_bytes()).unwrap()
+        };
+        let r = Request::parse(&base(r#","speech":{"kind":"speech"}"#)).unwrap();
+        assert!(r.frames_from_audio && r.audio && r.speech.is_some());
+        let r = Request::parse(&base(r#","speech":{"kind":"speech"},"frames":49"#)).unwrap();
+        assert!(!r.frames_from_audio && r.frames == 49);
+        assert!(Request::parse(&base(r#","speech":{"kind":"speech"},"audio":false"#)).is_err());
+        assert!(Request::parse(&base(r#","audio_file":"relative.wav""#)).is_err());
     }
     #[test]
     fn audio_length_follows_the_clip() {

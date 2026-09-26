@@ -450,8 +450,62 @@ fn reference_image(value: &Json, output_root: &Path, allow_local: bool) -> Resul
     Ok(Some(p.to_string_lossy().into_owned()))
 }
 
+/// Decode an `input_audio` value into a file the worker can read: a `data:`
+/// URL, `{"data": base64, "format": "wav"}` (OpenAI's audio input), `{"url"}`
+/// / `{"audio_url"}`, or a local path when `allow_local`.
+fn reference_audio(value: &Json, output_root: &Path, allow_local: bool) -> Result<Option<String>, String> {
+    const FORMATS: [&str; 8] = ["wav", "mp3", "ogg", "opus", "flac", "m4a", "aac", "webm"];
+    let save = |bytes: Vec<u8>, ext: &str| -> Result<Option<String>, String> {
+        if bytes.len() > 64 << 20 {
+            return Err("soundtracks are limited to 64 MiB".into());
+        }
+        let dir = output_root.join("inputs");
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let path = dir.join(format!("{}.{ext}", random_id("audio_")));
+        std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
+        Ok(Some(path.to_string_lossy().into_owned()))
+    };
+    let text = match value {
+        Json::Null => return Ok(None),
+        Json::Str(s) => s.clone(),
+        other => {
+            if let Some(data) = other.get("data").and_then(Json::as_str) {
+                let format = other.get("format").and_then(Json::as_str).unwrap_or("wav").to_lowercase();
+                if !FORMATS.contains(&format.as_str()) {
+                    return Err(format!("input_audio format must be one of {}", FORMATS.join(", ")));
+                }
+                return save(base64_decode(data)?, &format);
+            }
+            match other.get("audio_url").or_else(|| other.get("url")) {
+                Some(Json::Str(s)) => s.clone(),
+                Some(inner) => inner.get("url").and_then(Json::as_str).ok_or("input_audio needs data or url")?.to_string(),
+                None => return Err("input_audio needs data (base64) or url".into()),
+            }
+        }
+    };
+    if let Some(rest) = text.strip_prefix("data:") {
+        let (head, data) = rest.split_once(',').ok_or("bad data URL")?;
+        let ext = FORMATS.iter().find(|f| head.contains(*f)).copied().unwrap_or(if head.contains("mpeg") { "mp3" } else { "wav" });
+        return save(base64_decode(data)?, ext);
+    }
+    if text.starts_with("http://") || text.starts_with("https://") {
+        return Err("remote audio URLs are not fetched; send a data: URL".into());
+    }
+    if !allow_local {
+        return Err("local audio paths are only accepted from this machine; send a data: URL".into());
+    }
+    let p = PathBuf::from(text.strip_prefix("file://").unwrap_or(&text));
+    let meta = std::fs::metadata(&p).map_err(|e| format!("{}: {e}", p.display()))?;
+    if !p.is_absolute() || !meta.is_file() || meta.len() > 256 << 20 {
+        return Err("soundtracks must be absolute paths to files of at most 256 MiB".into());
+    }
+    Ok(Some(p.to_string_lossy().into_owned()))
+}
+
 /// The worker request for a video job. `seconds` (OpenAI) or `frames` sets the
-/// length; LTX takes 8k+1 frames, at most 121.
+/// length; LTX takes 8k+1 frames, at most 121. With a soundtrack to follow
+/// (`input_audio`, or `speech` to make first) and no length, the clip is as
+/// long as the soundtrack.
 pub fn video_request(cfg: &Json, root: &Path, output_root: &Path, body: &Json, allow_local: bool) -> Result<(Json, String, String, f64), String> {
     let media = cfg.get("media").ok_or("no media section")?;
     let section = media.get("video").ok_or("no video section")?;
@@ -468,6 +522,8 @@ pub fn video_request(cfg: &Json, root: &Path, output_root: &Path, body: &Json, a
     if !(1..=60).contains(&fps) {
         return Err("fps must be between 1 and 60".into());
     }
+    let follows_audio = body.get("input_audio").is_some_and(|v| !matches!(v, Json::Null)) || body.get("speech").is_some_and(|v| !matches!(v, Json::Null));
+    let explicit_length = body.get("frames").and_then(Json::as_i64).is_some() || body.get("seconds").is_some_and(|v| !matches!(v, Json::Null));
     let frames = match (body.get("frames").and_then(Json::as_i64), body.get("seconds")) {
         (Some(f), _) => f,
         (None, Some(s)) => {
@@ -493,7 +549,6 @@ pub fn video_request(cfg: &Json, root: &Path, output_root: &Path, body: &Json, a
         ("prompt".into(), Json::str(&prompt)),
         ("width".into(), Json::Int(w)),
         ("height".into(), Json::Int(h)),
-        ("frames".into(), Json::Int(frames)),
         ("fps".into(), Json::Int(fps)),
         ("seed".into(), Json::Int(seed(body)?)),
         ("device".into(), Json::Int(int_or(media, "device", 0))),
@@ -517,8 +572,48 @@ pub fn video_request(cfg: &Json, root: &Path, output_root: &Path, body: &Json, a
         Some(Json::Bool(true)) => return Err(format!("video model {name} has no audio VAE, so it cannot make sound")),
         Some(_) => return Err("audio must be true or false".into()),
     }
+    if follows_audio {
+        if audio_vae.is_none() {
+            return Err(format!("video model {name} has no audio VAE, so it cannot follow a soundtrack"));
+        }
+        if body.get("audio") == Some(&Json::Bool(false)) {
+            return Err("the soundtrack is the clip's audio; leave audio on".into());
+        }
+        if body.get("input_audio").is_some_and(|v| !matches!(v, Json::Null)) && body.get("speech").is_some_and(|v| !matches!(v, Json::Null)) {
+            return Err("send input_audio or speech, not both".into());
+        }
+    }
     if let Some(p) = audio_vae {
         f.push(("audio_vae".into(), Json::str(p)));
+    }
+    // Without a length, the worker makes the clip as long as the soundtrack.
+    let mut seconds = (frames - 1) as f64 / fps as f64;
+    if !follows_audio || explicit_length {
+        f.push(("frames".into(), Json::Int(frames)));
+    }
+    if let Some(v) = body.get("input_audio") {
+        if let Some(p) = reference_audio(v, output_root, allow_local)? {
+            f.push(("audio_file".into(), Json::str(p)));
+            if !explicit_length {
+                seconds = 120.0 / fps as f64;
+            }
+        }
+    }
+    if let Some(s) = body.get("speech").filter(|v| !matches!(v, Json::Null)) {
+        // What to say and in which voice: `input` (or `text`), `voice` (a saved
+        // voice or an OpenAI name), `instructions`, `language`, `seed`, `model`.
+        let mut sb = s.clone();
+        if sb.get("input").is_none() {
+            if let Some(t) = s.get("text").cloned() {
+                crate::util::set(&mut sb, "input", t);
+            }
+        }
+        let (request, _, _, speech_frames) = crate::speech::speech_request(cfg, root, &day_dir(output_root, "speech"), &sb).map_err(|e| format!("speech: {e}"))?;
+        f.push(("speech".into(), request));
+        if !explicit_length {
+            // Speech runs at 12.5 frames a second; the clip stops at 121 video frames.
+            seconds = (speech_frames as f64 / 12.5).min(120.0 / fps as f64);
+        }
     }
     let start = body.get("input_reference").or_else(|| body.get("image"));
     if let Some(v) = start {
@@ -543,7 +638,7 @@ pub fn video_request(cfg: &Json, root: &Path, output_root: &Path, body: &Json, a
         memory.push(("vram_gb".into(), Json::Int(192)));
     }
     f.extend(memory);
-    Ok((Json::Obj(f), name, format!("{w}x{h}"), (frames - 1) as f64 / fps as f64))
+    Ok((Json::Obj(f), name, format!("{w}x{h}"), seconds))
 }
 
 /// Whether a media job must have the GPU to itself: `llm_policy` `pause_llm`
@@ -572,6 +667,10 @@ fn progress_of(kind: Kind, n: usize, e: &Json) -> Option<(f64, String)> {
         (Kind::Image, "decoding") => 15.0 + 80.0 * i("image") / n - 1.0,
         (Kind::Image, "loading_unet" | "encoding_prompt") => 5.0 + 80.0 * (i("image") - 1.0).max(0.0) / n,
         (Kind::Image, _) => 3.0,
+        // Speech to follow comes first, then its reading.
+        (Kind::Video, "speaking") if i("total") > 0.0 => 1.0 + 3.0 * (1.0 - (-3.0 * i("current") / i("total")).exp()),
+        (Kind::Video, "decoding_speech" | "reading_soundtrack") => 4.0,
+        (Kind::Video, "encoding_soundtrack") => 5.0,
         (Kind::Video, "encoding_video_prompt") if i("total") > 0.0 => 3.0 + 12.0 * i("current") / i("total"),
         (Kind::Video, "video_text_connector") => 16.0,
         (Kind::Video, "video_denoising") if i("total") > 0.0 => 18.0 + 67.0 * i("current") / i("total"),
@@ -1103,6 +1202,36 @@ mod tests {
         assert!(video_request(&c, root, &out, &body(r#"{"prompt":"x","input_reference":{"file_id":"f"}}"#), false).is_err());
         let (long, ..) = video_request(&c, root, &out, &body(r#"{"prompt":"x","seconds":30}"#), false).unwrap();
         assert_eq!(long.get("frames").and_then(Json::as_i64), Some(121));
+        let _ = std::fs::remove_dir_all(out);
+    }
+
+    #[test]
+    fn video_follows_a_soundtrack_or_speech() {
+        let mut c = cfg("", r#","audio_vae":"s.safetensors""#);
+        let speech = Json::parse(br#"{"enabled":true,"default_model":"tts","voices_dir":"voices","models":{"tts":{"design":"/m/design","base":"/m/base"}}}"#).unwrap();
+        let Json::Obj(top) = &mut c else { unreachable!() };
+        let media = &mut top.iter_mut().find(|(k, _)| k == "media").unwrap().1;
+        crate::util::set(media, "speech", speech);
+        let root = Path::new("/install");
+        let out = std::env::temp_dir().join(format!("nrob-studio-a2v-{}", std::process::id()));
+        // OpenAI's audio input shape: the file is written, the length comes from it.
+        let wav = format!(r#"{{"prompt":"a woman talks","input_audio":{{"data":"{}","format":"wav"}}}}"#, crate::util::base64_encode(b"RIFF"));
+        let (r, ..) = video_request(&c, root, &out, &body(&wav), false).unwrap();
+        assert_eq!(std::fs::read(r.get("audio_file").and_then(Json::as_str).unwrap()).unwrap(), b"RIFF");
+        assert!(r.get("frames").is_none(), "the worker sizes the clip to the soundtrack");
+        // An explicit length still wins.
+        let (r, ..) = video_request(&c, root, &out, &body(&wav.replace(r#""prompt""#, r#""seconds":2,"prompt""#)), false).unwrap();
+        assert_eq!(r.get("frames").and_then(Json::as_i64), Some(49));
+        // Speech is made first, in the same job, with a described voice.
+        let (r, _, _, secs) = video_request(&c, root, &out, &body(r#"{"prompt":"a man speaks to camera","speech":{"text":"Hello there, welcome back.","voice":"onyx"}}"#), false).unwrap();
+        let s = r.get("speech").unwrap();
+        assert_eq!((str_or(s, "kind", ""), str_or(s, "text", "")), ("speech", "Hello there, welcome back."));
+        assert!(secs > 0.5 && secs <= 5.0, "{secs}");
+        // Refusals: no audio VAE, audio off, both sources, a local file from afar.
+        assert!(video_request(&cfg("", ""), root, &out, &body(&wav), false).unwrap_err().contains("audio VAE"));
+        assert!(video_request(&c, root, &out, &body(&wav.replace(r#""prompt""#, r#""audio":false,"prompt""#)), false).is_err());
+        assert!(video_request(&c, root, &out, &body(r#"{"prompt":"x","input_audio":"C:/voice.wav"}"#), false).unwrap_err().contains("this machine"));
+        assert!(video_request(&c, root, &out, &body(r#"{"prompt":"x","input_audio":"data:audio/wav;base64,UklGRg==","speech":{"text":"hi"}}"#), false).is_err());
         let _ = std::fs::remove_dir_all(out);
     }
 

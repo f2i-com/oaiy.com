@@ -142,11 +142,7 @@ impl AudioDecoder {
     /// A 2-D convolution causal in time (height): the past is padded, the
     /// frequency axis symmetrically, both with zeros.
     fn conv2d(&self, x: &Tensor, prefix: &str) -> Result<Tensor> {
-        let w = self.get(&format!("{prefix}.conv.weight"))?;
-        let b = self.get(&format!("{prefix}.conv.bias"))?;
-        let (_, _, kh, kw) = w.dims4()?;
-        let x = x.pad_with_zeros(2, kh - 1, 0)?.pad_with_zeros(3, (kw - 1) / 2, kw - 1 - (kw - 1) / 2)?;
-        x.conv2d(w, 0, 1, 1, 1)?.broadcast_add(&b.reshape((1, b.dim(0)?, 1, 1))?)
+        causal_conv2d(x, self.get(&format!("{prefix}.conv.weight"))?, self.get(&format!("{prefix}.conv.bias"))?)
     }
 
     fn resnet(&self, x: &Tensor, prefix: &str) -> Result<Tensor> {
@@ -330,6 +326,297 @@ fn pixel_norm(x: &Tensor) -> Result<Tensor> {
     x.broadcast_div(&(x.sqr()?.mean_keepdim(1)? + 1e-6)?.sqrt()?)
 }
 
+/// A 2-D convolution causal in time (height): the past is padded, the
+/// frequency axis symmetrically, both with zeros.
+fn causal_conv2d(x: &Tensor, w: &Tensor, b: &Tensor) -> Result<Tensor> {
+    let (_, _, kh, kw) = w.dims4()?;
+    let x = x.pad_with_zeros(2, kh - 1, 0)?.pad_with_zeros(3, (kw - 1) / 2, kw - 1 - (kw - 1) / 2)?;
+    x.conv2d(w, 0, 1, 1, 1)?.broadcast_add(&b.reshape((1, b.dim(0)?, 1, 1))?)
+}
+
+/// torchaudio's `functional.resample` (Hann-windowed sinc, 6 zero crossings,
+/// rolloff 0.99) for one channel, `from` Hz to `to` Hz.
+pub fn resample(x: &[f32], from: usize, to: usize) -> Vec<f32> {
+    if from == to || x.is_empty() {
+        return x.to_vec();
+    }
+    fn gcd(a: usize, b: usize) -> usize {
+        if b == 0 { a } else { gcd(b, a % b) }
+    }
+    let g = gcd(from, to);
+    let (orig, new) = (from / g, to / g);
+    let (zeros, rolloff) = (6f64, 0.99f64);
+    let base = orig.min(new) as f64 * rolloff;
+    let width = (zeros * orig as f64 / base).ceil() as usize;
+    let taps = 2 * width + orig;
+    // One kernel per output phase, computed in F64 and applied in F32.
+    let kernels: Vec<Vec<f32>> = (0..new)
+        .map(|phase| {
+            (0..taps)
+                .map(|i| {
+                    let idx = (i as f64 - width as f64) / orig as f64;
+                    let t = ((-(phase as f64) / new as f64 + idx) * base).clamp(-zeros, zeros);
+                    let window = (t * std::f64::consts::PI / zeros / 2.).cos().powi(2);
+                    let t = t * std::f64::consts::PI;
+                    let sinc = if t == 0. { 1. } else { t.sin() / t };
+                    (sinc * window * base / orig as f64) as f32
+                })
+                .collect()
+        })
+        .collect();
+    // Zeros: `width` before, `width + orig` after.
+    let padded: Vec<f32> = std::iter::repeat_n(0f32, width).chain(x.iter().copied()).chain(std::iter::repeat_n(0f32, width + orig)).collect();
+    let blocks = (padded.len() - taps) / orig + 1;
+    let target = (new as u128 * x.len() as u128).div_ceil(orig as u128) as usize;
+    let mut out = Vec::with_capacity(target);
+    'outer: for b in 0..blocks {
+        let window = &padded[b * orig..b * orig + taps];
+        for k in &kernels {
+            if out.len() == target {
+                break 'outer;
+            }
+            out.push(window.iter().zip(k).map(|(a, w)| a * w).sum());
+        }
+    }
+    out
+}
+
+/// In-place radix-2 FFT (`re.len()` a power of two).
+fn fft(re: &mut [f64], im: &mut [f64]) {
+    let n = re.len();
+    let mut j = 0;
+    for i in 1..n {
+        let mut bit = n >> 1;
+        while j & bit != 0 {
+            j ^= bit;
+            bit >>= 1;
+        }
+        j |= bit;
+        if i < j {
+            re.swap(i, j);
+            im.swap(i, j);
+        }
+    }
+    let mut len = 2;
+    while len <= n {
+        let angle = -2. * std::f64::consts::PI / len as f64;
+        for start in (0..n).step_by(len) {
+            for k in 0..len / 2 {
+                let (w_re, w_im) = ((angle * k as f64).cos(), (angle * k as f64).sin());
+                let (a, b) = (start + k, start + k + len / 2);
+                let (t_re, t_im) = (re[b] * w_re - im[b] * w_im, re[b] * w_im + im[b] * w_re);
+                re[b] = re[a] - t_re;
+                im[b] = im[a] - t_im;
+                re[a] += t_re;
+                im[a] += t_im;
+            }
+        }
+        len <<= 1;
+    }
+}
+
+/// torchaudio's slaney mel filterbank (`melscale_fbanks`, slaney norm) as a
+/// `(mels, bins)` matrix.
+fn slaney_filters(bins: usize, f_max: f64, mels: usize, sample_rate: usize) -> Vec<f32> {
+    let (sp, min_hz, step) = (200. / 3., 1000f64, 6.4f64.ln() / 27.);
+    let hz_to_mel = |f: f64| if f >= min_hz { min_hz / sp + (f / min_hz).ln() / step } else { f / sp };
+    let mel_to_hz = |m: f64| if m >= min_hz / sp { min_hz * (step * (m - min_hz / sp)).exp() } else { sp * m };
+    let freqs: Vec<f64> = (0..bins).map(|i| (sample_rate / 2) as f64 * i as f64 / (bins - 1) as f64).collect();
+    let (lo, hi) = (hz_to_mel(0.), hz_to_mel(f_max));
+    let pts: Vec<f64> = (0..mels + 2).map(|i| mel_to_hz(lo + (hi - lo) * i as f64 / (mels + 1) as f64)).collect();
+    let mut fb = vec![0f32; mels * bins];
+    for m in 0..mels {
+        let enorm = 2. / (pts[m + 2] - pts[m]);
+        for (i, &f) in freqs.iter().enumerate() {
+            let down = (f - pts[m]) / (pts[m + 1] - pts[m]);
+            let up = (pts[m + 2] - f) / (pts[m + 2] - pts[m + 1]);
+            fb[m * bins + i] = (down.min(up).max(0.) * enorm) as f32;
+        }
+    }
+    fb
+}
+
+/// The audio VAE encoder: a stereo waveform to the transformer's audio latent
+/// `(1, frames, 128)`, normalized, 25 frames a second. The official
+/// `AudioProcessor` and `AudioEncoder`, in F32.
+pub struct AudioEncoder {
+    w: HashMap<String, Tensor>,
+    levels: usize,
+    pub sample_rate: usize,
+    hop: usize,
+    n_fft: usize,
+    mel_bins: usize,
+    f_max: f64,
+}
+
+impl AudioEncoder {
+    /// `audio_vae.encoder.*` and the latent statistics from an audio VAE file,
+    /// or from an LTX 2.3 / Sulphur checkpoint, which carries its own.
+    pub fn load(path: &Path, dev: &Device) -> Result<Self> {
+        let mut store = Store::open(path, 0)?;
+        let config = Json::parse(store.index.metadata("config").ok_or_else(|| msg("audio VAE file lacks its config metadata"))?.as_bytes())
+            .map_err(candle_core::Error::wrap)?;
+        let vae = config.get("audio_vae").ok_or_else(|| msg("audio VAE config lacks audio_vae"))?;
+        let params = vae.get("model").and_then(|m| m.get("params"));
+        let dd = params.and_then(|p| p.get("ddconfig")).ok_or_else(|| msg("audio VAE config lacks audio_vae.model.params.ddconfig"))?;
+        for (key, want) in [("z_channels", 8), ("in_channels", 2), ("mel_bins", 64)] {
+            if dd.get(key).and_then(Json::as_i64) != Some(want) {
+                candle_core::bail!("unsupported audio VAE encoder: {key}");
+            }
+        }
+        if dd.get("norm_type").and_then(Json::as_str) != Some("pixel")
+            || dd.get("causality_axis").and_then(Json::as_str) != Some("height")
+            || dd.get("mid_block_add_attention").and_then(Json::as_bool) == Some(true)
+            || dd.get("attn_resolutions").and_then(Json::as_array).is_some_and(|a| !a.is_empty())
+            || dd.get("double_z").and_then(Json::as_bool) == Some(false)
+        {
+            candle_core::bail!("unsupported audio VAE encoder: needs pixel norm, causal in time, no attention");
+        }
+        let levels = ints(dd.get("ch_mult"), "ch_mult")?.len();
+        let pre = vae.get("preprocessing");
+        let num = |section: &str, key: &str, default: f64| pre.and_then(|p| p.get(section)).and_then(|s| s.get(key)).and_then(Json::as_f64).unwrap_or(default);
+        let names: Vec<String> = store
+            .index
+            .names()
+            .filter(|k| k.starts_with("audio_vae.encoder.") || k.starts_with("audio_vae.per_channel_statistics."))
+            .map(str::to_owned)
+            .collect();
+        if !names.iter().any(|k| k.starts_with("audio_vae.encoder.")) {
+            candle_core::bail!("this audio VAE file has no encoder, so it cannot read a soundtrack");
+        }
+        let mut w = HashMap::new();
+        for k in names {
+            let t = store.tensor_f32(&k, dev)?;
+            w.insert(k, t);
+        }
+        Ok(Self {
+            w,
+            levels,
+            sample_rate: params.and_then(|p| p.get("sampling_rate")).and_then(Json::as_i64).unwrap_or(16_000) as usize,
+            hop: num("stft", "hop_length", 160.) as usize,
+            n_fft: num("stft", "filter_length", 1024.) as usize,
+            mel_bins: 64,
+            f_max: num("mel", "mel_fmax", 8000.),
+        })
+    }
+
+    fn get(&self, k: &str) -> Result<&Tensor> {
+        self.w.get(k).ok_or_else(|| msg(format!("missing audio encoder tensor {k}")))
+    }
+
+    fn conv2d(&self, x: &Tensor, prefix: &str) -> Result<Tensor> {
+        causal_conv2d(x, self.get(&format!("{prefix}.conv.weight"))?, self.get(&format!("{prefix}.conv.bias"))?)
+    }
+
+    fn resnet(&self, x: &Tensor, prefix: &str) -> Result<Tensor> {
+        let h = self.conv2d(&pixel_norm(x)?.silu()?, &format!("{prefix}.conv1"))?;
+        let h = self.conv2d(&pixel_norm(&h)?.silu()?, &format!("{prefix}.conv2"))?;
+        let shortcut = format!("{prefix}.nin_shortcut");
+        let x = if self.w.contains_key(&format!("{shortcut}.conv.weight")) { self.conv2d(x, &shortcut)? } else { x.clone() };
+        x + h
+    }
+
+    /// The log-mel spectrogram of a stereo waveform at `sample_rate`,
+    /// `(1, 2, T)` to `(1, 2, frames, 64)`: torchaudio's `MelSpectrogram`
+    /// (Hann window, centred with reflection, magnitude, slaney mels), then
+    /// `log(max(x, 1e-5))`.
+    pub fn mel(&self, wave: &Tensor) -> Result<Tensor> {
+        let (b, s, len) = wave.dims3()?;
+        let dev = wave.device();
+        let pad = self.n_fft / 2;
+        if len <= pad {
+            candle_core::bail!("the soundtrack is too short to read");
+        }
+        // On the host, in F64 with an FFT: a direct F32 transform loses the
+        // quiet bins, which the log then magnifies.
+        let rows = wave.to_dtype(DType::F32)?.reshape((b * s, len))?.to_vec2::<f32>()?;
+        let n = self.n_fft;
+        let bins = n / 2 + 1;
+        let frames = len / self.hop + 1;
+        let window: Vec<f64> = (0..n).map(|i| 0.5 - 0.5 * (2. * std::f64::consts::PI * i as f64 / n as f64).cos()).collect();
+        let filters = slaney_filters(bins, self.f_max, self.mel_bins, self.sample_rate);
+        let mut out = vec![0f32; b * s * frames * self.mel_bins];
+        let (mut re, mut im, mut magnitude) = (vec![0f64; n], vec![0f64; n], vec![0f64; bins]);
+        for (row, r) in rows.iter().enumerate() {
+            // Reflection padding (the edge sample is not repeated).
+            let at = |j: isize| -> f64 {
+                let j = if j < 0 { -j } else if j >= len as isize { 2 * (len as isize - 1) - j } else { j };
+                r[j as usize] as f64
+            };
+            for f in 0..frames {
+                let start = (f * self.hop) as isize - pad as isize;
+                for i in 0..n {
+                    re[i] = at(start + i as isize) * window[i];
+                    im[i] = 0.;
+                }
+                fft(&mut re, &mut im);
+                for k in 0..bins {
+                    magnitude[k] = (re[k] * re[k] + im[k] * im[k]).sqrt();
+                }
+                for m in 0..self.mel_bins {
+                    let v: f64 = filters[m * bins..(m + 1) * bins].iter().zip(&magnitude).map(|(w, x)| *w as f64 * x).sum();
+                    out[(row * frames + f) * self.mel_bins + m] = v.max(1e-5).ln() as f32;
+                }
+            }
+        }
+        Tensor::from_vec(out, (b, s, frames, self.mel_bins), dev)
+    }
+
+    /// A log-mel spectrogram `(1, 2, T, 64)` to the latent `(1, frames, 128)`.
+    pub fn encode(&self, mel: &Tensor) -> Result<Tensor> {
+        let p = "audio_vae.encoder";
+        let mut h = self.conv2d(mel, &format!("{p}.conv_in"))?;
+        for level in 0..self.levels {
+            let mut i = 0;
+            while self.w.contains_key(&format!("{p}.down.{level}.block.{i}.conv1.conv.weight")) {
+                h = self.resnet(&h, &format!("{p}.down.{level}.block.{i}"))?;
+                i += 1;
+            }
+            if level != self.levels - 1 {
+                // Causal in time: two rows of past, none after; one frequency
+                // column after. A 3x3 convolution with stride 2.
+                let d = format!("{p}.down.{level}.downsample.conv");
+                let b = self.get(&format!("{d}.bias"))?;
+                h = h
+                    .pad_with_zeros(2, 2, 0)?
+                    .pad_with_zeros(3, 0, 1)?
+                    .conv2d(self.get(&format!("{d}.weight"))?, 0, 2, 1, 1)?
+                    .broadcast_add(&b.reshape((1, b.dim(0)?, 1, 1))?)?;
+            }
+        }
+        h = self.resnet(&h, &format!("{p}.mid.block_1"))?;
+        h = self.resnet(&h, &format!("{p}.mid.block_2"))?;
+        h = self.conv2d(&pixel_norm(&h)?.silu()?, &format!("{p}.conv_out"))?;
+        // The means (the first 8 channels), patchified as channel * 16 +
+        // frequency, then normalized.
+        let means = h.narrow(1, 0, 8)?;
+        let (b, c, t, f) = means.dims4()?;
+        let x = means.permute((0, 2, 1, 3))?.contiguous()?.reshape((b, t, c * f))?;
+        let std = self.get("audio_vae.per_channel_statistics.std-of-means")?;
+        let mean = self.get("audio_vae.per_channel_statistics.mean-of-means")?;
+        x.broadcast_sub(mean)?.broadcast_div(std)
+    }
+
+    /// Stereo samples at `rate` (one vector per channel) to `frames` latent
+    /// frames: resampled, padded with silence to cover them, cropped.
+    pub fn latent(&self, channels: &[Vec<f32>; 2], rate: usize, frames: usize, dev: &Device) -> Result<Tensor> {
+        let wanted = frames * 4 * self.hop + self.n_fft;
+        let mut data = Vec::with_capacity(2 * wanted);
+        for c in channels {
+            let mut x = resample(c, rate, self.sample_rate);
+            x.resize(x.len().max(wanted), 0.);
+            x.truncate(wanted);
+            data.extend(x);
+        }
+        let wave = Tensor::from_vec(data, (1, 2, wanted), dev)?;
+        let latent = self.encode(&self.mel(&wave)?)?;
+        if latent.dim(1)? < frames {
+            candle_core::bail!("the soundtrack gave {} latent frames, {frames} needed", latent.dim(1)?);
+        }
+        latent.narrow(1, 0, frames)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -365,6 +652,51 @@ mod tests {
         let e = relative(&wave, &read("audio-wave.f32", &[1, 2, 48480])?)?;
         println!("vocoder + bandwidth extension relative RMS error: {e}");
         assert!(e < 1e-4, "waveform {e}");
+        Ok(())
+    }
+
+    #[test]
+    fn resampling_keeps_length_and_tone() {
+        // 24 kHz to 16 kHz: torchaudio's length rule, and a 1 kHz tone stays one.
+        let x: Vec<f32> = (0..24_000).map(|i| (2. * std::f32::consts::PI * 1000. * i as f32 / 24_000.).sin()).collect();
+        let y = resample(&x, 24_000, 16_000);
+        assert_eq!(y.len(), 16_000);
+        for i in 1_000..15_000 {
+            let want = (2. * std::f32::consts::PI * 1000. * i as f32 / 16_000.).sin();
+            assert!((y[i] - want).abs() < 0.02, "sample {i}: {} vs {want}", y[i]);
+        }
+        assert_eq!(resample(&x[..441], 44_100, 16_000).len(), 160);
+    }
+
+    #[test]
+    #[ignore = "requires the audio VAE and tools/ltx/audio_reference.py --part encode output; NROB_LTX_GOLDEN, NROB_LTX_AUDIO_VAE"]
+    fn audio_encoder_matches_reference() -> Result<()> {
+        let root = std::path::PathBuf::from(std::env::var("NROB_LTX_GOLDEN").map_err(candle_core::Error::wrap)?);
+        let weights = std::env::var("NROB_LTX_AUDIO_VAE").map_err(candle_core::Error::wrap)?;
+        let dev = Device::new_cuda(std::env::var("NROB_LTX_TEST_DEVICE").ok().and_then(|v| v.parse().ok()).unwrap_or(0))?;
+        let read = |name: &str, shape: &[usize]| -> Result<Tensor> {
+            Tensor::from_raw_buffer(&std::fs::read(root.join(name))?, DType::F32, shape, &dev)
+        };
+        let encoder = AudioEncoder::load(Path::new(&weights), &dev)?;
+        let wave = read("audio-encode-wave.f32", &[1, 2, 55_200])?.to_vec3::<f32>()?;
+        let resampled: Vec<Vec<f32>> = wave[0].iter().map(|c| resample(c, 24_000, 16_000)).collect();
+        let r = Tensor::new(resampled, &dev)?.unsqueeze(0)?;
+        let e = relative(&r, &read("audio-encode-resampled.f32", &[1, 2, 36_800])?)?;
+        println!("resampler relative RMS error: {e}");
+        assert!(e < 1e-5, "resampler {e}");
+        let mel = encoder.mel(&r)?;
+        let expected = read("audio-encode-mel.f32", &[1, 2, 231, 64])?;
+        let e = relative(&mel, &expected)?;
+        println!("log-mel relative RMS error: {e}");
+        // The reference's own run-to-run spread on this signal (half its bins sit
+        // at the log floor): torch on the CPU differs by 5e-5 in F32, 4e-5 in F64.
+        assert!(e < 2e-4, "mel {e}");
+        // From the reference mel, so the encoder is measured on its own.
+        let latent = encoder.encode(&expected)?;
+        let want = read("audio-encode-latent.f32", &[1, 8, 58, 16])?.permute((0, 2, 1, 3))?.contiguous()?.reshape((1, 58, 128))?;
+        let e = relative(&latent, &want)?;
+        println!("audio VAE encoder relative RMS error: {e}");
+        assert!(e < 1e-5, "encoder {e}");
         Ok(())
     }
 }

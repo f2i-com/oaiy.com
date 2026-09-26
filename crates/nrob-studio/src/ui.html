@@ -303,6 +303,7 @@ pre.example { background: var(--well); border: 1px solid var(--line); border-rad
 .sp-voice .acts { display: flex; gap: 4px; margin-left: auto; }
 #sp-form .scroll > * { min-width: 0; }
 #mu-form .scroll > * { min-width: 0; }
+#vid-speak-row, #vid-file-row { display: grid; gap: 14px; }
 .controls textarea.lyrics { min-height: 150px; font: 13px/1.5 var(--mono, ui-monospace, monospace); }
 .sp-item details { font-size: 12px; color: var(--muted); }
 .sp-item details pre { white-space: pre-wrap; margin: 6px 0 0; font: 12px/1.5 var(--mono, ui-monospace, monospace); color: var(--text); }
@@ -592,12 +593,36 @@ dialog::backdrop { background: var(--backdrop); }
               <div class="grid-f" style="grid-template-columns:1fr 1fr">
                 <label class="f"><span>Length (seconds)</span><input type="number" id="vid-secs" min="0.5" max="5" step="0.5" value="2"></label>
                 <label class="f"><span>Seed</span><input type="number" id="vid-seed" min="0" placeholder="random"></label>
-                <label class="check" id="vid-sound-row" title="Models with an audio VAE generate a soundtrack with the picture"><input type="checkbox" id="vid-sound" checked> Sound</label>
               </div>
+              <div class="f" id="vid-sound-row"><span class="small muted">Soundtrack</span>
+                <select id="vid-soundtrack" aria-label="Soundtrack">
+                  <option value="made">Made with the picture</option>
+                  <option value="speak">Someone says this…</option>
+                  <option value="file">Follow an audio file…</option>
+                  <option value="none">None</option>
+                </select>
+              </div>
+              <div class="f" id="vid-speak-row" hidden>
+                <label class="f"><span>What they say</span><textarea id="vid-say" rows="3" placeholder="Hello there. Welcome back to the workshop."></textarea></label>
+                <label class="f"><span>Voice</span><select id="vid-voice"></select></label>
+                <label class="f" id="vid-voice-desc-row"><span>Describe the voice</span><textarea id="vid-voice-desc" rows="2" placeholder="A warm, calm middle-aged man, unhurried."></textarea></label>
+              </div>
+              <div class="f" id="vid-file-row" hidden>
+                <input type="file" id="vid-audio" accept="audio/*,video/mp4,video/webm" hidden>
+                <div class="dropzone" id="vaud-drop" tabindex="0" role="button" aria-label="Drop an audio file here, or click to choose">
+                  <span id="vaud-drop-label">Drop an audio file here, or click to choose</span>
+                </div>
+              </div>
+              <span class="muted small" id="vid-follow-hint" hidden>Mouths and motion follow the soundtrack, which the clip keeps. Leave the length empty to match it (up to 5 seconds).</span>
               <input type="file" id="vid-image" accept="image/png,image/jpeg,image/webp" hidden>
               <div class="dropzone" id="vid-drop" tabindex="0" role="button" aria-label="Drop a start frame here, or click to choose (optional)">
                 <span id="vid-drop-label">Drop a start frame here, or click to choose (optional)</span>
                 <div class="thumbs" id="vid-ref-preview"></div>
+              </div>
+              <input type="file" id="vid-end-image" accept="image/png,image/jpeg,image/webp" hidden>
+              <div class="dropzone" id="vend-drop" tabindex="0" role="button" aria-label="Drop an end frame here, or click to choose (optional)">
+                <span id="vend-drop-label">Drop an end frame here, or click to choose (optional)</span>
+                <div class="thumbs" id="vend-ref-preview"></div>
               </div>
               <div class="f"><span class="small muted">Where the weights live for this job</span><div class="seg" id="vid-tier"></div></div>
             </div>
@@ -1500,13 +1525,37 @@ function dropzone(k, input, max) {
 }
 const clearImgRefs = dropzone("img", $("#img-refs"), 3);
 const clearVidRef = dropzone("vid", $("#vid-image"), 1);
+const clearVidEnd = dropzone("vend", $("#vid-end-image"), 1);
+// The soundtrack file: any audio, named once chosen or dropped.
+(() => {
+  const zone = $("#vaud-drop"), input = $("#vid-audio"), label = $("#vaud-drop-label"), initial = label.textContent;
+  const show = () => { label.textContent = input.files[0] ? `${input.files[0].name} (click to change)` : initial; };
+  zone.onclick = () => input.click();
+  zone.onkeydown = e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); input.click(); } };
+  input.onchange = show;
+  zone.ondragover = e => { e.preventDefault(); zone.classList.add("over"); };
+  zone.ondragleave = () => zone.classList.remove("over");
+  zone.ondrop = e => { e.preventDefault(); zone.classList.remove("over"); const f = [...e.dataTransfer.files].find(f => f.type.startsWith("audio/") || f.type.startsWith("video/")); if (f) { const dt = new DataTransfer(); dt.items.add(f); input.files = dt.files; show(); } };
+})();
+function renderSoundtrack() {
+  const mode = soundCapable() ? $("#vid-soundtrack").value : "none", follows = mode === "speak" || mode === "file";
+  $("#vid-speak-row").hidden = mode !== "speak";
+  $("#vid-file-row").hidden = mode !== "file";
+  $("#vid-follow-hint").hidden = !follows;
+  $("#vid-voice-desc-row").hidden = $("#vid-voice").value !== "__describe";
+  const secs = $("#vid-secs");
+  if (follows && secs.dataset.follow !== "1") { secs.dataset.kept = secs.value; secs.value = ""; secs.placeholder = "match the soundtrack"; secs.dataset.follow = "1"; }
+  if (!follows && secs.dataset.follow === "1") { secs.value = secs.dataset.kept || "2"; secs.placeholder = ""; secs.dataset.follow = ""; }
+}
+$("#vid-soundtrack").onchange = renderSoundtrack;
+$("#vid-voice").onchange = renderSoundtrack;
 // Sound is offered for models that have their audio VAE.
 function soundCapable() {
   const name = $("#vid-model").value || cfg?.media?.video?.default_model;
   const m = cfg?.media?.video?.models?.[name];
   return !!(m && m.audio_vae);
 }
-function renderSound() { $("#vid-sound-row").hidden = !soundCapable(); }
+function renderSound() { $("#vid-sound-row").hidden = !soundCapable(); renderSoundtrack(); }
 $("#vid-model").addEventListener("change", renderSound);
 ["img", "vid"].forEach(k => $(`#${k}-prompt`).addEventListener("keydown", e => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); $(`#${k}-form`).requestSubmit(); } }));
 
@@ -1573,10 +1622,29 @@ $("#img-form").onsubmit = async e => {
 };
 $("#vid-form").onsubmit = async e => {
   e.preventDefault();
-  const body = {prompt: $("#vid-prompt").value, model: $("#vid-model").value || undefined, size: $("#vid-size").value, seconds: $("#vid-secs").value, memory: vidTier};
+  const body = {prompt: $("#vid-prompt").value, model: $("#vid-model").value || undefined, size: $("#vid-size").value, memory: vidTier};
+  if ($("#vid-secs").value) body.seconds = $("#vid-secs").value;
   if ($("#vid-seed").value) body.seed = +$("#vid-seed").value;
-  if (soundCapable() && !$("#vid-sound").checked) body.audio = false;
+  const mode = soundCapable() ? $("#vid-soundtrack").value : "none";
+  if (mode === "none" && soundCapable()) body.audio = false;
+  if (mode === "speak") {
+    const text = $("#vid-say").value.trim();
+    if (!text) return toast("Write what they say, or pick another soundtrack", true);
+    const voice = $("#vid-voice").value;
+    body.speech = {text};
+    if (voice === "__describe") {
+      if (!$("#vid-voice-desc").value.trim()) return toast("Describe the voice, or pick one", true);
+      body.speech.instructions = $("#vid-voice-desc").value.trim();
+    } else body.speech.voice = voice;
+  }
+  if (mode === "file") {
+    const a = $("#vid-audio").files[0];
+    if (!a) return toast("Choose an audio file, or pick another soundtrack", true);
+    body.input_audio = await readAsDataUrl(a);
+  }
+  if (!body.seconds && !body.speech && !body.input_audio) body.seconds = "2";
   const f = $("#vid-image").files[0]; if (f) body.input_reference = {image_url: await readAsDataUrl(f)};
+  const fe = $("#vid-end-image").files[0]; if (fe) body.end_image = {image_url: await readAsDataUrl(fe)};
   $("#vid-go").disabled = true; progress("vid", "Starting", 1);
   try {
     let v = await api("/api/play/videos", {method: "POST", body});
@@ -1606,6 +1674,10 @@ function renderVoicePicker() {
     + (savedVoices.length ? `<optgroup label="Saved voices">${savedVoices.map(v => `<option value="${esc(v.name)}">${esc(v.name)}</option>`).join("")}</optgroup>` : "")
     + `<optgroup label="Built-in (OpenAI names)">${STOCK_VOICES.map(v => `<option value="${v}">${v}</option>`).join("")}</optgroup>`;
   $("#sp-voice").value = [...$("#sp-voice").options].some(o => o.value === keepVal) ? keepVal : "__describe";
+  const keepVid = $("#vid-voice").value;
+  $("#vid-voice").innerHTML = $("#sp-voice").innerHTML;
+  $("#vid-voice").value = [...$("#vid-voice").options].some(o => o.value === keepVid) ? keepVid : (savedVoices[0]?.name || "__describe");
+  renderSoundtrack();
   $("#sp-desc-row").hidden = $("#sp-voice").value !== "__describe";
   $("#sp-voices").innerHTML = savedVoices.length ? savedVoices.map(v => `<div class="sp-voice"><strong>${esc(v.name)}</strong><span class="d" title="${esc(v.description)}">${esc(v.description)}</span>
       <span class="acts"><button class="btn quiet" type="button" data-sample="${esc(v.name)}">Play</button><button class="btn quiet" type="button" data-use="${esc(v.name)}">Use</button><button class="btn quiet warn" type="button" data-delvoice="${esc(v.name)}">Delete</button></span></div>`).join("")

@@ -249,6 +249,42 @@ Limits: the official LTX 2.5 pipeline samples its first stage ancestrally and
 refines at a second stage. This worker is single-stage Euler (as for video),
 which may cost some audio fidelity.
 
+### Following a soundtrack
+
+A clip can also follow a soundtrack it is given, instead of making its own: a
+voice, a song, any audio. Mouths, movement and timing follow the sound, and the
+clip keeps the original audio. This is the official `a2vid` pipeline's
+conditioning:
+
+1. The audio is read with FFmpeg, as stereo at its own rate (mono is doubled).
+   It is resampled to 16 kHz with torchaudio's windowed-sinc filter.
+2. It becomes a log-mel spectrogram: 64 slaney bins, hop 160.
+3. The audio VAE's encoder turns that into the transformer's audio latent, at
+   25 frames a second, cropped to the clip.
+4. That latent stays fixed through all eight steps. The audio stream's sigma is
+   0 for its own timestep embeddings, its prompt modulation and its
+   cross-attention scale and shift. The same 0 is used for the gate through
+   which the video attends to the audio. The gate through which the audio
+   attends to the video follows the video's sigma. The picture is denoised as
+   usual, with start and end images if given.
+5. The muxed audio is the input itself, cut to the clip, not a VAE round trip.
+
+The audio VAE files of all three models include the encoder. Request fields:
+
+| Field | Meaning |
+|---|---|
+| `audio_file` | An absolute path to any audio FFmpeg reads, up to 256 MiB (at most 60 s is read). |
+| `speech` | A complete `kind: "speech"` worker request (see [Speech](SPEECH.md)). The worker speaks it first, frees the TTS model, and follows the result: a saved voice, an OpenAI voice name or a described one. |
+| `frames` | Optional with a soundtrack. Without it, the clip is as long as the soundtrack: whole frames at `fps`, snapped down to 8k+1, from 9 to 121. |
+
+A soundtrack needs `audio_vae` and keeps `audio` on. The result reports
+`followed_soundtrack`, `audio_file` and `speech_seconds`.
+
+On an RTX 5090, 5-second 768×512 talking-head clips took 166 s (LTX 2.3),
+147 s (LTX 2.5) and 119 s (Sulphur), speech included. A 3-second Sulphur clip
+following an MP3 took 66 s. The 121-frame limit caps a clip at about
+5 seconds; a longer soundtrack is cut to the clip.
+
 ## Verification
 
 `cargo test --workspace` covers request constraints, trusted path selection,
@@ -271,6 +307,10 @@ the official checkout (strict F32, TF32 off). The opt-in tests are
 | First audio-video block (video / audio) | 0.11% / 0.05% |
 | Two-block velocities (video / audio) | 0.41% / 0.26% |
 | Audio text connector | 0.45% |
+| Resampler, 24 to 16 kHz | 1e-7 |
+| Log-mel spectrogram | 6e-5 (the reference's own F32 spread on this signal is 5e-5) |
+| Audio VAE encoder | 8e-7 |
+| Two-block pass with frozen audio (video velocity / audio output), LTX 2.3 | 0.38% / 0.32% |
 
 The last three run the official BF16 transformer as the reference, cut to its
 first two blocks. The same tests against the LTX 2.3 checkpoint:

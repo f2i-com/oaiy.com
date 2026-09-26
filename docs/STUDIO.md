@@ -55,8 +55,10 @@ The console accepts `status`, `start`, `stop`, `open`, `jobs` and `quit`.
     described in words, and **Save this voice…** keeps a described voice
     (see [Speech](SPEECH.md)). Music composes a song from lyrics and a
     description, or an instrumental (see [Music](MUSIC.md)).
-    Video comes with sound when the model has its audio VAE (a
-    **Sound** switch turns it off). Image and Video put the controls beside a
+    Video comes with sound when the model has its audio VAE. Its
+    **Soundtrack** choice can turn the sound off. It can also make the clip
+    follow speech in a saved or described voice, or an audio file. Start and
+    end frames drop in beside it. Image and Video put the controls beside a
     stage showing the latest result,
     with a filmstrip of this session's results under it. The controls include
     shape presets, a drop zone for reference images or a start frame, and where
@@ -255,7 +257,7 @@ text-to-image only. Local paths are accepted only from the UI.
 
 | request | reply |
 |---|---|
-| `POST /v1/videos` `{prompt, model?, seconds?, size?, input_reference?}` | a video object, `status: queued` |
+| `POST /v1/videos` `{prompt, model?, seconds?, size?, input_reference?, end_image?, input_audio?, speech?}` | a video object, `status: queued` |
 | `GET /v1/videos/{id}` | the video object: `status` (`queued`, `in_progress`, `completed`, `failed`), `progress` 0–100 |
 | `GET /v1/videos` | `{object: "list", data, first_id, last_id, has_more}` |
 | `GET /v1/videos/{id}/content[?variant=thumbnail]` | the MP4, or its first-frame PNG |
@@ -264,9 +266,26 @@ text-to-image only. Local paths are accepted only from the UI.
 `seconds` becomes frames at `media.video.fps`, rounded to LTX's `8k+1` and capped
 at 121. OpenAI sizes (`1280x720`, `720x1280`, `1792x1024`) scale down to fit LTX's
 1024 limit and keep their aspect ratio (`1280x720` → `1024x576`).
-`input_reference: {image_url: "data:image/png;base64,…"}` sets the starting frame.
+`input_reference: {image_url: "data:image/png;base64,…"}` sets the starting
+frame, and `end_image` (the same shape) the last. Either can be used alone.
+
+The clip can also follow a soundtrack, and it keeps that soundtrack. See
+[following a soundtrack](LTX_VIDEO.md#following-a-soundtrack).
+
+- **`input_audio`** takes any of:
+  - `{data: base64, format: "wav"}` (the OpenAI audio-input shape);
+  - `{url: "data:…"}`;
+  - a `data:` URL string.
+- **`speech`** speaks text first, in the same job. It takes
+  `{text (or input), voice?, instructions?, language?, seed?, model?}`, the
+  same fields as `/v1/audio/speech`. A saved voice keeps a character's voice
+  from clip to clip.
+
+Without `seconds` or `frames`, such a clip is as long as its soundtrack, up to
+121 frames.
+
 Local paths are accepted from the UI only, and `file_id` is not supported.
-Extensions: `frames`, `fps`, `seed`, `end_image`, `memory`, `ram_gb`, `vram_gb`.
+Extensions: `frames`, `fps`, `seed`, `memory`, `ram_gb`, `vram_gb`.
 
 ## Companion apps: discovery
 

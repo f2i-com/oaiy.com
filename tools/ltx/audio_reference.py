@@ -3,6 +3,8 @@
 Parts:
   decode       audio VAE decoder, vocoder and bandwidth extension on a fixed latent
                (float32, as the worker runs them).
+  encode       audio VAE encoder on a fixed 24 kHz stereo waveform: the resampler,
+               the log-mel spectrogram and the latent (float32).
   transformer  one audio-video block and the complete AV transformer on a tiny
                clip, plus the audio text connector (needs --checkpoint).
 
@@ -17,8 +19,8 @@ import torch
 from safetensors import safe_open
 
 parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-parser.add_argument('--part', choices=['decode', 'transformer'], required=True)
-parser.add_argument('--audio-vae', help='Audio VAE + vocoder safetensors (decode)')
+parser.add_argument('--part', choices=['decode', 'encode', 'transformer'], required=True)
+parser.add_argument('--audio-vae', help='Audio VAE + vocoder safetensors (decode, encode)')
 parser.add_argument('--checkpoint', help='LTX 2.5 transformer safetensors (transformer)')
 parser.add_argument('--source', required=True, help='Official LTX-2 repository checkout')
 parser.add_argument('--reference-deps', help='Optional isolated Python dependency directory')
@@ -81,6 +83,40 @@ def decode():
     dump('audio-wave.f32', wave)
 
 
+def encode():
+    from ltx_core.model.audio_vae.model_configurator import AudioEncoderConfigurator
+    from ltx_core.model.audio_vae.ops import AudioProcessor
+    from ltx_core.types import Audio
+    f = safe_open(args.audio_vae, framework='pt', device=args.device)
+    metadata = f.metadata()
+    metadata['config'] = json.loads(metadata['config'])
+    encoder = AudioEncoderConfigurator.from_metadata(metadata)
+    state = {}
+    for k in f.keys():
+        if k.startswith('audio_vae.encoder.'):
+            state[k.removeprefix('audio_vae.encoder.')] = f.get_tensor(k).float()
+        elif k.startswith('audio_vae.per_channel_statistics.'):
+            state['per_channel_statistics.' + k.removeprefix('audio_vae.per_channel_statistics.')] = f.get_tensor(k).float()
+    print('encoder', encoder.load_state_dict(state, strict=True), flush=True)
+    encoder = encoder.to(args.device).eval()
+    # 2.3 s of a chirp with a tremolo (left) and a detuned copy (right) at 24 kHz.
+    n = 55_200
+    t = torch.arange(n, device=args.device, dtype=torch.float64) / 24_000
+    left = torch.sin(2 * torch.pi * (220 * t + 400 * t * t)) * (0.6 + 0.3 * torch.sin(2 * torch.pi * 3 * t))
+    right = 0.5 * torch.sin(2 * torch.pi * (330 * t + 250 * t * t))
+    wave = torch.stack([left, right]).float().unsqueeze(0)
+    processor = AudioProcessor(target_sample_rate=encoder.sample_rate, mel_bins=encoder.mel_bins,
+                               mel_hop_length=encoder.mel_hop_length, n_fft=encoder.n_fft).to(args.device)
+    with torch.inference_mode():
+        resampled = processor.resample_audio(Audio(waveform=wave, sampling_rate=24_000)).waveform
+        mel = processor.waveform_to_mel(Audio(waveform=wave, sampling_rate=24_000))
+        latent = encoder(mel)
+    dump('audio-encode-wave.f32', wave)
+    dump('audio-encode-resampled.f32', resampled)
+    dump('audio-encode-mel.f32', mel)
+    dump('audio-encode-latent.f32', latent)
+
+
 def transformer():
     from ltx_core.model.transformer.model_configurator import LTXModelConfigurator
     from ltx_core.model.transformer.modality import Modality
@@ -125,9 +161,17 @@ def transformer():
         dump('av-block0-video.f32', outputs[0].x)
         dump('av-block0-audio.f32', outputs[1].x)
 
-    model.transformer_blocks[0].register_forward_hook(after_block0)
+    hook = model.transformer_blocks[0].register_forward_hook(after_block0)
     with torch.inference_mode():
         vout, aout = model(video, audio, None)
+        hook.remove()
+        # Frozen conditioning audio (the official a2vid pipeline): its sigma and
+        # every per-token timestep are 0 while the video is denoised.
+        frozen = Modality(latent=ax, sigma=torch.zeros_like(sigma), timesteps=torch.zeros((1, ta), device=d),
+                          positions=apos, context=actx)
+        fvout, faout = model(video, frozen, None)
+    dump('av-frozen-video-output.f32', fvout)
+    dump('av-frozen-audio-output.f32', faout)
     for name, value in [('av-video-input.f32', x), ('av-video-context.f32', context), ('av-audio-input.f32', ax),
                         ('av-audio-context.f32', actx), ('av-video-output.f32', vout), ('av-audio-output.f32', aout)]:
         dump(name, value)
@@ -150,5 +194,7 @@ def transformer():
 
 if args.part == 'decode':
     decode()
+elif args.part == 'encode':
+    encode()
 else:
     transformer()

@@ -444,6 +444,9 @@ pub struct AudioInput<'a> {
     pub context: &'a Tensor,
     pub rope: &'a Rope,
     pub video_cross: &'a Rope,
+    /// The audio stream's own sigma: the video's while both are denoised, 0
+    /// when the audio is a fixed condition (a soundtrack the picture follows).
+    pub sigma: f64,
 }
 
 pub struct Transformer {
@@ -641,14 +644,20 @@ mod tests {
         let rope = Rope::video_with_end(1, 4, 4, 24, false, &dev)?;
         let video_cross = Rope::video_cross(1, 4, 4, 24, false, &dev)?;
         let audio_rope = Rope::audio(6, &dev)?;
-        let audio = AudioInput { latent: &ax, context: &actx, rope: &audio_rope, video_cross: &video_cross };
+        let audio = AudioInput { latent: &ax, context: &actx, rope: &audio_rope, video_cross: &video_cross, sigma: 0.725 };
         let (video, audio) = model.forward(&x, &context, 0.725, &rope, 4, 0, Some(audio), |_| {})?;
+        let (first_video, first_audio) = (model.first_hidden.clone().unwrap(), model.first_audio_hidden.clone().unwrap());
+        // The same pass with the audio frozen as a condition (sigma 0 throughout).
+        let frozen = AudioInput { latent: &ax, context: &actx, rope: &audio_rope, video_cross: &video_cross, sigma: 0. };
+        let (frozen_video, frozen_audio) = model.forward(&x, &context, 0.725, &rope, 4, 0, Some(frozen), |_| {})?;
         let checks = [
-            ("first block, video", model.first_hidden.clone().unwrap(), read("av-block0-video.f32", &[1, 16, 4096])?, 0.01),
-            ("first block, audio", model.first_audio_hidden.clone().unwrap(), read("av-block0-audio.f32", &[1, 6, 2048])?, 0.01),
+            ("first block, video", first_video, read("av-block0-video.f32", &[1, 16, 4096])?, 0.01),
+            ("first block, audio", first_audio, read("av-block0-audio.f32", &[1, 6, 2048])?, 0.01),
             // Clean conditioning tokens' velocities are discarded by the sampler.
             ("video velocity", video.narrow(1, 4, 12)?, read("av-video-output.f32", &[1, 16, 128])?.narrow(1, 4, 12)?, 0.03),
             ("audio velocity", audio.unwrap(), read("av-audio-output.f32", &[1, 6, 128])?, 0.03),
+            ("video velocity, frozen audio", frozen_video.narrow(1, 4, 12)?, read("av-frozen-video-output.f32", &[1, 16, 128])?.narrow(1, 4, 12)?, 0.03),
+            ("audio output, frozen audio", frozen_audio.unwrap(), read("av-frozen-audio-output.f32", &[1, 6, 128])?, 0.03),
         ];
         let mut failed = Vec::new();
         for (name, actual, expected, limit) in checks {
@@ -831,9 +840,9 @@ impl Transformer {
             modulation = expand(&clean_modulation, &modulation)?;
             embedded = expand(&clean_embedded, &embedded)?;
         }
-        // Audio: every timestep is the scalar sigma. The video tokens' cross-
-        // attention scale/shift follows their own (per-token) timesteps; each
-        // gate follows the other stream's sigma.
+        // Audio: every timestep is the audio's scalar sigma. The video tokens'
+        // cross-attention scale/shift follows their own (per-token) timesteps;
+        // each gate follows the other stream's sigma.
         let mut audio_state = None;
         if let Some(a) = &audio {
             let (mut video_ss, _) = time_embedding(&self.global, "av_ca_video_scale_shift_adaln_single", sigma, dev)?;
@@ -849,9 +858,9 @@ impl Transformer {
                 }
                 video_ss = Tensor::cat(&parts, 1)?;
             }
-            let (audio_modulation, audio_embedded) = time_embedding(&self.global, "audio_adaln_single", sigma, dev)?;
+            let (audio_modulation, audio_embedded) = time_embedding(&self.global, "audio_adaln_single", a.sigma, dev)?;
             let prompt = if self.global.tensors.contains_key("audio_prompt_adaln_single.linear.weight") {
-                Some(time_embedding(&self.global, "audio_prompt_adaln_single", sigma, dev)?.0.reshape((1, 2, 2048))?)
+                Some(time_embedding(&self.global, "audio_prompt_adaln_single", a.sigma, dev)?.0.reshape((1, 2, 2048))?)
             } else {
                 None
             };
@@ -860,8 +869,8 @@ impl Transformer {
                 modulation: audio_modulation.reshape((1, 1, 9, 2048))?,
                 prompt,
                 video_ss: video_ss.reshape((1, video_ss.dim(1)?, 4, 4096))?,
-                audio_ss: time_embedding(&self.global, "av_ca_audio_scale_shift_adaln_single", sigma, dev)?.0.reshape((1, 1, 4, 2048))?,
-                video_gate: time_embedding(&self.global, "av_ca_a2v_gate_adaln_single", sigma, dev)?.0,
+                audio_ss: time_embedding(&self.global, "av_ca_audio_scale_shift_adaln_single", a.sigma, dev)?.0.reshape((1, 1, 4, 2048))?,
+                video_gate: time_embedding(&self.global, "av_ca_a2v_gate_adaln_single", a.sigma, dev)?.0,
                 audio_gate: time_embedding(&self.global, "av_ca_v2a_gate_adaln_single", sigma, dev)?.0,
                 rope: a.rope,
                 video_cross: a.video_cross,

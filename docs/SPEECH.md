@@ -82,6 +82,15 @@ leaves nothing behind.
 Companion apps find both endpoints, the speech models and the saved voices in
 `GET /v1/discovery`.
 
+### In a video
+
+`POST /v1/videos` takes `speech` with the same fields: `text`, `voice`,
+`instructions` and so on. It speaks them first and then makes a clip that
+follows the speech, with mouths moving to it. A saved voice keeps a character
+sounding the same from clip to clip. In the Playground's Video tab, pick
+**Someone says this…** as the soundtrack. See
+[following a soundtrack](LTX_VIDEO.md#following-a-soundtrack).
+
 ## Speed and memory
 
 On an RTX 5090:

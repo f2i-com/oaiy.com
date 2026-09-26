@@ -19,7 +19,7 @@ fn sub(method: &str, path: String, what: &str) -> Json {
 fn operations(target: &str, spec: &str, path: &str) -> Vec<Json> {
     match (target, spec) {
         ("videos", "openai") => vec![
-            sub("POST", path.into(), "create a video job (JSON: prompt, model, seconds, size, input_reference)"),
+            sub("POST", path.into(), "create a video job (JSON: prompt, model, seconds, size, input_reference (start frame), end_image, input_audio or speech {text, voice} for a soundtrack the clip follows)"),
             sub("GET", path.into(), "list video jobs"),
             sub("GET", format!("{path}/{{id}}"), "poll a job: status queued | in_progress | completed | failed, progress 0-100"),
             sub("GET", format!("{path}/{{id}}/content"), "download the MP4; ?variant=thumbnail for its first frame (PNG)"),
