@@ -174,3 +174,54 @@ describe('the plan and the goal', () => {
     expect(agent.plan).toBeNull();
   });
 });
+
+describe('the record of failing apps', () => {
+  function appSetup() {
+    const s = setup(OPENAI);
+    for (const root of ['a', 'b']) {
+      s.vfs.writeFile(`/${root}/manifest.json`, JSON.stringify({ name: root, version: '1.0.0', main: 'ui/main.ui', files: { ui: ['ui/main.ui'] } }), { parents: true });
+      s.vfs.writeFile(`/${root}/ui/main.ui`, '<App><Text>hi</Text></App>\n', { parents: true });
+    }
+    return s;
+  }
+  const breakA = { name: 'edit_file', input: { path: 'a/manifest.json', old_string: '["ui/main.ui"]', new_string: '["ui/main.ui","ui/x.ui"]' } };
+
+  it('a fix checked with softn_check clears the failure: no nudge about errors already gone', async () => {
+    fakeProvider('openai', [
+      { calls: [{ name: 'read_file', input: { path: 'a/manifest.json' } }] },
+      { calls: [breakA] },
+      (body) => {
+        expect(JSON.stringify((body.messages as unknown[]).at(-1))).toContain('lists ui/x.ui, which does not exist');
+        return { calls: [{ name: 'write_file', input: { path: 'a/ui/x.ui', content: '<App />\n' } }, { name: 'softn_check', input: { app: 'a' } }] };
+      },
+      { text: 'Fixed and checked.' },
+    ]);
+    const { agent, events, emit } = appSetup();
+    await agent.run('add a page', emit);
+    expect(events.filter((e) => e.type === 'check').map((e) => (e as { state: string }).state)).toEqual(['running', 'failed']);
+    expect(events.filter((e) => e.type === 'nudge')).toHaveLength(0);
+    expect(agent.failingApps.size).toBe(0);
+    expect(events.at(-1)).toMatchObject({ type: 'done', text: 'Fixed and checked.' });
+  });
+
+  it('a failure left in one app does not nudge a later run that works on another', async () => {
+    fakeProvider('openai', [
+      { calls: [{ name: 'read_file', input: { path: 'a/manifest.json' } }] },
+      { calls: [breakA] },
+      { text: 'left it' },
+      { text: 'still left' },
+      { text: 'giving up' },
+      { calls: [{ name: 'read_file', input: { path: 'b/ui/main.ui' } }] },
+      { calls: [{ name: 'edit_file', input: { path: 'b/ui/main.ui', old_string: 'hi', new_string: 'hello' } }] },
+      { text: 'Changed b.' },
+    ]);
+    const { agent, events, emit } = appSetup();
+    await agent.run('break a', emit);
+    expect(events.filter((e) => e.type === 'nudge')).toHaveLength(2);
+    expect(agent.failingApps.has('a')).toBe(true);
+    events.length = 0;
+    await agent.run('change b', emit);
+    expect(events.filter((e) => e.type === 'nudge')).toHaveLength(0);
+    expect(events.at(-1)).toMatchObject({ type: 'done', text: 'Changed b.' });
+  });
+});

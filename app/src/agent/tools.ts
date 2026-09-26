@@ -322,6 +322,8 @@ function requireFreshRead(ctx: ToolContext, key: string, what: string): void {
 let imagesOut: ImagePart[] = [];
 /** Files present_file shows the person, collected the same way. */
 let filesOut: string[] = [];
+/** softn_check's outcome, collected the same way. */
+let checkOut: ToolResult['check'] | null = null;
 
 async function execute(call: ToolCall, ctx: ToolContext): Promise<string> {
   const input = call.input;
@@ -606,7 +608,9 @@ async function execute(call: ToolCall, ctx: ToolContext): Promise<string> {
         const findings = checkProject(vfs, normalizePath(root));
         return `Not a SoftN app yet: ${target.reason}\nFiles in ${root}: ${formatFindings(findings)}`;
       }
-      return (await checkApp(ctx, target.root)).text;
+      const checked = await checkApp(ctx, target.root);
+      checkOut = { root: target.root, ok: checked.ok, text: checked.text };
+      return checked.text;
     }
     case 'softn_inspect': case 'softn_interact': {
       const target = resolveApp(vfs, input.app);
@@ -703,6 +707,7 @@ export async function runTool(call: ToolCall, ctx: ToolContext): Promise<ToolRes
   if (call.parseError) return { id: call.id, name: call.name, content: `Error: the tool call's arguments could not be read: ${call.parseError}`, isError: true };
   imagesOut = [];
   filesOut = [];
+  checkOut = null;
   try {
     const content = await execute(call, ctx);
     let isError = false;
@@ -710,6 +715,8 @@ export async function runTool(call: ToolCall, ctx: ToolContext): Promise<ToolRes
     const result: ToolResult = { id: call.id, name: call.name, content, isError };
     if (imagesOut.length) result.images = imagesOut;
     if (filesOut.length) result.files = filesOut;
+    if (checkOut) result.check = checkOut;
+    checkOut = null;
     imagesOut = [];
     filesOut = [];
     return result;

@@ -186,6 +186,7 @@ try {
     await page.keyboard.press('Enter');
     await page.waitForFunction(() => document.querySelector('.chat-log')?.textContent.includes('Renamed the heading'), { timeout: 60_000 });
     expect(JSON.stringify(requests[1]).includes('Common mistakes'), 'the guide section did not reach the model');
+    if (process.env.DUMP) console.log(requests[4].messages.at(-1).content, '\n----\n', requests[3].messages.at(-1).content);
     expect(JSON.stringify(requests[4]).includes('rendered without reported errors'), `softn_check said: ${JSON.stringify(requests[4]).slice(-400)}`);
     await waitStatus(page, /live/, 'after the agent');
     expect((await frameText(page)).includes('Shopping list'), await frameText(page));

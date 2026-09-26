@@ -136,15 +136,16 @@ export class Agent {
 
   /** The checklist from the latest update_plan. */
   plan: Plan | null = null;
-  private checkedThisRun = false;
+  /** Apps checked during this run, by the automatic check or softn_check. */
+  private checkedRoots = new Set<string>();
 
   /**
    * Why the run is not done yet, if the model stopped early: plan items it
    * set this run and did not finish, or an app whose check still fails.
    */
   private unfinished(planThisRun: boolean): string | null {
-    // Only this run's checks count: an old failure should not hold up a question.
-    const failing = this.checkedThisRun ? [...this.failingApps.entries()][0] : undefined;
+    // Only apps checked in this run count: an old failure should not hold up something else.
+    const failing = [...this.failingApps.entries()].find(([root]) => this.checkedRoots.has(root));
     if (failing) return `The last automatic check of ${appLabel(failing[0])} still reports errors:\n${failing[1]}\nFix them and check the app again before you finish. If you cannot, say what is wrong.`;
     const open = planThisRun && this.plan ? this.plan.items.filter((i) => i.status !== 'done') : [];
     if (open.length) return `Your plan still has ${open.length} open step${open.length > 1 ? 's' : ''}: ${open.map((i) => `"${i.text}"`).join(', ')}. Carry on with ${open.length > 1 ? 'them' : 'it'}. If a step is no longer needed, or already done, call update_plan to say so. Then finish with a short summary.`;
@@ -180,7 +181,7 @@ export class Agent {
     for (const [root, changed] of lastChange) {
       if ((lastCheck.get(root) ?? -1) > changed) continue;
       const id = `check-${Date.now()}-${root}`;
-      this.checkedThisRun = true;
+      this.checkedRoots.add(root);
       emit({ type: 'check', id, root, state: 'running' });
       const check = await checkApp(this.toolContext, root);
       emit({ type: 'check', id, root, state: check.ok ? 'ok' : 'failed', text: check.text });
@@ -261,7 +262,7 @@ export class Agent {
     });
     this.sameCheck = { signature: '', count: 0 };
     let planThisRun = false;
-    this.checkedThisRun = false;
+    this.checkedRoots.clear();
     let nudges = 0;
     try {
       for (let step = 1; step <= MAX_STEPS; step++) {
@@ -290,6 +291,12 @@ export class Agent {
           emit({ type: 'tool_call', call });
           const result = await runTool(call, this.toolContext);
           results.push(result);
+          // softn_check keeps the record of failing apps current, as the automatic check does.
+          if (result.check) {
+            this.checkedRoots.add(result.check.root);
+            if (result.check.ok) this.failingApps.delete(result.check.root);
+            else this.failingApps.set(result.check.root, result.check.text);
+          }
           if (call.name === 'update_plan' && !result.isError) {
             this.plan = readPlan(call.input);
             planThisRun = true;

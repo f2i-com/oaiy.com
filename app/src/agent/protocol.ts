@@ -33,6 +33,8 @@ export interface ToolResult {
   images?: ImagePart[];
   /** Project files the tool shows the person in the chat (present_file); not sent to the model. */
   files?: string[];
+  /** The outcome of softn_check, for the agent's record of failing apps; not sent to the model. */
+  check?: { root: string; ok: boolean; text: string };
 }
 
 /** A file attached to a user message, as saved in the project; for the chat only. */
