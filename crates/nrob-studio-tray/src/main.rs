@@ -12,12 +12,17 @@
 mod tray;
 
 fn main() {
+    #[cfg(windows)]
+    tray::dpi_aware();
     let args = match nrob_studio::parse_args_from(std::env::args().skip(1)) {
         Ok(a) => a,
         Err(e) => fail(&e),
     };
     // A second launch shows the running studio rather than failing on its ports.
     if let Some(url) = nrob_studio::running_instance(&args) {
+        #[cfg(windows)]
+        tray::show_ui(&url);
+        #[cfg(not(windows))]
         nrob_studio::open_ui(&url, "app");
         return;
     }
@@ -27,6 +32,13 @@ fn main() {
     };
     let silent = running.open == "none";
     if !silent {
+        #[cfg(windows)]
+        if running.open == "app" {
+            tray::show_ui(&running.ui_url);
+        } else {
+            nrob_studio::open_ui(&running.ui_url, &running.open);
+        }
+        #[cfg(not(windows))]
         nrob_studio::open_ui(&running.ui_url, &running.open);
     }
     #[cfg(windows)]

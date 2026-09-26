@@ -8,6 +8,8 @@ use nrob::json::Json;
 use nrob_studio::Running;
 use std::sync::atomic::{AtomicIsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
+use windows_sys::Win32::UI::HiDpi::{SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Shell::{
@@ -119,7 +121,90 @@ fn tooltip(tray: &Tray) -> String {
 }
 
 fn open_ui(tray: &Tray, mode: &str) {
-    nrob_studio::open_ui(&tray.running.ui_url, mode);
+    if mode == "app" {
+        show_ui(&tray.running.ui_url);
+    } else {
+        nrob_studio::open_ui(&tray.running.ui_url, mode);
+    }
+}
+
+/// Sharp icons and menus on high-DPI screens (Windows 10 1703+; harmless where
+/// unsupported). Must run before any window exists.
+pub fn dpi_aware() {
+    // SAFETY: takes a constant context value, no pointers; failure is ignored.
+    unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+}
+
+/// When the last UI window was launched: a new app window takes a few seconds
+/// to appear (and to take its title), so clicks meanwhile must not open more.
+static LAST_LAUNCH: Mutex<Option<Instant>> = Mutex::new(None);
+
+fn utf16_text(buf: &[u16], len: i32) -> String {
+    String::from_utf16_lossy(&buf[..len.clamp(0, buf.len() as i32) as usize])
+}
+
+/// The studio's app window, if one is open: a top-level Chromium window (Edge
+/// or Chrome `--app`) titled with the page title, or with the UI's address
+/// while the page is still loading. The tray's own hidden window has another
+/// class, and browser tabs carry the browser's name in their title.
+fn find_ui_window(ui_url: &str) -> Option<HWND> {
+    struct Search {
+        address: String,
+        found: HWND,
+    }
+    unsafe extern "system" fn visit(hwnd: HWND, lparam: LPARAM) -> windows_sys::core::BOOL {
+        // SAFETY: `lparam` is the `&mut Search` passed to EnumWindows below, which
+        // outlives the enumeration; the buffers are sized as declared.
+        unsafe {
+            let search = &mut *(lparam as *mut Search);
+            if IsWindowVisible(hwnd) == 0 {
+                return 1;
+            }
+            let mut class = [0u16; 64];
+            let n = GetClassNameW(hwnd, class.as_mut_ptr(), class.len() as i32);
+            if !utf16_text(&class, n).starts_with("Chrome_WidgetWin") {
+                return 1;
+            }
+            let mut title = [0u16; 256];
+            let n = GetWindowTextW(hwnd, title.as_mut_ptr(), title.len() as i32);
+            let title = utf16_text(&title, n);
+            if title == "NROB Studio" || (!search.address.is_empty() && title.starts_with(&search.address)) {
+                search.found = hwnd;
+                return 0;
+            }
+            1
+        }
+    }
+    let mut search = Search {
+        address: ui_url.trim_start_matches("http://").trim_start_matches("https://").to_string(),
+        found: std::ptr::null_mut(),
+    };
+    // SAFETY: the callback only reads window text and class into local buffers
+    // and writes `search`, which lives across this synchronous call.
+    unsafe { EnumWindows(Some(visit), &mut search as *mut Search as LPARAM) };
+    (!search.found.is_null()).then_some(search.found)
+}
+
+/// Bring the UI window forward (restoring it if minimised), or open one.
+pub fn show_ui(ui_url: &str) {
+    if let Some(hwnd) = find_ui_window(ui_url) {
+        // SAFETY: `hwnd` came from EnumWindows just now; these calls tolerate a
+        // window that closed in between (they fail and return 0).
+        unsafe {
+            if IsIconic(hwnd) != 0 {
+                ShowWindow(hwnd, SW_RESTORE);
+            }
+            BringWindowToTop(hwnd);
+            SetForegroundWindow(hwnd);
+        }
+        return;
+    }
+    let mut last = LAST_LAUNCH.lock().unwrap_or_else(|p| p.into_inner());
+    if last.is_some_and(|t| t.elapsed() < Duration::from_secs(4)) {
+        return;
+    }
+    *last = Some(Instant::now());
+    nrob_studio::open_ui(ui_url, "app");
 }
 
 const RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
@@ -254,7 +339,9 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
         CALLBACK => {
             if let Some(tray) = TRAY.get() {
                 match lparam as u32 {
-                    WM_LBUTTONDBLCLK | WM_LBUTTONUP => open_ui(tray, "app"),
+                    // One event per click: a double-click also sends two
+                    // button-ups, and each used to open a window.
+                    WM_LBUTTONUP => open_ui(tray, "app"),
                     WM_RBUTTONUP | WM_CONTEXTMENU => menu(hwnd, tray),
                     _ => {}
                 }

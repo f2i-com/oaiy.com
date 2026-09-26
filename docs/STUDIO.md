@@ -49,14 +49,22 @@ The console accepts `status`, `start`, `stop`, `open`, `jobs` and `quit`.
   - The Gallery keeps everything generated this session, with each item's
     prompt, seed, steps and where its weights lived. Items can be reused,
     downloaded or removed.
-  - Chat renders Markdown, can stop a reply mid-stream, and takes a system prompt.
+  - The Playground has Chat, Image and Video tabs sized to the window. Chat
+    renders Markdown, can stop a reply mid-stream, and takes a system prompt.
+    Image and Video put the controls beside a stage showing the latest result,
+    with a filmstrip of this session's results under it. The controls include
+    shape presets, a drop zone for reference images or a start frame, and where
+    the weights live. Ctrl+Enter generates. Link straight to a tab with
+    `#play:image` or `#play:video`.
 - **Shortcut:** Ctrl+S saves settings.
 
 ### In the notification area (Windows)
 
 `nrob-studio-tray.exe` is the same studio without a console window. It starts
 in the background, opens the UI window, and puts an icon by the clock. Closing
-the UI window leaves everything serving; click the icon to bring it back.
+the UI window leaves everything serving. Click the icon to bring it back: if
+the window is already open (even minimised), it comes to the front rather than
+opening a second one.
 Right-click for:
 
 - **Open NROB Studio**, or **Open in the browser**;
@@ -69,7 +77,7 @@ Right-click for:
 The tooltip shows the model's state and media progress, and a notification
 pops up when an image or video finishes (or fails). It takes the same options as
 `nrob-studio`; `--open none` starts it with no window. Starting a second copy
-just opens the running one's UI. Windows 11 puts new icons under the **^**
+just brings up the running one's UI. Windows 11 puts new icons under the **^**
 overflow at first; drag the icon onto the taskbar to keep it visible.
 
 ## Adding models

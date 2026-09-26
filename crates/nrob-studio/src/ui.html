@@ -36,6 +36,8 @@
   }
 }
 * { box-sizing: border-box; }
+/* `hidden` wins over any display rule (icon buttons, overlays, cards). */
+[hidden] { display: none !important; }
 html, body { margin: 0; height: 100%; }
 body { background: var(--bg); color: var(--text); font: clamp(13px, .35vw + 12px, 15px)/1.5 var(--body); -webkit-font-smoothing: antialiased; overflow-x: hidden; }
 button, input, select, textarea { font: inherit; color: inherit; }
@@ -210,6 +212,95 @@ body.incognito .banner { display: flex; }
 .endpoint code { font: 13px var(--code); color: var(--text); word-break: break-all; }
 pre.example { background: var(--well); border: 1px solid var(--line); border-radius: var(--r); padding: 12px 14px; font: 12px/1.55 var(--code); overflow-x: auto; color: var(--well-text); margin: 8px 0 0; }
 
+/* ---------- playground ---------- */
+/* Panels are sized to the window by fitPlayground(): --play-h is the height
+   left below the tabs, so chat and the benches fill the window and follow it. */
+#v-play { --play-h: 640px; }
+.play-head { display: flex; align-items: end; justify-content: space-between; gap: 16px; flex-wrap: wrap; margin-bottom: 14px; }
+.play-head h1 { margin: 0; }
+.play-head .lede { margin: 2px 0 0; }
+.ptabs { display: inline-flex; padding: 3px; gap: 2px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; }
+.ptabs button { all: unset; cursor: pointer; display: inline-flex; align-items: center; gap: 7px; padding: 7px 16px; border-radius: 8px; color: var(--muted); font: 500 14px var(--display); letter-spacing: .02em; }
+.ptabs button svg { width: 16px; height: 16px; stroke: currentColor; fill: none; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+.ptabs button[aria-selected=true] { background: var(--panel-2); color: var(--text); box-shadow: inset 0 -2px var(--gpu); }
+.ptabs button:focus-visible { outline: 2px solid var(--gpu); }
+
+.chatbox { display: grid; grid-template-rows: auto minmax(0, 1fr) auto; height: var(--play-h); min-height: 360px; border: 1px solid var(--line); border-radius: 12px; background: var(--panel); overflow: hidden; }
+.chatbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 10px 14px; border-bottom: 1px solid var(--line); }
+.chatbar select { width: auto; min-width: 180px; max-width: 100%; padding: 5px 10px; }
+.chatbar .grow { flex: 1; }
+.chatbar details { position: relative; }
+.chatbar details > summary { list-style: none; cursor: pointer; }
+.chatbar details > summary::-webkit-details-marker { display: none; }
+.chatbar details[open] > div { position: absolute; right: 0; top: calc(100% + 8px); z-index: 4; width: min(460px, 86vw); background: var(--panel); border: 1px solid var(--line-2); border-radius: 10px; padding: 12px; box-shadow: 0 12px 36px rgba(0, 0, 0, .25); }
+.msgs { overflow-y: auto; padding: clamp(14px, 2vw, 28px); display: flex; flex-direction: column; gap: 18px; scroll-behavior: smooth; }
+.msg { max-width: min(78ch, 88%); }
+.msg.user { align-self: flex-end; background: var(--gpu); color: var(--on-accent); padding: 9px 14px; border-radius: 14px 14px 4px 14px; }
+.msg.assistant { align-self: flex-start; background: var(--panel-2); padding: 11px 15px; border-radius: 14px 14px 14px 4px; }
+.msg .who { font: 600 11px var(--display); letter-spacing: .04em; color: var(--muted); margin-bottom: 4px; }
+.msg.assistant .body pre { background: var(--bg); }
+.chat-empty { margin: auto; text-align: center; width: min(640px, 100%); display: grid; gap: 14px; justify-items: center; color: var(--muted); }
+.chat-empty h2 { margin: 0; color: var(--text); }
+.suggest { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(240px, 100%), 1fr)); gap: 8px; width: 100%; margin-top: 6px; }
+.suggest button { all: unset; cursor: pointer; padding: 10px 12px; border: 1px solid var(--line-2); border-radius: 10px; font-size: 13px; color: var(--text); background: var(--bg); text-align: left; line-height: 1.4; }
+.suggest button:hover { border-color: var(--gpu); }
+.suggest button:focus-visible { outline: 2px solid var(--gpu); }
+.composer2 { padding: 12px clamp(12px, 1.6vw, 20px) 14px; border-top: 1px solid var(--line); }
+.composer2 .box { display: flex; align-items: flex-end; gap: 8px; border: 1px solid var(--line-2); border-radius: 12px; background: var(--bg); padding: 6px 6px 6px 12px; }
+.composer2 .box:focus-within { border-color: var(--gpu); }
+.composer2 textarea { border: 0; background: transparent; padding: 6px 0; min-height: 24px; max-height: 38vh; resize: none; }
+.composer2 textarea:focus { outline: none; }
+.composer2 .hint { font-size: 11px; color: var(--faint); margin-top: 6px; }
+.iconbtn { display: inline-grid; place-items: center; width: 36px; height: 36px; padding: 0; border-radius: 9px; flex: none; }
+.iconbtn svg { width: 18px; height: 18px; stroke: currentColor; fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+
+.bench { display: grid; grid-template-columns: minmax(300px, 400px) minmax(0, 1fr); gap: clamp(14px, 1.6vw, 24px); height: var(--play-h); min-height: 460px; }
+.controls { display: grid; grid-template-rows: minmax(0, 1fr) auto; border: 1px solid var(--line); border-radius: 12px; background: var(--panel); overflow: hidden; }
+.controls .scroll { overflow-y: auto; padding: 16px; display: grid; gap: 16px; align-content: start; }
+.controls .go-bar { padding: 12px 16px; border-top: 1px solid var(--line); display: grid; gap: 8px; }
+.controls .go-bar .btn.go { width: 100%; padding: 10px; font-size: 15px; }
+.controls textarea.prompt { min-height: 110px; font-size: 14px; }
+.controls details summary { cursor: pointer; font-size: 13px; color: var(--muted); }
+.controls details[open] summary { margin-bottom: 12px; }
+.aspects { display: grid; grid-template-columns: repeat(auto-fill, minmax(78px, 1fr)); gap: 6px; }
+.aspects button { all: unset; cursor: pointer; display: grid; justify-items: center; gap: 5px; padding: 8px 4px; border: 1px solid var(--line-2); border-radius: 9px; font-size: 11px; color: var(--muted); text-align: center; }
+.aspects button i { display: block; border: 1.5px solid currentColor; border-radius: 3px; }
+.aspects button[aria-pressed=true] { color: var(--text); border-color: var(--gpu); background: color-mix(in srgb, var(--gpu) 12%, transparent); }
+.aspects button:focus-visible { outline: 2px solid var(--gpu); }
+.dropzone { border: 1.5px dashed var(--line-2); border-radius: 10px; padding: 12px; display: grid; gap: 8px; justify-items: center; text-align: center; font-size: 12px; color: var(--muted); cursor: pointer; transition: border-color .15s, background .15s; }
+.dropzone.over { border-color: var(--gpu); background: color-mix(in srgb, var(--gpu) 10%, transparent); }
+.dropzone .thumbs { display: flex; gap: 6px; flex-wrap: wrap; justify-content: center; }
+.dropzone .thumbs img { width: 56px; height: 56px; object-fit: cover; border-radius: 6px; }
+.stagewrap { display: grid; grid-template-rows: minmax(0, 1fr) auto; gap: 10px; min-height: 0; }
+.stage { position: relative; border: 1px solid var(--line); border-radius: 12px; background:
+  repeating-conic-gradient(color-mix(in srgb, var(--panel-2) 60%, transparent) 0 25%, transparent 0 50%) 0 0 / 22px 22px, var(--panel);
+  display: grid; place-items: center; overflow: hidden; min-height: 240px; }
+.stage img, .stage video { max-width: 100%; max-height: 100%; object-fit: contain; display: block; }
+.stage .placeholder { text-align: center; color: var(--muted); display: grid; gap: 8px; justify-items: center; padding: 24px; max-width: 420px; }
+.stage .placeholder svg { width: 44px; height: 44px; stroke: var(--faint); fill: none; stroke-width: 1.4; }
+.stage .overlay { position: absolute; inset: auto 14px 14px 14px; background: color-mix(in srgb, var(--panel) 88%, transparent); backdrop-filter: blur(6px); border: 1px solid var(--line-2); border-radius: 10px; padding: 10px 12px; display: grid; gap: 6px; }
+.stage .overlay .meter > div { background: var(--gpu); }
+.stage .actions { position: absolute; top: 12px; right: 12px; display: flex; gap: 6px; }
+.stage .actions .btn { background: color-mix(in srgb, var(--panel) 85%, transparent); backdrop-filter: blur(6px); }
+.strip-row { display: flex; gap: 8px; overflow-x: auto; padding-bottom: 2px; min-height: 0; }
+.strip-row:empty { display: none; }
+.strip-row button { all: unset; cursor: pointer; flex: none; width: 88px; height: 66px; border-radius: 8px; overflow: hidden; border: 2px solid transparent; background: var(--panel-2); }
+.strip-row button[aria-pressed=true] { border-color: var(--gpu); }
+.strip-row button:focus-visible { outline: 2px solid var(--gpu); }
+.strip-row img, .strip-row video { width: 100%; height: 100%; object-fit: cover; display: block; }
+@media (max-width: 1080px) {
+  .bench { grid-template-columns: minmax(0, 1fr); height: auto; }
+  .controls { grid-template-rows: auto auto; }
+  .controls .scroll { overflow: visible; }
+  .stagewrap { grid-template-rows: auto auto; }
+  .stage { height: clamp(260px, 60vw, 560px); }
+}
+@media (max-width: 560px) {
+  .ptabs { width: 100%; } .ptabs button { flex: 1; justify-content: center; padding: 7px 8px; }
+  .msg { max-width: 94%; }
+  .chatbar select { min-width: 0; flex: 1; }
+}
+
 /* save bar, toasts, dialog */
 .savebar { position: fixed; left: var(--rail-w); right: 0; bottom: 0; background: var(--panel-2); border-top: 1px solid var(--line-2); padding: 12px 36px; display: none; justify-content: space-between; align-items: center; gap: 12px; z-index: 5; }
 .savebar.on { display: flex; }
@@ -335,67 +426,105 @@ dialog::backdrop { background: var(--backdrop); }
 
     <!-- Playground -->
     <section class="view" id="v-play">
-      <h1>Playground</h1>
-      <p class="lede">Try each endpoint here before pointing another app at it. Requests go through the same routes that other apps use.</p>
-      <div class="tabs" role="tablist">
-        <button role="tab" aria-selected="true" data-tab="chat">Chat</button>
-        <button role="tab" aria-selected="false" data-tab="image">Image</button>
-        <button role="tab" aria-selected="false" data-tab="video">Video</button>
+      <div class="play-head">
+        <div><h1>Playground</h1><p class="lede">Try each endpoint through the same routes other apps use.</p></div>
+        <div class="ptabs" role="tablist">
+          <button role="tab" aria-selected="true" data-tab="chat"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12a8 8 0 01-11.6 7.1L4 20l1-4.6A8 8 0 1121 12z"/></svg>Chat</button>
+          <button role="tab" aria-selected="false" data-tab="image"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="9" cy="10" r="2"/><path d="M21 17l-5-5-9 8"/></svg>Image</button>
+          <button role="tab" aria-selected="false" data-tab="video"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="6" width="13" height="12" rx="2"/><path d="M16 10l5-3v10l-5-3z"/></svg>Video</button>
+        </div>
       </div>
       <div data-panel="chat">
-        <div class="row" style="margin-bottom:12px">
-          <label class="f" style="min-width:220px"><span>Model</span><select id="chat-model"></select></label>
-          <label class="check" style="margin-top:18px"><input type="checkbox" id="chat-think"> Think first</label>
-          <button class="btn quiet" id="chat-clear" style="margin-top:18px">Clear conversation</button>
-        </div>
-        <details style="margin-bottom:12px"><summary class="muted small" style="cursor:pointer">System prompt</summary>
-          <textarea id="chat-system" rows="2" placeholder="Optional instructions sent before the conversation" style="margin-top:8px"></textarea></details>
-        <div class="chat">
-          <div class="msgs" id="msgs"><div class="empty" id="chat-empty">Send a message to load the model and start a conversation. The first reply includes load time.</div></div>
-          <div class="composer">
-            <textarea id="chat-input" rows="2" placeholder="Message the model (Enter sends, Shift+Enter for a new line)"></textarea>
-            <div class="row"><button class="btn warn" id="chat-stop" hidden>Stop</button><button class="btn go" id="chat-send">Send</button></div>
+        <div class="chatbox">
+          <div class="chatbar">
+            <select id="chat-model" aria-label="Model"></select>
+            <label class="check"><input type="checkbox" id="chat-think"> Think first</label>
+            <span class="grow"></span>
+            <details><summary class="btn quiet">System prompt</summary>
+              <div><textarea id="chat-system" rows="4" placeholder="Optional instructions sent before the conversation, e.g. You are a concise assistant."></textarea></div></details>
+            <button class="btn quiet" id="chat-clear">New chat</button>
+          </div>
+          <div class="msgs" id="msgs" aria-live="polite"></div>
+          <div class="composer2">
+            <div class="box">
+              <textarea id="chat-input" rows="1" placeholder="Message the model"></textarea>
+              <button class="btn warn iconbtn" id="chat-stop" hidden title="Stop the reply" aria-label="Stop"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="2"/></svg></button>
+              <button class="btn go iconbtn" id="chat-send" title="Send" aria-label="Send"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14M13 6l6 6-6 6"/></svg></button>
+            </div>
+            <div class="hint">Enter sends, Shift+Enter adds a line. The first reply includes the time to load the model.</div>
           </div>
         </div>
       </div>
       <div data-panel="image" hidden>
-        <div class="gen">
-          <form class="gen-form" id="img-form">
-            <label class="f"><span>Prompt</span><textarea id="img-prompt" required placeholder="A red fox sitting in fresh snow, photograph"></textarea></label>
-            <label class="f"><span>Model</span><select id="img-model"></select></label>
-            <div class="grid-f" style="grid-template-columns:1fr 1fr">
-              <label class="f"><span>Size</span><select id="img-size"><option value="auto">Auto</option><option>1024x1024</option><option>1344x768</option><option>768x1344</option><option>1536x1024</option><option>512x512</option></select></label>
-              <label class="f"><span>Images</span><input type="number" id="img-n" min="1" max="16" value="1"></label>
-              <label class="f"><span>Steps <em class="muted">model default</em></span><input type="number" id="img-steps" min="2" max="100" placeholder="auto"></label>
-              <label class="f"><span>Seed</span><input type="number" id="img-seed" min="0" placeholder="random"></label>
+        <form class="bench" id="img-form">
+          <div class="controls">
+            <div class="scroll">
+              <label class="f"><span>Prompt</span><textarea class="prompt" id="img-prompt" required placeholder="A red fox sitting in fresh snow, photograph"></textarea></label>
+              <label class="f"><span>Model</span><select id="img-model"></select></label>
+              <div class="f"><span class="small muted">Shape</span><div class="aspects" id="img-aspects"></div><input type="hidden" id="img-size"></div>
+              <div class="grid-f" style="grid-template-columns:1fr 1fr">
+                <label class="f"><span>Images</span><input type="number" id="img-n" min="1" max="16" value="1"></label>
+                <label class="f"><span>Seed</span><input type="number" id="img-seed" min="0" placeholder="random"></label>
+              </div>
+              <details><summary>More options</summary>
+                <div class="grid-f" style="grid-template-columns:1fr">
+                  <label class="f"><span>Steps (empty = the model's default)</span><input type="number" id="img-steps" min="2" max="100" placeholder="auto"></label>
+                  <label class="f"><span>Negative prompt (SDXL)</span><input type="text" id="img-neg" placeholder="blurry, low quality"></label>
+                </div>
+              </details>
+              <input type="file" id="img-refs" accept="image/png,image/jpeg,image/webp" multiple hidden>
+              <div class="dropzone" id="img-drop" tabindex="0" role="button" aria-label="Drop up to 3 images here to edit them, or click to choose (Qwen Image)">
+                <span id="img-drop-label">Drop up to 3 images here to edit them, or click to choose (Qwen Image)</span>
+                <div class="thumbs" id="img-ref-preview"></div>
+              </div>
+              <div class="f"><span class="small muted">Where the weights live for this job</span><div class="seg" id="img-tier"></div></div>
             </div>
-            <label class="f"><span>Negative prompt (SDXL)</span><input type="text" id="img-neg" placeholder="blurry, low quality"></label>
-            <label class="f"><span>Images to edit (up to 3, Qwen Image)</span><input type="file" id="img-refs" accept="image/png,image/jpeg,image/webp" multiple></label>
-            <div class="row" id="img-ref-preview"></div>
-            <div class="f"><span class="small muted">Where the weights live for this job</span><div class="seg" id="img-tier"></div></div>
-            <button class="btn go" type="submit" id="img-go">Generate</button>
-            <div class="progress" id="img-progress" hidden><div class="meter"><div style="width:0"></div></div><span class="small muted"></span></div>
-          </form>
-          <div><div class="gallery" id="img-gallery"></div></div>
-        </div>
+            <div class="go-bar">
+              <button class="btn go" type="submit" id="img-go">Generate</button>
+              <span class="muted small" id="img-hint">Ctrl+Enter in the prompt also generates.</span>
+            </div>
+          </div>
+          <div class="stagewrap">
+            <div class="stage" id="img-stage">
+              <div class="placeholder" id="img-empty"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="9" cy="10" r="2"/><path d="M21 17l-5-5-9 8"/></svg><strong>Your images appear here</strong><span>Write a prompt and generate. Drop in pictures to edit them instead.</span></div>
+              <div class="overlay" id="img-progress" hidden><div class="spread small"><span id="img-progress-text">Starting</span><button class="btn quiet warn" type="button" id="img-cancel">Cancel</button></div><div class="meter"><div style="width:0"></div></div></div>
+            </div>
+            <div class="strip-row" id="img-strip" aria-label="Results this session"></div>
+          </div>
+        </form>
       </div>
+
       <div data-panel="video" hidden>
-        <div class="gen">
-          <form class="gen-form" id="vid-form">
-            <label class="f"><span>Prompt</span><textarea id="vid-prompt" required placeholder="Waves rolling onto a pebble beach at dusk"></textarea></label>
-            <label class="f"><span>Model</span><select id="vid-model"></select></label>
-            <div class="grid-f" style="grid-template-columns:1fr 1fr">
-              <label class="f"><span>Size</span><select id="vid-size"><option>768x512</option><option>1024x576</option><option>576x1024</option><option>512x512</option></select></label>
-              <label class="f"><span>Seconds</span><input type="number" id="vid-secs" min="0.5" max="5" step="0.5" value="2"></label>
-              <label class="f"><span>Seed</span><input type="number" id="vid-seed" min="0" placeholder="random"></label>
-              <label class="f"><span>Start frame</span><input type="file" id="vid-image" accept="image/png,image/jpeg,image/webp"></label>
+        <form class="bench" id="vid-form">
+          <div class="controls">
+            <div class="scroll">
+              <label class="f"><span>Prompt</span><textarea class="prompt" id="vid-prompt" required placeholder="Waves rolling onto a pebble beach at dusk"></textarea></label>
+              <label class="f"><span>Model</span><select id="vid-model"></select></label>
+              <div class="f"><span class="small muted">Shape</span><div class="aspects" id="vid-aspects"></div><input type="hidden" id="vid-size"></div>
+              <div class="grid-f" style="grid-template-columns:1fr 1fr">
+                <label class="f"><span>Length (seconds)</span><input type="number" id="vid-secs" min="0.5" max="5" step="0.5" value="2"></label>
+                <label class="f"><span>Seed</span><input type="number" id="vid-seed" min="0" placeholder="random"></label>
+              </div>
+              <input type="file" id="vid-image" accept="image/png,image/jpeg,image/webp" hidden>
+              <div class="dropzone" id="vid-drop" tabindex="0" role="button" aria-label="Drop a start frame here, or click to choose (optional)">
+                <span id="vid-drop-label">Drop a start frame here, or click to choose (optional)</span>
+                <div class="thumbs" id="vid-ref-preview"></div>
+              </div>
+              <div class="f"><span class="small muted">Where the weights live for this job</span><div class="seg" id="vid-tier"></div></div>
             </div>
-            <div class="f"><span class="small muted">Where the weights live for this job</span><div class="seg" id="vid-tier"></div></div>
-            <button class="btn go" type="submit" id="vid-go">Generate video</button>
-            <div class="progress" id="vid-progress" hidden><div class="meter"><div style="width:0"></div></div><span class="small muted"></span></div>
-          </form>
-          <div><div class="gallery" id="vid-gallery"></div></div>
-        </div>
+            <div class="go-bar">
+              <button class="btn go" type="submit" id="vid-go">Generate video</button>
+              <span class="muted small" id="vid-hint">Ctrl+Enter in the prompt also generates.</span>
+            </div>
+          </div>
+          <div class="stagewrap">
+            <div class="stage" id="vid-stage">
+              <div class="placeholder" id="vid-empty"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="6" width="13" height="12" rx="2"/><path d="M16 10l5-3v10l-5-3z"/></svg><strong>Your videos appear here</strong><span>A few seconds of video; progress shows while it renders.</span></div>
+              <div class="overlay" id="vid-progress" hidden><div class="spread small"><span id="vid-progress-text">Starting</span><button class="btn quiet warn" type="button" id="vid-cancel">Cancel</button></div><div class="meter"><div style="width:0"></div></div></div>
+            </div>
+            <div class="strip-row" id="vid-strip" aria-label="Results this session"></div>
+          </div>
+        </form>
       </div>
     </section>
 
@@ -672,16 +801,30 @@ function show(view) {
   $$("nav button").forEach(b => b.dataset.view === view ? b.setAttribute("aria-current", "page") : b.removeAttribute("aria-current"));
   $$("section.view").forEach(s => s.classList.toggle("on", s.id === "v-" + view));
   try { localStorage.setItem("studio-view", view); } catch {}
-  if (location.hash !== "#" + view) history.replaceState(null, "", "#" + view);
+  if (location.hash.split(":")[0] !== "#" + view) history.replaceState(null, "", "#" + view);
   if (view === "logs") pollLogs(true);
+  if (view === "play") requestAnimationFrame(fitPlayground);
   if (view === "gallery") refreshGallery();
   if (view === "endpoints") renderCompanion();
 }
 $$("nav button").forEach(b => b.onclick = () => show(b.dataset.view));
-$$("#v-play .tabs button").forEach(b => b.onclick = () => {
-  $$("#v-play .tabs button").forEach(x => x.setAttribute("aria-selected", x === b));
+$$("#v-play .ptabs button").forEach(b => b.onclick = () => {
+  $$("#v-play .ptabs button").forEach(x => x.setAttribute("aria-selected", x === b));
   $$("#v-play [data-panel]").forEach(p => p.hidden = p.dataset.panel !== b.dataset.tab);
+  try { localStorage.setItem("studio-play-tab", b.dataset.tab); } catch {}
+  fitPlayground();
 });
+// Panels fill the window below their own top edge, and follow it as it resizes.
+function fitPlayground() {
+  const view = $("#v-play");
+  if (!view.classList.contains("on")) return;
+  const panel = $$("#v-play [data-panel]").find(p => !p.hidden);
+  if (!panel) return;
+  const top = panel.getBoundingClientRect().top + scrollY;
+  const bottom = parseFloat(getComputedStyle($("main")).paddingBottom) > 60 ? 24 : 16;
+  view.style.setProperty("--play-h", Math.max(360, innerHeight - top - bottom) + "px");
+}
+addEventListener("resize", () => requestAnimationFrame(fitPlayground));
 
 /* ---------- bound fields ---------- */
 function bindFields() {
@@ -1082,7 +1225,7 @@ $("#chat-input").addEventListener("input", autoGrow);
 function addMsg(role, text = "") {
   $("#chat-empty")?.remove();
   const el = document.createElement("div"); el.className = "msg " + role;
-  el.innerHTML = role === "user" ? esc(text) : '<div class="think" hidden></div><div class="body"></div><div class="meta"></div><div class="actions"><button class="btn quiet copy-msg">Copy reply</button></div>';
+  el.innerHTML = role === "user" ? esc(text) : `<div class="who">${esc($("#chat-model").value || "Assistant")}</div><div class="think" hidden></div><div class="body"></div><div class="meta"></div><div class="actions"><button class="btn quiet copy-msg">Copy reply</button></div>`;
   $("#msgs").append(el); el.scrollIntoView({block: "end"}); return el;
 }
 async function sendChat() {
@@ -1136,22 +1279,98 @@ async function sendChat() {
 $("#chat-send").onclick = sendChat;
 $("#chat-stop").onclick = () => chatAbort?.abort();
 $("#chat-input").onkeydown = e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendChat(); } };
-$("#chat-clear").onclick = () => { chatLog = []; $("#msgs").innerHTML = '<div class="empty" id="chat-empty">New conversation.</div>'; };
+const SUGGESTIONS = ["Explain how mixture-of-experts models save memory, briefly.", "Write a haiku about a lighthouse in fog.", "Give me three dinner ideas using rice and eggs.", "Summarise the plot of Hamlet in four sentences."];
+function chatEmpty() {
+  $("#msgs").innerHTML = `<div class="chat-empty" id="chat-empty"><h2>Start a conversation</h2><span>The model loads on the first message, so the first reply takes longer.</span>
+    <div class="suggest">${SUGGESTIONS.map(t => `<button type="button">${esc(t)}</button>`).join("")}</div></div>`;
+  $$("#chat-empty .suggest button").forEach(b => b.onclick = () => { $("#chat-input").value = b.textContent; autoGrow(); $("#chat-input").focus(); });
+}
+chatEmpty();
+$("#chat-clear").onclick = () => { chatAbort?.abort(); chatLog = []; chatEmpty(); $("#chat-input").focus(); };
 
 /* ---------- image & video ---------- */
-function watchJob(kind, bar) {
+const readAsDataUrl = f => new Promise((ok, no) => { const r = new FileReader(); r.onload = () => ok(r.result); r.onerror = no; r.readAsDataURL(f); });
+const SHAPES = {
+  img: [["auto", "Auto", 1, 1], ["1024x1024", "Square", 1, 1], ["1344x768", "Wide", 7, 4], ["768x1344", "Tall", 4, 7], ["1152x896", "Photo", 9, 7], ["896x1152", "Portrait", 7, 9], ["1536x1024", "3:2", 3, 2]],
+  vid: [["768x512", "3:2", 3, 2], ["1024x576", "16:9", 16, 9], ["576x1024", "9:16", 9, 16], ["512x512", "Square", 1, 1]],
+};
+function renderShapes(k) {
+  const saved = (() => { try { return localStorage.getItem(`studio-${k}-size`); } catch { return null; } })();
+  const list = SHAPES[k], pick = list.some(s => s[0] === saved) ? saved : list[0][0];
+  $(`#${k}-size`).value = pick;
+  $(`#${k}-aspects`).innerHTML = list.map(([v, label, w, h]) => {
+    const scale = 22 / Math.max(w, h);
+    const box = v === "auto" ? `<i style="width:18px;height:18px;border-style:dashed"></i>` : `<i style="width:${Math.round(w * scale)}px;height:${Math.round(h * scale)}px"></i>`;
+    return `<button type="button" data-size="${v}" aria-pressed="${v === pick}" title="${v === "auto" ? "The model's default, or the edited image's shape" : v.replace("x", " × ")}">${box}${label}<span class="muted">${v === "auto" ? "default" : v.replace("x", "×")}</span></button>`;
+  }).join("");
+  $$(`#${k}-aspects button`).forEach(b => b.onclick = () => {
+    $$(`#${k}-aspects button`).forEach(x => x.setAttribute("aria-pressed", x === b));
+    $(`#${k}-size`).value = b.dataset.size;
+    try { localStorage.setItem(`studio-${k}-size`, b.dataset.size); } catch {}
+  });
+}
+renderShapes("img"); renderShapes("vid");
+
+// Reference images: drop, paste or pick; previews in the zone.
+function dropzone(k, input, max) {
+  const zone = $(`#${k}-drop`), label = $(`#${k}-drop-label`), initial = label.textContent;
+  const show = () => {
+    const files = [...input.files].slice(0, max);
+    $(`#${k}-ref-preview`).innerHTML = files.map(f => `<img src="${URL.createObjectURL(f)}" alt="${esc(f.name)}">`).join("");
+    label.textContent = files.length ? `${files.length} image${files.length > 1 ? "s" : ""} (click to change, or drop others)` : initial;
+    if (k === "img") $("#img-go").textContent = files.length ? "Edit" : "Generate";
+  };
+  const take = list => { const dt = new DataTransfer(); [...list].filter(f => f.type.startsWith("image/")).slice(0, max).forEach(f => dt.items.add(f)); input.files = dt.files; show(); };
+  zone.onclick = () => input.click();
+  zone.onkeydown = e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); input.click(); } };
+  input.onchange = show;
+  zone.ondragover = e => { e.preventDefault(); zone.classList.add("over"); };
+  zone.ondragleave = () => zone.classList.remove("over");
+  zone.ondrop = e => { e.preventDefault(); zone.classList.remove("over"); take(e.dataTransfer.files); };
+  zone.oncontextmenu = e => { if (input.files.length) { e.preventDefault(); input.value = ""; show(); } };
+  return () => { input.value = ""; show(); };
+}
+const clearImgRefs = dropzone("img", $("#img-refs"), 3);
+const clearVidRef = dropzone("vid", $("#vid-image"), 1);
+["img", "vid"].forEach(k => $(`#${k}-prompt`).addEventListener("keydown", e => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); $(`#${k}-form`).requestSubmit(); } }));
+
+// The stage shows one result large; the strip keeps this session's.
+function stageShow(k, item) {
+  const stage = $(`#${k}-stage`);
+  $$(".shown, .actions", stage).forEach(x => x.remove());
+  $(`#${k}-empty`).hidden = true;
+  const media = item.video ? `<video class="shown" src="${esc(item.url)}" poster="${esc(item.poster || "")}" controls autoplay loop playsinline></video>` : `<img class="shown" src="${esc(item.url)}" alt="${esc(item.prompt)}">`;
+  stage.insertAdjacentHTML("afterbegin", media + `<div class="actions"><a class="btn" href="${esc(item.url)}" target="_blank">Open</a><a class="btn" href="${esc(item.url)}" download>Save</a><button class="btn" type="button" data-reuse>Reuse prompt</button></div>`);
+  $("[data-reuse]", stage).onclick = () => { $(`#${k}-prompt`).value = item.prompt; $(`#${k}-prompt`).focus(); };
+  $$(`#${k}-strip button`).forEach(b => b.setAttribute("aria-pressed", b.dataset.url === item.url));
+}
+function stageAdd(k, items) {
+  const strip = $(`#${k}-strip`);
+  for (const item of [...items].reverse()) {
+    const b = document.createElement("button");
+    b.type = "button"; b.dataset.url = item.url; b.title = item.prompt;
+    b.innerHTML = item.video ? `<video src="${esc(item.url)}" poster="${esc(item.poster || "")}" muted preload="metadata"></video>` : `<img src="${esc(item.url)}" alt="">`;
+    b.onclick = () => stageShow(k, item);
+    strip.prepend(b);
+  }
+  if (items[0]) stageShow(k, items[0]);
+}
+function progress(k, text, pct) {
+  const bar = $(`#${k}-progress`);
+  if (text === null) { bar.hidden = true; return; }
+  bar.hidden = false; $(`#${k}-progress-text`).textContent = text; $(".meter > div", bar).style.width = (pct || 0) + "%";
+}
+let imgJobId = null, vidJobId = null;
+function watchJob(kind) {
   // The synchronous image call gives no progress; the job list does.
   const tick = setInterval(() => {
     const j = state?.media?.jobs?.find(j => j.kind === kind && (j.status === "in_progress" || j.status === "queued"));
-    if (j) { bar.hidden = false; $(".meter > div", bar).style.width = j.progress + "%"; $("span", bar).textContent = j.status === "queued" ? "Waiting for the GPU" : `${j.progress.toFixed(0)}%, ${j.stage.replace(/_/g, " ")}`; }
+    if (j) { imgJobId = j.id; progress("img", j.status === "queued" ? "Waiting for the GPU" : `${j.progress.toFixed(0)}%, ${j.stage.replace(/_/g, " ")}`, j.progress); }
   }, 700);
-  return () => { clearInterval(tick); bar.hidden = true; };
+  return () => { clearInterval(tick); progress("img", null); imgJobId = null; };
 }
-$("#img-refs").onchange = () => {
-  const files = [...$("#img-refs").files].slice(0, 3);
-  $("#img-ref-preview").innerHTML = files.map(f => `<img src="${URL.createObjectURL(f)}" alt="${esc(f.name)}" style="width:64px;height:64px;object-fit:cover;border-radius:4px">`).join("");
-  $("#img-go").textContent = files.length ? "Edit" : "Generate";
-};
+$("#img-cancel").onclick = () => imgJobId && api(`/api/jobs/${imgJobId}/cancel`, {method: "POST"}).then(refresh);
+$("#vid-cancel").onclick = () => vidJobId && api(`/api/jobs/${vidJobId}/cancel`, {method: "POST"}).then(refresh);
 $("#img-form").onsubmit = async e => {
   e.preventDefault();
   const body = {prompt: $("#img-prompt").value, model: $("#img-model").value || undefined, size: $("#img-size").value, n: +$("#img-n").value || 1, memory: imgTier, response_format: "url"};
@@ -1160,39 +1379,34 @@ $("#img-form").onsubmit = async e => {
   if ($("#img-steps").value) body.steps = +$("#img-steps").value;
   if ($("#img-seed").value) body.seed = +$("#img-seed").value;
   if ($("#img-neg").value) body.negative_prompt = $("#img-neg").value;
-  $("#img-go").disabled = true; const stop = watchJob("image", $("#img-progress"));
+  $("#img-go").disabled = true; progress("img", "Starting", 1); const stop = watchJob("image");
   try {
     const r = await api(refs.length ? "/api/play/edits" : "/api/play/images", {method: "POST", body});
-    const g = $("#img-gallery");
-    for (const d of r.data.reverse()) d.url = fileUrl(d.url);
-    for (const d of r.data) g.insertAdjacentHTML("afterbegin", `<figure><a href="${esc(d.url)}" target="_blank"><img src="${esc(d.url)}" alt="${esc(body.prompt)}"></a><figcaption><span>${esc(r.model)}, ${esc(r.size)}</span><a href="${esc(d.url)}" download onclick="event.stopPropagation()">Save</a></figcaption></figure>`);
+    stageAdd("img", r.data.map(d => ({url: fileUrl(d.url), prompt: body.prompt})));
   } catch (err) { toast(err.message, true); }
   stop(); $("#img-go").disabled = false; refresh();
 };
-const readAsDataUrl = f => new Promise((ok, no) => { const r = new FileReader(); r.onload = () => ok(r.result); r.onerror = no; r.readAsDataURL(f); });
 $("#vid-form").onsubmit = async e => {
   e.preventDefault();
   const body = {prompt: $("#vid-prompt").value, model: $("#vid-model").value || undefined, size: $("#vid-size").value, seconds: $("#vid-secs").value, memory: vidTier};
   if ($("#vid-seed").value) body.seed = +$("#vid-seed").value;
   const f = $("#vid-image").files[0]; if (f) body.input_reference = {image_url: await readAsDataUrl(f)};
-  $("#vid-go").disabled = true; const bar = $("#vid-progress");
+  $("#vid-go").disabled = true; progress("vid", "Starting", 1);
   try {
     let v = await api("/api/play/videos", {method: "POST", body});
-    bar.hidden = false;
+    vidJobId = v.id;
     while (v.status === "queued" || v.status === "in_progress") {
-      $(".meter > div", bar).style.width = v.progress + "%";
       const j = state?.media?.jobs?.find(j => j.id === v.id);
-      $("span", bar).textContent = v.status === "queued" ? "Waiting for the GPU" : `${v.progress}%` + (j ? ", " + j.stage.replace(/_/g, " ") : "");
+      progress("vid", v.status === "queued" ? "Waiting for the GPU" : `${v.progress}%` + (j ? ", " + j.stage.replace(/_/g, " ") : ""), v.progress);
       await new Promise(r => setTimeout(r, 1500));
       v = await api("/api/play/videos/" + v.id);
     }
     if (v.status !== "completed") throw new Error(v.error?.message || "the video failed");
     await refresh();
     const j = state.media.jobs.find(j => j.id === v.id);
-    const src = j?.files?.[0] || fileUrl(`/api/play/videos/${v.id}/content`);
-    $("#vid-gallery").insertAdjacentHTML("afterbegin", `<figure><video src="${esc(src)}" controls loop playsinline poster="${esc(j?.preview || "")}"></video><figcaption><span>${esc(v.model)}, ${esc(v.size)}, ${esc(v.seconds)} s</span><a href="${esc(src)}" download>Save</a></figcaption></figure>`);
+    stageAdd("vid", [{url: j?.files?.[0] || fileUrl(`/api/play/videos/${v.id}/content`), poster: j?.preview, prompt: body.prompt, video: true}]);
   } catch (err) { toast(err.message, true); }
-  bar.hidden = true; $("#vid-go").disabled = false;
+  vidJobId = null; progress("vid", null); $("#vid-go").disabled = false;
 };
 
 /* ---------- gallery and viewer ---------- */
@@ -1234,7 +1448,7 @@ function openViewer(id) {
   $("#viewer-reuse").onclick = () => {
     const tab = j.kind === "video" ? "video" : "image";
     $(`#${tab === "video" ? "vid" : "img"}-prompt`).value = j.prompt;
-    $("#viewer").close(); show("play"); $(`#v-play .tabs button[data-tab=${tab}]`).click();
+    $("#viewer").close(); show("play"); $(`#v-play .ptabs button[data-tab=${tab}]`).click();
   };
   $("#viewer-delete").onclick = async () => { await api(`/api/jobs/${j.id}`, {method: "DELETE"}); galleryJobs = galleryJobs.filter(x => x.id !== j.id); $("#viewer").close(); renderGallery(); refresh(); };
   $("#viewer").showModal();
@@ -1276,8 +1490,10 @@ async function refresh() {
 async function refreshSystem() { try { sys = await api("/api/system"); renderHardware(); } catch {} }
 (async () => {
   await refresh(); await refreshSystem(); await loadConfig(); renderState(); renderHardware();
-  { let v = location.hash.slice(1); try { v ||= localStorage.getItem("studio-view"); } catch {} if (v && $("#v-" + v)) show(v); }
-  window.addEventListener("hashchange", () => { const v = location.hash.slice(1); if ($("#v-" + v)) show(v); });
+  try { const t = localStorage.getItem("studio-play-tab"); if (t) $(`#v-play .ptabs button[data-tab=${t}]`)?.click(); } catch {}
+  { const [hv, ht] = location.hash.slice(1).split(":"); if (hv === "play" && ht) $(`#v-play .ptabs button[data-tab=${ht}]`)?.click(); }
+  { let v = location.hash.slice(1).split(":")[0]; try { v ||= localStorage.getItem("studio-view"); } catch {} if (v && $("#v-" + v)) show(v); }
+  window.addEventListener("hashchange", () => { const [v, t] = location.hash.slice(1).split(":"); if ($("#v-" + v)) show(v); if (v === "play" && t) $(`#v-play .ptabs button[data-tab=${t}]`)?.click(); });
   setInterval(refresh, 1500);
   setInterval(() => { if ($("#v-overview").classList.contains("on") || $("#v-memory").classList.contains("on")) refreshSystem(); }, 3000);
   setInterval(() => { if ($("#v-logs").classList.contains("on")) pollLogs(false); }, 1500);
