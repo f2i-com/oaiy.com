@@ -1,6 +1,13 @@
 //! Native Rust Qwen3-TTS (12 Hz): text to speech in a voice described in
-//! words (VoiceDesign). The talker writes one frame of 16 codebook ids per
+//! words (VoiceDesign), or in a saved voice (the Base model, cloning from a
+//! short reference clip). The talker writes one frame of 16 codebook ids per
 //! 80 ms; the speech codec turns frames into 24 kHz audio.
+//!
+//! A saved voice is made once: VoiceDesign speaks a sample line in the
+//! described voice, then the Base model's speaker encoder and the codec's
+//! encoder turn that clip into a speaker embedding and reference codes. Later
+//! lines prompt the Base talker with them (in-context), so the voice holds.
+pub mod clone;
 pub mod codec;
 pub mod model;
 
@@ -50,6 +57,57 @@ pub struct Request {
     pub repetition_penalty: f64,
     /// Argmax instead of sampling (for tests; it tends to loop on long text).
     pub greedy: bool,
+    /// Speak in a saved voice (a file written by `design_voice`); `model_dir`
+    /// is then the Base model.
+    pub voice: Option<Voice>,
+}
+
+/// A reusable voice: the transcript and codec codes of its reference clip,
+/// and its speaker embedding. A few kilobytes; no audio is needed to use it.
+#[derive(Clone, Debug)]
+pub struct Voice {
+    pub name: String,
+    pub description: String,
+    pub language: String,
+    pub ref_text: String,
+    pub ref_codes: Vec<[u32; 16]>,
+    pub speaker: Vec<f32>,
+}
+
+impl Voice {
+    pub fn to_json(&self) -> Json {
+        Json::obj([
+            ("nrob_voice", Json::Int(1)),
+            ("name", Json::str(&self.name)),
+            ("description", Json::str(&self.description)),
+            ("language", Json::str(&self.language)),
+            ("ref_text", Json::str(&self.ref_text)),
+            ("ref_codes", Json::Arr(self.ref_codes.iter().map(|f| Json::Arr(f.iter().map(|&c| Json::Int(c as i64)).collect())).collect())),
+            ("speaker", Json::Arr(self.speaker.iter().map(|&v| Json::Num(v as f64)).collect())),
+        ])
+    }
+
+    pub fn from_json(j: &Json) -> std::result::Result<Self, String> {
+        if j.get("nrob_voice").and_then(Json::as_i64) != Some(1) {
+            return Err("not an NROB voice file".into());
+        }
+        let s = |k: &str| j.get(k).and_then(Json::as_str).unwrap_or_default().to_string();
+        let ref_codes = j
+            .get("ref_codes")
+            .and_then(Json::as_array)
+            .ok_or("voice: missing ref_codes")?
+            .iter()
+            .map(|f| {
+                let v: Vec<u32> = f.as_array().unwrap_or(&[]).iter().filter_map(|c| c.as_i64()).map(|c| c as u32).collect();
+                <[u32; 16]>::try_from(v).map_err(|_| "voice: every frame needs 16 codes".to_string())
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let speaker: Vec<f32> = j.get("speaker").and_then(Json::as_array).ok_or("voice: missing speaker")?.iter().filter_map(|v| v.as_f64()).map(|v| v as f32).collect();
+        if speaker.len() != 2048 || ref_codes.is_empty() || ref_codes.iter().flatten().any(|&c| c >= AUDIO_CODES) {
+            return Err("voice: needs a 2048-value speaker embedding and valid reference codes".into());
+        }
+        Ok(Self { name: s("name"), description: s("description"), language: s("language"), ref_text: s("ref_text"), ref_codes, speaker })
+    }
 }
 
 impl Request {
@@ -70,6 +128,13 @@ impl Request {
             top_p: f("top_p", 1.0),
             repetition_penalty: f("repetition_penalty", 1.05),
             greedy: j.get("greedy").and_then(Json::as_bool).unwrap_or(false),
+            voice: match j.get("voice_file").and_then(Json::as_str) {
+                None => None,
+                Some(p) => {
+                    let bytes = std::fs::read(p).map_err(|e| format!("voice file {p}: {e}"))?;
+                    Some(Voice::from_json(&Json::parse(&bytes).map_err(|e| format!("voice file {p}: {e}"))?)?)
+                }
+            },
         };
         if r.text.len() > 20_000 || r.instructions.len() > 4_000 {
             return Err("speech: text is limited to 20000 bytes and instructions to 4000".into());
@@ -249,6 +314,50 @@ impl Tts {
         Tensor::cat(&parts, 1)
     }
 
+    /// S(frames): each frame's 16 codec embeddings summed, (1, n, 2048).
+    fn frames_embedding(&self, frames: &[[u32; 16]]) -> Result<Tensor> {
+        let ids = |q: usize| Tensor::from_vec(frames.iter().map(|f| f[q]).collect::<Vec<u32>>(), frames.len(), &self.dev);
+        let mut e = self.codec_embedding.index_select(&ids(0)?, 0)?;
+        for (i, emb) in self.predictor_embeddings.iter().enumerate() {
+            e = (e + emb.index_select(&ids(i + 1)?, 0)?)?;
+        }
+        e.unsqueeze(0)
+    }
+
+    /// The Base talker's prefill for a saved voice (in-context, streaming
+    /// text): the codec prefix with the speaker embedding in it, then the
+    /// reference transcript and the new text over codec BOS and the reference
+    /// clip's frames. Text that outlasts the clip's frames is returned to be
+    /// fed one token per generated frame.
+    pub fn prefill_clone(&mut self, text_ids: &[u32], ref_ids: &[u32], voice: &Voice, language: Option<u32>) -> Result<(Tensor, Tensor)> {
+        let mut parts = vec![self.text(&[IM_START, ASSISTANT, NEWLINE])?];
+        let prefix: Vec<u32> = match language {
+            Some(l) => vec![CODEC_THINK, CODEC_THINK_BOS, l, CODEC_THINK_EOS],
+            None => vec![CODEC_NOTHINK, CODEC_THINK_BOS, CODEC_THINK_EOS],
+        };
+        let specials = self.text(&[TTS_PAD, TTS_BOS, TTS_EOS])?;
+        let (pad, bos, eos) = (specials.narrow(1, 0, 1)?, specials.narrow(1, 1, 1)?, specials.narrow(1, 2, 1)?);
+        let speaker = Tensor::from_slice(&voice.speaker, (1, 1, voice.speaker.len()), &self.dev)?.to_dtype(DType::BF16)?;
+        let codec_side = Tensor::cat(&[self.codec(&prefix)?, speaker, self.codec(&[CODEC_PAD])?], 1)?;
+        let n = codec_side.dim(1)?;
+        let text_side = Tensor::cat(&[pad.broadcast_as((1, n - 1, pad.dim(2)?))?.contiguous()?, bos], 1)?;
+        parts.push((text_side + codec_side)?);
+        let mut all_ids = ref_ids.to_vec();
+        all_ids.extend_from_slice(text_ids);
+        let text = Tensor::cat(&[self.text(&all_ids)?, eos], 1)?;
+        let codec = Tensor::cat(&[self.codec(&[CODEC_BOS])?, self.frames_embedding(&voice.ref_codes)?], 1)?;
+        let (lt, lc) = (text.dim(1)?, codec.dim(1)?);
+        let trailing = if lt > lc {
+            parts.push((text.narrow(1, 0, lc)? + &codec)?);
+            text.narrow(1, lc, lt - lc)?
+        } else {
+            let padded = Tensor::cat(&[text, pad.broadcast_as((1, lc - lt, pad.dim(2)?))?.contiguous()?], 1)?;
+            parts.push((padded + &codec)?);
+            pad
+        };
+        Ok((Tensor::cat(&parts, 1)?, trailing))
+    }
+
     /// The text term added to every generated step (non-streaming: tts_pad).
     fn pad_embedding(&mut self) -> Result<Tensor> {
         self.text(&[TTS_PAD])
@@ -286,9 +395,12 @@ impl Tts {
     }
 
     /// Generate frames until the codec EOS (or `max_frames`).
-    pub fn frames(&mut self, prefill: &Tensor, r: &Request, max_frames: usize, mut progress: impl FnMut(usize)) -> Result<Vec<[u32; 16]>> {
+    /// `trailing`: text still to be read, one position per generated frame
+    /// (then tts_pad); `None` for the non-streaming layout.
+    pub fn frames(&mut self, prefill: &Tensor, trailing: Option<&Tensor>, r: &Request, max_frames: usize, mut progress: impl FnMut(usize)) -> Result<Vec<[u32; 16]>> {
         let mut rng = Rng::new(r.seed);
         let pad = self.pad_embedding()?;
+        let trailing_len = trailing.map(|t| t.dim(1)).transpose()?.unwrap_or(0);
         let mut cache = Cache::new(self.talker.layers());
         let h = self.talker.forward(prefill, &mut cache)?;
         let mut hidden = h.narrow(1, h.dim(1)? - 1, 1)?;
@@ -319,10 +431,107 @@ impl Tts {
             let frame = self.predict_rest(&hidden, c0, r, &mut rng)?;
             frames.push(frame);
             progress(frames.len());
-            hidden = self.talker.forward(&self.frame_embedding(&frame, &pad)?, &mut cache)?;
+            let step = frames.len() - 1;
+            let text = match trailing {
+                Some(t) if step < trailing_len => t.narrow(1, step, 1)?,
+                _ => pad.clone(),
+            };
+            hidden = self.talker.forward(&self.frame_embedding(&frame, &text)?, &mut cache)?;
         }
         Ok(frames)
     }
+}
+
+/// Make a reusable voice from a description: VoiceDesign speaks `sample`
+/// in the described voice, then the Base model's encoders turn the clip into
+/// a `Voice`.
+#[derive(Clone, Debug)]
+pub struct DesignRequest {
+    pub design_dir: PathBuf,
+    pub base_dir: PathBuf,
+    pub name: String,
+    pub description: String,
+    pub sample: String,
+    pub language: String,
+    pub seed: u64,
+    pub device: usize,
+    pub output: PathBuf,
+}
+
+impl DesignRequest {
+    pub fn parse(j: &Json) -> std::result::Result<Self, String> {
+        let s = |k: &str| j.get(k).and_then(Json::as_str).map(str::trim).filter(|v| !v.is_empty()).map(str::to_owned);
+        let r = Self {
+            design_dir: s("design_model_dir").ok_or("voice: missing design_model_dir")?.into(),
+            base_dir: s("base_model_dir").ok_or("voice: missing base_model_dir")?.into(),
+            name: s("name").ok_or("voice: missing name")?,
+            description: s("description").ok_or("voice: describe the voice")?,
+            sample: s("sample_text").unwrap_or_else(|| "Hello there. This is my voice, and this is how I sound when I read a few sentences out loud.".into()),
+            language: s("language").unwrap_or_else(|| "auto".into()).to_lowercase(),
+            seed: j.get("seed").and_then(Json::as_i64).unwrap_or(0).max(0) as u64,
+            device: j.get("device").and_then(Json::as_i64).unwrap_or(0).max(0) as usize,
+            output: s("output_dir").ok_or("voice: missing output_dir")?.into(),
+        };
+        if r.description.len() > 4000 || r.sample.len() > 2000 || r.name.len() > 80 {
+            return Err("voice: description, sample text or name too long".into());
+        }
+        Ok(r)
+    }
+}
+
+pub fn design_voice(r: &DesignRequest, mut report: impl FnMut(Json)) -> Result<Json> {
+    let started = Instant::now();
+    std::fs::create_dir_all(&r.output)?;
+    let dev = device(r.device)?;
+    report(event("designing_voice", 0, 3));
+    let speak = Request {
+        model_dir: r.design_dir.clone(),
+        text: r.sample.clone(),
+        instructions: r.description.clone(),
+        language: r.language.clone(),
+        output: r.output.clone(),
+        seed: r.seed,
+        device: r.device,
+        max_seconds: 30.,
+        temperature: 0.9,
+        top_k: 50,
+        top_p: 1.0,
+        repetition_penalty: 1.05,
+        greedy: false,
+        voice: None,
+    };
+    let tok = tokenizer(&r.design_dir)?;
+    let mut tts = Tts::load(&r.design_dir, &dev)?;
+    let language = tts.language_id(&r.language)?;
+    let instruct = encode(&tok, &r.description)?;
+    let prefill = tts.prefill(&encode(&tok, &r.sample)?, Some(&instruct), language)?;
+    let frames = tts.frames(&prefill, None, &speak, 375, |_| {})?;
+    drop(tts);
+    if frames.len() < 12 {
+        candle_core::bail!("the voice sample came out too short; try a longer sample text or another seed");
+    }
+    report(event("designing_voice", 1, 3));
+    let codec = codec::CodecDecoder::load(&r.design_dir.join("speech_tokenizer").join("model.safetensors"), &dev)?;
+    let clip = codec.decode(&frames)?;
+    drop(codec);
+    report(event("designing_voice", 2, 3));
+    let speaker = clone::SpeakerEncoder::load(&r.base_dir.join("model.safetensors"), &dev)?.embed(&clip)?;
+    let ref_codes = clone::SpeechEncoder::load(&r.base_dir.join("speech_tokenizer").join("model.safetensors"), &dev)?.encode(&clip)?;
+    let voice = Voice { name: r.name.clone(), description: r.description.clone(), language: r.language.clone(), ref_text: r.sample.clone(), ref_codes, speaker };
+    let stamp = SystemTime::now().duration_since(UNIX_EPOCH).map_err(candle_core::Error::wrap)?.as_nanos();
+    let clip_path = r.output.join(format!("voice-{stamp}.wav"));
+    write_wav(&clip_path, &clip, codec::SAMPLE_RATE)?;
+    let voice_path = clip_path.with_extension("voice.json");
+    std::fs::write(&voice_path, voice.to_json().to_json())?;
+    report(event("designing_voice", 3, 3));
+    Ok(Json::obj([
+        ("voice_file", Json::str(voice_path.to_string_lossy())),
+        ("path", Json::str(clip_path.to_string_lossy())),
+        ("name", Json::str(&voice.name)),
+        ("duration", Json::Num(clip.len() as f64 / codec::SAMPLE_RATE as f64)),
+        ("frames", Json::Int(voice.ref_codes.len() as i64)),
+        ("seconds", Json::Num(started.elapsed().as_secs_f64())),
+    ]))
 }
 
 fn event(stage: &str, current: usize, total: usize) -> Json {
@@ -370,18 +579,38 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
     let mut tts = Tts::load(&r.model_dir, &dev)?;
     let language = tts.language_id(&r.language)?;
     let text_ids = encode(&tok, &r.text)?;
-    let instruct_ids = if r.instructions.trim().is_empty() { None } else { Some(encode(&tok, &r.instructions)?) };
-    let prefill = tts.prefill(&text_ids, instruct_ids.as_deref(), language)?;
+    let (prefill, trailing) = match &r.voice {
+        Some(voice) => {
+            let ref_ids = encode(&tok, &voice.ref_text)?;
+            let (p, t) = tts.prefill_clone(&text_ids, &ref_ids, voice, language)?;
+            (p, Some(t))
+        }
+        None => {
+            let instruct_ids = if r.instructions.trim().is_empty() { None } else { Some(encode(&tok, &r.instructions)?) };
+            (tts.prefill(&text_ids, instruct_ids.as_deref(), language)?, None)
+        }
+    };
     let load_seconds = started.elapsed().as_secs_f64();
     let max_frames = (r.max_seconds * FRAMES_PER_SECOND).ceil() as usize;
     let speak_started = Instant::now();
-    let frames = tts.frames(&prefill, r, max_frames, |n| report(event("speaking", n, max_frames)))?;
+    let frames = tts.frames(&prefill, trailing.as_ref(), r, max_frames, |n| report(event("speaking", n, max_frames)))?;
     let speak_seconds = speak_started.elapsed().as_secs_f64();
     drop(tts);
     report(event("decoding_speech", 0, 1));
     let decode_started = Instant::now();
     let codec = codec::CodecDecoder::load(&r.model_dir.join("speech_tokenizer").join("model.safetensors"), &dev)?;
-    let samples = if frames.is_empty() { Vec::new() } else { codec.decode(&frames)? };
+    // A saved voice's clip is decoded ahead of the new frames (as context for
+    // the causal decoder) and cut off again.
+    let samples = match (&r.voice, frames.is_empty()) {
+        (_, true) => Vec::new(),
+        (Some(voice), false) => {
+            let mut all = voice.ref_codes.clone();
+            all.extend_from_slice(&frames);
+            let wave = codec.decode(&all)?;
+            wave[(voice.ref_codes.len() * codec::SAMPLES_PER_FRAME).min(wave.len())..].to_vec()
+        }
+        (None, false) => codec.decode(&frames)?,
+    };
     drop(codec);
     let decode_seconds = decode_started.elapsed().as_secs_f64();
     let stamp = SystemTime::now().duration_since(UNIX_EPOCH).map_err(candle_core::Error::wrap)?.as_nanos();
@@ -423,6 +652,59 @@ mod tests {
             let s = sample(&logits, 1.0, 2, 1.0, false, &mut rng);
             assert!(s == 1 || s == 2, "top-2 only, got {s}");
         }
+    }
+
+    #[test]
+    #[ignore = "requires the Qwen3-TTS Base model and clone reference dumps; NROB_TTS_GOLDEN (clone folder), NROB_TTS_BASE"]
+    fn clone_prompt_matches_reference() -> Result<()> {
+        let root = PathBuf::from(std::env::var("NROB_TTS_GOLDEN").map_err(candle_core::Error::wrap)?);
+        let base = PathBuf::from(std::env::var("NROB_TTS_BASE").map_err(candle_core::Error::wrap)?);
+        let dev = Device::new_cuda(std::env::var("NROB_TTS_TEST_DEVICE").ok().and_then(|v| v.parse().ok()).unwrap_or(0))?;
+        let ints = |name: &str| -> Result<Vec<u32>> {
+            Ok(std::fs::read(root.join(name))?.chunks_exact(4).map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]) as u32).collect())
+        };
+        let floats = |name: &str| -> Result<Vec<f32>> {
+            Ok(std::fs::read(root.join(name))?.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect())
+        };
+        let read = |name: &str, shape: &[usize]| -> Result<Tensor> {
+            Tensor::from_raw_buffer(&std::fs::read(root.join(name))?, DType::F32, shape, &dev)
+        };
+        let meta = Json::parse(&std::fs::read(root.join("meta.json"))?).map_err(candle_core::Error::wrap)?;
+        let ref_text = meta.get("ref_text").and_then(Json::as_str).unwrap_or_default();
+        let new_text = meta.get("new_text").and_then(Json::as_str).unwrap_or_default();
+        let tok = tokenizer(&base)?;
+        let (ref_ids, text_ids) = (encode(&tok, ref_text)?, encode(&tok, new_text)?);
+        let (want_ref, want_text) = (ints("ref_ids.i32")?, ints("input_ids.i32")?);
+        assert_eq!(ref_ids, want_ref[3..want_ref.len() - 2], "reference transcript ids");
+        assert_eq!(text_ids, want_text[3..want_text.len() - 5], "new text ids");
+        let codes = ints("ref_code.i32")?;
+        let voice = Voice {
+            name: "golden".into(),
+            description: String::new(),
+            language: "english".into(),
+            ref_text: ref_text.into(),
+            ref_codes: codes.chunks_exact(16).map(|c| c.try_into().unwrap()).collect(),
+            speaker: floats("spk_embedding_bf16.f32")?,
+        };
+        let back = Voice::from_json(&Json::parse(voice.to_json().to_json().as_bytes()).map_err(candle_core::Error::wrap)?).map_err(candle_core::Error::Msg)?;
+        assert_eq!(back.ref_codes, voice.ref_codes, "voice files round-trip");
+        let mut tts = Tts::load(&base, &dev)?;
+        let lang = tts.language_id("english")?;
+        let (prefill, trailing) = tts.prefill_clone(&text_ids, &ref_ids, &voice, lang)?;
+        let n = prefill.dim(1)?;
+        assert_eq!(n, 100, "prefill positions");
+        let e = relative(&prefill.squeeze(0)?, &read("icl_prefill_in.f32", &[n, 2048])?)?;
+        println!("clone prefill ({n} positions): relative RMS error {e}");
+        assert!(e < 0.01, "clone prefill {e}");
+        let e = relative(&trailing.squeeze(0)?, &read("icl_trailing_text.f32", &[1, 2048])?)?;
+        println!("trailing text: relative RMS error {e}");
+        assert!(e < 0.01, "trailing {e}");
+        let mut cache = Cache::new(tts.talker.layers());
+        let out = tts.talker.forward(&prefill, &mut cache)?;
+        let e = relative(&out.squeeze(0)?, &read("icl_prefill_out.f32", &[n, 2048])?)?;
+        println!("Base talker on the clone prefill: relative RMS error {e}");
+        assert!(e < 0.03, "clone talker {e}");
+        Ok(())
     }
 
     #[test]
@@ -474,8 +756,9 @@ mod tests {
             top_p: 1.0,
             repetition_penalty: 1.05,
             greedy: true,
+            voice: None,
         };
-        let frames = tts.frames(&prefill, &r, 4, |_| {})?;
+        let frames = tts.frames(&prefill, None, &r, 4, |_| {})?;
         for (i, f) in frames.iter().enumerate() {
             let want = &greedy[i * 16..(i + 1) * 16];
             println!("frame {i}: ours {:?}\n         ref  {:?}", f, want);
