@@ -62,21 +62,39 @@ pub fn message_box(text: &str) {
     unsafe { MessageBoxW(std::ptr::null_mut(), text.as_ptr(), title.as_ptr(), MB_OK | MB_ICONERROR) };
 }
 
+/// The image in an .ico file that best fits `size` pixels: the smallest at
+/// least that big, else the largest. As `(offset, length)` into the file.
+fn ico_image(ico: &[u8], size: i32) -> Option<(usize, usize)> {
+    let u16_at = |i: usize| Some(u16::from_le_bytes([*ico.get(i)?, *ico.get(i + 1)?]));
+    let u32_at = |i: usize| Some(u32::from_le_bytes([*ico.get(i)?, *ico.get(i + 1)?, *ico.get(i + 2)?, *ico.get(i + 3)?]));
+    let count = u16_at(4)? as usize;
+    let mut entries = Vec::new();
+    for i in 0..count {
+        let e = 6 + i * 16;
+        let width = match *ico.get(e)? {
+            0 => 256,
+            w => w as i32,
+        };
+        let (len, offset) = (u32_at(e + 8)? as usize, u32_at(e + 12)? as usize);
+        if offset.checked_add(len).is_some_and(|end| end <= ico.len()) {
+            entries.push((width, offset, len));
+        }
+    }
+    let fits = entries.iter().filter(|e| e.0 >= size).min_by_key(|e| e.0);
+    let (_, offset, len) = *fits.or_else(|| entries.iter().max_by_key(|e| e.0))?;
+    Some((offset, len))
+}
+
 fn load_icon() -> HICON {
     // SAFETY: GetSystemMetrics takes no pointers.
     let size = unsafe { GetSystemMetrics(SM_CXSMICON) }.max(16);
-    // SAFETY: ICON is a complete .ico file (a directory followed by the images
-    // it indexes), which is what LookupIconIdFromDirectoryEx reads; the offset it
-    // returns is checked against the buffer before CreateIconFromResourceEx reads
-    // the image there, and that function copies what it needs.
-    unsafe {
-        let offset = LookupIconIdFromDirectoryEx(ICON.as_ptr(), 1, size, size, LR_DEFAULTCOLOR);
-        if offset <= 0 || offset as usize >= ICON.len() {
-            return std::ptr::null_mut();
-        }
-        let image = &ICON[offset as usize..];
-        CreateIconFromResourceEx(image.as_ptr(), image.len() as u32, 1, 0x0003_0000, size, size, LR_DEFAULTCOLOR)
-    }
+    // LookupIconIdFromDirectoryEx expects a resource's group directory (14-byte
+    // entries), not a file's (16-byte), so the file is read here.
+    let Some((offset, len)) = ico_image(ICON, size) else { return std::ptr::null_mut() };
+    let image = &ICON[offset..offset + len];
+    // SAFETY: `image` is one complete icon image inside ICON (bounds checked
+    // above); CreateIconFromResourceEx copies what it needs.
+    unsafe { CreateIconFromResourceEx(image.as_ptr(), image.len() as u32, 1, 0x0003_0000, size, size, LR_DEFAULTCOLOR) }
 }
 
 fn notify(hwnd: HWND, message: u32, balloon: Option<(&str, &str, bool)>) {
@@ -111,10 +129,8 @@ fn llm_state(tray: &Tray) -> (String, bool) {
 
 fn tooltip(tray: &Tray) -> String {
     let (state, _) = llm_state(tray);
-    let jobs = tray.running.studio.media.list();
-    let active = jobs.iter().find(|j| j.status == "in_progress");
-    let media = match active {
-        Some(j) => format!("{} {:.0}%", j.kind.name(), j.progress),
+    let media = match tray.running.studio.media.running() {
+        Some((kind, progress)) => format!("{} {progress:.0}%", kind.name()),
         None => "media idle".into(),
     };
     format!("NROB Studio: LLM {state}, {media}")
@@ -230,7 +246,7 @@ fn set_autostart(on: bool) {
     if on {
         let exe = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default();
         let config = TRAY.get().map(|t| t.running.studio.config_path.display().to_string()).unwrap_or_default();
-        let command = format!("\"{exe}\" --config \"{config}\" --open none");
+        let command = format!("\"{exe}\" --config \"{config}\" --open none {}", crate::AUTOSTART_FLAG);
         reg(&["add", RUN_KEY, "/v", RUN_VALUE, "/t", "REG_SZ", "/d", &command, "/f"]);
     } else {
         reg(&["delete", RUN_KEY, "/v", RUN_VALUE, "/f"]);
@@ -310,23 +326,33 @@ fn quit(hwnd: HWND) {
 /// Every few seconds: refresh the tooltip and announce media that finished.
 fn tick(hwnd: HWND) {
     let Some(tray) = TRAY.get() else { return };
-    let mut balloon = None;
-    {
+    let balloon: Option<(String, String, bool)> = {
+        let jobs = tray.running.studio.media.list();
         let mut seen = tray.announced.lock().unwrap_or_else(|p| p.into_inner());
-        for job in tray.running.studio.media.list() {
+        // Jobs the studio has let go of need no memory here either.
+        seen.retain(|id| jobs.iter().any(|j| &j.id == id));
+        let (mut ready, mut failed) = (Vec::new(), Vec::new());
+        for job in jobs {
             if !job.finished() || seen.contains(&job.id) {
                 continue;
             }
             seen.push(job.id.clone());
-            let what = if job.kind.name() == "video" { "Video" } else { "Image" };
-            let prompt: String = job.prompt.chars().take(80).collect();
-            balloon = Some(match job.status.as_str() {
-                "completed" => (format!("{what} ready"), prompt, false),
-                "failed" => (format!("{what} failed"), job.error.clone().unwrap_or_default().chars().take(200).collect(), true),
-                _ => continue,
-            });
+            match job.status.as_str() {
+                "completed" => ready.push(job),
+                "failed" => failed.push(job),
+                _ => {}
+            }
         }
-    }
+        let what = |kind: &str| if kind == "video" { "Video" } else { "Image" };
+        // Several finishing in one tick get one balloon that counts them.
+        match (ready.as_slice(), failed.as_slice()) {
+            ([], []) => None,
+            ([j], []) => Some((format!("{} ready", what(j.kind.name())), j.prompt.chars().take(80).collect(), false)),
+            ([], [j]) => Some((format!("{} failed", what(j.kind.name())), j.error.clone().unwrap_or_default().chars().take(200).collect(), true)),
+            (r, []) => Some((format!("{} results ready", r.len()), "Open NROB Studio to see them in the Gallery.".into(), false)),
+            (r, f) => Some((format!("{} ready, {} failed", r.len(), f.len()), "Open NROB Studio to see them in the Gallery.".into(), true)),
+        }
+    };
     match &balloon {
         Some((title, text, warn)) => notify(hwnd, NIM_MODIFY, Some((title, text, *warn))),
         None => notify(hwnd, NIM_MODIFY, None),
@@ -374,6 +400,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
 
 /// Show the icon and run the message loop until Quit.
 pub fn run(running: Running, show_balloon: bool) {
+    let refresh_autostart = autostart();
     let already: Vec<String> = running.studio.media.list().iter().filter(|j| j.finished()).map(|j| j.id.clone()).collect();
     let ui_url = running.ui_url.clone();
     let tray = Tray { running, announced: Mutex::new(already), icon: AtomicIsize::new(load_icon() as isize) };
@@ -403,6 +430,11 @@ pub fn run(running: Running, show_balloon: bool) {
         message_box("Could not create the notification-area window.");
         return;
     }
+    // Keep a registered "Start with Windows" pointing at this executable, with
+    // today's command line.
+    if refresh_autostart {
+        set_autostart(true);
+    }
     let hello = format!("Running in the background at {ui_url}. Click the icon to open it; right-click for more.");
     notify(hwnd, NIM_ADD, if show_balloon { Some(("NROB Studio", hello.as_str(), false)) } else { None });
     // SAFETY: `hwnd` is live and owned by this thread; no timer callback (the
@@ -415,5 +447,29 @@ pub fn run(running: Running, show_balloon: bool) {
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn icon_sizes_come_from_the_file_directory() {
+        let width = |size| {
+            let (offset, _) = ico_image(ICON, size).unwrap();
+            // Each image is a PNG (width at byte 16) or a DIB (width at byte 4).
+            let img = &ICON[offset..];
+            if img.starts_with(b"\x89PNG") {
+                u32::from_be_bytes([img[16], img[17], img[18], img[19]]) as i32
+            } else {
+                i32::from_le_bytes([img[4], img[5], img[6], img[7]])
+            }
+        };
+        assert_eq!(width(16), 16);
+        assert!(width(20) >= 20, "a larger image for 125% scaling");
+        assert!(width(32) >= 32);
+        assert!(width(1000) >= 48, "the largest when none is big enough");
+        assert!(ico_image(b"\0\0\x01\0\x01\0", 16).is_none());
     }
 }

@@ -177,6 +177,7 @@ impl Engine {
             self.model.set_busy(true);
             self.request_number += 1;
             self.forgetting = job.forget;
+            self.model.set_private(job.forget);
             let result = self.switch_phase(false).and_then(|_| {
                 if job.tool_precision && blocking_observer_review(&job.observer_context, self.model.uses_ternary_experts()) {
                     if self.observer.is_none() {
@@ -204,6 +205,9 @@ impl Engine {
                 // Incognito: the next request starts clean rather than from this one.
                 self.tokens.clear();
                 self.checkpoints.clear();
+                // The observer's memory of its reviews would outlive it too.
+                if let Some(o) = self.observer.as_mut() { o.forget(); }
+                self.model.set_private(false);
                 continue;
             }
             if let Some(path) = &self.usage {

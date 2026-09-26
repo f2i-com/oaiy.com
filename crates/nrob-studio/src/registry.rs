@@ -58,6 +58,15 @@ fn ensure_route(cfg: &mut Json, target: &str) {
     }
 }
 
+/// Add the default route for `target` only when the table has none at all. An
+/// import uses this: a route the user turned off stays off.
+fn add_route_if_absent(cfg: &mut Json, target: &str) {
+    let present = get(cfg, &["gateway", "routes"]).and_then(Json::as_array).is_some_and(|r| r.iter().any(|r| str_or(r, "target", "") == target));
+    if !present {
+        ensure_route(cfg, target);
+    }
+}
+
 /// Files near `path` (its folder, the parent's, and their subfolders, a few
 /// levels) for which `accept` finds a part. Header reads only; bounded.
 fn nearby(path: &Path, accept: impl Fn(&Path, &Detected) -> bool) -> Option<PathBuf> {
@@ -138,7 +147,8 @@ fn companion(cfg: &Json, section: &str, entry: &Json, missing: &str, picked: &Pa
 
 /// Components attach to the first model that lacks them.
 fn attach(cfg: &mut Json, d: &Detected, target: Option<(&str, &str)>) -> Result<Added, String> {
-    let (section, field, fits): (&str, &str, Box<dyn Fn(&Json) -> bool>) = match d.kind() {
+    type Fits = Box<dyn Fn(&Json) -> bool>;
+    let (section, field, fits): (&str, &str, Fits) = match d.kind() {
         "vision_projector" => ("llm", "vision_projector", Box::new(|_| true)),
         "adapter" => ("image", "adapter", Box::new(|m| str_or(m, "architecture", "qwen-image") == "qwen-image")),
         "image_base" => ("image", "base", Box::new(|m| str_or(m, "architecture", "qwen-image") == "qwen-image")),
@@ -224,7 +234,7 @@ fn backfill(cfg: &mut Json, section: &str, new_name: &str) -> Vec<String> {
         }
         for key in keys {
             // A combined LTX 2.3 file is its own VAE; only lend what was a separate part.
-            let lend = new.get(*key).and_then(Json::as_str).filter(|v| !v.is_empty() && Some(*v) != new.get("transformer").and_then(Json::as_str));
+            let lend = new.get(key).and_then(Json::as_str).filter(|v| !v.is_empty() && Some(*v) != new.get("transformer").and_then(Json::as_str));
             if let (true, Some(v)) = (str_or(m, key, "").is_empty(), lend) {
                 set(m, key, Json::str(v));
             }
@@ -343,13 +353,15 @@ pub fn export(cfg: &Json, root: &Path) -> Json {
 /// otherwise models merge by name (the file's version wins). Entries whose
 /// files are not on this machine come in disabled and are reported, so a file
 /// from another PC imports cleanly and shows what to repoint.
-pub fn import(cfg: &mut Json, doc: &Json, replace: bool) -> Result<Json, String> {
+pub fn import(cfg: &mut Json, doc: &Json, replace: bool, root: &Path) -> Result<Json, String> {
     if doc.get("nrob_models").and_then(Json::as_i64) != Some(1) {
         return Err("not an NROB models file (missing \"nrob_models\": 1)".into());
     }
     let mut missing = Vec::new();
+    let mut tools_missing = Vec::new();
     let mut counts = (0, 0, 0);
-    let exists = |p: &str| Path::new(p).exists();
+    // Relative paths mean what they mean everywhere else: beside the studio.
+    let exists = |p: &str| config::resolve(root, p).exists();
     let mut check = |section: &str, name: &str, m: &mut Json, keys: &[&str]| {
         let mut ok = true;
         for key in keys {
@@ -402,9 +414,19 @@ pub fn import(cfg: &mut Json, doc: &Json, replace: bool) -> Result<Json, String>
             }
         }
         let section = obj_mut(cfg, &["media", kind]).ok_or("no media section")?;
-        for key in ["memory", "ram_gb", "vram_gb", "fps", "ffmpeg"] {
+        for key in ["memory", "ram_gb", "vram_gb", "fps"] {
             if let Some(v) = section_in.get(key) {
                 set(section, key, v.clone());
+            }
+        }
+        // ffmpeg is a program this machine runs: taken only when it is here,
+        // otherwise the local setting stays and the path is reported.
+        if let Some(f) = section_in.get("ffmpeg").and_then(Json::as_str).map(str::trim).filter(|f| !f.is_empty()) {
+            // A bare `ffmpeg` means the one on the search path, wherever that is.
+            if exists(f) || f.eq_ignore_ascii_case("ffmpeg") || f.eq_ignore_ascii_case("ffmpeg.exe") {
+                set(section, "ffmpeg", Json::str(f));
+            } else {
+                tools_missing.push(Json::obj([("section", Json::str(kind)), ("model", Json::str("")), ("field", Json::str("ffmpeg")), ("path", Json::str(f))]));
             }
         }
         let d = str_or(section_in, "default_model", "").to_string();
@@ -422,10 +444,21 @@ pub fn import(cfg: &mut Json, doc: &Json, replace: bool) -> Result<Json, String>
             set(llm, "default_model", Json::str(known.first().map_or("", String::as_str)));
         }
     }
-    for target in ["chat", "completions", "models", "images", "edits", "videos", "files"] {
-        ensure_route(cfg, target);
+    let mut needed = Vec::new();
+    if counts.0 > 0 {
+        needed.extend(["chat", "completions", "models"]);
+    }
+    if counts.1 > 0 {
+        needed.extend(["images", "edits", "files"]);
+    }
+    if counts.2 > 0 {
+        needed.extend(["videos", "files"]);
+    }
+    for target in needed {
+        add_route_if_absent(cfg, target);
     }
     config::validate(cfg)?;
+    missing.extend(tools_missing);
     Ok(Json::obj([
         ("llm", Json::Int(counts.0)),
         ("image", Json::Int(counts.1)),
@@ -533,17 +566,36 @@ mod tests {
         assert_eq!(get(&file, &["llm", "models"]).unwrap().len(), 1);
         // Into a fresh install: the model arrives, enabled, as the default.
         let mut other = config::default_json();
-        let report = import(&mut other, &file, false).unwrap();
+        let report = import(&mut other, &file, false, &d).unwrap();
         assert_eq!(report.get("llm").and_then(Json::as_i64), Some(1));
         assert_eq!(get(&other, &["llm", "default_model"]).and_then(Json::as_str), Some("chat"));
         assert!(report.get("missing").unwrap().as_array().unwrap().is_empty());
         // From a machine where the file is elsewhere: imported, disabled, reported.
         std::fs::remove_file(d.join("Chat.gguf")).unwrap();
         let mut third = config::default_json();
-        let report = import(&mut third, &file, true).unwrap();
+        // A route turned off here stays off, whatever the file brings.
+        if let Some(Json::Arr(routes)) = obj_mut(&mut third, &["gateway", "routes"]) {
+            for r in routes.iter_mut().filter(|r| str_or(r, "target", "") == "completions") {
+                set(r, "enabled", Json::Bool(false));
+            }
+        }
+        let report = import(&mut third, &file, true, &d).unwrap();
         assert_eq!(report.get("missing").unwrap().len(), 1);
         assert_eq!(get(&third, &["llm", "models"]).unwrap().at(0).unwrap().get("enabled"), Some(&Json::Bool(false)));
-        assert!(import(&mut third, &Json::parse(b"{}").unwrap(), false).is_err());
+        let routes = get(&third, &["gateway", "routes"]).unwrap().as_array().unwrap();
+        assert!(routes.iter().filter(|r| str_or(r, "target", "") == "completions").all(|r| !bool_or(r, "enabled", true)));
+        // Another machine's ffmpeg is not taken when it is not here.
+        let mut foreign = file.clone();
+        if let Some(v) = obj_mut(&mut foreign, &["video"]) {
+            set(v, "ffmpeg", Json::str("Z:\\nowhere\\ffmpeg.exe"));
+        } else if let Json::Obj(f) = &mut foreign {
+            f.push(("video".into(), Json::obj([("ffmpeg", Json::str("Z:\\nowhere\\ffmpeg.exe"))])));
+        }
+        let before = get(&third, &["media", "video", "ffmpeg"]).cloned();
+        let report = import(&mut third, &foreign, false, &d).unwrap();
+        assert!(report.get("missing").unwrap().as_array().unwrap().iter().any(|m| str_or(m, "field", "") == "ffmpeg"));
+        assert_eq!(get(&third, &["media", "video", "ffmpeg"]).cloned(), before);
+        assert!(import(&mut third, &Json::parse(b"{}").unwrap(), false, &d).is_err());
         std::fs::remove_dir_all(d).unwrap();
     }
 

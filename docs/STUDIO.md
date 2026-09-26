@@ -123,8 +123,11 @@ Models → **Export models** downloads `nrob-models.json`: every language, image
 and video model with its parts, the defaults, and the memory settings. Paths are
 written absolute, so the file works from any install folder. **Import models**
 reads one back and asks whether to merge (same-named models are updated, others
-kept) or replace the whole list. Entries whose files are not on this machine come
-in switched off and are listed, ready to repoint with Browse. The same operations
+kept) or replace the whole list, or cancel. Entries whose files are not on this
+machine come in switched off and are listed, ready to repoint with Browse. An
+`ffmpeg` path is taken only if that file exists here. Relative paths are read
+beside the studio. A route you turned off stays off; import only adds a route
+when the table has none for what the new models serve. The same operations
 are available to scripts as `GET /api/models/export` and
 `POST /api/models/import?mode=merge|replace` on the control port.
 
@@ -289,10 +292,16 @@ header `X-NROB-Incognito: 1` or a body field `"incognito": true`.
   `nrob-server --incognito`.
 - **Images and video:** the job writes into a private folder under
   `outputs/.incognito/`, with no video prompt cache and uploads kept inside it. It
-  never appears in the job list, gallery or logs. Images returned as `b64_json`
-  are deleted as soon as they are sent. Files handed out as URLs are deleted after
-  10 minutes (images) or 30 minutes (videos). A studio restart clears whatever is
-  left.
+  never appears in the job list, gallery or logs. The UI still shows that
+  something is running (progress only, with Cancel). Images returned as
+  `b64_json` are deleted as soon as they are sent. Files handed out as URLs are
+  deleted after 10 minutes (images) or 30 minutes (videos), and are served with
+  `Cache-Control: no-store` so the browser keeps no copy. A job still running
+  when the gateway gives up waiting is cancelled too. A studio restart clears
+  whatever is left.
+- **Expert traces and usage:** an incognito request adds nothing to
+  `--expert-trace` or the expert-usage profile. The tool-call observer forgets
+  its reviews afterwards.
 
 ## The control port
 
@@ -304,8 +313,9 @@ which programs the studio runs, so:
   listener), so DNS rebinding cannot reach it;
 - anything carrying an `Origin` must come from its own origin, so another web
   page in the same browser cannot drive it;
-- if `ui.host` is not loopback and `gateway.api_key` is set, every API call needs
-  that key (the page takes it once as `?key=`).
+- if `ui.host` is not loopback and `gateway.api_key` is set, every API call from
+  another machine needs that key. The page takes it once as `?key=`, or asks for
+  it. Connections from this machine itself (loopback) need no key.
 
 Keep `ui.host` on `127.0.0.1` unless you mean to control the machine remotely.
 Saving a non-loopback `ui.host` is refused until `gateway.api_key` is set.

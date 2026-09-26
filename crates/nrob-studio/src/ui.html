@@ -236,6 +236,8 @@ pre.example { background: var(--well); border: 1px solid var(--line); border-rad
 .msgs { overflow-y: auto; padding: clamp(14px, 2vw, 28px); display: flex; flex-direction: column; gap: 18px; scroll-behavior: smooth; }
 .msg { max-width: min(78ch, 88%); }
 .msg.user { align-self: flex-end; background: var(--gpu); color: var(--on-accent); padding: 9px 14px; border-radius: 14px 14px 4px 14px; }
+.msg.user.unsent { opacity: .55; }
+.msg.user.unsent::after { content: "Not sent"; display: block; font-size: 11px; margin-top: 4px; opacity: .9; }
 .msg.assistant { align-self: flex-start; background: var(--panel-2); padding: 11px 15px; border-radius: 14px 14px 14px 4px; }
 .msg .who { font: 600 11px var(--display); letter-spacing: .04em; color: var(--muted); margin-bottom: 4px; }
 .msg.assistant .body pre { background: var(--bg); }
@@ -282,6 +284,9 @@ pre.example { background: var(--well); border: 1px solid var(--line); border-rad
 .stage .overlay .meter > div { background: var(--gpu); }
 .stage .actions { position: absolute; top: 12px; right: 12px; display: flex; gap: 6px; }
 .stage .actions .btn { background: color-mix(in srgb, var(--panel) 85%, transparent); backdrop-filter: blur(6px); }
+.stage .expiry { position: absolute; top: 12px; left: 12px; max-width: calc(100% - 300px); font-size: 12px; padding: 6px 10px; border-radius: 8px; background: color-mix(in srgb, var(--panel) 88%, transparent); backdrop-filter: blur(6px); border: 1px solid var(--line-2); color: var(--muted); }
+.stage .gone { color: var(--muted); text-align: center; padding: 24px; max-width: 360px; }
+@media (max-width: 860px) { .stage .expiry { max-width: none; right: 12px; top: auto; bottom: 12px; } }
 .strip-row { display: flex; gap: 8px; overflow-x: auto; padding-bottom: 2px; min-height: 0; }
 .strip-row:empty { display: none; }
 .strip-row button { all: unset; cursor: pointer; flex: none; width: 88px; height: 66px; border-radius: 8px; overflow: hidden; border: 2px solid transparent; background: var(--panel-2); }
@@ -311,6 +316,11 @@ dialog { background: var(--panel); color: var(--text); border: 1px solid var(--l
 dialog.wide { width: min(1200px, 96vw); }
 dialog::backdrop { background: var(--backdrop); }
 .dlg-head { padding: 16px 20px 10px; display: grid; gap: 10px; }
+#ask { width: min(480px, 94vw); }
+#ask form { padding: 20px 22px 18px; display: grid; gap: 12px; }
+#ask h2 { margin: 0; font-size: 17px; }
+#ask p { margin: 0; color: var(--muted); white-space: pre-line; }
+#ask .row { justify-content: flex-end; flex-wrap: wrap; }
 .crumbs { display: flex; gap: 6px; }
 .crumbs input { font: 12px var(--code); }
 .files { max-height: 52vh; overflow-y: auto; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
@@ -531,7 +541,7 @@ dialog::backdrop { background: var(--backdrop); }
     <!-- Gallery -->
     <section class="view" id="v-gallery">
       <h1>Gallery</h1>
-      <p class="lede">Everything generated since the studio started. Click one for its prompt and settings, or to reuse the prompt.</p>
+      <p class="lede">Recent results from this session (incognito requests are never listed). Click one for its prompt and settings, or to reuse the prompt.</p>
       <div class="chips" id="gallery-filter">
         <button data-f="all" aria-pressed="true">All</button><button data-f="image" aria-pressed="false">Images</button>
         <button data-f="video" aria-pressed="false">Videos</button><button data-f="active" aria-pressed="false">In progress</button>
@@ -703,6 +713,12 @@ dialog::backdrop { background: var(--backdrop); }
       <p id="viewer-prompt" style="margin:0"></p><dl id="viewer-meta"></dl><div class="row" id="viewer-actions"></div></div></div>
 </dialog>
 
+<dialog id="ask" aria-labelledby="ask-title">
+  <form method="dialog"><h2 id="ask-title"></h2><p id="ask-text"></p>
+    <input id="ask-input" hidden autocomplete="off" aria-labelledby="ask-title">
+    <div class="row" id="ask-buttons"></div></form>
+</dialog>
+
 <dialog id="picker" aria-label="Choose a file">
   <div class="dlg-head">
     <div class="spread"><h2 style="margin:0" id="pick-title">Choose a model file</h2><button class="btn quiet" id="pick-close" aria-label="Close">Close</button></div>
@@ -729,8 +745,32 @@ async function api(path, opts = {}) {
   const r = await fetch(path, Object.assign({}, opts, {headers, body: opts.body && typeof opts.body !== "string" ? JSON.stringify(opts.body) : opts.body}));
   const text = await r.text();
   let data; try { data = JSON.parse(text); } catch { data = text; }
+  if (r.status === 401) needKey();
   if (!r.ok) throw new Error(data?.error?.message || text || r.statusText);
   return data;
+}
+// A question with buttons (and optionally a text box). Resolves to the chosen
+// button's value and the text, or null when dismissed (Escape or Cancel).
+function ask({title, text = "", input = null, buttons}) {
+  return new Promise(done => {
+    const d = $("#ask"), box = $("#ask-input");
+    $("#ask-title").textContent = title; $("#ask-text").textContent = text;
+    box.hidden = !input; box.value = "";
+    if (input) { box.type = input.type || "text"; box.placeholder = input.placeholder || ""; }
+    $("#ask-buttons").innerHTML = buttons.map((b, i) => `<button class="btn ${b.kind || ""}" value="${b.value === null ? "cancel" : i}">${esc(b.label)}</button>`).join("");
+    d.returnValue = "";
+    d.onclose = () => { const i = d.returnValue; done(i === "" || i === "cancel" ? null : {value: buttons[+i].value, text: box.value}); };
+    d.showModal();
+    (input ? box : $("#ask-buttons .go") || $("#ask-buttons button:last-child")).focus();
+  });
+}
+let keyAsked = false;
+async function needKey() {
+  if (keyAsked) return; keyAsked = true;
+  const r = await ask({title: "Enter the API key", text: "This studio is reachable from other machines, so its controls need the gateway's API key.",
+    input: {type: "password", placeholder: "API key"}, buttons: [{label: "Unlock", value: "ok", kind: "go"}]});
+  if (r?.text.trim()) { try { sessionStorage.setItem("studio-key", r.text.trim()); } catch {} location.reload(); }
+  keyAsked = false;
 }
 function toast(msg, err) {
   const t = document.createElement("div");
@@ -757,6 +797,12 @@ $("#discard").onclick = () => { cfg = clone(saved); renderConfig(); dirty(); };
 /* ---------- incognito ---------- */
 $("#incognito").onchange = async e => {
   // A mode, not a draft setting: it applies (and restarts the LLM) at once.
+  if (["ready", "starting"].includes(state?.llm?.state)) {
+    const r = await ask({title: e.target.checked ? "Turn incognito on?" : "Turn incognito off?",
+      text: "The language model restarts to switch modes, which stops any reply in progress.",
+      buttons: [{label: "Cancel", value: null}, {label: "Restart and switch", value: "go", kind: "go"}]});
+    if (!r) { e.target.checked = !e.target.checked; return; }
+  }
   try {
     const next = clone(saved); next.privacy = {...(next.privacy || {}), incognito: e.target.checked};
     saved = await api("/api/config", {method: "PUT", body: next});
@@ -769,7 +815,11 @@ $("#incognito").onchange = async e => {
 $("#import-models").onchange = async e => {
   const f = e.target.files[0]; e.target.value = ""; if (!f) return;
   let doc; try { doc = JSON.parse(await f.text()); } catch { return toast("That file is not JSON", true); }
-  const replace = confirm("Replace your whole model list with this file?\n\nOK replaces. Cancel merges (models with the same name are updated, others kept).");
+  const pick = await ask({title: `Import ${f.name}?`,
+    text: "Add updates models with the same name and keeps the rest. Replace makes this file your whole model list.",
+    buttons: [{label: "Cancel", value: null}, {label: "Replace all", value: "replace", kind: "warn"}, {label: "Add to my models", value: "merge", kind: "go"}]});
+  if (!pick) return;
+  const replace = pick.value === "replace";
   try {
     const r = await api("/api/models/import?mode=" + (replace ? "replace" : "merge"), {method: "POST", body: doc});
     const miss = r.missing.length ? `\n${r.missing.length} path(s) not found here, switched off: ` + r.missing.slice(0, 4).map(m => `${m.model} ${m.field}`).join(", ") : "";
@@ -988,7 +1038,7 @@ function renderModels() {
   $$("[data-menable]").forEach(el => el.onchange = () => { const [s, n] = el.dataset.menable.split("|"); modelObj(s, n).enabled = el.checked; touch(); });
   $$("[data-default]").forEach(b => b.onclick = () => { const [s, n] = b.dataset.default.split("|"); if (s === "llm") cfg.llm.default_model = n; else cfg.media[s].default_model = n; renderModels(); renderSelects(); touch(); });
   $$("[data-remove]").forEach(b => b.onclick = async () => { const [section, name] = b.dataset.remove.split("|");
-    if (!confirm(`Remove ${name}? The files stay on disk.`)) return;
+    if (!await ask({title: `Remove ${name}?`, text: "It leaves the model list; the files stay on disk.", buttons: [{label: "Cancel", value: null}, {label: "Remove", value: "ok", kind: "warn"}]})) return;
     try { await api("/api/models/remove", {method: "POST", body: {section, name}}); await loadConfig(); toast("Removed " + name); } catch (e) { toast(e.message, true); } });
 }
 function mediaItem(section, name, m, arch, miss, fields) {
@@ -1086,7 +1136,7 @@ function renderRoutes() {
   $$("[data-rdel]").forEach(b => b.onclick = () => { cfg.gateway.routes.splice(+b.dataset.rdel, 1); renderRoutes(); renderExamples(); touch(); });
 }
 $("#route-add").onclick = () => { cfg.gateway.routes.push({path: "/custom/path", method: "POST", target: "chat", spec: "openai", enabled: true}); renderRoutes(); touch(); };
-$("#routes-reset").onclick = async () => { if (!confirm("Replace the route table with the defaults?")) return; try { saved = await api("/api/config/reset-routes", {method: "POST"}); cfg = clone(saved); renderConfig(); dirty(); toast("Routes restored"); } catch (e) { toast(e.message, true); } };
+$("#routes-reset").onclick = async () => { if (!await ask({title: "Restore the default routes?", text: "Your route table is replaced with the defaults. Custom paths are lost.", buttons: [{label: "Cancel", value: null}, {label: "Restore defaults", value: "ok", kind: "warn"}]})) return; try { saved = await api("/api/config/reset-routes", {method: "POST"}); cfg = clone(saved); renderConfig(); dirty(); toast("Routes restored"); } catch (e) { toast(e.message, true); } };
 function routeFor(target) { return cfg.gateway.routes.find(r => r.target === target && r.enabled !== false); }
 function renderExamples() {
   const base = state?.gateway_url || `http://127.0.0.1:${cfg.gateway.port}`;
@@ -1137,30 +1187,32 @@ function renderState() {
   $("#llm-stop").disabled = l.state === "stopped";
   $("#llm-note").textContent = state.restart_required ? "Listener changes apply after the studio restarts." : "";
   $("#foot-llm").className = "dot " + l.state; $("#foot-llm-text").textContent = "LLM " + label.toLowerCase();
-  const active = state.media.jobs.find(j => j.status === "in_progress");
+  const priv = state.media.private || [];
+  const active = state.media.jobs.find(j => j.status === "in_progress") || priv.find(j => j.status === "in_progress");
   $("#foot-media").className = "dot " + (active ? "starting" : ""); $("#foot-media-text").textContent = active ? `${active.kind} ${active.progress.toFixed(0)}%` : "Media idle";
   const ep = [["Chat", routeFor("chat")], ["Images", routeFor("images")], ["Videos", routeFor("videos")]].filter(([, r]) => r);
   $("#ov-endpoints").innerHTML = ep.map(([n, r]) => `<div class="endpoint"><span class="muted">${n}</span><code>${esc(state.gateway_url + r.path)}</code><button class="btn quiet" data-copy="${esc(state.gateway_url + r.path)}">Copy</button></div>`).join("")
     + `<div class="endpoint"><span class="muted">Base URL</span><code>${esc(state.gateway_url)}/v1</code><button class="btn quiet" data-copy="${esc(state.gateway_url)}/v1">Copy</button></div>`;
   $$("[data-copy]").forEach(b => b.onclick = () => navigator.clipboard.writeText(b.dataset.copy).then(() => toast("Copied")));
   const jobs = state.media.jobs.slice(0, 8);
-  $("#ov-jobs").innerHTML = jobs.length ? jobs.map(j => `<div class="job">${j.preview ? `<img src="${esc(j.preview)}" alt="" loading="lazy">` : '<div class="ph"></div>'}
+  $("#ov-jobs").innerHTML = jobs.length ? jobs.map(j => `<div class="job">${j.preview ? `<img src="${esc(j.preview)}" alt="" loading="lazy" data-job="${esc(j.id)}">` : '<div class="ph"></div>'}
     <div><div class="p">${esc(j.prompt)}</div><div class="muted small">${esc(j.model)}, ${esc(j.size)}, ${statusText(j)}</div></div>
     <div class="row">${j.status === "in_progress" || j.status === "queued" ? `<button class="btn quiet warn" data-cancel="${j.id}">Cancel</button>` : j.files[0] ? `<a class="btn quiet" href="${esc(j.files[0])}" target="_blank">Open</a>` : ""}</div></div>`).join("")
     : '<div class="empty">Nothing generated yet. Try the Playground.</div>';
-  $$("#ov-jobs img").forEach((img, i) => img.onclick = () => openViewer(jobs[i].id));
-  const now = state.media.jobs.find(j => j.status === "in_progress") || state.media.jobs.find(j => j.status === "queued");
+  $$("#ov-jobs img[data-job]").forEach(img => img.onclick = () => openViewer(img.dataset.job));
+  const all = [...state.media.jobs, ...priv];
+  const now = all.find(j => j.status === "in_progress") || all.find(j => j.status === "queued");
   $("#now-block").hidden = !now;
   if (now) {
-    const active = now;
-    $("#now").innerHTML = `<div class="now"><div class="ph"></div><div><div class="p" style="margin-bottom:6px">${esc(active.prompt)}</div>
+    const active = now, hidden = !("prompt" in now);
+    $("#now").innerHTML = `<div class="now"><div class="ph"></div><div><div class="p" style="margin-bottom:6px">${hidden ? "Incognito request" : esc(active.prompt)}</div>
       <div class="meter"><div style="width:${active.progress}%;background:var(--gpu)"></div></div>
-      <div class="muted small" style="margin-top:6px">${esc(active.kind)} on ${esc(active.model)}, ${esc(active.size)}: ${statusText(active)}</div></div>
+      <div class="muted small" style="margin-top:6px">${hidden ? esc(active.kind) : `${esc(active.kind)} on ${esc(active.model)}, ${esc(active.size)}`}: ${statusText(active)}</div></div>
       <button class="btn warn" data-cancel="${active.id}">Cancel</button></div>`;
   }
-  const busy = state.media.jobs.filter(j => j.status === "in_progress" || j.status === "queued").length;
+  const busy = all.filter(j => j.status === "in_progress" || j.status === "queued").length;
   $("#gallery-count").hidden = !busy; $("#gallery-count").textContent = busy;
-  $$("[data-cancel]").forEach(b => b.onclick = () => api(`/api/jobs/${b.dataset.cancel}/cancel`, {method: "POST"}).then(refresh));
+  $$("[data-cancel]").forEach(b => b.onclick = () => api(`/api/jobs/${b.dataset.cancel}/cancel`, {method: "POST"}).then(refresh, e => toast(e.message, true)));
   if ($("#v-gallery").classList.contains("on")) renderGallery(state.media.jobs);
   $("#cfg-path").textContent = "Configuration: " + state.config_path;
 }
@@ -1229,10 +1281,13 @@ function addMsg(role, text = "") {
   $("#msgs").append(el); el.scrollIntoView({block: "end"}); return el;
 }
 async function sendChat() {
+  if (chatAbort) return; // one reply at a time; Enter must not start a second
   const text = $("#chat-input").value.trim(); if (!text) return;
   $("#chat-input").value = ""; autoGrow(); $("#chat-send").disabled = true;
   chatAbort = new AbortController(); $("#chat-stop").hidden = false;
-  chatLog.push({role: "user", content: text}); addMsg("user", text);
+  chatLog.push({role: "user", content: text}); const sent = addMsg("user", text);
+  // A turn that produced nothing leaves the conversation; its bubble says so.
+  const unsend = () => { chatLog.pop(); sent.classList.add("unsent"); sent.title = "Not part of the conversation: the model did not answer it"; if (!$("#chat-input").value) { $("#chat-input").value = text; autoGrow(); } };
   const el = addMsg("assistant"), body = $(".body", el), think = $(".think", el), meta = $(".meta", el);
   meta.textContent = state?.llm?.state === "ready" ? "Thinking..." : "Loading the model (the first reply takes longer)...";
   const t0 = performance.now(); let content = "", reasoning = "", tokens = 0, drawn = 0;
@@ -1270,8 +1325,8 @@ async function sendChat() {
     if (e.name === "AbortError") {
       renderReply(el, content);
       meta.textContent = "Stopped.";
-      if (content) chatLog.push({role: "assistant", content}); else chatLog.pop();
-    } else { meta.textContent = ""; body.innerHTML = `<span style="color:var(--bad)">${esc(e.message)}</span>`; chatLog.pop(); }
+      if (content) chatLog.push({role: "assistant", content}); else unsend();
+    } else { meta.textContent = ""; body.innerHTML = `<span style="color:var(--bad)">${esc(e.message)}</span>`; unsend(); }
   }
   chatAbort = null; $("#chat-stop").hidden = true;
   $("#chat-send").disabled = false; refresh();
@@ -1316,6 +1371,7 @@ function dropzone(k, input, max) {
   const zone = $(`#${k}-drop`), label = $(`#${k}-drop-label`), initial = label.textContent;
   const show = () => {
     const files = [...input.files].slice(0, max);
+    $$(`#${k}-ref-preview img`).forEach(i => URL.revokeObjectURL(i.src));
     $(`#${k}-ref-preview`).innerHTML = files.map(f => `<img src="${URL.createObjectURL(f)}" alt="${esc(f.name)}">`).join("");
     label.textContent = files.length ? `${files.length} image${files.length > 1 ? "s" : ""} (click to change, or drop others)` : initial;
     if (k === "img") $("#img-go").textContent = files.length ? "Edit" : "Generate";
@@ -1339,9 +1395,15 @@ function stageShow(k, item) {
   const stage = $(`#${k}-stage`);
   $$(".shown, .actions", stage).forEach(x => x.remove());
   $(`#${k}-empty`).hidden = true;
+  $(".expiry", stage)?.remove(); $(".gone", stage)?.remove();
   const media = item.video ? `<video class="shown" src="${esc(item.url)}" poster="${esc(item.poster || "")}" controls autoplay loop playsinline></video>` : `<img class="shown" src="${esc(item.url)}" alt="${esc(item.prompt)}">`;
+  if (item.expires) stage.insertAdjacentHTML("afterbegin", `<div class="expiry">Incognito: deleted at ${new Date(item.expires).toLocaleTimeString([], {hour: "numeric", minute: "2-digit"})}. Save it to keep it.</div>`);
   stage.insertAdjacentHTML("afterbegin", media + `<div class="actions"><a class="btn" href="${esc(item.url)}" target="_blank">Open</a><a class="btn" href="${esc(item.url)}" download>Save</a><button class="btn" type="button" data-reuse>Reuse prompt</button></div>`);
   $("[data-reuse]", stage).onclick = () => { $(`#${k}-prompt`).value = item.prompt; $(`#${k}-prompt`).focus(); };
+  $(".shown", stage).onerror = () => {
+    $$(".shown, .actions, .expiry", stage).forEach(x => x.remove());
+    stage.insertAdjacentHTML("afterbegin", `<div class="gone">${item.expires ? "This incognito result has been deleted, as incognito results are after a while." : "This file is no longer there."}</div>`);
+  };
   $$(`#${k}-strip button`).forEach(b => b.setAttribute("aria-pressed", b.dataset.url === item.url));
 }
 function stageAdd(k, items) {
@@ -1362,15 +1424,18 @@ function progress(k, text, pct) {
 }
 let imgJobId = null, vidJobId = null;
 function watchJob(kind) {
-  // The synchronous image call gives no progress; the job list does.
+  // The synchronous image call gives no progress; the job list does (and the
+  // progress-only list of incognito jobs).
   const tick = setInterval(() => {
-    const j = state?.media?.jobs?.find(j => j.kind === kind && (j.status === "in_progress" || j.status === "queued"));
+    const j = [...(state?.media?.jobs || []), ...(state?.media?.private || [])].find(j => j.kind === kind && (j.status === "in_progress" || j.status === "queued"));
     if (j) { imgJobId = j.id; progress("img", j.status === "queued" ? "Waiting for the GPU" : `${j.progress.toFixed(0)}%, ${j.stage.replace(/_/g, " ")}`, j.progress); }
   }, 700);
   return () => { clearInterval(tick); progress("img", null); imgJobId = null; };
 }
-$("#img-cancel").onclick = () => imgJobId && api(`/api/jobs/${imgJobId}/cancel`, {method: "POST"}).then(refresh);
-$("#vid-cancel").onclick = () => vidJobId && api(`/api/jobs/${vidJobId}/cancel`, {method: "POST"}).then(refresh);
+$("#img-cancel").onclick = () => imgJobId && api(`/api/jobs/${imgJobId}/cancel`, {method: "POST"}).then(refresh, e => toast(e.message, true));
+$("#vid-cancel").onclick = () => vidJobId && api(`/api/jobs/${vidJobId}/cancel`, {method: "POST"}).then(refresh, e => toast(e.message, true));
+// Incognito results are deleted this long after they finish (see media.rs).
+const expiry = kind => saved?.privacy?.incognito ? Date.now() + (kind === "vid" ? 30 : 10) * 60000 : 0;
 $("#img-form").onsubmit = async e => {
   e.preventDefault();
   const body = {prompt: $("#img-prompt").value, model: $("#img-model").value || undefined, size: $("#img-size").value, n: +$("#img-n").value || 1, memory: imgTier, response_format: "url"};
@@ -1382,7 +1447,7 @@ $("#img-form").onsubmit = async e => {
   $("#img-go").disabled = true; progress("img", "Starting", 1); const stop = watchJob("image");
   try {
     const r = await api(refs.length ? "/api/play/edits" : "/api/play/images", {method: "POST", body});
-    stageAdd("img", r.data.map(d => ({url: fileUrl(d.url), prompt: body.prompt})));
+    stageAdd("img", r.data.map(d => ({url: fileUrl(d.url), prompt: body.prompt, expires: expiry("img")})));
   } catch (err) { toast(err.message, true); }
   stop(); $("#img-go").disabled = false; refresh();
 };
@@ -1404,7 +1469,7 @@ $("#vid-form").onsubmit = async e => {
     if (v.status !== "completed") throw new Error(v.error?.message || "the video failed");
     await refresh();
     const j = state.media.jobs.find(j => j.id === v.id);
-    stageAdd("vid", [{url: j?.files?.[0] || fileUrl(`/api/play/videos/${v.id}/content`), poster: j?.preview, prompt: body.prompt, video: true}]);
+    stageAdd("vid", [{url: j?.files?.[0] || fileUrl(`/api/play/videos/${v.id}/content`), poster: j?.preview, prompt: body.prompt, video: true, expires: expiry("vid")}]);
   } catch (err) { toast(err.message, true); }
   vidJobId = null; progress("vid", null); $("#vid-go").disabled = false;
 };
@@ -1415,7 +1480,7 @@ async function refreshGallery() { try { galleryJobs = keyed((await api("/api/job
 function renderGallery(fresh) {
   if (fresh) { const byId = new Map(galleryJobs.map(j => [j.id, j])); fresh.forEach(j => byId.set(j.id, j)); galleryJobs = [...byId.values()].sort((a, b) => b.created_at - a.created_at); }
   const pick = {all: () => true, image: j => j.kind === "image", video: j => j.kind === "video",
-    active: j => j.status === "in_progress" || j.status === "queued", failed: j => j.status === "failed" || j.status === "cancelled"}[galleryFilter];
+    active: j => j.status === "in_progress" || j.status === "queued", failed: j => j.status === "failed"}[galleryFilter];
   const items = galleryJobs.filter(pick);
   $("#gallery").innerHTML = items.length ? items.map(j => {
     const done = j.status === "completed";
@@ -1450,7 +1515,11 @@ function openViewer(id) {
     $(`#${tab === "video" ? "vid" : "img"}-prompt`).value = j.prompt;
     $("#viewer").close(); show("play"); $(`#v-play .ptabs button[data-tab=${tab}]`).click();
   };
-  $("#viewer-delete").onclick = async () => { await api(`/api/jobs/${j.id}`, {method: "DELETE"}); galleryJobs = galleryJobs.filter(x => x.id !== j.id); $("#viewer").close(); renderGallery(); refresh(); };
+  if (!j.status.match(/completed|failed|cancelled/)) $("#viewer-delete").textContent = "Cancel and remove";
+  $("#viewer-delete").onclick = async () => {
+    try { await api(`/api/jobs/${j.id}`, {method: "DELETE"}); } catch (e) { return toast(e.message, true); }
+    galleryJobs = galleryJobs.filter(x => x.id !== j.id); $("#viewer").close(); renderGallery(); refresh();
+  };
   $("#viewer").showModal();
 }
 $("#viewer-close").onclick = () => $("#viewer").close();

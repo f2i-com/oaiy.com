@@ -86,6 +86,13 @@ impl ReviewPrefix {
 }
 
 impl Observer {
+    /// Drop the remembered reviews and the reused prompt prefix (after an
+    /// incognito request, whose tool calls they would describe).
+    pub fn forget(&mut self) {
+        self.prefix = None;
+        self.results.clear();
+    }
+
     pub fn load(path: &Path, device: usize, vram_gb: usize) -> Result<Self> {
         Self::load_shared(path, device, vram_gb, false)
     }

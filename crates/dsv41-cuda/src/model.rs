@@ -528,6 +528,9 @@ pub struct GpuModel {
     /// and the tokens they came from.
     usage: Vec<u32>,
     usage_tokens: u64,
+    /// An incognito request is running: nothing about its tokens goes to the
+    /// route log or the usage counts.
+    private: bool,
     // cross-layer hand-offs (reference SharedAttentionRuntime)
     shared: Shared,
     compress_src: Option<usize>,
@@ -741,6 +744,7 @@ impl GpuModel {
             pass_stats: PassStats::default(),
             usage: vec![0; cfg.n_layers * cfg.n_routed_experts],
             usage_tokens: 0,
+            private: false,
             shared: Shared::default(),
             compress_src: None,
             index_k_src: None,
@@ -823,7 +827,13 @@ impl GpuModel {
         Ok(())
     }
     pub fn trace_phase(&mut self, request: u64, phase: &str, token: Option<u32>, text: &str) {
+        if self.private { return; }
         if let Some(log) = &mut self.route_log { log.context(request, phase, token, text); }
+    }
+    /// Incognito: while on, routes are neither traced nor counted into the
+    /// usage profile.
+    pub fn set_private(&mut self, on: bool) {
+        self.private = on;
     }
     pub fn flush_route_log(&mut self) -> Result<()> {
         if let Some(log) = &mut self.route_log { log.flush()?; }
@@ -1144,7 +1154,7 @@ impl GpuModel {
         let mask: Vec<bool> = img_rows.iter().map(Option::is_some).collect();
         let any_image = mask.contains(&true);
         self.image_mask.clear();
-        self.usage_tokens += t as u64;
+        if !self.private { self.usage_tokens += t as u64; }
         let hashes = self.hasher.forward_masked(ids, start_pos, any_image.then_some(&mask[..]))?;
         let mut h_host = vec![0.0f32; t * HC * d];
         for (i, &id) in ids.iter().enumerate() {
@@ -1282,8 +1292,10 @@ impl GpuModel {
             let Dev { g, dcache, .. } = &mut self.devs[self.cur];
             let logits = g.download(&ly.gate.forward(g, &x2_all.as_view(), t, Out::F32)?)?;
             let routes = route_mixed(&self.cfg, &logits, &ly.bias, image_bias(ly, &mask), t);
-            if let Some(log) = &mut self.route_log { log.routes(l, start_pos, &routes, self.ternary)?; }
-            note_usage(&mut self.usage, n_exp, l, &routes);
+            if !self.private {
+                if let Some(log) = &mut self.route_log { log.routes(l, start_pos, &routes, self.ternary)?; }
+                note_usage(&mut self.usage, n_exp, l, &routes);
+            }
             let mut used: Vec<u32> = routes.iter().flat_map(|r| r.experts.iter().copied()).collect();
             used.sort_unstable();
             used.dedup();
@@ -1509,7 +1521,7 @@ impl GpuModel {
         let any_image = mask.contains(&true);
         // the router (moe) reads it; set before anything can fail half-way
         self.image_mask = if any_image { mask.clone() } else { Vec::new() };
-        self.usage_tokens += t as u64;
+        if !self.private { self.usage_tokens += t as u64; }
         let hashes = self.hasher.forward_masked(ids, start_pos, any_image.then_some(&mask[..]))?;
         let mut emb = vec![0.0f32; t * d];
         for (i, &id) in ids.iter().enumerate() {
@@ -1969,8 +1981,10 @@ impl GpuModel {
             (g.download(&ly.gate.forward(g, &x.as_view(), t, Out::F32)?)?, None)
         };
         let routes = route_mixed(&self.cfg, &logits, &ly.bias, image_bias(ly, &self.image_mask), t);
-        if let Some(log) = &mut self.route_log { log.routes(l, self.route_position, &routes, self.ternary)?; }
-        note_usage(&mut self.usage, n_exp, l, &routes);
+        if !self.private {
+            if let Some(log) = &mut self.route_log { log.routes(l, self.route_position, &routes, self.ternary)?; }
+            note_usage(&mut self.usage, n_exp, l, &routes);
+        }
         let prof = self.profile.is_some();
         let elapsed = |t0: Option<Instant>| -> Result<f64> {
             match t0 {

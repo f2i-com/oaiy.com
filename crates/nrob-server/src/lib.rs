@@ -400,7 +400,11 @@ pub fn start_listening(mut o: Options, listening: impl FnOnce(SocketAddr)) -> nr
                         let keep = server.handle(req, w);
                         requests.last.store(requests.now(), Ordering::Relaxed);
                         requests.active.fetch_sub(1, Ordering::Relaxed);
-                        if request_log && req.path != "/health" && !api::incognito_request(req, None) {
+                        // A body can ask for incognito too; only a body that
+                        // mentions it is parsed again to find out.
+                        let private = api::incognito_request(req, None)
+                            || (req.body.windows(9).any(|w| w == b"incognito") && api::incognito_request(req, nrob::json::Json::parse(&req.body).ok().as_ref()));
+                        if request_log && req.path != "/health" && !private {
                             eprintln!("{peer} {} {} ({:.1}s)", req.method, req.path, t.elapsed().as_secs_f64());
                         }
                         keep

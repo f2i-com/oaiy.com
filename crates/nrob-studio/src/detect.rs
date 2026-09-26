@@ -153,8 +153,8 @@ fn read_gguf(path: &Path, max_tensors: usize) -> Result<Gguf, String> {
         Some(match t {
             0 | 1 | 7 => 1,
             2 | 3 => 2,
-            4 | 5 | 6 => 4,
-            10 | 11 | 12 => 8,
+            4..=6 => 4,
+            10..=12 => 8,
             _ => return None,
         })
     }

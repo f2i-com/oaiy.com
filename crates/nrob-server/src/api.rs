@@ -404,7 +404,7 @@ impl Server {
 /// Whether a request asked to leave nothing behind: `"incognito": true` in its
 /// body, or an `X-NROB-Incognito: 1` header.
 pub fn incognito_request(req: &Request, body: Option<&Json>) -> bool {
-    req.header("x-nrob-incognito").is_some_and(|v| matches!(v.trim(), "1" | "true" | "yes"))
+    req.header("x-nrob-incognito").is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
         || body.and_then(|b| b.get("incognito")).and_then(Json::as_bool) == Some(true)
 }
 

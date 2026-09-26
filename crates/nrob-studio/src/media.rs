@@ -626,6 +626,32 @@ impl Media {
         self.lock().iter().rev().filter(|j| !j.incognito).cloned().collect()
     }
 
+    /// Unfinished incognito jobs as progress only: no prompt, model or files,
+    /// so the UI can show that the GPU is busy (and offer Cancel) without
+    /// listing what the job is.
+    pub fn private_activity(&self) -> Json {
+        Json::Arr(
+            self.lock()
+                .iter()
+                .filter(|j| j.incognito && !j.finished())
+                .map(|j| {
+                    Json::obj([
+                        ("id", Json::str(&j.id)),
+                        ("kind", Json::str(j.kind.name())),
+                        ("status", Json::str(&j.status)),
+                        ("progress", Json::Num(j.progress)),
+                        ("stage", Json::str(&j.stage)),
+                    ])
+                })
+                .collect(),
+        )
+    }
+
+    /// The job on the GPU now, if any (incognito included): kind and progress.
+    pub fn running(&self) -> Option<(Kind, f64)> {
+        self.lock().iter().find(|j| j.status == "in_progress").map(|j| (j.kind, j.progress))
+    }
+
     /// Chat requests holding the LLM right now.
     pub fn chats_active(&self) -> usize {
         self.broker.lock().unwrap_or_else(|p| p.into_inner()).chats
@@ -652,7 +678,9 @@ impl Media {
         let due: Vec<String> = self
             .lock()
             .iter()
-            .filter(|j| j.finished() && (j.forget || j.expires_at.is_some_and(|t| now() >= t)))
+            // An incognito job cancelled while queued never reached the runner
+            // that stamps `expires_at`: nothing is left to deliver, so it goes.
+            .filter(|j| j.finished() && (j.forget || j.expires_at.map_or(j.incognito, |t| now() >= t)))
             .map(|j| j.id.clone())
             .collect();
         for id in due {
@@ -901,9 +929,7 @@ impl Media {
                                 j.stage = stage;
                             });
                         }
-                    } else {
-                        if !incognito { self.log.push(format!("{id}: {line}")); }
-                    }
+                    } else if !incognito { self.log.push(format!("{id}: {line}")); }
                     tail = line.chars().take(4096).collect();
                 }
                 last_error.unwrap_or(tail)
@@ -1087,8 +1113,13 @@ mod tests {
         assert!(job.incognito);
         assert!(m.list().is_empty(), "incognito jobs are not listed");
         assert!(m.get(&job.id).is_some(), "but their owner can poll them by id");
+        let private = m.private_activity();
+        assert_eq!(private.len(), 1, "the UI still learns that something runs");
+        assert!(private.at(0).unwrap().get("prompt").is_none(), "but not what");
+        // Cancelled while queued, it never reached the runner that stamps an
+        // expiry; the next sweep takes it anyway.
         m.cancel(&job.id);
-        m.update(&job.id, |j| j.expires_at = Some(0));
+        assert!(m.get(&job.id).unwrap().expires_at.is_none());
         m.sweep();
         assert!(m.get(&job.id).is_none());
         assert!(!dir.exists(), "its folder is gone");

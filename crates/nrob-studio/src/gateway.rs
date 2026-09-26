@@ -122,16 +122,22 @@ pub fn handle(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, m: Matched
             let scratch = scratch_for(studio, req, Some(&b));
             images_openai(studio, req, b, trusted, scratch)
         })),
-        ("edits", _) if m.rest.is_empty() => {
-            // Multipart bodies carry the flag as a field, so the header or the
-            // global mode decides where uploads land; JSON bodies may set it too.
-            let json = if multipart(req) { None } else { Json::parse(&req.body).ok() };
-            let scratch = scratch_for(studio, req, json.as_ref());
-            send(w, edit_body(studio, req, scratch.as_deref()).and_then(|b| {
-                let scratch = scratch.or_else(|| scratch_for(studio, req, Some(&b)));
-                images_openai(studio, req, b, trusted, scratch)
-            }))
-        }
+        ("edits", _) if m.rest.is_empty() => send(w, edit_body(req).and_then(|(mut b, uploads)| {
+            // Everything is parsed and checked before anything is written, so
+            // uploads land in the right folder (an `incognito` form field
+            // counts) and a rejected request leaves no files behind.
+            check_image_body(&b)?;
+            let scratch = scratch_for(studio, req, Some(&b));
+            if !uploads.is_empty() {
+                let saved = save_uploads(studio, scratch.as_deref(), uploads).inspect_err(|_| {
+                    if let Some(s) = &scratch {
+                        let _ = std::fs::remove_dir_all(s);
+                    }
+                })?;
+                crate::util::set(&mut b, "images", Json::Arr(saved));
+            }
+            images_openai(studio, req, b, trusted, scratch)
+        })),
         ("images", "nrob") | ("videos", "nrob") => {
             let kind = if m.target == "images" { Kind::Image } else { Kind::Video };
             send(w, nrob_jobs(studio, req, kind, &m.rest, trusted))
@@ -170,7 +176,7 @@ fn proxy(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, upstream: &str)
     if let Some(a) = req.header("accept") {
         headers.push(("Accept", a));
     }
-    if incognito_mode(studio) || req.header("x-nrob-incognito").is_some() {
+    if incognito_mode(studio) || incognito_header(req) {
         headers.push(("X-NROB-Incognito", "1"));
     }
     let response = match fetch(&endpoint.addr, &req.method, upstream, &headers, &req.body, UPSTREAM_READ) {
@@ -256,20 +262,41 @@ fn content_type(path: &std::path::Path) -> &'static str {
     }
 }
 
-/// `bytes=a-b`, `bytes=a-` or `bytes=-n` against a file of `len` bytes, as
-/// `(start, end_inclusive)`; `None` when unsatisfiable or not one range.
-fn byte_range(header: &str, len: u64) -> Option<(u64, u64)> {
-    let spec = header.trim().strip_prefix("bytes=")?;
-    if spec.contains(',') || len == 0 {
-        return None;
+#[derive(Debug, PartialEq)]
+enum Range {
+    /// No usable range (absent, several, malformed, another unit): send it all.
+    Whole,
+    /// `(start, end_inclusive)`.
+    Part(u64, u64),
+    /// A well-formed range that misses the file: 416.
+    Unsatisfiable,
+}
+
+/// `bytes=a-b`, `bytes=a-` or `bytes=-n` against a file of `len` bytes. What
+/// cannot be served as one range is ignored, as RFC 9110 allows.
+fn byte_range(header: &str, len: u64) -> Range {
+    let parsed = (|| {
+        let spec = header.trim().strip_prefix("bytes=")?;
+        if spec.contains(',') {
+            return None;
+        }
+        let (a, b) = spec.split_once('-')?;
+        let num = |s: &str| s.parse::<u64>().ok();
+        Some(match (a.trim(), b.trim()) {
+            ("", "") => return None,
+            ("", n) => (None, num(n)?),
+            (a, "") => (Some(num(a)?), u64::MAX),
+            (a, b) => (Some(num(a)?), num(b)?),
+        })
+    })();
+    let Some((start, end)) = parsed else { return Range::Whole };
+    match start {
+        None if end == 0 || len == 0 => Range::Unsatisfiable,
+        None => Range::Part(len.saturating_sub(end), len - 1),
+        Some(s) if end < s => Range::Whole,
+        Some(s) if s >= len => Range::Unsatisfiable,
+        Some(s) => Range::Part(s, end.min(len - 1)),
     }
-    let (a, b) = spec.split_once('-')?;
-    let (start, end) = match (a.trim(), b.trim()) {
-        ("", n) => (len.saturating_sub(n.parse().ok()?), len - 1),
-        (a, "") => (a.parse().ok()?, len - 1),
-        (a, b) => (a.parse().ok()?, b.parse::<u64>().ok()?.min(len - 1)),
-    };
-    (start <= end && start < len).then_some((start, end))
 }
 
 /// A file, copied in pieces rather than read whole, with `Range` support so
@@ -280,14 +307,17 @@ pub fn serve_file(w: &mut TcpStream, path: &std::path::Path, download: bool, ran
     let len = file.metadata()?.len();
     let name = path.file_name().map(|n| n.to_string_lossy().replace(['"', '\r', '\n'], "")).unwrap_or_default();
     let disposition = format!("{}; filename=\"{name}\"", if download { "attachment" } else { "inline" });
-    let mut extra = vec![("Content-Disposition", disposition), ("Cache-Control", "max-age=3600".into()), ("Accept-Ranges", "bytes".into())];
-    let (status, start, count) = match range.map(|r| byte_range(r, len)) {
-        None => (200, 0, len),
-        Some(Some((a, b))) => {
+    // Incognito output must not outlive its job in the browser's cache either.
+    let private = path.components().any(|c| c.as_os_str() == ".incognito");
+    let cache = if private { "no-store" } else { "max-age=3600" };
+    let mut extra = vec![("Content-Disposition", disposition), ("Cache-Control", cache.into()), ("Accept-Ranges", "bytes".into())];
+    let (status, start, count) = match range.map_or(Range::Whole, |r| byte_range(r, len)) {
+        Range::Whole => (200, 0, len),
+        Range::Part(a, b) => {
             extra.push(("Content-Range", format!("bytes {a}-{b}/{len}")));
             (206, a, b - a + 1)
         }
-        Some(None) => {
+        Range::Unsatisfiable => {
             let head = [("Content-Range", format!("bytes */{len}"))];
             let head: Vec<(&str, &str)> = head.iter().map(|(k, v)| (*k, v.as_str())).collect();
             respond_with(w, 416, "text/plain", &head, b"", true)?;
@@ -309,6 +339,11 @@ pub fn files(studio: &Studio, req: &Request, w: &mut TcpStream, rel: &str) -> io
     }
 }
 
+/// `X-NROB-Incognito: 1` (or `true`, `yes`).
+fn incognito_header(req: &Request) -> bool {
+    req.header("x-nrob-incognito").is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+}
+
 /// Whether the studio runs in incognito mode (`privacy.incognito`).
 pub fn incognito_mode(studio: &Studio) -> bool {
     studio.config().get("privacy").is_some_and(|p| bool_or(p, "incognito", false))
@@ -318,26 +353,28 @@ pub fn incognito_mode(studio: &Studio) -> bool {
 /// `"incognito": true`), a private folder its job writes everything into and
 /// that is deleted with it; `None` otherwise.
 fn scratch_for(studio: &Studio, req: &Request, body: Option<&Json>) -> Option<PathBuf> {
-    let asked = req.header("x-nrob-incognito").is_some_and(|v| matches!(v.trim(), "1" | "true" | "yes"))
+    let asked = incognito_header(req)
         || body.and_then(|b| b.get("incognito")).and_then(Json::as_bool) == Some(true);
     (incognito_mode(studio) || asked).then(|| studio.output_root().join(".incognito").join(crate::util::random_id("")))
 }
 
-/// An edit request as the JSON an image job takes. Multipart files are saved
-/// under the output root and passed by path; text fields become strings or
-/// numbers. Files can arrive only as files: a text field cannot name a path.
-fn edit_body(studio: &Studio, req: &Request, scratch: Option<&std::path::Path>) -> Result<Json, Reply> {
+/// Uploaded reference images: extension and bytes, checked but not yet saved.
+type Uploads = Vec<(&'static str, Vec<u8>)>;
+
+/// An edit request as the JSON an image job takes, plus any multipart files
+/// (saved later by `save_uploads`, which puts their paths in `images`). Text
+/// fields become strings or numbers. Files can arrive only as files: a text
+/// field cannot name a path.
+fn edit_body(req: &Request) -> Result<(Json, Uploads), Reply> {
     if req.method != "POST" {
         return Err(fail(405, "use POST"));
     }
     const NO_MASK: &str = "mask is not supported: Qwen Image edits the whole picture from the instruction in the prompt";
     let ctype = req.header("content-type").unwrap_or("");
+    let mut uploads = Vec::new();
     let body = if multipart(req) {
         let parts = crate::multipart::parse(ctype, &req.body).map_err(|e| fail(400, e))?;
-        let dir = scratch.map_or_else(|| studio.output_root().join("inputs"), |s| s.join("inputs"));
-        std::fs::create_dir_all(&dir).map_err(|e| fail(500, e.to_string()))?;
         let mut fields: Vec<(String, Json)> = Vec::new();
-        let mut images = Vec::new();
         for p in parts {
             let name = p.name.trim_end_matches("[]").to_string();
             match name.as_str() {
@@ -348,9 +385,7 @@ fn edit_body(studio: &Studio, req: &Request, scratch: Option<&std::path::Path>) 
                     if p.data.len() > 32 << 20 {
                         return Err(fail(400, "reference images are limited to 32 MiB"));
                     }
-                    let path = dir.join(format!("{}.{ext}", crate::util::random_id("ref_")));
-                    std::fs::write(&path, &p.data).map_err(|e| fail(500, e.to_string()))?;
-                    images.push(Json::str(path.to_string_lossy()));
+                    uploads.push((ext, p.data));
                 }
                 _ if p.filename.is_some() => return Err(fail(400, format!("unexpected file field {name}"))),
                 _ => {
@@ -371,7 +406,6 @@ fn edit_body(studio: &Studio, req: &Request, scratch: Option<&std::path::Path>) 
                 }
             }
         }
-        fields.push(("images".into(), Json::Arr(images)));
         Json::Obj(fields)
     } else {
         let body = parse_body(req)?;
@@ -381,10 +415,40 @@ fn edit_body(studio: &Studio, req: &Request, scratch: Option<&std::path::Path>) 
         body
     };
     let count: usize = ["images", "image"].iter().filter_map(|k| body.get(k)).map(|v| v.as_array().map_or(1, <[Json]>::len)).sum();
-    if count == 0 {
+    if count + uploads.len() == 0 {
         return Err(fail(400, "an edit needs at least one image"));
     }
-    Ok(body)
+    Ok((body, uploads))
+}
+
+/// Write checked uploads under `scratch/inputs` (incognito) or the output
+/// root's `inputs/`, returning their paths.
+fn save_uploads(studio: &Studio, scratch: Option<&std::path::Path>, uploads: Uploads) -> Result<Vec<Json>, Reply> {
+    let dir = scratch.map_or_else(|| studio.output_root().join("inputs"), |s| s.join("inputs"));
+    std::fs::create_dir_all(&dir).map_err(|e| fail(500, e.to_string()))?;
+    let mut saved: Vec<PathBuf> = Vec::new();
+    for (ext, data) in uploads {
+        let path = dir.join(format!("{}.{ext}", crate::util::random_id("ref_")));
+        if let Err(e) = std::fs::write(&path, &data) {
+            for p in &saved {
+                let _ = std::fs::remove_file(p);
+            }
+            return Err(fail(500, e.to_string()));
+        }
+        saved.push(path);
+    }
+    Ok(saved.iter().map(|p| Json::str(p.to_string_lossy())).collect())
+}
+
+/// The request fields `images_openai` rejects, checked up front.
+fn check_image_body(body: &Json) -> Result<(), Reply> {
+    if !matches!(body.get("response_format").and_then(Json::as_str), None | Some("b64_json" | "url")) {
+        return Err(fail(400, "response_format must be b64_json or url"));
+    }
+    if body.get("output_format").and_then(Json::as_str).is_some_and(|f| f != "png") {
+        return Err(fail(400, "output_format: this server writes png"));
+    }
+    Ok(())
 }
 
 /// Multipart edits carry files the gateway saved itself, so their paths are safe.
@@ -397,19 +461,19 @@ fn images_openai(studio: &Arc<Studio>, req: &Request, body: Json, trusted: bool,
     if req.method != "POST" {
         return Err(fail(405, "use POST"));
     }
-    let format = match body.get("response_format").and_then(Json::as_str) {
-        None => "b64_json",
-        Some(f @ ("b64_json" | "url")) => f,
-        Some(_) => return Err(fail(400, "response_format must be b64_json or url")),
-    };
-    if body.get("output_format").and_then(Json::as_str).is_some_and(|f| f != "png") {
-        return Err(fail(400, "output_format: this server writes png"));
-    }
+    check_image_body(&body)?;
+    let format = body.get("response_format").and_then(Json::as_str).unwrap_or("b64_json");
     let job = submit_image(studio, &body, trusted || multipart(req), scratch)?;
     let done = studio.media.wait(&job.id, IMAGE_WAIT).ok_or_else(|| fail(500, "the job disappeared"))?;
     if done.status != "completed" {
         if done.incognito {
-            studio.media.purge(&done.id);
+            // Still running after the wait: stop it too, or its scratch folder
+            // would vanish under a worker nobody can cancel any more.
+            if done.finished() {
+                studio.media.purge(&done.id);
+            } else {
+                studio.media.remove(&done.id);
+            }
         }
         return Err(fail(if done.status == "in_progress" { 504 } else { 500 }, done.error.unwrap_or_else(|| format!("image job {}", done.status))));
     }
@@ -630,13 +694,18 @@ mod tests {
 
     #[test]
     fn byte_ranges_follow_rfc_7233() {
-        assert_eq!(byte_range("bytes=0-99", 1000), Some((0, 99)));
-        assert_eq!(byte_range("bytes=500-", 1000), Some((500, 999)));
-        assert_eq!(byte_range("bytes=-100", 1000), Some((900, 999)));
-        assert_eq!(byte_range("bytes=990-2000", 1000), Some((990, 999)));
-        assert_eq!(byte_range("bytes=1000-", 1000), None);
-        assert_eq!(byte_range("bytes=0-1,5-9", 1000), None);
-        assert_eq!(byte_range("items=0-1", 1000), None);
+        assert_eq!(byte_range("bytes=0-99", 1000), Range::Part(0, 99));
+        assert_eq!(byte_range("bytes=500-", 1000), Range::Part(500, 999));
+        assert_eq!(byte_range("bytes=-100", 1000), Range::Part(900, 999));
+        assert_eq!(byte_range("bytes=-5000", 1000), Range::Part(0, 999));
+        assert_eq!(byte_range("bytes=990-2000", 1000), Range::Part(990, 999));
+        assert_eq!(byte_range("bytes=1000-", 1000), Range::Unsatisfiable);
+        assert_eq!(byte_range("bytes=-0", 1000), Range::Unsatisfiable);
+        // Several ranges, other units and nonsense are ignored: the whole file.
+        assert_eq!(byte_range("bytes=0-1,5-9", 1000), Range::Whole);
+        assert_eq!(byte_range("items=0-1", 1000), Range::Whole);
+        assert_eq!(byte_range("bytes=9-3", 1000), Range::Whole);
+        assert_eq!(byte_range("bytes=x-", 1000), Range::Whole);
     }
 
     #[test]

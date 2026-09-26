@@ -163,6 +163,7 @@ impl Studio {
             ("media", Json::obj([
                 ("busy", Json::Bool(self.media.busy())),
                 ("jobs", Json::Arr(self.media.list().iter().take(60).map(|j| j.to_json(&root)).collect())),
+                ("private", self.media.private_activity()),
             ])),
         ])
     }

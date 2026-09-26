@@ -77,8 +77,12 @@ pub fn base64_decode(text: &str) -> Result<Vec<u8>, String> {
 
 /// The last `cap` lines of a subprocess's (or the studio's own) log, numbered
 /// so a poller can ask for what it has not seen.
+/// Numbered, timestamped lines: `(number, unix millis, text)`.
+type Lines = VecDeque<(u64, u64, String)>;
+
 pub struct LogRing {
-    lines: Mutex<(u64, VecDeque<(u64, u64, String)>)>,
+    /// The last number handed out, and the lines kept.
+    lines: Mutex<(u64, Lines)>,
     cap: usize,
 }
 

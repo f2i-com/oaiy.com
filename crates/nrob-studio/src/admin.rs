@@ -58,7 +58,10 @@ pub fn handle(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, port: u16)
         }
     }
     // Reached from another machine: the gateway key guards the controls too.
-    let remote = !(ui_host == "localhost" || ui_host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback()));
+    // This machine's own clients (the app window, a second launch looking for
+    // this one) connect over loopback and are let through, as on a local bind.
+    let exposed = !(ui_host == "localhost" || ui_host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback()));
+    let remote = exposed && !w.peer_addr().is_ok_and(|a| a.ip().is_loopback() || a.ip().to_canonical().is_loopback());
     let key = cfg.get("gateway").map_or("", |g| str_or(g, "api_key", "")).to_string();
     let route = req.route().to_string();
     if remote && route != "/" && !key.is_empty() {
@@ -163,7 +166,7 @@ pub fn handle(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, port: u16)
         ("POST", "/api/models/import") => body(req).map_err(|e| (400, e)).and_then(|doc| {
             let replace = req.query("mode").as_deref() == Some("replace");
             let mut next = cfg.clone();
-            let report = registry::import(&mut next, &doc, replace).map_err(|e| (400, e))?;
+            let report = registry::import(&mut next, &doc, replace, &studio.root).map_err(|e| (400, e))?;
             studio.set_config(next).map_err(|e| (400, e))?;
             studio.log.push(format!("imported models ({})", if replace { "replaced" } else { "merged" }));
             Ok(report)

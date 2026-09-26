@@ -11,10 +11,18 @@
 #[cfg(windows)]
 mod tray;
 
+/// Added to the "Start with Windows" command line: a sign-in start stays
+/// quiet, with no balloon. Not an `nrob-studio` option, so it is taken out
+/// before the rest are parsed.
+pub const AUTOSTART_FLAG: &str = "--autostarted";
+
 fn main() {
     #[cfg(windows)]
     tray::dpi_aware();
-    let args = match nrob_studio::parse_args_from(std::env::args().skip(1)) {
+    let mut argv: Vec<String> = std::env::args().skip(1).collect();
+    let autostarted = argv.iter().any(|a| a == AUTOSTART_FLAG);
+    argv.retain(|a| a != AUTOSTART_FLAG);
+    let args = match nrob_studio::parse_args_from(argv.into_iter()) {
         Ok(a) => a,
         Err(e) => fail(&e),
     };
@@ -42,7 +50,9 @@ fn main() {
         nrob_studio::open_ui(&running.ui_url, &running.open);
     }
     #[cfg(windows)]
-    tray::run(running, silent);
+    tray::run(running, silent && !autostarted);
+    #[cfg(not(windows))]
+    let _ = autostarted;
     #[cfg(not(windows))]
     {
         eprintln!("nrob-studio-tray: the notification-area icon is Windows-only; serving as nrob-studio does");
