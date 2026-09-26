@@ -48,6 +48,11 @@ const SUB_AGENT_STEPS = 40;
 /** Sub-agent tasks one run may start. */
 const MAX_TASKS_PER_RUN = 24;
 
+/** For the agent that plans (the main one): plan before changing anything. */
+const PLAN_GUIDE = `
+
+Plan first: when you are given a task (anything that will change files: building or changing an app, a feature, a fix across files), call update_plan with the goal and 3 to 8 concrete steps that break the task down before you change anything, and update it as each step starts and finishes; the user watches that checklist. Then carry the plan out step by step. The task is done when every step is done and checked.`;
+
 const DELEGATE_GUIDE = `
 
 Sub-agents: for a big task that splits into independent parts, hand the parts to sub-agents with delegate. Each gets a fresh, smaller context and only the instructions you give it, so write each task to stand on its own (what to do, which files it may change, what to report) and keep tasks on separate files. Plan first, give each task the plan step it completes, then check and join the results yourself. Small tasks are quicker to do directly.`;
@@ -88,7 +93,7 @@ The user's project lives in a virtual filesystem in the browser; "/" is the proj
 - SoftN apps: a SoftN app is a folder whose manifest.json names a .ui page as "main" (with ui/*.ui pages and logic/*.logic or .py). A project can hold several, each in its own folder: to rebuild or learn from an existing app, read its files and write the new one in another folder. A .softn the user attaches is unpacked into its own folder (the original stays in uploads/, and softn_import unpacks any .softn in the project): when they ask for changes, edit that folder; when they ask to recreate, redo or base something on it, write a new app in a new folder and leave the original as it is. The SoftN reference is in your tools, so do not guess the language: softn_docs with no arguments gives the map, topic "guide" is the writing guide (read it before your first app), search finds how something is done across the guides, the components and the example apps; softn_components gives exact props and events; softn_examples has complete working apps to read or copy. Keep manifest.json true. After each step that changes an app, bot.computer checks it automatically (its files, then a real render) and adds the outcome to that step's result: when it reports errors, fix them before anything else. softn_check checks on demand; softn_inspect shows what the page displays; softn_interact uses the app like a person (click, fill, select, press keys) and reports errors the app raises, so test that the app works, not just that it renders. The user watches the app in a live preview as you build it, and can export any app folder as a .softn file.
 - web_fetch, curl, fetch() go through the user's network gate (/internet) and, from a browser, only reach sites that allow cross-origin requests. If the gate refuses a host, say so; the user decides whether to allow it.
 
-Work toward the user's goal, on your own, until it is reached. When you are given a task (anything that will change files: building or changing an app, a feature, a fix across files), plan first: call update_plan with the goal and 3 to 8 concrete steps that break the task down, before you change anything, and update it as each step starts and finishes; the user watches that checklist. Then carry the plan out step by step without stopping to ask for permission; ask the user only when you truly cannot decide something yourself. You are done when every step is done and the result is checked (for an app: it renders without errors and softn_interact shows it working), not before.
+Work toward the goal on your own until it is reached, without stopping to ask for permission; ask only when you truly cannot decide something yourself. You are done when the work is done and checked (for an app: it renders without errors and softn_interact shows it working), not before.
 
 Work in small, verified steps. Prefer running code to check a claim over guessing. When you are done, say briefly what you changed and what you verified.`;
 
@@ -318,7 +323,7 @@ export class Agent {
   }
 
   private get systemPrompt(): string {
-    return `${SYSTEM_PROMPT}${this.canDelegate ? DELEGATE_GUIDE : ''}${this.options.role ?? ''}`;
+    return `${SYSTEM_PROMPT}${this.canPlan ? PLAN_GUIDE : ''}${this.canDelegate ? DELEGATE_GUIDE : ''}${this.options.role ?? ''}`;
   }
 
   /** The prompt's fixed part: the system prompt and the tool definitions. */
@@ -489,6 +494,9 @@ export class Agent {
       if (chars > tailChars && keepFrom < view.length) break;
       keepFrom = i;
     }
+    // One turn on its own (a huge first message): there is nothing before it to summarize, and
+    // summarizing it would replace the request itself; trimming handles it.
+    if (keepFrom >= view.length) return;
     while (keepFrom > 0 && view[keepFrom]?.role === 'tool') keepFrom--;
     const old = view.slice(0, keepFrom);
     // Nothing old enough to summarize (one huge recent step, or only the last summary): trimming handles it.

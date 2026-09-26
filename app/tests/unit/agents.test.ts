@@ -115,6 +115,10 @@ describe('sub-agents', () => {
     expect(tools).not.toContain('delegate');
     expect(tools).not.toContain('update_plan');
     expect(JSON.stringify(sub.messages)).toContain('Write pages/a.txt saying A.');
+    // Its instructions do not mention tools it does not have; the main agent's do.
+    const system = (b: Record<string, unknown>) => JSON.stringify((b.messages as unknown[])[0]);
+    expect(system(sub)).not.toMatch(/update_plan|delegate/);
+    expect(system(bodies.find((b) => b.who === 'main')!.body)).toContain('Plan first');
     expect(JSON.stringify(sub.messages)).toContain('Project: two pages');
     // The main agent's context holds the reports, not the sub-agents' work.
     const report = (agent.turns.find((t) => t.role === 'tool' && t.results.some((r) => r.name === 'delegate')) as Extract<(typeof agent.turns)[number], { role: 'tool' }>).results.find((r) => r.name === 'delegate')!;

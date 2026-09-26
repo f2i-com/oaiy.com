@@ -106,3 +106,17 @@ describe('when the server says the prompt is too long', () => {
     expect(events.at(-1)).toMatchObject({ type: 'done', text: 'Done after compacting.' });
   });
 });
+
+describe('a single huge message', () => {
+  it('is not summarized away: the request stays, trimmed if need be', async () => {
+    const provider: ProviderConfig = { ...OPENAI, contextTokens: 12_000 };
+    const { script, summaries } = scripted([{ text: 'Got it.' }]);
+    fakeProvider('openai', script);
+    const agent = new Agent({ vfs: new Vfs(), gate: new NetGate(), provider: () => provider, projectSummary: () => 'p' });
+    const events: AgentEvent[] = [];
+    await agent.run(`Please look at this log:\n${'2026-09-26 12:00:00 INFO something happened\n'.repeat(2500)}`, (e) => events.push(e));
+    expect(summaries()).toBe(0);
+    expect(agent.turns.some((t) => t.role === 'user' && t.summary)).toBe(false);
+    expect(events.at(-1)).toMatchObject({ type: 'done', text: 'Got it.' });
+  });
+});

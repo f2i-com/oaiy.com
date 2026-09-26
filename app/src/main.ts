@@ -261,7 +261,7 @@ async function main(): Promise<void> {
     if (windowsChecked.has(key)) return;
     windowsChecked.add(key);
     if (p.type !== 'anthropic' && p.detectedContext?.model !== p.modelId) {
-      const found = await detectContextWindow(p).catch(() => null);
+      const found = await detectContextWindow(p, AbortSignal.timeout(5000)).catch(() => null);
       if (found) {
         p.detectedContext = { model: p.modelId, tokens: found.tokens, how: found.how, at: Date.now() };
         await saveProviders(providers, activeId);
