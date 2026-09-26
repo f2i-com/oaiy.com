@@ -60,8 +60,10 @@ const stampServiceWorker = {
 
 export default defineConfig({
   plugins: [softnHeaders, stampServiceWorker],
-  server: { headers: isolation },
-  preview: { headers: isolation },
+  // One fixed port, so a local server (nrob) can allow bot.computer by its origin, http://localhost:5317.
+  // src-tauri/target is Cargo's: its files are locked while it builds the desktop app.
+  server: { port: 5317, strictPort: true, headers: isolation, watch: { ignored: ['**/src-tauri/**'] } },
+  preview: { port: 5317, strictPort: true, headers: isolation },
   worker: { format: 'es' },
   build: {
     target: 'es2022',

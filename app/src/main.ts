@@ -51,8 +51,11 @@ A coding agent that lives entirely in this browser tab.
  * gets them from the service worker, once it controls the page. The app does
  * not start on that visit, so nothing half-done is left behind.
  */
+/** The desktop app (Tauri): it serves the page with the headers itself, and ships its files, so no service worker. */
+const DESKTOP = location.hostname === 'botcomputer.localhost' || location.protocol === 'botcomputer:' || '__TAURI_INTERNALS__' in window;
+
 async function registerServiceWorker(): Promise<boolean> {
-  if (!('serviceWorker' in navigator) || import.meta.env.DEV) return false;
+  if (!('serviceWorker' in navigator) || import.meta.env.DEV || DESKTOP) return false;
   try {
     await navigator.serviceWorker.register(`${import.meta.env.BASE_URL}sw.js`);
   } catch {
@@ -819,6 +822,20 @@ With that done, Settings → Images and video → Find nrob sets it up.`);
     if (document.visibilityState === 'hidden') saveNow();
   });
   window.addEventListener('pagehide', saveNow);
+  // The desktop app's Quit (tray menu, or closing with "keep running" off): stop the
+  // agent, write everything, then tell the app it may exit.
+  if (DESKTOP) {
+    (window as unknown as { __botComputerBeforeQuit: () => Promise<void> }).__botComputerBeforeQuit = async () => {
+      try {
+        controller?.abort();
+        editor.flush();
+        await project.flush();
+        await project.saveChat(agent.turns);
+      } finally {
+        await (window as unknown as { __TAURI_INTERNALS__?: { invoke: (cmd: string) => Promise<unknown> } }).__TAURI_INTERNALS__?.invoke('ready_to_quit');
+      }
+    };
+  }
   window.addEventListener('beforeunload', (e) => {
     saveNow();
     if (controller || project.dirty) e.preventDefault();

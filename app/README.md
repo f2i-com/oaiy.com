@@ -42,7 +42,7 @@ The results appear in the chat (a video gets a player) and in the project, where
   - If nrob answers, its image and video models, their limits (sizes, edits, seconds) and its defaults fill **Settings → Images and video**.
   - nrob is also added as a chat provider if none points at it yet. It becomes the active one only if nothing else is.
   - Found again later, its model lists are refreshed. Your chosen models and key stay.
-- **nrob has to allow the page.** Without an API key, nrob answers only the origins listed in `gateway.cors_origins` in its config. Add bot.computer's address there (the chat says which one), or set an API key in nrob and type it in Settings. Then press **Find nrob**.
+- **nrob allows bot.computer.** Without an API key, nrob answers only the origins in `gateway.cors_origins` in its config. Its defaults include `https://bot.computer`, `http://localhost:5317` and the desktop app. Serving bot.computer from anywhere else means adding that address there (the chat says which one), or setting an API key in nrob and typing it in Settings. Then press **Find nrob**.
 - **Other services.** Type the address of any OpenAI-spec service (for example `https://api.openai.com/v1`) and its key, then **List models** and choose. Images use `/images/generations` and `/images/edits`. Video uses `/videos` and follows the job until it's done.
 - **While it works.** The chat shows a video's progress. Stopping the agent cancels the job. The models' limits are in the tools' descriptions, so the model asks for sizes and lengths the service can make.
 - **Privacy.** These requests go straight from the page to the service you set up, like requests to your AI provider. They are not behind the network gate. Keys are stored encrypted with the provider keys.
@@ -111,14 +111,44 @@ On a phone or a narrow window, the panes (Files, Editor, Preview, Terminal and A
 
 ## Run it
 
+bot.computer runs three ways. All three use the same build of the same web app.
+
+| | How | Where your projects live |
+|---|---|---|
+| **On the web** | Open it from any HTTPS host (the `dist/` folder is a static site). It installs as an app from the browser and works offline. | That browser's storage for the site |
+| **On this computer** | `npm start` builds it and serves it at http://localhost:5317 | That browser's storage for `localhost:5317` |
+| **Desktop app** | The installer from `npm run desktop:build` (Windows, macOS, Linux) | The app's own webview storage |
+
 ```sh
-npm install        # also fetches and verifies the Zipp engine (public/zipp/, not committed)
+npm install          # also fetches and verifies the Zipp engine (public/zipp/, not committed)
 npm run fetch:softn  # optional: SoftN's app preview runtime (public/softn/, not committed)
-npm run dev        # http://localhost:5173
-npm run build      # dist/: a static site; serve it from anywhere
+npm run dev          # develop: http://localhost:5317
+npm start            # build and serve locally: http://localhost:5317
+npm run build        # dist/: a static site; serve it from anywhere
+npm run desktop      # the desktop app, running from the dev server
+npm run desktop:build  # the desktop app and its installer (src-tauri/target/release/bundle/)
+node tests/e2e/desktop.mjs  # Windows: checks the built app in WebView2 (isolation, sandbox, tray, saving on quit)
 ```
 
-Serve bot.computer over `localhost` or HTTPS. The sandbox needs a cross-origin isolated page, because a Worker blocks on `SharedArrayBuffer` while the page answers its file and network calls. The dev and preview servers send the headers. On a static host, the service worker adds them to every response, and the page reloads itself once on the first visit.
+bot.computer always uses port 5317 (`strictPort`), so a local server can allow it by origin. nrob allows it by default.
+
+### The desktop app
+
+The desktop app is a [Tauri](https://tauri.app) v2 shell around the same `dist/`. It doesn't call any native commands. It runs in the system's webview: WebView2 on Windows, WebKit on macOS and Linux.
+
+- **Its own origin.** It serves the app from its own scheme: `http://botcomputer.localhost` on Windows, `botcomputer://localhost` elsewhere.
+- **Headers.** That scheme sends the headers the sandbox and the SoftN preview need (COOP, COEP, CORP, and CORS on `/softn/`), so it needs no service worker.
+- **Offline.** The installer includes the Zipp engine and the SoftN runtime, so it works offline from the first start.
+- **In the system tray.** Minimizing the window hides it in the tray, and so does closing it. Either way the agent keeps working in the background.
+  - Click the tray icon, or start the app again, to bring the window back. Only one copy runs at a time.
+  - The tray menu has **Open**, **Keep running when the window is closed** (on by default; switch it off to make closing quit), and **Quit**.
+  - Quit stops the agent and saves your files and chat before exiting.
+  - A hidden window isn't throttled, so long runs, video jobs and timers carry on at full speed.
+- **Links.** Links that leave the app open in your browser.
+- **Your data.** Projects, chats and settings live in the app's webview storage, separate from any browser.
+- **Building it** needs Rust and [Tauri's prerequisites](https://tauri.app/start/prerequisites/). On Windows the result is an NSIS installer (`bot.computer_<version>_x64-setup.exe`) that installs for the current user. It doesn't update itself: install a newer version over it.
+
+Serve the web app over `localhost` or HTTPS. The sandbox needs a cross-origin isolated page, because a Worker blocks on `SharedArrayBuffer` while the page answers its file and network calls. The dev and preview servers send the headers. On a static host, the service worker adds them to every response, and the page reloads itself once on the first visit.
 
 ### Connecting a local model
 

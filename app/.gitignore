@@ -7,3 +7,6 @@ public/zipp/
 public/softn/
 .softn-release/
 *.log
+# The desktop app (Tauri): build output and generated schemas.
+src-tauri/target/
+src-tauri/gen/

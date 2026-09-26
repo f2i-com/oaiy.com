@@ -14,6 +14,10 @@
     "dev": "vite",
     "build": "node scripts/fetch-zipp.mjs --ensure && tsc --noEmit && vite build",
     "preview": "vite preview",
+    "start": "npm run build && vite preview",
+    "build:desktop": "node scripts/fetch-softn.mjs --ensure && npm run build",
+    "desktop": "tauri dev",
+    "desktop:build": "tauri build",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:e2e": "node tests/e2e/run.mjs && node tests/e2e/app.mjs && node tests/e2e/files.mjs && node tests/e2e/softn.mjs && node tests/e2e/csp.mjs && node tests/e2e/nrob.mjs && node tests/e2e/static.mjs --build"
@@ -32,6 +36,7 @@
     "fflate": "^0.8.3"
   },
   "devDependencies": {
+    "@tauri-apps/cli": "^2.11.5",
     "puppeteer-core": "^24.22.0",
     "typescript": "^5.9.2",
     "vite": "^8.3.1",
