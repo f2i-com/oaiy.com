@@ -55,6 +55,7 @@ pub trait PromptState: Send + 'static {
     }
 }
 
+#[cfg(feature = "cuda")]
 impl PromptState for dsv41_cuda::Snapshot {
     fn pos(&self) -> usize {
         self.pos()
@@ -282,7 +283,7 @@ impl<S: PromptState> DiskCache<S> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cuda"))]
 mod tests {
     use super::*;
 

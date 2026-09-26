@@ -1,5 +1,6 @@
 //! Resident reviewer with bounded internal read/search tools. Architecture comes from GGUF metadata.
 //! Reviews are bounded and advisory; malformed/unfinished reviews never accept tools.
+#[cfg_attr(not(feature = "cuda"), allow(unused_imports))]
 use std::{path::Path, sync::{Arc, atomic::{AtomicBool, Ordering}}, time::{Duration, Instant}};
 use nrob::{Error, Result, json::Json};
 use ggml_rs::{Backend, Tensor};
@@ -88,6 +89,12 @@ impl Observer {
     pub fn load(path: &Path, device: usize, vram_gb: usize) -> Result<Self> {
         Self::load_shared(path, device, vram_gb, false)
     }
+    /// The observer runs on its own CUDA card; a build without CUDA has none.
+    #[cfg(not(feature = "cuda"))]
+    pub fn load_shared(_path: &Path, _device: usize, _vram_gb: usize, _shares_primary_gpu: bool) -> Result<Self> {
+        Err(err("the observer needs the CUDA build"))
+    }
+    #[cfg(feature = "cuda")]
     pub fn load_shared(path: &Path, device: usize, vram_gb: usize, shares_primary_gpu: bool) -> Result<Self> {
         let g = gguf::GgufFile::open(path).map_err(err)?;
         let backend = ggml_rs_cuda::CudaBackend::new(device).map_err(err)?;
@@ -196,7 +203,10 @@ impl Observer {
             logits = Some(self.model.forward(chunk, &mut self.kv));
             self.forwarded_tokens+=chunk.len();
             if self.prefix.is_none() && self.kv.len==CACHE_PREFIX && ids.len()>CACHE_PREFIX {
+                #[cfg(feature = "cuda")]
                 let cap=ggml_rs_cuda::host_memory().map(|(free,_)|free/8).unwrap_or(0).min(512usize<<20);
+                #[cfg(not(feature = "cuda"))]
+                let cap=0usize;
                 self.prefix=ReviewPrefix::capture(&ids[..CACHE_PREFIX],&self.kv,self.model.backend().as_ref(),cap);
             }
         }

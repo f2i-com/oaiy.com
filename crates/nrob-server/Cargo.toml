@@ -9,17 +9,34 @@ description = "OpenAI-compatible HTTP server for DeepSeek-V4.1-Flash on nrob"
 name = "nrob-server"
 path = "src/main.rs"
 
+# The same server without CUDA, for machines that lack it: GGUF models on any
+# WebGPU adapter (D3D12, Vulkan, Metal), else the CPU. Build it with
+#   cargo build --release -p nrob-server --no-default-features --features webgpu --bin nrob-server-webgpu
+# A CUDA build imports nvcuda.dll and would not start on such a machine, hence
+# a second executable rather than a runtime switch.
+[[bin]]
+name = "nrob-server-webgpu"
+path = "src/webgpu_main.rs"
+required-features = ["webgpu"]
+
+[features]
+default = ["cuda"]
+# DeepSeek-V4.1, OrcaSAQ (EXL3), the observer, and GGUF on NVIDIA GPUs.
+cuda = ["dep:dsv41-cuda", "dep:ggml-rs-cuda", "llama-rs/cuda"]
+# GGUF models with their quantized matmuls on WebGPU (see crates/ggml-rs-wgpu).
+webgpu = ["dep:ggml-rs-wgpu"]
+
 # std-only apart from the workspace crates (dsv41-cuda brings CUDA).
 [dependencies]
 nrob = { path = "../nrob" }
 dsv41 = { path = "../dsv41" }
-dsv41-cuda = { path = "../dsv41-cuda" }
+dsv41-cuda = { path = "../dsv41-cuda", optional = true }
 # VENDORED-LOCAL: GLM-5.3-Flash is served through llama-rs rather than dsv41-cuda,
-# so a second engine sits beside the DeepSeek one (see src/glm.rs). The CUDA
-# feature is not optional here: this server has never built without CUDA, because
-# dsv41-cuda is unconditional above.
-llama-rs = { path = "../llama-rs", features = ["cuda"] }
+# so a second engine sits beside the DeepSeek one (see src/glm.rs). Its CUDA
+# backend comes with this crate's `cuda` feature (on by default).
+llama-rs = { path = "../llama-rs" }
 tokenizer = { path = "../tokenizer" }
 gguf = { path = "../gguf" }
 ggml-rs = { path = "../ggml-rs" }
-ggml-rs-cuda = { path = "../ggml-rs-cuda" }
+ggml-rs-cuda = { path = "../ggml-rs-cuda", optional = true }
+ggml-rs-wgpu = { path = "../ggml-rs-wgpu", optional = true }

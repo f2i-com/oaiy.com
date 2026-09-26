@@ -32,7 +32,9 @@ use std::thread::JoinHandle;
 use nrob::{Error, Result};
 
 use crate::engine::Job;
-use crate::{api, disk, engine, glm, Options, STATE_FORMAT};
+use crate::{api, disk, glm, Options, STATE_FORMAT};
+#[cfg(feature = "cuda")]
+use crate::engine;
 
 pub(crate) fn needs_tool_precision(body: &nrob::json::Json) -> bool {
     use nrob::json::Json;
@@ -58,7 +60,7 @@ impl Kind {
     /// Recognize EXL3 Qwen checkpoints by config, GGUF by extension, then
     /// fall back to the existing DeepSeek checkpoint loader.
     pub fn detect(path: &Path) -> Kind {
-        if crate::orcasaq::detect(path) { return Kind::OrcaSaq; }
+        if orcasaq_checkpoint(path) { return Kind::OrcaSaq; }
         if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("gguf")) {
             return Kind::Gguf;
         }
@@ -383,9 +385,16 @@ impl Models {
         let t = std::time::Instant::now();
         self.say(format!("loading {} from {}", spec.name, spec.path.display()));
         let next = match spec.kind {
+            #[cfg(feature = "cuda")]
             Kind::Deepseek => self.load_deepseek(&spec),
-            Kind::Gguf => self.load_gguf(&spec),
+            #[cfg(feature = "cuda")]
             Kind::OrcaSaq => self.load_orcasaq(&spec),
+            #[cfg(not(feature = "cuda"))]
+            Kind::Deepseek | Kind::OrcaSaq => Err(Error::Arg(format!(
+                "{} is a DeepSeek or EXL3 checkpoint, which needs the CUDA build (nrob-server); this build serves GGUF models",
+                spec.name
+            ))),
+            Kind::Gguf => self.load_gguf(&spec),
         }
         .map_err(|e| format!("loading {}: {e}", spec.name))?;
         {
@@ -434,6 +443,7 @@ impl Models {
     }
 
     // ---------------------------------------------------------------- DeepSeek
+    #[cfg(feature = "cuda")]
     fn load_deepseek(&self, spec: &Spec) -> Result<Live> {
         use dsv41_cuda::{GpuModel, GpuOptions};
 
@@ -547,6 +557,7 @@ impl Models {
         })
     }
 
+    #[cfg(feature = "cuda")]
     fn load_orcasaq(&self, spec: &Spec) -> Result<Live> {
         let o=&self.opts;
         self.say(format!("loading {}: native EXL3 mixed precision",spec.name));
@@ -609,9 +620,10 @@ impl Models {
         // same instances the expert tier will use, so the trunk and card 0's expert
         // shard share one CUDA context rather than opening a second on that device.
         let devices = self.image_config.as_ref().filter(|c|c.controller_name==spec.name).map(|c|vec![c.controller_device]).unwrap_or_else(||o.devices.clone());
-        let cards = llama_rs::glm5next::device::open_cards(&devices)
-            .map_err(|e| Error::Arg(e.to_string()))?;
-        let backend: Arc<dyn ggml_rs::Backend> = Arc::clone(&cards[0]) as Arc<dyn ggml_rs::Backend>;
+        // CUDA cards in a CUDA build; WebGPU or the CPU without one.
+        let picked = crate::backend::open(o, &devices)?;
+        self.say(format!("{} runs on {}", spec.name, picked.label));
+        let backend: Arc<dyn ggml_rs::Backend> = Arc::clone(&picked.backend);
         let gguf = gguf::GgufFile::open(&path).map_err(|e| Error::Arg(e.to_string()))?;
         if gguf.get_str("general.architecture").ok() == Some("qwen35") {
             let model = llama_rs::Model::load(&gguf, Arc::clone(&backend)).map_err(|e| Error::Arg(e.to_string()))?;
@@ -662,6 +674,7 @@ impl Models {
                 budget as f64 / 1e9
             ));
         }
+        #[cfg_attr(not(feature = "cuda"), allow(unused_mut))]
         let mut model = llama_rs::Model::open_streaming(&path, backend, budget)
             .map_err(|e| Error::Arg(e.to_string()))?;
 
@@ -670,7 +683,8 @@ impl Models {
         // GLM-5.3-Flash is 0.686 s a token against 0.139 tiered, because then every
         // routed expert of every token crosses PCIe. Nothing else served here needs
         // asking, so the arch decides.
-        if let llama_rs::Model::Glm5Next(g) = &mut model {
+        #[cfg(feature = "cuda")]
+        if let (llama_rs::Model::Glm5Next(g), Some(cards)) = (&mut model, picked.cards) {
             g.enable_tiering(cards, 0).map_err(|e| Error::Arg(e.to_string()))?;
             if !o.quiet && !o.silent {
                 let (budgets, layers) = g.tier_layout();
@@ -759,6 +773,19 @@ impl Models {
 /// A hybrid model starts with its ternary expert bank selected. Its Q4 bank
 /// can still fill on demand, but the usage profile should warm the bank that
 /// serves prompt and prose turns immediately after startup.
+/// An OrcaSAQ checkpoint: Qwen3.5 quantized to EXL3 (see `orcasaq`). Read here
+/// rather than there so a build without CUDA still recognises one and says why
+/// it cannot serve it.
+fn orcasaq_checkpoint(path: &Path) -> bool {
+    std::fs::read(path.join("config.json")).ok().and_then(|b| nrob::json::Json::parse(&b).ok()).is_some_and(|c| {
+        c.get("model_type").and_then(nrob::json::Json::as_str) == Some("qwen3_5")
+            && c.get("quantization_config")
+                .and_then(|q| q.get("quant_method"))
+                .and_then(nrob::json::Json::as_str)
+                == Some("exl3")
+    })
+}
+
 fn startup_warm_profile(usage: Option<&Path>, tool_experts: bool) -> Option<(&Path, &'static str)> {
     usage.filter(|p| p.is_file())
         .map(|p| (p, if tool_experts { "ternary" } else { "model" }))

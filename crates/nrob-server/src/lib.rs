@@ -8,10 +8,24 @@
 //! OS, and `silent` keeps the server's log off the host's terminal.
 
 #![forbid(unsafe_code)]
+// Without CUDA the DeepSeek engine is compiled out, and with it the only callers
+// of its helpers (repetition and tool-phase guards, observer internals). The
+// default CUDA build still checks all of them for dead code.
+#![cfg_attr(not(feature = "cuda"), allow(dead_code))]
 
 mod api;
 mod disk;
+// The request/reply types every engine shares; `engine` is the DeepSeek-V4.1
+// worker, which needs CUDA. Without it the name still carries the shared types.
+mod job;
+#[cfg(feature = "cuda")]
 mod engine;
+#[cfg(not(feature = "cuda"))]
+mod engine {
+    pub use crate::job::*;
+}
+// Which backend runs GGUF models: CUDA, WebGPU or the CPU.
+mod backend;
 pub mod observer;
 mod tool_phase;
 mod repetition;
@@ -21,9 +35,13 @@ pub mod glm;
 pub mod models;
 mod http;
 mod qwen;
+// OrcaSAQ (EXL3 on CUDA), its PEFT adapters and its Qwen vision tower.
+#[cfg(feature = "cuda")]
 mod orcasaq;
+#[cfg(feature = "cuda")]
 mod lora;
 mod qwen_cache;
+#[cfg(feature = "cuda")]
 mod qwen_vision;
 pub mod images;
 mod media_catalog;
@@ -149,6 +167,12 @@ pub struct Options {
     pub quiet: bool,
     /// No log at all, not even at start (a host with its own UI).
     pub silent: bool,
+    /// Backend for GGUF models: `auto` (CUDA in a CUDA build, else WebGPU when
+    /// an adapter exists, else the CPU), `cuda`, `webgpu` or `cpu`.
+    pub backend: String,
+    /// Weight bytes WebGPU may hold, in GiB (it cannot report free memory);
+    /// `None` picks by adapter type.
+    pub webgpu_gb: Option<u64>,
 }
 
 impl Options {
@@ -163,7 +187,11 @@ impl Options {
     /// 32 GB when the machine will not say -- small enough to start anywhere, and
     /// `--ram-gb` is there for a caller who knows better.
     pub fn expert_cache_bytes(&self) -> u64 {
-        host_cache_budget(self.ram_gb, ggml_rs_cuda::host_memory().map(|(free, _)| free as u64))
+        #[cfg(feature = "cuda")]
+        let free = ggml_rs_cuda::host_memory().map(|(free, _)| free as u64);
+        #[cfg(not(feature = "cuda"))]
+        let free = None;
+        host_cache_budget(self.ram_gb, free)
     }
 }
 
@@ -213,6 +241,8 @@ impl Default for Options {
             local_images: None,
             quiet: false,
             silent: false,
+            backend: "auto".into(),
+            webgpu_gb: None,
         }
     }
 }

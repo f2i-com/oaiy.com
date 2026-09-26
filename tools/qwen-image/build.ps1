@@ -14,4 +14,9 @@ try {
     if ($LASTEXITCODE) { throw 'Native diffusion build failed.' }
     cargo build --release -p nrob-server
     if ($LASTEXITCODE) { throw 'NROB server build failed.' }
+    # The same server without CUDA, for machines that lack it (WebGPU, else CPU).
+    cargo build --release -p nrob-server --no-default-features --features webgpu --bin nrob-server-webgpu
+    if ($LASTEXITCODE) { throw 'NROB WebGPU server build failed.' }
+    cargo build --release -p nrob-studio
+    if ($LASTEXITCODE) { throw 'NROB Studio build failed.' }
 } finally { Pop-Location }
