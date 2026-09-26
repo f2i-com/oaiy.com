@@ -307,6 +307,16 @@ fn classify_header(h: &Header, path: &Path, format: &'static str) -> Result<Dete
         return Ok(d);
     }
     if let Some(family) = ltx_family(h) {
+        // Parts of an LTX release that the worker has no use for.
+        if config.contains("\"audio_vae\"") || has(h, "audio_vae.decoder.") {
+            return Err(format!("{label}: LTX audio VAE; nrob makes silent video, so it is not needed"));
+        }
+        if config.contains("CausalDiffusionVAE") || has(h, "decoder.diff_blocks.") {
+            return Err(format!("{label}: LTX {} diffusion-decoder VAE, which nrob does not run; use the conv VAE (ltx-2.5-video-vae-conv) instead", &family[4..]));
+        }
+        if config.contains("upsampler") || config.contains("upscaler") {
+            return Err(format!("{label}: LTX latent upscaler; nrob renders at the requested size in one pass"));
+        }
         let transformer = config.contains("\"transformer\"") || has(h, "transformer_blocks.");
         let vae = config.contains("\"vae\"") || has(h, "decoder.conv_in.");
         if transformer {
@@ -338,7 +348,9 @@ fn classify_header(h: &Header, path: &Path, format: &'static str) -> Result<Dete
         d.missing.push("base".into());
         return Ok(d);
     }
-    if h.metadata.get("gemma_config").is_some() {
+    // Gemma 4 for LTX 2.5: its config in the metadata, or (in re-quantized
+    // copies that drop it) the embedded tokenizer and LTX projection.
+    if h.metadata.get("gemma_config").is_some() || (has(h, "tokenizer_json") && has(h, "text_embedding_projection.video_aggregate_embed.")) {
         return Ok(detected(Role::Component { kind: "video_text_encoder" }, format,
             format!("Gemma text encoder for LTX 2.5 ({label})"), vec![("text_encoder", p)]));
     }
@@ -400,14 +412,22 @@ fn directory(dir: &Path) -> Result<Detected, String> {
         }
         return Err(format!("{label}: diffusers pipeline {class:?} is not one nrob runs"));
     }
-    // An LTX 2.5 release laid out as ComfyUI folders.
+    // An LTX 2.5 release laid out as ComfyUI folders. Each part is the first
+    // file in its folder that is that part (a folder may also hold an audio
+    // VAE, upscalers or GGUF variants nrob does not use).
     if dir.join("diffusion_models").is_dir() && dir.join("text_encoders").is_dir() {
         let first = |sub: &str| first_with_ext(&dir.join(sub), "safetensors");
+        let part = |sub: &str, kind: &'static str| {
+            let mut files: Vec<PathBuf> = std::fs::read_dir(dir.join(sub)).ok()?.flatten().map(|e| e.path())
+                .filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("safetensors"))).collect();
+            files.sort();
+            files.into_iter().find(|p| safetensors_file(p).is_ok_and(|d| d.role == Role::Component { kind }))
+        };
         if let Some(t) = first("diffusion_models") {
             let mut d = safetensors_file(&t)?;
             if let Role::Video { .. } = d.role {
-                for (sub, key) in [("text_encoders", "text_encoder"), ("vae", "vae")] {
-                    if let Some(p) = first(sub) {
+                for (sub, key, kind) in [("text_encoders", "text_encoder", "video_text_encoder"), ("vae", "vae", "vae")] {
+                    if let Some(p) = part(sub, kind) {
                         d.fields.retain(|(k, _)| k != key);
                         d.fields.push((key.into(), path_json(&p)));
                         d.missing.retain(|m| m != key);
@@ -607,5 +627,36 @@ mod tests {
         let tok = d.0.join("tokenizer.json");
         std::fs::write(&tok, r#"{"added_tokens":[{"content":"<|startoftext|>"}]}"#).unwrap();
         assert_eq!(detect(&tok).unwrap().kind(), "clip_tokenizer");
+    }
+
+    #[test]
+    fn a_quantized_ltx_release_folder_picks_the_parts_nrob_runs() {
+        let d = tmp("ltx-folder");
+        let root = d.0.join("LTX-2.5-finetune");
+        for sub in ["diffusion_models", "text_encoders", "vae"] {
+            std::fs::create_dir_all(root.join(sub)).unwrap();
+        }
+        let t = |name: &str, dtype: &str| format!(r#""{name}":{{"dtype":"{dtype}","shape":[1],"data_offsets":[0,1]}}"#);
+        // A bare-named fp8 transformer with its scales.
+        safetensors(&root.join("diffusion_models").join("ltx25-fp8_scaled.safetensors"), &format!(
+            r#"{{"__metadata__":{{"model_version":"2.5.0","config":"{{\"transformer\":{{}}}}"}},{},{}}}"#,
+            t("transformer_blocks.0.attn1.to_q.weight", "F8_E4M3"), t("transformer_blocks.0.attn1.to_q.weight_scale", "F32")));
+        // An int8 Gemma 4 without its gemma_config, known by tokenizer and projection.
+        let gemma = root.join("text_encoders").join("gemma4-int8.safetensors");
+        safetensors(&gemma, &format!("{{{},{},{}}}", t("tokenizer_json", "U8"), t("text_embedding_projection.video_aggregate_embed.weight", "I8"), t("model.layers.0.mlp.down_proj.weight", "I8")));
+        assert_eq!(detect(&gemma).unwrap().kind(), "video_text_encoder");
+        // Sorted first in vae/, but neither is a VAE nrob can use.
+        let audio = root.join("vae").join("a_audio_vae.safetensors");
+        safetensors(&audio, &format!(r#"{{"__metadata__":{{"model_version":"2.5.0","config":"{{\"audio_vae\":{{}}}}"}},{}}}"#, t("audio_vae.decoder.conv_in.conv.bias", "BF16")));
+        assert!(detect(&audio).unwrap_err().contains("audio VAE"));
+        let diffusion = root.join("vae").join("b_video_vae.safetensors");
+        safetensors(&diffusion, &format!(r#"{{"__metadata__":{{"model_version":"2.5.0","config":"{{\"vae\":{{\"_class_name\":\"CausalDiffusionVAE\"}}}}"}},{},{}}}"#, t("decoder.conv_in.weight", "BF16"), t("decoder.diff_blocks.0.x", "BF16")));
+        assert!(detect(&diffusion).unwrap_err().contains("diffusion-decoder"));
+        let r = detect(&root).unwrap();
+        assert_eq!(r.role, Role::Video { family: "ltx-2.5" });
+        let field = |k: &str| r.fields.iter().find(|(f, _)| f == k).map(|(_, v)| v.as_str().unwrap_or("").to_string());
+        assert!(field("text_encoder").unwrap().ends_with("gemma4-int8.safetensors"));
+        assert_eq!(field("vae"), None, "no usable VAE in the folder");
+        assert_eq!(r.missing, vec!["vae".to_string()]);
     }
 }

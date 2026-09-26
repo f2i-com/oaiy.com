@@ -145,6 +145,12 @@ impl StIndex {
         self.shards.len()
     }
 
+    /// Serve every tensor as `prefix` + its stored name, for checkpoints
+    /// saved without the prefix their loader expects.
+    pub fn prefix_names(&mut self, prefix: &str) {
+        self.tensors = std::mem::take(&mut self.tensors).into_iter().map(|(k, v)| (format!("{prefix}{k}"), v)).collect();
+    }
+
     pub fn names(&self) -> impl Iterator<Item = &str> {
         self.tensors.keys().map(String::as_str)
     }

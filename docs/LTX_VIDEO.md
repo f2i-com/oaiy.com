@@ -19,9 +19,32 @@ Sulphur validates the shared LTX 2.3 architecture.
 | [Sulphur-2](https://huggingface.co/SulphurAI/Sulphur-2-base) | `sulphur_distil_bf16.safetensors` | Same Gemma 3 encoder | Included in checkpoint |
 | [LTX 2.5](https://huggingface.co/Lightricks/LTX-2.5) | `diffusion_models/ltx-2.5-22b-distilled-transformer-bf16.safetensors` | `text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors`, including its tokenizer | `vae/ltx-2.5-video-vae-conv-bf16.safetensors` |
 
-Use the complete distilled checkpoints. The worker does not apply video LoRAs,
-interpret FP8/NVFP4/GGUF video weights, or run the LTX 2.5 diffusion decoder.
-It reads published BF16/F16/F32 safetensors directly without conversion.
+Use the complete distilled checkpoints. The worker reads published safetensors
+directly, without conversion:
+
+- **Weight types:** BF16, F16 and F32. It also reads fp8 (`F8_E4M3`) and int8 (`I8`)
+  weights, with or without the per-tensor (or per-row) `weight_scale` that
+  ComfyUI's scaled checkpoints store beside each weight. These keep their stored
+  size on disk and in the RAM tier, and become BF16 on the GPU, so a 21 GB fp8
+  transformer streams from SSD at half the bytes of its BF16 original.
+- **Key names:** transformers saved with bare names (`patchify_proj.weight`
+  rather than `model.diffusion_model.patchify_proj.weight`) load as they are.
+  The `model_version` and `config` metadata must still be there.
+
+The worker does not apply video LoRAs (merged checkpoints are fine), and does
+not interpret NVFP4 or GGUF video weights. It does not run the LTX 2.5
+diffusion-decoder VAE (`CausalDiffusionVAE`, with `decoder.diff_blocks.*`);
+the conv VAE decodes the same latents. Audio VAEs and latent upscalers that
+ship with a release are not used: output is silent and rendered in one pass
+at the requested size.
+
+For example, the merged
+LTX 2.5 v1.1 fine-tune
+release runs as `diffusion_models/ltx25_v1.1-fp8_scaled.safetensors`
+with `text_encoders/gemma4_12b_ltx25-int8.safetensors` (int8, with
+its tokenizer and LTX projection). Its VAE is the diffusion-decoder one, so pair
+it with the official `ltx-2.5-video-vae-conv-bf16.safetensors`. The studio
+does this itself when another LTX 2.5 model is already configured.
 LTX 2.5's Gemma 4 Unified path has distinct RMS normalization, attention scaling,
 global head dimensions, shared K/V projections and proportional rotary positions.
 It cannot use Gemma 3 as a substitute. Model licenses and access requirements are
@@ -185,6 +208,17 @@ exercise the real convolutional VAE. Opt-in reference tests compare Gemma 3
 local/global attention and a Sulphur video block against the official PyTorch implementations;
 the block test also requires identical RAM-cache and SSD-read results.
 PyTorch is only an offline verification tool, never an inference dependency.
+
+Quantized weights are covered separately:
+- Unit tests decode fp8 and int8 with scalar and per-row scales, from the RAM
+  tier and from disk.
+- The fp8 table matches the reference conversion for all 256 byte values.
+- An opt-in CUDA test checks that the GPU decode matches the CPU bit for bit.
+
+On 2026-09-26 the LTX 2.5 v1.1 fine-tune (fp8_scaled transformer,
+int8 Gemma 4, official conv VAE) was run on an RTX 5090 with `memory: auto`.
+It produced coherent 2-second 768x512 clips at 24 fps: text-to-video in 25 s,
+and image-to-video from a still in 21 s.
 
 Generate the reference activations with `tools/ltx/gemma_reference.py --gemma
 <gemma-file>` and `tools/ltx/dit_reference.py --checkpoint <distilled-file>
