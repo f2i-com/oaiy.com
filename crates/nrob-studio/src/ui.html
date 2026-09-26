@@ -612,6 +612,7 @@ dialog::backdrop { background: var(--backdrop); }
                 <div class="dropzone" id="vaud-drop" tabindex="0" role="button" aria-label="Drop an audio file here, or click to choose">
                   <span id="vaud-drop-label">Drop an audio file here, or click to choose</span>
                 </div>
+                <label class="f"><span>What is said (optional, helps the lips follow)</span><textarea id="vid-transcript" rows="2" placeholder="The words in the audio, if it is speech or singing."></textarea></label>
               </div>
               <span class="muted small" id="vid-follow-hint" hidden>Mouths and motion follow the soundtrack, which the clip keeps. Leave the length empty to match it (up to 5 seconds).</span>
               <input type="file" id="vid-image" accept="image/png,image/jpeg,image/webp" hidden>
@@ -1641,6 +1642,7 @@ $("#vid-form").onsubmit = async e => {
     const a = $("#vid-audio").files[0];
     if (!a) return toast("Choose an audio file, or pick another soundtrack", true);
     body.input_audio = await readAsDataUrl(a);
+    if ($("#vid-transcript").value.trim()) body.transcript = $("#vid-transcript").value.trim();
   }
   if (!body.seconds && !body.speech && !body.input_audio) body.seconds = "2";
   const f = $("#vid-image").files[0]; if (f) body.input_reference = {image_url: await readAsDataUrl(f)};

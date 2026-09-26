@@ -587,6 +587,16 @@ pub fn video_request(cfg: &Json, root: &Path, output_root: &Path, body: &Json, a
     if let Some(p) = audio_vae {
         f.push(("audio_vae".into(), Json::str(p)));
     }
+    if let Some(t) = body.get("transcript").and_then(Json::as_str).map(str::trim).filter(|t| !t.is_empty()) {
+        if t.len() > 4000 {
+            return Err("transcript is limited to 4000 bytes".into());
+        }
+        f.push(("transcript".into(), Json::str(t)));
+    }
+    if let Some(g) = body.get("a2v_guidance").filter(|v| !matches!(v, Json::Null)) {
+        let g = g.as_f64().filter(|g| (1.0..=10.0).contains(g)).ok_or("a2v_guidance must be a number from 1 to 10")?;
+        f.push(("a2v_guidance".into(), Json::Num(g)));
+    }
     // Without a length, the worker makes the clip as long as the soundtrack.
     let mut seconds = (frames - 1) as f64 / fps as f64;
     if !follows_audio || explicit_length {

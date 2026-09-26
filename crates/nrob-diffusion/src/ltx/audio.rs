@@ -656,6 +656,37 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires an audio VAE and a speech WAV; NROB_LTX_AUDIO_VAE, NROB_LTX_ROUNDTRIP_WAV (16-bit mono)"]
+    fn speech_survives_an_encode_decode_round_trip() -> Result<()> {
+        let weights = std::env::var("NROB_LTX_AUDIO_VAE").map_err(candle_core::Error::wrap)?;
+        let wav = std::fs::read(std::env::var("NROB_LTX_ROUNDTRIP_WAV").map_err(candle_core::Error::wrap)?)?;
+        let rate = u32::from_le_bytes([wav[24], wav[25], wav[26], wav[27]]) as usize;
+        let samples: Vec<f32> = wav[44..].chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.).collect();
+        let dev = Device::new_cuda(0)?;
+        let encoder = AudioEncoder::load(Path::new(&weights), &dev)?;
+        let frames = (samples.len() as f64 / rate as f64 * LATENT_RATE) as usize;
+        let latent = encoder.latent(&[samples.clone(), samples.clone()], rate, frames, &dev)?;
+        let decoder = AudioDecoder::load(Path::new(&weights), &dev)?;
+        let wave = decoder.decode(&latent)?.to_vec3::<f32>()?;
+        // Compare log-mels at 16 kHz, over the common length.
+        let back = resample(&wave[0][0], decoder.sample_rate, 16_000);
+        let orig = resample(&samples, rate, 16_000);
+        let n = back.len().min(orig.len());
+        let mel = |x: &[f32]| -> Result<Tensor> { encoder.mel(&Tensor::from_vec([x, x].concat(), (1, 2, n), &dev)?) };
+        let (a, b) = (mel(&orig[..n])?, mel(&back[..n])?);
+        let e = relative(&b, &a)?;
+        let corr = {
+            let (a, b) = (a.flatten_all()?.to_vec1::<f32>()?, b.flatten_all()?.to_vec1::<f32>()?);
+            let (ma, mb) = (a.iter().sum::<f32>() / a.len() as f32, b.iter().sum::<f32>() / b.len() as f32);
+            let cov: f32 = a.iter().zip(&b).map(|(x, y)| (x - ma) * (y - mb)).sum();
+            cov / (a.iter().map(|x| (x - ma).powi(2)).sum::<f32>().sqrt() * b.iter().map(|y| (y - mb).powi(2)).sum::<f32>().sqrt())
+        };
+        println!("round trip: {frames} latent frames, log-mel relative error {e:.3}, correlation {corr:.3}");
+        assert!(corr > 0.8, "the round trip lost the speech: correlation {corr}");
+        Ok(())
+    }
+
+    #[test]
     fn resampling_keeps_length_and_tone() {
         // 24 kHz to 16 kHz: torchaudio's length rule, and a 1 kHz tone stays one.
         let x: Vec<f32> = (0..24_000).map(|i| (2. * std::f32::consts::PI * 1000. * i as f32 / 24_000.).sin()).collect();

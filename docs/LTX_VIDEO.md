@@ -275,6 +275,8 @@ The audio VAE files of all three models include the encoder. Request fields:
 |---|---|
 | `audio_file` | An absolute path to any audio FFmpeg reads, up to 256 MiB (at most 60 s is read). |
 | `speech` | A complete `kind: "speech"` worker request (see [Speech](SPEECH.md)). The worker speaks it first, frees the TTS model, and follows the result: a saved voice, an OpenAI voice name or a described one. |
+| `transcript` | The words in `audio_file`, if known. They, or the speech's own text, are added to the prompt as `They say: "…"`. Without the words, the distilled models take little lip movement from the sound alone. |
+| `a2v_guidance` | Audio-to-video guidance, 1 to 10 (default 3; 1 turns it off). Each step also runs without the audio-video cross-attention, and the picture moves away from that result. This is the reference's modality guidance. It doubles the denoising time. |
 | `frames` | Optional with a soundtrack. Without it, the clip is as long as the soundtrack: whole frames at `fps`, snapped down to 8k+1, from 9 to 121. |
 
 A soundtrack needs `audio_vae` and keeps `audio` on. The result reports

@@ -382,6 +382,7 @@ struct AudioStep<'a> {
     audio_gate: Tensor,
     rope: &'a Rope,
     video_cross: &'a Rope,
+    isolated: bool,
 }
 /// Audio and video attend to each other. Both directions read the states
 /// from before either update, so their order does not matter.
@@ -418,7 +419,7 @@ fn av_block(
     let am = a.modulation.broadcast_add(w.get(AUDIO.table)?)?;
     let vx = attend(w, &VIDEO, vx, context, &vm, prompt, rope)?;
     let ax = attend(w, &AUDIO, ax, a.context, &am, a.prompt.as_ref(), a.rope)?;
-    let (vx, ax) = cross(w, vx, ax, a)?;
+    let (vx, ax) = if a.isolated { (vx, ax) } else { cross(w, vx, ax, a)? };
     Ok((feed(w, &VIDEO, vx, &vm)?, feed(w, &AUDIO, ax, &am)?))
 }
 
@@ -447,6 +448,9 @@ pub struct AudioInput<'a> {
     /// The audio stream's own sigma: the video's while both are denoised, 0
     /// when the audio is a fixed condition (a soundtrack the picture follows).
     pub sigma: f64,
+    /// Skip the audio-video cross-attention in every block (both ways): the
+    /// "isolated modality" pass that audio-to-video guidance contrasts with.
+    pub isolated: bool,
 }
 
 pub struct Transformer {
@@ -644,11 +648,11 @@ mod tests {
         let rope = Rope::video_with_end(1, 4, 4, 24, false, &dev)?;
         let video_cross = Rope::video_cross(1, 4, 4, 24, false, &dev)?;
         let audio_rope = Rope::audio(6, &dev)?;
-        let audio = AudioInput { latent: &ax, context: &actx, rope: &audio_rope, video_cross: &video_cross, sigma: 0.725 };
+        let audio = AudioInput { latent: &ax, context: &actx, rope: &audio_rope, video_cross: &video_cross, sigma: 0.725, isolated: false };
         let (video, audio) = model.forward(&x, &context, 0.725, &rope, 4, 0, Some(audio), |_| {})?;
         let (first_video, first_audio) = (model.first_hidden.clone().unwrap(), model.first_audio_hidden.clone().unwrap());
         // The same pass with the audio frozen as a condition (sigma 0 throughout).
-        let frozen = AudioInput { latent: &ax, context: &actx, rope: &audio_rope, video_cross: &video_cross, sigma: 0. };
+        let frozen = AudioInput { latent: &ax, context: &actx, rope: &audio_rope, video_cross: &video_cross, sigma: 0., isolated: false };
         let (frozen_video, frozen_audio) = model.forward(&x, &context, 0.725, &rope, 4, 0, Some(frozen), |_| {})?;
         let checks = [
             ("first block, video", first_video, read("av-block0-video.f32", &[1, 16, 4096])?, 0.01),
@@ -874,6 +878,7 @@ impl Transformer {
                 audio_gate: time_embedding(&self.global, "av_ca_v2a_gate_adaln_single", sigma, dev)?.0,
                 rope: a.rope,
                 video_cross: a.video_cross,
+                isolated: a.isolated,
             };
             let ax = self.global.linear("audio_patchify_proj", a.latent)?;
             audio_state = Some((step, ax, audio_embedded));

@@ -282,7 +282,10 @@ The clip can also follow a soundtrack, and it keeps that soundtrack. See
   from clip to clip.
 
 Without `seconds` or `frames`, such a clip is as long as its soundtrack, up to
-121 frames.
+121 frames. With `input_audio`, send `transcript` (the words) when the audio is
+speech or singing: the words go into the prompt, which is what moves the lips.
+Speech's own text is added automatically. `a2v_guidance` (1-10, default 3)
+sets the audio-to-video guidance.
 
 Local paths are accepted from the UI only, and `file_id` is not supported.
 Extensions: `frames`, `fps`, `seed`, `memory`, `ram_gb`, `vram_gb`.

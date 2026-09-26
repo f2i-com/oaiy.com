@@ -43,9 +43,18 @@ pub struct Request {
     pub audio_file: Option<PathBuf>,
     /// Speech to make first and follow: a `kind: "speech"` worker request.
     pub speech: Option<Json>,
+    /// The words in `audio_file`, if known. They (or the speech's text) are
+    /// added to the prompt: the models move lips much more readily when the
+    /// prompt says what is spoken.
+    pub transcript: Option<String>,
     /// No length was asked for: the clip is as long as the soundtrack (up to
     /// 121 frames).
     pub frames_from_audio: bool,
+    /// Audio-to-video guidance while following a soundtrack: each step also
+    /// runs without the audio-video cross-attention and pushes the picture
+    /// away from that (the reference's modality guidance, 3 by default; 1 is
+    /// off). It is what makes mouths follow the words.
+    pub a2v_guidance: f64,
     pub output: PathBuf,
     pub prompt: String,
     pub image: Option<PathBuf>,
@@ -105,11 +114,13 @@ impl Request {
                 None | Some(Json::Null) => None,
                 Some(v) => Some(v.as_str().filter(|s| !s.trim().is_empty()).ok_or("audio_file must be an absolute local path")?.into()),
             },
+            transcript: j.get("transcript").and_then(Json::as_str).map(str::trim).filter(|t| !t.is_empty()).map(str::to_owned),
             speech: match j.get("speech") {
                 None | Some(Json::Null) => None,
                 Some(v @ Json::Obj(_)) => Some(v.clone()),
                 Some(_) => return Err("speech must be a speech request object".into()),
             },
+            a2v_guidance: j.get("a2v_guidance").and_then(Json::as_f64).unwrap_or(3.0),
             frames_from_audio: j.get("frames").is_none() && (j.get("audio_file").is_some_and(|v| !matches!(v, Json::Null)) || j.get("speech").is_some_and(|v| !matches!(v, Json::Null))),
             output: s("output_dir")?.into(),
             prompt: s("prompt")?,
@@ -204,8 +215,14 @@ impl Request {
         if (self.audio_file.is_some() || self.speech.is_some()) && !self.audio {
             return Err("a soundtrack to follow needs the model's audio stream; leave audio on".into());
         }
+        if !(1.0..=10.0).contains(&self.a2v_guidance) {
+            return Err("a2v_guidance must be between 1 and 10".into());
+        }
         if self.audio_file.is_some() && self.speech.is_some() {
             return Err("give audio_file or speech, not both".into());
+        }
+        if self.transcript.as_ref().is_some_and(|t| t.len() > 4000) {
+            return Err("transcript is limited to 4000 bytes".into());
         }
         if let Some(path) = &self.audio_file {
             let meta = std::fs::metadata(path).map_err(|e| format!("video soundtrack: {e}"))?;
@@ -249,6 +266,12 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
     // The soundtrack to follow: speech made first (its model is freed before
     // the video's loads), or a file; read as stereo at its own rate.
     let mut owned = r.clone();
+    // The words, in the prompt as LTX prompts carry dialogue: without them the
+    // picture barely takes lip movement from a soundtrack alone.
+    let words = r.speech.as_ref().and_then(|s| s.get("text")).and_then(Json::as_str).map(str::trim).map(str::to_owned).or_else(|| r.transcript.clone());
+    if let Some(w) = words.filter(|w| !w.is_empty() && !r.prompt.contains(w.as_str())) {
+        owned.prompt = format!("{} They say: \"{}\"", r.prompt.trim_end(), w.replace('"', "'"));
+    }
     let speech_started = Instant::now();
     if let Some(s) = &r.speech {
         let tts = crate::tts::Request::parse(s).map_err(candle_core::Error::Msg)?;
@@ -499,24 +522,43 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
         None
     };
     let denoise_started = Instant::now();
+    // Following a soundtrack, each step also runs with the audio-video
+    // cross-attention skipped, and the picture moves away from that result.
+    let guided = frozen_audio && r.a2v_guidance > 1.0;
+    let passes = if guided { 2 } else { 1 };
     for step in 0..8 {
         let audio_bf16 = audio_latent.as_ref().map(|a| a.to_dtype(DType::BF16)).transpose()?;
-        let audio_input = match (&audio_bf16, &audio_context, &audio_ropes) {
-            (Some(latent), Some(context), Some((rope, video_cross))) => {
-                Some(transformer::AudioInput { latent, context, rope, video_cross, sigma: if frozen_audio { 0. } else { SIGMAS[step] } })
-            }
-            _ => None,
+        let video_bf16 = latent.to_dtype(DType::BF16)?;
+        let mut run = |isolated: bool, pass: usize| {
+            let audio_input = match (&audio_bf16, &audio_context, &audio_ropes) {
+                (Some(latent), Some(context), Some((rope, video_cross))) => Some(transformer::AudioInput {
+                    latent,
+                    context,
+                    rope,
+                    video_cross,
+                    sigma: if frozen_audio { 0. } else { SIGMAS[step] },
+                    isolated,
+                }),
+                _ => None,
+            };
+            model.forward(
+                &video_bf16,
+                &context,
+                SIGMAS[step],
+                &rope,
+                if starting_latent.is_some() { h * w } else { 0 },
+                if ending_latent.is_some() { h * w } else { 0 },
+                audio_input,
+                |n| report(event("video_denoising", (step * passes + pass) * 48 + n, 8 * passes * 48)),
+            )
         };
-        let (velocity, audio_velocity) = model.forward(
-            &latent.to_dtype(DType::BF16)?,
-            &context,
-            SIGMAS[step],
-            &rope,
-            if starting_latent.is_some() { h * w } else { 0 },
-            if ending_latent.is_some() { h * w } else { 0 },
-            audio_input,
-            |n| report(event("video_denoising", step * 48 + n, 8 * 48)),
-        )?;
+        let (mut velocity, audio_velocity) = run(false, 0)?;
+        if guided {
+            let (isolated, _) = run(true, 1)?;
+            let cond = velocity.to_dtype(DType::F32)?;
+            let delta = (&cond - isolated.to_dtype(DType::F32)?)?;
+            velocity = (cond + (delta * (r.a2v_guidance - 1.0))?)?;
+        }
         let dt = SIGMAS[step + 1] - SIGMAS[step];
         latent = (latent + (velocity.to_dtype(DType::F32)? * dt)?)?;
         latent = condition_endpoints(latent, starting_latent.as_ref(), ending_latent.as_ref())?;
@@ -735,6 +777,7 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
         ("width", Json::Int(r.width as i64)),
         ("height", Json::Int(r.height as i64)),
         ("prompt", Json::str(&r.prompt)),
+        ("transcript", r.transcript.as_ref().map(Json::str).unwrap_or(Json::Null)),
         (
             "image",
             r.image
@@ -764,6 +807,7 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
         ("steps", Json::Int(8)),
         ("audio", Json::Bool(soundtrack.is_some())),
         ("followed_soundtrack", Json::Bool(soundtrack_in.is_some())),
+        ("a2v_guidance", if soundtrack_in.is_some() { Json::Num(r.a2v_guidance) } else { Json::Null }),
         (
             "audio_file",
             r.audio_file.as_ref().map(|p| Json::str(p.to_string_lossy())).unwrap_or(Json::Null),
