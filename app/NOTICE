@@ -7,6 +7,11 @@ This product includes software developed as part of:
   src/agent/providers/aiProvider.ts, providerConnection.ts and stream.ts are
   adapted from apps/softn-studio/src/lib/, and the agent's editing rules and
   loop structure follow apps/softn-studio/src/lib/agent/.
+  src/softn/guide.generated.ts and src/softn/knowledge/ (the SoftN writing
+  guide, component reference and published guides) are generated from
+  apps/softn-studio/src/lib/agent/, and the example apps in
+  src/softn/knowledge/examples.generated.ts come from
+  apps/softn-api/data/apps/ (scripts/generate-softn-knowledge.mjs).
 - coder-cli (https://github.com/f2i-com/coder-cli): the sandbox guest runtime
   (src/sandbox/guest/prelude.js), the emulated shell
   (src/sandbox/guest/shell.js) and the network gate's design.

@@ -14,6 +14,7 @@ import { VfsError, normalizePath, type Vfs } from '../vfs/vfs';
 import type { ToolCall, ToolResult, ToolSpec } from './protocol';
 import { appLabel, checkProject, describeApp, findApps, formatFindings, guideFor, importSoftn, logicSyntax, resolveApp } from '../softn/softn';
 import type { PreviewResult } from '../softn/preview';
+import { describeExample, docsMap, installExample, listExamples, lookupComponents, readTopic, searchKnowledge } from '../softn/knowledge';
 import { DEFAULT_VIEW_SIZE, MAX_VIEW_SIZE, imageMimeFor, imageSize, viewImage, type ImagePart } from './images';
 
 const READ_LINES = 400;
@@ -162,8 +163,23 @@ export const TOOLS: ToolSpec[] = [
   },
   {
     name: 'softn_docs',
-    description: 'The SoftN writing guide (from SoftN Studio): the app files, the .ui page language, .logic/.py logic, XDB data, capabilities, common mistakes and a complete example. Read it before writing or changing a SoftN app. Optional `section` returns only the sections whose heading contains it (e.g. "ui page", "logic", "mistakes", "example"). A SoftN app is any folder whose manifest.json has a .ui `main`; a project can hold several (e.g. an imported app to learn from and a new one), and paths inside an app are relative to its folder.',
-    parameters: { type: 'object', properties: { section: str, app: { ...str, description: 'The app folder, for the Python or JavaScript guide to match it' } } },
+    description:
+      'The SoftN reference: how to write SoftN apps. With no arguments: the map of everything there is (the writing guide\'s sections, the published guides, every component, the example apps). ' +
+      '`topic` reads one: "guide" for the whole writing guide (read it before your first app), "guide#<words from a heading>" for one section (e.g. "guide#mistakes"), or a published guide\'s slug, optionally "#section" (e.g. "xdb-data", "state-events#events"). ' +
+      '`search` finds words across the guide, the guides, the component reference and the example apps\' source, best first, each with a snippet and how to open it: use it when you need to know how something is done (e.g. "timer interval", "@change Select", "save to storage").',
+    parameters: { type: 'object', properties: { topic: str, search: str, app: { ...str, description: 'The app folder, so the guide matches its language (JavaScript or Python logic)' } } },
+  },
+  {
+    name: 'softn_components',
+    description: 'The exact reference for SoftN components you are about to use: every prop with its type and allowed values, events (@name), children, and a usage example. Generated from the component sources, so it is authoritative: check here instead of guessing a prop.',
+    parameters: { type: 'object', required: ['names'], properties: { names: { type: 'array', items: { type: 'string' }, description: 'Component names, e.g. ["Table", "Tabs"]; up to 12' } } },
+  },
+  {
+    name: 'softn_examples',
+    description:
+      'Complete, working SoftN apps to learn from (a notes app with storage, a game, a component and chart showcase, 3D, WebGPU, device permissions). ' +
+      'No arguments: the list. `name`: an app\'s files and manifest. `name` + `file`: read one of its files. `name` + `install_to`: copy the whole app into that folder of the project (it then shows in the preview; start from it or take parts of it).',
+    parameters: { type: 'object', properties: { name: str, file: str, install_to: str } },
   },
   {
     name: 'softn_check',
@@ -492,12 +508,31 @@ async function execute(call: ToolCall, ctx: ToolContext): Promise<string> {
     case 'softn_docs': {
       const target = typeof input.app === 'string' ? resolveApp(vfs, input.app) : null;
       const guide = guideFor(vfs, target?.ok ? target.root : (findApps(vfs)[0] ?? ''));
-      const want = typeof input.section === 'string' ? input.section.trim().toLowerCase() : '';
-      if (!want) return guide;
-      const sections = guide.split(/\n(?=## )/);
-      const hits = sections.filter((s) => s.split('\n')[0].toLowerCase().includes(want));
-      if (hits.length) return hits.join('\n\n');
-      return `No section heading contains "${want}". Sections: ${sections.map((s) => s.split('\n')[0].replace(/^#+\s*/, '')).join('; ')}`;
+      if (typeof input.search === 'string' && input.search.trim()) return searchKnowledge(input.search, guide);
+      // `section` is the older way to ask for part of the writing guide.
+      const topic = typeof input.topic === 'string' && input.topic.trim() ? input.topic : typeof input.section === 'string' && input.section.trim() ? `guide#${input.section}` : '';
+      if (!topic) return docsMap(guide);
+      const read = await readTopic(topic, guide);
+      if (!read.ok) throw new Error(read.text);
+      return read.text;
+    }
+    case 'softn_components': {
+      const names = Array.isArray(input.names) ? input.names.map(String) : typeof input.names === 'string' ? input.names.split(/[\s,]+/).filter(Boolean) : [];
+      if (!names.length) throw new Error('give the component names, e.g. names: ["Button", "Table"]');
+      const found = await lookupComponents(names);
+      if (!found.ok) throw new Error(found.text);
+      return found.text;
+    }
+    case 'softn_examples': {
+      const name = typeof input.name === 'string' ? input.name.trim() : '';
+      if (!name) return listExamples();
+      if (typeof input.install_to === 'string') {
+        const installed = await installExample(vfs, name, normalizePath(input.install_to));
+        return `Copied the example into ${appLabel(installed.root)} (${installed.files} files).\n${describeApp(vfs, installed.root)}\nRun softn_check with app "${installed.root}" to see it in the preview.`;
+      }
+      const shown = await describeExample(name, typeof input.file === 'string' && input.file.trim() ? input.file : undefined);
+      if (!shown.ok) throw new Error(shown.text);
+      return shown.text;
     }
     case 'softn_check': {
       const target = resolveApp(vfs, input.app);

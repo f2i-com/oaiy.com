@@ -11,6 +11,7 @@ import { EditorPane } from './ui/editor';
 import { openSettings } from './ui/settings';
 import { TerminalPane } from './ui/terminal';
 import { SoftnPreview } from './softn/preview';
+import { warmKnowledge } from './softn/knowledge';
 import { SOFTN_STARTER, appKey, appLabel, checkProject, describeApp, downloadSoftn, findApps, formatFindings, importSoftn, isSoftnProject, logicSyntax, resolveApp } from './softn/softn';
 import { imageForMessage, imageMimeFor, type ImagePart } from './agent/images';
 import type { Attachment } from './agent/protocol';
@@ -552,6 +553,8 @@ A project can hold several apps, each in its own folder (any folder whose manife
     void project.flush();
   });
   chat.focus();
+  // The SoftN reference loads on first use; fetch it now so it is cached for offline use.
+  (window.requestIdleCallback ?? ((f: () => void) => setTimeout(f, 3000)))(() => warmKnowledge());
 }
 
 main().catch((error: unknown) => {

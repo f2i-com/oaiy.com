@@ -27,6 +27,11 @@ A coding agent that runs entirely in your browser.
 bot.computer can build [SoftN](https://github.com/f2i-com/softn.com) apps and show them running while they're being built.
 
 - **Start one:** use **New SoftN app** (or `/softn new`), or ask the agent for an app. It reads `softn_docs` (SoftN Studio's own writing guide, regenerated with `npm run softn:guide`), writes `manifest.json`, `ui/*.ui` and `logic/*.logic`, and runs `softn_check`.
+- **Reference for the agent:** SoftN is in its tools, so it doesn't have to guess.
+  - `softn_docs` with no arguments gives a map of the writing guide, the published guides, every component and the example apps. It reads any of them by topic (`"guide#mistakes"`, `"xdb-data#operations"`). With `search` it finds a term across all of them, including the example apps' source, and says how to open each hit.
+  - `softn_components` gives a component's exact props, events and an example.
+  - `softn_examples` lists, reads or installs complete apps from softn.com's catalogue: notes, a 2048 game, a component showcase, 3D, WebGPU and device permissions.
+  - All of this is bundled for offline use. Regenerate it with `npm run softn:knowledge`.
 - **Live preview:** the **App preview** tab renders the app with SoftN's hosted runtime, in a sandboxed opaque-origin iframe with its own strict CSP. It re-renders about 0.7 s after edits settle.
 - **Errors:** load and render errors are reported, and `.logic` syntax errors are caught by compiling the logic on Zipp.
 - **Export:** **Export .softn** (or `/softn export [folder]`) downloads an app as a `.softn` file. That's a flat zip with `manifest.json` at its root, and the manifest's `main`, `version` and `files` are filled in from the files actually present.

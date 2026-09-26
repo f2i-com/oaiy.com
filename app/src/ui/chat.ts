@@ -21,7 +21,10 @@ function summarizeCall(call: ToolCall): string {
     case 'web_fetch': return s('url');
     case 'present_file': case 'view_image': case 'file_info': case 'search_file': return s('path');
     case 'softn_import': return s('path');
-    case 'softn_check': case 'softn_docs': return s('app');
+    case 'softn_check': return s('app');
+    case 'softn_docs': return s('search') ? `search: ${s('search')}` : s('topic') || s('section') || 'map';
+    case 'softn_components': return Array.isArray(i.names) ? i.names.join(', ') : s('names');
+    case 'softn_examples': return [s('name'), s('file'), s('install_to') && `→ ${s('install_to')}`].filter(Boolean).join(' ') || 'list';
     default: return '';
   }
 }
