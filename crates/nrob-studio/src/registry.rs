@@ -146,6 +146,39 @@ fn companion(cfg: &Json, section: &str, entry: &Json, missing: &str, picked: &Pa
     field_of(&d, key).or_else(|| Some(Json::str(found.to_string_lossy())))
 }
 
+/// A Qwen3-TTS folder: the VoiceDesign or Base half of a speech model. It
+/// completes the chosen (or the first) model lacking that half, else starts
+/// one.
+fn attach_speech(cfg: &mut Json, d: &Detected, target: Option<(&str, &str)>) -> Result<Added, String> {
+    let field = if d.kind() == "speech_design" { "design" } else { "base" };
+    let value = field_of(d, field).ok_or("detected part has no path")?;
+    let Some(Json::Obj(models)) = obj_mut(cfg, &["media", "speech", "models"]) else { return Err("no speech section".into()) };
+    let chosen = models
+        .iter()
+        .position(|(n, _)| target.is_some_and(|(_, t)| n == t))
+        .or_else(|| models.iter().position(|(_, m)| str_or(m, field, "").trim().is_empty()));
+    let name = match chosen {
+        Some(i) => {
+            set(&mut models[i].1, field, value);
+            set(&mut models[i].1, "enabled", Json::Bool(true));
+            models[i].0.clone()
+        }
+        None => {
+            let taken: Vec<String> = models.iter().map(|(k, _)| k.clone()).collect();
+            let name = unique(&taken, "qwen3-tts");
+            models.push((name.clone(), Json::obj([(field, value), ("enabled", Json::Bool(true))])));
+            name
+        }
+    };
+    let section = obj_mut(cfg, &["media", "speech"]).ok_or("no speech section")?;
+    if str_or(section, "default_model", "").is_empty() {
+        set(section, "default_model", Json::str(&name));
+    }
+    add_route_if_absent(cfg, "speech");
+    add_route_if_absent(cfg, "voices");
+    Ok(Added { section: "speech", name, missing: Vec::new(), enabled: true })
+}
+
 /// Components attach to the first model that lacks them.
 fn attach(cfg: &mut Json, d: &Detected, target: Option<(&str, &str)>) -> Result<Added, String> {
     type Fits = Box<dyn Fn(&Json) -> bool>;
@@ -177,6 +210,7 @@ fn attach(cfg: &mut Json, d: &Detected, target: Option<(&str, &str)>) -> Result<
             let v25 = d.summary.contains("2.5");
             ("video", "text_encoder", Box::new(move |m| (str_or(m, "family", "") == "ltx-2.5") == v25))
         }
+        "speech_design" | "speech_base" => return attach_speech(cfg, d, target),
         "ffmpeg" => {
             let value = field_of(d, "ffmpeg").unwrap_or(Json::Null);
             set(obj_mut(cfg, &["media", "video"]).ok_or("no video section")?, "ffmpeg", value);
@@ -619,6 +653,34 @@ mod tests {
         assert!(report.get("missing").unwrap().as_array().unwrap().iter().any(|m| str_or(m, "field", "") == "ffmpeg"));
         assert_eq!(get(&third, &["media", "video", "ffmpeg"]).cloned(), before);
         assert!(import(&mut third, &Json::parse(b"{}").unwrap(), false, &d).is_err());
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn qwen3_tts_folders_pair_into_one_speech_model() {
+        let d = tmp("tts");
+        let make = |name: &str, kind: &str| {
+            let dir = d.join(name);
+            std::fs::create_dir_all(dir.join("speech_tokenizer")).unwrap();
+            std::fs::write(dir.join("config.json"), format!(r#"{{"model_type":"qwen3_tts","tts_model_type":"{kind}"}}"#)).unwrap();
+            std::fs::write(dir.join("speech_tokenizer").join("model.safetensors"), b"x").unwrap();
+            dir
+        };
+        let (design, base) = (make("Qwen3-TTS-VoiceDesign", "voice_design"), make("Qwen3-TTS-Base", "base"));
+        let mut cfg = config::default_json();
+        let (a, _) = add(&mut cfg, &design, None, None).unwrap();
+        assert_eq!((a.section, a.name.as_str()), ("speech", "qwen3-tts"));
+        let (b, _) = add(&mut cfg, &base, None, None).unwrap();
+        assert_eq!(b.name, "qwen3-tts", "the Base half completes the same model");
+        let m = get(&cfg, &["media", "speech", "models", "qwen3-tts"]).unwrap();
+        assert!(str_or(m, "design", "").ends_with("Qwen3-TTS-VoiceDesign") && str_or(m, "base", "").ends_with("Qwen3-TTS-Base"));
+        assert_eq!(get(&cfg, &["media", "speech", "default_model"]).and_then(Json::as_str), Some("qwen3-tts"));
+        let routes = get(&cfg, &["gateway", "routes"]).unwrap().as_array().unwrap();
+        assert!(["speech", "voices"].iter().all(|t| routes.iter().any(|r| str_or(r, "target", "") == *t)));
+        let mut bad = config::default_json();
+        std::fs::write(design.join("config.json"), r#"{"model_type":"qwen3_tts","tts_model_type":"custom_voice"}"#).unwrap();
+        assert!(add(&mut bad, &design, None, None).is_err());
+        config::validate(&cfg).unwrap();
         std::fs::remove_dir_all(d).unwrap();
     }
 

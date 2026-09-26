@@ -288,6 +288,12 @@ fn ltx_family(h: &Header) -> Option<&'static str> {
 
 fn safetensors_file(path: &Path) -> Result<Detected, String> {
     let h = read_header(path)?;
+    // A Qwen3-TTS weight file stands for its folder (config, tokenizer, codec).
+    if has(&h, "talker.codec_head.") {
+        if let Some(dir) = path.parent() {
+            return directory(dir);
+        }
+    }
     classify_header(&h, path, "safetensors")
 }
 
@@ -454,6 +460,19 @@ fn directory(dir: &Path) -> Result<Detected, String> {
         if quant == "exl3" || arch.starts_with("Deepseek") || model_type.starts_with("deepseek") {
             return Ok(detected(Role::Llm, "checkpoint", format!("{label} — {} checkpoint folder ({arch})", if quant == "exl3" { "EXL3" } else { "safetensors" }),
                 vec![("path", path_json(dir))]));
+        }
+        // Qwen3-TTS: VoiceDesign speaks in voices described in words; Base
+        // speaks in saved voices. One speech model pairs the two.
+        if model_type == "qwen3_tts" {
+            let (kind, field, what) = match str_or(&config, "tts_model_type", "") {
+                "voice_design" => ("speech_design", "design", "VoiceDesign: speaks in any voice you describe"),
+                "base" => ("speech_base", "base", "Base: speaks in saved voices"),
+                other => return Err(format!("{label}: Qwen3-TTS {other} models are not supported; use VoiceDesign or Base")),
+            };
+            if !dir.join("speech_tokenizer").join("model.safetensors").is_file() {
+                return Err(format!("{label}: a Qwen3-TTS folder needs its speech_tokenizer/ folder"));
+            }
+            return Ok(detected(Role::Component { kind }, "safetensors", format!("Qwen3-TTS {what} ({label})"), vec![(field, path_json(dir))]));
         }
         if model_type == "qwen3_vl" && has_ext(dir, "safetensors") {
             return Ok(detected(Role::Component { kind: "text_encoder" }, "safetensors", format!("Qwen3-VL text encoder folder ({label})"), vec![("text_encoder", path_json(dir))]));

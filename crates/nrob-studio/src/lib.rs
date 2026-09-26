@@ -23,6 +23,7 @@ mod llm;
 mod media;
 mod multipart;
 mod registry;
+mod speech;
 mod system;
 mod util;
 

@@ -31,6 +31,18 @@ fn operations(target: &str, spec: &str, path: &str) -> Vec<Json> {
             sub("POST", format!("{path}/cancel"), "cancel the running job"),
         ],
         ("files", _) => vec![sub("GET", format!("{path}/{{file}}"), "a generated image or video (URLs come back from image and video replies)")],
+        ("speech", _) => vec![sub(
+            "POST",
+            path.into(),
+            "JSON: input, voice (a saved voice's name, or an OpenAI voice name), instructions (describe any voice), response_format mp3|opus|aac|flac|wav|pcm, speed 0.25-4, language, seed; returns the audio",
+        )],
+        ("voices", _) => vec![
+            sub("GET", path.into(), "list saved voices"),
+            sub("POST", path.into(), "design and save a voice (JSON: name, description, sample_text?, language?, seed?)"),
+            sub("GET", format!("{path}/{{name}}"), "one voice"),
+            sub("GET", format!("{path}/{{name}}/sample"), "the voice's sample clip (WAV)"),
+            sub("DELETE", format!("{path}/{{name}}"), "delete a voice"),
+        ],
         _ => Vec::new(),
     }
 }
@@ -43,6 +55,8 @@ fn describe(target: &str) -> &'static str {
         "images" => "text-to-image; add images: [{image_url}] to edit",
         "edits" => "image edits: multipart (image, prompt) or JSON with images",
         "videos" => "text/image-to-video",
+        "speech" => "text to speech in a saved or described voice (OpenAI audio.speech)",
+        "voices" => "saved voices: design one from a description, then speak in it by name",
         "files" => "generated media",
         "health" => "liveness, no key needed",
         "discovery" => "this document",
@@ -153,6 +167,21 @@ pub fn document(studio: &Studio, base: &str, authorized: bool) -> Json {
             ])
         })
         .collect();
+    let speech = section("speech");
+    let speech_default = effective(speech);
+    let voices = crate::speech::list(&crate::speech::voices_dir(&cfg, &studio.root));
+    let speech_models: Vec<Json> = names(speech)
+        .into_iter()
+        .map(|(name, m)| {
+            Json::obj([
+                ("id", Json::str(&name)),
+                ("default", Json::Bool(name == speech_default)),
+                ("described_voices", Json::Bool(!str_or(&m, "design", "").is_empty())),
+                ("saved_voices", Json::Bool(!str_or(&m, "base", "").is_empty())),
+                ("sample_rate", Json::Int(24_000)),
+            ])
+        })
+        .collect();
     let models_for = |target: &str| -> Vec<Json> {
         let ids = |list: &[Json]| list.iter().filter_map(|m| m.get("id").cloned()).collect::<Vec<_>>();
         match target {
@@ -160,6 +189,7 @@ pub fn document(studio: &Studio, base: &str, authorized: bool) -> Json {
             "images" => ids(&image_models),
             "edits" => image_models.iter().filter(|m| m.get("edits") == Some(&Json::Bool(true))).filter_map(|m| m.get("id").cloned()).collect(),
             "videos" => ids(&video_models),
+            "speech" | "voices" => ids(&speech_models),
             _ => Vec::new(),
         }
     };
@@ -187,7 +217,10 @@ pub fn document(studio: &Studio, base: &str, authorized: bool) -> Json {
                 e.push(("operations".into(), Json::Arr(ops)));
             }
             let models = models_for(target);
-            if !models.is_empty() || matches!(target, "chat" | "completions" | "images" | "edits" | "videos") {
+            if target == "speech" || target == "voices" {
+                e.push(("voices".into(), Json::Arr(voices.iter().filter_map(|v| v.get("name").cloned()).collect())));
+            }
+            if !models.is_empty() || matches!(target, "chat" | "completions" | "images" | "edits" | "videos" | "speech") {
                 e.push(("models".into(), Json::Arr(models)));
             }
             Json::Obj(e)
@@ -198,7 +231,7 @@ pub fn document(studio: &Studio, base: &str, authorized: bool) -> Json {
         ("endpoints".into(), Json::Arr(endpoints)),
         (
             "models".into(),
-            Json::obj([("llm", Json::Arr(llm_models)), ("image", Json::Arr(image_models)), ("video", Json::Arr(video_models))]),
+            Json::obj([("llm", Json::Arr(llm_models)), ("image", Json::Arr(image_models)), ("video", Json::Arr(video_models)), ("speech", Json::Arr(speech_models))]),
         ),
         (
             "defaults".into(),
@@ -206,6 +239,14 @@ pub fn document(studio: &Studio, base: &str, authorized: bool) -> Json {
                 ("llm", Json::str(&llm_default)),
                 ("image", Json::str(&image_default)),
                 ("video", Json::str(&video_default)),
+                ("speech", Json::str(&speech_default)),
+            ]),
+        ),
+        (
+            "voices".into(),
+            Json::obj([
+                ("saved", Json::Arr(voices.clone())),
+                ("openai_names", Json::Arr(crate::speech::STOCK_VOICES.iter().map(|(n, _)| Json::str(*n)).collect())),
             ]),
         ),
         (

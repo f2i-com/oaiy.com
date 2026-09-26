@@ -22,6 +22,8 @@ use std::time::Duration;
 pub enum Kind {
     Image,
     Video,
+    /// Text to speech, and designing a voice to save.
+    Speech,
 }
 
 impl Kind {
@@ -29,6 +31,7 @@ impl Kind {
         match self {
             Kind::Image => "image",
             Kind::Video => "video",
+            Kind::Speech => "speech",
         }
     }
 }
@@ -89,7 +92,11 @@ impl Job {
             ("error", self.error.as_ref().map_or(Json::Null, Json::str)),
             ("residency", self.result.get("residency").cloned().unwrap_or(Json::Null)),
             ("seconds_taken", self.result.get("seconds").cloned().unwrap_or(Json::Null)),
-            ("seconds", if self.kind == Kind::Video { Json::Num(self.seconds) } else { Json::Null }),
+            ("seconds", match self.kind {
+                Kind::Video => Json::Num(self.seconds),
+                Kind::Speech => self.result.get("duration").cloned().unwrap_or(Json::Null),
+                Kind::Image => Json::Null,
+            }),
             // What a viewer needs to reproduce it; never paths or references.
             ("settings", Json::obj(["seed", "steps", "memory", "cfg", "negative_prompt", "fps", "frames"].map(|k| (k, self.request.get(k).cloned().unwrap_or(Json::Null))))),
         ])
@@ -191,7 +198,7 @@ fn residency(body: &Json, section: &Json, model: &Json) -> Result<Vec<(String, J
     Ok(out)
 }
 
-fn pick_model<'a>(section: &'a Json, body: &Json, kind: &str) -> Result<(String, &'a Json), String> {
+pub(crate) fn pick_model<'a>(section: &'a Json, body: &Json, kind: &str) -> Result<(String, &'a Json), String> {
     let models = section.get("models").filter(|m| m.as_object().is_some_and(|o| !o.is_empty()))
         .ok_or_else(|| format!("no {kind} model is configured; add one under Models"))?;
     let asked = body.get("model").and_then(Json::as_str).filter(|s| !s.is_empty());
@@ -202,7 +209,7 @@ fn pick_model<'a>(section: &'a Json, body: &Json, kind: &str) -> Result<(String,
     };
     // An OpenAI client names OpenAI's models ("dall-e-3", "sora-2"): use the default.
     let found = found.or_else(|| {
-        asked.filter(|a| a.starts_with("dall-e") || a.starts_with("gpt-image") || a.starts_with("sora"))
+        asked.filter(|a| a.starts_with("dall-e") || a.starts_with("gpt-image") || a.starts_with("sora") || a.starts_with("tts-") || a.ends_with("-tts"))
             .and_then(|_| section.get("default_model").and_then(Json::as_str).and_then(|d| models.members().find(|(k, _)| *k == d)).or_else(|| models.members().next()))
     });
     let (name, model) = found.ok_or_else(|| format!("unknown {kind} model {:?}", name.unwrap_or("")))?;
@@ -253,6 +260,11 @@ fn prompt(body: &Json) -> Result<String, String> {
 
 /// A day folder under the output root: `images/2026-09-26`.
 fn output_dir(root: &Path, kind: &str) -> PathBuf {
+    day_dir(root, &format!("{kind}s"))
+}
+
+/// `folder/2026-09-26` under the output root.
+pub(crate) fn day_dir(root: &Path, folder: &str) -> PathBuf {
     let days = now() / 86_400;
     // Civil date from days since 1970 (Howard Hinnant's algorithm).
     let z = days as i64 + 719_468;
@@ -264,7 +276,7 @@ fn output_dir(root: &Path, kind: &str) -> PathBuf {
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = yoe + era * 400 + i64::from(m <= 2);
-    root.join(format!("{kind}s")).join(format!("{y:04}-{m:02}-{d:02}"))
+    root.join(folder).join(format!("{y:04}-{m:02}-{d:02}"))
 }
 
 fn path_field(root: &Path, model: &Json, key: &str) -> Option<String> {
@@ -563,6 +575,11 @@ fn progress_of(kind: Kind, n: usize, e: &Json) -> Option<(f64, String)> {
         (Kind::Video, "decoding_video") => 87.0,
         (Kind::Video, "encoding_mp4") => 95.0,
         (Kind::Video, _) => 2.0,
+        // `n` holds the expected frame count; the curve never quite reaches it.
+        (Kind::Speech, "speaking") => 8.0 + 84.0 * (1.0 - (-i("current") / n).exp()),
+        (Kind::Speech, "designing_voice") => 5.0 + 30.0 * i("current"),
+        (Kind::Speech, "decoding_speech") => 95.0,
+        (Kind::Speech, _) => 3.0,
     };
     Some((p, stage))
 }
@@ -819,11 +836,12 @@ impl Media {
                         j.files = match j.kind {
                             Kind::Image => result.get("data").and_then(Json::as_array).unwrap_or(&[]).iter()
                                 .filter_map(|d| d.get("path").and_then(Json::as_str)).map(PathBuf::from).collect(),
-                            Kind::Video => result.get("path").and_then(Json::as_str).map(PathBuf::from).into_iter().collect(),
+                            Kind::Video | Kind::Speech => result.get("path").and_then(Json::as_str).map(PathBuf::from).into_iter().collect(),
                         };
                         j.preview = match j.kind {
                             Kind::Image => j.files.first().cloned(),
                             Kind::Video => result.get("preview").and_then(Json::as_str).map(PathBuf::from),
+                            Kind::Speech => None,
                         };
                         j.result = result;
                     }

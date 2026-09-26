@@ -32,6 +32,8 @@ const LOAD_WAIT: Duration = Duration::from_secs(10 * 60);
 const UPSTREAM_READ: Duration = Duration::from_secs(30 * 60);
 /// A synchronous image request waits this long for its job.
 const IMAGE_WAIT: Duration = Duration::from_secs(60 * 60);
+/// A speech request (or designing a voice) waits this long.
+const SPEECH_WAIT: Duration = Duration::from_secs(30 * 60);
 
 pub struct Reply {
     status: u16,
@@ -90,7 +92,7 @@ pub fn route(routes: &[Json], method: &str, path: &str) -> Option<Matched> {
     for r in routes.iter().filter(|r| bool_or(r, "enabled", true)) {
         let base = str_or(r, "path", "").trim_end_matches('/');
         let target = str_or(r, "target", "");
-        let prefix_owner = matches!(target, "images" | "videos" | "files");
+        let prefix_owner = matches!(target, "images" | "videos" | "files" | "voices");
         let rest = if path == base {
             ""
         } else if prefix_owner && path.starts_with(base) && path[base.len()..].starts_with('/') {
@@ -99,7 +101,7 @@ pub fn route(routes: &[Json], method: &str, path: &str) -> Option<Matched> {
             continue;
         };
         // The configured method is the primary route's; sub-routes set their own.
-        if rest.is_empty() && target != "videos" && target != "files" && !str_or(r, "method", "POST").eq_ignore_ascii_case(method) {
+        if rest.is_empty() && !matches!(target, "videos" | "files" | "voices") && !str_or(r, "method", "POST").eq_ignore_ascii_case(method) {
             continue;
         }
         return Some(Matched { target: target.into(), spec: str_or(r, "spec", "openai").into(), rest: rest.into() });
@@ -143,6 +145,8 @@ pub fn handle(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, m: Matched
             send(w, nrob_jobs(studio, req, kind, &m.rest, trusted))
         }
         ("videos", "openai") => videos_openai(studio, req, w, method, &m.rest, trusted),
+        ("speech", _) if m.rest.is_empty() => speech_openai(studio, req, w),
+        ("voices", _) => voices(studio, req, w, &m.rest),
         _ => send(w, Err(fail(404, format!("no route {} {}", method, req.route())))),
     }
 }
@@ -226,7 +230,7 @@ fn models(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream) -> io::Result<
             }
         }
     }
-    for kind in ["image", "video"] {
+    for kind in ["image", "video", "speech"] {
         let section = cfg.get("media").and_then(|m| m.get(kind));
         if section.is_some_and(|s| bool_or(s, "enabled", true)) {
             for (name, m) in section.and_then(|s| s.get("models")).map(|m| m.members().collect::<Vec<_>>()).unwrap_or_default() {
@@ -454,6 +458,132 @@ fn check_image_body(body: &Json) -> Result<(), Reply> {
 /// Multipart edits carry files the gateway saved itself, so their paths are safe.
 fn multipart(req: &Request) -> bool {
     req.header("content-type").is_some_and(|c| c.to_ascii_lowercase().starts_with("multipart/form-data"))
+}
+
+/// OpenAI audio.speech: speak `input` in a saved or described voice, wait,
+/// and answer with the audio itself (converted by FFmpeg as asked).
+fn speech_openai(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
+    match speech_audio(studio, req) {
+        Ok((bytes, ctype)) => {
+            respond(w, 200, ctype, &bytes, true)?;
+            Ok(true)
+        }
+        Err(e) => send(w, Err(e)),
+    }
+}
+
+fn speech_audio(studio: &Arc<Studio>, req: &Request) -> Result<(Vec<u8>, &'static str), Reply> {
+    if req.method != "POST" {
+        return Err(fail(405, "use POST"));
+    }
+    let body = parse_body(req)?;
+    let format = body.get("response_format").and_then(Json::as_str).unwrap_or("mp3");
+    let ctype = crate::speech::FORMATS.iter().find(|(f, _)| *f == format).map(|(_, c)| *c)
+        .ok_or_else(|| fail(400, "response_format must be mp3, opus, aac, flac, wav or pcm"))?;
+    let speed = match body.get("speed") {
+        None | Some(Json::Null) => 1.0,
+        Some(v) => v.as_f64().filter(|s| (0.25..=4.0).contains(s)).ok_or_else(|| fail(400, "speed must be between 0.25 and 4"))?,
+    };
+    if body.get("stream_format").and_then(Json::as_str).is_some_and(|s| s != "audio") {
+        return Err(fail(400, "stream_format: the whole clip is returned at once (\"audio\")"));
+    }
+    let cfg = studio.config();
+    let scratch = scratch_for(studio, req, Some(&body));
+    let out = scratch.clone().unwrap_or_else(|| studio.output_root());
+    let drop_scratch = |e: String| {
+        if let Some(s) = &scratch {
+            let _ = std::fs::remove_dir_all(s);
+        }
+        fail(400, e)
+    };
+    let (request, model, voice, frames) = crate::speech::speech_request(&cfg, &studio.root, &media::day_dir(&out, "speech"), &body).map_err(drop_scratch)?;
+    let job = studio.media.submit(Kind::Speech, request, model, voice, frames, 0.0, keep_jobs(&cfg), scratch);
+    let done = studio.media.wait(&job.id, SPEECH_WAIT).ok_or_else(|| fail(500, "the job disappeared"))?;
+    let finish = |studio: &Arc<Studio>| {
+        if done.incognito {
+            if done.finished() { studio.media.purge(&done.id) } else { studio.media.remove(&done.id); }
+        }
+    };
+    if done.status != "completed" {
+        finish(studio);
+        return Err(fail(if done.status == "in_progress" { 504 } else { 500 }, done.error.clone().unwrap_or_else(|| format!("speech job {}", done.status))));
+    }
+    let wav = done.files.first().cloned().ok_or_else(|| fail(500, "the speech job wrote no audio"))?;
+    let bytes = if format == "wav" && speed == 1.0 {
+        std::fs::read(&wav).map_err(|e| fail(500, e.to_string()))
+    } else {
+        let ffmpeg = crate::config::program(&studio.root, cfg.get("media").and_then(|m| m.get("video")).map_or("ffmpeg", |v| str_or(v, "ffmpeg", "ffmpeg")));
+        let mut command = std::process::Command::new(&ffmpeg);
+        command.args(["-hide_banner", "-loglevel", "error", "-i"]).arg(&wav).args(crate::speech::convert_args(format, speed)).arg("pipe:1");
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x0800_0000);
+        }
+        match command.output() {
+            Ok(o) if o.status.success() => Ok(o.stdout),
+            Ok(o) => Err(fail(500, format!("FFmpeg could not write {format}: {}", String::from_utf8_lossy(&o.stderr).trim()))),
+            Err(e) => Err(fail(500, format!("FFmpeg ({}) is needed for {format} or speed: {e}", ffmpeg.display()))),
+        }
+    };
+    finish(studio);
+    Ok((bytes?, ctype))
+}
+
+/// Saved voices: list, design and save, show, sample clip, delete.
+fn voices(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, rest: &str) -> io::Result<bool> {
+    let cfg = studio.config();
+    let dir = crate::speech::voices_dir(&cfg, &studio.root);
+    let parts: Vec<String> = rest.split('/').filter(|s| !s.is_empty()).map(nrob::http::percent_decode).collect();
+    let parts: Vec<&str> = parts.iter().map(String::as_str).collect();
+    match (req.method.as_str(), parts.as_slice()) {
+        ("GET", []) => json_reply(w, 200, &Json::obj([("object", Json::str("list")), ("data", Json::Arr(crate::speech::list(&dir)))])),
+        ("POST", []) => send(w, create_voice(studio, req, &dir)),
+        ("GET", [name]) => match crate::speech::get(&dir, name) {
+            Some(v) => json_reply(w, 200, &v),
+            None => send(w, Err(fail(404, format!("no voice named {name}")))),
+        },
+        ("GET", [name, "sample"]) => {
+            let clip = crate::speech::sample_file(&dir, name);
+            if crate::speech::valid_name(name) && clip.is_file() {
+                serve_file(w, &clip, false, req.header("range"))
+            } else {
+                send(w, Err(fail(404, format!("no sample for {name}"))))
+            }
+        }
+        ("DELETE", [name]) => {
+            if crate::speech::remove(&dir, name) {
+                json_reply(w, 200, &Json::obj([("id", Json::str(*name)), ("object", Json::str("voice.deleted")), ("deleted", Json::Bool(true))]))
+            } else {
+                send(w, Err(fail(404, format!("no voice named {name}"))))
+            }
+        }
+        _ => send(w, Err(fail(405, "voices: GET (list), POST (save one), GET/DELETE {name}, GET {name}/sample"))),
+    }
+}
+
+/// Design a voice from a description and save it under its name.
+fn create_voice(studio: &Arc<Studio>, req: &Request, dir: &std::path::Path) -> Result<Reply, Reply> {
+    let body = parse_body(req)?;
+    if incognito_mode(studio) || incognito_header(req) || body.get("incognito").and_then(Json::as_bool) == Some(true) {
+        return Err(fail(400, "incognito keeps nothing, so voices are not saved; turn incognito off to save one"));
+    }
+    let name = body.get("name").and_then(Json::as_str).unwrap_or("").trim().to_string();
+    if crate::speech::get(dir, &name).is_some() && body.get("replace").and_then(Json::as_bool) != Some(true) {
+        return Err(fail(409, format!("a voice named {name} already exists; delete it first, or send replace: true")));
+    }
+    let cfg = studio.config();
+    let (request, model, label) = crate::speech::voice_request(&cfg, &studio.root, &media::day_dir(&studio.output_root(), "voices"), &body).map_err(|e| fail(400, e))?;
+    let job = studio.media.submit(Kind::Speech, request, model, format!("voice: {label}"), 1, 0.0, keep_jobs(&cfg), None);
+    let done = studio.media.wait(&job.id, SPEECH_WAIT).ok_or_else(|| fail(500, "the job disappeared"))?;
+    if done.status != "completed" {
+        return Err(fail(if done.status == "in_progress" { 504 } else { 500 }, done.error.unwrap_or_else(|| format!("voice job {}", done.status))));
+    }
+    let path = |k: &str| done.result.get(k).and_then(Json::as_str).map(std::path::PathBuf::from).ok_or_else(|| fail(500, format!("the voice job returned no {k}")));
+    let voice = crate::speech::keep(dir, &label, &path("voice_file")?, &path("path")?).map_err(|e| fail(500, e))?;
+    // Its files have moved into the voices folder; the job has nothing left to show.
+    studio.media.remove(&done.id);
+    ok(voice)
 }
 
 /// OpenAI Images: generate, wait, and answer with base64 PNGs or URLs.

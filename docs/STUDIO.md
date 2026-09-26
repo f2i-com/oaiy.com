@@ -51,6 +51,9 @@ The console accepts `status`, `start`, `stop`, `open`, `jobs` and `quit`.
     downloaded or removed.
   - The Playground has Chat, Image and Video tabs sized to the window. Chat
     renders Markdown, can stop a reply mid-stream, and takes a system prompt.
+    Speech speaks text in a saved voice, an OpenAI voice name, or a voice
+    described in words, and **Save this voice…** keeps a described voice
+    (see [Speech](SPEECH.md)).
     Video comes with sound when the model has its audio VAE (a
     **Sound** switch turns it off). Image and Video put the controls beside a
     stage showing the latest result,
@@ -98,6 +101,7 @@ headers, never its weights, and decides what it is:
 | SDXL `.safetensors` | `modelspec.architecture` or `conditioner.embedders.*` | an SDXL image model |
 | LTX 2.3 / 2.5, Sulphur | `__metadata__.model_version` and its `config` | a video model (2.3 files carry their own VAE) |
 | LTX 2.5 ComfyUI folder | `diffusion_models/`, `text_encoders/`, `vae/` | a complete video model (with sound when its `vae/` holds the audio VAE) |
+| Qwen3-TTS folder | `config.json` `model_type: qwen3_tts` (VoiceDesign or Base) | half of a speech model; the other half completes it |
 | LTX audio VAE | `audio_vae.*` with `vocoder.bwe_generator.*` | the optional audio VAE of every video model that lacks one (LTX 2.3 and Sulphur checkpoints are their own) |
 | LoRA `.safetensors` | `lora_A`/`lora_B` keys | the turbo adapter of a Qwen Image model |
 | Text encoders | vocabulary size (Qwen3-VL ~152k, Gemma 262k) or `gemma_config` | the encoder of an image or video model |
@@ -195,10 +199,12 @@ The **Endpoints** page edits `gateway.routes`. Each route has a `path`, a
 |---|---|---|
 | `chat` | `POST` → nrob-server `/v1/chat/completions`, streamed through as it arrives | — |
 | `completions` | `POST` → `/v1/completions` | — |
-| `models` | the LLM's list plus image and video models (`type`: llm, image, video) | — |
+| `models` | the LLM's list plus image, video and speech models (`type`: llm, image, video, speech) | — |
 | `images` | OpenAI Images (below) | nrob-server's job API: `202 {id, status_url}`, `GET …/status`, `POST …/cancel` |
 | `edits` | OpenAI image edits (below) | — |
 | `videos` | OpenAI Videos (below) | the same job API for video |
+| `speech` | OpenAI audio.speech: the audio itself ([Speech](SPEECH.md)) | the same |
+| `voices` | saved voices: list, design and save, sample, delete ([Speech](SPEECH.md)) | the same |
 | `files` | generated media under the output folder | — |
 | `health` | `{status, llm, media_busy}`, never behind the key | — |
 

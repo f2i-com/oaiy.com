@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 pub const FILE_NAME: &str = "nrob-studio.json";
 
 /// What a gateway route serves.
-pub const TARGETS: [&str; 9] = ["chat", "completions", "models", "images", "edits", "videos", "health", "files", "discovery"];
+pub const TARGETS: [&str; 11] = ["chat", "completions", "models", "images", "edits", "videos", "health", "files", "discovery", "speech", "voices"];
 /// The request/response dialect a route speaks. `openai` is the OpenAI API;
 /// `nrob` is nrob-server's own asynchronous media job API (what coder-cli uses).
 pub const SPECS: [&str; 2] = ["openai", "nrob"];
@@ -33,7 +33,7 @@ pub const DEFAULT: &str = r#"{
     "public_url": "",
     "cors_origins": ["https://bot.computer", "http://localhost:5317", "http://127.0.0.1:5317", "http://botcomputer.localhost", "botcomputer://localhost"],
     "origins_version": 1,
-    "routes_version": 3,
+    "routes_version": 4,
     "routes": [
       { "path": "/v1/chat/completions", "method": "POST", "target": "chat", "spec": "openai", "enabled": true },
       { "path": "/v1/completions", "method": "POST", "target": "completions", "spec": "openai", "enabled": true },
@@ -41,6 +41,8 @@ pub const DEFAULT: &str = r#"{
       { "path": "/v1/images/generations", "method": "POST", "target": "images", "spec": "openai", "enabled": true },
       { "path": "/v1/images/edits", "method": "POST", "target": "edits", "spec": "openai", "enabled": true },
       { "path": "/v1/videos", "method": "POST", "target": "videos", "spec": "openai", "enabled": true },
+      { "path": "/v1/audio/speech", "method": "POST", "target": "speech", "spec": "openai", "enabled": true },
+      { "path": "/v1/audio/voices", "method": "GET", "target": "voices", "spec": "openai", "enabled": true },
       { "path": "/files", "method": "GET", "target": "files", "spec": "openai", "enabled": true },
       { "path": "/health", "method": "GET", "target": "health", "spec": "openai", "enabled": true },
       { "path": "/v1/discovery", "method": "GET", "target": "discovery", "spec": "openai", "enabled": true }
@@ -95,6 +97,12 @@ pub const DEFAULT: &str = r#"{
       "ffmpeg": "ffmpeg",
       "fps": 24,
       "models": {}
+    },
+    "speech": {
+      "enabled": true,
+      "default_model": "",
+      "voices_dir": "voices",
+      "models": {}
     }
   }
 }"#;
@@ -119,8 +127,8 @@ pub fn merge_defaults(v: &mut Json, defaults: &Json) {
 /// which it has seen). Returns whether anything changed.
 pub fn upgrade_routes(v: &mut Json) -> bool {
     /// The target each routes_version introduced.
-    const ADDED: [(i64, &str); 2] = [(2, "edits"), (3, "discovery")];
-    const VERSION: i64 = 3;
+    const ADDED: [(i64, &str); 4] = [(2, "edits"), (3, "discovery"), (4, "speech"), (4, "voices")];
+    const VERSION: i64 = 4;
     let Json::Obj(top) = v else { return false };
     let Some((_, gateway)) = top.iter_mut().find(|(k, _)| k == "gateway") else { return false };
     let from = int_or(gateway, "routes_version", 1);
@@ -411,7 +419,13 @@ pub fn validate(v: &Json) -> Result<(), String> {
             return Err(format!("video model {name} needs the Gemma 3 tokenizer.json"));
         }
     }
-    for (kind, section, models) in [("image", image, image_models), ("video", video, object(video, "models")?)] {
+    let speech = object(media, "speech")?;
+    for (name, m) in object(speech, "models")?.members() {
+        if bool_or(m, "enabled", true) && str_or(m, "design", "").trim().is_empty() && str_or(m, "base", "").trim().is_empty() {
+            return Err(format!("speech model {name} needs a VoiceDesign folder (design) or a Base folder (base)"));
+        }
+    }
+    for (kind, section, models) in [("image", image, image_models), ("video", video, object(video, "models")?), ("speech", speech, object(speech, "models")?)] {
         let d = str_or(section, "default_model", "");
         if !d.is_empty() && models.get(d).is_none() {
             return Err(format!("media.{kind}.default_model {d} is not one of its models"));
@@ -473,13 +487,12 @@ mod tests {
         assert!(upgrade_routes(&mut v));
         merge_defaults(&mut v, &default_json());
         let routes = v.get("gateway").unwrap().get("routes").unwrap().as_array().unwrap();
-        assert_eq!(routes.len(), 3);
-        assert_eq!(str_or(&routes[1], "path", ""), "/v1/images/edits");
-        assert_eq!(str_or(&routes[2], "path", ""), "/v1/discovery");
-        // A file already at version 2 gains only the discovery route.
-        let mut v2 = Json::parse(br#"{"gateway":{"routes_version":2,"routes":[]}}"#).unwrap();
-        assert!(upgrade_routes(&mut v2));
-        assert_eq!(v2.get("gateway").unwrap().get("routes").unwrap().len(), 1);
+        let paths: Vec<&str> = routes.iter().map(|r| str_or(r, "path", "")).collect();
+        assert_eq!(paths, ["/v1/chat/completions", "/v1/images/edits", "/v1/audio/speech", "/v1/audio/voices", "/v1/discovery"]);
+        // A file already at version 3 gains only the speech routes.
+        let mut v3 = Json::parse(br#"{"gateway":{"routes_version":3,"routes":[]}}"#).unwrap();
+        assert!(upgrade_routes(&mut v3));
+        assert_eq!(v3.get("gateway").unwrap().get("routes").unwrap().len(), 2);
         assert!(!upgrade_routes(&mut v), "a second load changes nothing");
         validate(&v).unwrap();
     }

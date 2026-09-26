@@ -258,7 +258,7 @@ pre.example { background: var(--well); border: 1px solid var(--line); border-rad
 
 .bench { display: grid; grid-template-columns: minmax(300px, 400px) minmax(0, 1fr); gap: clamp(14px, 1.6vw, 24px); height: var(--play-h); min-height: 460px; }
 .controls { display: grid; grid-template-rows: minmax(0, 1fr) auto; border: 1px solid var(--line); border-radius: 12px; background: var(--panel); overflow: hidden; }
-.controls .scroll { overflow-y: auto; padding: 16px; display: grid; gap: 16px; align-content: start; }
+.controls .scroll { overflow-y: auto; padding: 16px; display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; align-content: start; }
 .controls .go-bar { padding: 12px 16px; border-top: 1px solid var(--line); display: grid; gap: 8px; }
 .controls .go-bar .btn.go { width: 100%; padding: 10px; font-size: 15px; }
 .controls textarea.prompt { min-height: 110px; font-size: 14px; }
@@ -293,6 +293,17 @@ pre.example { background: var(--well); border: 1px solid var(--line); border-rad
 .strip-row button[aria-pressed=true] { border-color: var(--gpu); }
 .strip-row button:focus-visible { outline: 2px solid var(--gpu); }
 .strip-row img, .strip-row video { width: 100%; height: 100%; object-fit: cover; display: block; }
+.sp-results { position: absolute; inset: 14px; display: grid; gap: 10px; align-content: start; overflow: auto; }
+.sp-item { border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; display: grid; gap: 8px; background: var(--panel); }
+.sp-item .t { font-size: 14px; line-height: 1.45; }
+.sp-item audio { width: 100%; }
+.sp-voices { display: grid; gap: 6px; }
+.sp-voice { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; font-size: 13px; min-width: 0; }
+.sp-voice .d { color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1 1 120px; min-width: 0; }
+.sp-voice .acts { display: flex; gap: 4px; margin-left: auto; }
+#sp-form .scroll > * { min-width: 0; }
+figure .audio-card { display: grid; place-items: center; aspect-ratio: 4 / 3; background: var(--panel-2); color: var(--muted); }
+figure .audio-card svg { width: 40px; height: 40px; stroke: currentColor; fill: none; stroke-width: 1.4; }
 @media (max-width: 1080px) {
   .bench { grid-template-columns: minmax(0, 1fr); height: auto; }
   .controls { grid-template-rows: auto auto; }
@@ -441,6 +452,7 @@ dialog::backdrop { background: var(--backdrop); }
         <div class="ptabs" role="tablist">
           <button role="tab" aria-selected="true" data-tab="chat"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12a8 8 0 01-11.6 7.1L4 20l1-4.6A8 8 0 1121 12z"/></svg>Chat</button>
           <button role="tab" aria-selected="false" data-tab="image"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="9" cy="10" r="2"/><path d="M21 17l-5-5-9 8"/></svg>Image</button>
+          <button role="tab" aria-selected="false" data-tab="speech"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0014 0M12 18v3"/></svg>Speech</button>
           <button role="tab" aria-selected="false" data-tab="video"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="6" width="13" height="12" rx="2"/><path d="M16 10l5-3v10l-5-3z"/></svg>Video</button>
         </div>
       </div>
@@ -504,6 +516,36 @@ dialog::backdrop { background: var(--backdrop); }
         </form>
       </div>
 
+      <div data-panel="speech" hidden>
+        <form class="bench" id="sp-form">
+          <div class="controls">
+            <div class="scroll">
+              <label class="f"><span>What to say</span><textarea class="prompt" id="sp-input" required placeholder="Welcome back! Here is today's summary in under a minute."></textarea></label>
+              <label class="f"><span>Voice</span><select id="sp-voice"></select></label>
+              <label class="f" id="sp-desc-row"><span>Describe the voice</span><textarea id="sp-desc" rows="3" placeholder="A warm, calm middle-aged woman with a slight Irish accent, unhurried and kind."></textarea></label>
+              <div class="grid-f" style="grid-template-columns:repeat(3,minmax(0,1fr))">
+                <label class="f"><span>Language</span><select id="sp-lang"></select></label>
+                <label class="f"><span>Speed</span><input type="number" id="sp-speed" min="0.25" max="4" step="0.05" value="1"></label>
+                <label class="f"><span>Seed</span><input type="number" id="sp-seed" min="0" placeholder="random"></label>
+              </div>
+              <label class="f"><span>Model</span><select id="sp-model"></select></label>
+              <div class="f"><div class="spread"><span class="small muted">Saved voices</span><button class="btn quiet" type="button" id="sp-refresh">Refresh</button></div><div class="sp-voices" id="sp-voices"></div></div>
+            </div>
+            <div class="go-bar">
+              <button class="btn go" type="submit" id="sp-go">Speak</button>
+              <span class="muted small" id="sp-hint">Ctrl+Enter in the text also speaks.</span>
+            </div>
+          </div>
+          <div class="stagewrap">
+            <div class="stage" id="sp-stage">
+              <div class="placeholder" id="sp-empty"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0014 0M12 18v3"/></svg><strong>Speech appears here</strong><span>Pick a voice or describe one. Like a described voice? Save it, and it stays the same from then on.</span></div>
+              <div class="sp-results" id="sp-results" hidden></div>
+              <div class="overlay" id="sp-progress" hidden><div class="spread small"><span id="sp-progress-text">Starting</span><button class="btn quiet warn" type="button" id="sp-cancel">Cancel</button></div><div class="meter"><div style="width:0"></div></div></div>
+            </div>
+          </div>
+        </form>
+      </div>
+
       <div data-panel="video" hidden>
         <form class="bench" id="vid-form">
           <div class="controls">
@@ -545,7 +587,7 @@ dialog::backdrop { background: var(--backdrop); }
       <p class="lede">Recent results from this session (incognito requests are never listed). Click one for its prompt and settings, or to reuse the prompt.</p>
       <div class="chips" id="gallery-filter">
         <button data-f="all" aria-pressed="true">All</button><button data-f="image" aria-pressed="false">Images</button>
-        <button data-f="video" aria-pressed="false">Videos</button><button data-f="active" aria-pressed="false">In progress</button>
+        <button data-f="video" aria-pressed="false">Videos</button><button data-f="speech" aria-pressed="false">Speech</button><button data-f="active" aria-pressed="false">In progress</button>
         <button data-f="failed" aria-pressed="false">Failed</button>
       </div>
       <div class="gallery" id="gallery"></div>
@@ -575,6 +617,7 @@ dialog::backdrop { background: var(--backdrop); }
       <div class="block"><div class="spread"><h2>Language models</h2><span class="muted small">Served on chat and completions routes</span></div><div class="list" id="m-llm"></div></div>
       <div class="block"><div class="spread"><h2>Image models</h2><span class="muted small">Served on the images route</span></div><div class="list" id="m-image"></div></div>
       <div class="block"><div class="spread"><h2>Video models</h2><span class="muted small">Served on the videos route</span></div><div class="list" id="m-video"></div></div>
+      <div class="block"><div class="spread"><h2>Speech models</h2><span class="muted small">Served on /v1/audio/speech; saved voices on /v1/audio/voices</span></div><div class="list" id="m-speech"></div></div>
     </section>
 
     <!-- Memory -->
@@ -990,6 +1033,7 @@ function modelObj(section, name) {
 }
 function missingOf(section, m) {
   const empty = k => !(m[k] || "").trim();
+  if (section === "speech") return empty("design") && empty("base") ? ["design"] : [];
   if (section === "image") return (m.architecture || "qwen-image") === "sdxl" ? ["checkpoint", "tokenizer"].filter(empty)
     : [...(empty("base") ? ["base"] : []), ...(empty("transformer") && empty("safetensors_transformer") ? ["transformer"] : [])];
   return [...["transformer", "text_encoder", "vae"].filter(empty), ...(m.family !== "ltx-2.5" && empty("tokenizer") ? ["tokenizer"] : [])];
@@ -1024,6 +1068,13 @@ function renderModels() {
         + field("Text encoder override (optional)", "image", name, "text_encoder", m.text_encoder);
     return mediaItem("image", name, m, sdxl ? "SDXL" : "Qwen Image", miss, fields);
   }).join("") : '<div class="empty">No image model yet. Add an SDXL checkpoint, a Qwen Image .gguf or .safetensors file, or a diffusers folder.</div>';
+
+  const sp = Object.entries(cfg.media.speech?.models || {});
+  $("#m-speech").innerHTML = sp.length ? sp.map(([name, m]) => {
+    const fields = field("VoiceDesign folder (speaks in described voices)", "speech", name, "design", m.design, {dir: true})
+      + field("Base folder (speaks in saved voices)", "speech", name, "base", m.base, {dir: true});
+    return mediaItem("speech", name, m, "Qwen3-TTS", missingOf("speech", m), fields);
+  }).join("") : '<div class="empty">No speech model yet. Add a Qwen3-TTS VoiceDesign folder, and its Base folder to save voices.</div>';
 
   const vid = Object.entries(cfg.media.video.models);
   $("#m-video").innerHTML = vid.length ? vid.map(([name, m]) => {
@@ -1238,6 +1289,8 @@ function renderSelects() {
   $("#chat-model").innerHTML = opts(cfg.llm.models.filter(m => m.enabled !== false).map(m => m.name), c || cfg.llm.default_model);
   $("#img-model").innerHTML = opts(Object.keys(cfg.media.image.models).filter(n => cfg.media.image.models[n].enabled !== false), i || cfg.media.image.default_model);
   $("#vid-model").innerHTML = opts(Object.keys(cfg.media.video.models).filter(n => cfg.media.video.models[n].enabled !== false), v || cfg.media.video.default_model);
+  const spm = cfg.media.speech?.models || {}, sv = keep("#sp-model");
+  $("#sp-model").innerHTML = opts(Object.keys(spm).filter(n => spm[n].enabled !== false), sv || cfg.media.speech?.default_model);
   segment($("#img-tier"), imgTier ||= cfg.media.image.memory || "auto", t => imgTier = t);
   segment($("#vid-tier"), vidTier ||= cfg.media.video.memory || "auto", t => vidTier = t);
   renderSound();
@@ -1486,20 +1539,103 @@ $("#vid-form").onsubmit = async e => {
   vidJobId = null; progress("vid", null); $("#vid-go").disabled = false;
 };
 
+/* ---------- speech ---------- */
+const STOCK_VOICES = ["alloy", "ash", "ballad", "cedar", "coral", "echo", "fable", "marin", "nova", "onyx", "sage", "shimmer", "verse"];
+const LANGUAGES = ["auto", "english", "chinese", "japanese", "korean", "german", "french", "spanish", "italian", "portuguese", "russian"];
+let savedVoices = [], spJobId = null, lastSpoken = null;
+$("#sp-lang").innerHTML = LANGUAGES.map(l => `<option value="${l}">${l === "auto" ? "Detect" : l[0].toUpperCase() + l.slice(1)}</option>`).join("");
+function renderVoicePicker() {
+  const keepVal = $("#sp-voice").value;
+  $("#sp-voice").innerHTML = `<option value="__describe">Describe a voice…</option>`
+    + (savedVoices.length ? `<optgroup label="Saved voices">${savedVoices.map(v => `<option value="${esc(v.name)}">${esc(v.name)}</option>`).join("")}</optgroup>` : "")
+    + `<optgroup label="Built-in (OpenAI names)">${STOCK_VOICES.map(v => `<option value="${v}">${v}</option>`).join("")}</optgroup>`;
+  $("#sp-voice").value = [...$("#sp-voice").options].some(o => o.value === keepVal) ? keepVal : "__describe";
+  $("#sp-desc-row").hidden = $("#sp-voice").value !== "__describe";
+  $("#sp-voices").innerHTML = savedVoices.length ? savedVoices.map(v => `<div class="sp-voice"><strong>${esc(v.name)}</strong><span class="d" title="${esc(v.description)}">${esc(v.description)}</span>
+      <span class="acts"><button class="btn quiet" type="button" data-sample="${esc(v.name)}">Play</button><button class="btn quiet" type="button" data-use="${esc(v.name)}">Use</button><button class="btn quiet warn" type="button" data-delvoice="${esc(v.name)}">Delete</button></span></div>`).join("")
+    : '<span class="muted small">None yet. Describe a voice, speak with it, then save it.</span>';
+  $$("[data-sample]").forEach(b => b.onclick = () => new Audio(fileUrl(`/api/play/voices/${encodeURIComponent(b.dataset.sample)}/sample`)).play());
+  $$("[data-use]").forEach(b => b.onclick = () => { $("#sp-voice").value = b.dataset.use; $("#sp-desc-row").hidden = true; });
+  $$("[data-delvoice]").forEach(b => b.onclick = async () => {
+    if (!await ask({title: `Delete ${b.dataset.delvoice}?`, text: "The saved voice and its sample are removed.", buttons: [{label: "Cancel", value: null}, {label: "Delete", value: "ok", kind: "warn"}]})) return;
+    try { await api(`/api/play/voices/${encodeURIComponent(b.dataset.delvoice)}`, {method: "DELETE"}); await loadVoices(); toast("Voice deleted"); } catch (e) { toast(e.message, true); }
+  });
+}
+async function loadVoices() {
+  try { savedVoices = (await api("/api/play/voices")).data || []; } catch { savedVoices = []; }
+  renderVoicePicker();
+}
+$("#sp-voice").onchange = () => { $("#sp-desc-row").hidden = $("#sp-voice").value !== "__describe"; };
+$("#sp-refresh").onclick = loadVoices;
+$("#sp-input").onkeydown = e => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); $("#sp-form").requestSubmit(); } };
+function spProgress(text, pct) {
+  const bar = $("#sp-progress");
+  if (text === null) { bar.hidden = true; return; }
+  bar.hidden = false; $("#sp-progress-text").textContent = text; $(".meter > div", bar).style.width = (pct || 0) + "%";
+}
+function watchSpeech() {
+  const tick = setInterval(() => {
+    const j = [...(state?.media?.jobs || []), ...(state?.media?.private || [])].find(j => j.kind === "speech" && (j.status === "in_progress" || j.status === "queued"));
+    if (j) { spJobId = j.id; spProgress(j.status === "queued" ? "Waiting for the GPU" : `${j.progress.toFixed(0)}%, ${j.stage.replace(/_/g, " ")}`, j.progress); }
+  }, 700);
+  return () => { clearInterval(tick); spProgress(null); spJobId = null; };
+}
+$("#sp-cancel").onclick = () => spJobId && api(`/api/jobs/${spJobId}/cancel`, {method: "POST"}).then(refresh, e => toast(e.message, true));
+function addSpeech(text, url, voice, canSave) {
+  $("#sp-empty").hidden = true; $("#sp-results").hidden = false;
+  const el = document.createElement("div"); el.className = "sp-item";
+  el.innerHTML = `<div class="spread small"><span class="muted">${esc(voice)}</span><span class="row"><a class="btn quiet" href="${esc(url)}" download="speech.wav">Save audio</a>${canSave ? '<button class="btn quiet" type="button" data-savevoice>Save this voice…</button>' : ""}</span></div>
+    <div class="t">${esc(text)}</div><audio controls autoplay src="${esc(url)}"></audio>`;
+  $("#sp-results").prepend(el);
+  const save = $("[data-savevoice]", el);
+  if (save) save.onclick = () => saveVoice(canSave);
+}
+async function saveVoice(spoken) {
+  const r = await ask({title: "Save this voice", text: "It is made from the same description, line and seed you just heard, and then stays the same in everything it says.",
+    input: {placeholder: "A name, e.g. Narrator"}, buttons: [{label: "Cancel", value: null}, {label: "Save voice", value: "ok", kind: "go"}]});
+  const name = r?.text?.trim(); if (!name) return;
+  toast("Saving the voice (about 10 seconds)…");
+  try {
+    await api("/api/play/voices", {method: "POST", body: {name, description: spoken.description, sample_text: spoken.input, language: spoken.language, seed: spoken.seed, model: spoken.model}});
+    await loadVoices(); $("#sp-voice").value = name; $("#sp-desc-row").hidden = true;
+    toast(`Saved. "${name}" is now in the voice list, and on the API as voice: "${name}".`);
+  } catch (e) { toast(e.message, true); }
+}
+$("#sp-form").onsubmit = async e => {
+  e.preventDefault();
+  const voice = $("#sp-voice").value, describe = voice === "__describe";
+  const seed = $("#sp-seed").value ? +$("#sp-seed").value : Math.floor(Math.random() * 2e9);
+  const body = {model: $("#sp-model").value || undefined, input: $("#sp-input").value, language: $("#sp-lang").value, speed: +$("#sp-speed").value || 1, seed, response_format: "wav"};
+  if (describe) {
+    if (!$("#sp-desc").value.trim()) return toast("Describe the voice first, or pick one", true);
+    body.instructions = $("#sp-desc").value.trim();
+  } else body.voice = voice;
+  $("#sp-go").disabled = true; spProgress("Starting", 1); const stop = watchSpeech();
+  try {
+    const r = await fetch("/api/play/speech", {method: "POST", headers: Object.assign({"Content-Type": "application/json"}, key ? {Authorization: "Bearer " + key} : {}, saved?.privacy?.incognito ? {"X-NROB-Incognito": "1"} : {}), body: JSON.stringify(body)});
+    if (!r.ok) { const j = await r.json().catch(() => ({})); throw new Error(j?.error?.message || r.statusText); }
+    const url = URL.createObjectURL(await r.blob());
+    const spoken = describe && body.speed === 1 ? {description: body.instructions, input: body.input, language: body.language, seed, model: body.model} : null;
+    addSpeech(body.input, url, describe ? "Described voice" : voice, spoken);
+  } catch (err) { toast(err.message, true); }
+  stop(); $("#sp-go").disabled = false; refresh();
+};
+
 /* ---------- gallery and viewer ---------- */
 let galleryJobs = [], galleryFilter = "all";
 async function refreshGallery() { try { galleryJobs = keyed((await api("/api/jobs")).jobs); renderGallery(); } catch (e) { toast(e.message, true); } }
 function renderGallery(fresh) {
   if (fresh) { const byId = new Map(galleryJobs.map(j => [j.id, j])); fresh.forEach(j => byId.set(j.id, j)); galleryJobs = [...byId.values()].sort((a, b) => b.created_at - a.created_at); }
-  const pick = {all: () => true, image: j => j.kind === "image", video: j => j.kind === "video",
+  const pick = {all: () => true, image: j => j.kind === "image", video: j => j.kind === "video", speech: j => j.kind === "speech",
     active: j => j.status === "in_progress" || j.status === "queued", failed: j => j.status === "failed"}[galleryFilter];
   const items = galleryJobs.filter(pick);
   $("#gallery").innerHTML = items.length ? items.map(j => {
     const done = j.status === "completed";
     const media = !done ? `<div class="fail" style="color:${j.status === "failed" ? "var(--bad)" : "var(--muted)"}">${statusText(j)}</div>`
       : j.kind === "video" ? `<video src="${esc(j.files[0] || "")}" poster="${esc(j.preview || "")}" muted loop playsinline preload="none" onmouseenter="this.play()" onmouseleave="this.pause()"></video>`
+      : j.kind === "speech" ? `<div class="audio-card"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0014 0M12 18v3"/></svg></div>`
       : `<img src="${esc(j.preview || j.files[0] || "")}" alt="${esc(j.prompt)}" loading="lazy">`;
-    return `<figure data-job="${j.id}">${media}<figcaption><span class="p">${esc(j.prompt.slice(0, 60))}</span><span>${esc(j.kind === "video" ? (j.seconds ? j.seconds.toFixed(1) + " s" : "video") : (j.files.length > 1 ? j.files.length + " images" : j.size))}</span></figcaption></figure>`;
+    return `<figure data-job="${j.id}">${media}<figcaption><span class="p">${esc(j.prompt.slice(0, 60))}</span><span>${esc(j.kind === "video" || j.kind === "speech" ? (j.seconds ? j.seconds.toFixed(1) + " s" : j.kind) : (j.files.length > 1 ? j.files.length + " images" : j.size))}</span></figcaption></figure>`;
   }).join("") : '<div class="empty">Nothing here yet. Generate something in the Playground.</div>';
   $$("#gallery figure").forEach(f => f.onclick = () => openViewer(f.dataset.job));
 }
@@ -1510,8 +1646,9 @@ function openViewer(id) {
   const file = j.files[0];
   $("#viewer-media").innerHTML = j.status !== "completed" ? `<div class="empty" style="padding:40px">${statusText(j)}</div>`
     : j.kind === "video" ? `<video src="${esc(file)}" poster="${esc(j.preview || "")}" controls autoplay loop playsinline></video>`
+    : j.kind === "speech" ? `<div style="padding:40px;width:100%"><audio src="${esc(file)}" controls autoplay style="width:100%"></audio></div>`
     : `<img src="${esc(file)}" alt="${esc(j.prompt)}">`;
-  $("#viewer-title").textContent = j.kind === "video" ? "Video" : j.files.length > 1 ? `Image 1 of ${j.files.length}` : "Image";
+  $("#viewer-title").textContent = j.kind === "video" ? "Video" : j.kind === "speech" ? "Speech" : j.files.length > 1 ? `Image 1 of ${j.files.length}` : "Image";
   $("#viewer-prompt").textContent = j.prompt;
   const st = j.settings || {}, r = j.residency?.transformer || j.residency;
   const rows = [["Model", j.model], ["Size", j.size], ["Seed", st.seed], ["Steps", st.steps], ["Memory", st.memory],
@@ -1523,8 +1660,8 @@ function openViewer(id) {
   $("#viewer-actions").innerHTML = (file ? `<a class="btn" href="${esc(file)}" target="_blank">Open</a><a class="btn" href="${esc(file)}" download>Download</a>` : "")
     + `<button class="btn" id="viewer-reuse">Reuse prompt</button><button class="btn quiet warn" id="viewer-delete">Remove from list</button>` + others;
   $("#viewer-reuse").onclick = () => {
-    const tab = j.kind === "video" ? "video" : "image";
-    $(`#${tab === "video" ? "vid" : "img"}-prompt`).value = j.prompt;
+    const tab = j.kind === "video" ? "video" : j.kind === "speech" ? "speech" : "image";
+    $(tab === "speech" ? "#sp-input" : `#${tab === "video" ? "vid" : "img"}-prompt`).value = j.prompt;
     $("#viewer").close(); show("play"); $(`#v-play .ptabs button[data-tab=${tab}]`).click();
   };
   if (!j.status.match(/completed|failed|cancelled/)) $("#viewer-delete").textContent = "Cancel and remove";
@@ -1570,7 +1707,7 @@ async function refresh() {
 }
 async function refreshSystem() { try { sys = await api("/api/system"); renderHardware(); } catch {} }
 (async () => {
-  await refresh(); await refreshSystem(); await loadConfig(); renderState(); renderHardware();
+  await refresh(); await refreshSystem(); await loadConfig(); renderState(); renderHardware(); loadVoices();
   try { const t = localStorage.getItem("studio-play-tab"); if (t) $(`#v-play .ptabs button[data-tab=${t}]`)?.click(); } catch {}
   { const [hv, ht] = location.hash.slice(1).split(":"); if (hv === "play" && ht) $(`#v-play .ptabs button[data-tab=${ht}]`)?.click(); }
   { let v = location.hash.slice(1).split(":")[0]; try { v ||= localStorage.getItem("studio-view"); } catch {} if (v && $("#v-" + v)) show(v); }

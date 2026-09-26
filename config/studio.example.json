@@ -9,7 +9,7 @@
     "port": 8080,
     "api_key": "",
     "public_url": "",
-    "routes_version": 3,
+    "routes_version": 4,
     "routes": [
       {
         "path": "/v1/chat/completions",
@@ -50,6 +50,20 @@
         "path": "/v1/videos",
         "method": "POST",
         "target": "videos",
+        "spec": "openai",
+        "enabled": true
+      },
+      {
+        "path": "/v1/audio/speech",
+        "method": "POST",
+        "target": "speech",
+        "spec": "openai",
+        "enabled": true
+      },
+      {
+        "path": "/v1/audio/voices",
+        "method": "GET",
+        "target": "voices",
         "spec": "openai",
         "enabled": true
       },
@@ -163,6 +177,18 @@
           "vae": "models/sulphur_distil_bf16.safetensors",
           "text_encoder": "models/gemma_3_12B_it.safetensors",
           "tokenizer": "models/gemma-3/tokenizer.json",
+          "enabled": true
+        }
+      }
+    },
+    "speech": {
+      "enabled": true,
+      "default_model": "qwen3-tts",
+      "voices_dir": "voices",
+      "models": {
+        "qwen3-tts": {
+          "design": "models/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
+          "base": "models/Qwen3-TTS-12Hz-1.7B-Base",
           "enabled": true
         }
       }
