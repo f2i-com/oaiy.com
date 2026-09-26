@@ -39,6 +39,11 @@
     errexit: false,
     oldpwd: null,
     depth: 0,
+    // name -> { assoc, map: Map(key -> value) }: indexed arrays keep numeric keys.
+    arrays: {},
+    dirstack: [],
+    traps: {},
+    optpos: 1,
   };
 
   /* ---------------- paths ---------------- */
@@ -67,11 +72,14 @@
   function dirName(p) { p = String(p).replace(/\/+$/, ""); const i = p.lastIndexOf("/"); if (i < 0) return "."; return i === 0 ? "/" : p.slice(0, i); }
 
   /* ---------------- fs helpers ---------------- */
+  // Files that exist only for this run: the output of <(command).
+  const virtualFiles = {};
+  let virtualNext = 63;
   const fs = {
-    stat(p) { return callJson("fs.stat", resolve(p)); },
+    stat(p) { const a = resolve(p); if (Object.prototype.hasOwnProperty.call(virtualFiles, a)) return { type: "file", size: virtualFiles[a].length, mtime_ms: Date.now() }; return callJson("fs.stat", a); },
     isDir(p) { const s = fs.stat(p); return !!s && s.type === "dir"; },
     isFile(p) { const s = fs.stat(p); return !!s && s.type === "file"; },
-    read(p) { return call("fs.read", resolve(p)); },
+    read(p) { const a = resolve(p); if (Object.prototype.hasOwnProperty.call(virtualFiles, a)) return virtualFiles[a]; return call("fs.read", a); },
     write(p, t) { call("fs.write", resolve(p), t); },
     append(p, t) { call("fs.append", resolve(p), t); },
     list(p) { return callJson("fs.list", resolve(p)); },
@@ -146,8 +154,38 @@
       }
       heredocs.length = 0;
     }
+    // Where a command can begin: (( here is arithmetic, not two subshells.
+    function atCommandStart() {
+      const last = toks[toks.length - 1];
+      if (!last) return true;
+      if (last.t === "op") return ["(", "{", ";", "&&", "||", "|", "&", ";;"].includes(last.v);
+      if (last.t === "word") return ["do", "then", "else", "elif", "for", "while", "until", "if", "!", "{"].includes(plain(last));
+      return false;
+    }
     while (i < src.length) {
       const c = src[i];
+      if (c === "(" && src[i + 1] === "(" && !word && atCommandStart()) {
+        i += 2;
+        const start = i;
+        let depth = 0;
+        while (i < src.length) {
+          if (src[i] === "(") depth++;
+          else if (src[i] === ")") { if (depth === 0 && src[i + 1] === ")") break; depth--; }
+          i++;
+        }
+        if (i >= src.length) throw new ShellError("syntax error: expected ))");
+        toks.push({ t: "arith", expr: src.slice(start, i) });
+        i += 2;
+        continue;
+      }
+      // <(command): its output as a file.
+      if (c === "<" && src[i + 1] === "(") { i += 2; pushPart(readBalanced("(", ")"), 3); continue; }
+      // name=( ... ): an array literal, kept whole for the assignment.
+      if (c === "(" && word && word.parts.length === 1 && word.parts[0].q === 0 && /^[A-Za-z_][A-Za-z0-9_]*(\[[^\]]*\])?\+?=$/.test(word.parts[0].s)) {
+        i++;
+        pushPart(readBalanced("(", ")"), 4);
+        continue;
+      }
       if (c === "\n") {
         endWord(); toks.push({ t: "op", v: ";", nl: true }); i++;
         if (heredocs.length) readHeredocBodies();
@@ -282,6 +320,18 @@
       }
     }
     function parseCommand() {
+      if (peek() && peek().t === "arith") {
+        const node = { t: "arithcmd", expr: toks[k++].expr, redirs: [] };
+        parseRedirs(node);
+        return node;
+      }
+      if (isKw("function") && plain(toks[k + 1])) {
+        const name = plain(toks[k + 1]); k += 2;
+        if (isOp("(") && toks[k + 1] && toks[k + 1].t === "op" && toks[k + 1].v === ")") k += 2;
+        skipSeps();
+        const body = parseCommand();
+        return { t: "funcdef", name: name, body: body, redirs: [] };
+      }
       if (isOp("(")) {
         k++;
         const body = parseList();
@@ -314,6 +364,16 @@
         }
         expectKw("fi");
         const node = { t: "if", clauses: clauses, orelse: orelse, redirs: [] };
+        parseRedirs(node);
+        return node;
+      }
+      if (isKw("for") && toks[k + 1] && toks[k + 1].t === "arith") {
+        k++;
+        const parts = toks[k++].expr.split(";");
+        if (parts.length !== 3) throw new ShellError("syntax error: for (( init; condition; step ))");
+        skipSeps(); expectKw("do");
+        const body = parseList(["done"]); expectKw("done");
+        const node = { t: "cfor", init: parts[0], cond: parts[1], step: parts[2], body: body, redirs: [] };
         parseRedirs(node);
         return node;
       }
@@ -382,7 +442,7 @@
         if (t.t === "redir") { parseRedirs(node); continue; }
         if (t.t !== "word") break;
         const p = plain(t);
-        if (node.words.length === 0 && t.parts[0].q === 0 && /^[A-Za-z_][A-Za-z0-9_]*=/.test(t.parts[0].s)) {
+        if (node.words.length === 0 && t.parts[0].q === 0 && /^[A-Za-z_][A-Za-z0-9_]*(\[[^\]]*\])?\+?=/.test(t.parts[0].s)) {
           node.assigns.push(t); k++; continue;
         }
         if (node.words.length === 0 && p !== null && ["then", "do", "done", "fi", "elif", "else", "esac", "}"].includes(p)) break;
@@ -403,26 +463,223 @@
   /* ---------------- expansion ---------------- */
   const functions = {};
   let positional = [];
+  const startedAt = Date.now();
+  /* arrays */
+  function arrayOf(name, create, assoc) {
+    let a = state.arrays[name];
+    if (!a && create) {
+      a = state.arrays[name] = { assoc: !!assoc, map: new Map() };
+      if (Object.prototype.hasOwnProperty.call(state.env, name)) { a.map.set("0", state.env[name]); delete state.env[name]; }
+    }
+    return a || null;
+  }
+  function arrayKeys(a) {
+    const keys = Array.from(a.map.keys());
+    return a.assoc ? keys : keys.sort((x, y) => Number(x) - Number(y));
+  }
+  function arrayValues(name) {
+    if (name === "@" || name === "*") return positional.slice();
+    const a = state.arrays[name];
+    if (!a) { const v = state.env[name]; return v === undefined ? [] : [String(v)]; }
+    return arrayKeys(a).map((k) => a.map.get(k));
+  }
+  function arrayKey(a, index) {
+    if (a && a.assoc) return expandString(index, true);
+    let n = Number(arith(index));
+    if (n < 0 && a) { const keys = arrayKeys(a); n = keys.length ? Number(keys[keys.length - 1]) + 1 + n : 0; }
+    return String(n);
+  }
+  function setVar(name, value, append) {
+    const m = /^([A-Za-z_][A-Za-z0-9_]*)\[(.*)\]$/.exec(name);
+    if (m) {
+      const a = arrayOf(m[1], true);
+      const key = arrayKey(a, m[2]);
+      a.map.set(key, append ? (a.map.get(key) || "") + value : value);
+      return;
+    }
+    const a = state.arrays[name];
+    if (a) { a.map.set("0", append ? (a.map.get("0") || "") + value : value); return; }
+    state.env[name] = append ? (state.env[name] || "") + value : value;
+  }
+  function setArray(name, values, append, assoc) {
+    let a = state.arrays[name];
+    if (!a || !append) { delete state.env[name]; a = state.arrays[name] = { assoc: !!(assoc || (a && a.assoc)), map: new Map() }; }
+    let next = a.assoc ? 0 : (a.map.size ? Math.max.apply(null, Array.from(a.map.keys()).map(Number)) + 1 : 0);
+    for (const v of values) {
+      const kv = /^\[([^\]]*)\]=(.*)$/s.exec(v);
+      if (kv) { const key = a.assoc ? kv[1] : String(Number(arith(kv[1]))); a.map.set(key, kv[2]); if (!a.assoc) next = Number(key) + 1; }
+      else a.map.set(String(next++), v);
+    }
+  }
+  // The words inside ( ... ) of an array assignment.
+  function arrayWords(inner) {
+    const words = tokenize(inner).filter((t) => t.t === "word");
+    return expandWords(words);
+  }
   function getVar(name) {
     if (name === "?") return String(state.last);
     if (name === "#") return String(positional.length);
     if (name === "@" || name === "*") return positional.join(" ");
     if (name === "PWD") return state.cwd;
     if (name === "$") return "1";
+    if (name === "SECONDS") return String(Math.floor((Date.now() - startedAt) / 1000));
+    if (name === "BASH_VERSION") return "5.2.21(1)-release";
+    if (name === "OLDPWD") return state.oldpwd || "";
+    if (Object.prototype.hasOwnProperty.call(state.arrays, name)) { const a = state.arrays[name]; return a.map.has("0") ? a.map.get("0") : ""; }
     if (name === "RANDOM") return String(Math.floor(Math.random() * 32768));
     if (/^[0-9]$/.test(name)) return name === "0" ? "sandbox-sh" : (positional[Number(name) - 1] || "");
     const v = state.env[name];
     return v === undefined ? "" : String(v);
   }
+  // $(( )) and (( )): integers, variables (assignable), C operators.
   function arith(expr) {
-    let e = expandString(expr, true);
-    e = e.replace(/[A-Za-z_][A-Za-z0-9_]*/g, (n) => String(Number(getVar(n)) || 0));
-    if (!/^[0-9+\-*/%()<>=!&|^~ \t?:]*$/.test(e)) throw new ShellError("arithmetic: unsupported expression: " + expr);
-    const v = Function("return (" + (e.trim() || "0") + ");")();
-    return String(Math.trunc(Number(v) || 0));
+    const src = expandString(String(expr), true);
+    let i = 0;
+    const toks = [];
+    while (i < src.length) {
+      const c = src[i];
+      if (/\s/.test(c)) { i++; continue; }
+      let m = /^(0[xX][0-9a-fA-F]+|[0-9]+#[0-9a-zA-Z]+|[0-9]+)/.exec(src.slice(i));
+      if (m) {
+        const t = m[1];
+        let v;
+        if (/^0[xX]/.test(t)) v = parseInt(t, 16);
+        else if (t.includes("#")) { const [b, d] = t.split("#"); v = parseInt(d, Number(b)); }
+        else if (/^0[0-7]+$/.test(t)) v = parseInt(t, 8);
+        else v = Number(t);
+        toks.push({ t: "n", v: v }); i += t.length; continue;
+      }
+      m = /^[A-Za-z_][A-Za-z0-9_]*/.exec(src.slice(i));
+      if (m) {
+        let name = m[0]; i += name.length;
+        if (src[i] === "[") { let depth = 0, j = i; for (; j < src.length; j++) { if (src[j] === "[") depth++; else if (src[j] === "]") { depth--; if (depth === 0) break; } } name += src.slice(i, j + 1); i = j + 1; }
+        toks.push({ t: "v", v: name }); continue;
+      }
+      m = /^(<<=|>>=|\*\*|\+\+|--|<<|>>|<=|>=|==|!=|&&|\|\||\+=|-=|\*=|\/=|%=|&=|\^=|\|=|[-+*/%<>=!~&^|?:(),])/.exec(src.slice(i));
+      if (!m) throw new ShellError("arithmetic: syntax error near '" + src.slice(i) + "'");
+      toks.push({ t: "o", v: m[0] }); i += m[0].length;
+    }
+    let k = 0;
+    const peek = () => toks[k];
+    const isOp = (v) => toks[k] && toks[k].t === "o" && toks[k].v === v;
+    const readVar = (name) => {
+      const m2 = /^([A-Za-z_][A-Za-z0-9_]*)\[(.*)\]$/.exec(name);
+      const raw = m2 ? paramExpand(m2[1] + "[" + m2[2] + "]") : getVar(name);
+      if (raw === "") return 0;
+      if (/^-?\d+$/.test(raw.trim())) return Number(raw.trim());
+      if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(raw.trim()) && raw.trim() !== name) return readVar(raw.trim());
+      return Number(raw) || 0;
+    };
+    const writeVar = (name, v) => { setVar(name, String(v)); return v; };
+    const int = (v) => (v < 0 ? Math.ceil(v) : Math.floor(v));
+    function primary() {
+      const t = toks[k++];
+      if (!t) throw new ShellError("arithmetic: expression expected");
+      if (t.t === "n") return { v: t.v };
+      if (t.t === "v") {
+        if (isOp("++") || isOp("--")) { const op = toks[k++].v; const old = readVar(t.v); writeVar(t.v, old + (op === "++" ? 1 : -1)); return { v: old }; }
+        return { v: readVar(t.v), name: t.v };
+      }
+      if (t.v === "(") { const v = comma(); if (!isOp(")")) throw new ShellError("arithmetic: ) expected"); k++; return { v: v }; }
+      if (t.v === "++" || t.v === "--") { const n = toks[k++]; if (!n || n.t !== "v") throw new ShellError("arithmetic: variable expected after " + t.v); return { v: writeVar(n.v, readVar(n.v) + (t.v === "++" ? 1 : -1)) }; }
+      if (t.v === "-") return { v: -unary().v };
+      if (t.v === "+") return { v: unary().v };
+      if (t.v === "!") return { v: unary().v ? 0 : 1 };
+      if (t.v === "~") return { v: ~unary().v };
+      throw new ShellError("arithmetic: syntax error near '" + t.v + "'");
+    }
+    function unary() { return primary(); }
+    function power() { const a = unary(); if (isOp("**")) { k++; const b = power(); return { v: Math.pow(a.v, b.v) }; } return a; }
+    const levels = [["*", "/", "%"], ["+", "-"], ["<<", ">>"], ["<", "<=", ">", ">="], ["==", "!="], ["&"], ["^"], ["|"]];
+    function binary(level) {
+      if (level < 0) return power();
+      let a = binary(level - 1);
+      while (peek() && peek().t === "o" && levels[level].includes(peek().v)) {
+        const op = toks[k++].v;
+        const b = binary(level - 1).v;
+        let v = a.v;
+        switch (op) {
+          case "*": v = v * b; break;
+          case "/": if (b === 0) throw new ShellError("arithmetic: division by 0"); v = int(v / b); break;
+          case "%": if (b === 0) throw new ShellError("arithmetic: division by 0"); v = v % b; break;
+          case "+": v = v + b; break;
+          case "-": v = v - b; break;
+          case "<<": v = v << b; break;
+          case ">>": v = v >> b; break;
+          case "<": v = v < b ? 1 : 0; break;
+          case "<=": v = v <= b ? 1 : 0; break;
+          case ">": v = v > b ? 1 : 0; break;
+          case ">=": v = v >= b ? 1 : 0; break;
+          case "==": v = v === b ? 1 : 0; break;
+          case "!=": v = v !== b ? 1 : 0; break;
+          case "&": v = v & b; break;
+          case "^": v = v ^ b; break;
+          case "|": v = v | b; break;
+        }
+        a = { v: v };
+      }
+      return a;
+    }
+    function logicAnd() { let a = binary(levels.length - 1); while (isOp("&&")) { k++; const b = binary(levels.length - 1); a = { v: a.v && b.v ? 1 : 0 }; } return a; }
+    function logicOr() { let a = logicAnd(); while (isOp("||")) { k++; const b = logicAnd(); a = { v: a.v || b.v ? 1 : 0 }; } return a; }
+    function ternary() {
+      const c = logicOr();
+      if (!isOp("?")) return c;
+      k++;
+      const a = assign();
+      if (!isOp(":")) throw new ShellError("arithmetic: : expected");
+      k++;
+      const b = assign();
+      return { v: c.v ? a.v : b.v };
+    }
+    function assign() {
+      const at = k;
+      const t = toks[k];
+      if (t && t.t === "v" && toks[k + 1] && toks[k + 1].t === "o" && /^(=|\+=|-=|\*=|\/=|%=|<<=|>>=|&=|\^=|\|=)$/.test(toks[k + 1].v)) {
+        const op = toks[k + 1].v; k += 2;
+        const b = assign().v;
+        const old = op === "=" ? 0 : readVar(t.v);
+        let v;
+        switch (op) {
+          case "=": v = b; break;
+          case "+=": v = old + b; break;
+          case "-=": v = old - b; break;
+          case "*=": v = old * b; break;
+          case "/=": if (b === 0) throw new ShellError("arithmetic: division by 0"); v = int(old / b); break;
+          case "%=": v = old % b; break;
+          case "<<=": v = old << b; break;
+          case ">>=": v = old >> b; break;
+          case "&=": v = old & b; break;
+          case "^=": v = old ^ b; break;
+          case "|=": v = old | b; break;
+        }
+        return { v: writeVar(t.v, v) };
+      }
+      k = at;
+      return ternary();
+    }
+    function comma() { let a = assign(); while (isOp(",")) { k++; a = assign(); } return a.v; }
+    if (!toks.length) return "0";
+    const value = comma();
+    if (k < toks.length) throw new ShellError("arithmetic: syntax error near '" + (toks[k].v) + "'");
+    return String(Math.trunc(value));
   }
   function paramExpand(inner) {
     let m;
+    if ((m = /^#([A-Za-z_][A-Za-z0-9_]*)\[[@*]\]$/.exec(inner))) return String(arrayValues(m[1]).length);
+    if ((m = /^!([A-Za-z_][A-Za-z0-9_]*)\[[@*]\]$/.exec(inner))) { const a = state.arrays[m[1]]; return a ? arrayKeys(a).join(" ") : (m[1] in state.env ? "0" : ""); }
+    if ((m = /^([A-Za-z_][A-Za-z0-9_]*)\[[@*]\](?::(-?[0-9]+)(?::([0-9]+))?)?$/.exec(inner))) {
+      let vals = arrayValues(m[1]);
+      if (m[2] !== undefined) { let start = Number(m[2]); if (start < 0) start = Math.max(0, vals.length + start); vals = m[3] === undefined ? vals.slice(start) : vals.slice(start, start + Number(m[3])); }
+      return vals.join(" ");
+    }
+    if ((m = /^(#?)([A-Za-z_][A-Za-z0-9_]*)\[(.+)\]$/.exec(inner))) {
+      const a = state.arrays[m[2]];
+      let v;
+      if (!a) v = arrayKey(null, m[3]) === "0" ? getVar(m[2]) : "";
+      else { const key = arrayKey(a, m[3]); v = a.map.has(key) ? a.map.get(key) : ""; }
+      return m[1] ? String(v.length) : v;
+    }
     if ((m = /^#([A-Za-z_][A-Za-z0-9_]*)$/.exec(inner))) return String(getVar(m[1]).length);
     if ((m = /^([A-Za-z_][A-Za-z0-9_]*|[0-9?#@*])(:?[-=+?])(.*)$/s.exec(inner))) {
       const v = getVar(m[1]);
@@ -475,7 +732,9 @@
           if (d === "'" || d === '"') { quote = d; continue; }
           if (d === "(") depth++; else if (d === ")") { depth--; if (depth === 0) break; }
         }
-        const r = runSub(s.slice(i + 2, j));
+        const inner = s.slice(i + 2, j);
+        const direct = /^\s*<\s*(\S+)\s*$/.exec(inner);
+        const r = direct ? fs.read(expandString(direct[1], true)) : runSub(inner);
         out += r.replace(/\n+$/, ""); i = j; continue;
       }
       if (s[i + 1] === "{") {
@@ -562,6 +821,24 @@
     let cur = "", curGlob = "", has = false, quotedAny = false;
     const flush = () => { if (has || quotedAny) fields.push({ s: cur, g: curGlob }); cur = ""; curGlob = ""; has = false; quotedAny = false; };
     tok.parts.forEach((part, idx) => {
+      if (part.q === 3) {
+        const text = runSub(part.s);
+        const path = "/dev/fd/" + (virtualNext++);
+        virtualFiles[path] = text;
+        cur += path; curGlob += path; has = true;
+        return;
+      }
+      if (part.q === 4) { cur += "(" + part.s + ")"; curGlob += "(" + part.s + ")"; has = true; return; }
+      if (part.q === 2) {
+        const all = /^\$@$|^\$\{@\}$|^\$\*$|^\$\{([A-Za-z_][A-Za-z0-9_]*)\[@\]\}$|^\$\{!([A-Za-z_][A-Za-z0-9_]*)\[@\]\}$/.exec(part.s);
+        if (all && part.s !== "$*") {
+          const keysOf = (name) => { const a = state.arrays[name]; return a ? arrayKeys(a) : (name in state.env ? ["0"] : []); };
+          const list = all[2] ? keysOf(all[2]) : all[1] ? arrayValues(all[1]) : positional.slice();
+          list.forEach((el, n) => { if (n > 0) flush(); cur += el; curGlob += el.replace(/[*?[\]\\]/g, "\\$&"); quotedAny = true; });
+          if (!list.length && tok.parts.length === 1) quotedAny = false;
+          return;
+        }
+      }
       if (part.q === 1) { cur += part.s; curGlob += part.s.replace(/[*?[\]\\]/g, "\\$&"); quotedAny = true; return; }
       let text = part.s;
       if (part.q === 0 && idx === 0 && (text === "~" || text.startsWith("~/"))) text = "/" + text.slice(1).replace(/^\//, "");
@@ -587,7 +864,60 @@
     }
     return out;
   }
-  function expandWords(toks) { const out = []; for (const t of toks) out.push.apply(out, expandWord(t)); return out; }
+  // Brace expansion, on unquoted text only: {a,b}c, {1..10}, {a..e}, {01..10..2}.
+  function braceExpandText(text) {
+    for (let i = 0; i < text.length; i++) {
+      if (text[i] !== "{" || (i > 0 && text[i - 1] === "$")) continue;
+      let depth = 0, j = i, commas = [];
+      for (; j < text.length; j++) {
+        if (text[j] === "{") depth++;
+        else if (text[j] === "}") { depth--; if (depth === 0) break; }
+        else if (text[j] === "," && depth === 1) commas.push(j);
+      }
+      if (j >= text.length) return [text];
+      const inner = text.slice(i + 1, j), pre = text.slice(0, i), post = text.slice(j + 1);
+      let alts = null;
+      if (commas.length) {
+        alts = [];
+        let from = i + 1;
+        for (const c of commas.concat([j])) { alts.push(text.slice(from, c)); from = c + 1; }
+      } else {
+        const r = /^(-?\d+|[A-Za-z])\.\.(-?\d+|[A-Za-z])(?:\.\.(-?\d+))?$/.exec(inner);
+        if (r) {
+          alts = [];
+          const step = Math.abs(Number(r[3] || 1)) || 1;
+          if (/^-?\d+$/.test(r[1]) && /^-?\d+$/.test(r[2])) {
+            const a = Number(r[1]), b = Number(r[2]);
+            const width = /^-?0\d/.test(r[1]) || /^-?0\d/.test(r[2]) ? Math.max(r[1].replace("-", "").length, r[2].replace("-", "").length) : 0;
+            for (let n = a; a <= b ? n <= b : n >= b; n += a <= b ? step : -step) { const t = String(Math.abs(n)).padStart(width, "0"); alts.push((n < 0 ? "-" : "") + t); if (alts.length > 100000) break; }
+          } else if (!/\d/.test(r[1] + r[2])) {
+            const a = r[1].charCodeAt(0), b = r[2].charCodeAt(0);
+            for (let n = a; a <= b ? n <= b : n >= b; n += a <= b ? step : -step) alts.push(String.fromCharCode(n));
+          }
+        }
+      }
+      if (!alts) continue;
+      const out = [];
+      for (const alt of alts) for (const rest of braceExpandText(alt + post)) out.push(pre + rest);
+      return out;
+    }
+    return [text];
+  }
+  function braceExpand(tok) {
+    let words = [[]];
+    for (const part of tok.parts) {
+      const alts = part.q === 0 && /\{/.test(part.s) ? braceExpandText(part.s) : [part.s];
+      const next = [];
+      for (const w of words) for (const a of alts) next.push(w.concat([{ s: a, q: part.q }]));
+      words = next;
+    }
+    return words.map((parts) => ({ t: "word", parts: parts }));
+  }
+  function expandWords(toks) {
+    const out = [];
+    for (const t of toks) for (const b of braceExpand(t)) out.push.apply(out, expandWord(b));
+    return out;
+  }
 
   /* ---------------- execution ---------------- */
   function R(out, err, code) { return { out: out || "", err: err || "", code: code || 0 }; }
@@ -688,6 +1018,8 @@
         case "for": res = runFor(node, r.stdin); break;
         case "while": res = runWhile(node, r.stdin); break;
         case "case": res = runCase(node, r.stdin); break;
+        case "arithcmd": res = R("", "", Number(arith(node.expr)) !== 0 ? 0 : 1); break;
+        case "cfor": res = runCfor(node, r.stdin); break;
         default: throw new ShellError("unsupported construct " + node.t);
       }
       return finishRedirs(r, res);
@@ -716,6 +1048,20 @@
       state.env[node.name] = item;
       const ctl = loopBody(node.body, stdin, acc);
       if (ctl === "break") break;
+      if (acc.out.length > MAX_STREAM * 2) break;
+    }
+    return R(acc.out, acc.err, acc.code);
+  }
+  function runCfor(node, stdin) {
+    const acc = { out: "", err: "", code: 0 };
+    if (node.init.trim()) arith(node.init);
+    let guard = 0;
+    for (;;) {
+      if (node.cond.trim() && Number(arith(node.cond)) === 0) break;
+      if (++guard > 100000) { acc.err += "sandbox-sh: loop stopped after 100000 iterations\n"; acc.code = 1; break; }
+      const ctl = loopBody(node.body, stdin, acc);
+      if (ctl === "break") break;
+      if (node.step.trim()) arith(node.step);
       if (acc.out.length > MAX_STREAM * 2) break;
     }
     return R(acc.out, acc.err, acc.code);
@@ -754,15 +1100,20 @@
   function runSimple(node, stdin) {
     const assigns = node.assigns.map((t) => {
       const raw = t.parts[0].s;
-      const eq = raw.indexOf("=");
-      const name = raw.slice(0, eq);
-      const valueTok = { parts: [{ s: raw.slice(eq + 1), q: 0 }].concat(t.parts.slice(1)) };
-      return [name, expandWord(valueTok, { noSplit: true, noGlob: true }).join("")];
+      const m = /^([A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]*\])?)(\+?)=/.exec(raw);
+      const name = m[1], append = m[2] === "+";
+      const arr = t.parts.find((p) => p.q === 4);
+      if (arr) return [name, arrayWords(arr.s), append, true];
+      const valueTok = { parts: [{ s: raw.slice(m[0].length), q: 0 }].concat(t.parts.slice(1)) };
+      return [name, expandWord(valueTok, { noSplit: true, noGlob: true }).join(""), append, false];
     });
     const argv = expandWords(node.words);
-    if (!argv.length) { for (const [n, v] of assigns) state.env[n] = v; return R(); }
+    if (!argv.length) {
+      for (const [n, v, append, isArray] of assigns) { if (isArray) setArray(n, v, append); else setVar(n, v, append); }
+      return R();
+    }
     const savedEnv = {};
-    for (const [n, v] of assigns) { savedEnv[n] = state.env[n]; state.env[n] = v; }
+    for (const [n, v] of assigns) { if (Array.isArray(v)) continue; savedEnv[n] = state.env[n]; state.env[n] = v; }
     try { return runArgv(argv, stdin); }
     finally { for (const n of Object.keys(savedEnv)) { if (savedEnv[n] === undefined) delete state.env[n]; else state.env[n] = savedEnv[n]; } }
   }
@@ -978,7 +1329,15 @@
     for (const a of args) { const eq = a.indexOf("="); if (eq > 0) state.env[a.slice(0, eq)] = a.slice(eq + 1); else if (!(a in state.env)) state.env[a] = ""; }
     return R();
   }, "export NAME=value");
-  B("unset", (args) => { for (const a of args) if (a !== "-v" && a !== "-f") { delete state.env[a]; delete functions[a]; } return R(); });
+  B("unset", (args) => {
+    for (const a of args) {
+      if (a === "-v" || a === "-f") continue;
+      const m = /^([A-Za-z_][A-Za-z0-9_]*)\[(.*)\]$/.exec(a);
+      if (m) { const arr = state.arrays[m[1]]; if (arr) arr.map.delete(arrayKey(arr, m[2])); continue; }
+      delete state.env[a]; delete state.arrays[a]; delete functions[a];
+    }
+    return R();
+  });
   B("env printenv", (args) => {
     if (args.length === 1 && !args[0].includes("=")) { const v = state.env[args[0]]; return v === undefined ? R("", "", 1) : R(v + "\n"); }
     let i = 0; const extra = {};
@@ -1002,7 +1361,30 @@
   B("return", (args) => { throw new ReturnCtl(args.length ? Number(args[0]) : state.last); });
   B("break", (args) => { throw new LoopCtl("break", Number(args[0] || 1)); });
   B("continue", (args) => { throw new LoopCtl("continue", Number(args[0] || 1)); });
-  B("local declare typeset readonly", (args) => { for (const a of args) { if (a.startsWith("-")) continue; const eq = a.indexOf("="); if (eq > 0) state.env[a.slice(0, eq)] = a.slice(eq + 1); else if (!(a in state.env)) state.env[a] = ""; } return R(); });
+  B("local declare typeset readonly", (args) => {
+    let assoc = false, isArray = false, print = false, any = false;
+    const show = (name) => {
+      const a = state.arrays[name];
+      if (a) return "declare -" + (a.assoc ? "A" : "a") + " " + name + "=(" + arrayKeys(a).map((k) => "[" + k + "]=" + JSON.stringify(a.map.get(k))).join(" ") + ")";
+      return name in state.env ? "declare -- " + name + "=" + JSON.stringify(state.env[name]) : null;
+    };
+    let out = "";
+    for (const a of args) {
+      if (/^[-+]/.test(a)) { if (a.includes("A")) assoc = true; if (a.includes("a")) isArray = true; if (a.includes("p")) print = true; continue; }
+      any = true;
+      const m = /^([A-Za-z_][A-Za-z0-9_]*)(\+?)=([\s\S]*)$/.exec(a);
+      if (m) {
+        if (/^\([\s\S]*\)$/.test(m[3]) && (assoc || isArray || m[3].length > 1)) setArray(m[1], arrayWords(m[3].slice(1, -1)), m[2] === "+", assoc);
+        else setVar(m[1], m[3], m[2] === "+");
+        continue;
+      }
+      if (print) { const line = show(a); if (line === null) return R(out, "declare: " + a + ": not found\n", 1); out += line + "\n"; continue; }
+      if (assoc || isArray) { if (!state.arrays[a]) { delete state.env[a]; state.arrays[a] = { assoc: assoc, map: new Map() }; } else if (assoc) state.arrays[a].assoc = true; continue; }
+      if (!(a in state.env)) state.env[a] = "";
+    }
+    if (print && !any) for (const n of Object.keys(state.env).concat(Object.keys(state.arrays)).sort()) out += show(n) + "\n";
+    return R(out);
+  });
   B("read", (args, stdin) => {
     const o = opts(args, { withValue: "pdnt" });
     const names = o.a.length ? o.a : ["REPLY"];
@@ -1955,26 +2337,65 @@
   globalThis.__arr = (n) => { if (!(n in awkVars) || typeof awkVars[n] !== "object") awkVars[n] = Object.create(null); return awkVars[n]; };
   globalThis.__re = (r) => (r instanceof RegExp ? r : new RegExp(r));
 
-  B("diff", (args) => {
-    const o = opts(args, { withValue: "U" });
-    if (o.a.length !== 2) throw new ShellError("usage: diff [-u] file1 file2");
+  B("diff", (args, stdin) => {
+    const o = opts(args, { withValue: "UC", long: { "unified": "value" } });
+    if (o.a.length !== 2) throw new ShellError("usage: diff [-u] [-q] [-r] [-w] [-i] [-B] file1 file2");
     const [a, b] = o.a;
-    const ta = lines(fs.read(a)), tb = lines(fs.read(b));
-    if (ta.join("\n") === tb.join("\n")) return R("", "", 0);
-    if (o.f.q) return R("Files " + a + " and " + b + " differ\n", "", 1);
+    // diff -r: the folders' files by name.
+    if (fs.isDir(a) && fs.isDir(b)) {
+      if (!o.f.r && !o.f.recursive) return R("Common subdirectories: " + a + " and " + b + "\n", "", 0);
+      const files = (dir) => fs.walk(dir, false).entries.filter((e) => e.type === "file").map((e) => e.path.slice(resolve(dir).replace(/^\//, "").length).replace(/^\//, ""));
+      const fa = files(a), fb = files(b);
+      let out = "", err = "", code = 0;
+      for (const f of Array.from(new Set(fa.concat(fb))).sort()) {
+        if (!fa.includes(f)) { out += "Only in " + b + ": " + f + "\n"; code = 1; continue; }
+        if (!fb.includes(f)) { out += "Only in " + a + ": " + f + "\n"; code = 1; continue; }
+        const sub = builtins.diff(args.filter((x) => x !== a && x !== b && !/^-[a-zA-Z]*r/.test(x)).concat([a.replace(/\/$/, "") + "/" + f, b.replace(/\/$/, "") + "/" + f]), stdin);
+        if (sub.code) { out += (o.f.u || o.f.U !== undefined ? "diff -u " : "diff ") + a.replace(/\/$/, "") + "/" + f + " " + b.replace(/\/$/, "") + "/" + f + "\n" + sub.out; code = 1; }
+        err += sub.err;
+      }
+      return R(out, err, code);
+    }
+    const read = (f) => (f === "-" ? stdin || "" : fs.read(f));
+    const ta = lines(read(a)), tb = lines(read(b));
+    const norm = (line) => { let l = line; if (o.f.w) l = l.replace(/\s+/g, ""); else if (o.f.b) l = l.replace(/\s+/g, " ").trimEnd(); if (o.f.i) l = l.toLowerCase(); return l; };
+    const na = ta.map(norm), nb = tb.map(norm);
+    if (na.join("\n") === nb.join("\n")) return R("", "", 0);
+    if (o.f.q || o.f.brief) return R("Files " + a + " and " + b + " differ\n", "", 1);
     const n = ta.length, m = tb.length;
     if (n * m > 25000000) return R("Files " + a + " and " + b + " differ (too large to diff here)\n", "", 1);
     const lcs = Array.from({ length: n + 1 }, () => new Int32Array(m + 1));
-    for (let x = n - 1; x >= 0; x--) for (let y = m - 1; y >= 0; y--) lcs[x][y] = ta[x] === tb[y] ? lcs[x + 1][y + 1] + 1 : Math.max(lcs[x + 1][y], lcs[x][y + 1]);
+    for (let x = n - 1; x >= 0; x--) for (let y = m - 1; y >= 0; y--) lcs[x][y] = na[x] === nb[y] ? lcs[x + 1][y + 1] + 1 : Math.max(lcs[x + 1][y], lcs[x][y + 1]);
     const ops = [];
     let x = 0, y = 0;
+    // Removed lines come before added ones within a change, as diff prints them.
     while (x < n || y < m) {
-      if (x < n && y < m && ta[x] === tb[y]) { ops.push([" ", ta[x], x, y]); x++; y++; }
-      else if (y < m && (x >= n || lcs[x][y + 1] >= lcs[x + 1][y])) { ops.push(["+", tb[y], x, y]); y++; }
-      else { ops.push(["-", ta[x], x, y]); x++; }
+      if (x < n && y < m && na[x] === nb[y]) { ops.push([" ", ta[x], x, y]); x++; y++; }
+      else if (x < n && (y >= m || lcs[x + 1][y] >= lcs[x][y + 1])) { ops.push(["-", ta[x], x, y]); x++; }
+      else { ops.push(["+", tb[y], x, y]); y++; }
     }
-    const ctx = o.f.U !== undefined ? Number(o.f.U) : 3;
-    let out = "--- " + a + "\n+++ " + b + "\n";
+    // Without -u: the classic format (2c2, < old, ---, > new).
+    if (!o.f.u && o.f.U === undefined && o.f.unified === undefined) {
+      let out = "";
+      const range = (from, count) => (count <= 1 ? String(from + (count === 0 ? 0 : 1)) : (from + 1) + "," + (from + count));
+      for (let k = 0; k < ops.length;) {
+        if (ops[k][0] === " ") { k++; continue; }
+        let end = k;
+        while (end < ops.length && ops[end][0] !== " ") end++;
+        const chunk = ops.slice(k, end);
+        const del = chunk.filter((h) => h[0] === "-"), add = chunk.filter((h) => h[0] === "+");
+        const aFrom = chunk[0][2], bFrom = chunk[0][3];
+        const kind = del.length && add.length ? "c" : del.length ? "d" : "a";
+        out += (kind === "a" ? String(aFrom) : range(aFrom, del.length)) + kind + (kind === "d" ? String(bFrom) : range(bFrom, add.length)) + "\n";
+        for (const h of del) out += "< " + h[1] + "\n";
+        if (del.length && add.length) out += "---\n";
+        for (const h of add) out += "> " + h[1] + "\n";
+        k = end;
+      }
+      return R(out, "", 1);
+    }
+    const ctx = o.f.U !== undefined ? Number(o.f.U) : o.f.unified !== undefined && o.f.unified !== true ? Number(o.f.unified) : 3;
+    let out = "--- " + (o.f.L || a) + "\n+++ " + b + "\n";
     for (let k = 0; k < ops.length;) {
       if (ops[k][0] === " ") { k++; continue; }
       let start = Math.max(0, k - ctx), end = k;
@@ -1985,8 +2406,8 @@
         end += run;
       }
       const hunk = ops.slice(start, end);
-      const aStart = hunk[0][2] + 1, bStart = hunk[0][3] + 1;
       const aLen = hunk.filter((h) => h[0] !== "+").length, bLen = hunk.filter((h) => h[0] !== "-").length;
+      const aStart = hunk[0][2] + (aLen ? 1 : 0), bStart = hunk[0][3] + (bLen ? 1 : 0);
       out += "@@ -" + aStart + "," + aLen + " +" + bStart + "," + bLen + " @@\n";
       for (const h of hunk) out += h[0] + h[1] + "\n";
       k = end;
@@ -2120,6 +2541,102 @@
   for (const name of ["git", "npm", "npx", "yarn", "pnpm", "pip", "pip3", "cargo", "rustc", "go", "make", "cmake", "gcc", "g++", "clang", "java", "javac", "dotnet", "docker", "kubectl", "ssh", "scp", "sudo", "apt", "apt-get", "brew", "powershell", "pwsh", "cmd", "code", "vim", "nano", "less", "more", "top", "ps", "kill"]) {
     builtins[name] = () => R("", name + ": not available in the sandbox shell (there are no real processes here). Do the work with the built-in commands, node/js, python, or the file tools.\n", 127);
   }
+  B("let", (args) => { let v = "0"; for (const a of args) v = arith(a); return R("", "", Number(v) !== 0 ? 0 : 1); }, "let EXPR...   (arithmetic, like (( )))");
+  B("expr", (args) => {
+    // expr: arithmetic, comparison and string operations on separate words.
+    let k = 0;
+    const isNum = (v) => /^-?\d+$/.test(String(v));
+    function prim() {
+      const t = args[k++];
+      if (t === undefined) throw new ShellError("syntax error: missing argument");
+      if (t === "(") { const v = or(); if (args[k] !== ")") throw new ShellError("syntax error: expected )"); k++; return v; }
+      if (t === "length") return String(String(prim()).length);
+      if (t === "substr") { const str = String(prim()), pos = Number(prim()), len = Number(prim()); return str.substr(pos - 1, len); }
+      if (t === "index") { const str = String(prim()), chars = String(prim()); let best = 0; for (const c of chars) { const i = str.indexOf(c); if (i >= 0 && (best === 0 || i + 1 < best)) best = i + 1; } return String(best); }
+      if (t === "match") { const str = String(prim()), re = String(prim()); return matchRe(str, re); }
+      return t;
+    }
+    function matchRe(str, re) {
+      const m = new RegExp("^(?:" + breToEre(re) + ")").exec(str);
+      if (!m) return /\\\(/.test(re) ? "" : "0";
+      return m.length > 1 ? (m[1] === undefined ? "" : m[1]) : String(m[0].length);
+    }
+    function colon() { let a = prim(); while (args[k] === ":") { k++; a = matchRe(String(a), String(prim())); } return a; }
+    function mul() { let a = colon(); while (["*", "/", "%"].includes(args[k])) { const op = args[k++]; const b = colon(); if (!isNum(a) || !isNum(b)) throw new ShellError("non-integer argument"); if (op !== "*" && Number(b) === 0) throw new ShellError("division by zero"); a = String(op === "*" ? Number(a) * Number(b) : op === "/" ? Math.trunc(Number(a) / Number(b)) : Number(a) % Number(b)); } return a; }
+    function add() { let a = mul(); while (["+", "-"].includes(args[k])) { const op = args[k++]; const b = mul(); if (!isNum(a) || !isNum(b)) throw new ShellError("non-integer argument"); a = String(op === "+" ? Number(a) + Number(b) : Number(a) - Number(b)); } return a; }
+    function cmp() { let a = add(); while (["=", "==", "!=", "<", "<=", ">", ">="].includes(args[k])) { const op = args[k++]; const b = add(); const both = isNum(a) && isNum(b); const x = both ? Number(a) : String(a), y = both ? Number(b) : String(b); const r = op === "=" || op === "==" ? x === y : op === "!=" ? x !== y : op === "<" ? x < y : op === "<=" ? x <= y : op === ">" ? x > y : x >= y; a = r ? "1" : "0"; } return a; }
+    function and() { let a = cmp(); while (args[k] === "&") { k++; const b = cmp(); a = a !== "" && a !== "0" && b !== "" && b !== "0" ? a : "0"; } return a; }
+    function or() { let a = and(); while (args[k] === "|") { k++; const b = and(); a = a !== "" && a !== "0" ? a : b; } return a; }
+    const v = or();
+    if (k < args.length) throw new ShellError("syntax error: unexpected argument '" + args[k] + "'");
+    return R(v + "\n", "", v === "" || v === "0" ? 1 : 0);
+  }, "expr ARG OP ARG   (arithmetic, comparisons, length/substr/index/match, STR : RE)");
+  B("pushd", (args) => {
+    const dir = args[0];
+    if (dir === undefined) { if (!state.dirstack.length) return R("", "pushd: no other directory\n", 1); const top = state.dirstack.shift(); state.dirstack.unshift(state.cwd); state.cwd = top; }
+    else { const abs = resolve(dir); if (!fs.isDir(abs)) return R("", "pushd: " + dir + ": No such directory\n", 1); state.dirstack.unshift(state.cwd); state.oldpwd = state.cwd; state.cwd = abs; }
+    return R([state.cwd].concat(state.dirstack).join(" ") + "\n");
+  }, "pushd DIR / popd / dirs");
+  B("popd", () => {
+    if (!state.dirstack.length) return R("", "popd: directory stack empty\n", 1);
+    state.oldpwd = state.cwd; state.cwd = state.dirstack.shift();
+    return R([state.cwd].concat(state.dirstack).join(" ") + "\n");
+  });
+  B("dirs", (args) => R((args.includes("-v") ? [state.cwd].concat(state.dirstack).map((d, i) => " " + i + "  " + d).join("\n") : [state.cwd].concat(state.dirstack).join(" ")) + "\n"));
+  B("trap", (args) => {
+    if (!args.length || args[0] === "-p") return R(Object.keys(state.traps).map((sig) => "trap -- '" + state.traps[sig] + "' " + sig).join("\n") + (Object.keys(state.traps).length ? "\n" : ""));
+    if (args[0] === "-l") return R(" 1) SIGHUP  2) SIGINT  3) SIGQUIT 15) SIGTERM\n");
+    const action = args[0];
+    for (const raw of args.slice(1)) {
+      const sig = raw.replace(/^SIG/, "") === "0" ? "EXIT" : raw.replace(/^SIG/, "");
+      if (action === "-" || action === "") delete state.traps[sig]; else state.traps[sig] = action;
+    }
+    return R();
+  }, "trap 'commands' EXIT   (runs when the command line finishes; signals do not happen here)");
+  B("getopts", (args) => {
+    if (args.length < 2) return R("", "getopts: usage: getopts optstring name [arg ...]\n", 2);
+    const spec = args[0], name = args[1];
+    const list = args.length > 2 ? args.slice(2) : positional;
+    let ind = Number(state.env.OPTIND || 1);
+    if (ind === 1 && state.optpos < 1) state.optpos = 1;
+    const silent = spec.startsWith(":");
+    const arg = list[ind - 1];
+    if (arg === undefined || arg === "--" || !arg.startsWith("-") || arg === "-") {
+      if (arg === "--") state.env.OPTIND = String(ind + 1);
+      state.env[name] = "?";
+      state.optpos = 1;
+      return R("", "", 1);
+    }
+    const ch = arg[state.optpos];
+    let err = "";
+    const at = spec.indexOf(ch);
+    const advance = () => { state.optpos++; if (state.optpos >= arg.length) { ind++; state.optpos = 1; } };
+    if (at < 0 || ch === ":") {
+      state.env[name] = "?";
+      if (silent) state.env.OPTARG = ch; else { delete state.env.OPTARG; err = "sandbox-sh: illegal option -- " + ch + "\n"; }
+      advance();
+    } else if (spec[at + 1] === ":") {
+      if (state.optpos + 1 < arg.length) { state.env.OPTARG = arg.slice(state.optpos + 1); ind++; state.optpos = 1; }
+      else if (list[ind] !== undefined) { state.env.OPTARG = list[ind]; ind += 2; state.optpos = 1; }
+      else {
+        if (silent) { state.env[name] = ":"; state.env.OPTARG = ch; } else { state.env[name] = "?"; err = "sandbox-sh: option requires an argument -- " + ch + "\n"; }
+        ind++; state.optpos = 1;
+        state.env.OPTIND = String(ind);
+        return R("", err, 0);
+      }
+      state.env[name] = ch;
+    } else {
+      state.env[name] = ch;
+      delete state.env.OPTARG;
+      advance();
+    }
+    state.env.OPTIND = String(ind);
+    return R("", err, 0);
+  }, "getopts OPTSTRING NAME [ARGS]");
+  B("less more most pager", (args, stdin) => builtins.cat(args.filter((a) => !a.startsWith("-") && !a.startsWith("+")), stdin));
+  for (const name of ["vi", "vim", "nvim", "nano", "emacs", "pico", "ed"]) {
+    builtins[name] = () => R("", name + ": there is no interactive editor here. Write files with cat > file <<'EOF' ... EOF, change them with sed -i or patch, or use the agent's file tools.\n", 127);
+  }
   B("help", () => R(
     "bot.computer sandbox shell — emulated on the Zipp VM, confined to the project folder (/ is the project root).\n" +
     "Syntax: pipes |, && ||, ;, redirects > >> < 2> 2>&1 &>, heredocs <<EOF, $VAR ${VAR:-x} $(cmd) $((1+2)), globs * ? ** [..],\n" +
@@ -2136,6 +2653,7 @@
     const src = String(input.command || "");
     const r = runSource(src, typeof input.stdin === "string" ? input.stdin : "");
     result = r;
+    if (state.traps.EXIT) { const t = runSource(state.traps.EXIT, ""); result = R(result.out + t.out, result.err + t.err, result.code); }
   } catch (e) {
     if (e instanceof ShellExit) result = R(e.out || "", e.err || "", e.code);
     else if (e instanceof LoopCtl) result = R("", "", 0);

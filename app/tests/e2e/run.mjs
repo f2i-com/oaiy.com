@@ -178,6 +178,24 @@ try {
     expect(r.esm.stdout === 'hi there 3\n', `esm: ${JSON.stringify(r.esm)}`);
     expect(r.pkg.stdout === '007\n', `pkg: ${JSON.stringify(r.pkg)}`);
   });
+
+  await check('the shell has bash syntax: arrays, brace expansion, arithmetic, C-style for, "$@", <(...), getopts, trap', async () => {
+    const script = [
+      'arr=(a "b c" d); echo ${#arr[@]} "${arr[1]}" ${arr[-1]}',
+      'declare -A m; m[x]=1; m[y]=2; for k in "${!m[@]}"; do printf "%s=%s " "$k" "${m[$k]}"; done; echo',
+      'f() { for a in "$@"; do printf "<%s>" "$a"; done; echo; }; f one "two three"',
+      'echo {1..3} {a,b}x',
+      'i=2; ((i++)); ((j = i * 4)); echo $i $j $((j % 5))',
+      'for ((n = 0; n < 3; n++)); do printf "%d" $n; done; echo',
+      'diff <(echo same; echo old) <(echo same; echo new) | head -1',
+      'opts() { OPTIND=1; while getopts "vo:" c; do case $c in v) printf "v ";; o) printf "o=%s " "$OPTARG";; esac; done; echo; }; opts -v -o out',
+      'trap "echo bye" EXIT',
+      'echo end',
+    ].join('\n');
+    const r = await page.evaluate((src) => window.__bot.shell(src), script);
+    const want = '3 b c d\nx=1 y=2 \n<one><two three>\n1 2 3 ax bx\n3 12 2\n012\n2c2\nv o=out \nend\nbye\n';
+    expect(r.report.stdout === want, `stdout: ${JSON.stringify(r.report.stdout)} stderr: ${r.report.stderr}`);
+  });
 } finally {
   await browser.close();
   await server.close();
