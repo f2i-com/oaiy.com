@@ -8,6 +8,7 @@ pub mod unet;
 pub mod vae;
 pub mod vae_layers;
 
+use crate::residency::{Budget, Memory};
 use crate::weights::Weights;
 use candle_core::{DType, Device, Result, Tensor};
 use candle_nn::VarBuilder;
@@ -29,6 +30,8 @@ pub struct Request {
     pub seed: u64,
     pub device: usize,
     pub clip_skip: usize,
+    /// Resident on the GPU, or staged component by component (see `Stages`).
+    pub budget: Budget,
 }
 impl Request {
     pub fn parse(j: &Json) -> std::result::Result<Self, String> {
@@ -120,6 +123,7 @@ impl Request {
             seed: number("seed", 0, 0, i64::MAX - count as i64)? as u64,
             device: number("device", 0, 0, 255)?,
             clip_skip: number("clip_skip", 1, 1, 11)?,
+            budget: Budget::parse(j)?,
         };
         for p in [&r.checkpoint, &r.tokenizer] {
             if !p.is_file() {
@@ -130,6 +134,13 @@ impl Request {
     }
 }
 
+const CLIP_L: &str = "conditioner.embedders.0.transformer.";
+const CLIP_G: &str = "conditioner.embedders.1.model.";
+const UNET: &str = "model.diffusion_model.";
+const VAE: &str = "first_stage_model.";
+
+/// One SDXL component's tensors, read on the CPU (that is where the checkpoint's
+/// FP16 bytes are converted) and placed on `dev`.
 fn component(
     w: &mut Weights,
     prefix: &str,
@@ -154,6 +165,72 @@ fn component(
     Ok(tensors)
 }
 
+/// SDXL's four components, fetched per stage when they are not all resident.
+///
+/// The UNet's skip connections make block streaming awkward, so SDXL tiers by
+/// component instead: in `ram`/`ssd` mode (or `auto` when the checkpoint does not
+/// fit the VRAM budget) only the stage running holds VRAM -- the two CLIP encoders
+/// while prompts are encoded, then the UNet, then the VAE. Host copies of each
+/// component are kept while the RAM budget allows (`ram`/`auto`); the rest are
+/// read from the SSD again for each image.
+struct Stages {
+    weights: Weights,
+    host: HashMap<&'static str, HashMap<String, Tensor>>,
+    ram_left: u64,
+    host_bytes: u64,
+    streamed_bytes: u64,
+}
+impl Stages {
+    fn fetch(&mut self, prefix: &'static str, dev: &Device, dtype: DType) -> Result<HashMap<String, Tensor>> {
+        if let Some(host) = self.host.get(prefix) {
+            return host.iter().map(|(k, t)| Ok((k.clone(), t.to_device(dev)?))).collect();
+        }
+        let cpu = component(&mut self.weights, prefix, &Device::Cpu, dtype)?;
+        let bytes: u64 = cpu.values().map(crate::weights::bytes_of).sum();
+        self.streamed_bytes += bytes;
+        let placed = cpu.iter().map(|(k, t)| Ok((k.clone(), t.to_device(dev)?))).collect::<Result<_>>()?;
+        if bytes <= self.ram_left {
+            self.ram_left -= bytes;
+            self.host_bytes += bytes;
+            self.host.insert(prefix, cpu);
+        }
+        Ok(placed)
+    }
+    fn clips(&mut self, dev: &Device, dtype: DType) -> Result<(text_encoder::ClipL, text_encoder::ClipG)> {
+        Ok((
+            text_encoder::ClipL::load(
+                &config::CLIPConfig::clip_l_14_336(),
+                VarBuilder::from_tensors(self.fetch(CLIP_L, dev, dtype)?, dtype, dev),
+            )?,
+            text_encoder::ClipG::load(
+                &config::CLIPConfig::open_clip_g_14_laion2b(),
+                VarBuilder::from_tensors(self.fetch(CLIP_G, dev, dtype)?, dtype, dev),
+            )?,
+        ))
+    }
+    fn unet(&mut self, dev: &Device, dtype: DType) -> Result<unet::UNet2DConditionModel> {
+        unet::UNet2DConditionModel::load(
+            &config::UNetConfig::sdxl_1_0(),
+            VarBuilder::from_tensors(self.fetch(UNET, dev, dtype)?, dtype, dev),
+        )
+    }
+    fn vae(&mut self, dev: &Device) -> Result<vae::AutoencoderKL> {
+        // FP32 decoding avoids overflow in original SDXL VAEs.
+        vae::AutoencoderKL::load(
+            &config::VaeConfig::sdxl_default(),
+            VarBuilder::from_tensors(self.fetch(VAE, dev, DType::F32)?, DType::F32, dev),
+        )
+    }
+}
+
+/// Every component on the GPU for the whole batch.
+struct Resident {
+    cl: text_encoder::ClipL,
+    cg: text_encoder::ClipG,
+    unet: unet::UNet2DConditionModel,
+    vae: vae::AutoencoderKL,
+}
+
 fn clip_ids(
     tokenizer: &tokenizers::Tokenizer,
     prompt: &str,
@@ -170,6 +247,37 @@ fn clip_ids(
     ids.push(49407);
     ids.resize(77, pad);
     Ok((Tensor::from_vec(ids, (1, 77), dev)?, n + 1, raw.len() > 75))
+}
+
+/// Prompt and negative through both CLIPs: (context, pooled label, truncated).
+fn encode_prompt(
+    r: &Request,
+    tokenizer: &tokenizers::Tokenizer,
+    cl: &text_encoder::ClipL,
+    cg: &text_encoder::ClipG,
+    prompt: &str,
+    dev: &Device,
+) -> Result<(Tensor, Tensor, bool)> {
+    let mut encoded = Vec::new();
+    let mut truncated = false;
+    for p in [prompt, &r.negative] {
+        let (l, _, tl) = clip_ids(tokenizer, p, 49407, dev)?;
+        // OpenCLIP-G pads with zero; CLIP-L pads with EOT.
+        let (g, eot, tg) = clip_ids(tokenizer, p, 0, dev)?;
+        encoded.push(text_encoder::dual_encode(cl, cg, &l, &g, &[eot], r.clip_skip)?);
+        truncated |= tl || tg;
+    }
+    let context = Tensor::cat(&[&encoded[0].context, &encoded[1].context], 0)?;
+    // SDXL's six micro-conditioning values are height, width, top, left, height, width.
+    let size = (r.height as u32, r.width as u32);
+    let y = Tensor::cat(
+        &encoded
+            .iter()
+            .map(|e| micro_cond::build_label_y(&e.pooled, size, (0, 0), size))
+            .collect::<Result<Vec<_>>>()?,
+        0,
+    )?;
+    Ok((context, y, truncated))
 }
 
 pub fn generate(r: &Request, mut event: impl FnMut(Json)) -> Result<Json> {
@@ -212,45 +320,28 @@ pub fn generate(r: &Request, mut event: impl FnMut(Json)) -> Result<Json> {
         .write(true)
         .open(out.join("manifest.jsonl"))?;
     event(Json::obj([("stage", Json::str("loading_sdxl"))]));
-    let mut weights = Weights::open(&r.checkpoint)?;
-    let cl = text_encoder::ClipL::load(
-        &config::CLIPConfig::clip_l_14_336(),
-        VarBuilder::from_tensors(
-            component(
-                &mut weights,
-                "conditioner.embedders.0.transformer.",
-                &dev,
-                dtype,
-            )?,
-            dtype,
-            &dev,
-        ),
-    )?;
-    let cg = text_encoder::ClipG::load(
-        &config::CLIPConfig::open_clip_g_14_laion2b(),
-        VarBuilder::from_tensors(
-            component(&mut weights, "conditioner.embedders.1.model.", &dev, dtype)?,
-            dtype,
-            &dev,
-        ),
-    )?;
-    let unet = unet::UNet2DConditionModel::load(
-        &config::UNetConfig::sdxl_1_0(),
-        VarBuilder::from_tensors(
-            component(&mut weights, "model.diffusion_model.", &dev, dtype)?,
-            dtype,
-            &dev,
-        ),
-    )?;
-    // FP32 decoding avoids overflow in original SDXL VAEs.
-    let vae = vae::AutoencoderKL::load(
-        &config::VaeConfig::sdxl_default(),
-        VarBuilder::from_tensors(
-            component(&mut weights, "first_stage_model.", &dev, DType::F32)?,
-            DType::F32,
-            &dev,
-        ),
-    )?;
+    // The checkpoint's FP16 size is what its components take on the device.
+    let checkpoint_bytes = std::fs::metadata(&r.checkpoint)?.len();
+    let resident = match r.budget.memory {
+        Memory::Gpu => true,
+        Memory::Auto => checkpoint_bytes <= r.budget.vram_limit(&dev)?,
+        Memory::Ram | Memory::Ssd => false,
+    };
+    let mut stages = Stages {
+        weights: Weights::open(&r.checkpoint)?,
+        host: HashMap::new(),
+        ram_left: if matches!(r.budget.memory, Memory::Auto | Memory::Ram) { r.budget.ram_bytes } else { 0 },
+        host_bytes: 0,
+        streamed_bytes: 0,
+    };
+    let models = if resident {
+        let (cl, cg) = stages.clips(&dev, dtype)?;
+        let unet = stages.unet(&dev, dtype)?;
+        let vae = stages.vae(&dev)?;
+        Some(Resident { cl, cg, unet, vae })
+    } else {
+        None
+    };
     let load_seconds = clock.elapsed().as_secs_f64();
     let sigmas = scheduler::sdxl_default_sigmas(r.steps);
     let mut files = Vec::new();
@@ -261,36 +352,28 @@ pub fn generate(r: &Request, mut event: impl FnMut(Json)) -> Result<Json> {
             ("stage", Json::str("encoding_prompt")),
             ("image", Json::Int(i as i64 + 1)),
         ]));
-        let mut encoded = Vec::new();
-        let mut truncated = false;
-        for p in [prompt, &r.negative] {
-            let (l, _, tl) = clip_ids(&tokenizer, p, 49407, &dev)?;
-            // OpenCLIP-G pads with zero; CLIP-L pads with EOT.
-            let (g, eot, tg) = clip_ids(&tokenizer, p, 0, &dev)?;
-            encoded.push(text_encoder::dual_encode(
-                &cl,
-                &cg,
-                &l,
-                &g,
-                &[eot],
-                r.clip_skip,
-            )?);
-            truncated |= tl || tg;
-        }
-        let context = Tensor::cat(&[&encoded[0].context, &encoded[1].context], 0)?;
-        // SDXL's six micro-conditioning values are height, width, top, left, height, width.
-        let size = (r.height as u32, r.width as u32);
-        let y = Tensor::cat(
-            &encoded
-                .iter()
-                .map(|e| micro_cond::build_label_y(&e.pooled, size, (0, 0), size))
-                .collect::<Result<Vec<_>>>()?,
-            0,
-        )?;
+        let (context, y, truncated) = match &models {
+            Some(m) => encode_prompt(r, &tokenizer, &m.cl, &m.cg, prompt, &dev)?,
+            None => {
+                let (cl, cg) = stages.clips(&dev, dtype)?;
+                encode_prompt(r, &tokenizer, &cl, &cg, prompt, &dev)?
+            }
+        };
         let seed = r.seed + i as u64;
         dev.set_seed(seed)?;
         let mut x = scheduler::build_initial_noise(1, r.height / 8, r.width / 8, sigmas[0], &dev)?;
         let mut state = scheduler::SamplerState::default();
+        let staged_unet = if models.is_none() {
+            event(Json::obj([("stage", Json::str("loading_unet")), ("image", Json::Int(i as i64 + 1))]));
+            Some(stages.unet(&dev, dtype)?)
+        } else {
+            None
+        };
+        let unet = match (&models, &staged_unet) {
+            (Some(m), _) => &m.unet,
+            (None, Some(u)) => u,
+            (None, None) => unreachable!("a staged UNet is loaded whenever none is resident"),
+        };
         let sampling = Instant::now();
         for step in 0..r.steps {
             let scaled = scheduler::scale_input_for_euler(&x, sigmas[step])?.to_dtype(dtype)?;
@@ -311,6 +394,8 @@ pub fn generate(r: &Request, mut event: impl FnMut(Json)) -> Result<Json> {
                 ("steps", Json::Int(r.steps as i64)),
             ]));
         }
+        drop(staged_unet);
+        drop(context);
         dev.synchronize()?;
         let sampling_seconds = sampling.elapsed().as_secs_f64();
         event(Json::obj([
@@ -318,8 +403,15 @@ pub fn generate(r: &Request, mut event: impl FnMut(Json)) -> Result<Json> {
             ("image", Json::Int(i as i64 + 1)),
         ]));
         let decode = Instant::now();
-        let rgb = vae
-            .decode(&x)?
+        let decoded = match &models {
+            Some(m) => m.vae.decode(&x)?,
+            None if i == 0 => {
+                event(Json::obj([("stage", Json::str("loading_vae")), ("image", Json::Int(i as i64 + 1))]));
+                stages.vae(&dev)?.decode(&x)?
+            }
+            None => stages.vae(&dev)?.decode(&x)?,
+        };
+        let rgb = decoded
             .squeeze(0)?
             .permute((1, 2, 0))?
             .contiguous()?
@@ -372,6 +464,15 @@ pub fn generate(r: &Request, mut event: impl FnMut(Json)) -> Result<Json> {
         ("output_dir", Json::str(out.to_string_lossy())),
         ("load_seconds", Json::Num(load_seconds)),
         ("seconds", Json::Num(clock.elapsed().as_secs_f64())),
+        (
+            "residency",
+            Json::obj([
+                ("budget", r.budget.to_json()),
+                ("mode", Json::str(if resident { "resident" } else { "staged" })),
+                ("ram_bytes", Json::Int(stages.host_bytes as i64)),
+                ("disk_bytes_read", Json::Int(stages.streamed_bytes as i64)),
+            ]),
+        ),
     ]))
 }
 

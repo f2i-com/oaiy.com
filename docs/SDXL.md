@@ -88,8 +88,12 @@ examples, not latency guarantees.
 - `clip_skip: 1` means the standard SDXL penultimate layer; `2` selects one layer
   earlier. UI conventions differ, so these are explicit worker semantics.
 - UNet/text encoders use BF16 on CUDA; VAE decoding uses FP32 for stability.
-  Peak memory increases with resolution. Generation requires enough free GPU
-  memory; the server's existing controller handoff frees the image GPU first.
+  Peak memory increases with resolution. With `memory: "gpu"` (or `auto` when
+  the checkpoint fits the VRAM cap) every component stays resident. With `ram` or
+  `ssd` (or `auto` when it does not fit) the worker stages by component: the CLIP
+  encoders, then the UNet, then the VAE each hold VRAM only while they run, with
+  host copies kept up to `ram_gb`. The images are identical; see
+  [STUDIO.md](STUDIO.md#memory-ssd-ram-and-gpu).
 - Each batch saves PNG files and `manifest.jsonl` with prompts, seed, checkpoint,
   settings and load/sampling/decode timings. Different runtimes need not produce
   pixel-identical output from the same numeric seed.

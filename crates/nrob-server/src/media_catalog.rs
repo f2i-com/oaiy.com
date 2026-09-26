@@ -72,6 +72,7 @@ pub(crate) fn read_directory(root: &Path) -> Result<Config, String> {
         image_model: None,
         text_encoder: None,
         sdxl: None,
+        image_memory: Json::obj([] as [(&str, Json); 0]),
     };
     if c.controller_device == c.image_device {
         return Err("image and controller devices must differ".into());
@@ -115,6 +116,13 @@ pub(crate) fn image(c: &Config, selected: Option<&str>) -> Result<Config, String
     } else if selected.is_some() {
         return Err("image catalog has no named models".into());
     }
+    // Catalog-wide residency, overridable per model like every other field.
+    snapshot.image_memory = Json::Obj(
+        ["memory", "ram_gb", "vram_gb"]
+            .into_iter()
+            .filter_map(|k| j.get(k).map(|v| (k.to_string(), v.clone())))
+            .collect(),
+    );
     match j.get("architecture").and_then(Json::as_str).unwrap_or("qwen-image") {
         "sdxl" => {
             let checkpoint = required_path(root, &j, "checkpoint")?;

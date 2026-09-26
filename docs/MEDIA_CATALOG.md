@@ -102,6 +102,16 @@ steps: sampling plus decoding took approximately 2.2-2.3 seconds per image.
 Cold loading is additional; submit a batch to amortize model loading across
 images. Timings vary with disk caching and concurrent GPU workloads.
 
+## Weight residency
+
+`image.json` (top level, or per model) accepts `memory` (`auto`, `gpu`, `ram`,
+`ssd`), `ram_gb` and `vram_gb`, and `video.json` accepts the same keys. The
+catalog values are defaults and caps: a request may name another mode, or less
+RAM or VRAM, but never more. Qwen Image places each of its transformer blocks
+and text-encoder layers on the GPU, in RAM or on the SSD; SDXL stages by
+component. Without these keys, image jobs run `auto` with a 32 GiB RAM cap and
+whatever VRAM is free. See [STUDIO.md](STUDIO.md#memory-ssd-ram-and-gpu).
+
 ## Project-owned output
 
 Coder-cli supplies `Options.media_output_root` for the open project's

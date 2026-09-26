@@ -1,3 +1,4 @@
+use crate::residency::Budget;
 use crate::{reference::Reference, vision::VisionEncoder};
 use crate::{schedule, text::TextEncoder, transformer::Transformer, vae::Vae};
 use candle_core::{DType, Device, Result, Tensor};
@@ -27,6 +28,8 @@ pub struct Request {
     pub cfg: f64,
     pub images: Vec<PathBuf>,
     pub reference_size: usize,
+    /// Where the transformer and text-encoder blocks live: GPU, RAM or SSD.
+    pub budget: Budget,
 }
 impl Request {
     pub fn parse(j: &Json) -> std::result::Result<Self, String> {
@@ -111,6 +114,7 @@ impl Request {
             seed: number("seed", 0)? as u64,
             device: number("device", 0)?,
             cfg,
+            budget: Budget::parse(j)?,
         };
         r.validate()?;
         Ok(r)
@@ -234,7 +238,7 @@ pub fn generate(r: &Request, mut event: impl FnMut(Json)) -> Result<Json> {
     let reference_encoding_seconds = t.elapsed().as_secs_f64();
     event(Json::obj([("stage", Json::str("loading_text_encoder"))]));
     let text_load_start = Instant::now();
-    let encoder = TextEncoder::load(&r.base, r.text_encoder.as_deref(), &dev, dtype)?;
+    let mut encoder = TextEncoder::load(&r.base, r.text_encoder.as_deref(), &dev, dtype, &r.budget)?;
     dev.synchronize()?;
     let text_load_seconds = text_load_start.elapsed().as_secs_f64();
     let encoding_start = Instant::now();
@@ -251,13 +255,20 @@ pub fn generate(r: &Request, mut event: impl FnMut(Json)) -> Result<Json> {
     } else {
         None
     };
+    let text_residency = encoder.residency();
     drop(encoder);
     drop(features);
     dev.synchronize()?;
     let encoding_seconds = encoding_start.elapsed().as_secs_f64();
     event(Json::obj([("stage", Json::str("loading_transformer"))]));
     let load_start = Instant::now();
-    let model = Transformer::load(&r.transformer, r.adapter.as_deref(), &dev, dtype)?;
+    let mut model = Transformer::load(&r.transformer, r.adapter.as_deref(), &dev, dtype, &r.budget, |n| {
+        event(Json::obj([
+            ("stage", Json::str("loading_transformer")),
+            ("block", Json::Int(n as i64)),
+            ("blocks", Json::Int(32)),
+        ]))
+    })?;
     dev.synchronize()?;
     let transformer_load_seconds = load_start.elapsed().as_secs_f64();
     event(Json::obj([("stage", Json::str("loading_vae"))]));
@@ -397,6 +408,14 @@ pub fn generate(r: &Request, mut event: impl FnMut(Json)) -> Result<Json> {
             Json::Num(transformer_load_seconds),
         ),
         ("vae_load_seconds", Json::Num(vae_load_seconds)),
+        (
+            "residency",
+            Json::obj([
+                ("budget", r.budget.to_json()),
+                ("transformer", model.residency()),
+                ("text_encoder", text_residency),
+            ]),
+        ),
     ]))
 }
 fn save_png(path: &Path, bytes: &[u8], width: u32, height: u32) -> Result<()> {

@@ -19,6 +19,9 @@ pub struct Config {
     pub image_model: Option<String>,
     pub text_encoder: Option<PathBuf>,
     pub sdxl: Option<Json>,
+    /// Image weight residency defaults and caps from the catalog: `memory`
+    /// (auto|gpu|ram|ssd), `ram_gb`, `vram_gb`. An object; empty when unset.
+    pub image_memory: Json,
     pub worker: PathBuf,
     pub base: PathBuf,
     pub transformer: PathBuf,
@@ -55,6 +58,7 @@ impl Config {
             image_model: None,
             text_encoder: None,
             sdxl: None,
+            image_memory: Json::obj([] as [(&str, Json); 0]),
             worker: s("worker")?.into(),
             base: s("base")?.into(),
             transformer: s("transformer")?.into(),
@@ -576,6 +580,39 @@ fn prepare_video(c: &Config, body: &Json) -> Result<Json, String> {
     Ok(Json::Obj(fields))
 }
 
+/// Where the worker may keep image weights: the request's `memory`, `ram_gb` and
+/// `vram_gb`, defaulting to the catalog's and never above its caps (the same
+/// contract as video). The worker places each block on the GPU, in RAM or on the
+/// SSD accordingly; see nrob-diffusion's `residency`.
+fn image_memory(c: &Config, body: &Json) -> Result<Vec<(String, Json)>, String> {
+    let settings = &c.image_memory;
+    let memory = match body.get("memory").or_else(|| settings.get("memory")) {
+        None | Some(Json::Null) => "auto",
+        Some(v) => v.as_str().ok_or("memory must be a string")?,
+    };
+    if !["auto", "gpu", "ram", "ssd"].contains(&memory) {
+        return Err("memory must be auto, gpu, ram or ssd".into());
+    }
+    let mut fields = vec![("memory".to_string(), Json::str(memory))];
+    for (key, default, max) in [("ram_gb", Some(32), 512), ("vram_gb", None, 192)] {
+        let cap = settings.get(key).and_then(Json::as_i64).map_or(max, |n| n.clamp(0, max));
+        let value = match body.get(key) {
+            None | Some(Json::Null) => settings.get(key).and_then(Json::as_i64).map(|n| n.clamp(0, max)).or(default),
+            Some(v) => {
+                let n = v.as_i64().ok_or_else(|| format!("{key} must be an integer"))?;
+                if !(0..=cap).contains(&n) {
+                    return Err(format!("{key} must be in 0..{cap}"));
+                }
+                Some(n)
+            }
+        };
+        if let Some(n) = value {
+            fields.push((key.into(), Json::Int(n.min(cap))));
+        }
+    }
+    Ok(fields)
+}
+
 fn prepare_sdxl(c: &Config, settings: &Json, body: &Json) -> Result<Json, String> {
     // Only catalog paths can select weights. Validate before unloading the LLM.
     let value = |key| body.get(key).or_else(|| settings.get(key));
@@ -625,6 +662,7 @@ fn prepare_sdxl(c: &Config, settings: &Json, body: &Json) -> Result<Json, String
         ("output_dir".into(), Json::str(output_directory(c, body, "images")?.to_string_lossy())),
     ];
     if let Some(model) = &c.image_model { fields.push(("model".into(), Json::str(model))); }
+    fields.extend(image_memory(c, body)?);
     for key in ["prompt", "prompts"] {
         if let Some(v) = body.get(key) { fields.push((key.into(), v.clone())); }
     }
@@ -740,6 +778,7 @@ fn prepare(c: &Config, body: &Json) -> Result<Json, String> {
         ("reference_size".into(), Json::Int(reference_size)),
     ];
     if let Some(p) = &c.text_encoder { fields.push(("text_encoder".into(), Json::str(p.to_string_lossy()))); }
+    fields.extend(image_memory(c, body)?);
     if let Some(name) = &c.image_model { fields.push(("model".into(), Json::str(name))); }
     if let Some(p) = prompt {
         fields.push(("prompt".into(), p));
@@ -998,6 +1037,7 @@ mod tests {
             image_model: None,
             text_encoder: None,
             sdxl: None,
+            image_memory: Json::obj([] as [(&str, Json); 0]),
             worker: "worker".into(),
             base: "base".into(),
             transformer: "model.gguf".into(),
@@ -1091,6 +1131,29 @@ mod tests {
         assert_eq!(custom.get("transformer").and_then(Json::as_str), Some("custom.safetensors"));
         let gguf = prepare(&cfg, &Json::parse(br#"{"prompt":"x","weights":"gguf"}"#).unwrap()).unwrap();
         assert_eq!(gguf.get("transformer").and_then(Json::as_str), Some("model.gguf"));
+        std::fs::remove_dir_all(&cfg.output_root).unwrap();
+    }
+    #[test]
+    fn image_memory_defaults_to_auto_and_respects_catalog_caps() {
+        let mut cfg = config();
+        cfg.output_root = std::env::temp_dir().join(format!("nrob-image-memory-{}", std::process::id()));
+        let body = |s: &str| Json::parse(s.as_bytes()).unwrap();
+        let r = prepare(&cfg, &body(r#"{"prompt":"x"}"#)).unwrap();
+        assert_eq!(r.get("memory").and_then(Json::as_str), Some("auto"));
+        assert_eq!(r.get("ram_gb").and_then(Json::as_i64), Some(32));
+        assert!(r.get("vram_gb").is_none());
+        cfg.image_memory = body(r#"{"memory":"ssd","ram_gb":8,"vram_gb":12}"#);
+        let r = prepare(&cfg, &body(r#"{"prompt":"x"}"#)).unwrap();
+        assert_eq!(r.get("memory").and_then(Json::as_str), Some("ssd"));
+        assert_eq!(r.get("ram_gb").and_then(Json::as_i64), Some(8));
+        assert_eq!(r.get("vram_gb").and_then(Json::as_i64), Some(12));
+        let r = prepare(&cfg, &body(r#"{"prompt":"x","memory":"ram","ram_gb":4,"vram_gb":0}"#)).unwrap();
+        assert_eq!(r.get("memory").and_then(Json::as_str), Some("ram"));
+        assert_eq!(r.get("ram_gb").and_then(Json::as_i64), Some(4));
+        assert_eq!(r.get("vram_gb").and_then(Json::as_i64), Some(0));
+        for extra in [r#","ram_gb":9"#, r#","vram_gb":13"#, r#","memory":"disk""#, r#","ram_gb":"4""#] {
+            assert!(prepare(&cfg, &body(&format!(r#"{{"prompt":"x"{extra}}}"#))).is_err(), "{extra}");
+        }
         std::fs::remove_dir_all(&cfg.output_root).unwrap();
     }
     #[test]

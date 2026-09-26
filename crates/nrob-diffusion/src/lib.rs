@@ -5,6 +5,7 @@
 pub mod math;
 pub mod pipeline;
 pub mod reference;
+pub mod residency;
 pub mod schedule;
 pub mod text;
 pub mod transformer;

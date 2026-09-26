@@ -1,9 +1,10 @@
 //! Native port of the Qwen Image 2.1 single-stream transformer (Apache-2.0,
 //! Qwen/Hugging Face). Text tokens are causal and conditioned at time zero.
+use crate::residency::{Budget, Resident, Tiered};
 use crate::text::Conditioning;
 use crate::{
     math::*,
-    weights::{Linear, Weights},
+    weights::{bytes_of, Linear, Weights},
 };
 use candle_core::{DType, Device, Result, Tensor};
 use std::path::Path;
@@ -24,6 +25,63 @@ struct Block {
     up: Linear,
     down: Linear,
 }
+impl Resident for Block {
+    fn bytes(&self) -> u64 {
+        [&self.q, &self.k, &self.v, &self.o, &self.gate, &self.up, &self.down]
+            .iter()
+            .map(|l| l.bytes())
+            .sum::<u64>()
+            + bytes_of(&self.qn)
+            + bytes_of(&self.kn)
+    }
+    fn to_device(&self, dev: &Device) -> Result<Self> {
+        Ok(Self {
+            q: self.q.to_device(dev)?,
+            k: self.k.to_device(dev)?,
+            v: self.v.to_device(dev)?,
+            o: self.o.to_device(dev)?,
+            qn: self.qn.to_device(dev)?,
+            kn: self.kn.to_device(dev)?,
+            gate: self.gate.to_device(dev)?,
+            up: self.up.to_device(dev)?,
+            down: self.down.to_device(dev)?,
+        })
+    }
+}
+/// Transformer block `i`, read from the published weights onto `device`.
+fn load_block(
+    w: &mut Weights,
+    lora: &mut Option<Weights>,
+    i: usize,
+    device: &Device,
+    dtype: DType,
+) -> Result<Block> {
+    let p = format!("transformer_blocks.{i}");
+    let mut linear = |name: &str| w.linear(&format!("{p}.{name}"), device, dtype, lora);
+    let (q, k, v, o) = (
+        linear("attn.to_q")?,
+        linear("attn.to_k")?,
+        linear("attn.to_v")?,
+        linear("attn.to_out.0")?,
+    );
+    let (gate, up, down) = (
+        linear("img_mlp.gate_layer")?,
+        linear("img_mlp.proj")?,
+        linear("img_mlp.out")?,
+    );
+    Ok(Block {
+        q,
+        k,
+        v,
+        o,
+        gate,
+        up,
+        down,
+        qn: w.tensor(&format!("{p}.attn.norm_q.weight"), device, dtype)?,
+        kn: w.tensor(&format!("{p}.attn.norm_k.weight"), device, dtype)?,
+    })
+}
+const BLOCKS: usize = 32;
 pub struct Transformer {
     img: Linear,
     text1: Linear,
@@ -34,14 +92,18 @@ pub struct Transformer {
     modulation: Linear,
     norm_out: Linear,
     out: Linear,
-    blocks: Vec<Block>,
+    /// Each block on the GPU, in RAM or streamed from the SSD (see `residency`).
+    blocks: Tiered<Block>,
+    /// Kept for blocks that are re-read on every pass.
+    weights: Weights,
+    lora: Option<Weights>,
     device: Device,
     dtype: DType,
 }
 impl Transformer {
     /// Reference/text tokens are time-zero conditions. Their per-layer keys and
     /// values are independent of the seed and all six denoising timesteps.
-    pub fn prepare(&self, text: &Conditioning, refs: &[(Tensor, usize, usize)]) -> Result<Prefix> {
+    pub fn prepare(&mut self, text: &Conditioning, refs: &[(Tensor, usize, usize)]) -> Result<Prefix> {
         if text.spans.len() != refs.len() {
             candle_core::bail!("conditioning/reference count mismatch");
         }
@@ -88,19 +150,25 @@ impl Transformer {
             .forward(&candle_nn::ops::silu(&time)?)?
             .unsqueeze(0)?;
         let mut kv = Vec::new();
-        for b in &self.blocks {
-            let norm = layer_norm(&x)?.broadcast_mul(&(mods.narrow(2, 0, 4096)? + 1.)?)?;
-            let rotate = |v: Tensor| candle_nn::rotary_emb::rope_i(&v.contiguous()?, &cos, &sin);
-            let q = rotate(rms(&heads(&b.q.forward(&norm)?, 32)?, &b.qn, 1e-6)?)?;
-            let k = rotate(rms(&heads(&b.k.forward(&norm)?, 32)?, &b.kn, 1e-6)?)?;
-            let v = heads(&b.v.forward(&norm)?, 32)?;
-            x = (x + b
-                .o
-                .forward(&unheads(&block_attention(&q, &k, &v, &segments)?)?)?
-                .broadcast_mul(&mods.narrow(2, 4096, 4096)?.tanh()?)?)?;
-            let norm = layer_norm(&x)?.broadcast_mul(&(mods.narrow(2, 8192, 4096)? + 1.)?)?;
-            x = (x + swiglu(&norm, &b.gate, &b.up, &b.down)?
-                .broadcast_mul(&mods.narrow(2, 12288, 4096)?.tanh()?)?)?;
+        let (device, dtype) = (self.device.clone(), self.dtype);
+        for i in 0..BLOCKS {
+            let (w, lora) = (&mut self.weights, &mut self.lora);
+            let (next, k, v) = self.blocks.with(i, |i| load_block(w, lora, i, &device, dtype), |b| {
+                let norm = layer_norm(&x)?.broadcast_mul(&(mods.narrow(2, 0, 4096)? + 1.)?)?;
+                let rotate = |v: Tensor| candle_nn::rotary_emb::rope_i(&v.contiguous()?, &cos, &sin);
+                let q = rotate(rms(&heads(&b.q.forward(&norm)?, 32)?, &b.qn, 1e-6)?)?;
+                let k = rotate(rms(&heads(&b.k.forward(&norm)?, 32)?, &b.kn, 1e-6)?)?;
+                let v = heads(&b.v.forward(&norm)?, 32)?;
+                let x = (&x + b
+                    .o
+                    .forward(&unheads(&block_attention(&q, &k, &v, &segments)?)?)?
+                    .broadcast_mul(&mods.narrow(2, 4096, 4096)?.tanh()?)?)?;
+                let norm = layer_norm(&x)?.broadcast_mul(&(mods.narrow(2, 8192, 4096)? + 1.)?)?;
+                let x = (&x + swiglu(&norm, &b.gate, &b.up, &b.down)?
+                    .broadcast_mul(&mods.narrow(2, 12288, 4096)?.tanh()?)?)?;
+                Ok((x, k, v))
+            })?;
+            x = next;
             kv.push((k, v));
         }
         Ok(Prefix { kv, position })
@@ -123,7 +191,7 @@ impl Transformer {
             )?)?)
     }
     pub fn conditioned(
-        &self,
+        &mut self,
         latent: &Tensor,
         prefix: &Prefix,
         sigma: f64,
@@ -139,21 +207,25 @@ impl Transformer {
             .forward(&candle_nn::ops::silu(&time)?)?
             .unsqueeze(0)?;
         let mut x = self.img.forward(latent)?;
-        for (b, (pk, pv)) in self.blocks.iter().zip(&prefix.kv) {
-            let norm = layer_norm(&x)?.broadcast_mul(&(mods.narrow(2, 0, 4096)? + 1.)?)?;
-            let rotate = |v: Tensor| candle_nn::rotary_emb::rope_i(&v.contiguous()?, &cos, &sin);
-            let q = rotate(rms(&heads(&b.q.forward(&norm)?, 32)?, &b.qn, 1e-6)?)?;
-            let k = rotate(rms(&heads(&b.k.forward(&norm)?, 32)?, &b.kn, 1e-6)?)?;
-            let v = heads(&b.v.forward(&norm)?, 32)?;
-            let k = Tensor::cat(&[pk, &k], 2)?;
-            let v = Tensor::cat(&[pv, &v], 2)?;
-            x = (x + b
-                .o
-                .forward(&unheads(&attention(&q, &k, &v, 0)?)?)?
-                .broadcast_mul(&mods.narrow(2, 4096, 4096)?.tanh()?)?)?;
-            let norm = layer_norm(&x)?.broadcast_mul(&(mods.narrow(2, 8192, 4096)? + 1.)?)?;
-            x = (x + swiglu(&norm, &b.gate, &b.up, &b.down)?
-                .broadcast_mul(&mods.narrow(2, 12288, 4096)?.tanh()?)?)?;
+        let (device, dtype) = (self.device.clone(), self.dtype);
+        for (i, (pk, pv)) in prefix.kv.iter().enumerate() {
+            let (w, lora) = (&mut self.weights, &mut self.lora);
+            x = self.blocks.with(i, |i| load_block(w, lora, i, &device, dtype), |b| {
+                let norm = layer_norm(&x)?.broadcast_mul(&(mods.narrow(2, 0, 4096)? + 1.)?)?;
+                let rotate = |v: Tensor| candle_nn::rotary_emb::rope_i(&v.contiguous()?, &cos, &sin);
+                let q = rotate(rms(&heads(&b.q.forward(&norm)?, 32)?, &b.qn, 1e-6)?)?;
+                let k = rotate(rms(&heads(&b.k.forward(&norm)?, 32)?, &b.kn, 1e-6)?)?;
+                let v = heads(&b.v.forward(&norm)?, 32)?;
+                let k = Tensor::cat(&[pk, &k], 2)?;
+                let v = Tensor::cat(&[pv, &v], 2)?;
+                let x = (&x + b
+                    .o
+                    .forward(&unheads(&attention(&q, &k, &v, 0)?)?)?
+                    .broadcast_mul(&mods.narrow(2, 4096, 4096)?.tanh()?)?)?;
+                let norm = layer_norm(&x)?.broadcast_mul(&(mods.narrow(2, 8192, 4096)? + 1.)?)?;
+                &x + swiglu(&norm, &b.gate, &b.up, &b.down)?
+                    .broadcast_mul(&mods.narrow(2, 12288, 4096)?.tanh()?)?
+            })?;
         }
         let scale = (self
             .norm_out
@@ -167,6 +239,8 @@ impl Transformer {
         adapter: Option<&Path>,
         device: &Device,
         dtype: DType,
+        budget: &Budget,
+        progress: impl FnMut(usize),
     ) -> Result<Self> {
         let mut w = Weights::open(path)?;
         let mut lora = adapter.map(Weights::open).transpose()?;
@@ -192,34 +266,15 @@ impl Transformer {
             linear("proj_out")?,
         );
         let text_norm = (w.tensor("txt_in.text_norm.weight", device, DType::F32)? + 1.)?;
-        let mut blocks = Vec::new();
-        for i in 0..32 {
-            let p = format!("transformer_blocks.{i}");
-            let mut linear =
-                |name: &str| w.linear(&format!("{p}.{name}"), device, dtype, &mut lora);
-            let (q, k, v, o) = (
-                linear("attn.to_q")?,
-                linear("attn.to_k")?,
-                linear("attn.to_v")?,
-                linear("attn.to_out.0")?,
-            );
-            let (gate, up, down) = (
-                linear("img_mlp.gate_layer")?,
-                linear("img_mlp.proj")?,
-                linear("img_mlp.out")?,
-            );
-            blocks.push(Block {
-                q,
-                k,
-                v,
-                o,
-                gate,
-                up,
-                down,
-                qn: w.tensor(&format!("{p}.attn.norm_q.weight"), device, dtype)?,
-                kn: w.tensor(&format!("{p}.attn.norm_k.weight"), device, dtype)?,
-            });
-        }
+        // The small global projections above always stay on the GPU; only the
+        // 32 blocks (nearly all of the weights) are tiered.
+        let blocks = Tiered::load(
+            BLOCKS,
+            budget,
+            device,
+            |i| load_block(&mut w, &mut lora, i, device, dtype),
+            progress,
+        )?;
         Ok(Self {
             img,
             text1,
@@ -231,13 +286,20 @@ impl Transformer {
             norm_out,
             out,
             blocks,
+            weights: w,
+            lora,
             device: device.clone(),
             dtype,
         })
     }
 
+    /// Where the blocks live and how much was streamed, for the job result.
+    pub fn residency(&self) -> nrob::json::Json {
+        self.blocks.report()
+    }
+
     pub fn forward(
-        &self,
+        &mut self,
         latents: &Tensor,
         text: &Tensor,
         sigma: f64,
@@ -288,18 +350,22 @@ impl Transformer {
         let scale2 = (mods.narrow(2, 8192, 4096)? + 1.)?;
         let gate2 = mods.narrow(2, 12288, 4096)?.tanh()?;
         let (cos, sin) = rope(nt, h, w, &self.device, self.dtype)?;
-        for b in &self.blocks {
-            let norm = layer_norm(&x)?.mul(&scale1)?;
-            let rotate = |v: Tensor| candle_nn::rotary_emb::rope_i(&v.contiguous()?, &cos, &sin);
-            let q = rotate(rms(&heads(&b.q.forward(&norm)?, 32)?, &b.qn, 1e-6)?)?;
-            let k = rotate(rms(&heads(&b.k.forward(&norm)?, 32)?, &b.kn, 1e-6)?)?;
-            let v = heads(&b.v.forward(&norm)?, 32)?;
-            x = (x + b
-                .o
-                .forward(&unheads(&attention(&q, &k, &v, nt)?)?)?
-                .mul(&gate1)?)?;
-            let norm = layer_norm(&x)?.mul(&scale2)?;
-            x = (x + swiglu(&norm, &b.gate, &b.up, &b.down)?.mul(&gate2)?)?;
+        let (device, dtype) = (self.device.clone(), self.dtype);
+        for i in 0..BLOCKS {
+            let (weights, lora) = (&mut self.weights, &mut self.lora);
+            x = self.blocks.with(i, |i| load_block(weights, lora, i, &device, dtype), |b| {
+                let norm = layer_norm(&x)?.mul(&scale1)?;
+                let rotate = |v: Tensor| candle_nn::rotary_emb::rope_i(&v.contiguous()?, &cos, &sin);
+                let q = rotate(rms(&heads(&b.q.forward(&norm)?, 32)?, &b.qn, 1e-6)?)?;
+                let k = rotate(rms(&heads(&b.k.forward(&norm)?, 32)?, &b.kn, 1e-6)?)?;
+                let v = heads(&b.v.forward(&norm)?, 32)?;
+                let x = (&x + b
+                    .o
+                    .forward(&unheads(&attention(&q, &k, &v, nt)?)?)?
+                    .mul(&gate1)?)?;
+                let norm = layer_norm(&x)?.mul(&scale2)?;
+                &x + swiglu(&norm, &b.gate, &b.up, &b.down)?.mul(&gate2)?
+            })?;
         }
         let scale = (self
             .norm_out

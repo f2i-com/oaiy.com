@@ -1,5 +1,5 @@
 use candle_core::{
-    quantized::{gguf_file, QMatMul},
+    quantized::{ggml_file, gguf_file, GgmlDType, QMatMul},
     DType, Device, Module, Result, Tensor,
 };
 use dsv41::safetensors::{Dtype, StIndex};
@@ -157,6 +157,17 @@ impl Weights {
 enum Weight {
     Dense(Tensor),
     Quant(QMatMul),
+    /// A quantized matrix parked in RAM as its GGML bytes, so a RAM-tier block
+    /// uploads the ~4.5-bit payload rather than a dequantized copy.
+    HostQuant {
+        dtype: GgmlDType,
+        bytes: Vec<u8>,
+        dims: Vec<usize>,
+    },
+}
+
+fn tensor_bytes(t: &Tensor) -> u64 {
+    (t.elem_count() * t.dtype().size_in_bytes()) as u64
 }
 pub struct Linear {
     weight: Weight,
@@ -174,6 +185,9 @@ impl Linear {
             Weight::Quant(q) => q
                 .forward(&flat.to_dtype(DType::F32)?)?
                 .to_dtype(x.dtype())?,
+            Weight::HostQuant { .. } => {
+                candle_core::bail!("a RAM-resident weight was used without uploading it")
+            }
         };
         if let Some((a, b)) = &self.adapter {
             y = (y + flat.matmul(&a.t()?)?.matmul(&b.t()?)?)?;
@@ -188,4 +202,57 @@ impl Linear {
             y.dim(1)?;
         y.reshape(out_shape)
     }
+}
+
+impl Linear {
+    /// Device bytes this projection holds (weight, bias and LoRA factors).
+    pub fn bytes(&self) -> u64 {
+        let weight = match &self.weight {
+            Weight::Dense(t) => tensor_bytes(t),
+            Weight::Quant(QMatMul::QTensor(q)) => q.storage_size_in_bytes() as u64,
+            Weight::Quant(QMatMul::Tensor(t) | QMatMul::TensorF16(t)) => tensor_bytes(t),
+            Weight::HostQuant { bytes, .. } => bytes.len() as u64,
+        };
+        weight
+            + self.bias.as_ref().map_or(0, tensor_bytes)
+            + self.adapter.as_ref().map_or(0, |(a, b)| tensor_bytes(a) + tensor_bytes(b))
+    }
+
+    /// The same projection on `dev`. Quantized GGUF weights move as their raw
+    /// blocks and are rebuilt there, never dequantized on the way.
+    pub fn to_device(&self, dev: &Device) -> Result<Self> {
+        let weight = match &self.weight {
+            Weight::Dense(t) => Weight::Dense(t.to_device(dev)?),
+            Weight::Quant(QMatMul::QTensor(q)) if dev.is_cpu() => Weight::HostQuant {
+                dtype: q.dtype(),
+                bytes: q.data()?.into_owned(),
+                dims: q.shape().dims().to_vec(),
+            },
+            Weight::Quant(QMatMul::QTensor(q)) => Weight::Quant(QMatMul::from_qtensor(
+                ggml_file::qtensor_from_ggml(q.dtype(), &q.data()?, q.shape().dims().to_vec(), dev)?,
+            )?),
+            Weight::Quant(QMatMul::Tensor(t)) => Weight::Quant(QMatMul::Tensor(t.to_device(dev)?)),
+            Weight::Quant(QMatMul::TensorF16(t)) => Weight::Quant(QMatMul::TensorF16(t.to_device(dev)?)),
+            Weight::HostQuant { dtype, bytes, dims } if dev.is_cpu() => {
+                Weight::HostQuant { dtype: *dtype, bytes: bytes.clone(), dims: dims.clone() }
+            }
+            Weight::HostQuant { dtype, bytes, dims } => Weight::Quant(QMatMul::from_qtensor(
+                ggml_file::qtensor_from_ggml(*dtype, bytes, dims.clone(), dev)?,
+            )?),
+        };
+        Ok(Self {
+            weight,
+            bias: self.bias.as_ref().map(|b| b.to_device(dev)).transpose()?,
+            adapter: self
+                .adapter
+                .as_ref()
+                .map(|(a, b)| Ok::<_, candle_core::Error>((a.to_device(dev)?, b.to_device(dev)?)))
+                .transpose()?,
+        })
+    }
+}
+
+/// Device bytes of a plain tensor (norm scales and the like), for block sizes.
+pub fn bytes_of(t: &Tensor) -> u64 {
+    tensor_bytes(t)
 }
