@@ -75,6 +75,15 @@ as the high-performance adapter), greedy decoding:
 | Qwen3.8 27B Q4_K_M | 0.79 tok/s | 4.0 tok/s (14.7 GB on the GPU); 1.16 tok/s with a 6 GB budget | 40 of 40, all three |
 
 Through `nrob-server-webgpu` the 9B loads in 4.1 s and answers chat requests.
+Forcing Direct3D 12 (`WGPU_BACKEND=dx12`) passes the same parity test and gives
+the same 1B tokens at 16.8 tok/s.
+
+Only this NVIDIA card has been tested, through Vulkan and D3D12. The shaders are
+plain WGSL, but driver compilers differ, so run `cargo test -p ggml-rs-wgpu` on a
+new adapter before trusting it. The 8 GiB / 2 GiB default budgets are starting
+points, not measurements: drivers often spill oversubscribed buffers to system
+memory silently, so they get slower rather than failing. Set `--webgpu-gb` to the
+card's real memory.
 
 These runs gave the same tokens as the CPU, but that is not guaranteed in
 general: the GPU sums each dot product in a different order, so a near-tie
