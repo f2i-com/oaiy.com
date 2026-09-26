@@ -118,6 +118,7 @@ bot.computer runs three ways. All three use the same build of the same web app.
 | **On the web** | Open it from any HTTPS host (the `dist/` folder is a static site). It installs as an app from the browser and works offline. | That browser's storage for the site |
 | **On this computer** | `npm start` builds it and serves it at http://localhost:5317 | That browser's storage for `localhost:5317` |
 | **Desktop app** | The installer from `npm run desktop:build` (Windows, macOS, Linux) | The app's own webview storage |
+| **Portable app** | One file from `npm run desktop:portable`: nothing to install, run it from anywhere (a USB stick) | `bot.computer-data/` beside the exe |
 
 ```sh
 npm install          # also fetches and verifies the Zipp engine (public/zipp/, not committed)
@@ -127,6 +128,7 @@ npm start            # build and serve locally: http://localhost:5317
 npm run build        # dist/: a static site; serve it from anywhere
 npm run desktop      # the desktop app, running from the dev server
 npm run desktop:build  # the desktop app and its installer (src-tauri/target/release/bundle/)
+npm run desktop:portable  # one portable exe (src-tauri/target/release/bundle/portable/)
 node tests/e2e/desktop.mjs  # Windows: checks the built app in WebView2 (isolation, sandbox, tray, saving on quit)
 ```
 
@@ -145,6 +147,11 @@ The desktop app is a [Tauri](https://tauri.app) v2 shell around the same `dist/`
   - Quit stops the agent and saves your files and chat before exiting.
   - A hidden window isn't throttled, so long runs, video jobs and timers carry on at full speed.
 - **Links.** Links that leave the app open in your browser.
+- **Portable.** The executable is self-contained, with the web app, the Zipp engine and the SoftN runtime built into it (about 8 MB). `npm run desktop:portable` saves it as `bot.computer_<version>_x64-portable.exe`.
+  - A copy whose name contains `portable` keeps everything in a `bot.computer-data` folder beside it: projects, chats, settings and the tray preference. Nothing is written to the user profile, so the exe and that folder can move together, for example on a USB stick.
+  - It lives in the tray just like the installed app.
+  - Each portable folder is its own single instance: it runs alongside the installed app, and starting the same copy again brings its window back.
+  - It needs the system's WebView2 runtime. That is part of Windows 11 and current Windows 10; on an older Windows 10, install it once from Microsoft.
 - **Your data.** Projects, chats and settings live in the app's webview storage, separate from any browser.
 - **Building it** needs Rust and [Tauri's prerequisites](https://tauri.app/start/prerequisites/). On Windows the result is an NSIS installer (`bot.computer_<version>_x64-setup.exe`) that installs for the current user. It doesn't update itself: install a newer version over it.
 

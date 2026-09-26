@@ -15,6 +15,10 @@
 //! The app lives in the system tray: minimizing hides the window there, and
 //! (unless switched off in the tray menu) so does closing it, so the agent can
 //! keep working in the background. Quit saves the page's work before exiting.
+//!
+//! Portable: an executable whose name contains "portable" keeps everything
+//! (the webview's storage, where projects live, and its own settings) in a
+//! `bot.computer-data` folder beside itself, so the two can be carried together.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -77,12 +81,39 @@ fn serve<R: Runtime>(app: &AppHandle<R>, request: &Request<Vec<u8>>) -> Response
     response.body(asset.bytes).unwrap()
 }
 
+// --- Portable ------------------------------------------------------------------
+
+/// The data folder beside the executable, when it runs portable.
+fn portable_dir() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let name = exe.file_stem()?.to_string_lossy().to_lowercase();
+    if !name.contains("portable") {
+        return None;
+    }
+    Some(exe.parent()?.join("bot.computer-data"))
+}
+
+/// An identifier per data folder (FNV-1a of its path), so a portable copy is
+/// its own single instance: not handed over to the installed app, or to a copy
+/// elsewhere with other projects.
+fn portable_identifier(base: &str, dir: &std::path::Path) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in dir.to_string_lossy().to_lowercase().bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("{base}.portable.{hash:016x}")
+}
+
 // --- Living in the tray ------------------------------------------------------
 
 /// Whether closing the window leaves the app running in the tray (the tray menu's check box).
 struct KeepRunning(AtomicBool);
 
 fn settings_file<R: Runtime>(app: &AppHandle<R>) -> Option<PathBuf> {
+    if let Some(dir) = portable_dir() {
+        return Some(dir.join("desktop.json"));
+    }
     app.path().app_config_dir().ok().map(|dir| dir.join("desktop.json"))
 }
 
@@ -105,8 +136,9 @@ fn save_keep_running<R: Runtime>(app: &AppHandle<R>, keep: bool) {
 
 fn show_main<R: Runtime>(app: &AppHandle<R>) {
     if let Some(window) = app.get_webview_window(MAIN) {
-        let _ = window.unminimize();
+        // Shown first: a window hidden while minimized comes back minimized otherwise.
         let _ = window.show();
+        let _ = window.unminimize();
         let _ = window.set_focus();
     }
     if let Some(tray) = app.tray_by_id(MAIN) {
@@ -184,6 +216,12 @@ fn tray<R: Runtime>(app: &tauri::App<R>) -> tauri::Result<()> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let portable = portable_dir();
+    let mut context = tauri::generate_context!();
+    if let Some(dir) = &portable {
+        let id = portable_identifier(&context.config().identifier, dir);
+        context.config_mut().identifier = id;
+    }
     tauri::Builder::default()
         // A second start (a shortcut clicked while the app is in the tray) shows the running one.
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| show_main(app)))
@@ -199,8 +237,8 @@ pub fn run() {
             let for_windows = app.handle().clone();
             let dev_nav = dev.clone();
             let dev_win = dev.clone();
-            let builder = WebviewWindowBuilder::new(app, MAIN, url)
-                .title("bot.computer")
+            let mut builder = WebviewWindowBuilder::new(app, MAIN, url)
+                .title(if portable_dir().is_some() { "bot.computer (portable)" } else { "bot.computer" })
                 .inner_size(1400.0, 900.0)
                 .min_inner_size(720.0, 520.0)
                 .center()
@@ -218,6 +256,9 @@ pub fn run() {
                     open_outside(&for_windows, &url);
                     NewWindowResponse::Deny
                 });
+            if let Some(dir) = portable_dir() {
+                builder = builder.data_directory(dir.join("webview"));
+            }
             // In the tray the window is hidden, and a hidden Chromium page has its timers
             // throttled and may be frozen: the agent has to keep working there.
             #[cfg(windows)]
@@ -248,13 +289,23 @@ pub fn run() {
                 _ => {}
             }
         })
-        .run(tauri::generate_context!())
+        .run(context)
         .expect("bot.computer could not start");
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn each_portable_folder_is_its_own_instance() {
+        let a = portable_identifier("computer.bot.desktop", std::path::Path::new("E:\\USB\\bot.computer-data"));
+        let b = portable_identifier("computer.bot.desktop", std::path::Path::new("e:\\usb\\BOT.computer-data"));
+        let c = portable_identifier("computer.bot.desktop", std::path::Path::new("D:\\tools\\bot.computer-data"));
+        assert!(a.starts_with("computer.bot.desktop.portable."));
+        assert_eq!(a, b, "the same folder, however it is spelled");
+        assert_ne!(a, c);
+    }
 
     #[test]
     fn the_app_keeps_its_own_pages_and_sends_links_out() {

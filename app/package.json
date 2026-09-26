@@ -18,6 +18,7 @@
     "build:desktop": "node scripts/fetch-softn.mjs --ensure && npm run build",
     "desktop": "tauri dev",
     "desktop:build": "tauri build",
+    "desktop:portable": "node scripts/desktop-portable.mjs",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:e2e": "node tests/e2e/run.mjs && node tests/e2e/app.mjs && node tests/e2e/files.mjs && node tests/e2e/softn.mjs && node tests/e2e/csp.mjs && node tests/e2e/nrob.mjs && node tests/e2e/static.mjs --build"
