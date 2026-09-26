@@ -4,7 +4,8 @@ import type { ProviderConfig } from './agent/providers/types';
 import { HELP, internetCommand } from './commands';
 import { NetGate } from './gate/netgate';
 import { sandboxAvailable, zippModule } from './sandbox/runner';
-import { loadSettings, saveGate, saveLastProject, saveProviders } from './settings';
+import { loadSettings, saveAgentSettings, saveGate, saveLastProject, saveProviders } from './settings';
+import { budgetFor, contextWindow, detectContextWindow, formatTokens } from './agent/context';
 import { ChatPane } from './ui/chat';
 import { clear, h } from './ui/dom';
 import { EditorPane } from './ui/editor';
@@ -97,6 +98,7 @@ async function main(): Promise<void> {
   let saveGateTimer: ReturnType<typeof setTimeout> | null = null;
   let providers: ProviderConfig[] = settings.providers;
   let activeId = settings.activeProviderId;
+  let agentSettings = settings.agent;
   const activeProvider = () => providers.find((p) => p.id === activeId) ?? null;
 
   let project!: OpenProject;
@@ -180,7 +182,20 @@ async function main(): Promise<void> {
     }
     project = await OpenProject.open(meta);
     project.onError = notice;
-    agent = new Agent({ vfs: project.vfs, gate, provider: activeProvider, projectSummary: () => summarizeProject(project.meta, project.vfs, gate), softn: preview });
+    agent = new Agent({
+      vfs: project.vfs,
+      gate,
+      provider: activeProvider,
+      projectSummary: () => summarizeProject(project.meta, project.vfs, gate),
+      softn: preview,
+      compactAt: () => agentSettings.compactAt,
+      onWindow: (tokens) => {
+        const p = activeProvider();
+        if (!p?.modelId) return;
+        p.detectedContext = { model: p.modelId, tokens, how: 'the server, when a prompt was too long', at: Date.now() };
+        void saveProviders(providers, activeId);
+      },
+    });
     agent.turns = await project.loadChat();
     tree.setVfs(project.vfs);
     editor.setVfs(project.vfs);
@@ -218,13 +233,44 @@ async function main(): Promise<void> {
   };
 
   const editSettings = async () => {
-    const result = await openSettings({ providers, activeId });
+    const result = await openSettings({ providers, activeId, agent: agentSettings });
     if (!result) return;
     providers = result.providers;
     activeId = result.activeId;
+    agentSettings = result.agent;
     await saveProviders(providers, activeId);
+    await saveAgentSettings(agentSettings);
     renderChips();
   };
+
+  /**
+   * Before the first request with a model: ask its server how big its
+   * context window is (once per session), and say so, with a warning when it
+   * is too small to work in.
+   */
+  const windowsChecked = new Set<string>();
+  async function checkWindow(): Promise<void> {
+    const p = activeProvider();
+    if (!p?.modelId || p.contextTokens) return;
+    const key = `${p.id}|${p.modelId}`;
+    if (windowsChecked.has(key)) return;
+    windowsChecked.add(key);
+    if (p.type !== 'anthropic' && p.detectedContext?.model !== p.modelId) {
+      const found = await detectContextWindow(p).catch(() => null);
+      if (found) {
+        p.detectedContext = { model: p.modelId, tokens: found.tokens, how: found.how, at: Date.now() };
+        await saveProviders(providers, activeId);
+      }
+    }
+    const w = contextWindow(p);
+    const room = budgetFor(w.tokens, 6000).prompt;
+    const from = w.source === 'server' ? `from ${p.detectedContext?.how}` : w.source === 'known' ? 'known for this model' : 'assumed: the server does not say; set it in Settings';
+    chat.system(
+      `${p.modelId}: ${formatTokens(w.tokens)} tokens of context (${from}). The conversation is compacted at ${Math.round(agentSettings.compactAt * 100)}%.` +
+        (room < 8000 ? `\nThat leaves little room to work in (about ${formatTokens(room)} tokens after the instructions and tools). A bigger window helps a lot${p.serverKind === 'ollama' ? ': start Ollama with OLLAMA_CONTEXT_LENGTH=32768 (or more), then press Detect in Settings' : ''}.` : ''),
+      room < 8000 ? 'error' : 'info',
+    );
+  }
 
   /** A free path for an upload: uploads/name, uploads/name-2, … */
   function freePath(dir: string, name: string): string {
@@ -327,6 +373,7 @@ async function main(): Promise<void> {
     chat.setBusy(true);
     controller = new AbortController();
     try {
+      await checkWindow();
       let prompt = text;
       let images: ImagePart[] = [];
       let attachments: Attachment[] = [];

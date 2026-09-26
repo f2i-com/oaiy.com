@@ -8,6 +8,22 @@ A coding agent that runs entirely in your browser.
 - **Any model.** A server on your own machine (Ollama, LM Studio, llama.cpp, nrob-server — anything OpenAI-compatible), Anthropic's API, or any OpenAI-compatible API.
 - **A network gate.** `/internet on | off | allowlist | allow <host> | deny <host> | status` (or `/net`) decides every request made on the model's behalf. Requests to your AI provider are not gated.
 
+## Context and long work
+
+- **The model's context window** is found out from its server before the first request:
+  - Ollama: the size the model is loaded with;
+  - LM Studio: the loaded context length;
+  - llama.cpp: `/props`;
+  - vLLM, OpenRouter and other OpenAI-compatible servers: the model list;
+  - cloud models: a table of known windows.
+
+  You can type your own number under **Context** in Settings, and **Detect** asks again. If a server rejects a prompt as too long and states its limit, that limit is remembered.
+- **Compaction:** before a prompt would pass 75% of the window (adjustable in Settings), the model summarizes the older turns: goal, decisions, files changed, plan, open errors. The recent turns stay word for word.
+  - If the old part is too big for the model to read at once, it's summarized in chunks.
+  - If no summary can be made, the old turns are reduced to their requests and file changes instead.
+  - The chat keeps the whole conversation; only the model reads from the summary on.
+- **The meter** in the Agent pane's title shows how full the context is. The provider's own token counts calibrate the estimate as it goes.
+
 ## Files, images and big files
 
 - **Viewer:** opening an image in the file tree shows it (fit or actual size; an SVG can switch to its source). Audio and video files open in a player.

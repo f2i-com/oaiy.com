@@ -47,7 +47,7 @@ export interface Attachment {
 }
 
 export type Turn =
-  | { role: 'user'; text: string; images?: ImagePart[]; attachments?: Attachment[]; /** Written by bot.computer (a nudge to finish), not the person. */ automatic?: boolean }
+  | { role: 'user'; text: string; images?: ImagePart[]; attachments?: Attachment[]; /** Written by bot.computer (a nudge to finish), not the person. */ automatic?: boolean; /** A summary of everything before it: the model reads from the latest one on. */ summary?: boolean }
   | { role: 'assistant'; text: string; calls: ToolCall[]; anthropicContent?: unknown[] }
   | { role: 'tool'; results: ToolResult[] };
 

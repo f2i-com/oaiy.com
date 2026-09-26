@@ -6,6 +6,7 @@
 import type { AgentEvent } from '../agent/agent';
 import type { Attachment, ToolCall, ToolResult, Turn } from '../agent/protocol';
 import { readPlan, type Plan } from '../agent/tools';
+import { formatTokens } from '../agent/context';
 import { clear, h } from './dom';
 import { mediaElement, mediaKind, type Media } from './media';
 import { renderMarkdown } from './markdown';
@@ -41,6 +42,10 @@ export class ChatPane {
   private readonly pending = h('div.attachments');
   private files: File[] = [];
   private readonly status = h('div.chat-status');
+  /** How full the model's context is. */
+  private readonly meterFill = h('span.context-fill');
+  private readonly meterText = h('span.context-text');
+  private readonly meter = h('span.context-meter', { title: 'How much of the model\'s context the conversation uses. Older turns are summarized before it fills up.' }, h('span.context-bar', this.meterFill), this.meterText);
   /** The agent's checklist for the current request, pinned above the log. */
   private readonly planBox = h('section.plan', { 'aria-live': 'polite' });
   /** The person's choice to show or hide the steps; null follows the run (hidden once finished). */
@@ -63,7 +68,8 @@ export class ChatPane {
     },
   ) {
     this.planBox.hidden = true;
-    this.element.append(h('div.pane-title', 'Agent'), this.planBox, this.log, this.status, this.pending, h('div.chat-compose', this.attachButton, this.input, this.send), this.picker);
+    this.meter.hidden = true;
+    this.element.append(h('div.pane-title', 'Agent', this.meter), this.planBox, this.log, this.status, this.pending, h('div.chat-compose', this.attachButton, this.input, this.send), this.picker);
     this.attachButton.addEventListener('click', () => this.picker.click());
     this.picker.addEventListener('change', () => {
       if (this.picker.files) this.addFiles([...this.picker.files]);
@@ -156,6 +162,23 @@ export class ChatPane {
 
   private scroll(): void {
     this.log.scrollTop = this.log.scrollHeight;
+  }
+
+  /** How full the context is: `used` tokens of `window`. */
+  showContext(used: number, window: number): void {
+    const share = Math.min(1, used / Math.max(1, window));
+    this.meter.hidden = false;
+    this.meterFill.style.width = `${Math.round(share * 100)}%`;
+    this.meter.dataset.level = share > 0.9 ? 'high' : share > 0.7 ? 'mid' : 'low';
+    this.meterText.textContent = `${formatTokens(used)} / ${formatTokens(window)}`;
+  }
+
+  /** A summary that replaced older turns for the model: a note that opens to show it. */
+  private summaryNote(text: string, heading: string): void {
+    this.current = null;
+    const body = text.replace(/^\[bot\.computer\][^\n]*\n(<project>[\s\S]*?<\/project>\n\n)?/, '');
+    this.log.append(h('details.msg.compacted', h('summary', h('span', '⇣'), h('span', ` ${heading}`)), h('pre', body)));
+    this.scroll();
   }
 
   /** Show the checklist: the goal, progress, and each step's state. */
@@ -351,6 +374,18 @@ export class ChatPane {
         this.currentPlan = e.plan;
         this.showPlan(e.plan, true);
         break;
+      case 'context':
+        this.showContext(e.used, e.window);
+        break;
+      case 'compact':
+        this.current = null;
+        this.log.append(
+          h('div.msg.nudge.compacted', h('span', '⇣'), h('span', e.how === 'summary'
+            ? ` Context compacted: ${e.turns} earlier turns summarized for the model (${formatTokens(e.before)} → ${formatTokens(e.after)} tokens). The chat keeps everything.`
+            : ` Context compacted: the model could not write a summary, so ${e.turns} earlier turns were reduced to their requests and changes (${formatTokens(e.before)} → ${formatTokens(e.after)} tokens).`)),
+        );
+        this.scroll();
+        break;
       case 'nudge':
         this.current = null;
         this.log.append(h('div.msg.nudge', h('span', '↻'), h('span', ` Not finished yet, so the agent carries on: ${e.message}`)));
@@ -369,6 +404,10 @@ export class ChatPane {
   replay(turns: Turn[]): void {
     this.clearLog();
     for (const turn of turns) {
+      if (turn.role === 'user' && turn.summary) {
+        this.summaryNote(turn.text, 'Earlier conversation summarized for the model (click to read the summary)');
+        continue;
+      }
       if (turn.role === 'user' && turn.automatic) {
         this.current = null;
         this.log.append(h('div.msg.nudge', h('span', '↻'), h('span', ` ${turn.text.replace(/^\[bot\.computer\] /, '').split('\n')[0]}`)));

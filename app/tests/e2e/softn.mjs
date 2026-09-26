@@ -44,6 +44,12 @@ const model = createHttpServer((req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Headers', '*');
   if (req.method === 'OPTIONS') return res.end();
+  // The model list (with its context window, as vLLM and OpenRouter report it); nothing else is served.
+  if (req.method === 'GET') {
+    if (req.url.endsWith('/models')) return res.end(JSON.stringify({ data: [{ id: 'mock', context_length: 131072 }] }));
+    res.statusCode = 404;
+    return res.end();
+  }
   let body = '';
   req.on('data', (c) => (body += c));
   req.on('end', () => {

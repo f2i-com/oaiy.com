@@ -75,11 +75,22 @@ async function open(sealed: Sealed | null | undefined): Promise<string> {
 
 type StoredProvider = Omit<ProviderConfig, 'apiKey'> & { apiKeySealed: Sealed | null };
 
+/** How the agent manages its work, for every provider. */
+export interface AgentSettings {
+  /** Compact the conversation when the prompt fills this share of the context window. */
+  compactAt: number;
+  /** The context a sub-agent works in, in tokens (never more than the model's window). */
+  subAgentTokens: number;
+}
+
+export const DEFAULT_AGENT_SETTINGS: AgentSettings = { compactAt: 0.75, subAgentTokens: 32_000 };
+
 export interface Settings {
   providers: ProviderConfig[];
   activeProviderId: string | null;
   gate: NetGateSettings;
   lastProjectId: string | null;
+  agent: AgentSettings;
 }
 
 export async function loadSettings(): Promise<Settings> {
@@ -91,6 +102,7 @@ export async function loadSettings(): Promise<Settings> {
     activeProviderId: (await get<string | null>('active-provider')) ?? providers[0]?.id ?? null,
     gate: (await get<NetGateSettings>('gate')) ?? { mode: 'open', allow: [], deny: [] },
     lastProjectId: (await get<string | null>('last-project')) ?? null,
+    agent: { ...DEFAULT_AGENT_SETTINGS, ...((await get<Partial<AgentSettings>>('agent-settings')) ?? {}) },
   };
 }
 
@@ -99,6 +111,10 @@ export async function saveProviders(providers: ProviderConfig[], activeId: strin
   for (const { apiKey, ...rest } of providers) stored.push({ ...rest, apiKeySealed: await seal(apiKey) });
   await put('providers', stored);
   await put('active-provider', activeId);
+}
+
+export async function saveAgentSettings(settings: AgentSettings): Promise<void> {
+  await put('agent-settings', settings);
 }
 
 export async function saveGate(settings: NetGateSettings): Promise<void> {

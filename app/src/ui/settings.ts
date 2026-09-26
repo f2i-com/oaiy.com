@@ -6,12 +6,15 @@
 import { testProvider } from '../agent/providers/aiProvider';
 import { LOCAL_SERVERS, defaultBaseUrl, listModels, type ModelInfo } from '../agent/providers/providerConnection';
 import type { LocalServerKind, ProviderConfig, ProviderType } from '../agent/providers/types';
+import { contextWindow, detectContextWindow, formatTokens } from '../agent/context';
+import type { AgentSettings } from '../settings';
 import { newId } from '../vfs/projects';
 import { clear, h } from './dom';
 
 export interface SettingsResult {
   providers: ProviderConfig[];
   activeId: string | null;
+  agent: AgentSettings;
 }
 
 const KINDS: Array<{ value: string; label: string; type: ProviderType; serverKind?: LocalServerKind }> = [
@@ -32,6 +35,7 @@ export function openSettings(initial: SettingsResult): Promise<SettingsResult | 
   return new Promise((resolve) => {
     let providers = initial.providers.map((p) => ({ ...p }));
     let activeId = initial.activeId;
+    const agent = { ...initial.agent };
     let editing: ProviderConfig | null = providers.find((p) => p.id === activeId) ?? providers[0] ?? null;
     // Model lists already fetched, by server address and key, so a re-render
     // (typing a name, switching rows) does not lose them.
@@ -135,6 +139,30 @@ export function openSettings(initial: SettingsResult): Promise<SettingsResult | 
       fillModels(modelCache.get(cacheKey(p)));
       if (!modelCache.has(cacheKey(p)) && (p.type === 'local' || p.apiKey)) void loadModels(true);
       const model = h('div.model-picker', modelSelect, custom);
+      // The context window: what the server reports (Detect), or the person's own number.
+      const windowNote = h('span.window-note');
+      const showWindow = () => {
+        const w = contextWindow(p);
+        windowNote.textContent = w.source === 'yours' ? 'your setting' : w.source === 'server' ? `${formatTokens(w.tokens)} from ${p.detectedContext?.how ?? 'the server'}` : w.source === 'known' ? `${formatTokens(w.tokens)} (known for this model)` : `${formatTokens(w.tokens)} assumed: press Detect, or type the size`;
+      };
+      const windowInput = h('input', { type: 'number', min: 1024, step: 1024, value: p.contextTokens ?? '', placeholder: 'auto', title: 'The model\'s context window in tokens. Empty: detected from the server, or known for the model.', oninput: () => {
+        const v = Number(windowInput.value);
+        p.contextTokens = Number.isFinite(v) && v >= 1024 ? Math.floor(v) : undefined;
+        showWindow();
+      } }) as HTMLInputElement;
+      const detect = h('button', { title: 'Ask the server how big the model\'s context window is', onclick: async () => {
+        if (!p.modelId) {
+          windowNote.textContent = 'Choose a model first.';
+          return;
+        }
+        windowNote.textContent = 'Asking the server…';
+        const found = await detectContextWindow(p);
+        if (found) {
+          p.detectedContext = { model: p.modelId, tokens: found.tokens, how: found.how, at: Date.now() };
+          showWindow();
+        } else windowNote.textContent = `The server does not say; ${formatTokens(contextWindow(p).tokens)} is assumed. Type the size if you know it.`;
+      } }, 'Detect');
+      showWindow();
       const test = h('button', { onclick: async () => {
         note.textContent = 'Testing…';
         const result = await testProvider(p);
@@ -154,6 +182,7 @@ export function openSettings(initial: SettingsResult): Promise<SettingsResult | 
         h('label', 'Address', base),
         h('label', 'API key', key),
         h('label', 'Model', model),
+        h('label', 'Context', h('div.window-picker', windowInput, detect, windowNote)),
         h('div.form-buttons', fetchModels, test, remove),
         help ? h('p.muted', help) : '',
         note,
@@ -164,7 +193,18 @@ export function openSettings(initial: SettingsResult): Promise<SettingsResult | 
       h('h2', 'AI providers'),
       h('p.muted', 'Keys are stored encrypted in this browser and sent only to their own provider. Sandboxed code never sees them.'),
       h('div.settings-grid', list, form),
-      h('div.dialog-buttons', h('button', { onclick: () => close(null) }, 'Cancel'), h('button.primary', { onclick: () => close({ providers, activeId: providers.some((p) => p.id === activeId) ? activeId : providers[0]?.id ?? null }) }, 'Save')),
+      h(
+        'div.agent-settings',
+        h('strong', 'Agent'),
+        h('label', 'Compact the conversation at ', (() => {
+          const input = h('input', { type: 'number', min: 40, max: 95, step: 5, value: Math.round(agent.compactAt * 100), oninput: () => {
+            const v = Number(input.value);
+            if (v >= 40 && v <= 95) agent.compactAt = v / 100;
+          } }) as HTMLInputElement;
+          return input;
+        })(), '% of the model\'s context (older turns are summarized; recent ones stay word for word)'),
+      ),
+      h('div.dialog-buttons', h('button', { onclick: () => close(null) }, 'Cancel'), h('button.primary', { onclick: () => close({ providers, activeId: providers.some((p) => p.id === activeId) ? activeId : providers[0]?.id ?? null, agent }) }, 'Save')),
     );
     document.body.append(dialog);
     renderList();

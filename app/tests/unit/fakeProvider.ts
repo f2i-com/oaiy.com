@@ -4,6 +4,8 @@ import { vi } from 'vitest';
 import type { ProviderConfig } from '../../src/agent/providers/types';
 
 export interface Step {
+  /** Answer with this HTTP error instead of a stream. */
+  error?: { status: number; body: string };
   text?: string;
   calls?: Array<{ name: string; input: Record<string, unknown> }>;
 }
@@ -72,6 +74,10 @@ export function fakeProvider(wire: 'anthropic' | 'openai', script: Array<Step | 
     const next = script[n];
     if (!next) throw new Error(`the script has no step ${n + 1}`);
     const step = typeof next === 'function' ? next(body) : next;
+    if (step.error) {
+      n++;
+      return new Response(step.error.body, { status: step.error.status, headers: { 'content-type': 'application/json' } });
+    }
     const text = wire === 'anthropic' ? anthropicStream(step, n) : openAIStream(step, n);
     n++;
     const bytes = new TextEncoder().encode(text);

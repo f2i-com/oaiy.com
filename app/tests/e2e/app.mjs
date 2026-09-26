@@ -33,9 +33,14 @@ const model = createHttpServer((req, res) => {
   res.setHeader('Access-Control-Allow-Headers', '*');
   res.setHeader('Access-Control-Allow-Private-Network', 'true');
   if (req.method === 'OPTIONS') return res.end();
+  // The model list, with its context window as vLLM and OpenRouter report it; no other GET is served.
   if (req.url.endsWith('/models')) {
     res.setHeader('content-type', 'application/json');
-    return res.end(JSON.stringify({ data: [{ id: 'mock-model' }] }));
+    return res.end(JSON.stringify({ data: [{ id: 'mock-model', context_length: 131072 }] }));
+  }
+  if (req.method === 'GET') {
+    res.statusCode = 404;
+    return res.end();
   }
   let body = '';
   req.on('data', (c) => (body += c));
@@ -128,6 +133,13 @@ try {
     expect(JSON.stringify(requests[2]).includes('mean 19.8'), 'python output not sent back');
     const out = await terminal(page, 'cat data/mean.txt', '19.8\n');
     expect(out.includes('19.8'), out);
+  });
+
+  await check("the model's context window is detected from the server, and a meter shows how full it is", async () => {
+    const log = await page.$eval('.chat-log', (e) => e.textContent);
+    expect(log.includes("mock-model: 131k tokens of context (from the server's model list)") && log.includes('compacted at 75%'), log.slice(0, 600));
+    const meter = await page.$eval('.context-meter', (m) => ({ hidden: m.hidden, text: m.textContent }));
+    expect(!meter.hidden && / \/ 131k$/.test(meter.text), JSON.stringify(meter));
   });
 
   await check('the internet chip toggles the gate off and on', async () => {

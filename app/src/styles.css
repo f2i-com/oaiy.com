@@ -351,3 +351,22 @@ footer.dialog-buttons { flex: none; padding: 12px 22px 16px; border-top: 1px sol
 @media (prefers-reduced-motion: reduce) { .plan-item.active.running .plan-mark { animation: none; border-top-color: var(--accent); } }
 .msg.nudge { display: flex; gap: 4px; font-size: 12px; color: var(--muted); background: transparent; border: 1px dashed var(--border); padding: 4px 8px; }
 .plan { margin-bottom: 6px; box-shadow: 0 6px 12px -8px rgba(0, 0, 0, 0.6); position: relative; z-index: 1; }
+
+/* The context meter in the Agent pane's title. */
+.context-meter { margin-left: auto; display: inline-flex; align-items: center; gap: 6px; font-size: 11px; color: var(--muted); text-transform: none; letter-spacing: 0; font-variant-numeric: tabular-nums; }
+.context-meter[hidden] { display: none; }
+.context-bar { width: 64px; height: 5px; border-radius: 3px; background: var(--border); overflow: hidden; }
+.context-fill { display: block; height: 100%; background: var(--accent); transition: width 300ms ease; }
+.context-meter[data-level='mid'] .context-fill { background: var(--warn); }
+.context-meter[data-level='high'] .context-fill { background: var(--err); }
+.msg.compacted { font-size: 12px; color: var(--muted); }
+details.msg.compacted { border: 1px dashed var(--border); padding: 4px 8px; background: transparent; }
+details.msg.compacted summary { cursor: pointer; list-style: none; }
+details.msg.compacted pre { white-space: pre-wrap; font-size: 12px; max-height: 320px; overflow: auto; }
+.window-picker { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.window-picker input { width: 110px; }
+.window-note { font-size: 12px; color: var(--muted); }
+.agent-settings { display: flex; flex-direction: column; gap: 6px; margin: 4px 0 12px; padding-top: 10px; border-top: 1px solid var(--border); font-size: 13px; }
+.agent-settings label { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.agent-settings input { width: 70px; }
+.chat > .pane-title { display: flex; align-items: center; gap: 8px; }

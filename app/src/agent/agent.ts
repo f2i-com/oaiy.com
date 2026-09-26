@@ -9,6 +9,7 @@
 import type { NetGate } from '../gate/netgate';
 import type { Vfs } from '../vfs/vfs';
 import { AIProviderError } from './providers/aiProvider';
+import { DEFAULT_COMPACT_AT, budgetFor, contextWindow, formatTokens, overflowWindow } from './context';
 import type { ProviderConfig } from './providers/types';
 import { sendTurn, type Attachment, type Reply, type ToolCall, type ToolResult, type Turn, type Usage } from './protocol';
 import { TOOLS, checkApp, readPlan, runTool, type Plan, type SoftnHost, type ToolContext } from './tools';
@@ -23,6 +24,10 @@ export type AgentEvent =
   | { type: 'tool_result'; result: ToolResult }
   | { type: 'status'; message: string }
   | { type: 'usage'; usage: Usage }
+  /** How full the model's context is: the prompt about to be sent, in tokens, and the window. */
+  | { type: 'context'; used: number; window: number }
+  /** Older turns were summarized to make room. */
+  | { type: 'compact'; turns: number; before: number; after: number; how: 'summary' | 'trimmed' }
   /** The checklist changed (update_plan). */
   | { type: 'plan'; plan: Plan }
   /** bot.computer asked the model to carry on (open plan items, a failing app). */
@@ -33,8 +38,20 @@ export type AgentEvent =
   | { type: 'error'; message: string };
 
 export const MAX_STEPS = 60;
-const TRIM_OVER_CHARS = 240_000;
 const KEEP_RECENT_TURNS = 8;
+/** Characters per token until the provider's own counts say otherwise. */
+const DEFAULT_CHARS_PER_TOKEN = 3.5;
+/** What an image costs, in tokens (about what vision models charge for one of ~1 megapixel). */
+const IMAGE_TOKENS = 1600;
+
+const SUMMARIZER_PROMPT = `You compress the conversation of a coding agent (bot.computer) so it can carry on with less context. Write a summary the agent can continue from as if it had read everything, with these sections (leave out empty ones):
+Goal: what the user asked for, in their words where it matters, including the request being worked on now.
+Decisions and constraints: what was agreed or ruled out, and why.
+Files: the files read, and the files created or changed with what changed in each.
+Plan: the steps and which are done.
+Current state: what works, errors still open, and what the agent was about to do next.
+Facts to remember: names, values, paths, commands, ids, anything that would be expensive to find again.
+Be specific and complete. Keep code only where it is essential. At most about 1200 words. Write only the summary.`;
 /** A run that stops short of its goal is asked to carry on at most this many times. */
 const MAX_NUDGES = 2;
 /** The same automatic-check errors this many times in a row stop the run. */
@@ -64,16 +81,46 @@ export interface AgentOptions {
   projectSummary: () => string;
   /** The live SoftN preview: softn_check, softn_inspect, softn_interact and the automatic check. */
   softn?: SoftnHost;
+  /** The share of the context window a prompt may fill before older turns are summarized (default 0.75). */
+  compactAt?: () => number;
+  /** A cap on the window this agent works in (a sub-agent gets a smaller one). */
+  maxContext?: number;
+  /** The server stated the window (in an overflow error): remember it for this provider and model. */
+  onWindow?: (tokens: number) => void;
 }
 
-function estimateChars(turns: Turn[]): number {
-  let n = 0;
-  for (const t of turns) {
-    if (t.role === 'user') n += t.text.length;
-    else if (t.role === 'assistant') n += t.text.length + JSON.stringify(t.calls).length;
-    else for (const r of t.results) n += r.content.length;
+function turnChars(t: Turn, charsPerToken = DEFAULT_CHARS_PER_TOKEN): number {
+  if (t.role === 'user') return t.text.length + (t.images?.length ?? 0) * IMAGE_TOKENS * charsPerToken;
+  if (t.role === 'assistant') return t.text.length + JSON.stringify(t.calls).length;
+  return t.results.reduce((n, r) => n + r.content.length + (r.images?.length ?? 0) * IMAGE_TOKENS * charsPerToken, 0);
+}
+
+function estimateChars(turns: Turn[], charsPerToken = DEFAULT_CHARS_PER_TOKEN): number {
+  return turns.reduce((n, t) => n + turnChars(t, charsPerToken), 0);
+}
+
+/** A turn as plain text, for the summarizer: long tool output is cut, the gist is kept. */
+function transcript(turn: Turn): string {
+  const cutText = (text: string, max: number) => (text.length > max ? `${text.slice(0, max)} […${text.length - max} more characters]` : text);
+  if (turn.role === 'user') {
+    if (turn.summary) return `Summary of what came before:\n${turn.text.replace(/^\[bot\.computer\][^\n]*\n(<project>[\s\S]*?<\/project>\n\n)?/, '')}`;
+    const text = turn.text.replace(/^<project>[\s\S]*?<\/project>\n\n/, '');
+    return `${turn.automatic ? 'bot.computer' : 'User'}: ${cutText(text, 6000)}${turn.images?.length ? ` [${turn.images.length} image(s)]` : ''}`;
   }
-  return n;
+  if (turn.role === 'assistant') {
+    const calls = turn.calls.map((c) => `  → ${c.name}(${cutText(JSON.stringify(c.input), 400)})`).join('\n');
+    return `Assistant: ${cutText(turn.text, 3000)}${calls ? `\n${calls}` : ''}`;
+  }
+  return turn.results.map((r) => `  ← ${r.name}${r.isError ? ' (error)' : ''}: ${cutText(r.content, 1500)}`).join('\n');
+}
+
+/** Where the model's view starts: the latest summary, or the beginning. */
+function viewStart(turns: Turn[]): number {
+  for (let i = turns.length - 1; i >= 0; i--) {
+    const t = turns[i];
+    if (t.role === 'user' && t.summary) return i;
+  }
+  return 0;
 }
 
 function hasImages(turn: Turn): boolean {
@@ -94,18 +141,25 @@ function withoutOldImages(turns: Turn[], keep = KEEP_IMAGE_TURNS): Turn[] {
   return out;
 }
 
-/** Old tool output shrinks first; the conversation's shape never changes. */
-function trimmed(allTurns: Turn[], images = true): Turn[] {
+/**
+ * The last resort when a summary cannot make room (or is not enough): old
+ * tool output shrinks, then everything but the recent turns; the
+ * conversation's shape never changes.
+ */
+function trimmed(allTurns: Turn[], images: boolean, maxChars: number): Turn[] {
   const turns = withoutOldImages(allTurns, images ? KEEP_IMAGE_TURNS : 0);
-  if (estimateChars(turns) <= TRIM_OVER_CHARS) return turns;
+  if (estimateChars(turns) <= maxChars) return turns;
   const cutoff = turns.length - KEEP_RECENT_TURNS;
-  return turns.map((t, i) => {
-    if (i >= cutoff || t.role !== 'tool') return t;
-    return {
-      role: 'tool',
-      results: t.results.map((r) => (r.content.length > 600 ? { ...r, content: `${r.content.slice(0, 500)}\n[older output trimmed to save context]` } : r)),
-    };
-  });
+  const shrink = (limit: number) =>
+    turns.map((t, i): Turn => {
+      if (i >= cutoff) return t;
+      if (t.role === 'tool') return { role: 'tool', results: t.results.map((r) => (r.content.length > limit ? { ...r, content: `${r.content.slice(0, limit)}\n[older output trimmed to save context]` } : r)) };
+      if (t.role === 'user' && t.text.length > limit * 4 && !t.summary) return { ...t, text: `${t.text.slice(0, limit * 4)}\n[trimmed to save context]` };
+      return t;
+    });
+  let out = shrink(500);
+  if (estimateChars(out) > maxChars) out = shrink(120);
+  return out;
 }
 
 const sleep = (ms: number, signal?: AbortSignal) =>
@@ -118,7 +172,12 @@ const sleep = (ms: number, signal?: AbortSignal) =>
   });
 
 export class Agent {
+  /** The whole conversation, as the chat shows it; the model reads from the latest summary on. */
   turns: Turn[] = [];
+  /** Measured from the provider's token counts; used to estimate the next prompt. */
+  private charsPerToken = DEFAULT_CHARS_PER_TOKEN;
+  /** A window the server stated in an overflow error, smaller than the one configured, for that provider and model. */
+  private windowOverride: { key: string; tokens: number } | null = null;
   readonly toolContext: ToolContext;
   running = false;
 
@@ -202,11 +261,139 @@ export class Agent {
   /** False once the model has refused images: they are left out from then on. */
   private imagesAccepted = true;
 
+  /** What the model reads: the latest summary and everything after it. */
+  view(): Turn[] {
+    return this.turns.slice(viewStart(this.turns));
+  }
+
+  private window(provider: ProviderConfig): number {
+    const configured = contextWindow(provider).tokens;
+    const override = this.windowOverride?.key === `${provider.id}|${provider.modelId}` ? this.windowOverride.tokens : null;
+    const window = override ? Math.min(configured, override) : configured;
+    return this.options.maxContext ? Math.min(window, this.options.maxContext) : window;
+  }
+
+  /** The prompt's fixed part: the system prompt and the tool definitions. */
+  private fixedChars(): number {
+    return SYSTEM_PROMPT.length + JSON.stringify(TOOLS).length;
+  }
+
+  private budget(provider: ProviderConfig): { window: number; fixed: number; prompt: number; reply: number } {
+    const window = this.window(provider);
+    const fixed = Math.ceil(this.fixedChars() / this.charsPerToken);
+    return { window, fixed, ...budgetFor(window, fixed) };
+  }
+
+  /** Tokens the conversation part of the next prompt will take. */
+  private estimate(turns: Turn[]): number {
+    return Math.ceil(estimateChars(withoutOldImages(turns, this.imagesAccepted ? KEEP_IMAGE_TURNS : 0), this.charsPerToken) / this.charsPerToken);
+  }
+
+  /**
+   * Before a request: if the prompt would pass the compaction threshold,
+   * summarize the older turns. `force` compacts regardless (the server said
+   * the prompt was too long).
+   */
+  private async fit(provider: ProviderConfig, emit: (e: AgentEvent) => void, signal?: AbortSignal, force = false): Promise<void> {
+    const b = this.budget(provider);
+    const used = this.estimate(this.view());
+    emit({ type: 'context', used: used + b.fixed, window: b.window });
+    const threshold = b.prompt * (this.options.compactAt?.() ?? DEFAULT_COMPACT_AT);
+    if (!force && used <= threshold) return;
+    await this.compact(provider, b, emit, signal);
+  }
+
+  /**
+   * Summarize everything before the recent turns into one summary turn. The
+   * recent turns (about a third of the room) stay word for word, starting on
+   * a user or assistant turn so every tool result keeps the call it answers.
+   */
+  private async compact(provider: ProviderConfig, b: { window: number; fixed: number; prompt: number; reply: number }, emit: (e: AgentEvent) => void, signal?: AbortSignal): Promise<void> {
+    const start = viewStart(this.turns);
+    const view = this.turns.slice(start);
+    const before = this.estimate(view) + b.fixed;
+    const tailChars = b.prompt * 0.3 * this.charsPerToken;
+    let keepFrom = view.length;
+    let chars = 0;
+    for (let i = view.length - 1; i >= 1; i--) {
+      chars += turnChars(view[i], this.charsPerToken);
+      if (chars > tailChars && keepFrom < view.length) break;
+      keepFrom = i;
+    }
+    while (keepFrom > 0 && view[keepFrom]?.role === 'tool') keepFrom--;
+    const old = view.slice(0, keepFrom);
+    // Nothing old enough to summarize (one huge recent step, or only the last summary): trimming handles it.
+    if (!old.length || (old.length === 1 && old[0].role === 'user' && old[0].summary)) return;
+    emit({ type: 'status', message: `Summarizing ${old.length} earlier turns to make room in the context…` });
+    let summary: string;
+    let how: 'summary' | 'trimmed' = 'summary';
+    try {
+      summary = await this.summarize(old, provider, b, signal);
+    } catch (error) {
+      if (signal?.aborted) throw error;
+      summary = this.mechanicalSummary(old);
+      how = 'trimmed';
+    }
+    const note: Turn = {
+      role: 'user',
+      automatic: true,
+      summary: true,
+      text: `[bot.computer] The conversation before this point (${old.length} turns) was summarized to fit the model's context.\n<project>\n${this.options.projectSummary()}\n</project>\n\n${summary}`,
+    };
+    this.turns.splice(start + keepFrom, 0, note);
+    const after = this.estimate(this.view()) + b.fixed;
+    emit({ type: 'compact', turns: old.length, before, after, how });
+  }
+
+  /** The model writes the summary, a chunk at a time when the old part is bigger than it can read. */
+  private async summarize(old: Turn[], provider: ProviderConfig, b: { window: number; reply: number }, signal?: AbortSignal): Promise<string> {
+    const room = Math.max(2000, (b.window - Math.min(4096, b.reply) - 2000) * 0.8 * this.charsPerToken);
+    const chunks: string[] = [];
+    let current = '';
+    for (const turn of old) {
+      let text = transcript(turn);
+      if (text.length > room * 0.9) text = `${text.slice(0, room * 0.9)} […]`;
+      if (current && current.length + text.length > room * 0.6) {
+        chunks.push(current);
+        current = '';
+      }
+      current += `${text}\n\n`;
+    }
+    if (current) chunks.push(current);
+    let summary = '';
+    for (const chunk of chunks) {
+      const prompt = `${summary ? `The summary so far:\n${summary}\n\n` : ''}The conversation to ${summary ? 'add to it' : 'summarize'}:\n${chunk}\nWrite the ${summary ? 'updated ' : ''}summary.`;
+      const reply = await sendTurn(provider, SUMMARIZER_PROMPT, [{ role: 'user', text: prompt }], [], { signal, maxOutputTokens: Math.min(4096, b.reply), sink: { text: () => {}, thinking: () => {}, toolStart: () => {}, toolArgs: () => {} } });
+      if (!reply.text.trim()) throw new Error('the summary came back empty');
+      summary = reply.text.trim();
+    }
+    return summary;
+  }
+
+  /** Without the model: the requests, the files touched, the plan. */
+  private mechanicalSummary(old: Turn[]): string {
+    const requests = old.filter((t): t is Extract<Turn, { role: 'user' }> => t.role === 'user' && !t.automatic).map((t) => `- ${t.text.replace(/^<project>[\s\S]*?<\/project>\n\n/, '').slice(0, 300)}`);
+    const touched = new Set<string>();
+    for (const t of old) if (t.role === 'assistant') for (const c of t.calls) if (typeof c.input.path === 'string' && /write|edit|delete/.test(c.name)) touched.add(c.input.path);
+    const earlier = old.find((t) => t.role === 'user' && t.summary) as Extract<Turn, { role: 'user' }> | undefined;
+    return [
+      earlier ? `Earlier summary:\n${earlier.text.replace(/^\[bot\.computer\][^\n]*\n(<project>[\s\S]*?<\/project>\n\n)?/, '')}` : '',
+      requests.length ? `Requests:\n${requests.join('\n')}` : '',
+      touched.size ? `Files changed: ${[...touched].join(', ')}` : '',
+      this.plan ? `Plan: ${this.plan.items.map((i) => `[${i.status}] ${i.text}`).join('; ')}` : '',
+      '(A model-written summary could not be made; read files again where details matter.)',
+    ].filter(Boolean).join('\n\n');
+  }
+
   private async request(provider: ProviderConfig, emit: (e: AgentEvent) => void, signal?: AbortSignal): Promise<Reply> {
     let lastError: unknown;
+    let overflowRetried = false;
     for (let attempt = 0; attempt < 4; attempt++) {
+      const b = this.budget(provider);
+      const sent = trimmed(this.view(), this.imagesAccepted, b.prompt * this.charsPerToken);
       try {
-        return await sendTurn(provider, SYSTEM_PROMPT, trimmed(this.turns, this.imagesAccepted), TOOLS, {
+        const reply = await sendTurn(provider, SYSTEM_PROMPT, sent, TOOLS, {
+          maxOutputTokens: b.reply,
           signal,
           sink: {
             text: (delta) => emit({ type: 'text', delta }),
@@ -215,9 +402,28 @@ export class Agent {
             toolArgs: () => {},
           },
         });
+        // The provider's own count calibrates the next estimate.
+        if (reply.usage.inputTokens > 200) {
+          const ratio = (this.fixedChars() + estimateChars(sent, this.charsPerToken)) / reply.usage.inputTokens;
+          if (ratio > 1 && ratio < 10) this.charsPerToken = ratio;
+          emit({ type: 'context', used: reply.usage.inputTokens + reply.usage.outputTokens, window: b.window });
+        }
+        return reply;
       } catch (error) {
         lastError = error;
         if (!(error instanceof AIProviderError)) throw error;
+        // Too long for the server: it often says how long it can take. Compact and try once more.
+        const overflow = error.kind === 'http' && (error.status === 400 || error.status === 413 || error.status === 422 || error.status === 500) ? overflowWindow(`${error.message} ${error.detail ?? ''}`) : { overflow: false, tokens: null };
+        if (overflow.overflow && !overflowRetried) {
+          overflowRetried = true;
+          if (overflow.tokens && overflow.tokens < b.window) {
+            this.windowOverride = { key: `${provider.id}|${provider.modelId}`, tokens: overflow.tokens };
+            this.options.onWindow?.(overflow.tokens);
+          }
+          emit({ type: 'status', message: `The prompt was too long for the model${overflow.tokens ? ` (its window is ${formatTokens(overflow.tokens)} tokens)` : ''}; compacting and retrying` });
+          await this.compact(provider, this.budget(provider), emit, signal);
+          continue;
+        }
         // A model without vision refuses image content: carry on in text.
         if (this.imagesAccepted && error.kind === 'http' && /image|vision|multimodal|image_url|content.*array/i.test(`${error.message} ${error.detail ?? ''}`) && this.turns.some(hasImages)) {
           this.imagesAccepted = false;
@@ -267,6 +473,7 @@ export class Agent {
     try {
       for (let step = 1; step <= MAX_STEPS; step++) {
         signal?.throwIfAborted();
+        await this.fit(provider, emit, signal);
         const reply = await this.request(provider, emit, signal);
         emit({ type: 'usage', usage: reply.usage });
         this.turns.push({ role: 'assistant', text: reply.text, calls: reply.calls, anthropicContent: provider.type === 'anthropic' ? reply.anthropicContent : undefined });
