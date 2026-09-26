@@ -1,7 +1,7 @@
 //! Native Rust text/image-to-video for LTX 2.3/2.5 and compatible distilled checkpoints.
 mod audio;
 mod cache;
-mod store;
+pub(crate) mod store;
 mod text;
 mod transformer;
 pub mod vae;

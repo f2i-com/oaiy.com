@@ -15,3 +15,4 @@ pub mod weights;
 mod comfy_quant;
 pub mod ltx;
 pub mod sdxl;
+pub mod tts;

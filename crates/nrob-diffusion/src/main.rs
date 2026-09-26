@@ -37,6 +37,13 @@ fn run() -> candle_core::Result<()> {
         writeln!(std::io::stdout(), "{}", result.to_json())?;
         return Ok(());
     }
+    if j.get("kind").and_then(Json::as_str) == Some("speech") {
+        let r = nrob_diffusion::tts::Request::parse(&j).map_err(candle_core::Error::Msg)?;
+        configure_cache(&r.output)?;
+        let result = nrob_diffusion::tts::generate(&r, |event| eprintln!("{}", event.to_json()))?;
+        writeln!(std::io::stdout(), "{}", result.to_json())?;
+        return Ok(());
+    }
     if j.get("kind").and_then(Json::as_str) == Some("video") {
         let r = nrob_diffusion::ltx::Request::parse(&j).map_err(candle_core::Error::Msg)?;
         configure_cache(&r.output)?;
@@ -61,10 +68,14 @@ fn configure_cache(output: &std::path::Path) -> candle_core::Result<()> {
         if std::env::var_os("CUDA_CACHE_PATH").is_none() {
             let cache = output.join(".cuda-cache");
             std::fs::create_dir_all(&cache)?;
-            std::env::set_var("CUDA_CACHE_PATH", cache.canonicalize()?);
+            // A plain absolute path: the driver ignores `\?\`-prefixed
+            // (canonical Windows) paths and would JIT every kernel again.
+            std::env::set_var("CUDA_CACHE_PATH", std::path::absolute(&cache)?);
         }
         if std::env::var_os("CUDA_CACHE_MAXSIZE").is_none() {
-            std::env::set_var("CUDA_CACHE_MAXSIZE", "1073741824");
+            // The driver's maximum (4 GiB): one GPU's worth of kernels for
+            // every model the worker runs.
+            std::env::set_var("CUDA_CACHE_MAXSIZE", "4294967296");
         }
     }
     #[cfg(not(feature = "cuda"))]
