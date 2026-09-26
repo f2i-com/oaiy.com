@@ -167,6 +167,10 @@ pub struct Options {
     pub quiet: bool,
     /// No log at all, not even at start (a host with its own UI).
     pub silent: bool,
+    /// Keep nothing of any request: no prompt states on disk, no usage profile
+    /// or expert trace, no per-request log, and each engine forgets a request's
+    /// state when it ends. Requests can also ask for this one at a time.
+    pub incognito: bool,
     /// Backend for GGUF models: `auto` (CUDA in a CUDA build, else WebGPU when
     /// an adapter exists, else the CPU), `cuda`, `webgpu` or `cpu`.
     pub backend: String,
@@ -241,6 +245,7 @@ impl Default for Options {
             local_images: None,
             quiet: false,
             silent: false,
+            incognito: false,
             backend: "auto".into(),
             webgpu_gb: None,
         }
@@ -301,7 +306,14 @@ pub fn start(o: Options) -> nrob::Result<Running> {
 /// [`start`], telling `listening` where the server listens as soon as it
 /// does (before the model loads: a client may connect at once, and its
 /// requests wait until the model is there).
-pub fn start_listening(o: Options, listening: impl FnOnce(SocketAddr)) -> nrob::Result<Running> {
+pub fn start_listening(mut o: Options, listening: impl FnOnce(SocketAddr)) -> nrob::Result<Running> {
+    if o.incognito {
+        // Nothing about a request may reach the disk.
+        o.prompt_cache = None;
+        o.usage = None;
+        o.expert_trace = None;
+    }
+    let incognito = o.incognito;
     if o.model.as_os_str().is_empty() {
         return Err(nrob::Error::Arg("no checkpoint directory given".into()));
     }
@@ -325,7 +337,7 @@ pub fn start_listening(o: Options, listening: impl FnOnce(SocketAddr)) -> nrob::
     // is on disk. Only one model is ever resident.
     let loopback = o.host == "localhost"
         || o.host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback());
-    let request_log = !o.quiet && !o.silent;
+    let request_log = !o.quiet && !o.silent && !o.incognito;
     let ctx = o.ctx;
     let api_key = o.api_key.clone();
     let local_images = o.local_images.unwrap_or(loopback);
@@ -367,6 +379,7 @@ pub fn start_listening(o: Options, listening: impl FnOnce(SocketAddr)) -> nrob::
         models: Arc::clone(&models),
         api_key,
         local_images,
+        incognito,
         ctx,
     });
     log(format!("serving {default_name} at http://{addr}/v1"));
@@ -387,7 +400,7 @@ pub fn start_listening(o: Options, listening: impl FnOnce(SocketAddr)) -> nrob::
                         let keep = server.handle(req, w);
                         requests.last.store(requests.now(), Ordering::Relaxed);
                         requests.active.fetch_sub(1, Ordering::Relaxed);
-                        if request_log && req.path != "/health" {
+                        if request_log && req.path != "/health" && !api::incognito_request(req, None) {
                             eprintln!("{peer} {} {} ({:.1}s)", req.method, req.path, t.elapsed().as_secs_f64());
                         }
                         keep

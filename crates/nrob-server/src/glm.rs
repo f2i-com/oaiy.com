@@ -98,6 +98,8 @@ pub struct GlmEngine {
     /// same system prompt every time. Without this the daemon re-reads it on every
     /// start.
     pub disk: Option<crate::disk::DiskCache<llama_rs::glm5next::forward::StateSnapshot>>,
+    /// The request running is incognito: keep no prompt state of it.
+    forgetting: bool,
     pub warn: bool,
     pub log: bool,
 }
@@ -169,6 +171,7 @@ impl GlmEngine {
             eos,
             tiers: TierCounters::default(),
             disk: None,
+            forgetting: false,
             warn: log,
             log,
         }
@@ -233,6 +236,9 @@ impl GlmEngine {
     /// prompt and tools, the part every request shares and the one worth keeping
     /// longest.
     fn persist(&mut self, pos: usize, base: bool) {
+        if self.forgetting {
+            return;
+        }
         let Some(disk) = self.disk.as_mut() else { return };
         let keys: Vec<u64> = self.covered[..pos].iter().map(|&t| u64::from(t)).collect();
         if disk.has(&keys) {
@@ -260,11 +266,15 @@ impl GlmEngine {
 
     pub fn run(mut self, jobs: Receiver<Job>) {
         for job in jobs {
+            self.forgetting = job.forget;
             let r = self.generate(&job);
             if let Err(e) = r {
                 // The state's position is unknown after a failure: start clean.
                 self.reset();
                 let _ = job.events.send(Event::Error(e.to_string()));
+            }
+            if job.forget {
+                self.reset();
             }
         }
     }

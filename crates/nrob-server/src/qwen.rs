@@ -213,6 +213,13 @@ impl QwenEngine {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.generate(&job)));
             let error = match result { Ok(Ok(())) => None, Ok(Err(e)) => Some(e), Err(_) => Some("native Qwen inference failed".into()) };
             if let Some(e) = error { self.kv.reset(); self.covered.clear(); let _ = job.events.send(Event::Error(e)); }
+            if job.forget {
+                // Incognito: nothing of this request is reused or kept.
+                self.kv.reset();
+                self.covered.clear();
+                self.checkpoints.clear();
+                self.vision_cache.clear();
+            }
         }
     }
     fn generate(&mut self, job: &Job) -> Result<(), String> {
@@ -294,7 +301,7 @@ impl QwenEngine {
                 if self.log { eprintln!("  Qwen checkpoint: {pos} tokens; disk={}", self.disk.is_some()); }
                 let base = stops.first() == Some(&pos);
                 if job.images.is_empty() || self.image_disk_cache {
-                    if let Some(disk) = &mut self.disk {
+                    if let Some(disk) = self.disk.as_mut().filter(|_| !job.forget) {
                         if !disk.has(&keys[..pos]) {
                             let snap = Arc::new(Snapshot::capture(&self.kv, &model.attention_layers, model.backend.as_ref()));
                             disk.save(keys[..pos].to_vec(), snap, base);

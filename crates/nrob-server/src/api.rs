@@ -64,6 +64,8 @@ pub struct Server {
     /// Server-wide, not per model.
     pub api_key: Option<String>,
     pub local_images: bool,
+    /// Every request incognito (`--incognito`); otherwise per request.
+    pub incognito: bool,
     /// The configured context cap, for `/v1/models`. What a model actually allows
     /// is in its own `Config` once it is loaded.
     pub ctx: usize,
@@ -396,8 +398,23 @@ impl Server {
             _ => Some(2_048),
         }
     }
+}
 
-    fn submit(&self, a: &crate::models::Active, prompt: Vec<u32>, images: Vec<JobImage>, sampling: Sampling, max_tokens: usize, think_budget: Option<usize>, tool_precision: bool, observer_context: String, tools: Vec<Json>) -> Result<(mpsc::Receiver<Event>, Arc<AtomicBool>), ApiError> {
+
+/// Whether a request asked to leave nothing behind: `"incognito": true` in its
+/// body, or an `X-NROB-Incognito: 1` header.
+pub fn incognito_request(req: &Request, body: Option<&Json>) -> bool {
+    req.header("x-nrob-incognito").is_some_and(|v| matches!(v.trim(), "1" | "true" | "yes"))
+        || body.and_then(|b| b.get("incognito")).and_then(Json::as_bool) == Some(true)
+}
+
+impl Server {
+    fn forget(&self, req: &Request, body: &Json) -> bool {
+        self.incognito || incognito_request(req, Some(body))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn submit(&self, a: &crate::models::Active, prompt: Vec<u32>, images: Vec<JobImage>, sampling: Sampling, max_tokens: usize, think_budget: Option<usize>, tool_precision: bool, observer_context: String, tools: Vec<Json>, forget: bool) -> Result<(mpsc::Receiver<Event>, Arc<AtomicBool>), ApiError> {
         if prompt.len() + 1 > a.cfg.max_seq {
             return Err(ApiError {
                 status: 400,
@@ -413,7 +430,7 @@ impl Server {
         let max_tokens = max_tokens.min(a.cfg.max_seq - prompt.len());
         let (tx, rx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
-        let job = Job { tools, tool_precision, observer_context, prompt, images, max_tokens, think_budget, sampling, cancel: Arc::clone(&cancel), events: tx };
+        let job = Job { tools, tool_precision, observer_context, prompt, images, max_tokens, think_budget, sampling, cancel: Arc::clone(&cancel), events: tx, forget };
         a.jobs
             .send(job)
             .map_err(|_| ApiError { status: 503, message: "the model worker has stopped".into(), code: "unavailable" })?;
@@ -452,7 +469,8 @@ impl Server {
         let think_budget = if mode == Mode::Thinking { Self::think_budget(&body, effort) } else { None };
         let request_clock = Instant::now();
         let mut prefilled_at = None;
-        let (rx, cancel) = self.submit(&a, prompt, images, sampling, max_tokens, think_budget, crate::models::needs_tool_precision(&body), observer_context(&body), body.get("tools").and_then(Json::as_array).unwrap_or(&[]).to_vec())?;
+        let forget = self.forget(req, &body);
+        let (rx, cancel) = self.submit(&a, prompt, images, sampling, max_tokens, think_budget, crate::models::needs_tool_precision(&body), observer_context(&body), body.get("tools").and_then(Json::as_array).unwrap_or(&[]).to_vec(), forget)?;
         let peer = w.try_clone().ok();
         let id = random_id("chatcmpl-");
         let created = now();
@@ -827,7 +845,8 @@ impl Server {
         }
         let n_prompt = prompt.len();
         let stream = body.get("stream").and_then(Json::as_bool).unwrap_or(false);
-        let (rx, cancel) = self.submit(&a, prompt, Vec::new(), sampling, max_tokens, None, false, String::new(), Vec::new())?;
+        let forget = self.forget(req, &body);
+        let (rx, cancel) = self.submit(&a, prompt, Vec::new(), sampling, max_tokens, None, false, String::new(), Vec::new(), forget)?;
         let peer = w.try_clone().ok();
         let id = random_id("cmpl-");
         let created = now();

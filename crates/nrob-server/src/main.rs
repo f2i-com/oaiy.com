@@ -73,6 +73,10 @@ const HELP: &str = "Observer: --observer-model FILE.gguf --observer-device auto|
   --local-images on|off  let requests name image files on this machine (paths,
                        file:// URLs); default on when listening on loopback only
   --quiet              no per-request log
+  --incognito          keep nothing of any request: no prompt states on disk, no
+                       request log, and each request's state is dropped when it
+                       ends (requests may also send incognito: true, or the
+                       header X-NROB-Incognito: 1, one at a time)
   --backend B          GGUF backend: auto (default), cuda, webgpu or cpu. auto is
                        CUDA in a CUDA build; in nrob-server-webgpu it is the
                        first WebGPU adapter, else the CPU
@@ -187,6 +191,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Options, Stri
                 }
             }
             "--quiet" => a.quiet = true,
+            "--incognito" => a.incognito = true,
             "--backend" => {
                 a.backend = val()?;
                 if !["auto", "cuda", "webgpu", "cpu"].contains(&a.backend.as_str()) {

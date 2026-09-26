@@ -61,6 +61,10 @@ pub struct Job {
     /// connection).
     pub cancel: Arc<AtomicBool>,
     pub events: Sender<Event>,
+    /// Incognito: keep nothing of this request. No prompt state goes to disk,
+    /// and when it ends the engine drops its live state and checkpoints, so
+    /// the next request cannot reuse (or reveal) this one's prefix.
+    pub forget: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

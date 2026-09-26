@@ -43,6 +43,8 @@ pub use crate::job::*;
 
 pub struct Engine {
     pub model: GpuModel,
+    /// The request running is incognito: no prompt state of it goes to disk.
+    forgetting: bool,
     pub tok: Arc<Tokenizer>,
     pub eos: u32,
     /// Attention sub-chunk of the layered prefill (tokens).
@@ -139,6 +141,7 @@ impl Engine {
     pub fn new(model: GpuModel, tok: Arc<Tokenizer>, chunk: usize, step_below: usize, layered_max: usize, max_checkpoints: usize, usage: Option<PathBuf>, log: bool) -> Engine {
         let eos = model.cfg.eos_token_id;
         Engine {
+            forgetting: false,
             model,
             tok,
             eos,
@@ -173,6 +176,7 @@ impl Engine {
             // the background cache fill waits for idle time
             self.model.set_busy(true);
             self.request_number += 1;
+            self.forgetting = job.forget;
             let result = self.switch_phase(false).and_then(|_| {
                 if job.tool_precision && blocking_observer_review(&job.observer_context, self.model.uses_ternary_experts()) {
                     if self.observer.is_none() {
@@ -195,6 +199,12 @@ impl Engine {
                 self.tokens.clear();
                 self.checkpoints.clear();
                 let _ = job.events.send(Event::Error(e.to_string()));
+            }
+            if job.forget {
+                // Incognito: the next request starts clean rather than from this one.
+                self.tokens.clear();
+                self.checkpoints.clear();
+                continue;
             }
             if let Some(path) = &self.usage {
                 if let (Err(e), true) = (self.model.save_usage(path), self.warn) {
@@ -267,6 +277,9 @@ impl Engine {
     /// conversation's first user message begins), unless it is there
     /// already or the prompt has images.
     fn persist(&mut self, pos: usize, base: bool) {
+        if self.forgetting {
+            return;
+        }
         let Some(disk) = self.disk.as_mut() else {
             return;
         };
