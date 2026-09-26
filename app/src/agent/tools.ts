@@ -588,6 +588,7 @@ async function execute(call: ToolCall, ctx: ToolContext, out: ToolOut): Promise<
         lang,
         source,
         fileName: file ?? (lang === 'python' ? 'main.py' : 'main.js'),
+        entryPath: file,
         argv: Array.isArray(input.args) ? input.args.map(String) : [],
         stdin: typeof input.stdin === 'string' ? input.stdin : '',
         preload: Array.isArray(input.files) ? input.files.map(String) : undefined,

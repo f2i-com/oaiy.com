@@ -815,7 +815,7 @@
     finally { state.cwd = saved.cwd; state.env = saved.env; positional = saved.pos; state.errexit = saved.errexit; }
   }
   function runExternal(lang, what, args, stdin) {
-    const request = { lang: lang, argv: args, stdin: stdin || "", cwd: state.cwd };
+    const request = { lang: lang, argv: args, stdin: stdin || "", cwd: state.cwd, env: state.env };
     if (what.file !== undefined) request.file = resolve(what.file);
     if (what.source !== undefined) request.source = what.source;
     const r = callJson("proc.run", request);
@@ -2058,13 +2058,40 @@
   }, "wget [-q] [-O file] url   (through the network gate)");
 
   /* ----- programs: JavaScript and Python on Zipp ----- */
+  // python -m NAME: a module of the project (NAME.py, or NAME/__main__.py for
+  // a package, from the working folder), or one of the standard ones that
+  // have a command-line use here.
+  function pythonModule(name, args, stdin) {
+    if (!name) return R("", "python: -m needs a module name\n", 2);
+    const path = name.replace(/\./g, "/");
+    for (const f of [path + ".py", path + "/__main__.py"]) if (fs.isFile(f)) return runExternal("python", { file: f }, args, stdin);
+    if (name === "json.tool") {
+      const src = "import json, sys\nargs = [a for a in sys.argv[1:] if not a.startswith('-')]\ntext = open(args[0]).read() if args else sys.stdin.read()\nout = json.dumps(json.loads(text), indent=None if '--compact' in sys.argv else 4, sort_keys='--sort-keys' in sys.argv, ensure_ascii='--no-ensure-ascii' not in sys.argv)\nif len(args) > 1:\n    open(args[1], 'w').write(out + '\\n')\nelse:\n    print(out)\n";
+      return runExternal("python", { source: src }, args, stdin);
+    }
+    if (name === "py_compile" || name === "compileall") {
+      const files = args.filter((a) => !a.startsWith("-"));
+      return runExternal("python", { source: "import sys\nfor f in sys.argv[1:]:\n    compile(open(f).read(), f, 'exec')\n" }, files, stdin);
+    }
+    if (/^(pip|venv|http\.server|ensurepip|idlelib|tkinter)$/.test(name)) return R("", "python: -m " + name + " is not available in the sandbox (no processes, packages or servers here)\n", 1);
+    return R("", "python: No module named " + name + " (looked for " + path + ".py and " + path + "/__main__.py from " + state.cwd + ")\n", 1);
+  }
   function scriptRunner(lang) {
     return (args, stdin) => {
-      const o = opts(args, { withValue: "ec", stopAtOperand: true });
+      // python -m NAME: everything after NAME is the module's own arguments.
+      if (lang === "python") {
+        const at = args.findIndex((a) => a === "-m" || (a.startsWith("-m") && a.length > 2));
+        const firstOperand = args.findIndex((a) => !a.startsWith("-"));
+        if (at >= 0 && (firstOperand < 0 || at < firstOperand || args[at] !== "-m" || firstOperand === at + 1)) {
+          const name = args[at] === "-m" ? args[at + 1] : args[at].slice(2);
+          return pythonModule(name, args.slice(args[at] === "-m" ? at + 2 : at + 1), stdin);
+        }
+      }
+      const o = opts(args, { withValue: lang === "python" ? "cm" : "ep", stopAtOperand: true });
       if (lang === "js" && (o.f.e !== undefined || o.f.p !== undefined)) return runExternal("js", { source: o.f.e !== undefined ? o.f.e : "console.log(" + o.f.p + ")" }, o.a, stdin);
       if (lang === "python" && o.f.c !== undefined) return runExternal("python", { source: o.f.c }, o.a, stdin);
       if (o.f.v || o.f.V || o.f.version) return R(lang === "js" ? "v22.0.0-zipp (bot.computer sandbox)\n" : "Python 3.13 (zipp, bot.computer sandbox)\n");
-      if (lang === "python" && o.f.m) return R("", "python: -m is not available in the sandbox\n", 2);
+      if (lang === "python" && o.f.m) return pythonModule(o.f.m === true ? o.a.shift() : o.f.m, o.a, stdin);
       if (!o.a.length || o.a[0] === "-") {
         if (stdin) return runExternal(lang, { source: stdin }, o.a.slice(1), "");
         return R("", (lang === "js" ? "node" : "python") + ": the sandbox has no interactive REPL; pass a file, " + (lang === "js" ? "-e CODE" : "-c CODE") + ", or pipe code in\n", 2);

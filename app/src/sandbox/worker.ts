@@ -10,6 +10,7 @@
  * guest cannot outwait.
  */
 import { blockingCall } from './channel';
+import { buildPackage } from './pystd/package';
 import type { ConsoleLine, FromWorker, GuestSources, RunRequest, RunResult, ToWorker } from './protocol';
 
 declare const self: DedicatedWorkerGlobalScope;
@@ -119,9 +120,24 @@ function shellProgram(request: RunRequest, guest: GuestSources): string {
 }
 
 async function run(message: Extract<ToWorker, { type: 'run' }>): Promise<RunResult> {
-  const glue = (await import(/* @vite-ignore */ message.glueUrl)) as { default: (opts: unknown) => Promise<unknown>; Engine: new () => ZippEngine };
+  const glue = (await import(/* @vite-ignore */ message.glueUrl)) as {
+    default: (opts: unknown) => Promise<unknown>;
+    Engine: new () => ZippEngine;
+    addPythonPackage?: (archive: Uint8Array, kernels: unknown) => string;
+    pythonPackages?: () => string;
+  };
   await glue.default({ module_or_path: message.module });
   const request = message.request;
+  // bot.computer's Python additions (standard modules, stdin, the working folder), before any Python engine exists.
+  let packageError: string | undefined;
+  if (request.lang === 'python' && glue.addPythonPackage && glue.pythonPackages) {
+    try {
+      const info = JSON.parse(glue.pythonPackages()) as { engineAbi: string; installed: Array<{ name: string }> };
+      if (!info.installed.some((p) => p.name === 'botcomputer-stdlib')) glue.addPythonPackage(await buildPackage(info.engineAbi), null);
+    } catch (error) {
+      packageError = errorText(error);
+    }
+  }
   const engine = new glue.Engine();
   const sab = message.sab;
   // Never throw from a bridge: Zipp would hand the guest an opaque failure.
@@ -163,6 +179,7 @@ async function run(message: Extract<ToWorker, { type: 'run' }>): Promise<RunResu
   engine.setInstructionBudget(request.limits.maxSteps);
 
   const result: RunResult = { console: [] };
+  if (packageError) result.console.push({ text: `[bot.computer's Python additions could not load: ${packageError}]`, err: true });
   try {
     if (request.lang === 'python') {
       const entry = request.fileName ?? 'main.py';

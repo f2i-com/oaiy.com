@@ -125,6 +125,36 @@ try {
     });
     expect(r.report.stdout === 'js says a b\npy says 2\n42\n', `stdout: ${JSON.stringify(r.report.stdout)} stderr: ${r.report.stderr}`);
   });
+
+  await check('python runs project scripts like CPython: sibling imports, the working folder, stdin, exit codes, -m', async () => {
+    const r = await page.evaluate(async () => {
+      const v = window.__bot.vfs;
+      v.writeFile('/tools/helper.py', 'def double(n):\n    return n * 2\n', { parents: true });
+      v.writeFile('/tools/main.py', 'import sys\nimport helper\nprint(helper.double(int(sys.argv[1])))\nif sys.argv[1] == "0":\n    sys.exit(4)\n', { parents: true });
+      v.writeFile('/tools/data/n.txt', '5', { parents: true });
+      v.writeFile('/tools/read.py', 'print(open("data/n.txt").read(), open("/tools/data/n.txt").read())\n', { parents: true });
+      v.writeFile('/cfg.json', '{"b":1,"a":2}');
+      const out = {};
+      out.root = (await window.__bot.shell('python tools/main.py 21')).report;
+      out.fromDir = (await window.__bot.shell('python main.py 5', '/tools')).report;
+      out.exit = (await window.__bot.shell('python tools/main.py 0; echo "code=$?"')).report;
+      out.relative = (await window.__bot.shell('python read.py', '/tools')).report;
+      out.stdin = (await window.__bot.shell('printf "Ann" | python -c "name = input(); print(name.upper())"')).report;
+      out.module = (await window.__bot.shell('python -m json.tool --sort-keys cfg.json')).report;
+      out.stdlib = (await window.__bot.shell('python -c "import csv, datetime, glob, shutil, urllib.parse, difflib, logging, base64; print(datetime.date(2024, 3, 1) - datetime.date(2024, 2, 1))"')).report;
+      out.hidden = (await window.__bot.shell('python -c "import os; print(sorted(os.listdir(chr(46))))"', '/tools')).report;
+      return out;
+    });
+    const say = (k) => `${k}: ${JSON.stringify(r[k])}`;
+    expect(r.root.stdout === '42\n', say('root'));
+    expect(r.fromDir.stdout === '10\n', say('fromDir'));
+    expect(r.exit.stdout === '0\ncode=4\n' && !r.exit.stderr, say('exit'));
+    expect(r.relative.stdout === '5 5\n', say('relative'));
+    expect(r.stdin.stdout === 'ANN\n', say('stdin'));
+    expect(r.module.stdout.startsWith('{\n    "a": 2,'), say('module'));
+    expect(r.stdlib.stdout === '29 days, 0:00:00\n', say('stdlib'));
+    expect(r.hidden.stdout === "['data', 'helper.py', 'main.py', 'read.py']\n", say('hidden'));
+  });
 } finally {
   await browser.close();
   await server.close();

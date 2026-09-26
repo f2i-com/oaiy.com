@@ -338,32 +338,66 @@ export class SandboxHost implements HostHandler {
     return out;
   }
 
-  private async procRun(req: { lang: string; file?: string; source?: string; argv?: string[]; stdin?: string; cwd?: string }) {
+  private async procRun(req: { lang: string; file?: string; source?: string; argv?: string[]; stdin?: string; cwd?: string; env?: Record<string, string> }) {
     if (this.depth >= MAX_NESTING) throw new Error('programs may only be nested three deep in the sandbox');
     const lang: Lang = /^py/.test(req.lang) ? 'python' : 'js';
     const cwd = `/${normalizePath(req.cwd ?? '/')}`;
     let source = req.source ?? '';
     let fileName: string | undefined;
+    let entryPath: string | undefined;
     if (req.file !== undefined) {
       source = this.vfs.readText(req.file);
       fileName = relativeTo(cwd, req.file);
+      entryPath = normalizePath(req.file);
     }
-    const outcome = await this.nested().runProgram({ lang, source, fileName, argv: req.argv ?? [], stdin: req.stdin ?? '', cwd });
+    const outcome = await this.nested().runProgram({ lang, source, fileName, entryPath, argv: req.argv ?? [], stdin: req.stdin ?? '', cwd, env: req.env });
     const { stdout, stderr, exitCode } = summarize(outcome);
     return { stdout, stderr, exit_code: exitCode };
   }
 
-  /** Run a JS or Python program; Python's writes come back into the project. */
-  async runProgram(request: Omit<RunRequest, 'limits' | 'files'> & { preload?: string[] }): Promise<RunOutcome> {
+  /**
+   * Run a JS or Python program; Python's writes come back into the project.
+   *
+   * A Python program's files are the whole project ("/" its root), with the
+   * run's settings under `.botcomputer/` (the working folder, environment,
+   * stdin, argv[0]) for bot.computer's runtime additions (pystd/runtime.js),
+   * which resolve relative paths against the working folder. Modules beside
+   * the script are also placed at the root, where Zipp looks for imports, so
+   * `import helper` finds scripts/helper.py as CPython's sys.path[0] would;
+   * listings leave those copies out, and writes to them are not kept.
+   */
+  async runProgram(request: Omit<RunRequest, 'limits' | 'files'> & { preload?: string[]; entryPath?: string }): Promise<RunOutcome> {
     const remaining = this.remainingMs();
     if (remaining < 200) throw new Error('the sandbox time budget is spent');
     const cwd = `/${normalizePath(request.cwd ?? '/')}`;
-    const full: RunRequest = { ...request, cwd, limits: { maxSteps: DEFAULT_MAX_STEPS } };
-    if (request.lang === 'python') full.files = this.preload(cwd, request.preload);
+    const { preload, entryPath, ...rest } = request;
+    const full: RunRequest = { ...rest, cwd, limits: { maxSteps: DEFAULT_MAX_STEPS } };
+    let skip = (_path: string) => false;
+    if (request.lang === 'python') {
+      const cwdRel = normalizePath(cwd);
+      const scriptDir = entryPath ? (normalizePath(entryPath).includes('/') ? normalizePath(entryPath).slice(0, normalizePath(entryPath).lastIndexOf('/')) : '') : cwdRel;
+      const files = this.preload(cwdRel, scriptDir, preload);
+      const aliases = scriptDir ? this.aliasModules(scriptDir, files) : [];
+      // Code given as text (python -c, a pipe, code_run) runs as a module at the root, kept out of listings.
+      const entry = entryPath ? normalizePath(entryPath) : files['__main__.py'] === undefined ? '__main__.py' : '__botcomputer_main__.py';
+      if (!entryPath) aliases.push(entry);
+      files['.botcomputer/run.json'] = JSON.stringify({
+        cwd: cwdRel,
+        scriptDir,
+        env: request.env ?? {},
+        argv0: request.fileName ?? (entryPath ? relativeTo(cwd, `/${entry}`) : '-c'),
+        hide: aliases,
+      });
+      files['.botcomputer/stdin'] = request.stdin ?? '';
+      full.files = files;
+      full.fileName = entry;
+      skip = (path) => path === '.botcomputer' || path.startsWith('.botcomputer/') || aliases.some((a) => path === a || path.startsWith(`${a}/`));
+    }
     const outcome = await runInSandbox(full, this, { timeoutMs: remaining, signal: this.signal });
     if (request.lang === 'python' && outcome.result?.vfsChanges) {
       for (const change of outcome.result.vfsChanges) {
-        const target = `${cwd === '/' ? '' : cwd}/${change.path}`;
+        if (skip(change.path)) continue;
+        const target = `/${normalizePath(change.path)}`;
         if (change.deleted) {
           if (this.vfs.exists(target)) {
             this.vfs.remove(target, false);
@@ -378,9 +412,14 @@ export class SandboxHost implements HostHandler {
     return outcome;
   }
 
-  /** The files a Python program's `open()` sees, relative to its directory. */
-  private preload(cwd: string, patterns?: string[]): Record<string, string | { base64: string }> {
-    const base = normalizePath(cwd);
+  /**
+   * The files a Python program sees: the project, keyed from its root. When
+   * there are more than the limits allow, the working folder and the
+   * script's folder come first. `patterns` (relative to the working folder)
+   * pick files instead.
+   */
+  private preload(cwdRel: string, scriptDir: string, patterns?: string[]): Record<string, string | { base64: string }> {
+    const under = (path: string, dir: string) => dir === '' || path === dir || path.startsWith(`${dir}/`);
     const matchers = patterns?.map((p) => {
       const clean = p.trim().replace(/^\.?\//, '');
       return /[*?[]/.test(clean) ? globRegex(clean, true) : new RegExp(`^${escapeRegex(clean.replace(/\/$/, ''))}(/.*)?$`);
@@ -388,11 +427,14 @@ export class SandboxHost implements HostHandler {
     const files: Record<string, string | { base64: string }> = {};
     let count = 0;
     let total = 0;
-    const walked = this.vfs.walk(`/${base}`, { includeIgnored: !!patterns });
-    for (const entry of walked.entries) {
-      if (entry.type !== 'file') continue;
-      const inside = base ? entry.path.slice(base.length + 1) : entry.path;
-      if (matchers && !matchers.some((m) => m.test(inside))) continue;
+    const walked = this.vfs.walk('/', { includeIgnored: !!patterns });
+    const rank = (path: string) => (under(path, scriptDir) ? 0 : under(path, cwdRel) ? 1 : 2);
+    const entries = walked.entries.filter((e) => e.type === 'file').sort((a, b) => rank(a.path) - rank(b.path));
+    for (const entry of entries) {
+      if (entry.path === '.botcomputer' || entry.path.startsWith('.botcomputer/')) continue;
+      const inside = cwdRel ? (under(entry.path, cwdRel) ? entry.path.slice(cwdRel.length + 1) : null) : entry.path;
+      if (matchers && (inside === null || !matchers.some((m) => m.test(inside)))) continue;
+      const key = entry.path;
       if (!matchers && (entry.size > PRELOAD_FILE_BYTES || count >= PRELOAD_FILES || total + entry.size > PRELOAD_TOTAL_BYTES)) continue;
       const bytes = this.vfs.readBytes(`/${entry.path}`);
       total += bytes.byteLength;
@@ -403,9 +445,36 @@ export class SandboxHost implements HostHandler {
       } catch {
         text = null;
       }
-      files[inside] = text !== null ? text : { base64: bytesToBase64(bytes) };
+      files[key] = text !== null ? text : { base64: bytesToBase64(bytes) };
     }
     return files;
+  }
+
+  /**
+   * Put the modules in `dir` (its .py files and packages) at the root of the
+   * file map too, unless the root has something of that name: Zipp finds
+   * imports from the root. Returns the top-level names added.
+   */
+  private aliasModules(dir: string, files: Record<string, string | { base64: string }>): string[] {
+    const added: string[] = [];
+    const taken = (name: string) => Object.keys(files).some((k) => k === name || k.startsWith(`${name}/`));
+    let entries;
+    try {
+      entries = this.vfs.list(`/${dir}`);
+    } catch {
+      return added;
+    }
+    for (const e of entries) {
+      const src = `${dir}/${e.name}`;
+      if (e.type === 'file' && e.name.endsWith('.py') && !taken(e.name) && files[src] !== undefined) {
+        files[e.name] = files[src];
+        added.push(e.name);
+      } else if (e.type === 'dir' && files[`${src}/__init__.py`] !== undefined && !taken(e.name)) {
+        for (const k of Object.keys(files)) if (k.startsWith(`${src}/`)) files[`${e.name}/${k.slice(src.length + 1)}`] = files[k];
+        added.push(e.name);
+      }
+    }
+    return added;
   }
 }
 
@@ -455,7 +524,16 @@ export function summarize(outcome: RunOutcome): { stdout: string; stderr: string
     exitCode = 125;
   }
   if (result) {
-    if (result.error) {
+    const exit = result.error ? /^SystemExit(?::\s*([\s\S]*?))?\s*$/.exec(result.error.split('\n')[0].trim()) : null;
+    if (exit && !/\n\s*File /.test(result.error ?? '')) {
+      const arg = (exit[1] ?? '').trim();
+      if (arg === '' || arg === 'None') exitCode = 0;
+      else if (/^-?\d+$/.test(arg)) exitCode = ((Number(arg) % 256) + 256) % 256;
+      else {
+        stderr += `${arg.replace(/^['"]|['"]$/g, '')}\n`;
+        exitCode = 1;
+      }
+    } else if (result.error) {
       stderr += `${result.error}\n`;
       exitCode = 1;
     }
