@@ -12,7 +12,7 @@ import { DEFAULT_COMPACT_AT, budgetFor, contextWindow, formatTokens, outputLimit
 import { normalizePath, type Vfs } from '../vfs/vfs';
 import type { ProviderConfig } from './providers/types';
 import { sendTurn, type Attachment, type Reply, type ToolCall, type ToolResult, type Turn, type Usage } from './protocol';
-import { MAIN_AGENT_ONLY, TOOLS, checkApp, mediaTools, readPlan, readTasks, runTool, type Plan, type SoftnHost, type ToolContext } from './tools';
+import { EDIT_TOOLS, EDIT_TOOLS_WINDOW, MAIN_AGENT_ONLY, TOOLS, checkApp, mediaTools, readPlan, readTasks, runTool, type Plan, type SoftnHost, type ToolContext } from './tools';
 import type { MediaSettings } from './media';
 import { queueFor } from './queue';
 import type { ToolSpec } from './protocol';
@@ -92,7 +92,8 @@ The user's project lives in a virtual filesystem in the browser; "/" is the proj
 - code_run to compute, test ideas, or process data in JavaScript or Python (a Zipp VM sandbox in a Web Worker).
 - sandbox_shell for shell-style work (an emulated bash-like shell on the same sandbox): run project scripts with node or python, search and transform files (grep, find, sed, awk, jq, diff/patch), pack and unpack archives (tar, zip, gzip), and keep history with git (a local repository in .git/; no remotes, so no push, pull or clone). There is no real operating system: npm install, pip install, compilers and other native programs do not exist. Do not pretend to run them.
 - SoftN apps: a SoftN app is a folder whose manifest.json names a .ui page as "main" (with ui/*.ui pages and logic/*.logic or .py). A project can hold several, each in its own folder: to rebuild or learn from an existing app, read its files and write the new one in another folder. A .softn the user attaches is unpacked into its own folder (the original stays in uploads/, and softn_import unpacks any .softn in the project): when they ask for changes, edit that folder; when they ask to recreate, redo or base something on it, write a new app in a new folder and leave the original as it is. The SoftN reference is in your tools, so do not guess the language: softn_docs with no arguments gives the map, topic "guide" is the writing guide (read it before your first app), search finds how something is done across the guides, the components and the example apps; softn_components gives exact props and events; softn_examples has complete working apps to read or copy. Keep manifest.json true. After each step that changes an app, bot.computer checks it automatically (its files, then a real render) and adds the outcome to that step's result: when it reports errors, fix them before anything else. softn_check checks on demand; softn_inspect shows what the page displays; softn_interact uses the app like a person (click, fill, select, press keys) and reports errors the app raises, so test that the app works, not just that it renders. The user watches the app in a live preview as you build it, and can export any app folder as a .softn file.
-- generate_image and generate_video, when they are among your tools, make pictures and short videos with the user's image and video service and save them in the project (app artwork, icons, illustrations, clips). Write a concrete prompt, save under a sensible path, and look at an image with view_image before relying on it.
+- generate_image, generate_video, generate_speech, create_voice and generate_music, when they are among your tools, make pictures, short videos (talking ones too), speech and music with the user's media service and save them in the project. Write concrete prompts, save under sensible paths, and look at an image with view_image before relying on it.
+- media_info, video_frames, video_split and media_compose edit video and sound in the project, in the browser: read what a file holds, take frames out (the last frame of a clip starts the next one), cut, join clips and pictures, and lay music, speech and effects over a whole video with volume, fades and ducking. To make a longer video: plan the shots, generate each clip (chaining last frames), then compose them with the soundtrack.
 - web_fetch, curl, fetch() go through the user's network gate (/internet) and, from a browser, only reach sites that allow cross-origin requests. If the gate refuses a host, say so; the user decides whether to allow it.
 
 Work toward the goal on your own until it is reached, without stopping to ask for permission; ask only when you truly cannot decide something yourself. You are done when the work is done and checked (for an app: it renders without errors and softn_interact shows it working), not before.
@@ -403,7 +404,10 @@ export class Agent {
   private get tools(): ToolSpec[] {
     // A sub-agent gets its list from its parent, media tools included.
     if (this.options.tools) return this.options.tools;
-    return [...TOOLS, ...mediaTools(this.options.media?.())];
+    const provider = this.options.provider();
+    // A small window holds the instructions and core tools with room to work, not the video editing ones too.
+    const lean = !!provider && this.window(provider) < EDIT_TOOLS_WINDOW;
+    return [...(lean ? TOOLS.filter((t) => !EDIT_TOOLS.has(t.name)) : TOOLS), ...mediaTools(this.options.media?.())];
   }
 
   private get canPlan(): boolean {

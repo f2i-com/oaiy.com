@@ -72,6 +72,8 @@ export default defineConfig({
       input: {
         main: 'index.html',
       },
+      // Chunks keep their export names (the desktop check loads the editor chunk by name).
+      output: { minifyInternalExports: false },
     },
   },
   test: {

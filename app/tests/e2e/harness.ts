@@ -3,6 +3,7 @@ import { NetGate } from '../../src/gate/netgate';
 import { SandboxHost, summarize } from '../../src/sandbox/host';
 import { runInSandbox, sandboxAvailable } from '../../src/sandbox/runner';
 import { Vfs } from '../../src/vfs/vfs';
+import { runTool } from '../../src/agent/tools';
 
 const vfs = new Vfs();
 const gate = new NetGate();
@@ -24,5 +25,11 @@ async function budgetRun(source: string) {
   return runInSandbox({ lang: 'js', source, limits: { maxSteps: 1_000_000 } }, host, { timeoutMs: 30_000 });
 }
 
-Object.assign(window, { __bot: { vfs, gate, shell, run, budgetRun, sandboxAvailable, isolated: globalThis.crossOriginIsolated } });
+/** One of the agent's tools, run against the harness's project. */
+async function tool(name: string, input: Record<string, unknown>) {
+  const result = await runTool({ id: `t${Date.now()}`, name, input }, { vfs, gate, reads: new Map(), shell: { cwd: '/', env: {} } });
+  return { content: result.content, isError: !!result.isError, files: result.files ?? [] };
+}
+
+Object.assign(window, { __bot: { vfs, gate, shell, run, budgetRun, tool, sandboxAvailable, isolated: globalThis.crossOriginIsolated } });
 document.getElementById('status')!.textContent = `ready isolated=${globalThis.crossOriginIsolated}`;

@@ -148,6 +148,34 @@ try {
     expect(ready === 'ready', `the runtime ${ready}`);
   });
 
+  await check('WebView2 edits video: H.264 and AAC encode, a picture and a tone composed into an MP4', async () => {
+    const r = await page.evaluate(async () => {
+      // The editor as the app loads it: the chunk its own script imports.
+      const main = document.querySelector('script[type="module"][src]').src;
+      const chunk = (await (await fetch(main)).text()).match(/\.\/(edit-[\w-]+\.js)/)?.[1];
+      if (!chunk) return { error: 'no editor chunk in the app' };
+      const edit = await import(new URL(chunk, main).href);
+      const c = new OffscreenCanvas(320, 240);
+      const g = c.getContext('2d');
+      g.fillStyle = '#00ff00';
+      g.fillRect(0, 0, 320, 240);
+      const png = new Uint8Array(await (await c.convertToBlob({ type: 'image/png' })).arrayBuffer());
+      const rate = 48000;
+      const n = rate;
+      const wav = new DataView(new ArrayBuffer(44 + n * 2));
+      const text = (at, t) => [...t].forEach((ch, i) => wav.setUint8(at + i, ch.charCodeAt(0)));
+      text(0, 'RIFF'); wav.setUint32(4, 36 + n * 2, true); text(8, 'WAVE'); text(12, 'fmt '); wav.setUint32(16, 16, true);
+      wav.setUint16(20, 1, true); wav.setUint16(22, 1, true); wav.setUint32(24, rate, true); wav.setUint32(28, rate * 2, true);
+      wav.setUint16(32, 2, true); wav.setUint16(34, 16, true); text(36, 'data'); wav.setUint32(40, n * 2, true);
+      for (let i = 0; i < n; i++) wav.setInt16(44 + i * 2, Math.sin((2 * Math.PI * 440 * i) / rate) * 12000, true);
+      const made = await edit.compose({ clips: [{ bytes: png, name: 'g.png', duration: 1 }], audio: [{ bytes: new Uint8Array(wav.buffer), name: 't.wav' }], output: 'mp4', fps: 30 });
+      const info = await edit.mediaInfo(made.bytes, 'out.mp4');
+      return { videoCodec: made.videoCodec, audioCodec: made.audioCodec, info };
+    });
+    expect(!r.error && r.videoCodec === 'avc' && r.audioCodec === 'aac', JSON.stringify(r));
+    expect(r.info.video.frames === 30 && r.info.video.width === 320 && r.info.audio?.channels === 2, JSON.stringify(r));
+  });
+
   await check('Export .zip saves a download', async () => {
     const cdp = await page.createCDPSession();
     await cdp.send('Browser.setDownloadBehavior', { behavior: 'allow', downloadPath: downloads });

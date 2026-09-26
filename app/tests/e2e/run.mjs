@@ -246,6 +246,92 @@ try {
     ];
     expect(JSON.stringify(lines.slice(0, expected.length)) === JSON.stringify(expected), `stdout: ${JSON.stringify(r.report.stdout)} stderr: ${r.report.stderr}`);
   });
+
+  await check('media tools: compose pictures into a video, read it, take frames, split it, rejoin it with music, and mix sound alone', async () => {
+    const r = await page.evaluate(async () => {
+      const bot = window.__bot;
+      // Two coloured pictures and a tone, made here: no fixtures.
+      const picture = async (color) => {
+        const c = new OffscreenCanvas(320, 240);
+        const g = c.getContext('2d');
+        g.fillStyle = color;
+        g.fillRect(0, 0, 320, 240);
+        return new Uint8Array(await (await c.convertToBlob({ type: 'image/png' })).arrayBuffer());
+      };
+      bot.vfs.writeFile('/media/red.png', await picture('#ff0000'), { parents: true });
+      bot.vfs.writeFile('/media/blue.png', await picture('#0000ff'), { parents: true });
+      const rate = 48000;
+      const n = rate * 3;
+      const wav = new DataView(new ArrayBuffer(44 + n * 2));
+      const text = (at, s) => [...s].forEach((ch, i) => wav.setUint8(at + i, ch.charCodeAt(0)));
+      text(0, 'RIFF'); wav.setUint32(4, 36 + n * 2, true); text(8, 'WAVE'); text(12, 'fmt '); wav.setUint32(16, 16, true);
+      wav.setUint16(20, 1, true); wav.setUint16(22, 1, true); wav.setUint32(24, rate, true); wav.setUint32(28, rate * 2, true);
+      wav.setUint16(32, 2, true); wav.setUint16(34, 16, true); text(36, 'data'); wav.setUint32(40, n * 2, true);
+      for (let i = 0; i < n; i++) wav.setInt16(44 + i * 2, Math.sin((2 * Math.PI * 440 * i) / rate) * 12000, true);
+      bot.vfs.writeFile('/media/tone.wav', new Uint8Array(wav.buffer));
+      // The colour at the middle of a saved frame.
+      const colour = async (path) => {
+        const bitmap = await createImageBitmap(new Blob([bot.vfs.readBytes(path)]));
+        const c = new OffscreenCanvas(bitmap.width, bitmap.height);
+        const g = c.getContext('2d');
+        g.drawImage(bitmap, 0, 0);
+        const [red, , blue] = g.getImageData(bitmap.width / 2, bitmap.height / 2, 1, 1).data;
+        return { size: `${bitmap.width}x${bitmap.height}`, is: red > 150 && blue < 100 ? 'red' : blue > 150 && red < 100 ? 'blue' : `rgb ${red},${blue}` };
+      };
+      const out = {};
+      out.compose = await bot.tool('media_compose', { output: 'media/slides.mp4', fps: 30, clips: [{ path: 'media/red.png', duration: 2 }, { path: 'media/blue.png', duration: 2 }] });
+      out.info = await bot.tool('media_info', { path: 'media/slides.mp4' });
+      out.frames = await bot.tool('video_frames', { path: 'media/slides.mp4', times: [0.5, 3.5], last: true });
+      const saved = bot.vfs.walk('/media/slides-frames').entries.filter((e) => e.type === 'file').map((e) => `/${e.path}`).sort();
+      out.colours = [];
+      for (const f of saved) out.colours.push(await colour(f));
+      out.split = await bot.tool('video_split', { path: 'media/slides.mp4', at: [2] });
+      out.part2 = await bot.tool('media_info', { path: 'media/slides-part-2.mp4' });
+      out.rejoin = await bot.tool('media_compose', {
+        output: 'media/rejoined.mp4',
+        clips: [{ path: 'media/slides-part-2.mp4' }, { path: 'media/slides-part-1.mp4', fade_out: 0.5 }],
+        audio: [{ path: 'media/tone.wav', at: 0.5, volume: 0.5, fade_out: 1, loop: true }],
+      });
+      out.rejoinInfo = await bot.tool('media_info', { path: 'media/rejoined.mp4' });
+      await bot.tool('video_frames', { path: 'media/rejoined.mp4', frames: [15], output_dir: 'media/check' });
+      out.firstColour = await colour('/media/check/frame-00015.png');
+      out.mix = await bot.tool('media_compose', { output: 'media/mix.wav', audio: [{ path: 'media/tone.wav', volume: 0.8 }, { path: 'media/tone.wav', at: 1, volume: 1, duck: 0.2 }] });
+      out.mixInfo = await bot.tool('media_info', { path: 'media/mix.wav' });
+      out.bad = await bot.tool('media_compose', { output: 'media/x.mp3', audio: [{ path: 'media/tone.wav' }] });
+      // The sound, measured: level (RMS) of a stretch of a WAV the tool wrote.
+      const level = async (path, from, to) => {
+        const ctx = new OfflineAudioContext(1, 1, 48000);
+        const buffer = await ctx.decodeAudioData(bot.vfs.readBytes(path).slice().buffer);
+        const data = buffer.getChannelData(0).subarray(Math.floor(from * buffer.sampleRate), Math.floor(to * buffer.sampleRate));
+        let sum = 0;
+        for (const v of data) sum += v * v;
+        return Math.sqrt(sum / Math.max(1, data.length));
+      };
+      await bot.tool('media_compose', { output: 'media/placed.wav', duration: 2, audio: [{ path: 'media/tone.wav', at: 0.5 }] });
+      out.placed = { before: await level('/media/placed.wav', 0, 0.45), after: await level('/media/placed.wav', 0.55, 1.5) };
+      // A silent voice that ducks: the music drops to 20% while it plays (1 s to 2 s), and comes back.
+      await bot.tool('media_compose', { output: 'media/ducked.wav', duration: 3, audio: [{ path: 'media/tone.wav' }, { path: 'media/tone.wav', at: 1, end: 1, volume: 0, duck: 0.2 }] });
+      out.ducked = { open: await level('/media/ducked.wav', 0.1, 0.7), ducked: await level('/media/ducked.wav', 1.3, 1.7), back: await level('/media/ducked.wav', 2.4, 2.9) };
+      // Four loud tones at once would clip: the mix is turned down to fit.
+      out.loud = await bot.tool('media_compose', { output: 'media/loud.wav', audio: [1, 2, 3, 4].map(() => ({ path: 'media/tone.wav', volume: 2 })) });
+      return out;
+    });
+    const all = JSON.stringify(r, null, 1).slice(0, 3000);
+    expect(!r.compose.isError && r.compose.content.includes('4 s') && r.compose.content.includes('320×240 at 30 fps'), all);
+    expect(r.info.content.includes('duration 4 s') && r.info.content.includes('video 320×240, 30 fps, 120 frames') && r.info.content.includes('no sound'), all);
+    expect(!r.frames.isError && JSON.stringify(r.colours.map((c) => c.is)) === '["red","blue","blue"]' && r.colours.every((c) => c.size === '320x240'), all);
+    expect(r.frames.content.includes('frame 119'), all);
+    expect(!r.split.isError && r.split.content.includes('into 2 parts') && r.part2.content.includes('duration 2 s'), all);
+    // AAC's encoder delay adds a few milliseconds to the container's duration.
+    expect(!r.rejoin.isError && /duration 4(\.0[0-4]\d*)? s/.test(r.rejoinInfo.content) && /audio (aac|opus)/.test(r.rejoinInfo.content), all);
+    expect(r.firstColour.is === 'blue', all);
+    expect(!r.mix.isError && r.mix.content.includes('4 s') && r.mixInfo.content.includes('audio') && r.mixInfo.content.includes('2 channels'), all);
+    expect(r.bad.isError && r.bad.content.includes('.wav or .m4a'), all);
+    expect(r.placed.before < 0.001 && r.placed.after > 0.2, `placement: ${JSON.stringify(r.placed)}`);
+    const ratio = r.ducked.ducked / r.ducked.open;
+    expect(ratio > 0.17 && ratio < 0.23 && Math.abs(r.ducked.back / r.ducked.open - 1) < 0.05, `ducking: ${JSON.stringify(r.ducked)} ratio ${ratio}`);
+    expect(!r.loud.isError && r.loud.content.includes('turned down'), `limiting: ${r.loud.content}`);
+  });
 } finally {
   await browser.close();
   await server.close();

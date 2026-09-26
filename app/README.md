@@ -43,6 +43,20 @@ The agent gets more tools when a media service is set up:
 
 The results appear in the chat (with a player for video and audio) and in the project, where an app can use them.
 
+### Editing video and sound
+
+These tools work on files already in the project, with or without a media service:
+- `media_info` reports what a video, audio or image file holds: duration, size, frame rate and exact frame count, codecs, sample rate and channels.
+- `video_frames` saves frames as PNGs: at times, by frame number, one every N seconds, or the first and last. The last frame of a clip is the start image for the next one, so a long video is made clip by clip.
+- `video_split` cuts a video into parts at times or frame numbers.
+- `media_compose` builds a timeline and saves it as .mp4 or .webm, or as .wav or .m4a for sound only:
+  - **clips** play one after another: videos, trimmed with start and end, or still pictures shown for a duration. Each can fade from or to black and set its own sound's volume.
+  - **audio** lays music, speech or effects over the whole timeline. Each track is placed at a time, trimmed, looped, set louder or quieter, and faded.
+  - A track can **duck** everything else while it plays, for a voice over music.
+  - The whole mix has its own volume and fades, and is turned down automatically if it would clip.
+
+They run in the page with the browser's own video and audio codecs (WebCodecs: H.264 and AAC where the system has them, otherwise VP9 and Opus). [Mediabunny](https://mediabunny.dev) reads and writes the files. Everything is re-encoded, so cuts are exact to the frame. Nothing leaves the computer, and it works offline and in the desktop app. A model with a context window under 16k tokens doesn't get these four tools, so that its window still has room to work.
+
 - **nrob is found on its own.** When the page opens, it asks `http://127.0.0.1:8080/v1/discovery`.
   - If nrob answers, its image, video, speech and music models, their limits (sizes, edits, seconds), its saved voices and its defaults fill **Settings → Images, video and audio**.
   - nrob is also added as a chat provider if none points at it yet. It becomes the active one only if nothing else is.

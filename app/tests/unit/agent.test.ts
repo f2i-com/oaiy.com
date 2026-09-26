@@ -87,6 +87,17 @@ describe('tool rules', () => {
     expect(fake.bodies[0].max_completion_tokens).toBeUndefined();
   });
 
+  it('a small context window gets the core tools without the video editing ones', async () => {
+    const names = (body: Record<string, unknown>) => (body.tools as Array<{ function: { name: string } }>).map((t) => t.function.name);
+    const small = fakeProvider('openai', [{ text: 'hi' }]);
+    await setup({ ...LOCAL, contextTokens: 12_000 }).agent.run('hello', () => {});
+    expect(names(small.bodies[0])).toContain('read_file');
+    expect(names(small.bodies[0])).not.toContain('media_compose');
+    const large = fakeProvider('openai', [{ text: 'hi' }]);
+    await setup({ ...LOCAL, contextTokens: 32_000 }).agent.run('hello', () => {});
+    expect(names(large.bodies[0])).toEqual(expect.arrayContaining(['media_info', 'video_frames', 'video_split', 'media_compose']));
+  });
+
   it('write_file needs a full read before it replaces an existing file', async () => {
     fakeProvider('anthropic', [
       { calls: [{ name: 'write_file', input: { path: 'src/app.js', content: 'gone' } }] },

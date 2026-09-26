@@ -30,6 +30,11 @@ const MAX_TIMEOUT_S = 300;
 /** Tools a sub-agent does not get: it does not delegate further or change the plan. */
 export const MAIN_AGENT_ONLY = new Set(['delegate', 'update_plan']);
 
+/** The video and sound editing tools: left out for a model with a small context window, to leave it room to work. */
+export const EDIT_TOOLS = new Set(['media_info', 'video_frames', 'video_split', 'media_compose']);
+/** The smallest window that gets the editing tools, in tokens. */
+export const EDIT_TOOLS_WINDOW = 16_000;
+
 /** The tasks of a delegate call, or an error saying what is wrong with them. */
 export function readTasks(input: Record<string, unknown>): Array<{ title: string; instructions: string; planStep?: number }> {
   const raw = Array.isArray(input.tasks) ? input.tasks : [];
@@ -169,6 +174,7 @@ export function mediaTools(media: MediaSettings | null | undefined): ToolSpec[] 
         (media.discovered
           ? 'A character can talk: give `say` (their words; the service speaks them in `voice`, and the lips follow), or `soundtrack` (a speech or audio file in the project to follow). Then without `seconds` the clip is as long as the speech, up to the model\'s limit of a few seconds: keep each line to one short sentence, and make several clips for longer speech. '
           : '') +
+        'For a longer video, make several clips: video_frames with last: true gives the last frame of one to start the next on, and media_compose joins them and adds music. ' +
         `It takes minutes; the user sees its progress in the chat, and the finished video gets a player there.${describeModels(media, 'video')}`,
       parameters: {
         type: 'object',
@@ -369,6 +375,93 @@ export const TOOLS: ToolSpec[] = [
     },
   },
   {
+    name: 'media_info',
+    description: 'What a video, audio or image file in the project holds: duration, size, frame rate and frame count, codecs, sample rate and channels.',
+    parameters: { type: 'object', required: ['path'], properties: { path: str } },
+  },
+  {
+    name: 'video_frames',
+    description:
+      'Save frames of a video as PNG images: at times (seconds), by frame number (from 0), one every N seconds, or the first and last. ' +
+      'The last frame of a clip is the start_image that continues it in generate_video. Look at frames with view_image.',
+    parameters: {
+      type: 'object',
+      required: ['path'],
+      properties: {
+        path: str,
+        times: { type: 'array', items: { type: 'number' }, description: 'Seconds into the video' },
+        frames: { type: 'array', items: int, description: 'Frame numbers, from 0' },
+        every: { type: 'number', description: 'One frame every this many seconds' },
+        first: { type: 'boolean' },
+        last: { type: 'boolean' },
+        output_dir: { type: 'string', description: 'Where to save them (default: a <name>-frames folder beside the video)' },
+        max_size: { ...int, description: 'Longest side in pixels (default: the video\'s size)' },
+      },
+    },
+  },
+  {
+    name: 'video_split',
+    description: 'Cut a video into parts at times (seconds) or frame numbers; each part is saved as its own file (<name>-part-1.mp4, -part-2, …). Each part is re-encoded, so the cuts are exact to the frame. To keep one stretch only, use media_compose with a clip start and end.',
+    parameters: {
+      type: 'object',
+      required: ['path'],
+      properties: {
+        path: str,
+        at: { type: 'array', items: { type: 'number' }, description: 'Cut points in seconds' },
+        frames: { type: 'array', items: int, description: 'Cut points as frame numbers: each part starts at one' },
+        output_dir: { type: 'string', description: 'Where to save the parts (default: beside the video)' },
+      },
+    },
+  },
+  {
+    name: 'media_compose',
+    description:
+      'Put videos, pictures and sounds together on a timeline and save the result. ' +
+      'clips play one after another (videos, or still pictures shown for `duration` seconds): trim a video with start/end, fade from and to black with fade_in/fade_out, and set its own sound with volume (0 silences it). ' +
+      'audio lays sound over the whole timeline (music, speech, effects): each placed `at` a time, trimmed, looped, louder or quieter (volume: 1 as it is, 0.25 for music under speech), faded, and `duck` (0-1) turns every other sound down to that level while it plays, for a voice over music. ' +
+      'Output .mp4 (or .webm) for a video; with no clips and a .wav or .m4a output it mixes sound only. Clips of another shape fit the first clip\'s frame (or width/height), letterboxed or cropped (fit). ' +
+      'Everything is re-encoded; a mix that would clip is turned down to fit.',
+    parameters: {
+      type: 'object',
+      required: ['output'],
+      properties: {
+        output: { type: 'string', description: 'Where to save it: .mp4, .webm, .wav, .m4a' },
+        clips: {
+          type: 'array',
+          items: { type: 'object', required: ['path'], properties: { path: str, start: { type: 'number' }, end: { type: 'number' }, duration: { type: 'number', description: 'Seconds a picture shows (default 3)' }, fade_in: { type: 'number' }, fade_out: { type: 'number' }, volume: { type: 'number' } } },
+        },
+        audio: {
+          type: 'array',
+          items: {
+            type: 'object',
+            required: ['path'],
+            properties: {
+              path: str,
+              at: { type: 'number', description: 'Where it starts on the timeline, seconds' },
+              start: { type: 'number', description: 'Where to start in the file' },
+              end: { type: 'number', description: 'Where to stop in the file' },
+              volume: { type: 'number' },
+              fade_in: { type: 'number' },
+              fade_out: { type: 'number' },
+              loop: { type: 'boolean', description: 'Repeat to the end (or to `until`)' },
+              until: { type: 'number' },
+              duck: { type: 'number', description: 'Others drop to this level (0-1) while this plays' },
+            },
+          },
+        },
+        keep_clip_audio: { type: 'boolean', description: 'The clips\' own sound (default true)' },
+        volume: { type: 'number', description: 'The whole mix' },
+        fade_in: { type: 'number', description: 'The whole mix\'s sound, seconds' },
+        fade_out: { type: 'number' },
+        width: int,
+        height: int,
+        fps: { type: 'number' },
+        fit: { type: 'string', enum: ['contain', 'cover'] },
+        duration: { type: 'number', description: 'Length of a sound-only mix (default: to its last sound)' },
+      },
+    },
+  },
+  {
     name: 'write_file',
     description: 'Create a file, or replace one you have read in full. Parent folders are created.',
     parameters: { type: 'object', required: ['path', 'content'], properties: { path: str, content: str } },
@@ -482,6 +575,20 @@ function cut(text: string, max = OUTPUT_CHARS): string {
   const head = text.slice(0, Math.floor(max * 0.7));
   const tail = text.slice(-Math.floor(max * 0.25));
   return `${head}\n\n[... ${text.length - head.length - tail.length} characters omitted ...]\n\n${tail}`;
+}
+
+/** A project file's bytes, or an error naming it. */
+function projectBytes(vfs: Vfs, path: string): Uint8Array {
+  if (vfs.stat(`/${path}`)?.type !== 'file') throw new Error(`/${path} does not exist`);
+  return vfs.readBytes(`/${path}`);
+}
+
+/** The output format media_compose writes, from the path. */
+function edit_format(path: string): 'mp4' | 'webm' | 'wav' | 'm4a' | 'ogg' {
+  const ext = path.slice(path.lastIndexOf('.') + 1).toLowerCase();
+  if (ext === 'mp4' || ext === 'webm' || ext === 'wav' || ext === 'm4a') return ext;
+  if (ext === 'ogg' || ext === 'opus') return 'ogg';
+  throw new Error(`write .mp4 or .webm for a video, .wav or .m4a for sound (not .${ext})`);
 }
 
 /** A file in the project, sent to a service as it is. */
@@ -1013,6 +1120,101 @@ async function execute(call: ToolCall, ctx: ToolContext, out: ToolOut): Promise<
       vfs.writeFile(`/${path}`, result.bytes, { parents: true });
       out.files.push(path);
       return `Saved /${path} (${result.seconds ? `${Math.round(result.seconds)} s, ` : ''}${(result.bytes.byteLength / 1e6).toFixed(1)} MB), made with ${result.model}. The user has a player for it in the chat.`;
+    }
+    case 'media_info': {
+      const path = normalizePath(need(input, 'path'));
+      const edit = await import('../media/edit');
+      const info = await edit.mediaInfo(projectBytes(vfs, path), path);
+      const lines = [`/${path}: ${info.kind}${info.container ? ` (${info.container})` : ''}`];
+      if (info.duration !== undefined) lines.push(`duration ${info.duration} s`);
+      if (info.video) lines.push(`video ${info.video.width}×${info.video.height}, ${info.video.fps} fps, ${info.video.frames} frames, ${info.video.codec ?? 'unknown codec'}`);
+      else if (info.width) lines.push(`${info.width}×${info.height} px`);
+      if (info.audio) lines.push(`audio ${info.audio.codec ?? 'unknown codec'}, ${info.audio.sampleRate} Hz, ${info.audio.channels} channel${info.audio.channels === 1 ? '' : 's'}`);
+      else if (info.kind === 'video') lines.push('no sound');
+      return lines.join('\n');
+    }
+    case 'video_frames': {
+      const path = normalizePath(need(input, 'path'));
+      const edit = await import('../media/edit');
+      const nums = (k: string) => (Array.isArray(input[k]) ? (input[k] as unknown[]).map(Number).filter((n) => Number.isFinite(n)) : undefined);
+      ctx.progress?.('taking frames out of the video…');
+      const result = await edit.videoFrames(projectBytes(vfs, path), path, {
+        times: nums('times'),
+        frames: nums('frames'),
+        every: typeof input.every === 'number' ? input.every : undefined,
+        first: input.first === true,
+        last: input.last === true,
+        maxSize: typeof input.max_size === 'number' ? input.max_size : undefined,
+      });
+      const stem = path.replace(/\.[a-z0-9]+$/i, '');
+      const dir = typeof input.output_dir === 'string' && input.output_dir.trim() ? normalizePath(input.output_dir) : `${stem}-frames`;
+      const saved = result.frames.map((f) => {
+        const file = `${dir}/frame-${String(f.frame).padStart(5, '0')}.png`;
+        vfs.writeFile(`/${file}`, f.png, { parents: true });
+        return `/${file} (frame ${f.frame}, ${f.time} s)`;
+      });
+      if (saved.length <= 4) out.files.push(...result.frames.map((f) => `${dir}/frame-${String(f.frame).padStart(5, '0')}.png`));
+      return `/${path}: ${result.count} frames at ${result.fps} fps, ${result.duration} s. Saved ${saved.length} (${result.frames[0]?.width}×${result.frames[0]?.height}):\n${saved.join('\n')}`;
+    }
+    case 'video_split': {
+      const path = normalizePath(need(input, 'path'));
+      const edit = await import('../media/edit');
+      const bytes = projectBytes(vfs, path);
+      let points = Array.isArray(input.at) ? (input.at as unknown[]).map(Number).filter((n) => Number.isFinite(n)) : [];
+      if (Array.isArray(input.frames)) {
+        const info = await edit.mediaInfo(bytes, path);
+        const fps = info.video?.fps || 30;
+        points = points.concat((input.frames as unknown[]).map(Number).filter((n) => Number.isFinite(n)).map((f) => f / fps));
+      }
+      if (!points.length) throw new Error('give the cut points: at (seconds) or frames');
+      const parts = await edit.splitVideo(bytes, path, points, (m) => ctx.progress?.(m));
+      const name = path.split('/').pop()!.replace(/\.[a-z0-9]+$/i, '');
+      const ext = edit.extOf(path) === 'webm' ? 'webm' : 'mp4';
+      const dir = typeof input.output_dir === 'string' && input.output_dir.trim() ? normalizePath(input.output_dir) : path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : '';
+      const saved = parts.map((p, i) => {
+        const file = `${dir ? `${dir}/` : ''}${name}-part-${i + 1}.${ext}`;
+        vfs.writeFile(`/${file}`, p.bytes, { parents: true });
+        return `/${file}: ${p.start} s to ${p.end} s (about ${p.frames} frames)`;
+      });
+      return `Cut /${path} into ${parts.length} parts:\n${saved.join('\n')}`;
+    }
+    case 'media_compose': {
+      const outputPath = normalizePath(need(input, 'output'));
+      const format = edit_format(outputPath);
+      const edit = await import('../media/edit');
+      const num = (o: Record<string, unknown>, k: string) => (typeof o[k] === 'number' && Number.isFinite(o[k]) ? (o[k] as number) : undefined);
+      const items = (k: string) => (Array.isArray(input[k]) ? (input[k] as unknown[]).filter((x): x is Record<string, unknown> => !!x && typeof x === 'object') : []);
+      const file = (o: Record<string, unknown>) => {
+        const p = normalizePath(String(o.path ?? ''));
+        return { bytes: projectBytes(vfs, p), name: p };
+      };
+      const clips = items('clips').map((c) => ({ ...file(c), start: num(c, 'start'), end: num(c, 'end'), duration: num(c, 'duration'), fadeIn: num(c, 'fade_in'), fadeOut: num(c, 'fade_out'), volume: num(c, 'volume') }));
+      const audio = items('audio').map((a) => ({ ...file(a), at: num(a, 'at'), start: num(a, 'start'), end: num(a, 'end'), volume: num(a, 'volume'), fadeIn: num(a, 'fade_in'), fadeOut: num(a, 'fade_out'), loop: a.loop === true, until: num(a, 'until'), duck: num(a, 'duck') }));
+      ctx.progress?.('composing…');
+      const result = await edit.compose({
+        clips,
+        audio,
+        output: format,
+        width: num(input, 'width'),
+        height: num(input, 'height'),
+        fps: num(input, 'fps'),
+        fit: input.fit === 'cover' ? 'cover' : 'contain',
+        clipAudio: input.keep_clip_audio !== false,
+        volume: num(input, 'volume'),
+        fadeIn: num(input, 'fade_in'),
+        fadeOut: num(input, 'fade_out'),
+        duration: num(input, 'duration'),
+      }, (m) => ctx.progress?.(m));
+      vfs.writeFile(`/${outputPath}`, result.bytes, { parents: true });
+      out.files.push(outputPath);
+      const facts = [
+        `${result.duration} s`,
+        result.width && `${result.width}×${result.height} at ${result.fps} fps`,
+        result.videoCodec && `video ${result.videoCodec}`,
+        result.audioCodec ? `sound ${result.audioCodec}, peak ${result.peak}${result.limitedBy ? ` (turned down to ×${result.limitedBy} to keep it from clipping)` : ''}` : 'no sound',
+        `${(result.bytes.byteLength / 1e6).toFixed(1)} MB`,
+      ].filter(Boolean);
+      return `Saved /${outputPath}: ${facts.join(', ')}. The user has a player for it in the chat.`;
     }
     case 'present_file': {
       const path = normalizePath(need(input, 'path'));
