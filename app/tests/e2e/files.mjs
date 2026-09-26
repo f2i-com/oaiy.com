@@ -247,13 +247,21 @@ try {
     await page.type('.chat-input', '/softn new apps/second');
     await page.keyboard.press('Enter');
     await page.waitForFunction(() => document.querySelectorAll('.preview-app option').length === 3, { timeout: 20_000 });
+    // The new app is shown once it is saved: choose another only after that.
+    await page.waitForFunction(() => document.querySelector('.chat-log')?.textContent.includes('New SoftN app "second"'), { timeout: 20_000 });
     const options = await page.$$eval('.preview-app option', (o) => o.map((x) => x.value));
     expect(options.includes('Imported') && options.includes('apps/second'), `${options}`);
     if (softnInstalled) {
       await page.select('.preview-app', 'Imported');
-      await page.waitForFunction(() => /live/.test(document.querySelector('.preview-status')?.textContent ?? ''), { timeout: 40_000 });
-      const frame = page.frames().find((f) => f.url().includes('/softn/index.html'));
-      expect((await frame.evaluate(() => document.body.innerText)).includes('hello from an imported app'), 'the imported app did not render');
+      // The status may still say "live" for the app shown before: wait for this app's own text.
+      let rendered = false;
+      for (let i = 0; i < 200 && !rendered; i++) {
+        await new Promise((r) => setTimeout(r, 200));
+        for (const f of page.frames().filter((f) => f.url().includes('/softn/index.html'))) {
+          if (await f.evaluate(() => document.body?.innerText ?? '').then((t) => t.includes('hello from an imported app'), () => false)) rendered = true;
+        }
+      }
+      expect(rendered, 'the imported app did not render');
     }
     await page.type('.chat-input', '/softn export Imported');
     await page.keyboard.press('Enter');
