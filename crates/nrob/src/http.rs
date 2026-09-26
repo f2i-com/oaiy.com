@@ -137,7 +137,8 @@ fn chunked_body(r: &mut impl BufRead, limit: usize) -> Result<Vec<u8>, ReadError
             while !line(r)?.is_empty() {}
             return Ok(body);
         }
-        if body.len() + size > limit {
+        // `size` is attacker-chosen: compare without adding, which could wrap.
+        if size > limit.saturating_sub(body.len()) {
             return Err(ReadError::Bad("body too large".into()));
         }
         let at = body.len();
@@ -183,6 +184,7 @@ pub fn read_request(r: &mut BufReader<TcpStream>, writer: &mut TcpStream) -> Res
 pub fn reason(status: u16) -> &'static str {
     match status {
         200 => "OK",
+        206 => "Partial Content",
         201 => "Created",
         202 => "Accepted",
         204 => "No Content",
@@ -194,6 +196,7 @@ pub fn reason(status: u16) -> &'static str {
         405 => "Method Not Allowed",
         409 => "Conflict",
         413 => "Payload Too Large",
+        416 => "Range Not Satisfiable",
         429 => "Too Many Requests",
         500 => "Internal Server Error",
         502 => "Bad Gateway",
@@ -203,7 +206,20 @@ pub fn reason(status: u16) -> &'static str {
     }
 }
 
-const COMMON: &str = "Access-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: *\r\nAccess-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS\r\n";
+// `Authorization` is named: the `*` wildcard never covers it, so browser
+// clients sending an API key would fail their preflight.
+const COMMON: &str = "Access-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: Authorization, Content-Type, *\r\nAccess-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS\r\n";
+
+/// Only the head of a response whose `len`-byte body the caller writes next
+/// (a file copied in pieces rather than read whole).
+pub fn respond_head(w: &mut impl Write, status: u16, content_type: &str, extra: &[(&str, &str)], len: u64, keep_alive: bool) -> io::Result<()> {
+    let mut head = format!("HTTP/1.1 {status} {}\r\nContent-Type: {content_type}\r\nContent-Length: {len}\r\n{COMMON}", reason(status));
+    for (k, v) in extra {
+        head.push_str(&format!("{k}: {v}\r\n"));
+    }
+    head.push_str(if keep_alive { "Connection: keep-alive\r\n\r\n" } else { "Connection: close\r\n\r\n" });
+    w.write_all(head.as_bytes())
+}
 
 /// A whole response.
 pub fn respond(w: &mut impl Write, status: u16, content_type: &str, body: &[u8], keep_alive: bool) -> io::Result<()> {
@@ -273,8 +289,16 @@ impl<'a> Stream<'a> {
 /// Serve one connection: read requests and hand each to `handle` until the
 /// client closes or asks to. `handle` returns whether the connection may be
 /// kept open.
+/// How long a connection may sit idle between requests, and how long a write
+/// may wait on a client that stopped reading (a stalled event-stream reader
+/// must not hold its request -- and whatever that request holds -- forever).
+const IDLE: std::time::Duration = std::time::Duration::from_secs(300);
+const WRITE_STALL: std::time::Duration = std::time::Duration::from_secs(120);
+
 pub fn serve(stream: TcpStream, mut handle: impl FnMut(&Request, &mut TcpStream) -> io::Result<bool>) {
     let _ = stream.set_nodelay(true);
+    let _ = stream.set_read_timeout(Some(IDLE));
+    let _ = stream.set_write_timeout(Some(WRITE_STALL));
     let Ok(mut writer) = stream.try_clone() else { return };
     let mut reader = BufReader::new(stream);
     loop {
@@ -353,6 +377,9 @@ impl Response {
                 if size == 0 {
                     while !line(&mut self.reader).map_err(|_| bad("trailer"))?.is_empty() {}
                     return Ok(());
+                }
+                if size > 64 << 20 {
+                    return Err(bad("chunk larger than 64 MiB"));
                 }
                 let mut chunk = vec![0; size];
                 self.reader.read_exact(&mut chunk)?;
@@ -445,6 +472,14 @@ fn headers_or(r: &mut BufReader<TcpStream>) -> io::Result<Vec<(String, String)>>
 mod tests {
     use super::*;
     use std::net::TcpListener;
+
+    #[test]
+    fn a_huge_chunk_size_is_refused_rather_than_wrapping() {
+        // 5 bytes, then a size that would wrap `len + size` past the limit.
+        let body = b"5\r\nhello\r\nfffffffffffffffd\r\nxx\r\n0\r\n\r\n";
+        let mut r = BufReader::new(&body[..]);
+        assert!(matches!(chunked_body(&mut r, 1 << 20), Err(ReadError::Bad(_))));
+    }
 
     #[test]
     fn query_parameters_are_decoded() {

@@ -168,6 +168,9 @@ impl<B: Resident> Tiered<B> {
             _ => 0,
         };
         let mut this = Self { slots: Vec::with_capacity(count), dev: dev.clone(), gpu_bytes: 0, host_bytes: 0, streamed_bytes: 0 };
+        // On a CPU device "the GPU" is RAM already: a host copy would be the same
+        // memory twice (and quantized host copies cannot run where they are).
+        let cpu = dev.is_cpu();
         for i in 0..count {
             if budget.memory == Memory::Ssd {
                 this.slots.push(Slot::Disk);
@@ -175,7 +178,7 @@ impl<B: Resident> Tiered<B> {
             }
             let block = load(i)?;
             let size = block.bytes();
-            let slot = if budget.memory == Memory::Gpu || this.gpu_bytes + size <= vram {
+            let slot = if cpu || budget.memory == Memory::Gpu || this.gpu_bytes + size <= vram {
                 this.gpu_bytes += size;
                 Slot::Device(block)
             } else if this.host_bytes + size <= ram {
@@ -270,11 +273,11 @@ mod tests {
     fn budgets_fill_gpu_then_ram_then_ssd_without_changing_results() -> Result<()> {
         let expected: Vec<f32> = (0..4).map(|i| i as f32 * 256.).collect();
         let (t, sums) = run(Budget { memory: Memory::Auto, vram_bytes: Some(2048), ram_bytes: 1024 })?;
-        assert_eq!(t.counts(), (2, 1, 1));
-        assert_eq!(t.streamed_bytes, 1024);
+        assert_eq!(t.counts(), (4, 0, 0));
         assert_eq!(sums, expected);
+        // On the CPU, RAM is the device: blocks that are loaded stay put.
         let (t, sums) = run(Budget { memory: Memory::Ram, vram_bytes: None, ram_bytes: 2048 })?;
-        assert_eq!(t.counts(), (0, 2, 2));
+        assert_eq!(t.counts(), (4, 0, 0));
         assert_eq!(sums, expected);
         let (t, sums) = run(Budget { memory: Memory::Ssd, vram_bytes: None, ram_bytes: 1 << 40 })?;
         assert_eq!(t.counts(), (0, 0, 4));

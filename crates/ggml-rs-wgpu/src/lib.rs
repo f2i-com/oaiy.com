@@ -329,6 +329,25 @@ impl WgpuBackend {
             x
         };
         let m = x.numel() / k;
+        let mut out_shape = x.shape().to_vec();
+        *out_shape.last_mut().expect("x has a last axis") = n;
+        if m == 0 || n == 0 {
+            return Tensor::from_vec(Vec::new(), out_shape);
+        }
+        // x and y are single bindings: a long prompt's rows go in batches that
+        // stay under the adapter's binding and buffer limits.
+        let limit = chunk_limit(&self.gpu.limits) as usize;
+        let rows = (limit / (4 * k.max(n))).max(1);
+        if m > rows {
+            let data = x.data();
+            let mut y = Vec::with_capacity(m * n);
+            for start in (0..m).step_by(rows) {
+                let count = rows.min(m - start);
+                let part = Tensor::from_vec(data[start * k..(start + count) * k].to_vec(), vec![count, k]);
+                y.extend_from_slice(self.linear_gpu(&part, q, shape).data());
+            }
+            return Tensor::from_vec(y, out_shape);
+        }
         let _one = self.serial.lock().unwrap_or_else(|p| p.into_inner());
         let gpu = &self.gpu;
         let pipeline = gpu.pipeline(q.dtype).expect("uploaded weights have a pipeline");
@@ -391,8 +410,6 @@ impl WgpuBackend {
         gpu.queue.submit([enc.finish()]);
         let raw = gpu.map_read(&staging, ysize);
         let y: Vec<f32> = raw.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
-        let mut out_shape = x.shape().to_vec();
-        *out_shape.last_mut().expect("x has a last axis") = n;
         Tensor::from_vec(y, out_shape)
     }
 }

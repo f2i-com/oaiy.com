@@ -123,6 +123,11 @@ impl Backend for CpuBackend {
         let row_bytes = in_ / dtype.block_size() * dtype.type_size();
         let bytes = w.bytes();
         let m = x.numel() / in_;
+        let mut shape = x.shape().to_vec();
+        *shape.last_mut().unwrap() = out;
+        if m == 0 || out == 0 {
+            return Tensor::from_vec(Vec::new(), shape);
+        }
         let xd = x.data();
         // Output rows per task: enough work to amortize the scheduling.
         const ROWS: usize = 16;
@@ -149,8 +154,6 @@ impl Backend for CpuBackend {
                 y[bi * out + o] = yt[o * m + bi];
             }
         }
-        let mut shape = x.shape().to_vec();
-        *shape.last_mut().unwrap() = out;
         Tensor::from_vec(y, shape)
     }
 
