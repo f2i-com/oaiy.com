@@ -8,6 +8,18 @@ A coding agent that runs entirely in your browser.
 - **Any model.** A server on your own machine (Ollama, LM Studio, llama.cpp, nrob-server — anything OpenAI-compatible), Anthropic's API, or any OpenAI-compatible API.
 - **A network gate.** `/internet on | off | allowlist | allow <host> | deny <host> | status` (or `/net`) decides every request made on the model's behalf. Requests to your AI provider are not gated.
 
+## Files, images and big files
+
+- **Attach** files to a message with 📎, by dropping them on the chat, or by pasting an image.
+  - Files are saved in the project under `uploads/`, so the agent can open them with its tools.
+  - Images also go to the model with the message, if it can see images. If it can't, the run carries on in text.
+  - A `.softn` file is unpacked as an app folder.
+- **`view_image`:** shows the model an image scaled to its vision budget. To zoom, it passes a region in the image's original pixels, and that region is shown at up to 2048 px. A small region therefore shows real detail rather than an enlarged thumbnail. `grid: true` overlays labelled coordinates to aim the next zoom.
+- **Large files:**
+  - `file_info` gives the size, line count and longest line.
+  - `search_file` finds regex matches with line, column, character offset and context.
+  - `read_file` pages by lines, cuts very long lines with a pointer to the rest, and reads raw character ranges with `char_start` (for minified or single-line files).
+
 ## SoftN apps
 
 bot.computer can build [SoftN](https://github.com/f2i-com/softn.com) apps and show them running while they're being built.
@@ -15,7 +27,8 @@ bot.computer can build [SoftN](https://github.com/f2i-com/softn.com) apps and sh
 - **Start one:** use **New SoftN app** (or `/softn new`), or ask the agent for an app. It reads `softn_docs` (SoftN Studio's own writing guide, regenerated with `npm run softn:guide`), writes `manifest.json`, `ui/*.ui` and `logic/*.logic`, and runs `softn_check`.
 - **Live preview:** the **App preview** tab renders the app with SoftN's hosted runtime, in a sandboxed opaque-origin iframe with its own strict CSP. It re-renders about 0.7 s after edits settle.
 - **Errors:** load and render errors are reported, and `.logic` syntax errors are caught by compiling the logic on Zipp.
-- **Export:** **Export .softn** (or `/softn export`) downloads the app as a `.softn` file. That's a flat zip with `manifest.json` at its root, and the manifest's `main`, `version` and `files` are filled in from the files actually present.
+- **Export:** **Export .softn** (or `/softn export [folder]`) downloads an app as a `.softn` file. That's a flat zip with `manifest.json` at its root, and the manifest's `main`, `version` and `files` are filled in from the files actually present.
+- **Several apps per project:** any folder whose `manifest.json` has a `.ui` `main` is an app. The preview has a picker, and `/softn new <folder>`, `/softn check <folder>`, `/softn export <folder>` and `/softn apps` take a folder. **Import .softn…** (or attaching a `.softn` in the chat) unpacks an app into a folder, so the agent can read an existing app and recreate or change it in another folder. `softn_check` takes the app's folder and switches the preview to it.
 
 The preview runtime is optional (about 23 MB) and comes from a checksummed softn.com release: `npm run fetch:softn`. Without it, apps can still be written, checked and exported.
 

@@ -27,14 +27,45 @@ export class ChatPane {
   private readonly log = h('div.chat-log');
   private readonly input = h('textarea.chat-input', { rows: 3, placeholder: 'Ask bot.computer…  (/help for commands)', title: 'Enter sends; Shift+Enter starts a new line' });
   private readonly send = h('button.primary', 'Send');
+  private readonly attachButton = h('button.attach', { title: 'Attach files or images (or drop them here, or paste an image)', 'aria-label': 'Attach files' }, '📎');
+  private readonly picker = h('input', { type: 'file', multiple: true, style: 'display:none' });
+  private readonly pending = h('div.attachments');
+  private files: File[] = [];
   private readonly status = h('div.chat-status');
   private current: { box: HTMLElement; text: string; body: HTMLElement } | null = null;
   private thinking: { box: HTMLElement; text: string } | null = null;
   private cards = new Map<string, HTMLElement>();
   private busy = false;
 
-  constructor(private readonly handlers: { submit: (text: string) => void; stop: () => void }) {
-    this.element.append(h('div.pane-title', 'Agent'), this.log, this.status, h('div.chat-compose', this.input, this.send));
+  constructor(private readonly handlers: { submit: (text: string, files: File[]) => void; stop: () => void }) {
+    this.element.append(h('div.pane-title', 'Agent'), this.log, this.status, this.pending, h('div.chat-compose', this.attachButton, this.input, this.send), this.picker);
+    this.attachButton.addEventListener('click', () => this.picker.click());
+    this.picker.addEventListener('change', () => {
+      if (this.picker.files) this.addFiles([...this.picker.files]);
+      this.picker.value = '';
+    });
+    this.element.addEventListener('dragover', (e) => {
+      if (e.dataTransfer?.types.includes('Files')) {
+        e.preventDefault();
+        this.element.classList.add('dropping');
+      }
+    });
+    this.element.addEventListener('dragleave', (e) => {
+      if (e.target === this.element || !this.element.contains(e.relatedTarget as Node)) this.element.classList.remove('dropping');
+    });
+    this.element.addEventListener('drop', (e) => {
+      this.element.classList.remove('dropping');
+      if (!e.dataTransfer?.files.length) return;
+      e.preventDefault();
+      this.addFiles([...e.dataTransfer.files]);
+    });
+    this.input.addEventListener('paste', (e) => {
+      const pasted = [...(e.clipboardData?.files ?? [])];
+      if (!pasted.length) return;
+      e.preventDefault();
+      // A pasted screenshot arrives as "image.png": give it a useful name.
+      this.addFiles(pasted.map((f, i) => (f.name === 'image.png' ? new File([f], `pasted-${new Date().toISOString().replace(/[:.]/g, '-')}${i ? `-${i}` : ''}.png`, { type: f.type }) : f)));
+    });
     this.send.addEventListener('click', () => (this.busy ? this.handlers.stop() : this.submit()));
     this.input.addEventListener('keydown', (e) => {
       if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
@@ -44,11 +75,42 @@ export class ChatPane {
     });
   }
 
+  addFiles(files: File[]): void {
+    this.files.push(...files);
+    this.renderPending();
+    this.input.focus();
+  }
+
+  private renderPending(): void {
+    clear(this.pending);
+    this.files.forEach((file, i) => {
+      const thumb = file.type.startsWith('image/') ? h('img', { src: URL.createObjectURL(file), alt: '' }) : h('span.file-icon', '📄');
+      this.pending.append(
+        h(
+          'span.attachment',
+          { title: `${file.name} (${file.size.toLocaleString()} bytes)` },
+          thumb,
+          h('span.attachment-name', file.name),
+          h('button.icon', { title: 'Remove', onclick: () => { this.files.splice(i, 1); this.renderPending(); } }, '✕'),
+        ),
+      );
+    });
+  }
+
   private submit(): void {
     const text = this.input.value.trim();
-    if (!text) return;
+    if (!text && !this.files.length) return;
+    // Slash commands are commands, even with files waiting.
+    if (text.startsWith('/') && this.files.length) {
+      this.input.value = '';
+      this.handlers.submit(text, []);
+      return;
+    }
+    const files = this.files;
+    this.files = [];
+    this.renderPending();
     this.input.value = '';
-    this.handlers.submit(text);
+    this.handlers.submit(text, files);
   }
 
   focus(): void {
@@ -77,9 +139,11 @@ export class ChatPane {
     this.thinking = null;
   }
 
-  user(text: string): void {
+  user(text: string, attachments: string[] = []): void {
     this.current = null;
-    this.log.append(h('div.msg.user', h('div.msg-body', text)));
+    const box = h('div.msg.user', h('div.msg-body', text || (attachments.length ? '' : ' ')));
+    if (attachments.length) box.append(h('div.msg-attachments', ...attachments.map((name) => h('span.attachment', h('span.file-icon', /\.(png|jpe?g|gif|webp|svg|bmp|avif)$/i.test(name) ? '🖼' : /\.softn$/i.test(name) ? '📦' : '📄'), h('span.attachment-name', name)))));
+    this.log.append(box);
     this.scroll();
   }
 
@@ -125,6 +189,9 @@ export class ChatPane {
     card.classList.add(result.isError ? 'failed' : 'ok');
     const pre = card.querySelector('.tool-result');
     if (pre) pre.textContent = result.content;
+    for (const image of result.images ?? []) {
+      card.append(h('img.tool-image', { src: `data:${image.mediaType};base64,${image.data}`, alt: image.label ?? 'image shown to the model' }));
+    }
     this.scroll();
   }
 
@@ -172,7 +239,11 @@ export class ChatPane {
   replay(turns: Turn[]): void {
     this.clearLog();
     for (const turn of turns) {
-      if (turn.role === 'user') this.user(turn.text.replace(/^<project>[\s\S]*?<\/project>\n\n/, ''));
+      if (turn.role === 'user') {
+        const text = turn.text.replace(/^<project>[\s\S]*?<\/project>\n\n/, '');
+        const attached = /\n\n\[Attached and saved in the project: ([\s\S]*)\]$/.exec(text);
+        this.user(attached ? text.slice(0, attached.index) : text, attached ? attached[1].split('; ').map((n) => n.split(' (')[0]) : []);
+      }
       else if (turn.role === 'assistant') {
         if (turn.text) this.assistantText(turn.text);
         this.current = null;

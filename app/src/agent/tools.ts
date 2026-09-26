@@ -12,11 +12,15 @@ import { SandboxHost, globRegex, summarize } from '../sandbox/host';
 import { runInSandbox } from '../sandbox/runner';
 import { VfsError, normalizePath, type Vfs } from '../vfs/vfs';
 import type { ToolCall, ToolResult, ToolSpec } from './protocol';
-import { checkProject, formatFindings, guideFor, isSoftnProject, logicSyntax } from '../softn/softn';
+import { appLabel, checkProject, findApps, formatFindings, guideFor, logicSyntax, resolveApp } from '../softn/softn';
 import type { PreviewResult } from '../softn/preview';
+import { DEFAULT_VIEW_SIZE, MAX_VIEW_SIZE, imageMimeFor, imageSize, viewImage, type ImagePart } from './images';
 
 const READ_LINES = 400;
 const READ_CHARS = 40_000;
+/** A line longer than this is cut in a line read; char_start reads the rest. */
+const LINE_CHARS = 2_000;
+const SEARCH_RESULTS = 100;
 const OUTPUT_CHARS = 30_000;
 const DEFAULT_TIMEOUT_S = 30;
 const MAX_TIMEOUT_S = 300;
@@ -29,7 +33,7 @@ export interface ToolContext {
   /** The emulated shell's state, kept between calls. */
   shell: { cwd: string; env: Record<string, string> };
   /** The live SoftN preview, when the page has one. */
-  softn?: { check(): Promise<PreviewResult> };
+  softn?: { check(root?: string): Promise<PreviewResult> };
   signal?: AbortSignal;
 }
 
@@ -44,8 +48,59 @@ export const TOOLS: ToolSpec[] = [
   },
   {
     name: 'read_file',
-    description: `Read a text file with numbered lines (at most ${READ_LINES} lines per call; use offset to page). Read a file before editing or replacing it.`,
-    parameters: { type: 'object', required: ['path'], properties: { path: str, offset: { ...int, description: 'First line (1-based)' }, limit: int } },
+    description: `Read a text file with numbered lines (at most ${READ_LINES} lines per call; page with offset). Lines over ${LINE_CHARS} characters are cut, with where they continue; char_start/char_count read raw characters instead (for minified or single-line files). For a large file, use file_info first and search_file to find the part you need. Read a file before editing or replacing it. Images: use view_image.`,
+    parameters: {
+      type: 'object',
+      required: ['path'],
+      properties: {
+        path: str,
+        offset: { ...int, description: 'First line (1-based)' },
+        limit: int,
+        char_start: { ...int, description: 'Read raw characters from this offset (0-based) instead of lines' },
+        char_count: { ...int, description: `How many characters with char_start (default and max ${READ_CHARS})` },
+      },
+    },
+  },
+  {
+    name: 'file_info',
+    description: 'Size and shape of a file before reading it: bytes, text or binary, line count, longest line, the first lines; for an image, its dimensions. Use it to plan reading a large file.',
+    parameters: { type: 'object', required: ['path'], properties: { path: str } },
+  },
+  {
+    name: 'search_file',
+    description: 'Search inside one file (any size) with a JavaScript regular expression; returns each match with its line number, column, character offset and surrounding lines. Use it to navigate a large file, then read_file around the match.',
+    parameters: {
+      type: 'object',
+      required: ['path', 'pattern'],
+      properties: {
+        path: str,
+        pattern: str,
+        context: { ...int, description: 'Lines of context around each match (default 2)' },
+        ignore_case: { type: 'boolean' },
+        literal: { type: 'boolean', description: 'Treat pattern as plain text' },
+        max_results: int,
+      },
+    },
+  },
+  {
+    name: 'view_image',
+    description:
+      `Look at an image in the project (png, jpg, gif, webp, svg, bmp, avif). The whole image is shown scaled to fit ${DEFAULT_VIEW_SIZE} px (max_size up to ${MAX_VIEW_SIZE}). ` +
+      'To see detail, zoom: pass a region x, y, width, height in the ORIGINAL image\'s pixels and that region is shown at up to max_size, so a smaller region shows more real detail. ' +
+      'grid: true overlays labelled coordinates (original pixels) to aim the next zoom. The reply states the original size, the region shown and the scale.',
+    parameters: {
+      type: 'object',
+      required: ['path'],
+      properties: {
+        path: str,
+        x: int,
+        y: int,
+        width: int,
+        height: int,
+        max_size: { ...int, minimum: 64, maximum: MAX_VIEW_SIZE },
+        grid: { type: 'boolean' },
+      },
+    },
   },
   {
     name: 'write_file',
@@ -102,13 +157,13 @@ export const TOOLS: ToolSpec[] = [
   },
   {
     name: 'softn_docs',
-    description: 'The SoftN writing guide (from SoftN Studio): the app files, the .ui page language, .logic/.py logic, XDB data, capabilities, common mistakes and a complete example. Read it before writing or changing a SoftN app. Optional `section` returns only the sections whose heading contains it (e.g. "ui page", "logic", "mistakes", "example").',
-    parameters: { type: 'object', properties: { section: str } },
+    description: 'The SoftN writing guide (from SoftN Studio): the app files, the .ui page language, .logic/.py logic, XDB data, capabilities, common mistakes and a complete example. Read it before writing or changing a SoftN app. Optional `section` returns only the sections whose heading contains it (e.g. "ui page", "logic", "mistakes", "example"). A SoftN app is any folder whose manifest.json has a .ui `main`; a project can hold several (e.g. an imported app to learn from and a new one), and paths inside an app are relative to its folder.',
+    parameters: { type: 'object', properties: { section: str, app: { ...str, description: 'The app folder, for the Python or JavaScript guide to match it' } } },
   },
   {
     name: 'softn_check',
-    description: 'Check the SoftN app in this project: the files (manifest.json, listed files, JSON, permissions) and a real render in the live preview, returning load and render errors. Run it after every change to a SoftN app, and fix what it reports.',
-    parameters: { type: 'object', properties: {} },
+    description: 'Check a SoftN app: its files (manifest.json, listed files, JSON, permissions, logic syntax) and a real render in the live preview, which switches to show it, returning load and render errors. Run it after every change to a SoftN app, and fix what it reports. With several apps in the project, name the one with `app` (its folder; "/" for the project root).',
+    parameters: { type: 'object', properties: { app: { ...str, description: 'The app\'s folder, e.g. "apps/tasks"; optional when the project has one app' } } },
   },
   {
     name: 'web_fetch',
@@ -172,6 +227,9 @@ function requireFreshRead(ctx: ToolContext, key: string, what: string): void {
   if (seen !== ctx.vfs.version(`/${key}`)) throw new Error(`/${key} changed since you read it; read it again before you ${what} it`);
 }
 
+/** Images a tool produced for the model, collected alongside its text. */
+let imagesOut: ImagePart[] = [];
+
 async function execute(call: ToolCall, ctx: ToolContext): Promise<string> {
   const input = call.input;
   const vfs = ctx.vfs;
@@ -191,12 +249,28 @@ async function execute(call: ToolCall, ctx: ToolContext): Promise<string> {
     }
     case 'read_file': {
       const key = normalizePath(need(input, 'path'));
+      if (imageMimeFor(key) && !/\.svg$/i.test(key)) throw new Error(`/${key} is an image: look at it with view_image`);
       const text = vfs.readText(`/${key}`);
+      if (typeof input.char_start === 'number') {
+        const start = Math.max(0, Math.floor(input.char_start));
+        const count = Math.min(Math.max(1, typeof input.char_count === 'number' ? Math.floor(input.char_count) : READ_CHARS), READ_CHARS);
+        const slice = text.slice(start, start + count);
+        const lineNo = text.slice(0, start).split('\n').length;
+        return `[characters ${start}-${start + slice.length} of ${text.length}, starting on line ${lineNo}]\n${slice}${start + slice.length < text.length ? `\n[continue with char_start ${start + slice.length}]` : ''}`;
+      }
       const lines = text.split('\n');
       const offset = typeof input.offset === 'number' ? Math.max(1, Math.floor(input.offset)) : 1;
       const limit = typeof input.limit === 'number' ? Math.min(Math.max(1, input.limit), READ_LINES) : READ_LINES;
       const slice = lines.slice(offset - 1, offset - 1 + limit);
-      let body = slice.map((l, i) => `${offset + i}\t${l}`).join('\n');
+      let charAt = 0;
+      for (let i = 0; i < offset - 1; i++) charAt += lines[i].length + 1;
+      let body = slice
+        .map((l, i) => {
+          const at = charAt;
+          charAt += l.length + 1;
+          return l.length > LINE_CHARS ? `${offset + i}\t${l.slice(0, LINE_CHARS)} [line continues: ${l.length - LINE_CHARS} more characters; char_start ${at + LINE_CHARS}]` : `${offset + i}\t${l}`;
+        })
+        .join('\n');
       if (body.length > READ_CHARS) body = `${body.slice(0, READ_CHARS)}\n[cut at ${READ_CHARS} characters]`;
       const whole = offset === 1 && slice.length === lines.length && body.length <= READ_CHARS;
       // Editing needs a read; replacing needs the whole file read.
@@ -205,6 +279,87 @@ async function execute(call: ToolCall, ctx: ToolContext): Promise<string> {
       else ctx.reads.delete(`${key}#partial`);
       const more = offset - 1 + slice.length < lines.length ? `\n[lines ${offset}-${offset - 1 + slice.length} of ${lines.length}; continue with offset ${offset + slice.length}]` : '';
       return body + more;
+    }
+    case 'file_info': {
+      const key = normalizePath(need(input, 'path'));
+      const st = vfs.stat(`/${key}`);
+      if (!st) throw new Error(`ENOENT: no such file or directory, '/${key}'`);
+      if (st.type === 'dir') {
+        const kids = vfs.list(`/${key}`);
+        return `/${key}: folder, ${kids.length} entries (${kids.filter((k) => k.type === 'dir').length} folders)`;
+      }
+      const head = `/${key}: ${st.size.toLocaleString()} bytes`;
+      const mime = imageMimeFor(key);
+      if (mime) {
+        try {
+          const size = await imageSize(vfs.readBytes(`/${key}`), mime);
+          return `${head}, image ${mime}, ${size.width}×${size.height} px. Look at it with view_image (zoom with a region).`;
+        } catch (error) {
+          return `${head}, ${mime}, but it could not be decoded: ${(error as Error).message}`;
+        }
+      }
+      if (!vfs.isText(`/${key}`)) return `${head}, binary (not UTF-8 text).`;
+      const text = vfs.readText(`/${key}`);
+      const lines = text.split('\n');
+      let longest = 0;
+      let longestAt = 0;
+      lines.forEach((l, i) => {
+        if (l.length > longest) {
+          longest = l.length;
+          longestAt = i + 1;
+        }
+      });
+      const preview = lines.slice(0, 5).map((l, i) => `${i + 1}\t${l.length > 200 ? `${l.slice(0, 200)}…` : l}`).join('\n');
+      return `${head}, text, ${text.length.toLocaleString()} characters, ${lines.length.toLocaleString()} lines; longest line ${longest.toLocaleString()} characters (line ${longestAt}).${longest > LINE_CHARS ? ' Long lines: read them with char_start.' : ''}\nFirst lines:\n${preview}`;
+    }
+    case 'search_file': {
+      const key = normalizePath(need(input, 'path'));
+      const text = vfs.readText(`/${key}`);
+      const raw = need(input, 'pattern');
+      let re: RegExp;
+      try {
+        re = new RegExp(input.literal === true ? raw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') : raw, input.ignore_case === true ? 'gi' : 'g');
+      } catch (error) {
+        throw new Error(`invalid regular expression: ${(error as Error).message}`);
+      }
+      const context = typeof input.context === 'number' ? Math.min(Math.max(0, Math.floor(input.context)), 20) : 2;
+      const max = typeof input.max_results === 'number' ? Math.min(Math.max(1, input.max_results), 1000) : SEARCH_RESULTS;
+      const lines = text.split('\n');
+      const starts: number[] = [];
+      let at = 0;
+      for (const l of lines) {
+        starts.push(at);
+        at += l.length + 1;
+      }
+      const lineOf = (offset: number) => {
+        let lo = 0;
+        let hi = starts.length - 1;
+        while (lo < hi) {
+          const mid = (lo + hi + 1) >> 1;
+          if (starts[mid] <= offset) lo = mid;
+          else hi = mid - 1;
+        }
+        return lo;
+      };
+      const out: string[] = [];
+      let count = 0;
+      let m: RegExpExecArray | null;
+      while ((m = re.exec(text)) !== null) {
+        if (m[0] === '') re.lastIndex++;
+        count++;
+        if (count > max) continue;
+        const li = lineOf(m.index);
+        const col = m.index - starts[li];
+        const clip = (l: string) => (l.length > 300 ? `${l.slice(Math.max(0, col - 120), col + 180)}…` : l);
+        const from = Math.max(0, li - context);
+        const to = Math.min(lines.length - 1, li + context);
+        const block: string[] = [`match ${count}: line ${li + 1}, column ${col + 1}, char ${m.index}`];
+        for (let j = from; j <= to; j++) block.push(`${j === li ? '>' : ' '}${j + 1}\t${clip(lines[j])}`);
+        out.push(block.join('\n'));
+        if (count > 100_000) break;
+      }
+      if (!count) return `no matches in /${key} (${lines.length.toLocaleString()} lines)`;
+      return `${count.toLocaleString()} match${count === 1 ? '' : 'es'} in /${key}${count > max ? ` (showing the first ${max})` : ''}\n\n${out.join('\n\n')}`;
     }
     case 'write_file': {
       const key = normalizePath(need(input, 'path'));
@@ -302,8 +457,29 @@ async function execute(call: ToolCall, ctx: ToolContext): Promise<string> {
       if (host.changes.deleted.size) report.files_deleted = [...host.changes.deleted];
       return JSON.stringify(report, null, 1);
     }
+    case 'view_image': {
+      const key = normalizePath(need(input, 'path'));
+      const mime = imageMimeFor(key);
+      if (!mime) throw new Error(`/${key} is not an image this tool can show (png, jpg, gif, webp, svg, bmp, avif)`);
+      const num = (k: string) => (typeof input[k] === 'number' ? (input[k] as number) : undefined);
+      const view = await viewImage(vfs.readBytes(`/${key}`), mime, {
+        x: num('x'),
+        y: num('y'),
+        width: num('width'),
+        height: num('height'),
+        maxSize: num('max_size'),
+        grid: input.grid === true,
+        label: key,
+      });
+      imagesOut.push(view.image);
+      const r = view.region;
+      const whole = r.x === 0 && r.y === 0 && r.width === view.width && r.height === view.height;
+      const scale = view.shownWidth / r.width;
+      return `/${key}: ${view.width}×${view.height} px. Showing ${whole ? 'the whole image' : `region x=${r.x}, y=${r.y}, ${r.width}×${r.height}`} at ${view.shownWidth}×${view.shownHeight} (scale ${scale >= 1 ? scale.toFixed(2) : `1/${(1 / scale).toFixed(1)}`}).${scale < 0.9 ? ' Zoom into a region to see more detail.' : ''}`;
+    }
     case 'softn_docs': {
-      const guide = guideFor(vfs);
+      const target = typeof input.app === 'string' ? resolveApp(vfs, input.app) : null;
+      const guide = guideFor(vfs, target?.ok ? target.root : (findApps(vfs)[0] ?? ''));
       const want = typeof input.section === 'string' ? input.section.trim().toLowerCase() : '';
       if (!want) return guide;
       const sections = guide.split(/\n(?=## )/);
@@ -312,15 +488,21 @@ async function execute(call: ToolCall, ctx: ToolContext): Promise<string> {
       return `No section heading contains "${want}". Sections: ${sections.map((s) => s.split('\n')[0].replace(/^#+\s*/, '')).join('; ')}`;
     }
     case 'softn_check': {
-      const findings = [...checkProject(vfs), ...(await logicSyntax(vfs).catch(() => []))];
-      const lines = [`Files: ${formatFindings(findings)}`];
-      if (!isSoftnProject(vfs)) return `${lines[0]}\nNot rendered: this is not a SoftN app until manifest.json names a "main" .ui page.`;
+      const target = resolveApp(vfs, input.app);
+      if (!target.ok) {
+        const root = typeof input.app === 'string' ? input.app : '/';
+        const findings = checkProject(vfs, normalizePath(root));
+        return `Not a SoftN app yet: ${target.reason}\nFiles in ${root}: ${formatFindings(findings)}`;
+      }
+      const root = target.root;
+      const findings = [...checkProject(vfs, root), ...(await logicSyntax(vfs, root).catch(() => []))];
+      const lines = [`App: ${appLabel(root)}`, `Files: ${formatFindings(findings)}`];
       if (findings.some((f) => f.level === 'error')) {
         lines.push('Render: skipped until the file errors above are fixed.');
       } else if (!ctx.softn) {
         lines.push('Render: no live preview in this session.');
       } else {
-        const result = await ctx.softn.check();
+        const result = await ctx.softn.check(root);
         lines.push(result.ok ? 'Render: the app loaded and rendered without reported errors (the user sees it in the preview).' : `Render errors:\n${result.errors.map((e) => `- ${e}`).join('\n')}`);
       }
       return lines.join('\n');
@@ -350,11 +532,14 @@ function htmlToText(html: string): string {
 
 export async function runTool(call: ToolCall, ctx: ToolContext): Promise<ToolResult> {
   if (call.parseError) return { id: call.id, name: call.name, content: `Error: the tool call's arguments could not be read: ${call.parseError}`, isError: true };
+  imagesOut = [];
   try {
     const content = await execute(call, ctx);
     let isError = false;
     if ((call.name === 'code_run' || call.name === 'sandbox_shell') && /"exit_code": (?!0\b)-?\d+/.test(content)) isError = true;
-    return { id: call.id, name: call.name, content, isError };
+    const images = imagesOut;
+    imagesOut = [];
+    return images.length ? { id: call.id, name: call.name, content, isError, images } : { id: call.id, name: call.name, content, isError };
   } catch (error) {
     const message = error instanceof VfsError || error instanceof Error ? error.message : String(error);
     return { id: call.id, name: call.name, content: `Error: ${message}`, isError: true };

@@ -8,6 +8,7 @@ import { AIProviderError, isOpenAIHost, isRecord, postProviderStream, sanitizeCo
 import { providerEndpoints } from './providers/providerConnection';
 import { AnthropicStream, OpenAIStream, type StreamSink } from './providers/stream';
 import type { ProviderConfig } from './providers/types';
+import type { ImagePart } from './images';
 
 export interface ToolSpec {
   name: string;
@@ -28,10 +29,12 @@ export interface ToolResult {
   name: string;
   content: string;
   isError: boolean;
+  /** Images the tool shows the model (view_image). */
+  images?: ImagePart[];
 }
 
 export type Turn =
-  | { role: 'user'; text: string }
+  | { role: 'user'; text: string; images?: ImagePart[] }
   | { role: 'assistant'; text: string; calls: ToolCall[]; anthropicContent?: unknown[] }
   | { role: 'tool'; results: ToolResult[] };
 
@@ -66,7 +69,7 @@ function anthropicMessages(turns: Turn[]): unknown[] {
     else out.push({ role, content: blocks });
   };
   for (const turn of turns) {
-    if (turn.role === 'user') push('user', [{ type: 'text', text: turn.text }]);
+    if (turn.role === 'user') push('user', [{ type: 'text', text: turn.text }, ...(turn.images ?? []).map(anthropicImage)]);
     else if (turn.role === 'assistant') {
       if (turn.anthropicContent?.length) push('assistant', turn.anthropicContent);
       else {
@@ -76,7 +79,12 @@ function anthropicMessages(turns: Turn[]): unknown[] {
         if (blocks.length) push('assistant', blocks);
       }
     } else {
-      push('user', turn.results.map((r) => ({ type: 'tool_result', tool_use_id: r.id, content: r.content, is_error: r.isError })));
+      push('user', turn.results.map((r) => ({
+        type: 'tool_result',
+        tool_use_id: r.id,
+        content: r.images?.length ? [{ type: 'text', text: r.content }, ...r.images.map(anthropicImage)] : r.content,
+        is_error: r.isError,
+      })));
     }
   }
   // Cache the conversation up to its last message.
@@ -86,10 +94,21 @@ function anthropicMessages(turns: Turn[]): unknown[] {
   return out;
 }
 
+function anthropicImage(image: ImagePart): unknown {
+  return { type: 'image', source: { type: 'base64', media_type: image.mediaType, data: image.data } };
+}
+
+function openAIImage(image: ImagePart): unknown {
+  return { type: 'image_url', image_url: { url: `data:${image.mediaType};base64,${image.data}` } };
+}
+
 function openAIMessages(system: string, turns: Turn[]): unknown[] {
   const out: unknown[] = [{ role: 'system', content: system }];
   for (const turn of turns) {
-    if (turn.role === 'user') out.push({ role: 'user', content: turn.text });
+    if (turn.role === 'user') {
+      out.push({ role: 'user', content: turn.images?.length ? [{ type: 'text', text: turn.text }, ...turn.images.map(openAIImage)] : turn.text });
+      continue;
+    }
     else if (turn.role === 'assistant') {
       const message: Record<string, unknown> = { role: 'assistant', content: turn.text || null };
       if (turn.calls.length) {
@@ -98,6 +117,14 @@ function openAIMessages(system: string, turns: Turn[]): unknown[] {
       out.push(message);
     } else {
       for (const r of turn.results) out.push({ role: 'tool', tool_call_id: r.id, content: r.content });
+      // A tool message carries text only; its images follow as a user message.
+      const images = turn.results.flatMap((r) => (r.images ?? []).map((image) => ({ image, tool: r.name })));
+      if (images.length) {
+        out.push({
+          role: 'user',
+          content: [{ type: 'text', text: `The image${images.length === 1 ? '' : 's'} returned by ${[...new Set(images.map((i) => i.tool))].join(', ')} above:` }, ...images.map((i) => openAIImage(i.image))],
+        });
+      }
     }
   }
   return out;

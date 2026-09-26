@@ -12,7 +12,7 @@
 import { zippBase } from '../sandbox/runner';
 import type { Vfs } from '../vfs/vfs';
 import { clear, h } from '../ui/dom';
-import { appFiles, isSoftnProject, logicSyntax } from './softn';
+import { appFiles, appLabel, findApps, isSoftnApp, logicSyntax } from './softn';
 
 export interface PreviewResult {
   ok: boolean;
@@ -53,6 +53,9 @@ const SETTLE_MS = 2500;
 export class SoftnPreview {
   readonly element = h('section.preview');
   private readonly status = h('span.preview-status', '');
+  private readonly picker = h('select.preview-app', { title: 'Which SoftN app to show' });
+  /** The app folder shown ('' is the project root). */
+  app = '';
   private readonly frameHost = h('div.preview-frame');
 
   private timer: ReturnType<typeof setTimeout> | null = null;
@@ -65,12 +68,34 @@ export class SoftnPreview {
 
   constructor(private vfs: Vfs, private readonly projectId: () => string) {
     const reload = h('button', { title: 'Render the app again', onclick: () => this.render() }, '↻ Reload');
-    this.element.append(h('div.pane-title', 'App preview ', this.status, reload), this.frameHost);
+    this.picker.addEventListener('change', () => this.setApp(this.picker.value));
+    this.element.append(h('div.pane-title', 'App preview ', this.picker, this.status, reload), this.frameHost);
+    this.picker.hidden = true;
     this.showMessage('Open or start a SoftN app (/softn new) to see it here.');
+  }
+
+  /** The SoftN apps in the project, for the picker; keeps the choice if it still exists. */
+  refreshApps(): string[] {
+    const apps = findApps(this.vfs);
+    if (!apps.includes(this.app)) this.app = apps[0] ?? '';
+    clear(this.picker);
+    for (const root of apps) this.picker.append(h('option', { value: root, selected: root === this.app }, root ? `${root}/` : '/ (project root)'));
+    this.picker.hidden = apps.length < 2;
+    return apps;
+  }
+
+  /** Show the app in `root`. */
+  setApp(root: string): void {
+    this.app = root;
+    this.refreshApps();
+    this.stale = true;
+    if (this.visible) this.render();
   }
 
   setVfs(vfs: Vfs): void {
     this.vfs = vfs;
+    this.app = '';
+    this.refreshApps();
     this.stale = true;
     this.current = { ok: false, errors: [], at: 0 };
     if (this.visible) this.render();
@@ -83,7 +108,9 @@ export class SoftnPreview {
 
   /** The project changed: re-render after edits settle (the agent writes in bursts). */
   changed(path: string | null): void {
-    if (path !== null && !/(^|\/)(manifest\.json|permission\.json)$|\.(ui|logic|py|xdb)$|^assets\//i.test(path)) return;
+    if (path === null || /(^|\/)manifest\.json$/i.test(path)) this.refreshApps();
+    if (path !== null && this.app && !path.startsWith(`${this.app}/`)) return;
+    if (path !== null && !/(^|\/)(manifest\.json|permission\.json)$|\.(ui|logic|py|xdb)$|(^|\/)assets\//i.test(path)) return;
     this.stale = true;
     if (!this.visible) return;
     if (this.timer) clearTimeout(this.timer);
@@ -107,7 +134,11 @@ export class SoftnPreview {
   }
 
   /** Render now and wait for the outcome (for the agent's softn_check). */
-  async check(): Promise<PreviewResult> {
+  async check(root?: string): Promise<PreviewResult> {
+    if (root !== undefined && root !== this.app) {
+      this.app = root;
+      this.refreshApps();
+    }
     if (!(await softnRuntimeAvailable())) return { ok: false, errors: ['the SoftN preview runtime is not installed (npm run fetch:softn); only the file checks ran'], at: Date.now() };
     const done = new Promise<PreviewResult>((resolve) => this.waiters.push(resolve));
     this.render();
@@ -123,12 +154,13 @@ export class SoftnPreview {
     this.stale = false;
     this.current = { ok: false, errors: [], at: Date.now() };
     if (this.settleTimer) clearTimeout(this.settleTimer);
-    if (!isSoftnProject(this.vfs)) {
+    if (!isSoftnApp(this.vfs, this.app)) {
       this.setStatus('');
-      this.showMessage('This project is not a SoftN app yet: it needs a manifest.json whose "main" is a .ui page. Try /softn new, or ask the agent to build one.');
-      this.settle({ ok: false, errors: ['not a SoftN app: manifest.json with a "main" .ui page is missing'] });
+      this.showMessage(this.app ? `${appLabel(this.app)} is not a SoftN app any more.` : 'No SoftN app here yet: an app is a folder whose manifest.json has a "main" .ui page. Try /softn new, import a .softn, or ask the agent to build one.');
+      this.settle({ ok: false, errors: [`${appLabel(this.app)} is not a SoftN app: manifest.json with a "main" .ui page is missing`] });
       return;
     }
+    const root = this.app;
     if (!(await softnRuntimeAvailable())) {
       this.setStatus('');
       this.showMessage('The SoftN preview runtime is not installed. Run `npm run fetch:softn` and reload bot.computer. You can still build, check and export .softn apps.');
@@ -138,10 +170,10 @@ export class SoftnPreview {
     this.setStatus('rendering…');
     // The runtime shows a logic syntax error inside the frame without
     // reporting it, so the logic is also compiled here, on Zipp.
-    const syntax = logicSyntax(this.vfs).catch(() => []);
+    const syntax = logicSyntax(this.vfs, root).catch(() => []);
     const client: Record<string, string> = {};
     const assets: Record<string, string> = {};
-    for (const [path, data] of appFiles(this.vfs)) {
+    for (const [path, data] of appFiles(this.vfs, root)) {
       if (path.startsWith('assets/')) {
         assets[path] = toBase64(data);
         continue;
@@ -187,7 +219,7 @@ export class SoftnPreview {
         }
       };
       frame.contentWindow!.postMessage(
-        { type: 'formlogic:init', client, assets, appId: `bot.computer-${this.projectId()}`, dark: matchMedia('(prefers-color-scheme: dark)').matches, engine: 'zipp-web-python', zippWasm: bytes.slice(0) },
+        { type: 'formlogic:init', client, assets, appId: `bot.computer-${this.projectId()}-${root || 'root'}`, dark: matchMedia('(prefers-color-scheme: dark)').matches, engine: 'zipp-web-python', zippWasm: bytes.slice(0) },
         '*',
         [channel.port2],
       );

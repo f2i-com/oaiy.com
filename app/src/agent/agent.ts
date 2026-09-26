@@ -12,6 +12,7 @@ import { AIProviderError } from './providers/aiProvider';
 import type { ProviderConfig } from './providers/types';
 import { sendTurn, type Reply, type ToolCall, type ToolResult, type Turn, type Usage } from './protocol';
 import { TOOLS, runTool, type ToolContext } from './tools';
+import type { ImagePart } from './images';
 
 export type AgentEvent =
   | { type: 'text'; delta: string }
@@ -27,6 +28,8 @@ export type AgentEvent =
 export const MAX_STEPS = 60;
 const TRIM_OVER_CHARS = 240_000;
 const KEEP_RECENT_TURNS = 8;
+/** Images stay in the conversation for this many image-bearing turns. */
+const KEEP_IMAGE_TURNS = 3;
 
 export const SYSTEM_PROMPT = `You are bot.computer, a coding agent that runs entirely inside the user's web browser.
 
@@ -35,7 +38,7 @@ The user's project lives in a virtual filesystem in the browser; "/" is the proj
 - edit_file for changes to existing files (exact, unique matches), write_file for new files or full rewrites.
 - code_run to compute, test ideas, or process data in JavaScript or Python (a Zipp VM sandbox in a Web Worker).
 - sandbox_shell for shell-style work (an emulated POSIX shell on the same sandbox). There is no real operating system: git, npm, pip, compilers and other native programs do not exist. Do not pretend to run them.
-- SoftN apps (manifest.json + ui/*.ui pages + logic): read softn_docs before writing one, keep manifest.json true, and run softn_check after each change. The user watches the app in a live preview as you build it; /softn export bundles it as a .softn file.
+- SoftN apps: a SoftN app is a folder whose manifest.json names a .ui page as "main" (with ui/*.ui pages and logic/*.logic or .py). A project can hold several, each in its own folder: to rebuild or learn from an existing app, read its files and write the new one in another folder. Read softn_docs before writing one, keep manifest.json true, and run softn_check (naming the app folder when there are several) after each change: the user watches that app in a live preview as you build it, and can export any app folder as a .softn file.
 - web_fetch, curl, fetch() go through the user's network gate (/internet) and, from a browser, only reach sites that allow cross-origin requests. If the gate refuses a host, say so; the user decides whether to allow it.
 
 Work in small, verified steps. Prefer running code to check a claim over guessing. When you are done, say briefly what you changed and what you verified.`;
@@ -47,7 +50,7 @@ export interface AgentOptions {
   /** A short description of the project, given to the model with the first request. */
   projectSummary: () => string;
   /** The live SoftN preview, for softn_check. */
-  softn?: { check(): Promise<import('../softn/preview').PreviewResult> };
+  softn?: { check(root?: string): Promise<import('../softn/preview').PreviewResult> };
 }
 
 function estimateChars(turns: Turn[]): number {
@@ -60,8 +63,27 @@ function estimateChars(turns: Turn[]): number {
   return n;
 }
 
+function hasImages(turn: Turn): boolean {
+  return (turn.role === 'user' && !!turn.images?.length) || (turn.role === 'tool' && turn.results.some((r) => r.images?.length));
+}
+
+/** Older images become a note: each costs the model as much as a page of text. */
+function withoutOldImages(turns: Turn[], keep = KEEP_IMAGE_TURNS): Turn[] {
+  let seen = 0;
+  const out = [...turns];
+  for (let i = out.length - 1; i >= 0; i--) {
+    const turn = out[i];
+    if (!hasImages(turn)) continue;
+    if (++seen <= keep) continue;
+    if (turn.role === 'user') out[i] = { role: 'user', text: `${turn.text}\n[${turn.images!.length} image(s) shown earlier, no longer attached; look again with view_image if needed]` };
+    else if (turn.role === 'tool') out[i] = { role: 'tool', results: turn.results.map((r) => (r.images?.length ? { ...r, images: undefined, content: `${r.content}\n[image no longer attached; call view_image again to see it]` } : r)) };
+  }
+  return out;
+}
+
 /** Old tool output shrinks first; the conversation's shape never changes. */
-function trimmed(turns: Turn[]): Turn[] {
+function trimmed(allTurns: Turn[], images = true): Turn[] {
+  const turns = withoutOldImages(allTurns, images ? KEEP_IMAGE_TURNS : 0);
   if (estimateChars(turns) <= TRIM_OVER_CHARS) return turns;
   const cutoff = turns.length - KEEP_RECENT_TURNS;
   return turns.map((t, i) => {
@@ -97,11 +119,14 @@ export class Agent {
     this.toolContext.shell = { cwd: '/', env: {} };
   }
 
+  /** False once the model has refused images: they are left out from then on. */
+  private imagesAccepted = true;
+
   private async request(provider: ProviderConfig, emit: (e: AgentEvent) => void, signal?: AbortSignal): Promise<Reply> {
     let lastError: unknown;
     for (let attempt = 0; attempt < 4; attempt++) {
       try {
-        return await sendTurn(provider, SYSTEM_PROMPT, trimmed(this.turns), TOOLS, {
+        return await sendTurn(provider, SYSTEM_PROMPT, trimmed(this.turns, this.imagesAccepted), TOOLS, {
           signal,
           sink: {
             text: (delta) => emit({ type: 'text', delta }),
@@ -113,6 +138,12 @@ export class Agent {
       } catch (error) {
         lastError = error;
         if (!(error instanceof AIProviderError)) throw error;
+        // A model without vision refuses image content: carry on in text.
+        if (this.imagesAccepted && error.kind === 'http' && /image|vision|multimodal|image_url|content.*array/i.test(`${error.message} ${error.detail ?? ''}`) && this.turns.some(hasImages)) {
+          this.imagesAccepted = false;
+          emit({ type: 'status', message: 'This model does not take images; continuing with text only' });
+          continue;
+        }
         if (error.kind === 'rate-limited' && attempt < 3) {
           const wait = Math.min(error.retryAfterMs ?? 5000 * (attempt + 1), 60_000);
           emit({ type: 'status', message: `The provider is busy; retrying in ${Math.round(wait / 1000)} s` });
@@ -130,7 +161,7 @@ export class Agent {
   }
 
   /** Run one user request to completion. */
-  async run(prompt: string, emit: (e: AgentEvent) => void, signal?: AbortSignal): Promise<void> {
+  async run(prompt: string, emit: (e: AgentEvent) => void, signal?: AbortSignal, images: ImagePart[] = []): Promise<void> {
     const provider = this.options.provider();
     if (!provider) {
       emit({ type: 'error', message: 'No AI provider is set up yet. Open Settings to connect a local server (Ollama, LM Studio) or an API.' });
@@ -139,7 +170,8 @@ export class Agent {
     this.running = true;
     this.toolContext.signal = signal;
     const first = this.turns.length === 0;
-    this.turns.push({ role: 'user', text: first ? `<project>\n${this.options.projectSummary()}\n</project>\n\n${prompt}` : prompt });
+    const text = first ? `<project>\n${this.options.projectSummary()}\n</project>\n\n${prompt}` : prompt;
+    this.turns.push(images.length ? { role: 'user', text, images } : { role: 'user', text });
     let failures = 0;
     let lastFailure = '';
     try {

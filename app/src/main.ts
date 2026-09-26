@@ -11,7 +11,8 @@ import { EditorPane } from './ui/editor';
 import { openSettings } from './ui/settings';
 import { TerminalPane } from './ui/terminal';
 import { SoftnPreview } from './softn/preview';
-import { SOFTN_STARTER, checkProject, downloadSoftn, formatFindings, isSoftnProject } from './softn/softn';
+import { SOFTN_STARTER, appKey, appLabel, checkProject, downloadSoftn, findApps, formatFindings, importSoftn, isSoftnProject, logicSyntax, resolveApp } from './softn/softn';
+import { imageForMessage, imageMimeFor, type ImagePart } from './agent/images';
 import { FileTree } from './ui/tree';
 import { OpenProject, createProject, deleteProject, listProjects, renameProject, type ProjectMeta } from './vfs/projects';
 import { canPickFolder, downloadZip, importFileList, importFolder, importZip, type Imported } from './vfs/transfer';
@@ -99,7 +100,7 @@ async function main(): Promise<void> {
   let controller: AbortController | null = null;
   let unsubscribe: (() => void) | null = null;
 
-  const chat = new ChatPane({ submit: (text) => void submit(text), stop: () => controller?.abort() });
+  const chat = new ChatPane({ submit: (text, files) => void submit(text, files), stop: () => controller?.abort() });
   const notice = (message: string) => chat.system(message, 'error');
   const tree = new FileTree(null as unknown as Vfs, (path) => {
     editor.open(path);
@@ -199,8 +200,57 @@ async function main(): Promise<void> {
     renderChips();
   };
 
-  async function submit(text: string): Promise<void> {
-    if (text.startsWith('/')) {
+  /** A free path for an upload: uploads/name, uploads/name-2, … */
+  function freePath(dir: string, name: string): string {
+    const clean = name.replace(/[\\/:*?"<>|\u0000-\u001f]+/g, '-').replace(/^\.+/, '') || 'file';
+    const dot = clean.lastIndexOf('.');
+    const stem = dot > 0 ? clean.slice(0, dot) : clean;
+    const ext = dot > 0 ? clean.slice(dot) : '';
+    let path = `/${dir}/${clean}`;
+    for (let n = 2; project.vfs.exists(path); n++) path = `/${dir}/${stem}-${n}${ext}`;
+    return path;
+  }
+
+  /**
+   * Files attached to a message go into the project (uploads/, or an app
+   * folder for a .softn), so the agent can open them with its tools; images
+   * also go to the model with the message, sized for its eyes.
+   */
+  async function receiveFiles(files: File[]): Promise<{ notes: string[]; images: ImagePart[] }> {
+    const notes: string[] = [];
+    const images: ImagePart[] = [];
+    for (const file of files) {
+      const bytes = new Uint8Array(await file.arrayBuffer());
+      if (/\.softn$/i.test(file.name)) {
+        try {
+          const imported = importSoftn(project.vfs, bytes, file.name);
+          notes.push(`${file.name}: a SoftN app, unpacked into ${imported.root}/ (${imported.files} files)`);
+          preview.setApp(imported.root);
+        } catch (error) {
+          notes.push(`${file.name}: could not be imported (${(error as Error).message})`);
+        }
+        continue;
+      }
+      const path = freePath('uploads', file.name);
+      project.vfs.writeFile(path, bytes, { parents: true });
+      const mime = imageMimeFor(file.name) ?? (file.type.startsWith('image/') ? file.type : null);
+      if (mime) {
+        try {
+          const { part, width, height } = await imageForMessage(bytes, mime, path.slice(1));
+          images.push(part);
+          notes.push(`${path.slice(1)} (image, ${width}×${height} px; attached so you can see it — view_image zooms into details)`);
+          continue;
+        } catch {
+          /* not decodable: treat as a plain file */
+        }
+      }
+      notes.push(`${path.slice(1)} (${bytes.byteLength.toLocaleString()} bytes)`);
+    }
+    return { notes, images };
+  }
+
+  async function submit(text: string, files: File[] = []): Promise<void> {
+    if (text.startsWith('/') && !files.length) {
       const [command, ...args] = text.slice(1).trim().split(/\s+/);
       switch (command.toLowerCase()) {
         case 'internet': case 'net':
@@ -224,11 +274,19 @@ async function main(): Promise<void> {
       }
     }
     editor.flush();
-    chat.user(text);
+    chat.user(text, files.map((f) => f.name));
     chat.setBusy(true);
     controller = new AbortController();
     try {
-      await agent.run(text, (event) => chat.event(event), controller.signal);
+      let prompt = text;
+      let images: ImagePart[] = [];
+      if (files.length) {
+        const received = await receiveFiles(files);
+        images = received.images;
+        await project.flush();
+        prompt = `${text || 'I attached some files.'}\n\n[Attached and saved in the project: ${received.notes.join('; ')}]`;
+      }
+      await agent.run(prompt, (event) => chat.event(event), controller.signal, images);
     } finally {
       controller = null;
       chat.setBusy(false);
@@ -237,47 +295,107 @@ async function main(): Promise<void> {
     }
   }
 
-  async function newSoftnApp(): Promise<void> {
-    const name = prompt('Name of the new SoftN app', 'Tasks');
+  /**
+   * A new SoftN app (Studio's task-list example to start from). With a
+   * folder, it goes into that folder of this project, next to anything else;
+   * without one, into a new project of its own.
+   */
+  async function newSoftnApp(folder?: string): Promise<void> {
+    const name = folder ? folder.split('/').filter(Boolean).pop() ?? 'app' : prompt('Name of the new SoftN app', 'Tasks');
     if (!name) return;
-    await openProject(await createProject(name));
-    for (const [path, text] of SOFTN_STARTER) project.vfs.writeFile(`/${path}`, path === 'manifest.json' ? text.replace('"Tasks"', JSON.stringify(name)) : text, { parents: true });
+    let root = '';
+    if (folder) {
+      root = appKey(folder);
+      if (project.vfs.exists(`/${root}/manifest.json`)) {
+        chat.system(`${appLabel(root)} already has a manifest.json.`, 'error');
+        return;
+      }
+    } else {
+      await openProject(await createProject(name));
+    }
+    for (const [path, text] of SOFTN_STARTER) project.vfs.writeFile(`/${root ? `${root}/` : ''}${path}`, path === 'manifest.json' ? text.replace('"Tasks"', JSON.stringify(name)) : text, { parents: true });
     await project.flush();
-    tree.select('/ui/main.ui');
+    tree.select(`/${root ? `${root}/` : ''}ui/main.ui`);
+    preview.setApp(root);
     showPane('preview');
-    chat.system(`New SoftN app "${name}": a small task list to start from. Ask the agent to change it into what you want — the preview updates as it works. /softn export saves it as a .softn file.`);
+    chat.system(`New SoftN app "${name}" in ${appLabel(root)}: a small task list to start from. Ask the agent to change it into what you want — the preview updates as it works. Export it with /softn export${root ? ` ${root}` : ''}.`);
   }
 
-  function exportSoftn(): void {
-    editor.flush();
-    if (!isSoftnProject(project.vfs)) {
-      chat.system('This project is not a SoftN app: it needs a manifest.json whose "main" is a .ui page. /softn new starts one.', 'error');
-      return;
+  function pickApp(folder?: string): string | null {
+    const target = resolveApp(project.vfs, folder ?? (findApps(project.vfs).length > 1 ? preview.app : undefined));
+    if (!target.ok) {
+      chat.system(`${target.reason}. /softn new starts one; /softn import unpacks a .softn file.`, 'error');
+      return null;
     }
-    const errors = checkProject(project.vfs).filter((f) => f.level === 'error');
-    const name = downloadSoftn(project.vfs, project.meta.name);
-    chat.system(errors.length ? `Exported ${name}, but it has problems that will stop it loading:\n${formatFindings(errors)}` : `Exported ${name}.`, errors.length ? 'error' : 'info');
+    return target.root;
+  }
+
+  async function exportSoftn(folder?: string): Promise<void> {
+    editor.flush();
+    const root = pickApp(folder);
+    if (root === null) return;
+    const errors = [...checkProject(project.vfs, root), ...(await logicSyntax(project.vfs, root).catch(() => []))].filter((f) => f.level === 'error');
+    const name = downloadSoftn(project.vfs, root, project.meta.name);
+    chat.system(errors.length ? `Exported ${appLabel(root)} as ${name}, but it has problems that will stop it loading:\n${formatFindings(errors)}` : `Exported ${appLabel(root)} as ${name}.`, errors.length ? 'error' : 'info');
+  }
+
+  function importSoftnFile(): void {
+    fileInput('.softn,.zip,application/zip', false, async (files) => {
+      const file = files[0];
+      try {
+        const imported = importSoftn(project.vfs, new Uint8Array(await file.arrayBuffer()), file.name);
+        await project.flush();
+        preview.setApp(imported.root);
+        showPane('preview');
+        tree.select(`/${imported.root}/manifest.json`);
+        chat.system(`Imported "${imported.name}" into ${imported.root}/ (${imported.files} files). It is shown in the preview; the agent can read it, change it, or build a new app from it in another folder.`);
+      } catch (error) {
+        chat.system((error as Error).message, 'error');
+      }
+    });
   }
 
   async function softnCommand(args: string[]): Promise<void> {
+    const folder = args[1];
     switch ((args[0] ?? '').toLowerCase()) {
       case 'new':
-        await newSoftnApp();
+        await newSoftnApp(folder);
+        return;
+      case 'import':
+        importSoftnFile();
         return;
       case 'export':
-        exportSoftn();
+        await exportSoftn(folder);
         return;
-      case 'check': {
-        const result = await preview.check();
-        const files = formatFindings(checkProject(project.vfs));
-        chat.system(`Files: ${files}\nRender: ${result.ok ? 'ok' : result.errors.join('; ')}`, result.ok ? 'info' : 'error');
+      case 'apps': case 'list': {
+        const apps = findApps(project.vfs);
+        chat.system(apps.length ? `SoftN apps in this project:\n${apps.map((r) => `  ${appLabel(r)}`).join('\n')}` : 'No SoftN apps in this project yet.');
         return;
       }
-      case 'preview':
+      case 'check': {
+        const root = pickApp(folder);
+        if (root === null) return;
+        const result = await preview.check(root);
+        const files = formatFindings([...checkProject(project.vfs, root), ...(await logicSyntax(project.vfs, root).catch(() => []))]);
+        chat.system(`App: ${appLabel(root)}\nFiles: ${files}\nRender: ${result.ok ? 'ok' : result.errors.join('; ')}`, result.ok ? 'info' : 'error');
+        return;
+      }
+      case 'preview': case 'show': {
+        const root = pickApp(folder);
+        if (root === null) return;
+        preview.setApp(root);
         showPane('preview');
         return;
+      }
       default:
-        chat.system('usage: /softn new | export | check | preview\n  new      start a SoftN app (a small task list) in a new project\n  export   download this app as a .softn file\n  check    check the files and render the app\n  preview  show the live preview');
+        chat.system(`usage: /softn new [folder] | import | export [folder] | check [folder] | preview [folder] | apps
+  new            start a SoftN app in a new project; with a folder, in that folder of this one
+  import         unpack a .softn file into a folder of this project
+  export         download an app as a .softn file (the one in the preview, or the folder named)
+  check          check an app's files and render it
+  preview        show an app in the live preview
+  apps           list the SoftN apps in this project
+A project can hold several apps, each in its own folder (any folder whose manifest.json has a .ui "main").`);
     }
   }
 
@@ -300,7 +418,8 @@ async function main(): Promise<void> {
       downloadZip(project.meta.name.replace(/[^\w.-]+/g, '-'), project.vfs.files());
     } }, 'Export .zip'),
     h('button', { title: 'Start a SoftN app in a new project', onclick: () => void newSoftnApp() }, 'New SoftN app'),
-    h('button', { title: 'Download this SoftN app as a .softn file', onclick: () => exportSoftn() }, 'Export .softn'),
+    h('button', { title: 'Unpack a .softn file into a folder of this project', onclick: () => importSoftnFile() }, 'Import .softn…'),
+    h('button', { title: 'Download the SoftN app in the preview as a .softn file', onclick: () => void exportSoftn() }, 'Export .softn'),
     h('button', { title: 'Rename this project', onclick: async () => {
       const name = prompt('Rename project', project.meta.name);
       if (name) {
