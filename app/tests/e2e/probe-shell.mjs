@@ -25,7 +25,7 @@ try {
         return { error: String(e) };
       }
     }, command, cwd);
-    const show = (s) => (s ?? '').trimEnd().split('\n').slice(0, 8).join('\n        ');
+    const show = (s) => (s ?? '').trimEnd().split('\n').slice(0, Number(process.env.LINES ?? 8)).join('\n        ');
     console.log(`### ${name}  [exit ${r.exit_code ?? '?'}]`);
     if (r.stdout) console.log(`  out: ${show(r.stdout)}`);
     if (r.stderr) console.log(`  err: ${show(r.stderr)}`);

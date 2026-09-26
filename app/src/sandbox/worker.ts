@@ -18,7 +18,7 @@ declare const self: DedicatedWorkerGlobalScope;
 const MAGIC = '\u0000bot.computer:';
 
 /** The operations a guest may ask the page for (answered by host.ts). */
-const HOST_KINDS = ['fs.read', 'fs.readb64', 'fs.write', 'fs.append', 'fs.writeb64', 'fs.stat', 'fs.list', 'fs.walk', 'fs.grep', 'fs.mkdir', 'fs.remove', 'fs.rename', 'fs.copy', 'net.fetch', 'proc.run', 'sys.sleep'];
+const HOST_KINDS = ['fs.read', 'fs.readb64', 'fs.write', 'fs.append', 'fs.writeb64', 'fs.stat', 'fs.list', 'fs.walk', 'fs.grep', 'fs.mkdir', 'fs.remove', 'fs.rename', 'fs.copy', 'net.fetch', 'proc.run', 'sys.sleep', 'fs.archive'];
 
 // Installed ahead of the guest: captures the host channel before any guest
 // code can shadow it, and turns the page's {ok}|{err} reply into a return
@@ -116,7 +116,7 @@ function jsProgram(request: RunRequest, guest: GuestSources): string {
 
 function shellProgram(request: RunRequest, guest: GuestSources): string {
   const input = { command: request.source, cwd: request.cwd ?? '/', env: request.env ?? {}, stdin: request.stdin ?? '' };
-  return `${HOSTCALL}var __coder_input = ${JSON.stringify(input)};\nvar __shell_result = ${guest.shell}\n`;
+  return `${HOSTCALL}var __coder_input = ${JSON.stringify(input)};\nvar __shell_tools = ${guest.tools};\nvar __shell_result = ${guest.shell}\n`;
 }
 
 async function run(message: Extract<ToWorker, { type: 'run' }>): Promise<RunResult> {

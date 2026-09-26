@@ -956,7 +956,16 @@
     if (r.errToOut) { out += err; err = ""; }
     if (r.outToErr) { err += out; out = ""; }
     if (r.out !== null) {
-      if (r.out !== DEVNULL) (r.outAppend ? fs.append : fs.write)(r.out, out);
+      // A binary result (gzip -c) holds one byte per character: write the bytes.
+      if (r.out !== DEVNULL && res.binary && !r.errToOut) {
+        let bytes = Uint8Array.from(out, (ch) => ch.charCodeAt(0) & 255);
+        if (r.outAppend && fs.isFile(r.out)) {
+          const old = Uint8Array.fromBase64(call("fs.readb64", resolve(r.out)));
+          const all = new Uint8Array(old.length + bytes.length);
+          all.set(old, 0); all.set(bytes, old.length); bytes = all;
+        }
+        call("fs.writeb64", resolve(r.out), bytes.toBase64());
+      } else if (r.out !== DEVNULL) (r.outAppend ? fs.append : fs.write)(r.out, out);
       out = "";
     }
     if (r.err !== null) {
@@ -2415,7 +2424,6 @@
     return R(out, "", 1);
   }, "diff [-u] [-q] file1 file2");
   B("cmp", (args) => { const o = opts(args); const x = fs.read(o.a[0]), y = fs.read(o.a[1]); return x === y ? R() : R(o.f.s ? "" : o.a[0] + " " + o.a[1] + " differ\n", "", 1); });
-  B("md5sum sha1sum sha256sum", function () { return R("", "checksums are not available in the sandbox shell; use `python -c` with hashlib\n", 1); });
   B("base64", (args, stdin) => {
     const o = opts(args);
     let text = "";
@@ -2427,7 +2435,6 @@
     return R(bytes.toBase64().replace(/(.{76})/g, "$1\n") + "\n");
   });
   class TextEncoderLite { encode(s) { const out = []; for (const ch of unescape(encodeURIComponent(s))) out.push(ch.charCodeAt(0)); return new Uint8Array(out); } }
-  B("jq", () => R("", "jq is not available; use `js -e` (e.g. js -e 'const d = JSON.parse(require(\"fs\").readFileSync(\"f.json\",\"utf8\")); console.log(d.x)') or python -c\n", 127));
 
   /* ----- network (through bot.computer's network gate) ----- */
   function fetchVia(url, o) {
@@ -2538,8 +2545,16 @@
   B("time", (args, stdin) => { const t0 = Date.now(); const r = runArgv(args, stdin); r.err += "\nreal\t" + ((Date.now() - t0) / 1000).toFixed(3) + "s\n"; return r; });
   B("timeout", (args, stdin) => { const o = opts(args, { withValue: "sk", stopAtOperand: true }); return runArgv(o.a.slice(1), stdin); });
   B("nohup nice", (args, stdin) => runArgv(args.filter((a, i) => !(i === 0 && a.startsWith("-"))), stdin));
-  for (const name of ["git", "npm", "npx", "yarn", "pnpm", "pip", "pip3", "cargo", "rustc", "go", "make", "cmake", "gcc", "g++", "clang", "java", "javac", "dotnet", "docker", "kubectl", "ssh", "scp", "sudo", "apt", "apt-get", "brew", "powershell", "pwsh", "cmd", "code", "vim", "nano", "less", "more", "top", "ps", "kill"]) {
+  for (const name of ["npm", "npx", "yarn", "pnpm", "cargo", "rustc", "go", "make", "cmake", "gcc", "g++", "clang", "java", "javac", "dotnet", "docker", "kubectl", "ssh", "scp", "sudo", "apt", "apt-get", "brew", "powershell", "pwsh", "cmd", "code"]) {
     builtins[name] = () => R("", name + ": not available in the sandbox shell (there are no real processes here). Do the work with the built-in commands, node/js, python, or the file tools.\n", 127);
+  }
+  if (typeof __shell_tools === "function") {
+    __shell_tools({
+      B: B, R: R, fs: fs, opts: opts, lines: lines, unlines: unlines, inputsOf: inputsOf, call: call, callJson: callJson,
+      errText: errText, resolve: resolve, display: display, baseName: baseName, dirName: dirName, ShellError: ShellError,
+      state: state, runArgv: runArgv, runSource: runSource, expandString: expandString, globToRegex: globToRegex,
+      makeRegex: makeRegex, builtins: builtins, arith: arith, fmtSize: fmtSize, fmtDate: fmtDate, normPath: normPath,
+    });
   }
   B("let", (args) => { let v = "0"; for (const a of args) v = arith(a); return R("", "", Number(v) !== 0 ? 0 : 1); }, "let EXPR...   (arithmetic, like (( )))");
   B("expr", (args) => {
@@ -2644,7 +2659,9 @@
     "Commands:\n  " + helpText.join("\n  ") + "\n" +
     "Also: true false test [ [[ export unset env set read shift exit break continue source eval xargs basename dirname realpath stat du\n" +
     "      rev tac nl seq yes diff cmp base64 whoami uname sleep time rmdir sort uniq cut tr sed awk tee\n" +
-    "Network commands go through bot.computer's network gate (/internet). Native tools (git, npm, cargo, ...) are not available here.\n"
+    "Programs: node/js FILE (require, ESM, node_modules), python FILE / -m MODULE / -c CODE (stdlib subset), sh FILE.\n" +
+    "git works on a local repository in .git/ (no remotes); jq, patch, tar/zip/gzip, checksums and bc are built in.\n" +
+    "Network commands go through bot.computer's network gate (/internet). Package managers and compilers (npm install, cargo, gcc, ...) are not available here.\n"
   ), "help");
 
   /* ---------------- run ---------------- */

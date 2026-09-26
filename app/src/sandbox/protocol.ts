@@ -65,4 +65,6 @@ export type FromWorker =
 export interface GuestSources {
   prelude: string;
   shell: string;
+  /** The shell's larger tools (git, jq, patch, archives, checksums, ...), given the shell's internals. */
+  tools: string;
 }

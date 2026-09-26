@@ -636,7 +636,8 @@ A project can hold several apps, each in its own folder (any folder whose manife
     h('button', { title: 'Import a .zip as a new project', onclick: () => fileInput('.zip,application/zip', false, async (files) => newProjectFrom(await importZip(files[0]))) }, 'Import .zip'),
     h('button', { title: 'Download this project as a .zip', onclick: async () => {
       editor.flush();
-      downloadZip(project.meta.name.replace(/[^\w.-]+/g, '-'), project.vfs.files());
+      // The sandbox git's .git/ is its own format, which a real git would read as a broken repository.
+      downloadZip(project.meta.name.replace(/[^\w.-]+/g, '-'), project.vfs.files().filter(([path]) => !path.split('/').includes('.git')));
     } }, 'Export .zip'),
     h('button', { title: 'Start a SoftN app: from a starter, a blank page or an example; in a new project or a folder of this one', onclick: () => newSoftnApp().catch((error: unknown) => chat.system(`Could not start the app: ${(error as Error).message}`, 'error')) }, 'New SoftN app'),
     h('button', { title: 'Unpack a .softn file into a folder of this project', onclick: () => importSoftnFile() }, 'Import .softn…'),

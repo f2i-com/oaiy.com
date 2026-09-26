@@ -7,6 +7,7 @@
  */
 import type { NetGate } from '../gate/netgate';
 import { IGNORED_DIRS, baseName, normalizePath, type Vfs } from '../vfs/vfs';
+import { archive, type ArchiveRequest } from './archive';
 import type { Lang, RunRequest } from './protocol';
 import { runInSandbox, type HostHandler, type RunOutcome } from './runner';
 
@@ -171,6 +172,11 @@ export class SandboxHost implements HostHandler {
         vfs.copy(arg(0, 'source'), arg(1, 'target'));
         this.wrote(args[1]);
         return '';
+      case 'fs.archive': {
+        const result = archive(vfs, JSON.parse(arg(0, 'request')) as ArchiveRequest);
+        for (const f of result.files) if (f.path.startsWith('/')) this.wrote(f.path);
+        return JSON.stringify(result);
+      }
       case 'net.fetch':
         return JSON.stringify(await this.fetch(JSON.parse(arg(0, 'request'))));
       case 'proc.run':

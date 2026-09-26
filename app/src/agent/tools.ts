@@ -248,8 +248,10 @@ export const TOOLS: ToolSpec[] = [
     name: 'sandbox_shell',
     description:
       'Run shell commands in bot.computer\'s emulated POSIX-style shell (on the Zipp VM, confined to the project; "/" is the project root). ' +
-      'Pipes, && || ;, redirects, heredocs, $VAR/$(...)/$((...)), globs, if/for/while/case, and built-in ls cat head tail grep find sed awk sort uniq cut tr wc diff mkdir cp mv rm touch tree xargs tee printf echo, curl/wget (through the /internet gate; CORS applies), node/js and python on Zipp. ' +
-      'There are no real processes: git, npm, compilers are not available. The working directory and exported variables persist between calls. Run `help` for details.',
+      'Bash syntax (pipes, && || ;, redirects, heredocs, $VAR/$(...)/$((...)), arrays, brace expansion, globs, if/for/while/case, functions) and built-in ls cat head tail grep find sed awk sort uniq cut tr wc diff patch mkdir cp mv rm touch tree xargs tee printf echo, ' +
+      'jq, tar zip unzip gzip, md5sum/sha256sum, xxd, file, column, bc, and git (a local repository in .git/: init status add commit log diff show branch switch merge stash reset restore tag; no remotes), ' +
+      'curl/wget (through the /internet gate; CORS applies), and node/js FILE and python FILE / -m / -c on Zipp. ' +
+      'There are no real processes: npm install, pip install and compilers are not available. The working directory and exported variables persist between calls. Run `help` for details.',
     parameters: { type: 'object', required: ['command'], properties: { command: str, timeout_secs: { ...int, minimum: 1, maximum: MAX_TIMEOUT_S } } },
   },
   {
@@ -597,8 +599,7 @@ async function execute(call: ToolCall, ctx: ToolContext, out: ToolOut): Promise<
       const report: Record<string, unknown> = { ok: exitCode === 0, exit_code: exitCode, stdout: cut(stdout), stderr: cut(stderr), elapsed_ms: outcome.elapsedMs };
       if (outcome.result?.value !== undefined) report.result = cut(outcome.result.value);
       if (outcome.timedOut) report.timed_out = true;
-      if (host.changes.written.size) report.files_written = [...host.changes.written];
-      if (host.changes.deleted.size) report.files_deleted = [...host.changes.deleted];
+      reportChanges(report, host.changes);
       return JSON.stringify(report, null, 1);
     }
     case 'sandbox_shell': {
@@ -618,8 +619,7 @@ async function execute(call: ToolCall, ctx: ToolContext, out: ToolOut): Promise<
         Object.assign(report, { exit_code: exitCode || 1, stdout: cut(stdout), stderr: cut(stderr), cwd });
         if (outcome.timedOut) report.timed_out = true;
       }
-      if (host.changes.written.size) report.files_written = [...host.changes.written];
-      if (host.changes.deleted.size) report.files_deleted = [...host.changes.deleted];
+      reportChanges(report, host.changes);
       return JSON.stringify(report, null, 1);
     }
     case 'view_image': {
@@ -775,6 +775,19 @@ export async function checkApp(ctx: ToolContext, root: string): Promise<{ ok: bo
   // The same errors again mean the fixes are not working.
   const signature = problems.map((p) => p.replace(/\d+/g, '#')).sort().join('|');
   return { ok: !problems.length, text: lines.join('\n'), signature };
+}
+
+/** The files a run changed, for its report: git's own bookkeeping in .git/ left out, long lists cut. */
+function reportChanges(report: Record<string, unknown>, changes: { written: Set<string>; deleted: Set<string> }): void {
+  const MAX = 100;
+  const list = (paths: Set<string>): string[] => {
+    const shown = [...paths].filter((p) => !p.split('/').includes('.git'));
+    return shown.length > MAX ? [...shown.slice(0, MAX), `... and ${shown.length - MAX} more`] : shown;
+  };
+  const written = list(changes.written);
+  const deleted = list(changes.deleted);
+  if (written.length) report.files_written = written;
+  if (deleted.length) report.files_deleted = deleted;
 }
 
 export async function runTool(call: ToolCall, ctx: ToolContext): Promise<ToolResult> {

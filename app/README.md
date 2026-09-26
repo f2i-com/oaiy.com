@@ -4,7 +4,7 @@ A coding agent that runs entirely in your browser.
 
 - **Your projects stay in the browser.** Files live in the browser's private file system (OPFS). Open a folder from disk, import a `.zip`, export one back, or start from scratch. Everything works offline once the page has loaded (it installs as an app).
 - **AI-written code runs on the [Zipp](https://github.com/f2i-com/zipp.org) VM.** JavaScript and Python run in Zipp's WebAssembly engine inside a Web Worker. The code can reach the project and nothing else, except what the network gate lets through.
-- **A shell, emulated.** The terminal and the agent's `sandbox_shell` are a POSIX-style shell written in JavaScript on the same sandbox. It has pipes, redirects, heredocs, loops, and `grep -r`/`find`/`sed`/`awk`/`sort`/…, plus `curl`/`wget` and `node`/`python`. There are no real processes, so `git`, `npm` and compilers don't exist here.
+- **A shell, emulated.** The terminal and the agent's `sandbox_shell` are a bash-like shell written in JavaScript on the same sandbox, with `git`, `jq`, `tar`/`zip`, `node` and `python` built in (see [The shell](#the-shell)). There are no real processes, so `npm install` and compilers don't exist here.
 - **Any model.** A server on your own machine (Ollama, LM Studio, llama.cpp, nrob-server — anything OpenAI-compatible), Anthropic's API, or any OpenAI-compatible API.
 - **A network gate.** `/internet on | off | allowlist | allow <host> | deny <host> | status` (or `/net`) decides every request made on the model's behalf. Requests to your AI provider are not gated.
 
@@ -133,11 +133,35 @@ page (trusted)                                   Worker (one per program)
 
 A dedicated host bridge in Zipp would replace the `localStorage` tunnel; see [docs/zipp-app-bridge.md](docs/zipp-app-bridge.md).
 
+### The shell
+
+The shell works on the project's files through the same host calls, so it can't get out of the project either.
+
+- **Syntax.** It covers most of what bash scripts use:
+  - pipes, `&&`/`||`, redirects, heredocs and here-strings;
+  - `$(...)`, `$((...))`, `<(...)` and brace expansion;
+  - indexed and associative arrays, functions and `local`;
+  - `if`/`case`/`for`/`while`, C-style `for ((...))`, `getopts` and `trap EXIT`.
+- **Files and text:**
+  - `ls`, `find`, `grep -r`, `sed -i`, `awk`, `sort`, `cut`, `tr`, `column`, `paste`, `comm`, `split`;
+  - `diff -u` and `patch`;
+  - `xxd`, `file`, `md5sum`/`sha256sum`, `bc`, `mktemp`.
+- **`jq`** covers paths, pipes, `map`/`select`/`sort_by`/`group_by`, `|=` and `del`, `reduce`, `def`, `@csv`/`@tsv`/`@base64`, and `--arg`/`-r`/`-c`/`-s`/`-n`/`-e`.
+- **Archives.** `tar` (with `-z`), `zip`/`unzip`, `gzip`/`gunzip`/`zcat`. Unpacking checks entry paths and size limits.
+- **`git`** keeps a real local repository in `.git/`. Blobs get git's SHA-1 ids.
+  - Commands: `init`, `status`, `add`, `rm`, `mv`, `commit`, `log`, `diff`, `show`, `branch`, `switch`/`checkout`, `restore`, `reset`, `merge` (three-way, with conflict markers), `cherry-pick`, `revert`, `stash`, `tag`, `blame`, `grep`, `clean` and `describe`.
+  - There are no remotes, so `push`, `pull` and `clone` say so.
+  - Exporting a `.zip` leaves `.git/` out: it's in the sandbox's own format, which a real git can't read.
+- **Programs.**
+  - `node file.js` supports `require`, ES modules, `node_modules` and Node's core modules.
+  - `python script.py` imports sibling modules, uses the working folder, and reads `input()`/stdin. It also supports `python -m`, `-c`, exit codes, and a stdlib subset (`csv`, `datetime`, `glob`, `shutil`, `urllib.parse`, `logging`, …).
+  - `sh script.sh`, and scripts that start with a `#!` line, also run.
+
 ## Tests
 
 ```sh
 npm test           # unit: gate, virtual filesystem, agent loop over both wire formats
-npm run test:e2e   # headless Chrome: the sandbox (tests/e2e/run.mjs) and the whole app with a scripted model (tests/e2e/app.mjs)
+npm run test:e2e   # headless Chrome: the sandbox, shell, git and tools (tests/e2e/run.mjs) and the whole app with a scripted model (tests/e2e/app.mjs)
 ```
 
 The end-to-end tests use a local Chrome or Edge (`CHROME=<path>` to choose one).

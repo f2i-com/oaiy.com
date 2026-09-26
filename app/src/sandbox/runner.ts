@@ -7,6 +7,7 @@
  */
 import PRELUDE from './guest/prelude.js?raw';
 import SHELL from './guest/shell.js?raw';
+import TOOLS from './guest/shell-tools.js?raw';
 import { ReplyWriter, createChannelBuffer } from './channel';
 import type { FromWorker, RunRequest, RunResult } from './protocol';
 
@@ -124,7 +125,7 @@ export async function runInSandbox(request: RunRequest, handler: HostHandler, op
       glueUrl: `${zippBase()}zipp_wasm.js`,
       sab,
       request,
-      guest: { prelude: PRELUDE, shell: SHELL },
+      guest: { prelude: PRELUDE, shell: SHELL, tools: TOOLS },
     });
   });
 }

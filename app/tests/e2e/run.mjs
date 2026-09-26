@@ -196,6 +196,56 @@ try {
     const want = '3 b c d\nx=1 y=2 \n<one><two three>\n1 2 3 ax bx\n3 12 2\n012\n2c2\nv o=out \nend\nbye\n';
     expect(r.report.stdout === want, `stdout: ${JSON.stringify(r.report.stdout)} stderr: ${r.report.stderr}`);
   });
+
+  await check('the shell tools: checksums, jq, diff | patch, tar/zip/gzip round trips', async () => {
+    const script = [
+      'printf abc | sha256sum',
+      'printf "" | md5sum',
+      `echo '{"items":[{"n":"a","v":2},{"n":"b","v":5}]}' > data.json`,
+      `jq -r '.items | map(select(.v > 3)) | .[].n' data.json`,
+      `jq -c '.items |= map(.v * 10)' data.json`,
+      'printf "one\\ntwo\\nthree\\n" > p1.txt; printf "one\\n2\\nthree\\n" > p2.txt',
+      'diff -u p1.txt p2.txt > ch.diff; patch -s p1.txt < ch.diff; cmp p1.txt p2.txt && echo patched',
+      'mkdir -p pack/in && echo deep > pack/in/f.txt && tar -czf pack.tgz pack && rm -r pack && tar -xzf pack.tgz && cat pack/in/f.txt',
+      'zip -qr pack.zip pack && rm -r pack && unzip -q pack.zip && cat pack/in/f.txt',
+      'echo zipped | gzip -c > z.gz && zcat z.gz',
+      'echo "scale=2; 7/4" | bc',
+    ].join('\n');
+    const r = await page.evaluate((src) => window.__bot.shell(src), script);
+    const want = 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad  -\nd41d8cd98f00b204e9800998ecf8427e  -\nb\n{"items":[20,50]}\npatched\ndeep\ndeep\nzipped\n1.75\n';
+    expect(r.report.stdout === want, `stdout: ${JSON.stringify(r.report.stdout)} stderr: ${r.report.stderr}`);
+  });
+
+  await check('git keeps a local repository: commit, branch, merge, conflict, stash, log', async () => {
+    const script = [
+      'mkdir -p proj && cd proj && git init -q',
+      'printf "a\\nb\\nc\\n" > f.txt && git add . && git commit -qm first',
+      'git switch -qc side && sed -i "s/^a$/A/" f.txt && git commit -qam side',
+      'git switch -q main && sed -i "s/^c$/C/" f.txt && git commit -qam main',
+      'git merge -q side >/dev/null && tr "\\n" " " < f.txt && echo',
+      'git log --format=%s | tr "\\n" " " && echo',
+      'git switch -qc x && echo X > f.txt && git commit -qam x && git switch -q main && echo M > f.txt && git commit -qam m',
+      'git merge x > /dev/null; echo "conflict=$?"; git status --short',
+      'echo resolved > f.txt && git add f.txt && git commit -qm resolved && git status --short && echo clean',
+      'echo wip >> f.txt && git stash -q && cat f.txt && git stash pop -q >/dev/null && tail -1 f.txt',
+      'git diff --stat | tail -1',
+      'cd / && git status 2>&1 | head -1',
+    ].join('\n');
+    const r = await page.evaluate((src) => window.__bot.shell(src), script);
+    const lines = r.report.stdout.split('\n');
+    const expected = [
+      'A b C ',
+      'Merge branch \'side\' main side first ',
+      'conflict=1',
+      'UU f.txt',
+      'clean',
+      'resolved',
+      'wip',
+      ' 1 file changed, 1 insertion(+)',
+      'fatal: not a git repository (or any of the parent directories): .git',
+    ];
+    expect(JSON.stringify(lines.slice(0, expected.length)) === JSON.stringify(expected), `stdout: ${JSON.stringify(r.report.stdout)} stderr: ${r.report.stderr}`);
+  });
 } finally {
   await browser.close();
   await server.close();
