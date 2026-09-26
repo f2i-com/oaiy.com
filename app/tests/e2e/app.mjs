@@ -104,14 +104,15 @@ try {
     await page.evaluate(() => [...document.querySelectorAll('dialog.settings button')].find((b) => b.textContent.includes('Add a provider')).click());
     await page.select('dialog.settings select', 'local-other');
     await page.evaluate((url) => {
-      const set = (label, value) => {
-        const input = [...document.querySelectorAll('dialog.settings label')].find((l) => l.firstChild.textContent === label).querySelector('input');
-        input.value = value;
-        input.dispatchEvent(new Event('input'));
-      };
-      set('Address', url);
-      set('Model', 'mock-model');
+      const input = [...document.querySelectorAll('dialog.settings label')].find((l) => l.firstChild.textContent === 'Address').querySelector('input');
+      input.value = url;
+      input.dispatchEvent(new Event('input'));
+      [...document.querySelectorAll('dialog.settings button')].find((b) => b.textContent === 'List models').click();
     }, modelUrl);
+    // The listed models fill a real dropdown, and one can be chosen from it.
+    await page.waitForFunction(() => [...document.querySelectorAll('.model-picker select option')].some((o) => o.value === 'mock-model'), { timeout: 15_000 });
+    await page.select('.model-picker select', 'mock-model');
+    await page.waitForFunction(() => document.querySelector('.provider-row.selected')?.textContent.includes('mock-model'));
     await page.evaluate(() => [...document.querySelectorAll('dialog.settings button')].find((b) => b.textContent === 'Save').click());
     await page.waitForFunction(() => document.querySelector('button[title="AI provider"]')?.textContent.includes('mock-model'));
   });
@@ -128,10 +129,18 @@ try {
     expect(out.includes('19.8'), out);
   });
 
+  await check('the internet chip toggles the gate off and on', async () => {
+    const chip = 'button[role="switch"]';
+    await page.click(chip);
+    await page.waitForFunction((c) => document.querySelector(c)?.textContent === 'internet: off', {}, chip);
+    await page.click(chip);
+    await page.waitForFunction((c) => document.querySelector(c)?.textContent === 'internet: on', {}, chip);
+  });
+
   await check('/internet off closes the gate for the sandbox', async () => {
     await page.type('.chat-input', '/internet off');
     await page.keyboard.press('Enter');
-    await page.waitForFunction(() => document.querySelector('button[title="Network gate (/internet)"]')?.textContent === 'internet: off');
+    await page.waitForFunction(() => document.querySelector('button[role="switch"]')?.textContent === 'internet: off');
     const out = await terminal(page, 'curl -sS https://example.com', 'network gate is closed');
     expect(out.includes('was not contacted'), out);
   });
@@ -144,7 +153,7 @@ try {
     expect(out.includes('19.8'), out);
     const log = await page.$eval('.chat-log', (e) => e.textContent);
     expect(log.includes('What is the mean temperature?') && log.includes('saved in data/mean.txt'), `log: ${log.slice(0, 300)}`);
-    expect((await page.$eval('button[title="Network gate (/internet)"]', (e) => e.textContent)) === 'internet: off', 'gate not remembered');
+    expect((await page.$eval('button[role="switch"]', (e) => e.textContent)) === 'internet: off', 'gate not remembered');
   });
 } finally {
   await browser.close();

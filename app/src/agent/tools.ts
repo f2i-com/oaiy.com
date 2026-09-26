@@ -246,6 +246,7 @@ async function execute(call: ToolCall, ctx: ToolContext): Promise<string> {
     case 'code_run': {
       const timeoutMs = timeoutOf(input);
       const host = new SandboxHost(vfs, ctx.gate, 'code_run', timeoutMs);
+      host.signal = ctx.signal;
       const file = typeof input.file === 'string' ? normalizePath(input.file) : undefined;
       const language = typeof input.language === 'string' ? input.language : file?.endsWith('.py') ? 'python' : 'javascript';
       const lang = /^py/i.test(language) ? 'python' : 'js';
@@ -269,8 +270,9 @@ async function execute(call: ToolCall, ctx: ToolContext): Promise<string> {
     case 'sandbox_shell': {
       const timeoutMs = timeoutOf(input);
       const host = new SandboxHost(vfs, ctx.gate, 'sandbox_shell', timeoutMs);
+      host.signal = ctx.signal;
       const cwd = vfs.stat(ctx.shell.cwd)?.type === 'dir' ? ctx.shell.cwd : '/';
-      const outcome = await runInSandbox({ lang: 'shell', source: need(input, 'command'), cwd, env: ctx.shell.env, limits: { maxSteps: 2_000_000_000 } }, host, { timeoutMs });
+      const outcome = await runInSandbox({ lang: 'shell', source: need(input, 'command'), cwd, env: ctx.shell.env, limits: { maxSteps: 2_000_000_000 } }, host, { timeoutMs, signal: ctx.signal });
       const shell = outcome.result?.shell;
       const report: Record<string, unknown> = {};
       if (shell && !outcome.timedOut && !outcome.result?.error) {

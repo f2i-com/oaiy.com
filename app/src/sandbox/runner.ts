@@ -17,6 +17,8 @@ export interface HostHandler {
 
 export interface RunOptions {
   timeoutMs: number;
+  /** Stop: ends the Worker at once, like the deadline. */
+  signal?: AbortSignal;
 }
 
 export interface RunOutcome {
@@ -82,6 +84,8 @@ export async function runInSandbox(request: RunRequest, handler: HostHandler, op
       resolve({ ...outcome, elapsedMs: Math.round(performance.now() - started), hostCalls });
     };
     const timer = setTimeout(() => finish({ timedOut: true }), options.timeoutMs);
+    if (options.signal?.aborted) queueMicrotask(() => finish({ timedOut: false, failure: 'stopped' }));
+    options.signal?.addEventListener('abort', () => finish({ timedOut: false, failure: 'stopped' }), { once: true });
 
     worker.onmessage = (event: MessageEvent<FromWorker>) => {
       const message = event.data;

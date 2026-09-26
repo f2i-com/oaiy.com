@@ -53,6 +53,8 @@ export interface ChangeLog {
 
 export class SandboxHost implements HostHandler {
   readonly changes: ChangeLog = { written: new Set(), deleted: new Set() };
+  /** Stop: ends every program this host (and its nested ones) runs. */
+  signal?: AbortSignal;
   private readonly deadline: number;
 
   constructor(
@@ -73,7 +75,9 @@ export class SandboxHost implements HostHandler {
   }
 
   private nested(): SandboxHost {
-    return new SandboxHost(this.vfs, this.gate, this.via, 0, this.depth + 1, this.changes, this.deadline);
+    const nested = new SandboxHost(this.vfs, this.gate, this.via, 0, this.depth + 1, this.changes, this.deadline);
+    nested.signal = this.signal;
+    return nested;
   }
 
   private wrote(path: string): void {
@@ -317,7 +321,7 @@ export class SandboxHost implements HostHandler {
     const cwd = `/${normalizePath(request.cwd ?? '/')}`;
     const full: RunRequest = { ...request, cwd, limits: { maxSteps: DEFAULT_MAX_STEPS } };
     if (request.lang === 'python') full.files = this.preload(cwd, request.preload);
-    const outcome = await runInSandbox(full, this, { timeoutMs: remaining });
+    const outcome = await runInSandbox(full, this, { timeoutMs: remaining, signal: this.signal });
     if (request.lang === 'python' && outcome.result?.vfsChanges) {
       for (const change of outcome.result.vfsChanges) {
         const target = `${cwd === '/' ? '' : cwd}/${change.path}`;

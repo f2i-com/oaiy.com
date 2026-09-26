@@ -19,5 +19,10 @@ async function run(lang: 'js' | 'python', source: string, timeoutMs = 20_000) {
   return { outcome, summary: summarize(outcome), changes: [...host.changes.written] };
 }
 
-Object.assign(window, { __bot: { vfs, gate, shell, run, sandboxAvailable, isolated: globalThis.crossOriginIsolated } });
+async function budgetRun(source: string) {
+  const host = new SandboxHost(vfs, gate, 'code_run', 30_000);
+  return runInSandbox({ lang: 'js', source, limits: { maxSteps: 1_000_000 } }, host, { timeoutMs: 30_000 });
+}
+
+Object.assign(window, { __bot: { vfs, gate, shell, run, budgetRun, sandboxAvailable, isolated: globalThis.crossOriginIsolated } });
 document.getElementById('status')!.textContent = `ready isolated=${globalThis.crossOriginIsolated}`;

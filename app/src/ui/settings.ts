@@ -4,7 +4,7 @@
  * choose which one the agent uses.
  */
 import { testProvider } from '../agent/providers/aiProvider';
-import { LOCAL_SERVERS, defaultBaseUrl, listModels } from '../agent/providers/providerConnection';
+import { LOCAL_SERVERS, defaultBaseUrl, listModels, type ModelInfo } from '../agent/providers/providerConnection';
 import type { LocalServerKind, ProviderConfig, ProviderType } from '../agent/providers/types';
 import { newId } from '../vfs/projects';
 import { clear, h } from './dom';
@@ -33,6 +33,10 @@ export function openSettings(initial: SettingsResult): Promise<SettingsResult | 
     let providers = initial.providers.map((p) => ({ ...p }));
     let activeId = initial.activeId;
     let editing: ProviderConfig | null = providers.find((p) => p.id === activeId) ?? providers[0] ?? null;
+    // Model lists already fetched, by server address and key, so a re-render
+    // (typing a name, switching rows) does not lose them.
+    const modelCache = new Map<string, ModelInfo[]>();
+    const cacheKey = (p: ProviderConfig) => `${p.type}|${p.baseUrl ?? ''}|${p.apiKey ? p.apiKey.slice(-6) : ''}`;
 
     const dialog = h('dialog.settings');
     const list = h('div.provider-list');
@@ -90,24 +94,47 @@ export function openSettings(initial: SettingsResult): Promise<SettingsResult | 
       const name = h('input', { value: p.name, oninput: () => { p.name = name.value; renderList(); } });
       const base = h('input', { value: p.baseUrl ?? '', placeholder: defaultBaseUrl(p.type, p.serverKind), oninput: () => { p.baseUrl = base.value.trim() || undefined; } });
       const key = h('input', { type: 'password', value: p.apiKey, placeholder: p.type === 'local' ? 'usually none' : 'sk-…', oninput: () => { p.apiKey = key.value.trim(); } });
-      const models = h('datalist', { id: 'model-options' });
-      const model = h('input', { value: p.modelId ?? '', list: 'model-options', placeholder: 'choose or type a model', oninput: () => { p.modelId = model.value.trim() || undefined; renderList(); } });
-      const fetchModels = h('button', { onclick: async () => {
-        note.textContent = 'Asking the server for its models…';
+      // The model: a real dropdown of what the server lists, plus "Other…"
+      // for a name typed by hand (a server that lists nothing, a new model).
+      const OTHER = '\u0000other';
+      const custom = h('input', { value: p.modelId ?? '', placeholder: 'type a model name', oninput: () => { p.modelId = custom.value.trim() || undefined; renderList(); } });
+      const modelSelect = h('select', { onchange: () => {
+        if (modelSelect.value === OTHER) {
+          custom.hidden = false;
+          custom.value = p.modelId ?? '';
+          custom.focus();
+          return;
+        }
+        p.modelId = modelSelect.value || undefined;
+        custom.hidden = true;
+        renderList();
+      } });
+      const fillModels = (found: ModelInfo[] | undefined) => {
+        clear(modelSelect);
+        const listed = found ?? [];
+        const known = !!p.modelId && listed.some((m) => m.id === p.modelId);
+        modelSelect.append(h('option', { value: '', selected: !p.modelId }, listed.length ? '— choose a model —' : found ? '— the server listed no models —' : '— press List models —'));
+        for (const m of listed) modelSelect.append(h('option', { value: m.id, selected: m.id === p.modelId }, m.label && m.label !== m.id ? `${m.label} (${m.id})` : m.id));
+        modelSelect.append(h('option', { value: OTHER, selected: !!p.modelId && !known }, 'Other (type a name)…'));
+        custom.hidden = known || (!p.modelId && listed.length > 0);
+      };
+      const loadModels = async (quiet: boolean) => {
+        if (!quiet) note.textContent = 'Asking the server for its models…';
         try {
           const found = await listModels(p);
-          clear(models);
-          for (const m of found) models.append(h('option', { value: m.id }, m.label ?? m.id));
-          note.textContent = found.length ? `${found.length} models: pick one in the Model box.` : 'The server listed no models.';
-          if (!p.modelId && found[0]) {
-            p.modelId = found[0].id;
-            model.value = found[0].id;
-            renderList();
-          }
+          modelCache.set(cacheKey(p), found);
+          if (editing !== p) return;
+          fillModels(found);
+          note.textContent = found.length ? `${found.length} model${found.length === 1 ? '' : 's'} available.` : 'The server listed no models; type one under Other.';
         } catch (error) {
-          note.textContent = (error as Error).message;
+          if (editing === p && !quiet) note.textContent = (error as Error).message;
+          else if (editing === p) note.textContent = `Could not list models yet: ${(error as Error).message}`;
         }
-      } }, 'List models');
+      };
+      const fetchModels = h('button', { onclick: () => void loadModels(false) }, 'List models');
+      fillModels(modelCache.get(cacheKey(p)));
+      if (!modelCache.has(cacheKey(p)) && (p.type === 'local' || p.apiKey)) void loadModels(true);
+      const model = h('div.model-picker', modelSelect, custom);
       const test = h('button', { onclick: async () => {
         note.textContent = 'Testing…';
         const result = await testProvider(p);
@@ -126,7 +153,7 @@ export function openSettings(initial: SettingsResult): Promise<SettingsResult | 
         h('label', 'Name', name),
         h('label', 'Address', base),
         h('label', 'API key', key),
-        h('label', 'Model', model, models),
+        h('label', 'Model', model),
         h('div.form-buttons', fetchModels, test, remove),
         help ? h('p.muted', help) : '',
         note,

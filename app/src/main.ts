@@ -1,7 +1,7 @@
 import './styles.css';
 import { Agent } from './agent/agent';
 import type { ProviderConfig } from './agent/providers/types';
-import { HELP, internetCommand, internetStatus } from './commands';
+import { HELP, internetCommand } from './commands';
 import { NetGate } from './gate/netgate';
 import { sandboxAvailable, zippModule } from './sandbox/runner';
 import { loadSettings, saveGate, saveLastProject, saveProviders } from './settings';
@@ -36,22 +36,38 @@ A coding agent that lives entirely in this browser tab.
   ['hello.js', "const fs = require('fs');\nconst rows = fs.readFileSync('data/weather.csv', 'utf8').trim().split('\\n').slice(1);\nconst warmest = rows.map((r) => r.split(',')).sort((a, b) => b[1] - a[1])[0];\nconsole.log('warmest:', warmest[0], warmest[1] + '°C');\n"],
 ];
 
-function registerServiceWorker(): void {
-  if (!('serviceWorker' in navigator) || import.meta.env.DEV) return;
-  navigator.serviceWorker.register(`${import.meta.env.BASE_URL}sw.js`).then(() => {
-    navigator.serviceWorker.ready.then((registration) => {
-      const urls = performance.getEntriesByType('resource').map((e) => e.name);
-      registration.active?.postMessage({ type: 'cache', urls: [location.href, ...urls] });
-    });
-    // The first visit is served without isolation headers; once the service
-    // worker controls the page, one reload gives it SharedArrayBuffer.
-    if (!crossOriginIsolated && !sessionStorage.getItem('bot.computer.reloaded')) {
-      navigator.serviceWorker.ready.then(() => {
-        sessionStorage.setItem('bot.computer.reloaded', '1');
-        location.reload();
-      });
-    }
-  });
+/**
+ * Register the service worker. Resolves true when the page is about to reload
+ * itself: a first visit on a host that does not send the isolation headers
+ * gets them from the service worker, once it controls the page. The app does
+ * not start on that visit, so nothing half-done is left behind.
+ */
+async function registerServiceWorker(): Promise<boolean> {
+  if (!('serviceWorker' in navigator) || import.meta.env.DEV) return false;
+  try {
+    await navigator.serviceWorker.register(`${import.meta.env.BASE_URL}sw.js`);
+  } catch {
+    return false;
+  }
+  const registration = await navigator.serviceWorker.ready;
+  const urls = performance.getEntriesByType('resource').map((e) => e.name);
+  registration.active?.postMessage({ type: 'cache', urls: [location.href, ...urls] });
+  if (crossOriginIsolated) return false;
+  // At most one automatic reload a minute: if isolation still does not come
+  // (a browser that refuses it), the app starts anyway and says why the
+  // sandbox is unavailable. localStorage, not sessionStorage: switching into
+  // a cross-origin isolated context can start a fresh session store.
+  const KEY = 'bot.computer.isolation-reload';
+  let last = 0;
+  try {
+    last = Number(localStorage.getItem(KEY)) || 0;
+    if (Date.now() - last < 60_000) return false;
+    localStorage.setItem(KEY, String(Date.now()));
+  } catch {
+    return false;
+  }
+  location.reload();
+  return true;
 }
 
 function summarizeProject(meta: ProjectMeta, vfs: Vfs, gate: NetGate): string {
@@ -63,8 +79,12 @@ function summarizeProject(meta: ProjectMeta, vfs: Vfs, gate: NetGate): string {
 }
 
 async function main(): Promise<void> {
-  registerServiceWorker();
   const app = document.getElementById('app')!;
+  if (!crossOriginIsolated && (await registerServiceWorker())) {
+    app.textContent = 'Setting up bot.computer for offline use…';
+    return;
+  }
+  if (crossOriginIsolated) void registerServiceWorker();
   const settings = await loadSettings();
   const gate = new NetGate(settings.gate);
   let saveGateTimer: ReturnType<typeof setTimeout> | null = null;
@@ -87,11 +107,23 @@ async function main(): Promise<void> {
   const terminal = new TerminalPane(null as unknown as Vfs, gate);
 
   const projectSelect = h('select.project-select', { title: 'Project' });
-  const gateChip = h('button.chip', { title: 'Network gate (/internet)', onclick: () => chat.system(internetStatus(gate)) });
+  // The chip is the gate's switch: on (open) ⇄ off (blocked). Allowlists and
+  // per-host rules stay with /internet.
+  const gateChip = h('button.chip.toggle', {
+    title: 'Network gate: click to turn the sandbox\'s internet access on or off (/internet for allow/deny lists and status)',
+    role: 'switch',
+    onclick: () => {
+      gate.setMode(gate.mode === 'blocked' ? 'open' : 'blocked');
+      chat.system(gate.mode === 'blocked'
+        ? 'Internet off: sandboxed code and web_fetch cannot reach any host. Your AI provider still works.'
+        : 'Internet on: sandboxed code and web_fetch may reach any host not on the deny list.');
+    },
+  });
   const providerChip = h('button.chip', { title: 'AI provider', onclick: () => void editSettings() });
   const renderChips = () => {
     gateChip.textContent = `internet: ${gate.mode === 'open' ? 'on' : gate.mode === 'blocked' ? 'off' : 'allowlist'}`;
     gateChip.dataset.mode = gate.mode;
+    gateChip.setAttribute('aria-checked', String(gate.mode !== 'blocked'));
     const p = activeProvider();
     providerChip.textContent = p ? `${p.name}${p.modelId ? ` · ${p.modelId}` : ' · no model'}` : 'Set up AI…';
   };
@@ -251,6 +283,7 @@ async function main(): Promise<void> {
     meta = await createProject('Welcome');
     await openProject(meta);
     for (const [path, text] of WELCOME) project.vfs.writeFile(`/${path}`, text, { parents: true });
+    await project.flush();
     editor.open('/README.md');
     tree.select('/README.md');
   } else {

@@ -112,6 +112,11 @@ try {
     expect(Date.now() - t0 < 10_000, 'took too long');
   });
 
+  await check('the instruction budget stops a runaway program and says so', async () => {
+    const r = await page.evaluate(() => window.__bot.budgetRun('for (;;) {}'));
+    expect(!r.timedOut && r.result?.limit, `outcome: ${JSON.stringify(r)}`);
+  });
+
   await check('node and python run nested inside the shell', async () => {
     const r = await page.evaluate(async () => {
       window.__bot.vfs.writeFile('/hello.js', "console.log('js says', process.argv.slice(2).join(' '))");

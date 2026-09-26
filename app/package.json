@@ -13,7 +13,7 @@
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "test:e2e": "node tests/e2e/run.mjs && node tests/e2e/app.mjs"
+    "test:e2e": "node tests/e2e/run.mjs && node tests/e2e/app.mjs && node tests/e2e/static.mjs --build"
   },
   "dependencies": {
     "@codemirror/lang-css": "^6.3.1",
