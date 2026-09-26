@@ -47,6 +47,9 @@ pub const DEFAULT: &str = r#"{
     "enabled": true,
     "autostart": false,
     "server": "nrob-server",
+    "server_webgpu": "nrob-server-webgpu",
+    "backend": "auto",
+    "webgpu_gb": null,
     "default_model": "",
     "models": [],
     "devices": [],
@@ -280,6 +283,10 @@ pub fn validate(v: &Json) -> Result<(), String> {
             return Err(format!("llm model {name} needs a path (a .gguf, a folder holding one, or a checkpoint folder)"));
         }
     }
+    if !["auto", "cuda", "webgpu", "cpu"].contains(&str_or(llm, "backend", "auto")) {
+        return Err("llm.backend must be auto, cuda, webgpu or cpu".into());
+    }
+    gib(llm, "webgpu_gb", "llm", 1024)?;
     let default = str_or(llm, "default_model", "");
     if !default.is_empty() && !names.contains(&default) {
         return Err(format!("llm.default_model {default} is not one of the listed models"));

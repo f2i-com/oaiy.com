@@ -54,6 +54,60 @@ struct Inner {
     /// Model names served by the running process, default first.
     models: Vec<String>,
     command: String,
+    /// Launches still to try if this one dies while loading (auto: CUDA, then WebGPU).
+    fallbacks: Vec<Launch>,
+    /// Arguments, key and folder of the current launch, for a fallback.
+    relaunch: Option<(Vec<String>, String, PathBuf)>,
+}
+
+/// One way to start the server: the program and its `--backend`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Launch {
+    pub program: PathBuf,
+    pub backend: &'static str,
+}
+
+/// Whether an NVIDIA driver answers (`nvidia-smi -L` lists a GPU).
+fn nvidia_present() -> bool {
+    let mut c = Command::new("nvidia-smi");
+    c.arg("-L").stdin(Stdio::null()).stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        c.creation_flags(0x0800_0000);
+    }
+    c.output().is_ok_and(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).contains("GPU"))
+}
+
+/// Which server programs to try, in order, for `llm.backend`:
+/// - `cuda`: `llm.server` (the CUDA build);
+/// - `webgpu` / `cpu`: `llm.server_webgpu` (built without CUDA, so it starts on
+///   any machine);
+/// - `auto`: the CUDA build when an NVIDIA GPU answers and the program exists,
+///   falling back to the WebGPU build if it dies while loading; the WebGPU build
+///   (WebGPU, else CPU) otherwise.
+pub fn launches(llm: &Json, root: &Path, nvidia: bool) -> Vec<Launch> {
+    let cuda = config::program(root, str_or(llm, "server", "nrob-server"));
+    let portable = config::program(root, str_or(llm, "server_webgpu", "nrob-server-webgpu"));
+    match str_or(llm, "backend", "auto") {
+        "cuda" => vec![Launch { program: cuda, backend: "cuda" }],
+        "webgpu" => vec![Launch { program: portable, backend: "webgpu" }],
+        "cpu" => vec![Launch { program: portable, backend: "cpu" }],
+        _ => {
+            let mut plan = Vec::new();
+            if nvidia && cuda.is_file() {
+                plan.push(Launch { program: cuda.clone(), backend: "auto" });
+            }
+            if portable.is_file() || plan.is_empty() {
+                plan.push(Launch { program: portable, backend: "auto" });
+            }
+            // Neither built beside the studio: let the OS path find the CUDA build.
+            if !plan.iter().any(|l| l.program.is_file()) && !cuda.is_file() {
+                plan.insert(0, Launch { program: cuda, backend: "auto" });
+            }
+            plan
+        }
+    }
 }
 
 pub struct Llm {
@@ -168,6 +222,8 @@ impl Llm {
                 last_used: Instant::now(),
                 models: Vec::new(),
                 command: String::new(),
+                fallbacks: Vec::new(),
+                relaunch: None,
             }),
             changed: Condvar::new(),
             log: Arc::new(LogRing::new(2000)),
@@ -225,36 +281,32 @@ impl Llm {
         let key = random_id("sk-studio-");
         let gateway_host = cfg.get("gateway").map_or("127.0.0.1", |g| str_or(g, "host", "127.0.0.1"));
         let loopback = gateway_host == "localhost" || gateway_host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback());
-        let (args, names) = arguments(llm, root, port, &key, loopback)?;
-        let program: PathBuf = config::program(root, str_or(llm, "server", "nrob-server"));
-        let mut command = Command::new(&program);
-        command.args(&args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).current_dir(root);
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        let (mut args, names) = arguments(llm, root, port, &key, loopback)?;
+        if let Some(gb) = llm.get("webgpu_gb").and_then(Json::as_i64).filter(|n| *n > 0) {
+            args.push("--webgpu-gb".into());
+            args.push(gb.to_string());
         }
-        let shown: Vec<String> = args.iter().map(|a| if a == &key { "<key>".into() } else { a.clone() }).collect();
-        g.command = format!("{} {}", program.display(), shown.join(" "));
-        self.log.push(format!("studio: starting {}", g.command));
-        let mut child = match command.spawn() {
-            Ok(c) => c,
-            Err(e) => {
-                let msg = format!("could not start {}: {e} (is nrob-server built? set llm.server)", program.display());
+        let mut plan = launches(llm, root, nvidia_present());
+        let mut errors = Vec::new();
+        let mut child = loop {
+            if plan.is_empty() {
+                let msg = format!("could not start the LLM server: {} (build nrob-server or nrob-server-webgpu, or set llm.server)", errors.join("; "));
                 g.state = State::Failed;
                 g.error = Some(msg.clone());
                 self.changed.notify_all();
                 return Err(msg);
             }
-        };
-        for pipe in [child.stdout.take().map(|p| Box::new(p) as Box<dyn Read + Send>), child.stderr.take().map(|p| Box::new(p) as Box<dyn Read + Send>)].into_iter().flatten() {
-            let log = Arc::clone(&self.log);
-            std::thread::spawn(move || {
-                for line in BufReader::new(pipe).lines().map_while(Result::ok) {
-                    log.push(line);
+            let launch = plan.remove(0);
+            match self.spawn(&launch, &args, &key, root) {
+                Ok((child, shown)) => {
+                    g.command = shown;
+                    break child;
                 }
-            });
-        }
+                Err(e) => errors.push(e),
+            }
+        };
+        g.fallbacks = plan;
+        g.relaunch = Some((args.clone(), key.clone(), root.to_path_buf()));
         g.generation += 1;
         let generation = g.generation;
         g.lifeline = child.stdin.take();
@@ -272,14 +324,39 @@ impl Llm {
         let this = Arc::clone(self);
         std::thread::Builder::new()
             .name("llm-watch".into())
-            .spawn(move || this.watch(generation))
+            .spawn(move || Arc::clone(&this).watch(generation))
             .map_err(|e| e.to_string())?;
         Ok(())
     }
 
+    /// Start one launch: the process with piped output (read into the log) and
+    /// the stdin lifeline. Returns the child and the command line shown in logs.
+    fn spawn(&self, launch: &Launch, args: &[String], key: &str, root: &Path) -> Result<(Child, String), String> {
+        let mut command = Command::new(&launch.program);
+        command.args(args).args(["--backend", launch.backend]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).current_dir(root);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        }
+        let shown: Vec<String> = args.iter().map(|a| if a == key { "<key>".into() } else { a.clone() }).collect();
+        let shown = format!("{} {} --backend {}", launch.program.display(), shown.join(" "), launch.backend);
+        self.log.push(format!("studio: starting {shown}"));
+        let mut child = command.spawn().map_err(|e| format!("{}: {e}", launch.program.display()))?;
+        for pipe in [child.stdout.take().map(|p| Box::new(p) as Box<dyn Read + Send>), child.stderr.take().map(|p| Box::new(p) as Box<dyn Read + Send>)].into_iter().flatten() {
+            let log = Arc::clone(&self.log);
+            std::thread::spawn(move || {
+                for line in BufReader::new(pipe).lines().map_while(Result::ok) {
+                    log.push(line);
+                }
+            });
+        }
+        Ok((child, shown))
+    }
+
     /// Wait for the process to answer `/health` (which it does once its model has
     /// loaded), then keep watching for an exit nobody asked for.
-    fn watch(&self, generation: u64) {
+    fn watch(self: Arc<Self>, generation: u64) {
         loop {
             std::thread::sleep(Duration::from_millis(500));
             let (addr, ready) = {
@@ -291,6 +368,21 @@ impl Llm {
                 if let Some(status) = exited {
                     g.child = None;
                     g.lifeline = None;
+                    // Died while loading with another launch to try: e.g. the CUDA
+                    // build on a machine whose driver it cannot load.
+                    if g.state == State::Starting && !g.fallbacks.is_empty() {
+                        let next = g.fallbacks.remove(0);
+                        self.log.push(format!("studio: nrob-server exited ({status}) while loading; trying {}", next.program.display()));
+                        if let Some((args, key, root)) = g.relaunch.clone() {
+                            if let Ok((mut child, shown)) = self.spawn(&next, &args, &key, &root) {
+                                g.lifeline = child.stdin.take();
+                                g.child = Some(child);
+                                g.command = shown;
+                                g.started = Some(Instant::now());
+                                continue;
+                            }
+                        }
+                    }
                     g.state = State::Failed;
                     let tail = self.log.tail(12);
                     g.error = Some(format!("nrob-server exited ({status}):\n{tail}"));
@@ -353,6 +445,12 @@ impl Llm {
         }
     }
 
+    /// "WebGPU on …", "CUDA (2 card(s))" or "the CPU", as nrob-server reported it.
+    fn runs_on(&self) -> Option<String> {
+        let tail = self.log.tail(400);
+        tail.lines().rev().find_map(|l| l.split_once(" runs on ").map(|(_, on)| on.trim().to_string()))
+    }
+
     pub fn status(&self) -> Json {
         let g = self.lock();
         Json::obj([
@@ -364,6 +462,7 @@ impl Llm {
             ("load_seconds", g.ready_after.map_or(Json::Null, Json::Num)),
             ("idle_seconds", Json::Int(g.last_used.elapsed().as_secs() as i64)),
             ("command", Json::str(&g.command)),
+            ("runs_on", self.runs_on().map_or(Json::Null, Json::str)),
         ])
     }
 }
@@ -404,11 +503,27 @@ mod tests {
     }
 
     #[test]
+    fn auto_prefers_cuda_with_an_nvidia_gpu_and_falls_back_to_webgpu() {
+        let dir = std::env::temp_dir().join(format!("nrob-studio-launch-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = |n: &str| dir.join(if cfg!(windows) { format!("{n}.exe") } else { n.to_string() });
+        std::fs::write(exe("cuda-srv"), b"x").unwrap();
+        std::fs::write(exe("gpu-srv"), b"x").unwrap();
+        let llm = |backend: &str| Json::parse(format!(r#"{{"backend":"{backend}","server":"cuda-srv","server_webgpu":"gpu-srv"}}"#).as_bytes()).unwrap();
+        let names = |plan: Vec<Launch>| plan.into_iter().map(|l| (l.program.file_stem().unwrap().to_string_lossy().into_owned(), l.backend)).collect::<Vec<_>>();
+        assert_eq!(names(launches(&llm("auto"), &dir, true)), [("cuda-srv".into(), "auto"), ("gpu-srv".into(), "auto")]);
+        assert_eq!(names(launches(&llm("auto"), &dir, false)), [("gpu-srv".into(), "auto")]);
+        assert_eq!(names(launches(&llm("cpu"), &dir, true)), [("gpu-srv".into(), "cpu")]);
+        assert_eq!(names(launches(&llm("cuda"), &dir, false)), [("cuda-srv".into(), "cuda")]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn a_missing_server_fails_clearly_instead_of_hanging() {
         let llm = Arc::new(Llm::new());
-        let cfg = Json::parse(br#"{"gateway":{"host":"127.0.0.1"},"llm":{"server":"definitely-missing/nrob-server-x","models":[{"name":"m","path":"m.gguf"}]}}"#).unwrap();
+        let cfg = Json::parse(br#"{"gateway":{"host":"127.0.0.1"},"llm":{"backend":"cuda","server":"definitely-missing/nrob-server-x","models":[{"name":"m","path":"m.gguf"}]}}"#).unwrap();
         let err = llm.ensure_ready(&cfg, &std::env::temp_dir(), Duration::from_secs(5)).unwrap_err();
-        assert!(err.contains("could not start"), "{err}");
+        assert!(err.contains("could not start the LLM server"), "{err}");
         assert_eq!(llm.state(), State::Failed);
     }
 }

@@ -95,6 +95,11 @@ Every token is a small, well-planned job:
   trunk and reads routed experts on demand, with parallel positioned reads, into a
   bounded RAM cache. The same quantized kernels run on the streamed bytes, so the output
   is token-identical to loading everything.
+- **WebGPU and CPU for machines without CUDA.** `--webgpu` (and the
+  `nrob-server-webgpu` build) runs GGUF models' quantized matmuls on any Direct3D
+  12, Vulkan or Metal GPU, straight from the GGML blocks, with the rest on the
+  CPU. Weights past the GPU budget run on the CPU. In testing, greedy tokens
+  matched the CPU on 1B, 9B and 27B models. See [WEBGPU.md](docs/WEBGPU.md).
 - **CUDA.** `--cuda` runs GGUF models on the GPU, with GPU-side routing, grouped MoE
   kernels and a VRAM expert cache (`--vram-cache`) for streamed models. Token ids are
   bit-identical to the CPU path on every tested model. The default build is CPU-only
@@ -326,6 +331,7 @@ crates/
                  control UI, configurable OpenAI-style gateway, model detection
   nrob-diffusion/ image and video worker (Candle): Qwen Image, SDXL, LTX, with
                  SSD/RAM/GPU block residency
+  ggml-rs-wgpu/  WebGPU backend: quantized GGUF matmuls in WGSL, the rest on the CPU
   gguf, ggml-quants, ggml-rs, ggml-rs-cuda, tokenizer, llama-rs
                  our pure-Rust GGUF stack: reader, quant kernels, CPU and CUDA
                  backends, tokenizers, model architectures, expert streaming

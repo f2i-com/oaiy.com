@@ -9,6 +9,7 @@
     "port": 8080,
     "api_key": "",
     "public_url": "",
+    "routes_version": 2,
     "routes": [
       {
         "path": "/v1/chat/completions",
@@ -35,6 +36,13 @@
         "path": "/v1/images/generations",
         "method": "POST",
         "target": "images",
+        "spec": "openai",
+        "enabled": true
+      },
+      {
+        "path": "/v1/images/edits",
+        "method": "POST",
+        "target": "edits",
         "spec": "openai",
         "enabled": true
       },
@@ -72,6 +80,9 @@
     "enabled": true,
     "autostart": false,
     "server": "nrob-server",
+    "server_webgpu": "nrob-server-webgpu",
+    "backend": "auto",
+    "webgpu_gb": null,
     "default_model": "qwen3-8b",
     "models": [
       {

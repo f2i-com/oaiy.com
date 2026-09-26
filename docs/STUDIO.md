@@ -223,7 +223,7 @@ sections are:
 
 - `ui`: `host`, `port`, `open` (`app` | `browser` | `none`).
 - `gateway`: `host`, `port`, `api_key`, `public_url`, `routes`.
-- `llm`: `server`, `models` (`[{name, path, vision_projector?, lora?, enabled}]`),
+- `llm`: `server`, `server_webgpu`, `backend`, `webgpu_gb`, `models` (`[{name, path, vision_projector?, lora?, enabled}]`),
   `default_model`, `devices`, `ctx`, `ram_gb` (expert cache, 0 = 80% of free),
   `cpu_threads`, `vram_headroom_gb`, `thinking`, `max_tokens`, `temperature`,
   `top_p`, `prompt_cache`, `prompt_cache_gb`, `vision`, `autostart`,
@@ -239,12 +239,21 @@ sections are:
     `family` (`ltx-2.3` | `ltx-2.5` | `sulphur-2`), `transformer`, `vae`,
     `text_encoder` and `tokenizer` (not for 2.5).
 
+## Machines without CUDA
+
+`llm.backend` picks what the language model runs on: `auto` (default), `cuda`,
+`webgpu` or `cpu`. With `auto` the studio starts `llm.server` (the CUDA build)
+when an NVIDIA GPU answers. If that dies while loading, or there is no NVIDIA GPU,
+it starts `llm.server_webgpu` (`nrob-server-webgpu`, built without CUDA), which
+runs GGUF models on any WebGPU adapter and falls back to the CPU.
+`llm.webgpu_gb` caps the weights WebGPU holds; the rest run on the CPU. The
+Overview shows what the model runs on. See [WEBGPU.md](WEBGPU.md).
+
 ## Current limits
 
-- The engines need CUDA: `nrob-server` has never built without it, and LTX video
-  requires the CUDA worker. A CPU-only machine runs the studio, its UI and
-  (slowly) CPU image jobs from a non-CUDA `nrob-diffusion`, but no LLM serving:
-  `nrob` (the CLI) has CPU chat, not an HTTP server.
+- Without CUDA, only GGUF language models serve (DeepSeek and EXL3 checkpoints
+  are CUDA engines), and image and video jobs are CPU-only (LTX video needs the
+  CUDA worker). `media.llm_policy: auto` reasons about CUDA device indices.
 - One media job runs at a time; jobs queue. Only one language model is resident
   (nrob-server swaps on request).
 - The job list lives in memory: a restart forgets jobs, not their files.

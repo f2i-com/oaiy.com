@@ -88,7 +88,8 @@ impl Studio {
         let launch = |v: &Json| {
             let llm = v.get("llm").cloned().unwrap_or(Json::Null);
             let args = llm::arguments(&llm, &self.root, 0, "", true).map(|(a, _)| a).unwrap_or_default();
-            (args, str_or(&llm, "server", "").to_string(), bool_or(&llm, "enabled", true))
+            let backend = ["server", "server_webgpu", "backend"].map(|k| str_or(&llm, k, "").to_string());
+            (args, backend, llm.get("webgpu_gb").cloned(), bool_or(&llm, "enabled", true))
         };
         let llm_changed = launch(&before) != launch(&next);
         if llm_changed && self.llm.is_running() {

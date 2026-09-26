@@ -381,7 +381,14 @@ dialog::backdrop { background: rgba(10, 13, 17, .6); }
           <label class="f"><span>Temperature</span><input type="number" step="0.05" data-bind="llm.temperature" data-type="num"></label>
           <label class="f"><span>Top-p</span><input type="number" step="0.01" data-bind="llm.top_p" data-type="num"></label>
           <label class="f"><span>Prompt cache on disk (GB)</span><input type="number" step="0.5" data-bind="llm.prompt_cache_gb" data-type="num"></label>
+          <label class="f"><span>Runs on</span><select data-bind="llm.backend">
+            <option value="auto">Auto: CUDA, else WebGPU, else CPU</option>
+            <option value="cuda">CUDA (NVIDIA)</option>
+            <option value="webgpu">WebGPU (any GPU)</option>
+            <option value="cpu">CPU only</option></select></label>
+          <label class="f"><span>WebGPU weights (GB, empty = by GPU type)</span><input type="number" min="0" data-bind="llm.webgpu_gb" data-type="intnull" placeholder="8 discrete, 2 integrated"></label>
         </div>
+        <p class="muted small">WebGPU runs GGUF models on any Direct3D 12, Vulkan or Metal GPU: the quantized matmuls go to the GPU, everything else runs on the CPU, and weights past the limit stay in RAM. DeepSeek and EXL3 checkpoints need CUDA.</p>
         <div class="row" style="margin-top:14px; gap:22px">
           <label class="check"><input type="checkbox" data-bind="llm.enabled"> Enabled</label>
           <label class="check"><input type="checkbox" data-bind="llm.autostart"> Load at startup</label>
@@ -393,7 +400,8 @@ dialog::backdrop { background: rgba(10, 13, 17, .6); }
       <div class="block">
         <h2>Programs and folders</h2>
         <div class="grid-f" style="grid-template-columns:1fr">
-          <label class="f"><span>nrob-server</span><div class="pathfield"><input type="text" data-bind="llm.server"><button class="btn" type="button" data-pick="llm.server">Browse</button></div></label>
+          <label class="f"><span>nrob-server (CUDA build)</span><div class="pathfield"><input type="text" data-bind="llm.server"><button class="btn" type="button" data-pick="llm.server">Browse</button></div></label>
+          <label class="f"><span>nrob-server-webgpu (for machines without CUDA)</span><div class="pathfield"><input type="text" data-bind="llm.server_webgpu"><button class="btn" type="button" data-pick="llm.server_webgpu">Browse</button></div></label>
           <label class="f"><span>nrob-diffusion</span><div class="pathfield"><input type="text" data-bind="media.worker"><button class="btn" type="button" data-pick="media.worker">Browse</button></div></label>
           <label class="f"><span>FFmpeg</span><div class="pathfield"><input type="text" data-bind="media.video.ffmpeg"><button class="btn" type="button" data-pick="media.video.ffmpeg">Browse</button></div></label>
           <label class="f"><span>Output folder</span><div class="pathfield"><input type="text" data-bind="media.output_dir"><button class="btn" type="button" data-pick="media.output_dir" data-dir="1">Browse</button></div></label>
@@ -794,7 +802,7 @@ function renderState() {
   const l = state.llm;
   const label = {stopped: "Stopped", starting: "Loading", ready: "Ready", failed: "Failed"}[l.state];
   $("#llm-tag").innerHTML = `<span class="tag ${l.state === "ready" ? "good" : l.state === "failed" ? "bad" : ""}">${label}</span>`;
-  $("#llm-detail").textContent = l.state === "ready" ? `Serving ${l.models.join(", ")}. Loaded in ${l.load_seconds?.toFixed(1)} s, idle ${l.idle_seconds} s.`
+  $("#llm-detail").textContent = l.state === "ready" ? `Serving ${l.models.join(", ")} on ${l.runs_on || "the GPU"}. Loaded in ${l.load_seconds?.toFixed(1)} s, idle ${l.idle_seconds} s.`
     : l.state === "starting" ? `Loading ${l.models[0] || ""}...` : l.state === "failed" ? l.error : l.paused_for_media ? "Paused while a media job uses its GPU." : "Not running. It starts on the first chat request.";
   $("#llm-start").disabled = l.state === "ready" || l.state === "starting";
   $("#llm-restart").disabled = l.state !== "ready";
