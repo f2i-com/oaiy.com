@@ -574,8 +574,9 @@ fn prepare_video(c: &Config, body: &Json) -> Result<Json, String> {
         }
         fields.push((key.into(), Json::str(value)));
     }
-    // LTX 2.5 models with an `audio_vae` generate a soundtrack unless asked not to.
-    let audio_vae = selected.get("audio_vae").and_then(Json::as_str).filter(|_| model == "ltx-2.5");
+    // Models with an `audio_vae` generate a soundtrack unless asked not to
+    // (for LTX 2.3 and Sulphur it is the checkpoint itself).
+    let audio_vae = selected.get("audio_vae").and_then(Json::as_str);
     if let Some(value) = audio_vae {
         let path = Path::new(value);
         if !path.is_absolute() || !path.is_file() {

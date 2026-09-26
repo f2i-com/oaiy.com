@@ -172,7 +172,8 @@ fn hidden_features(
 }
 
 /// Prompt features for the video stream, and for the audio stream when
-/// `audio` (LTX 2.5: Gemma 4's `audio_aggregate_embed`).
+/// `audio`. The aggregate projections sit in the Gemma 4 file for LTX 2.5,
+/// and in the transformer checkpoint (`projection`) for LTX 2.3 and Sulphur.
 #[allow(clippy::too_many_arguments)]
 pub fn encode(
     path: &Path,
@@ -222,12 +223,12 @@ pub fn encode(
     };
     let video = w.linear("video_aggregate_embed", &stacked)?;
     let audio = if audio {
-        if !gemma4 {
-            candle_core::bail!("audio prompt features need the LTX 2.5 Gemma 4 encoder");
-        }
-        let w = store.group("text_embedding_projection.", dev, false, |k| {
-            k.starts_with("audio_aggregate_embed.")
-        })?;
+        let select = |k: &str| k.starts_with("audio_aggregate_embed.");
+        let w = if gemma4 {
+            store.group("text_embedding_projection.", dev, false, select)?
+        } else {
+            projection.group("text_embedding_projection.", dev, false, select)?
+        };
         Some(w.linear("audio_aggregate_embed", &(&normed * (2048f64 / 3840.).sqrt())?)?)
     } else {
         None

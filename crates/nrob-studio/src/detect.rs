@@ -309,12 +309,12 @@ fn classify_header(h: &Header, path: &Path, format: &'static str) -> Result<Dete
     if let Some(family) = ltx_family(h) {
         // Parts of an LTX release that the worker has no use for.
         if config.contains("\"audio_vae\"") || has(h, "audio_vae.decoder.") {
-            // LTX 2.5 ships the vocoder with its bandwidth extension beside the decoder.
-            if family == "ltx-2.5" && has(h, "vocoder.bwe_generator.") {
+            // The vocoder must come with its bandwidth extension (48 kHz output).
+            if has(h, "vocoder.bwe_generator.") {
                 return Ok(detected(Role::Component { kind: "audio_vae" }, format,
-                    format!("LTX 2.5 audio VAE and vocoder ({label}); gives LTX 2.5 clips a soundtrack"), vec![("audio_vae", p)]));
+                    format!("LTX {} audio VAE and vocoder ({label}); gives LTX clips a soundtrack", &family[4..]), vec![("audio_vae", p)]));
             }
-            return Err(format!("{label}: an LTX {} audio VAE; nrob generates audio with LTX 2.5 models only", &family[4..]));
+            return Err(format!("{label}: an LTX audio VAE without the bandwidth-extension vocoder nrob needs"));
         }
         if config.contains("CausalDiffusionVAE") || has(h, "decoder.diff_blocks.") {
             return Err(format!("{label}: LTX {} diffusion-decoder VAE, which nrob does not run; use the conv VAE (ltx-2.5-video-vae-conv) instead", &family[4..]));
@@ -330,7 +330,11 @@ fn classify_header(h: &Header, path: &Path, format: &'static str) -> Result<Dete
             let family = if family == "ltx-2.3" && label.to_ascii_lowercase().contains("sulphur") { "sulphur-2" } else { family };
             let mut fields = vec![("family", Json::str(family)), ("transformer", p.clone())];
             if vae {
-                fields.push(("vae", p));
+                fields.push(("vae", p.clone()));
+            }
+            // LTX 2.3 releases (and Sulphur) also carry the audio VAE and vocoder.
+            if has(h, "audio_vae.decoder.") && has(h, "vocoder.bwe_generator.") {
+                fields.push(("audio_vae", p));
             }
             let title = if family == "sulphur-2" { "Sulphur 2 (LTX 2.3)".to_string() } else { format!("LTX {}", &family[4..]) };
             let mut d = detected(Role::Video { family }, format, format!("{title} video transformer ({label})"), fields);
@@ -607,6 +611,12 @@ mod tests {
         assert_eq!(ltx.role, Role::Video { family: "ltx-2.3" });
         assert!(ltx.fields.iter().any(|(k, _)| k == "vae"));
         assert!(ltx.missing.contains(&"tokenizer".to_string()));
+        assert!(!ltx.fields.iter().any(|(k, _)| k == "audio_vae"), "no audio parts, no audio VAE");
+        // An LTX 2.3 release with its audio VAE and vocoder is its own audio VAE too.
+        let av = d.0.join("ltx-av.safetensors");
+        safetensors(&av, r#"{"__metadata__":{"model_version":"2.3.0","config":"{\"transformer\":{},\"vae\":{}}"},"transformer_blocks.0.x":{"dtype":"BF16","shape":[1],"data_offsets":[0,2]},"audio_vae.decoder.conv_in.conv.bias":{"dtype":"BF16","shape":[1],"data_offsets":[2,4]},"vocoder.bwe_generator.conv_pre.weight":{"dtype":"BF16","shape":[1],"data_offsets":[4,6]}}"#);
+        let r = detect(&av).unwrap();
+        assert!(r.fields.iter().any(|(k, v)| k == "audio_vae" && v.as_str().is_some_and(|s| s.ends_with("ltx-av.safetensors"))));
         let bin = d.0.join("model.bin");
         std::fs::write(&bin, b"x").unwrap();
         assert!(detect(&bin).unwrap_err().contains("pickled"));

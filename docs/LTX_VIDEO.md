@@ -1,8 +1,8 @@
 # Native LTX video
 
 The `nrob-diffusion` worker implements text-to-video and image-to-video with optional start/end images for distilled
-LTX 2.3, LTX 2.5 and Sulphur-2 checkpoints in Rust. LTX 2.5 clips also get a
-soundtrack generated with the picture (see [Audio](#audio-ltx-25)). Candle supplies tensor
+LTX 2.3, LTX 2.5 and Sulphur-2 checkpoints in Rust. Clips also get a
+soundtrack generated with the picture (see [Audio](#audio)). Candle supplies tensor
 operations and CUDA kernels. Gemma text encoding, the video transformer,
 eight-step Euler sampling and the convolutional VAE run inside the worker.
 FFmpeg only encodes the decoded pixels into an H.264 MP4; it does not run models.
@@ -178,8 +178,8 @@ GPU residency, 63 seconds with RAM offload, and 106 seconds with direct weight
 reads. The three modes produced byte-identical MP4 files for the same prompt
 and seed. These are individual measurements with warm file caches and concurrent
 model downloads, not guaranteed latency. GPU denoising took about 14 seconds;
-text encoding remained a substantial part of total time. (Sulphur and LTX 2.3
-clips are silent.)
+text encoding remained a substantial part of total time. (These clips were
+made before audio support.)
 
 A repeated-prompt image-to-video run after these changes took 17.7 seconds for
 512×320, 49 frames on the second RTX 5090: 0.51 seconds for the starting image,
@@ -206,15 +206,17 @@ residency. `weight_bytes_read` counts checkpoint bytes requested by that store,
 including conditioning projections/connectors; it is not physical disk traffic
 and excludes the separate Gemma/VAE readers.
 
-## Audio (LTX 2.5)
+## Audio
 
-LTX 2.5 is an audio-video model: every transformer block carries an audio
-stream (2048 wide, 32 heads of 64) next to the video stream. The two streams
+LTX 2.3, LTX 2.5 and Sulphur are audio-video models: every transformer block
+carries an audio stream (2048 wide, 32 heads of 64) next to the video stream. The two streams
 attend to each other both ways. When the request names the model's `audio_vae`,
 the worker generates both streams together:
 
-- **Text:** Gemma 4's `audio_aggregate_embed` and the transformer's
-  `audio_embeddings_connector` produce the audio prompt context. It is cached
+- **Text:** the `audio_aggregate_embed` projection and the transformer's
+  `audio_embeddings_connector` produce the audio prompt context. For LTX 2.5
+  the projection is in the Gemma 4 file; for LTX 2.3 and Sulphur it is in the
+  checkpoint. It is cached
   alongside the video context.
 - **Latent:** a noise latent of 25 frames per second of video, 128 wide,
   denoised on the same eight-step schedule in the same transformer calls. A
@@ -228,8 +230,8 @@ Request fields:
 
 | Field | Meaning |
 |---|---|
-| `audio_vae` | The release's audio VAE file (`audio_vae.*` plus `vocoder.*`, LTX 2.5 layout). |
-| `audio` | `true` or `false`. It defaults to on for `ltx-2.5` whenever `audio_vae` is given. |
+| `audio_vae` | A file with `audio_vae.*` plus `vocoder.*` (with its bandwidth extension). LTX 2.3 and Sulphur checkpoints carry these, so for them it is the checkpoint itself; LTX 2.5 ships it separately. The audio VAEs of all three are the same layout, and in the releases tested, the same weights. |
+| `audio` | `true` or `false`. It defaults to on whenever `audio_vae` is given. |
 
 The result reports `audio`, `sample_rate` and `audio_seconds`.
 
@@ -245,8 +247,7 @@ may document `[VISUAL]`, `[SPEECH]` and `[SOUNDS]` sections.
 
 Limits: the official LTX 2.5 pipeline samples its first stage ancestrally and
 refines at a second stage. This worker is single-stage Euler (as for video),
-which may cost some audio fidelity. Audio for LTX 2.3 and Sulphur is not
-implemented.
+which may cost some audio fidelity.
 
 ## Verification
 
@@ -272,7 +273,13 @@ the official checkout (strict F32, TF32 off). The opt-in tests are
 | Audio text connector | 0.45% |
 
 The last three run the official BF16 transformer as the reference, cut to its
-first two blocks. The video-only path is unchanged by the audio work: the
+first two blocks. The same tests against the LTX 2.3 checkpoint:
+
+- first block: 0.03% (video), 0.07% (audio);
+- velocities: 0.37% (video), 0.28% (audio);
+- connector: 0.50%.
+
+The audio VAE inside the LTX 2.3 checkpoint decodes identically. The video-only path is unchanged by the audio work: the
 existing video tests produce identical numbers before and after.
 
 Quantized weights are covered separately:

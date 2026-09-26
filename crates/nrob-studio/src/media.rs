@@ -492,9 +492,9 @@ pub fn video_request(cfg: &Json, root: &Path, output_root: &Path, body: &Json, a
             None => return Err(format!("video model {name} needs {key}")),
         }
     }
-    // A soundtrack comes with LTX 2.5 models that have their audio VAE, unless
-    // the request says `"audio": false`.
-    let audio_vae = if family == "ltx-2.5" { path_field(root, model, "audio_vae") } else { None };
+    // A soundtrack comes with models that have their audio VAE (LTX 2.3 and
+    // Sulphur checkpoints are their own), unless the request says `"audio": false`.
+    let audio_vae = path_field(root, model, "audio_vae");
     match body.get("audio") {
         None | Some(Json::Null) => {}
         Some(Json::Bool(false)) => f.push(("audio".into(), Json::Bool(false))),

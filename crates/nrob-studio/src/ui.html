@@ -514,7 +514,7 @@ dialog::backdrop { background: var(--backdrop); }
               <div class="grid-f" style="grid-template-columns:1fr 1fr">
                 <label class="f"><span>Length (seconds)</span><input type="number" id="vid-secs" min="0.5" max="5" step="0.5" value="2"></label>
                 <label class="f"><span>Seed</span><input type="number" id="vid-seed" min="0" placeholder="random"></label>
-                <label class="check" id="vid-sound-row" title="LTX 2.5 models with an audio VAE generate a soundtrack with the picture"><input type="checkbox" id="vid-sound" checked> Sound</label>
+                <label class="check" id="vid-sound-row" title="Models with an audio VAE generate a soundtrack with the picture"><input type="checkbox" id="vid-sound" checked> Sound</label>
               </div>
               <input type="file" id="vid-image" accept="image/png,image/jpeg,image/webp" hidden>
               <div class="dropzone" id="vid-drop" tabindex="0" role="button" aria-label="Drop a start frame here, or click to choose (optional)">
@@ -1029,7 +1029,7 @@ function renderModels() {
   $("#m-video").innerHTML = vid.length ? vid.map(([name, m]) => {
     const miss = missingOf("video", m);
     const fields = ["transformer", "vae", "text_encoder", "tokenizer", "audio_vae"]
-      .filter(k => (k !== "tokenizer" || m.family !== "ltx-2.5") && (k !== "audio_vae" || m.family === "ltx-2.5"))
+      .filter(k => k !== "tokenizer" || m.family !== "ltx-2.5")
       .map(k => field({transformer: "Transformer", vae: "VAE", text_encoder: "Text encoder (Gemma)", tokenizer: "Gemma tokenizer.json", audio_vae: "Audio VAE (optional, for sound)"}[k], "video", name, k, m[k], {missing: miss.includes(k)})).join("");
     return mediaItem("video", name, m, (m.family || name).toUpperCase().replace("SULPHUR", "Sulphur"), miss, fields);
   }).join("") : '<div class="empty">No video model yet. Add an LTX 2.3, LTX 2.5 or Sulphur .safetensors file.</div>';
@@ -1391,11 +1391,11 @@ function dropzone(k, input, max) {
 }
 const clearImgRefs = dropzone("img", $("#img-refs"), 3);
 const clearVidRef = dropzone("vid", $("#vid-image"), 1);
-// Sound is offered for LTX 2.5 models that have their audio VAE.
+// Sound is offered for models that have their audio VAE.
 function soundCapable() {
   const name = $("#vid-model").value || cfg?.media?.video?.default_model;
   const m = cfg?.media?.video?.models?.[name];
-  return !!(m && m.family === "ltx-2.5" && m.audio_vae);
+  return !!(m && m.audio_vae);
 }
 function renderSound() { $("#vid-sound-row").hidden = !soundCapable(); }
 $("#vid-model").addEventListener("change", renderSound);

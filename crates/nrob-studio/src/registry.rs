@@ -135,7 +135,7 @@ fn companion(cfg: &Json, section: &str, entry: &Json, missing: &str, picked: &Pa
         ("image", "tokenizer") => &|d| d.kind() == "clip_tokenizer",
         ("video", "tokenizer") => &|d| d.kind() == "tokenizer",
         ("video", "vae") => &|d| d.kind() == "vae",
-        ("video", "audio_vae") if family == "ltx-2.5" => &|d| d.kind() == "audio_vae",
+        ("video", "audio_vae") => &|d| d.kind() == "audio_vae",
         ("video", "text_encoder") if family == "ltx-2.5" => &|d| d.kind() == "video_text_encoder" && d.summary.contains("2.5"),
         ("video", "text_encoder") => &|d| d.kind() == "video_text_encoder" && !d.summary.contains("2.5"),
         _ => return None,
@@ -158,18 +158,19 @@ fn attach(cfg: &mut Json, d: &Detected, target: Option<(&str, &str)>) -> Result<
         "tokenizer" => ("video", "tokenizer", Box::new(|m| str_or(m, "family", "") != "ltx-2.5")),
         "vae" => ("video", "vae", Box::new(|_| true)),
         "audio_vae" => {
-            // One vocoder serves every LTX 2.5 model: each that lacks it gets it.
+            // One vocoder serves every LTX model (their audio VAEs share one
+            // layout): each that lacks it gets it.
             let value = field_of(d, "audio_vae").ok_or("detected part has no path")?;
             let Some(Json::Obj(models)) = obj_mut(cfg, &["media", "video", "models"]) else { return Err("no video models".into()) };
             let mut named = None;
             for (n, m) in models.iter_mut() {
                 let chosen = target.is_some_and(|(_, t)| n == t);
-                if str_or(m, "family", "") == "ltx-2.5" && (chosen || str_or(m, "audio_vae", "").trim().is_empty()) {
+                if (chosen || str_or(m, "audio_vae", "").trim().is_empty()) && !str_or(m, "transformer", "").is_empty() {
                     set(m, "audio_vae", value.clone());
                     named.get_or_insert_with(|| n.clone());
                 }
             }
-            let name = named.ok_or_else(|| format!("{}: add an LTX 2.5 model first", d.summary))?;
+            let name = named.ok_or_else(|| format!("{}: add an LTX video model first", d.summary))?;
             return Ok(Added { section: "video", name, missing: Vec::new(), enabled: true });
         }
         "video_text_encoder" => {
@@ -296,8 +297,8 @@ pub fn add(cfg: &mut Json, path: &Path, name: Option<&str>, target: Option<(&str
                     set(&mut entry, &m, v);
                 }
             }
-            if section == "video" && str_or(&entry, "family", "") == "ltx-2.5" && str_or(&entry, "audio_vae", "").is_empty() {
-                // Optional: the soundtrack's decoder, from another LTX 2.5 model or nearby.
+            if section == "video" && str_or(&entry, "audio_vae", "").is_empty() {
+                // Optional: the soundtrack's decoder, from another LTX model or nearby.
                 if let Some(a) = companion(cfg, "video", &entry, "audio_vae", path) {
                     set(&mut entry, "audio_vae", a);
                 }
