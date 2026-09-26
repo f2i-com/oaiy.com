@@ -323,7 +323,12 @@ Saving a non-loopback `ui.host` is refused until `gateway.api_key` is set.
 The gateway is reachable by web pages too, so without an API key it refuses
 browser requests (those carrying `Origin`) from origins not listed in
 `gateway.cors_origins` (`*` allows any). Apps and SDKs outside a browser are
-unaffected. nrob-server is always started with `--local-images off`, so nothing
+unaffected. The list starts with bot.computer's origins: the web app
+(`https://bot.computer`), bot.computer served on this machine
+(`http://localhost:5317`, `http://127.0.0.1:5317`) and its desktop app
+(`http://botcomputer.localhost` on Windows, `botcomputer://localhost` on macOS and Linux).
+A configuration written before that gains them once (`origins_version`);
+remove any you do not want and they stay removed. nrob-server is always started with `--local-images off`, so nothing
 reaching the gateway can have the vision model read files from this machine.
 
 `nrob-server` runs on a private loopback port with a random key and is started

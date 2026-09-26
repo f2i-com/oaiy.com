@@ -207,8 +207,10 @@ pub fn reason(status: u16) -> &'static str {
 }
 
 // `Authorization` is named: the `*` wildcard never covers it, so browser
-// clients sending an API key would fail their preflight.
-const COMMON: &str = "Access-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: Authorization, Content-Type, *\r\nAccess-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS\r\n";
+// clients sending an API key would fail their preflight. Chrome also asks a
+// loopback server before a page from the internet may reach it (Private
+// Network Access); which origins are served is still the gateway's decision.
+const COMMON: &str = "Access-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: Authorization, Content-Type, *\r\nAccess-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS\r\nAccess-Control-Allow-Private-Network: true\r\n";
 
 /// Only the head of a response whose `len`-byte body the caller writes next
 /// (a file copied in pieces rather than read whole).

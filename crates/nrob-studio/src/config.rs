@@ -31,7 +31,8 @@ pub const DEFAULT: &str = r#"{
     "port": 8080,
     "api_key": "",
     "public_url": "",
-    "cors_origins": [],
+    "cors_origins": ["https://bot.computer", "http://localhost:5317", "http://127.0.0.1:5317", "http://botcomputer.localhost", "botcomputer://localhost"],
+    "origins_version": 1,
     "routes_version": 3,
     "routes": [
       { "path": "/v1/chat/completions", "method": "POST", "target": "chat", "spec": "openai", "enabled": true },
@@ -148,6 +149,39 @@ pub fn upgrade_routes(v: &mut Json) -> bool {
     true
 }
 
+/// Browser apps allowed by default (`gateway.cors_origins`): bot.computer on
+/// the web, served on this machine (`npm start`, port 5317), and as the desktop
+/// app (its own scheme: on Windows, then on macOS and Linux).
+pub const COMPANION_ORIGINS: [&str; 5] = ["https://bot.computer", "http://localhost:5317", "http://127.0.0.1:5317", "http://botcomputer.localhost", "botcomputer://localhost"];
+
+/// Companion origins for files written before they were defaults
+/// (`origins_version` records that they were offered once, so an origin the
+/// user removes stays removed). Returns whether anything changed.
+pub fn upgrade_origins(v: &mut Json) -> bool {
+    const VERSION: i64 = 1;
+    let Json::Obj(top) = v else { return false };
+    let Some((_, gateway)) = top.iter_mut().find(|(k, _)| k == "gateway") else { return false };
+    if int_or(gateway, "origins_version", 0) >= VERSION {
+        return false;
+    }
+    let Json::Obj(fields) = gateway else { return false };
+    // A file without the list gets the defaults' list when they are filled in.
+    if let Some((_, Json::Arr(origins))) = fields.iter_mut().find(|(k, _)| k == "cors_origins") {
+        if !origins.iter().any(|o| o.as_str() == Some("*")) {
+            for origin in COMPANION_ORIGINS {
+                if !origins.iter().any(|o| o.as_str().is_some_and(|s| s.trim_end_matches('/').eq_ignore_ascii_case(origin))) {
+                    origins.push(Json::str(origin));
+                }
+            }
+        }
+    }
+    match fields.iter_mut().find(|(k, _)| k == "origins_version") {
+        Some((_, n)) => *n = Json::Int(VERSION),
+        None => fields.push(("origins_version".into(), Json::Int(VERSION))),
+    }
+    true
+}
+
 /// Where the configuration lives: `--config`, else beside the executable.
 pub fn default_path() -> PathBuf {
     exe_dir().join(FILE_NAME)
@@ -171,6 +205,7 @@ pub fn load(path: &Path) -> Result<Json, String> {
     let mut v = Json::parse(&bytes).map_err(|e| format!("{}: {e}", path.display()))?;
     // Before the defaults fill in, so a file without `routes_version` is seen as old.
     let upgraded = upgrade_routes(&mut v);
+    let upgraded = upgrade_origins(&mut v) || upgraded;
     merge_defaults(&mut v, &default_json());
     if upgraded {
         save(path, &v)?;
@@ -446,6 +481,33 @@ mod tests {
         assert!(upgrade_routes(&mut v2));
         assert_eq!(v2.get("gateway").unwrap().get("routes").unwrap().len(), 1);
         assert!(!upgrade_routes(&mut v), "a second load changes nothing");
+        validate(&v).unwrap();
+    }
+
+    #[test]
+    fn companion_origins_are_defaults_and_reach_older_files_once() {
+        let defaults = default_json();
+        let listed: Vec<&str> = defaults.get("gateway").unwrap().get("cors_origins").unwrap().as_array().unwrap().iter().filter_map(Json::as_str).collect();
+        assert_eq!(listed, COMPANION_ORIGINS);
+        // A file written with the old empty default gains them, beside the user's own.
+        let mut v = Json::parse(br#"{"gateway":{"cors_origins":["http://localhost:3000","https://BOT.computer/"],"routes":[]}}"#).unwrap();
+        assert!(upgrade_origins(&mut v));
+        merge_defaults(&mut v, &default_json());
+        let origins: Vec<&str> = v.get("gateway").unwrap().get("cors_origins").unwrap().as_array().unwrap().iter().filter_map(Json::as_str).collect();
+        assert_eq!(origins, ["http://localhost:3000", "https://BOT.computer/", "http://localhost:5317", "http://127.0.0.1:5317", "http://botcomputer.localhost", "botcomputer://localhost"]);
+        // Once offered, a removed origin stays removed.
+        if let Json::Obj(top) = &mut v {
+            if let Some((_, Json::Obj(g))) = top.iter_mut().find(|(k, _)| k == "gateway") {
+                if let Some((_, Json::Arr(o))) = g.iter_mut().find(|(k, _)| k == "cors_origins") {
+                    o.retain(|x| x.as_str() != Some("botcomputer://localhost"));
+                }
+            }
+        }
+        assert!(!upgrade_origins(&mut v));
+        // "*" already allows everything: nothing is added to it.
+        let mut any = Json::parse(br#"{"gateway":{"cors_origins":["*"]}}"#).unwrap();
+        assert!(upgrade_origins(&mut any));
+        assert_eq!(any.get("gateway").unwrap().get("cors_origins").unwrap().len(), 1);
         validate(&v).unwrap();
     }
 
