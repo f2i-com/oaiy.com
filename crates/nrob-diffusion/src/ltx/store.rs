@@ -158,6 +158,14 @@ impl Store {
         }
         Ok(t)
     }
+    /// A tensor at full precision (the audio decoder and vocoder run in F32).
+    pub fn tensor_f32(&mut self, key: &str, dev: &Device) -> Result<Tensor> {
+        let info = self.index.info(key).map_err(candle_core::Error::wrap)?.clone();
+        let scale = self.scale(key)?;
+        let bytes = self.index.read(key).map_err(candle_core::Error::wrap)?;
+        self.disk_bytes += bytes.len() as u64;
+        decode_as(key, info.dtype, &info.shape, &bytes, scale.as_deref(), dev, DType::F32)
+    }
     /// Fetch only prompt vocabulary rows, avoiding a multi-gigabyte embedding upload.
     pub fn rows(&mut self, key: &str, ids: &[u32], dev: &Device) -> Result<Tensor> {
         use std::io::{Read, Seek, SeekFrom};
@@ -323,6 +331,10 @@ fn e4m3_table() -> &'static [f32; 256] {
 /// (which candle has no type for) goes up as bytes and is re-signed there.
 /// `scale` is one value for the whole tensor or one per row.
 fn decode(key: &str, dtype: Dtype, shape: &[usize], bytes: &[u8], scale: Option<&[f32]>, dev: &Device) -> Result<Tensor> {
+    decode_as(key, dtype, shape, bytes, scale, dev, DType::BF16)
+}
+
+fn decode_as(key: &str, dtype: Dtype, shape: &[usize], bytes: &[u8], scale: Option<&[f32]>, dev: &Device, out: DType) -> Result<Tensor> {
     let t = match dtype {
         Dtype::BF16 => Tensor::from_raw_buffer(bytes, DType::BF16, shape, dev)?,
         Dtype::F16 => Tensor::from_raw_buffer(bytes, DType::F16, shape, dev)?,
@@ -354,7 +366,7 @@ fn decode(key: &str, dtype: Dtype, shape: &[usize], bytes: &[u8], scale: Option<
         }
         Some(s) => candle_core::bail!("LTX tensor {key}: {} scales for shape {shape:?}", s.len()),
     };
-    t.to_dtype(DType::BF16)
+    t.to_dtype(out)
 }
 
 pub struct Group {
