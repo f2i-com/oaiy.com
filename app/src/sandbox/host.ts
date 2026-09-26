@@ -187,6 +187,8 @@ export class SandboxHost implements HostHandler {
 
   private grep(req: { pattern: string; path?: string; ignore_case?: boolean; glob?: string | null; exclude_dir?: string | null; max_results?: number; files_only?: boolean }) {
     let regex: RegExp;
+    // The search runs on the page's thread: a long pattern or a huge line is where a regex can hang it.
+    if (req.pattern.length > 1000) throw new SyntaxError('the pattern is too long (at most 1000 characters)');
     try {
       regex = new RegExp(req.pattern, req.ignore_case ? 'i' : '');
     } catch (error) {

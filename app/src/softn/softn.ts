@@ -10,7 +10,8 @@
  * Paths inside an app are relative to its folder. The rules here follow
  * softn.com's Studio (exportBundle.ts planBundle, validator.ts), Apache-2.0.
  */
-import { unzipSync, zipSync } from 'fflate';
+import { zipSync } from 'fflate';
+import { unzipChecked } from '../vfs/transfer';
 import { IGNORED_DIRS, normalizePath, type Vfs } from '../vfs/vfs';
 import { SOFTN_GUIDE_JAVASCRIPT, SOFTN_GUIDE_PYTHON } from './guide.generated';
 import { NetGate } from '../gate/netgate';
@@ -116,6 +117,8 @@ export function appFiles(vfs: Vfs, root = ''): Array<[string, Uint8Array]> {
     .filter(([path]) => {
       const segs = path.split('/');
       if (segs[0] === 'builder') return false;
+      // Uploads to the project are not the app's (an app at the root would otherwise ship them).
+      if (root === '' && segs[0] === 'uploads') return false;
       return !segs.some((s, i) => s.startsWith('.') || (i < segs.length - 1 && IGNORED_DIRS.has(s)));
     });
 }
@@ -188,7 +191,7 @@ export function downloadSoftn(vfs: Vfs, root: string, fallbackName: string): str
 export function importSoftn(vfs: Vfs, bytes: Uint8Array, fileName: string, parent = ''): { root: string; files: number; name: string } {
   let entries: Record<string, Uint8Array>;
   try {
-    entries = unzipSync(bytes);
+    entries = unzipChecked(bytes);
   } catch (error) {
     throw new Error(`${fileName} is not a .softn (zip) file: ${(error as Error).message}`);
   }

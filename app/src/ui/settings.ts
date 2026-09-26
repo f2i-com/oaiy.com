@@ -88,6 +88,8 @@ export function openSettings(initial: SettingsResult): Promise<SettingsResult | 
       const note = h('div.form-note');
       const kind = h('select', { onchange: () => {
         const k = KINDS.find((x) => x.value === kind.value)!;
+        // A key is for the service it came from: never send it to another one.
+        if (k.type !== p.type || k.serverKind !== p.serverKind) p.apiKey = '';
         p.type = k.type;
         p.serverKind = k.serverKind;
         p.baseUrl = defaultBaseUrl(k.type, k.serverKind);

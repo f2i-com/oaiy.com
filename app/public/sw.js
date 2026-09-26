@@ -10,6 +10,8 @@
  * Requests to other origins (AI providers, the sandbox's gated fetches) are
  * never cached or touched.
  */
+// The build stamps its own name here (vite.config.ts), so a new version gets a
+// fresh cache: the app, the Zipp engine and the rest always come from the same build.
 const CACHE = 'bot.computer-v1';
 const SCOPE = new URL(self.registration.scope);
 const PRECACHE = ['./', './index.html', './manifest.webmanifest', './icon.svg', './zipp/zipp_wasm.js', './zipp/zipp_wasm_bg.wasm'];
@@ -63,14 +65,17 @@ self.addEventListener('fetch', (event) => {
   event.respondWith(
     (async () => {
       const cache = await caches.open(CACHE);
-      const key = request.mode === 'navigate' ? new URL('./index.html', SCOPE).href : request;
+      // Only the app's own page is the app shell. Other pages opened on this site
+      // (the SoftN runtime, an icon opened in a tab, the preview frame) are cached as themselves.
+      const shell = request.mode === 'navigate' && request.destination === 'document' && (url.pathname === SCOPE.pathname || url.pathname === `${SCOPE.pathname}index.html`);
+      const key = shell ? new URL('./index.html', SCOPE).href : request;
       const network = fetch(request)
         .then((response) => {
           if (response.ok && response.type === 'basic') cache.put(key, response.clone());
           return response;
         })
         .catch(() => null);
-      // The page itself: fresh when online, cached when not.
+      // A page: fresh when online, cached when not.
       if (request.mode === 'navigate') return isolate((await network) ?? (await cache.match(key)) ?? new Response('offline', { status: 503 }));
       const cached = await cache.match(key);
       if (cached) {

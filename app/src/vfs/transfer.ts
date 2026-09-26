@@ -85,8 +85,28 @@ export async function importFileList(list: FileList): Promise<Imported> {
   return { name, files, skipped };
 }
 
+/**
+ * Unpack an archive, refusing one whose contents would pass the import limits
+ * before any of it is inflated (fflate reports each entry's size first).
+ * Dependency and build folders are left packed.
+ */
+export function unzipChecked(bytes: Uint8Array, skip: (name: string) => boolean = () => false): Record<string, Uint8Array> {
+  let total = 0;
+  let count = 0;
+  return unzipSync(bytes, {
+    filter: (entry) => {
+      if (entry.name.endsWith('/') || skip(entry.name)) return false;
+      total += entry.originalSize;
+      count++;
+      if (count > MAX_IMPORT_FILES) throw new Error(`the archive holds more than ${MAX_IMPORT_FILES.toLocaleString()} files`);
+      if (total > MAX_IMPORT_BYTES * 2) throw new Error(`the archive unpacks to more than ${Math.round((MAX_IMPORT_BYTES * 2) / 2 ** 20)} MB`);
+      return true;
+    },
+  });
+}
+
 export async function importZip(file: File): Promise<Imported> {
-  const entries = unzipSync(new Uint8Array(await file.arrayBuffer()));
+  const entries = unzipChecked(new Uint8Array(await file.arrayBuffer()), (name) => name.split('/').slice(0, -1).some((seg) => IGNORED_DIRS.has(seg)));
   const names = Object.keys(entries).filter((n) => !n.endsWith('/'));
   // A zip of one folder: drop that folder from every path.
   const firstSeg = names[0]?.split('/')[0];

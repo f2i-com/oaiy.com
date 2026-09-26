@@ -348,7 +348,7 @@ export class SoftnPreview {
 
     const frame = h('iframe', { title: 'SoftN app preview' }) as HTMLIFrameElement;
     // Opaque origin: the app cannot reach bot.computer's storage, files or keys.
-    frame.setAttribute('sandbox', 'allow-scripts allow-forms allow-modals allow-popups');
+    frame.setAttribute('sandbox', 'allow-scripts allow-forms allow-modals');
     // Lets the page embed the frame under its own COEP even where the host
     // cannot add headers to the frame's response.
     frame.setAttribute('credentialless', '');
