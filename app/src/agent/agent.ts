@@ -1066,6 +1066,10 @@ export class Agent {
       writeReviews(vfs, reviews);
       return reply(`Took /${path} as it is. Tell the user what is still off in it: ${notes}.`);
     }
+    // Sent back and not made again since: the same picture would only be judged again.
+    if (review.verdict === 'redo' && !(review.flagged && /^flagged by the user/.test(review.notes ?? ''))) {
+      return reply(`/${path} is the picture that was sent back, unchanged since: ${review.notes ?? 'see its review'}. Make it again at the same path, fixing that; its new version is reviewed as soon as it is made.${review.redos >= MAX_REDOS && !review.flagged ? ' Or, as it has had enough tries, take it as it is with review_frame and accept.' : ''}`, true);
+    }
     // What the user said when they flagged it (true when they said nothing, or the reviewer has since said what is wrong).
     const flagged = review.flagged ? (/^flagged by the user: ([\s\S]+)$/.exec(review.notes ?? '')?.[1] ?? true) : undefined;
     const text = await this.reviewPictures(call.id, [{ path, kind: review.kind, shot: review.shot, scene: review.scene, references: review.references ?? [], story: storyFolder(vfs, path) ?? '', fix: review.fix, flagged }], emit, signal);

@@ -13,9 +13,10 @@ vi.mock('../../src/agent/images', async (original) => {
   return {
     ...real,
     imageSize: async () => ({ width: 100, height: 100 }),
-    viewImage: async (_bytes: Uint8Array, _mime: string, o: { x?: number; y?: number; width?: number; height?: number } = {}) => {
+    // The stand-in carries the picture's own bytes, so a test can tell which picture was shown.
+    viewImage: async (bytes: Uint8Array, _mime: string, o: { x?: number; y?: number; width?: number; height?: number } = {}) => {
       const region = { x: o.x ?? 0, y: o.y ?? 0, width: o.width ?? 100, height: o.height ?? 100 };
-      return { image: { mediaType: 'image/png', data: 'iVBORw0KGgo=' }, width: 100, height: 100, region, shownWidth: region.width, shownHeight: region.height };
+      return { image: { mediaType: 'image/png', data: btoa(String.fromCharCode(...bytes)) }, width: 100, height: 100, region, shownWidth: region.width, shownHeight: region.height };
     },
   };
 });
@@ -242,6 +243,50 @@ describe('a picture made for a scripted video', () => {
     await agent.run('make Gary', (e) => events.push(e));
     expect(events.at(-1)).toMatchObject({ type: 'done', text: 'ok' });
     expect(chat.bodies).toHaveLength(3);
+  });
+
+  it('sent back, is made again at the same path, and its review sees the new picture, not the old one', async () => {
+    const vfs = film();
+    const path = 'video/film/scene1-bg.png';
+    // The pictures the image service makes, in order (see fakeServices).
+    const made = (n: number) => btoa(String.fromCharCode(137, 80, 78, 71, n, n * 7, 3));
+    const shown = (body: Record<string, unknown>) => JSON.stringify(body.messages).match(/data:image\/png;base64,([A-Za-z0-9+/=]+)/)?.[1];
+    const missing: string[] = [];
+    const want = (ok: boolean, what: string) => {
+      if (!ok) missing.push(what);
+    };
+    const verdict = (v: 'pass' | 'redo', notes: string) => ({ calls: [{ name: 'give_verdict', input: { verdict: v, people: [], out_of_place: 'nothing', notes } }] });
+    fakeServices([
+      { calls: [{ name: 'generate_image', input: { path, frame: 'background', scene: '1', prompt: 'the kitchen' } }] },
+      (body) => {
+        want(shown(body) === made(1), 'the first review sees the first picture');
+        return verdict('redo', 'The window is missing.');
+      },
+      // A fix under another name would leave the old picture in place: refused.
+      { calls: [{ name: 'generate_image', input: { path: 'video/film/scene1-bg-v2.png', frame: 'background', scene: '1', prompt: 'the kitchen with a window' } }] },
+      (body) => {
+        want(lastToolText(body).includes(`/${path} was sent back (The window is missing.): make it again first, at the same path (/${path})`), 'another name is refused');
+        return { calls: [{ name: 'review_frame', input: { path } }] };
+      },
+      // The same, unchanged picture is not judged again.
+      (body) => {
+        want(lastToolText(body).includes(`/${path} is the picture that was sent back, unchanged since: The window is missing.`), 'no second review of the old picture');
+        return { calls: [{ name: 'generate_image', input: { path, frame: 'background', scene: '1', prompt: 'the kitchen with a window' } }] };
+      },
+      (body) => {
+        want(shown(body) === made(2), 'the remake\'s review sees the remake');
+        want(JSON.stringify(body.messages).includes('The try before this one was sent back for: The window is missing.'), 'the review knows what to check');
+        return verdict('pass', 'The window is there now.');
+      },
+      { text: 'done' },
+    ]);
+    const agent = new Agent({ vfs, gate: new NetGate(), provider: () => ({ ...LOCAL, contextTokens: 32_000 }), projectSummary: () => '', media: () => MEDIA, guides: ['video'] });
+    const events: AgentEvent[] = [];
+    await agent.run('make the background', (e) => events.push(e));
+    expect(missing).toEqual([]);
+    expect(events.at(-1)).toMatchObject({ type: 'done', text: 'done' });
+    expect(vfs.exists('/video/film/scene1-bg-v2.png')).toBe(false);
+    expect(readReviews(vfs)[path]).toMatchObject({ verdict: 'pass', redos: 1 });
   });
 });
 

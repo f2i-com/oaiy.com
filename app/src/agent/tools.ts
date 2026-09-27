@@ -1089,6 +1089,14 @@ async function execute(call: ToolCall, ctx: ToolContext, out: ToolOut): Promise<
         const again = new RegExp(`^${path.replace(/\.png$/i, '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(-\\d+)?\\.png$`, 'i');
         const waiting = awaitingReview(vfs, reviews).filter((p) => !again.test(p));
         if (waiting.length) throw new Error(`${waiting.map((p) => `/${p}`).join(', ')} ${waiting.length === 1 ? 'is' : 'are'} still waiting for review: run review_frame on ${waiting.length === 1 ? 'it' : 'them'} before making another picture`);
+        // A picture sent back is made again where it is: a fix under another name
+        // would leave the old one in place, the one the script, its review and the clips use.
+        const sentBack = Object.keys(reviews).filter((p) => reviews[p].verdict === 'redo' && !again.test(p) && storyFolder(vfs, p) === story && reviewOf(vfs, reviews, p));
+        if (sentBack.length) {
+          const p = sentBack[0];
+          const r = reviews[p];
+          throw new Error(`/${p} was sent back (${r.notes ?? 'see its review'}): make it again first, at the same path (/${p}), fixing that. A remake under another name leaves the old picture in place.${r.redos >= MAX_REDOS && !r.flagged ? ` It has had ${r.redos} tries: if it is the best of them, take it with review_frame and accept instead.` : ''}`);
+        }
         const first = referencePaths[0] ? reviews[referencePaths[0]]?.kind : undefined;
         if (kind === 'end' && (!referencePaths.length || first === 'character' || first === 'prop' || first === 'background')) {
           throw new Error("an end frame is its shot's start frame edited: give the start frame as the first reference image (then the characters and props in view), and say in the prompt what has changed");
