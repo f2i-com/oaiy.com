@@ -91,6 +91,8 @@ export interface Settings {
   activeProviderId: string | null;
   gate: NetGateSettings;
   lastProjectId: string | null;
+  /** The last project that is kept (not incognito): where leaving incognito goes. */
+  lastKeptProjectId: string | null;
   agent: AgentSettings;
   /** The image and video service (nrob, or any OpenAI-spec one). */
   media: MediaSettings;
@@ -105,6 +107,7 @@ export async function loadSettings(): Promise<Settings> {
     activeProviderId: (await get<string | null>('active-provider')) ?? providers[0]?.id ?? null,
     gate: (await get<NetGateSettings>('gate')) ?? { mode: 'open', allow: [], deny: [] },
     lastProjectId: (await get<string | null>('last-project')) ?? null,
+    lastKeptProjectId: (await get<string | null>('last-kept-project')) ?? null,
     agent: { ...DEFAULT_AGENT_SETTINGS, ...((await get<Partial<AgentSettings>>('agent-settings')) ?? {}) },
     media: await (async () => {
       const stored = await get<Omit<MediaSettings, 'apiKey'> & { apiKeySealed: Sealed | null }>('media');
@@ -137,4 +140,8 @@ export async function saveGate(settings: NetGateSettings): Promise<void> {
 
 export async function saveLastProject(id: string | null): Promise<void> {
   await put('last-project', id);
+}
+
+export async function saveLastKeptProject(id: string | null): Promise<void> {
+  await put('last-kept-project', id);
 }

@@ -4,7 +4,7 @@ import { NetGate } from '../../src/gate/netgate';
 import { Vfs } from '../../src/vfs/vfs';
 import { EMPTY_MEDIA } from '../../src/agent/media';
 import { runTool, type ToolContext } from '../../src/agent/tools';
-import { REVIEWS_FILE, contentHash, countProblems, flagPicture, readReviews, scriptExcerpt, storyFolder, writeReviews } from '../../src/agent/review';
+import { REVIEWS_FILE, checklist, contentHash, countProblems, flagPicture, readReviews, scriptExcerpt, storyFolder, writeReviews } from '../../src/agent/review';
 import { LOCAL, fakeProvider } from './fakeProvider';
 
 // No canvas here: a look at a picture gives a stand-in image of the region asked for.
@@ -27,6 +27,9 @@ const SCRIPT = [
   '',
   '## Premise',
   'Gary, a tired chef, must win back his restaurant with one last soup.',
+  '',
+  '## Style',
+  'Soft 2D anime look. Style: 2D anime, clean line art, cel shading, soft pastel palette',
   '',
   '## Characters',
   'Gary: fifties, grey stubble, red chef jacket. Voice: gruff.',
@@ -89,6 +92,12 @@ describe('the script a picture is checked against', () => {
   it('is its premise, its scene without the other shots, and its shot', () => {
     const excerpt = scriptExcerpt(SCRIPT, 'start', '1');
     expect(excerpt).toContain('Gary, a tired chef');
+    // Every picture is checked against the video's art style.
+    expect(excerpt).toContain('Style: 2D anime, clean line art');
+    expect(scriptExcerpt(SCRIPT, 'background', undefined, '2')).toContain('Style: 2D anime');
+    for (const kind of ['start', 'end', 'background', 'character', 'prop'] as const) expect(checklist(kind)).toContain("It is in the script's Style");
+    // A character from the user's picture of a person must still be them.
+    expect(checklist('character')).toContain('it is recognisably that person, restyled but not replaced');
     expect(excerpt).toContain('Background: a small steel kitchen');
     expect(excerpt).toContain('Start frame: Gary at the stove');
     expect(excerpt).not.toContain('Start frame: the pot');
@@ -115,6 +124,8 @@ describe('a picture made for a scripted video', () => {
       (body) => {
         const text = JSON.stringify(body.messages);
         expect(text).toContain('You are a reviewer');
+        expect(text).toContain("a picture not in the script's art style");
+        expect(text).toContain("It is in the script's Style");
         expect(text).toContain('/video/film/shot1-start.png');
         expect(text).toContain('the start frame of shot 1');
         expect(text).toContain('- /video/film/gary.png');

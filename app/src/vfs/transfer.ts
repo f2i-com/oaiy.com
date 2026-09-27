@@ -29,6 +29,29 @@ export function canPickFolder(): boolean {
   return typeof (window as unknown as { showDirectoryPicker?: unknown }).showDirectoryPicker === 'function';
 }
 
+/** Write files into a folder the user picks: how many, or null when they cancel. */
+export async function exportFolder(files: Array<[string, Uint8Array]>): Promise<number | null> {
+  const picker = (window as unknown as { showDirectoryPicker: (o: { mode: string }) => Promise<FileSystemDirectoryHandle> }).showDirectoryPicker;
+  let dir: FileSystemDirectoryHandle;
+  try {
+    dir = await picker({ mode: 'readwrite' });
+  } catch (error) {
+    if ((error as DOMException).name === 'AbortError') return null;
+    throw error;
+  }
+  for (const [path, bytes] of files) {
+    const parts = path.split('/').filter(Boolean);
+    const name = parts.pop();
+    if (!name) continue;
+    let at = dir;
+    for (const part of parts) at = await at.getDirectoryHandle(part, { create: true });
+    const writable = await (await at.getFileHandle(name, { create: true })).createWritable();
+    await writable.write(new Blob([bytes as BlobPart]));
+    await writable.close();
+  }
+  return files.length;
+}
+
 /** Read a folder the user picks, skipping dependency/build folders. */
 export async function importFolder(): Promise<Imported | null> {
   const picker = (window as unknown as { showDirectoryPicker: (o?: unknown) => Promise<FileSystemDirectoryHandle> }).showDirectoryPicker;

@@ -5,6 +5,7 @@
  * calls the AI provider: it is the person's own service, set up in Settings,
  * so these requests are not behind the network gate.
  */
+import { incognitoHeaderFor } from '../privacy';
 
 export interface ImageModelInfo {
   id: string;
@@ -58,6 +59,19 @@ export interface VoiceInfo {
   description?: string;
   language?: string;
 }
+
+/**
+ * A voice the service designed and handed back rather than kept (nrob with
+ * `keep: false`): the voice itself and its sample clip, for the project to
+ * keep and send with each line spoken in it.
+ */
+export interface HandedVoice {
+  voice: Record<string, unknown>;
+  sample: Uint8Array;
+}
+
+/** A voice to speak in: a name the service knows, or a voice sent with the request. */
+export type VoiceChoice = string | Record<string, unknown>;
 
 export interface MediaSettings {
   /** The API base (`http://127.0.0.1:8080/v1`). Empty: there is no media service. */
@@ -139,7 +153,7 @@ function authHeaders(apiKey: string): Record<string, string> {
   return apiKey ? { Authorization: `Bearer ${apiKey}` } : {};
 }
 
-function bytesToBase64(bytes: Uint8Array): string {
+export function bytesToBase64(bytes: Uint8Array): string {
   let binary = '';
   for (let i = 0; i < bytes.length; i += 0x8000) binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
   return btoa(binary);
@@ -183,7 +197,7 @@ async function request(url: string, init: RequestInit & { apiKey: string; what: 
   const { apiKey, what, ...rest } = init;
   let resp: Response;
   try {
-    resp = await fetch(url, { ...rest, headers: { ...authHeaders(apiKey), ...(rest.headers as Record<string, string> | undefined) }, signal });
+    resp = await fetch(url, { ...rest, headers: { ...authHeaders(apiKey), ...incognitoHeaderFor(url), ...(rest.headers as Record<string, string> | undefined) }, signal });
   } catch (error) {
     if (signal?.aborted) throw error;
     throw new MediaError(`${what}: could not reach ${new URL(url).origin}. Is the service running, and does it allow requests from this page (CORS)?`);
@@ -419,8 +433,8 @@ export interface SpeechRequest {
   /** What to say. */
   input: string;
   model?: string;
-  /** A saved voice's name, or an OpenAI voice name. */
-  voice?: string;
+  /** A saved voice's name, an OpenAI voice name, or a voice sent with the request. */
+  voice?: VoiceChoice;
   /** A voice described in words (or how to say it). */
   instructions?: string;
   language?: string;
@@ -444,14 +458,24 @@ export async function generateSpeech(media: MediaSettings, req: SpeechRequest, s
 }
 
 /** Design a voice from a description and save it on the server under `name`. */
-export async function createVoice(media: MediaSettings, req: { name: string; description: string; sampleText?: string; language?: string; seed?: number }, signal?: AbortSignal): Promise<VoiceInfo> {
+/**
+ * Design a voice. With `keep: false` a service that can (nrob) hands the voice
+ * back (`handed`) instead of keeping it; otherwise it is saved on the server
+ * under `name`.
+ */
+export async function createVoice(media: MediaSettings, req: { name: string; description: string; sampleText?: string; language?: string; seed?: number; keep?: boolean }, signal?: AbortSignal): Promise<VoiceInfo & { handed?: HandedVoice }> {
   const body: Json = { name: req.name, description: req.description };
   if (req.sampleText) body.sample_text = req.sampleText;
   if (req.language) body.language = req.language;
   if (req.seed !== undefined) body.seed = req.seed;
+  if (req.keep === false) body.keep = false;
   const resp = await request(endpointsOf(media).voices, { method: 'POST', body: JSON.stringify(body), headers: { 'Content-Type': 'application/json' }, apiKey: media.apiKey, what: 'Designing the voice' }, signal);
   const voice = (await resp.json().catch(() => ({}))) as Json;
-  return { name: str(voice.name) ?? req.name, description: str(voice.description) ?? req.description, language: str(voice.language) ?? req.language };
+  const info = { name: str(voice.name) ?? req.name, description: str(voice.description) ?? req.description, language: str(voice.language) ?? req.language };
+  const handed = isRecord(voice.voice) && isRecord(voice.sample) && typeof voice.sample.data === 'string'
+    ? { voice: voice.voice as Record<string, unknown>, sample: base64ToBytes(voice.sample.data) }
+    : undefined;
+  return handed ? { ...info, handed } : info;
 }
 
 /** The voices saved on the server. */
@@ -564,7 +588,7 @@ export interface VideoRequest {
   /** A picture for the last frame: the video moves from the start to it. */
   endImage?: MediaFile;
   /** Words the character says: the service speaks them and the clip's lips follow. */
-  speech?: { input: string; voice?: string; instructions?: string; language?: string; seed?: number };
+  speech?: { input: string; voice?: VoiceChoice; instructions?: string; language?: string; seed?: number };
   /** A soundtrack (speech, a voice, any audio) the clip follows. */
   audio?: MediaFile;
   /** The words spoken in `audio`: the clip's lips follow them. */

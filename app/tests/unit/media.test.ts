@@ -203,6 +203,7 @@ describe('media tools', () => {
     expect(Object.keys((tools[1].parameters as { properties: Record<string, unknown> }).properties)).toContain('negative_prompt');
     expect(tools[0].description).toContain('each character (only them, full length, facing the camera, neutral expression, on a blank white background)');
     expect(tools[0].description).toContain('A reference image is never used as a picture of the story itself.');
+    expect(tools[0].description).toContain('from a picture the user attached (in uploads/), a cartoon of them say, give that picture as reference_images');
     expect(tools[1].description).toContain("giving the scene's background (the place with no people in it) and the reference images of the characters and props in it");
     expect(tools[1].description).toContain("Never give a character's reference image itself as a frame.");
     // A clip that continues another starts on its end frame; its real last frame only when it ended elsewhere.

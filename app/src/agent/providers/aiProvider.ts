@@ -2,6 +2,7 @@
  * Adapted from softn.com (apps/softn-studio/src/lib/aiProvider.ts),
  * Copyright f2i-com, licensed under the Apache License, Version 2.0.
  */
+import { incognitoHeaderFor } from '../../privacy';
 import type { ProviderConfig, ChatMessage } from './types';
 import {
   describeConnectionError,
@@ -369,7 +370,8 @@ async function providerRequest<T>(
   read: (resp: Response, signal: AbortSignal, touch: () => void) => Promise<T>,
 ): Promise<T> {
   const timeoutMs = options.timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
-  const headers = providerHeaders(provider, true);
+  // An nrob provider is told when the open project is incognito.
+  const headers = { ...providerHeaders(provider, true), ...incognitoHeaderFor(url) };
   if (typeof window !== 'undefined' && isBlockedMixedContent(url, window.location.protocol)) {
     throw new AIProviderError('network', describeConnectionError('mixed-content', { type: provider.type, serverKind: provider.serverKind, url }));
   }

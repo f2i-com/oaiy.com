@@ -35,7 +35,7 @@ describe("a project's saved voices", () => {
   });
 
   it("list this project's voices by their short names, and leave out other projects'", () => {
-    const project = { key: 'abc123', voices: { Gary: 'Gary-abc123' } };
+    const project = { key: 'abc123', voices: { Gary: 'Gary-abc123' }, local: {} };
     const listed = projectVoiceList(project, [
       { name: 'Gary-abc123', description: 'tired chef' },
       { name: 'Gary-ffee00', description: "another project's" },
@@ -48,7 +48,7 @@ describe("a project's saved voices", () => {
   });
 
   it('are saved under names the service takes', () => {
-    const project = { key: 'abc123', voices: {} };
+    const project = { key: 'abc123', voices: {}, local: {} };
     expect(savedName(project, "Dr. O'Brien")).toBe('Dr OBrien-abc123');
     expect(savedName(project, '  Old   Man  ')).toBe('Old Man-abc123');
     expect(savedName(project, 'Zoë')).toBe('Zoë-abc123');
@@ -76,6 +76,36 @@ describe("a project's saved voices", () => {
     expect(asked).toEqual(['gruff', 'squeaky']);
     const project = readProjectVoices(vfs);
     expect(project.voices).toEqual({ Gary: `Gary-${project.key}` });
+  });
+
+  it('handed back by the service, are kept in the project and sent with every line spoken in them', async () => {
+    const sent: Array<Record<string, unknown>> = [];
+    vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      sent.push(body);
+      if (String(url).includes('/voices')) {
+        expect(body.keep).toBe(false);
+        return new Response(JSON.stringify({ name: body.name, description: 'gruff', voice: { nrob_voice: 1, name: body.name, ref_text: 'hi', ref_codes: [[1]], speaker: [0.5] }, sample: { format: 'wav', data: btoa('RIFFdata') } }), { headers: { 'Content-Type': 'application/json' } });
+      }
+      return new Response(new Uint8Array([1, 2, 3]), { headers: { 'Content-Type': 'audio/mpeg' } });
+    }));
+    const media = { ...EMPTY_MEDIA, baseUrl: 'http://127.0.0.1:8080', speechModel: 'qwen3-tts' };
+    const vfs = new Vfs();
+    const ctx: ToolContext = { vfs, gate: new NetGate(), reads: new Map(), shell: { cwd: '/', env: {} }, media: () => media };
+    const made = await runTool({ id: '1', name: 'create_voice', input: { name: 'Gary', description: 'a gruff chef' } }, ctx);
+    expect(made.content).toContain('Saved the voice "Gary" in the project (/voices/Gary.json');
+    expect(made.files).toEqual(['voices/Gary.wav']);
+    expect(new TextDecoder().decode(vfs.readBytes('/voices/Gary.wav'))).toBe('RIFFdata');
+    expect(readProjectVoices(vfs).local.Gary).toEqual({ path: 'voices/Gary.json', description: 'gruff' });
+    // Spoken in: the voice goes with the request, its sample inside.
+    await runTool({ id: '2', name: 'generate_speech', input: { text: 'We are closing.', path: 'audio/line.mp3', voice: 'gary' } }, ctx);
+    const voice = sent[1].voice as Record<string, unknown>;
+    expect(voice.ref_codes).toEqual([[1]]);
+    expect(voice.sample).toEqual({ format: 'wav', data: btoa('RIFFdata') });
+    // Kept in the project, it is not designed again unless replaced.
+    const again = await runTool({ id: '3', name: 'create_voice', input: { name: 'Gary', description: 'squeaky' } }, ctx);
+    expect(again.content).toContain('"Gary" is already this project\'s voice');
+    expect(sent).toHaveLength(2);
   });
 
   it('made at the same time share the project key, and none is lost', async () => {

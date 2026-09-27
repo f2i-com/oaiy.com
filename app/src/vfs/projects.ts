@@ -7,6 +7,11 @@
  *
  * The in-memory Vfs is the source of truth while a project is open; every
  * change is written behind to OPFS (a short debounce, one write per path).
+ *
+ * An incognito project is a temporary one: its files are written behind the
+ * same way (a cache, so large media need not all sit in memory), its
+ * conversation is never written, and it is deleted when it is left, or when the
+ * app next starts if it was not. Exporting it is the only way to keep it.
  */
 import type { Turn } from '../agent/protocol';
 import { Vfs, type VfsChange } from './vfs';
@@ -16,6 +21,8 @@ export interface ProjectMeta {
   name: string;
   created: number;
   updated: number;
+  /** A temporary project: nothing of it is kept (see the module note). */
+  incognito?: boolean;
 }
 
 async function root(): Promise<FileSystemDirectoryHandle> {
@@ -69,9 +76,9 @@ export async function listProjects(): Promise<ProjectMeta[]> {
   return out.sort((a, b) => b.updated - a.updated);
 }
 
-export async function createProject(name: string): Promise<ProjectMeta> {
+export async function createProject(name: string, incognito = false): Promise<ProjectMeta> {
   const base = await root();
-  const meta: ProjectMeta = { id: newId(), name, created: Date.now(), updated: Date.now() };
+  const meta: ProjectMeta = { id: newId(), name, created: Date.now(), updated: Date.now(), ...(incognito ? { incognito: true } : {}) };
   const dir = await base.getDirectoryHandle(meta.id, { create: true });
   await dir.getDirectoryHandle('files', { create: true });
   await writeBytes(dir, 'project.json', JSON.stringify(meta));
@@ -80,6 +87,13 @@ export async function createProject(name: string): Promise<ProjectMeta> {
 
 export async function deleteProject(id: string): Promise<void> {
   await (await root()).removeEntry(id, { recursive: true });
+}
+
+/** Delete the incognito projects left behind (a closed app, a crash), all but `keep`. */
+export async function clearIncognito(keep?: string): Promise<void> {
+  for (const meta of await listProjects()) {
+    if (meta.incognito && meta.id !== keep) await deleteProject(meta.id).catch(() => {});
+  }
 }
 
 export async function renameProject(meta: ProjectMeta, name: string): Promise<ProjectMeta> {
@@ -217,10 +231,13 @@ export class OpenProject {
   }
 
   async loadChat(): Promise<Turn[]> {
+    if (this.meta.incognito) return [];
     return (await readJson<Turn[]>(this.dir, 'chat.json')) ?? [];
   }
 
+  /** The conversation, kept with the project; never for an incognito one. */
   async saveChat(turns: Turn[]): Promise<void> {
+    if (this.meta.incognito) return;
     await writeBytes(this.dir, 'chat.json', JSON.stringify(turns));
   }
 

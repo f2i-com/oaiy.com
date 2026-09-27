@@ -128,6 +128,13 @@ describe('tool rules', () => {
     expect(system).toContain('Only when the user asks for exactly one clip is it a single shot.');
     // Each shot is a cut or continuous (the motion flowing on from the clip before), the agent's choice.
     expect(system).toContain('Joins: cut (a new framing, place or moment), or continuous from shot 2');
+    // One art style for the whole video, carried by every picture's prompt and checked by the reviewer.
+    expect(system).toContain('## Style: the look of the whole video');
+    // Characters, props and places from the user's pictures are made from them.
+    expect(system).toContain('A character from a picture the user gave says so (From: uploads/NAME.jpg)');
+    expect(system).toContain("the same person, recognisably, in the video's Style.");
+    expect(system).toContain("Every picture's prompt ends with that Style line, word for word");
+    expect(system).toContain("Every generate_image prompt below ends with the script's Style line.");
     expect(system).toContain('Cut or continuous is your choice, shot by shot.');
     expect(system).toContain('A continuous shot instead starts on the last frame the clip it continues really ended on');
     expect(system).toContain('trim the first frame of each continuous clip (start: 0.04)');

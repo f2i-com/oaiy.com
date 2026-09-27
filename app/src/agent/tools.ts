@@ -17,7 +17,7 @@ import type { PageReport, PreviewAction, PreviewResult } from '../softn/preview'
 import { describeExample, docsMap, installExample, listExamples, lookupComponents, readTopic, searchKnowledge } from '../softn/knowledge';
 import { DEFAULT_VIEW_SIZE, MAX_VIEW_SIZE, imageMimeFor, imageSize, viewImage, type ImagePart } from './images';
 import { FRAME_KINDS, MAX_REDOS, MAX_REVIEW_FAILURES, awaitingReview, contentHash, readReviews, reviewOf, storyFolder, writeReviews, type FrameKind } from './review';
-import { VOICES_FILE, ownVoice, projectVoiceList, readProjectVoices, savedName, serviceVoice, writeProjectVoices, type ProjectVoices } from './voices';
+import { VOICES_FILE, keepVoice, ownVoice, projectVoiceList, readProjectVoices, savedName, voiceFor, writeProjectVoices, type ProjectVoices } from './voices';
 import { SOUNDTRACK_FORMATS, SPEECH_FORMATS, createVoice, generateImage, generateMusic, generateSpeech, generateVideo, mediaReady, type MediaFile, type MediaSettings, type SpeechFormat } from './media';
 
 const READ_LINES = 400;
@@ -156,9 +156,9 @@ export function mediaTools(media: MediaSettings | null | undefined, voices?: Pro
       name: 'generate_image',
       description:
         `Create an image from a text prompt with the user's image service (${where}) and save it in the project as a PNG. ` +
-        'Describe the picture concretely: subject, setting, style, lighting, composition. To edit a picture or combine several, give reference_images (project paths) and say what to change, with a model that edits. ' +
+        'Describe the picture concretely: subject, setting, style, lighting, composition. To edit a picture or combine several, give reference_images (project paths) and say what to change, with a model that edits. To make a picture of a person, place or thing from a picture the user attached (in uploads/), a cartoon of them say, give that picture as reference_images and say what to keep (a person\'s face, features, hair, skin tone, build) and what to change (the style, pose, clothes, place). ' +
         'Keep what recurs the same: make a reference image once for each character (only them, full length, facing the camera, neutral expression, on a blank white background) and each prop (alone on a blank white background), and one for each place with no people in it; then make every picture they appear in new, giving them as reference_images and saying each character\'s pose and expression for that moment. A reference image is never used as a picture of the story itself. Look at each picture with view_image, and make it again when a face, hand or body is broken or a character does not match their reference. ' +
-        'A picture saved in a scripted video\'s folder (beside or below its script.md) is reviewed as soon as it is made: a reviewer compares it with the script, its reference images and the pictures before it, and passes it or sends it back with what to fix. Say what it is with `frame` (and `shot` or `scene`), so it is checked against the right part of the script. An end frame is its shot\'s start frame edited: give the start frame as the first reference image. ' +
+        'A picture saved in a scripted video\'s folder (beside or below its script.md) is reviewed as soon as it is made: a reviewer compares it with the script, its reference images and the pictures before it, and passes it or sends it back with what to fix. Say what it is with `frame` (and `shot` or `scene`), so it is checked against the right part of the script, and end its prompt with the script\'s Style line, so every picture shares the video\'s art style. An end frame is its shot\'s start frame edited: give the start frame as the first reference image. ' +
         `It takes seconds to a few minutes. The image is shown to the user in the chat; use view_image to look at it yourself.${describeModels(media, 'image')}`,
       parameters: {
         type: 'object',
@@ -1176,7 +1176,7 @@ async function execute(call: ToolCall, ctx: ToolContext, out: ToolOut): Promise<
         startImage,
         endImage,
         negativePrompt: text('negative_prompt'),
-        speech: say ? { input: say, voice: serviceVoice(readProjectVoices(vfs), text('voice')), instructions: text('voice_description') } : undefined,
+        speech: say ? { input: say, voice: voiceFor(vfs, text('voice')), instructions: text('voice_description') } : undefined,
         audio: soundtrack,
         transcript,
       }, (message) => ctx.progress?.(message), ctx.signal);
@@ -1198,7 +1198,7 @@ async function execute(call: ToolCall, ctx: ToolContext, out: ToolOut): Promise<
       }
       const named = typeof input.voice === 'string' && input.voice.trim() ? input.voice.trim() : undefined;
       // This project's voice of that name, as the service saved it.
-      const voice = serviceVoice(readProjectVoices(vfs), named);
+      const voice = voiceFor(vfs, named);
       ctx.progress?.(`speaking${named ? ` as ${named}` : ''}…`);
       const result = await generateSpeech(media, {
         input: words,
@@ -1226,18 +1226,29 @@ async function execute(call: ToolCall, ctx: ToolContext, out: ToolOut): Promise<
       if (!vfs.exists(VOICES_FILE)) writeProjectVoices(vfs, project);
       // The service replaces a voice of the same name: keep a character's voice unless asked to change it.
       const known = ownVoice(project, name);
-      const onService = !media.voices || media.voices.some((v) => v.name === project.voices[known ?? '']);
+      const kept = known ? project.local[known] : undefined;
+      const onService = kept ? vfs.exists(`/${kept.path}`) : !media.voices || media.voices.some((v) => v.name === project.voices[known ?? '']);
       if (known && onService && input.replace !== true) {
         return `"${known}" is already this project's voice: speak in it with voice: "${known}". Designing it again would make ${known} sound different from the lines already made; give replace: true only when that is wanted.`;
       }
+      const description = need(input, 'description');
+      // Asked to hand the voice back, to keep in the project; a service that
+      // cannot keeps it under the project's key instead.
       const voice = await createVoice(media, {
         name: savedName(project, name),
-        description: need(input, 'description'),
+        description,
         sampleText: typeof input.sample_text === 'string' ? input.sample_text : undefined,
         language: typeof input.language === 'string' ? input.language : undefined,
+        keep: false,
       }, ctx.signal);
       // Read again: other voices may have been saved while this one was made.
       const now = readProjectVoices(vfs);
+      if (voice.handed) {
+        const files = keepVoice(vfs, now, name, voice.handed, voice.description ?? description);
+        writeProjectVoices(vfs, now);
+        out.files.push(files.sample);
+        return `Saved the voice "${name}" in the project (/${files.path}; its sample, /${files.sample}, is in the chat to hear). Speak in it with voice: "${name}" in generate_speech, or in generate_video with say.`;
+      }
       const before = ownVoice(now, name);
       if (before) delete now.voices[before];
       now.voices[name] = voice.name;

@@ -4,7 +4,7 @@ import type { ProviderConfig } from './agent/providers/types';
 import { HELP, internetCommand } from './commands';
 import { NetGate } from './gate/netgate';
 import { sandboxAvailable, zippModule } from './sandbox/runner';
-import { loadSettings, saveAgentSettings, saveGate, saveLastProject, saveMedia, saveProviders } from './settings';
+import { loadSettings, saveAgentSettings, saveGate, saveLastKeptProject, saveLastProject, saveMedia, saveProviders } from './settings';
 import { NROB_ORIGIN, discoverNrob, mediaAbilities, mergeDiscovered } from './agent/media';
 import { budgetFor, contextWindow, detectContextWindow, formatTokens } from './agent/context';
 import { ChatPane } from './ui/chat';
@@ -21,8 +21,9 @@ import { imageForMessage, imageMimeFor, type ImagePart } from './agent/images';
 import type { Attachment } from './agent/protocol';
 import { flagPicture } from './agent/review';
 import { FileTree } from './ui/tree';
-import { OpenProject, createProject, deleteProject, listProjects, renameProject, type ProjectMeta } from './vfs/projects';
-import { canPickFolder, downloadZip, importFileList, importFolder, importZip, type Imported } from './vfs/transfer';
+import { OpenProject, clearIncognito, createProject, deleteProject, listProjects, renameProject, type ProjectMeta } from './vfs/projects';
+import { addNrobOrigin, setIncognito } from './privacy';
+import { canPickFolder, downloadZip, exportFolder, importFileList, importFolder, importZip, type Imported } from './vfs/transfer';
 import type { Vfs } from './vfs/vfs';
 
 const WELCOME: Array<[string, string]> = [
@@ -195,9 +196,25 @@ async function main(): Promise<void> {
   });
 
   const renderProjects = async () => {
-    const list = await listProjects();
+    // An incognito project shows only while it is open.
+    const list = (await listProjects()).filter((m) => !m.incognito || m.id === project?.meta.id);
     clear(projectSelect);
-    for (const meta of list) projectSelect.append(h('option', { value: meta.id, selected: meta.id === project?.meta.id }, meta.name));
+    for (const meta of list) projectSelect.append(h('option', { value: meta.id, selected: meta.id === project?.meta.id }, meta.incognito ? `🕶 ${meta.name} (incognito)` : meta.name));
+  };
+
+  /** Where nrob answers, so an incognito project's requests to it say so (and only to it). */
+  const registerNrob = () => {
+    for (const p of providers) if (p.serverKind === 'nrob') addNrobOrigin(p.baseUrl);
+    if (media.discovered) {
+      addNrobOrigin(media.discovered.origin);
+      addNrobOrigin(media.baseUrl);
+    }
+  };
+
+  /** The project files to export (the sandbox git's .git/ is its own format, which a real git would read as broken). */
+  const exportFiles = () => {
+    editor.flush();
+    return project.vfs.files().filter(([path]) => !path.split('/').includes('.git'));
   };
 
   /** The run in progress, to wait for when it has to stop. */
@@ -221,13 +238,19 @@ async function main(): Promise<void> {
 
   /** Leaving the project while the agent works: ask first. */
   async function mayLeaveRun(): Promise<boolean> {
-    if (!controller) return true;
-    return confirmAction({ title: 'Stop the agent?', message: 'The agent is still working in this project. Switching stops it; what it has done so far is kept.', ok: 'Stop and switch' });
+    if (controller && !(await confirmAction({ title: 'Stop the agent?', message: 'The agent is still working in this project. Switching stops it; what it has done so far is kept.', ok: 'Stop and switch' }))) return false;
+    // Leaving an incognito project deletes it.
+    if (project?.meta.incognito) {
+      return confirmAction({ title: 'Leave incognito?', message: 'This incognito project, its conversation and everything made in it are deleted when you leave it. Export it first (Export .zip or Export to folder) to keep it.', ok: 'Leave and delete', danger: true });
+    }
+    return true;
   }
 
   const openProjectNow = async (meta: ProjectMeta) => {
     if (project && meta.id === project.meta.id) return;
     await stopRun();
+    // An incognito project is deleted once another is open.
+    const leaving = project?.meta.incognito ? project.meta.id : null;
     if (project) {
       editor.flush();
       await project.close();
@@ -273,9 +296,22 @@ async function main(): Promise<void> {
     // A SoftN app opens on its preview, so the person sees it being built.
     if (isSoftnProject(project.vfs)) showPane('preview');
     chat.replay(agent.turns);
+    registerNrob();
+    setIncognito(!!meta.incognito);
+    showIncognito(!!meta.incognito);
+    // The last project reopens after a refresh or a restart, incognito included:
+    // incognito stays on until it is turned off.
     await saveLastProject(meta.id);
+    if (meta.incognito) {
+      chat.system(`🕶 Incognito is on${reopening ? ' (as it was before the app was refreshed or restarted; the conversation was not kept, the files were)' : ''}. Nothing of this project is kept: its conversation is never saved, its files (and every picture, clip and sound made in it) live in a temporary cache that is deleted when you turn incognito off, and nrob is told to keep nothing of its requests. Export it (Export .zip, or Export to folder) to keep anything.`);
+    } else {
+      lastKept = meta.id;
+      await saveLastKeptProject(meta.id);
+    }
+    reopening = false;
+    if (leaving) await deleteProject(leaving).catch(() => {});
     await renderProjects();
-    document.title = `${meta.name} — bot.computer`;
+    document.title = `${meta.incognito ? '🕶 ' : ''}${meta.name} — bot.computer`;
   };
 
   const newProjectFrom = async (imported: Imported | null) => {
@@ -687,6 +723,56 @@ A project can hold several apps, each in its own folder (any folder whose manife
     }
   }
 
+  // Incognito, on or off: a toggle in the actions, and a chip in the top bar that shows while it is on.
+  const incognitoButton = h('button.incognito-toggle', { 'aria-pressed': 'false', onclick: () => void toggleIncognito() });
+  const incognitoChip = h('span.incognito-chip', { title: 'Incognito is on: nothing of this project is kept unless you export it', hidden: true }, '🕶 INCOGNITO');
+  function showIncognito(on: boolean): void {
+    incognitoButton.textContent = on ? '🕶 Incognito: ON' : '🕶 Incognito: OFF';
+    incognitoButton.title = on
+      ? 'Incognito is on: nothing of this project is kept. Click to leave it (the project is deleted; export it first to keep it)'
+      : 'Incognito is off. Click for a private project: nothing is kept (no conversation, files or media) unless you export it';
+    incognitoButton.classList.toggle('on', on);
+    incognitoButton.setAttribute('aria-pressed', String(on));
+    incognitoChip.hidden = !on;
+    deleteButton.textContent = on ? 'Clear' : 'Delete';
+    deleteButton.title = on ? 'Clear this incognito project: delete everything in it and start a fresh one (incognito stays on)' : 'Delete this project from the browser';
+    document.body.classList.toggle('incognito', on);
+  }
+  /** True while the app reopens the project it had open. */
+  let reopening = false;
+  /** The last project that is kept: where leaving incognito goes. */
+  let lastKept = settings.lastKeptProjectId ?? settings.lastProjectId;
+  /** On: a new incognito project. Off: back to the last kept project (the incognito one is deleted). */
+  async function toggleIncognito(): Promise<void> {
+    if (!(await mayLeaveRun())) return;
+    if (!project?.meta.incognito) {
+      await openProject(await createProject('Incognito', true));
+      return;
+    }
+    const kept = (await listProjects()).filter((m) => !m.incognito);
+    await openProject(kept.find((m) => m.id === lastKept) ?? kept[0] ?? (await createProject('untitled')));
+  }
+
+  // Delete, or in incognito Clear: the temporary project is wiped and a fresh one opens, incognito staying on.
+  const deleteButton = h('button.danger.delete-toggle', { onclick: () => void deleteOrClear() }, 'Delete');
+  async function deleteOrClear(): Promise<void> {
+    if (project.meta.incognito) {
+      if (controller && !(await confirmAction({ title: 'Stop the agent?', message: 'The agent is still working. Clearing stops it and deletes what it made.', ok: 'Stop and clear' }))) return;
+      if (!(await confirmAction({ title: 'Clear incognito?', message: 'Everything in this incognito project is deleted now: its files, pictures, clips and sounds, and the conversation. Incognito stays on, with a fresh empty project. Export it first to keep anything.', ok: 'Clear', danger: true }))) return;
+      // The new project opens first; opening it deletes the one left.
+      await openProject(await createProject('Incognito', true));
+      return;
+    }
+    if (!(await mayLeaveRun())) return;
+    if (!(await confirmAction({ title: 'Delete project', message: `Delete "${project.meta.name}" and all its files from this browser? This cannot be undone (export it as a .zip first to keep a copy).`, ok: 'Delete project', danger: true }))) return;
+    const doomed = project.meta.id;
+    const others = (await listProjects()).filter((m) => m.id !== doomed && !m.incognito);
+    const next = others[0] ?? (await createProject('untitled'));
+    await openProject(next);
+    await deleteProject(doomed).catch(() => {});
+    await renderProjects();
+  }
+
   // Project actions: a row of buttons on a wide screen, a ☰ menu on a phone.
   const closeMenu = () => header.classList.remove('menu-open');
   const actions = h(
@@ -703,10 +789,21 @@ A project can hold several apps, each in its own folder (any folder whose manife
     } }, 'Open folder…'),
     h('button', { title: 'Import a .zip as a new project', onclick: () => fileInput('.zip,application/zip', false, async (files) => newProjectFrom(await importZip(files[0]))) }, 'Import .zip'),
     h('button', { title: 'Download this project as a .zip', onclick: async () => {
-      editor.flush();
-      // The sandbox git's .git/ is its own format, which a real git would read as a broken repository.
-      downloadZip(project.meta.name.replace(/[^\w.-]+/g, '-'), project.vfs.files().filter(([path]) => !path.split('/').includes('.git')));
+      downloadZip(project.meta.name.replace(/[^\w.-]+/g, '-'), exportFiles());
     } }, 'Export .zip'),
+    h('button', { title: 'Write this project\'s files into a folder on this computer', onclick: async () => {
+      if (!canPickFolder()) {
+        chat.system('This browser cannot write to a folder: use Export .zip.', 'error');
+        return;
+      }
+      try {
+        const n = await exportFolder(exportFiles());
+        if (n !== null) chat.system(`Exported ${n} file${n === 1 ? '' : 's'} to the folder.`);
+      } catch (error) {
+        chat.system(`Could not export to the folder: ${(error as Error).message}`, 'error');
+      }
+    } }, 'Export to folder…'),
+    incognitoButton,
     h('button', { title: 'Start a SoftN app: from a starter, a blank page or an example; in a new project or a folder of this one', onclick: () => newSoftnApp().catch((error: unknown) => chat.system(`Could not start the app: ${(error as Error).message}`, 'error')) }, 'New SoftN app'),
     h('button', { title: 'Unpack a .softn file into a folder of this project', onclick: () => importSoftnFile() }, 'Import .softn…'),
     h('button', { title: 'Download the SoftN app in the preview as a .softn file', onclick: () => void exportSoftn() }, 'Export .softn'),
@@ -717,21 +814,13 @@ A project can hold several apps, each in its own folder (any folder whose manife
         await renderProjects();
       }
     } }, 'Rename'),
-    h('button.danger', { title: 'Delete this project from the browser', onclick: async () => {
-      if (!(await mayLeaveRun())) return;
-      if (!(await confirmAction({ title: 'Delete project', message: `Delete "${project.meta.name}" and all its files from this browser? This cannot be undone (export it as a .zip first to keep a copy).`, ok: 'Delete project', danger: true }))) return;
-      const doomed = project.meta.id;
-      const others = (await listProjects()).filter((m) => m.id !== doomed);
-      const next = others[0] ?? (await createProject('untitled'));
-      await openProject(next);
-      await deleteProject(doomed);
-      await renderProjects();
-    } }, 'Delete'),
+    deleteButton,
   );
   const header = h(
     'header.topbar',
     h('button.menu-toggle', { title: 'Project menu', 'aria-label': 'Project menu', onclick: () => header.classList.toggle('menu-open') }, '☰'),
     h('div.brand', h('span.logo', '◆'), h('span.brand-name', ' bot.computer')),
+    incognitoChip,
     projectSelect,
     actions,
     h('div.spacer'),
@@ -852,6 +941,10 @@ With that done, Settings → Images, video and audio → Find nrob sets it up.`)
   void navigator.storage?.persist?.().catch(() => false);
 
   // Open the last project, or make the welcome one.
+  // Incognito projects left from before are deleted, all but the one that was
+  // open (incognito stays on across a refresh or a restart).
+  await clearIncognito(settings.lastProjectId ?? undefined);
+  reopening = true;
   const all = await listProjects();
   let meta = all.find((m) => m.id === settings.lastProjectId) ?? all[0];
   if (!meta) {
