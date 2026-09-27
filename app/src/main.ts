@@ -301,13 +301,14 @@ async function main(): Promise<void> {
     const key = `${p.id}|${p.modelId}`;
     if (windowsChecked.has(key)) return;
     windowsChecked.add(key);
-    if (p.type !== 'anthropic' && p.detectedContext?.model !== p.modelId) {
+    // Asked again each session: a server restarted with another context says so; kept from before when it does not answer.
+    if (p.type !== 'anthropic') {
       const found = await detectContextWindow(p, AbortSignal.timeout(5000)).catch(() => null);
       if (found?.guess) {
         windowsGuessed.add(key);
         return;
       }
-      if (found) {
+      if (found && (p.detectedContext?.model !== p.modelId || p.detectedContext.tokens !== found.tokens)) {
         p.detectedContext = { model: p.modelId, tokens: found.tokens, how: found.how, at: Date.now() };
         await saveProviders(providers, activeId);
       }

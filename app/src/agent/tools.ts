@@ -101,6 +101,8 @@ export interface ToolContext {
   media?: () => MediaSettings | null;
   /** A line for the chat's status while a long tool works ("making the video: 40%"). */
   progress?: (message: string) => void;
+  /** The words of each speech file generate_speech saved, by project path: a clip that follows one is told what is said. */
+  spoken?: Map<string, string>;
 }
 
 /** A model's abilities in a few words, for the tool descriptions. */
@@ -128,6 +130,7 @@ function describeModels(media: MediaSettings, kind: 'image' | 'video' | 'speech'
         m.fps && `${m.fps} fps`,
         m.maxSide && `longest side up to ${m.maxSide} px`,
         m.startImage ? 'can animate a start_image' : m.startImage === false ? 'no start image' : '',
+        m.lipSync ? 'lip-synced speech' : '',
       ].filter(Boolean);
       return `${m.id}${m.id === chosen ? ' (default)' : ''}${bits.length ? `: ${bits.join(', ')}` : ''}`;
     });
@@ -165,6 +168,8 @@ export function mediaTools(media: MediaSettings | null | undefined): ToolSpec[] 
       },
     });
   }
+  // Video models that speak `say` in a saved voice with the picture, lips in sync.
+  const lipSync = media.videoModels.some((m) => m.lipSync);
   if (ready.video) {
     tools.push({
       name: 'generate_video',
@@ -173,6 +178,14 @@ export function mediaTools(media: MediaSettings | null | undefined): ToolSpec[] 
         'Describe the motion as well as the scene: what moves, how the camera moves. ' +
         (media.discovered
           ? 'A character can talk: give `say` (their words; the service speaks them in `voice`, and the lips follow), or `soundtrack` (a speech or audio file in the project to follow). Then without `seconds` the clip is as long as the speech, up to the model\'s limit of a few seconds: keep each line to one short sentence, and make several clips for longer speech. '
+          : '') +
+        (media.discovered && ready.speech && lipSync
+          ? 'Keep each character\'s voice the same and their lips in sync: give every speaking character a saved voice (create_voice, once, before their first line), then for each clip with dialogue give `say` (the line) and `voice` (their saved voice) with a model that has lip-synced speech: the service speaks the line in that voice together with the picture, lips in sync. In the prompt, show the character speaking to the camera with their mouth moving as they talk (not deadpan, silent or off camera). '
+          : media.discovered && ready.speech
+            ? 'Keep each character\'s voice the same in every clip: give every speaking character a saved voice (create_voice, once, before their first line), and for each clip with dialogue first speak the line with generate_speech in that character\'s saved voice, then give that file as `soundtrack` with its words as `transcript`. Do not use `say` with a described or ad-hoc voice for a recurring character: it sounds different each time. '
+            : '') +
+        (ready.image
+          ? 'Keep characters the same in every clip: before each clip, make its start frame and end frame with generate_image at the clip\'s size, giving the character image(s) as reference_images (for a clip that continues another, start from that clip\'s last frame); look at both with view_image, then give them as start_image and end_image. Do not leave a character\'s look to the video model and the prompt alone: it drifts from clip to clip. '
           : '') +
         'For a longer video, make several clips: video_frames with last: true gives the last frame of one to start the next on, and media_compose joins them and adds music. ' +
         `It takes minutes; the user sees its progress in the chat, and the finished video gets a player there.${describeModels(media, 'video')}`,
@@ -193,6 +206,7 @@ export function mediaTools(media: MediaSettings | null | undefined): ToolSpec[] 
                 voice: { type: 'string', description: `The voice for \`say\`: ${voiceNames(media)}` },
                 voice_description: { type: 'string', description: 'For `say`: a voice described in words, instead of a saved one' },
                 soundtrack: { type: 'string', description: `Project path of audio for the clip to follow (${SOUNDTRACK_FORMATS.join(', ')}), e.g. from generate_speech` },
+                transcript: { type: 'string', description: 'The words spoken in `soundtrack`, all of them, so the lips follow every line (filled in for a file generate_speech made this session)' },
               }
             : {}),
         },
@@ -206,6 +220,11 @@ export function mediaTools(media: MediaSettings | null | undefined): ToolSpec[] 
       description:
         `Speak text aloud with the user's speech service (${where}) and save the audio in the project (mp3, wav, opus, aac or flac, from the path). ` +
         'Use a saved voice by name, an OpenAI voice name, or describe a voice in `voice_description` (age, gender, accent, tone, pace). For the same character across many lines, save a voice with create_voice once and use its name. ' +
+        (media.discovered && ready.video
+          ? media.videoModels.some((m) => m.lipSync)
+            ? 'For a video clip with dialogue, give the words to generate_video as `say` with the saved `voice` instead: it speaks them with the picture, lips in sync. '
+            : 'For a video clip with dialogue, speak the line here in the character\'s saved voice and give the file to generate_video as `soundtrack`. '
+          : '') +
         `Voices: ${voiceNames(media)}.${saved.length ? ` Saved: ${saved.map((v) => `${v.name}${v.description ? ` (${v.description})` : ''}`).join('; ')}.` : ''}${describeModels(media, 'speech')}`,
       parameters: {
         type: 'object',
@@ -1037,6 +1056,8 @@ async function execute(call: ToolCall, ctx: ToolContext, out: ToolOut): Promise<
       const say = text('say');
       if (say && text('soundtrack')) throw new Error('give `say` or `soundtrack`, not both');
       const soundtrack = text('soundtrack') ? projectFile(vfs, text('soundtrack')!) : undefined;
+      // The words in the soundtrack: without them the picture barely moves its lips.
+      const transcript = soundtrack ? text('transcript') ?? ctx.spoken?.get(normalizePath(text('soundtrack')!)) : undefined;
       const model = text('model') ?? media.videoModel;
       ctx.progress?.(`starting the video${model ? ` with ${model}` : ''}…`);
       const result = await generateVideo(media, {
@@ -1048,6 +1069,7 @@ async function execute(call: ToolCall, ctx: ToolContext, out: ToolOut): Promise<
         endImage,
         speech: say ? { input: say, voice: text('voice'), instructions: text('voice_description') } : undefined,
         audio: soundtrack,
+        transcript,
       }, (message) => ctx.progress?.(message), ctx.signal);
       vfs.writeFile(`/${path}`, result.bytes, { parents: true });
       out.files.push(path);
@@ -1077,6 +1099,7 @@ async function execute(call: ToolCall, ctx: ToolContext, out: ToolOut): Promise<
         format,
       }, ctx.signal);
       vfs.writeFile(`/${path}`, result.bytes, { parents: true });
+      ctx.spoken?.set(path, words);
       out.files.push(path);
       return `Saved /${path} (${(result.bytes.byteLength / 1024).toFixed(0)} KB ${format}). The user has a player for it in the chat.`;
     }

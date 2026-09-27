@@ -113,6 +113,27 @@ describe('tool rules', () => {
     expect(vfs.readText('/notes/new.md')).toBe('# new');
   });
 
+  it('asks once more when the server could not read a tool call, then gives up', async () => {
+    const unreadable = { error: { status: 422, body: JSON.stringify({ error: { message: 'tool_contract_error: missing function tag; no tool from this batch was executed', code: 'tool_contract_error' } }) } };
+    fakeProvider('openai', [unreadable, { text: 'read it the second time' }, unreadable, unreadable]);
+    const { agent, events, emit } = setup(OPENAI);
+    await agent.run('go', emit);
+    expect(events.some((e) => e.type === 'status' && /could not read/.test(e.message))).toBe(true);
+    expect(events.at(-1)).toMatchObject({ type: 'done', text: 'read it the second time' });
+    events.length = 0;
+    await agent.run('again', emit);
+    expect(events.at(-1)).toMatchObject({ type: 'error' });
+  });
+
+  it('an unreadable view_image call is not the model refusing images', async () => {
+    const quoted = { error: { status: 422, body: JSON.stringify({ error: { message: 'tool_contract_error: missing function tag; no tool from this batch was executed. The model wrote: "<tool_call>\\n{\\"name\\": \\"view_image\\"}"', code: 'tool_contract_error' } }) } };
+    const fake = fakeProvider('openai', [quoted, quoted, { text: 'fine' }]);
+    const { agent, events, emit } = setup(OPENAI);
+    await agent.run('look', emit, undefined, [{ mediaType: 'image/png', data: 'iVBORw0KGgo=' }]);
+    expect(events.some((e) => e.type === 'status' && /does not take images/.test(e.message))).toBe(false);
+    expect(JSON.stringify(fake.bodies.at(-1))).toContain('image_url');
+  });
+
   it('with no provider the run says what to do', async () => {
     const vfs = new Vfs();
     const agent = new Agent({ vfs, gate: new NetGate(), provider: () => null, projectSummary: () => '' });

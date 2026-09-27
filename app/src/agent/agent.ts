@@ -92,7 +92,7 @@ The user's project lives in a virtual filesystem in the browser; "/" is the proj
 - code_run to compute, test ideas, or process data in JavaScript or Python (a Zipp VM sandbox in a Web Worker).
 - sandbox_shell for shell-style work (an emulated bash-like shell on the same sandbox): run project scripts with node or python, search and transform files (grep, find, sed, awk, jq, diff/patch), pack and unpack archives (tar, zip, gzip), and keep history with git (a local repository in .git/; no remotes, so no push, pull or clone). There is no real operating system: npm install, pip install, compilers and other native programs do not exist. Do not pretend to run them.
 - SoftN apps: a SoftN app is a folder whose manifest.json names a .ui page as "main" (with ui/*.ui pages and logic/*.logic or .py). A project can hold several, each in its own folder: to rebuild or learn from an existing app, read its files and write the new one in another folder. A .softn the user attaches is unpacked into its own folder (the original stays in uploads/, and softn_import unpacks any .softn in the project): when they ask for changes, edit that folder; when they ask to recreate, redo or base something on it, write a new app in a new folder and leave the original as it is. The SoftN reference is in your tools, so do not guess the language: softn_docs with no arguments gives the map, topic "guide" is the writing guide (read it before your first app), search finds how something is done across the guides, the components and the example apps; softn_components gives exact props and events; softn_examples has complete working apps to read or copy. Keep manifest.json true. After each step that changes an app, bot.computer checks it automatically (its files, then a real render) and adds the outcome to that step's result: when it reports errors, fix them before anything else. softn_check checks on demand; softn_inspect shows what the page displays; softn_interact uses the app like a person (click, fill, select, press keys) and reports errors the app raises, so test that the app works, not just that it renders. The user watches the app in a live preview as you build it, and can export any app folder as a .softn file.
-- generate_image, generate_video, generate_speech, create_voice and generate_music, when they are among your tools, make pictures, short videos (talking ones too), speech and music with the user's media service and save them in the project. Write concrete prompts, save under sensible paths, and look at an image with view_image before relying on it.
+- generate_image, generate_video, generate_speech, create_voice and generate_music, when they are among your tools, make pictures, short videos (talking ones too), speech and music with the user's media service and save them in the project. Write concrete prompts, save under sensible paths, and look at an image with view_image before relying on it. For each video clip with characters, make its start and end frames first with generate_image from the character images, and animate between them; for dialogue, give each character a saved voice with create_voice and use it for every line they speak (see generate_video for how).
 - media_info, video_frames, video_split and media_compose edit video and sound in the project, in the browser: read what a file holds, take frames out (the last frame of a clip starts the next one), cut, join clips and pictures, and lay music, speech and effects over a whole video with volume, fades and ducking. To make a longer video: plan the shots, generate each clip (chaining last frames), then compose them with the soundtrack.
 - web_fetch, curl, fetch() go through the user's network gate (/internet) and, from a browser, only reach sites that allow cross-origin requests. If the gate refuses a host, say so; the user decides whether to allow it.
 
@@ -305,7 +305,7 @@ export class Agent {
 
   constructor(private readonly options: AgentOptions) {
     // Writes made through this agent's tools are its changes; another agent's (or the person's) are not.
-    this.toolContext = { vfs: trackedVfs(options.vfs, (path) => this.onWrite?.(path)), gate: options.gate, reads: new Map(), shell: { cwd: '/', env: {} }, softn: options.softn, media: options.media };
+    this.toolContext = { vfs: trackedVfs(options.vfs, (path) => this.onWrite?.(path)), gate: options.gate, reads: new Map(), shell: { cwd: '/', env: {} }, softn: options.softn, media: options.media, spoken: new Map() };
   }
 
   reset(): void {
@@ -672,6 +672,7 @@ export class Agent {
   private async request(provider: ProviderConfig, emit: (e: AgentEvent) => void, signal?: AbortSignal): Promise<Reply> {
     let lastError: unknown;
     let overflowRetried = false;
+    let callRetried = false;
     for (let attempt = 0; attempt < 4; attempt++) {
       const b = this.budget(provider);
       const sent = wellFormed(trimmed(this.view(), this.imagesAccepted, b.prompt * this.charsPerToken));
@@ -716,11 +717,19 @@ export class Agent {
           emit({ type: 'status', message: `The model writes at most ${formatTokens(limit)} tokens per reply; retrying with that` });
           continue;
         }
+        // A tool call the server could not read (nrob's tool_contract_error): nothing ran, and another sample usually reads.
+        // It quotes the call, which may name view_image: that is not the model refusing images.
+        const unreadableCall = /tool_contract_error/.test(said);
+        if (unreadableCall && !callRetried) {
+          callRetried = true;
+          emit({ type: 'status', message: 'The model wrote a tool call the server could not read; asking again' });
+          continue;
+        }
         // A model without vision refuses image content: carry on in text (an image that is too big is not that).
-        if (this.imagesAccepted && error.kind === 'http' && /image|vision|multimodal|image_url|content.*array/i.test(said) && !/too (large|big)|exceeds?|dimension|resolution|megapixel/i.test(said) && this.turns.some(hasImages)) {
+        if (this.imagesAccepted && error.kind === 'http' && !unreadableCall && /image|vision|multimodal|image_url|content.*array/i.test(said) && !/too (large|big)|exceeds?|dimension|resolution|megapixel/i.test(said) && this.turns.some(hasImages)) {
           this.noImages.add(`${provider.id}|${provider.modelId}`);
           this.toolContext.images = false;
-          emit({ type: 'status', message: 'This model does not take images; continuing with text only' });
+          emit({ type: 'status', message: `This model does not take images (the server said: ${error.message.slice(0, 200)}); continuing with text only` });
           continue;
         }
         if (error.kind === 'rate-limited' && attempt < 3) {

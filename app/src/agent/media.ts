@@ -30,6 +30,8 @@ export interface VideoModelInfo {
   maxSide?: number;
   /** Animates a start image. */
   startImage?: boolean;
+  /** Speaks `say` in a saved voice with the picture, lips in sync (nrob with ID-LoRA). */
+  lipSync?: boolean;
 }
 
 export interface SpeechModelInfo {
@@ -244,6 +246,7 @@ export function readDiscovery(doc: Json, origin: string): Extract<Discovery, { s
     maxSeconds: num(m.max_seconds),
     maxSide: num(m.max_side),
     startImage: bool(m.start_image),
+    lipSync: bool(m.lip_sync),
   }));
   const speechModels: SpeechModelInfo[] = list(models.speech).filter((m) => str(m.id)).map((m) => ({
     id: String(m.id),
@@ -564,6 +567,8 @@ export interface VideoRequest {
   speech?: { input: string; voice?: string; instructions?: string; language?: string; seed?: number };
   /** A soundtrack (speech, a voice, any audio) the clip follows. */
   audio?: MediaFile;
+  /** The words spoken in `audio`: the clip's lips follow them. */
+  transcript?: string;
 }
 
 /** The audio formats a video soundtrack may come in. */
@@ -615,6 +620,7 @@ export async function generateVideo(media: MediaSettings, req: VideoRequest, onP
       const format = req.audio.name.split('.').pop()!.toLowerCase();
       if (!SOUNDTRACK_FORMATS.includes(format)) throw new MediaError(`A soundtrack must be ${SOUNDTRACK_FORMATS.join(', ')}; ${req.audio.name} is not.`);
       body.input_audio = { data: bytesToBase64(req.audio.bytes), format };
+      if (req.transcript) body.transcript = req.transcript;
     }
     created = await request(ep.videos, { method: 'POST', body: JSON.stringify(body), headers: { 'Content-Type': 'application/json' }, apiKey: media.apiKey, what: 'Starting the video' }, signal);
   }

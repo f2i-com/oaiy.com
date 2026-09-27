@@ -147,6 +147,9 @@ describe('media requests', () => {
     expect('seconds' in created).toBe(false);
     await generateVideo(media, { prompt: 'x', audio: { bytes: new Uint8Array([1, 2]), mime: 'audio/wav', name: 'line.wav' } }, () => {});
     expect(created.input_audio).toEqual({ data: 'AQI=', format: 'wav' });
+    expect(created.transcript).toBeUndefined();
+    await generateVideo(media, { prompt: 'x', audio: { bytes: new Uint8Array([1, 2]), mime: 'audio/wav', name: 'line.wav' }, transcript: 'That is the point.' }, () => {});
+    expect(created.transcript).toBe('That is the point.');
     await expect(generateVideo(media, { prompt: 'x', audio: { bytes: new Uint8Array([1]), mime: 'audio/x', name: 'a.txt' } }, () => {})).rejects.toThrow('soundtrack');
     await expect(generateVideo(media, { prompt: 'x', speech: { input: 'hi' }, audio: { bytes: new Uint8Array([1]), mime: 'audio/wav', name: 'a.wav' } }, () => {})).rejects.toThrow('not both');
   });
@@ -191,6 +194,16 @@ describe('media tools', () => {
     expect(tools[2].description).toContain('Voices: Narrator, alloy, onyx. Saved: Narrator (A deep, calm male narrator).');
     expect(tools[4].description).toContain('minimax-music3 (default): up to 360 s');
     expect(Object.keys((tools[1].parameters as { properties: Record<string, unknown> }).properties)).toEqual(expect.arrayContaining(['end_image', 'say', 'voice', 'soundtrack']));
+    expect(tools[1].description).toMatch(/start frame and end frame with generate_image .*reference_images.*start_image and end_image/);
+    expect(tools[1].description).toMatch(/saved voice \(create_voice.*generate_speech in that character's saved voice.*`soundtrack`/);
+    expect(tools[2].description).toContain('give the file to generate_video as `soundtrack`');
+    // A model with lip-synced speech: `say` in the saved voice, not a soundtrack.
+    const synced = readDiscovery(DOC, 'http://127.0.0.1:8080').media;
+    synced.videoModels = synced.videoModels.map((m) => ({ ...m, lipSync: true }));
+    const [, video, speech] = mediaTools(synced);
+    expect(video.description).toContain('give `say` (the line) and `voice` (their saved voice)');
+    expect(video.description).toContain('lip-synced speech');
+    expect(speech.description).toContain('as `say` with the saved `voice` instead');
     expect(tools[0].description).toContain('qwen-image-turbo-q4 (default): default size 1024x1024, sides in steps of 32, edits: up to 3 reference images');
     expect(tools[0].description).toContain('unholy-desire-sdxl: default size 1024x1024, sides in steps of 64, no edits, takes negative_prompt');
     expect(tools[1].description).toContain('sulphur-2 (default): up to 5 s, 24 fps, longest side up to 1024 px, can animate a start_image');
