@@ -68,6 +68,8 @@ You are a sub-agent: the main agent gave you one task, below. Do that task and n
 const REVIEW_TOOLS = new Set(['list_files', 'read_file', 'file_info', 'search_file', 'grep', 'glob', 'view_image', 'media_info']);
 /** A reviewer's step limit: a good once-over, a closer look where something is unclear, and a verdict. */
 const REVIEW_STEPS = 8;
+/** Requests a reviewer may spend looking before give_verdict is its only tool. */
+const REVIEW_LOOK_STEPS = 3;
 /** The side of the picture a reviewer sees first, and of any look it takes: small enough for the model to take in quickly. */
 const REVIEW_VIEW_SIZE = 640;
 /** The side of each reference image shown with it. */
@@ -211,6 +213,12 @@ export interface AgentOptions {
   keepImages?: number;
   /** The largest side view_image shows this agent (default: the tool's own). */
   viewSize?: number;
+  /**
+   * A run that must end with one tool (a reviewer's verdict): after `after`
+   * requests only that tool is offered, with `say` to use it now, and the run
+   * ends as soon as `done` says it has done its job.
+   */
+  finish?: { tool: string; after: number; say: string; done: () => boolean };
 }
 
 function turnChars(t: Turn, charsPerToken = DEFAULT_CHARS_PER_TOKEN): number {
@@ -715,21 +723,32 @@ export class Agent {
       const id = `${callId}#review${i}`;
       const title = `review /${picture.path}`;
       emit({ type: 'agent_task', callId, id, title, state: 'running', activity: 'starting' });
-      let outcome: { verdict: 'pass' | 'redo'; notes: string } | { error: string };
-      try {
-        outcome = await this.runReviewer(picture, (activity) => emit({ type: 'agent_task', callId, id, title, state: 'running', activity }), signal);
-      } catch (error) {
-        outcome = { error: signal?.aborted ? 'stopped before it finished' : (error as Error).message };
-      }
-      if ('error' in outcome) {
-        emit({ type: 'agent_task', callId, id, title, state: 'failed', result: outcome.error });
+      // A review that ends without a verdict is tried once more by a fresh reviewer.
+      let outcome: { verdict: 'pass' | 'redo'; notes: string } | { error: string; trail?: string[] } = { error: 'not reviewed' };
+      const tries: string[] = [];
+      for (let attempt = 1; attempt <= MAX_REVIEW_FAILURES; attempt++) {
+        try {
+          outcome = await this.runReviewer(picture, (activity) => emit({ type: 'agent_task', callId, id, title, state: 'running', activity: attempt > 1 ? `again: ${activity}` : activity }), signal);
+        } catch (error) {
+          outcome = { error: signal?.aborted ? 'stopped before it finished' : (error as Error).message };
+        }
+        if (!('error' in outcome) || signal?.aborted) break;
+        tries.push(`Try ${attempt}: ${outcome.error}${outcome.trail?.length ? `\n${outcome.trail.join('\n')}` : ''}`);
         const reviews = readReviews(vfs);
         const review = reviewOf(vfs, reviews, picture.path);
         if (review) {
           review.failures = (review.failures ?? 0) + 1;
           writeReviews(vfs, reviews);
         }
-        lines.push(`Review of /${picture.path}: no verdict (${outcome.error}). It waits for one: run review_frame on it.`);
+      }
+      if ('error' in outcome) {
+        // What each try did, for the person to see in the review's report.
+        emit({ type: 'agent_task', callId, id, title, state: 'failed', result: tries.join('\n\n') || outcome.error });
+        lines.push(
+          signal?.aborted
+            ? `Review of /${picture.path}: stopped before it finished. It waits for one: run review_frame on it.`
+            : `Review of /${picture.path}: no verdict after ${tries.length} tries (${outcome.error}). Look at it yourself with view_image: if it is right, take it with review_frame and accept (notes: what you checked); if not, make it again at the same path. Do not make other pictures until you have done one of these.`,
+        );
         continue;
       }
       const reviews = readReviews(vfs);
@@ -752,7 +771,7 @@ export class Agent {
   }
 
   /** One picture's review: a fresh agent that may look at anything in the project, then gives its verdict. */
-  private async runReviewer(picture: FrameReview, activity: (text: string) => void, signal?: AbortSignal): Promise<{ verdict: 'pass' | 'redo'; notes: string } | { error: string }> {
+  private async runReviewer(picture: FrameReview, activity: (text: string) => void, signal?: AbortSignal): Promise<{ verdict: 'pass' | 'redo'; notes: string } | { error: string; trail?: string[] }> {
     const provider = this.options.provider();
     if (!provider) return { error: 'no AI provider' };
     const vfs = this.options.vfs;
@@ -783,7 +802,8 @@ export class Agent {
       `The other pictures of this video are in /${picture.story || ''} (list_files): the backgrounds, reference images and earlier frames to compare with. Look at everything you need, then give_verdict.`,
     ].filter(Boolean).join('\n\n');
     const settings = this.options.subAgents?.() ?? { contextTokens: 32_000, parallel: 1 };
-    const reviewer = new Agent({
+    // After a few looks it must decide: then give_verdict is its only tool.
+    const reviewer: Agent = new Agent({
       ...this.options,
       provider: () => provider,
       tools: [...this.tools.filter((t) => REVIEW_TOOLS.has(t.name)), VERDICT_TOOL],
@@ -793,6 +813,12 @@ export class Agent {
       viewSize: REVIEW_VIEW_SIZE,
       maxContext: settings.contextTokens,
       subAgents: undefined,
+      finish: {
+        tool: 'give_verdict',
+        after: REVIEW_LOOK_STEPS,
+        say: 'You have looked enough. Give your verdict now with give_verdict, from what you have seen: pass, or redo with what the remake should fix. If give_verdict refuses it, correct what it says and call it again.',
+        done: () => !!reviewer.verdict,
+      },
     });
     reviewer.reviewing = { path: picture.path, references: picture.references, whole: false, zooms: 0, seen: new Set(), flagged: !!picture.flagged };
     // The picture and its references come with the task, small: a once-over in one request.
@@ -813,16 +839,22 @@ export class Agent {
     }
     const brief = shown.length ? `${task}\n\nAttached, in order:\n${shown.join('\n')}` : task;
     let failure = '';
+    // What it did, for the report when it ends without a verdict.
+    const trail: string[] = [];
     await reviewer.run(brief, (e) => {
       if (e.type === 'tool_call') {
         const arg = ['path', 'pattern'].map((k) => e.call.input[k]).find((v) => typeof v === 'string') as string | undefined;
         activity(`${e.call.name}${arg ? ` ${arg.slice(0, 80)}` : ''}`);
+        trail.push(`${e.call.name}${arg ? ` ${arg.slice(0, 80)}` : ''}`);
+      } else if (e.type === 'tool_result' && e.result.isError) {
+        trail.push(`  ${e.result.content.slice(0, 240)}`);
       } else if (e.type === 'error') {
         failure = e.message;
       }
     }, signal, attached);
     if (reviewer.verdict) return reviewer.verdict;
-    return { error: failure || 'the reviewer finished without a verdict' };
+    const reason = failure || 'the reviewer finished without a verdict';
+    return { error: reason, trail: trail.slice(-10) };
   }
 
   /** review_frame: review a picture again, or take it as it is after the tries it had. */
@@ -969,6 +1001,9 @@ export class Agent {
     ].filter(Boolean).join('\n\n');
   }
 
+  /** The finishing tool alone, once it is time for it (see AgentOptions.finish). */
+  private finishing = false;
+
   private async request(provider: ProviderConfig, emit: (e: AgentEvent) => void, signal?: AbortSignal): Promise<Reply> {
     let lastError: unknown;
     let overflowRetried = false;
@@ -977,7 +1012,9 @@ export class Agent {
       const b = this.budget(provider);
       const sent = wellFormed(trimmed(this.view(), this.keepImages, b.prompt * this.charsPerToken));
       try {
-        const reply = await sendTurn(provider, this.systemPrompt, sent, this.tools, {
+        const finish = this.options.finish;
+        const tools = finish && this.finishing ? this.tools.filter((t) => t.name === finish.tool) : this.tools;
+        const reply = await sendTurn(provider, this.systemPrompt, sent, tools, {
           maxOutputTokens: b.reply,
           signal,
           sink: {
@@ -1118,6 +1155,11 @@ export class Agent {
       for (let step = 1; step <= maxSteps; step++) {
         signal?.throwIfAborted();
         this.readInbox(emit);
+        const finish = this.options.finish;
+        if (finish && !this.finishing && step > finish.after) {
+          this.finishing = true;
+          this.turns.push({ role: 'user', text: `[bot.computer] ${finish.say}`, automatic: true });
+        }
         await this.fit(provider, emit, signal);
         const reply = await this.request(provider, emit, signal);
         emit({ type: 'usage', usage: reply.usage });
@@ -1125,6 +1167,12 @@ export class Agent {
         if (!reply.calls.length) {
           // A message came in while it answered: not done until it has read it.
           if (this.inbox.length) continue;
+          // A run that must end with its tool: ask for it (the loop's step limit still bounds this).
+          if (finish && !finish.done()) {
+            this.finishing = true;
+            this.turns.push({ role: 'user', text: `[bot.computer] ${finish.say}`, automatic: true });
+            continue;
+          }
           if (reply.truncated) emit({ type: 'status', message: 'The reply was cut off at the output limit.' });
           // Stopping short of the goal: ask once or twice to carry on.
           const unfinished = this.unfinished(planThisRun);
@@ -1203,6 +1251,11 @@ export class Agent {
         this.turns.push({ role: 'tool', results });
         if (stop) {
           emit({ type: 'error', message: stop });
+          return;
+        }
+        // Its finishing tool has done its job: nothing more to ask the model.
+        if (this.options.finish?.done()) {
+          emit({ type: 'done', text: '', steps: step });
           return;
         }
         if (failures >= 3) {

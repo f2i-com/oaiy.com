@@ -126,7 +126,6 @@ describe('a picture made for a scripted video', () => {
       },
       { calls: [{ name: 'list_files', input: { path: 'video/film' } }] },
       { calls: [{ name: 'give_verdict', input: { verdict: 'redo', people: [{ who: 'Gary', heads: 1, arms: 3, hands: 3, legs: 2, matches: 'yes' }], out_of_place: 'nothing', notes: 'Gary has a third arm from his left shoulder.' } }] },
-      { text: 'Sent back: a third arm.' },
       // The main agent hears the verdict, and cannot animate the frame.
       (body) => {
         expect(lastToolText(body)).toContain('sent back (try 1 of 3). Gary has a third arm from his left shoulder. (Counted: Gary: 1 head, 3 arms, 3 hands, 2 legs.)');
@@ -150,7 +149,6 @@ describe('a picture made for a scripted video', () => {
         expect(lastToolText(body)).toContain('it cannot pass with what you found: Gary has 3 arms');
         return { calls: [{ name: 'give_verdict', input: { verdict: 'pass', people: [{ who: 'Gary', heads: 1, arms: 2, hands: 2, legs: 2, matches: 'yes' }], out_of_place: 'nothing', notes: 'Face, jacket and kitchen match; two arms.' } }] };
       },
-      { text: 'Passed.' },
       (body) => {
         expect(lastToolText(body)).toContain('passed. Face, jacket and kitchen match; two arms.');
         return { calls: [{ name: 'generate_video', input: { prompt: 'he tastes', path: 'video/film/shot1.mp4', start_image: frame.path, end_image: frame.path } }] };
@@ -172,21 +170,36 @@ describe('a picture made for a scripted video', () => {
     expect(events.some((e) => e.type === 'agent_task' && e.title === `review /${frame.path}` && e.state === 'done')).toBe(true);
   });
 
-  it('waits for its verdict: no other picture is made until it has one', async () => {
+  it('is made to decide after a few looks, is tried again without a verdict, and then waits for the agent to look or remake', async () => {
     const vfs = film();
+    const path = 'video/film/scene1-bg.png';
+    const toolNames = (body: Record<string, unknown>) => (body.tools as Array<{ function: { name: string } }>).map((t) => t.function.name);
+    // A reviewer that only ever looks: three looks, then give_verdict is its only tool, until its steps run out.
+    const looking = (n: number) =>
+      Array.from({ length: 8 }, (_, i) => (body: Record<string, unknown>) => {
+        if (i < 3) {
+          expect(toolNames(body)).toContain('view_image');
+          return { calls: [{ name: 'view_image', input: { path } }] };
+        }
+        expect(toolNames(body)).toEqual(['give_verdict']);
+        expect(JSON.stringify(body.messages)).toContain('You have looked enough. Give your verdict now with give_verdict');
+        return { text: `try ${n}: still unsure` };
+      });
     fakeServices([
-      { calls: [{ name: 'generate_image', input: { path: 'video/film/scene1-bg.png', frame: 'background', scene: '1', prompt: 'the kitchen' } }] },
-      { text: 'I could not decide.' },
+      { calls: [{ name: 'generate_image', input: { path, frame: 'background', scene: '1', prompt: 'the kitchen' } }] },
+      ...looking(1),
+      ...looking(2),
       (body) => {
-        expect(lastToolText(body)).toContain('no verdict (the reviewer finished without a verdict)');
+        expect(lastToolText(body)).toContain(`Review of /${path}: no verdict after 2 tries`);
+        expect(lastToolText(body)).toContain('Look at it yourself with view_image: if it is right, take it with review_frame and accept');
         return { calls: [{ name: 'generate_image', input: { path: 'video/film/other.png', prompt: 'anything' } }] };
       },
       (body) => {
-        expect(lastToolText(body)).toContain('/video/film/scene1-bg.png is still waiting for review');
-        return { calls: [{ name: 'review_frame', input: { path: 'video/film/scene1-bg.png', accept: true } }] };
+        expect(lastToolText(body)).toContain(`/${path} is still waiting for review`);
+        return { calls: [{ name: 'review_frame', input: { path, accept: true, notes: 'looked right to me' } }] };
       },
       (body) => {
-        expect(lastToolText(body)).toContain('it can be taken as it is after 3 tries, or when 2 reviews could not reach a verdict');
+        expect(lastToolText(body)).toContain(`Took /${path} as it is.`);
         return { text: 'ok' };
       },
     ]);
@@ -194,7 +207,28 @@ describe('a picture made for a scripted video', () => {
     const events: AgentEvent[] = [];
     await agent.run('make the background', (e) => events.push(e));
     expect(events.at(-1)).toMatchObject({ type: 'done', text: 'ok' });
-    expect(readReviews(vfs)['video/film/scene1-bg.png']).toMatchObject({ verdict: 'waiting', failures: 1 });
+    expect(readReviews(vfs)[path]).toMatchObject({ verdict: 'pass', failures: 2 });
+    // The review's report in the chat says what each try did.
+    const failed = events.find((e) => e.type === 'agent_task' && e.state === 'failed') as { result?: string } | undefined;
+    expect(failed?.result).toContain('Try 1: The run reached its 8-step limit');
+    expect(failed?.result).toContain(`view_image ${path}`);
+  });
+
+  it('ends as soon as the reviewer gives its verdict: no closing reply is asked for', async () => {
+    const vfs = film();
+    const chat = fakeServices([
+      { calls: [{ name: 'generate_image', input: { path: 'video/film/gary-2.png', frame: 'character', prompt: 'Gary' } }] },
+      { calls: [{ name: 'give_verdict', input: { verdict: 'pass', people: [{ who: 'Gary', heads: 1, arms: 2, hands: 2, legs: 2, matches: 'no reference' }], out_of_place: 'nothing', notes: 'Gary as described.' } }] },
+      (body) => {
+        expect(lastToolText(body)).toContain('passed. Gary as described.');
+        return { text: 'ok' };
+      },
+    ]);
+    const agent = new Agent({ vfs, gate: new NetGate(), provider: () => ({ ...LOCAL, contextTokens: 32_000 }), projectSummary: () => '', media: () => MEDIA });
+    const events: AgentEvent[] = [];
+    await agent.run('make Gary', (e) => events.push(e));
+    expect(events.at(-1)).toMatchObject({ type: 'done', text: 'ok' });
+    expect(chat.bodies).toHaveLength(3);
   });
 });
 
@@ -242,7 +276,6 @@ describe('a picture the user flagged', () => {
         expect(lastToolText(body)).toContain('the user flagged this picture as wrong, so it cannot pass');
         return { calls: [{ name: 'give_verdict', input: { verdict: 'redo', people: [{ who: 'Gary', heads: 1, arms: 2, hands: 2, legs: 2, matches: 'yes' }], out_of_place: 'nothing', notes: 'His left hand has six fingers.' } }] };
       },
-      { text: 'Found it.' },
       (body) => {
         expect(lastToolText(body)).toContain('sent back (try 1 of 3). His left hand has six fingers.');
         return { text: 'ok' };
@@ -266,7 +299,6 @@ describe('a picture the user flagged', () => {
         expect(JSON.stringify(body.messages)).toContain('The user flagged this picture as wrong: \\"he has three arms\\"');
         return { calls: [{ name: 'give_verdict', input: { verdict: 'redo', people: [{ who: 'Gary', heads: 1, arms: 3, hands: 3, legs: 2, matches: 'yes' }], out_of_place: 'nothing', notes: 'A third arm behind his back.' } }] };
       },
-      { text: 'Yes.' },
       { text: 'ok' },
     ]);
     const agent = new Agent({ vfs, gate: new NetGate(), provider: () => ({ ...LOCAL, contextTokens: 32_000 }), projectSummary: () => '', media: () => MEDIA });
