@@ -172,7 +172,7 @@ export function mediaTools(media: MediaSettings | null | undefined, voices?: Pro
           negative_prompt: { type: 'string', description: 'What to keep out of the picture (models that take it)' },
           seed: int,
           reference_images: { type: 'array', items: str, description: 'Project paths of pictures to edit or combine' },
-          frame: { type: 'string', enum: [...FRAME_KINDS], description: 'For a scripted video: what this picture is (a shot\'s start or end frame, a scene\'s background, a character\'s or a prop\'s reference image)' },
+          frame: { type: 'string', enum: [...FRAME_KINDS], description: 'For a scripted video: what this picture is (a shot\'s start or end frame, a scene\'s background, a character\'s reference image (a person or animal, or part of one), or a prop\'s (a non-living object))' },
           shot: { type: 'string', description: 'For a start or end frame: its shot in the script, e.g. 3' },
           scene: { type: 'string', description: 'For a background: its scene in the script, e.g. 2' },
         },

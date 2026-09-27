@@ -3,6 +3,7 @@ import { Agent, announcesWork, type AgentEvent } from '../../src/agent/agent';
 import { NetGate } from '../../src/gate/netgate';
 import { Vfs } from '../../src/vfs/vfs';
 import { OpenAIStream } from '../../src/agent/providers/stream';
+import { flagPicture } from '../../src/agent/review';
 import { EMPTY_MEDIA } from '../../src/agent/media';
 import { ANTHROPIC, LOCAL, OPENAI, fakeProvider } from './fakeProvider';
 import type { ProviderConfig } from '../../src/agent/providers/types';
@@ -130,6 +131,9 @@ describe('tool rules', () => {
     expect(system).toContain('Joins: cut (a new framing, place or moment), or continuous from shot 2');
     // One art style for the whole video, carried by every picture's prompt and checked by the reviewer.
     expect(system).toContain('## Style: the look of the whole video');
+    // Anything alive, and any part of it, is a character; props are non-living objects.
+    expect(system).toContain('any part of one seen on its own (a hand reaching in, a paw) belongs to its character');
+    expect(system).toContain('## Props: every non-living object');
     // Characters, props and places from the user's pictures are made from them.
     expect(system).toContain('A character from a picture the user gave says so (From: uploads/NAME.jpg)');
     expect(system).toContain("the same person, recognisably, in the video's Style.");
@@ -261,6 +265,88 @@ describe('tool rules', () => {
     await agent.run('make a video', emit);
     expect(events.filter((e) => e.type === 'nudge')).toHaveLength(1);
     expect(events.at(-1)).toMatchObject({ type: 'done' });
+  });
+
+  it('stops, rather than loops, when the model keeps giving the same reply and does nothing', async () => {
+    const same = { text: "Oh, you bet! Let's make it." };
+    const fake = fakeProvider('openai', [
+      same,
+      (body) => {
+        expect(JSON.stringify(body.messages)).toContain('no tool has run yet, so nothing has started');
+        return same;
+      },
+      (body) => {
+        expect(JSON.stringify(body.messages)).toContain('You gave the same reply again, and still no tool has run.');
+        return same;
+      },
+    ]);
+    const { agent, events, emit } = setup(OPENAI);
+    await agent.run('make a video', emit);
+    expect(fake.bodies).toHaveLength(3);
+    expect(events.filter((e) => e.type === 'nudge')).toHaveLength(2);
+    expect(events.some((e) => e.type === 'status' && /kept giving the same reply/.test(e.message))).toBe(true);
+    expect(events.at(-1)).toMatchObject({ type: 'done' });
+  });
+
+  it('saves the conversation without the pictures tools showed long ago, but with the user\'s own', () => {
+    const { agent } = setup(OPENAI);
+    const pixel = { mediaType: 'image/png' as const, data: 'iVBORw0KGgo=' };
+    agent.turns = [
+      { role: 'user', text: 'look at this', images: [pixel] },
+      ...Array.from({ length: 5 }, (_, i) => ({ role: 'tool' as const, results: [{ id: String(i), name: 'view_image', content: `look ${i}`, isError: false, images: [pixel] }] })),
+    ];
+    const saved = agent.savedTurns();
+    const kept = saved.filter((t) => t.role === 'tool' && t.results[0].images?.length);
+    expect(kept.map((t) => (t.role === 'tool' ? t.results[0].content : ''))).toEqual(['look 2', 'look 3', 'look 4']);
+    expect(saved[1]).toMatchObject({ role: 'tool', results: [{ content: 'look 0\n[image no longer attached; call view_image again to see it]' }] });
+    expect(saved[0]).toMatchObject({ role: 'user', images: [pixel] });
+    // The conversation itself is untouched.
+    expect(agent.turns.filter((t) => t.role === 'tool' && t.results[0].images?.length)).toHaveLength(5);
+  });
+
+  it('fixes flagged pictures first, one at a time, then goes back to its work', async () => {
+    const said = (body: Record<string, unknown>) => JSON.stringify(body.messages);
+    // What each request lacked (a failed expect inside the fake would only show as a network error).
+    const missing: string[] = [];
+    const want = (body: Record<string, unknown>, step: number, text: string, present = true) => {
+      if (said(body).includes(text) !== present) missing.push(`request ${step} ${present ? 'lacks' : 'has'}: ${text}`);
+    };
+    const plan = { goal: 'a film', items: [{ text: 'Make shot 2', status: 'active' }] };
+    const fake = fakeProvider('openai', [
+      { calls: [{ name: 'update_plan', input: plan }] },
+      // The first flag alone, with the other waiting.
+      (body) => {
+        want(body, 2, 'The user flagged /pics/a.png as wrong: \\"three arms\\". Fix it before anything else, and only it (1 more flagged picture will follow');
+        want(body, 2, '/pics/b.png as wrong', false);
+        return { calls: [{ name: 'append_file', input: { path: 'pics/a.png', content: 'made again' } }] };
+      },
+      // Fixed: the next one.
+      (body) => {
+        want(body, 3, 'The user flagged /pics/b.png as wrong, without saying why');
+        return { calls: [{ name: 'append_file', input: { path: 'pics/b.png', content: 'made again' } }] };
+      },
+      // All fixed: back to the plan.
+      (body) => {
+        want(body, 4, 'The flagged pictures are fixed. Now go back to the work you were doing');
+        want(body, 4, '\\"Make shot 2\\"');
+        return { calls: [{ name: 'update_plan', input: { ...plan, items: [{ text: 'Make shot 2', status: 'done' }] } }] };
+      },
+      { text: 'Done.' },
+    ]);
+    const { vfs, agent, events, emit } = setup(OPENAI);
+    for (const p of ['pics/a.png', 'pics/b.png']) {
+      vfs.writeFile(`/${p}`, 'first try', { parents: true });
+      flagPicture(vfs, p, p.endsWith('a.png') ? 'three arms' : '');
+    }
+    // Flagged while idle: queued, and taken when the run starts.
+    expect(agent.flag('pics/a.png', 'three arms')).toBe(false);
+    agent.flag('pics/b.png', '');
+    await agent.run('make the film', emit);
+    expect(missing).toEqual([]);
+    expect(events.filter((e) => e.type === 'error')).toEqual([]);
+    expect(fake.bodies).toHaveLength(5);
+    expect(events.at(-1)).toMatchObject({ type: 'done', text: 'Done.' });
+    expect(events.filter((e) => e.type === 'status' && /Fixed the flagged/.test(e.message))).toHaveLength(2);
   });
 
   it('announces work only with a promise, not a question', () => {

@@ -178,7 +178,7 @@ function checkKind(kind: FrameKind | undefined): string {
     case 'character':
       return `It shows only this character, full length, facing the camera with a neutral expression, on a blank white background; they look as the script describes them (face, age, build, hair, clothes); when it was made from a picture of a real person (one of its reference images, the user's picture), it is recognisably that person, restyled but not replaced: the same face shape and features, hair, skin tone and build, anything distinctive kept; ${unbroken}`;
     case 'prop':
-      return `It shows only the prop, alone on a blank white background, as the script describes it (shape, size, colour, material, markings); ${unbroken}`;
+      return `It shows only the prop, alone on a blank white background, as the script describes it (shape, size, colour, material, markings); a prop is a non-living object: a picture of a body part (a hand, a face), a person or an animal is not a prop, and is sent back; ${unbroken}`;
     case 'background':
       return `It is the scene's place as its Background line says (the setting, its light and time of day, the props that stay in it), with no people in it; a place seen in an earlier scene looks the same as its background there; ${unbroken}`;
     case 'end':

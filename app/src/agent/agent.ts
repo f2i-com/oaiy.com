@@ -14,7 +14,7 @@ import type { ProviderConfig } from './providers/types';
 import { sendTurn, type Attachment, type FrameReview, type Reply, type ToolCall, type ToolResult, type Turn, type Usage } from './protocol';
 import { EDIT_TOOLS, EDIT_TOOLS_WINDOW, MAIN_AGENT_ONLY, TOOLS, checkApp, mediaTools, readPlan, readTasks, runTool, type Plan, type SoftnHost, type ToolContext } from './tools';
 import { readProjectVoices } from './voices';
-import { MAX_REDOS, MAX_REVIEW_FAILURES, checklist, countProblems, type PersonCount, readReviews, reviewOf, scriptExcerpt, storyFolder, writeReviews } from './review';
+import { MAX_REDOS, MAX_REVIEW_FAILURES, checklist, contentHash, countProblems, type PersonCount, readReviews, reviewOf, scriptExcerpt, storyFolder, writeReviews } from './review';
 import type { MediaSettings } from './media';
 import { queueFor } from './queue';
 import type { ToolSpec } from './protocol';
@@ -116,6 +116,8 @@ You are a reviewer: the main agent made a picture for a scripted video and goes 
 How to look: the picture and its reference images are attached to your task, small, for a quick once-over. Go over the picture person by person: count their heads, arms, hands and legs one by one, following every limb to where it joins the body, and compare each person and prop with their reference. Where something is unclear (a hand, a crowded part, a face), zoom in with view_image's x, y, width and height; look at the script (read_file), the scene's background or earlier frames only when you need them. Be quick: judge from what you see, in few steps.
 Be strict about what a viewer would notice: a picture not in the script's art style (its Style line: a photographic background in a cartoon, a drawn face in a realistic film); a wrong count of limbs, fingers or faces; a character who does not match their reference (face, hair, build, clothes); a missing or extra person or prop; something duplicated, merged, floating or the wrong size; the wrong place or light; a pose or expression that does not fit the moment or the story; more than the speaker in view in a shot with dialogue; an end frame that is not its start frame moved on; stray text. Let small things pass (a fold of cloth, a detail far in the background). When in doubt about a body or a face, send it back. Then call give_verdict once, and reply with one line.`;
 const KEEP_RECENT_TURNS = 8;
+/** For the same reply twice, with nothing done in between. */
+const REPEAT_NUDGE = 'You gave the same reply again, and still no tool has run. Do not reply in words: your next reply must be a tool call (update_plan for a task, or the first tool the work needs).';
 /** For a reply that only announced the work. */
 const START_NUDGE = 'You said what you will do, but no tool has run yet, so nothing has started. Start now: call update_plan with the plan (for a task with several steps), then the first step\'s tools. Do not describe the work again; do it.';
 
@@ -158,8 +160,8 @@ const MEDIA_MAKE_GUIDE = `- generate_image, generate_video, generate_speech, cre
 const VIDEO_SCRIPT_GUIDE = `- Every video the user asks for is made from a plan and a script, however short or vague the request, written and revised before any picture or clip is made. Start with update_plan: writing the script is its first step, then one step per scene, then joining the clips. A vague request ("a video of a cat", "make something fun") becomes a short scene of your own making: a premise with a small beginning, middle and end, told in 3 to 6 shots of varied framing (an establishing wide shot, closer shots of the action, a reaction or a detail), about 10 to 25 seconds in all, joined with media_compose. Only when the user asks for exactly one clip is it a single shot. Give the video its own folder (video/NAME/) with script.md in it, and its frames, clips and audio beside it. The script has these parts, under these headings (a reviewer finds each picture's part of the script by them):
   ## Premise: what the video is about, in a few sentences: who wants what, what stands in their way, and how it ends. Every scene moves this story on; nothing happens at random.
   ## Style: the look of the whole video, from what the user asked for (a cartoon, anime, a realistic film, a painting…; realistic when they did not say): the medium and art style, the line and shading, the colour palette and the mood of the light, ending in one Style line of prompt words, e.g. "Style: 2D anime, clean line art, cel shading, soft pastel palette" or "Style: photorealistic, 35mm film, natural light". Every picture's prompt ends with that Style line, word for word: the character and prop references, the backgrounds and every frame, so nothing comes out in another style (no photographic street behind a cartoon character, no drawn face in a realistic film).
-  ## Characters: for each, their look (face, age, build, hair, clothes: the same in every frame), their voice (for create_voice), and what they want. Their reference image shows only them, full length, facing the camera with a neutral expression, on a blank white background with nothing else in it: the frames give them their place and their expressions. It is a reference, never a frame. A character from a picture the user gave says so (From: uploads/NAME.jpg), and their look describes that person as the picture shows them; their reference image is then made from it (the user's picture as reference_images): the same person, recognisably, in the video's Style.
-  ## Props: every object, animal or vehicle that is seen in more than one shot or matters to the story, with its look (shape, size, colour, material, markings), so it never changes. Each gets a reference image of its own, alone on a blank white background. A prop or a place from a picture the user gave is made from that picture the same way (From: uploads/NAME.jpg).
+  ## Characters: every person or animal in the story (anything alive is a character, never a prop), and any part of one seen on its own (a hand reaching in, a paw) belongs to its character: described in their look and shown in their frames, never made as a prop. For each, their look (face, age, build, hair, clothes: the same in every frame), their voice (for create_voice), and what they want. Their reference image shows only them, full length, facing the camera with a neutral expression, on a blank white background with nothing else in it: the frames give them their place and their expressions. It is a reference, never a frame. A character from a picture the user gave says so (From: uploads/NAME.jpg), and their look describes that person as the picture shows them; their reference image is then made from it (the user's picture as reference_images): the same person, recognisably, in the video's Style.
+  ## Props: every non-living object (a thing, a vehicle, a piece of furniture; never a body part, a person or an animal) that is seen in more than one shot or matters to the story, with its look (shape, size, colour, material, markings), so it never changes. Each gets a reference image of its own, alone on a blank white background. A prop or a place from a picture the user gave is made from that picture the same way (From: uploads/NAME.jpg).
   ## Scene 2: a title (one heading per scene, numbered from 1): where and when it is, what happens and why it matters to the story, in a line or two, and a Background line: the empty place as a prompt for generate_image (the setting, its light and time of day, the props that stay in it), with no people in it. Then its shots, each at most 5 seconds and numbered on through the whole script, every one written out in full like this:
      ### Shot 3 (scene 2, 4 s)
      Joins: cut (a new framing, place or moment), or continuous from shot 2 (the motion flows on, unbroken, from where shot 2 ends).
@@ -442,6 +444,9 @@ export class Agent {
    * set this run and did not finish, or an app whose check still fails.
    */
   private unfinished(planThisRun: boolean): string | null {
+    if (this.activeFlag && !this.flagFixed(this.activeFlag.path)) {
+      return `The flagged /${this.activeFlag.path} is not fixed yet: make it again, fixing what the user flagged, until it passes its review. Then you will be told what comes next.`;
+    }
     // Only apps checked in this run count: an old failure should not hold up something else.
     const failing = [...this.failingApps.entries()].find(([root]) => this.checkedRoots.has(root));
     if (failing) return `The last automatic check of ${appLabel(failing[0])} still reports errors:\n${failing[1]}\nFix them and check the app again before you finish. If you cannot, say what is wrong.`;
@@ -1120,6 +1125,82 @@ export class Agent {
   }
 
   /** Run one user request to completion. */
+  /**
+   * The conversation as it is saved: pictures the tools showed long ago are
+   * left out (the model is not sent them again anyway, and a project full of
+   * them made every save slow). The user's own attachments stay.
+   */
+  savedTurns(): Turn[] {
+    let seen = 0;
+    return [...this.turns]
+      .reverse()
+      .map((t): Turn => {
+        if (t.role !== 'tool' || !t.results.some((r) => r.images?.length)) return t;
+        if (++seen <= KEEP_IMAGE_TURNS) return t;
+        return { role: 'tool', results: t.results.map((r) => (r.images?.length ? { ...r, images: undefined, content: `${r.content}\n[image no longer attached; call view_image again to see it]` } : r)) };
+      })
+      .reverse();
+  }
+
+  /**
+   * Pictures the user flagged, fixed one at a time before anything else: the
+   * first is given to the model alone; when it is fixed (made again, and passed
+   * its review when it has one) the next is given, and after the last the model
+   * is sent back to the work it was doing.
+   */
+  private flags: Array<{ path: string; comment: string }> = [];
+  private activeFlag: { path: string; comment: string } | null = null;
+
+  /** Flag a picture: it is fixed before anything else. True when a run is going (it takes the flag at its next step). */
+  flag(path: string, comment: string): boolean {
+    const key = normalizePath(path);
+    if (this.activeFlag?.path !== key && !this.flags.some((f) => f.path === key)) this.flags.push({ path: key, comment: comment.trim() });
+    return this.running;
+  }
+
+  /** Whether a flagged picture is fixed: made again, and passed its review when it has one. */
+  private flagFixed(path: string): boolean {
+    const vfs = this.options.vfs;
+    if (!vfs.exists(`/${path}`)) return true;
+    const entry = readReviews(vfs)[path];
+    if (!entry) return true;
+    // Made again outside a scripted video (no new review): the flagged picture is gone.
+    if (entry.hash !== contentHash(vfs.readBytes(`/${path}`))) return true;
+    return !entry.flagged && entry.verdict === 'pass';
+  }
+
+  /** Move the flags on: the fixed one is done, the next is given, or the model goes back to its work. True when it was told something. */
+  private flagStep(emit: (e: AgentEvent) => void): boolean {
+    if (this.activeFlag && this.flagFixed(this.activeFlag.path)) {
+      emit({ type: 'status', message: `Fixed the flagged /${this.activeFlag.path}.` });
+      this.activeFlag = null;
+      if (!this.flags.length) {
+        const open = this.plan?.items.filter((i) => i.status !== 'done') ?? [];
+        this.turns.push({
+          role: 'user',
+          automatic: true,
+          text: `[bot.computer] The flagged pictures are fixed. Now go back to the work you were doing before they were flagged, and carry on from where you left off${open.length ? `: your plan's open steps are ${open.map((i) => `"${i.text}"`).join(', ')}` : ''}. If there was none, finish with a short summary.`,
+        });
+        return true;
+      }
+    }
+    if (this.activeFlag || !this.flags.length) return false;
+    const f = (this.activeFlag = this.flags.shift()!);
+    emit({ type: 'status', message: `Fixing the flagged /${f.path} first${this.flags.length ? ` (${this.flags.length} more waiting)` : ''}.` });
+    this.turns.push({
+      role: 'user',
+      automatic: true,
+      text: [
+        `[bot.computer] The user flagged /${f.path} as wrong${f.comment ? `: "${f.comment}"` : ', without saying why'}. Fix it before anything else, and only it${this.flags.length ? ` (${this.flags.length} more flagged picture${this.flags.length === 1 ? '' : 's'} will follow, one at a time)` : ''}:`,
+        f.comment ? '- look at it (view_image) to see what they mean;' : '- run review_frame on it: a reviewer finds what is wrong;',
+        '- make it again at the same path, fixing that (a clearer prompt, other reference images, another seed), until it passes its review;',
+        '- then make again what was made from it, if anything (an end frame edited from it, a clip that starts or ends on it).',
+        'Do nothing else until it is fixed; you will then be told what comes next.',
+      ].join('\n'),
+    });
+    return true;
+  }
+
   /** Messages the user sent while a run was going, for the model's next step. */
   private inbox: Array<{ text: string; images: ImagePart[]; attachments: Attachment[] }> = [];
 
@@ -1187,11 +1268,15 @@ export class Agent {
     // Tool calls this run, and whether it was asked to start after only saying what it would do.
     let acted = 0;
     let startNudged = false;
+    // The last reply without a tool call, to notice the same words again.
+    let lastSaid = '';
+    let repeatNudged = false;
     const maxSteps = this.options.maxSteps ?? MAX_STEPS;
     try {
       for (let step = 1; step <= maxSteps; step++) {
         signal?.throwIfAborted();
         this.readInbox(emit);
+        this.flagStep(emit);
         const finish = this.options.finish;
         if (finish && !this.finishing && step > finish.after) {
           this.finishing = true;
@@ -1204,6 +1289,23 @@ export class Agent {
         if (!reply.calls.length) {
           // A message came in while it answered: not done until it has read it.
           if (this.inbox.length) continue;
+          // A flag fixed: the next is given, or it goes back to its work (one not fixed is nudged below).
+          if (this.flagStep(emit)) continue;
+          // The same reply again, and still nothing done: ask once for a tool call, then stop rather than loop.
+          const said = reply.text.trim().replace(/\s+/g, ' ').toLowerCase();
+          const repeated = !finish && !!said && said === lastSaid;
+          lastSaid = said;
+          if (repeated) {
+            if (!repeatNudged) {
+              repeatNudged = true;
+              emit({ type: 'nudge', message: 'It gave the same reply again without doing anything; asked for a tool call.' });
+              this.turns.push({ role: 'user', text: `[bot.computer] ${REPEAT_NUDGE}`, automatic: true });
+              continue;
+            }
+            emit({ type: 'status', message: 'The model kept giving the same reply without doing anything, so the run stopped. Say what to do next.' });
+            emit({ type: 'done', text: reply.text, steps: step });
+            return;
+          }
           // It said what it would do but has done nothing yet: ask it, once, to start.
           if (!acted && !startNudged && !finish && announcesWork(reply.text)) {
             startNudged = true;
@@ -1233,6 +1335,7 @@ export class Agent {
           return;
         }
         acted += reply.calls.length;
+        lastSaid = '';
         const results: ToolResult[] = [];
         stepResults = results;
         changes = [];

@@ -8,10 +8,10 @@
  * The in-memory Vfs is the source of truth while a project is open; every
  * change is written behind to OPFS (a short debounce, one write per path).
  *
- * An incognito project is a temporary one: its files are written behind the
- * same way (a cache, so large media need not all sit in memory), its
- * conversation is never written, and it is deleted when it is left, or when the
- * app next starts if it was not. Exporting it is the only way to keep it.
+ * An incognito project is a temporary one: its files and conversation are kept
+ * only in its own folder here (so it survives a refresh or a restart), and the
+ * folder is deleted when incognito is cleared or turned off. Nothing of it goes
+ * anywhere else; exporting it is the only way to keep it.
  */
 import type { Turn } from '../agent/protocol';
 import { Vfs, type VfsChange } from './vfs';
@@ -231,13 +231,11 @@ export class OpenProject {
   }
 
   async loadChat(): Promise<Turn[]> {
-    if (this.meta.incognito) return [];
     return (await readJson<Turn[]>(this.dir, 'chat.json')) ?? [];
   }
 
-  /** The conversation, kept with the project; never for an incognito one. */
+  /** The conversation, kept with the project (an incognito one's is deleted with it). */
   async saveChat(turns: Turn[]): Promise<void> {
-    if (this.meta.incognito) return;
     await writeBytes(this.dir, 'chat.json', JSON.stringify(turns));
   }
 

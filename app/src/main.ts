@@ -140,11 +140,13 @@ async function main(): Promise<void> {
       return;
     }
     flagPicture(project.vfs, key, comment);
-    void submit(
-      comment
-        ? `⚑ I flagged /${key}: ${comment}\n\nLook at it, then make it again at the same path, fixing that (a clearer prompt, other reference images or another seed). Anything already made from it (a frame edited from it, a clip that starts or ends on it) is made again after it. Then carry on.`
-        : `⚑ I flagged /${key} as wrong, without saying why.\n\nRun review_frame on it: a reviewer looks for what is wrong. Then make it again at the same path, fixing what it found, and make again anything already made from it (a frame edited from it, a clip that starts or ends on it). Then carry on.`,
-    );
+    // Flags queue up and are fixed one at a time, before the agent goes on; a working agent takes it at its next step.
+    const said = `⚑ Flagged /${key}${comment ? `: ${comment}` : ' (no comment: the agent will look for what is wrong)'}`;
+    if (agent.flag(key, comment)) {
+      chat.user(said, [], true);
+      return;
+    }
+    void submit(`${said}. Fix it, then carry on with what you were doing, if anything.`);
   }
   const notice = (message: string) => chat.system(message, 'error');
   const tree = new FileTree(null as unknown as Vfs, (path) => {
@@ -254,7 +256,7 @@ async function main(): Promise<void> {
     if (project) {
       editor.flush();
       await project.close();
-      await project.saveChat(agent.turns);
+      await project.saveChat(agent.savedTurns());
       unsubscribe?.();
     }
     project = await OpenProject.open(meta);
@@ -303,7 +305,7 @@ async function main(): Promise<void> {
     // incognito stays on until it is turned off.
     await saveLastProject(meta.id);
     if (meta.incognito) {
-      chat.system(`🕶 Incognito is on${reopening ? ' (as it was before the app was refreshed or restarted; the conversation was not kept, the files were)' : ''}. Nothing of this project is kept: its conversation is never saved, its files (and every picture, clip and sound made in it) live in a temporary cache that is deleted when you turn incognito off, and nrob is told to keep nothing of its requests. Export it (Export .zip, or Export to folder) to keep anything.`);
+      chat.system(`🕶 Incognito is on${reopening ? ', as it was before the app was refreshed or restarted' : ''}. This project, its conversation and every picture, clip and sound made in it are kept only in this app's temporary storage, until you press Clear or turn incognito off, and nrob is told to keep nothing of its requests. Export it (Export .zip, or Export to folder) to keep anything.`);
     } else {
       lastKept = meta.id;
       await saveLastKeptProject(meta.id);
@@ -522,7 +524,7 @@ async function main(): Promise<void> {
       if (saveTimer) return;
       saveTimer = setTimeout(() => {
         saveTimer = null;
-        void runProject.saveChat(runAgent.turns).catch(() => {});
+        void runProject.saveChat(runAgent.savedTurns()).catch(() => {});
       }, 1500);
     };
     try {
@@ -555,7 +557,7 @@ async function main(): Promise<void> {
       controller = null;
       if (project === runProject) chat.setBusy(false);
       await runProject.flush();
-      await runProject.saveChat(runAgent.turns);
+      await runProject.saveChat(runAgent.savedTurns());
       finish();
       currentRun = null;
       // Messages that came in as the run ended: the next request (the chat shows them already).
@@ -969,7 +971,7 @@ With that done, Settings → Images, video and audio → Find nrob sets it up.`)
   const saveNow = () => {
     editor.flush();
     void project.flush();
-    void project.saveChat(agent.turns).catch(() => {});
+    void project.saveChat(agent.savedTurns()).catch(() => {});
   };
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'hidden') saveNow();
@@ -983,7 +985,7 @@ With that done, Settings → Images, video and audio → Find nrob sets it up.`)
         controller?.abort();
         editor.flush();
         await project.flush();
-        await project.saveChat(agent.turns);
+        await project.saveChat(agent.savedTurns());
       } finally {
         await (window as unknown as { __TAURI_INTERNALS__?: { invoke: (cmd: string) => Promise<unknown> } }).__TAURI_INTERNALS__?.invoke('ready_to_quit');
       }

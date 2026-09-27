@@ -13,6 +13,13 @@ import { renderMarkdown } from './markdown';
 
 /** How long a flag waits for a comment before it goes without one. */
 const FLAG_WAIT_SECONDS = 10;
+/**
+ * Streamed text (the reply, thinking, a tool call being written) arrives in
+ * hundreds of pieces a second; redrawing a long text for each froze the page
+ * and could garble the display. Each box redraws at most this often, with all
+ * that has arrived by then.
+ */
+const STREAM_REDRAW_MS = 80;
 
 function summarizeCall(call: ToolCall): string {
   const i = call.input;
@@ -399,19 +406,21 @@ export class ChatPane {
       this.draft = { box, body, raw: '', json };
     }
     this.draft.raw += text;
-    const raw = this.draft.raw;
-    const name = this.draft.json ? '' : /<function=([\w.-]+)>/.exec(raw)?.[1] ?? '';
-    if (name) this.draft.box.querySelector('.tool-name')!.textContent = `writing ${name}…`;
-    this.draft.body.textContent = this.draft.json
-      ? raw.replace(/\\n/g, '\n').replace(/\\"/g, '"').replace(/\\t/g, '\t')
-      : raw
-          .replace(/<\/?tool_call>\s*/g, '')
-          .replace(/<function=[\w.-]+>\s*/g, '')
-          .replace(/<parameter=([\w.-]+)>\n?/g, '$1:\n')
-          .replace(/\n?<\/(parameter|function)>/g, '\n');
-    // A long draft scrolls in its box: the newest lines stay in view.
-    this.draft.body.scrollTop = this.draft.body.scrollHeight;
-    this.scroll();
+    const draft = this.draft;
+    this.redraw('draft', () => {
+      const raw = draft.raw;
+      const name = draft.json ? '' : /<function=([\w.-]+)>/.exec(raw)?.[1] ?? '';
+      if (name) draft.box.querySelector('.tool-name')!.textContent = `writing ${name}…`;
+      draft.body.textContent = draft.json
+        ? raw.replace(/\\n/g, '\n').replace(/\\"/g, '"').replace(/\\t/g, '\t')
+        : raw
+            .replace(/<\/?tool_call>\s*/g, '')
+            .replace(/<function=[\w.-]+>\s*/g, '')
+            .replace(/<parameter=([\w.-]+)>\n?/g, '$1:\n')
+            .replace(/\n?<\/(parameter|function)>/g, '\n');
+      // A long draft scrolls in its box: the newest lines stay in view.
+      draft.body.scrollTop = draft.body.scrollHeight;
+    });
   }
 
   /** A message from the app itself (commands, errors, notices). */
@@ -421,7 +430,22 @@ export class ChatPane {
     this.scroll();
   }
 
-  private renderQueued = false;
+  /** Run `draw` soon (see STREAM_REDRAW_MS), once for however many calls came before it ran. */
+  private redraws = new Map<string, () => void>();
+  private redraw(key: string, draw: () => void): void {
+    const queued = this.redraws.has(key);
+    this.redraws.set(key, draw);
+    if (queued) return;
+    setTimeout(() => {
+      const latest = this.redraws.get(key);
+      this.redraws.delete(key);
+      requestAnimationFrame(() => {
+        latest?.();
+        this.scroll();
+      });
+    }, STREAM_REDRAW_MS);
+  }
+
   private assistantText(delta: string): void {
     if (!this.current) {
       const body = h('div.msg-body');
@@ -430,14 +454,10 @@ export class ChatPane {
       this.current = { box, text: '', body };
     }
     this.current.text += delta;
-    // A long reply streams in many pieces: draw it at most once a frame.
-    if (this.renderQueued) return;
-    this.renderQueued = true;
+    // A long reply streams in many pieces: drawn a few times a second, not for each.
     const target = this.current;
-    requestAnimationFrame(() => {
-      this.renderQueued = false;
+    this.redraw('reply', () => {
       target.body.innerHTML = renderMarkdown(target.text);
-      this.scroll();
     });
   }
 
@@ -592,8 +612,12 @@ export class ChatPane {
           this.thinking = { box, text: '' };
         }
         this.thinking.text += e.delta;
-        this.thinking.box.querySelector('pre')!.textContent = this.thinking.text;
-        this.scroll();
+        {
+          const thinking = this.thinking;
+          this.redraw('thinking', () => {
+            thinking.box.querySelector('pre')!.textContent = thinking.text;
+          });
+        }
         break;
       case 'tool_draft':
         this.doneThinking();

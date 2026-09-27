@@ -98,6 +98,7 @@ describe('the script a picture is checked against', () => {
     for (const kind of ['start', 'end', 'background', 'character', 'prop'] as const) expect(checklist(kind)).toContain("It is in the script's Style");
     // A character from the user's picture of a person must still be them.
     expect(checklist('character')).toContain('it is recognisably that person, restyled but not replaced');
+    expect(checklist('prop')).toContain('a picture of a body part (a hand, a face), a person or an animal is not a prop');
     expect(excerpt).toContain('Background: a small steel kitchen');
     expect(excerpt).toContain('Start frame: Gary at the stove');
     expect(excerpt).not.toContain('Start frame: the pot');
