@@ -97,6 +97,29 @@ fn identifier(s: &str) -> Result<(), String> {
     if s.is_empty() || !s.chars().all(|c| c.is_ascii_alphanumeric() || "_-.:".contains(c)) { Err("invalid tool/parameter name".into()) } else { Ok(()) }
 }
 
+/// Qwen sometimes opens a call with the parameter tag where the function tag
+/// belongs: `<parameter=update_plan>` then the parameters. When the name is a
+/// declared function, read it as `<function=update_plan>`, and set right the
+/// closing tag that leaves (one `</parameter>` too many, or no `</function>`).
+/// Anything else stays as written, to be refused.
+fn repair_function_tag(block: &str, tools: &[Json]) -> Option<String> {
+    let (name, body) = block.trim().strip_prefix("<parameter=")?.split_once('>')?;
+    tools.iter().filter_map(|t| t.get("function")).find(|f| f.get("name").and_then(Json::as_str) == Some(name))?;
+    let mut body = body.trim_end();
+    if let Some(inner) = body.strip_suffix("</function>") {
+        body = inner.trim_end();
+    }
+    let (opens, closes) = (body.matches("<parameter=").count(), body.matches("</parameter>").count());
+    let body = if closes == opens + 1 {
+        body[..body.rfind("</parameter>")?].trim_end()
+    } else if closes == opens {
+        body
+    } else {
+        return None;
+    };
+    Some(format!("<function={name}>{body}\n</function>"))
+}
+
 /// Convert a complete, schema-typed native call to the server's existing
 /// strict tool parser. Partial/malformed calls never become executable calls.
 pub fn normalize(text: &str, tools: &[Json]) -> Result<String, String> {
@@ -109,6 +132,8 @@ pub fn normalize(text: &str, tools: &[Json]) -> Result<String, String> {
     let mut out = format!("{prefix}<{DSML} calls>");
     loop {
         let (block, tail) = rest.split_once("</tool_call>").ok_or("incomplete Qwen tool call")?;
+        let repaired = repair_function_tag(block, tools);
+        let block = repaired.as_deref().unwrap_or(block);
         let f = block.trim().strip_prefix("<function=").ok_or("missing function tag")?;
         let (name, params) = f.split_once('>').ok_or("incomplete function tag")?;
         identifier(name)?;
@@ -485,6 +510,18 @@ mod tests {
         assert!(normalize(&call.replace("</tool_call>",""),&tools()).is_err());
         assert!(normalize(&call.replace("function=computer","function=unknown"),&tools()).is_err());
         assert!(normalize(&format!("{call} unwanted suffix"),&tools()).is_err());
+    }
+    #[test]
+    fn a_function_named_with_the_parameter_tag_is_read_as_the_function() {
+        let call = "<tool_call>\n<parameter=computer>\n<parameter=action>\nkeyboard_sequence\n</parameter>\n</parameter>\n</tool_call>";
+        let fixed = "<tool_call>\n<function=computer>\n<parameter=action>\nkeyboard_sequence\n</parameter>\n</function>\n</tool_call>";
+        assert_eq!(normalize(call, &tools()).unwrap(), normalize(fixed, &tools()).unwrap());
+        // No stray closing tag, or a proper </function>: read the same.
+        assert!(normalize(&call.replace("</parameter>\n</parameter>", "</parameter>"), &tools()).is_ok());
+        assert!(normalize(&call.replace("</parameter>\n</parameter>", "</parameter>\n</function>"), &tools()).is_ok());
+        // Only for a declared function, and only when the tags balance.
+        assert!(normalize(&call.replace("parameter=computer", "parameter=unknown"), &tools()).is_err());
+        assert!(normalize(&call.replace("</parameter>\n</parameter>", "</parameter>\n</parameter>\n</parameter>"), &tools()).is_err());
     }
     #[test]
     fn rejected_calls_are_quoted_from_their_start() {
