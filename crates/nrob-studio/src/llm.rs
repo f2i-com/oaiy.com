@@ -53,6 +53,8 @@ struct Inner {
     last_used: Instant,
     /// Model names served by the running process, default first.
     models: Vec<String>,
+    /// The model it holds now: the default when it starts, then the last one asked for.
+    resident: Option<String>,
     /// The context the loaded model was opened with, as nrob-server reported it.
     context: Option<i64>,
     command: String,
@@ -254,6 +256,7 @@ impl Llm {
                 paused: false,
                 last_used: Instant::now(),
                 models: Vec::new(),
+                resident: None,
                 context: None,
                 command: String::new(),
                 fallbacks: Vec::new(),
@@ -361,6 +364,8 @@ impl Llm {
         g.started = Some(Instant::now());
         g.ready_after = None;
         g.context = None;
+        // nrob-server loads its default model as it starts.
+        g.resident = names.first().cloned();
         g.models = names;
         g.last_used = Instant::now();
         drop(g);
@@ -469,7 +474,19 @@ impl Llm {
         g.state = State::Stopped;
         g.error = None;
         g.ready_after = None;
+        g.resident = None;
         self.changed.notify_all();
+    }
+
+    /// The model the running server holds (None when it is not running).
+    pub fn resident(&self) -> Option<String> {
+        let g = self.lock();
+        matches!(g.state, State::Starting | State::Ready).then(|| g.resident.clone()).flatten()
+    }
+
+    /// A request is about to switch the server to `name`.
+    pub fn set_resident(&self, name: String) {
+        self.lock().resident = Some(name);
     }
 
     /// Start if needed and wait until it serves (or fails, or `timeout` passes).
@@ -512,6 +529,7 @@ impl Llm {
             ("state", Json::str(g.state.name())),
             ("error", g.error.as_ref().map_or(Json::Null, Json::str)),
             ("models", Json::Arr(g.models.iter().map(Json::str).collect())),
+            ("resident", g.resident.as_ref().filter(|_| matches!(g.state, State::Starting | State::Ready)).map_or(Json::Null, Json::str)),
             ("paused_for_media", Json::Bool(g.paused)),
             ("uptime_seconds", g.started.filter(|_| g.state != State::Stopped).map_or(Json::Null, |s| Json::Int(s.elapsed().as_secs() as i64))),
             ("load_seconds", g.ready_after.map_or(Json::Null, Json::Num)),

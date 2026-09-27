@@ -386,6 +386,12 @@ pub fn validate(v: &Json) -> Result<(), String> {
     if !llm.get("devices").and_then(Json::as_array).is_some_and(|d| d.iter().all(|d| d.as_i64().is_some_and(|d| (0..64).contains(&d)))) {
         return Err("llm.devices must be a list of GPU indices".into());
     }
+    // A model's own GPUs (it runs there instead of on llm.devices).
+    for m in llm.get("models").and_then(Json::as_array).unwrap_or(&[]) {
+        if m.get("devices").is_some_and(|d| !matches!(d, Json::Null) && !d.as_array().is_some_and(|d| d.iter().all(|d| d.as_i64().is_some_and(|d| (0..64).contains(&d))))) {
+            return Err(format!("model {}: devices must be a list of GPU indices", str_or(m, "name", "")));
+        }
+    }
     for (key, min, max) in [("ctx", 512, 1 << 20), ("max_tokens", 1, 1 << 20), ("cpu_threads", 0, 1024), ("ram_gb", 0, 4096)] {
         // `cpu_threads: null` means "this machine's core count".
         if key == "cpu_threads" && matches!(llm.get(key), Some(Json::Null)) {

@@ -182,14 +182,28 @@ It may never ask for more.
 
 ### Sharing GPUs with the language model
 
-`media.device` is the GPU media jobs use; `llm.devices` are the LLM's GPUs.
+`media.device` is the GPU that image, video, speech and music jobs use.
+`llm.devices` are the language models' GPUs, and a model's own `devices`
+override them for that model. For example, the 27B can run on GPU 0 while
+Flash-Next spans GPUs 0 and 1. On the **Memory** page, **Sharing GPUs** sets
+these, and **Layout** offers two common choices on a machine with two or more
+GPUs:
+
+- the language model on GPU 0 and media on GPU 1;
+- the language model on every GPU, with media on the last one pausing it.
+
+A model's own GPUs are set on its card under **Models**.
+
 `media.llm_policy` decides what happens when they meet:
 
-- `auto` (default): if the media GPU is one of the LLM's, the studio waits for
-  running chat requests to finish, stops `nrob-server`, runs the job, and
-  restarts the LLM once the queue is empty (`media.resume_llm`). Chat requests
-  that arrive meanwhile wait, up to 15 minutes, and are then answered.
-- `pause_llm`: always do that.
+- `auto` (default): media takes turns only with a model on the media GPU.
+  - When a job starts while such a model is loaded, the studio waits for that
+    model's running chat requests to finish, stops `nrob-server`, runs the job,
+    and restarts the LLM once the queue is empty (`media.resume_llm`).
+  - Chat requests for such a model that arrive meanwhile wait, up to 15
+    minutes, and are then answered.
+  - A model on other GPUs keeps answering while media runs.
+- `pause_llm`: every job stops the LLM, whichever model it holds.
 - `coexist`: never; both must fit.
 
 `llm.idle_stop_minutes` stops an idle LLM so its RAM and VRAM return to the

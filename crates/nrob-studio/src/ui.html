@@ -691,8 +691,14 @@ dialog::backdrop { background: var(--backdrop); }
       <div class="block" id="mem-video"></div>
       <div class="block">
         <h2>Sharing GPUs</h2>
+        <p class="muted small" style="margin-top:0">Which GPUs the language models use, and which one image, video, speech and music jobs use. A model can also have GPUs of its own (under Models), e.g. a big one across both.</p>
         <div class="grid-f">
-          <label class="f"><span>Media GPU</span><select id="media-device"></select></label>
+          <label class="f" id="gpu-layout-f"><span>Layout</span><select id="gpu-layout">
+            <option value="split">Language model on GPU 0, media on GPU 1</option>
+            <option value="llm_all">Language model on every GPU; media pauses it</option>
+            <option value="custom">Custom</option></select></label>
+          <div class="f"><span class="small muted">Language model GPUs</span><div class="row" id="llm-devices"></div></div>
+          <label class="f"><span>Media GPU (images, video, speech, music)</span><select id="media-device"></select></label>
           <label class="f"><span>When media needs the LLM's GPU</span><select id="llm-policy">
             <option value="auto">Pause the LLM only if they share a GPU</option>
             <option value="pause_llm">Always pause the LLM</option>
@@ -704,7 +710,6 @@ dialog::backdrop { background: var(--backdrop); }
       <div class="block">
         <h2>Language model memory</h2>
         <div class="grid-f">
-          <div class="f"><span class="small muted">GPUs</span><div class="row" id="llm-devices"></div></div>
           <label class="f"><span>RAM expert cache (GB, 0 = 80% of free)</span><input type="number" min="0" id="llm-ram" data-bind="llm.ram_gb" data-type="int"></label>
           <label class="f"><span>VRAM headroom (GB)</span><input type="number" min="0" step="0.5" id="llm-headroom" data-bind="llm.vram_headroom_gb" data-type="num"></label>
           <label class="f"><span>CPU threads for missed experts (empty = all cores)</span><input type="number" min="0" data-bind="llm.cpu_threads" data-type="intnull" placeholder="all cores"></label>
@@ -1136,12 +1141,13 @@ function renderModels() {
   $("#m-llm").innerHTML = llm.length ? llm.map(m => `<div class="item">
     <div class="item-head"><strong>${esc(m.name)}</strong>
       ${cfg.llm.default_model === m.name || (!cfg.llm.default_model && llm[0] === m) ? '<span class="tag good">Default</span>' : `<button class="btn quiet" data-default="llm|${esc(m.name)}">Make default</button>`}
-      ${state?.llm?.models?.[0] === m.name && state.llm.state === "ready" ? '<span class="tag gpu">Loaded</span>' : ""}
+      ${state?.llm?.resident === m.name && state.llm.state === "ready" ? '<span class="tag gpu">Loaded</span>' : ""}
       <span style="flex:1"></span>
       <label class="check"><input type="checkbox" data-menable="llm|${esc(m.name)}" ${m.enabled !== false ? "checked" : ""}> Enabled</label>
       <button class="btn quiet warn" data-remove="llm|${esc(m.name)}">Remove</button></div>
     <div class="cols" style="gap:12px">${field("Weights", "llm", m.name, "path", m.path)}${field("Vision projector (optional)", "llm", m.name, "vision_projector", m.vision_projector)}${field("LoRA adapter folder (optional)", "llm", m.name, "lora", m.lora, {dir: true})}<label class="f"><span>LoRA strength (1 = as trained)</span><input type="number" step="0.05" min="-4" max="4" value="${esc(String(m.lora_strength ?? 1))}" data-lorastrength="${esc(m.name)}"></label></div>
     ${loraList("llm", m.name, m.loras, "More LoRAs (optional; stacked with the one above, each with a strength)")}
+    <div class="f" style="margin-top:8px"><span class="small muted">GPUs of its own (none ticked: the language model GPUs under Memory)</span><div class="row">${gpuList().map(g => `<label class="check"><input type="checkbox" data-mgpu="${esc(m.name)}|${g.index}" ${(m.devices || []).includes(g.index) ? "checked" : ""}> GPU ${g.index}</label>`).join("")}</div></div>
   </div>`).join("") : '<div class="empty">No language model yet. Add a .gguf file or model folder above.</div>';
 
   const img = Object.entries(cfg.media.image.models);
@@ -1192,6 +1198,12 @@ function renderModels() {
   $$("[data-mfield]").forEach(el => el.oninput = () => { const [s, n, k] = el.dataset.mfield.split("|"); modelObj(s, n)[k] = el.value; touch(); });
   $$("[data-mpick]").forEach(b => b.onclick = () => { const [s, n, k] = b.dataset.mpick.split("|");
     pick({dir: !!b.dataset.dir, title: "Choose " + k.replace(/_/g, " ")}, p => { modelObj(s, n)[k] = p; const miss = s === "llm" ? [] : missingOf(s, modelObj(s, n)); if (s !== "llm" && !miss.length) modelObj(s, n).enabled = true; renderModels(); touch(); }); });
+  $$("[data-mgpu]").forEach(el => el.onchange = () => {
+    const [name] = el.dataset.mgpu.split("|"), m = modelObj("llm", name);
+    const picked = $$("[data-mgpu]").filter(i => i.checked && i.dataset.mgpu.split("|")[0] === name).map(i => +i.dataset.mgpu.split("|")[1]);
+    if (picked.length) m.devices = picked; else delete m.devices;
+    touch(); shareNote();
+  });
   $$("[data-lorastrength]").forEach(el => el.oninput = () => { const m = modelObj("llm", el.dataset.lorastrength); const v = Number(el.value); m.lora_strength = el.value === "" || isNaN(v) ? 1 : v; touch(); });
   $$("[data-lora]").forEach(el => el.oninput = () => { const [s, n, i, k] = el.dataset.lora.split("|"); const l = modelLoras(s, n)[+i];
     l[k] = k === "strength" ? (el.value === "" || isNaN(Number(el.value)) ? 1 : Number(el.value)) : el.value; touch(); });
@@ -1270,19 +1282,46 @@ function renderStripOnly(kind) {
   $("#" + kind + "-vram-v").textContent = s.vram_gb == null ? "free VRAM" : s.vram_gb + " GB";
   $("#" + kind + "-ram-v").textContent = (s.ram_gb ?? 32) + " GB";
 }
+function gpuList() {
+  return sys?.gpus?.length ? sys.gpus : [{index: 0, name: "GPU 0"}, {index: 1, name: "GPU 1"}];
+}
+/* The GPUs a language model runs on: its own, else the language model GPUs, else the first two. */
+function modelGpus(m) {
+  return m?.devices?.length ? m.devices : cfg.llm.devices.length ? cfg.llm.devices : [0, 1];
+}
+function gpuLayout() {
+  const all = gpuList().map(g => g.index), last = all[all.length - 1], devs = cfg.llm.devices;
+  if (devs.length === 1 && devs[0] === 0 && cfg.media.device === 1) return "split";
+  if (devs.length === all.length && all.every(i => devs.includes(i)) && cfg.media.device === last) return "llm_all";
+  return "custom";
+}
 function renderDevices() {
-  const gpus = sys?.gpus?.length ? sys.gpus : [{index: 0, name: "GPU 0"}, {index: 1, name: "GPU 1"}];
+  const gpus = gpuList();
   $("#media-device").innerHTML = gpus.map(g => `<option value="${g.index}" ${g.index === cfg.media.device ? "selected" : ""}>GPU ${g.index}: ${esc(g.name)}</option>`).join("");
-  $("#media-device").onchange = e => { cfg.media.device = +e.target.value; touch(); shareNote(); renderMemory(); };
+  $("#media-device").onchange = e => { cfg.media.device = +e.target.value; touch(); renderDevices(); shareNote(); renderMemory(); };
   $("#llm-devices").innerHTML = gpus.map(g => `<label class="check"><input type="checkbox" value="${g.index}" ${cfg.llm.devices.includes(g.index) ? "checked" : ""}> GPU ${g.index}</label>`).join("");
-  $$("#llm-devices input").forEach(el => el.onchange = () => { cfg.llm.devices = $$("#llm-devices input").filter(i => i.checked).map(i => +i.value); touch(); shareNote(); });
+  $$("#llm-devices input").forEach(el => el.onchange = () => { cfg.llm.devices = $$("#llm-devices input").filter(i => i.checked).map(i => +i.value); touch(); renderDevices(); shareNote(); });
+  // Two or more GPUs: a layout in one choice.
+  $("#gpu-layout-f").style.display = gpus.length > 1 ? "" : "none";
+  $("#gpu-layout").value = gpuLayout();
+  $("#gpu-layout").onchange = e => {
+    const all = gpus.map(g => g.index);
+    if (e.target.value === "split") { cfg.llm.devices = [0]; cfg.media.device = 1; }
+    if (e.target.value === "llm_all") { cfg.llm.devices = all; cfg.media.device = all[all.length - 1]; }
+    if (e.target.value !== "custom" && cfg.media.llm_policy === "coexist") cfg.media.llm_policy = "auto";
+    $("#llm-policy").value = cfg.media.llm_policy;
+    touch(); renderDevices(); shareNote(); renderMemory();
+  };
 }
 function shareNote() {
-  const d = cfg.media.device, devs = cfg.llm.devices, pol = cfg.media.llm_policy;
-  const shares = devs.length ? devs.includes(d) : d < 2;
-  $("#share-note").textContent = pol === "coexist" ? "Media and the LLM run side by side. Make sure both fit in VRAM."
-    : pol === "pause_llm" || shares ? `Media jobs on GPU ${d} stop the LLM first; chat requests wait until the job finishes.`
-    : `GPU ${d} is not one of the LLM's GPUs, so chat and media run at the same time.`;
+  const d = cfg.media.device, pol = cfg.media.llm_policy;
+  const models = cfg.llm.models.filter(m => m.enabled !== false);
+  const named = list => list.map(m => `${m.name} (GPU ${modelGpus(m).join(", ")})`).join(", ");
+  const shared = models.filter(m => modelGpus(m).includes(d)), free = models.filter(m => !modelGpus(m).includes(d));
+  $("#share-note").textContent = pol === "coexist" ? "Media and the language models run side by side. Make sure both fit in VRAM."
+    : pol === "pause_llm" ? `Every media job stops the language model first; chat requests wait until the job finishes.`
+    : [shared.length ? `Media jobs on GPU ${d} take turns with ${named(shared)}: it stops while a job runs, and its chat requests wait.` : `No language model uses GPU ${d}, so chat and media run at the same time.`,
+       shared.length && free.length ? `${named(free)} keep${free.length === 1 ? "s" : ""} answering while media runs.` : ""].filter(Boolean).join(" ");
 }
 
 /* ---------- endpoints ---------- */
@@ -1322,7 +1361,8 @@ function renderHardware() {
   for (const g of sys?.gpus || []) {
     const pct = g.memory_total_mb ? g.memory_used_mb / g.memory_total_mb * 100 : 0;
     const roles = [];
-    if (cfg && (cfg.llm.devices.length ? cfg.llm.devices.includes(g.index) : g.index < 2) && state?.llm?.state === "ready") roles.push("LLM");
+    const resident = cfg && state?.llm?.resident ? cfg.llm.models.find(m => m.name === state.llm.resident) : null;
+    if (cfg && state?.llm?.state === "ready" && modelGpus(resident).includes(g.index)) roles.push("LLM");
     if (cfg && cfg.media.device === g.index) roles.push("media");
     rows.push(`<div class="hw-row"><div class="label">GPU ${g.index}<small>${esc(g.name)}</small></div>
       <div class="meter" title="${pct.toFixed(0)}% used"><div style="width:${pct}%;background:var(--gpu)"></div></div>

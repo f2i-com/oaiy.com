@@ -163,12 +163,15 @@ pub struct Media {
 }
 
 /// A chat request's hold on the LLM; released on drop.
-pub struct ChatLease<'a>(&'a Media);
+/// A chat request's hold on the LLM; `true` when its model shares the media GPU.
+pub struct ChatLease<'a>(&'a Media, bool);
 
 impl Drop for ChatLease<'_> {
     fn drop(&mut self) {
         let mut b = self.0.broker.lock().unwrap_or_else(|p| p.into_inner());
-        b.chats -= 1;
+        if self.1 {
+            b.chats -= 1;
+        }
         self.0.broker_changed.notify_all();
     }
 }
@@ -820,7 +823,41 @@ pub fn video_request(cfg: &Json, root: &Path, output_root: &Path, body: &Json, a
     Ok((Json::Obj(f), name, format!("{w}x{h}"), seconds))
 }
 
-/// Whether a media job must have the GPU to itself: `llm_policy` `pause_llm`
+/// The enabled language model `requested` names, else the default one.
+pub fn resolve_model(cfg: &Json, requested: Option<&str>) -> Option<String> {
+    let llm = cfg.get("llm")?;
+    let enabled: Vec<&Json> = llm.get("models").and_then(Json::as_array).unwrap_or(&[]).iter().filter(|m| bool_or(m, "enabled", true)).collect();
+    let named = |n: &str| enabled.iter().find(|m| str_or(m, "name", "") == n).map(|m| str_or(m, "name", "").to_string());
+    requested.and_then(named).or_else(|| named(str_or(llm, "default_model", ""))).or_else(|| enabled.first().map(|m| str_or(m, "name", "").to_string()))
+}
+
+/// The GPUs a language model runs on: its own `devices`, else the LLM's
+/// `devices`, else the first two (nrob-server's default).
+pub fn model_devices(cfg: &Json, name: &str) -> Vec<i64> {
+    let llm = cfg.get("llm");
+    let ints = |v: Option<&Json>| -> Vec<i64> { v.and_then(Json::as_array).unwrap_or(&[]).iter().filter_map(Json::as_i64).collect() };
+    let own = llm.and_then(|l| l.get("models")).and_then(Json::as_array).unwrap_or(&[]).iter()
+        .find(|m| str_or(m, "name", "") == name).map(|m| ints(m.get("devices"))).unwrap_or_default();
+    if !own.is_empty() {
+        return own;
+    }
+    let all = ints(llm.and_then(|l| l.get("devices")));
+    if all.is_empty() { vec![0, 1] } else { all }
+}
+
+/// Whether language model `model` (None: the default) and media jobs take turns:
+/// `llm_policy` `pause_llm` always, `coexist` never, `auto` when the model runs on
+/// the media GPU. A model elsewhere keeps answering while media runs.
+pub fn needs_media_gpu(cfg: &Json, model: Option<&str>) -> bool {
+    let media = cfg.get("media").cloned().unwrap_or(Json::Null);
+    match str_or(&media, "llm_policy", "auto") {
+        "coexist" => false,
+        "pause_llm" => true,
+        _ => resolve_model(cfg, model).is_some_and(|m| model_devices(cfg, &m).contains(&int_or(&media, "device", 0))),
+    }
+}
+
+/// Whether a media job can stop the LLM at all: `llm_policy` `pause_llm`
 /// always, `coexist` never, `auto` when the media device is one the LLM uses
 /// (its `devices`, or those of an enabled model with GPUs of its own).
 pub fn pauses_llm(cfg: &Json) -> bool {
@@ -1088,8 +1125,9 @@ impl Media {
         self.changed.notify_all();
     }
 
-    /// Hold the LLM for one chat request. Waits (up to `timeout`) while a media
-    /// job that needs the LLM's GPU is queued to start or running.
+    /// Hold the LLM for one chat request. With `exclusive` (its model shares the
+    /// media GPU), waits (up to `timeout`) while a media job is queued to start or
+    /// running, and a media job waits for it.
     pub fn chat_lease(&self, exclusive: bool, timeout: Duration) -> Result<ChatLease<'_>, String> {
         let mut b = self.broker.lock().unwrap_or_else(|p| p.into_inner());
         let deadline = std::time::Instant::now() + timeout;
@@ -1100,8 +1138,10 @@ impl Media {
             }
             b = self.broker_changed.wait_timeout(b, left).unwrap_or_else(|p| p.into_inner()).0;
         }
-        b.chats += 1;
-        Ok(ChatLease(self))
+        if exclusive {
+            b.chats += 1;
+        }
+        Ok(ChatLease(self, exclusive))
     }
 
     /// The runner: one job at a time, forever. `studio` supplies configuration
@@ -1189,26 +1229,26 @@ impl Media {
         let cfg = studio.config();
         let media = cfg.get("media").cloned().unwrap_or(Json::Null);
         let device = int_or(&media, "device", 0);
-        let pause = pauses_llm(&cfg);
         {
             let mut b = self.broker.lock().unwrap_or_else(|p| p.into_inner());
-            if pause {
-                b.waiting_media = true;
-                // Chats finish, or their streams time out on a client that
-                // stopped reading; either way, not forever.
-                let deadline = std::time::Instant::now() + Duration::from_secs(10 * 60);
-                while b.chats > 0 {
-                    let left = deadline.saturating_duration_since(std::time::Instant::now());
-                    if left.is_zero() {
-                        self.log.push("chat requests still running after 10 minutes; starting the media job anyway");
-                        break;
-                    }
-                    b = self.broker_changed.wait_timeout(b, left).unwrap_or_else(|p| p.into_inner()).0;
+            // Chats whose model shares this GPU finish first (and no new ones start),
+            // or their streams time out on a client that stopped reading; either way,
+            // not forever. Chats on other GPUs carry on.
+            b.waiting_media = true;
+            let deadline = std::time::Instant::now() + Duration::from_secs(10 * 60);
+            while b.chats > 0 {
+                let left = deadline.saturating_duration_since(std::time::Instant::now());
+                if left.is_zero() {
+                    self.log.push("chat requests still running after 10 minutes; starting the media job anyway");
+                    break;
                 }
+                b = self.broker_changed.wait_timeout(b, left).unwrap_or_else(|p| p.into_inner()).0;
             }
-            b.media = pause;
+            b.media = true;
             b.waiting_media = false;
         }
+        // The LLM stops only when the model it holds shares the media GPU.
+        let pause = needs_media_gpu(&cfg, studio.llm.resident().as_deref());
         let paused_llm = pause && studio.llm.is_running();
         if paused_llm {
             self.log.push(format!("stopping the LLM to free GPU {device} for a media job"));
@@ -1583,6 +1623,25 @@ mod tests {
     }
 
     #[test]
+    fn only_models_on_the_media_gpu_take_turns_with_media() {
+        let cfg = |policy: &str| Json::parse(format!(r#"{{"media":{{"device":1,"llm_policy":"{policy}"}},"llm":{{"devices":[0],"default_model":"small",
+            "models":[{{"name":"small"}},{{"name":"big","devices":[0,1]}},{{"name":"off","devices":[1],"enabled":false}}]}}}}"#).as_bytes()).unwrap();
+        let auto = cfg("auto");
+        assert_eq!(model_devices(&auto, "small"), [0]);
+        assert_eq!(model_devices(&auto, "big"), [0, 1]);
+        assert!(!needs_media_gpu(&auto, Some("small")), "GPU 0 keeps answering");
+        assert!(needs_media_gpu(&auto, Some("big")));
+        assert!(!needs_media_gpu(&auto, None), "the default model is on GPU 0");
+        assert!(!needs_media_gpu(&auto, Some("off")), "a disabled model is not served: the default is");
+        assert_eq!(resolve_model(&auto, Some("nope")).as_deref(), Some("small"));
+        assert!(needs_media_gpu(&cfg("pause_llm"), Some("small")));
+        assert!(!needs_media_gpu(&cfg("coexist"), Some("big")));
+        // No LLM GPUs set: nrob-server's first two.
+        let both = Json::parse(br#"{"media":{"device":1},"llm":{"devices":[],"models":[{"name":"a"}]}}"#).unwrap();
+        assert!(needs_media_gpu(&both, None));
+    }
+
+    #[test]
     fn chat_leases_wait_for_exclusive_media_and_time_out() {
         let m = Media::new();
         {
@@ -1590,6 +1649,10 @@ mod tests {
             assert_eq!(m.broker.lock().unwrap().chats, 1);
         }
         assert_eq!(m.broker.lock().unwrap().chats, 0);
+        {
+            let _b = m.chat_lease(false, Duration::ZERO).unwrap();
+            assert_eq!(m.broker.lock().unwrap().chats, 0, "a chat on another GPU never holds media up");
+        }
         m.broker.lock().unwrap().media = true;
         assert!(m.chat_lease(true, Duration::from_millis(20)).is_err());
         assert!(m.chat_lease(false, Duration::ZERO).is_ok(), "coexisting devices never wait");

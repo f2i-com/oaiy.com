@@ -175,7 +175,12 @@ fn proxy(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, upstream: &str)
             return json_reply(w, 200, &Json::obj([("object", Json::str("nrob.session.forgotten")), ("session", Json::str(session))]));
         }
     }
-    let lease = match studio.media.chat_lease(media::pauses_llm(&cfg), CHAT_WAIT) {
+    // A model on the media GPU waits for a media job there (and a server that is
+    // not running loads its default model first); one on other GPUs goes ahead.
+    let requested = Json::parse(&req.body).ok().and_then(|b| b.get("model").and_then(Json::as_str).map(str::to_owned));
+    let model = media::resolve_model(&cfg, requested.as_deref());
+    let exclusive = media::needs_media_gpu(&cfg, model.as_deref()) || (!studio.llm.is_running() && media::needs_media_gpu(&cfg, None));
+    let lease = match studio.media.chat_lease(exclusive, CHAT_WAIT) {
         Ok(l) => l,
         Err(e) => return send(w, Err(fail(503, e))),
     };
@@ -183,6 +188,9 @@ fn proxy(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, upstream: &str)
         Ok(e) => e,
         Err(e) => return send(w, Err(fail(503, e))),
     };
+    if let Some(m) = model {
+        studio.llm.set_resident(m);
+    }
     studio.llm.touch();
     let auth = format!("Bearer {}", endpoint.key);
     let ctype = req.header("content-type").unwrap_or("application/json").to_string();
