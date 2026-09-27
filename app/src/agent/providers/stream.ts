@@ -29,6 +29,8 @@ export interface StreamSink {
   toolStart(index: number, id: string, name: string): void;
   /** A fragment of a call's JSON arguments, exactly as it came. */
   toolArgs(index: number, delta: string): void;
+  /** nrob: the tool call as the model writes it, raw (`start` begins a new one). */
+  draft?(text: string, start: boolean): void;
 }
 
 function parseEvent(event: SSEEvent): Record<string, unknown> | null {
@@ -196,6 +198,11 @@ export class OpenAIStream {
       return;
     }
     if (payload.error !== undefined) throw streamError(payload.error);
+    // nrob streams a tool call's text as it is written, before the call is whole.
+    if (isRecord(payload.nrob_tool_preview)) {
+      const p = payload.nrob_tool_preview;
+      if (typeof p.text === 'string' && p.text) this.sink?.draft?.(p.text, p.start === true);
+    }
     // The usage chunk (stream_options.include_usage) has an empty choices list.
     if (isRecord(payload.usage)) this.usage = payload.usage;
     const choice = Array.isArray(payload.choices) ? payload.choices.find((c) => isRecord(c) && (c.index === undefined || c.index === 0)) : undefined;

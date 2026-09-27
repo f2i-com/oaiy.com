@@ -206,8 +206,9 @@ describe('media tools', () => {
     expect(tools[1].description).toContain("giving the scene's background (the place with no people in it) and the reference images of the characters and props in it");
     expect(tools[1].description).toContain("Never give a character's reference image itself as a frame.");
     // A clip that continues another starts on its end frame; its real last frame only when it ended elsewhere.
-    expect(tools[1].description).toContain("a clip that continues another without a cut starts on that clip's end frame");
-    expect(tools[1].description).toContain('When a clip ended away from its end frame, start the clip that continues it on its real last frame');
+    // Cut or continuous is the agent's choice; a continuous clip starts on the last frame the one before really ended on.
+    expect(tools[1].description).toContain('starts on the last frame that clip really ended on, from video_frames with last: true');
+    expect(tools[1].description).toContain('Whether a clip is a cut or continues the one before is your choice, clip by clip');
     expect(tools[1].description).toMatch(/saved voice \(create_voice.*generate_speech in that character's saved voice.*`soundtrack`/);
     expect(tools[2].description).toContain('give the file to generate_video as `soundtrack`');
     // A model with lip-synced speech: `say` in the saved voice, not a soundtrack.

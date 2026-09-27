@@ -25,6 +25,8 @@ export type AgentEvent =
   | { type: 'text'; delta: string }
   | { type: 'thinking'; delta: string }
   | { type: 'tool_start'; index: number; name: string }
+  /** A tool call as it is written, before it is whole: nrob's raw text, or a call's JSON arguments (`index`). */
+  | { type: 'tool_draft'; text: string; start: boolean; index?: number }
   | { type: 'tool_call'; call: ToolCall }
   | { type: 'tool_result'; result: ToolResult }
   | { type: 'status'; message: string }
@@ -114,6 +116,19 @@ You are a reviewer: the main agent made a picture for a scripted video and goes 
 How to look: the picture and its reference images are attached to your task, small, for a quick once-over. Go over the picture person by person: count their heads, arms, hands and legs one by one, following every limb to where it joins the body, and compare each person and prop with their reference. Where something is unclear (a hand, a crowded part, a face), zoom in with view_image's x, y, width and height; look at the script (read_file), the scene's background or earlier frames only when you need them. Be quick: judge from what you see, in few steps.
 Be strict about what a viewer would notice: a wrong count of limbs, fingers or faces; a character who does not match their reference (face, hair, build, clothes); a missing or extra person or prop; something duplicated, merged, floating or the wrong size; the wrong place or light; a pose or expression that does not fit the moment or the story; more than the speaker in view in a shot with dialogue; an end frame that is not its start frame moved on; stray text. Let small things pass (a fold of cloth, a detail far in the background). When in doubt about a body or a face, send it back. Then call give_verdict once, and reply with one line.`;
 const KEEP_RECENT_TURNS = 8;
+/** For a reply that only announced the work. */
+const START_NUDGE = 'You said what you will do, but no tool has run yet, so nothing has started. Start now: call update_plan with the plan (for a task with several steps), then the first step\'s tools. Do not describe the work again; do it.';
+
+/**
+ * Whether a reply announces work it is about to do ("I'll…", "Let me…",
+ * "Right away") rather than answering or asking: a question at its end is left
+ * alone, since asking the user is fair.
+ */
+export function announcesWork(text: string): boolean {
+  const t = text.trim();
+  if (!t || /\?\s*$/.test(t)) return false;
+  return /\b(i['’]ll|i will|let me(?! know)|let['’]s|i['’]m going to|i am going to|right away|on it|i['’]ll start|first,? i['’]ll|here['’]s the plan|starting now)\b/i.test(t);
+}
 /** Characters per token until the provider's own counts say otherwise. */
 const DEFAULT_CHARS_PER_TOKEN = 3.5;
 /** What an image costs, in tokens (about what vision models charge for one of ~1 megapixel). */
@@ -140,31 +155,33 @@ const KEEP_IMAGE_TURNS = 3;
 const MEDIA_MAKE_GUIDE = `- generate_image, generate_video, generate_speech, create_voice and generate_music, when they are among your tools, make pictures, short videos (talking ones too), speech and music with the user's media service and save them in the project. Write concrete prompts, save under sensible paths, and look at an image with view_image before relying on it. Every video clip is at most 5 seconds and has a start and an end frame, each made new with generate_image from the scene's background and the character images (never a character image itself), and animates between them, its prompt describing the motion from start to end (what the characters do, how the camera moves), not the scene the frames already show. For dialogue, give each character a saved voice with create_voice and use it for every line they speak, and show only the speaker, alone in close-up, while they talk (see generate_video for how).
 `;
 /** How to make a video with a story: from a script, shot by shot. */
-const VIDEO_SCRIPT_GUIDE = `- A video with a story (anything longer than one clip) is made from a script, written and revised before any picture or clip is made. Give the video its own folder (video/NAME/) with script.md in it, and its frames, clips and audio beside it. Writing the script is the first step of your plan, then one step per scene. The script has these parts, under these headings (a reviewer finds each picture's part of the script by them):
+const VIDEO_SCRIPT_GUIDE = `- Every video the user asks for is made from a plan and a script, however short or vague the request, written and revised before any picture or clip is made. Start with update_plan: writing the script is its first step, then one step per scene, then joining the clips. A vague request ("a video of a cat", "make something fun") becomes a short scene of your own making: a premise with a small beginning, middle and end, told in 3 to 6 shots of varied framing (an establishing wide shot, closer shots of the action, a reaction or a detail), about 10 to 25 seconds in all, joined with media_compose. Only when the user asks for exactly one clip is it a single shot. Give the video its own folder (video/NAME/) with script.md in it, and its frames, clips and audio beside it. The script has these parts, under these headings (a reviewer finds each picture's part of the script by them):
   ## Premise: what the video is about, in a few sentences: who wants what, what stands in their way, and how it ends. Every scene moves this story on; nothing happens at random.
   ## Characters: for each, their look (face, age, build, hair, clothes: the same in every frame), their voice (for create_voice), and what they want. Their reference image shows only them, full length, facing the camera with a neutral expression, on a blank white background with nothing else in it: the frames give them their place and their expressions. It is a reference, never a frame.
   ## Props: every object, animal or vehicle that is seen in more than one shot or matters to the story, with its look (shape, size, colour, material, markings), so it never changes. Each gets a reference image of its own, alone on a blank white background.
   ## Scene 2: a title (one heading per scene, numbered from 1): where and when it is, what happens and why it matters to the story, in a line or two, and a Background line: the empty place as a prompt for generate_image (the setting, its light and time of day, the props that stay in it), with no people in it. Then its shots, each at most 5 seconds and numbered on through the whole script, every one written out in full like this:
      ### Shot 3 (scene 2, 4 s)
+     Joins: cut (a new framing, place or moment), or continuous from shot 2 (the motion flows on, unbroken, from where shot 2 ends).
      Start frame: the picture it opens on, as a prompt for generate_image: the place, who is in it and where, their pose, each face's expression as the moment calls for it (never left neutral), the props in view, the framing (close-up, medium, wide) and the light.
      End frame: the picture it ends on, as an edit of the start frame: what has changed (where the motion has brought everyone, their poses and expressions then); the place, people, clothes and light stay the same. Every shot has one, and it differs from the start frame.
      Video: the motion from the start frame to the end frame, in order, as the prompt for generate_video: what each character does first and then (how far and how fast they move, their gestures, how their expression changes, how they speak), and how the camera moves. Only the motion: the frames already show the place and the people.
      Dialogue: NAME (voice: Name): "the line", or none.
      Sound: effects and music under it, for media_compose, or none.
-  Write the script with append_file, one part per call (premise, characters and props, then each scene with its shots). Then read it all back and revise it with edit_file until: the story holds together from start to end and every shot serves it; every scene has its Background line and every shot all five lines, fully written; every shot ends on an end frame of its own, and its Video line tells, step by step, how the start frame becomes the end frame; no shot is over 5 seconds; each Dialogue is one short sentence (about 12 words at most) spoken by one person, who is alone in close-up in both frames; a shot that follows on from the one before starts on its end frame; every face in a frame shows what that character feels at that moment; the characters look and sound the same throughout, and the props look the same.
+  Cut or continuous is your choice, shot by shot. Make a shot continuous when one unbroken action or camera move runs longer than a clip can (a walk across a room, a chase, a line of dialogue too long for one clip, a camera that keeps moving), in the same place with the same people: its Start frame line is then "the last frame of shot N", and its Video line carries the motion on from there. Cut when the framing, the place, the speaker or the moment changes, or to show one moment from several angles. A scene may mix both.
+  Write the script with append_file, one part per call (premise, characters and props, then each scene with its shots). Then read it all back and revise it with edit_file until: the story holds together from start to end and every shot serves it; every scene has its Background line and every shot all six lines, fully written; every shot ends on an end frame of its own, and its Video line tells, step by step, how the start frame becomes the end frame; no shot is over 5 seconds; each Dialogue is one short sentence (about 12 words at most) spoken by one person, who is alone in close-up in both frames; a continuous shot names the shot it continues, is in the same place with the same people, and picks up the motion where that one ends; every face in a frame shows what that character feels at that moment; the characters look and sound the same throughout, and the props look the same.
   Only then make it, in this order. Every picture saved in the video's folder is reviewed as soon as it is made, before anything else: a reviewer looks at it, its reference images, the pictures before it and the script, and passes it or sends it back saying what is wrong. Give generate_image \`frame\` (and \`shot\` for a start or end frame, \`scene\` for a background) so the review checks it against the right part of the script. A picture sent back is made again at the same path, fixing what the review said; after 3 tries the best may be taken with review_frame and accept. No new picture is made while one waits for its review, and a frame is animated only once it has passed.
   a. Each character's reference image (frame: character; neutral expression, blank white background) and saved voice, and each prop's reference image (frame: prop; blank white background).
   b. Each scene's background (frame: background, scene: its number), from its Background line, with no people in it. A place seen in an earlier scene looks the same: give that scene's background as a reference image.
-  c. Then shot by shot, in order. Its start frame (frame: start, shot: its number), from its Start frame line, made new with generate_image from the scene's background and the reference images of the characters and props in view as reference_images (as many as the image model takes: the background and the characters first). Never use a character's or prop's reference image itself as a frame. A shot that follows on from the one before without a cut starts on that shot's end frame: use that same picture as its start frame (if that clip ended away from its end frame, take its real last frame (video_frames with last: true) instead). Then its end frame (frame: end, shot: its number), from its End frame line, made by editing the start frame: give the start frame as the first reference image (then the characters and props in view), and say in the prompt what changes; everything else stays as it is.
+  c. Then shot by shot, in order. Its start frame (frame: start, shot: its number), from its Start frame line, made new with generate_image from the scene's background and the reference images of the characters and props in view as reference_images (as many as the image model takes: the background and the characters first). Never use a character's or prop's reference image itself as a frame. A continuous shot instead starts on the last frame the clip it continues really ended on, so the motion flows on: once that clip is made, take its last frame with video_frames (last: true) and use it as this shot's start frame (it needs no new review). Then its end frame (frame: end, shot: its number), from its End frame line, made by editing the start frame: give the start frame as the first reference image (then the characters and props in view), and say in the prompt what changes; everything else stays as it is.
   d. Then that shot's clip, from its two passed frames and its Video and Dialogue lines, before the next shot.
-  e. When every shot has its clip, join them with media_compose, with the Sound lines.
+  e. When every shot has its clip, join them with media_compose, with the Sound lines; trim the first frame of each continuous clip (start: 0.04) so the frame it shares with the clip before does not show twice.
   When something has to change as you make it, change the script to match.
 `;
 /** The same in brief, for a window too small for the whole of it. */
-const VIDEO_SCRIPT_BRIEF = `- A video with a story (anything longer than one clip) is made from a script, written first in video/NAME/script.md with append_file and revised before any picture is made, under the headings ## Premise, ## Characters (look and voice), ## Props, and ## Scene N (with a Background line: the empty place), each scene's shots under ### Shot N (scene N, X s) (at most 5 seconds) with its Start frame, End frame, Video (the motion between them), Dialogue (one short line, the speaker alone in close-up) and Sound lines. Then make the character and prop reference images (blank white background, neutral faces) and voices, then each scene's empty background, then shot by shot its start frame made new from the background and references, its end frame made by editing the start frame, then the clip. Give generate_image \`frame\`, \`shot\` and \`scene\`: each picture is reviewed as it is made, and one sent back is made again.
+const VIDEO_SCRIPT_BRIEF = `- Every video is made from a plan (update_plan first) and a script, however short or vague the request: a vague one becomes a short scene of 3 to 6 shots of varied framing (about 10 to 25 seconds, joined with media_compose), a single shot only when exactly one clip is asked for. Each shot is a cut or, when one action runs on longer than a clip, continuous (starting on the last frame of the clip before), your choice. The script is written first in video/NAME/script.md with append_file and revised before any picture is made, under the headings ## Premise, ## Characters (look and voice), ## Props, and ## Scene N (with a Background line: the empty place), each scene's shots under ### Shot N (scene N, X s) (at most 5 seconds) with its Start frame, End frame, Video (the motion between them), Dialogue (one short line, the speaker alone in close-up) and Sound lines. Then make the character and prop reference images (blank white background, neutral faces) and voices, then each scene's empty background, then shot by shot its start frame made new from the background and references, its end frame made by editing the start frame, then the clip. Give generate_image \`frame\`, \`shot\` and \`scene\`: each picture is reviewed as it is made, and one sent back is made again.
 `;
 /** How to edit media: only when the editing tools are there. */
-const MEDIA_EDIT_GUIDE = `- media_info, video_frames, video_split and media_compose edit video and sound in the project, in the browser: read what a file holds, take frames out (to check a clip, or to take the last frame it really ended on), cut, join clips and pictures, and lay music, speech and effects over a whole video with volume, fades and ducking. To make a longer video: make its clips (a clip that follows on from another without a cut starts on that clip's end frame, or if it ended away from its end frame, take its real last frame (video_frames with last: true) instead), then compose them with the soundtrack.
+const MEDIA_EDIT_GUIDE = `- media_info, video_frames, video_split and media_compose edit video and sound in the project, in the browser: read what a file holds, take frames out (to check a clip, or to take the last frame it really ended on), cut, join clips and pictures, and lay music, speech and effects over a whole video with volume, fades and ducking. To make a longer video: make its clips (each a cut, or continuous: starting on the last frame the clip before really ended on, from video_frames with last: true, so the motion flows on), then compose them with the soundtrack (trimming a continuous clip's first frame).
 `;
 
 /** The system prompt, with how to use the media tools this agent has. */
@@ -657,6 +674,19 @@ export class Agent {
     return { ok: !failure, text: failure ? `${final ? `${final}\n` : ''}It stopped: ${failure}` : final, files: [...files] };
   }
 
+  /**
+   * Whether the model is working on a video's script: its plan's current step
+   * is about the script, or its last step wrote or read a script.md. It then
+   * thinks harder first, for a more complete story.
+   */
+  private writingScript(): boolean {
+    if (!this.tools.some((t) => t.name === 'generate_video')) return false;
+    const active = this.plan?.items.find((i) => i.status === 'active');
+    if (active && /\bscript\b/i.test(active.text)) return true;
+    const last = [...this.turns].reverse().find((t) => t.role === 'assistant');
+    return last?.role === 'assistant' && last.calls.some((c) => /(^|\/)script\.md$/i.test(String(c.input.path ?? '').trim()));
+  }
+
   /** A reviewer's verdict, given with give_verdict. */
   private verdict: { verdict: 'pass' | 'redo'; notes: string } | null = null;
   /** For a reviewer: the picture it judges, and how it has looked at it so far. */
@@ -1017,11 +1047,13 @@ export class Agent {
         const reply = await sendTurn(provider, this.systemPrompt, sent, tools, {
           maxOutputTokens: b.reply,
           signal,
+          reasoning: this.writingScript() ? 'high' : undefined,
           sink: {
             text: (delta) => emit({ type: 'text', delta }),
             thinking: (delta) => emit({ type: 'thinking', delta }),
             toolStart: (index, _id, name) => emit({ type: 'tool_start', index, name }),
-            toolArgs: () => {},
+            toolArgs: (index, delta) => emit({ type: 'tool_draft', text: delta, start: false, index }),
+            draft: (text, start) => emit({ type: 'tool_draft', text, start }),
           },
         });
         // The provider's own count calibrates the next estimate.
@@ -1150,6 +1182,9 @@ export class Agent {
     this.checkedRoots.clear();
     this.tasksThisRun = 0;
     let nudges = 0;
+    // Tool calls this run, and whether it was asked to start after only saying what it would do.
+    let acted = 0;
+    let startNudged = false;
     const maxSteps = this.options.maxSteps ?? MAX_STEPS;
     try {
       for (let step = 1; step <= maxSteps; step++) {
@@ -1167,6 +1202,13 @@ export class Agent {
         if (!reply.calls.length) {
           // A message came in while it answered: not done until it has read it.
           if (this.inbox.length) continue;
+          // It said what it would do but has done nothing yet: ask it, once, to start.
+          if (!acted && !startNudged && !finish && announcesWork(reply.text)) {
+            startNudged = true;
+            emit({ type: 'nudge', message: 'It said what it would do without starting; asked to start.' });
+            this.turns.push({ role: 'user', text: `[bot.computer] ${START_NUDGE}`, automatic: true });
+            continue;
+          }
           // A run that must end with its tool: ask for it (the loop's step limit still bounds this).
           if (finish && !finish.done()) {
             this.finishing = true;
@@ -1188,6 +1230,7 @@ export class Agent {
           emit({ type: 'done', text: reply.text, steps: step });
           return;
         }
+        acted += reply.calls.length;
         const results: ToolResult[] = [];
         stepResults = results;
         changes = [];

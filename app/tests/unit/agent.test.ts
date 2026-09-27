@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { Agent, type AgentEvent } from '../../src/agent/agent';
+import { Agent, announcesWork, type AgentEvent } from '../../src/agent/agent';
 import { NetGate } from '../../src/gate/netgate';
 import { Vfs } from '../../src/vfs/vfs';
+import { OpenAIStream } from '../../src/agent/providers/stream';
 import { EMPTY_MEDIA } from '../../src/agent/media';
 import { ANTHROPIC, LOCAL, OPENAI, fakeProvider } from './fakeProvider';
 import type { ProviderConfig } from '../../src/agent/providers/types';
@@ -109,7 +110,8 @@ describe('tool rules', () => {
     await agent.run('make a short film', (e) => events.push(e));
     expect(events.find((e) => e.type === 'error')).toBeUndefined();
     const system = JSON.stringify(fake.bodies[0].messages);
-    expect(system).toContain('is made from a script, written first in video/NAME/script.md');
+    expect(system).toContain('Every video is made from a plan (update_plan first) and a script, however short or vague the request');
+    expect(system).toContain('The script is written first in video/NAME/script.md');
     expect(system).not.toContain('Review each frame');
   });
 
@@ -120,6 +122,15 @@ describe('tool rules', () => {
     await agent.run('make a short film', () => {});
     const system = JSON.stringify(fake.bodies[0].messages);
     expect(system).toContain('video/NAME/) with script.md');
+    // Every video is planned and scripted; a vague request becomes a short scene of several shots.
+    expect(system).toContain('Every video the user asks for is made from a plan and a script, however short or vague the request');
+    expect(system).toContain('told in 3 to 6 shots of varied framing');
+    expect(system).toContain('Only when the user asks for exactly one clip is it a single shot.');
+    // Each shot is a cut or continuous (the motion flowing on from the clip before), the agent's choice.
+    expect(system).toContain('Joins: cut (a new framing, place or moment), or continuous from shot 2');
+    expect(system).toContain('Cut or continuous is your choice, shot by shot.');
+    expect(system).toContain('A continuous shot instead starts on the last frame the clip it continues really ended on');
+    expect(system).toContain('trim the first frame of each continuous clip (start: 0.04)');
     for (const line of ['## Premise:', '## Characters:', '## Props:', '## Scene 2:', 'Start frame:', 'End frame:', 'Video:', 'Dialogue:', 'Sound:']) expect(system).toContain(line);
     expect(system).toMatch(/read it all back and revise it with edit_file until: the story holds together/);
     // Reference images with neutral faces on blank white; the frames give the expressions, and props are made first.
@@ -201,6 +212,56 @@ describe('tool rules', () => {
     await agent.run('change the greeting', emit);
     expect(events.at(-1)).toMatchObject({ type: 'done', text: 'Hi! Done, with a shout.' });
     expect(agent.takeUnread()).toEqual([]);
+  });
+
+  it('thinks harder while it works on a video script, and only asks nrob for that', async () => {
+    const media = { ...EMPTY_MEDIA, baseUrl: 'http://127.0.0.1:8080', imageModel: 'image', videoModel: 'video' };
+    const script = { goal: 'a short film', items: [{ text: 'Write the script in video/film/script.md', status: 'active' }, { text: 'Make the clips', status: 'pending' }] };
+    for (const [serverKind, want] of [['nrob', 'high'], ['ollama', undefined]] as const) {
+      const fake = fakeProvider('openai', [
+        { calls: [{ name: 'update_plan', input: script }] },
+        { calls: [{ name: 'append_file', input: { path: 'video/film/script.md', content: '## Premise\nA cat.' } }] },
+        { text: 'done' },
+      ]);
+      const agent = new Agent({ vfs: new Vfs(), gate: new NetGate(), provider: () => ({ ...LOCAL, serverKind, contextTokens: 32_000 }), projectSummary: () => '', media: () => media });
+      await agent.run('make a short film', () => {});
+      // Not before there is a plan; while its step is the script, and after writing the script.
+      expect(fake.bodies.slice(0, 3).map((b) => b.reasoning_effort)).toEqual([undefined, want, want]);
+    }
+  });
+
+  it("shows nrob's tool call as it is written", () => {
+    const drafts: Array<[string, boolean]> = [];
+    const stream = new OpenAIStream({ text: () => {}, toolStart: () => {}, toolArgs: () => {}, draft: (t, s) => drafts.push([t, s]) });
+    for (const chunk of [{ nrob_tool_preview: { text: '<tool_call>\n<function=append_file>', start: true } }, { nrob_tool_preview: { text: '\n<parameter=content>\n## Scene 1', start: false } }]) {
+      stream.accept({ event: 'message', data: JSON.stringify(chunk) });
+    }
+    expect(drafts).toEqual([['<tool_call>\n<function=append_file>', true], ['\n<parameter=content>\n## Scene 1', false]]);
+  });
+
+  it('is asked, once, to start when it only says what it will do', async () => {
+    const said = (body: Record<string, unknown>) => JSON.stringify(body.messages);
+    fakeProvider('openai', [
+      { text: "Right away! I'll plan the script, make the character, then animate the clip." },
+      (body) => {
+        expect(said(body)).toContain('You said what you will do, but no tool has run yet, so nothing has started.');
+        return { calls: [{ name: 'read_file', input: { path: 'src/app.js' } }] };
+      },
+      // Having started, a plain closing answer ends the run: the nudge is only for not starting.
+      { text: "Let me know if you'd like changes." },
+    ]);
+    const { agent, events, emit } = setup(OPENAI);
+    await agent.run('make a video', emit);
+    expect(events.filter((e) => e.type === 'nudge')).toHaveLength(1);
+    expect(events.at(-1)).toMatchObject({ type: 'done' });
+  });
+
+  it('announces work only with a promise, not a question', () => {
+    expect(announcesWork("Okay! Let's make it. I'll plan the script first.")).toBe(true);
+    expect(announcesWork('Right away!')).toBe(true);
+    expect(announcesWork('Shall I make it 10 seconds or 20? Let me know?')).toBe(false);
+    expect(announcesWork('The greeting now says hi.')).toBe(false);
+    expect(announcesWork("It says hi now. Let me know if you'd like changes.")).toBe(false);
   });
 
   it('asks once more when the server could not read a tool call, then gives up', async () => {

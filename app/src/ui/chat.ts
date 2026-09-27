@@ -57,6 +57,8 @@ export class ChatPane {
   private planOpen: boolean | null = null;
   private current: { box: HTMLElement; text: string; body: HTMLElement } | null = null;
   private thinking: { box: HTMLElement; text: string } | null = null;
+  /** A tool call being written, shown as it streams until the call is whole. */
+  private draft: { box: HTMLElement; body: HTMLElement; raw: string; json: boolean } | null = null;
   private cards = new Map<string, HTMLElement>();
   /** Sub-agent task rows, by task id (the delegate call's id, #, the task's index). */
   private taskRows = new Map<string, { row: HTMLElement; state: HTMLElement; activity: HTMLElement; report: HTMLElement }>();
@@ -373,6 +375,45 @@ export class ChatPane {
     this.scroll();
   }
 
+  /** The thinking box folds away once the reply moves on (it can be opened again). */
+  private doneThinking(): void {
+    if (this.thinking) (this.thinking.box as HTMLDetailsElement).open = false;
+    this.thinking = null;
+  }
+
+  /**
+   * A tool call as it is written: nrob's raw call (its tags turned into a
+   * readable layout), or JSON arguments with their strings unescaped. A script
+   * written by append_file reads as it is written.
+   */
+  private toolDraft(text: string, start: boolean, json: boolean): void {
+    // nrob sends the finished call as JSON too: the raw draft already shows it.
+    if (json && this.draft && !this.draft.json) return;
+    if (!this.draft || start) {
+      this.draft?.box.remove();
+      this.current = null;
+      const body = h('pre.tool-result.draft-body');
+      const box = h('details.tool.draft', { open: true }, h('summary', h('span.tool-name', 'writing…')), body);
+      box.classList.add('pending');
+      this.log.append(box);
+      this.draft = { box, body, raw: '', json };
+    }
+    this.draft.raw += text;
+    const raw = this.draft.raw;
+    const name = this.draft.json ? '' : /<function=([\w.-]+)>/.exec(raw)?.[1] ?? '';
+    if (name) this.draft.box.querySelector('.tool-name')!.textContent = `writing ${name}…`;
+    this.draft.body.textContent = this.draft.json
+      ? raw.replace(/\\n/g, '\n').replace(/\\"/g, '"').replace(/\\t/g, '\t')
+      : raw
+          .replace(/<\/?tool_call>\s*/g, '')
+          .replace(/<function=[\w.-]+>\s*/g, '')
+          .replace(/<parameter=([\w.-]+)>\n?/g, '$1:\n')
+          .replace(/\n?<\/(parameter|function)>/g, '\n');
+    // A long draft scrolls in its box: the newest lines stay in view.
+    this.draft.body.scrollTop = this.draft.body.scrollHeight;
+    this.scroll();
+  }
+
   /** A message from the app itself (commands, errors, notices). */
   system(text: string, kind: 'info' | 'error' = 'info'): void {
     this.current = null;
@@ -540,22 +581,31 @@ export class ChatPane {
   event(e: AgentEvent): void {
     switch (e.type) {
       case 'text':
-        this.thinking = null;
+        this.doneThinking();
         this.assistantText(e.delta);
         break;
       case 'thinking':
         if (!this.thinking) {
-          const box = h('details.thinking', h('summary', 'thinking…'), h('pre'));
+          // Open while it streams, to read along; it folds away when the reply moves on.
+          const box = h('details.thinking', { open: true }, h('summary', 'thinking…'), h('pre'));
           this.log.append(box);
           this.thinking = { box, text: '' };
         }
         this.thinking.text += e.delta;
         this.thinking.box.querySelector('pre')!.textContent = this.thinking.text;
+        this.scroll();
+        break;
+      case 'tool_draft':
+        this.doneThinking();
+        this.toolDraft(e.text, e.start, e.index !== undefined);
         break;
       case 'tool_start':
         this.setStatus(`writing a ${e.name} call…`);
         break;
       case 'tool_call':
+        this.doneThinking();
+        this.draft?.box.remove();
+        this.draft = null;
         this.setStatus(`running ${e.call.name}…`);
         this.toolCard(e.call);
         break;
