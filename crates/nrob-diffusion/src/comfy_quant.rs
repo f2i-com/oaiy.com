@@ -147,6 +147,42 @@ pub fn load(s: &StIndex, name: &str, dev: &Device, dtype: DType) -> Result<Optio
     ))
 }
 
+/// The ConvRot group size of a Comfy `int8_tensorwise` weight, when its note
+/// says it was rotated (the stored rows are then Hadamard-rotated in groups).
+/// None for weights without a note, or not rotated.
+pub fn rotation(s: &StIndex, name: &str) -> Result<Option<usize>> {
+    let Some(prefix) = name.strip_suffix(".weight") else { return Ok(None) };
+    let metadata = format!("{prefix}.comfy_quant");
+    if s.get(&metadata).is_none() {
+        return Ok(None);
+    }
+    let config = Json::parse(&s.read(&metadata).map_err(candle_core::Error::wrap)?).map_err(candle_core::Error::wrap)?;
+    match config.get("format").and_then(Json::as_str) {
+        Some("int8_tensorwise") => {}
+        other => candle_core::bail!("{name}: unsupported comfy_quant format {other:?}"),
+    }
+    if !matches!(config.get("convrot"), Some(Json::Bool(true))) {
+        return Ok(None);
+    }
+    let gs = config.get("convrot_groupsize").and_then(Json::as_i64).unwrap_or(0);
+    let valid = gs >= 4 && gs <= 4096 && (gs as usize).is_power_of_two() && (gs as usize).trailing_zeros() % 2 == 0;
+    if !valid {
+        candle_core::bail!("{name}: invalid ConvRot group size {gs}");
+    }
+    Ok(Some(gs as usize))
+}
+
+/// Undo ConvRot on a decoded `[rows, cols]` weight: each group of `gs` columns
+/// times the (symmetric, orthonormal) Hadamard matrix, in F32.
+pub fn unrotate(t: &Tensor, gs: usize) -> Result<Tensor> {
+    let (rows, cols) = t.dims2()?;
+    if cols % gs != 0 {
+        candle_core::bail!("ConvRot group size {gs} does not divide {cols} columns");
+    }
+    let h = Tensor::from_vec(hadamard(gs), (gs, gs), t.device())?;
+    t.to_dtype(DType::F32)?.reshape((rows * cols / gs, gs))?.matmul(&h)?.reshape((rows, cols))
+}
+
 fn parallel_rows(data: &mut [f32], cols: usize, decode: impl Fn(usize, &mut [f32]) + Sync) {
     if cols == 0 || data.is_empty() {
         return;
@@ -271,7 +307,7 @@ mod tests {
                     &format!("transformer_blocks.0.img_mlp.{name}"),
                     &Device::Cpu,
                     DType::F32,
-                    &mut None,
+                    &mut crate::lora::Loras::default(),
                 )
                 .unwrap();
             assert_eq!(

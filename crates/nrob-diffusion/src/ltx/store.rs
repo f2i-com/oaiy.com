@@ -40,6 +40,45 @@ mod tests {
         Ok(())
     }
     #[test]
+    fn comfy_convrot_int8_decodes_as_the_reference_does() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("nrob-ltx-convrot-{}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        let file = dir.join("m.safetensors");
+        let key = "model.diffusion_model.blk.to_q.weight";
+        // 2 rows × 16 columns of INT8 codes, a per-row scale, rotated in groups of 16.
+        let codes: Vec<u8> = (0..32i32).map(|i| ((i * 37 % 200) - 100) as i8 as u8).collect();
+        let scales: Vec<u8> = [0.5f32, 0.25].iter().flat_map(|x| x.to_le_bytes()).collect();
+        let note = br#"{"format": "int8_tensorwise", "convrot": true, "convrot_groupsize": 16}"#.to_vec();
+        let mut header = Vec::new();
+        let mut data = Vec::new();
+        for (name, dtype, shape, bytes) in [
+            (key.to_owned(), "I8", vec![2, 16], codes),
+            ("model.diffusion_model.blk.to_q.weight_scale".to_owned(), "F32", vec![2, 1], scales),
+            ("model.diffusion_model.blk.to_q.comfy_quant".to_owned(), "U8", vec![note.len()], note),
+        ] {
+            header.push(format!("\"{name}\":{{\"dtype\":\"{dtype}\",\"shape\":{shape:?},\"data_offsets\":[{},{}]}}", data.len(), data.len() + bytes.len()));
+            data.extend(bytes);
+        }
+        let header = format!("{{{}}}", header.join(","));
+        let mut out = (header.len() as u64).to_le_bytes().to_vec();
+        out.extend(header.as_bytes());
+        out.extend(data);
+        std::fs::write(&file, out)?;
+        let mut store = Store::open(&file, 0)?;
+        let ours = store.tensor(key, &Device::Cpu, false)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+        let reference = crate::comfy_quant::load(&store.index, key, &Device::Cpu, DType::F32)?.unwrap().flatten_all()?.to_vec1::<f32>()?;
+        for (a, b) in ours.iter().zip(&reference) {
+            // BF16 storage of the result.
+            assert!((a - b).abs() <= b.abs() * 0.008 + 1e-3, "{a} vs {b}");
+        }
+        // Without undoing the rotation the values would differ well beyond that.
+        let raw = decode(key, Dtype::I8, &[2, 16], &store.index.read(key).unwrap(), Some(&[0.5, 0.25]), &Device::Cpu)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+        assert!(raw.iter().zip(&reference).any(|(a, b)| (a - b).abs() > 1.));
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
     fn lora_adds_scaled_b_times_a_to_its_weight() -> Result<()> {
         let dir = std::env::temp_dir().join(format!("nrob-lora-{}", std::process::id()));
         std::fs::create_dir_all(&dir)?;
@@ -236,6 +275,8 @@ pub struct Store {
     host: HashMap<String, Vec<u8>>,
     /// `weight_scale` values already read, by weight name.
     scales: HashMap<String, Option<Vec<f32>>>,
+    /// Comfy ConvRot group sizes already read, by weight name.
+    rotations: HashMap<String, Option<usize>>,
     pub host_bytes: u64,
     pub disk_bytes: u64,
     budget: u64,
@@ -259,6 +300,7 @@ impl Store {
             lora_scale: 0.,
             host: HashMap::new(),
             scales: HashMap::new(),
+            rotations: HashMap::new(),
             host_bytes: 0,
             disk_bytes: 0,
             budget,
@@ -315,8 +357,10 @@ impl Store {
             .map_err(candle_core::Error::wrap)?
             .clone();
         let scale = self.scale(key)?;
+        let rotation = self.rotation(key)?;
         if let Some(bytes) = self.host.get(key) {
-            return decode(key, info.dtype, &info.shape, bytes, scale.as_deref(), dev);
+            let t = decode(key, info.dtype, &info.shape, bytes, scale.as_deref(), dev)?;
+            return unrotated(t, rotation, DType::BF16);
         }
         let bytes = self.index.read(key).map_err(candle_core::Error::wrap)?;
         self.disk_bytes += bytes.len() as u64;
@@ -325,15 +369,28 @@ impl Store {
             self.host_bytes += bytes.len() as u64;
             self.host.insert(key.to_owned(), bytes);
         }
-        Ok(t)
+        unrotated(t, rotation, DType::BF16)
+    }
+
+    /// A Comfy ConvRot weight's group size (its rows were Hadamard-rotated before
+    /// quantization), read once from its `.comfy_quant` note.
+    fn rotation(&mut self, key: &str) -> Result<Option<usize>> {
+        if let Some(r) = self.rotations.get(key) {
+            return Ok(*r);
+        }
+        let r = crate::comfy_quant::rotation(&self.index, key)?;
+        self.rotations.insert(key.to_owned(), r);
+        Ok(r)
     }
     /// A tensor at full precision (the audio decoder and vocoder run in F32).
     pub fn tensor_f32(&mut self, key: &str, dev: &Device) -> Result<Tensor> {
         let info = self.index.info(key).map_err(candle_core::Error::wrap)?.clone();
         let scale = self.scale(key)?;
+        let rotation = self.rotation(key)?;
         let bytes = self.index.read(key).map_err(candle_core::Error::wrap)?;
         self.disk_bytes += bytes.len() as u64;
-        decode_as(key, info.dtype, &info.shape, &bytes, scale.as_deref(), dev, DType::F32)
+        let t = decode_as(key, info.dtype, &info.shape, &bytes, scale.as_deref(), dev, DType::F32)?;
+        unrotated(t, rotation, DType::F32)
     }
     /// Fetch only prompt vocabulary rows, avoiding a multi-gigabyte embedding upload.
     pub fn rows(&mut self, key: &str, ids: &[u32], dev: &Device) -> Result<Tensor> {
@@ -626,6 +683,14 @@ fn e4m3_table() -> &'static [f32; 256] {
 /// Stored bytes as a BF16 tensor on `dev`. fp8 converts on the device; int8
 /// (which candle has no type for) goes up as bytes and is re-signed there.
 /// `scale` is one value for the whole tensor or one per row.
+/// A decoded weight with Comfy ConvRot undone (when it was rotated), as `out`.
+fn unrotated(t: Tensor, rotation: Option<usize>, out: DType) -> Result<Tensor> {
+    match rotation {
+        None => Ok(t),
+        Some(gs) => crate::comfy_quant::unrotate(&t, gs)?.to_dtype(out),
+    }
+}
+
 fn decode(key: &str, dtype: Dtype, shape: &[usize], bytes: &[u8], scale: Option<&[f32]>, dev: &Device) -> Result<Tensor> {
     decode_as(key, dtype, shape, bytes, scale, dev, DType::BF16)
 }

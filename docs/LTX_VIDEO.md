@@ -28,6 +28,11 @@ directly, without conversion:
   ComfyUI's scaled checkpoints store beside each weight. These keep their stored
   size on disk and in the RAM tier, and become BF16 on the GPU, so a 21 GB fp8
   transformer streams from SSD at half the bytes of its BF16 original.
+  ComfyUI Kitchen's `int8_tensorwise` weights with ConvRot (a `.comfy_quant`
+  note saying `"convrot": true`) are rotated back after decoding, as Comfy does:
+  each group of `convrot_groupsize` columns times the Hadamard matrix. Checkpoints
+  such as the LTX 2.5 Stubelius Remix INT8 (the distilled LoRA already merged in,
+  so it runs on the distilled 8-step schedule at CFG 1) load this way.
 - **Key names:** transformers saved with bare names (`patchify_proj.weight`
   rather than `model.diffusion_model.patchify_proj.weight`) load as they are.
   The `model_version` and `config` metadata must still be there.
