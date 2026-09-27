@@ -173,7 +173,7 @@ describe('a picture made for a scripted video', () => {
         return { text: 'done' };
       },
     ]);
-    const agent = new Agent({ vfs, gate: new NetGate(), provider: () => ({ ...LOCAL, contextTokens: 32_000 }), projectSummary: () => '', media: () => MEDIA });
+    const agent = new Agent({ vfs, gate: new NetGate(), provider: () => ({ ...LOCAL, contextTokens: 32_000 }), projectSummary: () => '', media: () => MEDIA, guides: ['video'] });
     const events: AgentEvent[] = [];
     await agent.run('make shot 1', (e) => events.push(e));
     expect(events.at(-1)).toMatchObject({ type: 'done', text: 'done' });
@@ -216,7 +216,7 @@ describe('a picture made for a scripted video', () => {
         return { text: 'ok' };
       },
     ]);
-    const agent = new Agent({ vfs, gate: new NetGate(), provider: () => ({ ...LOCAL, contextTokens: 32_000 }), projectSummary: () => '', media: () => MEDIA });
+    const agent = new Agent({ vfs, gate: new NetGate(), provider: () => ({ ...LOCAL, contextTokens: 32_000 }), projectSummary: () => '', media: () => MEDIA, guides: ['video'] });
     const events: AgentEvent[] = [];
     await agent.run('make the background', (e) => events.push(e));
     expect(events.at(-1)).toMatchObject({ type: 'done', text: 'ok' });
@@ -237,7 +237,7 @@ describe('a picture made for a scripted video', () => {
         return { text: 'ok' };
       },
     ]);
-    const agent = new Agent({ vfs, gate: new NetGate(), provider: () => ({ ...LOCAL, contextTokens: 32_000 }), projectSummary: () => '', media: () => MEDIA });
+    const agent = new Agent({ vfs, gate: new NetGate(), provider: () => ({ ...LOCAL, contextTokens: 32_000 }), projectSummary: () => '', media: () => MEDIA, guides: ['video'] });
     const events: AgentEvent[] = [];
     await agent.run('make Gary', (e) => events.push(e));
     expect(events.at(-1)).toMatchObject({ type: 'done', text: 'ok' });
@@ -294,7 +294,7 @@ describe('a picture the user flagged', () => {
         return { text: 'ok' };
       },
     ]);
-    const agent = new Agent({ vfs, gate: new NetGate(), provider: () => ({ ...LOCAL, contextTokens: 32_000 }), projectSummary: () => '', media: () => MEDIA });
+    const agent = new Agent({ vfs, gate: new NetGate(), provider: () => ({ ...LOCAL, contextTokens: 32_000 }), projectSummary: () => '', media: () => MEDIA, guides: ['video'] });
     const events: AgentEvent[] = [];
     await agent.run('I flagged it', (e) => events.push(e));
     expect(events.at(-1)).toMatchObject({ type: 'done', text: 'ok' });
@@ -314,7 +314,7 @@ describe('a picture the user flagged', () => {
       },
       { text: 'ok' },
     ]);
-    const agent = new Agent({ vfs, gate: new NetGate(), provider: () => ({ ...LOCAL, contextTokens: 32_000 }), projectSummary: () => '', media: () => MEDIA });
+    const agent = new Agent({ vfs, gate: new NetGate(), provider: () => ({ ...LOCAL, contextTokens: 32_000 }), projectSummary: () => '', media: () => MEDIA, guides: ['video'] });
     const events: AgentEvent[] = [];
     await agent.run('I flagged it', (e) => events.push(e));
     expect(events.at(-1)).toMatchObject({ type: 'done', text: 'ok' });
@@ -333,7 +333,7 @@ describe('a picture sent back again and again', () => {
         return { text: 'ok' };
       },
     ]);
-    const agent = new Agent({ vfs, gate: new NetGate(), provider: () => ({ ...LOCAL, contextTokens: 32_000 }), projectSummary: () => '', media: () => MEDIA });
+    const agent = new Agent({ vfs, gate: new NetGate(), provider: () => ({ ...LOCAL, contextTokens: 32_000 }), projectSummary: () => '', media: () => MEDIA, guides: ['video'] });
     const events: AgentEvent[] = [];
     await agent.run('go on', (e) => events.push(e));
     expect(events.at(-1)).toMatchObject({ type: 'done', text: 'ok' });

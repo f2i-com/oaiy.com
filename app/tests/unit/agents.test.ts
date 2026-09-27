@@ -128,6 +128,28 @@ describe('sub-agents', () => {
     expect(events.at(-1)).toMatchObject({ type: 'done', text: 'Both pages are written.' });
   });
 
+  it("hear the user's messages while they work, as does the main agent after them", async () => {
+    const provider: ProviderConfig = { ...OPENAI, id: 'sub-3' };
+    let main!: Agent;
+    const { script, bodies } = routed([{ calls: [delegate] }, { text: 'done' }], (task, n) => {
+      // Said while Page A works: it gets it at its next step, Page B when it starts.
+      if (task === 'Page A' && n === 1) expect(main.interject('make the pages blue')).toBe(true);
+      return worker(task, n);
+    });
+    fakeProvider('openai', script);
+    const { agent, emit } = setup(provider, 1);
+    main = agent;
+    await agent.run('write two pages', emit);
+    const said = (who: string, i: number) => JSON.stringify(bodies.filter((b) => b.who === who)[i]?.body.messages ?? '');
+    expect(said('Page A', 0)).not.toContain('make the pages blue');
+    expect(said('Page A', 1)).toContain('while you worked on your task (the main agent has it too)');
+    expect(said('Page A', 1)).toContain('make the pages blue');
+    expect(said('Page B', 0)).toContain('make the pages blue');
+    expect(said('main', 1)).toContain('while your sub-agents worked');
+    expect(said('main', 1)).toContain('make the pages blue');
+    expect(main.helping()).toBe(false);
+  });
+
   it('run side by side when the provider allows more than one', async () => {
     const provider: ProviderConfig = { ...OPENAI, id: 'sub-2' };
     const { script } = routed([{ calls: [delegate] }, { text: 'done' }], worker);

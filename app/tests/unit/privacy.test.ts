@@ -18,6 +18,16 @@ describe('incognito', () => {
     expect(incognitoHeaderFor('not a url')).toEqual({});
   });
 
+  it('names the incognito session to nrob, so its next request reuses what nrob read', () => {
+    addNrobOrigin('http://127.0.0.1:8080/v1');
+    setIncognito(true, 'project-1');
+    expect(incognitoHeaderFor('http://127.0.0.1:8080/v1/chat/completions')).toEqual({ 'X-NROB-Incognito': '1', 'X-NROB-Session': 'project-1' });
+    expect(incognitoHeaderFor('https://api.openai.com/v1/chat/completions')).toEqual({});
+    // Out of incognito, no session is named.
+    setIncognito(false, 'project-1');
+    expect(incognitoHeaderFor('http://127.0.0.1:8080/v1/chat/completions')).toEqual({});
+  });
+
   it("is sent with the media service's requests", async () => {
     addNrobOrigin('http://127.0.0.1:8080');
     setIncognito(true);

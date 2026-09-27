@@ -65,8 +65,8 @@ export interface Attachment {
 }
 
 export type Turn =
-  | { role: 'user'; text: string; images?: ImagePart[]; attachments?: Attachment[]; /** Written by bot.computer (a nudge to finish), not the person. */ automatic?: boolean; /** A summary of everything before it: the model reads from the latest one on. */ summary?: boolean }
-  | { role: 'assistant'; text: string; calls: ToolCall[]; anthropicContent?: unknown[] }
+  | { role: 'user'; text: string; images?: ImagePart[]; attachments?: Attachment[]; /** Written by bot.computer (a nudge to finish), not the person. */ automatic?: boolean; /** A summary of everything before it: the model reads from the latest one on. */ summary?: boolean; /** Guides read with this request (it plainly asked for that kind of work). */ guides?: string[] }
+  | { role: 'assistant'; text: string; calls: ToolCall[]; anthropicContent?: unknown[]; /** What the model thought first: shown in the chat, never sent back. */ thinking?: string }
   | { role: 'tool'; results: ToolResult[] };
 
 export interface Usage {

@@ -21,6 +21,25 @@ const FLAG_WAIT_SECONDS = 10;
  */
 const STREAM_REDRAW_MS = 80;
 
+/** The prompt a picture, clip or sound is made from, shown on its card without opening it. */
+function mediaPrompt(call: ToolCall): string {
+  if (!/^generate_(image|video|speech|music)$/.test(call.name)) return '';
+  const i = call.input;
+  const text = [i.prompt, call.name === 'generate_speech' ? i.input : null, i.lyrics].filter((v): v is string => typeof v === 'string' && !!v.trim());
+  return text.join('\n\n');
+}
+
+/** What the model was sent for a step, as text to read: the system prompt, the tools, then the conversation. */
+function promptText(e: { system: string; turns: Turn[]; tools: string[] }): string {
+  const parts = [`━━ SYSTEM PROMPT ━━\n${e.system}`, `━━ TOOLS ━━\n${e.tools.join(', ')}`];
+  for (const t of e.turns) {
+    if (t.role === 'user') parts.push(`━━ ${t.automatic ? 'BOT.COMPUTER' : 'USER'} ━━\n${t.text}${t.images?.length ? `\n[${t.images.length} image(s)]` : ''}`);
+    else if (t.role === 'assistant') parts.push(`━━ MODEL ━━\n${[t.text, ...t.calls.map((c) => `→ ${c.name} ${JSON.stringify(c.input, null, 2)}`)].filter(Boolean).join('\n')}`);
+    else parts.push(...t.results.map((r) => `━━ RESULT of ${r.name}${r.isError ? ' (error)' : ''} ━━\n${r.content}${r.images?.length ? `\n[${r.images.length} image(s)]` : ''}`));
+  }
+  return parts.join('\n\n');
+}
+
 function summarizeCall(call: ToolCall): string {
   const i = call.input;
   const s = (k: string) => (typeof i[k] === 'string' ? String(i[k]) : '');
@@ -42,6 +61,16 @@ function summarizeCall(call: ToolCall): string {
     case 'softn_examples': return [s('name'), s('file'), s('install_to') && `→ ${s('install_to')}`].filter(Boolean).join(' ') || 'list';
     default: return '';
   }
+}
+
+/** How many turns of a saved conversation are drawn at a time (newest first; older ones as the log is scrolled down to them). */
+const REPLAY_PAGE = 60;
+
+/** Where the last page of `turns` starts: `size` turns back, moved back to the request they belong to. */
+function pageStart(turns: Turn[], size: number): number {
+  let from = Math.max(0, turns.length - size);
+  while (from > 0 && turns[from]?.role !== 'user') from--;
+  return from;
 }
 
 export class ChatPane {
@@ -88,9 +117,11 @@ export class ChatPane {
     this.planBox.hidden = true;
     this.meter.hidden = true;
     this.log.addEventListener('scroll', () => {
-      this.stick = this.log.scrollHeight - this.log.scrollTop - this.log.clientHeight < 60;
+      this.stick = this.log.scrollTop < 60;
+      this.toCurrent.hidden = this.log.scrollTop < 300;
+      this.maybeLoadOlder();
     }, { passive: true });
-    this.element.append(h('div.pane-title', 'Agent', this.meter), this.planBox, this.log, this.status, this.pending, h('div.chat-compose', this.attachButton, this.input, this.send), this.picker);
+    this.element.append(h('div.pane-title', 'Agent', this.meter), this.planBox, h('div.chat-log-wrap', this.log, this.toCurrent), this.status, this.pending, h('div.chat-compose', this.attachButton, this.input, this.send), this.picker);
     this.attachButton.addEventListener('click', () => this.picker.click());
     this.picker.addEventListener('change', () => {
       if (this.picker.files) this.addFiles([...this.picker.files]);
@@ -200,16 +231,37 @@ export class ChatPane {
     this.status.textContent = text;
   }
 
-  /** Follow new output only while the person is at the bottom: scrolled up to read, they stay put. */
+  /**
+   * The log reads newest first: the current step is at the top. It follows
+   * new output only while the person is at the top: scrolled down to read
+   * older messages, they stay put (the browser keeps what they read in place
+   * as new entries arrive above it).
+   */
   private stick = true;
   private scrollQueued = false;
   private scroll(): void {
-    if (!this.stick || this.scrollQueued) return;
+    if (!this.stick || this.scrollQueued || this.sink) return;
     this.scrollQueued = true;
     requestAnimationFrame(() => {
       this.scrollQueued = false;
-      if (this.stick) this.log.scrollTop = this.log.scrollHeight;
+      if (this.stick) this.log.scrollTop = 0;
     });
+  }
+
+  /** Back to the top, where the agent's current step is. */
+  private readonly toCurrent = h('button.to-current', { hidden: true, title: 'Back to the newest messages and what the agent is doing now', onclick: () => this.toTop() }, '↑ Current');
+
+  /** Straight to the top (the newest), following it from there. */
+  private toTop(): void {
+    this.stick = true;
+    this.log.scrollTop = 0;
+    this.toCurrent.hidden = true;
+  }
+
+  /** Where new entries go: the top of the log, or (drawing older turns) a holder of their own. */
+  private sink: HTMLElement | null = null;
+  private add(entry: HTMLElement): void {
+    (this.sink ?? this.log).prepend(entry);
   }
 
   /** How full the context is: `used` tokens of `window`. */
@@ -225,7 +277,7 @@ export class ChatPane {
   private summaryNote(text: string, heading: string): void {
     this.current = null;
     const body = text.replace(/^\[bot\.computer\][^\n]*\n(<project>[\s\S]*?<\/project>\n\n)?/, '');
-    this.log.append(h('details.msg.compacted', h('summary', h('span', '⇣'), h('span', ` ${heading}`)), h('pre', body)));
+    this.add(h('details.msg.compacted', h('summary', h('span', '⇣'), h('span', ` ${heading}`)), h('pre', body)));
     this.scroll();
   }
 
@@ -274,6 +326,8 @@ export class ChatPane {
     this.showPlan(null);
     for (const m of this.media.splice(0)) m.dispose();
     clear(this.log);
+    this.older.remove();
+    this.stick = true;
     this.cards.clear();
     this.current = null;
     this.thinking = null;
@@ -362,14 +416,14 @@ export class ChatPane {
   }
 
   /** The person's message: a new request, or (`during`) one sent while the agent works, which keeps its plan. */
-  user(text: string, attachments: Attachment[] = [], during = false): void {
+  user(text: string, attachments: Attachment[] = [], during = false, note = 'sent while the agent works: it reads it at its next step'): void {
     this.current = null;
-    this.stick = true;
+    // Sending a message goes back to the top, where the reply comes.
     if (during) {
-      const box = h('div.msg.user.during', h('div.msg-body', text || ' '), h('div.msg-note', 'sent while the agent works: it reads it at its next step'));
+      const box = h('div.msg.user.during', h('div.msg-body', text || ' '), h('div.msg-note', note));
       if (attachments.length) box.append(h('div.msg-attachments', ...attachments.map((a) => this.fileView(a.path, a.name, a.app))));
-      this.log.append(box);
-      this.scroll();
+      this.add(box);
+      if (!this.sink) this.toTop();
       return;
     }
     // A new request gets its own plan.
@@ -378,14 +432,34 @@ export class ChatPane {
     this.showPlan(null);
     const box = h('div.msg.user', h('div.msg-body', text || (attachments.length ? '' : ' ')));
     if (attachments.length) box.append(h('div.msg-attachments', ...attachments.map((a) => this.fileView(a.path, a.name, a.app))));
-    this.log.append(box);
-    this.scroll();
+    this.add(box);
+    if (!this.sink) this.toTop();
   }
 
-  /** The thinking box folds away once the reply moves on (it can be opened again). */
+  /** The model's thinking stays shown once the reply moves on: it says why the model did what it did. */
   private doneThinking(): void {
-    if (this.thinking) (this.thinking.box as HTMLDetailsElement).open = false;
+    if (this.thinking) this.thinking.box.querySelector('summary')!.textContent = '💭 What the model thought';
     this.thinking = null;
+  }
+
+  /** A box with the model's thinking, open to read. */
+  private thoughtBox(text: string, streaming = false): HTMLElement {
+    const box = h('details.thinking', { open: true }, h('summary', streaming ? '💭 The model is thinking…' : '💭 What the model thought'), h('pre', text));
+    this.add(box);
+    return box;
+  }
+
+  /** What the model was sent for this step: folded, and written out only when opened (it is long). */
+  private promptView(e: { system: string; turns: Turn[]; tools: string[] }): void {
+    this.current = null;
+    const chars = e.system.length + e.turns.reduce((n, t) => n + (t.role === 'user' ? t.text.length : t.role === 'assistant' ? t.text.length + JSON.stringify(t.calls).length : t.results.reduce((m, r) => m + r.content.length, 0)), 0);
+    const pre = h('pre');
+    const box = h('details.prompt-view', h('summary', `📝 The prompt the model was sent: ${e.turns.length} message${e.turns.length === 1 ? '' : 's'}, about ${formatTokens(Math.round(chars / 4))} tokens (click to read)`), pre);
+    box.addEventListener('toggle', () => {
+      if ((box as HTMLDetailsElement).open && !pre.textContent) pre.textContent = promptText(e);
+    });
+    this.add(box);
+    this.scroll();
   }
 
   /**
@@ -402,12 +476,12 @@ export class ChatPane {
       const body = h('pre.tool-result.draft-body');
       const box = h('details.tool.draft', { open: true }, h('summary', h('span.tool-name', 'writing…')), body);
       box.classList.add('pending');
-      this.log.append(box);
+      this.add(box);
       this.draft = { box, body, raw: '', json };
     }
     this.draft.raw += text;
     const draft = this.draft;
-    this.redraw('draft', () => {
+    this.redraw(draft.box, () => {
       const raw = draft.raw;
       const name = draft.json ? '' : /<function=([\w.-]+)>/.exec(raw)?.[1] ?? '';
       if (name) draft.box.querySelector('.tool-name')!.textContent = `writing ${name}…`;
@@ -426,13 +500,13 @@ export class ChatPane {
   /** A message from the app itself (commands, errors, notices). */
   system(text: string, kind: 'info' | 'error' = 'info'): void {
     this.current = null;
-    this.log.append(h('div.msg.system', { class: kind }, h('pre', text)));
+    this.add(h('div.msg.system', { class: kind }, h('pre', text)));
     this.scroll();
   }
 
-  /** Run `draw` soon (see STREAM_REDRAW_MS), once for however many calls came before it ran. */
-  private redraws = new Map<string, () => void>();
-  private redraw(key: string, draw: () => void): void {
+  /** Run `draw` soon (see STREAM_REDRAW_MS), once for however many calls for the same box came before it ran (each box is drawn: a replayed conversation has many). */
+  private redraws = new Map<HTMLElement, () => void>();
+  private redraw(key: HTMLElement, draw: () => void): void {
     const queued = this.redraws.has(key);
     this.redraws.set(key, draw);
     if (queued) return;
@@ -450,13 +524,13 @@ export class ChatPane {
     if (!this.current) {
       const body = h('div.msg-body');
       const box = h('div.msg.assistant', body);
-      this.log.append(box);
+      this.add(box);
       this.current = { box, text: '', body };
     }
     this.current.text += delta;
     // A long reply streams in many pieces: drawn a few times a second, not for each.
     const target = this.current;
-    this.redraw('reply', () => {
+    this.redraw(target.box, () => {
       target.body.innerHTML = renderMarkdown(target.text);
     });
   }
@@ -473,13 +547,13 @@ export class ChatPane {
     const result = h('pre.tool-result', 'running…');
     const card = h(
       'details.tool',
-      h('summary', h('span.tool-name', call.name), ' ', h('span.tool-arg', summarizeCall(call))),
+      h('summary', h('span.tool-name', call.name), ' ', h('span.tool-arg', summarizeCall(call)), ...(mediaPrompt(call) ? [h('span.tool-prompt', { title: mediaPrompt(call) }, mediaPrompt(call))] : [])),
       h('pre.tool-input', JSON.stringify(call.input, null, 2)),
       result,
     );
     card.classList.add('pending');
     this.cards.set(call.id, card);
-    this.log.append(card);
+    this.add(card);
     this.scroll();
   }
 
@@ -502,7 +576,7 @@ export class ChatPane {
     card.classList.add('pending');
     tasks.forEach((task, i) => this.taskRow(`${call.id}#${i}`, task.title, list));
     this.cards.set(call.id, card);
-    this.log.append(card);
+    this.add(card);
     this.scroll();
   }
 
@@ -517,11 +591,11 @@ export class ChatPane {
     let target = list ?? card?.querySelector('.agent-tasks');
     // A sub-agent under another tool's card (the review of a picture): a list of its own just below the card, seen without opening it.
     if (!target && card) {
-      const next = card.nextElementSibling;
+      const next = card.previousElementSibling;
       target = next instanceof HTMLElement && next.matches('ol.agent-tasks.under') ? next : null;
       if (!target) {
         target = h('ol.agent-tasks.under');
-        card.after(target);
+        card.before(target);
       }
     }
     target?.append(row);
@@ -551,7 +625,7 @@ export class ChatPane {
       const card = h('details.tool.auto', h('summary', h('span.tool-name', 'automatic check'), ' ', h('span.tool-arg', e.root ? `${e.root}/` : '/')), h('pre.tool-result', 'checking the files and rendering the app…'));
       card.classList.add('pending');
       this.cards.set(e.id, card);
-      this.log.append(card);
+      this.add(card);
       this.scroll();
       return;
     }
@@ -593,7 +667,7 @@ export class ChatPane {
     if (result.files?.length) {
       // Pictures the agent made can be flagged; files it only shows (uploads, extracted frames) cannot.
       const shown = h('div.msg.presented', ...result.files.map((path) => this.fileView(path, undefined, undefined, result.name === 'generate_image')));
-      card.after(shown);
+      card.before(shown);
     }
     this.scroll();
   }
@@ -606,18 +680,22 @@ export class ChatPane {
         break;
       case 'thinking':
         if (!this.thinking) {
-          // Open while it streams, to read along; it folds away when the reply moves on.
-          const box = h('details.thinking', { open: true }, h('summary', 'thinking…'), h('pre'));
-          this.log.append(box);
+          const box = this.thoughtBox('', true);
           this.thinking = { box, text: '' };
         }
         this.thinking.text += e.delta;
         {
           const thinking = this.thinking;
-          this.redraw('thinking', () => {
-            thinking.box.querySelector('pre')!.textContent = thinking.text;
+          this.redraw(thinking.box, () => {
+            const pre = thinking.box.querySelector('pre')!;
+            pre.textContent = thinking.text;
+            // The newest thoughts stay in view as they stream.
+            pre.scrollTop = pre.scrollHeight;
           });
         }
+        break;
+      case 'prompt':
+        this.promptView(e);
         break;
       case 'tool_draft':
         this.doneThinking();
@@ -658,7 +736,7 @@ export class ChatPane {
         break;
       case 'compact':
         this.current = null;
-        this.log.append(
+        this.add(
           h('div.msg.nudge.compacted', h('span', '⇣'), h('span', e.how === 'summary'
             ? ` Context compacted: ${e.turns} earlier turns summarized for the model (${formatTokens(e.before)} → ${formatTokens(e.after)} tokens). The chat keeps everything.`
             : ` Context compacted: the model could not write a summary, so ${e.turns} earlier turns were reduced to their requests and changes (${formatTokens(e.before)} → ${formatTokens(e.after)} tokens).`)),
@@ -667,7 +745,7 @@ export class ChatPane {
         break;
       case 'nudge':
         this.current = null;
-        this.log.append(h('div.msg.nudge', h('span', '↻'), h('span', ` Not finished yet, so the agent carries on: ${e.message}`)));
+        this.add(h('div.msg.nudge', h('span', '↻'), h('span', ` Not finished yet, so the agent carries on: ${e.message}`)));
         this.scroll();
         break;
       case 'done':
@@ -679,32 +757,62 @@ export class ChatPane {
     }
   }
 
-  /** Turns of a long saved conversation not drawn yet ("Show earlier"). */
+  /** Turns of a long saved conversation not drawn yet: drawn as the person scrolls down to them. */
   private hiddenTurns: Turn[] = [];
+  /** The end of the log while older turns are left: scrolling near it draws them. */
+  private readonly older = h('button.show-earlier', { onclick: () => this.loadOlder() });
 
   /**
-   * Show a saved conversation. A long one opens at its latest turns, with a
-   * button for the rest: drawing hundreds of tool cards at once is slow.
+   * Show a saved conversation, newest first. A long one opens at its latest
+   * turns, and older ones are drawn a page at a time as the person scrolls
+   * down to them: drawing hundreds of tool cards at once is slow.
    */
-  replay(turns: Turn[], latest = 120): void {
+  replay(turns: Turn[], latest = REPLAY_PAGE): void {
     this.clearLog();
-    let from = Math.max(0, turns.length - latest);
-    while (from > 0 && turns[from]?.role !== 'user') from--;
-    if (from > 0) {
-      this.hiddenTurns = turns.slice(0, from);
-      const more = h('button.show-earlier', { onclick: () => {
-        const all = [...this.hiddenTurns, ...turns.slice(from)];
-        const top = this.log.scrollHeight - this.log.scrollTop;
-        this.replay(all, Infinity);
-        this.stick = false;
-        this.log.scrollTop = this.log.scrollHeight - top;
-      } }, `Show ${from} earlier turns`);
-      this.log.append(more);
-    }
+    const from = pageStart(turns, latest);
+    this.hiddenTurns = turns.slice(0, from);
     this.drawTurns(turns.slice(from));
+    this.showOlder();
+    this.log.scrollTop = 0;
   }
 
-  private drawTurns(turns: Turn[]): void {
+  /** The note at the end of the log: how much older conversation there is. */
+  private showOlder(): void {
+    if (!this.hiddenTurns.length) {
+      this.older.remove();
+      return;
+    }
+    this.older.textContent = `↓ ${this.hiddenTurns.length} older turns: scroll down, or click, to show them`;
+    this.log.append(this.older);
+    // A short page does not fill the log: nothing to scroll, so draw on.
+    requestAnimationFrame(() => this.maybeLoadOlder());
+  }
+
+  private maybeLoadOlder(): void {
+    if (this.hiddenTurns.length && this.log.scrollHeight - this.log.scrollTop - this.log.clientHeight < 400) this.loadOlder();
+  }
+
+  /** Draw the next page of older turns at the end of the log, leaving what is live (the current reply, the plan) as it is. */
+  private loadOlder(): void {
+    if (!this.hiddenTurns.length || this.sink) return;
+    const from = pageStart(this.hiddenTurns, REPLAY_PAGE);
+    const page = this.hiddenTurns.slice(from);
+    this.hiddenTurns = this.hiddenTurns.slice(0, from);
+    const live = { current: this.current, thinking: this.thinking, draft: this.draft, plan: this.currentPlan, planOpen: this.planOpen };
+    this.sink = h('div');
+    try {
+      this.drawTurns(page, false);
+    } finally {
+      this.older.before(...this.sink.children);
+      this.sink = null;
+      ({ current: this.current, thinking: this.thinking, draft: this.draft, plan: this.currentPlan, planOpen: this.planOpen } = live);
+      this.showPlan(this.currentPlan);
+      this.showOlder();
+    }
+  }
+
+  /** Draw turns in the order they came (each goes on top of the ones before). */
+  private drawTurns(turns: Turn[], showPlan = true): void {
     for (const turn of turns) {
       if (turn.role === 'user' && turn.summary) {
         this.summaryNote(turn.text, 'Earlier conversation summarized for the model (click to read the summary)');
@@ -712,12 +820,12 @@ export class ChatPane {
       }
       if (turn.role === 'user' && turn.automatic) {
         this.current = null;
-        this.log.append(h('div.msg.nudge', h('span', '↻'), h('span', ` ${turn.text.replace(/^\[bot\.computer\] /, '').split('\n')[0]}`)));
+        this.add(h('div.msg.nudge', h('span', '↻'), h('span', ` ${turn.text.replace(/^\[bot\.computer\] /, '').split('\n')[0]}`)));
         continue;
       }
       if (turn.role === 'user') {
         // A message sent while the agent worked carries a note for the model: show it as the person wrote it.
-        const during = /^\[The user sent this while you were working\.[^\]]*\]\n\n/.exec(turn.text);
+        const during = /^\[The user sent this while you[^\]]*\]\n\n/.exec(turn.text);
         const text = (during ? turn.text.slice(during[0].length) : turn.text).replace(/^<project>[\s\S]*?<\/project>\n\n/, '');
         const attached = /\n\n\[Attached and saved in the project: ([\s\S]*)\]$/.exec(text);
         // Chats saved before attachments were kept on the turn: read them from the note.
@@ -725,6 +833,7 @@ export class ChatPane {
         this.user(attached ? text.slice(0, attached.index) : text, turn.attachments ?? fallback, !!during);
       }
       else if (turn.role === 'assistant') {
+        if (turn.thinking) this.thoughtBox(turn.thinking);
         if (turn.text) this.assistantText(turn.text);
         this.current = null;
         for (const call of turn.calls) {
@@ -739,6 +848,6 @@ export class ChatPane {
         }
       } else for (const r of turn.results) this.toolResult(r);
     }
-    this.showPlan(this.currentPlan, false);
+    if (showPlan) this.showPlan(this.currentPlan, false);
   }
 }

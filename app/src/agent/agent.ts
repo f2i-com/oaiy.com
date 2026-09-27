@@ -24,6 +24,8 @@ import { imageMimeFor, viewImage, type ImagePart } from './images';
 export type AgentEvent =
   | { type: 'text'; delta: string }
   | { type: 'thinking'; delta: string }
+  /** What the model is about to be sent for its next step, to show: the system prompt, the conversation as sent, the tools' names. */
+  | { type: 'prompt'; system: string; turns: Turn[]; tools: string[] }
   | { type: 'tool_start'; index: number; name: string }
   /** A tool call as it is written, before it is whole: nrob's raw text, or a call's JSON arguments (`index`). */
   | { type: 'tool_draft'; text: string; start: boolean; index?: number }
@@ -56,11 +58,7 @@ const MAX_TASKS_PER_RUN = 24;
 /** For the agent that plans (the main one): plan before changing anything. */
 const PLAN_GUIDE = `
 
-Plan first: when you are given a task (anything that will change files: building or changing an app, a feature, a fix across files), call update_plan with the goal and 3 to 8 concrete steps that break the task down before you change anything, and update it as each step starts and finishes; the user watches that checklist. Then carry the plan out step by step. The task is done when every step is done and checked.`;
-
-const DELEGATE_GUIDE = `
-
-Sub-agents: for a big task that splits into independent parts, hand the parts to sub-agents with delegate. Each gets a fresh, smaller context and only the instructions you give it, so write each task to stand on its own (what to do, which files it may change, what to report) and keep tasks on separate files. Plan first, give each task the plan step it completes, then check and join the results yourself. Small tasks are quicker to do directly.`;
+Plan first: for a task of several steps, call update_plan with the goal and 3 to 8 concrete steps before you start, and keep it current as each step starts and finishes (the user watches it). The task is done when every step is done and checked.`;
 
 const SUB_AGENT_ROLE = `
 
@@ -116,6 +114,8 @@ You are a reviewer: the main agent made a picture for a scripted video and goes 
 How to look: the picture and its reference images are attached to your task, small, for a quick once-over. Go over the picture person by person: count their heads, arms, hands and legs one by one, following every limb to where it joins the body, and compare each person and prop with their reference. Where something is unclear (a hand, a crowded part, a face), zoom in with view_image's x, y, width and height; look at the script (read_file), the scene's background or earlier frames only when you need them. Be quick: judge from what you see, in few steps.
 Be strict about what a viewer would notice: a picture not in the script's art style (its Style line: a photographic background in a cartoon, a drawn face in a realistic film); a wrong count of limbs, fingers or faces; a character who does not match their reference (face, hair, build, clothes); a missing or extra person or prop; something duplicated, merged, floating or the wrong size; the wrong place or light; a pose or expression that does not fit the moment or the story; more than the speaker in view in a shot with dialogue; an end frame that is not its start frame moved on; stray text. Let small things pass (a fold of cloth, a detail far in the background). When in doubt about a body or a face, send it back. Then call give_verdict once, and reply with one line.`;
 const KEEP_RECENT_TURNS = 8;
+/** How much of a step's thinking the saved conversation keeps (for the chat; the model never reads it again). */
+const MAX_KEPT_THINKING = 20_000;
 /** For the same reply twice, with nothing done in between. */
 const REPEAT_NUDGE = 'You gave the same reply again, and still no tool has run. Do not reply in words: your next reply must be a tool call (update_plan for a task, or the first tool the work needs).';
 /** For a reply that only announced the work. */
@@ -157,7 +157,7 @@ const KEEP_IMAGE_TURNS = 3;
 const MEDIA_MAKE_GUIDE = `- generate_image, generate_video, generate_speech, create_voice and generate_music, when they are among your tools, make pictures, short videos (talking ones too), speech and music with the user's media service and save them in the project. Write concrete prompts, save under sensible paths, and look at an image with view_image before relying on it. Every video clip is at most 5 seconds and has a start and an end frame, each made new with generate_image from the scene's background and the character images (never a character image itself), and animates between them, its prompt describing the motion from start to end (what the characters do, how the camera moves), not the scene the frames already show. For dialogue, give each character a saved voice with create_voice and use it for every line they speak, and show only the speaker, alone in close-up, while they talk (see generate_video for how).
 `;
 /** How to make a video with a story: from a script, shot by shot. */
-const VIDEO_SCRIPT_GUIDE = `- Every video the user asks for is made from a plan and a script, however short or vague the request, written and revised before any picture or clip is made. Start with update_plan: writing the script is its first step, then one step per scene, then joining the clips. A vague request ("a video of a cat", "make something fun") becomes a short scene of your own making: a premise with a small beginning, middle and end, told in 3 to 6 shots of varied framing (an establishing wide shot, closer shots of the action, a reaction or a detail), about 10 to 25 seconds in all, joined with media_compose. Only when the user asks for exactly one clip is it a single shot. Give the video its own folder (video/NAME/) with script.md in it, and its frames, clips and audio beside it. The script has these parts, under these headings (a reviewer finds each picture's part of the script by them):
+const VIDEO_SCRIPT_GUIDE = `- Every video the user asks for is made from a plan and a script, however short or vague the request, written and revised before any picture or clip is made. What the user asked for comes first: everything their request says (the story and what happens in it, the characters and how they look, what they say, the places, how many scenes or how long, the style, what to do or avoid) goes into the script as they said it. The rules below only fill in what the request leaves open, and never override it. Start with update_plan: writing the script is its first step, then one step per scene, then joining the clips. A vague request ("a video of a cat", "make something fun") becomes a short scene of your own making: a premise with a small beginning, middle and end, told in 3 to 6 shots of varied framing (an establishing wide shot, closer shots of the action, a reaction or a detail), about 10 to 25 seconds in all, joined with media_compose. Only when the user asks for exactly one clip is it a single shot. Give the video its own folder (video/NAME/) with script.md in it, and its frames, clips and audio beside it. The script has these parts, under these headings (a reviewer finds each picture's part of the script by them):
   ## Premise: what the video is about, in a few sentences: who wants what, what stands in their way, and how it ends. Every scene moves this story on; nothing happens at random.
   ## Style: the look of the whole video, from what the user asked for (a cartoon, anime, a realistic film, a painting…; realistic when they did not say): the medium and art style, the line and shading, the colour palette and the mood of the light, ending in one Style line of prompt words, e.g. "Style: 2D anime, clean line art, cel shading, soft pastel palette" or "Style: photorealistic, 35mm film, natural light". Every picture's prompt ends with that Style line, word for word: the character and prop references, the backgrounds and every frame, so nothing comes out in another style (no photographic street behind a cartoon character, no drawn face in a realistic film).
   ## Characters: every person or animal in the story (anything alive is a character, never a prop), and any part of one seen on its own (a hand reaching in, a paw) belongs to its character: described in their look and shown in their frames, never made as a prop. For each, their look (face, age, build, hair, clothes: the same in every frame), their voice (for create_voice), and what they want. Their reference image shows only them, full length, facing the camera with a neutral expression, on a blank white background with nothing else in it: the frames give them their place and their expressions. It is a reference, never a frame. A character from a picture the user gave says so (From: uploads/NAME.jpg), and their look describes that person as the picture shows them; their reference image is then made from it (the user's picture as reference_images): the same person, recognisably, in the video's Style.
@@ -182,29 +182,78 @@ const VIDEO_SCRIPT_GUIDE = `- Every video the user asks for is made from a plan 
   When something has to change as you make it, change the script to match.
 `;
 /** The same in brief, for a window too small for the whole of it. */
-const VIDEO_SCRIPT_BRIEF = `- Every video is made from a plan (update_plan first) and a script, however short or vague the request: a vague one becomes a short scene of 3 to 6 shots of varied framing (about 10 to 25 seconds, joined with media_compose), a single shot only when exactly one clip is asked for. Each shot is a cut or, when one action runs on longer than a clip, continuous (starting on the last frame of the clip before), your choice. The script is written first in video/NAME/script.md with append_file and revised before any picture is made, under the headings ## Premise, ## Style (the art style, ending in a Style line that ends every picture's prompt, so all of them share it), ## Characters (look and voice), ## Props, and ## Scene N (with a Background line: the empty place), each scene's shots under ### Shot N (scene N, X s) (at most 5 seconds) with its Start frame, End frame, Video (the motion between them), Dialogue (one short line, the speaker alone in close-up) and Sound lines. Then make the character and prop reference images (blank white background, neutral faces) and voices, then each scene's empty background, then shot by shot its start frame made new from the background and references, its end frame made by editing the start frame, then the clip. Give generate_image \`frame\`, \`shot\` and \`scene\`: each picture is reviewed as it is made, and one sent back is made again.
+const VIDEO_SCRIPT_BRIEF = `- Every video is made from a plan (update_plan first) and a script, however short or vague the request. Everything the request says goes into the script as said; these rules only fill in what it leaves open. a vague one becomes a short scene of 3 to 6 shots of varied framing (about 10 to 25 seconds, joined with media_compose), a single shot only when exactly one clip is asked for. Each shot is a cut or, when one action runs on longer than a clip, continuous (starting on the last frame of the clip before), your choice. The script is written first in video/NAME/script.md with append_file and revised before any picture is made, under the headings ## Premise, ## Style (the art style, ending in a Style line that ends every picture's prompt, so all of them share it), ## Characters (look and voice), ## Props, and ## Scene N (with a Background line: the empty place), each scene's shots under ### Shot N (scene N, X s) (at most 5 seconds) with its Start frame, End frame, Video (the motion between them), Dialogue (one short line, the speaker alone in close-up) and Sound lines. Then make the character and prop reference images (blank white background, neutral faces) and voices, then each scene's empty background, then shot by shot its start frame made new from the background and references, its end frame made by editing the start frame, then the clip. Give generate_image \`frame\`, \`shot\` and \`scene\`: each picture is reviewed as it is made, and one sent back is made again.
 `;
 /** How to edit media: only when the editing tools are there. */
+/** For the main agent of a video of several scenes: each scene made by a sub-agent, so its own conversation stays short (and each step quick). */
+const VIDEO_DELEGATE_GUIDE = `- A video of two or more scenes: once script.md, the character and prop references and the voices are made, hand the scenes to sub-agents with delegate, one task per scene, in the scenes' order (their clips are made one after another). Each task says: make scene N of video/NAME/script.md (its background, then shot by shot its start frame, end frame and clip, as the script and the steps above say), the reference images and voices to use (their paths), the file names to write, not to change the script or any other scene, and to report the files it made. Then check the reports, make again what a task did not finish (yourself, or in another task), and join the clips. A flagged picture you fix yourself.
+`;
+
+/** How a message the user sent while the agent worked reads to it. */
+const DURING_NOTE = '[The user sent this while you were working. Read it now and act on it as soon as you can: if it changes what you are doing, change course; if it asks a question, answer it and carry on.]';
+/** The start every such message has (whoever it reached), which tells it from a new request. */
+const DURING_PREFIX = '[The user sent this while you';
+
+/** How the user's message reads to the main agent when sub-agents working then were given it too. */
+const HEARD_BY_HELPERS = '[The user sent this while your sub-agents worked. The ones working then were given it too, and their reports say what they did with it. Read it now and act on what is left of it: if it changes what you are doing, change course; if it asks a question, answer it and carry on.]';
+/** How the user's message reads to a delegated task. */
+const HEARD_BY_TASK = '[The user sent this while you worked on your task (the main agent has it too). If it bears on your task, act on it now: if it changes what you are doing, change course, and say in your report what you did about it. Anything else is for the main agent: carry on with your task.]';
+/** How the user's message reads to a picture's reviewer. */
+const HEARD_BY_REVIEWER = '[The user sent this while you reviewed the picture (the main agent has it too). If it is about this picture, judge the picture by it as well. Anything else is for the main agent: carry on with the review.]';
+
+/** The tools that make a picture, a clip or a sound: before the first after a video's script is written, the script is checked against the request. */
+const MAKE_TOOLS = new Set(['generate_image', 'generate_video', 'generate_speech', 'generate_music', 'create_voice']);
+
 const MEDIA_EDIT_GUIDE = `- media_info, video_frames, video_split and media_compose edit video and sound in the project, in the browser: read what a file holds, take frames out (to check a clip, or to take the last frame it really ended on), cut, join clips and pictures, and lay music, speech and effects over a whole video with volume, fades and ducking. To make a longer video: make its clips (each a cut, or continuous: starting on the last frame the clip before really ended on, from video_frames with last: true, so the motion flows on), then compose them with the soundtrack (trimming a continuous clip's first frame).
 `;
 
 /** The system prompt, with how to use the media tools this agent has. */
-function basePrompt(media: string): string {
-  return `You are bot.computer, a coding agent that runs entirely inside the user's web browser.
+/**
+ * The system prompt: short, so the request stands out. What a kind of work
+ * needs (an app, a video, pictures, a long document) is in its guide, read
+ * when the work calls for it (see GUIDES).
+ */
+const BASE_PROMPT = `You are bot.computer, an agent working in the user's project inside their web browser. The project is a virtual filesystem: "/" is its root, and there is nothing outside it.
 
-The user's project lives in a virtual filesystem in the browser; "/" is the project root and there is nothing outside it. Work with the tools:
-- list_files, read_file, grep, glob to look around; read a file before you edit or replace it.
-- edit_file for changes to existing files (exact, unique matches), write_file for new files or full rewrites, append_file to add to the end of one.
-- Long documents (scripts, stories, reports: anything longer than a few pages) are written in parts, never in one call. Write an outline first (the sections, and what happens or is said in each), then the document one section per append_file call, following the outline. When it is all written, read it back in full (paging with offset) and revise it with edit_file until it is complete: every section of the outline is there and fully written, nothing is summarized or skipped ("the scene continues…", "etc."), and names, facts and tone agree from start to end.
-- code_run to compute, test ideas, or process data in JavaScript or Python (a Zipp VM sandbox in a Web Worker).
-- sandbox_shell for shell-style work (an emulated bash-like shell on the same sandbox): run project scripts with node or python, search and transform files (grep, find, sed, awk, jq, diff/patch), pack and unpack archives (tar, zip, gzip), and keep history with git (a local repository in .git/; no remotes, so no push, pull or clone). There is no real operating system: npm install, pip install, compilers and other native programs do not exist. Do not pretend to run them.
-- SoftN apps: a SoftN app is a folder whose manifest.json names a .ui page as "main" (with ui/*.ui pages and logic/*.logic or .py). A project can hold several, each in its own folder: to rebuild or learn from an existing app, read its files and write the new one in another folder. A .softn the user attaches is unpacked into its own folder (the original stays in uploads/, and softn_import unpacks any .softn in the project): when they ask for changes, edit that folder; when they ask to recreate, redo or base something on it, write a new app in a new folder and leave the original as it is. The SoftN reference is in your tools, so do not guess the language: softn_docs with no arguments gives the map, topic "guide" is the writing guide (read it before your first app), search finds how something is done across the guides, the components and the example apps; softn_components gives exact props and events; softn_examples has complete working apps to read or copy. Keep manifest.json true. After each step that changes an app, bot.computer checks it automatically (its files, then a real render) and adds the outcome to that step's result: when it reports errors, fix them before anything else. softn_check checks on demand; softn_inspect shows what the page displays; softn_interact uses the app like a person (click, fill, select, press keys) and reports errors the app raises, so test that the app works, not just that it renders. The user watches the app in a live preview as you build it, and can export any app folder as a .softn file.
-${media}- web_fetch, curl, fetch() go through the user's network gate (/internet) and, from a browser, only reach sites that allow cross-origin requests. If the gate refuses a host, say so; the user decides whether to allow it.
+The user's request is your task: do what it asks, as it asks it. Your tools say what each one does. Before work that has a guide (the guide tool lists them), read that guide first.
 
-Work toward the goal on your own until it is reached, without stopping to ask for permission; ask only when you truly cannot decide something yourself. You are done when the work is done and checked (for an app: it renders without errors and softn_interact shows it working), not before.
+Work on your own until the request is done and checked, in small, verified steps; ask only when you truly cannot decide something yourself. Read a file before you change it. When you are done, say briefly what you did and how you checked it.`;
 
-Work in small, verified steps. Prefer running code to check a claim over guessing. When you are done, say briefly what you changed and what you verified.`;
-}
+/** The kinds of work with a guide. */
+type GuideTopic = 'app' | 'video' | 'media' | 'document';
+
+/** What each guide is for, as the guide tool lists them. */
+const GUIDE_ABOUT: Record<GuideTopic, string> = {
+  video: 'making a video, film, animation or any story told in clips: the script, pictures, voices and clips',
+  media: 'making pictures, speech, voices or music',
+  app: 'building or changing an app (a SoftN app: pages, logic and a live preview); it also gives you the app tools',
+  document: 'writing a long document: a story, a script, a report',
+};
+
+/** Requests that plainly ask for a kind of work: its guide is read with them. */
+const GUIDE_WORDS: Array<[GuideTopic, RegExp]> = [
+  ['video', /\b(videos?|clips?|films?|movies?|animat\w*|sitcoms?|episodes?|trailers?|cartoons?|vlogs?|commercials?)\b/i],
+  ['media', /\b(images?|pictures?|photos?|drawings?|illustrations?|logos?|posters?|portraits?|songs?|music|voices?|speech|narrat\w*|podcasts?|sound effects?)\b/i],
+  ['app', /\b(apps?|softn|website|web ?page|dashboard|calculator|games?|to-?do list)\b/i],
+  ['document', /\b(stor(?:y|ies)|essays?|reports?|books?|chapters?|novels?|articles?|screenplays?|poems?)\b/i],
+];
+
+/** The note that a guide was read (in a tool result): from then on it is part of the instructions. */
+const guideLoaded = (topic: GuideTopic) => `[bot.computer] The ${topic} guide is now in your instructions`;
+const GUIDE_MARK = /\[bot\.computer\] The (app|video|media|document) guide is now in your instructions/g;
+
+/** The app tools: offered once the app guide is read, or when the project has an app. */
+const SOFTN_TOOLS = new Set(['softn_docs', 'softn_components', 'softn_examples', 'softn_check', 'softn_inspect', 'softn_interact', 'softn_import']);
+
+/** Files that make an app: writing one reads the app guide. */
+const APP_FILE = /(^|\/)(manifest\.json|[^/]+\.(ui|logic))$/;
+
+const APP_GUIDE = `- A SoftN app is a folder whose manifest.json names a .ui page as "main" (with ui/*.ui pages and logic/*.logic or .py). A project can hold several, each in its own folder: to rebuild or learn from an existing app, read its files and write the new one in another folder. A .softn the user attaches is unpacked into its own folder (the original stays in uploads/, and softn_import unpacks any .softn in the project): when they ask for changes, edit that folder; when they ask to recreate, redo or base something on it, write a new app in a new folder and leave the original as it is. The SoftN reference is in your tools, so do not guess the language: softn_docs with no arguments gives the map, topic "guide" is the writing guide (read it before your first app), search finds how something is done across the guides, the components and the example apps; softn_components gives exact props and events; softn_examples has complete working apps to read or copy. Keep manifest.json true. After each step that changes an app, bot.computer checks it automatically (its files, then a real render) and adds the outcome to that step's result: when it reports errors, fix them before anything else. softn_check checks on demand; softn_inspect shows what the page displays; softn_interact uses the app like a person (click, fill, select, press keys) and reports errors the app raises, so test that the app works, not just that it renders. The user watches the app in a live preview as you build it, and can export any app folder as a .softn file.
+- The app is done when it renders without errors and softn_interact shows it working.
+`;
+
+const DOCUMENT_GUIDE = `- Long documents (scripts, stories, reports: anything longer than a few pages) are written in parts, never in one call. Write an outline first (the sections, and what happens or is said in each), then the document one section per append_file call, following the outline. When it is all written, read it back in full (paging with offset) and revise it with edit_file until it is complete: every section of the outline is there and fully written, nothing is summarized or skipped ("the scene continues…", "etc."), and names, facts and tone agree from start to end.
+`;
 
 export interface AgentOptions {
   vfs: Vfs;
@@ -216,6 +265,8 @@ export interface AgentOptions {
   softn?: SoftnHost;
   /** The share of the context window a prompt may fill before older turns are summarized (default 0.75). */
   compactAt?: () => number;
+  /** Guides already read (a sub-agent starts with its parent's). */
+  guides?: string[];
   /** A cap on the window this agent works in (a sub-agent gets a smaller one). */
   maxContext?: number;
   /** The server stated the window (in an overflow error): remember it for this provider and model. */
@@ -366,6 +417,25 @@ function withoutOldImages(turns: Turn[], keep = KEEP_IMAGE_TURNS): Turn[] {
   return out;
 }
 
+/** The guides there are for these tools. */
+function guideTopics(names: Set<string>): GuideTopic[] {
+  const topics: GuideTopic[] = [];
+  if (names.has('generate_video')) topics.push('video');
+  if (['generate_image', 'generate_video', 'generate_speech', 'generate_music', 'create_voice'].some((n) => names.has(n))) topics.push('media');
+  if ([...SOFTN_TOOLS].some((n) => names.has(n)) || names.has('guide')) topics.push('app');
+  topics.push('document');
+  return topics;
+}
+
+/** Where the request being worked on is: the user's latest own message that is not one sent while the agent worked (-1 when none). */
+function requestIndex(turns: Turn[]): number {
+  for (let i = turns.length - 1; i >= 0; i--) {
+    const t = turns[i];
+    if (t.role === 'user' && !t.automatic && !t.summary && !t.text.startsWith(DURING_PREFIX)) return i;
+  }
+  return -1;
+}
+
 /**
  * The last resort when a summary cannot make room (or is not enough): old
  * tool output shrinks, then everything but the recent turns; the
@@ -375,9 +445,12 @@ function trimmed(allTurns: Turn[], keepImages: number, maxChars: number): Turn[]
   const turns = withoutOldImages(allTurns, keepImages);
   if (estimateChars(turns) <= maxChars) return turns;
   const cutoff = turns.length - KEEP_RECENT_TURNS;
+  const request = requestIndex(turns);
   const shrink = (limit: number) =>
     turns.map((t, i): Turn => {
       if (i >= cutoff) return t;
+      // The request being worked on (and what the user said while it ran) is kept word for word: the work is checked against it.
+      if (t.role === 'user' && !t.automatic && i >= request) return t;
       if (t.role === 'tool') return { role: 'tool', results: t.results.map((r) => (r.content.length > limit ? { ...r, content: `${r.content.slice(0, limit)}\n[older output trimmed to save context]` } : r)) };
       if (t.role === 'user' && t.text.length > limit * 4 && !t.summary) return { ...t, text: `${t.text.slice(0, limit * 4)}\n[trimmed to save context]` };
       return t;
@@ -526,12 +599,78 @@ export class Agent {
     const provider = this.options.provider();
     // A small window holds the instructions and core tools with room to work, not the video editing ones too.
     const lean = !!provider && this.window(provider) < EDIT_TOOLS_WINDOW;
-    return [...(lean ? TOOLS.filter((t) => !EDIT_TOOLS.has(t.name)) : TOOLS), ...mediaTools(this.options.media?.(), readProjectVoices(this.options.vfs))];
+    const all = [...(lean ? TOOLS.filter((t) => !EDIT_TOOLS.has(t.name)) : TOOLS), ...mediaTools(this.options.media?.(), readProjectVoices(this.options.vfs))];
+    // The app tools only once there is an app to work on: otherwise they only distract.
+    const apps = this.loadedGuides().has('app') || findApps(this.options.vfs).length > 0;
+    const tools = apps ? all : all.filter((t) => !SOFTN_TOOLS.has(t.name));
+    const topics = guideTopics(new Set(all.map((t) => t.name)));
+    return [...tools, {
+      name: 'guide',
+      description: `Read the guide for a kind of work before you start it; it stays in your instructions from then on. The guides: ${topics.map((t) => `"${t}" for ${GUIDE_ABOUT[t]}`).join('; ')}.`,
+      parameters: { type: 'object', required: ['topic'], properties: { topic: { type: 'string', enum: topics } } },
+    }];
   }
 
-  /** How many image-bearing turns keep their images: none for a model that refused them. */
+  /** Guides read so far: the parent's, those read with a request, and those read since (their note in a result). */
+  private guideCache: { turns: Turn[]; length: number; loaded: Set<GuideTopic> } | null = null;
+  private loadedGuides(): Set<GuideTopic> {
+    const c = this.guideCache;
+    if (c && c.turns === this.turns && c.length === this.turns.length) return c.loaded;
+    const loaded = new Set<GuideTopic>((this.options.guides ?? []) as GuideTopic[]);
+    for (const t of this.turns) {
+      if (t.role === 'user') for (const g of t.guides ?? []) loaded.add(g as GuideTopic);
+      else if (t.role === 'tool') for (const r of t.results) for (const m of r.content.matchAll(GUIDE_MARK)) loaded.add(m[1] as GuideTopic);
+    }
+    this.guideCache = { turns: this.turns, length: this.turns.length, loaded };
+    return loaded;
+  }
+
+  /** A guide's text, for the tools there are (a small window gets the video guide in brief). */
+  private guideText(topic: GuideTopic, names: Set<string>): string {
+    const has = (name: string) => names.has(name);
+    const edit = has('media_compose') ? MEDIA_EDIT_GUIDE : '';
+    if (topic === 'app') return APP_GUIDE;
+    if (topic === 'document') return DOCUMENT_GUIDE;
+    if (topic === 'media') return MEDIA_MAKE_GUIDE + edit;
+    const script = has('media_compose') ? VIDEO_SCRIPT_GUIDE : VIDEO_SCRIPT_BRIEF;
+    return MEDIA_MAKE_GUIDE + script + (script === VIDEO_SCRIPT_GUIDE && this.canDelegate ? VIDEO_DELEGATE_GUIDE : '') + edit;
+  }
+
+  /** The guide tool: the guide joins the instructions (from the next step on). */
+  private readGuide(call: ToolCall): ToolResult {
+    const topic = call.input.topic as GuideTopic;
+    const topics = guideTopics(new Set(this.tools.map((t) => t.name)));
+    if (!topics.includes(topic)) return { id: call.id, name: call.name, content: `Error: no guide "${String(topic)}". The guides: ${topics.join(', ')}.`, isError: true };
+    if (this.loadedGuides().has(topic)) return { id: call.id, name: call.name, content: `The ${topic} guide is already in your instructions: follow it.`, isError: false };
+    return { id: call.id, name: call.name, content: `${guideLoaded(topic)}: follow it from now on.${topic === 'app' ? ' The app tools (softn_docs, softn_components, softn_examples, softn_check, softn_inspect, softn_interact, softn_import) are yours from now on too.' : ''}`, isError: false };
+  }
+
+  /**
+   * The first picture, clip or sound made without its guide read: not made
+   * yet, the guide is read (the right way to make it, for this video or
+   * picture), and the call is made again.
+   */
+  private guideFirst(call: ToolCall): string | null {
+    if (!MAKE_TOOLS.has(call.name) || !this.tools.some((t) => t.name === 'guide')) return null;
+    const loaded = this.loadedGuides();
+    if (loaded.has('video') || loaded.has('media')) return null;
+    const names = new Set(this.tools.map((t) => t.name));
+    const video = names.has('generate_video') && (call.name === 'generate_video' || GUIDE_WORDS[0][1].test(this.requestText()));
+    const topic: GuideTopic = video ? 'video' : 'media';
+    return `Not made yet. ${guideLoaded(topic)}: how ${video ? 'a video (its script, pictures, voices and clips) is' : 'pictures and sounds are'} made here. Follow it: ${video ? 'if the script it asks for is not written yet, write it first; then ' : ''}call ${call.name} again as the guide says.`;
+  }
+
+  /**
+   * How many image-bearing turns keep their images: none for a model that
+   * refused them. The oldest go in batches (between keep and twice keep stay),
+   * not one per new picture: a dropped image changes the prompt from its turn
+   * on, and the server can reuse only what is unchanged.
+   */
   private get keepImages(): number {
-    return this.imagesAccepted ? (this.options.keepImages ?? KEEP_IMAGE_TURNS) : 0;
+    if (!this.imagesAccepted) return 0;
+    const keep = this.options.keepImages ?? KEEP_IMAGE_TURNS;
+    const withImages = this.turns.filter(hasImages).length;
+    return withImages <= keep ? keep : keep + ((withImages - keep) % keep);
   }
 
   private get canPlan(): boolean {
@@ -544,12 +683,15 @@ export class Agent {
 
   private get systemPrompt(): string {
     const names = new Set(this.tools.map((t) => t.name));
-    const has = (name: string) => names.has(name);
-    const make = has('generate_image') || has('generate_video') || has('generate_speech') || has('generate_music');
-    // The whole scripted way to a story needs room (a small window drops the editing tools too).
-    const script = has('generate_video') ? (has('media_compose') ? VIDEO_SCRIPT_GUIDE : VIDEO_SCRIPT_BRIEF) : '';
-    const media = (make ? MEDIA_MAKE_GUIDE + script : '') + (has('media_compose') ? MEDIA_EDIT_GUIDE : '');
-    return `${basePrompt(media)}${this.canPlan ? PLAN_GUIDE : ''}${this.canDelegate ? DELEGATE_GUIDE : ''}${this.options.role ?? ''}`;
+    const topics = guideTopics(names);
+    const loaded = this.loadedGuides();
+    // The video guide holds the media one.
+    const read = (['document', 'app', 'media', 'video'] as GuideTopic[]).filter((t) => loaded.has(t) && topics.includes(t) && !(t === 'media' && loaded.has('video')));
+    const guides = read.map((t) => `\n\nThe ${t} guide:\n${this.guideText(t, names)}`).join('');
+    // A video follows the request: it stays in view, word for word, however long the work (as a reference, not a step to take).
+    const request = read.includes('video') && !this.options.role ? this.requestText() : '';
+    const asked = request ? `\n\nThe user's request being worked on, word for word, for reference (the script and everything made follow it; the guide's rules only fill in what it leaves open):\n"""\n${request.length > 4000 ? `${request.slice(0, 4000)} […]` : request}\n"""` : '';
+    return `${BASE_PROMPT}${this.canPlan ? PLAN_GUIDE : ''}${guides}${asked}${this.options.role ?? ''}`;
   }
 
   /** The prompt's fixed part: the system prompt and the tool definitions. */
@@ -581,6 +723,15 @@ export class Agent {
       return { id: call.id, name: call.name, content: `Error: ${(error as Error).message}`, isError: true };
     }
     this.tasksThisRun += tasks.length;
+    this.heard = [];
+    try {
+      return await this.delegateTasks(call, tasks, provider!, emit, signal);
+    } finally {
+      this.heard = null;
+    }
+  }
+
+  private async delegateTasks(call: ToolCall, tasks: ReturnType<typeof readTasks>, provider: ProviderConfig, emit: (e: AgentEvent) => void, signal?: AbortSignal): Promise<ToolResult> {
     const settings = () => this.options.subAgents?.() ?? { contextTokens: 32_000, parallel: provider.type === 'local' ? 1 : 3 };
     const queue = queueFor(`${provider.id}|${provider.modelId}`, () => settings().parallel);
     const setStep = (step: number | undefined, status: 'active' | 'done') => {
@@ -640,6 +791,7 @@ export class Agent {
       ...this.options,
       provider: () => provider,
       tools: this.tools.filter((t) => !MAIN_AGENT_ONLY.has(t.name)),
+      guides: [...this.loadedGuides()],
       role: `${SUB_AGENT_ROLE}\n\nYour task: ${task.title}`,
       maxSteps: SUB_AGENT_STEPS,
       maxContext: contextTokens,
@@ -650,7 +802,7 @@ export class Agent {
     let final = '';
     let failure = '';
     const goal = this.plan?.goal ? `\n\n(The main agent's goal, for context: ${this.plan.goal})` : '';
-    await child.run(`${task.instructions}${goal}`, (e) => {
+    await this.withHelper(child, HEARD_BY_TASK, () => child.run(`${task.instructions}${goal}`, (e) => {
       if (e.type === 'tool_call') {
         calls.set(e.call.id, e.call);
         const arg = ['path', 'command', 'pattern', 'app', 'url'].map((k) => e.call.input[k]).find((v) => typeof v === 'string') as string | undefined;
@@ -670,7 +822,7 @@ export class Agent {
       } else if (e.type === 'error') {
         failure = e.message;
       }
-    }, signal);
+    }, signal), this.heard ? [...this.heard] : null);
     // What the sub-agent learned about apps is now this agent's to act on.
     for (const app of child.checkedApps()) {
       this.checkedRoots.add(app.root);
@@ -878,7 +1030,7 @@ export class Agent {
     let failure = '';
     // What it did, for the report when it ends without a verdict.
     const trail: string[] = [];
-    await reviewer.run(brief, (e) => {
+    await this.withHelper(reviewer, HEARD_BY_REVIEWER, () => reviewer.run(brief, (e) => {
       if (e.type === 'tool_call') {
         const arg = ['path', 'pattern'].map((k) => e.call.input[k]).find((v) => typeof v === 'string') as string | undefined;
         activity(`${e.call.name}${arg ? ` ${arg.slice(0, 80)}` : ''}`);
@@ -888,7 +1040,7 @@ export class Agent {
       } else if (e.type === 'error') {
         failure = e.message;
       }
-    }, signal, attached);
+    }, signal, attached));
     if (reviewer.verdict) return reviewer.verdict;
     const reason = failure || 'the reviewer finished without a verdict';
     return { error: reason, trail: trail.slice(-10) };
@@ -1051,6 +1203,7 @@ export class Agent {
       try {
         const finish = this.options.finish;
         const tools = finish && this.finishing ? this.tools.filter((t) => t.name === finish.tool) : this.tools;
+        if (attempt === 0) emit({ type: 'prompt', system: this.systemPrompt, turns: sent, tools: tools.map((t) => t.name) });
         const reply = await sendTurn(provider, this.systemPrompt, sent, tools, {
           maxOutputTokens: b.reply,
           signal,
@@ -1201,18 +1354,112 @@ export class Agent {
     return true;
   }
 
-  /** Messages the user sent while a run was going, for the model's next step. */
-  private inbox: Array<{ text: string; images: ImagePart[]; attachments: Attachment[] }> = [];
+  /** Messages the user sent while a run was going, for the model's next step (`note`: how it reads, when not the usual way). */
+  private inbox: Array<{ text: string; images: ImagePart[]; attachments: Attachment[]; note?: string }> = [];
+  /** Sub-agents working for this one now (a delegated task, a picture's review), with how the user's messages read to each. */
+  private helpers = new Map<Agent, string>();
+  /** The user's messages during the delegate call running now, for its tasks that start after them. */
+  private heard: Array<{ text: string; images: ImagePart[]; attachments: Attachment[] }> | null = null;
 
   /**
    * A message from the user while the agent works: the model sees it at its
-   * next step (after the tool it is running). False when no run is going:
-   * send it as a new request instead.
+   * next step (after the tool it is running), and so does each sub-agent
+   * working for it then (and each delegated task that starts later in the
+   * same call). False when no run is going: send it as a new request instead.
    */
-  interject(text: string, images: ImagePart[] = [], attachments: Attachment[] = []): boolean {
+  interject(text: string, images: ImagePart[] = [], attachments: Attachment[] = [], note?: string): boolean {
     if (!this.running) return false;
-    this.inbox.push({ text, images, attachments });
+    let shared = false;
+    for (const [helper, how] of this.helpers) if (helper.interject(text, images, attachments, how)) shared = true;
+    this.heard?.push({ text, images, attachments });
+    this.inbox.push({ text, images, attachments, note: note ?? (shared || this.heard ? HEARD_BY_HELPERS : undefined) });
     return true;
+  }
+
+  /** Whether sub-agents are working for this agent now (a message goes to them too). */
+  helping(): boolean {
+    return [...this.helpers.keys()].some((a) => a.running);
+  }
+
+  /** Run a sub-agent that hears the user's messages while it works (`how`: how they read to it). */
+  private async withHelper(child: Agent, how: string, run: () => Promise<void>, missed: typeof this.heard = null): Promise<void> {
+    // What was said before it started: read at its first step.
+    for (const m of missed ?? []) child.inbox.push({ ...m, note: how });
+    const started = run();
+    this.helpers.set(child, how);
+    try {
+      await started;
+    } finally {
+      this.helpers.delete(child);
+    }
+  }
+
+  /** The guides a request plainly calls for, not read yet. */
+  private guidesFor(prompt: string): GuideTopic[] {
+    const names = new Set(this.tools.map((t) => t.name));
+    if (!names.has('guide')) return [];
+    const topics = guideTopics(names);
+    const loaded = this.loadedGuides();
+    const wanted = GUIDE_WORDS.filter(([t, words]) => topics.includes(t) && !loaded.has(t) && words.test(prompt)).map(([t]) => t);
+    // The video guide holds the media one.
+    return wanted.includes('video') ? wanted.filter((t) => t !== 'media') : wanted;
+  }
+
+  /**
+   * A write that would only repeat what the file already holds (the model
+   * going round in circles): not made, and the model told where it is.
+   */
+  private writtenAlready(call: ToolCall): string | null {
+    if (call.name !== 'append_file' && call.name !== 'write_file') return null;
+    const { path, content } = call.input;
+    if (typeof path !== 'string' || typeof content !== 'string') return null;
+    const file = `/${normalizePath(path)}`;
+    const vfs = this.options.vfs;
+    if (!vfs.exists(file)) return null;
+    let text: string;
+    try {
+      text = vfs.readText(file);
+    } catch {
+      return null;
+    }
+    const next = 'If it is complete, mark its plan step done with update_plan and go on to the next step; if something is still missing, read the file to see where it ends and add only what is missing (edit_file to change a part).';
+    if (call.name === 'write_file' && text === content) return `Not written: /${normalizePath(path)} already holds exactly this. ${next}`;
+    const part = content.trim();
+    if (call.name === 'append_file' && part.length >= 80 && text.includes(part.slice(0, 400))) return `Not added: this part is already in /${normalizePath(path)} (you wrote it before). ${next}`;
+    return null;
+  }
+
+  /** Scripts already checked against the request. */
+  private scriptsChecked = new Set<string>();
+
+  /**
+   * Before the first picture, clip or voice after a video's script was
+   * written (by this agent, this run): not made yet, but the script is first
+   * checked against the user's request, given word for word. A small model
+   * writing a long script to a long guide can drift from what was asked.
+   */
+  private scriptCheck(call: ToolCall, changed: Set<string>): string | null {
+    if (!MAKE_TOOLS.has(call.name) || this.options.role) return null;
+    const scripts = [...changed].map((p) => p.replace(/^\/+/, '')).filter((p) => /(^|\/)script\.md$/.test(p) && !this.scriptsChecked.has(p));
+    if (!scripts.length) return null;
+    for (const s of scripts) this.scriptsChecked.add(s);
+    const request = this.requestText();
+    if (!request) return null;
+    return [
+      `Not made yet. Before the first picture, clip or voice, check the script against what the user asked for.`,
+      `The user's request, word for word:\n"""\n${request}\n"""`,
+      `Read ${scripts.map((s) => `/${s}`).join(' and ')} and go through the request point by point: everything it asks for (the story and what happens, in its order; the characters, how they look and what they say; the places; how many scenes or shots, and how long; the style; anything it says to do or avoid) must be in the script as the user asked it, not changed, left out or swapped for something else. The rules for writing a script only fill in what the request leaves open. Fix the script with edit_file where it differs (say what you changed), then call ${call.name} again.`,
+    ].join('\n\n');
+  }
+
+  /** The request being worked on, as the user wrote it, with what they added while it ran. */
+  private requestText(): string {
+    const at = requestIndex(this.turns);
+    if (at < 0) return '';
+    const own = (t: Turn) => (t.role === 'user' ? t.text.replace(/^<project>[\s\S]*?<\/project>\n\n/, '') : '');
+    const later = this.turns.slice(at + 1).filter((t) => t.role === 'user' && !t.automatic && t.text.startsWith(DURING_PREFIX)).map((t) => own(t).replace(/^\[[^\]]*\]\n\n/, ''));
+    const text = [own(this.turns[at]), ...later.map((t) => `Then, while you worked: ${t}`)].join('\n\n').trim();
+    return text.length > 8000 ? `${text.slice(0, 8000)} […]` : text;
   }
 
   /** Messages a run ended before it could read: to send as the next request. */
@@ -1224,7 +1471,7 @@ export class Agent {
   private readInbox(emit: (e: AgentEvent) => void): boolean {
     if (!this.inbox.length) return false;
     for (const m of this.inbox.splice(0)) {
-      const text = `[The user sent this while you were working. Read it now and act on it as soon as you can: if it changes what you are doing, change course; if it asks a question, answer it and carry on.]\n\n${m.text}`;
+      const text = `${m.note ?? DURING_NOTE}\n\n${m.text}`;
       this.turns.push({ role: 'user', text, ...(m.images.length ? { images: m.images } : {}), ...(m.attachments.length ? { attachments: m.attachments } : {}) });
     }
     emit({ type: 'status', message: 'The agent has your message.' });
@@ -1242,7 +1489,8 @@ export class Agent {
     this.toolContext.progress = (message) => emit({ type: 'status', message });
     const first = this.turns.length === 0;
     const text = first ? `<project>\n${this.options.projectSummary()}\n</project>\n\n${prompt}` : prompt;
-    this.turns.push({ role: 'user', text, ...(images.length ? { images } : {}), ...(attachments.length ? { attachments } : {}) });
+    const guides = this.guidesFor(prompt);
+    this.turns.push({ role: 'user', text, ...(images.length ? { images } : {}), ...(attachments.length ? { attachments } : {}), ...(guides.length ? { guides } : {}) });
     let failures = 0;
     let lastFailure = '';
     // What each step changes, by the index of the call that changed it.
@@ -1260,6 +1508,8 @@ export class Agent {
     let planNoted = false;
     // Progress, for deciding whether asking to carry on is still worth it.
     const changedThisRun = new Set<string>();
+    // How many times each file was written in full, this run.
+    const rewrites = new Map<string, number>();
     let idleNudges = 0;
     let progressAtNudge = { done: -1, changed: -1 };
     this.checkedRoots.clear();
@@ -1285,7 +1535,7 @@ export class Agent {
         await this.fit(provider, emit, signal);
         const reply = await this.request(provider, emit, signal);
         emit({ type: 'usage', usage: reply.usage });
-        this.turns.push({ role: 'assistant', text: reply.text, calls: reply.calls, anthropicContent: provider.type === 'anthropic' ? reply.anthropicContent : undefined });
+        this.turns.push({ role: 'assistant', text: reply.text, calls: reply.calls, anthropicContent: provider.type === 'anthropic' ? reply.anthropicContent : undefined, ...(reply.thinking ? { thinking: reply.thinking.length > MAX_KEPT_THINKING ? `${reply.thinking.slice(0, MAX_KEPT_THINKING)} […]` : reply.thinking } : {}) });
         if (!reply.calls.length) {
           // A message came in while it answered: not done until it has read it.
           if (this.inbox.length) continue;
@@ -1355,15 +1605,30 @@ export class Agent {
           callIndex = index;
           emit({ type: 'tool_call', call });
           const allowed = this.tools.some((t) => t.name === call.name);
+          const scriptCheck = allowed ? this.guideFirst(call) ?? this.writtenAlready(call) ?? this.scriptCheck(call, changedThisRun) : null;
           const result = !allowed
             ? { id: call.id, name: call.name, content: `Error: ${call.name} is not one of your tools`, isError: true }
-            : call.name === 'delegate'
+            : scriptCheck
+              ? { id: call.id, name: call.name, content: scriptCheck, isError: false }
+              : call.name === 'delegate'
               ? await this.delegate(call, emit, signal)
               : call.name === 'review_frame'
                 ? await this.reviewFrame(call, emit, signal)
                 : call.name === 'give_verdict'
                   ? this.takeVerdict(call)
-                  : await runTool(call, this.toolContext);
+                  : call.name === 'guide'
+                    ? this.readGuide(call)
+                    : await runTool(call, this.toolContext);
+          if (call.name === 'write_file' && !result.isError && typeof call.input.path === 'string') {
+            const path = normalizePath(call.input.path);
+            const times = (rewrites.get(path) ?? 0) + 1;
+            rewrites.set(path, times);
+            if (times >= 3) result.content += `\n\n[bot.computer] This is the ${times}${times === 3 ? 'rd' : 'th'} time you wrote /${path} in full for this request. Do not write it again: if it is done, mark its plan step done with update_plan and go on to the next step; to change a part of it, use edit_file.`;
+          }
+          // Writing an app's files reads the app guide (and gives the app tools).
+          if (!result.isError && /^(write_file|append_file|edit_file)$/.test(call.name) && typeof call.input.path === 'string' && APP_FILE.test(call.input.path) && !this.loadedGuides().has('app') && this.tools.some((t) => t.name === 'guide')) {
+            result.content += `\n\n${guideLoaded('app')}: follow it from your next step. The app tools (softn_docs, softn_check, softn_interact, …) are yours now too.`;
+          }
           if (call.name === 'view_image' && !result.isError) this.noteLook(call.input);
           // A picture for a scripted video is reviewed before anything else is made.
           if (result.review?.length && !result.isError) result.content += await this.reviewPictures(call.id, result.review, emit, signal);

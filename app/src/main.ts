@@ -23,6 +23,7 @@ import { flagPicture } from './agent/review';
 import { FileTree } from './ui/tree';
 import { OpenProject, clearIncognito, createProject, deleteProject, listProjects, renameProject, type ProjectMeta } from './vfs/projects';
 import { addNrobOrigin, setIncognito } from './privacy';
+import { providerEndpoints, providerHeaders } from './agent/providers/providerConnection';
 import { canPickFolder, downloadZip, exportFolder, importFileList, importFolder, importZip, type Imported } from './vfs/transfer';
 import type { Vfs } from './vfs/vfs';
 
@@ -204,6 +205,18 @@ async function main(): Promise<void> {
     for (const meta of list) projectSelect.append(h('option', { value: meta.id, selected: meta.id === project?.meta.id }, meta.incognito ? `🕶 ${meta.name} (incognito)` : meta.name));
   };
 
+  /** Tell nrob an incognito session has ended: it wipes what it held of it (a model not running is not started for this). */
+  async function endIncognitoSession(id: string): Promise<void> {
+    const p = activeProvider();
+    if (p?.serverKind !== 'nrob') return;
+    await fetch(providerEndpoints(p).chat, {
+      method: 'POST',
+      headers: { ...providerHeaders(p, true), 'X-NROB-Incognito': '1' },
+      body: JSON.stringify({ nrob_forget_session: id }),
+      signal: AbortSignal.timeout(20_000),
+    }).catch(() => {});
+  }
+
   /** Where nrob answers, so an incognito project's requests to it say so (and only to it). */
   const registerNrob = () => {
     for (const p of providers) if (p.serverKind === 'nrob') addNrobOrigin(p.baseUrl);
@@ -299,7 +312,7 @@ async function main(): Promise<void> {
     if (isSoftnProject(project.vfs)) showPane('preview');
     chat.replay(agent.turns);
     registerNrob();
-    setIncognito(!!meta.incognito);
+    setIncognito(!!meta.incognito, meta.incognito ? meta.id : null);
     showIncognito(!!meta.incognito);
     // The last project reopens after a refresh or a restart, incognito included:
     // incognito stays on until it is turned off.
@@ -311,7 +324,11 @@ async function main(): Promise<void> {
       await saveLastKeptProject(meta.id);
     }
     reopening = false;
-    if (leaving) await deleteProject(leaving).catch(() => {});
+    if (leaving) {
+      await deleteProject(leaving).catch(() => {});
+      // nrob forgets what it held of the session (in memory only) now, not at its next request.
+      void endIncognitoSession(leaving);
+    }
     await renderProjects();
     document.title = `${meta.incognito ? '🕶 ' : ''}${meta.name} — bot.computer`;
   };
@@ -501,7 +518,7 @@ async function main(): Promise<void> {
       let run: Promise<void> | null = running;
       while (run) {
         if (agent.interject(prompt, images, attachments)) {
-          chat.user(text, attachments, true);
+          chat.user(text, attachments, true, agent.helping() ? 'sent while sub-agents work: the ones working now read it at their next step, and the agent after them' : undefined);
           return;
         }
         await Promise.race([run, new Promise((resolve) => setTimeout(resolve, 200))]);

@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { Agent, announcesWork, type AgentEvent } from '../../src/agent/agent';
+import { TOOLS } from '../../src/agent/tools';
 import { NetGate } from '../../src/gate/netgate';
 import { Vfs } from '../../src/vfs/vfs';
 import { OpenAIStream } from '../../src/agent/providers/stream';
@@ -101,6 +102,45 @@ describe('tool rules', () => {
     const large = fakeProvider('openai', [{ text: 'hi' }]);
     await setup({ ...LOCAL, contextTokens: 32_000 }).agent.run('hello', () => {});
     expect(names(large.bodies[0])).toEqual(expect.arrayContaining(['media_info', 'video_frames', 'video_split', 'media_compose']));
+  });
+
+  it('keeps the system prompt short: the guides and the app tools come when the work needs them', async () => {
+    const names = (body: Record<string, unknown>) => (body.tools as Array<{ function: { name: string } }>).map((t) => t.function.name);
+    const system = (body: Record<string, unknown>) => String((body.messages as Array<{ content: unknown }>)[0].content);
+    const media = { ...EMPTY_MEDIA, baseUrl: 'http://127.0.0.1:8080', imageModel: 'image', videoModel: 'video', speechModel: 'speech' };
+    const fake = fakeProvider('openai', [
+      { calls: [{ name: 'guide', input: { topic: 'app' } }] },
+      { text: 'ok' },
+    ]);
+    const agent = new Agent({ vfs: new Vfs(), gate: new NetGate(), provider: () => ({ ...LOCAL, contextTokens: 32_000 }), projectSummary: () => '', media: () => media });
+    await agent.run('hello', () => {});
+    // A request with no guide to it: a few lines, nothing about apps or videos, no app tools.
+    expect(system(fake.bodies[0]).length).toBeLessThan(1500);
+    expect(system(fake.bodies[0])).not.toMatch(/SoftN|softn_|script\.md/);
+    expect(names(fake.bodies[0])).not.toContain('softn_docs');
+    expect(names(fake.bodies[0])).toContain('guide');
+    // The app guide read: it and the app tools from the next step on.
+    expect(system(fake.bodies[1])).toContain('A SoftN app is a folder');
+    expect(names(fake.bodies[1])).toContain('softn_docs');
+  });
+
+  it('reads the guide a request plainly asks for, and a picture made without one waits for it', async () => {
+    const system = (body: Record<string, unknown>) => String((body.messages as Array<{ content: unknown }>)[0].content);
+    const media = { ...EMPTY_MEDIA, baseUrl: 'http://127.0.0.1:8080', imageModel: 'image', videoModel: 'video', speechModel: 'speech' };
+    const film = fakeProvider('openai', [{ text: 'ok' }]);
+    await new Agent({ vfs: new Vfs(), gate: new NetGate(), provider: () => ({ ...LOCAL, contextTokens: 32_000 }), projectSummary: () => '', media: () => media }).run('Make a sitcom like Seinfeld, about a minute long', () => {});
+    expect(system(film.bodies[0])).toContain('The video guide:');
+    expect(system(film.bodies[0])).not.toContain('SoftN');
+    const fake = fakeProvider('openai', [
+      { calls: [{ name: 'generate_image', input: { prompt: 'a cat', path: 'cat.png' } }] },
+      (body) => ({ text: JSON.stringify(body.messages).includes('Not made yet. [bot.computer] The media guide is now in your instructions') && system(body).includes('The media guide:') ? 'guided' : 'not guided' }),
+    ]);
+    const vfs = new Vfs();
+    const events: AgentEvent[] = [];
+    await new Agent({ vfs, gate: new NetGate(), provider: () => ({ ...LOCAL, contextTokens: 32_000 }), projectSummary: () => '', media: () => media }).run('hi, surprise me', (e) => events.push(e));
+    expect(vfs.exists('/cat.png')).toBe(false);
+    expect(fake.bodies).toHaveLength(2);
+    expect(events.at(-1)).toMatchObject({ type: 'done', text: 'guided' });
   });
 
   it('a small window with a video service gets the scripted way to a story in brief, and room to work', async () => {
@@ -304,6 +344,17 @@ describe('tool rules', () => {
     expect(agent.turns.filter((t) => t.role === 'tool' && t.results[0].images?.length)).toHaveLength(5);
   });
 
+  it('drops old pictures a few at a time, so the start of the prompt stays the same between steps', () => {
+    const { agent } = setup(OPENAI);
+    const pixel = { mediaType: 'image/png' as const, data: 'iVBORw0KGgo=' };
+    const dropped = (n: number) => {
+      agent.turns = Array.from({ length: n }, (_, i) => ({ role: 'tool' as const, results: [{ id: String(i), name: 'view_image', content: `look ${i}`, isError: false, images: [pixel] }] }));
+      return n - (agent as unknown as { keepImages: number }).keepImages;
+    };
+    // Three stay at least; the rest go three at a time, not one per new picture.
+    expect([1, 3, 4, 5, 6, 7, 8, 9, 10].map(dropped)).toEqual([-2, 0, 0, 0, 3, 3, 3, 6, 6]);
+  });
+
   it('fixes flagged pictures first, one at a time, then goes back to its work', async () => {
     const said = (body: Record<string, unknown>) => JSON.stringify(body.messages);
     // What each request lacked (a failed expect inside the fake would only show as a network error).
@@ -347,6 +398,57 @@ describe('tool rules', () => {
     expect(fake.bodies).toHaveLength(5);
     expect(events.at(-1)).toMatchObject({ type: 'done', text: 'Done.' });
     expect(events.filter((e) => e.type === 'status' && /Fixed the flagged/.test(e.message))).toHaveLength(2);
+  });
+
+  it("keeps the user's request in view for a video, does not write the same script twice, and checks it against the request before making anything", async () => {
+    const said = (body: Record<string, unknown>) => JSON.stringify(body.messages);
+    const system = (body: Record<string, unknown>) => String((body.messages as Array<{ content: unknown }>)[0].content);
+    const missing: string[] = [];
+    const want = (body: Record<string, unknown>, step: number, text: string, present = true, where = said) => {
+      if (where(body).includes(text) !== present) missing.push(`request ${step} ${present ? 'lacks' : 'has'}: ${text}`);
+    };
+    const request = 'A video of a red fox who finds a golden key, in two scenes, watercolour style.';
+    const plan = { goal: 'the fox video', items: [{ text: 'Write the script', status: 'active' }, { text: 'Make scene 1', status: 'pending' }] };
+    const script = { name: 'write_file', input: { path: 'video/fox/script.md', content: '## Premise\nA fox finds a golden key.' } };
+    const fake = fakeProvider('openai', [
+      { calls: [{ name: 'update_plan', input: plan }] },
+      (body) => {
+        // The request is in the instructions, for reference, not added to the conversation as a step.
+        want(body, 2, "The user's request being worked on, word for word, for reference", true, system);
+        want(body, 2, 'golden key, in two scenes, watercolour style', true, system);
+        return { calls: [script] };
+      },
+      // The same script again: not written, and told to move on.
+      { calls: [script] },
+      (body) => {
+        want(body, 4, 'Not written: /video/fox/script.md already holds exactly this. If it is complete, mark its plan step done with update_plan and go on to the next step');
+        return { calls: [{ name: 'update_plan', input: { ...plan, items: [{ text: 'Write the script', status: 'done' }, { text: 'Make scene 1', status: 'active' }] } }] };
+      },
+      { calls: [{ name: 'generate_image', input: { prompt: 'a fox', path: 'video/fox/fox.png' } }] },
+      (body) => {
+        want(body, 6, 'Not made yet. Before the first picture, clip or voice, check the script against what the user asked for.');
+        want(body, 6, '/video/fox/script.md');
+        return { text: 'Checked.' };
+      },
+    ]);
+    const vfs = new Vfs();
+    const media = ['generate_image', 'generate_video'].map((name) => ({ name, description: name, parameters: { type: 'object', properties: {} } }));
+    const agent = new Agent({ vfs, gate: new NetGate(), provider: () => OPENAI, projectSummary: () => 'Project: demo', tools: [...TOOLS, ...media], guides: ['video'] });
+    await agent.run(request, () => {});
+    expect(missing).toEqual([]);
+    // (then the plan's open step asks it to carry on)
+    expect(fake.bodies.length).toBeGreaterThanOrEqual(6);
+    // It was not made: the check came instead.
+    expect(vfs.exists('/video/fox/fox.png')).toBe(false);
+  });
+
+  it('tells the model it is going round in circles when it writes a file in full a third time', async () => {
+    const write = (n: number) => ({ calls: [{ name: 'write_file', input: { path: 'notes.md', content: `version ${n}` } }] });
+    const fake = fakeProvider('openai', [write(1), write(2), write(3), { text: 'ok' }]);
+    const { agent, emit } = setup(OPENAI);
+    await agent.run('write notes', emit);
+    expect(JSON.stringify(fake.bodies[2].messages)).not.toContain('time you wrote /notes.md in full');
+    expect(JSON.stringify(fake.bodies[3].messages)).toContain('This is the 3rd time you wrote /notes.md in full for this request. Do not write it again');
   });
 
   it('announces work only with a promise, not a question', () => {
