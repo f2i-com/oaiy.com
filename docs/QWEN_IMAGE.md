@@ -193,6 +193,28 @@ the worker allows a 1 GiB compiled-kernel cache. The initial run still compiles
 kernels and every worker invocation loads model weights. Use one batch for many
 images to amortize setup; warm per-image timing is not first-request latency.
 
+## LoRA adapters
+
+Besides the turbo adapter, a Qwen Image model takes any number of LoRAs, each
+with a strength, applied at run time beside every projection they adapt (the
+base weights, GGUF or safetensors, stay as they are). They stack with the turbo
+adapter, so a 6-step turbo image and a reference-image edit both use them.
+
+- Layouts: diffusers/PEFT (`transformer.{module}.lora_A.weight` / `lora_B`, optional
+  `.alpha`), ComfyUI (`diffusion_model.{module}.lora_A`/`lora_B` or
+  `lora_down`/`lora_up`) and kohya (`lora_unet_{module}`). The scale is
+  strength × alpha / rank, with alpha = rank when the file has none.
+- Comfy's fused `img_mlp.gate_up` LoRA is split between the gate and up
+  projections, as the fused base weight is.
+- Each factor pair is checked against its projection's shape. A LoRA that fits
+  none of the projections is refused (it is for another model, such as the
+  two-stream Qwen-Image or Qwen-Image-Edit); one that fits only in part says
+  what was left out (`lora_note` events).
+
+Studio: a model's `loras`, `[{"path": "E:/loras/style.safetensors", "strength": 0.8}]`
+(the image model's card has a list for them). Worker and standalone config: the
+same `loras` key. The manifest records the LoRAs each image was made with.
+
 ## Turbo and source references
 
 Viggle v0.2.1 rank-128/256 adapters are applied at runtime with alpha/rank = 1,

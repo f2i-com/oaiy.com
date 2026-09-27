@@ -166,6 +166,11 @@ pub fn arguments(llm: &Json, root: &Path, port: u16, key: &str, local_images: bo
         }
         if !str_or(m, "lora", "").trim().is_empty() {
             push("--lora", format!("{name}={}", path(m, "lora")));
+            // How strongly it applies: 1 (as trained) unless set.
+            let strength = m.get("lora_strength").and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok())));
+            if let Some(s) = strength.filter(|s| s.is_finite() && *s != 1.0) {
+                push("--lora-strength", format!("{name}={s}"));
+            }
         }
     }
     push("--host", "127.0.0.1".into());

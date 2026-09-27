@@ -113,6 +113,8 @@ pub struct Options {
     pub vision_projectors: std::collections::BTreeMap<String, PathBuf>,
     /// One PEFT adapter directory per Orca model alias.
     pub lora_adapters: std::collections::BTreeMap<String, PathBuf>,
+    /// How strongly each alias's adapter applies (1 = as trained).
+    pub lora_strengths: std::collections::BTreeMap<String, f32>,
     /// Which configured model to load at start, by name. `None` takes `name`.
     ///
     /// Only one model is resident, and loading one takes 10 s for GLM-5.3-Flash and
@@ -223,6 +225,7 @@ impl Default for Options {
             extra_models: Vec::new(),
             vision_projectors: std::collections::BTreeMap::new(),
             lora_adapters: std::collections::BTreeMap::new(),
+            lora_strengths: std::collections::BTreeMap::new(),
             start_model: None,
             tools_experts: None,
             ternary_experts: std::collections::BTreeMap::new(),

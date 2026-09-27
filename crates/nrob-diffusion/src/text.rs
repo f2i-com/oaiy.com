@@ -56,7 +56,7 @@ const LAYERS: usize = 36;
 /// Decoder layer `i` under `prefix`, read onto `device`.
 fn load_block(w: &mut Weights, prefix: &str, i: usize, device: &Device, dtype: DType) -> Result<Block> {
     let p = format!("{prefix}.layers.{i}");
-    let mut linear = |name: &str| w.linear(&format!("{p}.{name}"), device, dtype, &mut None);
+    let mut linear = |name: &str| w.linear(&format!("{p}.{name}"), device, dtype, &mut crate::lora::Loras::default());
     let (q, k, v, o) = (
         linear("self_attn.q_proj")?,
         linear("self_attn.k_proj")?,

@@ -118,6 +118,15 @@ pub(crate) struct Adapter {
     pub fingerprint: u64,
 }
 impl Adapter {
+    /// Scale its effect: 1 is as trained. The prompt cache keys on it too.
+    pub fn with_strength(mut self, strength: f32) -> Self {
+        if strength != 1.0 {
+            self.config.scale *= strength;
+            self.fingerprint = crate::disk::fnv(&strength.to_le_bytes(), self.fingerprint);
+        }
+        self
+    }
+
     pub fn open(path: &Path) -> Result<Self> {
         let config_path = path.join("adapter_config.json");
         let config_bytes = std::fs::read(&config_path)
@@ -400,6 +409,19 @@ mod tests {
         std::fs::write(dir.0.join("adapter_config.json"), CONFIG).unwrap();
         let error = Adapter::open(&dir.0).err().unwrap().to_string();
         assert!(error.contains(&dir.0.join("adapter_model.safetensors").display().to_string()));
+    }
+
+    #[test]
+    fn a_strength_scales_the_adapter_and_keys_the_prompt_cache() {
+        let dir = Temp::new();
+        fixture(&dir.0, false);
+        let plain = Adapter::open(&dir.0).unwrap();
+        let (scale, fingerprint) = (plain.config.scale, plain.fingerprint);
+        let same = Adapter::open(&dir.0).unwrap().with_strength(1.0);
+        assert_eq!((same.config.scale, same.fingerprint), (scale, fingerprint));
+        let half = Adapter::open(&dir.0).unwrap().with_strength(0.5);
+        assert_eq!(half.config.scale, scale * 0.5);
+        assert_ne!(half.fingerprint, fingerprint);
     }
 
     #[test]

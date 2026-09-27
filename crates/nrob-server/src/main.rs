@@ -69,6 +69,7 @@ const HELP: &str = "Observer: --observer-model FILE.gguf --observer-device auto|
   --prompt-cache-gb F  disk the prompt states may take (default 4)
   --cpu-threads N      CPU threads for experts that miss VRAM (default 24; 0 = off)
   --lora NAME=DIR             PEFT LoRA/rsLoRA adapter for an Orca model alias
+  --lora-strength NAME=X      how strongly that adapter applies (default 1 = as trained; -4..4)
   --vision-projector NAME=PATH  GGUF projector, or original Qwen vision directory for Orca
   --no-vision          skip the vision tower (images are refused)
   --local-images on|off  let requests name image files on this machine (paths,
@@ -146,6 +147,12 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Options, Stri
                 let value=val()?;
                 let (name,path)=value.split_once('=').filter(|(n,p)|!n.is_empty() && !p.is_empty()).ok_or("--lora wants NAME=DIR")?;
                 a.lora_adapters.insert(name.into(),path.into());
+            }
+            "--lora-strength" => {
+                let value=val()?;
+                let (name,strength)=value.split_once('=').filter(|(n,s)|!n.is_empty() && !s.is_empty()).ok_or("--lora-strength wants NAME=X")?;
+                let strength:f32=strength.parse().ok().filter(|s:&f32|s.is_finite() && (-4.0..=4.0).contains(s)).ok_or("--lora-strength wants a number between -4 and 4")?;
+                a.lora_strengths.insert(name.into(),strength);
             }
             "--vision-projector" => {
                 let value=val()?;

@@ -378,7 +378,7 @@ sections are:
 - `ui`: `host`, `port`, `open` (`app` | `browser` | `none`).
 - `gateway`: `host`, `port`, `api_key`, `public_url`, `cors_origins`, `routes`.
 - `privacy`: `incognito`.
-- `llm`: `server`, `server_webgpu`, `backend`, `webgpu_gb`, `models` (`[{name, path, vision_projector?, lora?, enabled}]`),
+- `llm`: `server`, `server_webgpu`, `backend`, `webgpu_gb`, `models` (`[{name, path, vision_projector?, lora?, lora_strength?, enabled}]`),
   `default_model`, `devices`, `ctx`, `ram_gb` (expert cache, 0 = 80% of free),
   `cpu_threads`, `vram_headroom_gb`, `thinking`, `max_tokens`, `temperature`,
   `top_p`, `prompt_cache`, `prompt_cache_gb`, `vision`, `autostart`,
@@ -387,7 +387,7 @@ sections are:
   `keep_jobs`, and:
   - `image`: `enabled`, `default_model`, `memory`, `ram_gb`, `vram_gb` (null =
     free VRAM), and `models`. Each model has `architecture` (`qwen-image`: `base`,
-    `transformer` or `safetensors_transformer`, `adapter`, `text_encoder`; `sdxl`:
+    `transformer` or `safetensors_transformer`, `adapter`, `loras` (`[{path, strength}]`), `text_encoder`; `sdxl`:
     `checkpoint`, `tokenizer`, `steps`, `cfg`, `negative_prompt`, `clip_skip`),
     optional `memory`/`ram_gb`/`vram_gb`, `width`, `height`, `enabled`.
   - `video`: the same residency keys, `ffmpeg`, `fps`, and `models`, each with

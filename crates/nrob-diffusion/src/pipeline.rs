@@ -17,6 +17,8 @@ pub struct Request {
     pub text_encoder: Option<PathBuf>,
     pub model: Option<String>,
     pub adapter: Option<PathBuf>,
+    /// More LoRA adapters, each with its strength, applied with the turbo one.
+    pub loras: Vec<(PathBuf, f64)>,
     pub output: PathBuf,
     pub prompts: Vec<String>,
     pub count: usize,
@@ -98,6 +100,7 @@ impl Request {
             text_encoder: match j.get("text_encoder") { None | Some(Json::Null) => None, _ => Some(string("text_encoder")?.into()) },
             model: j.get("model").and_then(Json::as_str).map(str::to_owned),
             adapter,
+            loras: parse_loras(j)?,
             output: string("output_dir")?.into(),
             prompts,
             count: number("n", 1)?,
@@ -169,9 +172,14 @@ impl Request {
         {
             return Err("seed range exceeds signed 64-bit range".into());
         }
+        for (path, strength) in &self.loras {
+            if !strength.is_finite() || !(-4. ..=4.).contains(strength) {
+                return Err(format!("LoRA strength must be between -4 and 4 ({})", path.display()));
+            }
+        }
         for path in [&self.base, &self.transformer]
             .into_iter()
-            .chain(self.adapter.iter()).chain(self.text_encoder.iter())
+            .chain(self.adapter.iter()).chain(self.text_encoder.iter()).chain(self.loras.iter().map(|(p, _)| p))
         {
             if !path.exists() {
                 return Err(format!("missing weights: {}", path.display()));
@@ -179,6 +187,30 @@ impl Request {
         }
         Ok(())
     }
+}
+
+/// `loras`: LoRA adapters as `[{"path": …, "strength": 0.8}]` (strength 1 when left out), or plain paths.
+fn parse_loras(j: &Json) -> std::result::Result<Vec<(PathBuf, f64)>, String> {
+    let Some(list) = j.get("loras") else { return Ok(Vec::new()) };
+    if matches!(list, Json::Null) {
+        return Ok(Vec::new());
+    }
+    list.as_array()
+        .ok_or("loras must be an array of {path, strength}")?
+        .iter()
+        .map(|l| {
+            let (path, strength) = match l {
+                Json::Str(_) => (l.as_str(), None),
+                _ => (l.get("path").and_then(Json::as_str), l.get("strength")),
+            };
+            let path = path.filter(|p| !p.trim().is_empty()).ok_or("each LoRA needs a path")?;
+            let strength = match strength {
+                None | Some(Json::Null) => 1.,
+                Some(v) => v.as_f64().ok_or("a LoRA's strength must be a number")?,
+            };
+            Ok((PathBuf::from(path), strength))
+        })
+        .collect()
 }
 
 /// Prompt encoding and diffusion are sequential to bound peak VRAM. All images
@@ -262,7 +294,7 @@ pub fn generate(r: &Request, mut event: impl FnMut(Json)) -> Result<Json> {
     let encoding_seconds = encoding_start.elapsed().as_secs_f64();
     event(Json::obj([("stage", Json::str("loading_transformer"))]));
     let load_start = Instant::now();
-    let mut model = Transformer::load(&r.transformer, r.adapter.as_deref(), &dev, dtype, &r.budget, |n| {
+    let mut model = Transformer::load(&r.transformer, r.adapter.as_deref(), &r.loras, &dev, dtype, &r.budget, |n| {
         event(Json::obj([
             ("stage", Json::str("loading_transformer")),
             ("block", Json::Int(n as i64)),
@@ -271,6 +303,9 @@ pub fn generate(r: &Request, mut event: impl FnMut(Json)) -> Result<Json> {
     })?;
     dev.synchronize()?;
     let transformer_load_seconds = load_start.elapsed().as_secs_f64();
+    for note in model.lora_notes() {
+        event(Json::obj([("stage", Json::str("lora_note")), ("note", Json::str(note))]));
+    }
     event(Json::obj([("stage", Json::str("loading_vae"))]));
     let load_start = Instant::now();
     let vae = Vae::load(&r.base, &dev, dtype)?;
@@ -372,6 +407,10 @@ pub fn generate(r: &Request, mut event: impl FnMut(Json)) -> Result<Json> {
                 r.adapter
                     .as_ref()
                     .map_or(Json::Null, |p| Json::str(p.to_string_lossy())),
+            ),
+            (
+                "loras",
+                Json::Arr(r.loras.iter().map(|(p, s)| Json::obj([("path", Json::str(p.to_string_lossy())), ("strength", Json::Num(*s))])).collect()),
             ),
         ]);
         writeln!(manifest, "{}", record.to_json())?;

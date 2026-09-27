@@ -114,7 +114,7 @@ impl Weights {
         name: &str,
         dev: &Device,
         dtype: DType,
-        lora: &mut Option<Weights>,
+        lora: &mut crate::lora::Loras,
     ) -> Result<Linear> {
         let key = format!("{name}.weight");
         let key = if matches!(self, Self::Gguf { .. }) { self.resolve(&key)? } else { key };
@@ -130,26 +130,22 @@ impl Weights {
         } else {
             None
         };
-        let adapter = if let Some(lora) = lora {
-            let mut adapter = None;
-            for prefix in [format!("transformer.{name}"), name.to_owned()] {
-                let key = format!("{prefix}.lora_A.weight");
-                if lora.has(&key) {
-                    let a = lora.tensor(&key, dev, dtype)?;
-                    let b = lora.tensor(&format!("{prefix}.lora_B.weight"), dev, dtype)?;
-                    // Viggle v0.2.1: alpha == rank, so runtime scale is exactly one.
-                    adapter = Some((a, b));
-                    break;
-                }
-            }
-            adapter
+        // Each adapter's factors, checked against the projection's shape [out, input].
+        let adapters = if lora.is_empty() {
+            Vec::new()
         } else {
-            None
+            let (out, input) = match &weight {
+                Weight::Dense(t) => t.dims2()?,
+                Weight::Quant(QMatMul::QTensor(q)) => q.shape().dims2()?,
+                Weight::Quant(QMatMul::Tensor(t) | QMatMul::TensorF16(t)) => t.dims2()?,
+                Weight::HostQuant { dims, .. } => (dims[0], dims[1]),
+            };
+            lora.factors(name, out, input, dev, dtype)?
         };
         Ok(Linear {
             weight,
             bias,
-            adapter,
+            adapters,
         })
     }
 }
@@ -172,7 +168,8 @@ fn tensor_bytes(t: &Tensor) -> u64 {
 pub struct Linear {
     weight: Weight,
     bias: Option<Tensor>,
-    adapter: Option<(Tensor, Tensor)>,
+    /// LoRA factors (down, up with its scale folded in), one pair per adapter.
+    adapters: Vec<(Tensor, Tensor)>,
 }
 impl Linear {
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
@@ -189,7 +186,7 @@ impl Linear {
                 candle_core::bail!("a RAM-resident weight was used without uploading it")
             }
         };
-        if let Some((a, b)) = &self.adapter {
+        for (a, b) in &self.adapters {
             y = (y + flat.matmul(&a.t()?)?.matmul(&b.t()?)?)?;
         }
         if let Some(b) = &self.bias {
@@ -215,7 +212,7 @@ impl Linear {
         };
         weight
             + self.bias.as_ref().map_or(0, tensor_bytes)
-            + self.adapter.as_ref().map_or(0, |(a, b)| tensor_bytes(a) + tensor_bytes(b))
+            + self.adapters.iter().map(|(a, b)| tensor_bytes(a) + tensor_bytes(b)).sum::<u64>()
     }
 
     /// The same projection on `dev`. Quantized GGUF weights move as their raw
@@ -243,11 +240,11 @@ impl Linear {
         Ok(Self {
             weight,
             bias: self.bias.as_ref().map(|b| b.to_device(dev)).transpose()?,
-            adapter: self
-                .adapter
-                .as_ref()
+            adapters: self
+                .adapters
+                .iter()
                 .map(|(a, b)| Ok::<_, candle_core::Error>((a.to_device(dev)?, b.to_device(dev)?)))
-                .transpose()?,
+                .collect::<Result<_>>()?,
         })
     }
 }

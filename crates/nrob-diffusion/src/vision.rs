@@ -41,8 +41,8 @@ impl Merger {
     fn load(w: &mut Weights, p: &str, post: bool, d: &Device, ty: DType) -> Result<Self> {
         Ok(Self {
             norm: Norm::load(w, &format!("{p}.norm"), d, ty)?,
-            fc1: w.linear(&format!("{p}.linear_fc1"), d, ty, &mut None)?,
-            fc2: w.linear(&format!("{p}.linear_fc2"), d, ty, &mut None)?,
+            fc1: w.linear(&format!("{p}.linear_fc1"), d, ty, &mut crate::lora::Loras::default())?,
+            fc2: w.linear(&format!("{p}.linear_fc2"), d, ty, &mut crate::lora::Loras::default())?,
             post,
         })
     }
@@ -87,10 +87,10 @@ impl VisionEncoder {
             blocks.push(Block {
                 norm1: Norm::load(&mut w, &format!("{p}.norm1"), d, ty)?,
                 norm2: Norm::load(&mut w, &format!("{p}.norm2"), d, ty)?,
-                qkv: w.linear(&format!("{p}.attn.qkv"), d, ty, &mut None)?,
-                proj: w.linear(&format!("{p}.attn.proj"), d, ty, &mut None)?,
-                fc1: w.linear(&format!("{p}.mlp.linear_fc1"), d, ty, &mut None)?,
-                fc2: w.linear(&format!("{p}.mlp.linear_fc2"), d, ty, &mut None)?,
+                qkv: w.linear(&format!("{p}.attn.qkv"), d, ty, &mut crate::lora::Loras::default())?,
+                proj: w.linear(&format!("{p}.attn.proj"), d, ty, &mut crate::lora::Loras::default())?,
+                fc1: w.linear(&format!("{p}.mlp.linear_fc1"), d, ty, &mut crate::lora::Loras::default())?,
+                fc2: w.linear(&format!("{p}.mlp.linear_fc2"), d, ty, &mut crate::lora::Loras::default())?,
             });
         }
         let merger = Merger::load(&mut w, &format!("{p}.merger"), false, d, ty)?;

@@ -405,6 +405,22 @@ pub fn image_request(cfg: &Json, root: &Path, output_root: &Path, body: &Json, a
             f.push(("cfg".into(), Json::Num(cfg_scale)));
         }
         f.push(("adapter".into(), adapter.map_or(Json::Null, Json::str)));
+        // More LoRAs, each with its strength, applied with the turbo adapter (or without it).
+        if let Some(list) = model.get("loras").and_then(Json::as_array).filter(|l| !l.is_empty()) {
+            let mut loras = Vec::new();
+            for l in list {
+                let (path, strength) = match l {
+                    Json::Str(p) => (Some(p.as_str()), None),
+                    _ => (l.get("path").and_then(Json::as_str), l.get("strength")),
+                };
+                let Some(path) = path.map(str::trim).filter(|p| !p.is_empty()) else { continue };
+                let strength = strength.and_then(Json::as_f64).unwrap_or(1.);
+                loras.push(Json::obj([("path", Json::str(config::resolve(root, path).to_string_lossy())), ("strength", Json::Num(strength))]));
+            }
+            if !loras.is_empty() {
+                f.push(("loras".into(), Json::Arr(loras)));
+            }
+        }
         if let Some(te) = path_field(root, model, "text_encoder") {
             f.push(("text_encoder".into(), Json::str(te)));
         }

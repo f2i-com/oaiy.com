@@ -67,6 +67,7 @@ pub(crate) fn read_directory(root: &Path) -> Result<Config, String> {
         transformer: PathBuf::new(),
         safetensors_transformer: None,
         adapter: None,
+        loras: Vec::new(),
         video_config: None,
         default_weights: "gguf".into(),
         image_model: None,
@@ -141,6 +142,7 @@ pub(crate) fn image(c: &Config, selected: Option<&str>) -> Result<Config, String
             snapshot.safetensors_transformer = Some(checkpoint);
             snapshot.default_weights = "safetensors".into();
             snapshot.adapter = None;
+            snapshot.loras = Vec::new();
             snapshot.text_encoder = None;
             return Ok(snapshot);
         }
@@ -152,6 +154,7 @@ pub(crate) fn image(c: &Config, selected: Option<&str>) -> Result<Config, String
     snapshot.transformer = optional_path(root, &j, "transformer")?.unwrap_or_default();
     snapshot.safetensors_transformer = optional_path(root, &j, "safetensors_transformer")?;
     snapshot.adapter = optional_path(root, &j, "adapter")?;
+    snapshot.loras = crate::images::loras(Some(root), &j)?;
     snapshot.default_weights = match j.get("default_weights") {
         None => "gguf",
         Some(v) => v.as_str().ok_or("default_weights must be a string")?,

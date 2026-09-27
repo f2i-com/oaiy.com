@@ -3,11 +3,12 @@
 use crate::residency::{Budget, Resident, Tiered};
 use crate::text::Conditioning;
 use crate::{
+    lora::Loras,
     math::*,
     weights::{bytes_of, Linear, Weights},
 };
 use candle_core::{DType, Device, Result, Tensor};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub struct Prefix {
     kv: Vec<(Tensor, Tensor)>,
@@ -51,7 +52,7 @@ impl Resident for Block {
 /// Transformer block `i`, read from the published weights onto `device`.
 fn load_block(
     w: &mut Weights,
-    lora: &mut Option<Weights>,
+    lora: &mut Loras,
     i: usize,
     device: &Device,
     dtype: DType,
@@ -96,7 +97,9 @@ pub struct Transformer {
     blocks: Tiered<Block>,
     /// Kept for blocks that are re-read on every pass.
     weights: Weights,
-    lora: Option<Weights>,
+    lora: Loras,
+    /// Adapters that fit only in part: what was left out.
+    lora_notes: Vec<String>,
     device: Device,
     dtype: DType,
 }
@@ -234,24 +237,22 @@ impl Transformer {
             + 1.)?;
         self.out.forward(&layer_norm(&x)?.broadcast_mul(&scale)?)
     }
+    /// `adapter` is the turbo adapter (strength 1); `loras` are more adapters,
+    /// each with its strength, applied with it.
     pub fn load(
         path: &Path,
         adapter: Option<&Path>,
+        loras: &[(PathBuf, f64)],
         device: &Device,
         dtype: DType,
         budget: &Budget,
         progress: impl FnMut(usize),
     ) -> Result<Self> {
         let mut w = Weights::open(path)?;
-        let mut lora = adapter.map(Weights::open).transpose()?;
-        if let Some(l) = &lora {
-            if !l.has("transformer.transformer_blocks.0.attn.to_q.lora_A.weight")
-                && !l.has("transformer_blocks.0.attn.to_q.lora_A.weight")
-            {
-                candle_core::bail!(
-                    "not a supported Viggle runtime LoRA (expected diffusers lora_A/lora_B keys)"
-                );
-            }
+        let list: Vec<(PathBuf, f64)> = adapter.map(|a| (a.to_owned(), 1.)).into_iter().chain(loras.iter().cloned()).collect();
+        let mut lora = Loras::open(&list)?;
+        if adapter.is_some() && !lora.first_adapts("transformer_blocks.0.attn.to_q") {
+            candle_core::bail!("not a supported turbo adapter (expected LoRA factors for transformer_blocks.0.attn.to_q)");
         }
         let mut linear = |name: &str| w.linear(name, device, dtype, &mut lora);
         let img = linear("img_in")?;
@@ -275,6 +276,8 @@ impl Transformer {
             |i| load_block(&mut w, &mut lora, i, device, dtype),
             progress,
         )?;
+        // Every block has been read once: an adapter that fit nothing is for another model.
+        let lora_notes = lora.check()?;
         Ok(Self {
             img,
             text1,
@@ -288,6 +291,7 @@ impl Transformer {
             blocks,
             weights: w,
             lora,
+            lora_notes,
             device: device.clone(),
             dtype,
         })
@@ -296,6 +300,11 @@ impl Transformer {
     /// Where the blocks live and how much was streamed, for the job result.
     pub fn residency(&self) -> nrob::json::Json {
         self.blocks.report()
+    }
+
+    /// LoRA adapters that fit only in part, and what of them was left out.
+    pub fn lora_notes(&self) -> &[String] {
+        &self.lora_notes
     }
 
     pub fn forward(

@@ -238,6 +238,11 @@ impl Models {
                 return Err(Error::Arg(format!("expert source {name} must name a configured DeepSeek model")));
             }
         }
+        for name in opts.lora_strengths.keys() {
+            if !opts.lora_adapters.contains_key(name) {
+                return Err(Error::Arg(format!("LoRA strength for {name}, which has no LoRA")));
+            }
+        }
         for name in opts.lora_adapters.keys() {
             if !specs.iter().any(|s| &s.name==name && s.kind==Kind::OrcaSaq) {
                 return Err(Error::Arg(format!("LoRA {name} must name a configured OrcaSAQ model")));
@@ -579,9 +584,10 @@ impl Models {
     fn load_orcasaq(&self, spec: &Spec) -> Result<Live> {
         let o=&self.opts;
         self.say(format!("loading {}: native EXL3 mixed precision",spec.name));
-        let adapter=o.lora_adapters.get(&spec.name).map(|path|crate::lora::Adapter::open(path)).transpose()?;
+        let strength=o.lora_strengths.get(&spec.name).copied().unwrap_or(1.0);
+        let adapter=o.lora_adapters.get(&spec.name).map(|path|crate::lora::Adapter::open(path).map(|a|a.with_strength(strength))).transpose()?;
         let model=if let Some(adapter)=&adapter {crate::orcasaq::load_with_adapter(&spec.path,&o.devices,Some(adapter))?} else {crate::orcasaq::load(&spec.path,&o.devices)?};
-        if let Some(adapter)=&adapter {self.say(format!("OrcaSAQ: loaded LoRA for {} text projections",adapter.len()));}
+        if let Some(adapter)=&adapter {self.say(format!("OrcaSAQ: loaded LoRA for {} text projections (strength {strength})",adapter.len()));}
         let tok=Arc::new(model.tokenizer().clone());
         let max_seq=self.context(model.config().context_length);
         let mut cfg=self.base_cfg(spec,max_seq);

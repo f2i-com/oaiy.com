@@ -186,7 +186,8 @@ Use an adapter trained for `Qwen/Qwen3.8-27B`, containing
 `adapter_config.json` and `adapter_model.safetensors`. Nrob reads those files
 directly; the packed 3.21-bpw base weights remain unchanged. Adapter matrices
 are held in FP32 on the text GPU. Dropout is disabled for inference, and scaling
-uses `alpha/r` for LoRA or `alpha/sqrt(r)` for rsLoRA.
+uses `alpha/r` for LoRA or `alpha/sqrt(r)` for rsLoRA, times an optional
+strength (`--lora-strength NAME=X`, default 1; Studio: the model's `lora_strength`).
 
 In the selected project's `.coder-cli/config.toml`:
 

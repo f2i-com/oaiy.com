@@ -27,6 +27,8 @@ pub struct Config {
     pub transformer: PathBuf,
     pub safetensors_transformer: Option<PathBuf>,
     pub adapter: Option<PathBuf>,
+    /// More Qwen Image LoRA adapters, each with its strength, applied with the turbo one.
+    pub loras: Vec<(PathBuf, f64)>,
     pub output_root: PathBuf,
     pub controller_name: String,
     pub controller_path: PathBuf,
@@ -34,6 +36,39 @@ pub struct Config {
     pub image_device: usize,
     pub video_config: Option<PathBuf>,
 }
+/// A model's `loras`: `[{"path": …, "strength": 0.8}]` (strength 1 when left out) or plain paths,
+/// relative ones resolved against `root` when there is one.
+pub(crate) fn loras(root: Option<&Path>, j: &Json) -> Result<Vec<(PathBuf, f64)>, String> {
+    let Some(list) = j.get("loras") else { return Ok(Vec::new()) };
+    if matches!(list, Json::Null) {
+        return Ok(Vec::new());
+    }
+    list.as_array()
+        .ok_or("loras must be an array of {path, strength}")?
+        .iter()
+        .map(|l| {
+            let (path, strength) = match l {
+                Json::Str(p) => (Some(p.as_str()), None),
+                _ => (l.get("path").and_then(Json::as_str), l.get("strength")),
+            };
+            let path = path.filter(|p| !p.trim().is_empty()).ok_or("each LoRA needs a path")?;
+            let strength = match strength {
+                None | Some(Json::Null) => 1.,
+                Some(v) => v.as_f64().filter(|s| s.is_finite() && (-4. ..=4.).contains(s)).ok_or("a LoRA's strength must be a number between -4 and 4")?,
+            };
+            let path = PathBuf::from(path);
+            let path = match root {
+                Some(r) if path.is_relative() => r.join(path),
+                _ => path,
+            };
+            if !path.is_file() {
+                return Err(format!("LoRA not found: {}", path.display()));
+            }
+            Ok((path, strength))
+        })
+        .collect()
+}
+
 impl Config {
     pub fn read(path: &Path) -> Result<Self, String> {
         if path.is_dir() { return crate::media_catalog::read_directory(path); }
@@ -68,6 +103,7 @@ impl Config {
                     .ok_or("safetensors_transformer must be a nonempty path")?.into()),
             },
             adapter: j.get("adapter").and_then(Json::as_str).map(PathBuf::from),
+            loras: loras(None, &j)?,
             output_root: s("output_root")?.into(),
             controller_name: s("controller_name")?,
             controller_path: s("controller_path")?.into(),
@@ -81,6 +117,7 @@ impl Config {
         for p in [&c.worker, &c.base, &c.transformer, &c.controller_path]
             .into_iter()
             .chain(c.adapter.iter())
+            .chain(c.loras.iter().map(|(p, _)| p))
             .chain(c.safetensors_transformer.iter())
             .chain(c.video_config.iter())
         {
@@ -797,6 +834,9 @@ fn prepare(c: &Config, body: &Json) -> Result<Json, String> {
         ("reference_size".into(), Json::Int(reference_size)),
     ];
     if let Some(p) = &c.text_encoder { fields.push(("text_encoder".into(), Json::str(p.to_string_lossy()))); }
+    if !c.loras.is_empty() {
+        fields.push(("loras".into(), Json::Arr(c.loras.iter().map(|(p, s)| Json::obj([("path", Json::str(p.to_string_lossy())), ("strength", Json::Num(*s))])).collect())));
+    }
     fields.extend(image_memory(c, body)?);
     if let Some(name) = &c.image_model { fields.push(("model".into(), Json::str(name))); }
     if let Some(p) = prompt {
@@ -1062,6 +1102,7 @@ mod tests {
             transformer: "model.gguf".into(),
             safetensors_transformer: None,
             adapter: Some("turbo.safetensors".into()),
+            loras: Vec::new(),
             output_root: std::env::temp_dir()
                 .join(format!("nrob-image-test-{}", std::process::id())),
             controller_name: "controller".into(),
