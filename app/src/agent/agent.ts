@@ -19,7 +19,7 @@ import type { MediaSettings } from './media';
 import { queueFor } from './queue';
 import type { ToolSpec } from './protocol';
 import { appLabel, findApps, resolveApp } from '../softn/softn';
-import type { ImagePart } from './images';
+import { imageMimeFor, viewImage, type ImagePart } from './images';
 
 export type AgentEvent =
   | { type: 'text'; delta: string }
@@ -66,8 +66,12 @@ You are a sub-agent: the main agent gave you one task, below. Do that task and n
 
 /** What a reviewer may use: it looks and reads, and changes nothing. */
 const REVIEW_TOOLS = new Set(['list_files', 'read_file', 'file_info', 'search_file', 'grep', 'glob', 'view_image', 'media_info']);
-/** A reviewer's step limit: enough to look at everything it needs, several times. */
-const REVIEW_STEPS = 24;
+/** A reviewer's step limit: a good once-over, a closer look where something is unclear, and a verdict. */
+const REVIEW_STEPS = 8;
+/** The side of the picture a reviewer sees first, and of any look it takes: small enough for the model to take in quickly. */
+const REVIEW_VIEW_SIZE = 640;
+/** The side of each reference image shown with it. */
+const REVIEW_REFERENCE_SIZE = 384;
 /** The pictures a reviewer keeps in view at once: the picture, its references and the frames before it. */
 const REVIEW_KEEP_IMAGES = 8;
 const VERDICT_TOOL: ToolSpec = {
@@ -105,7 +109,7 @@ const VERDICT_TOOL: ToolSpec = {
 const REVIEWER_ROLE = `
 
 You are a reviewer: the main agent made a picture for a scripted video and goes on only once you have judged it. You look and read; you do not make or change anything. Your job is to find what is wrong before a viewer does, so look for mistakes, not for reasons to pass: image models often give a person an extra arm, hand or leg, merge two people, blend faces, change clothes, or put things where they cannot be, and a picture can look right at a glance and still have them.
-How to look: view the whole picture (grid: true shows coordinates), then zoom into each person in turn (view_image with x, y, width and height) and count their heads, arms, hands and legs one by one, following every limb to where it joins the body; zoom into faces and hands. View each reference image it was made from and compare it with the person or prop in the picture. Look at the scene's background, the frames made before it, and the script (read_file) as you need. Only your last ${REVIEW_KEEP_IMAGES} pictures stay in view: look at the picture again after looking at many others.
+How to look: the picture and its reference images are attached to your task, small, for a quick once-over. Go over the picture person by person: count their heads, arms, hands and legs one by one, following every limb to where it joins the body, and compare each person and prop with their reference. Where something is unclear (a hand, a crowded part, a face), zoom in with view_image's x, y, width and height; look at the script (read_file), the scene's background or earlier frames only when you need them. Be quick: judge from what you see, in few steps.
 Be strict about what a viewer would notice: a wrong count of limbs, fingers or faces; a character who does not match their reference (face, hair, build, clothes); a missing or extra person or prop; something duplicated, merged, floating or the wrong size; the wrong place or light; a pose or expression that does not fit the moment or the story; more than the speaker in view in a shot with dialogue; an end frame that is not its start frame moved on; stray text. Let small things pass (a fold of cloth, a detail far in the background). When in doubt about a body or a face, send it back. Then call give_verdict once, and reply with one line.`;
 const KEEP_RECENT_TURNS = 8;
 /** Characters per token until the provider's own counts say otherwise. */
@@ -205,6 +209,8 @@ export interface AgentOptions {
   media?: () => MediaSettings | null;
   /** Image-bearing turns that keep their images (default KEEP_IMAGE_TURNS); a reviewer comparing pictures keeps more. */
   keepImages?: number;
+  /** The largest side view_image shows this agent (default: the tool's own). */
+  viewSize?: number;
 }
 
 function turnChars(t: Turn, charsPerToken = DEFAULT_CHARS_PER_TOKEN): number {
@@ -386,7 +392,7 @@ export class Agent {
 
   constructor(private readonly options: AgentOptions) {
     // Writes made through this agent's tools are its changes; another agent's (or the person's) are not.
-    this.toolContext = { vfs: trackedVfs(options.vfs, (path) => this.onWrite?.(path)), gate: options.gate, reads: new Map(), shell: { cwd: '/', env: {} }, softn: options.softn, media: options.media, spoken: new Map() };
+    this.toolContext = { vfs: trackedVfs(options.vfs, (path) => this.onWrite?.(path)), gate: options.gate, reads: new Map(), shell: { cwd: '/', env: {} }, softn: options.softn, media: options.media, spoken: new Map(), viewSize: options.viewSize };
   }
 
   reset(): void {
@@ -682,10 +688,8 @@ export class Agent {
       const r = this.reviewing;
       if (r) {
         const unseen = r.references.filter((ref) => !r.seen.has(ref));
-        const wanted = Math.max(1, people.length);
         const missing = [
           !r.whole ? `view the whole picture (/${r.path})` : '',
-          r.zooms < wanted ? `zoom into the picture ${wanted === 1 ? 'once' : `once per person (${wanted})`} with view_image's x, y, width and height, and count again (${r.zooms} so far)` : '',
           unseen.length ? `view its reference image${unseen.length === 1 ? '' : 's'} ${unseen.map((u) => `/${u}`).join(', ')} and compare` : '',
         ].filter(Boolean);
         if (missing.length) return error(`before passing it, ${missing.join('; ')}`);
@@ -786,19 +790,37 @@ export class Agent {
       role: REVIEWER_ROLE,
       maxSteps: REVIEW_STEPS,
       keepImages: REVIEW_KEEP_IMAGES,
+      viewSize: REVIEW_VIEW_SIZE,
       maxContext: settings.contextTokens,
       subAgents: undefined,
     });
     reviewer.reviewing = { path: picture.path, references: picture.references, whole: false, zooms: 0, seen: new Set(), flagged: !!picture.flagged };
+    // The picture and its references come with the task, small: a once-over in one request.
+    const attached: ImagePart[] = [];
+    const shown: string[] = [];
+    for (const [i, path] of [picture.path, ...picture.references.slice(0, 3)].entries()) {
+      const mime = imageMimeFor(path);
+      if (!mime || !vfs.exists(`/${path}`)) continue;
+      try {
+        const view = await viewImage(vfs.readBytes(`/${path}`), mime, { maxSize: i === 0 ? REVIEW_VIEW_SIZE : REVIEW_REFERENCE_SIZE, label: path });
+        attached.push(view.image);
+        shown.push(i === 0 ? `${attached.length}. the picture, /${path}` : `${attached.length}. reference /${path}`);
+        if (i === 0) reviewer.reviewing.whole = true;
+        reviewer.reviewing.seen.add(path);
+      } catch {
+        /* it can look with view_image */
+      }
+    }
+    const brief = shown.length ? `${task}\n\nAttached, in order:\n${shown.join('\n')}` : task;
     let failure = '';
-    await reviewer.run(task, (e) => {
+    await reviewer.run(brief, (e) => {
       if (e.type === 'tool_call') {
         const arg = ['path', 'pattern'].map((k) => e.call.input[k]).find((v) => typeof v === 'string') as string | undefined;
         activity(`${e.call.name}${arg ? ` ${arg.slice(0, 80)}` : ''}`);
       } else if (e.type === 'error') {
         failure = e.message;
       }
-    }, signal);
+    }, signal, attached);
     if (reviewer.verdict) return reviewer.verdict;
     return { error: failure || 'the reviewer finished without a verdict' };
   }

@@ -99,6 +99,8 @@ export interface ToolContext {
   signal?: AbortSignal;
   /** False when the model has refused images: view_image then says so instead of sending one. */
   images?: boolean;
+  /** The largest side view_image shows (a reviewer's quick looks are smaller, so they are quicker for the model). */
+  viewSize?: number;
   /** The image and video service, when one is set up: generate_image and generate_video. */
   media?: () => MediaSettings | null;
   /** A line for the chat's status while a long tool works ("making the video: 40%"). */
@@ -995,7 +997,7 @@ async function execute(call: ToolCall, ctx: ToolContext, out: ToolOut): Promise<
         y: num('y'),
         width: num('width'),
         height: num('height'),
-        maxSize: num('max_size'),
+        maxSize: Math.min(num('max_size') ?? ctx.viewSize ?? DEFAULT_VIEW_SIZE, ctx.viewSize ?? MAX_VIEW_SIZE),
         grid: input.grid === true,
         label: key,
       });

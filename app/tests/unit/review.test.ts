@@ -136,27 +136,16 @@ describe('a picture made for a scripted video', () => {
         expect(lastToolText(body)).toContain('was sent back by its review (Gary has a third arm');
         return { calls: [{ name: 'generate_image', input: { ...frame, prompt: 'Gary tastes, two arms' } }] };
       },
-      // The remake's review is told what the last try was sent back for; a pass without looking closely is refused.
+      // The remake's review is told what the last try was sent back for, and gets the picture and its references
+      // with its task, small, for a once-over; counting three arms and still passing is refused.
       (body) => {
-        expect(JSON.stringify(body.messages)).toContain('The try before this one was sent back for: Gary has a third arm');
-        return { calls: [{ name: 'give_verdict', input: { verdict: 'pass', people: [{ who: 'Gary', heads: 1, arms: 2, hands: 2, legs: 2, matches: 'yes' }], out_of_place: 'nothing', notes: 'Looks right.' } }] };
+        const messages = body.messages as Array<{ role: string; content: unknown }>;
+        expect(JSON.stringify(messages)).toContain('The try before this one was sent back for: Gary has a third arm');
+        expect(JSON.stringify(messages)).toContain('Attached, in order:\\n1. the picture, /video/film/shot1-start.png\\n2. reference /video/film/scene1-background.png\\n3. reference /video/film/gary.png');
+        const task = messages.find((m) => m.role === 'user' && Array.isArray(m.content)) as { content: Array<{ type: string }> };
+        expect(task.content.filter((c) => c.type === 'image_url')).toHaveLength(3);
+        return { calls: [{ name: 'give_verdict', input: { verdict: 'pass', people: [{ who: 'Gary', heads: 1, arms: 3, hands: 2, legs: 2, matches: 'yes' }], out_of_place: 'nothing', notes: 'Fine.' } }] };
       },
-      (body) => {
-        const refused = lastToolText(body);
-        expect(refused).toContain('before passing it, view the whole picture (/video/film/shot1-start.png)');
-        expect(refused).toContain('zoom into the picture once');
-        expect(refused).toContain('view its reference images /video/film/scene1-background.png, /video/film/gary.png');
-        return {
-          calls: [
-            { name: 'view_image', input: { path: frame.path, grid: true } },
-            { name: 'view_image', input: { path: frame.path, x: 20, y: 10, width: 40, height: 60 } },
-            { name: 'view_image', input: { path: 'video/film/scene1-background.png' } },
-            { name: 'view_image', input: { path: 'video/film/gary.png' } },
-          ],
-        };
-      },
-      // Counting three arms and still passing is refused.
-      { calls: [{ name: 'give_verdict', input: { verdict: 'pass', people: [{ who: 'Gary', heads: 1, arms: 3, hands: 2, legs: 2, matches: 'yes' }], out_of_place: 'nothing', notes: 'Fine.' } }] },
       (body) => {
         expect(lastToolText(body)).toContain('it cannot pass with what you found: Gary has 3 arms');
         return { calls: [{ name: 'give_verdict', input: { verdict: 'pass', people: [{ who: 'Gary', heads: 1, arms: 2, hands: 2, legs: 2, matches: 'yes' }], out_of_place: 'nothing', notes: 'Face, jacket and kitchen match; two arms.' } }] };
