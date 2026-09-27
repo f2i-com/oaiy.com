@@ -220,6 +220,44 @@ fn attn_pe(
     let y = attention(&q, &k, &v, 0)?;
     gate_out(w, prefix, x, y)
 }
+/// Normalized Attention Guidance: a negative prompt without CFG (for distilled
+/// models, which sample at CFG 1). The video's text cross-attention also
+/// attends to the negative prompt, and its output is pushed away from that,
+/// its size held within `tau` times the plain output's, then blended back by
+/// `alpha` (Chen et al., "Normalized Attention Guidance", 2025). One extra
+/// cross-attention per block, not a second pass of the model.
+#[derive(Clone)]
+pub struct Nag {
+    /// The negative prompt's video context (from the connector, like the prompt's).
+    pub context: Tensor,
+    pub scale: f64,
+    pub tau: f64,
+    pub alpha: f64,
+}
+
+/// Text cross-attention guided away from a negative context (see `Nag`).
+fn nag_attn(w: &Group, prefix: &str, x: &Tensor, context: &Tensor, negative: &Tensor, nag: &Nag) -> Result<Tensor> {
+    let q = heads(&rms(&w.linear(&format!("{prefix}.to_q"), x)?, w.get(&format!("{prefix}.q_norm.weight"))?, 1e-6)?, 32)?;
+    let attend = |c: &Tensor| -> Result<Tensor> {
+        let k = heads(&rms(&w.linear(&format!("{prefix}.to_k"), c)?, w.get(&format!("{prefix}.k_norm.weight"))?, 1e-6)?, 32)?;
+        let v = heads(&w.linear(&format!("{prefix}.to_v"), c)?, 32)?;
+        unheads(&attention(&q, &k, &v, 0)?)?.to_dtype(DType::F32)
+    };
+    let y = nag_mix(&attend(context)?, &attend(negative)?, nag)?.to_dtype(x.dtype())?;
+    gate_out(w, prefix, x, heads(&y, 32)?)
+}
+/// NAG's mix of the plain (`pos`) and negative (`neg`) attention outputs, both
+/// (batch, tokens, channels) in F32.
+fn nag_mix(pos: &Tensor, neg: &Tensor, nag: &Nag) -> Result<Tensor> {
+    let guided = ((pos * nag.scale)? - (neg * (nag.scale - 1.))?)?;
+    // Per token, over all channels: where the guided output grew past tau times
+    // the plain one, it is scaled back to tau.
+    let l1 = |t: &Tensor| t.abs()?.sum_keepdim(2);
+    let ratio = (l1(&guided)? / (l1(pos)? + 1e-6)?)?;
+    let factor = (ratio.recip()? * nag.tau)?.clamp(0., 1.)?;
+    let guided = guided.broadcast_mul(&factor)?;
+    (guided * nag.alpha)? + (pos * (1. - nag.alpha))?
+}
 /// The per-head gate, then the output projection.
 fn gate_out(w: &Group, prefix: &str, x: &Tensor, mut y: Tensor) -> Result<Tensor> {
     if w.tensors
@@ -353,6 +391,7 @@ fn attend(
     prompt: Option<&Tensor>,
     rope: &Rope,
     skip_self: bool,
+    nag: Option<&Nag>,
 ) -> Result<Tensor> {
     let slot = |j| m.narrow(2, j, 1)?.squeeze(2);
     let h = affine(&norm(&x)?, &slot(0)?, &slot(1)?)?;
@@ -363,7 +402,14 @@ fn attend(
     }
     let h = affine(&norm(&x)?, &slot(6)?, &slot(7)?)?;
     let c = affine(context, &pm.narrow(1, 0, 1)?, &pm.narrow(1, 1, 1)?)?;
-    x + attn(w, s.attn2, &h, &c, None)?.broadcast_mul(&slot(8)?)?
+    let y = match nag {
+        Some(n) => {
+            let negative = affine(&n.context, &pm.narrow(1, 0, 1)?, &pm.narrow(1, 1, 1)?)?;
+            nag_attn(w, s.attn2, &h, &c, &negative, n)?
+        }
+        None => attn(w, s.attn2, &h, &c, None)?,
+    };
+    x + y.broadcast_mul(&slot(8)?)?
 }
 fn feed(w: &Group, s: &Stream, x: Tensor, m: &Tensor) -> Result<Tensor> {
     let slot = |j| m.narrow(2, j, 1)?.squeeze(2);
@@ -378,9 +424,10 @@ fn block(
     prompt: Option<&Tensor>,
     rope: &Rope,
     skip_self: bool,
+    nag: Option<&Nag>,
 ) -> Result<Tensor> {
     let m = modulation.broadcast_add(w.get(VIDEO.table)?)?;
-    let x = attend(w, &VIDEO, x, context, &m, prompt, rope, skip_self)?;
+    let x = attend(w, &VIDEO, x, context, &m, prompt, rope, skip_self, nag)?;
     feed(w, &VIDEO, x, &m)
 }
 /// The audio stream's inputs for one denoising step, computed once and
@@ -434,11 +481,12 @@ fn av_block(
     a: &AudioStep,
     skip_self: bool,
     skip_audio_self: bool,
+    nag: Option<&Nag>,
 ) -> Result<(Tensor, Tensor)> {
     let vm = modulation.broadcast_add(w.get(VIDEO.table)?)?;
     let am = a.modulation.broadcast_add(w.get(AUDIO.table)?)?;
-    let vx = attend(w, &VIDEO, vx, context, &vm, prompt, rope, skip_self)?;
-    let ax = attend(w, &AUDIO, ax, a.context, &am, a.prompt.as_ref(), a.rope, skip_audio_self)?;
+    let vx = attend(w, &VIDEO, vx, context, &vm, prompt, rope, skip_self, nag)?;
+    let ax = attend(w, &AUDIO, ax, a.context, &am, a.prompt.as_ref(), a.rope, skip_audio_self, None)?;
     let (vx, ax) = if a.isolated { (vx, ax) } else { cross(w, vx, ax, a)? };
     Ok((feed(w, &VIDEO, vx, &vm)?, feed(w, &AUDIO, ax, &am)?))
 }
@@ -493,6 +541,8 @@ pub struct Transformer {
     pub skip_audio_self_attn: Option<usize>,
     /// Every block kept on the device as INT8 (see `Store::group_int8`).
     pub int8: bool,
+    /// A negative prompt by NAG, for every forward until cleared.
+    pub nag: Option<Nag>,
     #[cfg(test)]
     last_hidden: Option<Tensor>,
     #[cfg(test)]
@@ -504,6 +554,24 @@ pub struct Transformer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn nag_pushes_away_from_the_negative_within_tau_and_blends_by_alpha() -> Result<()> {
+        let dev = Device::Cpu;
+        let t = |v: &[f32]| Tensor::from_slice(v, (1, 1, v.len()), &dev);
+        let nag = |scale, tau, alpha| Nag { context: Tensor::zeros(1, DType::F32, &dev).unwrap(), scale, tau, alpha };
+        let (pos, neg) = (t(&[1., 1.])?, t(&[1., -1.])?);
+        let values = |x: Tensor| x.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        // Scale 1: no guidance at all.
+        assert_eq!(values(nag_mix(&pos, &neg, &nag(1., 2.5, 1.))?), vec![1., 1.]);
+        // Scale 3: 3·pos − 2·neg = [1, 5]; its L1 (6) is 3× the plain one's (2),
+        // held to tau 2.5 → [5/6, 25/6]; alpha 1 keeps all of it.
+        let full = values(nag_mix(&pos, &neg, &nag(3., 2.5, 1.))?);
+        assert!((full[0] - 5. / 6.).abs() < 1e-4 && (full[1] - 25. / 6.).abs() < 1e-4, "{full:?}");
+        // Alpha 0.25 blends a quarter of that into the plain output.
+        let mixed = values(nag_mix(&pos, &neg, &nag(3., 2.5, 0.25))?);
+        assert!((mixed[0] - (0.25 * 5. / 6. + 0.75)).abs() < 1e-4 && (mixed[1] - (0.25 * 25. / 6. + 0.75)).abs() < 1e-4, "{mixed:?}");
+        Ok(())
+    }
     #[test]
     #[ignore = "requires the complete official transformer reference; NROB_LTX_GOLDEN"]
     fn full_video_transformer_matches_reference() -> Result<()> {
@@ -760,7 +828,7 @@ mod tests {
                     assert!(store.disk_bytes > before);
                 }
                 let y =
-                    block(&w, x.clone(), &context, &m, Some(&pm), &rope, false)?.to_dtype(DType::F32)?;
+                    block(&w, x.clone(), &context, &m, Some(&pm), &rope, false, None)?.to_dtype(DType::F32)?;
                 let error = (&y - &expected)?
                     .sqr()?
                     .mean_all()?
@@ -826,6 +894,7 @@ impl Transformer {
             skip_video_self_attn: None,
             skip_audio_self_attn: None,
             int8,
+            nag: None,
             #[cfg(test)]
             last_hidden: None,
             #[cfg(test)]
@@ -852,6 +921,7 @@ impl Transformer {
         mut progress: impl FnMut(usize),
     ) -> Result<(Tensor, Option<Tensor>)> {
         let dev = latent.device();
+        let nag = self.nag.clone();
         if audio.is_some() && !self.audio {
             candle_core::bail!("this transformer was loaded without its audio stream");
         }
@@ -1001,11 +1071,11 @@ impl Transformer {
             };
             match audio_state.as_mut() {
                 Some((step, ax, _)) => {
-                    let (v, a) = av_block(w, x, ax.clone(), context, &modulation, prompt.as_ref(), rope, step, skip_self, skip_audio_self)?;
+                    let (v, a) = av_block(w, x, ax.clone(), context, &modulation, prompt.as_ref(), rope, step, skip_self, skip_audio_self, nag.as_ref())?;
                     x = v;
                     *ax = a;
                 }
-                None => x = block(w, x, context, &modulation, prompt.as_ref(), rope, skip_self)?,
+                None => x = block(w, x, context, &modulation, prompt.as_ref(), rope, skip_self, nag.as_ref())?,
             }
             #[cfg(test)]
             if i == 0 {

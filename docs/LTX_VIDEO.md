@@ -377,6 +377,27 @@ On an RTX 5090, 5-second 768×512 talking-head clips took 166 s (LTX 2.3),
 following an MP3 took 66 s. The 121-frame limit caps a clip at about
 5 seconds; a longer soundtrack is cut to the clip.
 
+With no size asked for, Studio gives a clip with a start image the image's
+shape, at 768×512's pixel count, so a portrait or square frame is not cropped
+to landscape (the worker fills the size and crops what spills over).
+
+### Negative prompts
+
+`negative_prompt` names what a video should not show (watermark, text, logo,
+extra limbs…). Studio joins the model's `negative_prompt` (a default for
+all its videos) and the request's. With guided sampling (CFG above 1) it is the guidance's
+negative prompt. Distilled models sample at CFG 1, where a negative prompt has
+no effect, so there it steers by Normalized Attention Guidance (NAG, Chen et
+al. 2025): each block's video text cross-attention also attends to the negative
+prompt, and its output is pushed away from that one's (`scale`), its size held
+within `tau` times the plain output's, then blended back by `alpha`. That is one
+extra cross-attention per block rather than a second pass of the model. The
+defaults are the reference's for video models; `nag: {scale, tau, alpha}` in the
+request (or the model's config) tunes them (11, 2.5, 0.25). LTX was captioned
+with tags such as `has_subtitles`; a watermark baked into a checkpoint went away
+with `has_watermark, has_logo, has_text_overlay` in the negative prompt and
+`nag: {tau: 3.5, alpha: 0.4}` (stronger steering also follows the prompt a little less).
+
 ## Verification
 
 `cargo test --workspace` covers request constraints, trusted path selection,

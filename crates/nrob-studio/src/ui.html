@@ -1179,7 +1179,8 @@ function renderModels() {
     const miss = missingOf("video", m);
     const fields = ["transformer", "vae", "text_encoder", "tokenizer", "audio_vae"]
       .filter(k => k !== "tokenizer" || m.family !== "ltx-2.5")
-      .map(k => field({transformer: "Transformer", vae: "VAE", text_encoder: "Text encoder (Gemma)", tokenizer: "Gemma tokenizer.json", audio_vae: "Audio VAE (optional, for sound)"}[k], "video", name, k, m[k], {missing: miss.includes(k)})).join("");
+      .map(k => field({transformer: "Transformer", vae: "VAE", text_encoder: "Text encoder (Gemma)", tokenizer: "Gemma tokenizer.json", audio_vae: "Audio VAE (optional, for sound)"}[k], "video", name, k, m[k], {missing: miss.includes(k)})).join("")
+      + `<label class="f"><span>Negative prompt (optional: what its videos should not show, unless a request says otherwise)</span><input type="text" value="${esc(m.negative_prompt || "")}" data-mfield="video|${esc(name)}|negative_prompt" placeholder="watermark, text, logo, subtitles"></label>`;
     return mediaItem("video", name, m, (m.family || name).toUpperCase().replace("SULPHUR", "Sulphur"), miss, fields);
   }).join("") : '<div class="empty">No video model yet. Add an LTX 2.3, LTX 2.5 or Sulphur .safetensors file.</div>';
 

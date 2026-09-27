@@ -251,6 +251,55 @@ fn size(body: &Json, model: &Json, default: (i64, i64)) -> Result<(i64, i64), St
     Ok((w, h))
 }
 
+/// Whether the request or the model sets the size (else a start frame may).
+fn size_given(body: &Json, model: &Json) -> bool {
+    let set = |j: &Json, k: &str| j.get(k).is_some_and(|v| !matches!(v, Json::Null));
+    let asked = body.get("size").and_then(Json::as_str).is_some_and(|s| !s.trim().is_empty() && s.trim() != "auto");
+    asked || set(body, "width") || set(body, "height") || set(model, "width") || set(model, "height")
+}
+
+/// A size with the picture's aspect and about `area` pixels.
+fn shaped(w: u32, h: u32, area: i64) -> (i64, i64) {
+    let aspect = w as f64 / h as f64;
+    ((area as f64 * aspect).sqrt().round() as i64, (area as f64 / aspect).sqrt().round() as i64)
+}
+
+/// A PNG, JPEG or WebP image's width and height, from its header.
+fn image_dims(path: &Path) -> Option<(u32, u32)> {
+    let b = std::fs::read(path).ok()?;
+    let be16 = |i: usize| Some(u16::from_be_bytes([*b.get(i)?, *b.get(i + 1)?]) as u32);
+    let le = |i: usize, n: usize| Some((0..n).try_fold(0u32, |v, j| Some(v | (*b.get(i + j)? as u32) << (8 * j)))?);
+    let dims = if b.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some((u32::from_be_bytes(b.get(16..20)?.try_into().ok()?), u32::from_be_bytes(b.get(20..24)?.try_into().ok()?)))
+    } else if b.starts_with(&[0xff, 0xd8]) {
+        // Walk the markers to the frame header (SOF0-SOF15, not DHT/JPG/DAC).
+        let mut i = 2;
+        loop {
+            if *b.get(i)? != 0xff {
+                return None;
+            }
+            let marker = *b.get(i + 1)?;
+            if (0xc0..=0xcf).contains(&marker) && ![0xc4, 0xc8, 0xcc].contains(&marker) {
+                break Some((be16(i + 7)?, be16(i + 5)?));
+            }
+            i += 2 + be16(i + 2)? as usize;
+        }
+    } else if b.starts_with(b"RIFF") && b.get(8..12) == Some(b"WEBP") {
+        match b.get(12..16)? {
+            b"VP8X" => Some((le(24, 3)? + 1, le(27, 3)? + 1)),
+            b"VP8L" => {
+                let bits = le(21, 4)?;
+                Some(((bits & 0x3fff) + 1, ((bits >> 14) & 0x3fff) + 1))
+            }
+            b"VP8 " => Some((le(26, 2)? & 0x3fff, le(28, 2)? & 0x3fff)),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    dims.filter(|&(w, h)| w > 0 && h > 0)
+}
+
 /// Scale into `max` on the longer side (keeping the aspect), then round to `step`.
 pub fn fit(w: i64, h: i64, max: i64, min: i64, step: i64) -> (i64, i64) {
     let scale = (max as f64 / w.max(h) as f64).min(1.0);
@@ -573,7 +622,17 @@ pub fn video_request(cfg: &Json, root: &Path, output_root: &Path, body: &Json, a
     }
     .clamp(9, 121);
     let frames = (frames - 1) / 8 * 8 + 1;
-    let (w, h) = size(body, model, (768, 512))?;
+    // The start frame, read first: with no size asked for, the clip takes its
+    // shape (at the default's pixel count), so a portrait or square frame is
+    // not cropped to landscape.
+    let start_image = match body.get("input_reference").or_else(|| body.get("image")) {
+        Some(v) => reference_image(v, output_root, allow_local)?,
+        None => None,
+    };
+    let (w, h) = match (&start_image, size_given(body, model)) {
+        (Some(p), false) => image_dims(Path::new(p)).map_or((768, 512), |(iw, ih)| shaped(iw, ih, 768 * 512)),
+        _ => size(body, model, (768, 512))?,
+    };
     if w <= 0 || h <= 0 {
         return Err("size must be positive".into());
     }
@@ -722,11 +781,21 @@ pub fn video_request(cfg: &Json, root: &Path, output_root: &Path, body: &Json, a
             seconds = (speech_frames as f64 / 12.5).min(120.0 / fps as f64);
         }
     }
-    let start = body.get("input_reference").or_else(|| body.get("image"));
-    if let Some(v) = start {
-        if let Some(p) = reference_image(v, output_root, allow_local)? {
-            f.push(("image".into(), Json::str(p)));
-        }
+    if let Some(p) = start_image {
+        f.push(("image".into(), Json::str(p)));
+    }
+    // What the video should not show (watermarks, text…): the model's, and the
+    // request's added to it. Distilled models steer by it with NAG; `nag` tunes that.
+    let negative: Vec<&str> = [model.get("negative_prompt"), body.get("negative_prompt")]
+        .into_iter()
+        .filter_map(|v| v.and_then(Json::as_str).map(str::trim))
+        .filter(|s| !s.is_empty())
+        .collect();
+    if !negative.is_empty() {
+        f.push(("negative_prompt".into(), Json::str(negative.join(", "))));
+    }
+    if let Some(nag @ Json::Obj(_)) = body.get("nag").or_else(|| model.get("nag")) {
+        f.push(("nag".into(), nag.clone()));
     }
     if let Some(v) = body.get("end_image") {
         if let Some(p) = reference_image(v, output_root, allow_local)? {
@@ -1326,6 +1395,23 @@ mod tests {
         assert!(video_request(&c, root, &out, &body(r#"{"prompt":"x","input_reference":{"file_id":"f"}}"#), false).is_err());
         let (long, ..) = video_request(&c, root, &out, &body(r#"{"prompt":"x","seconds":30}"#), false).unwrap();
         assert_eq!(long.get("frames").and_then(Json::as_i64), Some(121));
+        // With no size asked for, a start frame gives the clip its shape (a
+        // 512x768 portrait stays portrait); a size asked for still wins.
+        let mut header = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+        header.extend(512u32.to_be_bytes());
+        header.extend(768u32.to_be_bytes());
+        let portrait = crate::util::base64_encode(&header);
+        let (r, _, size, _) = video_request(&c, root, &out, &body(&format!(r#"{{"prompt":"x","input_reference":{{"image_url":"data:image/png;base64,{portrait}"}}}}"#)), false).unwrap();
+        assert_eq!(size, "512x768");
+        assert_eq!((r.get("width").and_then(Json::as_i64), r.get("height").and_then(Json::as_i64)), (Some(512), Some(768)));
+        let (_, _, size, _) = video_request(&c, root, &out, &body(&format!(r#"{{"prompt":"x","size":"768x512","input_reference":{{"image_url":"data:image/png;base64,{portrait}"}}}}"#)), false).unwrap();
+        assert_eq!(size, "768x512");
+        // A request's negative prompt and NAG settings go to the worker.
+        let (r, ..) = video_request(&c, root, &out, &body(r#"{"prompt":"x","negative_prompt":"watermark","nag":{"tau":3.5}}"#), false).unwrap();
+        assert_eq!(r.get("negative_prompt").and_then(Json::as_str), Some("watermark"));
+        assert_eq!(r.get("nag").and_then(|n| n.get("tau")).and_then(Json::as_f64), Some(3.5));
+        let (r, ..) = video_request(&c, root, &out, &body(r#"{"prompt":"x"}"#), false).unwrap();
+        assert!(r.get("negative_prompt").is_none());
         let _ = std::fs::remove_dir_all(out);
     }
 

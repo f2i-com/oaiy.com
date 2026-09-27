@@ -85,6 +85,13 @@ impl Guidance {
     }
 }
 
+/// NAG defaults (the reference implementation's for video models): push the
+/// cross-attention output 11x away from the negative's, keep its size within
+/// 2.5x the plain one's, and blend a quarter of it in.
+const NAG_SCALE: f64 = 11.;
+const NAG_TAU: f64 = 2.5;
+const NAG_ALPHA: f64 = 0.25;
+
 /// The reference's LTX-2 schedule for guided sampling: `steps` evenly spaced
 /// times, shifted by 2.05 (its default token count) and stretched so the last
 /// nonzero sigma is 0.1.
@@ -236,6 +243,11 @@ pub struct Request {
     pub soundtrack_mode: String,
     /// Guided sampling with a non-distilled transformer; none for distilled ones.
     pub guidance: Option<Guidance>,
+    /// What the video should not show. With CFG guidance it is the guidance's
+    /// negative prompt; otherwise (distilled models, CFG 1) it steers by NAG.
+    pub negative_prompt: Option<String>,
+    /// NAG's (scale, tau, alpha).
+    pub nag: (f64, f64, f64),
     /// With `guidance`: render at half size, then upsample and refine.
     pub refine: Option<Refine>,
     /// A LoRA added to the transformer, and its strength.
@@ -328,6 +340,16 @@ impl Request {
             guidance: match j.get("guidance") {
                 None | Some(Json::Null) => None,
                 Some(g) => Some(Guidance::parse(g)?),
+            },
+            negative_prompt: j.get("negative_prompt").and_then(Json::as_str).map(str::trim).filter(|t| !t.is_empty()).map(str::to_owned),
+            nag: {
+                let n = |k: &str, default: f64, lo: f64, hi: f64| -> std::result::Result<f64, String> {
+                    match j.get("nag").and_then(|g| g.get(k)) {
+                        None | Some(Json::Null) => Ok(default),
+                        Some(v) => v.as_f64().filter(|v| (lo..=hi).contains(v)).ok_or_else(|| format!("nag.{k} must be a number from {lo} to {hi}")),
+                    }
+                };
+                (n("scale", NAG_SCALE, 1., 20.)?, n("tau", NAG_TAU, 1., 10.)?, n("alpha", NAG_ALPHA, 0., 1.)?)
             },
             lora: match j.get("lora") {
                 None | Some(Json::Null) => None,
@@ -777,9 +799,16 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
     };
     // The negative prompt for guided sampling: video only (the audio stream
     // keeps the prompt's context in that pass, as the reference does).
-    let negative = match &r.guidance {
-        Some(g) if g.cfg != 1. => {
-            let neg = Request { prompt: g.negative_prompt.clone(), audio: false, ..r.clone() };
+    let negative_text = match (&r.guidance, &r.negative_prompt) {
+        // Guided: the request's negative prompt, else the guidance's (or the reference's).
+        (Some(g), n) if g.cfg != 1. => Some(n.clone().unwrap_or_else(|| g.negative_prompt.clone())),
+        // Unguided: NAG, when there is one.
+        (_, Some(n)) => Some(n.clone()),
+        _ => None,
+    };
+    let negative = match negative_text {
+        Some(text) => {
+            let neg = Request { prompt: text, audio: false, ..r.clone() };
             let neg_cache = cache::PromptCache::new(&neg);
             match neg_cache.as_ref().and_then(|c| c.load(&dev)) {
                 Some(c) => Some(c),
@@ -826,6 +855,13 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
         gpu_budget.min(free.saturating_sub(8 * GIB))
     };
     let mut model = transformer::Transformer::new(store, &dev, gpu_budget, r.memory == "gpu", r.audio)?;
+    // A negative prompt without CFG steers every step by NAG.
+    if r.guidance.as_ref().is_none_or(|g| g.cfg == 1.) {
+        if let Some(context) = &negative {
+            model.nag = Some(transformer::Nag { context: context.clone(), scale: r.nag.0, tau: r.nag.1, alpha: r.nag.2 });
+            report(event("negative_prompt_nag", 1, 1));
+        }
+    }
     let int8_weights = model.int8;
     if int8_weights {
         report(event("int8_weights", 1, 1));
