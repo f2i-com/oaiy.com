@@ -189,6 +189,7 @@ export function mediaTools(media: MediaSettings | null | undefined, voices?: Pro
         'The prompt describes the motion that takes the start frame to the end frame, in order: what each character does first and then, and how (how far and fast they move, gestures, expressions changing, where they look, how they speak), and how the camera moves. Never leave it vague ("they talk", "a scene in a kitchen"). Do not describe the place, the people or the lighting: the start and end frames already show them, and repeating them pulls the picture away from the frames. ' +
         'Keep every clip to 5 seconds or less (`seconds` at most 5): a scene is several short clips, not one long one. ' +
         'For a story, make each clip from its shot in the script (see your instructions): the shot\'s Start frame and End frame lines are the prompts for its frames, its Video line is this prompt, and its Dialogue line is what is spoken in it. ' +
+        'Give negative_prompt with what must not appear (e.g. watermark, text, logo, subtitles, extra fingers, extra limbs), for every clip. ' +
         (media.discovered
           ? 'A character can talk: give `say` (their words; the service speaks them in `voice`, and the lips follow), or `soundtrack` (a speech or audio file in the project to follow). Then without `seconds` the clip is as long as the speech, up to the model\'s limit of about 5 seconds: keep each line to one short sentence, and make several clips for longer speech. ' +
             'Only one person may be in the frame while someone speaks: frame the speaker alone in a close-up (head and shoulders filling much of the frame, no other faces) in its start and end frames. With several faces the model moves the wrong mouth. Show the other characters in their own clips, and use shots of several people only without speech (reactions, entrances, wide establishing shots). '
@@ -211,9 +212,10 @@ export function mediaTools(media: MediaSettings | null | undefined, voices?: Pro
           path: { type: 'string', description: 'Where to save it in the project, e.g. media/intro.mp4' },
           model: { type: 'string', ...ids(media.videoModels) },
           seconds: { type: 'number', description: 'Length in seconds, at most 5 (leave it out to follow `say` or `soundtrack`)' },
-          size: { type: 'string', description: 'WIDTHxHEIGHT, e.g. 768x512 or 1024x576' },
+          size: { type: 'string', description: 'WIDTHxHEIGHT, e.g. 768x512 or 1024x576 (leave it out with a start_image: the clip takes the frame\'s shape)' },
           start_image: { type: 'string', description: 'Project path of a picture to use as the first frame (give end_image too)' },
           end_image: { type: 'string', description: 'Project path of a picture to end on: the clip moves from the start to it (give start_image too)' },
+          negative_prompt: { type: 'string', description: 'What the video should not show, e.g. watermark, text, logo, subtitles, extra limbs' },
           ...(media.discovered
             ? {
                 say: { type: 'string', description: 'Words the character speaks, with lip movement to match' },
@@ -1153,14 +1155,27 @@ async function execute(call: ToolCall, ctx: ToolContext, out: ToolOut): Promise<
       // The words in the soundtrack: without them the picture barely moves its lips.
       const transcript = soundtrack ? text('transcript') ?? ctx.spoken?.get(normalizePath(text('soundtrack')!)) : undefined;
       const model = text('model') ?? media.videoModel;
+      // A size whose shape differs from the start frame's would crop the frame
+      // (a portrait close-up loses its top and bottom): the frame's shape wins.
+      let size = text('size');
+      let reshaped = '';
+      const asked = size ? /^(\d+)\s*x\s*(\d+)$/i.exec(size) : null;
+      if (startImage && asked) {
+        const frame = await imageSize(startImage.bytes, startImage.mime).catch(() => null);
+        if (frame && Math.abs(Math.log((Number(asked[1]) / Number(asked[2])) / (frame.width / frame.height))) > 0.03) {
+          reshaped = ` The size ${size} did not have the start frame's shape (${frame.width}×${frame.height}), so the clip took the frame's shape instead.`;
+          size = undefined;
+        }
+      }
       ctx.progress?.(`starting the video${model ? ` with ${model}` : ''}…`);
       const result = await generateVideo(media, {
         prompt,
         model,
         seconds: typeof input.seconds === 'number' ? input.seconds : typeof input.seconds === 'string' && Number(input.seconds) > 0 ? Number(input.seconds) : undefined,
-        size: text('size'),
+        size,
         startImage,
         endImage,
+        negativePrompt: text('negative_prompt'),
         speech: say ? { input: say, voice: serviceVoice(readProjectVoices(vfs), text('voice')), instructions: text('voice_description') } : undefined,
         audio: soundtrack,
         transcript,
@@ -1168,7 +1183,7 @@ async function execute(call: ToolCall, ctx: ToolContext, out: ToolOut): Promise<
       vfs.writeFile(`/${path}`, result.bytes, { parents: true });
       out.files.push(path);
       const facts = [result.seconds && `${result.seconds} s`, result.size, `${(result.bytes.byteLength / 1e6).toFixed(1)} MB`].filter(Boolean).join(', ');
-      return `Saved /${path} (${facts}), made with ${result.model}. The user has a player for it in the chat.`;
+      return `Saved /${path} (${facts}), made with ${result.model}. The user has a player for it in the chat.${reshaped}`;
     }
     case 'generate_speech': {
       const media = ctx.media?.();

@@ -12,6 +12,7 @@ vi.mock('../../src/agent/images', async (original) => {
   const real = await original<typeof import('../../src/agent/images')>();
   return {
     ...real,
+    imageSize: async () => ({ width: 100, height: 100 }),
     viewImage: async (_bytes: Uint8Array, _mime: string, o: { x?: number; y?: number; width?: number; height?: number } = {}) => {
       const region = { x: o.x ?? 0, y: o.y ?? 0, width: o.width ?? 100, height: o.height ?? 100 };
       return { image: { mediaType: 'image/png', data: 'iVBORw0KGgo=' }, width: 100, height: 100, region, shownWidth: region.width, shownHeight: region.height };
@@ -325,6 +326,29 @@ describe('a picture sent back again and again', () => {
     await agent.run('go on', (e) => events.push(e));
     expect(events.at(-1)).toMatchObject({ type: 'done', text: 'ok' });
     expect(readReviews(vfs)[path]).toMatchObject({ verdict: 'pass', notes: 'taken as it is (3 tries, 0 reviews without a verdict); still off: the window is on the left' });
+  });
+});
+
+describe('generate_video with a start frame', () => {
+  it("takes the frame's shape when the size asked for has another", async () => {
+    const vfs = film();
+    // The stand-in viewer says every picture is 100×100; a square frame.
+    vfs.writeFile('/video/film/square.png', new Uint8Array([137, 80, 78, 71, 3]));
+    writeReviews(vfs, {});
+    const sent: Array<Record<string, unknown>> = [];
+    vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
+      if (String(url).endsWith('/content')) return new Response(new Uint8Array([0, 0, 0, 24]));
+      if (init?.method === 'POST') sent.push(JSON.parse(String(init.body)));
+      return new Response(JSON.stringify({ id: 'v1', status: 'completed', model: 'ltx', size: '640x640' }), { headers: { 'Content-Type': 'application/json' } });
+    }));
+    const ctx: ToolContext = { vfs, gate: new NetGate(), reads: new Map(), shell: { cwd: '/', env: {} }, media: () => MEDIA };
+    const run = (size: string) => runTool({ id: size, name: 'generate_video', input: { prompt: 'she smiles', path: `video/film/${size}.mp4`, size, start_image: 'video/film/square.png' } }, ctx);
+    const landscape = await run('768x512');
+    expect(sent[0].size).toBeUndefined();
+    expect(landscape.content).toContain("The size 768x512 did not have the start frame's shape (100×100)");
+    const square = await run('640x640');
+    expect(sent[1].size).toBe('640x640');
+    expect(square.content).not.toContain('did not have');
   });
 });
 

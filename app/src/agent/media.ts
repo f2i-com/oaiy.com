@@ -569,6 +569,8 @@ export interface VideoRequest {
   audio?: MediaFile;
   /** The words spoken in `audio`: the clip's lips follow them. */
   transcript?: string;
+  /** What the video should not show (watermarks, text, extra limbs...). */
+  negativePrompt?: string;
 }
 
 /** The audio formats a video soundtrack may come in. */
@@ -615,6 +617,7 @@ export async function generateVideo(media: MediaSettings, req: VideoRequest, onP
     if (req.seconds !== undefined) body.seconds = String(req.seconds);
     if (req.startImage) body.input_reference = { image_url: dataUrl(req.startImage) };
     if (req.endImage) body.end_image = { image_url: dataUrl(req.endImage) };
+    if (req.negativePrompt) body.negative_prompt = req.negativePrompt;
     if (req.speech) body.speech = Object.fromEntries(Object.entries(req.speech).filter(([, v]) => v !== undefined && v !== ''));
     if (req.audio) {
       const format = req.audio.name.split('.').pop()!.toLowerCase();

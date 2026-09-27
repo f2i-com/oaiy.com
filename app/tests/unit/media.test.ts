@@ -199,6 +199,8 @@ describe('media tools', () => {
     expect(tools[1].description).toContain('Keep every clip to 5 seconds or less');
     expect(tools[1].description).toContain('The prompt describes the motion that takes the start frame to the end frame, in order');
     expect(tools[1].description).toContain('make each clip from its shot in the script');
+    expect(tools[1].description).toContain('Give negative_prompt with what must not appear');
+    expect(Object.keys((tools[1].parameters as { properties: Record<string, unknown> }).properties)).toContain('negative_prompt');
     expect(tools[0].description).toContain('each character (only them, full length, facing the camera, neutral expression, on a blank white background)');
     expect(tools[0].description).toContain('A reference image is never used as a picture of the story itself.');
     expect(tools[1].description).toContain("giving the scene's background (the place with no people in it) and the reference images of the characters and props in it");
