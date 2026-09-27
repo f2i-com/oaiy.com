@@ -325,6 +325,15 @@ header `X-NROB-Incognito: 1` or a body field `"incognito": true`.
   state and checkpoints, so the next request cannot reuse (or reveal) it. The
   cost: every prompt is read from the start. The whole-server mode is
   `nrob-server --incognito`.
+- **Incognito sessions:** a caller that makes many requests in one private
+  conversation (an agent's steps) can name it with the header
+  `X-NROB-Session: <id>` (or a body field `"nrob_session"`). The engine then keeps
+  that session's prompt state in memory, never on disk, so its next request
+  reads only what is new. Any request from outside the session wipes it first,
+  and so does ending the session: `POST /v1/chat/completions` with the body
+  `{"nrob_forget_session": "<id>"}` (a model that is not running is not started
+  for this). bot.computer names its incognito project as the session, and ends
+  it when the project is cleared or incognito is turned off.
 - **Images and video:** the job writes into a private folder under
   `outputs/.incognito/`, with no video prompt cache and uploads kept inside it. It
   never appears in the job list, gallery or logs. The UI still shows that

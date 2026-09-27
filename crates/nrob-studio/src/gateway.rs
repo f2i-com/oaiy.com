@@ -168,6 +168,13 @@ fn proxy(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, upstream: &str)
     if !cfg.get("llm").is_some_and(|l| bool_or(l, "enabled", true)) {
         return send(w, Err(fail(503, "the language model is disabled")));
     }
+    // The end of an incognito session: a model that is not running holds
+    // nothing of it, so it is not started just to be told.
+    if studio.llm.endpoint().is_none() {
+        if let Some(session) = Json::parse(&req.body).ok().and_then(|b| b.get("nrob_forget_session").and_then(Json::as_str).map(str::to_owned)) {
+            return json_reply(w, 200, &Json::obj([("object", Json::str("nrob.session.forgotten")), ("session", Json::str(session))]));
+        }
+    }
     let lease = match studio.media.chat_lease(media::pauses_llm(&cfg), CHAT_WAIT) {
         Ok(l) => l,
         Err(e) => return send(w, Err(fail(503, e))),
@@ -185,6 +192,10 @@ fn proxy(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, upstream: &str)
     }
     if incognito_mode(studio) || incognito_header(req) {
         headers.push(("X-NROB-Incognito", "1"));
+    }
+    // An incognito session's requests reuse its state (in memory only).
+    if let Some(session) = req.header("x-nrob-session") {
+        headers.push(("X-NROB-Session", session));
     }
     let response = match fetch(&endpoint.addr, &req.method, upstream, &headers, &req.body, UPSTREAM_READ) {
         Ok(r) => r,

@@ -100,6 +100,8 @@ pub struct GlmEngine {
     pub disk: Option<crate::disk::DiskCache<llama_rs::glm5next::forward::StateSnapshot>>,
     /// The request running is incognito: keep no prompt state of it.
     forgetting: bool,
+    /// The incognito session whose prompt state is held (in memory only), if any.
+    private_session: Option<String>,
     pub warn: bool,
     pub log: bool,
 }
@@ -172,6 +174,7 @@ impl GlmEngine {
             tiers: TierCounters::default(),
             disk: None,
             forgetting: false,
+            private_session: None,
             warn: log,
             log,
         }
@@ -266,6 +269,16 @@ impl GlmEngine {
 
     pub fn run(mut self, jobs: Receiver<Job>) {
         for job in jobs {
+            // The end of an incognito session: wipe what is held of it.
+            if job.wipe {
+                if self.private_session.is_some() && self.private_session == job.session { self.reset(); }
+                let _ = job.events.send(Event::Done { finish: Finish::Stop, completion_tokens: 0 });
+                continue;
+            }
+            // A session's private state is reused by that session only.
+            if self.private_session.is_some() && !(job.forget && job.session.is_some() && job.session == self.private_session) {
+                self.reset();
+            }
             self.forgetting = job.forget;
             let r = self.generate(&job);
             if let Err(e) = r {
@@ -274,12 +287,14 @@ impl GlmEngine {
                 let _ = job.events.send(Event::Error(e.to_string()));
             }
             if job.forget {
-                self.reset();
+                // An incognito session keeps its state (in memory only) for its next request.
+                if job.session.is_some() { self.private_session = job.session.clone(); } else { self.reset(); }
             }
         }
     }
 
     fn reset(&mut self) {
+        self.private_session = None;
         if let Model::Glm5Next(g) = &self.model {
             g.reset();
         }

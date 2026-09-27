@@ -259,26 +259,47 @@ pub struct QwenEngine {
     pub disk: Option<crate::disk::DiskCache<Arc<Snapshot>>>,
     /// Only enable when the disk namespace fingerprints the vision pipeline.
     pub image_disk_cache: bool,
+    /// The incognito session whose prompt state is held (in memory only), if any.
+    private_session: Option<String>,
 }
 
 impl QwenEngine {
     pub fn new(model: Model, projector: Option<MmProj>, max_seq: usize, log: bool) -> Self {
         let kv = model.new_kv_cache(max_seq);
-        Self { model, projector, kv, covered: Vec::new(), vision_cache: Default::default(), log, checkpoints: Vec::new(), disk: None, image_disk_cache:false }
+        Self { model, projector, kv, covered: Vec::new(), vision_cache: Default::default(), log, checkpoints: Vec::new(), disk: None, image_disk_cache:false, private_session: None }
     }
     pub fn run(mut self, jobs: Receiver<Job>) {
         for job in jobs {
+            // The end of an incognito session: wipe what is held of it.
+            if job.wipe {
+                if self.private_session.is_some() && self.private_session == job.session { self.forget_state(); }
+                let _ = job.events.send(Event::Done { finish: Finish::Stop, completion_tokens: 0 });
+                continue;
+            }
+            // A session's private state is reused by that session only: anything
+            // else wipes it first.
+            if self.private_session.is_some() && !(job.forget && job.session.is_some() && job.session == self.private_session) {
+                self.forget_state();
+            }
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.generate(&job)));
             let error = match result { Ok(Ok(())) => None, Ok(Err(e)) => Some(e), Err(_) => Some("native Qwen inference failed".into()) };
             if let Some(e) = error { self.kv.reset(); self.covered.clear(); let _ = job.events.send(Event::Error(e)); }
             if job.forget {
-                // Incognito: nothing of this request is reused or kept.
-                self.kv.reset();
-                self.covered.clear();
-                self.checkpoints.clear();
-                self.vision_cache.clear();
+                // An incognito session keeps its state for its next request, in
+                // memory only (nothing of it goes to disk); otherwise nothing of
+                // this request is reused or kept.
+                if job.session.is_some() { self.private_session = job.session.clone(); } else { self.forget_state(); }
             }
         }
+    }
+
+    /// Forget everything held of a private request or session.
+    fn forget_state(&mut self) {
+        self.kv.reset();
+        self.covered.clear();
+        self.checkpoints.clear();
+        self.vision_cache.clear();
+        self.private_session = None;
     }
     fn generate(&mut self, job: &Job) -> Result<(), String> {
         if job.prompt.is_empty() { return Err("empty Qwen prompt".into()); }

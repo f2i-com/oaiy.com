@@ -45,6 +45,8 @@ pub struct Engine {
     pub model: GpuModel,
     /// The request running is incognito: no prompt state of it goes to disk.
     forgetting: bool,
+    /// The incognito session whose prompt state is held (in memory only), if any.
+    private_session: Option<String>,
     pub tok: Arc<Tokenizer>,
     pub eos: u32,
     /// Attention sub-chunk of the layered prefill (tokens).
@@ -142,6 +144,7 @@ impl Engine {
         let eos = model.cfg.eos_token_id;
         Engine {
             forgetting: false,
+            private_session: None,
             model,
             tok,
             eos,
@@ -173,6 +176,17 @@ impl Engine {
     /// Serve jobs until every sender is gone.
     pub fn run(mut self, jobs: Receiver<Job>) {
         for mut job in jobs {
+            // The end of an incognito session: wipe what is held of it.
+            if job.wipe {
+                if self.private_session.is_some() && self.private_session == job.session { self.forget_state(); }
+                let _ = job.events.send(Event::Done { finish: Finish::Stop, completion_tokens: 0 });
+                continue;
+            }
+            // A session's private state is reused by that session only: anything
+            // else wipes it first.
+            if self.private_session.is_some() && !(job.forget && job.session.is_some() && job.session == self.private_session) {
+                self.forget_state();
+            }
             // the background cache fill waits for idle time
             self.model.set_busy(true);
             self.request_number += 1;
@@ -202,12 +216,14 @@ impl Engine {
                 let _ = job.events.send(Event::Error(e.to_string()));
             }
             if job.forget {
+                // An incognito session keeps its state for its next request, in
+                // memory only (still private: nothing is written to disk).
+                if job.session.is_some() {
+                    self.private_session = job.session.clone();
+                    continue;
+                }
                 // Incognito: the next request starts clean rather than from this one.
-                self.tokens.clear();
-                self.checkpoints.clear();
-                // The observer's memory of its reviews would outlive it too.
-                if let Some(o) = self.observer.as_mut() { o.forget(); }
-                self.model.set_private(false);
+                self.forget_state();
                 continue;
             }
             if let Some(path) = &self.usage {
@@ -216,6 +232,16 @@ impl Engine {
                 }
             }
         }
+    }
+
+    /// Forget everything held of a private request or session.
+    fn forget_state(&mut self) {
+        self.tokens.clear();
+        self.checkpoints.clear();
+        // The observer's memory of its reviews would outlive it too.
+        if let Some(o) = self.observer.as_mut() { o.forget(); }
+        self.private_session = None;
+        self.model.set_private(false);
     }
 
     /// Where the prompt can start: the live state if it is a prefix of the

@@ -435,7 +435,7 @@ impl Server {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn submit(&self, a: &crate::models::Active, prompt: Vec<u32>, images: Vec<JobImage>, sampling: Sampling, max_tokens: usize, think_budget: Option<usize>, tool_precision: bool, observer_context: String, tools: Vec<Json>, forget: bool) -> Result<(mpsc::Receiver<Event>, Arc<AtomicBool>), ApiError> {
+    fn submit(&self, a: &crate::models::Active, prompt: Vec<u32>, images: Vec<JobImage>, sampling: Sampling, max_tokens: usize, think_budget: Option<usize>, tool_precision: bool, observer_context: String, tools: Vec<Json>, forget: bool, session: Option<String>) -> Result<(mpsc::Receiver<Event>, Arc<AtomicBool>), ApiError> {
         if prompt.len() + 1 > a.cfg.max_seq {
             return Err(ApiError {
                 status: 400,
@@ -451,7 +451,7 @@ impl Server {
         let max_tokens = max_tokens.min(a.cfg.max_seq - prompt.len());
         let (tx, rx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
-        let job = Job { tools, tool_precision, observer_context, prompt, images, max_tokens, think_budget, sampling, cancel: Arc::clone(&cancel), events: tx, forget };
+        let job = Job { tools, tool_precision, observer_context, prompt, images, max_tokens, think_budget, sampling, cancel: Arc::clone(&cancel), events: tx, forget, session: session.filter(|_| forget), wipe: false };
         a.jobs
             .send(job)
             .map_err(|_| ApiError { status: 503, message: "the model worker has stopped".into(), code: "unavailable" })?;
@@ -460,6 +460,20 @@ impl Server {
 
     fn chat(&self, req: &Request, w: &mut TcpStream) -> Result<bool, ApiError> {
         let body = Self::parse_body(req)?;
+        // The end of an incognito session: what the model holds of it is wiped
+        // (a model that is not loaded holds nothing, and is not loaded for this).
+        if let Some(session) = body.get("nrob_forget_session").and_then(Json::as_str) {
+            if let Some(name) = self.models.loaded() {
+                let a = self.models.activate(Some(&name)).map_err(bad)?;
+                let (tx, rx) = mpsc::channel();
+                let job = Job { tools: Vec::new(), tool_precision: false, observer_context: String::new(), prompt: Vec::new(), images: Vec::new(), max_tokens: 0, think_budget: None,
+                    sampling: Sampling { temperature: 0.0, top_p: 1.0, top_k: 0, seed: 0, reasoning_repeat_penalty: 1.0, reasoning_repeat_last_n: 0, repeat_penalty: 1.0, repeat_last_n: 0, presence_penalty: 0.0, frequency_penalty: 0.0 },
+                    cancel: Arc::new(AtomicBool::new(false)), events: tx, forget: true, session: Some(session.to_owned()), wipe: true };
+                a.jobs.send(job).map_err(|_| ApiError { status: 503, message: "the model worker has stopped".into(), code: "unavailable" })?;
+                let _ = rx.recv_timeout(std::time::Duration::from_secs(120));
+            }
+            return json_response(w, 200, &Json::obj([("object", Json::str("nrob.session.forgotten")), ("session", Json::str(session))])).map_err(|e| ApiError { status: 500, message: e.to_string(), code: "server_error" });
+        }
         observer_review_policy(&body)?;
         if body.get("nrob_file_write_yield").is_some_and(|v| !matches!(v, Json::Bool(_))) {
             return Err(bad("nrob_file_write_yield must be a boolean"));
@@ -491,7 +505,10 @@ impl Server {
         let request_clock = Instant::now();
         let mut prefilled_at = None;
         let forget = self.forget(req, &body);
-        let (rx, cancel) = self.submit(&a, prompt, images, sampling, max_tokens, think_budget, crate::models::needs_tool_precision(&body), observer_context(&body), body.get("tools").and_then(Json::as_array).unwrap_or(&[]).to_vec(), forget)?;
+        // An incognito session (X-NROB-Session, or nrob_session): its state is reused by its next request, in memory only.
+        let session = req.header("x-nrob-session").map(str::to_owned).or_else(|| body.get("nrob_session").and_then(Json::as_str).map(str::to_owned))
+            .map(|s| s.trim().to_owned()).filter(|s| !s.is_empty() && s.len() <= 128);
+        let (rx, cancel) = self.submit(&a, prompt, images, sampling, max_tokens, think_budget, crate::models::needs_tool_precision(&body), observer_context(&body), body.get("tools").and_then(Json::as_array).unwrap_or(&[]).to_vec(), forget, session)?;
         let peer = w.try_clone().ok();
         let id = random_id("chatcmpl-");
         let created = now();
@@ -872,7 +889,7 @@ impl Server {
         let n_prompt = prompt.len();
         let stream = body.get("stream").and_then(Json::as_bool).unwrap_or(false);
         let forget = self.forget(req, &body);
-        let (rx, cancel) = self.submit(&a, prompt, Vec::new(), sampling, max_tokens, None, false, String::new(), Vec::new(), forget)?;
+        let (rx, cancel) = self.submit(&a, prompt, Vec::new(), sampling, max_tokens, None, false, String::new(), Vec::new(), forget, None)?;
         let peer = w.try_clone().ok();
         let id = random_id("cmpl-");
         let created = now();

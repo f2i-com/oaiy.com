@@ -72,6 +72,12 @@ pub struct Job {
     /// and when it ends the engine drops its live state and checkpoints, so
     /// the next request cannot reuse (or reveal) this one's prefix.
     pub forget: bool,
+    /// An incognito session this request belongs to: its prompt state stays in
+    /// memory (never on disk) for the session's next request, and is wiped when a
+    /// request from anywhere else comes, or the session ends.
+    pub session: Option<String>,
+    /// Not a request: wipe the session's state (the end of an incognito session).
+    pub wipe: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
