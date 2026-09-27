@@ -462,8 +462,13 @@ fn directory(dir: &Path) -> Result<Detected, String> {
         let arch = config.get("architectures").and_then(|a| a.at(0)).and_then(Json::as_str).unwrap_or("").to_string();
         let model_type = str_or(&config, "model_type", "");
         if quant == "exl3" || arch.starts_with("Deepseek") || model_type.starts_with("deepseek") {
-            return Ok(detected(Role::Llm, "checkpoint", format!("{label} — {} checkpoint folder ({arch})", if quant == "exl3" { "EXL3" } else { "safetensors" }),
-                vec![("path", path_json(dir))]));
+            let mut fields = vec![("path", path_json(dir))];
+            // A Qwen EXL3 folder that kept its vision tower (config, preprocessor and
+            // model.visual.* weights) is its own vision projector.
+            if quant == "exl3" && config.get("vision_config").is_some() && dir.join("preprocessor_config.json").is_file() {
+                fields.push(("vision_projector", path_json(dir)));
+            }
+            return Ok(detected(Role::Llm, "checkpoint", format!("{label} — {} checkpoint folder ({arch})", if quant == "exl3" { "EXL3" } else { "safetensors" }), fields));
         }
         // MiniMax Music 3: the whole pipeline in one folder.
         if model_type == "minimax_music3" {
@@ -671,6 +676,10 @@ mod tests {
         std::fs::create_dir_all(&exl3).unwrap();
         std::fs::write(exl3.join("config.json"), r#"{"quantization_config":{"quant_method":"exl3"},"architectures":["Qwen3ForCausalLM"]}"#).unwrap();
         assert_eq!(detect(&exl3).unwrap().role, Role::Llm);
+        assert!(!detect(&exl3).unwrap().fields.iter().any(|(k, _)| k == "vision_projector"));
+        std::fs::write(exl3.join("config.json"), r#"{"quantization_config":{"quant_method":"exl3"},"architectures":["Qwen3_5ForConditionalGeneration"],"vision_config":{}}"#).unwrap();
+        std::fs::write(exl3.join("preprocessor_config.json"), "{}").unwrap();
+        assert!(detect(&exl3).unwrap().fields.iter().any(|(k, _)| k == "vision_projector"));
         let tok = d.0.join("tokenizer.json");
         std::fs::write(&tok, r#"{"added_tokens":[{"content":"<|startoftext|>"}]}"#).unwrap();
         assert_eq!(detect(&tok).unwrap().kind(), "clip_tokenizer");

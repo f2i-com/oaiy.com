@@ -60,7 +60,7 @@ pub const DEFAULT: &str = r#"{
     "default_model": "",
     "models": [],
     "devices": [],
-    "ctx": 32768,
+    "ctx": 0,
     "ram_gb": 0,
     "cpu_threads": null,
     "vram_headroom_gb": 2,
@@ -389,6 +389,10 @@ pub fn validate(v: &Json) -> Result<(), String> {
     for (key, min, max) in [("ctx", 512, 1 << 20), ("max_tokens", 1, 1 << 20), ("cpu_threads", 0, 1024), ("ram_gb", 0, 4096)] {
         // `cpu_threads: null` means "this machine's core count".
         if key == "cpu_threads" && matches!(llm.get(key), Some(Json::Null)) {
+            continue;
+        }
+        // `ctx: 0` means "the most the model allows".
+        if key == "ctx" && llm.get(key).and_then(Json::as_i64) == Some(0) {
             continue;
         }
         if !llm.get(key).and_then(Json::as_i64).is_some_and(|n| (min..=max).contains(&n)) {

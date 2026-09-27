@@ -32,11 +32,23 @@ directly, without conversion:
   rather than `model.diffusion_model.patchify_proj.weight`) load as they are.
   The `model_version` and `config` metadata must still be there.
 
-The worker does not apply video LoRAs (merged checkpoints are fine), and does
-not interpret NVFP4 or GGUF video weights. It does not run the LTX 2.5
+NVFP4 checkpoints load too: two E2M1 values a byte (high nibble first), an
+fp8 scale per 16 in the cuBLAS tiled layout, and a tensor-wide
+`weight_scale_2`; like fp8 they become BF16 on the device. A LoRA
+(`lora_A`/`lora_B` pairs) is added to the weights it adapts as they are read.
+The worker does not interpret GGUF video weights, and does not run the LTX 2.5
 diffusion-decoder VAE (`CausalDiffusionVAE`, with `decoder.diff_blocks.*`);
-the conv VAE decodes the same latents. Latent upscalers that ship with a
-release are not used: clips render in one pass at the requested size.
+the conv VAE decodes the same latents.
+
+Clips render in one distilled pass by default. `guidance` (with a dev
+transformer) and `refine` (the distilled transformer and a x2 spatial latent
+upsampler) run the reference's two-stage pipeline instead: guided sampling at
+half the size (30 steps; CFG 3 with the reference's negative prompt, STG on
+one block, rescale 0.7, x0-space), the latent doubled, then three distilled
+steps from sigma 0.909. In Studio a model's `dev_transformer` and
+`spatial_upscaler` enable it and a request asks with `pipeline: "two_stage"`.
+It did not make mouths follow a soundtrack measurably better and takes about
+four times as long.
 
 For example, the merged
 LTX 2.5 v1.1 fine-tune
@@ -150,10 +162,27 @@ server configuration, never from the generation request.
 
 | `memory` | Behavior |
 |---|---|
-| `auto` | Retains transformer blocks up to the VRAM budget; caches overflow weights in RAM up to the host budget; reads remaining weights from their checkpoint as needed. |
+| `auto` | Keeps every transformer block on the GPU in BF16 when that fits the VRAM budget, or else in INT8 when that fits (below); otherwise retains blocks up to the budget, caches overflow weights in RAM up to the host budget and reads the rest from their checkpoint as needed. |
 | `gpu` | Requires the video transformer blocks to fit the VRAM budget; otherwise returns an error. |
 | `ram` | Transfers each transformer block from a bounded host cache for GPU execution; overflow beyond the RAM budget is read from the checkpoint. |
 | `ssd` | Keeps no host or GPU transformer-block cache; reads each block directly from the original checkpoint on every step. |
+
+**INT8 on the GPU.** A 22B LTX transformer is about 44 GB in BF16; on a 32 GB
+card `auto` used to keep half of it and stream the rest from RAM on every pass,
+over a terabyte of uploads and device allocations per clip. When BF16 does not
+fit but INT8 does, every block is kept on the card instead, its large 2-D
+weights as symmetric per-row INT8 (one BF16 scale per output row; LoRAs merged
+and fp8 or NVFP4 weights decoded first) and expanded to BF16 just before each
+product. The transformer then takes about 18.6 GB, nothing streams, peak VRAM
+fell from 28.1 to 22.4 GB, and 57-frame LTX 2.5 clips denoised in 29 s rather
+than 35 s. The result reports `int8_weights`.
+
+**Headroom.** The weight budget leaves 8 GiB of the card free and the video
+decoder's workspace 4 GiB: on Windows, a card filled to the brim pages device
+memory to system RAM, where kernels can stall into the driver's 2-second
+watchdog (TDR). After a worker fails with a GPU fault (a CUDA error or
+non-finite output), Studio waits 30 s before the next media job, so a job never
+starts on a card whose driver is still recovering.
 
 `ram_gb` and `vram_gb` are weight-cache budgets, not total process memory limits.
 The server caps requested budgets at its configured values. The worker also
@@ -261,12 +290,23 @@ conditioning:
 2. It becomes a log-mel spectrogram: 64 slaney bins, hop 160.
 3. The audio VAE's encoder turns that into the transformer's audio latent, at
    25 frames a second, cropped to the clip.
-4. That latent stays fixed through all eight steps. The audio stream's sigma is
-   0 for its own timestep embeddings, its prompt modulation and its
-   cross-attention scale and shift. The same 0 is used for the gate through
-   which the video attends to the audio. The gate through which the audio
-   attends to the video follows the video's sigma. The picture is denoised as
-   usual, with start and end images if given.
+4. That latent is held through all the steps in one of two ways
+   (`soundtrack_mode`):
+   - `inpaint` (the default): at every step the latent is mixed with one fixed
+     noise to that step's sigma, as if the audio were being generated with the
+     picture, and put back again, so the model never changes it. The picture
+     sees the audio as it was trained to: denoised together with it.
+   - `frozen`: the reference's `a2vid` conditioning. The audio stream's sigma
+     is 0 for its own timestep embeddings, its prompt modulation and its
+     cross-attention scale and shift, and for the gate through which the
+     video attends to the audio. The gate through which the audio attends to
+     the video follows the video's sigma.
+
+   Measured with face landmarks (inner-lip opening against the soundtrack's
+   loudness, frame by frame), an LTX 2.5 fine-tune's lips matched
+   a speech file at +0.31 on average with `frozen` and +0.50 with `inpaint`,
+   over three seeds. The picture is denoised as usual, with start and end
+   images if given.
 5. The muxed audio is the input itself, cut to the clip, not a VAE round trip.
 
 The audio VAE files of all three models include the encoder. Request fields:
@@ -276,11 +316,56 @@ The audio VAE files of all three models include the encoder. Request fields:
 | `audio_file` | An absolute path to any audio FFmpeg reads, up to 256 MiB (at most 60 s is read). |
 | `speech` | A complete `kind: "speech"` worker request (see [Speech](SPEECH.md)). The worker speaks it first, frees the TTS model, and follows the result: a saved voice, an OpenAI voice name or a described one. |
 | `transcript` | The words in `audio_file`, if known. They, or the speech's own text, are added to the prompt as `They say: "…"`. Without the words, the distilled models take little lip movement from the sound alone. |
-| `a2v_guidance` | Audio-to-video guidance, 1 to 10 (default 3; 1 turns it off). Each step also runs without the audio-video cross-attention, and the picture moves away from that result. This is the reference's modality guidance. It doubles the denoising time. |
-| `frames` | Optional with a soundtrack. Without it, the clip is as long as the soundtrack: whole frames at `fps`, snapped down to 8k+1, from 9 to 121. |
+| `a2v_guidance` | Audio-to-video guidance, 1 to 10 (1 turns it off). Each step also runs without the audio-video cross-attention, and the picture moves away from that result. This is the reference's modality guidance. Default 3 with guided (two-stage) sampling, as the reference; 1 with the distilled models, where it did not make mouths follow the words measurably better, deformed faces and doubled the denoising time. |
+| `soundtrack_mode` | `inpaint` (default) or `frozen`, as above. |
+| `frames` | Optional with a soundtrack. Without it, the clip is as long as the soundtrack: enough whole frames at `fps` to hold all of it, snapped up to 8k+1 (from 9 to 121; the reference snaps down, which cuts the last words off), the soundtrack padded with silence to match. |
 
 A soundtrack needs `audio_vae` and keeps `audio` on. The result reports
 `followed_soundtrack`, `audio_file` and `speech_seconds`.
+
+### Lip-synced speech (ID-LoRA)
+
+Following a soundtrack, the distilled models move lips loosely. With
+[ID-LoRA](https://huggingface.co/papers/2603.10256) the clip's speech is
+generated *with* the picture instead, in a given voice, and joint generation
+keeps the lips in sync:
+
+- The LoRA (`lora`: `{path, strength}`, as ID-LoRA and the LTX trainer save
+  it) is added to the transformer's weights as they are read, `W + s B A`. The
+  TalkVid ID-LoRA adapts only the audio stream and the audio-video
+  cross-attention, so it also runs on LTX 2.5 and the fine-tunes.
+- `reference_voice`, an audio file of the speaker (up to 10 s is used), is
+  encoded by the audio VAE and leads the audio sequence as clean tokens
+  (timestep 0) at negative times, ending one latent (40 ms) before the clip.
+  The clip's own audio tokens start as noise and are denoised with the
+  picture; only they are decoded.
+- The prompt becomes ID-LoRA's (and the LTX 2.5 IC-LoRA's) form:
+  `[VISUAL]: … [SPEECH]: "the words" [SOUNDS]: …`.
+- With `identity: true`, the line (the `speech` made first, or `audio_file`)
+  sets the clip's length and, without a `reference_voice`, is the voice; it
+  is not followed as a soundtrack.
+- `identity_guidance` (0, off, by default) runs each step again without the
+  reference and pushes the audio toward the voice. ID-LoRA uses 3 with the dev
+  model; on the distilled ones it crackled, and the reference alone carries
+  the voice.
+- The decoded speech is matched to the reference voice's loudness and kept
+  under -0.3 dBFS; the vocoder's last step no longer hard-clips.
+
+In Studio, a model with `id_lora` (and optionally `id_lora_strength`) speaks a
+request's `speech` this way (`lip_sync`: auto, voice to re-speak an
+`input_audio` with its `transcript`, or off). A saved voice's sample is the
+reference. Discovery marks such models `lip_sync: true`. Measured with face
+landmarks, the lips' best match with the loudness sat within one frame for
+LTX 2.5 and Sulphur on every seed tried; a merged LTX 2.5 fine-tune's varied by
+a few frames.
+
+### Start and end images
+
+Before encoding, a start or end image goes through one H.264 frame and back
+(FFmpeg, libx264 veryfast, 4:2:0) at `image_crf`: 33 for the LTX 2.3
+generation (Sulphur is one), 18 for LTX 2.5, 0 to skip, as the reference
+pipelines do. The models were trained on video frames; a pristine still tended
+to stay still (Sulphur's faces did not move their mouths without it).
 
 On an RTX 5090, 5-second 768×512 talking-head clips took 166 s (LTX 2.3),
 147 s (LTX 2.5) and 119 s (Sulphur), speech included. A 3-second Sulphur clip

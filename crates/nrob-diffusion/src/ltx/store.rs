@@ -4,8 +4,14 @@
 //! as published: each weight may carry a per-tensor (or per-row)
 //! `<name>.weight_scale`, as ComfyUI's scaled checkpoints store it. They stay at
 //! their stored size on disk and in the RAM tier, and become BF16 on the device.
+//! NVFP4 checkpoints (ComfyUI's, and Lightricks' own `-nvfp4` releases) load too:
+//! two E2M1 values per byte, high nibble first, an fp8 `weight_scale` per block
+//! of 16 in the cuBLAS tiled layout, and a tensor-wide `weight_scale_2`.
 //! Transformers saved with bare names (`patchify_proj.weight`) are served under
 //! the `model.diffusion_model.` prefix the loader uses.
+//!
+//! A LoRA (`<module>.lora_A.weight` / `lora_B.weight`, as ID-LoRA and the LTX
+//! trainer save them) is added to its weights as they are read: `W + s B A`.
 use candle_core::{DType, Device, Result, Tensor};
 use dsv41::safetensors::{Dtype, StIndex};
 use std::{
@@ -16,6 +22,110 @@ use std::{
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn int8_rows_round_trip_within_half_a_step() -> Result<()> {
+        let dev = Device::Cpu;
+        let values: Vec<f32> = (0..4 * 300).map(|i| ((i * 37 % 101) as f32 - 50.) * if i < 300 { 0.01 } else { 3. }).collect();
+        let w = Tensor::from_vec(values.clone(), (4, 300), &dev)?;
+        let (codes, scale) = quantize_rows(&w)?;
+        assert_eq!(codes.dtype(), DType::U8);
+        let back = codes.to_dtype(DType::F32)?.affine(1., -128.)?.broadcast_mul(&scale.to_dtype(DType::F32)?)?.to_vec2::<f32>()?;
+        let scales = scale.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+        for (r, row) in back.iter().enumerate() {
+            for (c, v) in row.iter().enumerate() {
+                // Half a quantization step, plus BF16's rounding of the scale.
+                assert!((v - values[r * 300 + c]).abs() <= scales[r] * 0.51 + values[r * 300 + c].abs() * 0.008, "{r} {c}");
+            }
+        }
+        Ok(())
+    }
+    #[test]
+    fn lora_adds_scaled_b_times_a_to_its_weight() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("nrob-lora-{}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        let f32s = |v: &[f32]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+        let write = |path: &Path, tensors: &[(&str, &[usize], Vec<u8>)]| -> Result<()> {
+            let mut header = String::from("{");
+            let mut data = Vec::new();
+            for (i, (name, shape, bytes)) in tensors.iter().enumerate() {
+                if i > 0 { header.push(','); }
+                header.push_str(&format!("\"{name}\":{{\"dtype\":\"F32\",\"shape\":{shape:?},\"data_offsets\":[{},{}]}}", data.len(), data.len() + bytes.len()));
+                data.extend_from_slice(bytes);
+            }
+            header.push('}');
+            let mut out = (header.len() as u64).to_le_bytes().to_vec();
+            out.extend_from_slice(header.as_bytes());
+            out.extend(data);
+            std::fs::write(path, out)?;
+            Ok(())
+        };
+        let (model, lora) = (dir.join("m.safetensors"), dir.join("l.safetensors"));
+        // W (2x3) = 1; A (1x3) = [1,2,3]; B (2x1) = [1,-1]; scale 0.5.
+        write(&model, &[("model.diffusion_model.blk.to_q.weight", &[2, 3], f32s(&[1.; 6]))])?;
+        write(&lora, &[
+            ("diffusion_model.blk.to_q.lora_A.weight", &[1, 3], f32s(&[1., 2., 3.])),
+            ("diffusion_model.blk.to_q.lora_B.weight", &[2, 1], f32s(&[1., -1.])),
+        ])?;
+        let mut store = Store::open(&model, 0)?;
+        assert_eq!(store.add_lora(&lora, 0.5)?, 1);
+        let w = store.tensor("model.diffusion_model.blk.to_q.weight", &Device::Cpu, false)?.to_dtype(DType::F32)?.to_vec2::<f32>()?;
+        assert_eq!(w, vec![vec![1.5, 2.0, 2.5], vec![0.5, 0.0, -0.5]]);
+        // A transposed pair is refused, not merged.
+        write(&lora, &[
+            ("diffusion_model.blk.to_q.lora_A.weight", &[3, 1], f32s(&[1., 2., 3.])),
+            ("diffusion_model.blk.to_q.lora_B.weight", &[1, 2], f32s(&[1., -1.])),
+        ])?;
+        assert!(Store::open(&model, 0)?.add_lora(&lora, 1.).is_err());
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+    #[test]
+    fn nvfp4_unpacks_high_nibble_first_with_tiled_block_scales() -> Result<()> {
+        // 128 rows x 64 values: 32 bytes a row, 4 blocks of 16 a row.
+        let (rows, cols) = (128usize, 64usize);
+        let bytes: Vec<u8> = (0..rows * cols / 2).map(|i| if i % 32 == 0 { 0x2F } else { 0x00 }).collect();
+        // Row r, block c: scale 1 + r (as fp8 would round it, so keep r small) for block 0.
+        let mut plain = vec![0x38u8; rows * cols / 16]; // fp8 1.0
+        plain[5 * 4] = 0x40; // row 5, block 0: fp8 2.0
+        // Tile them as cuBLAS stores them.
+        let mut tiled = vec![0u8; plain.len()];
+        for (at, t) in tiled.iter_mut().enumerate() {
+            let (k, j, i) = (at % 4, at / 4 % 4, at / 16 % 32);
+            *t = plain[(j * 32 + i) * 4 + k];
+        }
+        assert_eq!(untile_scales(&tiled, rows, cols / 16)?, plain);
+        let scales: Vec<f32> = plain.iter().map(|&b| e4m3_table()[b as usize] * 0.5).collect();
+        let t = decode_as("w", Dtype::U8, &[rows, cols / 2], &bytes, Some(&scales), &Device::Cpu, DType::F32)?;
+        let v = t.to_vec2::<f32>()?;
+        // 0x2F: high nibble 2 (1.0) first, then low nibble 15 (-6.0); tensor scale 0.5.
+        assert_eq!((v[0][0], v[0][1], v[0][2]), (0.5, -3.0, 0.0));
+        assert_eq!((v[5][0], v[5][1]), (1.0, -6.0));
+        Ok(())
+    }
+    /// A real NVFP4 layer against the same layer of a BF16 relative (the
+    /// distilled model): the right layout correlates near 1, a wrong one near 0.
+    #[test]
+    #[ignore = "needs an NVFP4 LTX checkpoint and a BF16 relative; NROB_LTX_NVFP4, NROB_LTX_BF16"]
+    fn nvfp4_layer_matches_its_bf16_relative() -> Result<()> {
+        let (Some(q), Some(b)) = (std::env::var_os("NROB_LTX_NVFP4"), std::env::var_os("NROB_LTX_BF16")) else { return Ok(()) };
+        let name = "model.diffusion_model.transformer_blocks.10.attn1.to_q.weight";
+        let a = Store::open(Path::new(&q), 0)?.tensor(name, &Device::Cpu, false)?.to_dtype(DType::F32)?.flatten_all()?;
+        let r = Store::open(Path::new(&b), 0)?.tensor(name, &Device::Cpu, false)?.to_dtype(DType::F32)?.flatten_all()?;
+        let centre = |t: &Tensor| -> Result<Tensor> { t.broadcast_sub(&t.mean_all()?) };
+        let (a, r) = (centre(&a)?, centre(&r)?);
+        let dot = (&a * &r)?.sum_all()?.to_scalar::<f32>()?;
+        let corr = dot / (a.sqr()?.sum_all()?.to_scalar::<f32>()?.sqrt() * r.sqr()?.sum_all()?.to_scalar::<f32>()?.sqrt());
+        eprintln!("NVFP4 vs BF16 correlation {corr}");
+        if let Some(dump) = std::env::var_os("NROB_LTX_NVFP4_REF") {
+            let expected = candle_core::safetensors::load(Path::new(&dump), &Device::Cpu)?.remove("w").unwrap().flatten_all()?;
+            let mine = Store::open(Path::new(&q), 0)?.tensor(name, &Device::Cpu, false)?.to_dtype(DType::F32)?.flatten_all()?;
+            let err = (&mine - &expected)?.sqr()?.mean_all()?.to_scalar::<f32>()?.sqrt() / expected.sqr()?.mean_all()?.to_scalar::<f32>()?.sqrt();
+            eprintln!("NVFP4 decode vs reference dequantization: relative RMS {err:e}");
+            assert!(err < 5e-3, "{err}");
+        }
+        assert!(corr > 0.99, "{corr}");
+        Ok(())
+    }
     #[test]
     fn embedding_rows_preserve_order_and_check_bounds() -> Result<()> {
         let path = std::env::temp_dir().join(format!("nrob-rows-{}-{}.safetensors", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
@@ -112,8 +222,17 @@ mod tests {
     }
 }
 
+/// A LoRA's two factors for one weight, on the host.
+struct LoraPair {
+    a: Tensor,
+    b: Tensor,
+}
+
 pub struct Store {
     pub index: StIndex,
+    /// LoRA factors by the weight they adapt, and their scale.
+    lora: HashMap<String, LoraPair>,
+    lora_scale: f64,
     host: HashMap<String, Vec<u8>>,
     /// `weight_scale` values already read, by weight name.
     scales: HashMap<String, Option<Vec<f32>>>,
@@ -136,6 +255,8 @@ impl Store {
         }
         Ok(Self {
             index,
+            lora: HashMap::new(),
+            lora_scale: 0.,
             host: HashMap::new(),
             scales: HashMap::new(),
             host_bytes: 0,
@@ -143,7 +264,51 @@ impl Store {
             budget,
         })
     }
+    /// Add a LoRA: every `<module>.lora_A.weight` / `lora_B.weight` pair adapts
+    /// that module's weight by `scale * B A` whenever it is read. Returns how
+    /// many weights it adapts.
+    pub fn add_lora(&mut self, path: &Path, scale: f64) -> Result<usize> {
+        let mut file = Store::open(path, 0)?;
+        let names: Vec<String> = file.index.names().map(str::to_owned).collect();
+        let prefix = super::transformer::PREFIX;
+        for name in &names {
+            let Some(module) = name.strip_suffix(".lora_A.weight") else { continue };
+            let b_name = format!("{module}.lora_B.weight");
+            if !names.contains(&b_name) {
+                candle_core::bail!("LoRA {} lacks {b_name}", path.display());
+            }
+            // `diffusion_model.x`, `model.diffusion_model.x` or bare `x`.
+            let bare = module.strip_prefix("model.diffusion_model.").or_else(|| module.strip_prefix("diffusion_model.")).unwrap_or(module);
+            let weight = format!("{prefix}{bare}.weight");
+            let info = self.index.info(&weight).map_err(|_| candle_core::Error::Msg(format!("LoRA {}: the model has no {weight}", path.display())))?.clone();
+            let a = file.tensor(name, &Device::Cpu, false)?;
+            let b = file.tensor(&b_name, &Device::Cpu, false)?;
+            // A is (rank, in) and B (out, rank); B A must be the weight's shape
+            // (an NVFP4 weight stores half its columns).
+            let columns = if self.nvfp4(&weight) { info.shape[1] * 2 } else { info.shape[1] };
+            let (out, rank) = b.dims2()?;
+            let (rank_a, inner) = a.dims2()?;
+            if rank != rank_a || info.shape.len() != 2 || out != info.shape[0] || inner != columns {
+                candle_core::bail!("LoRA {} for {weight}: B {:?} A {:?} do not make its {:?}", path.display(), b.dims(), a.dims(), info.shape);
+            }
+            self.lora.insert(weight, LoraPair { a, b });
+        }
+        self.lora_scale = scale;
+        Ok(self.lora.len())
+    }
+
     pub fn tensor(&mut self, key: &str, dev: &Device, cache: bool) -> Result<Tensor> {
+        let t = self.tensor_plain(key, dev, cache)?;
+        match self.lora.get(key) {
+            None => Ok(t),
+            Some(l) => {
+                let delta = l.b.to_device(dev)?.to_dtype(DType::F32)?.matmul(&l.a.to_device(dev)?.to_dtype(DType::F32)?)?;
+                (t.to_dtype(DType::F32)? + (delta * self.lora_scale)?)?.to_dtype(t.dtype())
+            }
+        }
+    }
+
+    fn tensor_plain(&mut self, key: &str, dev: &Device, cache: bool) -> Result<Tensor> {
         let info = self
             .index
             .info(key)
@@ -226,6 +391,17 @@ impl Store {
                 let values: Vec<f32> = match info.dtype {
                     Dtype::F32 => bytes.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect(),
                     Dtype::BF16 => bytes.chunks_exact(2).map(|b| f32::from_bits((u16::from_le_bytes([b[0], b[1]]) as u32) << 16)).collect(),
+                    // NVFP4: one fp8 scale per 16 weights, tiled, times the tensor's own.
+                    Dtype::F8E4M3 if self.nvfp4(key) => {
+                        let global_name = format!("{base}.weight_scale_2");
+                        let g = self.index.read(&global_name).map_err(candle_core::Error::wrap)?;
+                        let global = f32::from_le_bytes(g.get(..4).and_then(|b| b.try_into().ok()).ok_or_else(|| candle_core::Error::Msg(format!("{global_name} is not one F32")))?);
+                        let (rows, cols) = match info.shape.as_slice() {
+                            [r, c] => (*r, *c),
+                            _ => candle_core::bail!("LTX tensor {name}: NVFP4 scales must be 2D"),
+                        };
+                        untile_scales(&bytes, rows, cols)?.into_iter().map(|b| e4m3_table()[b as usize] * global).collect()
+                    }
                     other => candle_core::bail!("LTX tensor {name}: unsupported scale dtype {other:?}"),
                 };
                 Some(values)
@@ -234,6 +410,14 @@ impl Store {
         self.scales.insert(key.to_owned(), found.clone());
         Ok(found)
     }
+    /// A weight packed as NVFP4 (two values per stored byte).
+    fn nvfp4(&self, key: &str) -> bool {
+        key.strip_suffix(".weight").is_some_and(|base| {
+            self.index.get(&format!("{base}.weight_scale_2")).is_some()
+                && self.index.get(key).is_some_and(|i| i.dtype == Dtype::U8)
+        })
+    }
+
     pub fn group_bytes(&self, prefix: &str, select: impl Fn(&str) -> bool) -> Result<u64> {
         let mut bytes = 0;
         for key in self.index.names() {
@@ -241,8 +425,10 @@ impl Store {
                 continue;
             };
             let info = self.index.info(key).map_err(candle_core::Error::wrap)?;
-            // All selected floating-point weights become BF16 on the device.
-            bytes += info.shape.iter().product::<usize>() as u64 * 2;
+            // All selected floating-point weights become BF16 on the device
+            // (an NVFP4 byte holds two).
+            let unpacked = if self.nvfp4(key) { 2 } else { 1 };
+            bytes += info.shape.iter().product::<usize>() as u64 * 2 * unpacked;
             if info.shape.len() == 2 {
                 if let Some(base) = short.strip_suffix(".weight") {
                     let bias = format!("{base}.bias");
@@ -305,13 +491,119 @@ impl Store {
             tensors,
             bytes,
             biased,
+            int8: HashMap::new(),
         })
     }
+
+    /// A group kept on the device with its large 2-D weights as INT8, one
+    /// scale per output row (symmetric, round to nearest): half the BF16
+    /// size, so a whole LTX transformer (about 22 GB) stays on one 32 GB card
+    /// rather than streaming half of itself from RAM on every pass. Each
+    /// weight is read as usual first (LoRA merged, fp8 or NVFP4 decoded).
+    pub fn group_int8(&mut self, prefix: &str, dev: &Device, select: impl Fn(&str) -> bool) -> Result<Group> {
+        let mut names: Vec<_> = self
+            .index
+            .names()
+            .filter_map(|k| k.strip_prefix(prefix).filter(|s| select(s) && !is_scale(s)).map(|s| (k.to_owned(), s.to_owned())))
+            .collect();
+        names.sort();
+        let mut tensors = HashMap::new();
+        let mut int8 = HashMap::new();
+        let mut biased = HashSet::new();
+        let mut bytes = 0;
+        for (key, short) in &names {
+            let t = self.tensor(key, dev, false)?;
+            match short.strip_suffix(".weight").filter(|_| t.rank() == 2 && t.elem_count() >= INT8_MIN_ELEMENTS) {
+                Some(linear) => {
+                    let (codes, scale) = quantize_rows(&t)?;
+                    bytes += (codes.elem_count() + scale.elem_count() * 2) as u64;
+                    if names.iter().any(|(_, s)| *s == format!("{linear}.bias")) {
+                        biased.insert(linear.to_owned());
+                    }
+                    int8.insert(linear.to_owned(), scale);
+                    tensors.insert(short.clone(), codes);
+                }
+                None => {
+                    bytes += (t.elem_count() * t.dtype().size_in_bytes()) as u64;
+                    tensors.insert(short.clone(), t);
+                }
+            }
+        }
+        // Small weights stay dense; with a bias they are packed as `group` does.
+        let dense: Vec<String> = tensors
+            .keys()
+            .filter_map(|k| k.strip_suffix(".bias").map(str::to_owned))
+            .filter(|k| !int8.contains_key(k))
+            .collect();
+        for key in dense {
+            let name = format!("{key}.weight");
+            let Some(w) = tensors.get(&name).filter(|w| w.rank() == 2) else { continue };
+            let out = w.dim(0)?;
+            let b = tensors.get(&format!("{key}.bias")).ok_or_else(|| candle_core::Error::Msg("bias".into()))?.unsqueeze(1)?;
+            let packed = Tensor::cat(&[w, &b, &Tensor::zeros((out, 7), w.dtype(), dev)?], 1)?;
+            bytes += (out * 8 * w.dtype().size_in_bytes()) as u64;
+            tensors.insert(name, packed);
+            biased.insert(key);
+        }
+        Ok(Group { tensors, bytes, biased, int8 })
+    }
+
+    /// What `group_int8` would keep on the device, in bytes.
+    pub fn group_int8_bytes(&self, prefix: &str, select: impl Fn(&str) -> bool) -> Result<u64> {
+        let mut bytes = 0;
+        for key in self.index.names() {
+            let Some(short) = key.strip_prefix(prefix).filter(|s| select(s) && !is_scale(s)) else { continue };
+            let info = self.index.info(key).map_err(candle_core::Error::wrap)?;
+            let unpacked = if self.nvfp4(key) { 2 } else { 1 };
+            let n = info.shape.iter().product::<usize>() as u64 * unpacked;
+            bytes += if short.ends_with(".weight") && info.shape.len() == 2 && n >= INT8_MIN_ELEMENTS as u64 { n + info.shape[0] as u64 * 2 } else { n * 2 };
+        }
+        Ok(bytes)
+    }
 }
+/// Weights smaller than this stay in BF16 when a group is kept as INT8.
+const INT8_MIN_ELEMENTS: usize = 1 << 16;
+
+/// Symmetric per-row INT8: codes offset by 128 into U8, and each row's scale
+/// (its largest magnitude over 127) as a BF16 column.
+fn quantize_rows(w: &Tensor) -> Result<(Tensor, Tensor)> {
+    let w = w.to_dtype(DType::F32)?;
+    let scale = (w.abs()?.max_keepdim(1)? / 127.)?.clamp(1e-12f32, f32::MAX)?;
+    let codes = w.broadcast_div(&scale)?.round()?.clamp(-127f32, 127f32)?.affine(1., 128.)?.to_dtype(DType::U8)?;
+    Ok((codes, scale.to_dtype(DType::BF16)?))
+}
+
 /// Quantization side tensors, applied with their weight rather than loaded.
 fn is_scale(name: &str) -> bool {
-    name.ends_with(".weight_scale") || name.ends_with(".input_scale")
+    name.ends_with(".weight_scale")
+        || name.ends_with(".weight_scale_2")
+        || name.ends_with(".input_scale")
+        // ComfyUI's per-layer quantization note (JSON bytes), not a weight.
+        || name.ends_with(".comfy_quant")
 }
+
+/// NVFP4 block scales from the cuBLAS tiled layout (128 x 4 tiles, stored as
+/// 32 x 4 x 4) to row-major `rows x cols`.
+fn untile_scales(tiled: &[u8], rows: usize, cols: usize) -> Result<Vec<u8>> {
+    if rows % 128 != 0 || cols % 4 != 0 || tiled.len() != rows * cols {
+        candle_core::bail!("NVFP4 scales of {rows} x {cols} are not whole 128 x 4 tiles");
+    }
+    let mut out = vec![0u8; rows * cols];
+    let col_blocks = cols / 4;
+    for (at, &b) in tiled.iter().enumerate() {
+        // Stored order: (row block, column block, i, j, k).
+        let k = at % 4;
+        let j = at / 4 % 4;
+        let i = at / 16 % 32;
+        let cb = at / 512 % col_blocks;
+        let rb = at / 512 / col_blocks;
+        out[(rb * 128 + j * 32 + i) * cols + cb * 4 + k] = b;
+    }
+    Ok(out)
+}
+
+/// E2M1: 1 sign, 2 exponent and 1 mantissa bits.
+const E2M1: [f32; 16] = [0., 0.5, 1., 1.5, 2., 3., 4., 6., -0., -0.5, -1., -1.5, -2., -3., -4., -6.];
 
 /// Every fp8 E4M3 (fn) byte's value: 1 sign, 4 exponent (bias 7) and 3
 /// mantissa bits; no infinities, and 0x7F/0xFF are NaN.
@@ -339,6 +631,19 @@ fn decode(key: &str, dtype: Dtype, shape: &[usize], bytes: &[u8], scale: Option<
 }
 
 fn decode_as(key: &str, dtype: Dtype, shape: &[usize], bytes: &[u8], scale: Option<&[f32]>, dev: &Device, out: DType) -> Result<Tensor> {
+    // NVFP4: `rows x cols/2` bytes and one scale per 16 values.
+    if let (Dtype::U8, Some(scales), [rows, packed]) = (dtype, scale, shape) {
+        let (rows, cols) = (*rows, *packed * 2);
+        if cols % 16 == 0 && scales.len() == rows * cols / 16 {
+            // Each byte to its two values, high nibble first.
+            let pairs: Vec<f32> = (0..256usize).flat_map(|b| [E2M1[b >> 4], E2M1[b & 15]]).collect();
+            let table = Tensor::from_vec(pairs, (256, 2), dev)?;
+            let codes = Tensor::from_raw_buffer(bytes, DType::U8, &[bytes.len()], dev)?.to_dtype(DType::U32)?;
+            let values = table.index_select(&codes, 0)?.reshape((rows, cols / 16, 16))?;
+            let s = Tensor::from_slice(scales, (rows, cols / 16, 1), dev)?;
+            return values.broadcast_mul(&s)?.reshape((rows, cols))?.to_dtype(out);
+        }
+    }
     let quantized = matches!(dtype, Dtype::F8E4M3 | Dtype::I8);
     if quantized && scale.is_none_or(|s| s.len() == 1) {
         // Each byte is looked up in a 256-entry table that already carries the
@@ -383,6 +688,9 @@ pub struct Group {
     pub tensors: HashMap<String, Tensor>,
     pub bytes: u64,
     biased: HashSet<String>,
+    /// Weights kept as INT8 (their `tensors` entry holds the codes, offset by
+    /// 128 in U8), with one scale per output row, by linear name.
+    int8: HashMap<String, Tensor>,
 }
 impl Group {
     pub fn get(&self, k: &str) -> Result<&Tensor> {
@@ -391,7 +699,23 @@ impl Group {
             .ok_or_else(|| candle_core::Error::Msg(format!("missing LTX tensor {k}")))
     }
     pub fn linear(&self, key: &str, x: &Tensor) -> Result<Tensor> {
-        let w = self.get(&format!("{key}.weight"))?;
+        let expanded;
+        let w = match self.int8.get(key) {
+            // An INT8 weight back to BF16 for this product only: codes - 128,
+            // times the row's scale, then its bias column as the packed form.
+            Some(scale) => {
+                let w = self.get(&format!("{key}.weight"))?.to_dtype(DType::BF16)?.affine(1., -128.)?.broadcast_mul(scale)?;
+                expanded = match self.tensors.get(&format!("{key}.bias")) {
+                    Some(b) if self.biased.contains(key) => {
+                        let out = w.dim(0)?;
+                        Tensor::cat(&[&w, &b.to_dtype(DType::BF16)?.unsqueeze(1)?, &Tensor::zeros((out, 7), DType::BF16, w.device())?], 1)?
+                    }
+                    _ => w,
+                };
+                &expanded
+            }
+            None => self.get(&format!("{key}.weight"))?,
+        };
         let input = x.dim(candle_core::D::Minus1)?;
         let rows = x.elem_count() / input;
         let flat = x.reshape((rows, input))?;

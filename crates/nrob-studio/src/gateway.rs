@@ -201,7 +201,10 @@ fn proxy(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, upstream: &str)
         if r.is_ok() {
             out.finish()?;
         }
-        r.map(|_| false)
+        // The stream said keep-alive and ended cleanly: the client may send its
+        // next request on this connection, so keep reading it rather than close
+        // it under a request already on its way.
+        r.map(|_| true)
     } else {
         let body = response.body(64 << 20)?;
         respond(w, status, &rtype, &body, true).map(|_| true)
@@ -797,7 +800,8 @@ pub fn video_object(job: &Job) -> Json {
         "failed" => ("failed", Json::obj([("code", Json::str("generation_failed")), ("message", Json::str(job.error.as_deref().unwrap_or("failed")))])),
         s => (s, Json::Null),
     };
-    let seconds = if job.seconds.fract().abs() < 0.05 { format!("{}", job.seconds.round() as i64) } else { format!("{:.1}", job.seconds) };
+    let clip = job.clip_seconds();
+    let seconds = if clip.fract().abs() < 0.05 { format!("{}", clip.round() as i64) } else { format!("{:.1}", clip) };
     Json::obj([
         ("id", Json::str(&job.id)),
         ("object", Json::str("video")),

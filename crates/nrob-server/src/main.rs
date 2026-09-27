@@ -17,7 +17,8 @@ const HELP: &str = "Observer: --observer-model FILE.gguf --observer-device auto|
   --port N             port (default 8000)
   --devices 1,0        CUDA devices; layers split across them (default: the
                        visible ones in order, at most two)
-  --ctx N              context length in tokens, prompt + reply (default 65536)
+  --ctx N|auto         context length in tokens, prompt + reply (default 65536);
+                       auto: the most the model allows
   --ram-gb N           host RAM for the expert cache (default: 80% of what is
                        free, so it leaves a fifth for everything else)
   --start NAME         which configured model to load at start (default: the one
@@ -113,7 +114,10 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Options, Stri
             "--devices" => {
                 a.devices = val()?.split(',').map(|d| d.trim().parse().map_err(|_| format!("--devices: bad ordinal {d:?}"))).collect::<Result<_, _>>()?
             }
-            "--ctx" => a.ctx = num(val()?)?,
+            "--ctx" => {
+                let v = val()?;
+                a.ctx = if v.trim() == "auto" { 0 } else { num(v)? };
+            }
             "--ram-gb" => a.ram_gb = num(val()?)?,
             "--model" => a.model = val()?.into(),
             "--engram-meta" => a.engram_meta = Some(val()?.into()),

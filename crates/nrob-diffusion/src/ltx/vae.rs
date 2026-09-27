@@ -686,6 +686,22 @@ impl PerChannelStatistics {
         })
     }
 
+    /// Only the statistics, from a VAE file.
+    pub fn load_file(path: &Path, device: &Device) -> Result<Self> {
+        let mut store = super::store::Store::open(path, 0)?;
+        let name = |key: &str| {
+            [format!("vae.per_channel_statistics.{key}"), format!("per_channel_statistics.{key}")]
+                .into_iter()
+                .find(|n| store.index.info(n).is_ok())
+                .ok_or_else(|| candle_core::Error::Msg(format!("the VAE lacks per_channel_statistics.{key}")))
+        };
+        let (std_name, mean_name) = (name("std-of-means")?, name("mean-of-means")?);
+        Ok(Self {
+            std_of_means: store.tensor(&std_name, device, false)?.to_dtype(DType::F32)?,
+            mean_of_means: store.tensor(&mean_name, device, false)?.to_dtype(DType::F32)?,
+        })
+    }
+
     pub fn un_normalize(&self, x: &Tensor) -> Result<Tensor> {
         let dtype = x.dtype();
         let s = self

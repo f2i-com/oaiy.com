@@ -64,6 +64,10 @@ use std::time::{Duration, Instant};
 /// harness repeats. See `llama_rs::glm5next::kda`.
 const STATE_FORMAT: u8 = 2;
 
+/// Context length when `--ctx` is not given, and for a model that names no
+/// maximum of its own under `--ctx auto`.
+pub const DEFAULT_CTX: usize = 65536;
+
 /// How to run the server; [`Options::default`] gives the binary's defaults,
 /// apart from the checkpoint directory, which the caller always names.
 #[derive(Clone, Debug)]
@@ -79,7 +83,8 @@ pub struct Options {
     /// CUDA devices; the layers are split across them. Empty: the visible
     /// ones in order, at most two (the layers split only at layer 20).
     pub devices: Vec<usize>,
-    /// Context length in tokens, prompt and reply together.
+    /// Context length in tokens, prompt and reply together. 0 (`--ctx auto`):
+    /// the most each model allows.
     pub ctx: usize,
     /// Host RAM for the expert cache, in GB.
     /// Host RAM for the expert cache, in GB. **0 means decide from what is free**:
@@ -207,7 +212,7 @@ impl Default for Options {
             host: "127.0.0.1".into(),
             port: 8000,
             devices: Vec::new(),
-            ctx: 65536,
+            ctx: DEFAULT_CTX,
             // Decided at load from what the machine actually has free, rather than
             // a number that is right for one machine: see `expert_cache_bytes`.
             ram_gb: 0,
@@ -359,12 +364,13 @@ pub fn start_listening(mut o: Options, listening: impl FnOnce(SocketAddr)) -> nr
     let models = Arc::new(models::Models::new(o, loopback)?);
     // Load it now rather than on the first request, so a start-up failure is a
     // start-up failure and not a 400 an hour later.
-    models
+    let active = models
         .activate(start_model.as_deref())
         .map_err(|e| nrob::Error::Arg(e))?;
     log(format!(
-        "{default_name} loaded in {:.1}s ({ctx} token context)",
-        t.elapsed().as_secs_f64()
+        "{default_name} loaded in {:.1}s ({} token context)",
+        t.elapsed().as_secs_f64(),
+        active.cfg.max_seq
     ));
     if configured.len() > 1 {
         log(format!(

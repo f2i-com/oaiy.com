@@ -394,6 +394,9 @@ cargo test -p dsv41-cuda --release --test gpu_vision_model -- --ignored --nocapt
   takes GGUF files.
 - **DeepSeek-V4.1 context:** the model is trained for 1,048,576 tokens (YaRN ×16 over
   65,536). nrob's caches cost ~7 KB a token, so `--ctx` can go far (65,536 by default).
+  `--ctx auto` serves every other model at the most it allows (its
+  `max_position_embeddings`) and DeepSeek at the default; Studio passes it when
+  the context setting is 0, its default.
   Verified against the reference oracle up to 247 tokens; longer contexts run the same
   code, but candidate filtering only engages past ~32K tokens and is unverified there.
 - **DeepSeek-V4.1 vision:** PNG and JPEG only (GIF, WebP and BMP are refused with a

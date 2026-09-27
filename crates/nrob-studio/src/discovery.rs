@@ -19,7 +19,7 @@ fn sub(method: &str, path: String, what: &str) -> Json {
 fn operations(target: &str, spec: &str, path: &str) -> Vec<Json> {
     match (target, spec) {
         ("videos", "openai") => vec![
-            sub("POST", path.into(), "create a video job (JSON: prompt, model, seconds, size, input_reference (start frame), end_image, input_audio or speech {text, voice} for a soundtrack the clip follows)"),
+            sub("POST", path.into(), "create a video job (JSON: prompt, model, seconds, size, input_reference (start frame), end_image, speech {text, voice}: on a model with lip_sync the speech is generated with the picture in that voice, lips in sync; input_audio (with its transcript) is kept exactly and followed (soundtrack_mode inpaint or frozen; lip_sync: voice to speak it again in that voice instead, off to follow speech as a soundtrack))"),
             sub("GET", path.into(), "list video jobs"),
             sub("GET", format!("{path}/{{id}}"), "poll a job: status queued | in_progress | completed | failed, progress 0-100"),
             sub("GET", format!("{path}/{{id}}/content"), "download the MP4; ?variant=thumbnail for its first frame (PNG)"),
@@ -173,6 +173,8 @@ pub fn document(studio: &Studio, base: &str, authorized: bool) -> Json {
                 ("max_seconds", Json::Num(120.0 / fps as f64)),
                 ("max_side", Json::Int(1024)),
                 ("start_image", Json::Bool(true)),
+                // Speech generated with the picture, lips in sync, in a saved voice (ID-LoRA).
+                ("lip_sync", Json::Bool(!str_or(&m, "id_lora", "").trim().is_empty())),
             ])
         })
         .collect();
@@ -282,7 +284,10 @@ pub fn document(studio: &Studio, base: &str, authorized: bool) -> Json {
             Json::obj([
                 ("state", status.get("state").cloned().unwrap_or(Json::Null)),
                 ("runs_on", status.get("runs_on").cloned().unwrap_or(Json::Null)),
-                ("context_tokens", Json::Int(int_or(&llm, "ctx", 32768))),
+                // What the loaded model was opened with; before it loads, the setting
+                // (0, the model's maximum, is not known until then).
+                ("context_tokens", status.get("context_tokens").filter(|c| !matches!(c, Json::Null)).cloned()
+                    .unwrap_or_else(|| match int_or(&llm, "ctx", 0) { 0 => Json::Null, n => Json::Int(n) })),
                 ("starts_on_demand", Json::Bool(true)),
             ]),
         ),

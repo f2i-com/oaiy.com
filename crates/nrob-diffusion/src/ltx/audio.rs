@@ -307,7 +307,9 @@ impl AudioDecoder {
         let low = low.pad_with_zeros(2, 0, (self.hop - len % self.hop) % self.hop)?;
         let residual = self.generate(&self.bwe, &self.log_mel(&low)?)?;
         let skip = self.resample(&low)?;
-        (residual + skip)?.clamp(-1f32, 1f32)?.narrow(2, 0, len * self.ratio)
+        // Not clamped to [-1, 1] here, as the reference does: a hot waveform
+        // would clip into static. The caller brings its level down instead.
+        (residual + skip)?.narrow(2, 0, len * self.ratio)
     }
 
     /// Latent to waveform in one call.

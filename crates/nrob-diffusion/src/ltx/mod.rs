@@ -11,6 +11,7 @@ mod cache;
 pub(crate) mod store;
 mod text;
 mod transformer;
+mod upsampler;
 pub mod vae;
 use candle_core::{DType, Device, Result, Tensor};
 use nrob::json::Json;
@@ -26,6 +27,175 @@ const GIB: u64 = 1 << 30;
 const SIGMAS: [f64; 9] = [
     1., 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.,
 ];
+
+/// The reference's negative prompt for guided (non-distilled) sampling.
+pub const DEFAULT_NEGATIVE_PROMPT: &str = "has_subtitles, has_blurbox, transition from black, transition to black, speech_ending_short, \
+blurry, out of focus, overexposed, underexposed, low contrast, washed out colors, excessive noise, \
+grainy texture, poor lighting, flickering, motion blur, distorted proportions, unnatural skin tones, \
+deformed facial features, asymmetrical face, missing facial features, extra limbs, disfigured hands, \
+wrong hand count, artifacts around text, inconsistent perspective, camera shake, incorrect depth of \
+field, background too sharp, background clutter, distracting reflections, harsh shadows, inconsistent \
+lighting direction, color banding, cartoonish rendering, 3D CGI look, unrealistic materials, uncanny \
+valley effect, incorrect ethnicity, wrong gender, exaggerated expressions, wrong gaze direction, \
+mismatched lip sync, silent or muted audio, distorted voice, robotic voice, echo, background noise, \
+off-sync audio, incorrect dialogue, added dialogue, repetitive speech, jittery movement, awkward \
+pauses, incorrect timing, unnatural transitions, inconsistent framing, tilted camera, flat lighting, \
+inconsistent tone, cinematic oversaturation, stylized filters, or AI artifacts.";
+
+/// Guided sampling, for a non-distilled (dev) transformer: the reference's
+/// first stage. Each step runs the prompt, the negative prompt, the prompt
+/// with block `stg_block`'s video self-attention passed through, and
+/// (following a soundtrack) the pass without audio-video cross-attention, and
+/// combines their denoised predictions.
+#[derive(Clone, Debug)]
+pub struct Guidance {
+    pub steps: usize,
+    pub cfg: f64,
+    pub stg: f64,
+    pub stg_block: usize,
+    pub rescale: f64,
+    pub negative_prompt: String,
+}
+impl Guidance {
+    fn parse(j: &Json) -> std::result::Result<Self, String> {
+        let num = |k: &str, default: f64, lo: f64, hi: f64| -> std::result::Result<f64, String> {
+            match j.get(k) {
+                None | Some(Json::Null) => Ok(default),
+                Some(v) => v
+                    .as_f64()
+                    .filter(|v| (lo..=hi).contains(v))
+                    .ok_or_else(|| format!("guidance.{k} must be a number from {lo} to {hi}")),
+            }
+        };
+        let g = Self {
+            steps: num("steps", 30., 2., 100.)? as usize,
+            cfg: num("cfg", 3., 1., 20.)?,
+            stg: num("stg", 1., 0., 10.)?,
+            stg_block: num("stg_block", 28., 0., 47.)? as usize,
+            rescale: num("rescale", 0.7, 0., 1.)?,
+            negative_prompt: j
+                .get("negative_prompt")
+                .and_then(Json::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or(DEFAULT_NEGATIVE_PROMPT)
+                .to_owned(),
+        };
+        Ok(g)
+    }
+}
+
+/// The reference's LTX-2 schedule for guided sampling: `steps` evenly spaced
+/// times, shifted by 2.05 (its default token count) and stretched so the last
+/// nonzero sigma is 0.1.
+fn guided_sigmas(steps: usize) -> Vec<f64> {
+    let shift = 2.05f64.exp();
+    let mut s: Vec<f64> = (0..=steps)
+        .map(|i| 1. - i as f64 / steps as f64)
+        .map(|t| if t == 0. { 0. } else { shift / (shift + (1. / t - 1.)) })
+        .collect();
+    let scale = (1. - s[steps - 1]) / (1. - 0.1);
+    for v in s.iter_mut().take(steps) {
+        *v = 1. - (1. - *v) / scale;
+    }
+    s
+}
+
+/// The reference's second stage (its two-stage pipelines): after guided
+/// sampling at half the size, the latent is doubled by `upsampler` and
+/// refined by the distilled `transformer` over the last three steps of its
+/// schedule, with the soundtrack held as in stage one and no guidance.
+#[derive(Clone, Debug)]
+pub struct Refine {
+    pub transformer: PathBuf,
+    pub upsampler: PathBuf,
+}
+
+/// The longest reference voice used (ID-LoRA trained on a few seconds).
+const MAX_REFERENCE_SECONDS: f64 = 10.;
+
+/// Stage two's schedule: the distilled one from 0.909375.
+const REFINE_SIGMAS: [f64; 4] = [0.909375, 0.725, 0.421875, 0.];
+
+/// The prompt's contexts for the refining transformer: from the prompt cache
+/// (keyed by that transformer), or Gemma and its connectors.
+fn refine_contexts(
+    r: &Request,
+    transformer: &std::path::Path,
+    store: &mut Store,
+    dev: &Device,
+    report: &mut dyn FnMut(Json),
+) -> Result<(Tensor, Option<Tensor>)> {
+    let refine = Request { transformer: transformer.to_path_buf(), ..r.clone() };
+    let video_cache = cache::PromptCache::new(&refine);
+    let audio_cache = if r.audio { cache::PromptCache::audio(&refine) } else { None };
+    let cached = video_cache.as_ref().and_then(|c| c.load(dev));
+    let cached_audio = audio_cache.as_ref().and_then(|c| c.load(dev));
+    if let Some(context) = cached {
+        if !r.audio || cached_audio.is_some() {
+            return Ok((context, cached_audio));
+        }
+    }
+    report(event("encoding_refine_prompt", 0, 48));
+    let (features, audio_features) = text::encode(
+        &r.text_encoder,
+        r.tokenizer.as_deref(),
+        store,
+        &r.prompt,
+        r.model == "ltx-2.5",
+        r.audio,
+        dev,
+        |n| report(event("encoding_refine_prompt", n, 48)),
+    )?;
+    let context = transformer::connector(store, &features, "video_embeddings_connector", dev, |_| {})?;
+    drop(features);
+    let audio_context = audio_features
+        .map(|f| transformer::connector(store, &f, "audio_embeddings_connector", dev, |_| {}))
+        .transpose()?;
+    if let Some(c) = &video_cache {
+        let _ = c.save(&context);
+    }
+    if let (Some(c), Some(a)) = (&audio_cache, &audio_context) {
+        let _ = c.save(a);
+    }
+    Ok((context, audio_context))
+}
+
+/// Speech loudness: the 95th percentile of 20 ms RMS, the level of its
+/// voiced parts (pauses do not pull it down). None for silence.
+fn speech_loudness(samples: &[f32], rate: usize) -> Option<f32> {
+    let w = (rate / 50).max(1);
+    let mut rms: Vec<f32> = samples.chunks(w).map(|c| (c.iter().map(|x| x * x).sum::<f32>() / c.len() as f32).sqrt()).collect();
+    rms.sort_by(|a, b| a.total_cmp(b));
+    let at = rms.get(rms.len() * 95 / 100).copied()?;
+    (at > 1e-5).then_some(at)
+}
+
+/// The generated soundtrack's level (interleaved stereo): matched to the
+/// reference voice's loudness when there is one (within 4x either way), then
+/// scaled so the peak stays under -0.3 dB rather than clipping.
+fn set_level(interleaved: &mut [f32], rate: usize, reference: Option<f32>) {
+    let left: Vec<f32> = interleaved.iter().step_by(2).copied().collect();
+    let mut gain = match (reference, speech_loudness(&left, rate)) {
+        (Some(want), Some(have)) => (want / have).clamp(0.25, 4.),
+        _ => 1.,
+    };
+    let peak = interleaved.iter().fold(0f32, |m, x| m.max(x.abs())) * gain;
+    const CEILING: f32 = 0.966; // -0.3 dBFS
+    if peak > CEILING {
+        gain *= CEILING / peak;
+    }
+    if gain != 1. {
+        interleaved.iter_mut().for_each(|x| *x *= gain);
+    }
+}
+
+/// The standard deviation of every element.
+fn std_all(t: &Tensor) -> Result<f64> {
+    let t = t.to_dtype(DType::F32)?.flatten_all()?;
+    let mean = t.mean_all()?.to_scalar::<f32>()?;
+    Ok(t.affine(1., -mean as f64)?.sqr()?.mean_all()?.to_scalar::<f32>()?.sqrt() as f64)
+}
 
 #[derive(Clone, Debug)]
 pub struct Request {
@@ -52,9 +222,42 @@ pub struct Request {
     pub frames_from_audio: bool,
     /// Audio-to-video guidance while following a soundtrack: each step also
     /// runs without the audio-video cross-attention and pushes the picture
-    /// away from that (the reference's modality guidance, 3 by default; 1 is
-    /// off). It is what makes mouths follow the words.
+    /// away from that (the reference's modality guidance; 1 is off). 3 with
+    /// guided sampling, as the reference; off by default for distilled models,
+    /// where it did not make mouths follow the words measurably better,
+    /// deforms faces, and doubles the time.
     pub a2v_guidance: f64,
+    /// How a given soundtrack is held while the picture follows it: "inpaint"
+    /// (the default: at every step, noised to that step's sigma as if it were
+    /// being generated, and replaced again, so the picture sees audio as it
+    /// was trained to, denoised together with it) or "frozen" (clean, at
+    /// timestep 0, as the reference's a2v pipeline; lips followed it more
+    /// loosely). The output keeps the file either way.
+    pub soundtrack_mode: String,
+    /// Guided sampling with a non-distilled transformer; none for distilled ones.
+    pub guidance: Option<Guidance>,
+    /// With `guidance`: render at half size, then upsample and refine.
+    pub refine: Option<Refine>,
+    /// A LoRA added to the transformer, and its strength.
+    pub lora: Option<(PathBuf, f64)>,
+    /// ID-LoRA: a clip of the speaker's voice. The clip's speech (the words in
+    /// `transcript`) is generated with the picture, in this voice: its latent
+    /// leads the audio as clean tokens at negative times.
+    pub reference_voice: Option<PathBuf>,
+    /// Lip-synced speech with ID-LoRA: the line (the speech made first, or the
+    /// given `audio_file`) sets the clip's length and, without a
+    /// `reference_voice`, is the voice too. The clip's own speech is generated
+    /// with the picture, so the line is not followed as a soundtrack.
+    pub identity: bool,
+    /// ID-LoRA's identity guidance: each step also runs without the reference
+    /// voice, and the clip's audio moves away from that result, toward the
+    /// voice by `identity_guidance` times the difference (ID-LoRA uses 3 with
+    /// the dev model). Off by default: on the distilled models it crackles,
+    /// and the reference voice alone carries the speaker.
+    pub identity_guidance: f64,
+    /// The H.264 CRF the start and end images are re-compressed at (see
+    /// `image_crf`); the model generation's default when not given.
+    pub image_crf: Option<u32>,
     pub output: PathBuf,
     pub prompt: String,
     pub image: Option<PathBuf>,
@@ -120,7 +323,44 @@ impl Request {
                 Some(v @ Json::Obj(_)) => Some(v.clone()),
                 Some(_) => return Err("speech must be a speech request object".into()),
             },
-            a2v_guidance: j.get("a2v_guidance").and_then(Json::as_f64).unwrap_or(3.0),
+            // The reference's 3 with guided (dev) sampling; off for distilled models.
+            a2v_guidance: j.get("a2v_guidance").and_then(Json::as_f64).unwrap_or(if j.get("guidance").is_some_and(|g| !matches!(g, Json::Null)) { 3.0 } else { 1.0 }),
+            guidance: match j.get("guidance") {
+                None | Some(Json::Null) => None,
+                Some(g) => Some(Guidance::parse(g)?),
+            },
+            lora: match j.get("lora") {
+                None | Some(Json::Null) => None,
+                Some(Json::Str(p)) => Some((PathBuf::from(p), 1.0)),
+                Some(l) => Some((
+                    l.get("path").and_then(Json::as_str).filter(|s| !s.trim().is_empty()).map(PathBuf::from).ok_or("lora.path must be a local path")?,
+                    l.get("strength").and_then(Json::as_f64).unwrap_or(1.0),
+                )),
+            },
+            identity_guidance: j.get("identity_guidance").and_then(Json::as_f64).unwrap_or(0.0),
+            image_crf: j.get("image_crf").and_then(Json::as_i64).map(|v| v.clamp(0, 51) as u32),
+            identity: j.get("identity").and_then(Json::as_bool).unwrap_or(false),
+            soundtrack_mode: match j.get("soundtrack_mode").and_then(Json::as_str).unwrap_or("inpaint") {
+                m @ ("frozen" | "inpaint") => m.to_owned(),
+                _ => return Err("soundtrack_mode must be frozen or inpaint".into()),
+            },
+            reference_voice: match j.get("reference_voice") {
+                None | Some(Json::Null) => None,
+                Some(v) => Some(v.as_str().filter(|s| !s.trim().is_empty()).ok_or("reference_voice must be a local path")?.into()),
+            },
+            refine: match j.get("refine") {
+                None | Some(Json::Null) => None,
+                Some(f) => {
+                    let path = |k: &str| {
+                        f.get(k)
+                            .and_then(Json::as_str)
+                            .filter(|s| !s.trim().is_empty())
+                            .map(PathBuf::from)
+                            .ok_or_else(|| format!("refine.{k} must be a local path"))
+                    };
+                    Some(Refine { transformer: path("transformer")?, upsampler: path("upsampler")? })
+                }
+            },
             frames_from_audio: j.get("frames").is_none() && (j.get("audio_file").is_some_and(|v| !matches!(v, Json::Null)) || j.get("speech").is_some_and(|v| !matches!(v, Json::Null))),
             output: s("output_dir")?.into(),
             prompt: s("prompt")?,
@@ -269,7 +509,15 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
     // The words, in the prompt as LTX prompts carry dialogue: without them the
     // picture barely takes lip movement from a soundtrack alone.
     let words = r.speech.as_ref().and_then(|s| s.get("text")).and_then(Json::as_str).map(str::trim).map(str::to_owned).or_else(|| r.transcript.clone());
-    if let Some(w) = words.filter(|w| !w.is_empty() && !r.prompt.contains(w.as_str())) {
+    if r.reference_voice.is_some() || r.identity {
+        // ID-LoRA's prompt: what is seen, what is said, what is heard.
+        if !r.prompt.contains("[SPEECH]") {
+            // Quoted words, and the voice speaking to the viewer with no music
+            // ("unscored"), as the LTX 2.5 IC-LoRA template writes it.
+            let said = words.as_deref().filter(|w| !w.is_empty()).map(|w| format!(" [SPEECH]: \"{}\"", w.trim().replace('"', "'"))).unwrap_or_default();
+            owned.prompt = format!("[VISUAL]: {}{said} [SOUNDS]: Clear speech, spoken directly to the viewer. Unscored.", r.prompt.trim());
+        }
+    } else if let Some(w) = words.filter(|w| !w.is_empty() && !r.prompt.contains(w.as_str())) {
         owned.prompt = format!("{} They say: \"{}\"", r.prompt.trim_end(), w.replace('"', "'"));
     }
     let speech_started = Instant::now();
@@ -292,6 +540,14 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
         }
         None => None,
     };
+    // Lip-synced speech: the line has set the length; it is the voice unless a
+    // saved voice's sample is given, and the clip's speech is generated.
+    let voice_source = if owned.identity {
+        owned.reference_voice.clone().or_else(|| owned.audio_file.clone())
+    } else {
+        owned.reference_voice.clone()
+    };
+    let soundtrack_in = if owned.identity { None } else { soundtrack_in };
     owned.validate().map_err(candle_core::Error::Msg)?;
     let r = &owned;
     let dev = inference_device(r.device)?;
@@ -301,6 +557,10 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
         r.ram_bytes
     };
     let mut store = Store::open(&r.transformer, ram)?;
+    if let Some((path, strength)) = &r.lora {
+        let n = store.add_lora(path, *strength)?;
+        report(event("lora_applied", n, n));
+    }
     let expected_version = if r.model == "ltx-2.5" { "2.5." } else { "2.3." };
     if !store
         .index
@@ -391,6 +651,28 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
         }
     }
     let image_started = Instant::now();
+    // Two stages: the first renders at half the size.
+    let two_stage = r.guidance.is_some() && r.refine.is_some();
+    let stage_size = if two_stage { (r.width / 2, r.height / 2) } else { (r.width, r.height) };
+    let encode_endpoints = |size: (usize, usize), report: &mut dyn FnMut(Json)| -> Result<(Option<Tensor>, Option<Tensor>)> {
+        if r.image.is_none() && r.end_image.is_none() {
+            return Ok((None, None));
+        }
+        let encoder = vae::LtxVideoEncoder::load(&r.vae, vae::LtxVaeConfig::ltx_2_3_22b(), &dev, DType::BF16)?;
+        let mut encode = |path: &Option<PathBuf>, stage: &str| -> Result<Option<Tensor>> {
+            path.as_ref()
+                .map(|path| {
+                    report(event(stage, 0, 1));
+                    encode_image(path, size, &encoder, &dev, &r.ffmpeg, image_crf(r))
+                })
+                .transpose()
+        };
+        let start = encode(&r.image, "encoding_starting_image")?;
+        let end = encode(&r.end_image, "encoding_ending_image")?;
+        drop(encoder);
+        dev.synchronize()?;
+        Ok((start, end))
+    };
     let (starting_latent, ending_latent) = if r.image.is_some() || r.end_image.is_some() {
         let encoder = vae::LtxVideoEncoder::load(
             &r.vae,
@@ -402,7 +684,7 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
             path.as_ref()
                 .map(|path| {
                     report(event(stage, 0, 1));
-                    encode_image(path, r, &encoder, &dev)
+                    encode_image(path, stage_size, &encoder, &dev, &r.ffmpeg, image_crf(r))
                 })
                 .transpose()
         };
@@ -417,6 +699,24 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
     let image_seconds = image_started.elapsed().as_secs_f64();
     // The given soundtrack as the transformer's audio latent, held fixed.
     let audio_frames = audio_latent_frames(r.frames, r.fps);
+    let mut reference_loudness = None;
+    // ID-LoRA's reference voice: its whole latent, clean, before the clip.
+    let reference_voice = match (&voice_source, &r.audio_vae) {
+        (Some(path), Some(vae)) => {
+            report(event("encoding_reference_voice", 0, 1));
+            let (channels, rate) = read_audio(&r.ffmpeg, path)?;
+            reference_loudness = speech_loudness(&channels[0], rate);
+            let seconds = (channels[0].len() as f64 / rate as f64).min(MAX_REFERENCE_SECONDS);
+            let frames = (seconds * audio::LATENT_RATE).round().max(1.) as usize;
+            let encoder = audio::AudioEncoder::load(vae, &dev)?;
+            let latent = encoder.latent(&channels, rate, frames, &dev)?;
+            drop(encoder);
+            Some(latent)
+        }
+        (Some(_), None) => candle_core::bail!("a reference voice needs the model's audio VAE"),
+        _ => None,
+    };
+    let ref_tokens = reference_voice.as_ref().map(|t| t.dim(1)).transpose()?.unwrap_or(0);
     let conditioning_audio = match (&soundtrack_in, &r.audio_vae) {
         (Some((channels, rate)), Some(path)) => {
             report(event("encoding_soundtrack", 0, 1));
@@ -475,6 +775,36 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
         }
         (context, audio_context)
     };
+    // The negative prompt for guided sampling: video only (the audio stream
+    // keeps the prompt's context in that pass, as the reference does).
+    let negative = match &r.guidance {
+        Some(g) if g.cfg != 1. => {
+            let neg = Request { prompt: g.negative_prompt.clone(), audio: false, ..r.clone() };
+            let neg_cache = cache::PromptCache::new(&neg);
+            match neg_cache.as_ref().and_then(|c| c.load(&dev)) {
+                Some(c) => Some(c),
+                None => {
+                    report(event("encoding_negative_prompt", 0, 48));
+                    let (features, _) = text::encode(
+                        &r.text_encoder,
+                        r.tokenizer.as_deref(),
+                        &mut store,
+                        &neg.prompt,
+                        r.model == "ltx-2.5",
+                        false,
+                        &dev,
+                        |n| report(event("encoding_negative_prompt", n, 48)),
+                    )?;
+                    let c = transformer::connector(&mut store, &features, "video_embeddings_connector", &dev, |_| {})?;
+                    if let Some(cache) = &neg_cache {
+                        let _ = cache.save(&c);
+                    }
+                    Some(c)
+                }
+            }
+        }
+        _ => None,
+    };
     let text_seconds = encode_started.elapsed().as_secs_f64();
     let gpu_budget = if r.memory == "ram" || r.memory == "ssd" {
         0
@@ -490,11 +820,17 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
             .mem_get_info()
             .map_err(candle_core::Error::wrap)?
             .0 as u64;
-        // Leave room for one streamed block, global projections, and activations.
-        gpu_budget.min(free.saturating_sub(6 * GIB))
+        // Leave room for global projections, activations and a streamed block,
+        // with a margin: on Windows a card filled to the brim pages device
+        // memory to system RAM, where kernels crawl into the driver's watchdog.
+        gpu_budget.min(free.saturating_sub(8 * GIB))
     };
     let mut model = transformer::Transformer::new(store, &dev, gpu_budget, r.memory == "gpu", r.audio)?;
-    let (f, h, w) = ((r.frames - 1) / 8 + 1, r.height / 32, r.width / 32);
+    let int8_weights = model.int8;
+    if int8_weights {
+        report(event("int8_weights", 1, 1));
+    }
+    let (f, mut h, mut w) = ((r.frames - 1) / 8 + 1, stage_size.1 / 32, stage_size.0 / 32);
     let rope = transformer::Rope::video_with_end(f, h, w, r.fps, ending_latent.is_some(), &dev)?;
     let noise = crate::pipeline::noise(r.seed, f * h * w * 128);
     let mut latent = Tensor::from_vec(noise, (1, f * h * w, 128), &dev)?;
@@ -505,73 +841,248 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
     // The soundtrack: its own latent, denoised jointly on the same schedule,
     // or the given one, frozen (sigma 0) while the picture follows it.
     let audio_ropes = if r.audio {
+        // A reference voice sits before the clip: its spans end one latent
+        // (40 ms) before zero, as ID-LoRA was trained.
+        let mut spans = transformer::audio_spans(ref_tokens);
+        let shift = spans.last().map_or(0., |s| s.1) + 4. * 0.01;
+        spans.iter_mut().for_each(|s| *s = (s.0 - shift, s.1 - shift));
+        spans.extend(transformer::audio_spans(audio_frames));
         Some((
-            transformer::Rope::audio(audio_frames, &dev)?,
+            transformer::Rope::audio_spans(&spans, &dev)?,
             transformer::Rope::video_cross(f, h, w, r.fps, ending_latent.is_some(), &dev)?,
         ))
     } else {
         None
     };
+    let identity = if ref_tokens > 0 && r.identity_guidance > 0. {
+        Some(transformer::Rope::audio(audio_frames, &dev)?)
+    } else {
+        None
+    };
     let frozen_audio = conditioning_audio.is_some();
-    let mut audio_latent = if let Some(latent) = conditioning_audio {
-        Some(latent)
-    } else if r.audio {
+    // Inpainting: one fixed noise the soundtrack is mixed with at each step.
+    let inpaint_noise = if frozen_audio && r.soundtrack_mode == "inpaint" {
         let noise = crate::pipeline::noise(r.seed.wrapping_add(AUDIO_SEED_OFFSET), audio_frames * 128);
         Some(Tensor::from_vec(noise, (1, audio_frames, 128), &dev)?)
     } else {
         None
     };
+    let mut audio_latent = if let Some(latent) = conditioning_audio {
+        Some(latent)
+    } else if r.audio {
+        let noise = crate::pipeline::noise(r.seed.wrapping_add(AUDIO_SEED_OFFSET), audio_frames * 128);
+        let noise = Tensor::from_vec(noise, (1, audio_frames, 128), &dev)?;
+        Some(match &reference_voice {
+            Some(voice) => Tensor::cat(&[voice, &noise], 1)?,
+            None => noise,
+        })
+    } else {
+        None
+    };
     let denoise_started = Instant::now();
+    let sigmas = match &r.guidance {
+        Some(g) => guided_sigmas(g.steps),
+        None => SIGMAS.to_vec(),
+    };
+    let steps = sigmas.len() - 1;
     // Following a soundtrack, each step also runs with the audio-video
     // cross-attention skipped, and the picture moves away from that result.
-    let guided = frozen_audio && r.a2v_guidance > 1.0;
-    let passes = if guided { 2 } else { 1 };
-    for step in 0..8 {
-        let audio_bf16 = audio_latent.as_ref().map(|a| a.to_dtype(DType::BF16)).transpose()?;
+    // Also with a reference voice: ID-LoRA's "bimodal" guidance (asked for).
+    let modality = if frozen_audio || ref_tokens > 0 { r.a2v_guidance } else { 1. };
+    let cfg = r.guidance.as_ref().map_or(1., |g| g.cfg);
+    let stg = r.guidance.as_ref().map_or(0., |g| g.stg);
+    let passes = 1 + usize::from(modality > 1.) + usize::from(negative.is_some() && cfg != 1.) + usize::from(stg != 0.) + usize::from(identity.is_some());
+    for step in 0..steps {
+        let sigma = sigmas[step];
+        let audio_bf16 = match (&audio_latent, &inpaint_noise) {
+            // The soundtrack noised to this step's sigma, like a generated one.
+            (Some(clean), Some(noise)) => Some(((clean * (1. - sigma))? + (noise * sigma)?)?.to_dtype(DType::BF16)?),
+            _ => audio_latent.as_ref().map(|a| a.to_dtype(DType::BF16)).transpose()?,
+        };
         let video_bf16 = latent.to_dtype(DType::BF16)?;
-        let mut run = |isolated: bool, pass: usize| {
+        let mut pass = 0;
+        // Without the reference voice: only the clip's own audio tokens.
+        let target_bf16 = match (&audio_bf16, &identity) {
+            (Some(a), Some(_)) => Some(a.narrow(1, ref_tokens, audio_frames)?),
+            _ => None,
+        };
+        let mut run = |context: &Tensor, isolated: bool, perturb: Option<usize>, without_reference: bool| {
             let audio_input = match (&audio_bf16, &audio_context, &audio_ropes) {
-                (Some(latent), Some(context), Some((rope, video_cross))) => Some(transformer::AudioInput {
-                    latent,
-                    context,
-                    rope,
-                    video_cross,
-                    sigma: if frozen_audio { 0. } else { SIGMAS[step] },
-                    isolated,
-                }),
+                (Some(latent), Some(context), Some((rope, video_cross))) => {
+                    let (latent, rope, clean_tokens) = match (without_reference, &target_bf16, &identity) {
+                        (true, Some(target), Some(rope)) => (target, rope, 0),
+                        _ => (latent, rope, ref_tokens),
+                    };
+                    Some(transformer::AudioInput {
+                        latent,
+                        context,
+                        rope,
+                        video_cross,
+                        sigma: if frozen_audio && inpaint_noise.is_none() { 0. } else { sigma },
+                        isolated,
+                        clean_tokens,
+                    })
+                }
                 _ => None,
             };
-            model.forward(
+            let at = pass;
+            pass += 1;
+            model.skip_video_self_attn = perturb;
+            let out = model.forward(
                 &video_bf16,
-                &context,
-                SIGMAS[step],
+                context,
+                sigma,
                 &rope,
                 if starting_latent.is_some() { h * w } else { 0 },
                 if ending_latent.is_some() { h * w } else { 0 },
                 audio_input,
-                |n| report(event("video_denoising", (step * passes + pass) * 48 + n, 8 * passes * 48)),
-            )
+                |n| report(event("video_denoising", (step * passes + at) * 48 + n, steps * passes * 48)),
+            );
+            model.skip_video_self_attn = None;
+            out
         };
-        let (mut velocity, audio_velocity) = run(false, 0)?;
-        if guided {
-            let (isolated, _) = run(true, 1)?;
+        let (mut velocity, mut audio_velocity) = run(&context, false, None, false)?;
+        // Identity guidance: the clip's audio away from what it would be
+        // without the reference voice (ID-LoRA's, on the audio stream only).
+        if identity.is_some() {
+            let (_, without) = run(&context, false, None, true)?;
+            if let (Some(with), Some(without)) = (audio_velocity.as_ref(), without) {
+                let with = with.to_dtype(DType::F32)?;
+                let target = with.narrow(1, ref_tokens, audio_frames)?;
+                let guided = (&target + ((&target - without.to_dtype(DType::F32)?)? * r.identity_guidance)?)?;
+                // Rescaled as the reference's guider does (0.7), on the denoised
+                // audio: the guidance alone inflates its level until it clips.
+                let a = audio_latent.as_ref().ok_or_else(|| candle_core::Error::Msg("audio latent".into()))?.narrow(1, ref_tokens, audio_frames)?;
+                let x0 = |v: &Tensor| -> Result<Tensor> { &a - (v * sigma)? };
+                let (plain, pushed) = (x0(&target)?, x0(&guided)?);
+                let factor = 0.7 * std_all(&plain)? / std_all(&pushed)?.max(1e-12) + 0.3;
+                let guided = ((&a - (pushed * factor)?)? / sigma)?;
+                audio_velocity = Some(Tensor::cat(&[&with.narrow(1, 0, ref_tokens)?, &guided], 1)?);
+            }
+        }
+        if let Some(g) = &r.guidance {
+            // The reference guides the denoised prediction, x0 = x - sigma v;
+            // its rescale needs that space.
+            let x0 = |v: &Tensor| -> Result<Tensor> { &latent - (v.to_dtype(DType::F32)? * sigma)? };
+            let cond = x0(&velocity)?;
+            let mut pred = cond.clone();
+            if let Some(negative) = negative.as_ref().filter(|_| g.cfg != 1.) {
+                let (uncond, _) = run(negative, false, None, false)?;
+                pred = (pred + ((&cond - x0(&uncond)?)? * (g.cfg - 1.))?)?;
+            }
+            if g.stg != 0. {
+                let (perturbed, _) = run(&context, false, Some(g.stg_block), false)?;
+                pred = (pred + ((&cond - x0(&perturbed)?)? * g.stg)?)?;
+            }
+            if modality > 1. {
+                let (isolated, _) = run(&context, true, None, false)?;
+                pred = (pred + ((&cond - x0(&isolated)?)? * (modality - 1.))?)?;
+            }
+            if g.rescale != 0. {
+                let factor = std_all(&cond)? / std_all(&pred)?.max(1e-12);
+                pred = (pred * (g.rescale * factor + (1. - g.rescale)))?;
+            }
+            velocity = ((&latent - pred)? / sigma)?;
+        } else if modality > 1. {
+            let (isolated, _) = run(&context, true, None, false)?;
             let cond = velocity.to_dtype(DType::F32)?;
             let delta = (&cond - isolated.to_dtype(DType::F32)?)?;
-            velocity = (cond + (delta * (r.a2v_guidance - 1.0))?)?;
+            velocity = (cond + (delta * (modality - 1.0))?)?;
         }
-        let dt = SIGMAS[step + 1] - SIGMAS[step];
+        let dt = sigmas[step + 1] - sigma;
         latent = (latent + (velocity.to_dtype(DType::F32)? * dt)?)?;
         latent = condition_endpoints(latent, starting_latent.as_ref(), ending_latent.as_ref())?;
         if let (Some(a), Some(v), false) = (audio_latent.as_mut(), audio_velocity, frozen_audio) {
             *a = (&*a + (v.to_dtype(DType::F32)? * dt)?)?;
+            // The reference voice stays as it was given.
+            if let Some(voice) = &reference_voice {
+                *a = Tensor::cat(&[voice, &a.narrow(1, ref_tokens, audio_frames)?], 1)?;
+            }
         }
+    }
+    // Only the clip's own audio is decoded.
+    if ref_tokens > 0 {
+        audio_latent = audio_latent.map(|a| a.narrow(1, ref_tokens, audio_frames)).transpose()?;
     }
     // Appended end-keyframe tokens guide attention but are not part of the decoded clip.
     latent = latent.narrow(1, 0, f * h * w)?.contiguous()?;
-    let (gpu, host, disk) = model.stats();
+    let (mut gpu, mut host, mut disk) = model.stats();
     dev.synchronize()?;
-    let denoise_seconds = denoise_started.elapsed().as_secs_f64();
     drop(model);
+    if let (true, Some(refine)) = (two_stage, &r.refine) {
+        // Double the latent: un-normalized through the upsampler, then back.
+        report(event("upsampling_latent", 0, 1));
+        let stats = vae::PerChannelStatistics::load_file(&r.vae, &dev)?;
+        let up = upsampler::Upsampler::load(&refine.upsampler, &dev)?;
+        let x = latent.reshape((1, f, h, w, 128))?.permute((0, 4, 1, 2, 3))?.contiguous()?;
+        let x = stats.normalize(&up.forward(&stats.un_normalize(&x)?)?)?;
+        drop(up);
+        h *= 2;
+        w *= 2;
+        let upscaled = x.permute((0, 2, 3, 4, 1))?.contiguous()?.reshape((1, f * h * w, 128))?;
+        // The endpoints again, at the full size.
+        let (start, end) = encode_endpoints((r.width, r.height), &mut report)?;
+        let rope = transformer::Rope::video_with_end(f, h, w, r.fps, end.is_some(), &dev)?;
+        let video_cross = if r.audio { Some(transformer::Rope::video_cross(f, h, w, r.fps, end.is_some(), &dev)?) } else { None };
+        let audio_rope = if r.audio { Some(transformer::Rope::audio(audio_frames, &dev)?) } else { None };
+        // Re-noised to the first refine sigma (a fresh draw from the seed).
+        let s0 = REFINE_SIGMAS[0];
+        let noise = crate::pipeline::noise(r.seed.wrapping_add(REFINE_SEED_OFFSET), f * h * w * 128);
+        let noise = Tensor::from_vec(noise, (1, f * h * w, 128), &dev)?;
+        latent = ((upscaled * (1. - s0))? + (noise * s0)?)?;
+        if let Some(end) = &end {
+            latent = Tensor::cat(&[&latent, end], 1)?;
+        }
+        latent = condition_endpoints(latent, start.as_ref(), end.as_ref())?;
+        report(event("loading_refine_model", 0, 1));
+        let ram = if r.memory == "ssd" || r.memory == "gpu" { 0 } else { r.ram_bytes };
+        let mut store = Store::open(&refine.transformer, ram)?;
+        // The prompt through the refining transformer's own text connectors:
+        // a fine-tune (Sulphur, or one of LTX 2.5) may have its own.
+        let (context, audio_context) = refine_contexts(r, &refine.transformer, &mut store, &dev, &mut report)?;
+        let budget = if r.memory == "ram" || r.memory == "ssd" { 0 } else { r.vram_bytes };
+        #[cfg(feature = "cuda")]
+        let budget = {
+            let free = dev.as_cuda_device()?.cuda_stream().context().mem_get_info().map_err(candle_core::Error::wrap)?.0 as u64;
+            budget.min(free.saturating_sub(8 * GIB))
+        };
+        let mut model = transformer::Transformer::new(store, &dev, budget, r.memory == "gpu", r.audio)?;
+        let audio_bf16 = audio_latent.as_ref().map(|a| a.to_dtype(DType::BF16)).transpose()?;
+        let refine_steps = REFINE_SIGMAS.len() - 1;
+        for step in 0..refine_steps {
+            let sigma = REFINE_SIGMAS[step];
+            let audio_input = match (&audio_bf16, &audio_context, &audio_rope, &video_cross) {
+                (Some(latent), Some(context), Some(rope), Some(video_cross)) => Some(transformer::AudioInput {
+                    latent,
+                    context,
+                    rope,
+                    video_cross,
+                    sigma: 0.,
+                    isolated: false,
+                    clean_tokens: 0,
+                }),
+                _ => None,
+            };
+            let (velocity, _) = model.forward(
+                &latent.to_dtype(DType::BF16)?,
+                &context,
+                sigma,
+                &rope,
+                if start.is_some() { h * w } else { 0 },
+                if end.is_some() { h * w } else { 0 },
+                audio_input,
+                |n| report(event("refining_video", step * 48 + n, refine_steps * 48)),
+            )?;
+            latent = (latent + (velocity.to_dtype(DType::F32)? * (REFINE_SIGMAS[step + 1] - sigma))?)?;
+            latent = condition_endpoints(latent, start.as_ref(), end.as_ref())?;
+        }
+        latent = latent.narrow(1, 0, f * h * w)?.contiguous()?;
+        let (g2, h2, d2) = model.stats();
+        (gpu, host, disk) = (gpu + g2, host + h2, disk + d2);
+        dev.synchronize()?;
+        drop(model);
+    }
+    let denoise_seconds = denoise_started.elapsed().as_secs_f64();
     drop(context);
     drop(audio_context);
     drop(audio_ropes);
@@ -599,7 +1110,7 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
             .mem_get_info()
             .map_err(candle_core::Error::wrap)?
             .0;
-        pixel_budget.min(free.saturating_sub(2usize << 30) / 512)
+        pixel_budget.min(free.saturating_sub(4usize << 30) / 512)
     };
     let pixels = if r.frames * r.height * r.width <= pixel_budget {
         decoder.decode(&latent)?.to_device(&Device::Cpu)?
@@ -639,10 +1150,11 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
             let have = wave.dim(2)?;
             let wave = if have >= samples { wave.narrow(2, 0, samples)? } else { wave.pad_with_zeros(2, 0, samples - have)? };
             // Interleaved stereo, as FFmpeg's f32le input wants it.
-            let interleaved = wave.squeeze(0)?.transpose(0, 1)?.contiguous()?.flatten_all()?.to_vec1::<f32>()?;
+            let mut interleaved = wave.squeeze(0)?.transpose(0, 1)?.contiguous()?.flatten_all()?.to_vec1::<f32>()?;
             if interleaved.iter().any(|x| !x.is_finite()) {
                 candle_core::bail!("nonfinite decoded audio samples");
             }
+            set_level(&mut interleaved, rate, reference_loudness);
             Some((interleaved, rate))
         }
         _ => None,
@@ -804,9 +1316,18 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
             Json::Num(export_started.elapsed().as_secs_f64()),
         ),
         ("fps", Json::Int(r.fps as i64)),
-        ("steps", Json::Int(8)),
+        ("steps", Json::Int(steps as i64)),
+        ("guided", Json::Bool(r.guidance.is_some())),
+        ("int8_weights", Json::Bool(int8_weights)),
+        ("two_stage", Json::Bool(two_stage)),
         ("audio", Json::Bool(soundtrack.is_some())),
         ("followed_soundtrack", Json::Bool(soundtrack_in.is_some())),
+        ("soundtrack_mode", if soundtrack_in.is_some() { Json::str(&r.soundtrack_mode) } else { Json::Null }),
+        ("reference_voice_tokens", Json::Int(ref_tokens as i64)),
+        ("lip_synced_speech", Json::Bool(ref_tokens > 0)),
+        ("image_crf", if r.image.is_some() || r.end_image.is_some() { Json::Int(image_crf(r) as i64) } else { Json::Null }),
+        ("identity_guidance", if ref_tokens > 0 { Json::Num(r.identity_guidance) } else { Json::Null }),
+        ("lora", r.lora.as_ref().map_or(Json::Null, |(p, _)| Json::str(p.to_string_lossy()))),
         ("a2v_guidance", if soundtrack_in.is_some() { Json::Num(r.a2v_guidance) } else { Json::Null }),
         (
             "audio_file",
@@ -828,11 +1349,13 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
     std::fs::write(path.with_extension("json"), result.to_json())?;
     Ok(result)
 }
-/// The clip length for a soundtrack of `seconds`: whole frames at `fps`,
-/// snapped down to 8k+1 as the reference does, within 9..=121.
+/// The clip length for a soundtrack of `seconds`: enough frames at `fps` to
+/// hold all of it, snapped up to 8k+1 (the reference snaps down, which cuts
+/// the last words off), within 9..=121. The soundtrack is padded with silence
+/// to the clip's length.
 fn frames_for_audio(seconds: f64, fps: usize) -> usize {
-    let raw = ((seconds * fps as f64) as usize).clamp(9, 121);
-    (raw - 1) / 8 * 8 + 1
+    let raw = ((seconds * fps as f64 - 1e-6).ceil().max(0.) as usize).clamp(9, 121);
+    ((raw - 1).div_ceil(8) * 8 + 1).min(121)
 }
 
 /// Decode any audio FFmpeg reads to stereo F32 at its own sample rate (mono
@@ -865,6 +1388,8 @@ fn read_audio(ffmpeg: &std::path::Path, path: &std::path::Path) -> Result<([Vec<
 
 /// Seeds the audio noise apart from the video noise drawn with the same seed.
 const AUDIO_SEED_OFFSET: u64 = 0x9e37_79b9_7f4a_7c15;
+/// Stage two's noise, drawn apart from stage one's.
+const REFINE_SEED_OFFSET: u64 = 0xc2b2_ae3d_27d4_eb4f;
 
 /// Audio latent frames for a clip: 25 per second of video, rounded half to
 /// even as the reference does.
@@ -872,11 +1397,56 @@ fn audio_latent_frames(frames: usize, fps: usize) -> usize {
     (frames as f64 / fps as f64 * audio::LATENT_RATE).round_ties_even().max(1.) as usize
 }
 
+/// The H.264 quality an image is re-compressed at before it conditions a
+/// clip, as the reference does: the models were trained on video frames, and a
+/// pristine still tends to stay still. 33 for the LTX 2.3 generation (Sulphur
+/// is one), 18 from 2.4 on; 0 leaves the image as it is.
+fn image_crf(r: &Request) -> u32 {
+    r.image_crf.unwrap_or(if r.model == "ltx-2.5" { 18 } else { 33 })
+}
+
+/// An image through one H.264 frame at `crf` and back (FFmpeg, libx264,
+/// veryfast, 4:2:0), at its own size cut to even sides.
+fn recompress(ffmpeg: &std::path::Path, image: image::RgbImage, crf: u32) -> Result<image::RgbImage> {
+    use std::io::Write;
+    let (w, h) = (image.width() / 2 * 2, image.height() / 2 * 2);
+    if crf == 0 || w < 2 || h < 2 {
+        return Ok(image);
+    }
+    let image = image::imageops::crop_imm(&image, 0, 0, w, h).to_image();
+    let run = |args: &[&str], input: &[u8]| -> Result<Vec<u8>> {
+        let mut child = command(ffmpeg)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()?;
+        let mut stdin = child.stdin.take().ok_or_else(|| candle_core::Error::Msg("FFmpeg stdin".into()))?;
+        let input = input.to_vec();
+        let writer = std::thread::spawn(move || stdin.write_all(&input));
+        let out = child.wait_with_output()?;
+        writer.join().map_err(|_| candle_core::Error::Msg("FFmpeg writer".into()))??;
+        if !out.status.success() || out.stdout.is_empty() {
+            candle_core::bail!("FFmpeg could not re-compress the conditioning image");
+        }
+        Ok(out.stdout)
+    };
+    let size = format!("{w}x{h}");
+    let crf = crf.to_string();
+    let h264 = run(&["-hide_banner", "-nostdin", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", &size, "-i", "-", "-frames:v", "1",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", &crf, "-pix_fmt", "yuv420p", "-f", "h264", "-"], image.as_raw())?;
+    let rgb = run(&["-hide_banner", "-f", "h264", "-i", "-", "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"], &h264)?;
+    image::RgbImage::from_raw(w, h, rgb.get(..(w * h * 3) as usize).map(<[u8]>::to_vec).unwrap_or_default())
+        .ok_or_else(|| candle_core::Error::Msg("FFmpeg returned a short frame".into()))
+}
+
 fn encode_image(
     path: &std::path::Path,
-    r: &Request,
+    (width, height): (usize, usize),
     encoder: &vae::LtxVideoEncoder,
     dev: &Device,
+    ffmpeg: &std::path::Path,
+    crf: u32,
 ) -> Result<Tensor> {
     let mut reader = image::ImageReader::open(path)?
         .with_guessed_format()
@@ -886,12 +1456,11 @@ fn encode_image(
     limits.max_image_height = Some(16384);
     limits.max_alloc = Some(256 * 1024 * 1024);
     reader.limits(limits);
-    let pixels = reader
-        .decode()
-        .map_err(candle_core::Error::wrap)?
+    let decoded = reader.decode().map_err(candle_core::Error::wrap)?.to_rgb8();
+    let pixels = image::DynamicImage::ImageRgb8(recompress(ffmpeg, decoded, crf)?)
         .resize_to_fill(
-            r.width as u32,
-            r.height as u32,
+            width as u32,
+            height as u32,
             image::imageops::FilterType::Lanczos3,
         )
         .to_rgb8();
@@ -900,7 +1469,7 @@ fn encode_image(
         .iter()
         .map(|&v| v as f32 / 127.5 - 1.)
         .collect();
-    let pixels = Tensor::from_vec(values, (1, 1, r.height, r.width, 3), &dev)?
+    let pixels = Tensor::from_vec(values, (1, 1, height, width, 3), &dev)?
         .permute((0, 4, 1, 2, 3))?
         .contiguous()?
         .to_dtype(DType::BF16)?;
@@ -908,7 +1477,7 @@ fn encode_image(
         .encode_means(&pixels)?
         .permute((0, 2, 3, 4, 1))?
         .contiguous()?
-        .reshape((1, r.height / 32 * (r.width / 32), 128))?
+        .reshape((1, height / 32 * (width / 32), 128))?
         .to_dtype(DType::F32)?;
     Ok(latent)
 }
@@ -958,8 +1527,39 @@ mod tests {
         Ok(())
     }
     #[test]
+    fn soundtrack_level_matches_the_voice_and_never_clips() {
+        let rate = 1000;
+        // A loud tone (peak 1.4, RMS near 1) against a reference voice at RMS 0.4.
+        let tone: Vec<f32> = (0..2 * rate).flat_map(|i| { let v = 1.4 * (i as f32 * 0.3).sin(); [v, v] }).collect();
+        let mut matched = tone.clone();
+        set_level(&mut matched, rate, Some(0.4));
+        let left: Vec<f32> = matched.iter().step_by(2).copied().collect();
+        assert!((speech_loudness(&left, rate).unwrap() - 0.4).abs() < 0.02);
+        let mut limited = tone;
+        set_level(&mut limited, rate, None);
+        assert!(limited.iter().all(|x| x.abs() <= 0.967));
+        assert_eq!(speech_loudness(&[0.; 100], rate), None);
+    }
+    #[test]
+    fn guided_schedule_matches_the_reference() {
+        let s = guided_sigmas(30);
+        assert_eq!(s.len(), 31);
+        assert_eq!(s[0], 1.);
+        assert!((s[29] - 0.1).abs() < 1e-9);
+        assert_eq!(s[30], 0.);
+        assert!(s.windows(2).all(|w| w[0] > w[1]));
+        // Before stretching, t = 0.5 maps to e^2.05 / (e^2.05 + 1).
+        let shifted = 2.05f64.exp() / (2.05f64.exp() + 1.);
+        let last = 2.05f64.exp() / (2.05f64.exp() + 29.);
+        let scale = (1. - last) / 0.9;
+        assert!((s[15] - (1. - (1. - shifted) / scale)).abs() < 1e-12);
+    }
+    #[test]
     fn clips_follow_the_soundtrack_length() {
-        assert_eq!(frames_for_audio(3.2, 24), 73);
+        assert_eq!(frames_for_audio(3.2, 24), 81);
+        // "After thirty years?": 1.68 s needs 40.3 frames, so 41, not 33.
+        assert_eq!(frames_for_audio(1.68, 24), 41);
+        assert_eq!(frames_for_audio(1.0, 24), 25);
         assert_eq!(frames_for_audio(0.2, 24), 9);
         assert_eq!(frames_for_audio(30., 24), 121);
         let base = |extra: &str| {

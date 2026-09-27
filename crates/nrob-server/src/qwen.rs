@@ -139,6 +139,15 @@ pub fn normalize(text: &str, tools: &[Json]) -> Result<String, String> {
     Ok(out)
 }
 
+/// The start of a rejected tool call, as the model wrote it, for the error.
+fn call_excerpt(raw: &str) -> String {
+    let from = raw.find("<tool_call").unwrap_or(0);
+    let call = &raw[from..];
+    let mut end = call.len().min(300);
+    while !call.is_char_boundary(end) { end -= 1; }
+    format!("{:?}{}", &call[..end], if end < call.len() { "…" } else { "" })
+}
+
 /// Stream prose and reasoning as tokens arrive. Native tool XML stays buffered
 /// until the existing strict parser validates the complete call. A token may
 /// end halfway through a UTF-8 character or the opening tool tag.
@@ -353,8 +362,10 @@ impl QwenEngine {
             self.covered.push(next as u64);
         }
         let raw = tok.decode(&generated);
+        // The client is told what the model wrote, so a rejected call can be read
+        // and fixed; the server log never holds it.
         let text = stream.push(&raw, &job.tools, true)
-            .map_err(|e| format!("tool_contract_error: {e}; no tool from this batch was executed"))?;
+            .map_err(|e| format!("tool_contract_error: {e}; no tool from this batch was executed. The model wrote: {}", call_excerpt(&raw)))?;
         if self.log { eprintln!("  Qwen: {} prompt tokens ({} cached) in {:.2}s; {} generated in {:.2}s", job.prompt.len(),start,prefill_secs,generated.len(),decode_clock.elapsed().as_secs_f64()); }
         if !text.is_empty() { let _ = job.events.send(Event::Text(text)); }
         let _ = job.events.send(Event::Done { finish, completion_tokens: generated.len() });
@@ -474,6 +485,12 @@ mod tests {
         assert!(normalize(&call.replace("</tool_call>",""),&tools()).is_err());
         assert!(normalize(&call.replace("function=computer","function=unknown"),&tools()).is_err());
         assert!(normalize(&format!("{call} unwanted suffix"),&tools()).is_err());
+    }
+    #[test]
+    fn rejected_calls_are_quoted_from_their_start() {
+        assert_eq!(call_excerpt("prose <tool_call>\n{\"name\":\"x\"}"), "\"<tool_call>\\n{\\\"name\\\":\\\"x\\\"}\"");
+        let long = format!("<tool_call>{}", "é".repeat(400));
+        assert!(call_excerpt(&long).ends_with('…'));
     }
     #[test]
     fn template_keeps_tool_images_and_non_thinking_prefix() {

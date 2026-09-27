@@ -53,6 +53,8 @@ struct Inner {
     last_used: Instant,
     /// Model names served by the running process, default first.
     models: Vec<String>,
+    /// The context the loaded model was opened with, as nrob-server reported it.
+    context: Option<i64>,
     command: String,
     /// Launches still to try if this one dies while loading (auto: CUDA, then WebGPU).
     fallbacks: Vec<Launch>,
@@ -169,7 +171,7 @@ pub fn arguments(llm: &Json, root: &Path, port: u16, key: &str, local_images: bo
     push("--host", "127.0.0.1".into());
     push("--port", port.to_string());
     push("--api-key", key.into());
-    push("--ctx", int_or(llm, "ctx", 32768).to_string());
+    push("--ctx", match int_or(llm, "ctx", 0) { 0 => "auto".into(), n => n.to_string() });
     push("--max-tokens", int_or(llm, "max_tokens", 8192).to_string());
     push("--temperature", num_or(llm, "temperature", 0.6).to_string());
     push("--top-p", num_or(llm, "top_p", 0.95).to_string());
@@ -224,6 +226,7 @@ impl Llm {
                 paused: false,
                 last_used: Instant::now(),
                 models: Vec::new(),
+                context: None,
                 command: String::new(),
                 fallbacks: Vec::new(),
                 relaunch: None,
@@ -329,6 +332,7 @@ impl Llm {
         g.error = None;
         g.started = Some(Instant::now());
         g.ready_after = None;
+        g.context = None;
         g.models = names;
         g.last_used = Instant::now();
         drop(g);
@@ -417,6 +421,7 @@ impl Llm {
                 if g.generation == generation && g.state == State::Starting {
                     g.state = State::Ready;
                     g.ready_after = g.started.map(|s| s.elapsed().as_secs_f64());
+                    g.context = self.loaded_context();
                     self.log.push(format!("studio: nrob-server ready in {:.1}s", g.ready_after.unwrap_or(0.0)));
                     self.changed.notify_all();
                 }
@@ -461,6 +466,12 @@ impl Llm {
         }
     }
 
+    /// "… loaded in 8.1s (262144 token context)", as nrob-server reported it.
+    fn loaded_context(&self) -> Option<i64> {
+        let tail = self.log.tail(400);
+        tail.lines().rev().find_map(|l| l.strip_suffix(" token context)")?.rsplit_once('(')?.1.parse().ok())
+    }
+
     /// "WebGPU on …", "CUDA (2 card(s))" or "the CPU", as nrob-server reported it.
     fn runs_on(&self) -> Option<String> {
         let tail = self.log.tail(400);
@@ -479,6 +490,7 @@ impl Llm {
             ("idle_seconds", Json::Int(g.last_used.elapsed().as_secs() as i64)),
             ("command", Json::str(&g.command)),
             ("runs_on", self.runs_on().map_or(Json::Null, Json::str)),
+            ("context_tokens", g.context.map_or(Json::Null, Json::Int)),
         ])
     }
 }
@@ -516,6 +528,9 @@ mod tests {
         assert!(!joined.contains("--prompt-cache"));
         let none = Json::parse(br#"{"models": []}"#).unwrap();
         assert!(arguments(&none, root, 1, "k", true).is_err());
+        let auto = Json::parse(br#"{"models": [{"name": "a", "path": "a.gguf"}]}"#).unwrap();
+        let joined = arguments(&auto, root, 1, "k", true).unwrap().0.join(" ");
+        assert!(joined.contains("--ctx auto"), "{joined}");
     }
 
     #[test]

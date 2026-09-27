@@ -611,6 +611,9 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
         }
         (None, false) => codec.decode(&frames)?,
     };
+    // The model opens with up to most of a second of silence: a clip that
+    // follows the line would spend it with the speaker's mouth shut.
+    let samples = trim_leading_silence(samples, codec::SAMPLE_RATE);
     drop(codec);
     let decode_seconds = decode_started.elapsed().as_secs_f64();
     let stamp = SystemTime::now().duration_since(UNIX_EPOCH).map_err(candle_core::Error::wrap)?.as_nanos();
@@ -633,9 +636,31 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
     Ok(result)
 }
 
+/// Silence before the first sound, down to a tenth of a second of it. "Sound"
+/// is a 10 ms window louder than -40 dB, so a lone click does not count.
+fn trim_leading_silence(samples: Vec<f32>, rate: usize) -> Vec<f32> {
+    let window = (rate / 100).max(1);
+    let loud = samples.chunks(window).position(|w| (w.iter().map(|x| x * x).sum::<f32>() / w.len() as f32).sqrt() > 0.01);
+    match loud {
+        Some(i) => samples[(i * window).saturating_sub(rate / 10)..].to_vec(),
+        None => samples,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_line_starts_a_tenth_of_a_second_before_its_first_sound() {
+        let rate = 24_000;
+        let mut line = vec![0.0005f32; rate / 2];
+        line.extend(vec![0.3; rate]);
+        let trimmed = trim_leading_silence(line, rate);
+        assert_eq!(trimmed.len(), rate + rate / 10);
+        assert_eq!(trim_leading_silence(vec![0.; 100], rate).len(), 100);
+        assert_eq!(trim_leading_silence(vec![0.3; 100], rate).len(), 100);
+    }
 
     fn relative(actual: &Tensor, expected: &Tensor) -> Result<f32> {
         let actual = actual.to_dtype(DType::F32)?;

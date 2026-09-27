@@ -312,6 +312,15 @@ impl Models {
         }
     }
 
+    /// The loaded model's context in tokens, as it was opened.
+    pub fn loaded_context(&self) -> Option<(String, usize)> {
+        self.live
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .map(|l| (l.name.clone(), l.cfg.max_seq))
+    }
+
     /// Which model is loaded right now, if any.
     pub fn loaded(&self) -> Option<String> {
         self.live
@@ -418,6 +427,12 @@ impl Models {
         Ok(active)
     }
 
+    /// The context a model is served with: `--ctx`, or under `--ctx auto` (0)
+    /// the model's own maximum -- never more than the model allows.
+    fn context(&self, model_max: usize) -> usize {
+        if self.opts.ctx == 0 { model_max } else { self.opts.ctx.min(model_max) }
+    }
+
     fn say(&self, msg: String) {
         if !self.opts.silent {
             eprintln!("{msg}");
@@ -462,9 +477,12 @@ impl Models {
             crate::observer::Observer::load_shared(path, observer_device, o.observer_vram_gb, devices.contains(&observer_device))
         }).transpose()?;
         let tok = Arc::new(dsv41::tokenizer::Tokenizer::load(&spec.path)?);
+        // DeepSeek sizes its caches up front and names no maximum of its own,
+        // so `--ctx auto` keeps it at the server's default.
+        let max_seq = if o.ctx == 0 { crate::DEFAULT_CTX } else { o.ctx };
         let gopts = GpuOptions {
             devices,
-            max_seq: o.ctx,
+            max_seq,
             expert_cache_bytes: o.expert_cache_bytes() as usize,
             direct_io: true,
             vram_expert_bytes: None,
@@ -490,7 +508,7 @@ impl Models {
             ));
         }
 
-        let mut cfg = self.base_cfg(spec, o.ctx);
+        let mut cfg = self.base_cfg(spec, max_seq);
         if model.has_vision() {
             cfg.vision = model.cfg.vision.clone();
             self.say("vision tower loaded; chat requests may carry images".into());
@@ -521,7 +539,7 @@ impl Models {
         if let Some(dir) = &o.prompt_cache {
             // Different expert banks must never share prompt states, including
             // two variants built from the same retained tensor index.
-            let identity = format!("{:?}|{:?}|{:?}|ctx={}|dsml-v1", spec.path, ternary_source, tool_source, o.ctx);
+            let identity = format!("{:?}|{:?}|{:?}|ctx={}|dsml-v1", spec.path, ternary_source, tool_source, max_seq);
             let precision = disk::fnv(identity.as_bytes(), 0);
             let isolated = dir.join(format!("model-{precision:016x}"));
             let dir = &isolated;
@@ -565,7 +583,7 @@ impl Models {
         let model=if let Some(adapter)=&adapter {crate::orcasaq::load_with_adapter(&spec.path,&o.devices,Some(adapter))?} else {crate::orcasaq::load(&spec.path,&o.devices)?};
         if let Some(adapter)=&adapter {self.say(format!("OrcaSAQ: loaded LoRA for {} text projections",adapter.len()));}
         let tok=Arc::new(model.tokenizer().clone());
-        let max_seq=o.ctx.min(model.config().context_length);
+        let max_seq=self.context(model.config().context_length);
         let mut cfg=self.base_cfg(spec,max_seq);
         cfg.image_token_id=tok.token_id("<|image_pad|>").ok_or_else(||Error::Arg("Orca tokenizer lacks image_pad".into()))?;
         let vision_path=o.vision.then(||o.vision_projectors.get(&spec.name)).flatten();
@@ -629,7 +647,7 @@ impl Models {
             let model = llama_rs::Model::load(&gguf, Arc::clone(&backend)).map_err(|e| Error::Arg(e.to_string()))?;
             let tok = Arc::new(model.tokenizer().clone());
             // Dense Qwen fits one card; bound the initial KV allocation.
-            let max_seq = o.ctx.min(model.config().context_length).min(16384);
+            let max_seq = self.context(model.config().context_length).min(16384);
             let mut cfg = self.base_cfg(spec, max_seq);
             cfg.image_token_id = tok.token_id("<|image_pad|>").ok_or_else(|| Error::Arg("Qwen tokenizer lacks image_pad".into()))?;
             let projector = if o.vision {
@@ -704,8 +722,8 @@ impl Models {
         // The state the model was opened with bounds the context, whatever was
         // asked for.
         let max_seq = match &model {
-            llama_rs::Model::Glm5Next(g) => g.max_len().min(o.ctx),
-            _ => o.ctx,
+            llama_rs::Model::Glm5Next(g) => self.context(g.max_len()),
+            _ => self.context(model.config().context_length),
         };
         let cfg = self.base_cfg(spec, max_seq);
 

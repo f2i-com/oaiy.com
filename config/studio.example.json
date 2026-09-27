@@ -123,7 +123,7 @@
     "devices": [
       0
     ],
-    "ctx": 32768,
+    "ctx": 0,
     "ram_gb": 0,
     "cpu_threads": 24,
     "vram_headroom_gb": 2,

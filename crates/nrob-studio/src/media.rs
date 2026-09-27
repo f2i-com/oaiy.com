@@ -72,6 +72,15 @@ pub struct Job {
 }
 
 impl Job {
+    /// A video's length: the clip made, once there is one. A soundtrack sets
+    /// the length only as the worker reads it, so the planned one is an estimate.
+    pub fn clip_seconds(&self) -> f64 {
+        match (self.result.get("frames").and_then(Json::as_f64), self.result.get("fps").and_then(Json::as_f64)) {
+            (Some(frames), Some(fps)) if fps > 0.0 => frames / fps,
+            _ => self.seconds,
+        }
+    }
+
     pub fn finished(&self) -> bool {
         matches!(self.status.as_str(), "completed" | "failed" | "cancelled")
     }
@@ -96,7 +105,7 @@ impl Job {
             ("residency", self.result.get("residency").cloned().unwrap_or(Json::Null)),
             ("seconds_taken", self.result.get("seconds").cloned().unwrap_or(Json::Null)),
             ("seconds", match self.kind {
-                Kind::Video => Json::Num(self.seconds),
+                Kind::Video => Json::Num(self.clip_seconds()),
                 Kind::Speech | Kind::Music => self.result.get("duration").cloned().unwrap_or(Json::Null),
                 Kind::Image => Json::Null,
             }),
@@ -507,6 +516,16 @@ fn reference_audio(value: &Json, output_root: &Path, allow_local: bool) -> Resul
 /// length; LTX takes 8k+1 frames, at most 121. With a soundtrack to follow
 /// (`input_audio`, or `speech` to make first) and no length, the clip is as
 /// long as the soundtrack.
+/// How long media jobs wait after a worker hit a GPU fault.
+const GPU_FAULT_PAUSE: Duration = Duration::from_secs(30);
+
+/// A worker error that means the GPU or its driver faulted (not a bad request).
+fn gpu_fault(error: &str) -> bool {
+    ["CUDA_ERROR", "DriverError", "nonfinite", "illegal memory access", "launch failure", "device-side assert"]
+        .iter()
+        .any(|m| error.contains(m))
+}
+
 pub fn video_request(cfg: &Json, root: &Path, output_root: &Path, body: &Json, allow_local: bool) -> Result<(Json, String, String, f64), String> {
     let media = cfg.get("media").ok_or("no media section")?;
     let section = media.get("video").ok_or("no video section")?;
@@ -542,8 +561,41 @@ pub fn video_request(cfg: &Json, root: &Path, output_root: &Path, body: &Json, a
     if w <= 0 || h <= 0 {
         return Err("size must be positive".into());
     }
+    // The reference's two-stage pipeline (a non-distilled first stage with
+    // guidance at half size, upsampled and refined by the distilled model)
+    // needs the dev weights and the latent upsampler. It did not make mouths
+    // follow a soundtrack measurably better and takes four times as long, so
+    // it is asked for: `pipeline` is auto or fast (one distilled pass), or two_stage.
+    let dev_transformer = path_field(root, model, "dev_transformer");
+    let upscaler = path_field(root, model, "spatial_upscaler");
+    // Lip-synced speech (ID-LoRA): with words to say (`speech`) and the
+    // model's `id_lora`, the clip's speech is generated with the picture, in
+    // the speaker's voice. A supplied file (`input_audio`) is kept exactly and
+    // followed as a soundtrack, unless `lip_sync` is voice (then the file is
+    // the voice and its `transcript` the words, spoken again). `lip_sync`:
+    // auto, voice, or off (follow any audio as a soundtrack).
+    let id_lora = path_field(root, model, "id_lora");
+    let has_speech = body.get("speech").is_some_and(|v| !matches!(v, Json::Null));
+    let has_file_words = body.get("input_audio").is_some_and(|v| !matches!(v, Json::Null))
+        && body.get("transcript").and_then(Json::as_str).is_some_and(|t| !t.trim().is_empty());
+    let identity = match body.get("lip_sync").and_then(Json::as_str).unwrap_or("auto") {
+        "auto" => id_lora.is_some() && has_speech,
+        "voice" if id_lora.is_some() && (has_speech || has_file_words) => true,
+        "voice" => return Err(format!("video model {name} needs an id_lora, and words to say, for lip_sync voice")),
+        "off" => false,
+        _ => return Err("lip_sync must be auto, voice or off".into()),
+    };
+    let two_stage = match body.get("pipeline").and_then(Json::as_str).unwrap_or("auto") {
+        "auto" | "fast" => false,
+        // Lip-synced speech is its own single pass.
+        "two_stage" if identity => false,
+        "two_stage" if dev_transformer.is_some() && upscaler.is_some() => true,
+        "two_stage" => return Err(format!("video model {name} needs dev_transformer and spatial_upscaler for the two-stage pipeline")),
+        _ => return Err("pipeline must be auto, fast or two_stage".into()),
+    };
     // OpenAI sizes (1280x720, 1792x1024) exceed LTX's 1024 cap: scale, keep aspect.
-    let (w, h) = fit(w, h, 1024, 128, 32);
+    // Two stages render at half the size first, so the sides go in steps of 64.
+    let (w, h) = fit(w, h, 1024, 128, if two_stage { 64 } else { 32 });
     let mut f: Vec<(String, Json)> = vec![
         ("kind".into(), Json::str("video")),
         ("model".into(), Json::str(&family)),
@@ -562,6 +614,26 @@ pub fn video_request(cfg: &Json, root: &Path, output_root: &Path, body: &Json, a
             None if key == "tokenizer" && family == "ltx-2.5" => {}
             None => return Err(format!("video model {name} needs {key}")),
         }
+    }
+    // How a followed soundtrack is held: inpaint (the worker's default) or frozen.
+    if let Some(m) = body.get("soundtrack_mode").and_then(Json::as_str) {
+        if !matches!(m, "inpaint" | "frozen") {
+            return Err("soundtrack_mode must be inpaint or frozen".into());
+        }
+        f.push(("soundtrack_mode".into(), Json::str(m)));
+    }
+    if let (true, Some(lora)) = (identity, &id_lora) {
+        f.push(("identity".into(), Json::Bool(true)));
+        f.push(("lora".into(), Json::obj([("path", Json::str(lora)), ("strength", Json::Num(num_or(model, "id_lora_strength", 1.0)))])));
+    }
+    if let (true, Some(dev), Some(upscaler)) = (two_stage, &dev_transformer, &upscaler) {
+        // Stage one runs the dev weights with the reference's guidance; the
+        // configured (distilled) transformer refines.
+        let distilled = f.iter().find(|(k, _)| k == "transformer").map(|(_, v)| v.clone()).unwrap_or(Json::Null);
+        f.retain(|(k, _)| k != "transformer");
+        f.push(("transformer".into(), Json::str(dev)));
+        f.push(("guidance".into(), Json::obj::<&str>([])));
+        f.push(("refine".into(), Json::obj([("transformer", distilled), ("upsampler", Json::str(upscaler))])));
     }
     // A soundtrack comes with models that have their audio VAE (LTX 2.3 and
     // Sulphur checkpoints are their own), unless the request says `"audio": false`.
@@ -621,6 +693,14 @@ pub fn video_request(cfg: &Json, root: &Path, output_root: &Path, body: &Json, a
         }
         let (request, _, _, speech_frames) = crate::speech::speech_request(cfg, root, &day_dir(output_root, "speech"), &sb).map_err(|e| format!("speech: {e}"))?;
         f.push(("speech".into(), request));
+        // A saved voice's sample is the ID-LoRA reference (the line itself otherwise).
+        if identity {
+            let dir = crate::speech::voices_dir(cfg, root);
+            let saved = s.get("voice").and_then(Json::as_str).map(|n| crate::speech::sample_file(&dir, n)).filter(|p| p.is_file());
+            if let Some(sample) = saved {
+                f.push(("reference_voice".into(), Json::str(sample.to_string_lossy())));
+            }
+        }
         if !explicit_length {
             // Speech runs at 12.5 frames a second; the clip stops at 121 video frames.
             seconds = (speech_frames as f64 / 12.5).min(120.0 / fps as f64);
@@ -685,6 +765,9 @@ fn progress_of(kind: Kind, n: usize, e: &Json) -> Option<(f64, String)> {
         (Kind::Video, "encoding_video_prompt") if i("total") > 0.0 => 3.0 + 12.0 * i("current") / i("total"),
         (Kind::Video, "video_text_connector") => 16.0,
         (Kind::Video, "video_denoising") if i("total") > 0.0 => 18.0 + 67.0 * i("current") / i("total"),
+        (Kind::Video, "encoding_negative_prompt") => 16.0,
+        (Kind::Video, "upsampling_latent" | "loading_refine_model") => 85.0,
+        (Kind::Video, "refining_video") if i("total") > 0.0 => 85.0 + 2.0 * i("current") / i("total"),
         (Kind::Video, "decoding_video") => 87.0,
         (Kind::Video, "encoding_mp4") => 95.0,
         (Kind::Video, _) => 2.0,
@@ -947,6 +1030,7 @@ impl Media {
             self.changed.notify_all();
             let outcome = self.run_one(studio, &next);
             let cancelled = next.cancel.load(Ordering::Relaxed);
+            let fault = outcome.as_ref().err().is_some_and(|e| gpu_fault(e));
             self.update(&next.id, |j| {
                 j.completed_at = Some(now());
                 if j.incognito {
@@ -975,11 +1059,17 @@ impl Media {
                     Err(e) => {
                         j.status = if cancelled { "cancelled" } else { "failed" }.into();
                         j.stage = j.status.clone();
-                        j.error = Some(e);
+                        j.error = Some(if fault { format!("{e} (the GPU driver reported a fault; media jobs wait {}s for it to recover)", GPU_FAULT_PAUSE.as_secs()) } else { e });
                     }
                 }
             });
             self.sweep();
+            if fault {
+                // Starting the next job on a card whose driver is still
+                // recovering is how one fault became a system crash.
+                self.log.push(format!("GPU fault: waiting {}s before the next media job", GPU_FAULT_PAUSE.as_secs()));
+                std::thread::sleep(GPU_FAULT_PAUSE);
+            }
         }
     }
 
@@ -1194,6 +1284,13 @@ mod tests {
     }
 
     #[test]
+    fn gpu_faults_are_told_from_bad_requests() {
+        assert!(gpu_fault("DriverError(CUDA_ERROR_LAUNCH_FAILED, \"unspecified launch failure\")"));
+        assert!(gpu_fault("nonfinite decoded video pixels"));
+        assert!(!gpu_fault("size must look like 1024x1024"));
+    }
+
+    #[test]
     fn video_requests_fit_openai_sizes_and_seconds_to_ltx() {
         let c = cfg("", "");
         let root = Path::new("/install");
@@ -1242,6 +1339,44 @@ mod tests {
         assert!(video_request(&cfg("", ""), root, &out, &body(&wav), false).unwrap_err().contains("audio VAE"));
         assert!(video_request(&c, root, &out, &body(&wav.replace(r#""prompt""#, r#""audio":false,"prompt""#)), false).is_err());
         assert!(video_request(&c, root, &out, &body(r#"{"prompt":"x","input_audio":"C:/voice.wav"}"#), false).unwrap_err().contains("this machine"));
+        // Two stages when asked, with the dev weights and upsampler set: the dev
+        // transformer guides at half size, the configured one refines.
+        assert!(r.get("guidance").is_none(), "no dev weights: one distilled pass");
+        let two = cfg("", r#","audio_vae":"s.safetensors","dev_transformer":"dev.safetensors","spatial_upscaler":"up.safetensors""#);
+        let (r, _, size, _) = video_request(&two, root, &out, &body(&wav.replace(r#""prompt""#, r#""pipeline":"two_stage","size":"1000x560","prompt""#)), false).unwrap();
+        assert_eq!(size, "1024x576", "sides in steps of 64");
+        assert!(r.get("transformer").and_then(Json::as_str).unwrap().ends_with("dev.safetensors"));
+        assert!(r.get("guidance").is_some());
+        let refine = r.get("refine").unwrap();
+        assert!(str_or(refine, "upsampler", "").ends_with("up.safetensors"));
+        assert!(!str_or(refine, "transformer", "").ends_with("dev.safetensors"));
+        let (fast, ..) = video_request(&two, root, &out, &body(&wav), false).unwrap();
+        assert!(fast.get("guidance").is_none() && fast.get("refine").is_none(), "auto: one distilled pass");
+        assert!(video_request(&c, root, &out, &body(r#"{"prompt":"x","pipeline":"two_stage"}"#), false).unwrap_err().contains("dev_transformer"));
+        // Lip-synced speech with the model's ID-LoRA: the saved voice's sample is the reference.
+        let mut id = cfg("", r#","audio_vae":"s.safetensors","id_lora":"id.safetensors""#);
+        let Json::Obj(top) = &mut id else { unreachable!() };
+        let media = &mut top.iter_mut().find(|(k, _)| k == "media").unwrap().1;
+        crate::util::set(media, "speech", Json::parse(format!(r#"{{"enabled":true,"default_model":"tts","voices_dir":"{}","models":{{"tts":{{"design":"/m/design","base":"/m/base"}}}}}}"#, out.join("voices").to_string_lossy().replace('\\', "/")).as_bytes()).unwrap());
+        std::fs::create_dir_all(out.join("voices")).unwrap();
+        std::fs::write(out.join("voices").join("gary.json"), br#"{"name":"Gary"}"#).unwrap();
+        std::fs::write(out.join("voices").join("gary.wav"), b"RIFF").unwrap();
+        let (r, ..) = video_request(&id, root, &out, &body(r#"{"prompt":"a man speaks","speech":{"text":"We are closing.","voice":"Gary"}}"#), false).unwrap();
+        assert_eq!(r.get("identity").and_then(Json::as_bool), Some(true));
+        assert!(str_or(r.get("lora").unwrap(), "path", "").ends_with("id.safetensors"));
+        assert!(r.get("reference_voice").and_then(Json::as_str).unwrap().ends_with("gary.wav"));
+        // A speech file is kept and followed; with lip_sync voice it is the voice instead.
+        let (r, ..) = video_request(&id, root, &out, &body(&wav.replace(r#""prompt""#, r#""transcript":"We are closing.","prompt""#)), false).unwrap();
+        assert!(r.get("identity").is_none() && r.get("audio_file").is_some());
+        let (r, ..) = video_request(&id, root, &out, &body(&wav.replace(r#""prompt""#, r#""lip_sync":"voice","transcript":"We are closing.","prompt""#)), false).unwrap();
+        assert!(r.get("identity").is_some() && r.get("reference_voice").is_none());
+        let (r, ..) = video_request(&id, root, &out, &body(&wav.replace(r#""prompt""#, r#""soundtrack_mode":"frozen","prompt""#)), false).unwrap();
+        assert_eq!(r.get("soundtrack_mode").and_then(Json::as_str), Some("frozen"));
+        // Without words, or with lip_sync off, the audio is followed as a soundtrack.
+        let (r, ..) = video_request(&id, root, &out, &body(&wav), false).unwrap();
+        assert!(r.get("identity").is_none());
+        let (r, ..) = video_request(&id, root, &out, &body(r#"{"prompt":"a man speaks","lip_sync":"off","speech":{"text":"We are closing.","voice":"Gary"}}"#), false).unwrap();
+        assert!(r.get("identity").is_none() && r.get("lora").is_none());
         assert!(video_request(&c, root, &out, &body(r#"{"prompt":"x","input_audio":"data:audio/wav;base64,UklGRg==","speech":{"text":"hi"}}"#), false).is_err());
         let _ = std::fs::remove_dir_all(out);
     }

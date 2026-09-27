@@ -99,13 +99,12 @@ impl Rope {
     /// 100 per second; its rotary position is the middle, in seconds. The same
     /// table serves audio self-attention and the audio side of cross-attention.
     pub fn audio(frames: usize, dev: &Device) -> Result<Self> {
-        let times: Vec<Vec<f32>> = (0..frames)
-            .map(|i| {
-                let start = (4 * i).saturating_sub(3) as f32 * 0.01;
-                let end = (4 * i + 1) as f32 * 0.01;
-                vec![(start + end) / 2.]
-            })
-            .collect();
+        Self::audio_spans(&audio_spans(frames), dev)
+    }
+    /// Audio tokens at given `[start, end)` seconds (a reference voice sits at
+    /// negative times, before the clip); each rotates by its middle.
+    pub fn audio_spans(spans: &[(f64, f64)], dev: &Device) -> Result<Self> {
+        let times: Vec<Vec<f32>> = spans.iter().map(|&(s, e)| vec![((s + e) / 2.) as f32]).collect();
         Self::positions(&times, &[20.], 2048, 32, dev)
     }
     fn video_positions(
@@ -163,6 +162,11 @@ impl Rope {
         )
     }
 }
+/// Audio latent frame `i` covers mel frames `[max(4i - 3, 0), 4i + 1)` at 100
+/// per second.
+pub fn audio_spans(frames: usize) -> Vec<(f64, f64)> {
+    (0..frames).map(|i| ((4 * i).saturating_sub(3) as f64 * 0.01, (4 * i + 1) as f64 * 0.01)).collect()
+}
 pub fn attn(
     w: &Group,
     prefix: &str,
@@ -170,10 +174,13 @@ pub fn attn(
     context: &Tensor,
     rope: Option<&Rope>,
 ) -> Result<Tensor> {
-    attn_pe(w, prefix, x, context, rope, rope)
+    attn_pe(w, prefix, x, context, rope, rope, false)
 }
 /// Attention whose queries and keys rotate by different tables (audio-video
 /// cross-attention places each side on its own timeline).
+/// `passthrough` replaces the attention with its value projection (the
+/// reference's perturbation for spatio-temporal guidance); the gate and the
+/// output projection still apply.
 fn attn_pe(
     w: &Group,
     prefix: &str,
@@ -181,7 +188,12 @@ fn attn_pe(
     context: &Tensor,
     q_rope: Option<&Rope>,
     k_rope: Option<&Rope>,
+    passthrough: bool,
 ) -> Result<Tensor> {
+    if passthrough {
+        let v = heads(&w.linear(&format!("{prefix}.to_v"), context)?, 32)?;
+        return gate_out(w, prefix, x, v);
+    }
     let mut q = heads(
         &rms(
             &w.linear(&format!("{prefix}.to_q"), x)?,
@@ -205,7 +217,11 @@ fn attn_pe(
     if let Some(r) = k_rope {
         k = r.apply(&k)?;
     }
-    let mut y = attention(&q, &k, &v, 0)?;
+    let y = attention(&q, &k, &v, 0)?;
+    gate_out(w, prefix, x, y)
+}
+/// The per-head gate, then the output projection.
+fn gate_out(w: &Group, prefix: &str, x: &Tensor, mut y: Tensor) -> Result<Tensor> {
     if w.tensors
         .contains_key(&format!("{prefix}.to_gate_logits.weight"))
     {
@@ -336,10 +352,11 @@ fn attend(
     m: &Tensor,
     prompt: Option<&Tensor>,
     rope: &Rope,
+    skip_self: bool,
 ) -> Result<Tensor> {
     let slot = |j| m.narrow(2, j, 1)?.squeeze(2);
     let h = affine(&norm(&x)?, &slot(0)?, &slot(1)?)?;
-    x = (x + attn(w, s.attn1, &h, &h, Some(rope))?.broadcast_mul(&slot(2)?)?)?;
+    x = (x + attn_pe(w, s.attn1, &h, &h, Some(rope), Some(rope), skip_self)?.broadcast_mul(&slot(2)?)?)?;
     let mut pm = w.get(s.prompt_table)?.unsqueeze(0)?;
     if let Some(p) = prompt {
         pm = (pm + p)?;
@@ -360,20 +377,21 @@ fn block(
     modulation: &Tensor,
     prompt: Option<&Tensor>,
     rope: &Rope,
+    skip_self: bool,
 ) -> Result<Tensor> {
     let m = modulation.broadcast_add(w.get(VIDEO.table)?)?;
-    let x = attend(w, &VIDEO, x, context, &m, prompt, rope)?;
+    let x = attend(w, &VIDEO, x, context, &m, prompt, rope, skip_self)?;
     feed(w, &VIDEO, x, &m)
 }
 /// The audio stream's inputs for one denoising step, computed once and
 /// shared by every block.
 struct AudioStep<'a> {
     context: &'a Tensor,
-    /// (1, 1, 9, 2048) audio modulation, and (1, 2, 2048) prompt modulation.
+    /// (1, 1 or tokens, 9, 2048) audio modulation, and (1, 2, 2048) prompt modulation.
     modulation: Tensor,
     prompt: Option<Tensor>,
     /// Cross-attention (scale, shift) rows: per video token (1, Tv, 4, 4096),
-    /// and for audio (1, 1, 4, 2048). Rows 0-1 serve audio-to-video, 2-3
+    /// and for audio (1, 1 or tokens, 4, 2048). Rows 0-1 serve audio-to-video, 2-3
     /// video-to-audio.
     video_ss: Tensor,
     audio_ss: Tensor,
@@ -399,10 +417,10 @@ fn cross(w: &Group, vx: Tensor, ax: Tensor, s: &AudioStep) -> Result<(Tensor, Te
     let (vn, an) = (norm(&vx)?, norm(&ax)?);
     let q = affine(&vn, &vrow(1)?, &vrow(0)?)?;
     let k = affine(&an, &arow(1)?, &arow(0)?)?;
-    let a2v = attn_pe(w, "audio_to_video_attn", &q, &k, Some(s.video_cross), Some(s.rope))?;
+    let a2v = attn_pe(w, "audio_to_video_attn", &q, &k, Some(s.video_cross), Some(s.rope), false)?;
     let q = affine(&an, &arow(3)?, &arow(2)?)?;
     let k = affine(&vn, &vrow(3)?, &vrow(2)?)?;
-    let v2a = attn_pe(w, "video_to_audio_attn", &q, &k, Some(s.rope), Some(s.video_cross))?;
+    let v2a = attn_pe(w, "video_to_audio_attn", &q, &k, Some(s.rope), Some(s.video_cross), false)?;
     Ok(((vx + a2v.broadcast_mul(&vgate)?)?, (ax + v2a.broadcast_mul(&agate)?)?))
 }
 fn av_block(
@@ -414,11 +432,13 @@ fn av_block(
     prompt: Option<&Tensor>,
     rope: &Rope,
     a: &AudioStep,
+    skip_self: bool,
+    skip_audio_self: bool,
 ) -> Result<(Tensor, Tensor)> {
     let vm = modulation.broadcast_add(w.get(VIDEO.table)?)?;
     let am = a.modulation.broadcast_add(w.get(AUDIO.table)?)?;
-    let vx = attend(w, &VIDEO, vx, context, &vm, prompt, rope)?;
-    let ax = attend(w, &AUDIO, ax, a.context, &am, a.prompt.as_ref(), a.rope)?;
+    let vx = attend(w, &VIDEO, vx, context, &vm, prompt, rope, skip_self)?;
+    let ax = attend(w, &AUDIO, ax, a.context, &am, a.prompt.as_ref(), a.rope, skip_audio_self)?;
     let (vx, ax) = if a.isolated { (vx, ax) } else { cross(w, vx, ax, a)? };
     Ok((feed(w, &VIDEO, vx, &vm)?, feed(w, &AUDIO, ax, &am)?))
 }
@@ -451,6 +471,9 @@ pub struct AudioInput<'a> {
     /// Skip the audio-video cross-attention in every block (both ways): the
     /// "isolated modality" pass that audio-to-video guidance contrasts with.
     pub isolated: bool,
+    /// The first tokens are clean conditioning (a reference voice): their
+    /// timesteps are 0 while `sigma` stays the stream's own.
+    pub clean_tokens: usize,
 }
 
 pub struct Transformer {
@@ -463,6 +486,13 @@ pub struct Transformer {
     pub gpu_bytes: u64,
     gpu_budget: u64,
     require_gpu: bool,
+    /// The block whose video self-attention passes its values straight through
+    /// on the next forward (the perturbed pass of spatio-temporal guidance).
+    pub skip_video_self_attn: Option<usize>,
+    /// Likewise for the audio self-attention.
+    pub skip_audio_self_attn: Option<usize>,
+    /// Every block kept on the device as INT8 (see `Store::group_int8`).
+    pub int8: bool,
     #[cfg(test)]
     last_hidden: Option<Tensor>,
     #[cfg(test)]
@@ -648,11 +678,11 @@ mod tests {
         let rope = Rope::video_with_end(1, 4, 4, 24, false, &dev)?;
         let video_cross = Rope::video_cross(1, 4, 4, 24, false, &dev)?;
         let audio_rope = Rope::audio(6, &dev)?;
-        let audio = AudioInput { latent: &ax, context: &actx, rope: &audio_rope, video_cross: &video_cross, sigma: 0.725, isolated: false };
+        let audio = AudioInput { latent: &ax, context: &actx, rope: &audio_rope, video_cross: &video_cross, sigma: 0.725, isolated: false, clean_tokens: 0 };
         let (video, audio) = model.forward(&x, &context, 0.725, &rope, 4, 0, Some(audio), |_| {})?;
         let (first_video, first_audio) = (model.first_hidden.clone().unwrap(), model.first_audio_hidden.clone().unwrap());
         // The same pass with the audio frozen as a condition (sigma 0 throughout).
-        let frozen = AudioInput { latent: &ax, context: &actx, rope: &audio_rope, video_cross: &video_cross, sigma: 0., isolated: false };
+        let frozen = AudioInput { latent: &ax, context: &actx, rope: &audio_rope, video_cross: &video_cross, sigma: 0., isolated: false, clean_tokens: 0 };
         let (frozen_video, frozen_audio) = model.forward(&x, &context, 0.725, &rope, 4, 0, Some(frozen), |_| {})?;
         let checks = [
             ("first block, video", first_video, read("av-block0-video.f32", &[1, 16, 4096])?, 0.01),
@@ -730,7 +760,7 @@ mod tests {
                     assert!(store.disk_bytes > before);
                 }
                 let y =
-                    block(&w, x.clone(), &context, &m, Some(&pm), &rope)?.to_dtype(DType::F32)?;
+                    block(&w, x.clone(), &context, &m, Some(&pm), &rope, false)?.to_dtype(DType::F32)?;
                 let error = (&y - &expected)?
                     .sqr()?
                     .mean_all()?
@@ -757,9 +787,15 @@ impl Transformer {
     pub fn new(mut store: Store, dev: &Device, gpu_budget: u64, require_gpu: bool, audio: bool) -> Result<Self> {
         let filter = if audio { av_weight } else { video_weight };
         let mut required = 0;
+        let mut required_int8 = 0;
         for i in 0..48 {
             required += store.group_bytes(&format!("{PREFIX}transformer_blocks.{i}."), filter)?;
+            required_int8 += store.group_int8_bytes(&format!("{PREFIX}transformer_blocks.{i}."), filter)?;
         }
+        // Streaming half the blocks from RAM on every pass is slow and churns
+        // gigabytes of device memory a pass; when BF16 does not fit but INT8
+        // does, every block stays on the card as INT8 instead.
+        let int8 = !require_gpu && required > gpu_budget && required_int8 <= gpu_budget;
         if require_gpu && required > gpu_budget {
             candle_core::bail!("video transformer needs {:.1} GiB of weight VRAM; budget is {:.1} GiB. Use auto, ram or ssd", required as f64 / 1073741824., gpu_budget as f64 / 1073741824.);
         }
@@ -787,6 +823,9 @@ impl Transformer {
             gpu_bytes: 0,
             gpu_budget,
             require_gpu,
+            skip_video_self_attn: None,
+            skip_audio_self_attn: None,
+            int8,
             #[cfg(test)]
             last_hidden: None,
             #[cfg(test)]
@@ -862,7 +901,25 @@ impl Transformer {
                 }
                 video_ss = Tensor::cat(&parts, 1)?;
             }
-            let (audio_modulation, audio_embedded) = time_embedding(&self.global, "audio_adaln_single", a.sigma, dev)?;
+            // Per-token timesteps: clean reference tokens at 0, the rest at the
+            // audio's sigma. The prompt modulation and both gates keep the sigma.
+            let audio_tokens = a.latent.dim(1)?;
+            let per_token = |prefix: &str| -> Result<(Tensor, Tensor)> {
+                let (m, e) = time_embedding(&self.global, prefix, a.sigma, dev)?;
+                if a.clean_tokens == 0 {
+                    return Ok((m, e));
+                }
+                let (cm, ce) = time_embedding(&self.global, prefix, 0., dev)?;
+                let join = |clean: &Tensor, noisy: &Tensor| -> Result<Tensor> {
+                    Tensor::cat(&[
+                        clean.broadcast_as((1, a.clean_tokens, clean.dim(2)?))?,
+                        noisy.broadcast_as((1, audio_tokens - a.clean_tokens, noisy.dim(2)?))?,
+                    ], 1)
+                };
+                Ok((join(&cm, &m)?, join(&ce, &e)?))
+            };
+            let (audio_modulation, audio_embedded) = per_token("audio_adaln_single")?;
+            let audio_ss = per_token("av_ca_audio_scale_shift_adaln_single")?.0;
             let prompt = if self.global.tensors.contains_key("audio_prompt_adaln_single.linear.weight") {
                 Some(time_embedding(&self.global, "audio_prompt_adaln_single", a.sigma, dev)?.0.reshape((1, 2, 2048))?)
             } else {
@@ -870,10 +927,10 @@ impl Transformer {
             };
             let step = AudioStep {
                 context: a.context,
-                modulation: audio_modulation.reshape((1, 1, 9, 2048))?,
+                modulation: audio_modulation.reshape((1, audio_modulation.dim(1)?, 9, 2048))?,
                 prompt,
                 video_ss: video_ss.reshape((1, video_ss.dim(1)?, 4, 4096))?,
-                audio_ss: time_embedding(&self.global, "av_ca_audio_scale_shift_adaln_single", a.sigma, dev)?.0.reshape((1, 1, 4, 2048))?,
+                audio_ss: audio_ss.reshape((1, audio_ss.dim(1)?, 4, 2048))?,
                 video_gate: time_embedding(&self.global, "av_ca_a2v_gate_adaln_single", a.sigma, dev)?.0,
                 audio_gate: time_embedding(&self.global, "av_ca_v2a_gate_adaln_single", sigma, dev)?.0,
                 rope: a.rope,
@@ -913,7 +970,15 @@ impl Transformer {
         }
         let filter = if self.audio { av_weight } else { video_weight };
         for i in 0..self.layers {
+            let skip_self = self.skip_video_self_attn == Some(i);
+            let skip_audio_self = self.skip_audio_self_attn == Some(i);
             let temporary;
+            if self.resident[i].is_none() && self.int8 {
+                let prefix = format!("{PREFIX}transformer_blocks.{i}.");
+                let group = self.store.group_int8(&prefix, dev, filter)?;
+                self.gpu_bytes += group.bytes;
+                self.resident[i] = Some(group);
+            }
             let w = if let Some(w) = self.resident[i].as_ref() {
                 w
             } else {
@@ -936,11 +1001,11 @@ impl Transformer {
             };
             match audio_state.as_mut() {
                 Some((step, ax, _)) => {
-                    let (v, a) = av_block(w, x, ax.clone(), context, &modulation, prompt.as_ref(), rope, step)?;
+                    let (v, a) = av_block(w, x, ax.clone(), context, &modulation, prompt.as_ref(), rope, step, skip_self, skip_audio_self)?;
                     x = v;
                     *ax = a;
                 }
-                None => x = block(w, x, context, &modulation, prompt.as_ref(), rope)?,
+                None => x = block(w, x, context, &modulation, prompt.as_ref(), rope, skip_self)?,
             }
             #[cfg(test)]
             if i == 0 {

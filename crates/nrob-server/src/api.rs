@@ -66,8 +66,8 @@ pub struct Server {
     pub local_images: bool,
     /// Every request incognito (`--incognito`); otherwise per request.
     pub incognito: bool,
-    /// The configured context cap, for `/v1/models`. What a model actually allows
-    /// is in its own `Config` once it is loaded.
+    /// The configured context cap (0: each model's own), for `/v1/models`. What a
+    /// model actually allows is in its own `Config` once it is loaded.
     pub ctx: usize,
 }
 
@@ -221,19 +221,21 @@ impl Server {
 
     /// Every configured model, with the loaded one marked.
     fn models(&self) -> Json {
-        let loaded = self.models.loaded();
+        let loaded = self.models.loaded_context();
         let data: Vec<Json> = self
             .models
             .names()
             .into_iter()
             .map(|name| {
-                let is_loaded = loaded.as_deref() == Some(name.as_str());
+                let context = loaded.as_ref().filter(|(n, _)| *n == name).map(|&(_, c)| c);
+                let is_loaded = context.is_some();
                 Json::obj([
                     ("id", Json::str(&name)),
                     ("object", Json::str("model")),
                     ("created", Json::Int(now() as i64)),
                     ("owned_by", Json::str("nrob")),
-                    ("context_length", Json::Int(self.ctx as i64)),
+                    // The loaded model's own; the others' is known once they load.
+                    ("context_length", context.or((self.ctx > 0).then_some(self.ctx)).map_or(Json::Null, |c| Json::Int(c as i64))),
                     // Not OpenAI's, but a client switching models wants to know
                     // which one is resident: the others cost a load.
                     ("loaded", Json::Bool(is_loaded)),
@@ -750,6 +752,11 @@ impl Server {
             ("total_tokens", Json::Int((n_prompt + completion_tokens) as i64)),
             ("prompt_tokens_details", Json::obj([("cached_tokens", Json::Int(cached as i64))])),
         ]);
+        // Why a request failed, for the log: never what the model wrote.
+        if let (Some(e), false) = (&error, forget) {
+            let why = e.split(". The model wrote:").next().unwrap_or(e);
+            eprintln!("  chat failed: {}", why.chars().take(300).collect::<String>());
+        }
 
         match sse {
             Some(mut s) => {
