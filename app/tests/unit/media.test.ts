@@ -194,7 +194,18 @@ describe('media tools', () => {
     expect(tools[2].description).toContain('Voices: Narrator, alloy, onyx. Saved: Narrator (A deep, calm male narrator).');
     expect(tools[4].description).toContain('minimax-music3 (default): up to 360 s');
     expect(Object.keys((tools[1].parameters as { properties: Record<string, unknown> }).properties)).toEqual(expect.arrayContaining(['end_image', 'say', 'voice', 'soundtrack']));
-    expect(tools[1].description).toMatch(/start frame and end frame with generate_image .*reference_images.*start_image and end_image/);
+    expect(tools[1].description).toMatch(/start frame and an end frame, and gets both.*generate_image .*reference_images.*start_image and end_image/);
+    expect(tools[1].description).toContain('Only one person may be in the frame while someone speaks');
+    expect(tools[1].description).toContain('Keep every clip to 5 seconds or less');
+    expect(tools[1].description).toContain('The prompt describes the motion that takes the start frame to the end frame, in order');
+    expect(tools[1].description).toContain('make each clip from its shot in the script');
+    expect(tools[0].description).toContain('each character (only them, full length, facing the camera, neutral expression, on a blank white background)');
+    expect(tools[0].description).toContain('A reference image is never used as a picture of the story itself.');
+    expect(tools[1].description).toContain("giving the scene's background (the place with no people in it) and the reference images of the characters and props in it");
+    expect(tools[1].description).toContain("Never give a character's reference image itself as a frame.");
+    // A clip that continues another starts on its end frame; its real last frame only when it ended elsewhere.
+    expect(tools[1].description).toContain("a clip that continues another without a cut starts on that clip's end frame");
+    expect(tools[1].description).toContain('When a clip ended away from its end frame, start the clip that continues it on its real last frame');
     expect(tools[1].description).toMatch(/saved voice \(create_voice.*generate_speech in that character's saved voice.*`soundtrack`/);
     expect(tools[2].description).toContain('give the file to generate_video as `soundtrack`');
     // A model with lip-synced speech: `say` in the saved voice, not a soundtrack.

@@ -16,6 +16,7 @@ import { appLabel, checkProject, describeApp, findApps, formatFindings, guideFor
 import type { PageReport, PreviewAction, PreviewResult } from '../softn/preview';
 import { describeExample, docsMap, installExample, listExamples, lookupComponents, readTopic, searchKnowledge } from '../softn/knowledge';
 import { DEFAULT_VIEW_SIZE, MAX_VIEW_SIZE, imageMimeFor, imageSize, viewImage, type ImagePart } from './images';
+import { VOICES_FILE, ownVoice, projectVoiceList, readProjectVoices, savedName, serviceVoice, writeProjectVoices, type ProjectVoices } from './voices';
 import { SOUNDTRACK_FORMATS, SPEECH_FORMATS, createVoice, generateImage, generateMusic, generateSpeech, generateVideo, mediaReady, type MediaFile, type MediaSettings, type SpeechFormat } from './media';
 
 const READ_LINES = 400;
@@ -138,10 +139,12 @@ function describeModels(media: MediaSettings, kind: 'image' | 'video' | 'speech'
   return ` Models: ${lines.join('; ')}.`;
 }
 
-/** generate_image and generate_video, described for the service that is set up (none when there is none). */
-export function mediaTools(media: MediaSettings | null | undefined): ToolSpec[] {
+/** generate_image and generate_video, described for the service that is set up (none when there is none). `voices` are the project's own saved voices (see voices.ts). */
+export function mediaTools(media: MediaSettings | null | undefined, voices?: ProjectVoices): ToolSpec[] {
   const ready = mediaReady(media);
   if (!media || (!ready.image && !ready.video && !ready.speech && !ready.music)) return [];
+  // The saved voices this project may use, by the names the agent knows.
+  if (voices) media = { ...media, voices: projectVoiceList(voices, media.voices ?? []) };
   const where = media.discovered ? `nrob at ${media.discovered.origin}` : new URL(media.baseUrl).host;
   const tools: ToolSpec[] = [];
   const ids = (list: Array<{ id: string }>) => (list.length ? { enum: list.map((m) => m.id) } : {});
@@ -151,6 +154,7 @@ export function mediaTools(media: MediaSettings | null | undefined): ToolSpec[] 
       description:
         `Create an image from a text prompt with the user's image service (${where}) and save it in the project as a PNG. ` +
         'Describe the picture concretely: subject, setting, style, lighting, composition. To edit a picture or combine several, give reference_images (project paths) and say what to change, with a model that edits. ' +
+        'Keep what recurs the same: make a reference image once for each character (only them, full length, facing the camera, neutral expression, on a blank white background) and each prop (alone on a blank white background), and one for each place with no people in it; then make every picture they appear in new, giving them as reference_images and saying each character\'s pose and expression for that moment. A reference image is never used as a picture of the story itself. Look at each picture with view_image, and make it again when a face, hand or body is broken or a character does not match their reference. ' +
         `It takes seconds to a few minutes. The image is shown to the user in the chat; use view_image to look at it yourself.${describeModels(media, 'image')}`,
       parameters: {
         type: 'object',
@@ -175,19 +179,22 @@ export function mediaTools(media: MediaSettings | null | undefined): ToolSpec[] 
       name: 'generate_video',
       description:
         `Create a short video (MP4) with the user's video service (${where}) and save it in the project: from a text prompt, or animating a start_image, optionally moving to an end_image. ` +
-        'Describe the motion as well as the scene: what moves, how the camera moves. ' +
+        'The prompt describes the motion that takes the start frame to the end frame, in order: what each character does first and then, and how (how far and fast they move, gestures, expressions changing, where they look, how they speak), and how the camera moves. Never leave it vague ("they talk", "a scene in a kitchen"). Do not describe the place, the people or the lighting: the start and end frames already show them, and repeating them pulls the picture away from the frames. ' +
+        'Keep every clip to 5 seconds or less (`seconds` at most 5): a scene is several short clips, not one long one. ' +
+        'For a story, make each clip from its shot in the script (see your instructions): the shot\'s Start frame and End frame lines are the prompts for its frames, its Video line is this prompt, and its Dialogue line is what is spoken in it. ' +
         (media.discovered
-          ? 'A character can talk: give `say` (their words; the service speaks them in `voice`, and the lips follow), or `soundtrack` (a speech or audio file in the project to follow). Then without `seconds` the clip is as long as the speech, up to the model\'s limit of a few seconds: keep each line to one short sentence, and make several clips for longer speech. '
+          ? 'A character can talk: give `say` (their words; the service speaks them in `voice`, and the lips follow), or `soundtrack` (a speech or audio file in the project to follow). Then without `seconds` the clip is as long as the speech, up to the model\'s limit of about 5 seconds: keep each line to one short sentence, and make several clips for longer speech. ' +
+            'Only one person may be in the frame while someone speaks: frame the speaker alone in a close-up (head and shoulders filling much of the frame, no other faces) in its start and end frames. With several faces the model moves the wrong mouth. Show the other characters in their own clips, and use shots of several people only without speech (reactions, entrances, wide establishing shots). '
           : '') +
         (media.discovered && ready.speech && lipSync
-          ? 'Keep each character\'s voice the same and their lips in sync: give every speaking character a saved voice (create_voice, once, before their first line), then for each clip with dialogue give `say` (the line) and `voice` (their saved voice) with a model that has lip-synced speech: the service speaks the line in that voice together with the picture, lips in sync. In the prompt, show the character speaking to the camera with their mouth moving as they talk (not deadpan, silent or off camera). '
+          ? 'Keep each character\'s voice the same and their lips in sync: give every speaking character a saved voice (create_voice, once, before their first line), then for each clip with dialogue give `say` (the line) and `voice` (their saved voice) with a model that has lip-synced speech: the service speaks the line in that voice together with the picture, lips in sync. In the prompt, describe the character speaking to the camera, their mouth moving as they talk (not deadpan, silent or off camera). '
           : media.discovered && ready.speech
             ? 'Keep each character\'s voice the same in every clip: give every speaking character a saved voice (create_voice, once, before their first line), and for each clip with dialogue first speak the line with generate_speech in that character\'s saved voice, then give that file as `soundtrack` with its words as `transcript`. Do not use `say` with a described or ad-hoc voice for a recurring character: it sounds different each time. '
             : '') +
         (ready.image
-          ? 'Keep characters the same in every clip: before each clip, make its start frame and end frame with generate_image at the clip\'s size, giving the character image(s) as reference_images (for a clip that continues another, start from that clip\'s last frame); look at both with view_image, then give them as start_image and end_image. Do not leave a character\'s look to the video model and the prompt alone: it drifts from clip to clip. '
+          ? 'Every clip has a start frame and an end frame, and gets both: before each clip, make each new with generate_image at the clip\'s size, giving the scene\'s background (the place with no people in it) and the reference images of the characters and props in it as reference_images, and saying each character\'s pose and expression (a clip that continues another without a cut starts on that clip\'s end frame, the same picture). Never give a character\'s reference image itself as a frame. Look at both with view_image and check them (the characters match their references, the place matches the background, no broken faces, hands or bodies); make a frame again if it is off. Then give them as start_image and end_image. Never make a clip from a prompt alone, or with only a start frame: a character\'s look drifts from clip to clip. '
           : '') +
-        'For a longer video, make several clips: video_frames with last: true gives the last frame of one to start the next on, and media_compose joins them and adds music. ' +
+        'For a longer video, make several clips and join them with media_compose, which adds music too. When a clip ended away from its end frame, start the clip that continues it on its real last frame instead (video_frames with last: true). ' +
         `It takes minutes; the user sees its progress in the chat, and the finished video gets a player there.${describeModels(media, 'video')}`,
       parameters: {
         type: 'object',
@@ -196,10 +203,10 @@ export function mediaTools(media: MediaSettings | null | undefined): ToolSpec[] 
           prompt: str,
           path: { type: 'string', description: 'Where to save it in the project, e.g. media/intro.mp4' },
           model: { type: 'string', ...ids(media.videoModels) },
-          seconds: { type: 'number', description: 'Length in seconds (leave it out to follow `say` or `soundtrack`)' },
+          seconds: { type: 'number', description: 'Length in seconds, at most 5 (leave it out to follow `say` or `soundtrack`)' },
           size: { type: 'string', description: 'WIDTHxHEIGHT, e.g. 768x512 or 1024x576' },
-          start_image: { type: 'string', description: 'Project path of a picture to use as the first frame' },
-          end_image: { type: 'string', description: 'Project path of a picture to end on: the clip moves from the start to it' },
+          start_image: { type: 'string', description: 'Project path of a picture to use as the first frame (give end_image too)' },
+          end_image: { type: 'string', description: 'Project path of a picture to end on: the clip moves from the start to it (give start_image too)' },
           ...(media.discovered
             ? {
                 say: { type: 'string', description: 'Words the character speaks, with lip movement to match' },
@@ -252,6 +259,7 @@ export function mediaTools(media: MediaSettings | null | undefined): ToolSpec[] 
             description: { type: 'string', description: 'Who speaks: age, gender, accent, tone, pace, character' },
             sample_text: { type: 'string', description: 'A line the sample says' },
             language: str,
+            replace: { type: 'boolean', description: 'Design it again although this project already has a voice of that name (it then sounds different from the lines already made)' },
           },
         },
       });
@@ -402,7 +410,7 @@ export const TOOLS: ToolSpec[] = [
     name: 'video_frames',
     description:
       'Save frames of a video as PNG images: at times (seconds), by frame number (from 0), one every N seconds, or the first and last. ' +
-      'The last frame of a clip is the start_image that continues it in generate_video. Look at frames with view_image.',
+      'The last frame of a clip starts the clip that continues it when the clip ended away from its end frame. Look at frames with view_image.',
     parameters: {
       type: 'object',
       required: ['path'],
@@ -483,6 +491,12 @@ export const TOOLS: ToolSpec[] = [
   {
     name: 'write_file',
     description: 'Create a file, or replace one you have read in full. Parent folders are created.',
+    parameters: { type: 'object', required: ['path', 'content'], properties: { path: str, content: str } },
+  },
+  {
+    name: 'append_file',
+    description:
+      'Add text to the end of a file (created with its folders if missing; no read needed). Write a long document in parts with it: one section per call, each continuing where the file ends. A newline is put between the old end and the new text when neither has one.',
     parameters: { type: 'object', required: ['path', 'content'], properties: { path: str, content: str } },
   },
   {
@@ -841,6 +855,19 @@ async function execute(call: ToolCall, ctx: ToolContext, out: ToolOut): Promise<
       ctx.reads.set(key, vfs.version(`/${key}`));
       return `wrote /${key} (${content.split('\n').length} lines)`;
     }
+    case 'append_file': {
+      const key = normalizePath(need(input, 'path'));
+      const content = need(input, 'content');
+      const before = vfs.exists(`/${key}`) ? vfs.readText(`/${key}`) : '';
+      // A fresh read stays fresh (the agent knows what it added), and a new file is known in full.
+      const fresh = ctx.reads.get(key) === vfs.version(`/${key}`);
+      const gap = before && !before.endsWith('\n') && !content.startsWith('\n') ? '\n' : '';
+      vfs.writeFile(`/${key}`, gap + content, { parents: true, append: true });
+      if (!before) ctx.reads.delete(`${key}#partial`);
+      if (fresh || !before) ctx.reads.set(key, vfs.version(`/${key}`));
+      const lines = (before + gap + content).split('\n').length;
+      return `appended ${content.split('\n').length} lines to /${key} (now ${lines.toLocaleString()} lines)`;
+    }
     case 'edit_file': {
       const key = normalizePath(need(input, 'path'));
       const oldString = need(input, 'old_string');
@@ -1067,7 +1094,7 @@ async function execute(call: ToolCall, ctx: ToolContext, out: ToolOut): Promise<
         size: text('size'),
         startImage,
         endImage,
-        speech: say ? { input: say, voice: text('voice'), instructions: text('voice_description') } : undefined,
+        speech: say ? { input: say, voice: serviceVoice(readProjectVoices(vfs), text('voice')), instructions: text('voice_description') } : undefined,
         audio: soundtrack,
         transcript,
       }, (message) => ctx.progress?.(message), ctx.signal);
@@ -1087,8 +1114,10 @@ async function execute(call: ToolCall, ctx: ToolContext, out: ToolOut): Promise<
         format = 'mp3';
         path = `${path.replace(/\.[a-z0-9]{1,5}$/i, '')}.mp3`;
       }
-      const voice = typeof input.voice === 'string' && input.voice.trim() ? input.voice.trim() : undefined;
-      ctx.progress?.(`speaking${voice ? ` as ${voice}` : ''}…`);
+      const named = typeof input.voice === 'string' && input.voice.trim() ? input.voice.trim() : undefined;
+      // This project's voice of that name, as the service saved it.
+      const voice = serviceVoice(readProjectVoices(vfs), named);
+      ctx.progress?.(`speaking${named ? ` as ${named}` : ''}…`);
       const result = await generateSpeech(media, {
         input: words,
         voice,
@@ -1108,15 +1137,32 @@ async function execute(call: ToolCall, ctx: ToolContext, out: ToolOut): Promise<
       if (!media || !mediaReady(media).speech) throw new Error('no speech service is set up (the user can add one in Settings, under Images, video and audio)');
       const name = need(input, 'name').trim();
       ctx.progress?.(`designing the voice ${name}…`);
+      // Saved under this project's key, so another project's voice of the same
+      // name neither blocks it nor is used in its place.
+      // The key is kept before the service is asked, so voices made at the same time share it.
+      const project = readProjectVoices(vfs);
+      if (!vfs.exists(VOICES_FILE)) writeProjectVoices(vfs, project);
+      // The service replaces a voice of the same name: keep a character's voice unless asked to change it.
+      const known = ownVoice(project, name);
+      const onService = !media.voices || media.voices.some((v) => v.name === project.voices[known ?? '']);
+      if (known && onService && input.replace !== true) {
+        return `"${known}" is already this project's voice: speak in it with voice: "${known}". Designing it again would make ${known} sound different from the lines already made; give replace: true only when that is wanted.`;
+      }
       const voice = await createVoice(media, {
-        name,
+        name: savedName(project, name),
         description: need(input, 'description'),
         sampleText: typeof input.sample_text === 'string' ? input.sample_text : undefined,
         language: typeof input.language === 'string' ? input.language : undefined,
       }, ctx.signal);
+      // Read again: other voices may have been saved while this one was made.
+      const now = readProjectVoices(vfs);
+      const before = ownVoice(now, name);
+      if (before) delete now.voices[before];
+      now.voices[name] = voice.name;
+      writeProjectVoices(vfs, now);
       // The next tool descriptions offer it by name.
       media.voices = [...(media.voices ?? []).filter((v) => v.name !== voice.name), voice];
-      return `Saved the voice "${voice.name}"${voice.description ? ` (${voice.description})` : ''}. Speak in it with voice: "${voice.name}" in generate_speech, or in generate_video with say.`;
+      return `Saved the voice "${name}"${voice.description ? ` (${voice.description})` : ''}. Speak in it with voice: "${name}" in generate_speech, or in generate_video with say.`;
     }
     case 'generate_music': {
       const media = ctx.media?.();

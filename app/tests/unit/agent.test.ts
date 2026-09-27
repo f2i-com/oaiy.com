@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { Agent, type AgentEvent } from '../../src/agent/agent';
 import { NetGate } from '../../src/gate/netgate';
 import { Vfs } from '../../src/vfs/vfs';
+import { EMPTY_MEDIA } from '../../src/agent/media';
 import { ANTHROPIC, LOCAL, OPENAI, fakeProvider } from './fakeProvider';
 import type { ProviderConfig } from '../../src/agent/providers/types';
 
@@ -85,6 +86,8 @@ describe('tool rules', () => {
     expect(fake.urls[0]).toBe('http://localhost:11434/v1/chat/completions');
     expect(fake.bodies[0].max_tokens).toBeDefined();
     expect(fake.bodies[0].max_completion_tokens).toBeUndefined();
+    // No media service: no media instructions to pay for in a small window.
+    expect(JSON.stringify(fake.bodies[0])).not.toContain('create_voice');
   });
 
   it('a small context window gets the core tools without the video editing ones', async () => {
@@ -96,6 +99,41 @@ describe('tool rules', () => {
     const large = fakeProvider('openai', [{ text: 'hi' }]);
     await setup({ ...LOCAL, contextTokens: 32_000 }).agent.run('hello', () => {});
     expect(names(large.bodies[0])).toEqual(expect.arrayContaining(['media_info', 'video_frames', 'video_split', 'media_compose']));
+  });
+
+  it('a small window with a video service gets the scripted way to a story in brief, and room to work', async () => {
+    const fake = fakeProvider('openai', [{ text: 'hi' }]);
+    const media = { ...EMPTY_MEDIA, baseUrl: 'http://127.0.0.1:8080', imageModel: 'image', videoModel: 'video', speechModel: 'speech' };
+    const agent = new Agent({ vfs: new Vfs(), gate: new NetGate(), provider: () => ({ ...LOCAL, contextTokens: 12_000 }), projectSummary: () => '', media: () => media });
+    const events: AgentEvent[] = [];
+    await agent.run('make a short film', (e) => events.push(e));
+    expect(events.find((e) => e.type === 'error')).toBeUndefined();
+    const system = JSON.stringify(fake.bodies[0].messages);
+    expect(system).toContain('is made from a script, written first in video/NAME/script.md');
+    expect(system).not.toContain('Review each frame');
+  });
+
+  it('with a video service, a story is scripted shot by shot before anything is made', async () => {
+    const fake = fakeProvider('openai', [{ text: 'hi' }]);
+    const media = { ...EMPTY_MEDIA, baseUrl: 'http://127.0.0.1:8080', imageModel: 'image', videoModel: 'video', speechModel: 'speech' };
+    const agent = new Agent({ vfs: new Vfs(), gate: new NetGate(), provider: () => ({ ...LOCAL, contextTokens: 32_000 }), projectSummary: () => '', media: () => media });
+    await agent.run('make a short film', () => {});
+    const system = JSON.stringify(fake.bodies[0].messages);
+    expect(system).toContain('video/NAME/) with script.md');
+    for (const line of ['Premise:', 'Characters:', 'Props:', 'Scenes:', 'Start frame:', 'End frame:', 'Video:', 'Dialogue:', 'Sound:']) expect(system).toContain(line);
+    expect(system).toMatch(/read it all back and revise it with edit_file until: the story holds together/);
+    // Reference images with neutral faces on blank white; the frames give the expressions, and props are made first.
+    expect(system).toContain('facing the camera with a neutral expression, on a blank white background');
+    expect(system).toContain('never left neutral');
+    expect(system).toContain("a. Each character's reference image (neutral expression, blank white background) and saved voice, and each prop's reference image");
+    // Each scene's empty background, reviewed; frames made new from it and reviewed, again when off.
+    expect(system).toContain('a Background line: the empty place');
+    expect(system).toMatch(/b\. Each scene's background.*Review it.*If not, make it again\./);
+    expect(system).toMatch(/c\. Then shot by shot, in order: its start and end frames.*each made new with generate_image from the scene's background.*Never use a character's or prop's reference image itself as a frame\..*Review each frame.*make it again/);
+    expect(system).toContain("d. Then that shot's clip, from its two frames and its Video and Dialogue lines, before the next shot.");
+    // Every shot ends on its own end frame, and its Video line tells the motion between the two.
+    expect(system).toContain('Every shot has one, and it differs from the start frame.');
+    expect(system).toContain('Video: the motion from the start frame to the end frame, in order');
   });
 
   it('write_file needs a full read before it replaces an existing file', async () => {
@@ -111,6 +149,29 @@ describe('tool rules', () => {
     await agent.run('go', emit);
     expect(vfs.readText('/src/app.js')).toContain('hello');
     expect(vfs.readText('/notes/new.md')).toBe('# new');
+  });
+
+  it('append_file writes a long document in parts, and the parts can then be edited', async () => {
+    fakeProvider('anthropic', [
+      { calls: [{ name: 'append_file', input: { path: 'script/draft.md', content: '# Act one\nGary cooks.' } }] },
+      { calls: [{ name: 'append_file', input: { path: 'script/draft.md', content: '# Act two\nGary rests.\n' } }] },
+      // Appending to a file it wrote keeps it known, so it can edit without reading again.
+      { calls: [{ name: 'edit_file', input: { path: 'script/draft.md', old_string: 'Gary rests.', new_string: 'Gary sleeps.' } }] },
+      // An existing file it never read can be added to, not edited.
+      { calls: [{ name: 'append_file', input: { path: 'src/app.js', content: '// more' } }] },
+      (body) => {
+        expect(JSON.stringify(body)).toContain('now 3 lines');
+        return { calls: [{ name: 'edit_file', input: { path: 'src/app.js', old_string: '// more', new_string: '' } }] };
+      },
+      (body) => {
+        expect(JSON.stringify(body)).toContain('before you edit it');
+        return { text: 'ok' };
+      },
+    ]);
+    const { vfs, agent, emit } = setup(ANTHROPIC);
+    await agent.run('go', emit);
+    expect(vfs.readText('/script/draft.md')).toBe('# Act one\nGary cooks.\n# Act two\nGary sleeps.\n');
+    expect(vfs.readText('/src/app.js')).toMatch(/\n\/\/ more$/);
   });
 
   it('asks once more when the server could not read a tool call, then gives up', async () => {

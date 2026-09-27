@@ -15,7 +15,7 @@ function summarizeCall(call: ToolCall): string {
   const i = call.input;
   const s = (k: string) => (typeof i[k] === 'string' ? String(i[k]) : '');
   switch (call.name) {
-    case 'read_file': case 'write_file': case 'edit_file': case 'delete_file': case 'list_files': return s('path') || '/';
+    case 'read_file': case 'write_file': case 'append_file': case 'edit_file': case 'delete_file': case 'list_files': return s('path') || '/';
     case 'grep': return `${s('pattern')}${s('path') ? ` in ${s('path')}` : ''}`;
     case 'glob': return s('pattern');
     case 'sandbox_shell': return s('command').split('\n')[0];
