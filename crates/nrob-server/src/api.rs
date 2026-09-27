@@ -46,6 +46,8 @@ pub struct Config {
     pub max_tokens: usize,
     pub temperature: f32,
     pub top_p: f32,
+    /// Repeat penalty on reply prose when a request gives none (1 = off).
+    pub repeat_penalty: f32,
     /// The vision tower's config when it is loaded (else images are refused).
     pub vision: Option<VisionConfig>,
     pub qwen_vision: Option<llama_rs::MmProjConfig>,
@@ -284,7 +286,24 @@ impl Server {
         if !(1.0..=2.0).contains(&reasoning_repeat_penalty) || !(0.0..=4096.0).contains(&reasoning_repeat_last_n) || reasoning_repeat_last_n.fract()!=0.0 {
             return Err(bad("reasoning_repeat_penalty must be in [1,2]; reasoning_repeat_last_n must be an integer in [0,4096]"));
         }
-        Ok((Sampling { temperature, top_p, top_k, seed, reasoning_repeat_penalty: reasoning_repeat_penalty as f32, reasoning_repeat_last_n: reasoning_repeat_last_n as usize }, max_tokens))
+        // The reply's prose: a repeat penalty (llama.cpp's repeat_penalty, or
+        // repetition_penalty), and OpenAI's presence and frequency penalties.
+        let repeat_penalty = num("repeat_penalty")?.or(num("repetition_penalty")?).unwrap_or(a.cfg.repeat_penalty as f64);
+        let repeat_last_n = num("repeat_last_n")?.unwrap_or(256.0);
+        let presence_penalty = num("presence_penalty")?.unwrap_or(0.0);
+        let frequency_penalty = num("frequency_penalty")?.unwrap_or(0.0);
+        if !(1.0..=2.0).contains(&repeat_penalty) || !(0.0..=4096.0).contains(&repeat_last_n) || repeat_last_n.fract() != 0.0 {
+            return Err(bad("repeat_penalty must be in [1,2]; repeat_last_n must be an integer in [0,4096]"));
+        }
+        if !(-2.0..=2.0).contains(&presence_penalty) || !(-2.0..=2.0).contains(&frequency_penalty) {
+            return Err(bad("presence_penalty and frequency_penalty must be in [-2,2]"));
+        }
+        Ok((Sampling {
+            temperature, top_p, top_k, seed,
+            reasoning_repeat_penalty: reasoning_repeat_penalty as f32, reasoning_repeat_last_n: reasoning_repeat_last_n as usize,
+            repeat_penalty: repeat_penalty as f32, repeat_last_n: repeat_last_n as usize,
+            presence_penalty: presence_penalty as f32, frequency_penalty: frequency_penalty as f32,
+        }, max_tokens))
     }
 
     fn stops(body: &Json) -> Result<Vec<String>, ApiError> {

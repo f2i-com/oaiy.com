@@ -15,6 +15,13 @@ pub struct Sampling {
     pub temperature: f32,
     pub reasoning_repeat_penalty: f32,
     pub reasoning_repeat_last_n: usize,
+    /// On the reply's prose (not its thinking, not inside a tool call, where
+    /// code rightly repeats): a repeat penalty over the last `repeat_last_n`
+    /// tokens (1 = off), and OpenAI's presence and frequency penalties.
+    pub repeat_penalty: f32,
+    pub repeat_last_n: usize,
+    pub presence_penalty: f32,
+    pub frequency_penalty: f32,
     pub top_p: f32,
     /// 0 = no limit (up to [`CANDIDATES`]).
     pub top_k: usize,

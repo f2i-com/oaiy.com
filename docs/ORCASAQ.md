@@ -181,7 +181,7 @@ in addition to the manual full-capacity and release CUDA comparisons.
 
 ### Optional LoRA adapters
 
-Native inference supports one PEFT LoRA or rsLoRA adapter per Orca model alias.
+Native inference supports PEFT LoRA and rsLoRA adapters per Orca model alias: one, or several stacked (`--lora NAME=DIR` repeated, each `DIR@X` at strength X; in Studio, the model's `lora` folder plus its `loras` list). Adapters that change the same projections add up: two at full strength can overcook the model (Yes-Man and absolute-heresy, both on `down_proj`/`o_proj`/`out_proj`, garbled their grammar at 1 + 1 and read well at 1 + 0.5), so a second one usually wants a lower strength.
 Use an adapter trained for `Qwen/Qwen3.8-27B`, containing
 `adapter_config.json` and `adapter_model.safetensors`. Nrob reads those files
 directly; the packed 3.21-bpw base weights remain unchanged. Adapter matrices

@@ -599,6 +599,8 @@ impl Engine {
         phase.push(tool_prefix);
         complete_tools.push(tool_prefix);
         let mut reasoning_history = std::collections::VecDeque::new();
+        // The reply's recent prose tokens, for its repetition penalties.
+        let mut reply_history = std::collections::VecDeque::new();
         let mut commented = false;
         let mut reasoning_commented = false;
         let mut repetition = crate::repetition::Guard::default();
@@ -609,10 +611,17 @@ impl Engine {
             if budget.thinking && !phase.original() {
                 penalize_reasoning(&mut logits, &reasoning_history, job.sampling.reasoning_repeat_penalty);
             } else { reasoning_history.clear(); }
+            // Prose only: a tool call's code and file contents rightly repeat.
+            let in_prose = !budget.thinking && !phase.original();
+            if in_prose { penalize_reply(&mut logits, &reply_history, &job.sampling); }
             let (next, forced) = budget.pass(sample(&logits, &job.sampling, &mut rng));
             if was_thinking && !phase.original() && !forced && !self.tok.is_special(next) {
                 reasoning_history.push_back(next);
                 while reasoning_history.len() > job.sampling.reasoning_repeat_last_n { reasoning_history.pop_front(); }
+            }
+            if in_prose && !forced && !self.tok.is_special(next) {
+                reply_history.push_back(next);
+                while reply_history.len() > job.sampling.repeat_last_n { reply_history.pop_front(); }
             }
             if forced && self.log {
                 eprintln!("  reasoning ended by budget/repetition control after {} tokens", budget.used);
@@ -953,6 +962,31 @@ fn observer_q4_forward(generated: usize, budget: usize) -> bool {
     budget > 0 && generated > 0 && generated <= budget.min(crate::observer::MAX_Q4)
 }
 
+/// The reply's penalties over its recent prose: repeat (sign-aware, once per
+/// token), presence (once per token) and frequency (per occurrence).
+fn penalize_reply(logits: &mut [f32], history: &std::collections::VecDeque<u32>, s: &Sampling) {
+    if s.repeat_penalty <= 1.0 && s.presence_penalty == 0.0 && s.frequency_penalty == 0.0 { return; }
+    let mut counts: std::collections::HashMap<u32, f32> = std::collections::HashMap::new();
+    for &id in history { *counts.entry(id).or_insert(0.0) += 1.0; }
+    for (id, count) in counts {
+        if let Some(value) = logits.get_mut(id as usize) {
+            if s.repeat_penalty > 1.0 { *value = if *value < 0.0 { *value * s.repeat_penalty } else { *value / s.repeat_penalty }; }
+            *value -= s.presence_penalty + s.frequency_penalty * count;
+        }
+    }
+}
+#[test]
+fn reply_penalties_push_recent_tokens_down_and_are_off_by_default() {
+    let history = std::collections::VecDeque::from(vec![0, 0, 1]);
+    let original = vec![2.0, -2.0, 1.5];
+    let base = Sampling { temperature: 1.0, top_p: 1.0, top_k: 0, seed: 0, reasoning_repeat_penalty: 1.0, reasoning_repeat_last_n: 256, repeat_penalty: 1.0, repeat_last_n: 256, presence_penalty: 0.0, frequency_penalty: 0.0 };
+    let mut logits = original.clone();
+    penalize_reply(&mut logits, &history, &base); assert_eq!(logits, original);
+    penalize_reply(&mut logits, &history, &Sampling { repeat_penalty: 2.0, ..base }); assert_eq!(logits, vec![1.0, -4.0, 1.5]);
+    let mut logits = original.clone();
+    penalize_reply(&mut logits, &history, &Sampling { presence_penalty: 0.5, frequency_penalty: 0.25, ..base });
+    assert_eq!(logits, vec![2.0 - 0.5 - 0.5, -2.0 - 0.5 - 0.25, 1.5]);
+}
 fn penalize_reasoning(logits: &mut [f32], history: &std::collections::VecDeque<u32>, penalty: f32) {
     if penalty <= 1.0 { return; }
     let unique: std::collections::HashSet<_> = history.iter().copied().collect();
@@ -1135,14 +1169,14 @@ mod tests {
     fn sampling_respects_temperature_top_k_and_top_p() {
         let logits = vec![0.0, 5.0, 4.0, -1.0, 4.9];
         let mut rng = 1;
-        let greedy = Sampling { temperature: 0.0, top_p: 1.0, top_k: 0, seed: 0, reasoning_repeat_penalty: 1.0, reasoning_repeat_last_n: 256 };
+        let greedy = Sampling { temperature: 0.0, top_p: 1.0, top_k: 0, seed: 0, reasoning_repeat_penalty: 1.0, reasoning_repeat_last_n: 256, repeat_penalty: 1.0, repeat_last_n: 256, presence_penalty: 0.0, frequency_penalty: 0.0 };
         assert_eq!(sample(&logits, &greedy, &mut rng), 1);
-        let top1 = Sampling { temperature: 1.0, top_p: 1.0, top_k: 1, seed: 0, reasoning_repeat_penalty: 1.0, reasoning_repeat_last_n: 256 };
+        let top1 = Sampling { temperature: 1.0, top_p: 1.0, top_k: 1, seed: 0, reasoning_repeat_penalty: 1.0, reasoning_repeat_last_n: 256, repeat_penalty: 1.0, repeat_last_n: 256, presence_penalty: 0.0, frequency_penalty: 0.0 };
         for _ in 0..50 {
             assert_eq!(sample(&logits, &top1, &mut rng), 1);
         }
         // top-p 0.5 keeps the best two (5.0, 4.9: ~0.47 then ~0.9 of the mass)
-        let nucleus = Sampling { temperature: 1.0, top_p: 0.5, top_k: 0, seed: 0, reasoning_repeat_penalty: 1.0, reasoning_repeat_last_n: 256 };
+        let nucleus = Sampling { temperature: 1.0, top_p: 0.5, top_k: 0, seed: 0, reasoning_repeat_penalty: 1.0, reasoning_repeat_last_n: 256, repeat_penalty: 1.0, repeat_last_n: 256, presence_penalty: 0.0, frequency_penalty: 0.0 };
         let mut seen = [0usize; 5];
         for _ in 0..2000 {
             seen[sample(&logits, &nucleus, &mut rng) as usize] += 1;

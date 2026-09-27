@@ -455,6 +455,7 @@ impl Models {
             max_tokens: o.max_tokens,
             temperature: o.temperature,
             top_p: o.top_p,
+            repeat_penalty: o.repeat_penalty,
             vision: None,
             qwen_vision: None,
             image_token_id: 0,
@@ -584,10 +585,13 @@ impl Models {
     fn load_orcasaq(&self, spec: &Spec) -> Result<Live> {
         let o=&self.opts;
         self.say(format!("loading {}: native EXL3 mixed precision",spec.name));
-        let strength=o.lora_strengths.get(&spec.name).copied().unwrap_or(1.0);
-        let adapter=o.lora_adapters.get(&spec.name).map(|path|crate::lora::Adapter::open(path).map(|a|a.with_strength(strength))).transpose()?;
-        let model=if let Some(adapter)=&adapter {crate::orcasaq::load_with_adapter(&spec.path,&o.devices,Some(adapter))?} else {crate::orcasaq::load(&spec.path,&o.devices)?};
-        if let Some(adapter)=&adapter {self.say(format!("OrcaSAQ: loaded LoRA for {} text projections (strength {strength})",adapter.len()));}
+        // Every adapter for the alias, applied together, each at its strength (else the alias's).
+        let default_strength=o.lora_strengths.get(&spec.name).copied().unwrap_or(1.0);
+        let adapters=o.lora_adapters.get(&spec.name).map(|list| list.iter().map(|(path,strength)| crate::lora::Adapter::open(path).map(|a|a.with_strength(strength.unwrap_or(default_strength)))).collect::<Result<Vec<_>>>()).transpose()?.unwrap_or_default();
+        let model=if adapters.is_empty() {crate::orcasaq::load(&spec.path,&o.devices)?} else {crate::orcasaq::load_with_adapter(&spec.path,&o.devices,&adapters)?};
+        for (adapter,(path,strength)) in adapters.iter().zip(o.lora_adapters.get(&spec.name).into_iter().flatten()) {
+            self.say(format!("OrcaSAQ: loaded LoRA {} for {} text projections (strength {})",path.display(),adapter.len(),strength.unwrap_or(default_strength)));
+        }
         let tok=Arc::new(model.tokenizer().clone());
         let max_seq=self.context(model.config().context_length);
         let mut cfg=self.base_cfg(spec,max_seq);
@@ -609,7 +613,7 @@ impl Models {
         if let Some(dir)=&o.prompt_cache {
             let mut fp=disk::fnv(b"orcasaq2-exl3-qwen-state-v1",0);
             fp=disk::fnv(spec.path.as_os_str().as_encoded_bytes(),fp);
-            if let Some(adapter)=&adapter {fp=disk::fnv(&adapter.fingerprint.to_le_bytes(),fp);}
+            for adapter in &adapters {fp=disk::fnv(&adapter.fingerprint.to_le_bytes(),fp);}
             let mut files:Vec<_>=std::fs::read_dir(&spec.path)?.filter_map(|e|e.ok().map(|e|e.path())).filter(|p|
                 p.extension().is_some_and(|x|x=="safetensors" || x=="json")).collect();
             if let Some(path)=vision_path {

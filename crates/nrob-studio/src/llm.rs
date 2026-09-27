@@ -172,6 +172,19 @@ pub fn arguments(llm: &Json, root: &Path, port: u16, key: &str, local_images: bo
                 push("--lora-strength", format!("{name}={s}"));
             }
         }
+        // More LoRAs (`loras`: [{path, strength}] or paths), stacked with it, each at its own strength.
+        for l in m.get("loras").and_then(Json::as_array).into_iter().flatten() {
+            let (file, strength) = match l {
+                Json::Str(p) => (Some(p.as_str()), None),
+                _ => (l.get("path").and_then(Json::as_str), l.get("strength").and_then(Json::as_f64)),
+            };
+            let Some(file) = file.map(str::trim).filter(|p| !p.is_empty()) else { continue };
+            let file = config::resolve(root, file).to_string_lossy().into_owned();
+            push("--lora", match strength.filter(|s| s.is_finite() && *s != 1.0) {
+                Some(s) => format!("{name}={file}@{s}"),
+                None => format!("{name}={file}"),
+            });
+        }
     }
     push("--host", "127.0.0.1".into());
     push("--port", port.to_string());
@@ -180,6 +193,11 @@ pub fn arguments(llm: &Json, root: &Path, port: u16, key: &str, local_images: bo
     push("--max-tokens", int_or(llm, "max_tokens", 8192).to_string());
     push("--temperature", num_or(llm, "temperature", 0.6).to_string());
     push("--top-p", num_or(llm, "top_p", 0.95).to_string());
+    // Against a reply that loops on a phrase (prose only; not thinking or tool calls).
+    let repeat = num_or(llm, "repeat_penalty", 1.0);
+    if repeat > 1.0 {
+        push("--repeat-penalty", repeat.clamp(1.0, 2.0).to_string());
+    }
     // Unset: every core the machine has (nrob-server's 24 suits one machine only).
     let cores = std::thread::available_parallelism().map_or(8, |n| n.get()) as i64;
     push("--cpu-threads", llm.get("cpu_threads").and_then(Json::as_i64).unwrap_or(cores).to_string());
@@ -536,6 +554,11 @@ mod tests {
         let auto = Json::parse(br#"{"models": [{"name": "a", "path": "a.gguf"}]}"#).unwrap();
         let joined = arguments(&auto, root, 1, "k", true).unwrap().0.join(" ");
         assert!(joined.contains("--ctx auto"), "{joined}");
+        // LoRAs stack: the adapter folder, then each of `loras` at its own strength.
+        let stacked = Json::parse(br#"{"models": [{"name": "q", "path": "C:/q", "lora": "C:/yes", "loras": [{"path": "C:/heresy", "strength": 0.5}, "C:/plain"]}]}"#).unwrap();
+        let args = arguments(&stacked, root, 1, "k", true).unwrap().0;
+        let loras: Vec<&str> = args.windows(2).filter(|w| w[0] == "--lora").map(|w| w[1].as_str()).collect();
+        assert_eq!(loras, ["q=C:/yes", "q=C:/heresy@0.5", "q=C:/plain"]);
     }
 
     #[test]

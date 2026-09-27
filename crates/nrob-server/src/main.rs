@@ -53,6 +53,8 @@ const HELP: &str = "Observer: --observer-model FILE.gguf --observer-device auto|
   --effort N           default reasoning effort, 1-100 (default 75)
   --max-tokens N       reply length when a request gives none (default 8192)
   --temperature F      default temperature (default 0.6)
+  --repeat-penalty F   default repeat penalty on reply prose, 1-2 (default 1 = off;
+                       not on thinking or tool calls; requests: repeat_penalty)
   --top-p F            default top-p (default 0.95)
   --step-below N       prompt stretches shorter than this run one token at a
                        time through the decode path (default 512)
@@ -68,8 +70,9 @@ const HELP: &str = "Observer: --observer-model FILE.gguf --observer-device auto|
                        again (default: not kept)
   --prompt-cache-gb F  disk the prompt states may take (default 4)
   --cpu-threads N      CPU threads for experts that miss VRAM (default 24; 0 = off)
-  --lora NAME=DIR             PEFT LoRA/rsLoRA adapter for an Orca model alias
-  --lora-strength NAME=X      how strongly that adapter applies (default 1 = as trained; -4..4)
+  --lora NAME=DIR[@X]         PEFT LoRA/rsLoRA adapter for an Orca model alias; repeat
+                              it to stack several, each at strength X (default 1)
+  --lora-strength NAME=X      strength of NAME's adapters that give none (default 1; -4..4)
   --vision-projector NAME=PATH  GGUF projector, or original Qwen vision directory for Orca
   --no-vision          skip the vision tower (images are refused)
   --local-images on|off  let requests name image files on this machine (paths,
@@ -145,8 +148,17 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Options, Stri
             "--start" => a.start_model = Some(val()?),
             "--lora" => {
                 let value=val()?;
-                let (name,path)=value.split_once('=').filter(|(n,p)|!n.is_empty() && !p.is_empty()).ok_or("--lora wants NAME=DIR")?;
-                a.lora_adapters.insert(name.into(),path.into());
+                let (name,path)=value.split_once('=').filter(|(n,p)|!n.is_empty() && !p.is_empty()).ok_or("--lora wants NAME=DIR[@STRENGTH]")?;
+                // A trailing @X is the adapter's strength (a path's own @ stays when X is not a number).
+                let (path,strength)=match path.rsplit_once('@') {
+                    Some((p,s)) if !p.is_empty() && s.parse::<f32>().is_ok() => {
+                        let s:f32=s.parse().unwrap();
+                        if !(s.is_finite() && (-4.0..=4.0).contains(&s)) { return Err("--lora strength must be between -4 and 4".into()); }
+                        (p,Some(s))
+                    }
+                    _ => (path,None),
+                };
+                a.lora_adapters.entry(name.into()).or_default().push((path.into(),strength));
             }
             "--lora-strength" => {
                 let value=val()?;
@@ -182,6 +194,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Options, Stri
             "--max-tokens" => a.max_tokens = num(val()?)?.max(1),
             "--temperature" => a.temperature = val()?.parse().map_err(|_| "--temperature: not a number".to_string())?,
             "--top-p" => a.top_p = val()?.parse().map_err(|_| "--top-p: not a number".to_string())?,
+            "--repeat-penalty" => a.repeat_penalty = val()?.parse().ok().filter(|p: &f32| (1.0..=2.0).contains(p)).ok_or("--repeat-penalty: a number from 1 to 2")?,
             "--chunk" => a.chunk = num(val()?)?.max(1),
             "--step-below" => a.step_below = num(val()?)?,
             "--layered-max" => a.layered_max = num(val()?)?,

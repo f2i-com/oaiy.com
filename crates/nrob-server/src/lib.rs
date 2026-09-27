@@ -111,9 +111,10 @@ pub struct Options {
     /// Vision projectors keyed by model name: GGUF files, or original Qwen
     /// safetensors directories for OrcaSAQ (tools/orcasaq/download.py --vision).
     pub vision_projectors: std::collections::BTreeMap<String, PathBuf>,
-    /// One PEFT adapter directory per Orca model alias.
-    pub lora_adapters: std::collections::BTreeMap<String, PathBuf>,
-    /// How strongly each alias's adapter applies (1 = as trained).
+    /// PEFT adapter directories per Orca model alias, applied together in
+    /// order, each with its own strength when it was given one.
+    pub lora_adapters: std::collections::BTreeMap<String, Vec<(PathBuf, Option<f32>)>>,
+    /// How strongly an alias's adapters apply when they give no strength of their own (1 = as trained).
     pub lora_strengths: std::collections::BTreeMap<String, f32>,
     /// Which configured model to load at start, by name. `None` takes `name`.
     ///
@@ -144,6 +145,8 @@ pub struct Options {
     pub max_tokens: usize,
     pub temperature: f32,
     pub top_p: f32,
+    /// Repeat penalty on reply prose when a request gives none (1 = off).
+    pub repeat_penalty: f32,
     /// Attention sub-chunk of a layered pass.
     pub chunk: usize,
     /// Prompt stretches shorter than this run one token at a time.
@@ -241,6 +244,7 @@ impl Default for Options {
             max_tokens: 8192,
             temperature: 0.6,
             top_p: 0.95,
+            repeat_penalty: 1.0,
             chunk: 1024,
             step_below: 512,
             layered_max: 20_480,
