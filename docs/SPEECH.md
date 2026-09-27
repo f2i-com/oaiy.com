@@ -48,7 +48,7 @@ OpenAI's request, plus a few extensions. It returns the audio itself.
 | Field | Meaning |
 |---|---|
 | `input` | The text to speak (up to 20000 bytes). |
-| `voice` | A saved voice's name, or an OpenAI voice name (`alloy`, `ash`, `ballad`, `cedar`, `coral`, `echo`, `fable`, `marin`, `nova`, `onyx`, `sage`, `shimmer`, `verse`, each given a matching description). May also be `{"id": "..."}`. |
+| `voice` | A saved voice's name, or an OpenAI voice name (`alloy`, `ash`, `ballad`, `cedar`, `coral`, `echo`, `fable`, `marin`, `nova`, `onyx`, `sage`, `shimmer`, `verse`, each given a matching description). May also be `{"id": "..."}`, or a voice itself: the object `POST /v1/audio/voices` with `keep: false` handed back (nothing needs to be saved here). |
 | `instructions` | Describe any voice in words; this takes precedence over an OpenAI voice name. It is ignored for saved voices. |
 | `model` | A speech model; `tts-1`, `tts-1-hd` and `gpt-4o-mini-tts` mean the default. |
 | `response_format` | `mp3` (default), `opus`, `aac`, `flac`, `wav`, or `pcm` (16-bit mono, 24 kHz). |
@@ -70,7 +70,7 @@ curl http://127.0.0.1:8080/v1/audio/speech -H "Content-Type: application/json" \
 | Request | Does |
 |---|---|
 | `GET /v1/audio/voices` | Lists saved voices (name, description, language, sample text, time). |
-| `POST /v1/audio/voices` | Designs and saves a voice. JSON: `name`, `description`, and optionally `sample_text`, `language`, `seed`, `replace`. Takes about 10 seconds. |
+| `POST /v1/audio/voices` | Designs and saves a voice. JSON: `name`, `description`, and optionally `sample_text`, `language`, `seed`, `replace`. Takes about 10 seconds. With `keep: false` (the default in incognito, where saving is refused) nothing is saved: the reply also holds `voice` (the voice itself) and `sample` (`{format: "wav", data}` in base64), for the caller to keep and send as `voice`, with `sample` inside it for a talking video's reference voice. |
 | `GET /v1/audio/voices/{name}` | One voice. |
 | `GET /v1/audio/voices/{name}/sample` | Its sample clip (WAV). |
 | `DELETE /v1/audio/voices/{name}` | Deletes it. |

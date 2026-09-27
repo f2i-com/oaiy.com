@@ -124,6 +124,40 @@ pub fn keep(dir: &Path, name: &str, worker_voice: &Path, clip: &Path) -> Result<
     Ok(summary(&v))
 }
 
+/// A voice the worker made, handed back rather than kept: the voice (for
+/// `voice` in later requests) with its sample clip inside it as base64 WAV
+/// (`sample`). The worker's files are removed.
+pub fn hand_back(name: &str, worker_voice: &Path, clip: &Path) -> Result<Json, String> {
+    let mut v = Json::parse(&std::fs::read(worker_voice).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+    crate::util::set(&mut v, "name", Json::str(name.trim()));
+    let sample = std::fs::read(clip).map_err(|e| e.to_string())?;
+    let mut out = summary(&v);
+    crate::util::set(&mut out, "voice", v);
+    crate::util::set(&mut out, "sample", Json::obj([("format", Json::str("wav")), ("data", Json::str(crate::util::base64_encode(&sample)))]));
+    let _ = std::fs::remove_file(worker_voice);
+    let _ = std::fs::remove_file(clip);
+    Ok(out)
+}
+
+/// A voice sent with the request (`voice` as the object a voice design handed
+/// back, with its `ref_codes` and `speaker`), rather than named.
+pub fn inline_voice(body: &Json) -> Option<&Json> {
+    body.get("voice").filter(|v| v.get("ref_codes").is_some() && v.get("speaker").is_some())
+}
+
+/// An inline voice's sample clip (base64 WAV), written into `dir` for the worker.
+pub fn inline_sample(voice: &Json, dir: &Path) -> Result<Option<PathBuf>, String> {
+    let Some(data) = voice.get("sample").and_then(|s| s.get("data")).and_then(Json::as_str) else { return Ok(None) };
+    let bytes = crate::util::base64_decode(data)?;
+    if bytes.len() > 16 << 20 {
+        return Err("a voice sample is limited to 16 MiB".into());
+    }
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    let path = dir.join(format!("{}.wav", crate::util::random_id("voice_sample_")));
+    std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
+    Ok(Some(path))
+}
+
 fn section(cfg: &Json) -> Result<&Json, String> {
     let s = cfg.get("media").and_then(|m| m.get("speech")).ok_or("no speech section")?;
     if !bool_or(s, "enabled", true) {
@@ -185,7 +219,22 @@ pub fn speech_request(cfg: &Json, root: &Path, output_dir: &Path, body: &Json) -
     }
     let asked = voice_name(body);
     let dir = voices_dir(cfg, root);
-    let saved = asked.as_deref().filter(|n| valid_name(n)).map(|n| voice_file(&dir, n)).filter(|p| p.is_file());
+    // A voice sent inline is written beside the job's output for the worker,
+    // without its sample (which only a talking video uses).
+    let inline = match inline_voice(body) {
+        Some(v) => {
+            let mut v = v.clone();
+            if let Json::Obj(fields) = &mut v {
+                fields.retain(|(k, _)| k != "sample");
+            }
+            std::fs::create_dir_all(output_dir).map_err(|e| e.to_string())?;
+            let path = output_dir.join(format!("{}.json", crate::util::random_id("voice_")));
+            std::fs::write(&path, v.to_json()).map_err(|e| e.to_string())?;
+            Some(path)
+        }
+        None => None,
+    };
+    let saved = inline.or_else(|| asked.as_deref().filter(|n| valid_name(n)).map(|n| voice_file(&dir, n)).filter(|p| p.is_file()));
     let label = match saved {
         Some(path) => {
             // A saved voice: the Base model, prompted with the voice.
@@ -315,6 +364,39 @@ mod tests {
         assert!(get(&dir, "Narrator 2").is_some());
         assert!(remove(&dir, "Narrator 2"));
         assert!(list(&dir).is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_voice_handed_back_is_spoken_inline_and_nothing_is_kept() {
+        let dir = std::env::temp_dir().join(format!("nrob-voices-inline-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("base")).unwrap();
+        std::fs::create_dir_all(dir.join("design")).unwrap();
+        let worker = dir.join("w.voice.json");
+        std::fs::write(&worker, r#"{"nrob_voice":1,"name":"x","language":"english","ref_text":"hi","ref_codes":[[1,2]],"speaker":[0.5]}"#).unwrap();
+        let clip = dir.join("w.wav");
+        std::fs::write(&clip, b"RIFFdata").unwrap();
+        // Handed back: the voice with its sample inside, and the worker's files gone.
+        let handed = hand_back("Gary", &worker, &clip).unwrap();
+        assert!(!worker.exists() && !clip.exists() && list(&dir).is_empty());
+        let voice = handed.get("voice").unwrap().clone();
+        assert_eq!(str_or(&voice, "name", ""), "Gary");
+        assert_eq!(handed.get("sample").and_then(|s| s.get("data")).and_then(Json::as_str), Some(crate::util::base64_encode(b"RIFFdata").as_str()));
+        // Spoken inline: the Base model, prompted with the voice written for the worker (without its sample).
+        let cfg = Json::parse(format!(r#"{{"media":{{"speech":{{"models":{{"tts":{{"base":"{0}/base","design":"{0}/design"}}}},"voices_dir":"{0}/voices"}}}}}}"#, dir.to_string_lossy().replace('\\', "/")).as_bytes()).unwrap();
+        let mut with_sample = voice.clone();
+        crate::util::set(&mut with_sample, "sample", handed.get("sample").unwrap().clone());
+        let out = dir.join("out");
+        let body = Json::obj([("input", Json::str("We are closing.")), ("voice", with_sample.clone())]);
+        let (request, _, label, _) = speech_request(&cfg, &dir, &out, &body).unwrap();
+        assert!(str_or(&request, "model_dir", "").ends_with("base"));
+        let written = Json::parse(&std::fs::read(str_or(&request, "voice_file", "")).unwrap()).unwrap();
+        assert!(written.get("ref_codes").is_some() && written.get("sample").is_none());
+        assert_eq!(label, "Gary");
+        // Its sample is a talking video's reference voice.
+        let sample = inline_sample(&with_sample, &out).unwrap().unwrap();
+        assert_eq!(std::fs::read(sample).unwrap(), b"RIFFdata");
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

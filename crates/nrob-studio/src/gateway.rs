@@ -681,14 +681,20 @@ fn voices(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, rest: &str) ->
     }
 }
 
-/// Design a voice from a description and save it under its name.
+/// Design a voice from a description and save it under its name, or, with
+/// `keep: false` (and always in incognito), hand it back instead: the voice
+/// and its sample clip, for the caller to keep and send with each request
+/// (`voice` as that object), with nothing left here.
 fn create_voice(studio: &Arc<Studio>, req: &Request, dir: &std::path::Path) -> Result<Reply, Reply> {
     let body = parse_body(req)?;
-    if incognito_mode(studio) || incognito_header(req) || body.get("incognito").and_then(Json::as_bool) == Some(true) {
-        return Err(fail(400, "incognito keeps nothing, so voices are not saved; turn incognito off to save one"));
-    }
+    let incognito = incognito_mode(studio) || incognito_header(req) || body.get("incognito").and_then(Json::as_bool) == Some(true);
+    let keep = match body.get("keep").and_then(Json::as_bool) {
+        Some(true) if incognito => return Err(fail(400, "incognito keeps nothing, so voices are not saved here; send keep: false to have the voice handed back instead")),
+        Some(k) => k,
+        None => !incognito,
+    };
     let name = body.get("name").and_then(Json::as_str).unwrap_or("").trim().to_string();
-    if crate::speech::get(dir, &name).is_some() && body.get("replace").and_then(Json::as_bool) != Some(true) {
+    if keep && crate::speech::get(dir, &name).is_some() && body.get("replace").and_then(Json::as_bool) != Some(true) {
         return Err(fail(409, format!("a voice named {name} already exists; delete it first, or send replace: true")));
     }
     let cfg = studio.config();
@@ -699,6 +705,11 @@ fn create_voice(studio: &Arc<Studio>, req: &Request, dir: &std::path::Path) -> R
         return Err(fail(if done.status == "in_progress" { 504 } else { 500 }, done.error.unwrap_or_else(|| format!("voice job {}", done.status))));
     }
     let path = |k: &str| done.result.get(k).and_then(Json::as_str).map(std::path::PathBuf::from).ok_or_else(|| fail(500, format!("the voice job returned no {k}")));
+    if !keep {
+        let handed = crate::speech::hand_back(&label, &path("voice_file")?, &path("path")?).map_err(|e| fail(500, e));
+        studio.media.remove(&done.id);
+        return handed.and_then(ok);
+    }
     let voice = crate::speech::keep(dir, &label, &path("voice_file")?, &path("path")?).map_err(|e| fail(500, e))?;
     // Its files have moved into the voices folder; the job has nothing left to show.
     studio.media.remove(&done.id);
