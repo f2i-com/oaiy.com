@@ -929,6 +929,339 @@ pub trait Backend: Send + Sync + Debug + 'static {
     /// Returns `(q_only, q_gate)`, each `[seq, n_heads * head_dim]`.
     /// Default impl is host-side (slow d2h + h2d); CUDA overrides with a single
     /// kernel that writes both halves directly on device.
+    /// VENDORED-LOCAL: Qwen3.8-Flash-Next — the delta-net step with a `sigmoid(z)` output
+    /// gate instead of `silu(z)` (otherwise identical to [`Backend::delta_net_step`]).
+    #[allow(clippy::too_many_arguments)]
+    fn delta_net_step_sigmoid(
+        &self,
+        mixed_qkv:   &Tensor,
+        z_in:        &Tensor,
+        beta_alpha:  &Tensor,
+        conv_weight: &Tensor,
+        ssm_a:       &Tensor,
+        dt_bias:     &Tensor,
+        ssm_norm:    &Tensor,
+        conv_state:  &mut Tensor,
+        state:       &mut Tensor,
+        seq:         usize,
+        num_v_heads: usize,
+        num_k_heads: usize,
+        head_v_dim:  usize,
+        head_k_dim:  usize,
+        v_per_k:     usize,
+        scale_q:     f32,
+        eps:         f32,
+    ) -> Tensor {
+        let _ = (mixed_qkv, z_in, beta_alpha, conv_weight, ssm_a, dt_bias, ssm_norm, conv_state, state,
+                 seq, num_v_heads, num_k_heads, head_v_dim, head_k_dim, v_per_k, scale_q, eps);
+        panic!("{}: the sigmoid-gated delta-net step needs the CUDA backend", self.name())
+    }
+
+    /// VENDORED-LOCAL: split each row of `x` (`[rows, a + b]`) into its first `a` and last `b`
+    /// columns.
+    fn split_cols(&self, x: &Tensor, a: usize) -> (Tensor, Tensor) {
+        let rows = x.dim(0);
+        let width = x.numel() / rows;
+        let h = x.to_host();
+        let d = h.data();
+        let (mut l, mut r) = (Vec::with_capacity(rows * a), Vec::with_capacity(rows * (width - a)));
+        for i in 0..rows { l.extend_from_slice(&d[i * width..i * width + a]); r.extend_from_slice(&d[i * width + a..(i + 1) * width]); }
+        (Tensor::from_vec(l, vec![rows, a]), Tensor::from_vec(r, vec![rows, width - a]))
+    }
+
+    /// VENDORED-LOCAL: the n-gram layer's gate. Per row `r` and stream `s` (width `d`):
+    /// `g = signed_sqrt(scale * rms(key[r,s]) * nk[s] . rms(x[r,s]) * nq[s])`,
+    /// `gated[r,s] = sigmoid(g) * value[r]`, and `conv_in[r,s] = f16(rms(gated[r,s]) * nc[s])`.
+    /// `key`, `x` are `[rows, streams * d]`, `value` `[rows, d]`; the norms `[streams * d]`.
+    #[allow(clippy::too_many_arguments)]
+    fn ple_gate(&self, key: &Tensor, x: &Tensor, value: &Tensor, norm_key: &Tensor, norm_query: &Tensor, norm_conv: &Tensor, streams: usize, eps: f32) -> (Tensor, Tensor) {
+        let rows = value.dim(0);
+        let d = value.numel() / rows;
+        let width = streams * d;
+        let (kh, xh, vh) = (key.to_host(), x.to_host(), value.to_host());
+        let (nk, nq, nc) = (norm_key.to_host(), norm_query.to_host(), norm_conv.to_host());
+        let (kd, xd, vd, nk, nq, nc) = (kh.data(), xh.data(), vh.data(), nk.data(), nq.data(), nc.data());
+        let rms = |v: &[f32]| 1.0 / (v.iter().map(|a| a * a).sum::<f32>() / v.len() as f32 + eps).sqrt();
+        let scale = 1.0 / (d as f32).sqrt();
+        let mut gated = vec![0f32; rows * width];
+        let mut conv_in = vec![0f32; rows * width];
+        for r in 0..rows {
+            for s in 0..streams {
+                let o = r * width + s * d;
+                let (kr, qr) = (&kd[o..o + d], &xd[o..o + d]);
+                let (ik, iq) = (rms(kr), rms(qr));
+                let mut dot = 0f32;
+                for j in 0..d { dot += (kr[j] * ik * nk[s * d + j]) * (qr[j] * iq * nq[s * d + j]); }
+                let g = dot * scale;
+                let ss = if g == 0.0 { 0.0 } else { g.signum() * g.abs().max(1e-6).sqrt() };
+                let gate = 1.0 / (1.0 + (-ss).exp());
+                for j in 0..d { gated[o + j] = gate * vd[r * d + j]; }
+                let inv = rms(&gated[o..o + d]);
+                for j in 0..d { conv_in[o + j] = crate::tensor::round_f16(gated[o + j] * inv * nc[s * d + j]); }
+            }
+        }
+        (Tensor::from_vec(gated, vec![rows, width]), Tensor::from_vec(conv_in, vec![rows, width]))
+    }
+
+    /// VENDORED-LOCAL: the n-gram layer's dilated causal conv. With `stream` = `window`
+    /// (`[kernel - 1) * dilation, width]`) then `conv_in` (`[rows, width]`):
+    /// `x[r, c] += gated[r, c] + silu(sum_j w[c, j] * stream[r + j * dilation, c])`.
+    /// `window` becomes `stream`'s last `(kernel - 1) * dilation` rows.
+    #[allow(clippy::too_many_arguments)]
+    fn ple_conv(&self, x: &mut Tensor, gated: &Tensor, conv_in: &Tensor, window: &mut Tensor, weight: &Tensor, kernel: usize, dilation: usize) {
+        let rows = gated.dim(0);
+        let width = gated.numel() / rows;
+        let state = (kernel - 1) * dilation;
+        let mut stream = window.to_host().data().to_vec();
+        stream.extend_from_slice(conv_in.to_host().data());
+        let (gh, wh) = (gated.to_host(), weight.to_host());
+        let (gd, wd) = (gh.data(), wh.data());
+        let mut delta = vec![0f32; rows * width];
+        for r in 0..rows {
+            for c in 0..width {
+                let mut acc = 0f32;
+                for j in 0..kernel { acc += wd[c * kernel + j] * stream[(r + j * dilation) * width + c]; }
+                delta[r * width + c] = gd[r * width + c] + acc / (1.0 + (-acc).exp());
+            }
+        }
+        self.add_inplace(x, &Tensor::from_vec(delta, vec![rows, width]));
+        *window = Tensor::from_vec(stream[rows * width..].to_vec(), vec![state, width]);
+    }
+
+    /// VENDORED-LOCAL: gated residual — `x += post * y` per stream (as `stream_apply`), then
+    /// each stream RMS-normed and scaled by its part of `weight` (as `hc_norm`).
+    fn hc_apply_norm(&self, x: &mut Tensor, y: &Tensor, post: &Tensor, weight: &Tensor, streams: usize, eps: f32) -> Tensor {
+        self.stream_apply(x, y, post, streams);
+        self.hc_norm(x, weight, streams, eps)
+    }
+
+    /// VENDORED-LOCAL: the `[rows, 2 * words]` values of `packed` (`[rows, words]`, see
+    /// `tensor::pack_f16`).
+    fn unpack_f16(&self, packed: &Tensor) -> Tensor {
+        let rows = packed.dim(0);
+        let values = crate::tensor::unpack_f16(packed.to_host().data());
+        let cols = values.len() / rows.max(1);
+        Tensor::from_vec(values, vec![rows, cols])
+    }
+
+    /// VENDORED-LOCAL: gated residual — `normed @ down^T` (`down`: `[rank + writes, width / 2]`,
+    /// f16 packed by `tensor::pack_f16`), then as `hc_gates`: returns (`t`
+    /// `[rows, rank + writes]`, the write weights).
+    fn hc_down_gates(&self, normed: &Tensor, down: &Tensor, rank: usize, writes: usize, streams: usize) -> (Tensor, Tensor) {
+        let mut t = self.linear(normed, &self.unpack_f16(down));
+        let post = self.hc_gates(&mut t, rank, writes, streams);
+        (t, post)
+    }
+
+    /// VENDORED-LOCAL: gated residual — `t @ up^T` as logits (`up`: `[width, cols / 2]`, f16
+    /// packed), then as `hc_mix`.
+    fn hc_up_mix(&self, t: &Tensor, up: &Tensor, normed: &Tensor, streams: usize) -> Tensor {
+        let logits = self.linear(t, &self.unpack_f16(up));
+        self.hc_mix(&logits, normed, streams)
+    }
+
+    /// VENDORED-LOCAL: gated residual — each stream of `x` (`[rows, streams * d]`) RMS-normed
+    /// and scaled by its part of `weight` (`[streams * d]`).
+    fn hc_norm(&self, x: &Tensor, weight: &Tensor, streams: usize, eps: f32) -> Tensor {
+        let rows = x.dim(0);
+        let d = x.numel() / rows / streams;
+        let (h, w) = (x.to_host(), weight.to_host());
+        let (h, w) = (h.data(), w.data());
+        let mut out = vec![0f32; h.len()];
+        for r in 0..rows {
+            for s in 0..streams {
+                let o = (r * streams + s) * d;
+                let inv = 1.0 / (h[o..o + d].iter().map(|v| v * v).sum::<f32>() / d as f32 + eps).sqrt();
+                for j in 0..d { out[o + j] = h[o + j] * inv * w[s * d + j]; }
+            }
+        }
+        Tensor::from_vec(out, x.shape().to_vec())
+    }
+
+    /// VENDORED-LOCAL: gated residual — `t` (`[rows, rank + writes]`: the low-rank gate's
+    /// input, then each stream's write logit, if any): the first `rank` become
+    /// `silu(t / streams)`, the rest 0; returns the write weights `2 * sigmoid(logit / streams)`
+    /// (`[rows, writes]`).
+    fn hc_gates(&self, t: &mut Tensor, rank: usize, writes: usize, streams: usize) -> Tensor {
+        let rows = t.dim(0);
+        let width = rank + writes;
+        let mut post = vec![0f32; rows * writes];
+        let data = t.data_mut();
+        for r in 0..rows {
+            for c in 0..width {
+                let v = data[r * width + c] / streams as f32;
+                if c < rank { data[r * width + c] = v / (1.0 + (-v).exp()); } else {
+                    post[r * writes + c - rank] = 2.0 / (1.0 + (-v).exp());
+                    data[r * width + c] = 0.0;
+                }
+            }
+        }
+        Tensor::from_vec(post, vec![rows, writes])
+    }
+
+    /// VENDORED-LOCAL: gated residual — the branch input: the mean over streams of
+    /// `sigmoid(logits) * normed` (both `[rows, streams * d]`) -> `[rows, d]`.
+    fn hc_mix(&self, logits: &Tensor, normed: &Tensor, streams: usize) -> Tensor {
+        let rows = normed.dim(0);
+        let d = normed.numel() / rows / streams;
+        let (l, n) = (logits.to_host(), normed.to_host());
+        let (l, n) = (l.data(), n.data());
+        let mut out = vec![0f32; rows * d];
+        for r in 0..rows { for s in 0..streams { for j in 0..d {
+            let i = (r * streams + s) * d + j;
+            out[r * d + j] += n[i] / (1.0 + (-l[i]).exp()) / streams as f32;
+        } } }
+        Tensor::from_vec(out, vec![rows, d])
+    }
+
+    /// VENDORED-LOCAL: `dst[r] += src[r] * scale[r]` (`scale`: one value per row).
+    fn add_rows_scaled(&self, dst: &mut Tensor, src: &Tensor, scale: &Tensor) {
+        let rows = src.dim(0);
+        let d = src.numel() / rows.max(1);
+        let (s, g) = (src.to_host(), scale.to_host());
+        let (s, g) = (s.data(), g.data());
+        let out = dst.data_mut();
+        for r in 0..rows { for j in 0..d { out[r * d + j] += s[r * d + j] * g[r]; } }
+    }
+
+    /// VENDORED-LOCAL: rows `rows[i]` of `src` `[n, d]`, in order: `[rows.len(), d]`.
+    fn gather_rows(&self, src: &Tensor, rows: &[u32]) -> Tensor {
+        let d = src.numel() / src.dim(0).max(1);
+        let host = src.to_host();
+        let data = host.data();
+        let mut out = Vec::with_capacity(rows.len() * d);
+        for &r in rows { out.extend_from_slice(&data[r as usize * d..(r as usize + 1) * d]); }
+        Tensor::from_vec(out, vec![rows.len(), d])
+    }
+
+    /// VENDORED-LOCAL: `dst[rows[i]] += src[i] * weights[i]` for each row `i` of `src`.
+    fn scatter_add_rows(&self, dst: &mut Tensor, src: &Tensor, rows: &[u32], weights: &[f32]) {
+        let d = src.numel() / src.dim(0).max(1);
+        let s = src.to_host();
+        let s = s.data();
+        let out = dst.data_mut();
+        for (i, (&r, &w)) in rows.iter().zip(weights).enumerate() {
+            for j in 0..d { out[r as usize * d + j] += s[i * d + j] * w; }
+        }
+    }
+
+    /// VENDORED-LOCAL: the mean of `streams` interleaved streams: `x` `[rows, streams * d]`
+    /// (row-major `[rows, streams, d]`) -> `[rows, d]`.
+    fn stream_mean(&self, x: &Tensor, streams: usize) -> Tensor {
+        let rows = x.dim(0);
+        let d = x.numel() / rows / streams;
+        let h = x.to_host();
+        let h = h.data();
+        let mut out = vec![0.0f32; rows * d];
+        for r in 0..rows { for s in 0..streams { for j in 0..d { out[r * d + j] += h[(r * streams + s) * d + j]; } } }
+        for v in &mut out { *v /= streams as f32; }
+        Tensor::from_vec(out, vec![rows, d])
+    }
+
+    /// VENDORED-LOCAL: the residual write-back of a hyper-connection site:
+    /// `x[r, s, :] += post[r, s] * y[r, :]` (`x` `[rows, streams * d]`, `y` `[rows, d]`,
+    /// `post` `[rows, streams]`).
+    fn stream_apply(&self, x: &mut Tensor, y: &Tensor, post: &Tensor, streams: usize) {
+        let rows = y.dim(0);
+        let d = y.numel() / rows;
+        let yh = y.to_host();
+        let ph = post.to_host();
+        let (yh, ph) = (yh.data(), ph.data());
+        let out = x.data_mut();
+        for r in 0..rows { for s in 0..streams { for j in 0..d { out[(r * streams + s) * d + j] += ph[r * streams + s] * yh[r * d + j]; } } }
+    }
+
+    /// VENDORED-LOCAL: QSA — the mean of each complete `ratio`-row block of `raw`
+    /// (`[rows, .., d]`, the first `blocks * ratio` rows): `[blocks, d]`.
+    fn qsa_pool(&self, raw: &Tensor, blocks: usize, ratio: usize) -> Tensor {
+        let d = raw.numel() / raw.dim(0).max(1);
+        let h = raw.to_host();
+        let h = h.data();
+        let mut out = vec![0f32; blocks * d];
+        for b in 0..blocks { for c in 0..ratio { for j in 0..d { out[b * d + j] += h[(b * ratio + c) * d + j] / ratio as f32; } } }
+        Tensor::from_vec(out, vec![blocks, d])
+    }
+
+    /// VENDORED-LOCAL: QSA block scores: `out[r, j] = scale * sum_h relu(q[r, h] . pooled[j])`
+    /// for the blocks query `r` (at position `first + r`) sees whole, `-inf` for the rest.
+    fn qsa_block_scores(&self, q: &Tensor, pooled: &Tensor, first: usize, ratio: usize, scale: f32) -> Tensor {
+        let rows = q.dim(0);
+        let nb = pooled.dim(0);
+        let d = pooled.numel() / nb.max(1);
+        let heads = q.numel() / rows / d;
+        let (qh, ph) = (q.to_host(), pooled.to_host());
+        let (qd, pd) = (qh.data(), ph.data());
+        let mut out = vec![f32::NEG_INFINITY; rows * nb];
+        for r in 0..rows {
+            let visible = (first + r + 1) / ratio;
+            for j in 0..nb.min(visible) {
+                let mut total = 0f32;
+                for hh in 0..heads {
+                    let dot: f32 = (0..d).map(|i| qd[(r * heads + hh) * d + i] * pd[j * d + i]).sum();
+                    total += dot.max(0.0);
+                }
+                out[r * nb + j] = total * scale;
+            }
+        }
+        Tensor::from_vec(out, vec![rows, nb])
+    }
+
+    /// VENDORED-LOCAL: QSA selection: for each query row of `scores` (`[n, nb]`, the query at
+    /// position `first + r`), the tokens it attends to: its `keep` best whole blocks (all of
+    /// them when it sees no more) and its incomplete tail block. `[n, keep * ratio + ratio]`
+    /// token indices as f32 (exact: under 2^24), `-1` for none.
+    fn qsa_select(&self, scores: &Tensor, first: usize, ratio: usize, keep: usize) -> Tensor {
+        let n = scores.dim(0);
+        let nb = scores.numel() / n.max(1);
+        let width = keep * ratio + ratio;
+        let h = scores.to_host();
+        let h = h.data();
+        let mut out = vec![-1f32; n * width];
+        for r in 0..n {
+            let p = first + r;
+            let visible = ((p + 1) / ratio).min(nb);
+            let row = &h[r * nb..r * nb + visible];
+            let mut chosen: Vec<usize> = (0..visible).collect();
+            if visible > keep {
+                chosen.select_nth_unstable_by(keep - 1, |&x, &y| row[y].total_cmp(&row[x]));
+                chosen.truncate(keep);
+            }
+            let o = &mut out[r * width..(r + 1) * width];
+            let mut i = 0;
+            for &b in &chosen { for c in 0..ratio { o[i] = (b * ratio + c) as f32; i += 1; } }
+            for t in visible * ratio..=p { o[i] = t as f32; i += 1; }
+        }
+        Tensor::from_vec(out, vec![n, width])
+    }
+
+    /// VENDORED-LOCAL: QSA attention: each query row attends only to the cache rows its row of
+    /// `sel` names (from `qsa_select`; `-1`: none). `q` `[n, heads, d]`, `k`/`v` cache buffers
+    /// `[capacity, kv_heads, d]`; returns `[n, heads, d]`.
+    fn sparse_attention(&self, q: &Tensor, k: &Tensor, v: &Tensor, sel: &Tensor, scale: f32) -> Tensor {
+        let width = sel.numel() / sel.dim(0).max(1);
+        let rows: Vec<i32> = sel.to_host().data().iter().map(|&v| v as i32).collect();
+        let n = q.dim(0);
+        let (heads, d) = (q.dim(1), q.dim(2));
+        let kv_heads = k.dim(1);
+        let (qh, kh, vh) = (q.to_host(), k.to_host(), v.to_host());
+        let (qd, kd, vd) = (qh.data(), kh.data(), vh.data());
+        let mut out = vec![0f32; n * heads * d];
+        for r in 0..n {
+            for h in 0..heads {
+                let g = h / (heads / kv_heads);
+                let sel: Vec<usize> = rows[r * width..(r + 1) * width].iter().filter(|&&t| t >= 0).map(|&t| t as usize).collect();
+                let scores: Vec<f32> = sel.iter().map(|&t| (0..d).map(|i| qd[(r * heads + h) * d + i] * kd[(t * kv_heads + g) * d + i]).sum::<f32>() * scale).collect();
+                let m = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let e: Vec<f32> = scores.iter().map(|s| (s - m).exp()).collect();
+                let sum: f32 = e.iter().sum();
+                for (p, &t) in e.iter().zip(&sel) {
+                    for i in 0..d { out[(r * heads + h) * d + i] += p / sum * vd[(t * kv_heads + g) * d + i]; }
+                }
+            }
+        }
+        Tensor::from_vec(out, vec![n, heads, d])
+    }
+
     fn split_q_and_gate(
         &self,
         q_full:  &Tensor,

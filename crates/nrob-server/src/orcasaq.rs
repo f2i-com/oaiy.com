@@ -70,7 +70,7 @@ mod runtime_tests {
         let mut model = load_with_adapter(&path, &[0, 1],adapter.as_slice()).unwrap();
         let vision = if std::env::var_os("NROB_TEST_VISION").is_some() {
             let Model::Qwen35(m)=&model else { unreachable!() };
-            Some(crate::qwen_vision::load(&path.join("vision"),m.cache_backends.last().unwrap().clone(),5120).unwrap())
+            Some(crate::qwen_vision::load(&path.join("vision"),m.cache_backends.last().unwrap().clone(),5120,None).unwrap())
         } else { None };
         let tokens = model
             .tokenizer()
@@ -261,12 +261,12 @@ impl Loader<'_> {
 
 /// GGML delta-net uses tiled value heads; HF uses grouped heads. This maps
 /// each tiled output channel back to its original HF channel, without changing weights.
-fn value_map(nk: usize, nv: usize, dim: usize) -> Vec<u32> {
+pub(crate) fn value_map(nk: usize, nv: usize, dim: usize) -> Vec<u32> {
     (0..nv * dim)
         .map(|i| (((i / dim) % nk) * (nv / nk) * dim + (i / dim / nk) * dim + i % dim) as u32)
         .collect()
 }
-fn inverse(map: &[u32]) -> Vec<u32> {
+pub(crate) fn inverse(map: &[u32]) -> Vec<u32> {
     let mut out = vec![0; map.len()];
     for (i, &v) in map.iter().enumerate() {
         out[v as usize] = i as u32;
@@ -274,7 +274,7 @@ fn inverse(map: &[u32]) -> Vec<u32> {
     out
 }
 
-fn tokenizer(path: &Path, vocab: usize) -> Result<tokenizer::Tokenizer> {
+pub(crate) fn tokenizer(path: &Path, vocab: usize) -> Result<tokenizer::Tokenizer> {
     let t = json(&path.join("tokenizer.json"))?;
     let model = t.get("model").ok_or_else(|| bad("missing BPE model"))?;
     if t.get("normalizer")

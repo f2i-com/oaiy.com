@@ -31,6 +31,8 @@ pub mod moe;
 // VENDORED-LOCAL: GPU-02 — pinned staging ring + transfer-stream/event
 // overlap APIs for the streaming-MoE pipeline.
 pub mod transfer;
+#[cfg(test)]
+mod graph_bench;
 
 /// VENDORED-LOCAL: PERF. Host<->device round trips, counted.
 ///
@@ -171,3 +173,24 @@ mod host_memory_tests {
 pub mod exl3;
 pub use moe::{grouped_kernel_covers, quant_device_ptr, MoeDevicePlan, MoeRoutingDevice};
 pub use transfer::{DeviceSlot, PinnedPool, PinnedSlot, UploadTicket};
+
+/// VENDORED-LOCAL: give GPU memory freed by a dropped model back to the driver. Allocations are
+/// stream-ordered (the device's default memory pool), and the pool keeps what they free for
+/// reuse; after a model is unloaded that reserve can hold most of its size, so the next model
+/// finds the GPU full. Synchronizes each device first, so every pending free has landed.
+pub fn release_unused_memory() {
+    use cudarc::driver::{sys, CudaContext};
+    let count = CudaContext::device_count().unwrap_or(0);
+    for ordinal in 0..count.max(0) as usize {
+        let Ok(ctx) = CudaContext::new(ordinal) else { continue };
+        let _ = ctx.synchronize();
+        let mut pool: sys::CUmemoryPool = std::ptr::null_mut();
+        // SAFETY: a valid device handle and an out pointer to a local; trimming only releases
+        // pool memory no allocation holds.
+        unsafe {
+            if sys::cuDeviceGetDefaultMemPool(&mut pool, ctx.cu_device()) == sys::CUresult::CUDA_SUCCESS {
+                sys::cuMemPoolTrimTo(pool, 0);
+            }
+        }
+    }
+}

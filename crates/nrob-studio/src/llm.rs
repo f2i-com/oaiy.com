@@ -164,6 +164,11 @@ pub fn arguments(llm: &Json, root: &Path, port: u16, key: &str, local_images: bo
         if !str_or(m, "vision_projector", "").trim().is_empty() {
             push("--vision-projector", format!("{name}={}", path(m, "vision_projector")));
         }
+        // Its own GPUs (a model too big for one), instead of the LLM's `devices`.
+        let own: Vec<String> = m.get("devices").and_then(Json::as_array).unwrap_or(&[]).iter().filter_map(Json::as_i64).map(|d| d.to_string()).collect();
+        if !own.is_empty() {
+            push("--devices-for", format!("{name}={}", own.join(",")));
+        }
         if !str_or(m, "lora", "").trim().is_empty() {
             push("--lora", format!("{name}={}", path(m, "lora")));
             // How strongly it applies: 1 (as trained) unless set.

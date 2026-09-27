@@ -1,5 +1,6 @@
 //! Original Qwen3.8 vision tensors, read directly from the published shard.
 use dsv41::safetensors::StIndex;
+use ggml_rs_cuda::CudaBackend;
 use ggml_rs::{Backend, Tensor};
 use llama_rs::{
     loader::Weight,
@@ -37,14 +38,16 @@ fn parse_config(c: &Json, p: &Json, width: usize) -> Result<MmProjConfig> {
         ("spatial_merge_size", 2),
         ("temporal_patch_size", 2),
         ("in_channels", 3),
-        ("out_hidden_size", 5120),
     ] {
         if v.get(key).and_then(Json::as_i64) != Some(expected) {
             return Err(bad(format!("unsupported Qwen vision {key}")));
         }
     }
-    if width != 5120
-        || c.get("model_type").and_then(Json::as_str) != Some("qwen3_5")
+    if v.get("out_hidden_size").and_then(Json::as_i64) != Some(width as i64) {
+        return Err(bad("unsupported Qwen vision out_hidden_size"));
+    }
+    // Qwen3.8-27B's tower, and Qwen3.8-Flash-Next's (the same, into a 2560-wide model).
+    if !matches!((width, c.get("model_type").and_then(Json::as_str)), (5120, Some("qwen3_5")) | (2560, Some("qwen4_exp")))
         || v.get("hidden_act").and_then(Json::as_str) != Some("gelu_pytorch_tanh")
         || v.get("deepstack_visual_indexes")
             .and_then(Json::as_array)
@@ -114,12 +117,26 @@ fn static_patch(values: &[f32], d: usize, p: usize) -> Vec<f32> {
     out
 }
 
-pub fn load(root: &Path, backend: Arc<dyn Backend>, width: usize) -> Result<MmProj> {
-    let cfg = config(root, width)?;
+/// `exl3`: where EXL3 matrices go, for a tower stored quantized (Qwen3.8-Flash-Next's):
+/// a matrix without plain weights is read from its EXL3 tiles.
+pub fn load(root: &Path, backend: Arc<dyn Backend>, width: usize, exl3: Option<Arc<CudaBackend>>) -> Result<MmProj> {
+    let mut cfg = config(root, width)?;
     let idx = StIndex::open(root)?;
+    // A quantized tower stores its MLP padded to whole EXL3 tiles (4304 -> 4352, the padding
+    // cancelling out): build it at the width stored.
+    if let Some(info) = idx.get("model.visual.blocks.0.mlp.linear_fc1.bias") {
+        cfg.ff_dim = info.shape[0];
+    }
     let b = backend.as_ref();
     let t = |name: &str, shape: &[usize]| tensor(&idx, b, name, shape);
-    let w = |name: &str, shape: &[usize]| t(name, shape).map(Weight::Dense);
+    let w = |name: &str, shape: &[usize]| -> Result<Weight> {
+        match (&exl3, name.strip_suffix(".weight")) {
+            (Some(cuda), Some(base)) if idx.get(&format!("model.visual.{name}")).is_none() => {
+                crate::flashnext::exl3_weight(&idx, cuda, &format!("model.visual.{base}"), shape[1], shape[0], None, None)
+            }
+            _ => t(name, shape).map(Weight::Dense),
+        }
+    };
     let (d, ff) = (cfg.embedding_dim, cfg.ff_dim);
     let patch_name = "model.visual.patch_embed.proj.weight";
     if idx.info(patch_name)?.shape != [d, 3, 2, 16, 16] {
@@ -204,7 +221,7 @@ mod tests {
     fn original_vision_matches_huggingface() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let b: Arc<dyn Backend> = Arc::new(ggml_rs_cuda::CudaBackend::new(1).unwrap());
-        let mm = load(&root.join("models/OrcaSAQ-2-27B/vision"), b, 5120).unwrap();
+        let mm = load(&root.join("models/OrcaSAQ-2-27B/vision"), b, 5120, None).unwrap();
         let oracle =
             StIndex::open_file(&root.join("target/orca-vision-research/oracle.safetensors"))
                 .unwrap();

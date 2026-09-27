@@ -172,10 +172,44 @@ pub struct CudaBackend {
     // multi-stream bookkeeping entirely.)
     h2d:                   std::sync::OnceLock<Arc<CudaStream>>,
     pub(crate) event_pool: crate::transfer::EventPool,
+    /// VENDORED-LOCAL: recently uploaded rope positions, by content: every layer of a forward
+    /// ropes at the same positions, so they cross to the device once, not once a layer.
+    rope_positions: std::sync::Mutex<Vec<(Vec<u32>, Arc<CudaSlice<u32>>)>>,
     // VENDORED-LOCAL: a private stream for recording graphs, never for running
     // inference. Its mutex prevents overlapping capture across projections.
     capture: std::sync::OnceLock<std::sync::Mutex<Arc<CudaStream>>>,
+    /// VENDORED-LOCAL: a whole step captured into one graph (see `graph_begin`).
+    graph: std::sync::Mutex<GraphRun>,
     pub(crate) name:   String,
+}
+
+/// VENDORED-LOCAL: the graph a step is captured into and replayed from, updated in place from
+/// each new capture (the launches repeat step to step; their arguments change), and the arena
+/// the captured step's temporaries come from.
+#[derive(Default)]
+struct GraphRun {
+    exec: usize,
+    arena: Option<CudaSlice<u8>>,
+    /// What the captured step dropped, freed once it has run.
+    deferred: Vec<cudarc::driver::sys::CUdeviceptr>,
+    /// How much of the arena the last capture used.
+    used: usize,
+}
+
+/// VENDORED-LOCAL: room for one captured step's temporaries, at first. Some grow with the
+/// context (long attention's block scores), so the arena doubles whenever a step fills half.
+const GRAPH_ARENA: usize = 256 << 20;
+
+impl Drop for CudaBackend {
+    fn drop(&mut self) {
+        let g = self.graph.get_mut().unwrap_or_else(|e| e.into_inner());
+        if g.exec != 0 {
+            self.ctx.record_err(self.ctx.bind_to_thread());
+            // SAFETY: the exec is ours alone; the stream finishes any replay before its memory goes.
+            unsafe { let _ = cudarc::driver::result::graph::exec_destroy(g.exec as cudarc::driver::sys::CUgraphExec); }
+            g.exec = 0;
+        }
+    }
 }
 
 impl std::fmt::Debug for CudaBackend {
@@ -187,9 +221,166 @@ impl std::fmt::Debug for CudaBackend {
 }
 
 impl CudaBackend {
+    #[allow(clippy::too_many_arguments)]
+    fn delta_net_inner(
+        &self,
+        mixed_qkv:   &Tensor,
+        z_in:        &Tensor,
+        beta_alpha:  &Tensor,
+        conv_weight: &Tensor,
+        ssm_a:       &Tensor,
+        dt_bias:     &Tensor,
+        ssm_norm:    &Tensor,
+        conv_state:  &mut Tensor,
+        state:       &mut Tensor,
+        seq:         usize,
+        num_v_heads: usize,
+        num_k_heads: usize,
+        head_v_dim:  usize,
+        head_k_dim:  usize,
+        v_per_k:     usize,
+        scale_q:     f32,
+        eps:         f32,
+        gate_mode:   i32,
+    ) -> Tensor {
+        let conv_dim    = mixed_qkv.numel() / seq;
+        let conv_kernel = conv_weight.dim(1);
+        let mqkv_dev = self.cuda_input(mixed_qkv);
+        let z_dev    = self.cuda_input(z_in);
+        let ba_dev   = self.cuda_input(beta_alpha);
+        let cw_dev   = self.cuda_input(conv_weight);
+        let sa_dev   = self.cuda_input(ssm_a);
+        let dt_dev   = self.cuda_input(dt_bias);
+        let nm_dev   = self.cuda_input(ssm_norm);
+        let cs_dev   = self.cuda_input_mut(conv_state);
+        let st_dev   = self.cuda_input_mut(state);
+
+        // Allocate intermediate conv_out for ALL seq tokens (the loop kernels
+        // write/read the full [seq, conv_dim] buffer rather than reusing one
+        // token's worth — keeps the kernels single-launch).
+        // VENDORED-LOCAL: SAFETY: the kernel below overwrites every output
+        // element on this stream before it is exposed to a consumer.
+        let mut conv_out = unsafe { self.stream.alloc::<f32>(seq * conv_dim) }.expect("output allocation");
+        // VENDORED-LOCAL: SAFETY: the kernel below overwrites every output
+        // element on this stream before it is exposed to a consumer.
+        let mut output = unsafe { self.stream.alloc::<f32>(seq * num_v_heads * head_v_dim) }.expect("output allocation");
+
+        let block_x: u32 = 256;
+        let grid_x = ((conv_dim as u32) + block_x - 1) / block_x;
+        let conv_cfg = LaunchConfig {
+            grid_dim: (grid_x, 1, 1),
+            block_dim: (block_x, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let step_cfg = LaunchConfig {
+            grid_dim: (num_v_heads as u32, 1, 1),
+            block_dim: (head_v_dim as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let seq_i = seq as i32;
+        let cd_i = conv_dim as i32;
+        let ck_i = conv_kernel as i32;
+        let nvh = num_v_heads as i32;
+        let nkh = num_k_heads as i32;
+        let hvd = head_v_dim as i32;
+        let hkd = head_k_dim as i32;
+        let vpk = v_per_k as i32;
+
+        // One launch per layer per direction (conv + step). The seq loop runs
+        // INSIDE each kernel — seq*64KB of state I/O eliminated by holding the
+        // per-head state row in registers across iterations.
+        unsafe {
+            self.stream
+                .launch_builder(self.func("delta_net_conv1d_loop_f32"))
+                .arg(mqkv_dev.as_ref())
+                .arg(cs_dev)
+                .arg(cw_dev.as_ref())
+                .arg(&mut conv_out)
+                .arg(&seq_i).arg(&cd_i).arg(&ck_i)
+                .launch(conv_cfg)
+                .expect("delta_net_conv1d_loop launch");
+        }
+        // VENDORED-LOCAL: long prefills benefit from distributing state rows
+        // across SMs. Decode retains its single fused launch.
+        if head_k_dim == 128 && head_v_dim == 128 {
+            // SAFETY: every core/output element and state row has one writer.
+            // Full warps own 128-wide rows; the second launch runs after the
+            // first on this stream, and all buffers outlive both launches.
+            let mut core =
+                unsafe { self.stream.alloc::<f32>(seq * num_v_heads * 128) }.expect("delta core");
+            // SAFETY: launch dimensions cover disjoint rows/elements, and the
+            // ordered stream keeps the initialized core alive for normalization.
+            unsafe {
+                self.stream
+                    .launch_builder(self.func("delta_net_rows_128_f32"))
+                    .arg(&conv_out)
+                    .arg(ba_dev.as_ref())
+                    .arg(sa_dev.as_ref())
+                    .arg(dt_dev.as_ref())
+                    .arg(st_dev)
+                    .arg(&mut core)
+                    .arg(&seq_i)
+                    .arg(&nvh)
+                    .arg(&nkh)
+                    .arg(&scale_q)
+                    .arg(&eps)
+                    .launch(LaunchConfig {
+                        grid_dim: (num_v_heads as u32, 32, 1),
+                        block_dim: (128, 1, 1),
+                        shared_mem_bytes: 0,
+                    })
+                    .expect("delta rows");
+                self.stream
+                    .launch_builder(self.func("delta_net_norm_128_f32"))
+                    .arg(&core)
+                    .arg(z_dev.as_ref())
+                    .arg(nm_dev.as_ref())
+                    .arg(&mut output)
+                    .arg(&eps)
+                    .arg(&gate_mode)
+                    .launch(LaunchConfig {
+                        grid_dim: ((seq * num_v_heads) as u32, 1, 1),
+                        block_dim: (32, 1, 1),
+                        shared_mem_bytes: 0,
+                    })
+                    .expect("delta norm");
+            }
+            return self.make_tensor(output, vec![seq, num_v_heads * head_v_dim]);
+        }
+        unsafe {
+            self.stream
+                .launch_builder(self.func("delta_net_step_loop_f32"))
+                .arg(&conv_out)
+                .arg(z_dev.as_ref())
+                .arg(ba_dev.as_ref())
+                .arg(sa_dev.as_ref())
+                .arg(dt_dev.as_ref())
+                .arg(nm_dev.as_ref())
+                .arg(st_dev)
+                .arg(&mut output)
+                .arg(&seq_i)
+                .arg(&nvh).arg(&nkh).arg(&hvd).arg(&hkd).arg(&vpk)
+                .arg(&scale_q).arg(&eps).arg(&gate_mode)
+                .launch(step_cfg)
+                .expect("delta_net_step_loop launch");
+        }
+
+        self.make_tensor(output, vec![seq, num_v_heads * head_v_dim])
+    }
+
     pub fn new(device_ordinal: usize) -> Result<Self, CudaError> {
+        Self::with_stream(device_ordinal, false)
+    }
+
+    /// VENDORED-LOCAL: a backend on a stream of its own rather than the device's default one,
+    /// so that its steps can be captured into graphs (`graph_begin`).
+    pub fn new_graphable(device_ordinal: usize) -> Result<Self, CudaError> {
+        Self::with_stream(device_ordinal, true)
+    }
+
+    fn with_stream(device_ordinal: usize, own: bool) -> Result<Self, CudaError> {
         let ctx = CudaContext::new(device_ordinal)?;
-        let stream = ctx.default_stream();
+        let stream = if own { ctx.new_stream()? } else { ctx.default_stream() };
 
         // VENDORED-LOCAL: target the installed GPU so EXL3 can sum four
         // codebook bytes with one DP4A instruction. Older devices keep the
@@ -252,7 +443,9 @@ impl CudaBackend {
             blas,
             h2d: Default::default(), // created lazily — see the field comment
             event_pool: Default::default(),
+            rope_positions: Default::default(),
             capture: Default::default(),
+            graph: Default::default(),
             name: format!("cuda:{device_ordinal}"),
         })
     }
@@ -271,6 +464,99 @@ impl CudaBackend {
             self.ctx.new_stream().expect("h2d transfer stream")
         })
     }
+
+    /// VENDORED-LOCAL: start capturing a step (e.g. a decode step's layers on this device) into
+    /// a graph instead of launching it: false (and nothing captured) on the default stream.
+    /// Until `graph_end`, nothing may wait on the device (no reads back, no uploads from
+    /// pageable memory); what the step allocates comes from an arena reused every step, so a
+    /// tensor it makes must be done with before the next capture, and state kept across steps
+    /// must be updated in place.
+    pub fn graph_begin(&self) -> bool {
+        if self.stream.cu_stream() == self.ctx.default_stream().cu_stream() {
+            return false;
+        }
+        let mut g = self.graph.lock().unwrap_or_else(|e| e.into_inner());
+        let size = g.arena.as_ref().map_or(0, |a| a.len());
+        if size == 0 || 2 * g.used > size {
+            let grown = (4 * g.used).max(GRAPH_ARENA).next_power_of_two();
+            // The old arena goes in stream order, after the steps that used it.
+            // SAFETY: scratch, written by the captured kernels before they read it.
+            g.arena = Some(unsafe { self.stream.alloc::<u8>(grown) }.expect("graph arena"));
+        }
+        let arena = g.arena.as_ref().unwrap();
+        let (base, _record) = cudarc::driver::DevicePtr::device_ptr(arena, &self.stream);
+        // SAFETY: the arena outlives every graph captured with it: a grown one replaces it
+        // only before a capture, and the exec is updated to the new addresses then.
+        unsafe { self.stream.begin_graph(base, arena.len()) }.is_ok()
+    }
+
+    /// VENDORED-LOCAL: end the capture `graph_begin` started and run it.
+    pub fn graph_end(&self) {
+        self.graph_finish();
+        self.graph_launch();
+    }
+
+    /// VENDORED-LOCAL: end the capture `graph_begin` started, ready for `graph_launch`: the
+    /// previous step's graph updated to this one's arguments when the launches match, or a
+    /// new one. (Between the two, e.g., the step's input can be written.)
+    pub fn graph_finish(&self) {
+        use cudarc::driver::{result, sys};
+        let (graph, deferred, used) = self.stream.end_graph().expect("end of the step's capture");
+        let mut g = self.graph.lock().unwrap_or_else(|e| e.into_inner());
+        g.deferred.extend(deferred);
+        g.used = used;
+        // SAFETY: the graph and exec are this backend's alone; the exec replays on its stream.
+        unsafe {
+            let mut updated = false;
+            if g.exec != 0 {
+                let mut info = std::mem::zeroed::<sys::CUgraphExecUpdateResultInfo>();
+                updated = sys::cuGraphExecUpdate_v2(g.exec as sys::CUgraphExec, graph, &mut info).result().is_ok();
+                if !updated {
+                    let _ = result::graph::exec_destroy(g.exec as sys::CUgraphExec);
+                    g.exec = 0;
+                }
+            }
+            if !updated {
+                g.exec = result::graph::instantiate(graph, sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH)
+                    .expect("step graph") as usize;
+            }
+            let _ = result::graph::destroy(graph);
+        }
+    }
+
+    /// VENDORED-LOCAL: run the step `graph_finish` readied.
+    pub fn graph_launch(&self) {
+        use cudarc::driver::{result, sys};
+        let mut g = self.graph.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: the exec is this backend's alone; it replays on its stream.
+        unsafe { result::graph::launch(g.exec as sys::CUgraphExec, self.stream.cu_stream()) }.expect("step graph launch");
+        // What the step dropped (e.g. its input) goes once the graph has run.
+        let deferred = std::mem::take(&mut g.deferred);
+        drop(g);
+        self.stream.free_after(deferred);
+    }
+
+    /// VENDORED-LOCAL: where a tensor on this device lives, for `write_at`.
+    pub fn device_address(&self, t: &Tensor) -> u64 {
+        assert!(t.device_storage().is_some(), "device_address of a host tensor");
+        let input = self.cuda_input(t);
+        let (address, _record) = cudarc::driver::DevicePtr::device_ptr(input.as_ref(), &self.stream);
+        address
+    }
+
+    /// VENDORED-LOCAL: copy `data` to `address` (from `device_address`), in stream order.
+    pub fn write_at(&self, address: u64, data: &[f32]) {
+        self.ctx.bind_to_thread().expect("bind");
+        // SAFETY: the caller's address holds at least `data.len()` floats and lives until the
+        // copy (queued on this stream) is done; pageable memory is staged before this returns.
+        unsafe { cudarc::driver::result::memcpy_htod_async(address, data, self.stream.cu_stream()) }.expect("h2d write");
+    }
+
+    /// VENDORED-LOCAL: whether a step is being captured (`graph_begin`).
+    pub fn graph_recording(&self) -> bool { self.stream.graph_recording() }
+
+    /// VENDORED-LOCAL: upload rope positions ahead of a capture, which cannot.
+    pub fn prime_rope_positions(&self, positions: &[u32]) { let _ = self.cached_positions(positions); }
 
     pub(crate) fn capture_stream(&self) -> std::sync::MutexGuard<'_, Arc<CudaStream>> {
         self.capture.get_or_init(|| std::sync::Mutex::new(self.ctx.new_stream().expect("graph capture stream")))
@@ -319,12 +605,66 @@ impl CudaBackend {
         self.stream.alloc_zeros::<f32>(n).expect("alloc failed")
     }
 
+    /// VENDORED-LOCAL: an output buffer a kernel writes in full, left uninitialized: the zeroing
+    /// `alloc` does is a memset launch of its own, and decode makes hundreds a token.
+    fn alloc_uninit(&self, n: usize) -> CudaSlice<f32> {
+        // SAFETY: only for outputs every element of which the following launch writes.
+        unsafe { self.stream.alloc::<f32>(n.max(1)) }.expect("alloc failed")
+    }
+
     fn alloc_u32(&self, n: usize) -> CudaSlice<u32> {
         self.stream.alloc_zeros::<u32>(n).expect("alloc failed")
     }
 
     fn upload_f32(&self, host: &[f32]) -> CudaSlice<f32> {
         self.stream.memcpy_stod(host).expect("h2d failed")
+    }
+
+    /// VENDORED-LOCAL: `positions` on the device, uploaded once while they stay in use (the
+    /// last few kept; never written after upload, so sharing them is safe).
+    /// VENDORED-LOCAL: attention over `width` keys per query row, split across blocks and then
+    /// combined: the keys `sel` lists (-1 for none), or with no `sel` every key j that row r
+    /// sees (j <= past + r).
+    #[allow(clippy::too_many_arguments)]
+    fn split_attention(&self, q: &Tensor, k: &Tensor, v: &Tensor, sel: Option<&Tensor>, width: usize, scale: f32, past: usize) -> Tensor {
+        let n = q.dim(0);
+        let (heads, d) = (q.dim(1), q.dim(2));
+        let kv_heads = k.dim(1);
+        // Enough blocks to fill the card: a few query rows split their keys finely.
+        let splits = if n * heads >= 256 { (width / 256).clamp(1, 16) } else { width.div_ceil(64).clamp(1, 32) };
+        let per = width.div_ceil(splits);
+        let q_in = self.cuda_input(q);
+        let k_in = self.cuda_input(k);
+        let v_in = self.cuda_input(v);
+        let s_in = sel.map(|s| self.cuda_input(s));
+        let null: u64 = 0;
+        let mut part = self.alloc_uninit(n * heads * splits * (d + 2));
+        let mut out = self.alloc_uninit(n * heads * d);
+        let (h_i, g_i, d_i, w_i, sp_i, p_i) = (heads as i32, kv_heads as i32, d as i32, width as i32, splits as i32, past as i32);
+        unsafe {
+            let mut launch = self.stream.launch_builder(self.func("qsa_sparse_partial_f32"));
+            launch.arg(q_in.as_ref()).arg(k_in.as_ref()).arg(v_in.as_ref());
+            match &s_in { Some(s) => { launch.arg(s.as_ref()); } None => { launch.arg(&null); } }
+            launch.arg(&mut part).arg(&h_i).arg(&g_i).arg(&d_i).arg(&w_i).arg(&sp_i).arg(&scale).arg(&p_i)
+                .launch(LaunchConfig { grid_dim: (n as u32, heads as u32, splits as u32), block_dim: (256, 1, 1), shared_mem_bytes: ((per + d) * 4) as u32 })
+                .expect("qsa_sparse_partial launch");
+            self.stream.launch_builder(self.func("qsa_sparse_combine_f32"))
+                .arg(&part).arg(&mut out).arg(&h_i).arg(&d_i).arg(&sp_i)
+                .launch(LaunchConfig { grid_dim: (n as u32, heads as u32, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 })
+                .expect("qsa_sparse_combine launch");
+        }
+        self.make_tensor(out, vec![n, heads, d])
+    }
+
+    fn cached_positions(&self, positions: &[u32]) -> Arc<CudaSlice<u32>> {
+        let mut cache = self.rope_positions.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some((_, dev)) = cache.iter().find(|(host, _)| host.as_slice() == positions) {
+            return dev.clone();
+        }
+        let dev = Arc::new(self.upload_u32(positions));
+        if cache.len() >= 4 { cache.remove(0); }
+        cache.push((positions.to_vec(), dev.clone()));
+        dev
     }
 
     fn upload_u32(&self, host: &[u32]) -> CudaSlice<u32> {
@@ -424,7 +764,7 @@ impl CudaBackend {
     }
 
     /// Mutable downcast — for in-place ops on a tensor we know is on this device.
-    fn cuda_input_mut<'a>(&self, t: &'a mut Tensor) -> &'a mut CudaSlice<f32> {
+    pub(crate) fn cuda_input_mut<'a>(&self, t: &'a mut Tensor) -> &'a mut CudaSlice<f32> {
         let s = t.device_storage_mut().expect(
             "mutating CUDA op called on non-device tensor; call backend.to_device(t) first",
         );
@@ -691,7 +1031,7 @@ impl Backend for CudaBackend {
 
         let a = self.cuda_input(x);
         let b = self.cuda_input(w);
-        let mut c = self.alloc(m_rows * out);
+        let mut c = self.alloc_uninit(m_rows * out);
 
         // Decode-time GEMV fast path: same coop pattern as the quantized kernels,
         // but for dense F32 weights. Below the cuBLAS threshold the alternative
@@ -705,7 +1045,7 @@ impl Backend for CudaBackend {
             if let Some(split_kernel) = Self::split_gemv_kernel(GgmlType::F32, out, in_) {
                 let splits = Self::gemv_splits(GgmlType::F32, in_);
                 const OUT_PER_BLOCK: u32 = 8;
-                let mut partials = self.alloc(out * splits);
+                let mut partials = self.alloc_uninit(out * splits);
                 let cfg = LaunchConfig {
                     grid_dim: ((out as u32).div_ceil(OUT_PER_BLOCK), splits as u32, 1),
                     block_dim: (32, OUT_PER_BLOCK, 1),
@@ -1191,7 +1531,7 @@ impl Backend for CudaBackend {
     fn silu(&self, x: &Tensor) -> Tensor {
         let n = x.numel();
         let x_in = self.cuda_input(x);
-        let mut y = self.alloc(n);
+        let mut y = self.alloc_uninit(n);
         let cfg = LaunchConfig::for_num_elems(n as u32);
         let n_i = n as i32;
         unsafe {
@@ -1227,7 +1567,7 @@ impl Backend for CudaBackend {
     fn sigmoid(&self, x: &Tensor) -> Tensor {
         let n = x.numel();
         let x_in = self.cuda_input(x);
-        let mut y = self.alloc(n);
+        let mut y = self.alloc_uninit(n);
         let cfg = LaunchConfig::for_num_elems(n as u32);
         let n_i = n as i32;
         unsafe {
@@ -1645,7 +1985,7 @@ impl Backend for CudaBackend {
         let n_h = x.dim(1);
         assert_eq!(positions.len(), seq);
 
-        let pos_dev = self.upload_u32(positions);
+        let pos_dev = self.cached_positions(positions);
         let x_dev = self.cuda_input_mut(x);
 
         let half = (rotated_dim / 2) as u32;
@@ -1662,7 +2002,7 @@ impl Backend for CudaBackend {
         unsafe {
             self.stream
                 .launch_builder(self.func("rope_partial_neox_f32"))
-                .arg(x_dev).arg(&pos_dev)
+                .arg(x_dev).arg(pos_dev.as_ref())
                 .arg(&seq_i).arg(&n_h_i).arg(&hd_i)
                 .arg(&rot_i).arg(&theta)
                 .launch(cfg)
@@ -1716,128 +2056,336 @@ impl Backend for CudaBackend {
         scale_q:     f32,
         eps:         f32,
     ) -> Tensor {
-        let conv_dim    = mixed_qkv.numel() / seq;
-        let conv_kernel = conv_weight.dim(1);
-        let mqkv_dev = self.cuda_input(mixed_qkv);
-        let z_dev    = self.cuda_input(z_in);
-        let ba_dev   = self.cuda_input(beta_alpha);
-        let cw_dev   = self.cuda_input(conv_weight);
-        let sa_dev   = self.cuda_input(ssm_a);
-        let dt_dev   = self.cuda_input(dt_bias);
-        let nm_dev   = self.cuda_input(ssm_norm);
-        let cs_dev   = self.cuda_input_mut(conv_state);
-        let st_dev   = self.cuda_input_mut(state);
+        self.delta_net_inner(mixed_qkv, z_in, beta_alpha, conv_weight, ssm_a, dt_bias, ssm_norm, conv_state, state, seq, num_v_heads, num_k_heads, head_v_dim, head_k_dim, v_per_k, scale_q, eps, 0)
+    }
 
-        // Allocate intermediate conv_out for ALL seq tokens (the loop kernels
-        // write/read the full [seq, conv_dim] buffer rather than reusing one
-        // token's worth — keeps the kernels single-launch).
-        // VENDORED-LOCAL: SAFETY: the kernel below overwrites every output
-        // element on this stream before it is exposed to a consumer.
-        let mut conv_out = unsafe { self.stream.alloc::<f32>(seq * conv_dim) }.expect("output allocation");
-        // VENDORED-LOCAL: SAFETY: the kernel below overwrites every output
-        // element on this stream before it is exposed to a consumer.
-        let mut output = unsafe { self.stream.alloc::<f32>(seq * num_v_heads * head_v_dim) }.expect("output allocation");
+    fn delta_net_step_sigmoid(
+        &self,
+        mixed_qkv:   &Tensor,
+        z_in:        &Tensor,
+        beta_alpha:  &Tensor,
+        conv_weight: &Tensor,
+        ssm_a:       &Tensor,
+        dt_bias:     &Tensor,
+        ssm_norm:    &Tensor,
+        conv_state:  &mut Tensor,
+        state:       &mut Tensor,
+        seq:         usize,
+        num_v_heads: usize,
+        num_k_heads: usize,
+        head_v_dim:  usize,
+        head_k_dim:  usize,
+        v_per_k:     usize,
+        scale_q:     f32,
+        eps:         f32,
+    ) -> Tensor {
+        self.delta_net_inner(mixed_qkv, z_in, beta_alpha, conv_weight, ssm_a, dt_bias, ssm_norm, conv_state, state, seq, num_v_heads, num_k_heads, head_v_dim, head_k_dim, v_per_k, scale_q, eps, 1)
+    }
 
-        let block_x: u32 = 256;
-        let grid_x = ((conv_dim as u32) + block_x - 1) / block_x;
-        let conv_cfg = LaunchConfig {
-            grid_dim: (grid_x, 1, 1),
-            block_dim: (block_x, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        let step_cfg = LaunchConfig {
-            grid_dim: (num_v_heads as u32, 1, 1),
-            block_dim: (head_v_dim as u32, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        let seq_i = seq as i32;
-        let cd_i = conv_dim as i32;
-        let ck_i = conv_kernel as i32;
-        let nvh = num_v_heads as i32;
-        let nkh = num_k_heads as i32;
-        let hvd = head_v_dim as i32;
-        let hkd = head_k_dim as i32;
-        let vpk = v_per_k as i32;
-
-        // One launch per layer per direction (conv + step). The seq loop runs
-        // INSIDE each kernel — seq*64KB of state I/O eliminated by holding the
-        // per-head state row in registers across iterations.
-        unsafe {
-            self.stream
-                .launch_builder(self.func("delta_net_conv1d_loop_f32"))
-                .arg(mqkv_dev.as_ref())
-                .arg(cs_dev)
-                .arg(cw_dev.as_ref())
-                .arg(&mut conv_out)
-                .arg(&seq_i).arg(&cd_i).arg(&ck_i)
-                .launch(conv_cfg)
-                .expect("delta_net_conv1d_loop launch");
-        }
-        // VENDORED-LOCAL: long prefills benefit from distributing state rows
-        // across SMs. Decode retains its single fused launch.
-        if seq > 1 && head_k_dim == 128 && head_v_dim == 128 {
-            // SAFETY: every core/output element and state row has one writer.
-            // Full warps own 128-wide rows; the second launch runs after the
-            // first on this stream, and all buffers outlive both launches.
-            let mut core =
-                unsafe { self.stream.alloc::<f32>(seq * num_v_heads * 128) }.expect("delta core");
-            // SAFETY: launch dimensions cover disjoint rows/elements, and the
-            // ordered stream keeps the initialized core alive for normalization.
+    fn qsa_pool(&self, raw: &Tensor, blocks: usize, ratio: usize) -> Tensor {
+        let d = raw.numel() / raw.dim(0).max(1);
+        let raw_in = self.cuda_input(raw);
+        let mut out = self.alloc_uninit(blocks * d);
+        if blocks > 0 {
+            let (b_i, d_i, r_i) = (blocks as i32, d as i32, ratio as i32);
             unsafe {
-                self.stream
-                    .launch_builder(self.func("delta_net_rows_128_f32"))
-                    .arg(&conv_out)
-                    .arg(ba_dev.as_ref())
-                    .arg(sa_dev.as_ref())
-                    .arg(dt_dev.as_ref())
-                    .arg(st_dev)
-                    .arg(&mut core)
-                    .arg(&seq_i)
-                    .arg(&nvh)
-                    .arg(&nkh)
-                    .arg(&scale_q)
-                    .arg(&eps)
-                    .launch(LaunchConfig {
-                        grid_dim: (num_v_heads as u32, 32, 1),
-                        block_dim: (128, 1, 1),
-                        shared_mem_bytes: 0,
-                    })
-                    .expect("delta rows");
-                self.stream
-                    .launch_builder(self.func("delta_net_norm_128_f32"))
-                    .arg(&core)
-                    .arg(z_dev.as_ref())
-                    .arg(nm_dev.as_ref())
-                    .arg(&mut output)
-                    .arg(&eps)
-                    .launch(LaunchConfig {
-                        grid_dim: ((seq * num_v_heads) as u32, 1, 1),
-                        block_dim: (32, 1, 1),
-                        shared_mem_bytes: 0,
-                    })
-                    .expect("delta norm");
+                self.stream.launch_builder(self.func("qsa_pool_f32"))
+                    .arg(raw_in.as_ref()).arg(&mut out).arg(&b_i).arg(&d_i).arg(&r_i)
+                    .launch(LaunchConfig::for_num_elems((blocks * d) as u32)).expect("qsa_pool launch");
             }
-            return self.make_tensor(output, vec![seq, num_v_heads * head_v_dim]);
         }
-        unsafe {
-            self.stream
-                .launch_builder(self.func("delta_net_step_loop_f32"))
-                .arg(&conv_out)
-                .arg(z_dev.as_ref())
-                .arg(ba_dev.as_ref())
-                .arg(sa_dev.as_ref())
-                .arg(dt_dev.as_ref())
-                .arg(nm_dev.as_ref())
-                .arg(st_dev)
-                .arg(&mut output)
-                .arg(&seq_i)
-                .arg(&nvh).arg(&nkh).arg(&hvd).arg(&hkd).arg(&vpk)
-                .arg(&scale_q).arg(&eps)
-                .launch(step_cfg)
-                .expect("delta_net_step_loop launch");
-        }
+        self.make_tensor(out, vec![blocks, d])
+    }
 
-        self.make_tensor(output, vec![seq, num_v_heads * head_v_dim])
+    fn qsa_block_scores(&self, q: &Tensor, pooled: &Tensor, first: usize, ratio: usize, scale: f32) -> Tensor {
+        let rows = q.dim(0);
+        let nb = pooled.dim(0);
+        let d = pooled.numel() / nb.max(1);
+        let heads = q.numel() / rows / d;
+        let q_in = self.cuda_input(q);
+        let p_in = self.cuda_input(pooled);
+        let mut out = self.alloc_uninit(rows * nb);
+        let (r_i, h_i, d_i, n_i, f_i, c_i) = (rows as i32, heads as i32, d as i32, nb as i32, first as i32, ratio as i32);
+        unsafe {
+            self.stream.launch_builder(self.func("qsa_block_scores_f32"))
+                .arg(q_in.as_ref()).arg(p_in.as_ref()).arg(&mut out)
+                .arg(&r_i).arg(&h_i).arg(&d_i).arg(&n_i).arg(&f_i).arg(&c_i).arg(&scale)
+                .launch(LaunchConfig { grid_dim: (((rows * nb) as u32).div_ceil(8), 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 })
+                .expect("qsa_block_scores launch");
+        }
+        self.make_tensor(out, vec![rows, nb])
+    }
+
+    fn qsa_select(&self, scores: &Tensor, first: usize, ratio: usize, keep: usize) -> Tensor {
+        let n = scores.dim(0);
+        let nb = scores.numel() / n.max(1);
+        let width = keep * ratio + ratio;
+        let s_in = self.cuda_input(scores);
+        let mut out = self.alloc_uninit(n * width);
+        let (nb_i, f_i, r_i, k_i, w_i) = (nb as i32, first as i32, ratio as i32, keep as i32, width as i32);
+        unsafe {
+            self.stream.launch_builder(self.func("qsa_select_f32"))
+                .arg(s_in.as_ref()).arg(&mut out).arg(&nb_i).arg(&f_i).arg(&r_i).arg(&k_i).arg(&w_i)
+                .launch(LaunchConfig { grid_dim: (n as u32, 1, 1), block_dim: (1024, 1, 1), shared_mem_bytes: 0 })
+                .expect("qsa_select launch");
+        }
+        self.make_tensor(out, vec![n, width])
+    }
+
+    fn sparse_attention(&self, q: &Tensor, k: &Tensor, v: &Tensor, sel: &Tensor, scale: f32) -> Tensor {
+        let width = sel.numel() / q.dim(0).max(1);
+        self.split_attention(q, k, v, Some(sel), width, scale, 0)
+    }
+
+    fn gather_rows(&self, src: &Tensor, rows: &[u32]) -> Tensor {
+        let d = src.numel() / src.dim(0).max(1);
+        let src_in = self.cuda_input(src);
+        let rows_dev = self.upload_u32(rows);
+        let mut out = self.alloc_uninit(rows.len() * d);
+        let n = (rows.len() * d) as u32;
+        if n > 0 {
+            let (m_i, d_i) = (rows.len() as i32, d as i32);
+            unsafe {
+                self.stream.launch_builder(self.func("gather_rows_f32"))
+                    .arg(src_in.as_ref()).arg(&rows_dev).arg(&mut out).arg(&m_i).arg(&d_i)
+                    .launch(LaunchConfig::for_num_elems(n)).expect("gather_rows launch");
+            }
+        }
+        self.make_tensor(out, vec![rows.len(), d])
+    }
+
+    fn scatter_add_rows(&self, dst: &mut Tensor, src: &Tensor, rows: &[u32], weights: &[f32]) {
+        let d = src.numel() / src.dim(0).max(1);
+        let n = (rows.len() * d) as u32;
+        if n == 0 { return; }
+        let src_in = self.cuda_input(src);
+        let rows_dev = self.upload_u32(rows);
+        let w_dev = self.upload_f32(weights);
+        let dst_dev = self.cuda_input_mut(dst);
+        let (m_i, d_i) = (rows.len() as i32, d as i32);
+        unsafe {
+            self.stream.launch_builder(self.func("scatter_add_rows_f32"))
+                .arg(dst_dev).arg(src_in.as_ref()).arg(&rows_dev).arg(&w_dev).arg(&m_i).arg(&d_i)
+                .launch(LaunchConfig::for_num_elems(n)).expect("scatter_add_rows launch");
+        }
+    }
+
+    fn split_cols(&self, x: &Tensor, a: usize) -> (Tensor, Tensor) {
+        let rows = x.dim(0);
+        let width = x.numel() / rows;
+        let x_in = self.cuda_input(x);
+        let mut l = self.alloc_uninit(rows * a);
+        let mut r = self.alloc_uninit(rows * (width - a));
+        let (r_i, w_i, a_i) = (rows as i32, width as i32, a as i32);
+        unsafe {
+            self.stream.launch_builder(self.func("split_cols_f32"))
+                .arg(x_in.as_ref()).arg(&mut l).arg(&mut r).arg(&r_i).arg(&w_i).arg(&a_i)
+                .launch(LaunchConfig::for_num_elems((rows * width) as u32)).expect("split_cols launch");
+        }
+        (self.make_tensor(l, vec![rows, a]), self.make_tensor(r, vec![rows, width - a]))
+    }
+
+    fn hc_apply_norm(&self, x: &mut Tensor, y: &Tensor, post: &Tensor, weight: &Tensor, streams: usize, eps: f32) -> Tensor {
+        let rows = x.dim(0);
+        let d = x.numel() / rows / streams;
+        let y_in = self.cuda_input(y);
+        let p_in = self.cuda_input(post);
+        let w_in = self.cuda_input(weight);
+        let mut out = self.alloc_uninit(rows * streams * d);
+        let shape = x.shape().to_vec();
+        let x_dev = self.cuda_input_mut(x);
+        let (d_i, s_i) = (d as i32, streams as i32);
+        unsafe {
+            self.stream.launch_builder(self.func("hc_apply_norm_f32"))
+                .arg(x_dev).arg(y_in.as_ref()).arg(p_in.as_ref()).arg(w_in.as_ref()).arg(&mut out).arg(&d_i).arg(&s_i).arg(&eps)
+                .launch(LaunchConfig { grid_dim: ((rows * streams) as u32, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 })
+                .expect("hc_apply_norm launch");
+        }
+        self.make_tensor(out, shape)
+    }
+
+    fn hc_down_gates(&self, normed: &Tensor, down: &Tensor, rank: usize, writes: usize, streams: usize) -> (Tensor, Tensor) {
+        let rows = normed.dim(0);
+        // The fused kernel reads the weights once a row: a GEMM for a prompt's many rows.
+        if rows > 8 {
+            let mut t = self.linear(normed, &self.unpack_f16(down));
+            let post = self.hc_gates(&mut t, rank, writes, streams);
+            return (t, post);
+        }
+        let width = normed.numel() / rows;
+        let cols = rank + writes;
+        let n_in = self.cuda_input(normed);
+        let w_in = self.cuda_input(down);
+        let mut t = self.alloc_uninit(rows * cols);
+        let mut post = self.alloc_uninit((rows * writes).max(1));
+        let (wd, rk, wr, st) = (width as i32, rank as i32, writes as i32, streams as i32);
+        unsafe {
+            self.stream.launch_builder(self.func("hc_down_gates_f32"))
+                .arg(n_in.as_ref()).arg(w_in.as_ref()).arg(&mut t).arg(&mut post).arg(&wd).arg(&rk).arg(&wr).arg(&st)
+                .launch(LaunchConfig { grid_dim: (cols as u32, rows as u32, 1), block_dim: (1024, 1, 1), shared_mem_bytes: 0 })
+                .expect("hc_down_gates launch");
+        }
+        (self.make_tensor(t, vec![rows, cols]), self.make_tensor(post, vec![rows, writes.max(1)]))
+    }
+
+    fn unpack_f16(&self, packed: &Tensor) -> Tensor {
+        let rows = packed.dim(0);
+        let words = packed.numel();
+        let p_in = self.cuda_input(packed);
+        let mut out = self.alloc_uninit(2 * words);
+        let w_i = words as i64;
+        unsafe {
+            self.stream.launch_builder(self.func("unpack_f16_f32"))
+                .arg(p_in.as_ref()).arg(&mut out).arg(&w_i)
+                .launch(LaunchConfig::for_num_elems(words as u32)).expect("unpack_f16 launch");
+        }
+        self.make_tensor(out, vec![rows, 2 * words / rows.max(1)])
+    }
+
+    fn hc_up_mix(&self, t: &Tensor, up: &Tensor, normed: &Tensor, streams: usize) -> Tensor {
+        let rows = normed.dim(0);
+        if rows > 8 {
+            let logits = self.linear(t, &self.unpack_f16(up));
+            return self.hc_mix(&logits, normed, streams);
+        }
+        let d = normed.numel() / rows / streams;
+        let cols = t.numel() / rows;
+        let t_in = self.cuda_input(t);
+        let u_in = self.cuda_input(up);
+        let n_in = self.cuda_input(normed);
+        let mut out = self.alloc_uninit(rows * d);
+        let (r_i, s_i, d_i, c_i) = (rows as i32, streams as i32, d as i32, cols as i32);
+        unsafe {
+            self.stream.launch_builder(self.func("hc_up_mix_f32"))
+                .arg(t_in.as_ref()).arg(u_in.as_ref()).arg(n_in.as_ref()).arg(&mut out).arg(&r_i).arg(&s_i).arg(&d_i).arg(&c_i)
+                .launch(LaunchConfig { grid_dim: (((rows * d) as u32).div_ceil(8), 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 })
+                .expect("hc_up_mix launch");
+        }
+        self.make_tensor(out, vec![rows, d])
+    }
+
+    fn hc_norm(&self, x: &Tensor, weight: &Tensor, streams: usize, eps: f32) -> Tensor {
+        let rows = x.dim(0);
+        let d = x.numel() / rows / streams;
+        let x_in = self.cuda_input(x);
+        let w_in = self.cuda_input(weight);
+        let mut out = self.alloc_uninit(rows * streams * d);
+        let (d_i, s_i) = (d as i32, streams as i32);
+        unsafe {
+            self.stream.launch_builder(self.func("hc_norm_f32"))
+                .arg(x_in.as_ref()).arg(w_in.as_ref()).arg(&mut out).arg(&d_i).arg(&s_i).arg(&eps)
+                .launch(LaunchConfig { grid_dim: ((rows * streams) as u32, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 })
+                .expect("hc_norm launch");
+        }
+        self.make_tensor(out, x.shape().to_vec())
+    }
+
+    fn hc_gates(&self, t: &mut Tensor, rank: usize, writes: usize, streams: usize) -> Tensor {
+        let rows = t.dim(0);
+        let mut post = self.alloc((rows * writes).max(1));
+        let t_dev = self.cuda_input_mut(t);
+        let (r_i, k_i, w_i, s_i) = (rows as i32, rank as i32, writes as i32, streams as i32);
+        unsafe {
+            self.stream.launch_builder(self.func("hc_gates_f32"))
+                .arg(t_dev).arg(&mut post).arg(&r_i).arg(&k_i).arg(&w_i).arg(&s_i)
+                .launch(LaunchConfig::for_num_elems((rows * (rank + writes)) as u32)).expect("hc_gates launch");
+        }
+        self.make_tensor(post, vec![rows, writes.max(1)])
+    }
+
+    fn hc_mix(&self, logits: &Tensor, normed: &Tensor, streams: usize) -> Tensor {
+        let rows = normed.dim(0);
+        let d = normed.numel() / rows / streams;
+        let l_in = self.cuda_input(logits);
+        let n_in = self.cuda_input(normed);
+        let mut out = self.alloc_uninit(rows * d);
+        let (r_i, s_i, d_i) = (rows as i32, streams as i32, d as i32);
+        unsafe {
+            self.stream.launch_builder(self.func("hc_mix_f32"))
+                .arg(l_in.as_ref()).arg(n_in.as_ref()).arg(&mut out).arg(&r_i).arg(&s_i).arg(&d_i)
+                .launch(LaunchConfig::for_num_elems((rows * d) as u32)).expect("hc_mix launch");
+        }
+        self.make_tensor(out, vec![rows, d])
+    }
+
+    fn add_rows_scaled(&self, dst: &mut Tensor, src: &Tensor, scale: &Tensor) {
+        let rows = src.dim(0);
+        let d = src.numel() / rows.max(1);
+        let n = (rows * d) as u32;
+        if n == 0 { return; }
+        let src_in = self.cuda_input(src);
+        let g_in = self.cuda_input(scale);
+        let dst_dev = self.cuda_input_mut(dst);
+        let (r_i, d_i) = (rows as i32, d as i32);
+        unsafe {
+            self.stream.launch_builder(self.func("add_rows_scaled_f32"))
+                .arg(dst_dev).arg(src_in.as_ref()).arg(g_in.as_ref()).arg(&r_i).arg(&d_i)
+                .launch(LaunchConfig::for_num_elems(n)).expect("add_rows_scaled launch");
+        }
+    }
+
+    fn stream_mean(&self, x: &Tensor, streams: usize) -> Tensor {
+        let rows = x.dim(0);
+        let d = x.numel() / rows / streams;
+        let x_in = self.cuda_input(x);
+        let mut out = self.alloc_uninit(rows * d);
+        let (r_i, h_i, d_i) = (rows as i32, streams as i32, d as i32);
+        unsafe {
+            self.stream.launch_builder(self.func("stream_mean_f32"))
+                .arg(x_in.as_ref()).arg(&mut out).arg(&r_i).arg(&h_i).arg(&d_i)
+                .launch(LaunchConfig::for_num_elems((rows * d) as u32)).expect("stream_mean launch");
+        }
+        self.make_tensor(out, vec![rows, d])
+    }
+
+    fn ple_gate(&self, key: &Tensor, x: &Tensor, value: &Tensor, norm_key: &Tensor, norm_query: &Tensor, norm_conv: &Tensor, streams: usize, eps: f32) -> (Tensor, Tensor) {
+        let rows = value.dim(0);
+        let d = value.numel() / rows;
+        let width = streams * d;
+        let (k_in, x_in, v_in) = (self.cuda_input(key), self.cuda_input(x), self.cuda_input(value));
+        let (nk, nq, nc) = (self.cuda_input(norm_key), self.cuda_input(norm_query), self.cuda_input(norm_conv));
+        let mut gated = self.alloc_uninit(rows * width);
+        let mut conv_in = self.alloc_uninit(rows * width);
+        let (s_i, d_i) = (streams as i32, d as i32);
+        unsafe {
+            self.stream.launch_builder(self.func("ple_gate_f32"))
+                .arg(k_in.as_ref()).arg(x_in.as_ref()).arg(v_in.as_ref()).arg(nk.as_ref()).arg(nq.as_ref()).arg(nc.as_ref())
+                .arg(&mut gated).arg(&mut conv_in).arg(&s_i).arg(&d_i).arg(&eps)
+                .launch(LaunchConfig { grid_dim: (rows as u32, streams as u32, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 })
+                .expect("ple_gate launch");
+        }
+        (self.make_tensor(gated, vec![rows, width]), self.make_tensor(conv_in, vec![rows, width]))
+    }
+
+    fn ple_conv(&self, x: &mut Tensor, gated: &Tensor, conv_in: &Tensor, window: &mut Tensor, weight: &Tensor, kernel: usize, dilation: usize) {
+        let rows = gated.dim(0);
+        let width = gated.numel() / rows;
+        let (g_in, c_in, wt) = (self.cuda_input(gated), self.cuda_input(conv_in), self.cuda_input(weight));
+        let (r_i, w_i, k_i, d_i) = (rows as i32, width as i32, kernel as i32, dilation as i32);
+        let win = self.cuda_input_mut(window) as *mut CudaSlice<f32>;
+        let x_dev = self.cuda_input_mut(x);
+        // SAFETY: `window` and `x` are distinct tensors; the pointer only splits the borrows.
+        let win = unsafe { &mut *win };
+        unsafe {
+            self.stream.launch_builder(self.func("ple_conv_f32"))
+                .arg(x_dev).arg(g_in.as_ref()).arg(c_in.as_ref()).arg(win).arg(wt.as_ref())
+                .arg(&r_i).arg(&w_i).arg(&k_i).arg(&d_i)
+                .launch(LaunchConfig::for_num_elems(width as u32)).expect("ple_conv launch");
+        }
+    }
+
+    fn stream_apply(&self, x: &mut Tensor, y: &Tensor, post: &Tensor, streams: usize) {
+        let rows = y.dim(0);
+        let d = y.numel() / rows;
+        let y_in = self.cuda_input(y);
+        let p_in = self.cuda_input(post);
+        let x_dev = self.cuda_input_mut(x);
+        let (r_i, h_i, d_i) = (rows as i32, streams as i32, d as i32);
+        unsafe {
+            self.stream.launch_builder(self.func("stream_apply_f32"))
+                .arg(x_dev).arg(y_in.as_ref()).arg(p_in.as_ref()).arg(&r_i).arg(&h_i).arg(&d_i)
+                .launch(LaunchConfig::for_num_elems((rows * streams * d) as u32)).expect("stream_apply launch");
+        }
     }
 
     fn split_qkv_3way(&self, qkv: &Tensor, d: usize) -> (Tensor, Tensor, Tensor) {
@@ -2104,6 +2652,12 @@ impl Backend for CudaBackend {
         debug_assert!(kv_len <= max_kv_len);
         debug_assert_eq!(n_h_q % n_h_kv, 0, "n_h_q must be a multiple of n_h_kv");
 
+        // VENDORED-LOCAL: a few query rows (decode): the keys split over many blocks, a warp
+        // a key, rather than a block per head walking all of them a thread a key.
+        if seq <= 4 && sliding_window.is_none() && past + seq <= kv_len && kv_len <= 32768 {
+            return self.split_attention(q, k_buffer, v_buffer, None, kv_len, scale, past);
+        }
+
         // VENDORED-LOCAL: full bidirectional vision attention. A bounded score
         // matrix lets cuBLAS reuse tiles instead of rereading K/V per query.
         // Never select this path for causal decoding or long-context attention.
@@ -2256,7 +2810,7 @@ impl Backend for CudaBackend {
         let n = count * inner;
 
         let src_in = self.cuda_input(src);
-        let mut new_slice = self.alloc(n);
+        let mut new_slice = self.alloc_uninit(n);
         let src_view = src_in.as_ref().slice(off..off + n);
         self.stream
             .memcpy_dtod(&src_view, &mut new_slice)

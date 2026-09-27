@@ -38,6 +38,9 @@ mod qwen;
 // OrcaSAQ (EXL3 on CUDA), its PEFT adapters and its Qwen vision tower.
 #[cfg(feature = "cuda")]
 mod orcasaq;
+// Qwen3.8-Flash-Next (qwen4_exp, EXL3 on CUDA).
+#[cfg(feature = "cuda")]
+mod flashnext;
 #[cfg(feature = "cuda")]
 mod lora;
 mod qwen_cache;
@@ -111,8 +114,11 @@ pub struct Options {
     /// Vision projectors keyed by model name: GGUF files, or original Qwen
     /// safetensors directories for OrcaSAQ (tools/orcasaq/download.py --vision).
     pub vision_projectors: std::collections::BTreeMap<String, PathBuf>,
-    /// PEFT adapter directories per Orca model alias, applied together in
-    /// order, each with its own strength when it was given one.
+    /// GPUs for one model, keyed by name, instead of `devices` (a model too big for one).
+    pub model_devices: std::collections::BTreeMap<String, Vec<usize>>,
+    /// LoRA adapters per Orca or Flash-Next model alias (PEFT folders; for Flash-Next also
+    /// llama.cpp GGUF LoRAs), applied together in order, each with its own strength when it
+    /// was given one.
     pub lora_adapters: std::collections::BTreeMap<String, Vec<(PathBuf, Option<f32>)>>,
     /// How strongly an alias's adapters apply when they give no strength of their own (1 = as trained).
     pub lora_strengths: std::collections::BTreeMap<String, f32>,
@@ -227,6 +233,7 @@ impl Default for Options {
             name: "deepseek-v4.1-flash".into(),
             extra_models: Vec::new(),
             vision_projectors: std::collections::BTreeMap::new(),
+            model_devices: std::collections::BTreeMap::new(),
             lora_adapters: std::collections::BTreeMap::new(),
             lora_strengths: std::collections::BTreeMap::new(),
             start_model: None,

@@ -1099,7 +1099,7 @@ function loraList(section, name, list, label = "LoRAs (optional; each with a str
   const rows = (list || []).map((l, i) => {
     const path = typeof l === "string" ? l : (l.path || ""), strength = typeof l === "string" ? 1 : (l.strength ?? 1);
     return `<div class="pathfield" style="margin-top:4px">
-      <input type="text" value="${esc(path)}" data-lora="${section}|${esc(name)}|${i}|path" placeholder="${dir ? "LoRA folder (adapter_config.json)" : "LoRA .safetensors"}">
+      <input type="text" value="${esc(path)}" data-lora="${section}|${esc(name)}|${i}|path" placeholder="${dir ? "LoRA folder (adapter_config.json, or a Flash-Next .gguf)" : "LoRA .safetensors"}">
       <input type="number" step="0.05" min="-4" max="4" value="${esc(String(strength))}" data-lora="${section}|${esc(name)}|${i}|strength" title="Strength (1 = as trained)" style="width:6em;flex:none">
       <button class="btn quiet warn" type="button" data-lora-remove="${section}|${esc(name)}|${i}">Remove</button></div>`;
   }).join("");
@@ -1197,7 +1197,7 @@ function renderModels() {
     l[k] = k === "strength" ? (el.value === "" || isNaN(Number(el.value)) ? 1 : Number(el.value)) : el.value; touch(); });
   $$("[data-lora-remove]").forEach(b => b.onclick = () => { const [s, n, i] = b.dataset.loraRemove.split("|"); modelLoras(s, n).splice(+i, 1); renderModels(); touch(); });
   $$("[data-lora-add]").forEach(b => b.onclick = () => { const [s, n] = b.dataset.loraAdd.split("|");
-    pick({dir: !!b.dataset.dir, title: b.dataset.dir ? "Choose a LoRA folder (with adapter_config.json)" : "Choose a LoRA (.safetensors)"}, p => { modelLoras(s, n).push({path: p, strength: 1}); renderModels(); touch(); }); });
+    pick({dir: !!b.dataset.dir, title: b.dataset.dir ? "Choose a LoRA folder (with adapter_config.json, or a Flash-Next .gguf LoRA)" : "Choose a LoRA (.safetensors)"}, p => { modelLoras(s, n).push({path: p, strength: 1}); renderModels(); touch(); }); });
   $$("[data-menable]").forEach(el => el.onchange = () => { const [s, n] = el.dataset.menable.split("|"); modelObj(s, n).enabled = el.checked; touch(); });
   $$("[data-default]").forEach(b => b.onclick = () => { const [s, n] = b.dataset.default.split("|"); if (s === "llm") cfg.llm.default_model = n; else cfg.media[s].default_model = n; renderModels(); renderSelects(); touch(); });
   $$("[data-remove]").forEach(b => b.onclick = async () => { const [section, name] = b.dataset.remove.split("|");

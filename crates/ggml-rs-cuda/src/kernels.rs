@@ -6,6 +6,497 @@
 //! don't shuttle every op through host memory.
 
 pub const KERNEL_SRC: &str = r#"
+
+// VENDORED-LOCAL: QSA (Qwen3.8-Flash-Next sparse attention).
+extern "C" __global__ void qsa_pool_f32(const float* raw, float* out, int blocks, int d, int ratio) {
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (long)blocks * d) return;
+    long b = i / d; int c = (int)(i % d);
+    float s = 0.f;
+    for (int j = 0; j < ratio; ++j) s += raw[(b * ratio + j) * d + c];
+    out[i] = s / (float)ratio;
+}
+// One warp per (query row, block): lanes split the dimensions.
+extern "C" __global__ void qsa_block_scores_f32(const float* q, const float* pooled, float* out,
+    int rows, int heads, int d, int nb, int first, int ratio, float scale) {
+    long i = ((long)blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    int lane = threadIdx.x % 32;
+    if (i >= (long)rows * nb) return;
+    int r = (int)(i / nb), j = (int)(i % nb);
+    if (j >= (first + r + 1) / ratio) { if (lane == 0) out[i] = -__int_as_float(0x7f800000); return; }
+    const float* pp = pooled + (long)j * d;
+    float total = 0.f;
+    for (int h = 0; h < heads; ++h) {
+        const float* qp = q + ((long)r * heads + h) * d;
+        float dot = 0.f;
+        for (int k = lane; k < d; k += 32) dot += qp[k] * pp[k];
+        for (int o = 16; o > 0; o >>= 1) dot += __shfl_xor_sync(0xffffffff, dot, o);
+        total += fmaxf(dot, 0.f);
+    }
+    if (lane == 0) out[i] = total * scale;
+}
+// One block per (query row, head): scores for the row's selected cache rows (a warp per key),
+// softmax, then each thread one output channel.
+extern "C" __global__ void qsa_sparse_attention_f32(const float* q, const float* k, const float* v,
+    const int* sel, float* out, int heads, int kv_heads, int d, int width, float scale) {
+    int row = blockIdx.x, h = blockIdx.y;
+    int g = h / (heads / kv_heads);
+    extern __shared__ float sm[];
+    float* sc = sm;
+    float* qs = sm + width;
+    __shared__ float red[32];
+    const float* qp = q + ((long)row * heads + h) * d;
+    for (int i = threadIdx.x; i < d; i += blockDim.x) qs[i] = qp[i];
+    __syncthreads();
+    int warp = threadIdx.x / 32, lane = threadIdx.x % 32, warps = blockDim.x / 32;
+    const int* rs = sel + (long)row * width;
+    for (int j = warp; j < width; j += warps) {
+        int t = rs[j];
+        float s = -__int_as_float(0x7f800000);
+        if (t >= 0) {
+            const float* kp = k + ((long)t * kv_heads + g) * d;
+            float acc = 0.f;
+            for (int i = lane; i < d; i += 32) acc += qs[i] * kp[i];
+            for (int o = 16; o > 0; o >>= 1) acc += __shfl_down_sync(0xffffffff, acc, o);
+            s = acc * scale;
+        }
+        if (lane == 0) sc[j] = s;
+    }
+    __syncthreads();
+    float m = -__int_as_float(0x7f800000);
+    for (int j = threadIdx.x; j < width; j += blockDim.x) m = fmaxf(m, sc[j]);
+    for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_down_sync(0xffffffff, m, o));
+    if (lane == 0) red[warp] = m;
+    __syncthreads();
+    if (threadIdx.x == 0) { float mm = red[0]; for (int w = 1; w < warps; ++w) mm = fmaxf(mm, red[w]); red[0] = mm; }
+    __syncthreads();
+    m = red[0];
+    __syncthreads();
+    float sum = 0.f;
+    for (int j = threadIdx.x; j < width; j += blockDim.x) {
+        float e = rs[j] >= 0 ? expf(sc[j] - m) : 0.f;
+        sc[j] = e;
+        sum += e;
+    }
+    for (int o = 16; o > 0; o >>= 1) sum += __shfl_down_sync(0xffffffff, sum, o);
+    if (lane == 0) red[warp] = sum;
+    __syncthreads();
+    if (threadIdx.x == 0) { float ss = 0.f; for (int w = 0; w < warps; ++w) ss += red[w]; red[0] = ss; }
+    __syncthreads();
+    float inv = 1.f / red[0];
+    for (int i = threadIdx.x; i < d; i += blockDim.x) {
+        float acc = 0.f;
+        for (int j = 0; j < width; ++j) {
+            float p = sc[j];
+            if (p > 0.f) acc += p * v[((long)rs[j] * kv_heads + g) * d + i];
+        }
+        out[((long)row * heads + h) * d + i] = acc * inv;
+    }
+}
+
+// VENDORED-LOCAL: Qwen3.8-Flash-Next — grouped MoE rows and hyper-connection streams.
+extern "C" __global__ void gather_rows_f32(const float* src, const unsigned int* rows, float* out, int m, int d) {
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (long)m * d) return;
+    long r = i / d; int c = (int)(i % d);
+    out[i] = src[(long)rows[r] * d + c];
+}
+extern "C" __global__ void scatter_add_rows_f32(float* dst, const float* src, const unsigned int* rows, const float* w, int m, int d) {
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (long)m * d) return;
+    long r = i / d; int c = (int)(i % d);
+    atomicAdd(&dst[(long)rows[r] * d + c], src[i] * w[r]);
+}
+// VENDORED-LOCAL: gated residual, fused. One block per (row, stream): the pending write-back
+// x += post * y, then the stream's RMS norm.
+extern "C" __global__ void hc_apply_norm_f32(float* x, const float* y, const float* post, const float* w, float* out, int d, int streams, float eps) {
+    int b = blockIdx.x, r = b / streams;
+    float* xs = x + (long)b * d;
+    const float* ys = y + (long)r * d;
+    float p = post[b];
+    float ss = 0.f;
+    for (int j = threadIdx.x; j < d; j += blockDim.x) { float v = xs[j] + p * ys[j]; xs[j] = v; ss += v * v; }
+    __shared__ float red[32];
+    for (int o = 16; o > 0; o >>= 1) ss += __shfl_down_sync(0xffffffff, ss, o);
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x / 32] = ss;
+    __syncthreads();
+    if (threadIdx.x == 0) { float t = 0.f; for (int i = 0; i < blockDim.x / 32; ++i) t += red[i]; red[0] = t; }
+    __syncthreads();
+    float inv = rsqrtf(red[0] / (float)d + eps);
+    const float* ws = w + (long)(b % streams) * d;
+    for (int j = threadIdx.x; j < d; j += blockDim.x) out[(long)b * d + j] = xs[j] * inv * ws[j];
+}
+// One block per (output, row): the dot, then silu(v / streams) for the gate's rank, or the
+// write weight 2 * sigmoid(v / streams) (its t entry 0).
+// VENDORED-LOCAL: f16 weights two to a word (low half first): exact, half the reading.
+__device__ __forceinline__ float2 hc_unpack(unsigned int w) {
+    float lo, hi;
+    asm("cvt.f32.f16 %0, %1;" : "=f"(lo) : "h"((unsigned short)(w & 0xffffu)));
+    asm("cvt.f32.f16 %0, %1;" : "=f"(hi) : "h"((unsigned short)(w >> 16)));
+    return make_float2(lo, hi);
+}
+extern "C" __global__ void unpack_f16_f32(const unsigned int* packed, float* out, long words) {
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= words) return;
+    float2 v = hc_unpack(packed[i]);
+    out[2 * i] = v.x; out[2 * i + 1] = v.y;
+}
+// VENDORED-LOCAL: y[r, o] = x[r] . w[o] for f16 weights packed two to a word: a block per
+// (output, row).
+extern "C" __global__ void half_gemv_f32(const float* x, const unsigned int* w, float* y, int k, int n) {
+    int o = blockIdx.x, r = blockIdx.y, half = k / 2;
+    const float2* a = (const float2*)(x + (long)r * k);
+    const unsigned int* wr = w + (long)o * half;
+    float s = 0.f;
+    for (int j = threadIdx.x; j < half; j += blockDim.x) { float2 v = hc_unpack(wr[j]), xv = a[j]; s += xv.x * v.x + xv.y * v.y; }
+    __shared__ float red[32];
+    for (int off = 16; off > 0; off >>= 1) s += __shfl_down_sync(0xffffffff, s, off);
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x / 32] = s;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float v = 0.f;
+        for (int i = 0; i < blockDim.x / 32; ++i) v += red[i];
+        y[(long)r * n + o] = v;
+    }
+}
+extern "C" __global__ void hc_down_gates_f32(const float* normed, const unsigned int* down, float* t, float* post, int width, int rank, int writes, int streams) {
+    int m = blockIdx.x, r = blockIdx.y, cols = rank + writes, half = width / 2;
+    const float2* a = (const float2*)(normed + (long)r * width);
+    const unsigned int* wr = down + (long)m * half;
+    float s = 0.f;
+    for (int j = threadIdx.x; j < half; j += blockDim.x) { float2 w = hc_unpack(wr[j]), x = a[j]; s += x.x * w.x + x.y * w.y; }
+    __shared__ float red[32];
+    for (int o = 16; o > 0; o >>= 1) s += __shfl_down_sync(0xffffffff, s, o);
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x / 32] = s;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float v = 0.f;
+        for (int i = 0; i < blockDim.x / 32; ++i) v += red[i];
+        v /= (float)streams;
+        if (m < rank) t[(long)r * cols + m] = v / (1.f + expf(-v));
+        else { post[(long)r * writes + m - rank] = 2.f / (1.f + expf(-v)); t[(long)r * cols + m] = 0.f; }
+    }
+}
+// One warp per (row, channel): each stream's logit (lanes split the rank), then the mean over
+// streams of sigmoid(logit) * normed.
+extern "C" __global__ void hc_up_mix_f32(const float* t, const unsigned int* up, const float* normed, float* out, int rows, int streams, int d, int cols) {
+    long i = ((long)blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    int lane = threadIdx.x % 32, half = cols / 2;
+    if (i >= (long)rows * d) return;
+    long r = i / d; int c = (int)(i % d);
+    const float2* tr = (const float2*)(t + r * cols);
+    float acc = 0.f;
+    for (int h = 0; h < streams; ++h) {
+        const unsigned int* ur = up + ((long)h * d + c) * half;
+        float s = 0.f;
+        for (int k = lane; k < half; k += 32) { float2 w = hc_unpack(ur[k]), x = tr[k]; s += x.x * w.x + x.y * w.y; }
+        for (int o = 16; o > 0; o >>= 1) s += __shfl_xor_sync(0xffffffff, s, o);
+        acc += normed[(r * streams + h) * d + c] / (1.f + expf(-s));
+    }
+    if (lane == 0) out[i] = acc / (float)streams;
+}
+// VENDORED-LOCAL: the n-gram layer's gate, a block per (row, stream).
+__device__ float round_f16_dev(float v) {
+    unsigned int bits=__float_as_uint(v), sign=bits&0x80000000u, mant=bits&0x7fffffu, h;
+    int exp=(int)((bits>>23)&0xff)-127+15;
+    if(exp>=31) h=(sign>>16)|0x7c00u;
+    else if(exp<=0) {
+        if(exp<-10) h=sign>>16;
+        else {
+            unsigned int m=mant|0x800000u, shift=(unsigned int)(14-exp), half=1u<<(shift-1), rest=m&((1u<<shift)-1), r=m>>shift;
+            if(rest>half||(rest==half&&(r&1u))) r++;
+            h=(sign>>16)|r;
+        }
+    } else {
+        unsigned int rest=mant&0x1fffu, r=((unsigned int)exp<<10)|(mant>>13);
+        if(rest>0x1000u||(rest==0x1000u&&(r&1u))) r++;
+        h=(sign>>16)|r;
+    }
+    unsigned int s=(h&0x8000u)<<16, e=(h>>10)&0x1fu, m=h&0x3ffu;
+    if(e==0) { float f=(float)m*(1.0f/16777216.0f); return s?-f:f; }
+    if(e==31) return __uint_as_float(s|0x7f800000u|(m<<13));
+    return __uint_as_float(s|((e+112)<<23)|(m<<13));
+}
+__device__ float ple_block_sum(float v, float* red) {
+    for(int o=16;o>0;o>>=1) v+=__shfl_xor_sync(0xffffffff,v,o);
+    int lane=threadIdx.x&31, warp=threadIdx.x>>5, warps=blockDim.x>>5;
+    __syncthreads();
+    if(lane==0) red[warp]=v;
+    __syncthreads();
+    float t=0.f;
+    for(int w=0;w<warps;++w) t+=red[w];
+    return t;
+}
+extern "C" __global__ void ple_gate_f32(const float* key, const float* x, const float* value, const float* nk, const float* nq,
+    const float* nc, float* gated, float* conv_in, int streams, int d, float eps) {
+    __shared__ float red[32];
+    int r=blockIdx.x, s=blockIdx.y, width=streams*d;
+    const float* kr=key+(size_t)r*width+s*d;
+    const float* qr=x+(size_t)r*width+s*d;
+    const float* vr=value+(size_t)r*d;
+    float kk=0.f, qq=0.f, kq=0.f, vv=0.f;
+    for(int j=threadIdx.x;j<d;j+=blockDim.x) {
+        float k=kr[j], q=qr[j], v=vr[j];
+        kk+=k*k; qq+=q*q; kq+=k*nk[s*d+j]*q*nq[s*d+j]; vv+=v*v;
+    }
+    kk=ple_block_sum(kk,red); qq=ple_block_sum(qq,red); kq=ple_block_sum(kq,red); vv=ple_block_sum(vv,red);
+    float ik=rsqrtf(kk/d+eps), iq=rsqrtf(qq/d+eps);
+    float g=kq*ik*iq*rsqrtf((float)d);
+    float ss=g==0.f?0.f:copysignf(sqrtf(fmaxf(fabsf(g),1e-6f)),g);
+    float gate=1.f/(1.f+expf(-ss));
+    // rms(gate * value) = |gate| * rms(value): the gated row needs no second pass.
+    float inv=rsqrtf(gate*gate*vv/d+eps);
+    for(int j=threadIdx.x;j<d;j+=blockDim.x) {
+        float gv=gate*vr[j];
+        size_t o=(size_t)r*width+s*d+j;
+        gated[o]=gv;
+        conv_in[o]=round_f16_dev(gv*inv*nc[s*d+j]);
+    }
+}
+// VENDORED-LOCAL: the n-gram layer's dilated causal conv over window ++ conv_in, added (with
+// the gated rows) into x, then the window moved on in place: a thread per column, which reads
+// each window row before it writes over it.
+extern "C" __global__ void ple_conv_f32(float* x, const float* gated, const float* conv_in, float* window, const float* w,
+    int rows, int width, int kernel, int dilation) {
+    int c=blockIdx.x*blockDim.x+threadIdx.x;
+    if(c>=width) return;
+    int state=(kernel-1)*dilation;
+    for(int r=0;r<rows;++r) {
+        float acc=0.f;
+        for(int j=0;j<kernel;++j) {
+            int row=r+j*dilation;
+            float v=row<state ? window[(size_t)row*width+c] : conv_in[(size_t)(row-state)*width+c];
+            acc+=w[c*kernel+j]*v;
+        }
+        size_t i=(size_t)r*width+c;
+        x[i]+=gated[i]+acc/(1.f+expf(-acc));
+    }
+    for(int i=0;i<state;++i) {
+        int row=i+rows;
+        window[(size_t)i*width+c]=row<state ? window[(size_t)row*width+c] : conv_in[(size_t)(row-state)*width+c];
+    }
+}
+extern "C" __global__ void split_cols_f32(const float* x, float* l, float* r, int rows, int width, int a) {
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (long)rows * width) return;
+    long row = i / width; int c = (int)(i % width);
+    if (c < a) l[row * a + c] = x[i]; else r[row * (width - a) + c - a] = x[i];
+}
+extern "C" __global__ void hc_norm_f32(const float* x, const float* w, float* out, int d, int streams, float eps) {
+    // One block per (row, stream).
+    int b = blockIdx.x;
+    const float* xs = x + (long)b * d;
+    float ss = 0.f;
+    for (int j = threadIdx.x; j < d; j += blockDim.x) ss += xs[j] * xs[j];
+    __shared__ float red[32];
+    for (int o = 16; o > 0; o >>= 1) ss += __shfl_down_sync(0xffffffff, ss, o);
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x / 32] = ss;
+    __syncthreads();
+    if (threadIdx.x == 0) { float t = 0.f; for (int i = 0; i < blockDim.x / 32; ++i) t += red[i]; red[0] = t; }
+    __syncthreads();
+    float inv = rsqrtf(red[0] / (float)d + eps);
+    const float* ws = w + (long)(b % streams) * d;
+    for (int j = threadIdx.x; j < d; j += blockDim.x) out[(long)b * d + j] = xs[j] * inv * ws[j];
+}
+extern "C" __global__ void hc_gates_f32(float* t, float* post, int rows, int rank, int writes, int streams) {
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    int width = rank + writes;
+    if (i >= (long)rows * width) return;
+    int r = (int)(i / width), c = (int)(i % width);
+    float v = t[i] / (float)streams;
+    if (c < rank) { t[i] = v / (1.f + expf(-v)); }
+    else { post[(long)r * writes + c - rank] = 2.f / (1.f + expf(-v)); t[i] = 0.f; }
+}
+extern "C" __global__ void hc_mix_f32(const float* logits, const float* normed, float* out, int rows, int streams, int d) {
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (long)rows * d) return;
+    long r = i / d; int j = (int)(i % d);
+    float s = 0.f;
+    for (int k = 0; k < streams; ++k) {
+        long at = (r * streams + k) * d + j;
+        s += normed[at] / (1.f + expf(-logits[at]));
+    }
+    out[i] = s / (float)streams;
+}
+
+// VENDORED-LOCAL: QSA block selection, one block (1024 threads) per query row: a radix select
+// finds the keep-th best score (scores are non-negative, so their bits order like the values),
+// then every block above it, and enough at it, are written out with the tail block's tokens.
+// VENDORED-LOCAL: how many threads of the block before this one have `flag` set (and, in
+// `total`, how many in all). Every thread of the block must call it.
+__device__ int qsa_count_before(bool flag, int* warp_counts, int* total) {
+    unsigned int m = __ballot_sync(0xffffffffu, flag);
+    int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, warps = blockDim.x >> 5;
+    if (lane == 0) warp_counts[warp] = __popc(m);
+    __syncthreads();
+    int before = 0, all = 0;
+    for (int w = 0; w < warps; ++w) { if (w < warp) before += warp_counts[w]; all += warp_counts[w]; }
+    __syncthreads();
+    *total = all;
+    return before + __popc(m & ((1u << lane) - 1u));
+}
+extern "C" __global__ void qsa_select_f32(const float* scores, float* out, int nb, int first, int ratio, int keep, int width) {
+    int r = blockIdx.x, t = threadIdx.x;
+    const unsigned int* bits = (const unsigned int*)(scores + (long)r * nb);
+    float* o = out + (long)r * width;
+    int p = first + r;
+    int visible = min((p + 1) / ratio, nb);
+    int written, ties;
+    for (int i = t; i < width; i += blockDim.x) o[i] = -1.f;
+    __syncthreads();
+    if (visible <= keep) {
+        for (int j = t; j < visible * ratio; j += blockDim.x) o[j] = (float)j;
+        __syncthreads();
+        for (int j = visible * ratio + t; j <= p; j += blockDim.x) o[visible * ratio + (j - visible * ratio)] = (float)j;
+        return;
+    }
+    // Four 8-bit digits, most significant first: a 256-bin histogram of the candidates still
+    // matching the prefix picks each digit of the keep-th best.
+    __shared__ int hist[256];
+    __shared__ unsigned int s_prefix;
+    __shared__ int s_k;
+    unsigned int prefix = 0, mask = 0;
+    int k = keep;
+    for (int shift = 24; shift >= 0; shift -= 8) {
+        for (int i = t; i < 256; i += blockDim.x) hist[i] = 0;
+        __syncthreads();
+        for (int j = t; j < visible; j += blockDim.x) {
+            unsigned int b = bits[j];
+            if ((b & mask) == prefix) atomicAdd(&hist[(b >> shift) & 255], 1);
+        }
+        __syncthreads();
+        if (t == 0) {
+            int above = 0, digit = 0;
+            for (int dgt = 255; dgt >= 0; --dgt) {
+                if (above + hist[dgt] >= k) { digit = dgt; break; }
+                above += hist[dgt];
+            }
+            s_prefix = prefix | ((unsigned int)digit << shift);
+            s_k = k - above;
+        }
+        __syncthreads();
+        prefix = s_prefix;
+        k = s_k;
+        mask |= 255u << shift;
+        __syncthreads();
+    }
+    // prefix: the keep-th best score's bits; k: how many of the blocks at it to take. The
+    // chosen go out in block order, ties to the earliest: the same choice, in the same order
+    // (so the same sums), every run.
+    written = 0; ties = 0;
+    __shared__ int warp_counts[32];
+    for (int base = 0; base < visible; base += blockDim.x) {
+        int j = base + t;
+        unsigned int b = j < visible ? bits[j] : 0u;
+        bool tie = j < visible && b == prefix;
+        int tie_total;
+        int tie_rank = ties + qsa_count_before(tie, warp_counts, &tie_total);
+        bool take = (j < visible && b > prefix) || (tie && tie_rank < k);
+        int take_total;
+        int at = written + qsa_count_before(take, warp_counts, &take_total);
+        if (take) for (int c = 0; c < ratio; ++c) o[at * ratio + c] = (float)(j * ratio + c);
+        written += take_total;
+        ties += tie_total;
+    }
+    __syncthreads();
+    int base = keep * ratio;
+    for (int j = visible * ratio + t; j <= p; j += blockDim.x) o[base + (j - visible * ratio)] = (float)j;
+}
+// VENDORED-LOCAL: QSA attention, split over the selected keys: each (row, head, split) block
+// scores its share, then writes its max, sum and unnormalized output for the combine.
+// With no `sel`, every key a query sees: key j for row r when j <= past + r (dense decode).
+extern "C" __global__ void qsa_sparse_partial_f32(const float* q, const float* k, const float* v, const float* sel,
+    float* part, int heads, int kv_heads, int d, int width, int splits, float scale, int past) {
+    int row = blockIdx.x, h = blockIdx.y, sp = blockIdx.z;
+    int g = h / (heads / kv_heads);
+    int per = (width + splits - 1) / splits, j0 = sp * per, j1 = min(width, j0 + per);
+    extern __shared__ float sm[];
+    float* sc = sm;          // per
+    float* qs = sm + per;    // d
+    __shared__ float red[32];
+    const float* qp = q + ((long)row * heads + h) * d;
+    for (int i = threadIdx.x; i < d; i += blockDim.x) qs[i] = qp[i];
+    __syncthreads();
+    int warp = threadIdx.x / 32, lane = threadIdx.x % 32, warps = blockDim.x / 32;
+    const float* rs = sel ? sel + (long)row * width : nullptr;
+    #define QSA_KEY(j) (rs ? (int)rs[j] : ((j) <= past + row ? (j) : -1))
+    for (int j = j0 + warp; j < j1; j += warps) {
+        int t = QSA_KEY(j);
+        float s = -__int_as_float(0x7f800000);
+        if (t >= 0) {
+            const float* kp = k + ((long)t * kv_heads + g) * d;
+            float acc = 0.f;
+            for (int i = lane; i < d; i += 32) acc += qs[i] * kp[i];
+            for (int o = 16; o > 0; o >>= 1) acc += __shfl_down_sync(0xffffffff, acc, o);
+            s = acc * scale;
+        }
+        if (lane == 0) sc[j - j0] = s;
+    }
+    __syncthreads();
+    float m = -__int_as_float(0x7f800000);
+    for (int j = threadIdx.x; j < j1 - j0; j += blockDim.x) m = fmaxf(m, sc[j]);
+    for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_down_sync(0xffffffff, m, o));
+    if (lane == 0) red[warp] = m;
+    __syncthreads();
+    if (threadIdx.x == 0) { float mm = red[0]; for (int w = 1; w < warps; ++w) mm = fmaxf(mm, red[w]); red[0] = mm; }
+    __syncthreads();
+    m = red[0];
+    __syncthreads();
+    float sum = 0.f;
+    for (int j = threadIdx.x; j < j1 - j0; j += blockDim.x) {
+        float e = (m > -__int_as_float(0x7f800000) && QSA_KEY(j0 + j) >= 0) ? expf(sc[j] - m) : 0.f;
+        sc[j] = e;
+        sum += e;
+    }
+    for (int o = 16; o > 0; o >>= 1) sum += __shfl_down_sync(0xffffffff, sum, o);
+    if (lane == 0) red[warp] = sum;
+    __syncthreads();
+    if (threadIdx.x == 0) { float ss = 0.f; for (int w = 0; w < warps; ++w) ss += red[w]; red[0] = ss; }
+    __syncthreads();
+    float* pp = part + (((long)row * heads + h) * splits + sp) * (d + 2);
+    for (int i = threadIdx.x; i < d; i += blockDim.x) {
+        float acc = 0.f;
+        for (int j = 0; j < j1 - j0; ++j) {
+            float p = sc[j];
+            if (p > 0.f) acc += p * v[((long)QSA_KEY(j0 + j) * kv_heads + g) * d + i];
+        }
+        pp[i] = acc;
+    }
+    if (threadIdx.x == 0) { pp[d] = m; pp[d + 1] = red[0]; }
+    #undef QSA_KEY
+}
+extern "C" __global__ void qsa_sparse_combine_f32(const float* part, float* out, int heads, int d, int splits) {
+    int row = blockIdx.x, h = blockIdx.y;
+    const float* pp = part + ((long)row * heads + h) * splits * (d + 2);
+    float m = -__int_as_float(0x7f800000);
+    for (int s = 0; s < splits; ++s) m = fmaxf(m, pp[s * (d + 2) + d]);
+    float total = 0.f;
+    for (int s = 0; s < splits; ++s) { float ms = pp[s * (d + 2) + d]; if (ms > -__int_as_float(0x7f800000)) total += pp[s * (d + 2) + d + 1] * expf(ms - m); }
+    for (int i = threadIdx.x; i < d; i += blockDim.x) {
+        float acc = 0.f;
+        for (int s = 0; s < splits; ++s) { float ms = pp[s * (d + 2) + d]; if (ms > -__int_as_float(0x7f800000)) acc += pp[s * (d + 2) + i] * expf(ms - m); }
+        out[((long)row * heads + h) * d + i] = acc / total;
+    }
+}
+extern "C" __global__ void add_rows_scaled_f32(float* dst, const float* src, const float* scale, int rows, int d) {
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (long)rows * d) return;
+    dst[i] += src[i] * scale[i / d];
+}
+extern "C" __global__ void stream_mean_f32(const float* x, float* out, int rows, int h, int d) {
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (long)rows * d) return;
+    long r = i / d; int c = (int)(i % d);
+    float s = 0.f;
+    for (int k = 0; k < h; ++k) s += x[(r * h + k) * d + c];
+    out[i] = s / (float)h;
+}
+extern "C" __global__ void stream_apply_f32(float* x, const float* y, const float* post, int rows, int h, int d) {
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (long)rows * h * d) return;
+    long rh = i / d; int c = (int)(i % d); long r = rh / h;
+    x[i] += post[rh] * y[r * d + c];
+}
 // VENDORED-LOCAL: two-pass LoRA decode. Split A*x across the card, then
 // reduce its tiny partials and add B*(A*x) directly to the packed projection.
 extern "C" __global__ void lora_down_f32(
@@ -85,7 +576,7 @@ extern "C" __global__ void delta_net_rows_128_f32(
     for(int j=0;j<4;++j) state[base+lane+j*32]=st[j];
 }
 extern "C" __global__ void delta_net_norm_128_f32(
-    const float* core, const float* z, const float* norm, float* out, float eps) {
+    const float* core, const float* z, const float* norm, float* out, float eps, int gate_mode) {
     int base=blockIdx.x*128, lane=threadIdx.x;
     float v[4], ss=0.f;
     #pragma unroll
@@ -94,7 +585,7 @@ extern "C" __global__ void delta_net_norm_128_f32(
     #pragma unroll
     for(int j=0;j<4;++j) {
         int d=lane+j*32; float zv=z[base+d];
-        out[base+d]=v[j]*inv*norm[d]*(zv/(1.f+expf(-zv)));
+        out[base+d]=v[j]*inv*norm[d]*(gate_mode ? 1.f/(1.f+expf(-zv)) : zv/(1.f+expf(-zv)));
     }
 }
 // VENDORED-LOCAL: arbitrary axial NeoX frequency/position mapping.
@@ -2265,7 +2756,7 @@ __global__ void delta_net_step_loop_f32(
     float* __restrict__ state,
     float* __restrict__ output_full,
     int seq, int num_v_heads, int num_k_heads, int head_v_dim, int head_k_dim,
-    int v_per_k, float scale_q, float eps
+    int v_per_k, float scale_q, float eps, int gate_mode
 ) {
     int h_v = blockIdx.x;
     int tid = threadIdx.x;
@@ -2389,8 +2880,8 @@ __global__ void delta_net_step_loop_f32(
         if (tid < head_v_dim) {
             float normed = core[tid] * core_inv_rms * ssm_norm[tid];
             float zv = z_s[tid];
-            float silu_z = zv / (1.0f + expf(-zv));
-            output_full[out_t + h_v * head_v_dim + tid] = normed * silu_z;
+            float gate_z = gate_mode ? 1.0f / (1.0f + expf(-zv)) : zv / (1.0f + expf(-zv));
+            output_full[out_t + h_v * head_v_dim + tid] = normed * gate_z;
         }
         __syncthreads();
     }
@@ -2918,8 +3409,10 @@ pub const KERNEL_NAMES: &[&str] = &[
     "lora_down_f32",
     "lora_up_add_f32",
     "rope_axes_f32",
-    "exl3_had", "exl3_had_reduce", "exl3_reconstruct", "exl3_tile_32", "exl3_tile_48", "exl3_tile_56", "exl3_tile_64", "exl3_tile_96",
-    "exl3_gemv_generic", "exl3_gemv_32", "exl3_gemv_48", "exl3_gemv_56", "exl3_gemv_64", "exl3_gemv_96",
+    "exl3_moe_in", "exl3_moe_tile", "exl3_moe_route", "exl3_moe_group", "exl3_moe_route_group",
+    "exl3_moe_sum", "exl3_moe_lora", "exl3_moe_mid", "exl3_moe_out",
+    "exl3_had", "exl3_had_reduce", "exl3_reconstruct", "exl3_tile_32", "exl3_tile_48", "exl3_tile_56", "exl3_tile_64", "exl3_tile_80", "exl3_tile_96",
+    "exl3_gemv_generic", "exl3_gemv_32", "exl3_gemv_48", "exl3_gemv_56", "exl3_gemv_64", "exl3_gemv_80", "exl3_gemv_96",
     "linear_q8_0_f32",
     "linear_q8_0_gemv_coop_f32",
     "linear_iq4_nl_f32",
@@ -2991,6 +3484,28 @@ pub const KERNEL_NAMES: &[&str] = &[
     "delta_net_step_loop_f32",
     "delta_net_rows_128_f32",
     "delta_net_norm_128_f32",
+    "gather_rows_f32",
+    "qsa_pool_f32",
+    "qsa_block_scores_f32",
+    "qsa_sparse_attention_f32",
+    "scatter_add_rows_f32",
+    "stream_mean_f32",
+    "add_rows_scaled_f32",
+    "qsa_select_f32",
+    "qsa_sparse_partial_f32",
+    "qsa_sparse_combine_f32",
+    "hc_norm_f32",
+    "unpack_f16_f32",
+    "half_gemv_f32",
+    "split_cols_f32",
+    "ple_gate_f32",
+    "ple_conv_f32",
+    "hc_apply_norm_f32",
+    "hc_down_gates_f32",
+    "hc_up_mix_f32",
+    "hc_gates_f32",
+    "hc_mix_f32",
+    "stream_apply_f32",
     "split_q_and_gate_f32",
     "split_qkv_3way_f32",
     "linear_q4_k_gemv_coop_f32",

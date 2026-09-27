@@ -58,3 +58,20 @@ its roadmap id:
 DeepSeek-V4.1 (`dsv41`, `dsv41-cuda`) does not go through this stack: it has its own
 safetensors reader and CUDA kernels (cudarc directly), and shares only `nrob`'s cache
 and store seam.
+
+## cudarc
+
+`crates/cudarc` is cudarc 0.19.8 from crates.io, used in place of it through
+`[patch.crates-io]` in the workspace manifest (and excluded from the workspace). Its
+changes are marked `VENDORED-LOCAL`:
+
+- `CudaSlice::drop` makes its context current before it frees, as the stream and event
+  drops already do. Without it, a buffer freed on a thread where another device's context
+  (or none) was current was never released: a model unloaded from its engine thread kept
+  all of its VRAM, and the next model found the GPU full.
+- Graph capture for whole decode steps (`CudaStream::begin_graph` and `end_graph`):
+  - While a stream is being captured, its allocations come from an arena, a bump allocator
+    reset each capture, so the same launches get the same addresses every step. Those
+    slices are not `owned` and free nothing.
+  - Frees anywhere in the context wait until the capture ends (`free_after`), because a
+    free recorded into the graph would happen again at every replay.

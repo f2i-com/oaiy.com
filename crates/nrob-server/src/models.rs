@@ -50,6 +50,8 @@ pub(crate) fn needs_tool_precision(body: &nrob::json::Json) -> bool {
 pub enum Kind {
     /// Qwen hybrid with original EXL3 trellis safetensors.
     OrcaSaq,
+    /// Qwen3.8-Flash-Next (`qwen4_exp`) with EXL3 trellis safetensors.
+    FlashNext,
     /// `dsv41-cuda`: a safetensors checkpoint directory with Engram tables.
     Deepseek,
     /// `llama-rs`: a GGUF file, or a directory holding one.
@@ -61,6 +63,7 @@ impl Kind {
     /// fall back to the existing DeepSeek checkpoint loader.
     pub fn detect(path: &Path) -> Kind {
         if orcasaq_checkpoint(path) { return Kind::OrcaSaq; }
+        if flashnext_checkpoint(path) { return Kind::FlashNext; }
         if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("gguf")) {
             return Kind::Gguf;
         }
@@ -244,13 +247,13 @@ impl Models {
             }
         }
         for name in opts.lora_adapters.keys() {
-            if !specs.iter().any(|s| &s.name==name && s.kind==Kind::OrcaSaq) {
-                return Err(Error::Arg(format!("LoRA {name} must name a configured OrcaSAQ model")));
+            if !specs.iter().any(|s| &s.name==name && matches!(s.kind, Kind::OrcaSaq | Kind::FlashNext)) {
+                return Err(Error::Arg(format!("LoRA {name} must name a configured OrcaSAQ or Flash-Next model")));
             }
         }
         for name in opts.vision_projectors.keys() {
-            if !specs.iter().any(|s| &s.name==name && matches!(s.kind,Kind::Gguf | Kind::OrcaSaq)) {
-                return Err(Error::Arg(format!("vision projector {name} must name a configured GGUF or OrcaSAQ model")));
+            if !specs.iter().any(|s| &s.name==name && matches!(s.kind,Kind::Gguf | Kind::OrcaSaq | Kind::FlashNext)) {
+                return Err(Error::Arg(format!("vision projector {name} must name a configured GGUF, OrcaSAQ or Flash-Next model")));
             }
         }
         for name in opts.tool_expert_sources.keys().chain(opts.tools_experts.iter().map(|_| &opts.name)) {
@@ -393,6 +396,10 @@ impl Models {
             self.say(format!("unloading {}", l.name));
             drop(l.jobs);
             let _ = l.thread.join();
+            // What it freed goes back to the driver, not the allocator's pool: the next
+            // model may need the whole GPU.
+            #[cfg(feature = "cuda")]
+            ggml_rs_cuda::release_unused_memory();
             self.say(format!("{} unloaded", l.name));
         }
 
@@ -403,8 +410,10 @@ impl Models {
             Kind::Deepseek => self.load_deepseek(&spec),
             #[cfg(feature = "cuda")]
             Kind::OrcaSaq => self.load_orcasaq(&spec),
+            #[cfg(feature = "cuda")]
+            Kind::FlashNext => self.load_flashnext(&spec),
             #[cfg(not(feature = "cuda"))]
-            Kind::Deepseek | Kind::OrcaSaq => Err(Error::Arg(format!(
+            Kind::Deepseek | Kind::OrcaSaq | Kind::FlashNext => Err(Error::Arg(format!(
                 "{} is a DeepSeek or EXL3 checkpoint, which needs the CUDA build (nrob-server); this build serves GGUF models",
                 spec.name
             ))),
@@ -581,6 +590,41 @@ impl Models {
         })
     }
 
+    /// Qwen3.8-Flash-Next: its layers split over the configured GPUs (it needs about 50 GB).
+    #[cfg(feature = "cuda")]
+    fn load_flashnext(&self, spec: &Spec) -> Result<Live> {
+        let o = &self.opts;
+        self.say(format!("loading {}: Qwen3.8-Flash-Next, native EXL3 over {} GPU(s)", spec.name, o.model_devices.get(&spec.name).unwrap_or(&o.devices).len().max(1)));
+        let devices = o.model_devices.get(&spec.name).unwrap_or(&o.devices);
+        // Every adapter for the alias, applied together, each at its strength (else the alias's).
+        let default_strength = o.lora_strengths.get(&spec.name).copied().unwrap_or(1.0);
+        let base = crate::flashnext::lora_base(&spec.path)?;
+        let adapters = o.lora_adapters.get(&spec.name).map(|list| list.iter()
+            .map(|(path, strength)| crate::lora::Adapter::open_for(path, &base).map(|a| a.with_strength(strength.unwrap_or(default_strength))))
+            .collect::<Result<Vec<_>>>()).transpose()?.unwrap_or_default();
+        let model = crate::flashnext::load_with_adapters(&spec.path, devices, &adapters)?;
+        for (adapter, (path, strength)) in adapters.iter().zip(o.lora_adapters.get(&spec.name).into_iter().flatten()) {
+            self.say(format!("Flash-Next: loaded LoRA {} for {} projections (strength {})", path.display(), adapter.len(), strength.unwrap_or(default_strength)));
+        }
+        let tok = Arc::new(model.tokenizer.clone());
+        let max_seq = self.context(model.config.context_length);
+        let mut cfg = self.base_cfg(spec, max_seq);
+        cfg.image_token_id = tok.token_id("<|image_pad|>").ok_or_else(|| Error::Arg("Flash-Next tokenizer lacks image_pad".into()))?;
+        // Its vision tower: Qwen3.5's, stored as EXL3, on the last GPU.
+        let vision_path = o.vision.then(|| o.vision_projectors.get(&spec.name)).flatten();
+        let projector = if let Some(path) = vision_path {
+            let cuda = model.cudas.last().expect("a GPU").clone();
+            let mm = crate::qwen_vision::load(path, cuda.clone(), model.config.hidden, Some(cuda))?;
+            cfg.qwen_vision = Some(mm.config().clone());
+            self.say("Flash-Next: Qwen vision tower loaded (576 tokens/image)".into());
+            Some(mm)
+        } else { None };
+        let (jobs, rx) = std::sync::mpsc::channel();
+        let e = crate::qwen::QwenEngine::new(crate::qwen::Hybrid::Flash(Box::new(model)), projector, max_seq, !o.quiet && !o.silent);
+        let thread = std::thread::Builder::new().name("flashnext-model".into()).spawn(move || e.run(rx))?;
+        Ok(Live { name: spec.name.clone(), jobs, thread, cfg: Arc::new(cfg), flavour: Arc::new(Flavour::Qwen(tok)) })
+    }
+
     #[cfg(feature = "cuda")]
     fn load_orcasaq(&self, spec: &Spec) -> Result<Live> {
         let o=&self.opts;
@@ -602,7 +646,7 @@ impl Models {
             // Use the last configured cache device: the first already holds
             // the text weights. Image embeddings cross back through host RAM.
             let backend=m.cache_backends.last().unwrap_or(&m.backend).clone();
-            let mm=crate::qwen_vision::load(path,backend,model.config().embedding_dim)?;
+            let mm=crate::qwen_vision::load(path,backend,model.config().embedding_dim,None)?;
             cfg.qwen_vision=Some(mm.config().clone());
             self.say("OrcaSAQ: original Qwen vision tower loaded (576 tokens/image)".into());
             Some(mm)
@@ -807,6 +851,18 @@ impl Models {
 fn orcasaq_checkpoint(path: &Path) -> bool {
     std::fs::read(path.join("config.json")).ok().and_then(|b| nrob::json::Json::parse(&b).ok()).is_some_and(|c| {
         c.get("model_type").and_then(nrob::json::Json::as_str) == Some("qwen3_5")
+            && c.get("quantization_config")
+                .and_then(|q| q.get("quant_method"))
+                .and_then(nrob::json::Json::as_str)
+                == Some("exl3")
+    })
+}
+
+/// A Qwen3.8-Flash-Next checkpoint (`qwen4_exp`, EXL3). Read here so a build without CUDA
+/// still recognises one and says why it cannot serve it.
+fn flashnext_checkpoint(path: &Path) -> bool {
+    std::fs::read(path.join("config.json")).ok().and_then(|b| nrob::json::Json::parse(&b).ok()).is_some_and(|c| {
+        c.get("model_type").and_then(nrob::json::Json::as_str) == Some("qwen4_exp")
             && c.get("quantization_config")
                 .and_then(|q| q.get("quant_method"))
                 .and_then(nrob::json::Json::as_str)

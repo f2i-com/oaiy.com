@@ -219,3 +219,66 @@ impl fmt::Debug for Tensor {
         write!(f, ")")
     }
 }
+
+/// VENDORED-LOCAL: the nearest `f16` to an `f32` (ties to even), as its bits.
+pub fn f32_to_f16_bits(v: f32) -> u16 {
+    let bits = v.to_bits();
+    let sign = bits & 0x8000_0000;
+    let exp = ((bits >> 23) & 0xff) as i32 - 127 + 15;
+    let mant = bits & 0x7f_ffff;
+    let h: u32 = if exp >= 31 {
+        (sign >> 16) | 0x7c00
+    } else if exp <= 0 {
+        if exp < -10 { sign >> 16 } else {
+            let m = mant | 0x80_0000;
+            let shift = (14 - exp) as u32;
+            let half = 1u32 << (shift - 1);
+            let rest = m & ((1 << shift) - 1);
+            let mut r = m >> shift;
+            if rest > half || (rest == half && r & 1 == 1) { r += 1; }
+            (sign >> 16) | r
+        }
+    } else {
+        let rest = mant & 0x1fff;
+        let mut r = ((exp as u32) << 10) | (mant >> 13);
+        if rest > 0x1000 || (rest == 0x1000 && r & 1 == 1) { r += 1; }
+        (sign >> 16) | r
+    };
+    h as u16
+}
+
+/// VENDORED-LOCAL: an `f16`'s bits as `f32`.
+pub fn f16_bits_to_f32(h: u16) -> f32 {
+    let h = h as u32;
+    let (s, e, m) = ((h & 0x8000) << 16, (h >> 10) & 0x1f, h & 0x3ff);
+    if e == 0 {
+        let v = m as f32 * (1.0 / 16_777_216.0);
+        if s != 0 { -v } else { v }
+    } else if e == 31 {
+        f32::from_bits(s | 0x7f80_0000 | (m << 13))
+    } else {
+        f32::from_bits(s | ((e + 112) << 23) | (m << 13))
+    }
+}
+
+/// VENDORED-LOCAL: round an `f32` to the nearest `f16` (ties to even) and back.
+pub fn round_f16(v: f32) -> f32 {
+    f16_bits_to_f32(f32_to_f16_bits(v))
+}
+
+/// VENDORED-LOCAL: `values` (an even count) as `f16`, two to an `f32` word: value `2i` in word
+/// `i`'s low half, `2i + 1` in its high half. Half the memory, and half the reading.
+pub fn pack_f16(values: &[f32]) -> Vec<f32> {
+    assert!(values.len() % 2 == 0, "pack_f16: an odd count");
+    values.chunks_exact(2)
+        .map(|p| f32::from_bits(f32_to_f16_bits(p[0]) as u32 | (f32_to_f16_bits(p[1]) as u32) << 16))
+        .collect()
+}
+
+/// VENDORED-LOCAL: the values `pack_f16` packed.
+pub fn unpack_f16(words: &[f32]) -> Vec<f32> {
+    words.iter().flat_map(|w| {
+        let b = w.to_bits();
+        [f16_bits_to_f32(b as u16), f16_bits_to_f32((b >> 16) as u16)]
+    }).collect()
+}

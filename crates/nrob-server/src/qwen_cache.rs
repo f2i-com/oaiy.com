@@ -28,6 +28,21 @@ impl RecurrentSnapshot {
     pub fn bytes(&self) -> usize {
         self.0.layers.iter().flatten().flatten().map(|t| t.numel()*4).sum()
     }
+    /// Restore onto a cache whose attention (and other per-token) buffers still hold the
+    /// checkpoint's prefix: every recurrent slot goes back on its own layer's device, whatever
+    /// its shape (Qwen3.8-Flash-Next: the delta-net states, then the n-gram layer's).
+    pub fn restore_slots(&self, kv: &mut KvCache, common_prefix: usize) -> Result<(), String> {
+        if self.0.pos > common_prefix || self.0.pos > kv.len || self.0.layers.len() != kv.ssm_state.len() {
+            return Err("recurrent checkpoint no longer matches the live cache".into());
+        }
+        for (i, layer) in self.0.layers.iter().enumerate() {
+            let backend = kv.layer_backends[i].clone();
+            kv.ssm_state[i] = layer[2].as_ref().map(|t| backend.to_device(t.clone()));
+            kv.ssm_conv[i] = layer[3].as_ref().map(|t| backend.to_device(t.clone()));
+        }
+        kv.len = self.0.pos;
+        Ok(())
+    }
     pub fn restore(&self, kv: &mut KvCache, common_prefix: usize, attention: &[bool], ssm: SsmConfig, backend: &dyn Backend) -> Result<(), String> {
         if self.0.pos > common_prefix || self.0.pos > kv.len {
             return Err("Qwen recurrent checkpoint no longer has a live attention prefix".into());

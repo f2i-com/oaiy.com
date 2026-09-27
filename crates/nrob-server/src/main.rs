@@ -70,10 +70,12 @@ const HELP: &str = "Observer: --observer-model FILE.gguf --observer-device auto|
                        again (default: not kept)
   --prompt-cache-gb F  disk the prompt states may take (default 4)
   --cpu-threads N      CPU threads for experts that miss VRAM (default 24; 0 = off)
-  --lora NAME=DIR[@X]         PEFT LoRA/rsLoRA adapter for an Orca model alias; repeat
+  --lora NAME=DIR[@X]         LoRA adapter for an Orca or Flash-Next model alias (a PEFT
+                              folder; for Flash-Next also a llama.cpp .gguf LoRA); repeat
                               it to stack several, each at strength X (default 1)
   --lora-strength NAME=X      strength of NAME's adapters that give none (default 1; -4..4)
   --vision-projector NAME=PATH  GGUF projector, or original Qwen vision directory for Orca
+  --devices-for NAME=0,1  the GPUs for NAME, instead of --devices (a model too big for one)
   --no-vision          skip the vision tower (images are refused)
   --local-images on|off  let requests name image files on this machine (paths,
                        file:// URLs); default on when listening on loopback only
@@ -165,6 +167,12 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Options, Stri
                 let (name,strength)=value.split_once('=').filter(|(n,s)|!n.is_empty() && !s.is_empty()).ok_or("--lora-strength wants NAME=X")?;
                 let strength:f32=strength.parse().ok().filter(|s:&f32|s.is_finite() && (-4.0..=4.0).contains(s)).ok_or("--lora-strength wants a number between -4 and 4")?;
                 a.lora_strengths.insert(name.into(),strength);
+            }
+            "--devices-for" => {
+                let value = val()?;
+                let (name, list) = value.split_once('=').filter(|(n, l)| !n.is_empty() && !l.is_empty()).ok_or("--devices-for wants NAME=0,1")?;
+                let list = list.split(',').map(|d| d.trim().parse().map_err(|_| format!("--devices-for: bad ordinal {d:?}"))).collect::<Result<Vec<usize>, _>>()?;
+                a.model_devices.insert(name.into(), list);
             }
             "--vision-projector" => {
                 let value=val()?;

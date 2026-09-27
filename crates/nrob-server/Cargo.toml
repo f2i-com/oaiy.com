@@ -38,5 +38,6 @@ llama-rs = { path = "../llama-rs" }
 tokenizer = { path = "../tokenizer" }
 gguf = { path = "../gguf" }
 ggml-rs = { path = "../ggml-rs" }
+rayon = "1.10"
 ggml-rs-cuda = { path = "../ggml-rs-cuda", optional = true }
 ggml-rs-wgpu = { path = "../ggml-rs-wgpu", optional = true }

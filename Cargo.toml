@@ -1,5 +1,7 @@
 [workspace]
 resolver = "2"
+# Vendored cudarc (patched in [patch.crates-io] below) is not a workspace member.
+exclude = ["crates/cudarc"]
 members = [
     "crates/nrob-diffusion",
     "crates/nrob",
@@ -70,3 +72,8 @@ license = "Apache-2.0"
 # ggml-rs-cuda's tests/cpu_vs_cuda.rs at the default codegen-units=16;
 # a single codegen unit avoids it (and matches the vendored llm workspace).
 codegen-units = 1
+
+# VENDORED-LOCAL: cudarc 0.19.8 with one fix (crates/cudarc, see crates/VENDORED.md): a
+# device buffer freed on a thread without its context current was never released.
+[patch.crates-io]
+cudarc = { path = "crates/cudarc" }

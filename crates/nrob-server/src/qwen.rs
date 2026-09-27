@@ -248,8 +248,69 @@ pub fn prepare_images(records: &[Json], prompt: Vec<u32>, image_id: u32, cfg: &M
     Ok((ids, images))
 }
 
+/// What the engine runs: a Qwen3.5 hybrid (llama-rs), or Qwen3.8-Flash-Next.
+pub enum Hybrid {
+    Qwen35(Model),
+    #[cfg(feature = "cuda")]
+    Flash(Box<crate::flashnext::FlashNext>),
+}
+
+impl From<Model> for Hybrid {
+    fn from(m: Model) -> Self { Self::Qwen35(m) }
+}
+
+impl Hybrid {
+    /// The Qwen3.5 model: its checkpoints and disk states are Qwen3.5's shape.
+    fn qwen35(&self) -> Option<&llama_rs::Qwen35Model> {
+        match self { Self::Qwen35(Model::Qwen35(m)) => Some(m), _ => None }
+    }
+    fn tokenizer(&self) -> Result<&tokenizer::Tokenizer, String> {
+        match self {
+            Self::Qwen35(Model::Qwen35(m)) => Ok(&m.tokenizer),
+            Self::Qwen35(_) => Err("not a dense Qwen hybrid".into()),
+            #[cfg(feature = "cuda")]
+            Self::Flash(f) => Ok(&f.tokenizer),
+        }
+    }
+    fn width(&self) -> usize {
+        match self {
+            Self::Qwen35(m) => m.config().embedding_dim,
+            #[cfg(feature = "cuda")]
+            Self::Flash(f) => f.config.hidden,
+        }
+    }
+    fn new_kv_cache(&self, max_seq: usize) -> KvCache {
+        match self {
+            Self::Qwen35(m) => m.new_kv_cache(max_seq),
+            #[cfg(feature = "cuda")]
+            Self::Flash(f) => f.new_kv_cache(max_seq),
+        }
+    }
+    /// Token embeddings on the host.
+    fn embed(&self, tokens: &[u32]) -> Result<Tensor, String> {
+        match self {
+            Self::Qwen35(Model::Qwen35(m)) => Ok(m.embed_text(tokens).to_host()),
+            Self::Qwen35(_) => Err("not a dense Qwen hybrid".into()),
+            #[cfg(feature = "cuda")]
+            Self::Flash(f) => f.embed_text(tokens).map_err(|e| e.to_string()),
+        }
+    }
+    /// Run `tokens` (embedded as `embeds`, on the host) after what `kv` holds: the last logits, on the host.
+    fn forward(&self, tokens: &[u32], embeds: Tensor, kv: &mut KvCache, positions: Option<&[[u32; 3]]>) -> Result<Tensor, String> {
+        match self {
+            Self::Qwen35(Model::Qwen35(m)) => {
+                let embeds = m.backend.to_device(embeds);
+                Ok(m.forward_embeds_positions(&embeds, tokens.len(), kv, positions).map_err(|e| e.to_string())?.to_host())
+            }
+            Self::Qwen35(_) => Err("not a dense Qwen hybrid".into()),
+            #[cfg(feature = "cuda")]
+            Self::Flash(f) => f.forward(tokens, &embeds, kv, positions).map_err(|e| e.to_string()),
+        }
+    }
+}
+
 pub struct QwenEngine {
-    model: Model,
+    model: Hybrid,
     projector: Option<MmProj>,
     kv: KvCache,
     covered: Vec<u64>,
@@ -264,7 +325,8 @@ pub struct QwenEngine {
 }
 
 impl QwenEngine {
-    pub fn new(model: Model, projector: Option<MmProj>, max_seq: usize, log: bool) -> Self {
+    pub fn new(model: impl Into<Hybrid>, projector: Option<MmProj>, max_seq: usize, log: bool) -> Self {
+        let model = model.into();
         let kv = model.new_kv_cache(max_seq);
         Self { model, projector, kv, covered: Vec::new(), vision_cache: Default::default(), log, checkpoints: Vec::new(), disk: None, image_disk_cache:false, private_session: None }
     }
@@ -303,11 +365,13 @@ impl QwenEngine {
     }
     fn generate(&mut self, job: &Job) -> Result<(), String> {
         if job.prompt.is_empty() { return Err("empty Qwen prompt".into()); }
-        let Model::Qwen35(model) = &self.model else { return Err("not a dense Qwen hybrid".into()); };
+        let hybrid = &self.model;
+        // Checkpoints and disk states are the Qwen3.5 hybrid's (Flash-Next continues from memory only).
+        let model = hybrid.qwen35();
         let (positions, mut next_position) = positions(job)?;
         let mut keys: Vec<_> = job.prompt.iter().map(|&t| t as u64).collect();
         for image in &job.images { for (offset,k) in keys[image.start..image.start+image.prep.n_tokens()].iter_mut().enumerate() { *k = image.hash.rotate_left(17) ^ (offset as u64) ^ (1<<63); } }
-        let stops = checkpoint_positions(&job.prompt, model.tokenizer.token_id("<|im_start|>"));
+        let stops = checkpoint_positions(&job.prompt, hybrid.tokenizer()?.token_id("<|im_start|>"));
         let cache_clock = std::time::Instant::now();
         let common = self.covered.iter().zip(&keys).take_while(|(a,b)| a==b).count();
         // An attention suffix overwritten by a different branch cannot support
@@ -318,13 +382,16 @@ impl QwenEngine {
         if let Some((saved, snap, _)) = self.checkpoints.iter().filter(|(saved, _, _)|
             saved.len() > start && saved.len() < keys.len() && keys.starts_with(saved)
         ).max_by_key(|(saved, _, _)| saved.len()) {
-            snap.restore(&mut self.kv, common, &model.attention_layers, model.ssm_cfg, model.backend.as_ref())?;
+            match model {
+                Some(model) => snap.restore(&mut self.kv, common, &model.attention_layers, model.ssm_cfg, model.backend.as_ref())?,
+                None => snap.restore_slots(&mut self.kv, common)?,
+            }
             self.covered = saved.clone(); start = saved.len(); source = "checkpoint";
             self.checkpoints.retain(|(saved,_,_)| saved.len() <= start);
         }
         // Persist images only when the caller identifies both the projector and
         // preprocessing version. The prompt keys also include the image bytes.
-        if job.images.is_empty() || self.image_disk_cache {
+        if let Some(model) = model.filter(|_| job.images.is_empty() || self.image_disk_cache) {
             if let Some((saved, snap)) = self.disk.as_mut().and_then(|d| d.load_best(&keys, keys.len()-1, start, self.log)) {
                 match snap.restore(&mut self.kv, &model.attention_layers, model.ssm_cfg, model.backend.as_ref()) {
                     Ok(()) => {
@@ -364,22 +431,22 @@ impl QwenEngine {
         while pos < keys.len() {
             if job.cancel.load(Ordering::Relaxed) { return Ok(()); }
             let end = (pos+PREFILL_CHUNK).min(keys.len()).min(stops.iter().copied().find(|&s| s > pos).unwrap_or(keys.len()));
-            let mut embeds = model.embed_text(&job.prompt[pos..end]).to_host();
-            let width = model.config.embedding_dim;
+            let mut embeds = hybrid.embed(&job.prompt[pos..end])?;
+            let width = hybrid.width();
             for (at,t) in &soft {
                 let from = pos.max(*at); let to = end.min(*at+t.dim(0));
                 if from < to { embeds.data_mut()[(from-pos)*width..(to-pos)*width].copy_from_slice(&t.data()[(from-at)*width..(to-at)*width]); }
             }
-            let embeds = model.backend.to_device(embeds);
-            let out = model.forward_embeds_positions(&embeds, end-pos, &mut self.kv, (!job.images.is_empty()).then_some(&positions[pos..end])).map_err(|e|e.to_string())?;
-            logits = Some(out.to_host());
+            let out = hybrid.forward(&job.prompt[pos..end], embeds, &mut self.kv, (!job.images.is_empty()).then_some(&positions[pos..end]))?;
+            logits = Some(out);
             self.covered.extend_from_slice(&keys[pos..end]);
             let _ = job.events.send(Event::Progress { done: end-start, total });
             pos = end;
             if stops.contains(&pos) && !self.checkpoints.iter().any(|(saved, _, _)| saved == &keys[..pos]) {
                 if self.log { eprintln!("  Qwen checkpoint: {pos} tokens; disk={}", self.disk.is_some()); }
                 let base = stops.first() == Some(&pos);
-                if job.images.is_empty() || self.image_disk_cache {
+                // Disk states are the Qwen3.5 hybrid's; memory checkpoints any model's.
+                if let Some(model) = model.filter(|_| job.images.is_empty() || self.image_disk_cache) {
                     if let Some(disk) = self.disk.as_mut().filter(|_| !job.forget) {
                         if !disk.has(&keys[..pos]) {
                             let snap = Arc::new(Snapshot::capture(&self.kv, &model.attention_layers, model.backend.as_ref()));
@@ -397,7 +464,7 @@ impl QwenEngine {
         let prefill_secs = clock.elapsed().as_secs_f64();
         let _ = job.events.send(Event::Prefilled { cached: start });
         let decode_clock = std::time::Instant::now();
-        let tok = &model.tokenizer;
+        let tok = hybrid.tokenizer()?;
         let eos = tok.token_id("<|im_end|>").ok_or("Qwen tokenizer lacks im_end")?;
         let think_end = tok.token_id("</think>");
         let mut thinking = job.think_budget.is_some();
@@ -406,12 +473,17 @@ impl QwenEngine {
         let mut rng = job.sampling.seed ^ 0x9E3779B97F4A7C15;
         let mut logits = logits.unwrap();
         let mut finish = Finish::Length;
+        // Where decoding's time goes, for the log: sampling, the text (decode and stream), the model.
+        let (mut t_sample, mut t_text, mut t_model) = (0f64, 0f64, 0f64);
         while generated.len() < job.max_tokens && self.kv.len < self.kv.max_len {
             if job.cancel.load(Ordering::Relaxed) { return Ok(()); }
+            let clock = std::time::Instant::now();
             let mut next = sample(logits.data(), &job.sampling, &mut rng);
+            t_sample += clock.elapsed().as_secs_f64();
             if thinking && job.think_budget.is_some_and(|n|think_used >= n) { if let Some(end) = think_end { next = end; } }
             if next == eos || Some(next) == tok.eos() { finish = Finish::Stop; break; }
             generated.push(next);
+            let clock = std::time::Instant::now();
             let decoded = tok.decode(&generated);
             let delta = stream.push(&decoded, &job.tools, false)?;
             if !delta.is_empty() { let _ = job.events.send(Event::Text(delta)); }
@@ -426,8 +498,11 @@ impl QwenEngine {
                 }
             }
             if thinking && generated.len() % 16 == 0 { let _ = job.events.send(Event::Thinking { used: think_used, budget: job.think_budget, done: false }); }
-            let embeds = model.embed_text(&[next]);
-            logits = model.forward_embeds_positions(&embeds,1,&mut self.kv,(!job.images.is_empty()).then_some(&[[next_position;3]])).map_err(|e|e.to_string())?.to_host();
+            t_text += clock.elapsed().as_secs_f64();
+            let clock = std::time::Instant::now();
+            let embeds = hybrid.embed(&[next])?;
+            logits = hybrid.forward(&[next], embeds, &mut self.kv, (!job.images.is_empty()).then_some(&[[next_position;3]]))?;
+            t_model += clock.elapsed().as_secs_f64();
             next_position += 1;
             self.covered.push(next as u64);
         }
@@ -436,7 +511,7 @@ impl QwenEngine {
         // and fixed; the server log never holds it.
         let text = stream.push(&raw, &job.tools, true)
             .map_err(|e| format!("tool_contract_error: {e}; no tool from this batch was executed. The model wrote: {}", call_excerpt(&raw)))?;
-        if self.log { eprintln!("  Qwen: {} prompt tokens ({} cached) in {:.2}s; {} generated in {:.2}s", job.prompt.len(),start,prefill_secs,generated.len(),decode_clock.elapsed().as_secs_f64()); }
+        if self.log { eprintln!("  Qwen: {} prompt tokens ({} cached) in {:.2}s; {} generated in {:.2}s (sampling {t_sample:.2}s, text {t_text:.2}s, model {t_model:.2}s)", job.prompt.len(),start,prefill_secs,generated.len(),decode_clock.elapsed().as_secs_f64()); }
         if !text.is_empty() { let _ = job.events.send(Event::Text(text)); }
         let _ = job.events.send(Event::Done { finish, completion_tokens: generated.len() });
         Ok(())

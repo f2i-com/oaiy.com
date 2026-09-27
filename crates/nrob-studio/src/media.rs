@@ -821,11 +821,24 @@ pub fn video_request(cfg: &Json, root: &Path, output_root: &Path, body: &Json, a
 }
 
 /// Whether a media job must have the GPU to itself: `llm_policy` `pause_llm`
-/// always, `coexist` never, `auto` when the media device is one the LLM uses.
+/// always, `coexist` never, `auto` when the media device is one the LLM uses
+/// (its `devices`, or those of an enabled model with GPUs of its own).
 pub fn pauses_llm(cfg: &Json) -> bool {
     let media = cfg.get("media").cloned().unwrap_or(Json::Null);
     let device = int_or(&media, "device", 0);
-    let devices: Vec<i64> = cfg.get("llm").and_then(|l| l.get("devices")).and_then(Json::as_array).unwrap_or(&[]).iter().filter_map(Json::as_i64).collect();
+    let llm = cfg.get("llm");
+    let ints = |v: Option<&Json>| -> Vec<i64> { v.and_then(Json::as_array).unwrap_or(&[]).iter().filter_map(Json::as_i64).collect() };
+    let mut devices = ints(llm.and_then(|l| l.get("devices")));
+    let own: Vec<i64> = llm.and_then(|l| l.get("models")).and_then(Json::as_array).unwrap_or(&[]).iter()
+        .filter(|m| bool_or(m, "enabled", true))
+        .flat_map(|m| ints(m.get("devices")))
+        .collect();
+    if !devices.is_empty() || own.is_empty() {
+        devices.extend(own);
+    } else {
+        // No global list: nrob-server takes the first two GPUs for the others.
+        devices = own.into_iter().chain([0, 1]).collect();
+    }
     match str_or(&media, "llm_policy", "auto") {
         "coexist" => false,
         "pause_llm" => true,
@@ -1558,6 +1571,15 @@ mod tests {
         m.update(&run.id, |j| j.status = "cancelled".into());
         m.sweep();
         assert!(m.get(&run.id).is_none());
+    }
+
+    #[test]
+    fn a_model_on_gpus_of_its_own_is_paused_for_media_there() {
+        let cfg = |models: &str| Json::parse(format!(r#"{{"media":{{"device":1}},"llm":{{"devices":[0],"models":{models}}}}}"#).as_bytes()).unwrap();
+        assert!(!pauses_llm(&cfg(r#"[{"name":"a"}]"#)));
+        assert!(pauses_llm(&cfg(r#"[{"name":"a"},{"name":"big","devices":[0,1]}]"#)));
+        // A disabled one does not count.
+        assert!(!pauses_llm(&cfg(r#"[{"name":"big","devices":[0,1],"enabled":false}]"#)));
     }
 
     #[test]
