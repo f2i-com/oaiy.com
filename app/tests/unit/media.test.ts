@@ -190,7 +190,7 @@ describe('media tools', () => {
   it('are offered only when a service is set up, with the models described', () => {
     expect(mediaTools(EMPTY_MEDIA)).toEqual([]);
     const tools = mediaTools(readDiscovery(DOC, 'http://127.0.0.1:8080').media);
-    expect(tools.map((t) => t.name)).toEqual(['generate_image', 'generate_video', 'generate_speech', 'create_voice', 'generate_music']);
+    expect(tools.map((t) => t.name)).toEqual(['generate_image', 'generate_video', 'generate_speech', 'create_voice', 'generate_music', 'review_frame']);
     expect(tools[2].description).toContain('Voices: Narrator, alloy, onyx. Saved: Narrator (A deep, calm male narrator).');
     expect(tools[4].description).toContain('minimax-music3 (default): up to 360 s');
     expect(Object.keys((tools[1].parameters as { properties: Record<string, unknown> }).properties)).toEqual(expect.arrayContaining(['end_image', 'say', 'voice', 'soundtrack']));

@@ -11,11 +11,15 @@ import { clear, h } from './dom';
 import { mediaElement, mediaKind, type Media } from './media';
 import { renderMarkdown } from './markdown';
 
+/** How long a flag waits for a comment before it goes without one. */
+const FLAG_WAIT_SECONDS = 10;
+
 function summarizeCall(call: ToolCall): string {
   const i = call.input;
   const s = (k: string) => (typeof i[k] === 'string' ? String(i[k]) : '');
   switch (call.name) {
     case 'read_file': case 'write_file': case 'append_file': case 'edit_file': case 'delete_file': case 'list_files': return s('path') || '/';
+    case 'review_frame': return `${s('path')}${i.accept === true ? ' (accept)' : ''}`;
     case 'grep': return `${s('pattern')}${s('path') ? ` in ${s('path')}` : ''}`;
     case 'glob': return s('pattern');
     case 'sandbox_shell': return s('command').split('\n')[0];
@@ -68,6 +72,8 @@ export class ChatPane {
       file: (path: string) => Uint8Array | null;
       /** Open a project file (or, for an unpacked .softn, its app) in the workspace. */
       open: (path: string, app?: string) => void;
+      /** The person flagged a picture the agent made, with what is wrong ('' when they did not say). */
+      flag?: (path: string, comment: string) => void;
     },
   ) {
     this.planBox.hidden = true;
@@ -103,13 +109,15 @@ export class ChatPane {
       // A pasted screenshot arrives as "image.png": give it a useful name.
       this.addFiles(pasted.map((f, i) => (f.name === 'image.png' ? new File([f], `pasted-${new Date().toISOString().replace(/[:.]/g, '-')}${i ? `-${i}` : ''}.png`, { type: f.type }) : f)));
     });
-    this.send.addEventListener('click', () => (this.busy ? this.handlers.stop() : this.submit()));
+    // While the agent works, a written message is sent to it; with nothing written, the button stops it.
+    this.send.addEventListener('click', () => (this.busy && !this.hasMessage() ? this.handlers.stop() : this.submit()));
     this.input.addEventListener('keydown', (e) => {
       if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
         e.preventDefault();
-        if (!this.busy) this.submit();
+        this.submit();
       }
     });
+    this.input.addEventListener('input', () => this.updateSend());
   }
 
   addFiles(files: File[]): void {
@@ -120,6 +128,7 @@ export class ChatPane {
 
   private pendingUrls: string[] = [];
   private renderPending(): void {
+    this.updateSend();
     for (const url of this.pendingUrls.splice(0)) URL.revokeObjectURL(url);
     clear(this.pending);
     this.files.forEach((file, i) => {
@@ -151,6 +160,7 @@ export class ChatPane {
     this.files = [];
     this.renderPending();
     this.input.value = '';
+    this.updateSend();
     this.handlers.submit(text, files);
   }
 
@@ -161,9 +171,20 @@ export class ChatPane {
   setBusy(busy: boolean): void {
     this.busy = busy;
     if (this.currentPlan) this.showPlan(this.currentPlan, busy);
-    this.send.textContent = busy ? 'Stop' : 'Send';
-    this.send.classList.toggle('danger', busy);
+    this.input.placeholder = busy ? 'Message the agent while it works…  (it reads it at its next step)' : 'Ask bot.computer…  (/help for commands)';
+    this.updateSend();
     if (!busy) this.setStatus('');
+  }
+
+  private hasMessage(): boolean {
+    return !!this.input.value.trim() || this.files.length > 0;
+  }
+
+  /** Stop while the agent works with nothing written; Send otherwise. */
+  private updateSend(): void {
+    const stop = this.busy && !this.hasMessage();
+    this.send.textContent = stop ? 'Stop' : 'Send';
+    this.send.classList.toggle('danger', stop);
   }
 
   setStatus(text: string): void {
@@ -253,21 +274,95 @@ export class ChatPane {
    * A project file shown in the log: an image as a thumbnail, audio and
    * video with a player, anything else as a chip; each opens the file.
    */
-  private fileView(path: string, name = path.split('/').pop() ?? path, app?: string): HTMLElement {
+  private fileView(path: string, name = path.split('/').pop() ?? path, app?: string, flaggable = false): HTMLElement {
     const open = () => this.handlers.open(path, app);
     const bytes = mediaKind(path) ? this.handlers.file(path) : null;
     const media = bytes ? mediaElement(path, bytes, { compact: true, onOpen: open }) : null;
     if (media) {
       this.media.push(media);
+      // A picture the agent made can be flagged: the agent makes it again.
+      if (flaggable && this.handlers.flag && mediaKind(path) === 'image') {
+        const wrap = h('span.flaggable', media.element);
+        wrap.append(h('button.flag-button', { type: 'button', title: 'Flag this picture: say what is wrong (or let the agent find it), and it is made again', 'aria-label': `Flag ${path}`, onclick: () => this.flagBox(path, wrap) }, '⚑'));
+        return wrap;
+      }
       return media.element;
     }
     const icon = app || /\.softn$/i.test(name) ? '📦' : mediaKind(path) === 'image' ? '🖼' : '📄';
     return h('button.attachment', { title: app ? `Unpacked into ${app}/: click to preview it` : `${path}: click to open`, onclick: open }, h('span.file-icon', icon), h('span.attachment-name', name));
   }
 
-  user(text: string, attachments: Attachment[] = []): void {
+  /**
+   * The box under a flagged picture: a quick comment on what is wrong. Left
+   * untouched for a few seconds, the flag goes without one, and the agent
+   * looks for what is wrong itself.
+   */
+  private flagBox(path: string, wrap: HTMLElement): void {
+    const holder = wrap.closest('.msg') ?? wrap;
+    const open = holder.nextElementSibling;
+    if (open instanceof HTMLElement && open.dataset.flag === path) {
+      open.querySelector('textarea')?.focus();
+      return;
+    }
+    const comment = h('textarea.flag-comment', { rows: 2, placeholder: 'What is wrong with it? e.g. three arms; his jacket should be red (optional)' });
+    const note = h('span.flag-note');
+    let left = FLAG_WAIT_SECONDS;
+    let timer: ReturnType<typeof setInterval> | null = null;
+    const stopCountdown = () => {
+      if (!timer) return;
+      clearInterval(timer);
+      timer = null;
+      note.textContent = 'Enter flags it with your comment';
+    };
+    const done = (text: string | null) => {
+      stopCountdown();
+      box.remove();
+      if (text === null) return;
+      wrap.classList.add('flagged');
+      wrap.title = text ? `Flagged: ${text}` : 'Flagged: the agent looks for what is wrong';
+      this.handlers.flag?.(path, text);
+    };
+    const box = h(
+      'div.msg.flag-box',
+      { 'data-flag': path },
+      h('div.flag-title', `⚑ Flag ${path.split('/').pop() ?? path}`),
+      comment,
+      h('div.flag-actions', note, h('button', { type: 'button', onclick: () => done(null) }, 'Cancel'), h('button.primary', { type: 'button', onclick: () => done(comment.value.trim()) }, 'Flag')),
+    );
+    const tick = () => {
+      note.textContent = `Flags it without a comment in ${left} s: the agent then looks for what is wrong`;
+    };
+    comment.addEventListener('input', stopCountdown);
+    comment.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
+        e.preventDefault();
+        done(comment.value.trim());
+      } else if (e.key === 'Escape') {
+        done(null);
+      }
+    });
+    tick();
+    timer = setInterval(() => {
+      left--;
+      if (left <= 0) done(comment.value.trim());
+      else tick();
+    }, 1000);
+    holder.after(box);
+    comment.focus();
+    this.scroll();
+  }
+
+  /** The person's message: a new request, or (`during`) one sent while the agent works, which keeps its plan. */
+  user(text: string, attachments: Attachment[] = [], during = false): void {
     this.current = null;
     this.stick = true;
+    if (during) {
+      const box = h('div.msg.user.during', h('div.msg-body', text || ' '), h('div.msg-note', 'sent while the agent works: it reads it at its next step'));
+      if (attachments.length) box.append(h('div.msg-attachments', ...attachments.map((a) => this.fileView(a.path, a.name, a.app))));
+      this.log.append(box);
+      this.scroll();
+      return;
+    }
     // A new request gets its own plan.
     this.currentPlan = null;
     this.planOpen = null;
@@ -357,7 +452,17 @@ export class ChatPane {
     const activity = h('span.task-activity');
     const report = h('pre.task-report');
     const row = h('li.agent-task.queued', h('div.task-head', h('span.task-mark'), h('span.task-title', title), state), activity, h('details.task-more', h('summary', 'report'), report));
-    const target = list ?? this.cards.get(id.split('#')[0])?.querySelector('.agent-tasks');
+    const card = this.cards.get(id.split('#')[0]);
+    let target = list ?? card?.querySelector('.agent-tasks');
+    // A sub-agent under another tool's card (the review of a picture): a list of its own just below the card, seen without opening it.
+    if (!target && card) {
+      const next = card.nextElementSibling;
+      target = next instanceof HTMLElement && next.matches('ol.agent-tasks.under') ? next : null;
+      if (!target) {
+        target = h('ol.agent-tasks.under');
+        card.after(target);
+      }
+    }
     target?.append(row);
     const entry = { row, state, activity, report };
     this.taskRows.set(id, entry);
@@ -425,7 +530,8 @@ export class ChatPane {
     }
     // A file the agent hands over is shown outside the (collapsed) card.
     if (result.files?.length) {
-      const shown = h('div.msg.presented', ...result.files.map((path) => this.fileView(path)));
+      // Pictures the agent made can be flagged; files it only shows (uploads, extracted frames) cannot.
+      const shown = h('div.msg.presented', ...result.files.map((path) => this.fileView(path, undefined, undefined, result.name === 'generate_image')));
       card.after(shown);
     }
     this.scroll();
@@ -536,11 +642,13 @@ export class ChatPane {
         continue;
       }
       if (turn.role === 'user') {
-        const text = turn.text.replace(/^<project>[\s\S]*?<\/project>\n\n/, '');
+        // A message sent while the agent worked carries a note for the model: show it as the person wrote it.
+        const during = /^\[The user sent this while you were working\.[^\]]*\]\n\n/.exec(turn.text);
+        const text = (during ? turn.text.slice(during[0].length) : turn.text).replace(/^<project>[\s\S]*?<\/project>\n\n/, '');
         const attached = /\n\n\[Attached and saved in the project: ([\s\S]*)\]$/.exec(text);
         // Chats saved before attachments were kept on the turn: read them from the note.
         const fallback = attached ? attached[1].split('; ').map((n) => n.split(/ \(|: /)[0]).filter((p) => /^uploads\/[^\s]+$/.test(p)).map((path) => ({ name: path.split('/').pop()!, path })) : [];
-        this.user(attached ? text.slice(0, attached.index) : text, turn.attachments ?? fallback);
+        this.user(attached ? text.slice(0, attached.index) : text, turn.attachments ?? fallback, !!during);
       }
       else if (turn.role === 'assistant') {
         if (turn.text) this.assistantText(turn.text);

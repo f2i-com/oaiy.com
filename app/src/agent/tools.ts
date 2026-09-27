@@ -11,11 +11,12 @@ import type { NetGate } from '../gate/netgate';
 import { SandboxHost, globRegex, summarize } from '../sandbox/host';
 import { runInSandbox } from '../sandbox/runner';
 import { VfsError, normalizePath, type Vfs } from '../vfs/vfs';
-import type { ToolCall, ToolResult, ToolSpec } from './protocol';
+import type { FrameReview, ToolCall, ToolResult, ToolSpec } from './protocol';
 import { appLabel, checkProject, describeApp, findApps, formatFindings, guideFor, importSoftn, logicSyntax, resolveApp } from '../softn/softn';
 import type { PageReport, PreviewAction, PreviewResult } from '../softn/preview';
 import { describeExample, docsMap, installExample, listExamples, lookupComponents, readTopic, searchKnowledge } from '../softn/knowledge';
 import { DEFAULT_VIEW_SIZE, MAX_VIEW_SIZE, imageMimeFor, imageSize, viewImage, type ImagePart } from './images';
+import { FRAME_KINDS, MAX_REDOS, MAX_REVIEW_FAILURES, awaitingReview, contentHash, readReviews, reviewOf, storyFolder, writeReviews, type FrameKind } from './review';
 import { VOICES_FILE, ownVoice, projectVoiceList, readProjectVoices, savedName, serviceVoice, writeProjectVoices, type ProjectVoices } from './voices';
 import { SOUNDTRACK_FORMATS, SPEECH_FORMATS, createVoice, generateImage, generateMusic, generateSpeech, generateVideo, mediaReady, type MediaFile, type MediaSettings, type SpeechFormat } from './media';
 
@@ -155,6 +156,7 @@ export function mediaTools(media: MediaSettings | null | undefined, voices?: Pro
         `Create an image from a text prompt with the user's image service (${where}) and save it in the project as a PNG. ` +
         'Describe the picture concretely: subject, setting, style, lighting, composition. To edit a picture or combine several, give reference_images (project paths) and say what to change, with a model that edits. ' +
         'Keep what recurs the same: make a reference image once for each character (only them, full length, facing the camera, neutral expression, on a blank white background) and each prop (alone on a blank white background), and one for each place with no people in it; then make every picture they appear in new, giving them as reference_images and saying each character\'s pose and expression for that moment. A reference image is never used as a picture of the story itself. Look at each picture with view_image, and make it again when a face, hand or body is broken or a character does not match their reference. ' +
+        'A picture saved in a scripted video\'s folder (beside or below its script.md) is reviewed as soon as it is made: a reviewer compares it with the script, its reference images and the pictures before it, and passes it or sends it back with what to fix. Say what it is with `frame` (and `shot` or `scene`), so it is checked against the right part of the script. An end frame is its shot\'s start frame edited: give the start frame as the first reference image. ' +
         `It takes seconds to a few minutes. The image is shown to the user in the chat; use view_image to look at it yourself.${describeModels(media, 'image')}`,
       parameters: {
         type: 'object',
@@ -168,6 +170,9 @@ export function mediaTools(media: MediaSettings | null | undefined, voices?: Pro
           negative_prompt: { type: 'string', description: 'What to keep out of the picture (models that take it)' },
           seed: int,
           reference_images: { type: 'array', items: str, description: 'Project paths of pictures to edit or combine' },
+          frame: { type: 'string', enum: [...FRAME_KINDS], description: 'For a scripted video: what this picture is (a shot\'s start or end frame, a scene\'s background, a character\'s or a prop\'s reference image)' },
+          shot: { type: 'string', description: 'For a start or end frame: its shot in the script, e.g. 3' },
+          scene: { type: 'string', description: 'For a background: its scene in the script, e.g. 2' },
         },
       },
     });
@@ -192,7 +197,7 @@ export function mediaTools(media: MediaSettings | null | undefined, voices?: Pro
             ? 'Keep each character\'s voice the same in every clip: give every speaking character a saved voice (create_voice, once, before their first line), and for each clip with dialogue first speak the line with generate_speech in that character\'s saved voice, then give that file as `soundtrack` with its words as `transcript`. Do not use `say` with a described or ad-hoc voice for a recurring character: it sounds different each time. '
             : '') +
         (ready.image
-          ? 'Every clip has a start frame and an end frame, and gets both: before each clip, make each new with generate_image at the clip\'s size, giving the scene\'s background (the place with no people in it) and the reference images of the characters and props in it as reference_images, and saying each character\'s pose and expression (a clip that continues another without a cut starts on that clip\'s end frame, the same picture). Never give a character\'s reference image itself as a frame. Look at both with view_image and check them (the characters match their references, the place matches the background, no broken faces, hands or bodies); make a frame again if it is off. Then give them as start_image and end_image. Never make a clip from a prompt alone, or with only a start frame: a character\'s look drifts from clip to clip. '
+          ? 'Every clip has a start frame and an end frame, and gets both: before each clip, make its start frame new with generate_image at the clip\'s size, giving the scene\'s background (the place with no people in it) and the reference images of the characters and props in it as reference_images, and saying each character\'s pose and expression (a clip that continues another without a cut starts on that clip\'s end frame, the same picture); then make its end frame by editing the start frame: the start frame as the first reference image, and a prompt saying what changes, so the place, the people and the light stay the same. Never give a character\'s reference image itself as a frame. In a scripted video\'s folder each frame is reviewed as it is made, and only frames that passed can be animated; elsewhere, look at both with view_image and check them (the characters match their references, the place matches the background, no broken faces, hands or bodies), and make a frame again if it is off. Then give them as start_image and end_image. Never make a clip from a prompt alone, or with only a start frame: a character\'s look drifts from clip to clip. '
           : '') +
         'For a longer video, make several clips and join them with media_compose, which adds music too. When a clip ended away from its end frame, start the clip that continues it on its real last frame instead (video_frames with last: true). ' +
         `It takes minutes; the user sees its progress in the chat, and the finished video gets a player there.${describeModels(media, 'video')}`,
@@ -282,6 +287,22 @@ export function mediaTools(media: MediaSettings | null | undefined, voices?: Pro
           seconds: { type: 'number', description: 'Length in seconds' },
           path: { type: 'string', description: 'Where to save it, e.g. audio/theme.mp3' },
           seed: int,
+        },
+      },
+    });
+  }
+  if (ready.image) {
+    tools.push({
+      name: 'review_frame',
+      description:
+        `Have a picture of a scripted video reviewed again (it is reviewed once as it is made, and again here when that review reached no verdict), or, with accept, take it as it is after it was sent back ${MAX_REDOS} times or ${MAX_REVIEW_FAILURES} reviews reached no verdict, saying what is still off. A frame that has not passed its review cannot be animated, and no new picture is made while one waits for its review.`,
+      parameters: {
+        type: 'object',
+        required: ['path'],
+        properties: {
+          path: str,
+          accept: { type: 'boolean', description: `Take it as it is (only after ${MAX_REDOS} tries)` },
+          notes: { type: 'string', description: 'With accept: what is still off' },
         },
       },
     });
@@ -700,6 +721,8 @@ interface ToolOut {
   files: string[];
   /** softn_check's outcome. */
   check: ToolResult['check'] | null;
+  /** Pictures to have reviewed (generate_image in a scripted video's folder). */
+  review: FrameReview[];
 }
 
 async function execute(call: ToolCall, ctx: ToolContext, out: ToolOut): Promise<string> {
@@ -1050,7 +1073,23 @@ async function execute(call: ToolCall, ctx: ToolContext, out: ToolOut): Promise<
       const prompt = need(input, 'prompt');
       let path = normalizePath(need(input, 'path'));
       if (!/\.png$/i.test(path)) path = `${path.replace(/\.[a-z0-9]{1,5}$/i, '')}.png`;
-      const references = (Array.isArray(input.reference_images) ? input.reference_images : []).map((r) => projectImage(vfs, String(r)));
+      const referencePaths = (Array.isArray(input.reference_images) ? input.reference_images : []).map((r) => normalizePath(String(r)));
+      const references = referencePaths.map((r) => projectImage(vfs, r));
+      // A picture for a scripted video is reviewed as it is made, when the model can see pictures.
+      const story = ctx.images === false ? null : storyFolder(vfs, path);
+      const kind = typeof input.frame === 'string' && (FRAME_KINDS as readonly string[]).includes(input.frame) ? (input.frame as FrameKind) : undefined;
+      const label = (k: string) => (typeof input[k] === 'number' ? String(input[k]) : typeof input[k] === 'string' && (input[k] as string).trim() ? (input[k] as string).trim() : undefined);
+      if (story !== null) {
+        const reviews = readReviews(vfs);
+        // Making the waiting picture again is its remake; anything else waits for the review.
+        const again = new RegExp(`^${path.replace(/\.png$/i, '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(-\\d+)?\\.png$`, 'i');
+        const waiting = awaitingReview(vfs, reviews).filter((p) => !again.test(p));
+        if (waiting.length) throw new Error(`${waiting.map((p) => `/${p}`).join(', ')} ${waiting.length === 1 ? 'is' : 'are'} still waiting for review: run review_frame on ${waiting.length === 1 ? 'it' : 'them'} before making another picture`);
+        const first = referencePaths[0] ? reviews[referencePaths[0]]?.kind : undefined;
+        if (kind === 'end' && (!referencePaths.length || first === 'character' || first === 'prop' || first === 'background')) {
+          throw new Error("an end frame is its shot's start frame edited: give the start frame as the first reference image (then the characters and props in view), and say in the prompt what has changed");
+        }
+      }
       const n = typeof input.n === 'number' ? Math.min(4, Math.max(1, Math.floor(input.n))) : 1;
       const model = typeof input.model === 'string' && input.model.trim() ? input.model.trim() : media.imageModel;
       ctx.progress?.(`${references.length ? 'editing' : 'generating'} ${n > 1 ? `${n} images` : 'an image'}${model ? ` with ${model}` : ''}…`);
@@ -1068,6 +1107,20 @@ async function execute(call: ToolCall, ctx: ToolContext, out: ToolOut): Promise<
         vfs.writeFile(`/${p}`, result.images[i], { parents: true });
         out.files.push(p);
       });
+      if (story !== null) {
+        const reviews = readReviews(vfs);
+        const shot = label('shot');
+        const scene = label('scene');
+        for (const p of paths) {
+          // Tries at the same picture add up: after MAX_REDOS it may be taken as it is.
+          const before = reviews[p];
+          // What the last try was sent back for (by the reviewer or the user), for this review to check.
+          const fix = before?.verdict === 'redo' ? before.notes : before?.verdict === 'waiting' ? before.fix : undefined;
+          reviews[p] = { hash: contentHash(result.images[paths.indexOf(p)]), verdict: 'waiting', redos: before?.redos ?? 0, kind, shot, scene, references: referencePaths, ...(fix ? { fix } : {}) };
+          out.review.push({ path: p, kind, shot, scene, references: referencePaths, story, ...(fix ? { fix } : {}) });
+        }
+        writeReviews(vfs, reviews);
+      }
       const size = await imageSize(result.images[0], 'image/png').catch(() => null);
       return `Saved ${paths.map((p) => `/${p}`).join(', ')}: ${size ? `${size.width}×${size.height} px` : result.size ?? 'PNG'}, made with ${result.model}. Shown to the user in the chat; use view_image to look at ${paths.length > 1 ? 'them' : 'it'}.`;
     }
@@ -1078,6 +1131,18 @@ async function execute(call: ToolCall, ctx: ToolContext, out: ToolOut): Promise<
       let path = normalizePath(need(input, 'path'));
       if (!/\.mp4$/i.test(path)) path = `${path.replace(/\.[a-z0-9]{1,5}$/i, '')}.mp4`;
       const text = (k: string) => (typeof input[k] === 'string' && (input[k] as string).trim() ? (input[k] as string).trim() : undefined);
+      // A frame made for a scripted video is animated only once it has passed its review.
+      if (ctx.images !== false) {
+        const reviews = readReviews(vfs);
+        for (const frame of [text('start_image'), text('end_image')]) {
+          const key = frame ? normalizePath(frame) : '';
+          const review = key ? reviewOf(vfs, reviews, key) : undefined;
+          if (!review || review.verdict === 'pass') continue;
+          throw new Error(review.verdict === 'waiting'
+            ? `/${key} is still waiting for its review: run review_frame on it first`
+            : `/${key} was sent back by its review${review.notes ? ` (${review.notes})` : ''}: make it again, or after ${MAX_REDOS} tries take it with review_frame and accept`);
+        }
+      }
       const startImage = text('start_image') ? projectImage(vfs, text('start_image')!) : undefined;
       const endImage = text('end_image') ? projectImage(vfs, text('end_image')!) : undefined;
       const say = text('say');
@@ -1372,7 +1437,7 @@ function reportChanges(report: Record<string, unknown>, changes: { written: Set<
 
 export async function runTool(call: ToolCall, ctx: ToolContext): Promise<ToolResult> {
   if (call.parseError) return { id: call.id, name: call.name, content: `Error: the tool call's arguments could not be read: ${call.parseError}`, isError: true };
-  const out: ToolOut = { images: [], files: [], check: null };
+  const out: ToolOut = { images: [], files: [], check: null, review: [] };
   try {
     const content = await execute(call, ctx, out);
     let isError = false;
@@ -1381,6 +1446,7 @@ export async function runTool(call: ToolCall, ctx: ToolContext): Promise<ToolRes
     if (out.images.length) result.images = out.images;
     if (out.files.length) result.files = out.files;
     if (out.check) result.check = out.check;
+    if (out.review.length) result.review = out.review;
     return result;
   } catch (error) {
     const message = error instanceof VfsError || error instanceof Error ? error.message : String(error);

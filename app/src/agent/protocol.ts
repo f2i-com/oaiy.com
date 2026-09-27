@@ -35,6 +35,24 @@ export interface ToolResult {
   files?: string[];
   /** The outcome of softn_check, for the agent's record of failing apps; not sent to the model. */
   check?: { root: string; ok: boolean; text: string };
+  /** Pictures generate_image made for a scripted video, for the agent to have reviewed; not sent to the model. */
+  review?: FrameReview[];
+}
+
+/** A picture made for a scripted video, and what it is checked against. */
+export interface FrameReview {
+  path: string;
+  kind?: 'start' | 'end' | 'background' | 'character' | 'prop';
+  shot?: string;
+  scene?: string;
+  /** The reference images it was made from. */
+  references: string[];
+  /** The story's folder (where script.md is; '' for the project root). */
+  story: string;
+  /** What the try before it was sent back for, to check it is fixed. */
+  fix?: string;
+  /** The user flagged it as wrong: what they said, or true when they said nothing. */
+  flagged?: string | true;
 }
 
 /** A file attached to a user message, as saved in the project; for the chat only. */

@@ -19,6 +19,7 @@ import { newAppDialog, type NewAppChoice } from './ui/newApp';
 import { SOFTN_BLANK, SOFTN_STARTER, readManifest, appKey, appLabel, checkProject, describeApp, downloadSoftn, findApps, formatFindings, importSoftn, isSoftnProject, logicSyntax, resolveApp } from './softn/softn';
 import { imageForMessage, imageMimeFor, type ImagePart } from './agent/images';
 import type { Attachment } from './agent/protocol';
+import { flagPicture } from './agent/review';
 import { FileTree } from './ui/tree';
 import { OpenProject, createProject, deleteProject, listProjects, renameProject, type ProjectMeta } from './vfs/projects';
 import { canPickFolder, downloadZip, importFileList, importFolder, importZip, type Imported } from './vfs/transfer';
@@ -122,7 +123,28 @@ async function main(): Promise<void> {
       }
     },
     open: (path, app) => openFromChat(path, app),
+    flag: (path, comment) => flagFromChat(path, comment),
   });
+
+  /**
+   * The person flagged a picture: it is sent back (it cannot be animated or
+   * taken as it is), and the agent is told to make it again: fixing what they
+   * said, or, when they said nothing, first having it reviewed to find what is
+   * wrong. A working agent reads this at its next step.
+   */
+  function flagFromChat(path: string, comment: string): void {
+    const key = path.replace(/^\/+/, '');
+    if (!project.vfs.exists(`/${key}`)) {
+      chat.system(`/${key} is no longer in the project.`, 'error');
+      return;
+    }
+    flagPicture(project.vfs, key, comment);
+    void submit(
+      comment
+        ? `⚑ I flagged /${key}: ${comment}\n\nLook at it, then make it again at the same path, fixing that (a clearer prompt, other reference images or another seed). Anything already made from it (a frame edited from it, a clip that starts or ends on it) is made again after it. Then carry on.`
+        : `⚑ I flagged /${key} as wrong, without saying why.\n\nRun review_frame on it: a reviewer looks for what is wrong. Then make it again at the same path, fixing what it found, and make again anything already made from it (a frame edited from it, a clip that starts or ends on it). Then carry on.`,
+    );
+  }
   const notice = (message: string) => chat.system(message, 'error');
   const tree = new FileTree(null as unknown as Vfs, (path) => {
     editor.open(path);
@@ -396,7 +418,7 @@ async function main(): Promise<void> {
     if (window.matchMedia('(max-width: 900px)').matches) showView('editor');
   }
 
-  async function submit(text: string, files: File[] = []): Promise<void> {
+  async function submit(text: string, files: File[] = [], shown = false): Promise<void> {
     if (text.startsWith('/') && !files.length) {
       const [command, ...args] = text.slice(1).trim().split(/\s+/);
       switch (command.toLowerCase()) {
@@ -404,6 +426,10 @@ async function main(): Promise<void> {
           chat.system(internetCommand(gate, args));
           return;
         case 'clear': case 'new': case 'reset':
+          if (currentRun) {
+            chat.system('The agent is working: stop it first, then start a new conversation.', 'error');
+            return;
+          }
           agent.reset();
           chat.clearLog();
           await project.saveChat([]);
@@ -420,9 +446,36 @@ async function main(): Promise<void> {
           return;
       }
     }
+    // While the agent works, a message goes to it: it reads it at its next step.
+    if (currentRun) {
+      const running = currentRun;
+      let prompt = text;
+      let images: ImagePart[] = [];
+      let attachments: Attachment[] = [];
+      if (files.length) {
+        const received = await receiveFiles(files);
+        images = received.images;
+        attachments = received.attachments;
+        await project.flush();
+        prompt = `${text || 'I attached some files.'}\n\n[Attached and saved in the project: ${received.notes.join('; ')}]`;
+      }
+      // A run that is starting or just ending cannot take it yet: wait, then give it to the next.
+      let run: Promise<void> | null = running;
+      while (run) {
+        if (agent.interject(prompt, images, attachments)) {
+          chat.user(text, attachments, true);
+          return;
+        }
+        await Promise.race([run, new Promise((resolve) => setTimeout(resolve, 200))]);
+        run = currentRun as Promise<void> | null;
+      }
+      files = [];
+      text = prompt;
+    }
     editor.flush();
     chat.setBusy(true);
     controller = new AbortController();
+    const runController = controller;
     const runProject = project;
     const runAgent = agent;
     let finish!: () => void;
@@ -448,7 +501,7 @@ async function main(): Promise<void> {
         await project.flush();
         prompt = `${text || 'I attached some files.'}\n\n[Attached and saved in the project: ${received.notes.join('; ')}]`;
       }
-      chat.user(text, attachments);
+      if (!shown) chat.user(text, attachments);
       // The first check of a run brings the preview forward, so the person sees the app being built.
       let previewShown = false;
       await runAgent.run(prompt, (event) => {
@@ -469,6 +522,12 @@ async function main(): Promise<void> {
       await runProject.saveChat(runAgent.turns);
       finish();
       currentRun = null;
+      // Messages that came in as the run ended: the next request (the chat shows them already).
+      const unread = runAgent.takeUnread();
+      if (unread.length && project === runProject) {
+        if (runController.signal.aborted) chat.system('The agent stopped before it read your last message: send it again when you are ready.', 'error');
+        else setTimeout(() => void submit(unread.join('\n\n'), [], true));
+      }
       // The model is loaded now: a window that was only guessed can be read for real.
       const p = activeProvider();
       if (p?.modelId && windowsGuessed.has(`${p.id}|${p.modelId}`)) {

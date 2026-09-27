@@ -11,9 +11,10 @@ import { AIProviderError } from './providers/aiProvider';
 import { DEFAULT_COMPACT_AT, budgetFor, contextWindow, formatTokens, outputLimit, overflowWindow } from './context';
 import { normalizePath, type Vfs } from '../vfs/vfs';
 import type { ProviderConfig } from './providers/types';
-import { sendTurn, type Attachment, type Reply, type ToolCall, type ToolResult, type Turn, type Usage } from './protocol';
+import { sendTurn, type Attachment, type FrameReview, type Reply, type ToolCall, type ToolResult, type Turn, type Usage } from './protocol';
 import { EDIT_TOOLS, EDIT_TOOLS_WINDOW, MAIN_AGENT_ONLY, TOOLS, checkApp, mediaTools, readPlan, readTasks, runTool, type Plan, type SoftnHost, type ToolContext } from './tools';
 import { readProjectVoices } from './voices';
+import { MAX_REDOS, MAX_REVIEW_FAILURES, checklist, countProblems, type PersonCount, readReviews, reviewOf, scriptExcerpt, storyFolder, writeReviews } from './review';
 import type { MediaSettings } from './media';
 import { queueFor } from './queue';
 import type { ToolSpec } from './protocol';
@@ -62,6 +63,50 @@ Sub-agents: for a big task that splits into independent parts, hand the parts to
 const SUB_AGENT_ROLE = `
 
 You are a sub-agent: the main agent gave you one task, below. Do that task and nothing else; other agents may be changing other files at the same time, so change only the files your task is about. You cannot ask the user anything: decide sensibly and say what you assumed. When the task is done (and checked, for an app), reply with a short report for the main agent: what you did, the files you changed, how you checked it, and anything unfinished or wrong.`;
+
+/** What a reviewer may use: it looks and reads, and changes nothing. */
+const REVIEW_TOOLS = new Set(['list_files', 'read_file', 'file_info', 'search_file', 'grep', 'glob', 'view_image', 'media_info']);
+/** A reviewer's step limit: enough to look at everything it needs, several times. */
+const REVIEW_STEPS = 24;
+/** The pictures a reviewer keeps in view at once: the picture, its references and the frames before it. */
+const REVIEW_KEEP_IMAGES = 8;
+const VERDICT_TOOL: ToolSpec = {
+  name: 'give_verdict',
+  description:
+    'Your verdict on the picture, once you have looked at everything you need: pass (it is right for its place in the video) or redo (it is not). ' +
+    'people lists every person in the picture with what you counted when zoomed in on them (limbs out of frame or hidden are not counted); a pass needs one head, at most two arms, hands and legs each, and a match with their reference. ' +
+    'With redo, notes say exactly what is wrong and what the remake should change; with pass, what you checked.',
+  parameters: {
+    type: 'object',
+    required: ['verdict', 'people', 'out_of_place', 'notes'],
+    properties: {
+      verdict: { type: 'string', enum: ['pass', 'redo'] },
+      people: {
+        type: 'array',
+        description: 'Every person in the picture (empty when there is none)',
+        items: {
+          type: 'object',
+          required: ['who', 'heads', 'arms', 'hands', 'legs', 'matches'],
+          properties: {
+            who: { type: 'string', description: 'Their name in the script, or where they are in the picture' },
+            heads: { type: 'integer' },
+            arms: { type: 'integer', description: 'Arms seen joined to this person, counted one by one' },
+            hands: { type: 'integer' },
+            legs: { type: 'integer' },
+            matches: { type: 'string', enum: ['yes', 'no', 'no reference'], description: 'Face, hair, build and clothes as in their reference image' },
+          },
+        },
+      },
+      out_of_place: { type: 'string', description: 'Anything duplicated, merged, floating, the wrong size, stray text, or not in the script; "nothing" when there is none' },
+      notes: { type: 'string' },
+    },
+  },
+};
+const REVIEWER_ROLE = `
+
+You are a reviewer: the main agent made a picture for a scripted video and goes on only once you have judged it. You look and read; you do not make or change anything. Your job is to find what is wrong before a viewer does, so look for mistakes, not for reasons to pass: image models often give a person an extra arm, hand or leg, merge two people, blend faces, change clothes, or put things where they cannot be, and a picture can look right at a glance and still have them.
+How to look: view the whole picture (grid: true shows coordinates), then zoom into each person in turn (view_image with x, y, width and height) and count their heads, arms, hands and legs one by one, following every limb to where it joins the body; zoom into faces and hands. View each reference image it was made from and compare it with the person or prop in the picture. Look at the scene's background, the frames made before it, and the script (read_file) as you need. Only your last ${REVIEW_KEEP_IMAGES} pictures stay in view: look at the picture again after looking at many others.
+Be strict about what a viewer would notice: a wrong count of limbs, fingers or faces; a character who does not match their reference (face, hair, build, clothes); a missing or extra person or prop; something duplicated, merged, floating or the wrong size; the wrong place or light; a pose or expression that does not fit the moment or the story; more than the speaker in view in a shot with dialogue; an end frame that is not its start frame moved on; stray text. Let small things pass (a fold of cloth, a detail far in the background). When in doubt about a body or a face, send it back. Then call give_verdict once, and reply with one line.`;
 const KEEP_RECENT_TURNS = 8;
 /** Characters per token until the provider's own counts say otherwise. */
 const DEFAULT_CHARS_PER_TOKEN = 3.5;
@@ -89,28 +134,28 @@ const KEEP_IMAGE_TURNS = 3;
 const MEDIA_MAKE_GUIDE = `- generate_image, generate_video, generate_speech, create_voice and generate_music, when they are among your tools, make pictures, short videos (talking ones too), speech and music with the user's media service and save them in the project. Write concrete prompts, save under sensible paths, and look at an image with view_image before relying on it. Every video clip is at most 5 seconds and has a start and an end frame, each made new with generate_image from the scene's background and the character images (never a character image itself), and animates between them, its prompt describing the motion from start to end (what the characters do, how the camera moves), not the scene the frames already show. For dialogue, give each character a saved voice with create_voice and use it for every line they speak, and show only the speaker, alone in close-up, while they talk (see generate_video for how).
 `;
 /** How to make a video with a story: from a script, shot by shot. */
-const VIDEO_SCRIPT_GUIDE = `- A video with a story (anything longer than one clip) is made from a script, written and revised before any picture or clip is made. Give the video its own folder (video/NAME/) with script.md in it, and its frames, clips and audio beside it. Writing the script is the first step of your plan, then one step per scene. The script has, in order:
-  1. Premise: what the video is about, in a few sentences: who wants what, what stands in their way, and how it ends. Every scene moves this story on; nothing happens at random.
-  2. Characters: for each, their look (face, age, build, hair, clothes: the same in every frame), their voice (for create_voice), and what they want. Their reference image shows only them, full length, facing the camera with a neutral expression, on a blank white background with nothing else in it: the frames give them their place and their expressions. It is a reference, never a frame.
-  3. Props: every object, animal or vehicle that is seen in more than one shot or matters to the story, with its look (shape, size, colour, material, markings), so it never changes. Each gets a reference image of its own, alone on a blank white background.
-  4. Scenes: for each, where and when it is, what happens and why it matters to the story, in a line or two, and a Background line: the empty place as a prompt for generate_image (the setting, its light and time of day, the props that stay in it), with no people in it.
-  5. Shots: each scene as shots of at most 5 seconds, every shot written out in full like this:
+const VIDEO_SCRIPT_GUIDE = `- A video with a story (anything longer than one clip) is made from a script, written and revised before any picture or clip is made. Give the video its own folder (video/NAME/) with script.md in it, and its frames, clips and audio beside it. Writing the script is the first step of your plan, then one step per scene. The script has these parts, under these headings (a reviewer finds each picture's part of the script by them):
+  ## Premise: what the video is about, in a few sentences: who wants what, what stands in their way, and how it ends. Every scene moves this story on; nothing happens at random.
+  ## Characters: for each, their look (face, age, build, hair, clothes: the same in every frame), their voice (for create_voice), and what they want. Their reference image shows only them, full length, facing the camera with a neutral expression, on a blank white background with nothing else in it: the frames give them their place and their expressions. It is a reference, never a frame.
+  ## Props: every object, animal or vehicle that is seen in more than one shot or matters to the story, with its look (shape, size, colour, material, markings), so it never changes. Each gets a reference image of its own, alone on a blank white background.
+  ## Scene 2: a title (one heading per scene, numbered from 1): where and when it is, what happens and why it matters to the story, in a line or two, and a Background line: the empty place as a prompt for generate_image (the setting, its light and time of day, the props that stay in it), with no people in it. Then its shots, each at most 5 seconds and numbered on through the whole script, every one written out in full like this:
      ### Shot 3 (scene 2, 4 s)
      Start frame: the picture it opens on, as a prompt for generate_image: the place, who is in it and where, their pose, each face's expression as the moment calls for it (never left neutral), the props in view, the framing (close-up, medium, wide) and the light.
-     End frame: the picture it ends on, the same way: where the motion has brought everyone, and their expressions then. Every shot has one, and it differs from the start frame.
+     End frame: the picture it ends on, as an edit of the start frame: what has changed (where the motion has brought everyone, their poses and expressions then); the place, people, clothes and light stay the same. Every shot has one, and it differs from the start frame.
      Video: the motion from the start frame to the end frame, in order, as the prompt for generate_video: what each character does first and then (how far and how fast they move, their gestures, how their expression changes, how they speak), and how the camera moves. Only the motion: the frames already show the place and the people.
      Dialogue: NAME (voice: Name): "the line", or none.
      Sound: effects and music under it, for media_compose, or none.
-  Write the script with append_file, one part per call (premise, characters and props, then each scene with its shots). Then read it all back and revise it with edit_file until: the story holds together from start to end and every shot serves it; every scene has its Background line and every shot all five lines, fully written; every shot ends on an end frame of its own, and its Video line tells, step by step, how the start frame becomes the end frame; no shot is over 5 seconds; each Dialogue is one short sentence (about 12 words at most) spoken by one person, who is alone in close-up in both frames; a shot that follows on from the one before starts on its end frame; every face in a frame shows what that character feels at that moment; the characters look and sound the same throughout, and the props look the same. Only then make it, in this order, looking at every picture with view_image as soon as it is made:
-  a. Each character's reference image (neutral expression, blank white background) and saved voice, and each prop's reference image (blank white background).
-  b. Each scene's background, from its Background line, with no people in it. Review it: it is the place the script describes, with its light and props, and a place seen in an earlier scene looks the same (give that scene's background as a reference image). If not, make it again.
-  c. Then shot by shot, in order: its start and end frames, from its Start frame and End frame lines, each made new with generate_image from the scene's background and the reference images of the characters and props in the shot as reference_images (as many as the image model takes: the background and the characters first). Never use a character's or prop's reference image itself as a frame. A shot that follows on from the one before without a cut starts on that shot's end frame: use that same picture as its start frame (if that clip ended away from its end frame, take its real last frame (video_frames with last: true) instead). Review each frame: every character matches their reference (face, hair, build, clothes) with the pose and expression the line asks for; the place matches the scene's background; the props are right; the framing is right, with only the speaker in view in a shot with dialogue; nothing is broken (faces, hands, extra or missing limbs, people merged together, stray text). If anything is off, make it again with a clearer prompt or another seed, up to three times, then go on with the best one and say what is still off.
-  d. Then that shot's clip, from its two frames and its Video and Dialogue lines, before the next shot.
+  Write the script with append_file, one part per call (premise, characters and props, then each scene with its shots). Then read it all back and revise it with edit_file until: the story holds together from start to end and every shot serves it; every scene has its Background line and every shot all five lines, fully written; every shot ends on an end frame of its own, and its Video line tells, step by step, how the start frame becomes the end frame; no shot is over 5 seconds; each Dialogue is one short sentence (about 12 words at most) spoken by one person, who is alone in close-up in both frames; a shot that follows on from the one before starts on its end frame; every face in a frame shows what that character feels at that moment; the characters look and sound the same throughout, and the props look the same.
+  Only then make it, in this order. Every picture saved in the video's folder is reviewed as soon as it is made, before anything else: a reviewer looks at it, its reference images, the pictures before it and the script, and passes it or sends it back saying what is wrong. Give generate_image \`frame\` (and \`shot\` for a start or end frame, \`scene\` for a background) so the review checks it against the right part of the script. A picture sent back is made again at the same path, fixing what the review said; after 3 tries the best may be taken with review_frame and accept. No new picture is made while one waits for its review, and a frame is animated only once it has passed.
+  a. Each character's reference image (frame: character; neutral expression, blank white background) and saved voice, and each prop's reference image (frame: prop; blank white background).
+  b. Each scene's background (frame: background, scene: its number), from its Background line, with no people in it. A place seen in an earlier scene looks the same: give that scene's background as a reference image.
+  c. Then shot by shot, in order. Its start frame (frame: start, shot: its number), from its Start frame line, made new with generate_image from the scene's background and the reference images of the characters and props in view as reference_images (as many as the image model takes: the background and the characters first). Never use a character's or prop's reference image itself as a frame. A shot that follows on from the one before without a cut starts on that shot's end frame: use that same picture as its start frame (if that clip ended away from its end frame, take its real last frame (video_frames with last: true) instead). Then its end frame (frame: end, shot: its number), from its End frame line, made by editing the start frame: give the start frame as the first reference image (then the characters and props in view), and say in the prompt what changes; everything else stays as it is.
+  d. Then that shot's clip, from its two passed frames and its Video and Dialogue lines, before the next shot.
   e. When every shot has its clip, join them with media_compose, with the Sound lines.
   When something has to change as you make it, change the script to match.
 `;
 /** The same in brief, for a window too small for the whole of it. */
-const VIDEO_SCRIPT_BRIEF = `- A video with a story (anything longer than one clip) is made from a script, written first in video/NAME/script.md with append_file and revised before any picture is made: the premise; the characters (look and voice) and props; each scene with its place; and each shot (at most 5 seconds) with its start frame, end frame, the motion between them, its dialogue (one short line, the speaker alone in close-up) and its sound. Then make the character and prop reference images (blank white background, neutral faces) and voices, then each scene's empty background, then shot by shot the frames made new from the background and references (look at each and make it again when it is off), then the clip.
+const VIDEO_SCRIPT_BRIEF = `- A video with a story (anything longer than one clip) is made from a script, written first in video/NAME/script.md with append_file and revised before any picture is made, under the headings ## Premise, ## Characters (look and voice), ## Props, and ## Scene N (with a Background line: the empty place), each scene's shots under ### Shot N (scene N, X s) (at most 5 seconds) with its Start frame, End frame, Video (the motion between them), Dialogue (one short line, the speaker alone in close-up) and Sound lines. Then make the character and prop reference images (blank white background, neutral faces) and voices, then each scene's empty background, then shot by shot its start frame made new from the background and references, its end frame made by editing the start frame, then the clip. Give generate_image \`frame\`, \`shot\` and \`scene\`: each picture is reviewed as it is made, and one sent back is made again.
 `;
 /** How to edit media: only when the editing tools are there. */
 const MEDIA_EDIT_GUIDE = `- media_info, video_frames, video_split and media_compose edit video and sound in the project, in the browser: read what a file holds, take frames out (to check a clip, or to take the last frame it really ended on), cut, join clips and pictures, and lay music, speech and effects over a whole video with volume, fades and ducking. To make a longer video: make its clips (a clip that follows on from another without a cut starts on that clip's end frame, or if it ended away from its end frame, take its real last frame (video_frames with last: true) instead), then compose them with the soundtrack.
@@ -158,6 +203,8 @@ export interface AgentOptions {
   subAgents?: () => { contextTokens: number; parallel: number };
   /** The image and video service, when one is set up: adds generate_image and generate_video. */
   media?: () => MediaSettings | null;
+  /** Image-bearing turns that keep their images (default KEEP_IMAGE_TURNS); a reviewer comparing pictures keeps more. */
+  keepImages?: number;
 }
 
 function turnChars(t: Turn, charsPerToken = DEFAULT_CHARS_PER_TOKEN): number {
@@ -289,8 +336,8 @@ function withoutOldImages(turns: Turn[], keep = KEEP_IMAGE_TURNS): Turn[] {
  * tool output shrinks, then everything but the recent turns; the
  * conversation's shape never changes.
  */
-function trimmed(allTurns: Turn[], images: boolean, maxChars: number): Turn[] {
-  const turns = withoutOldImages(allTurns, images ? KEEP_IMAGE_TURNS : 0);
+function trimmed(allTurns: Turn[], keepImages: number, maxChars: number): Turn[] {
+  const turns = withoutOldImages(allTurns, keepImages);
   if (estimateChars(turns) <= maxChars) return turns;
   const cutoff = turns.length - KEEP_RECENT_TURNS;
   const shrink = (limit: number) =>
@@ -444,6 +491,11 @@ export class Agent {
     return [...(lean ? TOOLS.filter((t) => !EDIT_TOOLS.has(t.name)) : TOOLS), ...mediaTools(this.options.media?.(), readProjectVoices(this.options.vfs))];
   }
 
+  /** How many image-bearing turns keep their images: none for a model that refused them. */
+  private get keepImages(): number {
+    return this.imagesAccepted ? (this.options.keepImages ?? KEEP_IMAGE_TURNS) : 0;
+  }
+
   private get canPlan(): boolean {
     return this.tools.some((t) => t.name === 'update_plan');
   }
@@ -591,6 +643,192 @@ export class Agent {
     return { ok: !failure, text: failure ? `${final ? `${final}\n` : ''}It stopped: ${failure}` : final, files: [...files] };
   }
 
+  /** A reviewer's verdict, given with give_verdict. */
+  private verdict: { verdict: 'pass' | 'redo'; notes: string } | null = null;
+  /** For a reviewer: the picture it judges, and how it has looked at it so far. */
+  private reviewing: { path: string; references: string[]; whole: boolean; zooms: number; seen: Set<string>; flagged: boolean } | null = null;
+
+  /** A reviewer's view_image: the whole picture, a zoom into it, or another picture. */
+  private noteLook(input: Record<string, unknown>): void {
+    const r = this.reviewing;
+    if (!r || typeof input.path !== 'string') return;
+    const path = normalizePath(input.path);
+    r.seen.add(path);
+    if (path !== r.path) return;
+    const zoomed = ['x', 'y', 'width', 'height'].some((k) => typeof input[k] === 'number' && (input[k] as number) > 0);
+    if (zoomed) r.zooms++;
+    else r.whole = true;
+  }
+
+  private takeVerdict(call: ToolCall): ToolResult {
+    const verdict = call.input.verdict;
+    const notes = typeof call.input.notes === 'string' ? call.input.notes.trim() : '';
+    const error = (text: string): ToolResult => ({ id: call.id, name: call.name, content: `Error: ${text}`, isError: true });
+    if (verdict !== 'pass' && verdict !== 'redo') return error('verdict is pass or redo');
+    if (!Array.isArray(call.input.people)) return error('people is a list of every person in the picture, with what you counted (an empty list when there is none)');
+    const count = (v: unknown) => (typeof v === 'number' ? Math.round(v) : typeof v === 'string' && /^\d+$/.test(v.trim()) ? Number(v) : NaN);
+    const people: PersonCount[] = [];
+    for (const [i, p] of (call.input.people as unknown[]).entries()) {
+      const o = (p && typeof p === 'object' ? p : {}) as Record<string, unknown>;
+      const person: PersonCount = { who: typeof o.who === 'string' && o.who.trim() ? o.who.trim() : `person ${i + 1}`, heads: count(o.heads), arms: count(o.arms), hands: count(o.hands), legs: count(o.legs), matches: o.matches === 'no' || o.matches === 'no reference' ? o.matches : 'yes' };
+      if ([person.heads, person.arms, person.hands, person.legs].some(Number.isNaN)) return error(`give ${person.who}'s heads, arms, hands and legs as numbers, counted one by one`);
+      people.push(person);
+    }
+    const outOfPlace = typeof call.input.out_of_place === 'string' ? call.input.out_of_place.trim() : '';
+    const nothingOut = !outOfPlace || /^(nothing|none|no|n\/a)\.?$/i.test(outOfPlace);
+    if (verdict === 'pass' && this.reviewing?.flagged) return error('the user flagged this picture as wrong, so it cannot pass: look again, closer, until you find what is wrong, then give verdict redo saying what the remake should fix');
+    if (verdict === 'pass') {
+      // A pass is only as good as the looking behind it.
+      const r = this.reviewing;
+      if (r) {
+        const unseen = r.references.filter((ref) => !r.seen.has(ref));
+        const wanted = Math.max(1, people.length);
+        const missing = [
+          !r.whole ? `view the whole picture (/${r.path})` : '',
+          r.zooms < wanted ? `zoom into the picture ${wanted === 1 ? 'once' : `once per person (${wanted})`} with view_image's x, y, width and height, and count again (${r.zooms} so far)` : '',
+          unseen.length ? `view its reference image${unseen.length === 1 ? '' : 's'} ${unseen.map((u) => `/${u}`).join(', ')} and compare` : '',
+        ].filter(Boolean);
+        if (missing.length) return error(`before passing it, ${missing.join('; ')}`);
+      }
+      const problems = countProblems(people);
+      if (!nothingOut) problems.push(`out of place: ${outOfPlace}`);
+      if (problems.length) return error(`it cannot pass with what you found: ${problems.join('; ')}. Give verdict redo, saying what the remake should fix.`);
+    }
+    if (verdict === 'redo' && !notes) return error('say in notes what is wrong and what the remake should change');
+    const counted = people.map((p) => `${p.who}: ${p.heads} head${p.heads === 1 ? '' : 's'}, ${p.arms} arms, ${p.hands} hands, ${p.legs} legs${p.matches === 'no' ? ', not as in their reference' : ''}`).join('; ');
+    this.verdict = { verdict, notes: [notes, !nothingOut ? `Out of place: ${outOfPlace}.` : '', counted ? `(Counted: ${counted}.)` : ''].filter(Boolean).join(' ') };
+    return { id: call.id, name: call.name, content: 'Recorded. Reply with one line to finish.', isError: false };
+  }
+
+  /**
+   * Have pictures made for a scripted video reviewed, one after another, each
+   * by a reviewer of its own; record the verdicts, and say what they were.
+   */
+  private async reviewPictures(callId: string, pictures: FrameReview[], emit: (e: AgentEvent) => void, signal?: AbortSignal): Promise<string> {
+    const vfs = this.options.vfs;
+    const lines: string[] = [];
+    for (const [i, picture] of pictures.entries()) {
+      const id = `${callId}#review${i}`;
+      const title = `review /${picture.path}`;
+      emit({ type: 'agent_task', callId, id, title, state: 'running', activity: 'starting' });
+      let outcome: { verdict: 'pass' | 'redo'; notes: string } | { error: string };
+      try {
+        outcome = await this.runReviewer(picture, (activity) => emit({ type: 'agent_task', callId, id, title, state: 'running', activity }), signal);
+      } catch (error) {
+        outcome = { error: signal?.aborted ? 'stopped before it finished' : (error as Error).message };
+      }
+      if ('error' in outcome) {
+        emit({ type: 'agent_task', callId, id, title, state: 'failed', result: outcome.error });
+        const reviews = readReviews(vfs);
+        const review = reviewOf(vfs, reviews, picture.path);
+        if (review) {
+          review.failures = (review.failures ?? 0) + 1;
+          writeReviews(vfs, reviews);
+        }
+        lines.push(`Review of /${picture.path}: no verdict (${outcome.error}). It waits for one: run review_frame on it.`);
+        continue;
+      }
+      const reviews = readReviews(vfs);
+      const review = reviewOf(vfs, reviews, picture.path);
+      if (review) {
+        review.verdict = outcome.verdict;
+        review.notes = outcome.notes;
+        if (outcome.verdict === 'redo') review.redos += 1;
+        writeReviews(vfs, reviews);
+      }
+      const redos = review?.redos ?? 0;
+      emit({ type: 'agent_task', callId, id, title, state: 'done', result: `${outcome.verdict === 'pass' ? 'passed' : 'sent back'}: ${outcome.notes}` });
+      lines.push(
+        outcome.verdict === 'pass'
+          ? `Review of /${picture.path}: passed. ${outcome.notes}`
+          : `Review of /${picture.path}: sent back (try ${redos} of ${MAX_REDOS}). ${outcome.notes}\nMake it again at the same path, fixing that (a clearer prompt, other reference images or another seed)${redos >= MAX_REDOS ? `; or, if this is the best of the tries, take it with review_frame and accept, noting what is still off` : ''}. It cannot be animated until it passes.`,
+      );
+    }
+    return lines.length ? `\n\n${lines.join('\n\n')}` : '';
+  }
+
+  /** One picture's review: a fresh agent that may look at anything in the project, then gives its verdict. */
+  private async runReviewer(picture: FrameReview, activity: (text: string) => void, signal?: AbortSignal): Promise<{ verdict: 'pass' | 'redo'; notes: string } | { error: string }> {
+    const provider = this.options.provider();
+    if (!provider) return { error: 'no AI provider' };
+    const vfs = this.options.vfs;
+    const scriptPath = picture.story ? `${picture.story}/script.md` : 'script.md';
+    const script = vfs.exists(`/${scriptPath}`) ? vfs.readText(`/${scriptPath}`) : '';
+    const what: Record<string, string> = {
+      start: `the start frame of shot ${picture.shot ?? '(not given)'}`,
+      end: `the end frame of shot ${picture.shot ?? '(not given)'}, made by editing its start frame`,
+      background: `the background of scene ${picture.scene ?? '(not given)'}: the place with no people in it`,
+      character: "a character's reference image",
+      prop: "a prop's reference image",
+    };
+    const refs = picture.references.length
+      ? picture.references.map((r, i) => `- /${r}${i === 0 && picture.kind === 'end' ? ' (its start frame)' : ''}`).join('\n')
+      : '- none';
+    const task = [
+      `Review this picture, made for a scripted video: /${picture.path}`,
+      `What it is: ${picture.kind ? what[picture.kind] : 'a picture for the video (see the script for which)'}.`,
+      `It was made from these reference images:\n${refs}`,
+      `The script is /${scriptPath}. The parts this picture is checked against:\n\n${scriptExcerpt(script, picture.kind, picture.shot, picture.scene) || '(none found: read the script)'}`,
+      picture.flagged
+        ? picture.flagged === true
+          ? 'The user flagged this picture as wrong, without saying why. Something in it is wrong: find what, however long it takes (it cannot pass), and say exactly what the remake should fix.'
+          : `The user flagged this picture as wrong: "${picture.flagged}". Find that and anything else wrong (it cannot pass), and say exactly what the remake should fix.`
+        : '',
+      picture.fix ? `The try before this one was sent back for: ${picture.fix}\nCheck above all that this is fixed.` : '',
+      `Check: ${checklist(picture.kind)}`,
+      `The other pictures of this video are in /${picture.story || ''} (list_files): the backgrounds, reference images and earlier frames to compare with. Look at everything you need, then give_verdict.`,
+    ].filter(Boolean).join('\n\n');
+    const settings = this.options.subAgents?.() ?? { contextTokens: 32_000, parallel: 1 };
+    const reviewer = new Agent({
+      ...this.options,
+      provider: () => provider,
+      tools: [...this.tools.filter((t) => REVIEW_TOOLS.has(t.name)), VERDICT_TOOL],
+      role: REVIEWER_ROLE,
+      maxSteps: REVIEW_STEPS,
+      keepImages: REVIEW_KEEP_IMAGES,
+      maxContext: settings.contextTokens,
+      subAgents: undefined,
+    });
+    reviewer.reviewing = { path: picture.path, references: picture.references, whole: false, zooms: 0, seen: new Set(), flagged: !!picture.flagged };
+    let failure = '';
+    await reviewer.run(task, (e) => {
+      if (e.type === 'tool_call') {
+        const arg = ['path', 'pattern'].map((k) => e.call.input[k]).find((v) => typeof v === 'string') as string | undefined;
+        activity(`${e.call.name}${arg ? ` ${arg.slice(0, 80)}` : ''}`);
+      } else if (e.type === 'error') {
+        failure = e.message;
+      }
+    }, signal);
+    if (reviewer.verdict) return reviewer.verdict;
+    return { error: failure || 'the reviewer finished without a verdict' };
+  }
+
+  /** review_frame: review a picture again, or take it as it is after the tries it had. */
+  private async reviewFrame(call: ToolCall, emit: (e: AgentEvent) => void, signal?: AbortSignal): Promise<ToolResult> {
+    const vfs = this.options.vfs;
+    const reply = (content: string, isError = false): ToolResult => ({ id: call.id, name: call.name, content: isError ? `Error: ${content}` : content, isError });
+    const path = typeof call.input.path === 'string' ? normalizePath(call.input.path) : '';
+    if (!path) return reply('path is required', true);
+    if (this.toolContext.images === false) return reply('this model does not take images, so it cannot review pictures', true);
+    const reviews = readReviews(vfs);
+    const review = reviewOf(vfs, reviews, path);
+    if (!review) return reply(`/${path} is not a picture made for a scripted video as it is now (made with generate_image in a folder with a script.md), so there is nothing to review`, true);
+    if (call.input.accept === true) {
+      if (review.verdict === 'pass') return reply(`/${path} has already passed its review.`);
+      if (review.flagged) return reply(`the user flagged /${path} (${review.notes ?? ''}): make it again, fixing that`, true);
+      if (review.redos < MAX_REDOS && (review.failures ?? 0) < MAX_REVIEW_FAILURES) return reply(`/${path} has been sent back ${review.redos} time${review.redos === 1 ? '' : 's'}: make it again, fixing what the review said (it can be taken as it is after ${MAX_REDOS} tries, or when ${MAX_REVIEW_FAILURES} reviews could not reach a verdict)`, true);
+      const notes = typeof call.input.notes === 'string' && call.input.notes.trim() ? call.input.notes.trim() : 'not said';
+      review.verdict = 'pass';
+      review.notes = `taken as it is (${review.redos} tries, ${review.failures ?? 0} reviews without a verdict); still off: ${notes}`;
+      writeReviews(vfs, reviews);
+      return reply(`Took /${path} as it is. Tell the user what is still off in it: ${notes}.`);
+    }
+    // What the user said when they flagged it (true when they said nothing, or the reviewer has since said what is wrong).
+    const flagged = review.flagged ? (/^flagged by the user: ([\s\S]+)$/.exec(review.notes ?? '')?.[1] ?? true) : undefined;
+    const text = await this.reviewPictures(call.id, [{ path, kind: review.kind, shot: review.shot, scene: review.scene, references: review.references ?? [], story: storyFolder(vfs, path) ?? '', fix: review.fix, flagged }], emit, signal);
+    return reply(text.trim());
+  }
+
   private budget(provider: ProviderConfig): { window: number; fixed: number; prompt: number; reply: number } {
     const window = this.window(provider);
     const fixed = Math.ceil(this.fixedChars() / this.charsPerToken);
@@ -605,7 +843,7 @@ export class Agent {
 
   /** Tokens the conversation part of the next prompt will take. */
   private estimate(turns: Turn[]): number {
-    return Math.ceil(estimateChars(withoutOldImages(turns, this.imagesAccepted ? KEEP_IMAGE_TURNS : 0), this.charsPerToken) / this.charsPerToken);
+    return Math.ceil(estimateChars(withoutOldImages(turns, this.keepImages), this.charsPerToken) / this.charsPerToken);
   }
 
   /**
@@ -715,7 +953,7 @@ export class Agent {
     let callRetried = false;
     for (let attempt = 0; attempt < 4; attempt++) {
       const b = this.budget(provider);
-      const sent = wellFormed(trimmed(this.view(), this.imagesAccepted, b.prompt * this.charsPerToken));
+      const sent = wellFormed(trimmed(this.view(), this.keepImages, b.prompt * this.charsPerToken));
       try {
         const reply = await sendTurn(provider, this.systemPrompt, sent, this.tools, {
           maxOutputTokens: b.reply,
@@ -789,6 +1027,36 @@ export class Agent {
   }
 
   /** Run one user request to completion. */
+  /** Messages the user sent while a run was going, for the model's next step. */
+  private inbox: Array<{ text: string; images: ImagePart[]; attachments: Attachment[] }> = [];
+
+  /**
+   * A message from the user while the agent works: the model sees it at its
+   * next step (after the tool it is running). False when no run is going:
+   * send it as a new request instead.
+   */
+  interject(text: string, images: ImagePart[] = [], attachments: Attachment[] = []): boolean {
+    if (!this.running) return false;
+    this.inbox.push({ text, images, attachments });
+    return true;
+  }
+
+  /** Messages a run ended before it could read: to send as the next request. */
+  takeUnread(): string[] {
+    return this.inbox.splice(0).map((m) => m.text);
+  }
+
+  /** Give the model the messages that came in while it worked. */
+  private readInbox(emit: (e: AgentEvent) => void): boolean {
+    if (!this.inbox.length) return false;
+    for (const m of this.inbox.splice(0)) {
+      const text = `[The user sent this while you were working. Read it now and act on it as soon as you can: if it changes what you are doing, change course; if it asks a question, answer it and carry on.]\n\n${m.text}`;
+      this.turns.push({ role: 'user', text, ...(m.images.length ? { images: m.images } : {}), ...(m.attachments.length ? { attachments: m.attachments } : {}) });
+    }
+    emit({ type: 'status', message: 'The agent has your message.' });
+    return true;
+  }
+
   async run(prompt: string, emit: (e: AgentEvent) => void, signal?: AbortSignal, images: ImagePart[] = [], attachments: Attachment[] = []): Promise<void> {
     const provider = this.options.provider();
     if (!provider) {
@@ -827,11 +1095,14 @@ export class Agent {
     try {
       for (let step = 1; step <= maxSteps; step++) {
         signal?.throwIfAborted();
+        this.readInbox(emit);
         await this.fit(provider, emit, signal);
         const reply = await this.request(provider, emit, signal);
         emit({ type: 'usage', usage: reply.usage });
         this.turns.push({ role: 'assistant', text: reply.text, calls: reply.calls, anthropicContent: provider.type === 'anthropic' ? reply.anthropicContent : undefined });
         if (!reply.calls.length) {
+          // A message came in while it answered: not done until it has read it.
+          if (this.inbox.length) continue;
           if (reply.truncated) emit({ type: 'status', message: 'The reply was cut off at the output limit.' });
           // Stopping short of the goal: ask once or twice to carry on.
           const unfinished = this.unfinished(planThisRun);
@@ -870,7 +1141,14 @@ export class Agent {
             ? { id: call.id, name: call.name, content: `Error: ${call.name} is not one of your tools`, isError: true }
             : call.name === 'delegate'
               ? await this.delegate(call, emit, signal)
-              : await runTool(call, this.toolContext);
+              : call.name === 'review_frame'
+                ? await this.reviewFrame(call, emit, signal)
+                : call.name === 'give_verdict'
+                  ? this.takeVerdict(call)
+                  : await runTool(call, this.toolContext);
+          if (call.name === 'view_image' && !result.isError) this.noteLook(call.input);
+          // A picture for a scripted video is reviewed before anything else is made.
+          if (result.review?.length && !result.isError) result.content += await this.reviewPictures(call.id, result.review, emit, signal);
           results.push(result);
           // softn_check keeps the record of failing apps current, as the automatic check does.
           if (result.check) {

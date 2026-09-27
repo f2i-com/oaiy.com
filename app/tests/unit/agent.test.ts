@@ -120,17 +120,20 @@ describe('tool rules', () => {
     await agent.run('make a short film', () => {});
     const system = JSON.stringify(fake.bodies[0].messages);
     expect(system).toContain('video/NAME/) with script.md');
-    for (const line of ['Premise:', 'Characters:', 'Props:', 'Scenes:', 'Start frame:', 'End frame:', 'Video:', 'Dialogue:', 'Sound:']) expect(system).toContain(line);
+    for (const line of ['## Premise:', '## Characters:', '## Props:', '## Scene 2:', 'Start frame:', 'End frame:', 'Video:', 'Dialogue:', 'Sound:']) expect(system).toContain(line);
     expect(system).toMatch(/read it all back and revise it with edit_file until: the story holds together/);
     // Reference images with neutral faces on blank white; the frames give the expressions, and props are made first.
     expect(system).toContain('facing the camera with a neutral expression, on a blank white background');
     expect(system).toContain('never left neutral');
-    expect(system).toContain("a. Each character's reference image (neutral expression, blank white background) and saved voice, and each prop's reference image");
-    // Each scene's empty background, reviewed; frames made new from it and reviewed, again when off.
+    expect(system).toContain("a. Each character's reference image (frame: character; neutral expression, blank white background) and saved voice, and each prop's reference image");
+    // Each scene's empty background; every picture reviewed as it is made, and made again when sent back.
     expect(system).toContain('a Background line: the empty place');
-    expect(system).toMatch(/b\. Each scene's background.*Review it.*If not, make it again\./);
-    expect(system).toMatch(/c\. Then shot by shot, in order: its start and end frames.*each made new with generate_image from the scene's background.*Never use a character's or prop's reference image itself as a frame\..*Review each frame.*make it again/);
-    expect(system).toContain("d. Then that shot's clip, from its two frames and its Video and Dialogue lines, before the next shot.");
+    expect(system).toContain("b. Each scene's background (frame: background, scene: its number)");
+    expect(system).toMatch(/Every picture saved in the video's folder is reviewed as soon as it is made, before anything else.*A picture sent back is made again at the same path/);
+    // The start frame made new from the background and references; the end frame an edit of the start frame.
+    expect(system).toMatch(/c\. Then shot by shot, in order\. Its start frame \(frame: start, shot: its number\).*made new with generate_image from the scene's background.*Never use a character's or prop's reference image itself as a frame\./);
+    expect(system).toContain('Then its end frame (frame: end, shot: its number), from its End frame line, made by editing the start frame: give the start frame as the first reference image');
+    expect(system).toContain("d. Then that shot's clip, from its two passed frames and its Video and Dialogue lines, before the next shot.");
     // Every shot ends on its own end frame, and its Video line tells the motion between the two.
     expect(system).toContain('Every shot has one, and it differs from the start frame.');
     expect(system).toContain('Video: the motion from the start frame to the end frame, in order');
@@ -172,6 +175,32 @@ describe('tool rules', () => {
     await agent.run('go', emit);
     expect(vfs.readText('/script/draft.md')).toBe('# Act one\nGary cooks.\n# Act two\nGary sleeps.\n');
     expect(vfs.readText('/src/app.js')).toMatch(/\n\/\/ more$/);
+  });
+
+  it('reads a message the user sent while it worked at its next step, and is not done until it has read it', async () => {
+    const { agent, events, emit } = setup(OPENAI);
+    expect(agent.interject('not now')).toBe(false);
+    const said = (body: Record<string, unknown>) => JSON.stringify(body.messages);
+    fakeProvider('openai', [
+      () => {
+        expect(agent.interject('Also make the greeting shout.')).toBe(true);
+        return { calls: [{ name: 'read_file', input: { path: 'src/app.js' } }] };
+      },
+      (body) => {
+        expect(said(body)).toContain('[The user sent this while you were working. Read it now and act on it as soon as you can');
+        expect(said(body)).toContain('Also make the greeting shout.');
+        // One more, as it gives its final answer.
+        agent.interject('And say hi.');
+        return { text: 'All done.' };
+      },
+      (body) => {
+        expect(said(body)).toContain('And say hi.');
+        return { text: 'Hi! Done, with a shout.' };
+      },
+    ]);
+    await agent.run('change the greeting', emit);
+    expect(events.at(-1)).toMatchObject({ type: 'done', text: 'Hi! Done, with a shout.' });
+    expect(agent.takeUnread()).toEqual([]);
   });
 
   it('asks once more when the server could not read a tool call, then gives up', async () => {
