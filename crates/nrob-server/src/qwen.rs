@@ -103,14 +103,30 @@ fn identifier(s: &str) -> Result<(), String> {
 /// closing tag that leaves (one `</parameter>` too many, or no `</function>`).
 /// Anything else stays as written, to be refused.
 fn repair_function_tag(block: &str, tools: &[Json]) -> Option<String> {
-    let (name, body) = block.trim().strip_prefix("<parameter=")?.split_once('>')?;
+    let block = block.trim();
+    if block.starts_with("<function=") {
+        return None;
+    }
+    // `<parameter=NAME>` in place of the function tag leaves one `</parameter>`
+    // too many; `function=NAME>` behind a stray special token (`<|im_start|>`)
+    // or with no `<` at all leaves the rest as it should be.
+    let (name, body, parameter_tag) = match block.strip_prefix("<parameter=") {
+        Some(rest) => {
+            let (name, body) = rest.split_once('>')?;
+            (name, body, true)
+        }
+        None => {
+            let (name, body) = without_special_token(block).strip_prefix("function=")?.split_once('>')?;
+            (name, body, false)
+        }
+    };
     tools.iter().filter_map(|t| t.get("function")).find(|f| f.get("name").and_then(Json::as_str) == Some(name))?;
     let mut body = body.trim_end();
     if let Some(inner) = body.strip_suffix("</function>") {
         body = inner.trim_end();
     }
     let (opens, closes) = (body.matches("<parameter=").count(), body.matches("</parameter>").count());
-    let body = if closes == opens + 1 {
+    let body = if parameter_tag && closes == opens + 1 {
         body[..body.rfind("</parameter>")?].trim_end()
     } else if closes == opens {
         body
@@ -118,6 +134,14 @@ fn repair_function_tag(block: &str, tools: &[Json]) -> Option<String> {
         return None;
     };
     Some(format!("<function={name}>{body}\n</function>"))
+}
+
+/// Text after a leading chat-template token such as `<|im_start|>`, or the text as it is.
+fn without_special_token(s: &str) -> &str {
+    s.strip_prefix("<|")
+        .and_then(|rest| rest.split_once("|>"))
+        .filter(|(token, _)| !token.is_empty() && token.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+        .map_or(s, |(_, rest)| rest.trim_start())
 }
 
 /// Convert a complete, schema-typed native call to the server's existing
@@ -522,6 +546,19 @@ mod tests {
         // Only for a declared function, and only when the tags balance.
         assert!(normalize(&call.replace("parameter=computer", "parameter=unknown"), &tools()).is_err());
         assert!(normalize(&call.replace("</parameter>\n</parameter>", "</parameter>\n</parameter>\n</parameter>"), &tools()).is_err());
+    }
+    #[test]
+    fn a_function_tag_behind_a_stray_template_token_is_read_as_the_function() {
+        let fixed = "<tool_call>\n<function=computer>\n<parameter=action>\nkeyboard_sequence\n</parameter>\n</function>\n</tool_call>";
+        let want = normalize(fixed, &tools()).unwrap();
+        // `<|im_start|>` where the `<` belongs, or no `<` at all.
+        assert_eq!(normalize(&fixed.replace("<function=", "<|im_start|>function="), &tools()).unwrap(), want);
+        assert_eq!(normalize(&fixed.replace("<function=", "function="), &tools()).unwrap(), want);
+        assert_eq!(normalize(&fixed.replace("<function=", "<|im_start|>function=").replace("\n</function>", ""), &tools()).unwrap(), want);
+        // Still only a declared function with balanced tags, and only a template-like token.
+        assert!(normalize(&fixed.replace("<function=computer", "<|im_start|>function=unknown"), &tools()).is_err());
+        assert!(normalize(&fixed.replace("<function=", "<|im_start|>function=").replace("</parameter>", ""), &tools()).is_err());
+        assert!(normalize(&fixed.replace("<function=", "<|a b|>function="), &tools()).is_err());
     }
     #[test]
     fn rejected_calls_are_quoted_from_their_start() {
