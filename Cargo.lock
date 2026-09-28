@@ -1578,6 +1578,7 @@ dependencies = [
  "meshopt",
  "oaiy-engine",
  "oaiy-image",
+ "oaiy-tts",
  "regex",
  "tokenizers 0.21.4",
 ]
