@@ -532,6 +532,13 @@ export class Sessions {
   private callQueue: Session[] = [];
   private pumping = false;
   private pumpingCalls = false;
+  /**
+   * The last calls that ended, by id, with their conversation (null: a call this
+   * page did not follow). The desktop may still send a caller's last words
+   * after the end (they were being transcribed as the caller hung up): they are
+   * kept, and the call is not taken up again.
+   */
+  private ended = new Map<string, Session | null>();
 
   constructor(
     private readonly project: OpenProject,
@@ -793,6 +800,15 @@ export class Sessions {
     const callId = typeof event.callId === 'string' ? event.callId : '';
     const type = String(event.type ?? '');
     if (!callId) return null;
+    if (this.ended.has(callId)) {
+      // Words that come after the end are the caller's last: kept in their conversation, not answered.
+      if (type !== 'call.started') {
+        if (type === 'call.caller') await this.heardAfterEnd(this.ended.get(callId) ?? null, event);
+        return null;
+      }
+      // The same call started again (its stream came back): it goes on.
+      this.ended.delete(callId);
+    }
     let session = this.list.find((s) => s.callId === callId) ?? null;
     if (type === 'call.started' || (!session && type === 'call.caller')) {
       const from = String(event.from ?? '') || callId;
@@ -826,7 +842,11 @@ export class Sessions {
       if (type === 'call.started' && !session.running) void session.agent.warm();
       if (type === 'call.started') return session;
     }
-    if (!session) return null;
+    if (!session) {
+      // A call this page did not follow: its end is noted all the same, so its last words do not open it here.
+      if (type === 'call.ended') this.noteEnded(callId, null);
+      return null;
+    }
     switch (type) {
       case 'call.speech_started':
         // The caller is speaking: an answer that comes now waits for their words (or a few seconds, if it was a noise).
@@ -864,17 +884,41 @@ export class Sessions {
         if (!session.inTool) session.controller?.abort();
         break;
       case 'call.ended':
-        clearTimeout(session.speakingTimer);
-        session.callerSpeaking = false;
-        session.speech?.hush();
-        this.stop(session);
-        session.callId = undefined;
-        session.agent.turns.push({ role: 'user', text: '[OAIY] 📞 The call ended.', automatic: true });
-        await this.save(session);
-        this.hooks.changed();
+        await this.endCall(session);
         break;
     }
     return session;
+  }
+
+  /** The call `session` is on has ended: it stops speaking and working, and its conversation says so. */
+  private async endCall(session: Session): Promise<void> {
+    if (session.callId) this.noteEnded(session.callId, session);
+    clearTimeout(session.speakingTimer);
+    session.callerSpeaking = false;
+    session.speech?.hush();
+    this.stop(session);
+    session.callId = undefined;
+    session.agent.turns.push({ role: 'user', text: '[OAIY] 📞 The call ended.', automatic: true });
+    await this.save(session);
+    this.hooks.changed();
+  }
+
+  private noteEnded(callId: string, session: Session | null): void {
+    this.ended.set(callId, session);
+    // The last few are enough: late words come within seconds of the end.
+    if (this.ended.size > 20) this.ended.delete(this.ended.keys().next().value!);
+  }
+
+  /** The caller's words, heard after their call ended: kept in their conversation, not answered (no one is there to hear it). */
+  private async heardAfterEnd(session: Session | null, event: Record<string, unknown>): Promise<void> {
+    const words = String(event.text ?? '').trim();
+    // Not into a run, or a call that has begun since: those have their own words.
+    if (!session || !words || session.running || session.callId) return;
+    const line = callerLine(words, event);
+    this.hooks.arrived?.(session, line);
+    session.agent.turns.push({ role: 'user', text: line });
+    await this.save(session);
+    this.hooks.changed();
   }
 
   /** The caller is not speaking (their words came, or it was a noise): answers held for them go to the agent. */

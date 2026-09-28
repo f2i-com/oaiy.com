@@ -236,6 +236,27 @@ describe('a phone call answered by the agent', () => {
     expect(sessions.list.filter((s) => s.kind === 'call')).toHaveLength(1);
   });
 
+  it("the caller's last words, heard after the call ended, are kept and not answered: the call is not taken up again", async () => {
+    const fake = fakeProvider('openai', [{ text: 'Bye now.' }]);
+    const { sessions, calls } = setup();
+    const call = await sessions.callEvent({ type: 'call.started', callId: 'call_e', from: '+61400000017' });
+    await sessions.callEvent({ type: 'call.ended', callId: 'call_e', reason: 'hung up' });
+    // Still being transcribed as they hung up: the desktop sends it after the end.
+    expect(await sessions.callEvent({ type: 'call.caller', callId: 'call_e', text: 'Thanks, bye.', startMs: 61_000, endMs: 61_800 })).toBeNull();
+    await settled(sessions);
+    expect(fake.bodies).toHaveLength(0);
+    expect(calls).toEqual([]);
+    expect(call?.callId).toBeUndefined();
+    const turns = call!.agent.turns;
+    expect(turns.filter((t) => t.role === 'user' && t.text.startsWith('[OAIY] 📞 A call from'))).toHaveLength(1);
+    expect(turns.at(-1)).toMatchObject({ role: 'user', text: 'Caller [1:01]: Thanks, bye.' });
+    // A call this page did not follow is not opened by its last words either.
+    await sessions.callEvent({ type: 'call.ended', callId: 'call_f' });
+    expect(await sessions.callEvent({ type: 'call.caller', callId: 'call_f', text: 'Hello?' })).toBeNull();
+    expect(sessions.list).toHaveLength(1);
+    expect(sessions.list.some((s) => s.callId)).toBe(false);
+  });
+
   it('on a call the model does not think first, and has a short list of tools', async () => {
     const fake = fakeProvider('openai', [{ text: 'Hello!' }]);
     const { sessions } = setup(LOCAL);
