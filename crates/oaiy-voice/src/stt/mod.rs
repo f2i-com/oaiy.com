@@ -342,3 +342,50 @@ mod cut_tests {
         assert!(pieces.iter().all(|(a, b)| b - a <= 100));
     }
 }
+
+#[cfg(test)]
+mod files_tests {
+    use super::ModelFiles;
+    use std::path::{Path, PathBuf};
+
+    /// A scratch folder holding empty files with these names.
+    fn folder(tag: &str, names: &[&str]) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("oaiy-voice-files-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for n in names {
+            std::fs::write(dir.join(n), b"").unwrap();
+        }
+        dir
+    }
+
+    fn name(p: &Path) -> &str {
+        p.file_name().unwrap().to_str().unwrap()
+    }
+
+    #[test]
+    fn a_nemo_is_preferred_and_safetensors_bring_their_json() {
+        let dir = folder("nemo", &["model.safetensors", "config.json", "tokenizer.json", "parakeet.nemo"]);
+        let f = ModelFiles::find(&dir).unwrap();
+        assert_eq!(name(&f.weights), "parakeet.nemo");
+        assert!(f.config.is_none() && f.tokenizer.is_none());
+        std::fs::remove_file(dir.join("parakeet.nemo")).unwrap();
+        let f = ModelFiles::find(&dir).unwrap();
+        assert_eq!(name(&f.weights), "model.safetensors");
+        assert_eq!(f.config.as_deref().map(name), Some("config.json"));
+        assert_eq!(f.tokenizer.as_deref().map(name), Some("tokenizer.json"));
+        assert!(f.processor.is_none());
+        let f = ModelFiles::find(&dir.join("model.safetensors")).unwrap();
+        assert_eq!(f.config.as_deref().map(name), Some("config.json"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn onnx_folders_and_missing_paths_say_what_is_wrong() {
+        let dir = folder("onnx", &["encoder.int8.onnx", "decoder_joint.int8.onnx", "tokenizer.model"]);
+        assert!(ModelFiles::find(&dir).unwrap_err().to_string().contains("ONNX"));
+        assert!(ModelFiles::find(&dir.join("encoder.int8.onnx")).is_err());
+        assert!(ModelFiles::find(&dir.join("nothing-here")).unwrap_err().to_string().contains("no such"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}

@@ -53,10 +53,6 @@ impl Linear {
     pub fn from_parts(w: Tensor, b: Option<Tensor>) -> Self {
         Self { w, b }
     }
-
-    pub fn out_dim(&self) -> usize {
-        self.w.dims()[0]
-    }
 }
 
 impl Module for Linear {
