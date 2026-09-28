@@ -53,8 +53,13 @@ export class FileTree {
     });
   }
 
-  select(path: string): void {
+  /** Select a path (its folders opened), or nothing. */
+  select(path: string | null): void {
     this.selected = path;
+    if (!path) {
+      this.refresh();
+      return;
+    }
     const parts = path.replace(/^\//, '').split('/');
     for (let i = 1; i < parts.length; i++) this.expanded.add(parts.slice(0, i).join('/'));
     this.refresh();

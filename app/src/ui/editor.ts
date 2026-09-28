@@ -36,7 +36,12 @@ function languageFor(path: string): Extension[] {
 
 export class EditorPane {
   readonly element = h('section.editor');
-  private readonly title = h('div.editor-title', 'No file open');
+  /** The open file's path, beside a button that closes it. */
+  private readonly pathLabel = h('span.editor-path', 'No file open');
+  private readonly closeButton = h('button.icon.editor-close', { title: 'Close this file', 'aria-label': 'Close this file', onclick: () => this.closeByHand() }, '×') as HTMLButtonElement;
+  private readonly title = h('div.editor-title', this.pathLabel, this.closeButton);
+  /** The person closed the file (the tree lets go of it). */
+  onClose: () => void = () => {};
   private readonly body = h('div.editor-body');
   private view: EditorView | null = null;
   private path: string | null = null;
@@ -70,6 +75,7 @@ export class EditorPane {
   }
 
   private showEmpty(): void {
+    this.closeButton.hidden = true;
     clear(this.body);
     this.body.append(h('div.empty', h('p', 'Open a file from the tree, or ask the agent to write one.')));
   }
@@ -92,7 +98,8 @@ export class EditorPane {
     if (!media) return;
     this.media = media;
     this.mediaPath = path;
-    this.title.textContent = path;
+    this.pathLabel.textContent = path;
+    this.closeButton.hidden = false;
     const info = h('span.media-info', formatBytes(bytes.byteLength));
     const bar = h('div.media-bar', info);
     const img = media.element.querySelector('img');
@@ -125,14 +132,16 @@ export class EditorPane {
       this.view?.destroy();
       this.view = null;
       clear(this.body);
-      this.title.textContent = path;
+      this.pathLabel.textContent = path;
+      this.closeButton.hidden = false;
       const size = this.vfs.stat(path)?.size ?? 0;
       this.body.append(h('div.empty', h('p', `Binary file (${size.toLocaleString()} bytes) — not shown.`)));
       return;
     }
     this.path = path;
     this.dirty = false;
-    this.title.textContent = path;
+    this.pathLabel.textContent = path;
+    this.closeButton.hidden = false;
     const doc = this.vfs.readText(path);
     const state = EditorState.create({
       doc,
@@ -144,7 +153,8 @@ export class EditorPane {
         EditorView.updateListener.of((update) => {
           if (!update.docChanged || this.applying) return;
           this.dirty = true;
-          this.title.textContent = `${this.path} •`;
+          this.pathLabel.textContent = `${this.path} •`;
+          this.closeButton.hidden = false;
           if (this.saveTimer) clearTimeout(this.saveTimer);
           this.saveTimer = setTimeout(() => this.flush(), 400);
         }),
@@ -165,9 +175,11 @@ export class EditorPane {
     try {
       this.vfs.writeFile(this.path, this.view.state.doc.toString(), { parents: true });
       this.dirty = false;
-      this.title.textContent = this.path;
+      this.pathLabel.textContent = this.path;
+      this.closeButton.hidden = false;
     } catch (error) {
-      this.title.textContent = `${this.path} — not saved: ${(error as Error).message}`;
+      this.pathLabel.textContent = `${this.path} — not saved: ${(error as Error).message}`;
+      this.closeButton.hidden = false;
     }
   }
 
@@ -209,7 +221,8 @@ export class EditorPane {
       h('button.primary', { onclick: () => this.resolve('mine') }, 'Keep mine'),
     );
     this.conflictBar.hidden = false;
-    this.title.textContent = `${this.path} • (changed elsewhere)`;
+    this.pathLabel.textContent = `${this.path} • (changed elsewhere)`;
+    this.closeButton.hidden = false;
   }
 
   private resolve(choice: 'mine' | 'theirs'): void {
@@ -221,11 +234,19 @@ export class EditorPane {
       return;
     }
     this.dirty = false;
-    this.title.textContent = this.path;
+    this.pathLabel.textContent = this.path;
+    this.closeButton.hidden = false;
     const text = this.vfs.exists(this.path) ? this.vfs.readText(this.path) : '';
     this.applying = true;
     this.view.dispatch({ changes: { from: 0, to: this.view.state.doc.length, insert: text } });
     this.applying = false;
+  }
+
+  /** Closed with its button: what was typed is saved first, and nothing is open after. */
+  private closeByHand(): void {
+    this.flush();
+    this.close();
+    this.onClose();
   }
 
   close(): void {
@@ -236,7 +257,7 @@ export class EditorPane {
     this.view = null;
     this.path = null;
     this.dirty = false;
-    this.title.textContent = 'No file open';
+    this.pathLabel.textContent = 'No file open';
     this.showEmpty();
   }
 }

@@ -151,7 +151,12 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 .tree-row:hover .row-actions { visibility: visible; }
 
 .editor { display: flex; flex-direction: column; min-height: 0; }
-.editor-title { padding: 6px 10px; font-family: var(--mono); font-size: 12px; border-bottom: 1px solid var(--border); background: var(--panel); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.editor-title { display: flex; align-items: center; gap: 6px; padding: 4px 6px 4px 10px; font-family: var(--mono); font-size: 12px; border-bottom: 1px solid var(--border); background: var(--panel); min-height: 29px; }
+.editor-path { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* Close the open file: a quiet × that shows it can be let go of. */
+.editor-close { flex: none; width: 22px; height: 22px; padding: 0; border-radius: 6px; font-size: 16px; line-height: 1; color: var(--muted); }
+.editor-close:hover { color: var(--text); background: var(--panel-2); }
+.editor-close[hidden] { display: none; }
 .editor-body { flex: 1; min-height: 0; overflow: hidden; }
 .editor-body .cm-editor { height: 100%; }
 .editor-body .cm-scroller { font-family: var(--mono); }

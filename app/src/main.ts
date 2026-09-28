@@ -208,6 +208,8 @@ async function main(): Promise<void> {
     if (window.matchMedia('(max-width: 900px)').matches) showView('editor');
   }, notice);
   const editor = new EditorPane(null as unknown as Vfs);
+  // Closing a file lets the tree go of it too.
+  editor.onClose = () => tree.select(null);
   const terminal = new TerminalPane(null as unknown as Vfs, gate);
   const preview = new Preview(null as unknown as Vfs, () => project?.meta.id ?? 'none');
   // An error while the person uses the app or page: one click asks the agent to fix it.
