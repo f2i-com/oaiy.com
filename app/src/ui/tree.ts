@@ -24,8 +24,16 @@ export class FileTree {
       h('button.icon', { title: 'New folder', onclick: () => void this.create('dir') }, '+ folder'),
     );
     this.list.setAttribute('role', 'tree');
-    this.element.append(h('div.pane-title', 'Files'), actions, this.list);
+    this.element.append(this.title, actions, this.list);
     this.render();
+  }
+
+  private readonly title = h('div.pane-title', 'Files');
+
+  /** Say whose files these are (the front desk's, say): nothing for the open project's. */
+  setPlace(place: string | null): void {
+    this.title.textContent = place ? `Files · ${place}` : 'Files';
+    this.title.title = place ? `The ${place.toLowerCase()}'s files: what the phone's agent reads` : '';
   }
 
   setVfs(vfs: Vfs): void {

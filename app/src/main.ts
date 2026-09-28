@@ -405,15 +405,8 @@ async function main(): Promise<void> {
     // The first project is open: the page is usable from here on.
     header.inert = false;
     workspace.inert = false;
-    tree.setVfs(project.vfs);
-    editor.setVfs(project.vfs);
-    terminal.setVfs(project.vfs);
-    preview.setVfs(project.vfs);
-    unsubscribe = project.vfs.onChange((change) => {
-      tree.refresh();
-      editor.externalChange('path' in change ? change.path : null);
-      preview.changed('path' in change ? change.path : null);
-    });
+    shownFiles = null;
+    showFiles(project);
     // A SoftN app or a web page opens on its preview, so the person sees it being built.
     if (isSoftnProject(project.vfs) || findPages(project.vfs).length) showPane('preview');
     chat.replay(agent.turns);
@@ -1098,9 +1091,35 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
   }
 
   /** Show a conversation: the project's own (null), or a text-message thread. */
+  /** The place whose files the panels show: the open project, or the front desk. */
+  let shownFiles: OpenProject | null = null;
+
+  /**
+   * Show a place's files in the tree, the editor, the terminal and the preview:
+   * the open project's, or, while one of the phone's conversations is shown,
+   * the front desk's (where the person keeps what the phone's agent reads).
+   */
+  function showFiles(place: OpenProject): void {
+    if (shownFiles === place) return;
+    if (shownFiles) editor.flush();
+    shownFiles = place;
+    unsubscribe?.();
+    tree.setVfs(place.vfs);
+    editor.setVfs(place.vfs);
+    terminal.setVfs(place.vfs);
+    preview.setVfs(place.vfs);
+    tree.setPlace(place === frontDesk ? frontDesk.meta.name : null);
+    unsubscribe = place.vfs.onChange((change) => {
+      tree.refresh();
+      editor.externalChange('path' in change ? change.path : null);
+      preview.changed('path' in change ? change.path : null);
+    });
+  }
+
   function selectSession(id: string | null): void {
     const session = id ? sessions?.get(id) : null;
     viewing = session ? session.id : null;
+    showFiles(session ? frontDesk : project);
     if (session) {
       chat.replay(session.agent.turns);
       chat.setBusy(!!session.running);
