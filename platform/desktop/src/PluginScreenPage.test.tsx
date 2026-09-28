@@ -7,8 +7,8 @@
 // `data-theme` on ITS OWN document, and nothing ever crossed the frame
 // boundary, so the plugin screens rendered light under every theme.
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { HOST_BOOTSTRAP, pluginAiSources } from './PluginScreenPage';
-import { API_BASE } from './api';
+import { HOST_BOOTSTRAP, isPluginNavTarget, pluginAiSources, pluginOaiyStatus } from './PluginScreenPage';
+import { API_BASE, engines, voices } from './api';
 
 describe('plugin AI source gateway routes', () => {
   it('uses the configured host API for provider selections and preserves their metadata', () => {
@@ -118,5 +118,34 @@ describe('plugin RPC recovery', () => {
     send({ __pluginHost: 1, id: 'r1', ok: true, data: { connected: true } });
     expect(await result).toEqual({ connected: true });
     expect(vi.getTimerCount()).toBe(0);
+  });
+});
+
+describe('plugin screen navigation and OAIY status', () => {
+  beforeEach(() => { vi.useFakeTimers(); boot(); });
+  afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); vi.restoreAllMocks(); });
+  const host = () => (window as unknown as { PluginHost: Record<string, (...a: unknown[]) => Promise<unknown>> }).PluginHost;
+
+  it('asks the host to open a dashboard page, which checks it against a fixed list', () => {
+    void host().navigate('agent');
+    expect(window.parent.postMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ __pluginHost: 1, method: 'navigate', args: ['agent'] }), '*',
+    );
+    expect(isPluginNavTarget('calendar')).toBe(true);
+    expect(isPluginNavTarget('engines')).toBe(true);
+    expect(isPluginNavTarget('settings')).toBe(false);
+    expect(isPluginNavTarget('plugin:aokie:receptionist')).toBe(false);
+    expect(isPluginNavTarget(undefined)).toBe(false);
+  });
+
+  it('reads the chosen call voice and the engines model, and keeps one when the other fails', async () => {
+    vi.spyOn(voices, 'list').mockResolvedValue({ voices: [], chosen: 'receptionist' });
+    vi.spyOn(engines, 'status').mockResolvedValue({ running: true, llm: { state: 'ready', resident: 'model-a', models: ['model-a'], loadSeconds: 1 } });
+    expect(await pluginOaiyStatus()).toEqual({
+      voice: { chosen: 'receptionist' },
+      llm: { running: true, state: 'ready', resident: 'model-a' },
+    });
+    vi.spyOn(engines, 'status').mockRejectedValue(new Error('offline'));
+    expect(await pluginOaiyStatus()).toEqual({ voice: { chosen: 'receptionist' }, llm: null });
   });
 });

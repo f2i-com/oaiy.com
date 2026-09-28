@@ -4,7 +4,9 @@ import {
   API_BASE,
   bridge,
   companion,
+  engines,
   plugins,
+  voices,
   type CompanionOfferRequest,
   type PluginRecord,
 } from './api';
@@ -25,10 +27,43 @@ import { useToast } from './Toasts';
  * events, read a snapshot) instead of a network and an origin.
  */
 
+/** The dashboard pages a plugin screen may open with `PluginHost.navigate`. */
+export const PLUGIN_NAV_TARGETS = ['agent', 'calendar', 'engines', 'services', 'overview', 'plugins', 'providers'] as const;
+export type PluginNavTarget = (typeof PLUGIN_NAV_TARGETS)[number];
+
+export function isPluginNavTarget(value: unknown): value is PluginNavTarget {
+  return typeof value === 'string' && (PLUGIN_NAV_TARGETS as readonly string[]).includes(value);
+}
+
+/** What OAIY answers calls with, for a plugin screen to show: the voice
+ *  chosen for calls and the engines' language model. Names and states only;
+ *  a part that cannot be read comes back null rather than failing the rest. */
+export interface PluginOaiyStatus {
+  voice: { chosen: string | null } | null;
+  llm: { running: boolean; state: string | null; resident: string | null } | null;
+}
+
+export async function pluginOaiyStatus(): Promise<PluginOaiyStatus> {
+  const [voice, engine] = await Promise.allSettled([voices.list(), engines.status()]);
+  return {
+    voice: voice.status === 'fulfilled' ? { chosen: voice.value.chosen ?? null } : null,
+    llm:
+      engine.status === 'fulfilled'
+        ? {
+            running: !!engine.value.running,
+            state: engine.value.llm?.state ?? null,
+            resident: engine.value.llm?.resident ?? null,
+          }
+        : null,
+  };
+}
+
 interface Props {
   pluginId: string;
   /** The `ui.nav[].id` that was clicked. */
   navId: string;
+  /** Opens one of the dashboard's own pages for the screen's `navigate`. */
+  onNavigate?: (view: PluginNavTarget) => void;
 }
 
 interface UiNav {
@@ -108,6 +143,12 @@ export const HOST_BOOTSTRAP = `
     snapshot: function () { return call('snapshot', []); },
     aiSources: function () { return call('aiSources', []); },
     restartPlugin: function () { return call('restartPlugin', []); },
+    // Open one of the dashboard's own pages ('agent', 'calendar', 'engines',
+    // ...). The frame cannot navigate itself out of the sandbox, so the host
+    // does it, and only to its fixed list.
+    navigate: function (view) { return call('navigate', [view]); },
+    // Read-only: the voice chosen for calls and the engines' language model.
+    oaiyStatus: function () { return call('oaiyStatus', []); },
     events: {
       // Resolves to a HANDLE (with .unsubscribe()), not the function itself —
       // callers do subscribe(...).then(h => handle = h).
@@ -157,13 +198,17 @@ export const HOST_BOOTSTRAP = `
 })();
 `;
 
-export default function PluginScreenPage({ pluginId, navId }: Props) {
+export default function PluginScreenPage({ pluginId, navId, onNavigate }: Props) {
   // Changing screens discards the old document, pending RPCs and event cursor.
-  return <PluginScreenContent key={`${pluginId}:${navId}`} pluginId={pluginId} navId={navId} />;
+  return <PluginScreenContent key={`${pluginId}:${navId}`} pluginId={pluginId} navId={navId} onNavigate={onNavigate} />;
 }
 
-function PluginScreenContent({ pluginId, navId }: Props) {
+function PluginScreenContent({ pluginId, navId, onNavigate }: Props) {
   const toast = useToast();
+  // Held in a ref so a new callback each render does not re-register the
+  // message pump (handleCall depends on nothing that changes per render).
+  const navigateRef = useRef(onNavigate);
+  navigateRef.current = onNavigate;
   const [record, setRecord] = useState<PluginRecord | null | undefined>(undefined);
   // The manifest selects and assembles the iframe once. Runtime status changes
   // separately so a health refresh cannot remount a call console or transcript.
@@ -321,6 +366,15 @@ function PluginScreenContent({ pluginId, navId }: Props) {
           await plugins.stop(pluginId).catch(() => {});
           await plugins.start(pluginId);
           return true;
+        case 'navigate': {
+          const [target] = args as [unknown];
+          const go = navigateRef.current;
+          if (!go || !isPluginNavTarget(target)) throw new Error('That page cannot be opened from a plugin screen.');
+          go(target);
+          return true;
+        }
+        case 'oaiyStatus':
+          return await pluginOaiyStatus();
         // Companion trust. The screen never names a plugin: it gets its OWN id
         // from the host, so a screen cannot administer another plugin's phones
         // by asking nicely.

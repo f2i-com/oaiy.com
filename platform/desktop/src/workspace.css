@@ -34,6 +34,10 @@
 .content-page.page-fill { display: flex; flex-direction: column; }
 .content-page.page-fill > * { flex: none; }
 .content-page.page-fill > .panel { flex: 1 1 auto; }
+/* It also fills the page's width: a plugin screen lays out its own columns,
+   so the 1160px reading width of the built-in pages would only leave a gap. */
+.content-page.page-fill > .page-intro,
+.content-page.page-fill > .panel { max-width: none; }
 .plugin-screen { flex: 1 1 auto; min-height: 320px; }
 .form-row, .form-row-pair, .service-card { min-width: 0; }
 input, select, textarea { max-width: 100%; }

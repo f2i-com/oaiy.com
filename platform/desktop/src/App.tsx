@@ -529,7 +529,9 @@ export default function App() {
                 onOpenPluginScreen={(pluginId, navId) => setView(`plugin:${pluginId}:${navId}`)}
               />
             )}
-            {pluginView && <PluginScreenPage pluginId={pluginView[1]} navId={pluginView[2]} />}
+            {pluginView && (
+              <PluginScreenPage pluginId={pluginView[1]} navId={pluginView[2]} onNavigate={(v) => setView(v)} />
+            )}
             {view === 'services' && <ServicesPanel />}
             {view === 'plugins' && <PluginsPanel />}
             {view === 'runs' && <RunsPanel />}

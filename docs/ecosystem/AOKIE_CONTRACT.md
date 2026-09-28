@@ -62,8 +62,9 @@ The canonical host-side specs live in FormLogic: `docs/DESKTOP_PLUGIN_SDK.md`,
   (`appliesLive` says which apply at once). `managerPin` is write-only.
 - **UI.** The plugin's screens run in a sandboxed iframe with an injected `window.PluginHost`:
   `command`, `snapshot`, `events.subscribe`, `toast`, `aiSources`, `consent.get`,
-  `companionPairing.*`, `restartPlugin` (`ui/receptionist/app.js`; the `aiSources` shape is in
-  `ui/receptionist/tabs/settings.js`).
+  `companionPairing.*`, `restartPlugin`, `navigate(view)` (one of the dashboard pages in
+  `PLUGIN_NAV_TARGETS`) and `oaiyStatus()` (the chosen call voice and the engines' language
+  model), all in `platform/desktop/src/PluginScreenPage.tsx`.
 
 ## The voice loop (inside the plugin)
 
