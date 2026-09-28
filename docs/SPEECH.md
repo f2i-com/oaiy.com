@@ -5,6 +5,9 @@ natively in Rust (`oaiy-media`, `kind: "speech"`). The studio serves both as
 OpenAI's `audio.speech`. It adds **saved voices**: describe a voice once, keep
 it, and every later line uses the same voice.
 
+For calls, [`oaiy-tts`](#realtime-speech-oaiy-tts) speaks as it goes, in real
+time on the GPU, in a voice cloned from a clip of anyone speaking.
+
 ## Models
 
 Use two folders from the Qwen3-TTS release:
@@ -124,29 +127,91 @@ sounding the same from clip to clip. In the Playground's Video tab, pick
 **Someone says this…** as the soundtrack. See
 [following a soundtrack](LTX_VIDEO.md#following-a-soundtrack).
 
+## Realtime speech: `oaiy-tts`
+
+`crates/oaiy-tts` is a library for live calls. It uses Qwen3-TTS-12Hz-0.6B-Base
+(Apache-2.0; the 1.7B Base works the same) and streams 16-bit, 24 kHz PCM
+while it speaks. A voice is cloned from a short clip and its transcript.
+`oaiy-media` shares its layers: the talker, the code predictor, the codec, and
+the encoders that make a voice.
+
+```rust
+let dev = oaiy_tts::cuda(1)?;                       // the GPU to use
+let mut tts = oaiy_tts::Tts::load(model_dir, &dev)?; // loads and warms up
+let voice = tts.voice_from_audio(clip, Some(transcript))?; // mp3, wav, ...
+let cancel = AtomicBool::new(false);                // set it to stop (barge-in)
+let report = tts.speak(text, &voice, &cancel, |pcm: &[i16]| { /* play it */ })?;
+```
+
+- **Model folder.** The 0.6B release: `config.json`, `model.safetensors`,
+  `vocab.json`, `merges.txt` and `speech_tokenizer/`. The speech tokenizer is
+  byte for byte the 1.7B's, so it can be a hard link.
+- **Voices.** `voice_from_audio` reads the clip: a plain WAV natively,
+  anything else through FFmpeg (`tts.ffmpeg`). It makes the clip 24 kHz mono,
+  trims silence at both ends, and cuts it to 30 seconds at a quiet moment. The
+  speaker encoder and the codec encoder then make the voice. The voice is kept
+  in `tts.voice_cache`, keyed by the clip's bytes and the transcript, so a clip
+  is worked through once. The transcript must say exactly what the clip says:
+  words it lacks are read out before the line. Transcribe the audio
+  `audio::read_clip` returns. Without a transcript, the voice is refused.
+  A voice made for one model size (1024 values for the 0.6B, 2048 for the 1.7B)
+  is refused by the other.
+- **Streaming.** The first chunk comes after one frame, then one every
+  `options.chunk_frames` (2 frames, 160 ms). The model sometimes opens with up
+  to a second of silence; that is dropped, down to a tenth of a second. The
+  codec carries each stage's past from chunk to chunk (the transformer's keys
+  and values over its 72-frame window, each causal convolution's last inputs).
+  Its audio is therefore the whole-clip decode's (117 dB SNR against it), at
+  the cost of the new frames only.
+- **Speed.** Each frame's code prediction (15 steps of the predictor, with the
+  codes drawn on the GPU), and each chunk's decode, are captured once as CUDA
+  graphs and replayed. Candle's thread-local cache of kernel parameters makes a
+  graph belong to its thread: `load` warms up on its thread, and a server
+  that speaks on another calls `warm_up()` there (otherwise its first line
+  takes about a third of a second longer).
+- **Threads.** `Tts` is `Send`. It speaks one line at a time (`&mut self`).
+  For concurrent calls, use one engine per call; each takes about 2 GB.
+
+Measured on an RTX 5090 (`cuda:1`), with a two-sentence reply (4.8 s of audio)
+in a voice cloned from a 6-second clip:
+
+| | |
+|---|---|
+| Frames | 10 ms each (100 a second; real time is 12.5) |
+| Codec | 4 ms a 2-frame chunk |
+| First audio | 50-100 ms after the call (after any opening silence) |
+| Real-time factor | 0.15-0.16 |
+| Device memory | 1.7 GB of weights; about 2.0-2.2 GB in all |
+
+`cargo run --release -p oaiy-tts --features flash-attn --example speak --
+--voice clip.mp3 --transcript "..." --text "..." --out out.wav --device 1`
+speaks a line and prints these numbers; `--example bench` times frames and codec
+chunks apart. `cargo test -p oaiy-tts` runs on the CPU with no weights.
+
 ## Speed and memory
 
 On an RTX 5090:
 
-- The talker writes about 14 frames a second, against 12.5 for real time. The
-  official PyTorch implementation writes 8.2.
-- 8 seconds of speech takes about 9 seconds in all: 1.5 s to load, then
+- The talker writes about 80 frames a second, against 12.5 for real time (the
+  official PyTorch implementation writes 8.2): the code predictor's steps
+  replay as a CUDA graph, as in `oaiy-tts`.
+- 8 seconds of speech takes about 3 seconds in all: 1.5 s to load, 1.3 s
   speaking, then 0.3 s to decode.
 - Saving a voice takes 7-10 seconds.
 
 The talker and codec need about 3.5 GB of VRAM (BF16 talker, F32 codec). The
 text embedding table stays in the file: only the prompt's rows are read.
 
-Breeze TTS 2 writes about 7 frames a second, a little over half real time: the
-depth decoder's 15 steps a frame dominate. A 6-second line takes about 10 s
-once the model is loaded, and designing a voice about 30 s. It needs about
+Breeze TTS 2 writes about 12 frames a second, just under real time: the
+depth decoder's 15 steps a frame dominate. A 6-second line takes about 6 s
+once the model is loaded. It needs about
 6.5 GB of VRAM.
 
 ## Verification
 
 Reference activations come from the official `qwen-tts` package (strict F32 for
-the F32 parts, TF32 off). The opt-in tests are `tts::codec`, `tts::clone` and
-`tts::tests`.
+the F32 parts, TF32 off). The opt-in tests are `codec` and `clone` in
+`oaiy-tts`, and `tts::tests` in `oaiy-media`.
 
 | Stage | Relative RMS error |
 |---|---|
@@ -159,6 +224,14 @@ the F32 parts, TF32 off). The opt-in tests are `tts::codec`, `tts::clone` and
 The tokenizer reproduces the reference's token ids exactly. Greedy decoding
 reproduces the reference's first frames; later frames differ only where BF16
 near-ties flip.
+
+`oaiy-tts`'s own checks run on the CPU without weights. They use tiny random
+models built like the real ones. A stream decodes exactly what the whole
+sequence decodes, in any chunking, past the attention window, and after a
+primed reference clip. Codes drawn on the device match those drawn on the host
+(greedy). A decoder step at a time matches the whole sequence through its
+growing KV cache. On the GPU, streamed audio measures 117 dB SNR against the
+whole-clip decode, and cloned lines transcribe back word for word.
 
 For Breeze TTS 2, the reference is the official `breeze-tts` code with
 Transformers. Greedy decoding reproduces its prompt and its first frame, with
