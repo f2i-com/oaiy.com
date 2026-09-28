@@ -12,12 +12,15 @@ import PairingPrompt from './PairingPrompt';
 let container: HTMLDivElement;
 let root: Root;
 const saved = { id: 'saved-1', product: 'FormLogic', label: 'My workspace', origin: 'https://workspace.example', createdAtMs: Date.parse('2026-09-12T01:02:03Z') };
+const request = { pairingId: 'new-1', product: 'New workspace', origin: 'https://new.example', code: '123456', status: 'pending', createdAtMs: saved.createdAtMs };
 
 beforeEach(() => {
   vi.clearAllMocks();
   vi.useFakeTimers();
   pending.mockResolvedValue({ pending: [] });
   paired.mockResolvedValue({ paired: [saved] });
+  approve.mockResolvedValue({});
+  deny.mockResolvedValue({});
   container = document.createElement('div');
   document.body.appendChild(container);
   root = createRoot(container);
@@ -28,41 +31,47 @@ afterEach(async () => {
   vi.useRealTimers();
 });
 async function mount() { await act(async () => root.render(<PairingPrompt />)); }
+const buttonIn = (el: Element, label: string) =>
+  Array.from(el.querySelectorAll('button')).find((b) => b.textContent?.includes(label))!;
 
-describe('PairingPrompt connected app disclosure', () => {
-  it('starts collapsed, preserves identifying details, and remains open across polling', async () => {
+describe('PairingPrompt', () => {
+  it('shows nothing when no request is waiting, even with apps connected', async () => {
+    // The connected apps have their own section on Connections (and Overview).
+    // Listing them here as well put a second copy above that page's heading.
     await mount();
-    const details = container.querySelector('details')!;
-    const summary = container.querySelector('summary')!;
-    expect(details.open).toBe(false);
-    expect(summary.textContent).toContain('Connected apps (1)');
-    expect(container.querySelector('.pairing-origin')!.textContent).toBe(saved.origin);
-    expect(container.querySelector('time')!.dateTime).toBe('2026-09-12T01:02:03.000Z');
-    await act(async () => summary.click());
-    expect(details.open).toBe(true);
     await act(async () => { await vi.advanceTimersByTimeAsync(3000); });
-    expect(details.open).toBe(true);
-    expect(revoke).not.toHaveBeenCalled();
+    expect(container.innerHTML).toBe('');
+    expect(paired).not.toHaveBeenCalled();
   });
 
-  it('keeps a new pairing decision visible outside the collapsed saved apps', async () => {
-    pending.mockResolvedValue({ pending: [{ pairingId: 'new-1', product: 'New workspace', origin: 'https://new.example', code: '123456', status: 'pending', createdAtMs: saved.createdAtMs }] });
+  it('shows a request with the code to confirm, and approves only that request', async () => {
+    pending.mockResolvedValue({ pending: [request] });
     await mount();
     const prompt = container.querySelector('[role="alert"]')!;
-    expect(prompt.closest('details')).toBeNull();
+    expect(prompt.textContent).toContain('New workspace wants to connect');
     expect(prompt.textContent).toContain('123456');
-    const button = Array.from(prompt.querySelectorAll('button')).find(el => el.textContent?.includes('Approve'))!;
-    await act(async () => button.click());
+    expect(container.textContent).not.toContain('Connected apps');
+    await act(async () => buttonIn(prompt, 'Approve').click());
     expect(approve).toHaveBeenCalledWith('new-1');
+    expect(deny).not.toHaveBeenCalled();
     expect(revoke).not.toHaveBeenCalled();
+    expect(push).toHaveBeenCalledWith(expect.objectContaining({ kind: 'success', title: 'Approved New workspace' }));
   });
 
-  it('only revokes the selected saved app when its explicit control is used', async () => {
+  it('denies a request when asked', async () => {
+    pending.mockResolvedValue({ pending: [request] });
     await mount();
-    await act(async () => container.querySelector('summary')!.click());
-    const button = container.querySelector<HTMLButtonElement>('button[aria-label^="Revoke"]')!;
-    expect(button.getAttribute('aria-label')).toContain(saved.origin);
-    await act(async () => button.click());
-    expect(revoke).toHaveBeenCalledWith(saved.id);
+    const prompt = container.querySelector('[role="alert"]')!;
+    await act(async () => buttonIn(prompt, 'Deny').click());
+    expect(deny).toHaveBeenCalledWith('new-1');
+    expect(approve).not.toHaveBeenCalled();
+  });
+
+  it('keeps a request on screen when one poll fails', async () => {
+    pending.mockResolvedValue({ pending: [request] });
+    await mount();
+    pending.mockRejectedValue(new Error('starting'));
+    await act(async () => { await vi.advanceTimersByTimeAsync(3000); });
+    expect(container.querySelector('[role="alert"]')!.textContent).toContain('123456');
   });
 });

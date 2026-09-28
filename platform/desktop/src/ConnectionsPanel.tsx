@@ -16,10 +16,9 @@ import { useToast } from './Toasts';
  * Connections — every app that has been granted access to this machine, and any
  * request waiting on the user.
  *
- * The app-wide PairingPrompt banner only appears when something is pending or
- * paired, so there was no screen to AUDIT access from: no way to review who is
- * connected before granting more, and nowhere to land after revoking everything.
- * This is that screen.
+ * The app-wide PairingPrompt banner only appears when a request is pending, so
+ * this is the screen to AUDIT access from: to review who is connected before
+ * granting more, and somewhere to land after revoking everything.
  */
 
 const POLL_MS = 3000;

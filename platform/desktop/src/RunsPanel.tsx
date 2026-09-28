@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { CircleAlert, RefreshCw, Trash2 } from 'lucide-react';
 import { bridge, type RunHistory, type RunRecord, type RunStatus } from './api';
 import DeadLetters from './DeadLetters';
@@ -87,6 +87,51 @@ function noFailuresMessage(data: RunHistory): string {
   const inFlight = (counts.queued ?? 0) + (counts.running ?? 0);
   if (inFlight === 0) return `Nothing has failed — all ${clean} recorded runs finished cleanly.`;
   return `Nothing has failed — ${clean} finished cleanly, ${inFlight} still queued or running.`;
+}
+
+/**
+ * Why a run failed, held to three lines. Some reasons are a whole paragraph (a
+ * list of every node type a flow could not find), and a block of red that size
+ * buries the rows below it. The toggle shows only when the three lines hide
+ * something; the full text is also the tooltip.
+ */
+function RunError({ code, message }: { code: string; message: string }) {
+  const [all, setAll] = useState(false);
+  const [clipped, setClipped] = useState(false);
+  const textRef = useRef<HTMLSpanElement>(null);
+
+  // Measured, not guessed from the length: whether it passes three lines
+  // depends on the window's width. Not measured while open, so the toggle stays.
+  useLayoutEffect(() => {
+    const el = textRef.current;
+    if (!el || all) return;
+    const measure = () => setClipped(el.scrollHeight > el.clientHeight + 1);
+    measure();
+    if (typeof ResizeObserver === 'undefined') return;
+    const observer = new ResizeObserver(measure);
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [message, all]);
+
+  return (
+    <>
+      <p className="run-error">
+        <CircleAlert size={13} /> <code>{code}</code>{' '}
+        <span
+          ref={textRef}
+          className={all ? 'run-error-text' : 'run-error-text clamped'}
+          title={clipped && !all ? message : undefined}
+        >
+          {message}
+        </span>
+      </p>
+      {clipped && (
+        <button className="btn-tiny run-more" aria-expanded={all} onClick={() => setAll(!all)}>
+          {all ? 'Show less' : 'Show all'}
+        </button>
+      )}
+    </>
+  );
 }
 
 export default function RunsPanel() {
@@ -230,11 +275,7 @@ export default function RunsPanel() {
 
                   {/* The reason, on the row, unexpanded. Making someone click to
                       find out why a run failed is the problem this panel fixes. */}
-                  {r.error && (
-                    <p className="run-error">
-                      <CircleAlert size={13} /> <code>{r.error.code}</code> {r.error.message}
-                    </p>
-                  )}
+                  {r.error && <RunError code={r.error.code} message={r.error.message} />}
 
                   <button
                     className="btn-tiny run-more"

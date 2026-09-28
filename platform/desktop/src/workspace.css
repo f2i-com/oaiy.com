@@ -28,7 +28,13 @@
 .banner { flex-wrap: wrap; line-height: 1.5; }
 .banner > span { min-width: 0; overflow-wrap: anywhere; flex: 1 1 240px; }
 .btn, .btn-tiny, .icon-button { min-height: 36px; }
-.plugin-screen { min-height: max(600px, 74dvh); }
+/* A plugin screen fills the page from its intro down to the dock, and scrolls
+   inside itself. The page around it does not scroll too, so there is one
+   scrollbar. Below 320px of room the page scrolls again rather than squash it. */
+.content-page.page-fill { display: flex; flex-direction: column; }
+.content-page.page-fill > * { flex: none; }
+.content-page.page-fill > .panel { flex: 1 1 auto; }
+.plugin-screen { flex: 1 1 auto; min-height: 320px; }
 .form-row, .form-row-pair, .service-card { min-width: 0; }
 input, select, textarea { max-width: 100%; }
 @media (max-width: 1240px) { .sidebar .nav-badge { display: none; } }
@@ -40,7 +46,6 @@ input, select, textarea { max-width: 100%; }
   .btn, .btn-tiny, .icon-button { min-height: 44px; }
   .icon-button { min-width: 44px; }
   .top-actions { gap: 4px; }
-  .plugin-screen { min-height: 78dvh; }
 }
 @media (max-width: 480px) {
   .app-shell { grid-template-columns: 58px minmax(0, 1fr); }

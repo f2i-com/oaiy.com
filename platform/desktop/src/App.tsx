@@ -87,8 +87,6 @@ interface PluginNavEntry {
   badge?: string;
 }
 
-const WEB_APP_URL = 'https://oaiy.com/app.html';
-
 /** The sidebar, in groups: what you work in, what runs on this machine, what it connects to. */
 const NAV: { value: BuiltinView; label: string; icon: LucideIcon; group?: string }[] = [
   { value: 'agent', label: 'Agent', icon: Bot, group: 'Work' },
@@ -108,6 +106,8 @@ const NAV: { value: BuiltinView; label: string; icon: LucideIcon; group?: string
 /**
  * `crumb` is the short topbar name; `title` is the descriptive page heading.
  * Keeping them different avoids saying the same words twice on one screen.
+ * `kicker` is the sidebar group the page is in. Settings is in no group, and
+ * goes with This machine.
  */
 const PAGE: Record<BuiltinView, { crumb: string; kicker: string; title: string; copy: string }> = {
   agent: {
@@ -118,73 +118,73 @@ const PAGE: Record<BuiltinView, { crumb: string; kicker: string; title: string; 
   },
   flows: {
     crumb: 'Flows',
-    kicker: 'Automate',
+    kicker: 'Work',
     title: 'The flow editor',
     copy: 'Build flows, run them, and give the agent new tools.',
   },
   calendar: {
     crumb: 'Calendar',
-    kicker: 'Bookings',
+    kicker: 'Work',
     title: 'Calendar',
     copy: 'Appointments, the requests your calls and texts bring in, and the hours the phone offers.',
   },
   engines: {
     crumb: 'Engines',
-    kicker: 'On this machine',
+    kicker: 'This machine',
     title: 'Engines',
     copy: 'The language, picture, video, speech, music and 3D models this machine runs, and their endpoints.',
   },
   overview: {
     crumb: 'Overview',
-    kicker: 'Control centre',
+    kicker: 'This machine',
     title: 'Overview',
     copy: 'What this machine is running, and anything your flows need you to fix.',
   },
   services: {
     crumb: 'Services',
-    kicker: 'Connections',
+    kicker: 'This machine',
     title: 'Local AI services',
     copy: 'Start, stop and install the engines this machine exposes to OAIY.',
   },
   plugins: {
     crumb: 'Plugins',
-    kicker: 'Extensions',
+    kicker: 'Connect',
     title: 'Plugins',
     copy: 'Supervised extensions that add connectors and events to your flows.',
   },
   runs: {
     crumb: 'Runs',
-    kicker: 'Flow runtime',
-    title: 'Run history',
+    kicker: 'This machine',
+    title: 'Runs',
     copy: 'Every flow this machine has run, and the reason any of them failed.',
   },
   models: {
     crumb: 'Model files',
-    kicker: 'Storage',
-    title: 'Model library',
+    kicker: 'This machine',
+    title: 'Model files',
     copy: 'Download weights from Hugging Face and manage what is on disk.',
   },
   providers: {
     crumb: 'Providers',
-    kicker: 'AI gateway',
+    kicker: 'Connect',
     title: 'AI providers',
     copy: 'Cloud or local AI providers your flows can call — keys stay on this device.',
   },
   python: {
     crumb: 'Python',
-    kicker: 'Runtime',
+    kicker: 'This machine',
     title: 'Portable Python',
     copy: 'A bundled interpreter and reusable venvs — no system Python needed.',
   },
   connections: {
     crumb: 'Connections',
-    kicker: 'Access',
+    kicker: 'Connect',
     title: 'Connections',
     copy: 'Apps allowed to run flows and call plugins on this machine.',
   },
   settings: {
     crumb: 'Settings',
-    kicker: 'Local workspace',
+    kicker: 'This machine',
     title: 'Settings',
     copy: 'Your machine, your models, your orchestration.',
   },
@@ -335,7 +335,7 @@ export default function App() {
   const page = pluginView
     ? {
         crumb: activePluginNav?.label ?? 'Plugin',
-        kicker: 'Plugin',
+        kicker: 'Connect',
         title: activePluginNav?.label ?? 'Plugin screen',
         copy: `Provided by the ${pluginView[1]} plugin.`,
       }
@@ -508,8 +508,14 @@ export default function App() {
               so navigation feels instant instead of replaying a staggered reveal
               on every switch. */}
           {(view === 'agent' || view === 'flows' || view === 'engines') && <EmbeddedPage page={view} />}
-          <div hidden={view === 'agent' || view === 'flows' || view === 'engines'} className={visited.has(view) ? 'content-page revisit' : 'content-page'} key={view}>
-            <PairingPrompt listConnected={view === 'overview' || view === 'connections'} />
+          {/* `page-fill`: a plugin screen fills the page down to the dock and
+              scrolls on its own, so the page itself does not scroll as well. */}
+          <div
+            hidden={view === 'agent' || view === 'flows' || view === 'engines'}
+            className={`content-page${visited.has(view) ? ' revisit' : ''}${pluginView ? ' page-fill' : ''}`}
+            key={view}
+          >
+            <PairingPrompt />
             <div className="page-intro">
               <div>
                 <span className="kicker">{page.kicker}</span>
@@ -571,15 +577,10 @@ export default function App() {
           <em>
             <LockKeyhole size={12} /> Local only
           </em>
-          <a
-            href={WEB_APP_URL}
-            onClick={(e) => {
-              e.preventDefault();
-              openExternal(WEB_APP_URL);
-            }}
-          >
-            Open editor <ChevronRight size={13} />
-          </a>
+          {/* The flow editor is a page of this app now, not a website. */}
+          <button type="button" className="dock-link" onClick={() => setView('flows')}>
+            Open Flows <ChevronRight size={13} />
+          </button>
         </footer>
       </main>
     </div>

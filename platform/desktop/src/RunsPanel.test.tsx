@@ -164,6 +164,49 @@ describe('RunsPanel', () => {
     expect(text()).not.toContain('run_a1');
   });
 
+  it('offers no "Show all" when the reason fits in three lines', async () => {
+    await mount();
+    expect(host.querySelector('.run-error-text.clamped')!.textContent).toBe('Ollama is not running.');
+    expect(text()).not.toContain('Show all');
+  });
+
+  it('holds a long reason to three lines, with the rest a click away', async () => {
+    // jsdom has no layout, so stand in for it: the clamped text is taller
+    // inside than the three lines it shows.
+    const long = `Unknown node types: ${Array.from({ length: 60 }, (_, i) => `node_type_${i}`).join(', ')}.`;
+    runsMock.mockResolvedValue({
+      runs: [{ ...FAILED, error: { ...FAILED.error, message: long } }],
+      total: 12,
+      byStatus: { failed: 1, succeeded: 11 },
+    });
+    Object.defineProperty(HTMLElement.prototype, 'scrollHeight', {
+      configurable: true,
+      get(this: HTMLElement) { return this.classList.contains('run-error-text') ? 400 : 0; },
+    });
+    Object.defineProperty(HTMLElement.prototype, 'clientHeight', {
+      configurable: true,
+      get(this: HTMLElement) { return this.classList.contains('clamped') ? 57 : this.classList.contains('run-error-text') ? 400 : 0; },
+    });
+    try {
+      await mount();
+      const message = host.querySelector('.run-error-text')!;
+      expect(message.classList.contains('clamped')).toBe(true);
+      expect(message.getAttribute('title')).toBe(long);
+
+      await click(button('Show all'));
+      expect(message.classList.contains('clamped')).toBe(false);
+      expect(message.textContent).toBe(long);
+      expect(button('Show less').getAttribute('aria-expanded')).toBe('true');
+
+      await click(button('Show less'));
+      expect(message.classList.contains('clamped')).toBe(true);
+      expect(button('Show all').getAttribute('aria-expanded')).toBe('false');
+    } finally {
+      delete (HTMLElement.prototype as unknown as Record<string, unknown>).scrollHeight;
+      delete (HTMLElement.prototype as unknown as Record<string, unknown>).clientHeight;
+    }
+  });
+
   it('expands to the ids and node a support conversation needs', async () => {
     await mount();
     await click(button('Details'));

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
-import { Check, X, Link2, ShieldCheck, ChevronDown } from 'lucide-react';
-import { pairing, type PendingPairing, type PairedApp } from './api';
+import { Check, X, Link2 } from 'lucide-react';
+import { pairing, type PendingPairing } from './api';
 import { useToast } from './Toasts';
 
 /**
@@ -15,24 +15,25 @@ import { useToast } from './Toasts';
  * Rendered app-wide (in App.tsx) rather than on a settings page, because the
  * user must see a request wherever they are — a prompt buried in a tab they are
  * not on is a prompt that never gets answered.
+ *
+ * Only requests show here. The apps already connected are listed on the
+ * Connections page, with their own heading; listing them here as well put a
+ * second copy above that heading.
  */
 
 const POLL_MS = 3000;
 
-/** `listConnected`: also list the apps already connected (Overview, Connections); a request to connect shows everywhere. */
-export default function PairingPrompt({ listConnected = true }: { listConnected?: boolean }) {
+export default function PairingPrompt() {
   const toast = useToast();
   const [pending, setPending] = useState<PendingPairing[]>([]);
-  const [paired, setPaired] = useState<PairedApp[]>([]);
   const [busy, setBusy] = useState<Set<string>>(new Set());
 
   const refresh = useCallback(async () => {
-    // Both are privileged reads; a failure just means OAIY is starting or the
-    // webview lost trust momentarily — keep the last state, don't blank it.
+    // A privileged read; a failure just means OAIY is starting or the webview
+    // lost trust momentarily — keep the last state, don't blank it.
     try {
-      const [p, a] = await Promise.all([pairing.pending(), pairing.paired()]);
+      const p = await pairing.pending();
       setPending(p.pending ?? []);
-      setPaired(a.paired ?? []);
     } catch {
       /* transient — retry on the next tick */
     }
@@ -64,7 +65,7 @@ export default function PairingPrompt({ listConnected = true }: { listConnected?
     [refresh, toast],
   );
 
-  if (pending.length === 0 && (paired.length === 0 || !listConnected)) return null;
+  if (pending.length === 0) return null;
 
   return (
     <div className="pairing-wrap">
@@ -113,40 +114,6 @@ export default function PairingPrompt({ listConnected = true }: { listConnected?
           </div>
         </div>
       ))}
-
-      {listConnected && paired.length > 0 && (
-        <details className="pairing-card pairing-connected">
-          <summary className="pairing-summary">
-            <ShieldCheck size={15} aria-hidden />
-            <strong>Connected apps ({paired.length})</strong>
-            <span className="pairing-summary-hint">Manage connections</span>
-            <ChevronDown className="pairing-summary-chevron" size={16} aria-hidden />
-          </summary>
-          <ul className="pairing-list">
-            {paired.map((app) => (
-              <li key={app.id}>
-                <span className="pairing-app-info">
-                  {app.label ?? app.product} <span style={{ opacity: 0.55 }}>({app.product})</span>
-                  <code className="pairing-origin">{app.origin || 'Native app'}</code>
-                  {Number.isFinite(app.createdAtMs) && (
-                    <span className="pairing-approved-at">
-                      Approved <time dateTime={new Date(app.createdAtMs).toISOString()}>{new Date(app.createdAtMs).toLocaleString()}</time>
-                    </span>
-                  )}
-                </span>
-                <button
-                  className="btn-tiny"
-                  disabled={busy.has(app.id)}
-                  aria-label={`Revoke access for ${app.label ?? app.product}${app.origin ? ` at ${app.origin}` : ''}`}
-                  onClick={() => act(app.id, () => pairing.revoke(app.id), `Revoked ${app.product}`)}
-                >
-                  Revoke
-                </button>
-              </li>
-            ))}
-          </ul>
-        </details>
-      )}
     </div>
   );
 }
