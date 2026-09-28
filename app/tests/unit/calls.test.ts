@@ -445,29 +445,112 @@ describe('a phone call answered by the agent', () => {
     expect(fake.bodies).toHaveLength(2);
   });
 
-  it('a caller speaking while a tool works does not stop it: the result and their words reach the agent, and the answer is spoken', async () => {
+  it('a lookup answers later: the agent talks with the caller meanwhile, and gives the answer when it comes', async () => {
     let lookedUp!: () => void;
     const lookup = new Promise<void>((r) => (lookedUp = r));
     const fake = fakeProvider('openai', [
       { text: 'Let me check.', calls: [{ name: 'lookup_business_data', input: { question: 'Saturday hours' } }] },
       (body) => {
-        const said = JSON.stringify(body.messages);
-        expect(said).toContain('Open Saturday 8 to 2.');
-        expect(said).toContain('Also, do you mow on Sundays?');
-        return { text: "We're open Saturday from eight to two. We don't mow on Sundays." };
+        expect(JSON.stringify(body.messages)).toContain('The answer comes to you in a message of its own');
+        return { text: '' };
+      },
+      (body) => {
+        const sent = JSON.stringify(body.messages);
+        expect(sent).toContain('Also, do you mow on Sundays?');
+        expect(sent).not.toContain('Open Saturday 8 to 2.');
+        return { text: "We don't mow on Sundays. Still checking Saturday." };
+      },
+      (body) => {
+        expect(JSON.stringify(body.messages)).toContain('The answer to your lookup \\"Saturday hours\\":');
+        return { text: "We're open Saturday from eight to two." };
       },
     ]);
     const { sessions, calls } = setup(OPENAI, lookup);
     await sessions.callEvent({ type: 'call.started', callId: 'call_9', from: '+61400000009' });
     await sessions.callEvent({ type: 'call.caller', callId: 'call_9', text: 'What are your Saturday hours?' });
-    for (let i = 0; i < 100 && !calls.some((c) => c[0] === 'lookup_business_data'); i++) await new Promise((r) => setTimeout(r, 10));
-    // The caller speaks over the check: the words stop, the lookup goes on.
-    await sessions.callEvent({ type: 'call.interrupted', callId: 'call_9', itemId: 'out_1' });
+    await settled(sessions);
+    // The lookup still going, the caller asks something else: answered now.
     await sessions.callEvent({ type: 'call.caller', callId: 'call_9', text: 'Also, do you mow on Sundays?' });
+    await settled(sessions);
     lookedUp();
+    await new Promise((r) => setTimeout(r, 20));
+    await settled(sessions);
+    expect(fake.bodies).toHaveLength(4);
+    expect(calls.filter((c) => c[0] === 'say').map((c) => c[2])).toEqual(['Let me check.', "We don't mow on Sundays.", 'Still checking Saturday.', "We're open Saturday from eight to two."]);
+  });
+
+  it('an answer that comes while the caller speaks waits for their words, and goes with them', async () => {
+    let lookedUp!: () => void;
+    const lookup = new Promise<void>((r) => (lookedUp = r));
+    const fake = fakeProvider('openai', [
+      { text: '', calls: [{ name: 'lookup_business_data', input: { question: 'Saturday hours' } }] },
+      { text: 'Checking.' },
+      (body) => {
+        const sent = JSON.stringify(body.messages);
+        expect(sent).toMatch(/Caller \[0:12\]: Sorry, and Sunday\?\\n\[OAIY\] The answer to your lookup/);
+        return { text: 'Saturday eight to two, and no Sundays.' };
+      },
+    ]);
+    const { sessions } = setup(OPENAI, lookup);
+    await sessions.callEvent({ type: 'call.started', callId: 'call_w', from: '+61400000014' });
+    await sessions.callEvent({ type: 'call.caller', callId: 'call_w', text: 'Saturday hours?' });
+    await settled(sessions);
+    await sessions.callEvent({ type: 'call.speech_started', callId: 'call_w', atMs: 12_000, over: false });
+    lookedUp();
+    await new Promise((r) => setTimeout(r, 20));
     await settled(sessions);
     expect(fake.bodies).toHaveLength(2);
-    expect(calls.filter((c) => c[0] === 'say').map((c) => c[2])).toEqual(['Let me check.', "We're open Saturday from eight to two.", "We don't mow on Sundays."]);
+    await sessions.callEvent({ type: 'call.caller', callId: 'call_w', text: 'Sorry, and Sunday?', startMs: 12_000, endMs: 13_000, over: false, cut: false, backchannel: false });
+    await settled(sessions);
+    expect(fake.bodies).toHaveLength(3);
+  });
+
+  it('an "mm-hmm" over the agent does not start a reply: it goes with the caller\'s next words, with when each was said', async () => {
+    const fake = fakeProvider('openai', [
+      (body) => {
+        const sent = JSON.stringify(body.messages);
+        expect(sent).toContain('Caller [0:03, over you as you said \\"We mow on Tuesdays and Fridays.\\"]: Mm-hmm.');
+        expect(sent).toContain('Caller [0:06]: Friday then.');
+        return { text: 'Friday it is.' };
+      },
+    ]);
+    const { sessions } = setup();
+    await sessions.callEvent({ type: 'call.started', callId: 'call_m', from: '+61400000015' });
+    await sessions.callEvent({ type: 'call.said', callId: 'call_m', itemId: 'out_1', text: 'We mow on Tuesdays and Fridays.', startMs: 2_000, endMs: 4_500 });
+    await sessions.callEvent({ type: 'call.caller', callId: 'call_m', text: 'Mm-hmm.', startMs: 3_100, endMs: 3_400, over: true, cut: false, backchannel: true });
+    await settled(sessions);
+    expect(fake.bodies).toHaveLength(0);
+    await sessions.callEvent({ type: 'call.caller', callId: 'call_m', text: 'Friday then.', startMs: 6_000, endMs: 7_000, over: false, cut: false, backchannel: false });
+    await settled(sessions);
+    expect(fake.bodies).toHaveLength(1);
+  });
+
+  it('a reply cut off keeps only the sentences that had begun playing when the caller cut in', async () => {
+    let cut!: () => void;
+    const cutNow = new Promise<void>((r) => (cut = r));
+    const fake = fakeProvider('openai', [
+      { text: 'We are open from nine. We close at five. And on Sundays we rest.', hold: { at: 42, until: cutNow } },
+      (body) => {
+        const sent = JSON.stringify(body.messages);
+        expect(sent).toContain('We are open from nine.…');
+        expect(sent).not.toContain('We close at five.');
+        expect(sent).toContain('Caller [0:09, cutting in as you said \\"We are open from nine.\\"]: Wait, Saturday?');
+        return { text: 'Saturday too.' };
+      },
+    ]);
+    const { sessions, calls } = setup();
+    await sessions.callEvent({ type: 'call.started', callId: 'call_x', from: '+61400000016' });
+    await sessions.callEvent({ type: 'call.caller', callId: 'call_x', text: 'When are you open?' });
+    for (let i = 0; i < 100 && calls.filter((c) => c[0] === 'say').length < 2; i++) await new Promise((r) => setTimeout(r, 10));
+    // The first sentence has played from 0:08; the second was sent but had not begun when they cut in.
+    await sessions.callEvent({ type: 'call.said', callId: 'call_x', itemId: 'out_1', text: 'We are open from nine.', startMs: 8_000, endMs: 9_600 });
+    await sessions.callEvent({ type: 'call.said', callId: 'call_x', itemId: 'out_1', text: 'We close at five.', startMs: 9_600, endMs: 11_000 });
+    await sessions.callEvent({ type: 'call.interrupted', callId: 'call_x', itemId: 'out_1', atMs: 9_400 });
+    cut();
+    await settled(sessions);
+    await sessions.callEvent({ type: 'call.caller', callId: 'call_x', text: 'Wait, Saturday?', startMs: 9_000, endMs: 9_900, over: true, cut: true, backchannel: false });
+    await settled(sessions);
+    expect(fake.bodies).toHaveLength(2);
   });
 
   it('a tool that takes a while gets a short line said, once, when nothing has been said', async () => {

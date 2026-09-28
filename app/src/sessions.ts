@@ -35,6 +35,17 @@ export interface Session extends SessionInfo {
   inTool?: boolean;
   /** This call's agent was reminded that a booking it promised was not requested (once a call). */
   bookingNudged?: boolean;
+  /** This call's sentences as they played (ms from the call's start): what the caller heard, and when. */
+  played?: Array<{ text: string; startMs: number; endMs: number }>;
+  /** When the caller last cut this call's agent off (ms from the call's start). */
+  cutAtMs?: number;
+  /** Acknowledgements ("mm-hmm") said over the agent: it talked on, and reads them with the caller's next words. */
+  aside?: string[];
+  /** The caller is speaking now (their words are not in yet). */
+  callerSpeaking?: boolean;
+  speakingTimer?: ReturnType<typeof setTimeout>;
+  /** Answers that came in while the caller spoke: given to the agent with their words. */
+  held?: string[];
   /** A flow's tasks waiting for their answers, each by its prompt (one task a run; a message of the person's answers none). */
   answers?: Array<{ prompt: string; settle: (reply: string, error?: string) => void }>;
 }
@@ -288,10 +299,10 @@ export function spoken(text: string): string {
 export function callInstructions(brief: string, instructions: string): string {
   return [
     `This conversation is a live phone call, on the phone of the person you work for: who is calling, today's date and what you know about them are in the note that starts the call. Everything you write is spoken aloud to the caller as you write it, so write only what you would say: one or two short sentences, plain words, no markdown, lists, emoji, links or quotation marks. Start with what matters, not a filler word. Then stop, and let them answer.`,
-    'Their words arrive as "Caller: …", transcribed from speech (allow for a misheard word). A message "[OAIY] A note from the runner" is your person\'s direction, passed on by the main agent they talk to: go by it, without reading it out. Any other message without the "Caller:" label comes from the person you work for, who may be watching: do what they say.',
+    'Their words arrive as "Caller [0:42]: …", transcribed from speech (allow for a misheard word), with when they said them (minutes and seconds into the call). "over you" means they spoke while you were talking: a short "mm-hmm" or "yeah" does not stop you (you see it with their next words); more than that stops you, and you see what you were saying. If they have not finished (they stopped mid-sentence, or said "um, let me think"), write nothing at all: an empty reply keeps listening. A message "[OAIY] A note from the runner" is your person\'s direction, passed on by the main agent they talk to: go by it, without reading it out. Any other message without the "Caller:" label comes from the person you work for, who may be watching: do what they say.',
     'Your call tools: request_appointment (a booking request for staff to confirm; never say it is booked or confirmed), lookup_business_data (a question about the business\'s records or calendar), end_call (a short goodbye, then the call ends; use it when the caller is done). Your other tools work too.',
     REFERENCE,
-    'To look something up (a tool, a file), do it in the same reply as a few words: say "Let me check." and make the call at once, then answer from what it returned. Never say you will check without doing it: the caller hears you and waits. If the caller speaks while you check, their words reach you with the result: answer both.',
+    'To look something up, do it in the same reply as a few words: say "Let me check." and make the call at once. Never say you will check without doing it: the caller hears you and waits. lookup_business_data answers later, in a message of its own ("[OAIY] The answer to your lookup …"): keep the conversation going meanwhile (answer anything else they say, without guessing the answer), and tell them the answer when it comes. Other tools (a file, remember) answer at once.',
     'Say only what you know: from these instructions, the brief, or what a tool returned. Never make up availability, times, prices or bookings, and never say a time is free or agree to one unless a tool said it is. If you cannot check, say so, and offer to take their preferred time as a request for staff to confirm.',
     'To take a booking request: once you have the service, the day and time they want and their name, call request_appointment in that same reply, and only then tell them it is requested. Saying you have noted it without calling request_appointment records nothing.',
     'Never repeat something you have already said on this call. When the caller says goodbye or is done, call end_call with a short goodbye, and write nothing else.',
@@ -314,7 +325,7 @@ export function promisesBooking(text: string): boolean {
 
 /** Whether the caller has said when they want to come: a day, a date or a time. */
 export function namesATime(turns: Turn[]): boolean {
-  return turns.some((t) => t.role === 'user' && t.text.startsWith('Caller:') && /\b(mon|tues|wednes|thurs|fri|satur|sun)day\b|\b(tomorrow|today|tonight|morning|afternoon|evening|noon|midday|next week)\b|\b\d{1,2}(:\d\d)?\s*(a\.?m\.?|p\.?m\.?)|\bo'?clock\b|\b\d{1,2}(st|nd|rd|th)\b/i.test(t.text));
+  return turns.some((t) => t.role === 'user' && /(^|\n)Caller\b/.test(t.text) && /\b(mon|tues|wednes|thurs|fri|satur|sun)day\b|\b(tomorrow|today|tonight|morning|afternoon|evening|noon|midday|next week)\b|\b\d{1,2}(:\d\d)?\s*(a\.?m\.?|p\.?m\.?)|\bo'?clock\b|\b\d{1,2}(st|nd|rd|th)\b/i.test(t.text));
 }
 
 /** What a call's agent is told when it promised a booking without requesting it. */
@@ -323,6 +334,29 @@ const BOOKING_NUDGE = "[OAIY] You told the caller their booking is requested, bu
 /** How long a tool may run on a call before a short line is said, and the line. */
 const HOLD_AFTER_MS = 2_000;
 const HOLD_LINE = 'One moment, let me check.';
+
+/** What the call's agent is told when it asks the business's records: the answer comes later. */
+export const LOOKUP_ASKED =
+  'Asked. The answer comes to you in a message of its own, usually within a few seconds. Until then keep the conversation going: tell the caller you are checking, or answer anything else they ask, and do not guess the answer.';
+
+/** A time on a call, from its start ("0:42", "12:05"). */
+export function callClock(ms: number): string {
+  const s = Math.max(0, Math.round(ms / 1000));
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+}
+
+/**
+ * A caller's words as the call's agent reads them: when they said them, and
+ * how that fell against its own speech (what it was saying when they spoke
+ * over it, or cut in).
+ */
+export function callerLine(text: string, when: { startMs?: unknown; over?: unknown; cut?: unknown }, youSaid = ''): string {
+  const at = typeof when.startMs === 'number' ? callClock(when.startMs) : '';
+  const said = youSaid ? ` as you said "${youSaid.length > 90 ? `${youSaid.slice(0, 90)}…` : youSaid}"` : '';
+  const how = when.cut === true ? `cutting in${said}` : when.over === true ? `over you${said}` : '';
+  const label = [at, how].filter(Boolean).join(', ');
+  return `Caller${label ? ` [${label}]` : ''}: ${text}`;
+}
 
 /** What the call's agent is told when the business's records cannot be checked. */
 export const LOOKUP_UNAVAILABLE =
@@ -662,6 +696,19 @@ export class Sessions {
     return 'Passed on: it reads it before its next reply.';
   }
 
+  /** An answer for a call's agent (a lookup's): at once, or with the caller's words when they are speaking. */
+  private answered(session: Session, callId: string, text: string): void {
+    if (session.callId !== callId) return;
+    if (session.callerSpeaking) (session.held ??= []).push(text);
+    else this.deliver(session, text, true);
+  }
+
+  /** What this call's agent was saying at `ms` (from the call's start), as it played. */
+  private sayingAt(session: Session, ms: unknown): string {
+    if (typeof ms !== 'number') return '';
+    return session.played?.find((p) => p.startMs <= ms && ms <= p.endMs + 300)?.text ?? '';
+  }
+
   /** A call's own tools: through the desktop to Aokie. */
   private callTools(session: Session): SessionTool[] {
     const live = () => {
@@ -712,12 +759,16 @@ export class Sessions {
           description: 'Ask the business\'s records a question (an existing appointment, availability, a customer\'s details): answered by the business lookup flow.',
           parameters: { type: 'object', required: ['question'], properties: { question: { type: 'string' } } },
         },
+        // It answers later, in a message of its own: the agent talks with the caller meanwhile.
         run: async (input) => {
           const { desktop, callId } = live();
-          const r = await desktop.callTool(callId, 'lookup_business_data', { question: String(input.question ?? '') });
-          // No records to ask (no business-lookup flow on the desktop, or it failed): say so plainly, so nothing is made up.
-          if (JSON.stringify(r.output ?? '').includes('LOOKUP UNAVAILABLE')) return LOOKUP_UNAVAILABLE;
-          return outcome(r);
+          const question = String(input.question ?? '');
+          void desktop
+            .callTool(callId, 'lookup_business_data', { question })
+            // No records to ask (no business-lookup flow on the desktop, or it failed): say so plainly, so nothing is made up.
+            .then((r) => (JSON.stringify(r.output ?? '').includes('LOOKUP UNAVAILABLE') ? LOOKUP_UNAVAILABLE : outcome(r)), (e: unknown) => `The lookup failed (${(e as Error).message}). ${LOOKUP_UNAVAILABLE}`)
+            .then((answer) => this.answered(session, callId, `[OAIY] The answer to your lookup "${question}":\n${answer}`));
+          return LOOKUP_ASKED;
         },
       },
     ];
@@ -746,7 +797,14 @@ export class Sessions {
       // stay, for the chat and for earlier_conversations; what is known about the caller is in its instructions.
       const fresh = type === 'call.started' && !session.running;
       if (fresh) session.agent.turns = keptTurns(session.agent.turns);
-      if (type === 'call.started') session.bookingNudged = false;
+      if (type === 'call.started') {
+        session.bookingNudged = false;
+        session.played = [];
+        session.aside = [];
+        session.held = [];
+        session.cutAtMs = undefined;
+        session.callerSpeaking = false;
+      }
       const who = `${session.title}${session.title !== session.key ? ` (${session.key})` : ''}`;
       const note = callStartNote(who, typeof event.greeting === 'string' ? event.greeting : '', knownText(this.callerNote(session.key)));
       session.agent.turns.push({ role: 'user', text: note, automatic: true, ...(fresh ? { fresh: true } : {}) });
@@ -759,19 +817,44 @@ export class Sessions {
     }
     if (!session) return null;
     switch (type) {
+      case 'call.speech_started':
+        // The caller is speaking: an answer that comes now waits for their words (or a few seconds, if it was a noise).
+        session.callerSpeaking = true;
+        clearTimeout(session.speakingTimer);
+        session.speakingTimer = setTimeout(() => this.heardAll(session!), 6_000);
+        break;
+      case 'call.said':
+        if (typeof event.text === 'string' && typeof event.startMs === 'number' && typeof event.endMs === 'number') {
+          (session.played ??= []).push({ text: event.text, startMs: event.startMs, endMs: event.endMs });
+          if (session.played.length > 400) session.played.splice(0, 100);
+        }
+        break;
       case 'call.caller': {
-        const text = `Caller: ${String(event.text ?? '').trim()}`;
+        const words = String(event.text ?? '').trim();
+        if (!words) break;
+        const line = callerLine(words, event, event.over === true || event.cut === true ? this.sayingAt(session, event.startMs) : '');
         session.lastAt = Date.now();
-        this.hooks.arrived?.(session, text);
-        this.deliver(session, text, true);
+        this.hooks.arrived?.(session, line);
+        clearTimeout(session.speakingTimer);
+        session.callerSpeaking = false;
+        // "Mm-hmm" over the agent: it talks on, and reads it with the caller's next words.
+        if (event.backchannel === true) {
+          (session.aside ??= []).push(line);
+          this.heardAll(session);
+          break;
+        }
+        this.deliver(session, [...(session.aside ?? []).splice(0), line, ...(session.held ?? []).splice(0)].join('\n'), true);
         break;
       }
       case 'call.interrupted':
         // The words stop. A tool at work goes on: what the caller says reaches the agent with its result.
+        if (typeof event.atMs === 'number') session.cutAtMs = event.atMs;
         session.speech?.hush();
         if (!session.inTool) session.controller?.abort();
         break;
       case 'call.ended':
+        clearTimeout(session.speakingTimer);
+        session.callerSpeaking = false;
         session.speech?.hush();
         this.stop(session);
         session.callId = undefined;
@@ -781,6 +864,14 @@ export class Sessions {
         break;
     }
     return session;
+  }
+
+  /** The caller is not speaking (their words came, or it was a noise): answers held for them go to the agent. */
+  private heardAll(session: Session): void {
+    clearTimeout(session.speakingTimer);
+    session.callerSpeaking = false;
+    const held = (session.held ?? []).splice(0);
+    if (held.length && session.callId) this.deliver(session, held.join('\n'), true);
   }
 
   /** send_text_message: through the desktop to Aokie's sms.send (a test conversation's replies are only shown). */
@@ -983,7 +1074,10 @@ export class Sessions {
       }, controller.signal);
       session.speech?.flush();
       // Cut off (the caller spoke over it): what they heard of the reply is kept, so the agent knows it was said.
-      const heard = session.speech?.reply.join(' ') ?? '';
+      const cutAt = session.cutAtMs;
+      const playedBy = (line: string) => cutAt === undefined || !session.played?.length || session.played.some((p) => p.text === line && p.startMs < cutAt);
+      const heard = (session.speech?.reply ?? []).filter(playedBy).join(' ');
+      session.cutAtMs = undefined;
       if (controller.signal.aborted && heard && session.agent.turns.at(-1)?.role !== 'assistant') session.agent.turns.push({ role: 'assistant', text: `${heard}…`, calls: [] });
       if (session.speech) tidyReplies(session.agent.view());
     } catch (error) {
