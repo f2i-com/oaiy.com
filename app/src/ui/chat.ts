@@ -92,6 +92,8 @@ export class ChatPane {
   private readonly meter = h('span.context-meter', { title: 'How much of the model\'s context the conversation uses. Older turns are summarized before it fills up.' }, h('span.context-bar', this.meterFill), this.meterText);
   /** The agent's checklist for the current request, pinned above the log. */
   private readonly planBox = h('section.plan', { 'aria-live': 'polite' });
+  /** The project's conversations: its own chat, and one per person who texts the phone. */
+  private readonly sessionTabs = h('nav.session-tabs', { 'aria-label': 'Conversations', hidden: true });
   /** The person's choice to show or hide the steps; null follows the run (hidden once finished). */
   private planOpen: boolean | null = null;
   /** Every step shown, not only the one in progress and the next few (the finished ones fold into one line). */
@@ -128,7 +130,7 @@ export class ChatPane {
       this.toCurrent.hidden = this.log.scrollTop < 300;
       this.maybeLoadOlder();
     }, { passive: true });
-    this.element.append(h('div.pane-title', 'Agent', this.meter), this.planBox, h('div.chat-log-wrap', this.log, this.toCurrent), this.status, this.pending, h('div.chat-compose', this.attachButton, this.input, this.send), this.picker);
+    this.element.append(h('div.pane-title', 'Agent', this.meter), this.sessionTabs, this.planBox, h('div.chat-log-wrap', this.log, this.toCurrent), this.status, this.pending, h('div.chat-compose', this.attachButton, this.input, this.send), this.picker);
     this.attachButton.addEventListener('click', () => this.picker.click());
     this.picker.addEventListener('change', () => {
       if (this.picker.files) this.addFiles([...this.picker.files]);
@@ -272,6 +274,24 @@ export class ChatPane {
   private sink: HTMLElement | null = null;
   private add(entry: HTMLElement): void {
     (this.sink ?? this.log).prepend(entry);
+  }
+
+  /**
+   * The conversations to switch between: the project's chat (id null) and the
+   * text-message threads, each with its unread count and whether it is working.
+   * Hidden while the project has only its own chat.
+   */
+  setSessions(tabs: Array<{ id: string | null; label: string; title?: string; unread: number; working: boolean }>, active: string | null, select: (id: string | null) => void): void {
+    clear(this.sessionTabs);
+    this.sessionTabs.hidden = tabs.length < 2;
+    for (const tab of tabs) {
+      this.sessionTabs.append(h(
+        'button.session-tab',
+        { class: `${tab.id === active ? 'active' : ''} ${tab.working ? 'working' : ''}`, title: tab.title ?? tab.label, 'aria-current': tab.id === active ? 'true' : 'false', onclick: () => select(tab.id) },
+        h('span.session-label', tab.label),
+        ...(tab.unread ? [h('span.session-unread', { 'aria-label': `${tab.unread} unread` }, String(tab.unread))] : []),
+      ));
+    }
   }
 
   /** How full the context is: `used` tokens of `window`. */

@@ -86,6 +86,26 @@ export interface AgentSettings {
 
 export const DEFAULT_AGENT_SETTINGS: AgentSettings = { compactAt: 0.75, subAgentTokens: 32_000 };
 
+/** OAIY Desktop on this computer, once paired: where it is and the token it gave. */
+export interface DesktopSettings {
+  origin: string;
+  token: string;
+}
+
+/** How the agent answers the phone's text messages (through Aokie). */
+export interface MessageSettings {
+  /** Answer text messages as they arrive (off: they are only shown). */
+  answer: boolean;
+  /** The person's instructions for answering them. */
+  instructions: string;
+}
+
+export const DEFAULT_MESSAGE_SETTINGS: MessageSettings = {
+  // Off until the person turns it on: every text to their phone would be answered.
+  answer: false,
+  instructions: 'Reply politely and briefly, as my assistant. If you cannot help, say I will get back to them.',
+};
+
 export interface Settings {
   providers: ProviderConfig[];
   activeProviderId: string | null;
@@ -96,6 +116,9 @@ export interface Settings {
   agent: AgentSettings;
   /** The image and video service (OAIY, or any OpenAI-spec one). */
   media: MediaSettings;
+  /** OAIY Desktop, when this page is paired with it. */
+  desktop: DesktopSettings | null;
+  messages: MessageSettings;
 }
 
 export async function loadSettings(): Promise<Settings> {
@@ -115,7 +138,23 @@ export async function loadSettings(): Promise<Settings> {
       const { apiKeySealed, ...rest } = stored;
       return { ...EMPTY_MEDIA, ...rest, apiKey: await open(apiKeySealed) };
     })(),
+    desktop: await (async () => {
+      const stored = await get<{ origin: string; tokenSealed: Sealed | null }>('desktop');
+      if (!stored) return null;
+      const token = await open(stored.tokenSealed);
+      return token ? { origin: stored.origin, token } : null;
+    })(),
+    messages: { ...DEFAULT_MESSAGE_SETTINGS, ...((await get<Partial<MessageSettings>>('messages')) ?? {}) },
   };
+}
+
+/** The paired desktop (its token sealed like an API key), or null to forget it. */
+export async function saveDesktop(desktop: DesktopSettings | null): Promise<void> {
+  await put('desktop', desktop ? { origin: desktop.origin, tokenSealed: await seal(desktop.token) } : null);
+}
+
+export async function saveMessages(messages: MessageSettings): Promise<void> {
+  await put('messages', messages);
 }
 
 export async function saveProviders(providers: ProviderConfig[], activeId: string | null): Promise<void> {

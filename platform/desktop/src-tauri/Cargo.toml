@@ -41,7 +41,8 @@ tauri-build = { version = "2.0", features = [], optional = true }
 
 [dependencies]
 # Tauri 2.x with tray-icon support — GUI only, so optional behind `gui`.
-tauri = { version = "2.1", features = ["tray-icon"], optional = true }
+# `unstable`: a window with several webviews (the agent and the flow editor beside the dashboard).
+tauri = { version = "2.1", features = ["tray-icon", "unstable"], optional = true }
 tauri-plugin-shell = { version = "2.0", optional = true }
 # Native folder picker for "choose where models/services live".
 tauri-plugin-dialog = { version = "2.0", optional = true }
@@ -88,6 +89,7 @@ uuid = { version = "1", features = ["v4"] }
 # URL parsing for the HuggingFace `huggingface.co/<repo>/blob/...`
 # → `/resolve/...` rewrite so users can paste either flavour.
 url = "2"
+percent-encoding = "2"
 
 # Cross-platform free-disk-space query, for the pre-download space check
 # (refuse a 40 GB model before filling the drive) + the "X free" readout

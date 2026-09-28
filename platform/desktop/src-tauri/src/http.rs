@@ -672,9 +672,21 @@ fn is_loopback_origin(origin: &str) -> bool {
     host == "localhost" || host == "127.0.0.1"
 }
 
+/// Whether `origin` is one of the pages OAIY shows in its own window (the
+/// agent, `oaiy`; the flow editor, `oaiyflows`), served from its own schemes.
+pub fn is_embedded_origin(origin: &str) -> bool {
+    ["oaiy", "oaiyflows"].iter().any(|s| {
+        origin == format!("{s}://localhost") || origin == format!("http://{s}.localhost") || origin == format!("https://{s}.localhost")
+    })
+}
+
 fn is_allowed_origin(origin: &str) -> bool {
     // Dev + locally-served oaiy-web (any loopback port).
     if is_loopback_origin(origin) {
+        return true;
+    }
+    // OAIY's own pages in its window: the agent and the flow editor.
+    if is_embedded_origin(origin) {
         return true;
     }
     // The provider this desktop is LINKED to. Linking is the user approving
@@ -873,6 +885,7 @@ fn is_allowed_origin_privileged(origin: &str) -> bool {
     if origin == "tauri://localhost"
         || origin == "http://tauri.localhost"
         || origin == "https://tauri.localhost"
+        || is_embedded_origin(origin)
     {
         return true;
     }

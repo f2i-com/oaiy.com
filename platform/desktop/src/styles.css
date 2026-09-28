@@ -1647,3 +1647,7 @@ select:disabled { cursor: not-allowed; opacity: 0.5; }
 .setup-wizard-choice { margin-top: 16px; }
 .setup-wizard .service-section { margin-top: 20px; }
 @media (max-width: 480px) { .setup-wizard { padding: 14px; } .setup-wizard .form-actions { flex-wrap: wrap; } .setup-wizard-nav button { flex: 1 1 auto; min-height: 40px; } }
+
+/* The agent and the flow editor: webviews of their own, laid over this box by the app. */
+.embedded-page { height: 100%; min-height: 0; position: relative; background: var(--canvas); }
+.embedded-problem { margin: 24px; color: var(--muted, #8b93a3); }

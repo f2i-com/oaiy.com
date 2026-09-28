@@ -36,6 +36,7 @@
 
 pub mod conditions;
 pub mod deadletters;
+pub mod leases;
 pub mod ledger;
 pub mod pairing;
 pub mod routes;

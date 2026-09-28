@@ -2559,6 +2559,7 @@ dependencies = [
  "futures-util",
  "getrandom 0.2.17",
  "log",
+ "percent-encoding",
  "qrcode",
  "reqwest 0.12.28",
  "serde",

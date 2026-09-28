@@ -24,6 +24,9 @@ export default defineConfig({
   server: {
     port: 17973,
     strictPort: true,
+    // The Rust build lives under src-tauri: watching it crashes Vite on Windows
+    // (EBUSY on a build script cargo holds open), and nothing there is UI.
+    watch: { ignored: ['**/src-tauri/**'] },
   },
   build: {
     outDir: 'dist',

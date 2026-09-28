@@ -1,9 +1,9 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "OAIY Desktop",
+  "productName": "OAIY",
   "mainBinaryName": "oaiy-desktop",
   "version": "0.1.0",
-  "identifier": "com.oaiy",
+  "identifier": "com.oaiy.app",
   "build": {
     "beforeDevCommand": "npm run dev",
     "beforeBuildCommand": "npm run build",
@@ -13,14 +13,15 @@
   "app": {
     "windows": [
       {
-        "title": "OAIY Desktop",
+        "title": "OAIY",
         "width": 1280,
         "height": 820,
         "minWidth": 760,
         "minHeight": 560,
         "resizable": true,
         "fullscreen": false,
-        "visible": false
+        "visible": false,
+        "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --disable-background-timer-throttling --disable-renderer-backgrounding --disable-backgrounding-occluded-windows"
       }
     ],
     "security": {

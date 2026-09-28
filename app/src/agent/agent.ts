@@ -317,6 +317,17 @@ export interface AgentOptions {
    * ends as soon as `done` says it has done its job.
    */
   finish?: { tool: string; after: number; say: string; done: () => boolean };
+  /** Added to the system prompt: what this conversation is for (a text-message thread: who it is with, and the person's instructions). */
+  instructions?: string | (() => string);
+  /** Tools of this conversation only (a text-message thread's reply), each with what it does. */
+  sessionTools?: SessionTool[];
+}
+
+/** A tool one conversation has (not every agent): its spec, and what running it does. */
+export interface SessionTool {
+  spec: ToolSpec;
+  /** The result for the model; a thrown error is reported as one. */
+  run: (input: Record<string, unknown>, signal?: AbortSignal) => Promise<string>;
 }
 
 function turnChars(t: Turn, charsPerToken = DEFAULT_CHARS_PER_TOKEN): number {
@@ -614,6 +625,22 @@ export class Agent {
     return { id: call.id, name: call.name, content: lines.join('\n\n'), isError: false };
   }
 
+  /** This conversation's own instructions, as they are now. */
+  private get instructions(): string {
+    const i = this.options.instructions;
+    return (typeof i === 'function' ? i() : i) ?? '';
+  }
+
+  /** A tool of this conversation only: its answer, or the error it threw. */
+  private async runSessionTool(call: ToolCall, signal?: AbortSignal): Promise<ToolResult> {
+    const tool = this.options.sessionTools!.find((t) => t.spec.name === call.name)!;
+    try {
+      return { id: call.id, name: call.name, content: await tool.run(call.input, signal), isError: false };
+    } catch (error) {
+      return { id: call.id, name: call.name, content: `Error: ${(error as Error).message}`, isError: true };
+    }
+  }
+
   /** The open plan from an earlier request, for a new one: it may be about that work, or not. */
   private carryOver(): string | null {
     if (!this.plan || !this.canPlan) return null;
@@ -723,7 +750,7 @@ export class Agent {
     const models = all.some((t) => t.name === 'generate_3d_model') || findModels(this.options.vfs).length > 0;
     const tools = all.filter((t) => (apps || !SOFTN_TOOLS.has(t.name)) && (web || !WEB_TOOLS.has(t.name)) && (apps || web || models || !PREVIEW_TOOLS.has(t.name)));
     const topics = guideTopics(new Set(all.map((t) => t.name)));
-    return [...tools, {
+    return [...tools, ...(this.options.sessionTools ?? []).map((t) => t.spec), {
       name: 'guide',
       description: `Read the guide for a kind of work before you start it; it stays in your instructions from then on. The guides: ${topics.map((t) => `"${t}" for ${GUIDE_ABOUT[t]}`).join('; ')}.`,
       parameters: { type: 'object', required: ['topic'], properties: { topic: { type: 'string', enum: topics } } },
@@ -813,7 +840,9 @@ export class Agent {
     // A video follows the request: it stays in view, word for word, however long the work (as a reference, not a step to take).
     const request = read.includes('video') && !this.options.role ? this.requestText() : '';
     const asked = request ? `\n\nThe user's request being worked on, word for word, for reference (the script and everything made follow it; the guide's rules only fill in what it leaves open):\n"""\n${request.length > 4000 ? `${request.slice(0, 4000)} […]` : request}\n"""` : '';
-    return `${BASE_PROMPT}${this.canPlan ? PLAN_GUIDE : ''}${guides}${asked}${this.options.role ?? ''}`;
+    return `${BASE_PROMPT}${this.canPlan ? PLAN_GUIDE : ''}${guides}${asked}${this.options.role ?? ''}${this.instructions ? `
+
+${this.instructions}` : ''}`;
   }
 
   /** The prompt's fixed part: the system prompt and the tool definitions. */
@@ -1757,6 +1786,8 @@ export class Agent {
               ? { id: call.id, name: call.name, content: scriptCheck, isError: false }
               : call.name === 'update_plan'
               ? this.takePlan(call, emit)
+              : this.options.sessionTools?.some((t) => t.spec.name === call.name)
+              ? await this.runSessionTool(call, signal)
               : call.name === 'delegate'
               ? await this.delegate(call, emit, signal)
               : call.name === 'review_frame'

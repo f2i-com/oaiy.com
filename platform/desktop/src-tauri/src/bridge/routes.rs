@@ -1623,6 +1623,7 @@ async fn revoke_pairing(State(st): State<BridgeState>, Path(id): Path<String>) -
 pub fn router(state: BridgeState) -> Router {
     Router::new()
         .route("/api/bridge/capabilities", get(capabilities))
+        .route("/api/bridge/leases/:name", post(super::leases::take_lease))
         .route("/api/bridge/status", get(runtime_status))
         .route(
             "/api/bridge/runs",

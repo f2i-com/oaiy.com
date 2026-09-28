@@ -61,6 +61,28 @@ async function writeBytes(dir: FileSystemDirectoryHandle, name: string, data: Ui
   await writable.close();
 }
 
+/**
+ * A conversation of a project besides its own chat: a text-message thread with
+ * one person (`key` their number), or a call. Its turns are kept beside it.
+ */
+export interface SessionInfo {
+  id: string;
+  kind: 'sms' | 'call';
+  /** Who it is with: a phone number. */
+  key: string;
+  /** Their name, when the phone knows it; else the number. */
+  title: string;
+  /** When it last heard or said something (ms). */
+  lastAt: number;
+  /** Messages the person has not looked at yet. */
+  unread: number;
+}
+
+/** A session id as a file name. */
+function safeName(id: string): string {
+  return id.replace(/[^\w.-]+/g, '_');
+}
+
 export function newId(): string {
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 }
@@ -237,6 +259,25 @@ export class OpenProject {
   /** The conversation, kept with the project (an incognito one's is deleted with it). */
   async saveChat(turns: Turn[]): Promise<void> {
     await writeBytes(this.dir, 'chat.json', JSON.stringify(turns));
+  }
+
+  /** The project's other conversations (a text-message thread, a call): what each is, newest first. */
+  async loadSessions(): Promise<SessionInfo[]> {
+    const dir = await dirAt(this.dir, 'sessions', false).catch(() => null);
+    return (dir && (await readJson<SessionInfo[]>(dir, 'index.json'))) ?? [];
+  }
+
+  async saveSessions(list: SessionInfo[]): Promise<void> {
+    await writeBytes(await dirAt(this.dir, 'sessions', true), 'index.json', JSON.stringify(list));
+  }
+
+  async loadSessionChat(id: string): Promise<Turn[]> {
+    const dir = await dirAt(this.dir, 'sessions', false).catch(() => null);
+    return (dir && (await readJson<Turn[]>(dir, `${safeName(id)}.json`))) ?? [];
+  }
+
+  async saveSessionChat(id: string, turns: Turn[]): Promise<void> {
+    await writeBytes(await dirAt(this.dir, 'sessions', true), `${safeName(id)}.json`, JSON.stringify(turns));
   }
 
   async close(): Promise<void> {

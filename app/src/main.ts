@@ -1,11 +1,14 @@
 import './styles.css';
-import { Agent } from './agent/agent';
+import { Agent, type AgentOptions } from './agent/agent';
 import { planAfter } from './agent/tools';
 import type { ProviderConfig } from './agent/providers/types';
 import { HELP, internetCommand } from './commands';
 import { NetGate } from './gate/netgate';
 import { sandboxAvailable, zippModule } from './sandbox/runner';
-import { loadSettings, saveAgentSettings, saveGate, saveLastKeptProject, saveLastProject, saveMedia, saveProviders } from './settings';
+import { loadSettings, saveAgentSettings, saveDesktop, saveGate, saveLastKeptProject, saveLastProject, saveMedia, saveMessages, saveProviders } from './settings';
+import { Desktop } from './desktop/bridge';
+import { DesktopEvents, Sessions, TEST_NUMBER } from './sessions';
+import { editPhone } from './ui/phone';
 import { OAIY_ORIGIN, discoverOaiy, mediaAbilities, mergeDiscovered } from './agent/media';
 import { budgetFor, contextWindow, detectContextWindow, formatTokens } from './agent/context';
 import { ChatPane } from './ui/chat';
@@ -58,7 +61,15 @@ A coding agent that lives entirely in this browser tab.
  * not start on that visit, so nothing half-done is left behind.
  */
 /** The desktop app (Tauri): it serves the page with the headers itself, and ships its files, so no service worker. */
-const DESKTOP = location.hostname === 'botcomputer.localhost' || location.protocol === 'botcomputer:' || '__TAURI_INTERNALS__' in window;
+/** The desktop OAIY's window gives its pages: where it is, and a token for it. */
+function embeddedDesktop(): { origin: string; token: string } | null {
+  const given = (window as unknown as { __OAIY_DESKTOP__?: { origin?: unknown; token?: unknown } }).__OAIY_DESKTOP__;
+  return given && typeof given.origin === 'string' && typeof given.token === 'string' && given.token ? { origin: given.origin, token: given.token } : null;
+}
+
+/** OAIY's own window, where the app is a page beside the sidebar (it knows the desktop from its first line). */
+const IN_OAIY = location.hostname === 'oaiy.localhost' || location.protocol === 'oaiy:' || !!embeddedDesktop();
+const DESKTOP = IN_OAIY || location.hostname === 'botcomputer.localhost' || location.protocol === 'botcomputer:' || '__TAURI_INTERNALS__' in window;
 
 async function registerServiceWorker(): Promise<boolean> {
   if (!('serviceWorker' in navigator) || import.meta.env.DEV || DESKTOP) return false;
@@ -99,7 +110,7 @@ function summarizeProject(meta: ProjectMeta, vfs: Vfs, gate: NetGate): string {
 async function main(): Promise<void> {
   const app = document.getElementById('app')!;
   if (!crossOriginIsolated && (await registerServiceWorker())) {
-    app.textContent = 'Setting up bot.computer for offline use…';
+    app.textContent = 'Setting up OAIY for offline use…';
     return;
   }
   if (crossOriginIsolated) void registerServiceWorker();
@@ -116,10 +127,22 @@ async function main(): Promise<void> {
   let agent!: Agent;
   let controller: AbortController | null = null;
   let unsubscribe: (() => void) | null = null;
+  // OAIY Desktop (the phone, through Aokie), and the project's text-message conversations.
+  // In OAIY's own window the desktop is given; a page elsewhere pairs with it.
+  const given = embeddedDesktop();
+  let desktop: Desktop | null = given ? new Desktop(given.origin, given.token) : settings.desktop ? new Desktop(settings.desktop.origin, settings.desktop.token) : null;
+  let messages = settings.messages;
+  let sessions: Sessions | null = null;
+  // Several OAIY pages may follow the same phone: the one holding this lease answers its texts.
+  const pageId = crypto.randomUUID();
+  let holdsTexts = false;
+  let textHolder = '';
+  /** The conversation the chat shows: null for the project's own. */
+  let viewing: string | null = null;
 
   const chat = new ChatPane({
-    submit: (text, files) => void submit(text, files),
-    stop: () => controller?.abort(),
+    submit: (text, files) => (viewing ? sessionSubmit(text, files) : void submit(text, files)),
+    stop: () => (viewing ? stopViewed() : controller?.abort()),
     file: (path) => {
       try {
         return project.vfs.readBytes(`/${path}`);
@@ -193,6 +216,7 @@ async function main(): Promise<void> {
     },
   });
   const providerChip = h('button.chip', { title: 'AI provider', onclick: () => void editSettings() });
+  const phoneChip = h('button.chip.toggle.phone', { title: 'Phone: OAIY Desktop, Aokie and text messages', onclick: () => void openPhone() });
   const renderChips = () => {
     gateChip.textContent = `internet: ${gate.mode === 'open' ? 'on' : gate.mode === 'blocked' ? 'off' : 'allowlist'}`;
     gateChip.dataset.mode = gate.mode;
@@ -282,7 +306,7 @@ async function main(): Promise<void> {
     }
     project = await OpenProject.open(meta);
     project.onError = notice;
-    agent = new Agent({
+    const agentOptions = (): AgentOptions => ({
       vfs: project.vfs,
       gate,
       provider: activeProvider,
@@ -302,9 +326,27 @@ async function main(): Promise<void> {
         void saveProviders(providers, activeId);
       },
     });
+    agent = new Agent(agentOptions());
     agent.turns = await project.loadChat();
     // The plan goes on where the saved conversation left it.
     agent.plan = planAfter(agent.turns);
+    // The project's text-message conversations, each with an agent of its own.
+    sessions?.stopAll();
+    viewing = null;
+    const opened = project;
+    const own = (sessions = new Sessions(project, (extra) => new Agent({ ...agentOptions(), ...extra }), () => ({ ...messages, answer: messages.answer && holdsTexts }), () => desktop, {
+      changed: () => {
+        if (project === opened) renderSessions();
+      },
+      arrived: (session, text) => {
+        if (project === opened && viewing === session.id) chat.user(text, []);
+      },
+      event: (session, event) => {
+        if (project === opened && viewing === session.id) chat.event(event);
+        if (event.type === 'tool_result') void own.save(session).catch(() => {});
+      },
+    }));
+    await own.load();
     announce();
     // The first project is open: the page is usable from here on.
     header.inert = false;
@@ -321,6 +363,7 @@ async function main(): Promise<void> {
     // A SoftN app or a web page opens on its preview, so the person sees it being built.
     if (isSoftnProject(project.vfs) || findPages(project.vfs).length) showPane('preview');
     chat.replay(agent.turns);
+    renderSessions();
     registerOaiy();
     setIncognito(!!meta.incognito, meta.incognito ? meta.id : null);
     showIncognito(!!meta.incognito);
@@ -340,7 +383,7 @@ async function main(): Promise<void> {
       void endIncognitoSession(leaving);
     }
     await renderProjects();
-    document.title = `${meta.incognito ? '🕶 ' : ''}${meta.name} — bot.computer`;
+    document.title = `${meta.incognito ? '🕶 ' : ''}${meta.name} — OAIY`;
   };
 
   const newProjectFrom = async (imported: Imported | null) => {
@@ -545,6 +588,7 @@ async function main(): Promise<void> {
     const runAgent = agent;
     let finish!: () => void;
     currentRun = new Promise<void>((resolve) => (finish = resolve));
+    renderSessions();
     // The conversation is saved as it grows, so a closed tab or a crash loses little.
     let saveTimer: ReturnType<typeof setTimeout> | null = null;
     const saveSoon = () => {
@@ -571,7 +615,7 @@ async function main(): Promise<void> {
       let previewShown = false;
       await runAgent.run(prompt, (event) => {
         // A run stopped by a project switch finishes quietly: the chat now shows another project.
-        if (project !== runProject) return;
+        if (project !== runProject || viewing !== null) return;
         chat.event(event);
         if (event.type === 'tool_result' || event.type === 'compact' || event.type === 'nudge') saveSoon();
         if (event.type === 'check' && event.state === 'running' && !previewShown) {
@@ -582,11 +626,12 @@ async function main(): Promise<void> {
     } finally {
       if (saveTimer) clearTimeout(saveTimer);
       controller = null;
-      if (project === runProject) chat.setBusy(false);
+      if (project === runProject && viewing === null) chat.setBusy(false);
       await runProject.flush();
       await runProject.saveChat(runAgent.savedTurns());
       finish();
       currentRun = null;
+      renderSessions();
       // Messages that came in as the run ended: the next request (the chat shows them already).
       const unread = runAgent.takeUnread();
       if (unread.length && project === runProject) {
@@ -848,11 +893,12 @@ A project can hold several apps, each in its own folder (any folder whose manife
   const header = h(
     'header.topbar',
     h('button.menu-toggle', { title: 'Project menu', 'aria-label': 'Project menu', onclick: () => header.classList.toggle('menu-open') }, '☰'),
-    h('div.brand', h('span.logo', '◆'), h('span.brand-name', ' bot.computer')),
+    h('div.brand', h('span.logo', '◆'), h('span.brand-name', ' OAIY')),
     incognitoChip,
     projectSelect,
     actions,
     h('div.spacer'),
+    phoneChip,
     gateChip,
     providerChip,
     h('button.settings-button', { title: 'AI providers', 'aria-label': 'Settings', onclick: () => void editSettings() }, '⚙', h('span.label', ' Settings')),
@@ -966,6 +1012,153 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
     }
   }
 
+  // ---- The phone: OAIY Desktop, its events, and the text-message conversations ----
+
+  function renderSessions(): void {
+    if (!sessions) return;
+    chat.setSessions([
+      { id: null, label: 'Project', title: `${project.meta.name}: your conversation with the agent`, unread: 0, working: !!currentRun },
+      ...sessions.list.map((s) => ({
+        id: s.id,
+        label: s.key === TEST_NUMBER ? '💬 Test' : `💬 ${s.title}`,
+        title: `Text messages with ${s.title}${s.title !== s.key ? ` (${s.key})` : ''}`,
+        unread: s.id === viewing ? 0 : s.unread,
+        working: !!s.running,
+      })),
+    ], viewing, selectSession);
+    const shown = viewing ? sessions.get(viewing) : null;
+    if (shown) chat.setBusy(!!shown.running);
+  }
+
+  /** Show a conversation: the project's own (null), or a text-message thread. */
+  function selectSession(id: string | null): void {
+    const session = id ? sessions?.get(id) : null;
+    viewing = session ? session.id : null;
+    if (session) {
+      chat.replay(session.agent.turns);
+      chat.setBusy(!!session.running);
+      sessions!.seen(session);
+    } else {
+      chat.replay(agent.turns);
+      chat.setBusy(!!currentRun);
+    }
+    renderSessions();
+    chat.focus();
+  }
+
+  /** The person's message in a text-message conversation: to its agent, first in line. */
+  function sessionSubmit(text: string, files: File[]): void {
+    const session = viewing ? sessions?.get(viewing) : null;
+    if (!session || !sessions) return;
+    if (files.length) chat.system('Attach files in the project\'s own conversation; in a text-message conversation, write what the agent should do.', 'error');
+    if (!text) return;
+    if (text.trim() === '/clear') {
+      sessions.stop(session);
+      session.agent.reset();
+      void sessions.save(session);
+      chat.clearLog();
+      chat.system('This conversation starts again. The texts it sent stay sent.');
+      return;
+    }
+    chat.user(text, [], !!session.running);
+    sessions.say(session, text);
+  }
+
+  function stopViewed(): void {
+    const session = viewing ? sessions?.get(viewing) : null;
+    if (session) sessions?.stop(session);
+  }
+
+  // Whether the phone is there: from Aokie's status, then its events.
+  let phoneConnected: boolean | null = null;
+  let desktopProblem = '';
+  function renderPhoneChip(): void {
+    const state = !desktop ? 'off' : desktopProblem ? 'problem' : phoneConnected ? 'ready' : 'paired';
+    phoneChip.dataset.state = state;
+    phoneChip.textContent = state === 'off' ? 'phone: off' : state === 'problem' ? 'phone: desktop offline' : phoneConnected ? 'phone: connected' : 'phone: not connected';
+    phoneChip.title = state === 'problem' ? `OAIY Desktop: ${desktopProblem}` : 'Phone: OAIY Desktop, Aokie and text messages';
+  }
+
+  async function refreshPhone(): Promise<void> {
+    if (!desktop) return;
+    try {
+      const status = (await desktop.command('aokie', 'phone.status', {}, `oaiy:phone.status:${crypto.randomUUID()}`, AbortSignal.timeout(8000))) as Record<string, unknown> | null;
+      phoneConnected = !!status?.connected;
+      desktopProblem = '';
+    } catch (error) {
+      desktopProblem = (error as Error).message;
+    }
+    renderPhoneChip();
+  }
+
+  const desktopEvents = new DesktopEvents(() => desktop, async (event) => {
+    if (event.name === 'aokie.phone.connected' || event.name === 'aokie.phone.disconnected') {
+      phoneConnected = event.name === 'aokie.phone.connected';
+      renderPhoneChip();
+    }
+    await sessions?.desktopEvent(event);
+  }, (problem) => {
+    desktopProblem = problem;
+    renderPhoneChip();
+    if (!problem) void refreshPhone();
+  });
+
+  /**
+   * Answering texts: hold the lease for it while answering is on (OAIY's own
+   * window takes it over), and let it go when answering is turned off.
+   */
+  async function keepTextLease(): Promise<void> {
+    const was = holdsTexts;
+    if (!desktop || !messages.answer) {
+      if (holdsTexts && desktop) void desktop.release('answer-texts', pageId);
+      holdsTexts = false;
+    } else {
+      try {
+        const lease = await desktop.lease('answer-texts', pageId, 30_000, IN_OAIY);
+        holdsTexts = lease.granted;
+        textHolder = lease.granted ? '' : lease.holder;
+      } catch {
+        holdsTexts = false;
+      }
+    }
+    if (holdsTexts && !was) {
+      const n = sessions?.answerWaiting() ?? 0;
+      if (n) chat.system(`Answering ${n} text message${n > 1 ? 's' : ''} that came while this page was not answering.`);
+    }
+  }
+  setInterval(() => void keepTextLease(), 10_000);
+  window.addEventListener('pagehide', () => {
+    if (holdsTexts && desktop) void desktop.release('answer-texts', pageId);
+  });
+
+  async function openPhone(): Promise<void> {
+    const saved = await editPhone({
+      desktop: desktop ? { origin: desktop.origin, token: desktop.token } : null,
+      given: !!given,
+      elsewhere: messages.answer && !holdsTexts && textHolder ? 'Another OAIY page answers the texts now (OAIY\'s own window comes first). This one keeps them in their conversations.' : '',
+      messages,
+      paired: (d) => {
+        desktop = d ? new Desktop(d.origin, d.token) : null;
+        void saveDesktop(d);
+        desktopEvents.stop();
+        if (desktop) {
+          desktopEvents.start();
+          void refreshPhone();
+        }
+        renderPhoneChip();
+      },
+      test: (body) => {
+        void sessions?.textArrived(TEST_NUMBER, 'Test', body).then((session) => selectSession(session.id));
+      },
+    });
+    if (saved) {
+      messages = saved;
+      await saveMessages(saved);
+      // Turned on: take the lease now (and answer what waits); turned off: give it up.
+      await keepTextLease();
+    }
+  }
+
   // Ask the browser to keep this site's storage (projects live there) rather than clear it under pressure.
   void navigator.storage?.persist?.().catch(() => false);
 
@@ -991,6 +1184,12 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
   if (!sandbox.ok) chat.system(`The code sandbox is unavailable: ${sandbox.reason}.`, 'error');
   else void zippModule().catch((error: unknown) => chat.system(`Could not load the Zipp engine: ${(error as Error).message}`, 'error'));
   await lookForOaiy();
+  renderPhoneChip();
+  if (desktop) {
+    desktopEvents.start();
+    void refreshPhone();
+    void keepTextLease();
+  }
   if (!activeProvider()) chat.system('Welcome! Set up an AI provider in ⚙ Settings to talk to the agent — a local server (Ollama, LM Studio, OAIY) keeps everything on this computer. The editor and terminal work without one.');
   // Leaving the page (closing the tab, reloading, switching away on a phone): save now.
   // pagehide and a hidden page come early enough for the writes to start; the
@@ -1028,5 +1227,5 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
 }
 
 main().catch((error: unknown) => {
-  document.body.textContent = `bot.computer failed to start: ${(error as Error).message}`;
+  document.body.textContent = `OAIY failed to start: ${(error as Error).message}`;
 });

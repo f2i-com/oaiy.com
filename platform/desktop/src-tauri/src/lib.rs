@@ -196,6 +196,8 @@ pub mod companion;
 // builds the headless server WITHOUT tauri/webkit2gtk. `http` + `services`
 // above are tauri-free and shared by both binaries.
 #[cfg(feature = "gui")]
+mod embed;
+#[cfg(feature = "gui")]
 mod migrate;
 #[cfg(feature = "gui")]
 mod tray;
@@ -1308,7 +1310,12 @@ pub fn run() {
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
+        // The agent and the flow editor, shown in the window beside the sidebar.
+        .register_uri_scheme_protocol(crate::embed::AGENT_SCHEME, |ctx, request| crate::embed::serve(ctx.app_handle(), crate::embed::Page::Agent, &request))
+        .register_uri_scheme_protocol(crate::embed::FLOWS_SCHEME, |ctx, request| crate::embed::serve(ctx.app_handle(), crate::embed::Page::Flows, &request))
         .invoke_handler(tauri::generate_handler![
+            crate::embed::show_embedded,
+            crate::embed::hide_embedded,
             open_path,
             log_path,
             open_url,

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
+  Bot,
   Check,
   ChevronRight,
   Copy,
@@ -35,6 +36,7 @@ import PluginScreenPage from './PluginScreenPage';
 import ConnectionsPanel from './ConnectionsPanel';
 import PairingPrompt from './PairingPrompt';
 import SettingsPanel from './SettingsPanel';
+import EmbeddedPage from './EmbeddedPage';
 
 /**
  * OAIY Desktop — the OAIY design-system shell (222px sidebar + a workspace of
@@ -57,6 +59,8 @@ interface HealthResponse {
 }
 
 type BuiltinView =
+  | 'agent'
+  | 'flows'
   | 'overview'
   | 'services'
   | 'plugins'
@@ -81,6 +85,8 @@ interface PluginNavEntry {
 const WEB_APP_URL = 'https://oaiy.com/app.html';
 
 const NAV: { value: BuiltinView; label: string; icon: LucideIcon }[] = [
+  { value: 'agent', label: 'Agent', icon: Bot },
+  { value: 'flows', label: 'Flows', icon: Workflow },
   { value: 'overview', label: 'Overview', icon: LayoutDashboard },
   { value: 'services', label: 'Services', icon: Server },
   { value: 'plugins', label: 'Plugins', icon: Plug },
@@ -96,6 +102,18 @@ const NAV: { value: BuiltinView; label: string; icon: LucideIcon }[] = [
  * Keeping them different avoids saying the same words twice on one screen.
  */
 const PAGE: Record<BuiltinView, { crumb: string; kicker: string; title: string; copy: string }> = {
+  agent: {
+    crumb: 'Agent',
+    kicker: 'Work',
+    title: 'The agent',
+    copy: 'Your projects, and the agent that works in them, answers your texts and calls.',
+  },
+  flows: {
+    crumb: 'Flows',
+    kicker: 'Automate',
+    title: 'The flow editor',
+    copy: 'Build flows, run them, and give the agent new tools.',
+  },
   overview: {
     crumb: 'Overview',
     kicker: 'Control centre',
@@ -308,18 +326,6 @@ export default function App() {
           <small>Connect. Draw. Expose.</small>
         </div>
 
-        <button
-          className="open-editor"
-          type="button"
-          onClick={() => openExternal(WEB_APP_URL)}
-          aria-label="Open the OAIY flow editor"
-          title={WEB_APP_URL}
-        >
-          <Workflow size={17} />
-          <span>Flow editor</span>
-          <ExternalLink size={13} />
-        </button>
-
         <nav aria-label="Primary">
           {NAV.map((item) => {
             const Icon = item.icon;
@@ -468,7 +474,8 @@ export default function App() {
               suppresses the entrance animation the second time you open a panel,
               so navigation feels instant instead of replaying a staggered reveal
               on every switch. */}
-          <div className={visited.has(view) ? 'content-page revisit' : 'content-page'} key={view}>
+          {(view === 'agent' || view === 'flows') && <EmbeddedPage page={view} />}
+          <div hidden={view === 'agent' || view === 'flows'} className={visited.has(view) ? 'content-page revisit' : 'content-page'} key={view}>
             <PairingPrompt />
             <div className="page-intro">
               <div>
