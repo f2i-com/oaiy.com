@@ -2,41 +2,34 @@
    that fit smaller windows. Theme colours remain shared with plugin screens. */
 .app-shell { height: 100dvh; }
 .sidebar { min-height: 0; overflow-y: auto; overscroll-behavior: contain; }
-.sidebar nav button, .sidebar .settings { min-height: 44px; }
-/* A window under 1000px tall (a pointer's, not a phone's): the sidebar tightens so all of it shows without scrolling. */
-@media (max-height: 1000px) and (min-width: 761px) {
+.sidebar nav button, .sidebar .settings { min-height: 42px; }
+/* A window under 760px tall (a pointer's, not a phone's): the sidebar tightens so all of it shows without scrolling. */
+@media (max-height: 760px) and (min-width: 761px) {
   .sidebar { padding-top: 18px; padding-bottom: 12px; }
-  .brand > small { display: none; }
-  .sidebar nav { gap: 2px; margin-top: 14px; }
+  .sidebar nav { gap: 2px; margin-top: 16px; }
   .sidebar nav button, .sidebar .settings { min-height: 36px; }
   .sidebar nav button.active::before, .sidebar .settings.active::before { top: 8px; bottom: 8px; }
   .sidebar nav .nav-group { margin: 10px 0 2px; }
-  .sidebar nav .nav-group:first-child { margin-top: 0; }
 }
-.sidebar nav button[title*="provided by"] > span { white-space: normal; line-height: 1.4; }
+.sidebar nav button[title*=", from the"] > span { white-space: normal; line-height: 1.3; }
 .content-page { overscroll-behavior: contain; scrollbar-gutter: stable; }
-.page-intro, .panel { width: 100%; max-width: 1160px; }
-.page-intro { padding-bottom: 22px; border-bottom: 1px solid var(--border); }
-.page-intro p { max-width: 70ch; font-size: 14px; line-height: 1.6; }
-.kicker { font-size: 11px; color: var(--muted); }
-.panel { gap: 18px; }
+.panel { width: 100%; max-width: 1160px; gap: 18px; }
 .overview-grid { gap: 12px; grid-template-columns: repeat(auto-fit, minmax(min(100%, 170px), 1fr)); }
-.overview-tile { padding: 20px; gap: 8px; background: var(--surface-solid); box-shadow: var(--shadow-card); }
-.overview-tile strong { font-size: 28px; line-height: 1.15; }
+.overview-tile { padding: 18px 20px; gap: 8px; background: var(--surface-solid); box-shadow: var(--shadow-card); }
+.overview-tile strong { font-size: 26px; line-height: 1.15; }
 .overview-tile small { font-size: 13px; line-height: 1.5; }
 .service-card { box-shadow: var(--shadow-card); }
 .banner { flex-wrap: wrap; line-height: 1.5; }
 .banner > span { min-width: 0; overflow-wrap: anywhere; flex: 1 1 240px; }
-.btn, .btn-tiny, .icon-button { min-height: 36px; }
-/* A plugin screen fills the page from its intro down to the dock, and scrolls
-   inside itself. The page around it does not scroll too, so there is one
-   scrollbar. Below 320px of room the page scrolls again rather than squash it. */
+.btn, .btn-tiny, .icon-button { min-height: 34px; }
+/* A plugin screen fills the page down to the dock, and scrolls inside itself.
+   The page around it does not scroll too, so there is one scrollbar. Below
+   320px of room the page scrolls again rather than squash it. */
 .content-page.page-fill { display: flex; flex-direction: column; }
 .content-page.page-fill > * { flex: none; }
 .content-page.page-fill > .panel { flex: 1 1 auto; }
 /* It also fills the page's width: a plugin screen lays out its own columns,
    so the 1160px reading width of the built-in pages would only leave a gap. */
-.content-page.page-fill > .page-intro,
 .content-page.page-fill > .panel { max-width: none; }
 .plugin-screen { flex: 1 1 auto; min-height: 320px; }
 /* No frame of its own: the screen's document is transparent and draws its
@@ -46,9 +39,6 @@
 input, select, textarea { max-width: 100%; }
 @media (max-width: 1240px) { .sidebar .nav-badge { display: none; } }
 @media (max-width: 760px) {
-  .content-page { padding: 20px 16px 32px; }
-  .page-intro { padding-bottom: 16px; gap: 12px; }
-  .page-intro p { font-size: 13px; }
   .overview-tile { padding: 16px; }
   .btn, .btn-tiny, .icon-button { min-height: 44px; }
   .icon-button { min-width: 44px; }
@@ -58,6 +48,6 @@ input, select, textarea { max-width: 100%; }
   .app-shell { grid-template-columns: 58px minmax(0, 1fr); }
   .sidebar { padding: 18px 6px 12px; }
   .content-page { padding: 16px 10px 24px; }
-  .top-title { display: none; }
-  .topbar { padding: 0 8px; justify-content: flex-end; }
+  .section-tabs { padding: 0 10px 8px; }
+  .seg-tabs > button > span { display: none; }
 }

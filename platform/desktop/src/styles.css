@@ -260,13 +260,6 @@ a:hover { text-decoration: underline; text-underline-offset: 2px; }
   color: var(--muted);
   font-size: 12px;
 }
-.brand > small {
-  display: block;
-  margin-top: 11px;
-  color: var(--faint);
-  font-size: 11px;
-}
-
 kbd {
   border: 1px solid var(--border);
   border-radius: var(--r-sm);
@@ -277,31 +270,11 @@ kbd {
   font-size: 9px;
 }
 
-/* "Open flow editor" — the prototype's .new-workflow slot. */
-.open-editor {
-  display: flex;
-  height: 42px;
-  align-items: center;
-  gap: 9px;
-  margin-top: 28px;
-  border: 1px solid var(--strong-border);
-  border-radius: 9px;
-  background: transparent;
-  color: var(--text);
-  padding: 0 11px;
-  font-size: 12px;
-  text-align: left;
-  transition: border-color 0.14s, background 0.14s;
-}
-.open-editor:hover { border-color: var(--primary); background: var(--primary-soft); }
-.open-editor > span { flex: 1; min-width: 0; }
-.open-editor kbd { margin-left: auto; }
-
 .sidebar nav {
   display: flex;
   flex-direction: column;
-  gap: 4px;
-  margin-top: 18px;
+  gap: 3px;
+  margin-top: 26px;
 }
 .sidebar nav button,
 .sidebar .settings {
@@ -348,71 +321,21 @@ kbd {
 
 .sidebar-fill { flex: 1; }
 
-.engine-card {
-  position: relative;
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  margin: 12px 0;
-  border: 1px solid var(--border);
-  border-radius: 9px;
-  background: var(--surface-soft);
-  padding: 11px;
-}
-.engine-card > svg { flex: none; color: var(--green); }
-.engine-card.offline > svg { color: var(--danger); }
-.engine-card.pending > svg { color: var(--primary); }
-.engine-card > span { display: flex; min-width: 0; flex-direction: column; gap: 2px; }
-.engine-card strong {
-  font-size: 10px;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
-}
-.engine-card small {
-  overflow: hidden;
-  color: var(--faint);
-  font-size: 9px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.engine-card > i {
-  position: absolute;
-  top: 10px;
-  right: 10px;
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  background: var(--green);
-  box-shadow: 0 0 0 4px var(--green-soft);
-}
-.engine-card.offline > i { background: var(--danger); box-shadow: 0 0 0 4px var(--danger-soft); }
-.engine-card.pending > i {
-  background: var(--primary);
-  box-shadow: 0 0 0 4px var(--primary-soft);
-  animation: led-pulse 1.3s ease-in-out infinite;
-}
 @keyframes led-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
 
-.trust {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 11px 12px 0;
-  color: var(--faint);
-  font-size: 10px;
-}
-
 /* ---------------------------------------------------------------------------
- * WORKSPACE
+ * WORKSPACE — topbar (the page's header) / page / endpoint dock
  * ------------------------------------------------------------------------- */
 
 .workspace {
   display: grid;
   min-width: 0;
   min-height: 0;
-  grid-template-rows: 72px minmax(0, 1fr) 64px;
+  grid-template-rows: 78px minmax(0, 1fr) 54px;
 }
 
+/* Every page's header, the same for the dashboard's own pages and the ones in
+   webviews: the group it is in, its name, and one line on what it is for. */
 .topbar {
   z-index: 8;
   display: flex;
@@ -422,54 +345,103 @@ kbd {
   gap: 18px;
   border-bottom: 1px solid var(--border);
   background: color-mix(in srgb, var(--surface-solid) 91%, transparent);
-  padding: 0 19px 0 24px;
+  padding: 0 20px 0 30px;
   backdrop-filter: blur(18px);
 }
-.top-title { min-width: 0; }
-.top-title > span {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  margin-bottom: 5px;
-  color: var(--faint);
-  font-size: 9px;
-  font-weight: 650;
-  letter-spacing: 0.08em;
+/* A section with tabs: the tabs are the header's lower half, so no line between. */
+.topbar.has-tabs { border-bottom-color: transparent; }
+.top-title { display: flex; min-width: 0; flex-direction: column; gap: 2px; }
+.top-kicker {
+  color: var(--primary);
+  font-size: 10px;
+  font-weight: 720;
+  letter-spacing: 0.13em;
+  line-height: 1.3;
   text-transform: uppercase;
 }
-.top-title > div { display: flex; min-width: 0; align-items: center; gap: 9px; }
 .top-title h1 {
   overflow: hidden;
   margin: 0;
-  font-size: 17px;
-  font-weight: 630;
+  font-size: 19px;
+  font-weight: 640;
   letter-spacing: -0.02em;
+  line-height: 1.2;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.top-title em {
-  border: 1px solid var(--border);
-  border-radius: 999px;
-  background: var(--surface-soft);
+.top-title p {
+  overflow: hidden;
+  margin: 0;
   color: var(--muted);
-  padding: 3px 7px;
-  font-size: 9px;
-  font-style: normal;
+  font-size: 12.5px;
+  line-height: 1.4;
+  text-overflow: ellipsis;
   white-space: nowrap;
 }
-.top-title small {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  color: var(--faint);
-  font-size: 10px;
-  white-space: nowrap;
-}
-.top-title small svg { color: var(--green); }
-.top-title small.is-error svg { color: var(--danger); }
-.top-title small.is-pending svg { color: var(--primary); }
 
 .top-actions { display: flex; flex: 0 0 auto; align-items: center; gap: 8px; }
+/* Only while the local API cannot be reached: the dock says so too, in red. */
+.top-alert {
+  display: inline-flex;
+  height: 30px;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid color-mix(in srgb, var(--danger) 40%, var(--border));
+  border-radius: 999px;
+  background: var(--danger-soft);
+  color: var(--danger);
+  padding: 0 11px;
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+/* A section's pages, under its header: the segmented tabs the Flows editor and
+   plugin screens use too. For a page in a webview the strip sits above it, and
+   the webview is laid below the strip. */
+.section-tabs {
+  z-index: 7;
+  display: flex;
+  flex: none;
+  min-width: 0;
+  align-items: center;
+  border-bottom: 1px solid var(--border);
+  background: color-mix(in srgb, var(--surface-solid) 91%, transparent);
+  padding: 0 30px 10px;
+}
+.seg-tabs {
+  display: inline-flex;
+  min-width: 0;
+  max-width: 100%;
+  flex-wrap: wrap;
+  gap: 2px;
+  border: 1px solid var(--border);
+  border-radius: calc(var(--r-ctl) + 2px);
+  background: var(--canvas);
+  padding: 3px;
+}
+.seg-tabs > button {
+  display: inline-flex;
+  height: 28px;
+  align-items: center;
+  gap: 7px;
+  border: 0;
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: var(--muted);
+  padding: 0 13px;
+  font-size: 12.5px;
+  font-weight: 600;
+  white-space: nowrap;
+  transition: background 0.14s, color 0.14s;
+}
+.seg-tabs > button > svg { flex: none; opacity: 0.85; }
+.seg-tabs > button:hover { background: var(--surface-soft); color: var(--text); }
+.seg-tabs > button.active { background: var(--primary-soft); color: var(--primary); }
+:root:not([data-theme='light']) .seg-tabs > button.active {
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--primary) 30%, transparent);
+}
+.seg-tabs > button:focus-visible { outline-offset: -2px; }
 
 .icon-button {
   display: grid;
@@ -494,10 +466,12 @@ kbd {
  * CONTENT PAGE
  * ------------------------------------------------------------------------- */
 
-.view { min-width: 0; min-height: 0; overflow: hidden; }
+/* The tab strip (if any), then the page: the dashboard's own, or the box a webview is laid over. */
+.view { display: flex; min-width: 0; min-height: 0; flex-direction: column; overflow: hidden; }
 
 .content-page {
-  height: 100%;
+  flex: 1 1 auto;
+  min-height: 0;
   overflow-y: auto;
   background: radial-gradient(
       circle at 86% 4%,
@@ -505,35 +479,9 @@ kbd {
       transparent 28%
     ),
     var(--canvas);
-  padding: 27px 30px 40px;
+  padding: 24px 30px 40px;
 }
 :root[data-theme='light'] .content-page { background: var(--canvas); }
-
-.page-intro {
-  display: flex;
-  align-items: flex-end;
-  justify-content: space-between;
-  gap: 24px;
-  margin-bottom: 23px;
-}
-.kicker {
-  display: block;
-  color: var(--primary);
-  font-size: 9px;
-  font-weight: 720;
-  letter-spacing: 0.13em;
-  text-transform: uppercase;
-}
-.page-intro h2 {
-  margin: 6px 0 5px;
-  font-size: clamp(25px, 2.2vw, 34px);
-  font-weight: 620;
-  letter-spacing: -0.035em;
-}
-.page-intro p { margin: 0; color: var(--muted); font-size: 12px; }
-/* `div + div` (not :last-child) — with no action slot the copy block IS the
-   last child, and turning it into a flex row would lay kicker/h2/p side by side. */
-.page-intro > div + div { display: flex; flex: none; align-items: center; gap: 8px; }
 
 /* The panels' own root. */
 .panel { display: flex; max-width: 1000px; flex-direction: column; gap: 14px; }
@@ -1412,27 +1360,29 @@ select:disabled { cursor: not-allowed; opacity: 0.5; }
  * ENDPOINT DOCK — the prototype's persistent local-API footer.
  * ------------------------------------------------------------------------- */
 
+/* One readout of the local API: whether it is up (the dot), where it is, and the promise that keys stay here. */
 .endpoint-dock {
   z-index: 9;
-  display: grid;
+  display: flex;
   min-width: 0;
-  grid-template-columns: auto minmax(200px, 1fr) auto auto auto;
   align-items: center;
-  gap: 9px;
+  gap: 16px;
   border-top: 1px solid var(--border);
   background: var(--surface-solid);
-  padding: 0 17px;
+  padding: 0 20px 0 30px;
 }
-.endpoint-dock > button {
+.dock-status {
   display: flex;
+  flex: none;
   align-items: center;
-  gap: 9px;
+  gap: 10px;
   border: 0;
+  border-radius: var(--r-sm);
   background: transparent;
   padding: 0;
   text-align: left;
 }
-.endpoint-dock > button > i {
+.dock-status > i {
   flex: none;
   width: 8px;
   height: 8px;
@@ -1440,24 +1390,29 @@ select:disabled { cursor: not-allowed; opacity: 0.5; }
   background: var(--green);
   box-shadow: 0 0 0 4px var(--green-soft);
 }
-.endpoint-dock.offline > button > i {
-  background: var(--danger);
-  box-shadow: 0 0 0 4px var(--danger-soft);
+.endpoint-dock.offline .dock-status > i { background: var(--danger); box-shadow: 0 0 0 4px var(--danger-soft); }
+.endpoint-dock.pending .dock-status > i {
+  background: var(--primary);
+  box-shadow: 0 0 0 4px var(--primary-soft);
+  animation: led-pulse 1.3s ease-in-out infinite;
 }
-.endpoint-dock > button > span { display: flex; min-width: 0; flex-direction: column; gap: 2px; }
-.endpoint-dock > button strong { font-size: 10px; }
-.endpoint-dock > button small { color: var(--faint); font-size: 9px; }
-.endpoint-dock > div {
+.dock-status > span { display: flex; min-width: 0; flex-direction: column; gap: 1px; }
+.dock-status strong { font-size: 11.5px; font-weight: 640; line-height: 1.3; }
+.endpoint-dock.offline .dock-status strong { color: var(--danger); }
+.dock-status small { color: var(--faint); font-size: 10.5px; line-height: 1.3; }
+.dock-status:hover strong { color: var(--primary); }
+.dock-endpoint {
   display: flex;
   min-width: 0;
-  height: 34px;
+  flex: 0 1 360px;
+  height: 32px;
   align-items: center;
   border: 1px solid var(--border);
   border-radius: var(--r-ctl);
   background: var(--surface-soft);
   padding-left: 11px;
 }
-.endpoint-dock > div code {
+.dock-endpoint code {
   overflow: hidden;
   min-width: 0;
   flex: 1;
@@ -1465,43 +1420,21 @@ select:disabled { cursor: not-allowed; opacity: 0.5; }
   background: transparent;
   color: var(--muted);
   padding: 0;
-  font-size: 11px;
+  font-size: 11.5px;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.endpoint-dock > em {
+.dock-endpoint .icon-button { width: 30px; height: 30px; min-height: 0; }
+.dock-trust {
   display: inline-flex;
   align-items: center;
-  gap: 4px;
-  border: 1px solid color-mix(in srgb, var(--primary) 35%, var(--border));
-  border-radius: 999px;
-  background: var(--primary-soft);
-  color: var(--primary);
-  padding: 5px 8px;
-  font-size: 9px;
+  gap: 6px;
+  margin-left: auto;
+  color: var(--faint);
+  font-size: 11px;
   font-style: normal;
   white-space: nowrap;
 }
-.endpoint-dock > em.ok {
-  border-color: color-mix(in srgb, var(--green) 35%, var(--border));
-  background: var(--green-soft);
-  color: var(--green);
-}
-.endpoint-dock > em.bad {
-  border-color: color-mix(in srgb, var(--danger) 35%, var(--border));
-  background: var(--danger-soft);
-  color: var(--danger);
-}
-/* Open Flows: a button that reads as a quiet link, as it did when it opened the web editor. */
-.endpoint-dock > .dock-link {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  color: var(--muted);
-  font-size: 10px;
-  white-space: nowrap;
-}
-.endpoint-dock > .dock-link:hover { color: var(--text); }
 
 /* ---------------------------------------------------------------------------
  * TOASTS — rendered OUTSIDE .app-shell, hence tokens live on :root.
@@ -1511,7 +1444,7 @@ select:disabled { cursor: not-allowed; opacity: 0.5; }
   position: fixed;
   z-index: 9999;
   right: 20px;
-  bottom: 78px;
+  bottom: 70px;
   display: flex;
   max-width: 380px;
   flex-direction: column;
@@ -1571,44 +1504,31 @@ select:disabled { cursor: not-allowed; opacity: 0.5; }
   .brand { padding: 0; text-align: center; }
   .brand > strong { font-size: 19px; letter-spacing: 0.05em; }
   .brand > span,
-  .brand > small,
-  .open-editor > span,
-  .open-editor kbd,
-  .open-editor > svg:last-child,
   .sidebar nav button > span,
-  .sidebar .settings > span,
-  .engine-card > span,
-  .trust span { display: none; }
-  .open-editor,
+  .sidebar .settings > span { display: none; }
   .sidebar nav,
   .sidebar .settings { width: 43px; }
-  .open-editor,
   .sidebar nav button,
   .sidebar .settings { justify-content: center; padding: 0; }
-  .engine-card { width: 43px; justify-content: center; padding: 7px; }
-  .engine-card > i { top: 4px; right: 4px; }
-  .trust { padding: 8px 0 0; }
-  .content-page { padding: 24px 22px 36px; }
+  .topbar, .section-tabs, .endpoint-dock { padding-left: 24px; }
+  .content-page { padding: 22px 24px 36px; }
 }
 
 @media (max-width: 960px) {
-  .endpoint-dock { grid-template-columns: auto minmax(150px, 1fr) auto; }
-  .endpoint-dock > em { display: none; }
-  .top-title small { display: none; }
+  .top-site > span { display: none; }
+  .top-site { width: 34px; padding: 0; }
 }
 
 @media (max-width: 760px) {
-  .workspace { grid-template-rows: 65px minmax(0, 1fr) 56px; }
-  .topbar { padding: 0 12px 0 14px; }
-  .top-title > span,
-  .top-title em { display: none; }
-  .top-title h1 { font-size: 15px; }
-  .content-page { padding: 19px 15px 30px; }
-  .page-intro { align-items: flex-start; flex-direction: column; margin-bottom: 17px; }
-  .page-intro h2 { font-size: 25px; }
-  .endpoint-dock { grid-template-columns: auto minmax(0, 1fr); padding: 0 10px; }
-  .endpoint-dock > .dock-link,
-  .endpoint-dock > button > span { display: none; }
+  .workspace { grid-template-rows: 60px minmax(0, 1fr) 50px; }
+  .topbar { padding: 0 12px 0 16px; }
+  .top-kicker, .top-title p { display: none; }
+  .top-title h1 { font-size: 16px; }
+  .section-tabs { padding: 0 16px 8px; }
+  .seg-tabs > button { padding: 0 10px; }
+  .content-page { padding: 18px 16px 30px; }
+  .endpoint-dock { gap: 10px; padding: 0 12px 0 16px; }
+  .dock-status > span, .dock-trust { display: none; }
   .form-row-pair { flex-direction: column; }
 }
 
@@ -1672,8 +1592,8 @@ select:disabled { cursor: not-allowed; opacity: 0.5; }
 .setup-wizard .service-section { margin-top: 20px; }
 @media (max-width: 480px) { .setup-wizard { padding: 14px; } .setup-wizard .form-actions { flex-wrap: wrap; } .setup-wizard-nav button { flex: 1 1 auto; min-height: 40px; } }
 
-/* The agent and the flow editor: webviews of their own, laid over this box by the app. */
-.embedded-page { height: 100%; min-height: 0; position: relative; background: var(--canvas); }
+/* The agent, the flow editor and the engines: webviews of their own, laid over this box by the app. */
+.embedded-page { flex: 1 1 auto; min-height: 0; position: relative; background: var(--canvas); }
 .embedded-problem { margin: 24px; color: var(--muted, #8b93a3); }
 
 /* ---------------------------------------------------------------------------
@@ -1808,8 +1728,8 @@ select:disabled { cursor: not-allowed; opacity: 0.5; }
 /* The sidebar's group labels. */
 .sidebar nav .nav-group {
   display: block;
-  margin: 14px 0 4px;
-  padding: 0 14px;
+  margin: 16px 0 4px;
+  padding: 0 12px;
   color: var(--faint);
   font-family: var(--font-mono);
   font-size: 9.5px;

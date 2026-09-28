@@ -1,17 +1,20 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState, type KeyboardEvent } from 'react';
 import {
   Bot,
+  CalendarDays,
   Check,
-  ChevronRight,
   Copy,
+  Cpu,
   ExternalLink,
   HardDrive,
   History,
   LayoutDashboard,
-  LoaderCircle,
   LockKeyhole,
+  Mail,
+  MessageSquare,
   Moon,
   Package,
+  Phone,
   Plug,
   Puzzle,
   Server,
@@ -22,8 +25,6 @@ import {
   TriangleAlert,
   Workflow,
   type LucideIcon,
-  CalendarDays,
-  Cpu,
 } from 'lucide-react';
 import { API_BASE, openExternal, phone as phoneApi, plugins as pluginsApi } from './api';
 import { applyTheme, initialTheme, THEME_LABEL, type ThemeMode } from './theme';
@@ -42,14 +43,14 @@ import SettingsPanel from './SettingsPanel';
 import EmbeddedPage from './EmbeddedPage';
 
 /**
- * OAIY Desktop — the OAIY design-system shell (222px sidebar + a workspace of
- * topbar / content page / endpoint dock), carrying the same four views it always
- * had: Services · Models · Python · Settings.
+ * OAIY Desktop: a sidebar of a few sections, and a workspace of topbar / page /
+ * endpoint dock. A section with more than one page shows them as tabs under the
+ * topbar; every page keeps its own view id, so anything that opens a page by id
+ * (the Overview, a plugin screen's `navigate`, the dock) still lands on it.
  *
- * The HTTP API is bound to 127.0.0.1:17972; the health poll below drives three
- * places at once — the sidebar's engine card, the topbar readout, and the
- * endpoint dock. If the Rust side isn't up, everything degrades to
- * "unreachable" without crashing.
+ * The HTTP API is bound to 127.0.0.1:17972; the health poll below drives the
+ * dock. If the Rust side isn't up, everything degrades to "unreachable"
+ * without crashing.
  */
 
 interface HealthResponse {
@@ -79,116 +80,146 @@ type BuiltinView =
 /** A plugin-contributed screen, addressed as `plugin:<pluginId>:<navId>`. */
 type View = BuiltinView | `plugin:${string}:${string}`;
 
+/** The pages shown in webviews of their own, laid over the page by the desktop. */
+const EMBEDDED = new Set<View>(['agent', 'flows', 'engines']);
+
 /** One nav entry a plugin contributes (`manifest.ui.nav[]`). */
 interface PluginNavEntry {
   pluginId: string;
+  pluginName: string;
   navId: string;
   label: string;
+  icon?: string;
   badge?: string;
 }
 
-/** The sidebar, in groups: what you work in, what runs on this machine, what it connects to. */
-const NAV: { value: BuiltinView; label: string; icon: LucideIcon; group?: string }[] = [
-  { value: 'agent', label: 'Agent', icon: Bot, group: 'Work' },
-  { value: 'flows', label: 'Flows', icon: Workflow },
-  { value: 'calendar', label: 'Calendar', icon: CalendarDays },
-  { value: 'overview', label: 'Overview', icon: LayoutDashboard, group: 'This machine' },
-  { value: 'engines', label: 'Engines', icon: Cpu },
-  { value: 'services', label: 'Services', icon: Server },
-  { value: 'models', label: 'Model files', icon: Package },
-  { value: 'python', label: 'Python', icon: HardDrive },
-  { value: 'runs', label: 'Runs', icon: History },
-  { value: 'plugins', label: 'Plugins', icon: Plug, group: 'Connect' },
-  { value: 'providers', label: 'Providers', icon: Sparkles },
-  { value: 'connections', label: 'Connections', icon: ShieldCheck },
-];
+type Group = 'Home' | 'Work' | 'Setup';
 
-/**
- * `crumb` is the short topbar name; `title` is the descriptive page heading.
- * Keeping them different avoids saying the same words twice on one screen.
- * `kicker` is the sidebar group the page is in. Settings is in no group, and
- * goes with This machine.
- */
-const PAGE: Record<BuiltinView, { crumb: string; kicker: string; title: string; copy: string }> = {
+interface Section {
+  id: string;
+  label: string;
+  icon: LucideIcon;
+  group: Group;
+  /** Its pages, the first the one it opens on. More than one shows as tabs. */
+  tabs: BuiltinView[];
+}
+
+/** The sidebar: home, what you work in, and what this machine is set up with. Settings sits at the bottom. */
+const SECTIONS: Section[] = [
+  { id: 'overview', label: 'Overview', icon: LayoutDashboard, group: 'Home', tabs: ['overview'] },
+  { id: 'agent', label: 'Agent', icon: Bot, group: 'Work', tabs: ['agent'] },
+  { id: 'flows', label: 'Flows', icon: Workflow, group: 'Work', tabs: ['flows', 'runs'] },
+  { id: 'calendar', label: 'Calendar', icon: CalendarDays, group: 'Work', tabs: ['calendar'] },
+  { id: 'engines', label: 'Engines', icon: Cpu, group: 'Setup', tabs: ['engines', 'models'] },
+  { id: 'services', label: 'Services', icon: Server, group: 'Setup', tabs: ['services', 'python'] },
+  { id: 'connections', label: 'Connections', icon: Plug, group: 'Setup', tabs: ['connections', 'providers', 'plugins'] },
+];
+const SETTINGS: Section = { id: 'settings', label: 'Settings', icon: Settings2, group: 'Setup', tabs: ['settings'] };
+
+/** Each page: its tab's name and icon, and the line under the topbar's title. */
+const PAGE: Record<BuiltinView, { tab: string; icon: LucideIcon; copy: string }> = {
+  overview: {
+    tab: 'Overview',
+    icon: LayoutDashboard,
+    copy: 'Today on this machine: the phone, the model, your appointments, and anything that needs you.',
+  },
   agent: {
-    crumb: 'Agent',
-    kicker: 'Work',
-    title: 'The agent',
-    copy: 'Your projects, and the agent that works in them, answers your texts and calls.',
+    tab: 'Agent',
+    icon: Bot,
+    copy: 'Your projects, and the agent that works in them and answers your texts and calls.',
   },
-  flows: {
-    crumb: 'Flows',
-    kicker: 'Work',
-    title: 'The flow editor',
-    copy: 'Build flows, run them, and give the agent new tools.',
-  },
+  flows: { tab: 'Editor', icon: Workflow, copy: 'Build flows, run them, and give the agent new tools.' },
+  runs: { tab: 'Run history', icon: History, copy: 'Every flow this machine has run, and why any of them failed.' },
   calendar: {
-    crumb: 'Calendar',
-    kicker: 'Work',
-    title: 'Calendar',
+    tab: 'Calendar',
+    icon: CalendarDays,
     copy: 'Appointments, the requests your calls and texts bring in, and the hours the phone offers.',
   },
   engines: {
-    crumb: 'Engines',
-    kicker: 'This machine',
-    title: 'Engines',
+    tab: 'Engines',
+    icon: Cpu,
     copy: 'The language, picture, video, speech, music and 3D models this machine runs, and their endpoints.',
   },
-  overview: {
-    crumb: 'Overview',
-    kicker: 'This machine',
-    title: 'Overview',
-    copy: 'What this machine is running, and anything your flows need you to fix.',
-  },
-  services: {
-    crumb: 'Services',
-    kicker: 'This machine',
-    title: 'Local AI services',
-    copy: 'Start, stop and install the engines this machine exposes to OAIY.',
-  },
-  plugins: {
-    crumb: 'Plugins',
-    kicker: 'Connect',
-    title: 'Plugins',
-    copy: 'Supervised extensions that add connectors and events to your flows.',
-  },
-  runs: {
-    crumb: 'Runs',
-    kicker: 'This machine',
-    title: 'Runs',
-    copy: 'Every flow this machine has run, and the reason any of them failed.',
-  },
-  models: {
-    crumb: 'Model files',
-    kicker: 'This machine',
-    title: 'Model files',
-    copy: 'Download weights from Hugging Face and manage what is on disk.',
-  },
-  providers: {
-    crumb: 'Providers',
-    kicker: 'Connect',
-    title: 'AI providers',
-    copy: 'Cloud or local AI providers your flows can call — keys stay on this device.',
-  },
-  python: {
-    crumb: 'Python',
-    kicker: 'This machine',
-    title: 'Portable Python',
-    copy: 'A bundled interpreter and reusable venvs — no system Python needed.',
-  },
-  connections: {
-    crumb: 'Connections',
-    kicker: 'Connect',
-    title: 'Connections',
-    copy: 'Apps allowed to run flows and call plugins on this machine.',
-  },
-  settings: {
-    crumb: 'Settings',
-    kicker: 'This machine',
-    title: 'Settings',
-    copy: 'Your machine, your models, your orchestration.',
-  },
+  models: { tab: 'Model files', icon: Package, copy: 'Download weights from Hugging Face and manage what is on disk.' },
+  services: { tab: 'Services', icon: Server, copy: 'Start, stop and install the local AI services this machine offers OAIY.' },
+  python: { tab: 'Python', icon: HardDrive, copy: 'A bundled Python and reusable venvs, so no system Python is needed.' },
+  connections: { tab: 'Connections', icon: ShieldCheck, copy: 'Apps and accounts allowed to run flows and call plugins on this machine.' },
+  providers: { tab: 'AI providers', icon: Sparkles, copy: 'Cloud or local AI providers your flows can call. Keys stay on this device.' },
+  plugins: { tab: 'Plugins', icon: Puzzle, copy: 'Supervised extensions that add connectors and events to your flows.' },
+  settings: { tab: 'Settings', icon: Settings2, copy: 'Where OAIY keeps its data and models, and your Hugging Face token.' },
 };
+
+/** The icons a plugin's nav entry may name (`manifest.ui.nav[].icon`); any other gets the plugin piece. */
+const PLUGIN_ICONS: Record<string, LucideIcon> = {
+  phone: Phone,
+  calendar: CalendarDays,
+  chat: MessageSquare,
+  message: MessageSquare,
+  mail: Mail,
+  bot: Bot,
+};
+
+/** Plugin screens already opened here: their "New" badge is no longer news. */
+const SEEN_KEY = 'oaiy.pluginNavSeen';
+function readSeen(): Set<string> {
+  try {
+    const raw = window.localStorage.getItem(SEEN_KEY);
+    const list: unknown = raw ? JSON.parse(raw) : [];
+    return new Set(Array.isArray(list) ? list.filter((v): v is string => typeof v === 'string') : []);
+  } catch {
+    return new Set();
+  }
+}
+function writeSeen(seen: Set<string>) {
+  try {
+    window.localStorage.setItem(SEEN_KEY, JSON.stringify([...seen]));
+  } catch {
+    /* storage can be unavailable; the badge just shows again next time */
+  }
+}
+
+function sectionOf(view: View): Section | null {
+  if (view === 'settings') return SETTINGS;
+  return SECTIONS.find((s) => (s.tabs as View[]).includes(view)) ?? null;
+}
+
+/** A section's pages as tabs: the dashboard's segmented control, keyboard-driven with the arrow keys. */
+function SectionTabs({ section, view, onSelect }: { section: Section; view: View; onSelect: (v: BuiltinView) => void }) {
+  const onKey = (e: KeyboardEvent<HTMLDivElement>) => {
+    const i = section.tabs.indexOf(view as BuiltinView);
+    const step = e.key === 'ArrowRight' ? 1 : e.key === 'ArrowLeft' ? -1 : 0;
+    if (!step || i < 0) return;
+    e.preventDefault();
+    const next = section.tabs[(i + step + section.tabs.length) % section.tabs.length];
+    onSelect(next);
+    requestAnimationFrame(() => document.getElementById(`tab-${next}`)?.focus());
+  };
+  return (
+    <div className="section-tabs">
+      <div className="seg-tabs" role="tablist" aria-label={`${section.label} pages`} onKeyDown={onKey}>
+        {section.tabs.map((t) => {
+          const Icon = PAGE[t].icon;
+          const on = t === view;
+          return (
+            <button
+              type="button"
+              role="tab"
+              id={`tab-${t}`}
+              key={t}
+              aria-selected={on}
+              tabIndex={on ? 0 : -1}
+              className={on ? 'active' : undefined}
+              onClick={() => onSelect(t)}
+            >
+              <Icon size={14} />
+              <span>{PAGE[t].tab}</span>
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
 
 export default function App() {
   const [health, setHealth] = useState<HealthResponse | null>(null);
@@ -200,6 +231,9 @@ export default function App() {
   const [receptionist, setReceptionist] = useState<boolean | null>(null);
   /** Views already opened this session — they skip the entrance animation. */
   const visited = useRef<Set<string>>(new Set()).current;
+  /** The tab each section was last on, so the sidebar brings you back to it. */
+  const lastTab = useRef<Record<string, BuiltinView>>({}).current;
+  const [seen, setSeen] = useState<Set<string>>(readSeen);
   const [theme, setThemeState] = useState<ThemeMode>(initialTheme);
   const [copied, setCopied] = useState(false);
 
@@ -304,7 +338,14 @@ export default function App() {
           const ui = (p.manifest as unknown as { ui?: { nav?: Array<Record<string, string>> } } | undefined)?.ui;
           for (const n of ui?.nav ?? []) {
             if (n.id && n.label) {
-              entries.push({ pluginId: p.id, navId: n.id, label: n.label, badge: n.badge });
+              entries.push({
+                pluginId: p.id,
+                pluginName: p.manifest?.name ?? p.id,
+                navId: n.id,
+                label: n.label,
+                icon: n.icon,
+                badge: n.badge,
+              });
             }
           }
         }
@@ -338,28 +379,77 @@ export default function App() {
   }, [view, pluginNav]);
 
   // Mark AFTER render: the first open of a view still animates, a return does not.
+  // A plugin screen once opened loses its "New" badge.
   useEffect(() => {
     visited.add(view);
-  }, [view, visited]);
+    const section = sectionOf(view);
+    if (section && section.tabs.length > 1) lastTab[section.id] = view as BuiltinView;
+    if (view.startsWith('plugin:')) {
+      const key = view.slice('plugin:'.length);
+      setSeen((prev) => {
+        if (prev.has(key)) return prev;
+        const next = new Set(prev).add(key);
+        writeSeen(next);
+        return next;
+      });
+    }
+  }, [view, visited, lastTab]);
 
-  // One derived state drives the engine card, the topbar readout and the dock.
+  const openSection = (s: Section) => setView(lastTab[s.id] ?? s.tabs[0]);
+
+  // One derived state drives the dock (and the topbar's warning when the API is down).
   const link: 'up' | 'down' | 'pending' = health ? 'up' : healthError ? 'down' : 'pending';
-  const engineClass =
-    link === 'up' ? 'engine-card' : `engine-card ${link === 'down' ? 'offline' : 'pending'}`;
+  const section = sectionOf(view);
   // A plugin screen has no PAGE entry — its heading comes from the nav entry the
   // plugin contributed.
   const pluginView = view.startsWith('plugin:') ? view.split(':') : null;
   const activePluginNav = pluginView
     ? pluginNav.find((n) => n.pluginId === pluginView[1] && n.navId === pluginView[2])
     : undefined;
-  const page = pluginView
+  const header = pluginView
     ? {
-        crumb: activePluginNav?.label ?? 'Plugin',
-        kicker: 'Connect',
+        kicker: 'Work',
         title: activePluginNav?.label ?? 'Plugin screen',
-        copy: `Provided by the ${pluginView[1]} plugin.`,
+        copy: `From the ${activePluginNav?.pluginName ?? pluginView[1]} plugin.`,
       }
-    : PAGE[view as BuiltinView];
+    : {
+        kicker: section?.group ?? 'Home',
+        title: section?.label ?? PAGE[view as BuiltinView].tab,
+        copy: PAGE[view as BuiltinView].copy,
+      };
+  const tabbed = section && section.tabs.length > 1 ? section : null;
+  const embedded = EMBEDDED.has(view);
+  const visibleSections = SECTIONS.filter((s) => s.id !== 'calendar' || receptionist === true);
+
+  const navButton = (s: Section) => {
+    const Icon = s.icon;
+    const active = section?.id === s.id;
+    const calling = s.id === 'agent' && onCall;
+    return (
+      <button
+        type="button"
+        key={s.id}
+        className={`${active ? 'active' : ''}${calling ? ' on-call' : ''}`}
+        aria-current={active ? 'page' : undefined}
+        /* Below 1240px the label <span> is display:none and the icon is
+           aria-hidden, which would leave the button with no accessible name at
+           all — so name it explicitly. The name stays the section's even on a
+           call (scripts find the Agent by it); the call is said in its description. */
+        aria-label={s.label}
+        aria-describedby={calling ? 'nav-on-call' : undefined}
+        title={calling ? 'Agent: on a call now. Open it to see the call.' : s.label}
+        onClick={() => openSection(s)}
+      >
+        <Icon size={18} />
+        <span>{s.label}</span>
+        {calling && (
+          <em className="nav-badge on-call" id="nav-on-call">
+            On call
+          </em>
+        )}
+      </button>
+    );
+  };
 
   return (
     <div className="app-shell">
@@ -371,75 +461,46 @@ export default function App() {
         <div className="brand">
           <strong>OAIY</strong>
           <span>Orchestrate AI Yourself</span>
-          <small>Connect. Draw. Expose.</small>
         </div>
 
         <nav aria-label="Primary">
-          {NAV.filter((item) => item.value !== 'calendar' || receptionist === true).map((item) => {
-            const Icon = item.icon;
-            return [
-              item.group && (
-                <span key={`group-${item.group}`} className="nav-group" aria-hidden>
-                  {item.group}
-                </span>
-              ),
-              <button
-                type="button"
-                key={item.value}
-                className={`${view === item.value ? 'active' : ''}${item.value === 'agent' && onCall ? ' on-call' : ''}`}
-                aria-current={view === item.value ? 'page' : undefined}
-                /* Below 1240px the label <span> is display:none and the icon is
-                   aria-hidden, which would leave the button with no accessible
-                   name at all — so name it explicitly. */
-                aria-label={item.value === 'agent' && onCall ? 'Agent (on a call now)' : item.label}
-                title={item.value === 'agent' && onCall ? 'Agent: on a call now. Open it to see the call.' : item.label}
-                onClick={() => setView(item.value)}
-              >
-                <Icon size={18} />
-                <span>{item.label}</span>
-                {item.value === 'agent' && onCall && <em className="nav-badge on-call">On call</em>}
-              </button>,
-            ];
-          })}
-
-          {/* Screens installed plugins contribute. Rendered after the built-ins so
-              a plugin can extend the app without displacing its own navigation. */}
-          {pluginNav.map((n) => {
-            const value: View = `plugin:${n.pluginId}:${n.navId}`;
-            return (
-              <button
-                type="button"
-                key={value}
-                className={view === value ? 'active' : ''}
-                aria-current={view === value ? 'page' : undefined}
-                aria-label={n.label}
-                title={`${n.label} — provided by the ${n.pluginId} plugin`}
-                onClick={() => setView(value)}
-              >
-                <Puzzle size={18} />
-                <span>{n.label}</span>
-                {n.badge && <em className="nav-badge">{n.badge}</em>}
-              </button>
+          {visibleSections.map((s, i) => {
+            const prev = visibleSections[i - 1];
+            const heading = s.group !== 'Home' && prev?.group !== s.group && (
+              <span key={`group-${s.group}`} className="nav-group" aria-hidden>
+                {s.group}
+              </span>
             );
+            // Screens installed plugins contribute go at the end of Work, after
+            // the built-ins, so a plugin extends the app without displacing them.
+            const plugins =
+              s.group === 'Setup' && prev?.group === 'Work'
+                ? pluginNav.map((n) => {
+                    const value: View = `plugin:${n.pluginId}:${n.navId}`;
+                    const Icon = (n.icon && PLUGIN_ICONS[n.icon]) || Puzzle;
+                    const isNew = !!n.badge && !seen.has(`${n.pluginId}:${n.navId}`);
+                    return (
+                      <button
+                        type="button"
+                        key={value}
+                        className={view === value ? 'active' : ''}
+                        aria-current={view === value ? 'page' : undefined}
+                        aria-label={n.label}
+                        title={`${n.label}, from the ${n.pluginName} plugin`}
+                        onClick={() => setView(value)}
+                      >
+                        <Icon size={18} />
+                        <span>{n.label}</span>
+                        {isNew && <em className="nav-badge">{n.badge}</em>}
+                      </button>
+                    );
+                  })
+                : null;
+            return [plugins, heading, navButton(s)];
           })}
         </nav>
 
         <div className="sidebar-fill" />
-
-        <div className={engineClass} title={healthError ?? undefined}>
-          <Server size={17} />
-          <span>
-            <strong>Local engine</strong>
-            <small>
-              {link === 'up'
-                ? `v${health?.version} · this device`
-                : link === 'down'
-                  ? 'Unreachable'
-                  : 'Checking…'}
-            </small>
-          </span>
-          <i />
-        </div>
 
         <button
           className={view === 'settings' ? 'settings active' : 'settings'}
@@ -452,50 +513,27 @@ export default function App() {
           <Settings2 size={18} />
           <span>Settings</span>
         </button>
-
-        <div className="trust">
-          <LockKeyhole size={13} />
-          <span>Keys stay on this device</span>
-        </div>
       </aside>
 
       <main id="main" className="workspace" tabIndex={-1}>
-        <header className="topbar">
+        <header className={tabbed ? 'topbar has-tabs' : 'topbar'}>
           <div className="top-title">
-            <span>
-              OAIY <ChevronRight size={12} /> Desktop
-            </span>
-            <div>
-              <h1>{page.crumb}</h1>
-              <em>Local</em>
-              <small
-                className={
-                  link === 'down' ? 'is-error' : link === 'pending' ? 'is-pending' : undefined
-                }
-                role="status"
-                title={healthError ?? undefined}
-              >
-                {link === 'up' ? (
-                  <>
-                    <Check size={13} />
-                    API v{health?.version}
-                  </>
-                ) : link === 'down' ? (
-                  <>
-                    <TriangleAlert size={13} />
-                    API unreachable
-                  </>
-                ) : (
-                  <>
-                    <LoaderCircle size={13} />
-                    Checking…
-                  </>
-                )}
-              </small>
-            </div>
+            <span className="top-kicker">{header.kicker}</span>
+            <h1>{header.title}</h1>
+            <p title={header.copy}>{header.copy}</p>
           </div>
 
           <div className="top-actions">
+            {link === 'down' && (
+              <button
+                type="button"
+                className="top-alert"
+                title={healthError ?? undefined}
+                onClick={() => setView('services')}
+              >
+                <TriangleAlert size={13} /> API unreachable
+              </button>
+            )}
             {/* One button showing the theme you would switch TO, matching the
                 web app. The label is an action rather than a state, so
                 aria-pressed is gone: this does something, it does not report
@@ -510,40 +548,32 @@ export default function App() {
               {theme === 'dark' ? <Sun size={16} /> : <Moon size={16} />}
             </button>
             <button
-              className="button secondary"
+              className="button secondary top-site"
               type="button"
+              title="oaiy.com, in your browser"
               onClick={() => openExternal('https://oaiy.com')}
             >
-              oaiy.com <ExternalLink size={13} />
+              <span>oaiy.com</span> <ExternalLink size={13} />
             </button>
           </div>
         </header>
 
         <section className={`view view-${view}`}>
-          {/* keyed so React remounts the scroller on a view change — otherwise
-              the next view opens at the previous one's scroll offset, i.e.
-              mid-content. */}
+          {tabbed && <SectionTabs section={tabbed} view={view} onSelect={setView} />}
+          {/* A page in a webview of its own: the desktop lays it over this box. */}
+          {embedded && <EmbeddedPage page={view as 'agent' | 'flows' | 'engines'} />}
           {/* Keyed so React remounts the scroller on a view change — otherwise
               the next view opens at the previous one's scroll offset. `revisit`
               suppresses the entrance animation the second time you open a panel,
               so navigation feels instant instead of replaying a staggered reveal
-              on every switch. */}
-          {(view === 'agent' || view === 'flows' || view === 'engines') && <EmbeddedPage page={view} />}
-          {/* `page-fill`: a plugin screen fills the page down to the dock and
-              scrolls on its own, so the page itself does not scroll as well. */}
+              on every switch. `page-fill`: a plugin screen fills the page down
+              to the dock and scrolls on its own. */}
           <div
-            hidden={view === 'agent' || view === 'flows' || view === 'engines'}
+            hidden={embedded}
             className={`content-page${visited.has(view) ? ' revisit' : ''}${pluginView ? ' page-fill' : ''}`}
             key={view}
           >
             <PairingPrompt />
-            <div className="page-intro">
-              <div>
-                <span className="kicker">{page.kicker}</span>
-                <h2>{page.title}</h2>
-                <p>{page.copy}</p>
-              </div>
-            </div>
             {view === 'overview' && (
               <OverviewPanel
                 onNavigate={(v) => setView(v)}
@@ -565,21 +595,24 @@ export default function App() {
           </div>
         </section>
 
-        <footer className={link === 'down' ? 'endpoint-dock offline' : 'endpoint-dock'}>
-          <button type="button" onClick={() => setView('services')}>
+        <footer className={link === 'down' ? 'endpoint-dock offline' : link === 'pending' ? 'endpoint-dock pending' : 'endpoint-dock'}>
+          <button
+            type="button"
+            className="dock-status"
+            title={healthError ?? 'The services this machine runs'}
+            onClick={() => setView('services')}
+          >
             <i />
             <span>
               <strong>
-                {link === 'up'
-                  ? 'Local API running'
-                  : link === 'down'
-                    ? 'Local API down'
-                    : 'Local API…'}
+                {link === 'up' ? 'Local API running' : link === 'down' ? 'Local API down' : 'Local API…'}
               </strong>
-              <small>localhost only</small>
+              <small>
+                {link === 'up' ? `v${health?.version} · ` : ''}localhost only
+              </small>
             </span>
           </button>
-          <div>
+          <div className="dock-endpoint">
             <code>{API_BASE}</code>
             <button
               type="button"
@@ -593,17 +626,9 @@ export default function App() {
               {copied ? <Check size={14} /> : <Copy size={14} />}
             </button>
           </div>
-          <em className={link === 'up' ? 'ok' : link === 'down' ? 'bad' : ''}>
-            {link === 'up' ? <Check size={12} /> : <LoaderCircle size={12} />}
-            {link === 'up' ? `v${health?.version}` : link === 'down' ? 'offline' : 'checking'}
+          <em className="dock-trust">
+            <LockKeyhole size={12} /> Keys stay on this device
           </em>
-          <em>
-            <LockKeyhole size={12} /> Local only
-          </em>
-          {/* The flow editor is a page of this app now, not a website. */}
-          <button type="button" className="dock-link" onClick={() => setView('flows')}>
-            Open Flows <ChevronRight size={13} />
-          </button>
         </footer>
       </main>
     </div>
