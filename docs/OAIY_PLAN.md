@@ -201,6 +201,7 @@ Tried on the Pixel 9a test phone, on the dongle, with the Qwen 27B model on this
 - Decided: the desktop host is `platform/desktop`; the engines run in its process; flows stay
   and join the agent; the agent owns conversations and flows own records by default; speech
   is OAIY's own (Parakeet and Qwen3-TTS in Rust on the GPU); Aokie's servers stay as services.
+- Waiting for a use: `/v1/realtime` (the OpenAI Realtime API over the same call sessions); the phone is served by Aokie's `desktop_realtime`, and nothing else asks for it yet.
 - Open: the order in which pages move into the shell; whether the engines' control API keeps
   its own port or joins 17972; which receptionist voices OAIY ships beyond its own.
 
