@@ -1114,6 +1114,8 @@ export class Sessions {
       if (holding) clearTimeout(holding);
       holding = null;
     };
+    // end_call has run: nothing more is said in this run, whatever tool answers after it.
+    let goodbye = false;
     try {
       await session.agent.run(prompt, (event) => {
         if (event.type === 'done') said = event.text;
@@ -1127,8 +1129,9 @@ export class Sessions {
           session.inTool = false;
           stopHolding();
           // What it says next is heard, even if the caller spoke over the words before the tool;
-          // but nothing after the goodbye (end_call): the call is ending.
-          if (event.result.name !== 'end_call') session.speech?.begin(true);
+          // but nothing after the goodbye (end_call), even when another tool of the same reply answers after it: the call is ending.
+          if (event.result.name === 'end_call') goodbye = true;
+          if (!goodbye) session.speech?.begin(true);
         }
         if (session.speech && event.type === 'text') session.speech.push(event.delta);
         // A reply ends (a tool is called, or the model's turn is over): what it said is complete.

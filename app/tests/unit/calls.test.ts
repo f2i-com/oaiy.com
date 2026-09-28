@@ -269,6 +269,19 @@ describe('a phone call answered by the agent', () => {
     expect(call?.agent.turns.at(-1)).toMatchObject({ text: '[OAIY] 📞 The call ended.' });
   });
 
+  it('nothing is said after the goodbye, even when another tool of the same reply answers after end_call', async () => {
+    const fake = fakeProvider('openai', [
+      { calls: [{ name: 'end_call', input: { goodbye: 'Thanks, bye!' } }, { name: 'remember', input: { fact: 'Mows fortnightly' } }] },
+      { text: 'Done. I saved that for next time.' },
+    ]);
+    const { sessions, calls } = setup();
+    await sessions.callEvent({ type: 'call.started', callId: 'call_g', from: '+61400000020' });
+    await sessions.callEvent({ type: 'call.caller', callId: 'call_g', text: "That's all, bye." });
+    await settled(sessions);
+    expect(fake.bodies).toHaveLength(2);
+    expect(calls).toEqual([['finish', 'call_g', 'Thanks, bye!']]);
+  });
+
   it('on a call the model does not think first, and has a short list of tools', async () => {
     const fake = fakeProvider('openai', [{ text: 'Hello!' }]);
     const { sessions } = setup(LOCAL);
