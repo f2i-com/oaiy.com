@@ -20,6 +20,8 @@ const { servicesMock, pluginsMock, providersMock, pairedMock, statusMock, nodeIn
   }));
 
 const calendarMock = vi.hoisted(() => vi.fn());
+const syncMock = vi.hoisted(() => vi.fn());
+const linkMock = vi.hoisted(() => vi.fn());
 vi.mock('./api', () => ({
   services: { list: servicesMock },
   plugins: { list: pluginsMock },
@@ -31,7 +33,8 @@ vi.mock('./api', () => ({
   openExternal: vi.fn(),
   // Today's tiles (TodayPanel): nothing to show.
   phone: { status: vi.fn().mockRejectedValue(new Error('no phone')), calls: vi.fn().mockRejectedValue(new Error('no phone')) },
-  calendar: { get: (...a: unknown[]) => calendarMock(...a) },
+  calendar: { get: (...a: unknown[]) => calendarMock(...a), syncStatus: (...a: unknown[]) => syncMock(...a) },
+  link: { status: (...a: unknown[]) => linkMock(...a) },
   engines: { status: vi.fn().mockRejectedValue(new Error('no engines')) },
 }));
 
@@ -74,6 +77,8 @@ beforeEach(() => {
   pairedMock.mockResolvedValue({ paired: [] });
   statusMock.mockResolvedValue(runtime(3));
   calendarMock.mockRejectedValue(new Error('no calendar'));
+  syncMock.mockRejectedValue(new Error('no calendar'));
+  linkMock.mockResolvedValue({ linked: false, attempt: { phase: 'idle' }, available: [] });
   host = document.createElement('div');
   document.body.appendChild(host);
   root = createRoot(host);
@@ -98,6 +103,32 @@ describe("Today's tiles", () => {
     expect(text()).not.toContain('The phone');
     expect(text()).not.toContain('Next appointment');
     expect(text()).toContain('Language model');
+  });
+
+  it('says nothing about FormLogic while unlinked', async () => {
+    await mount();
+    expect(text()).not.toContain('FormLogic:');
+  });
+
+  it('tells the truth when FormLogic cannot be reached: offline, when it last synced, and what waits', async () => {
+    const lastSync = new Date(Date.now() - 12 * 60_000).toISOString();
+    syncMock.mockResolvedValue({ linked: true, state: 'offline', at: new Date().toISOString(), lastSuccessAt: lastSync, pulled: 0, pushed: 0, error: 'formlogic.com can’t be reached: it did not answer in time', pending: { creates: 1, updates: 1, deletes: 0, total: 2 } });
+    linkMock.mockResolvedValue({ linked: true, heartbeatError: 'formlogic.com can’t be reached', outbox: { waiting: 3, lastError: 'formlogic.com can’t be reached' }, attempt: { phase: 'idle' }, available: [] });
+    await mount();
+    expect(text()).toContain('FormLogic: Offline');
+    expect(text()).toContain('last synced 12 min ago');
+    expect(text()).toContain('5 changes waiting');
+    await act(async () => button('FormLogic: Offline')!.click());
+    expect(onNavigate).toHaveBeenCalledWith('connections');
+  });
+
+  it('says when it last synced when all is well', async () => {
+    syncMock.mockResolvedValue({ linked: true, state: 'synced', at: new Date().toISOString(), lastSuccessAt: new Date().toISOString(), pulled: 0, pushed: 0, error: null, pending: { creates: 0, updates: 0, deletes: 0, total: 0 } });
+    linkMock.mockResolvedValue({ linked: true, lastHeartbeatAt: new Date().toISOString(), outbox: { waiting: 0 }, attempt: { phase: 'idle' }, available: [] });
+    await mount();
+    expect(text()).toContain('FormLogic: Synced');
+    expect(text()).toContain('just now');
+    expect(text()).not.toContain('waiting');
   });
 });
 

@@ -581,6 +581,10 @@ export interface LinkStatus {
    *  they show up on the provider's website as "no desktop picked it up in
    *  time", which reads as a broken connection rather than a lane erroring. */
   relayError?: string;
+  /** When this desktop last looked at the account's queued flow runs, and why
+   *  it stopped if it did (a run it claimed and could not report on). */
+  lastFlowRunAt?: string;
+  flowRunError?: string;
   /** Which lanes the linked connector declares at all, so the UI can tell a
    *  lane that is broken from one this provider never had. Absent from an older
    *  host, hence optional. */
@@ -604,6 +608,8 @@ export interface LinkStatus {
   };
   dataNodeError?: string;
   dataNodeSupported?: boolean;
+  /** Plugin events kept for the account until FormLogic can take them. */
+  outbox?: { waiting: number; oldestAt?: string | null; lastError?: string | null; lastSentAt?: string | null; nextAttemptAt?: string | null };
   attempt: LinkPhase;
   /** Every provider this build can link to — the UI hardcodes no list. */
   available: LinkConnector[];
@@ -759,7 +765,7 @@ export interface DeadLetter {
   id: string;
   source: string;
   event: string;
-  reason: { kind: 'shed' | 'not_reserved'; detail?: string };
+  reason: { kind: 'shed' | 'not_reserved' | 'not_delivered'; detail?: string };
   envelope: unknown;
   recordedAtMs: number;
   attempts: number;
@@ -1150,12 +1156,25 @@ export interface NewAppointment {
   source?: string;
 }
 
+/** How the calendar's sync with FormLogic stands. */
 export interface CalendarSync {
   linked: boolean;
+  /** `offline`: FormLogic could not be reached; `error`: it answered, and refused.
+   *  Absent from an older desktop. */
+  state?: 'unlinked' | 'waiting' | 'syncing' | 'synced' | 'offline' | 'error';
+  /** When the last sync was tried. */
   at: string | null;
+  /** When a sync last went through. */
+  lastSuccessAt?: string | null;
+  nextAttemptAt?: string | null;
   pulled: number;
   pushed: number;
+  removed?: number;
+  /** Changes made here that FormLogic has not had yet. */
+  pending?: { creates: number; updates: number; deletes: number; total: number };
   error: string | null;
+  /** Appointments FormLogic would not take, and why (sent again once changed here). */
+  problems?: { id: string; message: string }[];
 }
 
 export const calendar = {

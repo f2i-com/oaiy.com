@@ -348,6 +348,18 @@ pub fn last() -> Report {
             if report.last_success_at.is_none() {
                 report.last_success_at = book.sync.last_success_at.clone();
             }
+            // What FormLogic refuses now, not only what the last sync tried:
+            // one set aside stays set aside until it changes here.
+            let mut problems: Vec<Problem> = book
+                .appointments
+                .iter()
+                .filter_map(|a| {
+                    let r = remote(a);
+                    refused_now(a, &r).then(|| Problem { id: a.id.clone(), message: r.refused.map(|x| x.message).unwrap_or_default() })
+                })
+                .collect();
+            problems.extend(report.problems.iter().filter(|p| !book.appointments.iter().any(|a| a.id == p.id)).cloned());
+            report.problems = problems;
         }
     }
     report

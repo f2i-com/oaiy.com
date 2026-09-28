@@ -53,7 +53,9 @@ export default function DeadLetters() {
       // what happened rather than just "failed".
       setNote(
         r.reserved
-          ? `Redrive reserved a run for ${item.event}.`
+          ? item.reason.kind === 'not_delivered'
+            ? `${item.event} is waiting to be sent to the linked account again.`
+            : `Redrive reserved a run for ${item.event}.`
           : `${item.event} is still not running — ${r.outcomes.join('; ') || 'no binding matched'}`,
       );
       await refresh();
@@ -95,7 +97,7 @@ export default function DeadLetters() {
           <li key={d.id} className="run-row">
             <div className="run-head">
               <span className="badge badge-err">
-                {d.reason.kind === 'shed' ? 'dropped' : 'not run'}
+                {d.reason.kind === 'shed' ? 'dropped' : d.reason.kind === 'not_delivered' ? 'not sent to FormLogic' : 'not run'}
               </span>
               <strong className="run-flow">{d.event}</strong>
               <span className="run-meta">

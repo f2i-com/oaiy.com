@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { CalendarPlus, Check, ChevronLeft, ChevronRight, MessageSquare, Phone, Plus, RefreshCw, Trash2, Volume2, X } from 'lucide-react';
 import { calendar, voices, type Appointment, type AppointmentStatus, type CalendarService, type CalendarSettings, type CalendarSync, type NewAppointment, type VoiceClip } from './api';
 import { useToast } from './Toasts';
+import { describeSync } from './syncStatus';
 
 /**
  * The calendar: the week's appointments, the requests waiting for someone to
@@ -42,12 +43,6 @@ function sayWhen(start: string): string {
   const [date, time] = start.split('T');
   const d = parseYmd(date);
   return `${DAYS[(d.getDay() + 6) % 7]} ${d.getDate()} ${d.toLocaleString(undefined, { month: 'short' })}, ${sayTime(time ?? '00:00')}`;
-}
-
-/** "just now", "3 min ago". */
-function ago(iso: string): string {
-  const s = Math.max(0, (Date.now() - new Date(iso).getTime()) / 1000);
-  return s < 45 ? 'just now' : s < 3600 ? `${Math.round(s / 60)} min ago` : `${Math.round(s / 3600)} h ago`;
 }
 
 const STATUS_LABEL: Record<AppointmentStatus, string> = {
@@ -114,6 +109,8 @@ export default function CalendarPanel() {
     }
   };
 
+  const syncView = useMemo(() => describeSync(sync, null), [sync]);
+  const everyone = useMemo(() => [...appointments, ...requests], [appointments, requests]);
   const days = useMemo(() => Array.from({ length: 7 }, (_, i) => addDays(week, i)), [week]);
   // The grid spans the opening hours (with an hour either side), or 8 to 6.
   const [firstHour, lastHour] = useMemo(() => {
@@ -129,6 +126,19 @@ export default function CalendarPanel() {
   return (
     <div className="panel calendar">
       {error && <div className="banner banner-err">⚠ {error}</div>}
+      {sync?.linked && (sync.problems?.length ?? 0) > 0 && (
+        <div className="banner banner-err" role="status">
+          FormLogic would not take {sync.problems!.length === 1 ? 'an appointment' : `${sync.problems!.length} appointments`}:{' '}
+          {sync.problems!
+            .slice(0, 3)
+            .map((p) => {
+              const a = everyone.find((x) => x.id === p.id);
+              return `${a ? `${a.service || 'Appointment'}, ${sayWhen(a.start)}` : 'one'} (${p.message})`;
+            })
+            .join('; ')}
+          . It is kept here, and sent again once it is changed.
+        </div>
+      )}
 
       <div className="section-title-row">
         <div className="seg">
@@ -161,9 +171,19 @@ export default function CalendarPanel() {
         <button className="btn-tiny" onClick={() => void refresh()} title="Refresh now">
           <RefreshCw size={13} />
         </button>
-        {sync?.linked && (
-          <span className={`cal-sync${sync.error ? ' cal-sync-err' : ''}`} title={sync.error ?? `Last sync: ${sync.pulled} in, ${sync.pushed} out`}>
-            {sync.error ? 'FormLogic: sync failed' : sync.at ? `FormLogic · ${ago(sync.at)}` : 'FormLogic'}
+        {syncView && sync && (
+          <span
+            className={`cal-sync${syncView.tone === 'err' || syncView.tone === 'warn' ? ' cal-sync-err' : ''}`}
+            title={[
+              sync.error,
+              sync.nextAttemptAt && sync.state !== 'synced' ? `Next try ${new Date(sync.nextAttemptAt).toLocaleTimeString()}` : null,
+              sync.at ? `Last sync: ${sync.pulled} in, ${sync.pushed} out` : null,
+              'The calendar works without FormLogic; changes made here are sent when it can be reached.',
+            ]
+              .filter(Boolean)
+              .join('\n')}
+          >
+            FormLogic: {syncView.headline} · {syncView.detail}
             <button
               className="btn-tiny"
               disabled={syncing}
@@ -172,6 +192,8 @@ export default function CalendarPanel() {
                 try {
                   setSync(await calendar.syncNow());
                   await refresh();
+                } catch (e) {
+                  toast.push({ kind: 'error', title: 'Could not sync now', body: String(e instanceof Error ? e.message : e) });
                 } finally {
                   setSyncing(false);
                 }

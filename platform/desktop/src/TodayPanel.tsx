@@ -1,11 +1,14 @@
 import { useCallback, useEffect, useState } from 'react';
-import { CalendarClock, Cpu, Inbox, Phone } from 'lucide-react';
-import { calendar, engines, phone, type Appointment, type EnginesStatus } from './api';
+import { CalendarClock, Cloud, CloudOff, Cpu, Inbox, Phone } from 'lucide-react';
+import { calendar, engines, link, phone, type Appointment, type CalendarSync, type EnginesStatus, type LinkStatus } from './api';
+import { describeSync } from './syncStatus';
 
 /**
  * Today, at the top of Overview: whether the phone is connected (and a call
- * live), whether the language model is loaded, the next appointments, and the
- * requests waiting for someone to confirm them. Each tile opens its page.
+ * live), whether the language model is loaded, the next appointments, the
+ * requests waiting for someone to confirm them, and, when linked, how this
+ * desktop stands with FormLogic (everything here works without it). Each tile
+ * opens its page.
  */
 
 const POLL_MS = 10_000;
@@ -24,15 +27,17 @@ function sayWhen(start: string): string {
   return `${d.toLocaleDateString(undefined, { weekday: 'short', day: 'numeric', month: 'short' })}, ${clock}`;
 }
 
-export default function TodayPanel({ onNavigate }: { onNavigate: (view: 'agent' | 'calendar' | 'engines') => void }) {
+export default function TodayPanel({ onNavigate }: { onNavigate: (view: 'agent' | 'calendar' | 'engines' | 'connections') => void }) {
   const [phoneState, setPhoneState] = useState<{ connected: boolean; onCall: boolean } | null>(null);
   const [model, setModel] = useState<EnginesStatus | null>(null);
   const [upcoming, setUpcoming] = useState<Appointment[] | null>(null);
   /** The phone receptionist is installed: the phone and its calendar are shown. */
   const [receptionist, setReceptionist] = useState(true);
+  const [sync, setSync] = useState<CalendarSync | null>(null);
+  const [linked, setLinked] = useState<LinkStatus | null>(null);
 
   const refresh = useCallback(async () => {
-    const [p, calls, e, cal] = await Promise.allSettled([phone.status(), phone.calls(), engines.status(), calendar.get(ymd(new Date()))]);
+    const [p, calls, e, cal, s, l] = await Promise.allSettled([phone.status(), phone.calls(), engines.status(), calendar.get(ymd(new Date())), calendar.syncStatus(), link.status()]);
     setPhoneState(p.status === 'fulfilled' ? { connected: p.value.connected, onCall: calls.status === 'fulfilled' && calls.value.length > 0 } : null);
     setModel(e.status === 'fulfilled' ? e.value : null);
     if (cal.status === 'fulfilled') {
@@ -40,7 +45,10 @@ export default function TodayPanel({ onNavigate }: { onNavigate: (view: 'agent' 
       const now = `${ymd(new Date())}T${pad(new Date().getHours())}:${pad(new Date().getMinutes())}`;
       setUpcoming(cal.value.appointments.filter((a) => (a.status === 'confirmed' || a.status === 'requested') && a.start >= now));
     }
+    setSync(s.status === 'fulfilled' ? s.value : null);
+    setLinked(l.status === 'fulfilled' ? l.value : null);
   }, []);
+  const formlogic = describeSync(sync, linked);
 
   useEffect(() => {
     void refresh();
@@ -85,6 +93,17 @@ export default function TodayPanel({ onNavigate }: { onNavigate: (view: 'agent' 
               <small>{requests.length === 1 ? 'Request to confirm' : 'Requests to confirm'}</small>
             </button>
           </>
+        )}
+        {formlogic && (
+          <button
+            className="overview-tile"
+            onClick={() => onNavigate('connections')}
+            title={[sync?.error, linked?.heartbeatError, linked?.outbox?.lastError, 'Calls, the calendar and the agent work without FormLogic; what changed here is sent when it can be reached.'].filter(Boolean).join('\n')}
+          >
+            {formlogic.headline === 'Offline' ? <CloudOff size={16} aria-hidden /> : <Cloud size={16} aria-hidden />}
+            <strong className={formlogic.tone === 'ok' ? 'ok' : formlogic.tone === 'neutral' ? undefined : 'warn'}>FormLogic: {formlogic.headline}</strong>
+            <small>{formlogic.detail}</small>
+          </button>
         )}
       </div>
     </section>

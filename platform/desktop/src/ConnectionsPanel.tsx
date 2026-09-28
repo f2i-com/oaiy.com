@@ -485,6 +485,26 @@ export default function ConnectionsPanel() {
                       Connecting to the command lane…
                     </small>
                   ))}
+                {/* Events for the account (the phone's calls and texts) are
+                    kept here while it cannot be reached, and sent in order
+                    once it can: say how many, and why they wait. */}
+                {(account.outbox?.waiting ?? 0) > 0 && (
+                  <small role="status" style={{ display: 'block', marginTop: 3, color: account.outbox?.lastError ? 'var(--danger)' : undefined }}>
+                    {account.outbox!.waiting} event{account.outbox!.waiting === 1 ? '' : 's'} waiting to reach the account
+                    {account.outbox?.lastError ? `: ${account.outbox.lastError}` : ''}
+                    {account.outbox?.nextAttemptAt ? ` · next try ${new Date(account.outbox.nextAttemptAt).toLocaleTimeString()}` : ''}
+                  </small>
+                )}
+                {account.flowRunError && (
+                  <small style={{ display: 'block', marginTop: 3, color: 'var(--danger)' }}>
+                    Flow runs: {account.flowRunError}
+                  </small>
+                )}
+                {account.dataNodeSupported && account.dataNodeError && (
+                  <small style={{ display: 'block', marginTop: 3, color: 'var(--danger)' }}>
+                    Storage node: {account.dataNodeError}
+                  </small>
+                )}
               </span>
               <button className="btn-tiny btn-danger" onClick={() => void unlink()}>
                 Disconnect
