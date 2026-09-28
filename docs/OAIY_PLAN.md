@@ -190,10 +190,11 @@ Tried on the Pixel 9a test phone, on the dongle, with the Qwen 27B model on this
 
 | Step | Done, and how it was tried | Not yet |
 |---|---|---|
-| 2. Text messages | Text threads as sessions; answering (off by default, one lease-holding page); a text delivered again is not answered twice; the reply goes out through Aokie. Texts from the phone arrive, and sends were proven once Google Messages was rolled back (see Known issues). | Turning on answering for real traffic |
-| 3. One desktop | The OAIY window shows the agent (Agent) and the flow editor (Flows) as pages of their own origin, cross-origin isolated, beside the sidebar. The agent's page is made at startup, so calls and texts are answered whatever the window shows. The web app stays optional and pairs. | The engines started in-process (the Studio still runs on its own); pages moving into the shell |
+| 2. Text messages | Text threads as sessions; answering (on since 28 Sept, one lease-holding page); a text delivered again is not answered twice; the reply goes out through Aokie. A thread can see the calendar's free times and ask for an appointment. Texts from the phone arrive, and sends were proven once Google Messages was rolled back (see Known issues). | An answered text on the live phone |
+| 3. One desktop | The OAIY window shows the agent (Agent), the flow editor (Flows) and the engines' control pages (Engines) beside the sidebar; the agent's page takes the window's look. The agent's page is made at startup, so calls and texts are answered whatever the window shows. The window opens with OAIY, and launching OAIY again brings it back (one instance). The engines run in the desktop's process (`engines.rs`; a debug build uses a running `oaiy-studio`, so a rebuild does not unload the model); this machine's Studio configuration moved to `<data>/engines/`. The web app stays optional and pairs. | Pages moving into the shell |
 | 4. Flows | A flow is made a tool in the editor ("Make it a tool for the agent…"), and the agent uses it (`make_greeting`, run through the bridge). | Flows as project files; the agent writing flows; an agent node |
-| 5. Voice | Calls answered by the agent through Aokie's `desktop_realtime` on 17872: the greeting plays whole, and replies are heard 2–3 s after the caller stops (one output item per reply). Appointment requests reach Aokie. On goodbye it says a short goodbye and hangs up (tried on a stand-in call; the last real call was before that change). `transcribe_audio`: a 42 s recording written out word for word. | The native voice worker (above); a business lookup for OAIY; `/v1/realtime` |
+| Calendar | Hours, services and appointments on the desktop (`<data>/calendar/calendar.json`), a Calendar page (week, requests to confirm with an optional text, hours and services). The phone's `business-lookup` is answered from it (free times, the caller's own appointments), and a call's agreed appointment is recorded as a request. The agent lists, books and changes appointments. It syncs with FormLogic's appointments form every minute while linked (tried both ways on the linked account). | Deletions synced (FormLogic has no change feed); FormLogic's missing `updatedSince` and version check |
+| 5. Voice | Calls answered by the agent through Aokie's `desktop_realtime` on 17872: the greeting plays whole, and replies are heard 2–3 s after the caller stops (one output item per reply). Appointment requests reach Aokie. On goodbye it says a short goodbye and hangs up (tried on a stand-in call; the last real call was before that change). `transcribe_audio`: a 42 s recording written out word for word. | The native voice worker (above; Parakeet and Qwen3-TTS 0.6B on CUDA are being built on branches `voice-engine` and `voice-tts`); `/v1/realtime` |
 
 ## Decided, and still open
 
@@ -209,9 +210,9 @@ Tried on the Pixel 9a test phone, on the dongle, with the Qwen 27B model on this
 - **Texts stuck on "Sending…" on Android 17.** The Google Messages open beta takes over texts
   sent by other apps (Bluetooth included) and never sends them. Roll it back and leave the beta:
   see [Aokie's contract](ecosystem/AOKIE_CONTRACT.md#what-smssent-means-and-texts-stuck-on-sending).
-- **No business lookup without FormLogic.** Aokie's `lookup_business_data` runs the
-  `business-lookup` flow, which comes with FormLogic's receptionist pack and reads its bookings.
-  OAIY Desktop has none, so the agent is told it can't check. It then offers to take a request.
+- **A plugin's `flow.run` returned no result** until 28 Sept: the host reserved an async run and
+  answered `{runId, status}`, so Aokie's lookups always read "LOOKUP UNAVAILABLE". It now waits
+  within the plugin's budget, and `business-lookup` is answered by the calendar.
 - **Names on calls are misheard** by speech-to-text ("Lanes" for "Lance"). The appointment
   request records what was heard.
 
