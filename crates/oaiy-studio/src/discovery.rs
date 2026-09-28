@@ -111,6 +111,41 @@ fn names(section: Option<&Json>) -> Vec<(String, Json)> {
         .unwrap_or_default()
 }
 
+/// The files each kind of model names, by field (what `missing_files` checks).
+const LLM_FILES: [&str; 3] = ["path", "vision_projector", "lora"];
+const IMAGE_FILES: [&str; 7] = ["base", "transformer", "safetensors_transformer", "adapter", "text_encoder", "checkpoint", "tokenizer"];
+const VIDEO_FILES: [&str; 8] = ["transformer", "text_encoder", "vae", "tokenizer", "audio_vae", "dev_transformer", "spatial_upscaler", "id_lora"];
+const SPEECH_FILES: [&str; 3] = ["design", "base", "breeze"];
+const MUSIC_FILES: [&str; 2] = ["path", "language_model"];
+const SOUND_FILES: [&str; 1] = ["path"];
+const MODEL3D_FILES: [&str; 5] = ["path", "dino", "naf", "matte", "upscaler"];
+
+/// The fields of `m` among `keys` naming a file or folder that is not on this
+/// machine (relative paths are beside the studio), and its LoRAs' as `loras[i]`.
+/// A model whose files are gone (moved, a drive unplugged, a download not
+/// finished) is still configured, but cannot run.
+pub fn missing_files(root: &std::path::Path, m: &Json, keys: &[&str]) -> Vec<String> {
+    let absent = |v: &str| !v.trim().is_empty() && !crate::config::resolve(root, v).exists();
+    let mut out: Vec<String> = keys.iter().filter(|k| absent(str_or(m, k, ""))).map(|k| k.to_string()).collect();
+    for (i, lora) in m.get("loras").and_then(Json::as_array).unwrap_or(&[]).iter().enumerate() {
+        if absent(str_or(lora, "path", "")) {
+            out.push(format!("loras[{i}]"));
+        }
+    }
+    out
+}
+
+/// `entry` with `files_present` and `missing_files` added.
+fn with_files(entry: Json, missing: Vec<String>) -> Json {
+    let mut e = match entry {
+        Json::Obj(v) => v,
+        other => return other,
+    };
+    e.push(("files_present".into(), Json::Bool(missing.is_empty())));
+    e.push(("missing_files".into(), Json::Arr(missing.into_iter().map(Json::Str).collect())));
+    Json::Obj(e)
+}
+
 /// The document. `authorized`: the caller may see models and routes.
 pub fn document(studio: &Studio, base: &str, authorized: bool) -> Json {
     let cfg = studio.config();
@@ -157,12 +192,15 @@ pub fn document(studio: &Studio, base: &str, authorized: bool) -> Json {
         .filter(|m| bool_or(m, "enabled", true))
         .map(|m| {
             let name = str_or(m, "name", "");
-            Json::obj([
-                ("id", Json::str(name)),
-                ("default", Json::Bool(name == llm_default)),
-                ("loaded", Json::Bool(loaded.iter().any(|l| l == name))),
-                ("vision", Json::Bool(!str_or(m, "vision_projector", "").is_empty())),
-            ])
+            with_files(
+                Json::obj([
+                    ("id", Json::str(name)),
+                    ("default", Json::Bool(name == llm_default)),
+                    ("loaded", Json::Bool(loaded.iter().any(|l| l == name))),
+                    ("vision", Json::Bool(!str_or(m, "vision_projector", "").is_empty())),
+                ]),
+                missing_files(&studio.root, m, &LLM_FILES),
+            )
         })
         .collect();
     let section = |kind: &str| media.get(kind).filter(|s| bool_or(s, "enabled", true));
@@ -177,7 +215,7 @@ pub fn document(studio: &Studio, base: &str, authorized: bool) -> Json {
         .into_iter()
         .map(|(name, m)| {
             let sdxl = str_or(&m, "architecture", "qwen-image") == "sdxl";
-            Json::obj([
+            let entry = Json::obj([
                 ("id", Json::str(&name)),
                 ("default", Json::Bool(name == image_default)),
                 ("architecture", Json::str(if sdxl { "sdxl" } else { "qwen-image" })),
@@ -186,7 +224,8 @@ pub fn document(studio: &Studio, base: &str, authorized: bool) -> Json {
                 ("size_step", Json::Int(if sdxl { 64 } else { 32 })),
                 ("default_size", Json::str(format!("{}x{}", int_or(&m, "width", 1024), int_or(&m, "height", 1024)))),
                 ("negative_prompt", Json::Bool(sdxl)),
-            ])
+            ]);
+            with_files(entry, missing_files(&studio.root, &m, &IMAGE_FILES))
         })
         .collect();
     let video = section("video");
@@ -195,7 +234,7 @@ pub fn document(studio: &Studio, base: &str, authorized: bool) -> Json {
     let video_models: Vec<Json> = names(video)
         .into_iter()
         .map(|(name, m)| {
-            Json::obj([
+            let entry = Json::obj([
                 ("id", Json::str(&name)),
                 ("default", Json::Bool(name == video_default)),
                 ("family", Json::str(str_or(&m, "family", &name))),
@@ -206,7 +245,8 @@ pub fn document(studio: &Studio, base: &str, authorized: bool) -> Json {
                 ("start_image", Json::Bool(true)),
                 // Speech generated with the picture, lips in sync, in a saved voice (ID-LoRA).
                 ("lip_sync", Json::Bool(!str_or(&m, "id_lora", "").trim().is_empty())),
-            ])
+            ]);
+            with_files(entry, missing_files(&studio.root, &m, &VIDEO_FILES))
         })
         .collect();
     let speech = section("speech");
@@ -216,7 +256,7 @@ pub fn document(studio: &Studio, base: &str, authorized: bool) -> Json {
         .into_iter()
         .map(|(name, m)| {
             let breeze = !str_or(&m, "breeze", "").is_empty();
-            Json::obj([
+            let entry = Json::obj([
                 ("id", Json::str(&name)),
                 ("default", Json::Bool(name == speech_default)),
                 ("engine", Json::str(if breeze { "breeze-tts-2" } else { "qwen3-tts" })),
@@ -225,7 +265,8 @@ pub fn document(studio: &Studio, base: &str, authorized: bool) -> Json {
                 // Breeze TTS 2's weights and what they make are for research and non-commercial use.
                 ("license", Json::str(if breeze { "research and non-commercial" } else { "apache-2.0" })),
                 ("sample_rate", Json::Int(24_000)),
-            ])
+            ]);
+            with_files(entry, missing_files(&studio.root, &m, &SPEECH_FILES))
         })
         .collect();
     let music = section("music");
@@ -233,28 +274,30 @@ pub fn document(studio: &Studio, base: &str, authorized: bool) -> Json {
     let music_models: Vec<Json> = names(music)
         .into_iter()
         .map(|(name, m)| {
-            Json::obj([
+            let entry = Json::obj([
                 ("id", Json::str(&name)),
                 ("default", Json::Bool(name == music_default)),
                 ("max_seconds", Json::Num(crate::music::MAX_SECONDS)),
                 ("sample_rate", Json::Int(44_100)),
                 ("channels", Json::Int(2)),
                 ("quantized", Json::Bool(!str_or(&m, "language_model", "").is_empty())),
-            ])
+            ]);
+            with_files(entry, missing_files(&studio.root, &m, &MUSIC_FILES))
         })
         .collect();
     let sound = section("sound");
     let sound_default = effective(sound);
     let sound_models: Vec<Json> = names(sound)
         .into_iter()
-        .map(|(name, _)| {
-            Json::obj([
+        .map(|(name, m)| {
+            let entry = Json::obj([
                 ("id", Json::str(&name)),
                 ("default", Json::Bool(name == sound_default)),
                 ("max_seconds", Json::Num(crate::sound::MAX_SECONDS)),
                 ("sample_rate", Json::Int(crate::sound::SAMPLE_RATE)),
                 ("channels", Json::Int(1)),
-            ])
+            ]);
+            with_files(entry, missing_files(&studio.root, &m, &SOUND_FILES))
         })
         .collect();
     let model3d = section("model3d");
@@ -263,7 +306,7 @@ pub fn document(studio: &Studio, base: &str, authorized: bool) -> Json {
         .into_iter()
         .map(|(name, m)| {
             let has = |k: &str| !str_or(&m, k, "").trim().is_empty();
-            Json::obj([
+            let entry = Json::obj([
                 ("id", Json::str(&name)),
                 ("default", Json::Bool(name == model3d_default)),
                 ("format", Json::str("glb")),
@@ -274,24 +317,26 @@ pub fn document(studio: &Studio, base: &str, authorized: bool) -> Json {
                 ("upscales", Json::Bool(has("upscaler"))),
                 ("ready", Json::Bool(has("path") && has("dino") && has("naf"))),
                 ("license", Json::str("MIT (Pixal3D); DINOv3 under Meta's DINOv3 License")),
-            ])
+            ]);
+            with_files(entry, missing_files(&studio.root, &m, &MODEL3D_FILES))
         })
         .collect();
     // The picture tools: one model each, when configured.
+    let picture = media.get("picture").cloned().unwrap_or(Json::Null);
     let background_models: Vec<Json> = if crate::picture::ready(&cfg, crate::picture::Op::RemoveBackground) {
-        vec![Json::obj([
+        vec![with_files(Json::obj([
             ("id", Json::str(crate::picture::Op::RemoveBackground.model())),
             ("default", Json::Bool(true)),
             ("format", Json::str("png")),
             ("output", Json::str("the picture at its own size, its background transparent (RGBA)")),
             ("ready", Json::Bool(true)),
             ("license", Json::str("MIT")),
-        ])]
+        ]), missing_files(&studio.root, &picture, &["background"]))]
     } else {
         Vec::new()
     };
     let upscale_models: Vec<Json> = if crate::picture::ready(&cfg, crate::picture::Op::Upscale) {
-        vec![Json::obj([
+        vec![with_files(Json::obj([
             ("id", Json::str(crate::picture::Op::Upscale.model())),
             ("default", Json::Bool(true)),
             ("format", Json::str("png")),
@@ -299,7 +344,7 @@ pub fn document(studio: &Studio, base: &str, authorized: bool) -> Json {
             ("max_pixels", Json::Int(crate::picture::MAX_UPSCALE_PIXELS as i64)),
             ("ready", Json::Bool(true)),
             ("license", Json::str("BSD-3-Clause")),
-        ])]
+        ]), missing_files(&studio.root, &picture, &["upscaler"]))]
     } else {
         Vec::new()
     };
@@ -474,6 +519,30 @@ mod tests {
         assert_eq!(endpoint.get("url").and_then(Json::as_str), Some("http://127.0.0.1:8080/v1/3d/models"));
         assert_eq!(endpoint.get("models").map(Json::len), Some(2));
         assert_eq!(endpoint.get("operations").map(Json::len), Some(7));
+    }
+
+    #[test]
+    fn each_model_says_whether_its_files_are_on_this_machine() {
+        let root = std::env::temp_dir().join(format!("oaiy-studio-files-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("moss")).unwrap();
+        std::fs::write(root.join("song.gguf"), b"x").unwrap();
+        let mut cfg = crate::config::default_json();
+        let sound = crate::registry::obj_mut(&mut cfg, &["media", "sound"]).unwrap();
+        // One relative to the studio and present, one absolute and gone.
+        crate::util::set(sound, "models", Json::parse(br#"{"here":{"path":"moss"},"gone":{"path":"Z:/nowhere/moss-soundeffect"}}"#).unwrap());
+        let music = crate::registry::obj_mut(&mut cfg, &["media", "music"]).unwrap();
+        crate::util::set(music, "models", Json::parse(br#"{"song":{"path":"moss","language_model":"song.gguf","loras":[{"path":"no-such.safetensors"}]}}"#).unwrap());
+        let doc = document(&studio_with(&root, cfg), "http://127.0.0.1:8080", true);
+        let model = |kind: &str, id: &str| {
+            doc.get("models").and_then(|m| m.get(kind)).and_then(Json::as_array).unwrap().iter().find(|m| str_or(m, "id", "") == id).cloned().unwrap()
+        };
+        assert_eq!(model("sound", "here").get("files_present"), Some(&Json::Bool(true)));
+        assert_eq!(model("sound", "here").get("missing_files").map(Json::len), Some(0));
+        assert_eq!(model("sound", "gone").get("files_present"), Some(&Json::Bool(false)));
+        assert_eq!(model("sound", "gone").get("missing_files").and_then(Json::as_array).unwrap()[0].as_str(), Some("path"));
+        // A LoRA counts: the model would not run without it.
+        assert_eq!(model("music", "song").get("missing_files").and_then(Json::as_array).unwrap()[0].as_str(), Some("loras[0]"));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
