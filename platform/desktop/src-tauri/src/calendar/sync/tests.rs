@@ -101,6 +101,14 @@ impl Fake {
         self.tombstones.push((id.to_string(), t));
     }
 
+    /// FormLogic's own flow recording a call's request from the late
+    /// `aokie.appointment.requested`, as the pack does: only if no record
+    /// carries its request id or its call id yet.
+    fn flow_records_request(&mut self, answers: Value) -> Option<String> {
+        let taken = self.records.iter().any(|r| r.answers["request_id"] == answers["request_id"] || (answers["call_id"] != "" && r.answers["call_id"] == answers["call_id"]));
+        (!taken).then(|| self.add(answers))
+    }
+
     fn get(&self, id: &str) -> &Rec {
         self.records.iter().find(|r| r.id == id).expect("no such record")
     }
@@ -690,6 +698,35 @@ fn when_both_recorded_one_call_formlogics_record_is_kept_and_the_desktops_delete
     drop(f);
     assert_eq!(cal.list(None, None).len(), 1);
     assert_eq!(remote_id(&cal, &a.id).as_deref(), Some(flows.as_str()));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn a_call_sent_after_a_gap_is_not_made_twice_when_formlogics_flow_catches_up_with_the_late_event() {
+    let (cal, dir) = calendar();
+    let (fake, base) = formlogic();
+    let a = cal.record_request(&call("req-5")).unwrap();
+    // Offline: the call's event waits in the outbox, and the calendar with it.
+    assert!(matches!(run_with(&cal, &closed(), HashSet::from(["req-5".to_string()]), chrono::Duration::minutes(10)), Err(Failure::Offline(_))));
+
+    // Back online, the event has left the outbox; the calendar sends its record first.
+    run(&cal, &base).unwrap();
+    let ours = remote_id(&cal, &a.id).expect("sent");
+    {
+        let f = fake.lock().unwrap();
+        let sent = &f.get(&ours).answers;
+        assert_eq!((sent["request_id"].as_str(), sent["call_id"].as_str()), (Some("req-5"), Some("call-1")), "what the pack de-duplicates the request by");
+        assert_eq!(sent["source"], "call");
+    }
+
+    // Then FormLogic's flow catches up with the late aokie.appointment.requested.
+    assert_eq!(fake.lock().unwrap().flow_records_request(flow_record("req-5")), None, "the flow finds the request already recorded");
+    run(&cal, &base).unwrap();
+    let f = fake.lock().unwrap();
+    assert_eq!(f.records.len(), 1, "one record");
+    drop(f);
+    assert_eq!(cal.list(None, None).len(), 1, "and one appointment");
+    assert_eq!(remote_id(&cal, &a.id).as_deref(), Some(ours.as_str()));
     let _ = std::fs::remove_dir_all(dir);
 }
 
