@@ -4,7 +4,7 @@ import type { Turn } from '../../src/agent/protocol';
 import { NetGate } from '../../src/gate/netgate';
 import { Vfs } from '../../src/vfs/vfs';
 import type { SessionInfo } from '../../src/vfs/projects';
-import { Sessions, Speech, callInstructions, earlierWords, spoken } from '../../src/sessions';
+import { Sessions, Speech, callInstructions, earlierWords, sameNumber, spoken } from '../../src/sessions';
 import type { Desktop } from '../../src/desktop/bridge';
 import type { MessageSettings } from '../../src/settings';
 import { LOCAL, OPENAI, fakeProvider } from './fakeProvider';
@@ -186,6 +186,17 @@ describe('a phone call answered by the agent', () => {
     await settled(sessions);
     expect(calls[0]).toEqual(['request_appointment', 'call_9', { callerName: 'Sam', service: 'Haircut', date: '2026-10-03', time: '10:00', agreementPhrase: 'yes ten works' }]);
     expect(calls.at(-1)?.[0]).toBe('say');
+  });
+
+  it("a call takes the name the caller's text conversation has (the caller id gives none)", async () => {
+    const { sessions } = setup();
+    const texts = await sessions.conversationWith('+61491570006', 'Lance', 'sms');
+    expect(texts.title).toBe('Lance');
+    const call = await sessions.callEvent({ type: 'call.started', callId: 'call_n', from: '0491570006' });
+    expect(call?.title).toBe('Lance');
+    expect(sameNumber('+61 491 570 006', '0491570006')).toBe(true);
+    expect(sameNumber('0491570006', '0491570157')).toBe(false);
+    expect(sameNumber('110', '110')).toBe(false);
   });
 
   it('its words are its answer: never asked to start work, so nothing is said twice', async () => {

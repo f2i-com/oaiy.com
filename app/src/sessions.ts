@@ -53,6 +53,11 @@ export interface SessionHooks {
 }
 
 const digits = (number: string) => number.replace(/[^\d+]/g, '');
+/** The same phone number, with or without its country code ("+61491570006", "0491570006"): the last nine digits agree. */
+export function sameNumber(a: string, b: string): boolean {
+  const [x, y] = [a.replace(/\D/g, ''), b.replace(/\D/g, '')];
+  return x.length >= 8 && y.length >= 8 && x.slice(-9) === y.slice(-9);
+}
 
 /** A text message as the conversation's agent reads it. */
 export function textMessage(title: string, number: string, body: string): string {
@@ -398,12 +403,14 @@ export class Sessions {
   /** The conversation with `number` (texts or calls), made when it is the first from them. */
   async conversationWith(number: string, name: string, kind: 'sms' | 'call' = 'sms'): Promise<Session> {
     const key = number === TEST_NUMBER ? TEST_NUMBER : digits(number) || number;
+    // No name given (a call's caller id has none): the name another conversation with the same number has.
+    const known = name || this.list.find((s) => s.title !== s.key && sameNumber(s.key, key))?.title || '';
     const existing = this.list.find((s) => s.kind === kind && s.key === key);
     if (existing) {
-      if (name && existing.title === existing.key) existing.title = name;
+      if (known && existing.title === existing.key) existing.title = known;
       return existing;
     }
-    const session = this.create({ id: `${kind}-${key.replace(/\W/g, '') || key}`, kind, key, title: name || key, lastAt: Date.now(), unread: 0 });
+    const session = this.create({ id: `${kind}-${key.replace(/\W/g, '') || key}`, kind, key, title: known || key, lastAt: Date.now(), unread: 0 });
     this.list.push(session);
     await this.saveIndex();
     return session;
