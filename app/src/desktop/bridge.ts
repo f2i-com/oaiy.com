@@ -168,6 +168,20 @@ export class Desktop {
     return this.follow('/api/voice/events', "OAIY Desktop's call events", onEvent, signal);
   }
 
+  /**
+   * Which of the desktop's modules (the phone, the calendar) are on: its
+   * snapshot, as `modules.ts` reads it. An older desktop answers 404 (a
+   * DesktopError with that status).
+   */
+  async modules(signal?: AbortSignal): Promise<unknown> {
+    return reply(await fetch(`${this.origin}/api/modules`, { headers: this.headers(), signal }));
+  }
+
+  /** The modules' snapshot now, then again on each change (server-sent), until `signal` aborts or the stream ends. */
+  async moduleEvents(onSnapshot: (snapshot: Record<string, unknown>) => void, signal: AbortSignal): Promise<void> {
+    return this.follow('/api/modules/events', "OAIY Desktop's modules", onSnapshot, signal);
+  }
+
   /** Flows' tasks for the agent (`agent.task`: id, from, task), the waiting ones first, until `signal` aborts. */
   async agentTasks(onEvent: (event: Record<string, unknown>) => void, signal: AbortSignal): Promise<void> {
     return this.follow('/api/agent/events', "OAIY Desktop's tasks for the agent", onEvent, signal);

@@ -564,6 +564,7 @@ details.msg.compacted pre { white-space: pre-wrap; font-size: 12px; max-height: 
 .chip.phone[data-state='ready']::before { background: var(--ok); }
 .chip.phone[data-state='off']::before, .chip.phone[data-state='problem']::before { background: var(--muted); box-shadow: none; }
 .chip.phone[data-state='problem'] { color: var(--warn); border-color: var(--warn); }
+.chip.phone[hidden] { display: none; }
 /* On a call now: who with (a click shows the call). */
 .chip.on-call { color: var(--err); border-color: var(--err); font-weight: 600; }
 .chip.on-call[hidden] { display: none; }

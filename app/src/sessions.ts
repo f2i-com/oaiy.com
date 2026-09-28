@@ -536,6 +536,8 @@ export class Sessions {
   callers: CallerNote[] = [];
   /** The missed call being returned to `number` now, when the call to them is a call back. */
   callingBack: (number: string) => { missedAt: number } | undefined = () => undefined;
+  /** Whether the desktop's calendar is on (a plugin provides it): a text thread's calendar tools only then. */
+  calendarOn: () => boolean = () => true;
   /** Conversations with messages waiting, in the order they came. */
   /** Conversations waiting to run, one at a time per lane: calls in their own (a caller never waits behind a text or a flow's task), the rest in another. */
   private queue: Session[] = [];
@@ -614,12 +616,15 @@ export class Sessions {
       return session;
     }
     const test = info.key === TEST_NUMBER;
+    const own = [this.replyTool(session, test), ...this.personTools(session)];
+    // A pretend thread does not put requests in the real calendar.
+    const calendar = test ? [] : textCalendarTools(this.desktop, session.key, () => session.title);
     session.agent = this.makeAgent({
       instructions: () => this.directed(smsInstructions(session.title, session.key, this.settings().instructions, test, knownText(this.callerNote(session.key)))),
       // A texter reaches the front desk's files, to read (see KNOWLEDGE_TOOLS).
       tools: TOOLS.filter((t) => KNOWLEDGE_TOOLS.has(t.name)),
-      // A pretend thread does not put requests in the real calendar.
-      sessionTools: [this.replyTool(session, test), ...this.personTools(session), ...(test ? [] : textCalendarTools(this.desktop, session.key, () => session.title))],
+      // The calendar's tools only while there is a calendar (a plugin provides it).
+      sessionTools: () => [...own, ...(this.calendarOn() ? calendar : [])],
       conversation: true,
     });
     return session;

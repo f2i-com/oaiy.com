@@ -1,7 +1,9 @@
 /**
  * The Phone dialog: pairing this page with OAIY Desktop (which runs Aokie, the
  * phone bridge), whether the agent answers text messages, and the person's
- * instructions for them. A pretend text tries it without the phone.
+ * instructions for them. A pretend text tries it without the phone. While no
+ * plugin on the desktop provides the phone, only the pairing shows, as the
+ * OAIY Desktop dialog.
  */
 import { DESKTOP_ORIGIN, desktopHealth, pairingStatus, startPairing } from '../desktop/bridge';
 import { AU_PATTERN, DEFAULT_CALL_BACK_LINE, type Callback, type CallBackFilter, type Screening } from '../callbacks';
@@ -13,6 +15,8 @@ export interface PhoneDialog {
   desktop: DesktopSettings | null;
   /** The page is in OAIY's own window: the desktop is given, nothing to pair. */
   given?: boolean;
+  /** A plugin on the desktop provides the phone (false: only the pairing shows). */
+  phone?: boolean;
   /** Why this page does not answer texts although answering is on (another page does). */
   elsewhere?: string;
   messages: MessageSettings;
@@ -28,7 +32,8 @@ export interface PhoneDialog {
 
 export async function editPhone(options: PhoneDialog): Promise<MessageSettings | null> {
   let desktop = options.desktop;
-  const status = h('p.muted', options.given ? "This is OAIY's own window: texts and calls to the phone come here." : 'Looking for OAIY Desktop…');
+  const phone = options.phone !== false;
+  const status = h('p.muted', options.given ? (phone ? "This is OAIY's own window: texts and calls to the phone come here." : "This is OAIY's own window: it is OAIY Desktop's.") : 'Looking for OAIY Desktop…');
   const code = h('div.pair-code');
   code.hidden = true;
   let pairing: AbortController | null = null;
@@ -46,6 +51,17 @@ export async function editPhone(options: PhoneDialog): Promise<MessageSettings |
     const health = await desktopHealth(origin, AbortSignal.timeout(3000));
     pair.hidden = !health || !!desktop;
     forget.hidden = !desktop || !!options.given;
+    if (!phone) {
+      // No phone: pairing brings the desktop's flows, calendar and speech to this page.
+      status.textContent = options.given
+        ? health ? `This is OAIY's own window (OAIY Desktop ${health.version}).` : 'OAIY Desktop is not answering.'
+        : !health
+        ? `OAIY Desktop is not running at ${origin}. Start it to use its flows and speech from this page.`
+        : desktop
+          ? `Paired with OAIY Desktop ${health.version} at ${origin}.`
+          : `OAIY Desktop ${health.version} is running at ${origin}. Pair with it to use its flows and speech from this page.`;
+      return;
+    }
     status.textContent = options.given
       ? health ? `This is OAIY's own window: texts and calls to the phone come here (OAIY Desktop ${health.version}).` : 'OAIY Desktop is not answering.'
       : !health
@@ -113,7 +129,7 @@ export async function editPhone(options: PhoneDialog): Promise<MessageSettings |
   const showPattern = () => (pattern.hidden = accept.value !== 'pattern');
   accept.addEventListener('change', showPattern);
   let screeningLoaded: Screening | null = null;
-  if (options.screening) {
+  if (options.screening && phone) {
     void options.screening.load().then((s) => {
       screeningLoaded = s;
       if (!s) {
@@ -154,6 +170,18 @@ export async function editPhone(options: PhoneDialog): Promise<MessageSettings |
   } }, 'Try a pretend text…');
 
   void refresh();
+  if (!phone) {
+    // No plugin provides the phone: the dialog is OAIY Desktop's pairing, and nothing else.
+    await modal<MessageSettings>({
+      title: 'OAIY Desktop',
+      message: 'Pair this page with OAIY Desktop to use its flows and speech here. Calls and texts come once a plugin on it provides the phone (the AI Receptionist).',
+      body: [h('div.phone-form', status, code, h('div.row', pair, forget))],
+      ok: { label: 'Done', value: () => null as unknown as MessageSettings },
+      cancel: 'Close',
+    });
+    (pairing as AbortController | null)?.abort();
+    return null;
+  }
   const result = await modal<MessageSettings>({
     title: 'Phone',
     message: 'Calls and text messages come through Aokie, which OAIY Desktop runs with the Bluetooth adapter and your phone.',

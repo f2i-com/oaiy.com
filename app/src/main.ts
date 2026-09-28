@@ -9,6 +9,7 @@ import { loadSettings, saveAgentSettings, saveDesktop, saveGate, saveLastKeptPro
 import { Desktop } from './desktop/bridge';
 import { DesktopEvents, Sessions, TEST_NUMBER, callerNotesTool, phoneConversationsTool, tellAgentTool } from './sessions';
 import { Callbacks, type Screening } from './callbacks';
+import { UNPAIRED, diffModules, followModules, isOn, readModules, sessionShown, whyOff, type Modules } from './modules';
 import { flowSessionTools, flowToolHooks, readFlowStore } from './desktop/flowTools';
 import { TRANSCRIBE_TOOL, transcribeTool } from './desktop/transcribe';
 import { calendarTools } from './desktop/calendarTools';
@@ -161,8 +162,14 @@ async function main(): Promise<void> {
   let flowTools: SessionTool[] = [];
   /** Flows in front of the agents' tools. */
   let toolHooks: ToolHook[] = [];
-  /** The desktop has a calendar (the phone receptionist, Aokie, is installed). */
-  let calendarAvailable = false;
+  /**
+   * The desktop's modules: the phone (calls, texts and the Front desk) and the
+   * calendar are there only while a plugin provides them (Aokie, the AI
+   * Receptionist). Null until the desktop has said; with no desktop, none.
+   */
+  let modules: Modules | null = null;
+  const phoneOn = () => isOn(modules, 'phone');
+  const calendarOn = () => isOn(modules, 'calendar');
   /** The conversation the chat shows: null for the project's own. */
   let viewing: string | null = null;
 
@@ -268,8 +275,8 @@ async function main(): Promise<void> {
     const list = (await listProjects()).filter((m) => !m.incognito || m.id === project?.meta.id);
     clear(projectSelect);
     // The Front desk first: the phone's runner, whose sub-agents answer calls, texts and flows' tasks.
-    // Only with a phone to answer: OAIY Desktop connected.
-    if (frontDesk && (desktop || project === frontDesk)) projectSelect.append(h('option', { value: FRONT_DESK.id, selected: project === frontDesk, title: "The phone's agents: calls, texts and flows' tasks" }, `📞 ${frontDesk.meta.name}`));
+    // Only with a phone to answer: a plugin on OAIY Desktop provides it (and while it is open, as it is left).
+    if (frontDesk && (phoneOn() || project === frontDesk)) projectSelect.append(h('option', { value: FRONT_DESK.id, selected: project === frontDesk, title: "The phone's agents: calls, texts and flows' tasks" }, `📞 ${frontDesk.meta.name}`));
     for (const meta of list) projectSelect.append(h('option', { value: meta.id, selected: meta.id === project?.meta.id }, meta.incognito ? `🕶 ${meta.name} (incognito)` : meta.name));
   };
 
@@ -339,12 +346,12 @@ async function main(): Promise<void> {
     const calendar = calendarTools(() => desktop);
     const flowBuilder = flowBuilderTools(() => desktop, () => refreshFlowTools());
     const phone = [phoneConversationsTool(() => sessions), callerNotesTool(() => sessions), tellAgentTool(() => sessions)];
-    // The project's own agent in the Front desk is the phone's runner.
-    const runner = () => withPreview && place() === frontDesk;
+    // The project's own agent in the Front desk is the phone's runner (while there is a phone).
+    const runner = () => withPreview && place() === frontDesk && phoneOn();
     return (): AgentOptions => ({
       // Flows made tools, and speech to text: both run on OAIY Desktop.
-      // The calendar's tools only while there is one (the phone receptionist is installed).
-      sessionTools: () => [...(desktop ? [...flowTools, transcribe, ...(calendarAvailable ? calendar : []), ...flowBuilder] : flowTools), ...(runner() ? phone : [])],
+      // The calendar's tools only while there is one (a plugin provides it).
+      sessionTools: () => [...(desktop ? [...flowTools, transcribe, ...(calendarOn() ? calendar : []), ...flowBuilder] : flowTools), ...(runner() ? phone : [])],
       instructions: () => (runner() ? RUNNER_INSTRUCTIONS : ''),
       toolHooks: () => toolHooks,
       vfs: place().vfs,
@@ -380,7 +387,9 @@ async function main(): Promise<void> {
   /**
    * The phone's conversations (each call and text thread, and flows' tasks),
    * each with an agent of its own, in the front desk: made once, and kept
-   * whatever project is open (switching projects never ends a call).
+   * whatever project is open (switching projects never ends a call). Its
+   * storage is open whether or not there is a phone: flows' tasks are
+   * answered there too, and they are core.
    */
   async function openFrontDesk(): Promise<void> {
     frontDesk = await OpenProject.openFrontDesk();
@@ -388,7 +397,10 @@ async function main(): Promise<void> {
     const own = (sessions = new Sessions(
       frontDesk,
       // A call or a text thread brings its own tools; a flow's task has the desktop's, as the project's agent does.
-      (extra) => new Agent({ ...deskOptions(), ...extra, sessionTools: Array.isArray(extra.sessionTools) ? () => [...(extra.sessionTools as SessionTool[]), ...flowTools] : deskOptions().sessionTools }),
+      (extra) => {
+        const tools = extra.sessionTools;
+        return new Agent({ ...deskOptions(), ...extra, sessionTools: tools ? () => [...(typeof tools === 'function' ? tools() : tools), ...flowTools] : deskOptions().sessionTools });
+      },
       () => ({ ...messages, answer: messages.answer && holdsTexts }),
       () => desktop,
       {
@@ -409,14 +421,14 @@ async function main(): Promise<void> {
           if (event.type === 'tool_result') void own.save(session).catch(() => {});
         },
       },
-      // Every call, text and task goes by the runner's brief.
-      () => (frontDesk.vfs.exists(FRONT_DESK_BRIEF) ? frontDesk.vfs.readText(FRONT_DESK_BRIEF) : ''),
+      // Every call, text and task goes by the runner's brief: the phone's, so none while there is no phone.
+      () => (phoneOn() && frontDesk.vfs.exists(FRONT_DESK_BRIEF) ? frontDesk.vfs.readText(FRONT_DESK_BRIEF) : ''),
     ));
+    own.calendarOn = calendarOn;
     await own.load();
-    // Missed calls rung back: by the page that answers the calls, when no call is going on.
+    // Missed calls rung back: by the page that answers the calls, when no call is going on (started with the phone).
     callbacks = new Callbacks(frontDesk, () => messages, () => desktop, () => holdsCalls && !own.list.some((s) => s.callId), readScreening, () => {}, callsToOaiy);
     await callbacks.load();
-    callbacks.start();
     // A call back's call is taken by the agent knowing it rang them, and why.
     own.callingBack = (number) => callbacks?.calling(number);
   }
@@ -492,6 +504,7 @@ async function main(): Promise<void> {
       chat.system(`🕶 Incognito is on${reopening ? ', as it was before the app was refreshed or restarted' : ''}. This project, its conversation and every picture, clip and sound made in it are kept only in this app's temporary storage, until you press Clear or turn incognito off, and OAIY is told to keep nothing of its requests. Export it (Export .zip, or Export to folder) to keep anything.`);
     } else {
       lastKept = meta.id;
+      if (meta.id !== FRONT_DESK.id) lastOwn = meta.id;
       await saveLastKeptProject(meta.id);
     }
     reopening = false;
@@ -934,6 +947,8 @@ A project can hold several apps, each in its own folder (any folder whose manife
   let reopening = false;
   /** The last project that is kept: where leaving incognito goes. */
   let lastKept = settings.lastKeptProjectId ?? settings.lastProjectId;
+  /** The last kept project that is not the Front desk: where the Front desk is left for when the phone goes off. */
+  let lastOwn = lastKept !== FRONT_DESK.id ? lastKept : null;
   /** On: a new incognito project. Off: back to the last kept project (the incognito one is deleted). */
   async function toggleIncognito(): Promise<void> {
     if (!(await mayLeaveRun())) return;
@@ -1178,8 +1193,10 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
   // ---- The phone: OAIY Desktop, its events, and the text-message conversations ----
 
   function renderSessions(): void {
-    if (!sessions) return;
-    const live = sessions.list.find((s) => s.callId);
+    if (!sessions || !project) return;
+    // Calls and texts are the phone's: hidden (and kept) while there is none. Flows' tasks always show.
+    const shownSessions = sessions.list.filter((s) => sessionShown(s.kind, modules));
+    const live = phoneOn() ? shownSessions.find((s) => s.callId) : undefined;
     callChip.hidden = !live;
     if (live) {
       callChip.textContent = `On a call · ${live.title}`;
@@ -1187,7 +1204,7 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
     }
     chat.setSessions([
       { id: null, label: project === frontDesk ? '🧭 The runner' : '💬 Project', title: `${project.meta.name}: your conversation with the agent`, status: project === frontDesk ? "Your conversation: it directs the phone's agents" : `Your conversation in ${project.meta.name}`, unread: 0, working: !!currentRun },
-      ...sessions.list.map((s) => ({
+      ...shownSessions.map((s) => ({
         id: s.id,
         status: s.callId ? 'On a call now' : s.running ? 'Working…' : `${s.kind === 'call' ? 'Calls' : s.kind === 'task' ? 'Flow tasks' : 'Texts'} · ${since(s.lastAt)}`,
         label: s.key === TEST_NUMBER ? '💬 Test' : `${s.kind === 'call' ? '📞' : s.kind === 'task' ? '🔀' : '💬'} ${s.title}`,
@@ -1249,7 +1266,9 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
   }
 
   function selectSession(id: string | null): void {
-    const session = id ? sessions?.get(id) : null;
+    const found = id ? sessions?.get(id) : null;
+    // A call or a text thread is not shown while there is no phone.
+    const session = found && sessionShown(found.kind, modules) ? found : null;
     viewing = session ? session.id : null;
     showFiles(session ? frontDesk : project);
     if (session) {
@@ -1291,6 +1310,17 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
   let phoneConnected: boolean | null = null;
   let desktopProblem = '';
   function renderPhoneChip(): void {
+    if (!phoneOn()) {
+      // No phone (no plugin provides it): the chip only pairs this page with OAIY Desktop,
+      // and in OAIY's own window, whose desktop is given, there is nothing to pair.
+      phoneChip.hidden = !!given;
+      const state = !desktop ? 'off' : desktopProblem ? 'problem' : 'paired';
+      phoneChip.dataset.state = state;
+      phoneChip.textContent = state === 'off' ? 'desktop: not paired' : state === 'problem' ? 'desktop: offline' : 'desktop: paired';
+      phoneChip.title = state === 'problem' ? `OAIY Desktop: ${desktopProblem}` : 'OAIY Desktop: pair this page with it';
+      return;
+    }
+    phoneChip.hidden = false;
     const state = !desktop ? 'off' : desktopProblem ? 'problem' : phoneConnected ? 'ready' : 'paired';
     phoneChip.dataset.state = state;
     phoneChip.textContent = state === 'off' ? 'phone: off' : state === 'problem' ? 'phone: desktop offline' : phoneConnected ? 'phone: connected' : 'phone: not connected';
@@ -1313,7 +1343,8 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
   }
 
   async function refreshPhone(): Promise<void> {
-    if (!desktop) return;
+    // Asked only while there is a phone (a plugin provides it).
+    if (!desktop || !phoneOn()) return;
     try {
       const status = (await desktop.command('aokie', 'phone.status', {}, `oaiy:phone.status:${crypto.randomUUID()}`, AbortSignal.timeout(8000))) as Record<string, unknown> | null;
       phoneConnected = !!status?.connected;
@@ -1325,7 +1356,10 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
     renderPhoneChip();
   }
 
+  // The desktop's events: kept up while paired (they say whether it answers), and the phone's
+  // taken only while there is a phone.
   const desktopEvents = new DesktopEvents(() => desktop, async (event) => {
+    if (!phoneOn()) return;
     if (event.name === 'aokie.phone.connected' || event.name === 'aokie.phone.disconnected') {
       phoneConnected = event.name === 'aokie.phone.connected';
       renderPhoneChip();
@@ -1344,7 +1378,8 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
    */
   async function keepTextLease(): Promise<void> {
     const was = holdsTexts;
-    if (!desktop || !messages.answer) {
+    // Texts and calls are the phone's: no lease for them while there is none (the desktop would refuse it).
+    if (!desktop || !messages.answer || !phoneOn()) {
       if (holdsTexts && desktop) void desktop.release('answer-texts', pageId);
       holdsTexts = false;
     } else {
@@ -1361,7 +1396,7 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
       if (n) chat.system(`Answering ${n} text message${n > 1 ? 's' : ''} that came while this page was not answering.`);
     }
     // Calls, the same way.
-    if (!desktop || !messages.calls) {
+    if (!desktop || !messages.calls || !phoneOn()) {
       if (holdsCalls && desktop) void desktop.release('answer-calls', pageId);
       holdsCalls = false;
     } else {
@@ -1381,7 +1416,6 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
     }
     try {
       const taken = new Set([...TOOLS.map((t) => t.name), 'send_text_message', 'end_call', 'request_appointment', 'lookup_business_data', 'guide', 'update_plan', 'delegate', TRANSCRIBE_TOOL, 'calendar_free_times', 'calendar_list', 'calendar_book', 'calendar_change', 'flow_nodes', 'flow_list', 'flow_read', 'flow_write', 'flow_run']);
-      calendarAvailable = (await d.calendar(undefined, undefined, AbortSignal.timeout(5_000)).catch(() => null))?.available !== false;
       const store = await readFlowStore(d, AbortSignal.timeout(10_000));
       flowTools = flowSessionTools(store.tools, () => desktop, taken);
       toolHooks = flowToolHooks(store.hooks, () => desktop);
@@ -1451,6 +1485,77 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
       }
     })();
   }
+
+  // ---- The desktop's modules: the phone and the calendar come and go with their plugin ----
+
+  /** The phone came on: its calls, the leases for calls and texts, call backs and its chip start. */
+  function phoneStarted(): void {
+    if (!desktop) return;
+    followCalls();
+    void refreshPhone();
+    callbacks?.start();
+    void keepTextLease();
+  }
+
+  /** The phone went off: all of that stops, and its conversations are hidden, kept for when it is back. */
+  function phoneStopped(): void {
+    callsAbort?.abort();
+    callsAbort = null;
+    callbacks?.stop();
+    if (holdsCalls && desktop) void desktop.release('answer-calls', pageId);
+    if (holdsTexts && desktop) void desktop.release('answer-texts', pageId);
+    holdsCalls = holdsTexts = false;
+    phoneConnected = null;
+    for (const s of sessions?.list ?? []) if (s.kind !== 'task' && s.running) sessions?.stop(s);
+    const shown = viewing ? sessions?.get(viewing) : null;
+    if (shown && !sessionShown(shown.kind, modules)) selectSession(null);
+    if (project === frontDesk) void leaveFrontDesk();
+  }
+
+  /** The phone went off with the Front desk open: to the last project kept (the Front desk stays, for when the phone is back). */
+  async function leaveFrontDesk(): Promise<void> {
+    if (project !== frontDesk) return;
+    const kept = (await listProjects()).filter((m) => !m.incognito);
+    await openProject(kept.find((m) => m.id === lastOwn) ?? kept[0] ?? (await createProject('untitled')));
+    const why = whyOff(modules, 'phone');
+    chat.system(`The phone is off in OAIY Desktop${why ? ` (${why.replace(/\.$/, '')})` : ''}, so the Front desk is put away. Its files and conversations are kept, and come back with the phone.`);
+  }
+
+  /** The modules as the desktop says now: what came on starts, what went off stops. */
+  function applyModules(next: Modules): void {
+    const changes = diffModules(modules, next);
+    modules = next;
+    for (const change of changes) {
+      if (change.id !== 'phone') continue;
+      if (change.on) phoneStarted();
+      else phoneStopped();
+    }
+    renderPhoneChip();
+    renderSessions();
+    void renderProjects();
+  }
+
+  // The desktop's modules, as they change (a stream, reopened when it drops; an older desktop is asked now and then).
+  let modulesAbort: AbortController | null = null;
+  function startModules(): void {
+    modulesAbort?.abort();
+    const d = desktop;
+    if (!d) {
+      applyModules(UNPAIRED);
+      return;
+    }
+    const abort = (modulesAbort = new AbortController());
+    void followModules(d, (next) => {
+      if (desktop === d) applyModules(next);
+    }, abort.signal);
+  }
+
+  /** No desktop: nothing is on. */
+  function stopModules(): void {
+    modulesAbort?.abort();
+    modulesAbort = null;
+    applyModules(UNPAIRED);
+  }
   setInterval(() => void keepTextLease(), 10_000);
   window.addEventListener('pagehide', () => {
     if (holdsTexts && desktop) void desktop.release('answer-texts', pageId);
@@ -1460,6 +1565,8 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
     const saved = await editPhone({
       desktop: desktop ? { origin: desktop.origin, token: desktop.token } : null,
       given: !!given,
+      // With no phone (no plugin provides it), only the pairing with OAIY Desktop shows.
+      phone: phoneOn(),
       elsewhere: messages.answer && !holdsTexts && textHolder ? 'Another OAIY page answers the texts now (OAIY\'s own window comes first). This one keeps them in their conversations.' : '',
       messages,
       paired: (d) => {
@@ -1468,19 +1575,23 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
         desktopEvents.stop();
         if (desktop) {
           desktopEvents.start();
-          void refreshPhone();
-          followCalls();
           followTasks();
           void refreshFlowTools();
-        } else callsAbort?.abort();
+          // The phone's parts start once this desktop says it has a phone (again, on this desktop, if it was on).
+          if (phoneOn()) phoneStarted();
+          startModules();
+        } else {
+          tasksAbort?.abort();
+          stopModules();
+        }
         renderPhoneChip();
       },
       test: (body) => {
         void sessions?.textArrived(TEST_NUMBER, 'Test', body).then((session) => selectSession(session.id));
       },
       // The phone refusing who is answered (a pattern it cannot read, or the phone gone) is said, and the rest is still saved.
-      screening: desktop ? { load: readScreening, save: (s) => saveScreening(s).catch((e: unknown) => chat.system(`The phone did not take who is answered: ${(e as Error).message}`, 'error')) } : undefined,
-      callbacks: callbacks?.list,
+      screening: desktop && phoneOn() ? { load: readScreening, save: (s) => saveScreening(s).catch((e: unknown) => chat.system(`The phone did not take who is answered: ${(e as Error).message}`, 'error')) } : undefined,
+      callbacks: phoneOn() ? callbacks?.list : undefined,
     });
     if (saved) {
       // Calling back needs Aokie's outbound calling (its kill switch is off until someone turns it on).
@@ -1505,8 +1616,11 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
   await clearIncognito(settings.lastProjectId ?? undefined);
   await openFrontDesk();
   reopening = true;
+  // The Front desk reopens only while there is a phone: the desktop is asked first (a moment at most) when it was the last project.
+  const deskLast = settings.lastProjectId === FRONT_DESK.id;
+  const firstModules = deskLast && desktop ? await readModules(desktop, AbortSignal.timeout(3000)).catch(() => null) : null;
   const all = await listProjects();
-  let meta = settings.lastProjectId === FRONT_DESK.id ? frontDesk.meta : (all.find((m) => m.id === settings.lastProjectId) ?? all[0]);
+  let meta = deskLast && isOn(firstModules, 'phone') ? frontDesk.meta : (all.find((m) => m.id === (deskLast ? lastOwn : settings.lastProjectId)) ?? all[0]);
   if (!meta) {
     meta = await createProject('Welcome');
     await openProject(meta);
@@ -1522,15 +1636,17 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
   if (!sandbox.ok) chat.system(`The code sandbox is unavailable: ${sandbox.reason}.`, 'error');
   else void zippModule().catch((error: unknown) => chat.system(`Could not load the Zipp engine: ${(error as Error).message}`, 'error'));
   await lookForOaiy();
+  // What the desktop said already starts its parts now; the stream keeps them up to date.
+  if (firstModules) applyModules(firstModules);
   renderPhoneChip();
   if (desktop) {
     desktopEvents.start();
-    void refreshPhone();
     void keepTextLease();
-    followCalls();
     followTasks();
     void refreshFlowTools();
-  }
+    // The phone's calls, its chip and call backs start once the desktop says there is a phone.
+    startModules();
+  } else applyModules(UNPAIRED);
   if (!activeProvider()) chat.system('Welcome! Set up an AI provider in ⚙ Settings to talk to the agent — a local server (Ollama, LM Studio, OAIY) keeps everything on this computer. The editor and terminal work without one.');
   // Leaving the page (closing the tab, reloading, switching away on a phone): save now.
   // pagehide and a hidden page come early enough for the writes to start; the
