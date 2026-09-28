@@ -462,11 +462,13 @@ fn run_once(cal: &Calendar, link: &LinkHandle) {
         Err(fail) => {
             r.failures += 1;
             r.failed_at = Some(at);
-            let wait = backoff(r.failures);
+            // Busy is not a failure to back off from: it is tried again in half a minute.
+            let wait = if matches!(fail, Failure::Busy(_)) { std::time::Duration::from_secs(30) } else { backoff(r.failures) };
             r.next_at = Some(Instant::now() + wait);
             r.next_at_wall = Some(at + chrono::Duration::from_std(wait).unwrap_or_default());
             let (state, message) = match fail {
                 Failure::Offline(m) => ("offline", m),
+                Failure::Busy(m) => ("busy", m),
                 Failure::Refused(m) | Failure::Local(m) => ("error", m),
                 Failure::FormGone => ("error", "FormLogic's appointments form has gone".to_string()),
             };
@@ -501,6 +503,8 @@ fn waiting_requests() -> HashSet<String> {
 pub(crate) enum Failure {
     /// FormLogic could not be reached, or is not answering properly: tried again later.
     Offline(String),
+    /// FormLogic answered, asking for fewer requests (429): tried again shortly, and not called offline.
+    Busy(String),
     /// It answered and refused (a revoked key, no appointments form).
     Refused(String),
     /// The appointments form is not there any more.
@@ -545,7 +549,8 @@ impl Api {
         let body: Value = resp.json().unwrap_or(Value::Null);
         match status {
             401 | 403 => Err(Failure::Refused(format!("FormLogic no longer accepts this desktop's key ({}): link it again", said(&body, status)))),
-            408 | 429 | 500..=599 => Err(Failure::Offline(format!("FormLogic is not answering properly (HTTP {status})"))),
+            429 => Err(Failure::Busy("FormLogic asked for fewer requests: syncing again shortly".into())),
+            408 | 500..=599 => Err(Failure::Offline(format!("FormLogic is not answering properly (HTTP {status})"))),
             _ => Ok(Reply { status, body }),
         }
     }

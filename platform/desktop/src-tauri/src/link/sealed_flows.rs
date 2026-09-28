@@ -243,6 +243,7 @@ pub fn spawn(store: LinkHandle, node: Option<NodeHandle>) {
                     continue;
                 }
             };
+            let polled = std::time::Instant::now();
             let result = poll_once(
                 &http,
                 &account,
@@ -274,7 +275,7 @@ pub fn spawn(store: LinkHandle, node: Option<NodeHandle>) {
                 Ok(worked) => {
                     last_warned = None;
                     if !worked {
-                        std::thread::sleep(Duration::from_millis(500));
+                        std::thread::sleep(super::net::idle_pause(polled.elapsed()));
                     }
                 }
                 Err(error) => {

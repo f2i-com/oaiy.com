@@ -291,13 +291,14 @@ pub fn spawn(store: LinkHandle, sources: AiSources) {
                 tunnel
                     .publish_pubkey_if_needed(&account, &spec, &instance)
                     .await;
+                let polled = std::time::Instant::now();
                 match tunnel.poll_cycle(&account, &spec, &instance).await {
                     Ok(handled) => {
                         if last_warned.take().is_some() {
                             log::info!("AI tunnel poll: working again");
                         }
                         if handled == 0 {
-                            tokio::time::sleep(Duration::from_millis(500)).await;
+                            tokio::time::sleep(crate::link::net::idle_pause(polled.elapsed())).await;
                         }
                     }
                     Err(e) => {

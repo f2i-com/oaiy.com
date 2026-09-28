@@ -1161,7 +1161,7 @@ export interface CalendarSync {
   linked: boolean;
   /** `offline`: FormLogic could not be reached; `error`: it answered, and refused.
    *  Absent from an older desktop. */
-  state?: 'unlinked' | 'waiting' | 'syncing' | 'synced' | 'offline' | 'error';
+  state?: 'unlinked' | 'waiting' | 'syncing' | 'synced' | 'offline' | 'busy' | 'error';
   /** When the last sync was tried. */
   at: string | null;
   /** When a sync last went through. */

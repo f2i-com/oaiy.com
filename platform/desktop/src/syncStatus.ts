@@ -43,12 +43,17 @@ export function describeSync(sync: CalendarSync | null, link: LinkStatus | null,
   const lastText = last ? `last synced ${ago(last, now)}` : 'not synced yet';
   // The calendar's own sync is the best witness; the heartbeat speaks when
   // the calendar has not said (no phone receptionist installed).
-  const offline = sync?.state === 'offline' || (sync?.state !== 'synced' && !!link?.heartbeatError) || !!link?.outbox?.lastError;
+  // FormLogic answering "too many requests" (HTTP 429) is there, only busy: not offline.
+  const away = (error?: string | null) => !!error && !/\b429\b|too many requests/i.test(error);
+  const offline = sync?.state === 'offline' || (sync?.state !== 'synced' && sync?.state !== 'busy' && away(link?.heartbeatError)) || away(link?.outbox?.lastError);
   if (sync?.state === 'error') {
     return { headline: 'Sync stopped', detail: sync.error ?? 'FormLogic refused the sync', tone: 'err', waiting };
   }
   if (offline) {
     return { headline: 'Offline', detail: [lastText, waitingText || 'nothing waiting'].join(' · '), tone: 'warn', waiting };
+  }
+  if (sync?.state === 'busy') {
+    return { headline: 'Syncing shortly', detail: ['FormLogic asked for fewer requests', lastText, waitingText].filter(Boolean).join(' · '), tone: 'neutral', waiting };
   }
   if (sync?.state === 'syncing') {
     return { headline: 'Syncing…', detail: [lastText, waitingText].filter(Boolean).join(' · '), tone: 'neutral', waiting };

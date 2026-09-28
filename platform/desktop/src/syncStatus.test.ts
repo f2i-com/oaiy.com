@@ -47,6 +47,14 @@ describe('describeSync', () => {
     expect(v.detail).toContain('4 changes waiting');
   });
 
+  it('is not offline when FormLogic only asks for fewer requests', () => {
+    const v = describeSync(sync({ state: 'busy', lastSuccessAt: minutesAgo(2), pending: { creates: 1, updates: 0, deletes: 0, total: 1 } }), link({ heartbeatError: 'HTTP 429: Too Many Requests' }), NOW)!;
+    expect(v.headline).toBe('Syncing shortly');
+    expect(v.detail).toBe('FormLogic asked for fewer requests · last synced 2 min ago · 1 change waiting');
+    const heartbeatOnly = describeSync(sync({ state: 'synced', lastSuccessAt: minutesAgo(1) }), link({ outbox: { waiting: 0, lastError: 'HTTP 429' } }), NOW)!;
+    expect(heartbeatOnly.headline).toBe('Synced');
+  });
+
   it('says why when FormLogic refuses rather than being away', () => {
     const v = describeSync(sync({ state: 'error', error: 'FormLogic no longer accepts this desktop’s key (HTTP 401): link it again' }), null, NOW)!;
     expect(v.headline).toBe('Sync stopped');

@@ -84,6 +84,7 @@ pub fn spawn(store: LinkHandle, dispatch: Dispatcher) {
         };
         let instance = store.instance_id();
 
+        let polled = std::time::Instant::now();
         match poll_once(&account, &spec, &instance, &dispatch) {
             // `trouble` is a poll that WORKED carrying commands that did not.
             // Recorded as the lane's state because from the provider's side it
@@ -99,7 +100,7 @@ pub fn spawn(store: LinkHandle, dispatch: Dispatcher) {
                 if backoff {
                     std::thread::sleep(Duration::from_secs(spec.error_backoff_seconds));
                 } else if handled == 0 {
-                    std::thread::sleep(Duration::from_millis(500));
+                    std::thread::sleep(super::net::idle_pause(polled.elapsed()));
                 }
             }
             Err(e) => {
