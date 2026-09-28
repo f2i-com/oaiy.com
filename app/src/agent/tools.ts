@@ -20,7 +20,7 @@ import { describeExample, docsMap, installExample, listExamples, lookupComponent
 import { DEFAULT_VIEW_SIZE, MAX_VIEW_SIZE, imageMimeFor, imageSize, viewImage, type ImagePart } from './images';
 import { FRAME_KINDS, MAX_REDOS, MAX_REVIEW_FAILURES, awaitingReview, contentHash, readReviews, reviewOf, storyFolder, writeReviews, type FrameKind } from './review';
 import { VOICES_FILE, keepVoice, ownVoice, projectVoiceList, readProjectVoices, savedName, voiceFor, writeProjectVoices, type ProjectVoices } from './voices';
-import { SOUNDTRACK_FORMATS, SPEECH_FORMATS, createVoice, generate3dModel, generateImage, generateMusic, generateSoundEffect, generateSpeech, generateVideo, mediaReady, type MediaFile, type MediaSettings, type SpeechFormat } from './media';
+import { SOUNDTRACK_FORMATS, SPEECH_FORMATS, createVoice, generate3dModel, generateImage, generateMusic, generateSoundEffect, generateSpeech, generateVideo, mediaReady, removeBackground, upscaleImage, type MediaFile, type MediaSettings, type SpeechFormat } from './media';
 
 const READ_LINES = 400;
 const READ_CHARS = 40_000;
@@ -168,7 +168,7 @@ function describeModels(media: MediaSettings, kind: 'image' | 'video' | 'speech'
 /** generate_image and generate_video, described for the service that is set up (none when there is none). `voices` are the project's own saved voices (see voices.ts). */
 export function mediaTools(media: MediaSettings | null | undefined, voices?: ProjectVoices): ToolSpec[] {
   const ready = mediaReady(media);
-  if (!media || (!ready.image && !ready.video && !ready.speech && !ready.music && !ready.sound && !ready.model3d)) return [];
+  if (!media || (!ready.image && !ready.video && !ready.speech && !ready.music && !ready.sound && !ready.model3d && !ready.background && !ready.upscale)) return [];
   // The saved voices this project may use, by the names the agent knows.
   if (voices) media = { ...media, voices: projectVoiceList(voices, media.voices ?? []) };
   const where = media.discovered ? `nrob at ${media.discovered.origin}` : new URL(media.baseUrl).host;
@@ -360,6 +360,42 @@ export function mediaTools(media: MediaSettings | null | undefined, voices?: Pro
           faces: { ...int, minimum: 1000, maximum: 2_000_000, description: 'Triangles in the mesh (default 200000); fewer for a small or far-off object, e.g. 20000' },
           resolution: { ...int, enum: [1024, 1536], description: '1536 for finer detail, and slower (default 1024)' },
           seed: int,
+        },
+      },
+    });
+  }
+  if (ready.background) {
+    tools.push({
+      name: 'remove_background',
+      description:
+        `Remove a picture's background with the user's media service (${where}): the object or person is kept, and the rest becomes transparent. Saves a PNG at the picture's own size. ` +
+        'Use it for game sprites, icons, product shots, stickers and cut-outs to place on a page or in a scene; look at the result with view_image. ' +
+        'Pictures made for it come out cleanest with the subject whole, in view and on a plain background.',
+      parameters: {
+        type: 'object',
+        required: ['image', 'path'],
+        properties: {
+          image: { type: 'string', description: 'Project path of the picture (png, jpg or webp)' },
+          path: { type: 'string', description: 'Where to save the result, e.g. assets/sprites/knight.png (always .png)' },
+        },
+      },
+    });
+  }
+  if (ready.upscale) {
+    const up = media.upscaleModels?.[0];
+    const most = up?.maxPixels ? ` Pictures up to ${(up.maxPixels / 1_048_576).toFixed(0)} megapixels.` : '';
+    tools.push({
+      name: 'upscale_image',
+      description:
+        `Make a picture larger with the user's media service (${where}), restoring detail rather than blurring it (Real-ESRGAN): twice or four times its width and height. Saves a PNG; a transparent picture stays transparent. ` +
+        `Use it when a picture is too small for where it goes (a hero image, a print, a texture), or to sharpen a small generated picture.${most}`,
+      parameters: {
+        type: 'object',
+        required: ['image', 'path'],
+        properties: {
+          image: { type: 'string', description: 'Project path of the picture (png, jpg or webp)' },
+          path: { type: 'string', description: 'Where to save the result, e.g. images/hero@4x.png (always .png)' },
+          scale: { type: 'integer', enum: [2, 4], description: 'How much larger (default 4)' },
         },
       },
     });
@@ -1505,6 +1541,26 @@ async function execute(call: ToolCall, ctx: ToolContext, out: ToolOut): Promise<
       vfs.writeFile(`/${path}`, result.bytes, { parents: true });
       out.files.push(path);
       return `Saved /${path} (${result.seconds ? `${result.seconds.toFixed(1)} s, ` : ''}${(result.bytes.byteLength / 1e6).toFixed(1)} MB), made with ${result.model}. The user has a player for it in the chat.`;
+    }
+    case 'remove_background': case 'upscale_image': {
+      const media = ctx.media?.();
+      const upscale = call.name === 'upscale_image';
+      if (!media || !mediaReady(media)[upscale ? 'upscale' : 'background']) throw new Error(`no ${upscale ? 'upscaling' : 'background removal'} service is set up (nrob has it when BiRefNet or Real-ESRGAN is added on its Models page)`);
+      const imagePath = normalizePath(need(input, 'image'));
+      if (!/\.(png|jpe?g|webp)$/i.test(imagePath)) throw new Error(`/${imagePath} is not a picture (png, jpg or webp)`);
+      const image = projectImage(vfs, imagePath);
+      let path = normalizePath(need(input, 'path'));
+      if (!/\.png$/i.test(path)) path = `${path.replace(/\.[a-z0-9]{1,5}$/i, '')}.png`;
+      const scale = input.scale === 2 ? 2 : 4;
+      ctx.progress?.(upscale ? `making /${imagePath} ${scale}× larger…` : `removing the background of /${imagePath}…`);
+      const result = upscale ? await upscaleImage(media, image, scale, ctx.signal) : await removeBackground(media, image, ctx.signal);
+      vfs.writeFile(`/${path}`, result.bytes, { parents: true });
+      out.files.push(path);
+      const size = result.width && result.height ? `${result.width}×${result.height}, ` : '';
+      const mb = result.bytes.byteLength < 1e6 ? `${Math.max(1, Math.round(result.bytes.byteLength / 1024))} KB` : `${(result.bytes.byteLength / 1e6).toFixed(1)} MB`;
+      return upscale
+        ? `Saved /${path} (${size}${mb}): /${imagePath} made ${scale}× larger with ${result.model}. Look at it with view_image.`
+        : `Saved /${path} (${size}${mb}): /${imagePath} with its background removed (transparent) by ${result.model}. Look at it with view_image.`;
     }
     case 'generate_3d_model': {
       const media = ctx.media?.();

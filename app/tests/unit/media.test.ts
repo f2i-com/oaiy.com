@@ -21,6 +21,8 @@ const DOC = {
     { name: 'music', method: 'POST', path: '/v1/audio/music', url: 'http://127.0.0.1:8080/v1/audio/music', spec: 'openai' },
     { name: 'sound', method: 'POST', path: '/v1/audio/sound_effects', url: 'http://127.0.0.1:8080/v1/audio/sound_effects', spec: 'openai' },
     { name: 'model3d', method: 'POST', path: '/v1/3d/models', url: 'http://127.0.0.1:8080/v1/3d/models', spec: 'openai', models: ['pixal3d'] },
+    { name: 'background', method: 'POST', path: '/v1/images/background_removal', url: 'http://127.0.0.1:8080/v1/images/background_removal', spec: 'openai', models: ['birefnet'] },
+    { name: 'upscale', method: 'POST', path: '/v1/images/upscale', url: 'http://127.0.0.1:8080/v1/images/upscale', spec: 'openai', models: ['real-esrgan-x4plus'] },
   ],
   models: {
     llm: [{ id: 'qwen3.8-27b', default: true, loaded: false, vision: false }, { id: 'qwen3.5-9b', default: false }],
@@ -33,6 +35,8 @@ const DOC = {
     music: [{ id: 'minimax-music3', default: true, max_seconds: 360, sample_rate: 44100, channels: 2 }],
     sound: [{ id: 'moss-soundeffect', default: true, max_seconds: 30, sample_rate: 48000, channels: 1 }],
     model3d: [{ id: 'pixal3d', default: true, format: 'glb', resolutions: [1024, 1536], faces: 200000, input: 'a picture of one object on a plain or transparent background', ready: true, license: "MIT (Pixal3D); DINOv3 under Meta's DINOv3 License" }],
+    background: [{ id: 'birefnet', default: true, format: 'png', ready: true, license: 'MIT' }],
+    upscale: [{ id: 'real-esrgan-x4plus', default: true, format: 'png', scales: [2, 4], max_pixels: 4194304, ready: true, license: 'BSD-3-Clause' }],
   },
   defaults: { llm: 'qwen3.8-27b', image: 'qwen-image-turbo-q4', video: 'sulphur-2', speech: 'qwen3-tts', music: 'minimax-music3', sound: 'moss-soundeffect', model3d: 'pixal3d' },
   voices: { saved: [{ id: 'Narrator', name: 'Narrator', description: 'A deep, calm male narrator', language: 'english' }], openai_names: ['alloy', 'onyx'] },
@@ -53,8 +57,10 @@ describe('nrob discovery', () => {
     expect(found.media.imageModels[1]).toMatchObject({ id: 'unholy-desire-sdxl', edits: false, sizeStep: 64, negativePrompt: true });
     expect(found.media.videoModels[0]).toMatchObject({ maxSeconds: 5, maxSide: 1024, startImage: true, fps: 24 });
     expect(found.llm).toEqual({ base: 'http://127.0.0.1:8080/v1', models: ['qwen3.8-27b', 'qwen3.5-9b'], default: 'qwen3.8-27b', contextTokens: 32768 });
-    expect(mediaReady(found.media)).toEqual({ image: true, video: true, speech: true, music: true, sound: true, model3d: true });
-    expect(mediaAbilities(found.media)).toBe('images, video, speech, music, sound effects and 3D models');
+    expect(mediaReady(found.media)).toEqual({ image: true, video: true, speech: true, music: true, sound: true, model3d: true, background: true, upscale: true });
+    expect(mediaAbilities(found.media)).toBe('images, video, speech, music, sound effects, 3D models, background removal and upscaling');
+    expect(found.media.upscaleModels?.[0]).toMatchObject({ id: 'real-esrgan-x4plus', scales: [2, 4], maxPixels: 4194304 });
+    expect(found.media.endpoints?.background).toBe('http://127.0.0.1:8080/v1/images/background_removal');
     expect(found.media.model3dModel).toBe('pixal3d');
     expect(found.media.model3dModels?.[0]).toMatchObject({ id: 'pixal3d', resolutions: [1024, 1536], faces: 200000, ready: true });
     expect(found.media.endpoints?.model3d).toBe('http://127.0.0.1:8080/v1/3d/models');
@@ -284,6 +290,29 @@ describe('media requests', () => {
     expect(gif.isError && gif.content).toContain('png, jpg or webp');
   });
 
+  it('removes a background and upscales a picture, saving PNGs', async () => {
+    const sent: Array<{ url: string; body: Record<string, unknown> }> = [];
+    vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
+      sent.push({ url, body: JSON.parse(String(init?.body)) });
+      const upscale = url.endsWith('/upscale');
+      return json({ created: 1, data: [{ b64_json: upscale ? 'AQIDBA==' : 'AQI=' }], width: upscale ? 800 : 200, height: upscale ? 600 : 150, model: upscale ? 'real-esrgan-x4plus' : 'birefnet', seconds_taken: 1.2 });
+    }));
+    const vfs = new Vfs();
+    vfs.writeFile('/art/knight.jpg', new Uint8Array([9, 9]), { parents: true });
+    const found = readDiscovery(DOC, 'http://127.0.0.1:8080').media;
+    const ctx: ToolContext = { vfs, gate: new NetGate(), reads: new Map(), shell: { cwd: '/', env: {} }, media: () => found };
+    const cut = await runTool({ id: '1', name: 'remove_background', input: { image: 'art/knight.jpg', path: 'sprites/knight' } }, ctx);
+    expect(sent[0]).toEqual({ url: 'http://127.0.0.1:8080/v1/images/background_removal', body: { image: 'data:image/jpeg;base64,CQk=', response_format: 'b64_json' } });
+    expect(cut.content).toBe('Saved /sprites/knight.png (200×150, 1 KB): /art/knight.jpg with its background removed (transparent) by birefnet. Look at it with view_image.');
+    expect(Array.from(vfs.readBytes('/sprites/knight.png'))).toEqual([1, 2]);
+    const up = await runTool({ id: '2', name: 'upscale_image', input: { image: 'art/knight.jpg', path: 'art/knight-big.png', scale: 2 } }, ctx);
+    expect(sent[1]).toEqual({ url: 'http://127.0.0.1:8080/v1/images/upscale', body: { image: 'data:image/jpeg;base64,CQk=', scale: 2, response_format: 'b64_json' } });
+    expect(up.content).toBe('Saved /art/knight-big.png (800×600, 1 KB): /art/knight.jpg made 2× larger with real-esrgan-x4plus. Look at it with view_image.');
+    // Without the service's tools, the agent is told where they come from.
+    const none = await runTool({ id: '3', name: 'upscale_image', input: { image: 'art/knight.jpg', path: 'x.png' } }, { ...ctx, media: () => ({ ...found, upscaleModels: [] }) });
+    expect(none.isError && none.content).toContain('Real-ESRGAN');
+  });
+
   it('reports a failed job with the service\'s reason', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => json({ id: 'v', status: 'failed', error: { code: 'generation_failed', message: 'out of memory' } })));
     await expect(generateVideo(media, { prompt: 'x' }, () => {})).rejects.toThrow('out of memory');
@@ -294,7 +323,8 @@ describe('media tools', () => {
   it('are offered only when a service is set up, with the models described', () => {
     expect(mediaTools(EMPTY_MEDIA)).toEqual([]);
     const tools = mediaTools(readDiscovery(DOC, 'http://127.0.0.1:8080').media);
-    expect(tools.map((t) => t.name)).toEqual(['generate_image', 'generate_video', 'generate_speech', 'create_voice', 'generate_music', 'generate_sound_effect', 'generate_3d_model', 'review_frame']);
+    expect(tools.map((t) => t.name)).toEqual(['generate_image', 'generate_video', 'generate_speech', 'create_voice', 'generate_music', 'generate_sound_effect', 'generate_3d_model', 'remove_background', 'upscale_image', 'review_frame']);
+    expect(tools[8].description).toContain('Pictures up to 4 megapixels.');
     expect(tools[5].description).toContain('moss-soundeffect (default): up to 30 s');
     // A 3D model is made from a picture of the object alone, made first.
     expect(tools[6].description).toContain('first make a picture for it with generate_image of the object alone: the whole object in view and centred, on a plain white or grey background (or a transparent one), in soft even light, from a three-quarter view');

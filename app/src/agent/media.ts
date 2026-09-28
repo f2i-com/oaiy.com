@@ -84,6 +84,16 @@ export interface Model3dModelInfo {
   upscales?: boolean;
 }
 
+/** A picture tool the service has: background removal or upscaling. */
+export interface PictureToolInfo {
+  id: string;
+  /** Upscaling: how much larger it makes a picture (2, 4). */
+  scales?: number[];
+  /** Upscaling: the largest picture it takes, in pixels. */
+  maxPixels?: number;
+  license?: string;
+}
+
 /** A voice saved on the server (designed once from a description). */
 export interface VoiceInfo {
   name: string;
@@ -122,11 +132,14 @@ export interface MediaSettings {
   musicModels?: MusicModelInfo[];
   soundModels?: SoundModelInfo[];
   model3dModels?: Model3dModelInfo[];
+  /** Background removal and upscaling, when the service has them (nrob's discovery). */
+  backgroundModels?: PictureToolInfo[];
+  upscaleModels?: PictureToolInfo[];
   /** Saved voices, and the OpenAI voice names the service also takes. */
   voices?: VoiceInfo[];
   openaiVoices?: string[];
   /** Full URLs from a discovery document (nrob's routes are configurable). */
-  endpoints?: { images?: string; edits?: string; videos?: string; speech?: string; voices?: string; music?: string; sound?: string; model3d?: string };
+  endpoints?: { images?: string; edits?: string; videos?: string; speech?: string; voices?: string; music?: string; sound?: string; model3d?: string; background?: string; upscale?: string };
   /** Set when the details came from nrob's discovery document. */
   discovered?: { service: string; version: string; origin: string; at: number };
 }
@@ -137,7 +150,7 @@ export const EMPTY_MEDIA: MediaSettings = { baseUrl: '', apiKey: '', enabled: tr
 export const NROB_ORIGIN = 'http://127.0.0.1:8080';
 
 /** What the agent can make with these settings. */
-export function mediaReady(media: MediaSettings | null | undefined): { image: boolean; video: boolean; speech: boolean; music: boolean; sound: boolean; model3d: boolean } {
+export function mediaReady(media: MediaSettings | null | undefined): { image: boolean; video: boolean; speech: boolean; music: boolean; sound: boolean; model3d: boolean; background: boolean; upscale: boolean } {
   const on = !!media && media.enabled && !!media.baseUrl.trim();
   return {
     image: on && !!(media!.imageModel || media!.imageModels.length),
@@ -146,13 +159,15 @@ export function mediaReady(media: MediaSettings | null | undefined): { image: bo
     music: on && !!(media!.musicModel || media!.musicModels?.length),
     sound: on && !!(media!.soundModel || media!.soundModels?.length),
     model3d: on && !!(media!.model3dModel || media!.model3dModels?.length),
+    background: on && !!media!.backgroundModels?.length && !!media!.endpoints?.background,
+    upscale: on && !!media!.upscaleModels?.length && !!media!.endpoints?.upscale,
   };
 }
 
 /** What the service can make, in words ("images, video and speech"). */
 export function mediaAbilities(media: MediaSettings | null | undefined): string {
   const ready = mediaReady(media);
-  const can = [ready.image && 'images', ready.video && 'video', ready.speech && 'speech', ready.music && 'music', ready.sound && 'sound effects', ready.model3d && '3D models'].filter(Boolean) as string[];
+  const can = [ready.image && 'images', ready.video && 'video', ready.speech && 'speech', ready.music && 'music', ready.sound && 'sound effects', ready.model3d && '3D models', ready.background && 'background removal', ready.upscale && 'upscaling'].filter(Boolean) as string[];
   return can.length > 1 ? `${can.slice(0, -1).join(', ')} and ${can[can.length - 1]}` : can[0] ?? '';
 }
 
@@ -334,6 +349,12 @@ export function readDiscovery(doc: Json, origin: string): Extract<Discovery, { s
     removesBackground: bool(m.removes_background),
     upscales: bool(m.upscales),
   }));
+  const pictureTools = (kind: unknown): PictureToolInfo[] => list(kind).filter((m) => str(m.id)).map((m) => ({
+    id: String(m.id),
+    scales: Array.isArray(m.scales) ? m.scales.filter((s): s is number => typeof s === 'number') : undefined,
+    maxPixels: num(m.max_pixels),
+    license: str(m.license),
+  }));
   const voiceDoc = isRecord(doc.voices) ? doc.voices : {};
   const voices: VoiceInfo[] = list(voiceDoc.saved).map((v) => ({ name: str(v.name) ?? str(v.id) ?? '', description: str(v.description), language: str(v.language) })).filter((v) => v.name);
   const openaiVoices = Array.isArray(voiceDoc.openai_names) ? voiceDoc.openai_names.filter((n): n is string => typeof n === 'string') : [];
@@ -350,13 +371,15 @@ export function readDiscovery(doc: Json, origin: string): Extract<Discovery, { s
     media: {
       ...EMPTY_MEDIA,
       baseUrl: base,
-      endpoints: { images: urlOf('images'), edits: urlOf('edits'), videos: urlOf('videos'), speech: urlOf('speech'), voices: urlOf('voices'), music: urlOf('music'), sound: urlOf('sound'), model3d: urlOf('model3d') },
+      endpoints: { images: urlOf('images'), edits: urlOf('edits'), videos: urlOf('videos'), speech: urlOf('speech'), voices: urlOf('voices'), music: urlOf('music'), sound: urlOf('sound'), model3d: urlOf('model3d'), background: urlOf('background'), upscale: urlOf('upscale') },
       imageModels,
       videoModels,
       speechModels,
       musicModels,
       soundModels,
       model3dModels,
+      backgroundModels: pictureTools(models.background),
+      upscaleModels: pictureTools(models.upscale),
       voices,
       openaiVoices,
       imageModel: str(defaults.image) ?? imageModels.find((m) => m.default)?.id ?? imageModels[0]?.id,
@@ -744,6 +767,39 @@ export async function generateImage(media: MediaSettings, req: ImageRequest, sig
   }
   if (!images.length) throw new MediaError('The image service answered without an image.');
   return { images, model: str(json.model) ?? model ?? 'default', size: str(json.size), revisedPrompt: str(list(json.data)[0]?.revised_prompt) };
+}
+
+// --- Picture tools -----------------------------------------------------------
+
+export interface PictureResult {
+  /** A PNG. */
+  bytes: Uint8Array;
+  width?: number;
+  height?: number;
+  model: string;
+  seconds?: number;
+}
+
+async function pictureTool(media: MediaSettings, url: string | undefined, body: Json, what: string, signal?: AbortSignal): Promise<PictureResult> {
+  if (!url) throw new MediaError(`${what}: the service has no such tool.`);
+  const resp = await request(url, { method: 'POST', body: JSON.stringify({ ...body, response_format: 'b64_json' }), headers: { 'Content-Type': 'application/json' }, apiKey: media.apiKey, what }, signal);
+  const json = (await resp.json()) as Json;
+  const item = list(json.data)[0];
+  let bytes: Uint8Array | undefined;
+  if (str(item?.b64_json)) bytes = base64ToBytes(String(item!.b64_json));
+  else if (str(item?.url)) bytes = new Uint8Array(await (await request(String(item!.url), { apiKey: media.apiKey, what: `${what}: downloading` }, signal)).arrayBuffer());
+  if (!bytes?.length) throw new MediaError(`${what}: the service answered without a picture.`);
+  return { bytes, width: num(json.width), height: num(json.height), model: str(json.model) ?? 'default', seconds: num(json.seconds_taken) };
+}
+
+/** The picture with its background removed: a PNG at its own size, the background transparent. */
+export function removeBackground(media: MediaSettings, image: MediaFile, signal?: AbortSignal): Promise<PictureResult> {
+  return pictureTool(media, media.endpoints?.background, { image: dataUrl(image) }, 'Removing the background', signal);
+}
+
+/** The picture two or four times larger, its detail restored: a PNG. */
+export function upscaleImage(media: MediaSettings, image: MediaFile, scale: 2 | 4, signal?: AbortSignal): Promise<PictureResult> {
+  return pictureTool(media, media.endpoints?.upscale, { image: dataUrl(image), scale }, 'Upscaling the picture', signal);
 }
 
 // --- Video -----------------------------------------------------------------
