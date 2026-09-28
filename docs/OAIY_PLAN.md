@@ -102,6 +102,29 @@ shell's code one at a time after that.
   languages and token-by-token input.
 - Details and sources: [speech models](ecosystem/SPEECH_MODELS.md).
 
+**Today (28 Sept 2026)**, speech runs as two OAIY services: `aokie-stt` on 8781 and
+`aokie-tts` on 8782. They are Aokie's own voice server, in Rust on ONNX Runtime. The desktop
+starts them when a call or the `transcribe_audio` tool needs them. Its speech-to-text is
+`nvidia/parakeet-unified-en-0.6b` (RNN-T, int8 ONNX, CPU); "parakeet-tdt-0.6b" is only the name
+it reports. Its text-to-speech is Pocket TTS (`english_2026-04`, int8 ONNX, first audio after
+0.7–1 s).
+
+**The native voice worker, as researched:** a resident `crates/oaiy-voice`, since `oaiy-media`
+starts a process per job. It serves the same routes and arguments, so the two service templates
+simply point at it. The work, in this order:
+1. The server skeleton, with contract tests against `aokie-voice-server`: 2–3 days.
+2. Pocket TTS: 5–8 days, adapting the MIT/Apache Candle port
+   (github.com/babybirdprd/pocket-tts, parity-tested) to Candle 0.11 and the 2026-04 configs.
+   `candle-transformers` already has streaming Mimi. This comes first because it decides when
+   the caller hears the first word.
+3. Parakeet: 6–10 days to parity, plus 3–5 days for streaming. One FastConformer encoder with an
+   RNN-T head (Unified) and a TDT head (v2, v3, ultra). The Candle ports found are unlicensed or
+   not at parity, so they are only references.
+
+That is about 3–4 weeks. Parity fixtures come from the fp32 ONNX graphs. One product decision
+is open: preset Pocket TTS voices, or gated weights (a Hugging Face token) to keep today's cloned
+voice.
+
 ## Flows and the agent
 
 - **The flow engine stays** (the editor, `oaiy-core`, the CLI runner, local triggers, the
@@ -131,6 +154,8 @@ shell's code one at a time after that.
   commands, queued and relayed flow runs, app-logic scripts.
 - **Plugins**: the stdio host, `eventAck`, `flow.run`, the plugin screens with
   `window.PluginHost`; the environment Aokie expects (`FORMLOGIC_*`) and a consent signing key.
+- **Services**: the desktop's Python (and other) services stay, so people can add their own.
+  Our Rust implementations come first wherever there is one.
 
 ## Later
 
@@ -159,6 +184,17 @@ Each step ends with something that works and can be shown.
 6. **Pages move into the shell**, one at a time; `app/src-tauri` retired.
 7. **Publish** to softn.com and FormLogic.
 
+### Where it is (28 Sept 2026)
+
+Tried on the Pixel 9a test phone, on the dongle, with the Qwen 27B model on this PC.
+
+| Step | Done, and how it was tried | Not yet |
+|---|---|---|
+| 2. Text messages | Text threads as sessions; answering (off by default, one lease-holding page); a text delivered again is not answered twice; the reply goes out through Aokie. Texts from the phone arrive, and sends were proven once Google Messages was rolled back (see Known issues). | Turning on answering for real traffic |
+| 3. One desktop | The OAIY window shows the agent (Agent) and the flow editor (Flows) as pages of their own origin, cross-origin isolated, beside the sidebar. The agent's page is made at startup, so calls and texts are answered whatever the window shows. The web app stays optional and pairs. | The engines started in-process (the Studio still runs on its own); pages moving into the shell |
+| 4. Flows | A flow is made a tool in the editor ("Make it a tool for the agent…"), and the agent uses it (`make_greeting`, run through the bridge). | Flows as project files; the agent writing flows; an agent node |
+| 5. Voice | Calls answered by the agent through Aokie's `desktop_realtime` on 17872: the greeting plays whole, and replies are heard 2–3 s after the caller stops (one output item per reply). Appointment requests reach Aokie. On goodbye it says a short goodbye and hangs up (tried on a stand-in call; the last real call was before that change). `transcribe_audio`: a 42 s recording written out word for word. | The native voice worker (above); a business lookup for OAIY; `/v1/realtime` |
+
 ## Decided, and still open
 
 - Decided: the desktop host is `platform/desktop`; the engines run in its process; flows stay
@@ -169,6 +205,15 @@ Each step ends with something that works and can be shown.
   their own licences).
 
 ## Known issues
+
+- **Texts stuck on "Sending…" on Android 17.** The Google Messages open beta takes over texts
+  sent by other apps (Bluetooth included) and never sends them. Roll it back and leave the beta:
+  see [Aokie's contract](ecosystem/AOKIE_CONTRACT.md#what-smssent-means-and-texts-stuck-on-sending).
+- **No business lookup without FormLogic.** Aokie's `lookup_business_data` runs the
+  `business-lookup` flow, which comes with FormLogic's receptionist pack and reads its bookings.
+  OAIY Desktop has none, so the agent is told it can't check. It then offers to take a request.
+- **Names on calls are misheard** by speech-to-text ("Lanes" for "Lance"). The appointment
+  request records what was heard.
 
 - `llama-rs` tests do not compile without CUDA (`cuda_backend` in `glm5next/device.rs` is
   defined only under the CUDA test module).
