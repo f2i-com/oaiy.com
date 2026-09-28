@@ -21,6 +21,7 @@ const videos = [];
 const speeches = [];
 const voicesMade = [];
 const songs = [];
+const effects = [];
 let polls = 0;
 let songPolls = 0;
 const script = [
@@ -31,6 +32,7 @@ const script = [
   { calls: [{ name: 'create_voice', input: { name: 'Fox', description: 'a sly young fox, quick and playful' } }] },
   { calls: [{ name: 'generate_speech', input: { text: 'Catch me if you can!', voice: 'Fox', path: 'audio/line.wav' } }] },
   { calls: [{ name: 'generate_music', input: { style: 'playful pizzicato strings', instrumental: true, seconds: 20, path: 'audio/theme.mp3' } }] },
+  { calls: [{ name: 'generate_sound_effect', input: { description: 'snow crunching under quick paws', seconds: 3, path: 'audio/steps.wav' } }] },
   { calls: [{ name: 'generate_video', input: { prompt: 'the fox grins and talks to camera', path: 'media/talk.mp4', start_image: 'art/fox.png', end_image: 'art/fox.png', say: 'Catch me if you can!', voice: 'Fox' } }] },
   { text: 'The fox talks in media/talk.mp4.' },
 ];
@@ -51,18 +53,19 @@ function discovery(origin) {
     base_url: origin,
     openai_base_url: `${origin}/v1`,
     auth: { type: 'none', required: false },
-    endpoints: ['chat:/v1/chat/completions', 'models:/v1/models', 'images:/v1/images/generations', 'edits:/v1/images/edits', 'videos:/v1/videos', 'speech:/v1/audio/speech', 'voices:/v1/audio/voices', 'music:/v1/audio/music'].map((e) => {
+    endpoints: ['chat:/v1/chat/completions', 'models:/v1/models', 'images:/v1/images/generations', 'edits:/v1/images/edits', 'videos:/v1/videos', 'speech:/v1/audio/speech', 'voices:/v1/audio/voices', 'music:/v1/audio/music', 'sound:/v1/audio/sound_effects'].map((e) => {
       const [name, path] = e.split(':');
       return { name, path, url: `${origin}${path}`, spec: 'openai' };
     }),
     models: {
       speech: [{ id: 'qwen3-tts', default: true, described_voices: true, saved_voices: true }],
       music: [{ id: 'minimax-music3', default: true, max_seconds: 360 }],
+      sound: [{ id: 'moss-soundeffect', default: true, max_seconds: 30 }],
       llm: [{ id: 'qwen3.8-27b', default: true }],
       image: [{ id: 'qwen-image-turbo-q4', default: true, edits: true, max_references: 3, size_step: 32, default_size: '1024x1024' }],
       video: [{ id: 'sulphur-2', default: true, fps: 24, max_seconds: 5, max_side: 1024, start_image: true }],
     },
-    defaults: { llm: 'qwen3.8-27b', image: 'qwen-image-turbo-q4', video: 'sulphur-2', speech: 'qwen3-tts', music: 'minimax-music3' },
+    defaults: { llm: 'qwen3.8-27b', image: 'qwen-image-turbo-q4', video: 'sulphur-2', speech: 'qwen3-tts', music: 'minimax-music3', sound: 'moss-soundeffect' },
     voices: { saved: [{ name: 'Narrator', description: 'a deep, calm narrator' }], openai_names: ['alloy'] },
     llm: { context_tokens: 32768 },
   };
@@ -116,6 +119,12 @@ const nrob = createHttpServer((req, res) => {
       return send(200, songPolls < 2 ? { id: 'song_1', status: 'in_progress', progress: 60 } : { id: 'song_1', status: 'completed', seconds: 20, model: 'minimax-music3' });
     }
     if (url === '/v1/audio/music/song_1/content') return send(200, Buffer.from('ID3 not really an mp3'), 'audio/mpeg');
+    if (url === '/v1/audio/sound_effects' && req.method === 'POST') {
+      effects.push(JSON.parse(body));
+      return send(200, { id: 'sfx_1', object: 'sound_effect', status: 'queued', progress: 0 });
+    }
+    if (url === '/v1/audio/sound_effects/sfx_1') return send(200, { id: 'sfx_1', status: 'completed', seconds: 3, model: 'moss-soundeffect' });
+    if (url === '/v1/audio/sound_effects/sfx_1/content') return send(200, Buffer.from('RIFF....WAVEfmt '), 'audio/wav');
     if (url === '/v1/videos/video_1') {
       polls++;
       return send(200, polls < 3 ? { id: 'video_1', status: 'in_progress', progress: polls * 40 } : { id: 'video_1', status: 'completed', progress: 100, seconds: '4', size: '768x512', model: 'sulphur-2' });
@@ -165,14 +174,14 @@ try {
   await check('nrob is found on its own: images, video and chat are set up from its discovery document', async () => {
     await page.waitForFunction(() => document.querySelector('.chat-log')?.textContent.includes('Found nrob-studio 0.1.0'), { timeout: 15_000 });
     const log = await page.$eval('.chat-log', (e) => e.textContent);
-    expect(log.includes('The agent can make images, video, speech and music with it.') && log.includes('in the AI providers for chat too, and in use'), log.slice(0, 500));
+    expect(log.includes('The agent can make images, video, speech, music and sound effects with it.') && log.includes('in the AI providers for chat too, and in use'), log.slice(0, 500));
     expect(!log.includes('Welcome! Set up an AI provider'), 'the welcome still asks for a provider');
     const chip = await page.$eval('button[title="AI provider"]', (b) => b.textContent);
     expect(chip === 'nrob · qwen3.8-27b', chip);
     await page.click('button[title="AI providers"]');
     await page.waitForSelector('dialog.settings[open]');
     const media = await page.$eval('.media-settings', (s) => ({ text: s.textContent, inputs: [...s.querySelectorAll('input')].map((i) => i.value) }));
-    expect(media.text.includes(`nrob-studio 0.1.0 at ${new URL(nrobUrl).origin} (images, video, speech and music)`), media.text);
+    expect(media.text.includes(`nrob-studio 0.1.0 at ${new URL(nrobUrl).origin} (images, video, speech, music and sound effects)`), media.text);
     expect(media.inputs.includes(`${nrobUrl}/v1`) && media.inputs.includes('qwen-image-turbo-q4') && media.inputs.includes('sulphur-2'), JSON.stringify(media.inputs));
     await page.evaluate(() => [...document.querySelectorAll('dialog.settings button')].find((b) => b.textContent === 'Cancel').click());
   });
@@ -201,13 +210,14 @@ try {
     const names = await page.$$eval('.tree-row .name', (els) => els.map((e) => e.textContent));
     expect(names.includes('art') && names.includes('media'), `tree: ${names}`);
   });
-  await check('the agent designs a voice, speaks a line, makes a song, and a talking clip that ends on a frame', async () => {
+  await check('the agent designs a voice, speaks a line, makes a song and a sound effect, and a talking clip that ends on a frame', async () => {
     await page.type('.chat-input', 'Make the fox talk.');
     await page.keyboard.press('Enter');
     await page.waitForFunction(() => document.querySelector('.chat-log')?.textContent.includes('The fox talks in media/talk.mp4.'), { timeout: 60_000 });
-    expect(voicesMade.length === 1 && voicesMade[0].name === 'Fox' && voicesMade[0].description.includes('sly'), JSON.stringify(voicesMade));
+    expect(voicesMade.length === 1 && /^Fox(-[0-9a-f]+)?$/.test(voicesMade[0].name) && voicesMade[0].description.includes('sly'), JSON.stringify(voicesMade));
     expect(speeches.length === 1 && speeches[0].input === 'Catch me if you can!' && speeches[0].voice === 'Fox' && speeches[0].response_format === 'wav', JSON.stringify(speeches));
     expect(songs.length === 1 && songs[0].instrumental === true && songs[0].duration === 20 && songs[0].prompt.includes('pizzicato'), JSON.stringify(songs));
+    expect(effects.length === 1 && effects[0].prompt.includes('snow crunching') && effects[0].seconds === 3 && effects[0].model === 'moss-soundeffect', JSON.stringify(effects));
     const talk = videos[1];
     expect(talk && talk.speech?.input === 'Catch me if you can!' && talk.speech?.voice === 'Fox' && /^data:image\/png;base64,/.test(talk.end_image?.image_url) && !('seconds' in talk), JSON.stringify(talk).slice(0, 300));
     // The new voice is offered by name from then on.

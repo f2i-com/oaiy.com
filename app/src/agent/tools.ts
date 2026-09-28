@@ -18,7 +18,7 @@ import { describeExample, docsMap, installExample, listExamples, lookupComponent
 import { DEFAULT_VIEW_SIZE, MAX_VIEW_SIZE, imageMimeFor, imageSize, viewImage, type ImagePart } from './images';
 import { FRAME_KINDS, MAX_REDOS, MAX_REVIEW_FAILURES, awaitingReview, contentHash, readReviews, reviewOf, storyFolder, writeReviews, type FrameKind } from './review';
 import { VOICES_FILE, keepVoice, ownVoice, projectVoiceList, readProjectVoices, savedName, voiceFor, writeProjectVoices, type ProjectVoices } from './voices';
-import { SOUNDTRACK_FORMATS, SPEECH_FORMATS, createVoice, generateImage, generateMusic, generateSpeech, generateVideo, mediaReady, type MediaFile, type MediaSettings, type SpeechFormat } from './media';
+import { SOUNDTRACK_FORMATS, SPEECH_FORMATS, createVoice, generateImage, generateMusic, generateSoundEffect, generateSpeech, generateVideo, mediaReady, type MediaFile, type MediaSettings, type SpeechFormat } from './media';
 
 const READ_LINES = 400;
 const READ_CHARS = 40_000;
@@ -110,12 +110,17 @@ export interface ToolContext {
 }
 
 /** A model's abilities in a few words, for the tool descriptions. */
-function describeModels(media: MediaSettings, kind: 'image' | 'video' | 'speech' | 'music'): string {
-  if (kind === 'speech' || kind === 'music') {
-    const chosen = kind === 'speech' ? media.speechModel : media.musicModel;
-    const models = (kind === 'speech' ? media.speechModels : media.musicModels) ?? [];
+function describeModels(media: MediaSettings, kind: 'image' | 'video' | 'speech' | 'music' | 'sound'): string {
+  if (kind === 'speech' || kind === 'music' || kind === 'sound') {
+    const chosen = kind === 'speech' ? media.speechModel : kind === 'music' ? media.musicModel : media.soundModel;
+    const models = (kind === 'speech' ? media.speechModels : kind === 'music' ? media.musicModels : media.soundModels) ?? [];
     if (!models.length) return chosen ? ` Model: ${chosen}.` : '';
-    return ` Models: ${models.map((m) => `${m.id}${m.id === chosen ? ' (default)' : ''}${'maxSeconds' in m && m.maxSeconds ? `: up to ${m.maxSeconds} s` : ''}`).join('; ')}.`;
+    const about = (m: (typeof models)[number]) => [
+      'maxSeconds' in m && m.maxSeconds ? `up to ${m.maxSeconds} s` : '',
+      'engine' in m && m.engine === 'breeze-tts-2' ? 'Breeze TTS 2' : '',
+      'license' in m && m.license && m.license !== 'apache-2.0' ? `${m.license} use only` : '',
+    ].filter(Boolean).join(', ');
+    return ` Models: ${models.map((m) => `${m.id}${m.id === chosen ? ' (default)' : ''}${about(m) ? `: ${about(m)}` : ''}`).join('; ')}.`;
   }
   const chosen = kind === 'image' ? media.imageModel : media.videoModel;
   const lines = kind === 'image'
@@ -145,7 +150,7 @@ function describeModels(media: MediaSettings, kind: 'image' | 'video' | 'speech'
 /** generate_image and generate_video, described for the service that is set up (none when there is none). `voices` are the project's own saved voices (see voices.ts). */
 export function mediaTools(media: MediaSettings | null | undefined, voices?: ProjectVoices): ToolSpec[] {
   const ready = mediaReady(media);
-  if (!media || (!ready.image && !ready.video && !ready.speech && !ready.music)) return [];
+  if (!media || (!ready.image && !ready.video && !ready.speech && !ready.music && !ready.sound)) return [];
   // The saved voices this project may use, by the names the agent knows.
   if (voices) media = { ...media, voices: projectVoiceList(voices, media.voices ?? []) };
   const where = media.discovered ? `nrob at ${media.discovered.origin}` : new URL(media.baseUrl).host;
@@ -290,6 +295,25 @@ export function mediaTools(media: MediaSettings | null | undefined, voices?: Pro
           instrumental: { type: 'boolean' },
           seconds: { type: 'number', description: 'Length in seconds' },
           path: { type: 'string', description: 'Where to save it, e.g. audio/theme.mp3' },
+          seed: int,
+        },
+      },
+    });
+  }
+  if (ready.sound) {
+    tools.push({
+      name: 'generate_sound_effect',
+      description:
+        `Make a sound effect with the user's sound effects service (${where}) and save it in the project (wav or mp3, from the path): ambience, weather, crowds, creatures, machines, footsteps, impacts, short musical stings. ` +
+        'Describe what makes the sound, where, and how it sounds ("heavy rain on a tin roof with distant thunder", "a wooden door creaking open slowly"), not speech or a song. ' +
+        `Up to 30 seconds; it takes about half a minute. Lay it under clips or other sound with media_compose.${describeModels(media, 'sound')}`,
+      parameters: {
+        type: 'object',
+        required: ['description', 'path'],
+        properties: {
+          description: { type: 'string', description: 'What makes the sound, where, and how it sounds' },
+          seconds: { type: 'number', description: 'Length in seconds, up to 30 (default 10)' },
+          path: { type: 'string', description: 'Where to save it, e.g. audio/rain.wav' },
           seed: int,
         },
       },
@@ -1290,6 +1314,28 @@ async function execute(call: ToolCall, ctx: ToolContext, out: ToolOut): Promise<
       vfs.writeFile(`/${path}`, result.bytes, { parents: true });
       out.files.push(path);
       return `Saved /${path} (${result.seconds ? `${Math.round(result.seconds)} s, ` : ''}${(result.bytes.byteLength / 1e6).toFixed(1)} MB), made with ${result.model}. The user has a player for it in the chat.`;
+    }
+    case 'generate_sound_effect': {
+      const media = ctx.media?.();
+      if (!media || !mediaReady(media).sound) throw new Error('no sound effects service is set up (the user can add one in Settings, under Images, video and audio)');
+      const description = need(input, 'description');
+      let path = normalizePath(need(input, 'path'));
+      let format = (path.split('.').pop() ?? '').toLowerCase() as 'wav' | 'mp3';
+      if (format !== 'wav' && format !== 'mp3') {
+        format = 'wav';
+        path = `${path.replace(/\.[a-z0-9]{1,5}$/i, '')}.wav`;
+      }
+      const seconds = typeof input.seconds === 'number' ? Math.min(30, Math.max(0.5, input.seconds)) : undefined;
+      ctx.progress?.('starting the sound effect…');
+      const result = await generateSoundEffect(media, {
+        prompt: description,
+        seconds,
+        seed: typeof input.seed === 'number' ? input.seed : undefined,
+        format,
+      }, (message) => ctx.progress?.(message), ctx.signal);
+      vfs.writeFile(`/${path}`, result.bytes, { parents: true });
+      out.files.push(path);
+      return `Saved /${path} (${result.seconds ? `${result.seconds.toFixed(1)} s, ` : ''}${(result.bytes.byteLength / 1e6).toFixed(1)} MB), made with ${result.model}. The user has a player for it in the chat.`;
     }
     case 'media_info': {
       const path = normalizePath(need(input, 'path'));

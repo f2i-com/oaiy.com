@@ -6,7 +6,7 @@ A coding agent that runs entirely in your browser.
 - **AI-written code runs on the [Zipp](https://github.com/f2i-com/zipp.org) VM.** JavaScript and Python run in Zipp's WebAssembly engine inside a Web Worker. The code can reach the project and nothing else, except what the network gate lets through.
 - **A shell, emulated.** The terminal and the agent's `sandbox_shell` are a bash-like shell written in JavaScript on the same sandbox, with `git`, `jq`, `tar`/`zip`, `node` and `python` built in (see [The shell](#the-shell)). There are no real processes, so `npm install` and compilers don't exist here.
 - **Any model.** A server on your own machine (Ollama, LM Studio, nrob, llama.cpp — anything OpenAI-compatible), Anthropic's API, or any OpenAI-compatible API.
-- **Images, video and audio.** With nrob, or any service with OpenAI's media APIs, the agent can make pictures, short videos (talking ones too), speech and music straight into the project (see [Images, video and audio](#images-video-and-audio)).
+- **Images, video and audio.** With nrob, or any service with OpenAI's media APIs, the agent can make pictures, short videos (talking ones too), speech, music and sound effects straight into the project (see [Images, video and audio](#images-video-and-audio)).
 - **A network gate.** `/internet on | off | allowlist | allow <host> | deny <host> | status` (or `/net`) decides every request made on the model's behalf. Requests to your AI provider are not gated.
 
 ## Context and long work
@@ -46,8 +46,9 @@ The agent gets more tools when a media service is set up:
   - animate a start image, optionally moving to an end image;
   - make a character talk, with lip movement: it takes `say` (words to speak in a voice) or `soundtrack` (a speech or audio file to follow). Without a length, the clip is as long as the speech, up to the model's few seconds.
 - `generate_speech` saves spoken audio (mp3, wav, opus, aac, flac) in a saved voice, an OpenAI voice name, or a voice described in words.
-- `create_voice` designs a voice from a description and saves it on nrob, so a character keeps the same voice.
+- `create_voice` designs a voice from a description and saves it on nrob, so a character keeps the same voice. It uses the speech model chosen in Settings (nrob's Qwen3-TTS or Breeze TTS 2). A voice Breeze TTS 2 made is always spoken by a Breeze model.
 - `generate_music` saves a song from a style and lyrics (with [Verse] and [Chorus] sections), or an instrumental.
+- `generate_sound_effect` saves a sound effect (wav or mp3, up to 30 seconds) from a description of what makes it, where, and how it sounds (nrob's MOSS-SoundEffect).
 
 The results appear in the chat (with a player for video and audio) and in the project, where an app can use them.
 
@@ -66,7 +67,7 @@ These tools work on files already in the project, with or without a media servic
 They run in the page with the browser's own video and audio codecs (WebCodecs: H.264 and AAC where the system has them, otherwise VP9 and Opus). [Mediabunny](https://mediabunny.dev) reads and writes the files. Everything is re-encoded, so cuts are exact to the frame. Nothing leaves the computer, and it works offline and in the desktop app. A model with a context window under 16k tokens doesn't get these four tools, so that its window still has room to work.
 
 - **nrob is found on its own.** When the page opens, it asks `http://127.0.0.1:8080/v1/discovery`.
-  - If nrob answers, its image, video, speech and music models, their limits (sizes, edits, seconds), its saved voices and its defaults fill **Settings → Images, video and audio**.
+  - If nrob answers, its image, video, speech, music and sound effects models, their limits (sizes, edits, seconds), its saved voices and its defaults fill **Settings → Images, video and audio**.
   - nrob is also added as a chat provider if none points at it yet. It becomes the active one only if nothing else is.
   - Found again later, its model lists are refreshed. Your chosen models and key stay.
 - **nrob allows bot.computer.** Without an API key, nrob answers only the origins in `gateway.cors_origins` in its config. Its defaults include `https://bot.computer`, `http://localhost:5317` and the desktop app. Serving bot.computer from anywhere else means adding that address there (the chat says which one), or setting an API key in nrob and typing it in Settings. Then press **Find nrob**.

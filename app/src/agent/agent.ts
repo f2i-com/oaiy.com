@@ -154,7 +154,7 @@ const SAME_CHECK_LIMIT = 3;
 const KEEP_IMAGE_TURNS = 3;
 
 /** How to make media: only when the media service's tools are there. */
-const MEDIA_MAKE_GUIDE = `- generate_image, generate_video, generate_speech, create_voice and generate_music, when they are among your tools, make pictures, short videos (talking ones too), speech and music with the user's media service and save them in the project. Write concrete prompts, save under sensible paths, and look at an image with view_image before relying on it. Every video clip is at most 5 seconds and has a start and an end frame, each made new with generate_image from the scene's background and the character images (never a character image itself), and animates between them, its prompt describing the motion from start to end (what the characters do, how the camera moves), not the scene the frames already show. For dialogue, give each character a saved voice with create_voice and use it for every line they speak, and show only the speaker, alone in close-up, while they talk (see generate_video for how).
+const MEDIA_MAKE_GUIDE = `- generate_image, generate_video, generate_speech, create_voice, generate_music and generate_sound_effect, when they are among your tools, make pictures, short videos (talking ones too), speech, music and sound effects with the user's media service and save them in the project; media_compose lays sound effects and music under clips. Write concrete prompts, save under sensible paths, and look at an image with view_image before relying on it. Every video clip is at most 5 seconds and has a start and an end frame, each made new with generate_image from the scene's background and the character images (never a character image itself), and animates between them, its prompt describing the motion from start to end (what the characters do, how the camera moves), not the scene the frames already show. For dialogue, give each character a saved voice with create_voice and use it for every line they speak, and show only the speaker, alone in close-up, while they talk (see generate_video for how).
 `;
 /** How to make a video with a story: from a script, shot by shot. */
 const VIDEO_SCRIPT_GUIDE = `- Every video the user asks for is made from a plan and a script, however short or vague the request, written and revised before any picture or clip is made. What the user asked for comes first: everything their request says (the story and what happens in it, the characters and how they look, what they say, the places, how many scenes or how long, the style, what to do or avoid) goes into the script as they said it. The rules below only fill in what the request leaves open, and never override it. Start with update_plan: writing the script is its first step, then one step per scene, then joining the clips. A vague request ("a video of a cat", "make something fun") becomes a short scene of your own making: a premise with a small beginning, middle and end, told in 3 to 6 shots of varied framing (an establishing wide shot, closer shots of the action, a reaction or a detail), about 10 to 25 seconds in all, joined with media_compose. Only when the user asks for exactly one clip is it a single shot. Give the video its own folder (video/NAME/) with script.md in it, and its frames, clips and audio beside it. The script has these parts, under these headings (a reviewer finds each picture's part of the script by them):
@@ -202,7 +202,7 @@ const HEARD_BY_TASK = '[The user sent this while you worked on your task (the ma
 const HEARD_BY_REVIEWER = '[The user sent this while you reviewed the picture (the main agent has it too). If it is about this picture, judge the picture by it as well. Anything else is for the main agent: carry on with the review.]';
 
 /** The tools that make a picture, a clip or a sound: before the first after a video's script is written, the script is checked against the request. */
-const MAKE_TOOLS = new Set(['generate_image', 'generate_video', 'generate_speech', 'generate_music', 'create_voice']);
+const MAKE_TOOLS = new Set(['generate_image', 'generate_video', 'generate_speech', 'generate_music', 'generate_sound_effect', 'create_voice']);
 
 const MEDIA_EDIT_GUIDE = `- media_info, video_frames, video_split and media_compose edit video and sound in the project, in the browser: read what a file holds, take frames out (to check a clip, or to take the last frame it really ended on), cut, join clips and pictures, and lay music, speech and effects over a whole video with volume, fades and ducking. To make a longer video: make its clips (each a cut, or continuous: starting on the last frame the clip before really ended on, from video_frames with last: true, so the motion flows on), then compose them with the soundtrack (trimming a continuous clip's first frame).
 `;
@@ -225,7 +225,7 @@ type GuideTopic = 'app' | 'video' | 'media' | 'document';
 /** What each guide is for, as the guide tool lists them. */
 const GUIDE_ABOUT: Record<GuideTopic, string> = {
   video: 'making a video, film, animation or any story told in clips: the script, pictures, voices and clips',
-  media: 'making pictures, speech, voices or music',
+  media: 'making pictures, speech, voices, music or sound effects',
   app: 'building or changing an app (a SoftN app: pages, logic and a live preview); it also gives you the app tools',
   document: 'writing a long document: a story, a script, a report',
 };
@@ -421,7 +421,7 @@ function withoutOldImages(turns: Turn[], keep = KEEP_IMAGE_TURNS): Turn[] {
 function guideTopics(names: Set<string>): GuideTopic[] {
   const topics: GuideTopic[] = [];
   if (names.has('generate_video')) topics.push('video');
-  if (['generate_image', 'generate_video', 'generate_speech', 'generate_music', 'create_voice'].some((n) => names.has(n))) topics.push('media');
+  if (['generate_image', 'generate_video', 'generate_speech', 'generate_music', 'generate_sound_effect', 'create_voice'].some((n) => names.has(n))) topics.push('media');
   if ([...SOFTN_TOOLS].some((n) => names.has(n)) || names.has('guide')) topics.push('app');
   topics.push('document');
   return topics;

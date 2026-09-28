@@ -42,10 +42,23 @@ export interface SpeechModelInfo {
   describedVoices?: boolean;
   /** Speaks in voices saved on the server. */
   savedVoices?: boolean;
+  /** What speaks: nrob's `qwen3-tts` or `breeze-tts-2`. */
+  engine?: string;
+  /** The terms of the model's weights and what it makes, when nrob says. */
+  license?: string;
   sampleRate?: number;
 }
 
 export interface MusicModelInfo {
+  id: string;
+  default?: boolean;
+  maxSeconds?: number;
+  sampleRate?: number;
+  channels?: number;
+}
+
+/** A sound effects model (nrob's MOSS-SoundEffect): a description in, a short sound out. */
+export interface SoundModelInfo {
   id: string;
   default?: boolean;
   maxSeconds?: number;
@@ -85,13 +98,15 @@ export interface MediaSettings {
   videoModels: VideoModelInfo[];
   speechModel?: string;
   musicModel?: string;
+  soundModel?: string;
   speechModels?: SpeechModelInfo[];
   musicModels?: MusicModelInfo[];
+  soundModels?: SoundModelInfo[];
   /** Saved voices, and the OpenAI voice names the service also takes. */
   voices?: VoiceInfo[];
   openaiVoices?: string[];
   /** Full URLs from a discovery document (nrob's routes are configurable). */
-  endpoints?: { images?: string; edits?: string; videos?: string; speech?: string; voices?: string; music?: string };
+  endpoints?: { images?: string; edits?: string; videos?: string; speech?: string; voices?: string; music?: string; sound?: string };
   /** Set when the details came from nrob's discovery document. */
   discovered?: { service: string; version: string; origin: string; at: number };
 }
@@ -102,20 +117,21 @@ export const EMPTY_MEDIA: MediaSettings = { baseUrl: '', apiKey: '', enabled: tr
 export const NROB_ORIGIN = 'http://127.0.0.1:8080';
 
 /** What the agent can make with these settings. */
-export function mediaReady(media: MediaSettings | null | undefined): { image: boolean; video: boolean; speech: boolean; music: boolean } {
+export function mediaReady(media: MediaSettings | null | undefined): { image: boolean; video: boolean; speech: boolean; music: boolean; sound: boolean } {
   const on = !!media && media.enabled && !!media.baseUrl.trim();
   return {
     image: on && !!(media!.imageModel || media!.imageModels.length),
     video: on && !!(media!.videoModel || media!.videoModels.length),
     speech: on && !!(media!.speechModel || media!.speechModels?.length),
     music: on && !!(media!.musicModel || media!.musicModels?.length),
+    sound: on && !!(media!.soundModel || media!.soundModels?.length),
   };
 }
 
 /** What the service can make, in words ("images, video and speech"). */
 export function mediaAbilities(media: MediaSettings | null | undefined): string {
   const ready = mediaReady(media);
-  const can = [ready.image && 'images', ready.video && 'video', ready.speech && 'speech', ready.music && 'music'].filter(Boolean) as string[];
+  const can = [ready.image && 'images', ready.video && 'video', ready.speech && 'speech', ready.music && 'music', ready.sound && 'sound effects'].filter(Boolean) as string[];
   return can.length > 1 ? `${can.slice(0, -1).join(', ')} and ${can[can.length - 1]}` : can[0] ?? '';
 }
 
@@ -135,7 +151,7 @@ export function mediaBase(address: string): string {
   return `${url.origin}${path}`;
 }
 
-function endpointsOf(media: MediaSettings): { images: string; edits: string; videos: string; models: string; speech: string; voices: string; music: string } {
+function endpointsOf(media: MediaSettings): { images: string; edits: string; videos: string; models: string; speech: string; voices: string; music: string; sound: string } {
   const base = mediaBase(media.baseUrl);
   const trim = (url: string) => url.replace(/\/+$/, '');
   return {
@@ -146,6 +162,7 @@ function endpointsOf(media: MediaSettings): { images: string; edits: string; vid
     speech: media.endpoints?.speech ?? `${base}/audio/speech`,
     voices: trim(media.endpoints?.voices ?? `${base}/audio/voices`),
     music: trim(media.endpoints?.music ?? `${base}/audio/music`),
+    sound: trim(media.endpoints?.sound ?? `${base}/audio/sound_effects`),
   };
 }
 
@@ -267,9 +284,18 @@ export function readDiscovery(doc: Json, origin: string): Extract<Discovery, { s
     default: bool(m.default),
     describedVoices: bool(m.described_voices),
     savedVoices: bool(m.saved_voices),
+    engine: str(m.engine),
+    license: str(m.license),
     sampleRate: num(m.sample_rate),
   }));
   const musicModels: MusicModelInfo[] = list(models.music).filter((m) => str(m.id)).map((m) => ({
+    id: String(m.id),
+    default: bool(m.default),
+    maxSeconds: num(m.max_seconds),
+    sampleRate: num(m.sample_rate),
+    channels: num(m.channels),
+  }));
+  const soundModels: SoundModelInfo[] = list(models.sound).filter((m) => str(m.id)).map((m) => ({
     id: String(m.id),
     default: bool(m.default),
     maxSeconds: num(m.max_seconds),
@@ -292,17 +318,19 @@ export function readDiscovery(doc: Json, origin: string): Extract<Discovery, { s
     media: {
       ...EMPTY_MEDIA,
       baseUrl: base,
-      endpoints: { images: urlOf('images'), edits: urlOf('edits'), videos: urlOf('videos'), speech: urlOf('speech'), voices: urlOf('voices'), music: urlOf('music') },
+      endpoints: { images: urlOf('images'), edits: urlOf('edits'), videos: urlOf('videos'), speech: urlOf('speech'), voices: urlOf('voices'), music: urlOf('music'), sound: urlOf('sound') },
       imageModels,
       videoModels,
       speechModels,
       musicModels,
+      soundModels,
       voices,
       openaiVoices,
       imageModel: str(defaults.image) ?? imageModels.find((m) => m.default)?.id ?? imageModels[0]?.id,
       videoModel: str(defaults.video) ?? videoModels.find((m) => m.default)?.id ?? videoModels[0]?.id,
       speechModel: str(defaults.speech) ?? speechModels.find((m) => m.default)?.id ?? speechModels[0]?.id,
       musicModel: str(defaults.music) ?? musicModels.find((m) => m.default)?.id ?? musicModels[0]?.id,
+      soundModel: str(defaults.sound) ?? soundModels.find((m) => m.default)?.id ?? soundModels[0]?.id,
       discovered: { service, version, origin, at: Date.now() },
     },
     llm: {
@@ -365,14 +393,15 @@ export function mergeDiscovered(current: MediaSettings, found: MediaSettings): M
   const keepVideo = current.videoModel && found.videoModels.some((m) => m.id === current.videoModel) ? current.videoModel : found.videoModel;
   const keepSpeech = current.speechModel && found.speechModels?.some((m) => m.id === current.speechModel) ? current.speechModel : found.speechModel;
   const keepMusic = current.musicModel && found.musicModels?.some((m) => m.id === current.musicModel) ? current.musicModel : found.musicModel;
-  return { ...found, apiKey: current.apiKey, enabled: current.baseUrl ? current.enabled : true, imageModel: keepImage, videoModel: keepVideo, speechModel: keepSpeech, musicModel: keepMusic };
+  const keepSound = current.soundModel && found.soundModels?.some((m) => m.id === current.soundModel) ? current.soundModel : found.soundModel;
+  return { ...found, apiKey: current.apiKey, enabled: current.baseUrl ? current.enabled : true, imageModel: keepImage, videoModel: keepVideo, speechModel: keepSpeech, musicModel: keepMusic, soundModel: keepSound };
 }
 
-/** The image, video, speech and music models a server lists: typed (nrob), else guessed from their names. */
-export async function listMediaModels(media: MediaSettings, signal?: AbortSignal): Promise<{ image: string[]; video: string[]; speech: string[]; music: string[] }> {
+/** The image, video, speech, music and sound effects models a server lists: typed (nrob), else guessed from their names. */
+export async function listMediaModels(media: MediaSettings, signal?: AbortSignal): Promise<{ image: string[]; video: string[]; speech: string[]; music: string[]; sound: string[] }> {
   const resp = await request(endpointsOf(media).models, { apiKey: media.apiKey, what: 'Listing the models' }, signal ?? AbortSignal.timeout(10_000));
   const body = (await resp.json()) as Json;
-  const found = { image: [] as string[], video: [] as string[], speech: [] as string[], music: [] as string[] };
+  const found = { image: [] as string[], video: [] as string[], speech: [] as string[], music: [] as string[], sound: [] as string[] };
   for (const m of list(body.data)) {
     const id = str(m.id);
     if (!id) continue;
@@ -381,6 +410,7 @@ export async function listMediaModels(media: MediaSettings, signal?: AbortSignal
     else if (type === 'video' || (!type && /sora|video|veo|ltx|wan/i.test(id))) found.video.push(id);
     else if (type === 'speech' || (!type && /tts|speech/i.test(id))) found.speech.push(id);
     else if (type === 'music' || (!type && /music|song/i.test(id))) found.music.push(id);
+    else if (type === 'sound' || (!type && /sound.?effect|sfx|foley/i.test(id))) found.sound.push(id);
   }
   return found;
 }
@@ -444,8 +474,22 @@ export interface SpeechRequest {
 }
 
 /** The speech as audio bytes (the whole clip: the service answers when it is made). */
+/** Whether a voice sent with a request was made by Breeze TTS 2 (it has no speaker embedding, which Qwen3-TTS needs). */
+function madeByBreeze(voice: VoiceChoice | undefined): boolean {
+  return isRecord(voice) && Array.isArray(voice.speaker) && voice.speaker.length === 0;
+}
+
+/** The speech model for a request: the chosen one, unless the voice was made by Breeze TTS 2 and the chosen model is not Breeze. */
+export function speechModelFor(media: MediaSettings, voice?: VoiceChoice): string | undefined {
+  const chosen = media.speechModel;
+  if (!madeByBreeze(voice)) return chosen;
+  const models = media.speechModels ?? [];
+  if (models.find((m) => m.id === chosen)?.engine === 'breeze-tts-2') return chosen;
+  return models.find((m) => m.engine === 'breeze-tts-2')?.id ?? chosen;
+}
+
 export async function generateSpeech(media: MediaSettings, req: SpeechRequest, signal?: AbortSignal): Promise<{ bytes: Uint8Array; mime: string }> {
-  const body: Json = { input: req.input, model: req.model || media.speechModel, response_format: req.format ?? 'mp3' };
+  const body: Json = { input: req.input, model: req.model || speechModelFor(media, req.voice), response_format: req.format ?? 'mp3' };
   if (req.voice) body.voice = req.voice;
   if (req.instructions) body.instructions = req.instructions;
   if (req.language) body.language = req.language;
@@ -465,6 +509,8 @@ export async function generateSpeech(media: MediaSettings, req: SpeechRequest, s
  */
 export async function createVoice(media: MediaSettings, req: { name: string; description: string; sampleText?: string; language?: string; seed?: number; keep?: boolean }, signal?: AbortSignal): Promise<VoiceInfo & { handed?: HandedVoice }> {
   const body: Json = { name: req.name, description: req.description };
+  // Designed by the chosen speech model, which then speaks it best.
+  if (media.speechModel) body.model = media.speechModel;
   if (req.sampleText) body.sample_text = req.sampleText;
   if (req.language) body.language = req.language;
   if (req.seed !== undefined) body.seed = req.seed;
@@ -514,6 +560,34 @@ export async function generateMusic(media: MediaSettings, req: MusicRequest, onP
   onProgress('downloading the song…');
   const format = req.format ?? 'wav';
   const content = await request(`${ep.music}/${encodeURIComponent(id)}/content${format === 'wav' ? '' : `?format=${format}`}`, { apiKey: media.apiKey, what: 'Downloading the song' }, signal);
+  const seconds = num(job.seconds) ?? (str(job.seconds) ? Number(job.seconds) : undefined);
+  return { bytes: new Uint8Array(await content.arrayBuffer()), seconds, model: str(job.model) ?? model ?? 'default' };
+}
+
+// --- Sound effects -----------------------------------------------------------
+
+export interface SoundEffectRequest {
+  /** What makes the sound, where, and how it sounds. */
+  prompt: string;
+  seconds?: number;
+  model?: string;
+  seed?: number;
+  format?: 'wav' | 'mp3' | 'opus' | 'aac' | 'flac';
+}
+
+/** Start a sound effect job, follow it, and download the sound. */
+export async function generateSoundEffect(media: MediaSettings, req: SoundEffectRequest, onProgress: (message: string) => void, signal?: AbortSignal): Promise<{ bytes: Uint8Array; seconds?: number; model: string }> {
+  const ep = endpointsOf(media);
+  const model = req.model || media.soundModel;
+  const body: Json = { prompt: req.prompt, model };
+  if (req.seconds !== undefined) body.seconds = req.seconds;
+  if (req.seed !== undefined) body.seed = req.seed;
+  const created = await request(ep.sound, { method: 'POST', body: JSON.stringify(body), headers: { 'Content-Type': 'application/json' }, apiKey: media.apiKey, what: 'Starting the sound effect' }, signal);
+  const { id, job } = await followJob(media, ep.sound, (await created.json()) as Json, 'sound effect', onProgress, signal, (jobId) =>
+    fetch(`${ep.sound}/${encodeURIComponent(jobId)}/cancel`, { method: 'POST', headers: authHeaders(media.apiKey) }));
+  onProgress('downloading the sound…');
+  const format = req.format ?? 'wav';
+  const content = await request(`${ep.sound}/${encodeURIComponent(id)}/content${format === 'wav' ? '' : `?format=${format}`}`, { apiKey: media.apiKey, what: 'Downloading the sound effect' }, signal);
   const seconds = num(job.seconds) ?? (str(job.seconds) ? Number(job.seconds) : undefined);
   return { bytes: new Uint8Array(await content.arrayBuffer()), seconds, model: str(job.model) ?? model ?? 'default' };
 }
@@ -642,7 +716,7 @@ export async function generateVideo(media: MediaSettings, req: VideoRequest, onP
     if (req.startImage) body.input_reference = { image_url: dataUrl(req.startImage) };
     if (req.endImage) body.end_image = { image_url: dataUrl(req.endImage) };
     if (req.negativePrompt) body.negative_prompt = req.negativePrompt;
-    if (req.speech) body.speech = Object.fromEntries(Object.entries(req.speech).filter(([, v]) => v !== undefined && v !== ''));
+    if (req.speech) body.speech = Object.fromEntries(Object.entries({ model: speechModelFor(media, req.speech.voice), ...req.speech }).filter(([, v]) => v !== undefined && v !== ''));
     if (req.audio) {
       const format = req.audio.name.split('.').pop()!.toLowerCase();
       if (!SOUNDTRACK_FORMATS.includes(format)) throw new MediaError(`A soundtrack must be ${SOUNDTRACK_FORMATS.join(', ')}; ${req.audio.name} is not.`);

@@ -348,7 +348,7 @@ function readModelList(body: unknown): ModelInfo[] | null {
   for (const item of body.data) {
     if (!isRecord(item) || typeof item.id !== 'string' || !item.id.trim()) continue;
     // nrob lists its image, video, speech and music models here too, typed: they cannot chat.
-    if (item.type === 'image' || item.type === 'video' || item.type === 'speech' || item.type === 'music') continue;
+    if (item.type === 'image' || item.type === 'video' || item.type === 'speech' || item.type === 'music' || item.type === 'sound') continue;
     models.push({
       id: item.id,
       label: typeof item.display_name === 'string' && item.display_name !== item.id ? item.display_name : undefined,

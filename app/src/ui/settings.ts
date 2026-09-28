@@ -64,7 +64,7 @@ export function openSettings(initial: SettingsResult): Promise<SettingsResult | 
     let providers = initial.providers.map((p) => ({ ...p }));
     let activeId = initial.activeId;
     const agent = { ...initial.agent };
-    let media: MediaSettings = { ...initial.media, imageModels: [...initial.media.imageModels], videoModels: [...initial.media.videoModels], speechModels: [...(initial.media.speechModels ?? [])], musicModels: [...(initial.media.musicModels ?? [])] };
+    let media: MediaSettings = { ...initial.media, imageModels: [...initial.media.imageModels], videoModels: [...initial.media.videoModels], speechModels: [...(initial.media.speechModels ?? [])], musicModels: [...(initial.media.musicModels ?? [])], soundModels: [...(initial.media.soundModels ?? [])] };
     let editing: ProviderConfig | null = providers.find((p) => p.id === activeId) ?? providers[0] ?? null;
     // Model lists already fetched, by server address and key, so a re-render
     // (typing a name, switching rows) does not lose them.
@@ -249,14 +249,16 @@ export function openSettings(initial: SettingsResult): Promise<SettingsResult | 
         }
       } }) as HTMLInputElement;
       const key = h('input', { type: 'password', value: media.apiKey, placeholder: 'usually none', oninput: () => { media.apiKey = key.value.trim(); } }) as HTMLInputElement;
-      const modelInput = (kind: 'image' | 'video' | 'speech' | 'music') => {
+      const modelInput = (kind: 'image' | 'video' | 'speech' | 'music' | 'sound') => {
         const listId = `media-${kind}-models`;
-        const field = `${kind}Model` as 'imageModel' | 'videoModel' | 'speechModel' | 'musicModel';
-        const ids = ((kind === 'image' ? media.imageModels : kind === 'video' ? media.videoModels : kind === 'speech' ? media.speechModels : media.musicModels) ?? []).map((m) => m.id);
+        const field = `${kind}Model` as 'imageModel' | 'videoModel' | 'speechModel' | 'musicModel' | 'soundModel';
+        const ids = ((kind === 'image' ? media.imageModels : kind === 'video' ? media.videoModels : kind === 'speech' ? media.speechModels : kind === 'music' ? media.musicModels : media.soundModels) ?? []).map((m) => m.id);
         const input = h('input', { list: listId, value: media[field] ?? '', placeholder: ids.length ? 'choose or type a model' : 'type a model name', oninput: () => {
           media[field] = input.value.trim() || undefined;
         } }) as HTMLInputElement;
-        return h('span.model-choice', input, h('datalist', { id: listId }, ...ids.map((id) => h('option', { value: id }))));
+        // Breeze TTS 2's weights and what they make are for research and non-commercial use.
+        const note = (id: string) => kind === 'speech' && media.speechModels?.find((m) => m.id === id)?.engine === 'breeze-tts-2' ? 'Breeze TTS 2: research and non-commercial use only' : undefined;
+        return h('span.model-choice', input, h('datalist', { id: listId }, ...ids.map((id) => h('option', { value: id, label: note(id) }))));
       };
       const find = h('button', { title: 'Ask nrob for its details (/v1/discovery) and fill everything in', onclick: async () => {
         note.textContent = 'Looking for nrob…';
@@ -294,12 +296,14 @@ export function openSettings(initial: SettingsResult): Promise<SettingsResult | 
           media.videoModels = found.video.map((id) => media.videoModels.find((m) => m.id === id) ?? { id });
           media.speechModels = found.speech.map((id) => media.speechModels?.find((m) => m.id === id) ?? { id });
           media.musicModels = found.music.map((id) => media.musicModels?.find((m) => m.id === id) ?? { id });
+          media.soundModels = found.sound.map((id) => media.soundModels?.find((m) => m.id === id) ?? { id });
           media.speechModel ??= found.speech[0];
           media.musicModel ??= found.music[0];
+          media.soundModel ??= found.sound[0];
           media.imageModel ??= found.image[0];
           media.videoModel ??= found.video[0];
           renderMedia();
-          (mediaSection.querySelector('.form-note') as HTMLElement).textContent = `${found.image.length} image, ${found.video.length} video, ${found.speech.length} speech and ${found.music.length} music models.`;
+          (mediaSection.querySelector('.form-note') as HTMLElement).textContent = `${found.image.length} image, ${found.video.length} video, ${found.speech.length} speech, ${found.music.length} music and ${found.sound.length} sound effects models.`;
         } catch (error) {
           note.textContent = (error as Error).message;
         }
@@ -307,7 +311,7 @@ export function openSettings(initial: SettingsResult): Promise<SettingsResult | 
       const enabled = h('input', { type: 'checkbox', checked: media.enabled, onchange: () => { media.enabled = enabled.checked; } }) as HTMLInputElement;
       mediaSection.append(
         h('strong', 'Images, video and audio'),
-        h('p.muted', `The agent can make pictures, short videos, speech and music with a media service: nrob is found on its own, and any server with OpenAI's /v1/images/generations, /v1/videos and /v1/audio/speech works. Now: ${status}${media.baseUrl ? ` (${abilities || 'no models chosen'})` : ''}.`),
+        h('p.muted', `The agent can make pictures, short videos, speech, music and sound effects with a media service: nrob is found on its own, and any server with OpenAI's /v1/images/generations, /v1/videos and /v1/audio/speech works. Now: ${status}${media.baseUrl ? ` (${abilities || 'no models chosen'})` : ''}.`),
         h('div.provider-form',
           h('label', 'Address', h('div.window-picker', address, find, listButton)),
           h('label', 'API key', key),
@@ -315,8 +319,9 @@ export function openSettings(initial: SettingsResult): Promise<SettingsResult | 
           h('label', 'Video', modelInput('video')),
           h('label', 'Speech', modelInput('speech')),
           h('label', 'Music', modelInput('music')),
+          h('label', 'Sound effects', modelInput('sound')),
         ),
-        h('label', enabled, ' Let the agent make images, video, speech and music'),
+        h('label', enabled, ' Let the agent make images, video, speech, music and sound effects'),
         note,
       );
     };

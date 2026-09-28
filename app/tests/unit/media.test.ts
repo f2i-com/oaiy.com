@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { EMPTY_MEDIA, discoverNrob, generateImage, generateMusic, generateSpeech, generateVideo, mediaAbilities, mediaBase, mediaReady, mergeDiscovered, readDiscovery } from '../../src/agent/media';
+import { EMPTY_MEDIA, createVoice, discoverNrob, generateImage, generateMusic, generateSoundEffect, generateSpeech, generateVideo, mediaAbilities, mediaBase, mediaReady, mergeDiscovered, readDiscovery, speechModelFor } from '../../src/agent/media';
 import { mediaTools } from '../../src/agent/tools';
 
 // nrob-studio's discovery document, as it answers /v1/discovery (trimmed).
@@ -17,6 +17,7 @@ const DOC = {
     { name: 'speech', method: 'POST', path: '/v1/audio/speech', url: 'http://127.0.0.1:8080/v1/audio/speech', spec: 'openai' },
     { name: 'voices', method: 'GET', path: '/v1/audio/voices', url: 'http://127.0.0.1:8080/v1/audio/voices', spec: 'openai' },
     { name: 'music', method: 'POST', path: '/v1/audio/music', url: 'http://127.0.0.1:8080/v1/audio/music', spec: 'openai' },
+    { name: 'sound', method: 'POST', path: '/v1/audio/sound_effects', url: 'http://127.0.0.1:8080/v1/audio/sound_effects', spec: 'openai' },
   ],
   models: {
     llm: [{ id: 'qwen3.8-27b', default: true, loaded: false, vision: false }, { id: 'qwen3.5-9b', default: false }],
@@ -25,10 +26,11 @@ const DOC = {
       { id: 'unholy-desire-sdxl', default: false, architecture: 'sdxl', edits: false, max_references: 0, size_step: 64, default_size: '1024x1024', negative_prompt: true },
     ],
     video: [{ id: 'sulphur-2', default: true, family: 'sulphur-2', fps: 24, max_frames: 121, max_seconds: 5, max_side: 1024, start_image: true }],
-    speech: [{ id: 'qwen3-tts', default: true, described_voices: true, saved_voices: true, sample_rate: 24000 }],
+    speech: [{ id: 'qwen3-tts', default: true, engine: 'qwen3-tts', license: 'apache-2.0', described_voices: true, saved_voices: true, sample_rate: 24000 }],
     music: [{ id: 'minimax-music3', default: true, max_seconds: 360, sample_rate: 44100, channels: 2 }],
+    sound: [{ id: 'moss-soundeffect', default: true, max_seconds: 30, sample_rate: 48000, channels: 1 }],
   },
-  defaults: { llm: 'qwen3.8-27b', image: 'qwen-image-turbo-q4', video: 'sulphur-2', speech: 'qwen3-tts', music: 'minimax-music3' },
+  defaults: { llm: 'qwen3.8-27b', image: 'qwen-image-turbo-q4', video: 'sulphur-2', speech: 'qwen3-tts', music: 'minimax-music3', sound: 'moss-soundeffect' },
   voices: { saved: [{ id: 'Narrator', name: 'Narrator', description: 'A deep, calm male narrator', language: 'english' }], openai_names: ['alloy', 'onyx'] },
   llm: { state: 'stopped', context_tokens: 32768, starts_on_demand: true },
 };
@@ -47,8 +49,11 @@ describe('nrob discovery', () => {
     expect(found.media.imageModels[1]).toMatchObject({ id: 'unholy-desire-sdxl', edits: false, sizeStep: 64, negativePrompt: true });
     expect(found.media.videoModels[0]).toMatchObject({ maxSeconds: 5, maxSide: 1024, startImage: true, fps: 24 });
     expect(found.llm).toEqual({ base: 'http://127.0.0.1:8080/v1', models: ['qwen3.8-27b', 'qwen3.5-9b'], default: 'qwen3.8-27b', contextTokens: 32768 });
-    expect(mediaReady(found.media)).toEqual({ image: true, video: true, speech: true, music: true });
-    expect(mediaAbilities(found.media)).toBe('images, video, speech and music');
+    expect(mediaReady(found.media)).toEqual({ image: true, video: true, speech: true, music: true, sound: true });
+    expect(mediaAbilities(found.media)).toBe('images, video, speech, music and sound effects');
+    expect(found.media.soundModel).toBe('moss-soundeffect');
+    expect(found.media.soundModels?.[0]).toMatchObject({ id: 'moss-soundeffect', maxSeconds: 30, sampleRate: 48000 });
+    expect(found.media.endpoints?.sound).toBe('http://127.0.0.1:8080/v1/audio/sound_effects');
     expect(found.media.speechModel).toBe('qwen3-tts');
     expect(found.media.musicModels?.[0]).toMatchObject({ id: 'minimax-music3', maxSeconds: 360 });
     expect(found.media.voices).toEqual([{ name: 'Narrator', description: 'A deep, calm male narrator', language: 'english' }]);
@@ -180,6 +185,51 @@ describe('media requests', () => {
     expect(song).toMatchObject({ seconds: 30, model: 'minimax-music3' });
   });
 
+  it('designs voices with the chosen speech model, and speaks a Breeze TTS 2 voice with Breeze', async () => {
+    const doc = { ...DOC, models: { ...DOC.models, speech: [...DOC.models.speech, { id: 'breeze-tts-2', engine: 'breeze-tts-2', license: 'research and non-commercial', described_voices: true, saved_voices: true }] } };
+    const both = readDiscovery(doc, 'http://127.0.0.1:8080').media;
+    expect(both.speechModels?.[1]).toMatchObject({ id: 'breeze-tts-2', engine: 'breeze-tts-2', license: 'research and non-commercial' });
+    const calls: Array<{ url: string; body?: Record<string, unknown> }> = [];
+    vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
+      calls.push({ url, body: init?.body ? JSON.parse(String(init.body)) : undefined });
+      if (url.endsWith('/audio/voices')) return json({ name: 'Fox', description: 'sly' });
+      return new Response(new Uint8Array([1]), { headers: { 'content-type': 'audio/wav' } });
+    }));
+    await createVoice({ ...both, speechModel: 'breeze-tts-2' }, { name: 'Fox', description: 'sly' });
+    expect(calls[0].body).toMatchObject({ name: 'Fox', model: 'breeze-tts-2' });
+    // A voice Breeze made (no speaker embedding) goes to Breeze though Qwen3-TTS is chosen; others stay.
+    const fox = { nrob_voice: 1, name: 'Fox', ref_text: 'hi', ref_codes: [[1]], speaker: [] };
+    expect(speechModelFor(both, fox)).toBe('breeze-tts-2');
+    expect(speechModelFor(both, { ...fox, speaker: [0.5] })).toBe('qwen3-tts');
+    expect(speechModelFor(both, 'Narrator')).toBe('qwen3-tts');
+    await generateSpeech(both, { input: 'Hello.', voice: fox });
+    expect(calls[1].body).toMatchObject({ model: 'breeze-tts-2' });
+    const [, , speech] = mediaTools(both);
+    expect(speech.description).toContain('breeze-tts-2: Breeze TTS 2, research and non-commercial use only');
+  });
+
+  it('makes sound effects as jobs', async () => {
+    const calls: Array<{ url: string; body?: Record<string, unknown> }> = [];
+    let polls = 0;
+    vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
+      calls.push({ url, body: init?.body ? JSON.parse(String(init.body)) : undefined });
+      if (url.endsWith('/audio/sound_effects')) return json({ id: 'sfx_1', status: 'queued' });
+      if (url.endsWith('/sfx_1')) return json(++polls < 2 ? { id: 'sfx_1', status: 'in_progress', progress: 40 } : { id: 'sfx_1', status: 'completed', seconds: 4, model: 'moss-soundeffect' });
+      if (url.includes('/sfx_1/content')) return new Response(new Uint8Array([1, 2, 3]));
+      return json({}, 404);
+    }));
+    vi.useFakeTimers();
+    const progress: string[] = [];
+    const pending = generateSoundEffect(media, { prompt: 'rain on a tin roof', seconds: 4, seed: 2 }, (m) => progress.push(m));
+    await vi.runAllTimersAsync();
+    const effect = await pending;
+    vi.useRealTimers();
+    expect(calls[0]).toEqual({ url: 'http://127.0.0.1:8080/v1/audio/sound_effects', body: { prompt: 'rain on a tin roof', model: 'moss-soundeffect', seconds: 4, seed: 2 } });
+    expect(calls[calls.length - 1].url).toBe('http://127.0.0.1:8080/v1/audio/sound_effects/sfx_1/content');
+    expect(progress).toEqual(['sound effect queued, waiting for the GPU…', 'making the sound effect: 40%', 'downloading the sound…']);
+    expect(effect).toMatchObject({ seconds: 4, model: 'moss-soundeffect', bytes: new Uint8Array([1, 2, 3]) });
+  });
+
   it('reports a failed job with the service\'s reason', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => json({ id: 'v', status: 'failed', error: { code: 'generation_failed', message: 'out of memory' } })));
     await expect(generateVideo(media, { prompt: 'x' }, () => {})).rejects.toThrow('out of memory');
@@ -190,7 +240,8 @@ describe('media tools', () => {
   it('are offered only when a service is set up, with the models described', () => {
     expect(mediaTools(EMPTY_MEDIA)).toEqual([]);
     const tools = mediaTools(readDiscovery(DOC, 'http://127.0.0.1:8080').media);
-    expect(tools.map((t) => t.name)).toEqual(['generate_image', 'generate_video', 'generate_speech', 'create_voice', 'generate_music', 'review_frame']);
+    expect(tools.map((t) => t.name)).toEqual(['generate_image', 'generate_video', 'generate_speech', 'create_voice', 'generate_music', 'generate_sound_effect', 'review_frame']);
+    expect(tools[5].description).toContain('moss-soundeffect (default): up to 30 s');
     expect(tools[2].description).toContain('Voices: Narrator, alloy, onyx. Saved: Narrator (A deep, calm male narrator).');
     expect(tools[4].description).toContain('minimax-music3 (default): up to 360 s');
     expect(Object.keys((tools[1].parameters as { properties: Record<string, unknown> }).properties)).toEqual(expect.arrayContaining(['end_image', 'say', 'voice', 'soundtrack']));
