@@ -43,6 +43,10 @@ members = [
     # matmuls on any wgpu adapter for machines without CUDA. A member, not a
     # default member: wgpu adds minutes to every default build.
     "crates/ggml-rs-wgpu",
+    # The resident speech server (Parakeet speech-to-text on Candle). Like
+    # oaiy-media a member, not a default member: Candle is a long build, and
+    # its GPU build needs a CUDA toolchain (`--features cuda`).
+    "crates/oaiy-voice",
 ]
 default-members = [
     "crates/oaiy-engine",
