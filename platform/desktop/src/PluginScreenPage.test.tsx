@@ -7,7 +7,7 @@
 // `data-theme` on ITS OWN document, and nothing ever crossed the frame
 // boundary, so the plugin screens rendered light under every theme.
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { HOST_BOOTSTRAP, isPluginNavTarget, pluginAiSources, pluginOaiyStatus } from './PluginScreenPage';
+import { HOST_BOOTSTRAP, isPluginNavTarget, pluginAiSources, pluginFontCss, pluginOaiyStatus } from './PluginScreenPage';
 import { API_BASE, engines, voices } from './api';
 
 describe('plugin AI source gateway routes', () => {
@@ -147,5 +147,20 @@ describe('plugin screen navigation and OAIY status', () => {
     });
     vi.spyOn(engines, 'status').mockRejectedValue(new Error('offline'));
     expect(await pluginOaiyStatus()).toEqual({ voice: { chosen: 'receptionist' }, llm: null });
+  });
+});
+
+describe('plugin screen fonts', () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('gives no fonts when they cannot be read, and tries again next time', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: false, status: 404 }));
+    expect(await pluginFontCss()).toBe('');
+    const fetch = vi.fn().mockResolvedValue({ ok: true, arrayBuffer: async () => new Uint8Array([1, 2, 3]).buffer });
+    vi.stubGlobal('fetch', fetch);
+    const css = await pluginFontCss();
+    expect(fetch).toHaveBeenCalledWith('/fonts/public-sans.woff2');
+    expect(css).toContain("font-family:'Public Sans';src:url(data:font/woff2;base64,AQID)");
+    expect(css).toContain("font-family:'JetBrains Mono'");
   });
 });

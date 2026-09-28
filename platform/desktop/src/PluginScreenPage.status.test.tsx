@@ -42,6 +42,9 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
+/** Fetches of the screen's own files (the host's font loader fetches too). */
+const assetFetches = () => fetchAssets.mock.calls.filter(([url]) => String(url).includes('/api/plugins/')).length;
+
 async function mount() {
   await act(async () => root.render(<PluginScreenPage pluginId="aokie" navId="calls" />));
   return container.querySelector('iframe')!;
@@ -69,7 +72,7 @@ describe('plugin screen runtime status', () => {
     expect(container.querySelector('iframe')).toBe(frame);
     expect(frame.srcdoc).toBe(source);
     expect(frame.contentDocument!.getElementById('saved-turn')).toBe(transcript);
-    expect(fetchAssets).toHaveBeenCalledTimes(1);
+    expect(assetFetches()).toBe(1);
   });
 
   it('does not let an older snapshot put a recovered plugin back into unhealthy state', async () => {
@@ -82,6 +85,6 @@ describe('plugin screen runtime status', () => {
     await act(async () => resolveOld({ plugins: [plugin('unhealthy', 'outdated probe')] }));
     expect(container.querySelector('[role="alert"]')).toBeNull();
     expect(container.querySelector('iframe')).toBe(frame);
-    expect(fetchAssets).toHaveBeenCalledTimes(1);
+    expect(assetFetches()).toBe(1);
   });
 });

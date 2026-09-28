@@ -95,6 +95,39 @@ export function pluginAiSources(sources: unknown[], apiBase = API_BASE): unknown
   });
 }
 
+/**
+ * The dashboard's own fonts, as `@font-face` rules with data: URLs.
+ *
+ * A plugin screen's CSP allows fonts only from data:, so without this every
+ * screen fell back to the system font and read as a different app. The files
+ * are the ones the dashboard self-hosts; they are read once per session. Any
+ * failure gives '' and the screen keeps its fallback fonts.
+ */
+let hostFontCss: Promise<string> | null = null;
+export function pluginFontCss(): Promise<string> {
+  if (!hostFontCss) {
+    const face = async (family: string, file: string, weight: string) => {
+      const resp = await fetch(`/fonts/${file}`);
+      if (!resp.ok) throw new Error(`${file} → HTTP ${resp.status}`);
+      const bytes = new Uint8Array(await resp.arrayBuffer());
+      let binary = '';
+      for (let i = 0; i < bytes.length; i += 0x8000) binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+      return `@font-face{font-family:'${family}';src:url(data:font/woff2;base64,${btoa(binary)}) format('woff2');font-weight:${weight};font-display:swap}`;
+    };
+    hostFontCss = Promise.all([
+      face('Public Sans', 'public-sans.woff2', '300 700'),
+      face('JetBrains Mono', 'jetbrains-mono.woff2', '400 700'),
+    ]).then(
+      (faces) => faces.join('\n'),
+      () => {
+        hostFontCss = null;
+        return '';
+      },
+    );
+  }
+  return hostFontCss;
+}
+
 /** The bootstrap injected ahead of the plugin's own scripts. Plain ES5-ish so it
  *  runs before any transform, and self-contained: the iframe has no imports. */
 export const HOST_BOOTSTRAP = `
@@ -290,7 +323,7 @@ function PluginScreenContent({ pluginId, navId, onNavigate }: Props) {
         // after the first failure. Separate tags give identical global semantics
         // and identical ordering, but isolate a bad module to itself.
         const jsFiles = files.filter((f) => f.endsWith('.js'));
-        const sources = await Promise.all(jsFiles.map(fetchText));
+        const [sources, fonts] = await Promise.all([Promise.all(jsFiles.map(fetchText)), pluginFontCss()]);
         if (cancelled) return;
         const scripts = sources.map((s) => `<script>${s.replace(/<\/script/gi, '<\\/script')}</script>`).join('');
         // Stamped at assembly rather than messaged in after load, so the screen
@@ -303,7 +336,7 @@ function PluginScreenContent({ pluginId, navId, onNavigate }: Props) {
           `<!doctype html><html${dark ? ' class="fl-dark" data-theme="dark"' : ' data-theme="light"'}><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">` +
             // No external anything: the plugin ships inline SVG and its own CSS.
             `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src data: blob:; font-src data:; connect-src 'none'">` +
-            `<style>${css}</style></head><body>${body}` +
+            `<style>${fonts}\n${css}</style></head><body>${body}` +
             `<script>${HOST_BOOTSTRAP}</script>${scripts}</body></html>`,
         );
         setError(null);
