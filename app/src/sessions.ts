@@ -649,7 +649,9 @@ export class Sessions {
     if (remove) note.facts = note.facts.filter((f) => !f.toLowerCase().includes(remove));
     note.facts = note.facts.slice(-MAX_FACTS);
     note.updatedAt = Date.now();
-    if (note.name) for (const s of this.list) if (s.kind !== 'task' && (s.key === note.number || sameNumber(s.key, note.number))) s.title = note.name;
+    // Their conversations take the name; cleared, they go back to the number.
+    const renamed = typeof change.name === 'string';
+    for (const s of this.list) if (s.kind !== 'task' && (s.key === note.number || sameNumber(s.key, note.number)) && (note.name || renamed)) s.title = note.name || s.key;
     await this.project.saveCallers(this.callers);
     await this.saveIndex();
     this.hooks.named?.(note);

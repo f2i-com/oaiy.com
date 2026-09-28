@@ -400,9 +400,9 @@ async function main(): Promise<void> {
         finished: (session) => {
           if (viewing === session.id) chat.endReply();
         },
-        // The phone greets a caller by the name its agents know.
+        // The phone greets a caller by the name its agents know (a cleared name is forgotten there too).
         named: (note) => {
-          if (note.name) void desktop?.rememberCaller(note.number, note.name).catch(() => {});
+          void desktop?.rememberCaller(note.number, note.name ?? '').catch(() => {});
         },
         event: (session, event) => {
           if (viewing === session.id) chat.event(event);

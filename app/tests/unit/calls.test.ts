@@ -466,6 +466,10 @@ describe('a phone call answered by the agent', () => {
     expect(await notes.run({}, new AbortController().signal)).toContain('Lance');
     expect(await notes.run({ number: '0400000011', remove: 'lawn', add: 'Prefers mornings' }, new AbortController().signal)).toContain('- Prefers mornings');
     expect(sessions.callerNote('+61400000011')?.facts).toEqual(['Prefers mornings']);
+    // A name cleared: the phone forgets it, and the conversations go back to the number.
+    await notes.run({ number: '0400000011', name: '' }, new AbortController().signal);
+    expect(named.at(-1)?.name).toBeUndefined();
+    expect(sessions.list.filter((s) => s.key === '+61400000011' || s.key === '0400000011').every((s) => s.title === s.key)).toBe(true);
   });
 
   it('the runner passes a note to a call going on now: read with its next reply, or acted on at once', async () => {
