@@ -245,6 +245,11 @@ async function main(): Promise<void> {
   });
   const providerChip = h('button.chip', { title: 'AI provider', onclick: () => void editSettings() });
   const phoneChip = h('button.chip.toggle.phone', { title: 'Phone: OAIY Desktop, Aokie and text messages', onclick: () => void openPhone() });
+  // A call going on now: who with, and a click shows it.
+  const callChip = h('button.chip.on-call', { hidden: true, onclick: () => {
+    const live = sessions?.list.find((s) => s.callId);
+    if (live) selectSession(live.id);
+  } }) as HTMLButtonElement;
   const renderChips = () => {
     gateChip.textContent = `internet: ${gate.mode === 'open' ? 'on' : gate.mode === 'blocked' ? 'off' : 'allowlist'}`;
     gateChip.dataset.mode = gate.mode;
@@ -1003,6 +1008,7 @@ A project can hold several apps, each in its own folder (any folder whose manife
     actions,
     h('div.spacer'),
     phoneChip,
+    callChip,
     gateChip,
     providerChip,
     h('button.settings-button', { title: 'AI providers', 'aria-label': 'Settings', onclick: () => void editSettings() }, '⚙', h('span.label', ' Settings')),
@@ -1160,6 +1166,12 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
 
   function renderSessions(): void {
     if (!sessions) return;
+    const live = sessions.list.find((s) => s.callId);
+    callChip.hidden = !live;
+    if (live) {
+      callChip.textContent = `On a call · ${live.title}`;
+      callChip.title = viewing === live.id ? `On a call with ${live.title}: shown here` : `On a call with ${live.title}: click to show it`;
+    }
     chat.setSessions([
       { id: null, label: project === frontDesk ? '🧭 The runner' : '💬 Project', title: `${project.meta.name}: your conversation with the agent`, status: project === frontDesk ? "Your conversation: it directs the phone's agents" : `Your conversation in ${project.meta.name}`, unread: 0, working: !!currentRun },
       ...sessions.list.map((s) => ({

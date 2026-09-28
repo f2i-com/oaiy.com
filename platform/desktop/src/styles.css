@@ -1165,6 +1165,42 @@ select:disabled { cursor: not-allowed; opacity: 0.5; }
 .overview-tile strong { font-size: 20px; font-weight: 650; letter-spacing: -0.01em; }
 .overview-tile small { color: var(--muted); font-size: 11.5px; }
 
+/* The Agent is on a call: a red badge beside its label, and (when the labels are hidden) a dot on its icon. */
+.nav-badge.on-call {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  background: color-mix(in srgb, var(--danger) 16%, transparent);
+  color: var(--danger);
+}
+.nav-badge.on-call::before {
+  content: '';
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  animation: on-call-pulse 1.4s ease-in-out infinite;
+}
+.sidebar nav button.on-call { position: relative; }
+@media (max-width: 1240px) {
+  .sidebar nav button.on-call::after {
+    content: '';
+    position: absolute;
+    top: 7px;
+    right: 7px;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--danger);
+    box-shadow: 0 0 0 2px var(--sidebar);
+    animation: on-call-pulse 1.4s ease-in-out infinite;
+  }
+}
+@keyframes on-call-pulse { 50% { opacity: 0.35; } }
+@media (prefers-reduced-motion: reduce) {
+  .nav-badge.on-call::before, .sidebar nav button.on-call::after { animation: none; }
+}
+
 /* A plugin's nav badge ("New"), sized to sit beside the sidebar label. */
 .nav-badge {
   margin-left: auto;

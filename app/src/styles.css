@@ -564,6 +564,11 @@ details.msg.compacted pre { white-space: pre-wrap; font-size: 12px; max-height: 
 .chip.phone[data-state='ready']::before { background: var(--ok); }
 .chip.phone[data-state='off']::before, .chip.phone[data-state='problem']::before { background: var(--muted); box-shadow: none; }
 .chip.phone[data-state='problem'] { color: var(--warn); border-color: var(--warn); }
+/* On a call now: who with (a click shows the call). */
+.chip.on-call { color: var(--err); border-color: var(--err); font-weight: 600; }
+.chip.on-call[hidden] { display: none; }
+.chip.on-call::before { content: ''; display: inline-block; width: 7px; height: 7px; margin-right: 6px; border-radius: 50%; background: currentColor; animation: session-pulse 1.2s ease-in-out infinite; vertical-align: 1px; }
+@media (prefers-reduced-motion: reduce) { .chip.on-call::before { animation: none; } }
 .phone-form { display: flex; flex-direction: column; gap: 10px; }
 .phone-form textarea { width: 100%; min-height: 90px; resize: vertical; }
 .phone-form .pair-code { font: 700 22px/1.2 var(--mono); letter-spacing: 0.2em; color: var(--accent); }

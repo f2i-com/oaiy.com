@@ -25,7 +25,7 @@ import {
   CalendarDays,
   Cpu,
 } from 'lucide-react';
-import { API_BASE, openExternal, plugins as pluginsApi } from './api';
+import { API_BASE, openExternal, phone as phoneApi, plugins as pluginsApi } from './api';
 import { applyTheme, initialTheme, THEME_LABEL, type ThemeMode } from './theme';
 import ServicesPanel from './ServicesPanel';
 import ModelsPanel from './ModelsPanel';
@@ -270,6 +270,26 @@ export default function App() {
     };
   }, []);
 
+  // A call going on now: the Agent's nav entry says so (the Agent page shows the call itself).
+  const [onCall, setOnCall] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    const look = async () => {
+      try {
+        const calls = await phoneApi.calls();
+        if (!cancelled) setOnCall(calls.length > 0);
+      } catch {
+        if (!cancelled) setOnCall(false);
+      }
+    };
+    look();
+    const id = window.setInterval(look, 2000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+    };
+  }, []);
+
   // Plugins can contribute sidebar entries that open a screen they ship. Polled
   // (not one-shot) so installing or removing a plugin updates the nav without a
   // restart — the same cadence the Plugins panel uses.
@@ -366,17 +386,18 @@ export default function App() {
               <button
                 type="button"
                 key={item.value}
-                className={view === item.value ? 'active' : ''}
+                className={`${view === item.value ? 'active' : ''}${item.value === 'agent' && onCall ? ' on-call' : ''}`}
                 aria-current={view === item.value ? 'page' : undefined}
                 /* Below 1240px the label <span> is display:none and the icon is
                    aria-hidden, which would leave the button with no accessible
                    name at all — so name it explicitly. */
-                aria-label={item.label}
-                title={item.label}
+                aria-label={item.value === 'agent' && onCall ? 'Agent (on a call now)' : item.label}
+                title={item.value === 'agent' && onCall ? 'Agent: on a call now. Open it to see the call.' : item.label}
                 onClick={() => setView(item.value)}
               >
                 <Icon size={18} />
                 <span>{item.label}</span>
+                {item.value === 'agent' && onCall && <em className="nav-badge on-call">On call</em>}
               </button>,
             ];
           })}
