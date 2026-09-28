@@ -1421,7 +1421,8 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
       while (!abort.signal.aborted) {
         try {
           await d.voiceEvents((event) => {
-            if (!holdsCalls) return;
+            // A call's end, and the calls still going on, are taken even without the lease: a call this page was on must end here.
+            if (!holdsCalls && event.type !== 'call.ended' && event.type !== 'hello') return;
             void sessions?.callEvent(event).then((session) => {
               // A call begins: show it (the person sees the conversation as it happens).
               if (session && event.type === 'call.started') {

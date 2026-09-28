@@ -799,6 +799,13 @@ export class Sessions {
   async callEvent(event: Record<string, unknown>): Promise<Session | null> {
     const callId = typeof event.callId === 'string' ? event.callId : '';
     const type = String(event.type ?? '');
+    // The desktop's live calls, sent as its event stream opens: a call not among them has ended
+    // (its end came while the stream was down, as when the desktop restarted).
+    if (type === 'hello' && Array.isArray(event.calls)) {
+      const live = new Set(event.calls.map(String));
+      for (const s of this.list) if (s.callId && !live.has(s.callId)) await this.endCall(s);
+      return null;
+    }
     if (!callId) return null;
     if (this.ended.has(callId)) {
       // Words that come after the end are the caller's last: kept in their conversation, not answered.

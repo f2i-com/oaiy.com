@@ -257,6 +257,18 @@ describe('a phone call answered by the agent', () => {
     expect(sessions.list.some((s) => s.callId)).toBe(false);
   });
 
+  it('a call whose end was missed (the desktop restarted) ends when the desktop says which calls go on', async () => {
+    const { sessions } = setup();
+    const call = await sessions.callEvent({ type: 'call.started', callId: 'call_h', from: '+61400000018' });
+    // The stream opens again with the call still going on: nothing changes.
+    await sessions.callEvent({ type: 'hello', calls: ['call_h'] });
+    expect(call?.callId).toBe('call_h');
+    // It opens again after the desktop restarted: the call is gone.
+    expect(await sessions.callEvent({ type: 'hello', calls: [] })).toBeNull();
+    expect(call?.callId).toBeUndefined();
+    expect(call?.agent.turns.at(-1)).toMatchObject({ text: '[OAIY] 📞 The call ended.' });
+  });
+
   it('on a call the model does not think first, and has a short list of tools', async () => {
     const fake = fakeProvider('openai', [{ text: 'Hello!' }]);
     const { sessions } = setup(LOCAL);
