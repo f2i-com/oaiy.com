@@ -86,6 +86,22 @@ describe('missed calls, called back', () => {
     expect(callbacks.list[0]).toMatchObject({ state: 'dropped', note: 'Not one of the numbers you call back.' });
   });
 
+  it('a caller who hung up waiting in the queue is rung back with a sorry; one who hung up on hold is not', async () => {
+    const { callbacks, dials } = setup();
+    const t0 = Date.now();
+    await callbacks.event(ended({ from: '0400000011', outcome: 'abandoned_in_queue', direction: 'inbound' }));
+    await callbacks.event(ended({ from: '0400000012', outcome: 'abandoned_on_hold', direction: 'inbound' }));
+    await callbacks.tick(t0 + 120_000);
+    expect(dials).toEqual([expect.objectContaining({ number: '0400000011', openingLine: expect.stringContaining('Sorry you were kept waiting') })]);
+    expect(callbacks.list.map((c) => c.number)).toEqual(['0400000011']);
+  });
+
+  it('a blocked number matches as Aokie matches it: its last nine digits, six or more', () => {
+    const screening: Screening = { acceptPattern: '', blockedNumbers: '123456, 12345', rejectPrivate: false };
+    expect(callsBack('123456', 'any', screening)).toBe(false);
+    expect(callsBack('9912345', 'any', screening)).toBe(true);
+  });
+
   it('a refusal from the phone (quiet hours, the daily cap) waits and tries again', async () => {
     const t0 = new Date(2026, 8, 28, 22, 0).getTime();
     expect(retryAfter('quiet hours: automated calls are not placed between 21:00 and 8:00', t0)).toBe(t0 + 30 * 60_000);

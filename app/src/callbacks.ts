@@ -24,6 +24,8 @@ export interface Callback {
   state: 'waiting' | 'calling' | 'done' | 'dropped';
   /** How it ended, or why the last try did not reach them. */
   note?: string;
+  /** They hung up waiting in the queue (the line was busy), not a call that rang out: the call back says sorry first. */
+  queued?: boolean;
 }
 
 /** Aokie's call screening, as the person set it: which calls are answered at all. */
@@ -57,8 +59,10 @@ const TOO_OLD_MS = 24 * 60 * 60_000;
 export function callsBack(number: string, filter: CallBackFilter, screening: Screening | null): boolean {
   const digits = number.replace(/\D/g, '');
   if (digits.length < 6) return false;
-  const blocked = (screening?.blockedNumbers ?? '').split(/[,;\n]/).map((b) => b.trim()).filter(Boolean);
-  if (blocked.some((b) => b.replace(/\D/g, '').length >= 6 && sameNumber(b, number))) return false;
+  // Aokie's rule: a blocked number is its last nine digits, and needs six or more.
+  const suffix = (n: string) => n.replace(/\D/g, '').slice(-9);
+  const blocked = (screening?.blockedNumbers ?? '').split(/[,;\n]/).map(suffix).filter((b) => b.length >= 6);
+  if (blocked.includes(suffix(number))) return false;
   const matches = (pattern: string) => {
     try {
       return new RegExp(pattern).test(number.trim());
@@ -131,6 +135,9 @@ export class Callbacks {
       const outcome = String(d.outcome ?? '');
       if (d.direction === 'outbound') await this.rang(number, outcome);
       else if (outcome === 'missed') await this.missed(number);
+      // Left waiting in the queue while the line was busy: rung back like a missed call, with a sorry.
+      // (One who hung up on hold, after talking, is texted an apology by Aokie's flows, not rung.)
+      else if (outcome === 'abandoned_in_queue') await this.missed(number, Date.now(), true);
       else if (outcome === 'completed') await this.settle(number, 'They rang again and were answered.');
     } else if (event.name === 'aokie.sms.received') {
       const number = String(d.from ?? '').trim();
@@ -139,12 +146,13 @@ export class Callbacks {
   }
 
   /** A call from `number` was missed: it is called back once the receptionist is free. */
-  async missed(number: string, at = Date.now()): Promise<void> {
+  async missed(number: string, at = Date.now(), queued = false): Promise<void> {
     const open = this.open.find((c) => sameNumber(c.number, number));
     if (open) {
       open.missedAt = at;
+      if (queued) open.queued = true;
       if (open.state === 'waiting') open.nextAt = Math.min(open.nextAt, at + FIRST_WAIT_MS);
-    } else this.list.push({ number, missedAt: at, tries: 0, nextAt: at + FIRST_WAIT_MS, state: 'waiting' });
+    } else this.list.push({ number, missedAt: at, tries: 0, nextAt: at + FIRST_WAIT_MS, state: 'waiting', ...(queued ? { queued: true } : {}) });
     await this.save();
   }
 
@@ -188,8 +196,10 @@ export class Callbacks {
       try {
         await desktop.command('aokie', 'call.dial', {
           number: next.number,
-          openingLine: settings.callBackLine.trim() || DEFAULT_CALL_BACK_LINE,
-          purpose: `Returning their missed call from ${when}: find out what they needed, and help them as on any call.`,
+          openingLine: next.queued ? QUEUE_CALL_BACK_LINE : settings.callBackLine.trim() || DEFAULT_CALL_BACK_LINE,
+          purpose: next.queued
+            ? `Returning their call from ${when}: they hung up waiting while the line was busy. Say sorry for the wait, find out what they needed, and help them as on any call.`
+            : `Returning their missed call from ${when}: find out what they needed, and help them as on any call.`,
         }, `oaiy:callback:${next.number}:${next.missedAt}:${next.tries + 1}`);
         Object.assign(next, { state: 'calling', tries: next.tries + 1, nextAt: now, note: undefined });
       } catch (error) {
@@ -213,3 +223,5 @@ export class Callbacks {
 
 /** What the receptionist says first when they answer a call back. */
 export const DEFAULT_CALL_BACK_LINE = "Hi, it's the receptionist, returning your call from earlier. How can I help?";
+/** The same, to someone who hung up waiting in the queue. */
+export const QUEUE_CALL_BACK_LINE = "Hi, it's the receptionist, returning your call. Sorry you were kept waiting earlier. How can I help?";
