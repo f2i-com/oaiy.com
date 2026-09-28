@@ -42,6 +42,15 @@ fn roomiest_gpu() -> Option<(usize, u64)> {
     if !candle_core::utils::cuda_is_available() {
         return None;
     }
+    // Asked of nvidia-smi when every GPU is visible: measuring through CUDA
+    // opens a context on each GPU, and one left on another GPU holds memory
+    // there for as long as this server runs.
+    let pinned = std::env::var("CUDA_VISIBLE_DEVICES").is_ok_and(|v| !v.trim().is_empty());
+    if !pinned {
+        if let Some(best) = free_by_smi().and_then(|rows| rows.into_iter().max_by_key(|&(_, free)| free)) {
+            return Some(best);
+        }
+    }
     let mut best: Option<(usize, u64)> = None;
     for n in 0..16 {
         let Ok(dev) = Device::new_cuda(n) else { break };
@@ -52,6 +61,34 @@ fn roomiest_gpu() -> Option<(usize, u64)> {
         }
     }
     best
+}
+
+/// Free memory per GPU, from nvidia-smi (numbered as CUDA numbers them here:
+/// `main` sets `CUDA_DEVICE_ORDER=PCI_BUS_ID`, nvidia-smi's order).
+fn free_by_smi() -> Option<Vec<(usize, u64)>> {
+    let mut command = std::process::Command::new("nvidia-smi");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // No console window for the child.
+        command.creation_flags(0x0800_0000);
+    }
+    let out = command.args(["--query-gpu=index,memory.free", "--format=csv,noheader,nounits"]).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let rows = parse_free(&String::from_utf8_lossy(&out.stdout));
+    (!rows.is_empty()).then_some(rows)
+}
+
+/// `index, free MiB` lines, as bytes.
+fn parse_free(text: &str) -> Vec<(usize, u64)> {
+    text.lines()
+        .filter_map(|line| {
+            let (index, free) = line.split_once(',')?;
+            Some((index.trim().parse().ok()?, free.trim().parse::<u64>().ok()? * 1024 * 1024))
+        })
+        .collect()
 }
 
 /// The GPU speech runs on (`None`: the CPU).
@@ -195,6 +232,11 @@ fn transcribe(argv: Vec<String>) -> Result<(), String> {
 }
 
 fn main() {
+    // GPUs numbered as nvidia-smi numbers them (by PCI bus), so the one it
+    // reports with the most free memory is the one CUDA opens.
+    if std::env::var_os("CUDA_DEVICE_ORDER").is_none() {
+        std::env::set_var("CUDA_DEVICE_ORDER", "PCI_BUS_ID");
+    }
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let result = if argv.first().is_some_and(|a| a == "transcribe") {
         transcribe(argv.into_iter().skip(1).collect())
@@ -204,5 +246,16 @@ fn main() {
     if let Err(e) = result {
         eprintln!("[oaiy-voice] {e}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_free;
+
+    #[test]
+    fn nvidia_smi_s_free_memory_is_read_per_gpu() {
+        assert_eq!(parse_free("0, 11074\n1, 32168\n"), vec![(0, 11_074 * 1024 * 1024), (1, 32_168 * 1024 * 1024)]);
+        assert_eq!(parse_free("No devices were found\n"), vec![]);
     }
 }
