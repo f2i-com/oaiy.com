@@ -95,6 +95,14 @@ The canonical host-side specs live in FormLogic: `docs/DESKTOP_PLUGIN_SDK.md`,
   `hangup_requested`, `error`. Native tools on this path: `lookup_business_data`,
   `request_appointment`, `finish_call`. **This is how the host (and so the agent) can own the
   conversation.** `call.operatorSpeak` is refused while the in-plugin receptionist answers.
+- **One output item at a time** (`OutputPacer` in `src/realtime_voice.rs`). Aokie paces an
+  item's PCM into the call in real time. An `output_item_started` that arrives while the last
+  item still has audio queued *supersedes* it: the unplayed tail is dropped ("realtime output
+  item … superseded the still-playing …" in its log). So a host must not open an item per
+  sentence. OAIY Desktop (`platform/desktop/src-tauri/src/voice/call.rs`) speaks a whole reply
+  into one item, adding each sentence as it is synthesized, and opens the next item only once
+  the last one should have finished playing. The first live call (28 Sept 2026) opened one item
+  per sentence, and the caller heard nothing but fragments.
 
 ## Events
 
@@ -157,6 +165,44 @@ essential events are held and health reports degraded.** The host dedupes on
   callHeldState}`; `call.activate` swaps; at most one caller on hold.
 - SMS: the plugin only offers `sms.send` and the `sms.*` events. Drafting and approval live in
   FormLogic flows; the plugin makes no LLM call for SMS.
+
+### What `sms.sent` means, and texts stuck on "Sending…"
+
+Aokie sends a text with MAP: it pushes the message into the phone's `telecom/msg/outbox`, and
+the phone sends it. Aokie emits `aokie.sms.sent` when the phone acknowledges that push (OBEX
+`0xA0`). That means **the phone has it, not that it went out**. The phone reports the real result
+(`SendingSuccess` / `SendingFailure`) only over MNS, and on an outbound (initiator-mux) session
+the phone never opens MNS to us. Aokie cannot see a send fail today.
+
+On Android 17 a pushed text can sit in the phone's outbox for ever. The phone's Messages app
+shows "Still sending" with only *Stop sending and delete*. Found on the Pixel 9a test phone
+(Android 17, build CP3A.260905.009) on 28 Sept 2026:
+
+1. The phone service takes the Bluetooth text (`SmsController: sendStoredText
+   caller=com.google.android.bluetooth`). Before sending, it asks the default messaging app
+   whether to "upgrade" it (`SMSDispatcher: sendText: requesting message upgrade via DMA.`).
+   This is new in Android 17. The messaging app answers through an
+   `AlternativeMessageTransportService` (Google Messages: `.shared.telephony.rcsupgrade.
+   BugleAlternativeMessageTransportService`).
+2. The **Google Messages open beta** (`messages.android_20260921_01_RC00.phone.openbeta`)
+   accepted the handover (`BugleTelephony: onMessageUpgradeRequested`), queued its own SMS copy
+   and never sent it. Its send queue saw the synced copy already "sending" and skipped it
+   (`PendingMessagesProcessor: message already sent … MESSAGE_STATUS_OUTGOING_SENDING`). Texts
+   typed on the phone were fine; only texts from other apps (Bluetooth, and presumably
+   assistants) stuck.
+3. **Fix:** `adb shell pm uninstall-system-updates com.google.android.apps.messaging` rolled
+   Messages back to the factory build (20260331). That build declines the upgrade at once
+   (`message upgrade request failed.`), the phone service sends the text itself (`ImsSmsDispatcher
+   … onSendSmsResult status=1`), and it arrives. To keep it that way, leave the Messages beta in
+   the Play Store (Google Messages → *You're a beta tester* → *Leave*). Otherwise the Play Store
+   installs the beta again.
+
+To diagnose it again, turn on USB or wireless debugging on the phone. `adb mdns services` finds
+a phone offering wireless debugging; pair with `adb pair <ip:port> <code>`. Then read
+**`adb logcat -b radio`**. The phone service logs to the radio buffer, which a plain
+`adb logcat` leaves out. Google Messages logs under `Bugle*` tags in the main buffer. None of
+this is a Bluetooth, SIM, carrier or caller-ID fault: the SIM defaults and Aokie's side were
+all fine throughout.
 
 ## Tools on the local voice path
 
