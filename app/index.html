@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="A coding agent that runs entirely in your browser: local projects, AI-written code sandboxed on the Zipp VM, and any local or cloud model." />
+    <meta name="theme-color" content="#0f1115" />
+    <!-- Scripts only from bot.computer itself (and the Zipp engine's WebAssembly); model servers anywhere; nothing else. -->
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self' blob:; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' data: blob:; font-src 'self' data:; connect-src * data: blob: ws: wss:; frame-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'" />
+    <link rel="icon" href="/icon.svg" type="image/svg+xml" />
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <title>bot.computer</title>
+  </head>
+  <body>
+    <div id="app"><div class="boot">bot.computer is starting…</div></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

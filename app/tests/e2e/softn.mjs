@@ -1,0 +1,317 @@
+// SoftN in bot.computer: a new app renders live, reacts to input, follows
+// edits, reports errors, is checked by the agent, and exports as .softn.
+// Needs the SoftN runtime (npm run fetch:softn).   node tests/e2e/softn.mjs
+import { existsSync, mkdtempSync, readdirSync, readFileSync } from 'node:fs';
+import { createServer as createHttpServer } from 'node:http';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { unzipSync } from 'fflate';
+import { createServer } from 'vite';
+import puppeteer from 'puppeteer-core';
+
+if (!existsSync('public/softn/index.html')) {
+  console.log('skipped: the SoftN runtime is not installed (npm run fetch:softn)');
+  process.exit(0);
+}
+const executablePath = [process.env.CHROME, 'C:/Program Files/Google/Chrome/Application/chrome.exe', '/usr/bin/google-chrome', '/usr/bin/chromium', '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'].filter(Boolean).find((p) => existsSync(p));
+
+// A scripted model that reads the guide, changes the heading, and checks.
+const requests = [];
+const script = [
+  { calls: [{ name: 'softn_docs', input: { section: 'mistakes' } }] },
+  { calls: [{ name: 'read_file', input: { path: 'ui/main.ui' } }] },
+  { calls: [{ name: 'edit_file', input: { path: 'ui/main.ui', old_string: '<Heading level={1}>Groceries</Heading>', new_string: '<Heading level={1}>Shopping list</Heading>' } }] },
+  { calls: [{ name: 'softn_check', input: {} }] },
+  { text: 'Renamed the heading and checked the app.' },
+  // "Try it": use the app like a person.
+  { calls: [{ name: 'softn_interact', input: { actions: [{ fill: 'What needs to be done?', value: 'Buy bread' }, { click: 'Add' }] } }] },
+  { text: 'Adding a task works.' },
+  // "Add a clear button": a mistake the automatic check catches, then the fix.
+  { calls: [
+    { name: 'update_plan', input: { goal: 'Clear finished tasks', items: [{ text: 'Read the logic', status: 'active' }, { text: 'Add clearDone()', status: 'pending' }, { text: 'Check the app', status: 'pending' }] } },
+    { name: 'read_file', input: { path: 'logic/main.logic' } },
+  ] },
+  { calls: [{ name: 'edit_file', input: { path: 'logic/main.logic', old_string: 'function remaining() {', new_string: 'function clearDone( {\n  tasks = tasks.filter((t) => !t.done)\n}\n\nfunction remaining() {' } }] },
+  { calls: [
+    { name: 'edit_file', input: { path: 'logic/main.logic', old_string: 'function clearDone( {', new_string: 'function clearDone() {' } },
+    { name: 'update_plan', input: { goal: 'Clear finished tasks', items: [{ text: 'Read the logic', status: 'done' }, { text: 'Add clearDone()', status: 'done' }, { text: 'Check the app', status: 'done' }] } },
+  ] },
+  { text: 'Added clearDone.' },
+  // "Fix with agent" from the preview.
+  { text: 'Looking at it.' },
+];
+const model = createHttpServer((req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Headers', '*');
+  if (req.method === 'OPTIONS') return res.end();
+  // The model list (with its context window, as vLLM and OpenRouter report it); nothing else is served.
+  if (req.method === 'GET') {
+    if (req.url.endsWith('/models')) return res.end(JSON.stringify({ data: [{ id: 'mock', context_length: 131072 }] }));
+    res.statusCode = 404;
+    return res.end();
+  }
+  let body = '';
+  req.on('data', (c) => (body += c));
+  req.on('end', () => {
+    requests.push(JSON.parse(body));
+    const step = script[requests.length - 1] ?? { text: 'out of script' };
+    const events = [];
+    for (const piece of step.text?.match(/.{1,6}/gs) ?? []) events.push({ choices: [{ index: 0, delta: { content: piece } }] });
+    (step.calls ?? []).forEach((call, i) => events.push({ choices: [{ index: 0, delta: { tool_calls: [{ index: i, id: `c${requests.length}_${i}`, type: 'function', function: { name: call.name, arguments: JSON.stringify(call.input) } }] } }] }));
+    events.push({ choices: [{ index: 0, delta: {}, finish_reason: step.calls ? 'tool_calls' : 'stop' }] });
+    res.setHeader('content-type', 'text/event-stream');
+    res.end(events.map((e) => `data: ${JSON.stringify(e)}\n\n`).join('') + 'data: [DONE]\n\n');
+  });
+});
+await new Promise((r) => model.listen(0, '127.0.0.1', r));
+
+const server = await createServer({ server: { port: 0, host: '127.0.0.1' }, logLevel: 'error' });
+await server.listen();
+const base = `http://127.0.0.1:${server.httpServer.address().port}`;
+const browser = await puppeteer.launch({ executablePath, headless: true });
+let failures = 0;
+const check = async (name, fn) => {
+  try {
+    await fn();
+    console.log(`ok   ${name}`);
+  } catch (error) {
+    failures++;
+    console.log(`FAIL ${name}\n     ${String(error.message).split('\n').join('\n     ')}`);
+  }
+};
+const expect = (c, m) => {
+  if (!c) throw new Error(m);
+};
+const appFrame = (page) => page.frames().find((f) => f.url().includes('/softn/index.html'));
+async function waitStatus(page, pattern, label) {
+  try {
+    await page.waitForFunction((p) => new RegExp(p).test(document.querySelector('.preview-status')?.textContent ?? ''), { timeout: 40_000 }, pattern.source);
+  } catch {
+    throw new Error(`${label}: the preview status stayed "${await page.$eval('.preview-status', (e) => e.textContent)}"`);
+  }
+}
+/** Run `action`, then wait for the preview to finish a new render (live or error). */
+async function afterRender(page, action, label) {
+  const before = await page.$eval('.preview-status', (e) => e.textContent);
+  await action();
+  try {
+    await page.waitForFunction((b) => {
+      const t = document.querySelector('.preview-status')?.textContent ?? '';
+      return t !== b && /live|error/.test(t);
+    }, { timeout: 40_000 }, before);
+  } catch {
+    throw new Error(`${label}: no new render; the status stayed "${await page.$eval('.preview-status', (e) => e.textContent)}"`);
+  }
+  return page.$eval('.preview-status', (e) => e.textContent);
+}
+async function frameText(page) {
+  const frame = appFrame(page);
+  return frame ? frame.evaluate(() => document.body.innerText) : '';
+}
+async function terminal(page, command) {
+  await page.click('.term-input');
+  await page.type('.term-input', command);
+  await page.keyboard.press('Enter');
+  await page.waitForFunction(() => !document.querySelector('.term-prompt')?.classList.contains('busy'), { timeout: 30_000 });
+}
+
+try {
+  const page = await browser.newPage();
+  await page.setViewport({ width: 1400, height: 900 });
+  page.on('pageerror', (e) => console.log('  [pageerror]', e.message));
+  page.on('dialog', (d) => {
+    console.log(`  [native dialog] ${d.type()}: ${d.message()}`);
+    failures++;
+    d.dismiss();
+  });
+  const downloads = mkdtempSync(join(tmpdir(), 'botc-softn-'));
+  const cdp = await page.createCDPSession();
+  await cdp.send('Browser.setDownloadBehavior', { behavior: 'allow', downloadPath: downloads });
+  await page.goto(base);
+  await page.waitForSelector('.tree-row', { timeout: 60_000 });
+
+  await check('New SoftN app asks in a modal (not a browser prompt), and the app renders live in the sandboxed preview', async () => {
+    await page.type('.chat-input', '/softn new');
+    await page.keyboard.press('Enter');
+    await page.waitForSelector('dialog.modal[open] .template-card');
+    const cards = await page.$$eval('dialog.modal .template-card strong', (els) => els.map((e) => e.textContent));
+    expect(cards[0] === 'Task list' && cards.includes('Blank') && cards.includes('Twenty48'), `cards: ${cards}`);
+    if (process.env.SHOT) await page.screenshot({ path: process.env.SHOT.replace('.png', '-new-app.png') });
+    await page.$eval('dialog.modal input[type=text]', (i) => (i.value = ''));
+    await page.type('dialog.modal input[type=text]', 'Tasks');
+    await page.click('dialog.modal button.primary');
+    await page.waitForFunction(() => !document.querySelector('dialog.modal'));
+    await waitStatus(page, /live/, 'first render');
+    const text = await frameText(page);
+    expect(text.includes('Tasks') && text.includes('0 remaining'), text);
+    const sandbox = await page.$eval('.preview-frame iframe', (f) => f.getAttribute('sandbox'));
+    expect(!/allow-same-origin/.test(sandbox), `sandbox: ${sandbox}`);
+  });
+
+  await check('the app runs its logic: adding a task updates the page', async () => {
+    const frame = appFrame(page);
+    await frame.type('input', 'Buy milk');
+    await frame.evaluate(() => [...document.querySelectorAll('button')].find((b) => b.textContent.trim() === 'Add').click());
+    await frame.waitForFunction(() => document.body.innerText.includes('1 remaining') && document.body.innerText.includes('Buy milk'), { timeout: 10_000 });
+  });
+
+  await check('an edit from the terminal re-renders the preview', async () => {
+    const status = await afterRender(page, () => terminal(page, 'sed -i "s/>Tasks</>Groceries</" ui/main.ui'), 'after edit');
+    expect(/live/.test(status), status);
+    const text = await frameText(page);
+    expect(text.includes('Groceries'), text);
+  });
+
+  await check('a broken app is reported in the preview and by /softn check', async () => {
+    const status = await afterRender(page, () => terminal(page, 'cp logic/main.logic /tmp.bak && echo "function broken( {" >> logic/main.logic'), 'broken logic');
+    expect(/error/.test(status), `status: ${status}`);
+    await page.type('.chat-input', '/softn check');
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() => /Render: (?!ok)/.test(document.querySelector('.chat-log')?.textContent ?? ''), { timeout: 40_000 });
+    const repaired = await afterRender(page, () => terminal(page, 'mv /tmp.bak logic/main.logic'), 'repaired');
+    expect(/live/.test(repaired), repaired);
+  });
+
+  await check('the agent reads the guide, edits the page and checks it', async () => {
+    await page.click('button[title="AI providers"]');
+    await page.waitForSelector('dialog.settings[open]');
+    await page.evaluate(() => [...document.querySelectorAll('dialog.settings button')].find((b) => b.textContent.includes('Add a provider')).click());
+    await page.select('dialog.settings select', 'local-other');
+    await page.evaluate((url) => {
+      const input = [...document.querySelectorAll('dialog.settings label')].find((l) => l.firstChild.textContent === 'Address').querySelector('input');
+      input.value = url;
+      input.dispatchEvent(new Event('input'));
+      const custom = document.querySelector('.model-picker input');
+      document.querySelector('.model-picker select').value = '\u0000other';
+      document.querySelector('.model-picker select').dispatchEvent(new Event('change'));
+      custom.value = 'mock';
+      custom.dispatchEvent(new Event('input'));
+      [...document.querySelectorAll('dialog.settings button')].find((b) => b.textContent === 'Save').click();
+    }, `http://127.0.0.1:${model.address().port}`);
+    await page.type('.chat-input', 'Call it a shopping list.');
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() => document.querySelector('.chat-log')?.textContent.includes('Renamed the heading'), { timeout: 60_000 });
+    expect(JSON.stringify(requests[1]).includes('Common mistakes'), 'the guide section did not reach the model');
+    if (process.env.DUMP) console.log(requests[4].messages.at(-1).content, '\n----\n', requests[3].messages.at(-1).content);
+    expect(JSON.stringify(requests[4]).includes('rendered without reported errors'), `softn_check said: ${JSON.stringify(requests[4]).slice(-400)}`);
+    await waitStatus(page, /live/, 'after the agent');
+    expect((await frameText(page)).includes('Shopping list'), await frameText(page));
+  });
+
+  const toolMessages = (i) => JSON.stringify(requests[i].messages.filter((m) => m.role === 'tool'));
+  const ask = async (text, done) => {
+    await page.type('.chat-input', text);
+    await page.keyboard.press('Enter');
+    await page.waitForFunction((d) => document.querySelector('.chat-log')?.textContent.includes(d), { timeout: 90_000 }, done);
+  };
+
+  await check('the agent uses the app in the preview like a person: fills, clicks, reads the page', async () => {
+    await ask('Try adding a task.', 'Adding a task works.');
+    const result = JSON.stringify(requests[6].messages.at(-1));
+    if (process.env.DUMP) console.log(requests[6].messages.at(-1).content);
+    expect(/filled .*Buy bread/.test(result) && /clicked \[button \\"Add\\"\]/.test(result), result.slice(0, 600));
+    expect(result.includes('Buy bread') && result.includes('1 remaining') && result.includes('[button \\"Delete\\"]'), result.slice(0, 1200));
+    expect((await frameText(page)).includes('Buy bread'), 'the task is not in the preview');
+  });
+
+  await check('a mistake is caught by the automatic check after the step, and the fix is checked too', async () => {
+    await ask('Add a way to clear finished tasks.', 'Added clearDone.');
+    const broken = JSON.stringify(requests[9].messages.at(-1));
+    expect(broken.includes('[Automatic check of') && /logic\/main\.logic/.test(broken) && broken.includes('Fix these errors'), broken.slice(0, 900));
+    const fixed = JSON.stringify(requests[10].messages.at(-1));
+    expect(fixed.includes('[Automatic check of') && fixed.includes('rendered without reported errors'), fixed.slice(-600));
+    const plan = await page.$eval('.plan', (el) => ({ hidden: el.hidden, finished: el.classList.contains('finished'), count: el.querySelector('.plan-count').textContent, goal: el.querySelector('.plan-goal').textContent, done: el.querySelectorAll('.plan-item.done').length }));
+    expect(!plan.hidden && plan.finished && plan.count === '3/3' && plan.goal === 'Clear finished tasks' && plan.done === 3, JSON.stringify(plan));
+    // Finished and idle: the steps fold away; a click shows them again.
+    expect(await page.$eval('.plan', (el) => el.classList.contains('collapsed')), 'a finished plan stays open');
+    await page.click('.plan-head');
+    expect(!(await page.$eval('.plan-items', (el) => el.hidden)), 'the steps did not open');
+    expect(!(await page.$$eval('details.tool .tool-name', (els) => els.map((e) => e.textContent))).includes('update_plan'), 'update_plan got a card');
+    if (process.env.SHOT) {
+      await page.screenshot({ path: process.env.SHOT.replace('.png', '-plan.png') });
+    }
+    const cards = await page.$$eval('details.tool.auto', (els) => els.map((e) => e.className));
+    expect(cards.some((c) => c.includes('failed')) && cards.at(-1).includes('ok'), `cards: ${cards}`);
+  });
+
+  await check('an error while the person uses the app shows in the preview, and one click asks the agent to fix it', async () => {
+    const status = await afterRender(page, () => terminal(page, 'sed -i "s/const title = newTask.trim()/throw new Error(\\"boom from addTask\\")/" logic/main.logic'), 'throwing handler');
+    expect(/live/.test(status), status);
+    await appFrame(page).evaluate(() => [...document.querySelectorAll('button')].find((b) => b.textContent.trim() === 'Add').click());
+    await page.waitForFunction(() => !document.querySelector('.preview-problem')?.hidden, { timeout: 15_000 });
+    const banner = await page.$eval('.preview-problem', (e) => e.textContent);
+    expect(banner.includes('boom from addTask'), banner);
+    await page.click('.preview-problem button.primary');
+    await page.waitForFunction(() => document.querySelector('.chat-log')?.textContent.includes('Looking at it.'), { timeout: 60_000 });
+    const sent = JSON.stringify(requests[11].messages.at(-1));
+    expect(sent.includes('boom from addTask') && sent.includes('fix it'), sent.slice(0, 600));
+    await afterRender(page, () => terminal(page, 'sed -i "s/throw new Error(\\"boom from addTask\\")/const title = newTask.trim()/" logic/main.logic'), 'repaired');
+  });
+
+  await check('Export .softn downloads a flat zip with the manifest at its root', async () => {
+    await page.evaluate(() => [...document.querySelectorAll('.actions button')].find((b) => b.textContent === 'Export .softn').click());
+    let file;
+    for (let i = 0; i < 50 && !file; i++) {
+      await new Promise((r) => setTimeout(r, 200));
+      file = readdirSync(downloads).find((f) => f.endsWith('.softn'));
+    }
+    expect(file === 'Tasks.softn', `downloaded: ${readdirSync(downloads)}`);
+    const entries = unzipSync(readFileSync(join(downloads, file)));
+    const manifest = JSON.parse(new TextDecoder().decode(entries['manifest.json']));
+    expect(manifest.main === 'ui/main.ui' && manifest.files.ui.includes('ui/main.ui') && manifest.files.logic.includes('logic/main.logic'), JSON.stringify(manifest));
+    expect(Object.keys(entries).every((n) => !n.startsWith('Tasks/')), `entries: ${Object.keys(entries)}`);
+    expect(new TextDecoder().decode(entries['ui/main.ui']).includes('Shopping list'), 'stale ui/main.ui');
+  });
+
+  await check('a new app can start from an example, in a folder of this project', async () => {
+    await page.evaluate(() => [...document.querySelectorAll('.actions button')].find((b) => b.textContent === 'New SoftN app').click());
+    await page.waitForSelector('dialog.modal[open] .template-card');
+    expect(!(await page.$eval('dialog.modal details.template-examples', (d) => d.open)), 'the examples start open');
+    await page.click('dialog.modal details.template-examples summary');
+    await page.evaluate(() => [...document.querySelectorAll('dialog.modal .template-card')].find((c) => c.textContent.includes('Twenty48')).click());
+    expect((await page.$eval('dialog.modal input[type=text]', (i) => i.value)) === 'Twenty48', 'the name did not follow the example');
+    await page.evaluate(() => document.querySelector('dialog.modal input[value=folder]').click());
+    // A folder that already holds an app is refused in the dialog.
+    await page.$eval('.folder-field input', (i) => (i.value = ''));
+    await page.type('.folder-field input', '/');
+    await page.click('dialog.modal button.primary');
+    await page.waitForFunction(() => /empty|already holds|Name the folder/.test(document.querySelector('dialog.modal .modal-error')?.textContent ?? ''));
+    await page.$eval('.folder-field input', (i) => (i.value = ''));
+    await page.type('.folder-field input', 'games/2048');
+    await page.click('dialog.modal button.primary');
+    await page.waitForFunction(() => !document.querySelector('dialog.modal'));
+    await page.waitForFunction(() => /New SoftN app "Twenty48"|Could not start/.test(document.querySelector('.chat-log')?.textContent ?? ''), { timeout: 20_000 }).catch(async () => {
+      throw new Error(`no app was made; chat: ${(await page.$eval('.chat-log', (e) => e.textContent)).slice(-200)}`);
+    });
+    await waitStatus(page, /live/, 'the example');
+    const picked = await page.$eval('.preview-app', (s) => ({ value: s.value, options: [...s.options].map((o) => o.value), hidden: s.hidden }));
+    expect(picked.value === 'app:games/2048', `the preview is not on the new app: ${JSON.stringify(picked)}; chat: ${(await page.$eval('.chat-log', (e) => e.textContent)).slice(-300)}; tree: ${await page.$$eval('.tree-row .name', (els) => els.map((e) => e.textContent).join(','))}`);
+    const manifest = await page.evaluate(() => document.querySelector('.chat-log').textContent);
+    expect(manifest.includes('a copy of the twenty48 example'), manifest.slice(-300));
+  });
+
+  await check('the file tree asks for names and confirmations in modals', async () => {
+    await page.click('button[title="New file"]');
+    await page.waitForSelector('dialog.modal[open] input');
+    await page.type('dialog.modal input', 'notes/todo.md');
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() => /\/notes\/todo\.md$/.test(document.querySelector('.editor-title')?.textContent ?? ''), { timeout: 10_000 }).catch(async () => {
+      throw new Error(`editor title: ${await page.$eval('.editor-title', (e) => e.textContent)}; modal: ${await page.$eval('dialog.modal', (d) => d.textContent).catch(() => 'none')}`);
+    });
+    await page.waitForFunction(() => [...document.querySelectorAll('.tree-row .name')].some((e) => e.textContent === 'todo.md'));
+    await page.$$eval('.tree-row', (rows) => rows.find((r) => r.querySelector('.name')?.textContent === 'todo.md').querySelector('button[title=Delete]').click());
+    await page.waitForSelector('dialog.modal[open] button.danger');
+    await page.keyboard.press('Escape');
+    await page.waitForFunction(() => !document.querySelector('dialog.modal'));
+    expect(await page.$$eval('.tree-row .name', (els) => els.some((e) => e.textContent === 'todo.md')), 'Escape deleted the file');
+    await page.$$eval('.tree-row', (rows) => rows.find((r) => r.querySelector('.name')?.textContent === 'todo.md').querySelector('button[title=Delete]').click());
+    await page.click('dialog.modal button.danger');
+    await page.waitForFunction(() => ![...document.querySelectorAll('.tree-row .name')].some((e) => e.textContent === 'todo.md'));
+  });
+} finally {
+  await browser.close();
+  await server.close();
+  model.close();
+}
+console.log(failures ? `\n${failures} failed` : '\nall passed');
+process.exit(failures ? 1 : 0);

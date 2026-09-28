@@ -1,0 +1,34 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "bot.computer",
+  "mainBinaryName": "bot-computer",
+  "version": "../package.json",
+  "identifier": "computer.bot.desktop",
+  "build": {
+    "devUrl": "http://localhost:5317",
+    "frontendDist": "../dist",
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build:desktop"
+  },
+  "app": {
+    "windows": [],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis", "app", "dmg", "deb", "appimage"],
+    "category": "DeveloperTool",
+    "shortDescription": "A coding agent that runs on your computer",
+    "longDescription": "A coding agent: projects kept on this computer, AI-written code sandboxed on the Zipp VM, and any local or cloud model.",
+    "copyright": "Copyright f2i-com",
+    "license": "Apache-2.0",
+    "icon": ["icons/32x32.png", "icons/128x128.png", "icons/128x128@2x.png", "icons/icon.icns", "icons/icon.ico"],
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser"
+      }
+    }
+  }
+}

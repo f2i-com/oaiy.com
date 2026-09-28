@@ -1,0 +1,6 @@
+[
+  ["jq paths", "echo '{\"a\":{\"b\":[1,{\"c\":2}]}}' > t.json; jq -c '[paths]' t.json; jq -c '[..|numbers]' t.json; jq -c 'getpath([\"a\",\"b\",1,\"c\"])' t.json; jq -c 'path(.a.b[0])' t.json; jq -c '[leaf_paths | map(tostring) | join(\".\")]' t.json"],
+  ["jq string ops", "jq -nr '\"a,b\" | split(\",\") | join(\"|\")'; jq -nr '\"Hello World\" | ascii_downcase | ltrimstr(\"hello \")'; jq -nr '[\"x\",\"y\"] | @tsv'; jq -nr '\"a b\" | @uri'; jq -nr '\"hi\" | @base64'; jq -nr '\"aGk=\" | @base64d'; jq -nc '\"test123\" | capture(\"(?<w>[a-z]+)(?<n>[0-9]+)\")'; jq -n '\"2026-01-02T03:04:05Z\" | fromdate'; jq -n '[1,2,3] | IN(2)'"],
+  ["gzip binary", "echo 'hello gzip' > z.txt && gzip -c z.txt > z.gz && gunzip -c z.gz && zcat z.gz && gzip -c z.txt | gunzip && echo 'piped' | gzip | zcat && file z.gz && tar -cf t.tar z.txt && tar -tvf t.tar"],
+  ["unzip overwrite", "echo x > z2.txt && zip -q ok.zip z2.txt && unzip -o ok.zip -d outdir && ls outdir"]
+]

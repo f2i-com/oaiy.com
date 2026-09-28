@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "The page calls no Tauri commands: it is the same web app as bot.computer, served from the app.",
+  "windows": ["main"],
+  "permissions": []
+}
