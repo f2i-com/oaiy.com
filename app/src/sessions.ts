@@ -1186,8 +1186,11 @@ export class Sessions {
   stop(session: Session): void {
     session.controller?.abort();
     session.waiting = [];
-    this.queue = this.queue.filter((s) => s !== session);
-    this.callQueue = this.callQueue.filter((s) => s !== session);
+    // Taken out in place: a lane being pumped goes on with the same array, and what is added to it later is run.
+    for (const lane of [this.queue, this.callQueue]) {
+      const at = lane.indexOf(session);
+      if (at >= 0) lane.splice(at, 1);
+    }
   }
 
   stopAll(): void {

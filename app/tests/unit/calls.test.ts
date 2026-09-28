@@ -302,6 +302,27 @@ describe('a phone call answered by the agent', () => {
     expect(call!.agent.turns.at(-1)).toMatchObject({ role: 'user', text: 'Caller [0:05]: Actually, never mind.' });
   });
 
+  it('the next caller is answered when the last call ended while its agent was still writing', async () => {
+    let release!: () => void;
+    const held = new Promise<void>((r) => (release = r));
+    const fake = fakeProvider('openai', [
+      { text: 'We are open from nine. And we close at five.', hold: { at: 10, until: held } },
+      { text: 'Yes, we are open until five.' },
+    ]);
+    const { sessions, calls } = setup();
+    await sessions.callEvent({ type: 'call.started', callId: 'call_q1', from: '+61400000022' });
+    await sessions.callEvent({ type: 'call.caller', callId: 'call_q1', text: 'When are you open?' });
+    for (let i = 0; i < 100 && !fake.bodies.length; i++) await new Promise((r) => setTimeout(r, 10));
+    await sessions.callEvent({ type: 'call.ended', callId: 'call_q1' });
+    // Another caller gets through, and speaks, before that agent has stopped.
+    await sessions.callEvent({ type: 'call.started', callId: 'call_q2', from: '+61400000023' });
+    await sessions.callEvent({ type: 'call.caller', callId: 'call_q2', text: 'Are you open today?' });
+    release();
+    await settled(sessions);
+    expect(fake.bodies).toHaveLength(2);
+    expect(calls).toEqual([['say', 'call_q2', 'Yes, we are open until five.']]);
+  });
+
   it('on a call the model does not think first, and has a short list of tools', async () => {
     const fake = fakeProvider('openai', [{ text: 'Hello!' }]);
     const { sessions } = setup(LOCAL);
