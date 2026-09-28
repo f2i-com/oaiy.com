@@ -20,9 +20,10 @@
 //! Sending again is harmless: a run is reserved under the event's own key,
 //! and a record under one made from the event, the script and the effect.
 //!
-//! An event queued for one link is never sent over another: if the desktop is
-//! linked again since (perhaps to another account), it goes to the dead
-//! letters, where a person can send it on. While unlinked, events wait.
+//! An event is kept for the provider it was linked to, and linking again to
+//! the same one (to mend a revoked key) sends it there. Linked to another
+//! provider since, it goes to the dead letters, where a person can send it on.
+//! While unlinked, events wait.
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -114,10 +115,12 @@ pub fn current_status() -> Status {
     CURRENT.lock().ok().and_then(|g| g.as_ref().and_then(Weak::upgrade)).map(|o| o.status()).unwrap_or_default()
 }
 
-/// Which link an event is kept for: the desktop connection the link made, or
-/// the provider's address for a link from before connections had ids.
+/// Which link an event is kept for: the provider's address. Not the desktop
+/// connection's id, as linking again (the way to mend a revoked key) makes a
+/// new connection, and the events kept meanwhile are for the account linked
+/// again; a desktop moved to another provider sends them nowhere.
 pub fn account_key(account: &super::LinkedAccount) -> String {
-    account.account_id.clone().filter(|s| !s.is_empty()).unwrap_or_else(|| account.base_url.clone())
+    account.base_url.trim_end_matches('/').to_string()
 }
 
 fn request_id(envelope: &Value) -> Option<String> {
@@ -260,7 +263,7 @@ impl Outbox {
                 dead(
                     &entry.plugin,
                     &entry.envelope,
-                    "not sent: this desktop was linked again, or to another account, after the event was kept; \
+                    "not sent: this desktop was linked to another provider after the event was kept; \
                      redrive it if it belongs to the account linked now"
                         .into(),
                 );
@@ -421,7 +424,24 @@ mod tests {
     }
 
     #[test]
-    fn events_wait_while_unlinked_and_never_go_to_another_account() {
+    fn linking_again_to_the_same_provider_keeps_what_waits_for_it() {
+        let account = |id: &str| crate::link::LinkedAccount {
+            connector_id: "formlogic".into(),
+            base_url: "https://formlogic.com/".into(),
+            credential: "flk".into(),
+            account_id: Some(id.into()),
+            account_name: None,
+            granted_scopes: None,
+            linked_at: Utc::now(),
+            instance_id: None,
+        };
+        // A new desktop connection, as linking again makes: the same place to send to.
+        assert_eq!(account_key(&account("conn_1")), account_key(&account("conn_2")));
+        assert_eq!(account_key(&account("conn_1")), "https://formlogic.com");
+    }
+
+    #[test]
+    fn events_wait_while_unlinked_and_never_go_to_another_provider() {
         let d = dir();
         let o = Outbox::open(&d);
         o.enqueue("aokie", "acct-1", &event("aokie.call.started", "1")).unwrap();
@@ -429,7 +449,7 @@ mod tests {
         assert_eq!(o.status().waiting, 1);
         let dead = RefCell::new(0);
         o.send_due(Some("acct-2"), None, &|_: &str, _: &Value| panic!("not to another account"), &|_, _, why| {
-            assert!(why.contains("linked again"), "{why}");
+            assert!(why.contains("another provider"), "{why}");
             *dead.borrow_mut() += 1;
         });
         assert_eq!((*dead.borrow(), o.status().waiting), (1, 0));
