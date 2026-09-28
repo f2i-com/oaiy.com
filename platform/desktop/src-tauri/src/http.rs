@@ -797,11 +797,11 @@ async fn engines_status() -> axum::response::Response {
     .into_response()
 }
 
-/// Calls and the calendar: callers' numbers and words, customers' names and
-/// appointments. Reading them is a restricted read; changing them (speaking on
+/// Calls, the calendar and flows' tasks for the agent: callers' numbers and words, customers' names and
+/// appointments, what a flow asks. Reading them is a restricted read; changing them (speaking on
 /// a live call, booking or deleting an appointment) takes the privileged gate.
 fn is_personal_path(path: &str) -> bool {
-    path.starts_with("/api/voice/") || path == "/api/calendar" || path.starts_with("/api/calendar/")
+    path.starts_with("/api/voice/") || path == "/api/calendar" || path.starts_with("/api/calendar/") || path.starts_with("/api/agent/")
 }
 
 /// Bridge + plugin routes that EXECUTE code, cause physical side effects, or
@@ -1321,6 +1321,7 @@ pub async fn serve(
         .merge(bridge_routes)
         .merge(voice_routes)
         .merge(crate::calendar::routes::router())
+        .merge(crate::agent_tasks::router())
         .route("/api/engines", axum::routing::get(engines_status))
         .merge(companion_routes)
         .merge(link_routes)

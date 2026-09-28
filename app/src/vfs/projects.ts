@@ -67,8 +67,9 @@ async function writeBytes(dir: FileSystemDirectoryHandle, name: string, data: Ui
  */
 export interface SessionInfo {
   id: string;
-  kind: 'sms' | 'call';
-  /** Who it is with: a phone number. */
+  /** A text thread, a call, or a flow's tasks for the agent. */
+  kind: 'sms' | 'call' | 'task';
+  /** Who it is with: a phone number (a flow's tasks: the flow's name). */
   key: string;
   /** Their name, when the phone knows it; else the number. */
   title: string;

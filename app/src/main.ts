@@ -150,6 +150,8 @@ async function main(): Promise<void> {
   let textHolder = '';
   // And calls: the page holding answer-calls talks with the caller.
   let holdsCalls = false;
+  /** This page answers flows' tasks for the agent (OAIY's own window comes first). */
+  let holdsTasks = false;
   // Flows made tools in the flow editor: every agent may use them.
   let flowTools: SessionTool[] = [];
   /** Flows in front of the agents' tools. */
@@ -1046,8 +1048,8 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
       { id: null, label: 'Project', title: `${project.meta.name}: your conversation with the agent`, unread: 0, working: !!currentRun },
       ...sessions.list.map((s) => ({
         id: s.id,
-        label: s.key === TEST_NUMBER ? '💬 Test' : `${s.kind === 'call' ? '📞' : '💬'} ${s.title}`,
-        title: `${s.kind === 'call' ? (s.callId ? 'On a call with' : 'Calls with') : 'Text messages with'} ${s.title}${s.title !== s.key ? ` (${s.key})` : ''}`,
+        label: s.key === TEST_NUMBER ? '💬 Test' : `${s.kind === 'call' ? '📞' : s.kind === 'task' ? '🔀' : '💬'} ${s.title}`,
+        title: s.kind === 'task' ? `The tasks your flow "${s.title}" gives the agent` : `${s.kind === 'call' ? (s.callId ? 'On a call with' : 'Calls with') : 'Text messages with'} ${s.title}${s.title !== s.key ? ` (${s.key})` : ''}`,
         unread: s.id === viewing ? 0 : s.unread,
         working: !!s.running,
         // A finished conversation can go (not one that is working, or a live call).
@@ -1062,7 +1064,7 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
   async function closeSession(id: string): Promise<void> {
     const session = sessions?.get(id);
     if (!session || session.running || session.callId) return;
-    const what = session.kind === 'call' ? `the calls with ${session.title}` : `the text messages with ${session.title}`;
+    const what = session.kind === 'call' ? `the calls with ${session.title}` : session.kind === 'task' ? `the tasks from the flow "${session.title}"` : `the text messages with ${session.title}`;
     if (!(await confirmAction({ title: 'Remove this conversation?', message: `Its record of ${what} is deleted from this project. If they call or text again, a new one starts.`, ok: 'Remove', danger: true }))) return;
     if (viewing === id) selectSession(null);
     await sessions!.remove(session);
@@ -1171,6 +1173,8 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
     } else {
       holdsCalls = await desktop.lease('answer-calls', pageId, 30_000, IN_OAIY).then((l) => l.granted, () => false);
     }
+    // Flows' tasks: answered while the desktop is connected.
+    holdsTasks = desktop ? await desktop.lease('answer-tasks', pageId, 30_000, IN_OAIY).then((l) => l.granted, () => false) : false;
   }
 
   /** The flows made tools on the desktop, as the agents' tools. */
@@ -1195,6 +1199,38 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
 
   // The desktop's calls, as they happen (a stream, reopened when it drops).
   let callsAbort: AbortController | null = null;
+  // Flows' tasks for the agent, as they come (a stream, reopened when it drops).
+  let tasksAbort: AbortController | null = null;
+  const tasksTaken = new Set<string>();
+  function followTasks(): void {
+    tasksAbort?.abort();
+    const d = desktop;
+    if (!d) return;
+    const abort = (tasksAbort = new AbortController());
+    void (async () => {
+      while (!abort.signal.aborted) {
+        try {
+          await d.agentTasks((event) => {
+            const id = String(event.id ?? '');
+            if (event.type !== 'agent.task' || !id || !holdsTasks || !sessions || tasksTaken.has(id)) return;
+            tasksTaken.add(id);
+            const from = String(event.from ?? 'a flow');
+            chat.system(`🔀 Your flow "${from}" gave the agent a task.`);
+            sessions
+              .task(from, String(event.task ?? ''))
+              .then((reply) => d.answerTask(id, { reply }), (error: Error) => d.answerTask(id, { error: error.message }))
+              .catch(() => {
+                /* the desktop went away: the flow's wait runs out */
+              });
+          }, abort.signal);
+        } catch {
+          /* the desktop went away: try again shortly */
+        }
+        if (!abort.signal.aborted) await new Promise((r) => setTimeout(r, 3000));
+      }
+    })();
+  }
+
   function followCalls(): void {
     callsAbort?.abort();
     const d = desktop;
@@ -1239,6 +1275,7 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
           desktopEvents.start();
           void refreshPhone();
           followCalls();
+          followTasks();
           void refreshFlowTools();
         } else callsAbort?.abort();
         renderPhoneChip();
@@ -1286,6 +1323,7 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
     void refreshPhone();
     void keepTextLease();
     followCalls();
+    followTasks();
     void refreshFlowTools();
   }
   if (!activeProvider()) chat.system('Welcome! Set up an AI provider in ⚙ Settings to talk to the agent — a local server (Ollama, LM Studio, OAIY) keeps everything on this computer. The editor and terminal work without one.');

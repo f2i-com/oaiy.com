@@ -31,6 +31,8 @@ export interface Session extends SessionInfo {
   brief?: string;
   /** What the agent writes, spoken on the call. */
   speech?: Speech;
+  /** A flow's tasks: those waiting for their answers, in turn (one task a run). */
+  answers?: Array<(reply: string, error?: string) => void>;
 }
 
 /** How the app makes an agent for this project, with a conversation's own instructions and tools. */
@@ -198,6 +200,11 @@ export function earlierWords(turns: Turn[], keep = 6): Turn[] {
     .map((t): Turn => (t.role === 'user' ? { role: 'user', text: t.text } : { role: 'assistant', text: t.text, calls: [] }));
 }
 
+/** What a flow's tasks are about: the flow waits for the agent's last words as its output. */
+export function taskInstructions(flow: string): string {
+  return `This conversation holds the tasks your person's flow "${flow}" gives you (an "Ask the agent" node in it). Each message is one task. Do it with your tools, then end with the result itself: your last reply is handed back to the flow as its output, so give only what the flow asked for (no greeting, no offer of more help). If you cannot do it, say why in one sentence.`;
+}
+
 export class Sessions {
   list: Session[] = [];
   /** Conversations with messages waiting, in the order they came. */
@@ -249,6 +256,11 @@ export class Sessions {
         },
         (error) => this.hooks.event(session, { type: 'status', message: `Could not speak on the call: ${error}` }),
       );
+      return session;
+    }
+    if (info.kind === 'task') {
+      session.answers = [];
+      session.agent = this.makeAgent({ instructions: () => taskInstructions(session.key) });
       return session;
     }
     const test = info.key === TEST_NUMBER;
@@ -475,6 +487,31 @@ export class Sessions {
     return n;
   }
 
+  /**
+   * A flow's task: done in that flow's conversation, one task a run, and
+   * answered with what the agent said last.
+   */
+  task(from: string, text: string): Promise<string> {
+    const key = from.trim() || 'a flow';
+    let session = this.list.find((s) => s.kind === 'task' && s.key === key);
+    if (!session) {
+      session = this.create({ id: `task-${key.replace(/\W+/g, '-').toLowerCase().slice(0, 40) || 'flow'}-${Date.now().toString(36)}`, kind: 'task', key, title: key, lastAt: Date.now(), unread: 0 });
+      this.list.push(session);
+      void this.saveIndex();
+    }
+    const s = session;
+    s.answers ??= [];
+    s.lastAt = Date.now();
+    s.unread++;
+    this.sort();
+    this.hooks.changed();
+    // Queued at once, so tasks run in the order they came.
+    return new Promise<string>((resolve, reject) => {
+      s.answers!.push((reply, error) => (error ? reject(new Error(error)) : resolve(reply)));
+      this.deliver(s, `[OAIY] Your flow "${key}" asks: ${text}`);
+    });
+  }
+
   /** The person's own message in a conversation: it goes first. */
   say(session: Session, text: string): void {
     this.deliver(session, text, true);
@@ -482,7 +519,8 @@ export class Sessions {
 
   /** A message for a conversation: to its running agent, or its next run. */
   private deliver(session: Session, text: string, first = false): void {
-    if (session.running && session.agent.interject(text)) return;
+    // A flow's task is its own run (its answer is what that run says), never added to another.
+    if (session.kind !== 'task' && session.running && session.agent.interject(text)) return;
     session.waiting.push(text);
     if (!this.queue.includes(session)) {
       if (first) this.queue.unshift(session);
@@ -498,7 +536,8 @@ export class Sessions {
     try {
       while (this.queue.length) {
         const session = this.queue.shift()!;
-        const prompt = session.waiting.splice(0).join('\n\n');
+        const prompt = session.kind === 'task' ? session.waiting.shift() ?? '' : session.waiting.splice(0).join('\n\n');
+        if (session.kind === 'task' && session.waiting.length) this.queue.push(session);
         if (prompt) await this.run(session, prompt);
       }
     } finally {
@@ -513,8 +552,13 @@ export class Sessions {
     session.running = new Promise<void>((resolve) => (finish = resolve));
     this.hooks.changed();
     session.speech?.begin();
+    // What the run says last (a flow's task is answered with it), or why it failed.
+    let said = '';
+    let failed = '';
     try {
       await session.agent.run(prompt, (event) => {
+        if (event.type === 'done') said = event.text;
+        if (event.type === 'error') failed = event.message;
         if (session.speech && event.type === 'text') session.speech.push(event.delta);
         // A reply ends (a tool is called, or the model's turn is over): what it said is complete.
         if (session.speech && (event.type === 'tool_call' || event.type === 'usage')) session.speech.flush();
@@ -522,8 +566,10 @@ export class Sessions {
       }, controller.signal);
       session.speech?.flush();
     } catch (error) {
+      failed = (error as Error).message;
       this.hooks.event(session, { type: 'error', message: (error as Error).message });
     } finally {
+      session.answers?.shift()?.(said.trim(), said.trim() ? undefined : failed || 'the agent finished without an answer');
       session.running = null;
       session.controller = null;
       finish();

@@ -1,0 +1,72 @@
+{
+  "id": "ask_agent",
+  "name": "Ask the Agent",
+  "description": "Give OAIY's agent a task and wait for its answer.",
+  "doc": "Hands a task to the agent in OAIY's window, which does it with its own tools (files, the web, pictures, the calendar, texts...) in a conversation of this flow's, and gives back its answer as the output.\n\nThe task is the Task input when connected, else the Task setting; {{input}} in the setting is the Task input. Anything on the Context input goes with it.\n\nThe answer is the agent's last reply: ask for exactly what the rest of the flow needs.\n\nRuns in the OAIY app (the agent must be open there).",
+  "icon": "bot",
+  "color": "purple",
+  "tags": [
+    "agent",
+    "assistant",
+    "ai",
+    "task",
+    "delegate",
+    "oaiy"
+  ],
+  "inputs": [
+    {
+      "id": "task",
+      "name": "Task",
+      "type": "string",
+      "position": "left"
+    },
+    {
+      "id": "context",
+      "name": "Context",
+      "type": "any",
+      "position": "left"
+    }
+  ],
+  "outputs": [
+    {
+      "id": "reply",
+      "name": "Answer",
+      "type": "string",
+      "position": "right"
+    }
+  ],
+  "properties": [
+    {
+      "id": "task",
+      "name": "Task",
+      "type": "textarea",
+      "default": "",
+      "description": "What the agent should do (used when the Task input is not connected; {{input}} is the Task input)",
+      "rows": 4
+    },
+    {
+      "id": "conversation",
+      "name": "Conversation",
+      "type": "string",
+      "default": "Flow tasks",
+      "description": "The agent's conversation the tasks go to (a tab in the Agent page)"
+    },
+    {
+      "id": "waitMinutes",
+      "name": "Wait (minutes)",
+      "type": "number",
+      "default": 10,
+      "min": 1,
+      "max": 60,
+      "description": "How long the flow waits for the answer",
+      "advanced": true
+    }
+  ],
+  "compiler": {
+    "customHandler": "ask_agent"
+  },
+  "ui": {
+    "width": 300,
+    "resizable": true
+  }
+}

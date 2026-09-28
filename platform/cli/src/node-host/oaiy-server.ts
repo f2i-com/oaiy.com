@@ -44,6 +44,37 @@ async function call(method: string, path: string, body?: unknown): Promise<Respo
   }
 }
 
+/**
+ * `ask_agent`: a task for the agent in OAIY's window ("Ask the Agent"). The
+ * desktop holds the request until the agent answers, for a few minutes at
+ * most (undici gives up on headers after five); then the task is asked after
+ * until `waitSeconds` run out. Answers `{id, status, reply?, error?}`.
+ */
+export async function askAgent(args: Record<string, unknown>): Promise<Record<string, unknown>> {
+  const wait = Math.max(1, Number(args.waitSeconds ?? 600));
+  const until = Date.now() + wait * 1000;
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (TOKEN) headers.Authorization = `Bearer ${TOKEN}`;
+  const first = Math.min(wait, 240);
+  const resp = await fetch(BASE + '/api/agent/tasks', {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ task: args.task, from: args.from, waitSeconds: first }),
+    signal: AbortSignal.timeout((first + 30) * 1000),
+  });
+  let body = (await resp.json().catch(() => ({}))) as Record<string, unknown>;
+  if (!resp.ok) {
+    const e = body.error as { message?: string } | string | undefined;
+    throw new Error(`the agent did not take the task: ${typeof e === 'object' ? e?.message : e ?? `oaiy-server HTTP ${resp.status}`}`);
+  }
+  while (body.status === 'pending' && typeof body.id === 'string' && Date.now() < until) {
+    await new Promise((r) => setTimeout(r, 2000));
+    const again = await fetch(`${BASE}/api/agent/tasks/${encodeURIComponent(body.id)}`, { headers, signal: AbortSignal.timeout(30_000) });
+    if (again.ok) body = (await again.json().catch(() => body)) as Record<string, unknown>;
+  }
+  return body;
+}
+
 /** `ensure_service_ready_by_port`: start whatever service owns `port`. */
 export async function ensureByPort(args: Record<string, unknown>): Promise<EnsureResult> {
   const port = Number(args.port ?? 0);

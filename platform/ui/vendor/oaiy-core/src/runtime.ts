@@ -986,6 +986,8 @@ export class OAIYRuntime {
     // === Service orchestration ============================================
     'ensure_service_ready',
     'ensure_service_ready_by_port',
+    // "Ask the Agent" (core-agent): a task for the agent in OAIY's window, through the desktop.
+    'ask_agent',
     'get_service_port',
     // === Media playback URL minting (still goes via media server) =========
     'get_media_url',

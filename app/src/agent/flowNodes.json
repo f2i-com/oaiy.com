@@ -1,5 +1,44 @@
 [
  {
+  "type": "ask_agent",
+  "name": "Ask the Agent",
+  "module": "core-agent",
+  "description": "Give OAIY's agent a task and wait for its answer.",
+  "inputs": [
+   {
+    "id": "task",
+    "type": "string"
+   },
+   {
+    "id": "context",
+    "type": "any"
+   }
+  ],
+  "outputs": [
+   {
+    "id": "reply",
+    "type": "string"
+   }
+  ],
+  "properties": [
+   {
+    "id": "task",
+    "type": "textarea"
+   },
+   {
+    "id": "conversation",
+    "type": "string",
+    "default": "Flow tasks"
+   },
+   {
+    "id": "waitMinutes",
+    "type": "number",
+    "default": 10,
+    "advanced": true
+   }
+  ]
+ },
+ {
   "type": "ai_llm",
   "name": "AI LLM",
   "module": "core-ai",

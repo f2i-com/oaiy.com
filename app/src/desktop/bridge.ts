@@ -165,8 +165,23 @@ export class Desktop {
    * `call.ended`) until `signal` aborts or the stream ends.
    */
   async voiceEvents(onEvent: (event: Record<string, unknown>) => void, signal: AbortSignal): Promise<void> {
-    const resp = await fetch(`${this.origin}/api/voice/events`, { headers: this.headers(), signal });
-    if (!resp.ok || !resp.body) throw new DesktopError(`OAIY Desktop's call events: HTTP ${resp.status}`, resp.status);
+    return this.follow('/api/voice/events', "OAIY Desktop's call events", onEvent, signal);
+  }
+
+  /** Flows' tasks for the agent (`agent.task`: id, from, task), the waiting ones first, until `signal` aborts. */
+  async agentTasks(onEvent: (event: Record<string, unknown>) => void, signal: AbortSignal): Promise<void> {
+    return this.follow('/api/agent/events', "OAIY Desktop's tasks for the agent", onEvent, signal);
+  }
+
+  /** The agent's answer to a flow's task (or why it could not). */
+  async answerTask(id: string, answer: { reply: string } | { error: string }, signal?: AbortSignal): Promise<void> {
+    await reply(await fetch(`${this.origin}/api/agent/tasks/${encodeURIComponent(id)}/reply`, { method: 'POST', headers: this.headers(), body: JSON.stringify(answer), signal }));
+  }
+
+  /** A server-sent event stream of the desktop's, event by event. */
+  private async follow(path: string, what: string, onEvent: (event: Record<string, unknown>) => void, signal: AbortSignal): Promise<void> {
+    const resp = await fetch(`${this.origin}${path}`, { headers: this.headers(), signal });
+    if (!resp.ok || !resp.body) throw new DesktopError(`${what}: HTTP ${resp.status}`, resp.status);
     const reader = resp.body.pipeThrough(new TextDecoderStream()).getReader();
     let buffer = '';
     for (;;) {

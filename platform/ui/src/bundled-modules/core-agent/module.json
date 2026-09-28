@@ -1,0 +1,16 @@
+{
+  "id": "core-agent",
+  "name": "OAIY Agent",
+  "version": "1.0.0",
+  "description": "Hand work to OAIY's agent: it does the task with its tools and the flow gets its answer",
+  "author": "OAIY Team",
+  "category": "AI",
+  "icon": "bot",
+  "color": "purple",
+  "nodes": ["ask_agent"],
+  "permissions": ["network"],
+  "runtime": {
+    "typescript": "runtime.ts",
+    "compiler": "compiler.ts"
+  }
+}

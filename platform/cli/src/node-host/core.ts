@@ -431,6 +431,8 @@ export async function invoke<T = unknown>(cmd: string, args?: InvokeArgs): Promi
       return (await oaiyServer.ensureService((args ?? {}) as Record<string, unknown>)) as T;
     case 'ensure_service_ready_by_port':
       return (await oaiyServer.ensureByPort((args ?? {}) as Record<string, unknown>)) as T;
+    case 'ask_agent':
+      return (await oaiyServer.askAgent((args ?? {}) as Record<string, unknown>)) as T;
     case 'get_service_port':
       return null as T;
 

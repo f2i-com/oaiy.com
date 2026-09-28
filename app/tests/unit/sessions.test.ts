@@ -236,3 +236,35 @@ describe("following the desktop's events", () => {
     follower.stop();
   });
 });
+
+describe("a flow's tasks for the agent", () => {
+  it('each task is its own run in the flow\'s conversation, answered with what the agent said last', async () => {
+    const asked: string[] = [];
+    fakeProvider('openai', [
+      (body) => {
+        asked.push(JSON.stringify(body.messages));
+        return { text: 'Welcome aboard, Sam!' };
+      },
+      (body) => {
+        asked.push(JSON.stringify(body.messages));
+        return { text: 'Welcome aboard, Priya!' };
+      },
+    ]);
+    const { sessions } = setup({ answer: false, instructions: '' });
+    const [sam, priya] = await Promise.all([sessions.task('Welcome', 'Write a welcome line for Sam'), sessions.task('Welcome', 'Now one for Priya')]);
+    expect([sam, priya]).toEqual(['Welcome aboard, Sam!', 'Welcome aboard, Priya!']);
+    expect(asked[0]).toContain('Your flow \\"Welcome\\" asks: Write a welcome line for Sam');
+    expect(asked[0]).toContain('your last reply is handed back to the flow as its output');
+    expect(asked[1]).toContain('asks: Now one for Priya');
+    const flows = sessions.list.filter((s) => s.kind === 'task');
+    expect(flows.map((s) => s.title)).toEqual(['Welcome']);
+    await settled(sessions);
+  });
+
+  it('a task the agent cannot answer fails, and the flow is told why', async () => {
+    fakeProvider('openai', [{ error: { status: 400, body: '{"error":{"message":"the model is away"}}' } }]);
+    const { sessions } = setup({ answer: false, instructions: '' });
+    await expect(sessions.task('Nightly report', 'Summarise the day')).rejects.toThrow();
+    await settled(sessions);
+  });
+});

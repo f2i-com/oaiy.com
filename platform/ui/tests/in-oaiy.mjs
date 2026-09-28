@@ -44,7 +44,8 @@ const bundlePath = path.join(os.tmpdir(), `oaiy-in-oaiy-${process.pid}.mjs`);
 await esbuild.build({
   stdin: {
     contents: `export { flowKey, fromDoc, reconcile, shared } from './src/hooks/useDesktopFlows.ts';
-export { desktopTheme } from './src/contexts/ThemeContext.tsx';`,
+export { desktopTheme } from './src/contexts/ThemeContext.tsx';
+export { taskText } from './src/bundled-modules/core-agent/runtime.ts';`,
     resolveDir: UI,
     loader: 'ts',
   },
@@ -55,7 +56,7 @@ export { desktopTheme } from './src/contexts/ThemeContext.tsx';`,
   logLevel: 'silent',
   jsx: 'automatic',
 });
-const { flowKey, fromDoc, reconcile, shared, desktopTheme } = await import(pathToFileURL(bundlePath).href);
+const { flowKey, fromDoc, reconcile, shared, desktopTheme, taskText } = await import(pathToFileURL(bundlePath).href);
 fs.rmSync(bundlePath, { force: true });
 
 const flow = (extra = {}) => ({ id: 'f1', name: 'Greeting', createdAt: '', updatedAt: '', graph: { nodes: [], edges: [] }, ...extra });
@@ -116,6 +117,13 @@ check('a flow deleted there goes here unless changed here; one deleted here is n
   assert.deepEqual(kept.remove, []);
   const deletedHere = reconcile(new Map([['a', a]]), [], new Map([['a', key(a)]]));
   assert.deepEqual(deletedHere.put, [], 'the push removes it there');
+});
+
+check('"Ask the Agent" words its task from the input, the setting and the context', () => {
+  assert.equal(taskText('Summarise this', '', null), 'Summarise this');
+  assert.equal(taskText('Sam', 'Welcome {{ input }} to Green Lawns.', null), 'Welcome Sam to Green Lawns.');
+  assert.equal(taskText(null, 'Check the calendar for tomorrow.', { booked: 3 }), 'Check the calendar for tomorrow.\n\nWhat the flow gives with it:\n{\n "booked": 3\n}');
+  assert.equal(taskText('', '', ''), '');
 });
 
 check('the theme is the one OAIY said last', () => {
