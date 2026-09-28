@@ -1284,12 +1284,28 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
     phoneChip.title = state === 'problem' ? `OAIY Desktop: ${desktopProblem}` : 'Phone: OAIY Desktop, Aokie and text messages';
   }
 
+  /**
+   * The names the phone's agents know (a caller's note, or a conversation named
+   * by the phone's contacts), given to the desktop so its greeting can use them.
+   */
+  let namesGiven = false;
+  function giveCallerNames(): void {
+    const d = desktop;
+    if (!d || !sessions || namesGiven) return;
+    namesGiven = true;
+    const names = new Map<string, string>();
+    for (const s of sessions.list) if (s.kind !== 'task' && s.key !== TEST_NUMBER && s.title && s.title !== s.key) names.set(s.key, s.title);
+    for (const c of sessions.callers) if (c.name) names.set(c.number, c.name);
+    for (const [number, name] of names) void d.rememberCaller(number, name).catch(() => {});
+  }
+
   async function refreshPhone(): Promise<void> {
     if (!desktop) return;
     try {
       const status = (await desktop.command('aokie', 'phone.status', {}, `oaiy:phone.status:${crypto.randomUUID()}`, AbortSignal.timeout(8000))) as Record<string, unknown> | null;
       phoneConnected = !!status?.connected;
       desktopProblem = '';
+      giveCallerNames();
     } catch (error) {
       desktopProblem = (error as Error).message;
     }
