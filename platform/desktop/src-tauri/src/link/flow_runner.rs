@@ -68,6 +68,13 @@ const RUN_TIMEOUT: Duration = Duration::from_secs(300);
 /// nothing else will pick it up.
 const COMPLETE_ATTEMPTS: usize = 3;
 
+/// Where completions the provider could not be told are kept until it can be: set
+/// once the lane starts (`<data>/link/completions`).
+static PENDING_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+/// How often kept completions are tried again (a provider that is away is not asked
+/// every poll).
+const PENDING_EVERY: Duration = Duration::from_secs(60);
+
 /// Cap on the result handed back to the provider.
 ///
 /// An oversized typed result must fail explicitly, never become a successful
@@ -254,6 +261,8 @@ pub fn spawn(
 }
 
 fn spawn_inner(store: LinkHandle, node: Option<crate::services::node_runtime::NodeHandle>) {
+    let _ = PENDING_DIR.set(store.data_dir().join("link").join("completions"));
+    let mut pending_at = std::time::Instant::now();
     std::thread::spawn(move || loop {
         let Some(account) = store.account() else {
             // Not linked. Sleep rather than spin; a link is a human action and
@@ -261,6 +270,14 @@ fn spawn_inner(store: LinkHandle, node: Option<crate::services::node_runtime::No
             std::thread::sleep(Duration::from_secs(5));
             continue;
         };
+        // Outcomes this desktop could not report before are told first: until
+        // they are, those runs look as though they were still running.
+        if std::time::Instant::now() >= pending_at {
+            if let Some(dir) = PENDING_DIR.get() {
+                resend_pending(dir, &account);
+            }
+            pending_at = std::time::Instant::now() + PENDING_EVERY;
+        }
         let Some(spec) =
             descriptor::find(store.data_dir(), &account.connector_id).and_then(|d| d.flows)
         else {
@@ -975,11 +992,79 @@ fn report(
             Err(e) => last = format!("could not report the outcome: {e}"),
         }
     }
-    // Loud, because this is the state the whole module exists to avoid: a run
-    // this desktop claimed and left looking as though it were still working.
-    Err(format!(
-        "{last} — run {run_id} was claimed by this desktop and may be stuck at running"
-    ))
+    // Kept, and told when the provider can be reached (a lost network after the
+    // run must not leave it marked running for good). Loud all the same: until
+    // then the run looks as though it were still working.
+    match PENDING_DIR.get().map(|dir| keep_pending(dir, account, run_id, &url, &body)) {
+        Some(Ok(())) => Err(format!(
+            "{last} — run {run_id} looks stuck at running until then: its outcome is kept and will be sent when the provider answers"
+        )),
+        _ => Err(format!(
+            "{last} — run {run_id} was claimed by this desktop and may be stuck at running"
+        )),
+    }
+}
+
+/// A completion kept until the provider takes it.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PendingCompletion {
+    /// The provider it belongs to: never sent to another one.
+    base_url: String,
+    run_id: String,
+    url: String,
+    body: Value,
+    kept_at: String,
+}
+
+fn pending_file(dir: &Path, run_id: &str) -> PathBuf {
+    let safe: String = run_id.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect();
+    dir.join(format!("{safe}.json"))
+}
+
+fn keep_pending(dir: &Path, account: &LinkedAccount, run_id: &str, url: &str, body: &Value) -> Result<(), String> {
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    let kept = PendingCompletion { base_url: account.base_url.clone(), run_id: run_id.into(), url: url.into(), body: body.clone(), kept_at: chrono::Utc::now().to_rfc3339() };
+    let text = serde_json::to_string_pretty(&kept).map_err(|e| e.to_string())?;
+    // Written whole, then renamed: a crash never leaves half a completion.
+    let path = pending_file(dir, run_id);
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, text).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, &path).map_err(|e| e.to_string())
+}
+
+/// Tell the provider the outcomes kept for it: each goes once it is taken, or the
+/// provider says it is final already (409) or no longer there to finish (404,
+/// 410). While the provider cannot be reached the rest wait for the next try.
+fn resend_pending(dir: &Path, account: &LinkedAccount) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let Ok(http) = client(Duration::from_secs(15)) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Some(kept) = std::fs::read_to_string(&path).ok().and_then(|t| serde_json::from_str::<PendingCompletion>(&t).ok()) else {
+            continue;
+        };
+        if kept.base_url != account.base_url {
+            continue;
+        }
+        match http.patch(&kept.url).bearer_auth(&account.credential).json(&kept.body).send() {
+            Ok(resp) if resp.status().is_success() || matches!(resp.status().as_u16(), 404 | 409 | 410) => {
+                log::info!("flow run {}: its kept outcome was reported (HTTP {})", kept.run_id, resp.status().as_u16());
+                let _ = std::fs::remove_file(&path);
+            }
+            Ok(resp) => {
+                log::warn!("flow run {}: its kept outcome is still refused (HTTP {}); trying again later", kept.run_id, resp.status().as_u16());
+                return;
+            }
+            Err(e) => {
+                log::info!("flow run {}: the provider is still away ({e}); its outcome waits", kept.run_id);
+                return;
+            }
+        }
+    }
 }
 
 /// Keep the original type intact or report a bounded failure. Use the existing
@@ -1823,6 +1908,39 @@ mod tests {
             }
         }
         assert_eq!(patches, COMPLETE_ATTEMPTS, "the completion must be retried");
+    }
+
+    #[test]
+    fn an_outcome_that_could_not_be_reported_is_kept_and_sent_when_the_provider_answers() {
+        let dir = std::env::temp_dir().join(format!("oaiy-pending-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // A provider that is away: nothing listens on this port.
+        let away = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let away_url = format!("http://{}", away.local_addr().unwrap());
+        drop(away);
+        let body = json!({"instanceId": "oaiy-test", "status": "done", "result": {"ok": true}});
+        keep_pending(&dir, &account(away_url.clone()), "r/1", &format!("{away_url}/runs/r1"), &body).unwrap();
+        resend_pending(&dir, &account(away_url));
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1, "kept while the provider is away");
+
+        // Another provider's kept outcome is never sent to this one.
+        let (base, rx) = stub_provider(ONE_RUN, NO_MATCHING_FLOW, "200 OK", "200 OK");
+        resend_pending(&dir, &account(base.clone()));
+        assert!(rx.recv_timeout(Duration::from_millis(300)).is_err());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+
+        // Its own provider back: sent once, with the same body, and let go.
+        let file = std::fs::read_dir(&dir).unwrap().next().unwrap().unwrap().path();
+        let mut kept: PendingCompletion = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        kept.base_url = base.clone();
+        kept.url = format!("{base}/runs/r1");
+        std::fs::write(&file, serde_json::to_string(&kept).unwrap()).unwrap();
+        resend_pending(&dir, &account(base));
+        let (line, raw) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(line.starts_with("PATCH") && line.contains("/runs/r1"), "{line}");
+        assert!(raw.contains("\"status\":\"done\""), "{raw}");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0, "let go once taken");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
