@@ -574,6 +574,9 @@ details.msg.compacted pre { white-space: pre-wrap; font-size: 12px; max-height: 
 .phone-form .pair-code { font: 700 22px/1.2 var(--mono); letter-spacing: 0.2em; color: var(--accent); }
 .phone-form .row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 /* The dialog's sections: who is answered, and missed calls. */
+/* A checkbox and its words on one line, the words wrapping beside it. */
+.phone-form label.row { flex-wrap: nowrap; align-items: flex-start; }
+.phone-form label.row input[type='checkbox'] { flex: none; margin-top: 3px; }
 .phone-form .phone-heading { margin: 10px 0 0; padding-top: 12px; border-top: 1px solid var(--border); font-size: 13px; font-weight: 600; }
 .phone-form .phone-screening { display: flex; flex-direction: column; gap: 10px; }
 .phone-form .phone-screening[hidden] { display: none; }
