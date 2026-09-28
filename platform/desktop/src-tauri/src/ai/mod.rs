@@ -5,6 +5,7 @@
 //! - `egress`     — SSRF/redirect guard for outbound provider calls.
 //! - `gateway`    — the chat/models proxy + OpenAI↔Anthropic normalization.
 //! - `routes`     — the `/api/ai/*` axum sub-router (merged in `http::serve`).
+//! - `engine_services` — OAIY's engine's models as flow services, and their calls.
 //! - `e2e`        — the sealed envelope a provider's web app chats through.
 //! - `tunnel`     — answering the sealed turns it relays here.
 //! - `chat_tools` — letting one of those turns act on the linked account.
@@ -13,6 +14,7 @@ pub mod chat_tools;
 pub mod codex;
 pub mod e2e;
 pub mod egress;
+pub mod engine_services;
 pub mod gateway;
 pub mod providers;
 pub mod routes;

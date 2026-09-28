@@ -52,17 +52,24 @@ pub const ENGINE_PROVIDER_ID: &str = "oaiy-engine";
 /// The engines' gateway and the model chosen in Engines, asked of the engines now
 /// (their control page's state gives the gateway, the gateway's discovery the model).
 async fn engine_now() -> Result<(String, String), String> {
+    let (gateway, discovery) = engine_discovery().await?;
+    Ok((gateway, chosen_model(&discovery)))
+}
+
+/// The engines' gateway and its discovery document, asked of the engines now. Only
+/// asks: nothing is started (the gateway answers discovery from its configuration).
+pub(super) async fn engine_discovery() -> Result<(String, Value), String> {
     let ui = engines_ui().ok_or("OAIY's engines are not running")?;
     let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(4)).build().map_err(|e| e.to_string())?;
     let state: Value = client.get(format!("{}/api/state", ui.trim_end_matches('/'))).send().await.map_err(|e| format!("the engines did not answer: {e}"))?.json().await.map_err(|e| e.to_string())?;
     let gateway = state.get("gateway_url").and_then(Value::as_str).filter(|g| !g.is_empty()).ok_or("the engines have no gateway yet")?.trim_end_matches('/').to_string();
     let discovery: Value = client.get(format!("{gateway}/v1/discovery")).send().await.map_err(|e| format!("the engines' gateway did not answer: {e}"))?.json().await.map_err(|e| e.to_string())?;
-    Ok((gateway, chosen_model(&discovery)))
+    Ok((gateway, discovery))
 }
 
 /// The model chosen in Engines, from the gateway's discovery: `defaults.llm`, else
 /// the language model marked default ("" when there is none).
-fn chosen_model(discovery: &Value) -> String {
+pub(super) fn chosen_model(discovery: &Value) -> String {
     discovery
         .pointer("/defaults/llm")
         .and_then(Value::as_str)
@@ -98,6 +105,8 @@ fn engine_provider(gateway: String, model: String) -> AiProvider {
 }
 
 pub fn router(state: AiState) -> Router {
+    // OAIY's engine's models as flow services, and the calls to them.
+    let engine = super::engine_services::router(state.clone());
     Router::new()
         // union of local services + configured providers, for the flow pickers
         .route("/api/ai/sources", get(list_ai_sources))
@@ -118,6 +127,7 @@ pub fn router(state: AiState) -> Router {
         .route("/api/ai/codex/login", post(codex_login_start).delete(codex_login_cancel))
         .route("/api/ai/codex/logout", post(codex_logout))
         .with_state(state)
+        .merge(engine)
     // OUT OF SCOPE v1 (hook here later, same shape as the reference):
     //   POST /api/ai/v1/audio/transcriptions      -> Capability::Transcription
     //   POST /api/ai/v1/audio/chat/completions     -> buffered audio-chat
@@ -126,7 +136,7 @@ pub fn router(state: AiState) -> Router {
 }
 
 /// `{ "error": { "code", "message" } }` — identical taxonomy shape to the bridge.
-fn ai_error(status: StatusCode, code: &str, message: String) -> Response {
+pub(super) fn ai_error(status: StatusCode, code: &str, message: String) -> Response {
     (status, Json(json!({ "error": { "code": code, "message": message } }))).into_response()
 }
 
