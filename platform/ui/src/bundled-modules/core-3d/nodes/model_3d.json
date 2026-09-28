@@ -1,0 +1,124 @@
+{
+  "id": "model_3d",
+  "name": "3D Model",
+  "description": "Make a 3D model (GLB with PBR materials) from a picture of an object, or from a description (a picture is made first). Runs on OAIY's engine (service engine:model3d) or a service you add.",
+  "doc": "Turns a picture of one object into a textured 3D model: a GLB (glTF 2.0) file with PBR materials, for game engines, 3D viewers and SoftN apps.\n\n**From a picture** — connect it to Image. Any background works when the engine's model removes backgrounds; small pictures are enlarged first when it has an upscaler.\n\n**From a description** — leave Image unconnected and describe the object (Description input or property): a picture of it is made first with Picture Service (OAIY's default image model), then the model. The picture comes out on Picture, so you can check it.\n\n**Service** — `OAIY engine` uses the 3D model set up in OAIY's Engines (Pixal3D). Your own services (a Python rig in OAIY → Services, or a custom HTTP service) are sent the picture as a data: URL in `{{image}}` and should answer with the GLB (a file, base64, a URL, or a job that makes it).\n\n**Out** — `Model` is a URL of the GLB; `Path` is the file (Copy File / File Write take it); `Picture` is the picture it was made from.\n\nA model takes a few minutes on the GPU.",
+  "icon": "box",
+  "color": "orange",
+  "tags": ["3d", "model", "mesh", "glb", "gltf", "image to 3d", "text to 3d", "generation", "ai"],
+  "inputs": [
+    {
+      "id": "image",
+      "name": "Image",
+      "type": "image",
+      "position": "left",
+      "description": "A picture of one object (optional when a description is given)"
+    },
+    {
+      "id": "prompt",
+      "name": "Description",
+      "type": "string",
+      "position": "left",
+      "description": "The object, when there is no picture: a picture of it is made first"
+    }
+  ],
+  "outputs": [
+    {
+      "id": "model",
+      "name": "Model",
+      "type": "any",
+      "position": "right",
+      "description": "The 3D model: a URL of the GLB file"
+    },
+    {
+      "id": "path",
+      "name": "Path",
+      "type": "string",
+      "position": "right",
+      "description": "The GLB file"
+    },
+    {
+      "id": "picture",
+      "name": "Picture",
+      "type": "image",
+      "position": "right",
+      "description": "The picture the model was made from"
+    }
+  ],
+  "properties": [
+    {
+      "id": "service",
+      "name": "Service",
+      "type": "select",
+      "default": "engine:model3d",
+      "dynamicOptionsSource": "service:list:model_3d",
+      "options": [{ "value": "engine:model3d", "label": "OAIY engine · default model" }],
+      "description": "Which model or service makes the 3D model. Add models in OAIY's Engines, or your own services (Python rigs) in OAIY's Services."
+    },
+    {
+      "id": "prompt",
+      "name": "Description",
+      "type": "textarea",
+      "default": "",
+      "rows": 2,
+      "placeholder": "A red ceramic teapot",
+      "description": "The object, when no picture is connected"
+    },
+    {
+      "id": "pictureService",
+      "name": "Picture Service",
+      "type": "select",
+      "default": "engine:image",
+      "dynamicOptionsSource": "service:list:image_gen",
+      "options": [{ "value": "engine:image", "label": "OAIY engine · default model" }],
+      "description": "What makes the picture from the description (only used without a connected picture)"
+    },
+    {
+      "id": "resolution",
+      "name": "Detail",
+      "type": "select",
+      "default": 1024,
+      "options": [
+        { "value": 1024, "label": "Standard (1024)" },
+        { "value": 1536, "label": "High (1536, slower)" }
+      ],
+      "description": "The model's resolution"
+    },
+    {
+      "id": "faces",
+      "name": "Faces",
+      "type": "number",
+      "default": 200000,
+      "min": 1000,
+      "max": 2000000,
+      "step": 1000,
+      "description": "The mesh's triangle budget",
+      "advanced": true
+    },
+    {
+      "id": "seed",
+      "name": "Seed",
+      "type": "number",
+      "default": -1,
+      "min": -1,
+      "description": "The same seed gives the same model (-1 for a new one each time)",
+      "advanced": true
+    },
+    {
+      "id": "filename",
+      "name": "Filename",
+      "type": "string",
+      "default": "model",
+      "description": "Base name for the GLB file"
+    }
+  ],
+  "compiler": {
+    "async": true,
+    "abortable": true,
+    "statusTracking": true,
+    "customHandler": true
+  },
+  "ui": {
+    "width": 300
+  }
+}

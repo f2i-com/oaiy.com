@@ -13,6 +13,8 @@
  */
 
 import type { RuntimeModule, RuntimeContext, RuntimeMethod } from 'oaiy-core/src/module-types';
+import type { CustomService } from './examples';
+import { runContract } from './contractRuntime';
 
 // Per-job method factory: methods close over THIS job's ctx (no module-level singleton).
 function createServiceMethods(ctx: RuntimeContext): Record<string, RuntimeMethod> {
@@ -247,8 +249,45 @@ async function call(
   return responsePath ? extractJsonPath(parsed, responsePath) : parsed;
 }
 
+/**
+ * A contract service (see contract.ts): an OAIY engine model, OAIY Voice, or
+ * a rig that declares what it makes. What it gives back: a picture as a
+ * data: URL, audio / video / a 3D model as `{audio|video|model, path}`, text
+ * as text, anything else as the answer at its response path.
+ */
+async function callContract(
+  contract: CustomService | string,
+  vars: Record<string, unknown>,
+  nodeId: string,
+): Promise<unknown> {
+  ctx.onNodeStatus?.(nodeId, 'running');
+  try {
+    const r = await runContract(ctx, contract, vars, { nodeId, label: typeof contract === 'object' ? contract.name : 'Service' });
+    ctx.onNodeStatus?.(nodeId, 'completed');
+    switch (r.output) {
+      case 'image':
+        ctx.onImage?.(nodeId, r.image!);
+        return r.image;
+      case 'audio':
+        return { audio: r.url, path: r.path };
+      case 'video':
+        return { video: r.url, path: r.path };
+      case 'model3d':
+        return { model: r.url, path: r.path };
+      case 'text':
+        return r.text;
+      default:
+        return r.value;
+    }
+  } catch (e) {
+    ctx.onNodeStatus?.(nodeId, 'error');
+    throw e;
+  }
+}
+
   return {
     call,
+    callContract: callContract as RuntimeMethod,
   };
 }
 

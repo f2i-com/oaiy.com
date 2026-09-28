@@ -13,9 +13,11 @@
         "music_gen",
         "audio_append",
         "speech_to_text",
-        "audio_fade"
+        "audio_fade",
+        "sound_effect"
     ],
     "permissions": [
+        "network",
         "filesystem"
     ],
     "runtime": {

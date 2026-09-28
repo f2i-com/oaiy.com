@@ -6,45 +6,13 @@
 
 import type { ModuleCompiler, ModuleCompilerContext } from 'oaiy-core/src/module-types';
 import { resolveRefsExpr } from 'oaiy-core/src/value-refs';
-import { BUILT_IN_SERVICES, type CustomService } from '../core-service/examples';
-
-// Service-preset lookup mirrors core-service/compiler.ts:
-// user-saved services from localStorage take precedence over built-ins
-// (same id-shadowing rule). When a service is picked on the AI LLM node,
-// its endpoint / model / headers / apiKeyConstant / body template fill
-// in below explicit data.* fields, replacing the per-provider hardcoded
-// defaults — single source of truth for "how do I reach this engine".
-const SERVICE_STORAGE_KEY = 'oaiy.customServices';
-// OAIY-Desktop-managed services (Phase 3) are published to a separate key
-// by lib/desktopServices.ts while the OAIY Desktop is running.
-// Read it inline (no app-module import) so this bundled compiler stays
-// self-contained, mirroring how it reads oaiy.customServices.
-const DESKTOP_SERVICE_STORAGE_KEY = 'oaiy.desktopServices';
-function readServiceKey(key: string): CustomService[] {
-  try {
-    if (typeof localStorage === 'undefined') return [];
-    const raw = localStorage.getItem(key);
-    if (!raw) return [];
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? (parsed as CustomService[]) : [];
-  } catch {
-    return [];
-  }
-}
-function getCustomServices(): CustomService[] {
-  return readServiceKey(SERVICE_STORAGE_KEY);
-}
-function resolveService(id: string): CustomService | null {
-  if (!id) return null;
-  // User services take precedence, then live companion services, then
-  // built-in examples — companion ids are `companion:*` so no collision.
-  const all = [
-    ...getCustomServices(),
-    ...readServiceKey(DESKTOP_SERVICE_STORAGE_KEY),
-    ...BUILT_IN_SERVICES,
-  ];
-  return all.find((s) => s.id === id) ?? null;
-}
+// Service-preset lookup shared with every compiler (core-service/contract.ts):
+// the user's own services shadow built-ins; OAIY Desktop's services and
+// OAIY's engine (`engine:llm:<model>`, or `engine:llm` for the chosen one)
+// follow. When a service is picked on the AI LLM node, its endpoint / model /
+// headers / apiKeyConstant / body template fill in below explicit data.*
+// fields, replacing the per-provider hardcoded defaults.
+import { resolveService } from '../core-service/contract';
 
 const CoreAICompiler: ModuleCompiler = {
   name: 'AI',
@@ -123,6 +91,10 @@ const CoreAICompiler: ModuleCompiler = {
     // so new nodes inherit the user's preferred engine without configuring.
     const presetId = String(data.service || projectSettings?.defaultAIServiceId || '');
     const preset = resolveService(presetId);
+    // OAIY's engine: the desktop's `oaiy-engine` provider, which needs no key
+    // (the user's OpenAI key must not be sent to it) and speaks plain OpenAI
+    // chat — its body template is for the Service Call node only.
+    const isEngine = preset?.group === 'engine';
 
     const provider = String(data.provider || (preset ? 'custom' : 'oaiy-local'));
     // HuggingFace LLM defaults to local service endpoint with OpenAI-compatible API
@@ -167,8 +139,7 @@ const CoreAICompiler: ModuleCompiler = {
       data.apiKeyConstant
         || data.apiKey
         || preset?.apiKeyConstant
-        || projectSettings?.defaultAIApiKeyConstant
-        || defaultApiKey
+        || (isEngine ? '' : projectSettings?.defaultAIApiKeyConstant || defaultApiKey)
     ));
 
     const streaming = data.streaming !== false;
@@ -259,11 +230,11 @@ const CoreAICompiler: ModuleCompiler = {
     // headers are non-trivial, fall through to those so the runtime's
     // custom-template branch handles the request — same code path the
     // 'custom' provider mode uses for inline templates.
-    const presetHasBody = !!preset && !!preset.bodyTemplate && preset.bodyTemplate !== '{{inputRaw}}';
+    const presetHasBody = !!preset && !isEngine && !!preset.bodyTemplate && preset.bodyTemplate !== '{{inputRaw}}';
     const customBodyTemplate = (_d.customBodyTemplate as string)
       || (presetHasBody ? preset!.bodyTemplate : '');
     const customResponsePath = (_d.customResponsePath as string)
-      || (preset?.responsePath ?? '');
+      || (isEngine ? '' : preset?.responsePath ?? '');
     const customHeaders = (_d.customHeaders as string)
       || (preset && preset.headers && preset.headers !== '{}' ? preset.headers : '');
 

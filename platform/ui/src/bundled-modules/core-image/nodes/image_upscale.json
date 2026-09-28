@@ -1,0 +1,58 @@
+{
+  "id": "image_upscale",
+  "name": "Upscale Image",
+  "description": "Make a picture two or four times larger with its detail restored (PNG). Runs on OAIY's engine (Real-ESRGAN) or a service you add; service engine:upscale is the engine's.",
+  "doc": "Enlarges a picture two or four times, restoring detail rather than blurring it.\n\n**Service** — `OAIY engine` uses the upscaler set up in OAIY's Engines (Real-ESRGAN x4plus; pictures up to about 4 megapixels). You can also pick one of your own services: it is sent the picture as a data: URL in `{{image}}` and the scale in `{{scale}}`, and should answer with the new picture.\n\n**In → out** — any picture in; a PNG data URL out, which Image View and Image Save take.",
+  "icon": "maximize",
+  "color": "indigo",
+  "tags": ["image", "upscale", "enlarge", "super resolution", "esrgan"],
+  "inputs": [
+    {
+      "id": "image",
+      "name": "Image",
+      "type": "image",
+      "position": "left",
+      "description": "The picture to enlarge"
+    }
+  ],
+  "outputs": [
+    {
+      "id": "image",
+      "name": "Image",
+      "type": "image",
+      "position": "right",
+      "description": "The larger picture (PNG data URL)"
+    }
+  ],
+  "properties": [
+    {
+      "id": "service",
+      "name": "Service",
+      "type": "select",
+      "default": "engine:upscale",
+      "dynamicOptionsSource": "service:list:image_upscale",
+      "options": [{ "value": "engine:upscale", "label": "OAIY engine · default model" }],
+      "description": "Which model or service enlarges the picture. Add models in OAIY's Engines, or your own services (Python rigs) in OAIY's Services."
+    },
+    {
+      "id": "scale",
+      "name": "Scale",
+      "type": "select",
+      "default": 4,
+      "options": [
+        { "value": 2, "label": "2× larger" },
+        { "value": 4, "label": "4× larger" }
+      ],
+      "description": "How much larger the picture becomes."
+    }
+  ],
+  "compiler": {
+    "async": true,
+    "abortable": true,
+    "statusTracking": true,
+    "customHandler": true
+  },
+  "ui": {
+    "width": 280
+  }
+}

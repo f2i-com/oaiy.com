@@ -651,7 +651,8 @@ function ServiceRow({
   );
 }
 
-function ServiceForm({
+/** The service editor (also opened from a node's "Add a service…", lib/addServiceDialog.tsx). */
+export function ServiceForm({
   initial,
   isNew,
   onSave,
@@ -777,6 +778,12 @@ function ServiceForm({
     image_gen: 'Image Gen',
     video_gen: 'Video Gen',
     text_to_speech: 'TTS',
+    music_gen: 'Music Gen',
+    speech_to_text: 'Speech to Text',
+    sound_effect: 'Sound Effect',
+    model_3d: '3D Model',
+    background_removal: 'Remove Background',
+    image_upscale: 'Upscale Image',
     service_call: 'Service Call',
   };
 

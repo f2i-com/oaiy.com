@@ -283,6 +283,13 @@ export interface PropertyOption {
   value: unknown;
   label: string;
   description?: string;
+  /** Shown under this heading in the dropdown (an <optgroup>). */
+  group?: string;
+  /**
+   * An action rather than a value ("Add a service…"): picking it runs this
+   * and leaves the field's value as it was. Only from dynamic resolvers.
+   */
+  action?: () => void;
 }
 
 export interface PropertyDefinition {

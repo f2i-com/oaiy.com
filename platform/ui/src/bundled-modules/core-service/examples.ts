@@ -13,7 +13,11 @@
  */
 
 export type ServiceMethod = 'GET' | 'POST' | 'PUT' | 'DELETE' | 'PATCH';
-export type ServiceResponseType = 'json' | 'text';
+/**
+ * `binary`: the answer is the file itself (audio from a speech endpoint);
+ * only services that declare an `output` use it.
+ */
+export type ServiceResponseType = 'json' | 'text' | 'binary';
 
 /**
  * Which oaiy node types a service is meant for. Picked from a node's
@@ -30,7 +34,45 @@ export type ServiceNodeTag =
   | 'image_gen'
   | 'video_gen'
   | 'text_to_speech'
+  | 'music_gen'
+  | 'speech_to_text'
+  | 'sound_effect'
+  | 'model_3d'
+  | 'background_removal'
+  | 'image_upscale'
   | 'service_call';
+
+/**
+ * How a service that runs as a job is followed: the call that starts it
+ * answers with the job (its id at `idPath`); `statusUrl` is polled until the
+ * value at `statusPath` is one of `done` (then `contentUrl` is what it made)
+ * or `failed` (the reason at `errorPath`). `{id}` in a URL is the job's id; a
+ * URL starting with `/` is on OAIY Desktop. `cancelUrl` is POSTed when the
+ * flow is stopped, so a stopped flow does not leave the GPU busy.
+ */
+export interface ServiceJobSpec {
+  idPath: string;
+  statusUrl: string;
+  statusPath: string;
+  progressPath?: string;
+  done: string[];
+  failed: string[];
+  errorPath?: string;
+  contentUrl?: string;
+  /** Tried when `contentUrl` fails (a converter the server lacks). */
+  contentFallbackUrl?: string | null;
+  cancelUrl?: string | null;
+}
+
+/** What a service makes, for the nodes that turn it into a file or a picture. */
+export type ServiceOutputKind = 'image' | 'video' | 'audio' | 'model3d' | 'text';
+
+/**
+ * Where a service comes from, for grouping in the pickers: OAIY's own engine
+ * (its models, OAIY Voice), a service OAIY Desktop runs (Python rigs, Ollama,
+ * llama.cpp, …), or one the user defined in this editor.
+ */
+export type ServiceGroup = 'engine' | 'desktop' | 'custom';
 
 /**
  * Declared input pin for a service-as-node. The Service Call node uses
@@ -128,6 +170,24 @@ export interface CustomService {
    * legacy Service Call shape.
    */
   outputs?: ServiceOutputDecl[];
+  /** Where it comes from (see ServiceGroup); unset means the user's own. */
+  group?: ServiceGroup;
+  /** OAIY engine entries: the kind of model (image, music, model3d, …). */
+  kind?: string;
+  /** OAIY engine entries: the default model of its kind. */
+  default?: boolean;
+  /**
+   * What the call makes. Set, the typed nodes and Service Call run it as a
+   * contract (the body rendered with every missing value as null, the answer
+   * turned into a file or a picture) — see core-service/contract.ts.
+   */
+  output?: ServiceOutputKind;
+  /** The file format of what it makes: png, mp4, mp3, wav, glb, … */
+  outputFormat?: string;
+  /** `wav16k`: the body is the recording as a 16 kHz mono 16-bit WAV (OAIY Voice). */
+  requestFormat?: 'json' | 'wav16k';
+  /** Set when the call starts a job that is polled (see ServiceJobSpec). */
+  job?: ServiceJobSpec;
 }
 
 export const BUILT_IN_SERVICES: CustomService[] = [

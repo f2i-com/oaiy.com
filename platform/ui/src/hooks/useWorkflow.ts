@@ -18,6 +18,9 @@ import {
   reactFlowToWorkflowGraph,
 } from '../utils/WorkflowIO';
 import { getDefaultNodeData } from '../utils/NodeDefaults';
+import { getService } from '../utils/serviceRegistry';
+import { SERVICE_NODE_TYPES, initialServiceFor, nodeTypeForService } from '../lib/nodeAvailability';
+import { currentAvailabilityEnv } from '../lib/availabilityEnv';
 import { useClipboard } from './useClipboard';
 import { workflowLogger } from '../utils/logger';
 import { notifyStorageQuotaExceeded, markStorageWriteSucceeded } from '../lib/storageQuota';
@@ -594,8 +597,18 @@ export function useWorkflow(options: UseWorkflowOptions = {}) {
     // that endpoint. See useModuleNodes.tsx for the injection side.
     if (typeof type === 'string' && type.startsWith('service:')) {
       const svcId = type.slice('service:'.length);
-      type = 'service_call' as NodeType;
+      // An OAIY engine model (or a service declaring what it makes) becomes
+      // the node it is for — "OAIY engine · Music · …" drops as Music Gen
+      // with that model picked; anything else as a Service Call.
+      const loader = getModuleLoader();
+      type = nodeTypeForService(getService(svcId), (t) => !!loader.getNodeDefinition(t)) as NodeType;
       extraData = { ...(extraData || {}), service: svcId };
+    } else if (typeof type === 'string' && SERVICE_NODE_TYPES.has(type) && !(extraData && 'service' in extraData)) {
+      // In OAIY's window a service node starts on what can run it: the
+      // engine's default model of its kind, else the first service offered.
+      const env = currentAvailabilityEnv();
+      const initial = env.inOaiy ? initialServiceFor(type, env) : null;
+      if (initial) extraData = { ...(extraData || {}), service: initial };
     }
     const id = `${type}-${uuidv4().slice(0, 8)}`;
     const defaultData = getDefaultNodeData(type, projectSettings);

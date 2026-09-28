@@ -37,3 +37,9 @@ export {
   registerDynamicOptionsResolver,
   subscribeToDynamicOptionsInvalidation,
 } from './hooks/useDynamicOptions.js';
+export {
+  useNodeNotice,
+  getNodeNotice,
+  registerNodeNoticeProvider,
+  type NodeNoticeProvider,
+} from './hooks/useNodeNotice.js';

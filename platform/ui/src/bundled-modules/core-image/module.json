@@ -7,7 +7,7 @@
   "category": "Image",
   "icon": "image",
   "color": "pink",
-  "nodes": ["image_gen", "image_view", "image_save", "image_resize"],
+  "nodes": ["image_gen", "image_view", "image_save", "image_resize", "background_removal", "image_upscale"],
   "permissions": ["network", "filesystem"],
   "runtime": {
     "typescript": "runtime.ts",

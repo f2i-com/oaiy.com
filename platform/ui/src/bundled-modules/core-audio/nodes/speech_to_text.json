@@ -1,7 +1,7 @@
 {
     "id": "speech_to_text",
     "name": "Speech to Text",
-    "description": "Transcribe audio/video to text with word-level timestamps using WhisperX",
+    "description": "Transcribe audio or video to text: with OAIY Voice (service voice:transcribe), a service you add, or a WhisperX server at API URL (word timestamps, speakers).",
     "doc": "Transcribe speech from audio or video files using WhisperX.\n\nFeatures:\n• Word-level timestamps for precise subtitles\n• Speaker diarization (identify who's speaking)\n• Auto language detection or specify language\n• Segment time ranges for partial transcription\n\nOutputs:\n• Full Text - complete transcript as string\n• Segments - array with timestamps & speaker info\n• Language - detected language code\n• Duration - audio length in seconds\n\nRequires: WhisperX API server (default: localhost:8770)\nNote: Speaker diarization requires HuggingFace token.",
     "icon": "file-text",
     "color": "violet",
@@ -71,11 +71,25 @@
     ],
     "properties": [
         {
+            "id": "service",
+            "name": "Service",
+            "type": "select",
+            "default": "",
+            "dynamicOptionsSource": "service:list:speech_to_text",
+            "options": [
+                {
+                    "value": "voice:transcribe",
+                    "label": "OAIY Voice · transcription"
+                }
+            ],
+            "description": "Which service writes out the recording. Blank: the WhisperX server at API URL (timestamps and speakers); OAIY Voice and your own services give the text only."
+        },
+        {
             "id": "apiUrl",
             "name": "API URL",
             "type": "string",
             "default": "http://127.0.0.1:8770/transcribe",
-            "description": "WhisperX STT API endpoint"
+            "description": "The WhisperX server (used when Service is blank)"
         },
         {
             "id": "language",

@@ -16,6 +16,7 @@ import {
   type CustomService,
 } from 'oaiy-core/modules/core-service/examples';
 import { invalidateDynamicOptions } from 'oaiy-ui-components';
+import { resolveService } from 'oaiy-core/modules/core-service/contract';
 import { notifyStorageQuotaExceeded } from '../lib/storageQuota';
 import { listDesktopServices } from '../lib/desktopServices';
 
@@ -67,13 +68,11 @@ export function listCustomServices(): CustomService[] {
 }
 
 export function getService(id: string): CustomService | null {
-  const own = listAllServices().find((s) => s.id === id);
-  if (own) return own;
-  // OAIY-Desktop-managed services (ids prefixed `companion:`) live in a separate
-  // registry. Fall through so the UI can resolve + display a picked companion
-  // service's fields and node title — the compiler already resolves these at
-  // run time, this just keeps the editor in sync.
-  return listDesktopServices().find((s) => s.id === id) ?? null;
+  // The user's own first, then what OAIY Desktop offers (`companion:*`, and
+  // OAIY's engine: `engine:<kind>:<model>`, or `engine:<kind>` for its
+  // default) — the same lookup the compilers use, so the editor shows what
+  // will run.
+  return resolveService(id, { custom: listAllServices(), desktop: listDesktopServices() });
 }
 
 export function saveService(svc: CustomService): void {

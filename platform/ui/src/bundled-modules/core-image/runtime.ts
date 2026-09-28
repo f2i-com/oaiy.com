@@ -6,6 +6,8 @@
  */
 
 import type { RuntimeContext, RuntimeModule, RuntimeMethod } from 'oaiy-core/src/module-types';
+import type { CustomService } from '../core-service/examples';
+import { runContract } from '../core-service/contractRuntime';
 
 // Per-job method factory: methods close over THIS job's ctx (no module-level singleton).
 function createImageMethods(ctx: RuntimeContext): Record<string, RuntimeMethod> {
@@ -1419,8 +1421,43 @@ async function resizeImageWithQuality(
  *
  * IMPORTANT: Module name is 'Image' to match compiler output (Image.generate, Image.save)
  */
+/**
+ * A picture from a contract service (OAIY's engine, or a service that
+ * declares what it makes): a data: URL, shown on the node as it arrives.
+ * Background removal and upscaling take the node's picture as `image`.
+ */
+async function serviceImage(
+  contract: CustomService | string,
+  vars: Record<string, unknown>,
+  nodeId: string,
+  label = 'Image',
+): Promise<string> {
+  ctx.onNodeStatus?.(nodeId, 'running');
+  try {
+    if ('image' in vars && (vars.image == null || vars.image === '')) {
+      throw new Error(`${label}: no picture was given (connect one to the Image input)`);
+    }
+    const r = await runContract(ctx, contract, vars, { nodeId, label });
+    if (!r.image) throw new Error(`${label}: the service made no picture`);
+    ctx.onImage?.(nodeId, r.image);
+    ctx.onNodeStatus?.(nodeId, 'completed');
+    ctx.log('success', `[${label}] done`);
+    return r.image;
+  } catch (e) {
+    ctx.onNodeStatus?.(nodeId, 'error');
+    throw e;
+  }
+}
+
+async function generateService(contract: CustomService | string, vars: Record<string, unknown>, nodeId: string): Promise<string> {
+  if (!vars.prompt) throw new Error('Image Gen: the prompt is empty (connect one to the Prompt input)');
+  return serviceImage(contract, vars, nodeId, 'Image Gen');
+}
+
   return {
     generate,
+    generateService,
+    serviceImage,
     save,
     resize,
   };

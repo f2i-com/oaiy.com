@@ -1,0 +1,16 @@
+{
+  "id": "core-3d",
+  "name": "3D",
+  "version": "1.0.0",
+  "description": "3D models (GLB) from a picture or a description, on OAIY's engine or a service you add",
+  "author": "OAIY Team",
+  "category": "Image",
+  "icon": "box",
+  "color": "orange",
+  "nodes": ["model_3d"],
+  "permissions": ["network", "filesystem"],
+  "runtime": {
+    "typescript": "runtime.ts",
+    "compiler": "compiler.ts"
+  }
+}

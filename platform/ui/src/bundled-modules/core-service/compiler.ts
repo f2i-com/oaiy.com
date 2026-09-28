@@ -15,41 +15,7 @@
  */
 
 import type { ModuleCompiler, ModuleCompilerContext } from 'oaiy-core/src/module-types';
-import { BUILT_IN_SERVICES, type CustomService } from './examples';
-
-const STORAGE_KEY = 'oaiy.customServices';
-// OAIY-Desktop-managed services (Phase 3), published to a separate key by
-// lib/desktopServices.ts while the OAIY Desktop is running. Read
-// inline so this bundled compiler stays self-contained.
-const DESKTOP_SERVICE_STORAGE_KEY = 'oaiy.desktopServices';
-
-function readServiceKey(key: string): CustomService[] {
-  try {
-    if (typeof localStorage === 'undefined') return [];
-    const raw = localStorage.getItem(key);
-    if (!raw) return [];
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? (parsed as CustomService[]) : [];
-  } catch {
-    return [];
-  }
-}
-
-function getCustomServices(): CustomService[] {
-  return readServiceKey(STORAGE_KEY);
-}
-
-function resolveService(id: string): CustomService | null {
-  if (!id) return null;
-  // Custom services first so user edits shadow same-id built-ins, then
-  // live companion services (`companion:*` ids), then built-in examples.
-  const all = [
-    ...getCustomServices(),
-    ...readServiceKey(DESKTOP_SERVICE_STORAGE_KEY),
-    ...BUILT_IN_SERVICES,
-  ];
-  return all.find((s) => s.id === id) ?? null;
-}
+import { contractLiteral, isContractService, resolveService } from './contract';
 
 function firstNonEmpty(...vals: (string | undefined | null)[]): string {
   for (const v of vals) {
@@ -73,6 +39,11 @@ const CoreServiceCompiler: ModuleCompiler = {
 
     const presetId = (data.service as string) || '';
     const preset = resolveService(presetId);
+    // A contract service (OAIY's engine models, a rig that declares what it
+    // makes or a job to follow) runs through Service.callContract: its body
+    // is rendered with missing values as null, jobs are followed, and a file
+    // it makes is kept. Inline fields still override the preset's.
+    const contract = contractLiteral(presetId, preset);
 
     const endpoint = firstNonEmpty(data.endpoint as string, preset?.endpoint);
     const method = firstNonEmpty(data.method as string, preset?.method, 'POST');
@@ -122,6 +93,32 @@ const CoreServiceCompiler: ModuleCompiler = {
     const modelLit = `model: ${JSON.stringify(model)}`;
     const systemLit = `system: ${JSON.stringify(systemMessage)}`;
     let varsExpr: string;
+    if (contract) {
+      // Every declared input by id, plus `input`, `prompt` (the first wired
+      // pin, for a template that names the prompt) and the model.
+      const declared = preset?.inputs ?? [];
+      const parts = declared.map((inp) => `${JSON.stringify(inp.id)}: ${inputs.get(inp.id) || 'null'}`);
+      const first = inputs.get('input') || inputs.get('default') || (declared[0] ? inputs.get(declared[0].id) : undefined) || 'null';
+      if (!declared.some((d) => d.id === 'input')) parts.push(`input: ${first}`);
+      if (!declared.some((d) => d.id === 'prompt')) parts.push(`prompt: ${first}`);
+      parts.push(modelLit, systemLit);
+      const merged = isContractService(preset)
+        ? JSON.stringify({
+            ...preset,
+            endpoint: firstNonEmpty(data.endpoint as string, preset.endpoint),
+            method: firstNonEmpty(data.method as string, preset.method, 'POST'),
+            bodyTemplate: firstNonEmpty(data.bodyTemplate as string, preset.bodyTemplate),
+            responsePath: firstNonEmpty(data.responsePath as string, preset.responsePath),
+          })
+        : contract;
+      return `
+  ${letOrAssign}${outputVar} = await Service.callContract(
+    ${merged},
+    { ${parts.join(', ')} },
+    "${node.id}"
+  );
+  workflow_context["${node.id}"] = ${outputVar};`;
+    }
     if (declaredInputs.length > 0) {
       const reserved = new Set(declaredInputs.map((inp) => inp.id));
       const parts = declaredInputs.map((inp) => {

@@ -1,5 +1,83 @@
 [
  {
+  "type": "model_3d",
+  "name": "3D Model",
+  "module": "core-3d",
+  "description": "Make a 3D model (GLB with PBR materials) from a picture of an object, or from a description (a picture is made first). Runs on OAIY's engine (service engine:model3d) or a service you add.",
+  "inputs": [
+   {
+    "id": "image",
+    "type": "image"
+   },
+   {
+    "id": "prompt",
+    "type": "string"
+   }
+  ],
+  "outputs": [
+   {
+    "id": "model",
+    "type": "any"
+   },
+   {
+    "id": "path",
+    "type": "string"
+   },
+   {
+    "id": "picture",
+    "type": "image"
+   }
+  ],
+  "properties": [
+   {
+    "id": "service",
+    "type": "select",
+    "default": "engine:model3d",
+    "options": [
+     "engine:model3d"
+    ]
+   },
+   {
+    "id": "prompt",
+    "type": "textarea"
+   },
+   {
+    "id": "pictureService",
+    "type": "select",
+    "default": "engine:image",
+    "options": [
+     "engine:image"
+    ]
+   },
+   {
+    "id": "resolution",
+    "type": "select",
+    "default": 1024,
+    "options": [
+     1024,
+     1536
+    ]
+   },
+   {
+    "id": "faces",
+    "type": "number",
+    "default": 200000,
+    "advanced": true
+   },
+   {
+    "id": "seed",
+    "type": "number",
+    "default": -1,
+    "advanced": true
+   },
+   {
+    "id": "filename",
+    "type": "string",
+    "default": "model"
+   }
+  ]
+ },
+ {
   "type": "ask_agent",
   "name": "Ask the Agent",
   "module": "core-agent",
@@ -285,7 +363,7 @@
   "type": "music_gen",
   "name": "Music Gen",
   "module": "core-audio",
-  "description": "Generate music from text descriptions and optional lyrics using ACE-Step AI.",
+  "description": "Generate music from a description and optional lyrics: with OAIY's engine (service engine:music), a service you add, or an ACE-Step / HeartMuLa server at API URL.",
   "inputs": [
    {
     "id": "prompt",
@@ -311,6 +389,16 @@
    }
   ],
   "properties": [
+   {
+    "id": "service",
+    "type": "select",
+    "default": "ace-step",
+    "options": [
+     "engine:music",
+     "ace-step",
+     "heartmula"
+    ]
+   },
    {
     "id": "apiUrl",
     "type": "string",
@@ -399,10 +487,62 @@
   ]
  },
  {
+  "type": "sound_effect",
+  "name": "Sound Effect",
+  "module": "core-audio",
+  "description": "Make a sound effect (ambience, creatures, machines, actions) from a description, up to 30 seconds. Runs on OAIY's engine or a service you add; service engine:sound is the engine's.",
+  "inputs": [
+   {
+    "id": "prompt",
+    "type": "string"
+   }
+  ],
+  "outputs": [
+   {
+    "id": "audio",
+    "type": "audio"
+   },
+   {
+    "id": "path",
+    "type": "string"
+   }
+  ],
+  "properties": [
+   {
+    "id": "service",
+    "type": "select",
+    "default": "engine:sound",
+    "options": [
+     "engine:sound"
+    ]
+   },
+   {
+    "id": "prompt",
+    "type": "textarea"
+   },
+   {
+    "id": "seconds",
+    "type": "number",
+    "default": 10
+   },
+   {
+    "id": "seed",
+    "type": "number",
+    "default": -1,
+    "advanced": true
+   },
+   {
+    "id": "filename",
+    "type": "string",
+    "default": "sound_effect"
+   }
+  ]
+ },
+ {
   "type": "speech_to_text",
   "name": "Speech to Text",
   "module": "core-audio",
-  "description": "Transcribe audio/video to text with word-level timestamps using WhisperX",
+  "description": "Transcribe audio or video to text: with OAIY Voice (service voice:transcribe), a service you add, or a WhisperX server at API URL (word timestamps, speakers).",
   "inputs": [
    {
     "id": "media",
@@ -436,6 +576,13 @@
    }
   ],
   "properties": [
+   {
+    "id": "service",
+    "type": "select",
+    "options": [
+     "voice:transcribe"
+    ]
+   },
    {
     "id": "apiUrl",
     "type": "string",
@@ -475,7 +622,7 @@
   "type": "text_to_speech",
   "name": "Text to Speech",
   "module": "core-audio",
-  "description": "Convert text to natural speech. Internal mode uses the OAIY DramaBox engine (local, fast, voice cloning). External mode drives any HTTP TTS service (ElevenLabs, OpenAI, Chatterbox, your own).",
+  "description": "Convert text to natural speech. Internal mode uses the OAIY DramaBox engine (local, fast, voice cloning). External mode drives any HTTP TTS service (ElevenLabs, OpenAI, Chatterbox, your own). Service engine:speech is OAI",
   "inputs": [
    {
     "id": "text",
@@ -503,7 +650,10 @@
   "properties": [
    {
     "id": "service",
-    "type": "select"
+    "type": "select",
+    "options": [
+     "engine:speech"
+    ]
    },
    {
     "id": "provider",
@@ -1544,6 +1694,34 @@
   ]
  },
  {
+  "type": "background_removal",
+  "name": "Remove Background",
+  "module": "core-image",
+  "description": "Cut the subject out of a picture: the same picture with its background made transparent (PNG). Runs on OAIY's engine (BiRefNet) or a service you add; service engine:background is the engine's.",
+  "inputs": [
+   {
+    "id": "image",
+    "type": "image"
+   }
+  ],
+  "outputs": [
+   {
+    "id": "image",
+    "type": "image"
+   }
+  ],
+  "properties": [
+   {
+    "id": "service",
+    "type": "select",
+    "default": "engine:background",
+    "options": [
+     "engine:background"
+    ]
+   }
+  ]
+ },
+ {
   "type": "image_gen",
   "name": "Image Gen",
   "module": "core-image",
@@ -1756,6 +1934,43 @@
     "type": "number",
     "default": 95,
     "advanced": true
+   }
+  ]
+ },
+ {
+  "type": "image_upscale",
+  "name": "Upscale Image",
+  "module": "core-image",
+  "description": "Make a picture two or four times larger with its detail restored (PNG). Runs on OAIY's engine (Real-ESRGAN) or a service you add; service engine:upscale is the engine's.",
+  "inputs": [
+   {
+    "id": "image",
+    "type": "image"
+   }
+  ],
+  "outputs": [
+   {
+    "id": "image",
+    "type": "image"
+   }
+  ],
+  "properties": [
+   {
+    "id": "service",
+    "type": "select",
+    "default": "engine:upscale",
+    "options": [
+     "engine:upscale"
+    ]
+   },
+   {
+    "id": "scale",
+    "type": "select",
+    "default": 4,
+    "options": [
+     2,
+     4
+    ]
    }
   ]
  },
@@ -2506,7 +2721,7 @@
   "type": "video_gen",
   "name": "Video Gen",
   "module": "core-video",
-  "description": "Generate videos using ComfyUI workflows or other local video APIs.",
+  "description": "Generate videos with OAIY's engine (service engine:video; a start picture on Image), ComfyUI workflows or other local video APIs.",
   "inputs": [
    {
     "id": "prompt",
@@ -2542,7 +2757,10 @@
   "properties": [
    {
     "id": "service",
-    "type": "select"
+    "type": "select",
+    "options": [
+     "engine:video"
+    ]
    },
    {
     "id": "apiFormat",

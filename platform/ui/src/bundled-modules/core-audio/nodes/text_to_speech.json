@@ -1,7 +1,7 @@
 {
     "id": "text_to_speech",
     "name": "Text to Speech",
-    "description": "Convert text to natural speech. Internal mode uses the OAIY DramaBox engine (local, fast, voice cloning). External mode drives any HTTP TTS service (ElevenLabs, OpenAI, Chatterbox, your own).",
+    "description": "Convert text to natural speech. Internal mode uses the OAIY DramaBox engine (local, fast, voice cloning). External mode drives any HTTP TTS service (ElevenLabs, OpenAI, Chatterbox, your own). Service engine:speech is OAIY's engine.",
     "doc": "Generate natural-sounding speech from text.\n\n## Two modes\n\n**Internal** — DramaBox running natively in OAIY (no Python, no server). Realtime on a recent GPU. Connect a 5-15 s reference wav to the **voice** pin for voice cloning.\n\n**External** — drive any HTTP TTS endpoint via a request/response template. Presets ship for ElevenLabs, OpenAI, Chatterbox, and Qwen3; pick **Custom** to point at your own service.\n\n## Pins\n\n• **Text (in)** — what to say\n• **Description (in)** — optional voice-style hint (overrides the Voice Description field when connected)\n• **Voice (in)** — reference wav for voice cloning (Internal) or to fill `{{voiceRefPath}}` (External)\n• **Audio (out)** — playable media URL\n• **Path (out)** — absolute file path for Save Audio / FFmpeg / diffusion-video audio input",
     "icon": "mic",
     "color": "teal",
@@ -60,7 +60,8 @@
             "type": "select",
             "default": "",
             "dynamicOptionsSource": "service:list:text_to_speech",
-            "description": "Pick a registered TTS service (manage in Settings → Services) to auto-fill the URL + headers + body template. Inline external* fields below still override. Leave blank to fill manually."
+            "options": [{ "value": "engine:speech", "label": "OAIY engine · default model" }],
+            "description": "Pick a speech model or service. OAIY engine: Speaker names a saved voice (or an OpenAI voice name) and Voice Description describes one. Blank: the Mode fields below. Add models in OAIY's Engines, services in OAIY's Services or Settings → Services."
         },
         {
             "id": "provider",

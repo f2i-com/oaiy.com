@@ -4,6 +4,10 @@ export interface SelectOption {
   value: string | number;
   label: string;
   description?: string;
+  /** Options sharing a group are shown under it (<optgroup>), in first-seen order. */
+  group?: string;
+  /** Picking it runs this instead of changing the value ("Add a service…"). */
+  action?: () => void;
 }
 
 export interface SelectFieldProps {
@@ -34,12 +38,33 @@ export const SelectField: React.FC<SelectFieldProps> = ({
   const handleChange = useCallback(
     (e: React.ChangeEvent<HTMLSelectElement>) => {
       const selectedOption = options.find(opt => String(opt.value) === e.target.value);
+      if (selectedOption?.action) {
+        // An action, not a value: run it and show the value as it was.
+        e.target.value = value !== undefined ? String(value) : '';
+        selectedOption.action();
+        return;
+      }
       if (selectedOption) {
         onChange(selectedOption.value);
       }
     },
-    [onChange, options]
+    [onChange, options, value]
   );
+
+  const optionClass = 'bg-[rgb(var(--color-bg-elevated))] text-[rgb(var(--color-text-primary))]';
+  const renderOption = (option: SelectOption) => (
+    <option key={String(option.value)} value={String(option.value)} title={option.description} className={optionClass}>
+      {option.label}
+    </option>
+  );
+  // Ungrouped options first, then each group in the order it first appears.
+  const groups: Array<[string, SelectOption[]]> = [];
+  for (const option of options) {
+    if (!option.group) continue;
+    const found = groups.find(([name]) => name === option.group);
+    if (found) found[1].push(option);
+    else groups.push([option.group, [option]]);
+  }
 
   return (
     <div className={`flex flex-col gap-1 ${className}`}>
@@ -69,10 +94,11 @@ export const SelectField: React.FC<SelectFieldProps> = ({
               {String(value)} (unavailable)
             </option>
           )}
-        {options.map((option) => (
-          <option key={String(option.value)} value={String(option.value)} className="bg-[rgb(var(--color-bg-elevated))] text-[rgb(var(--color-text-primary))]">
-            {option.label}
-          </option>
+        {options.filter((option) => !option.group).map(renderOption)}
+        {groups.map(([name, list]) => (
+          <optgroup key={name} label={name}>
+            {list.map(renderOption)}
+          </optgroup>
         ))}
       </select>
       {description && (

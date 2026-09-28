@@ -52,48 +52,24 @@ const uiGlob = import.meta.glob('./bundled-modules/*/ui/index.ts');
 // removing it from the vendor, add its id here.
 const WEB_INCOMPATIBLE_MODULES = new Set<string>([]);
 
-// Individual node ids the web build hides — usually because they only
+// Individual node ids the web build does not register at all — they only
 // make sense alongside a specific desktop-only engine (video_avatar
 // drives the desktop avatar generator; comfyui_free_memory pokes a
 // ComfyUI VRAM-eviction endpoint that's a no-op without our desktop
-// model-manager around it). Add ids here to hide them from the palette
-// without touching the shared module manifests.
+// model-manager around it; video_downloader shells out to ffmpeg/yt-dlp
+// behind the scenes, which only works in the desktop bundle).
+//
+// The typed AI nodes (ai_llm, image_gen, video_gen, text_to_speech,
+// music_gen, speech_to_text) are NOT here any more: they are always
+// registered — so a saved flow using one opens, compiles and runs — and
+// whether the PALETTE offers one is decided by lib/nodeAvailability.ts:
+// outside OAIY they stay folded into Service Call + a preset, as since
+// 2026-05-28; in OAIY's window each shows when something installed (an
+// engine model, a desktop service, a service of the user's) can run it.
 const WEB_HIDDEN_NODE_IDS = new Set<string>([
   'video_avatar',
   'comfyui_free_memory',
-  // Hidden in the local-first web build because the unified Services
-  // path doesn't cover them yet:
-  //  - `video_downloader` shells out to ffmpeg/yt-dlp behind the scenes,
-  //    which only works in the desktop bundle.
-  //  - `speech_to_text` has no service-tag wiring (no Whisper / Deepgram
-  //    service preset listed for it). Until either lands, hiding both
-  //    avoids users wiring up a node that silently no-ops in the browser.
   'video_downloader',
-  'speech_to_text',
-  // `music_gen` is structurally identical to a custom HTTP service
-  // (text → audio file). Hide it from the palette; users wire up a
-  // Music Gen service in Settings → Services using the dedicated
-  // template, then drop a Text-to-Speech node + pick that service.
-  'music_gen',
-  // ---------------------------------------------------------------
-  // Typed nodes folded into the generic Service Call (2026-05-28)
-  // ---------------------------------------------------------------
-  // The web build doesn't ship its own AI engines, so AI LLM / Image
-  // Gen / Video Gen / TTS were always going to be "pick a service and
-  // call it" anyway. With per-node-type Quick-Add templates landing in
-  // Settings → Services (one click → a pre-filled openai-chat /
-  // image-gen-generic / video-gen-generic / tts-generic / music-gen
-  // service), there's no remaining reason to expose four near-identical
-  // typed palette entries. Each becomes a Service: dropped from the
-  // palette as a synthetic Service Call with the right preset baked in.
-  //
-  // Existing saved flows with `type: ai_llm` etc. keep working — the
-  // compiler + runtime path is untouched. They just don't appear in
-  // the palette for NEW drops.
-  'ai_llm',
-  'image_gen',
-  'video_gen',
-  'text_to_speech',
   // ---------------------------------------------------------------
   // ffmpeg-dependent nodes — most now route through ffmpeg.wasm
   // (tauri-shim/ffmpeg.ts) via the run_command shim. Only the ones that
@@ -144,6 +120,12 @@ const WEB_FORCE_GENERIC_NODES = new Set<string>([
   'image_gen',
   'video_gen',
   'text_to_speech',
+  // Their custom components predate the Service picker (MusicGenNode's own
+  // select writes ace-step/heartmula into `service`); the JSON-driven node
+  // shows the picker with the engine's models, the desktop's services and
+  // the user's, and the notice when the picked one is not installed.
+  'music_gen',
+  'speech_to_text',
 ]);
 
 // Extract the module id from a glob key. Paths look like

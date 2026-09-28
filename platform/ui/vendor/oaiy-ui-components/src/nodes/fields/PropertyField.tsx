@@ -172,6 +172,8 @@ export const PropertyField: React.FC<PropertyFieldProps> = ({
             value: opt.value as string | number,
             label: opt.label,
             description: opt.description,
+            group: opt.group,
+            action: opt.action,
           }))}
         />
       );

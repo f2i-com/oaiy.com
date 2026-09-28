@@ -5,35 +5,18 @@
  */
 
 import type { ModuleCompiler, ModuleCompilerContext } from 'oaiy-core/src/module-types';
-import { BUILT_IN_SERVICES, type CustomService } from '../core-service/examples';
-
-// Service-preset lookup — same shape as core-ai + core-service. Lets the
-// user pick a registered service in the property panel; its endpoint /
-// model / apiKeyConstant fill in below explicit data.* fields so picking
-// a service replaces the per-provider hardcoded defaults.
-const SERVICE_STORAGE_KEY = 'oaiy.customServices';
-function getCustomServices(): CustomService[] {
-  try {
-    if (typeof localStorage === 'undefined') return [];
-    const raw = localStorage.getItem(SERVICE_STORAGE_KEY);
-    if (!raw) return [];
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? (parsed as CustomService[]) : [];
-  } catch {
-    return [];
-  }
-}
-function resolveService(id: string): CustomService | null {
-  if (!id) return null;
-  const all = [...getCustomServices(), ...BUILT_IN_SERVICES];
-  return all.find((s) => s.id === id) ?? null;
-}
+// Service-preset lookup shared with every compiler (core-service/contract.ts):
+// the user's services, OAIY Desktop's (its services, OAIY's engine models)
+// and the built-in examples. A picked service's endpoint / model /
+// apiKeyConstant fill in below explicit data.* fields; an engine model (or
+// any service that declares what it makes) runs as a contract instead.
+import { contractModel, nodeContract, resolveService } from '../core-service/contract';
 
 const CoreImageCompiler: ModuleCompiler = {
   name: 'Image',
 
   getNodeTypes() {
-    return ['image_gen', 'image_view', 'image_save', 'image_resize'];
+    return ['image_gen', 'image_view', 'image_save', 'image_resize', 'background_removal', 'image_upscale'];
   },
 
   compileNode(nodeType: string, ctx: ModuleCompilerContext): string | null {
@@ -62,7 +45,42 @@ const CoreImageCompiler: ModuleCompiler = {
           defaultImageApiKeyConstant?: string;
           defaultImageServiceId?: string;
         } | undefined;
-        const preset = resolveService(String(data.service || projectSettings?.defaultImageServiceId || ''));
+        const serviceId = String(data.service || projectSettings?.defaultImageServiceId || '');
+        const preset = resolveService(serviceId);
+        // OAIY's engine (or a service declaring its output): Image.generateService.
+        const contract = nodeContract(serviceId, preset);
+        if (contract) {
+          const imageVars: string[] = [];
+          for (let i = 0; i < (Number(data.imageInputCount) || 0); i++) {
+            const v = inputs.get(`image_${i}`) || (i === 0 ? inputs.get('image') : undefined);
+            if (v) imageVars.push(v);
+          }
+          if (imageVars.length === 0 && inputs.get('image')) imageVars.push(inputs.get('image')!);
+          const width = Number(data.width) || 1024;
+          const height = Number(data.height) || 1024;
+          code += `
+  ${letOrAssign}${outputVar} = null;
+  let ${outputVar}_image = null;
+  if (${promptInputVar} === null) {
+    console.log("[Image Gen] (${node.id}) Skipped - prompt is null");
+    workflow_context["${node.id}"] = null;
+  } else {
+    ${outputVar} = await Image.generateService(
+      ${contract},
+      {
+        prompt: [${JSON.stringify(String(data.prompt || ''))}, typeof ${promptInputVar} === 'string' ? ${promptInputVar} : ''].filter(Boolean).join("\\n"),
+        negative_prompt: ${JSON.stringify(String(data.negativePrompt || ''))},
+        size: ${JSON.stringify(`${width}x${height}`)},
+        images: [${imageVars.join(', ')}].filter((x) => x != null),
+        model: ${JSON.stringify(contractModel(preset, data.model))},
+      },
+      "${node.id}"
+    );
+    ${outputVar}_image = ${outputVar};
+    workflow_context["${node.id}"] = ${outputVar};
+  }`;
+          break;
+        }
         const endpoint = escapeString(String(
           data.endpoint || preset?.endpoint || projectSettings?.defaultImageEndpoint || ''
         ));
@@ -305,6 +323,31 @@ const CoreImageCompiler: ModuleCompiler = {
     return workflow_context;
   }
   // Create suffixed output variable for 'image' output handle
+  let ${outputVar}_image = ${outputVar};
+  workflow_context["${node.id}"] = ${outputVar};`;
+        break;
+      }
+
+      case 'background_removal':
+      case 'image_upscale': {
+        // OAIY's engine by default (BiRefNet / Real-ESRGAN), or any service
+        // picked for the node: the picture in, a picture (PNG data URL) out.
+        const kind = nodeType === 'background_removal' ? 'background' : 'upscale';
+        const serviceId = String(data.service || `engine:${kind}`);
+        const preset = resolveService(serviceId);
+        const contract = nodeContract(serviceId, preset, 'image') ?? JSON.stringify(serviceId);
+        const imageVar = inputs.get('image') || 'null';
+        const scale = Number(data.scale) === 2 ? 2 : 4;
+        const vars = kind === 'upscale'
+          ? `{ image: ${imageVar}, scale: ${scale}, model: ${JSON.stringify(contractModel(preset, ''))} }`
+          : `{ image: ${imageVar}, model: ${JSON.stringify(contractModel(preset, ''))} }`;
+        code += `
+  ${letOrAssign}${outputVar} = await Image.serviceImage(
+    ${contract},
+    ${vars},
+    "${node.id}",
+    ${JSON.stringify(kind === 'upscale' ? 'Upscale' : 'Remove Background')}
+  );
   let ${outputVar}_image = ${outputVar};
   workflow_context["${node.id}"] = ${outputVar};`;
         break;

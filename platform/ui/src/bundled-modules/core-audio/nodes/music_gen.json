@@ -1,8 +1,8 @@
 {
     "id": "music_gen",
     "name": "Music Gen",
-    "description": "Generate music from text descriptions and optional lyrics using ACE-Step AI.",
-    "doc": "Generate AI music from text prompts using ACE-Step.\n\nPrompt Tips:\n• Include genre: pop, rock, electronic, jazz\n• Specify mood: energetic, calm, melancholic\n• Add instruments: piano, guitar, synth\n• Describe vocals: male/female, soft, powerful\n\nLyrics Format:\n[verse] First verse lyrics here\n[chorus] Catchy chorus lyrics\n[bridge] Bridge section\n\nSettings:\n• Duration: 10-240 seconds\n• Quality Steps: higher = better but slower\n• Seed: use same seed for reproducible results\n\nRequires: ACE-Step API server (default: localhost:8766)",
+    "description": "Generate music from a description and optional lyrics: with OAIY's engine (service engine:music), a service you add, or an ACE-Step / HeartMuLa server at API URL.",
+    "doc": "Generate AI music from text prompts using ACE-Step.\n\nPrompt Tips:\n• Include genre: pop, rock, electronic, jazz\n• Specify mood: energetic, calm, melancholic\n• Add instruments: piano, guitar, synth\n• Describe vocals: male/female, soft, powerful\n\nLyrics Format:\n[verse] First verse lyrics here\n[chorus] Catchy chorus lyrics\n[bridge] Bridge section\n\nSettings:\n• Duration: 10-240 seconds\n• Quality Steps: higher = better but slower\n• Seed: use same seed for reproducible results\n\nService: `OAIY engine` uses the music model set up in OAIY's Engines (songs with vocals; no lyrics makes an instrumental). Your own services (a Python rig in OAIY → Services, or a custom HTTP service) are sent `{{prompt}}`, `{{lyrics}}`, `{{duration}}`, `{{instrumental}}` and `{{seed}}`. `ACE-Step` / `HeartMuLa` call that server at API URL (default: localhost:8766).",
     "icon": "music",
     "color": "purple",
     "tags": [
@@ -55,11 +55,33 @@
     ],
     "properties": [
         {
+            "id": "service",
+            "name": "Service",
+            "type": "select",
+            "default": "ace-step",
+            "dynamicOptionsSource": "service:list:music_gen",
+            "options": [
+                {
+                    "value": "engine:music",
+                    "label": "OAIY engine · default model"
+                },
+                {
+                    "value": "ace-step",
+                    "label": "ACE-Step server (API URL)"
+                },
+                {
+                    "value": "heartmula",
+                    "label": "HeartMuLa server (API URL)"
+                }
+            ],
+            "description": "Which model or service makes the music. Add models in OAIY's Engines, or your own services (Python rigs) in OAIY's Services."
+        },
+        {
             "id": "apiUrl",
             "name": "API URL",
             "type": "string",
             "default": "http://127.0.0.1:8766/generate",
-            "description": "ACE-Step API endpoint"
+            "description": "The ACE-Step / HeartMuLa server (used only when Service is one of them)"
         },
         {
             "id": "prompt",
@@ -83,9 +105,9 @@
             "type": "number",
             "default": 60,
             "min": 10,
-            "max": 240,
+            "max": 360,
             "step": 5,
-            "description": "Length of generated audio (10-240 seconds)"
+            "description": "Length of the music in seconds (ACE-Step: 10-240; OAIY engine: up to 360)"
         },
         {
             "id": "inferSteps",
@@ -129,7 +151,8 @@
     "compiler": {
         "customHandler": true,
         "async": true,
-        "statusTracking": true
+        "statusTracking": true,
+        "abortable": true
     },
     "ui": {
         "width": 320,

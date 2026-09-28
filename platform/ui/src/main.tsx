@@ -18,31 +18,19 @@ installConsoleBuffer();
 //   service:list                 — every registered service (Service Call uses this).
 //   service:list:<nodeType>      — only services tagged for the given node type;
 //                                  e.g. `service:list:ai_llm` for the AI LLM dropdown.
-import { registerDynamicOptionsResolver } from 'oaiy-ui-components';
-import { listAllServices } from './utils/serviceRegistry';
-import { listDesktopServices } from './lib/desktopServices';
-import {
-  filterServicesForNodeType,
-  type ServiceNodeTag,
-} from 'oaiy-core/modules/core-service/examples';
-registerDynamicOptionsResolver('service:list', (rest: string) => {
-  // User-saved services first, then any services the OAIY Desktop is
-  // currently running (Phase 3). OAIY Desktop entries carry a `companion:`
-  // id prefix so they never collide with the user's own.
-  const all = [...listAllServices(), ...listDesktopServices()];
-  const filtered = filterServicesForNodeType(all, (rest as ServiceNodeTag) || '');
-  const isDesktop = (id: string) => id.startsWith('companion:');
-  return [
-    { value: '', label: rest ? '(none — use the fields below)' : '(none — fill fields inline)' },
-    ...filtered.map((s) => ({
-      value: s.id,
-      label: isDesktop(s.id) ? `${s.name}` : s.name,
-      description: isDesktop(s.id)
-        ? (s.description || 'Running in the OAIY Desktop')
-        : s.description || (s.isBuiltIn ? 'Built-in example' : 'Custom service'),
-    })),
-  ];
-});
+import { registerDynamicOptionsResolver, registerNodeNoticeProvider } from 'oaiy-ui-components';
+import { serviceOptions } from './lib/serviceOptions';
+import { nodeNotice } from './lib/nodeAvailability';
+import { currentAvailabilityEnv } from './lib/availabilityEnv';
+// Every Service dropdown: OAIY's engine models, the desktop's services (Python
+// rigs, Ollama …) and the user's own, grouped, with "Add a service…" last.
+registerDynamicOptionsResolver('service:list', (rest: string) =>
+  serviceOptions(rest, currentAvailabilityEnv(), (nodeType) => {
+    void import('./lib/addServiceDialog').then((m) => m.openAddServiceDialog(nodeType));
+  }),
+);
+// A node in a flow whose service is not installed says so on the node.
+registerNodeNoticeProvider((nodeType, data) => nodeNotice(nodeType, data, currentAvailabilityEnv()));
 
 // Dynamic module discovery - MUST be imported first before any module access
 import './dynamicModules';

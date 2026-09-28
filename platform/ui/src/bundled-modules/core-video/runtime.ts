@@ -12,6 +12,8 @@
  */
 
 import type { RuntimeContext, RuntimeModule } from 'oaiy-core';
+import type { CustomService } from '../core-service/examples';
+import { runContract } from '../core-service/contractRuntime';
 import type { RuntimeMethod } from 'oaiy-core/src/module-types';
 import { applyVideoOverrides, analyzeComfyUIVideoWorkflow } from './comfyui-video-analyzer';
 
@@ -2222,7 +2224,30 @@ async function downloadVideo(
 // Runtime Module Export
 // ============================================
 
+/**
+ * A video from a contract service (OAIY's engine, or a service that declares
+ * what it makes): the clip kept in the temp folder; its path is what the
+ * node passes on, like the node's other backends.
+ */
+async function generateService(contract: CustomService | string, vars: Record<string, unknown>, nodeId: string): Promise<string> {
+  ctx.onNodeStatus?.(nodeId, 'running');
+  try {
+    if (vars.prompt == null || String(vars.prompt).trim() === '') {
+      throw new Error('Video Gen: the prompt is empty (connect one to the Prompt input)');
+    }
+    const r = await runContract(ctx, contract, vars, { nodeId, filename: 'video', label: 'Video Gen' });
+    if (!r.path) throw new Error('Video Gen: the service returned no video');
+    ctx.onNodeStatus?.(nodeId, 'completed');
+    ctx.log('success', `[VideoGen] ${r.path}`);
+    return r.path;
+  } catch (e) {
+    ctx.onNodeStatus?.(nodeId, 'error');
+    throw e;
+  }
+}
+
   return {
+    generateService,
     getInfo,
     extract,
     extractAtTimestamps,

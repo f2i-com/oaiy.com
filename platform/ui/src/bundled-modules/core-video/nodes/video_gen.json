@@ -1,7 +1,7 @@
 {
     "id": "video_gen",
     "name": "Video Gen",
-    "description": "Generate videos using ComfyUI workflows or other local video APIs.",
+    "description": "Generate videos with OAIY's engine (service engine:video; a start picture on Image), ComfyUI workflows or other local video APIs.",
     "doc": "Generate AI videos from prompts or images.\n\nSupported Backends:\n• ComfyUI (custom workflows)\n• Any local/HTTP video API (set the endpoint per node)\n\nModes:\n• Text-to-video: Describe what you want\n• Image-to-video: Animate a source image\n\nSettings:\n• Frame Count - number of frames to generate\n• Width/Height - video dimensions\n• Frame Rate - output FPS\n\nTip: Use 'Free Memory' node before video generation to prevent out-of-memory errors.",
     "icon": "video",
     "color": "orange",
@@ -94,6 +94,7 @@
             "type": "select",
             "default": "",
             "dynamicOptionsSource": "service:list:video_gen",
+            "options": [{ "value": "engine:video", "label": "OAIY engine · default model" }],
             "description": "Pick a registered video-gen service (manage in Settings → Services) to auto-fill endpoint. Fields below still override the preset. Leave blank to use the inline Backend dropdown below."
         },
         {

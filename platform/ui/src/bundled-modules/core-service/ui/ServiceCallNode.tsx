@@ -21,14 +21,11 @@
  */
 
 import { memo, useEffect, useMemo, useState } from 'react';
-import { Position } from '@xyflow/react';
+import { Position, useStore } from '@xyflow/react';
 import { CollapsibleNodeWrapper, type HandleConfig } from 'oaiy-ui-components';
-import { subscribeToDynamicOptionsInvalidation } from 'oaiy-ui-components';
-import {
-  BUILT_IN_SERVICES,
-  type CustomService,
-  type ServiceInputDecl,
-} from '../examples';
+import { subscribeToDynamicOptionsInvalidation, useNodeNotice } from 'oaiy-ui-components';
+import type { ServiceInputDecl } from '../examples';
+import { resolveService as lookupService } from '../contract';
 
 interface ServiceCallNodeData {
   service?: string;
@@ -39,37 +36,15 @@ interface ServiceCallNodeData {
 }
 
 interface ServiceCallNodeProps {
+  id?: string;
   data: ServiceCallNodeData;
 }
 
-const STORAGE_KEY = 'oaiy.customServices';
-// Services the OAIY Desktop is exposing — published here by
-// lib/desktopServices.ts (ids prefixed `companion:`). Read so a dragged or
-// picked companion service resolves on the CANVAS too, not just in the
-// Properties panel (whose getService() already falls through to these).
-const DESKTOP_STORAGE_KEY = 'oaiy.desktopServices';
-
-function readKey(key: string): CustomService[] {
-  try {
-    if (typeof localStorage === 'undefined') return [];
-    const raw = localStorage.getItem(key);
-    if (!raw) return [];
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? (parsed as CustomService[]) : [];
-  } catch {
-    return [];
-  }
-}
-
-function readCustomServices(): CustomService[] {
-  return readKey(STORAGE_KEY);
-}
-
-function resolveService(id?: string): CustomService | null {
-  if (!id) return null;
-  // Custom + companion services first so user edits shadow same-id built-ins.
-  const all = [...readCustomServices(), ...readKey(DESKTOP_STORAGE_KEY), ...BUILT_IN_SERVICES];
-  return all.find((s) => s.id === id) ?? null;
+// The same lookup the compiler uses (core-service/contract.ts): the user's
+// services, OAIY Desktop's (its services, OAIY's engine models) and the
+// built-in examples — so a dragged or picked one resolves on the canvas too.
+function resolveService(id?: string) {
+  return id ? lookupService(id) : null;
 }
 
 // Pin-type → handle color. Mirrors the convention image_gen / video_gen
@@ -127,7 +102,7 @@ function renderIcon(emoji: string | undefined) {
   return DefaultServiceIcon;
 }
 
-function ServiceCallNode({ data }: ServiceCallNodeProps) {
+function ServiceCallNode({ id: nodeId, data }: ServiceCallNodeProps) {
   // Bump on every Services-registry change so the resolved service +
   // derived handles refresh without forcing a workflow reload.
   const [refreshTick, setRefreshTick] = useState(0);
@@ -136,9 +111,21 @@ function ServiceCallNode({ data }: ServiceCallNodeProps) {
   }, []);
 
   const service = useMemo(() => resolveService(data.service), [data.service, refreshTick]);
+  // Picked, but not installed here (a model removed from Engines, a service
+  // uninstalled): the node says so, and keeps the pins its edges use.
+  const notice = useNodeNotice('service_call', data as Record<string, unknown>);
+  const missing = !!data.service && !service;
+  const wiredInputs = useStore((st) =>
+    missing && nodeId
+      ? st.edges.filter((e) => e.target === nodeId && e.targetHandle).map((e) => e.targetHandle as string).sort().join('|')
+      : '',
+  );
 
   const declaredInputs: ServiceInputDecl[] = useMemo(() => {
     if (service?.inputs && service.inputs.length > 0) return service.inputs;
+    if (missing && wiredInputs) {
+      return wiredInputs.split('|').filter((v, i, a) => a.indexOf(v) === i).map((pin) => ({ id: pin, name: pin, type: 'any' as const }));
+    }
     return [
       {
         id: 'input',
@@ -147,7 +134,7 @@ function ServiceCallNode({ data }: ServiceCallNodeProps) {
         description: 'Substituted into the body template as {{input}} / {{inputRaw}}.',
       },
     ];
-  }, [service]);
+  }, [service, missing, wiredInputs]);
 
   const inputHandles = useMemo<HandleConfig[]>(
     () =>
@@ -178,7 +165,7 @@ function ServiceCallNode({ data }: ServiceCallNodeProps) {
     }));
   }, [service]);
 
-  const title = service?.name || 'Service Call';
+  const title = service?.name || (missing ? `${data.service} (not available)` : 'Service Call');
   const endpointPreview = data.endpoint || service?.endpoint || '';
   const collapsedPreview = (
     <div className="text-slate-500 dark:text-slate-400 text-xs">
@@ -230,6 +217,13 @@ function ServiceCallNode({ data }: ServiceCallNodeProps) {
               </div>
             )}
           </>
+        ) : missing ? (
+          <div
+            role="status"
+            className="rounded border border-amber-500/60 bg-amber-50 dark:bg-amber-900/30 px-2 py-1.5 text-[11px] leading-snug text-amber-900 dark:text-amber-100"
+          >
+            {notice || `The service “${data.service}” is not available here. Pick another in the Properties panel.`}
+          </div>
         ) : (
           <div className="text-slate-600 dark:text-slate-400 italic">
             No service selected — pick one in the Properties panel or drop a

@@ -6,6 +6,8 @@
 
 import type { RuntimeContext, RuntimeModule } from 'oaiy-core';
 import type { RuntimeMethod } from 'oaiy-core/src/module-types';
+import type { CustomService } from '../core-service/examples';
+import { runContract } from '../core-service/contractRuntime';
 
 // Per-job method factory: methods close over THIS job's ctx (no module-level singleton).
 function createAudioMethods(ctx: RuntimeContext): Record<string, RuntimeMethod> {
@@ -1867,7 +1869,63 @@ async function fadeAudio(
 // Runtime Module Export
 // ============================================
 
+/**
+ * Audio from a contract service (OAIY's engine: speech, music, sound effects;
+ * or a service that declares what it makes): `{ audio, path }` like the
+ * node's own request code gives, the file kept in the temp folder.
+ */
+async function serviceAudio(
+    contract: CustomService | string,
+    vars: Record<string, unknown>,
+    nodeId: string,
+    filename: string,
+    label: string,
+): Promise<{ audio: string; path: string }> {
+    ctx.onNodeStatus?.(nodeId, 'running');
+    try {
+        const said = vars.text ?? vars.prompt;
+        if (said == null || String(said).trim() === '') {
+            throw new Error(`${label}: nothing to make it from (connect the ${'text' in vars ? 'Text' : 'Prompt'} input, or fill it in)`);
+        }
+        const r = await runContract(ctx, contract, vars, { nodeId, filename, label });
+        if (!r.path) throw new Error(`${label}: the service returned no audio`);
+        ctx.onNodeStatus?.(nodeId, 'completed');
+        ctx.log('success', `[${label}] ${r.path}`);
+        return { audio: r.url || r.path, path: r.path };
+    } catch (e) {
+        ctx.onNodeStatus?.(nodeId, 'error');
+        throw e;
+    }
+}
+
+/**
+ * A recording written out by a contract service (OAIY Voice's transcription,
+ * or a service that answers with text). Only the text comes back from these,
+ * so the segments are empty and the duration unknown.
+ */
+async function serviceTranscribe(
+    contract: CustomService | string,
+    media: unknown,
+    language: string,
+    nodeId: string,
+): Promise<{ text: string; segments: TranscriptSegment[]; language: string; duration: number }> {
+    ctx.onNodeStatus?.(nodeId, 'running');
+    try {
+        if (media == null || media === '') throw new Error('Speech to Text: no recording was given (connect the Media input)');
+        const r = await runContract(ctx, contract, { audio: media, input: media, language: language || undefined }, { nodeId, label: 'Speech to Text' });
+        const text = (r.text ?? (typeof r.value === 'string' ? r.value : '')).trim();
+        ctx.onNodeStatus?.(nodeId, 'completed');
+        ctx.log('success', `[Speech to Text] ${text.length} characters`);
+        return { text, segments: [], language: language || 'unknown', duration: 0 };
+    } catch (e) {
+        ctx.onNodeStatus?.(nodeId, 'error');
+        throw e;
+    }
+}
+
     return {
+        serviceAudio: serviceAudio as RuntimeMethod,
+        serviceTranscribe: serviceTranscribe as RuntimeMethod,
         textToSpeech,
         textToSpeechV2,
         saveAudio,

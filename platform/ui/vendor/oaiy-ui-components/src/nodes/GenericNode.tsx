@@ -4,6 +4,7 @@ import type { NodeDefinition, HandleDefinition } from 'oaiy-core';
 import { BUNDLED_MODULES, getModuleLoader } from 'oaiy-core';
 import CollapsibleNodeWrapper, { type HandleConfig } from '../components/CollapsibleNodeWrapper';
 import { PropertyField, shouldShowProperty } from './fields/PropertyField';
+import { useNodeNotice } from '../hooks/useNodeNotice';
 
 // Icon components map - we use simple SVG icons to avoid lucide-react dependency
 const defaultIconSvg = (
@@ -124,6 +125,10 @@ export const GenericNode: React.FC<GenericNodeProps> = memo(({ id, data }) => {
     return undefined;
   }, [data.__definition, nodeType]);
 
+  // What the host says about this node (e.g. the service it uses is not
+  // installed). Asked before any early return so the hook order is fixed.
+  const notice = useNodeNotice(nodeType, data);
+
   // If no definition, render a placeholder
   if (!definition) {
     return (
@@ -210,6 +215,15 @@ export const GenericNode: React.FC<GenericNodeProps> = memo(({ id, data }) => {
       outputHandles={outputHandles}
     >
       <div className="flex flex-col gap-3">
+        {notice && (
+          <div
+            role="status"
+            className="rounded border border-amber-500/60 bg-amber-50 dark:bg-amber-900/30 px-2 py-1.5 text-[11px] leading-snug text-amber-900 dark:text-amber-100"
+          >
+            {notice}
+          </div>
+        )}
+
         {/* Preview Image */}
         {definition.ui?.showPreview && data.previewImageUrl && (
           <div className="w-full aspect-video bg-slate-200 dark:bg-slate-800 rounded overflow-hidden">

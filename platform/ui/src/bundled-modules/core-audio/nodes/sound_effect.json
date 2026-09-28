@@ -1,0 +1,89 @@
+{
+    "id": "sound_effect",
+    "name": "Sound Effect",
+    "description": "Make a sound effect (ambience, creatures, machines, actions) from a description, up to 30 seconds. Runs on OAIY's engine or a service you add; service engine:sound is the engine's.",
+    "doc": "Describe the sound — what makes it, where, how it sounds — and get a clip of it.\n\n**Service** — `OAIY engine` uses the sound-effect model set up in OAIY's Engines (MOSS-SoundEffect, 48 kHz). You can also pick one of your own services (a Python rig in OAIY → Services, or a custom HTTP service): it is sent `{{prompt}}`, `{{seconds}}` and `{{seed}}` and should answer with the audio (a file, base64 or a URL).\n\n**Out** — `Audio` plays in the flow and goes to Save Audio, Audio Append or Audio Mixer; `Path` is the file.\n\nPrompt tips: name the source and the space (\"heavy rain on a tin roof, distant thunder\"), and how it moves (\"a door creaks open slowly, then slams\").",
+    "icon": "volume-2",
+    "color": "teal",
+    "tags": ["audio", "sound", "sound effect", "sfx", "foley", "generation", "ai"],
+    "inputs": [
+        {
+            "id": "prompt",
+            "name": "Description",
+            "type": "string",
+            "position": "left",
+            "description": "What the sound is (overrides the Description property when connected)"
+        }
+    ],
+    "outputs": [
+        {
+            "id": "audio",
+            "name": "Audio",
+            "type": "audio",
+            "position": "right",
+            "description": "The sound (a media URL)"
+        },
+        {
+            "id": "path",
+            "name": "Path",
+            "type": "string",
+            "position": "right",
+            "description": "The sound's file"
+        }
+    ],
+    "properties": [
+        {
+            "id": "service",
+            "name": "Service",
+            "type": "select",
+            "default": "engine:sound",
+            "dynamicOptionsSource": "service:list:sound_effect",
+            "options": [{ "value": "engine:sound", "label": "OAIY engine · default model" }],
+            "description": "Which model or service makes the sound. Add models in OAIY's Engines, or your own services (Python rigs) in OAIY's Services."
+        },
+        {
+            "id": "prompt",
+            "name": "Description",
+            "type": "textarea",
+            "default": "",
+            "rows": 3,
+            "placeholder": "Heavy rain on a tin roof, distant thunder",
+            "description": "What the sound is: its source, the space, how it moves"
+        },
+        {
+            "id": "seconds",
+            "name": "Length (seconds)",
+            "type": "number",
+            "default": 10,
+            "min": 0.5,
+            "max": 30,
+            "step": 0.5,
+            "description": "How long the sound is (0.5 to 30 seconds)"
+        },
+        {
+            "id": "seed",
+            "name": "Seed",
+            "type": "number",
+            "default": -1,
+            "min": -1,
+            "description": "The same seed gives the same sound (-1 for a new one each time)",
+            "advanced": true
+        },
+        {
+            "id": "filename",
+            "name": "Filename",
+            "type": "string",
+            "default": "sound_effect",
+            "description": "Base name for the sound's file"
+        }
+    ],
+    "compiler": {
+        "customHandler": true,
+        "async": true,
+        "abortable": true,
+        "statusTracking": true
+    },
+    "ui": {
+        "width": 300
+    }
+}

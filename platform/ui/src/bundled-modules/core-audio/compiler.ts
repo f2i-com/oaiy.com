@@ -5,35 +5,22 @@
  */
 
 import type { ModuleCompiler, ModuleCompilerContext } from 'oaiy-core';
-import { BUILT_IN_SERVICES, type CustomService } from '../core-service/examples';
+// Service-preset lookup shared with every compiler (core-service/contract.ts):
+// the user's services, OAIY Desktop's (its services, OAIY's engine models,
+// OAIY Voice) and the built-in examples. A picked TTS service's endpoint /
+// headers / body template / response path fill in below explicit data.*
+// external* fields; an engine model (or any service declaring what it makes)
+// runs as a contract through Audio.serviceAudio / Audio.serviceTranscribe.
+import { contractModel, nodeContract, resolveService } from '../core-service/contract';
 
-// Service-preset lookup — same shape as core-ai + core-image + core-video.
-// Lets the user pick a registered TTS service in the property panel; its
-// endpoint / headers / body template / response path fill in below explicit
-// data.* external* fields.
-const SERVICE_STORAGE_KEY = 'oaiy.customServices';
-function getCustomServices(): CustomService[] {
-  try {
-    if (typeof localStorage === 'undefined') return [];
-    const raw = localStorage.getItem(SERVICE_STORAGE_KEY);
-    if (!raw) return [];
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? (parsed as CustomService[]) : [];
-  } catch {
-    return [];
-  }
-}
-function resolveService(id: string): CustomService | null {
-  if (!id) return null;
-  const all = [...getCustomServices(), ...BUILT_IN_SERVICES];
-  return all.find((s) => s.id === id) ?? null;
-}
+/** The values music_gen's legacy services take in `data.service` (not presets). */
+const LEGACY_MUSIC_SERVICES = new Set(['ace-step', 'heartmula']);
 
 const CoreAudioCompiler: ModuleCompiler = {
     name: 'Audio',
 
     getNodeTypes() {
-        return ['text_to_speech', 'save_audio', 'music_gen', 'audio_append', 'speech_to_text', 'audio_fade'];
+        return ['text_to_speech', 'save_audio', 'music_gen', 'audio_append', 'speech_to_text', 'audio_fade', 'sound_effect'];
     },
 
     compileNode(nodeType: string, ctx: ModuleCompilerContext): string | null {
@@ -148,6 +135,31 @@ const CoreAudioCompiler: ModuleCompiler = {
 
             const descInputExpr = descriptionInput ? descriptionInput : 'undefined';
 
+            // OAIY's engine (or a service declaring what it makes): the text
+            // spoken in the voice named in Speaker (a saved voice or an OpenAI
+            // voice name) or described in Voice Description.
+            const speechContract = nodeContract(String(data.service || ''), preset);
+            if (speechContract) {
+                return `
+  // --- Node: ${node.id} (text_to_speech, service) ---
+  ${letOrAssign}${outputVar} = await Audio.serviceAudio(
+    ${speechContract},
+    {
+      text: ${textVar},
+      voice: ${JSON.stringify(String(data.speaker || ''))},
+      instructions: ${descInputExpr} || ${JSON.stringify(String(data.description || ''))},
+      language: ${JSON.stringify(data.language && data.language !== 'Auto' ? String(data.language) : '')},
+      model: ${JSON.stringify(contractModel(preset, ''))},
+    },
+    "${node.id}",
+    ${JSON.stringify(String(data.filename || 'tts_output'))},
+    "Text to Speech"
+  );
+  let ${outputVar}_audio = ${outputVar}.audio || ${outputVar};
+  let ${outputVar}_path = ${outputVar}.path || ${outputVar};
+  workflow_context["${node.id}"] = ${outputVar};`;
+            }
+
             const code = `
   // --- Node: ${node.id} (text_to_speech, provider=${provider}) ---
   ${letOrAssign}${outputVar} = await Audio.textToSpeechV2({
@@ -226,8 +238,43 @@ const CoreAudioCompiler: ModuleCompiler = {
         }
 
         if (nodeType === 'music_gen') {
+            // `data.service`: 'ace-step' / 'heartmula' (the node's own request
+            // code, at API URL) or a service preset — OAIY's engine
+            // (`engine:music`, `engine:music:<model>`), a rig, a custom service.
+            const pickedService = String(data.service || 'ace-step');
+            if (!LEGACY_MUSIC_SERVICES.has(pickedService)) {
+                const preset = resolveService(pickedService);
+                const contract = nodeContract(pickedService, preset, 'audio') ?? JSON.stringify(pickedService);
+                const promptIn = inputs.get('prompt');
+                const lyricsIn = inputs.get('lyrics');
+                const durationIn = inputs.get('duration');
+                const promptLit = JSON.stringify(String(data.prompt || 'pop, energetic, catchy melody'));
+                const lyricsLit = JSON.stringify(String(data.lyrics || ''));
+                const durationDefault = Number(data.duration) || 60;
+                const seed = Number(data.seed);
+                return `
+  // --- Node: ${node.id} (music_gen, service) ---
+  const ${outputVar}_lyrics = String(${lyricsIn ? `${lyricsIn} || ${lyricsLit}` : lyricsLit}).trim();
+  ${letOrAssign}${outputVar} = await Audio.serviceAudio(
+    ${contract},
+    {
+      prompt: ${promptIn ? `${promptIn} || ${promptLit}` : promptLit},
+      lyrics: ${outputVar}_lyrics,
+      instrumental: ${outputVar}_lyrics === '',
+      duration: ${durationIn ? `(typeof ${durationIn} === 'number' ? ${durationIn} : (parseFloat(${durationIn}) || ${durationDefault}))` : durationDefault},
+      seed: ${Number.isFinite(seed) && seed >= 0 ? seed : 'null'},
+      model: ${JSON.stringify(contractModel(preset, ''))},
+    },
+    "${node.id}",
+    ${JSON.stringify(String(data.filename || 'music_output'))},
+    "Music Gen"
+  );
+  let ${outputVar}_audio = ${outputVar}.audio || ${outputVar};
+  let ${outputVar}_path = ${outputVar}.path || ${outputVar};
+  workflow_context["${node.id}"] = ${outputVar};`;
+            }
             // Get service type (ace-step or heartmula)
-            const service = escapeString(String(data.service || 'ace-step'));
+            const service = escapeString(pickedService);
 
             // Get prompt from input handle or property
             const promptInput = inputs.get('prompt');
@@ -333,6 +380,27 @@ const CoreAudioCompiler: ModuleCompiler = {
             const startTime = startTimeInput || 'null';
             const endTime = endTimeInput || 'null';
 
+            // A service preset (OAIY Voice's transcription, a rig, a custom
+            // service): the recording goes to it; only the text comes back.
+            const sttService = String(data.service || '');
+            if (sttService) {
+                const preset = resolveService(sttService);
+                const contract = nodeContract(sttService, preset, 'text') ?? JSON.stringify(sttService);
+                return `
+  // --- Node: ${node.id} (speech_to_text, service) ---
+  ${letOrAssign}${outputVar} = await Audio.serviceTranscribe(
+    ${contract},
+    ${mediaVar},
+    ${JSON.stringify(String(data.language || ''))},
+    "${node.id}"
+  );
+  let ${outputVar}_text = ${outputVar}.text || "";
+  let ${outputVar}_segments = ${outputVar}.segments || [];
+  let ${outputVar}_language = ${outputVar}.language || "unknown";
+  let ${outputVar}_duration = ${outputVar}.duration || 0;
+  workflow_context["${node.id}"] = ${outputVar};`;
+            }
+
             // API settings - use user-provided URL or default
             const apiUrl = escapeString(String(data.apiUrl || 'http://127.0.0.1:8770/transcribe'));
             const language = escapeString(String(data.language || ''));
@@ -372,6 +440,35 @@ const CoreAudioCompiler: ModuleCompiler = {
   workflow_context["${node.id}"] = ${outputVar};`;
 
             return code;
+        }
+
+        if (nodeType === 'sound_effect') {
+            // OAIY's engine by default (MOSS-SoundEffect), or any service
+            // picked for the node: a description in, a sound out.
+            const serviceId = String(data.service || 'engine:sound');
+            const preset = resolveService(serviceId);
+            const contract = nodeContract(serviceId, preset, 'audio') ?? JSON.stringify(serviceId);
+            const promptIn = inputs.get('prompt');
+            const promptLit = JSON.stringify(String(data.prompt || ''));
+            const seconds = Math.min(30, Math.max(0.5, Number(data.seconds) || 10));
+            const seed = Number(data.seed);
+            return `
+  // --- Node: ${node.id} (sound_effect) ---
+  ${letOrAssign}${outputVar} = await Audio.serviceAudio(
+    ${contract},
+    {
+      prompt: ${promptIn ? `${promptIn} || ${promptLit}` : promptLit},
+      seconds: ${seconds},
+      seed: ${Number.isFinite(seed) && seed >= 0 ? seed : 'null'},
+      model: ${JSON.stringify(contractModel(preset, ''))},
+    },
+    "${node.id}",
+    ${JSON.stringify(String(data.filename || 'sound_effect'))},
+    "Sound Effect"
+  );
+  let ${outputVar}_audio = ${outputVar}.audio || ${outputVar};
+  let ${outputVar}_path = ${outputVar}.path || ${outputVar};
+  workflow_context["${node.id}"] = ${outputVar};`;
         }
 
         if (nodeType === 'audio_fade') {

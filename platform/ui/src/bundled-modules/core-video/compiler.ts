@@ -5,28 +5,12 @@
  */
 
 import type { ModuleCompiler, ModuleCompilerContext } from 'oaiy-core';
-import { BUILT_IN_SERVICES, type CustomService } from '../core-service/examples';
-
-// Service-preset lookup — same shape as core-ai + core-image. Lets the
-// user pick a registered service in the property panel; its endpoint /
-// apiFormat fill in below explicit data.* fields.
-const SERVICE_STORAGE_KEY = 'oaiy.customServices';
-function getCustomServices(): CustomService[] {
-  try {
-    if (typeof localStorage === 'undefined') return [];
-    const raw = localStorage.getItem(SERVICE_STORAGE_KEY);
-    if (!raw) return [];
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? (parsed as CustomService[]) : [];
-  } catch {
-    return [];
-  }
-}
-function resolveService(id: string): CustomService | null {
-  if (!id) return null;
-  const all = [...getCustomServices(), ...BUILT_IN_SERVICES];
-  return all.find((s) => s.id === id) ?? null;
-}
+// Service-preset lookup shared with every compiler (core-service/contract.ts):
+// the user's services, OAIY Desktop's (its services, OAIY's engine models)
+// and the built-in examples. A picked service's endpoint / apiFormat fill in
+// below explicit data.* fields; an engine model (or any service declaring
+// what it makes) runs as a contract through VideoFrames.generateService.
+import { contractModel, nodeContract, resolveService } from '../core-service/contract';
 
 const CoreVideoCompiler: ModuleCompiler = {
   name: 'Video',
@@ -237,7 +221,32 @@ const CoreVideoCompiler: ModuleCompiler = {
       // explicit data.endpoint, replacing the projectSettings fallback so
       // the unified Services registry is the source of truth. Falls back
       // to project-wide `defaultVideoServiceId` from Settings → Providers.
-      const preset = resolveService(String(data.service || projectSettings?.defaultVideoServiceId || ''));
+      const serviceId = String(data.service || projectSettings?.defaultVideoServiceId || '');
+      const preset = resolveService(serviceId);
+      const contract = nodeContract(serviceId, preset);
+      if (contract) {
+        // OAIY's engine (LTX family): a job, followed until the clip is made.
+        const imageVar = inputs.get('image') || 'null';
+        const durationVar = inputs.get('duration');
+        const seconds = Number(data.wan2gpDuration) || 5;
+        const res = /^(\d+)x(\d+)$/.exec(String(data.wan2gpResolution || ''));
+        const size = res && Number(res[1]) <= 1024 && Number(res[2]) <= 1024 ? `${res[1]}x${res[2]}` : '';
+        return `
+  // --- Node: ${node.id} (${nodeType} - service) ---
+  ${letOrAssign}${outputVar} = await VideoFrames.generateService(
+    ${contract},
+    {
+      prompt: ${promptVar},
+      image: ${imageVar},
+      seconds: ${durationVar ? `(Number(${durationVar}) || ${seconds})` : seconds},
+      size: ${JSON.stringify(size)},
+      model: ${JSON.stringify(contractModel(preset, ''))},
+    },
+    "${node.id}"
+  );
+  let ${outputVar}_video = ${outputVar};
+  workflow_context["${node.id}"] = ${outputVar};`;
+      }
       const apiFormat = String(data.apiFormat || preset?.apiFormat || 'comfyui');
 
       // Wan2GP backend - simpler path, no ComfyUI workflow needed

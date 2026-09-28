@@ -1,0 +1,47 @@
+{
+  "id": "background_removal",
+  "name": "Remove Background",
+  "description": "Cut the subject out of a picture: the same picture with its background made transparent (PNG). Runs on OAIY's engine (BiRefNet) or a service you add; service engine:background is the engine's.",
+  "doc": "Removes a picture's background and keeps the subject, as a PNG with a transparent background at the picture's own size.\n\n**Service** — `OAIY engine` uses the background-removal model set up in OAIY's Engines (BiRefNet). You can also pick one of your own services (a Python rig in OAIY → Services, or a custom HTTP service): it is sent the picture as a data: URL in `{{image}}` and should answer with the new picture (base64, a data: URL or a URL) at its response path.\n\n**In → out** — any picture (Input File, Image Gen, a URL, a data: URL) in; a PNG data URL out, which Image View and Image Save take.",
+  "icon": "scissors",
+  "color": "indigo",
+  "tags": ["image", "background", "cutout", "matte", "transparent", "remove background"],
+  "inputs": [
+    {
+      "id": "image",
+      "name": "Image",
+      "type": "image",
+      "position": "left",
+      "description": "The picture whose background is removed"
+    }
+  ],
+  "outputs": [
+    {
+      "id": "image",
+      "name": "Image",
+      "type": "image",
+      "position": "right",
+      "description": "The subject on a transparent background (PNG data URL)"
+    }
+  ],
+  "properties": [
+    {
+      "id": "service",
+      "name": "Service",
+      "type": "select",
+      "default": "engine:background",
+      "dynamicOptionsSource": "service:list:background_removal",
+      "options": [{ "value": "engine:background", "label": "OAIY engine · default model" }],
+      "description": "Which model or service removes the background. Add models in OAIY's Engines, or your own services (Python rigs) in OAIY's Services."
+    }
+  ],
+  "compiler": {
+    "async": true,
+    "abortable": true,
+    "statusTracking": true,
+    "customHandler": true
+  },
+  "ui": {
+    "width": 280
+  }
+}

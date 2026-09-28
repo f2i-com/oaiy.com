@@ -15,6 +15,8 @@ import {
   type ModuleCategory,
 } from 'oaiy-core';
 import { subscribeToDynamicOptionsInvalidation } from 'oaiy-ui-components';
+import { paletteShowsNode } from '../lib/nodeAvailability';
+import { currentAvailabilityEnv } from '../lib/availabilityEnv';
 import type { PackageNodeInfo } from './usePackageNodes';
 import { listAllServices } from '../utils/serviceRegistry';
 import { listDesktopServices } from '../lib/desktopServices';
@@ -87,6 +89,12 @@ const AI_SERVICE_NODE_IDS: ReadonlySet<string> = new Set([
   'image_gen',
   'video_gen',
   'text_to_speech',
+  'music_gen',
+  'speech_to_text',
+  'sound_effect',
+  'model_3d',
+  'background_removal',
+  'image_upscale',
   'service_call',
 ]);
 
@@ -153,12 +161,24 @@ export function useModuleNodes(options?: UseModuleNodesOptions) {
     loadModules();
   }, [loader]);
 
+  // The node types the palette offers now: a service-driven node (Image Gen,
+  // Music Gen, 3D Model, …) only when something installed can run it — in
+  // OAIY's window an engine model, an installed desktop service or one of the
+  // user's own; see lib/nodeAvailability.ts. Re-derived whenever the service
+  // lists change (servicesVersion), so installing a model shows its node.
+  const paletteNodes = useMemo(() => {
+    const env = currentAvailabilityEnv();
+    return nodes.filter((n) => paletteShowsNode(n.definition.id, env));
+    // servicesVersion: the lists behind `env` changed.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [nodes, servicesVersion]);
+
   // Group nodes by category (including package nodes when active)
   const groupedNodes = useMemo<GroupedNodes[]>(() => {
     const groups = new Map<ModuleCategory | 'Package', ModuleNodeInfo[]>();
 
     // Add built-in nodes (filter out package nodes - they're handled separately below)
-    for (const node of nodes) {
+    for (const node of paletteNodes) {
       // Skip package nodes (prefixed with pkg:) - they should only appear in the Package category
       if (node.definition.id.startsWith('pkg:')) {
         continue;
@@ -277,7 +297,7 @@ export function useModuleNodes(options?: UseModuleNodesOptions) {
     return sortedGroups;
     // servicesVersion participates so adding/removing a service in
     // Settings re-runs the synthetic-entry injection above.
-  }, [nodes, activePackageId, pkgNodes, servicesVersion]);
+  }, [paletteNodes, activePackageId, pkgNodes, servicesVersion]);
 
   // Get a node definition by ID (checks both built-in and package nodes)
   const getNodeDefinition = useCallback((nodeId: string): NodeDefinition | undefined => {
@@ -311,7 +331,9 @@ export function useModuleNodes(options?: UseModuleNodesOptions) {
   const nodeIds = useMemo(() => nodes.map(n => n.definition.id), [nodes]);
 
   return {
-    nodes,
+    // What the palette offers (quick-connect reads this too): hidden service
+    // nodes stay registered, so flows using them still open and run.
+    nodes: paletteNodes,
     groupedNodes,
     isLoading,
     error,
@@ -528,6 +550,18 @@ export function getNodeIcon(iconName: string | undefined): React.ReactElement {
     download: (
       <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+      </svg>
+    ),
+    // Upscale Image: arrows out to the corners.
+    maximize: (
+      <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 8V4h4M20 8V4h-4M4 16v4h4M20 16v4h-4M9 9l-5-5M15 9l5-5M9 15l-5 5M15 15l5 5" />
+      </svg>
+    ),
+    // 3D Model: a cube.
+    box: (
+      <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M20 7l-8-4-8 4m16 0l-8 4m8-4v10l-8 4m0-10L4 7m8 4v10M4 7v10l8 4" />
       </svg>
     ),
   };
