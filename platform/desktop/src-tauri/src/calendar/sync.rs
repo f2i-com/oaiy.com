@@ -929,19 +929,29 @@ fn look_up_missing(cal: &Calendar, api: &Api, form: &str, pulled: &mut Pulled) -
 /// Merge a pull into the book.
 fn apply(b: &mut Book, pulled: &Pulled, out: &mut Outcome) {
     // Deleted in FormLogic: deleted here, whatever changed here meanwhile.
-    for rid in &pulled.deleted {
-        if let Some(i) = b.appointments.iter().position(|a| remote(a).id.as_deref() == Some(rid.as_str())) {
-            b.appointments.remove(i);
-            out.removed += 1;
-        }
-        b.deleted.retain(|t| t.formlogic_id.as_deref() != Some(rid.as_str()) || !t.request_key.starts_with("oaiy:"));
+    let gone: HashSet<&str> = pulled.deleted.iter().map(String::as_str).collect();
+    if !gone.is_empty() {
+        let before = b.appointments.len();
+        b.appointments.retain(|a| !remote(a).id.as_deref().is_some_and(|id| gone.contains(id)));
+        out.removed += before - b.appointments.len();
+        b.deleted.retain(|t| !t.formlogic_id.as_deref().is_some_and(|id| gone.contains(id)) || !t.request_key.starts_with("oaiy:"));
         for t in &mut b.deleted {
-            if t.formlogic_id.as_deref() == Some(rid.as_str()) {
+            if t.formlogic_id.as_deref().is_some_and(|id| gone.contains(id)) {
                 t.formlogic_id = None;
                 t.checked = true;
             }
         }
-        b.sync.discard.retain(|d| d != rid);
+        b.sync.discard.retain(|d| !gone.contains(d.as_str()));
+    }
+    // Looked up once, not per record: a first sync of a busy form holds the
+    // calendar (and the phone's lookups) for as short a time as it can.
+    let mut by_rid: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut by_key: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for (i, a) in b.appointments.iter().enumerate() {
+        if let Some(id) = remote(a).id {
+            by_rid.insert(id, i);
+        }
+        by_key.entry(request_key(a)).or_insert(i);
     }
     for r in &pulled.records {
         let Some(stamp) = Stamp::of(r) else { continue };
@@ -961,10 +971,15 @@ fn apply(b: &mut Book, pulled: &Pulled, out: &mut Outcome) {
                 continue;
             }
         }
-        let by_id = b.appointments.iter().position(|a| remote(a).id.as_deref() == Some(rid.as_str()));
-        let found = by_id.or_else(|| key.as_ref().and_then(|k| b.appointments.iter().position(|a| request_key(a) == *k)));
+        let found = by_rid.get(&rid).or_else(|| key.as_ref().and_then(|k| by_key.get(k))).copied();
+        let mut add = |b: &mut Book, out: &mut Outcome| {
+            if let Some(i) = insert(b, &stamp, &answers, out) {
+                by_rid.insert(rid.clone(), i);
+                by_key.entry(request_key(&b.appointments[i])).or_insert(i);
+            }
+        };
         let Some(i) = found else {
-            insert(b, &stamp, &answers, out);
+            add(b, out);
             continue;
         };
         let mine = remote(&b.appointments[i]);
@@ -975,20 +990,24 @@ fn apply(b: &mut Book, pulled: &Pulled, out: &mut Outcome) {
                     // FormLogic's is kept (its texts refer to it), this one's goes.
                     b.sync.discard.push(r0.to_string());
                     reconcile(b, i, &stamp, &answers, out);
+                    by_rid.insert(rid.clone(), i);
                 } else {
                     // FormLogic has two of its own; so does this calendar.
-                    insert(b, &stamp, &answers, out);
+                    add(b, out);
                 }
             }
-            _ => reconcile(b, i, &stamp, &answers, out),
+            _ => {
+                reconcile(b, i, &stamp, &answers, out);
+                by_rid.insert(rid.clone(), i);
+            }
         }
     }
 }
 
-/// A record new to this desktop.
-fn insert(b: &mut Book, stamp: &Stamp, answers: &Value, out: &mut Outcome) {
+/// A record new to this desktop: where it went.
+fn insert(b: &mut Book, stamp: &Stamp, answers: &Value, out: &mut Outcome) -> Option<usize> {
     let c = change_from(answers);
-    let Some(start) = c.start.clone() else { return };
+    let start = c.start.clone()?;
     let made = b.create(NewAppointment {
         service: c.service.clone().unwrap_or_default(),
         start,
@@ -999,14 +1018,16 @@ fn insert(b: &mut Book, stamp: &Stamp, answers: &Value, out: &mut Outcome) {
         source: source_here(answers.get("source").and_then(Value::as_str).unwrap_or("")).to_string(),
         ..Default::default()
     });
-    let Ok(made) = made else { return };
-    if let Some(a) = b.appointments.iter_mut().find(|a| a.id == made.id) {
-        a.request_id = text_of(answers, "request_id");
-        a.call_id = text_of(answers, "call_id");
-        let synced_at = a.updated_at.clone();
-        set_remote(a, Remote { id: Some(stamp.id.clone()), updated_at: stamp.updated_at.clone(), etag: stamp.etag.clone(), synced_at, base: Some(answers.clone()), ..Default::default() });
-    }
+    made.ok()?;
+    // `create` puts it last.
+    let i = b.appointments.len() - 1;
+    let a = &mut b.appointments[i];
+    a.request_id = text_of(answers, "request_id");
+    a.call_id = text_of(answers, "call_id");
+    let synced_at = a.updated_at.clone();
+    set_remote(a, Remote { id: Some(stamp.id.clone()), updated_at: stamp.updated_at.clone(), etag: stamp.etag.clone(), synced_at, base: Some(answers.clone()), ..Default::default() });
     out.pulled += 1;
+    Some(i)
 }
 
 /// Bring a local appointment and its FormLogic record into step, as far as
