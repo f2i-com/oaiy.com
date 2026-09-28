@@ -31,8 +31,8 @@ export interface Session extends SessionInfo {
   brief?: string;
   /** What the agent writes, spoken on the call. */
   speech?: Speech;
-  /** A flow's tasks: those waiting for their answers, in turn (one task a run). */
-  answers?: Array<(reply: string, error?: string) => void>;
+  /** A flow's tasks waiting for their answers, each by its prompt (one task a run; a message of the person's answers none). */
+  answers?: Array<{ prompt: string; settle: (reply: string, error?: string) => void }>;
 }
 
 /** How the app makes an agent for this project, with a conversation's own instructions and tools. */
@@ -506,9 +506,10 @@ export class Sessions {
     this.sort();
     this.hooks.changed();
     // Queued at once, so tasks run in the order they came.
+    const prompt = `[OAIY] Your flow "${key}" asks: ${text}`;
     return new Promise<string>((resolve, reject) => {
-      s.answers!.push((reply, error) => (error ? reject(new Error(error)) : resolve(reply)));
-      this.deliver(s, `[OAIY] Your flow "${key}" asks: ${text}`);
+      s.answers!.push({ prompt, settle: (reply, error) => (error ? reject(new Error(error)) : resolve(reply)) });
+      this.deliver(s, prompt);
     });
   }
 
@@ -569,7 +570,9 @@ export class Sessions {
       failed = (error as Error).message;
       this.hooks.event(session, { type: 'error', message: (error as Error).message });
     } finally {
-      session.answers?.shift()?.(said.trim(), said.trim() ? undefined : failed || 'the agent finished without an answer');
+      // The task this run was (none, when it was a message of the person's).
+      const task = session.answers?.findIndex((a) => a.prompt === prompt) ?? -1;
+      if (task >= 0) session.answers!.splice(task, 1)[0].settle(said.trim(), said.trim() ? undefined : failed || 'the agent finished without an answer');
       session.running = null;
       session.controller = null;
       finish();

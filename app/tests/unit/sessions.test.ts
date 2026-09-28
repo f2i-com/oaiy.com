@@ -261,6 +261,23 @@ describe("a flow's tasks for the agent", () => {
     await settled(sessions);
   });
 
+  it("a message of the person's in the flow's conversation does not take a task's answer", async () => {
+    // Each reply answers what was asked last.
+    const answer = (body: Record<string, unknown>) => {
+      const last = JSON.stringify((body.messages as unknown[]).at(-1));
+      return { text: last.includes('Hello, how is it going?') ? 'Reply to the person.' : last.includes('Second') ? 'The second task done.' : 'The first task done.' };
+    };
+    fakeProvider('openai', [answer, answer, answer]);
+    const { sessions } = setup({ answer: false, instructions: '' });
+    expect(await sessions.task('Nightly', 'First')).toBe('The first task done.');
+    const session = sessions.list.find((s) => s.kind === 'task')!;
+    // The person writes in the flow's tab, and a task comes while that is answered.
+    sessions.say(session, 'Hello, how is it going?');
+    const second = sessions.task('Nightly', 'Second');
+    expect(await second).toBe('The second task done.');
+    await settled(sessions);
+  });
+
   it('a task the agent cannot answer fails, and the flow is told why', async () => {
     fakeProvider('openai', [{ error: { status: 400, body: '{"error":{"message":"the model is away"}}' } }]);
     const { sessions } = setup({ answer: false, instructions: '' });

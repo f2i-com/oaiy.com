@@ -89,7 +89,8 @@ impl Hub {
         let tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
         match tasks.get(id) {
             Some(t) if *t.state.borrow() == State::Pending => {
-                let _ = t.state.send(state);
+                // Kept even with no one waiting (the asker's wait ran out and it asks after).
+                t.state.send_replace(state);
                 true
             }
             _ => false,
@@ -223,5 +224,14 @@ mod tests {
         assert_eq!(outcome(&id, &s), json!({"id": id, "status": "done", "reply": "Dear Sam, welcome!"}));
         assert!(h.pending().is_empty());
         assert!(!h.answer("task_nope", State::Done(String::new())));
+    }
+
+    #[test]
+    fn an_answer_after_the_wait_ran_out_is_kept_for_the_asker_to_ask_after() {
+        let h = Hub { tasks: Mutex::new(HashMap::new()), events: broadcast::channel(8).0, next: Mutex::new(0) };
+        let (id, rx) = h.add("Nightly report", "Summarise the day");
+        drop(rx);
+        assert!(h.answer(&id, State::Done("A quiet day.".into())));
+        assert_eq!(h.state(&id), Some(State::Done("A quiet day.".into())));
     }
 }
