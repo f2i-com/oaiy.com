@@ -830,8 +830,10 @@ export class Sessions {
     }
     let session = this.list.find((s) => s.callId === callId) ?? null;
     if (type === 'call.started' || (!session && type === 'call.caller')) {
-      const from = String(event.from ?? '') || callId;
-      session = await this.conversationWith(from, String(event.name ?? ''), 'call');
+      // A hidden number: a conversation of its own for this call (never shared with another hidden caller), named as such.
+      const hidden = !String(event.from ?? '').trim();
+      const from = hidden ? callId : String(event.from);
+      session = await this.conversationWith(from, hidden ? 'Hidden number' : String(event.name ?? ''), 'call');
       session.callId = callId;
       if (typeof event.instructions === 'string') session.brief = event.instructions;
       session.lastAt = Date.now();

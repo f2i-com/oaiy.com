@@ -711,6 +711,17 @@ describe('a phone call answered by the agent', () => {
     }
   });
 
+  it('a caller who hides their number gets a conversation of their own, named as such', async () => {
+    fakeProvider('openai', []);
+    const { sessions } = setup();
+    const a = await sessions.callEvent({ type: 'call.started', callId: 'call_h1', from: '' });
+    await sessions.callEvent({ type: 'call.ended', callId: 'call_h1' });
+    const b = await sessions.callEvent({ type: 'call.started', callId: 'call_h2' });
+    expect(a?.title).toBe('Hidden number');
+    expect(b?.title).toBe('Hidden number');
+    expect(a).not.toBe(b);
+  });
+
   it('a booking promised but not requested: the agent is told once, and requests it', async () => {
     const fake = fakeProvider('openai', [
       { text: "Thanks, Lance! I'll request Tuesday at one for a mow." },
