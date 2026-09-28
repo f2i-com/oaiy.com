@@ -239,7 +239,7 @@ try {
   await check('the agent unpacks the original .softn again into a folder of its choosing', async () => {
     const tool = toolText(7);
     expect(tool.includes('into copies/Imported/ (3 files)') && tool.includes('ui/main.ui'), tool);
-    const apps = await page.$$eval('.preview-app option', (els) => els.map((e) => e.value));
+    const apps = await page.$$eval('.preview-app option', (els) => els.map((e) => e.value.replace(/^app:/, '')));
     expect(apps.includes('copies/Imported'), `apps: ${apps}`);
   });
 
@@ -249,10 +249,10 @@ try {
     await page.waitForFunction(() => document.querySelectorAll('.preview-app option').length === 3, { timeout: 20_000 });
     // The new app is shown once it is saved: choose another only after that.
     await page.waitForFunction(() => document.querySelector('.chat-log')?.textContent.includes('New SoftN app "second"'), { timeout: 20_000 });
-    const options = await page.$$eval('.preview-app option', (o) => o.map((x) => x.value));
+    const options = await page.$$eval('.preview-app option', (o) => o.map((x) => x.value.replace(/^app:/, '')));
     expect(options.includes('Imported') && options.includes('apps/second'), `${options}`);
     if (softnInstalled) {
-      await page.select('.preview-app', 'Imported');
+      await page.select('.preview-app', 'app:Imported');
       // The status may still say "live" for the app shown before: wait for this app's own text.
       let rendered = false;
       for (let i = 0; i < 200 && !rendered; i++) {

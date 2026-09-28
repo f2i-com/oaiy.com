@@ -9,7 +9,10 @@
  *     page, so the agent sees them and the person can ask for a fix;
  *   - "inspect" describes what the page shows as text: headings, text,
  *     buttons, inputs with their values, checkboxes, links, images, canvases;
- *   - "act" clicks, fills, selects and presses keys, then describes the page.
+ *   - "act" clicks, fills, selects and presses keys, then describes the page;
+ *   - "screenshot" renders what the page shows to a PNG (with modern-screenshot,
+ *     loaded beside this as bot-capture.js), at the frame's own size or the
+ *     whole page.
  *
  * The frame is sandboxed with an opaque origin, so this reaches nothing of
  * bot.computer's: it only posts messages to its parent, which treats them as
@@ -81,6 +84,12 @@
     return clean(el.getAttribute('placeholder') || el.getAttribute('name') || el.getAttribute('title') || '');
   };
   const CONTROL = 'button, a[href], input, textarea, select, [role="button"], [role="checkbox"], [role="switch"], [role="tab"], [role="slider"], [contenteditable="true"]';
+  // An element the page listens to clicks on (the web page preview, whose pages run on Zipp, keeps track).
+  const CLICK_TYPES = ['click', 'pointerdown', 'mousedown', 'pointerup', 'mouseup', 'touchstart'];
+  const clickable = (el) => {
+    const types = window.__botComputerListening && window.__botComputerListening.get(el);
+    return !!types && CLICK_TYPES.some((t) => types.has(t));
+  };
   const describeControl = (el) => {
     const tag = el.tagName.toLowerCase();
     const role = el.getAttribute('role');
@@ -128,6 +137,10 @@
       if (hidden(el)) return;
       if (/^h[1-6]$/.test(tag)) return push(`${'#'.repeat(Number(tag[1]))} ${clean(el.textContent)}`);
       if (el.matches(CONTROL)) return push(describeControl(el));
+      if (clickable(el)) {
+        const text = clean(el.textContent);
+        if (text.length <= 80 && !el.querySelector(CONTROL)) return push(`[clickable "${text || labelOf(el) || tag}"]`);
+      }
       if (tag === 'img') return push(`[image "${clean(el.getAttribute('alt')) || el.getAttribute('src')?.split('/').pop() || ''}" ${el.naturalWidth}×${el.naturalHeight}]`);
       if (tag === 'canvas') return push(`[canvas ${el.width}×${el.height}]`);
       if (tag === 'video' || tag === 'audio') return push(`[${tag}${el.paused ? ' paused' : ' playing'}]`);
@@ -142,10 +155,14 @@
   };
 
   // --- acting on the page -----------------------------------------------------
-  const candidates = (selector) => [...document.querySelectorAll(selector)].filter((el) => !hidden(el));
-  const find = (target, selector, nth = 1) => {
+  const candidates = (selector, withClickable) => {
+    const all = [...document.querySelectorAll(selector)];
+    if (withClickable) for (const el of document.body.querySelectorAll('*')) if (!all.includes(el) && clickable(el)) all.push(el);
+    return all.filter((el) => !hidden(el));
+  };
+  const find = (target, selector, nth = 1, withClickable = false) => {
     const want = clean(target).toLowerCase();
-    const all = candidates(selector);
+    const all = candidates(selector, withClickable);
     const texts = all.map((el) => [el, clean(el.tagName === 'INPUT' ? el.value || labelOf(el) : el.textContent || labelOf(el)).toLowerCase(), labelOf(el).toLowerCase()]);
     const exact = texts.filter(([, t, l]) => t === want || l === want).map(([el]) => el);
     const partial = texts.filter(([, t, l]) => t.includes(want) || l.includes(want)).map(([el]) => el);
@@ -168,7 +185,7 @@
   };
   const act = async (action) => {
     if (typeof action.click === 'string') {
-      const el = find(action.click, `${CONTROL}, label, [onclick], [tabindex]`, action.nth);
+      const el = find(action.click, `${CONTROL}, label, [onclick], [tabindex]`, action.nth, true);
       el.scrollIntoView?.({ block: 'center' });
       for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup']) el.dispatchEvent(new (type.startsWith('pointer') ? PointerEvent : MouseEvent)(type, { bubbles: true, cancelable: true }));
       el.click();
@@ -204,7 +221,68 @@
     }
     throw new Error(`unknown action ${JSON.stringify(action)}: use {click}, {fill, value}, {select, value}, {key} or {wait}`);
   };
-  const settle = () => new Promise((resolve) => requestAnimationFrame(() => setTimeout(resolve, 250)));
+  // A frame off screen gets no animation frames, so a timer also ends the wait.
+  const settle = () =>
+    new Promise((resolve) => {
+      let done = false;
+      const finish = () => {
+        if (done) return;
+        done = true;
+        setTimeout(resolve, 250);
+      };
+      requestAnimationFrame(finish);
+      setTimeout(finish, 100);
+    });
+
+  // --- screenshots ------------------------------------------------------------
+  const MAX_PAGE_HEIGHT = 12_000;
+  const opaque = (color) => color && color !== 'transparent' && !/rgba\([^)]*,\s*0\)$/.test(color);
+  const shoot = async (fullPage) => {
+    const lib = window.modernScreenshot;
+    if (!lib) throw new Error('the screenshot library is not installed here (run npm install, then reload bot.computer)');
+    const root = document.documentElement;
+    const width = window.innerWidth;
+    const pageHeight = Math.max(root.scrollHeight, document.body ? document.body.scrollHeight : 0, window.innerHeight);
+    const height = fullPage ? Math.min(pageHeight, MAX_PAGE_HEIGHT) : Math.min(pageHeight, window.scrollY + window.innerHeight);
+    const background = [document.body && getComputedStyle(document.body).backgroundColor, getComputedStyle(root).backgroundColor].find(opaque) || '#ffffff';
+    // The library learns each element's default style from a blank iframe it
+    // makes; in this sandboxed frame that iframe would be another origin, so it
+    // gets a shadow root instead, where browser defaults apply and the page's
+    // stylesheets do not.
+    const host = document.createElement('div');
+    host.setAttribute('style', 'all: initial; position: fixed; left: -10000px; top: 0; visibility: hidden; pointer-events: none;');
+    const blank = host.attachShadow({ mode: 'closed' }).appendChild(document.createElement('div'));
+    blank.setAttribute('style', 'all: initial;');
+    root.appendChild(host);
+    const sandbox = {
+      contentWindow: {
+        document: { createElement: (n) => document.createElement(n), createElementNS: (ns, n) => document.createElementNS(ns, n), body: blank },
+        getComputedStyle: (el, pseudo) => getComputedStyle(el, pseudo),
+      },
+      remove: () => {},
+    };
+    let whole;
+    try {
+      const context = await lib.createContext(root, { width, height, scale: 1, backgroundColor: background, timeout: 15_000, filter: (node) => node !== host });
+      context.sandbox = sandbox;
+      whole = await lib.domToCanvas(context);
+      lib.destroyContext(context);
+    } finally {
+      host.remove();
+    }
+    let canvas = whole;
+    if (!fullPage) {
+      canvas = document.createElement('canvas');
+      canvas.width = width;
+      canvas.height = window.innerHeight;
+      const ctx = canvas.getContext('2d');
+      ctx.fillStyle = background;
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.drawImage(whole, 0, -window.scrollY);
+    }
+    const blob = await new Promise((resolve, reject) => canvas.toBlob((b) => (b ? resolve(b) : reject(new Error('the page could not be drawn'))), 'image/png'));
+    return { png: await blob.arrayBuffer(), width: canvas.width, height: canvas.height, pageHeight, scrollY: Math.round(window.scrollY), cut: fullPage && pageHeight > MAX_PAGE_HEIGHT };
+  };
 
   window.addEventListener('message', async (event) => {
     const data = event.data;
@@ -220,6 +298,8 @@
           await settle();
         }
         result = { ok: true, done, page: describe() };
+      } else if (data.type === 'bot:screenshot') {
+        result = { ok: true, page: '', shot: await shoot(data.fullPage === true) };
       } else {
         result = { ok: false, error: `unknown request ${data.type}` };
       }

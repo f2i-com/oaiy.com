@@ -7,6 +7,7 @@ A coding agent that runs entirely in your browser.
 - **A shell, emulated.** The terminal and the agent's `sandbox_shell` are a bash-like shell written in JavaScript on the same sandbox, with `git`, `jq`, `tar`/`zip`, `node` and `python` built in (see [The shell](#the-shell)). There are no real processes, so `npm install` and compilers don't exist here.
 - **Any model.** A server on your own machine (Ollama, LM Studio, nrob, llama.cpp — anything OpenAI-compatible), Anthropic's API, or any OpenAI-compatible API.
 - **Images, video and audio.** With nrob, or any service with OpenAI's media APIs, the agent can make pictures, short videos (talking ones too), speech, music and sound effects straight into the project (see [Images, video and audio](#images-video-and-audio)).
+- **Web pages with a live preview.** The agent builds HTML, CSS and JavaScript pages and sees them as you do: their JavaScript runs on the Zipp VM against the preview's real DOM, and it can screenshot the page at phone, tablet or desktop sizes (see [Web pages](#web-pages)).
 - **A network gate.** `/internet on | off | allowlist | allow <host> | deny <host> | status` (or `/net`) decides every request made on the model's behalf. Requests to your AI provider are not gated.
 
 ## Context and long work
@@ -89,6 +90,19 @@ They run in the page with the browser's own video and audio codecs (WebCodecs: H
   - `search_file` finds regex matches with line, column, character offset and context.
   - `read_file` pages by lines, cuts very long lines with a pointer to the rest, and reads raw character ranges with `char_start` (for minified or single-line files).
 
+## Web pages
+
+Any `.html` file of the project is a web page, with its CSS, images and JavaScript beside it. The **Preview** tab shows it; its picker lists the project's pages and SoftN apps, and clicking an `.html` file in the tree shows that page.
+
+- **JavaScript on Zipp.** A page's scripts don't run in the browser's own engine. The preview frame (`public/webpage/`) builds the page from its HTML and CSS, takes out its `<script>` elements and `on*` attributes, and runs them on the Zipp VM instead, against a DOM facade (`src/preview/zippDom.guest.js`). Every node, event, style or canvas the page touches is a proxy that reads, writes and calls the real object in the frame over Zipp's synchronous host channel. Listeners, timers and observers are the page's functions, called back when the real event fires. So the browser renders, lays out and dispatches, and only the page's code runs on Zipp. This follows the live DOM bridge described in zipp-browser's design notes.
+  - Works: classic scripts (several share globals and run in order), the DOM, `addEventListener` and `on*` attributes (including ones added through `innerHTML`), timers and `requestAnimationFrame`, canvas, `localStorage` (kept per page while bot.computer is open), `fetch` and `XMLHttpRequest` for the project's own files, and links between the project's pages.
+  - Doesn't: ES module `import`/`export` between files, JSX or anything that needs a build step, and the internet: the preview is offline, so CDN scripts, web fonts and remote images don't load. The page is told what didn't load.
+  - A script that never finishes (an endless loop) is stopped after about two seconds, and the page's scripts stop with it.
+  - The frame is sandboxed with an opaque origin and a strict CSP, so nothing of the page runs natively, even HTML it inserts later.
+- **Screen sizes.** The preview's size picker shows the page at a phone (390×844), tablet (820×1180), laptop (1366×768) or desktop (1920×1080) size, or any custom size. The page lays out at that size (media queries, `innerWidth`), and the frame is scaled down to fit the pane.
+- **The agent's tools:** `page_check` renders a page and reports script errors and files that didn't load. `page_inspect` and `page_interact` describe and use the page the way `softn_inspect` and `softn_interact` do for apps. `preview_viewport` sets the screen size. `preview_screenshot` shows the agent how the page (or a SoftN app) looks at that size, one screen or the whole page, and can save the PNG in the project.
+- **Screenshots** are drawn inside the frame with [modern-screenshot](https://github.com/qq15725/modern-screenshot) (bundled, offline), so they work in the browser and in the desktop app alike.
+
 ## SoftN apps
 
 bot.computer can build [SoftN](https://github.com/f2i-com/softn.com) apps and show them running while they're being built.
@@ -99,7 +113,7 @@ bot.computer can build [SoftN](https://github.com/f2i-com/softn.com) apps and sh
   - `softn_components` gives a component's exact props, events and an example.
   - `softn_examples` lists, reads or installs complete apps from softn.com's catalogue: notes, a 2048 game, a component showcase, 3D, WebGPU and device permissions.
   - All of this is bundled for offline use. Regenerate it with `npm run softn:knowledge`.
-- **Live preview:** the **App preview** tab renders the app with SoftN's hosted runtime, in a sandboxed opaque-origin iframe with its own strict CSP. It re-renders about 0.7 s after edits settle.
+- **Live preview:** the **Preview** tab renders the app with SoftN's hosted runtime, in a sandboxed opaque-origin iframe with its own strict CSP. It re-renders about 0.7 s after edits settle.
 - **Errors the agent sees and fixes:**
   - After every agent step that changes an app, bot.computer checks it: the files (manifest, listed files, `.logic` syntax compiled on Zipp), then a real render. The outcome goes into that step's result, so the agent fixes what's broken before going on. You see each check as a card in the chat.
   - If the same errors come back three times in a row, the run stops rather than loop.
@@ -110,7 +124,7 @@ bot.computer can build [SoftN](https://github.com/f2i-com/softn.com) apps and sh
   - The checklist is pinned above the chat, with a progress bar and the current step highlighted, and it updates as the agent works.
   - The agent carries the plan out without stopping to ask for permission.
   - If it stops while steps are still open, or while an app it changed still fails its check, it's asked to carry on. That repeats (up to 6 times) as long as steps get done or files change in between, and stops after two nudges in a row with no progress.
-- **Testing like a person:** `softn_inspect` describes what the page shows as text (headings, text, buttons, inputs and their values). `softn_interact` clicks, fills, selects and presses keys in the running app, then describes the result, so the agent can check that the app actually works.
+- **Testing like a person:** `softn_inspect` describes what the page shows as text (headings, text, buttons, inputs and their values). `softn_interact` clicks, fills, selects and presses keys in the running app, then describes the result, so the agent can check that the app actually works. `preview_screenshot` shows the agent how it looks, and `preview_viewport` sets the screen size, as for web pages.
 - **Export:** **Export .softn** (or `/softn export [folder]`) downloads an app as a `.softn` file. That's a flat zip with `manifest.json` at its root, and the manifest's `main`, `version` and `files` are filled in from the files actually present.
 - **Several apps per project:** any folder whose `manifest.json` has a `.ui` `main` is an app. The preview has a picker, and `/softn new <folder>`, `/softn check <folder>`, `/softn export <folder>` and `/softn apps` take a folder. **Import .softn…** (or attaching a `.softn` in the chat) unpacks an app into a folder, so the agent can read an existing app and recreate or change it in another folder. `softn_check` takes the app's folder and switches the preview to it.
 
@@ -244,7 +258,7 @@ The shell works on the project's files through the same host calls, so it can't 
 
 ```sh
 npm test           # unit: gate, virtual filesystem, agent loop over both wire formats
-npm run test:e2e   # headless Chrome: the sandbox, shell, git and tools (tests/e2e/run.mjs), the whole app with a scripted model (tests/e2e/app.mjs), images and video with a mock nrob (tests/e2e/nrob.mjs)
+npm run test:e2e   # headless Chrome: the sandbox, shell, git and tools (tests/e2e/run.mjs), the whole app with a scripted model (tests/e2e/app.mjs), web pages on Zipp with screenshots and screen sizes (tests/e2e/webpage.mjs), images and video with a mock nrob (tests/e2e/nrob.mjs)
 ```
 
 The end-to-end tests use a local Chrome or Edge (`CHROME=<path>` to choose one).

@@ -285,7 +285,7 @@ try {
     });
     await waitStatus(page, /live/, 'the example');
     const picked = await page.$eval('.preview-app', (s) => ({ value: s.value, options: [...s.options].map((o) => o.value), hidden: s.hidden }));
-    expect(picked.value === 'games/2048', `the preview is not on the new app: ${JSON.stringify(picked)}; chat: ${(await page.$eval('.chat-log', (e) => e.textContent)).slice(-300)}; tree: ${await page.$$eval('.tree-row .name', (els) => els.map((e) => e.textContent).join(','))}`);
+    expect(picked.value === 'app:games/2048', `the preview is not on the new app: ${JSON.stringify(picked)}; chat: ${(await page.$eval('.chat-log', (e) => e.textContent)).slice(-300)}; tree: ${await page.$$eval('.tree-row .name', (els) => els.map((e) => e.textContent).join(','))}`);
     const manifest = await page.evaluate(() => document.querySelector('.chat-log').textContent);
     expect(manifest.includes('a copy of the twenty48 example'), manifest.slice(-300));
   });

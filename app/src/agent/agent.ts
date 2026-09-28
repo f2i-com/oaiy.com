@@ -12,13 +12,14 @@ import { DEFAULT_COMPACT_AT, budgetFor, contextWindow, formatTokens, outputLimit
 import { normalizePath, type Vfs } from '../vfs/vfs';
 import type { ProviderConfig } from './providers/types';
 import { sendTurn, type Attachment, type FrameReview, type Reply, type ToolCall, type ToolResult, type Turn, type Usage } from './protocol';
-import { EDIT_TOOLS, EDIT_TOOLS_WINDOW, MAIN_AGENT_ONLY, TOOLS, checkApp, mediaTools, readPlan, readTasks, runTool, type Plan, type SoftnHost, type ToolContext } from './tools';
+import { EDIT_TOOLS, EDIT_TOOLS_WINDOW, MAIN_AGENT_ONLY, TOOLS, checkApp, mediaTools, readPlan, readTasks, runTool, type Plan, type PreviewHost, type ToolContext } from './tools';
 import { readProjectVoices } from './voices';
 import { MAX_REDOS, MAX_REVIEW_FAILURES, checklist, contentHash, countProblems, type PersonCount, readReviews, reviewOf, scriptExcerpt, storyFolder, writeReviews } from './review';
 import type { MediaSettings } from './media';
 import { queueFor } from './queue';
 import type { ToolSpec } from './protocol';
 import { appLabel, findApps, resolveApp } from '../softn/softn';
+import { findPages } from '../preview/page';
 import { imageMimeFor, viewImage, type ImagePart } from './images';
 
 export type AgentEvent =
@@ -220,13 +221,14 @@ The user's request is your task: do what it asks, as it asks it. Your tools say 
 Work on your own until the request is done and checked, in small, verified steps; ask only when you truly cannot decide something yourself. Read a file before you change it. When you are done, say briefly what you did and how you checked it.`;
 
 /** The kinds of work with a guide. */
-type GuideTopic = 'app' | 'video' | 'media' | 'document';
+type GuideTopic = 'app' | 'web' | 'video' | 'media' | 'document';
 
 /** What each guide is for, as the guide tool lists them. */
 const GUIDE_ABOUT: Record<GuideTopic, string> = {
   video: 'making a video, film, animation or any story told in clips: the script, pictures, voices and clips',
   media: 'making pictures, speech, voices, music or sound effects',
   app: 'building or changing an app (a SoftN app: pages, logic and a live preview); it also gives you the app tools',
+  web: 'building or changing a web page or website (HTML, CSS and JavaScript, with a live preview, screenshots and screen sizes); it also gives you the page tools',
   document: 'writing a long document: a story, a script, a report',
 };
 
@@ -234,22 +236,38 @@ const GUIDE_ABOUT: Record<GuideTopic, string> = {
 const GUIDE_WORDS: Array<[GuideTopic, RegExp]> = [
   ['video', /\b(videos?|clips?|films?|movies?|animat\w*|sitcoms?|episodes?|trailers?|cartoons?|vlogs?|commercials?)\b/i],
   ['media', /\b(images?|pictures?|photos?|drawings?|illustrations?|logos?|posters?|portraits?|songs?|music|voices?|speech|narrat\w*|podcasts?|sound effects?)\b/i],
-  ['app', /\b(apps?|softn|website|web ?page|dashboard|calculator|games?|to-?do list)\b/i],
+  ['app', /\b(apps?|softn|dashboard|calculator|games?|to-?do list)\b/i],
+  ['web', /\b(websites?|web ?sites?|web ?pages?|landing pages?|home ?pages?|html|css|responsive)\b/i],
   ['document', /\b(stor(?:y|ies)|essays?|reports?|books?|chapters?|novels?|articles?|screenplays?|poems?)\b/i],
 ];
 
 /** The note that a guide was read (in a tool result): from then on it is part of the instructions. */
 const guideLoaded = (topic: GuideTopic) => `[bot.computer] The ${topic} guide is now in your instructions`;
-const GUIDE_MARK = /\[bot\.computer\] The (app|video|media|document) guide is now in your instructions/g;
+const GUIDE_MARK = /\[bot\.computer\] The (app|web|video|media|document) guide is now in your instructions/g;
 
 /** The app tools: offered once the app guide is read, or when the project has an app. */
 const SOFTN_TOOLS = new Set(['softn_docs', 'softn_components', 'softn_examples', 'softn_check', 'softn_inspect', 'softn_interact', 'softn_import']);
 
+/** The web page tools: offered once the web guide is read, or when the project has a page. */
+const WEB_TOOLS = new Set(['page_check', 'page_inspect', 'page_interact']);
+/** How a page or an app looks, and at what screen size: with either set of tools. */
+const PREVIEW_TOOLS = new Set(['preview_screenshot', 'preview_viewport']);
+
 /** Files that make an app: writing one reads the app guide. */
 const APP_FILE = /(^|\/)(manifest\.json|[^/]+\.(ui|logic))$/;
+/** A web page: writing one reads the web guide. */
+const WEB_FILE = /\.html?$/i;
 
 const APP_GUIDE = `- A SoftN app is a folder whose manifest.json names a .ui page as "main" (with ui/*.ui pages and logic/*.logic or .py). A project can hold several, each in its own folder: to rebuild or learn from an existing app, read its files and write the new one in another folder. A .softn the user attaches is unpacked into its own folder (the original stays in uploads/, and softn_import unpacks any .softn in the project): when they ask for changes, edit that folder; when they ask to recreate, redo or base something on it, write a new app in a new folder and leave the original as it is. The SoftN reference is in your tools, so do not guess the language: softn_docs with no arguments gives the map, topic "guide" is the writing guide (read it before your first app), search finds how something is done across the guides, the components and the example apps; softn_components gives exact props and events; softn_examples has complete working apps to read or copy. Keep manifest.json true. After each step that changes an app, bot.computer checks it automatically (its files, then a real render) and adds the outcome to that step's result: when it reports errors, fix them before anything else. softn_check checks on demand; softn_inspect shows what the page displays; softn_interact uses the app like a person (click, fill, select, press keys) and reports errors the app raises, so test that the app works, not just that it renders. The user watches the app in a live preview as you build it, and can export any app folder as a .softn file.
+- preview_screenshot shows you how the app looks (look at it and fix what looks wrong), and preview_viewport sets the screen size it is shown at (phone, tablet, laptop, desktop or any size) for responsive layouts.
 - The app is done when it renders without errors and softn_interact shows it working.
+`;
+
+const WEB_GUIDE = `- A web page is an .html file of the project with its CSS, images and JavaScript beside it (say index.html, css/, js/, images/), linked by relative paths. The user watches it in a live preview as you build it; links between pages of the project open there too.
+- The preview runs the page's JavaScript on the Zipp VM against the page's real DOM, so write plain, classic browser JavaScript: <script src="js/app.js"> tags (several share globals and run in order), the DOM, addEventListener and on* attributes, timers and requestAnimationFrame, canvas, localStorage, and fetch of the project's own files (JSON, text). Not available: ES module import/export between files, JSX or anything needing a build step or npm packages, and the internet: CDN scripts, web fonts and remote images do not load, so put what the page needs in the project (use system font stacks).
+- After each change, page_check renders the page and reports script errors and files that did not load: fix them before anything else. page_inspect shows what the page displays; page_interact uses it like a person (click, fill, select, press keys), so test that it works, not just that it renders. preview_screenshot shows you how it looks: look at it, and fix what looks wrong (layout, spacing, alignment, overflow, contrast, cut-off text).
+- Make pages responsive: preview_viewport sets the screen size (phone 390×844, tablet 820×1180, laptop 1366×768, desktop 1920×1080, or any size); check and screenshot at a phone size and a desktop size at least.
+- The page is done when page_check is clean, page_interact shows it working, and the screenshots at those sizes look right.
 `;
 
 const DOCUMENT_GUIDE = `- Long documents (scripts, stories, reports: anything longer than a few pages) are written in parts, never in one call. Write an outline first (the sections, and what happens or is said in each), then the document one section per append_file call, following the outline. When it is all written, read it back in full (paging with offset) and revise it with edit_file until it is complete: every section of the outline is there and fully written, nothing is summarized or skipped ("the scene continues…", "etc."), and names, facts and tone agree from start to end.
@@ -261,8 +279,8 @@ export interface AgentOptions {
   provider: () => ProviderConfig | null;
   /** A short description of the project, given to the model with the first request. */
   projectSummary: () => string;
-  /** The live SoftN preview: softn_check, softn_inspect, softn_interact and the automatic check. */
-  softn?: SoftnHost;
+  /** The live preview of SoftN apps and web pages: the softn_ and page_ tools, screenshots and the automatic check. */
+  preview?: PreviewHost;
   /** The share of the context window a prompt may fill before older turns are summarized (default 0.75). */
   compactAt?: () => number;
   /** Guides already read (a sub-agent starts with its parent's). */
@@ -423,6 +441,7 @@ function guideTopics(names: Set<string>): GuideTopic[] {
   if (names.has('generate_video')) topics.push('video');
   if (['generate_image', 'generate_video', 'generate_speech', 'generate_music', 'generate_sound_effect', 'create_voice'].some((n) => names.has(n))) topics.push('media');
   if ([...SOFTN_TOOLS].some((n) => names.has(n)) || names.has('guide')) topics.push('app');
+  if ([...WEB_TOOLS].some((n) => names.has(n)) || names.has('guide')) topics.push('web');
   topics.push('document');
   return topics;
 }
@@ -494,7 +513,7 @@ export class Agent {
 
   constructor(private readonly options: AgentOptions) {
     // Writes made through this agent's tools are its changes; another agent's (or the person's) are not.
-    this.toolContext = { vfs: trackedVfs(options.vfs, (path) => this.onWrite?.(path)), gate: options.gate, reads: new Map(), shell: { cwd: '/', env: {} }, softn: options.softn, media: options.media, spoken: new Map(), viewSize: options.viewSize };
+    this.toolContext = { vfs: trackedVfs(options.vfs, (path) => this.onWrite?.(path)), gate: options.gate, reads: new Map(), shell: { cwd: '/', env: {} }, preview: options.preview, media: options.media, spoken: new Map(), viewSize: options.viewSize };
   }
 
   reset(): void {
@@ -602,7 +621,8 @@ export class Agent {
     const all = [...(lean ? TOOLS.filter((t) => !EDIT_TOOLS.has(t.name)) : TOOLS), ...mediaTools(this.options.media?.(), readProjectVoices(this.options.vfs))];
     // The app tools only once there is an app to work on: otherwise they only distract.
     const apps = this.loadedGuides().has('app') || findApps(this.options.vfs).length > 0;
-    const tools = apps ? all : all.filter((t) => !SOFTN_TOOLS.has(t.name));
+    const web = this.loadedGuides().has('web') || findPages(this.options.vfs).length > 0;
+    const tools = all.filter((t) => (apps || !SOFTN_TOOLS.has(t.name)) && (web || !WEB_TOOLS.has(t.name)) && (apps || web || !PREVIEW_TOOLS.has(t.name)));
     const topics = guideTopics(new Set(all.map((t) => t.name)));
     return [...tools, {
       name: 'guide',
@@ -630,6 +650,7 @@ export class Agent {
     const has = (name: string) => names.has(name);
     const edit = has('media_compose') ? MEDIA_EDIT_GUIDE : '';
     if (topic === 'app') return APP_GUIDE;
+    if (topic === 'web') return WEB_GUIDE;
     if (topic === 'document') return DOCUMENT_GUIDE;
     if (topic === 'media') return MEDIA_MAKE_GUIDE + edit;
     const script = has('media_compose') ? VIDEO_SCRIPT_GUIDE : VIDEO_SCRIPT_BRIEF;
@@ -642,7 +663,8 @@ export class Agent {
     const topics = guideTopics(new Set(this.tools.map((t) => t.name)));
     if (!topics.includes(topic)) return { id: call.id, name: call.name, content: `Error: no guide "${String(topic)}". The guides: ${topics.join(', ')}.`, isError: true };
     if (this.loadedGuides().has(topic)) return { id: call.id, name: call.name, content: `The ${topic} guide is already in your instructions: follow it.`, isError: false };
-    return { id: call.id, name: call.name, content: `${guideLoaded(topic)}: follow it from now on.${topic === 'app' ? ' The app tools (softn_docs, softn_components, softn_examples, softn_check, softn_inspect, softn_interact, softn_import) are yours from now on too.' : ''}`, isError: false };
+    const tools = topic === 'app' ? ' The app tools (softn_docs, softn_components, softn_examples, softn_check, softn_inspect, softn_interact, softn_import, preview_screenshot, preview_viewport) are yours from now on too.' : topic === 'web' ? ' The page tools (page_check, page_inspect, page_interact, preview_screenshot, preview_viewport) are yours from now on too.' : '';
+    return { id: call.id, name: call.name, content: `${guideLoaded(topic)}: follow it from now on.${tools}`, isError: false };
   }
 
   /**
@@ -686,7 +708,7 @@ export class Agent {
     const topics = guideTopics(names);
     const loaded = this.loadedGuides();
     // The video guide holds the media one.
-    const read = (['document', 'app', 'media', 'video'] as GuideTopic[]).filter((t) => loaded.has(t) && topics.includes(t) && !(t === 'media' && loaded.has('video')));
+    const read = (['document', 'app', 'web', 'media', 'video'] as GuideTopic[]).filter((t) => loaded.has(t) && topics.includes(t) && !(t === 'media' && loaded.has('video')));
     const guides = read.map((t) => `\n\nThe ${t} guide:\n${this.guideText(t, names)}`).join('');
     // A video follows the request: it stays in view, word for word, however long the work (as a reference, not a step to take).
     const request = read.includes('video') && !this.options.role ? this.requestText() : '';
@@ -1632,6 +1654,10 @@ export class Agent {
           // Writing an app's files reads the app guide (and gives the app tools).
           if (!result.isError && /^(write_file|append_file|edit_file)$/.test(call.name) && typeof call.input.path === 'string' && APP_FILE.test(call.input.path) && !this.loadedGuides().has('app') && this.tools.some((t) => t.name === 'guide')) {
             result.content += `\n\n${guideLoaded('app')}: follow it from your next step. The app tools (softn_docs, softn_check, softn_interact, …) are yours now too.`;
+          }
+          // Writing a web page reads the web guide (and gives the page tools).
+          if (!result.isError && /^(write_file|append_file|edit_file)$/.test(call.name) && typeof call.input.path === 'string' && WEB_FILE.test(call.input.path) && !this.loadedGuides().has('web') && this.tools.some((t) => t.name === 'guide')) {
+            result.content += `\n\n${guideLoaded('web')}: follow it from your next step. The page tools (page_check, page_interact, preview_screenshot, preview_viewport, …) are yours now too.`;
           }
           if (call.name === 'view_image' && !result.isError) this.noteLook(call.input);
           // A picture for a scripted video is reviewed before anything else is made.

@@ -1,2 +1,5 @@
 bot.computer
 Copyright f2i-com
+
+The preview frames load modern-screenshot (https://github.com/qq15725/modern-screenshot),
+copied from node_modules as bot-capture.js: MIT License, Copyright (c) 2021-present wxm.

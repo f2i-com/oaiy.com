@@ -2,7 +2,7 @@ import { defineConfig } from 'vitest/config';
 import { createHash } from 'node:crypto';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { installBridge } from './scripts/softn-bridge/install.mjs';
+import { copyBridge, installBridge } from './scripts/softn-bridge/install.mjs';
 
 // The sandbox blocks a Worker on SharedArrayBuffer + Atomics.wait while the
 // page answers its host calls, which needs a cross-origin isolated page.
@@ -17,9 +17,11 @@ const isolation = {
 // loads from /softn/ is a cross-origin fetch from its point of view.
 const softnHeaders = {
   name: 'softn-runtime-headers',
-  // The runtime in public/softn/ gets bot.computer's bridge (errors, inspect, act).
+  // The runtime in public/softn/ and the web page preview in public/webpage/ get
+  // bot.computer's bridge (errors, inspect, act, screenshot).
   buildStart() {
     installBridge('public/softn');
+    copyBridge('public/webpage');
   },
   configureServer(server: { middlewares: { use: (fn: (req: { url?: string }, res: { setHeader: (k: string, v: string) => void }, next: () => void) => void) => void } }) {
     server.middlewares.use(softnMiddleware);
@@ -29,7 +31,7 @@ const softnHeaders = {
   },
 };
 function softnMiddleware(req: { url?: string }, res: { setHeader: (k: string, v: string) => void }, next: () => void): void {
-  if (req.url?.startsWith('/softn/')) {
+  if (req.url?.startsWith('/softn/') || req.url?.startsWith('/webpage/')) {
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
   }

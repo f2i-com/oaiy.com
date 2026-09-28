@@ -124,6 +124,30 @@ describe('tool rules', () => {
     expect(names(fake.bodies[1])).toContain('softn_docs');
   });
 
+  it('gives the web guide and the page tools with a web page to work on', async () => {
+    const names = (body: Record<string, unknown>) => (body.tools as Array<{ function: { name: string } }>).map((t) => t.function.name);
+    const system = (body: Record<string, unknown>) => String((body.messages as Array<{ content: unknown }>)[0].content);
+    const fake = fakeProvider('openai', [
+      { calls: [{ name: 'write_file', input: { path: 'site/index.html', content: '<h1>Hi</h1>\n' } }] },
+      { text: 'ok' },
+    ]);
+    const vfs = new Vfs();
+    await new Agent({ vfs, gate: new NetGate(), provider: () => ({ ...LOCAL, contextTokens: 32_000 }), projectSummary: () => '' }).run('hello', () => {});
+    // Nothing about pages before there is one.
+    expect(names(fake.bodies[0])).not.toContain('page_check');
+    expect(names(fake.bodies[0])).not.toContain('preview_screenshot');
+    expect(system(fake.bodies[0])).not.toContain('The web guide:');
+    // A page written: the guide and the page tools, screenshots and screen sizes from the next step on.
+    expect(system(fake.bodies[1])).toContain('The web guide:');
+    expect(names(fake.bodies[1])).toEqual(expect.arrayContaining(['page_check', 'page_inspect', 'page_interact', 'preview_screenshot', 'preview_viewport']));
+    expect(names(fake.bodies[1])).not.toContain('softn_check');
+    // A request for a website reads the guide with it.
+    const site = fakeProvider('openai', [{ text: 'ok' }]);
+    await new Agent({ vfs: new Vfs(), gate: new NetGate(), provider: () => ({ ...LOCAL, contextTokens: 32_000 }), projectSummary: () => '' }).run('Build me a landing page for my bakery', () => {});
+    expect(system(site.bodies[0])).toContain('The web guide:');
+    expect(system(site.bodies[0])).not.toContain('A SoftN app is a folder');
+  });
+
   it('reads the guide a request plainly asks for, and a picture made without one waits for it', async () => {
     const system = (body: Record<string, unknown>) => String((body.messages as Array<{ content: unknown }>)[0].content);
     const media = { ...EMPTY_MEDIA, baseUrl: 'http://127.0.0.1:8080', imageModel: 'image', videoModel: 'video', speechModel: 'speech' };

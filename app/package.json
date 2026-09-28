@@ -21,7 +21,7 @@
     "desktop:portable": "node scripts/desktop-portable.mjs",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "test:e2e": "node tests/e2e/run.mjs && node tests/e2e/app.mjs && node tests/e2e/files.mjs && node tests/e2e/softn.mjs && node tests/e2e/csp.mjs && node tests/e2e/nrob.mjs && node tests/e2e/static.mjs --build"
+    "test:e2e": "node tests/e2e/run.mjs && node tests/e2e/app.mjs && node tests/e2e/files.mjs && node tests/e2e/softn.mjs && node tests/e2e/webpage.mjs && node tests/e2e/csp.mjs && node tests/e2e/nrob.mjs && node tests/e2e/static.mjs --build"
   },
   "dependencies": {
     "@codemirror/lang-css": "^6.3.1",
@@ -35,7 +35,8 @@
     "@codemirror/view": "^6.43.13",
     "codemirror": "^6.0.2",
     "fflate": "^0.8.3",
-    "mediabunny": "^1.60.0"
+    "mediabunny": "^1.60.0",
+    "modern-screenshot": "^4.7.0"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.11.5",

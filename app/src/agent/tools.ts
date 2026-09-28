@@ -13,7 +13,8 @@ import { runInSandbox } from '../sandbox/runner';
 import { VfsError, normalizePath, type Vfs } from '../vfs/vfs';
 import type { FrameReview, ToolCall, ToolResult, ToolSpec } from './protocol';
 import { appLabel, checkProject, describeApp, findApps, formatFindings, guideFor, importSoftn, logicSyntax, resolveApp } from '../softn/softn';
-import type { PageReport, PreviewAction, PreviewResult } from '../softn/preview';
+import { VIEWPORTS, targetLabel, type PageReport, type PreviewAction, type PreviewResult, type PreviewTarget, type Problem, type Shot, type Viewport, type ViewportInfo } from '../preview/preview';
+import { findPages, resolvePage } from '../preview/page';
 import { describeExample, docsMap, installExample, listExamples, lookupComponents, readTopic, searchKnowledge } from '../softn/knowledge';
 import { DEFAULT_VIEW_SIZE, MAX_VIEW_SIZE, imageMimeFor, imageSize, viewImage, type ImagePart } from './images';
 import { FRAME_KINDS, MAX_REDOS, MAX_REVIEW_FAILURES, awaitingReview, contentHash, readReviews, reviewOf, storyFolder, writeReviews, type FrameKind } from './review';
@@ -80,11 +81,16 @@ export function readPlan(input: Record<string, unknown>): Plan {
   return { goal: typeof input.goal === 'string' ? input.goal.trim().slice(0, 300) : '', items };
 }
 
-/** The live SoftN preview, as the tools use it. */
-export interface SoftnHost {
-  check(root?: string): Promise<PreviewResult>;
-  inspect(root?: string): Promise<PageReport>;
-  act(root: string | undefined, actions: PreviewAction[]): Promise<PageReport>;
+/** The live preview (SoftN apps and web pages), as the tools use it. */
+export interface PreviewHost {
+  check(target?: PreviewTarget): Promise<PreviewResult>;
+  inspect(target?: PreviewTarget): Promise<PageReport>;
+  act(target: PreviewTarget | undefined, actions: PreviewAction[]): Promise<PageReport>;
+  screenshot(target: PreviewTarget | undefined, options: { fullPage?: boolean }): Promise<Shot & { problems: Problem[] }>;
+  setViewport(size: Viewport | null): ViewportInfo;
+  viewport(): ViewportInfo;
+  /** What it shows now. */
+  readonly target: PreviewTarget | null;
 }
 
 export interface ToolContext {
@@ -94,8 +100,8 @@ export interface ToolContext {
   reads: Map<string, number>;
   /** The emulated shell's state, kept between calls. */
   shell: { cwd: string; env: Record<string, string> };
-  /** The live SoftN preview, when the page has one. */
-  softn?: SoftnHost;
+  /** The live preview of SoftN apps and web pages, when the page has one. */
+  preview?: PreviewHost;
   signal?: AbortSignal;
   /** False when the model has refused images: view_image then says so instead of sending one. */
   images?: boolean;
@@ -641,6 +647,52 @@ export const TOOLS: ToolSpec[] = [
     },
   },
   {
+    name: 'page_check',
+    description:
+      'Check a web page (an .html file of the project, with its CSS, images and JavaScript) in the live preview, which switches to show it: it renders the page, runs its scripts and returns script errors and files that did not load. ' +
+      'The page\'s JavaScript runs on the Zipp VM against the page\'s real DOM, so classic browser JavaScript works (DOM, events, timers, canvas, localStorage, fetch of the project\'s own files); ES module import/export, JSX and the internet (CDN scripts, fonts, images) do not. Errors inside async code other than handlers may go unreported. Run it after every change to a page.',
+    parameters: { type: 'object', properties: { path: { ...str, description: 'The page, e.g. "site/index.html" (a folder means its index.html); optional when the project has one page' } } },
+  },
+  {
+    name: 'page_inspect',
+    description: 'Describe what a web page shows in the live preview right now, as text: headings, text, buttons and other clickable things, inputs with their values, links, images and canvases, plus errors the page reported.',
+    parameters: { type: 'object', properties: { path: { ...str, description: 'The page; optional when the project has one page or the preview shows one' } } },
+  },
+  {
+    name: 'page_interact',
+    description:
+      'Use a web page in the live preview the way a person would, to test that it works: a list of actions, run in order, then the page as text and any errors it raised. ' +
+      'Actions: {"click": "<button, link or clickable text, or a label>"}, {"fill": "<input label or placeholder>", "value": "..."}, {"select": "<select label>", "value": "<option>"}, {"key": "Enter" | "ArrowUp" | "a" …}, {"wait": 500}. Add "nth": 2 to pick the second match. ' +
+      'State carries over between calls until the page is changed or re-rendered.',
+    parameters: {
+      type: 'object',
+      required: ['actions'],
+      properties: { path: { ...str, description: 'The page; optional when the project has one page or the preview shows one' }, actions: { type: 'array', items: { type: 'object' } } },
+    },
+  },
+  {
+    name: 'preview_screenshot',
+    description:
+      'See how a web page or SoftN app looks: a screenshot of the live preview at its current screen size (preview_viewport sets it), shown to you as an image. Look at it and fix what looks wrong: layout, spacing, overflow, alignment, contrast, text that is cut off. ' +
+      '`full_page` captures the whole scrolling page instead of one screen; `save_to` also saves the PNG in the project (then view_image can zoom into parts of it).',
+    parameters: {
+      type: 'object',
+      properties: {
+        path: { ...str, description: 'A web page, e.g. "index.html"; or leave it out for what the preview shows' },
+        app: { ...str, description: 'A SoftN app\'s folder, instead of a page' },
+        full_page: { type: 'boolean' },
+        save_to: { ...str, description: 'A .png path in the project, e.g. "screenshots/home-phone.png"' },
+      },
+    },
+  },
+  {
+    name: 'preview_viewport',
+    description:
+      `Set the screen size the live preview shows pages and apps at, for responsive design: a preset (${Object.entries(VIEWPORTS).map(([k, v]) => `${k} ${v.width}×${v.height}`).join(', ')}), "fit" (the preview pane's own size), or width and height in CSS pixels (200-3840). ` +
+      'The page lays out at that size (media queries, innerWidth), and the size stays for later checks and screenshots until changed. With no arguments it reports the current size.',
+    parameters: { type: 'object', properties: { preset: { type: 'string', enum: [...Object.keys(VIEWPORTS), 'fit'] }, width: int, height: int } },
+  },
+  {
     name: 'softn_import',
     description: 'Unpack a .softn file (a zipped SoftN app) that is in the project into a new folder of its own, named after the app (never over existing files), and list what it holds. Uploaded .softn files are unpacked already; use this for one that is not, or to get a fresh copy of the original to compare with or start again from. Then change the unpacked app in place, or read it and write a new app in another folder, as the user asks.',
     parameters: { type: 'object', required: ['path'], properties: { path: { ...str, description: 'The .softn (or .zip) file, e.g. "uploads/Tasks.softn"' }, parent: { ...str, description: 'Folder to unpack under (default: the project root)' } } },
@@ -1076,16 +1128,80 @@ async function execute(call: ToolCall, ctx: ToolContext, out: ToolOut): Promise<
     case 'softn_inspect': case 'softn_interact': {
       const target = resolveApp(vfs, input.app);
       if (!target.ok) throw new Error(target.reason);
-      if (!ctx.softn) throw new Error('there is no live preview in this session');
-      const report = call.name === 'softn_inspect' ? await ctx.softn.inspect(target.root) : await ctx.softn.act(target.root, Array.isArray(input.actions) ? (input.actions as PreviewAction[]) : []);
-      const lines = [`App: ${appLabel(target.root)}`];
-      if (report.done?.length) lines.push(`Done: ${report.done.join('; ')}`);
-      if (report.error) lines.push(`Could not: ${report.error}`);
-      lines.push(formatProblems(report.problems) || 'Errors: none reported.');
-      lines.push('The page now shows:', report.page || '(nothing)');
-      const text = cut(lines.join('\n'));
-      if (report.error || report.problems.some((p) => p.level === 'error')) throw new Error(text);
-      return text;
+      if (!ctx.preview) throw new Error('there is no live preview in this session');
+      const app: PreviewTarget = { kind: 'app', root: target.root };
+      const report = call.name === 'softn_inspect' ? await ctx.preview.inspect(app) : await ctx.preview.act(app, Array.isArray(input.actions) ? (input.actions as PreviewAction[]) : []);
+      return pageReport(`App: ${appLabel(target.root)}`, report);
+    }
+    case 'page_check': {
+      if (!ctx.preview) throw new Error('there is no live preview in this session');
+      const page = pageTarget(ctx, input.path, false);
+      const result = await ctx.preview.check(page);
+      const lines = [`Page: /${page.path} (${viewportText(ctx.preview.viewport())})`];
+      if (result.ok) lines.push('Render: the page loaded and its scripts ran without reported errors (the user sees it in the preview).');
+      else lines.push(`Errors:\n${result.errors.map((e) => `- ${e}`).join('\n')}`);
+      if (result.warnings?.length) lines.push(`Warnings:\n${[...new Set(result.warnings)].slice(0, 12).map((w) => `- ${w}`).join('\n')}`);
+      const text = lines.join('\n');
+      if (!result.ok) throw new Error(text);
+      return `${text}\npage_inspect shows what it displays, page_interact tries it, preview_screenshot shows how it looks.`;
+    }
+    case 'page_inspect': case 'page_interact': {
+      if (!ctx.preview) throw new Error('there is no live preview in this session');
+      const page = pageTarget(ctx, input.path, true);
+      const report = call.name === 'page_inspect' ? await ctx.preview.inspect(page) : await ctx.preview.act(page, Array.isArray(input.actions) ? (input.actions as PreviewAction[]) : []);
+      return pageReport(`Page: /${page.path}`, report);
+    }
+    case 'preview_viewport': {
+      if (!ctx.preview) throw new Error('there is no live preview in this session');
+      const preset = typeof input.preset === 'string' ? input.preset : '';
+      const width = typeof input.width === 'number' ? input.width : undefined;
+      const height = typeof input.height === 'number' ? input.height : undefined;
+      let info: ViewportInfo;
+      if (preset === 'fit') info = ctx.preview.setViewport(null);
+      else if (preset) {
+        if (!VIEWPORTS[preset]) throw new Error(`no preset "${preset}": ${Object.keys(VIEWPORTS).join(', ')} or fit`);
+        info = ctx.preview.setViewport(VIEWPORTS[preset]);
+      } else if (width !== undefined || height !== undefined) {
+        const now = ctx.preview.viewport();
+        info = ctx.preview.setViewport({ width: width ?? now.width, height: height ?? now.height });
+      } else info = ctx.preview.viewport();
+      return `The preview shows pages at ${viewportText(info)}.`;
+    }
+    case 'preview_screenshot': {
+      if (!ctx.preview) throw new Error('there is no live preview in this session');
+      let target: PreviewTarget | undefined;
+      if (typeof input.app === 'string') {
+        const app = resolveApp(vfs, input.app);
+        if (!app.ok) throw new Error(app.reason);
+        target = { kind: 'app', root: app.root };
+      } else if (typeof input.path === 'string' && input.path.trim()) target = pageTarget(ctx, input.path, false);
+      else if (!ctx.preview.target) {
+        const pages = findPages(vfs);
+        const apps = findApps(vfs);
+        if (pages.length + apps.length === 0) throw new Error('there is no web page or SoftN app to show yet');
+        target = apps.length ? { kind: 'app', root: apps[0] } : { kind: 'page', path: pages[0] };
+      }
+      const fullPage = input.full_page === true;
+      if (ctx.images === false) {
+        const report = await ctx.preview.inspect(target);
+        return `This model does not take images, so here is the page as text instead.\n${pageReport(target ? targetLabel(target) : 'The preview', report)}`;
+      }
+      const shot = await ctx.preview.screenshot(target, { fullPage });
+      const shown = ctx.preview.target ? targetLabel(ctx.preview.target) : 'the preview';
+      const lines = [`Screenshot of ${shown}: ${shot.width}×${shot.height} px at ${viewportText(ctx.preview.viewport())}${fullPage ? `, the whole page${shot.cut ? ` (cut at ${shot.height} of ${shot.pageHeight} px)` : ''}` : shot.pageHeight > shot.height ? `, one screen of a ${shot.pageHeight} px page (full_page shows it all)` : ''}.`];
+      if (typeof input.save_to === 'string' && input.save_to.trim()) {
+        let path = normalizePath(input.save_to);
+        if (!/\.png$/i.test(path)) path = `${path.replace(/\.[a-z0-9]{1,5}$/i, '')}.png`;
+        vfs.writeFile(`/${path}`, shot.png, { parents: true });
+        out.files.push(path);
+        lines.push(`Saved /${path}.`);
+      }
+      const view = await viewImage(shot.png, 'image/png', { maxSize: Math.min(ctx.viewSize ?? MAX_VIEW_SIZE, MAX_VIEW_SIZE), label: shown });
+      out.images.push(view.image);
+      if (view.shownWidth < shot.width * 0.9) lines.push(`Shown at ${view.shownWidth}×${view.shownHeight}; save_to and view_image zoom into parts.`);
+      const problems = formatProblems(shot.problems);
+      if (problems) lines.push(problems);
+      return lines.join('\n');
     }
     case 'delegate':
       throw new Error('delegate is not available here: sub-agents do the work themselves');
@@ -1485,16 +1601,43 @@ function formatProblems(problems: PageReport['problems']): string {
  * logic syntax) and a real render in the live preview. Used by softn_check
  * and by the automatic check after the agent changes an app.
  */
+/** The page a page tool means: the one named, the one the preview shows, or the only one there is. */
+function pageTarget(ctx: ToolContext, asked: unknown, preferShown: boolean): { kind: 'page'; path: string } {
+  const named = typeof asked === 'string' && asked.trim() ? asked : undefined;
+  const shown = ctx.preview?.target;
+  if (!named && preferShown && shown?.kind === 'page') return shown;
+  const page = resolvePage(ctx.vfs, named);
+  if (!page.ok) throw new Error(page.reason);
+  return { kind: 'page', path: page.path };
+}
+
+function viewportText(info: ViewportInfo): string {
+  const preset = Object.entries(VIEWPORTS).find(([, v]) => v.width === info.width && v.height === info.height)?.[0];
+  return info.fit ? `the pane's size, ${info.width}×${info.height}` : `${preset ? `${preset} size, ` : ''}${info.width}×${info.height}`;
+}
+
+/** An inspect or interact report for the agent (an error when something went wrong). */
+function pageReport(title: string, report: PageReport): string {
+  const lines = [title];
+  if (report.done?.length) lines.push(`Done: ${report.done.join('; ')}`);
+  if (report.error) lines.push(`Could not: ${report.error}`);
+  lines.push(formatProblems(report.problems) || 'Errors: none reported.');
+  lines.push('The page now shows:', report.page || '(nothing)');
+  const text = cut(lines.join('\n'));
+  if (report.error || report.problems.some((p) => p.level === 'error')) throw new Error(text);
+  return text;
+}
+
 export async function checkApp(ctx: ToolContext, root: string): Promise<{ ok: boolean; text: string; signature: string }> {
   const findings = [...checkProject(ctx.vfs, root), ...(await logicSyntax(ctx.vfs, root).catch(() => []))];
   const lines = [`App: ${appLabel(root)}`, `Files: ${formatFindings(findings)}`];
   const problems: string[] = findings.filter((f) => f.level === 'error').map((f) => `${f.file}: ${f.message}`);
   if (problems.length) {
     lines.push('Render: skipped until the file errors above are fixed.');
-  } else if (!ctx.softn) {
+  } else if (!ctx.preview) {
     lines.push('Render: no live preview in this session.');
   } else {
-    const result = await ctx.softn.check(root);
+    const result = await ctx.preview.check({ kind: 'app', root });
     problems.push(...result.errors);
     lines.push(result.ok ? 'Render: the app loaded and rendered without reported errors (the user sees it in the preview).' : `Render errors:\n${result.errors.map((e) => `- ${e}`).join('\n')}`);
     if (result.warnings?.length) lines.push(`Warnings while it loaded (often a handler or name the logic does not define):\n${[...new Set(result.warnings)].slice(0, 8).map((w) => `- ${w}`).join('\n')}`);
