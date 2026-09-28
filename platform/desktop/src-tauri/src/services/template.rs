@@ -58,6 +58,12 @@ pub struct ServiceTemplate {
     #[serde(default)]
     pub installed_marker: Option<String>,
 
+    /// Start with OAIY once installed (ticked when its install succeeds; the
+    /// Services page can untick it). For a service that must be warm before
+    /// it is needed: the voice a call is answered in.
+    #[serde(default)]
+    pub autostart: bool,
+
     /// How to run the service.
     pub run: RunSpec,
 
@@ -251,6 +257,7 @@ mod tests {
             assert!(script.contains(&format!("name = '{model}'")), "the installer must find or fetch {model}");
         }
         assert!(t.installed_marker.as_deref().is_some_and(|m| script.contains("'.oaiy-installed'") && m.ends_with("oaiy-voice/.oaiy-installed")));
+        assert!(t.autostart, "the voice is loaded before the first call");
     }
 
     use super::*;

@@ -9,6 +9,7 @@
     "windows": "install-oaiy-voice.ps1"
   },
   "installedMarker": "${modelsDir}/oaiy-voice/.oaiy-installed",
+  "autostart": true,
   "run": {
     "command": "oaiy-voice",
     "args": [

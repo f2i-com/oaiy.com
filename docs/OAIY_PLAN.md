@@ -112,6 +112,9 @@ streamed PCM or a WAV, and `/v1/audio/voices`), so the desktop's calls and the
 - **The GPU:** `--device auto` takes the CUDA GPU with the most free memory when it starts
   (about 4 GB for both models); the engines that load later size themselves around it. The
   Services page can pin it to a GPU.
+- **Warm before the phone rings:** it starts with OAIY once installed (its template's
+  `autostart`), and the language model stays loaded (`llm.autostart`, `idle_stop_minutes: 0`
+  in the engines' settings), so a caller never waits for a model to load.
 - **The models:** found by name in the model folders (`--model-dirs`), or downloaded by its
   installer at pinned revisions with checksums.
 - **The voices:** clips in `<data>/voices`, by file name; the one calls use is chosen on the

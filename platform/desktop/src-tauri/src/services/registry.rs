@@ -1936,6 +1936,8 @@ impl Registry {
         // Collected here, written AFTER the loop so we can resolve the marker path via self.ctx
         // (an immutable borrow) without conflicting with the mutable services iteration.
         let mut mark_installed: Vec<(u16, String)> = Vec::new();
+        // Installed just now, and meant to start with OAIY (`autostart` in the template).
+        let mut start_with_oaiy: Vec<String> = Vec::new();
         for svc in self.services.values_mut() {
             // Reap the install script if one's in flight.
             if svc.status == ServiceStatus::Installing {
@@ -1944,6 +1946,9 @@ impl Registry {
                         if code == 0 {
                             if let Some(marker) = svc.template.installed_marker.clone() {
                                 mark_installed.push((svc.port, marker));
+                            }
+                            if svc.template.autostart {
+                                start_with_oaiy.push(svc.template.id.clone());
                             }
                         }
                         // KEEP the installer (and its LogBuffer) so a failed
@@ -2039,6 +2044,16 @@ impl Registry {
             }
             if let Err(e) = std::fs::write(&resolved, "installed by oaiy\n") {
                 log::warn!("could not write install marker {resolved}: {e}");
+            }
+        }
+        // A service meant to be warm before it is needed starts with OAIY from now on.
+        if !start_with_oaiy.is_empty() {
+            let before = self.autostart.len();
+            self.autostart.extend(start_with_oaiy);
+            if self.autostart.len() != before {
+                if let Err(e) = self.persist_autostart() {
+                    log::warn!("could not note the services that start with OAIY: {e}");
+                }
             }
         }
     }
