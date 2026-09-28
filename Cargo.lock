@@ -1599,6 +1599,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "oaiy-voice"
+version = "0.1.0"
+dependencies = [
+ "candle-core",
+ "candle-nn",
+ "dsv41",
+ "half",
+ "oaiy-engine",
+]
+
+[[package]]
 name = "objc2"
 version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
