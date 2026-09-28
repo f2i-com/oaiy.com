@@ -1876,7 +1876,7 @@ fn ffn_chunk(
 /// every time: coder-cli's system prompt is thousands of tokens, and reading it
 /// takes minutes. This is what lets a later process start where an earlier one
 /// finished instead of reading it again -- the same trick `dsv41_cuda::Snapshot`
-/// does for DeepSeek, whose states `nrob-server` already keeps on disk.
+/// does for DeepSeek, whose states `oaiy-llm-server` already keeps on disk.
 ///
 /// The recurrent state is fixed-size (34 layers x 4.2 MB) and has to be kept whole.
 /// The caches are not: `latents` and the indexer buffers are allocated for

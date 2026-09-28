@@ -135,7 +135,7 @@ pub const fn n_select(indexer_top_k: usize, kpool: usize) -> usize {
 ///
 /// The reference gates on `cparams.n_ctx > n_select`, deliberately **not** on
 /// the live `n_kv`: "gated on n_ctx, not n_kv, which grows and would flip the
-/// graph topology mid-run." nrob has no graph-topology constraint, but the
+/// graph topology mid-run." OAIY has no graph-topology constraint, but the
 /// comparison target does, so this must gate on the same quantity — the cache
 /// capacity — or a prompt straddling `n_select` would diverge from llama.cpp
 /// mid-prefill.

@@ -39,11 +39,11 @@ describe("a project's saved voices", () => {
     const listed = projectVoiceList(project, [
       { name: 'Gary-abc123', description: 'tired chef' },
       { name: 'Gary-ffee00', description: "another project's" },
-      { name: 'Narrator', description: 'made in nrob Studio' },
+      { name: 'Narrator', description: 'made in OAIY Studio' },
     ]);
     expect(listed).toEqual([
       { name: 'Gary', description: 'tired chef' },
-      { name: 'Narrator', description: 'made in nrob Studio' },
+      { name: 'Narrator', description: 'made in OAIY Studio' },
     ]);
   });
 
@@ -85,7 +85,7 @@ describe("a project's saved voices", () => {
       sent.push(body);
       if (String(url).includes('/voices')) {
         expect(body.keep).toBe(false);
-        return new Response(JSON.stringify({ name: body.name, description: 'gruff', voice: { nrob_voice: 1, name: body.name, ref_text: 'hi', ref_codes: [[1]], speaker: [0.5] }, sample: { format: 'wav', data: btoa('RIFFdata') } }), { headers: { 'Content-Type': 'application/json' } });
+        return new Response(JSON.stringify({ name: body.name, description: 'gruff', voice: { oaiy_voice: 1, name: body.name, ref_text: 'hi', ref_codes: [[1]], speaker: [0.5] }, sample: { format: 'wav', data: btoa('RIFFdata') } }), { headers: { 'Content-Type': 'application/json' } });
       }
       return new Response(new Uint8Array([1, 2, 3]), { headers: { 'Content-Type': 'audio/mpeg' } });
     }));

@@ -952,7 +952,7 @@ impl Glm5NextModel {
     }
 
     /// How many trunk layers run each attention kind — cheap sanity readout for
-    /// `nrob info`, and what the streamed-vs-resident tests assert on.
+    /// `OAIY info`, and what the streamed-vs-resident tests assert on.
     pub fn layer_census(&self) -> (usize, usize) {
         // From the layer map rather than from `blocks`, which the streaming path
         // leaves empty.
@@ -1036,7 +1036,7 @@ impl Glm5NextModel {
     pub fn tier_stats(
         &self,
     ) -> Option<(
-        nrob::ecache::CacheStats,
+        oaiy_engine::ecache::CacheStats,
         Vec<crate::expert_stream::device_cache::DeviceCacheStats>,
         (u64, u64, f64),
         (u64, u64, u64),
@@ -1143,7 +1143,7 @@ impl Glm5NextModel {
         let mut st = d.state.lock().unwrap_or_else(|e| e.into_inner());
 
         // One thing does cross from the argument: a caller that has reset the cache
-        // is starting a new sequence, and `nrob-cli` does exactly that between turns.
+        // is starting a new sequence, and `oaiy-llm-cli` does exactly that between turns.
         // Mirroring it here means the generic contract works without the caller
         // knowing this architecture keeps its own state.
         if kv.len == 0 && st.len != 0 {

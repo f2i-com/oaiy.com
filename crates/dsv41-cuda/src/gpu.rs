@@ -19,7 +19,7 @@ use cudarc::driver::{
     LaunchConfig, PushKernelArg, ValidAsZeroBits,
 };
 use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
-use nrob::{Error, Result};
+use oaiy_engine::{Error, Result};
 
 const SRC: &str = concat!(include_str!("kernels.cu"), "\nextern \"C\" {\n", include_str!("ternary.cuh"), "\n}\n");
 const KERNELS: &[&str] = &[

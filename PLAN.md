@@ -1,6 +1,6 @@
-# nrob — System Plan
+# OAIY — System Plan
 
-**nrob** (**N**VMe · **R**AM · **O**n-GPU · **B**roker) is a Rust inference engine
+**OAIY** (**N**VMe · **R**AM · **O**n-GPU · **B**roker) is a Rust inference engine
 for models far bigger than VRAM, on consumer hardware. The weights stay on disk in the
 files they were published in, **GGUF** or **safetensors**, with no conversion step
 and no format of our own. The engine keeps the shared trunk resident, reads each
@@ -17,15 +17,15 @@ computes RAM-resident experts when that beats a PCIe upload.
 ## Products and crates
 
 ```
-nrob/                       workspace root
+oaiy/                       workspace root
   crates/
-    nrob/                   core: WeightStore seam, Ecache, thread pool, JSON parser (std-only)
-    nrob-cli/               `nrob` binary for GGUF models: run / chat / bench / info / tokenize
+    oaiy/                   core: WeightStore seam, Ecache, thread pool, JSON parser (std-only)
+    oaiy-llm-cli/               `oaiy-llm` binary for GGUF models: run / chat / bench / info / tokenize
     dsv41/                  DeepSeek-V4.1 from safetensors: expert store, CPU reference model,
                             CPU experts (std-only)
     dsv41-cuda/             DeepSeek-V4.1 on CUDA: kernels, VRAM expert cache, hybrid decode,
                             chunk continuation, checkpoints, layer-by-layer prefill
-    nrob-server/            OpenAI-compatible HTTP server for DeepSeek-V4.1 (std-only)
+    oaiy-llm-server/            OpenAI-compatible HTTP server for DeepSeek-V4.1 (std-only)
     gguf/                   GGUF reader; FileSource streams tensor bytes from the file
     ggml-quants/, ggml-rs/, ggml-rs-cuda/, tokenizer/
                             quant kernels, CPU/CUDA backends, tokenizers
@@ -37,13 +37,13 @@ their `llm` workspace (see `crates/VENDORED.md`).
 
 ## Hard constraints
 
-- **std-only core.** No external crates in `nrob` or `dsv41`. The JSON reader, the
+- **std-only core.** No external crates in `oaiy-engine` or `dsv41`. The JSON reader, the
   cache and the thread pool are hand-rolled.
-- `#![forbid(unsafe_code)]` in `nrob`, `nrob-cli`, `nrob-server` and `dsv41`. `dsv41-cuda` holds the
+- `#![forbid(unsafe_code)]` in `oaiy-engine`, `oaiy-llm-cli`, `oaiy-llm-server` and `dsv41`. `dsv41-cuda` holds the
   DeepSeek path's `unsafe` (kernel launches, pinned mappings, AVX-512 dispatch), each
   with a SAFETY note. The GGUF stack keeps its own style: `unsafe` for the CUDA backend,
   the mmap and a couple of byte views.
-- Library code never prints and never exits; errors are `nrob::Error` (core, dsv41) or
+- Library code never prints and never exits; errors are `oaiy_engine::Error` (core, dsv41) or
   `llama_rs::LlamaError` (GGUF stack).
 - **Weights are read in place.** GGUF and safetensors only; no converters, no
   container format of our own.
@@ -69,7 +69,7 @@ Two implementations, one per file format:
   expert's weights are adjacent in its shard, and so are its scales, so a record is
   two reads. These bypass the page cache.
 
-Both sit behind `nrob::ecache::Ecache`: LFRU with a recency tiebreak (chosen from a
+Both sit behind `oaiy_engine::ecache::Ecache`: LFRU with a recency tiebreak (chosen from a
 random draw of resident records) and zero-copy hits through `HostLease`. `dsv41-cuda`
 also saves a usage profile that warms its RAM and VRAM tiers at start.
 
@@ -84,13 +84,13 @@ resident.
 5090s at ~29 tok/s warm; a fresh process's first answer runs at 2–6 tok/s (SSD-bound).
 It passes every golden gate.
 
-It is served by `nrob-server`: an OpenAI-compatible API with tools and reasoning, and a
+It is served by `oaiy-llm-server`: an OpenAI-compatible API with tools and reasoning, and a
 prefix cache that resumes each harness turn. Long prompts run layer by layer at
 ~22 tok/s. Details are in `docs/DEEPSEEK_V41.md`.
 
 ## Phase log
 
-- **Phases 0–4 (2026-08): prototype.** An earlier engine with its own `.nrob`
+- **Phases 0–4 (2026-08): prototype.** An earlier engine with its own `.oaiy`
   container format, a native model, a server and the `xdb` weight store; all retired
   in Phase 8.
 - **Phase 5 (2026-08): any GGUF.** Added the author's own Rust GGUF stack, with MoE
@@ -115,13 +115,13 @@ prefix cache that resumes each harness turn. Long prompts run layer by layer at
   - Launch-ahead hybrid decode: 2.6 → 29 tok/s warm.
 - **Phase 8 (2026-09-19): GGUF and safetensors only.** Removed everything format-
   specific that no longer earned its keep:
-  - The `.nrob` container and native engine, `xdb` and `nrob-server`.
+  - The `.oaiy` container and native engine, `xdb` and `oaiy-llm-server`.
   - The core that remained (expert cache, JSON parser, thread pool, error type) and
     the CLI's option handling were rewritten from scratch, and the version restarted
     at 0.7.0.
   - GGUF streaming reads experts straight from the `.gguf` (`gguf::FileSource`,
     `Model::open_streaming`) instead of from an xdb copy.
-  - `nrob-cli` is now a GGUF client of llama-rs.
+  - `oaiy-llm-cli` is now a GGUF client of llama-rs.
 - **Phase 9 (2026-09-19): serving DeepSeek-V4.1.**
   - Rust tokenizer and chat format, exact against the reference on 3,638 and 420
     golden cases.
@@ -129,14 +129,14 @@ prefix cache that resumes each harness turn. Long prompts run layer by layer at
   - Layer-by-layer prefill: each expert is read once per long stretch, ~6× the
     chunked rate on this SSD.
   - Exclusive VRAM/RAM tiers.
-  - `nrob-server`, new code, with a prefix cache for coding harnesses.
+  - `oaiy-llm-server`, new code, with a prefix cache for coding harnesses.
 - **Phase 10 (2026-09-19): DeepSeek-V4.1 vision.**
-  - `nrob-image`: our own PNG (with inflate) and JPEG decoders and Pillow's resize,
+  - `oaiy-image`: our own PNG (with inflate) and JPEG decoders and Pillow's resize,
     pixel-exact to Pillow on 111 test images.
   - The reference's preprocessing, bit-exact; the ViT and aligner on CPU (the oracle)
     and GPU (60–160 ms an image).
   - Image spans in the model (vision routing bias, Engram masking, any position,
-    chunked and layered), and images in `nrob-server`.
+    chunked and layered), and images in `oaiy-llm-server`.
 
 ## Testing strategy
 
@@ -175,7 +175,7 @@ No downloads are needed for `cargo test --workspace`:
   - Expert streaming for more MoE architectures (Gemma 4 MoE, Qwen3.5-MoE).
   - Hybrid CPU experts on the GGUF path.
   - Direct I/O for streamed reads.
-- **Serving:** GGUF models in `nrob-server` too; the Anthropic messages API.
+- **Serving:** GGUF models in `oaiy-llm-server` too; the Anthropic messages API.
 
 ## Non-goals (for now)
 

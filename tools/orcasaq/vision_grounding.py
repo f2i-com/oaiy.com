@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Manual pixel-grounding checks against a running Nrob daemon (requires Pillow).
+"""Manual pixel-grounding checks against a running Oaiy daemon (requires Pillow).
 
 Answers appear only in generated pixels, never in request text or filenames.
 The JSON report also includes blank/no-image controls; inspect those for guesses.
@@ -25,7 +25,7 @@ def main():
         sys.stdout.reconfigure(errors="backslashreplace")
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--state", type=pathlib.Path, required=True,
-                        help="project's Nrob daemon state JSON")
+                        help="project's Oaiy daemon state JSON")
     parser.add_argument("--output", type=pathlib.Path, required=True)
     parser.add_argument("--font", required=True, help="path to a TrueType font")
     parser.add_argument("--seed", type=int, default=9252042)

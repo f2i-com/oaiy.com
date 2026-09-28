@@ -21,7 +21,7 @@ use std::fs::File;
 use std::path::Path;
 use std::sync::mpsc;
 
-use nrob::{Error, Result};
+use oaiy_engine::{Error, Result};
 
 use crate::config::Config;
 use crate::formats::{e8m0_to_f32, fp8_e4m3_to_f32, to_bf16};

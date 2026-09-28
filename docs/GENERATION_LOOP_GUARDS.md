@@ -23,8 +23,8 @@ no-progress tool loops and improves its checklist/state reminders.
 
 ## Validation
 
-- cargo build -p nrob-server --release --offline: exit 0.
-- cargo test -p nrob-server --offline: exit 0 (initial guard revision).
+- cargo build -p oaiy-llm-server --release --offline: exit 0.
+- cargo test -p oaiy-llm-server --offline: exit 0 (initial guard revision).
 - cargo test --workspace --offline: exit 101, existing duplicate generate.exe
   example output collision between llama-rs and dsv41-cuda (LNK1104).
 - cargo test --workspace --offline -j 1: exit 0 with final guard revision;
@@ -50,12 +50,12 @@ existing incomplete-generation error behavior.
 The absence of ThinkingProgress in saved events does not show a broken budget:
 those progress events are deliberately ephemeral in coder-cli.
 
-Tests: nrob-server 22 regular tests passed. CPU-only replay using the actual
+Tests: oaiy-llm-server 22 regular tests passed. CPU-only replay using the actual
 DeepSeek tokenizer closed repeated tool intentions at token 80. This is a
 synthetic token-sequence regression with a real tokenizer, not a model-quality
 score. cargo test --workspace --offline -j 1 passed (447 passed, 69 ignored).
 The tokenizer test was explicitly run separately. Real-model golden gates remain
-unexecuted. Standalone nrob-server and coder-cli release builds both passed.
+unexecuted. Standalone oaiy-llm-server and coder-cli release builds both passed.
 
 ## Live ternary tool-call verification
 

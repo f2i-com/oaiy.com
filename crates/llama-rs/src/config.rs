@@ -124,7 +124,7 @@ impl Architecture {
             Self::Gemma3 | Self::Gemma3n | Self::Gemma4 => RopeType::NeoX,
             // VENDORED-LOCAL: glm5next is NoPE — `rope.dimension_count` is 0 and
             // the GGUF carries no rope tensors, so this value is never applied.
-            // It is reported rather than left to the fallback so `nrob info`
+            // It is reported rather than left to the fallback so `OAIY info`
             // does not imply a rotation the arch never performs.
             Self::Glm5Next => RopeType::NeoX,
             Self::Unsupported(_) => RopeType::NeoX,

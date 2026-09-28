@@ -10,10 +10,10 @@ use std::path::PathBuf;
 use dsv41::config::{Config, VisionConfig};
 use dsv41::safetensors::StIndex;
 use dsv41::vision::{self, VisionTower};
-use nrob::json::Json;
+use oaiy_engine::json::Json;
 
 fn golden() -> Option<PathBuf> {
-    let dir = PathBuf::from(std::env::var("NROB_VISION_GOLDEN").unwrap_or_else(|_| r"E:\deepseek\golden\vision".into()));
+    let dir = PathBuf::from(std::env::var("OAIY_VISION_GOLDEN").unwrap_or_else(|_| r"E:\deepseek\golden\vision".into()));
     dir.join("plan.json").exists().then_some(dir)
 }
 
@@ -109,7 +109,7 @@ fn cpu_tower_matches_the_reference() {
     let tower = VisionTower::load(&model_dir(), &cfg).expect("tower");
     eprintln!("loaded the tower in {:.1}s", t.elapsed().as_secs_f64());
     let feats = StIndex::open_file(&dir.join("features.safetensors")).expect("features");
-    let names: Vec<String> = std::env::var("NROB_VISION_IMAGES").unwrap_or_else(|_| "mascot".into()).split(',').map(String::from).collect();
+    let names: Vec<String> = std::env::var("OAIY_VISION_IMAGES").unwrap_or_else(|_| "mascot".into()).split(',').map(String::from).collect();
     for name in names {
         let patches = feats.read_f32(&format!("{name}.patches")).expect("patches");
         let dims = feats.read_i64(&format!("{name}.dims")).expect("dims");
@@ -128,7 +128,7 @@ fn cpu_tower_matches_the_reference() {
         let e = rel_l2(&b0, &feats.read_f32(&format!("{name}.block0")).unwrap());
         eprintln!("{name}: block 0 rel-L2 {e:.2e}");
         assert!(e < 1e-2, "{name}: block 0 {e}");
-        if std::env::var("NROB_VISION_BLOCKS").is_ok() {
+        if std::env::var("OAIY_VISION_BLOCKS").is_ok() {
             // each block from the reference's own input: where drift comes from
             let mut prev = ref_x.clone();
             for i in 0..tower.cfg.n_layers {

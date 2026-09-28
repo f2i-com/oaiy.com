@@ -94,7 +94,7 @@ export interface Settings {
   /** The last project that is kept (not incognito): where leaving incognito goes. */
   lastKeptProjectId: string | null;
   agent: AgentSettings;
-  /** The image and video service (nrob, or any OpenAI-spec one). */
+  /** The image and video service (OAIY, or any OpenAI-spec one). */
   media: MediaSettings;
 }
 

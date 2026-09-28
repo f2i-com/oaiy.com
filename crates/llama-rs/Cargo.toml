@@ -12,9 +12,9 @@ ggml-rs      = { path = "../ggml-rs", version = "0.0.1" }
 ggml-rs-cuda = { path = "../ggml-rs-cuda", version = "0.0.1", optional = true }
 tokenizer    = { path = "../tokenizer", version = "0.0.1" }
 # VENDORED-LOCAL: streaming expert backend (src/expert_stream.rs) reuses
-# nrob's bounded expert cache (`Ecache`) and `WeightStore` seam. Workspace-
-# internal, no dependency cycle (nrob does not depend on llama-rs).
-nrob         = { path = "../nrob" }
+# OAIY's bounded expert cache (`Ecache`) and `WeightStore` seam. Workspace-
+# internal, no dependency cycle (OAIY does not depend on llama-rs).
+oaiy-engine  = { path = "../oaiy-engine" }
 half         = { version = "2.4", features = ["bytemuck", "num-traits"] }
 image        = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 rayon        = "1.10"

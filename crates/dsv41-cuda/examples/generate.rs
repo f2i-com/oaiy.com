@@ -28,7 +28,7 @@ use dsv41::detok::Detokenizer;
 use dsv41::model::argmax;
 use dsv41_cuda::{GpuModel, GpuOptions};
 
-fn main() -> nrob::Result<()> {
+fn main() -> oaiy_engine::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let ids_file = args.get(1).expect("usage: generate PROMPT_IDS_FILE [max_new_tokens] [devices]");
     let max_new: usize = args.get(2).and_then(|v| v.parse().ok()).unwrap_or(128);
@@ -36,8 +36,8 @@ fn main() -> nrob::Result<()> {
         .get(3)
         .map_or("1", String::as_str)
         .split(',')
-        .map(|v| v.trim().parse().map_err(|_| nrob::Error::Arg(format!("bad device {v:?}"))))
-        .collect::<nrob::Result<_>>()?;
+        .map(|v| v.trim().parse().map_err(|_| oaiy_engine::Error::Arg(format!("bad device {v:?}"))))
+        .collect::<oaiy_engine::Result<_>>()?;
     let model_dir = std::env::var_os("DSV41_MODEL").map(PathBuf::from).unwrap_or_else(|| r"E:\deepseek\model".into());
     let golden = std::env::var_os("DSV41_GOLDEN_DIR").map(PathBuf::from).unwrap_or_else(|| r"E:\deepseek\golden".into());
 
@@ -48,7 +48,7 @@ fn main() -> nrob::Result<()> {
     let prompt: Vec<u32> = match ids {
         Ok(ids) if !ids.is_empty() => ids,
         _ => {
-            let user = nrob::json::Json::obj([("role", nrob::json::Json::str("user")), ("content", nrob::json::Json::str(text.trim()))]);
+            let user = oaiy_engine::json::Json::obj([("role", oaiy_engine::json::Json::str("user")), ("content", oaiy_engine::json::Json::str(text.trim()))]);
             let enc = dsv41::chat::encode(&[user], &dsv41::chat::Options::default())?;
             dsv41::tokenizer::Tokenizer::load(&model_dir)?.encode(&enc.prompt)
         }
@@ -65,7 +65,7 @@ fn main() -> nrob::Result<()> {
     let t = Instant::now();
     let cpu_expert_threads = match std::env::var("DSV41_CPU_THREADS").as_deref() {
         Ok("off") => None,
-        Ok(v) => Some(v.parse().map_err(|_| nrob::Error::Arg(format!("bad DSV41_CPU_THREADS {v:?}")))?),
+        Ok(v) => Some(v.parse().map_err(|_| oaiy_engine::Error::Arg(format!("bad DSV41_CPU_THREADS {v:?}")))?),
         Err(_) => Some(24),
     };
     let opts = GpuOptions { devices: devices.clone(), max_seq: 4096, expert_cache_bytes: ram_gb << 30, direct_io: true, vram_expert_bytes: None, vram_headroom_bytes: 1 << 30, cpu_expert_threads, vision: false, residual_on_device: None };

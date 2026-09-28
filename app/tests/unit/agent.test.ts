@@ -304,10 +304,10 @@ describe('tool rules', () => {
     expect(agent.takeUnread()).toEqual([]);
   });
 
-  it('thinks harder while it works on a video script, and only asks nrob for that', async () => {
+  it('thinks harder while it works on a video script, and only asks OAIY for that', async () => {
     const media = { ...EMPTY_MEDIA, baseUrl: 'http://127.0.0.1:8080', imageModel: 'image', videoModel: 'video' };
     const script = { goal: 'a short film', items: [{ text: 'Write the script in video/film/script.md', status: 'active' }, { text: 'Make the clips', status: 'pending' }] };
-    for (const [serverKind, want] of [['nrob', 'high'], ['ollama', undefined]] as const) {
+    for (const [serverKind, want] of [['oaiy', 'high'], ['ollama', undefined]] as const) {
       const fake = fakeProvider('openai', [
         { calls: [{ name: 'update_plan', input: script }] },
         { calls: [{ name: 'append_file', input: { path: 'video/film/script.md', content: '## Premise\nA cat.' } }] },
@@ -320,10 +320,10 @@ describe('tool rules', () => {
     }
   });
 
-  it("shows nrob's tool call as it is written", () => {
+  it("shows OAIY's tool call as it is written", () => {
     const drafts: Array<[string, boolean]> = [];
     const stream = new OpenAIStream({ text: () => {}, toolStart: () => {}, toolArgs: () => {}, draft: (t, s) => drafts.push([t, s]) });
-    for (const chunk of [{ nrob_tool_preview: { text: '<tool_call>\n<function=append_file>', start: true } }, { nrob_tool_preview: { text: '\n<parameter=content>\n## Scene 1', start: false } }]) {
+    for (const chunk of [{ oaiy_tool_preview: { text: '<tool_call>\n<function=append_file>', start: true } }, { oaiy_tool_preview: { text: '\n<parameter=content>\n## Scene 1', start: false } }]) {
       stream.accept({ event: 'message', data: JSON.stringify(chunk) });
     }
     expect(drafts).toEqual([['<tool_call>\n<function=append_file>', true], ['\n<parameter=content>\n## Scene 1', false]]);

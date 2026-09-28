@@ -100,11 +100,11 @@ export async function detectContextWindow(provider: ProviderConfig, signal?: Abo
       return tokens ? { tokens, how: 'LM Studio (/api/v0/models)' } : null;
     });
   }
-  if (provider.serverKind === 'nrob') {
+  if (provider.serverKind === 'oaiy') {
     attempts.push(async () => {
       const body = (await getJson(`${origin}/v1/discovery`, { headers }, signal)) as { llm?: { context_tokens?: unknown } };
       const tokens = num(body.llm?.context_tokens);
-      return tokens ? { tokens, how: 'nrob (/v1/discovery)' } : null;
+      return tokens ? { tokens, how: 'OAIY (/v1/discovery)' } : null;
     });
   }
   // Any OpenAI-compatible server: the models list, then llama.cpp's /props.

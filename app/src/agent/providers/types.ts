@@ -2,7 +2,7 @@
 
 export type ProviderType = 'anthropic' | 'openai' | 'local' | 'custom';
 
-export type LocalServerKind = 'ollama' | 'lmstudio' | 'nrob' | 'other';
+export type LocalServerKind = 'ollama' | 'lmstudio' | 'oaiy' | 'other';
 
 export interface ProviderConfig {
   id: string;

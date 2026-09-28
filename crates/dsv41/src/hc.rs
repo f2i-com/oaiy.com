@@ -5,7 +5,7 @@
 //! doubly stochastic by Sinkhorn iterations) — reference `Block.hc_mixes`,
 //! `hc_split_sinkhorn`, `hc_pre`, `hc_post`.
 
-use nrob::Result;
+use oaiy_engine::Result;
 
 use crate::formats::to_bf16;
 use crate::ops::sigmoid;

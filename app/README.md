@@ -5,8 +5,8 @@ A coding agent that runs entirely in your browser.
 - **Your projects stay in the browser.** Files live in the browser's private file system (OPFS). Open a folder from disk, import a `.zip`, export one back, or start from scratch. Everything works offline once the page has loaded (it installs as an app).
 - **AI-written code runs on the [Zipp](https://github.com/f2i-com/zipp.org) VM.** JavaScript and Python run in Zipp's WebAssembly engine inside a Web Worker. The code can reach the project and nothing else, except what the network gate lets through.
 - **A shell, emulated.** The terminal and the agent's `sandbox_shell` are a bash-like shell written in JavaScript on the same sandbox, with `git`, `jq`, `tar`/`zip`, `node` and `python` built in (see [The shell](#the-shell)). There are no real processes, so `npm install` and compilers don't exist here.
-- **Any model.** A server on your own machine (Ollama, LM Studio, nrob, llama.cpp — anything OpenAI-compatible), Anthropic's API, or any OpenAI-compatible API.
-- **Images, video and audio.** With nrob, or any service with OpenAI's media APIs, the agent can make pictures, short videos (talking ones too), speech, music, sound effects and 3D models straight into the project, and remove a picture's background or upscale it (see [Images, video and audio](#images-video-and-audio)).
+- **Any model.** A server on your own machine (Ollama, LM Studio, OAIY, llama.cpp — anything OpenAI-compatible), Anthropic's API, or any OpenAI-compatible API.
+- **Images, video and audio.** With OAIY, or any service with OpenAI's media APIs, the agent can make pictures, short videos (talking ones too), speech, music, sound effects and 3D models straight into the project, and remove a picture's background or upscale it (see [Images, video and audio](#images-video-and-audio)).
 - **Web pages with a live preview.** The agent builds HTML, CSS and JavaScript pages and sees them as you do: their JavaScript runs on the Zipp VM against the preview's real DOM, and it can screenshot the page at phone, tablet or desktop sizes (see [Web pages](#web-pages)).
 - **A network gate.** `/internet on | off | allowlist | allow <host> | deny <host> | status` (or `/net`) decides every request made on the model's behalf. Requests to your AI provider are not gated.
 
@@ -36,7 +36,7 @@ A coding agent that runs entirely in your browser.
   - Marks in the log show where the plan moved (a step started, a step done, the plan changed), so the history reads step by step.
   - The window never scrolls as a page: the file tree, the editor, the terminal and the chat each scroll on their own. The chat box stays at the bottom of the Agent pane, beside even a very large open file, at any window size.
   - The model's thinking is shown as it thinks, and stays shown (it is saved with the chat, but never sent back to the model). Each step has a folded **prompt** entry: open it to read exactly what the model was sent (the system prompt, the tools and the conversation). A picture, clip or sound shows the prompt it was made from on its card.
-- **Prompt reuse:** old pictures leave the prompt a few at a time rather than one per step, so the start of the prompt stays the same and a server that reuses it (nrob, llama.cpp) reads only what is new. In incognito, nrob keeps the project's prompt state in memory only, for its next step, and wipes it when the project is cleared or incognito is turned off.
+- **Prompt reuse:** old pictures leave the prompt a few at a time rather than one per step, so the start of the prompt stays the same and a server that reuses it (OAIY, llama.cpp) reads only what is new. In incognito, OAIY keeps the project's prompt state in memory only, for its next step, and wipes it when the project is cleared or incognito is turned off.
 - **A short system prompt:** the model starts with a few lines and your request, so nothing crowds it out. What a kind of work needs is in its guide (apps, videos, pictures and sound, long documents), read with the `guide` tool when the work calls for it, or with your request when it plainly asks for that work ("make a video" reads the video guide). A guide stays in the instructions once read. The first picture, clip or sound made without its guide waits for it, and the app tools come only once the app guide is read or the project has an app.
 - **Scripts follow the request:** while the agent makes a video, your request stays in its instructions word for word, as a reference, and it is never trimmed from the conversation. Before the first picture, clip or voice is made, the agent checks the script against the request point by point, and fixes the script where it strays. A write that only repeats what a file already holds is not made, and a file written in full a third time in one request tells the agent to mark the step done and move on (or change just a part).
 - **A picture sent back is remade where it is:** until it is made again at the same path, no other picture of that video is made (a fix under another name would leave the old one in place, the one the script, the review and the clips use). Asking for a review of the sent-back picture before it is remade says what to fix rather than judging the same picture again; the remake is reviewed as soon as it is made, from its new bytes.
@@ -49,11 +49,11 @@ The agent gets more tools when a media service is set up:
   - animate a start image, optionally moving to an end image;
   - make a character talk, with lip movement: it takes `say` (words to speak in a voice) or `soundtrack` (a speech or audio file to follow). Without a length, the clip is as long as the speech, up to the model's few seconds.
 - `generate_speech` saves spoken audio (mp3, wav, opus, aac, flac) in a saved voice, an OpenAI voice name, or a voice described in words.
-- `create_voice` designs a voice from a description and saves it on nrob, so a character keeps the same voice. It uses the speech model chosen in Settings (nrob's Qwen3-TTS or Breeze TTS 2). A voice Breeze TTS 2 made is always spoken by a Breeze model.
+- `create_voice` designs a voice from a description and saves it on OAIY, so a character keeps the same voice. It uses the speech model chosen in Settings (OAIY's Qwen3-TTS or Breeze TTS 2). A voice Breeze TTS 2 made is always spoken by a Breeze model.
 - `generate_music` saves a song from a style and lyrics (with [Verse] and [Chorus] sections), or an instrumental.
-- `generate_sound_effect` saves a sound effect (wav or mp3, up to 30 seconds) from a description of what makes it, where, and how it sounds (nrob's MOSS-SoundEffect).
-- `generate_3d_model` saves a 3D model (a GLB mesh) of one object from a picture of it, with nrob's Pixal3D, and beside it the object as the service cut it out, with a transparent background (`NAME.cutout.png`, 2048 pixels a side when nrob has Real-ESRGAN). When nrob has BiRefNet it removes any background itself, and the tool tells the agent so; Real-ESRGAN enlarges a small picture first. The agent makes the picture first with `generate_image`: the object alone, whole and centred, from a three-quarter view. The model has baked PBR textures, Y up, its front facing +Z, and fits a unit cube; it takes about a minute and a half. The agent looks at it with `preview_screenshot` (see [3D models](#3d-models)) and puts it in a SoftN app's `assets/`, where a `Scene3D` shows it.
-- `remove_background` saves a picture with its background removed (a PNG with a transparent background, for sprites, icons and cut-outs), and `upscale_image` makes a picture two or four times larger with its detail restored. nrob offers them when it has BiRefNet and Real-ESRGAN, which its Get models page downloads.
+- `generate_sound_effect` saves a sound effect (wav or mp3, up to 30 seconds) from a description of what makes it, where, and how it sounds (OAIY's MOSS-SoundEffect).
+- `generate_3d_model` saves a 3D model (a GLB mesh) of one object from a picture of it, with OAIY's Pixal3D, and beside it the object as the service cut it out, with a transparent background (`NAME.cutout.png`, 2048 pixels a side when OAIY has Real-ESRGAN). When OAIY has BiRefNet it removes any background itself, and the tool tells the agent so; Real-ESRGAN enlarges a small picture first. The agent makes the picture first with `generate_image`: the object alone, whole and centred, from a three-quarter view. The model has baked PBR textures, Y up, its front facing +Z, and fits a unit cube; it takes about a minute and a half. The agent looks at it with `preview_screenshot` (see [3D models](#3d-models)) and puts it in a SoftN app's `assets/`, where a `Scene3D` shows it.
+- `remove_background` saves a picture with its background removed (a PNG with a transparent background, for sprites, icons and cut-outs), and `upscale_image` makes a picture two or four times larger with its detail restored. OAIY offers them when it has BiRefNet and Real-ESRGAN, which its Get models page downloads.
 
 The results appear in the chat (with a player for video and audio) and in the project, where an app can use them.
 
@@ -71,11 +71,11 @@ These tools work on files already in the project, with or without a media servic
 
 They run in the page with the browser's own video and audio codecs (WebCodecs: H.264 and AAC where the system has them, otherwise VP9 and Opus). [Mediabunny](https://mediabunny.dev) reads and writes the files. Everything is re-encoded, so cuts are exact to the frame. Nothing leaves the computer, and it works offline and in the desktop app. A model with a context window under 16k tokens doesn't get these four tools, so that its window still has room to work.
 
-- **nrob is found on its own.** When the page opens, it asks `http://127.0.0.1:8080/v1/discovery`.
-  - If nrob answers, its image, video, speech, music, sound effects and 3D models, their limits (sizes, edits, seconds), its saved voices and its defaults fill **Settings → Images, video and audio**.
-  - nrob is also added as a chat provider if none points at it yet. It becomes the active one only if nothing else is.
+- **OAIY is found on its own.** When the page opens, it asks `http://127.0.0.1:8080/v1/discovery`.
+  - If OAIY answers, its image, video, speech, music, sound effects and 3D models, their limits (sizes, edits, seconds), its saved voices and its defaults fill **Settings → Images, video and audio**.
+  - OAIY is also added as a chat provider if none points at it yet. It becomes the active one only if nothing else is.
   - Found again later, its model lists are refreshed. Your chosen models and key stay.
-- **nrob allows bot.computer.** Without an API key, nrob answers only the origins in `gateway.cors_origins` in its config. Its defaults include `https://bot.computer`, `http://localhost:5317` and the desktop app. Serving bot.computer from anywhere else means adding that address there (the chat says which one), or setting an API key in nrob and typing it in Settings. Then press **Find nrob**.
+- **OAIY allows bot.computer.** Without an API key, OAIY answers only the origins in `gateway.cors_origins` in its config. Its defaults include `https://bot.computer`, `http://localhost:5317` and the desktop app. Serving bot.computer from anywhere else means adding that address there (the chat says which one), or setting an API key in OAIY and typing it in Settings. Then press **Find OAIY**.
 - **Other services.** Type the address of any OpenAI-spec service (for example `https://api.openai.com/v1`) and its key, then **List models** and choose. Images use `/images/generations` and `/images/edits`. Video uses `/videos` and follows the job until it's done. Speech uses `/audio/speech`.
 - **While it works.** The chat shows the progress of a video or a song. Stopping the agent cancels the job. The models' limits are in the tools' descriptions, so the model asks for sizes and lengths the service can make.
 - **Privacy.** These requests go straight from the page to the service you set up, like requests to your AI provider. They are not behind the network gate. Keys are stored encrypted with the provider keys.
@@ -192,7 +192,7 @@ npm run desktop:portable  # one portable exe (src-tauri/target/release/bundle/po
 node tests/e2e/desktop.mjs  # Windows: checks the built app in WebView2 (isolation, sandbox, tray, saving on quit)
 ```
 
-bot.computer always uses port 5317 (`strictPort`), so a local server can allow it by origin. nrob allows it by default.
+bot.computer always uses port 5317 (`strictPort`), so a local server can allow it by origin. OAIY allows it by default.
 
 ### The desktop app
 
@@ -276,7 +276,7 @@ The shell works on the project's files through the same host calls, so it can't 
 
 ```sh
 npm test           # unit: gate, virtual filesystem, agent loop over both wire formats
-npm run test:e2e   # headless Chrome: the sandbox, shell, git and tools (tests/e2e/run.mjs), the whole app with a scripted model (tests/e2e/app.mjs), web pages on Zipp with screenshots and screen sizes, 3D models in the viewer and in a SoftN Scene3D (tests/e2e/webpage.mjs), media with a mock nrob (tests/e2e/nrob.mjs)
+npm run test:e2e   # headless Chrome: the sandbox, shell, git and tools (tests/e2e/run.mjs), the whole app with a scripted model (tests/e2e/app.mjs), web pages on Zipp with screenshots and screen sizes, 3D models in the viewer and in a SoftN Scene3D (tests/e2e/webpage.mjs), media with a mock oaiy (tests/e2e/oaiy.mjs)
 ```
 
 The end-to-end tests use a local Chrome or Edge (`CHROME=<path>` to choose one).

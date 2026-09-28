@@ -1,7 +1,7 @@
 # Music
 
-NROB writes complete songs with MiniMax Music 3, natively in Rust
-(`nrob-diffusion`, `kind: "music"`). A song has vocals and instruments, is
+OAIY writes complete songs with MiniMax Music 3, natively in Rust
+(`oaiy-media`, `kind: "music"`). A song has vocals and instruments, is
 44.1 kHz stereo, and is up to six minutes long. You give it:
 
 - **lyrics**, with section tags such as `[Verse]` and `[Chorus]` on lines of
@@ -147,8 +147,8 @@ Companion apps find the endpoints and music models in `GET /v1/discovery`.
 The reference activations come from the official diffusers pipeline. The
 acoustic stack runs in strict F32 (TF32 off); the language model and depth
 decoder in BF16, as stored. The opt-in tests are `music::acoustic::golden`,
-`music::lm::tests` and `music::tests`. They need `NROB_MUSIC_GOLDEN` and
-`NROB_MUSIC_MODEL`, plus `NROB_MUSIC_LM` for a quantized file.
+`music::lm::tests` and `music::tests`. They need `OAIY_MUSIC_GOLDEN` and
+`OAIY_MUSIC_MODEL`, plus `OAIY_MUSIC_LM` for a quantized file.
 
 | Stage | Relative RMS error |
 |---|---|

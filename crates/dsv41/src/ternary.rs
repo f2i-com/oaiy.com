@@ -3,8 +3,8 @@
 //! Scales: little-endian FP16, one per row's 128 columns.
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
-use nrob::{Error, Result};
-use nrob::store::WeightStore;
+use oaiy_engine::{Error, Result};
+use oaiy_engine::store::WeightStore;
 use crate::expert::{DIM, INTER};
 use crate::formats::f16_to_f32;
 
@@ -37,7 +37,9 @@ impl TernaryStore {
     }
     /// Bounded samples may omit experts; fetching an absent record fails.
     pub fn sample(root: &Path, layers: u32, experts: u32) -> Result<Self> {
-        if std::fs::read_to_string(root.join("format.txt"))?.trim() != "NROB_W2G128_V1" {
+        // Records converted before the OAIY name carry the older tag; both are the same format.
+        let format = std::fs::read_to_string(root.join("format.txt"))?;
+        if !matches!(format.trim(), "OAIY_W2G128_V1" | "NROB_W2G128_V1") {
             return Err(Error::Arg("unsupported ternary record format".into()));
         }
         Ok(Self {root: root.to_path_buf(), layers, experts, direct:false})

@@ -1,4 +1,4 @@
-use nrob::store::WeightStore;
+use oaiy_engine::store::WeightStore;
 fn main() {
     let arg=std::env::args().nth(1).expect("SAMPLE_DIR");let root=std::path::Path::new(&arg);
     let store=dsv41::ternary::TernaryStore::sample(root,40,384).unwrap().with_direct(true).unwrap();

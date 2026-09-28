@@ -1,6 +1,6 @@
 # WebGPU and CPU inference
 
-nrob's GGUF models run on NVIDIA GPUs through CUDA. On a machine without CUDA
+OAIY's GGUF models run on NVIDIA GPUs through CUDA. On a machine without CUDA
 (an AMD or Intel GPU, a laptop's integrated graphics, Apple silicon) they run
 through **WebGPU**, and on a machine with no usable GPU, on the **CPU**.
 
@@ -36,32 +36,32 @@ before.
 
 ```sh
 # the CLI
-cargo build --release -p nrob-cli --features webgpu
-nrob run model.gguf "prompt" --webgpu            # or --webgpu-gb 20
+cargo build --release -p oaiy-llm-cli --features webgpu
+oaiy-llm run model.gguf "prompt" --webgpu            # or --webgpu-gb 20
 
 # the OpenAI-compatible server, built without CUDA so it starts anywhere
-cargo build --release -p nrob-server --no-default-features --features webgpu --bin nrob-server-webgpu
-nrob-server-webgpu --model model.gguf --backend auto   # WebGPU, else the CPU
+cargo build --release -p oaiy-llm-server --no-default-features --features webgpu --bin oaiy-llm-server-webgpu
+oaiy-llm-server-webgpu --model model.gguf --backend auto   # WebGPU, else the CPU
 ```
 
-`tools/qwen-image/build.ps1` builds `nrob-server-webgpu` beside the CUDA
-`nrob-server`. It is a separate executable because a CUDA build imports the
-NVIDIA driver's DLLs and will not start without them. `nrob-server-webgpu`
+`tools/qwen-image/build.ps1` builds `oaiy-llm-server-webgpu` beside the CUDA
+`oaiy-llm-server`. It is a separate executable because a CUDA build imports the
+NVIDIA driver's DLLs and will not start without them. `oaiy-llm-server-webgpu`
 imports only system DLLs.
 
-In **NROB Studio**, Settings → Language model → *Runs on*:
+In **OAIY**, Settings → Language model → *Runs on*:
 
 - `auto` (the default) starts the CUDA build when an NVIDIA GPU answers. If that
   build dies while loading (a missing driver, say), the studio starts
-  `nrob-server-webgpu` instead. Without an NVIDIA GPU it starts
-  `nrob-server-webgpu` directly.
+  `oaiy-llm-server-webgpu` instead. Without an NVIDIA GPU it starts
+  `oaiy-llm-server-webgpu` directly.
 - `cuda`, `webgpu` and `cpu` pin one.
 
 The Overview page shows what the model actually runs on.
 
-`nrob-server-webgpu` serves GGUF models only. DeepSeek-V4.1 checkpoints, OrcaSAQ
+`oaiy-llm-server-webgpu` serves GGUF models only. DeepSeek-V4.1 checkpoints, OrcaSAQ
 (EXL3) and the observer are CUDA engines, and it says so rather than trying.
-Image and video generation (`nrob-diffusion`) still need CUDA for useful speed.
+Image and video generation (`oaiy-media`) still need CUDA for useful speed.
 
 ## Measured (2026-09-26)
 
@@ -74,7 +74,7 @@ as the high-performance adapter), greedy decoding:
 | Qwen3.5 9B Q4_K_M | 2.7 tok/s | 9.2 tok/s | 40 of 40 |
 | Qwen3.8 27B Q4_K_M | 0.79 tok/s | 4.0 tok/s (14.7 GB on the GPU); 1.16 tok/s with a 6 GB budget | 40 of 40, all three |
 
-Through `nrob-server-webgpu` the 9B loads in 4.1 s and answers chat requests.
+Through `oaiy-llm-server-webgpu` the 9B loads in 4.1 s and answers chat requests.
 Forcing Direct3D 12 (`WGPU_BACKEND=dx12`) passes the same parity test and gives
 the same 1B tokens at 16.8 tok/s.
 

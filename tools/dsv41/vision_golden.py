@@ -1,4 +1,4 @@
-"""Golden files for DeepSeek-V4.1 vision on nrob: what Pillow and the reference produce, for the
+"""Golden files for DeepSeek-V4.1 vision on OAIY: what Pillow and the reference produce, for the
 Rust image decoders, preprocessing and vision tower to match.
 
   decode/     test images (PNG in every colour type / bit depth / interlace / filter / deflate block

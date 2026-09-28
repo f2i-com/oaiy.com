@@ -244,7 +244,7 @@ export function mediaTools(media: MediaSettings | null | undefined, voices?: Pro
   if (!media || (!ready.image && !ready.video && !ready.speech && !ready.music && !ready.sound && !ready.model3d && !ready.background && !ready.upscale)) return [];
   // The saved voices this project may use, by the names the agent knows.
   if (voices) media = { ...media, voices: projectVoiceList(voices, media.voices ?? []) };
-  const where = media.discovered ? `nrob at ${media.discovered.origin}` : new URL(media.baseUrl).host;
+  const where = media.discovered ? `OAIY at ${media.discovered.origin}` : new URL(media.baseUrl).host;
   const tools: ToolSpec[] = [];
   const ids = (list: Array<{ id: string }>) => (list.length ? { enum: list.map((m) => m.id) } : {});
   if (ready.image) {
@@ -1623,7 +1623,7 @@ async function execute(call: ToolCall, ctx: ToolContext, out: ToolOut): Promise<
     case 'remove_background': case 'upscale_image': {
       const media = ctx.media?.();
       const upscale = call.name === 'upscale_image';
-      if (!media || !mediaReady(media)[upscale ? 'upscale' : 'background']) throw new Error(`no ${upscale ? 'upscaling' : 'background removal'} service is set up (nrob has it when BiRefNet or Real-ESRGAN is added on its Models page)`);
+      if (!media || !mediaReady(media)[upscale ? 'upscale' : 'background']) throw new Error(`no ${upscale ? 'upscaling' : 'background removal'} service is set up (OAIY has it when BiRefNet or Real-ESRGAN is added on its Models page)`);
       const imagePath = normalizePath(need(input, 'image'));
       if (!/\.(png|jpe?g|webp)$/i.test(imagePath)) throw new Error(`/${imagePath} is not a picture (png, jpg or webp)`);
       const image = projectImage(vfs, imagePath);

@@ -1,12 +1,12 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { NetGate } from '../../src/gate/netgate';
-import { EMPTY_MEDIA, createVoice, discoverNrob, generate3dModel, generateImage, generateMusic, generateSoundEffect, generateSpeech, generateVideo, mediaAbilities, mediaBase, mediaReady, mergeDiscovered, readDiscovery, speechModelFor } from '../../src/agent/media';
+import { EMPTY_MEDIA, createVoice, discoverOaiy, generate3dModel, generateImage, generateMusic, generateSoundEffect, generateSpeech, generateVideo, mediaAbilities, mediaBase, mediaReady, mergeDiscovered, readDiscovery, speechModelFor } from '../../src/agent/media';
 import { mediaTools, runTool, type ToolContext } from '../../src/agent/tools';
 import { Vfs } from '../../src/vfs/vfs';
 
-// nrob-studio's discovery document, as it answers /v1/discovery (trimmed).
+// oaiy-studio's discovery document, as it answers /v1/discovery (trimmed).
 const DOC = {
-  service: 'nrob-studio',
+  service: 'oaiy-studio',
   version: '0.1.0',
   base_url: 'http://127.0.0.1:8080',
   openai_base_url: 'http://127.0.0.1:8080/v1',
@@ -47,7 +47,7 @@ const json = (body: unknown, status = 200) => new Response(JSON.stringify(body),
 
 afterEach(() => vi.unstubAllGlobals());
 
-describe('nrob discovery', () => {
+describe('OAIY discovery', () => {
   it('reads models, capabilities, defaults, endpoints and the chat side', () => {
     const found = readDiscovery(DOC, 'http://127.0.0.1:8080');
     expect(found.media.baseUrl).toBe('http://127.0.0.1:8080/v1');
@@ -83,28 +83,28 @@ describe('nrob discovery', () => {
     expect(merged.videoModel).toBe('sulphur-2');
   });
 
-  it('says why when nrob will not answer this page, needs a key, or is not there', async () => {
+  it('says why when OAIY will not answer this page, needs a key, or is not there', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => json({ error: { message: 'requests from http://x are not allowed; add it to gateway.cors_origins, or set an API key' } }, 403)));
-    const forbidden = await discoverNrob('127.0.0.1:8080');
+    const forbidden = await discoverOaiy('127.0.0.1:8080');
     expect(forbidden.state).toBe('forbidden');
     expect(forbidden.state !== 'found' && forbidden.message).toContain('gateway.cors_origins');
 
-    vi.stubGlobal('fetch', vi.fn(async () => json({ service: 'nrob-studio', auth: { required: true }, note: 'send the API key' })));
-    expect((await discoverNrob('http://127.0.0.1:8080')).state).toBe('needs-key');
+    vi.stubGlobal('fetch', vi.fn(async () => json({ service: 'oaiy-studio', auth: { required: true }, note: 'send the API key' })));
+    expect((await discoverOaiy('http://127.0.0.1:8080')).state).toBe('needs-key');
 
     vi.stubGlobal('fetch', vi.fn(async () => { throw new TypeError('Failed to fetch'); }));
-    expect((await discoverNrob()).state).toBe('absent');
+    expect((await discoverOaiy()).state).toBe('absent');
   });
 
-  it('falls back to /.well-known/nrob.json when the discovery route moved', async () => {
+  it('falls back to /.well-known/oaiy.json when the discovery route moved', async () => {
     const seen: string[] = [];
     vi.stubGlobal('fetch', vi.fn(async (url: string) => {
       seen.push(url);
       return url.endsWith('/v1/discovery') ? json({ error: { message: 'no route' } }, 404) : json(DOC);
     }));
-    const found = await discoverNrob('http://localhost:8080/v1');
+    const found = await discoverOaiy('http://localhost:8080/v1');
     expect(found.state).toBe('found');
-    expect(seen).toEqual(['http://localhost:8080/v1/discovery', 'http://localhost:8080/.well-known/nrob.json']);
+    expect(seen).toEqual(['http://localhost:8080/v1/discovery', 'http://localhost:8080/.well-known/oaiy.json']);
   });
 });
 
@@ -116,7 +116,7 @@ describe('media requests', () => {
     expect(mediaBase('https://api.openai.com/v1/images/generations')).toBe('https://api.openai.com/v1');
   });
 
-  it('generates an image as base64 PNG, with references as data URLs for nrob', async () => {
+  it('generates an image as base64 PNG, with references as data URLs for OAIY', async () => {
     let sent: Record<string, unknown> = {};
     vi.stubGlobal('fetch', vi.fn(async (url: string, init: RequestInit) => {
       expect(url).toBe('http://127.0.0.1:8080/v1/images/generations');
@@ -212,7 +212,7 @@ describe('media requests', () => {
     await createVoice({ ...both, speechModel: 'breeze-tts-2' }, { name: 'Fox', description: 'sly' });
     expect(calls[0].body).toMatchObject({ name: 'Fox', model: 'breeze-tts-2' });
     // A voice Breeze made (no speaker embedding) goes to Breeze though Qwen3-TTS is chosen; others stay.
-    const fox = { nrob_voice: 1, name: 'Fox', ref_text: 'hi', ref_codes: [[1]], speaker: [] };
+    const fox = { oaiy_voice: 1, name: 'Fox', ref_text: 'hi', ref_codes: [[1]], speaker: [] };
     expect(speechModelFor(both, fox)).toBe('breeze-tts-2');
     expect(speechModelFor(both, { ...fox, speaker: [0.5] })).toBe('qwen3-tts');
     expect(speechModelFor(both, 'Narrator')).toBe('qwen3-tts');

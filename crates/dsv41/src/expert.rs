@@ -3,7 +3,7 @@
 //!
 //! # Record
 //!
-//! nrob's cache layer ([`nrob::ecache::Ecache`]) deals in uniform byte
+//! OAIY's cache layer ([`oaiy_engine::ecache::Ecache`]) deals in uniform byte
 //! records addressed by `(layer, expert)`. One DeepSeek-V4.1 expert record
 //! is the six checkpoint tensors in a fixed order:
 //!
@@ -24,8 +24,8 @@ use std::fs::File;
 use std::path::Path;
 use std::sync::Mutex;
 
-use nrob::store::WeightStore;
-use nrob::{Error, Result};
+use oaiy_engine::store::WeightStore;
+use oaiy_engine::{Error, Result};
 
 use crate::formats::{e8m0_to_f32, fake_quant_fp8, to_bf16, FP4_VALUES};
 use crate::io::{open_read, read_direct, read_exact_at, AlignedScratch};

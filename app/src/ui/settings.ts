@@ -8,7 +8,7 @@ import { LOCAL_SERVERS, defaultBaseUrl, listModels, type ModelInfo } from '../ag
 import type { LocalServerKind, ProviderConfig, ProviderType } from '../agent/providers/types';
 import { contextWindow, detectContextWindow, formatTokens } from '../agent/context';
 import type { AgentSettings } from '../settings';
-import { NROB_ORIGIN, discoverNrob, listMediaModels, mediaAbilities, mergeDiscovered, originOf, type Discovery, type MediaSettings } from '../agent/media';
+import { OAIY_ORIGIN, discoverOaiy, listMediaModels, mediaAbilities, mergeDiscovered, originOf, type Discovery, type MediaSettings } from '../agent/media';
 import { newId } from '../vfs/projects';
 import { clear, h } from './dom';
 
@@ -20,10 +20,10 @@ export interface SettingsResult {
 }
 
 /**
- * The chat provider for an nrob that was found, when none points there yet;
+ * The chat provider for an OAIY that was found, when none points there yet;
  * null when one does.
  */
-export function nrobProvider(providers: ProviderConfig[], found: Extract<Discovery, { state: 'found' }>): ProviderConfig | null {
+export function oaiyProvider(providers: ProviderConfig[], found: Extract<Discovery, { state: 'found' }>): ProviderConfig | null {
   const there = providers.some((p) => {
     try {
       return p.baseUrl && originOf(p.baseUrl) === found.origin;
@@ -35,19 +35,19 @@ export function nrobProvider(providers: ProviderConfig[], found: Extract<Discove
   return {
     id: newId(),
     type: 'local',
-    serverKind: 'nrob',
-    name: 'nrob',
+    serverKind: 'oaiy',
+    name: 'OAIY',
     apiKey: '',
     baseUrl: found.origin,
     modelId: found.llm.default,
-    ...(found.llm.contextTokens && found.llm.default ? { detectedContext: { model: found.llm.default, tokens: found.llm.contextTokens, how: 'nrob (/v1/discovery)', at: Date.now() } } : {}),
+    ...(found.llm.contextTokens && found.llm.default ? { detectedContext: { model: found.llm.default, tokens: found.llm.contextTokens, how: 'OAIY (/v1/discovery)', at: Date.now() } } : {}),
   };
 }
 
 const KINDS: Array<{ value: string; label: string; type: ProviderType; serverKind?: LocalServerKind }> = [
   { value: 'ollama', label: 'Ollama (local)', type: 'local', serverKind: 'ollama' },
   { value: 'lmstudio', label: 'LM Studio (local)', type: 'local', serverKind: 'lmstudio' },
-  { value: 'nrob', label: 'nrob (local: chat, images and video)', type: 'local', serverKind: 'nrob' },
+  { value: 'oaiy', label: 'OAIY (local: chat, images and video)', type: 'local', serverKind: 'oaiy' },
   { value: 'local-other', label: 'Other local OpenAI-compatible server (llama.cpp, vLLM…)', type: 'local', serverKind: 'other' },
   { value: 'anthropic', label: 'Anthropic API', type: 'anthropic' },
   { value: 'openai', label: 'OpenAI API', type: 'openai' },
@@ -55,7 +55,7 @@ const KINDS: Array<{ value: string; label: string; type: ProviderType; serverKin
 ];
 
 function kindOf(p: ProviderConfig): string {
-  if (p.type === 'local') return p.serverKind === 'lmstudio' ? 'lmstudio' : p.serverKind === 'ollama' ? 'ollama' : p.serverKind === 'nrob' ? 'nrob' : 'local-other';
+  if (p.type === 'local') return p.serverKind === 'lmstudio' ? 'lmstudio' : p.serverKind === 'ollama' ? 'ollama' : p.serverKind === 'oaiy' ? 'oaiy' : 'local-other';
   return p.type;
 }
 
@@ -231,7 +231,7 @@ export function openSettings(initial: SettingsResult): Promise<SettingsResult | 
       );
     };
 
-    // Images, video and audio: nrob (found by its discovery document) or any OpenAI-spec media service.
+    // Images, video and audio: OAIY (found by its discovery document) or any OpenAI-spec media service.
     const mediaSection = h('div.agent-settings.media-settings');
     const renderMedia = () => {
       clear(mediaSection);
@@ -240,7 +240,7 @@ export function openSettings(initial: SettingsResult): Promise<SettingsResult | 
       const status = media.discovered
         ? `${media.discovered.service} ${media.discovered.version} at ${media.discovered.origin}`
         : media.baseUrl ? 'set up by hand' : 'not set up';
-      const address = h('input', { value: media.baseUrl, placeholder: `${NROB_ORIGIN}/v1`, oninput: () => {
+      const address = h('input', { value: media.baseUrl, placeholder: `${OAIY_ORIGIN}/v1`, oninput: () => {
         media.baseUrl = address.value.trim();
         // A typed address is no longer the discovered one: its routes may differ.
         if (media.discovered && media.baseUrl && originOf(media.baseUrl) !== media.discovered.origin) {
@@ -260,21 +260,21 @@ export function openSettings(initial: SettingsResult): Promise<SettingsResult | 
         const note = (id: string) => kind === 'speech' && media.speechModels?.find((m) => m.id === id)?.engine === 'breeze-tts-2' ? 'Breeze TTS 2: research and non-commercial use only' : undefined;
         return h('span.model-choice', input, h('datalist', { id: listId }, ...ids.map((id) => h('option', { value: id, label: note(id) }))));
       };
-      const find = h('button', { title: 'Ask nrob for its details (/v1/discovery) and fill everything in', onclick: async () => {
-        note.textContent = 'Looking for nrob…';
-        let where = NROB_ORIGIN;
+      const find = h('button', { title: 'Ask OAIY for its details (/v1/discovery) and fill everything in', onclick: async () => {
+        note.textContent = 'Looking for OAIY…';
+        let where = OAIY_ORIGIN;
         try {
           if (media.baseUrl) where = originOf(media.baseUrl);
         } catch {
           /* the default */
         }
-        const found = await discoverNrob(where, media.apiKey).catch((error: unknown) => ({ state: 'absent' as const, origin: where, message: (error as Error).message }));
+        const found = await discoverOaiy(where, media.apiKey).catch((error: unknown) => ({ state: 'absent' as const, origin: where, message: (error as Error).message }));
         if (found.state !== 'found') {
           note.textContent = found.message;
           return;
         }
         media = mergeDiscovered(media, found.media);
-        const chat = nrobProvider(providers, found);
+        const chat = oaiyProvider(providers, found);
         if (chat) {
           providers.push(chat);
           activeId ??= chat.id;
@@ -283,7 +283,7 @@ export function openSettings(initial: SettingsResult): Promise<SettingsResult | 
         renderMedia();
         (mediaSection.querySelector('.form-note') as HTMLElement).textContent =
           `Found ${found.service} ${found.version}: it can make ${mediaAbilities(media) || 'nothing yet'}.${chat ? ' It is in the AI providers too, for chat.' : ''}`;
-      } }, 'Find nrob');
+      } }, 'Find OAIY');
       const listButton = h('button', { title: 'Ask the server which image and video models it has', onclick: async () => {
         if (!media.baseUrl) {
           note.textContent = 'Give the address first.';
@@ -313,7 +313,7 @@ export function openSettings(initial: SettingsResult): Promise<SettingsResult | 
       const enabled = h('input', { type: 'checkbox', checked: media.enabled, onchange: () => { media.enabled = enabled.checked; } }) as HTMLInputElement;
       mediaSection.append(
         h('strong', 'Images, video and audio'),
-        h('p.muted', `The agent can make pictures, short videos, speech, music, sound effects and 3D models with a media service: nrob is found on its own, and any server with OpenAI's /v1/images/generations, /v1/videos and /v1/audio/speech works. Now: ${status}${media.baseUrl ? ` (${abilities || 'no models chosen'})` : ''}.`),
+        h('p.muted', `The agent can make pictures, short videos, speech, music, sound effects and 3D models with a media service: OAIY is found on its own, and any server with OpenAI's /v1/images/generations, /v1/videos and /v1/audio/speech works. Now: ${status}${media.baseUrl ? ` (${abilities || 'no models chosen'})` : ''}.`),
         h('div.provider-form',
           h('label', 'Address', h('div.window-picker', address, find, listButton)),
           h('label', 'API key', key),

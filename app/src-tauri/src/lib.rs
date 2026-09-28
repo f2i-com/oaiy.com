@@ -10,7 +10,7 @@
 //!
 //! It also gives the app an origin of its own (`http://botcomputer.localhost`
 //! on Windows, `botcomputer://localhost` elsewhere) that local servers such as
-//! nrob can allow by name. Links that leave the app open in the system browser.
+//! OAIY can allow by name. Links that leave the app open in the system browser.
 //!
 //! The app lives in the system tray: minimizing hides the window there, and
 //! (unless switched off in the tray menu) so does closing it, so the agent can

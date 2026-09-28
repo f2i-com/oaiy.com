@@ -1,6 +1,6 @@
 /**
  * Images, video, speech, music and 3D models for the agent, from an OpenAI-spec
- * media service: nrob (found through its discovery document), or any server with
+ * media service: OAIY (found through its discovery document), or any server with
  * `/images/generations`, `/videos` and `/audio/speech`. The page calls it directly, as it
  * calls the AI provider: it is the person's own service, set up in Settings,
  * so these requests are not behind the network gate.
@@ -31,7 +31,7 @@ export interface VideoModelInfo {
   maxSide?: number;
   /** Animates a start image. */
   startImage?: boolean;
-  /** Speaks `say` in a saved voice with the picture, lips in sync (nrob with ID-LoRA). */
+  /** Speaks `say` in a saved voice with the picture, lips in sync (OAIY with ID-LoRA). */
   lipSync?: boolean;
 }
 
@@ -42,9 +42,9 @@ export interface SpeechModelInfo {
   describedVoices?: boolean;
   /** Speaks in voices saved on the server. */
   savedVoices?: boolean;
-  /** What speaks: nrob's `qwen3-tts` or `breeze-tts-2`. */
+  /** What speaks: OAIY's `qwen3-tts` or `breeze-tts-2`. */
   engine?: string;
-  /** The terms of the model's weights and what it makes, when nrob says. */
+  /** The terms of the model's weights and what it makes, when OAIY says. */
   license?: string;
   sampleRate?: number;
 }
@@ -57,7 +57,7 @@ export interface MusicModelInfo {
   channels?: number;
 }
 
-/** A sound effects model (nrob's MOSS-SoundEffect): a description in, a short sound out. */
+/** A sound effects model (OAIY's MOSS-SoundEffect): a description in, a short sound out. */
 export interface SoundModelInfo {
   id: string;
   default?: boolean;
@@ -66,7 +66,7 @@ export interface SoundModelInfo {
   channels?: number;
 }
 
-/** A 3D model maker (nrob's Pixal3D): a picture of one object in, a GLB mesh out. */
+/** A 3D model maker (OAIY's Pixal3D): a picture of one object in, a GLB mesh out. */
 export interface Model3dModelInfo {
   id: string;
   default?: boolean;
@@ -76,7 +76,7 @@ export interface Model3dModelInfo {
   faces?: number;
   /** False while the service cannot make models with it yet. */
   ready?: boolean;
-  /** The terms of the model's weights and what it makes, when nrob says. */
+  /** The terms of the model's weights and what it makes, when OAIY says. */
   license?: string;
   /** The service removes a picture's background itself (any background will do). */
   removesBackground?: boolean;
@@ -102,7 +102,7 @@ export interface VoiceInfo {
 }
 
 /**
- * A voice the service designed and handed back rather than kept (nrob with
+ * A voice the service designed and handed back rather than kept (OAIY with
  * `keep: false`): the voice itself and its sample clip, for the project to
  * keep and send with each line spoken in it.
  */
@@ -132,22 +132,22 @@ export interface MediaSettings {
   musicModels?: MusicModelInfo[];
   soundModels?: SoundModelInfo[];
   model3dModels?: Model3dModelInfo[];
-  /** Background removal and upscaling, when the service has them (nrob's discovery). */
+  /** Background removal and upscaling, when the service has them (OAIY's discovery). */
   backgroundModels?: PictureToolInfo[];
   upscaleModels?: PictureToolInfo[];
   /** Saved voices, and the OpenAI voice names the service also takes. */
   voices?: VoiceInfo[];
   openaiVoices?: string[];
-  /** Full URLs from a discovery document (nrob's routes are configurable). */
+  /** Full URLs from a discovery document (OAIY's routes are configurable). */
   endpoints?: { images?: string; edits?: string; videos?: string; speech?: string; voices?: string; music?: string; sound?: string; model3d?: string; background?: string; upscale?: string };
-  /** Set when the details came from nrob's discovery document. */
+  /** Set when the details came from OAIY's discovery document. */
   discovered?: { service: string; version: string; origin: string; at: number };
 }
 
 export const EMPTY_MEDIA: MediaSettings = { baseUrl: '', apiKey: '', enabled: true, imageModels: [], videoModels: [] };
 
-/** Where nrob listens out of the box. */
-export const NROB_ORIGIN = 'http://127.0.0.1:8080';
+/** Where OAIY listens out of the box. */
+export const OAIY_ORIGIN = 'http://127.0.0.1:8080';
 
 /** What the agent can make with these settings. */
 export function mediaReady(media: MediaSettings | null | undefined): { image: boolean; video: boolean; speech: boolean; music: boolean; sound: boolean; model3d: boolean; background: boolean; upscale: boolean } {
@@ -289,7 +289,7 @@ export function originOf(address: string): string {
   return new URL(raw).origin;
 }
 
-/** Media settings and the chat side from an nrob discovery document. */
+/** Media settings and the chat side from an OAIY discovery document. */
 export function readDiscovery(doc: Json, origin: string): Extract<Discovery, { state: 'found' }> {
   const endpoints = list(doc.endpoints);
   const urlOf = (name: string) => str(endpoints.find((e) => e.name === name)?.url);
@@ -361,7 +361,7 @@ export function readDiscovery(doc: Json, origin: string): Extract<Discovery, { s
   const base = str(doc.openai_base_url) ?? `${origin}/v1`;
   const llmModels = list(models.llm).map((m) => str(m.id)).filter((id): id is string => !!id);
   const llm = isRecord(doc.llm) ? doc.llm : {};
-  const service = str(doc.service) ?? 'nrob';
+  const service = str(doc.service) ?? 'OAIY';
   const version = str(doc.version) ?? '';
   return {
     state: 'found',
@@ -400,12 +400,12 @@ export function readDiscovery(doc: Json, origin: string): Extract<Discovery, { s
 }
 
 /**
- * Ask a server for nrob's discovery document: `/v1/discovery`, then the
- * fixed `/.well-known/nrob.json`. Says why when it cannot: nothing there,
- * the page's origin not allowed (nrob's own message says how to allow it),
+ * Ask a server for OAIY's discovery document: `/v1/discovery`, then the
+ * fixed `/.well-known/oaiy.json`. Says why when it cannot: nothing there,
+ * the page's origin not allowed (OAIY's own message says how to allow it),
  * or an API key needed.
  */
-export async function discoverNrob(address = NROB_ORIGIN, apiKey = '', signal?: AbortSignal, timeoutMs = 5000): Promise<Discovery> {
+export async function discoverOaiy(address = OAIY_ORIGIN, apiKey = '', signal?: AbortSignal, timeoutMs = 5000): Promise<Discovery> {
   let origin: string;
   try {
     origin = originOf(address);
@@ -414,34 +414,34 @@ export async function discoverNrob(address = NROB_ORIGIN, apiKey = '', signal?: 
   }
   const deadline = AbortSignal.timeout(timeoutMs);
   const both = signal ? AbortSignal.any([signal, deadline]) : deadline;
-  for (const path of ['/v1/discovery', '/.well-known/nrob.json']) {
+  for (const path of ['/v1/discovery', '/.well-known/oaiy.json']) {
     let resp: Response;
     try {
       resp = await fetch(`${origin}${path}`, { headers: authHeaders(apiKey), signal: both });
     } catch (error) {
       if (signal?.aborted) throw error;
-      return { state: 'absent', origin, message: `Nothing answered at ${origin}. Start nrob, or give the address it listens on.` };
+      return { state: 'absent', origin, message: `Nothing answered at ${origin}. Start OAIY, or give the address it listens on.` };
     }
     if (resp.status === 404) continue;
-    if (resp.status === 403) return { state: 'forbidden', origin, message: `nrob at ${origin} refused this page: ${(await detailOf(resp)) || 'forbidden'}. ${typeof location === 'undefined' ? '' : `The origin to allow is ${location.origin}.`}` };
-    if (resp.status === 401) return { state: 'needs-key', origin, message: `nrob at ${origin} needs its API key: enter it under Images, video and audio, then Find nrob again.` };
+    if (resp.status === 403) return { state: 'forbidden', origin, message: `OAIY at ${origin} refused this page: ${(await detailOf(resp)) || 'forbidden'}. ${typeof location === 'undefined' ? '' : `The origin to allow is ${location.origin}.`}` };
+    if (resp.status === 401) return { state: 'needs-key', origin, message: `OAIY at ${origin} needs its API key: enter it under Images, video and audio, then Find OAIY again.` };
     if (!resp.ok) return { state: 'absent', origin, message: `${origin}${path} answered HTTP ${resp.status}.` };
     let doc: unknown;
     try {
       doc = await resp.json();
     } catch {
-      return { state: 'absent', origin, message: `${origin}${path} did not answer with JSON: it is not nrob.` };
+      return { state: 'absent', origin, message: `${origin}${path} did not answer with JSON: it is not OAIY.` };
     }
-    if (!isRecord(doc) || !(str(doc.service)?.startsWith('nrob') || Array.isArray(doc.endpoints))) {
-      return { state: 'absent', origin, message: `${origin} answered, but not as nrob.` };
+    if (!isRecord(doc) || !(str(doc.service)?.startsWith('oaiy') || Array.isArray(doc.endpoints))) {
+      return { state: 'absent', origin, message: `${origin} answered, but not as OAIY.` };
     }
     const auth = isRecord(doc.auth) ? doc.auth : {};
     if (auth.required === true && !Array.isArray(doc.endpoints)) {
-      return { state: 'needs-key', origin, message: `nrob at ${origin} needs its API key${apiKey ? ' (the one given was not accepted)' : ''}: enter it under Images, video and audio, then Find nrob again.` };
+      return { state: 'needs-key', origin, message: `OAIY at ${origin} needs its API key${apiKey ? ' (the one given was not accepted)' : ''}: enter it under Images, video and audio, then Find OAIY again.` };
     }
     return readDiscovery(doc, origin);
   }
-  return { state: 'absent', origin, message: `${origin} has no discovery document: it is not nrob, or an older version.` };
+  return { state: 'absent', origin, message: `${origin} has no discovery document: it is not OAIY, or an older version.` };
 }
 
 /** Found settings over the current ones: the key stays, chosen models stay while they still exist. */
@@ -455,7 +455,7 @@ export function mergeDiscovered(current: MediaSettings, found: MediaSettings): M
   return { ...found, apiKey: current.apiKey, enabled: current.baseUrl ? current.enabled : true, imageModel: keepImage, videoModel: keepVideo, speechModel: keepSpeech, musicModel: keepMusic, soundModel: keepSound, model3dModel: keepModel3d };
 }
 
-/** The image, video, speech, music, sound effects and 3D models a server lists: typed (nrob), else guessed from their names. */
+/** The image, video, speech, music, sound effects and 3D models a server lists: typed (OAIY), else guessed from their names. */
 export async function listMediaModels(media: MediaSettings, signal?: AbortSignal): Promise<{ image: string[]; video: string[]; speech: string[]; music: string[]; sound: string[]; model3d: string[] }> {
   const resp = await request(endpointsOf(media).models, { apiKey: media.apiKey, what: 'Listing the models' }, signal ?? AbortSignal.timeout(10_000));
   const body = (await resp.json()) as Json;
@@ -563,7 +563,7 @@ export async function generateSpeech(media: MediaSettings, req: SpeechRequest, s
 
 /** Design a voice from a description and save it on the server under `name`. */
 /**
- * Design a voice. With `keep: false` a service that can (nrob) hands the voice
+ * Design a voice. With `keep: false` a service that can (OAIY) hands the voice
  * back (`handed`) instead of keeping it; otherwise it is saved on the server
  * under `name`.
  */
@@ -751,7 +751,7 @@ export async function generateImage(media: MediaSettings, req: ImageRequest, sig
     if (!/^gpt-image/i.test(model ?? '')) body.response_format = 'b64_json';
     if (req.negativePrompt) body.negative_prompt = req.negativePrompt;
     if (req.seed !== undefined) body.seed = req.seed;
-    // nrob edits through generations: the pictures as data URLs.
+    // OAIY edits through generations: the pictures as data URLs.
     if (refs.length) body.images = refs.map((r) => ({ image_url: dataUrl(r) }));
     resp = await request(ep.images, { method: 'POST', body: JSON.stringify(body), headers: { 'Content-Type': 'application/json' }, apiKey: media.apiKey, what: refs.length ? 'Editing the image' : 'Generating the image' }, signal);
   }

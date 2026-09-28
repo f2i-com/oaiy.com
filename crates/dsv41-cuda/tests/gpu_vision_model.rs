@@ -155,7 +155,7 @@ fn gpu_image_layers_in_isolation() {
     assert!((r.route_flips as f64) < 0.01 * r.routes as f64, "{} of {} routes differ", r.route_flips, r.routes);
     assert!(r.logits_rel < 2e-2, "logits rel-L2 {:.2e}", r.logits_rel);
 
-    if std::env::var("NROB_FREE_RUN").is_err() {
+    if std::env::var("OAIY_FREE_RUN").is_err() {
         return;
     }
     // free-running: how the difference grows, text and image tokens apart

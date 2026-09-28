@@ -526,12 +526,12 @@ export class ChatPane {
   }
 
   /**
-   * A tool call as it is written: nrob's raw call (its tags turned into a
+   * A tool call as it is written: OAIY's raw call (its tags turned into a
    * readable layout), or JSON arguments with their strings unescaped. A script
    * written by append_file reads as it is written.
    */
   private toolDraft(text: string, start: boolean, json: boolean): void {
-    // nrob sends the finished call as JSON too: the raw draft already shows it.
+    // OAIY sends the finished call as JSON too: the raw draft already shows it.
     if (json && this.draft && !this.draft.json) return;
     if (!this.draft || start) {
       this.draft?.box.remove();

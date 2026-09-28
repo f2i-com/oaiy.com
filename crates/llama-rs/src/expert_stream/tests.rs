@@ -18,9 +18,9 @@ use gguf::{GgufFile, TensorBytes, TensorInfo, Value};
 
 use crate::Model;
 
-use nrob::ecache::Ecache;
-use nrob::store::WeightStore;
-use nrob::types::CachePolicy;
+use oaiy_engine::ecache::Ecache;
+use oaiy_engine::store::WeightStore;
+use oaiy_engine::types::CachePolicy;
 
 use super::*;
 
@@ -424,7 +424,7 @@ fn file_fixture() -> FileFixture {
     let data_start = probe.tensor_data_start() as usize;
 
     let path = std::env::temp_dir().join(format!(
-        "nrob_llama_stream_{}_{}.gguf",
+        "oaiy_llama_stream_{}_{}.gguf",
         std::process::id(),
         FILE_FIXTURE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));

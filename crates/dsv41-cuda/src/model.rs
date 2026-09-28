@@ -1,7 +1,7 @@
 //! The DeepSeek-V4.1 backbone on one or more GPUs (Phase C1-C3): the trunk
 //! is resident in its stored dtypes (fp8 stays fp8), every matmul, norm,
 //! rotation, attention and expert runs on a device, and routed experts live
-//! in a per-device VRAM cache fed from nrob's host cache.
+//! in a per-device VRAM cache fed from OAIY's host cache.
 //!
 //! With several devices the layers are split into contiguous ranges (C3):
 //! each layer's weights, KV caches, RoPE tables and experts live on its
@@ -33,9 +33,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use cudarc::driver::{CudaSlice, CudaView};
-use nrob::ecache::Ecache;
-use nrob::store::WeightStore;
-use nrob::{CachePolicy, Error, Result};
+use oaiy_engine::ecache::Ecache;
+use oaiy_engine::store::WeightStore;
+use oaiy_engine::{CachePolicy, Error, Result};
 
 use dsv41::attention::{compressed_pos, select_compressed, CandidateRole, Shared};
 use dsv41::config::Config;
@@ -359,7 +359,7 @@ pub struct PassStats {
 /// pool, whose rows the reduction reads from the device's hand-off.
 enum CpuPart {
     None,
-    Blocking(Vec<(usize, nrob::ecache::HostLease, f32)>, Vec<f32>),
+    Blocking(Vec<(usize, oaiy_engine::ecache::HostLease, f32)>, Vec<f32>),
     Launched { mask: u32, seq: u32, uses: u64 },
 }
 

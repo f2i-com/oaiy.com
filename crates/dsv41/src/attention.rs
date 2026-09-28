@@ -26,7 +26,7 @@
 
 use std::sync::Arc;
 
-use nrob::{Error, Result};
+use oaiy_engine::{Error, Result};
 
 use crate::config::Config;
 use crate::formats::{fake_quant_fp4_inplace, fake_quant_fp8_inplace, to_bf16, Fp4Scale};

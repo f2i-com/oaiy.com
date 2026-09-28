@@ -1,0 +1,9 @@
+[package]
+name = "oaiy-engine"
+version = "0.7.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "OAIY core: expert store seam, bounded RAM expert cache, row-parallel pool"
+
+# std-only. Do not add external crates.
+[dependencies]

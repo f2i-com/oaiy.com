@@ -1,8 +1,8 @@
-# NROB Studio
+# OAIY
 
-`nrob-studio` is a portable host for running language, image and video models on
-one machine with finite memory. It supervises the two engines, `nrob-server`
-(language models) and `nrob-diffusion` (images and video), as subprocesses. It
+`oaiy-studio` is a portable host for running language, image and video models on
+one machine with finite memory. It supervises the two engines, `oaiy-llm-server`
+(language models) and `oaiy-media` (images and video), as subprocesses. It
 serves a control UI and exposes one API whose routes you configure: paths,
 methods, and the dialect each speaks.
 
@@ -15,24 +15,24 @@ it builds and runs its UI on any machine. The engines need CUDA; see
 Put these in one folder:
 
 ```
-nrob-studio.exe        the host, as a console program (cargo build --release -p nrob-studio)
-nrob-studio-tray.exe   the same host as a notification-area app (Windows)
-nrob-server.exe        language models (tools/qwen-image/build.ps1 builds both)
-nrob-diffusion.exe     images and video (built with --features flash-attn)
-nrob-studio.json       created with defaults on first start
+oaiy-studio.exe        the host, as a console program (cargo build --release -p oaiy-studio)
+oaiy-studio-tray.exe   the same host as a notification-area app (Windows)
+oaiy-llm-server.exe        language models (tools/qwen-image/build.ps1 builds both)
+oaiy-media.exe     images and video (built with --features flash-attn)
+oaiy-studio.json       created with defaults on first start
 ```
 
-Programs named without a folder (`"server": "nrob-server"`) are found beside
-`nrob-studio`, then beside the configuration, then on `PATH`. Relative paths in
+Programs named without a folder (`"server": "oaiy-llm-server"`) are found beside
+`oaiy-studio`, then beside the configuration, then on `PATH`. Relative paths in
 the configuration resolve against the configuration's folder. Generated media
 goes to `outputs/` there, and prompt states to `cache/`. Copy the folder to
 another machine and it runs there.
 
 ```sh
-nrob-studio                      # opens the UI in a browser window without tabs
-nrob-studio --open browser       # a normal browser tab
-nrob-studio --headless           # console only; the UI still serves on its port
-nrob-studio --config D:/ai/studio.json --ui-port 7000 --port 9000 --start-llm
+oaiy-studio                      # opens the UI in a browser window without tabs
+oaiy-studio --open browser       # a normal browser tab
+oaiy-studio --headless           # console only; the UI still serves on its port
+oaiy-studio --config D:/ai/studio.json --ui-port 7000 --port 9000 --start-llm
 ```
 
 The console accepts `status`, `start`, `stop`, `open`, `jobs` and `quit`.
@@ -73,14 +73,14 @@ The console accepts `status`, `start`, `stop`, `open`, `jobs` and `quit`.
 
 ### In the notification area (Windows)
 
-`nrob-studio-tray.exe` is the same studio without a console window. It starts
+`oaiy-studio-tray.exe` is the same studio without a console window. It starts
 in the background, opens the UI window, and puts an icon by the clock. Closing
 the UI window leaves everything serving. Click the icon to bring it back: if
 the window is already open (even minimised), it comes to the front rather than
 opening a second one.
 Right-click for:
 
-- **Open NROB Studio**, or **Open in the browser**;
+- **Open OAIY**, or **Open in the browser**;
 - the language model's state, and **Start** / **Stop** it;
 - **Open the output folder**;
 - **Start with Windows**, which registers it to start at sign-in, silently, in
@@ -89,7 +89,7 @@ Right-click for:
 
 The tooltip shows the model's state and media progress, and a notification
 pops up when an image or video finishes (or fails). It takes the same options as
-`nrob-studio`; `--open none` starts it with no window. Starting a second copy
+`oaiy-studio`; `--open none` starts it with no window. Starting a second copy
 just brings up the running one's UI. Windows 11 puts new icons under the **^**
 overflow at first; drag the icon onto the taskbar to keep it visible.
 
@@ -107,7 +107,7 @@ The catalog lists mainstream releases only, with their licences:
 | Images | Qwen Image 2.1 with Viggle's turbo adapter; Stable Diffusion XL 1.0 with its CLIP tokenizer |
 | Video | LTX 2.5 (its BF16 transformer, Gemma 4 text encoder, and video and audio VAEs) |
 | Speech | Qwen3-TTS 1.7B (VoiceDesign and Base); Breeze TTS 2 |
-| Music | MiniMax Music 3 (the parts nrob uses: 28.5 of its 57 GB) |
+| Music | MiniMax Music 3 (the parts OAIY uses: 28.5 of its 57 GB) |
 | Sound effects | MOSS-SoundEffect v2.0 |
 | 3D models | Pixal3D (the single-picture checkpoints) with DINOv3 ViT-L/16 and NAF, bringing BiRefNet and Real-ESRGAN |
 | Picture tools | BiRefNet (background removal), Real-ESRGAN x4plus (upscaling) |
@@ -132,7 +132,7 @@ licence. **Recommended** picks one of each kind to start with.
   model that was removed from the list.
 - **How it downloads:** with the system's `curl`, which Windows 10 and later,
   macOS and Linux include (`downloads.curl` names another). Each finished part
-  leaves `.nrob-<id>.json` in its folder.
+  leaves `.oaiy-<id>.json` in its folder.
 
 ## Adding models
 
@@ -168,7 +168,7 @@ headers, never its weights, and decides what it is:
 
 Pickled `.bin`, `.pt` and `.ckpt` files are refused, because loading them can run code
 (NAF's `naf_release.pth` and Real-ESRGAN's `RealESRGAN_x4plus.pth` are the exceptions:
-nrob reads only their tensors).
+OAIY reads only their tensors).
 
 A model that still needs a part is added **disabled** and marked with what it
 needs. The studio fills parts itself where it can:
@@ -186,7 +186,7 @@ been removed or turned off.
 
 ### Saving and moving your model list
 
-Models → **Export models** downloads `nrob-models.json`: every language, image
+Models → **Export models** downloads `oaiy-models.json`: every language, image
 and video model with its parts, the defaults, and the memory settings. Paths are
 written absolute, so the file works from any install folder. **Import models**
 reads one back and asks whether to merge (same-named models are updated, others
@@ -215,7 +215,7 @@ mode and caps. The worker applies the setting per block:
 
 - **Qwen Image**: the 32 transformer blocks and the 36 Qwen3-VL text-encoder
   layers each settle on the GPU, in RAM or on the SSD
-  (`nrob-diffusion/src/residency.rs`). GGUF blocks travel as their quantized
+  (`oaiy-media/src/residency.rs`). GGUF blocks travel as their quantized
   bytes and are rebuilt on the GPU, never dequantized on the way. ConvRot/int8
   safetensors are decoded once when they settle in RAM, and again on every pass
   when streamed from the SSD.
@@ -253,7 +253,7 @@ A model's own GPUs are set on its card under **Models**.
 
 - `auto` (default): media takes turns only with a model on the media GPU.
   - When a job starts while such a model is loaded, the studio waits for that
-    model's running chat requests to finish, stops `nrob-server`, runs the job,
+    model's running chat requests to finish, stops `oaiy-llm-server`, runs the job,
     and restarts the LLM once the queue is empty (`media.resume_llm`).
   - Chat requests for such a model that arrive meanwhile wait, up to 15
     minutes, and are then answered.
@@ -269,12 +269,12 @@ machine. The next request loads it again.
 The **Endpoints** page edits `gateway.routes`. Each route has a `path`, a
 `method`, a `target` and a `spec` (dialect):
 
-| target | spec `openai` | spec `nrob` |
+| target | spec `openai` | spec `oaiy` |
 |---|---|---|
-| `chat` | `POST` → nrob-server `/v1/chat/completions`, streamed through as it arrives | — |
+| `chat` | `POST` → oaiy-llm-server `/v1/chat/completions`, streamed through as it arrives | — |
 | `completions` | `POST` → `/v1/completions` | — |
 | `models` | the LLM's list plus image, video, speech, music, sound effects and 3D models (`type`: llm, image, video, speech, music, sound, model3d) | — |
-| `images` | OpenAI Images (below) | nrob-server's job API: `202 {id, status_url}`, `GET …/status`, `POST …/cancel` |
+| `images` | OpenAI Images (below) | oaiy-llm-server's job API: `202 {id, status_url}`, `GET …/status`, `POST …/cancel` |
 | `edits` | OpenAI image edits (below) | — |
 | `videos` | OpenAI Videos (below) | the same job API for video |
 | `speech` | OpenAI audio.speech: the audio itself ([Speech](SPEECH.md)) | the same |
@@ -307,7 +307,7 @@ table that routes the same method and path twice. `gateway.api_key` requires
 | extensions | `seed`, `steps`, `cfg`, `negative_prompt` (SDXL), `turbo`, `weights`, `memory`, `ram_gb`, `vram_gb` |
 
 The reply is `{created, data: [{b64_json | url, revised_prompt}], output_format: "png", size, model}`.
-Generation requests may also carry `images` (below) to edit; the nrob dialect accepts them too.
+Generation requests may also carry `images` (below) to edit; the OAIY dialect accepts them too.
 
 ### OpenAI image edits
 
@@ -369,7 +369,7 @@ One request tells an app what this studio offers:
 
 ```sh
 curl http://127.0.0.1:8080/v1/discovery          # a route, movable like any other
-curl http://127.0.0.1:8080/.well-known/nrob.json # fixed, for probing any host:port
+curl http://127.0.0.1:8080/.well-known/oaiy.json # fixed, for probing any host:port
 ```
 
 The reply includes:
@@ -391,20 +391,20 @@ With a key configured, a caller without it sees only that a key is needed.
 
 The **Incognito** switch (bottom of the sidebar), or `privacy.incognito: true`,
 keeps nothing about any request. A single request can ask for the same with the
-header `X-NROB-Incognito: 1` or a body field `"incognito": true`.
+header `X-OAIY-Incognito: 1` or a body field `"incognito": true`.
 
-- **Language model:** no prompt state is written to disk, and nrob-server logs
+- **Language model:** no prompt state is written to disk, and oaiy-llm-server logs
   nothing about the request. When the request ends, the engine drops its live
   state and checkpoints, so the next request cannot reuse (or reveal) it. The
   cost: every prompt is read from the start. The whole-server mode is
-  `nrob-server --incognito`.
+  `oaiy-llm-server --incognito`.
 - **Incognito sessions:** a caller that makes many requests in one private
   conversation (an agent's steps) can name it with the header
-  `X-NROB-Session: <id>` (or a body field `"nrob_session"`). The engine then keeps
+  `X-OAIY-Session: <id>` (or a body field `"oaiy_session"`). The engine then keeps
   that session's prompt state in memory, never on disk, so its next request
   reads only what is new. Any request from outside the session wipes it first,
   and so does ending the session: `POST /v1/chat/completions` with the body
-  `{"nrob_forget_session": "<id>"}` (a model that is not running is not started
+  `{"oaiy_forget_session": "<id>"}` (a model that is not running is not started
   for this). bot.computer names its incognito project as the session, and ends
   it when the project is cleared or incognito is turned off.
 - **Images and video:** the job writes into a private folder under
@@ -445,10 +445,10 @@ unaffected. The list starts with bot.computer's origins: the web app
 (`http://localhost:5317`, `http://127.0.0.1:5317`) and its desktop app
 (`http://botcomputer.localhost` on Windows, `botcomputer://localhost` on macOS and Linux).
 A configuration written before that gains them once (`origins_version`);
-remove any you do not want and they stay removed. nrob-server is always started with `--local-images off`, so nothing
+remove any you do not want and they stay removed. oaiy-llm-server is always started with `--local-images off`, so nothing
 reaching the gateway can have the vision model read files from this machine.
 
-`nrob-server` runs on a private loopback port with a random key and is started
+`oaiy-llm-server` runs on a private loopback port with a random key and is started
 with `--watch-stdin`. The studio holds that pipe, so if the studio dies,
 however it ends, the server exits and returns its GPU memory.
 
@@ -484,7 +484,7 @@ sections are:
 `llm.backend` picks what the language model runs on: `auto` (default), `cuda`,
 `webgpu` or `cpu`. With `auto` the studio starts `llm.server` (the CUDA build)
 when an NVIDIA GPU answers. If that dies while loading, or there is no NVIDIA GPU,
-it starts `llm.server_webgpu` (`nrob-server-webgpu`, built without CUDA), which
+it starts `llm.server_webgpu` (`oaiy-llm-server-webgpu`, built without CUDA), which
 runs GGUF models on any WebGPU adapter and falls back to the CPU.
 `llm.webgpu_gb` caps the weights WebGPU holds; the rest run on the CPU. The
 Overview shows what the model runs on. See [WEBGPU.md](WEBGPU.md).
@@ -495,7 +495,7 @@ Overview shows what the model runs on. See [WEBGPU.md](WEBGPU.md).
   are CUDA engines), and image and video jobs are CPU-only (LTX video needs the
   CUDA worker). `media.llm_policy: auto` reasons about CUDA device indices.
 - One media job runs at a time; jobs queue. Only one language model is resident
-  (nrob-server swaps on request).
+  (oaiy-llm-server swaps on request).
 - The job list lives in memory: a restart forgets jobs, not their files.
 - Multipart is accepted on the edits route only; a video's `input_reference`
   goes as a `data:` URL in JSON. Edits take no mask.
@@ -508,14 +508,14 @@ On two RTX 5090s and 192 GB RAM, with the studio isolated on GPU 1 and its own p
 
 - Qwen Image Q4 GGUF through `POST /v1/images/generations`: 512², RAM tier (all
   32 blocks and 36 encoder layers in RAM), 44 s including cold loads.
-- Chat through the gateway: the first request started `nrob-server`
+- Chat through the gateway: the first request started `oaiy-llm-server`
   (Qwen3.8 27B Q4 GGUF, loaded in 24 s) and streamed the reply.
 - `POST /v1/videos` (Sulphur 2, 1 s at 512×320) while that LLM held GPU 1: the
   studio stopped the LLM, rendered the clip in 108 s, and restarted the LLM. A chat
   request sent mid-render waited 123 s and was then answered. `…/content` and
   `?variant=thumbnail` served the MP4 and PNG.
-- A custom route `/my/sdxl` in the nrob dialect ran SDXL staged from the SSD.
-- Killing the studio process left no `nrob-server` behind.
+- A custom route `/my/sdxl` in the OAIY dialect ran SDXL staged from the SSD.
+- Killing the studio process left no `oaiy-llm-server` behind.
 - `POST /v1/images/edits` as multipart (`curl -F image=@lighthouse.png -F prompt=…`)
   turned the sunset lighthouse into a snowy night with the beam lit, keeping the
   composition. A config written before the edits route existed gained it on load.

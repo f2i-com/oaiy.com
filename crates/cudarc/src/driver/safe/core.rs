@@ -40,13 +40,13 @@ pub struct CudaContext {
     pub(crate) num_streams: AtomicUsize,
     pub(crate) event_tracking: AtomicBool,
     pub(crate) error_state: AtomicU32,
-    /// VENDORED-LOCAL (nrob): whether a stream of this context is being captured into a graph
+    /// VENDORED-LOCAL (OAIY): whether a stream of this context is being captured into a graph
     /// with [CudaStream::begin_graph] (checked before taking `graph_recording`'s lock).
     pub(crate) graph_active: AtomicBool,
     pub(crate) graph_recording: std::sync::Mutex<GraphRecording>,
 }
 
-/// VENDORED-LOCAL (nrob): a graph capture in progress. Allocations on the captured stream come
+/// VENDORED-LOCAL (OAIY): a graph capture in progress. Allocations on the captured stream come
 /// from `arena` (a bump allocator reset each capture, so the same sequence of launches gets
 /// the same addresses every time), and frees wait until the capture is over: a free recorded
 /// into the graph would happen again at every replay.
@@ -817,7 +817,7 @@ pub struct CudaSlice<T> {
     pub(crate) write: Option<CudaEvent>,
     pub(crate) stream: Arc<CudaStream>,
     pub(crate) marker: PhantomData<*const T>,
-    /// VENDORED-LOCAL (nrob): false for a slice of a graph arena, which frees nothing.
+    /// VENDORED-LOCAL (OAIY): false for a slice of a graph arena, which frees nothing.
     pub(crate) owned: bool,
 }
 
@@ -830,7 +830,7 @@ impl<T> Drop for CudaSlice<T> {
         if !self.owned {
             return;
         }
-        // VENDORED-LOCAL (nrob): during a graph capture, free once it is over.
+        // VENDORED-LOCAL (OAIY): during a graph capture, free once it is over.
         if ctx.graph_active.load(Ordering::Acquire) {
             if let Ok(mut g) = ctx.graph_recording.lock() {
                 if ctx.graph_active.load(Ordering::Acquire) {
@@ -839,7 +839,7 @@ impl<T> Drop for CudaSlice<T> {
                 }
             }
         }
-        // VENDORED-LOCAL (nrob): make this slice's context current first, as the stream and
+        // VENDORED-LOCAL (OAIY): make this slice's context current first, as the stream and
         // event drops do. Freed on a thread where another device's context (or none) is
         // current, the free fails silently and the memory is never released: a model
         // unloaded from its engine thread kept all of its VRAM.
@@ -1550,7 +1550,7 @@ impl<T> HostSlice<T> for PinnedHostSlice<T> {
 }
 
 impl CudaStream {
-    /// VENDORED-LOCAL (nrob): `bytes` from the graph arena, while this stream is being captured.
+    /// VENDORED-LOCAL (OAIY): `bytes` from the graph arena, while this stream is being captured.
     fn arena_alloc(&self, bytes: usize) -> Option<sys::CUdeviceptr> {
         if !self.ctx.graph_active.load(Ordering::Acquire) {
             return None;
@@ -1571,7 +1571,7 @@ impl CudaStream {
         Some(ptr)
     }
 
-    /// VENDORED-LOCAL (nrob): start capturing this stream into a graph: until [Self::end_graph],
+    /// VENDORED-LOCAL (OAIY): start capturing this stream into a graph: until [Self::end_graph],
     /// its allocations come from `arena` (`size` bytes, reused from its start each capture)
     /// and every free in this context waits.
     ///
@@ -1598,7 +1598,7 @@ impl CudaStream {
         begun
     }
 
-    /// VENDORED-LOCAL (nrob): end the capture [Self::begin_graph] started: the graph (for
+    /// VENDORED-LOCAL (OAIY): end the capture [Self::begin_graph] started: the graph (for
     /// the caller to instantiate or update, launch and destroy), the frees that waited (for
     /// [Self::free_after]), and how much of the arena the capture used.
     pub fn end_graph(&self) -> Result<(sys::CUgraph, Vec<sys::CUdeviceptr>, usize), DriverError> {
@@ -1615,13 +1615,13 @@ impl CudaStream {
         (std::mem::take(&mut g.deferred), g.used)
     }
 
-    /// VENDORED-LOCAL (nrob): whether this stream is being captured by [Self::begin_graph].
+    /// VENDORED-LOCAL (OAIY): whether this stream is being captured by [Self::begin_graph].
     pub fn graph_recording(&self) -> bool {
         self.ctx.graph_active.load(Ordering::Acquire)
             && self.ctx.graph_recording.lock().is_ok_and(|g| g.stream == self.cu_stream as usize)
     }
 
-    /// VENDORED-LOCAL (nrob): free `ptrs` in this stream's order (after the work queued so far).
+    /// VENDORED-LOCAL (OAIY): free `ptrs` in this stream's order (after the work queued so far).
     pub fn free_after(&self, ptrs: Vec<sys::CUdeviceptr>) {
         self.ctx.record_err(self.ctx.bind_to_thread());
         for p in ptrs {

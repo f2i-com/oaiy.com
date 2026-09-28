@@ -16,7 +16,7 @@ use std::time::Instant;
 use dsv41::expert::{expert_forward, SafetensorsExpertStore, DIM, RECORD_BYTES};
 use dsv41::formats::f32_to_bf16;
 use dsv41::safetensors::StIndex;
-use nrob::store::WeightStore;
+use oaiy_engine::store::WeightStore;
 
 fn env_path(var: &str, default: &str) -> PathBuf {
     std::env::var_os(var).map(PathBuf::from).unwrap_or_else(|| PathBuf::from(default))

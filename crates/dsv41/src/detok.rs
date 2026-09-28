@@ -9,8 +9,8 @@
 
 use std::path::Path;
 
-use nrob::json::Json;
-use nrob::{Error, Result};
+use oaiy_engine::json::Json;
+use oaiy_engine::{Error, Result};
 
 pub struct Detokenizer {
     /// Byte string of every token id (empty for unused ids).

@@ -7,7 +7,7 @@ use cudarc::driver::{CudaSlice, CudaView};
 use dsv41::config::{Config, VisionConfig};
 use dsv41::safetensors::{Dtype, StIndex};
 use dsv41::vision::{self, Prepared};
-use nrob::{Error, Result};
+use oaiy_engine::{Error, Result};
 
 use crate::gpu::Gpu;
 

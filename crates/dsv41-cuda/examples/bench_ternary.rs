@@ -5,9 +5,9 @@ use std::time::Instant;
 use dsv41::{expert, ternary};
 use dsv41::cpu_experts::CpuExperts;
 use dsv41_cuda::{Gpu, cpu::{row_kernel,ternary_row_kernel}};
-use nrob::store::WeightStore;
-use nrob::ecache::Ecache;
-use nrob::types::CachePolicy;
+use oaiy_engine::store::WeightStore;
+use oaiy_engine::ecache::Ecache;
+use oaiy_engine::types::CachePolicy;
 use expert::{DIM,INTER};
 
 fn rel(a:&[f32],b:&[f32])->f64 {

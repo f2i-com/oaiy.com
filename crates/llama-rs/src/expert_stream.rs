@@ -1,10 +1,10 @@
-//! VENDORED-LOCAL: streaming MoE expert backend (nrob bridge).
+//! VENDORED-LOCAL: streaming MoE expert backend (OAIY bridge).
 //!
 //! The resident loaders ([`crate::qwen3moe`], [`crate::mixtral`]) materialize
 //! every expert's weights host-resident at load time. This module is the
 //! alternative for MoE models opened with [`crate::Model::open_streaming`]:
 //! expert tensors are never materialized; instead each expert's packed bytes
-//! are fetched on demand through [`nrob::ecache::Ecache`], a bounded RAM
+//! are fetched on demand through [`oaiy_engine::ecache::Ecache`], a bounded RAM
 //! cache, from the [`gguf::TensorBytes`] source attached to the
 //! [`GgufFile`] (a [`gguf::FileSource`]: positioned reads from the `.gguf`).
 //!
@@ -54,9 +54,9 @@ use ggml_rs::quantized::{QuantizedHostBytes, QuantizedTensor};
 use ggml_rs::{Backend, Tensor};
 use gguf::{GgufFile, TensorInfo};
 
-use nrob::ecache::Ecache;
-use nrob::store::WeightStore;
-use nrob::Error;
+use oaiy_engine::ecache::Ecache;
+use oaiy_engine::store::WeightStore;
+use oaiy_engine::Error;
 
 use crate::loader::{dtype_supports_packed_matmul, FfnPair, Weight};
 use crate::moe::MoeOptions;
@@ -80,9 +80,9 @@ pub const MIN_CACHE_RECORDS: usize = 8;
 // `n_expert_used` records and each record was read as three ranged reads one
 // after another inside one worker -- so a worker had one request outstanding and
 // idled between parts. Splitting per part triples the work items, and this raises
-// the ceiling on how many run at once. Override with NROB_FETCH_WORKERS.
+// the ceiling on how many run at once. Override with OAIY_FETCH_WORKERS.
 fn fetch_workers() -> usize {
-    std::env::var("NROB_FETCH_WORKERS")
+    std::env::var("OAIY_FETCH_WORKERS")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|&v| v > 0)
@@ -93,12 +93,12 @@ fn fetch_workers() -> usize {
 /// [`QuantizedTensor::from_mmap`] so a cached expert's packed bytes are read
 /// directly by the quant kernels with no `.to_vec()` doubling.
 ///
-// VENDORED-LOCAL (CACHE-01): the view owns an `nrob::ecache::HostLease`
+// VENDORED-LOCAL (CACHE-01): the view owns an `oaiy_engine::ecache::HostLease`
 // instead of an `Arc<Vec<u8>>` copy. The lease pins the cache slot's record
 // buffer for as long as any `QuantizedTensor` built from it lives — through
 // the packed matvec — with zero copies on a cache hit.
 struct RecordView {
-    lease: nrob::ecache::HostLease,
+    lease: oaiy_engine::ecache::HostLease,
     start: usize,
     len:   usize,
 }
@@ -413,7 +413,7 @@ impl GgufExpertStore {
     /// batch without side effects and names its position.
     ///
     // VENDORED-LOCAL (Wave C).
-    pub fn fetch_many(&self, keys: &[(u32, u32)], bufs: &mut [Vec<u8>]) -> nrob::Result<()> {
+    pub fn fetch_many(&self, keys: &[(u32, u32)], bufs: &mut [Vec<u8>]) -> oaiy_engine::Result<()> {
         if keys.len() != bufs.len() {
             return Err(Error::Arg(format!(
                 "fetch_many: {} keys but {} buffers",
@@ -469,7 +469,7 @@ impl GgufExpertStore {
 
         let workers = jobs
             .len()
-            .min(nrob::backend::hardware_concurrency())
+            .min(oaiy_engine::backend::hardware_concurrency())
             .min(fetch_workers());
         // Round-robin, so a record's three parts land on three different workers
         // and are in flight together rather than one after another.
@@ -484,7 +484,7 @@ impl GgufExpertStore {
             let handles: Vec<_> = buckets
                 .into_iter()
                 .map(|bucket| {
-                    s.spawn(move || -> nrob::Result<()> {
+                    s.spawn(move || -> oaiy_engine::Result<()> {
                         for (shard, off, dst) in bucket {
                             let src = self.file.shard_source_at(shard).ok_or_else(|| {
                                 Error::Io(std::io::Error::other(
@@ -524,7 +524,7 @@ impl WeightStore for GgufExpertStore {
         (self.layout.n_layers, self.layout.n_experts)
     }
 
-    fn fetch(&self, layer: u32, expert: u32, dst: &mut [u8]) -> nrob::Result<()> {
+    fn fetch(&self, layer: u32, expert: u32, dst: &mut [u8]) -> oaiy_engine::Result<()> {
         let io_err = |msg: String| {
             Error::Io(std::io::Error::new(std::io::ErrorKind::Other, msg))
         };
@@ -636,7 +636,7 @@ impl StreamShared {
         }
         Ok(Arc::new(Self {
             store,
-            cache: Ecache::new(cache_budget_bytes, rec, nrob::types::CachePolicy::Lfru),
+            cache: Ecache::new(cache_budget_bytes, rec, oaiy_engine::types::CachePolicy::Lfru),
             resident_est_bytes,
             error: Mutex::new(None),
             #[cfg(feature = "cuda")]
@@ -821,7 +821,7 @@ impl StreamShared {
         self.cache.len()
     }
 
-    pub fn cache_stats(&self) -> nrob::ecache::CacheStats {
+    pub fn cache_stats(&self) -> oaiy_engine::ecache::CacheStats {
         self.cache.stats()
     }
 
@@ -972,7 +972,7 @@ impl LayerStream {
     }
 
     /// This expert's record from the RAM tier, reading it in on a miss.
-    pub(crate) fn host_record(&self, e: u32) -> Result<nrob::ecache::HostLease, String> {
+    pub(crate) fn host_record(&self, e: u32) -> Result<oaiy_engine::ecache::HostLease, String> {
         self.shared
             .cache
             .acquire(self.layer, e, &self.shared.store)
@@ -1428,7 +1428,7 @@ pub(crate) enum ResolvedExpert {
     /// VENDORED-LOCAL: GLM-5.3-Flash. A VRAM miss whose record is in RAM, left
     /// there on purpose: computing it on the CPU costs less than the PCIe copy
     /// that would move it, and it runs while the GPU works on the resident ones.
-    Cpu(nrob::ecache::HostLease),
+    Cpu(oaiy_engine::ecache::HostLease),
 }
 
 impl ResolvedExpert {
@@ -1457,7 +1457,7 @@ impl ResolvedExpert {
         }
     }
 
-    pub(crate) fn cpu_lease(&self) -> Option<&nrob::ecache::HostLease> {
+    pub(crate) fn cpu_lease(&self) -> Option<&oaiy_engine::ecache::HostLease> {
         match self {
             Self::Cpu(l) => Some(l),
             _ => None,
@@ -1583,7 +1583,7 @@ impl DeviceDispatch {
 ///
 // VENDORED-LOCAL (CACHE-01): takes the cache lease, not an `Arc<Vec<u8>>`.
 fn make_weight(
-    rec: &nrob::ecache::HostLease,
+    rec: &oaiy_engine::ecache::HostLease,
     start: usize,
     len: usize,
     dtype: GgmlType,
@@ -1666,7 +1666,7 @@ impl crate::Model {
     /// resident as in [`crate::Model::load`]; expert tensors are never
     /// materialized: routed experts are read on demand from the `.gguf`
     /// file ([`GgufFile::open_streaming`], positioned reads) through a
-    /// bounded [`nrob::ecache::Ecache`].
+    /// bounded [`oaiy_engine::ecache::Ecache`].
     ///
     /// `ram_budget_bytes` covers resident weights + expert cache: the cache
     /// is sized as `budget − resident_estimate`, where the estimate is

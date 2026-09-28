@@ -1,7 +1,7 @@
 //! The GPU vision tower against the reference's features
 //! (tools/dsv41/vision_golden.py) and each ViT block against the CPU tower:
 //!   cargo test -p dsv41-cuda --release --test gpu_vision -- --ignored --nocapture
-//! (`DSV41_CUDA_DEVICES=1` picks the device; `NROB_VISION_IMAGES` the images.)
+//! (`DSV41_CUDA_DEVICES=1` picks the device; `OAIY_VISION_IMAGES` the images.)
 
 use std::path::PathBuf;
 use std::time::Instant;
@@ -16,7 +16,7 @@ fn model_dir() -> PathBuf {
 }
 
 fn golden() -> Option<PathBuf> {
-    let dir = PathBuf::from(std::env::var("NROB_VISION_GOLDEN").unwrap_or_else(|_| r"E:\deepseek\golden\vision".into()));
+    let dir = PathBuf::from(std::env::var("OAIY_VISION_GOLDEN").unwrap_or_else(|_| r"E:\deepseek\golden\vision".into()));
     dir.join("features.safetensors").exists().then_some(dir)
 }
 
@@ -46,7 +46,7 @@ fn gpu_tower_matches_the_reference() {
     eprintln!("loaded {:.0} MB of vision weights in {:.1}s", tower.bytes() as f64 / 1e6, t.elapsed().as_secs_f64());
     let cpu = VisionTower::load(&model_dir(), &cfg).expect("cpu tower");
     let feats = StIndex::open_file(&dir.join("features.safetensors")).expect("features");
-    let names = std::env::var("NROB_VISION_IMAGES").unwrap_or_else(|_| "mascot,wide,odd,tiny".into());
+    let names = std::env::var("OAIY_VISION_IMAGES").unwrap_or_else(|_| "mascot,wide,odd,tiny".into());
     for name in names.split(',') {
         let patches = feats.read_f32(&format!("{name}.patches")).expect("patches");
         let dims = feats.read_i64(&format!("{name}.dims")).expect("dims");

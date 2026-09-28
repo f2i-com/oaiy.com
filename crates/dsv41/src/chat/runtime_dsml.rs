@@ -2,7 +2,7 @@
 //! The reference/golden parser remains strict. Never repair missing closing tags,
 //! invent arguments, or rewrite raw string parameter contents.
 use super::{format_err, split_tool_name, write_str, ToolCall, DSML};
-use nrob::{json::Json, Result};
+use oaiy_engine::{json::Json, Result};
 
 struct Tag<'a> { name: &'a str, close: bool, dsml: bool, attrs: Vec<(&'a str, &'a str)> }
 

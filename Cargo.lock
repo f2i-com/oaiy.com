@@ -503,8 +503,8 @@ dependencies = [
 name = "dsv41"
 version = "0.1.0"
 dependencies = [
- "nrob",
- "nrob-image",
+ "oaiy-engine",
+ "oaiy-image",
 ]
 
 [[package]]
@@ -513,7 +513,7 @@ version = "0.1.0"
 dependencies = [
  "cudarc 0.19.8",
  "dsv41",
- "nrob",
+ "oaiy-engine",
 ]
 
 [[package]]
@@ -1271,7 +1271,7 @@ dependencies = [
  "gguf",
  "half",
  "image",
- "nrob",
+ "oaiy-engine",
  "rayon",
  "thiserror 1.0.69",
  "tokenizer",
@@ -1442,79 +1442,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "nrob"
-version = "0.7.0"
-
-[[package]]
-name = "nrob-cli"
-version = "0.7.0"
-dependencies = [
- "ggml-rs",
- "ggml-rs-cuda",
- "ggml-rs-wgpu",
- "gguf",
- "llama-rs",
- "nrob",
- "tokenizer",
-]
-
-[[package]]
-name = "nrob-diffusion"
-version = "0.1.0"
-dependencies = [
- "candle-core",
- "candle-flash-attn",
- "candle-nn",
- "dsv41",
- "half",
- "image",
- "meshopt",
- "nrob",
- "nrob-image",
- "regex",
- "tokenizers 0.21.4",
-]
-
-[[package]]
-name = "nrob-image"
-version = "0.1.0"
-dependencies = [
- "nrob",
-]
-
-[[package]]
-name = "nrob-server"
-version = "0.7.0"
-dependencies = [
- "dsv41",
- "dsv41-cuda",
- "ggml-rs",
- "ggml-rs-cuda",
- "ggml-rs-wgpu",
- "gguf",
- "llama-rs",
- "nrob",
- "rayon",
- "tokenizer",
-]
-
-[[package]]
-name = "nrob-studio"
-version = "0.1.0"
-dependencies = [
- "nrob",
-]
-
-[[package]]
-name = "nrob-studio-tray"
-version = "0.1.0"
-dependencies = [
- "nrob",
- "nrob-studio",
- "windows-sys",
-]
-
-[[package]]
 name = "num"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1596,6 +1523,79 @@ checksum = "91df4bbde75afed763b708b7eee1e8e7651e02d97f6d5dd763e89367e957b23b"
 dependencies = [
  "hermit-abi",
  "libc",
+]
+
+[[package]]
+name = "oaiy-engine"
+version = "0.7.0"
+
+[[package]]
+name = "oaiy-image"
+version = "0.1.0"
+dependencies = [
+ "oaiy-engine",
+]
+
+[[package]]
+name = "oaiy-llm-cli"
+version = "0.7.0"
+dependencies = [
+ "ggml-rs",
+ "ggml-rs-cuda",
+ "ggml-rs-wgpu",
+ "gguf",
+ "llama-rs",
+ "oaiy-engine",
+ "tokenizer",
+]
+
+[[package]]
+name = "oaiy-llm-server"
+version = "0.7.0"
+dependencies = [
+ "dsv41",
+ "dsv41-cuda",
+ "ggml-rs",
+ "ggml-rs-cuda",
+ "ggml-rs-wgpu",
+ "gguf",
+ "llama-rs",
+ "oaiy-engine",
+ "rayon",
+ "tokenizer",
+]
+
+[[package]]
+name = "oaiy-media"
+version = "0.1.0"
+dependencies = [
+ "candle-core",
+ "candle-flash-attn",
+ "candle-nn",
+ "dsv41",
+ "half",
+ "image",
+ "meshopt",
+ "oaiy-engine",
+ "oaiy-image",
+ "regex",
+ "tokenizers 0.21.4",
+]
+
+[[package]]
+name = "oaiy-studio"
+version = "0.1.0"
+dependencies = [
+ "oaiy-engine",
+]
+
+[[package]]
+name = "oaiy-studio-tray"
+version = "0.1.0"
+dependencies = [
+ "oaiy-engine",
+ "oaiy-studio",
+ "windows-sys",
 ]
 
 [[package]]

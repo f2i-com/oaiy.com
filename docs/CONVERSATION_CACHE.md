@@ -33,7 +33,7 @@ the next valid exact prefix instead of forcing a cold read. The same disk
 selection policy covers DeepSeek and GLM. Cancelling DeepSeek's token-by-token
 prompt pass also checkpoints the fully processed tokens before returning.
 
-Streaming `nrob_progress` now includes `cached_tokens`, `cache_source` (memory,
+Streaming `oaiy_progress` now includes `cached_tokens`, `cache_source` (memory,
 checkpoint, disk or none), and `previous_prefix_tokens`, alongside the existing
 `prompt_done` / `prompt_total`. The latter total is the suffix still requiring
 processing, not the entire prompt. The first progress event reports reuse before

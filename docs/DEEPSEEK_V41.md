@@ -1,4 +1,4 @@
-# DeepSeek-V4.1-Flash on nrob — feasibility and plan
+# DeepSeek-V4.1-Flash on OAIY — feasibility and plan
 
 **Target:** `DeepSeek-V4.1-Flash-FP8` (510.3 GB, 55 files, commit
 `d61c59ea`), weights in `E:\deepseek\model`, reference code (`inference/model.py`,
@@ -9,8 +9,8 @@ checkpoint headers unless marked *estimate*.
 
 ## Verdict
 
-Feasible, and a good fit for nrob's design: this is a 552B sparse MoE whose active set per
-token is small (6 of 384 experts × 40 layers), and nrob already has the streaming pipeline
+Feasible, and a good fit for OAIY's design: this is a 552B sparse MoE whose active set per
+token is small (6 of 384 experts × 40 layers), and OAIY already has the streaming pipeline
 (host cache with leases, VRAM expert cache, pinned staging, GPU routing, grouped MoE).
 What does not exist yet is everything model-specific: the data formats (MXFP4 experts,
 FP8 32×32-block trunk), the V4.1 forward pass (hyper-connections, compressed sparse
@@ -51,7 +51,7 @@ of VRAM (trunk ≈ 16.7 GB total). That is the simplest v1; a native FP8 GEMV co
 
 ## What the forward pass needs (reference: `inference/model.py`)
 
-None of this exists in nrob or llama-rs today:
+None of this exists in OAIY or llama-rs today:
 
 - **Hyper-connections** (`Block`, `hc_split_sinkhorn`): the residual is 4 parallel copies
   of the 5120-d stream. Each sublayer computes pre/post/comb mixes from an RMS-normalized
@@ -119,7 +119,7 @@ device 1.
 
 ## Where the experts get computed
 
-1. **GPU streaming** (the existing nrob path). Every RAM-hit expert crosses PCIe. At
+1. **GPU streaming** (the existing OAIY path). Every RAM-hit expert crosses PCIe. At
    today's links that is 4.5 GB × (1 − VRAM hit) per token at 7–14 GB/s, so ~200–300 ms
    a token before any SSD traffic.
 2. **Hybrid CPU + GPU (recommended here).** The GPU runs the trunk, shared expert and
@@ -155,20 +155,20 @@ experts, and 50 tokens touch ~55%. So every chat turn re-reads most SSD-resident
 experts once: ~20–40 s per turn today, a few seconds with 256 GB RAM. Chunks amortize
 well (one read serves every token in the chunk), so prefill in large chunks.
 
-## What nrob already had
+## What OAIY already had
 
 The starting point, as of 2026-09-18. The VENDORED-LOCAL module headers are more
 current than `docs/ROADMAP.md`, which predates several of these:
 
-- `nrob::ecache::Ecache` with `HostLease` (zero-copy hits), plus the `WeightStore` seam.
+- `oaiy_engine::ecache::Ecache` with `HostLease` (zero-copy hits), plus the `WeightStore` seam.
 - VRAM expert cache `llama-rs/src/expert_stream/device_cache.rs` (CACHE-02 / STREAM-01).
 - Pinned staging ring, async H2D stream and upload tickets: `ggml-rs-cuda/src/transfer.rs` (GPU-02).
 - GPU top-k routing and grouped gate/up and down MoE kernels: `ggml-rs-cuda/src/moe.rs`,
   `llama-rs/src/moe_cuda.rs` (MOE-01/02).
 - BPE tokenizers and samplers in the GGUF stack.
 
-Since 2026-09-19 nrob reads only GGUF and safetensors: the `.nrob` container, the `xdb`
-store and `nrob-server` are gone, and `dsv41` shares only the cache, the store seam, the
+Since 2026-09-19 OAIY reads only GGUF and safetensors: the `.oaiy` container, the `xdb`
+store and `oaiy-llm-server` are gone, and `dsv41` shares only the cache, the store seam, the
 thread pool and the JSON reader with the rest of the workspace.
 
 ## What was missing
@@ -205,7 +205,7 @@ the chat encoder and serving in item 7.
   - Each expert's three weight tensors are adjacent in its shard. So are its three
     scale tensors, which sit in a separate region because the writer grouped
     tensors by dtype.
-  - `dsv41::expert::SafetensorsExpertStore`, nrob's `WeightStore` over the original
+  - `dsv41::expert::SafetensorsExpertStore`, OAIY's `WeightStore` over the original
     shards, therefore serves any expert in **2 positioned reads**.
   - Indexing all 96,085 tensors reads only the headers: **51 ms**.
   - Page-cache bypass works from safe Rust (`OpenOptionsExt::custom_flags` plus an
@@ -237,7 +237,7 @@ the chat encoder and serving in item 7.
     `fast_round_scale`.
   - Don't expect bit-identity later on: attention and tensor-core reductions will need
     tolerances, as ROADMAP.md says.
-- `nrob::json::JsDoc::members` was added (a linear walk of an object's members), with
+- `oaiy_engine::json::JsDoc::members` was added (a linear walk of an object's members), with
   a test.
 
 **Phase B — full forward on the CPU (in progress, 2026-09-19).**
@@ -434,7 +434,7 @@ spins on CPU experts, ~17 ms of kernels, ~10 ms idle between them.
 - **Exclusive tiers:** after the warm start, the VRAM-resident experts leave the RAM
   tier, whose ~2,900 freed places go to the next-hottest experts. That is about 10,400
   experts resident instead of about 8,000 once the fill completes.
-- **`nrob-server`**: an OpenAI-compatible API (chat completions, streaming, tools,
+- **`oaiy-llm-server`**: an OpenAI-compatible API (chat completions, streaming, tools,
   reasoning) over one model worker.
   - A prefix cache: the live state plus checkpoints every 256 prompt tokens, at
     user-turn boundaries and at the end of each layered pass.
@@ -611,7 +611,7 @@ Measured (both GPUs, 140 GB RAM tier):
 - **Token by token vs layered, re-measured with the fixed pass** (RAM full): layered
   1,000 tokens in 43.1 s, 2,000 in 65.8 s (about 20 s + 23 ms a token); token by token
   at its warm best 69 ms a token (much slower on a new topic). They cross near 450
-  tokens, so `nrob-server --step-below` now defaults to 512 (was 2,048).
+  tokens, so `oaiy-llm-server --step-below` now defaults to 512 (was 2,048).
 - **Prompt tokens fed one by one skip the output head** (`GpuModel::advance_with`):
   warm, 13.98 → 14.54 tok/s (3 ms a token); only the last prompt token needs logits.
 - **VRAM frequency aging:** the VRAM cache halves its usage counts every 128 decode
@@ -683,7 +683,7 @@ The reference (`image_processor.py`, `vision.py`) decodes with Pillow, pads to a
 3×3 aligner into LLM rows, and fills an image span `[START] (IMAGE×w NEWLINE)×h [END]`
 whose positions all carry `<｜deepseek_image｜>`.
 
-- **Decoding, our own:** `crates/nrob-image` (std-only, no `unsafe`).
+- **Decoding, our own:** `crates/oaiy-image` (std-only, no `unsafe`).
   - PNG with its own inflate: every colour type, bit depth, Adam7, every filter,
     stored, fixed and dynamic deflate blocks.
   - JPEG: baseline and progressive, libjpeg-turbo's integer IDCT, fancy upsampling
@@ -720,7 +720,7 @@ whose positions all carry `<｜deepseek_image｜>`.
     agree in substance:
     - oracle: *"The image shows a minimalist, dark-themed icon of a stylized robot with
       a smiling face, antenna, and boxy…"*
-    - nrob, own pipeline end to end: *"The image displays a minimalist, line-art icon
+    - OAIY, own pipeline end to end: *"The image displays a minimalist, line-art icon
       of a stylized robot with a smiling face, antenna, and boxy…"*
 - **Serving:** `image_url` parts (base64 `data:` URLs, or local paths on a loopback
   server) are decoded and sized on the request thread. The worker encodes only the

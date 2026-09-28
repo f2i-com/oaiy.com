@@ -1,7 +1,7 @@
 # Sound effects
 
-NROB makes sound effects with MOSS-SoundEffect v2.0, natively in Rust
-(`nrob-diffusion`, `kind: "sound"`): ambience, weather, crowds, creatures,
+OAIY makes sound effects with MOSS-SoundEffect v2.0, natively in Rust
+(`oaiy-media`, `kind: "sound"`): ambience, weather, crowds, creatures,
 machines, footsteps, impacts. You describe what makes the sound, where, and how
 it sounds ("heavy rain on a tin roof with distant thunder"), and get up to 30
 seconds of 48 kHz mono audio.

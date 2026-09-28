@@ -1919,7 +1919,7 @@ mod tests {
     /// There is no non-thinking variant. `<think></think>` appears in that template
     /// only for a *history* turn that recorded no reasoning -- never as a sequence the
     /// model is asked to continue from. This port invented a second form for a
-    /// "non-thinking" mode and `nrob-server` defaults to it, so every request
+    /// "non-thinking" mode and `oaiy-llm-server` defaults to it, so every request
     /// coder-cli has made asked the model to continue from something it was never
     /// trained to continue: off-distribution, which on a reasoning model degenerates
     /// into the repetition this has been chased for a day.
@@ -2687,7 +2687,7 @@ because water wheels drove the machinery.";
         );
     }
 
-    /// GLM through the generic `Model` API, which is the path `nrob-cli` takes.
+    /// GLM through the generic `Model` API, which is the path `oaiy-llm-cli` takes.
     ///
     /// `Model::open_streaming` -> `Model::forward(tokens, &mut kv)` -> logits, with no
     /// glm5next-specific code at the call site. This used to return an error saying
@@ -2700,7 +2700,7 @@ because water wheels drove the machinery.";
         let Some(backend) = cuda_backend() else { return };
 
         let t0 = std::time::Instant::now();
-        // Exactly what nrob-cli does.
+        // Exactly what oaiy-llm-cli does.
         let model = crate::Model::open_streaming(released(), backend, 64 << 30)
             .expect("open_streaming");
         println!();

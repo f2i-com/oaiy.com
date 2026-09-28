@@ -8,9 +8,9 @@
 
 use std::sync::Arc;
 
-use nrob::ecache::Ecache;
-use nrob::store::WeightStore;
-use nrob::Result;
+use oaiy_engine::ecache::Ecache;
+use oaiy_engine::store::WeightStore;
+use oaiy_engine::Result;
 
 use crate::config::Config;
 use crate::expert::expert_forward_batch;

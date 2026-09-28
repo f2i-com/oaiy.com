@@ -10,13 +10,13 @@ if (-not (Get-Command cl.exe -ErrorAction SilentlyContinue) -or $env:VSCMD_VER -
 }
 Push-Location $repo
 try {
-    cargo build --release -p nrob-diffusion --features flash-attn
+    cargo build --release -p oaiy-media --features flash-attn
     if ($LASTEXITCODE) { throw 'Native diffusion build failed.' }
-    cargo build --release -p nrob-server
-    if ($LASTEXITCODE) { throw 'NROB server build failed.' }
+    cargo build --release -p oaiy-llm-server
+    if ($LASTEXITCODE) { throw 'OAIY server build failed.' }
     # The same server without CUDA, for machines that lack it (WebGPU, else CPU).
-    cargo build --release -p nrob-server --no-default-features --features webgpu --bin nrob-server-webgpu
-    if ($LASTEXITCODE) { throw 'NROB WebGPU server build failed.' }
-    cargo build --release -p nrob-studio -p nrob-studio-tray
-    if ($LASTEXITCODE) { throw 'NROB Studio build failed.' }
+    cargo build --release -p oaiy-llm-server --no-default-features --features webgpu --bin oaiy-llm-server-webgpu
+    if ($LASTEXITCODE) { throw 'OAIY WebGPU server build failed.' }
+    cargo build --release -p oaiy-studio -p oaiy-studio-tray
+    if ($LASTEXITCODE) { throw 'OAIY build failed.' }
 } finally { Pop-Location }

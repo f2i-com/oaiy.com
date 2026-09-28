@@ -17,7 +17,7 @@ checks format, source config, record sizes and all-layer expert coverage.
 ## Running the server
 
 ```powershell
-cargo run --release -p nrob-server -- --model 'D:\bitnet\MODEL\model' --ternary-experts 'D:\bitnet\MODEL\experts' --name deepseek-v4.1-flash --devices 0,1 --ram-gb 140 --ctx 16384 --no-vision --port 18002 --tools-experts 'D:\deepseek\model' --expert-trace 'expert-routing-NEW.jsonl'
+cargo run --release -p oaiy-llm-server -- --model 'D:\bitnet\MODEL\model' --ternary-experts 'D:\bitnet\MODEL\experts' --name deepseek-v4.1-flash --devices 0,1 --ram-gb 140 --ctx 16384 --no-vision --port 18002 --tools-experts 'D:\deepseek\model' --expert-trace 'expert-routing-NEW.jsonl'
 ```
 
 Without a ternary mapping, ordinary original-model inference remains available.

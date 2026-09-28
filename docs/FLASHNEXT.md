@@ -1,8 +1,8 @@
 # Qwen3.8-Flash-Next
 
-Nrob reads turboderp's EXL3 quantization of Qwen3.8-Flash-Next
+Oaiy reads turboderp's EXL3 quantization of Qwen3.8-Flash-Next
 ([turboderp/Qwen3.8-Flash-Next-exl3](https://huggingface.co/turboderp/Qwen3.8-Flash-Next-exl3),
-branch `3.05bpw_h5_ng5`) directly from its safetensors (`crates/nrob-server/src/flashnext.rs`).
+branch `3.05bpw_h5_ng5`) directly from its safetensors (`crates/oaiy-llm-server/src/flashnext.rs`).
 No Python runtime or conversion is involved.
 
 The model has 125B parameters with 6B active per token, plus a 51B-parameter n-gram
@@ -13,7 +13,7 @@ table (32.6 GB) stays on disk and is read as it is needed.
 
 ```powershell
 hf download turboderp/Qwen3.8-Flash-Next-exl3 --revision 3.05bpw_h5_ng5 --local-dir E:\models\Qwen3.8-Flash-Next\exl3-3.05bpw
-target/release/nrob-server.exe --model E:\models\Qwen3.8-Flash-Next\exl3-3.05bpw --name Qwen3.8-Flash-Next --devices 0,1
+target/release/oaiy-llm-server.exe --model E:\models\Qwen3.8-Flash-Next\exl3-3.05bpw --name Qwen3.8-Flash-Next --devices 0,1
 ```
 
 In Studio, add it as a model with GPUs of its own, so the others keep theirs:
@@ -23,7 +23,7 @@ In Studio, add it as a model with GPUs of its own, so the others keep theirs:
  "vision_projector": "E:\\models\\Qwen3.8-Flash-Next\\exl3-3.05bpw", "devices": [0, 1]}
 ```
 
-Studio passes a model's `devices` to nrob-server as `--devices-for NAME=0,1`. While a
+Studio passes a model's `devices` to oaiy-llm-server as `--devices-for NAME=0,1`. While a
 model with GPUs of its own is enabled, a media job on any of those GPUs pauses the LLM
 (`llm_policy` `auto`), so image and video work never shares a GPU with it.
 
@@ -86,14 +86,14 @@ The multi-token prediction head is not used.
 
 ## Checking it
 
-`matches_the_reference` (in `flashnext.rs`, ignored by default) compares nrob with
+`matches_the_reference` (in `flashnext.rs`, ignored by default) compares OAIY with
 exllamav3 on the same checkpoint. Generate a reference with exllamav3 1.4.9 (the 1.5 Windows
 wheels' extension is over 2 GB and does not load), then:
 
 ```powershell
 $env:FLASHNEXT_MODEL = "E:\models\Qwen3.8-Flash-Next\exl3-3.05bpw"
 $env:FLASHNEXT_REFERENCE = "reference.json"
-cargo test --release -p nrob-server --features cuda --lib flashnext -- --ignored --nocapture
+cargo test --release -p oaiy-llm-server --features cuda --lib flashnext -- --ignored --nocapture
 ```
 
 On a 33-token prompt the n-gram features match to 1e-5 and the top prediction agrees at
@@ -137,5 +137,5 @@ turns graphs off. The `bench::speed` test measures prefill and decode:
 
 ```powershell
 $env:FLASHNEXT_DECODE = "400"
-cargo test --release -p nrob-server --lib flashnext::bench::speed -- --ignored --nocapture
+cargo test --release -p oaiy-llm-server --lib flashnext::bench::speed -- --ignored --nocapture
 ```

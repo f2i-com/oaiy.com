@@ -1,7 +1,7 @@
 # 3D models
 
-NROB makes 3D models from a picture with Pixal3D, natively in Rust
-(`nrob-diffusion`, `kind: "model3d"`). Give it a picture of one object (a
+OAIY makes 3D models from a picture with Pixal3D, natively in Rust
+(`oaiy-media`, `kind: "model3d"`). Give it a picture of one object (a
 product, a character, a prop, a building), and you get a textured GLB. With
 BiRefNet, any background is removed first; with Real-ESRGAN, a small picture is
 enlarged first. The GLB is glTF 2.0, Y up, with the object's front
@@ -39,7 +39,7 @@ general-use weights are MIT. A RMBG-2.0 folder works too, and the Models page
 says what its licence allows.
 
 `naf_release.pth` and `RealESRGAN_x4plus.pth` are the only pickled files the
-studio accepts. The worker reads them with nrob's own tensor reader, which takes
+studio accepts. The worker reads them with OAIY's own tensor reader, which takes
 only the tensors and refuses anything else in the pickle, so no Python and no
 code from the file ever runs.
 

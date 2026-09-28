@@ -5,7 +5,7 @@
 //! hits for ~1,200 slots per GPU on a 247-token document).
 //!
 //! A hit costs zero PCIe bytes: the kernels read the slot in place. A miss
-//! takes a record from nrob's host cache (RAM tier, or the SSD behind it)
+//! takes a record from OAIY's host cache (RAM tier, or the SSD behind it)
 //! and uploads it into the victim slot on the compute stream, so stream
 //! order alone guarantees the upload lands before the kernels that read it,
 //! and that no kernel still reading a victim's bytes is overtaken by the
@@ -26,9 +26,9 @@
 use std::collections::HashMap;
 
 use cudarc::driver::{CudaEvent, CudaSlice, CudaView};
-use nrob::ecache::Ecache;
-use nrob::store::WeightStore;
-use nrob::Result;
+use oaiy_engine::ecache::Ecache;
+use oaiy_engine::store::WeightStore;
+use oaiy_engine::Result;
 
 use crate::gpu::Gpu;
 
@@ -335,7 +335,7 @@ impl DeviceExpertCache {
     fn place(&mut self, g: &Gpu, key: (u32, u32), record: &[u8]) -> Result<usize> {
         let i = self
             .victim()
-            .ok_or_else(|| nrob::Error::Arg("every VRAM expert slot is pinned by this batch; the cache is smaller than one layer's experts".into()))?;
+            .ok_or_else(|| oaiy_engine::Error::Arg("every VRAM expert slot is pinned by this batch; the cache is smaller than one layer's experts".into()))?;
         if let Some(old) = self.slots[i].key.take() {
             self.index.remove(&old);
             self.stats.evictions += 1;

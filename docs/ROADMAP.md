@@ -1,7 +1,7 @@
-# NROB streaming and token-speed improvement roadmap
+# OAIY streaming and token-speed improvement roadmap
 
-**Repository:** [`f2i-com/nrob`](https://github.com/f2i-com/nrob)  
-**Reviewed revision:** [`1bea44aa0ea01061a1b593c6c58644f68fa7a856`](https://github.com/f2i-com/nrob/tree/1bea44aa0ea01061a1b593c6c58644f68fa7a856)  
+**Repository:** [`f2i-com/oaiy`](https://github.com/f2i-com/oaiy)  
+**Reviewed revision:** [`1bea44aa0ea01061a1b593c6c58644f68fa7a856`](https://github.com/f2i-com/oaiy/tree/1bea44aa0ea01061a1b593c6c58644f68fa7a856)  
 **Review date:** 2026-08-03  
 **Primary goal:** faster local inference, especially sparse mixture-of-experts (MoE) models with hundreds of billions to trillions of total parameters, by streaming expert weights through RAM into one or more GPUs.
 
@@ -9,8 +9,8 @@
 
 The review below is kept as written, against the revision above. Since then:
 
-- **Formats.** nrob now reads only GGUF and safetensors, in place.
-  - The XDB store and the native `.nrob` container are gone, and so are the server and
+- **Formats.** OAIY now reads only GGUF and safetensors, in place.
+  - The XDB store and the native `.oaiy` container are gone, and so are the server and
     the converter.
   - Sections 2–4 (XDB2 storage, recovery, conversion) and 17 (native container) are
     retired, along with XDB-01/02 and NCUDA-01.
@@ -18,7 +18,7 @@ The review below is kept as written, against the revision above. Since then:
     positioned reads (`gguf::FileSource`), and a layer's cold misses go out as one
     batch on a small thread pool (`GgufExpertStore::fetch_many`).
 - **Landed in the GGUF path** (ids in the `VENDORED-LOCAL` comments):
-  - PERF-01: bench phases and JSON schema (`nrob bench`), route traces (`--trace-out`).
+  - PERF-01: bench phases and JSON schema (`oaiy-llm bench`), route traces (`--trace-out`).
   - CACHE-01: host-cache leases.
   - LAYOUT-01: direct gate/up views.
   - GPU-02: pinned staging and async uploads.
@@ -41,7 +41,7 @@ The review below is kept as written, against the revision above. Since then:
 
 ## Executive summary
 
-NROB already has the right high-level idea for very large local MoE inference: keep the shared trunk resident, store experts compactly, and load only routed experts under a memory budget. The code is modular, correctness-conscious, and unusually easy to reason about for a young inference engine. The `WeightStore` abstraction, XDB object store, LFRU cache, native nrob-container path, GGUF path, CUDA backend, and streamed-versus-resident equivalence tests are all useful foundations.
+OAIY already has the right high-level idea for very large local MoE inference: keep the shared trunk resident, store experts compactly, and load only routed experts under a memory budget. The code is modular, correctness-conscious, and unusually easy to reason about for a young inference engine. The `WeightStore` abstraction, XDB object store, LFRU cache, native oaiy-container path, GGUF path, CUDA backend, and streamed-versus-resident equivalence tests are all useful foundations.
 
 The current CUDA streaming implementation is not yet an overlapped SSD-to-GPU pipeline, however. Its hot path is effectively:
 
@@ -74,7 +74,7 @@ This is a source-level architecture and performance review of the repository rev
 The review concentrated on:
 
 - GGUF/XDB MoE streaming;
-- the native nrob-container streaming path;
+- the native oaiy-container streaming path;
 - XDB physical layout and read behavior;
 - host and device caching;
 - CUDA execution and quantized kernels;
@@ -146,7 +146,7 @@ Published parameter counts illustrate the distinction:
 
 These are not interchangeable workloads. A 2.8T-class model can fit on storage locally, but its much larger active set still demands aggressive low-bit packing, locality, prefetch, multiple drives, and/or multiple GPUs. Conversely, total model size can be enormous without proportionally increasing token traffic if the active set remains modest.
 
-Dense offload can still be useful for throughput-oriented batching. [FlexGen demonstrated OPT-175B on a 16 GB GPU at about one token/s using an effective batch size of 144](https://arxiv.org/abs/2303.06865); that is a different objective from responsive batch-one chat. NROB should explicitly report both latency and throughput modes.
+Dense offload can still be useful for throughput-oriented batching. [FlexGen demonstrated OPT-175B on a 16 GB GPU at about one token/s using an effective batch size of 144](https://arxiv.org/abs/2303.06865); that is a different objective from responsive batch-one chat. OAIY should explicitly report both latency and throughput modes.
 
 ### Practical target statement
 
@@ -159,7 +159,7 @@ Dense offload can still be useful for throughput-oriented batching. [FlexGen dem
 
 1. **Clear separation of storage and inference.** `WeightStore` makes it possible to improve the I/O backend without rewriting the native model implementation.
 2. **Correctness-first testing.** The project has synthetic fixtures, format round trips, known-answer tests, and CUDA-versus-CPU comparisons. That is exactly the right base for aggressive kernel and pipeline changes.
-3. **Compact expert representations.** The native nrob-container path keeps packed VQ records instead of requiring the full model to be expanded.
+3. **Compact expert representations.** The native oaiy-container path keeps packed VQ records instead of requiring the full model to be expanded.
 4. **Existing cache policy and lookahead hooks.** The native forward path already records routing history and calls `hint`/`prefetch`; the missing piece is a scheduler that acts on them.
 5. **A working resident CUDA path.** It provides a correctness reference and an upper bound for the same model/quantization.
 6. **Reproducible CLI behavior.** Model conversion, planning, running, and statistics already have natural homes in one tool.
@@ -187,21 +187,21 @@ The README says expert streaming can use “one aligned read per expert.” That
 
 | Priority | Finding | Why it matters | Primary evidence |
 |---|---|---|---|
-| P0 | No VRAM expert cache | A RAM hit still uploads every routed expert; PCIe remains in the critical path | [`cuda_quant_input`](https://github.com/f2i-com/nrob/blob/1bea44aa0ea01061a1b593c6c58644f68fa7a856/crates/ggml-rs-cuda/src/backend.rs#L233-L242) |
-| P0 | One CUDA stream for copies and compute | H2D for the next expert cannot overlap current expert compute | [`CudaBackend::new`](https://github.com/f2i-com/nrob/blob/1bea44aa0ea01061a1b593c6c58644f68fa7a856/crates/ggml-rs-cuda/src/backend.rs#L149-L184) |
-| P0 | Storage is effectively queue-depth one | A global mutex covers cursor-based reads; top-k reads serialize | [`Store2::get_range`](https://github.com/f2i-com/nrob/blob/1bea44aa0ea01061a1b593c6c58644f68fa7a856/crates/xdb/src/store2.rs#L354-L393) |
-| P0 | Three logical reads and many physical reads per expert | Gate/up/down are separate; 1 MiB “chunks” cause repeated seeks despite contiguous payload | [`GgufExpertStore::fetch`](https://github.com/f2i-com/nrob/blob/1bea44aa0ea01061a1b593c6c58644f68fa7a856/crates/llama-rs/src/expert_stream.rs#L305-L343) |
-| P0 | Cache hits copy full records | Each dispatch allocates a destination and copies the cached bytes while holding cache coordination | [`LayerStream::expert_weights`](https://github.com/f2i-com/nrob/blob/1bea44aa0ea01061a1b593c6c58644f68fa7a856/crates/llama-rs/src/expert_stream.rs#L469-L491), [`Ecache::get`](https://github.com/f2i-com/nrob/blob/1bea44aa0ea01061a1b593c6c58644f68fa7a856/crates/nrob/src/ecache.rs#L387-L482) |
-| P0 | Gate/up fusion copies bytes in the hot path | “Zero-copy reconstruction” is only partial; compatible quantized halves are restacked | [`Weight::stack_axis0`](https://github.com/f2i-com/nrob/blob/1bea44aa0ea01061a1b593c6c58644f68fa7a856/crates/llama-rs/src/loader.rs#L179-L228), [`FfnPair::from_halves`](https://github.com/f2i-com/nrob/blob/1bea44aa0ea01061a1b593c6c58644f68fa7a856/crates/llama-rs/src/loader.rs#L397-L411) |
-| P0 | Host-driven routing and expert loop | A D2H synchronization occurs at every MoE layer; launches scale with token × top-k | [`moe_forward_with_logits`](https://github.com/f2i-com/nrob/blob/1bea44aa0ea01061a1b593c6c58644f68fa7a856/crates/llama-rs/src/moe.rs#L109-L169), [`streaming forward`](https://github.com/f2i-com/nrob/blob/1bea44aa0ea01061a1b593c6c58644f68fa7a856/crates/llama-rs/src/expert_stream.rs#L499-L544) |
-| P0 | CUDA allocations and real tensor clones occur during decode | Allocation/zeroing, D2D copies, and frees add synchronization and bandwidth costs | [`CudaBackend` allocation helpers](https://github.com/f2i-com/nrob/blob/1bea44aa0ea01061a1b593c6c58644f68fa7a856/crates/ggml-rs-cuda/src/backend.rs#L198-L242), [`Tensor::clone`](https://github.com/f2i-com/nrob/blob/1bea44aa0ea01061a1b593c6c58644f68fa7a856/crates/ggml-rs/src/tensor.rs#L204-L210) |
-| P0 | Resident quant kernels are not yet the target ceiling | The kernel file identifies correctness-oriented F32 accumulation, and only some formats/shapes use cooperative decode paths | [`kernels.rs`](https://github.com/f2i-com/nrob/blob/1bea44aa0ea01061a1b593c6c58644f68fa7a856/crates/ggml-rs-cuda/src/kernels.rs#L1-L6), [`linear_q`](https://github.com/f2i-com/nrob/blob/1bea44aa0ea01061a1b593c6c58644f68fa7a856/crates/ggml-rs-cuda/src/backend.rs#L544-L649) |
-| P1 | `hint` and `prefetch` are no-ops | Existing native lookahead cannot hide storage latency | [`Ecache::hint/prefetch`](https://github.com/f2i-com/nrob/blob/1bea44aa0ea01061a1b593c6c58644f68fa7a856/crates/nrob/src/ecache.rs#L499-L503) |
-| P1 | Long-context attention has a performance cliff | Above a shared-memory threshold, scores are materialized; sliding-window masking can round-trip through the CPU | [`CudaBackend::attention`](https://github.com/f2i-com/nrob/blob/1bea44aa0ea01061a1b593c6c58644f68fa7a856/crates/ggml-rs-cuda/src/backend.rs#L1490-L1572) |
-| P1 | KV is eagerly allocated in F32 | KV can consume the VRAM needed for the expert hot set | [`KvCache`](https://github.com/f2i-com/nrob/blob/1bea44aa0ea01061a1b593c6c58644f68fa7a856/crates/llama-rs/src/kv_cache.rs#L78-L106) |
-| P1 | Placement is opportunistic and single-GPU | A fixed 2 GiB margin and load-order placement do not represent real RAM/VRAM/KV needs; CLI hardcodes device 0 | [`try_to_device`](https://github.com/f2i-com/nrob/blob/1bea44aa0ea01061a1b593c6c58644f68fa7a856/crates/llama-rs/src/loader.rs#L588-L610), [`llama_backend`](https://github.com/f2i-com/nrob/blob/1bea44aa0ea01061a1b593c6c58644f68fa7a856/crates/nrob-cli/src/main.rs#L942-L956) |
-| P1 | Generic XDB streaming supports only a narrow MoE set | The streaming opener dispatches Qwen3-MoE and Mixtral, not a general expert-layout interface for newer architectures | [`open_from_xdb_streaming`](https://github.com/f2i-com/nrob/blob/1bea44aa0ea01061a1b593c6c58644f68fa7a856/crates/llama-rs/src/xdb_container.rs#L244-L295) |
-| P1 | Benchmarks do not isolate the desired path | `nrob bench` is native-path oriented, while run statistics combine prompt and decode and omit GPU-cache/H2D metrics | [`cmd_bench`](https://github.com/f2i-com/nrob/blob/1bea44aa0ea01061a1b593c6c58644f68fa7a856/crates/nrob-cli/src/main.rs#L1444-L1515) |
+| P0 | No VRAM expert cache | A RAM hit still uploads every routed expert; PCIe remains in the critical path | [`cuda_quant_input`](https://github.com/f2i-com/oaiy/blob/1bea44aa0ea01061a1b593c6c58644f68fa7a856/crates/ggml-rs-cuda/src/backend.rs#L233-L242) |
+| P0 | One CUDA stream for copies and compute | H2D for the next expert cannot overlap current expert compute | [`CudaBackend::new`](https://github.com/f2i-com/oaiy/blob/1bea44aa0ea01061a1b593c6c58644f68fa7a856/crates/ggml-rs-cuda/src/backend.rs#L149-L184) |
+| P0 | Storage is effectively queue-depth one | A global mutex covers cursor-based reads; top-k reads serialize | [`Store2::get_range`](https://github.com/f2i-com/oaiy/blob/1bea44aa0ea01061a1b593c6c58644f68fa7a856/crates/xdb/src/store2.rs#L354-L393) |
+| P0 | Three logical reads and many physical reads per expert | Gate/up/down are separate; 1 MiB “chunks” cause repeated seeks despite contiguous payload | [`GgufExpertStore::fetch`](https://github.com/f2i-com/oaiy/blob/1bea44aa0ea01061a1b593c6c58644f68fa7a856/crates/llama-rs/src/expert_stream.rs#L305-L343) |
+| P0 | Cache hits copy full records | Each dispatch allocates a destination and copies the cached bytes while holding cache coordination | [`LayerStream::expert_weights`](https://github.com/f2i-com/oaiy/blob/1bea44aa0ea01061a1b593c6c58644f68fa7a856/crates/llama-rs/src/expert_stream.rs#L469-L491), [`Ecache::get`](https://github.com/f2i-com/oaiy/blob/1bea44aa0ea01061a1b593c6c58644f68fa7a856/crates/oaiy-engine/src/ecache.rs#L387-L482) |
+| P0 | Gate/up fusion copies bytes in the hot path | “Zero-copy reconstruction” is only partial; compatible quantized halves are restacked | [`Weight::stack_axis0`](https://github.com/f2i-com/oaiy/blob/1bea44aa0ea01061a1b593c6c58644f68fa7a856/crates/llama-rs/src/loader.rs#L179-L228), [`FfnPair::from_halves`](https://github.com/f2i-com/oaiy/blob/1bea44aa0ea01061a1b593c6c58644f68fa7a856/crates/llama-rs/src/loader.rs#L397-L411) |
+| P0 | Host-driven routing and expert loop | A D2H synchronization occurs at every MoE layer; launches scale with token × top-k | [`moe_forward_with_logits`](https://github.com/f2i-com/oaiy/blob/1bea44aa0ea01061a1b593c6c58644f68fa7a856/crates/llama-rs/src/moe.rs#L109-L169), [`streaming forward`](https://github.com/f2i-com/oaiy/blob/1bea44aa0ea01061a1b593c6c58644f68fa7a856/crates/llama-rs/src/expert_stream.rs#L499-L544) |
+| P0 | CUDA allocations and real tensor clones occur during decode | Allocation/zeroing, D2D copies, and frees add synchronization and bandwidth costs | [`CudaBackend` allocation helpers](https://github.com/f2i-com/oaiy/blob/1bea44aa0ea01061a1b593c6c58644f68fa7a856/crates/ggml-rs-cuda/src/backend.rs#L198-L242), [`Tensor::clone`](https://github.com/f2i-com/oaiy/blob/1bea44aa0ea01061a1b593c6c58644f68fa7a856/crates/ggml-rs/src/tensor.rs#L204-L210) |
+| P0 | Resident quant kernels are not yet the target ceiling | The kernel file identifies correctness-oriented F32 accumulation, and only some formats/shapes use cooperative decode paths | [`kernels.rs`](https://github.com/f2i-com/oaiy/blob/1bea44aa0ea01061a1b593c6c58644f68fa7a856/crates/ggml-rs-cuda/src/kernels.rs#L1-L6), [`linear_q`](https://github.com/f2i-com/oaiy/blob/1bea44aa0ea01061a1b593c6c58644f68fa7a856/crates/ggml-rs-cuda/src/backend.rs#L544-L649) |
+| P1 | `hint` and `prefetch` are no-ops | Existing native lookahead cannot hide storage latency | [`Ecache::hint/prefetch`](https://github.com/f2i-com/oaiy/blob/1bea44aa0ea01061a1b593c6c58644f68fa7a856/crates/oaiy-engine/src/ecache.rs#L499-L503) |
+| P1 | Long-context attention has a performance cliff | Above a shared-memory threshold, scores are materialized; sliding-window masking can round-trip through the CPU | [`CudaBackend::attention`](https://github.com/f2i-com/oaiy/blob/1bea44aa0ea01061a1b593c6c58644f68fa7a856/crates/ggml-rs-cuda/src/backend.rs#L1490-L1572) |
+| P1 | KV is eagerly allocated in F32 | KV can consume the VRAM needed for the expert hot set | [`KvCache`](https://github.com/f2i-com/oaiy/blob/1bea44aa0ea01061a1b593c6c58644f68fa7a856/crates/llama-rs/src/kv_cache.rs#L78-L106) |
+| P1 | Placement is opportunistic and single-GPU | A fixed 2 GiB margin and load-order placement do not represent real RAM/VRAM/KV needs; CLI hardcodes device 0 | [`try_to_device`](https://github.com/f2i-com/oaiy/blob/1bea44aa0ea01061a1b593c6c58644f68fa7a856/crates/llama-rs/src/loader.rs#L588-L610), [`llama_backend`](https://github.com/f2i-com/oaiy/blob/1bea44aa0ea01061a1b593c6c58644f68fa7a856/crates/oaiy-llm-cli/src/main.rs#L942-L956) |
+| P1 | Generic XDB streaming supports only a narrow MoE set | The streaming opener dispatches Qwen3-MoE and Mixtral, not a general expert-layout interface for newer architectures | [`open_from_xdb_streaming`](https://github.com/f2i-com/oaiy/blob/1bea44aa0ea01061a1b593c6c58644f68fa7a856/crates/llama-rs/src/xdb_container.rs#L244-L295) |
+| P1 | Benchmarks do not isolate the desired path | `oaiy-llm bench` is native-path oriented, while run statistics combine prompt and decode and omit GPU-cache/H2D metrics | [`cmd_bench`](https://github.com/f2i-com/oaiy/blob/1bea44aa0ea01061a1b593c6c58644f68fa7a856/crates/oaiy-llm-cli/src/main.rs#L1444-L1515) |
 
 ## Detailed source audit
 
@@ -246,7 +246,7 @@ One contiguous requested range should become one positioned read. A `get_ranges`
 
 ### 3. XDB2 recovery correctness
 
-There is a correctness issue to fix before using XDB2 as the authoritative copy of very large conversions. [`Store2::commit`](https://github.com/f2i-com/nrob/blob/1bea44aa0ea01061a1b593c6c58644f68fa7a856/crates/xdb/src/store2.rs#L290-L302) appends a new directory and then updates the header pointer. The comment says bytes appended before a failed pointer update are harmless. On reopen, however, [`open_impl`](https://github.com/f2i-com/nrob/blob/1bea44aa0ea01061a1b593c6c58644f68fa7a856/crates/xdb/src/store2.rs#L240-L278) reads from the old directory offset through the new end of file, and [`parse_directory`](https://github.com/f2i-com/nrob/blob/1bea44aa0ea01061a1b593c6c58644f68fa7a856/crates/xdb/src/store2.rs#L567-L615) rejects trailing bytes. A crash before the root pointer update can therefore make the prior committed directory fail to open.
+There is a correctness issue to fix before using XDB2 as the authoritative copy of very large conversions. [`Store2::commit`](https://github.com/f2i-com/oaiy/blob/1bea44aa0ea01061a1b593c6c58644f68fa7a856/crates/xdb/src/store2.rs#L290-L302) appends a new directory and then updates the header pointer. The comment says bytes appended before a failed pointer update are harmless. On reopen, however, [`open_impl`](https://github.com/f2i-com/oaiy/blob/1bea44aa0ea01061a1b593c6c58644f68fa7a856/crates/xdb/src/store2.rs#L240-L278) reads from the old directory offset through the new end of file, and [`parse_directory`](https://github.com/f2i-com/oaiy/blob/1bea44aa0ea01061a1b593c6c58644f68fa7a856/crates/xdb/src/store2.rs#L567-L615) rejects trailing bytes. A crash before the root pointer update can therefore make the prior committed directory fail to open.
 
 Also, `flush()` is not an fsync ordering barrier, and `len > dir_offset - offset` can underflow if a malformed entry has `offset > dir_offset`.
 
@@ -317,7 +317,7 @@ After routing determines top-k, submit every missing expert together. Wait only 
 Absent → Reading → HostReady → Uploading → DeviceReady → InUse
 ```
 
-Only after exact top-k overlap is proven should the existing lookahead predictor drive speculative next-layer reads. [MoE-Infinity](https://arxiv.org/abs/2401.14361) is a useful reference for activation-aware expert caching and prefetch, but NROB should validate prediction on its own route traces.
+Only after exact top-k overlap is proven should the existing lookahead predictor drive speculative next-layer reads. [MoE-Infinity](https://arxiv.org/abs/2401.14361) is a useful reference for activation-aware expert caching and prefetch, but OAIY should validate prediction on its own route traces.
 
 Track:
 
@@ -546,7 +546,7 @@ Direct I/O should be optional and benchmarked against the OS page cache. It requ
 
 The current `std`-only plus `#![forbid(unsafe_code)]` rule is valuable for the reference engine, but high-performance platform I/O, pinned allocations, SIMD, and CUDA interop may require a separate optional crate with narrow, reviewed unsafe boundaries. Keep the safe implementation as a correctness fallback.
 
-### 17. Native nrob-container path
+### 17. Native oaiy-container path
 
 The native path contains the most interesting format for extremely large sparse models, but it remains CPU-only and its kernels are scalar. It also performs hot-path tensor-name formatting/lookups, clones `ModelCfg` during token/layer work, creates transient vectors, and uses scoped OS-thread creation rather than a persistent pool.
 
@@ -565,7 +565,7 @@ This path should eventually share the same `IoScheduler`, host leases, pinned st
 
 ### 18. Server throughput
 
-The current server supports native `.nrob` models, while GGUF/XDB support is pending. Once single-request correctness and latency are stable:
+The current server supports native `.oaiy` models, while GGUF/XDB support is pending. Once single-request correctness and latency are stable:
 
 - add GGUF/XDB/CUDA to the server;
 - implement continuous batching;
@@ -620,7 +620,7 @@ The scheduler should maintain separate demand and speculative queues. The GPU pa
 
 Tasks:
 
-- make `nrob bench` exercise resident GGUF, streamed XDB, and native `.nrob`, on CPU and CUDA;
+- make `oaiy-llm bench` exercise resident GGUF, streamed XDB, and native `.oaiy`, on CPU and CUDA;
 - time model load, conversion, TTFT, prefill, and steady-state decode separately;
 - synchronize the backend explicitly at timing boundaries;
 - add CUDA event timings and NVTX ranges per layer/stage;
@@ -824,7 +824,7 @@ Test at least:
 - Qwen3-30B-A3B as the regression model;
 - one genuine 100B+ sparse MoE;
 - synthetic expert stores with 0.5/2/8/16/32/64 GB active bytes per token;
-- resident GGUF, current streamed XDB, revised streamed XDB, and native `.nrob` where compatible;
+- resident GGUF, current streamed XDB, revised streamed XDB, and native `.oaiy` where compatible;
 - CPU, each GPU individually, and supported multi-GPU plans;
 - cold, RAM-warm, and VRAM-warm starts;
 - host and device cache-budget sweeps;
@@ -973,7 +973,7 @@ After those three changes, rerun the roofline. If compute is dominant, prioritiz
 
 ## Final recommendation
 
-NROB can become a strong local sparse-MoE engine, including models with hundreds of billions of total parameters, but it should define success by **active bytes per token** rather than total parameter count. The present architecture validates correctness and the basic idea; the next architecture needs stable cached objects, explicit pipeline stages, and end-to-end backpressure.
+OAIY can become a strong local sparse-MoE engine, including models with hundreds of billions of total parameters, but it should define success by **active bytes per token** rather than total parameter count. The present architecture validates correctness and the basic idea; the next architecture needs stable cached objects, explicit pipeline stages, and end-to-end backpressure.
 
 The central invariant should be:
 

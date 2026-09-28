@@ -370,7 +370,7 @@ async function providerRequest<T>(
   read: (resp: Response, signal: AbortSignal, touch: () => void) => Promise<T>,
 ): Promise<T> {
   const timeoutMs = options.timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
-  // An nrob provider is told when the open project is incognito.
+  // An OAIY provider is told when the open project is incognito.
   const headers = { ...providerHeaders(provider, true), ...incognitoHeaderFor(url) };
   if (typeof window !== 'undefined' && isBlockedMixedContent(url, window.location.protocol)) {
     throw new AIProviderError('network', describeConnectionError('mixed-content', { type: provider.type, serverKind: provider.serverKind, url }));

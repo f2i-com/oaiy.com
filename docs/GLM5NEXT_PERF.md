@@ -168,7 +168,7 @@ cards near-empty at load climbing to **31-32 GB of 32.6** during a prefill.
 
 ### 2.2 Tier 1 — RAM, phase-aware
 
-DeepSeek: `nrob::ecache`. LFRU over a random draw of `SAMPLES = 16`, leases so a
+DeepSeek: `oaiy_engine::ecache`. LFRU over a random draw of `SAMPLES = 16`, leases so a
 record in use is never evicted, one mutex never held across a read.
 
 The phase-aware part is `Ecache::set_scan_layer`. A prefill runs the layers in

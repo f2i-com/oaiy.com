@@ -1,6 +1,6 @@
 # Picture tools
 
-NROB has two tools for pictures, natively in Rust (`nrob-diffusion`,
+OAIY has two tools for pictures, natively in Rust (`oaiy-media`,
 `kind: "picture"`):
 
 - **Background removal** with BiRefNet: the subject kept, the rest made
@@ -26,7 +26,7 @@ BiRefNet's own weights are MIT. RMBG-2.0 is the same network with weights for
 non-commercial use only; a RMBG-2.0 folder works too, and the Models page says
 what its licence allows.
 
-`RealESRGAN_x4plus.pth` is read by nrob's own tensor reader, which takes only
+`RealESRGAN_x4plus.pth` is read by OAIY's own tensor reader, which takes only
 the tensors and refuses anything else in the pickle, so no code from the file
 runs.
 

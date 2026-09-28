@@ -1,6 +1,6 @@
 # OrcaSAQ2 27B
 
-Nrob reads [orcarouter/OrcaSAQ-2-27B](https://huggingface.co/orcarouter/OrcaSAQ-2-27B)
+Oaiy reads [orcarouter/OrcaSAQ-2-27B](https://huggingface.co/orcarouter/OrcaSAQ-2-27B)
 directly from its original safetensors. The published **3.21 bpw** is the
 decoder's average precision, not a uniform 3-bit format. Decoder projections
 use 2, 3, 3.5 and 4 bits, the output head uses 6 bits, and embeddings use int8
@@ -8,12 +8,12 @@ with one FP16 scale per vocabulary row. Four shards total 12,270,435,404 bytes.
 
 ## Download and launch
 
-From the Nrob checkout:
+From the Oaiy checkout:
 
 ```powershell
 python tools/orcasaq/download.py
-cargo build --release -p nrob-server
-target/release/nrob-server.exe --model models/OrcaSAQ-2-27B --name orcasaq-2-27b --devices 0,1 --ctx 260000
+cargo build --release -p oaiy-llm-server
+target/release/oaiy-llm-server.exe --model models/OrcaSAQ-2-27B --name orcasaq-2-27b --devices 0,1 --ctx 260000
 ```
 
 The stdlib downloader pins revision `15d20d7e9ae4fd89d1a47878f69381760169445b`,
@@ -24,30 +24,30 @@ The manifest intentionally omits demonstration media. No model code is executed.
 For the sibling coder-cli checkout, set these entries in `settings.toml`:
 
 ```toml
-[nrob]
+[oaiy]
 startup_model = 'orcasaq-2-27b'
 context_tokens = 260000
 devices = [0, 1]
 prompt_cache = 'workspace' # coder-cli resolves the selected project
 prompt_cache_gb = 96
 
-[nrob.models]
-'orcasaq-2-27b' = '../nrob/models/OrcaSAQ-2-27B'
+[oaiy.models]
+'orcasaq-2-27b' = '../oaiy/models/OrcaSAQ-2-27B'
 ```
 
 Keep the other existing settings and model aliases. Rebuild coder-cli with
 `build.bat`; `start.bat` already reads `startup_model`. An explicit model
 argument still overrides the setting. With `keep_running = true`, opening the
-coder-cli TUI starts Nrob in its own console while you type. A matching daemon
+coder-cli TUI starts Oaiy in its own console while you type. A matching daemon
 is reused; changing project/settings automatically restarts it after its
-current request completes. `coder-cli --workspace PATH nrob start` also starts
+current request completes. `coder-cli --workspace PATH oaiy start` also starts
 it explicitly. No separate Python/vLLM server is needed.
 
 ## Implementation and limits
 
 ### Optional image reading
 
-The Orca release omits vision. Nrob can pair its text weights with the original
+The Orca release omits vision. Oaiy can pair its text weights with the original
 vision encoder and trained merger from `Qwen/Qwen3.8-27B`, pinned to revision
 `1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0`:
 
@@ -63,8 +63,8 @@ No conversion, retraining, Python runtime, or separate inference server is used.
 Configure coder-cli (the value names a directory, not a GGUF file):
 
 ```toml
-[nrob.vision_projectors]
-'orcasaq-2-27b' = '../nrob/models/OrcaSAQ-2-27B/vision'
+[oaiy.vision_projectors]
+'orcasaq-2-27b' = '../oaiy/models/OrcaSAQ-2-27B/vision'
 ```
 
 The standalone equivalent is `--vision-projector orcasaq-2-27b=models/OrcaSAQ-2-27B/vision`.
@@ -92,9 +92,9 @@ weights (tested with Transformers 5.17.0). It writes a synthetic image and FP32
 oracle under `target/orca-vision-research`. Then run:
 
 ```powershell
-cargo test --release -p nrob-server original_vision_matches -- --ignored --nocapture
-$env:NROB_TEST_VISION='1'
-cargo test --release -p nrob-server real_model_distributed_cache -- --ignored --nocapture
+cargo test --release -p oaiy-llm-server original_vision_matches -- --ignored --nocapture
+$env:OAIY_TEST_VISION='1'
+cargo test --release -p oaiy-llm-server real_model_distributed_cache -- --ignored --nocapture
 ```
 
 The latter reserves all 260,000 KV slots with vision resident and runs image
@@ -176,7 +176,7 @@ Rebuilding with the previous recurrent kernel and bypassing the image cache
 produced the same `JBL 52` response, confirming this case predates the change.
 A live coder-cli session called `image_read` once on a neutrally named local
 card and correctly answered `LEK 427`; neither the filename nor the prompt
-contained that code. Nrob's workspace suite passed 537 tests (93 ignored),
+contained that code. Oaiy's workspace suite passed 537 tests (93 ignored),
 in addition to the manual full-capacity and release CUDA comparisons.
 
 ### Optional LoRA adapters
@@ -184,7 +184,7 @@ in addition to the manual full-capacity and release CUDA comparisons.
 Native inference supports PEFT LoRA and rsLoRA adapters per Orca model alias (and per
 Flash-Next alias; see FLASHNEXT.md): one, or several stacked (`--lora NAME=DIR` repeated, each `DIR@X` at strength X; in Studio, the model's `lora` folder plus its `loras` list). Adapters that change the same projections add up: two at full strength can overcook the model (Yes-Man and absolute-heresy, both on `down_proj`/`o_proj`/`out_proj`, garbled their grammar at 1 + 1 and read well at 1 + 0.5), so a second one usually wants a lower strength.
 Use an adapter trained for `Qwen/Qwen3.8-27B`, containing
-`adapter_config.json` and `adapter_model.safetensors`. Nrob reads those files
+`adapter_config.json` and `adapter_model.safetensors`. Oaiy reads those files
 directly; the packed 3.21-bpw base weights remain unchanged. Adapter matrices
 are held in FP32 on the text GPU. Dropout is disabled for inference, and scaling
 uses `alpha/r` for LoRA or `alpha/sqrt(r)` for rsLoRA, times an optional
@@ -193,7 +193,7 @@ strength (`--lora-strength NAME=X`, default 1; Studio: the model's `lora_strengt
 In the selected project's `.coder-cli/config.toml`:
 
 ```toml
-[nrob.lora_adapters]
+[oaiy.lora_adapters]
 'orcasaq-2-27b' = '.coder-cli/adapters/my-adapter'
 ```
 
@@ -203,7 +203,7 @@ an empty string to disable an inherited adapter. A new coder-cli session
 detects changed adapter settings and restarts its daemon when idle. Standalone:
 
 ```powershell
-nrob-server --model models/OrcaSAQ-2-27B --name orcasaq-2-27b --devices 0,1 --ctx 260000 --lora orcasaq-2-27b=PATH_TO_ADAPTER
+oaiy-llm-server --model models/OrcaSAQ-2-27B --name orcasaq-2-27b --devices 0,1 --ctx 260000 --lora orcasaq-2-27b=PATH_TO_ADAPTER
 ```
 
 Attention and FFN adapters run as a separate low-rank contribution alongside
@@ -230,10 +230,10 @@ CPU/CUDA tests compare adapter outputs and channel permutations with a direct
 dense equation. To test full capacity and checkpoint restoration with an adapter:
 
 ```powershell
-$env:NROB_TEST_ORCA='E:/models/OrcaSAQ-2-27B' # optional override for relocated weights
-$env:NROB_TEST_LORA='PATH_TO_ADAPTER'
-$env:NROB_TEST_VISION='1'
-cargo test --release -p nrob-server real_model_distributed_cache -- --ignored --nocapture
+$env:OAIY_TEST_ORCA='E:/models/OrcaSAQ-2-27B' # optional override for relocated weights
+$env:OAIY_TEST_LORA='PATH_TO_ADAPTER'
+$env:OAIY_TEST_VISION='1'
+cargo test --release -p oaiy-llm-server real_model_distributed_cache -- --ignored --nocapture
 ```
 
 With the initial adapter implementation on the two RTX 5090s, 128 generated tokens took
@@ -283,7 +283,7 @@ an inert draft and becomes an executable API call only after full validation.
   Prefill reconstructs one projection into temporary FP32 scratch;
   the vocabulary head runs only for the last row. This initial implementation
   is **not verified to fit 16 GB GPUs**.
-- HF grouped value heads are mapped to Nrob's tiled delta-net layout at runtime.
+- HF grouped value heads are mapped to Oaiy's tiled delta-net layout at runtime.
   RMSNorm offsets and negative-exponential A_log are applied during loading.
 - The checkpoint tokenizer uses NFC normalization, combining-mark-aware words
   and individual digits. Its 140-case test corpus matches Hugging Face tokenizers.
@@ -309,7 +309,7 @@ an inert draft and becomes an executable API call only after full validation.
   prefixes. Model changes and different prompts correctly invalidate reuse.
 - On this machine's two RTX 5090s, the graph decoder generated 128 tokens in
   **2.73 seconds on the first request (46.9 tokens/s)** and **2.50 seconds
-  after warm-up (51.2 tokens/s)** through coder-cli's Nrob daemon. The prior
+  after warm-up (51.2 tokens/s)** through coder-cli's Oaiy daemon. The prior
   optimized build took 2.86 seconds (44.8 tokens/s) warm, and the original
   implementation took 15.47 seconds (8.3 tokens/s). Both graph responses
   matched the original text on the same deterministic compiler-explanation
@@ -321,7 +321,7 @@ an inert draft and becomes an executable API call only after full validation.
   from disk and one token was processed in 0.02 seconds. Loading took 9.8
   seconds. No claim of BF16/reference-model token identity is made.
 
-Client sampling remains controlled by Nrob's settings and request parameters.
+Client sampling remains controlled by Oaiy's settings and request parameters.
 The model card recommends temperature 1.0, top_p 0.95 and top_k 20.
 
 ## Validation
@@ -329,10 +329,10 @@ The model card recommends temperature 1.0, top_p 0.95 and top_k 20.
 ```powershell
 cargo test --workspace
 cargo test --release -p ggml-rs-cuda --test exl3 --test long_attention
-cargo test --release -p nrob-server benchmark_real_model_decode -- --ignored --nocapture
-cargo test --release -p nrob-server benchmark_real_model_prefill -- --ignored --nocapture
-cargo test --release -p nrob-server real_model_distributed_cache -- --ignored --nocapture
-cargo test --release -p nrob-server tokenizer_matches_huggingface_oracle -- --ignored
+cargo test --release -p oaiy-llm-server benchmark_real_model_decode -- --ignored --nocapture
+cargo test --release -p oaiy-llm-server benchmark_real_model_prefill -- --ignored --nocapture
+cargo test --release -p oaiy-llm-server real_model_distributed_cache -- --ignored --nocapture
+cargo test --release -p oaiy-llm-server tokenizer_matches_huggingface_oracle -- --ignored
 python tools/orcasaq/download.py --verify-only
 ```
 
@@ -362,7 +362,7 @@ request including restoration and the reply, after model loading). These are
 local measurements, not throughput guarantees. The existing Qwen3.8 GGUF
 also reused its prior turn (43 cached tokens, 28 new tokens) and recalled the
 verification word. Windows must permit writes to
-the selected project's `.coder-cli/nrob-cache`; failed publications are logged.
+the selected project's `.coder-cli/oaiy-cache`; failed publications are logged.
 
 Format references: [OrcaSAQ2 integration](https://github.com/Continuum-AI-Corp/OrcaSAQ2-kernel),
 [exllamav3](https://github.com/turboderp-org/exllamav3) and its pack, frac,

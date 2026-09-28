@@ -1,6 +1,6 @@
 """Encode a chat prompt to DeepSeek-V4.1 token ids with the reference
 encoding (encoding/encoding.py) and the checkpoint's tokenizer — a stopgap
-until nrob has a Rust encoder (docs/DEEPSEEK_V41.md, Phase E).
+until OAIY has a Rust encoder (docs/DEEPSEEK_V41.md, Phase E).
 
 Usage: python encode.py "Write a haiku about rivers." [--thinking] > prompt.ids
 Prints comma-separated ids on one line.

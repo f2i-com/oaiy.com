@@ -1,29 +1,31 @@
 [workspace]
 resolver = "2"
 # Vendored cudarc (patched in [patch.crates-io] below) is not a workspace member.
-exclude = ["crates/cudarc"]
+# The two desktop apps (bot.computer's in app/, the previous OAIY Desktop in
+# platform/) keep their own lockfiles and build on their own for now.
+exclude = ["crates/cudarc", "app/src-tauri", "platform/desktop/src-tauri"]
 members = [
-    "crates/nrob-diffusion",
-    "crates/nrob",
-    "crates/nrob-cli",
+    "crates/oaiy-media",
+    "crates/oaiy-engine",
+    "crates/oaiy-llm-cli",
     # DeepSeek-V4.1 support (docs/DEEPSEEK_V41.md); std-only like the core.
     "crates/dsv41",
     # Image decoding for the vision models (PNG, JPEG, Pillow-exact resize);
     # std-only like the core.
-    "crates/nrob-image",
+    "crates/oaiy-image",
     # Its CUDA path (and the hybrid CPU/GPU decode). Like ggml-rs-cuda: a
     # member, not a default member (needs a CUDA toolchain); holds the
     # reviewed unsafe (kernel launches, pinned mappings, AVX-512 dispatch).
     "crates/dsv41-cuda",
     # The OpenAI-compatible server for it (needs CUDA too, so not a default
     # member either).
-    "crates/nrob-server",
-    # The portable host: supervises nrob-server and nrob-diffusion, serves the
+    "crates/oaiy-llm-server",
+    # The portable host: supervises oaiy-llm-server and oaiy-media, serves the
     # control UI and the configurable API gateway. std-only, so a default member.
-    "crates/nrob-studio",
+    "crates/oaiy-studio",
     # The studio as a Windows notification-area app (windows-sys; the only
     # unsafe is its Win32 calls, in src/tray.rs).
-    "crates/nrob-studio-tray",
+    "crates/oaiy-studio-tray",
     # Vendored GGUF compute subsystem (see crates/VENDORED.md). These keep
     # their own identity and external deps; the std-only rule below does
     # not apply to them.
@@ -35,7 +37,7 @@ members = [
     # Vendored CUDA backend (see crates/VENDORED.md). A member so its tests
     # run under `--workspace`, but kept out of `default-members`: building it
     # needs a CUDA toolchain (cudarc dynamic-linking), so the default build
-    # stays CPU-only. Opt in with `cargo build -p nrob-cli --features cuda`.
+    # stays CPU-only. Opt in with `cargo build -p oaiy-llm-cli --features cuda`.
     "crates/ggml-rs-cuda",
     # WebGPU backend (VENDORED-LOCAL addition beside ggml-rs-cuda): quantized
     # matmuls on any wgpu adapter for machines without CUDA. A member, not a
@@ -43,12 +45,12 @@ members = [
     "crates/ggml-rs-wgpu",
 ]
 default-members = [
-    "crates/nrob",
-    "crates/nrob-cli",
+    "crates/oaiy-engine",
+    "crates/oaiy-llm-cli",
     "crates/dsv41",
-    "crates/nrob-image",
-    "crates/nrob-studio",
-    "crates/nrob-studio-tray",
+    "crates/oaiy-image",
+    "crates/oaiy-studio",
+    "crates/oaiy-studio-tray",
     "crates/gguf",
     "crates/ggml-quants",
     "crates/ggml-rs",
@@ -60,7 +62,7 @@ default-members = [
 edition = "2021"
 license = "Apache-2.0"
 
-# Hard rule for nrob, nrob-image, nrob-studio and dsv41: std-only, no external crates.
+# Hard rule for oaiy-engine, oaiy-image, oaiy-studio and dsv41: std-only, no external crates.
 # Do not add a [workspace.dependencies] table.
 # Exception: the vendored GGUF subsystem members (crates/gguf,
 # ggml-quants, ggml-rs, tokenizer, llama-rs, ggml-rs-cuda — see

@@ -1,5 +1,5 @@
 // Custom ternary kernels; no claim of native BitNet integer activation arithmetic.
-// We retain NROB's FP8-simulated activations and BF16 rounding boundaries.
+// We retain OAIY's FP8-simulated activations and BF16 rounding boundaries.
 __device__ __forceinline__ float ternary_part(const float* x, const unsigned char* w,
                                               const unsigned char* s, int k, int lane, int lanes) {
     float acc=0.f;

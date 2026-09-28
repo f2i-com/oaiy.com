@@ -40,7 +40,7 @@ pub mod qwen35moe;
 pub mod sampler;
 pub mod vision;
 // VENDORED-LOCAL: streaming MoE expert backend — experts read on demand
-// from the .gguf file through nrob's bounded Ecache instead of
+// from the .gguf file through OAIY's bounded Ecache instead of
 // materialized in RAM (`Model::open_streaming`).
 pub mod expert_stream;
 
@@ -326,7 +326,7 @@ impl Model {
 
     /// Expert-cache counters (hits / misses / bytes read) for a streaming
     /// model; `None` for resident loads.
-    pub fn expert_cache_stats(&self) -> Option<nrob::ecache::CacheStats> {
+    pub fn expert_cache_stats(&self) -> Option<oaiy_engine::ecache::CacheStats> {
         self.stream_shared().map(|s| s.cache_stats())
     }
 

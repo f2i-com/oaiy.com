@@ -30,7 +30,7 @@
 //!
 //! # Eviction safety
 //!
-//! Eviction is LFRU mirroring the host [`Ecache`](nrob::ecache) policy:
+//! Eviction is LFRU mirroring the host [`Ecache`](oaiy_engine::ecache) policy:
 //! frequency first, recency (`last` clock) as tiebreak. The host cache
 //! samples 16 slots per eviction; here entries number in the hundreds
 //! (budget ÷ ~3 MiB record), so a full scan picks the exact LFRU victim at
@@ -70,7 +70,7 @@
 //!   "enqueue all misses' uploads, then compute in order" and also its
 //!   "prefetch the whole layer's misses, then compute" — for a whole layer
 //!   batch the two coincide.
-//! * **lazy** (`NROB_VRAM_UPLOAD_MODE=lazy`): each miss is uploaded right
+//! * **lazy** (`OAIY_VRAM_UPLOAD_MODE=lazy`): each miss is uploaded right
 //!   before its first compute, the classic "compute expert i while i+1
 //!   transfers" pipeline.
 //!
@@ -195,7 +195,7 @@ pub struct DeviceCache {
     pool: PinnedPool,
     budget: usize,
     /// Staging order — see the module docs. Read once from
-    /// `NROB_VRAM_UPLOAD_MODE` (`eager` default, `lazy` opt-in).
+    /// `OAIY_VRAM_UPLOAD_MODE` (`eager` default, `lazy` opt-in).
     eager: bool,
     inner: Mutex<Inner>,
     hits: AtomicU64,
@@ -254,7 +254,7 @@ impl DeviceCache {
         let pool = backend
             .pinned_pool(3, rec_bytes)
             .map_err(|e| format!("pinned staging pool: {e}"))?;
-        let eager = match std::env::var("NROB_VRAM_UPLOAD_MODE").as_deref() {
+        let eager = match std::env::var("OAIY_VRAM_UPLOAD_MODE").as_deref() {
             Ok("lazy") => false,
             _ => true,
         };

@@ -1,6 +1,6 @@
 # Native Qwen Image 2.1
 
-NROB implements text-to-image and reference-image editing in Rust: Qwen3-VL-8B conditioning,
+OAIY implements text-to-image and reference-image editing in Rust: Qwen3-VL-8B conditioning,
 the 32-layer single-stream image transformer, FlowMatch Euler and the RGBA VAE.
 The compute worker uses Candle tensor primitives; it does not launch Python,
 ComfyUI or stable-diffusion.cpp. The server and existing core remain std-only.
@@ -45,8 +45,8 @@ On Windows with CUDA 12.8 and Visual Studio 2022 C++ build tools:
 On a configured CUDA development shell, the equivalent commands are:
 
 ```sh
-cargo build --release -p nrob-diffusion --features flash-attn
-cargo build --release -p nrob-server
+cargo build --release -p oaiy-media --features flash-attn
+cargo build --release -p oaiy-llm-server
 ```
 
 The first FlashAttention build compiles CUDA kernels and downloads the pinned
@@ -63,10 +63,10 @@ GPU 1 encodes prompts, drops the text encoder, then holds the diffusion model
 and VAE. The standalone worker can use one GPU without a language controller.
 
 ```powershell
-./target/release/nrob-server.exe --model D:/deepseek/model --image-config config/qwen-image.local.json
+./target/release/oaiy-llm-server.exe --model D:/deepseek/model --image-config config/qwen-image.local.json
 ```
 
-The configured controller is automatically added to NROB's model list. Generation
+The configured controller is automatically added to OAIY's model list. Generation
 unloads and joins the old language worker before loading the controller, then
 starts the diffusion worker. Further chat requests are routed to the controller
 until explicitly released, including requests that still name DeepSeek. The
@@ -76,11 +76,11 @@ retained by the unloaded worker. Failed controller loading never starts diffusio
 ## Agent tool
 
 The sibling coder-cli exposes `image_generate`. Build the updated coder-cli and
-add the following in its existing `[nrob]` settings table (or set the
-`NROB_IMAGE_CONFIG` environment variable):
+add the following in its existing `[oaiy]` settings table (or set the
+`OAIY_IMAGE_CONFIG` environment variable):
 
 ```toml
-image_config = 'E:\deepseek\nrob\config\qwen-image.local.json'
+image_config = 'E:\repos\oaiy\config\qwen-image.local.json'
 ```
 
 An example tool request is:
@@ -109,7 +109,7 @@ in a batch. Inputs are opened for reading; results always go into a new batch fo
 ```
 
 The agent tool resolves relative references against its workspace. HTTP callers
-must use absolute paths accessible on the NROB server. PNG, JPEG, and WebP are
+must use absolute paths accessible on the OAIY server. PNG, JPEG, and WebP are
 supported, with a 32 MiB limit per file and bounded decoding. The server's existing
 `--local-images` policy also governs these inputs (enabled by default on loopback,
 disabled by default when listening remotely). Up to three references are supported
@@ -151,15 +151,15 @@ Every batch gets a unique subdirectory and never overwrites another batch.
 Only one image batch can run at a time. Controller chats can continue during it.
 This is an asynchronous local extension, not the OpenAI base64-image response.
 
-For the standalone worker, use `nrob-diffusion --request request.json` or send
+For the standalone worker, use `oaiy-media --request request.json` or send
 JSON on stdin with `--stdin`:
 
 ```json
 {
   "base":"D:/Qwen-Image-2.1",
-  "transformer":"E:/deepseek/nrob/models/qwen-image-2.1/qwen-image-2.1-Q4_K_M.gguf",
-  "adapter":"E:/deepseek/nrob/models/qwen-image-2.1/viggle-v0.2.1-r128.safetensors",
-  "output_dir":"E:/deepseek/nrob/generated-images",
+  "transformer":"E:/repos/oaiy/models/qwen-image-2.1/qwen-image-2.1-Q4_K_M.gguf",
+  "adapter":"E:/repos/oaiy/models/qwen-image-2.1/viggle-v0.2.1-r128.safetensors",
+  "output_dir":"E:/repos/oaiy/generated-images",
   "prompt":"A friendly robot painting a landscape",
   "n":2,"width":1024,"height":1024,"steps":6,"seed":42,"device":1
 }
@@ -186,7 +186,7 @@ events, results and PNGs below `target/qwen-image-bench`. It reports the first
 image separately and the median of subsequent images. It does not load the
 language controller. Avoid concurrent GPU workloads or compilation when timing.
 
-NROB shares a `.cuda-cache` directory under the configured output root between
+OAIY shares a `.cuda-cache` directory under the configured output root between
 jobs. The standalone worker defaults to `.cuda-cache` under its output directory.
 An explicit `CUDA_CACHE_PATH` or `CUDA_CACHE_MAXSIZE` takes precedence; otherwise
 the worker allows a 1 GiB compiled-kernel cache. The initial run still compiles
@@ -260,7 +260,7 @@ alpha handling, patch ordering, temporal VAE shortcuts, and block attention.
 The GPU attention comparison also checks causal text interleaved between reference
 blocks against the F32 CPU result. All 11 diffusion tests passed with GPU tests enabled.
 The affected coder-cli library suites passed 268 tests (15 explicitly ignored).
-The final NROB workspace suite passed 507 tests (77 explicitly ignored), with
+The final OAIY workspace suite passed 507 tests (77 explicitly ignored), with
 the diffusion GPU test also run separately as noted above.
 
 After the FlashAttention optimization, on RTX 5090 at 1024x1024, six steps,
@@ -284,7 +284,7 @@ The GPU regression compares FlashAttention with the F32 reference for causal,
 mixed-prefix and bidirectional attention, including multiple batches and
 non-aligned sequence lengths. All six diffusion tests passed with the GPU test
 explicitly enabled. Generated Q4 and BF16 images were also visually inspected.
-The full workspace suite with `--features nrob-diffusion/flash-attn` passed:
+The full workspace suite with `--features oaiy-media/flash-attn` passed:
 501 tests passed, zero failed, 77 explicitly ignored (the GPU attention test
 was then run separately with `--include-ignored`).
 

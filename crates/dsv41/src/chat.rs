@@ -22,8 +22,8 @@
 //! arguments) is written as Python's `json.dumps` would, since the model
 //! was trained on that.
 
-use nrob::json::{write_str, Json};
-use nrob::{Error, Result};
+use oaiy_engine::json::{write_str, Json};
+use oaiy_engine::{Error, Result};
 
 pub const BOS: &str = "<｜begin▁of▁sentence｜>";
 pub const EOS: &str = "<｜end▁of▁sentence｜>";

@@ -2,7 +2,7 @@
 
 `--image-config` accepts either the legacy image JSON file or a directory of
 media manifests. Copy `config/media.example` to a local folder, edit the paths,
-then pass that folder. The configured local folder is `E:/deepseek/nrob/media`.
+then pass that folder. The configured local folder is `E:/repos/oaiy/media`.
 Model weights stay at their existing paths; nothing is copied or converted.
 
 | File | Purpose | When read |
@@ -39,7 +39,7 @@ availability, defaults, image checkpoint path and video weight readiness.
 Reading status loads no model weights. Coder-cli reads these same configuration
 rules locally before each turn to expose only the available generation tools.
 
-The controller name must match its entry in coder-cli's `[nrob.models]`.
+The controller name must match its entry in coder-cli's `[oaiy.models]`.
 Use different controller and media GPU devices. DeepSeek should be selected only
 for explicit language-model requests or reasoning help after active media has
 finished; media jobs keep the lightweight controller selected until release.
@@ -90,7 +90,7 @@ layer names. REDQwen21 is BF16 with separate matrices; both use six-step turbo.
 
 The optional encoder contains Comfy Kitchen `asym_w4a8_int8` matrices with
 16-element FP8 scale groups, codebooks and ConvRot, plus rotated per-row INT8
-embeddings. NROB decodes these in Rust into BF16 compute tensors in memory;
+embeddings. OAIY decodes these in Rust into BF16 compute tensors in memory;
 it does not yet execute fused W4A8 activation kernels. It therefore saves disk
 space but does not retain 4-bit VRAM usage. No converted weights are written.
 Quantized encoder provenance/censorship cannot be established from its metadata.
@@ -116,7 +116,7 @@ whatever VRAM is free. See [STUDIO.md](STUDIO.md#memory-ssd-ram-and-gpu).
 
 Coder-cli supplies `Options.media_output_root` for the open project's
 `.coder-cli/media` directory. This trusted host setting overrides the shared
-controller manifest's `output_root`. Standalone NROB accepts the same override
+controller manifest's `output_root`. Standalone OAIY accepts the same override
 as `--media-output-root DIR`. Relative output folders and LTX prompt caches
 remain confined to that root. The worker writes images/videos and manifests
 there directly, without copying them to a central output directory.

@@ -1,13 +1,13 @@
 # SDXL image generation
 
-Nrob's opt-in `nrob-diffusion` worker supports complete SDXL 1.0 base-compatible
+Oaiy's opt-in `oaiy-media` worker supports complete SDXL 1.0 base-compatible
 single-file safetensors checkpoints, including Illustrious derivatives. It reads
 the original checkpoint in place: UNet, CLIP-L, OpenCLIP-G and VAE must all be
 present. The architecture code was ported from the author's `plugin-diffusion`
 Rust implementation. Inference is native Rust/Candle; no Python service is used.
 
 Build with `tools/qwen-image/build.ps1` on Windows (CUDA/Flash Attention), or
-`cargo build --release -p nrob-diffusion --features flash-attn` with the CUDA
+`cargo build --release -p oaiy-media --features flash-attn` with the CUDA
 toolchain configured. The existing [media controller setup](QWEN_IMAGE.md) and
 image API supervise SDXL jobs too. Restart the server/coder-cli after rebuilding.
 

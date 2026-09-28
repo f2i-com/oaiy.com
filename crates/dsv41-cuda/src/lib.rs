@@ -1,4 +1,4 @@
-//! CUDA path for DeepSeek-V4.1 on nrob (docs/DEEPSEEK_V41.md, Phase C).
+//! CUDA path for DeepSeek-V4.1 on OAIY (docs/DEEPSEEK_V41.md, Phase C).
 //!
 //! Every kernel mirrors a CPU function in `dsv41` — which is validated
 //! against the reference model — and is tested against it

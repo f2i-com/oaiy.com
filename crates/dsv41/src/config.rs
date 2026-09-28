@@ -8,8 +8,8 @@
 
 use std::path::Path;
 
-use nrob::json::Json;
-use nrob::{Error, Result};
+use oaiy_engine::json::Json;
+use oaiy_engine::{Error, Result};
 
 #[derive(Clone, Debug)]
 pub struct Config {

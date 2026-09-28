@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 
-use nrob::Result;
+use oaiy_engine::Result;
 
 use crate::formats::f32_to_bf16;
 use crate::hc::HC;
@@ -20,7 +20,7 @@ use crate::safetensors::StIndex;
 /// file's metadata (e.g. a shrunk `index_topk` so a short prompt exercises
 /// top-k selection).
 pub fn apply_overrides(model: &mut dyn Backbone, g: &StIndex) -> Result<()> {
-    let bad = |k: &str| nrob::Error::Format(format!("golden metadata {k} is not a number"));
+    let bad = |k: &str| oaiy_engine::Error::Format(format!("golden metadata {k} is not a number"));
     if let Some(v) = g.metadata("index_topk") {
         model.config_mut().index_topk = v.parse().map_err(|_| bad("index_topk"))?;
     }
@@ -80,7 +80,7 @@ pub fn isolation(model: &mut dyn Backbone, g: &StIndex, phase: &str, ids: &[u32]
         trace.insert(k.to_string(), v.to_vec());
     })?;
     let got = |name: &str| -> Result<&Vec<f32>> {
-        trace.get(name).ok_or_else(|| nrob::Error::Format(format!("model did not trace {name}")))
+        trace.get(name).ok_or_else(|| oaiy_engine::Error::Format(format!("model did not trace {name}")))
     };
 
     let mut layers = Vec::with_capacity(n_layers);

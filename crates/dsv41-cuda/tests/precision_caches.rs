@@ -1,6 +1,6 @@
 //! Real CUDA cache isolation across ternary/original bank swaps; no model needed.
 use dsv41_cuda::{Gpu, expert_cache::DeviceExpertCache};
-use nrob::{ecache::Ecache, store::WeightStore, CachePolicy, Result};
+use oaiy_engine::{ecache::Ecache, store::WeightStore, CachePolicy, Result};
 use std::sync::atomic::{AtomicUsize, Ordering};
 struct Store {record:usize, value:u8, reads:AtomicUsize}
 impl WeightStore for Store {

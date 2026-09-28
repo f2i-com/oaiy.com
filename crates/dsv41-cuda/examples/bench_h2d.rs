@@ -10,7 +10,7 @@ use std::time::Instant;
 use dsv41::expert::RECORD_BYTES;
 use dsv41_cuda::Gpu;
 
-fn main() -> nrob::Result<()> {
+fn main() -> oaiy_engine::Result<()> {
     let devices: Vec<usize> = std::env::args().nth(1).as_deref().unwrap_or("1,0").split(',').map(|v| v.trim().parse().expect("device ordinal")).collect();
     let n = 40;
     let host: Vec<u8> = (0..RECORD_BYTES).map(|i| (i * 31 % 251) as u8).collect();
@@ -19,30 +19,30 @@ fn main() -> nrob::Result<()> {
         let mut dev = g.zeros::<u8>(RECORD_BYTES)?;
         let gb = |s: f64| (n * RECORD_BYTES) as f64 / s / 1e9;
         // pageable (the driver stages it)
-        nrob_cu(g.stream.memcpy_htod(&host, &mut dev.slice_mut(..)))?;
+        oaiy_cu(g.stream.memcpy_htod(&host, &mut dev.slice_mut(..)))?;
         g.sync()?;
         let t = Instant::now();
         for _ in 0..n {
-            nrob_cu(g.stream.memcpy_htod(&host, &mut dev.slice_mut(..)))?;
+            oaiy_cu(g.stream.memcpy_htod(&host, &mut dev.slice_mut(..)))?;
         }
         g.sync()?;
         let pageable = gb(t.elapsed().as_secs_f64());
         // pinned
         // SAFETY: filled completely below before any copy reads it.
-        let mut pinned = nrob_cu(unsafe { g.context().alloc_pinned::<u8>(RECORD_BYTES) })?;
-        nrob_cu(pinned.as_mut_slice())?.copy_from_slice(&host);
-        nrob_cu(g.stream.memcpy_htod(&pinned, &mut dev.slice_mut(..)))?;
+        let mut pinned = oaiy_cu(unsafe { g.context().alloc_pinned::<u8>(RECORD_BYTES) })?;
+        oaiy_cu(pinned.as_mut_slice())?.copy_from_slice(&host);
+        oaiy_cu(g.stream.memcpy_htod(&pinned, &mut dev.slice_mut(..)))?;
         g.sync()?;
         let t = Instant::now();
         for _ in 0..n {
-            nrob_cu(g.stream.memcpy_htod(&pinned, &mut dev.slice_mut(..)))?;
+            oaiy_cu(g.stream.memcpy_htod(&pinned, &mut dev.slice_mut(..)))?;
         }
         g.sync()?;
         let pinned_bw = gb(t.elapsed().as_secs_f64());
         // host copy into the pinned (write-combined) buffer
         let t = Instant::now();
         for _ in 0..n {
-            nrob_cu(pinned.as_mut_slice())?.copy_from_slice(&host);
+            oaiy_cu(pinned.as_mut_slice())?.copy_from_slice(&host);
         }
         let host_copy = gb(t.elapsed().as_secs_f64());
         // one staged write alone, then its pieces
@@ -65,13 +65,13 @@ fn main() -> nrob::Result<()> {
         let mut back = vec![0u8; RECORD_BYTES];
         let t = Instant::now();
         for _ in 0..n {
-            nrob_cu(g.stream.memcpy_dtoh(&dev, &mut back))?;
+            oaiy_cu(g.stream.memcpy_dtoh(&dev, &mut back))?;
         }
         g.sync()?;
         let d2h_pageable = gb(t.elapsed().as_secs_f64());
         let t = Instant::now();
         for _ in 0..n {
-            nrob_cu(g.stream.memcpy_dtoh(&dev, &mut pinned))?;
+            oaiy_cu(g.stream.memcpy_dtoh(&dev, &mut pinned))?;
         }
         g.sync()?;
         let d2h_pinned = gb(t.elapsed().as_secs_f64());
@@ -82,6 +82,6 @@ fn main() -> nrob::Result<()> {
     Ok(())
 }
 
-fn nrob_cu<T, E: std::fmt::Debug>(r: std::result::Result<T, E>) -> nrob::Result<T> {
-    r.map_err(|e| nrob::Error::Unsupported(format!("cuda: {e:?}")))
+fn oaiy_cu<T, E: std::fmt::Debug>(r: std::result::Result<T, E>) -> oaiy_engine::Result<T> {
+    r.map_err(|e| oaiy_engine::Error::Unsupported(format!("cuda: {e:?}")))
 }

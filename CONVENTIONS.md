@@ -1,17 +1,17 @@
-# CONVENTIONS.md — engineering contract for the nrob workspace
+# CONVENTIONS.md — engineering contract for the OAIY workspace
 
-This workspace is a Rust (edition 2021) inference engine, `nrob`, that reads GGUF and
+This workspace is a Rust (edition 2021) inference engine, `oaiy-engine`, that reads GGUF and
 safetensors weights in place. This file is the contract every change to the engine
-crates (`nrob`, `nrob-cli`, `nrob-server`, `nrob-image`, `dsv41`, `dsv41-cuda`) is held to.
+crates (`oaiy-engine`, `oaiy-llm-cli`, `oaiy-llm-server`, `oaiy-image`, `dsv41`, `dsv41-cuda`) is held to.
 
 ## Hard rules
 
-- **std-only.** No external crates in `nrob`, `nrob-image`, `dsv41`, `nrob-server` or `nrob-studio`: no serde, no
+- **std-only.** No external crates in `oaiy-engine`, `oaiy-image`, `dsv41`, `oaiy-llm-server` or `oaiy-studio`: no serde, no
   tokio, nothing.
   The core is zero-dependency by design. Do not add a dependency "just for this one
   thing"; write the 30 lines instead. (`dsv41-cuda` depends on cudarc for the GPU; the
   GGUF stack is covered below.)
-- **No `unsafe`** in `nrob`, `nrob-cli`, `nrob-server`, `nrob-studio`, `nrob-image` or `dsv41`: their crate roots say
+- **No `unsafe`** in `oaiy-engine`, `oaiy-llm-cli`, `oaiy-llm-server`, `oaiy-studio`, `oaiy-image` or `dsv41`: their crate roots say
   `#![forbid(unsafe_code)]`. `dsv41-cuda` may use it for kernel launches, pinned
   memory and SIMD dispatch, with a `SAFETY:` comment on every block explaining why safe
   Rust cannot express it and what makes it sound.
@@ -35,13 +35,13 @@ crates (`nrob`, `nrob-cli`, `nrob-server`, `nrob-image`, `dsv41`, `dsv41-cuda`) 
 
 ## Errors
 
-- Everything fallible returns `nrob::Result<T>` with `nrob::Error`; pick the variant
+- Everything fallible returns `oaiy_engine::Result<T>` with `oaiy_engine::Error`; pick the variant
   matching the failure (`Error::Format` for a malformed header, …) and put the detail
   string into the payload. The GGUF stack uses its own `LlamaError` / `GgufError`.
 - **Never panic on bad external data.** A truncated shard, a corrupt header, a tensor
   of the wrong size: all `Err`. `unwrap`/`expect` are for invariants you can argue from
   code you own, never for input bytes.
-- **Never print from library code.** No `println!`/`eprintln!` in `nrob` or `dsv41`.
+- **Never print from library code.** No `println!`/`eprintln!` in `oaiy-engine` or `dsv41`.
   The CLI and the examples print; the libraries return.
 
 ## Done means
@@ -54,19 +54,19 @@ crates (`nrob`, `nrob-cli`, `nrob-server`, `nrob-image`, `dsv41`, `dsv41-cuda`) 
 
 ## The tray app
 
-`nrob-studio-tray` puts the std-only `nrob-studio` library behind a Windows
+`oaiy-studio-tray` puts the std-only `oaiy-studio` library behind a Windows
 notification-area icon. Win32 UI is outside std, so this crate depends on
 `windows-sys` (bindings only). Its `unsafe` is confined to `src/tray.rs`, and
 every block there carries a `SAFETY:` comment, as in `dsv41-cuda`.
 
 ## Diffusion compute boundary
 
-`nrob-diffusion` is a separate, opt-in Rust compute worker. It uses Candle core/nn
+`oaiy-media` is a separate, opt-in Rust compute worker. It uses Candle core/nn
 tensor primitives (and CUDA kernels), the Rust tokenizer and PNG encoder. Its
 architecture, weight loading, scheduler and batch loop live in this workspace;
 it does not invoke Python or a C++ diffusion engine. It forbids unsafe Rust.
 The server supervises it through a std-only subprocess protocol, so these
-dependencies do not enter `nrob-server`, `nrob`, `nrob-image` or `dsv41`.
+dependencies do not enter `oaiy-llm-server`, `oaiy-engine`, `oaiy-image` or `dsv41`.
 
 ## GGUF stack dependencies
 

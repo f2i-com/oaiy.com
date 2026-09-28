@@ -103,10 +103,10 @@
         "enabled": true
       },
       {
-        "path": "/nrob/images",
+        "path": "/oaiy/images",
         "method": "POST",
         "target": "images",
-        "spec": "nrob",
+        "spec": "oaiy",
         "enabled": true
       },
       {
@@ -135,8 +135,8 @@
   "llm": {
     "enabled": true,
     "autostart": false,
-    "server": "nrob-server",
-    "server_webgpu": "nrob-server-webgpu",
+    "server": "oaiy-llm-server",
+    "server_webgpu": "oaiy-llm-server-webgpu",
     "backend": "auto",
     "webgpu_gb": null,
     "default_model": "qwen3-8b",
@@ -166,7 +166,7 @@
     "extra_args": []
   },
   "media": {
-    "worker": "nrob-diffusion",
+    "worker": "oaiy-media",
     "output_dir": "outputs",
     "device": 1,
     "llm_policy": "auto",

@@ -1,16 +1,16 @@
-"""Residency must not change pixels: run one request through nrob-diffusion in
+"""Residency must not change pixels: run one request through oaiy-media in
 several memory modes and compare the PNG hashes.
 
     python tools/qwen-image/residency_parity.py qwen  [gpu ram:64 ssd auto:64:4]
     python tools/qwen-image/residency_parity.py sdxl  [gpu ram:32 ssd]
 
 Modes are memory[:ram_gb[:vram_gb]]. Paths below are this machine's; edit them
-(or set NROB_WORKER) for yours. Outputs go to the system temp folder.
+(or set OAIY_WORKER) for yours. Outputs go to the system temp folder.
 """
 import hashlib, json, os, subprocess, sys, tempfile, time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-WORKER = os.environ.get("NROB_WORKER", os.path.join(ROOT, "target", "release", "nrob-diffusion.exe" if os.name == "nt" else "nrob-diffusion"))
+WORKER = os.environ.get("OAIY_WORKER", os.path.join(ROOT, "target", "release", "oaiy-media.exe" if os.name == "nt" else "oaiy-media"))
 REQUESTS = {
     "qwen": {
         "base": "D:/Qwen-Image-2.1",
@@ -29,7 +29,7 @@ REQUESTS = {
 def main():
     kind = sys.argv[1] if len(sys.argv) > 1 else "qwen"
     modes = sys.argv[2:] or (["gpu", "ram:64", "ssd", "auto:64:4"] if kind == "qwen" else ["gpu", "ram:32", "ssd"])
-    out_root = tempfile.mkdtemp(prefix=f"nrob-parity-{kind}-")
+    out_root = tempfile.mkdtemp(prefix=f"oaiy-parity-{kind}-")
     hashes = {}
     for mode in modes:
         parts = mode.split(":")

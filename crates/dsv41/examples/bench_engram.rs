@@ -11,7 +11,7 @@ use dsv41::config::Config;
 use dsv41::engram::{Engram, NgramHasher};
 use dsv41::safetensors::StIndex;
 
-fn main() -> nrob::Result<()> {
+fn main() -> oaiy_engine::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let (dir, meta) = (Path::new(&args[1]), Path::new(&args[2]));
     let steps: usize = args.get(3).and_then(|v| v.parse().ok()).unwrap_or(64);
@@ -20,7 +20,7 @@ fn main() -> nrob::Result<()> {
     let prompt = args.get(6).is_some_and(|v| v == "prompt");
     let cfg = Config::load(dir)?;
     let idx = StIndex::open(dir)?;
-    let engrams: Vec<Engram> = cfg.engram_layer_ids.iter().map(|&l| Engram::load(&idx, &cfg, l)).collect::<nrob::Result<_>>()?;
+    let engrams: Vec<Engram> = cfg.engram_layer_ids.iter().map(|&l| Engram::load(&idx, &cfg, l)).collect::<oaiy_engine::Result<_>>()?;
     let mut hasher = NgramHasher::load(meta, &cfg, steps + 1)?;
     let cols = hasher.cols();
     for pass in 0..passes {

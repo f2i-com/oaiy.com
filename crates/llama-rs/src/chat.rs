@@ -234,7 +234,7 @@ pub fn glm5next_template_with(
 /// on every coder-cli turn for a question that does not need one.
 ///
 /// That 2x2 is worth keeping for a second reason. This pair was the prime suspect
-/// for a day, because `nrob-server` defaults to `thinking = false` and so every
+/// for a day, because `oaiy-llm-server` defaults to `thinking = false` and so every
 /// request a harness made took the off-reference branch -- which made the closed
 /// form correlate perfectly with output that degenerated. It was not the cause;
 /// the KDA decay axis was (see `glm5next::kda`). A correlation with the one thing

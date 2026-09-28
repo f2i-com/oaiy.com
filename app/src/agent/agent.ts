@@ -29,7 +29,7 @@ export type AgentEvent =
   /** What the model is about to be sent for its next step, to show: the system prompt, the conversation as sent, the tools' names. */
   | { type: 'prompt'; system: string; turns: Turn[]; tools: string[] }
   | { type: 'tool_start'; index: number; name: string }
-  /** A tool call as it is written, before it is whole: nrob's raw text, or a call's JSON arguments (`index`). */
+  /** A tool call as it is written, before it is whole: OAIY's raw text, or a call's JSON arguments (`index`). */
   | { type: 'tool_draft'; text: string; start: boolean; index?: number }
   | { type: 'tool_call'; call: ToolCall }
   | { type: 'tool_result'; result: ToolResult }
@@ -1381,7 +1381,7 @@ export class Agent {
           emit({ type: 'status', message: `The model writes at most ${formatTokens(limit)} tokens per reply; retrying with that` });
           continue;
         }
-        // A tool call the server could not read (nrob's tool_contract_error): nothing ran, and another sample usually reads.
+        // A tool call the server could not read (OAIY's tool_contract_error): nothing ran, and another sample usually reads.
         // It quotes the call, which may name view_image: that is not the model refusing images.
         const unreadableCall = /tool_contract_error/.test(said);
         if (unreadableCall && !callRetried) {

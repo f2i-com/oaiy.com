@@ -1,9 +1,9 @@
-//! DeepSeek-V4.1-Flash for nrob. See `docs/DEEPSEEK_V41.md` for the plan
+//! DeepSeek-V4.1-Flash for OAIY. See `docs/DEEPSEEK_V41.md` for the plan
 //! and the measurements behind it.
 //!
 //! The checkpoint is used in place: [`safetensors::StIndex`] reads only the
 //! shard headers, and [`expert::SafetensorsExpertStore`] serves the 15,360
-//! routed experts to nrob's cache layer straight from the shards, two
+//! routed experts to OAIY's cache layer straight from the shards, two
 //! positioned reads per expert. Nothing is converted.
 //!
 //! Module map:

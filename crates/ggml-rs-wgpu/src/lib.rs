@@ -12,7 +12,7 @@
 //! host and take `CpuBackend`'s path: a model larger than the GPU still runs,
 //! the rest of it on the CPU.
 
-// VENDORED-LOCAL: this crate is nrob's addition beside ggml-rs-cuda.
+// VENDORED-LOCAL: this crate is OAIY's addition beside ggml-rs-cuda.
 
 pub mod shaders;
 
@@ -108,7 +108,7 @@ impl Gpu {
     fn read(&self, src: &wgpu::Buffer, len: u64) -> Vec<u8> {
         let len = len.div_ceil(4) * 4;
         let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("nrob-readback"),
+            label: Some("oaiy-readback"),
             size: len,
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
@@ -141,7 +141,7 @@ impl Gpu {
             let data = &bytes[r * row_bytes..(r + n) * row_bytes];
             let size = (data.len() as u64).div_ceil(4) * 4;
             let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("nrob-weight"),
+                label: Some("oaiy-weight"),
                 size,
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
                 mapped_at_creation: false,
@@ -175,11 +175,11 @@ impl Gpu {
         }
         let source = shaders::source(dtype)?;
         let module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("nrob-linear-q"),
+            label: Some("oaiy-linear-q"),
             source: wgpu::ShaderSource::Wgsl(source.into()),
         });
         let pipeline = Arc::new(self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("nrob-linear-q"),
+            label: Some("oaiy-linear-q"),
             layout: Some(&self.pipeline_layout),
             module: &module,
             entry_point: Some("main"),
@@ -235,7 +235,7 @@ impl WgpuBackend {
         };
         let limits = adapter.limits();
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            label: Some("nrob"),
+            label: Some("oaiy"),
             required_limits: limits.clone(),
             ..Default::default()
         }))
@@ -252,7 +252,7 @@ impl WgpuBackend {
             min_binding_size: None,
         };
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("nrob-linear-q"),
+            label: Some("oaiy-linear-q"),
             entries: &[
                 entry(0, storage(true)),
                 entry(1, storage(true)),
@@ -264,7 +264,7 @@ impl WgpuBackend {
             ],
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("nrob-linear-q"),
+            label: Some("oaiy-linear-q"),
             bind_group_layouts: &[Some(&layout)],
             immediate_size: 0,
         });
@@ -353,17 +353,17 @@ impl WgpuBackend {
         let pipeline = gpu.pipeline(q.dtype).expect("uploaded weights have a pipeline");
         let bytes = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|f| f.to_le_bytes()).collect() };
         let usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
-        let xbuf = gpu.device.create_buffer(&wgpu::BufferDescriptor { label: Some("nrob-x"), size: (x.numel() * 4) as u64, usage, mapped_at_creation: false });
+        let xbuf = gpu.device.create_buffer(&wgpu::BufferDescriptor { label: Some("oaiy-x"), size: (x.numel() * 4) as u64, usage, mapped_at_creation: false });
         gpu.queue.write_buffer(&xbuf, 0, &bytes(x.data()));
         let ysize = (m * n * 4) as u64;
         let ybuf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("nrob-y"),
+            label: Some("oaiy-y"),
             size: ysize,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
         let staging = gpu.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("nrob-y-read"),
+            label: Some("oaiy-y-read"),
             size: ysize,
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
@@ -376,14 +376,14 @@ impl WgpuBackend {
                 .flat_map(|v| v.to_le_bytes())
                 .collect();
             let pbuf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("nrob-params"),
+                label: Some("oaiy-params"),
                 size: params.len() as u64,
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
             gpu.queue.write_buffer(&pbuf, 0, &params);
             let group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("nrob-linear-q"),
+                label: Some("oaiy-linear-q"),
                 layout: &gpu.layout,
                 entries: &[
                     wgpu::BindGroupEntry { binding: 0, resource: buffer.as_entire_binding() },

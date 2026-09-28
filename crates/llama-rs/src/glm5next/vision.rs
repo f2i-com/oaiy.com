@@ -103,7 +103,7 @@
 //!
 //! **Wired into `Glm5NextModel`: no.** The remaining gap for end-to-end vision is
 //! preprocessing — resize to a multiple of `patch * n_merge` (bicubic) and
-//! normalise by `clip.vision.image_mean` / `image_std`. `nrob-image` already has
+//! normalise by `clip.vision.image_mean` / `image_std`. `oaiy-image` already has
 //! Pillow-exact resize, and `vision::preprocess_image` wraps it.
 
 use crate::{LlamaError, Result};

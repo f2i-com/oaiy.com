@@ -21,7 +21,7 @@ use ggml_rs::{Backend, Tensor};
 
 use crate::loader::Weight;
 
-// VENDORED-LOCAL: PERF-01 — route-trace hook. `nrob run --trace-out` records
+// VENDORED-LOCAL: PERF-01 — route-trace hook. `OAIY run --trace-out` records
 // the (layer, expert) routing sequence per token for deterministic offline
 // replay (docs/ROADMAP.md Phase 0). The streaming path's routing decision is
 // computed inside `expert_stream.rs`, which does not expose the routed ids;

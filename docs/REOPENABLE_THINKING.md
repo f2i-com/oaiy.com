@@ -6,7 +6,7 @@ closed. Ternary reasoning and original 4-bit tool arguments remain unchanged.
 
 ## Implementation
 
-- NROB's streaming parser recognizes opening and closing thinking markers in
+- OAIY's streaming parser recognizes opening and closing thinking markers in
   either text channel, including markers split across chunks. Reopening selects
   reasoning; closing selects answer text. Redundant closes are idempotent and
   are not displayed as prose. An unmatched close does not imply an opening:
@@ -19,13 +19,13 @@ closed. Ternary reasoning and original 4-bit tool arguments remain unchanged.
   new thinking section starts. Explicit budget closure can end an unfinished
   code span in reasoning. No model weights or token IDs were changed.
 - coder-cli preserves text/reasoning block order when streaming, storing replies,
-  and retaining a plan. Its NROB adapter writes leading reasoning into the usual
+  and retaining a plan. Its OAIY adapter writes leading reasoning into the usual
   reasoning_content field and later sections back into assistant content with
   the model's own markers, preserving order for the next request.
 - The interactive TUI displays later reasoning between the surrounding answer
   sections, both live and after completion. Plain OpenAI-style nonstreaming
   responses still have separate aggregate content/reasoning fields; they cannot
-  express arbitrary interleaving. coder-cli's NROB turn path uses streaming.
+  express arbitrary interleaving. coder-cli's OAIY turn path uses streaming.
 
 This fixes channel interpretation and history order. Repeated greetings, echoed
 user prompts, and invented facts are separate generation problems; removing or
@@ -35,11 +35,11 @@ because it follows a closing marker.
 
 ## Verification
 
-- cargo test -p provider-nrob -p runtime-core -p tui --lib --offline: exit 0;
+- cargo test -p provider-oaiy -p runtime-core -p tui --lib --offline: exit 0;
   17 provider, 117 runtime, 76 TUI tests passed; 1 hardware-monitor test ignored.
 - Initial parser run found a regression in holding the newline separator before
   a split DSML opening. Restored the existing holdback rule; assertion retained.
-- cargo test --workspace --offline -j 1 in nrob: exit 0; 452 passed, 69 ignored.
+- cargo test --workspace --offline -j 1 in OAIY: exit 0; 452 passed, 69 ignored.
   Includes the existing chat template reference-encoding fixture tests.
 - Tests cover ordered draft/think/revision deltas, duplicate closes, split markers,
   literal code/fence markers, markers in tool data, forced closure, accumulated

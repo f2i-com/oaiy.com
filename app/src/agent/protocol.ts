@@ -90,7 +90,7 @@ export interface RequestOptions {
   sink?: StreamSink;
   maxOutputTokens?: number;
   timeoutMs?: number;
-  /** How hard the model thinks first (nrob's `reasoning_effort`); other servers are not asked. */
+  /** How hard the model thinks first (OAIY's `reasoning_effort`); other servers are not asked. */
   reasoning?: 'low' | 'medium' | 'high' | 'max';
 }
 
@@ -275,7 +275,7 @@ export async function sendTurn(
   // OpenAI's reasoning models take max_completion_tokens; other servers read max_tokens.
   if (isOpenAIHost(url)) body.max_completion_tokens = maxTokens;
   else body.max_tokens = maxTokens;
-  if (options.reasoning && provider.serverKind === 'nrob') body.reasoning_effort = options.reasoning;
+  if (options.reasoning && provider.serverKind === 'oaiy') body.reasoning_effort = options.reasoning;
   const stream = new OpenAIStream(options.sink);
   const outcome = await postProviderStream(provider, url, body, {
     signal: options.signal,

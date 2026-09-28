@@ -17,8 +17,8 @@
 
 use std::sync::Mutex;
 
-use nrob::backend::parallel_rows;
-use nrob::{Error, Result};
+use oaiy_engine::backend::parallel_rows;
+use oaiy_engine::{Error, Result};
 
 use crate::formats::{bf16_to_f32, e8m0_to_f32, fake_quant_fp8, fp8_e4m3_to_f32, to_bf16};
 use crate::safetensors::{Dtype, StIndex};

@@ -12,15 +12,15 @@
 //! embeddings and the IMAGE slots the aligner's rows, in reading order.
 //!
 //! - [`plan_image_grid`], [`prepare`] — sizing, Pillow's resize/pad (via
-//!   `nrob-image`), normalization and patches, bit-exact to the reference
+//!   `oaiy-image`), normalization and patches, bit-exact to the reference
 //! - [`VisionTower`] — the ViT and aligner on the CPU, the oracle the CUDA
 //!   tower is tested against (and a fallback); `bf16` rounding wherever the
 //!   reference's tensors are bf16
 
 use std::path::Path;
 
-use nrob::{Error, Result};
-use nrob_image::Image;
+use oaiy_engine::{Error, Result};
+use oaiy_image::Image;
 
 use crate::config::{Config, VisionConfig};
 use crate::formats::{bf16_to_f32, f32_to_bf16, to_bf16};
@@ -147,8 +147,8 @@ pub fn prepare(img: &Image, cfg: &VisionConfig) -> Prepared {
     let plan = plan_image_grid(img.width, img.height, cfg);
     let (n_vit_h, n_vit_w) = (plan.best_h / p, plan.best_w / p);
     let sized = match cfg.max_wh_ratio {
-        Some(r) if img.width >= r * img.height => nrob_image::resize::resize_bicubic(img, plan.best_w, plan.best_h),
-        _ => nrob_image::resize::pad(img, plan.best_w, plan.best_h, [127; 3]),
+        Some(r) if img.width >= r * img.height => oaiy_image::resize::resize_bicubic(img, plan.best_w, plan.best_h),
+        _ => oaiy_image::resize::pad(img, plan.best_w, plan.best_h, [127; 3]),
     };
     // (x / 255 - 0.5) / 0.5 in f32, then bf16: one value per byte
     let lut: Vec<f32> = (0..256).map(|v| to_bf16((v as f32 / 255.0 - 0.5) / 0.5)).collect();
@@ -169,7 +169,7 @@ pub fn prepare(img: &Image, cfg: &VisionConfig) -> Prepared {
 
 /// Decode (PNG or JPEG) and [`prepare`] an encoded image.
 pub fn load_image(bytes: &[u8], cfg: &VisionConfig) -> Result<Prepared> {
-    Ok(prepare(&nrob_image::decode(bytes)?, cfg))
+    Ok(prepare(&oaiy_image::decode(bytes)?, cfg))
 }
 
 /// The bytes of an image record (the reference `load_image_bytes`): `data`
@@ -177,8 +177,8 @@ pub fn load_image(bytes: &[u8], cfg: &VisionConfig) -> Result<Prepared> {
 /// `data:` URL, or — when `local_files` — a local path or `file://` URL.
 /// Remote `http(s)` URLs are refused (no TLS in a std-only build); send the
 /// image inline instead.
-pub fn image_bytes(record: &nrob::json::Json, local_files: bool) -> Result<Vec<u8>> {
-    use nrob::json::Json;
+pub fn image_bytes(record: &oaiy_engine::json::Json, local_files: bool) -> Result<Vec<u8>> {
+    use oaiy_engine::json::Json;
     if let Some(Json::Str(d)) = record.get("data") {
         return base64_decode(d);
     }
@@ -378,7 +378,7 @@ impl Linear {
         let (n, k) = (self.n, self.k);
         assert_eq!(x.len(), t * k, "linear: input is not [t, k]");
         let mut y = vec![0.0f32; t * n];
-        let threads = nrob::backend::hardware_concurrency().clamp(1, 64);
+        let threads = oaiy_engine::backend::hardware_concurrency().clamp(1, 64);
         let per = t.div_ceil(threads).max(1);
         std::thread::scope(|s| {
             for (ci, ys) in y.chunks_mut(per * n).enumerate() {
@@ -579,7 +579,7 @@ pub fn attention(qkv: &[f32], n: usize, heads: usize, hd: usize, cos: &[f32], si
     }
     let scale = 1.0 / (hd as f32).sqrt();
     let mut out = vec![0.0f32; n * d];
-    let threads = nrob::backend::hardware_concurrency().clamp(1, 64);
+    let threads = oaiy_engine::backend::hardware_concurrency().clamp(1, 64);
     let per = n.div_ceil(threads).max(1);
     std::thread::scope(|s| {
         for (ci, os) in out.chunks_mut(per * d).enumerate() {
@@ -663,13 +663,13 @@ mod tests {
         assert_eq!(base64_decode("aGVs\nbG8=").unwrap(), b"hello");
         assert_eq!(base64_decode("-_8=").unwrap(), [0xfb, 0xff]);
         assert!(base64_decode("a$b").is_err());
-        let rec = nrob::json::Json::parse(br#"{"type": "image", "url": "data:image/png;base64,aGk="}"#).unwrap();
+        let rec = oaiy_engine::json::Json::parse(br#"{"type": "image", "url": "data:image/png;base64,aGk="}"#).unwrap();
         assert_eq!(image_bytes(&rec, false).unwrap(), b"hi");
-        let rec = nrob::json::Json::parse(br#"{"type": "image", "source": {"type": "base64", "data": "aGk="}}"#).unwrap();
+        let rec = oaiy_engine::json::Json::parse(br#"{"type": "image", "source": {"type": "base64", "data": "aGk="}}"#).unwrap();
         assert_eq!(image_bytes(&rec, false).unwrap(), b"hi");
-        let rec = nrob::json::Json::parse(br#"{"type": "image", "url": "C:/nope.png"}"#).unwrap();
+        let rec = oaiy_engine::json::Json::parse(br#"{"type": "image", "url": "C:/nope.png"}"#).unwrap();
         assert!(matches!(image_bytes(&rec, false), Err(Error::Arg(_))));
-        let rec = nrob::json::Json::parse(br#"{"type": "image", "url": "https://example.com/a.png"}"#).unwrap();
+        let rec = oaiy_engine::json::Json::parse(br#"{"type": "image", "url": "https://example.com/a.png"}"#).unwrap();
         assert!(matches!(image_bytes(&rec, true), Err(Error::Unsupported(_))));
     }
 

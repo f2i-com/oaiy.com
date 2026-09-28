@@ -1,7 +1,7 @@
 # Speech
 
-NROB speaks with Qwen3-TTS (12 Hz, 1.7B) or [Breeze TTS 2](#breeze-tts-2),
-natively in Rust (`nrob-diffusion`, `kind: "speech"`). The studio serves both as
+OAIY speaks with Qwen3-TTS (12 Hz, 1.7B) or [Breeze TTS 2](#breeze-tts-2),
+natively in Rust (`oaiy-media`, `kind: "speech"`). The studio serves both as
 OpenAI's `audio.speech`. It adds **saved voices**: describe a voice once, keep
 it, and every later line uses the same voice.
 

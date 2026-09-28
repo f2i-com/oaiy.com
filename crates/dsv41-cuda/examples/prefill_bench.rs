@@ -13,10 +13,10 @@
 //! run only with another profiled run;
 //! DSV41_WAIT_WARM=1 lets the background RAM fill finish first (a server
 //! that has been up a while); DSV41_HEADROOM_GB sets the VRAM kept for
-//! activations (default 2, as nrob-server's).
+//! activations (default 2, as oaiy-llm-server's).
 //!
 //! DSV41_LAYERED=1 runs layer by layer; DSV41_PASS=N splits that into passes
-//! of N tokens, as nrob-server does a stretch longer than its layered_max.
+//! of N tokens, as oaiy-llm-server does a stretch longer than its layered_max.
 //! DSV41_CARRY=0/1 forces the residual onto the host or the device, where
 //! the default lets the free VRAM decide (`GpuOptions::residual_on_device`).
 
@@ -44,7 +44,7 @@ fn sources(dir: &Path, out: &mut String, limit: usize) {
     }
 }
 
-fn main() -> nrob::Result<()> {
+fn main() -> oaiy_engine::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let n_tokens: usize = args.get(1).and_then(|v| v.parse().ok()).unwrap_or(4096);
     let chunk: usize = args.get(2).and_then(|v| v.parse().ok()).unwrap_or(1024);

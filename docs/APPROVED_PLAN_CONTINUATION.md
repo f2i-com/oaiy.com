@@ -10,7 +10,7 @@ not evidence that web_search or the file tools failed.
 - Later-turn approval now receives the same explicit execution handoff as an
   AutoBuild plan: start with one concrete tool action, inspect when needed, and
   research uncertain facts through tools rather than reconstructing them first.
-- NROB adds a decoded-prose guard alongside its existing token-ID guard. Four
+- OAIY adds a decoded-prose guard alongside its existing token-ID guard. Four
   consecutive identical completed sentences stop an incomplete generation even
   when token/chunk boundaries differ. Whitespace is normalized; qualifying
   sentences need at least 24 bytes and 16 alphabetic characters. Individual
@@ -39,20 +39,20 @@ cargo build -p coder-cli --example plan_continuation --release --offline
 target/release/examples/plan_continuation.exe <isolated-workspace>
 ```
 
-NROB also has an opt-in CPU replay of saved AssistantDelta events:
-set NROB_LOOP_EVENTS to the local events.jsonl, then run
-`cargo test -p nrob-server recorded_prose_loop_is_stopped --offline -- --ignored --nocapture`.
+OAIY also has an opt-in CPU replay of saved AssistantDelta events:
+set OAIY_LOOP_EVENTS to the local events.jsonl, then run
+`cargo test -p oaiy-llm-server recorded_prose_loop_is_stopped --offline -- --ignored --nocapture`.
 The user's exact recording stopped at event line 583. This replay does not run
 inference or claim that the model can complete the task after the guard stops it.
 
 ## Validation
 
-- NROB server regressions: 25 passed, 1 ignored before the optional replay test
+- OAIY server regressions: 25 passed, 1 ignored before the optional replay test
   was added; replay explicitly executed afterward, passed.
-- `cargo test --workspace --offline -j 1` in NROB: exit 0. Existing ignored model
+- `cargo test --workspace --offline -j 1` in OAIY: exit 0. Existing ignored model
   golden gates remain unexecuted; no numerical inference kernels were changed.
 - `cargo test -p runtime-core --lib --offline`: 117 passed, exit 0.
-- coder-cli and standalone nrob-server release builds: exit 0.
+- coder-cli and standalone oaiy-llm-server release builds: exit 0.
 - Live harness initial compilation failed because RunRequest has no Default;
   explicit fields corrected it, and its release build passed.
 
@@ -64,14 +64,14 @@ reach approval: it wrote a plan twice and continued guessing rotor data. It was
 stopped manually; no completed assistant plan or tool call was saved. Therefore
 that attempt does not validate the execution handoff.
 
-NROB planning requests now ask for the final line `End of plan.` and pass it as
+OAIY planning requests now ask for the final line `End of plan.` and pass it as
 a content-only stop sequence. They also have a 1280-token total cap and a
 512-token thinking cap. The stop marker is removed by the server before display
 and stored history, and cancellation stops generation. Execution requests do not
 inherit these planning limits; rethinking remains available in normal turns.
 The provider regression tests explicitly check isolation of the planning limits.
 
-After this addition, provider-nrob (18 tests) and runtime-core (117 tests) passed.
+After this addition, provider-oaiy (18 tests) and runtime-core (117 tests) passed.
 The live harness is rerun with a new session and separately retained logs.
 ## Final live observation and stream retry correction
 
@@ -99,8 +99,8 @@ The end-to-end mock regression covers partial reasoning, answer text and tool
 arguments followed by connection failure, checking exactly one attempt and no
 file write. Its initial fixture omitted the session directory and failed before
 calling the provider; that fixture was corrected without weakening assertions.
-Final affected suites: 118 runtime tests and 18 NROB adapter tests passed, exit 0.
-NROB workspace suite: 454 passed, 69 ignored before the opt-in replay was added;
+Final affected suites: 118 runtime tests and 18 OAIY adapter tests passed, exit 0.
+OAIY workspace suite: 454 passed, 69 ignored before the opt-in replay was added;
 the new replay was explicitly executed and passed. Existing GPU golden gates
 remain unexecuted. Final coder-cli release rebuild and live example build both passed (exit 0).
 The saved-event evidence was rechecked in full: web_search had also completed

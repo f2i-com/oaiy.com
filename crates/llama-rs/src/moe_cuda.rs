@@ -38,12 +38,12 @@ pub(crate) struct GpuLayerPlan {
 }
 
 // VENDORED-LOCAL: A/B switch for benchmarks and debugging —
-/// `NROB_MOE_GROUPED=0` forces the reference per-expert loops (resident and
+/// `OAIY_MOE_GROUPED=0` forces the reference per-expert loops (resident and
 /// streaming alike). Read once per process; unset or any other value keeps
 /// the grouped path on.
 pub(crate) fn grouped_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| !matches!(std::env::var("NROB_MOE_GROUPED").as_deref(), Ok("0")))
+    *ENABLED.get_or_init(|| !matches!(std::env::var("OAIY_MOE_GROUPED").as_deref(), Ok("0")))
 }
 
 impl std::fmt::Debug for GpuLayerPlan {

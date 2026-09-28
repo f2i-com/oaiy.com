@@ -4,8 +4,8 @@
   "vram_gb": 26,
   "models": {
     "sulphur-2": {
-      "transformer": "E:\\deepseek\\nrob\\models\\sulphur-2\\sulphur_distil_bf16.safetensors",
-      "vae": "E:\\deepseek\\nrob\\models\\sulphur-2\\sulphur_distil_bf16.safetensors",
+      "transformer": "E:\\deepseek\\oaiy\\models\\sulphur-2\\sulphur_distil_bf16.safetensors",
+      "vae": "E:\\deepseek\\oaiy\\models\\sulphur-2\\sulphur_distil_bf16.safetensors",
       "text_encoder": "E:/models/comfyui/models/text_encoders/gemma_3_12B_it.safetensors",
       "tokenizer": "E:/models/checkpoints/gemma-3-12b-it-qat-q4_0-unquantized/tokenizer.json"
     }

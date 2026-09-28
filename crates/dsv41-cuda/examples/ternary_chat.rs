@@ -2,11 +2,11 @@
 use std::path::Path;
 use std::io::Write;
 use std::time::Instant;
-use nrob::json::Json as J;
+use oaiy_engine::json::Json as J;
 use dsv41::{chat, detok::Detokenizer, tokenizer::Tokenizer, model::argmax};
 use dsv41_cuda::{GpuModel, GpuOptions};
 
-fn main() -> nrob::Result<()> {
+fn main() -> oaiy_engine::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let source = Path::new(args.get(1).expect("MODEL_DIR"));
     let prompt = args.get(2).expect("PROMPT");

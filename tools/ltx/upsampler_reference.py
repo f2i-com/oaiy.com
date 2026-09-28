@@ -1,4 +1,4 @@
-"""Reference activations for nrob's LTX latent upsampler.
+"""Reference activations for OAIY's LTX latent upsampler.
 
 The official LatentUpsampler (ltx_core.model.upsampler: 3D, x2 spatial) on a
 fixed random latent, in F32 on the CPU. Writes `input` and `output` to a

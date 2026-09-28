@@ -6,12 +6,12 @@ import { HELP, internetCommand } from './commands';
 import { NetGate } from './gate/netgate';
 import { sandboxAvailable, zippModule } from './sandbox/runner';
 import { loadSettings, saveAgentSettings, saveGate, saveLastKeptProject, saveLastProject, saveMedia, saveProviders } from './settings';
-import { NROB_ORIGIN, discoverNrob, mediaAbilities, mergeDiscovered } from './agent/media';
+import { OAIY_ORIGIN, discoverOaiy, mediaAbilities, mergeDiscovered } from './agent/media';
 import { budgetFor, contextWindow, detectContextWindow, formatTokens } from './agent/context';
 import { ChatPane } from './ui/chat';
 import { clear, h } from './ui/dom';
 import { EditorPane } from './ui/editor';
-import { nrobProvider, openSettings } from './ui/settings';
+import { oaiyProvider, openSettings } from './ui/settings';
 import { TerminalPane } from './ui/terminal';
 import { Preview } from './preview/preview';
 import { findPages, isPagePath } from './preview/page';
@@ -25,7 +25,7 @@ import type { Attachment } from './agent/protocol';
 import { flagPicture } from './agent/review';
 import { FileTree } from './ui/tree';
 import { OpenProject, clearIncognito, createProject, deleteProject, listProjects, renameProject, type ProjectMeta } from './vfs/projects';
-import { addNrobOrigin, setIncognito } from './privacy';
+import { addOaiyOrigin, setIncognito } from './privacy';
 import { providerEndpoints, providerHeaders } from './agent/providers/providerConnection';
 import { canPickFolder, downloadZip, exportFolder, importFileList, importFolder, importZip, type Imported } from './vfs/transfer';
 import type { Vfs } from './vfs/vfs';
@@ -213,24 +213,24 @@ async function main(): Promise<void> {
     for (const meta of list) projectSelect.append(h('option', { value: meta.id, selected: meta.id === project?.meta.id }, meta.incognito ? `🕶 ${meta.name} (incognito)` : meta.name));
   };
 
-  /** Tell nrob an incognito session has ended: it wipes what it held of it (a model not running is not started for this). */
+  /** Tell OAIY an incognito session has ended: it wipes what it held of it (a model not running is not started for this). */
   async function endIncognitoSession(id: string): Promise<void> {
     const p = activeProvider();
-    if (p?.serverKind !== 'nrob') return;
+    if (p?.serverKind !== 'oaiy') return;
     await fetch(providerEndpoints(p).chat, {
       method: 'POST',
-      headers: { ...providerHeaders(p, true), 'X-NROB-Incognito': '1' },
-      body: JSON.stringify({ nrob_forget_session: id }),
+      headers: { ...providerHeaders(p, true), 'X-OAIY-Incognito': '1' },
+      body: JSON.stringify({ oaiy_forget_session: id }),
       signal: AbortSignal.timeout(20_000),
     }).catch(() => {});
   }
 
-  /** Where nrob answers, so an incognito project's requests to it say so (and only to it). */
-  const registerNrob = () => {
-    for (const p of providers) if (p.serverKind === 'nrob') addNrobOrigin(p.baseUrl);
+  /** Where OAIY answers, so an incognito project's requests to it say so (and only to it). */
+  const registerOaiy = () => {
+    for (const p of providers) if (p.serverKind === 'oaiy') addOaiyOrigin(p.baseUrl);
     if (media.discovered) {
-      addNrobOrigin(media.discovered.origin);
-      addNrobOrigin(media.baseUrl);
+      addOaiyOrigin(media.discovered.origin);
+      addOaiyOrigin(media.baseUrl);
     }
   };
 
@@ -321,14 +321,14 @@ async function main(): Promise<void> {
     // A SoftN app or a web page opens on its preview, so the person sees it being built.
     if (isSoftnProject(project.vfs) || findPages(project.vfs).length) showPane('preview');
     chat.replay(agent.turns);
-    registerNrob();
+    registerOaiy();
     setIncognito(!!meta.incognito, meta.incognito ? meta.id : null);
     showIncognito(!!meta.incognito);
     // The last project reopens after a refresh or a restart, incognito included:
     // incognito stays on until it is turned off.
     await saveLastProject(meta.id);
     if (meta.incognito) {
-      chat.system(`🕶 Incognito is on${reopening ? ', as it was before the app was refreshed or restarted' : ''}. This project, its conversation and every picture, clip and sound made in it are kept only in this app's temporary storage, until you press Clear or turn incognito off, and nrob is told to keep nothing of its requests. Export it (Export .zip, or Export to folder) to keep anything.`);
+      chat.system(`🕶 Incognito is on${reopening ? ', as it was before the app was refreshed or restarted' : ''}. This project, its conversation and every picture, clip and sound made in it are kept only in this app's temporary storage, until you press Clear or turn incognito off, and OAIY is told to keep nothing of its requests. Export it (Export .zip, or Export to folder) to keep anything.`);
     } else {
       lastKept = meta.id;
       await saveLastKeptProject(meta.id);
@@ -336,7 +336,7 @@ async function main(): Promise<void> {
     reopening = false;
     if (leaving) {
       await deleteProject(leaving).catch(() => {});
-      // nrob forgets what it held of the session (in memory only) now, not at its next request.
+      // OAIY forgets what it held of the session (in memory only) now, not at its next request.
       void endIncognitoSession(leaving);
     }
     await renderProjects();
@@ -926,20 +926,20 @@ A project can hold several apps, each in its own folder (any folder whose manife
   const announce = () => tabChannel?.postMessage({ type: 'open', tab: tabId, project: project.meta.id });
 
   /**
-   * nrob on this computer: read its discovery document and set up images,
+   * OAIY on this computer: read its discovery document and set up images,
    * video and chat from it. A service set up by hand is left alone; one found
-   * before is refreshed (its models may have changed). `?nrob=<address>` looks
+   * before is refreshed (its models may have changed). `?OAIY=<address>` looks
    * somewhere else; automated browsers (the tests) only look when asked to.
    */
-  async function lookForNrob(): Promise<void> {
-    const asked = new URLSearchParams(location.search).get('nrob');
-    const where = asked ?? (navigator.webdriver ? null : media.discovered?.origin ?? NROB_ORIGIN);
+  async function lookForOaiy(): Promise<void> {
+    const asked = new URLSearchParams(location.search).get('oaiy');
+    const where = asked ?? (navigator.webdriver ? null : media.discovered?.origin ?? OAIY_ORIGIN);
     if (!where || (media.baseUrl && !media.discovered && !asked)) return;
-    const found = await discoverNrob(where, media.apiKey, undefined, 3000).catch(() => null);
+    const found = await discoverOaiy(where, media.apiKey, undefined, 3000).catch(() => null);
     if (!found || found.state === 'absent') return;
     if (found.state !== 'found') {
-      // nrob is there but closed to this page: say how to open it, once per browser.
-      const told = `bot.computer:nrob-told:${found.origin}:${found.state}`;
+      // OAIY is there but closed to this page: say how to open it, once per browser.
+      const told = `bot.computer:oaiy-told:${found.origin}:${found.state}`;
       try {
         if (localStorage.getItem(told)) return;
         localStorage.setItem(told, '1');
@@ -947,13 +947,13 @@ A project can hold several apps, each in its own folder (any folder whose manife
         /* storage blocked: say it every time */
       }
       chat.system(`${found.message}
-With that done, Settings → Images, video and audio → Find nrob sets it up.`);
+With that done, Settings → Images, video and audio → Find OAIY sets it up.`);
       return;
     }
     const first = !media.discovered;
     media = mergeDiscovered(media, found.media);
     await saveMedia(media);
-    const chatProvider = nrobProvider(providers, found);
+    const chatProvider = oaiyProvider(providers, found);
     if (chatProvider) {
       providers.push(chatProvider);
       activeId ??= chatProvider.id;
@@ -990,8 +990,8 @@ With that done, Settings → Images, video and audio → Find nrob sets it up.`)
   const sandbox = sandboxAvailable();
   if (!sandbox.ok) chat.system(`The code sandbox is unavailable: ${sandbox.reason}.`, 'error');
   else void zippModule().catch((error: unknown) => chat.system(`Could not load the Zipp engine: ${(error as Error).message}`, 'error'));
-  await lookForNrob();
-  if (!activeProvider()) chat.system('Welcome! Set up an AI provider in ⚙ Settings to talk to the agent — a local server (Ollama, LM Studio, nrob) keeps everything on this computer. The editor and terminal work without one.');
+  await lookForOaiy();
+  if (!activeProvider()) chat.system('Welcome! Set up an AI provider in ⚙ Settings to talk to the agent — a local server (Ollama, LM Studio, OAIY) keeps everything on this computer. The editor and terminal work without one.');
   // Leaving the page (closing the tab, reloading, switching away on a phone): save now.
   // pagehide and a hidden page come early enough for the writes to start; the
   // beforeunload prompt covers a run still going.

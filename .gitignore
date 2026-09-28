@@ -31,5 +31,5 @@ Thumbs.db
 desktop.ini
 /media/
 
-# NROB Studio: per-machine configuration
-/nrob-studio.json
+# OAIY: per-machine configuration
+/oaiy-studio.json

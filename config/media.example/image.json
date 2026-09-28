@@ -1,7 +1,7 @@
 {
   "base": "D:\\Qwen-Image-2.1",
-  "transformer": "E:\\deepseek\\nrob\\models\\qwen-image-2.1\\qwen-image-2.1-Q4_K_M.gguf",
-  "adapter": "E:\\deepseek\\nrob\\models\\qwen-image-2.1\\viggle-v0.2.1-r128.safetensors",
+  "transformer": "E:\\deepseek\\oaiy\\models\\qwen-image-2.1\\qwen-image-2.1-Q4_K_M.gguf",
+  "adapter": "E:\\deepseek\\oaiy\\models\\qwen-image-2.1\\viggle-v0.2.1-r128.safetensors",
   "default_weights": "safetensors",
   "enabled": true,
   "default_model": "redqwen21",

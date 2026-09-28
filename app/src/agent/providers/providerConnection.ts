@@ -26,10 +26,10 @@ export const LOCAL_SERVERS: Record<LocalServerKind, { label: string; baseUrl: st
     baseUrl: 'http://localhost:1234',
     help: 'Load a model, then start the server in LM Studio’s Developer tab with “Enable CORS” switched on.',
   },
-  nrob: {
-    label: 'nrob',
+  oaiy: {
+    label: 'OAIY',
     baseUrl: 'http://127.0.0.1:8080',
-    help: 'nrob serves chat, images and video. Without an API key it answers only the pages in gateway.cors_origins in its config: add this site there (or set an API key and enter it here). Settings → Images and video uses the same server.',
+    help: 'OAIY serves chat, images and video. Without an API key it answers only the pages in gateway.cors_origins in its config: add this site there (or set an API key and enter it here). Settings → Images and video uses the same server.',
   },
   other: {
     label: 'Another server',
@@ -225,8 +225,8 @@ export function describeConnectionError(kind: ConnectionErrorKind, context: Erro
       const page = context.pageOrigin ?? 'this site';
       const fix = context.serverKind === 'lmstudio'
         ? 'In LM Studio, open the Developer tab, start the server, and switch on “Enable CORS”.'
-        : context.serverKind === 'nrob'
-          ? `Start nrob, and add ${page} to gateway.cors_origins in its config (or set an API key there and enter it here).`
+        : context.serverKind === 'oaiy'
+          ? `Start OAIY, and add ${page} to gateway.cors_origins in its config (or set an API key there and enter it here).`
           : context.serverKind === 'other'
           ? `Allow requests from ${page} in the server’s CORS settings.`
           : `For Ollama, quit it and start it again with OLLAMA_ORIGINS set to include ${page} (for example OLLAMA_ORIGINS="${page}" ollama serve). LM Studio has an “Enable CORS” switch in its server settings.`;
@@ -347,7 +347,7 @@ function readModelList(body: unknown): ModelInfo[] | null {
   const models: ModelInfo[] = [];
   for (const item of body.data) {
     if (!isRecord(item) || typeof item.id !== 'string' || !item.id.trim()) continue;
-    // nrob lists its image, video, speech, music, sound effects and 3D models here too, typed: they cannot chat.
+    // OAIY lists its image, video, speech, music, sound effects and 3D models here too, typed: they cannot chat.
     if (item.type === 'image' || item.type === 'video' || item.type === 'speech' || item.type === 'music' || item.type === 'sound' || item.type === 'model3d') continue;
     models.push({
       id: item.id,

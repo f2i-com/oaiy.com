@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use cudarc::driver::{sys, CudaContext};
-use nrob::{Error, Result};
+use oaiy_engine::{Error, Result};
 
 use crate::gpu::{cu, Gpu};
 

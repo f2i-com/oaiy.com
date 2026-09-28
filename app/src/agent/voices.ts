@@ -6,7 +6,7 @@
  * the names they are saved under are kept in `.botcomputer/voices.json`, so a
  * later chat in the same project speaks in the same voices.
  *
- * A service that can (nrob) hands a new voice back instead of keeping it: the
+ * A service that can (OAIY) hands a new voice back instead of keeping it: the
  * project keeps it (`voices/NAME.json`, and its sample `voices/NAME.wav`), and
  * sends it with every line spoken in it. Such voices go wherever the project
  * goes, and need nothing kept on the service (incognito included).
@@ -117,7 +117,7 @@ export function serviceVoice(voices: ProjectVoices, name: string | undefined): s
 /**
  * The saved voices this project can use, by the names the agent knows: its
  * own under their short names, and voices saved without a project key (made
- * in nrob Studio, say). Other projects' voices are left out.
+ * in OAIY Studio, say). Other projects' voices are left out.
  */
 export function projectVoiceList(voices: ProjectVoices, saved: VoiceInfo[]): VoiceInfo[] {
   const byService = new Map(Object.entries(voices.voices).map(([mine, service]) => [service, mine]));

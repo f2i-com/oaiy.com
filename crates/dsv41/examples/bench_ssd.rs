@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use dsv41::expert::{SafetensorsExpertStore, RECORD_BYTES};
-use nrob::store::WeightStore;
+use oaiy_engine::store::WeightStore;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();

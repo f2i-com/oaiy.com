@@ -1,11 +1,11 @@
 NOTICE
 ======
 
-nrob — NVMe · RAM · On-GPU · Broker
+OAIY — Orchestrate AI Yourself
 Copyright 2026 F2i
 
-The crates under crates/nrob, crates/nrob-cli, crates/nrob-image,
-crates/nrob-server, crates/dsv41 and crates/dsv41-cuda are licensed under
+The crates under crates/oaiy-engine, crates/oaiy-llm-cli, crates/oaiy-image,
+crates/oaiy-llm-server, crates/dsv41 and crates/dsv41-cuda are licensed under
 the Apache License, Version 2.0 (see LICENSE-APACHE).
 
 crates/dsv41 and crates/dsv41-cuda implement DeepSeek-V4.1 following
@@ -15,7 +15,7 @@ encoding rule for rule, including its prompt templates. That reference
 code and the model weights are published by DeepSeek under the MIT
 License.
 
-crates/nrob-image decodes and resizes images to the same pixels as Pillow,
+crates/oaiy-image decodes and resizes images to the same pixels as Pillow,
 which the reference model's preprocessing uses. Its code is written from
 scratch, but it follows Pillow's resampling arithmetic (libImaging/
 Resample.c; Pillow is under the MIT-CMU license, Copyright (c) 1997-2011 by

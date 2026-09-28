@@ -1,7 +1,7 @@
 //! Parse a saved response only; does not execute any tools or load a model.
 use dsv41::chat::{Mode,StreamParser};
-use nrob::json::Json;
-fn main() -> nrob::Result<()> {
+use oaiy_engine::json::Json;
+fn main() -> oaiy_engine::Result<()> {
     let path=std::env::args().nth(1).expect("TEXT_FILE");
     let text=std::fs::read_to_string(path)?;
     let mut p=StreamParser::new(Mode::Chat);

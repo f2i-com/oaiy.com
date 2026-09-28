@@ -1,6 +1,6 @@
 # Native LTX video
 
-The `nrob-diffusion` worker implements text-to-video and image-to-video with optional start/end images for distilled
+The `oaiy-media` worker implements text-to-video and image-to-video with optional start/end images for distilled
 LTX 2.3, LTX 2.5 and Sulphur-2 checkpoints in Rust. Clips also get a
 soundtrack generated with the picture (see [Audio](#audio)). Candle supplies tensor
 operations and CUDA kernels. Gemma text encoding, the video transformer,
@@ -72,8 +72,8 @@ available in the linked repositories.
 Use the same CUDA worker and server build as [Qwen Image](QWEN_IMAGE.md):
 
 ```sh
-cargo build --release -p nrob-diffusion --features flash-attn
-cargo build --release -p nrob-server
+cargo build --release -p oaiy-media --features flash-attn
+cargo build --release -p oaiy-llm-server
 ```
 
 Install FFmpeg with `libx264` support. Copy `config/ltx-video.example.json` to
@@ -81,11 +81,11 @@ Install FFmpeg with `libx264` support. Copy `config/ltx-video.example.json` to
 path as `video_config` in the existing image/controller configuration:
 
 ```json
-"video_config": "E:/deepseek/nrob/config/ltx-video.local.json"
+"video_config": "E:/repos/oaiy/config/ltx-video.local.json"
 ```
 
-Start NROB with that `--image-config`, or use coder-cli's existing
-`[nrob].image_config` setting. The same lightweight controller handoff applies:
+Start OAIY with that `--image-config`, or use coder-cli's existing
+`[oaiy].image_config` setting. The same lightweight controller handoff applies:
 DeepSeek is unloaded before the configured Qwen controller is selected, and the
 video worker runs on the other configured GPU. Image and video jobs share one
 queue so their GPU allocations cannot overlap. A standalone worker can use one
@@ -481,10 +481,10 @@ accumulated differences rather than only checking final velocities.
 LTX 2.5 convolutional VAE pixels differed by 1.44%.
 These compare numerical components, not end-to-end video quality.
 
-Set `NROB_LTX_GOLDEN`, `NROB_LTX_GEMMA`, `NROB_LTX_GEMMA4`, `NROB_LTX_CHECKPOINT`, `NROB_LTX_VAE`,
-and optionally `NROB_LTX_TEST_DEVICE` before running the ignored tests:
+Set `OAIY_LTX_GOLDEN`, `OAIY_LTX_GEMMA`, `OAIY_LTX_GEMMA4`, `OAIY_LTX_CHECKPOINT`, `OAIY_LTX_VAE`,
+and optionally `OAIY_LTX_TEST_DEVICE` before running the ignored tests:
 
 ```sh
-cargo test --release -p nrob-diffusion --features flash-attn --lib ltx:: -- --include-ignored --test-threads=1
-cargo test --release -p nrob-diffusion --features flash-attn --test ltx -- --include-ignored --test-threads=1
+cargo test --release -p oaiy-media --features flash-attn --lib ltx:: -- --include-ignored --test-threads=1
+cargo test --release -p oaiy-media --features flash-attn --test ltx -- --include-ignored --test-threads=1
 ```
