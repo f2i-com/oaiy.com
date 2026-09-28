@@ -213,6 +213,11 @@ export class Speech {
     this.buffer = '';
   }
 
+  /** Sentences the caller never heard (cut off before they played): when they come again, they are said. */
+  unsay(lines: string[]): void {
+    for (const line of lines) this.said.delete(sayKey(line));
+  }
+
   /** Everything queued has been sent to be spoken. */
   get done(): Promise<void> {
     return this.chain;
@@ -229,7 +234,7 @@ export class Speech {
     } else this.fillerOk = false;
     // A sentence of a few words already said on this call is not said again (a model repeats itself;
     // a short "Sure!" or "Okay." may come again).
-    const key = clean.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
+    const key = sayKey(clean);
     if (key.split(' ').length >= 4) {
       if (this.said.has(key)) {
         this.repeated.push(clean);
@@ -245,6 +250,11 @@ export class Speech {
     this.reply.push(clean);
     this.chain = this.chain.then(() => (this.hushed ? undefined : this.say(clean))).catch((e: unknown) => this.failed((e as Error).message));
   }
+}
+
+/** A sentence as it is compared with what was said before: its words, in lower case. */
+function sayKey(sentence: string): string {
+  return sentence.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
 }
 
 /** A sentence that is only a filler word or two: "Sure!", "Great!", "Happy to!", "Of course!". */
@@ -272,7 +282,7 @@ export function tidyReplies(turns: Turn[]): void {
     const kept: string[] = [];
     for (const [n, line] of sentences(t.text).entries()) {
       const clean = spoken(line);
-      const key = clean.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
+      const key = sayKey(clean);
       if (isFiller(clean) && !(opens && n === 0)) continue;
       if (key.split(' ').length >= 4) {
         if (said.has(key)) continue;
@@ -889,6 +899,8 @@ export class Sessions {
         if (typeof event.atMs === 'number') session.cutAtMs = event.atMs;
         session.speech?.hush();
         if (!session.inTool) session.controller?.abort();
+        // A reply is written faster than it is spoken: one whose run has ended may still have been playing.
+        if (!session.running) await this.cutAfterRun(session);
         break;
       case 'call.ended':
         await this.endCall(session);
@@ -908,6 +920,25 @@ export class Sessions {
     session.agent.turns.push({ role: 'user', text: '[OAIY] 📞 The call ended.', automatic: true });
     await this.save(session);
     this.hooks.changed();
+  }
+
+  /**
+   * The caller cut in on a reply whose run had ended: it stays in the
+   * conversation as far as they heard it (the sentences that had begun
+   * playing), and the rest may be said again.
+   */
+  private async cutAfterRun(session: Session): Promise<void> {
+    const cutAt = session.cutAtMs;
+    session.cutAtMs = undefined;
+    const last = session.agent.turns.at(-1);
+    const reply = session.speech?.reply ?? [];
+    // Nothing known of when it played (no call.said): kept whole, as a run cut off keeps it.
+    if (cutAt === undefined || last?.role !== 'assistant' || last.calls.length || !reply.length || !session.played?.length) return;
+    const heard = reply.filter((line) => session.played!.some((p) => p.text === line && p.startMs < cutAt));
+    if (heard.length === reply.length) return;
+    session.speech?.unsay(reply.filter((line) => !heard.includes(line)));
+    last.text = heard.length ? `${heard.join(' ')}…` : '';
+    await this.save(session);
   }
 
   private noteEnded(callId: string, session: Session | null): void {
@@ -1145,6 +1176,8 @@ export class Sessions {
       const cutAt = session.cutAtMs;
       const playedBy = (line: string) => cutAt === undefined || !session.played?.length || session.played.some((p) => p.text === line && p.startMs < cutAt);
       const heard = (session.speech?.reply ?? []).filter(playedBy).join(' ');
+      // What was cut off before it played was never heard: it may be said again.
+      if (controller.signal.aborted && cutAt !== undefined) session.speech?.unsay((session.speech?.reply ?? []).filter((line) => !playedBy(line)));
       session.cutAtMs = undefined;
       if (controller.signal.aborted && heard && session.agent.turns.at(-1)?.role !== 'assistant') session.agent.turns.push({ role: 'assistant', text: `${heard}…`, calls: [] });
       if (session.speech) tidyReplies(session.agent.view());

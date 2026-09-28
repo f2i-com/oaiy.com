@@ -641,6 +641,52 @@ describe('a phone call answered by the agent', () => {
     expect(fake.bodies).toHaveLength(2);
   });
 
+  it('a reply written already, and cut off as it played, stays as far as it was heard, and the rest may be said again', async () => {
+    const fake = fakeProvider('openai', [
+      { text: 'We are open from nine. We close at five on weekdays.' },
+      (body) => {
+        const sent = JSON.stringify(body.messages);
+        expect(sent).toContain('We are open from nine.…');
+        expect(sent).not.toContain('We close at five on weekdays.');
+        return { text: 'Sure. We close at five on weekdays.' };
+      },
+    ]);
+    const { sessions, calls } = setup();
+    await sessions.callEvent({ type: 'call.started', callId: 'call_p', from: '+61400000024' });
+    await sessions.callEvent({ type: 'call.caller', callId: 'call_p', text: 'When are you open?' });
+    await settled(sessions);
+    // Written at once, spoken over seconds: the caller cuts in before the second sentence plays.
+    await sessions.callEvent({ type: 'call.said', callId: 'call_p', itemId: 'out_1', text: 'We are open from nine.', startMs: 8_000, endMs: 9_600 });
+    await sessions.callEvent({ type: 'call.said', callId: 'call_p', itemId: 'out_1', text: 'We close at five on weekdays.', startMs: 9_600, endMs: 11_500 });
+    await sessions.callEvent({ type: 'call.interrupted', callId: 'call_p', itemId: 'out_1', atMs: 9_400 });
+    await sessions.callEvent({ type: 'call.caller', callId: 'call_p', text: 'Sorry, and closing?', startMs: 9_000, endMs: 10_000, over: true, cut: true, backchannel: false });
+    await settled(sessions);
+    expect(fake.bodies).toHaveLength(2);
+    // Never heard, so not held back as said before.
+    expect(calls.filter((c) => c[0] === 'say').map((c) => c[2])).toEqual(['We are open from nine.', 'We close at five on weekdays.', 'Sure.', 'We close at five on weekdays.']);
+  });
+
+  it('a sentence cut off before it played, while the reply was still written, may be said again', async () => {
+    let cut!: () => void;
+    const cutNow = new Promise<void>((r) => (cut = r));
+    fakeProvider('openai', [
+      { text: 'We are open from nine. We close at five on weekdays. And on Sundays we rest.', hold: { at: 53, until: cutNow } },
+      { text: 'Sure. We close at five on weekdays.' },
+    ]);
+    const { sessions, calls } = setup();
+    await sessions.callEvent({ type: 'call.started', callId: 'call_r', from: '+61400000025' });
+    await sessions.callEvent({ type: 'call.caller', callId: 'call_r', text: 'When are you open?' });
+    for (let i = 0; i < 100 && calls.filter((c) => c[0] === 'say').length < 2; i++) await new Promise((r) => setTimeout(r, 10));
+    await sessions.callEvent({ type: 'call.said', callId: 'call_r', itemId: 'out_1', text: 'We are open from nine.', startMs: 8_000, endMs: 9_600 });
+    await sessions.callEvent({ type: 'call.said', callId: 'call_r', itemId: 'out_1', text: 'We close at five on weekdays.', startMs: 9_600, endMs: 11_500 });
+    await sessions.callEvent({ type: 'call.interrupted', callId: 'call_r', itemId: 'out_1', atMs: 9_400 });
+    cut();
+    await settled(sessions);
+    await sessions.callEvent({ type: 'call.caller', callId: 'call_r', text: 'And closing?', startMs: 9_000, endMs: 9_900, over: true, cut: true, backchannel: false });
+    await settled(sessions);
+    expect(calls.filter((c) => c[0] === 'say').map((c) => c[2])).toEqual(['We are open from nine.', 'We close at five on weekdays.', 'Sure.', 'We close at five on weekdays.']);
+  });
+
   it('a tool that takes a while gets a short line said, once, when nothing has been said', async () => {
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
     try {
