@@ -600,6 +600,41 @@ details.msg.compacted pre { white-space: pre-wrap; font-size: 12px; max-height: 
 .in-oaiy .topbar.menu-open .actions button:hover { background: var(--panel-2); border-color: var(--border); }
 .in-oaiy .project-select { max-width: 260px; }
 
+/* In OAIY's window the Agent is one of the dashboard's pages: its chips are the
+   dashboard's pills, its pane tabs and its narrow-window pane switcher are the
+   dashboard's segmented tabs, and the type stays the desktop's size. */
+.in-oaiy .topbar { min-height: 50px; }
+.in-oaiy .topbar > button, .in-oaiy .topbar > select { height: 32px; }
+.in-oaiy .chip { display: inline-flex; align-items: center; height: 30px; border-radius: 999px; background: transparent; padding: 0 11px; font-size: 12px; white-space: nowrap; }
+.in-oaiy .chip.toggle { padding-left: 25px; }
+.in-oaiy .chip.toggle::before { left: 10px; width: 8px; height: 8px; margin-top: -4px; }
+.in-oaiy .chip:hover { background: var(--panel-2); }
+.in-oaiy .settings-button { width: 32px; padding: 0; border-color: transparent; background: transparent; color: var(--muted); font-size: 15px; }
+.in-oaiy .settings-button:hover { border-color: var(--border); background: var(--panel-2); color: var(--text); }
+.in-oaiy .settings-button .label { display: none; }
+.in-oaiy .center-tabs { gap: 2px; padding: 5px 8px; }
+.in-oaiy .center-tabs button { border: 0; border-radius: 6px; padding: 3px 12px; color: var(--muted); font-size: 12.5px; font-weight: 600; }
+.in-oaiy .center-tabs button:hover { background: var(--panel-2); color: var(--text); }
+.in-oaiy .center-tabs button.active { background: color-mix(in srgb, var(--accent) 14%, transparent); color: var(--accent); box-shadow: none; }
+.in-oaiy .pane-title { letter-spacing: 0.08em; font-size: 11px; font-weight: 650; }
+/* The message box grows; its buttons stay button-sized, at its foot. */
+.in-oaiy .chat-compose { align-items: flex-end; }
+.in-oaiy .chat-compose > button { min-height: 0; height: 36px; }
+.in-oaiy .chat-compose > button.primary { padding: 0 16px; }
+@media (max-width: 900px) {
+  /* A desktop window, not a phone: no zoom-proof 16px type, and the pane switcher at the top, under the bar. */
+  .in-oaiy body { font-size: 14px; }
+  .in-oaiy input, .in-oaiy select, .in-oaiy textarea, .in-oaiy .term-input, .in-oaiy .chat-input { font-size: 13.5px; }
+  .in-oaiy #app > .topbar { order: 0; }
+  .in-oaiy #app > .tabs { order: 1; gap: 2px; margin: 6px 10px; padding: 3px; border: 1px solid var(--border); border-radius: 10px; background: var(--bg); align-self: flex-start; }
+  .in-oaiy #app > .workspace { order: 2; border-top: 1px solid var(--border); }
+  .in-oaiy .tabs button { flex: none; min-height: 28px; padding: 0 14px; border-radius: 7px; font-size: 12.5px; font-weight: 600; }
+  .in-oaiy .tabs button:hover { background: var(--panel-2); color: var(--text); }
+  .in-oaiy .tabs button.active { background: color-mix(in srgb, var(--accent) 14%, transparent); color: var(--accent); box-shadow: none; }
+  .in-oaiy .chip { max-width: 30vw; }
+  .in-oaiy .topbar > button, .in-oaiy .topbar > select { min-height: 0; }
+}
+
 /* A call or text conversation that has finished can be closed. */
 .session-close { margin-left: 2px; padding: 0 3px; border-radius: 50%; color: var(--muted); line-height: 1; cursor: pointer; }
 .session-close:hover { color: var(--text); background: var(--panel-2); }
