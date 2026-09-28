@@ -260,7 +260,8 @@ async function main(): Promise<void> {
     const list = (await listProjects()).filter((m) => !m.incognito || m.id === project?.meta.id);
     clear(projectSelect);
     // The Front desk first: the phone's runner, whose sub-agents answer calls, texts and flows' tasks.
-    if (frontDesk) projectSelect.append(h('option', { value: FRONT_DESK.id, selected: project === frontDesk, title: "The phone's agents: calls, texts and flows' tasks" }, `📞 ${frontDesk.meta.name}`));
+    // Only with a phone to answer: OAIY Desktop connected.
+    if (frontDesk && (desktop || project === frontDesk)) projectSelect.append(h('option', { value: FRONT_DESK.id, selected: project === frontDesk, title: "The phone's agents: calls, texts and flows' tasks" }, `📞 ${frontDesk.meta.name}`));
     for (const meta of list) projectSelect.append(h('option', { value: meta.id, selected: meta.id === project?.meta.id }, meta.incognito ? `🕶 ${meta.name} (incognito)` : meta.name));
   };
 
