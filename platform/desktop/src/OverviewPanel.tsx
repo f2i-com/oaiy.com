@@ -13,6 +13,7 @@ import {
 } from 'lucide-react';
 import { peek, put } from './useCached';
 import SetupGuidePanel from './SetupGuidePanel';
+import TodayPanel from './TodayPanel';
 import { dismissGuide, reopenGuide, shouldAutoOpen } from './setupGuide';
 import type { StepTarget } from './setupGuide';
 import {
@@ -43,6 +44,9 @@ import {
 const POLL_MS = 4000;
 
 export type OverviewNav =
+  | 'agent'
+  | 'calendar'
+  | 'engines'
   | 'services'
   | 'plugins'
   | 'runs'
@@ -169,6 +173,7 @@ export default function OverviewPanel({ onNavigate, onOpenPluginScreen }: Props)
           <button className="btn" onClick={() => void refresh()}>Refresh status</button>
         </div>
       )}
+      <TodayPanel onNavigate={onNavigate} />
       {guideOpen && (
         <SetupGuidePanel
           codexConnected={codexConnected}

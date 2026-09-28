@@ -1182,3 +1182,29 @@ export const calendar = {
       body: JSON.stringify({ command: 'sms.send', payload: { to, body }, idempotencyKey: `oaiy-calendar-${Date.now()}-${Math.random().toString(36).slice(2)}` }),
     }),
 };
+
+// ----- the engines and the phone, for Overview -----
+
+export interface EnginesStatus {
+  running: boolean;
+  uiUrl?: string;
+  llm?: { state: string | null; resident: string | null; models: string[] | null; loadSeconds: number | null };
+  gpus?: Array<{ index: number; name: string; memory_used_mb: number; memory_total_mb: number }> | null;
+}
+
+export const engines = {
+  status: () => request<EnginesStatus>('/api/engines'),
+};
+
+export const phone = {
+  /** Whether Aokie has the phone connected. */
+  status: async () => {
+    const r = await request<{ result?: { data?: { connected?: boolean } } }>('/api/bridge/connectors/aokie/request', {
+      method: 'POST',
+      body: JSON.stringify({ command: 'phone.status', payload: {}, idempotencyKey: `oaiy-overview-${Date.now()}` }),
+    });
+    return { connected: !!r?.result?.data?.connected };
+  },
+  /** The calls live now. */
+  calls: async () => (await request<{ calls: unknown[] }>('/api/voice/calls')).calls ?? [],
+};

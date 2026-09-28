@@ -1783,3 +1783,9 @@ select:disabled { cursor: not-allowed; opacity: 0.5; }
 @media (max-width: 1240px) {
   .sidebar nav .nav-group { visibility: hidden; height: 6px; margin: 6px 0 0; }
 }
+
+/* Overview's Today tiles: a state in colour. */
+.today-grid .overview-tile strong.ok { color: var(--green); }
+.today-grid .overview-tile strong.warn { color: var(--amber); }
+.today-grid { grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); }
+.today-grid .overview-tile strong { font-size: 20px; line-height: 1.25; }

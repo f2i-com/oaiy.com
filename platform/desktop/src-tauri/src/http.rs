@@ -755,6 +755,48 @@ fn is_privileged_path(method: &Method, path: &str) -> bool {
     }
 }
 
+/// Where the engines' control pages are, once the desktop found or started them (see `engines.rs`).
+static ENGINES_UI: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
+
+pub fn set_engines_ui(url: &str) {
+    if let Ok(mut g) = ENGINES_UI.write() {
+        *g = Some(url.to_string());
+    }
+}
+
+/// `GET /api/engines`: the engines' state for the window — the language model
+/// (loaded or not, which one), the GPUs, where their pages are. Their control
+/// port answers only its own origin, so the desktop asks it for the window.
+async fn engines_status() -> axum::response::Response {
+    let Some(ui) = ENGINES_UI.read().ok().and_then(|g| g.clone()) else {
+        return Json(serde_json::json!({ "running": false })).into_response();
+    };
+    let state = match reqwest::Client::new().get(format!("{ui}/api/state")).timeout(std::time::Duration::from_secs(5)).send().await {
+        Ok(r) if r.status().is_success() => r.json::<serde_json::Value>().await.ok(),
+        _ => None,
+    };
+    let Some(state) = state else {
+        return Json(serde_json::json!({ "running": false, "uiUrl": ui })).into_response();
+    };
+    let llm = state.get("llm").cloned().unwrap_or(serde_json::Value::Null);
+    let system = match reqwest::Client::new().get(format!("{ui}/api/system")).timeout(std::time::Duration::from_secs(5)).send().await {
+        Ok(r) if r.status().is_success() => r.json::<serde_json::Value>().await.unwrap_or(serde_json::Value::Null),
+        _ => serde_json::Value::Null,
+    };
+    Json(serde_json::json!({
+        "running": true,
+        "uiUrl": ui,
+        "llm": {
+            "state": llm.get("state"),
+            "resident": llm.get("resident"),
+            "models": llm.get("models"),
+            "loadSeconds": llm.get("load_seconds"),
+        },
+        "gpus": system.get("gpus"),
+    }))
+    .into_response()
+}
+
 /// Calls and the calendar: callers' numbers and words, customers' names and
 /// appointments. Reading them is a restricted read; changing them (speaking on
 /// a live call, booking or deleting an appointment) takes the privileged gate.
@@ -886,6 +928,8 @@ fn is_restricted_read_path(path: &str) -> bool {
         // arbitrary remote page; a paired token or a trusted origin passes.
         || path.starts_with("/api/ai/")
         || is_personal_path(path)
+        // Which models are loaded, the GPUs, the engines' address.
+        || path == "/api/engines"
 }
 
 /// Stricter allow-list for privileged endpoints: OAIY Desktop's OWN webview and
@@ -1276,6 +1320,7 @@ pub async fn serve(
         .merge(bridge_routes)
         .merge(voice_routes)
         .merge(crate::calendar::routes::router())
+        .route("/api/engines", axum::routing::get(engines_status))
         .merge(companion_routes)
         .merge(link_routes)
         .merge(ai_routes)

@@ -85,6 +85,7 @@ fn start_with(data_dir: &Path, m: Mode) -> Result<String, String> {
     let args = oaiy_studio::Args { config: config.clone(), open: Some("none".into()), ui_port: None, port: None, start_llm: false };
     if let Some(url) = oaiy_studio::running_instance(&args) {
         log::info!("engines: using the ones already running at {url}");
+        crate::http::set_engines_ui(&url);
         let _ = UI_URL.set(url.clone());
         return Ok(url);
     }
@@ -94,6 +95,7 @@ fn start_with(data_dir: &Path, m: Mode) -> Result<String, String> {
     let running = oaiy_studio::launch(&args, true)?;
     let url = running.ui_url.clone();
     log::info!("engines: started (control pages {url}, gateway {})", running.gateway_url);
+    crate::http::set_engines_ui(&url);
     let _ = UI_URL.set(url.clone());
     *RUNNING.lock().unwrap_or_else(|e| e.into_inner()) = Some(running);
     Ok(url)
