@@ -7,7 +7,7 @@ import { NetGate } from './gate/netgate';
 import { sandboxAvailable, zippModule } from './sandbox/runner';
 import { loadSettings, saveAgentSettings, saveDesktop, saveGate, saveLastKeptProject, saveLastProject, saveMedia, saveMessages, saveProviders } from './settings';
 import { Desktop } from './desktop/bridge';
-import { DesktopEvents, Sessions, TEST_NUMBER } from './sessions';
+import { DesktopEvents, Sessions, TEST_NUMBER, phoneConversationsTool } from './sessions';
 import { flowSessionTools, flowToolHooks, readFlowStore } from './desktop/flowTools';
 import { TRANSCRIBE_TOOL, transcribeTool } from './desktop/transcribe';
 import { calendarTools } from './desktop/calendarTools';
@@ -34,7 +34,7 @@ import { imageForMessage, imageMimeFor, type ImagePart } from './agent/images';
 import type { Attachment } from './agent/protocol';
 import { flagPicture } from './agent/review';
 import { FileTree } from './ui/tree';
-import { OpenProject, clearIncognito, createProject, deleteProject, listProjects, renameProject, type ProjectMeta } from './vfs/projects';
+import { FRONT_DESK, FRONT_DESK_BRIEF, OpenProject, clearIncognito, createProject, deleteProject, listProjects, renameProject, type ProjectMeta } from './vfs/projects';
 import { addOaiyOrigin, setIncognito } from './privacy';
 import { providerEndpoints, providerHeaders } from './agent/providers/providerConnection';
 import { canPickFolder, downloadZip, exportFolder, importFileList, importFolder, importZip, type Imported } from './vfs/transfer';
@@ -257,6 +257,8 @@ async function main(): Promise<void> {
     // An incognito project shows only while it is open.
     const list = (await listProjects()).filter((m) => !m.incognito || m.id === project?.meta.id);
     clear(projectSelect);
+    // The Front desk first: the phone's runner, whose sub-agents answer calls, texts and flows' tasks.
+    if (frontDesk) projectSelect.append(h('option', { value: FRONT_DESK.id, selected: project === frontDesk, title: "The phone's agents: calls, texts and flows' tasks" }, `📞 ${frontDesk.meta.name}`));
     for (const meta of list) projectSelect.append(h('option', { value: meta.id, selected: meta.id === project?.meta.id }, meta.incognito ? `🕶 ${meta.name} (incognito)` : meta.name));
   };
 
@@ -325,10 +327,14 @@ async function main(): Promise<void> {
     const transcribe = transcribeTool(() => place().vfs, () => desktop);
     const calendar = calendarTools(() => desktop);
     const flowBuilder = flowBuilderTools(() => desktop);
+    const phone = phoneConversationsTool(() => sessions);
+    // The project's own agent in the Front desk is the phone's runner.
+    const runner = () => withPreview && place() === frontDesk;
     return (): AgentOptions => ({
       // Flows made tools, and speech to text: both run on OAIY Desktop.
       // The calendar's tools only while there is one (the phone receptionist is installed).
-      sessionTools: () => (desktop ? [...flowTools, transcribe, ...(calendarAvailable ? calendar : []), ...flowBuilder] : flowTools),
+      sessionTools: () => [...(desktop ? [...flowTools, transcribe, ...(calendarAvailable ? calendar : []), ...flowBuilder] : flowTools), ...(runner() ? [phone] : [])],
+      instructions: () => (runner() ? RUNNER_INSTRUCTIONS : ''),
       toolHooks: () => toolHooks,
       vfs: place().vfs,
       gate,
@@ -350,6 +356,12 @@ async function main(): Promise<void> {
       },
     });
   };
+  /** What the Front desk's own agent is for: it directs the phone's sub-agents. */
+  const RUNNER_INSTRUCTIONS = [
+    "This project is the Front desk, and you are the phone's runner. Each call, text-message thread and flow task is answered by a sub-agent of yours, in a conversation of its own (the tabs beside this one): each has its own context, reads this project's files but cannot change them, and takes its direction from /brief.md before every reply.",
+    'You keep that direction. When your person tells you what callers or texters should hear, be offered, or not be promised, update /brief.md: short, current and plain, with anything out of date taken out. Put lasting facts (services explained, prices, areas served, answers to common questions) in files under /knowledge. Files your person attaches are kept in /uploads, where the sub-agents read them too.',
+    'To see what the phone\'s agents said and did, use phone_conversations (the list, or one conversation). Opening hours and services come from the Calendar, not from files.',
+  ].join('\n');
   const projectOptions = optionsFor(() => project, true);
   const deskOptions = optionsFor(() => frontDesk, false);
 
@@ -377,6 +389,8 @@ async function main(): Promise<void> {
           if (event.type === 'tool_result') void own.save(session).catch(() => {});
         },
       },
+      // Every call, text and task goes by the runner's brief.
+      () => (frontDesk.vfs.exists(FRONT_DESK_BRIEF) ? frontDesk.vfs.readText(FRONT_DESK_BRIEF) : ''),
     ));
     await own.load();
   }
@@ -388,12 +402,16 @@ async function main(): Promise<void> {
     const leaving = project?.meta.incognito ? project.meta.id : null;
     if (project) {
       editor.flush();
-      await project.close();
+      // The Front desk stays open for the phone: it is saved, not closed.
+      if (project === frontDesk) await project.flush();
+      else await project.close();
       await project.saveChat(agent.savedTurns());
       unsubscribe?.();
     }
-    project = await OpenProject.open(meta);
-    project.onError = notice;
+    project = meta.id === FRONT_DESK.id ? frontDesk : await OpenProject.open(meta);
+    if (project !== frontDesk) project.onError = notice;
+    // The Front desk is not renamed or deleted.
+    renameButton.disabled = deleteButton.disabled = project === frontDesk;
     const agentOptions = projectOptions;
     agent = new Agent(agentOptions());
     agent.turns = await project.loadChat();
@@ -874,9 +892,19 @@ A project can hold several apps, each in its own folder (any folder whose manife
     await openProject(kept.find((m) => m.id === lastKept) ?? kept[0] ?? (await createProject('untitled')));
   }
 
+  const renameButton = h('button', { title: 'Rename this project', onclick: async () => {
+    if (project === frontDesk) return;
+    const name = await askText({ title: 'Rename project', label: 'Project name', value: project.meta.name, ok: 'Rename' });
+    if (name && name !== project.meta.name) {
+      project.meta = await renameProject(project.meta, name);
+      await renderProjects();
+    }
+  } }, 'Rename') as HTMLButtonElement;
+
   // Delete, or in incognito Clear: the temporary project is wiped and a fresh one opens, incognito staying on.
   const deleteButton = h('button.danger.delete-toggle', { onclick: () => void deleteOrClear() }, 'Delete');
   async function deleteOrClear(): Promise<void> {
+    if (project === frontDesk) return;
     if (project.meta.incognito) {
       if (controller && !(await confirmAction({ title: 'Stop the agent?', message: 'The agent is still working. Clearing stops it and deletes what it made.', ok: 'Stop and clear' }))) return;
       if (!(await confirmAction({ title: 'Clear incognito?', message: 'Everything in this incognito project is deleted now: its files, pictures, clips and sounds, and the conversation. Incognito stays on, with a fresh empty project. Export it first to keep anything.', ok: 'Clear', danger: true }))) return;
@@ -928,13 +956,7 @@ A project can hold several apps, each in its own folder (any folder whose manife
     h('button', { title: 'Start a SoftN app: from a starter, a blank page or an example; in a new project or a folder of this one', onclick: () => newSoftnApp().catch((error: unknown) => chat.system(`Could not start the app: ${(error as Error).message}`, 'error')) }, 'New SoftN app'),
     h('button', { title: 'Unpack a .softn file into a folder of this project', onclick: () => importSoftnFile() }, 'Import .softn…'),
     h('button', { title: 'Download the SoftN app in the preview as a .softn file', onclick: () => void exportSoftn() }, 'Export .softn'),
-    h('button', { title: 'Rename this project', onclick: async () => {
-      const name = await askText({ title: 'Rename project', label: 'Project name', value: project.meta.name, ok: 'Rename' });
-      if (name && name !== project.meta.name) {
-        project.meta = await renameProject(project.meta, name);
-        await renderProjects();
-      }
-    } }, 'Rename'),
+    renameButton,
     deleteButton,
   );
   const header = h(
@@ -951,7 +973,7 @@ A project can hold several apps, each in its own folder (any folder whose manife
     h('button.settings-button', { title: 'AI providers', 'aria-label': 'Settings', onclick: () => void editSettings() }, '⚙', h('span.label', ' Settings')),
   );
   projectSelect.addEventListener('change', async () => {
-    const meta = (await listProjects()).find((m) => m.id === projectSelect.value);
+    const meta = projectSelect.value === FRONT_DESK.id ? frontDesk.meta : (await listProjects()).find((m) => m.id === projectSelect.value);
     if (!meta) return;
     if (!(await mayLeaveRun())) {
       projectSelect.value = project.meta.id;
@@ -1347,7 +1369,7 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
   await openFrontDesk();
   reopening = true;
   const all = await listProjects();
-  let meta = all.find((m) => m.id === settings.lastProjectId) ?? all[0];
+  let meta = settings.lastProjectId === FRONT_DESK.id ? frontDesk.meta : (all.find((m) => m.id === settings.lastProjectId) ?? all[0]);
   if (!meta) {
     meta = await createProject('Welcome');
     await openProject(meta);

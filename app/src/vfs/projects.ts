@@ -96,12 +96,25 @@ function safeName(id: string): string {
 export const FRONT_DESK = { id: 'front-desk', name: 'Front desk' } as const;
 /** What the front desk is for, in its files. */
 export const FRONT_DESK_NOTE = '/knowledge/README.md';
+/** The runner's direction to the phone's agents: every call, text and task reads it before each reply. */
+export const FRONT_DESK_BRIEF = '/brief.md';
+const FRONT_DESK_BRIEF_TEXT = `# The brief
+
+What every call, text and flow task should go by right now. The phone's agents
+read this before each reply, before anything a caller asks. The Front desk's
+own agent keeps it up to date: tell it things like "this week, tell callers
+we're booked until Friday" or "don't quote prices for jobs over a day".
+
+- Nothing special for now.
+`;
 const FRONT_DESK_README = `# The front desk
 
-The phone's agent works here: it answers your calls and text messages, each
-caller in a conversation of their own, and does the tasks your flows give it.
+The phone's agents work here: each call, text-message thread and flow task is
+answered by a sub-agent in a conversation of its own, and they all take their
+direction from \`/brief.md\`, which the Front desk's main agent keeps (open the
+Front desk in the project list and tell it what the phone should know).
 
-Put what it should know about your business in this \`knowledge\` folder, as
+Put what they should know about your business in this \`knowledge\` folder, as
 plain text or Markdown files: what you offer and what it costs, your area,
 directions, what to say about common questions, what not to promise. It reads
 these files when a call or a text needs them; callers and texters cannot
@@ -191,10 +204,9 @@ export class OpenProject {
     const fresh = !(await readJson<ProjectMeta>(dir, 'project.json'));
     if (fresh) await writeBytes(dir, 'project.json', JSON.stringify(meta));
     const desk = await OpenProject.openAt(meta, dir);
-    if (fresh || !desk.vfs.exists(FRONT_DESK_NOTE)) {
-      desk.vfs.writeFile(FRONT_DESK_NOTE, FRONT_DESK_README, { parents: true });
-      await desk.flush();
-    }
+    if (fresh || !desk.vfs.exists(FRONT_DESK_NOTE)) desk.vfs.writeFile(FRONT_DESK_NOTE, FRONT_DESK_README, { parents: true });
+    if (!desk.vfs.exists(FRONT_DESK_BRIEF)) desk.vfs.writeFile(FRONT_DESK_BRIEF, FRONT_DESK_BRIEF_TEXT, { parents: true });
+    await desk.flush();
     if (fresh) await desk.adoptSessions();
     return desk;
   }
