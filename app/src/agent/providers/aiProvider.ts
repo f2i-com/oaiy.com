@@ -169,7 +169,8 @@ export async function sendAIRequest(
     // max_tokens. Decided by where the request goes, not the type: older
     // Studios saved gateways and local servers as `openai` too.
     body = {
-      model,
+      // Following OAIY's Engines: the engine answers with the model chosen there.
+      ...(provider.followEngine ? {} : { model }),
       ...(isOpenAIHost(url) ? { max_completion_tokens: maxTokens } : { max_tokens: maxTokens }),
       messages: [
         { role: 'system', content: request.system },

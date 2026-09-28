@@ -13,6 +13,12 @@ export interface ProviderConfig {
   baseUrl?: string;
   /** The model every request uses. There is no default. */
   modelId?: string;
+  /**
+   * OAIY only: use the model chosen in OAIY's Engines (its default), whichever
+   * that is now. Requests name no model, so the engine answers with its own
+   * choice; `modelId` shows which that was when OAIY was last asked.
+   */
+  followEngine?: boolean;
   orgId?: string;
   /** For a `local` provider: which server, for its address and its advice. */
   serverKind?: LocalServerKind;

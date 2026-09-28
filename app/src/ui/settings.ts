@@ -40,6 +40,8 @@ export function oaiyProvider(providers: ProviderConfig[], found: Extract<Discove
     apiKey: '',
     baseUrl: found.origin,
     modelId: found.llm.default,
+    // The model chosen in OAIY's Engines, whichever that is.
+    followEngine: true,
     ...(found.llm.contextTokens && found.llm.default ? { detectedContext: { model: found.llm.default, tokens: found.llm.contextTokens, how: 'OAIY (/v1/discovery)', at: Date.now() } } : {}),
   };
 }
@@ -132,8 +134,17 @@ export function openSettings(initial: SettingsResult): Promise<SettingsResult | 
       // The model: a real dropdown of what the server lists, plus "Other…"
       // for a name typed by hand (a server that lists nothing, a new model).
       const OTHER = '\u0000other';
+      // OAIY: the model chosen in its Engines, whichever that is (the default for OAIY).
+      const ENGINE = '\u0000engine';
       const custom = h('input', { value: p.modelId ?? '', placeholder: 'type a model name', oninput: () => { p.modelId = custom.value.trim() || undefined; renderList(); } });
       const modelSelect = h('select', { onchange: () => {
+        // A model chosen here stays chosen (false, not left unset: unset follows Engines).
+        p.followEngine = modelSelect.value === ENGINE;
+        if (p.followEngine) {
+          custom.hidden = true;
+          renderList();
+          return;
+        }
         if (modelSelect.value === OTHER) {
           custom.hidden = false;
           custom.value = p.modelId ?? '';
@@ -148,10 +159,12 @@ export function openSettings(initial: SettingsResult): Promise<SettingsResult | 
         clear(modelSelect);
         const listed = found ?? [];
         const known = !!p.modelId && listed.some((m) => m.id === p.modelId);
-        modelSelect.append(h('option', { value: '', selected: !p.modelId }, listed.length ? '— choose a model —' : found ? '— the server listed no models —' : '— press List models —'));
-        for (const m of listed) modelSelect.append(h('option', { value: m.id, selected: m.id === p.modelId }, m.label && m.label !== m.id ? `${m.label} (${m.id})` : m.id));
-        modelSelect.append(h('option', { value: OTHER, selected: !!p.modelId && !known }, 'Other (type a name)…'));
-        custom.hidden = known || (!p.modelId && listed.length > 0);
+        const engine = p.serverKind === 'oaiy';
+        modelSelect.append(h('option', { value: '', selected: !p.modelId && !p.followEngine }, listed.length ? '— choose a model —' : found ? '— the server listed no models —' : '— press List models —'));
+        if (engine) modelSelect.append(h('option', { value: ENGINE, selected: !!p.followEngine }, `The model chosen in Engines${p.modelId ? ` (now ${p.modelId})` : ''}`));
+        for (const m of listed) modelSelect.append(h('option', { value: m.id, selected: !p.followEngine && m.id === p.modelId }, m.label && m.label !== m.id ? `${m.label} (${m.id})` : m.id));
+        modelSelect.append(h('option', { value: OTHER, selected: !p.followEngine && !!p.modelId && !known }, 'Other (type a name)…'));
+        custom.hidden = !!p.followEngine || known || (!p.modelId && listed.length > 0);
       };
       const loadModels = async (quiet: boolean) => {
         if (!quiet) note.textContent = 'Asking the server for its models…';

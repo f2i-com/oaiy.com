@@ -16,7 +16,7 @@ import { TOOLS } from './agent/tools';
 import type { SessionTool, ToolHook } from './agent/agent';
 import { editPhone } from './ui/phone';
 import { startTheme } from './ui/theme';
-import { OAIY_ORIGIN, discoverOaiy, mediaAbilities, mergeDiscovered } from './agent/media';
+import { OAIY_ORIGIN, discoverOaiy, mediaAbilities, mergeDiscovered, originOf } from './agent/media';
 import { budgetFor, contextWindow, detectContextWindow, formatTokens } from './agent/context';
 import { ChatPane } from './ui/chat';
 import { clear, h } from './ui/dom';
@@ -1080,6 +1080,7 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
     const first = !media.discovered;
     media = mergeDiscovered(media, found.media);
     await saveMedia(media);
+    followEngine(found);
     const chatProvider = oaiyProvider(providers, found);
     if (chatProvider) {
       providers.push(chatProvider);
@@ -1092,6 +1093,45 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
       chat.system(`Found ${found.service} ${found.version} at ${found.origin}.${can ? ` The agent can make ${can} with it.` : ''}${chatProvider ? ` It is in the AI providers for chat too${activeId === chatProvider.id ? ', and in use' : ''}.` : ''} Change this in Settings → Images, video and audio.`);
     }
   }
+
+  /**
+   * The OAIY providers that follow its Engines take the model chosen there now
+   * (shown, and its context window). One from before there was a choice
+   * follows from now on, so a change in Engines reaches the agent, the phone's
+   * agents and the flows alike; one given its own model in Settings keeps it.
+   */
+  function followEngine(found: Extract<Awaited<ReturnType<typeof discoverOaiy>>, { state: 'found' }>): void {
+    let changed = false;
+    for (const p of providers) {
+      let origin = '';
+      try {
+        origin = p.baseUrl ? originOf(p.baseUrl) : '';
+      } catch {
+        /* an address that is not one */
+      }
+      if (p.serverKind !== 'oaiy' || origin !== found.origin || !found.llm.default) continue;
+      if (p.followEngine === undefined) {
+        p.followEngine = true;
+        changed = true;
+      }
+      if (!p.followEngine || p.modelId === found.llm.default) continue;
+      p.modelId = found.llm.default;
+      if (found.llm.contextTokens) p.detectedContext = { model: found.llm.default, tokens: found.llm.contextTokens, how: 'OAIY (/v1/discovery)', at: Date.now() };
+      changed = true;
+    }
+    if (!changed) return;
+    void saveProviders(providers, activeId);
+    renderChips();
+  }
+
+  // What Engines has chosen is looked at again now and then (it may be changed there at any time).
+  setInterval(() => {
+    if (!providers.some((p) => p.followEngine) || navigator.webdriver) return;
+    const origin = media.discovered?.origin ?? OAIY_ORIGIN;
+    void discoverOaiy(origin, media.apiKey, undefined, 3000).then((found) => {
+      if (found.state === 'found') followEngine(found);
+    }).catch(() => {});
+  }, 60_000);
 
   // ---- The phone: OAIY Desktop, its events, and the text-message conversations ----
 

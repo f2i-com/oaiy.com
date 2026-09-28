@@ -270,7 +270,8 @@ export async function sendTurn(
     return decodeAnthropic(outcome.streamed ? stream.result() : outcome.data, stream.parseErrors);
   }
   const body: Record<string, unknown> = {
-    model,
+    // Following OAIY's Engines: no model named, so the engine uses the one chosen there (naming the last one seen would load it back).
+    ...(provider.followEngine ? {} : { model }),
     stream: true,
     stream_options: { include_usage: true },
     messages: openAIMessages(system, turns),

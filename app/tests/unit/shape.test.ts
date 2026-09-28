@@ -49,3 +49,16 @@ describe('the output limit', () => {
     expect(events.at(-1)).toMatchObject({ type: 'done', text: 'fine' });
   });
 });
+
+describe("OAIY's Engines choose the model", () => {
+  it('a provider that follows them names no model, so the engine answers with the one chosen there', async () => {
+    const fake = fakeProvider('openai', [{ text: 'Hi.' }, { text: 'Hi again.' }]);
+    const provider = { ...OPENAI, type: 'local' as const, serverKind: 'oaiy' as const, baseUrl: 'http://127.0.0.1:8080', modelId: 'Qwen3.8-Flash-Next', followEngine: true };
+    const agent = new Agent({ vfs: new Vfs(), gate: new NetGate(), provider: () => provider, projectSummary: () => '', conversation: true });
+    await agent.run('Hello', () => {});
+    expect(fake.bodies[0]).not.toHaveProperty('model');
+    provider.followEngine = false;
+    await agent.run('Hello again', () => {});
+    expect(fake.bodies[1].model).toBe('Qwen3.8-Flash-Next');
+  });
+});
