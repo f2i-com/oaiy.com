@@ -256,6 +256,14 @@ fn read_start(text: &str) -> Result<(Ids, Value), String> {
     Ok((Ids { call: call.to_string(), generation }, v))
 }
 
+/// A start that only asks for a line to be said (`mode: "speak"`): Aokie's screen
+/// message, a hold announcement or an apology, in OAIY's voice. The greeting is
+/// said once; no agent answers, the caller is not listened to, and it is not a
+/// call the app sees. Aokie knows it has been said from the item's end.
+fn speaks_only(start: &Value) -> bool {
+    start.get("mode").and_then(Value::as_str) == Some("speak")
+}
+
 /// Run one call to its end.
 pub async fn run(socket: WebSocket, hub: VoiceHub, engines: Engines) {
     let (mut sink, mut stream) = socket.split();
@@ -283,6 +291,7 @@ pub async fn run(socket: WebSocket, hub: VoiceHub, engines: Engines) {
     // and on a call it placed, why and its first words. Absent: the plugin's events say who.
     let (direction, start_from, start_name) = (str_of("direction"), str_of("from"), str_of("callerName"));
     let (purpose, opening_line) = (str_of("purpose"), str_of("openingLine"));
+    let speak_only = speaks_only(&start);
     // The voice chosen for calls (a clip in the voices folder; see `voices`).
     let voice: Option<String> = super::voices::chosen();
 
@@ -467,7 +476,14 @@ pub async fn run(socket: WebSocket, hub: VoiceHub, engines: Engines) {
     };
 
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<CallCommand>();
-    hub.register(&ids.call, cmd_tx);
+    // A line only to be said is not a call the app answers: it is not listed, and takes no commands
+    // (its sender is kept here, as a closed channel would end the call).
+    let _unlisted = if speak_only {
+        Some(cmd_tx)
+    } else {
+        hub.register(&ids.call, cmd_tx);
+        None
+    };
     // Speech is ready before the caller first speaks.
     {
         let (engines, hub, call) = (engines.clone(), hub.clone(), ids.call.clone());
@@ -509,6 +525,13 @@ pub async fn run(socket: WebSocket, hub: VoiceHub, engines: Engines) {
                                 clock.start();
                                 if let Some(g) = v.get("greeting").and_then(Value::as_str).filter(|g| !g.trim().is_empty()) {
                                     greeting = g.to_string();
+                                }
+                                // Only a line to say: said whole, and nothing else happens.
+                                if speak_only {
+                                    if !greeting.trim().is_empty() {
+                                        speak(greeting.clone(), true, None);
+                                    }
+                                    continue;
                                 }
                                 // The brief for this caller, which Aokie knows once the call connects: it wins over the start's.
                                 if let Some(i) = v.get("instructions").and_then(Value::as_str).filter(|i| !i.trim().is_empty()) {
@@ -557,7 +580,8 @@ pub async fn run(socket: WebSocket, hub: VoiceHub, engines: Engines) {
                         }
                     }
                     Message::Binary(bytes) => {
-                        if !begun {
+                        // Before it begins, or when there is only a line to say, the caller is not listened to.
+                        if !begun || speak_only {
                             continue;
                         }
                         let (out, quiet) = {
@@ -650,6 +674,14 @@ pub async fn run(socket: WebSocket, hub: VoiceHub, engines: Engines) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_line_to_say_is_asked_for_by_the_start() {
+        let start = |mode: &str| serde_json::from_str::<Value>(&format!(r#"{{"type":"formlogic.realtime.start","mode":"{mode}"}}"#)).unwrap();
+        assert!(speaks_only(&start("speak")));
+        assert!(!speaks_only(&start("call")));
+        assert!(!speaks_only(&json!({"type": "formlogic.realtime.start"})));
+    }
 
     #[test]
     fn a_call_starts_only_for_this_desktop() {

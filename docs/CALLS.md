@@ -98,6 +98,15 @@ in the call's first note instead.
 The model is the one chosen in Engines: the Agent's OAIY provider names no
 model, so the engine answers with its choice (Qwen3.8-Flash-Next now).
 
+## A line only to be said
+
+A start with `"mode": "speak"` asks OAIY only to say its greeting, once, in
+the call voice: Aokie's screen message to a caller it turns away, a hold
+announcement, or an apology when a call cannot go on. No agent answers, the
+caller is not listened to, and it is not a call the Agent or the sidebar sees.
+Aokie knows the line has been said when its output item ends, and then stops
+the session.
+
 ## Who is answered, and missed calls
 
 Agent → Phone sets Aokie's call screening: answer any number, Australian
