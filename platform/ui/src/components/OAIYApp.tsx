@@ -18,7 +18,8 @@ import { JobQueueProvider, useJobQueue } from '../contexts/JobQueueContext';
 import { ConfirmDialogProvider } from '../hooks/useConfirmDialog';
 import ProjectImportButton from './ProjectImportButton';
 import { ShellSidebar, ShellTopbar, ShellIconAction, ShellDock, ShellSections, shellNavItems, type ShellSectionsState } from './chrome/ShellChrome';
-import { Activity, HelpCircle, PanelLeft, Settings2, Share2 } from 'lucide-react';
+import { Activity, Bot, HelpCircle, PanelLeft, Settings2, Share2 } from 'lucide-react';
+import AgentToolDialog from './dialogs/AgentToolDialog';
 import { useTheme } from '../contexts/ThemeContext';
 import { useMediaQuery } from '../hooks/useMediaQuery';
 import {
@@ -160,6 +161,8 @@ export default function OAIYApp() {
   >(undefined);
   const [queuePanelOpen, setQueuePanelOpen] = useState(false);
   const [shareDialogOpen, setShareDialogOpen] = useState(false);
+  // In OAIY's window: the open flow given to the agent (a tool of its own, or before or instead of one of its tools).
+  const [agentToolOpen, setAgentToolOpen] = useState(false);
   // First-run wizard. Auto-opens on the first ever load (no completed
   // flag in localStorage); can be re-opened any time from the header
   // help button. Skipping marks it completed too, so dismissing once
@@ -686,6 +689,16 @@ export default function OAIYApp() {
               >
                 <PanelLeft size={16} />
               </ShellIconAction>
+              {followsOaiy && activeTab === 'builder' && activeFlow && (
+                <ShellIconAction
+                  label="Give this flow to the agent"
+                  title={`Give "${activeFlow.name}" to OAIY's agent: as a tool of its own, or before or instead of one of its tools`}
+                  on={agentToolOpen}
+                  onClick={() => setAgentToolOpen(true)}
+                >
+                  <Bot size={16} />
+                </ShellIconAction>
+              )}
               {activeTab === 'builder' && backend.enabled && (
                 <ShellIconAction
                   label={backend.share ? 'Manage share' : 'Share this flow'}
@@ -956,6 +969,10 @@ export default function OAIYApp() {
           manageLabel={backend.share ? 'Manage share' : 'Share'}
         />}
       </main>
+
+      {agentToolOpen && activeFlow && (
+        <AgentToolDialog flow={activeFlow} onClose={() => setAgentToolOpen(false)} onDone={(message) => addToast(message, 'success')} />
+      )}
 
       {/* Settings Panel */}
       <SettingsPanel
