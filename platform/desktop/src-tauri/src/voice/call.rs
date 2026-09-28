@@ -278,7 +278,7 @@ pub async fn run(socket: WebSocket, hub: VoiceHub, engines: Engines) {
         }
     };
     let str_of = |k: &str| start.get(k).and_then(Value::as_str).unwrap_or("").to_string();
-    let (instructions, mut greeting) = (str_of("instructions"), str_of("greeting"));
+    let (mut instructions, mut greeting) = (str_of("instructions"), str_of("greeting"));
     // The voice chosen for calls (a clip in the voices folder; see `voices`).
     let voice: Option<String> = super::voices::chosen();
 
@@ -505,6 +505,10 @@ pub async fn run(socket: WebSocket, hub: VoiceHub, engines: Engines) {
                                 clock.start();
                                 if let Some(g) = v.get("greeting").and_then(Value::as_str).filter(|g| !g.trim().is_empty()) {
                                     greeting = g.to_string();
+                                }
+                                // The brief for this caller, which Aokie knows once the call connects: it wins over the start's.
+                                if let Some(i) = v.get("instructions").and_then(Value::as_str).filter(|i| !i.trim().is_empty()) {
+                                    instructions = i.to_string();
                                 }
                                 let (from, name) = hub.caller_of(&ids.call).unwrap_or_default();
                                 // Greeted by name when we know it: the name kept for their number, else the phone's.
