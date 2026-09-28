@@ -467,6 +467,13 @@ impl LinkStore {
         }
     }
 
+    /// The provider does not offer data nodes: nothing to show, and no error.
+    pub fn note_data_node_off(&self) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.data_node = None;
+        inner.data_node_error = None;
+    }
+
     /// Record the outcome of a heartbeat.
     pub fn note_heartbeat(&self, error: Option<String>) {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());

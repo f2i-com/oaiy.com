@@ -180,9 +180,15 @@ pub fn spawn(store: LinkHandle) {
             if now >= next_register {
                 let registered = register(&account, &spec, &identity);
                 // A failed one (the provider away) is tried again in five
-                // minutes, not an hour: enrolment waits on it.
+                // minutes, not an hour: enrolment waits on it. A provider that
+                // does not offer data nodes is not a failure: it is asked again
+                // on the slow schedule, and nothing is shown as wrong.
                 let wait = if registered.is_ok() { spec.interval_seconds.max(60) } else { spec.interval_seconds.clamp(60, 300) };
-                store.note_data_node(registered);
+                match registered {
+                    Ok(Some(status)) => store.note_data_node(Ok(status)),
+                    Ok(None) => store.note_data_node_off(),
+                    Err(e) => store.note_data_node(Err(e)),
+                }
                 next_register = now + Duration::from_secs(wait);
                 // A register answers with the record too, so the read-back can
                 // wait its full interval rather than firing straight after.
@@ -204,12 +210,13 @@ pub fn spawn(store: LinkHandle) {
     });
 }
 
-/// One registration. Idempotent server-side.
+/// One registration. Idempotent server-side. `Ok(None)`: the provider does not offer
+/// data nodes (switched off there), which is no error.
 fn register(
     account: &LinkedAccount,
     spec: &DataNodeSpec,
     identity: &NodeIdentity,
-) -> Result<DataNodeStatus, String> {
+) -> Result<Option<DataNodeStatus>, String> {
     let http = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(20))
         .build()
@@ -230,6 +237,9 @@ fn register(
 
     let status = resp.status();
     let payload: Value = resp.json().unwrap_or(Value::Null);
+    if offers_no_data_nodes(status.as_u16(), &payload) {
+        return Ok(None);
+    }
     if !status.is_success() {
         let message = payload
             .get("message")
@@ -239,7 +249,21 @@ fn register(
         // fresh link, and the next tick fixes it.
         return Err(format!("HTTP {}: {message}", status.as_u16()));
     }
-    node_status(&payload).ok_or_else(|| "the provider returned no node record".to_string())
+    node_status(&payload).map(Some).ok_or_else(|| "the provider returned no node record".to_string())
+}
+
+/// Whether the provider's answer means it does not offer data nodes at all (a
+/// FormLogic with the feature switched off answers 403 "not enabled"; one
+/// without the lane, 404), rather than refusing this desktop.
+fn offers_no_data_nodes(status: u16, payload: &Value) -> bool {
+    let said = [payload.get("message"), payload.pointer("/error/message"), payload.pointer("/error/code"), payload.get("code")]
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    status == 404 || (status == 403 && (said.contains("not enabled") || said.contains("disabled") || said.contains("not available")))
 }
 
 /// Read this desktop's node record back.
@@ -292,6 +316,16 @@ fn node_status(payload: &Value) -> Option<DataNodeStatus> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_provider_without_data_nodes_is_no_error() {
+        assert!(offers_no_data_nodes(403, &json!({"message": "Data nodes are not enabled on this server."})));
+        assert!(offers_no_data_nodes(403, &json!({"error": {"code": "feature_disabled", "message": "Storage nodes are disabled"}})));
+        assert!(offers_no_data_nodes(404, &Value::Null));
+        // A refusal of this desktop is still an error.
+        assert!(!offers_no_data_nodes(403, &json!({"message": "This key may not enrol a node."})));
+        assert!(!offers_no_data_nodes(409, &json!({"message": "not enabled"})));
+    }
 
     #[test]
     fn the_fingerprint_matches_the_providers_own_derivation() {
