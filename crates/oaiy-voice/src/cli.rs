@@ -2,7 +2,9 @@
 //! and `aokie-tts` service templates pass to `aokie-voice-server.exe`
 //! (`--mode`, `--port`, `--stt-model-dir`, `--tts-model-dir`), accepts
 //! Aokie's engine flags where they name what this server does, and adds
-//! `--device` and `--dtype`.
+//! `--device` and `--dtype`. Those two can also come from the environment
+//! (`OAIY_VOICE_DEVICE`, `OAIY_VOICE_DTYPE`), so a service template can set
+//! them without changing its arguments; a flag wins over the environment.
 
 use std::path::PathBuf;
 
@@ -108,15 +110,27 @@ pub const USAGE: &str = "usage: oaiy-voice [--mode stt|tts|both] [--port N] [--h
 PATH is a Parakeet .nemo, a model.safetensors (with config.json and
 tokenizer.json beside it), or a folder holding either.";
 
-/// Parse the server's flags (`--flag value` or `--flag=value`).
+/// Parse the server's flags (`--flag value` or `--flag=value`), with the
+/// process environment for what they leave out.
 pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Args, String> {
+    parse_with_env(args, |k| std::env::var(k).ok())
+}
+
+/// [`parse`] with the environment given (tests).
+pub fn parse_with_env<I: IntoIterator<Item = String>>(args: I, env: impl Fn(&str) -> Option<String>) -> Result<Args, String> {
     let argv: Vec<String> = args.into_iter().collect();
     let mut mode = None;
     let mut port = None;
     let mut host = "127.0.0.1".to_string();
     let (mut stt_model, mut tts_model) = (None, None);
-    let mut device = DeviceChoice::Auto;
-    let mut dtype = Precision::Auto;
+    let mut device = match env("OAIY_VOICE_DEVICE").filter(|v| !v.trim().is_empty()) {
+        Some(v) => DeviceChoice::parse(&v).map_err(|e| format!("OAIY_VOICE_DEVICE: {e}"))?,
+        None => DeviceChoice::Auto,
+    };
+    let mut dtype = match env("OAIY_VOICE_DTYPE").filter(|v| !v.trim().is_empty()) {
+        Some(v) => Precision::parse(&v).map_err(|e| format!("OAIY_VOICE_DTYPE: {e}"))?,
+        None => Precision::Auto,
+    };
     let mut i = 0;
     while i < argv.len() {
         let (flag, inline) = match argv[i].split_once('=') {
@@ -166,7 +180,7 @@ mod tests {
     use super::*;
 
     fn p(a: &[&str]) -> Result<Args, String> {
-        parse(a.iter().map(|s| s.to_string()))
+        parse_with_env(a.iter().map(|s| s.to_string()), |_| None)
     }
 
     #[test]
@@ -187,6 +201,20 @@ mod tests {
         assert_eq!(DeviceChoice::parse("CPU").unwrap(), DeviceChoice::Cpu);
         assert!(DeviceChoice::parse("cuda:x").is_err());
         assert!(Precision::parse("int8").is_err());
+    }
+
+    #[test]
+    fn environment_sets_device_and_dtype_unless_a_flag_does() {
+        let env = |k: &str| match k {
+            "OAIY_VOICE_DEVICE" => Some("cuda:1".to_string()),
+            "OAIY_VOICE_DTYPE" => Some("f32".to_string()),
+            _ => None,
+        };
+        let a = parse_with_env(["--mode", "stt"].map(String::from), env).unwrap();
+        assert_eq!((a.device, a.dtype), (DeviceChoice::Cuda(1), Precision::F32));
+        let a = parse_with_env(["--device", "cpu"].map(String::from), env).unwrap();
+        assert_eq!(a.device, DeviceChoice::Cpu);
+        assert!(parse_with_env(Vec::<String>::new(), |k| (k == "OAIY_VOICE_DEVICE").then(|| "tpu".to_string())).is_err());
     }
 
     #[test]

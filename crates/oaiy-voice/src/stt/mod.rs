@@ -38,6 +38,44 @@ pub(crate) fn bad(s: impl Into<String>) -> candle_core::Error {
 /// How many encoder frames the joint scores per device round trip.
 const JOINT_BLOCK: usize = 8;
 
+/// The longest audio transcribed in one pass, in seconds. Full attention
+/// and the subsampling's gathers grow with the length (300 s takes about
+/// 6 GB of GPU memory, 90 s about 1.5 GB); longer audio is cut where it is
+/// quietest into pieces no longer than this.
+pub const MAX_PASS_SECONDS: f64 = 90.0;
+
+/// A cut falls in the quietest 100 ms of the last this many seconds before
+/// the limit.
+const CUT_SEARCH_SECONDS: f64 = 10.0;
+
+/// Pieces of the audio no longer than `max` samples, each cut at the
+/// quietest `frame` samples (by energy, on a `frame / 10` grid) of the last
+/// `search` samples before the limit.
+pub fn quiet_cuts(samples: &[f32], max: usize, search: usize, frame: usize) -> Vec<(usize, usize)> {
+    let n = samples.len();
+    let (search, frame) = (search.min(max / 2).max(1), frame.max(1));
+    let hop = (frame / 10).max(1);
+    let mut pieces = Vec::new();
+    let mut start = 0;
+    while n - start > max {
+        let end = start + max;
+        let from = end - search;
+        let mut best = (f64::INFINITY, end);
+        let mut at = from;
+        while at + frame <= end {
+            let e: f64 = samples[at..at + frame].iter().map(|&x| (x as f64) * (x as f64)).sum();
+            if e < best.0 {
+                best = (e, at + frame / 2);
+            }
+            at += hop;
+        }
+        pieces.push((start, best.1));
+        start = best.1;
+    }
+    pieces.push((start, n));
+    pieces
+}
+
 /// The files of one model: its weights and where its configuration and
 /// tokenizer are.
 #[derive(Clone, Debug)]
@@ -62,10 +100,10 @@ impl ModelFiles {
                 let dir = path.parent().unwrap_or(Path::new("."));
                 return Ok(Self::beside(path.to_path_buf(), dir));
             }
-            return Err(bad(format!("{}: not a .nemo or .safetensors file", path.display())));
+            return Err(bad("not a .nemo or .safetensors file"));
         }
         if !path.is_dir() {
-            return Err(bad(format!("{} does not exist", path.display())));
+            return Err(bad("no such file or folder"));
         }
         let mut entries: Vec<PathBuf> = std::fs::read_dir(path)?.filter_map(|e| e.ok().map(|e| e.path())).collect();
         entries.sort();
@@ -79,7 +117,10 @@ impl ModelFiles {
         if let Some(st) = entries.iter().find(|p| p.is_file() && is(p, "safetensors")) {
             return Ok(Self::beside(st.clone(), path));
         }
-        Err(bad(format!("{}: no Parakeet .nemo or model.safetensors (with config.json and tokenizer.json) found", path.display())))
+        if entries.iter().any(|p| is(p, "onnx")) {
+            return Err(bad("this folder holds ONNX files (an export for ONNX Runtime, as Aokie's voice server uses); oaiy-voice reads the published checkpoint instead: a .nemo (nvidia/parakeet-unified-en-0.6b, nvidia/parakeet-tdt-0.6b-v2 or -v3) or a model.safetensors with config.json and tokenizer.json (nvidia/parakeet-tdt-0.6b-v3, moondream/parakeet-ultra)"));
+        }
+        Err(bad("no Parakeet .nemo, or model.safetensors with config.json and tokenizer.json, in this folder"))
     }
 
     fn beside(weights: PathBuf, dir: &Path) -> Self {
@@ -224,6 +265,28 @@ impl Transcriber {
 
     /// Transcribe mono audio at the model's sample rate, in [-1, 1].
     pub fn transcribe(&self, samples: &[f32]) -> Result<Transcript> {
+        let rate = self.sample_rate() as f64;
+        let max = (MAX_PASS_SECONDS * rate) as usize;
+        if samples.len() <= max {
+            return self.transcribe_pass(samples);
+        }
+        let mut tokens = Vec::new();
+        let mut timings = Timings::default();
+        for (a, b) in quiet_cuts(samples, max, (CUT_SEARCH_SECONDS * rate) as usize, (0.1 * rate) as usize) {
+            let t = self.transcribe_pass(&samples[a..b])?;
+            tokens.extend(t.tokens);
+            timings.audio += t.timings.audio;
+            timings.features += t.timings.features;
+            timings.encoder += t.timings.encoder;
+            timings.decoder += t.timings.decoder;
+            timings.joint_trips += t.timings.joint_trips;
+        }
+        // Each piece begins with a word, whose first token carries the space.
+        Ok(Transcript { text: self.detokenize(&tokens), tokens, timings })
+    }
+
+    /// One pass of the model over at most [`MAX_PASS_SECONDS`] of audio.
+    fn transcribe_pass(&self, samples: &[f32]) -> Result<Transcript> {
         let mut timings = Timings { audio: Duration::from_secs_f64(samples.len() as f64 / self.sample_rate() as f64), ..Default::default() };
         let started = Instant::now();
         let f = self.features(samples);
@@ -249,4 +312,33 @@ impl Transcriber {
 fn model_name(weights: &Path) -> String {
     let stem = if weights.extension().is_some_and(|e| e.eq_ignore_ascii_case("nemo")) { weights.file_stem() } else { weights.parent().and_then(|p| p.file_name()) };
     stem.map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "parakeet".into())
+}
+
+#[cfg(test)]
+mod cut_tests {
+    use super::quiet_cuts;
+
+    #[test]
+    fn short_audio_is_one_piece() {
+        assert_eq!(quiet_cuts(&[0.5; 100], 100, 20, 4), vec![(0, 100)]);
+        assert_eq!(quiet_cuts(&[], 100, 20, 4), vec![(0, 0)]);
+    }
+
+    #[test]
+    fn long_audio_is_cut_in_its_quiet_parts() {
+        // Loud everywhere except two quiet stretches, at 85..90 and 170..175.
+        let mut x = vec![0.5f32; 260];
+        x[85..90].fill(0.0);
+        x[170..175].fill(0.0);
+        let pieces = quiet_cuts(&x, 100, 30, 4);
+        assert_eq!(pieces.len(), 3, "{pieces:?}");
+        assert_eq!(pieces[0].0, 0);
+        assert!((85..90).contains(&pieces[0].1), "{pieces:?}");
+        assert!((170..175).contains(&pieces[1].1), "{pieces:?}");
+        assert_eq!(pieces[2].1, 260);
+        for w in pieces.windows(2) {
+            assert_eq!(w[0].1, w[1].0);
+        }
+        assert!(pieces.iter().all(|(a, b)| b - a <= 100));
+    }
 }

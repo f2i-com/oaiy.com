@@ -51,10 +51,16 @@ fn pick_device(choice: DeviceChoice) -> Result<Device, String> {
 fn pick_dtype(p: Precision, dev: &Device) -> DType {
     // TF32 products are a process-wide cuBLAS setting; this process runs one model.
     candle_core::cuda::set_gemm_reduced_precision_f32(p == Precision::Tf32 && dev.is_cuda());
+    if !dev.is_cuda() {
+        // Candle's CPU kernels are fastest in f32; half precision there only loses.
+        if matches!(p, Precision::F16 | Precision::Bf16) {
+            eprintln!("[oaiy-voice] the CPU runs in f32 (half precision is for the GPU)");
+        }
+        return DType::F32;
+    }
     match p {
-        Precision::Auto if dev.is_cuda() => DType::F16,
-        Precision::Auto | Precision::F32 | Precision::Tf32 => DType::F32,
-        Precision::F16 => DType::F16,
+        Precision::Auto | Precision::F16 => DType::F16,
+        Precision::F32 | Precision::Tf32 => DType::F32,
         Precision::Bf16 => DType::BF16,
     }
 }
@@ -77,6 +83,10 @@ fn load(path: &Path, device: DeviceChoice, precision: Precision) -> Result<Trans
     let dtype = pick_dtype(precision, &dev);
     let started = Instant::now();
     let t = Transcriber::load(path, &dev, dtype).map_err(|e| format!("{}: {e}", path.display()))?;
+    // One pass over a second of quiet, so the first caller does not wait
+    // for the GPU's libraries and kernels to load.
+    let quiet: Vec<f32> = (0..t.sample_rate()).map(|i| 1e-3 * ((i as f32) * 0.37).sin()).collect();
+    t.transcribe(&quiet).map_err(|e| format!("{}: warm-up: {e}", path.display()))?;
     eprintln!("[oaiy-voice] loaded {} on {} in {:.1} s", t.name, describe(&dev, dtype), started.elapsed().as_secs_f64());
     Ok(t)
 }
@@ -98,7 +108,8 @@ fn serve(args: Args) -> Result<(), String> {
 
 /// `transcribe --model PATH [--device D] [--dtype T] [--repeat N] FILE...`
 fn transcribe(argv: Vec<String>) -> Result<(), String> {
-    let (mut model, mut device, mut dtype, mut repeat, mut files) = (None, DeviceChoice::Auto, Precision::Auto, 1usize, Vec::new());
+    let defaults = cli::parse(Vec::new())?;
+    let (mut model, mut device, mut dtype, mut repeat, mut files) = (None, defaults.device, defaults.dtype, 1usize, Vec::new());
     let mut it = argv.into_iter();
     while let Some(a) = it.next() {
         let mut val = |name: &str| it.next().ok_or(format!("{name} needs a value"));

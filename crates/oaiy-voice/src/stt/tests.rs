@@ -1,12 +1,15 @@
 //! Parity with NeMo: the mel features, the encoder output and the greedy
 //! tokens of real checkpoints against fixtures NeMo made on the CPU in f32.
 //!
-//! The fixtures are not in the repository (a few MB per model). Each test is
-//! skipped unless `OAIY_VOICE_FIXTURES` names their folder (with
-//! `<model>/index.json`, `<clip>.mel.f32`, `<clip>.enc.f32`) and the clips
-//! (`clips/<clip>.wav` beside it), and the model's weights are found under
-//! `OAIY_VOICE_MODELS` (default `E:\models`). Run them in release:
-//! `cargo test --release -p oaiy-voice parity -- --nocapture`.
+//! The fixtures are not in the repository (a few MB per model):
+//! `tools/make_clips.py` writes the clips and `tools/nemo_fixtures.py` the
+//! fixtures (its docstring has the Python setup). Each test is skipped
+//! unless `OAIY_VOICE_FIXTURES` names the fixtures folder (with
+//! `<model>/index.json`, `<clip>.mel.f32`, `<clip>.enc.f32`, and the clips
+//! in `../clips/`) and the weights are under `OAIY_VOICE_MODELS` (default
+//! `E:\models`). Run them in release:
+//! `cargo test --release -p oaiy-voice parity -- --nocapture`; the GPU ones
+//! also need a CUDA build and `OAIY_VOICE_CUDA=<gpu index>`.
 
 use std::path::{Path, PathBuf};
 
