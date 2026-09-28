@@ -1105,6 +1105,8 @@ export class Sessions {
     session.running = new Promise<void>((resolve) => (finish = resolve));
     this.hooks.changed();
     session.speech?.begin();
+    // The call this run answers, if it is a call's: once that call has ended, what is left for the run is not answered.
+    const onCall = session.callId;
     // What the run says last (a flow's task is answered with it), or why it failed.
     let said = '';
     let failed = '';
@@ -1169,7 +1171,14 @@ export class Sessions {
         session.bookingNudged = true;
         unread.push(BOOKING_NUDGE);
       }
-      if (unread.length) this.deliver(session, unread.join('\n\n'));
+      if (unread.length && onCall && session.callId !== onCall) {
+        // Its call has ended: what came for it (the caller's last words) is kept, and no one is answered.
+        // A call begun since has its own words.
+        if (!session.callId) {
+          session.agent.turns.push({ role: 'user', text: unread.join('\n\n') });
+          await this.save(session);
+        }
+      } else if (unread.length) this.deliver(session, unread.join('\n\n'));
       this.hooks.changed();
     }
   }

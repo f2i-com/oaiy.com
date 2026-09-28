@@ -282,6 +282,26 @@ describe('a phone call answered by the agent', () => {
     expect(calls).toEqual([['finish', 'call_g', 'Thanks, bye!']]);
   });
 
+  it('what the caller said as the call ended is kept, and no reply is written for a call that has ended', async () => {
+    let release!: () => void;
+    const held = new Promise<void>((r) => (release = r));
+    const fake = fakeProvider('openai', [
+      { text: 'We are open from nine. And we close at five.', hold: { at: 10, until: held } },
+      { text: 'Are you still there?' },
+    ]);
+    const { sessions } = setup();
+    const call = await sessions.callEvent({ type: 'call.started', callId: 'call_u', from: '+61400000021' });
+    await sessions.callEvent({ type: 'call.caller', callId: 'call_u', text: 'When are you open?' });
+    for (let i = 0; i < 100 && !fake.bodies.length; i++) await new Promise((r) => setTimeout(r, 10));
+    // They speak while the reply is written, and hang up.
+    await sessions.callEvent({ type: 'call.caller', callId: 'call_u', text: 'Actually, never mind.', startMs: 5_000 });
+    await sessions.callEvent({ type: 'call.ended', callId: 'call_u' });
+    release();
+    await settled(sessions);
+    expect(fake.bodies).toHaveLength(1);
+    expect(call!.agent.turns.at(-1)).toMatchObject({ role: 'user', text: 'Caller [0:05]: Actually, never mind.' });
+  });
+
   it('on a call the model does not think first, and has a short list of tools', async () => {
     const fake = fakeProvider('openai', [{ text: 'Hello!' }]);
     const { sessions } = setup(LOCAL);
