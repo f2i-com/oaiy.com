@@ -266,7 +266,7 @@ describe('media requests', () => {
     vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
       if (init?.method === 'POST') {
         sent.push(JSON.parse(String(init.body)));
-        return json({ id: 'm3d_2', status: 'completed', model: 'pixal3d', faces: 20000, vertices: 10002, seconds_taken: 64 });
+        return json({ id: 'm3d_2', status: 'completed', model: 'pixal3d', faces: 20000, vertices: 10002, seconds_taken: 64, matte: 'birefnet', upscaled: [310, 1024] });
       }
       return new Response(new Uint8Array(url.endsWith('/content') ? 2_500_000 : 8));
     }));
@@ -279,7 +279,7 @@ describe('media requests', () => {
     expect(made.files).toEqual(['assets/models/lamp.glb', 'assets/models/lamp.cutout.png']);
     expect(vfs.readBytes('/assets/models/lamp.glb').byteLength).toBe(2_500_000);
     expect(vfs.readBytes('/assets/models/lamp.cutout.png').byteLength).toBe(8);
-    expect(made.content).toBe('Saved /assets/models/lamp.glb (20,000 faces, 10,002 vertices, 2.5 MB, made in 64 s), made with pixal3d, and beside it the picture as the service cut the object out, /assets/models/lamp.cutout.png. Its front faces +Z, Y is up, and it fits a unit cube. Look at it with preview_screenshot (path: assets/models/lamp.glb) before using it.');
+    expect(made.content).toBe('Saved /assets/models/lamp.glb (20,000 faces, 10,002 vertices, 2.5 MB, made in 64 s), made with pixal3d, and beside it the object as the service cut it out (a PNG with a transparent background: its background removed, enlarged from 310 to 1024 px), /assets/models/lamp.cutout.png. Its front faces +Z, Y is up, and it fits a unit cube. Look at it with preview_screenshot (path: assets/models/lamp.glb) before using it.');
     const gif = await runTool({ id: '2', name: 'generate_3d_model', input: { image: 'art/lamp.gif', path: 'assets/models/lamp.glb' } }, ctx);
     expect(gif.isError && gif.content).toContain('png, jpg or webp');
   });
@@ -297,7 +297,13 @@ describe('media tools', () => {
     expect(tools.map((t) => t.name)).toEqual(['generate_image', 'generate_video', 'generate_speech', 'create_voice', 'generate_music', 'generate_sound_effect', 'generate_3d_model', 'review_frame']);
     expect(tools[5].description).toContain('moss-soundeffect (default): up to 30 s');
     // A 3D model is made from a picture of the object alone, made first.
-    expect(tools[6].description).toContain('first make a picture for it with generate_image of the object alone: the whole object in view and centred, on a plain white or grey background, in soft even light, from a three-quarter view');
+    expect(tools[6].description).toContain('first make a picture for it with generate_image of the object alone: the whole object in view and centred, on a plain white or grey background (or a transparent one), in soft even light, from a three-quarter view');
+    expect(tools[6].description).not.toContain('enlarges');
+    // A service that removes backgrounds and enlarges pictures takes any picture of the object.
+    const helped = readDiscovery({ ...DOC, models: { ...DOC.models, model3d: [{ ...DOC.models.model3d[0], removes_background: true, upscales: true }] } }, 'http://127.0.0.1:8080').media;
+    const described = mediaTools(helped).find((t) => t.name === 'generate_3d_model')!.description;
+    expect(described).toContain('on any background (the service removes it; a plain one gives the cleanest edges)');
+    expect(described).toContain('A small picture is fine: the service enlarges it first.');
     expect(tools[6].description).toContain('facing +Z');
     expect(tools[6].description).toContain('about a minute and a half');
     expect(tools[6].description).toContain('pixal3d (default): resolution 1024 or 1536, 200000 faces by default');

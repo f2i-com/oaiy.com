@@ -78,6 +78,10 @@ export interface Model3dModelInfo {
   ready?: boolean;
   /** The terms of the model's weights and what it makes, when nrob says. */
   license?: string;
+  /** The service removes a picture's background itself (any background will do). */
+  removesBackground?: boolean;
+  /** The service enlarges a small picture before it makes the model. */
+  upscales?: boolean;
 }
 
 /** A voice saved on the server (designed once from a description). */
@@ -327,6 +331,8 @@ export function readDiscovery(doc: Json, origin: string): Extract<Discovery, { s
     faces: num(m.faces),
     ready: bool(m.ready),
     license: str(m.license),
+    removesBackground: bool(m.removes_background),
+    upscales: bool(m.upscales),
   }));
   const voiceDoc = isRecord(doc.voices) ? doc.voices : {};
   const voices: VoiceInfo[] = list(voiceDoc.saved).map((v) => ({ name: str(v.name) ?? str(v.id) ?? '', description: str(v.description), language: str(v.language) })).filter((v) => v.name);
@@ -641,8 +647,12 @@ export interface Model3dRequest {
 export interface Model3dResult {
   /** The model: glTF 2.0 binary, Y up, its front facing +Z, fitted in a unit cube. */
   glb: Uint8Array;
-  /** The picture as the service cut the object out of it (PNG), when it gave it. */
+  /** The object as the service cut it out of the picture (PNG, its background transparent), when it gave it. */
   cutout?: Uint8Array;
+  /** How the object was cut out: "alpha" (the picture's own transparency), "birefnet" (its background removed) or "background" (a plain background cut away). */
+  matte?: string;
+  /** The object's crop enlarged from and to (pixels), when the service upscaled it. */
+  upscaled?: [number, number];
   faces?: number;
   vertices?: number;
   /** How long the service took to make it. */
@@ -674,7 +684,8 @@ export async function generate3dModel(media: MediaSettings, req: Model3dRequest,
   } catch (error) {
     if (signal?.aborted || !(error instanceof MediaError)) throw error;
   }
-  return { glb, cutout: cutout?.length ? cutout : undefined, faces: num(job.faces), vertices: num(job.vertices), seconds: num(job.seconds_taken), model: str(job.model) ?? model ?? 'default' };
+  const up = Array.isArray(job.upscaled) && job.upscaled.length === 2 && job.upscaled.every((v) => typeof v === 'number') ? (job.upscaled as [number, number]) : undefined;
+  return { glb, cutout: cutout?.length ? cutout : undefined, faces: num(job.faces), vertices: num(job.vertices), seconds: num(job.seconds_taken), model: str(job.model) ?? model ?? 'default', matte: str(job.matte), upscaled: up };
 }
 
 // --- Images ----------------------------------------------------------------

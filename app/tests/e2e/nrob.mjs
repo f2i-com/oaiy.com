@@ -293,7 +293,7 @@ try {
     expect(tool && tool.description.includes('three-quarter view') && tool.description.includes('pixal3d (default)'), tool?.description ?? 'generate_3d_model was not offered');
     expect(models3d.length === 1 && models3d[0].model === 'pixal3d' && models3d[0].faces === 20000 && models3d[0].image === `data:image/png;base64,${PNG.toString('base64')}`, JSON.stringify(models3d).slice(0, 300));
     const results = chats.slice(-2).map((c) => c.messages.filter((m) => m.role === 'tool').map((m) => m.content).join('\n')).join('\n');
-    expect(results.includes('Saved /assets/models/fox.glb (1 face, 3 vertices, 1 KB, made in 70 s), made with pixal3d, and beside it the picture as the service cut the object out, /assets/models/fox.cutout.png.') && results.includes('Look at it with preview_screenshot (path: assets/models/fox.glb) before using it.'), results);
+    expect(results.includes('Saved /assets/models/fox.glb (1 face, 3 vertices, 1 KB, made in 70 s), made with pixal3d, and beside it the object as the service cut it out (a PNG with a transparent background: its plain background cut away), /assets/models/fox.cutout.png.') && results.includes('Look at it with preview_screenshot (path: assets/models/fox.glb) before using it.'), results);
     // The files as saved: the GLB byte for byte in size, and the cut-out a real picture.
     expect(results.includes(`/assets/models/fox.glb: ${GLB.length} bytes`) && results.includes(`/assets/models/fox.cutout.png: ${PNG.length} bytes, image image/png, 1×1 px`), results);
     const statuses = await page.evaluate(() => window.__statuses);

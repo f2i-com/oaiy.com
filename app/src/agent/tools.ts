@@ -338,12 +338,17 @@ export function mediaTools(media: MediaSettings | null | undefined, voices?: Pro
     });
   }
   if (ready.model3d) {
+    // What the chosen model's service does to the picture first.
+    const model3d = media!.model3dModels?.find((m) => m.id === media!.model3dModel) ?? media!.model3dModels?.[0];
+    const cuts = !!model3d?.removesBackground;
+    const background = cuts ? 'on any background (the service removes it; a plain one gives the cleanest edges)' : 'on a plain white or grey background (or a transparent one)';
     tools.push({
       name: 'generate_3d_model',
       description:
-        `Make a 3D model (a GLB mesh) of one object from a picture of it, with the user's 3D model service (${where}), and save it in the project, with the picture as the service cut the object out of it beside it (NAME.cutout.png). ` +
-        `The model is only as good as the picture: ${ready.image ? 'first make a picture for it with generate_image' : 'give it a picture'} of the object alone: the whole object in view and centred, on a plain white or grey background, in soft even light, from a three-quarter view (its front and one side visible), with no text and no other objects in it. ` +
-        `${ready.image ? 'Look at that picture with view_image, then make the model from it with generate_3d_model. ' : ''}A picture the user attached (in uploads/) works too when it shows the object that way. ` +
+        `Make a 3D model (a GLB mesh) of one object from a picture of it, with the user's 3D model service (${where}), and save it in the project, with the object as the service cut it out, on a transparent background, beside it (NAME.cutout.png). ` +
+        `The model is only as good as the picture: ${ready.image ? 'first make a picture for it with generate_image' : 'give it a picture'} of the object alone: the whole object in view and centred, ${background}, in soft even light, from a three-quarter view (its front and one side visible), with no text and no other objects in it. ` +
+        `${model3d?.upscales ? 'A small picture is fine: the service enlarges it first. ' : ''}` +
+        `${ready.image ? 'Look at that picture with view_image, then make the model from it with generate_3d_model. ' : ''}A picture the user attached (in uploads/) works too when it shows the object that way${cuts ? ', whatever its background' : ''}. ` +
         'The model is glTF 2.0 with Y up, its front (the side the picture shows) facing +Z, fitted in a unit cube centred on the origin (-0.5 to 0.5 on each axis): scale and place it where it is used. ' +
         `It takes about a minute and a half; the user sees its progress in the chat. Look at the model with preview_screenshot before using it.${describeModels(media, 'model3d')}`,
       parameters: {
@@ -1535,7 +1540,11 @@ async function execute(call: ToolCall, ctx: ToolContext, out: ToolOut): Promise<
         bytes < 1e6 ? `${Math.max(1, Math.round(bytes / 1024))} KB` : `${(bytes / 1e6).toFixed(1)} MB`,
         result.seconds !== undefined && `made in ${Math.round(result.seconds)} s`,
       ].filter(Boolean).join(', ');
-      return `Saved /${path} (${facts}), made with ${result.model}${result.cutout ? `, and beside it the picture as the service cut the object out, /${cutoutPath}` : ''}. Its front faces +Z, Y is up, and it fits a unit cube. Look at it with preview_screenshot (path: ${path}) before using it.`;
+      const prepared = [
+        result.matte === 'birefnet' ? 'its background removed' : result.matte === 'background' ? 'its plain background cut away' : result.matte === 'alpha' ? "cut out by the picture's own transparency" : '',
+        result.upscaled && result.upscaled[0] < result.upscaled[1] ? `enlarged from ${result.upscaled[0]} to ${result.upscaled[1]} px` : '',
+      ].filter(Boolean).join(', ');
+      return `Saved /${path} (${facts}), made with ${result.model}${result.cutout ? `, and beside it the object as the service cut it out (a PNG with a transparent background${prepared ? `: ${prepared}` : ''}), /${cutoutPath}` : ''}. Its front faces +Z, Y is up, and it fits a unit cube. Look at it with preview_screenshot (path: ${path}) before using it.`;
     }
     case 'media_info': {
       const path = normalizePath(need(input, 'path'));
