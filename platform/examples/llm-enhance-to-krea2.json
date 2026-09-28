@@ -1,0 +1,72 @@
+{
+  "_comment": "Two-stage: an LLM (llama.cpp) expands a terse idea into a detailed prompt, which feeds Krea-2 Turbo to render an image. The rewrite instruction lives in the 'instruct' template node (sent as the LLM's user message) so it's visible + editable right in the flow. Needs the 'llama-cpp' (port 8080, with a GGUF chosen in its Model selector) + 'krea2' (port 17910) services running. Web app: open via Flows sidebar → 'Load from File'. CLI: oaiy run examples/llm-enhance-to-krea2.json",
+  "name": "LLM-enhanced Krea-2 image",
+  "flows": [
+    {
+      "id": "llm-enhance-to-krea2",
+      "name": "LLM-enhanced Krea-2 image",
+      "description": "An LLM (llama.cpp) expands a terse idea into a detailed, photorealistic prompt — the rewrite instruction sits in the 'instruct' template node (the LLM's user message) — which feeds Krea-2 Turbo to render the image. Requires the 'llama-cpp' (8080, with a GGUF selected in its Model picker) + 'krea2' (17910) services running.",
+      "graph": {
+        "nodes": [
+          {
+            "id": "idea",
+            "type": "template",
+            "position": { "x": 0, "y": 80 },
+            "data": { "template": "a lighthouse on a cliff" }
+          },
+          {
+            "id": "instruct",
+            "type": "template",
+            "position": { "x": 280, "y": 80 },
+            "data": { "template": "Rewrite the following idea into ONE vivid, detailed, photorealistic text-to-image prompt with concrete style, lighting and mood. Output ONLY the prompt text — no preamble, no quotes.\n\nIdea: {{input}}" }
+          },
+          {
+            "id": "enhance",
+            "type": "service_call",
+            "position": { "x": 600, "y": 80 },
+            "data": {
+              "service": "companion:llama-cpp",
+              "endpoint": "http://127.0.0.1:8080/v1/chat/completions",
+              "method": "POST",
+              "bodyTemplate": "{\"model\": \"local-model\", \"messages\": [{\"role\": \"user\", \"content\": {{input}}}], \"stream\": false}",
+              "responseType": "json",
+              "responsePath": "choices.0.message.content"
+            }
+          },
+          {
+            "id": "image",
+            "type": "service_call",
+            "position": { "x": 920, "y": 80 },
+            "data": {
+              "service": "companion:krea2",
+              "endpoint": "http://127.0.0.1:17910/generate",
+              "method": "POST",
+              "bodyTemplate": "{\"prompt\": {{input}}, \"width\": 1024, \"height\": 1024, \"steps\": 8}",
+              "responseType": "json",
+              "responsePath": "imageUrl"
+            }
+          },
+          {
+            "id": "outPrompt",
+            "type": "output",
+            "position": { "x": 600, "y": 320 },
+            "data": { "label": "enhancedPrompt", "outputType": "text" }
+          },
+          {
+            "id": "outImage",
+            "type": "output",
+            "position": { "x": 1240, "y": 80 },
+            "data": { "label": "image", "outputType": "text" }
+          }
+        ],
+        "edges": [
+          { "id": "e-idea-instruct", "source": "idea", "target": "instruct", "sourceHandle": "result", "targetHandle": "input" },
+          { "id": "e-instruct-enhance", "source": "instruct", "target": "enhance", "sourceHandle": "result", "targetHandle": "input" },
+          { "id": "e-enhance-image", "source": "enhance", "target": "image", "sourceHandle": "response", "targetHandle": "input" },
+          { "id": "e-enhance-outPrompt", "source": "enhance", "target": "outPrompt", "sourceHandle": "response", "targetHandle": "result" },
+          { "id": "e-image-outImage", "source": "image", "target": "outImage", "sourceHandle": "response", "targetHandle": "result" }
+        ]
+      }
+    }
+  ]
+}

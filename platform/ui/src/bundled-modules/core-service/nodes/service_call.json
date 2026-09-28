@@ -1,0 +1,132 @@
+{
+  "id": "service_call",
+  "name": "Service Call",
+  "description": "Call a local HTTP service with a templated request body. The connected input is substituted into the body template; the response is parsed and an optional path extracts the field you want.",
+  "doc": "**Service** is a generic HTTP caller — point it at any local engine you run yourself.\n\n**Pick a Service Preset** to fill the endpoint + method + body template + response path in one click (Ollama / LM Studio / ComfyUI / Whisper / generic). Manage your own presets in **Settings → Services** (web) or paste templates inline on the node.\n\n**Templating** — the connected `input` is available as:\n  - `{{input}}` — JSON-escaped + quoted (safe to drop into a JSON string slot)\n  - `{{inputRaw}}` — raw substitution (use when input is already a JSON object/array)\n  - `{{apiKey}}` — resolves the **API Key Constant**\n  - `{{model}}` — the **Model** field\n  - `{{system}}` — the **System Message** field (chat/LLM bodies)\n\n**Response Path** uses dot/bracket notation: `choices.0.message.content`, `data[0].url`, etc. Leave blank to return the parsed body whole.\n\n**Inline overrides win** — any field you fill on the node overrides the same field from the selected preset.",
+  "icon": "server",
+  "color": "cyan",
+  "tags": ["service", "http", "api", "integration", "ollama", "comfyui", "webhook"],
+  "inputs": [
+    {
+      "id": "input",
+      "name": "Input",
+      "type": "any",
+      "position": "left",
+      "description": "The data to send — referenced as {{input}} (JSON-escaped) or {{inputRaw}} (raw) in the body template."
+    }
+  ],
+  "outputs": [
+    {
+      "id": "response",
+      "name": "Response",
+      "type": "any",
+      "position": "right",
+      "description": "The extracted response (via Response Path) or the parsed body when path is blank."
+    }
+  ],
+  "properties": [
+    {
+      "id": "service",
+      "name": "Service Preset",
+      "type": "select",
+      "default": "",
+      "dynamicOptionsSource": "service:list",
+      "description": "Pick a built-in or saved service. The fields below override the preset's values."
+    },
+    {
+      "id": "model",
+      "name": "Model",
+      "type": "string",
+      "default": "",
+      "placeholder": "Model name",
+      "description": "Model name sent to the service. Substituted into the body template as {{model}}; legacy templates with a literal model string are rewritten in place when this changes. Leave blank to inherit from the service preset."
+    },
+    {
+      "id": "systemMessage",
+      "name": "System Message (LLM)",
+      "type": "textarea",
+      "default": "",
+      "rows": 3,
+      "placeholder": "You are a helpful assistant…",
+      "description": "Optional system prompt for chat/LLM services (llama.cpp, Ollama, OpenAI-compatible). Substituted into the body as {{system}} (JSON-escaped). The built-in chat presets already include a {\"role\":\"system\"} slot, so just fill this in; for a custom body add {\"role\": \"system\", \"content\": {{system}}}."
+    },
+    {
+      "id": "endpoint",
+      "name": "Endpoint URL",
+      "type": "string",
+      "default": "",
+      "placeholder": "http://localhost:11434/api/generate",
+      "description": "Full URL to the service."
+    },
+    {
+      "id": "method",
+      "name": "HTTP Method",
+      "type": "select",
+      "default": "POST",
+      "options": [
+        { "value": "GET", "label": "GET" },
+        { "value": "POST", "label": "POST" },
+        { "value": "PUT", "label": "PUT" },
+        { "value": "DELETE", "label": "DELETE" },
+        { "value": "PATCH", "label": "PATCH" }
+      ]
+    },
+    {
+      "id": "bodyTemplate",
+      "name": "Body Template",
+      "type": "textarea",
+      "default": "",
+      "rows": 6,
+      "placeholder": "{\"prompt\": {{input}}, \"stream\": false}",
+      "description": "Request body. Use {{input}} (JSON-escaped) or {{inputRaw}} for raw substitution. Ignored for GET/HEAD."
+    },
+    {
+      "id": "responseType",
+      "name": "Response Type",
+      "type": "select",
+      "default": "json",
+      "options": [
+        { "value": "json", "label": "JSON" },
+        { "value": "text", "label": "Text" }
+      ]
+    },
+    {
+      "id": "responsePath",
+      "name": "Response Path",
+      "type": "string",
+      "default": "",
+      "placeholder": "choices.0.message.content",
+      "description": "Dot/bracket path to extract from the response. Blank = return the whole parsed body."
+    },
+    {
+      "id": "headers",
+      "name": "Headers (JSON template)",
+      "type": "textarea",
+      "default": "",
+      "rows": 2,
+      "placeholder": "{\"Authorization\": \"Bearer {{apiKey}}\"}",
+      "description": "HTTP headers as JSON. {{apiKey}} resolves the API Key Constant. Blank = Content-Type: application/json.",
+      "advanced": true
+    },
+    {
+      "id": "apiKeyConstant",
+      "name": "API Key Constant",
+      "type": "string",
+      "default": "",
+      "placeholder": "Constant name (e.g. OPENAI_API_KEY)",
+      "description": "Name of a Project Constant whose value is the API key, accessible as {{apiKey}} in headers + body.",
+      "advanced": true
+    }
+  ],
+  "compiler": {
+    "async": true,
+    "abortable": true,
+    "statusTracking": true,
+    "customHandler": true
+  },
+  "ui": {
+    "width": 320,
+    "resizable": true,
+    "minWidth": 260
+  }
+}

@@ -1,0 +1,85 @@
+{
+  "id": "core-browser",
+  "name": "Core Browser",
+  "version": "2.0.0",
+  "description": "Native Chromium browser automation, HTTP requests, and extraction helpers",
+  "author": "OAIY Team",
+  "category": "Browser",
+  "icon": "globe",
+  "color": "cyan",
+  "nodes": [
+    "browser_session",
+    "browser_page",
+    "browser_extract",
+    "browser_action",
+    "browser_request"
+  ],
+  "permissions": [
+    "network",
+    "browser.session",
+    "browser.navigate",
+    "browser.evaluate",
+    "browser.screenshot",
+    "browser.cookies",
+    "browser.proxy",
+    "browser.engine.update",
+    "filesystem.read",
+    "filesystem.write"
+  ],
+  "runtime": {
+    "typescript": "runtime.ts",
+    "compiler": "compiler.ts",
+    "native": {
+      "plugin": "oaiy-browser",
+      "source": "native/src/lib.rs",
+      "cargo": "native/Cargo.toml"
+    }
+  },
+  "settings": {
+    "defaultMode": {
+      "type": "select",
+      "label": "Default Session Mode",
+      "description": "Default browser session mode. Chromium uses the bundled engine and CDP; WebView uses the Tauri embedded view; HTTP is plain fetch.",
+      "default": "chromium",
+      "options": [
+        { "value": "chromium", "label": "Bundled Chromium (CDP)" },
+        { "value": "webview", "label": "WebView (Tauri embedded)" },
+        { "value": "http", "label": "HTTP Only (fetch)" }
+      ]
+    },
+    "defaultUserAgent": {
+      "type": "string",
+      "label": "Default User Agent",
+      "description": "Default user agent string for requests"
+    },
+    "defaultTimeout": {
+      "type": "number",
+      "label": "Default Timeout (ms)",
+      "description": "Default timeout for browser operations",
+      "default": 30000
+    },
+    "engineChannel": {
+      "type": "select",
+      "label": "Browser Engine Channel",
+      "description": "Which managed Chromium channel to track",
+      "default": "stable",
+      "options": [
+        { "value": "stable", "label": "Stable" },
+        { "value": "beta", "label": "Beta" },
+        { "value": "pinned", "label": "Pinned (no auto-updates)" }
+      ]
+    },
+    "engineAutoCheck": {
+      "type": "boolean",
+      "label": "Check for engine updates",
+      "description": "Periodically check for new managed Chromium builds",
+      "default": true
+    },
+    "engineAutoDownload": {
+      "type": "boolean",
+      "label": "Auto-download engine updates",
+      "description": "Download new engine builds without asking. Bundled engine always stays as a fallback.",
+      "default": false
+    }
+  }
+}

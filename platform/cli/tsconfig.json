@@ -1,0 +1,31 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "lib": ["ES2023"],
+    "strict": true,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "resolveJsonModule": true,
+    "allowJs": true,
+    "noEmit": true,
+    "allowImportingTsExtensions": true,
+    "types": ["node"],
+    "baseUrl": ".",
+    "paths": {
+      // `../ui/**` files import these, and Node resolution walks up from THEIR
+      // directory — never into `cli/node_modules` — so a checkout that installed
+      // only this workspace cannot resolve them. `cli` declares both itself, so
+      // point at its own copies rather than making CI install the ui tree.
+      "acorn": ["./node_modules/acorn"],
+      "uuid": ["./node_modules/uuid"],
+      "oaiy-core": ["../ui/vendor/oaiy-core/src/index.ts"],
+      "oaiy-core/modules/*": ["../ui/src/bundled-modules/*"],
+      "oaiy-core/*": ["../ui/vendor/oaiy-core/*"],
+      "@tauri-apps/api/core": ["./src/node-host/core.ts"],
+      "@tauri-apps/plugin-sql": ["./src/node-host/sql.ts"]
+    }
+  },
+  "include": ["src"]
+}

@@ -1,0 +1,19 @@
+{
+  "id": "llama-cpp-server",
+  "name": "llama.cpp server",
+  "description": "OpenAI-compatible local LLM server. The install script makes a venv and installs llama-cpp-python[server]; point --model at a GGUF in your models dir.",
+  "category": "LLM",
+  "defaultPort": 8080,
+  "install": {
+    "kind": "script",
+    "windows": "@echo off\r\n\"%OAIY_DATA_DIR%\\python\\python.exe\" -m venv \"%OAIY_VENVS_DIR%\\llamacpp\"\r\n\"%OAIY_VENVS_DIR%\\llamacpp\\Scripts\\pip.exe\" install -U \"llama-cpp-python[server]\"\r\n"
+  },
+  "run": {
+    "command": "${dataDir}/venvs/llamacpp/Scripts/python.exe",
+    "args": ["-m", "llama_cpp.server", "--host", "127.0.0.1", "--port", "${port}", "--model", "${modelsDir}/model.gguf"],
+    "env": {},
+    "cwd": null
+  },
+  "health": { "url": "http://127.0.0.1:${port}/v1/models", "timeoutSecs": 90 },
+  "docsUrl": "https://github.com/abetlen/llama-cpp-python"
+}

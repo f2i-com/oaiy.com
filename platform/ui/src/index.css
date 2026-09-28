@@ -1,0 +1,2584 @@
+@import "tailwindcss";
+
+/* The @font-face rules for the two self-hosted families are NOT imported here.
+   They come in through the JS graph instead — see src/styles/fonts.ts, which
+   every page entry imports alongside this file, and which explains why. */
+
+/* Tailwind v4 is CSS-first and does NOT pick up tailwind.config.js on its own.
+   Without this the JS config is dead: its theme extensions and — more visibly —
+   the custom `short:` variant (@media (max-height: 780px), used across 9 dialog
+   components to compact them on short screens) register as nothing, so those
+   utilities silently emit no CSS. */
+@config "../tailwind.config.js";
+
+/* Configure dark mode variant for class-based switching */
+@variant dark (&:where(.dark, .dark *));
+
+/* ============================================
+   DESIGN TOKENS — OAIY design system.
+
+   Two named themes, not one palette with a dark filter:
+     Prism Lab    (dark, the house default) — #070a12 shell, violet primary,
+                  cyan/magenta/green/amber signal accents, soft glows.
+     Paper Circuit (light) — #f3f0e9 warm paper, one blue primary, HARD offset
+                  shadows (2px 2px 0), squarer radii, no glow.
+
+   Colours are space-separated RGB triples so every consumer can compose alpha
+   via `rgb(var(--token) / 0.5)` — that contract is unchanged, only the values
+   and the semantics of the two themes are new.
+   ============================================ */
+:root {
+  /* One neutral grotesque carries every sans role (the prototype has no serif);
+     JetBrains Mono carries the data/code voice. --font-display is kept as a
+     token name because ~40 components reference it, but it now points at the
+     same family with tighter tracking applied via .font-display. */
+  /* 'Inter Variable' first, then plain 'Inter'. The self-hosted @font-face rules
+     declare the -Variable name (that is fontsource's convention for the variable
+     cuts), so a stack asking only for 'Inter' matches nothing and silently falls
+     through to Segoe UI — which is exactly what happened when these were first
+     un-CDN'd, and it is invisible unless you check document.fonts. Plain 'Inter'
+     is kept behind it so a locally installed copy is still honoured. */
+  --font-display: 'Inter Variable', Inter, ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --font-body: 'Inter Variable', Inter, ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --font-mono: 'JetBrains Mono Variable', 'JetBrains Mono', ui-monospace, 'SF Mono', 'Cascadia Mono', Menlo, monospace;
+
+  font-family: var(--font-body);
+  line-height: 1.5;
+  font-weight: 400;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+
+  /* Spacing scale */
+  --space-1: 0.25rem;
+  --space-2: 0.5rem;
+  --space-3: 0.75rem;
+  --space-4: 1rem;
+  --space-5: 1.25rem;
+  --space-6: 1.5rem;
+  --space-8: 2rem;
+
+  /* Transitions */
+  --transition-fast: 150ms ease;
+  --transition-base: 200ms ease;
+  --transition-slow: 300ms ease;
+
+  /* Border radius */
+  --radius-sm: 0.375rem;
+  --radius-md: 0.5rem;
+  --radius-lg: 0.75rem;
+  --radius-xl: 1rem;
+  --radius-full: 9999px;
+
+  /* Accent color (OAIY brand: violet; can be customized via ThemeContext) */
+  --accent-primary: 113 103 255;
+  --accent-hover: 141 133 255;
+  --accent-glow: 113 103 255;
+  --accent-secondary: 64 116 213;
+
+  /* Signal accents — fixed hues that do NOT follow the customizable accent.
+     Node kinds, edge classes and status chrome key off these. */
+  --signal-cyan: 53 212 232;
+  --signal-magenta: 231 107 243;
+  --signal-green: 69 214 162;
+  --signal-amber: 242 184 75;
+  --signal-danger: 255 110 120;
+
+  /* Dynamic background tint (can be customized via ThemeContext) */
+  --bg-primary: 8 13 24;
+  --bg-secondary: 14 20 34;
+  --bg-tertiary: 19 28 45;
+
+  /* Default theme colors — Prism Lab (dark) is the house default. */
+  color-scheme: dark;
+  --color-bg-primary: 7 10 18;
+  --color-bg-secondary: 14 20 34;
+  --color-bg-tertiary: 19 28 45;
+  --color-bg-elevated: 14 20 34;
+  --color-bg-canvas: 8 13 24;
+  --color-text-primary: 244 247 255;
+  --color-text-secondary: 152 166 189;
+  --color-text-tertiary: 113 126 149;
+  --color-text-muted: 117 126 146;
+  --color-border-primary: 32 42 60;
+  --color-border-secondary: 22 30 44;
+  --color-border-strong: 51 66 92;
+  --dot: 38 52 77;
+
+  /* Prism Lab shadows — deep and diffuse. */
+  --shadow-sm: 0 1px 2px 0 rgb(0 0 0 / 0.35);
+  --shadow-md: 0 10px 26px rgb(0 0 0 / 0.18), 0 2px 4px -2px rgb(0 0 0 / 0.3);
+  --shadow-lg: 0 18px 50px rgb(0 0 0 / 0.28);
+  --shadow-glow-accent: 0 0 0 3px rgb(var(--accent-primary) / 0.3);
+  --shadow-glow-green: 0 0 0 3px rgb(var(--signal-green) / 0.3);
+}
+
+/* ============================================
+   BASE INTERACTION POLISH — theme-aware (tracks the customizable accent)
+   ============================================ */
+:root {
+  /* Native form controls (checkbox / radio / range / progress) follow the theme accent instead
+     of the browser's default blue. Inherited, so it reaches every control. */
+  accent-color: rgb(var(--accent-primary));
+  /* Suppress the grey flash WebView2 / touch paints over a tapped element. */
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* Text selection picks up the (user-customizable) accent as a soft tint — a small brand touch
+   visible everywhere, and it tracks whatever accent the user chose in Settings. */
+::selection {
+  background-color: rgb(var(--accent-primary) / 0.22);
+  /* Normalize selected text to the primary color so accent-colored text (links, the violet
+     headline accent, status text) stays readable on the tint — and it adapts to light/dark. */
+  color: rgb(var(--color-text-primary));
+}
+
+/* ============================================
+   PAPER CIRCUIT — light theme. Warm paper, ONE blue primary, hard offset
+   shadows instead of glows, squarer corners. Not a lightened Prism Lab.
+   ============================================ */
+:root.light {
+  color-scheme: light;
+
+  --accent-primary: 36 87 230;
+  --accent-hover: 26 68 190;
+  --accent-glow: 36 87 230;
+  --accent-secondary: 36 87 230;
+
+  --signal-cyan: 22 117 185;
+  --signal-magenta: 239 94 76;
+  --signal-green: 33 132 80;
+  --signal-amber: 156 106 8;
+  --signal-danger: 233 75 60;
+
+  --bg-primary: 248 245 238;
+  --bg-secondary: 255 254 250;
+  --bg-tertiary: 246 243 237;
+
+  /* Background colors */
+  --color-bg-primary: 243 240 233;
+  --color-bg-secondary: 255 254 250;
+  --color-bg-tertiary: 246 243 237;
+  --color-bg-elevated: 255 255 255;
+  --color-bg-canvas: 248 245 238;
+
+  /* Text colors — near-black ink on paper */
+  --color-text-primary: 23 23 23;
+  --color-text-secondary: 104 100 94;
+  --color-text-tertiary: 114 109 102;
+  --color-text-muted: 114 109 104;
+
+  /* Border colors — warm graphite */
+  --color-border-primary: 206 200 190;
+  --color-border-secondary: 222 216 206;
+  --color-border-strong: 159 153 143;
+  --dot: 215 209 199;
+
+  /* Paper Circuit's signature: an un-blurred offset, like ink on card. */
+  --shadow-sm: 1px 1px 0 rgb(50 42 30 / 0.05);
+  --shadow-md: 2px 2px 0 rgb(50 42 30 / 0.045);
+  --shadow-lg: 6px 6px 0 rgb(28 24 18 / 0.13);
+  --shadow-glow-accent: 0 0 0 3px rgb(var(--accent-primary) / 0.18);
+  --shadow-glow-green: 0 0 0 3px rgb(var(--signal-green) / 0.22);
+}
+
+/* ============================================
+   PRISM LAB — dark theme (also the bare :root default above)
+   ============================================ */
+:root.dark, :root:not(.light) {
+  color-scheme: dark;
+
+  --signal-cyan: 53 212 232;
+  --signal-magenta: 231 107 243;
+  --signal-green: 69 214 162;
+  --signal-amber: 242 184 75;
+  --signal-danger: 255 110 120;
+
+  /* Background colors */
+  --color-bg-primary: 7 10 18;
+  --color-bg-secondary: 14 20 34;
+  --color-bg-tertiary: 19 28 45;
+  --color-bg-elevated: 14 20 34;
+  --color-bg-canvas: 8 13 24;
+
+  /* Text colors */
+  --color-text-primary: 244 247 255;
+  --color-text-secondary: 152 166 189;
+  --color-text-tertiary: 113 126 149;
+  --color-text-muted: 117 126 146;
+
+  /* Border colors */
+  --color-border-primary: 32 42 60;
+  --color-border-secondary: 22 30 44;
+  --color-border-strong: 51 66 92;
+  --dot: 38 52 77;
+
+  /* Shadows */
+  --shadow-sm: 0 1px 2px 0 rgb(0 0 0 / 0.35);
+  --shadow-md: 0 10px 26px rgb(0 0 0 / 0.18), 0 2px 4px -2px rgb(0 0 0 / 0.3);
+  --shadow-lg: 0 18px 50px rgb(0 0 0 / 0.28);
+  --shadow-glow-accent: 0 0 0 3px rgb(var(--accent-primary) / 0.3);
+  --shadow-glow-green: 0 0 0 3px rgb(var(--signal-green) / 0.3);
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+  min-height: 100dvh;
+  background-color: rgb(var(--color-bg-primary));
+  color: rgb(var(--color-text-primary));
+  font-family: var(--font-body);
+  font-feature-settings: 'ss01', 'ss02', 'cv11';
+}
+
+#root {
+  width: 100%;
+  height: 100vh;
+  height: 100dvh;
+}
+
+/* Display typography — the same grotesque, tightened. The OAIY design system
+   has no serif: headline voice comes from weight + negative tracking, exactly
+   as in the prototype's .page-intro h2 / .top-title h1. */
+.font-display {
+  font-family: var(--font-display);
+  font-weight: 620;
+  letter-spacing: -0.035em;
+}
+
+/* Mono utility — tabular numbers for IDs, paths, status */
+.font-mono {
+  font-family: var(--font-mono);
+  font-feature-settings: 'tnum';
+  letter-spacing: -0.01em;
+}
+
+/* Subtle dot grid background — for canvas / ambient surfaces. Matches the
+   prototype's --dot at an 18px gap. */
+.bg-dotgrid {
+  background-image: radial-gradient(circle, rgb(var(--dot)) 1px, transparent 1px);
+  background-size: 18px 18px;
+  background-position: 0 0;
+}
+
+/* ============================================
+   GLOBAL FOCUS STATES
+   ============================================ */
+
+/* Improved focus visibility for all interactive elements */
+button:focus-visible,
+a:focus-visible,
+input:focus-visible,
+textarea:focus-visible,
+select:focus-visible,
+[tabindex]:focus-visible {
+  /* transparent outline = a visible ring in Windows forced-colors / high-contrast,
+     which strips box-shadow; the box-shadow is the styled ring everywhere else. */
+  outline: 2px solid transparent;
+  outline-offset: 2px;
+  box-shadow: 0 0 0 2px rgb(var(--color-bg-elevated)), 0 0 0 5px rgb(var(--accent-primary));
+}
+
+/* Focus within for custom components */
+.focus-ring:focus-within {
+  box-shadow: 0 0 0 2px rgb(var(--color-bg-elevated)), 0 0 0 5px rgb(var(--accent-primary));
+}
+
+/* ============================================
+   BUTTON UTILITIES
+   ============================================ */
+
+/* Base button reset */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.45rem;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  font-weight: 580;
+  white-space: nowrap;
+  transition: background var(--transition-fast), border-color var(--transition-fast),
+    transform 60ms ease, box-shadow var(--transition-fast);
+  cursor: pointer;
+  user-select: none;
+}
+
+.btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* Button sizes */
+.btn-sm {
+  padding: 0.375rem 0.75rem;
+  font-size: 0.75rem;
+  line-height: 1rem;
+}
+
+.btn-md {
+  padding: 0.5rem 1rem;
+  font-size: 0.875rem;
+  line-height: 1.25rem;
+}
+
+.btn-lg {
+  padding: 0.625rem 1.25rem;
+  font-size: 0.875rem;
+  line-height: 1.25rem;
+}
+
+/* Button variants */
+/* The design system's primary: a lit gradient with an accent bloom under it in
+   Prism Lab; Paper Circuit keeps the gradient but drops the bloom, because a
+   glow on paper reads as a printing error rather than emphasis. */
+.btn-primary {
+  border-color: rgb(var(--accent-primary));
+  background: linear-gradient(115deg, rgb(var(--accent-fill, var(--accent-primary))), rgb(var(--accent-fill-2, var(--accent-secondary))));
+  color: white;
+  box-shadow: 0 8px 22px rgb(var(--accent-primary) / 0.25),
+              inset 0 1px 0 rgb(255 255 255 / 0.2);
+}
+:root.light .btn-primary {
+  box-shadow: 2px 2px 0 rgb(50 42 30 / 0.1), inset 0 1px 0 rgb(255 255 255 / 0.2);
+}
+
+.btn-primary:hover:not(:disabled) { transform: translateY(-1px); }
+.btn-primary:active:not(:disabled) { transform: translateY(0); }
+
+.btn-secondary {
+  border-color: rgb(var(--color-border-strong));
+  background-color: rgb(var(--color-bg-tertiary) / 0.7);
+  color: rgb(var(--color-text-primary));
+}
+
+.btn-secondary:hover:not(:disabled) {
+  border-color: rgb(var(--accent-primary));
+  background-color: rgb(var(--accent-primary) / 0.14);
+}
+
+.btn-ghost {
+  background-color: transparent;
+  color: rgb(var(--color-text-secondary));
+}
+
+.btn-ghost:hover:not(:disabled) {
+  background-color: rgb(var(--color-bg-tertiary) / 0.7);
+  color: rgb(var(--color-text-primary));
+}
+
+.btn-danger {
+  background-color: rgb(220 38 38);
+  color: white;
+}
+
+.btn-danger:hover:not(:disabled) {
+  background-color: rgb(239 68 68);
+}
+
+.btn-warning {
+  background-color: rgb(180 83 9);
+  color: white;
+}
+
+.btn-warning:hover:not(:disabled) {
+  background-color: rgb(217 119 6);
+}
+
+/* Icon button */
+.btn-icon {
+  padding: 0.5rem;
+  border-radius: var(--radius-md);
+}
+
+.btn-icon-sm {
+  padding: 0.375rem;
+}
+
+/* ============================================
+   INPUT UTILITIES
+   ============================================ */
+
+.input {
+  width: 100%;
+  padding-top: 0.5rem;
+  padding-bottom: 0.5rem;
+  padding-left: 2rem;
+  padding-right: 0.75rem;
+  background-color: rgb(var(--color-bg-elevated));
+  border: 1px solid rgb(var(--color-border-primary));
+  border-radius: var(--radius-md);
+  color: rgb(var(--color-text-primary));
+  font-size: 0.875rem;
+  font-family: var(--font-body);
+  transition: border-color var(--transition-fast), box-shadow var(--transition-fast);
+}
+
+.input::placeholder {
+  color: rgb(var(--color-text-muted));
+}
+
+.input:hover:not(:disabled) {
+  border-color: rgb(var(--color-text-muted));
+}
+
+.input:focus {
+  outline: none;
+  border-color: rgb(var(--accent-primary));
+  box-shadow: var(--shadow-glow-accent);
+}
+
+.input:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* ============================================
+   PANEL UTILITIES
+   ============================================ */
+
+.panel {
+  background-color: rgb(var(--color-bg-elevated));
+  border: 1px solid rgb(var(--color-border-primary));
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+}
+
+.panel-header {
+  padding: 0.75rem 1rem;
+  border-bottom: 1px solid rgb(var(--color-border-secondary));
+  background-color: rgb(var(--color-bg-tertiary) / 0.4);
+}
+
+.panel-body {
+  padding: 1rem;
+}
+
+.panel-footer {
+  padding: 0.75rem 1rem;
+  border-top: 1px solid rgb(var(--color-border-secondary));
+  background-color: rgb(var(--color-bg-tertiary) / 0.4);
+}
+
+/* ============================================
+   CARD UTILITIES
+   ============================================ */
+
+.card {
+  background-color: rgb(var(--color-bg-secondary));
+  border: 1px solid rgb(var(--color-border-primary));
+  border-radius: 11px;
+  box-shadow: var(--shadow-md);
+  padding: 1rem;
+  transition: border-color var(--transition-fast), background var(--transition-fast),
+    transform var(--transition-fast), box-shadow var(--transition-fast);
+}
+/* Paper Circuit squares the corners and swaps the diffuse shadow for a hard
+   offset — the single strongest cue that it is a different theme, not a tint. */
+:root.light .card { border-radius: 8px; }
+
+.card-interactive:hover {
+  border-color: rgb(var(--accent-primary) / 0.35);
+  background-color: rgb(var(--color-bg-secondary));
+  transform: translateY(-1px);
+  box-shadow: var(--shadow-md);
+}
+
+.card-interactive:active {
+  transform: translateY(0);
+}
+
+/* ============================================
+   LIST UTILITIES
+   ============================================ */
+
+.list-item {
+  padding: 0.625rem 0.75rem;
+  border-radius: var(--radius-md);
+  transition: background-color var(--transition-fast), color var(--transition-fast);
+  cursor: pointer;
+  color: rgb(var(--color-text-secondary));
+}
+
+.list-item:hover {
+  background-color: rgb(var(--color-bg-tertiary) / 0.7);
+  color: rgb(var(--color-text-primary));
+}
+
+.list-item-active {
+  background-color: rgb(var(--accent-primary) / 0.10);
+  color: rgb(var(--accent-primary));
+  font-weight: 500;
+}
+
+.list-item-active:hover {
+  background-color: rgb(var(--accent-primary) / 0.14);
+  color: rgb(var(--accent-primary));
+}
+
+/* ============================================
+   TRANSITIONS & ANIMATIONS
+   ============================================ */
+
+/* Fade in */
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+  }
+
+  to {
+    opacity: 1;
+  }
+}
+
+.animate-fadeIn {
+  animation: fadeIn var(--transition-base) forwards;
+}
+
+/* Slide up */
+@keyframes slideUp {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.animate-slideUp {
+  animation: slideUp var(--transition-base) forwards;
+}
+
+/* Slide down */
+@keyframes slideDown {
+  from {
+    opacity: 0;
+    transform: translateY(-10px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.animate-slideDown {
+  animation: slideDown var(--transition-base) forwards;
+}
+
+/* Scale in */
+@keyframes scaleIn {
+  from {
+    opacity: 0;
+    transform: scale(0.95);
+  }
+
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+.animate-scaleIn {
+  animation: scaleIn var(--transition-fast) forwards;
+}
+
+/* Blinking cursor animation for streaming */
+@keyframes blink {
+
+  0%,
+  50% {
+    opacity: 1;
+  }
+
+  51%,
+  100% {
+    opacity: 0;
+  }
+}
+
+.animate-blink {
+  animation: blink 1s step-end infinite;
+}
+
+/* Spin animation */
+@keyframes spin {
+  from {
+    transform: rotate(0deg);
+  }
+
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.animate-spin {
+  animation: spin 1s linear infinite;
+}
+
+/* Pulse animation */
+@keyframes pulse {
+
+  0%,
+  100% {
+    opacity: 1;
+  }
+
+  50% {
+    opacity: 0.5;
+  }
+}
+
+.animate-pulse {
+  animation: pulse 2s ease-in-out infinite;
+}
+
+/* Toast Animations */
+@keyframes toast-enter {
+  from {
+    opacity: 0;
+    transform: translateX(100%);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+@keyframes toast-exit {
+  from {
+    opacity: 1;
+    transform: translateX(0);
+  }
+
+  to {
+    opacity: 0;
+    transform: translateX(100%);
+  }
+}
+
+.animate-toast-enter {
+  animation: toast-enter 0.3s ease-out forwards;
+}
+
+.animate-toast-exit {
+  animation: toast-exit 0.3s ease-in forwards;
+}
+
+/* ============================================
+   REACT FLOW CUSTOMIZATIONS
+   ============================================ */
+
+.react-flow__node {
+  border-radius: var(--radius-lg);
+  background: transparent !important;
+  border: none !important;
+  box-shadow: none !important;
+  outline: none !important;
+}
+
+.react-flow__node.selected,
+.react-flow__node:focus,
+.react-flow__node:focus-visible {
+  background: transparent !important;
+  border: none !important;
+  box-shadow: none !important;
+  outline: none !important;
+}
+
+.react-flow__node.selected>div {
+  box-shadow: 0 0 0 2px rgb(var(--accent-primary));
+  border-radius: var(--radius-lg);
+}
+
+.react-flow__handle {
+  /* Force larger handle size for easier clicking */
+  width: 1.5rem !important;
+  height: 1.5rem !important;
+  min-width: 1.5rem !important;
+  min-height: 1.5rem !important;
+  border-radius: var(--radius-full);
+  border-width: 2px;
+  border-color: rgb(var(--color-text-muted));
+  transition: border-color var(--transition-fast), box-shadow var(--transition-fast);
+}
+
+.react-flow__handle:hover {
+  border-color: rgb(var(--accent-primary));
+  box-shadow: 0 0 0 3px rgb(var(--accent-primary) / 0.25);
+}
+
+.react-flow__handle-left {
+  left: -0.75rem;
+}
+
+.react-flow__handle-right {
+  right: -0.75rem;
+}
+
+/* Edge styles */
+.react-flow__edge {
+  pointer-events: all;
+  cursor: pointer;
+}
+
+.react-flow__edge-path {
+  stroke: rgb(var(--color-text-muted));
+  stroke-width: 2;
+  pointer-events: stroke;
+  transition: stroke var(--transition-fast), stroke-width var(--transition-fast);
+}
+
+.react-flow__edge.selected .react-flow__edge-path {
+  stroke: rgb(var(--accent-primary));
+  stroke-width: 3;
+}
+
+.react-flow__edge:hover .react-flow__edge-path {
+  stroke: rgb(var(--color-text-secondary));
+  stroke-width: 3;
+}
+
+.react-flow__edge.selected:hover .react-flow__edge-path {
+  stroke: rgb(var(--accent-hover));
+}
+
+/* ============================================
+   CUSTOM SCROLLBAR
+   ============================================ */
+
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background-color: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background-color: rgb(var(--color-text-muted) / 0.4);
+  border-radius: var(--radius-full);
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background-color: rgb(var(--color-text-muted) / 0.65);
+}
+
+/* Firefox scrollbar */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: rgb(var(--color-text-muted) / 0.4) transparent;
+}
+
+/* ============================================
+   FORM ELEMENTS IN REACT FLOW
+   ============================================ */
+
+/* Ensure text selection works in form elements */
+input,
+textarea,
+select,
+[contenteditable] {
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+/* Allow text selection to be deselected on click */
+.react-flow {
+  user-select: none;
+}
+
+.react-flow__node input,
+.react-flow__node textarea,
+.react-flow__node select {
+  user-select: text;
+  -webkit-user-select: text;
+  cursor: text;
+}
+
+/* Prevent React Flow from intercepting mouse events on form elements */
+.react-flow__node input,
+.react-flow__node textarea,
+.react-flow__node select,
+.react-flow__node button {
+  pointer-events: auto;
+}
+
+/* ============================================
+   NODE STATUS ANIMATIONS
+   ============================================ */
+
+@keyframes pulse-glow {
+
+  0%,
+  100% {
+    box-shadow: 0 0 5px 0 rgb(var(--accent-primary) / 0.5),
+      0 0 20px 0 rgb(var(--accent-primary) / 0.3);
+  }
+
+  50% {
+    box-shadow: 0 0 10px 2px rgb(var(--accent-primary) / 0.8),
+      0 0 40px 5px rgb(var(--accent-primary) / 0.4);
+  }
+}
+
+@keyframes success-flash {
+  0% {
+    box-shadow: 0 0 20px 5px rgba(34, 197, 94, 0.8);
+  }
+
+  100% {
+    box-shadow: none;
+  }
+}
+
+.node-running {
+  animation: pulse-glow 1.5s ease-in-out infinite;
+  border-color: rgb(var(--accent-primary)) !important;
+}
+
+.node-completed {
+  animation: success-flash 0.5s ease-out forwards;
+}
+
+.node-error {
+  box-shadow: 0 0 15px 3px rgba(239, 68, 68, 0.6);
+  border-color: rgb(239 68 68) !important;
+}
+
+/* ============================================
+   EMPTY STATE UTILITIES
+   ============================================ */
+
+.empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 2rem 1rem;
+  text-align: center;
+  color: rgb(var(--color-text-tertiary));
+}
+
+.empty-state-icon {
+  width: 3rem;
+  height: 3rem;
+  margin-bottom: 1rem;
+  opacity: 0.5;
+}
+
+.empty-state-title {
+  font-size: 0.875rem;
+  font-weight: 500;
+  color: rgb(var(--color-text-primary));
+  margin-bottom: 0.25rem;
+}
+
+.empty-state-description {
+  font-size: 0.75rem;
+  color: rgb(var(--color-text-tertiary));
+}
+
+/* ============================================
+   SKELETON LOADING
+   ============================================ */
+
+@keyframes shimmer {
+  0% {
+    background-position: -200% 0;
+  }
+
+  100% {
+    background-position: 200% 0;
+  }
+}
+
+.skeleton {
+  background: linear-gradient(90deg,
+      rgb(var(--color-bg-tertiary)) 25%,
+      rgb(var(--color-bg-secondary)) 50%,
+      rgb(var(--color-bg-tertiary)) 75%);
+  background-size: 200% 100%;
+  animation: shimmer 1.5s ease-in-out infinite;
+  border-radius: var(--radius-md);
+}
+
+/* ============================================
+   TOOLTIP
+   ============================================ */
+
+.tooltip {
+  position: relative;
+}
+
+.tooltip::after {
+  content: attr(data-tooltip);
+  position: absolute;
+  bottom: 100%;
+  left: 50%;
+  transform: translateX(-50%) translateY(-0.5rem);
+  padding: 0.375rem 0.625rem;
+  background-color: rgb(var(--color-text-primary));
+  border: 1px solid rgb(var(--color-text-primary));
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-md);
+  font-size: 0.75rem;
+  color: rgb(var(--color-bg-elevated));
+  white-space: nowrap;
+  opacity: 0;
+  visibility: hidden;
+  transition: all var(--transition-fast);
+  pointer-events: none;
+  z-index: 50;
+}
+
+.tooltip:hover::after {
+  opacity: 1;
+  visibility: visible;
+  transform: translateX(-50%) translateY(-0.25rem);
+}
+
+/* ============================================
+   BADGE UTILITIES
+   ============================================ */
+
+.badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.125rem 0.5rem;
+  font-size: 0.625rem;
+  font-weight: 500;
+  border-radius: var(--radius-full);
+  text-transform: uppercase;
+  letter-spacing: 0.025em;
+}
+
+/* Light-theme base: dark, high-contrast text on a soft color tint. */
+.badge-blue {
+  background-color: rgb(59 130 246 / 0.14);
+  color: rgb(29 78 216);
+}
+
+.badge-green {
+  background-color: rgb(34 197 94 / 0.16);
+  color: rgb(21 128 61);
+}
+
+.badge-red {
+  background-color: rgb(239 68 68 / 0.14);
+  color: rgb(185 28 28);
+}
+
+.badge-amber {
+  background-color: rgb(245 158 11 / 0.16);
+  color: rgb(180 83 9);
+}
+
+.badge-slate {
+  background-color: rgb(100 116 139 / 0.14);
+  color: rgb(51 65 85);
+}
+
+/* Dark theme: the original light-on-tint values read better on a dark surface. */
+:where(.dark) .badge-blue  { background-color: rgb(59 130 246 / 0.2); color: rgb(147 197 253); }
+:where(.dark) .badge-green { background-color: rgb(34 197 94 / 0.2); color: rgb(134 239 172); }
+:where(.dark) .badge-red   { background-color: rgb(239 68 68 / 0.2); color: rgb(252 165 165); }
+:where(.dark) .badge-amber { background-color: rgb(245 158 11 / 0.2); color: rgb(252 211 77); }
+:where(.dark) .badge-slate { background-color: rgb(100 116 139 / 0.2); color: rgb(203 213 225); }
+
+/* ============================================
+   LANDING PAGE (marketing root at /)
+   ============================================
+   Scoped helpers used only by src/landing/*. Namespaced `lp-` so they
+   never collide with app styles. All animations collapse correctly under
+   the prefers-reduced-motion block below (it !important-overrides
+   animation-duration globally), so the graph simply renders in its
+   final, fully-drawn state for motion-sensitive users. */
+
+/* Staggered entrance — pair with an inline animation-delay. */
+@keyframes lp-fade-up {
+  from { opacity: 0; transform: translateY(14px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.lp-reveal {
+  opacity: 0;
+  animation: lp-fade-up 0.7s cubic-bezier(0.22, 0.7, 0.2, 1) forwards;
+}
+
+/* ---------- the hero run ----------
+   One shared 6.4 s timeline, expressed per node as keyframes over the status
+   light's fill and the card's outline. Percentages are seconds/6.4:
+
+     image_gen  runs 0.0–0.8   → done      runs again 3.2–4.0 → done
+     ai_llm     runs 0.9–1.9   → done      runs again 4.1–5.1 → done
+     condition  runs 2.0–2.5   → False     runs again 5.2–5.6 → True
+     output                                runs 5.7–6.1 → done
+
+   Every lane uses the same duration and delay so they stay in step. Wires
+   light while data is on them; the False wire marches only during the loop.
+   `both` holds the first frame through the delay, so nothing flashes in
+   before the run starts. */
+.lp-status, .lp-card, .lp-wire, .lp-wire-true, .lp-wire-false,
+.lp-run-dot, .lp-run-label {
+  animation-duration: 6.4s;
+  animation-timing-function: linear;
+  animation-delay: 0.9s;
+  animation-fill-mode: both;
+}
+.lp-status { fill: rgb(var(--color-border-strong)); }
+.lp-card {
+  stroke: rgb(var(--color-border-strong));
+  stroke-width: 1.2;
+}
+.lp-status.lp-run-a { animation-name: lp-st-a; }
+.lp-status.lp-run-b { animation-name: lp-st-b; }
+.lp-status.lp-run-c { animation-name: lp-st-c; }
+.lp-status.lp-run-d { animation-name: lp-st-d; }
+.lp-card.lp-run-a { animation-name: lp-cd-a; }
+.lp-card.lp-run-b { animation-name: lp-cd-b; }
+.lp-card.lp-run-c { animation-name: lp-cd-c; }
+.lp-card.lp-run-d { animation-name: lp-cd-d; }
+
+@keyframes lp-st-a {
+  0%, 12% { fill: rgb(var(--accent-primary)); }
+  13%, 50% { fill: rgb(var(--signal-green)); }
+  51%, 62% { fill: rgb(var(--accent-primary)); }
+  63%, 100% { fill: rgb(var(--signal-green)); }
+}
+@keyframes lp-cd-a {
+  0%, 12% { stroke: rgb(var(--accent-primary)); stroke-width: 2; }
+  13%, 50% { stroke: rgb(var(--color-border-strong)); stroke-width: 1.2; }
+  51%, 62% { stroke: rgb(var(--accent-primary)); stroke-width: 2; }
+  63%, 100% { stroke: rgb(var(--color-border-strong)); stroke-width: 1.2; }
+}
+@keyframes lp-st-b {
+  0%, 14% { fill: rgb(var(--color-border-strong)); }
+  15%, 29% { fill: rgb(var(--accent-primary)); }
+  30%, 63% { fill: rgb(var(--signal-green)); }
+  64%, 79% { fill: rgb(var(--accent-primary)); }
+  80%, 100% { fill: rgb(var(--signal-green)); }
+}
+@keyframes lp-cd-b {
+  0%, 14% { stroke: rgb(var(--color-border-strong)); stroke-width: 1.2; }
+  15%, 29% { stroke: rgb(var(--accent-primary)); stroke-width: 2; }
+  30%, 63% { stroke: rgb(var(--color-border-strong)); stroke-width: 1.2; }
+  64%, 79% { stroke: rgb(var(--accent-primary)); stroke-width: 2; }
+  80%, 100% { stroke: rgb(var(--color-border-strong)); stroke-width: 1.2; }
+}
+@keyframes lp-st-c {
+  0%, 31% { fill: rgb(var(--color-border-strong)); }
+  32%, 38% { fill: rgb(var(--accent-primary)); }
+  39%, 80% { fill: rgb(var(--signal-amber)); }
+  81%, 86% { fill: rgb(var(--accent-primary)); }
+  87%, 100% { fill: rgb(var(--signal-green)); }
+}
+@keyframes lp-cd-c {
+  0%, 31% { stroke: rgb(var(--color-border-strong)); stroke-width: 1.2; }
+  32%, 38% { stroke: rgb(var(--accent-primary)); stroke-width: 2; }
+  39%, 80% { stroke: rgb(var(--color-border-strong)); stroke-width: 1.2; }
+  81%, 86% { stroke: rgb(var(--accent-primary)); stroke-width: 2; }
+  87%, 100% { stroke: rgb(var(--color-border-strong)); stroke-width: 1.2; }
+}
+@keyframes lp-st-d {
+  0%, 88% { fill: rgb(var(--color-border-strong)); }
+  89%, 94% { fill: rgb(var(--accent-primary)); }
+  95%, 100% { fill: rgb(var(--signal-green)); }
+}
+@keyframes lp-cd-d {
+  0%, 88% { stroke: rgb(var(--color-border-strong)); stroke-width: 1.2; }
+  89%, 94% { stroke: rgb(var(--accent-primary)); stroke-width: 2; }
+  95%, 100% { stroke: rgb(var(--signal-green)); stroke-width: 1.6; }
+}
+
+.lp-wire {
+  fill: none;
+  stroke: rgb(var(--color-text-tertiary) / 0.55);
+  stroke-width: 2;
+}
+.lp-wire-1 { animation-name: lp-w1; }
+.lp-wire-2 { animation-name: lp-w2; }
+@keyframes lp-w1 {
+  0%, 11% { stroke: rgb(var(--color-text-tertiary) / 0.55); }
+  12%, 15% { stroke: rgb(var(--accent-primary)); }
+  16%, 61% { stroke: rgb(var(--color-text-tertiary) / 0.55); }
+  62%, 65% { stroke: rgb(var(--accent-primary)); }
+  66%, 100% { stroke: rgb(var(--color-text-tertiary) / 0.55); }
+}
+@keyframes lp-w2 {
+  0%, 28% { stroke: rgb(var(--color-text-tertiary) / 0.55); }
+  29%, 32% { stroke: rgb(var(--accent-primary)); }
+  33%, 78% { stroke: rgb(var(--color-text-tertiary) / 0.55); }
+  79%, 82% { stroke: rgb(var(--accent-primary)); }
+  83%, 100% { stroke: rgb(var(--color-text-tertiary) / 0.55); }
+}
+.lp-wire-true { animation-name: lp-wt; }
+@keyframes lp-wt {
+  0%, 86% { opacity: 0.3; }
+  87%, 100% { opacity: 1; }
+}
+.lp-wire-false { animation-name: lp-wf; }
+@keyframes lp-wf {
+  0%, 38% { opacity: 0.4; }
+  39%, 50% { opacity: 1; }
+  51%, 100% { opacity: 0.4; }
+}
+/* The False wire marches only while the loop is live. */
+@keyframes lp-edge-march { to { stroke-dashoffset: -26; } }
+.lp-edge-flow { animation: lp-edge-march 0.9s linear infinite; }
+.lp-wire-label {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.04em;
+}
+
+/* Run chip in the window bar: a pulse while running, a settled line once done. */
+.lp-run-chip {
+  align-items: center;
+  gap: 7px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: rgb(var(--color-text-secondary));
+}
+.lp-run-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 999px;
+  background: rgb(var(--accent-primary));
+  animation-name: lp-run-dot;
+}
+@keyframes lp-run-dot {
+  0%, 94% { background: rgb(var(--accent-primary)); }
+  95%, 100% { background: rgb(var(--signal-green)); }
+}
+/* Both labels share one grid cell, so the chip is sized by the longer of the
+   two and the swap happens in place instead of overflowing the bar. */
+.lp-run-chip { display: inline-grid; grid-template-columns: auto auto; }
+.lp-run-label { grid-column: 2; grid-row: 1; white-space: nowrap; }
+.lp-run-label-running { animation-name: lp-run-lr; }
+.lp-run-label-done { animation-name: lp-run-ld; }
+@keyframes lp-run-lr { 0%, 94% { opacity: 1; } 95%, 100% { opacity: 0; } }
+@keyframes lp-run-ld { 0%, 94% { opacity: 0; } 95%, 100% { opacity: 1; } }
+
+/* ============================================
+   REDUCED MOTION
+   ============================================
+   Users who set `prefers-reduced-motion: reduce` (Windows: Settings →
+   Ease of Access → Display → "Show animations in Windows"; macOS:
+   System Settings → Accessibility → Display → "Reduce motion") get
+   shortened animations and transitions everywhere. Vestibular-disorder
+   users find translate/scale/rotate effects nauseating, so we collapse
+   them to ~0ms.
+
+   Exceptions kept at full duration:
+   - `.animate-spin`: loading spinners need to keep moving so users
+     still get progress feedback — otherwise a 5-minute generation
+     looks identical to a hang. We slow them slightly (1.5s vs 1s) to
+     reduce visual intensity but keep them rotating.
+   - `.animate-pulse`: same reasoning for "alive" indicators on
+     in-progress jobs. */
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+
+  /* The landing hero's run lanes have a start delay so they stay in step;
+     with motion reduced they should simply arrive finished, not idle first. */
+  .lp-status, .lp-card, .lp-wire, .lp-wire-true, .lp-wire-false,
+  .lp-run-dot, .lp-run-label {
+    animation-delay: 0s !important;
+  }
+
+  /* Spinners and "alive" pulses still need to convey activity. */
+  .animate-spin,
+  [class*="animate-spin"] {
+    animation-duration: 1.5s !important;
+    animation-iteration-count: infinite !important;
+  }
+  .animate-pulse,
+  [class*="animate-pulse"] {
+    animation-duration: 3s !important;
+    animation-iteration-count: infinite !important;
+  }
+}
+
+/* ============================================================================
+   OAIY SHELL — the design system's app chrome, ported from the OAIY prototype.
+
+   Layout is a 222px sidebar + a workspace grid of 72px topbar / canvas /
+   64px endpoint dock. These are plain semantic classes (not Tailwind
+   utilities) because they carry the brand and need to stay legible as one
+   block; the panels inside them keep their existing utility classes.
+
+   Breakpoints mirror the prototype: 1240 collapses the sidebar to an icon
+   rail, 960 hides the dock chips, 760 compacts the topbar.
+   ============================================================================ */
+
+.app-shell {
+  display: grid;
+  grid-template-columns: 222px minmax(0, 1fr);
+  /* 100% not 100vw: on a desktop with a classic scrollbar, 100vw INCLUDES the
+     gutter and forces a horizontal scroll of exactly the scrollbar width.
+     dvh not vh: on iOS and Android the URL bar collapses on scroll, and 100vh
+     is the TALLEST viewport -- so the bottom dock sat permanently below the
+     fold, which for this shell means the primary action row. */
+  width: 100%;
+  height: 100vh;
+  height: 100dvh;
+  overflow: hidden;
+  overscroll-behavior: none;
+  background:
+    radial-gradient(circle at 72% -5%, rgb(var(--accent-primary) / 0.13), transparent 32%),
+    rgb(var(--color-bg-primary));
+  color: rgb(var(--color-text-primary));
+  font-size: 14px;
+}
+:root.light .app-shell {
+  background:
+    radial-gradient(circle at 72% -5%, rgb(var(--accent-primary) / 0.06), transparent 32%),
+    rgb(var(--color-bg-primary));
+}
+
+.oaiy-skip {
+  position: fixed;
+  z-index: 200;
+  top: 8px;
+  left: 8px;
+  transform: translateY(-160%);
+  border-radius: 6px;
+  background: rgb(var(--accent-primary));
+  color: #fff;
+  padding: 8px 11px;
+  text-decoration: none;
+}
+.oaiy-skip:focus { transform: translateY(0); }
+
+/* ---------- sidebar ---------- */
+
+.oaiy-sidebar {
+  z-index: 10;
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  border-right: 1px solid rgb(var(--color-border-primary));
+  background: rgb(var(--color-bg-secondary));
+  padding: 25px 14px 16px;
+}
+
+.oaiy-brand { padding: 0 12px; }
+.oaiy-brand > strong {
+  display: block;
+  font-size: 34px;
+  font-weight: 650;
+  letter-spacing: 0.11em;
+  line-height: 1;
+}
+.oaiy-brand > span {
+  display: block;
+  margin-top: 8px;
+  color: rgb(var(--color-text-secondary));
+  font-size: 12px;
+}
+.oaiy-brand > small {
+  display: block;
+  margin-top: 11px;
+  color: rgb(var(--color-text-tertiary));
+  font-size: 11px;
+}
+
+.oaiy-new {
+  display: flex;
+  width: 100%;
+  height: 42px;
+  align-items: center;
+  gap: 9px;
+  margin-top: 28px;
+  border: 1px solid rgb(var(--color-border-strong));
+  border-radius: 9px;
+  background: transparent;
+  color: rgb(var(--color-text-primary));
+  padding: 0 11px;
+  font-size: 12px;
+  text-align: left;
+  transition: border-color 0.14s, background 0.14s;
+}
+.oaiy-new { cursor: pointer; }
+.oaiy-new:hover {
+  border-color: rgb(var(--accent-primary));
+  background: rgb(var(--accent-primary) / 0.14);
+}
+.oaiy-new > span { flex: 1; min-width: 0; }
+
+
+.oaiy-nav { display: flex; flex-direction: column; gap: 4px; margin-top: 18px; }
+.oaiy-nav button,
+.oaiy-settings-btn {
+  position: relative;
+  display: flex;
+  width: 100%;
+  min-height: 43px;
+  align-items: center;
+  gap: 13px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: rgb(var(--color-text-secondary));
+  padding: 0 12px;
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.14s, color 0.14s;
+}
+.oaiy-nav button:hover,
+.oaiy-settings-btn:hover {
+  background: rgb(var(--color-bg-tertiary) / 0.7);
+  color: rgb(var(--color-text-primary));
+}
+.oaiy-nav button.active,
+.oaiy-settings-btn.active {
+  background: linear-gradient(90deg, rgb(var(--accent-primary) / 0.14), transparent);
+  color: rgb(var(--color-text-primary));
+}
+.oaiy-nav button.active::before,
+.oaiy-settings-btn.active::before {
+  position: absolute;
+  top: 9px;
+  bottom: 9px;
+  left: 0;
+  width: 2px;
+  border-radius: 4px;
+  background: rgb(var(--accent-primary));
+  content: '';
+}
+.oaiy-nav button > span,
+.oaiy-settings-btn > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.oaiy-nav button > em {
+  margin-left: auto;
+  border-radius: 999px;
+  background: rgb(var(--accent-primary) / 0.16);
+  color: rgb(var(--accent-primary));
+  padding: 2px 6px;
+  font-size: 9px;
+  font-style: normal;
+  font-weight: 700;
+}
+
+.oaiy-fill { flex: 1; }
+
+.oaiy-engine {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 12px 0;
+  border: 1px solid rgb(var(--color-border-primary));
+  border-radius: 9px;
+  background: rgb(var(--color-bg-tertiary) / 0.7);
+  padding: 11px;
+}
+.oaiy-engine > svg { flex: none; color: rgb(var(--signal-green)); }
+.oaiy-engine.off > svg { color: rgb(var(--color-text-tertiary)); }
+.oaiy-engine > span { display: flex; min-width: 0; flex-direction: column; gap: 2px; }
+.oaiy-engine strong { font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em; }
+.oaiy-engine small {
+  overflow: hidden;
+  color: rgb(var(--color-text-tertiary));
+  font-size: 9px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.oaiy-engine > i {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: rgb(var(--signal-green));
+  box-shadow: 0 0 0 4px rgb(var(--signal-green) / 0.12);
+}
+.oaiy-engine.off > i {
+  background: rgb(var(--color-text-tertiary));
+  box-shadow: 0 0 0 4px rgb(var(--color-text-tertiary) / 0.12);
+}
+
+.oaiy-trust {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 11px 12px 0;
+  color: rgb(var(--color-text-tertiary));
+  font-size: 10px;
+}
+
+/* ---------- workspace ---------- */
+
+.oaiy-workspace {
+  display: grid;
+  min-width: 0;
+  min-height: 0;
+  grid-template-rows: 72px minmax(0, 1fr) 64px;
+}
+
+.oaiy-topbar {
+  z-index: 8;
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  border-bottom: 1px solid rgb(var(--color-border-primary));
+  background: rgb(var(--color-bg-secondary) / 0.91);
+  padding: 0 19px 0 24px;
+  backdrop-filter: blur(18px);
+}
+.oaiy-title { min-width: 0; }
+.oaiy-title > span {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 5px;
+  color: rgb(var(--color-text-tertiary));
+  font-size: 9px;
+  font-weight: 650;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.oaiy-title > div { display: flex; min-width: 0; align-items: center; gap: 9px; }
+.oaiy-title h1,
+.oaiy-title input.oaiy-name {
+  overflow: hidden;
+  min-width: 0;
+  max-width: 320px;
+  margin: 0;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  outline: 0;
+  background: transparent;
+  color: rgb(var(--color-text-primary));
+  padding: 1px 4px;
+  font-family: inherit;
+  font-size: 17px;
+  font-weight: 630;
+  letter-spacing: -0.02em;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.oaiy-title input.oaiy-name:hover { border-color: rgb(var(--color-border-primary)); }
+.oaiy-title input.oaiy-name:focus {
+  border-color: rgb(var(--accent-primary));
+  background: rgb(var(--color-bg-tertiary) / 0.6);
+  box-shadow: none;
+}
+.oaiy-chip {
+  flex: none;
+  border: 1px solid rgb(var(--color-border-primary));
+  border-radius: 999px;
+  background: rgb(var(--color-bg-tertiary) / 0.7);
+  color: rgb(var(--color-text-secondary));
+  padding: 3px 7px;
+  font-size: 9px;
+  font-style: normal;
+  white-space: nowrap;
+}
+.oaiy-chip.ok {
+  border-color: rgb(var(--signal-green) / 0.35);
+  background: rgb(var(--signal-green) / 0.12);
+  color: rgb(var(--signal-green));
+}
+.oaiy-chip.accent {
+  border-color: rgb(var(--accent-primary) / 0.35);
+  background: rgb(var(--accent-primary) / 0.14);
+  color: rgb(var(--accent-primary));
+}
+.oaiy-saved {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 5px;
+  color: rgb(var(--color-text-tertiary));
+  font-size: 10px;
+  white-space: nowrap;
+}
+.oaiy-saved svg { color: rgb(var(--signal-green)); }
+
+.oaiy-actions {
+  display: flex;
+  min-width: 0;
+  flex: 0 1 auto;
+  align-items: center;
+  /* flex-START, not flex-end, even though this cluster sits on the right.
+     The box is `flex: 0 1 auto`, so while everything fits its width IS the
+     content width and the two are visually identical. They differ only when it
+     overflows -- and with flex-end the overflow spills past the START edge,
+     where `overflow: hidden` clipped it and no amount of scrolling could reach
+     it (scrollLeft cannot go negative in LTR). At 390px that is seven icon
+     buttons in about 209px, so the theme toggle and the flows-rail button were
+     simply gone. flex-start puts the overflow at the end, where it is
+     scrollable. */
+  justify-content: flex-start;
+  gap: 8px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  /* Scrollable, but without a scrollbar sitting across a 40px-tall toolbar. */
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+.oaiy-actions::-webkit-scrollbar { display: none; }
+/* With the scrollbar hidden, an overflowing row is indistinguishable from a
+   short one -- at 390px that hid Settings, the wizard and Import behind a
+   gesture nobody had a reason to try. Fade the trailing edge so the row reads
+   as continuing.
+
+   CSS cannot ask "is this overflowing", so the fade is unconditional and the
+   trailing padding is what keeps it honest: it is exactly as wide as the fade,
+   so when everything fits the gradient falls entirely on padding and no button
+   is dimmed, and when the row is scrolled to its end that same padding arrives
+   under the fade to signal there is nothing further. In between -- the only
+   case where content is actually hidden -- the fade lands on a real button and
+   says so. */
+@media (width < 760px) {
+  .oaiy-actions {
+    padding-right: 22px;
+    -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 22px), transparent);
+    mask-image: linear-gradient(to right, #000 calc(100% - 22px), transparent);
+  }
+}
+/* Icon buttons keep their size; shrinking them to avoid the overflow would
+   trade an unreachable control for an untappable one. */
+.oaiy-actions > * { flex: 0 0 auto; }
+
+.oaiy-toggle {
+  display: flex;
+  border: 1px solid rgb(var(--color-border-primary));
+  border-radius: 8px;
+  background: rgb(var(--color-bg-tertiary) / 0.7);
+  padding: 2px;
+}
+.oaiy-icon-btn {
+  display: grid;
+  width: 30px;
+  height: 30px;
+  flex: 0 0 auto;
+  place-items: center;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: rgb(var(--color-text-secondary));
+  padding: 0;
+  cursor: pointer;
+  transition: background 0.14s, color 0.14s;
+}
+.oaiy-icon-btn:hover,
+.oaiy-icon-btn.active {
+  background: rgb(var(--color-bg-elevated));
+  color: rgb(var(--color-text-primary));
+}
+.oaiy-icon-btn.on {
+  background: rgb(var(--accent-primary) / 0.14);
+  color: rgb(var(--accent-primary));
+}
+/* Declared after `.on` deliberately: at equal specificity the later rule wins,
+   and without this an enabled toggle has no hover feedback at all. */
+.oaiy-icon-btn.on:hover {
+  background: rgb(var(--accent-primary) / 0.24);
+}
+
+/* Buttons in the shell reuse the .btn / .btn-primary utilities above rather
+   than a parallel .oaiy-btn family — the duplicate set was unused. */
+/* ---------- canvas region ---------- */
+
+.oaiy-view { position: relative; min-width: 0; min-height: 0; overflow: hidden; }
+.oaiy-canvas-wrap {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  background: rgb(var(--color-bg-canvas));
+}
+/* Ambient prism wash over the canvas — the prototype's .canvas::before. */
+.oaiy-canvas-wrap::before {
+  position: absolute;
+  z-index: 0;
+  inset: 0;
+  pointer-events: none;
+  background:
+    radial-gradient(circle at 72% 16%, rgb(var(--accent-primary) / 0.1), transparent 36%),
+    radial-gradient(circle at 35% 72%, rgb(var(--signal-cyan) / 0.07), transparent 30%);
+  content: '';
+}
+:root.light .oaiy-canvas-wrap::before { opacity: 0.35; }
+
+/* ---------- endpoint dock ---------- */
+
+.oaiy-dock {
+  z-index: 9;
+  display: grid;
+  min-width: 0;
+  grid-template-columns: auto minmax(200px, 1fr) auto auto auto;
+  align-items: center;
+  gap: 9px;
+  border-top: 1px solid rgb(var(--color-border-primary));
+  background: rgb(var(--color-bg-secondary));
+  padding: 0 17px;
+}
+.oaiy-dock > button {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  border: 0;
+  background: transparent;
+  padding: 0;
+  cursor: pointer;
+  text-align: left;
+}
+.oaiy-dock > button > i {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: rgb(var(--signal-green));
+  box-shadow: 0 0 0 4px rgb(var(--signal-green) / 0.12);
+}
+.oaiy-dock.off > button > i {
+  background: rgb(var(--color-text-tertiary));
+  box-shadow: 0 0 0 4px rgb(var(--color-text-tertiary) / 0.12);
+}
+.oaiy-dock > button > span { display: flex; min-width: 0; flex-direction: column; gap: 2px; }
+.oaiy-dock > button strong { font-size: 9px; }
+.oaiy-dock > button small { color: rgb(var(--color-text-tertiary)); font-size: 8px; }
+.oaiy-dock > button:hover { color: rgb(var(--color-text-primary)); }
+.oaiy-dock > button:hover small { color: rgb(var(--color-text-secondary)); }
+.oaiy-dock-url {
+  display: flex;
+  min-width: 0;
+  height: 35px;
+  align-items: center;
+  border: 1px solid rgb(var(--color-border-primary));
+  border-radius: 7px;
+  background: rgb(var(--color-bg-tertiary) / 0.7);
+  padding-left: 11px;
+}
+.oaiy-dock-url code {
+  overflow: hidden;
+  min-width: 0;
+  flex: 1;
+  color: rgb(var(--color-text-secondary));
+  font-family: var(--font-mono);
+  font-size: 9px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.oaiy-dock > em {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border: 1px solid rgb(var(--accent-primary) / 0.35);
+  border-radius: 999px;
+  background: rgb(var(--accent-primary) / 0.14);
+  color: rgb(var(--accent-primary));
+  padding: 5px 7px;
+  font-size: 8px;
+  font-style: normal;
+  white-space: nowrap;
+}
+.oaiy-dock > em.ok {
+  border-color: rgb(var(--signal-green) / 0.35);
+  background: rgb(var(--signal-green) / 0.12);
+  color: rgb(var(--signal-green));
+}
+.oaiy-dock > button:last-child { color: rgb(var(--color-text-secondary)); font-size: 9px; }
+
+/* ---------- react-flow, in the prototype's voice ---------- */
+
+.oaiy-canvas-wrap .react-flow__edge-path {
+  stroke: rgb(var(--color-border-strong));
+  stroke-width: 1.7;
+}
+.oaiy-canvas-wrap .react-flow__edge.selected .react-flow__edge-path,
+.oaiy-canvas-wrap .react-flow__edge:hover .react-flow__edge-path {
+  stroke: rgb(var(--accent-primary));
+  stroke-width: 2.25;
+}
+.oaiy-canvas-wrap .react-flow__edge.animated .react-flow__edge-path {
+  stroke-width: 2.25;
+  filter: drop-shadow(0 0 4px currentColor);
+}
+.oaiy-canvas-wrap .react-flow__edge-text { fill: rgb(var(--color-text-secondary)); font-size: 9px; }
+.oaiy-canvas-wrap .react-flow__edge-textbg {
+  fill: rgb(var(--color-bg-secondary));
+  stroke: rgb(var(--color-border-primary));
+  stroke-width: 0.5;
+}
+.oaiy-canvas-wrap .react-flow__controls {
+  overflow: hidden;
+  border: 1px solid rgb(var(--color-border-primary)) !important;
+  border-radius: 8px !important;
+  background: rgb(var(--color-bg-secondary)) !important;
+  box-shadow: var(--shadow-lg) !important;
+}
+.oaiy-canvas-wrap .react-flow__controls button {
+  width: 30px !important;
+  height: 30px !important;
+  border-bottom-color: rgb(var(--color-border-primary)) !important;
+  background: rgb(var(--color-bg-secondary)) !important;
+  fill: rgb(var(--color-text-secondary)) !important;
+}
+.oaiy-canvas-wrap .react-flow__minimap {
+  overflow: hidden;
+  border: 1px solid rgb(var(--color-border-primary)) !important;
+  border-radius: 8px !important;
+  background: rgb(var(--color-bg-secondary)) !important;
+  box-shadow: var(--shadow-lg) !important;
+}
+.oaiy-canvas-wrap .react-flow__minimap-mask {
+  fill: rgb(var(--color-bg-primary) / 0.78);
+}
+.oaiy-canvas-wrap .react-flow__minimap-node {
+  fill: rgb(var(--accent-primary) / 0.55);
+  stroke: none;
+}
+.oaiy-canvas-wrap .react-flow__attribution { display: none; }
+
+/* ---------- touch targets ----------
+   Guarded on `pointer: coarse` rather than a width, because the thing that
+   matters is the input device, not the viewport: a 390px browser window on a
+   desktop is still driven by a mouse and does not need 44px controls, while a
+   1024px tablet is driven by a thumb and does. Nothing here can match on a
+   mouse-driven machine, so the desktop layout is untouched by construction.
+
+   30x30 is the measured size of the theme toggle and the nav links -- fine for
+   a cursor, under the 44px both Apple and Google publish for a fingertip. The
+   box grows without the icon moving, so nothing reflows. */
+@media (pointer: coarse) {
+  .oaiy-icon-btn {
+    min-width: 44px;
+    min-height: 44px;
+  }
+  .site-nav-links > a:not(.btn) {
+    padding-top: 12px;
+    padding-bottom: 12px;
+  }
+  /* Every button, not a hand-picked list: the landing CTAs measured 38-42px,
+     and picking selectors one at a time guarantees the next one added is
+     missed. min-height only, so type and line box are unchanged. */
+  .btn,
+  button.btn,
+  a.btn {
+    min-height: 44px;
+  }
+  /* Icon-only buttons carry no text to widen them, so the min-height above left
+     the thumb toolbar 38px wide -- tall enough, too narrow to hit. */
+  .btn.btn-icon,
+  button.btn.btn-icon {
+    min-width: 44px;
+  }
+  /* React Flow ships its zoom stack as 30x30 buttons flush against each other,
+     so the tap targets are both undersized and touching. */
+  .oaiy-canvas-wrap .react-flow__controls {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .oaiy-canvas-wrap .react-flow__controls button {
+    min-width: 44px;
+    min-height: 44px;
+  }
+  .oaiy-nav { gap: 8px; }
+  .oaiy-nav button {
+    min-height: 44px;
+  }
+  /* The status dot stays 8px -- it is a readout, not a control surface. Only
+     the box around it grows, so nothing reflows. */
+  .oaiy-dock > button:first-child {
+    min-width: 44px;
+    min-height: 44px;
+    justify-content: center;
+  }
+}
+
+/* ---------- responsive, mirroring the prototype ---------- */
+
+@media (max-width: 1240px) {
+  .app-shell { grid-template-columns: 74px minmax(0, 1fr); }
+  .oaiy-sidebar { align-items: center; padding-right: 10px; padding-left: 10px; }
+  .oaiy-brand { padding: 0; text-align: center; }
+  .oaiy-brand > strong { font-size: 19px; letter-spacing: 0.05em; }
+  .oaiy-brand > span,
+  .oaiy-brand > small,
+  .oaiy-new > span,
+  .oaiy-nav button > span,
+  .oaiy-nav button > em,
+  .oaiy-settings-btn > span,
+  .oaiy-engine > span,
+  .oaiy-trust span { display: none; }
+  .oaiy-new,
+  .oaiy-nav,
+  .oaiy-settings-btn { width: 43px; }
+  .oaiy-new,
+  .oaiy-nav button,
+  .oaiy-settings-btn { justify-content: center; padding: 0; }
+  .oaiy-engine { width: 43px; justify-content: center; padding: 7px; }
+  .oaiy-engine > i { top: 4px; right: 4px; }
+  .oaiy-trust { padding: 8px 0 0; }
+}
+
+@media (max-width: 960px) {
+  .oaiy-dock { grid-template-columns: auto minmax(150px, 1fr) auto; }
+  .oaiy-dock > em { display: none; }
+  .oaiy-saved { display: none; }
+}
+
+@media (max-width: 760px) {
+  .oaiy-workspace { grid-template-rows: 65px minmax(0, 1fr) 56px; }
+  .oaiy-topbar { padding: 0 10px 0 14px; }
+  .oaiy-title > span,
+  .oaiy-chip { display: none; }
+  .oaiy-title h1,
+  .oaiy-title input.oaiy-name { font-size: 14px; }
+  .oaiy-dock { grid-template-columns: auto minmax(0, 1fr); padding: 0 10px; }
+  .oaiy-dock > button:last-child,
+  .oaiy-dock > button > span { display: none; }
+}
+
+/* ---------- phone: the rail becomes a drawer ----------
+   Above md the rail is a grid column and always visible; the opener and the
+   scrim below are not rendered, so none of this can fire. Below md the grid
+   collapses to ONE column and the rail goes off-canvas.
+
+   The reason is arithmetic: at 390px the two-column shell spent 74px -- 19% of
+   the screen -- on an icon strip that could not be expanded OR dismissed,
+   leaving 316px for a node canvas. A drawer gives the canvas the whole width
+   and gives the rail its labels back, which the 74px version had to hide. */
+@media (width < 760px) {
+  .app-shell { grid-template-columns: minmax(0, 1fr); }
+
+  .oaiy-sidebar {
+    position: fixed;
+    /* Above every content overlay, not merely above most of them. The first
+       attempt used 60, which cleared the settings panel (z-50) but sat UNDER
+       the package browser and the package dialogs (z-9999) -- so opening the
+       nav from Plugins slid the drawer in behind the thing it was meant to
+       navigate away from. Navigation chrome outranks the content it moves
+       between, so it is pinned above the highest overlay in the app. */
+    z-index: 10001;
+    top: 0;
+    left: 0;
+    bottom: 0;
+    width: min(78vw, 264px);
+    transform: translateX(-100%);
+    transition: transform 180ms ease;
+    /* Opaque: it sits over the canvas, not beside it. */
+    background: rgb(var(--color-bg-secondary));
+    border-right: 1px solid rgb(var(--color-border-primary));
+    overflow-y: auto;
+    overscroll-behavior: contain;
+  }
+  .oaiy-sidebar.is-open { transform: translateX(0); }
+
+  .oaiy-nav-scrim {
+    position: fixed;
+    /* Directly beneath the drawer and above everything else, so the scrim
+       dims the overlay it is covering rather than appearing under it. */
+    z-index: 10000;
+    inset: 0;
+    background: rgb(0 0 0 / 0.5);
+  }
+
+  /* Off-canvas it has room for words again, so undo the 1240px icon-only
+     collapse rather than shipping a 264px drawer of unlabelled glyphs. */
+  .oaiy-sidebar .oaiy-brand,
+  .oaiy-sidebar .oaiy-brand > span,
+  .oaiy-sidebar .oaiy-brand > small,
+  .oaiy-sidebar .oaiy-new > span,
+  .oaiy-sidebar .oaiy-nav button > span,
+  .oaiy-sidebar .oaiy-nav button > em,
+  .oaiy-sidebar .oaiy-settings-btn > span,
+  .oaiy-sidebar .oaiy-engine > span,
+  .oaiy-sidebar .oaiy-trust span { display: revert; }
+  .oaiy-sidebar { align-items: stretch; padding-right: 14px; padding-left: 14px; }
+  .oaiy-sidebar .oaiy-brand { padding: revert; text-align: left; }
+  .oaiy-sidebar .oaiy-new,
+  .oaiy-sidebar .oaiy-nav,
+  .oaiy-sidebar .oaiy-settings-btn { width: auto; }
+  .oaiy-sidebar .oaiy-new,
+  .oaiy-sidebar .oaiy-nav button,
+  .oaiy-sidebar .oaiy-settings-btn { justify-content: flex-start; padding: 0 10px; }
+  .oaiy-sidebar .oaiy-engine { width: auto; justify-content: flex-start; padding: 9px 10px; }
+}
+
+/* The opener only exists below md; above it the rail is already on screen. */
+.oaiy-nav-open { display: none; flex: 0 0 auto; margin-right: 10px; }
+@media (width < 760px) { .oaiy-nav-open { display: inline-flex; } }
+
+
+
+/* ============================================================================
+   LANDING PAGES — the same design system, applied to the marketing surfaces
+   (index.html and desktop.html). Shared with the app via the tokens above; only
+   the type idiom and the hero flow-node need their own rules.
+   ============================================================================ */
+
+/* The OAIY wordmark: tracked-out caps, exactly the prototype's .brand > strong
+   at a nav-appropriate size. No gradient chip — the letterforms are the mark. */
+.lp-wordmark {
+  font-size: 19px;
+  font-weight: 650;
+  letter-spacing: 0.16em;
+  line-height: 1;
+  color: rgb(var(--color-text-primary));
+}
+.lp-tagline {
+  color: rgb(var(--color-text-tertiary));
+  font-size: 10px;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+}
+
+/* ---------- landing type scale ----------
+   One family (Inter) carries display and text; the display voice is weight
+   and negative tracking, not a second face. JetBrains Mono is reserved for
+   machine facts. Measures stay under ~65 characters. */
+.lp-h1 {
+  font-weight: 640;
+  letter-spacing: -0.045em;
+  line-height: 1.0;
+  font-size: clamp(2.7rem, 7vw, 5.25rem);
+  color: rgb(var(--color-text-primary));
+  text-wrap: balance;
+  max-width: 14ch;
+}
+.lp-h2 {
+  margin: 0;
+  font-size: clamp(1.75rem, 3vw, 2.25rem);
+  font-weight: 620;
+  letter-spacing: -0.03em;
+  line-height: 1.1;
+  color: rgb(var(--color-text-primary));
+  text-wrap: balance;
+}
+.lp-lede {
+  font-size: clamp(1.05rem, 1.4vw, 1.25rem);
+  line-height: 1.55;
+  color: rgb(var(--color-text-secondary));
+  max-width: 34rem;
+}
+
+/* ---------- sections: a heading rail beside the content ---------- */
+.lp-section {
+  padding: 4.5rem 0;
+}
+@media (min-width: 640px) { .lp-section { padding: 6rem 0; } }
+.lp-section + .lp-section { border-top: 1px solid rgb(var(--color-border-secondary)); }
+.lp-rail {
+  position: relative;
+  padding-left: 1.1rem;
+}
+.lp-rail::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 0.35rem;
+  bottom: 0.25rem;
+  width: 3px;
+  border-radius: 3px;
+  background: rgb(var(--tone));
+}
+@media (min-width: 1024px) {
+  .lp-rail { position: sticky; top: 5.5rem; align-self: start; }
+}
+.lp-rail-sub {
+  margin-top: 0.9rem;
+  font-size: 0.975rem;
+  line-height: 1.55;
+  color: rgb(var(--color-text-secondary));
+  max-width: 30rem;
+}
+
+/* ---------- definition list (Why, Desktop features) ---------- */
+.lp-defs {
+  display: grid;
+  gap: 1.75rem 2.5rem;
+  margin: 0;
+}
+@media (min-width: 640px) { .lp-defs { grid-template-columns: 1fr 1fr; } }
+.lp-defs-tight { gap: 1.25rem 2rem; }
+.lp-def {
+  border-top: 2px solid rgb(var(--tone) / 0.7);
+  padding-top: 0.9rem;
+}
+.lp-def dt {
+  font-weight: 620;
+  letter-spacing: -0.01em;
+  font-size: 1.05rem;
+  color: rgb(var(--color-text-primary));
+}
+.lp-def dd {
+  margin: 0.4rem 0 0;
+  font-size: 0.95rem;
+  line-height: 1.55;
+  color: rgb(var(--color-text-secondary));
+  max-width: 34rem;
+}
+
+/* ---------- engines strip ---------- */
+.lp-engines {
+  padding: 1.6rem 0;
+  border-top: 1px solid rgb(var(--color-border-secondary));
+  border-bottom: 1px solid rgb(var(--color-border-secondary));
+  background: rgb(var(--color-bg-secondary) / 0.35);
+}
+.lp-engines-lead {
+  flex-shrink: 0;
+  font-size: 0.95rem;
+  color: rgb(var(--color-text-secondary));
+}
+.lp-engine {
+  padding: 0.35rem 0.75rem;
+  border-radius: 999px;
+  border: 1px solid rgb(var(--color-border-primary));
+  background: rgb(var(--color-bg-elevated));
+  color: rgb(var(--color-text-secondary));
+  font-size: 0.85rem;
+  white-space: nowrap;
+}
+
+/* ---------- the palette, drawn the way the app draws it ----------
+   A family is a colour bar and a name; its nodes are the ids the palette
+   lists, in the mono the app uses for them. */
+.lp-palette {
+  display: grid;
+  gap: 1.25rem;
+}
+@media (min-width: 640px) { .lp-palette { grid-template-columns: 1fr 1fr; } }
+.lp-family {
+  padding: 1rem 1.1rem 1.1rem;
+  border-radius: 10px;
+  border: 1px solid rgb(var(--color-border-secondary));
+  background: rgb(var(--color-bg-elevated) / 0.6);
+}
+.lp-family-head {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+}
+.lp-swatch {
+  width: 4px;
+  height: 22px;
+  border-radius: 999px;
+  background: rgb(var(--tone));
+  flex-shrink: 0;
+}
+.lp-family h3 {
+  font-weight: 620;
+  font-size: 1rem;
+  letter-spacing: -0.01em;
+  color: rgb(var(--color-text-primary));
+}
+.lp-family p {
+  margin: 0.55rem 0 0;
+  font-size: 0.9rem;
+  line-height: 1.5;
+  color: rgb(var(--color-text-secondary));
+}
+.lp-nodes {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  margin-top: 0.8rem;
+}
+.lp-nodes li {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.01em;
+  padding: 0.2rem 0.5rem;
+  border-radius: 6px;
+  color: rgb(var(--tone));
+  background: rgb(var(--tone) / 0.1);
+}
+
+/* ---------- how it works: a real sequence, so it is numbered ---------- */
+.lp-steps {
+  display: grid;
+  gap: 1.5rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  counter-reset: lp-step;
+}
+@media (min-width: 768px) { .lp-steps { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 2rem; } }
+.lp-step {
+  position: relative;
+  padding-top: 1rem;
+  border-top: 2px solid rgb(var(--tone) / 0.7);
+}
+.lp-step-n {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.6rem;
+  height: 1.6rem;
+  border-radius: 999px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: rgb(var(--tone));
+  background: rgb(var(--tone) / 0.12);
+}
+.lp-step h3 {
+  margin-top: 0.75rem;
+  font-weight: 620;
+  font-size: 1.05rem;
+  letter-spacing: -0.01em;
+  color: rgb(var(--color-text-primary));
+}
+.lp-step p {
+  margin-top: 0.4rem;
+  font-size: 0.95rem;
+  line-height: 1.55;
+  color: rgb(var(--color-text-secondary));
+}
+
+/* ---------- privacy checklist ---------- */
+.lp-checks {
+  display: grid;
+  gap: 1.25rem 2rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+@media (min-width: 640px) { .lp-checks { grid-template-columns: 1fr 1fr; } }
+.lp-checks li { display: flex; gap: 0.8rem; }
+.lp-check {
+  margin-top: 0.15rem;
+  display: inline-flex;
+  width: 1.4rem;
+  height: 1.4rem;
+  flex-shrink: 0;
+  align-items: center;
+  justify-content: center;
+  border-radius: 999px;
+  color: rgb(var(--tone));
+  background: rgb(var(--tone) / 0.14);
+}
+.lp-checks h3 {
+  font-weight: 620;
+  font-size: 1rem;
+  letter-spacing: -0.01em;
+  color: rgb(var(--color-text-primary));
+}
+.lp-checks p {
+  margin-top: 0.3rem;
+  font-size: 0.925rem;
+  line-height: 1.5;
+  color: rgb(var(--color-text-secondary));
+}
+
+/* ---------- framed "window" surfaces (hero canvas, desktop diagram, API sample) ---------- */
+.lp-window {
+  border-radius: 14px;
+  border: 1px solid rgb(var(--color-border-primary));
+  background: rgb(var(--color-bg-elevated));
+  box-shadow: var(--shadow-md);
+  overflow: hidden;
+}
+.lp-window-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.55rem 0.9rem;
+  border-bottom: 1px solid rgb(var(--color-border-secondary));
+  background: rgb(var(--color-bg-tertiary) / 0.5);
+}
+.lp-window-file {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: rgb(var(--color-text-tertiary));
+}
+.lp-canvas {
+  background-color: rgb(var(--color-bg-canvas));
+  overflow-x: auto;
+}
+.lp-canvas-svg {
+  display: block;
+  width: 100%;
+  min-width: 640px;
+  height: auto;
+}
+.lp-code {
+  margin: 0;
+  padding: 1rem 1.1rem;
+  overflow-x: auto;
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  line-height: 1.75;
+  color: rgb(var(--color-text-secondary));
+  background: rgb(var(--color-bg-canvas));
+}
+.lp-code-c { color: rgb(var(--color-text-muted)); }
+.lp-code-m { color: rgb(var(--tone)); font-weight: 600; }
+.lp-code-v { color: rgb(var(--signal-green)); }
+
+/* the two-process diagram */
+.lp-procs {
+  padding: 1.25rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+.lp-proc {
+  border-radius: 10px;
+  border: 1px solid rgb(var(--tone) / 0.4);
+  background: rgb(var(--color-bg-elevated) / 0.85);
+  padding: 0.85rem 1rem;
+}
+.lp-proc-where {
+  display: block;
+  font-size: 0.8rem;
+  color: rgb(var(--tone));
+}
+.lp-proc h3 {
+  margin-top: 0.15rem;
+  font-weight: 620;
+  font-size: 1rem;
+  color: rgb(var(--color-text-primary));
+}
+.lp-proc p {
+  margin-top: 0.25rem;
+  font-size: 0.875rem;
+  line-height: 1.5;
+  color: rgb(var(--color-text-secondary));
+}
+.lp-proc-link {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  justify-content: center;
+  color: rgb(var(--color-text-tertiary));
+}
+.lp-proc-wire {
+  flex: 1;
+  height: 0;
+  border-top: 2px dashed rgb(var(--tone) / 0.45);
+}
+.lp-proc-addr {
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+.lp-proc-note {
+  margin-top: 0.4rem;
+  font-size: 0.8rem;
+  line-height: 1.5;
+  color: rgb(var(--color-text-tertiary));
+}
+.lp-proc-note code { font-family: var(--font-mono); }
+
+/* ---------- desktop page: small headings, the field reference, the library ---------- */
+.lp-mini-h {
+  font-weight: 620;
+  font-size: 0.95rem;
+  letter-spacing: -0.01em;
+  color: rgb(var(--color-text-primary));
+  margin-bottom: 0.6rem;
+}
+.lp-fields {
+  display: grid;
+  gap: 0;
+  margin: 0;
+  border-top: 1px solid rgb(var(--color-border-secondary));
+}
+@media (min-width: 768px) { .lp-fields { grid-template-columns: 1fr 1fr; column-gap: 3rem; } }
+.lp-field {
+  display: grid;
+  grid-template-columns: 9rem minmax(0, 1fr);
+  gap: 1rem;
+  padding: 0.8rem 0;
+  border-bottom: 1px solid rgb(var(--color-border-secondary));
+}
+.lp-field dt code {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  color: rgb(var(--tone));
+}
+.lp-field-req {
+  display: block;
+  margin-top: 0.15rem;
+  font-size: 11px;
+  color: rgb(var(--color-text-tertiary));
+}
+.lp-field dd {
+  margin: 0;
+  font-size: 0.9rem;
+  line-height: 1.5;
+  color: rgb(var(--color-text-secondary));
+}
+.lp-note {
+  border-left: 3px solid rgb(var(--tone));
+  padding: 0.2rem 0 0.2rem 1rem;
+  font-size: 0.925rem;
+  line-height: 1.55;
+  color: rgb(var(--color-text-secondary));
+  max-width: 40rem;
+}
+.lp-note p + p { margin-top: 0.4rem; color: rgb(var(--color-text-tertiary)); }
+.lp-note code { font-family: var(--font-mono); font-size: 0.9em; }
+.lp-library {
+  display: grid;
+  gap: 1rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+@media (min-width: 640px) { .lp-library { grid-template-columns: 1fr 1fr; } }
+@media (min-width: 1024px) { .lp-library { grid-template-columns: 1fr 1fr 1fr; } }
+.lp-library-item {
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 1rem 1.1rem;
+  border-radius: 10px;
+  border: 1px solid rgb(var(--color-border-secondary));
+  background: rgb(var(--color-bg-elevated) / 0.6);
+}
+.lp-library-item h3 {
+  font-weight: 620;
+  font-size: 1rem;
+  letter-spacing: -0.01em;
+  color: rgb(var(--color-text-primary));
+}
+.lp-library-cat {
+  display: inline-block;
+  margin-top: 0.25rem;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: rgb(var(--tone));
+}
+.lp-library-item p {
+  margin-top: 0.5rem;
+  font-size: 0.9rem;
+  line-height: 1.5;
+  color: rgb(var(--color-text-secondary));
+}
+.lp-library-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+.lp-library-file {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: rgb(var(--color-text-tertiary));
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ---------- final call ---------- */
+.lp-cta {
+  border-radius: 18px;
+  border: 1px solid rgb(var(--color-border-primary));
+  background-color: rgb(var(--color-bg-elevated));
+  padding: 3rem 1.5rem;
+}
+@media (min-width: 640px) { .lp-cta { padding: 4rem 3.5rem; } }
+
+/* The hero graph's node cards. An SVG <rect> can't take a box-shadow, so the
+   elevation is a filter — diffuse in Prism Lab, a hard offset in Paper Circuit. */
+.lp-graph-card { filter: drop-shadow(0 10px 22px rgb(0 0 0 / 0.35)); }
+:root.light .lp-graph-card { filter: drop-shadow(2px 2px 0 rgb(50 42 30 / 0.07)); }
+
+/* ---------- shared site nav (index.html + desktop.html) ---------- */
+
+.site-nav {
+  position: sticky;
+  z-index: 50;
+  top: 0;
+  border-bottom: 1px solid rgb(var(--color-border-primary));
+  background: rgb(var(--color-bg-primary) / 0.85);
+  backdrop-filter: blur(18px);
+}
+.site-nav-bar {
+  display: flex;
+  max-width: 72rem;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  margin: 0 auto;
+  height: 60px;
+  padding: 0 1.25rem;
+}
+@media (min-width: 640px) { .site-nav-bar { padding: 0 2rem; } }
+
+.site-nav-links { display: flex; align-items: center; gap: 2px; }
+.site-nav-links > a:not(.btn) {
+  position: relative;
+  display: none;
+  border-radius: 7px;
+  color: rgb(var(--color-text-secondary));
+  padding: 7px 11px;
+  font-size: 13px;
+  transition: background 0.14s, color 0.14s;
+}
+@media (min-width: 720px) { .site-nav-links > a:not(.btn) { display: inline-block; } }
+.site-nav-links > a:not(.btn):hover {
+  background: rgb(var(--color-bg-tertiary) / 0.7);
+  color: rgb(var(--color-text-primary));
+  text-decoration: none;
+}
+/* The current page gets the accent underline the app's inspector tabs use, so
+   "where am I" reads the same on the marketing pages as inside the product. */
+.site-nav-links > a.active {
+  color: rgb(var(--color-text-primary));
+  font-weight: 560;
+}
+.site-nav-links > a.active::after {
+  position: absolute;
+  right: 11px;
+  bottom: -1px;
+  left: 11px;
+  height: 2px;
+  border-radius: 3px;
+  background: rgb(var(--accent-primary));
+  content: '';
+}
+.site-nav-links .oaiy-icon-btn { margin-left: 6px; }
+
+/* In-page jump list for whichever page you're on — subordinate to the site bar
+   above it, which is the point: page sections should not look like site nav. */
+.site-subnav {
+  border-top: 1px solid rgb(var(--color-border-secondary));
+  background: rgb(var(--color-bg-secondary) / 0.55);
+}
+.site-subnav nav {
+  display: flex;
+  max-width: 72rem;
+  align-items: center;
+  gap: 2px;
+  margin: 0 auto;
+  overflow-x: auto;
+  padding: 7px 1.25rem;
+  scrollbar-width: none;
+}
+.site-subnav nav::-webkit-scrollbar { display: none; }
+@media (min-width: 640px) { .site-subnav nav { padding: 7px 2rem; } }
+.site-subnav a {
+  flex: none;
+  border-radius: 999px;
+  color: rgb(var(--color-text-tertiary));
+  padding: 4px 10px;
+  font-size: 11px;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+  transition: background 0.14s, color 0.14s;
+}
+.site-subnav a:hover {
+  background: rgb(var(--accent-primary) / 0.12);
+  color: rgb(var(--accent-primary));
+  text-decoration: none;
+}
+
+/* Marching dashes on the hero graph's feedback edge — the visual cue that the
+   loop actually runs. Paused under reduced-motion by the global rule. */
+
+/* GitHub star link in the shared nav. Bordered rather than plain text so it
+   reads as an action next to "Open the app" without competing with it. */
+.site-nav-links > a.site-nav-star {
+  display: none;
+  align-items: center;
+  gap: 7px;
+  margin-left: 8px;
+  border: 1px solid rgb(var(--color-border-strong));
+  border-radius: 8px;
+  background: rgb(var(--color-bg-tertiary) / 0.7);
+  color: rgb(var(--color-text-secondary));
+  padding: 6px 11px;
+  font-size: 12px;
+  font-weight: 560;
+  white-space: nowrap;
+  transition: border-color 0.14s, background 0.14s, color 0.14s;
+}
+@media (min-width: 560px) { .site-nav-links > a.site-nav-star { display: inline-flex; } }
+.site-nav-links > a.site-nav-star:hover {
+  border-color: rgb(var(--accent-primary));
+  background: rgb(var(--accent-primary) / 0.14);
+  color: rgb(var(--color-text-primary));
+  text-decoration: none;
+}
+
+/* Inline "Star us on GitHub" in the closing CTA. */
+.lp-star-inline {
+  color: rgb(var(--accent-primary));
+  font-weight: 560;
+  text-decoration-color: rgb(var(--accent-primary) / 0.4);
+  text-decoration-line: underline;
+  text-underline-offset: 3px;
+}
+.lp-star-inline:hover { text-decoration-color: rgb(var(--accent-primary)); }
+
+/* The topbar's editable names. The project name is an input, the flow name a
+   button — both look like the heading they replace, and both stay reachable. */
+.oaiy-title .oaiy-name-project { max-width: 190px; }
+.oaiy-title .oaiy-name-flow {
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: rgb(var(--color-text-primary));
+  cursor: text;
+  font: inherit;
+  font-size: 17px;
+  font-weight: 630;
+  letter-spacing: -0.02em;
+  max-width: 220px;
+  overflow: hidden;
+  padding: 1px 4px;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.oaiy-title .oaiy-name-flow:hover { border-color: rgb(var(--color-border-primary)); }
+.oaiy-name-sep { color: rgb(var(--color-text-tertiary)); font-size: 15px; }
+@media (max-width: 960px) {
+  .oaiy-title .oaiy-name-project { max-width: 120px; }
+  .oaiy-name-sep { display: none; }
+}
+
+/* Phones need the document name as well as the actions. Give each its own
+   row instead of collapsing the name to make room for a hidden action strip. */
+@media (width < 760px) {
+  .oaiy-workspace { grid-template-rows: auto minmax(0, 1fr) auto; }
+  .oaiy-topbar { display: grid; grid-template-columns: 44px minmax(0, 1fr); gap: 4px 8px; padding: 8px 12px 4px; }
+  .oaiy-nav-open { margin: 0; }
+  .oaiy-title > div { display: flex; align-items: stretch; flex-direction: column; gap: 0; }
+  .oaiy-title .oaiy-name-project { display: block; width: 100%; max-width: none; font-size: 16px; font-weight: 400; color: rgb(var(--color-text-secondary)); }
+  .oaiy-title .oaiy-name-flow, .oaiy-title input.oaiy-name { max-width: 100%; width: 100%; min-height: 28px; text-align: left; font-size: 16px; }
+  .oaiy-actions { grid-column: 1 / -1; width: 100%; gap: 4px; padding: 0 0 4px; scrollbar-width: thin; scrollbar-color: rgb(var(--color-border-strong)) transparent; mask-image: none; -webkit-mask-image: none; }
+  .oaiy-actions::-webkit-scrollbar { display: block; height: 4px; }
+  .oaiy-actions::-webkit-scrollbar-thumb { background: rgb(var(--color-border-strong)); border-radius: 4px; }
+  .oaiy-actions .oaiy-icon-btn, .oaiy-nav-open, .oaiy-nav-close { width: 44px; height: 44px; flex-shrink: 0; }
+  .oaiy-nav-close { align-self: flex-end; }
+  .oaiy-sidebar .oaiy-new, .oaiy-sidebar .oaiy-nav button, .oaiy-sidebar .oaiy-settings-btn { min-height: 44px; }
+  .oaiy-sidebar { padding-bottom: max(14px, env(safe-area-inset-bottom)); }
+  .oaiy-dock { min-height: 56px; padding-bottom: env(safe-area-inset-bottom); }
+  .oaiy-canvas-wrap .react-flow__controls { bottom: 88px !important; }
+}
+@media (width < 760px) and (max-height: 500px) {
+  .oaiy-canvas-wrap .react-flow__controls { top: 8px !important; bottom: auto !important; flex-direction: row; }
+}

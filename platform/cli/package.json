@@ -1,0 +1,37 @@
+{
+  "name": "oaiy-cli",
+  "private": true,
+  "version": "0.2.0",
+  "type": "module",
+  "description": "Headless CLI to run oaiy flows on a server (no GUI). Shares the oaiy-core engine with the web app via a Node host adapter.",
+  "license": "Apache-2.0",
+  "bin": {
+    "oaiy": "bin/oaiy.mjs"
+  },
+  "scripts": {
+    "prebuild": "node ../scripts/fetch-zipp-release.mjs --ensure",
+    "build": "node esbuild.mjs",
+    "pretypecheck": "node ../scripts/fetch-zipp-release.mjs --ensure",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "pretest": "node ../scripts/fetch-zipp-release.mjs --ensure",
+    "test": "node test/run-test.mjs test/module-ctx-isolation.ts dist/_ctxtest.mjs && node test/run-test.mjs test/cross-module-isolation.ts dist/_xmtest.mjs && node test/run-test.mjs test/ssrf-guard.test.ts dist/_ssrftest.mjs --packages-external && node test/run-test.mjs test/connector-module.test.ts dist/_connectortest.mjs && node test/build-engine-tests.mjs && node test/zipp-cli.mjs && node test/no-host-eval.mjs && node test/engine-wiring.mjs && node test/zipp-guard.mjs && node test/zipp-limits.mjs && node test/zipp-script.mjs && node test/cli-asset.mjs",
+    "test:http-exit": "npm run build && node test/cli-http-exit.mjs",
+    "oaiy": "node bin/oaiy.mjs"
+  },
+  "dependencies": {
+    "acorn": "^8.18.0",
+    "fflate": "^0.8.2",
+    "playwright": "^1.60.0",
+    "undici": "^8.5.0",
+    "uuid": "^13.0.2"
+  },
+  "optionalDependencies": {
+    "sharp": "^0.35.4"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.1",
+    "commander": "^12.1.0",
+    "esbuild": "^0.28.2",
+    "typescript": "^5.8.3"
+  }
+}

@@ -1,0 +1,71 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oaiy.com/schemas/bridge/v1/run-event.schema.json",
+  "title": "Run event",
+  "description": "One SSE message from GET /api/bridge/runs/{runId}/events.\n\nStreaming is an optimisation over polling and must never be the only path to a result \u2014 a dropped connection cannot be allowed to lose the outcome. The terminal state is always durably readable from the run itself.",
+  "type": "object",
+  "required": [
+    "runId",
+    "type",
+    "at"
+  ],
+  "properties": {
+    "runId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "type": {
+      "enum": [
+        "status_changed",
+        "node_started",
+        "node_finished",
+        "log",
+        "progress"
+      ]
+    },
+    "at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "status": {
+      "enum": [
+        "queued",
+        "running",
+        "succeeded",
+        "failed",
+        "timed_out",
+        "cancelled"
+      ]
+    },
+    "nodeId": {
+      "type": "string",
+      "maxLength": 128
+    },
+    "nodeType": {
+      "type": "string",
+      "maxLength": 128
+    },
+    "level": {
+      "enum": [
+        "debug",
+        "info",
+        "warning",
+        "error"
+      ]
+    },
+    "message": {
+      "type": "string",
+      "maxLength": 2000
+    },
+    "progress": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "error": {
+      "$ref": "https://oaiy.com/schemas/bridge/v1/error.schema.json"
+    }
+  },
+  "additionalProperties": false
+}

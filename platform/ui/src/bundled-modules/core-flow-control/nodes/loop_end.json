@@ -1,0 +1,35 @@
+{
+  "id": "loop_end",
+  "name": "Loop End",
+  "description": "End a loop and collect results into an array.",
+  "doc": "Mark the end of a loop body and collect results.\n\nUsage:\n• Connect the value from each iteration to the Result input\n• All results are collected into an output array\n• The Results output contains all iteration values in order\n\nPair with Loop Start:\nLoop Start → (your processing nodes) → Loop End\n\nOutput:\nArray of all values passed to the Result input across all iterations.",
+  "icon": "stop",
+  "color": "amber",
+  "tags": ["loop", "end", "collect"],
+  "inputs": [
+    {
+      "id": "input",
+      "name": "Result",
+      "type": "any",
+      "position": "left",
+      "description": "Value to add to results array"
+    }
+  ],
+  "outputs": [
+    {
+      "id": "results",
+      "name": "Results",
+      "type": "array",
+      "position": "right",
+      "description": "Array of all iteration results"
+    }
+  ],
+  "properties": [],
+  "compiler": {
+    "template": "{{input}}",
+    "customHandler": "loop_end"
+  },
+  "ui": {
+    "width": 200
+  }
+}

@@ -1,0 +1,96 @@
+{
+  "id": "file_write",
+  "name": "File Write",
+  "description": "Write content to a file on disk. Supports templated filenames and folder connections.",
+  "doc": "Save content to files with flexible naming.\n\nFilename Templates:\n• {{name}} - original filename with extension\n• {{nameWithoutExt}} - filename without extension\n• {{ext}} - file extension\n• {{index}} - item index in loops\n\nContent Types:\n• Base64/Binary - for images, audio, etc.\n• Text - for text files, JSON, etc.\n\nFeatures:\n• Auto-creates parent directories\n• Connect folder from Input Folder node\n• Output returns saved file path\n\nTip: Use with loops to batch-save multiple files.",
+  "icon": "save",
+  "color": "teal",
+  "tags": ["file", "write", "save", "output"],
+  "inputs": [
+    {
+      "id": "content",
+      "name": "Content",
+      "type": "any",
+      "position": "left",
+      "description": "Content to write (text or base64)"
+    },
+    {
+      "id": "folder",
+      "name": "Folder",
+      "type": "string",
+      "position": "left",
+      "description": "Output folder path (optional)"
+    },
+    {
+      "id": "info",
+      "name": "Info",
+      "type": "object",
+      "position": "left",
+      "description": "File info for templating (optional)"
+    }
+  ],
+  "outputs": [
+    {
+      "id": "path",
+      "name": "Path",
+      "type": "string",
+      "position": "right",
+      "description": "Path of written file"
+    }
+  ],
+  "properties": [
+    {
+      "id": "targetPath",
+      "name": "Output Folder",
+      "type": "string",
+      "default": "",
+      "description": "Target folder path (or connect folder input)"
+    },
+    {
+      "id": "filenamePattern",
+      "name": "Filename Pattern",
+      "type": "string",
+      "default": "",
+      "description": "Filename with templates: {{name}}, {{nameWithoutExt}}, {{ext}}, {{index}}"
+    },
+    {
+      "id": "contentType",
+      "name": "Content Type",
+      "type": "select",
+      "default": "base64",
+      "options": [
+        { "value": "base64", "label": "Base64/Binary" },
+        { "value": "text", "label": "Text" }
+      ],
+      "description": "How to interpret the content"
+    },
+    {
+      "id": "createDirectories",
+      "name": "Create Directories",
+      "type": "boolean",
+      "default": true,
+      "description": "Create parent directories if they don't exist"
+    }
+  ],
+  "flowplan": {
+    "stepTypes": ["file_write"],
+    "fieldMapping": {
+      "path": "targetPath",
+      "contentType": "contentType"
+    },
+    "templateFields": ["content", "path"],
+    "inputHandleMapping": {
+      "content": "content"
+    }
+  },
+  "compiler": {
+    "template": "{{await}}FileSystem.write({{prop.targetPath}}, {{input.content}}, {{prop.contentType.raw}}, {{prop.createDirectories}}, {{prop.filenamePattern}}, {{input.folder}}, {{input.info}}, \"{{nodeId}}\")",
+    "async": true,
+    "abortable": true,
+    "statusTracking": true
+  },
+  "ui": {
+    "width": 280,
+    "customComponent": "FileWriteNode"
+  }
+}

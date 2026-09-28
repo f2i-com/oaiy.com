@@ -1,0 +1,56 @@
+{
+  "id": "image_resize",
+  "name": "Image Resize",
+  "description": "Resize an image to fit within specified dimensions and file size limits.",
+  "doc": "Resize and compress images for API or storage limits.\n\nControls:\n• Max Dimension - scales to fit within this width/height\n• Max Size (KB) - compresses to meet file size target\n• Quality - JPEG quality (1-100)\n\nUse Cases:\n• Prepare images for LLM vision APIs\n• Reduce base64 size for database storage\n• Optimize images before processing\n\nBehavior:\n• Maintains aspect ratio when scaling\n• Iteratively adjusts quality to meet size target\n• Outputs JPEG for best compression",
+  "icon": "image",
+  "color": "pink",
+  "tags": ["image", "resize", "scale", "compress", "optimize"],
+  "inputs": [
+    {
+      "id": "image",
+      "name": "Image",
+      "type": "string",
+      "position": "left",
+      "description": "Base64 image data URL to resize"
+    }
+  ],
+  "outputs": [
+    {
+      "id": "image",
+      "name": "Image",
+      "type": "string",
+      "position": "right",
+      "description": "Resized base64 image data URL"
+    }
+  ],
+  "properties": [
+    {
+      "id": "maxDimension",
+      "name": "Max Dimension",
+      "type": "number",
+      "default": 1024,
+      "description": "Maximum width or height in pixels (maintains aspect ratio)"
+    },
+    {
+      "id": "maxSizeKB",
+      "name": "Max Size (KB)",
+      "type": "number",
+      "default": 200,
+      "description": "Maximum file size in kilobytes (uses JPEG compression)"
+    },
+    {
+      "id": "quality",
+      "name": "Quality",
+      "type": "number",
+      "default": 85,
+      "description": "JPEG quality (1-100). Lower = smaller file, less quality"
+    }
+  ],
+  "compiler": {
+    "customHandler": true
+  },
+  "ui": {
+    "width": 240
+  }
+}

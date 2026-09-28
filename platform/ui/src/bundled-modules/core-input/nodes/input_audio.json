@@ -1,0 +1,63 @@
+{
+    "id": "input_audio",
+    "name": "Audio Input",
+    "description": "Load an audio file (music, sound effects, etc.) for use in workflows.",
+    "doc": "Select an audio file for processing.\n\nSupported Formats:\n• MP3, WAV, OGG, FLAC\n• M4A, AAC, WMA\n\nOutput:\nReturns the file path for use with audio processing nodes like Speech to Text or Audio Append.\n\nTip: Preview audio in the node before running the workflow.",
+    "icon": "music",
+    "color": "teal",
+    "category": "Input",
+    "tags": [
+        "audio",
+        "music",
+        "sound",
+        "input",
+        "file"
+    ],
+    "inputs": [],
+    "outputs": [
+        {
+            "id": "audio",
+            "name": "Audio",
+            "type": "audio",
+            "position": "right",
+            "description": "Audio file path"
+        }
+    ],
+    "properties": [
+        {
+            "id": "filePath",
+            "name": "Audio File",
+            "type": "file",
+            "default": "",
+            "fileFilters": [
+                {
+                    "name": "Audio Files",
+                    "extensions": [
+                        "mp3",
+                        "wav",
+                        "ogg",
+                        "flac",
+                        "m4a",
+                        "aac",
+                        "wma"
+                    ]
+                },
+                {
+                    "name": "All Files",
+                    "extensions": [
+                        "*"
+                    ]
+                }
+            ],
+            "description": "Select an audio file to load"
+        }
+    ],
+    "compiler": {
+        "template": "\"{{prop.filePath}}\"",
+        "async": false
+    },
+    "ui": {
+        "width": 220,
+        "customComponent": "AudioInputNode"
+    }
+}

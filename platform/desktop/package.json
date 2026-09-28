@@ -1,0 +1,36 @@
+{
+  "name": "oaiy-desktop",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Tray-resident OAIY Desktop for oaiy-web. Manages local AI services (Ollama, ComfyUI, custom Python) and exposes them to the oaiy-web flow editor via a localhost API.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "node scripts/sync-cli.mjs && tsc --noEmit && vite build",
+    "test": "vitest run",
+    "test:unit": "vitest",
+    "preview": "vite preview",
+    "tauri": "tauri",
+    "tauri:dev": "tauri dev --features gui",
+    "tauri:build": "tauri build --features gui",
+    "sync-cli": "node scripts/sync-cli.mjs"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.1.1",
+    "@tauri-apps/plugin-notification": "^2.4.0",
+    "lucide-react": "^0.468.0",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.1.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^4.3.4",
+    "jsdom": "^29.1.1",
+    "typescript": "^5.7.0",
+    "vite": "^7.0.0",
+    "vitest": "^5.0.0"
+  }
+}

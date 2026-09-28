@@ -1,0 +1,9 @@
+{
+  "repository": "https://github.com/f2i-com/zipp.org",
+  "release": "v0.0.21",
+  "sources": [
+    "LICENSE-UNICODE"
+  ],
+  "file": "THIRD_PARTY_LICENSES.txt",
+  "sha256": "d446f547fb21b6d9d95d7e3df7de7da5489f16684ba4a9eaf289fbde6bfc9834"
+}

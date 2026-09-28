@@ -1,0 +1,54 @@
+{
+    "id": "macro",
+    "name": "Macro",
+    "description": "Execute a saved macro workflow. Inputs and outputs are dynamically created based on the macro's Macro Input and Macro Output nodes.",
+    "doc": "Use a saved macro workflow as a reusable component.\n\nFeatures:\n• Dynamic inputs/outputs based on macro definition\n• Encapsulates complex logic into single node\n• Reuse the same macro across multiple flows\n\nCreating Macros:\n1. Mark a flow as 'Macro' in flow settings\n2. Add Macro Input nodes for parameters\n3. Add Macro Output nodes for results\n4. The macro appears in the Macros category\n\nTip: Macros are great for standardizing common operations like image processing pipelines or API formatting.",
+    "icon": "cube",
+    "color": "violet",
+    "tags": ["macro", "workflow", "reusable", "component"],
+    "inputs": [],
+    "outputs": [],
+    "properties": [
+        {
+            "id": "macroId",
+            "name": "Macro",
+            "type": "string",
+            "default": "",
+            "description": "The macro workflow to execute"
+        },
+        {
+            "id": "macroName",
+            "name": "Macro Name",
+            "type": "string",
+            "default": "",
+            "hidden": true,
+            "description": "Display name of the selected macro"
+        },
+        {
+            "id": "macroInputs",
+            "name": "Inputs",
+            "type": "array",
+            "default": [],
+            "hidden": true,
+            "description": "Input port definitions from the macro"
+        },
+        {
+            "id": "macroOutputs",
+            "name": "Outputs",
+            "type": "array",
+            "default": [],
+            "hidden": true,
+            "description": "Output port definitions from the macro"
+        }
+    ],
+    "compiler": {
+        "customHandler": true,
+        "async": true,
+        "abortable": true,
+        "statusTracking": true
+    },
+    "ui": {
+        "width": 280,
+        "dynamicHandles": true
+    }
+}

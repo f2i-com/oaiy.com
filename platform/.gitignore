@@ -1,0 +1,89 @@
+# ---------------------------------------------------------------------------
+# oaiy-web — repo-root gitignore
+# ---------------------------------------------------------------------------
+# `ui/` is the React + Vite frontend; `api/` is the PHP/Slim backend.
+# Lockfiles are committed (package-lock.json + composer.lock); installed
+# dependency trees are not.
+
+# --- ui/ frontend ----------------------------------------------------------
+ui/node_modules/
+ui/dist/
+ui/build/
+ui/.vite/
+ui/.cache/
+# Vite serves a synthetic deps cache when imports change at runtime.
+ui/.tmp/
+
+# --- ZIPP engines ----------------------------------------------------------
+# Installed from a verified zipp.org release by scripts/fetch-zipp-release.mjs
+# (ui's dev, typecheck, test, test:zipp and build hooks run --ensure), never
+# committed. The curated notices in ui/vendor/zipp-notices/ are committed.
+/ui/vendor/zipp-wasm/
+/ui/vendor/zipp-wasm-python/
+# Its install lock and stage folders, and the per-tag download cache.
+/ui/vendor/.zipp-wasm*
+/.zipp-release/
+
+# --- api/ backend ----------------------------------------------------------
+api/vendor/
+# .env carries the live DB password — committed copy lives at .env.example.
+api/.env
+# Default SQLite location + the WAL/journal sidecars libsqlite drops
+# next to it. Schema lives in api/migrations/, so the DB file itself is
+# always rebuildable with `php bin/migrate.php`.
+api/var/*.sqlite
+api/var/*.sqlite-journal
+api/var/*.sqlite-wal
+api/var/*.sqlite-shm
+api/var/cache/
+api/var/log/
+api/storage/
+
+# --- editor / OS noise -----------------------------------------------------
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/settings.json
+!.vscode/launch.json
+!.vscode/extensions.json
+*.swp
+*.swo
+*~
+.history/
+
+# --- logs / dumps ----------------------------------------------------------
+*.log
+*.log.*
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# --- env / secrets ---------------------------------------------------------
+.env
+.env.local
+.env.*.local
+
+# --- agent-task / scratch (Claude Code, etc.) ------------------------------
+.claude/
+.cursor/
+
+# Staged at build time by desktop/scripts/sync-cli.mjs (mirrors cli/dist, which is also ignored).
+desktop/src-tauri/resources/cli/
+
+# Scratch measurement/probe harnesses written at the repo root of ui/.
+# Real tooling lives in ui/tests/ or ui/scripts/, so anything loose here is
+# throwaway by definition.
+# NOTE the trailing-slash-free, single-segment intent: these must NOT match
+# ui/tests/*.mjs, which are the real suites. A `git ls-files 'ui/*.mjs'`
+# pathspec DOES cross directory separators and deleted them once.
+/ui/probe*.mjs
+/ui/probe*.cjs
+/ui/m.mjs
+/ui/measure-tmp.mjs
+/ui/vt-*.mjs
+/ui/zz*.mjs
+
+# Screenshots dropped at the ui root by measurement runs. Single-segment on
+# purpose: ui/public/ holds real assets and must not be caught.
+/ui/*.png

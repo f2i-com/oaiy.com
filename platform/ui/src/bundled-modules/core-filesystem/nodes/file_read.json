@@ -1,0 +1,76 @@
+{
+  "id": "file_read",
+  "name": "File Read",
+  "description": "Read and optionally parse content from a file on disk.",
+  "doc": "Load file content with automatic parsing options.\n\nRead Modes:\n• Text - raw text content\n• Base64 - binary files as base64 string\n• JSON - parse and return object/array\n• CSV - parse into array of row objects\n• Lines - split into array of lines\n\nUsage:\nConnect a file path from Input File node or provide path directly. Output format depends on selected mode.\n\nTip: Use JSON mode for config files, CSV mode for spreadsheets, Lines mode for log files.",
+  "icon": "file",
+  "color": "emerald",
+  "tags": ["file", "read", "load", "content", "json", "csv"],
+  "flowplan": {
+    "stepTypes": ["file_read"],
+    "fieldMapping": {
+      "path": "path",
+      "as": "readAs"
+    },
+    "valueMapping": {
+      "as": {
+        "text": "text",
+        "base64": "base64",
+        "json": "json",
+        "csv": "csv",
+        "lines": "lines"
+      }
+    },
+    "templateFields": ["path"]
+  },
+  "inputs": [
+    {
+      "id": "path",
+      "name": "Path",
+      "type": "string",
+      "position": "left",
+      "description": "File path to read"
+    }
+  ],
+  "outputs": [
+    {
+      "id": "content",
+      "name": "Content",
+      "type": "any",
+      "position": "right",
+      "description": "File content (string, parsed JSON, CSV rows, or lines array)"
+    }
+  ],
+  "properties": [
+    {
+      "id": "readAs",
+      "name": "Read As",
+      "type": "select",
+      "default": "text",
+      "options": [
+        { "value": "text", "label": "Text" },
+        { "value": "base64", "label": "Base64" },
+        { "value": "json", "label": "JSON (parsed)" },
+        { "value": "csv", "label": "CSV (parsed)" },
+        { "value": "lines", "label": "Lines (array)" }
+      ]
+    },
+    {
+      "id": "csvHasHeader",
+      "name": "CSV Has Header",
+      "type": "boolean",
+      "default": true,
+      "description": "First row is header (CSV only)",
+      "advanced": true
+    }
+  ],
+  "compiler": {
+    "template": "{{await}}FileSystem.read({{input}}, {{prop.readAs.raw}}, \"{{nodeId}}\")",
+    "async": true,
+    "abortable": true,
+    "statusTracking": true
+  },
+  "ui": {
+    "width": 260
+  }
+}

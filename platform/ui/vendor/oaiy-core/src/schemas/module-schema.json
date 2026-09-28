@@ -1,0 +1,112 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://oaiy.com/schemas/module.json",
+  "title": "OAIY Module",
+  "description": "Schema for OAIY node module definitions",
+  "type": "object",
+  "required": ["id", "name", "version", "nodes"],
+  "properties": {
+    "id": {
+      "type": "string",
+      "description": "Unique identifier for the module",
+      "pattern": "^[a-z][a-z0-9-]*$"
+    },
+    "name": {
+      "type": "string",
+      "description": "Display name of the module"
+    },
+    "version": {
+      "type": "string",
+      "description": "Semantic version of the module",
+      "pattern": "^\\d+\\.\\d+\\.\\d+(-[a-zA-Z0-9.]+)?$"
+    },
+    "description": {
+      "type": "string",
+      "description": "Brief description of the module's purpose"
+    },
+    "author": {
+      "type": "string",
+      "description": "Author or organization name"
+    },
+    "category": {
+      "type": "string",
+      "description": "Category for grouping in the UI",
+      "enum": ["Input", "Output", "AI", "Image", "Video", "Audio", "Text", "File System", "Flow Control", "Browser", "Database", "Network", "Utility", "Custom"]
+    },
+    "icon": {
+      "type": "string",
+      "description": "Icon name from Lucide icons"
+    },
+    "color": {
+      "type": "string",
+      "description": "Primary color for the module (hex or Tailwind color)",
+      "pattern": "^(#[0-9a-fA-F]{6}|[a-z]+-\\d{3})$"
+    },
+    "dependencies": {
+      "type": "array",
+      "description": "List of required module IDs",
+      "items": {
+        "type": "string"
+      },
+      "default": []
+    },
+    "nodes": {
+      "type": "array",
+      "description": "List of node IDs provided by this module",
+      "items": {
+        "type": "string"
+      },
+      "minItems": 1
+    },
+    "settings": {
+      "type": "object",
+      "description": "Module-level settings configurable by the user",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["type", "label"],
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": ["string", "number", "boolean", "select", "secret"]
+          },
+          "label": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "default": {},
+          "options": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "value": {},
+                "label": { "type": "string" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "permissions": {
+      "type": "array",
+      "description": "Permissions required by this module",
+      "items": {
+        "type": "string",
+        "enum": ["filesystem", "network", "shell", "clipboard", "notifications"]
+      },
+      "default": []
+    },
+    "repository": {
+      "type": "string",
+      "description": "URL to the module's source repository",
+      "format": "uri"
+    },
+    "homepage": {
+      "type": "string",
+      "description": "URL to the module's homepage or documentation",
+      "format": "uri"
+    }
+  }
+}

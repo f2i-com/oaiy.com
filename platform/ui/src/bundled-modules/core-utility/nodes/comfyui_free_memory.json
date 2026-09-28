@@ -1,0 +1,57 @@
+{
+    "id": "comfyui_free_memory",
+    "name": "ComfyUI Free Memory",
+    "description": "Free GPU memory by unloading ComfyUI models. Use between image and video generation to prevent OOM errors. Passes through input unchanged.",
+    "doc": "Release GPU memory used by ComfyUI models.\n\nWhen to Use:\n• Between image generation batches\n• Before video generation (which needs lots of VRAM)\n• When switching between different model types\n\nOptions:\n• Unload Models - removes models from GPU memory\n• Free Memory - clears cached allocations\n\nBehavior:\nPasses input through unchanged, so you can insert it into any workflow without breaking connections.\n\nNote: Requires ComfyUI server running at the specified URL.",
+    "icon": "trash",
+    "color": "gray",
+    "tags": ["utility", "comfyui", "memory", "gpu"],
+    "inputs": [
+        {
+            "id": "input",
+            "name": "Input",
+            "type": "any",
+            "position": "left",
+            "required": false,
+            "description": "Input to pass through (e.g., array of images)"
+        }
+    ],
+    "outputs": [
+        {
+            "id": "default",
+            "name": "Output",
+            "type": "any",
+            "position": "right",
+            "description": "Passes through the input unchanged after freeing memory"
+        }
+    ],
+    "properties": [
+        {
+            "id": "comfyuiUrl",
+            "name": "ComfyUI URL",
+            "type": "string",
+            "default": "",
+            "placeholder": "Use default (http://127.0.0.1:8188)",
+            "description": "ComfyUI server URL"
+        },
+        {
+            "id": "unloadModels",
+            "name": "Unload Models",
+            "type": "boolean",
+            "default": true,
+            "description": "Unload all models from memory"
+        },
+        {
+            "id": "freeMemory",
+            "name": "Free Memory",
+            "type": "boolean",
+            "default": true,
+            "description": "Free cached GPU memory"
+        }
+    ],
+    "compiler": {
+        "async": true,
+        "statusTracking": true,
+        "customHandler": "comfyui_free_memory"
+    }
+}

@@ -1,0 +1,133 @@
+{
+    "id": "speech_to_text",
+    "name": "Speech to Text",
+    "description": "Transcribe audio/video to text with word-level timestamps using WhisperX",
+    "doc": "Transcribe speech from audio or video files using WhisperX.\n\nFeatures:\n• Word-level timestamps for precise subtitles\n• Speaker diarization (identify who's speaking)\n• Auto language detection or specify language\n• Segment time ranges for partial transcription\n\nOutputs:\n• Full Text - complete transcript as string\n• Segments - array with timestamps & speaker info\n• Language - detected language code\n• Duration - audio length in seconds\n\nRequires: WhisperX API server (default: localhost:8770)\nNote: Speaker diarization requires HuggingFace token.",
+    "icon": "file-text",
+    "color": "violet",
+    "tags": [
+        "audio",
+        "video",
+        "transcription",
+        "speech",
+        "whisper",
+        "stt",
+        "subtitles"
+    ],
+    "inputs": [
+        {
+            "id": "media",
+            "name": "Media",
+            "type": "any",
+            "position": "left",
+            "description": "Audio or video file path to transcribe"
+        },
+        {
+            "id": "startTime",
+            "name": "Start Time",
+            "type": "number",
+            "position": "left",
+            "optional": true,
+            "description": "Start time in seconds (optional, for segment transcription)"
+        },
+        {
+            "id": "endTime",
+            "name": "End Time",
+            "type": "number",
+            "position": "left",
+            "optional": true,
+            "description": "End time in seconds (optional, for segment transcription)"
+        }
+    ],
+    "outputs": [
+        {
+            "id": "text",
+            "name": "Full Text",
+            "type": "string",
+            "position": "right",
+            "description": "Complete transcript as plain text"
+        },
+        {
+            "id": "segments",
+            "name": "Segments",
+            "type": "array",
+            "position": "right",
+            "description": "Array of transcript segments with timestamps"
+        },
+        {
+            "id": "language",
+            "name": "Language",
+            "type": "string",
+            "position": "right",
+            "description": "Detected language code"
+        },
+        {
+            "id": "duration",
+            "name": "Duration",
+            "type": "number",
+            "position": "right",
+            "description": "Audio duration in seconds"
+        }
+    ],
+    "properties": [
+        {
+            "id": "apiUrl",
+            "name": "API URL",
+            "type": "string",
+            "default": "http://127.0.0.1:8770/transcribe",
+            "description": "WhisperX STT API endpoint"
+        },
+        {
+            "id": "language",
+            "name": "Language",
+            "type": "string",
+            "default": "",
+            "description": "Language code (e.g., 'en', 'es'). Leave empty for auto-detect"
+        },
+        {
+            "id": "enableWordTimestamps",
+            "name": "Word Timestamps",
+            "type": "boolean",
+            "default": true,
+            "description": "Include word-level timing information"
+        },
+        {
+            "id": "enableDiarization",
+            "name": "Speaker Diarization",
+            "type": "boolean",
+            "default": false,
+            "description": "Identify different speakers (requires HuggingFace token)"
+        },
+        {
+            "id": "hfTokenConstant",
+            "name": "HF Token Constant",
+            "type": "string",
+            "default": "",
+            "placeholder": "Enter constant name (e.g. HF_TOKEN)",
+            "description": "Name of the constant containing your HuggingFace token (for speaker diarization)"
+        },
+        {
+            "id": "minSpeakers",
+            "name": "Min Speakers",
+            "type": "number",
+            "default": null,
+            "description": "Minimum number of speakers (for diarization)"
+        },
+        {
+            "id": "maxSpeakers",
+            "name": "Max Speakers",
+            "type": "number",
+            "default": null,
+            "description": "Maximum number of speakers (for diarization)"
+        }
+    ],
+    "compiler": {
+        "customHandler": true,
+        "async": true,
+        "statusTracking": true
+    },
+    "ui": {
+        "width": 300,
+        "customComponent": "SpeechToTextNode"
+    }
+}

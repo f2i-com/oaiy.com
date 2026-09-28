@@ -1,0 +1,48 @@
+[Unit]
+Description=OAIY server (headless companion — services/models/python API on 127.0.0.1:17972)
+Documentation=https://oaiy.com
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Run as a dedicated unprivileged user you create:
+#   useradd --system --shell /usr/sbin/nologin oaiy
+# (StateDirectory below auto-creates /var/lib/oaiy owned by oaiy — no manual mkdir.)
+User=oaiy
+Group=oaiy
+
+# All state lives under one dir (databases, venvs, downloaded models, templates).
+Environment=OAIY_DATA_DIR=/var/lib/oaiy
+Environment=OAIY_MODELS_DIR=/var/lib/oaiy/models
+# Bind port (loopback only). Front with nginx/Caddy + TLS if exposed.
+Environment=OAIY_SERVER_PORT=17972
+# Set a long random token to allow privileged admin calls (define service /
+# install python / create venv) from the CLI: Authorization: Bearer <token>.
+# Leave empty to keep privileged routes closed to non-browser callers.
+Environment=OAIY_SERVER_TOKEN=
+# Optional: HuggingFace token for gated model downloads.
+# Environment=OAIY_HF_TOKEN=
+
+ExecStart=/usr/local/bin/oaiy-server
+Restart=on-failure
+RestartSec=3
+
+# oaiy-server stops every managed service on SIGTERM before exiting.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+# State dir: systemd auto-creates /var/lib/oaiy (+ /var/lib/oaiy/models) owned by
+# oaiy:oaiy at 0700 on first start, and keeps it writable under ProtectSystem=strict
+# — so no manual mkdir/chown and no separate ReadWritePaths is needed.
+StateDirectory=oaiy oaiy/models
+StateDirectoryMode=0700
+
+# Hardening (relax if a managed service needs more).
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

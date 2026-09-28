@@ -1,0 +1,62 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oaiy.com/schemas/bridge/v1/device-registration.schema.json",
+  "title": "Device registration",
+  "description": "POST /api/bridge/devices \u2014 how a desktop announces itself to a cloud tenant and keeps a heartbeat.\n\nAn upsert on `deviceId` that also stamps `lastSeenAt`, so the registry doubles as the liveness signal: a consumer deciding whether a remote runtime exists reads freshness here rather than maintaining a second presence channel.",
+  "type": "object",
+  "required": [
+    "deviceId",
+    "runtime",
+    "protocol"
+  ],
+  "properties": {
+    "deviceId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "runtime": {
+      "enum": [
+        "desktop",
+        "browser",
+        "cli",
+        "cloud"
+      ],
+      "description": "Where execution happens. A capability is offered by a runtime, not by the platform in the abstract."
+    },
+    "protocol": {
+      "type": "string",
+      "const": "oaiy-bridge/1",
+      "description": "Protocol the sender speaks. Receivers reject unknown majors rather than guessing."
+    },
+    "deviceName": {
+      "type": "string",
+      "maxLength": 120,
+      "description": "Human label, e.g. 'Reception PC'. Shown in run history as the claimer."
+    },
+    "version": {
+      "type": "string",
+      "maxLength": 32
+    },
+    "capabilities": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "description": "Dotted capability id. `oaiy.*` is reserved for the platform; products and plugins own their own namespace (`connector.aokie.*`).",
+        "pattern": "^[a-z][a-z0-9_]*(\\.[a-zA-Z0-9_*]+)+$",
+        "maxLength": 128
+      },
+      "maxItems": 512
+    },
+    "platform": {
+      "type": "string",
+      "maxLength": 64,
+      "description": "e.g. `windows-x86_64`. Lets a consumer explain why a platform-specific capability is missing."
+    },
+    "lastSeenAt": {
+      "type": "string",
+      "format": "date-time"
+    }
+  },
+  "additionalProperties": false
+}

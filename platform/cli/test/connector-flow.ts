@@ -1,0 +1,470 @@
+/**
+ * End-to-end connector test: a connector config file on disk → a registered
+ * module → a real compiled flow → real HTTP shapes.
+ *
+ * This is the test that proves the two halves meet. It drives the SAME path
+ * `oaiy run --connector <file>` drives (read the file, build the module,
+ * register it in the shared ModuleLoader, compile, execute), with the host's
+ * `http_request` broker stubbed so the requests can be inspected instead of
+ * being sent.
+ *
+ * Run via `npm test` (bundled by test/build-engine-tests.mjs so the oaiy-core /
+ * @tauri-apps aliases resolve exactly as in the shipped CLI).
+ */
+import '../src/node-host/core'; // installs window.__TAURI__ before shared code reads it
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { createCliEngine } from '../src/engine';
+import { loadNodeBundledModules } from '../src/generated/bundled-modules';
+import { loadConnectorModule } from '../src/connector';
+import { getModuleLoader } from 'oaiy-core';
+
+/* eslint-disable @typescript-eslint/no-explicit-any */
+let pass = 0;
+let fail = 0;
+const check = (name: string, cond: boolean) => {
+  if (cond) pass++;
+  else {
+    fail++;
+    console.log('  FAIL:', name);
+  }
+};
+
+async function rejectsWith(name: string, needle: string, fn: () => Promise<unknown>): Promise<void> {
+  try {
+    await fn();
+    fail++;
+    console.log(`  FAIL: ${name} (did not reject)`);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (msg.includes(needle)) pass++;
+    else {
+      fail++;
+      console.log(`  FAIL: ${name} (message lacked ${JSON.stringify(needle)}): ${msg}`);
+    }
+  }
+}
+
+const TERMINAL = new Set(['completed', 'failed', 'aborted']);
+
+const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'oaiy-connector-'));
+function writeConfig(name: string, config: unknown): string {
+  const p = path.join(tmp, name);
+  fs.writeFileSync(p, typeof config === 'string' ? config : JSON.stringify(config, null, 2));
+  return p;
+}
+
+// A provider vocabulary that exists nowhere in the source tree — the module has
+// to learn it from this file alone.
+const CONFIG = {
+  baseUrl: 'http://provider.test',
+  credential: 'cred_e2e',
+  nodes: [
+    { nodeType: 'run_start', operation: 'runInput' },
+    { nodeType: 'catalogue_items', operation: 'listRecords', path: '/api/v1/shelves/{shelf}/items' },
+    { nodeType: 'catalogue_add', operation: 'createRecord', path: '/api/v1/shelves/{shelf}/items' },
+    { nodeType: 'device_command', operation: 'connectorRequest' },
+  ],
+};
+
+interface Sent {
+  url: string;
+  method: string;
+  headers: Record<string, string>;
+  body: string | null;
+}
+
+const sent: Sent[] = [];
+
+/** Stub of the host's `http_request` broker: record, then answer canned JSON. */
+async function tauriInvoke(cmd: string, args?: Record<string, unknown>): Promise<unknown> {
+  if (cmd !== 'http_request') throw new Error(`unexpected host command in this test: ${cmd}`);
+  const r = (args as any).request as Sent;
+  sent.push(r);
+  let body: unknown = {};
+  if (r.url.includes('/items') && r.method === 'GET') body = { items: [{ id: 'i1' }, { id: 'i2' }] };
+  else if (r.url.includes('/items')) body = { id: 'i3', created: true };
+  else if (r.url.includes('/api/bridge/connectors/')) body = { ok: true, result: { acknowledged: true } };
+  return { status: 200, headers: { 'content-type': 'application/json' }, body: JSON.stringify(body), url: r.url };
+}
+
+function graph(nodes: any[], edges: any[]): any {
+  return { nodes, edges };
+}
+
+async function runToEnd(engine: any, id: string): Promise<any> {
+  await new Promise<void>((resolve) => {
+    const done = () => {
+      if (TERMINAL.has(engine.getJob(id)?.status ?? '')) {
+        clearTimeout(timer);
+        u();
+        resolve();
+      }
+    };
+    const u = engine.onStateChange(done);
+    const timer = setTimeout(() => {
+      u();
+      resolve();
+    }, 30000);
+    done();
+  });
+  return engine.getJob(id);
+}
+
+async function main(): Promise<void> {
+  await loadNodeBundledModules();
+
+  // --- refusals, before anything is registered ----------------------------
+  await rejectsWith('load: a missing file is refused', 'cannot read the connector config', () =>
+    loadConnectorModule(path.join(tmp, 'does-not-exist.json')),
+  );
+  await rejectsWith('load: invalid JSON is refused', 'not valid JSON', () =>
+    loadConnectorModule(writeConfig('broken.json', '{ nope')),
+  );
+  await rejectsWith('load: an unknown operation is refused', 'is not something this build can perform', () =>
+    loadConnectorModule(
+      writeConfig('bad-op.json', { ...CONFIG, nodes: [{ nodeType: 'thing', operation: 'dropTable' }] }),
+    ),
+  );
+  await rejectsWith('load: colliding with a bundled node type is refused', 'already registered', () =>
+    loadConnectorModule(
+      writeConfig('collide.json', { ...CONFIG, nodes: [{ nodeType: 'ai_llm', operation: 'chat' }] }),
+    ),
+  );
+  check('load: a refused connector registers nothing', !getModuleLoader().isNodeTypeValid('thing'));
+
+  // --- the real load ------------------------------------------------------
+  const built = await loadConnectorModule(writeConfig('connector.json', CONFIG));
+  const loader = getModuleLoader();
+  check('load: the provider node types are registered', CONFIG.nodes.every((n) => loader.isNodeTypeValid(n.nodeType)));
+  check('load: bundled node types still resolve', loader.isNodeTypeValid('template'));
+  check('load: the module reports what it contributed', built.manifest.nodes.length === CONFIG.nodes.length);
+
+  const engine = await createCliEngine({
+    networkPermissionHandler: async () => ({ allowed: true, remember: false }),
+    tauriInvoke,
+  });
+
+  // --- a real run ---------------------------------------------------------
+  const id = engine.submit(
+    'test',
+    'connector-e2e',
+    graph(
+      [
+        { id: 'start', type: 'run_start', position: { x: 0, y: 0 }, data: {} },
+        { id: 'list', type: 'catalogue_items', position: { x: 200, y: 0 }, data: {} },
+        { id: 'add', type: 'catalogue_add', position: { x: 200, y: 200 }, data: { shelf: 'fixed' } },
+        {
+          id: 'cmd',
+          type: 'device_command',
+          position: { x: 400, y: 0 },
+          data: { connector: 'gadget', command: 'beep', payload: { times: 2 } },
+        },
+      ],
+      [
+        { id: 'e1', source: 'start', target: 'list', sourceHandle: 'default', targetHandle: 'default' },
+        { id: 'e2', source: 'start', target: 'add', sourceHandle: 'default', targetHandle: 'default' },
+        { id: 'e3', source: 'list', target: 'cmd', sourceHandle: 'default', targetHandle: 'default' },
+      ],
+    ),
+    { shelf: 'kitchen', name: 'kettle' },
+  );
+
+  const job = await runToEnd(engine, id);
+  check(`run: the flow completed (status=${job?.status}${job?.error ? ` — ${job.error}` : ''})`, job?.status === 'completed');
+
+  const get = sent.find((s) => s.method === 'GET');
+  check('run: the placeholder was filled from the run inputs', get?.url === 'http://provider.test/api/v1/shelves/kitchen/items');
+  check('run: the provider credential travelled as a bearer', get?.headers?.Authorization === 'Bearer cred_e2e');
+  check('run: rows were unwrapped from the provider envelope', Array.isArray(job?.nodeOutputs?.list) && job.nodeOutputs.list.length === 2);
+
+  const post = sent.find((s) => s.method === 'POST' && s.url.includes('/items'));
+  check('run: the node\'s own field beat the input for the placeholder', post?.url === 'http://provider.test/api/v1/shelves/fixed/items');
+  check('run: the create body came from the wired input', JSON.parse(post?.body ?? '{}').name === 'kettle');
+
+  const relay = sent.find((s) => s.url.includes('/api/bridge/connectors/'));
+  check('run: the connector command went to this desktop\'s relay', relay?.url === 'http://127.0.0.1:17972/api/bridge/connectors/gadget/request');
+  const relayBody = JSON.parse(relay?.body ?? '{}');
+  check('run: the relayed command carried an idempotency key', typeof relayBody.idempotencyKey === 'string' && relayBody.idempotencyKey.length > 0);
+  check('run: the relayed command carried its payload', relayBody.command === 'beep' && relayBody.payload.times === 2);
+  check('run: the relay result was unwrapped', (job?.nodeOutputs?.cmd as any)?.acknowledged === true);
+
+  // --- value references in a node's data ----------------------------------
+  //
+  // A graph points a node's fields at values it does not hold. Unresolved, the
+  // REFERENCE is what the connector acts on — live report 2026-08-01:
+  //   callId "$inputs.callId" is not the current call ("call_af6d0b3f…")
+  // which is exactly right, and meant the receptionist could never hang up.
+  sent.length = 0;
+  const refId = engine.submit(
+    'test',
+    'connector-value-refs',
+    graph(
+      [
+        { id: 'start', type: 'run_start', position: { x: 0, y: 0 }, data: {} },
+        {
+          id: 'cmd',
+          type: 'device_command',
+          position: { x: 100, y: 0 },
+          data: {
+            connectorId: 'gadget',
+            command: 'beep',
+            payload: {
+              callId: '$inputs.callId',
+              who: '{{ inputs.from }}',
+              note: 'call {{inputs.callId}} costs $inputs.from',
+              settled: '$nodes.start.settled',
+              literal: '$250 deposit',
+            },
+          },
+        },
+      ],
+      [{ source: 'start', target: 'cmd' }],
+    ),
+    { callId: 'call_af6d0b3f', from: '0421285243', settled: { turns: 3 } },
+  );
+  await runToEnd(engine, refId);
+  const refRelay = sent.find((s) => s.url.includes('/api/bridge/connectors/'));
+  const refPayload = JSON.parse(refRelay?.body ?? '{}').payload ?? {};
+  check('refs: a lone selector resolves to the referenced value', refPayload.callId === 'call_af6d0b3f');
+  check('refs: a template interpolates', refPayload.who === '0421285243');
+  // Braces interpolate INSIDE text; a bare selector does not. Only a whole
+  // string may be a selector, so prose containing a $word survives intact —
+  // otherwise an SMS body would have its own text eaten.
+  check(
+    'refs: braces interpolate in text while a bare $word stays literal',
+    refPayload.note === 'call call_af6d0b3f costs $inputs.from',
+  );
+  // A selector must be able to yield a whole object, not just text.
+  check('refs: a selector can yield an object', refPayload.settled && refPayload.settled.turns === 3);
+  // Only a DECLARED root makes a reference; "$250 deposit" is money, not a path.
+  check('refs: a bare dollar sign stays literal text', refPayload.literal === '$250 deposit');
+
+  // --- a whole payload addressed by one reference -------------------------
+  //
+  // The live shape: a logic block builds the payload and the connector node's
+  // payload field is nothing but "$nodes.cfg.settingsPayload". If that does not
+  // resolve, `payload` reads as absent and connectorRequest falls back to
+  // `{ value: input }` — which is exactly the key the plugin then rejected
+  // ("value: objects/arrays are not valid settings values").
+  sent.length = 0;
+  const wholeId = engine.submit(
+    'test',
+    'connector-whole-payload',
+    graph(
+      [
+        {
+          id: 'cfg',
+          type: 'logic_block',
+          position: { x: 0, y: 0 },
+          data: { code: 'return { settingsPayload: { persona: "warm", greeting: "hi", aiReceptionist: true } };' },
+        },
+        {
+          id: 'push',
+          type: 'device_command',
+          position: { x: 100, y: 0 },
+          data: { connectorId: 'gadget', command: 'settings.set', payload: '$nodes.cfg.settingsPayload' },
+        },
+      ],
+      [{ source: 'cfg', target: 'push' }],
+    ),
+    {},
+  );
+  const wholeJob = await runToEnd(engine, wholeId);
+  check('whole-payload: the flow completed', wholeJob?.status === 'completed');
+  const wholeRelay = sent.find((s) => s.url.includes('/api/bridge/connectors/'));
+  const wholeSent = JSON.parse(wholeRelay?.body ?? '{}').payload ?? {};
+  check('whole-payload: the referenced object became the payload', wholeSent.persona === 'warm' && wholeSent.greeting === 'hi');
+  // The tell-tale of the old failure: a `value` wrapper around the input.
+  check('whole-payload: it is not wrapped in a `value` key', wholeSent.value === undefined);
+
+  // --- a condition must not run BOTH of its branches -----------------------
+  //
+  // Live report 2026-08-01: a receptionist flow gated `call.reject` behind a
+  // condition that said "do not reject". Both downstream nodes ran anyway — the
+  // untaken one merely receiving null — so the plugin was sent call.reject on
+  // every call and accepted it. Callers were answered and hung up on a second
+  // later. A connector node's work comes from its own data, so a null input
+  // does not make it harmless.
+  sent.length = 0;
+  const branchId = engine.submit(
+    'test',
+    'connector-branch-gate',
+    graph(
+      [
+        { id: 'decide', type: 'logic_block', position: { x: 0, y: 0 }, data: { expr: 'return { reject: false };' } },
+        { id: 'gate', type: 'condition', position: { x: 100, y: 0 }, data: { expr: '(nodes.decide || {}).reject === true' } },
+        {
+          id: 'reject',
+          type: 'device_command',
+          position: { x: 200, y: -50 },
+          data: { connectorId: 'gadget', command: 'call.reject', payload: { callId: '$inputs.callId' } },
+        },
+        {
+          id: 'configure',
+          type: 'device_command',
+          position: { x: 200, y: 50 },
+          data: { connectorId: 'gadget', command: 'call.configureAgent', payload: { callId: '$inputs.callId' } },
+        },
+        { id: 'rejectTail', type: 'device_command', position: {x:300,y:-50}, data: {connectorId:'gadget',command:'must.not.run',payload:{}} },
+        { id: 'merge', type: 'device_command', position: {x:400,y:0}, data: {connectorId:'gadget',command:'merge.reached',payload:{}} },
+      ],
+      [
+        { source: 'decide', target: 'gate' },
+        { source: 'gate', target: 'reject', sourceHandle: 'true' },
+        { source: 'gate', target: 'configure', sourceHandle: 'false' },
+        { source: 'reject', target: 'rejectTail' },
+        { source: 'rejectTail', target: 'merge' },
+        { source: 'configure', target: 'merge' },
+      ],
+    ),
+    { callId: 'call_bf26a886' },
+  );
+  const branchJob = await runToEnd(engine, branchId);
+  check('branch: the flow completed', branchJob?.status === 'completed', `error=${branchJob?.error ?? ''}`);
+  const commands = sent
+    .filter((s) => s.url.includes('/api/bridge/connectors/'))
+    .map((s) => JSON.parse(s.body ?? '{}').command);
+  check(
+    'branch: only the taken branch ran its connector command',
+    commands.length === 2 && commands[0] === 'call.configureAgent' && commands[1] === 'merge.reached',
+    `commands sent: ${JSON.stringify(commands)}`,
+  );
+  check('branch: the untaken branch never reached the connector', !commands.includes('call.reject'), `got ${JSON.stringify(commands)}`);
+  check('branch: untaken descendants never execute', !commands.includes('must.not.run'), `got ${JSON.stringify(commands)}`);
+
+  // And the other way round, so the gate is not simply blocking everything.
+  sent.length = 0;
+  const branch2 = engine.submit(
+    'test',
+    'connector-branch-gate-true',
+    graph(
+      [
+        { id: 'decide', type: 'logic_block', position: { x: 0, y: 0 }, data: { expr: 'return { reject: true };' } },
+        { id: 'gate', type: 'condition', position: { x: 100, y: 0 }, data: { expr: '(nodes.decide || {}).reject === true' } },
+        { id: 'reject', type: 'device_command', position: { x: 200, y: -50 }, data: { connectorId: 'gadget', command: 'call.reject', payload: {} } },
+        { id: 'configure', type: 'device_command', position: { x: 200, y: 50 }, data: { connectorId: 'gadget', command: 'call.configureAgent', payload: {} } },
+      ],
+      [
+        { source: 'decide', target: 'gate' },
+        { source: 'gate', target: 'reject', sourceHandle: 'true' },
+        { source: 'gate', target: 'configure', sourceHandle: 'false' },
+      ],
+    ),
+    {},
+  );
+  await runToEnd(engine, branch2);
+  const commands2 = sent
+    .filter((s) => s.url.includes('/api/bridge/connectors/'))
+    .map((s) => JSON.parse(s.body ?? '{}').command);
+  check(
+    'branch: the true path runs when the condition is true, and only it',
+    commands2.length === 1 && commands2[0] === 'call.reject',
+    `commands sent: ${JSON.stringify(commands2)}`,
+  );
+
+  // --- a listing's shape, and its filters ---------------------------------
+  //
+  // Live report 2026-08-01: a caller lookup answered "unknown caller" for a
+  // customer plainly in the table. The graph reads `$nodes.customers.first`
+  // and `.found`; a bare array has neither, so it read undefined and decided
+  // the record did not exist. Its `phone_eq` filter was ignored too — which is
+  // worse than failing, because the unfiltered listing then hands the graph a
+  // real record belonging to somebody else.
+  sent.length = 0;
+  await loadConnectorModule(
+    writeConfig('shaped.json', {
+      ...CONFIG,
+      nodes: [
+        {
+          nodeType: 'catalogue_lookup',
+          operation: 'listRecords',
+          path: '/api/v1/shelves/{shelf}/items',
+          listResult: { items: 'responses', count: 'count', first: 'first', found: 'found' },
+          filters: {
+            field: 'filters',
+            opKey: 'op',
+            fieldKey: 'field',
+            valueKey: 'value',
+            ops: [{ op: 'phone_eq', param: 'answersPhone.{field}' }],
+          },
+        },
+      ],
+    }),
+  );
+  const shapedId = engine.submit(
+    'test',
+    'connector-list-shape',
+    graph(
+      [
+        {
+          id: 'customers',
+          type: 'catalogue_lookup',
+          position: { x: 100, y: 0 },
+          data: {
+            shelf: 'fixed',
+            filters: [{ op: 'phone_eq', field: 'phone', value: '$inputs.from' }],
+          },
+        },
+      ],
+      [],
+    ),
+    { from: '0421285243' },
+  );
+  const shapedJob = await runToEnd(engine, shapedId);
+  check('listing: the flow completed', shapedJob?.status === 'completed', `error=${shapedJob?.error ?? ''}`);
+  const listUrl = sent.find((s) => s.url.includes('/items'))?.url ?? '';
+  check(
+    'listing: the phone_eq filter reached the provider as a query parameter',
+    listUrl.includes('answersPhone.phone=0421285243'),
+    `url=${listUrl}`,
+  );
+  const shaped = shapedJob?.nodeOutputs?.customers as any;
+  check('listing: it is a structured object, not a bare array', shaped && !Array.isArray(shaped), `got ${JSON.stringify(shaped)?.slice(0, 80)}`);
+  check('listing: .responses carries the rows', Array.isArray(shaped?.responses) && shaped.responses.length === 2, `got ${JSON.stringify(shaped?.responses)?.slice(0, 60)}`);
+  check('listing: .first is the first row', shaped?.first?.id === 'i1', `got ${JSON.stringify(shaped?.first)}`);
+  check('listing: .found says a record exists', shaped?.found === true, `got ${JSON.stringify(shaped?.found)}`);
+  check('listing: .count matches', shaped?.count === 2, `got ${JSON.stringify(shaped?.count)}`);
+
+  // A filter this provider cannot apply must REFUSE, never silently widen.
+  const badFilterId = engine.submit(
+    'test',
+    'connector-bad-filter',
+    graph(
+      [
+        {
+          id: 'q',
+          type: 'catalogue_lookup',
+          position: { x: 0, y: 0 },
+          data: { shelf: 'fixed', filters: [{ op: 'starts_with', field: 'phone', value: '04' }] },
+        },
+      ],
+      [],
+    ),
+    {},
+  );
+  const badFilterJob = await runToEnd(engine, badFilterId);
+  check('listing: an unsupported filter fails the flow rather than widening it', badFilterJob?.status === 'failed');
+  check('listing: and names the filter it cannot apply', String(badFilterJob?.error ?? '').includes('starts_with'), `error=${badFilterJob?.error ?? ''}`);
+
+  // --- a node type this build does not have -------------------------------
+  const badId = engine.submit(
+    'test',
+    'connector-unknown-node',
+    graph([{ id: 'x', type: 'not_in_the_config', position: { x: 0, y: 0 }, data: {} }], []),
+    {},
+  );
+  const badJob = await runToEnd(engine, badId);
+  check('run: an unconfigured node type fails the flow instead of no-opping', badJob?.status === 'failed');
+  check('run: and says so by name', String(badJob?.error ?? '').includes('not_in_the_config'));
+
+  fs.rmSync(tmp, { recursive: true, force: true });
+  console.log(`connector-flow: ${pass} passed, ${fail} failed`);
+  process.exit(fail ? 1 : 0);
+}
+
+main().catch((e) => {
+  console.error('connector-flow crashed:', e);
+  process.exit(1);
+});

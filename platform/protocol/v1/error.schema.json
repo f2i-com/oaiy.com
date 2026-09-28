@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oaiy.com/schemas/bridge/v1/error.schema.json",
+  "title": "Bridge error",
+  "description": "Closed error taxonomy. Callers branch on `code`; people read `message` and `detail`.\n\nThe set is closed on purpose. An open-ended string means every consumer substring-matches on prose, and the prose then cannot be improved without breaking them.",
+  "type": "object",
+  "required": [
+    "code",
+    "message"
+  ],
+  "properties": {
+    "code": {
+      "enum": [
+        "invalid_request",
+        "invalid_flow",
+        "flow_not_found",
+        "capability_denied",
+        "capability_unavailable",
+        "connection_missing",
+        "node_failed",
+        "timeout",
+        "cancelled",
+        "runtime_unavailable",
+        "internal"
+      ],
+      "description": "`capability_denied` = the caller's grants do not cover it (a permission problem). `capability_unavailable` = granted, but not usable right now (an operational problem). Conflating them sends users to fix the wrong thing."
+    },
+    "message": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1000,
+      "description": "One sentence, safe to show a user. No credentials, no stack traces."
+    },
+    "detail": {
+      "type": "string",
+      "maxLength": 2000,
+      "description": "What to do about it. Required for `capability_unavailable`."
+    },
+    "nodeId": {
+      "type": "string",
+      "maxLength": 128
+    },
+    "capability": {
+      "type": "string",
+      "description": "Dotted capability id. `oaiy.*` is reserved for the platform; products and plugins own their own namespace (`connector.aokie.*`).",
+      "pattern": "^[a-z][a-z0-9_]*(\\.[a-zA-Z0-9_*]+)+$",
+      "maxLength": 128
+    },
+    "retryable": {
+      "type": "boolean",
+      "description": "True only when the outcome can change on a retry. A malformed flow, a denied capability and a deterministic 4xx are all false \u2014 re-driving them just burns the ledger."
+    }
+  },
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "code": {
+            "const": "capability_unavailable"
+          }
+        },
+        "required": [
+          "code"
+        ]
+      },
+      "then": {
+        "required": [
+          "detail"
+        ]
+      }
+    }
+  ]
+}

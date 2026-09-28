@@ -1,0 +1,138 @@
+{
+    "id": "music_gen",
+    "name": "Music Gen",
+    "description": "Generate music from text descriptions and optional lyrics using ACE-Step AI.",
+    "doc": "Generate AI music from text prompts using ACE-Step.\n\nPrompt Tips:\n• Include genre: pop, rock, electronic, jazz\n• Specify mood: energetic, calm, melancholic\n• Add instruments: piano, guitar, synth\n• Describe vocals: male/female, soft, powerful\n\nLyrics Format:\n[verse] First verse lyrics here\n[chorus] Catchy chorus lyrics\n[bridge] Bridge section\n\nSettings:\n• Duration: 10-240 seconds\n• Quality Steps: higher = better but slower\n• Seed: use same seed for reproducible results\n\nRequires: ACE-Step API server (default: localhost:8766)",
+    "icon": "music",
+    "color": "purple",
+    "tags": [
+        "audio",
+        "music",
+        "generation",
+        "ai",
+        "song"
+    ],
+    "inputs": [
+        {
+            "id": "prompt",
+            "name": "Prompt",
+            "type": "string",
+            "position": "left",
+            "description": "Music description/tags (genre, mood, instruments, etc.)"
+        },
+        {
+            "id": "lyrics",
+            "name": "Lyrics",
+            "type": "string",
+            "position": "left",
+            "optional": true,
+            "description": "Song lyrics with structure markers like [verse], [chorus]"
+        },
+        {
+            "id": "duration",
+            "name": "Duration",
+            "type": "number",
+            "position": "left",
+            "optional": true,
+            "description": "Duration in seconds (overrides property if connected)"
+        }
+    ],
+    "outputs": [
+        {
+            "id": "audio",
+            "name": "Audio",
+            "type": "audio",
+            "position": "right",
+            "description": "Generated audio file (media URL)"
+        },
+        {
+            "id": "path",
+            "name": "Path",
+            "type": "string",
+            "position": "right",
+            "description": "File path to generated audio (for FFmpeg operations)"
+        }
+    ],
+    "properties": [
+        {
+            "id": "apiUrl",
+            "name": "API URL",
+            "type": "string",
+            "default": "http://127.0.0.1:8766/generate",
+            "description": "ACE-Step API endpoint"
+        },
+        {
+            "id": "prompt",
+            "name": "Prompt",
+            "type": "textarea",
+            "default": "pop, energetic, catchy melody, female vocal",
+            "description": "Music style tags (genre, mood, instruments, vocals)",
+            "rows": 2
+        },
+        {
+            "id": "lyrics",
+            "name": "Lyrics",
+            "type": "textarea",
+            "default": "",
+            "description": "Song lyrics with [verse], [chorus], [bridge] markers",
+            "rows": 4
+        },
+        {
+            "id": "duration",
+            "name": "Duration (seconds)",
+            "type": "number",
+            "default": 60,
+            "min": 10,
+            "max": 240,
+            "step": 5,
+            "description": "Length of generated audio (10-240 seconds)"
+        },
+        {
+            "id": "inferSteps",
+            "name": "Quality Steps",
+            "type": "number",
+            "default": 27,
+            "min": 10,
+            "max": 100,
+            "step": 1,
+            "description": "More steps = higher quality but slower",
+            "advanced": true
+        },
+        {
+            "id": "guidanceScale",
+            "name": "Guidance Scale",
+            "type": "number",
+            "default": 15.0,
+            "min": 1.0,
+            "max": 30.0,
+            "step": 0.5,
+            "description": "How closely to follow the prompt",
+            "advanced": true
+        },
+        {
+            "id": "seed",
+            "name": "Seed",
+            "type": "number",
+            "default": -1,
+            "min": -1,
+            "description": "Random seed (-1 for random)",
+            "advanced": true
+        },
+        {
+            "id": "filename",
+            "name": "Filename",
+            "type": "string",
+            "default": "music_output",
+            "description": "Base filename for output"
+        }
+    ],
+    "compiler": {
+        "customHandler": true,
+        "async": true,
+        "statusTracking": true
+    },
+    "ui": {
+        "width": 320,
+        "customComponent": "MusicGenNode"
+    }
+}
