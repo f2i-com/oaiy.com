@@ -42,6 +42,25 @@ describe('speaking what the agent writes', () => {
     expect(said).toEqual(['One.', 'Next reply.']);
   });
 
+  it('a sentence already said on this call is not said again; a short one may be, and a new call starts over', async () => {
+    const said: string[] = [];
+    const speech = new Speech(async (text) => void said.push(text));
+    const reply = (text: string) => {
+      speech.begin();
+      speech.push(text);
+      speech.flush();
+    };
+    reply("Sure! I've recorded the request for Thursday at ten.");
+    reply("Okay. I've recorded the request for Thursday, at ten!");
+    reply('Sure! Anything else?');
+    await speech.done;
+    expect(said).toEqual(['Sure!', "I've recorded the request for Thursday at ten.", 'Okay.', 'Sure!', 'Anything else?']);
+    speech.newCall();
+    reply("I've recorded the request for Thursday at ten.");
+    await speech.done;
+    expect(said.at(-1)).toBe("I've recorded the request for Thursday at ten.");
+  });
+
   it('a long run of words is spoken at a comma rather than waited on', async () => {
     const said: string[] = [];
     const speech = new Speech(async (text) => void said.push(text));
@@ -179,7 +198,31 @@ describe('a phone call answered by the agent', () => {
     await settled(sessions);
     expect(calls).toEqual([['say', 'call_3', "Let me check what's open on the calendar."]]);
     expect(fake.bodies).toHaveLength(1);
-    expect(callInstructions('', '+61400000003', '', '')).toContain('Never say you will check without calling the tool');
+    const rules = callInstructions('', '+61400000003', '', '');
+    expect(rules).toContain('Never say you will check without calling the tool');
+    expect(rules).toContain('Never make up availability');
+    expect(rules).toContain('When the caller says goodbye or is done, call end_call');
+  });
+
+  it("no records to ask: the agent is told plainly, so it does not make up a time", async () => {
+    fakeProvider('openai', [
+      { calls: [{ name: 'lookup_business_data', input: { question: 'What is free on Thursday?' } }] },
+      (body) => {
+        expect(JSON.stringify(body.messages)).toContain('Do not guess times, availability');
+        return { text: "I can't check the calendar right now." };
+      },
+    ]);
+    const { sessions, calls } = setup();
+    const desktopCalls = calls;
+    (sessions as unknown as { desktop: () => { callTool: unknown } }).desktop().callTool = async (callId: string, name: string, args: unknown) => {
+      desktopCalls.push([name, callId, args]);
+      return { ok: true, output: { answer: 'LOOKUP UNAVAILABLE (no result)' } };
+    };
+    await sessions.callEvent({ type: 'call.started', callId: 'call_4', from: '+61400000004' });
+    await sessions.callEvent({ type: 'call.caller', callId: 'call_4', text: "What's free on Thursday?" });
+    await settled(sessions);
+    expect(calls[0]).toEqual(['lookup_business_data', 'call_4', { question: 'What is free on Thursday?' }]);
+    expect(calls.at(-1)).toEqual(['say', 'call_4', "I can't check the calendar right now."]);
   });
 
   it("a new call starts afresh: only the caller's last words carry over, never a line said again and again", () => {

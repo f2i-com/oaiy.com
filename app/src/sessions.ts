@@ -80,6 +80,8 @@ export class Speech {
   private buffer = '';
   private chain: Promise<void> = Promise.resolve();
   private hushed = false;
+  /** What was said on this call, so a sentence is not said twice. */
+  private said = new Set<string>();
 
   constructor(private readonly say: (text: string) => Promise<void>, private readonly failed: (error: string) => void = () => {}) {}
 
@@ -87,6 +89,11 @@ export class Speech {
   begin(): void {
     this.hushed = false;
     this.buffer = '';
+  }
+
+  /** A new call: nothing has been said on it yet. */
+  newCall(): void {
+    this.said.clear();
   }
 
   push(delta: string): void {
@@ -125,6 +132,13 @@ export class Speech {
   private speak(text: string): void {
     const clean = spoken(text);
     if (!clean) return;
+    // A sentence of a few words already said on this call is not said again (a model repeats itself;
+    // a short "Sure!" or "Okay." may come again).
+    const key = clean.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
+    if (key.split(' ').length >= 4) {
+      if (this.said.has(key)) return;
+      this.said.add(key);
+    }
     this.chain = this.chain.then(() => (this.hushed ? undefined : this.say(clean))).catch((e: unknown) => this.failed((e as Error).message));
   }
 }
@@ -147,10 +161,16 @@ export function callInstructions(title: string, number: string, brief: string, i
     'Their words arrive as "Caller: …", transcribed from speech (allow for a misheard word). A message without that label comes from the person you work for, who may be watching: do what they say.',
     'Your call tools: request_appointment (a booking request for staff to confirm; never say it is booked or confirmed), lookup_business_data (a question about the business\'s records or calendar), end_call (a short goodbye, then the call ends; use it when the caller is done). Your other tools work too.',
     'To look something up, call the tool in the same reply as your words: say "Let me check." and make the call at once. Never say you will check without calling the tool: the caller hears you and waits.',
+    'Say only what you know: from these instructions, the brief, or what a tool returned. Never make up availability, times, prices or bookings. If you cannot check, say so, and offer to take their preferred time as a request for staff to confirm.',
+    'Never repeat something you have already said on this call. When the caller says goodbye or is done, call end_call with a short goodbye, and write nothing else.',
     brief.trim() ? `The receptionist brief:\n${brief.trim()}` : '',
     `The instructions of the person you work for, for calls:\n${instructions.trim() || '(none)'}`,
   ].filter(Boolean).join('\n');
 }
+
+/** What the call's agent is told when the business's records cannot be checked. */
+export const LOOKUP_UNAVAILABLE =
+  "The business's records could not be checked just now (no business lookup is set up on OAIY Desktop, or it failed). Do not guess times, availability, prices or bookings: tell the caller you can't check right now, and offer to take their preferred time as a request for staff to confirm.";
 
 /**
  * What a new call keeps of the caller's earlier calls: the last few things said, without the
@@ -285,7 +305,10 @@ export class Sessions {
         },
         run: async (input) => {
           const { desktop, callId } = live();
-          return outcome(await desktop.callTool(callId, 'lookup_business_data', { question: String(input.question ?? '') }));
+          const r = await desktop.callTool(callId, 'lookup_business_data', { question: String(input.question ?? '') });
+          // No records to ask (no business-lookup flow on the desktop, or it failed): say so plainly, so nothing is made up.
+          if (JSON.stringify(r.output ?? '').includes('LOOKUP UNAVAILABLE')) return LOOKUP_UNAVAILABLE;
+          return outcome(r);
         },
       },
     ];
@@ -311,6 +334,7 @@ export class Sessions {
       session.unread++;
       // A new call starts afresh, with only the last few words of the earlier ones.
       if (type === 'call.started' && !session.running) session.agent.turns = earlierWords(session.agent.turns);
+      if (type === 'call.started') session.speech?.newCall();
       const greeting = typeof event.greeting === 'string' && event.greeting.trim() ? ` You greeted them: "${event.greeting.trim()}"` : '';
       session.agent.turns.push({ role: 'user', text: `[OAIY] 📞 A call from ${session.title}${session.title !== session.key ? ` (${session.key})` : ''} began.${greeting}`, automatic: true });
       await this.save(session);
