@@ -76,10 +76,21 @@ export interface AvailabilityEnv {
   desktop: CustomService[];
 }
 
+/**
+ * Whether a service is offered in lists (the palette and the Service
+ * dropdowns): the user's own, OAIY's engine (its models that are switched on
+ * and on disk), and desktop services in use (running, or set to start with
+ * OAIY). An installed one that is stopped is left out, but still resolves,
+ * so a flow that uses it runs as before.
+ */
+export function isListed(s: CustomService): boolean {
+  return s.group !== 'desktop' || s.inUse !== false;
+}
+
 /** Whether the palette offers node type `id`. */
 export function paletteShowsNode(id: string, env: AvailabilityEnv): boolean {
   if (!SERVICE_NODE_TYPES.has(id)) return true;
-  const all = [...env.custom, ...env.desktop];
+  const all = [...env.custom, ...env.desktop].filter(isListed);
   if (env.inOaiy) return env.loaded && servesNode(all, id as never);
   if (WEB_TYPED_NODE_IDS.has(id)) return false;
   return servesNode(all, id as never);

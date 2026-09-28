@@ -91,9 +91,12 @@ export const PropertyField: React.FC<PropertyFieldProps> = ({
     // with a dynamic entry, the dynamic one wins (richer metadata).
     const seen = new Set<string>();
     const merged: PropertyOption[] = [];
+    const current = String(value ?? property.default ?? '');
     for (const opt of dynamicOptions) {
       const key = String(opt.value);
       if (seen.has(key)) continue;
+      // Kept for a flow that already uses it; not offered otherwise.
+      if (opt.onlyWhenSelected && key !== current) continue;
       seen.add(key);
       merged.push(opt);
     }
@@ -104,7 +107,7 @@ export const PropertyField: React.FC<PropertyFieldProps> = ({
       merged.push(opt);
     }
     return merged;
-  }, [property.dynamicOptionsSource, property.options, dynamicOptions]);
+  }, [property.dynamicOptionsSource, property.options, property.default, dynamicOptions, value]);
 
   if (!isVisible || property.hidden) {
     return null;

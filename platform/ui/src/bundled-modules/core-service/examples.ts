@@ -177,6 +177,12 @@ export interface CustomService {
   /** OAIY engine entries: the default model of its kind. */
   default?: boolean;
   /**
+   * OAIY Desktop services: whether it is in use (running, or set to start
+   * with OAIY). One that is not is still installed and still runs a flow
+   * that uses it, but lists leave it out (see `isListed`).
+   */
+  inUse?: boolean;
+  /**
    * What the call makes. Set, the typed nodes and Service Call run it as a
    * contract (the body rendered with every missing value as null, the answer
    * turned into a file or a picture) — see core-service/contract.ts.

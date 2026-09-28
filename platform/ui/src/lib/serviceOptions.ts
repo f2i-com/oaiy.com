@@ -2,19 +2,25 @@
  * The options of a Service dropdown (`service:list[:<nodeType>]`).
  *
  * Grouped by where the service comes from:
- *   - "OAIY engine" — its models whose files are here (and OAIY Voice), with
- *     "Default <kind> model" first: `engine:<kind>`, which follows the
- *     default set in OAIY → Engines;
- *   - "Your services" — what OAIY Desktop runs: Python rigs, Ollama, …;
+ *   - "OAIY engine" — its models switched on in OAIY → Engines whose files are
+ *     here (and OAIY Voice), with "Default <kind> model" first: `engine:<kind>`,
+ *     which follows the default set there. A typed node lists every model of
+ *     its kind; Service Call, which takes any kind, lists each kind's default
+ *     only;
+ *   - "Your services" — what OAIY Desktop runs and is in use (running, or
+ *     started with OAIY): Python rigs, Ollama, …;
  *   - "Custom" — HTTP services defined in this editor (Settings → Services);
  * then "Add a service…", which says where more come from and opens the
  * editor's service form for this node.
+ *
+ * What lists leave out (another model on Service Call, a stopped service) is
+ * still there as `onlyWhenSelected`, so a flow that already uses one shows it.
  */
 import type { PropertyOption } from 'oaiy-core';
 import type { CustomService, ServiceNodeTag } from 'oaiy-core/modules/core-service/examples';
 import { filterServicesForNodeType } from 'oaiy-core/modules/core-service/examples';
 import { NODE_ENGINE_KIND, engineDefault } from 'oaiy-core/modules/core-service/contract';
-import { DEFAULT_SERVICE, type AvailabilityEnv } from './nodeAvailability';
+import { DEFAULT_SERVICE, isListed, type AvailabilityEnv } from './nodeAvailability';
 
 export const GROUP_ENGINE = 'OAIY engine';
 export const GROUP_DESKTOP = 'Your services';
@@ -51,7 +57,10 @@ export function serviceOptions(
   onAdd: (nodeType: string) => void,
 ): PropertyOption[] {
   const all = [...env.desktop, ...env.custom];
-  const offered = filterServicesForNodeType(all, (nodeType as ServiceNodeTag) || '');
+  const anyKind = !nodeType || nodeType === 'service_call';
+  // Service Call takes a service meant for it (or one that says nothing).
+  const offered = filterServicesForNodeType(all, (nodeType as ServiceNodeTag) || '')
+    .filter((s) => !anyKind || !s.nodeTypes?.length || s.nodeTypes.includes('service_call'));
   const options: PropertyOption[] = [];
   // Blank means "no preset" on the older nodes (their own fields run); the
   // new nodes always run on a service, so they have no blank.
@@ -61,23 +70,34 @@ export function serviceOptions(
       label: nodeType ? '(none — use the fields below)' : '(none — fill fields inline)',
     });
   }
-  const kind = NODE_ENGINE_KIND[nodeType];
-  const def = kind ? engineDefault(env.desktop, kind) : null;
-  if (def && def.nodeTypes?.includes(nodeType as ServiceNodeTag)) {
+  const defaultOf = (kind: string) => {
+    const def = engineDefault(env.desktop, kind);
+    if (!def) return;
     options.push({
       value: `engine:${kind}`,
       label: `Default ${KIND_NAME[kind] ?? `${kind} model`} (${def.model || def.name})`,
       description: 'Follows the default set in OAIY → Engines',
       group: GROUP_ENGINE,
     });
+  };
+  const kind = NODE_ENGINE_KIND[nodeType];
+  if (anyKind) {
+    // Each kind's default once, in the engine's order.
+    const kinds = [...new Set(offered.filter((s) => s.group === 'engine' && s.id.startsWith('engine:') && s.kind).map((s) => s.kind!))];
+    kinds.forEach(defaultOf);
+  } else if (kind && engineDefault(env.desktop, kind)?.nodeTypes?.includes(nodeType as ServiceNodeTag)) {
+    defaultOf(kind);
   }
   for (const s of offered) {
     const group = serviceGroup(s);
+    // Service Call offers each kind's default above, not every model.
+    const listed = isListed(s) && !(anyKind && s.group === 'engine' && s.id.startsWith('engine:'));
     options.push({
       value: s.id,
       label: labelFor(s),
       description: s.description || (group === GROUP_CUSTOM ? (s.isBuiltIn ? 'Built-in example' : 'Custom service') : ''),
       group,
+      ...(listed ? {} : { onlyWhenSelected: true }),
     });
   }
   options.push({

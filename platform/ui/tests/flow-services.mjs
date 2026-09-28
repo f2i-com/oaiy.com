@@ -81,7 +81,7 @@ const bundlePath = path.join(os.tmpdir(), `oaiy-flow-services-${process.pid}.mjs
 await esbuild.build({
   stdin: {
     contents: `export { mapToCustomService, mapEngineService, combineDesktopServices } from './src/lib/desktopServices.ts';
-export { paletteShowsNode, nodeNotice, initialServiceFor, nodeTypeForService } from './src/lib/nodeAvailability.ts';
+export { paletteShowsNode, nodeNotice, initialServiceFor, nodeTypeForService, isListed } from './src/lib/nodeAvailability.ts';
 export { serviceOptions } from './src/lib/serviceOptions.ts';
 export { resolveService, renderContractBody, nodeContract } from './src/bundled-modules/core-service/contract.ts';
 export { runContract, contractTiming } from './src/bundled-modules/core-service/contractRuntime.ts';
@@ -129,6 +129,7 @@ const ENGINE = [
 const SERVICES = [
   { id: 'krea2', name: 'Krea 2', description: 'Pictures', category: 'Image Generation', status: 'stopped', port: 17910, defaultPort: 17910, docsUrl: null, installed: false, node: { endpoint: '/generate', bodyTemplate: '{"prompt": {{input}}}', responsePath: 'imageUrl' } },
   { id: 'ollama', name: 'Ollama', description: 'Local LLMs', category: 'LLM', status: 'stopped', port: 11434, defaultPort: 11434, docsUrl: null, installed: true, node: { apiFormat: 'openai', endpoint: '/v1/chat/completions' } },
+  { id: 'lm', name: 'Local LLM', description: 'Started with OAIY', category: 'LLM', status: 'stopped', port: 1234, defaultPort: 1234, docsUrl: null, installed: true, autostart: true, node: { apiFormat: 'openai', endpoint: '/v1/chat/completions' } },
   { id: 'my-rig', name: 'My Python rig', description: 'A rig', category: 'Audio', status: 'running', port: 9000, defaultPort: 9000, docsUrl: null, installed: true },
 ];
 const CUSTOM = [{ id: 'my-tts', name: 'My TTS', endpoint: 'http://127.0.0.1:5002/tts', method: 'POST', headers: '{}', bodyTemplate: '{"text": {{input}}}', responseType: 'json', responsePath: 'url', nodeTypes: ['text_to_speech', 'service_call'] }];
@@ -215,6 +216,40 @@ await check('the Service dropdown is grouped: OAIY engine, your services, custom
   const groups = [...new Set(call.map((o) => o.group).filter(Boolean))];
   assert.deepEqual(groups, ['OAIY engine', 'Your services', 'Custom', 'More']);
   assert.ok(!M.serviceOptions('sound_effect', env(), () => {}).some((o) => o.value === ''), 'the new nodes always run on a service');
+});
+
+await check('lists offer only what is in use: a stopped service is left out but still resolves', () => {
+  const by = (id) => desktop.find((s) => s.id === id);
+  assert.equal(M.isListed(by('companion:ollama')), false, 'installed, stopped, not started with OAIY');
+  assert.equal(M.isListed(by('companion:lm')), true, 'started with OAIY');
+  assert.equal(M.isListed(by('companion:my-rig')), true, 'running');
+  assert.equal(M.isListed(by('engine:music:song')), true);
+  assert.equal(M.isListed(CUSTOM[0]), true, "the user's own");
+  // An AI LLM node offers the engine and Local LLM; Ollama only while a flow already uses it.
+  const llm = M.serviceOptions('ai_llm', env(), () => {});
+  const ollama = llm.find((o) => o.value === 'companion:ollama');
+  assert.equal(ollama.onlyWhenSelected, true);
+  assert.ok(!llm.find((o) => o.value === 'companion:lm').onlyWhenSelected);
+  // A flow that uses it still runs on it, with no "not installed" notice.
+  assert.equal(M.nodeNotice('ai_llm', { service: 'companion:ollama' }, env()), null);
+  // Nothing in use serves music: the palette has no Music Gen from a stopped rig.
+  const stoppedRig = { id: 'companion:rig', name: 'Rig', endpoint: 'http://127.0.0.1:9000/music', method: 'POST', headers: '{}', bodyTemplate: '{}', responseType: 'json', responsePath: '', nodeTypes: ['music_gen'], group: 'desktop', inUse: false };
+  const noMusic = env({ desktop: [...desktop.filter((s) => s.kind !== 'music'), stoppedRig] });
+  assert.equal(M.paletteShowsNode('music_gen', noMusic), false);
+});
+
+await check("Service Call offers each kind's default model, not every model", () => {
+  const more = [...desktop, { ...desktop.find((s) => s.id === 'engine:image:qwen'), id: 'engine:image:other', model: 'other', default: false }];
+  const call = M.serviceOptions('service_call', env({ desktop: more }), () => {});
+  const engine = call.filter((o) => o.group === 'OAIY engine' && !o.onlyWhenSelected).map((o) => o.value);
+  assert.deepEqual(engine, ['engine:llm', 'engine:image', 'engine:music', 'engine:sound', 'engine:background']);
+  // Each model stays pickable only where a flow already names it.
+  assert.equal(call.find((o) => o.value === 'engine:image:other').onlyWhenSelected, true);
+  // OAIY Voice's transcription is for Speech to Text, not Service Call.
+  assert.ok(!call.some((o) => o.value === 'voice:transcribe'));
+  // A typed node still lists every model of its kind.
+  const image = M.serviceOptions('image_gen', env({ desktop: more }), () => {}).filter((o) => !o.onlyWhenSelected).map((o) => o.value);
+  assert.deepEqual(image.filter((v) => String(v).startsWith('engine:')), ['engine:image', 'engine:image:qwen', 'engine:image:other']);
 });
 
 await check('a dropped engine entry becomes the node it is for; a service node starts on the engine', () => {

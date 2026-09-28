@@ -15,7 +15,7 @@ import {
   type ModuleCategory,
 } from 'oaiy-core';
 import { subscribeToDynamicOptionsInvalidation } from 'oaiy-ui-components';
-import { paletteShowsNode } from '../lib/nodeAvailability';
+import { isListed, paletteShowsNode } from '../lib/nodeAvailability';
 import { currentAvailabilityEnv } from '../lib/availabilityEnv';
 import type { PackageNodeInfo } from './usePackageNodes';
 import { listAllServices } from '../utils/serviceRegistry';
@@ -233,6 +233,12 @@ export function useModuleNodes(options?: UseModuleNodesOptions) {
       // Service Call node, until the user adds their first service.
       if (svc.isBuiltIn) continue;
       if (!svc.endpoint) continue; // skip half-formed user services
+      // OAIY's engine models are not entries of their own: each has its
+      // typed node (Image Gen, Music Gen, 3D Model …), which starts on the
+      // default model and picks another in its Service dropdown.
+      if (svc.group === 'engine') continue;
+      // Installed but not in use (stopped, not started with OAIY).
+      if (!isListed(svc)) continue;
       const synthetic: ModuleNodeInfo = {
         definition: {
           id: `service:${svc.id}`,

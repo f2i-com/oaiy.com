@@ -71,6 +71,8 @@ export interface DesktopServiceSnapshot {
   docsUrl: string | null;
   /** Whether its program is on disk. Not installed → not listed. */
   installed?: boolean;
+  /** Set to start with OAIY. */
+  autostart?: boolean;
   /** How to call this service as a node, declared by its template (optional). */
   node?: DesktopNodeSpec | null;
 }
@@ -149,7 +151,10 @@ export function mapToCustomService(s: DesktopServiceSnapshot): CustomService | n
   const desc = running
     ? baseDesc
     : `${baseDesc} (currently ${s.status} — auto-starts when the flow runs)`;
-  const common = { id, description: desc, headers: '{}', responseType: 'json' as const, isBuiltIn: false, group: 'desktop' as const };
+  // In use: running, or started with OAIY. A stopped one stays resolvable
+  // (a flow that uses it starts it) but is not offered in lists.
+  const inUse = running || s.autostart === true;
+  const common = { id, description: desc, headers: '{}', responseType: 'json' as const, isBuiltIn: false, group: 'desktop' as const, inUse };
 
   // 1. An explicit call contract declared by the template WINS — the service
   // tells us exactly how to call it, so even a custom/third-party service

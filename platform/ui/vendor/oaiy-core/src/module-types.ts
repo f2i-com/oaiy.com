@@ -290,6 +290,11 @@ export interface PropertyOption {
    * and leaves the field's value as it was. Only from dynamic resolvers.
    */
   action?: () => void;
+  /**
+   * Listed only while it is the field's value: a choice no longer offered
+   * (a stopped service) that a saved flow still uses stays visible there.
+   */
+  onlyWhenSelected?: boolean;
 }
 
 export interface PropertyDefinition {
