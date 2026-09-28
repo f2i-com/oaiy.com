@@ -11,6 +11,7 @@ import { DesktopEvents, Sessions, TEST_NUMBER } from './sessions';
 import { flowSessionTools, listFlowTools } from './desktop/flowTools';
 import { TRANSCRIBE_TOOL, transcribeTool } from './desktop/transcribe';
 import { calendarTools } from './desktop/calendarTools';
+import { flowBuilderTools } from './desktop/flowBuilder';
 import { TOOLS } from './agent/tools';
 import type { SessionTool } from './agent/agent';
 import { editPhone } from './ui/phone';
@@ -319,9 +320,10 @@ async function main(): Promise<void> {
     project.onError = notice;
     const transcribe = transcribeTool(() => project.vfs, () => desktop);
     const calendar = calendarTools(() => desktop);
+    const flowBuilder = flowBuilderTools(() => desktop);
     const agentOptions = (): AgentOptions => ({
       // Flows made tools, and speech to text: both run on OAIY Desktop.
-      sessionTools: () => (desktop ? [...flowTools, transcribe, ...calendar] : flowTools),
+      sessionTools: () => (desktop ? [...flowTools, transcribe, ...calendar, ...flowBuilder] : flowTools),
       vfs: project.vfs,
       gate,
       provider: activeProvider,
@@ -1170,7 +1172,7 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
       return;
     }
     try {
-      const taken = new Set([...TOOLS.map((t) => t.name), 'send_text_message', 'end_call', 'request_appointment', 'lookup_business_data', 'guide', 'update_plan', 'delegate', TRANSCRIBE_TOOL, 'calendar_free_times', 'calendar_list', 'calendar_book', 'calendar_change']);
+      const taken = new Set([...TOOLS.map((t) => t.name), 'send_text_message', 'end_call', 'request_appointment', 'lookup_business_data', 'guide', 'update_plan', 'delegate', TRANSCRIBE_TOOL, 'calendar_free_times', 'calendar_list', 'calendar_book', 'calendar_change', 'flow_nodes', 'flow_list', 'flow_read', 'flow_write', 'flow_run']);
       flowTools = flowSessionTools(await listFlowTools(d, AbortSignal.timeout(10_000)), () => desktop, taken);
     } catch {
       /* the desktop is away: keep what was there */

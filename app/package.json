@@ -11,6 +11,7 @@
     "fetch:softn": "node scripts/fetch-softn.mjs",
     "softn:guide": "node scripts/generate-softn-guide.mjs",
     "softn:knowledge": "node scripts/generate-softn-knowledge.mjs",
+    "flow-nodes": "node scripts/flow-nodes.mjs",
     "dev": "vite",
     "build": "node scripts/fetch-zipp.mjs --ensure && tsc --noEmit && vite build",
     "preview": "vite preview",

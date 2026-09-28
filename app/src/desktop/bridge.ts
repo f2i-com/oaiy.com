@@ -221,6 +221,11 @@ export class Desktop {
     await this.voice(callId, 'hush', {}).catch(() => {});
   }
 
+  /** Store a flow on the desktop (the flow editor's store): made or replaced. */
+  async putFlow(id: string, doc: Record<string, unknown>, signal?: AbortSignal): Promise<void> {
+    await reply(await fetch(`${this.origin}/api/bridge/flows/${encodeURIComponent(id)}`, { method: 'PUT', headers: this.headers(), body: JSON.stringify(doc), signal }));
+  }
+
   /** The flows stored on the desktop. */
   async flows(signal?: AbortSignal): Promise<Array<{ id: string; name: string }>> {
     const body = await reply(await fetch(`${this.origin}/api/bridge/flows`, { headers: this.headers(), signal }));

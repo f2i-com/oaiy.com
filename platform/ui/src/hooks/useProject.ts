@@ -21,6 +21,7 @@ import {
   revertMacroOverride,
 } from '../utils/userMacroStorage';
 import { createLogger } from '../utils/logger';
+import { useDesktopFlows } from './useDesktopFlows';
 
 const logger = createLogger('Project');
 import {
@@ -176,6 +177,9 @@ export function useProject() {
   const [macroOverrideIds, setMacroOverrideIds] = useState<Set<string>>(new Set());
   // Track original macro states for dirty detection (from disk or saved override)
   const [originalMacroStates, setOriginalMacroStates] = useState<Map<string, Flow>>(new Map());
+
+  // In OAIY's window, the desktop's flows and these are the same flows.
+  useDesktopFlows(project, setProject);
 
   const isMountedRef = useRef(true);
 

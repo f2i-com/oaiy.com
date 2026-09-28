@@ -1,0 +1,2732 @@
+[
+ {
+  "type": "ai_llm",
+  "name": "AI LLM",
+  "module": "core-ai",
+  "description": "Send prompts to an LLM (Language Model) and receive generated responses. Supports OpenAI-compatible APIs.",
+  "inputs": [
+   {
+    "id": "prompt",
+    "type": "string"
+   },
+   {
+    "id": "image",
+    "type": "image"
+   },
+   {
+    "id": "video",
+    "type": "video"
+   }
+  ],
+  "outputs": [
+   {
+    "id": "response",
+    "type": "string"
+   }
+  ],
+  "properties": [
+   {
+    "id": "service",
+    "type": "select"
+   },
+   {
+    "id": "provider",
+    "type": "select",
+    "options": [
+     "ollama",
+     "lmstudio",
+     "huggingface",
+     "custom"
+    ]
+   },
+   {
+    "id": "apiKeyConstant",
+    "type": "string"
+   },
+   {
+    "id": "headers",
+    "type": "json",
+    "default": {},
+    "advanced": true
+   },
+   {
+    "id": "imageInputCount",
+    "type": "number",
+    "default": 0,
+    "advanced": true
+   },
+   {
+    "id": "videoFrames",
+    "type": "number",
+    "default": 8,
+    "advanced": true
+   },
+   {
+    "id": "mmprojPath",
+    "type": "filepath"
+   },
+   {
+    "id": "systemPrompt",
+    "type": "textarea"
+   },
+   {
+    "id": "model",
+    "type": "string"
+   },
+   {
+    "id": "endpoint",
+    "type": "string"
+   },
+   {
+    "id": "apiKey",
+    "type": "secret"
+   },
+   {
+    "id": "customBodyTemplate",
+    "type": "textarea",
+    "advanced": true
+   },
+   {
+    "id": "customResponsePath",
+    "type": "string",
+    "advanced": true
+   },
+   {
+    "id": "customHeaders",
+    "type": "textarea",
+    "advanced": true
+   },
+   {
+    "id": "format",
+    "type": "select",
+    "default": "openai",
+    "options": [
+     "openai",
+     "anthropic",
+     "ollama",
+     "lmstudio"
+    ]
+   },
+   {
+    "id": "imageFormat",
+    "type": "select",
+    "default": "none",
+    "options": [
+     "none",
+     "base64_inline",
+     "base64_separate",
+     "url",
+     "binary"
+    ],
+    "advanced": true
+   },
+   {
+    "id": "maxImageDimension",
+    "type": "number",
+    "default": 0,
+    "advanced": true
+   },
+   {
+    "id": "maxImageSizeKB",
+    "type": "number",
+    "default": 0,
+    "advanced": true
+   },
+   {
+    "id": "maxTokens",
+    "type": "number",
+    "default": 0,
+    "advanced": true
+   },
+   {
+    "id": "enableThinking",
+    "type": "boolean",
+    "default": false,
+    "advanced": true
+   },
+   {
+    "id": "contextLength",
+    "type": "number",
+    "default": 0,
+    "advanced": true
+   }
+  ]
+ },
+ {
+  "type": "audio_append",
+  "name": "Audio Append",
+  "module": "core-audio",
+  "description": "Concatenate multiple audio files into a single audio file.",
+  "inputs": [
+   {
+    "id": "audios",
+    "type": "audio[]"
+   }
+  ],
+  "outputs": [
+   {
+    "id": "audio",
+    "type": "audio"
+   },
+   {
+    "id": "path",
+    "type": "string"
+   }
+  ],
+  "properties": [
+   {
+    "id": "filename",
+    "type": "string",
+    "default": "concatenated_audio"
+   },
+   {
+    "id": "format",
+    "type": "select",
+    "default": "wav",
+    "options": [
+     "wav",
+     "mp3"
+    ]
+   }
+  ]
+ },
+ {
+  "type": "audio_fade",
+  "name": "Audio Fade",
+  "module": "core-audio",
+  "description": "Apply audio fade-in or fade-out effect to a video file.",
+  "inputs": [
+   {
+    "id": "video",
+    "type": "video"
+   }
+  ],
+  "outputs": [
+   {
+    "id": "video",
+    "type": "video"
+   },
+   {
+    "id": "path",
+    "type": "string"
+   }
+  ],
+  "properties": [
+   {
+    "id": "fadeDirection",
+    "type": "select",
+    "default": "out",
+    "options": [
+     "out",
+     "in"
+    ]
+   },
+   {
+    "id": "fadeType",
+    "type": "select",
+    "default": "exponential",
+    "options": [
+     "exponential",
+     "linear"
+    ]
+   },
+   {
+    "id": "fadeDuration",
+    "type": "number",
+    "default": 10
+   },
+   {
+    "id": "filename",
+    "type": "string",
+    "default": "audio_faded"
+   }
+  ]
+ },
+ {
+  "type": "music_gen",
+  "name": "Music Gen",
+  "module": "core-audio",
+  "description": "Generate music from text descriptions and optional lyrics using ACE-Step AI.",
+  "inputs": [
+   {
+    "id": "prompt",
+    "type": "string"
+   },
+   {
+    "id": "lyrics",
+    "type": "string"
+   },
+   {
+    "id": "duration",
+    "type": "number"
+   }
+  ],
+  "outputs": [
+   {
+    "id": "audio",
+    "type": "audio"
+   },
+   {
+    "id": "path",
+    "type": "string"
+   }
+  ],
+  "properties": [
+   {
+    "id": "apiUrl",
+    "type": "string",
+    "default": "http://127.0.0.1:8766/generate"
+   },
+   {
+    "id": "prompt",
+    "type": "textarea",
+    "default": "pop, energetic, catchy melody, female vocal"
+   },
+   {
+    "id": "lyrics",
+    "type": "textarea"
+   },
+   {
+    "id": "duration",
+    "type": "number",
+    "default": 60
+   },
+   {
+    "id": "inferSteps",
+    "type": "number",
+    "default": 27,
+    "advanced": true
+   },
+   {
+    "id": "guidanceScale",
+    "type": "number",
+    "default": 15,
+    "advanced": true
+   },
+   {
+    "id": "seed",
+    "type": "number",
+    "default": -1,
+    "advanced": true
+   },
+   {
+    "id": "filename",
+    "type": "string",
+    "default": "music_output"
+   }
+  ]
+ },
+ {
+  "type": "save_audio",
+  "name": "Save Audio",
+  "module": "core-audio",
+  "description": "Save audio data to a file.",
+  "inputs": [
+   {
+    "id": "audio",
+    "type": "audio"
+   }
+  ],
+  "outputs": [
+   {
+    "id": "path",
+    "type": "string"
+   }
+  ],
+  "properties": [
+   {
+    "id": "filename",
+    "type": "string",
+    "default": "audio_output"
+   },
+   {
+    "id": "directory",
+    "type": "string"
+   },
+   {
+    "id": "format",
+    "type": "select",
+    "default": "wav",
+    "options": [
+     "wav",
+     "mp3"
+    ]
+   },
+   {
+    "id": "overwrite",
+    "type": "boolean",
+    "default": false
+   }
+  ]
+ },
+ {
+  "type": "speech_to_text",
+  "name": "Speech to Text",
+  "module": "core-audio",
+  "description": "Transcribe audio/video to text with word-level timestamps using WhisperX",
+  "inputs": [
+   {
+    "id": "media",
+    "type": "any"
+   },
+   {
+    "id": "startTime",
+    "type": "number"
+   },
+   {
+    "id": "endTime",
+    "type": "number"
+   }
+  ],
+  "outputs": [
+   {
+    "id": "text",
+    "type": "string"
+   },
+   {
+    "id": "segments",
+    "type": "array"
+   },
+   {
+    "id": "language",
+    "type": "string"
+   },
+   {
+    "id": "duration",
+    "type": "number"
+   }
+  ],
+  "properties": [
+   {
+    "id": "apiUrl",
+    "type": "string",
+    "default": "http://127.0.0.1:8770/transcribe"
+   },
+   {
+    "id": "language",
+    "type": "string"
+   },
+   {
+    "id": "enableWordTimestamps",
+    "type": "boolean",
+    "default": true
+   },
+   {
+    "id": "enableDiarization",
+    "type": "boolean",
+    "default": false
+   },
+   {
+    "id": "hfTokenConstant",
+    "type": "string"
+   },
+   {
+    "id": "minSpeakers",
+    "type": "number",
+    "default": null
+   },
+   {
+    "id": "maxSpeakers",
+    "type": "number",
+    "default": null
+   }
+  ]
+ },
+ {
+  "type": "text_to_speech",
+  "name": "Text to Speech",
+  "module": "core-audio",
+  "description": "Convert text to natural speech. Internal mode uses the OAIY DramaBox engine (local, fast, voice cloning). External mode drives any HTTP TTS service (ElevenLabs, OpenAI, Chatterbox, your own).",
+  "inputs": [
+   {
+    "id": "text",
+    "type": "string"
+   },
+   {
+    "id": "descriptionInput",
+    "type": "string"
+   },
+   {
+    "id": "audioPrompt",
+    "type": "audio"
+   }
+  ],
+  "outputs": [
+   {
+    "id": "audio",
+    "type": "audio"
+   },
+   {
+    "id": "path",
+    "type": "string"
+   }
+  ],
+  "properties": [
+   {
+    "id": "service",
+    "type": "select"
+   },
+   {
+    "id": "provider",
+    "type": "select",
+    "default": "external",
+    "options": [
+     "external"
+    ]
+   },
+   {
+    "id": "internalModel",
+    "type": "select",
+    "default": "dramabox-v1",
+    "options": [
+     "dramabox-v1"
+    ]
+   },
+   {
+    "id": "internalCfgScale",
+    "type": "number",
+    "default": 2.5
+   },
+   {
+    "id": "internalDurationSeconds",
+    "type": "number",
+    "default": 0
+   },
+   {
+    "id": "internalStreaming",
+    "type": "boolean",
+    "default": false
+   },
+   {
+    "id": "internalFastMode",
+    "type": "boolean",
+    "default": false
+   },
+   {
+    "id": "internalSeed",
+    "type": "number",
+    "default": 0
+   },
+   {
+    "id": "externalPreset",
+    "type": "select",
+    "default": "elevenlabs",
+    "options": [
+     "elevenlabs",
+     "openai-tts",
+     "chatterbox-tts",
+     "qwen3-tts",
+     "custom"
+    ]
+   },
+   {
+    "id": "externalUrl",
+    "type": "string",
+    "default": "https://api.elevenlabs.io/v1/text-to-speech/{{speaker}}"
+   },
+   {
+    "id": "externalApiKeyConstant",
+    "type": "string",
+    "default": "ELEVENLABS_API_KEY"
+   },
+   {
+    "id": "externalMethod",
+    "type": "select",
+    "default": "POST",
+    "options": [
+     "POST",
+     "GET"
+    ]
+   },
+   {
+    "id": "externalHeaders",
+    "type": "string",
+    "default": "{\"Content-Type\": \"application/json\", \"xi-api-key\": \"{{apiKey}}\"}"
+   },
+   {
+    "id": "externalBodyTemplate",
+    "type": "string",
+    "default": "{\"text\": {{text}}, \"model_id\": \"eleven_multilingual_v2\"}"
+   },
+   {
+    "id": "externalResponseType",
+    "type": "select",
+    "default": "binary_mp3",
+    "options": [
+     "binary_mp3",
+     "binary_wav",
+     "base64_mp3",
+     "base64_wav",
+     "url",
+     "file_path"
+    ]
+   },
+   {
+    "id": "externalResponsePath",
+    "type": "string"
+   },
+   {
+    "id": "description",
+    "type": "string"
+   },
+   {
+    "id": "speaker",
+    "type": "string"
+   },
+   {
+    "id": "language",
+    "type": "select",
+    "default": "Auto",
+    "options": [
+     "Auto",
+     "English",
+     "Chinese",
+     "Japanese",
+     "Korean",
+     "Spanish",
+     "French",
+     "German",
+     "Portuguese"
+    ]
+   },
+   {
+    "id": "outputFormat",
+    "type": "select",
+    "default": "wav",
+    "options": [
+     "wav",
+     "mp3"
+    ]
+   },
+   {
+    "id": "filename",
+    "type": "string",
+    "default": "tts_output"
+   }
+  ]
+ },
+ {
+  "type": "browser_action",
+  "name": "Browser Action",
+  "module": "core-browser",
+  "description": "Drive a browser session: click, type, scroll, wait, screenshot, cookies, close.",
+  "inputs": [
+   {
+    "id": "session",
+    "type": "object"
+   },
+   {
+    "id": "value",
+    "type": "any"
+   }
+  ],
+  "outputs": [
+   {
+    "id": "session",
+    "type": "object"
+   },
+   {
+    "id": "result",
+    "type": "any"
+   }
+  ],
+  "properties": [
+   {
+    "id": "action",
+    "type": "select",
+    "default": "click",
+    "options": [
+     "click",
+     "type",
+     "scroll",
+     "wait",
+     "screenshot",
+     "get_cookies",
+     "set_cookies",
+     "close"
+    ]
+   },
+   {
+    "id": "selector",
+    "type": "string"
+   },
+   {
+    "id": "text",
+    "type": "string"
+   },
+   {
+    "id": "scrollTo",
+    "type": "select",
+    "default": "bottom",
+    "options": [
+     "bottom",
+     "top",
+     "selector"
+    ]
+   },
+   {
+    "id": "format",
+    "type": "select",
+    "default": "png",
+    "options": [
+     "png",
+     "jpeg"
+    ]
+   },
+   {
+    "id": "fullPage",
+    "type": "boolean",
+    "default": false
+   },
+   {
+    "id": "savePath",
+    "type": "string",
+    "advanced": true
+   },
+   {
+    "id": "quality",
+    "type": "number",
+    "default": 80,
+    "advanced": true
+   },
+   {
+    "id": "domain",
+    "type": "string"
+   },
+   {
+    "id": "cookies",
+    "type": "textarea",
+    "default": "[]"
+   },
+   {
+    "id": "merge",
+    "type": "boolean",
+    "default": true
+   },
+   {
+    "id": "timeoutMs",
+    "type": "number",
+    "default": 15000,
+    "advanced": true
+   }
+  ]
+ },
+ {
+  "type": "browser_extract",
+  "name": "Browser Extract",
+  "module": "core-browser",
+  "description": "Extract data from a live browser session, or from HTML/JSON content.",
+  "inputs": [
+   {
+    "id": "session",
+    "type": "object"
+   },
+   {
+    "id": "content",
+    "type": "any"
+   }
+  ],
+  "outputs": [
+   {
+    "id": "result",
+    "type": "any"
+   }
+  ],
+  "properties": [
+   {
+    "id": "type",
+    "type": "select",
+    "default": "text",
+    "options": [
+     "text",
+     "links",
+     "images",
+     "emails",
+     "phones",
+     "colors",
+     "evaluate",
+     "selector",
+     "regex",
+     "jsonpath"
+    ]
+   },
+   {
+    "id": "selector",
+    "type": "string"
+   },
+   {
+    "id": "pattern",
+    "type": "string"
+   },
+   {
+    "id": "attribute",
+    "type": "string",
+    "default": "text"
+   },
+   {
+    "id": "script",
+    "type": "textarea",
+    "default": "(() => ({ title: document.title, url: location.href }))()"
+   },
+   {
+    "id": "region",
+    "type": "string",
+    "default": "GENERIC"
+   },
+   {
+    "id": "max",
+    "type": "number",
+    "default": 0,
+    "advanced": true
+   },
+   {
+    "id": "maxLength",
+    "type": "number",
+    "default": 10000,
+    "advanced": true
+   },
+   {
+    "id": "sameOriginOnly",
+    "type": "boolean",
+    "default": false,
+    "advanced": true
+   },
+   {
+    "id": "minSize",
+    "type": "number",
+    "default": 0,
+    "advanced": true
+   },
+   {
+    "id": "paletteSize",
+    "type": "number",
+    "default": 5,
+    "advanced": true
+   }
+  ]
+ },
+ {
+  "type": "browser_page",
+  "name": "Browser Page",
+  "module": "core-browser",
+  "description": "Open a URL in a session and wait for it to be ready. Returns the final URL, title, HTML, and visible text.",
+  "inputs": [
+   {
+    "id": "session",
+    "type": "object"
+   },
+   {
+    "id": "url",
+    "type": "string"
+   }
+  ],
+  "outputs": [
+   {
+    "id": "session",
+    "type": "object"
+   },
+   {
+    "id": "result",
+    "type": "object"
+   }
+  ],
+  "properties": [
+   {
+    "id": "url",
+    "type": "string"
+   },
+   {
+    "id": "waitUntil",
+    "type": "select",
+    "default": "load",
+    "options": [
+     "load",
+     "domcontentloaded",
+     "networkidle"
+    ]
+   },
+   {
+    "id": "waitForSelector",
+    "type": "string",
+    "advanced": true
+   },
+   {
+    "id": "settleMs",
+    "type": "number",
+    "default": 1000,
+    "advanced": true
+   },
+   {
+    "id": "timeoutMs",
+    "type": "number",
+    "default": 30000
+   }
+  ]
+ },
+ {
+  "type": "browser_request",
+  "name": "Browser Request",
+  "module": "core-browser",
+  "description": "Make HTTP requests with full header control.",
+  "inputs": [
+   {
+    "id": "session",
+    "type": "object"
+   },
+   {
+    "id": "url",
+    "type": "string"
+   }
+  ],
+  "outputs": [
+   {
+    "id": "response",
+    "type": "object"
+   }
+  ],
+  "properties": [
+   {
+    "id": "url",
+    "type": "string"
+   },
+   {
+    "id": "method",
+    "type": "select",
+    "default": "GET",
+    "options": [
+     "GET",
+     "POST",
+     "PUT",
+     "DELETE",
+     "PATCH"
+    ]
+   },
+   {
+    "id": "headers",
+    "type": "textarea"
+   },
+   {
+    "id": "body",
+    "type": "textarea"
+   },
+   {
+    "id": "bodyType",
+    "type": "select",
+    "default": "none",
+    "options": [
+     "none",
+     "json",
+     "form_urlencoded",
+     "raw"
+    ]
+   },
+   {
+    "id": "responseFormat",
+    "type": "select",
+    "default": "auto",
+    "options": [
+     "auto",
+     "json",
+     "text",
+     "full"
+    ]
+   },
+   {
+    "id": "allowLocalNetwork",
+    "type": "boolean",
+    "default": false
+   }
+  ]
+ },
+ {
+  "type": "browser_session",
+  "name": "Browser Session",
+  "module": "core-browser",
+  "description": "Open a browser session. Choose Chromium for headless scraping, WebView for visible/interactive, or HTTP for plain fetch.",
+  "inputs": [
+   {
+    "id": "proxy",
+    "type": "object"
+   }
+  ],
+  "outputs": [
+   {
+    "id": "session",
+    "type": "object"
+   }
+  ],
+  "properties": [
+   {
+    "id": "mode",
+    "type": "select",
+    "default": "chromium",
+    "options": [
+     "chromium",
+     "webview",
+     "http"
+    ]
+   },
+   {
+    "id": "headless",
+    "type": "boolean",
+    "default": true
+   },
+   {
+    "id": "profile",
+    "type": "string",
+    "default": "default"
+   },
+   {
+    "id": "persistProfile",
+    "type": "boolean",
+    "default": false
+   },
+   {
+    "id": "userAgent",
+    "type": "string"
+   },
+   {
+    "id": "viewportWidth",
+    "type": "number",
+    "default": 1365
+   },
+   {
+    "id": "viewportHeight",
+    "type": "number",
+    "default": 900
+   },
+   {
+    "id": "blockResources",
+    "type": "multiselect",
+    "default": [],
+    "options": [
+     "image",
+     "font",
+     "media",
+     "stylesheet",
+     "script"
+    ],
+    "advanced": true
+   },
+   {
+    "id": "headers",
+    "type": "textarea",
+    "advanced": true
+   },
+   {
+    "id": "cookies",
+    "type": "textarea",
+    "advanced": true
+   },
+   {
+    "id": "timeoutMs",
+    "type": "number",
+    "default": 30000,
+    "advanced": true
+   },
+   {
+    "id": "stealth",
+    "type": "boolean",
+    "default": false,
+    "advanced": true
+   },
+   {
+    "id": "impersonate",
+    "type": "select",
+    "options": [
+     "",
+     "chrome131",
+     "chrome124"
+    ],
+    "advanced": true
+   }
+  ]
+ },
+ {
+  "type": "database",
+  "name": "Store Data",
+  "module": "core-database",
+  "description": "Store data to a collection in the database.",
+  "inputs": [
+   {
+    "id": "data",
+    "type": "any"
+   }
+  ],
+  "outputs": [
+   {
+    "id": "result",
+    "type": "any"
+   }
+  ],
+  "properties": [
+   {
+    "id": "collection_name",
+    "type": "string",
+    "default": "default"
+   }
+  ]
+ },
+ {
+  "type": "database_query",
+  "name": "Read Data",
+  "module": "core-database",
+  "description": "Read data from a collection in the database.",
+  "inputs": [
+   {
+    "id": "filter",
+    "type": "object"
+   }
+  ],
+  "outputs": [
+   {
+    "id": "result",
+    "type": "array"
+   }
+  ],
+  "properties": [
+   {
+    "id": "collectionName",
+    "type": "string",
+    "default": "default"
+   },
+   {
+    "id": "filterJson",
+    "type": "string",
+    "default": "{}"
+   }
+  ]
+ },
+ {
+  "type": "file_read",
+  "name": "File Read",
+  "module": "core-filesystem",
+  "description": "Read and optionally parse content from a file on disk.",
+  "inputs": [
+   {
+    "id": "path",
+    "type": "string"
+   }
+  ],
+  "outputs": [
+   {
+    "id": "content",
+    "type": "any"
+   }
+  ],
+  "properties": [
+   {
+    "id": "readAs",
+    "type": "select",
+    "default": "text",
+    "options": [
+     "text",
+     "base64",
+     "json",
+     "csv",
+     "lines"
+    ]
+   },
+   {
+    "id": "csvHasHeader",
+    "type": "boolean",
+    "default": true,
+    "advanced": true
+   }
+  ]
+ },
+ {
+  "type": "file_write",
+  "name": "File Write",
+  "module": "core-filesystem",
+  "description": "Write content to a file on disk. Supports templated filenames and folder connections.",
+  "inputs": [
+   {
+    "id": "content",
+    "type": "any"
+   },
+   {
+    "id": "folder",
+    "type": "string"
+   },
+   {
+    "id": "info",
+    "type": "object"
+   }
+  ],
+  "outputs": [
+   {
+    "id": "path",
+    "type": "string"
+   }
+  ],
+  "properties": [
+   {
+    "id": "targetPath",
+    "type": "string"
+   },
+   {
+    "id": "filenamePattern",
+    "type": "string"
+   },
+   {
+    "id": "contentType",
+    "type": "select",
+    "default": "base64",
+    "options": [
+     "base64",
+     "text"
+    ]
+   },
+   {
+    "id": "createDirectories",
+    "type": "boolean",
+    "default": true
+   }
+  ]
+ },
+ {
+  "type": "text_chunker",
+  "name": "Text Chunker",
+  "module": "core-filesystem",
+  "description": "Split text, JSON arrays, CSV, or lines into batches. Auto-detects type from file extension (.json, .csv, .txt). Supports streaming 100MB+ files.",
+  "inputs": [
+   {
+    "id": "text",
+    "type": "string"
+   }
+  ],
+  "outputs": [
+   {
+    "id": "chunks",
+    "type": "array"
+   }
+  ],
+  "properties": [
+   {
+    "id": "contentType",
+    "type": "select",
+    "default": "raw",
+    "options": [
+     "raw",
+     "json_array",
+     "csv",
+     "lines"
+    ]
+   },
+   {
+    "id": "chunkSize",
+    "type": "number",
+    "default": 1000
+   },
+   {
+    "id": "overlap",
+    "type": "number",
+    "default": 100
+   },
+   {
+    "id": "csvHasHeader",
+    "type": "boolean",
+    "default": true
+   },
+   {
+    "id": "indexName",
+    "type": "string",
+    "default": "default"
+   }
+  ]
+ },
+ {
+  "type": "condition",
+  "name": "Condition",
+  "module": "core-flow-control",
+  "description": "Branch workflow based on a condition.",
+  "inputs": [
+   {
+    "id": "value",
+    "type": "any"
+   }
+  ],
+  "outputs": [
+   {
+    "id": "true",
+    "type": "any"
+   },
+   {
+    "id": "false",
+    "type": "any"
+   }
+  ],
+  "properties": [
+   {
+    "id": "operator",
+    "type": "select",
+    "default": "equals",
+    "options": [
+     "equals",
+     "not_equals",
+     "contains",
+     "not_contains",
+     "greater",
+     "less",
+     "is_empty",
+     "not_empty"
+    ]
+   },
+   {
+    "id": "compareValue",
+    "type": "string"
+   }
+  ]
+ },
+ {
+  "type": "loop_end",
+  "name": "Loop End",
+  "module": "core-flow-control",
+  "description": "End a loop and collect results into an array.",
+  "inputs": [
+   {
+    "id": "input",
+    "type": "any"
+   }
+  ],
+  "outputs": [
+   {
+    "id": "results",
+    "type": "array"
+   }
+  ],
+  "properties": []
+ },
+ {
+  "type": "loop_start",
+  "name": "Loop Start",
+  "module": "core-flow-control",
+  "description": "Begin a loop. Iterates over an array or a fixed number of times.",
+  "inputs": [
+   {
+    "id": "array",
+    "type": "array"
+   }
+  ],
+  "outputs": [
+   {
+    "id": "item",
+    "type": "any"
+   },
+   {
+    "id": "index",
+    "type": "number"
+   }
+  ],
+  "properties": [
+   {
+    "id": "loopName",
+    "type": "string"
+   },
+   {
+    "id": "loopMode",
+    "type": "select",
+    "default": "count",
+    "options": [
+     "count",
+     "foreach",
+     "while_true"
+    ]
+   },
+   {
+    "id": "iterations",
+    "type": "number",
+    "default": 3
+   }
+  ]
+ },
+ {
+  "type": "macro",
+  "name": "Macro",
+  "module": "core-flow-control",
+  "description": "Execute a saved macro workflow. Inputs and outputs are dynamically created based on the macro's Macro Input and Macro Output nodes.",
+  "inputs": [],
+  "outputs": [],
+  "properties": [
+   {
+    "id": "macroId",
+    "type": "string"
+   },
+   {
+    "id": "macroName",
+    "type": "string"
+   },
+   {
+    "id": "macroInputs",
+    "type": "array",
+    "default": []
+   },
+   {
+    "id": "macroOutputs",
+    "type": "array",
+    "default": []
+   }
+  ]
+ },
+ {
+  "type": "macro_input",
+  "name": "Macro Input",
+  "module": "core-flow-control",
+  "description": "Defines an input port for a macro. Place this node in a workflow to expose it as an input when the workflow is used as a macro.",
+  "inputs": [],
+  "outputs": [
+   {
+    "id": "value",
+    "type": "any"
+   }
+  ],
+  "properties": [
+   {
+    "id": "name",
+    "type": "string",
+    "default": "input"
+   },
+   {
+    "id": "inputType",
+    "type": "select",
+    "default": "any",
+    "options": [
+     "any",
+     "text",
+     "number",
+     "image",
+     "video",
+     "audio",
+     "file"
+    ]
+   },
+   {
+    "id": "defaultValue",
+    "type": "string"
+   },
+   {
+    "id": "required",
+    "type": "boolean",
+    "default": true
+   }
+  ]
+ },
+ {
+  "type": "macro_output",
+  "name": "Macro Output",
+  "module": "core-flow-control",
+  "description": "Defines an output port for a macro. Place this node in a workflow to expose it as an output when the workflow is used as a macro.",
+  "inputs": [
+   {
+    "id": "value",
+    "type": "any"
+   }
+  ],
+  "outputs": [],
+  "properties": [
+   {
+    "id": "name",
+    "type": "string",
+    "default": "output"
+   },
+   {
+    "id": "outputType",
+    "type": "select",
+    "default": "any",
+    "options": [
+     "any",
+     "text",
+     "number",
+     "image",
+     "video",
+     "audio",
+     "file"
+    ]
+   }
+  ]
+ },
+ {
+  "type": "output",
+  "name": "Output",
+  "module": "core-flow-control",
+  "description": "Workflow output/endpoint. Marks the end of a workflow path.",
+  "inputs": [
+   {
+    "id": "result",
+    "type": "any"
+   }
+  ],
+  "outputs": [],
+  "properties": [
+   {
+    "id": "label",
+    "type": "string",
+    "default": "Output"
+   },
+   {
+    "id": "outputType",
+    "type": "select",
+    "default": "text",
+    "options": [
+     "text",
+     "json",
+     "image",
+     "audio",
+     "video",
+     "file"
+    ],
+    "advanced": true
+   }
+  ]
+ },
+ {
+  "type": "subflow",
+  "name": "Subflow",
+  "module": "core-flow-control",
+  "description": "Execute another workflow as a subflow.",
+  "inputs": [
+   {
+    "id": "input",
+    "type": "any"
+   }
+  ],
+  "outputs": [
+   {
+    "id": "default",
+    "type": "any"
+   }
+  ],
+  "properties": [
+   {
+    "id": "flowId",
+    "type": "string"
+   }
+  ]
+ },
+ {
+  "type": "image_gen",
+  "name": "Image Gen",
+  "module": "core-image",
+  "description": "Generate images using ComfyUI or other local image APIs.",
+  "inputs": [
+   {
+    "id": "prompt",
+    "type": "string"
+   }
+  ],
+  "outputs": [
+   {
+    "id": "image",
+    "type": "image"
+   }
+  ],
+  "properties": [
+   {
+    "id": "service",
+    "type": "select"
+   },
+   {
+    "id": "endpoint",
+    "type": "string"
+   },
+   {
+    "id": "model",
+    "type": "string"
+   },
+   {
+    "id": "apiKeyConstant",
+    "type": "string"
+   },
+   {
+    "id": "apiFormat",
+    "type": "select",
+    "options": [
+     "comfyui",
+     "openai"
+    ]
+   },
+   {
+    "id": "wan2gpModel",
+    "type": "select",
+    "options": [
+     "qwen",
+     "flux2_klein_4b",
+     "flux2_klein_9b",
+     "z_image"
+    ]
+   },
+   {
+    "id": "wan2gpVram",
+    "type": "select",
+    "default": "auto",
+    "options": [
+     "auto",
+     "6",
+     "8",
+     "10",
+     "12",
+     "16",
+     "24"
+    ]
+   },
+   {
+    "id": "wan2gpResolution",
+    "type": "select",
+    "default": "1024x1024",
+    "options": [
+     "1024x1024",
+     "1280x720",
+     "720x1280",
+     "1024x576",
+     "576x1024",
+     "832x624",
+     "624x832",
+     "512x512"
+    ]
+   },
+   {
+    "id": "wan2gpSteps",
+    "type": "number",
+    "default": 4
+   },
+   {
+    "id": "wan2gpSampler",
+    "type": "select",
+    "default": "lightning",
+    "options": [
+     "default",
+     "lightning"
+    ]
+   },
+   {
+    "id": "wan2gpSeed",
+    "type": "number",
+    "default": -1
+   },
+   {
+    "id": "wan2gpRandomSeed",
+    "type": "boolean",
+    "default": true
+   },
+   {
+    "id": "negativePrompt",
+    "type": "textarea"
+   },
+   {
+    "id": "width",
+    "type": "number",
+    "default": 1024
+   },
+   {
+    "id": "height",
+    "type": "number",
+    "default": 1024
+   },
+   {
+    "id": "steps",
+    "type": "number",
+    "default": 20
+   },
+   {
+    "id": "imageInputCount",
+    "type": "number",
+    "default": 0
+   },
+   {
+    "id": "maxImageDimension",
+    "type": "number",
+    "default": 0
+   },
+   {
+    "id": "maxImageSizeKB",
+    "type": "number",
+    "default": 0
+   }
+  ]
+ },
+ {
+  "type": "image_resize",
+  "name": "Image Resize",
+  "module": "core-image",
+  "description": "Resize an image to fit within specified dimensions and file size limits.",
+  "inputs": [
+   {
+    "id": "image",
+    "type": "string"
+   }
+  ],
+  "outputs": [
+   {
+    "id": "image",
+    "type": "string"
+   }
+  ],
+  "properties": [
+   {
+    "id": "maxDimension",
+    "type": "number",
+    "default": 1024
+   },
+   {
+    "id": "maxSizeKB",
+    "type": "number",
+    "default": 200
+   },
+   {
+    "id": "quality",
+    "type": "number",
+    "default": 85
+   }
+  ]
+ },
+ {
+  "type": "image_save",
+  "name": "Image Save",
+  "module": "core-image",
+  "description": "Save an image to a file on disk.",
+  "inputs": [
+   {
+    "id": "image",
+    "type": "image"
+   }
+  ],
+  "outputs": [
+   {
+    "id": "path",
+    "type": "string"
+   }
+  ],
+  "properties": [
+   {
+    "id": "path",
+    "type": "string"
+   },
+   {
+    "id": "format",
+    "type": "select",
+    "default": "png",
+    "options": [
+     "png",
+     "jpg",
+     "webp"
+    ]
+   },
+   {
+    "id": "quality",
+    "type": "number",
+    "default": 95,
+    "advanced": true
+   }
+  ]
+ },
+ {
+  "type": "image_view",
+  "name": "Image View",
+  "module": "core-image",
+  "description": "Display an image in the workflow.",
+  "inputs": [
+   {
+    "id": "image",
+    "type": "image"
+   }
+  ],
+  "outputs": [
+   {
+    "id": "image",
+    "type": "image"
+   }
+  ],
+  "properties": [
+   {
+    "id": "maxHeight",
+    "type": "number",
+    "default": 300
+   }
+  ]
+ },
+ {
+  "type": "input_audio",
+  "name": "Audio Input",
+  "module": "core-input",
+  "description": "Load an audio file (music, sound effects, etc.) for use in workflows.",
+  "inputs": [],
+  "outputs": [
+   {
+    "id": "audio",
+    "type": "audio"
+   }
+  ],
+  "properties": [
+   {
+    "id": "filePath",
+    "type": "file"
+   }
+  ]
+ },
+ {
+  "type": "input_file",
+  "name": "File Input",
+  "module": "core-input",
+  "description": "Provides image or text file input to the workflow. For video files, use the Video Input node.",
+  "inputs": [],
+  "outputs": [
+   {
+    "id": "content",
+    "type": "any"
+   }
+  ],
+  "properties": [
+   {
+    "id": "label",
+    "type": "string",
+    "default": "File"
+   },
+   {
+    "id": "filePath",
+    "type": "string"
+   },
+   {
+    "id": "fileName",
+    "type": "string"
+   },
+   {
+    "id": "fileContent",
+    "type": "string"
+   },
+   {
+    "id": "fileType",
+    "type": "string"
+   }
+  ]
+ },
+ {
+  "type": "input_folder",
+  "name": "Folder Input",
+  "module": "core-input",
+  "description": "Scans a folder and outputs a list of files matching the specified patterns.",
+  "inputs": [
+   {
+    "id": "path",
+    "type": "string"
+   }
+  ],
+  "outputs": [
+   {
+    "id": "files",
+    "type": "array"
+   }
+  ],
+  "properties": [
+   {
+    "id": "path",
+    "type": "string"
+   },
+   {
+    "id": "includePatterns",
+    "type": "string",
+    "default": "*.png, *.jpg, *.jpeg"
+   },
+   {
+    "id": "recursive",
+    "type": "boolean",
+    "default": false
+   },
+   {
+    "id": "maxFiles",
+    "type": "number",
+    "default": 100
+   }
+  ]
+ },
+ {
+  "type": "input_text",
+  "name": "Text Input",
+  "module": "core-input",
+  "description": "Provides text input to the workflow. Can be set manually or via workflow inputs.",
+  "inputs": [],
+  "outputs": [
+   {
+    "id": "text",
+    "type": "string"
+   }
+  ],
+  "properties": [
+   {
+    "id": "label",
+    "type": "string",
+    "default": "Input"
+   },
+   {
+    "id": "value",
+    "type": "textarea"
+   },
+   {
+    "id": "multiline",
+    "type": "boolean",
+    "default": true,
+    "advanced": true
+   }
+  ]
+ },
+ {
+  "type": "input_video",
+  "name": "Video Input",
+  "module": "core-input",
+  "description": "Provides video file input to the workflow. Passes video path for processing.",
+  "inputs": [],
+  "outputs": [
+   {
+    "id": "path",
+    "type": "video"
+   }
+  ],
+  "properties": [
+   {
+    "id": "label",
+    "type": "string",
+    "default": "Video"
+   },
+   {
+    "id": "filePath",
+    "type": "string"
+   },
+   {
+    "id": "fileName",
+    "type": "string"
+   }
+  ]
+ },
+ {
+  "type": "service_call",
+  "name": "Service Call",
+  "module": "core-service",
+  "description": "Call a local HTTP service with a templated request body. The connected input is substituted into the body template; the response is parsed and an optional path extracts the field you want.",
+  "inputs": [
+   {
+    "id": "input",
+    "type": "any"
+   }
+  ],
+  "outputs": [
+   {
+    "id": "response",
+    "type": "any"
+   }
+  ],
+  "properties": [
+   {
+    "id": "service",
+    "type": "select"
+   },
+   {
+    "id": "model",
+    "type": "string"
+   },
+   {
+    "id": "systemMessage",
+    "type": "textarea"
+   },
+   {
+    "id": "endpoint",
+    "type": "string"
+   },
+   {
+    "id": "method",
+    "type": "select",
+    "default": "POST",
+    "options": [
+     "GET",
+     "POST",
+     "PUT",
+     "DELETE",
+     "PATCH"
+    ]
+   },
+   {
+    "id": "bodyTemplate",
+    "type": "textarea"
+   },
+   {
+    "id": "responseType",
+    "type": "select",
+    "default": "json",
+    "options": [
+     "json",
+     "text"
+    ]
+   },
+   {
+    "id": "responsePath",
+    "type": "string"
+   },
+   {
+    "id": "headers",
+    "type": "textarea",
+    "advanced": true
+   },
+   {
+    "id": "apiKeyConstant",
+    "type": "string",
+    "advanced": true
+   }
+  ]
+ },
+ {
+  "type": "comfyui_free_memory",
+  "name": "ComfyUI Free Memory",
+  "module": "core-utility",
+  "description": "Free GPU memory by unloading ComfyUI models. Use between image and video generation to prevent OOM errors. Passes through input unchanged.",
+  "inputs": [
+   {
+    "id": "input",
+    "type": "any"
+   }
+  ],
+  "outputs": [
+   {
+    "id": "default",
+    "type": "any"
+   }
+  ],
+  "properties": [
+   {
+    "id": "comfyuiUrl",
+    "type": "string"
+   },
+   {
+    "id": "unloadModels",
+    "type": "boolean",
+    "default": true
+   },
+   {
+    "id": "freeMemory",
+    "type": "boolean",
+    "default": true
+   }
+  ]
+ },
+ {
+  "type": "logic_block",
+  "name": "Logic Block",
+  "module": "core-utility",
+  "description": "Custom JavaScript code block for advanced processing. Write JavaScript code to transform data.",
+  "inputs": [
+   {
+    "id": "input",
+    "type": "any"
+   }
+  ],
+  "outputs": [
+   {
+    "id": "default",
+    "type": "any"
+   }
+  ],
+  "properties": [
+   {
+    "id": "code",
+    "type": "code",
+    "default": "// input is available as $input\nlet result = $input;\nresult"
+   }
+  ]
+ },
+ {
+  "type": "memory",
+  "name": "Memory",
+  "module": "core-utility",
+  "description": "Store and recall values across workflow iterations.",
+  "inputs": [
+   {
+    "id": "value",
+    "type": "any"
+   }
+  ],
+  "outputs": [
+   {
+    "id": "value",
+    "type": "any"
+   }
+  ],
+  "properties": [
+   {
+    "id": "key",
+    "type": "string",
+    "default": "my_value"
+   },
+   {
+    "id": "operation",
+    "type": "select",
+    "default": "get",
+    "options": [
+     "get",
+     "set",
+     "append",
+     "clear"
+    ]
+   }
+  ]
+ },
+ {
+  "type": "template",
+  "name": "Template",
+  "module": "core-utility",
+  "description": "Combine inputs using a template with {{placeholders}}.",
+  "inputs": [
+   {
+    "id": "input",
+    "type": "any"
+   },
+   {
+    "id": "input2",
+    "type": "any"
+   },
+   {
+    "id": "input3",
+    "type": "any"
+   },
+   {
+    "id": "input4",
+    "type": "any"
+   },
+   {
+    "id": "input5",
+    "type": "any"
+   }
+  ],
+  "outputs": [
+   {
+    "id": "result",
+    "type": "string"
+   }
+  ],
+  "properties": [
+   {
+    "id": "template",
+    "type": "textarea",
+    "default": "{{input}}"
+   }
+  ]
+ },
+ {
+  "type": "audio_mixer",
+  "name": "Audio Mixer",
+  "module": "core-video",
+  "description": "Mix an audio track into a video with volume control.",
+  "inputs": [
+   {
+    "id": "video",
+    "type": "video"
+   },
+   {
+    "id": "audio",
+    "type": "audio"
+   }
+  ],
+  "outputs": [
+   {
+    "id": "video",
+    "type": "video"
+   }
+  ],
+  "properties": [
+   {
+    "id": "videoVolume",
+    "type": "number",
+    "default": 1
+   },
+   {
+    "id": "audioVolume",
+    "type": "number",
+    "default": 1
+   },
+   {
+    "id": "replaceAudio",
+    "type": "boolean",
+    "default": false
+   },
+   {
+    "id": "filename",
+    "type": "string",
+    "default": "mixed_video"
+   }
+  ]
+ },
+ {
+  "type": "extend_videos",
+  "name": "Extend Videos",
+  "module": "core-video",
+  "description": "Extend videos to match target durations by freezing the last frame. Use this to sync video with TTS narration.",
+  "inputs": [
+   {
+    "id": "videos",
+    "type": "array"
+   },
+   {
+    "id": "durations",
+    "type": "array"
+   }
+  ],
+  "outputs": [
+   {
+    "id": "videos",
+    "type": "array"
+   }
+  ],
+  "properties": [
+   {
+    "id": "filename",
+    "type": "string",
+    "default": "extended_video"
+   }
+  ]
+ },
+ {
+  "type": "video_append",
+  "name": "Video Append",
+  "module": "core-video",
+  "description": "Concatenate multiple videos into a single video file.",
+  "inputs": [
+   {
+    "id": "videos",
+    "type": "array"
+   },
+   {
+    "id": "video_1",
+    "type": "video"
+   },
+   {
+    "id": "video_2",
+    "type": "video"
+   },
+   {
+    "id": "video_3",
+    "type": "video"
+   },
+   {
+    "id": "video_4",
+    "type": "video"
+   }
+  ],
+  "outputs": [
+   {
+    "id": "video",
+    "type": "video"
+   },
+   {
+    "id": "path",
+    "type": "string"
+   }
+  ],
+  "properties": [
+   {
+    "id": "filename",
+    "type": "string",
+    "default": "appended_video"
+   },
+   {
+    "id": "format",
+    "type": "select",
+    "default": "mp4",
+    "options": [
+     "mp4",
+     "webm"
+    ]
+   }
+  ]
+ },
+ {
+  "type": "video_avatar",
+  "name": "Video Avatar",
+  "module": "core-video",
+  "description": "Generate lip-synced talking head video from an image and audio using Ditto.",
+  "inputs": [
+   {
+    "id": "image",
+    "type": "image"
+   },
+   {
+    "id": "audio",
+    "type": "audio"
+   }
+  ],
+  "outputs": [
+   {
+    "id": "video",
+    "type": "video"
+   }
+  ],
+  "properties": [
+   {
+    "id": "apiUrl",
+    "type": "string",
+    "default": "http://127.0.0.1:8768/generate"
+   },
+   {
+    "id": "prompt",
+    "type": "string"
+   },
+   {
+    "id": "guidanceScale",
+    "type": "number",
+    "default": 5
+   },
+   {
+    "id": "numInferenceSteps",
+    "type": "number",
+    "default": 30
+   }
+  ]
+ },
+ {
+  "type": "video_captions",
+  "name": "Video Captions",
+  "module": "core-video",
+  "description": "Add text captions/subtitles overlay to a video. Automatically times captions based on narration segments.",
+  "inputs": [
+   {
+    "id": "video",
+    "type": "video"
+   },
+   {
+    "id": "text",
+    "type": "string"
+   },
+   {
+    "id": "durations",
+    "type": "array"
+   },
+   {
+    "id": "segments",
+    "type": "array"
+   }
+  ],
+  "outputs": [
+   {
+    "id": "video",
+    "type": "video"
+   }
+  ],
+  "properties": [
+   {
+    "id": "position",
+    "type": "select",
+    "default": "bottom",
+    "options": [
+     "top",
+     "center",
+     "bottom"
+    ]
+   },
+   {
+    "id": "fontSize",
+    "type": "number",
+    "default": 48
+   },
+   {
+    "id": "fontColor",
+    "type": "string",
+    "default": "white"
+   },
+   {
+    "id": "backgroundColor",
+    "type": "string",
+    "default": "black@0.7"
+   },
+   {
+    "id": "padding",
+    "type": "number",
+    "default": 15
+   },
+   {
+    "id": "margin",
+    "type": "number",
+    "default": 50
+   }
+  ]
+ },
+ {
+  "type": "video_downloader",
+  "name": "Video Downloader",
+  "module": "core-video",
+  "description": "Download videos or audio from YouTube, Vimeo, Twitter, TikTok, and 1000+ more sites",
+  "inputs": [
+   {
+    "id": "url",
+    "type": "string"
+   },
+   {
+    "id": "mode",
+    "type": "string"
+   },
+   {
+    "id": "start",
+    "type": "number"
+   },
+   {
+    "id": "end",
+    "type": "number"
+   },
+   {
+    "id": "quality",
+    "type": "string"
+   }
+  ],
+  "outputs": [
+   {
+    "id": "video",
+    "type": "video"
+   },
+   {
+    "id": "duration",
+    "type": "number"
+   },
+   {
+    "id": "width",
+    "type": "number"
+   },
+   {
+    "id": "height",
+    "type": "number"
+   }
+  ],
+  "properties": []
+ },
+ {
+  "type": "video_frame_extractor",
+  "name": "Video Frames",
+  "module": "core-video",
+  "description": "Extract frames from a video file.",
+  "inputs": [
+   {
+    "id": "video",
+    "type": "video"
+   },
+   {
+    "id": "timestamps",
+    "type": "array"
+   },
+   {
+    "id": "startTimeInput",
+    "type": "number"
+   },
+   {
+    "id": "endTimeInput",
+    "type": "number"
+   }
+  ],
+  "outputs": [
+   {
+    "id": "frames",
+    "type": "array"
+   }
+  ],
+  "properties": [
+   {
+    "id": "fps",
+    "type": "number",
+    "default": 1
+   },
+   {
+    "id": "maxFrames",
+    "type": "number",
+    "default": 100
+   },
+   {
+    "id": "startTime",
+    "type": "number",
+    "default": 0
+   },
+   {
+    "id": "endTime",
+    "type": "number",
+    "default": 0
+   },
+   {
+    "id": "outputFormat",
+    "type": "select",
+    "default": "jpeg",
+    "options": [
+     "jpeg",
+     "png"
+    ]
+   },
+   {
+    "id": "lastFrameOnly",
+    "type": "boolean",
+    "default": false
+   },
+   {
+    "id": "batchSize",
+    "type": "number",
+    "default": 10
+   }
+  ]
+ },
+ {
+  "type": "video_gen",
+  "name": "Video Gen",
+  "module": "core-video",
+  "description": "Generate videos using ComfyUI workflows or other local video APIs.",
+  "inputs": [
+   {
+    "id": "prompt",
+    "type": "string"
+   },
+   {
+    "id": "image",
+    "type": "image"
+   },
+   {
+    "id": "image_end",
+    "type": "image"
+   },
+   {
+    "id": "frameCount",
+    "type": "number"
+   },
+   {
+    "id": "duration",
+    "type": "number"
+   },
+   {
+    "id": "audio",
+    "type": "audio"
+   }
+  ],
+  "outputs": [
+   {
+    "id": "video",
+    "type": "video"
+   }
+  ],
+  "properties": [
+   {
+    "id": "service",
+    "type": "select"
+   },
+   {
+    "id": "apiFormat",
+    "type": "select",
+    "default": "comfyui",
+    "options": [
+     "comfyui"
+    ]
+   },
+   {
+    "id": "wan2gpModel",
+    "type": "select",
+    "default": "ltx2_22B_distilled",
+    "options": [
+     "ltx2_22B_distilled",
+     "ltx2_22B",
+     "ltx2_19B",
+     "t2v",
+     "t2v_1.3B",
+     "i2v",
+     "i2v_720p",
+     "t2v_2_2",
+     "hunyuan_t2v"
+    ]
+   },
+   {
+    "id": "wan2gpDuration",
+    "type": "number",
+    "default": 5
+   },
+   {
+    "id": "wan2gpResolution",
+    "type": "select",
+    "default": "832x480",
+    "options": [
+     "3840x2176",
+     "2176x3840",
+     "3840x1664",
+     "1664x3840",
+     "2560x1440",
+     "1440x2560",
+     "1920x1440",
+     "1440x1920",
+     "2160x1440",
+     "1440x2160",
+     "1440x1440",
+     "2688x1152"
+    ]
+   },
+   {
+    "id": "wan2gpSteps",
+    "type": "number",
+    "default": 8
+   },
+   {
+    "id": "endpoint",
+    "type": "string"
+   },
+   {
+    "id": "comfyWorkflow",
+    "type": "json"
+   },
+   {
+    "id": "comfyWorkflowName",
+    "type": "string"
+   },
+   {
+    "id": "comfyPrimaryPromptNodeId",
+    "type": "string"
+   },
+   {
+    "id": "comfyImageInputConfigs",
+    "type": "json",
+    "default": []
+   },
+   {
+    "id": "comfySeedMode",
+    "type": "string",
+    "default": "random"
+   },
+   {
+    "id": "comfyFixedSeed",
+    "type": "number",
+    "default": null
+   },
+   {
+    "id": "comfyAllImageNodeIds",
+    "type": "json",
+    "default": []
+   },
+   {
+    "id": "comfyFrameCount",
+    "type": "number",
+    "default": null
+   },
+   {
+    "id": "comfyWidth",
+    "type": "number",
+    "default": null
+   },
+   {
+    "id": "comfyHeight",
+    "type": "number",
+    "default": null
+   },
+   {
+    "id": "comfyFrameRate",
+    "type": "number",
+    "default": null
+   }
+  ]
+ },
+ {
+  "type": "video_pip",
+  "name": "Video PiP",
+  "module": "core-video",
+  "description": "Overlay a picture-in-picture video (like a talking head) on top of a main video.",
+  "inputs": [
+   {
+    "id": "mainVideo",
+    "type": "video"
+   },
+   {
+    "id": "pipVideo",
+    "type": "video"
+   }
+  ],
+  "outputs": [
+   {
+    "id": "video",
+    "type": "video"
+   }
+  ],
+  "properties": [
+   {
+    "id": "position",
+    "type": "select",
+    "default": "bottom-right",
+    "options": [
+     "top-left",
+     "top-right",
+     "bottom-left",
+     "bottom-right"
+    ]
+   },
+   {
+    "id": "size",
+    "type": "number",
+    "default": 25
+   },
+   {
+    "id": "margin",
+    "type": "number",
+    "default": 20
+   },
+   {
+    "id": "shape",
+    "type": "select",
+    "default": "rectangle",
+    "options": [
+     "rectangle",
+     "rounded",
+     "circle"
+    ]
+   },
+   {
+    "id": "startTime",
+    "type": "number",
+    "default": 0
+   },
+   {
+    "id": "pipDuration",
+    "type": "number",
+    "default": 0
+   },
+   {
+    "id": "mainVolume",
+    "type": "number",
+    "default": 1
+   },
+   {
+    "id": "pipVolume",
+    "type": "number",
+    "default": 1
+   }
+  ]
+ },
+ {
+  "type": "video_save",
+  "name": "Video Save",
+  "module": "core-video",
+  "description": "Save a video to a file on disk.",
+  "inputs": [
+   {
+    "id": "video",
+    "type": "video"
+   }
+  ],
+  "outputs": [
+   {
+    "id": "path",
+    "type": "video"
+   }
+  ],
+  "properties": [
+   {
+    "id": "path",
+    "type": "string"
+   },
+   {
+    "id": "filename",
+    "type": "string",
+    "default": "video"
+   },
+   {
+    "id": "format",
+    "type": "select",
+    "default": "mp4",
+    "options": [
+     "mp4",
+     "webm"
+    ]
+   }
+  ]
+ }
+]
