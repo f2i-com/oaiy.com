@@ -100,11 +100,6 @@ export const FRONT_DESK_NOTE = '/knowledge/README.md';
 export const FRONT_DESK_BRIEF = '/brief.md';
 const FRONT_DESK_BRIEF_TEXT = `# The brief
 
-What every call, text and flow task should go by right now. The phone's agents
-read this before each reply, before anything a caller asks. The Front desk's
-own agent keeps it up to date: tell it things like "this week, tell callers
-we're booked until Friday" or "don't quote prices for jobs over a day".
-
 - Nothing special for now.
 `;
 const FRONT_DESK_README = `# The front desk
@@ -112,7 +107,10 @@ const FRONT_DESK_README = `# The front desk
 The phone's agents work here: each call, text-message thread and flow task is
 answered by a sub-agent in a conversation of its own, and they all take their
 direction from \`/brief.md\`, which the Front desk's main agent keeps (open the
-Front desk in the project list and tell it what the phone should know).
+Front desk in the project list and tell it what the phone should know, like
+"this week, tell callers we're booked until Friday" or "don't quote prices for
+jobs over a day"; it writes that into the brief, which is only ever what the
+phone goes by right now).
 
 Put what they should know about your business in this \`knowledge\` folder, as
 plain text or Markdown files: what you offer and what it costs, your area,
