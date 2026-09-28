@@ -907,21 +907,23 @@ export class Sessions {
         if (!session.running) await this.cutAfterRun(session);
         break;
       case 'call.ended':
-        await this.endCall(session);
+        await this.endCall(session, typeof event.reason === 'string' ? event.reason : '');
         break;
     }
     return session;
   }
 
-  /** The call `session` is on has ended: it stops speaking and working, and its conversation says so. */
-  private async endCall(session: Session): Promise<void> {
+  /** The call `session` is on has ended: it stops speaking and working, and its conversation says so (and why, when it failed). */
+  private async endCall(session: Session, reason = ''): Promise<void> {
     if (session.callId) this.noteEnded(session.callId, session);
     clearTimeout(session.speakingTimer);
     session.callerSpeaking = false;
     session.speech?.hush();
     this.stop(session);
     session.callId = undefined;
-    session.agent.turns.push({ role: 'user', text: '[OAIY] 📞 The call ended.', automatic: true });
+    // A call that failed (the phone's voice link broke, say) says why: the person sees it in the call's record.
+    const failed = /fail|error|lost/i.test(reason) ? reason.trim() : '';
+    session.agent.turns.push({ role: 'user', text: failed ? `[OAIY] 📞 The call ended: ${failed}.` : '[OAIY] 📞 The call ended.', automatic: true });
     await this.save(session);
     this.hooks.changed();
   }

@@ -711,6 +711,17 @@ describe('a phone call answered by the agent', () => {
     }
   });
 
+  it('a call that failed says why in its record; one that just ended does not', async () => {
+    fakeProvider('openai', []);
+    const { sessions } = setup();
+    const a = await sessions.callEvent({ type: 'call.started', callId: 'call_f1', from: '+61400000031' });
+    await sessions.callEvent({ type: 'call.ended', callId: 'call_f1', reason: 'realtime voice failed: the websocket closed' });
+    expect(a?.agent.turns.at(-1)).toMatchObject({ text: '[OAIY] 📞 The call ended: realtime voice failed: the websocket closed.' });
+    await sessions.callEvent({ type: 'call.started', callId: 'call_f2', from: '+61400000031' });
+    await sessions.callEvent({ type: 'call.ended', callId: 'call_f2', reason: 'hung up' });
+    expect(a?.agent.turns.at(-1)).toMatchObject({ text: '[OAIY] 📞 The call ended.' });
+  });
+
   it('a caller who hides their number gets a conversation of their own, named as such', async () => {
     fakeProvider('openai', []);
     const { sessions } = setup();
