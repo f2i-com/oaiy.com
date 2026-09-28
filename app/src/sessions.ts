@@ -33,7 +33,7 @@ export interface Session extends SessionInfo {
 }
 
 /** How the app makes an agent for this project, with a conversation's own instructions and tools. */
-export type MakeAgent = (extra: Pick<AgentOptions, 'instructions' | 'sessionTools' | 'tools' | 'reasoning'>) => Agent;
+export type MakeAgent = (extra: Pick<AgentOptions, 'instructions' | 'sessionTools' | 'tools' | 'reasoning' | 'conversation'>) => Agent;
 
 /**
  * What an agent on a call may use besides the call's own tools: a short list,
@@ -145,10 +145,30 @@ export function callInstructions(title: string, number: string, brief: string, i
   return [
     `This conversation is a live phone call with ${who}, on the phone of the person you work for. Everything you write is spoken aloud to the caller as you write it, so write only what you would say: one or two short sentences, plain words, no markdown, lists, emoji or links. Then stop, and let them answer.`,
     'Their words arrive as "Caller: …", transcribed from speech (allow for a misheard word). A message without that label comes from the person you work for, who may be watching: do what they say.',
-    'Your call tools: request_appointment (a booking request for staff to confirm; never say it is booked or confirmed), lookup_business_data (a question about the business\'s records or calendar), end_call (a short goodbye, then the call ends; use it when the caller is done). Your other tools work too: say a few words first ("Let me check") when one takes a moment.',
+    'Your call tools: request_appointment (a booking request for staff to confirm; never say it is booked or confirmed), lookup_business_data (a question about the business\'s records or calendar), end_call (a short goodbye, then the call ends; use it when the caller is done). Your other tools work too.',
+    'To look something up, call the tool in the same reply as your words: say "Let me check." and make the call at once. Never say you will check without calling the tool: the caller hears you and waits.',
     brief.trim() ? `The receptionist brief:\n${brief.trim()}` : '',
     `The instructions of the person you work for, for calls:\n${instructions.trim() || '(none)'}`,
   ].filter(Boolean).join('\n');
+}
+
+/**
+ * What a new call keeps of the caller's earlier calls: the last few things said, without the
+ * automatic notes, tool calls, or any line the agent said more than once. A model copies what it
+ * said before, so a repeated line would be said on every call.
+ */
+export function earlierWords(turns: Turn[], keep = 6): Turn[] {
+  const words: Array<{ role: 'user' | 'assistant'; text: string }> = [];
+  for (const t of turns) {
+    if (t.role === 'user' && !t.automatic && t.text.startsWith('Caller:')) words.push({ role: 'user', text: t.text });
+    else if (t.role === 'assistant' && !t.calls.length && t.text.trim()) words.push({ role: 'assistant', text: t.text });
+  }
+  const times = new Map<string, number>();
+  for (const t of words) if (t.role === 'assistant') times.set(t.text.trim(), (times.get(t.text.trim()) ?? 0) + 1);
+  return words
+    .filter((t) => t.role === 'user' || times.get(t.text.trim()) === 1)
+    .slice(-keep)
+    .map((t): Turn => (t.role === 'user' ? { role: 'user', text: t.text } : { role: 'assistant', text: t.text, calls: [] }));
 }
 
 export class Sessions {
@@ -193,6 +213,7 @@ export class Sessions {
         tools: TOOLS.filter((t) => CALL_TOOLS.has(t.name)),
         // Answer at once: no thinking first.
         reasoning: 'none',
+        conversation: true,
       });
       session.speech = new Speech(
         async (text) => {
@@ -207,6 +228,7 @@ export class Sessions {
     session.agent = this.makeAgent({
       instructions: () => smsInstructions(session.title, session.key, this.settings().instructions, test),
       sessionTools: [this.replyTool(session, test)],
+      conversation: true,
     });
     return session;
   }
@@ -287,6 +309,8 @@ export class Sessions {
       if (typeof event.instructions === 'string') session.brief = event.instructions;
       session.lastAt = Date.now();
       session.unread++;
+      // A new call starts afresh, with only the last few words of the earlier ones.
+      if (type === 'call.started' && !session.running) session.agent.turns = earlierWords(session.agent.turns);
       const greeting = typeof event.greeting === 'string' && event.greeting.trim() ? ` You greeted them: "${event.greeting.trim()}"` : '';
       session.agent.turns.push({ role: 'user', text: `[OAIY] 📞 A call from ${session.title}${session.title !== session.key ? ` (${session.key})` : ''} began.${greeting}`, automatic: true });
       await this.save(session);

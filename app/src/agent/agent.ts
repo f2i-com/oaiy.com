@@ -323,6 +323,11 @@ export interface AgentOptions {
   sessionTools?: SessionTool[] | (() => SessionTool[]);
   /** How hard the model thinks before it answers (`none` on a phone call). */
   reasoning?: 'none' | 'low' | 'medium' | 'high' | 'max';
+  /**
+   * A conversation with a person (a phone call, a text thread): a reply in words is a whole
+   * answer, so it is never asked to start work or carry on (on a call those asks were spoken aloud).
+   */
+  conversation?: boolean;
 }
 
 /** A tool one conversation has (not every agent): its spec, and what running it does. */
@@ -1742,6 +1747,11 @@ ${this.instructions}` : ''}`;
           if (this.inbox.length) continue;
           // A flag fixed: the next is given, or it goes back to its work (one not fixed is nudged below).
           if (this.flagStep(emit)) continue;
+          // In a conversation its words are the answer.
+          if (this.options.conversation) {
+            emit({ type: 'done', text: reply.text, steps: step });
+            return;
+          }
           // The same reply again, and still nothing done: ask once for a tool call, then stop rather than loop.
           const said = reply.text.trim().replace(/\s+/g, ' ').toLowerCase();
           const repeated = !finish && !!said && said === lastSaid;

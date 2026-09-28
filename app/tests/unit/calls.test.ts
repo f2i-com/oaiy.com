@@ -4,7 +4,7 @@ import type { Turn } from '../../src/agent/protocol';
 import { NetGate } from '../../src/gate/netgate';
 import { Vfs } from '../../src/vfs/vfs';
 import type { SessionInfo } from '../../src/vfs/projects';
-import { Sessions, Speech, callInstructions, spoken } from '../../src/sessions';
+import { Sessions, Speech, callInstructions, earlierWords, spoken } from '../../src/sessions';
 import type { Desktop } from '../../src/desktop/bridge';
 import type { MessageSettings } from '../../src/settings';
 import { LOCAL, OPENAI, fakeProvider } from './fakeProvider';
@@ -167,6 +167,45 @@ describe('a phone call answered by the agent', () => {
     await settled(sessions);
     expect(calls[0]).toEqual(['request_appointment', 'call_9', { callerName: 'Sam', service: 'Haircut', date: '2026-10-03', time: '10:00', agreementPhrase: 'yes ten works' }]);
     expect(calls.at(-1)?.[0]).toBe('say');
+  });
+
+  it('its words are its answer: never asked to start work, so nothing is said twice', async () => {
+    // Live 28 Sept 2026: "Let me check what's open on the calendar." with no tool call drew the coding
+    // nudges ("You said what you will do…"), and each nudge made it say the line again, aloud.
+    const fake = fakeProvider('openai', [{ text: "Let me check what's open on the calendar." }, { text: 'We have Friday at two.' }]);
+    const { sessions, calls } = setup();
+    await sessions.callEvent({ type: 'call.started', callId: 'call_3', from: '+61400000003' });
+    await sessions.callEvent({ type: 'call.caller', callId: 'call_3', text: "What's your availability?" });
+    await settled(sessions);
+    expect(calls).toEqual([['say', 'call_3', "Let me check what's open on the calendar."]]);
+    expect(fake.bodies).toHaveLength(1);
+    expect(callInstructions('', '+61400000003', '', '')).toContain('Never say you will check without calling the tool');
+  });
+
+  it("a new call starts afresh: only the caller's last words carry over, never a line said again and again", () => {
+    const check = "Let me check what's open on the calendar.";
+    const turns: Turn[] = [
+      { role: 'user', text: '[OAIY] 📞 A call from Lance began.', automatic: true },
+      { role: 'user', text: 'Caller: Hi, can you hear me?' },
+      { role: 'assistant', text: 'Yes, I can hear you!', calls: [] },
+      { role: 'user', text: "Caller: What's your availability?" },
+      { role: 'assistant', text: check, calls: [] },
+      { role: 'user', text: '[bot.computer] You said what you will do…', automatic: true },
+      { role: 'assistant', text: check, calls: [] },
+      { role: 'assistant', text: '', calls: [{ id: 't1', name: 'lookup_business_data', input: {} }] },
+      { role: 'tool', results: [{ id: 't1', name: 'lookup_business_data', content: '{}', isError: false }] },
+      { role: 'user', text: 'Caller: Okay, bye.' },
+    ];
+    expect(earlierWords(turns)).toEqual([
+      { role: 'user', text: 'Caller: Hi, can you hear me?' },
+      { role: 'assistant', text: 'Yes, I can hear you!', calls: [] },
+      { role: 'user', text: "Caller: What's your availability?" },
+      { role: 'user', text: 'Caller: Okay, bye.' },
+    ]);
+    expect(earlierWords(turns, 2)).toEqual([
+      { role: 'user', text: "Caller: What's your availability?" },
+      { role: 'user', text: 'Caller: Okay, bye.' },
+    ]);
   });
 
   it('when the caller speaks over it, the rest of that reply is not said', async () => {
