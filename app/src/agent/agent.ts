@@ -12,7 +12,7 @@ import { DEFAULT_COMPACT_AT, budgetFor, contextWindow, formatTokens, outputLimit
 import { normalizePath, type Vfs } from '../vfs/vfs';
 import type { ProviderConfig } from './providers/types';
 import { sendTurn, type Attachment, type FrameReview, type Reply, type ToolCall, type ToolResult, type Turn, type Usage } from './protocol';
-import { EDIT_TOOLS, EDIT_TOOLS_WINDOW, MAIN_AGENT_ONLY, TOOLS, checkApp, mediaTools, readPlan, readTasks, runTool, type Plan, type PreviewHost, type ToolContext } from './tools';
+import { EDIT_TOOLS, EDIT_TOOLS_WINDOW, MAIN_AGENT_ONLY, TOOLS, checkApp, mediaTools, planChanges, readPlan, readTasks, runTool, settlePlan, type Plan, type PreviewHost, type ToolContext } from './tools';
 import { readProjectVoices } from './voices';
 import { MAX_REDOS, MAX_REVIEW_FAILURES, checklist, contentHash, countProblems, type PersonCount, readReviews, reviewOf, scriptExcerpt, storyFolder, writeReviews } from './review';
 import type { MediaSettings } from './media';
@@ -60,7 +60,7 @@ const MAX_TASKS_PER_RUN = 24;
 /** For the agent that plans (the main one): plan before changing anything. */
 const PLAN_GUIDE = `
 
-Plan first: for a task of several steps, call update_plan with the goal and 3 to 8 concrete steps before you start, and keep it current as each step starts and finishes (the user watches it). The task is done when every step is done and checked.`;
+Plan first: for a task of several steps, call update_plan with the goal and 3 to 8 concrete steps before you start (the user watches it). Make each step one piece of the result that can be finished and checked on its own (for a site: its sections or pages, then how it looks, then a last check), not one step for everything. Then work through the steps one at a time, each until it is done: mark it done with update_plan ({"step": N, "status": "done"}), review it when asked, and go on with the next. Keep the plan true: when the user asks for something different, or you find a mistake or a missing step, change the plan (add, drop, reword or reopen steps) and carry on. The task is done when every step is done and checked.`;
 
 const SUB_AGENT_ROLE = `
 
@@ -147,9 +147,11 @@ Current state: what works, errors still open, and what the agent was about to do
 Facts to remember: names, values, paths, commands, ids, anything that would be expensive to find again.
 Be specific and complete. Keep code only where it is essential. At most about 1200 words. Write only the summary.`;
 /** A run that stops short of its goal is asked to carry on at most this many times… */
-const MAX_NUDGES = 6;
+const MAX_NUDGES = 30;
 /** …and not again after this many in a row with no progress (no step done, no file changed). */
 const MAX_IDLE_NUDGES = 2;
+/** Steps (model replies with tool calls) on one plan step without the plan changing, before a reminder of where the work is. */
+const DRIFT_STEPS = 12;
 /** The same automatic-check errors this many times in a row stop the run. */
 const SAME_CHECK_LIMIT = 3;
 /** Images stay in the conversation for this many image-bearing turns. */
@@ -527,6 +529,8 @@ export class Agent {
     this.noImages.clear();
     this.toolContext.images = true;
     this.plan = null;
+    this.stepFiles.clear();
+    this.looseFiles.clear();
     this.failingApps.clear();
     this.toolContext.reads.clear();
     this.toolContext.shell = { cwd: '/', env: {} };
@@ -534,6 +538,89 @@ export class Agent {
 
   /** The checklist from the latest update_plan. */
   plan: Plan | null = null;
+  /** The files changed while each plan step was active (by its wording), and while none was: for reviewing a step when it is done. */
+  private stepFiles = new Map<string, Set<string>>();
+  private looseFiles = new Set<string>();
+
+  /** A file changed now: it belongs to the plan step being worked on. */
+  private noteStepFile(path: string): void {
+    const active = this.plan?.items.find((i) => i.status === 'active');
+    if (!active) {
+      this.looseFiles.add(path);
+      return;
+    }
+    const files = this.stepFiles.get(active.text) ?? new Set<string>();
+    files.add(path);
+    this.stepFiles.set(active.text, files);
+  }
+
+  /** How to check files like these, with the tools this agent has. */
+  private reviewHint(paths: string[]): string {
+    const has = (name: string) => this.tools.some((t) => t.name === name);
+    const media = /\.(png|jpe?g|webp|gif|bmp|avif|mp4|webm|mov|wav|mp3|ogg|flac|glb)$/i;
+    const ways: string[] = [];
+    // Text is read back; a picture, a clip or a model is looked at, not read.
+    if (paths.some((p) => !media.test(p))) ways.push('read back what you changed (read_file)');
+    if (paths.some((p) => isAppFile(p) || APP_FILE.test(p) || findApps(this.options.vfs).some((r) => r !== '' && p.startsWith(`${r}/`))) && has('softn_check')) ways.push(`softn_check the app${has('softn_interact') ? ' and try it with softn_interact' : ''}`);
+    if (paths.some((p) => /\.(html?|css)$/i.test(p)) && has('page_check')) ways.push(`page_check the page${has('preview_screenshot') ? ' and look at it with preview_screenshot' : ''}`);
+    else if (paths.some((p) => /\.(html?|css)$/i.test(p)) && has('preview_screenshot')) ways.push('look at the page with preview_screenshot');
+    if (ways.length < 2 && paths.some((p) => /\.(m?js|ts|py)$/i.test(p)) && (has('code_run') || has('sandbox_shell'))) ways.push(`run it (${has('code_run') ? 'code_run' : 'sandbox_shell'})`);
+    if (ways.length < 2 && paths.some((p) => /\.(png|jpe?g|webp|gif|bmp|avif)$/i.test(p)) && has('view_image')) ways.push('look at the pictures with view_image');
+    if (!ways.length) ways.push('look over what you made');
+    const hint = ways.join(', then ');
+    return hint[0].toUpperCase() + hint.slice(1);
+  }
+
+  /**
+   * update_plan: the plan changed (the whole list, or one step), a step kept
+   * in progress, and for each step just finished, a review of what it
+   * changed before the next one starts.
+   */
+  private takePlan(call: ToolCall, emit: (e: AgentEvent) => void): ToolResult {
+    let next: Plan;
+    try {
+      next = settlePlan(readPlan(call.input, this.plan));
+    } catch (error) {
+      return { id: call.id, name: call.name, content: `Error: ${(error as Error).message}`, isError: true };
+    }
+    const { done } = planChanges(this.plan, next);
+    if (!this.plan || (next.goal && this.plan.goal && next.goal !== this.plan.goal)) {
+      this.stepFiles.clear();
+      this.looseFiles.clear();
+    }
+    this.plan = next;
+    emit({ type: 'plan', plan: next });
+    const total = next.items.length;
+    const finished = next.items.filter((i) => i.status === 'done').length;
+    const step = (i: number) => `step ${i + 1} "${next.items[i].text}"`;
+    const lines: string[] = [];
+    // What the steps just finished changed: the files of each, and the ones changed with no step in progress.
+    const changed = new Set<string>(done.length ? this.looseFiles : []);
+    for (const i of done) for (const f of this.stepFiles.get(next.items[i].text) ?? []) changed.add(f);
+    if (done.length) this.looseFiles.clear();
+    const files = [...changed].sort();
+    if (finished === total) {
+      lines.push(`Plan updated: all ${total} steps done. Check the result, then tell the user what you did.`);
+      if (files.length) lines.push(`Before you finish, review ${done.length > 1 ? 'the last steps' : step(done[0])}: it changed ${files.map((f) => `/${f}`).join(', ')}. ${this.reviewHint(files)}, and make sure it does what the user asked for. If something falls short, fix it (set its step back to "active" while you do).`);
+      return { id: call.id, name: call.name, content: lines.join('\n\n'), isError: false };
+    }
+    lines.push(`Plan updated: ${finished} of ${total} done.`);
+    if (files.length) {
+      const which = done.length > 1 ? `steps ${done.map((i) => i + 1).join(' and ')}` : step(done[0]);
+      lines.push(`Review ${which} before going on. While ${done.length > 1 ? 'they were' : 'it was'} in progress you changed ${files.map((f) => `/${f}`).join(', ')}. ${this.reviewHint(files)}, and make sure it does what the step and the user's request call for. If it falls short, set the step back to "active" ({"step": ${done[0] + 1}, "status": "active"}) and fix it. If the plan itself is wrong (a step missing, one no longer needed, a mistake to undo), change the plan.`);
+    }
+    const active = next.items.findIndex((i) => i.status === 'active');
+    if (active >= 0) lines.push(`${files.length ? 'Then carry on with' : 'Now:'} ${step(active)}. Work on it until it is done, then mark it done ({"step": ${active + 1}, "status": "done"}).`);
+    return { id: call.id, name: call.name, content: lines.join('\n\n'), isError: false };
+  }
+
+  /** The open plan from an earlier request, for a new one: it may be about that work, or not. */
+  private carryOver(): string | null {
+    if (!this.plan || !this.canPlan) return null;
+    const open = this.plan.items.map((item, i) => ({ item, i })).filter(({ item }) => item.status !== 'done');
+    if (!open.length) return null;
+    return `Your plan from before${this.plan.goal ? ` ("${this.plan.goal}")` : ''} still has ${open.length} open step${open.length > 1 ? 's' : ''}: ${open.map(({ item, i }) => `${i + 1}. ${item.text}`).join('; ')}. If this message is about that work, carry on with it, and first change the plan (update_plan) if the user wants something different. If it asks for something else, leave that plan, and make a new one if the new work has several steps.`;
+  }
   /** Apps checked during this run, by the automatic check or softn_check. */
   private checkedRoots = new Set<string>();
 
@@ -541,15 +628,19 @@ export class Agent {
    * Why the run is not done yet, if the model stopped early: plan items it
    * set this run and did not finish, or an app whose check still fails.
    */
-  private unfinished(planThisRun: boolean): string | null {
+  private unfinished(planThisRun: boolean, announced = false): string | null {
     if (this.activeFlag && !this.flagFixed(this.activeFlag.path)) {
       return `The flagged /${this.activeFlag.path} is not fixed yet: make it again, fixing what the user flagged, until it passes its review. Then you will be told what comes next.`;
     }
     // Only apps checked in this run count: an old failure should not hold up something else.
     const failing = [...this.failingApps.entries()].find(([root]) => this.checkedRoots.has(root));
     if (failing) return `The last automatic check of ${appLabel(failing[0])} still reports errors:\n${failing[1]}\nFix them and check the app again before you finish. If you cannot, say what is wrong.`;
-    const open = planThisRun && this.plan ? this.plan.items.filter((i) => i.status !== 'done') : [];
-    if (open.length) return `Your plan still has ${open.length} open step${open.length > 1 ? 's' : ''}: ${open.map((i) => `"${i.text}"`).join(', ')}. Carry on with ${open.length > 1 ? 'them' : 'it'}. If a step is no longer needed, or already done, call update_plan to say so. Then finish with a short summary.`;
+    const open = planThisRun && this.plan ? this.plan.items.map((item, i) => ({ item, i })).filter(({ item }) => item.status !== 'done') : [];
+    if (open.length) {
+      const now = open.find(({ item }) => item.status === 'active') ?? open[0];
+      if (announced) return `You said what you would do next, then stopped before doing it: do it now, with the tool it needs. Step ${now.i + 1} "${now.item.text}" is in progress (${open.length} open step${open.length > 1 ? 's' : ''}): when it is done, mark it done with update_plan ({"step": ${now.i + 1}, "status": "done"}) and go on with the next.`;
+      return `Your plan still has ${open.length} open step${open.length > 1 ? 's' : ''}: ${open.map(({ item, i }) => `${i + 1}. "${item.text}"`).join(', ')}. Carry on with step ${now.i + 1} "${now.item.text}": work on it until it is done, then mark it done with update_plan ({"step": ${now.i + 1}, "status": "done"}) and go on with the next. If a step is no longer needed or already done, or the plan is wrong, change the plan. When every step is done and checked, finish with a short summary.`;
+    }
     return null;
   }
 
@@ -801,11 +892,20 @@ export class Agent {
       o.files.length ? `Files changed: ${o.files.join(', ')}` : 'Files changed: none',
     ].join('\n')).join('\n\n');
     const failing = [...this.failingApps.keys()].filter((root) => this.checkedRoots.has(root));
+    const stepsDone = [...new Set(outcomes.filter((o) => o.ok && o.task.planStep).map((o) => o.task.planStep!))].sort((a, b) => a - b);
+    if (this.plan) {
+      const settled = settlePlan(this.plan);
+      if (settled !== this.plan) {
+        this.plan = settled;
+        emit({ type: 'plan', plan: settled });
+      }
+    }
+    const review = stepsDone.length ? ` The tasks marked plan step${stepsDone.length > 1 ? 's' : ''} ${stepsDone.join(' and ')} done: review ${stepsDone.length > 1 ? 'them' : 'it'} (read what the tasks changed and check it works), and set a step back to "active" with update_plan if it falls short.` : '';
     return {
       id: call.id,
       name: call.name,
       isError: done === 0,
-      content: `${tasks.length} task${tasks.length > 1 ? 's' : ''}: ${done} done${done < tasks.length ? `, ${tasks.length - done} not finished` : ''}.\n\n${report}${failing.length ? `\n\nApps still failing their check: ${failing.join(', ')}.` : ''}\n\nCheck the results fit together before you finish.`,
+      content: `${tasks.length} task${tasks.length > 1 ? 's' : ''}: ${done} done${done < tasks.length ? `, ${tasks.length - done} not finished` : ''}.\n\n${report}${failing.length ? `\n\nApps still failing their check: ${failing.join(', ')}.` : ''}\n\nCheck the results fit together before you finish.${review}`,
     };
   }
 
@@ -1505,8 +1605,10 @@ export class Agent {
   /** Give the model the messages that came in while it worked. */
   private readInbox(emit: (e: AgentEvent) => void): boolean {
     if (!this.inbox.length) return false;
+    const planned = !!this.plan?.items.some((i) => i.status !== 'done') && this.canPlan;
     for (const m of this.inbox.splice(0)) {
-      const text = `${m.note ?? DURING_NOTE}\n\n${m.text}`;
+      const note = m.note ?? DURING_NOTE;
+      const text = `${planned && note !== HEARD_BY_TASK && note !== HEARD_BY_REVIEWER ? note.replace(/\]$/, ' If it changes what is wanted, change the plan to match (update_plan) before you carry on.]') : note}\n\n${m.text}`;
       this.turns.push({ role: 'user', text, ...(m.images.length ? { images: m.images } : {}), ...(m.attachments.length ? { attachments: m.attachments } : {}) });
     }
     emit({ type: 'status', message: 'The agent has your message.' });
@@ -1526,12 +1628,18 @@ export class Agent {
     const text = first ? `<project>\n${this.options.projectSummary()}\n</project>\n\n${prompt}` : prompt;
     const guides = this.guidesFor(prompt);
     this.turns.push({ role: 'user', text, ...(images.length ? { images } : {}), ...(attachments.length ? { attachments } : {}), ...(guides.length ? { guides } : {}) });
+    const carry = this.carryOver();
+    if (carry) this.turns.push({ role: 'user', text: `[bot.computer] ${carry}`, automatic: true });
     let failures = 0;
     let lastFailure = '';
     // What each step changes, by the index of the call that changed it.
     let callIndex = -1;
     let changes: Array<{ path: string; index: number }> = [];
-    this.onWrite = (path) => changes.push({ path, index: callIndex });
+    this.onWrite = (path) => {
+      changes.push({ path, index: callIndex });
+      // Written now, for the plan step in progress now (a step marked done later in the same reply had it).
+      this.noteStepFile(path);
+    };
     this.toolContext.images = this.imagesAccepted;
     const unwatch = () => {
       this.onWrite = null;
@@ -1541,12 +1649,14 @@ export class Agent {
     this.sameCheck = { signature: '', count: 0 };
     let planThisRun = false;
     let planNoted = false;
+    // Steps since the plan last changed, for a reminder when the work drifts.
+    let sincePlan = 0;
     // Progress, for deciding whether asking to carry on is still worth it.
     const changedThisRun = new Set<string>();
     // How many times each file was written in full, this run.
     const rewrites = new Map<string, number>();
     let idleNudges = 0;
-    let progressAtNudge = { done: -1, changed: -1 };
+    let progressAtNudge = { done: -1, changed: -1, acted: -1 };
     this.checkedRoots.clear();
     this.tasksThisRun = 0;
     let nudges = 0;
@@ -1606,9 +1716,9 @@ export class Agent {
           }
           if (reply.truncated) emit({ type: 'status', message: 'The reply was cut off at the output limit.' });
           // Stopping short of the goal: ask once or twice to carry on.
-          const unfinished = this.unfinished(planThisRun);
-          const progress = { done: this.plan?.items.filter((i) => i.status === 'done').length ?? 0, changed: changedThisRun.size };
-          idleNudges = progress.done > progressAtNudge.done || progress.changed > progressAtNudge.changed ? 0 : idleNudges + 1;
+          const unfinished = this.unfinished(planThisRun, announcesWork(reply.text));
+          const progress = { done: this.plan?.items.filter((i) => i.status === 'done').length ?? 0, changed: changedThisRun.size, acted };
+          idleNudges = progress.done > progressAtNudge.done || progress.changed > progressAtNudge.changed || progress.acted > progressAtNudge.acted ? 0 : idleNudges + 1;
           progressAtNudge = progress;
           if (unfinished && nudges < MAX_NUDGES && idleNudges < MAX_IDLE_NUDGES && !reply.truncated) {
             nudges++;
@@ -1645,6 +1755,8 @@ export class Agent {
             ? { id: call.id, name: call.name, content: `Error: ${call.name} is not one of your tools`, isError: true }
             : scriptCheck
               ? { id: call.id, name: call.name, content: scriptCheck, isError: false }
+              : call.name === 'update_plan'
+              ? this.takePlan(call, emit)
               : call.name === 'delegate'
               ? await this.delegate(call, emit, signal)
               : call.name === 'review_frame'
@@ -1679,9 +1791,8 @@ export class Agent {
             else this.failingApps.set(result.check.root, result.check.text);
           }
           if (call.name === 'update_plan' && !result.isError) {
-            this.plan = readPlan(call.input);
             planThisRun = true;
-            emit({ type: 'plan', plan: this.plan });
+            sincePlan = 0;
           }
           emit({ type: 'tool_result', result });
           if (result.isError && result.content === lastFailure) failures++;
@@ -1690,6 +1801,13 @@ export class Agent {
         }
         callIndex = reply.calls.length;
         for (const c of changes) changedThisRun.add(c.path);
+        // Many steps on one plan step without the plan moving: where the work is, and what to do about it.
+        const openStep = planThisRun ? this.plan?.items.findIndex((i) => i.status === 'active') ?? -1 : -1;
+        if (openStep >= 0 && !reply.calls.some((c) => c.name === 'update_plan') && ++sincePlan >= DRIFT_STEPS && results.length) {
+          sincePlan = 0;
+          const n = openStep + 1;
+          results[results.length - 1].content += `\n\n[bot.computer] ${DRIFT_STEPS} steps since the plan last changed, and step ${n} "${this.plan!.items[openStep].text}" is still in progress. If it is done, mark it done (update_plan: {"step": ${n}, "status": "done"}) and go on with the next. If it is bigger than one step, split it in the plan. If you are going round in circles (writing the same files again, the same error), stop and change the approach, or change the plan.`;
+        }
         // A task: plan before going further (once, and not for a one-file fix).
         if (!planThisRun && !planNoted && this.canPlan && results.length) {
           const apps = findApps(this.options.vfs);

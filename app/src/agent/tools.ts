@@ -11,7 +11,7 @@ import type { NetGate } from '../gate/netgate';
 import { SandboxHost, globRegex, summarize } from '../sandbox/host';
 import { runInSandbox } from '../sandbox/runner';
 import { VfsError, normalizePath, type Vfs } from '../vfs/vfs';
-import type { FrameReview, ToolCall, ToolResult, ToolSpec } from './protocol';
+import type { FrameReview, ToolCall, ToolResult, ToolSpec, Turn } from './protocol';
 import { appLabel, checkProject, describeApp, findApps, formatFindings, guideFor, importSoftn, logicSyntax, resolveApp } from '../softn/softn';
 import { VIEWPORTS, targetLabel, type PageReport, type PreviewAction, type PreviewResult, type PreviewTarget, type ModelView, type Problem, type Shot, type Viewport, type ViewportInfo } from '../preview/preview';
 import { findPages, resolvePage } from '../preview/page';
@@ -60,9 +60,24 @@ export interface Plan {
   goal: string;
   items: Array<{ text: string; status: 'pending' | 'active' | 'done' }>;
 }
+type PlanStatus = Plan['items'][number]['status'];
 
-/** A plan from update_plan's arguments, or an error saying what is wrong with them. */
-export function readPlan(input: Record<string, unknown>): Plan {
+/** The most steps a plan holds. */
+export const MAX_PLAN_STEPS = 16;
+
+function readStatus(value: unknown): PlanStatus {
+  const status = String(value ?? 'pending').toLowerCase();
+  return status === 'done' || status === 'completed' || status === 'complete' ? 'done' : status === 'active' || status === 'in_progress' || status === 'doing' ? 'active' : 'pending';
+}
+
+/**
+ * A plan from update_plan's arguments, or an error saying what is wrong with
+ * them: the whole checklist (items), or one step of the current plan changed
+ * (step, with its new status or text).
+ */
+export function readPlan(input: Record<string, unknown>, current: Plan | null = null): Plan {
+  const hasItems = Array.isArray(input.items) || (typeof input.items === 'string' && input.items.trim() !== '');
+  if (!hasItems && input.step !== undefined) return changeStep(input, current);
   const raw = Array.isArray(input.items) ? input.items : typeof input.items === 'string' ? (() => {
     try {
       return JSON.parse(input.items as string) as unknown[];
@@ -73,13 +88,71 @@ export function readPlan(input: Record<string, unknown>): Plan {
   const items = raw
     .map((item) => (typeof item === 'string' ? { text: item, status: 'pending' } : (item as Record<string, unknown>)))
     .filter((item) => typeof item?.text === 'string' && item.text.trim())
-    .map((item) => {
-      const status = String(item.status ?? 'pending').toLowerCase();
-      return { text: String(item.text).trim().slice(0, 200), status: (status === 'done' || status === 'completed' || status === 'complete' ? 'done' : status === 'active' || status === 'in_progress' || status === 'doing' ? 'active' : 'pending') as Plan['items'][number]['status'] };
-    })
-    .slice(0, 12);
-  if (!items.length) throw new Error('items is empty: give the whole checklist, e.g. [{"text": "Write the page", "status": "active"}, {"text": "Check it", "status": "pending"}]');
-  return { goal: typeof input.goal === 'string' ? input.goal.trim().slice(0, 300) : '', items };
+    .map((item) => ({ text: String(item.text).trim().slice(0, 200), status: readStatus(item.status) }))
+    .slice(0, MAX_PLAN_STEPS);
+  if (!items.length) throw new Error('items is empty: give the whole checklist, e.g. [{"text": "Write the page", "status": "active"}, {"text": "Check it", "status": "pending"}], or change one step of the plan with step and status');
+  const goal = typeof input.goal === 'string' && input.goal.trim() ? input.goal.trim().slice(0, 300) : current && input.goal === undefined ? current.goal : '';
+  return { goal, items };
+}
+
+/** One step of the current plan given a new status or wording. */
+function changeStep(input: Record<string, unknown>, current: Plan | null): Plan {
+  if (!current) throw new Error('there is no plan yet: give the whole checklist in items, e.g. {"goal": "...", "items": [{"text": "Write the page", "status": "active"}, {"text": "Check it", "status": "pending"}]}');
+  const step = Number(input.step);
+  if (!Number.isInteger(step) || step < 1 || step > current.items.length) throw new Error(`step ${String(input.step)} is not in the plan: it has steps 1 to ${current.items.length}`);
+  const text = typeof input.text === 'string' && input.text.trim() ? input.text.trim().slice(0, 200) : null;
+  if (input.status === undefined && !text) throw new Error('say what changes: a status ("pending", "active" or "done") or new text for the step');
+  const items = current.items.map((item, i) => (i === step - 1 ? { text: text ?? item.text, status: input.status === undefined ? item.status : readStatus(input.status) } : item));
+  const goal = typeof input.goal === 'string' && input.goal.trim() ? input.goal.trim().slice(0, 300) : current.goal;
+  return { goal, items };
+}
+
+/** The plan with a step in progress: while steps are left and none is active, the first one left is. */
+export function settlePlan(plan: Plan): Plan {
+  if (plan.items.some((i) => i.status === 'active')) return plan;
+  const next = plan.items.findIndex((i) => i.status === 'pending');
+  return next < 0 ? plan : { ...plan, items: plan.items.map((item, i) => (i === next ? { ...item, status: 'active' as const } : item)) };
+}
+
+/**
+ * The plan as it stood after these turns: each update_plan applied in order,
+ * as the agent took it (one it refused is skipped). A saved conversation
+ * gives the plan back this way.
+ */
+export function planAfter(turns: Turn[]): Plan | null {
+  let plan: Plan | null = null;
+  for (const turn of turns) {
+    if (turn.role !== 'assistant') continue;
+    for (const call of turn.calls) {
+      if (call.name !== 'update_plan') continue;
+      try {
+        plan = settlePlan(readPlan(call.input, plan));
+      } catch {
+        /* refused: the plan stayed as it was */
+      }
+    }
+  }
+  return plan;
+}
+
+/**
+ * What changed from one plan to the next: the steps finished and the steps
+ * started, by index in the new plan, matched by their wording (a step may
+ * have moved). A new plan's steps (or one for another goal) marked done
+ * from the start were not finished by it.
+ */
+export function planChanges(before: Plan | null, after: Plan): { done: number[]; started: number[] } {
+  // Another goal is another plan.
+  if (before && after.goal && before.goal && after.goal !== before.goal) before = null;
+  const was = new Map((before?.items ?? []).map((i) => [i.text, i.status]));
+  const done: number[] = [];
+  const started: number[] = [];
+  after.items.forEach((item, i) => {
+    const old = was.get(item.text);
+    if (item.status === 'done' && old !== 'done' && before) done.push(i);
+    if (item.status === 'active' && old !== 'active') started.push(i);
+  });
+  return { done, started };
 }
 
 /** The live preview (SoftN apps and web pages), as the tools use it. */
@@ -495,14 +568,19 @@ export const TOOLS: ToolSpec[] = [
   {
     name: 'update_plan',
     description:
-      'Set the checklist the user watches while you work: the goal of their request and 3 to 8 concrete steps to reach it. Call it before you start work that takes several steps (building or changing an app, a feature, a fix across files), ' +
-      'then again whenever a step starts or finishes, sending the whole list each time with each item "pending", "active" (the one you are on) or "done". The work is finished when every item is done and the result is checked.',
+      'The checklist the user watches while you work: the goal of their request and 3 to 8 concrete steps to reach it. Call it with goal and items before you start work that takes several steps (building or changing an app, a site, a feature, a fix across files). ' +
+      'Make each step one piece of the result that can be finished and checked on its own (a page, a section, a feature), not one step for everything. ' +
+      'Work through the steps one at a time. When a step is finished, mark it done: {"step": 2, "status": "done"}. You are then asked to review it, and the next step becomes active. ' +
+      'Change the plan whenever it should change: when the user asks for something different, or you find a mistake or something missing. Send the whole list again (items) to add, drop, reword or reorder steps, or set a done step back to "active" to redo it. ' +
+      'The work is finished when every step is done and the result is checked.',
     parameters: {
       type: 'object',
-      required: ['items'],
       properties: {
         goal: { ...str, description: 'What the user asked for, as the outcome to reach, in one sentence' },
-        items: { type: 'array', items: { type: 'object', properties: { text: str, status: { type: 'string', enum: ['pending', 'active', 'done'] } }, required: ['text', 'status'] } },
+        items: { type: 'array', description: 'The whole checklist, replacing the one before', items: { type: 'object', properties: { text: str, status: { type: 'string', enum: ['pending', 'active', 'done'] } }, required: ['text', 'status'] } },
+        step: { type: 'integer', minimum: 1, description: 'Instead of items: the number of one step to change (1 is the first)' },
+        status: { type: 'string', enum: ['pending', 'active', 'done'], description: 'With step: its new status' },
+        text: { ...str, description: 'With step: its new wording' },
       },
     },
   },
@@ -1295,7 +1373,7 @@ async function execute(call: ToolCall, ctx: ToolContext, out: ToolOut): Promise<
     case 'delegate':
       throw new Error('delegate is not available here: sub-agents do the work themselves');
     case 'update_plan': {
-      const plan = readPlan(input);
+      const plan = settlePlan(readPlan(input));
       const done = plan.items.filter((i) => i.status === 'done').length;
       const next = plan.items.find((i) => i.status === 'active') ?? plan.items.find((i) => i.status === 'pending');
       return done === plan.items.length ? `Plan updated: all ${done} steps done. Check the result, then tell the user what you did.` : `Plan updated: ${done} of ${plan.items.length} done.${next ? ` Next: ${next.text}` : ''}`;

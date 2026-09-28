@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { Agent, announcesWork, type AgentEvent } from '../../src/agent/agent';
-import { TOOLS } from '../../src/agent/tools';
+import { TOOLS, planAfter, planChanges, readPlan, settlePlan } from '../../src/agent/tools';
 import { NetGate } from '../../src/gate/netgate';
 import { Vfs } from '../../src/vfs/vfs';
 import { OpenAIStream } from '../../src/agent/providers/stream';
@@ -685,5 +685,212 @@ describe('plan first, and carry on while there is progress', () => {
     await agent.run('do three things', emit);
     expect(events.filter((e) => e.type === 'nudge')).toHaveLength(3);
     expect(events.at(-1)).toMatchObject({ type: 'done', text: 'All three done.' });
+  });
+});
+
+describe('the plan, step by step until it is done', () => {
+  const site = { goal: 'A small site', items: [{ text: 'Write the page', status: 'active' }, { text: 'Style it', status: 'pending' }, { text: 'Check it', status: 'pending' }] };
+  const last = (body: Record<string, unknown>) => JSON.stringify((body.messages as unknown[]).at(-1));
+  const statuses = (events: AgentEvent[]) => events.filter((e) => e.type === 'plan').map((e) => (e as Extract<AgentEvent, { type: 'plan' }>).plan.items.map((i) => i.status).join(' '));
+
+  it('changes one step, or the whole list, and keeps a step in progress', () => {
+    const plan = settlePlan(readPlan({ goal: 'g', items: ['a', 'b'] }));
+    expect(plan.items.map((i) => i.status)).toEqual(['active', 'pending']);
+    const next = settlePlan(readPlan({ step: 1, status: 'done' }, plan));
+    expect(next).toEqual({ goal: 'g', items: [{ text: 'a', status: 'done' }, { text: 'b', status: 'active' }] });
+    expect(readPlan({ step: 2, text: 'b, better' }, next).items[1]).toEqual({ text: 'b, better', status: 'active' });
+    // The whole list again keeps the goal when it leaves it out.
+    expect(readPlan({ items: [{ text: 'a', status: 'done' }, { text: 'c', status: 'pending' }] }, next).goal).toBe('g');
+    expect(() => readPlan({ step: 1, status: 'done' }, null)).toThrow(/no plan yet/);
+    expect(() => readPlan({ step: 3, status: 'done' }, next)).toThrow(/steps 1 to 2/);
+    expect(() => readPlan({ step: 1 }, next)).toThrow(/say what changes/);
+    expect(planChanges(plan, next)).toEqual({ done: [0], started: [1] });
+    // A step found by its wording, wherever it moved.
+    expect(planChanges(next, readPlan({ items: [{ text: 'b', status: 'done' }, { text: 'a', status: 'done' }] }, next)).done).toEqual([0]);
+    // A new plan, or one for another goal: its steps done from the start were not finished by it.
+    expect(planChanges(null, readPlan({ items: [{ text: 'x', status: 'done' }] })).done).toEqual([]);
+    expect(planChanges(plan, readPlan({ goal: 'other', items: [{ text: 'a', status: 'done' }] })).done).toEqual([]);
+  });
+
+  it('a saved conversation gives the plan back, one-step changes and all', () => {
+    const call = (input: Record<string, unknown>, n: number) => ({ role: 'assistant' as const, text: '', calls: [{ id: `c${n}`, name: 'update_plan', input }] });
+    const turns = [
+      { role: 'user' as const, text: 'make a small site' },
+      call(site, 1),
+      call({ step: 1, status: 'done' }, 2),
+      // Refused (no such step): the plan stays as it was.
+      call({ step: 9, status: 'done' }, 3),
+      call({ step: 2, text: 'Style it in blue' }, 4),
+    ];
+    expect(planAfter(turns)).toEqual({ goal: 'A small site', items: [{ text: 'Write the page', status: 'done' }, { text: 'Style it in blue', status: 'active' }, { text: 'Check it', status: 'pending' }] });
+    expect(planAfter(turns.slice(0, 1))).toBeNull();
+  });
+
+  it('a step marked done is reviewed, with the files it changed, and the next one starts', async () => {
+    const fake = fakeProvider('openai', [
+      { calls: [{ name: 'update_plan', input: site }] },
+      // Written and marked done in one reply: the file is the step's.
+      { calls: [{ name: 'write_file', input: { path: 'site/index.html', content: '<h1>Hi</h1>\n' } }, { name: 'update_plan', input: { step: 1, status: 'done' } }] },
+      (body) => {
+        const said = last(body);
+        expect(said).toContain('Plan updated: 1 of 3 done.');
+        expect(said).toContain('Review step 1 \\"Write the page\\" before going on. While it was in progress you changed /site/index.html. Read back what you changed (read_file)');
+        expect(said).toContain('set the step back to \\"active\\"');
+        expect(said).toContain('Then carry on with step 2 \\"Style it\\"');
+        return { calls: [{ name: 'read_file', input: { path: 'site/index.html' } }] };
+      },
+      { calls: [{ name: 'update_plan', input: { step: 2, status: 'done' } }] },
+      (body) => {
+        // Nothing changed while step 2 was in progress: nothing to review, on to step 3.
+        expect(last(body)).not.toContain('Review');
+        expect(last(body)).toContain('Now: step 3 \\"Check it\\"');
+        return { calls: [{ name: 'update_plan', input: { step: 3, status: 'done' } }] };
+      },
+      { text: 'The site is written.' },
+    ]);
+    const { agent, events, emit } = setup(OPENAI);
+    await agent.run('make a small site', emit);
+    expect(statuses(events)).toEqual(['active pending pending', 'done active pending', 'done done active', 'done done done']);
+    expect(events.filter((e) => e.type === 'nudge')).toHaveLength(0);
+    expect(events.at(-1)).toMatchObject({ type: 'done', text: 'The site is written.' });
+    expect(fake.bodies).toHaveLength(6);
+  });
+
+  it('a step that only made pictures is looked at, not read back', async () => {
+    fakeProvider('openai', [
+      { calls: [{ name: 'update_plan', input: site }] },
+      { calls: [{ name: 'write_file', input: { path: 'shots/phone.png', content: 'not really a picture' } }, { name: 'update_plan', input: { step: 1, status: 'done' } }] },
+      (body) => {
+        expect(last(body)).toContain('you changed /shots/phone.png. Look at the pictures with view_image, and make sure');
+        expect(last(body)).not.toContain('read_file');
+        return { calls: [{ name: 'update_plan', input: { items: site.items.map((i) => ({ ...i, status: 'done' })) } }] };
+      },
+      { text: 'Done.' },
+    ]);
+    const { agent, events, emit } = setup(OPENAI);
+    await agent.run('make a small site', emit);
+    expect(events.at(-1)).toMatchObject({ type: 'done', text: 'Done.' });
+  });
+
+  it('the plan can change while it works: steps added, reworded, and one reopened', async () => {
+    fakeProvider('openai', [
+      { calls: [{ name: 'update_plan', input: site }] },
+      { calls: [{ name: 'write_file', input: { path: 'site/index.html', content: '<h1>Hi</h1>\n' } }, { name: 'update_plan', input: { step: 1, status: 'done' } }] },
+      // The review finds a mistake: step 1 again, and a step added.
+      { calls: [{ name: 'update_plan', input: { items: [{ text: 'Write the page', status: 'active' }, { text: 'Add a contact form', status: 'pending' }, { text: 'Style it', status: 'pending' }, { text: 'Check it', status: 'pending' }] } }] },
+      (body) => {
+        expect(last(body)).toContain('Plan updated: 0 of 4 done.');
+        return { calls: [{ name: 'update_plan', input: { step: 3, text: 'Style it in blue' } }] };
+      },
+      { calls: [{ name: 'update_plan', input: { items: [{ text: 'Write the page', status: 'done' }, { text: 'Add a contact form', status: 'done' }, { text: 'Style it in blue', status: 'done' }, { text: 'Check it', status: 'done' }] } }] },
+      { text: 'Done, in blue, with a form.' },
+    ]);
+    const { agent, events, emit } = setup(OPENAI);
+    await agent.run('make a small site', emit);
+    expect(agent.plan?.goal).toBe('A small site');
+    expect(agent.plan?.items.map((i) => i.text)).toEqual(['Write the page', 'Add a contact form', 'Style it in blue', 'Check it']);
+    expect(events.at(-1)).toMatchObject({ type: 'done', text: 'Done, in blue, with a form.' });
+  });
+
+  it('works on until every step is done, however many times it stops, while steps get done', async () => {
+    const eight = { goal: 'eight things', items: Array.from({ length: 8 }, (_, i) => ({ text: `thing ${i + 1}`, status: 'pending' })) };
+    const script: Array<Parameters<typeof fakeProvider>[1][number]> = [{ calls: [{ name: 'update_plan', input: eight }] }];
+    for (let i = 1; i <= 8; i++) {
+      script.push({ text: 'pausing here' });
+      const step = i;
+      script.push((body) => {
+        expect(last(body)).toContain(`Carry on with step ${step} \\"thing ${step}\\"`);
+        return { calls: [{ name: 'update_plan', input: { step, status: 'done' } }] };
+      });
+    }
+    script.push({ text: 'All eight done.' });
+    fakeProvider('openai', script);
+    const { agent, events, emit } = setup(OPENAI);
+    await agent.run('do eight things', emit);
+    expect(events.filter((e) => e.type === 'nudge')).toHaveLength(8);
+    expect(agent.plan?.items.every((i) => i.status === 'done')).toBe(true);
+    expect(events.at(-1)).toMatchObject({ type: 'done', text: 'All eight done.' });
+  });
+
+  it('stopping right after saying what comes next is met with a short "do it now"', async () => {
+    fakeProvider('openai', [
+      { calls: [{ name: 'update_plan', input: site }] },
+      { text: 'The page is written. Let me check the desktop layout.' },
+      (body) => {
+        expect(last(body)).toContain('You said what you would do next, then stopped before doing it: do it now, with the tool it needs. Step 1 \\"Write the page\\" is in progress (3 open steps)');
+        return { calls: [{ name: 'update_plan', input: { items: site.items.map((i) => ({ ...i, status: 'done' })) } }] };
+      },
+      { text: 'Done.' },
+    ]);
+    const { events, emit, agent } = setup(OPENAI);
+    await agent.run('make a small site', emit);
+    expect(events.filter((e) => e.type === 'nudge')).toHaveLength(1);
+    expect(events.at(-1)).toMatchObject({ type: 'done', text: 'Done.' });
+  });
+
+  it('checking between stops is working too: it is asked to go on, not let go after two', async () => {
+    const script: Array<Parameters<typeof fakeProvider>[1][number]> = [{ calls: [{ name: 'update_plan', input: site }] }];
+    for (let i = 0; i < 4; i++) script.push({ calls: [{ name: 'read_file', input: { path: 'src/app.js' } }] }, { text: `looked again (${i})` });
+    script.push({ calls: [{ name: 'update_plan', input: { items: site.items.map((i) => ({ ...i, status: 'done' })) } }] }, { text: 'Done at last.' });
+    fakeProvider('openai', script);
+    const { events, emit, agent } = setup(OPENAI);
+    await agent.run('make a small site', emit);
+    expect(events.filter((e) => e.type === 'nudge')).toHaveLength(4);
+    expect(events.at(-1)).toMatchObject({ type: 'done', text: 'Done at last.' });
+  });
+
+  it('after many steps without the plan moving, says where the work is', async () => {
+    const script: Array<Parameters<typeof fakeProvider>[1][number]> = [{ calls: [{ name: 'update_plan', input: site }] }];
+    for (let i = 0; i < 12; i++) script.push({ calls: [{ name: 'write_file', input: { path: 'site/index.html', content: `<h1>Hi ${i}</h1>\n` } }] });
+    script.push((body) => {
+      expect(last(body)).toContain('12 steps since the plan last changed, and step 1 \\"Write the page\\" is still in progress');
+      return { calls: [{ name: 'update_plan', input: { items: site.items.map((i) => ({ ...i, status: 'done' })) } }] };
+    });
+    script.push({ text: 'Done.' });
+    const fake = fakeProvider('openai', script);
+    const { agent, events, emit } = setup(OPENAI);
+    await agent.run('make a small site', emit);
+    expect(events.at(-1)).toMatchObject({ type: 'done', text: 'Done.' });
+    expect(JSON.stringify(fake.bodies.at(-1)).match(/steps since the plan last changed/g)).toHaveLength(1);
+  });
+
+  it('a new request hears of the plan left open, and is not held to it', async () => {
+    fakeProvider('openai', [
+      { calls: [{ name: 'update_plan', input: site }] },
+      { text: 'a' },
+      { text: 'b' },
+      { text: 'c' },
+      (body) => {
+        expect(JSON.stringify(body.messages)).toContain('Your plan from before (\\"A small site\\") still has 3 open steps: 1. Write the page; 2. Style it; 3. Check it. If this message is about that work, carry on with it');
+        return { text: '4' };
+      },
+    ]);
+    const { agent, events, emit } = setup(OPENAI);
+    await agent.run('make a small site', emit);
+    events.length = 0;
+    await agent.run('what is 2 + 2?', emit);
+    expect(events.filter((e) => e.type === 'nudge')).toHaveLength(0);
+    expect(events.at(-1)).toMatchObject({ type: 'done', text: '4' });
+  });
+
+  it('a message while it works may change the plan', async () => {
+    const ref: { agent?: Agent } = {};
+    fakeProvider('openai', [
+      { calls: [{ name: 'update_plan', input: site }] },
+      () => {
+        ref.agent!.interject('make it blue');
+        return { calls: [{ name: 'read_file', input: { path: 'src/app.js' } }] };
+      },
+      (body) => {
+        expect(last(body)).toContain('If it changes what is wanted, change the plan to match (update_plan) before you carry on.]');
+        expect(last(body)).toContain('make it blue');
+        return { calls: [{ name: 'update_plan', input: { items: site.items.map((i) => ({ ...i, status: 'done' })) } }] };
+      },
+      { text: 'Done.' },
+    ]);
+    const s = setup(OPENAI);
+    ref.agent = s.agent;
+    await s.agent.run('make a small site', s.emit);
+    expect(s.events.at(-1)).toMatchObject({ type: 'done', text: 'Done.' });
   });
 });

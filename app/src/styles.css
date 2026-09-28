@@ -15,7 +15,10 @@
 
 * { box-sizing: border-box; }
 html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text); font: 14px/1.45 system-ui, -apple-system, 'Segoe UI', sans-serif; }
+/* The app fills the window and never scrolls as a page: each pane scrolls on its own, so the chat box stays in view. */
+html, body { overflow: hidden; overscroll-behavior: none; }
 #app { height: 100%; display: flex; flex-direction: column; }
+#app > .topbar, #app > .tabs { flex: none; }
 .boot { margin: auto; color: var(--muted); }
 button, select, input, textarea { font: inherit; color: var(--text); background: var(--panel-2); border: 1px solid var(--border); border-radius: 6px; }
 button { padding: 4px 10px; cursor: pointer; }
@@ -49,12 +52,14 @@ input, select, textarea { padding: 5px 8px; }
 .chip[data-mode='blocked'] { color: var(--err); border-color: var(--err); }
 .chip[data-mode='allowlist'] { color: var(--warn); border-color: var(--warn); }
 
-.workspace { flex: 1; min-height: 0; display: grid; grid-template-columns: 240px minmax(0, 1fr) minmax(340px, 38%); }
-.center { display: grid; grid-template-rows: auto minmax(0, 1fr) 230px; min-width: 0; border-left: 1px solid var(--border); border-right: 1px solid var(--border); }
+/* One row the height of the window: a big file or a long chat scrolls inside its pane, never the page. */
+.workspace { flex: 1; min-height: 0; display: grid; grid-template-columns: 240px minmax(0, 1fr) minmax(340px, 38%); grid-template-rows: minmax(0, 1fr); }
+.workspace > * { min-height: 0; }
+.center { display: grid; grid-template-rows: auto minmax(0, 1fr) min(230px, 32%); min-width: 0; min-height: 0; border-left: 1px solid var(--border); border-right: 1px solid var(--border); }
 .center-tabs { display: flex; gap: 2px; padding: 4px 6px 0; background: var(--panel); border-bottom: 1px solid var(--border); }
 .center-tabs button { border: none; border-radius: 6px 6px 0 0; background: transparent; color: var(--muted); padding: 5px 12px; }
 .center-tabs button.active { color: var(--text); background: var(--bg); box-shadow: inset 0 2px 0 var(--accent); }
-.center-main { position: relative; min-height: 0; display: grid; }
+.center-main { position: relative; min-height: 0; display: grid; grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 1fr); }
 .center-main > * { grid-area: 1 / 1; min-height: 0; }
 .center[data-pane='editor'] .preview, .center[data-pane='preview'] .editor { visibility: hidden; pointer-events: none; }
 .preview { display: flex; flex-direction: column; min-height: 0; background: var(--bg); }
@@ -109,7 +114,9 @@ input, select, textarea { padding: 5px 8px; }
 .chat { display: flex; flex-direction: column; min-height: 0; background: var(--panel); }
 .chat-log-wrap { flex: 1; min-height: 0; position: relative; display: flex; flex-direction: column; }
 /* Newest first: what arrives goes on top, and what is being read further down stays in place. */
-.chat-log { flex: 1; min-height: 0; overflow: auto; overflow-anchor: auto; padding: 10px; display: flex; flex-direction: column; gap: 8px; }
+.chat-log { flex: 1; min-height: 0; overflow: auto; overflow-anchor: auto; overscroll-behavior: contain; scrollbar-gutter: stable; padding: 10px; display: flex; flex-direction: column; gap: 8px; }
+/* Thin scrollbars in the theme's colours, one per pane. */
+.chat-log, .tree-list, .term-out, .plan-items, .tool pre, .thinking pre, .prompt-view pre, .task-report, .modal-body { scrollbar-width: thin; scrollbar-color: color-mix(in srgb, var(--muted) 45%, transparent) transparent; }
 /* However long the conversation, each entry keeps its height (the log scrolls). */
 .chat-log > * { flex-shrink: 0; }
 .to-current { position: absolute; top: 8px; left: 50%; transform: translateX(-50%); z-index: 2; font-size: 12px; padding: 4px 12px; border-radius: 999px; box-shadow: 0 2px 8px rgba(0, 0, 0, 0.4); }
@@ -151,7 +158,7 @@ input, select, textarea { padding: 5px 8px; }
 .msg-attachments { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
 .tool-image { display: block; max-width: 100%; max-height: 320px; margin: 6px 8px 8px; border: 1px solid var(--border); border-radius: 4px; }
 .preview-app { font-size: 12px; padding: 1px 4px; max-width: 40%; text-transform: none; letter-spacing: 0; }
-.chat-input { flex: 1; resize: vertical; min-height: 44px; }
+.chat-input { flex: 1; resize: vertical; min-height: 44px; max-height: 40vh; }
 
 dialog.settings { width: min(860px, 94vw); background: var(--panel); color: var(--text); border: 1px solid var(--border); border-radius: 10px; padding: 16px 18px; }
 dialog::backdrop { background: rgba(0, 0, 0, 0.55); }
@@ -382,11 +389,17 @@ footer.dialog-buttons { flex: none; padding: 12px 22px 16px; border-top: 1px sol
 .plan-bar { height: 3px; background: var(--border); }
 .plan-bar span { display: block; height: 100%; background: var(--accent); transition: width 300ms ease; }
 .plan.finished .plan-bar span { background: var(--ok); }
-.plan-items { list-style: none; margin: 0; padding: 6px 10px 8px; display: flex; flex-direction: column; gap: 3px; max-height: 32vh; overflow-y: auto; }
+/* Short while it runs (finished steps fold into one line, and a long tail into "+N more"), so it rarely needs to scroll. */
+.plan-items { list-style: none; margin: 0; padding: 6px 10px 8px; display: flex; flex-direction: column; gap: 3px; max-height: 40vh; overflow-y: auto; }
 .plan-items[hidden] { display: none; }
 .plan-item { display: flex; align-items: flex-start; gap: 8px; font-size: 13px; line-height: 1.4; color: var(--muted); }
 .plan-item.active { color: var(--text); font-weight: 550; }
 .plan-item.done .plan-text { text-decoration: line-through; text-decoration-color: color-mix(in srgb, var(--muted) 60%, transparent); }
+.plan-body { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.plan-activity { font: 11.5px/1.4 var(--mono); color: var(--muted); font-weight: 400; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.plan-activity:empty { display: none; }
+.plan-fold button { border: 0; background: transparent; padding: 0 0 0 23px; font-size: 12px; color: var(--muted); min-height: 0; }
+.plan-fold button:hover { color: var(--text); border: 0; }
 .plan-mark { flex: none; width: 15px; height: 15px; margin-top: 2px; border-radius: 50%; border: 1.5px solid var(--border); display: grid; place-items: center; font-size: 10px; line-height: 1; }
 .plan-item.done .plan-mark { border-color: var(--ok); background: var(--ok); color: #0f1115; font-weight: 700; }
 .plan-item.active .plan-mark { border-color: var(--accent); }
@@ -394,6 +407,14 @@ footer.dialog-buttons { flex: none; padding: 12px 22px 16px; border-top: 1px sol
 @keyframes plan-spin { to { transform: rotate(360deg); } }
 @media (prefers-reduced-motion: reduce) { .plan-item.active.running .plan-mark { animation: none; border-top-color: var(--accent); } }
 .msg.nudge { display: flex; gap: 4px; font-size: 12px; color: var(--muted); background: transparent; border: 1px dashed var(--border); padding: 4px 8px; }
+/* Where the plan moved, in the log: a thin rule with the step. */
+.msg.step { display: flex; align-items: center; gap: 8px; padding: 2px 2px; font-size: 12px; color: var(--muted); border-radius: 0; }
+.msg.step::after { content: ''; flex: 1; min-width: 12px; border-top: 1px solid var(--border); }
+.msg.step .step-text { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.msg.step .step-icon { flex: none; width: 14px; text-align: center; }
+.msg.step.started { color: var(--accent); }
+.msg.step.done { color: var(--ok); }
+.msg.step.plan-made, .msg.step.plan-changed { color: var(--text); font-weight: 550; }
 .plan { margin-bottom: 6px; box-shadow: 0 6px 12px -8px rgba(0, 0, 0, 0.6); position: relative; z-index: 1; }
 
 /* The context meter in the Agent pane's title. */

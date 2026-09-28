@@ -5,7 +5,7 @@
  */
 import type { AgentEvent } from '../agent/agent';
 import type { Attachment, ToolCall, ToolResult, Turn } from '../agent/protocol';
-import { readPlan, readTasks, type Plan } from '../agent/tools';
+import { planAfter, planChanges, readPlan, readTasks, settlePlan, type Plan } from '../agent/tools';
 import { formatTokens } from '../agent/context';
 import { clear, h } from './dom';
 import { mediaElement, mediaKind, type Media } from './media';
@@ -63,6 +63,9 @@ function summarizeCall(call: ToolCall): string {
   }
 }
 
+/** Steps after the one in progress that the checklist shows before folding the rest into "+N more". */
+const PLAN_UPCOMING = 4;
+
 /** How many turns of a saved conversation are drawn at a time (newest first; older ones as the log is scrolled down to them). */
 const REPLAY_PAGE = 60;
 
@@ -91,6 +94,10 @@ export class ChatPane {
   private readonly planBox = h('section.plan', { 'aria-live': 'polite' });
   /** The person's choice to show or hide the steps; null follows the run (hidden once finished). */
   private planOpen: boolean | null = null;
+  /** Every step shown, not only the one in progress and the next few (the finished ones fold into one line). */
+  private planAll = false;
+  /** What the agent is doing now, shown under the step in progress. */
+  private readonly planActivity = h('span.plan-activity');
   private current: { box: HTMLElement; text: string; body: HTMLElement } | null = null;
   private thinking: { box: HTMLElement; text: string } | null = null;
   /** A tool call being written, shown as it streams until the call is whole. */
@@ -210,6 +217,8 @@ export class ChatPane {
 
   setBusy(busy: boolean): void {
     this.busy = busy;
+    // A new run: the last run's last tool is not what the agent does now.
+    if (busy) this.setActivity('');
     if (this.currentPlan) this.showPlan(this.currentPlan, busy);
     this.input.placeholder = busy ? 'Message the agent while it works…  (it reads it at its next step)' : 'Ask bot.computer…  (/help for commands)';
     this.updateSend();
@@ -254,7 +263,8 @@ export class ChatPane {
   /** Straight to the top (the newest), following it from there. */
   private toTop(): void {
     this.stick = true;
-    this.log.scrollTop = 0;
+    const still = typeof matchMedia === 'function' && matchMedia('(prefers-reduced-motion: reduce)').matches;
+    this.log.scrollTo({ top: 0, behavior: still ? 'auto' : 'smooth' });
     this.toCurrent.hidden = true;
   }
 
@@ -281,7 +291,12 @@ export class ChatPane {
     this.scroll();
   }
 
-  /** Show the checklist: the goal, progress, and each step's state. */
+  /**
+   * Show the checklist: the goal, progress, and the steps. While it runs, the
+   * finished steps fold into one line and only the next few are listed, so the
+   * list stays short and the log below keeps its room; "show all" lists every
+   * step.
+   */
   showPlan(plan: Plan | null, running = this.busy): void {
     clear(this.planBox);
     if (!plan) {
@@ -306,14 +321,60 @@ export class ChatPane {
       h('span.plan-count', `${done}/${total}`),
     );
     const bar = h('div.plan-bar', h('span', { style: `width:${Math.round((done / total) * 100)}%` }));
-    const list = h(
-      'ol.plan-items',
-      ...plan.items.map((item) =>
-        h(`li.plan-item.${item.status}`, { class: item.status === 'active' && running ? 'running' : '' }, h('span.plan-mark', { 'aria-label': item.status }, item.status === 'done' ? '✓' : item.status === 'active' ? '' : ''), h('span.plan-text', item.text)),
-      ),
-    );
+    const toggle = (label: string, title: string) => h('li.plan-fold', h('button', { title, onclick: () => {
+      this.planAll = !this.planAll;
+      this.showPlan(plan, running);
+    } }, label));
+    const current = plan.items.findIndex((i) => i.status === 'active');
+    const last = current < 0 ? -1 : current + PLAN_UPCOMING;
+    const all = this.planAll || finished;
+    const rows: HTMLElement[] = [];
+    let hiddenLater = 0;
+    plan.items.forEach((item, i) => {
+      if (!all && item.status === 'done') return;
+      if (!all && current >= 0 && i > last && item.status !== 'active') {
+        hiddenLater++;
+        return;
+      }
+      const active = item.status === 'active';
+      rows.push(h(
+        `li.plan-item.${item.status}`,
+        { class: active && running ? 'running' : '' },
+        h('span.plan-mark', { 'aria-label': item.status }, item.status === 'done' ? '✓' : ''),
+        h('span.plan-body', h('span.plan-text', `${i + 1}. ${item.text}`), ...(active && running ? [this.planActivity] : [])),
+      ));
+    });
+    if (!all && done) rows.unshift(toggle(`✓ ${done} step${done > 1 ? 's' : ''} done`, 'Show every step'));
+    if (!all && hiddenLater) rows.push(toggle(`+${hiddenLater} more`, 'Show every step'));
+    if (this.planAll && !finished) rows.push(toggle('Show less', 'Show only the step in progress and the next ones'));
+    const list = h('ol.plan-items', ...rows);
     list.hidden = !open;
     this.planBox.append(head, bar, list);
+  }
+
+  /** What the agent is doing now, under the step in progress. */
+  private setActivity(text: string): void {
+    this.planActivity.textContent = text;
+  }
+
+  /**
+   * Marks in the log where the plan moved: a new plan, a step started or
+   * finished, the steps changed. The log reads newest first, so each step's
+   * work sits above the mark where it started.
+   */
+  private planMarks(before: Plan | null, after: Plan): void {
+    const fresh = !before || (!!after.goal && !!before.goal && after.goal !== before.goal);
+    const { done, started } = planChanges(before, after);
+    const n = after.items.length;
+    const mark = (cls: string, icon: string, text: string) => {
+      this.current = null;
+      this.add(h(`div.msg.step${cls}`, h('span.step-icon', icon), h('span.step-text', text)));
+    };
+    if (fresh) mark('.plan-made', '☰', `Plan: ${after.goal || `${n} steps`}${after.goal ? ` (${n} steps)` : ''}`);
+    else if (after.items.map((i) => i.text).join('\n') !== before.items.map((i) => i.text).join('\n')) mark('.plan-changed', '✎', `Plan changed: now ${n} steps`);
+    for (const i of done) mark('.done', '✓', `Step ${i + 1} of ${n} done: ${after.items[i].text}`);
+    for (const i of started) mark('.started', '▶', `Step ${i + 1} of ${n}: ${after.items[i].text}`);
+    if (done.length || started.length || fresh) this.scroll();
   }
 
   private currentPlan: Plan | null = null;
@@ -323,6 +384,8 @@ export class ChatPane {
     this.hiddenTurns = [];
     this.taskRows.clear();
     this.currentPlan = null;
+    this.planAll = false;
+    this.setActivity('');
     this.showPlan(null);
     for (const m of this.media.splice(0)) m.dispose();
     clear(this.log);
@@ -709,6 +772,7 @@ export class ChatPane {
         this.draft?.box.remove();
         this.draft = null;
         this.setStatus(`running ${e.call.name}…`);
+        if (e.call.name !== 'update_plan') this.setActivity(`${e.call.name} ${summarizeCall(e.call)}`.trim());
         this.toolCard(e.call);
         break;
       case 'tool_result':
@@ -724,7 +788,11 @@ export class ChatPane {
         this.checkCard(e);
         break;
       case 'plan':
-        if (this.currentPlan?.goal !== e.plan.goal) this.planOpen = null;
+        if (this.currentPlan?.goal !== e.plan.goal) {
+          this.planOpen = null;
+          this.planAll = false;
+        }
+        this.planMarks(this.currentPlan, e.plan);
         this.currentPlan = e.plan;
         this.showPlan(e.plan, true);
         break;
@@ -750,6 +818,7 @@ export class ChatPane {
         break;
       case 'done':
         this.current = null;
+        this.setActivity('');
         break;
       case 'error':
         this.system(e.message, 'error');
@@ -771,6 +840,8 @@ export class ChatPane {
     this.clearLog();
     const from = pageStart(turns, latest);
     this.hiddenTurns = turns.slice(0, from);
+    // The plan the turns drawn change (one step at a time, maybe) is the one the older turns left.
+    this.currentPlan = planAfter(this.hiddenTurns);
     this.drawTurns(turns.slice(from));
     this.showOlder();
     this.log.scrollTop = 0;
@@ -799,6 +870,8 @@ export class ChatPane {
     const page = this.hiddenTurns.slice(from);
     this.hiddenTurns = this.hiddenTurns.slice(0, from);
     const live = { current: this.current, thinking: this.thinking, draft: this.draft, plan: this.currentPlan, planOpen: this.planOpen };
+    // The page's marks follow the plan as it was then, not as it is now.
+    this.currentPlan = planAfter(this.hiddenTurns);
     this.sink = h('div');
     try {
       this.drawTurns(page, false);
@@ -840,7 +913,9 @@ export class ChatPane {
           this.toolCard(call);
           if (call.name === 'update_plan') {
             try {
-              this.currentPlan = readPlan(call.input);
+              const next = settlePlan(readPlan(call.input, this.currentPlan));
+              this.planMarks(this.currentPlan, next);
+              this.currentPlan = next;
             } catch {
               /* a plan the tool refused */
             }

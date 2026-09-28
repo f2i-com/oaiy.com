@@ -1,5 +1,6 @@
 import './styles.css';
 import { Agent } from './agent/agent';
+import { planAfter } from './agent/tools';
 import type { ProviderConfig } from './agent/providers/types';
 import { HELP, internetCommand } from './commands';
 import { NetGate } from './gate/netgate';
@@ -302,6 +303,8 @@ async function main(): Promise<void> {
       },
     });
     agent.turns = await project.loadChat();
+    // The plan goes on where the saved conversation left it.
+    agent.plan = planAfter(agent.turns);
     announce();
     // The first project is open: the page is usable from here on.
     header.inert = false;
