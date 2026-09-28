@@ -1150,6 +1150,14 @@ export interface NewAppointment {
   source?: string;
 }
 
+export interface CalendarSync {
+  linked: boolean;
+  at: string | null;
+  pulled: number;
+  pushed: number;
+  error: string | null;
+}
+
 export const calendar = {
   get: (from?: string, to?: string) =>
     request<{ settings: CalendarSettings; appointments: Appointment[]; now: string }>(
@@ -1164,6 +1172,9 @@ export const calendar = {
   update: (id: string, change: Partial<Pick<Appointment, 'status' | 'start' | 'minutes' | 'service' | 'name' | 'phone' | 'notes'>>) =>
     request<Appointment>(`/api/calendar/appointments/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(change) }),
   remove: (id: string) => request<void>(`/api/calendar/appointments/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  /** How the last FormLogic sync went (`linked` false when this desktop is not linked). */
+  syncStatus: () => request<CalendarSync>('/api/calendar/sync'),
+  syncNow: () => request<CalendarSync>('/api/calendar/sync', { method: 'POST' }),
   /** Text someone through the phone (Aokie). */
   text: (to: string, body: string) =>
     request<unknown>('/api/bridge/connectors/aokie/request', {

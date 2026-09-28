@@ -1207,6 +1207,8 @@ pub async fn serve(
     let pairing_for_auth = bridge.pairing.clone();
     let companion_routes =
         crate::companion::routes::router(companion.clone(), companion_upstream.clone());
+    // The calendar syncs with FormLogic while this desktop is linked to it.
+    crate::calendar::sync::spawn(link.clone());
     let link_routes = crate::link::routes::router(link);
     // Calls answered by the agent: the app's side here, Aokie's on the voice gateway (17872).
     let voice = {

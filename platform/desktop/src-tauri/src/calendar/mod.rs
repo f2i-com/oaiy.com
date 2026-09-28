@@ -14,6 +14,7 @@
 //! keeps them.
 
 pub mod routes;
+pub mod sync;
 
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
@@ -446,6 +447,23 @@ impl Calendar {
             }
             a.updated_at = now_rfc3339();
             Ok(a.clone())
+        })
+    }
+
+    /// Record that the appointment is in step with FormLogic's record `remote_id`
+    /// (its `updatedAt` then), and the call's ids when FormLogic knew them. Not
+    /// a change of the appointment: its `updatedAt` stays as it is.
+    pub fn mark_synced(&self, id: &str, remote_id: &str, remote_updated_at: &str, request_id: Option<String>, call_id: Option<String>) -> Result<(), String> {
+        self.with(|book| {
+            let a = book.appointments.iter_mut().find(|a| a.id == id).ok_or_else(|| format!("no appointment {id}"))?;
+            a.formlogic = Some(serde_json::json!({ "id": remote_id, "updatedAt": remote_updated_at, "syncedAt": a.updated_at }));
+            if request_id.is_some() && a.request_id.is_none() {
+                a.request_id = request_id;
+            }
+            if call_id.is_some() && a.call_id.is_none() {
+                a.call_id = call_id;
+            }
+            Ok(())
         })
     }
 

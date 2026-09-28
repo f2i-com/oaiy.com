@@ -8,6 +8,8 @@
 //!   PATCH  /api/calendar/appointments/:id                  → the appointment, changed
 //!   DELETE /api/calendar/appointments/:id                  → 204
 //!   POST   /api/calendar/lookup {question, from}            → {digest} (what the phone is told)
+//!   GET    /api/calendar/sync                               → how the last FormLogic sync went
+//!   POST   /api/calendar/sync                               → sync now
 
 use axum::extract::{Path, Query};
 use axum::http::StatusCode;
@@ -43,6 +45,18 @@ pub fn router() -> Router {
         .route("/api/calendar/appointments", post(create))
         .route("/api/calendar/appointments/:id", patch(update).delete(remove))
         .route("/api/calendar/lookup", post(lookup))
+        .route("/api/calendar/sync", get(sync_status).post(sync_now))
+}
+
+async fn sync_status() -> Response {
+    Json(super::sync::last()).into_response()
+}
+
+async fn sync_now() -> Response {
+    match tokio::task::spawn_blocking(super::sync::now).await {
+        Ok(report) => Json(report).into_response(),
+        Err(e) => fail(StatusCode::INTERNAL_SERVER_ERROR, "sync_failed", &e.to_string()),
+    }
 }
 
 #[derive(Deserialize)]

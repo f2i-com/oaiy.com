@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { CalendarPlus, Check, ChevronLeft, ChevronRight, MessageSquare, Phone, Plus, RefreshCw, Trash2, X } from 'lucide-react';
-import { calendar, type Appointment, type AppointmentStatus, type CalendarService, type CalendarSettings, type NewAppointment } from './api';
+import { calendar, type Appointment, type AppointmentStatus, type CalendarService, type CalendarSettings, type CalendarSync, type NewAppointment } from './api';
 import { useToast } from './Toasts';
 
 /**
@@ -44,6 +44,12 @@ function sayWhen(start: string): string {
   return `${DAYS[(d.getDay() + 6) % 7]} ${d.getDate()} ${d.toLocaleString(undefined, { month: 'short' })}, ${sayTime(time ?? '00:00')}`;
 }
 
+/** "just now", "3 min ago". */
+function ago(iso: string): string {
+  const s = Math.max(0, (Date.now() - new Date(iso).getTime()) / 1000);
+  return s < 45 ? 'just now' : s < 3600 ? `${Math.round(s / 60)} min ago` : `${Math.round(s / 3600)} h ago`;
+}
+
 const STATUS_LABEL: Record<AppointmentStatus, string> = {
   requested: 'requested',
   confirmed: 'confirmed',
@@ -66,6 +72,8 @@ export default function CalendarPanel() {
   const [error, setError] = useState<string | null>(null);
   const [open, setOpen] = useState<Appointment | null>(null);
   const [adding, setAdding] = useState<Partial<NewAppointment> | null>(null);
+  const [sync, setSync] = useState<CalendarSync | null>(null);
+  const [syncing, setSyncing] = useState(false);
 
   const refresh = useCallback(async () => {
     try {
@@ -73,6 +81,7 @@ export default function CalendarPanel() {
       setSettings((s) => s ?? wk.settings);
       setAppointments(wk.appointments);
       setRequests(all.appointments.filter((a) => a.status === 'requested'));
+      setSync(await calendar.syncStatus().catch(() => null));
       setError(null);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -152,6 +161,26 @@ export default function CalendarPanel() {
         <button className="btn-tiny" onClick={() => void refresh()} title="Refresh now">
           <RefreshCw size={13} />
         </button>
+        {sync?.linked && (
+          <span className={`cal-sync${sync.error ? ' cal-sync-err' : ''}`} title={sync.error ?? `Last sync: ${sync.pulled} in, ${sync.pushed} out`}>
+            {sync.error ? 'FormLogic sync failed' : sync.at ? `Synced with FormLogic ${ago(sync.at)}` : 'Syncs with FormLogic'}
+            <button
+              className="btn-tiny"
+              disabled={syncing}
+              onClick={async () => {
+                setSyncing(true);
+                try {
+                  setSync(await calendar.syncNow());
+                  await refresh();
+                } finally {
+                  setSyncing(false);
+                }
+              }}
+            >
+              {syncing ? 'Syncing…' : 'Sync now'}
+            </button>
+          </span>
+        )}
         <button className="btn btn-primary" onClick={() => setAdding({ date: today })}>
           <CalendarPlus size={14} /> New appointment
         </button>

@@ -1763,3 +1763,6 @@ select:disabled { cursor: not-allowed; opacity: 0.5; }
 .cal-hours-row { display: grid; grid-template-columns: 150px 120px auto 120px; align-items: center; gap: 8px; }
 .cal-services { display: grid; gap: 6px; }
 .cal-service-row { display: grid; grid-template-columns: 1.4fr 80px auto 1fr 1.6fr auto; align-items: center; gap: 8px; }
+
+.cal-sync { display: inline-flex; align-items: center; gap: 8px; color: var(--muted); font-size: 12px; }
+.cal-sync-err { color: var(--danger); }
