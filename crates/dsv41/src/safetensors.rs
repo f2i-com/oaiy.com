@@ -241,6 +241,10 @@ fn index_shard(
         }
         let bad = |what: &str| Error::Format(format!("tensor {name}: {what}"));
         let tag = v.get("dtype").and_then(Json::as_str).ok_or_else(|| bad("missing dtype"))?;
+        // Complex buffers (precomputed RoPE phases, say) are left out: nothing reads them.
+        if tag == "C64" || tag == "C128" {
+            continue;
+        }
         let dtype = Dtype::parse(tag).ok_or_else(|| bad(&format!("unsupported dtype {tag}")))?;
         let dims = v.get("shape").and_then(Json::as_array).ok_or_else(|| bad("missing shape"))?;
         let mut shape = Vec::with_capacity(dims.len());

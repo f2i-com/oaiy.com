@@ -9,7 +9,7 @@
     "port": 8080,
     "api_key": "",
     "public_url": "",
-    "routes_version": 6,
+    "routes_version": 7,
     "routes": [
       {
         "path": "/v1/chat/completions",
@@ -78,6 +78,13 @@
         "path": "/v1/audio/sound_effects",
         "method": "POST",
         "target": "sound",
+        "spec": "openai",
+        "enabled": true
+      },
+      {
+        "path": "/v1/3d/models",
+        "method": "POST",
+        "target": "model3d",
         "spec": "openai",
         "enabled": true
       },
@@ -228,6 +235,20 @@
       "models": {
         "moss-soundeffect": {
           "path": "models/MOSS-SoundEffect-v2.0",
+          "enabled": true
+        }
+      }
+    },
+    "model3d": {
+      "enabled": true,
+      "default_model": "pixal3d",
+      "models": {
+        "pixal3d": {
+          "path": "models/Pixal3D",
+          "dino": "models/dinov3-vitl16",
+          "naf": "models/NAF/naf_release.pth",
+          "resolution": 1024,
+          "faces": 200000,
           "enabled": true
         }
       }

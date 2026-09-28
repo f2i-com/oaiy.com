@@ -52,6 +52,15 @@ fn operations(target: &str, spec: &str, path: &str) -> Vec<Json> {
             sub("POST", format!("{path}/{{id}}/cancel"), "stop a job"),
             sub("DELETE", format!("{path}/{{id}}"), "forget a job (files stay on disk)"),
         ],
+        ("model3d", _) => vec![
+            sub("POST", path.into(), "create a 3D model job from a picture (JSON: image (a data: URL of an object on a plain or transparent background), resolution 1024 | 1536, faces 1000-2000000 (default 200000), fov_degrees, seed)"),
+            sub("GET", path.into(), "list 3D model jobs"),
+            sub("GET", format!("{path}/{{id}}"), "poll a job: status queued | in_progress | completed | failed, progress 0-100"),
+            sub("GET", format!("{path}/{{id}}/content"), "download the model: a GLB (glTF 2.0) with PBR materials"),
+            sub("GET", format!("{path}/{{id}}/input"), "the picture as it was cut out (PNG)"),
+            sub("POST", format!("{path}/{{id}}/cancel"), "stop a job"),
+            sub("DELETE", format!("{path}/{{id}}"), "forget a job (files stay on disk)"),
+        ],
         ("voices", _) => vec![
             sub("GET", path.into(), "list saved voices"),
             sub("POST", path.into(), "design and save a voice (JSON: name, description, sample_text?, language?, seed?)"),
@@ -67,7 +76,7 @@ fn describe(target: &str) -> &'static str {
     match target {
         "chat" => "chat completions, streamed as server-sent events with stream: true",
         "completions" => "raw text completions",
-        "models" => "model list; each entry has type llm | image | video | speech | music | sound",
+        "models" => "model list; each entry has type llm | image | video | speech | music | sound | model3d",
         "images" => "text-to-image; add images: [{image_url}] to edit",
         "edits" => "image edits: multipart (image, prompt) or JSON with images",
         "videos" => "text/image-to-video",
@@ -75,6 +84,7 @@ fn describe(target: &str) -> &'static str {
         "voices" => "saved voices: design one from a description, then speak in it by name",
         "music" => "songs with vocals and instruments from lyrics and a description, as asynchronous jobs",
         "sound" => "sound effects (ambience, creatures, machines, actions) from a description, up to 30 seconds, as asynchronous jobs",
+        "model3d" => "3D models (GLB, with PBR materials) from a picture of an object, as asynchronous jobs",
         "files" => "generated media",
         "health" => "liveness, no key needed",
         "discovery" => "this document",
@@ -235,6 +245,24 @@ pub fn document(studio: &Studio, base: &str, authorized: bool) -> Json {
             ])
         })
         .collect();
+    let model3d = section("model3d");
+    let model3d_default = effective(model3d);
+    let model3d_models: Vec<Json> = names(model3d)
+        .into_iter()
+        .map(|(name, m)| {
+            let has = |k: &str| !str_or(&m, k, "").trim().is_empty();
+            Json::obj([
+                ("id", Json::str(&name)),
+                ("default", Json::Bool(name == model3d_default)),
+                ("format", Json::str("glb")),
+                ("resolutions", Json::Arr(vec![Json::Int(1024), Json::Int(1536)])),
+                ("faces", Json::Int(int_or(&m, "faces", crate::model3d::DEFAULT_FACES))),
+                ("input", Json::str("a picture of one object on a plain or transparent background")),
+                ("ready", Json::Bool(has("path") && has("dino") && has("naf"))),
+                ("license", Json::str("MIT (Pixal3D); DINOv3 under Meta's DINOv3 License")),
+            ])
+        })
+        .collect();
     let models_for = |target: &str| -> Vec<Json> {
         let ids = |list: &[Json]| list.iter().filter_map(|m| m.get("id").cloned()).collect::<Vec<_>>();
         match target {
@@ -247,6 +275,7 @@ pub fn document(studio: &Studio, base: &str, authorized: bool) -> Json {
             "voices" => ids(&speech_models),
             "music" => ids(&music_models),
             "sound" => ids(&sound_models),
+            "model3d" => ids(&model3d_models),
             _ => Vec::new(),
         }
     };
@@ -277,7 +306,7 @@ pub fn document(studio: &Studio, base: &str, authorized: bool) -> Json {
             if target == "speech" || target == "voices" {
                 e.push(("voices".into(), Json::Arr(voices.iter().filter_map(|v| v.get("name").cloned()).collect())));
             }
-            if !models.is_empty() || matches!(target, "chat" | "completions" | "images" | "edits" | "videos" | "speech" | "music" | "sound") {
+            if !models.is_empty() || matches!(target, "chat" | "completions" | "images" | "edits" | "videos" | "speech" | "music" | "sound" | "model3d") {
                 e.push(("models".into(), Json::Arr(models)));
             }
             Json::Obj(e)
@@ -288,7 +317,7 @@ pub fn document(studio: &Studio, base: &str, authorized: bool) -> Json {
         ("endpoints".into(), Json::Arr(endpoints)),
         (
             "models".into(),
-            Json::obj([("llm", Json::Arr(llm_models)), ("image", Json::Arr(image_models)), ("video", Json::Arr(video_models)), ("speech", Json::Arr(speech_models)), ("music", Json::Arr(music_models)), ("sound", Json::Arr(sound_models))]),
+            Json::obj([("llm", Json::Arr(llm_models)), ("image", Json::Arr(image_models)), ("video", Json::Arr(video_models)), ("speech", Json::Arr(speech_models)), ("music", Json::Arr(music_models)), ("sound", Json::Arr(sound_models)), ("model3d", Json::Arr(model3d_models))]),
         ),
         (
             "defaults".into(),
@@ -299,6 +328,7 @@ pub fn document(studio: &Studio, base: &str, authorized: bool) -> Json {
                 ("speech", Json::str(&speech_default)),
                 ("music", Json::str(&music_default)),
                 ("sound", Json::str(&sound_default)),
+                ("model3d", Json::str(&model3d_default)),
             ]),
         ),
         (
@@ -345,5 +375,44 @@ mod tests {
         assert_eq!(ops[3].get("path").and_then(Json::as_str), Some("/v1/videos/{id}/content"));
         assert_eq!(operations("images", "nrob", "/nrob/images")[1].get("path").and_then(Json::as_str), Some("/nrob/images/status"));
         assert!(operations("chat", "openai", "/v1/chat/completions").is_empty());
+        let ops = operations("model3d", "openai", "/v1/3d/models");
+        let paths: Vec<&str> = ops.iter().filter_map(|o| o.get("path").and_then(Json::as_str)).collect();
+        assert!(paths.contains(&"/v1/3d/models/{id}/content") && paths.contains(&"/v1/3d/models/{id}/input"));
+    }
+
+    #[test]
+    fn a_3d_model_is_listed_with_its_endpoint_and_default() {
+        let root = std::env::temp_dir().join(format!("nrob-studio-discovery-{}", std::process::id()));
+        let mut cfg = crate::config::default_json();
+        let model3d = crate::registry::obj_mut(&mut cfg, &["media", "model3d"]).unwrap();
+        crate::util::set(model3d, "models", Json::parse(br#"{"pixal3d":{"path":"P","dino":"D","naf":"N.pth"},"half":{"path":"P"}}"#).unwrap());
+        crate::util::set(model3d, "default_model", Json::str("pixal3d"));
+        let studio = crate::Studio {
+            config_path: root.join("nrob-studio.json"),
+            root: root.clone(),
+            config: std::sync::RwLock::new(cfg),
+            llm: std::sync::Arc::new(crate::llm::Llm::new()),
+            media: std::sync::Arc::new(crate::media::Media::new()),
+            system: crate::system::System::new(),
+            log: std::sync::Arc::new(crate::util::LogRing::new(10)),
+            ui_url: std::sync::RwLock::new(String::new()),
+            gateway_url: std::sync::RwLock::new(String::new()),
+            restart_required: std::sync::RwLock::new(false),
+            saving: std::sync::Mutex::new(()),
+            port_overrides: (None, None),
+        };
+        let doc = document(&studio, "http://127.0.0.1:8080", true);
+        let listed = doc.get("models").and_then(|m| m.get("model3d")).and_then(Json::as_array).unwrap();
+        let by_id = |id: &str| listed.iter().find(|m| m.get("id").and_then(Json::as_str) == Some(id)).unwrap();
+        assert_eq!(by_id("pixal3d").get("ready"), Some(&Json::Bool(true)));
+        assert_eq!(by_id("pixal3d").get("default"), Some(&Json::Bool(true)));
+        assert_eq!(by_id("pixal3d").get("format").and_then(Json::as_str), Some("glb"));
+        assert_eq!(by_id("half").get("ready"), Some(&Json::Bool(false)), "no DINOv3 or NAF yet");
+        assert_eq!(doc.get("defaults").and_then(|d| d.get("model3d")).and_then(Json::as_str), Some("pixal3d"));
+        let endpoint = doc.get("endpoints").and_then(Json::as_array).unwrap().iter().find(|e| e.get("name").and_then(Json::as_str) == Some("model3d")).unwrap();
+        assert_eq!(endpoint.get("method").and_then(Json::as_str), Some("POST"));
+        assert_eq!(endpoint.get("url").and_then(Json::as_str), Some("http://127.0.0.1:8080/v1/3d/models"));
+        assert_eq!(endpoint.get("models").map(Json::len), Some(2));
+        assert_eq!(endpoint.get("operations").map(Json::len), Some(7));
     }
 }

@@ -57,6 +57,12 @@ fn run() -> candle_core::Result<()> {
         writeln!(std::io::stdout(), "{}", result.to_json())?;
         return Ok(());
     }
+    if j.get("kind").and_then(Json::as_str) == Some("model3d") {
+        let r = nrob_diffusion::model3d::Request::parse(&j).map_err(candle_core::Error::Msg)?;
+        let result = nrob_diffusion::model3d::generate(&r, |event| eprintln!("{}", event.to_json()))?;
+        println!("{}", result.to_json());
+        return Ok(());
+    }
     if j.get("kind").and_then(Json::as_str) == Some("sound") {
         let r = nrob_diffusion::sound::Request::parse(&j).map_err(candle_core::Error::Msg)?;
         configure_cache(&r.output)?;

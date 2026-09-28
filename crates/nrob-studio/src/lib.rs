@@ -24,6 +24,7 @@ mod media;
 mod music;
 mod multipart;
 mod registry;
+mod model3d;
 mod sound;
 mod speech;
 mod system;

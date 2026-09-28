@@ -28,6 +28,8 @@ pub enum Kind {
     Music,
     /// Sound effects from a description.
     Sound,
+    /// A 3D model from a picture.
+    Model3d,
 }
 
 impl Kind {
@@ -38,6 +40,7 @@ impl Kind {
             Kind::Speech => "speech",
             Kind::Music => "music",
             Kind::Sound => "sound",
+            Kind::Model3d => "model3d",
         }
     }
 }
@@ -110,7 +113,7 @@ impl Job {
             ("seconds", match self.kind {
                 Kind::Video => Json::Num(self.clip_seconds()),
                 Kind::Speech | Kind::Music | Kind::Sound => self.result.get("duration").cloned().unwrap_or(Json::Null),
-                Kind::Image => Json::Null,
+                Kind::Image | Kind::Model3d => Json::Null,
             }),
             // What a viewer needs to reproduce it; never paths or references.
             ("settings", Json::obj(["seed", "steps", "memory", "cfg", "negative_prompt", "fps", "frames", "lyrics"].map(|k| (k, self.request.get(k).cloned().unwrap_or(Json::Null))))),
@@ -492,7 +495,7 @@ pub fn image_request(cfg: &Json, root: &Path, output_root: &Path, body: &Json, a
 
 /// Decode an `input_reference` / `image` value (a `data:` URL, or a local path
 /// when `allow_local`) into a file the worker can read.
-fn reference_image(value: &Json, output_root: &Path, allow_local: bool) -> Result<Option<String>, String> {
+pub(crate) fn reference_image(value: &Json, output_root: &Path, allow_local: bool) -> Result<Option<String>, String> {
     let text = match value {
         Json::Null => return Ok(None),
         Json::Str(s) => s.clone(),
@@ -929,6 +932,15 @@ fn progress_of(kind: Kind, n: usize, e: &Json) -> Option<(f64, String)> {
         (Kind::Sound, "generating_sound") if i("total") > 0.0 => 10.0 + 85.0 * i("current") / i("total"),
         (Kind::Sound, "decoding_sound") => 96.0,
         (Kind::Sound, _) => 2.0,
+        (Kind::Model3d, "preparing_image") => 1.0,
+        (Kind::Model3d, "encoding_image") => 3.0 + 3.0 * i("current"),
+        (Kind::Model3d, "making_structure") if i("total") > 0.0 => 10.0 + 12.0 * i("current") / i("total"),
+        (Kind::Model3d, "making_shape") if i("total") > 0.0 => 22.0 + 40.0 * i("current") / i("total"),
+        (Kind::Model3d, "making_texture") if i("total") > 0.0 => 62.0 + 20.0 * i("current") / i("total"),
+        (Kind::Model3d, "decoding") => 80.0 + 5.0 * i("current"),
+        // Remeshing, simplifying, then unwrapping and baking the textures: about 40 s on the CPU.
+        (Kind::Model3d, "meshing") if i("total") > 0.0 => 85.0 + 14.0 * i("current") / i("total"),
+        (Kind::Model3d, _) => 1.0,
     };
     Some((p, stage))
 }
@@ -960,6 +972,7 @@ impl Media {
                 Kind::Speech => "speech_",
                 Kind::Music => "music_",
                 Kind::Sound => "sfx_",
+                Kind::Model3d => "m3d_",
             }),
             kind,
             status: "queued".into(),
@@ -1195,7 +1208,7 @@ impl Media {
                         j.files = match j.kind {
                             Kind::Image => result.get("data").and_then(Json::as_array).unwrap_or(&[]).iter()
                                 .filter_map(|d| d.get("path").and_then(Json::as_str)).map(PathBuf::from).collect(),
-                            Kind::Video | Kind::Speech | Kind::Sound => result.get("path").and_then(Json::as_str).map(PathBuf::from).into_iter().collect(),
+                            Kind::Video | Kind::Speech | Kind::Sound | Kind::Model3d => result.get("path").and_then(Json::as_str).map(PathBuf::from).into_iter().collect(),
                             // A song; a smaller copy of the model is not a file to show.
                             Kind::Music => result.get("path").and_then(Json::as_str).map(PathBuf::from).filter(|p| p.extension().is_some_and(|e| e == "wav")).into_iter().collect(),
                         };
@@ -1203,6 +1216,8 @@ impl Media {
                             Kind::Image => j.files.first().cloned(),
                             Kind::Video => result.get("preview").and_then(Json::as_str).map(PathBuf::from),
                             Kind::Speech | Kind::Music | Kind::Sound => None,
+                            // The picture as it was cut out.
+                            Kind::Model3d => result.get("input").and_then(Json::as_str).map(PathBuf::from),
                         };
                         j.result = result;
                     }

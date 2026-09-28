@@ -88,6 +88,12 @@ Every token is a small, well-planned job:
   audio endpoints, and an LTX clip can follow that speech, or any audio file,
   with mouths moving to it.
 
+- **Native Rust 3D models from a picture.** Pixal3D (TRELLIS.2's cascade with
+  pixel-aligned conditioning, with DINOv3 and NAF) turns a picture of one object
+  into a textured GLB in about 95 seconds on an RTX 5090. The mesh is closed and
+  simplified, and its colours are baked into PBR textures, ready for three.js,
+  game engines and 3D printing slicers ([3D models](docs/MODEL3D.md)).
+
 - **DeepSeek-V4.1-Flash from safetensors, end to end.** The checkpoint's shards are
   indexed in place (51 ms, headers only) and each expert is served with two positioned
   reads. Hybrid CPU/GPU decode across two GPUs, per-GPU VRAM expert caches, an AVX-512
@@ -339,9 +345,9 @@ crates/
   nrob-server/   OpenAI-compatible HTTP server for DeepSeek-V4.1 (std-only)
   nrob-studio/   portable host (std-only): supervises nrob-server and nrob-diffusion,
                  control UI, configurable OpenAI-style gateway, model detection
-  nrob-diffusion/ image, video, speech, music and sound worker (Candle): Qwen Image,
+  nrob-diffusion/ image, video, speech, music, sound and 3D worker (Candle): Qwen Image,
                  SDXL, LTX, Qwen3-TTS, Breeze TTS 2, MiniMax Music 3,
-                 MOSS-SoundEffect, with
+                 MOSS-SoundEffect, Pixal3D, with
                  SSD/RAM/GPU block residency
   ggml-rs-wgpu/  WebGPU backend: quantized GGUF matmuls in WGSL, the rest on the CPU
   gguf, ggml-quants, ggml-rs, ggml-rs-cuda, tokenizer, llama-rs

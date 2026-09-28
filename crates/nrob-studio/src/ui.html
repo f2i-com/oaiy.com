@@ -297,6 +297,12 @@ pre.example { background: var(--well); border: 1px solid var(--line); border-rad
 .sp-item { border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; display: grid; gap: 8px; background: var(--panel); }
 .sp-item .t { font-size: 14px; line-height: 1.45; }
 .sp-item audio { width: 100%; }
+.m3d-item { grid-template-columns: 160px minmax(0, 1fr); align-items: start; }
+.m3d-item img { width: 160px; height: 160px; object-fit: contain; border-radius: 8px; background: var(--panel-2); }
+.m3d-item dl { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 4px 12px; margin: 0; font-size: 13px; }
+.m3d-item dt { color: var(--muted); }
+.m3d-item dd { margin: 0; }
+@media (max-width: 520px) { .m3d-item { grid-template-columns: 1fr; } }
 .sp-voices { display: grid; gap: 6px; }
 .sp-voice { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; font-size: 13px; min-width: 0; }
 .sp-voice .d { color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1 1 120px; min-width: 0; }
@@ -461,6 +467,7 @@ dialog::backdrop { background: var(--backdrop); }
           <button role="tab" aria-selected="false" data-tab="speech"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0014 0M12 18v3"/></svg>Speech</button>
           <button role="tab" aria-selected="false" data-tab="music"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>Music</button>
           <button role="tab" aria-selected="false" data-tab="sound"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M11 5L6 9H3v6h3l5 4z"/><path d="M15.5 8.5a5 5 0 010 7M18.5 5.5a9 9 0 010 13"/></svg>Sound</button>
+          <button role="tab" aria-selected="false" data-tab="model3d"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l8 4.5v9L12 21l-8-4.5v-9z"/><path d="M4 7.5l8 4.5 8-4.5M12 12v9"/></svg>3D</button>
           <button role="tab" aria-selected="false" data-tab="video"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="6" width="13" height="12" rx="2"/><path d="M16 10l5-3v10l-5-3z"/></svg>Video</button>
         </div>
       </div>
@@ -582,6 +589,38 @@ dialog::backdrop { background: var(--backdrop); }
         </form>
       </div>
 
+      <div data-panel="model3d" hidden>
+        <form class="bench" id="m3d-form">
+          <div class="controls">
+            <div class="scroll">
+              <input type="file" id="m3d-image" accept="image/png,image/jpeg,image/webp" hidden>
+              <div class="dropzone" id="m3d-drop" tabindex="0" role="button" aria-label="Drop a picture of one object here, or click to choose">
+                <span id="m3d-drop-label">Drop a picture of one object here, or click to choose</span>
+                <div class="thumbs" id="m3d-ref-preview"></div>
+              </div>
+              <div class="grid-f" style="grid-template-columns:repeat(3,minmax(0,1fr))">
+                <label class="f"><span>Resolution</span><select id="m3d-resolution"><option value="1024">1024</option><option value="1536">1536</option></select></label>
+                <label class="f"><span>Faces</span><input type="number" id="m3d-faces" min="1000" max="2000000" step="1" value="200000"></label>
+                <label class="f"><span>Seed</span><input type="number" id="m3d-seed" min="0" placeholder="random"></label>
+              </div>
+              <label class="f"><span>Model</span><select id="m3d-model"></select></label>
+              <p class="muted small" style="margin:0">One object on a plain or transparent background works best; the background is cut away first. The model faces the way the picture does. 1536 gives finer detail and takes longer; faces is the triangle budget of the finished mesh.</p>
+            </div>
+            <div class="go-bar">
+              <button class="btn go" type="submit" id="m3d-go">Generate</button>
+              <span class="muted small">About a minute and a half at 1024 on a fast GPU. The language model is unloaded while it runs.</span>
+            </div>
+          </div>
+          <div class="stagewrap">
+            <div class="stage" id="m3d-stage">
+              <div class="placeholder" id="m3d-empty"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l8 4.5v9L12 21l-8-4.5v-9z"/><path d="M4 7.5l8 4.5 8-4.5M12 12v9"/></svg><strong>3D models appear here</strong><span>Pick a picture of an object and generate. Each model is a GLB (glTF 2.0) with PBR materials, ready for Blender, game engines and web viewers.</span></div>
+              <div class="sp-results" id="m3d-results" hidden></div>
+              <div class="overlay" id="m3d-progress" hidden><div class="spread small"><span id="m3d-progress-text">Starting</span><button class="btn quiet warn" type="button" id="m3d-cancel">Cancel</button></div><div class="meter"><div style="width:0"></div></div></div>
+            </div>
+          </div>
+        </form>
+      </div>
+
       <div data-panel="speech" hidden>
         <form class="bench" id="sp-form">
           <div class="controls">
@@ -678,7 +717,7 @@ dialog::backdrop { background: var(--backdrop); }
       <p class="lede">Recent results from this session (incognito requests are never listed). Click one for its prompt and settings, or to reuse the prompt.</p>
       <div class="chips" id="gallery-filter">
         <button data-f="all" aria-pressed="true">All</button><button data-f="image" aria-pressed="false">Images</button>
-        <button data-f="video" aria-pressed="false">Videos</button><button data-f="speech" aria-pressed="false">Speech</button><button data-f="music" aria-pressed="false">Music</button><button data-f="sound" aria-pressed="false">Sound</button><button data-f="active" aria-pressed="false">In progress</button>
+        <button data-f="video" aria-pressed="false">Videos</button><button data-f="speech" aria-pressed="false">Speech</button><button data-f="music" aria-pressed="false">Music</button><button data-f="sound" aria-pressed="false">Sound</button><button data-f="model3d" aria-pressed="false">3D</button><button data-f="active" aria-pressed="false">In progress</button>
         <button data-f="failed" aria-pressed="false">Failed</button>
       </div>
       <div class="gallery" id="gallery"></div>
@@ -696,7 +735,7 @@ dialog::backdrop { background: var(--backdrop); }
             <button class="btn" id="add-detect">Check</button>
           </div>
           <div id="add-result"></div>
-          <p class="muted small" style="margin:0">Reads GGUF (LLMs, Qwen Image, vision projectors), safetensors (SDXL, Qwen Image, LTX 2.3/2.5, Sulphur, LoRA adapters, text encoders, VAEs), diffusers and EXL3/DeepSeek folders, and tokenizer.json. Pickled .bin/.pt files are refused because loading them can run code.</p>
+          <p class="muted small" style="margin:0">Reads GGUF (LLMs, Qwen Image, vision projectors), safetensors (SDXL, Qwen Image, LTX 2.3/2.5, Sulphur, LoRA adapters, text encoders, VAEs), diffusers and EXL3/DeepSeek folders, Pixal3D and DINOv3 folders (3D models), and tokenizer.json. Pickled .bin/.pt files are refused because loading them can run code; NAF's naf_release.pth is the one exception, read by nrob's own reader, which runs nothing from the file.</p>
         </div>
       </div>
       <div class="block">
@@ -711,6 +750,7 @@ dialog::backdrop { background: var(--backdrop); }
       <div class="block"><div class="spread"><h2>Speech models</h2><span class="muted small">Served on /v1/audio/speech; saved voices on /v1/audio/voices</span></div><div class="list" id="m-speech"></div></div>
       <div class="block"><div class="spread"><h2>Music models</h2><span class="muted small">Served on /v1/audio/music, and on /v1/audio/speech by name</span></div><div class="list" id="m-music"></div></div>
       <div class="block"><div class="spread"><h2>Sound effect models</h2><span class="muted small">Served on /v1/audio/sound_effects</span></div><div class="list" id="m-sound"></div></div>
+      <div class="block"><div class="spread"><h2>3D models</h2><span class="muted small">Served on /v1/3d/models</span></div><div class="list" id="m-model3d"></div></div>
     </section>
 
     <!-- Memory -->
@@ -721,14 +761,14 @@ dialog::backdrop { background: var(--backdrop); }
       <div class="block" id="mem-video"></div>
       <div class="block">
         <h2>Sharing GPUs</h2>
-        <p class="muted small" style="margin-top:0">Which GPUs the language models use, and which one image, video, speech, music and sound effect jobs use. A model can also have GPUs of its own (under Models), e.g. a big one across both.</p>
+        <p class="muted small" style="margin-top:0">Which GPUs the language models use, and which one image, video, speech, music, sound effect and 3D model jobs use. A model can also have GPUs of its own (under Models), e.g. a big one across both.</p>
         <div class="grid-f">
           <label class="f" id="gpu-layout-f"><span>Layout</span><select id="gpu-layout">
             <option value="split">Language model on GPU 0, media on GPU 1</option>
             <option value="llm_all">Language model on every GPU; media pauses it</option>
             <option value="custom">Custom</option></select></label>
           <div class="f"><span class="small muted">Language model GPUs</span><div class="row" id="llm-devices"></div></div>
-          <label class="f"><span>Media GPU (images, video, speech, music, sound effects)</span><select id="media-device"></select></label>
+          <label class="f"><span>Media GPU (images, video, speech, music, sound effects, 3D models)</span><select id="media-device"></select></label>
           <label class="f"><span>When media needs the LLM's GPU</span><select id="llm-policy">
             <option value="auto">Pause the LLM only if they share a GPU</option>
             <option value="pause_llm">Always pause the LLM</option>
@@ -1094,7 +1134,8 @@ $("#pick-path").onkeydown = e => { if (e.key === "Enter") browse($("#pick-path")
 
 /* ---------- add model ---------- */
 const kindName = {llm: "Language model", image: "Image model", video: "Video model", vision_projector: "Vision projector", adapter: "LoRA adapter", image_base: "Qwen Image base folder",
-  text_encoder: "Image text encoder", video_text_encoder: "Video text encoder", vae: "VAE", audio_vae: "Audio VAE", tokenizer: "Gemma tokenizer", clip_tokenizer: "CLIP tokenizer", ffmpeg: "FFmpeg", sound_model: "Sound effect model", speech_breeze: "Speech model"};
+  text_encoder: "Image text encoder", video_text_encoder: "Video text encoder", vae: "VAE", audio_vae: "Audio VAE", tokenizer: "Gemma tokenizer", clip_tokenizer: "CLIP tokenizer", ffmpeg: "FFmpeg", sound_model: "Sound effect model", speech_breeze: "Speech model",
+  model3d: "3D model", model3d_dino: "3D model part: DINOv3", model3d_naf: "3D model part: NAF"};
 async function detectPath() {
   const path = $("#add-path").value.trim(); if (!path) return;
   const out = $("#add-result");
@@ -1110,7 +1151,7 @@ async function detectPath() {
 async function addModel(path, name, target) {
   try {
     const r = await api("/api/models/add", {method: "POST", body: Object.assign({path, name: name || undefined}, target || {})});
-    toast(`${r.enabled ? "Added" : "Added (incomplete)"} ${r.name} to ${r.section === "llm" ? "language models" : r.section + " models"}` + (r.missing.length ? `. Still needs ${r.missing.join(", ")}` : ""));
+    toast(`${r.enabled ? "Added" : "Added (incomplete)"} ${r.name} to ${r.section === "llm" ? "language models" : r.section === "model3d" ? "3D models" : r.section + " models"}` + (r.missing.length ? `. Still needs ${r.missing.join(", ")}` : ""));
     $("#add-result").innerHTML = ""; $("#add-path").value = "";
     await loadConfig();
   } catch (e) { toast(e.message, true); }
@@ -1154,6 +1195,7 @@ function missingOf(section, m) {
   const empty = k => !(m[k] || "").trim();
   if (section === "speech") return empty("design") && empty("base") && empty("breeze") ? ["design"] : [];
   if (section === "music" || section === "sound") return empty("path") ? ["path"] : [];
+  if (section === "model3d") return ["path", "dino", "naf"].filter(empty);
   if (section === "image") return (m.architecture || "qwen-image") === "sdxl" ? ["checkpoint", "tokenizer"].filter(empty)
     : [...(empty("base") ? ["base"] : []), ...(empty("transformer") && empty("safetensors_transformer") ? ["transformer"] : [])];
   return [...["transformer", "text_encoder", "vae"].filter(empty), ...(m.family !== "ltx-2.5" && empty("tokenizer") ? ["tokenizer"] : [])];
@@ -1223,6 +1265,15 @@ function renderModels() {
     const fields = field("MOSS-SoundEffect folder", "sound", name, "path", m.path, {dir: true, missing: !(m.path || "").trim()});
     return mediaItem("sound", name, m, "MOSS-SoundEffect", missingOf("sound", m), fields);
   }).join("") : '<div class="empty">No sound effect model yet. Add the MOSS-SoundEffect-v2.0 folder.</div>';
+
+  const m3d = Object.entries(cfg.media.model3d?.models || {});
+  $("#m-model3d").innerHTML = m3d.length ? m3d.map(([name, m]) => {
+    const miss = missingOf("model3d", m);
+    const fields = field("Pixal3D folder (MIT)", "model3d", name, "path", m.path, {dir: true, missing: miss.includes("path")})
+      + field("DINOv3 ViT-L/16 folder (Meta's DINOv3 License)", "model3d", name, "dino", m.dino, {dir: true, missing: miss.includes("dino")})
+      + field("NAF weights (naf_release.pth, Apache-2.0)", "model3d", name, "naf", m.naf, {missing: miss.includes("naf")});
+    return mediaItem("model3d", name, m, "Pixal3D", miss, fields);
+  }).join("") : '<div class="empty">No 3D model yet. Add the Pixal3D folder; the DINOv3 ViT-L/16 folder and NAF\'s naf_release.pth are found when they sit beside it, or add them after.</div>';
 
   const vid = Object.entries(cfg.media.video.models);
   $("#m-video").innerHTML = vid.length ? vid.map(([name, m]) => {
@@ -1431,14 +1482,14 @@ function renderState() {
   $("#foot-llm").className = "dot " + l.state; $("#foot-llm-text").textContent = "LLM " + label.toLowerCase();
   const priv = state.media.private || [];
   const active = state.media.jobs.find(j => j.status === "in_progress") || priv.find(j => j.status === "in_progress");
-  $("#foot-media").className = "dot " + (active ? "starting" : ""); $("#foot-media-text").textContent = active ? `${active.kind} ${active.progress.toFixed(0)}%` : "Media idle";
+  $("#foot-media").className = "dot " + (active ? "starting" : ""); $("#foot-media-text").textContent = active ? `${kindText(active.kind)} ${active.progress.toFixed(0)}%` : "Media idle";
   const ep = [["Chat", routeFor("chat")], ["Images", routeFor("images")], ["Videos", routeFor("videos")]].filter(([, r]) => r);
   $("#ov-endpoints").innerHTML = ep.map(([n, r]) => `<div class="endpoint"><span class="muted">${n}</span><code>${esc(state.gateway_url + r.path)}</code><button class="btn quiet" data-copy="${esc(state.gateway_url + r.path)}">Copy</button></div>`).join("")
     + `<div class="endpoint"><span class="muted">Base URL</span><code>${esc(state.gateway_url)}/v1</code><button class="btn quiet" data-copy="${esc(state.gateway_url)}/v1">Copy</button></div>`;
   $$("[data-copy]").forEach(b => b.onclick = () => navigator.clipboard.writeText(b.dataset.copy).then(() => toast("Copied")));
   const jobs = state.media.jobs.slice(0, 8);
   $("#ov-jobs").innerHTML = jobs.length ? jobs.map(j => `<div class="job">${j.preview ? `<img src="${esc(j.preview)}" alt="" loading="lazy" data-job="${esc(j.id)}">` : '<div class="ph"></div>'}
-    <div><div class="p">${esc(j.prompt)}</div><div class="muted small">${esc(j.model)}, ${esc(j.size)}, ${statusText(j)}</div></div>
+    <div><div class="p">${esc(j.prompt || (j.kind === "model3d" ? "3D model" : ""))}</div><div class="muted small">${esc(j.model)}, ${esc(j.size)}, ${statusText(j)}</div></div>
     <div class="row">${j.status === "in_progress" || j.status === "queued" ? `<button class="btn quiet warn" data-cancel="${j.id}">Cancel</button>` : j.files[0] ? `<a class="btn quiet" href="${esc(j.files[0])}" target="_blank">Open</a>` : ""}</div></div>`).join("")
     : '<div class="empty">Nothing generated yet. Try the Playground.</div>';
   $$("#ov-jobs img[data-job]").forEach(img => img.onclick = () => openViewer(img.dataset.job));
@@ -1447,9 +1498,9 @@ function renderState() {
   $("#now-block").hidden = !now;
   if (now) {
     const active = now, hidden = !("prompt" in now);
-    $("#now").innerHTML = `<div class="now"><div class="ph"></div><div><div class="p" style="margin-bottom:6px">${hidden ? "Incognito request" : esc(active.prompt)}</div>
+    $("#now").innerHTML = `<div class="now"><div class="ph"></div><div><div class="p" style="margin-bottom:6px">${hidden ? "Incognito request" : esc(active.prompt || (active.kind === "model3d" ? "3D model" : ""))}</div>
       <div class="meter"><div style="width:${active.progress}%;background:var(--gpu)"></div></div>
-      <div class="muted small" style="margin-top:6px">${hidden ? esc(active.kind) : `${esc(active.kind)} on ${esc(active.model)}, ${esc(active.size)}`}: ${statusText(active)}</div></div>
+      <div class="muted small" style="margin-top:6px">${hidden ? esc(kindText(active.kind)) : `${esc(kindText(active.kind))} on ${esc(active.model)}, ${esc(active.size)}`}: ${statusText(active)}</div></div>
       <button class="btn warn" data-cancel="${active.id}">Cancel</button></div>`;
   }
   const busy = all.filter(j => j.status === "in_progress" || j.status === "queued").length;
@@ -1460,6 +1511,8 @@ function renderState() {
 }
 // Status lines include worker output: plain text, escaped here once.
 function statusText(j) { return esc(statusRaw(j)); }
+// A job's kind as people say it.
+function kindText(k) { return k === "model3d" ? "3D model" : k; }
 function statusRaw(j) {
   if (j.status === "in_progress") return `${j.progress.toFixed(0)}%, ${j.stage.replace(/_/g, " ")}`;
   if (j.status === "failed") return "failed: " + (j.error || "").slice(0, 140);
@@ -1484,6 +1537,8 @@ function renderSelects() {
   $("#mu-model").innerHTML = opts(Object.keys(mum).filter(n => mum[n].enabled !== false), mv || cfg.media.music?.default_model);
   const sfm = cfg.media.sound?.models || {}, sfv = keep("#sfx-model");
   $("#sfx-model").innerHTML = opts(Object.keys(sfm).filter(n => sfm[n].enabled !== false), sfv || cfg.media.sound?.default_model);
+  const m3m = cfg.media.model3d?.models || {}, m3v = keep("#m3d-model");
+  $("#m3d-model").innerHTML = opts(Object.keys(m3m).filter(n => m3m[n].enabled !== false), m3v || cfg.media.model3d?.default_model);
   segment($("#img-tier"), imgTier ||= cfg.media.image.memory || "auto", t => imgTier = t);
   segment($("#vid-tier"), vidTier ||= cfg.media.video.memory || "auto", t => vidTier = t);
   renderSound();
@@ -1638,6 +1693,7 @@ function dropzone(k, input, max) {
 const clearImgRefs = dropzone("img", $("#img-refs"), 3);
 const clearVidRef = dropzone("vid", $("#vid-image"), 1);
 const clearVidEnd = dropzone("vend", $("#vid-end-image"), 1);
+dropzone("m3d", $("#m3d-image"), 1);
 // The soundtrack file: any audio, named once chosen or dropped.
 (() => {
   const zone = $("#vaud-drop"), input = $("#vid-audio"), label = $("#vaud-drop-label"), initial = label.textContent;
@@ -1949,12 +2005,60 @@ $("#sfx-form").onsubmit = async e => {
   sfxJobId = null; sfxProgress(null); $("#sfx-go").disabled = false; refresh();
 };
 
+/* ---------- 3D models ---------- */
+const M3D_STAGES = {preparing_image: "Cutting out the object", encoding_image: "Reading the picture", making_structure: "Making the structure", making_shape: "Making the shape",
+  making_texture: "Making the texture", decoding: "Decoding", meshing: "Making the mesh"};
+let m3dJobId = null;
+function m3dProgress(text, pct) {
+  const bar = $("#m3d-progress");
+  if (text === null) { bar.hidden = true; return; }
+  bar.hidden = false; $("#m3d-progress-text").textContent = text; $(".meter > div", bar).style.width = (pct || 0) + "%";
+}
+$("#m3d-cancel").onclick = () => m3dJobId && api(`/api/play/model3d/${m3dJobId}/cancel`, {method: "POST"}).then(refresh, e => toast(e.message, true));
+// A finished model: the picture as it was cut out, its numbers, and the GLB.
+function addModel3d(job) {
+  $("#m3d-empty").hidden = true; $("#m3d-results").hidden = false;
+  const input = fileUrl(`/api/play/model3d/${job.id}/input`), glb = fileUrl(`/api/play/model3d/${job.id}/content`);
+  const rows = [["Faces", job.faces?.toLocaleString()], ["Vertices", job.vertices?.toLocaleString()], ["Size", job.bytes ? fmtSize(job.bytes) : null],
+    ["Took", job.seconds_taken ? job.seconds_taken.toFixed(0) + " s" : null], ["Resolution", job.resolution], ["Seed", job.seed],
+    ["Background", job.matte === "alpha" ? "the picture's own transparency" : job.matte === "background" ? "cut away" : null]].filter(([, v]) => v !== null && v !== undefined && v !== "");
+  const el = document.createElement("div"); el.className = "sp-item m3d-item";
+  el.innerHTML = `<img src="${esc(input)}" alt="The picture, cut out">
+    <div style="display:grid;gap:10px"><dl>${rows.map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join("")}</dl>
+    <div class="row"><a class="btn" href="${esc(glb)}" download="model-${esc(job.seed ?? job.id)}.glb">Download GLB</a></div></div>`;
+  $("#m3d-results").prepend(el);
+}
+$("#m3d-form").onsubmit = async e => {
+  e.preventDefault();
+  const f = $("#m3d-image").files[0];
+  if (!f) return toast("Choose a picture of the object first", true);
+  const seed = $("#m3d-seed").value ? +$("#m3d-seed").value : Math.floor(Math.random() * 2e9);
+  $("#m3d-go").disabled = true; m3dProgress("Starting", 1);
+  const headers = Object.assign({"Content-Type": "application/json"}, key ? {Authorization: "Bearer " + key} : {}, saved?.privacy?.incognito ? {"X-NROB-Incognito": "1"} : {});
+  try {
+    const body = {model: $("#m3d-model").value || undefined, image: await readAsDataUrl(f), resolution: +$("#m3d-resolution").value || 1024, faces: +$("#m3d-faces").value || 200000, seed};
+    const r = await fetch("/api/play/model3d", {method: "POST", headers, body: JSON.stringify(body)});
+    let job = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(job?.error?.message || r.statusText);
+    m3dJobId = job.id;
+    while (job.status === "queued" || job.status === "in_progress") {
+      await new Promise(ok => setTimeout(ok, 1000));
+      job = await api(`/api/play/model3d/${job.id}`);
+      const stage = M3D_STAGES[job.stage];
+      m3dProgress(job.status === "queued" ? "Waiting for the GPU" : `${job.progress}%${stage ? ", " + stage.toLowerCase() : ""}`, job.progress);
+    }
+    if (job.status !== "completed") throw new Error(job.error?.message || `The 3D model ${job.status}`);
+    addModel3d(job);
+  } catch (err) { toast(err.message, true); }
+  m3dJobId = null; m3dProgress(null); $("#m3d-go").disabled = false; refresh();
+};
+
 /* ---------- gallery and viewer ---------- */
 let galleryJobs = [], galleryFilter = "all";
 async function refreshGallery() { try { galleryJobs = keyed((await api("/api/jobs")).jobs); renderGallery(); } catch (e) { toast(e.message, true); } }
 function renderGallery(fresh) {
   if (fresh) { const byId = new Map(galleryJobs.map(j => [j.id, j])); fresh.forEach(j => byId.set(j.id, j)); galleryJobs = [...byId.values()].sort((a, b) => b.created_at - a.created_at); }
-  const pick = {all: () => true, image: j => j.kind === "image", video: j => j.kind === "video", speech: j => j.kind === "speech", music: j => j.kind === "music", sound: j => j.kind === "sound",
+  const pick = {all: () => true, image: j => j.kind === "image", video: j => j.kind === "video", speech: j => j.kind === "speech", music: j => j.kind === "music", sound: j => j.kind === "sound", model3d: j => j.kind === "model3d",
     active: j => j.status === "in_progress" || j.status === "queued", failed: j => j.status === "failed"}[galleryFilter];
   const items = galleryJobs.filter(pick);
   $("#gallery").innerHTML = items.length ? items.map(j => {
@@ -1965,8 +2069,9 @@ function renderGallery(fresh) {
       : j.kind === "music" && !j.files.length ? `<div class="fail" style="color:var(--muted)">Smaller language model written</div>`
       : j.kind === "music" ? `<div class="audio-card"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg></div>`
       : j.kind === "sound" ? `<div class="audio-card"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M11 5L6 9H3v6h3l5 4z"/><path d="M15.5 8.5a5 5 0 010 7M18.5 5.5a9 9 0 010 13"/></svg></div>`
+      : j.kind === "model3d" ? (j.preview ? `<img src="${esc(j.preview)}" alt="3D model" loading="lazy">` : `<div class="audio-card"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l8 4.5v9L12 21l-8-4.5v-9z"/><path d="M4 7.5l8 4.5 8-4.5M12 12v9"/></svg></div>`)
       : `<img src="${esc(j.preview || j.files[0] || "")}" alt="${esc(j.prompt)}" loading="lazy">`;
-    return `<figure data-job="${j.id}">${media}<figcaption><span class="p">${esc(j.prompt.slice(0, 60))}</span><span>${esc(j.kind === "video" || j.kind === "speech" || j.kind === "music" || j.kind === "sound" ? (j.seconds ? j.seconds.toFixed(1) + " s" : j.kind) : (j.files.length > 1 ? j.files.length + " images" : j.size))}</span></figcaption></figure>`;
+    return `<figure data-job="${j.id}">${media}<figcaption><span class="p">${esc(j.kind === "model3d" ? "3D model" : j.prompt.slice(0, 60))}</span><span>${esc(j.kind === "model3d" ? j.size : j.kind === "video" || j.kind === "speech" || j.kind === "music" || j.kind === "sound" ? (j.seconds ? j.seconds.toFixed(1) + " s" : j.kind) : (j.files.length > 1 ? j.files.length + " images" : j.size))}</span></figcaption></figure>`;
   }).join("") : '<div class="empty">Nothing here yet. Generate something in the Playground.</div>';
   $$("#gallery figure").forEach(f => f.onclick = () => openViewer(f.dataset.job));
 }
@@ -1978,8 +2083,9 @@ function openViewer(id) {
   $("#viewer-media").innerHTML = j.status !== "completed" ? `<div class="empty" style="padding:40px">${statusText(j)}</div>`
     : j.kind === "video" ? `<video src="${esc(file)}" poster="${esc(j.preview || "")}" controls autoplay loop playsinline></video>`
     : j.kind === "speech" || j.kind === "music" || j.kind === "sound" ? (file ? `<div style="padding:40px;width:100%"><audio src="${esc(file)}" controls autoplay style="width:100%"></audio>${j.settings?.lyrics ? `<pre style="white-space:pre-wrap;font-size:12px;margin-top:14px">${esc(j.settings.lyrics)}</pre>` : ""}</div>` : `<div class="empty" style="padding:40px">Done</div>`)
+    : j.kind === "model3d" ? (j.preview ? `<img src="${esc(j.preview)}" alt="The picture the 3D model was made from, cut out">` : `<div class="empty" style="padding:40px">Done</div>`)
     : `<img src="${esc(file)}" alt="${esc(j.prompt)}">`;
-  $("#viewer-title").textContent = j.kind === "video" ? "Video" : j.kind === "speech" ? "Speech" : j.kind === "music" ? "Song" : j.kind === "sound" ? "Sound effect" : j.files.length > 1 ? `Image 1 of ${j.files.length}` : "Image";
+  $("#viewer-title").textContent = j.kind === "model3d" ? "3D model" : j.kind === "video" ? "Video" : j.kind === "speech" ? "Speech" : j.kind === "music" ? "Song" : j.kind === "sound" ? "Sound effect" : j.files.length > 1 ? `Image 1 of ${j.files.length}` : "Image";
   $("#viewer-prompt").textContent = j.prompt;
   const st = j.settings || {}, r = j.residency?.transformer || j.residency;
   const rows = [["Model", j.model], ["Size", j.size], ["Seed", st.seed], ["Steps", st.steps], ["Memory", st.memory],
@@ -1988,8 +2094,9 @@ function openViewer(id) {
     ["Created", new Date(j.created_at * 1000).toLocaleString()], ["Status", j.status], ["Error", j.error]].filter(([, v]) => v !== null && v !== undefined && v !== "");
   $("#viewer-meta").innerHTML = rows.map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join("");
   const others = j.files.slice(1).map((f, i) => `<a class="btn quiet" href="${esc(f)}" target="_blank">Image ${i + 2}</a>`).join("");
-  $("#viewer-actions").innerHTML = (file ? `<a class="btn" href="${esc(file)}" target="_blank">Open</a><a class="btn" href="${esc(file)}" download>Download</a>` : "")
-    + `<button class="btn" id="viewer-reuse">Reuse prompt</button><button class="btn quiet warn" id="viewer-delete">Remove from list</button>` + others;
+  const glb = j.kind === "model3d";
+  $("#viewer-actions").innerHTML = (file && glb ? `<a class="btn" href="${esc(file)}" download="model.glb">Download GLB</a>` : file ? `<a class="btn" href="${esc(file)}" target="_blank">Open</a><a class="btn" href="${esc(file)}" download>Download</a>` : "")
+    + `<button class="btn" id="viewer-reuse"${glb ? " hidden" : ""}>Reuse prompt</button><button class="btn quiet warn" id="viewer-delete">Remove from list</button>` + others;
   $("#viewer-reuse").onclick = () => {
     const tab = j.kind === "video" ? "video" : j.kind === "speech" ? "speech" : j.kind === "music" ? "music" : j.kind === "sound" ? "sound" : "image";
     $(tab === "speech" ? "#sp-input" : tab === "music" ? "#mu-prompt" : tab === "sound" ? "#sfx-prompt" : `#${tab === "video" ? "vid" : "img"}-prompt`).value = j.prompt;

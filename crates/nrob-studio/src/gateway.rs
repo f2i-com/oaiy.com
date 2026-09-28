@@ -94,7 +94,7 @@ pub fn route(routes: &[Json], method: &str, path: &str) -> Option<Matched> {
     for r in routes.iter().filter(|r| bool_or(r, "enabled", true)) {
         let base = str_or(r, "path", "").trim_end_matches('/');
         let target = str_or(r, "target", "");
-        let prefix_owner = matches!(target, "images" | "videos" | "files" | "voices" | "music" | "sound");
+        let prefix_owner = matches!(target, "images" | "videos" | "files" | "voices" | "music" | "sound" | "model3d");
         let rest = if path == base {
             ""
         } else if prefix_owner && path.starts_with(base) && path[base.len()..].starts_with('/') {
@@ -103,7 +103,7 @@ pub fn route(routes: &[Json], method: &str, path: &str) -> Option<Matched> {
             continue;
         };
         // The configured method is the primary route's; sub-routes set their own.
-        if rest.is_empty() && !matches!(target, "videos" | "files" | "voices" | "music" | "sound") && !str_or(r, "method", "POST").eq_ignore_ascii_case(method) {
+        if rest.is_empty() && !matches!(target, "videos" | "files" | "voices" | "music" | "sound" | "model3d") && !str_or(r, "method", "POST").eq_ignore_ascii_case(method) {
             continue;
         }
         return Some(Matched { target: target.into(), spec: str_or(r, "spec", "openai").into(), rest: rest.into() });
@@ -151,6 +151,7 @@ pub fn handle(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, m: Matched
         ("voices", _) => voices(studio, req, w, &m.rest),
         ("music", _) => music_openai(studio, req, w, method, &m.rest),
         ("sound", _) => sound_openai(studio, req, w, method, &m.rest),
+        ("model3d", _) => model3d_openai(studio, req, w, method, &m.rest, trusted),
         _ => send(w, Err(fail(404, format!("no route {} {}", method, req.route())))),
     }
 }
@@ -256,7 +257,7 @@ fn models(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream) -> io::Result<
             }
         }
     }
-    for kind in ["image", "video", "speech", "music", "sound"] {
+    for kind in ["image", "video", "speech", "music", "sound", "model3d"] {
         let section = cfg.get("media").and_then(|m| m.get(kind));
         if section.is_some_and(|s| bool_or(s, "enabled", true)) {
             for (name, m) in section.and_then(|s| s.get("models")).map(|m| m.members().collect::<Vec<_>>()).unwrap_or_default() {
@@ -292,6 +293,7 @@ fn content_type(path: &std::path::Path) -> &'static str {
         Some("ogg" | "opus") => "audio/ogg",
         Some("flac") => "audio/flac",
         Some("json" | "jsonl") => "application/json",
+        Some("glb") => "model/gltf-binary",
         _ => "application/octet-stream",
     }
 }
@@ -760,6 +762,91 @@ fn sound_openai(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, method: 
     }
 }
 
+pub fn model3d_object(job: &Job) -> Json {
+    let (status, error) = match job.status.as_str() {
+        "cancelled" => ("failed", Json::obj([("code", Json::str("cancelled")), ("message", Json::str("the job was cancelled"))])),
+        "failed" => ("failed", Json::obj([("code", Json::str("generation_failed")), ("message", Json::str(job.error.as_deref().unwrap_or("failed")))])),
+        s => (s, Json::Null),
+    };
+    let r = |k: &str| job.result.get(k).cloned().unwrap_or(Json::Null);
+    Json::obj([
+        ("id", Json::str(&job.id)),
+        ("object", Json::str("model3d")),
+        ("model", Json::str(&job.model)),
+        ("status", Json::str(status)),
+        ("progress", Json::Int(job.progress.floor() as i64)),
+        ("stage", Json::str(&job.stage)),
+        ("created_at", Json::Int(job.created_at as i64)),
+        ("completed_at", job.completed_at.map_or(Json::Null, |t| Json::Int(t as i64))),
+        ("seed", job.request.get("seed").cloned().unwrap_or(Json::Null)),
+        ("resolution", job.request.get("resolution").cloned().unwrap_or(Json::Null)),
+        ("format", Json::str("glb")),
+        ("faces", r("faces")),
+        ("vertices", r("vertices")),
+        ("bytes", r("bytes")),
+        ("matte", r("matte")),
+        ("seconds_taken", r("seconds")),
+        ("error", error),
+    ])
+}
+
+/// 3D models from a picture as asynchronous jobs: create, list, get, cancel, delete,
+/// download the GLB (`/content`) and see the picture as it was cut out (`/input`).
+fn model3d_openai(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, method: &str, rest: &str, trusted: bool) -> io::Result<bool> {
+    let parts: Vec<&str> = rest.trim_start_matches('/').split('/').filter(|p| !p.is_empty()).collect();
+    let model = |id: &str| studio.media.get(id).filter(|j| j.kind == Kind::Model3d);
+    match (method, parts.as_slice()) {
+        ("POST", []) => send(w, parse_body(req).and_then(|b| {
+            let cfg = studio.config();
+            let scratch = scratch_for(studio, req, Some(&b));
+            let out = scratch.clone().unwrap_or_else(|| studio.output_root());
+            let (request, name, label) = crate::model3d::model3d_request(&cfg, &studio.root, &media::day_dir(&out, "3d"), &b, trusted).map_err(|e| {
+                if let Some(s) = &scratch {
+                    let _ = std::fs::remove_dir_all(s);
+                }
+                fail(400, e)
+            })?;
+            let job = studio.media.submit(Kind::Model3d, request, name, label, 1, 0.0, keep_jobs(&cfg), scratch);
+            Ok(Reply { status: 200, body: model3d_object(&job) })
+        })),
+        ("GET", []) => {
+            let limit = req.query("limit").and_then(|l| l.parse::<usize>().ok()).unwrap_or(20).clamp(1, 100);
+            let models: Vec<Job> = studio.media.list().into_iter().filter(|j| j.kind == Kind::Model3d).collect();
+            let has_more = models.len() > limit;
+            let data: Vec<Json> = models.iter().take(limit).map(model3d_object).collect();
+            let id = |i: Option<&Json>| i.and_then(|v| v.get("id")).cloned().unwrap_or(Json::Null);
+            json_reply(w, 200, &Json::obj([
+                ("object", Json::str("list")),
+                ("first_id", id(data.first())),
+                ("last_id", id(data.last())),
+                ("has_more", Json::Bool(has_more)),
+                ("data", Json::Arr(data)),
+            ]))
+        }
+        ("GET", [id]) => send(w, model(id).map(|j| Reply { status: 200, body: model3d_object(&j) }).ok_or_else(|| fail(404, "no such 3D model"))),
+        ("DELETE", [id]) => {
+            let deleted = model(id).is_some() && studio.media.remove(id);
+            send(w, Ok(Reply { status: if deleted { 200 } else { 404 }, body: Json::obj([("id", Json::str(*id)), ("object", Json::str("model3d.deleted")), ("deleted", Json::Bool(deleted))]) }))
+        }
+        ("POST", [id, "cancel"]) => {
+            let cancelled = model(id).is_some() && studio.media.cancel(id);
+            send(w, Ok(Reply { status: if cancelled { 200 } else { 404 }, body: Json::obj([("id", Json::str(*id)), ("cancelled", Json::Bool(cancelled))]) }))
+        }
+        ("GET", [id, what]) if *what == "content" || *what == "input" => {
+            let Some(job) = model(id) else { return send(w, Err(fail(404, "no such 3D model"))) };
+            if job.status != "completed" {
+                return send(w, Err(fail(409, format!("the 3D model is {}", job.status))));
+            }
+            let file = if *what == "content" { job.files.first().cloned() } else { job.preview.clone() };
+            match file.filter(|f| f.is_file()) {
+                Some(f) => serve_file(w, &f, true, req.header("range")),
+                None => send(w, Err(fail(404, "the file is gone"))),
+            }
+        }
+        _ => send(w, Err(fail(405, format!("{method} is not supported here")))),
+    }
+}
+
 /// Saved voices: list, design and save, show, sample clip, delete.
 fn voices(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, rest: &str) -> io::Result<bool> {
     let cfg = studio.config();
@@ -1062,6 +1149,11 @@ mod tests {
         assert_eq!((m.spec.as_str(), m.rest.as_str()), ("nrob", "/status"));
         let disabled = vec![Json::parse(br#"{"path":"/x","method":"POST","target":"chat","enabled":false}"#).unwrap()];
         assert!(route(&disabled, "POST", "/x").is_none());
+        // 3D model jobs own their sub-paths, and listing them is a GET on the route itself.
+        let m = route(&r, "GET", "/v1/3d/models/m3d_abc/content").unwrap();
+        assert_eq!((m.target.as_str(), m.rest.as_str()), ("model3d", "/m3d_abc/content"));
+        assert_eq!(route(&r, "GET", "/v1/3d/models").unwrap().target, "model3d");
+        assert_eq!(route(&r, "POST", "/v1/3d/models/m3d_abc/cancel").unwrap().rest, "/m3d_abc/cancel");
     }
 
     #[test]
@@ -1093,5 +1185,24 @@ mod tests {
         let v = video_object(&m.get(&job.id).unwrap());
         assert_eq!(v.get("status").and_then(Json::as_str), Some("failed"));
         assert_eq!(v.get("error").unwrap().get("code").and_then(Json::as_str), Some("cancelled"));
+    }
+
+    #[test]
+    fn jobs_render_as_3d_model_objects() {
+        let m = crate::media::Media::new();
+        let request = Json::obj([("kind", Json::str("model3d")), ("seed", Json::Int(7)), ("resolution", Json::Int(1536))]);
+        let job = m.submit(Kind::Model3d, request, "pixal3d".into(), "1536, 200000 faces".into(), 1, 0.0, 10, None);
+        assert!(job.id.starts_with("m3d_"));
+        let v = model3d_object(&job);
+        assert_eq!(v.get("object").and_then(Json::as_str), Some("model3d"));
+        assert_eq!(v.get("status").and_then(Json::as_str), Some("queued"));
+        assert_eq!(v.get("format").and_then(Json::as_str), Some("glb"));
+        assert_eq!((v.get("seed").and_then(Json::as_i64), v.get("resolution").and_then(Json::as_i64)), (Some(7), Some(1536)));
+        assert_eq!(v.get("error"), Some(&Json::Null));
+        m.cancel(&job.id);
+        let v = model3d_object(&m.get(&job.id).unwrap());
+        assert_eq!(v.get("status").and_then(Json::as_str), Some("failed"));
+        assert_eq!(v.get("error").unwrap().get("code").and_then(Json::as_str), Some("cancelled"));
+        assert_eq!(content_type(std::path::Path::new("a/model.glb")), "model/gltf-binary");
     }
 }

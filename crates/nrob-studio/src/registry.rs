@@ -9,7 +9,8 @@ use crate::util::{bool_or, set, str_or};
 use nrob::json::Json;
 use std::path::{Path, PathBuf};
 
-/// Where an entry lives: `llm`, `image` or `video`, and its name.
+/// Where an entry lives: its section (`llm`, `image`, `video`, `speech`, `music`,
+/// `sound` or `model3d`) and its name.
 #[derive(Debug, PartialEq)]
 pub struct Added {
     pub section: &'static str,
@@ -90,7 +91,7 @@ fn nearby(path: &Path, accept: impl Fn(&Path, &Detected) -> bool) -> Option<Path
                 continue;
             }
             let ext = c.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
-            let interesting = c.is_dir() || ext == "safetensors" || ext == "gguf" || c.file_name().is_some_and(|n| n == "tokenizer.json");
+            let interesting = c.is_dir() || ext == "safetensors" || ext == "gguf" || c.file_name().is_some_and(|n| n == "tokenizer.json" || n.eq_ignore_ascii_case(detect::NAF_FILE));
             if !interesting {
                 continue;
             }
@@ -271,8 +272,75 @@ fn attach_sound(cfg: &mut Json, d: &Detected, target: Option<(&str, &str)>) -> R
     Ok(Added { section: "sound", name, missing: Vec::new(), enabled: true })
 }
 
-/// Components attach to the first model that lacks them.
-fn attach(cfg: &mut Json, d: &Detected, target: Option<(&str, &str)>) -> Result<Added, String> {
+/// The fields a 3D model needs: the Pixal3D folder, DINOv3 and NAF.
+const MODEL3D_PARTS: [&str; 3] = ["path", "dino", "naf"];
+
+/// A 3D model's part from files near `picked` (the release folders usually sit
+/// side by side): a DINOv3 folder, or NAF's folder or weights.
+fn model3d_nearby(picked: &Path, key: &str) -> Option<Json> {
+    let kind = if key == "dino" { "model3d_dino" } else { "model3d_naf" };
+    let found = nearby(picked, |_, d| d.kind() == kind)?;
+    field_of(&detect::detect(&found).ok()?, key)
+}
+
+/// A Pixal3D folder is a 3D model of its own (or fills the chosen one, else one
+/// still waiting for it); DINOv3 and NAF fill the chosen model, else the
+/// default or only one, else one lacking them, else start one. Parts a model
+/// lacks come from another 3D model, or from folders beside the picked one.
+fn attach_model3d(cfg: &mut Json, d: &Detected, target: Option<(&str, &str)>, picked: &Path) -> Result<Added, String> {
+    let field = match d.kind() {
+        "model3d_dino" => "dino",
+        "model3d_naf" => "naf",
+        _ => "path",
+    };
+    let value = field_of(d, field).ok_or("detected part has no path")?;
+    let default = get(cfg, &["media", "model3d", "default_model"]).and_then(Json::as_str).unwrap_or("").to_string();
+    // What the other 3D models already use, lent to one that lacks it.
+    let lent = |key: &str| -> Option<Json> {
+        get(cfg, &["media", "model3d", "models"])?.members().find_map(|(_, m)| m.get(key).filter(|v| v.as_str().is_some_and(|s| !s.trim().is_empty())).cloned())
+    };
+    let lend: Vec<(&str, Json)> = MODEL3D_PARTS.iter().filter(|k| **k != field).filter_map(|k| lent(k).map(|v| (*k, v))).collect();
+    let Some(Json::Obj(models)) = obj_mut(cfg, &["media", "model3d", "models"]) else { return Err("no 3D model section".into()) };
+    let lacks = |m: &Json| str_or(m, field, "").trim().is_empty();
+    let chosen = models.iter().position(|(n, _)| target.is_some_and(|(_, t)| n == t)).or_else(|| {
+        if field == "path" {
+            models.iter().position(|(_, m)| lacks(m))
+        } else {
+            models.iter().position(|(n, _)| *n == default).or_else(|| (models.len() == 1).then_some(0)).or_else(|| models.iter().position(|(_, m)| lacks(m)))
+        }
+    });
+    let i = match chosen {
+        Some(i) => i,
+        None => {
+            let taken: Vec<String> = models.iter().map(|(k, _)| k.clone()).collect();
+            models.push((unique(&taken, "pixal3d"), Json::Obj(Vec::new())));
+            models.len() - 1
+        }
+    };
+    let (name, model) = &mut models[i];
+    let name = name.clone();
+    set(model, field, value);
+    for key in MODEL3D_PARTS.iter().filter(|k| **k != "path") {
+        if str_or(model, key, "").trim().is_empty() {
+            if let Some(v) = lend.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone()).or_else(|| model3d_nearby(picked, key)) {
+                set(model, key, v);
+            }
+        }
+    }
+    let missing: Vec<String> = MODEL3D_PARTS.iter().filter(|k| str_or(model, k, "").trim().is_empty()).map(|k| k.to_string()).collect();
+    let enabled = missing.is_empty();
+    set(model, "enabled", Json::Bool(enabled));
+    let section = obj_mut(cfg, &["media", "model3d"]).ok_or("no 3D model section")?;
+    if enabled && str_or(section, "default_model", "").is_empty() {
+        set(section, "default_model", Json::str(&name));
+    }
+    add_route_if_absent(cfg, "model3d");
+    Ok(Added { section: "model3d", name, missing, enabled })
+}
+
+/// Components attach to the first model that lacks them (`picked`: where the
+/// part is, to look for others beside it).
+fn attach(cfg: &mut Json, d: &Detected, target: Option<(&str, &str)>, picked: &Path) -> Result<Added, String> {
     type Fits = Box<dyn Fn(&Json) -> bool>;
     let (section, field, fits): (&str, &str, Fits) = match d.kind() {
         "vision_projector" => ("llm", "vision_projector", Box::new(|_| true)),
@@ -305,6 +373,7 @@ fn attach(cfg: &mut Json, d: &Detected, target: Option<(&str, &str)>) -> Result<
         "speech_design" | "speech_base" | "speech_breeze" => return attach_speech(cfg, d, target),
         "music_model" | "music_lm" => return attach_music(cfg, d, target),
         "sound_model" => return attach_sound(cfg, d, target),
+        "model3d" | "model3d_dino" | "model3d_naf" => return attach_model3d(cfg, d, target, picked),
         "ffmpeg" => {
             let value = field_of(d, "ffmpeg").unwrap_or(Json::Null);
             set(obj_mut(cfg, &["media", "video"]).ok_or("no video section")?, "ffmpeg", value);
@@ -398,7 +467,7 @@ pub fn add(cfg: &mut Json, path: &Path, name: Option<&str>, target: Option<(&str
     let d = detect::detect(path)?;
     let wanted = name.map(str::to_string).filter(|n| !n.trim().is_empty()).unwrap_or_else(|| detect::model_name(path));
     let added = match &d.role {
-        Role::Component { .. } => attach(cfg, &d, target)?,
+        Role::Component { .. } => attach(cfg, &d, target, path)?,
         Role::Llm => {
             let Some(Json::Arr(models)) = obj_mut(cfg, &["llm", "models"]) else { return Err("no llm models".into()) };
             let taken: Vec<String> = models.iter().map(|m| str_or(m, "name", "").to_string()).collect();
@@ -794,13 +863,77 @@ mod tests {
                 routes.retain(|r| str_or(r, "target", "") != "sound");
             }
         }
-        let a = attach(&mut cfg, &found, None).unwrap();
+        let a = attach(&mut cfg, &found, None, &dir).unwrap();
         assert_eq!((a.section, a.name.as_str()), ("sound", "moss-soundeffect"));
         assert_eq!(get(&cfg, &["media", "sound", "default_model"]).and_then(Json::as_str), Some("moss-soundeffect"));
         let routes = get(&cfg, &["gateway", "routes"]).and_then(Json::as_array).unwrap();
         assert!(routes.iter().any(|r| str_or(r, "target", "") == "sound"));
         crate::config::validate(&cfg).unwrap();
         let _ = std::fs::remove_dir_all(d);
+    }
+
+    /// A Pixal3D release as it is downloaded: its folder, DINOv3 and NAF side by side under `at`.
+    fn pixal3d_parts(at: &Path) -> (PathBuf, PathBuf, PathBuf) {
+        let (pixal, dino, naf) = (at.join("Pixal3D"), at.join("dinov3-vitl16"), at.join("NAF"));
+        for dir in [pixal.join("ckpts"), dino.clone(), naf.clone()] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        std::fs::write(pixal.join("pipeline.json"), r#"{"name":"Trellis2ImageTo3DPipeline"}"#).unwrap();
+        std::fs::write(dino.join("config.json"), r#"{"model_type":"dinov3_vit","hidden_size":1024,"patch_size":16}"#).unwrap();
+        safetensors(&dino.join("model.safetensors"), r#"{"x":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#);
+        std::fs::write(naf.join("naf_release.pth"), b"PK").unwrap();
+        (pixal, dino, naf.join("naf_release.pth"))
+    }
+
+    #[test]
+    fn a_pixal3d_folder_and_its_parts_make_one_3d_model_and_its_route() {
+        let d = tmp("model3d");
+        let model = |cfg: &Json, name: &str| get(cfg, &["media", "model3d", "models", name]).cloned().unwrap_or(Json::Null);
+        // The Pixal3D folder finds DINOv3 and NAF beside it, and the route comes back.
+        let (pixal, _, naf) = pixal3d_parts(&d.join("side-by-side"));
+        let mut cfg = config::default_json();
+        if let Some(Json::Arr(routes)) = obj_mut(&mut cfg, &["gateway", "routes"]) {
+            routes.retain(|r| str_or(r, "target", "") != "model3d");
+        }
+        let (a, found) = add(&mut cfg, &pixal, None, None).unwrap();
+        assert_eq!(found.kind(), "model3d");
+        assert_eq!((a.section, a.name.as_str(), a.enabled), ("model3d", "pixal3d", true), "{:?}", a.missing);
+        let m = model(&cfg, "pixal3d");
+        assert!(str_or(&m, "path", "").ends_with("Pixal3D") && str_or(&m, "dino", "").ends_with("dinov3-vitl16") && str_or(&m, "naf", "").ends_with("naf_release.pth"));
+        assert_eq!(get(&cfg, &["media", "model3d", "default_model"]).and_then(Json::as_str), Some("pixal3d"));
+        let routes = get(&cfg, &["gateway", "routes"]).and_then(Json::as_array).unwrap();
+        assert!(routes.iter().any(|r| str_or(r, "target", "") == "model3d" && str_or(r, "path", "") == "/v1/3d/models"));
+        // A second Pixal3D folder is a model of its own, with the first one's parts.
+        let (a2, _) = add(&mut cfg, &pixal, None, None).unwrap();
+        assert_eq!((a2.name.as_str(), a2.enabled), ("pixal3d-2", true));
+        assert_eq!(str_or(&model(&cfg, "pixal3d-2"), "naf", ""), str_or(&model(&cfg, "pixal3d"), "naf", ""));
+        config::validate(&cfg).unwrap();
+        // Parts first, each from its own place: one model, switched on once it has all three.
+        let apart = d.join("apart");
+        let (pixal, _, _) = pixal3d_parts(&apart.join("a"));
+        let (_, dino, _) = pixal3d_parts(&apart.join("b").join("c"));
+        std::fs::remove_dir_all(apart.join("b").join("c").join("NAF")).unwrap();
+        let mut cfg = config::default_json();
+        let (a, _) = add(&mut cfg, &dino, None, None).unwrap();
+        assert_eq!((a.name.as_str(), a.enabled, a.missing.clone()), ("pixal3d", false, vec!["path".to_string(), "naf".to_string()]));
+        assert_eq!(get(&cfg, &["media", "model3d", "default_model"]).and_then(Json::as_str), Some(""), "an incomplete model is not the default");
+        let (b, _) = add(&mut cfg, &naf, None, None).unwrap();
+        assert_eq!((b.name.as_str(), b.enabled, b.missing.clone()), ("pixal3d", false, vec!["path".to_string()]));
+        let (c, _) = add(&mut cfg, &pixal, None, None).unwrap();
+        assert_eq!((c.name.as_str(), c.enabled), ("pixal3d", true), "{:?}", c.missing);
+        assert_eq!(get(&cfg, &["media", "model3d", "models"]).unwrap().len(), 1);
+        assert!(str_or(&model(&cfg, "pixal3d"), "dino", "").ends_with("dinov3-vitl16"));
+        assert_eq!(get(&cfg, &["media", "model3d", "default_model"]).and_then(Json::as_str), Some("pixal3d"), "the default once it is complete");
+        config::validate(&cfg).unwrap();
+        // NAF's weights loose beside the Pixal3D folder, not in a folder of their own.
+        let loose = d.join("loose");
+        let (pixal, _, naf) = pixal3d_parts(&loose);
+        std::fs::rename(&naf, loose.join("naf_release.pth")).unwrap();
+        let mut cfg = config::default_json();
+        let (a, _) = add(&mut cfg, &pixal, None, None).unwrap();
+        assert!(a.enabled, "{:?}", a.missing);
+        assert_eq!(str_or(&model(&cfg, "pixal3d"), "naf", ""), loose.join("naf_release.pth").to_string_lossy());
+        std::fs::remove_dir_all(d).unwrap();
     }
 
     #[test]

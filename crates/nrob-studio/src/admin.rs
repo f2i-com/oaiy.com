@@ -86,7 +86,7 @@ pub fn handle(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, port: u16)
         // The playground: every target, no key, local references allowed.
         let (target, sub) = rest.split_once('/').map_or((rest, String::new()), |(t, s)| (t, format!("/{s}")));
         let target = match target {
-            "chat" | "completions" | "models" | "images" | "edits" | "videos" | "speech" | "voices" | "music" | "sound" | "health" => target,
+            "chat" | "completions" | "models" | "images" | "edits" | "videos" | "speech" | "voices" | "music" | "sound" | "model3d" | "health" => target,
             _ => return err(w, 404, "unknown playground target"),
         };
         let m = Matched { target: target.into(), spec: "openai".into(), rest: sub };
@@ -247,7 +247,7 @@ fn remove_model(cfg: &mut Json, section: &str, name: &str) -> Result<(), String>
             }
             clear_default(llm);
         }
-        "image" | "video" | "speech" | "music" => {
+        "image" | "video" | "speech" | "music" | "sound" | "model3d" => {
             let media = &mut top.iter_mut().find(|(k, _)| k == "media").ok_or("no media")?.1;
             let Json::Obj(media) = media else { return Err("bad media".into()) };
             let sec = &mut media.iter_mut().find(|(k, _)| k == section).ok_or("no section")?.1;
@@ -262,7 +262,7 @@ fn remove_model(cfg: &mut Json, section: &str, name: &str) -> Result<(), String>
             }
             clear_default(sec);
         }
-        _ => return Err("section must be llm, image, video, speech or music".into()),
+        _ => return Err("section must be llm, image, video, speech, music, sound or model3d".into()),
     }
     Ok(())
 }
@@ -294,6 +294,15 @@ mod tests {
         remove_model(&mut cfg, "llm", "a").unwrap();
         assert_eq!(cfg.get("llm").unwrap().get("default_model").and_then(Json::as_str), Some(""));
         assert!(remove_model(&mut cfg, "llm", "a").is_err());
+        config::validate(&cfg).unwrap();
+        // Sound effect and 3D models are removed the same way.
+        for section in ["sound", "model3d"] {
+            let media = crate::registry::obj_mut(&mut cfg, &["media", section]).unwrap();
+            crate::util::set(media, "models", Json::parse(br#"{"m":{"path":"m"}}"#).unwrap());
+            crate::util::set(media, "default_model", Json::str("m"));
+            remove_model(&mut cfg, section, "m").unwrap();
+            assert_eq!(cfg.get("media").unwrap().get(section).unwrap().get("default_model").and_then(Json::as_str), Some(""));
+        }
         config::validate(&cfg).unwrap();
     }
 }

@@ -16,6 +16,10 @@ use std::path::{Path, PathBuf};
 /// Largest safetensors header read (real ones are a few MB).
 const MAX_HEADER: u64 = 128 << 20;
 
+/// NAF's release weights, the one PyTorch file nrob reads (with its own reader,
+/// which never runs code from the file).
+pub(crate) const NAF_FILE: &str = "naf_release.pth";
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Role {
     /// A language model nrob-server can serve (GGUF, EXL3, DeepSeek checkpoint).
@@ -25,7 +29,9 @@ pub enum Role {
     /// A text/image-to-video model of an LTX family.
     Video { family: &'static str },
     /// A part another model needs: `vision_projector`, `adapter`, `text_encoder`,
-    /// `video_text_encoder`, `vae`, `tokenizer`, `clip_tokenizer`, `image_base`.
+    /// `video_text_encoder`, `vae`, `tokenizer`, `clip_tokenizer`, `image_base`;
+    /// or a model of a section of its own (`sound_model`, `music_model`,
+    /// `model3d`) and its parts (`model3d_dino`, `model3d_naf`).
     Component { kind: &'static str },
 }
 
@@ -94,10 +100,12 @@ pub fn detect(path: &Path) -> Result<Detected, String> {
         "gguf" => gguf_file(path),
         "safetensors" => safetensors_file(path),
         "json" if name == "tokenizer.json" => tokenizer_file(path),
-        "json" if name.ends_with(".safetensors.index.json") || name == "model_index.json" || name == "config.json" => {
+        "json" if name.ends_with(".safetensors.index.json") || name == "model_index.json" || name == "config.json" || name == "pipeline.json" => {
             path.parent().map_or(Err("no folder".into()), directory)
         }
         "exe" | "" if name.contains("ffmpeg") => Ok(detected(Role::Component { kind: "ffmpeg" }, "program", "FFmpeg (writes the video container)".into(), vec![("ffmpeg", path_json(path))])),
+        // NAF's weights are a PyTorch file, read without unpickling code.
+        "pth" if name == NAF_FILE => Ok(naf(path)),
         "bin" | "pt" | "pth" | "ckpt" => Err(format!(
             "{name}: pickled PyTorch weights are not supported (they can run code when loaded); use the .safetensors or .gguf release"
         )),
@@ -408,9 +416,29 @@ fn tokenizer_file(path: &Path) -> Result<Detected, String> {
 
 // --------------------------------------------------------------- folders
 
+fn naf(path: &Path) -> Detected {
+    detected(Role::Component { kind: "model3d_naf" }, "pth", "NAF: feature upsampler for 3D models (Apache-2.0)".into(), vec![("naf", path_json(path))])
+}
+
 fn directory(dir: &Path) -> Result<Detected, String> {
     let label = stem(dir);
     let read = |name: &str| std::fs::read(dir.join(name)).ok().and_then(|b| Json::parse(&b).ok());
+    // Pixal3D: its pipeline.json names the checkpoints in ckpts/.
+    if let Some(pipeline) = read("pipeline.json") {
+        let name = str_or(&pipeline, "name", "");
+        if name == "Trellis2ImageTo3DPipeline" || name.contains("Pixal3D") {
+            if !dir.join("ckpts").is_dir() {
+                return Err(format!("{label}: a Pixal3D folder needs its ckpts/ folder"));
+            }
+            let mut d = detected(Role::Component { kind: "model3d" }, "safetensors", "Pixal3D: 3D models from a picture (MIT)".into(), vec![("path", path_json(dir))]);
+            d.missing = vec!["dino".into(), "naf".into()];
+            return Ok(d);
+        }
+    }
+    // A NAF folder holds its release weights (and its license).
+    if dir.join(NAF_FILE).is_file() {
+        return Ok(naf(&dir.join(NAF_FILE)));
+    }
     if let Some(index) = read("model_index.json") {
         let class = str_or(&index, "_class_name", "");
         if class.starts_with("QwenImage") {
@@ -507,6 +535,18 @@ fn directory(dir: &Path) -> Result<Detected, String> {
                 return Err(format!("{label}: a Qwen3-TTS folder needs its speech_tokenizer/ folder"));
             }
             return Ok(detected(Role::Component { kind }, "safetensors", format!("Qwen3-TTS {what} ({label})"), vec![(field, path_json(dir))]));
+        }
+        // DINOv3: the image encoder Pixal3D reads pictures with (ViT-L/16 only).
+        if model_type == "dinov3_vit" {
+            let (width, patch) = (config.get("hidden_size").and_then(Json::as_i64).unwrap_or(0), config.get("patch_size").and_then(Json::as_i64).unwrap_or(0));
+            if (width, patch) != (1024, 16) {
+                return Err(format!("{label}: DINOv3 with width {width} and patch {patch}; 3D models need DINOv3 ViT-L/16 (dinov3-vitl16)"));
+            }
+            // The names nrob-diffusion loads it from.
+            if !["model.safetensors", "pytorch_model.safetensors"].iter().any(|f| dir.join(f).is_file()) {
+                return Err(format!("{label}: a DINOv3 folder needs its model.safetensors"));
+            }
+            return Ok(detected(Role::Component { kind: "model3d_dino" }, "safetensors", "DINOv3 ViT-L/16: the image encoder 3D models need (Meta's DINOv3 License)".into(), vec![("dino", path_json(dir))]));
         }
         if model_type == "qwen3_vl" && has_ext(dir, "safetensors") {
             return Ok(detected(Role::Component { kind: "text_encoder" }, "safetensors", format!("Qwen3-VL text encoder folder ({label})"), vec![("text_encoder", path_json(dir))]));
@@ -699,6 +739,52 @@ mod tests {
         let tok = d.0.join("tokenizer.json");
         std::fs::write(&tok, r#"{"added_tokens":[{"content":"<|startoftext|>"}]}"#).unwrap();
         assert_eq!(detect(&tok).unwrap().kind(), "clip_tokenizer");
+    }
+
+    #[test]
+    fn pixal3d_its_image_encoder_and_naf_are_recognised() {
+        let d = tmp("3d");
+        let field = |r: &Detected, k: &str| r.fields.iter().find(|(f, _)| f == k).and_then(|(_, v)| v.as_str().map(String::from));
+        // Pixal3D: pipeline.json and its checkpoints; the pipeline.json itself stands for the folder.
+        let pixal = d.0.join("Pixal3D");
+        std::fs::create_dir_all(&pixal).unwrap();
+        std::fs::write(pixal.join("pipeline.json"), r#"{"name":"Trellis2ImageTo3DPipeline","args":{"models":{}}}"#).unwrap();
+        assert!(detect(&pixal).unwrap_err().contains("ckpts"));
+        std::fs::create_dir_all(pixal.join("ckpts")).unwrap();
+        for p in [pixal.clone(), pixal.join("pipeline.json")] {
+            let r = detect(&p).unwrap();
+            assert_eq!(r.kind(), "model3d");
+            assert!(r.summary.starts_with("Pixal3D"), "{}", r.summary);
+            assert!(field(&r, "path").unwrap().ends_with("Pixal3D"));
+            assert_eq!(r.missing, vec!["dino".to_string(), "naf".to_string()]);
+        }
+        std::fs::write(pixal.join("pipeline.json"), r#"{"name":"SomeOtherPipeline"}"#).unwrap();
+        assert!(detect(&pixal).is_err());
+        // DINOv3 ViT-L/16, as transformers lays it out; other sizes are refused.
+        let dino = d.0.join("dinov3-vitl16");
+        std::fs::create_dir_all(&dino).unwrap();
+        std::fs::write(dino.join("config.json"), r#"{"architectures":["DINOv3ViTModel"],"model_type":"dinov3_vit","hidden_size":1024,"patch_size":16}"#).unwrap();
+        safetensors(&dino.join("model.safetensors"), r#"{"embeddings.patch_embeddings.weight":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#);
+        let r = detect(&dino).unwrap();
+        assert_eq!(r.kind(), "model3d_dino");
+        assert!(field(&r, "dino").unwrap().ends_with("dinov3-vitl16"));
+        assert_eq!(detect(&dino.join("config.json")).unwrap().kind(), "model3d_dino");
+        std::fs::rename(dino.join("model.safetensors"), dino.join("weights.safetensors")).unwrap();
+        assert!(detect(&dino).unwrap_err().contains("model.safetensors"), "the worker loads model.safetensors only");
+        std::fs::rename(dino.join("weights.safetensors"), dino.join("model.safetensors")).unwrap();
+        std::fs::write(dino.join("config.json"), r#"{"model_type":"dinov3_vit","hidden_size":384,"patch_size":16}"#).unwrap();
+        assert!(detect(&dino).unwrap_err().contains("ViT-L/16"));
+        // NAF: its release weights, or the folder holding them. Other .pth files stay refused.
+        let naf = d.0.join("NAF");
+        std::fs::create_dir_all(&naf).unwrap();
+        std::fs::write(naf.join("naf_release.pth"), b"PK\x03\x04").unwrap();
+        for p in [naf.join("naf_release.pth"), naf.clone()] {
+            let r = detect(&p).unwrap();
+            assert_eq!(r.kind(), "model3d_naf");
+            assert!(field(&r, "naf").unwrap().ends_with("naf_release.pth"));
+        }
+        std::fs::write(naf.join("other.pth"), b"PK\x03\x04").unwrap();
+        assert!(detect(&naf.join("other.pth")).unwrap_err().contains("pickled"));
     }
 
     #[test]

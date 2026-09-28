@@ -49,13 +49,15 @@ The console accepts `status`, `start`, `stop`, `open`, `jobs` and `quit`.
   - The Gallery keeps everything generated this session, with each item's
     prompt, seed, steps and where its weights lived. Items can be reused,
     downloaded or removed.
-  - The Playground has Chat, Image, Speech, Music, Sound and Video tabs sized to the window. Chat
+  - The Playground has Chat, Image, Speech, Music, Sound, 3D and Video tabs sized to the window. Chat
     renders Markdown, can stop a reply mid-stream, and takes a system prompt.
     Speech speaks text in a saved voice, an OpenAI voice name, or a voice
     described in words, and **Save this voice…** keeps a described voice
     (see [Speech](SPEECH.md)). Music composes a song from lyrics and a
     description, or an instrumental (see [Music](MUSIC.md)). Sound makes a
-    sound effect from a description (see [Sound effects](SOUND.md)).
+    sound effect from a description (see [Sound effects](SOUND.md)). 3D makes
+    a textured GLB from a dropped picture of an object, and shows the picture as
+    it was cut out (see [3D models](MODEL3D.md)).
     Video comes with sound when the model has its audio VAE. Its
     **Soundtrack** choice can turn the sound off. It can also make the clip
     follow speech in a saved or described voice, or an audio file. Start and
@@ -108,6 +110,9 @@ headers, never its weights, and decides what it is:
 | Qwen3-TTS folder | `config.json` `model_type: qwen3_tts` (VoiceDesign or Base) | half of a speech model; the other half completes it |
 | Breeze TTS 2 folder | `config.json` `model_type: breeze` | a speech model (research and non-commercial use only) |
 | MOSS-SoundEffect folder | `model_index.json` `MossSoundEffectPipeline` | a sound effects model |
+| Pixal3D folder | `pipeline.json` `Trellis2ImageTo3DPipeline`, with `ckpts/` | a 3D model ([3D models](MODEL3D.md)); its DINOv3 and NAF parts are found beside it |
+| DINOv3 ViT-L/16 folder | `config.json` `model_type: dinov3_vit` | the image encoder of a 3D model |
+| `naf_release.pth` | its name | the feature upsampler of a 3D model (the one pickle accepted: read as tensors only) |
 | MiniMax-Music3 folder | `config.json` `model_type: minimax_music3` | a music model |
 | smaller music language model | GGUF `general.architecture: music3-lm` | the music model's `language_model` |
 | LTX audio VAE | `audio_vae.*` with `vocoder.bwe_generator.*` | the optional audio VAE of every video model that lacks one (LTX 2.3 and Sulphur checkpoints are their own) |
@@ -116,7 +121,8 @@ headers, never its weights, and decides what it is:
 | `tokenizer.json` | CLIP or Gemma special tokens | the tokenizer of an SDXL or LTX 2.3 model |
 | EXL3 / DeepSeek folders | `config.json` | a language model |
 
-Pickled `.bin`, `.pt` and `.ckpt` files are refused, because loading them can run code.
+Pickled `.bin`, `.pt` and `.ckpt` files are refused, because loading them can run code
+(NAF's `naf_release.pth` is the exception: nrob reads only its tensors).
 
 A model that still needs a part is added **disabled** and marked with what it
 needs. The studio fills parts itself where it can:
@@ -221,7 +227,7 @@ The **Endpoints** page edits `gateway.routes`. Each route has a `path`, a
 |---|---|---|
 | `chat` | `POST` → nrob-server `/v1/chat/completions`, streamed through as it arrives | — |
 | `completions` | `POST` → `/v1/completions` | — |
-| `models` | the LLM's list plus image, video, speech, music and sound effects models (`type`: llm, image, video, speech, music, sound) | — |
+| `models` | the LLM's list plus image, video, speech, music, sound effects and 3D models (`type`: llm, image, video, speech, music, sound, model3d) | — |
 | `images` | OpenAI Images (below) | nrob-server's job API: `202 {id, status_url}`, `GET …/status`, `POST …/cancel` |
 | `edits` | OpenAI image edits (below) | — |
 | `videos` | OpenAI Videos (below) | the same job API for video |
@@ -229,6 +235,7 @@ The **Endpoints** page edits `gateway.routes`. Each route has a `path`, a
 | `voices` | saved voices: list, design and save, sample, delete ([Speech](SPEECH.md)) | the same |
 | `music` | song jobs: create, poll, download, cancel ([Music](MUSIC.md)); a music model on `speech` sings too | the same |
 | `sound` | sound effect jobs on `/v1/audio/sound_effects`: create, poll, download, cancel ([Sound effects](SOUND.md)) | the same |
+| `model3d` | 3D model jobs on `/v1/3d/models`: create from a picture, poll, download the GLB and the cut-out picture, cancel ([3D models](MODEL3D.md)) | the same |
 | `files` | generated media under the output folder | — |
 | `health` | `{status, llm, media_busy}`, never behind the key | — |
 

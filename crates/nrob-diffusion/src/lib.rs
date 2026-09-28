@@ -19,3 +19,4 @@ pub mod sdxl;
 pub mod music;
 pub mod tts;
 pub mod sound;
+pub mod model3d;

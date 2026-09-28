@@ -133,7 +133,9 @@ pub fn browse(path: Option<&str>) -> Result<Json, String> {
             dirs.push((name.to_ascii_lowercase(), entry_json(&p, &name, true, 0)));
         } else {
             let ext = p.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
-            if SHOWN.contains(&ext.as_str()) && (ext != "exe" || name.to_ascii_lowercase().contains("ffmpeg")) && (!ext.is_empty() || name.contains("ffmpeg")) {
+            let shown = SHOWN.contains(&ext.as_str()) && (ext != "exe" || name.to_ascii_lowercase().contains("ffmpeg")) && (!ext.is_empty() || name.contains("ffmpeg"));
+            // NAF's weights, the one PyTorch file a model needs.
+            if shown || name.eq_ignore_ascii_case(crate::detect::NAF_FILE) {
                 files.push((name.to_ascii_lowercase(), entry_json(&p, &name, false, meta.len())));
             }
         }
@@ -188,12 +190,12 @@ mod tests {
         assert!(parse_gpu("garbage").is_none());
         let d = std::env::temp_dir().join(format!("nrob-studio-browse-{}", std::process::id()));
         std::fs::create_dir_all(d.join("sub")).unwrap();
-        for f in ["a.gguf", "notes.txt", "b.safetensors"] {
+        for f in ["a.gguf", "notes.txt", "b.safetensors", "naf_release.pth", "other.pth"] {
             std::fs::write(d.join(f), b"x").unwrap();
         }
         let listing = browse(Some(d.to_str().unwrap())).unwrap();
         let names: Vec<_> = listing.get("entries").unwrap().as_array().unwrap().iter().map(|e| e.get("name").unwrap().as_str().unwrap().to_string()).collect();
-        assert_eq!(names, ["sub", "a.gguf", "b.safetensors"]);
+        assert_eq!(names, ["sub", "a.gguf", "b.safetensors", "naf_release.pth"]);
         assert!(browse(Some(d.join("missing").to_str().unwrap())).is_err());
         std::fs::remove_dir_all(d).unwrap();
         assert!(!browse(None).unwrap().get("entries").unwrap().as_array().unwrap().is_empty());
