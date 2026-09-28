@@ -859,6 +859,8 @@ code {
 .card-meta { margin: 5px 0 0; color: var(--faint); font-size: 12px; }
 .card-warn { display: flex; align-items: center; gap: 6px; color: var(--amber); }
 .card-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+.card-actions-flush { margin-top: 0; }
+.card-address { overflow-wrap: anywhere; }
 
 /* A framed aside for a path/location note — the prototype's rail treatment. */
 .datadir-note {
@@ -1615,7 +1617,7 @@ select:disabled { cursor: not-allowed; opacity: 0.5; }
      This sheet's vocabulary is --border / --surface-raised / --primary, and
      they are hex, so they cannot go inside rgb(). */
   border: 1px solid var(--border);
-  border-radius: 12px;
+  border-radius: var(--r-card);
   padding: 14px 16px;
   background: var(--surface-raised);
 }
@@ -1628,7 +1630,7 @@ select:disabled { cursor: not-allowed; opacity: 0.5; }
 .pairing-body { display: flex; flex-direction: column; gap: 4px; font-size: 13px; opacity: 0.85; }
 .pairing-code code {
   font-size: 15px; letter-spacing: 2px; font-weight: 600;
-  padding: 1px 6px; border-radius: 6px;
+  padding: 1px 6px; border-radius: var(--r-sm);
   background: var(--surface-soft);
 }
 .pairing-actions { display: flex; gap: 8px; margin-top: 12px; }
@@ -1663,7 +1665,7 @@ select:disabled { cursor: not-allowed; opacity: 0.5; }
 
 /* The agent, the flow editor and the engines: webviews of their own, laid over this box by the app. */
 .embedded-page { flex: 1 1 auto; min-height: 0; position: relative; background: var(--canvas); }
-.embedded-problem { margin: 24px; color: var(--muted, #8b93a3); }
+.embedded-problem { margin: 24px; color: var(--muted); }
 
 /* ---------------------------------------------------------------------------
  * CALENDAR
@@ -1824,7 +1826,7 @@ select:disabled { cursor: not-allowed; opacity: 0.5; }
 .today-grid .overview-tile strong.ok { color: var(--green); }
 .today-grid .overview-tile strong.warn { color: var(--amber); }
 /* Five tiles stay one row down to a narrow window, their states a little smaller there. */
-.today-grid { grid-template-columns: repeat(auto-fit, minmax(128px, 1fr)); }
+.overview-grid.today-grid { grid-template-columns: repeat(auto-fit, minmax(128px, 1fr)); }
 .today-grid .overview-tile strong { max-width: 100%; overflow: hidden; font-size: clamp(16px, 1.45vw, 20px); line-height: 1.25; text-overflow: ellipsis; white-space: nowrap; }
 @media (max-width: 1000px) { .today-grid .overview-tile { padding: 14px; } }
 .overview-tile > svg { color: var(--muted); }

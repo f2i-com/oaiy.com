@@ -4,6 +4,7 @@ import {
   Loader2,
   Pencil,
   Plug2,
+  Plus,
   RefreshCw,
   Sparkles,
   Trash2,
@@ -425,9 +426,9 @@ export default function AiProvidersPanel() {
             </div>
           </form>
         ) : (
-          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+          <div className="card-actions card-actions-flush">
             <button className="btn btn-secondary" onClick={startAdd}>
-              + Add provider
+              <Plus size={14} /> Add provider
             </button>
           </div>
         )}
@@ -477,7 +478,7 @@ export default function AiProvidersPanel() {
                   {!p.enabled && <span className="badge badge-neutral">disabled</span>}
                 </div>
 
-                <p className="card-reason">
+                <p className="card-desc card-address">
                   <code>{p.id}</code> · {p.baseUrl}
                   {p.model ? ` · ${p.model}` : ''}
                 </p>
@@ -520,7 +521,7 @@ export default function AiProvidersPanel() {
                   </button>
                   {p.hasKey && (
                     <button
-                      className="btn btn-ghost btn-danger"
+                      className="btn btn-ghost"
                       disabled={working}
                       aria-label={`Clear the stored API key for ${p.name}`}
                       onClick={() => clearKey(p)}
