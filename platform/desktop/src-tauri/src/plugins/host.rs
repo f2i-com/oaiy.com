@@ -2158,6 +2158,39 @@ mod tests {
     }
 
     #[test]
+    fn the_phones_business_lookup_is_answered_by_the_calendar() {
+        // Aokie's lookup_business_data runs `business-lookup` and reads
+        // `{status:"done", result:{digest}}`; with no flow of that name stored,
+        // the calendar answers, at once.
+        let (sb, host) = host_with("lookup", vec![]);
+        install_plugin(&sb, "aokie", &["flow.run"]);
+        host.registry.lock().unwrap().scan();
+        crate::calendar::init(&sb.0);
+        let out = host
+            .handle_plugin_request("aokie", "flow.run", serde_json::json!({"flowSlug": "business-lookup", "input": {"question": "Any times this week?", "from": "+61400000000"}, "timeoutMs": 6000}))
+            .unwrap();
+        assert_eq!(out["status"], "done");
+        let digest = out["result"]["digest"].as_str().unwrap();
+        assert!(digest.contains("Opening hours:") && digest.contains("Free times"), "{digest}");
+    }
+
+    #[test]
+    fn another_flow_is_waited_for_only_within_its_budget() {
+        // No worker runs here, so the run stays queued: the answer comes when
+        // the plugin's budget is spent, saying so, rather than never.
+        let (sb, host) = host_with("flowwait", vec![]);
+        install_plugin(&sb, "aokie", &["flow.run"]);
+        host.registry.lock().unwrap().scan();
+        let started = Instant::now();
+        let out = host
+            .handle_plugin_request("aokie", "flow.run", serde_json::json!({"flowId": "manager-action-plan", "input": {}, "timeoutMs": 300}))
+            .unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(250) && started.elapsed() < Duration::from_secs(5));
+        assert_eq!(out["status"], "queued");
+        assert!(out["runId"].as_str().is_some_and(|id| !id.is_empty()));
+    }
+
+    #[test]
     fn admission_is_refused_to_a_plugin_that_did_not_declare_the_capability() {
         // The capability is the whole authorisation for reaching the roster.
         // A plugin that can broker admissions decides which phones take live
