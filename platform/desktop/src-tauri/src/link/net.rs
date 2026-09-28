@@ -61,6 +61,14 @@ mod tests {
     }
 }
 
+/// How long a provider that refused for too many requests (429) asks to be left:
+/// its `Retry-After` in seconds, at most two minutes (a lane is not parked for
+/// longer on a provider's word), or None when it did not say.
+pub fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<std::time::Duration> {
+    let secs: u64 = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?.trim().parse().ok()?;
+    Some(std::time::Duration::from_secs(secs.min(120)))
+}
+
 /// How long a lane waits after a poll that came back with nothing, given how long
 /// that poll took: at least half a second, and enough that the lane's polls are
 /// two seconds apart. A provider that cuts its long polls short (FormLogic under
@@ -76,6 +84,19 @@ pub fn idle_pause(polled_for: std::time::Duration) -> std::time::Duration {
 mod idle_tests {
     use super::idle_pause;
     use std::time::Duration;
+
+    #[test]
+    fn a_providers_retry_after_is_taken_within_reason() {
+        let mut h = reqwest::header::HeaderMap::new();
+        assert_eq!(super::retry_after(&h), None);
+        h.insert(reqwest::header::RETRY_AFTER, "17".parse().unwrap());
+        assert_eq!(super::retry_after(&h), Some(Duration::from_secs(17)));
+        h.insert(reqwest::header::RETRY_AFTER, "3600".parse().unwrap());
+        assert_eq!(super::retry_after(&h), Some(Duration::from_secs(120)));
+        // A date instead of seconds: not understood, so the lane's own back-off.
+        h.insert(reqwest::header::RETRY_AFTER, "Wed, 21 Oct 2026 07:28:00 GMT".parse().unwrap());
+        assert_eq!(super::retry_after(&h), None);
+    }
 
     #[test]
     fn an_empty_poll_is_followed_by_enough_of_a_pause() {

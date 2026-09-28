@@ -122,6 +122,12 @@ fn poll_once(
         .send()
         .map_err(|_| "sealed flow poll could not reach the provider")?;
     if !pending.status().is_success() {
+        // Asked to slow down: wait as long as the provider said before the lane's own back-off.
+        if pending.status().as_u16() == 429 {
+            if let Some(wait) = super::net::retry_after(pending.headers()) {
+                std::thread::sleep(wait);
+            }
+        }
         return Err(format!("sealed flow poll: HTTP {}", pending.status()));
     }
     let pending: Pending = read_json(pending)?;

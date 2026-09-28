@@ -150,6 +150,12 @@ fn poll_once(
 
     let status = resp.status();
     if !status.is_success() {
+        // Asked to slow down: wait as long as the provider said before the lane's own back-off.
+        if status.as_u16() == 429 {
+            if let Some(wait) = super::net::retry_after(resp.headers()) {
+                std::thread::sleep(wait);
+            }
+        }
         let body: Value = resp.json().unwrap_or(Value::Null);
         let message = body
             .get("message")

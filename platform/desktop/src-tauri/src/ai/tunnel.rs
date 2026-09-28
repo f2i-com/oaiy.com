@@ -435,6 +435,12 @@ impl AiTunnel {
             .map_err(|e| format!("could not reach the AI lane: {e}"))?;
         let status = resp.status();
         if !status.is_success() {
+            // Asked to slow down: wait as long as the provider said before the lane's own back-off.
+            if status.as_u16() == 429 {
+                if let Some(wait) = crate::link::net::retry_after(resp.headers()) {
+                    tokio::time::sleep(wait).await;
+                }
+            }
             let body: Value = resp.json().await.unwrap_or(Value::Null);
             let message = body
                 .get("message")
