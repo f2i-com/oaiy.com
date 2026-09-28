@@ -238,7 +238,8 @@
       "payload": "payload",
       "items": "responses",
       "id": "id",
-      "effectsList": "effects"
+      "effectsList": "effects",
+      "writeKey": "idempotencyKey"
     },
     "catalogue": {
       "apps": "apps",

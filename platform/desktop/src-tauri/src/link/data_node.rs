@@ -178,11 +178,12 @@ pub fn spawn(store: LinkHandle) {
 
             // Registering is a WRITE and belongs on the slow schedule.
             if now >= next_register {
-                match register(&account, &spec, &identity) {
-                    Ok(status) => store.note_data_node(Ok(status)),
-                    Err(e) => store.note_data_node(Err(e)),
-                }
-                next_register = now + Duration::from_secs(spec.interval_seconds.max(60));
+                let registered = register(&account, &spec, &identity);
+                // A failed one (the provider away) is tried again in five
+                // minutes, not an hour: enrolment waits on it.
+                let wait = if registered.is_ok() { spec.interval_seconds.max(60) } else { spec.interval_seconds.clamp(60, 300) };
+                store.note_data_node(registered);
+                next_register = now + Duration::from_secs(wait);
                 // A register answers with the record too, so the read-back can
                 // wait its full interval rather than firing straight after.
                 next_refresh = now + REFRESH_INTERVAL;

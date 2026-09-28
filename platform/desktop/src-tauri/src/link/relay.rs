@@ -89,10 +89,16 @@ pub fn spawn(store: LinkHandle, dispatch: Dispatcher) {
             // Recorded as the lane's state because from the provider's side it
             // is indistinguishable from a desktop that never polled at all.
             Ok((handled, trouble)) => {
+                // A poll that works while its commands cannot be claimed or
+                // answered (the provider half down) backs off like a failed
+                // poll, rather than going straight round again.
+                let backoff = trouble.is_some();
                 store.note_relay(trouble);
                 // A batch that did work is likely followed by more; go straight
                 // back. An empty one already waited server-side.
-                if handled == 0 {
+                if backoff {
+                    std::thread::sleep(Duration::from_secs(spec.error_backoff_seconds));
+                } else if handled == 0 {
                     std::thread::sleep(Duration::from_millis(500));
                 }
             }
@@ -139,7 +145,7 @@ fn poll_once(
         .get(&url)
         .bearer_auth(&account.credential)
         .send()
-        .map_err(|e| format!("could not reach the relay: {e}"))?;
+        .map_err(|e| format!("could not reach the relay: {}", super::net::unreachable(&e)))?;
 
     let status = resp.status();
     if !status.is_success() {
@@ -247,23 +253,28 @@ fn serve(
         &account.base_url,
         &spec.complete_path.replace("{id}", &command.id),
     );
-    let done = http
-        .post(&complete_url)
-        .bearer_auth(&account.credential)
-        .json(&report)
-        .send()
-        .map_err(|e| format!("could not report the outcome: {e}"))?;
-    if !done.status().is_success() {
-        return Err(format!(
-            "the relay refused the outcome: HTTP {}",
-            done.status().as_u16()
-        ));
+    // The work is done (a text may have gone), so its outcome is worth a few
+    // tries: lost, the provider shows the command as never picked up, and a
+    // person asking again would do the work twice. Within the command's short
+    // life, so no longer than a few seconds.
+    let mut last = String::new();
+    for wait in [0u64, 1, 3] {
+        std::thread::sleep(Duration::from_secs(wait));
+        match http.post(&complete_url).bearer_auth(&account.credential).json(&report).send() {
+            // Ok even when the WORK failed. The command was answered, so the
+            // user reads "no plugin named ghost" on the provider's page; calling
+            // that a lane failure would put a red "not receiving commands" on
+            // this panel every time somebody asks for something that does not exist.
+            Ok(done) if done.status().is_success() => return Ok(()),
+            // Refused outright: another try says the same.
+            Ok(done) if done.status().is_client_error() => {
+                return Err(format!("the relay refused the outcome: HTTP {}", done.status().as_u16()));
+            }
+            Ok(done) => last = format!("the relay refused the outcome: HTTP {}", done.status().as_u16()),
+            Err(e) => last = format!("could not report the outcome: {}", super::net::unreachable(&e)),
+        }
     }
-    // Ok even when the WORK failed. The command was answered, so the user reads
-    // "no plugin named ghost" on the provider's page; calling that a lane
-    // failure would put a red "not receiving commands" on this panel every time
-    // somebody asks for something that does not exist.
-    Ok(())
+    Err(last)
 }
 
 fn urlencode(value: &str) -> String {

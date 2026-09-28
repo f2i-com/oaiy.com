@@ -202,6 +202,8 @@ pub struct LinkStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data_node_error: Option<String>,
     pub data_node_supported: bool,
+    /// Plugin events kept for the account until FormLogic can take them.
+    pub outbox: outbox::Status,
     /// The in-flight attempt, if any.
     pub attempt: LinkPhase,
     /// Every provider this build can link to.
@@ -331,6 +333,7 @@ impl LinkStore {
                 data_node: None,
                 data_node_error: None,
                 data_node_supported: false,
+                outbox: outbox::current_status(),
                 attempt: inner.attempt.clone(),
                 available,
             },
@@ -370,6 +373,7 @@ impl LinkStore {
                     data_node: inner.data_node.clone(),
                     data_node_error: inner.data_node_error.clone(),
                     data_node_supported: d.is_some_and(|d| d.data_node.is_some()),
+                    outbox: outbox::current_status(),
                     attempt: inner.attempt.clone(),
                     available,
                 }

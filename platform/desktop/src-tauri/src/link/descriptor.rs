@@ -309,6 +309,11 @@ pub struct AppLogicFields {
     /// and a name spelled in the code would read a key that is not there and
     /// perform nothing at all, on every event.
     pub effects_list: String,
+    /// On a record write: where a key goes, so the same event sent again
+    /// (the provider was away) finds the record it made instead of making a
+    /// second. Optional: a provider without one is sent no key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write_key: Option<String>,
 }
 
 /// What the parts of the fetched app list are called.

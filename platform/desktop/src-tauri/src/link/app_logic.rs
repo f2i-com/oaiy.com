@@ -194,6 +194,9 @@ pub struct Outcome {
     /// failure happened before any effect was reached.
     pub effect: String,
     pub detail: Result<String, String>,
+    /// A record write that did not land because the provider could not be
+    /// reached or was down: the event is sent again later (see `outbox`).
+    pub transient: bool,
 }
 
 impl Outcome {
@@ -203,8 +206,53 @@ impl Outcome {
             script: script.to_string(),
             effect: effect.to_string(),
             detail: Err(detail.into()),
+            transient: false,
         }
     }
+}
+
+/// Why a record write did not happen, and whether trying again later can help.
+#[derive(Debug)]
+struct Failed {
+    message: String,
+    transient: bool,
+}
+
+impl From<String> for Failed {
+    fn from(message: String) -> Self {
+        Self { message, transient: false }
+    }
+}
+
+impl Failed {
+    fn unreachable(what: &str, e: &reqwest::Error) -> Self {
+        Self { message: format!("could not reach the provider to {what}: {}", super::net::unreachable(e)), transient: true }
+    }
+
+    /// A refusal, which is worth trying again when the provider was down or busy.
+    fn refused(status: reqwest::StatusCode, message: String) -> Self {
+        let s = status.as_u16();
+        // 409 here is "still being taken from an earlier try" (a clash of
+        // values is handled before this); a key refused is mended by linking
+        // again, and the event must still be there then.
+        Self { message, transient: matches!(s, 401 | 403 | 408 | 409 | 429) || s >= 500 }
+    }
+}
+
+/// The key a record written for an effect is created under, so the same
+/// event sent again (the provider was away) finds the record it made the
+/// first time. Kept to 128 characters, as providers cap keys.
+fn record_key(event_key: &str, script: &str, index: usize) -> Option<String> {
+    if event_key.is_empty() {
+        return None;
+    }
+    let key = format!("applogic:{event_key}:{script}:{index}");
+    if key.len() <= 128 {
+        return Some(key);
+    }
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(key.as_bytes());
+    Some(format!("applogic:{}", digest.iter().take(24).map(|b| format!("{b:02x}")).collect::<String>()))
 }
 
 /// Perform a connector command on this desktop. Supplied by the caller so this
@@ -310,6 +358,12 @@ impl Catalog {
     /// different account entirely, whose scripts would write the wrong records.
     pub fn invalidate(&self) {
         *self.inner.lock().unwrap_or_else(|e| e.into_inner()) = CatalogState::default();
+    }
+
+    /// Let the next load ask the provider again at once, keeping what is
+    /// held: the outbox, which spaces its own tries, is trying again.
+    pub fn retry_now(&self) {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).retry_at = None;
     }
 }
 
@@ -963,14 +1017,15 @@ fn apply_effects(
             continue;
         };
 
-        let result = match operation {
+        let key = record_key(event_key, script, index);
+        let result: Result<String, Failed> = match operation {
             AppLogicOperation::SubmitRecord => {
-                submit(account, spec, entry, effect).map(|id| match id {
+                submit(account, spec, entry, effect, key.as_deref()).map(|id| match id {
                     Some(id) => format!("created record {id}"),
                     None => "created a record".to_string(),
                 })
             }
-            AppLogicOperation::UpdateRecord => update(account, spec, entry, effect),
+            AppLogicOperation::UpdateRecord => update(account, spec, entry, effect, key.as_deref()),
             AppLogicOperation::SetStorage => {
                 let key = effect
                     .get(&f.storage_key)
@@ -979,15 +1034,16 @@ fn apply_effects(
                     .trim()
                     .to_string();
                 if key.is_empty() {
-                    Err("the effect names no key to store under".to_string())
+                    Err("the effect names no key to store under".to_string().into())
                 } else if record_write_failed {
                     // Deliberately not stored. The script's own order says a
                     // failed write must not be marked handled, and storing it
                     // anyway would lose the record permanently.
                     Err(format!(
                         "held back {key:?} because a record write earlier in this script \
-                         failed; the event will be handled again"
-                    ))
+                         failed, so the event is not marked handled"
+                    )
+                    .into())
                 } else {
                     // A marker with no value would read as absent on the next
                     // delivery, so an unstated one means "yes, seen".
@@ -1001,9 +1057,9 @@ fn apply_effects(
                         .apply(app, std::slice::from_ref(&(key.clone(), value)))
                         .map(|()| format!("remembered {key:?}"))
                         .map_err(|e| {
-                            format!(
+                            Failed::from(format!(
                                 "{e} — {key:?} was not saved, so this event will be handled again"
-                            )
+                            ))
                         })
                 }
             }
@@ -1016,11 +1072,11 @@ fn apply_effects(
                             .unwrap_or("info");
                         Ok(format!("[{level}] {m}"))
                     }
-                    _ => Err("the effect names no message to show".to_string()),
+                    _ => Err("the effect names no message to show".to_string().into()),
                 }
             }
             AppLogicOperation::ConnectorRequest => {
-                connector_request(spec, effect, event_key, script, index, connector)
+                connector_request(spec, effect, event_key, script, index, connector).map_err(Failed::from)
             }
         };
 
@@ -1031,11 +1087,13 @@ fn apply_effects(
         {
             record_write_failed = true;
         }
+        let transient = result.as_ref().err().is_some_and(|f| f.transient);
         out.push(Outcome {
             app: app.to_string(),
             script: script.to_string(),
             effect: kind,
-            detail: result,
+            detail: result.map_err(|f| f.message),
+            transient,
         });
     }
     out
@@ -1091,26 +1149,36 @@ fn submit(
     spec: &AppLogicSpec,
     entry: &AppEntry,
     effect: &Value,
-) -> Result<Option<String>, String> {
+    key: Option<&str>,
+) -> Result<Option<String>, Failed> {
     let form = form_id(spec, entry, effect)?;
     let values = record(spec, effect)?;
     let url = super::oauth::join(
         &account.base_url,
         &spec.submit_path.replace("{formId}", form),
     );
+    let mut body = json!({ &spec.fields.record: values });
+    if let (Some(k), Some(field)) = (key, spec.fields.write_key.as_deref()) {
+        // The same event sent again gets the record it made, not a second one.
+        body[field] = json!(k);
+    }
     let resp = client()?
         .post(&url)
         .bearer_auth(&account.credential)
-        .json(&json!({ &spec.fields.record: values }))
+        .json(&body)
         .send()
-        .map_err(|e| format!("could not reach the provider to create the record: {e}"))?;
+        .map_err(|e| Failed::unreachable("create the record", &e))?;
     let status = resp.status();
     let payload: Value = resp.json().unwrap_or(Value::Null);
+    if status.as_u16() == 409 && payload.get("conflict").and_then(Value::as_bool) == Some(true) {
+        // Made already, under this key, from values the script has since
+        // built differently: the record is there.
+        return Ok(None);
+    }
     if !status.is_success() {
-        return Err(format!(
-            "the provider refused the record: HTTP {}: {}",
-            status.as_u16(),
-            refusal(&payload)
+        return Err(Failed::refused(
+            status,
+            format!("the provider refused the record: HTTP {}: {}", status.as_u16(), refusal(&payload)),
         ));
     }
     Ok(created_id(spec, &payload))
@@ -1143,7 +1211,8 @@ fn update(
     spec: &AppLogicSpec,
     entry: &AppEntry,
     effect: &Value,
-) -> Result<String, String> {
+    key: Option<&str>,
+) -> Result<String, Failed> {
     let f = &spec.fields;
     let form = form_id(spec, entry, effect)?;
     let values = record(spec, effect)?;
@@ -1177,7 +1246,8 @@ fn update(
                 return Err(format!(
                     "the effect's match wants {field:?} to equal nothing, which would find the \
                      first record that has no {field:?} at all and overwrite it"
-                ));
+                )
+                .into());
             }
             find_record(account, spec, form, field, wanted)?
         }
@@ -1188,7 +1258,7 @@ fn update(
         // record that was never written — a clean no-op, said out loud rather
         // than swallowed.
         if effect.get(&f.upsert).and_then(Value::as_bool) == Some(true) {
-            let created = submit(account, spec, entry, effect)?;
+            let created = submit(account, spec, entry, effect, key)?;
             return Ok(match created {
                 Some(id) => format!("no record matched, so one was created ({id})"),
                 None => "no record matched, so one was created".to_string(),
@@ -1210,14 +1280,13 @@ fn update(
         .bearer_auth(&account.credential)
         .json(&json!({ &f.record: values }))
         .send()
-        .map_err(|e| format!("could not reach the provider to update the record: {e}"))?;
+        .map_err(|e| Failed::unreachable("update the record", &e))?;
     let status = resp.status();
     if !status.is_success() {
         let payload: Value = resp.json().unwrap_or(Value::Null);
-        return Err(format!(
-            "the provider refused the update to {id}: HTTP {}: {}",
-            status.as_u16(),
-            refusal(&payload)
+        return Err(Failed::refused(
+            status,
+            format!("the provider refused the update to {id}: HTTP {}: {}", status.as_u16(), refusal(&payload)),
         ));
     }
     Ok(format!("updated record {id}"))
@@ -1236,7 +1305,7 @@ fn find_record(
     form: &str,
     field: &str,
     wanted: &Value,
-) -> Result<Option<String>, String> {
+) -> Result<Option<String>, Failed> {
     let path = spec.list_path.replace("{formId}", form);
     let sep = if path.contains('?') { '&' } else { '?' };
     let url = format!(
@@ -1248,14 +1317,13 @@ fn find_record(
         .get(&url)
         .bearer_auth(&account.credential)
         .send()
-        .map_err(|e| format!("could not reach the provider to find the record: {e}"))?;
+        .map_err(|e| Failed::unreachable("find the record", &e))?;
     let status = resp.status();
     let payload: Value = resp.json().unwrap_or(Value::Null);
     if !status.is_success() {
-        return Err(format!(
-            "the provider refused the record listing: HTTP {}: {}",
-            status.as_u16(),
-            refusal(&payload)
+        return Err(Failed::refused(
+            status,
+            format!("the provider refused the record listing: HTTP {}: {}", status.as_u16(), refusal(&payload)),
         ));
     }
     let items = payload
@@ -2152,6 +2220,21 @@ mod tests {
     }
 
     // --- idempotency -------------------------------------------------------
+
+    #[test]
+    fn a_record_write_keys_on_the_event_so_sending_it_again_makes_no_second_record() {
+        // The outbox sends an event again when the provider was away; the
+        // records its scripts wrote the first time must be found, not made twice.
+        let a = record_key("evt-7", "calls", 0).unwrap();
+        assert_eq!(Some(a.clone()), record_key("evt-7", "calls", 0));
+        assert_ne!(Some(a.clone()), record_key("evt-7", "calls", 1));
+        assert_ne!(Some(a), record_key("evt-8", "calls", 0));
+        let long = record_key(&"e".repeat(200), "calls", 0).unwrap();
+        assert!(long.len() <= 128, "{long}");
+        assert_eq!(record_key("", "calls", 0), None, "no event key, no record key");
+        let d = crate::link::descriptor::find(std::path::Path::new("/nonexistent"), "formlogic").unwrap();
+        assert!(d.app_logic.unwrap().fields.write_key.is_some(), "the built-in connector says where the key goes");
+    }
 
     #[test]
     fn a_connector_command_keys_on_the_events_own_key_so_a_retry_cannot_act_twice() {

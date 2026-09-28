@@ -217,6 +217,8 @@ pub fn spawn(store: LinkHandle, node: Option<NodeHandle>) {
                 return;
             }
         };
+        // Said once per reason, not every ten seconds while the provider is away.
+        let mut last_warned: Option<String> = None;
         loop {
             let Some(account) = store.account() else {
                 std::thread::sleep(Duration::from_secs(5));
@@ -269,10 +271,17 @@ pub fn spawn(store: LinkHandle, node: Option<NodeHandle>) {
                 store.note_sealed_flow(result.as_ref().err().cloned());
             }
             match result {
-                Ok(true) => (),
-                Ok(false) => std::thread::sleep(Duration::from_millis(500)),
+                Ok(worked) => {
+                    last_warned = None;
+                    if !worked {
+                        std::thread::sleep(Duration::from_millis(500));
+                    }
+                }
                 Err(error) => {
-                    log::warn!("{error}");
+                    if last_warned.as_deref() != Some(error.as_str()) {
+                        log::warn!("{error}");
+                        last_warned = Some(error);
+                    }
                     std::thread::sleep(Duration::from_secs(spec.error_backoff_seconds));
                 }
             }

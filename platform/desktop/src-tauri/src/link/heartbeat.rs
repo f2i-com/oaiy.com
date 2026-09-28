@@ -413,7 +413,7 @@ fn send(
         .bearer_auth(&account.credential)
         .json(&serde_json::Value::Object(body))
         .send()
-        .map_err(|e| format!("could not reach {}: {e}", account.base_url))?;
+        .map_err(|e| super::net::unreachable(&e))?;
 
     let status = resp.status();
     if status.is_success() {

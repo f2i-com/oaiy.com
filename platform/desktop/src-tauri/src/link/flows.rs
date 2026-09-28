@@ -215,6 +215,12 @@ impl FlowBindings {
     pub fn invalidate(&self) {
         *self.inner.lock().unwrap_or_else(|e| e.into_inner()) = BindingsState::default();
     }
+
+    /// Let the next load ask the provider again at once, keeping what is
+    /// held: the outbox, which spaces its own tries, is trying again.
+    pub fn retry_now(&self) {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).retry_at = None;
+    }
 }
 
 /// What the run is started with.
@@ -510,6 +516,26 @@ pub fn idempotency_key(binding_id: &str, event_idempotency_key: &str) -> String 
 ///
 /// Returns the run id, or `None` when the provider says it already had this
 /// one — which is the idempotency gate doing its job, not a failure.
+/// Why a run was not reserved, and whether trying again later can help (the
+/// provider could not be reached, or was down or busy).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotReserved {
+    pub message: String,
+    pub later: bool,
+}
+
+impl std::fmt::Display for NotReserved {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl From<String> for NotReserved {
+    fn from(message: String) -> Self {
+        Self { message, later: false }
+    }
+}
+
 pub fn reserve(
     account: &LinkedAccount,
     spec: &FlowsSpec,
@@ -518,7 +544,7 @@ pub fn reserve(
     correlation_id: &str,
     event_idempotency_key: &str,
     envelope: &Value,
-) -> Result<Option<String>, String> {
+) -> Result<Option<String>, NotReserved> {
     let flow_slug = binding
         .flow_slug
         .as_deref()
@@ -554,7 +580,7 @@ pub fn reserve(
         .bearer_auth(&account.credential)
         .json(&body)
         .send()
-        .map_err(|e| format!("could not reserve the run: {e}"))?;
+        .map_err(|e| NotReserved { message: format!("could not reserve the run: {}", super::net::unreachable(&e)), later: true })?;
     let status = resp.status();
     let payload: Value = resp.json().unwrap_or(Value::Null);
     if !status.is_success() {
@@ -562,7 +588,11 @@ pub fn reserve(
             .get("message")
             .and_then(Value::as_str)
             .unwrap_or("the provider refused the run");
-        return Err(format!("HTTP {}: {message}", status.as_u16()));
+        let s = status.as_u16();
+        // A key the provider no longer takes is mended by linking again, and
+        // the event must still be there then.
+        let later = matches!(s, 401 | 403 | 408 | 429) || s >= 500;
+        return Err(NotReserved { message: format!("HTTP {s}: {message}"), later });
     }
     // Already reserved by an earlier delivery of this same event.
     if payload.get("created").and_then(Value::as_bool) == Some(false) {

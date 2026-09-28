@@ -358,6 +358,20 @@ impl ProfileCache {
         self.inner.lock().unwrap_or_else(|e| e.into_inner()).held.clone()
     }
 
+    /// What is held, from memory or else the disk copy, never asking the
+    /// provider: for this desktop's own triggers, which must not wait on a
+    /// provider that is away. The heartbeat keeps the copy fresh.
+    pub fn held_here(&self, data_dir: &Path) -> Option<Arc<Profile>> {
+        let mut state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if state.held.is_none() && !state.read_disk {
+            state.read_disk = true;
+            if let Some(profile) = read_disk(data_dir) {
+                state.held = Some(Arc::new(profile));
+            }
+        }
+        state.held.clone()
+    }
+
     /// The profile for a lane about to run the provider's source: memory, else
     /// the disk copy, else one fetch (rate-limited after a failure).
     ///
@@ -568,6 +582,18 @@ pub fn resolve(account: &LinkedAccount, data_dir: &Path) -> Held {
              engine while that is true, and runs the work there instead",
             spec.path
         )),
+    }
+}
+
+/// `resolve`, from what this desktop already holds: no request, however long
+/// the provider has been away.
+pub fn resolve_held(account: &LinkedAccount, data_dir: &Path) -> Held {
+    if super::descriptor::find(data_dir, &account.connector_id).and_then(|d| d.script_profile).is_none() {
+        return Held::NotRequired;
+    }
+    match ProfileCache::global().held_here(data_dir) {
+        Some(profile) => Held::Ready(profile),
+        None => Held::Missing("this desktop has not read the provider's standard library yet".into()),
     }
 }
 

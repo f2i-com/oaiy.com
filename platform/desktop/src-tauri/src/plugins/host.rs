@@ -53,6 +53,7 @@ use super::runner::{restart_delay, should_restart, HealthTracker, HealthVerdict,
 use crate::bridge::deadletters::{DeadLetterHandle, DeadReason};
 use crate::bridge::ledger::{LedgerHandle, LineageRef, ReserveOutcome, RunRequest, RunStatus};
 use crate::bridge::triggers::{dispatch, DispatchOutcome, Event, SkipReason, TriggerBinding};
+use crate::link::outbox::account_key;
 use crate::services::runner::LogBuffer;
 
 /// Does this skip mean something went WRONG, or the trigger system working?
@@ -497,6 +498,9 @@ pub struct PluginHost {
     /// construction like the companion broker, and for the same reason: the
     /// host exists before the link does, and in tests there is no link at all.
     link: Mutex<Option<crate::link::LinkHandle>>,
+    /// Events on their way to the linked account, kept on disk until they get
+    /// there (see [`crate::link::outbox`]). Made with the link.
+    outbox: std::sync::OnceLock<Arc<crate::link::outbox::Outbox>>,
     /// The account's trigger bindings, cached between events.
     flow_bindings: crate::link::flows::FlowBindings,
     /// The account's apps and their logic scripts, cached between events.
@@ -548,6 +552,7 @@ impl PluginHost {
             dev_mode,
             companion: Mutex::new(None),
             link: Mutex::new(None),
+            outbox: std::sync::OnceLock::new(),
             flow_bindings: crate::link::flows::FlowBindings::new(),
             app_logic: crate::link::app_logic::Catalog::new(),
             scripts: Mutex::new(std::sync::Arc::new(crate::bridge::script_host::GlobalHost)),
@@ -561,6 +566,43 @@ impl PluginHost {
                     let Some(host) = host.upgrade() else { break };
                     host.process_event(&plugin_id, envelope);
                 }
+            });
+        }
+
+        // Outbox thread: sends the events kept for the linked account, oldest
+        // first, and waits while FormLogic cannot be reached. Off the event
+        // thread, so nothing local waits on FormLogic.
+        {
+            let host = Arc::downgrade(&host);
+            thread::spawn(move || loop {
+                let Some(h) = host.upgrade() else { break };
+                let Some(outbox) = h.outbox.get().cloned() else {
+                    drop(h);
+                    thread::sleep(Duration::from_secs(2));
+                    continue;
+                };
+                let link = h.link.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                let account = link.as_ref().and_then(|l| l.account()).map(|a| account_key(&a));
+                let heard = if outbox.retrying() {
+                    // The outbox spaces its own tries; the caches' own waits
+                    // after a failure would only add to them.
+                    h.flow_bindings.retry_now();
+                    h.app_logic.retry_now();
+                    link.as_ref().and_then(|l| l.status().last_heartbeat_at)
+                } else {
+                    None
+                };
+                outbox.send_due(
+                    account.as_deref(),
+                    heard,
+                    &|plugin, envelope| h.deliver_to_account(plugin, envelope),
+                    &|plugin, envelope, why| {
+                        let name = envelope.get("name").and_then(Value::as_str).unwrap_or("(unnamed)").to_string();
+                        h.record_dead(plugin, &name, DeadReason::NotDelivered { detail: why }, envelope.clone());
+                    },
+                );
+                drop(h);
+                outbox.wait_for_work();
             });
         }
 
@@ -1016,34 +1058,83 @@ impl PluginHost {
 
     // --- internals ---------------------------------------------------------
 
+    /// Send one kept event to the linked account: its flows, then its apps'
+    /// logic. Runs on the outbox thread (see `crate::link::outbox`), so a
+    /// FormLogic that cannot be reached holds up nothing on this machine.
+    fn deliver_to_account(&self, plugin_id: &str, envelope: &Value) -> crate::link::outbox::Delivery {
+        use crate::link::outbox::Delivery;
+        let event = Event {
+            name: envelope.get("name").and_then(Value::as_str).unwrap_or("").to_string(),
+            source: plugin_id.to_string(),
+            correlation_id: envelope.get("correlationId").and_then(Value::as_str).unwrap_or("").to_string(),
+            idempotency_key: envelope.get("idempotencyKey").and_then(Value::as_str).unwrap_or("").to_string(),
+            data: envelope.get("data").cloned().unwrap_or(Value::Null),
+            origin_run: None,
+        };
+        let flows = self.fan_out_to_linked_flows(&event, envelope);
+        let logic = self.fan_out_to_app_logic(&event, envelope);
+        match (flows, logic) {
+            (Delivery::Later(a), _) | (_, Delivery::Later(a)) => Delivery::Later(a),
+            (Delivery::Refused(a), Delivery::Refused(b)) => Delivery::Refused(format!("{a}; {b}")),
+            (Delivery::Refused(a), _) | (_, Delivery::Refused(a)) => Delivery::Refused(a),
+            _ => Delivery::Done,
+        }
+    }
+
+    /// Keep an event for the linked account, when there is one. Err when it
+    /// could not be written, so the plugin is not told it arrived.
+    fn queue_for_account(&self, plugin_id: &str, envelope: &Value) -> Result<(), String> {
+        let link = self.link.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let Some(account) = link.as_ref().and_then(|l| l.account()) else {
+            // Not linked: this desktop is all there is.
+            return Ok(());
+        };
+        let Some(outbox) = self.outbox.get() else { return Ok(()) };
+        match outbox.enqueue(plugin_id, &account_key(&account), envelope) {
+            Ok(()) => Ok(()),
+            Err(crate::link::outbox::Enqueue::Full) => {
+                let name = envelope.get("name").and_then(Value::as_str).unwrap_or("(unnamed)").to_string();
+                self.record_dead(
+                    plugin_id,
+                    &name,
+                    DeadReason::NotDelivered { detail: "not sent: too many events were already waiting for the linked account".into() },
+                    envelope.clone(),
+                );
+                Ok(())
+            }
+            Err(crate::link::outbox::Enqueue::NotWritten(e)) => Err(e),
+        }
+    }
+
     /// Reserve a run on the linked account for every binding this event fires.
     ///
-    /// Best effort and non-fatal: the local dispatch has already happened, and
-    /// a provider that is unreachable must not stop this desktop's own
-    /// automation. Each outcome is logged with the binding it belongs to,
-    /// because a trigger that silently does nothing is the hardest kind of
-    /// automation bug to find.
-    fn fan_out_to_linked_flows(&self, event: &crate::bridge::triggers::Event, envelope: &Value) {
+    /// The local dispatch has already happened. Each outcome is logged with the
+    /// binding it belongs to, because a trigger that silently does nothing is
+    /// the hardest kind of automation bug to find. `Later` when a run could not
+    /// be reserved for want of FormLogic (reserving again is harmless: each run
+    /// is keyed by its binding and the event).
+    fn fan_out_to_linked_flows(&self, event: &crate::bridge::triggers::Event, envelope: &Value) -> crate::link::outbox::Delivery {
+        use crate::link::outbox::Delivery;
         let link = {
             let guard = self.link.lock().unwrap_or_else(|e| e.into_inner());
             match guard.as_ref() {
                 Some(l) => l.clone(),
-                None => return,
+                None => return Delivery::Done,
             }
         };
         let Some(account) = link.account() else {
-            return;
+            return Delivery::Done;
         };
         let Some(spec) = crate::link::descriptor::find(link.data_dir(), &account.connector_id)
             .and_then(|d| d.flows)
         else {
-            return;
+            return Delivery::Done;
         };
         let bindings = match self.flow_bindings.load(&account, &spec) {
             Ok(b) => b,
             Err(e) => {
-                log::warn!("flow bindings for {}: {e}", event.name);
-                return;
+                // Not "no bindings": the event waits until they can be read.
+                return Delivery::Later(format!("the account's flow triggers could not be read: {e}"));
             }
         };
         // The envelope, not the internal event: conditions are authored against
@@ -1070,6 +1161,7 @@ impl PluginHost {
                 reason.message()
             );
         }
+        let (mut later, mut refused) = (None, Vec::new());
         for binding in selection.fire {
             match crate::link::flows::reserve(
                 &account,
@@ -1086,8 +1178,19 @@ impl PluginHost {
                 // Already reserved by an earlier delivery — the idempotency
                 // gate doing its job, not a failure.
                 Ok(None) => log::debug!("flow binding {} already had this event", binding.id),
-                Err(e) => log::warn!("flow binding {} could not reserve a run: {e}", binding.id),
+                Err(e) if e.later => {
+                    later.get_or_insert(format!("flow trigger {}: {e}", binding.id));
+                }
+                Err(e) => {
+                    log::warn!("flow binding {} could not reserve a run: {e}", binding.id);
+                    refused.push(format!("flow trigger {} could not start its flow: {e}", binding.id));
+                }
             }
+        }
+        match (later, refused.is_empty()) {
+            (Some(why), _) => crate::link::outbox::Delivery::Later(why),
+            (None, false) => crate::link::outbox::Delivery::Refused(refused.join("; ")),
+            (None, true) => crate::link::outbox::Delivery::Done,
         }
     }
 
@@ -1104,27 +1207,28 @@ impl PluginHost {
     /// runs on the warm script host, in the third and last batch this event
     /// sends — so an account whose apps carry no event scripts must and does
     /// cost nothing here, not even a batch.
-    fn fan_out_to_app_logic(&self, event: &crate::bridge::triggers::Event, envelope: &Value) {
+    fn fan_out_to_app_logic(&self, event: &crate::bridge::triggers::Event, envelope: &Value) -> crate::link::outbox::Delivery {
+        use crate::link::outbox::Delivery;
         let link = {
             let guard = self.link.lock().unwrap_or_else(|e| e.into_inner());
             match guard.as_ref() {
                 Some(l) => l.clone(),
-                None => return,
+                None => return Delivery::Done,
             }
         };
         let Some(account) = link.account() else {
-            return;
+            return Delivery::Done;
         };
         let Some(spec) = crate::link::descriptor::find(link.data_dir(), &account.connector_id)
             .and_then(|d| d.app_logic)
         else {
-            return;
+            return Delivery::Done;
         };
         let apps = match self.app_logic.load(&account, &spec) {
             Ok(a) => a,
             Err(e) => {
-                log::warn!("app logic for {}: {e}", event.name);
-                return;
+                // Not "no apps": the event waits until they can be read.
+                return Delivery::Later(format!("the account's app logic could not be read: {e}"));
             }
         };
         let held = crate::link::script_profile::resolve(&account, link.data_dir());
@@ -1148,6 +1252,7 @@ impl PluginHost {
                     ForwardError::Internal(message) => message,
                 })
         };
+        let mut later = None;
         for outcome in crate::link::app_logic::handle_event(
             &account,
             &spec,
@@ -1168,6 +1273,11 @@ impl PluginHost {
                     outcome.script,
                     outcome.effect
                 ),
+                // A write FormLogic was not there for: the event is sent again
+                // later, and said once there, not here each time.
+                Err(why) if outcome.transient => {
+                    later.get_or_insert(format!("app logic {}/{}: {why}", outcome.app, outcome.script));
+                }
                 Err(why) => log::warn!(
                     "app logic {}/{} {} failed for {}: {why}",
                     outcome.app,
@@ -1177,6 +1287,7 @@ impl PluginHost {
                 ),
             }
         }
+        later.map_or(Delivery::Done, Delivery::Later)
     }
 
     /// The event thread's work: ring, triggers, ack.
@@ -1217,20 +1328,17 @@ impl PluginHost {
         }
         let outcomes = dispatched.outcomes;
 
-        // …and the SAME event to the linked account's own flows. The flows a
-        // user actually built live in the provider's web app, so without this
-        // the event was matched only against local bindings, found nothing, and
-        // the flow they wrote never ran. Before the ack, for the same reason
-        // the local dispatch is.
-        self.fan_out_to_linked_flows(&event, &envelope);
-        // …and to the account's app LOGIC SCRIPTS, which are what actually
-        // write a record. A separate mechanism from the flows above — the flows
-        // a user built are graphs the account runs, these are scripts an app
-        // ships with itself — and this desktop implements neither. Before the
-        // ack, for the same reason: an event acked before its records were
-        // written would be lost entirely if we crashed in between, and the
-        // scripts' own storage markers make the redelivery harmless.
-        self.fan_out_to_app_logic(&event, &envelope);
+        // …and the SAME event to the linked account: its own flows (the flows a
+        // user built live in the provider's web app) and its apps' logic
+        // scripts (which write the records). Both need FormLogic, so the event
+        // is kept on disk and sent by the outbox thread: nothing here waits on
+        // FormLogic, and nothing is lost while it cannot be reached. Kept
+        // before the ack, for the same reason the local dispatch is; if it
+        // could not be kept, no ack, and the plugin sends it again.
+        let kept = self.queue_for_account(plugin_id, &envelope);
+        if let Err(e) = &kept {
+            log::warn!("{name} could not be kept for the linked account ({e}); the plugin will send it again");
+        }
 
         let seq = self.events.seq.fetch_add(1, Ordering::Relaxed) + 1;
         if let Ok(mut ring) = self.events.ring.lock() {
@@ -1249,7 +1357,7 @@ impl PluginHost {
         // permission to stop re-delivering, and an event acked before its runs
         // were reserved would be lost entirely if we crashed in between. The
         // ledger's idempotency keys make the redelivery harmless.
-        if !idempotency_key.is_empty() {
+        if !idempotency_key.is_empty() && kept.is_ok() {
             let process = self
                 .procs
                 .lock()
@@ -1278,7 +1386,9 @@ impl PluginHost {
         self.scripts.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
-    /// The linked provider's prelude, if this desktop is linked at all.
+    /// The linked provider's prelude, if this desktop is linked at all: what
+    /// is already held here, as this desktop's own triggers do not wait on the
+    /// provider (the heartbeat keeps the copy fresh).
     ///
     /// Unlinked is [`Held::NotRequired`] rather than `Missing`: a desktop with
     /// no account has no provider to be missing a prelude FROM, and its own
@@ -1292,7 +1402,7 @@ impl PluginHost {
             }
         };
         match link.account() {
-            Some(account) => crate::link::script_profile::resolve(&account, link.data_dir()),
+            Some(account) => crate::link::script_profile::resolve_held(&account, link.data_dir()),
             None => crate::link::script_profile::Held::NotRequired,
         }
     }
@@ -1306,6 +1416,8 @@ impl PluginHost {
     /// the user built there. Until this is set, events stay local — which is
     /// the correct behaviour for an unlinked desktop.
     pub fn set_link(&self, link: crate::link::LinkHandle) {
+        // Where events wait for the account, with what an earlier run left there.
+        self.outbox.get_or_init(|| crate::link::outbox::Outbox::open(link.data_dir())).make_current();
         *self.link.lock().unwrap_or_else(|e| e.into_inner()) = Some(link);
         // A fresh link may belong to a different account entirely; keeping the
         // previous account's bindings would fire the wrong flows, and keeping
@@ -1831,6 +1943,23 @@ impl PluginHost {
     /// Returns the dispatch outcomes, and whether any binding actually reserved.
     pub fn redrive(&self, id: &str) -> Option<(Vec<String>, bool)> {
         let item = self.dead.lock().ok()?.get(id)?;
+        if matches!(item.reason, DeadReason::NotDelivered { .. }) {
+            // It never reached the linked account: it goes there again, through
+            // the outbox, as the account linked now.
+            let queued = self.link.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|l| l.account()).is_some();
+            if !queued {
+                return Some((vec!["not sent: this desktop is not linked to an account".into()], false));
+            }
+            return Some(match self.queue_for_account(&item.source, &item.envelope) {
+                Ok(()) => {
+                    if let Ok(mut q) = self.dead.lock() {
+                        q.remove(id);
+                    }
+                    (vec!["kept to send to the linked account".into()], true)
+                }
+                Err(e) => (vec![format!("could not be kept to send: {e}")], false),
+            });
+        }
         let envelope = &item.envelope;
         let original_key = envelope
             .get("idempotencyKey")
@@ -2896,5 +3025,115 @@ mod tests {
         host.process_event("aokie", envelope());
         assert_eq!(host.ledger.lock().unwrap().len(), 0, "a condition ZIPP refuses never fires");
         assert_eq!(host.dead.lock().unwrap().list(10).len(), 1, "and it is dead-lettered");
+    }
+
+    // --- events for the linked account, with FormLogic away and back ----------
+
+    /// A FormLogic on `port` with one flow trigger on `aokie.call.ended`: every
+    /// run it is asked to reserve lands in the returned list.
+    fn formlogic_on(port: u16) -> Arc<Mutex<Vec<Value>>> {
+        use std::io::{Read, Write};
+        let reserved = Arc::new(Mutex::new(Vec::new()));
+        let seen = reserved.clone();
+        let listener = std::net::TcpListener::bind(("127.0.0.1", port)).expect("the port is free again");
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut raw = Vec::new();
+                let mut buf = [0u8; 8192];
+                let (head, body) = loop {
+                    let Ok(n) = stream.read(&mut buf) else { break (String::new(), String::new()) };
+                    if n == 0 {
+                        break (String::new(), String::new());
+                    }
+                    raw.extend_from_slice(&buf[..n]);
+                    let text = String::from_utf8_lossy(&raw).to_string();
+                    if let Some(end) = text.find("\r\n\r\n") {
+                        let len: usize = text[..end].lines().find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length: ").map(|v| v.trim().parse().unwrap_or(0))).unwrap_or(0);
+                        if raw.len() >= end + 4 + len {
+                            break (text[..end].to_string(), String::from_utf8_lossy(&raw[end + 4..end + 4 + len]).to_string());
+                        }
+                    }
+                };
+                let line = head.lines().next().unwrap_or("").to_string();
+                let reply = if line.starts_with("GET /api/v1/flow-bindings") {
+                    json!({"bindings": [{"id": "b1", "event": "aokie.call.ended", "flow": "call-summary", "enabled": true}]})
+                } else if line.starts_with("POST /api/v1/flow-runs") {
+                    seen.lock().unwrap().push(serde_json::from_str::<Value>(&body).unwrap_or(Value::Null));
+                    json!({"created": true, "run": {"runId": "run-1"}})
+                } else if line.starts_with("GET /api/v1/app-logic") {
+                    json!({"apps": []})
+                } else {
+                    json!({})
+                };
+                let text = reply.to_string();
+                let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}", text.len());
+            }
+        });
+        reserved
+    }
+
+    fn wait_until(what: &str, done: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !done() {
+            assert!(Instant::now() < deadline, "timed out waiting until {what}");
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    #[test]
+    fn an_event_while_formlogic_is_away_is_kept_and_reaches_its_flow_when_it_is_back() {
+        let (sb, host) = host_with("outbox", vec![]);
+        // A port FormLogic is not on yet.
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        std::fs::create_dir_all(sb.0.join("link")).unwrap();
+        std::fs::write(
+            sb.0.join("link").join("account.json"),
+            json!({"connectorId": "formlogic", "baseUrl": format!("http://127.0.0.1:{port}"), "credential": "flk_test", "accountId": "conn_1", "linkedAt": "2026-09-29T00:00:00Z"}).to_string(),
+        )
+        .unwrap();
+        host.set_link(crate::link::open_handle(sb.0.clone()));
+
+        let started = Instant::now();
+        host.process_event("aokie", json!({"name": "aokie.call.ended", "idempotencyKey": "evt-9", "correlationId": "call_9", "data": {"callId": "call_9"}}));
+        assert!(started.elapsed() < Duration::from_secs(1), "the event thread does not wait for FormLogic");
+        let outbox = host.outbox.get().unwrap().clone();
+        wait_until("the first try has failed", || outbox.status().last_error.is_some());
+        assert_eq!(outbox.status().waiting, 1, "kept, not lost");
+        assert!(host.dead.lock().unwrap().list(10).is_empty(), "and not given up on");
+
+        // FormLogic is back.
+        let reserved = formlogic_on(port);
+        wait_until("the kept event is sent", || outbox.status().waiting == 0);
+        let runs = reserved.lock().unwrap().clone();
+        assert_eq!(runs.len(), 1, "one run, not one per try: {runs:?}");
+        assert_eq!(runs[0]["bindingId"], "b1");
+        assert!(runs[0]["idempotencyKey"].as_str().unwrap().contains("evt-9"), "keyed by the event, so a retry is harmless");
+        assert!(outbox.status().last_error.is_none());
+    }
+
+    #[test]
+    fn an_event_formlogic_refuses_is_dead_lettered_and_sent_again_on_redrive() {
+        let (sb, host) = host_with("outbox-redrive", vec![]);
+        let outbox = crate::link::outbox::Outbox::open(&sb.0);
+        let _ = host.outbox.set(outbox.clone());
+        host.record_dead("aokie", "aokie.call.ended", DeadReason::NotDelivered { detail: "HTTP 400: no such flow".into() }, json!({"name": "aokie.call.ended", "idempotencyKey": "evt-1"}));
+        let id = host.dead.lock().unwrap().list(10)[0].id.clone();
+
+        // Unlinked: it stays where it is.
+        let (said, done) = host.redrive(&id).unwrap();
+        assert!(!done && said[0].contains("not linked"), "{said:?}");
+
+        std::fs::create_dir_all(sb.0.join("link")).unwrap();
+        std::fs::write(
+            sb.0.join("link").join("account.json"),
+            json!({"connectorId": "formlogic", "baseUrl": "http://127.0.0.1:9", "credential": "flk_test", "accountId": "conn_1", "linkedAt": "2026-09-29T00:00:00Z"}).to_string(),
+        )
+        .unwrap();
+        host.set_link(crate::link::open_handle(sb.0.clone()));
+        let (_, done) = host.redrive(&id).unwrap();
+        assert!(done);
+        assert!(host.dead.lock().unwrap().list(10).is_empty());
+        assert_eq!(outbox.status().waiting, 1, "back in line for the account");
     }
 }

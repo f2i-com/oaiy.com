@@ -273,6 +273,8 @@ pub fn spawn(store: LinkHandle, sources: AiSources) {
             }
         };
         runtime.block_on(async move {
+            // Said once per reason, not every ten seconds while the provider is away.
+            let mut last_warned: Option<String> = None;
             loop {
                 let Some(account) = store.account() else {
                     tokio::time::sleep(Duration::from_secs(5)).await;
@@ -291,12 +293,18 @@ pub fn spawn(store: LinkHandle, sources: AiSources) {
                     .await;
                 match tunnel.poll_cycle(&account, &spec, &instance).await {
                     Ok(handled) => {
+                        if last_warned.take().is_some() {
+                            log::info!("AI tunnel poll: working again");
+                        }
                         if handled == 0 {
                             tokio::time::sleep(Duration::from_millis(500)).await;
                         }
                     }
                     Err(e) => {
-                        log::warn!("AI tunnel poll: {e}");
+                        if last_warned.as_deref() != Some(e.as_str()) {
+                            log::warn!("AI tunnel poll: {e}");
+                            last_warned = Some(e);
+                        }
                         tokio::time::sleep(Duration::from_secs(spec.error_backoff_seconds)).await;
                     }
                 }
@@ -444,13 +452,20 @@ impl AiTunnel {
             .map_err(|e| format!("the AI lane returned an unreadable batch: {e}"))?;
 
         let mut handled = 0usize;
+        let mut failed = None;
         for request in reply.requests {
             if let Err(e) = self.serve(account, spec, instance, &request).await {
                 log::warn!("AI turn {} could not be served: {e}", request.id);
+                failed.get_or_insert(e);
             }
             handled += 1;
         }
-        Ok(handled)
+        // Polling that works while every turn fails (the provider half down)
+        // must back off like a failed poll, not go straight round again.
+        match failed {
+            Some(e) if handled > 0 => Err(format!("{handled} AI turn(s) could not be served: {e}")),
+            _ => Ok(handled),
+        }
     }
 
     /// Claim one turn, answer it, and always report a terminal status.

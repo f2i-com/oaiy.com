@@ -68,6 +68,9 @@ pub enum DeadReason {
     /// Dispatch ran, and every binding that matched failed to fire for an
     /// operational reason. Carries the dispatcher's own words.
     NotReserved { detail: String },
+    /// The linked account refused it, or it was kept for a link since
+    /// replaced (see `crate::link::outbox`). A redrive sends it to the account again.
+    NotDelivered { detail: String },
 }
 
 impl DeadReason {
@@ -76,7 +79,7 @@ impl DeadReason {
             DeadReason::Shed => {
                 "the host event queue was full, so this event was dropped before dispatch".into()
             }
-            DeadReason::NotReserved { detail } => detail.clone(),
+            DeadReason::NotReserved { detail } | DeadReason::NotDelivered { detail } => detail.clone(),
         }
     }
 }
