@@ -6,6 +6,9 @@ resolver = "2"
 exclude = ["crates/cudarc", "app/src-tauri", "platform/desktop/src-tauri"]
 members = [
     "crates/oaiy-media",
+    # Realtime text to speech (Qwen3-TTS on Candle, streaming, voice cloning);
+    # oaiy-media shares its speech layers. Like oaiy-media, not a default member.
+    "crates/oaiy-tts",
     "crates/oaiy-engine",
     "crates/oaiy-llm-cli",
     # DeepSeek-V4.1 support (docs/DEEPSEEK_V41.md); std-only like the core.

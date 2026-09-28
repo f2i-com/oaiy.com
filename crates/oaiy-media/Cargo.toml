@@ -9,6 +9,8 @@ description = "Native Rust Qwen Image and LTX video inference worker for OAIY"
 oaiy-engine = { path = "../oaiy-engine" }
 oaiy-image = { path = "../oaiy-image" }
 dsv41 = { path = "../dsv41" }
+# Qwen3-TTS's layers, codec and voice encoders (shared with the realtime engine).
+oaiy-tts = { path = "../oaiy-tts" }
 candle-core = "0.11.0"
 candle-nn = "0.11.0"
 candle-flash-attn = { version = "0.11.0", optional = true }
@@ -21,5 +23,5 @@ meshopt = "0.6"
 
 [features]
 default = []
-cuda = ["candle-core/cuda", "candle-nn/cuda"]
-flash-attn = ["cuda", "dep:candle-flash-attn"]
+cuda = ["candle-core/cuda", "candle-nn/cuda", "oaiy-tts/cuda"]
+flash-attn = ["cuda", "dep:candle-flash-attn", "oaiy-tts/flash-attn"]

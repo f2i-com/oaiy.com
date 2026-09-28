@@ -1,0 +1,102 @@
+//! Where the time goes: the talker's frames and the codec's chunks, timed
+//! apart (with the device synchronized around each part).
+//!
+//! cargo run --release -p oaiy-tts --features flash-attn --example bench -- \
+//!     --voice clip.wav --transcript "..." --device 1 [--frames 60]
+use oaiy_tts::codec::{CodecDecoder, CodecStream};
+use oaiy_tts::talker::{Draws, Talker};
+use oaiy_tts::{text, Sampling, Tts};
+use std::path::PathBuf;
+use std::time::Instant;
+
+fn main() {
+    if let Err(e) = run() {
+        eprintln!("error: {e}");
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<(), Box<dyn std::error::Error>> {
+    let mut args = std::env::args().skip(1);
+    let (mut model, mut device, mut voice, mut transcript, mut frames) = (PathBuf::from("E:/models/Qwen3-TTS-12Hz-0.6B-Base"), 0usize, None, None, 60usize);
+    let mut text_arg = "Sure, I can help with that. Your appointment is booked for Tuesday at three in the afternoon, and you will get a text to confirm it.".to_string();
+    while let Some(a) = args.next() {
+        let mut value = || args.next().ok_or(format!("{a} needs a value"));
+        match a.as_str() {
+            "--model" => model = value()?.into(),
+            "--device" => device = value()?.parse()?,
+            "--voice" => voice = Some(PathBuf::from(value()?)),
+            "--transcript" => transcript = Some(value()?),
+            "--frames" => frames = value()?.parse()?,
+            "--text" => text_arg = value()?,
+            other => return Err(format!("unknown argument {other}").into()),
+        }
+    }
+    let dev = oaiy_tts::cuda(device)?;
+    let voice = {
+        let mut tts = Tts::load(&model, &dev)?;
+        tts.voice_from_audio(&voice.ok_or("--voice is required")?, transcript.as_deref())?
+    };
+    let mut talker = Talker::load(&model, &dev)?;
+    let codec = CodecDecoder::load(&model.join("speech_tokenizer").join("model.safetensors"), &dev)?;
+    let tok = text::tokenizer(&model)?;
+    let text_ids = text::encode(&tok, &text_arg)?;
+    let ref_ids = text::encode(&tok, &voice.ref_text)?;
+    let sync = || dev.synchronize();
+    for round in 0..4 {
+        // Rounds alternate where the draws happen: on the device, then on the host.
+        let on_device = round % 2 == 0;
+        let draws = if on_device { Draws::Device } else { Draws::Host };
+        sync()?;
+        let t = Instant::now();
+        let (prefill, trailing) = talker.prefill_clone(&text_ids, &ref_ids, &voice, None)?;
+        let mut g = talker.start(&prefill, Some(trailing), Sampling { draws, ..Sampling::default() })?;
+        sync()?;
+        let prefill_ms = t.elapsed().as_secs_f64() * 1e3;
+        let t = Instant::now();
+        let mut made = Vec::new();
+        for _ in 0..frames {
+            match talker.next_frame(&mut g)? {
+                Some(f) => made.push(f),
+                None => break,
+            }
+        }
+        sync()?;
+        let per_frame = t.elapsed().as_secs_f64() * 1e3 / made.len().max(1) as f64;
+        println!("round {round} (draws on the {}): prefill ({} positions) {prefill_ms:.1} ms; {} frames at {per_frame:.2} ms a frame ({:.1} frames/s)", if on_device { "device" } else { "host" }, prefill.dim(1)?, made.len(), 1e3 / per_frame);
+        if round == 0 {
+            // Streaming against the whole-clip decode (the reference clip and
+            // the new frames at once, the clip's part cut off).
+            let mut all = voice.ref_codes.clone();
+            all.extend_from_slice(&made);
+            let whole = codec.forward(&all)?;
+            let whole = &whole[voice.ref_codes.len() * 1920..];
+            let mut stream = CodecStream::primed(&codec, &voice.ref_codes)?;
+            let mut streamed = stream.push(&codec, &made[..1])?;
+            for c in made[1..].chunks(2) {
+                streamed.extend(stream.push(&codec, c)?);
+            }
+            let signal: f64 = whole.iter().map(|&x| (x as f64).powi(2)).sum();
+            let noise: f64 = whole.iter().zip(&streamed).map(|(&a, &b)| (a as f64 - b as f64).powi(2)).sum();
+            let peak = whole.iter().zip(&streamed).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+            println!("  streamed vs the whole decode: SNR {:.1} dB, largest difference {peak:.6}", 10. * (signal / noise.max(1e-30)).log10());
+        }
+        for chunk in [1usize, 2, 4, 8] {
+            // Once to warm up (and capture), then timed.
+            let mut stream = CodecStream::primed(&codec, &voice.ref_codes)?;
+            for c in made.chunks(chunk).take(2) {
+                stream.push(&codec, c)?;
+            }
+            sync()?;
+            let t = Instant::now();
+            let mut n = 0;
+            for c in made.chunks(chunk).take(8) {
+                stream.push(&codec, c)?;
+                n += 1;
+            }
+            sync()?;
+            println!("  codec, {chunk} frames a chunk: {:.2} ms a chunk", t.elapsed().as_secs_f64() * 1e3 / n as f64);
+        }
+    }
+    Ok(())
+}

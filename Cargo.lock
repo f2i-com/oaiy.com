@@ -1578,6 +1578,7 @@ dependencies = [
  "meshopt",
  "oaiy-engine",
  "oaiy-image",
+ "oaiy-tts",
  "regex",
  "tokenizers 0.21.4",
 ]
@@ -1596,6 +1597,18 @@ dependencies = [
  "oaiy-engine",
  "oaiy-studio",
  "windows-sys",
+]
+
+[[package]]
+name = "oaiy-tts"
+version = "0.1.0"
+dependencies = [
+ "candle-core",
+ "candle-flash-attn",
+ "candle-nn",
+ "dsv41",
+ "oaiy-engine",
+ "tokenizers 0.21.4",
 ]
 
 [[package]]
