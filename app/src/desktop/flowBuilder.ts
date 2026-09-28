@@ -69,6 +69,26 @@ export function checkFlow(nodes: FlowNode[], edges: FlowEdge[]): string[] {
   return problems;
 }
 
+/** A template node's handles, in order: its placeholders are named after them ({{input}}, {{input2}}…). */
+const TEMPLATE_INPUTS = ['input', 'input2', 'input3', 'input4', 'input5'];
+
+/**
+ * What the editor needs to show a template node as it runs: its inputs named
+ * after its handles, as many as its edges and placeholders use (the editor's
+ * own compiler does the same), so none of its placeholders shows as unknown.
+ */
+export function nameTemplateInputs(nodes: FlowNode[], edges: FlowEdge[]): FlowNode[] {
+  return nodes.map((n) => {
+    if (n.type !== 'template' || Array.isArray(n.data.inputNames)) return n;
+    const used = [
+      ...edges.filter((e) => e.target === n.id).map((e) => e.targetHandle),
+      ...[...String(n.data.template ?? '').matchAll(/\{\{(\w+)\}\}/g)].map((m) => m[1]),
+    ];
+    const count = Math.max(1, ...used.map((id) => TEMPLATE_INPUTS.indexOf(id) + 1));
+    return { ...n, data: { ...n.data, inputCount: count, inputNames: TEMPLATE_INPUTS.slice(0, count) } };
+  });
+}
+
 /** Positions for the editor: a column per step from the inputs, nodes stacked in each. */
 export function layOut(nodes: FlowNode[], edges: FlowEdge[]): FlowNode[] {
   const depth = new Map<string, number>(nodes.map((n) => [n.id, 0]));
@@ -168,7 +188,7 @@ export function flowBuilderTools(desktop: () => Desktop | null): SessionTool[] {
         const name = String(input.name);
         const id = typeof input.id === 'string' && input.id.trim() ? input.id.trim() : slug(name);
         const tool = isRecord(input.tool) && typeof input.tool.name === 'string' ? { name: input.tool.name, description: String(input.tool.description ?? '') } : null;
-        await connected(desktop).putFlow(id, { name, ...(tool ? { oaiyTool: tool } : {}), nodes: layOut(nodes, edges), edges }, signal);
+        await connected(desktop).putFlow(id, { name, ...(tool ? { oaiyTool: tool } : {}), nodes: layOut(nameTemplateInputs(nodes, edges), edges), edges }, signal);
         const inputs = nodes.filter((n) => n.type.startsWith('input_')).map((n) => String(n.data.label ?? n.id));
         return `Wrote flow ${id} ("${name}"): ${nodes.length} nodes, ${edges.length} edges${inputs.length ? `; its inputs: ${inputs.join(', ')}` : ''}. It is in the flow editor now${tool ? `, and ${tool.name} becomes one of your tools within a minute` : ''}. Run it with flow_run.`;
       },

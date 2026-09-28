@@ -178,8 +178,13 @@ export function useProject() {
   // Track original macro states for dirty detection (from disk or saved override)
   const [originalMacroStates, setOriginalMacroStates] = useState<Map<string, Flow>>(new Map());
 
-  // In OAIY's window, the desktop's flows and these are the same flows.
-  useDesktopFlows(project, setProject);
+  // In OAIY's window, the desktop's flows and these are the same flows. The
+  // canvas holds the open flow's nodes itself: one changed there is shown anew.
+  const activeFlowIdRef = useRef(activeFlowId);
+  activeFlowIdRef.current = activeFlowId;
+  useDesktopFlows(project, setProject, (ids) => {
+    if (activeFlowIdRef.current && ids.includes(activeFlowIdRef.current)) setResetCounter((c) => c + 1);
+  });
 
   const isMountedRef = useRef(true);
 

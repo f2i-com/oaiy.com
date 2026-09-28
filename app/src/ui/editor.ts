@@ -10,11 +10,15 @@ import { json } from '@codemirror/lang-json';
 import { markdown } from '@codemirror/lang-markdown';
 import { python } from '@codemirror/lang-python';
 import { oneDark } from '@codemirror/theme-one-dark';
-import { EditorState, type Extension } from '@codemirror/state';
+import { Compartment, EditorState, type Extension } from '@codemirror/state';
 import { EditorView, basicSetup } from 'codemirror';
 import type { Vfs } from '../vfs/vfs';
 import { clear, h } from './dom';
 import { formatBytes, mediaElement, mediaKind, type Media } from './media';
+import { onTheme, theme, type Theme } from './theme';
+
+/** One Dark in the dark theme; CodeMirror's own light look in the light. */
+const look = (t: Theme): Extension => (t === 'dark' ? oneDark : []);
 
 function languageFor(path: string): Extension[] {
   const ext = path.slice(path.lastIndexOf('.') + 1).toLowerCase();
@@ -45,11 +49,14 @@ export class EditorPane {
   /** The image, audio or video file on show, and its element. */
   private mediaPath: string | null = null;
   private media: Media | null = null;
+  /** The editor's colours, which follow the page's light or dark. */
+  private readonly look = new Compartment();
 
   constructor(private vfs: Vfs) {
     this.conflictBar.hidden = true;
     this.element.append(this.title, this.conflictBar, this.body);
     this.showEmpty();
+    onTheme((t) => this.view?.dispatch({ effects: this.look.reconfigure(look(t)) }));
   }
 
   get openPath(): string | null {
@@ -131,7 +138,7 @@ export class EditorPane {
       doc,
       extensions: [
         basicSetup,
-        oneDark,
+        this.look.of(look(theme())),
         EditorView.lineWrapping,
         ...languageFor(path),
         EditorView.updateListener.of((update) => {

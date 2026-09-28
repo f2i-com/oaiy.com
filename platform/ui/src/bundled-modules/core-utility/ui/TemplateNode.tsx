@@ -212,8 +212,8 @@ function TemplateNode({ data }: TemplateNodeProps) {
                 <span
                   key={varName}
                   className={`px-1.5 py-0.5 text-[10px] rounded font-mono ${inputNames.includes(varName)
-                    ? 'bg-green-900/50 text-green-400 border border-green-700'
-                    : 'bg-red-900/50 text-red-400 border border-red-700'
+                    ? 'bg-green-100 text-green-800 border border-green-300 dark:bg-green-900/50 dark:text-green-400 dark:border-green-700'
+                    : 'bg-red-100 text-red-700 border border-red-300 dark:bg-red-900/50 dark:text-red-400 dark:border-red-700'
                     }`}
                 >
                   {`{{${varName}}}`}

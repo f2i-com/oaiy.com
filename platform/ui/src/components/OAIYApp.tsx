@@ -170,7 +170,7 @@ export default function OAIYApp() {
   const flowNameInputRef = useRef<HTMLInputElement>(null);
   const [activeTab, setActiveTab] = useState<MainTab>('builder');
   // Theme lives in ThemeContext; the topbar toggle just drives it.
-  const { resolvedTheme, setTheme } = useTheme();
+  const { resolvedTheme, setTheme, followsOaiy } = useTheme();
   // OAIY Desktop presence feeds the sidebar's engine card AND the dock's LED, so
   // subscribe once here rather than in each.
   const [companion, setDesktop] = useState<DesktopInfo>(getDesktopInfo);
@@ -647,7 +647,7 @@ export default function OAIYApp() {
           onOpenNav={() => setNavOpen(true)}
           crumb={activeTab === 'data' ? 'Data' : 'Workflows'}
           theme={resolvedTheme}
-          onSetTheme={setTheme}
+          onSetTheme={followsOaiy ? undefined : setTheme}
           savedLabel={activeTab === 'builder' ? 'Saved locally' : undefined}
           chips={
             activeTab === 'builder' ? (

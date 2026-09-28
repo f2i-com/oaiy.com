@@ -15,6 +15,7 @@ import { flowBuilderTools } from './desktop/flowBuilder';
 import { TOOLS } from './agent/tools';
 import type { SessionTool } from './agent/agent';
 import { editPhone } from './ui/phone';
+import { startTheme } from './ui/theme';
 import { OAIY_ORIGIN, discoverOaiy, mediaAbilities, mergeDiscovered } from './agent/media';
 import { budgetFor, contextWindow, detectContextWindow, formatTokens } from './agent/context';
 import { ChatPane } from './ui/chat';
@@ -77,6 +78,8 @@ function embeddedDesktop(): { origin: string; token: string } | null {
 const IN_OAIY = location.hostname === 'oaiy.localhost' || location.protocol === 'oaiy:' || !!embeddedDesktop();
 // Inside OAIY's window the page takes the window's look (styles.css, `.in-oaiy`).
 if (IN_OAIY) document.documentElement.classList.add('in-oaiy');
+// Light or dark: OAIY's (the dashboard's choice), or the system's.
+startTheme(IN_OAIY);
 const DESKTOP = IN_OAIY || location.hostname === 'botcomputer.localhost' || location.protocol === 'botcomputer:' || '__TAURI_INTERNALS__' in window;
 
 async function registerServiceWorker(): Promise<boolean> {

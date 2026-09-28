@@ -621,7 +621,7 @@ export default function FlowsSidebar({
                         }
                       }}
                       autoFocus
-                      className="w-full px-2 py-1.5 text-sm bg-white dark:bg-slate-900 border border-blue-500 rounded text-slate-700 dark:text-slate-200 focus:outline-none"
+                      className="w-full px-2 py-1.5 text-sm bg-white dark:bg-slate-900 border border-accent rounded text-slate-700 dark:text-slate-200 focus:outline-none"
                     />
                   ) : (
                     <div
@@ -630,9 +630,9 @@ export default function FlowsSidebar({
                       className={`
                         group w-full flex items-center gap-2 px-2 h-8 rounded text-sm
                         transition-colors cursor-pointer
-                        focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-1 focus:ring-offset-white dark:focus:ring-offset-slate-900
+                        focus:outline-none focus:ring-2 focus:ring-accent focus:ring-offset-1 focus:ring-offset-white dark:focus:ring-offset-slate-900
                         ${flow.id === activeFlowId
-                          ? 'bg-blue-600/30 text-blue-700 dark:text-blue-200 border border-blue-500/50'
+                          ? 'bg-accent/15 text-slate-900 dark:text-slate-50 border border-accent/50'
                           : 'text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700'
                         }
                       `}
@@ -651,8 +651,8 @@ export default function FlowsSidebar({
                       <span className="flex-1 truncate">{flow.name}</span>
                       {/* Running indicator */}
                       {isFlowRunning?.(flow.id) && (
-                        <span className="flex items-center gap-1 text-[10px] px-1.5 py-0.5 bg-blue-600/30 rounded text-blue-300 border border-blue-500/30" title="Running">
-                          <span className="w-1.5 h-1.5 bg-blue-400 rounded-full animate-pulse" />
+                        <span className="flex items-center gap-1 text-[10px] px-1.5 py-0.5 bg-accent/20 rounded text-accent border border-accent/30" title="Running">
+                          <span className="w-1.5 h-1.5 bg-accent rounded-full animate-pulse" />
                           <span>Running</span>
                         </span>
                       )}

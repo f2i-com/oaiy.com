@@ -24,7 +24,10 @@
     <script>
       (function () {
         try {
-          var t = localStorage.getItem('oaiy_theme');
+          // In OAIY's window the desktop says the theme (ThemeContext's desktopTheme).
+          var d = window.__OAIY_DESKTOP__, kept = null;
+          try { kept = sessionStorage.getItem('oaiy-desktop-theme'); } catch (e) { /* storage blocked */ }
+          var t = d ? (window.__OAIY_THEME__ || kept || d.theme) : localStorage.getItem('oaiy_theme');
           var resolved =
             t === 'dark' ? 'dark'
             : t === 'light' ? 'light'
@@ -34,6 +37,7 @@
           var r = document.documentElement;
           r.classList.remove('light', 'dark');
           r.classList.add(resolved);
+          if (d) r.classList.add('in-oaiy');
           r.style.colorScheme = resolved;
         } catch (e) { /* localStorage blocked — fall back to the class on <html> */ }
       })();

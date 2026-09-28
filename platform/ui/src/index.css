@@ -11,6 +11,22 @@
    utilities silently emit no CSS. */
 @config "../tailwind.config.js";
 
+/* In OAIY's window (app.html marks it `in-oaiy`) the editor takes OAIY's type,
+   the dashboard's Public Sans. Its file is in public/fonts, reached by an
+   absolute URL, which Tailwind's inlining leaves alone. */
+@font-face {
+  font-family: 'Public Sans';
+  src: url('/fonts/public-sans.woff2') format('woff2');
+  font-weight: 300 700;
+  font-display: swap;
+}
+:root.in-oaiy {
+  --font-display: 'Public Sans', 'Inter Variable', Inter, ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --font-body: 'Public Sans', 'Inter Variable', Inter, ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+}
+/* OAIY's sidebar, beside this page, carries the name: the editor's rail keeps to its sections. */
+.in-oaiy .oaiy-sidebar > .oaiy-brand { display: none; }
+
 /* Configure dark mode variant for class-based switching */
 @variant dark (&:where(.dark, .dark *));
 

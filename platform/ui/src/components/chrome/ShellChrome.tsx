@@ -234,7 +234,8 @@ export function ShellTopbar({
   chips?: ReactNode;
   savedLabel?: string;
   theme: 'light' | 'dark';
-  onSetTheme: (t: 'light' | 'dark') => void;
+  /** Absent in OAIY's window, where the theme is OAIY's (its sidebar switches it). */
+  onSetTheme?: (t: 'light' | 'dark') => void;
   actions?: ReactNode;
 }) {
   return (
@@ -275,15 +276,17 @@ export function ShellTopbar({
             are choosing -- so the label is an action ("Switch to X"), not a
             state, and aria-pressed is gone with it: this is a button that does
             something, not a toggle reporting whether it is on. */}
-        <button
-          type="button"
-          className="oaiy-icon-btn"
-          aria-label={theme === 'dark' ? 'Switch to the Paper Circuit light theme' : 'Switch to the Prism Lab dark theme'}
-          title={theme === 'dark' ? 'Switch to Paper Circuit' : 'Switch to Prism Lab'}
-          onClick={() => onSetTheme(theme === 'dark' ? 'light' : 'dark')}
-        >
-          {theme === 'dark' ? <Sun size={16} /> : <Moon size={16} />}
-        </button>
+        {onSetTheme && (
+          <button
+            type="button"
+            className="oaiy-icon-btn"
+            aria-label={theme === 'dark' ? 'Switch to the Paper Circuit light theme' : 'Switch to the Prism Lab dark theme'}
+            title={theme === 'dark' ? 'Switch to Paper Circuit' : 'Switch to Prism Lab'}
+            onClick={() => onSetTheme(theme === 'dark' ? 'light' : 'dark')}
+          >
+            {theme === 'dark' ? <Sun size={16} /> : <Moon size={16} />}
+          </button>
+        )}
         {actions}
       </div>
     </header>

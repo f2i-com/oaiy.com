@@ -28,6 +28,10 @@ vi.mock('./api', () => ({
   bridge: { status: statusMock },
   nodeRuntime: { install: nodeInstallMock },
   openExternal: vi.fn(),
+  // Today's tiles (TodayPanel): nothing to show.
+  phone: { status: vi.fn().mockRejectedValue(new Error('no phone')), calls: vi.fn().mockRejectedValue(new Error('no phone')) },
+  calendar: { get: vi.fn().mockRejectedValue(new Error('no calendar')) },
+  engines: { status: vi.fn().mockRejectedValue(new Error('no engines')) },
 }));
 
 import OverviewPanel from './OverviewPanel';

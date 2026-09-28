@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { NODE_TYPES, checkFlow, flowBuilderTools, layOut } from '../../src/desktop/flowBuilder';
+import { NODE_TYPES, checkFlow, flowBuilderTools, layOut, nameTemplateInputs } from '../../src/desktop/flowBuilder';
 import type { Desktop } from '../../src/desktop/bridge';
 
 const signal = new AbortController().signal;
@@ -42,6 +42,15 @@ describe('the agent builds flows', () => {
     expect(at.in1!.x).toBeLessThan(at.tpl1!.x);
     expect(at.tpl1!.x).toBeLessThan(at.out1!.x);
     expect(at.p).toEqual({ x: 5, y: 6 });
+  });
+
+  it("names a template's inputs after its handles, as many as it uses, so the editor knows its placeholders", () => {
+    const [, tpl] = nameTemplateInputs(greeting.nodes, greeting.edges);
+    expect(tpl.data).toMatchObject({ inputCount: 1, inputNames: ['input'] });
+    const two = nameTemplateInputs([{ id: 't', type: 'template', data: { template: '{{input}} and {{input3}}' } }], []);
+    expect(two[0].data.inputNames).toEqual(['input', 'input2', 'input3']);
+    const named = { id: 't', type: 'template', data: { inputNames: ['who'] } };
+    expect(nameTemplateInputs([named], [])[0]).toBe(named);
   });
 
   it('writes a checked flow to the desktop (a tool when asked), refuses a broken one, and runs one', async () => {

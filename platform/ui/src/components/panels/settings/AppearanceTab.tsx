@@ -34,7 +34,18 @@ const BACKGROUND_TINTS: { id: BackgroundTint; label: string; lightBg: string; da
 ];
 
 export default function AppearanceTab() {
-  const { theme, setTheme, resolvedTheme, accentColor, setAccentColor, backgroundTint, setBackgroundTint } = useTheme();
+  const { theme, setTheme, resolvedTheme, accentColor, setAccentColor, backgroundTint, setBackgroundTint, followsOaiy } = useTheme();
+
+  if (followsOaiy) {
+    return (
+      <div className="space-y-3 max-w-2xl">
+        <h3 className="text-sm font-medium text-slate-700 dark:text-slate-200">Theme</h3>
+        <p className="text-sm text-slate-600 dark:text-slate-300">
+          The editor follows OAIY: it is light or dark as OAIY is ({resolvedTheme} now), in OAIY&apos;s colours. Switch it with the theme button at the foot of OAIY&apos;s sidebar.
+        </p>
+      </div>
+    );
+  }
 
   return (
     <div className="space-y-6 max-w-2xl">

@@ -1659,6 +1659,9 @@ select:disabled { cursor: not-allowed; opacity: 0.5; }
 .cal-weeknav { display: flex; align-items: center; gap: 6px; }
 .cal-range { color: var(--muted); font-size: 12px; margin-left: 4px; }
 .cal-grid {
+  /* The hours shown and an hour's height; the week sets both on the element. */
+  --hours: 10;
+  --hour-px: 48px;
   display: grid;
   grid-template-columns: 64px repeat(7, minmax(0, 1fr));
   border: 1px solid var(--border);

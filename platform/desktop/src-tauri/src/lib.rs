@@ -1323,6 +1323,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             crate::embed::show_embedded,
             crate::embed::hide_embedded,
+            crate::embed::set_theme,
             open_path,
             log_path,
             open_url,

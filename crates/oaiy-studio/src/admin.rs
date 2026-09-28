@@ -17,6 +17,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 const PAGE: &str = include_str!("ui.html");
+/// The page's type, OAIY's (SIL OFL 1.1; the licences are beside them in `fonts/`).
+const FONTS: [(&str, &[u8]); 2] = [
+    ("/fonts/public-sans.woff2", include_bytes!("fonts/public-sans.woff2")),
+    ("/fonts/jetbrains-mono.woff2", include_bytes!("fonts/jetbrains-mono.woff2")),
+];
 
 fn err(w: &mut TcpStream, status: u16, message: &str) -> io::Result<bool> {
     json_reply(w, status, &error_json(message, "invalid_request_error", "invalid_request"))
@@ -64,7 +69,8 @@ pub fn handle(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, port: u16)
     let remote = exposed && !w.peer_addr().is_ok_and(|a| a.ip().is_loopback() || a.ip().to_canonical().is_loopback());
     let key = cfg.get("gateway").map_or("", |g| str_or(g, "api_key", "")).to_string();
     let route = req.route().to_string();
-    if remote && route != "/" && !key.is_empty() {
+    let font = FONTS.iter().find(|(path, _)| *path == route).map(|(_, bytes)| *bytes);
+    if remote && route != "/" && font.is_none() && !key.is_empty() {
         let given = req.header("authorization").and_then(|v| v.strip_prefix("Bearer ")).map(str::trim).map(str::to_string).or_else(|| req.query("key"));
         if given.as_deref() != Some(key.as_str()) {
             return err(w, 401, "this control port needs the gateway API key");
@@ -77,6 +83,10 @@ pub fn handle(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, port: u16)
     }
     if method == "GET" && (route == "/" || route == "/index.html") {
         respond(w, 200, "text/html; charset=utf-8", PAGE.as_bytes(), true)?;
+        return Ok(true);
+    }
+    if let (true, Some(bytes)) = (method == "GET", font) {
+        oaiy_engine::http::respond_with(w, 200, "font/woff2", &[("Cache-Control", "max-age=86400")], bytes, true)?;
         return Ok(true);
     }
     if let Some(rel) = route.strip_prefix("/files/") {
@@ -295,6 +305,14 @@ fn remove_model(cfg: &mut Json, section: &str, name: &str) -> Result<(), String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_page_has_oaiy_s_type() {
+        for (path, bytes) in FONTS {
+            assert!(PAGE.contains(path), "{path} is not used by the page");
+            assert_eq!(&bytes[..4], b"wOF2", "{path}");
+        }
+    }
 
     #[test]
     fn only_this_listener_s_names_are_answered() {

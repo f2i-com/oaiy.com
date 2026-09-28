@@ -8,33 +8,39 @@
 <style>
 :root {
   color-scheme: dark;
-  --bg: #1E252E; --panel: #252D38; --panel-2: #2B3441; --line: #343E4C; --line-2: #414D5E;
-  --text: #E4E8EE; --muted: #8A94A3; --faint: #677284;
-  --ssd: #E3A63B; --ram: #3DB5A6; --gpu: #8E7DF2; --bad: #EF6F6C; --good: #6FCF8E;
-  --well: #181E25; --well-text: #C6CDD7; --media-bg: #151A20; --on-accent: #14121F; --backdrop: rgba(10, 13, 17, .6);
+  --bg: #080d18; --panel: #0e1422; --panel-2: #131c2d; --line: #202a3c; --line-2: #33425c;
+  --text: #f4f7ff; --muted: #98a6bd; --faint: #8592ab;
+  --ssd: #f2b84b; --ram: #35d4e8; --gpu: #7167ff; --bad: #ff6e78; --good: #45d6a2; --magenta: #e76bf3; --azure: #4d8bff;
+  --well: #060a13; --well-text: #c9d3e6; --media-bg: #05080f; --on-accent: #FFFFFF; --on-tier: #0b0f19; --backdrop: rgba(3, 6, 12, .6);
   --rail-w: 216px; --pad: clamp(16px, 2.6vw, 44px);
-  --display: "Bahnschrift", "DIN Alternate", "DIN 2014", "Barlow", system-ui, sans-serif;
-  --body: "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, sans-serif;
-  --code: "Cascadia Mono", "Cascadia Code", Consolas, "SF Mono", monospace;
-  --r: 6px;
+  --display: "Public Sans", "Bahnschrift", "Segoe UI Variable Display", system-ui, sans-serif;
+  --body: "Public Sans", "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, sans-serif;
+  --code: "JetBrains Mono", "Cascadia Mono", "Cascadia Code", Consolas, "SF Mono", monospace;
+  --r: 8px;
 }
-/* Light: the same tiers on paper. Follows the system unless the toggle pins one. */
+/* OAIY's two themes, as its desktop has them: Prism Lab (above) and Paper
+   Circuit (light). Follows the system unless the toggle pins one; in OAIY's
+   window, OAIY's choice (`?theme=`, then `__oaiySetTheme`). */
 :root[data-theme=light] {
   color-scheme: light;
-  --bg: #F3F5F8; --panel: #FFFFFF; --panel-2: #E9EDF2; --line: #DCE1E8; --line-2: #C4CCD7;
-  --text: #1D2430; --muted: #5E6878; --faint: #8390A2;
-  --ssd: #B7791F; --ram: #1E8C80; --gpu: #6A56E0; --bad: #C8423F; --good: #2E8B57;
-  --well: #EEF1F5; --well-text: #2A3340; --media-bg: #E4E8EE; --on-accent: #FFFFFF; --backdrop: rgba(30, 37, 46, .35);
+  --bg: #f8f5ee; --panel: #fffefa; --panel-2: #f3f0e9; --line: #cec8be; --line-2: #9f998f;
+  --text: #171717; --muted: #68645e; --faint: #6f6a63;
+  --ssd: #9c6a08; --ram: #1675b9; --gpu: #2457e6; --bad: #e94b3c; --good: #218450; --magenta: #c2410c; --azure: #1675b9;
+  --well: #f1ede5; --well-text: #2a2723; --media-bg: #ebe7de; --on-accent: #FFFFFF; --on-tier: #FFFFFF; --backdrop: rgba(40, 34, 26, .35);
 }
 @media (prefers-color-scheme: light) {
   :root:not([data-theme=dark]) {
     color-scheme: light;
-    --bg: #F3F5F8; --panel: #FFFFFF; --panel-2: #E9EDF2; --line: #DCE1E8; --line-2: #C4CCD7;
-    --text: #1D2430; --muted: #5E6878; --faint: #8390A2;
-    --ssd: #B7791F; --ram: #1E8C80; --gpu: #6A56E0; --bad: #C8423F; --good: #2E8B57;
-    --well: #EEF1F5; --well-text: #2A3340; --media-bg: #E4E8EE; --on-accent: #FFFFFF; --backdrop: rgba(30, 37, 46, .35);
+    --bg: #f8f5ee; --panel: #fffefa; --panel-2: #f3f0e9; --line: #cec8be; --line-2: #9f998f;
+    --text: #171717; --muted: #68645e; --faint: #6f6a63;
+    --ssd: #9c6a08; --ram: #1675b9; --gpu: #2457e6; --bad: #e94b3c; --good: #218450; --magenta: #c2410c; --azure: #1675b9;
+    --well: #f1ede5; --well-text: #2a2723; --media-bg: #ebe7de; --on-accent: #FFFFFF; --on-tier: #FFFFFF; --backdrop: rgba(40, 34, 26, .35);
   }
 }
+@font-face { font-family: "Public Sans"; src: url("/fonts/public-sans.woff2") format("woff2"); font-weight: 300 700; font-display: swap; }
+@font-face { font-family: "JetBrains Mono"; src: url("/fonts/jetbrains-mono.woff2") format("woff2"); font-weight: 400 700; font-display: swap; }
+/* In OAIY's window its sidebar has the name and the theme: this page's rail keeps to its sections. */
+.in-oaiy .brand, .in-oaiy .theme-toggle { display: none; }
 * { box-sizing: border-box; }
 /* `hidden` wins over any display rule (icon buttons, overlays, cards). */
 [hidden] { display: none !important; }
@@ -47,7 +53,7 @@ a { color: var(--gpu); }
 
 /* frame */
 .app { display: grid; grid-template-columns: var(--rail-w) minmax(0, 1fr); min-height: 100vh; min-height: 100dvh; }
-.rail { border-right: 1px solid var(--line); padding: 20px 14px; display: flex; flex-direction: column; gap: 22px; position: sticky; top: 0; height: 100vh; height: 100dvh; overflow-y: auto; }
+.rail { border-right: 1px solid var(--line); padding: 20px 14px; display: flex; flex-direction: column; gap: 22px; position: sticky; top: 0; height: 100vh; height: 100dvh; overflow-y: auto; overflow-x: hidden; }
 .brand { display: flex; align-items: center; gap: 10px; padding: 0 6px; }
 .brand-mark { display: grid; gap: 3px; width: 22px; }
 .brand-mark i { display: block; height: 4px; border-radius: 1px; }
@@ -114,9 +120,9 @@ input[type=range] { width: 100%; accent-color: var(--gpu); }
 
 /* the tier strip */
 .strip { display: flex; height: 34px; border-radius: var(--r); overflow: hidden; border: 1px solid var(--line-2); background: var(--bg); }
-.strip > div { display: flex; align-items: center; padding: 0 10px; font: 600 12px var(--display); letter-spacing: .03em; color: #15181D; white-space: nowrap; overflow: hidden; min-width: 0; transition: flex-grow .35s ease; }
+.strip > div { display: flex; align-items: center; padding: 0 10px; font: 600 12px var(--display); letter-spacing: .03em; color: var(--on-tier); white-space: nowrap; overflow: hidden; min-width: 0; transition: flex-grow .35s ease; }
 .strip .t-gpu { background: var(--gpu); } .strip .t-ram { background: var(--ram); }
-.strip .t-ssd { background: repeating-linear-gradient(135deg, var(--ssd) 0 8px, #CF9530 8px 16px); }
+.strip .t-ssd { background: repeating-linear-gradient(135deg, var(--ssd) 0 8px, color-mix(in srgb, var(--ssd) 84%, #000) 8px 16px); }
 .strip-legend { display: flex; gap: 18px; flex-wrap: wrap; margin-top: 8px; font-size: 12px; color: var(--muted); }
 .key { display: inline-flex; align-items: center; gap: 6px; } .key i { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
 .meter { height: 8px; background: var(--bg); border: 1px solid var(--line); border-radius: 4px; overflow: hidden; }
@@ -411,8 +417,8 @@ dialog::backdrop { background: var(--backdrop); }
 .dl-card::before { content: ""; position: absolute; inset: 0 0 auto 0; height: 3px; background: var(--accent); opacity: .85; }
 .dl-card:hover { border-color: var(--line-2); }
 .dl-card[data-group=image] { --accent: var(--ram); } .dl-card[data-group=video] { --accent: var(--ssd); }
-.dl-card[data-group=speech], .dl-card[data-group=music], .dl-card[data-group=sound] { --accent: #D97BB6; }
-.dl-card[data-group=model3d] { --accent: #5FA8E8; } .dl-card[data-group=picture] { --accent: var(--good); }
+.dl-card[data-group=speech], .dl-card[data-group=music], .dl-card[data-group=sound] { --accent: var(--magenta); }
+.dl-card[data-group=model3d] { --accent: var(--azure); } .dl-card[data-group=picture] { --accent: var(--good); }
 .dl-card.installed { background: color-mix(in srgb, var(--good) 5%, var(--panel)); }
 .dl-head { display: flex; align-items: center; gap: 8px; min-width: 0; }
 .dl-icon { width: 30px; height: 30px; border-radius: 8px; display: grid; place-items: center; flex: none; background: color-mix(in srgb, var(--accent) 16%, transparent); color: var(--accent); }
@@ -1085,9 +1091,13 @@ function applyTheme(t) {
   $("#theme-label").textContent = dark ? "Light theme" : "Dark theme";
 }
 (() => {
-  let t = new URLSearchParams(location.search).get("theme") || "";
+  const params = new URLSearchParams(location.search);
+  // Shown in OAIY's window: its theme, said in the address and again at each change.
+  if (params.get("in") === "oaiy") document.documentElement.classList.add("in-oaiy");
+  let t = window.__OAIY_THEME__ || params.get("theme") || "";
   if (!["light", "dark"].includes(t)) { t = ""; try { t = localStorage.getItem("studio-theme") || ""; } catch {} }
   applyTheme(t);
+  window.__oaiySetTheme = (mode) => { if (mode === "light" || mode === "dark") applyTheme(mode); };
 })();
 $("#theme").onclick = () => {
   const dark = document.documentElement.dataset.theme ? document.documentElement.dataset.theme === "dark" : !matchMedia("(prefers-color-scheme: light)").matches;

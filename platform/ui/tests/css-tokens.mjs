@@ -22,6 +22,7 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SHEETS = [
   { label: 'ui/src/index.css', file: path.join(HERE, '..', 'src', 'index.css'), themes: [':root.light', ':root.dark'] },
   { label: 'desktop/src/styles.css', file: path.join(HERE, '..', '..', 'desktop', 'src', 'styles.css'), themes: [":root[data-theme='light']"] },
+  { label: 'app/src/styles.css (the agent)', file: path.join(HERE, '..', '..', '..', 'app', 'src', 'styles.css'), themes: [":root[data-theme='light']"] },
 ];
 
 /**

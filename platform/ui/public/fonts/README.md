@@ -15,6 +15,7 @@ files sit in `public/` and are copied verbatim into `dist/` alongside them.
 |---|---|---|---|
 | Inter | UI, body, display (weight + tracking carry the display voice) | [rsms/inter](https://github.com/rsms/inter) | [`inter.OFL.txt`](inter.OFL.txt) |
 | JetBrains Mono | data, code, readouts | [JetBrains/JetBrainsMono](https://github.com/JetBrains/JetBrainsMono) | [`jetbrains-mono.OFL.txt`](jetbrains-mono.OFL.txt) |
+| Public Sans | UI and body in OAIY's window, as OAIY Desktop's dashboard has it (`public-sans.woff2`, declared in `src/index.css`) | [uswds/public-sans](https://github.com/uswds/public-sans) | [`public-sans.OFL.txt`](public-sans.OFL.txt) |
 
 Both are **variable** weight, which the design system depends on — it asks for
 580/620/650/720 and a static cut would snap those to the nearest available.

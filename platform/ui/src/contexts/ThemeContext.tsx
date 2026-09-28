@@ -1,4 +1,5 @@
 import { createContext, useContext, useState, useEffect, useLayoutEffect, useCallback, useMemo, type ReactNode } from 'react';
+import { oaiyDesktop } from '../lib/oaiyAgentTools';
 
 export type Theme = 'light' | 'dark' | 'system';
 export type AccentColor = 'indigo' | 'blue' | 'purple' | 'green' | 'orange' | 'pink' | 'cyan';
@@ -12,6 +13,8 @@ interface ThemeContextValue {
   setAccentColor: (color: AccentColor) => void;
   backgroundTint: BackgroundTint;
   setBackgroundTint: (tint: BackgroundTint) => void;
+  /** In OAIY's window: the theme is OAIY's (the dashboard's), and so are the colours. */
+  followsOaiy: boolean;
 }
 
 const ThemeContext = createContext<ThemeContextValue | null>(null);
@@ -19,6 +22,30 @@ const ThemeContext = createContext<ThemeContextValue | null>(null);
 const THEME_KEY = 'oaiy_theme';
 const ACCENT_KEY = 'oaiy_accent_color';
 const BG_TINT_KEY = 'oaiy_bg_tint';
+/** The desktop's last word on the theme, kept for the tab so a reload starts in it (app.html reads it too). */
+const DESKTOP_THEME_KEY = 'oaiy-desktop-theme';
+
+type OaiyThemeWindow = Window & { __OAIY_DESKTOP__?: { theme?: unknown }; __OAIY_THEME__?: unknown; __oaiySetTheme?: (mode: unknown) => void };
+
+/**
+ * In OAIY's window the editor looks like the rest of OAIY: light or dark as the
+ * dashboard has it (the desktop says it at start, and again at each change),
+ * in OAIY's own violet (blue on paper) over the theme's own canvas.
+ */
+const IN_OAIY = typeof window !== 'undefined' && !!oaiyDesktop();
+
+/** The theme the desktop said last: while loading, kept from before a reload, or at start. */
+export function desktopTheme(): 'light' | 'dark' | null {
+  const w = window as OaiyThemeWindow;
+  let kept: string | null = null;
+  try {
+    kept = sessionStorage.getItem(DESKTOP_THEME_KEY);
+  } catch {
+    // storage can be unavailable
+  }
+  const found = [w.__OAIY_THEME__, kept, w.__OAIY_DESKTOP__?.theme].find((t) => t === 'light' || t === 'dark');
+  return (found as 'light' | 'dark' | undefined) ?? null;
+}
 
 interface ThemeProviderProps {
   children: ReactNode;
@@ -34,6 +61,7 @@ export function ThemeProvider({ children }: ThemeProviderProps) {
   // resolved value is written back to localStorage immediately so the
   // next read returns 'light' or 'dark' directly.
   const [theme, setThemeState] = useState<Theme>(() => {
+    if (IN_OAIY) return desktopTheme() ?? 'dark';
     try {
       const stored = localStorage.getItem(THEME_KEY);
       if (stored === 'light' || stored === 'dark') return stored;
@@ -53,6 +81,7 @@ export function ThemeProvider({ children }: ThemeProviderProps) {
 
   // Initialize accent color from localStorage or default to 'indigo' (OAIY brand)
   const [accentColor, setAccentColorState] = useState<AccentColor>(() => {
+    if (IN_OAIY) return 'indigo';
     try {
       const stored = localStorage.getItem(ACCENT_KEY);
       if (stored && ['indigo', 'blue', 'purple', 'green', 'orange', 'pink', 'cyan'].includes(stored)) {
@@ -66,6 +95,7 @@ export function ThemeProvider({ children }: ThemeProviderProps) {
 
   // Initialize background tint from localStorage or default to 'none'
   const [backgroundTint, setBackgroundTintState] = useState<BackgroundTint>(() => {
+    if (IN_OAIY) return 'none';
     try {
       const stored = localStorage.getItem(BG_TINT_KEY);
       if (stored && ['none', 'indigo', 'blue', 'purple', 'green', 'orange', 'pink', 'cyan', 'slate'].includes(stored)) {
@@ -84,6 +114,27 @@ export function ThemeProvider({ children }: ThemeProviderProps) {
   // state + prefers-color-scheme listener were dead (their value fed only this
   // branch) and have been removed.
   const resolvedTheme: 'light' | 'dark' = theme === 'light' ? 'light' : 'dark';
+
+  // In OAIY's window, follow the dashboard's theme as the desktop says it.
+  useEffect(() => {
+    if (!IN_OAIY) return;
+    const w = window as OaiyThemeWindow;
+    w.__oaiySetTheme = (mode) => {
+      if (mode !== 'light' && mode !== 'dark') return;
+      try {
+        sessionStorage.setItem(DESKTOP_THEME_KEY, mode);
+      } catch {
+        // storage can be unavailable
+      }
+      setThemeState(mode);
+    };
+    // Said while the page was starting, after the first render read it.
+    const said = desktopTheme();
+    if (said) setThemeState(said);
+    return () => {
+      delete w.__oaiySetTheme;
+    };
+  }, []);
 
   // Apply theme class to document element
   useEffect(() => {
@@ -273,7 +324,7 @@ export function ThemeProvider({ children }: ThemeProviderProps) {
   // setters are already useCallback-stable, so the value only changes when the
   // actual theme state does.
   const value = useMemo(
-    () => ({ theme, setTheme, resolvedTheme, accentColor, setAccentColor, backgroundTint, setBackgroundTint }),
+    () => ({ theme, setTheme, resolvedTheme, accentColor, setAccentColor, backgroundTint, setBackgroundTint, followsOaiy: IN_OAIY }),
     [theme, setTheme, resolvedTheme, accentColor, setAccentColor, backgroundTint, setBackgroundTint],
   );
 

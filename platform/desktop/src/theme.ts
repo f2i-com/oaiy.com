@@ -9,8 +9,11 @@
  * bare `:root` default, so `data-theme` is only written for light.
  *
  * The preference persists to localStorage and falls back to the OS
- * `prefers-color-scheme` on first run.
+ * `prefers-color-scheme` on first run. The pages shown in the window beside
+ * the sidebar (Agent, Flows, Engines) follow it: the desktop is told.
  */
+import { isTauri, tauriInvoke } from './api';
+
 export type ThemeMode = 'light' | 'dark';
 
 const KEY = 'oaiy-theme';
@@ -40,4 +43,5 @@ export function applyTheme(mode: ThemeMode): void {
   } catch {
     // ignore persistence failures
   }
+  if (isTauri()) tauriInvoke('set_theme', { mode }).catch(() => undefined);
 }
