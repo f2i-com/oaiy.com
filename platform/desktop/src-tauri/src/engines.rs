@@ -66,7 +66,10 @@ pub fn programs_dir() -> Option<PathBuf> {
 
 /// Start the engines, or find them running. Returns their control pages' address.
 pub fn start(data_dir: &Path) -> Result<String, String> {
-    let m = mode();
+    start_with(data_dir, mode())
+}
+
+fn start_with(data_dir: &Path, m: Mode) -> Result<String, String> {
     if m == Mode::Off {
         return Err("the engines are off (OAIY_ENGINES=off)".into());
     }
@@ -116,6 +119,35 @@ mod tests {
     #[test]
     fn the_configuration_lives_in_the_data_folder() {
         assert_eq!(config_path(Path::new("D:/data")), Path::new("D:/data").join("engines").join("oaiy-studio.json"));
+    }
+
+    #[test]
+    fn started_by_the_desktop_they_serve_and_stop() {
+        // A configuration of its own on ports the system picks, so it cannot meet a running studio.
+        let data = std::env::temp_dir().join(format!("oaiy-engines-{}", std::process::id()));
+        let config = config_path(&data);
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        oaiy_studio::use_programs_from(&config, &data).unwrap();
+        let mut v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&config).unwrap()).unwrap();
+        v["ui"]["port"] = 0.into();
+        v["gateway"]["port"] = 0.into();
+        std::fs::write(&config, serde_json::to_string_pretty(&v).unwrap()).unwrap();
+
+        let ui = start_with(&data, Mode::Launch).unwrap();
+        assert!(ui.starts_with("http://127.0.0.1:") && !ui.ends_with(":0"), "{ui}");
+        assert_eq!(ui_url().as_deref(), Some(ui.as_str()));
+        // The control pages answer while it runs.
+        let addr = ui.trim_start_matches("http://");
+        let mut stream = std::net::TcpStream::connect(addr).unwrap();
+        use std::io::{Read, Write};
+        stream.write_all(format!("GET /api/state HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n").as_bytes()).unwrap();
+        let mut reply = String::new();
+        stream.read_to_string(&mut reply).unwrap();
+        assert!(reply.starts_with("HTTP/1.1 200"), "{}", &reply[..reply.len().min(200)]);
+        assert!(reply.contains("config_path"));
+        stop();
+        assert!(RUNNING.lock().unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&data);
     }
 
     #[test]
