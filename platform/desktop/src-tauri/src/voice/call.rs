@@ -171,7 +171,8 @@ pub async fn run(socket: WebSocket, hub: VoiceHub, engines: Engines) {
     };
     let str_of = |k: &str| start.get(k).and_then(Value::as_str).unwrap_or("").to_string();
     let (instructions, mut greeting) = (str_of("instructions"), str_of("greeting"));
-    let voice: Option<String> = None;
+    // The voice chosen for calls (a clip in the voices folder; see `voices`).
+    let voice: Option<String> = super::voices::chosen();
 
     // Everything we send goes through one writer.
     let (out_tx, mut out_rx) = mpsc::channel::<Message>(256);

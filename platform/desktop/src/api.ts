@@ -1183,6 +1183,49 @@ export const calendar = {
     }),
 };
 
+// ----- the voice calls are answered in -----
+
+/** A voice: a clip of someone speaking, kept on this machine by name. */
+export interface VoiceClip {
+  name: string;
+  file: string;
+  bytes: number;
+  /** What it says is written beside it (else OAIY's speech server hears it). */
+  written: boolean;
+}
+
+export const voices = {
+  list: () => request<{ voices: VoiceClip[]; chosen: string | null }>('/api/voice/voices'),
+  choose: (voice: string) => request<{ chosen: string }>('/api/voice/voices/chosen', { method: 'PUT', body: JSON.stringify({ voice }) }),
+  /** Keep a clip (MP3, WAV, ...) as the voice `name`; `words` is what it says, when known. */
+  add: (name: string, file: File, words?: string, choose?: boolean) =>
+    request<{ voice: VoiceClip; chosen: string | null }>(
+      `/api/voice/voices?${new URLSearchParams({ name, file: file.name, ...(words?.trim() ? { words: words.trim() } : {}), ...(choose ? { choose: 'true' } : {}) })}`,
+      { method: 'POST', headers: { 'Content-Type': 'application/octet-stream' }, body: file },
+    ),
+  remove: (name: string) => request<{ chosen: string | null }>(`/api/voice/voices/${encodeURIComponent(name)}`, { method: 'DELETE' }),
+  /** A line spoken in a voice, as audio. The speech server starts if it has to (up to a minute the first time). */
+  hear: async (name: string, text?: string): Promise<Blob> => {
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), 90_000);
+    try {
+      const resp = await fetch(`${API_BASE}/api/voice/voices/${encodeURIComponent(name)}/try`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(text ? { text } : {}),
+        signal: ac.signal,
+      });
+      if (!resp.ok) {
+        const body = await resp.json().catch(() => null);
+        throw new Error(body?.error?.message ?? `${resp.status}: ${resp.statusText}`);
+      }
+      return await resp.blob();
+    } finally {
+      clearTimeout(timer);
+    }
+  },
+};
+
 // ----- the engines and the phone, for Overview -----
 
 export interface EnginesStatus {

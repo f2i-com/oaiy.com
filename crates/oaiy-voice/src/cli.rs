@@ -5,6 +5,11 @@
 //! `--device` and `--dtype`. Those two can also come from the environment
 //! (`OAIY_VOICE_DEVICE`, `OAIY_VOICE_DTYPE`), so a service template can set
 //! them without changing its arguments; a flag wins over the environment.
+//!
+//! For speech it adds `--voices-dir` (voice clips by name), `--voice` (the
+//! default: a name there, or a clip) and `--ffmpeg`. A model given by name
+//! rather than path is looked for in `--model-dirs` (`OAIY_MODEL_DIRS`), the
+//! model folders joined by the system's path separator.
 
 use std::path::PathBuf;
 
@@ -45,7 +50,8 @@ impl Mode {
 /// Where the model runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DeviceChoice {
-    /// The first CUDA GPU when this build has CUDA and one is there, else the CPU.
+    /// The CUDA GPU with the most free memory when this build has CUDA and
+    /// one is there, else the CPU.
     Auto,
     Cpu,
     Cuda(usize),
@@ -100,15 +106,36 @@ pub struct Args {
     pub tts_model: Option<PathBuf>,
     pub device: DeviceChoice,
     pub dtype: Precision,
+    /// Voice clips, by name.
+    pub voices_dir: Option<PathBuf>,
+    /// The default voice: a name in `voices_dir`, or a clip.
+    pub voice: Option<String>,
+    pub ffmpeg: PathBuf,
+    /// Where a model given by name is looked for.
+    pub model_dirs: Vec<PathBuf>,
+}
+
+impl Args {
+    /// A model's folder or file: the path as given when it is there, else the
+    /// first of the model folders that has it by that name.
+    pub fn find_model(&self, given: &std::path::Path) -> PathBuf {
+        if given.exists() || given.is_absolute() {
+            return given.to_path_buf();
+        }
+        self.model_dirs.iter().map(|d| d.join(given)).find(|p| p.exists()).unwrap_or_else(|| given.to_path_buf())
+    }
 }
 
 pub const USAGE: &str = "usage: oaiy-voice [--mode stt|tts|both] [--port N] [--host ADDR]
                   [--stt-model-dir PATH | --model PATH] [--tts-model-dir PATH]
                   [--device auto|cpu|cuda|cuda:N] [--dtype auto|f32|tf32|f16|bf16]
+                  [--voices-dir DIR] [--voice NAME|CLIP] [--ffmpeg PATH] [--model-dirs DIRS]
        oaiy-voice transcribe --model PATH [--device ...] [--dtype ...] [--repeat N] FILE.wav...
 
 PATH is a Parakeet .nemo, a model.safetensors (with config.json and
-tokenizer.json beside it), or a folder holding either.";
+tokenizer.json beside it), or a folder holding either; the TTS model is a
+Qwen3-TTS Base folder. A model named without a path is looked for in the
+model folders. A voice is a clip (WAV, MP3...) in DIR, by its file name.";
 
 /// Parse the server's flags (`--flag value` or `--flag=value`), with the
 /// process environment for what they leave out.
@@ -131,6 +158,10 @@ pub fn parse_with_env<I: IntoIterator<Item = String>>(args: I, env: impl Fn(&str
         Some(v) => Precision::parse(&v).map_err(|e| format!("OAIY_VOICE_DTYPE: {e}"))?,
         None => Precision::Auto,
     };
+    let (mut voices_dir, mut voice) = (None, None);
+    let mut ffmpeg = PathBuf::from("ffmpeg");
+    let split = |v: &str| std::env::split_paths(v).filter(|p| !p.as_os_str().is_empty()).collect::<Vec<PathBuf>>();
+    let mut model_dirs = env("OAIY_MODEL_DIRS").map(|v| split(&v)).unwrap_or_default();
     let mut i = 0;
     while i < argv.len() {
         let (flag, inline) = match argv[i].split_once('=') {
@@ -159,6 +190,10 @@ pub fn parse_with_env<I: IntoIterator<Item = String>>(args: I, env: impl Fn(&str
             "--tts-model-dir" => tts_model = Some(PathBuf::from(value()?)),
             "--device" => device = DeviceChoice::parse(&value()?)?,
             "--dtype" => dtype = Precision::parse(&value()?)?,
+            "--voices-dir" => voices_dir = Some(PathBuf::from(value()?)),
+            "--voice" => voice = Some(value()?).filter(|v| !v.trim().is_empty()),
+            "--ffmpeg" => ffmpeg = PathBuf::from(value()?),
+            "--model-dirs" => model_dirs = split(&value()?),
             // Aokie's engine choice: only Parakeet is served here.
             "--stt-engine" => {
                 let v = value()?;
@@ -172,7 +207,7 @@ pub fn parse_with_env<I: IntoIterator<Item = String>>(args: I, env: impl Fn(&str
         i += 1;
     }
     let mode = mode.unwrap_or(Mode::Both);
-    Ok(Args { mode, port: port.unwrap_or(mode.default_port()), host, stt_model, tts_model, device, dtype })
+    Ok(Args { mode, port: port.unwrap_or(mode.default_port()), host, stt_model, tts_model, device, dtype, voices_dir, voice, ffmpeg, model_dirs })
 }
 
 #[cfg(test)]
@@ -215,6 +250,22 @@ mod tests {
         let a = parse_with_env(["--device", "cpu"].map(String::from), env).unwrap();
         assert_eq!(a.device, DeviceChoice::Cpu);
         assert!(parse_with_env(Vec::<String>::new(), |k| (k == "OAIY_VOICE_DEVICE").then(|| "tpu".to_string())).is_err());
+    }
+
+    #[test]
+    fn speech_flags_and_models_by_name() {
+        let roots = std::env::join_paths([std::env::temp_dir().join("oaiy-voice-none"), std::env::temp_dir()]).unwrap().into_string().unwrap();
+        let a = p(&["--mode", "both", "--voices-dir", "V", "--voice", "phone", "--ffmpeg", "C:/ff/ffmpeg.exe", "--model-dirs", &roots]).unwrap();
+        assert_eq!((a.voices_dir.clone(), a.voice.as_deref(), a.ffmpeg.clone()), (Some(PathBuf::from("V")), Some("phone"), PathBuf::from("C:/ff/ffmpeg.exe")));
+        assert_eq!(a.model_dirs.len(), 2);
+        let name = format!("oaiy-voice-model-{}", std::process::id());
+        std::fs::create_dir_all(std::env::temp_dir().join(&name)).unwrap();
+        assert_eq!(a.find_model(std::path::Path::new(&name)), std::env::temp_dir().join(&name));
+        assert_eq!(a.find_model(std::path::Path::new("not-here")), PathBuf::from("not-here"));
+        let _ = std::fs::remove_dir_all(std::env::temp_dir().join(&name));
+        let env = parse_with_env(Vec::<String>::new(), |k| (k == "OAIY_MODEL_DIRS").then(|| roots.clone())).unwrap();
+        assert_eq!(env.model_dirs.len(), 2);
+        assert_eq!(p(&["--voice", " "]).unwrap().voice, None);
     }
 
     #[test]

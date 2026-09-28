@@ -1620,6 +1620,7 @@ dependencies = [
  "dsv41",
  "half",
  "oaiy-engine",
+ "oaiy-tts",
 ]
 
 [[package]]

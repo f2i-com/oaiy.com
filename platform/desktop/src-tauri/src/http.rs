@@ -1232,6 +1232,7 @@ pub async fn serve(
     // The calendar lives in the data folder, beside the flows it may defer to.
     if let Ok(dir) = registry.lock().map(|r| r.data_dir().to_path_buf()) {
         crate::calendar::init(&dir);
+        crate::voice::voices::init(&dir);
     }
 
     let state = AppState {

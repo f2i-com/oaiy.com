@@ -14,6 +14,7 @@
 pub mod audio;
 pub mod call;
 pub mod engines;
+pub mod voices;
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -21,11 +22,11 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use axum::extract::{Path, State, WebSocketUpgrade};
+use axum::extract::{Path, Query, State, WebSocketUpgrade};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::IntoResponse;
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -132,7 +133,93 @@ pub fn app_router(hub: VoiceHub) -> Router {
         .route("/api/voice/calls/:id/hush", post(hush))
         // Half a minute of 16 kHz speech is under 1 MB; the app sends pieces that size.
         .route("/api/voice/transcribe", post(transcribe).layer(axum::extract::DefaultBodyLimit::max(8 * 1024 * 1024)))
+        // The voice calls are answered in: clips by name, the one chosen, a new
+        // one (the clip's bytes as the body), and a line spoken in one to hear it.
+        .route("/api/voice/voices", get(voices_list).post(voice_add).layer(axum::extract::DefaultBodyLimit::max(voices::MAX_CLIP_BYTES + 1024)))
+        .route("/api/voice/voices/chosen", put(voice_choose))
+        .route("/api/voice/voices/:name", delete(voice_remove))
+        .route("/api/voice/voices/:name/try", post(voice_try))
         .with_state(hub)
+}
+
+fn voice_error(status: StatusCode, code: &str, message: impl Into<String>) -> axum::response::Response {
+    (status, Json(json!({"error": {"code": code, "message": message.into()}}))).into_response()
+}
+
+async fn voices_list() -> Json<Value> {
+    Json(json!({"voices": voices::list(), "chosen": voices::chosen()}))
+}
+
+#[derive(Deserialize)]
+struct Chosen {
+    voice: String,
+}
+
+async fn voice_choose(Json(body): Json<Chosen>) -> axum::response::Response {
+    match voices::choose(&body.voice) {
+        Ok(name) => Json(json!({"chosen": name})).into_response(),
+        Err(e) => voice_error(StatusCode::NOT_FOUND, "no_voice", e),
+    }
+}
+
+#[derive(Deserialize)]
+struct NewVoice {
+    name: String,
+    /// The clip's file name or extension (`clip.mp3`, `mp3`).
+    file: String,
+    /// What the clip says, word for word (else the speech server hears it).
+    words: Option<String>,
+    /// Choose it for calls.
+    choose: Option<bool>,
+}
+
+async fn voice_add(Query(q): Query<NewVoice>, body: axum::body::Bytes) -> axum::response::Response {
+    let extension = q.file.rsplit('.').next().unwrap_or("").to_string();
+    match voices::add(&q.name, &extension, &body, q.words.as_deref()) {
+        Ok(v) => {
+            if q.choose.unwrap_or(false) {
+                let _ = voices::choose(&v.name);
+            }
+            (StatusCode::CREATED, Json(json!({"voice": v, "chosen": voices::chosen()}))).into_response()
+        }
+        Err(e) => voice_error(StatusCode::BAD_REQUEST, "bad_voice", e),
+    }
+}
+
+async fn voice_remove(Path(name): Path<String>) -> axum::response::Response {
+    match voices::remove(&name) {
+        Ok(()) => Json(json!({"removed": name, "chosen": voices::chosen()})).into_response(),
+        Err(e) => voice_error(StatusCode::NOT_FOUND, "no_voice", e),
+    }
+}
+
+#[derive(Deserialize, Default)]
+struct TryLine {
+    text: Option<String>,
+}
+
+/// A line spoken in a voice, as a WAV, to hear it before choosing it.
+async fn voice_try(State(hub): State<VoiceHub>, Path(name): Path<String>, body: Option<Json<TryLine>>) -> axum::response::Response {
+    if !voices::list().iter().any(|v| v.name.eq_ignore_ascii_case(&name)) {
+        return voice_error(StatusCode::NOT_FOUND, "no_voice", format!("no voice called {name:?}"));
+    }
+    let text = body.and_then(|b| b.0.text).map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
+    let text = text.unwrap_or_else(|| "Hi, thanks for calling! How can I help you today?".to_string());
+    if text.chars().count() > 400 {
+        return voice_error(StatusCode::BAD_REQUEST, "too_long", "a line to try is at most 400 characters");
+    }
+    let (tx, mut rx) = mpsc::channel::<Vec<i16>>(64);
+    let engines = hub.inner.engines.clone();
+    let speaking = tokio::spawn(async move { engines.speak(&text, Some(&name), &tx).await });
+    let mut pcm: Vec<i16> = Vec::new();
+    while let Some(piece) = rx.recv().await {
+        pcm.extend_from_slice(&piece);
+    }
+    match speaking.await {
+        Ok(Ok(())) => ([(axum::http::header::CONTENT_TYPE, "audio/wav")], audio::wav(&pcm, engines::WIRE_RATE)).into_response(),
+        Ok(Err(e)) => voice_error(StatusCode::BAD_GATEWAY, "text_to_speech", e),
+        Err(e) => voice_error(StatusCode::INTERNAL_SERVER_ERROR, "text_to_speech", e.to_string()),
+    }
 }
 
 /// What was said in a recording (the agent's speech-to-text tool): a 16 kHz mono 16-bit WAV in, `{text}` out.

@@ -97,33 +97,30 @@ shell's code one at a time after that.
   checkpoints: v3 (with its processor config), parakeet-ultra (the same network, retrained,
   with a VAD head) and v2 (from its `.nemo`). Also served as `/v1/audio/transcriptions`, and
   given to the agent as a tool (`transcribe`: a recording in the project to text).
-- **Text-to-speech: Kyutai Pocket TTS** (about 100M parameters, 24 kHz, about 200 ms to the
-  first audio), fed the agent's reply sentence by sentence. MOSS-TTS-Realtime later, for 20
-  languages and token-by-token input.
+- **Text-to-speech: Qwen3-TTS 0.6B Base** (`crates/oaiy-tts`: 24 kHz, streamed as it is made,
+  about 90 ms to the first audio on the GPU, CUDA graphs per frame), in a voice cloned from a
+  short clip, fed the agent's reply sentence by sentence. Pocket TTS was the first plan; a
+  cloned voice from any MP3 decided it.
 - Details and sources: [speech models](ecosystem/SPEECH_MODELS.md).
 
-**Today (28 Sept 2026)**, speech runs as two OAIY services: `aokie-stt` on 8781 and
-`aokie-tts` on 8782. They are Aokie's own voice server, in Rust on ONNX Runtime. The desktop
-starts them when a call or the `transcribe_audio` tool needs them. Its speech-to-text is
-`nvidia/parakeet-unified-en-0.6b` (RNN-T, int8 ONNX, CPU); "parakeet-tdt-0.6b" is only the name
-it reports. Its text-to-speech is Pocket TTS (`english_2026-04`, int8 ONNX, first audio after
-0.7–1 s).
+**Today (28 Sept 2026)**, speech runs as one OAIY service, `oaiy-voice` on 8783: the
+resident server in `crates/oaiy-voice` (Parakeet TDT v2 and Qwen3-TTS 0.6B, Rust on Candle).
+It serves Aokie's routes and arguments (`/v1/audio/transcriptions`, `/v1/audio/speech` as
+streamed PCM or a WAV, and `/v1/audio/voices`), so the desktop's calls and the
+`transcribe_audio` tool use it as they used Aokie's two services, which remain installable.
 
-**The native voice worker, as researched:** a resident `crates/oaiy-voice`, since `oaiy-media`
-starts a process per job. It serves the same routes and arguments, so the two service templates
-simply point at it. The work, in this order:
-1. The server skeleton, with contract tests against `aokie-voice-server`: 2–3 days.
-2. Pocket TTS: 5–8 days, adapting the MIT/Apache Candle port
-   (github.com/babybirdprd/pocket-tts, parity-tested) to Candle 0.11 and the 2026-04 configs.
-   `candle-transformers` already has streaming Mimi. This comes first because it decides when
-   the caller hears the first word.
-3. Parakeet: 6–10 days to parity, plus 3–5 days for streaming. One FastConformer encoder with an
-   RNN-T head (Unified) and a TDT head (v2, v3, ultra). The Candle ports found are unlicensed or
-   not at parity, so they are only references.
-
-That is about 3–4 weeks. Parity fixtures come from the fp32 ONNX graphs. One product decision
-is open: preset Pocket TTS voices, or gated weights (a Hugging Face token) to keep today's cloned
-voice.
+- **The GPU:** `--device auto` takes the CUDA GPU with the most free memory when it starts
+  (about 4 GB for both models); the engines that load later size themselves around it. The
+  Services page can pin it to a GPU.
+- **The models:** found by name in the model folders (`--model-dirs`), or downloaded by its
+  installer at pinned revisions with checksums.
+- **The voices:** clips in `<data>/voices`, by file name; the one calls use is chosen on the
+  Calendar page (Hours & services, "Voice on calls"), where each can be heard and a new one added
+  from an MP3 or WAV. What a clip says is read from `NAME.txt` beside it, or heard by the
+  server's own speech-to-text from exactly the audio the voice is made from. OAIY ships a
+  receptionist voice made with Qwen3-TTS VoiceDesign.
+- **Next:** streaming speech-to-text (a call's turns wait for the end of an utterance today),
+  the talker's own step as a CUDA graph, and WebGPU for machines without CUDA.
 
 ## Flows and the agent
 
@@ -178,7 +175,7 @@ Each step ends with something that works and can be shown.
    the web app pairs with it. The sidebar layout, with the existing pages framed.
 4. **Flows in the app.** The editor as a page; flows as project files; flow tools for the
    agent; the agent's flow tools; an agent node.
-5. **Voice.** The resident voice worker; `/v1/realtime`; Parakeet; Pocket TTS; the 17872
+5. **Voice.** The resident voice worker; `/v1/realtime`; Parakeet; Qwen3-TTS; the 17872
    gateway and Aokie's `desktop_realtime` bridge; call sessions, one at a time; the
    `transcribe` tool.
 6. **Pages move into the shell**, one at a time; `app/src-tauri` retired.
@@ -194,16 +191,15 @@ Tried on the Pixel 9a test phone, on the dongle, with the Qwen 27B model on this
 | 3. One desktop | The OAIY window shows the agent (Agent), the flow editor (Flows) and the engines' control pages (Engines) beside the sidebar. All three take the dashboard's look: its light or dark (Paper Circuit or Prism Lab), sent to each page as it changes (`set_theme`), in the same colours and type (Public Sans), with the pages' own theme buttons and names hidden. The agent's page is made at startup, so calls and texts are answered whatever the window shows. The window opens with OAIY, and launching OAIY again brings it back (one instance). The engines run in the desktop's process (`engines.rs`; a debug build uses a running `oaiy-studio`, so a rebuild does not unload the model); this machine's Studio configuration moved to `<data>/engines/`. The web app stays optional and pairs. | Pages moving into the shell |
 | 4. Flows | A flow is made a tool in the editor ("Make it a tool for the agent…"), and the agent uses it (run through the bridge). The agent reads the node types, writes, checks and runs flows (`flow_write`, `flow_run`). The editor and the desktop keep the same flows: new and changed flows go both ways (three-way, remembered across restarts), and a flow the agent changes redraws in the open editor. | Flows as project files; an agent node |
 | Calendar | Hours, services and appointments on the desktop (`<data>/calendar/calendar.json`), a Calendar page (week, requests to confirm with an optional text, hours and services). The phone's `business-lookup` is answered from it (free times, the caller's own appointments), and a call's agreed appointment is recorded as a request. The agent lists, books and changes appointments. It syncs with FormLogic's appointments form every minute while linked (tried both ways on the linked account). | Deletions synced (FormLogic has no change feed); FormLogic's missing `updatedSince` and version check |
-| 5. Voice | Calls answered by the agent through Aokie's `desktop_realtime` on 17872: the greeting plays whole, and replies are heard 2–3 s after the caller stops (one output item per reply). Appointment requests reach Aokie. On goodbye it says a short goodbye and hangs up (tried on a stand-in call; the last real call was before that change). `transcribe_audio`: a 42 s recording written out word for word. | The native voice worker (above; Parakeet and Qwen3-TTS 0.6B on CUDA are being built on branches `voice-engine` and `voice-tts`); `/v1/realtime` |
+| 5. Voice | OAIY's own voice server (`crates/oaiy-voice`, the `oaiy-voice` service): Parakeet speech-to-text and Qwen3-TTS 0.6B (`crates/oaiy-tts`) in Rust on the GPU with the most free memory, loaded once (about 4 GB). A line starts in about 90 ms and runs at about 6x real time; a stand-in call was answered in it end to end. The voice is a clip (MP3 or WAV) chosen on the Calendar page, heard and transcribed by the server itself; OAIY ships a receptionist voice made with VoiceDesign. Calls answered by the agent through Aokie's `desktop_realtime` on 17872: the greeting plays whole, and replies are heard 2–3 s after the caller stops (one output item per reply). Appointment requests reach Aokie. On goodbye it says a short goodbye and hangs up (tried on a stand-in call; the last real call was before that change). `transcribe_audio`: a 42 s recording written out word for word. | `/v1/realtime`; a live call on the new voice; WebGPU for machines without CUDA |
 
 ## Decided, and still open
 
 - Decided: the desktop host is `platform/desktop`; the engines run in its process; flows stay
   and join the agent; the agent owns conversations and flows own records by default; speech
-  is Parakeet and Pocket TTS first.
+  is OAIY's own (Parakeet and Qwen3-TTS in Rust on the GPU); Aokie's servers stay as services.
 - Open: the order in which pages move into the shell; whether the engines' control API keeps
-  its own port or joins 17972; the voices shipped with Pocket TTS (its voice samples have
-  their own licences).
+  its own port or joins 17972; which receptionist voices OAIY ships beyond its own.
 
 ## Known issues
 

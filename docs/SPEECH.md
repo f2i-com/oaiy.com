@@ -129,6 +129,17 @@ sounding the same from clip to clip. In the Playground's Video tab, pick
 
 ## Realtime speech: `oaiy-tts`
 
+Calls hear it through `crates/oaiy-voice`, OAIY's voice server (the desktop's
+`oaiy-voice` service), which also runs Parakeet speech-to-text. There a voice
+is a clip in the voices folder, and a clip with nothing written beside it is
+transcribed by the server itself, so an MP3 alone makes a voice:
+
+```sh
+oaiy-voice --mode both --port 8783 --stt-model-dir parakeet-tdt-0.6b-v2   --tts-model-dir Qwen3-TTS-12Hz-0.6B-Base --model-dirs E:/models --voices-dir voices
+curl http://127.0.0.1:8783/v1/audio/speech -H "Content-Type: application/json"   -d '{"input": "Hi, thanks for calling!", "voice": "receptionist", "response_format": "pcm"}' -o hi.pcm
+```
+
+
 `crates/oaiy-tts` is a library for live calls. It uses Qwen3-TTS-12Hz-0.6B-Base
 (Apache-2.0; the 1.7B Base works the same) and streams 16-bit, 24 kHz PCM
 while it speaks. A voice is cloned from a short clip and its transcript.

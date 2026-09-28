@@ -2,13 +2,15 @@
 //! transcribe WAV files from the command line (and time it).
 
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use candle_core::{DType, Device};
-use oaiy_voice::cli::{self, Args, DeviceChoice, Precision};
-use oaiy_voice::server::{self, Server, SpeechToText};
-use oaiy_voice::stt::Transcriber;
 use oaiy_voice::audio;
+use oaiy_voice::cli::{self, Args, DeviceChoice, Precision};
+use oaiy_voice::server::{self, Server, SharedStt, SpeechToText, TextToSpeech};
+use oaiy_voice::stt::Transcriber;
+use oaiy_voice::tts::{Setup, Speaker, Transcribe, Voices};
 
 struct Parakeet(Transcriber);
 
@@ -33,18 +35,41 @@ impl SpeechToText for Parakeet {
     }
 }
 
-fn pick_device(choice: DeviceChoice) -> Result<Device, String> {
-    match choice {
-        DeviceChoice::Cpu => Ok(Device::Cpu),
-        DeviceChoice::Cuda(n) => Device::new_cuda(n).map_err(|e| format!("cuda:{n}: {e}")),
-        DeviceChoice::Auto => {
-            if candle_core::utils::cuda_is_available() {
-                if let Ok(d) = Device::new_cuda(0) {
-                    return Ok(d);
-                }
+/// The CUDA GPU with the most free memory, and how much: speech takes what
+/// is spare there first, and the engines that load later size themselves
+/// around it.
+fn roomiest_gpu() -> Option<(usize, u64)> {
+    if !candle_core::utils::cuda_is_available() {
+        return None;
+    }
+    let mut best: Option<(usize, u64)> = None;
+    for n in 0..16 {
+        let Ok(dev) = Device::new_cuda(n) else { break };
+        if let Some((free, _)) = oaiy_tts::device_memory(&dev) {
+            if best.is_none_or(|(_, most)| free > most) {
+                best = Some((n, free));
             }
-            Ok(Device::Cpu)
         }
+    }
+    best
+}
+
+/// The GPU speech runs on (`None`: the CPU).
+fn pick_gpu(choice: DeviceChoice) -> Option<usize> {
+    match choice {
+        DeviceChoice::Cpu => None,
+        DeviceChoice::Cuda(n) => Some(n),
+        DeviceChoice::Auto => roomiest_gpu().map(|(n, free)| {
+            eprintln!("[oaiy-voice] cuda:{n} has the most free memory ({:.1} GB): speech runs there", free as f64 / 1e9);
+            n
+        }),
+    }
+}
+
+fn device_for(gpu: Option<usize>) -> Result<Device, String> {
+    match gpu {
+        None => Ok(Device::Cpu),
+        Some(n) => Device::new_cuda(n).map_err(|e| format!("cuda:{n}: {e}")),
     }
 }
 
@@ -78,8 +103,8 @@ fn describe(dev: &Device, dtype: DType) -> String {
     format!("{d} {}", if tf32 { "tf32" } else { dtype.as_str() })
 }
 
-fn load(path: &Path, device: DeviceChoice, precision: Precision) -> Result<Transcriber, String> {
-    let dev = pick_device(device)?;
+fn load(path: &Path, gpu: Option<usize>, precision: Precision) -> Result<Transcriber, String> {
+    let dev = device_for(gpu)?;
     let dtype = pick_dtype(precision, &dev);
     let started = Instant::now();
     let t = Transcriber::load(path, &dev, dtype).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -92,18 +117,35 @@ fn load(path: &Path, device: DeviceChoice, precision: Precision) -> Result<Trans
 }
 
 fn serve(args: Args) -> Result<(), String> {
+    let gpu = pick_gpu(args.device);
     let (stt, id, device) = if args.mode.stt() {
         let path = args.stt_model.clone().ok_or("no speech-to-text model: pass --stt-model-dir (a Parakeet .nemo, a model.safetensors or a folder holding one)")?;
-        let t = load(&path, args.device, args.dtype)?;
+        let t = load(&args.find_model(&path), gpu, args.dtype)?;
         let (id, device) = (t.name.clone(), describe(t.device(), t.dtype()));
-        (Some(Box::new(Parakeet(t)) as Box<dyn SpeechToText>), id, device)
+        let shared: SharedStt = Arc::new(Mutex::new(Box::new(Parakeet(t)) as Box<dyn SpeechToText>));
+        (Some(shared), id, device)
     } else {
         (None, String::new(), "none".to_string())
     };
-    if args.mode.tts() {
-        eprintln!("[oaiy-voice] text-to-speech is not in this build: /v1/audio/speech answers 501");
-    }
-    server::run(Server::new(args.mode, stt, id, device), &args.host, args.port)
+    let tts = if args.mode.tts() {
+        let path = args.tts_model.clone().ok_or("no text-to-speech model: pass --tts-model-dir (a Qwen3-TTS Base folder)")?;
+        let gpu = gpu.ok_or("text-to-speech runs on a CUDA GPU: there is none here, or this build has no CUDA (build with --features cuda)")?;
+        // A voice clip with nothing written beside it is heard by this server's own ears.
+        let transcribe = stt.clone().map(|stt| {
+            Arc::new(move |samples: &[f32], rate: usize| {
+                let mut stt = stt.lock().unwrap_or_else(|p| p.into_inner());
+                let at = stt.sample_rate();
+                stt.transcribe(&audio::resample(samples, rate, at))
+            }) as Transcribe
+        });
+        let voices = Voices { dir: args.voices_dir.clone(), default: args.voice.clone() };
+        let cache = args.voices_dir.as_ref().map(|d| d.join(".made"));
+        let speaker = Speaker::start(Setup { model_dir: args.find_model(&path), gpu, voices, ffmpeg: args.ffmpeg.clone(), cache, transcribe })?;
+        Some(Arc::new(speaker) as Arc<dyn TextToSpeech>)
+    } else {
+        None
+    };
+    server::run(Server::new(args.mode, stt, id, device, tts), &args.host, args.port)
 }
 
 /// `transcribe --model PATH [--device D] [--dtype T] [--repeat N] FILE...`
@@ -123,7 +165,7 @@ fn transcribe(argv: Vec<String>) -> Result<(), String> {
         }
     }
     let model = model.ok_or("transcribe needs --model")?;
-    let t = load(&model, device, dtype)?;
+    let t = load(&model, pick_gpu(device), dtype)?;
     for f in files {
         let bytes = std::fs::read(&f).map_err(|e| format!("{}: {e}", f.display()))?;
         let wav = audio::parse_wav(&bytes).map_err(|e| format!("{}: {e}", f.display()))?;

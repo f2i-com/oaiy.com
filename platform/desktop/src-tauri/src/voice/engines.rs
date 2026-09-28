@@ -1,6 +1,8 @@
-//! Speech for calls: speech-to-text and text-to-speech, from the voice server
-//! (Aokie's, Rust on ONNX Runtime: Parakeet and Pocket TTS) run as OAIY's
-//! `aokie-stt` and `aokie-tts` services, started when a call needs them.
+//! Speech for calls: speech-to-text and text-to-speech from OAIY's own voice
+//! server (`oaiy-voice`: Parakeet and Qwen3-TTS in Rust on the GPU, in the
+//! voice chosen from the clips in `<data>/voices`), run as the `oaiy-voice`
+//! service and started when a call needs it. Aokie's servers answer the same
+//! routes, and remain as the `aokie-stt` / `aokie-tts` services.
 
 use std::time::{Duration, Instant};
 
@@ -11,8 +13,9 @@ use tokio::sync::mpsc;
 use super::audio::{self, Resampler};
 use crate::services::registry::RegistryHandle;
 
-pub const STT_SERVICE: &str = "aokie-stt";
-pub const TTS_SERVICE: &str = "aokie-tts";
+/// One process serves both: speech-to-text and text-to-speech.
+pub const STT_SERVICE: &str = "oaiy-voice";
+pub const TTS_SERVICE: &str = "oaiy-voice";
 /// The rate calls run at on the wire (Aokie's realtime stream).
 pub const WIRE_RATE: u32 = 24_000;
 /// What speech-to-text takes.
@@ -64,6 +67,9 @@ impl Engines {
 
     /// Start both (a call is coming: the first words should not wait for a model to load).
     pub async fn warm(&self) -> Result<(), String> {
+        if STT_SERVICE == TTS_SERVICE && self.fixed.is_none() {
+            return self.base(STT_SERVICE).await.map(|_| ());
+        }
         let (a, b) = tokio::join!(self.base(STT_SERVICE), self.base(TTS_SERVICE));
         a.and(b).map(|_| ())
     }

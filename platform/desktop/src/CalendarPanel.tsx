@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
-import { CalendarPlus, Check, ChevronLeft, ChevronRight, MessageSquare, Phone, Plus, RefreshCw, Trash2, X } from 'lucide-react';
-import { calendar, type Appointment, type AppointmentStatus, type CalendarService, type CalendarSettings, type CalendarSync, type NewAppointment } from './api';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { CalendarPlus, Check, ChevronLeft, ChevronRight, MessageSquare, Phone, Plus, RefreshCw, Trash2, Volume2, X } from 'lucide-react';
+import { calendar, voices, type Appointment, type AppointmentStatus, type CalendarService, type CalendarSettings, type CalendarSync, type NewAppointment, type VoiceClip } from './api';
 import { useToast } from './Toasts';
 
 /**
@@ -241,14 +241,17 @@ export default function CalendarPanel() {
       )}
 
       {tab === 'settings' && settings && (
-        <SettingsForm
-          settings={settings}
-          onSaved={(s) => {
-            setSettings(s);
-            toast.push({ kind: 'success', title: 'Saved', body: 'The phone uses these hours and services from now on.' });
-            void refresh();
-          }}
-        />
+        <>
+          <SettingsForm
+            settings={settings}
+            onSaved={(s) => {
+              setSettings(s);
+              toast.push({ kind: 'success', title: 'Saved', body: 'The phone uses these hours and services from now on.' });
+              void refresh();
+            }}
+          />
+          <CallVoice business={settings.business} />
+        </>
       )}
 
       {open && <AppointmentDialog a={open} settings={settings} onClose={() => setOpen(null)} onDecide={decide} onChanged={() => void refresh()} />}
@@ -491,6 +494,127 @@ function NewAppointmentDialog({ start, settings, onClose, onCreated }: { start: 
         </div>
       </div>
     </div>
+  );
+}
+
+/**
+ * The voice the phone speaks in: a clip of someone speaking (MP3, WAV...),
+ * cloned by OAIY's own speech engine on this machine's GPU. Each can be heard
+ * first; a new one needs only its clip (what it says is heard from it).
+ */
+function CallVoice({ business }: { business: string }) {
+  const toast = useToast();
+  const [list, setList] = useState<VoiceClip[]>([]);
+  const [chosen, setChosen] = useState<string | null>(null);
+  const [speaking, setSpeaking] = useState<string | null>(null);
+  const [file, setFile] = useState<File | null>(null);
+  const [name, setName] = useState('');
+  const [words, setWords] = useState('');
+  const [adding, setAdding] = useState(false);
+  const player = useRef<HTMLAudioElement | null>(null);
+  const fail = (title: string, e: unknown) => toast.push({ kind: 'error', title, body: String(e instanceof Error ? e.message : e) });
+
+  const load = useCallback(async () => {
+    try {
+      const r = await voices.list();
+      setList(r.voices);
+      setChosen(r.chosen);
+    } catch (e) {
+      fail('Voices not read', e);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  useEffect(() => {
+    void load();
+    return () => player.current?.pause();
+  }, [load]);
+
+  const hear = async (voice: string) => {
+    setSpeaking(voice);
+    try {
+      const blob = await voices.hear(voice, `Hi, thanks for calling${business.trim() ? ` ${business.trim()}` : ''}! How can I help you today?`);
+      player.current?.pause();
+      const audio = new Audio(URL.createObjectURL(blob));
+      player.current = audio;
+      await audio.play();
+    } catch (e) {
+      fail('Could not speak', e);
+    } finally {
+      setSpeaking(null);
+    }
+  };
+  const choose = async (voice: string) => {
+    try {
+      setChosen((await voices.choose(voice)).chosen);
+    } catch (e) {
+      fail('Not chosen', e);
+    }
+  };
+  const remove = async (voice: string) => {
+    try {
+      setChosen((await voices.remove(voice)).chosen);
+      setList((l) => l.filter((v) => v.name !== voice));
+    } catch (e) {
+      fail('Not removed', e);
+    }
+  };
+  const add = async () => {
+    if (!file) return;
+    setAdding(true);
+    try {
+      const r = await voices.add(name.trim() || file.name.replace(/\.[^.]+$/, ''), file, words, true);
+      toast.push({ kind: 'success', title: 'Voice added', body: `Calls are answered as “${r.voice.name}” now. Hear it to check it sounds right.` });
+      setFile(null);
+      setName('');
+      setWords('');
+      await load();
+    } catch (e) {
+      fail('Voice not added', e);
+    } finally {
+      setAdding(false);
+    }
+  };
+
+  return (
+    <section className="service-section cal-settings cal-voice">
+      <h3 className="section-title">Voice on calls</h3>
+      <p className="form-hint">
+        The phone speaks in the voice of a short clip: 5 to 30 seconds of one person speaking clearly, as an MP3 or WAV. OAIY copies the voice on this computer and hears what the clip says itself.
+      </p>
+      <ul className="cal-voices">
+        {list.map((v) => (
+          <li key={v.name} className={v.name === chosen ? 'chosen' : ''}>
+            <label className="cal-check">
+              <input type="radio" name="call-voice" checked={v.name === chosen} onChange={() => void choose(v.name)} /> <strong>{v.name}</strong>
+            </label>
+            <span className="form-hint">{v.name === chosen ? 'Answers calls' : `${Math.max(1, Math.round(v.bytes / 1024))} KB`}</span>
+            <button className="btn btn-ghost" disabled={speaking !== null} onClick={() => void hear(v.name)}>
+              <Volume2 size={14} /> {speaking === v.name ? 'Speaking…' : 'Hear it'}
+            </button>
+            <button className="btn-tiny btn-danger" disabled={list.length < 2} title={list.length < 2 ? 'The phone needs one voice' : 'Remove this voice'} aria-label={`Remove ${v.name}`} onClick={() => void remove(v.name)}>
+              <Trash2 size={13} />
+            </button>
+          </li>
+        ))}
+      </ul>
+      <div className="cal-voice-add">
+        <label className="form-row">
+          <span>A CLIP</span>
+          <input type="file" accept="audio/*,.mp3,.wav,.m4a,.ogg,.flac,.opus" onChange={(e) => setFile(e.target.files?.[0] ?? null)} />
+        </label>
+        <label className="form-row">
+          <span>NAME</span>
+          <input value={name} placeholder={file ? file.name.replace(/\.[^.]+$/, '') : 'Front desk'} onChange={(e) => setName(e.target.value)} />
+        </label>
+        <label className="form-row cal-voice-words">
+          <span>WHAT IT SAYS (OPTIONAL)</span>
+          <input value={words} placeholder="Heard from the clip when left empty" onChange={(e) => setWords(e.target.value)} />
+        </label>
+        <button className="btn btn-primary" disabled={!file || adding} onClick={() => void add()}>
+          <Plus size={14} /> {adding ? 'Adding…' : 'Add and use it'}
+        </button>
+      </div>
+    </section>
   );
 }
 

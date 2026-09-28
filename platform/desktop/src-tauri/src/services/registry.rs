@@ -57,6 +57,13 @@ const BUILTIN_TEMPLATES: &[(&str, &str)] = &[
         "aokie-tts.json",
         include_str!("../../resources/templates/aokie-tts.json"),
     ),
+    // OAIY's own voice for calls (speech-to-text and text-to-speech in one
+    // resident process on the GPU), which calls use in place of the two above.
+    // Its program ships with OAIY (see `oaiy_program`).
+    (
+        "oaiy-voice.json",
+        include_str!("../../resources/templates/oaiy-voice.json"),
+    ),
 ];
 
 const BUILTIN_SCRIPTS: &[(&str, &str)] = &[
@@ -504,6 +511,26 @@ fn os_fix_path(s: String) -> String {
     s.replace("\\Scripts\\python.exe", "/bin/python")
         .replace("/Scripts/python.exe", "/bin/python")
         .replace("/Scripts/pythonw.exe", "/bin/python")
+}
+
+/// A program that ships with OAIY (beside the desktop, in its `engines`
+/// folder, `OAIY_ENGINES_DIR`, or a build from the repository's release
+/// folder), as a bare service command names it: `oaiy-voice`.
+fn oaiy_program(cmd: &str) -> Option<PathBuf> {
+    if cmd.is_empty() || cmd.contains(['/', '\\', ':']) {
+        return None;
+    }
+    let file = if cfg!(windows) && !cmd.ends_with(".exe") { format!("{cmd}.exe") } else { cmd.to_string() };
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Some(dir) = std::env::var_os("OAIY_ENGINES_DIR") {
+        dirs.push(PathBuf::from(dir));
+    }
+    if let Some(dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf)) {
+        dirs.push(dir.join("engines"));
+        dirs.push(dir);
+    }
+    dirs.push(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../target/release"));
+    dirs.into_iter().map(|d| d.join(&file)).find(|p| p.is_file()).map(|p| std::path::absolute(&p).unwrap_or(p))
 }
 
 /// The standard per-user install location an installer like Ollama's `OllamaSetup.exe` drops
@@ -1206,7 +1233,8 @@ impl Registry {
                 let p = dir.join(&raw);
                 p.exists() || p.with_extension("exe").exists()
             })
-        }) || user_programs_exe(&raw).is_some()
+        }) || oaiy_program(&raw).is_some()
+            || user_programs_exe(&raw).is_some()
     }
 
     /// The resolved path of a service's install-completion marker, if it declares one.
@@ -1677,6 +1705,7 @@ impl Registry {
                 // Resolve a just-installed system tool (e.g. ollama) to its real path so the
                 // spawn doesn't fall back to the bare name + OAIY Desktop's stale PATH (which
                 // wouldn't find it until a restart) and Error out.
+                .or_else(|| oaiy_program(&raw_cmd).map(|p| p.display().to_string()))
                 .or_else(|| user_programs_exe(&raw_cmd).map(|p| p.display().to_string()))
                 .unwrap_or(raw_cmd)
         };

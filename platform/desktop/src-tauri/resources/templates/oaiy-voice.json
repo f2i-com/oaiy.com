@@ -1,0 +1,42 @@
+{
+  "id": "oaiy-voice",
+  "name": "OAIY Voice",
+  "description": "OAIY's own voice for calls, in Rust on the GPU with the most free memory: Parakeet speech-to-text and Qwen3-TTS speech that streams as it is made, in a voice cloned from a short clip (an MP3 or WAV, chosen on the Calendar page). Served locally over the OpenAI /v1/audio/transcriptions and /v1/audio/speech APIs. Uses the models already in your model folders, or downloads them (~4.3 GB, checksum-verified).",
+  "category": "Speech",
+  "defaultPort": 8783,
+  "install": {
+    "kind": "script",
+    "windows": "install-oaiy-voice.ps1"
+  },
+  "installedMarker": "${modelsDir}/oaiy-voice/.oaiy-installed",
+  "run": {
+    "command": "oaiy-voice",
+    "args": [
+      "--mode",
+      "both",
+      "--port",
+      "${port}",
+      "--stt-model-dir",
+      "parakeet-tdt-0.6b-v2",
+      "--tts-model-dir",
+      "Qwen3-TTS-12Hz-0.6B-Base",
+      "--model-dirs",
+      "${modelDirs}",
+      "--voices-dir",
+      "${dataDir}/voices"
+    ],
+    "env": {}
+  },
+  "health": {
+    "url": "http://127.0.0.1:${port}/v1/models",
+    "timeoutSecs": 180
+  },
+  "uninstall": {
+    "paths": [
+      "${modelsDir}/oaiy-voice"
+    ]
+  },
+  "files": {
+    "install-oaiy-voice.ps1": "# install-oaiy-voice.ps1\n#\n# The models OAIY's voice server (oaiy-voice) runs for calls:\n#   - parakeet-tdt-0.6b-v2        speech to text (NVIDIA, CC-BY-4.0)\n#   - Qwen3-TTS-12Hz-0.6B-Base    text to speech in a voice from a clip (Qwen, Apache-2.0)\n#\n# Each is used where it already is, in any of OAIY's model folders (Settings >\n# model folders); otherwise it is downloaded into the primary one from Hugging\n# Face at a pinned revision, and its large files are checked against their\n# SHA-256 before the folder is put in place.\n$ErrorActionPreference = 'Stop'\n\n$modelsDir = $env:OAIY_MODELS_DIR\nif (-not $modelsDir) {\n  if (-not $env:OAIY_DATA_DIR) { throw \"OAIY_MODELS_DIR is not set\" }\n  $modelsDir = Join-Path $env:OAIY_DATA_DIR 'models'\n}\n$roots = @($modelsDir)\nif ($env:OAIY_MODEL_DIRS) { $roots += $env:OAIY_MODEL_DIRS -split [IO.Path]::PathSeparator | Where-Object { $_ } }\n\n$models = @(\n  @{\n    name = 'parakeet-tdt-0.6b-v2'; repo = 'nvidia/parakeet-tdt-0.6b-v2'; revision = 'ae9ad07059c7c739ffaf932226a8fe64ae2620b0'\n    license = 'CC-BY-4.0 (https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2)'\n    files = @(\n      @{ path = 'parakeet-tdt-0.6b-v2.nemo'; sha256 = 'd99e39955c9d3d0350d8fb7c75e40c64a2b2eaeb003883d7c941fd2e8747b28c' }\n    )\n  },\n  @{\n    name = 'Qwen3-TTS-12Hz-0.6B-Base'; repo = 'Qwen/Qwen3-TTS-12Hz-0.6B-Base'; revision = '5d83992436eae1d760afd27aff78a71d676296fc'\n    license = 'Apache-2.0 (https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-Base)'\n    files = @(\n      @{ path = 'config.json' }, @{ path = 'generation_config.json' }, @{ path = 'merges.txt' },\n      @{ path = 'preprocessor_config.json' }, @{ path = 'tokenizer_config.json' }, @{ path = 'vocab.json' },\n      @{ path = 'model.safetensors'; sha256 = '180b3b10eb1c9f1b4db7806d5475bae3071c0243c299d49926bab1da3b6946f6' },\n      @{ path = 'speech_tokenizer/config.json' }, @{ path = 'speech_tokenizer/configuration.json' },\n      @{ path = 'speech_tokenizer/preprocessor_config.json' },\n      @{ path = 'speech_tokenizer/model.safetensors'; sha256 = '836b7b357f5ea43e889936a3709af68dfe3751881acefe4ecf0dbd30ba571258' }\n    )\n  }\n)\n\nfunction Test-Complete($dir, $model) {\n  foreach ($f in $model.files) {\n    if (-not (Test-Path (Join-Path $dir $f.path))) { return $false }\n  }\n  return $true\n}\n\nforeach ($m in $models) {\n  $found = $roots | ForEach-Object { Join-Path $_ $m.name } | Where-Object { Test-Complete $_ $m } | Select-Object -First 1\n  if ($found) {\n    Write-Output \"$($m.name): found at $found\"\n    continue\n  }\n  $dest = Join-Path $modelsDir $m.name\n  $staging = \"$dest.partial\"\n  New-Item -ItemType Directory -Force -Path $staging | Out-Null\n  Write-Output \"$($m.name): downloading from $($m.repo) - licence: $($m.license)\"\n  $oldPref = $ProgressPreference\n  $ProgressPreference = 'SilentlyContinue'\n  try {\n    foreach ($f in $m.files) {\n      $target = Join-Path $staging $f.path\n      New-Item -ItemType Directory -Force -Path (Split-Path $target -Parent) | Out-Null\n      $ok = (Test-Path $target) -and ((-not $f.sha256) -or (Get-FileHash $target -Algorithm SHA256).Hash.ToLower() -eq $f.sha256)\n      if ($ok) { Write-Output \"  ok (already here)  $($f.path)\"; continue }\n      $url = \"https://huggingface.co/$($m.repo)/resolve/$($m.revision)/$($f.path)\"\n      Write-Output \"  downloading  $($f.path)\"\n      Invoke-WebRequest -Uri $url -OutFile \"$target.part\" -UseBasicParsing -MaximumRedirection 10\n      if ($f.sha256) {\n        $digest = (Get-FileHash \"$target.part\" -Algorithm SHA256).Hash.ToLower()\n        if ($digest -ne $f.sha256) {\n          Remove-Item \"$target.part\" -Force\n          throw \"$($f.path): checksum mismatch - expected $($f.sha256), got $digest\"\n        }\n      }\n      Move-Item \"$target.part\" $target -Force\n      Write-Output \"  verified     $($f.path)\"\n    }\n  } finally {\n    $ProgressPreference = $oldPref\n  }\n  if (Test-Path $dest) { Remove-Item $dest -Recurse -Force }\n  Move-Item $staging $dest -Force\n  Write-Output \"$($m.name): installed to $dest\"\n}\n\n$marker = Join-Path $modelsDir 'oaiy-voice'\nNew-Item -ItemType Directory -Force -Path $marker | Out-Null\nNew-Item -ItemType File -Force -Path (Join-Path $marker '.oaiy-installed') | Out-Null\nWrite-Output \"OAIY Voice is ready\"\n"
+  }
+}

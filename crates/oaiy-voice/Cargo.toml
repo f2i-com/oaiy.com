@@ -3,7 +3,7 @@ name = "oaiy-voice"
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
-description = "OAIY's resident speech server: Parakeet speech-to-text on Candle, GPU first"
+description = "OAIY's resident speech server: Parakeet speech-to-text and Qwen3-TTS text-to-speech on Candle, GPU first"
 
 [dependencies]
 oaiy-engine = { path = "../oaiy-engine" }
@@ -12,7 +12,11 @@ dsv41 = { path = "../dsv41" }
 candle-core = "0.11.0"
 candle-nn = "0.11.0"
 half = "2"
+# Text to speech: Qwen3-TTS, streaming, in a voice from a clip.
+oaiy-tts = { path = "../oaiy-tts" }
 
 [features]
 default = []
-cuda = ["candle-core/cuda", "candle-nn/cuda"]
+cuda = ["candle-core/cuda", "candle-nn/cuda", "oaiy-tts/cuda"]
+# Faster attention for the speech model (as oaiy-media builds it).
+flash-attn = ["cuda", "oaiy-tts/flash-attn"]

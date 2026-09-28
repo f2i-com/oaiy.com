@@ -236,6 +236,23 @@ mod tests {
         }
     }
 
+    /// OAIY's own voice server: one process for both, run by a bare command
+    /// (it ships with OAIY), its models found by name in the model folders.
+    #[test]
+    fn the_shipped_oaiy_voice_template_parses() {
+        let t: super::ServiceTemplate = serde_json::from_str(include_str!("../../resources/templates/oaiy-voice.json")).expect("shipped template must parse");
+        assert_eq!((t.id.as_str(), t.category.as_str(), t.run.command.as_str()), ("oaiy-voice", "Speech", "oaiy-voice"));
+        let arg = |flag: &str| t.run.args.iter().position(|a| a == flag).and_then(|i| t.run.args.get(i + 1)).cloned();
+        assert_eq!(arg("--mode").as_deref(), Some("both"));
+        assert_eq!(arg("--model-dirs").as_deref(), Some("${modelDirs}"));
+        assert_eq!(arg("--voices-dir").as_deref(), Some("${dataDir}/voices"));
+        let script = &t.files["install-oaiy-voice.ps1"];
+        for model in [arg("--stt-model-dir").unwrap(), arg("--tts-model-dir").unwrap()] {
+            assert!(script.contains(&format!("name = '{model}'")), "the installer must find or fetch {model}");
+        }
+        assert!(t.installed_marker.as_deref().is_some_and(|m| script.contains("'.oaiy-installed'") && m.ends_with("oaiy-voice/.oaiy-installed")));
+    }
+
     use super::*;
 
     #[test]
