@@ -43,7 +43,14 @@ export type MakeAgent = (extra: Pick<AgentOptions, 'instructions' | 'sessionTool
  * so its prompt stays small and the caller is answered at once (reading and
  * noting things in the project, and the web).
  */
-export const CALL_TOOLS = new Set(['read_file', 'list_files', 'search_file', 'grep', 'glob', 'web_fetch', 'append_file', 'write_file', 'edit_file']);
+/**
+ * What a call's or a text thread's agent may do beyond its own tools (the
+ * reply, the calendar, the lookup): read the front desk's files. The person on
+ * the other end is a stranger to this computer, so nothing that writes, runs
+ * code, fetches from the web or makes pictures and sounds.
+ */
+export const KNOWLEDGE_TOOLS = new Set(['read_file', 'list_files', 'search_file', 'grep', 'glob']);
+export const CALL_TOOLS = KNOWLEDGE_TOOLS;
 
 export interface SessionHooks {
   /** The list changed: a new conversation, an unread message, one started or finished working. */
@@ -74,7 +81,7 @@ export function smsInstructions(title: string, number: string, instructions: str
     `This conversation is a text-message thread with ${who}, on the phone of the person you work for.${test ? ' It is a test: your replies are shown, not sent.' : ''}`,
     'Their messages arrive as "Text message from …". Answer them with send_text_message: short plain text (no markdown), in the language they write in. Only what you send with it reaches them; anything else you write is seen only by the person you work for.',
     'A message without that label comes from the person you work for, who may be watching: do what they say (they may tell you what to reply, or ask you to do something first).',
-    'Use your other tools (the project\'s files, the web, flows) when a message needs it. There is no need to reply to a message that needs no answer (a thank-you, an emoji).',
+    'When a message needs it, read the front desk\'s files (what the business wants you to know: /knowledge) and use your flows made tools. You cannot change files, browse the web or run code here. There is no need to reply to a message that needs no answer (a thank-you, an emoji).',
     'To book them in: find a time with calendar_free_times, agree a day and time with them, then request_appointment. It is a request that staff confirm (they are texted when it is): never say it is booked.',
     `The instructions of the person you work for, for text messages:\n${instructions.trim() || '(none)'}`,
   ].join('\n');
@@ -202,14 +209,17 @@ export function earlierWords(turns: Turn[], keep = 6): Turn[] {
 
 /** What a flow's tasks are about: the flow waits for the agent's last words as its output. */
 export function taskInstructions(flow: string): string {
-  return `This conversation holds the tasks your person's flow "${flow}" gives you (an "Ask the agent" node in it). Each message is one task. Do it with your tools, then end with the result itself: your last reply is handed back to the flow as its output, so give only what the flow asked for (no greeting, no offer of more help). If you cannot do it, say why in one sentence.`;
+  return `This conversation holds the tasks your person's flow "${flow}" gives you (an "Ask the agent" node in it). Each message is one task. Do it with your tools, then end with the result itself: your last reply is handed back to the flow as its output, so give only what the flow asked for (no greeting, no offer of more help). If you cannot do it, say why in one sentence. Your files here are the front desk's (what the business wants its phone agent to know, in /knowledge), not a project of the person's.`;
 }
 
 export class Sessions {
   list: Session[] = [];
   /** Conversations with messages waiting, in the order they came. */
+  /** Conversations waiting to run, one at a time per lane: calls in their own (a caller never waits behind a text or a flow's task), the rest in another. */
   private queue: Session[] = [];
+  private callQueue: Session[] = [];
   private pumping = false;
+  private pumpingCalls = false;
 
   constructor(
     private readonly project: OpenProject,
@@ -235,7 +245,7 @@ export class Sessions {
 
   /** Whether any conversation is working (or waiting to). */
   get busy(): boolean {
-    return this.list.some((s) => s.running) || this.queue.length > 0;
+    return this.list.some((s) => s.running) || this.queue.length > 0 || this.callQueue.length > 0;
   }
 
   private create(info: SessionInfo): Session {
@@ -266,6 +276,8 @@ export class Sessions {
     const test = info.key === TEST_NUMBER;
     session.agent = this.makeAgent({
       instructions: () => smsInstructions(session.title, session.key, this.settings().instructions, test),
+      // A texter reaches the front desk's files, to read (see KNOWLEDGE_TOOLS).
+      tools: TOOLS.filter((t) => KNOWLEDGE_TOOLS.has(t.name)),
       // A pretend thread does not put requests in the real calendar.
       sessionTools: [this.replyTool(session, test), ...(test ? [] : textCalendarTools(this.desktop, session.key, () => session.title))],
       conversation: true,
@@ -523,26 +535,30 @@ export class Sessions {
     // A flow's task is its own run (its answer is what that run says), never added to another.
     if (session.kind !== 'task' && session.running && session.agent.interject(text)) return;
     session.waiting.push(text);
-    if (!this.queue.includes(session)) {
-      if (first) this.queue.unshift(session);
-      else this.queue.push(session);
+    const lane = session.kind === 'call' ? this.callQueue : this.queue;
+    if (!lane.includes(session)) {
+      if (first) lane.unshift(session);
+      else lane.push(session);
     }
-    void this.pump();
+    void this.pump(session.kind === 'call');
   }
 
-  /** Run the waiting conversations, one at a time. */
-  private async pump(): Promise<void> {
-    if (this.pumping) return;
-    this.pumping = true;
+  /** Run a lane's waiting conversations, one at a time. */
+  private async pump(calls = false): Promise<void> {
+    if (calls ? this.pumpingCalls : this.pumping) return;
+    if (calls) this.pumpingCalls = true;
+    else this.pumping = true;
+    const lane = calls ? this.callQueue : this.queue;
     try {
-      while (this.queue.length) {
-        const session = this.queue.shift()!;
+      while (lane.length) {
+        const session = lane.shift()!;
         const prompt = session.kind === 'task' ? session.waiting.shift() ?? '' : session.waiting.splice(0).join('\n\n');
-        if (session.kind === 'task' && session.waiting.length) this.queue.push(session);
+        if (session.kind === 'task' && session.waiting.length) lane.push(session);
         if (prompt) await this.run(session, prompt);
       }
     } finally {
-      this.pumping = false;
+      if (calls) this.pumpingCalls = false;
+      else this.pumping = false;
     }
   }
 
@@ -590,6 +606,7 @@ export class Sessions {
     session.controller?.abort();
     session.waiting = [];
     this.queue = this.queue.filter((s) => s !== session);
+    this.callQueue = this.callQueue.filter((s) => s !== session);
   }
 
   stopAll(): void {

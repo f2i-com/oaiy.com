@@ -285,3 +285,55 @@ describe("a flow's tasks for the agent", () => {
     await settled(sessions);
   });
 });
+
+describe('lanes', () => {
+  it("a caller's words are answered while a flow's task is still being worked on", async () => {
+    const store = fakeProject();
+    let release!: () => void;
+    const held = new Promise<void>((r) => (release = r));
+    const order: string[] = [];
+    // A stand-in agent: a task's run holds until released; a call's answers at once.
+    const makeAgent = () =>
+      ({
+        turns: [] as Turn[],
+        run: async (prompt: string, emit: (e: AgentEvent) => void) => {
+          order.push(`start ${prompt.slice(0, 30)}`);
+          if (prompt.includes('asks:')) await held;
+          order.push(`end ${prompt.slice(0, 30)}`);
+          emit({ type: 'done', text: 'ok', steps: 1 } as AgentEvent);
+        },
+        interject: () => false,
+        takeUnread: () => [],
+        savedTurns: () => [],
+        warm: async () => {},
+      }) as unknown as Agent;
+    const sessions = new Sessions(store.project as never, makeAgent, () => ({ answer: false, calls: true, instructions: '', callInstructions: '' }) as MessageSettings, () => null, { changed: () => {}, event: () => {} });
+    const task = sessions.task('Nightly', 'Summarise the day');
+    await new Promise((r) => setTimeout(r, 10));
+    await sessions.callEvent({ type: 'call.started', callId: 'c1', from: '+61400000000' });
+    await sessions.callEvent({ type: 'call.caller', callId: 'c1', text: 'Are you open today?' });
+    await new Promise((r) => setTimeout(r, 10));
+    expect(order).toContain('end Caller: Are you open today?');
+    expect(order).not.toContain('end [OAIY] Your flow "Nightly" as');
+    release();
+    await task;
+  });
+});
+
+describe('what a stranger can reach', () => {
+  it("a text thread's agent reads the front desk's files and replies, but writes, runs and fetches nothing", async () => {
+    let offered: string[] = [];
+    fakeProvider('openai', [
+      (body) => {
+        offered = ((body.tools as Array<{ function?: { name: string }; name?: string }>) ?? []).map((t) => t.function?.name ?? t.name ?? '');
+        return { calls: [{ name: 'send_text_message', input: { body: 'Hi!' } }] };
+      },
+      { text: '' },
+    ]);
+    const { sessions } = setup({ answer: true, instructions: '' });
+    await sessions.textArrived('+61400000001', 'Sam', 'Hello?');
+    await settled(sessions);
+    expect(offered).toEqual(expect.arrayContaining(['read_file', 'grep', 'send_text_message']));
+    for (const tool of ['write_file', 'edit_file', 'delete_file', 'web_fetch', 'code_run', 'sandbox_shell', 'generate_image']) expect(offered).not.toContain(tool);
+  });
+});
