@@ -1766,3 +1766,20 @@ select:disabled { cursor: not-allowed; opacity: 0.5; }
 
 .cal-sync { display: inline-flex; align-items: center; gap: 8px; color: var(--muted); font-size: 12px; }
 .cal-sync-err { color: var(--danger); }
+
+/* The sidebar's group labels. */
+.sidebar nav .nav-group {
+  display: block;
+  margin: 14px 0 4px;
+  padding: 0 14px;
+  color: var(--faint);
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  font-weight: 650;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+.sidebar nav .nav-group:first-child { margin-top: 2px; }
+@media (max-width: 1240px) {
+  .sidebar nav .nav-group { visibility: hidden; height: 6px; margin: 6px 0 0; }
+}

@@ -89,18 +89,19 @@ interface PluginNavEntry {
 
 const WEB_APP_URL = 'https://oaiy.com/app.html';
 
-const NAV: { value: BuiltinView; label: string; icon: LucideIcon }[] = [
-  { value: 'agent', label: 'Agent', icon: Bot },
+/** The sidebar, in groups: what you work in, what runs on this machine, what it connects to. */
+const NAV: { value: BuiltinView; label: string; icon: LucideIcon; group?: string }[] = [
+  { value: 'agent', label: 'Agent', icon: Bot, group: 'Work' },
   { value: 'flows', label: 'Flows', icon: Workflow },
   { value: 'calendar', label: 'Calendar', icon: CalendarDays },
+  { value: 'overview', label: 'Overview', icon: LayoutDashboard, group: 'This machine' },
   { value: 'engines', label: 'Engines', icon: Cpu },
-  { value: 'overview', label: 'Overview', icon: LayoutDashboard },
   { value: 'services', label: 'Services', icon: Server },
-  { value: 'plugins', label: 'Plugins', icon: Plug },
-  { value: 'runs', label: 'Runs', icon: History },
-  { value: 'models', label: 'Models', icon: Package },
-  { value: 'providers', label: 'Providers', icon: Sparkles },
+  { value: 'models', label: 'Model files', icon: Package },
   { value: 'python', label: 'Python', icon: HardDrive },
+  { value: 'runs', label: 'Runs', icon: History },
+  { value: 'plugins', label: 'Plugins', icon: Plug, group: 'Connect' },
+  { value: 'providers', label: 'Providers', icon: Sparkles },
   { value: 'connections', label: 'Connections', icon: ShieldCheck },
 ];
 
@@ -158,7 +159,7 @@ const PAGE: Record<BuiltinView, { crumb: string; kicker: string; title: string; 
     copy: 'Every flow this machine has run, and the reason any of them failed.',
   },
   models: {
-    crumb: 'Models',
+    crumb: 'Model files',
     kicker: 'Storage',
     title: 'Model library',
     copy: 'Download weights from Hugging Face and manage what is on disk.',
@@ -348,7 +349,12 @@ export default function App() {
         <nav aria-label="Primary">
           {NAV.map((item) => {
             const Icon = item.icon;
-            return (
+            return [
+              item.group && (
+                <span key={`group-${item.group}`} className="nav-group" aria-hidden>
+                  {item.group}
+                </span>
+              ),
               <button
                 type="button"
                 key={item.value}
@@ -363,8 +369,8 @@ export default function App() {
               >
                 <Icon size={18} />
                 <span>{item.label}</span>
-              </button>
-            );
+              </button>,
+            ];
           })}
 
           {/* Screens installed plugins contribute. Rendered after the built-ins so
@@ -495,7 +501,7 @@ export default function App() {
               on every switch. */}
           {(view === 'agent' || view === 'flows' || view === 'engines') && <EmbeddedPage page={view} />}
           <div hidden={view === 'agent' || view === 'flows' || view === 'engines'} className={visited.has(view) ? 'content-page revisit' : 'content-page'} key={view}>
-            <PairingPrompt />
+            <PairingPrompt listConnected={view === 'overview' || view === 'connections'} />
             <div className="page-intro">
               <div>
                 <span className="kicker">{page.kicker}</span>

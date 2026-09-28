@@ -19,7 +19,8 @@ import { useToast } from './Toasts';
 
 const POLL_MS = 3000;
 
-export default function PairingPrompt() {
+/** `listConnected`: also list the apps already connected (Overview, Connections); a request to connect shows everywhere. */
+export default function PairingPrompt({ listConnected = true }: { listConnected?: boolean }) {
   const toast = useToast();
   const [pending, setPending] = useState<PendingPairing[]>([]);
   const [paired, setPaired] = useState<PairedApp[]>([]);
@@ -63,7 +64,7 @@ export default function PairingPrompt() {
     [refresh, toast],
   );
 
-  if (pending.length === 0 && paired.length === 0) return null;
+  if (pending.length === 0 && (paired.length === 0 || !listConnected)) return null;
 
   return (
     <div className="pairing-wrap">
@@ -113,7 +114,7 @@ export default function PairingPrompt() {
         </div>
       ))}
 
-      {paired.length > 0 && (
+      {listConnected && paired.length > 0 && (
         <details className="pairing-card pairing-connected">
           <summary className="pairing-summary">
             <ShieldCheck size={15} aria-hidden />

@@ -148,13 +148,13 @@ export default function CalendarPanel() {
               <ChevronLeft size={14} />
             </button>
             <button className="btn-tiny" onClick={() => setWeek(mondayOf(new Date()))}>
-              This week
+              Today
             </button>
             <button className="btn-tiny" onClick={() => setWeek(addDays(week, 7))} aria-label="Next week">
               <ChevronRight size={14} />
             </button>
             <span className="cal-range">
-              {week.toLocaleDateString(undefined, { day: 'numeric', month: 'short' })} – {addDays(week, 6).toLocaleDateString(undefined, { day: 'numeric', month: 'short', year: 'numeric' })}
+              {week.toLocaleDateString(undefined, { day: 'numeric', month: 'short' })} – {addDays(week, 6).toLocaleDateString(undefined, { day: 'numeric', month: 'short' })}
             </span>
           </div>
         )}
@@ -163,7 +163,7 @@ export default function CalendarPanel() {
         </button>
         {sync?.linked && (
           <span className={`cal-sync${sync.error ? ' cal-sync-err' : ''}`} title={sync.error ?? `Last sync: ${sync.pulled} in, ${sync.pushed} out`}>
-            {sync.error ? 'FormLogic sync failed' : sync.at ? `Synced with FormLogic ${ago(sync.at)}` : 'Syncs with FormLogic'}
+            {sync.error ? 'FormLogic: sync failed' : sync.at ? `FormLogic · ${ago(sync.at)}` : 'FormLogic'}
             <button
               className="btn-tiny"
               disabled={syncing}
