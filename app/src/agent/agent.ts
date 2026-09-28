@@ -319,8 +319,8 @@ export interface AgentOptions {
   finish?: { tool: string; after: number; say: string; done: () => boolean };
   /** Added to the system prompt: what this conversation is for (a text-message thread: who it is with, and the person's instructions). */
   instructions?: string | (() => string);
-  /** Tools of this conversation only (a text-message thread's reply), each with what it does. */
-  sessionTools?: SessionTool[];
+  /** Tools of this conversation only (a text-message thread's reply, flows made tools), each with what it does; a function when they change. */
+  sessionTools?: SessionTool[] | (() => SessionTool[]);
   /** How hard the model thinks before it answers (`none` on a phone call). */
   reasoning?: 'none' | 'low' | 'medium' | 'high' | 'max';
 }
@@ -627,6 +627,12 @@ export class Agent {
     return { id: call.id, name: call.name, content: lines.join('\n\n'), isError: false };
   }
 
+  /** This conversation's own tools, as they are now. */
+  private get sessionToolList(): SessionTool[] {
+    const t = this.options.sessionTools;
+    return (typeof t === 'function' ? t() : t) ?? [];
+  }
+
   /** This conversation's own instructions, as they are now. */
   private get instructions(): string {
     const i = this.options.instructions;
@@ -635,7 +641,7 @@ export class Agent {
 
   /** A tool of this conversation only: its answer, or the error it threw. */
   private async runSessionTool(call: ToolCall, signal?: AbortSignal): Promise<ToolResult> {
-    const tool = this.options.sessionTools!.find((t) => t.spec.name === call.name)!;
+    const tool = this.sessionToolList.find((t) => t.spec.name === call.name)!;
     try {
       return { id: call.id, name: call.name, content: await tool.run(call.input, signal), isError: false };
     } catch (error) {
@@ -740,7 +746,7 @@ export class Agent {
 
   private get tools(): ToolSpec[] {
     // A sub-agent gets its list from its parent, media tools included (a call, a short list of its own).
-    if (this.options.tools) return [...this.options.tools, ...(this.options.sessionTools ?? []).map((t) => t.spec)];
+    if (this.options.tools) return [...this.options.tools, ...this.sessionToolList.map((t) => t.spec)];
     const provider = this.options.provider();
     // A small window holds the instructions and core tools with room to work, not the video editing ones too.
     const lean = !!provider && this.window(provider) < EDIT_TOOLS_WINDOW;
@@ -752,7 +758,7 @@ export class Agent {
     const models = all.some((t) => t.name === 'generate_3d_model') || findModels(this.options.vfs).length > 0;
     const tools = all.filter((t) => (apps || !SOFTN_TOOLS.has(t.name)) && (web || !WEB_TOOLS.has(t.name)) && (apps || web || models || !PREVIEW_TOOLS.has(t.name)));
     const topics = guideTopics(new Set(all.map((t) => t.name)));
-    return [...tools, ...(this.options.sessionTools ?? []).map((t) => t.spec), {
+    return [...tools, ...this.sessionToolList.map((t) => t.spec), {
       name: 'guide',
       description: `Read the guide for a kind of work before you start it; it stays in your instructions from then on. The guides: ${topics.map((t) => `"${t}" for ${GUIDE_ABOUT[t]}`).join('; ')}.`,
       parameters: { type: 'object', required: ['topic'], properties: { topic: { type: 'string', enum: topics } } },
@@ -1807,7 +1813,7 @@ ${this.instructions}` : ''}`;
               ? { id: call.id, name: call.name, content: scriptCheck, isError: false }
               : call.name === 'update_plan'
               ? this.takePlan(call, emit)
-              : this.options.sessionTools?.some((t) => t.spec.name === call.name)
+              : this.sessionToolList.some((t) => t.spec.name === call.name)
               ? await this.runSessionTool(call, signal)
               : call.name === 'delegate'
               ? await this.delegate(call, emit, signal)

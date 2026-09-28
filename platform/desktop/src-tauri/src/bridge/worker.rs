@@ -101,6 +101,11 @@ impl FlowStore {
         Self::valid_id(id).then(|| self.dir.join(format!("{id}.json")))
     }
 
+    /// A stored flow document, as it was put.
+    pub fn get(&self, id: &str) -> Option<String> {
+        std::fs::read_to_string(self.path_of(id)?).ok()
+    }
+
     /// Store a flow document. The desktop deliberately does NOT validate the
     /// graph — the CLI owns the schema, and validating here would be the first
     /// step towards a second engine. It checks only that the body is JSON, so a

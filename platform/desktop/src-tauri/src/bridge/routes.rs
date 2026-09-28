@@ -1496,6 +1496,14 @@ async fn put_flow(
     }
 }
 
+/// A stored flow, as it was put (the agent reads a tool flow's inputs from it).
+async fn get_flow(State(st): State<BridgeState>, Path(id): Path<String>) -> axum::response::Response {
+    match st.flows.get(&id) {
+        Some(body) => ([(axum::http::header::CONTENT_TYPE, "application/json")], body).into_response(),
+        None => bridge_error(StatusCode::NOT_FOUND, "invalid_request", format!("no flow {id:?}")),
+    }
+}
+
 async fn delete_flow(State(st): State<BridgeState>, Path(id): Path<String>) -> axum::response::Response {
     match st.flows.delete(&id) {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
@@ -1668,7 +1676,7 @@ pub fn router(state: BridgeState) -> Router {
         .route("/api/bridge/flows", get(list_flows))
         .route(
             "/api/bridge/flows/:id",
-            axum::routing::put(put_flow).delete(delete_flow),
+            axum::routing::put(put_flow).delete(delete_flow).get(get_flow),
         )
         .route("/api/bridge/pairing", get(list_pending_pairings).post(create_pairing))
         .route("/api/bridge/pairing/:id", get(poll_pairing))

@@ -8,6 +8,9 @@ import { sandboxAvailable, zippModule } from './sandbox/runner';
 import { loadSettings, saveAgentSettings, saveDesktop, saveGate, saveLastKeptProject, saveLastProject, saveMedia, saveMessages, saveProviders } from './settings';
 import { Desktop } from './desktop/bridge';
 import { DesktopEvents, Sessions, TEST_NUMBER } from './sessions';
+import { flowSessionTools, listFlowTools } from './desktop/flowTools';
+import { TOOLS } from './agent/tools';
+import type { SessionTool } from './agent/agent';
 import { editPhone } from './ui/phone';
 import { OAIY_ORIGIN, discoverOaiy, mediaAbilities, mergeDiscovered } from './agent/media';
 import { budgetFor, contextWindow, detectContextWindow, formatTokens } from './agent/context';
@@ -139,6 +142,8 @@ async function main(): Promise<void> {
   let textHolder = '';
   // And calls: the page holding answer-calls talks with the caller.
   let holdsCalls = false;
+  // Flows made tools in the flow editor: every agent may use them.
+  let flowTools: SessionTool[] = [];
   /** The conversation the chat shows: null for the project's own. */
   let viewing: string | null = null;
 
@@ -309,6 +314,7 @@ async function main(): Promise<void> {
     project = await OpenProject.open(meta);
     project.onError = notice;
     const agentOptions = (): AgentOptions => ({
+      sessionTools: () => flowTools,
       vfs: project.vfs,
       gate,
       provider: activeProvider,
@@ -336,7 +342,7 @@ async function main(): Promise<void> {
     sessions?.stopAll();
     viewing = null;
     const opened = project;
-    const own = (sessions = new Sessions(project, (extra) => new Agent({ ...agentOptions(), ...extra }), () => ({ ...messages, answer: messages.answer && holdsTexts }), () => desktop, {
+    const own = (sessions = new Sessions(project, (extra) => new Agent({ ...agentOptions(), ...extra, sessionTools: () => [...(Array.isArray(extra.sessionTools) ? extra.sessionTools : []), ...flowTools] }), () => ({ ...messages, answer: messages.answer && holdsTexts }), () => desktop, {
       changed: () => {
         if (project === opened) renderSessions();
       },
@@ -1136,6 +1142,22 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
     }
   }
 
+  /** The flows made tools on the desktop, as the agents' tools. */
+  async function refreshFlowTools(): Promise<void> {
+    const d = desktop;
+    if (!d) {
+      flowTools = [];
+      return;
+    }
+    try {
+      const taken = new Set([...TOOLS.map((t) => t.name), 'send_text_message', 'end_call', 'request_appointment', 'lookup_business_data', 'guide', 'update_plan', 'delegate']);
+      flowTools = flowSessionTools(await listFlowTools(d, AbortSignal.timeout(10_000)), () => desktop, taken);
+    } catch {
+      /* the desktop is away: keep what was there */
+    }
+  }
+  setInterval(() => void refreshFlowTools(), 30_000);
+
   // The desktop's calls, as they happen (a stream, reopened when it drops).
   let callsAbort: AbortController | null = null;
   function followCalls(): void {
@@ -1182,6 +1204,7 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
           desktopEvents.start();
           void refreshPhone();
           followCalls();
+          void refreshFlowTools();
         } else callsAbort?.abort();
         renderPhoneChip();
       },
@@ -1228,6 +1251,7 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
     void refreshPhone();
     void keepTextLease();
     followCalls();
+    void refreshFlowTools();
   }
   if (!activeProvider()) chat.system('Welcome! Set up an AI provider in ⚙ Settings to talk to the agent — a local server (Ollama, LM Studio, OAIY) keeps everything on this computer. The editor and terminal work without one.');
   // Leaving the page (closing the tab, reloading, switching away on a phone): save now.

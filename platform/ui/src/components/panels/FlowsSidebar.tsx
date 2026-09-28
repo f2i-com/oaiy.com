@@ -1,5 +1,6 @@
 import { useState, useCallback, useMemo } from 'react';
 import type { Flow, OAIYPackageManifest } from 'oaiy-core';
+import { oaiyDesktop, publishAsTool, toolName } from '../../lib/oaiyAgentTools';
 import ConfirmDialog from '../ui/ConfirmDialog';
 import PackageServicesPanel from './PackageServicesPanel';
 import { isWebBuild } from '../../lib/platform';
@@ -201,6 +202,23 @@ export default function FlowsSidebar({
   const handleDeleteCancel = useCallback(() => {
     setDeleteConfirm(null);
   }, []);
+
+  // In OAIY's window: a flow can become one of the agent's tools.
+  const handleMakeTool = useCallback(async (flowId: string) => {
+    setContextMenuFlowId(null);
+    const flow = flows.find((f) => f.id === flowId);
+    if (!flow) return;
+    const name = window.prompt("The tool's name, as the agent will call it", toolName(flow.name));
+    if (!name) return;
+    const description = window.prompt('What the tool does, and when the agent should use it', flow.description || `Runs the flow "${flow.name}".`);
+    if (description === null) return;
+    try {
+      await publishAsTool(flow, { name, description });
+      window.alert(`"${toolName(name)}" is now one of the agent's tools. Its inputs are the flow's input nodes, by their labels.`);
+    } catch (error) {
+      window.alert((error as Error).message);
+    }
+  }, [flows]);
 
   const handleDuplicate = useCallback((flowId: string) => {
     onDuplicateFlow(flowId);
@@ -694,6 +712,18 @@ export default function FlowsSidebar({
                 </svg>
                 Duplicate
               </button>
+              {oaiyDesktop() && (
+                <button
+                  onClick={() => void handleMakeTool(contextMenuFlowId)}
+                  className="w-full px-3 py-1.5 text-left text-sm text-emerald-700 dark:text-emerald-300 hover:bg-slate-100 dark:hover:bg-slate-700 flex items-center gap-2"
+                  title="Offer this flow to OAIY's agent as a tool: its input nodes are the tool's parameters"
+                >
+                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M11.42 15.17L17.25 21A2.652 2.652 0 0021 17.25l-5.877-5.877M11.42 15.17l2.496-3.03c.317-.384.74-.626 1.208-.766M11.42 15.17l-4.655 5.653a2.548 2.548 0 11-3.586-3.586l6.837-5.63m5.108-.233c.55-.164 1.163-.188 1.743-.14a4.5 4.5 0 004.486-6.336l-3.276 3.277a3.004 3.004 0 01-2.25-2.25l3.276-3.276a4.5 4.5 0 00-6.336 4.486c.091 1.076-.071 2.264-.904 2.95l-.102.085" />
+                  </svg>
+                  Make it a tool for the agent…
+                </button>
+              )}
               {onExportAsPackage && (
                 <button
                   onClick={() => handleExportAsPackage(contextMenuFlowId)}

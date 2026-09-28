@@ -221,6 +221,30 @@ export class Desktop {
     await this.voice(callId, 'hush', {}).catch(() => {});
   }
 
+  /** The flows stored on the desktop. */
+  async flows(signal?: AbortSignal): Promise<Array<{ id: string; name: string }>> {
+    const body = await reply(await fetch(`${this.origin}/api/bridge/flows`, { headers: this.headers(), signal }));
+    const list = isRecord(body) && Array.isArray(body.flows) ? body.flows : [];
+    return list.filter(isRecord).map((f) => ({ id: String(f.flowId ?? ''), name: String(f.name ?? f.flowId ?? '') })).filter((f) => f.id);
+  }
+
+  /** A stored flow, as it was stored. */
+  async flow(id: string, signal?: AbortSignal): Promise<unknown> {
+    return reply(await fetch(`${this.origin}/api/bridge/flows/${encodeURIComponent(id)}`, { headers: this.headers(), signal }));
+  }
+
+  /** Run a stored flow with `input` (by its input nodes' labels) and wait for its result. */
+  async runFlow(flowId: string, input: Record<string, unknown>, timeoutMs: number, signal?: AbortSignal): Promise<Record<string, unknown>> {
+    const key = `oaiy-app:${flowId}:${crypto.randomUUID()}`;
+    const body = await reply(await fetch(`${this.origin}/api/bridge/runs`, {
+      method: 'POST',
+      headers: this.headers(),
+      body: JSON.stringify({ protocol: 'oaiy-bridge/1', caller: { product: 'oaiy-app', label: 'OAIY agent' }, flowId, input, mode: 'sync', timeoutMs, correlationId: key, idempotencyKey: key }),
+      signal,
+    }));
+    return isRecord(body) ? body : {};
+  }
+
   /** The plugins, and whether each runs. */
   async plugins(signal?: AbortSignal): Promise<Array<{ id: string; state: string }>> {
     const body = await reply(await fetch(`${this.origin}/api/plugins`, { headers: this.headers(), signal }));
