@@ -607,7 +607,7 @@ export default function OAIYApp() {
   const newFlow = () => handleCreateFlow('Untitled flow');
   const openSettings = () => {
     if (settingsPanelOpen && settingsInitialTab !== 'services') { setSettingsPanelOpen(false); return; }
-    setQueuePanelOpen(false); setShowPackageBrowser(false); setSettingsInitialTab(undefined); setSettingsPanelOpen(true);
+    setQueuePanelOpen(false); setShowPackageBrowser(false); setSettingsInitialTab('appearance'); setSettingsPanelOpen(true);
   };
 
   return (
