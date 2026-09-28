@@ -52,7 +52,7 @@ pub const ENGINE_PROVIDER_ID: &str = "oaiy-engine";
 /// The engines' gateway and the model chosen in Engines, asked of the engines now
 /// (their control page's state gives the gateway, the gateway's discovery the model).
 async fn engine_now() -> Result<(String, String), String> {
-    let ui = crate::engines::ui_url().ok_or("OAIY's engines are not running")?;
+    let ui = engines_ui().ok_or("OAIY's engines are not running")?;
     let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(4)).build().map_err(|e| e.to_string())?;
     let state: Value = client.get(format!("{}/api/state", ui.trim_end_matches('/'))).send().await.map_err(|e| format!("the engines did not answer: {e}"))?.json().await.map_err(|e| e.to_string())?;
     let gateway = state.get("gateway_url").and_then(Value::as_str).filter(|g| !g.is_empty()).ok_or("the engines have no gateway yet")?.trim_end_matches('/').to_string();
@@ -69,6 +69,16 @@ fn chosen_model(discovery: &Value) -> String {
         .or_else(|| discovery.pointer("/models/llm").and_then(Value::as_array).and_then(|m| m.iter().find(|m| m.get("default").and_then(Value::as_bool) == Some(true))).and_then(|m| m.get("id")).and_then(Value::as_str))
         .unwrap_or("")
         .to_string()
+}
+
+/// Where the engines' control pages are: the window runs the engines; the headless server has none.
+#[cfg(feature = "gui")]
+fn engines_ui() -> Option<String> {
+    crate::engines::ui_url()
+}
+#[cfg(not(feature = "gui"))]
+fn engines_ui() -> Option<String> {
+    None
 }
 
 /// The engine as a provider record the gateway code can forward to.
