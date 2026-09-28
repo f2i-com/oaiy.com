@@ -70,9 +70,13 @@ impl Engines {
 
     /// What was said in an utterance (24 kHz phone audio).
     pub async fn transcribe(&self, utterance: &[i16]) -> Result<String, String> {
-        let base = self.base(STT_SERVICE).await?;
         let pcm = Resampler::new(WIRE_RATE, STT_RATE).process(utterance);
-        let wav = audio::wav(&pcm, STT_RATE);
+        self.transcribe_wav(audio::wav(&pcm, STT_RATE)).await
+    }
+
+    /// What was said in a recording: a 16 kHz mono 16-bit WAV.
+    pub async fn transcribe_wav(&self, wav: Vec<u8>) -> Result<String, String> {
+        let base = self.base(STT_SERVICE).await?;
         let body = serde_json::json!({
             "audio": base64::engine::general_purpose::STANDARD.encode(wav),
             "response_format": "json",

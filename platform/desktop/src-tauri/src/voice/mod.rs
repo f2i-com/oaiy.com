@@ -130,7 +130,25 @@ pub fn app_router(hub: VoiceHub) -> Router {
         .route("/api/voice/calls/:id/tool", post(tool))
         .route("/api/voice/calls/:id/finish", post(finish))
         .route("/api/voice/calls/:id/hush", post(hush))
+        // Half a minute of 16 kHz speech is under 1 MB; the app sends pieces that size.
+        .route("/api/voice/transcribe", post(transcribe).layer(axum::extract::DefaultBodyLimit::max(8 * 1024 * 1024)))
         .with_state(hub)
+}
+
+/// What was said in a recording (the agent's speech-to-text tool): a 16 kHz mono 16-bit WAV in, `{text}` out.
+async fn transcribe(State(hub): State<VoiceHub>, body: axum::body::Bytes) -> axum::response::Response {
+    match audio::wav_format(&body) {
+        Some((16_000, 1, 16)) => {}
+        Some((rate, channels, bits)) => {
+            let message = format!("send 16 kHz mono 16-bit audio (this is {rate} Hz, {channels} channel(s), {bits}-bit)");
+            return (StatusCode::BAD_REQUEST, Json(json!({"error": {"code": "bad_audio", "message": message}}))).into_response();
+        }
+        None => return (StatusCode::BAD_REQUEST, Json(json!({"error": {"code": "bad_audio", "message": "the body is not a PCM WAV file"}}))).into_response(),
+    }
+    match hub.inner.engines.transcribe_wav(body.to_vec()).await {
+        Ok(text) => (StatusCode::OK, Json(json!({"text": text}))).into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({"error": {"code": "speech_to_text", "message": e}}))).into_response(),
+    }
 }
 
 async fn events(State(hub): State<VoiceHub>) -> impl IntoResponse {

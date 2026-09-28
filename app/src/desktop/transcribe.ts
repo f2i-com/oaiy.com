@@ -118,7 +118,7 @@ export function transcribeTool(vfs: () => Vfs, desktop: () => Desktop | null, de
       const transcript = words.join(' ');
       const seconds = Math.round(samples.length / RATE);
       const saveTo = typeof input.save_to === 'string' && input.save_to.trim() ? input.save_to.trim() : '';
-      if (saveTo) files.writeFile(saveTo, transcript);
+      if (saveTo) files.writeFile(saveTo, transcript, { parents: true });
       const heading = `${path}: ${seconds} s of sound${saveTo ? `, the transcript saved to ${saveTo}` : ''}.`;
       if (!transcript) return `${heading} No speech was heard.`;
       if (transcript.length > MAX_REPLY) {

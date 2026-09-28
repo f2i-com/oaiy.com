@@ -61,6 +61,32 @@ pub fn wav(samples: &[i16], rate: u32) -> Vec<u8> {
     out
 }
 
+/// A WAV file's format: (sample rate, channels, bits per sample), or None when it is not a PCM WAV.
+pub fn wav_format(file: &[u8]) -> Option<(u32, u16, u16)> {
+    if file.len() < 12 || &file[0..4] != b"RIFF" || &file[8..12] != b"WAVE" {
+        return None;
+    }
+    // The chunks after the header: find "fmt ".
+    let mut at = 12;
+    while at + 8 <= file.len() {
+        let size = u32::from_le_bytes([file[at + 4], file[at + 5], file[at + 6], file[at + 7]]) as usize;
+        if &file[at..at + 4] == b"fmt " && at + 8 + 16 <= file.len() {
+            let f = &file[at + 8..];
+            let format = u16::from_le_bytes([f[0], f[1]]);
+            // 1: PCM; 0xFFFE: extensible (PCM inside, for our purposes).
+            if format != 1 && format != 0xFFFE {
+                return None;
+            }
+            let channels = u16::from_le_bytes([f[2], f[3]]);
+            let rate = u32::from_le_bytes([f[4], f[5], f[6], f[7]]);
+            let bits = u16::from_le_bytes([f[14], f[15]]);
+            return Some((rate, channels, bits));
+        }
+        at += 8 + size + (size & 1);
+    }
+    None
+}
+
 /// PCM16 little-endian bytes as samples (an odd last byte is dropped).
 pub fn samples(bytes: &[u8]) -> Vec<i16> {
     bytes.chunks_exact(2).map(|p| i16::from_le_bytes([p[0], p[1]])).collect()
@@ -204,6 +230,14 @@ impl Detector {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_wav_says_its_format() {
+        assert_eq!(wav_format(&wav(&[0; 160], 16_000)), Some((16_000, 1, 16)));
+        assert_eq!(wav_format(&wav(&[0; 240], 24_000)), Some((24_000, 1, 16)));
+        assert_eq!(wav_format(b"RIFF\0\0\0\0WAVEdata"), None);
+        assert_eq!(wav_format(b"not a wav at all"), None);
+    }
 
     fn tone(ms: u32, rate: u32, amp: f32) -> Vec<i16> {
         (0..(rate * ms / 1000)).map(|i| (amp * (i as f32 * 0.07).sin()) as i16).collect()
