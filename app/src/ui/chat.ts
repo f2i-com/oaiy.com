@@ -93,7 +93,14 @@ export class ChatPane {
   /** The agent's checklist for the current request, pinned above the log. */
   private readonly planBox = h('section.plan', { 'aria-live': 'polite' });
   /** The project's conversations: its own chat, and one per person who texts the phone. */
-  private readonly sessionTabs = h('nav.session-tabs', { 'aria-label': 'Conversations', hidden: true });
+  /**
+   * The conversations: the one shown, in a line of its own, and all of them in
+   * a list that opens below it (one to a row, scrolling down when there are
+   * many: never a strip to scroll sideways).
+   */
+  private readonly sessionTabs = h('nav.session-switch', { 'aria-label': 'Conversations', hidden: true });
+  private sessionsOpen = false;
+  private closeSessions: () => void = () => {};
   /** The person's choice to show or hide the steps; null follows the run (hidden once finished). */
   private planOpen: boolean | null = null;
   /** Every step shown, not only the one in progress and the next few (the finished ones fold into one line). */
@@ -130,6 +137,16 @@ export class ChatPane {
       this.toCurrent.hidden = this.log.scrollTop < 300;
       this.maybeLoadOlder();
     }, { passive: true });
+    // The conversations' list closes on a click elsewhere, or Escape.
+    document.addEventListener('pointerdown', (e) => {
+      if (this.sessionsOpen && !this.sessionTabs.contains(e.target as Node)) this.closeSessions();
+    });
+    this.sessionTabs.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && this.sessionsOpen) {
+        this.closeSessions();
+        (this.sessionTabs.querySelector('.session-current') as HTMLElement | null)?.focus();
+      }
+    });
     this.element.append(h('div.pane-title', 'Agent', this.meter), this.sessionTabs, this.planBox, h('div.chat-log-wrap', this.log, this.toCurrent), this.status, this.pending, h('div.chat-compose', this.attachButton, this.input, this.send), this.picker);
     this.attachButton.addEventListener('click', () => this.picker.click());
     this.picker.addEventListener('change', () => {
@@ -281,20 +298,59 @@ export class ChatPane {
    * text-message threads, each with its unread count and whether it is working.
    * Hidden while the project has only its own chat.
    */
-  setSessions(tabs: Array<{ id: string | null; label: string; title?: string; unread: number; working: boolean; close?: () => void }>, active: string | null, select: (id: string | null) => void): void {
+  setSessions(tabs: Array<{ id: string | null; label: string; title?: string; status?: string; unread: number; working: boolean; close?: () => void }>, active: string | null, select: (id: string | null) => void): void {
     clear(this.sessionTabs);
     this.sessionTabs.hidden = tabs.length < 2;
+    if (!tabs.length) return;
+    const current = tabs.find((t) => t.id === active) ?? tabs[0];
+    const others = tabs.filter((t) => t !== current);
+    const unread = others.reduce((n, t) => n + t.unread, 0);
+    const list = h('div.session-list', { role: 'listbox', 'aria-label': 'Conversations' });
+    const head = h(
+      'button.session-current',
+      { 'aria-haspopup': 'listbox', title: 'All the conversations: yours, the calls, the texts and the flows\' tasks', onclick: () => toggle(!this.sessionsOpen) },
+      h('span.session-label', { class: current.working ? 'working' : '' }, current.label),
+      h('span.session-more', `${others.length} other${others.length === 1 ? '' : 's'}`),
+      ...(unread ? [h('span.session-unread', { 'aria-label': `${unread} unread elsewhere` }, String(unread))] : []),
+      h('span.session-caret', { 'aria-hidden': 'true' }, '▾'),
+    );
+    const toggle = (open: boolean) => {
+      this.sessionsOpen = open;
+      list.hidden = !open;
+      head.setAttribute('aria-expanded', String(open));
+      this.sessionTabs.classList.toggle('open', open);
+    };
+    const choose = (id: string | null) => {
+      toggle(false);
+      select(id);
+    };
     for (const tab of tabs) {
-      this.sessionTabs.append(h(
-        'button.session-tab',
-        { class: `${tab.id === active ? 'active' : ''} ${tab.working ? 'working' : ''}`, title: tab.title ?? tab.label, 'aria-current': tab.id === active ? 'true' : 'false', onclick: () => select(tab.id) },
-        h('span.session-label', tab.label),
+      list.append(h(
+        'div.session-tab.session-row',
+        {
+          class: `${tab.id === active ? 'active' : ''} ${tab.working ? 'working' : ''}`,
+          role: 'option',
+          tabindex: 0,
+          title: tab.title ?? tab.label,
+          'aria-selected': String(tab.id === active),
+          onclick: () => choose(tab.id),
+          onkeydown: (e: KeyboardEvent) => {
+            if (e.key === 'Enter' || e.key === ' ') {
+              e.preventDefault();
+              choose(tab.id);
+            }
+          },
+        },
+        h('span.session-text', h('span.session-label', tab.label), ...(tab.status ? [h('small.session-status', tab.status)] : [])),
         ...(tab.unread ? [h('span.session-unread', { 'aria-label': `${tab.unread} unread` }, String(tab.unread))] : []),
         ...(tab.close
           ? [h('span.session-close', { role: 'button', title: 'Remove this conversation', 'aria-label': 'Remove this conversation', onclick: (e: Event) => { e.stopPropagation(); tab.close!(); } }, '×')]
           : []),
       ));
     }
+    this.sessionTabs.append(head, list);
+    this.closeSessions = () => toggle(false);
+    toggle(this.sessionsOpen);
   }
 
   /** How full the context is: `used` tokens of `window`. */

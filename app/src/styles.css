@@ -184,7 +184,8 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 .msg.user { background: var(--user-bubble); align-self: flex-end; white-space: pre-wrap; }
 .msg.assistant { background: var(--panel-2); }
 .msg.assistant p { margin: 0 0 6px; }
-.msg.assistant pre.code { background: var(--well); padding: 8px; border-radius: 6px; overflow: auto; font: 12.5px/1.4 var(--mono); }
+/* Code in the chat wraps: the pane never scrolls sideways. */
+.msg.assistant pre.code { background: var(--well); padding: 8px; border-radius: 6px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font: 12.5px/1.4 var(--mono); }
 .msg code { font-family: var(--mono); font-size: 12.5px; background: var(--well); padding: 0 3px; border-radius: 4px; }
 .msg.system pre { margin: 0; white-space: pre-wrap; font: 12.5px/1.45 var(--mono); color: var(--muted); }
 .msg.system.error pre { color: var(--err); }
@@ -538,14 +539,27 @@ details.msg.compacted pre { white-space: pre-wrap; font-size: 12px; max-height: 
 .show-earlier { align-self: center; font-size: 12px; color: var(--muted); margin: 6px 0 12px; }
 
 /* The project's conversations: its own chat, and one per person who texts the phone. */
-.session-tabs { display: flex; gap: 4px; padding: 6px 8px 0; overflow-x: auto; scrollbar-width: thin; flex: none; }
-.session-tabs[hidden] { display: none; }
-.session-tab { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; padding: 3px 10px; border-radius: 999px; white-space: nowrap; background: transparent; color: var(--muted); }
-.session-tab.active { color: var(--text); background: var(--panel-2); border-color: var(--accent); }
-.session-tab.working .session-label::before { content: ''; display: inline-block; width: 7px; height: 7px; margin-right: 6px; border-radius: 50%; background: var(--accent); animation: session-pulse 1.2s ease-in-out infinite; vertical-align: 1px; }
+/* The conversations: the one shown in a line of its own; all of them in a list that opens below it, over the log. */
+.session-switch { position: relative; flex: none; padding: 6px 8px 0; }
+.session-switch[hidden] { display: none; }
+.session-current { display: flex; align-items: center; gap: 8px; width: 100%; padding: 6px 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--panel-2); font-size: 13px; text-align: left; }
+.session-current:hover { border-color: var(--accent); }
+.session-current .session-label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
+.session-more { flex: none; color: var(--muted); font-size: 12px; white-space: nowrap; }
+.session-caret { flex: none; color: var(--muted); transition: transform 0.15s; }
+.session-switch.open .session-caret { transform: rotate(180deg); }
+.session-list { position: absolute; top: calc(100% + 4px); left: 8px; right: 8px; z-index: 25; display: flex; flex-direction: column; gap: 2px; max-height: min(360px, 50vh); overflow-x: hidden; overflow-y: auto; scrollbar-width: thin; padding: 4px; border: 1px solid var(--border); border-radius: 10px; background: var(--panel); box-shadow: var(--shadow); }
+.session-list[hidden] { display: none; }
+.session-row { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-radius: 7px; cursor: pointer; color: var(--text); }
+.session-row:hover, .session-row:focus-visible { background: var(--panel-2); outline: none; }
+.session-row.active { background: var(--selected); }
+.session-text { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.session-row .session-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
+.session-status { color: var(--muted); font-size: 11.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.session-switch .working::before, .session-row.working .session-label::before { content: ''; display: inline-block; width: 7px; height: 7px; margin-right: 6px; border-radius: 50%; background: var(--accent); animation: session-pulse 1.2s ease-in-out infinite; vertical-align: 1px; }
 @keyframes session-pulse { 50% { opacity: 0.3; } }
-@media (prefers-reduced-motion: reduce) { .session-tab.working .session-label::before { animation: none; } }
-.session-unread { min-width: 18px; padding: 0 5px; border-radius: 999px; background: var(--accent); color: var(--on-accent); font-weight: 700; font-size: 11px; text-align: center; }
+@media (prefers-reduced-motion: reduce) { .session-switch .working::before, .session-row.working .session-label::before { animation: none; } .session-caret { transition: none; } }
+.session-unread { flex: none; min-width: 18px; padding: 0 5px; border-radius: 999px; background: var(--accent); color: var(--on-accent); font-weight: 700; font-size: 11px; text-align: center; }
 /* The phone chip: whether OAIY Desktop and the phone are there. */
 .chip.phone[data-state='ready']::before { background: var(--ok); }
 .chip.phone[data-state='off']::before, .chip.phone[data-state='problem']::before { background: var(--muted); box-shadow: none; }
@@ -568,7 +582,6 @@ details.msg.compacted pre { white-space: pre-wrap; font-size: 12px; max-height: 
 .in-oaiy .topbar.menu-open .actions button { text-align: left; padding: 7px 12px; border-color: transparent; background: transparent; min-width: 0; }
 .in-oaiy .topbar.menu-open .actions button:hover { background: var(--panel-2); border-color: var(--border); }
 .in-oaiy .project-select { max-width: 260px; }
-.in-oaiy .session-tab.active { border-color: var(--accent); }
 
 /* A call or text conversation that has finished can be closed. */
 .session-close { margin-left: 2px; padding: 0 3px; border-radius: 50%; color: var(--muted); line-height: 1; cursor: pointer; }

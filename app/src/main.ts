@@ -1088,9 +1088,10 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
   function renderSessions(): void {
     if (!sessions) return;
     chat.setSessions([
-      { id: null, label: 'Project', title: `${project.meta.name}: your conversation with the agent`, unread: 0, working: !!currentRun },
+      { id: null, label: project === frontDesk ? '🧭 The runner' : '💬 Project', title: `${project.meta.name}: your conversation with the agent`, status: project === frontDesk ? "Your conversation: it directs the phone's agents" : `Your conversation in ${project.meta.name}`, unread: 0, working: !!currentRun },
       ...sessions.list.map((s) => ({
         id: s.id,
+        status: s.callId ? 'On a call now' : s.running ? 'Working…' : `${s.kind === 'call' ? 'Calls' : s.kind === 'task' ? 'Flow tasks' : 'Texts'} · ${since(s.lastAt)}`,
         label: s.key === TEST_NUMBER ? '💬 Test' : `${s.kind === 'call' ? '📞' : s.kind === 'task' ? '🔀' : '💬'} ${s.title}`,
         title: s.kind === 'task' ? `The tasks your flow "${s.title}" gives the agent` : `${s.kind === 'call' ? (s.callId ? 'On a call with' : 'Calls with') : 'Text messages with'} ${s.title}${s.title !== s.key ? ` (${s.key})` : ''}`,
         unread: s.id === viewing ? 0 : s.unread,
@@ -1101,6 +1102,15 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
     ], viewing, selectSession);
     const shown = viewing ? sessions.get(viewing) : null;
     if (shown) chat.setBusy(!!shown.running);
+  }
+
+  /** When something last happened, as a person says it. */
+  function since(at: number): string {
+    const minutes = Math.round((Date.now() - at) / 60_000);
+    if (minutes < 1) return 'just now';
+    if (minutes < 60) return `${minutes} min ago`;
+    if (minutes < 24 * 60) return `${Math.round(minutes / 60)} h ago`;
+    return new Date(at).toLocaleDateString(undefined, { weekday: 'short', day: 'numeric', month: 'short' });
   }
 
   /** Remove a call or text conversation from this project (asked first). */
