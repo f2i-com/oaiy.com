@@ -279,6 +279,10 @@ pub async fn run(socket: WebSocket, hub: VoiceHub, engines: Engines) {
     };
     let str_of = |k: &str| start.get(k).and_then(Value::as_str).unwrap_or("").to_string();
     let (mut instructions, mut greeting) = (str_of("instructions"), str_of("greeting"));
+    // What Aokie knows of the call (a newer Aokie sends it): which way it goes, who with,
+    // and on a call it placed, why and its first words. Absent: the plugin's events say who.
+    let (direction, start_from, start_name) = (str_of("direction"), str_of("from"), str_of("callerName"));
+    let (purpose, opening_line) = (str_of("purpose"), str_of("openingLine"));
     // The voice chosen for calls (a clip in the voices folder; see `voices`).
     let voice: Option<String> = super::voices::chosen();
 
@@ -511,10 +515,18 @@ pub async fn run(socket: WebSocket, hub: VoiceHub, engines: Engines) {
                                     instructions = i.to_string();
                                 }
                                 let (from, name) = hub.caller_of(&ids.call).unwrap_or_default();
+                                let from = if from.trim().is_empty() { start_from.clone() } else { from };
+                                let name = if name.trim().is_empty() { start_name.clone() } else { name };
                                 // Greeted by name when we know it: the name kept for their number, else the phone's.
                                 let known = super::callers::name_of(&from).or_else(|| super::callers::looks_like_name(&name).then(|| name.trim().to_string())).unwrap_or_default();
                                 greeting = super::callers::personal_greeting(&greeting, &known);
-                                hub.emit(json!({"type": "call.started", "callId": ids.call, "from": from, "name": name, "knownName": known, "instructions": instructions, "greeting": greeting}));
+                                let mut started = json!({"type": "call.started", "callId": ids.call, "from": from, "name": name, "knownName": known, "instructions": instructions, "greeting": greeting});
+                                for (key, value) in [("direction", &direction), ("purpose", &purpose), ("openingLine", &opening_line)] {
+                                    if !value.trim().is_empty() {
+                                        started[key] = json!(value);
+                                    }
+                                }
+                                hub.emit(started);
                                 if !greeting.trim().is_empty() {
                                     speak(greeting.clone(), true, None);
                                 }

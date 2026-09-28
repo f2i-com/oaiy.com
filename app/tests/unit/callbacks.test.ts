@@ -113,5 +113,9 @@ describe('missed calls, called back', () => {
     const note = callStartNote('Lance (0491570006)', "Hi, it's the receptionist, returning your call.", 'Name: Lance', new Date(2026, 8, 29, 10, 5), new Date(2026, 8, 29, 9, 40).getTime());
     expect(note).toMatch(/^\[OAIY\] 📞 You rang Lance \(0491570006\) back, returning their missed call from .+; they answered .+\. You opened with: "Hi, it's the receptionist, returning your call\."/);
     expect(isCallStart({ role: 'user', text: note, automatic: true })).toBe(true);
+    // A call the phone placed for another reason (a flow's call.dial): the agent is told it rang, and why.
+    const placed = callStartNote('Sam (0400000009)', 'Hi Sam, it is the receptionist.', '', new Date(2026, 8, 29, 10, 5), undefined, { purpose: 'Remind them of tomorrow at 9.' });
+    expect(placed).toMatch(/^\[OAIY\] 📞 You rang Sam \(0400000009\); they answered .+\. Why you rang: Remind them of tomorrow at 9\. You opened with: "Hi Sam, it is the receptionist\."/);
+    expect(isCallStart({ role: 'user', text: placed, automatic: true })).toBe(true);
   });
 });

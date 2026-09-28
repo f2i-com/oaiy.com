@@ -363,11 +363,15 @@ export const LOOKUP_UNAVAILABLE =
   "The business's records could not be checked just now (no business lookup is set up on OAIY Desktop, or it failed). Do not guess times, availability, prices or bookings: tell the caller you can't check right now, and offer to take their preferred time as a request for staff to confirm.";
 
 /** The note that starts a call: who, when, and what is known about them (the model's view of the call starts there). */
-export function callStartNote(who: string, greeting: string, known: string, now = new Date(), returning?: number): string {
-  const opened = greeting.trim() ? ` You ${returning ? 'opened with' : 'greeted them'}: "${greeting.trim()}"` : '';
-  const began = returning
+export function callStartNote(who: string, greeting: string, known: string, now = new Date(), returning?: number, outbound?: { purpose?: string }): string {
+  const rang = returning !== undefined || !!outbound;
+  const opened = greeting.trim() ? ` You ${rang ? 'opened with' : 'greeted them'}: "${greeting.trim()}"` : '';
+  const why = outbound?.purpose?.trim() ? ` Why you rang: ${outbound.purpose.trim()}` : '';
+  const began = returning !== undefined
     ? `You rang ${who} back, returning their missed call from ${whenSaid(returning)}; they answered ${whenSaid(now.getTime())}.`
-    : `A call from ${who} began, ${whenSaid(now.getTime())}.`;
+    : outbound
+      ? `You rang ${who}; they answered ${whenSaid(now.getTime())}.${why}`
+      : `A call from ${who} began, ${whenSaid(now.getTime())}.`;
   return `[OAIY] 📞 ${began}${opened}\nToday is ${today(now)}.\n${known}`;
 }
 
@@ -811,7 +815,9 @@ export class Sessions {
         session.callerSpeaking = false;
       }
       const who = `${session.title}${session.title !== session.key ? ` (${session.key})` : ''}`;
-      const note = callStartNote(who, typeof event.greeting === 'string' ? event.greeting : '', knownText(this.callerNote(session.key)), new Date(), this.callingBack(from)?.missedAt);
+      // A call the phone placed (Aokie says so): the agent rang them, and why.
+      const outbound = event.direction === 'outbound' ? { purpose: typeof event.purpose === 'string' ? event.purpose : '' } : undefined;
+      const note = callStartNote(who, typeof event.greeting === 'string' ? event.greeting : '', knownText(this.callerNote(session.key)), new Date(), this.callingBack(from)?.missedAt, outbound);
       session.agent.turns.push({ role: 'user', text: note, automatic: true, ...(fresh ? { fresh: true } : {}) });
       await this.save(session);
       await this.saveIndex();
