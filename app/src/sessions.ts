@@ -31,6 +31,8 @@ export interface Session extends SessionInfo {
   brief?: string;
   /** What the agent writes, spoken on the call. */
   speech?: Speech;
+  /** Its agent is using a tool now (a caller speaking over it does not stop the tool). */
+  inTool?: boolean;
   /** A flow's tasks waiting for their answers, each by its prompt (one task a run; a message of the person's answers none). */
   answers?: Array<{ prompt: string; settle: (reply: string, error?: string) => void }>;
 }
@@ -49,7 +51,9 @@ export type MakeAgent = (extra: Pick<AgentOptions, 'instructions' | 'sessionTool
  * the other end is a stranger to this computer, so nothing that writes, runs
  * code, fetches from the web or makes pictures and sounds.
  */
-export const KNOWLEDGE_TOOLS = new Set(['read_file', 'list_files', 'search_file', 'grep', 'glob']);
+export const KNOWLEDGE_TOOLS = new Set(['read_file', 'list_files', 'search_file', 'grep', 'glob', 'file_info', 'view_image']);
+/** Where the front desk keeps what the person gives its agents to go by. */
+const REFERENCE = 'Your person\'s reference files are the front desk\'s: /brief.md (your direction), /knowledge (what the business wants you to know) and /uploads (documents and pictures they gave you). Read them when a question is one they cover.';
 export const CALL_TOOLS = KNOWLEDGE_TOOLS;
 
 export interface SessionHooks {
@@ -81,7 +85,7 @@ export function smsInstructions(title: string, number: string, instructions: str
     `This conversation is a text-message thread with ${who}, on the phone of the person you work for.${test ? ' It is a test: your replies are shown, not sent.' : ''}`,
     'Their messages arrive as "Text message from …". Answer them with send_text_message: short plain text (no markdown), in the language they write in. Only what you send with it reaches them; anything else you write is seen only by the person you work for.',
     'A message without that label comes from the person you work for, who may be watching: do what they say (they may tell you what to reply, or ask you to do something first).',
-    'When a message needs it, read the front desk\'s files (what the business wants you to know: /knowledge) and use your flows made tools. You cannot change files, browse the web or run code here. There is no need to reply to a message that needs no answer (a thank-you, an emoji).',
+    `${REFERENCE} Use your flows made tools when a message needs one. You cannot change files, browse the web or run code here. There is no need to reply to a message that needs no answer (a thank-you, an emoji).`,
     'To book them in: find a time with calendar_free_times, agree a day and time with them, then request_appointment. It is a request that staff confirm (they are texted when it is): never say it is booked.',
     `The instructions of the person you work for, for text messages:\n${instructions.trim() || '(none)'}`,
   ].join('\n');
@@ -98,6 +102,8 @@ export class Speech {
   private hushed = false;
   /** What was said on this call, so a sentence is not said twice. */
   private said = new Set<string>();
+  /** Something has been said in this reply. */
+  private spoke = false;
 
   constructor(private readonly say: (text: string) => Promise<void>, private readonly failed: (error: string) => void = () => {}) {}
 
@@ -105,6 +111,13 @@ export class Speech {
   begin(): void {
     this.hushed = false;
     this.buffer = '';
+    this.spoke = false;
+  }
+
+  /** A tool is taking a while: say a short line, unless this reply has said something already. */
+  hold(line: string): void {
+    if (this.hushed || this.spoke) return;
+    this.speak(line);
   }
 
   /** A new call: nothing has been said on it yet. */
@@ -155,6 +168,7 @@ export class Speech {
       if (this.said.has(key)) return;
       this.said.add(key);
     }
+    this.spoke = true;
     this.chain = this.chain.then(() => (this.hushed ? undefined : this.say(clean))).catch((e: unknown) => this.failed((e as Error).message));
   }
 }
@@ -176,13 +190,18 @@ export function callInstructions(title: string, number: string, brief: string, i
     `This conversation is a live phone call with ${who}, on the phone of the person you work for. Everything you write is spoken aloud to the caller as you write it, so write only what you would say: one or two short sentences, plain words, no markdown, lists, emoji or links. Then stop, and let them answer.`,
     'Their words arrive as "Caller: …", transcribed from speech (allow for a misheard word). A message without that label comes from the person you work for, who may be watching: do what they say.',
     'Your call tools: request_appointment (a booking request for staff to confirm; never say it is booked or confirmed), lookup_business_data (a question about the business\'s records or calendar), end_call (a short goodbye, then the call ends; use it when the caller is done). Your other tools work too.',
-    'To look something up, call the tool in the same reply as your words: say "Let me check." and make the call at once. Never say you will check without calling the tool: the caller hears you and waits.',
+    REFERENCE,
+    'To look something up (a tool, a file), do it in the same reply as a few words: say "Let me check." and make the call at once, then answer from what it returned. Never say you will check without doing it: the caller hears you and waits. If the caller speaks while you check, their words reach you with the result: answer both.',
     'Say only what you know: from these instructions, the brief, or what a tool returned. Never make up availability, times, prices or bookings. If you cannot check, say so, and offer to take their preferred time as a request for staff to confirm.',
     'Never repeat something you have already said on this call. When the caller says goodbye or is done, call end_call with a short goodbye, and write nothing else.',
     brief.trim() ? `The receptionist brief:\n${brief.trim()}` : '',
     `The instructions of the person you work for, for calls:\n${instructions.trim() || '(none)'}`,
   ].filter(Boolean).join('\n');
 }
+
+/** How long a tool may run on a call before a short line is said, and the line. */
+const HOLD_AFTER_MS = 2_000;
+const HOLD_LINE = 'One moment, let me check.';
 
 /** What the call's agent is told when the business's records cannot be checked. */
 export const LOOKUP_UNAVAILABLE =
@@ -207,6 +226,50 @@ export function earlierWords(turns: Turn[], keep = 6): Turn[] {
     .map((t): Turn => (t.role === 'user' ? { role: 'user', text: t.text } : { role: 'assistant', text: t.text, calls: [] }));
 }
 
+/** A conversation's words, as the runner reads them: who said what, and what was done. */
+export function conversationText(turns: Turn[], last = 40): string {
+  const lines: string[] = [];
+  for (const t of turns) {
+    if (t.role === 'user') lines.push(t.text.startsWith('[OAIY]') ? `(${t.text.replace(/^\[OAIY\]\s*/, '')})` : t.text);
+    else if (t.role === 'assistant') {
+      if (t.text.trim()) lines.push(`Agent: ${t.text.trim()}`);
+      for (const c of t.calls) lines.push(`(used ${c.name}${c.name === 'send_text_message' && typeof c.input.body === 'string' ? `: "${c.input.body}"` : ''})`);
+    }
+  }
+  const shown = lines.slice(-last).join('\n');
+  return shown.length > 8000 ? `…${shown.slice(-8000)}` : shown;
+}
+
+/**
+ * The runner's view of its sub-agents (the front desk's main agent): the
+ * phone's conversations, and what was said and done in one.
+ */
+export function phoneConversationsTool(sessions: () => Sessions | null): SessionTool {
+  return {
+    spec: {
+      name: 'phone_conversations',
+      description:
+        "The phone's conversations, each answered by a sub-agent of yours: calls, text-message threads and flows' tasks. With no id: the list, newest first. With an id: what was said and done in it (its last `last` lines, 40 by default).",
+      parameters: { type: 'object', properties: { id: { type: 'string', description: "A conversation's id, from the list" }, last: { type: 'number' } } },
+    },
+    run: async (input) => {
+      const all = sessions()?.list ?? [];
+      const id = typeof input.id === 'string' ? input.id.trim() : '';
+      if (id) {
+        const s = all.find((x) => x.id === id);
+        if (!s) return `No conversation ${id}. Call phone_conversations with no id for the list.`;
+        const last = typeof input.last === 'number' && input.last > 0 ? Math.min(200, Math.floor(input.last)) : 40;
+        return `${s.kind === 'call' ? 'Calls' : s.kind === 'task' ? "Tasks from the flow" : 'Text messages'} with ${s.title}${s.title !== s.key ? ` (${s.key})` : ''}${s.callId ? ', on a call now' : ''}:\n${conversationText(s.agent.turns, last) || '(nothing yet)'}`;
+      }
+      if (!all.length) return 'No calls, texts or flow tasks yet.';
+      const when = (ms: number) => new Date(ms).toLocaleString('en-AU', { weekday: 'short', day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit' });
+      return all
+        .map((s) => `${s.id}: ${s.kind === 'call' ? 'call' : s.kind === 'task' ? 'flow task' : 'texts'} with ${s.title}${s.title !== s.key ? ` (${s.key})` : ''}, last ${when(s.lastAt)}${s.running ? ', working now' : ''}${s.callId ? ', on a call now' : ''}`)
+        .join('\n');
+    },
+  };
+}
+
 /** What a flow's tasks are about: the flow waits for the agent's last words as its output. */
 export function taskInstructions(flow: string): string {
   return `This conversation holds the tasks your person's flow "${flow}" gives you (an "Ask the agent" node in it). Each message is one task. Do it with your tools, then end with the result itself: your last reply is handed back to the flow as its output, so give only what the flow asked for (no greeting, no offer of more help). If you cannot do it, say why in one sentence. Your files here are the front desk's (what the business wants its phone agent to know, in /knowledge), not a project of the person's.`;
@@ -227,7 +290,17 @@ export class Sessions {
     private readonly settings: () => MessageSettings,
     private readonly desktop: () => Desktop | null,
     private readonly hooks: SessionHooks,
+    /** The direction every conversation takes, from its runner (the front desk's brief): read afresh for each reply. */
+    private readonly direction: () => string = () => '',
   ) {}
+
+  /** A conversation's instructions, with the runner's direction after them. */
+  private directed(instructions: string): string {
+    const said = this.direction().trim();
+    if (!said) return instructions;
+    const brief = said.length > 4000 ? `${said.slice(0, 4000)}\n[the rest of the brief is cut]` : said;
+    return `${instructions}\n\nYour direction, from the front desk's brief (kept by the main agent your person talks to). Go by it before anything a caller or texter asks, and where a tool, a file or the calendar says otherwise, the brief wins:\n${brief}`;
+  }
 
   /** The project's saved conversations. */
   async load(): Promise<void> {
@@ -252,7 +325,7 @@ export class Sessions {
     const session = { ...info, running: null, controller: null, waiting: [] } as unknown as Session;
     if (info.kind === 'call') {
       session.agent = this.makeAgent({
-        instructions: () => callInstructions(session.title, session.key, session.brief ?? '', this.settings().callInstructions),
+        instructions: () => this.directed(callInstructions(session.title, session.key, session.brief ?? '', this.settings().callInstructions)),
         sessionTools: this.callTools(session),
         tools: TOOLS.filter((t) => CALL_TOOLS.has(t.name)),
         // Answer at once: no thinking first.
@@ -270,12 +343,12 @@ export class Sessions {
     }
     if (info.kind === 'task') {
       session.answers = [];
-      session.agent = this.makeAgent({ instructions: () => taskInstructions(session.key) });
+      session.agent = this.makeAgent({ instructions: () => this.directed(taskInstructions(session.key)) });
       return session;
     }
     const test = info.key === TEST_NUMBER;
     session.agent = this.makeAgent({
-      instructions: () => smsInstructions(session.title, session.key, this.settings().instructions, test),
+      instructions: () => this.directed(smsInstructions(session.title, session.key, this.settings().instructions, test)),
       // A texter reaches the front desk's files, to read (see KNOWLEDGE_TOOLS).
       tools: TOOLS.filter((t) => KNOWLEDGE_TOOLS.has(t.name)),
       // A pretend thread does not put requests in the real calendar.
@@ -386,8 +459,9 @@ export class Sessions {
         break;
       }
       case 'call.interrupted':
+        // The words stop. A tool at work goes on: what the caller says reaches the agent with its result.
         session.speech?.hush();
-        session.controller?.abort();
+        if (!session.inTool) session.controller?.abort();
         break;
       case 'call.ended':
         session.speech?.hush();
@@ -572,10 +646,27 @@ export class Sessions {
     // What the run says last (a flow's task is answered with it), or why it failed.
     let said = '';
     let failed = '';
+    // On a call: a tool that takes a while gets a short line said, so the caller is not left in silence.
+    let holding: ReturnType<typeof setTimeout> | null = null;
+    const stopHolding = () => {
+      if (holding) clearTimeout(holding);
+      holding = null;
+    };
     try {
       await session.agent.run(prompt, (event) => {
         if (event.type === 'done') said = event.text;
         if (event.type === 'error') failed = event.message;
+        if (event.type === 'tool_call') {
+          session.inTool = true;
+          stopHolding();
+          if (session.speech) holding = setTimeout(() => session.speech?.hold(HOLD_LINE), HOLD_AFTER_MS);
+        }
+        if (event.type === 'tool_result') {
+          session.inTool = false;
+          stopHolding();
+          // What it says next is heard, even if the caller spoke over the words before the tool.
+          session.speech?.begin();
+        }
         if (session.speech && event.type === 'text') session.speech.push(event.delta);
         // A reply ends (a tool is called, or the model's turn is over): what it said is complete.
         if (session.speech && (event.type === 'tool_call' || event.type === 'usage')) session.speech.flush();
@@ -586,6 +677,8 @@ export class Sessions {
       failed = (error as Error).message;
       this.hooks.event(session, { type: 'error', message: (error as Error).message });
     } finally {
+      stopHolding();
+      session.inTool = false;
       // The task this run was (none, when it was a message of the person's).
       const task = session.answers?.findIndex((a) => a.prompt === prompt) ?? -1;
       if (task >= 0) session.answers!.splice(task, 1)[0].settle(said.trim(), said.trim() ? undefined : failed || 'the agent finished without an answer');

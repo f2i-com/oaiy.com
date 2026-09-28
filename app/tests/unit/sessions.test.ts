@@ -337,3 +337,39 @@ describe('what a stranger can reach', () => {
     for (const tool of ['write_file', 'edit_file', 'delete_file', 'web_fetch', 'code_run', 'sandbox_shell', 'generate_image']) expect(offered).not.toContain(tool);
   });
 });
+
+describe("the runner's direction", () => {
+  it("every call and text reads the front desk's brief afresh, before anything the caller asks", async () => {
+    let brief = 'We are fully booked until Friday.';
+    const bodies: string[] = [];
+    fakeProvider('openai', [
+      (body) => {
+        bodies.push(JSON.stringify(body));
+        return { text: 'The earliest is Monday.' };
+      },
+      (body) => {
+        bodies.push(JSON.stringify(body));
+        return { text: 'Sure, Wednesday works.' };
+      },
+    ]);
+    const store = fakeProject();
+    const sessions = new Sessions(
+      store.project as never,
+      (extra) => new Agent({ vfs: new Vfs(), gate: new NetGate(), provider: () => OPENAI, projectSummary: () => '', ...extra }),
+      () => ({ answer: false, calls: true, instructions: '', callInstructions: '' }) as MessageSettings,
+      () => null,
+      { changed: () => {}, event: () => {} },
+      () => brief,
+    );
+    await sessions.callEvent({ type: 'call.started', callId: 'c1', from: '+61400000002' });
+    await sessions.callEvent({ type: 'call.caller', callId: 'c1', text: 'Can you come Wednesday?' });
+    await settled(sessions);
+    expect(bodies[0]).toContain('the brief wins');
+    expect(bodies[0]).toContain('We are fully booked until Friday.');
+    brief = 'Wednesdays are open again.';
+    await sessions.callEvent({ type: 'call.caller', callId: 'c1', text: 'What about next week?' });
+    await settled(sessions);
+    expect(bodies[1]).toContain('Wednesdays are open again.');
+    expect(bodies[1]).not.toContain('fully booked until Friday');
+  });
+});

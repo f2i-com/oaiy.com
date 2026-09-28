@@ -82,7 +82,7 @@ describe('speaking what the agent writes', () => {
   });
 });
 
-function setup(provider: ProviderConfig = OPENAI) {
+function setup(provider: ProviderConfig = OPENAI, toolWait?: Promise<void>) {
   const chats = new Map<string, Turn[]>();
   let index: SessionInfo[] = [];
   const project = {
@@ -104,7 +104,9 @@ function setup(provider: ProviderConfig = OPENAI) {
     },
     callTool: async (callId: string, name: string, args: unknown) => {
       calls.push([name, callId, args]);
-      return { ok: true, output: { recorded: true, status: 'requested' } };
+      // A tool that takes a while (the phone looking something up).
+      if (toolWait) await toolWait;
+      return { ok: true, output: name === 'lookup_business_data' ? { answer: 'Open Saturday 8 to 2.' } : { recorded: true, status: 'requested' } };
     },
   };
   const messages: MessageSettings = { answer: false, instructions: '', calls: true, callInstructions: 'Be kind.' };
@@ -210,7 +212,7 @@ describe('a phone call answered by the agent', () => {
     expect(calls).toEqual([['say', 'call_3', "Let me check what's open on the calendar."]]);
     expect(fake.bodies).toHaveLength(1);
     const rules = callInstructions('', '+61400000003', '', '');
-    expect(rules).toContain('Never say you will check without calling the tool');
+    expect(rules).toContain('Never say you will check without doing it');
     expect(rules).toContain('Never make up availability');
     expect(rules).toContain('When the caller says goodbye or is done, call end_call');
   });
@@ -276,5 +278,50 @@ describe('a phone call answered by the agent', () => {
     await sessions.callEvent({ type: 'call.caller', callId: 'call_5', text: 'Hello?' });
     await settled(sessions);
     expect(calls.filter((c) => c[0] === 'say')).toEqual([]);
+  });
+
+  it('a caller speaking while a tool works does not stop it: the result and their words reach the agent, and the answer is spoken', async () => {
+    let lookedUp!: () => void;
+    const lookup = new Promise<void>((r) => (lookedUp = r));
+    const fake = fakeProvider('openai', [
+      { text: 'Let me check.', calls: [{ name: 'lookup_business_data', input: { question: 'Saturday hours' } }] },
+      (body) => {
+        const said = JSON.stringify(body.messages);
+        expect(said).toContain('Open Saturday 8 to 2.');
+        expect(said).toContain('Also, do you mow on Sundays?');
+        return { text: "We're open Saturday from eight to two. We don't mow on Sundays." };
+      },
+    ]);
+    const { sessions, calls } = setup(OPENAI, lookup);
+    await sessions.callEvent({ type: 'call.started', callId: 'call_9', from: '+61400000009' });
+    await sessions.callEvent({ type: 'call.caller', callId: 'call_9', text: 'What are your Saturday hours?' });
+    for (let i = 0; i < 100 && !calls.some((c) => c[0] === 'lookup_business_data'); i++) await new Promise((r) => setTimeout(r, 10));
+    // The caller speaks over the check: the words stop, the lookup goes on.
+    await sessions.callEvent({ type: 'call.interrupted', callId: 'call_9', itemId: 'out_1' });
+    await sessions.callEvent({ type: 'call.caller', callId: 'call_9', text: 'Also, do you mow on Sundays?' });
+    lookedUp();
+    await settled(sessions);
+    expect(fake.bodies).toHaveLength(2);
+    expect(calls.filter((c) => c[0] === 'say').map((c) => c[2])).toEqual(['Let me check.', "We're open Saturday from eight to two.", "We don't mow on Sundays."]);
+  });
+
+  it('a tool that takes a while gets a short line said, once, when nothing has been said', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      const said: string[] = [];
+      const speech = new Speech(async (text) => void said.push(text));
+      speech.begin();
+      speech.hold('One moment, let me check.');
+      speech.hold('One moment, let me check.');
+      await speech.done;
+      expect(said).toEqual(['One moment, let me check.']);
+      speech.begin();
+      speech.push('Let me look. ');
+      speech.hold('One moment, let me check.');
+      await speech.done;
+      expect(said).toEqual(['One moment, let me check.', 'Let me look.']);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
