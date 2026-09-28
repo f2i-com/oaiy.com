@@ -1124,25 +1124,34 @@ async fn install_plugin(
     match installed {
         Ok(Ok(out)) => {
             // Pick the new plugin up immediately rather than on the next poll.
+            let mut setup = None;
             if let Ok(mut reg) = st.plugins.lock() {
                 reg.scan();
                 crate::modules::refresh(&reg);
+                setup = reg.get(&out.id).and_then(crate::setup::declared);
             }
             crate::modules::poke();
-            (
-                StatusCode::OK,
-                Json(json!({
-                    "id": out.id,
-                    "name": out.name,
-                    "version": out.version,
-                    "replaced": out.replaced,
-                })),
-            )
-                .into_response()
+            (StatusCode::OK, Json(install_reply(&out, setup.as_ref()))).into_response()
         }
         Ok(Err(e)) => bridge_error(StatusCode::BAD_REQUEST, "invalid_request", e),
         Err(e) => bridge_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()),
     }
+}
+
+/// What an install answers: the plugin installed, and when it declares a
+/// setup, its version and title, so the window that installed it can open
+/// its setup wizard (or, for an update, nudge when the version went up).
+fn install_reply(out: &crate::plugins::install::Installed, setup: Option<&crate::setup::Declared>) -> serde_json::Value {
+    let mut reply = json!({
+        "id": out.id,
+        "name": out.name,
+        "version": out.version,
+        "replaced": out.replaced,
+    });
+    if let Some(setup) = setup {
+        reply["setup"] = json!({ "version": setup.version, "title": setup.title });
+    }
+    reply
 }
 
 /// `DELETE /api/plugins/:id` — stop a plugin and remove it from disk. PRIVILEGED.
@@ -1716,6 +1725,23 @@ mod tests {
     #[test]
     fn a_well_formed_request_validates() {
         assert!(validate(&valid()).is_ok());
+    }
+
+    #[test]
+    fn an_install_says_the_setup_version_when_the_plugin_declares_one() {
+        let out = crate::plugins::install::Installed {
+            id: "aokie".into(),
+            name: "Aokie Phone Bridge".into(),
+            version: "0.1.0".into(),
+            dir: std::path::PathBuf::from("plugins/aokie"),
+            replaced: false,
+        };
+        let plain = install_reply(&out, None);
+        assert_eq!(plain, json!({ "id": "aokie", "name": "Aokie Phone Bridge", "version": "0.1.0", "replaced": false }));
+        let setup = crate::setup::Declared { version: 2, title: "Set up the AI Receptionist".into(), steps: vec![] };
+        let with = install_reply(&out, Some(&setup));
+        assert_eq!(with["setup"], json!({ "version": 2, "title": "Set up the AI Receptionist" }));
+        assert!(with.get("dir").is_none(), "the folder (and the OS username in it) stays on the desktop");
     }
 
     #[test]

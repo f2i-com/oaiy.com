@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "plugins": [
+    {
+      "id": "aokie",
+      "name": "AI Receptionist",
+      "plugin": "Aokie Phone Bridge",
+      "publisher": "Aokie",
+      "description": "Answers your business phone's calls and texts with OAIY's agent, through a Bluetooth adapter paired with the phone. Brings the phone and the Calendar to OAIY.",
+      "provides": ["phone", "calendar"],
+      "needs": "A Bluetooth USB adapter, and the phone to pair with it.",
+      "source": {
+        "kind": "folder",
+        "note": "Aokie is not published for download yet. Install it from its plugin folder: an unpacked Aokie release (aokie-plugin-windows-<version>.zip), or the bundle folder a build of the Aokie repository makes.",
+        "lookIn": [
+          "{exeDir}/plugins/aokie",
+          "{sources}/aokie",
+          "{repo}/../aokie.com/bundle"
+        ]
+      }
+    }
+  ]
+}

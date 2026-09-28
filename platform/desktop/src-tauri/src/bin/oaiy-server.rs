@@ -20,6 +20,11 @@
 //!   OAIY_LLAMACPP_MMPROJ mmproj projector for vision/audio input  [none]
 //!                       (the headless equivalent of the Model selector)
 //!   OAIY_OLLAMA_MODEL    model the ollama service uses (${ollamaModel}) [qwen2.5:0.5b]
+//!   OAIY_ENGINES_UI      the engines' control pages, when oaiy-studio runs beside
+//!                       this server (e.g. http://127.0.0.1:7860): /api/engines*
+//!                       reads and relays them                   [none]
+//!   OAIY_PLUGIN_SOURCES  a folder of plugin folders the setup wizard's catalog
+//!                       offers to install from (<dir>/<plugin id>) [none]
 //!
 //! With no OAIY_SERVER_TOKEN set, privileged routes (define service / install
 //! python / create venv / delete) are CLOSED: a headless server has no real
@@ -434,6 +439,12 @@ async fn main() {
         companion: companion.clone(),
         upstream: companion_upstream.clone(),
     });
+
+    // The engines, when a studio runs beside this server: the GUI finds or
+    // starts them itself (engines.rs); a headless server is told where they are.
+    if let Some(ui) = std::env::var("OAIY_ENGINES_UI").ok().map(|u| u.trim().trim_end_matches('/').to_string()).filter(|u| !u.is_empty()) {
+        http::set_engines_ui(&ui);
+    }
 
     // gui_mode = false: headless server is token-strict (no webview origin).
     if let Err(e) = http::serve(

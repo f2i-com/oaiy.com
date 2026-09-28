@@ -732,7 +732,10 @@ fn is_privileged_path(method: &Method, path: &str) -> bool {
                     | "/api/python/venvs"
                     | "/api/python/install"
                     | "/api/node/install"
+                    // Starts a download of gigabytes into the engines' folder.
+                    | "/api/engines/downloads"
             ) || (path.starts_with("/api/services/") && path.ends_with("/uninstall"))
+                || is_setup_path(path)
                 || is_bridge_exec_path(path)
                 || is_ai_exec_path(path)
                 || is_personal_path(path)
@@ -740,7 +743,7 @@ fn is_privileged_path(method: &Method, path: &str) -> bool {
         Method::PATCH => is_personal_path(path),
         // PUT is only used by the bridge (flow documents). A flow doc is
         // executable code the worker hands to the CLI, so it is exec surface.
-        Method::PUT => is_bridge_exec_path(path) || is_personal_path(path),
+        Method::PUT => is_bridge_exec_path(path) || is_personal_path(path) || is_setup_path(path),
         Method::DELETE => {
             path.starts_with("/api/services/")
                 || path.starts_with("/api/models/")
@@ -795,6 +798,179 @@ async fn engines_status() -> axum::response::Response {
         "gpus": system.get("gpus"),
     }))
     .into_response()
+}
+
+// ------- the engines' catalog and downloads, relayed -------
+//
+// The setup wizard offers the language model (and what other groups need)
+// from the engines' own catalog, and downloads it with progress, without the
+// window reaching the engines' control port (it answers only its own origin).
+// The model the person chose in Engines is the discovery document's
+// `defaults.<group>` (the document the gateway serves as `/v1/discovery`,
+// which the control port serves as `/api/discovery`): nothing here names a
+// model of its own.
+
+fn engines_ui() -> Option<String> {
+    ENGINES_UI.read().ok().and_then(|g| g.clone())
+}
+
+/// The message when no engines are there to relay to.
+const ENGINES_NOT_RUNNING: &str = "The engines are not running: they start with OAIY, or run oaiy-studio.";
+
+async fn studio_json(ui: &str, method: reqwest::Method, path: &str, body: Option<serde_json::Value>) -> Result<serde_json::Value, (u16, String)> {
+    let mut req = reqwest::Client::new().request(method, format!("{ui}{path}")).timeout(std::time::Duration::from_secs(10));
+    if let Some(body) = body {
+        req = req.json(&body);
+    }
+    let resp = req.send().await.map_err(|e| (502, format!("the engines did not answer: {e}")))?;
+    let status = resp.status().as_u16();
+    let value: serde_json::Value = resp.json().await.map_err(|e| (502, format!("the engines' answer could not be read: {e}")))?;
+    if (200..300).contains(&status) {
+        Ok(value)
+    } else {
+        let message = value.get("error").and_then(|e| e.as_str().map(str::to_string).or_else(|| e.get("message").and_then(|m| m.as_str()).map(str::to_string)));
+        Err((status, message.unwrap_or_else(|| format!("the engines answered {status}"))))
+    }
+}
+
+/// One download as the window reads it (camelCase, only what it shows).
+fn engine_download(d: &serde_json::Value) -> serde_json::Value {
+    if d.is_null() {
+        return serde_json::Value::Null;
+    }
+    serde_json::json!({
+        "id": d.get("id"),
+        "status": d.get("status"),
+        "done": d.get("done"),
+        "total": d.get("total"),
+        "file": d.get("file"),
+        "filesDone": d.get("files_done"),
+        "filesTotal": d.get("files_total"),
+        "speed": d.get("speed"),
+        "error": d.get("error"),
+    })
+}
+
+/// One catalog model as the window reads it.
+fn engine_model(m: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "id": m.get("id"),
+        "group": m.get("group"),
+        "name": m.get("name"),
+        "about": m.get("about"),
+        "license": m.get("license"),
+        "sizeGb": m.get("size_gb"),
+        "vramGb": m.get("vram_gb"),
+        "recommended": m.get("recommended").and_then(|r| r.as_bool()).unwrap_or(false),
+        "needs": m.get("needs").cloned().unwrap_or_else(|| serde_json::json!([])),
+        "installed": m.get("installed").and_then(|r| r.as_bool()).unwrap_or(false),
+        "partial": m.get("partial").and_then(|r| r.as_bool()).unwrap_or(false),
+        "download": engine_download(m.get("download").unwrap_or(&serde_json::Value::Null)),
+    })
+}
+
+fn engine_downloads(state: &serde_json::Value) -> Vec<serde_json::Value> {
+    state
+        .get("models")
+        .and_then(|m| m.as_array())
+        .map(|models| models.iter().filter_map(|m| m.get("download").filter(|d| !d.is_null()).map(engine_download)).collect())
+        .unwrap_or_default()
+}
+
+/// The catalog at `ui` (none: the engines are not running), with the models
+/// chosen in Engines (`defaults`, from its discovery document; `null` for a
+/// group with none).
+pub(crate) async fn engines_catalog_at(ui: Option<String>) -> serde_json::Value {
+    let Some(ui) = ui else {
+        return serde_json::json!({ "running": false, "error": ENGINES_NOT_RUNNING });
+    };
+    let (state, discovery) = tokio::join!(
+        studio_json(&ui, reqwest::Method::GET, "/api/downloads", None),
+        studio_json(&ui, reqwest::Method::GET, "/api/discovery", None)
+    );
+    let state = match state {
+        Ok(s) => s,
+        Err((_, e)) => return serde_json::json!({ "running": false, "error": e }),
+    };
+    let defaults: serde_json::Map<String, serde_json::Value> = discovery
+        .ok()
+        .and_then(|d| d.get("defaults").and_then(|d| d.as_object()).cloned())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(group, m)| (group, m.as_str().map(str::trim).filter(|m| !m.is_empty()).map_or(serde_json::Value::Null, |m| serde_json::Value::String(m.to_string()))))
+        .collect();
+    serde_json::json!({
+        "running": true,
+        "dir": state.get("dir"),
+        "free": state.get("free"),
+        "groups": state.get("groups").cloned().unwrap_or_else(|| serde_json::json!([])),
+        "models": state.get("models").and_then(|m| m.as_array()).map(|m| m.iter().map(engine_model).collect::<Vec<_>>()).unwrap_or_default(),
+        "defaults": defaults,
+    })
+}
+
+/// The downloads at `ui`, as they stand.
+pub(crate) async fn engines_downloads_at(ui: Option<String>) -> serde_json::Value {
+    let Some(ui) = ui else {
+        return serde_json::json!({ "running": false, "downloads": [], "error": ENGINES_NOT_RUNNING });
+    };
+    match studio_json(&ui, reqwest::Method::GET, "/api/downloads", None).await {
+        Ok(state) => serde_json::json!({ "running": true, "downloads": engine_downloads(&state) }),
+        Err((_, e)) => serde_json::json!({ "running": false, "downloads": [], "error": e }),
+    }
+}
+
+/// A catalog id: what the engines' catalog names its models with.
+fn catalog_id(id: &str) -> bool {
+    (1..=80).contains(&id.len())
+        && id.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
+        && id.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+}
+
+/// Start downloading catalog model `id` at `ui`, into the engines' own
+/// download folder (no folder is ever passed on).
+pub(crate) async fn engines_download_at(ui: Option<String>, id: &str) -> Result<serde_json::Value, (u16, String)> {
+    if !catalog_id(id) {
+        return Err((400, format!("{id:?} is not a catalog model id")));
+    }
+    let ui = ui.ok_or((409, ENGINES_NOT_RUNNING.to_string()))?;
+    let state = studio_json(&ui, reqwest::Method::POST, "/api/downloads", Some(serde_json::json!({ "id": id }))).await?;
+    Ok(serde_json::json!({ "running": true, "downloads": engine_downloads(&state) }))
+}
+
+/// `GET /api/engines/catalog`
+async fn engines_catalog() -> axum::response::Response {
+    Json(engines_catalog_at(engines_ui()).await).into_response()
+}
+
+/// `GET /api/engines/downloads`
+async fn engines_downloads() -> axum::response::Response {
+    Json(engines_downloads_at(engines_ui()).await).into_response()
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EngineDownloadBody {
+    id: String,
+}
+
+/// `POST /api/engines/downloads {id}`: download a model from the engines' catalog.
+async fn engines_download_start(Json(body): Json<EngineDownloadBody>) -> axum::response::Response {
+    match engines_download_at(engines_ui(), body.id.trim()).await {
+        Ok(v) => Json(v).into_response(),
+        Err((status, message)) => (
+            StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
+            Json(serde_json::json!({ "error": message })),
+        )
+            .into_response(),
+    }
+}
+
+/// The setup wizard's record and its checks (`setup.rs`). Changing it is
+/// privileged: accepting a plugin's capabilities is a trust act, and a check
+/// runs one of the plugin's commands. Reading it is a restricted read.
+fn is_setup_path(path: &str) -> bool {
+    path == "/api/setup" || path.starts_with("/api/setup/")
 }
 
 /// Calls, the calendar and flows' tasks for the agent: callers' numbers and words, customers' names and
@@ -931,8 +1107,12 @@ fn is_restricted_read_path(path: &str) -> bool {
         // arbitrary remote page; a paired token or a trusted origin passes.
         || path.starts_with("/api/ai/")
         || is_personal_path(path)
-        // Which models are loaded, the GPUs, the engines' address.
+        // Which models are loaded, the GPUs, the engines' address; their
+        // catalog, the models chosen and the downloads.
         || path == "/api/engines"
+        || path.starts_with("/api/engines/")
+        // How far setup got, which plugins were chosen, what was accepted.
+        || is_setup_path(path)
 }
 
 /// Stricter allow-list for privileged endpoints: OAIY Desktop's OWN webview and
@@ -1242,6 +1422,21 @@ pub async fn serve(
     }
     // Which modules (the phone, the calendar) a plugin provides: worked out now, then kept up to date.
     crate::modules::start(bridge.plugins.clone());
+    // The setup wizard's record. Made now when there is none, so a desktop
+    // already in use is recorded as set up before any window asks.
+    let setup_routes = {
+        let data_dir = registry.lock().map(|r| r.data_dir().to_path_buf()).ok();
+        let plugins_root = bridge.plugins.lock().map(|r| r.root().to_path_buf()).ok();
+        let providers = ai_providers.lock().map(|s| s.list()).unwrap_or_default();
+        let data_dir = data_dir.unwrap_or_else(|| std::env::temp_dir().join("oaiy-setup-unavailable"));
+        let store = crate::setup::Store::open(&data_dir, || {
+            crate::setup::in_use_signal(&data_dir, plugins_root.as_deref().unwrap_or(&data_dir.join("plugins")), &providers)
+        });
+        if let Some(why) = &store.state().first_run.migrated {
+            log::info!("setup: first-run wizard recorded as finished ({why})");
+        }
+        crate::setup::router(crate::setup::Ctx::new(store, bridge.plugins.clone(), bridge.host.clone()))
+    };
 
     let state = AppState {
         config,
@@ -1333,7 +1528,10 @@ pub async fn serve(
         .merge(crate::calendar::routes::router())
         .merge(crate::modules::routes::router())
         .merge(crate::agent_tasks::router())
+        .merge(setup_routes)
         .route("/api/engines", axum::routing::get(engines_status))
+        .route("/api/engines/catalog", axum::routing::get(engines_catalog))
+        .route("/api/engines/downloads", axum::routing::get(engines_downloads).post(engines_download_start))
         .merge(companion_routes)
         .merge(link_routes)
         .merge(ai_routes)
@@ -1695,12 +1893,137 @@ mod tests {
             "/api/bridge/runs/run_1",
             "/api/bridge/flows",
             "/api/bridge/triggers",
+            // The setup wizard's record: how far setup got and what was accepted.
+            "/api/setup",
+            "/api/setup/catalog",
+            "/api/setup/plugins/aokie",
+            // The engines' catalog, the models chosen in Engines, the downloads.
+            "/api/engines",
+            "/api/engines/catalog",
+            "/api/engines/downloads",
         ] {
             assert!(
                 is_restricted_read_path(path),
                 "{path} leaks data and must be a restricted read"
             );
         }
+        assert!(!is_restricted_read_path("/api/setupx"));
+    }
+
+    #[test]
+    fn setup_changes_and_engine_downloads_are_privileged() {
+        // Accepting a plugin's capabilities is a trust act, and a check runs one
+        // of the plugin's commands: a local page must reach neither.
+        for (m, path) in [
+            (Method::PUT, "/api/setup"),
+            (Method::POST, "/api/setup/plugins/aokie/steps/permissions"),
+            (Method::POST, "/api/setup/plugins/aokie/finish"),
+            (Method::POST, "/api/setup/plugins/aokie/check/pair"),
+            // Gigabytes into the engines' folder.
+            (Method::POST, "/api/engines/downloads"),
+        ] {
+            assert!(is_privileged_path(&m, path), "{m} {path} must be privileged");
+        }
+        assert!(!is_privileged_path(&Method::GET, "/api/setup"));
+    }
+
+    /// A stand-in for the engines' control port: their catalog with one model
+    /// downloading, a discovery document, and a download route that records
+    /// what it was asked.
+    async fn fake_studio(chosen: &'static str) -> (String, std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>, tokio::task::JoinHandle<()>) {
+        use axum::routing::get;
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let state = || {
+            serde_json::json!({
+                "dir": "D:/models", "free": 123_000_000_000u64, "token": false,
+                "groups": [{ "id": "llm", "name": "Chat", "about": "Language models." }],
+                "models": [
+                    { "id": "qwen3.5-9b", "group": "llm", "name": "Qwen3.5 9B", "about": "A strong all-round chat model.", "license": "Apache-2.0",
+                      "size_gb": 5.7, "vram_gb": 8, "recommended": true, "installed": false, "partial": false,
+                      "download": { "id": "qwen3.5-9b", "dir": "D:/models", "status": "downloading", "done": 1024, "total": 4096, "file": "Qwen3.5-9B-Q4_K_M.gguf",
+                                    "files_done": 0, "files_total": 1, "speed": 2.5, "error": null, "added": [] } },
+                    { "id": "qwen3-4b", "group": "llm", "name": "Qwen3 4B", "size_gb": 2.5, "vram_gb": 4, "installed": true, "partial": false, "download": null }
+                ]
+            })
+        };
+        let recorder = asked.clone();
+        let app = axum::Router::new()
+            .route("/api/downloads", get(move || async move { axum::Json(state()) }).post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                let recorder = recorder.clone();
+                async move {
+                    recorder.lock().unwrap().push(body.clone());
+                    if body["id"] == "nope" {
+                        return (axum::http::StatusCode::BAD_REQUEST, axum::Json(serde_json::json!({ "error": "no model nope in the catalog" })));
+                    }
+                    (axum::http::StatusCode::OK, axum::Json(state()))
+                }
+            }))
+            .route("/api/discovery", get(move || async move { axum::Json(serde_json::json!({ "defaults": { "llm": chosen, "image": "" } })) }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ui = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (ui, asked, server)
+    }
+
+    #[tokio::test]
+    async fn the_engines_catalog_is_relayed_with_the_model_chosen_in_engines() {
+        let (ui, _, server) = fake_studio("Qwen3.8-Flash-Next").await;
+        let v = super::engines_catalog_at(Some(ui)).await;
+        assert_eq!(v["running"], true);
+        // The model chosen in Engines, as its discovery document says: never one of ours.
+        assert_eq!(v["defaults"]["llm"], "Qwen3.8-Flash-Next");
+        assert_eq!(v["defaults"]["image"], serde_json::Value::Null, "an empty default is no model");
+        let first = &v["models"][0];
+        assert_eq!(first["id"], "qwen3.5-9b");
+        assert_eq!(first["recommended"], true);
+        assert_eq!((first["sizeGb"].as_f64(), first["vramGb"].as_i64()), (Some(5.7), Some(8)));
+        assert_eq!(first["download"]["filesTotal"], 1);
+        assert_eq!(first["download"]["done"], 1024);
+        assert_eq!(v["models"][1]["installed"], true);
+        assert_eq!(v["models"][1]["download"], serde_json::Value::Null);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn with_no_model_chosen_the_default_is_null() {
+        let (ui, _, server) = fake_studio("").await;
+        let v = super::engines_catalog_at(Some(ui)).await;
+        assert_eq!(v["defaults"]["llm"], serde_json::Value::Null);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn downloads_are_relayed_and_only_a_catalog_id_is_passed_on() {
+        let (ui, asked, server) = fake_studio("").await;
+        let v = super::engines_downloads_at(Some(ui.clone())).await;
+        assert_eq!(v["running"], true);
+        assert_eq!(v["downloads"].as_array().unwrap().len(), 1, "only the models downloading");
+        assert_eq!(v["downloads"][0]["status"], "downloading");
+
+        let v = super::engines_download_at(Some(ui.clone()), "qwen3.5-9b").await.unwrap();
+        assert_eq!(v["downloads"][0]["id"], "qwen3.5-9b");
+        // The engines' own folder: no folder is ever passed on.
+        assert_eq!(asked.lock().unwrap().last().unwrap(), &serde_json::json!({ "id": "qwen3.5-9b" }));
+
+        let refused = super::engines_download_at(Some(ui.clone()), "nope").await.unwrap_err();
+        assert_eq!(refused, (400, "no model nope in the catalog".to_string()));
+        let before = asked.lock().unwrap().len();
+        for bad in ["", "../x", "a b", "x/y"] {
+            assert_eq!(super::engines_download_at(Some(ui.clone()), bad).await.unwrap_err().0, 400, "{bad:?}");
+        }
+        assert_eq!(asked.lock().unwrap().len(), before, "a bad id never reaches the engines");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn with_no_engines_the_relay_says_so() {
+        assert_eq!(super::engines_catalog_at(None).await["running"], false);
+        assert_eq!(super::engines_downloads_at(None).await["downloads"], serde_json::json!([]));
+        assert_eq!(super::engines_download_at(None, "qwen3.5-9b").await.unwrap_err().0, 409);
+        // Engines that went away since: not running, and why.
+        let v = super::engines_catalog_at(Some("http://127.0.0.1:9".into())).await;
+        assert_eq!(v["running"], false);
+        assert!(v["error"].as_str().unwrap().contains("did not answer"));
     }
 
     #[test]

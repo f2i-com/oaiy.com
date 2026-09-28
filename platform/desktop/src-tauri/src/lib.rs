@@ -16,6 +16,8 @@ pub mod voice;
 pub mod calendar;
 pub mod modules;
 pub mod agent_tasks;
+/// The setup wizard's record (`<data>/setup.json`) and routes.
+pub mod setup;
 
 /// Port the localhost API binds to. Fixed so oaiy-web's detection probe has a
 /// stable target. Shared by both binaries (the GUI and the headless server).
@@ -1326,6 +1328,7 @@ pub fn run() {
             crate::embed::show_embedded,
             crate::embed::hide_embedded,
             crate::embed::set_theme,
+            crate::embed::agent_intent,
             open_path,
             log_path,
             open_url,

@@ -248,6 +248,29 @@ pub async fn set_theme<R: Runtime>(app: AppHandle<R>, mode: String) -> Result<()
     Ok(())
 }
 
+/// What the dashboard may ask the agent's page to do, by name only: the setup
+/// wizard's "Answer calls and texts with OAIY" (the agent's own settings live
+/// in its page's storage, which only the page can change).
+const AGENT_INTENTS: [&str; 1] = ["answerWithOaiy"];
+
+/// Hands an intent to the agent's page: its `__oaiyIntent`, or, while the
+/// page is still starting, where it looks when it starts.
+fn intent_script(intent: &str) -> String {
+    format!("window.__oaiyIntent ? window.__oaiyIntent({intent:?}) : (window.__OAIY_INTENTS__ = (window.__OAIY_INTENTS__ || []).concat([{intent:?}]));")
+}
+
+/// Ask the agent's page (made at startup, hidden) to do one of `AGENT_INTENTS`.
+#[tauri::command]
+pub async fn agent_intent<R: Runtime>(app: AppHandle<R>, intent: String) -> Result<(), String> {
+    if !AGENT_INTENTS.contains(&intent.as_str()) {
+        return Err(format!("no agent intent called {intent}"));
+    }
+    let webview = app
+        .get_webview(Page::Agent.label())
+        .ok_or("the Agent is not open: open it once from the sidebar, then try again")?;
+    webview.eval(intent_script(&intent)).map_err(|e| e.to_string())
+}
+
 /// A link that leaves an embedded page: to the system browser.
 fn open_outside<R: Runtime>(app: &AppHandle<R>, url: &Url) {
     use tauri_plugin_shell::ShellExt;
@@ -398,6 +421,15 @@ mod tests {
         assert_eq!(parse_theme("sepia"), None);
         assert!(desktop_script("light").contains(r#"theme: "light""#));
         assert_eq!(theme_script("dark"), r#"window.__oaiySetTheme ? window.__oaiySetTheme("dark") : (window.__OAIY_THEME__ = "dark");"#);
+    }
+
+    #[test]
+    fn the_agent_is_handed_an_intent_by_name_only() {
+        assert_eq!(
+            intent_script("answerWithOaiy"),
+            r#"window.__oaiyIntent ? window.__oaiyIntent("answerWithOaiy") : (window.__OAIY_INTENTS__ = (window.__OAIY_INTENTS__ || []).concat(["answerWithOaiy"]));"#
+        );
+        assert!(!AGENT_INTENTS.contains(&"alert(1)"));
     }
 
     #[test]
