@@ -100,6 +100,12 @@ export class Callbacks {
     /** Aokie's screening now (read when a call back is due). */
     private readonly screening: () => Promise<Screening | null>,
     private readonly changed: () => void = () => {},
+    /**
+     * Whether Aokie sends its calls to OAIY (true), to its own voice (false), or cannot
+     * say (null). On its own voice, FormLogic's follow-ups ring missed calls back:
+     * OAIY does not as well, so no one is rung twice.
+     */
+    private readonly callsToOaiy: () => Promise<boolean | null> = async () => true,
   ) {}
 
   async load(): Promise<void> {
@@ -192,6 +198,14 @@ export class Callbacks {
         await this.save();
         return;
       }
+      const route = await this.callsToOaiy();
+      if (route === false) {
+        Object.assign(next, { state: 'dropped', note: "Calls go to Aokie's own voice, so its follow-ups ring missed calls back." });
+        await this.save();
+        return;
+      }
+      // Cannot say now (the phone away): asked again at the next look.
+      if (route === null) return;
       const when = new Date(next.missedAt).toLocaleString('en-AU', { weekday: 'short', hour: 'numeric', minute: '2-digit' });
       try {
         await desktop.command('aokie', 'call.dial', {

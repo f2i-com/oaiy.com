@@ -414,7 +414,7 @@ async function main(): Promise<void> {
     ));
     await own.load();
     // Missed calls rung back: by the page that answers the calls, when no call is going on.
-    callbacks = new Callbacks(frontDesk, () => messages, () => desktop, () => holdsCalls && !own.list.some((s) => s.callId), readScreening);
+    callbacks = new Callbacks(frontDesk, () => messages, () => desktop, () => holdsCalls && !own.list.some((s) => s.callId), readScreening, () => {}, callsToOaiy);
     await callbacks.load();
     callbacks.start();
     // A call back's call is taken by the agent knowing it rang them, and why.
@@ -428,6 +428,19 @@ async function main(): Promise<void> {
     const read = async (key: string) => ((await d.command('aokie', 'settings.get', { key }, `oaiy:settings.get:${key}:${crypto.randomUUID()}`)) as { value?: unknown } | null)?.value;
     const [accept, blocked, hidden] = await Promise.all([read('acceptPattern'), read('blockedNumbers'), read('rejectPrivate')]);
     return { acceptPattern: typeof accept === 'string' ? accept : '', blockedNumbers: typeof blocked === 'string' ? blocked : '', rejectPrivate: hidden === true || hidden === 'true' };
+  }
+
+  /** Whether Aokie sends its calls to OAIY (its realtime route, with OAIY's provider); null when the phone cannot be asked. */
+  async function callsToOaiy(): Promise<boolean | null> {
+    const d = desktop;
+    if (!d) return null;
+    try {
+      const read = async (key: string) => ((await d.command('aokie', 'settings.get', { key }, `oaiy:settings.get:${key}:${crypto.randomUUID()}`)) as { value?: unknown } | null)?.value;
+      const [mode, endpoint] = await Promise.all([read('realtimeVoiceMode'), read('realtimeVoiceEndpoint')]);
+      return mode === 'desktop_realtime' && typeof endpoint === 'string' && /\/providers\/oaiy\//.test(endpoint);
+    } catch {
+      return null;
+    }
   }
 
   async function saveScreening(screening: Screening): Promise<void> {

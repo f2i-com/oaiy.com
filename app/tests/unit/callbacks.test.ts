@@ -6,7 +6,7 @@ import { callStartNote, isCallStart } from '../../src/sessions';
 
 const ended = (data: Record<string, unknown>): DesktopEvent => ({ seq: 1, name: 'aokie.call.ended', source: 'aokie', correlationId: '', idempotencyKey: '', occurredAt: '', data });
 
-function setup(screening: Screening | null = { acceptPattern: '', blockedNumbers: '', rejectPrivate: false }, refuse = '') {
+function setup(screening: Screening | null = { acceptPattern: '', blockedNumbers: '', rejectPrivate: false }, refuse = '', route: boolean | null = true) {
   let saved: Callback[] = [];
   const project = { loadCallbacks: async () => saved, saveCallbacks: async (list: Callback[]) => void (saved = list) };
   const dials: Array<Record<string, unknown>> = [];
@@ -19,7 +19,7 @@ function setup(screening: Screening | null = { acceptPattern: '', blockedNumbers
   };
   const settings: MessageSettings = { ...DEFAULT_MESSAGE_SETTINGS, callBack: true, callBackFilter: 'answered' };
   let free = true;
-  const callbacks = new Callbacks(project as never, () => settings, () => desktop as unknown as Desktop, () => free, async () => screening);
+  const callbacks = new Callbacks(project as never, () => settings, () => desktop as unknown as Desktop, () => free, async () => screening, () => {}, async () => route);
   return { callbacks, dials, settings, setFree: (f: boolean) => (free = f), saved: () => saved };
 }
 
@@ -100,6 +100,20 @@ describe('missed calls, called back', () => {
     const screening: Screening = { acceptPattern: '', blockedNumbers: '123456, 12345', rejectPrivate: false };
     expect(callsBack('123456', 'any', screening)).toBe(false);
     expect(callsBack('9912345', 'any', screening)).toBe(true);
+  });
+
+  it("calls on Aokie's own voice: its follow-ups ring back, not OAIY; the route unknown, it waits", async () => {
+    const t0 = Date.now();
+    const own = setup(undefined, '', false);
+    await own.callbacks.missed('0400000021', t0);
+    await own.callbacks.tick(t0 + 120_000);
+    expect(own.dials).toHaveLength(0);
+    expect(own.callbacks.list[0]).toMatchObject({ state: 'dropped', note: expect.stringContaining("Aokie's own voice") });
+    const unknown = setup(undefined, '', null);
+    await unknown.callbacks.missed('0400000022', t0);
+    await unknown.callbacks.tick(t0 + 120_000);
+    expect(unknown.dials).toHaveLength(0);
+    expect(unknown.callbacks.list[0]).toMatchObject({ state: 'waiting' });
   });
 
   it('a refusal from the phone (quiet hours, the daily cap) waits and tries again', async () => {
