@@ -202,10 +202,22 @@ pub struct Calendar {
 }
 
 static SHARED: OnceLock<Calendar> = OnceLock::new();
+static DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 /// Open the calendar in `data_dir/calendar` for the whole desktop (once; later calls keep the first).
 pub fn init(data_dir: &Path) -> &'static Calendar {
+    let _ = DATA_DIR.set(data_dir.to_path_buf());
     SHARED.get_or_init(|| Calendar::open(&data_dir.join("calendar"), Some(data_dir.join("flows"))))
+}
+
+/// Whether the calendar is in use: it is the phone receptionist's diary, so it
+/// is there while the Aokie plugin (the phone) is installed. Kept either way.
+pub fn available() -> bool {
+    DATA_DIR.get().is_some_and(|d| receptionist_installed(d))
+}
+
+fn receptionist_installed(data_dir: &Path) -> bool {
+    data_dir.join("plugins").join("aokie").join("manifest.json").is_file()
 }
 
 /// The desktop's calendar, once `init` has run.
@@ -669,6 +681,18 @@ fn weekday_index(w: Weekday) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_calendar_is_there_with_the_phone_receptionist() {
+        let dir = std::env::temp_dir().join(format!("oaiy-calendar-available-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!receptionist_installed(&dir));
+        std::fs::create_dir_all(dir.join("plugins/aokie")).unwrap();
+        assert!(!receptionist_installed(&dir), "a folder alone is not an installed plugin");
+        std::fs::write(dir.join("plugins/aokie/manifest.json"), "{}").unwrap();
+        assert!(receptionist_installed(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     use serde_json::json;
 
     fn calendar() -> (Calendar, PathBuf) {

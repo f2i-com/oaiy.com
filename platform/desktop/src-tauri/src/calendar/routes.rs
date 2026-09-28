@@ -74,7 +74,7 @@ async fn overview(Query(r): Query<Range>) -> Response {
         (Ok(f), Ok(t)) => (f, t),
         (Err(e), _) | (_, Err(e)) => return e,
     };
-    Json(json!({"settings": cal.settings(), "appointments": cal.list(from, to), "now": local_now().format("%Y-%m-%dT%H:%M").to_string()})).into_response()
+    Json(json!({"available": super::available(), "settings": cal.settings(), "appointments": cal.list(from, to), "now": local_now().format("%Y-%m-%dT%H:%M").to_string()})).into_response()
 }
 
 async fn set_settings(Json(s): Json<Settings>) -> Response {

@@ -1160,7 +1160,7 @@ export interface CalendarSync {
 
 export const calendar = {
   get: (from?: string, to?: string) =>
-    request<{ settings: CalendarSettings; appointments: Appointment[]; now: string }>(
+    request<{ available?: boolean; settings: CalendarSettings; appointments: Appointment[]; now: string }>(
       `/api/calendar${from || to ? `?${new URLSearchParams({ ...(from ? { from } : {}), ...(to ? { to } : {}) })}` : ''}`,
     ),
   saveSettings: (s: CalendarSettings) => request<CalendarSettings>('/api/calendar/settings', { method: 'PUT', body: JSON.stringify(s) }),

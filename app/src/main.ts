@@ -154,6 +154,8 @@ async function main(): Promise<void> {
   let flowTools: SessionTool[] = [];
   /** Flows in front of the agents' tools. */
   let toolHooks: ToolHook[] = [];
+  /** The desktop has a calendar (the phone receptionist, Aokie, is installed). */
+  let calendarAvailable = false;
   /** The conversation the chat shows: null for the project's own. */
   let viewing: string | null = null;
 
@@ -328,7 +330,8 @@ async function main(): Promise<void> {
     const flowBuilder = flowBuilderTools(() => desktop);
     const agentOptions = (): AgentOptions => ({
       // Flows made tools, and speech to text: both run on OAIY Desktop.
-      sessionTools: () => (desktop ? [...flowTools, transcribe, ...calendar, ...flowBuilder] : flowTools),
+      // The calendar's tools only while there is one (the phone receptionist is installed).
+      sessionTools: () => (desktop ? [...flowTools, transcribe, ...(calendarAvailable ? calendar : []), ...flowBuilder] : flowTools),
       toolHooks: () => toolHooks,
       vfs: project.vfs,
       gate,
@@ -1180,6 +1183,7 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
     }
     try {
       const taken = new Set([...TOOLS.map((t) => t.name), 'send_text_message', 'end_call', 'request_appointment', 'lookup_business_data', 'guide', 'update_plan', 'delegate', TRANSCRIBE_TOOL, 'calendar_free_times', 'calendar_list', 'calendar_book', 'calendar_change', 'flow_nodes', 'flow_list', 'flow_read', 'flow_write', 'flow_run']);
+      calendarAvailable = (await d.calendar(undefined, undefined, AbortSignal.timeout(5_000)).catch(() => null))?.available !== false;
       const store = await readFlowStore(d, AbortSignal.timeout(10_000));
       flowTools = flowSessionTools(store.tools, () => desktop, taken);
       toolHooks = flowToolHooks(store.hooks, () => desktop);

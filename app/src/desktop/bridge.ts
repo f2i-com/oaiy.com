@@ -258,7 +258,7 @@ export class Desktop {
   }
 
   /** The desktop's calendar: its settings, and the appointments from `from` (YYYY-MM-DD) to before `to`. */
-  async calendar(from?: string, to?: string, signal?: AbortSignal): Promise<{ settings: Record<string, unknown>; appointments: Array<Record<string, unknown>>; now: string }> {
+  async calendar(from?: string, to?: string, signal?: AbortSignal): Promise<{ available?: boolean; settings: Record<string, unknown>; appointments: Array<Record<string, unknown>>; now: string }> {
     const q = new URLSearchParams({ ...(from ? { from } : {}), ...(to ? { to } : {}) }).toString();
     const body = await reply(await fetch(`${this.origin}/api/calendar${q ? `?${q}` : ''}`, { headers: this.headers(), signal }));
     return isRecord(body) ? (body as { settings: Record<string, unknown>; appointments: Array<Record<string, unknown>>; now: string }) : { settings: {}, appointments: [], now: '' };

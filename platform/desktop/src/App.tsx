@@ -196,6 +196,8 @@ export default function App() {
   const [view, setView] = useState<View>('overview');
   /** Nav entries contributed by installed plugins (`manifest.ui.nav[]`). */
   const [pluginNav, setPluginNav] = useState<PluginNavEntry[]>([]);
+  /** The phone receptionist (the Aokie plugin) is installed: the calendar is its diary. `null` until known. */
+  const [receptionist, setReceptionist] = useState<boolean | null>(null);
   /** Views already opened this session — they skip the entrance animation. */
   const visited = useRef<Set<string>>(new Set()).current;
   const [theme, setThemeState] = useState<ThemeMode>(initialTheme);
@@ -287,6 +289,7 @@ export default function App() {
           }
         }
         setPluginNav(entries);
+        setReceptionist(snap.plugins.some((p) => p.id === 'aokie'));
       } catch {
         /* the Plugins panel surfaces the error; the nav just stays as it was */
       }
@@ -298,6 +301,11 @@ export default function App() {
       window.clearInterval(id);
     };
   }, []);
+
+  // The calendar goes with the phone receptionist: on it when that is removed, go to Overview.
+  useEffect(() => {
+    if (view === 'calendar' && receptionist === false) setView('overview');
+  }, [view, receptionist]);
 
   // A plugin screen the user is on can disappear (plugin removed/disabled) —
   // fall back to Overview rather than rendering a dead page.
@@ -347,7 +355,7 @@ export default function App() {
         </div>
 
         <nav aria-label="Primary">
-          {NAV.map((item) => {
+          {NAV.filter((item) => item.value !== 'calendar' || receptionist === true).map((item) => {
             const Icon = item.icon;
             return [
               item.group && (

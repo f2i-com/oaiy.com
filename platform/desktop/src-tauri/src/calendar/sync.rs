@@ -62,7 +62,10 @@ pub fn spawn(link: LinkHandle) {
         .name("calendar-sync".into())
         .spawn(|| loop {
             std::thread::sleep(Duration::from_secs(20));
-            let _ = now();
+            // Only while the phone receptionist (and so the calendar) is installed.
+            if super::available() {
+                let _ = now();
+            }
             std::thread::sleep(EVERY.saturating_sub(Duration::from_secs(20)));
         })
         .ok();

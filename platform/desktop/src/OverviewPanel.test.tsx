@@ -19,6 +19,7 @@ const { servicesMock, pluginsMock, providersMock, pairedMock, statusMock, nodeIn
     nodeInstallMock: vi.fn(),
   }));
 
+const calendarMock = vi.hoisted(() => vi.fn());
 vi.mock('./api', () => ({
   services: { list: servicesMock },
   plugins: { list: pluginsMock },
@@ -30,7 +31,7 @@ vi.mock('./api', () => ({
   openExternal: vi.fn(),
   // Today's tiles (TodayPanel): nothing to show.
   phone: { status: vi.fn().mockRejectedValue(new Error('no phone')), calls: vi.fn().mockRejectedValue(new Error('no phone')) },
-  calendar: { get: vi.fn().mockRejectedValue(new Error('no calendar')) },
+  calendar: { get: (...a: unknown[]) => calendarMock(...a) },
   engines: { status: vi.fn().mockRejectedValue(new Error('no engines')) },
 }));
 
@@ -72,6 +73,7 @@ beforeEach(() => {
   });
   pairedMock.mockResolvedValue({ paired: [] });
   statusMock.mockResolvedValue(runtime(3));
+  calendarMock.mockRejectedValue(new Error('no calendar'));
   host = document.createElement('div');
   document.body.appendChild(host);
   root = createRoot(host);
@@ -81,6 +83,22 @@ afterEach(() => {
   act(() => root.unmount());
   host.remove();
   reopenGuide();
+});
+
+describe("Today's tiles", () => {
+  it('shows the phone and its calendar only while the phone receptionist is installed', async () => {
+    calendarMock.mockResolvedValue({ available: true, settings: {}, appointments: [], now: '' });
+    await mount();
+    expect(text()).toContain('The phone');
+    expect(text()).toContain('Next appointment');
+    act(() => root.unmount());
+    root = createRoot(host);
+    calendarMock.mockResolvedValue({ available: false, settings: {}, appointments: [], now: '' });
+    await mount();
+    expect(text()).not.toContain('The phone');
+    expect(text()).not.toContain('Next appointment');
+    expect(text()).toContain('Language model');
+  });
 });
 
 describe('OverviewPanel failure reporting', () => {

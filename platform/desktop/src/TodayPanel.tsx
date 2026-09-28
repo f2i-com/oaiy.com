@@ -28,12 +28,15 @@ export default function TodayPanel({ onNavigate }: { onNavigate: (view: 'agent' 
   const [phoneState, setPhoneState] = useState<{ connected: boolean; onCall: boolean } | null>(null);
   const [model, setModel] = useState<EnginesStatus | null>(null);
   const [upcoming, setUpcoming] = useState<Appointment[] | null>(null);
+  /** The phone receptionist is installed: the phone and its calendar are shown. */
+  const [receptionist, setReceptionist] = useState(true);
 
   const refresh = useCallback(async () => {
     const [p, calls, e, cal] = await Promise.allSettled([phone.status(), phone.calls(), engines.status(), calendar.get(ymd(new Date()))]);
     setPhoneState(p.status === 'fulfilled' ? { connected: p.value.connected, onCall: calls.status === 'fulfilled' && calls.value.length > 0 } : null);
     setModel(e.status === 'fulfilled' ? e.value : null);
     if (cal.status === 'fulfilled') {
+      setReceptionist(cal.value.available !== false);
       const now = `${ymd(new Date())}T${pad(new Date().getHours())}:${pad(new Date().getMinutes())}`;
       setUpcoming(cal.value.appointments.filter((a) => (a.status === 'confirmed' || a.status === 'requested') && a.start >= now));
     }
@@ -57,26 +60,32 @@ export default function TodayPanel({ onNavigate }: { onNavigate: (view: 'agent' 
         <h3 className="section-title">Today</h3>
       </div>
       <div className="overview-grid today-grid">
-        <button className="overview-tile" onClick={() => onNavigate('agent')} title="Calls and texts are answered by the agent">
-          <Phone size={16} aria-hidden />
-          <strong className={phoneState?.connected ? 'ok' : 'warn'}>{phoneState === null ? '—' : phoneState.onCall ? 'On a call' : phoneState.connected ? 'Connected' : 'Not connected'}</strong>
-          <small>The phone</small>
-        </button>
+        {receptionist && (
+          <button className="overview-tile" onClick={() => onNavigate('agent')} title="Calls and texts are answered by the agent">
+            <Phone size={16} aria-hidden />
+            <strong className={phoneState?.connected ? 'ok' : 'warn'}>{phoneState === null ? '—' : phoneState.onCall ? 'On a call' : phoneState.connected ? 'Connected' : 'Not connected'}</strong>
+            <small>The phone</small>
+          </button>
+        )}
         <button className="overview-tile" onClick={() => onNavigate('engines')} title={llm?.resident ? `${llm.resident}: ${llm.state}` : 'The engines'}>
           <Cpu size={16} aria-hidden />
           <strong className={llm?.state === 'ready' ? 'ok' : undefined}>{model === null ? '—' : !model.running ? 'Engines off' : llm?.state === 'ready' ? 'Model ready' : llm?.state === 'loading' ? 'Loading…' : 'Loads on use'}</strong>
           <small>{llm?.resident ?? 'Language model'}</small>
         </button>
-        <button className="overview-tile" onClick={() => onNavigate('calendar')}>
-          <CalendarClock size={16} aria-hidden />
-          <strong>{upcoming === null ? '—' : next ? sayWhen(next.start) : 'Nothing booked'}</strong>
-          <small>{next ? `${next.service || 'Appointment'}${next.name ? `, ${next.name}` : ''}` : 'Next appointment'}</small>
-        </button>
-        <button className="overview-tile" onClick={() => onNavigate('calendar')}>
-          <Inbox size={16} aria-hidden />
-          <strong className={requests.length ? 'warn' : undefined}>{upcoming === null ? '—' : requests.length}</strong>
-          <small>{requests.length === 1 ? 'Request to confirm' : 'Requests to confirm'}</small>
-        </button>
+        {receptionist && (
+          <>
+            <button className="overview-tile" onClick={() => onNavigate('calendar')}>
+              <CalendarClock size={16} aria-hidden />
+              <strong>{upcoming === null ? '—' : next ? sayWhen(next.start) : 'Nothing booked'}</strong>
+              <small>{next ? `${next.service || 'Appointment'}${next.name ? `, ${next.name}` : ''}` : 'Next appointment'}</small>
+            </button>
+            <button className="overview-tile" onClick={() => onNavigate('calendar')}>
+              <Inbox size={16} aria-hidden />
+              <strong className={requests.length ? 'warn' : undefined}>{upcoming === null ? '—' : requests.length}</strong>
+              <small>{requests.length === 1 ? 'Request to confirm' : 'Requests to confirm'}</small>
+            </button>
+          </>
+        )}
       </div>
     </section>
   );
