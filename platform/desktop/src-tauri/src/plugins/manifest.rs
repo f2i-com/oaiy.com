@@ -25,7 +25,9 @@
 //! update, approved `call.dial` and `sms.send` without being asked. Expanding at
 //! load time makes the grant a fixed list you can show someone.
 
-use serde::{Deserialize, Serialize};
+use serde::de::Error as _;
+use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::Value;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
@@ -39,8 +41,29 @@ pub const SUPPORTED_PLUGIN_API: std::ops::RangeInclusive<u32> = 1..=1;
 /// Manifest `schemaVersion` values this host can read.
 ///
 /// Aokie ships `3`. Older first-party manifests exist at `1` and `2`, and the
-/// differences are additive, so all three parse.
-pub const SUPPORTED_SCHEMA_VERSIONS: std::ops::RangeInclusive<u32> = 1..=3;
+/// differences are additive, so all of them parse. `4` adds `modules`,
+/// `agentTools` and `setup` (see [`V4_SECTIONS`]).
+pub const SUPPORTED_SCHEMA_VERSIONS: std::ops::RangeInclusive<u32> = 1..=4;
+
+/// The sections schemaVersion 4 adds. Under an older schemaVersion each is
+/// refused, not half-honoured: a host that predates the section would ignore
+/// it, and a plugin that believes it declared something it did not is worse
+/// than one that fails to load.
+pub const V4_SECTIONS: &[&str] = &["modules", "agentTools", "setup"];
+
+/// This desktop's version, which a manifest's `minDesktopVersion` is held to.
+pub const DESKTOP_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Where an agent tool may be offered: the project conversation, the Front
+/// desk's runner, or one of the Front desk's own conversations.
+pub const AGENT_AUDIENCES: &[&str] = &["project", "runner", "session:sms", "session:call", "session:task"];
+
+/// The audience of an agent tool that does not name one.
+pub const DEFAULT_AGENT_AUDIENCE: &str = "project";
+
+/// The host's own setup steps a plugin's `setup` may use (`kind: "host"`).
+/// Another action is left out with a warning, so a newer plugin still loads.
+pub const HOST_SETUP_ACTIONS: &[&str] = &["phone.answerWithOaiy", "calendar.business"];
 
 /// Cap on the declared capability surface, after wildcard expansion. A plugin
 /// asking for thousands of capabilities is either broken or hostile, and an
@@ -137,16 +160,469 @@ pub struct PluginManifest {
     pub events: Vec<String>,
     #[serde(default)]
     pub commands: Option<CommandsDecl>,
+    /// schemaVersion 4: the built-in modules this plugin provides (the phone,
+    /// the calendar). Read by `modules::claims`; without it, the plugin id
+    /// `aokie` provides both (the legacy rule).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modules: Option<ModulesDecl>,
+    /// schemaVersion 4: the plugin's own service-definition actions offered
+    /// to the agent as tools.
+    #[serde(default, skip_serializing_if = "Vec::is_empty", deserialize_with = "de_agent_tools")]
+    pub agent_tools: Vec<AgentToolDecl>,
+    /// schemaVersion 4: the plugin's setup wizard.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setup: Option<SetupDecl>,
     /// Unknown keys (`ui`, `data`, `serviceDefinitions`, …) are retained rather
     /// than rejected: the manifest schema is additive within a major, so a
     /// newer plugin must not be refused for carrying a field this host has no
     /// opinion about.
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
+    /// What loading it found worth saying without refusing it (a setup step
+    /// this host cannot run, an unreadable `minDesktopVersion`). Shown in
+    /// `/api/modules` `warnings`; never read from the file.
+    #[serde(skip)]
+    pub warnings: Vec<String>,
+    /// `agentTools`, each resolved against the service-definition action it
+    /// names (the name, description and input schema the agent sees). Worked
+    /// out at load, so the modules snapshot never reads the disk.
+    #[serde(skip)]
+    pub resolved_agent_tools: Vec<AgentTool>,
 }
 
 fn default_schema_version() -> u32 {
     1
+}
+
+// ---- schemaVersion 4: modules ------------------------------------------------------
+
+/// `modules`: `{"provides": ["phone", "calendar"], "connector": "aokie"}`, or
+/// just the list `["phone", "calendar"]`. Written back as the object form.
+#[derive(Debug, Clone, PartialEq, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModulesDecl {
+    pub provides: Vec<String>,
+    /// The connector that serves the phone (optional: otherwise the first
+    /// connector declaring every command the phone uses).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connector: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for ModulesDecl {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        const SHAPE: &str = "modules must be a list of module ids, or {\"provides\": [...]}";
+        let ids = |list: &[Value]| -> Result<Vec<String>, D::Error> {
+            let mut out: Vec<String> = Vec::new();
+            for item in list {
+                let id = item.as_str().ok_or_else(|| D::Error::custom(format!("{SHAPE}: {item} is not a module id")))?;
+                let id = id.trim().to_string();
+                if !out.contains(&id) {
+                    out.push(id);
+                }
+            }
+            Ok(out)
+        };
+        match Value::deserialize(d)? {
+            Value::Array(list) => Ok(Self { provides: ids(&list)?, connector: None }),
+            Value::Object(o) => {
+                let provides = match o.get("provides") {
+                    Some(Value::Array(list)) => ids(list)?,
+                    _ => return Err(D::Error::custom(format!("{SHAPE}: \"provides\" is missing or not a list"))),
+                };
+                let connector = match o.get("connector") {
+                    None | Some(Value::Null) => None,
+                    Some(Value::String(c)) => Some(c.trim().to_string()),
+                    Some(_) => return Err(D::Error::custom("modules.connector must be a connector id")),
+                };
+                Ok(Self { provides, connector })
+            }
+            _ => Err(D::Error::custom(SHAPE)),
+        }
+    }
+}
+
+// ---- schemaVersion 4: agent tools ----------------------------------------------------
+
+/// One `agentTools[]` entry: a service-definition action of the plugin's own,
+/// offered to the agent under `name`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentToolDecl {
+    /// `<service definition id>/<action id>`, e.g. `aokie.phone/sms.threads`.
+    pub action: String,
+    /// What the agent calls it: `^[a-z][a-z0-9_]{2,47}$`, unique in the plugin.
+    pub name: String,
+    /// Instead of the action's own description.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Where it is offered (a subset of [`AGENT_AUDIENCES`]); absent: `["project"]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audience: Option<Vec<String>>,
+    /// What the person is asked before it runs (`Call {number}`). Required
+    /// when the action's `sideEffects` is not `none`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirm: Option<String>,
+}
+
+impl AgentToolDecl {
+    /// The audience it names, or the default.
+    pub fn audience(&self) -> Vec<String> {
+        self.audience.clone().unwrap_or_else(|| vec![DEFAULT_AGENT_AUDIENCE.to_string()])
+    }
+}
+
+fn de_agent_tools<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<AgentToolDecl>, D::Error> {
+    let list = match Value::deserialize(d)? {
+        Value::Array(list) => list,
+        Value::Null => return Ok(Vec::new()),
+        _ => return Err(D::Error::custom("agentTools must be a list")),
+    };
+    list.into_iter()
+        .enumerate()
+        .map(|(i, v)| serde_json::from_value(v).map_err(|e| D::Error::custom(format!("agentTools[{i}]: {e}"))))
+        .collect()
+}
+
+/// An agent tool as the agent sees it: an `agentTools[]` entry with the
+/// name, description and input schema of the action it names.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentTool {
+    pub plugin_id: String,
+    pub name: String,
+    /// `<definition>/<actionId>`, as declared.
+    pub action: String,
+    /// The service definition's id (`aokie.phone`): the invoke route's first part.
+    pub definition: String,
+    /// The action's id (`sms.threads`): the invoke route's second part.
+    pub action_id: String,
+    pub description: String,
+    pub input_schema: Value,
+    /// The action's, as its definition says (absent: not said, so treated as having some).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub side_effects: Option<String>,
+    pub audience: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confirm: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+}
+
+impl AgentTool {
+    /// Does running it change anything (its action's `sideEffects` is not `none`)?
+    pub fn has_side_effects(&self) -> bool {
+        self.side_effects.as_deref() != Some("none")
+    }
+}
+
+/// `^[a-z][a-z0-9_]{2,47}$`
+fn is_valid_tool_name(s: &str) -> bool {
+    let mut chars = s.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_lowercase())
+        && (3..=48).contains(&s.len())
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+}
+
+// ---- schemaVersion 4: setup -----------------------------------------------------------
+
+/// `setup`: the plugin's own setup wizard, run by the host.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetupDecl {
+    /// Moves when the plugin's setup changes enough to be run again (default 1).
+    pub version: u32,
+    /// The wizard's title (default: "Set up <plugin name>").
+    pub title: String,
+    pub steps: Vec<SetupStep>,
+}
+
+impl<'de> Deserialize<'de> for SetupDecl {
+    /// Each step is read on its own, so a refusal says which one.
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Raw {
+            #[serde(default = "default_setup_version")]
+            version: u32,
+            #[serde(default)]
+            title: String,
+            steps: Vec<Value>,
+        }
+        let raw = Raw::deserialize(d).map_err(|e| D::Error::custom(format!("setup: {e}")))?;
+        let steps = raw
+            .steps
+            .into_iter()
+            .enumerate()
+            .map(|(i, v)| {
+                let id = v.get("id").and_then(Value::as_str).map(|s| format!(" ({s:?})")).unwrap_or_default();
+                serde_json::from_value(v).map_err(|e| D::Error::custom(format!("setup.steps[{i}]{id}: {e}")))
+            })
+            .collect::<Result<Vec<SetupStep>, D::Error>>()?;
+        Ok(Self { version: raw.version, title: raw.title, steps })
+    }
+}
+
+fn default_setup_version() -> u32 {
+    1
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+/// One step of a plugin's setup.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetupStep {
+    /// Unique in the setup: `^[a-z][a-z0-9-]{0,39}$`.
+    pub id: String,
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// The person may skip it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub optional: bool,
+    /// The step is shown only while this check passes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub when: Option<Check>,
+    #[serde(flatten)]
+    pub kind: StepKind,
+}
+
+/// What a setup step does (`kind`), and what it needs for that.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum StepKind {
+    /// The capabilities the person grants. The host always shows it first,
+    /// declared or not.
+    Permissions {},
+    /// Services and engine models the plugin needs on this computer.
+    Requirements { requires: Vec<Requirement> },
+    /// A few of the plugin's settings, read and written through its connector.
+    Settings {
+        fields: Vec<SettingField>,
+        /// Default `{"command": "settings.get", "path": "settings"}`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        read: Option<SettingsRead>,
+        /// Default `{"command": "settings.set"}`, with `{"<key>": value, ...}`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        write: Option<SettingsWrite>,
+    },
+    /// One of the plugin's `ui.screens`, in setup mode, showing `view`.
+    Screen {
+        screen: String,
+        view: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        done: Option<Check>,
+    },
+    /// One of the host's own steps ([`HOST_SETUP_ACTIONS`]).
+    Host { action: String },
+}
+
+impl StepKind {
+    pub fn name(&self) -> &'static str {
+        match self {
+            StepKind::Permissions {} => "permissions",
+            StepKind::Requirements { .. } => "requirements",
+            StepKind::Settings { .. } => "settings",
+            StepKind::Screen { .. } => "screen",
+            StepKind::Host { .. } => "host",
+        }
+    }
+}
+
+/// Something a `requirements` step needs. There is no model id: an engine
+/// model is met by whatever the person chose in Engines for that group.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum Requirement {
+    Service {
+        id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        why: Option<String>,
+    },
+    EngineModel {
+        group: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        why: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FieldType {
+    Bool,
+    Choice,
+    Text,
+    Number,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SettingField {
+    pub key: String,
+    pub label: String,
+    #[serde(rename = "type")]
+    pub kind: FieldType,
+    /// A choice's options (and only a choice's).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub options: Option<Vec<ChoiceOption>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub help: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChoiceOption {
+    pub value: Value,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SettingsRead {
+    pub command: String,
+    /// Where the settings are in the answer (absent: the whole answer).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SettingsWrite {
+    pub command: String,
+}
+
+/// Present, even as `null` (a plain `Option<Value>` reads `null` as absent,
+/// and `"equals": null` is a real test).
+fn some_value<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Value>, D::Error> {
+    Value::deserialize(d).map(Some)
+}
+
+/// One test of a command's answer: a `path` and exactly one operator.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Condition {
+    /// Dot-separated. A missing path equals null.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub path: String,
+    #[serde(default, deserialize_with = "some_value", skip_serializing_if = "Option::is_none")]
+    pub equals: Option<Value>,
+    /// The path exists and is not null (`true`), or the reverse (`false`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub present: Option<bool>,
+    #[serde(default, rename = "in", skip_serializing_if = "Option::is_none")]
+    pub one_of: Option<Vec<Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_in: Option<Vec<Value>>,
+}
+
+impl Condition {
+    fn operators(&self) -> usize {
+        [self.equals.is_some(), self.present.is_some(), self.one_of.is_some(), self.not_in.is_some()]
+            .iter()
+            .filter(|x| **x)
+            .count()
+    }
+
+    fn validate(&self, what: &str) -> Result<(), String> {
+        if !is_valid_path(&self.path) {
+            return Err(format!("{what} needs a dot-separated path, not {:?}", self.path));
+        }
+        match self.operators() {
+            1 => Ok(()),
+            0 => Err(format!("{what} has no test: give one of equals, present, in or notIn")),
+            _ => Err(format!("{what} has more than one test: give exactly one of equals, present, in or notIn")),
+        }
+    }
+}
+
+/// A check (a step's `done` or `when`): a read-only command of the plugin's,
+/// sent with no payload, and a test of its answer. Either one condition
+/// inline, or `all` of a list.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Check {
+    pub command: String,
+    #[serde(flatten)]
+    pub condition: Condition,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub all: Option<Vec<Condition>>,
+}
+
+fn is_valid_path(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 256 && s.split('.').all(|seg| !seg.is_empty())
+}
+
+/// `^[a-z][a-z0-9-]{0,39}$`
+fn is_valid_step_id(s: &str) -> bool {
+    let mut chars = s.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_lowercase())
+        && s.len() <= 40
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+// ---- minDesktopVersion -----------------------------------------------------------------
+
+/// A semantic version: `major.minor.patch`, an optional `-pre.release`, and
+/// build metadata (`+...`, ignored). `None` when `s` is not one.
+fn parse_semver(s: &str) -> Option<(u64, u64, u64, Vec<String>)> {
+    let s = s.trim();
+    let s = s.split_once('+').map_or(s, |(v, _)| v);
+    let (core, pre) = match s.split_once('-') {
+        Some((core, pre)) => (core, Some(pre)),
+        None => (s, None),
+    };
+    let nums: Vec<&str> = core.split('.').collect();
+    if nums.len() != 3 || nums.iter().any(|n| n.is_empty() || !n.bytes().all(|b| b.is_ascii_digit())) {
+        return None;
+    }
+    let pre: Vec<String> = match pre {
+        None => Vec::new(),
+        Some(p) => {
+            let ids: Vec<String> = p.split('.').map(str::to_string).collect();
+            if ids.iter().any(|x| x.is_empty() || !x.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')) {
+                return None;
+            }
+            ids
+        }
+    };
+    Some((nums[0].parse().ok()?, nums[1].parse().ok()?, nums[2].parse().ok()?, pre))
+}
+
+/// Semver order: the numbers, then a pre-release below its release, its
+/// identifiers compared numerically when both are numbers.
+fn semver_cmp(a: &(u64, u64, u64, Vec<String>), b: &(u64, u64, u64, Vec<String>)) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let by_numbers = (a.0, a.1, a.2).cmp(&(b.0, b.1, b.2));
+    if by_numbers != Ordering::Equal {
+        return by_numbers;
+    }
+    match (a.3.is_empty(), b.3.is_empty()) {
+        (true, true) => return Ordering::Equal,
+        (true, false) => return Ordering::Greater,
+        (false, true) => return Ordering::Less,
+        (false, false) => {}
+    }
+    for (x, y) in a.3.iter().zip(b.3.iter()) {
+        let o = match (x.parse::<u64>(), y.parse::<u64>()) {
+            (Ok(x), Ok(y)) => x.cmp(&y),
+            (Ok(_), Err(_)) => Ordering::Less,
+            (Err(_), Ok(_)) => Ordering::Greater,
+            (Err(_), Err(_)) => x.cmp(y),
+        };
+        if o != Ordering::Equal {
+            return o;
+        }
+    }
+    a.3.len().cmp(&b.3.len())
+}
+
+/// Is `wanted` (a manifest's `minDesktopVersion`) newer than `have`?
+/// `Err` when either is not a semantic version.
+pub fn needs_newer_desktop(wanted: &str, have: &str) -> Result<bool, String> {
+    let w = parse_semver(wanted).ok_or_else(|| format!("{wanted:?} is not a version like 1.2.3"))?;
+    let h = parse_semver(have).ok_or_else(|| format!("this desktop's version {have:?} is not a version like 1.2.3"))?;
+    Ok(semver_cmp(&w, &h) == std::cmp::Ordering::Greater)
 }
 
 impl PluginManifest {
@@ -155,13 +631,17 @@ impl PluginManifest {
         let path = dir.join("manifest.json");
         let raw = std::fs::read_to_string(&path)
             .map_err(|e| ManifestError::Unreadable(e.to_string()))?;
-        let manifest: PluginManifest =
-            serde_json::from_str(&raw).map_err(|e| ManifestError::Malformed(e.to_string()))?;
+        let value: Value = serde_json::from_str(&raw).map_err(|e| ManifestError::Malformed(e.to_string()))?;
+        // Before the sections are read: under an older schemaVersion the
+        // reason is the version, even when the section is malformed too.
+        refuse_newer_sections(&value)?;
+        let mut manifest: PluginManifest =
+            serde_json::from_value(value).map_err(|e| ManifestError::Invalid(e.to_string()))?;
         manifest.validate(dir)?;
         Ok(manifest)
     }
 
-    fn validate(&self, dir: &Path) -> Result<(), ManifestError> {
+    fn validate(&mut self, dir: &Path) -> Result<(), ManifestError> {
         if !SUPPORTED_SCHEMA_VERSIONS.contains(&self.schema_version) {
             return Err(ManifestError::Unsupported(format!(
                 "manifest schemaVersion {} (this host reads {}-{})",
@@ -169,6 +649,19 @@ impl PluginManifest {
                 SUPPORTED_SCHEMA_VERSIONS.start(),
                 SUPPORTED_SCHEMA_VERSIONS.end()
             )));
+        }
+        self.warnings.clear();
+        if let Some(wanted) = self.min_desktop_version.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+            match needs_newer_desktop(wanted, DESKTOP_VERSION) {
+                Ok(true) => {
+                    return Err(ManifestError::Unsupported(format!(
+                        "{} needs OAIY Desktop {wanted} or later (this is {DESKTOP_VERSION})",
+                        self.name
+                    )))
+                }
+                Ok(false) => {}
+                Err(why) => self.warnings.push(format!("minDesktopVersion {why}, so it is not checked.")),
+            }
         }
         if !SUPPORTED_PLUGIN_API.contains(&self.plugin_api_version) {
             return Err(ManifestError::Unsupported(format!(
@@ -269,6 +762,281 @@ impl PluginManifest {
             )));
         }
 
+        // schemaVersion 4's sections (refused under an older one before this).
+        self.validate_modules()?;
+        self.resolved_agent_tools = if self.agent_tools.is_empty() {
+            Vec::new()
+        } else {
+            let definitions = super::definitions::load_for_plugin(dir, self);
+            self.resolve_agent_tools(&definitions).map_err(ManifestError::Invalid)?
+        };
+        self.validate_setup()?;
+
+        Ok(())
+    }
+
+    /// The connector declaring `command`, if one does.
+    pub fn connector_for(&self, command: &str) -> Option<&ConnectorDecl> {
+        self.connectors.iter().find(|c| c.commands.iter().any(|x| x == command))
+    }
+
+    /// The ids of the plugin's `ui.screens`.
+    pub fn ui_screen_ids(&self) -> BTreeSet<String> {
+        self.extra
+            .get("ui")
+            .and_then(|u| u.get("screens"))
+            .and_then(Value::as_array)
+            .map(|list| list.iter().filter_map(|s| s.get("id").and_then(Value::as_str)).map(str::to_string).collect())
+            .unwrap_or_default()
+    }
+
+    /// A command only read from (a check's, or a settings step's `read`):
+    /// declared by one of the plugin's connectors, and not journalled.
+    fn read_only_command(&self, command: &str, what: &str) -> Result<(), String> {
+        if self.connector_for(command).is_none() {
+            return Err(format!("{what} sends {command:?}, which no connector of this plugin declares"));
+        }
+        if self.is_journalled(command) {
+            return Err(format!(
+                "{what} sends {command:?}, which is journalled (it changes something); it may only read"
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_check(&self, check: &Check, what: &str) -> Result<(), String> {
+        self.read_only_command(&check.command, what)?;
+        match &check.all {
+            Some(list) => {
+                if !check.condition.path.is_empty() || check.condition.operators() > 0 {
+                    return Err(format!("{what} gives a condition and \"all\": give one or the other"));
+                }
+                if list.is_empty() {
+                    return Err(format!("{what} has an empty \"all\""));
+                }
+                for (i, c) in list.iter().enumerate() {
+                    c.validate(&format!("{what}.all[{i}]"))?;
+                }
+                Ok(())
+            }
+            None => check.condition.validate(what),
+        }
+    }
+
+    /// `modules`: known modules only, and a connector the plugin declares.
+    fn validate_modules(&self) -> Result<(), ManifestError> {
+        let Some(decl) = &self.modules else { return Ok(()) };
+        for id in &decl.provides {
+            if crate::modules::def(id).is_none() {
+                let known: Vec<&str> = crate::modules::BUILTIN.iter().map(|d| d.id).collect();
+                return Err(ManifestError::Invalid(format!(
+                    "modules names {id:?}, which is not a module this OAIY knows ({})",
+                    known.join(", ")
+                )));
+            }
+        }
+        if let Some(c) = &decl.connector {
+            if !self.connectors.iter().any(|x| &x.id == c) {
+                return Err(ManifestError::Invalid(format!(
+                    "modules.connector names {c:?}, which is not one of this plugin's connectors"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// `agentTools`, each resolved against the action it names in `definitions`
+    /// (the plugin's own service definitions).
+    pub fn resolve_agent_tools(
+        &self,
+        definitions: &[super::definitions::ServiceDefinition],
+    ) -> Result<Vec<AgentTool>, String> {
+        let mut out = Vec::new();
+        let mut names = BTreeSet::new();
+        for (i, t) in self.agent_tools.iter().enumerate() {
+            if !is_valid_tool_name(&t.name) {
+                return Err(format!(
+                    "agentTools[{i}]: the name {:?} must be 3 to 48 lowercase letters, digits and underscores, starting with a letter",
+                    t.name
+                ));
+            }
+            let what = format!("agentTools[{i}] ({:?})", t.name);
+            if !names.insert(t.name.as_str()) {
+                return Err(format!("{what}: the name is used twice"));
+            }
+            let Some((def_id, action_id)) = t.action.split_once('/').filter(|(d, a)| !d.is_empty() && !a.is_empty()) else {
+                return Err(format!("{what}: the action {:?} must be \"<service definition id>/<action id>\"", t.action));
+            };
+            let Some(def) = definitions.iter().find(|d| d.id == def_id) else {
+                return Err(format!("{what}: {def_id:?} is not one of this plugin's service definitions"));
+            };
+            let Some(action) = def.action(action_id) else {
+                return Err(format!("{what}: the service definition {def_id:?} has no action {action_id:?}"));
+            };
+            let declared = t.audience();
+            if declared.is_empty() {
+                return Err(format!("{what}: the audience is empty (leave it out for [\"project\"])"));
+            }
+            let mut audience: Vec<String> = Vec::new();
+            for a in declared {
+                if !AGENT_AUDIENCES.contains(&a.as_str()) {
+                    return Err(format!("{what}: the audience {a:?} is not one of {}", AGENT_AUDIENCES.join(", ")));
+                }
+                if !audience.contains(&a) {
+                    audience.push(a);
+                }
+            }
+            let confirm = t.confirm.as_deref().map(str::trim).filter(|c| !c.is_empty()).map(str::to_string);
+            let effects = action.side_effects.clone();
+            if effects.as_deref() != Some("none") && confirm.is_none() {
+                let why = match effects.as_deref() {
+                    Some(e) => format!("has side effects ({e})"),
+                    None => "does not say it has no side effects".to_string(),
+                };
+                return Err(format!(
+                    "{what}: {} {why}, so the tool needs a \"confirm\" template (what the person is asked before it runs)",
+                    t.action
+                ));
+            }
+            let text = |s: Option<&str>| s.map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+            let description = text(t.description.as_deref())
+                .or_else(|| text(action.description.as_deref()))
+                .or_else(|| text(action.title.as_deref()))
+                .unwrap_or_else(|| action_id.to_string());
+            let input_schema = match &action.input_schema {
+                Some(schema @ Value::Object(_)) => schema.clone(),
+                _ => serde_json::json!({ "type": "object" }),
+            };
+            out.push(AgentTool {
+                plugin_id: self.id.clone(),
+                name: t.name.clone(),
+                action: t.action.clone(),
+                definition: def_id.to_string(),
+                action_id: action_id.to_string(),
+                description,
+                input_schema,
+                side_effects: effects,
+                audience,
+                confirm,
+                timeout_ms: action.timeout_ms,
+            });
+        }
+        Ok(out)
+    }
+
+    /// `setup`: every refusal in the pinned contract; a host step this OAIY
+    /// cannot run is left out with a warning.
+    fn validate_setup(&mut self) -> Result<(), ManifestError> {
+        let Some(mut setup) = self.setup.take() else { return Ok(()) };
+        let result = self.check_setup(&mut setup);
+        self.setup = Some(setup);
+        result.map_err(ManifestError::Invalid)
+    }
+
+    fn check_setup(&mut self, setup: &mut SetupDecl) -> Result<(), String> {
+        if setup.version == 0 {
+            return Err("setup.version must be 1 or more".into());
+        }
+        if setup.title.trim().is_empty() {
+            setup.title = format!("Set up {}", self.name.trim());
+        }
+        let screens = self.ui_screen_ids();
+        let mut ids = BTreeSet::new();
+        let mut kept = Vec::with_capacity(setup.steps.len());
+        for (i, step) in std::mem::take(&mut setup.steps).into_iter().enumerate() {
+            let what = format!("setup.steps[{i}] ({:?})", step.id);
+            if !is_valid_step_id(&step.id) {
+                return Err(format!(
+                    "{what}: the id must be up to 40 lowercase letters, digits and hyphens, starting with a letter"
+                ));
+            }
+            if !ids.insert(step.id.clone()) {
+                return Err(format!("{what}: the id is used twice"));
+            }
+            if step.title.trim().is_empty() {
+                return Err(format!("{what}: the title is empty"));
+            }
+            if let Some(when) = &step.when {
+                self.validate_check(when, &format!("{what}.when"))?;
+            }
+            match &step.kind {
+                StepKind::Permissions {} => {}
+                StepKind::Requirements { requires } => {
+                    if requires.is_empty() {
+                        return Err(format!("{what}: a requirements step with nothing in requires"));
+                    }
+                    for (j, r) in requires.iter().enumerate() {
+                        match r {
+                            Requirement::Service { id, .. } if id.trim().is_empty() => {
+                                return Err(format!("{what}.requires[{j}]: the service id is empty"))
+                            }
+                            Requirement::EngineModel { group, .. } if group.trim().is_empty() => {
+                                return Err(format!("{what}.requires[{j}]: the engine group is empty"))
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                StepKind::Settings { fields, read, write } => {
+                    if fields.is_empty() {
+                        return Err(format!("{what}: a settings step with no fields"));
+                    }
+                    let mut keys = BTreeSet::new();
+                    for (j, f) in fields.iter().enumerate() {
+                        let field = format!("{what}.fields[{j}]");
+                        if f.key.trim().is_empty() {
+                            return Err(format!("{field}: the key is empty"));
+                        }
+                        if !keys.insert(f.key.as_str()) {
+                            return Err(format!("{field}: the key {:?} is used twice", f.key));
+                        }
+                        if f.label.trim().is_empty() {
+                            return Err(format!("{field}: the label is empty"));
+                        }
+                        match (f.kind, &f.options) {
+                            (FieldType::Choice, Some(options)) if !options.is_empty() => {}
+                            (FieldType::Choice, _) => return Err(format!("{field}: a choice needs options")),
+                            (_, Some(_)) => return Err(format!("{field}: options are only for a choice")),
+                            _ => {}
+                        }
+                    }
+                    let read_command = read.as_ref().map_or("settings.get", |r| r.command.as_str());
+                    self.read_only_command(read_command, &format!("{what}.read"))?;
+                    if let Some(path) = read.as_ref().and_then(|r| r.path.as_deref()) {
+                        if !is_valid_path(path) {
+                            return Err(format!("{what}.read: the path {path:?} must be dot-separated"));
+                        }
+                    }
+                    let write_command = write.as_ref().map_or("settings.set", |w| w.command.as_str());
+                    if self.connector_for(write_command).is_none() {
+                        return Err(format!(
+                            "{what}.write sends {write_command:?}, which no connector of this plugin declares"
+                        ));
+                    }
+                }
+                StepKind::Screen { screen, view, done } => {
+                    if !screens.contains(screen) {
+                        return Err(format!("{what}: it shows the screen {screen:?}, which is not in ui.screens"));
+                    }
+                    if view.trim().is_empty() {
+                        return Err(format!("{what}: the view is empty"));
+                    }
+                    if let Some(done) = done {
+                        self.validate_check(done, &format!("{what}.done"))?;
+                    }
+                }
+                StepKind::Host { action } => {
+                    if !HOST_SETUP_ACTIONS.contains(&action.as_str()) {
+                        self.warnings.push(format!(
+                            "{what}: the host step {action:?} needs a newer OAIY, so it is left out."
+                        ));
+                        continue;
+                    }
+                }
+            }
+            kept.push(step);
+        }
+        setup.steps = kept;
         Ok(())
     }
 
@@ -454,6 +1222,21 @@ pub const LEGACY_HOST_CAPABILITY_ALIASES: &[(&str, &str)] = &[
     ("events.publish", "oaiy.events.publish"),
     ("services.read", "oaiy.services.read"),
 ];
+
+/// A schemaVersion 4 section under an older schemaVersion is refused, with
+/// the version as the reason.
+fn refuse_newer_sections(manifest: &Value) -> Result<(), ManifestError> {
+    let version = manifest.get("schemaVersion").and_then(Value::as_u64).unwrap_or(1);
+    if version >= 4 {
+        return Ok(());
+    }
+    match V4_SECTIONS.iter().find(|key| manifest.get(**key).is_some()) {
+        Some(key) => Err(ManifestError::Invalid(format!(
+            "{key} needs schemaVersion 4, and this manifest declares {version}: a section is refused under an older schemaVersion rather than half-honoured"
+        ))),
+        None => Ok(()),
+    }
+}
 
 fn canonical_capability(cap: &str) -> &str {
     for (legacy, canonical) in LEGACY_HOST_CAPABILITY_ALIASES {
@@ -988,6 +1771,414 @@ mod tests {
             !m.declares_event("aokie.call.invented"),
             "a plugin must not invent event names to reach triggers it was not granted"
         );
+    }
+
+    // --- schemaVersion 4: modules, agentTools, setup ----------------------
+
+    /// Aokie's shipped manifest with the proposed v4 fragment merged in (its
+    /// `_notes` dropped): `modules` and a three-step `setup`.
+    const AOKIE_V4: &str = include_str!("fixtures/aokie-v4.manifest.json");
+    /// Aokie's `definitions/phone.json`, which its `serviceDefinitions` names.
+    const AOKIE_PHONE: &str = include_str!("fixtures/aokie-phone.definition.json");
+
+    fn aokie_v4() -> serde_json::Value {
+        serde_json::from_str(AOKIE_V4).unwrap()
+    }
+
+    /// Aokie's shipped manifest as it is today: schemaVersion 3, no v4 sections.
+    fn aokie_v3() -> serde_json::Value {
+        let mut v = aokie_v4();
+        v["schemaVersion"] = serde_json::json!(3);
+        let o = v.as_object_mut().unwrap();
+        o.remove("modules");
+        o.remove("setup");
+        v
+    }
+
+    fn write_aokie(body: &serde_json::Value) -> tempdir::TempPluginDir {
+        let d = write_manifest(body);
+        fs::create_dir_all(d.path().join("definitions")).unwrap();
+        fs::write(d.path().join("definitions/phone.json"), AOKIE_PHONE).unwrap();
+        d
+    }
+
+    fn load_aokie(body: &serde_json::Value) -> Result<PluginManifest, ManifestError> {
+        let d = write_aokie(body);
+        PluginManifest::load(d.path())
+    }
+
+    /// The reason `body` is refused (it must be).
+    fn refusal(body: &serde_json::Value) -> String {
+        load_aokie(body).expect_err("must be refused").reason()
+    }
+
+    fn with_tools(tools: serde_json::Value) -> serde_json::Value {
+        let mut v = aokie_v4();
+        v["agentTools"] = tools;
+        v
+    }
+
+    fn with_steps(steps: serde_json::Value) -> serde_json::Value {
+        let mut v = aokie_v4();
+        v["setup"] = serde_json::json!({ "version": 2, "title": "Set up the AI Receptionist", "steps": steps });
+        v
+    }
+
+    #[test]
+    fn the_live_aokie_manifest_still_loads() {
+        // schemaVersion 3, minDesktopVersion 0.1.0 on a 0.1.0 desktop.
+        let m = load_aokie(&aokie_v3()).expect("the shipped Aokie loads");
+        assert_eq!(m.schema_version, 3);
+        assert_eq!(m.min_desktop_version.as_deref(), Some("0.1.0"));
+        assert!(m.modules.is_none() && m.setup.is_none() && m.agent_tools.is_empty());
+        assert!(m.warnings.is_empty(), "{:?}", m.warnings);
+    }
+
+    #[test]
+    fn aokies_v4_manifest_loads() {
+        let m = load_aokie(&aokie_v4()).expect("the v4 fixture loads");
+        assert_eq!(m.schema_version, 4);
+        assert_eq!(m.modules.as_ref().unwrap().provides, vec!["phone", "calendar"]);
+        let setup = m.setup.as_ref().unwrap();
+        assert_eq!(setup.version, 1, "no version: 1");
+        assert_eq!(setup.title, "Set up Aokie Phone Bridge", "no title: the plugin's name");
+        let ids: Vec<&str> = setup.steps.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, vec!["consent", "dongle", "pair"]);
+        assert!(m.warnings.is_empty(), "{:?}", m.warnings);
+        // `equals: null` is a test, not an absent operator.
+        let StepKind::Screen { done: Some(done), .. } = &setup.steps[0].kind else { panic!("a screen step with a check") };
+        let all = done.all.as_ref().unwrap();
+        assert_eq!(all[2].path, "blocked");
+        assert_eq!(all[2].equals, Some(serde_json::Value::Null));
+        // And the modules claim reads it.
+        assert!(crate::modules::claims(&m).declared);
+        assert!(crate::modules::provided_by(&m).contains(crate::modules::PHONE));
+    }
+
+    #[test]
+    fn the_v4_sections_reach_the_dashboard_in_camel_case() {
+        let mut v = with_tools(serde_json::json!([
+            { "action": "aokie.phone/sms.threads", "name": "phone_sms_threads", "audience": ["project", "runner"] }
+        ]));
+        v["modules"] = serde_json::json!(["phone", "calendar"]);
+        let m = load_aokie(&v).unwrap();
+        let out = serde_json::to_value(&m).unwrap();
+        assert_eq!(out["modules"], serde_json::json!({ "provides": ["phone", "calendar"] }), "the list form is written back as the object form");
+        assert_eq!(out["agentTools"], serde_json::json!([{ "action": "aokie.phone/sms.threads", "name": "phone_sms_threads", "audience": ["project", "runner"] }]));
+        let steps = &out["setup"]["steps"];
+        assert_eq!(out["setup"]["version"], 1);
+        assert_eq!(out["setup"]["title"], "Set up Aokie Phone Bridge");
+        assert_eq!(steps[0]["kind"], "screen");
+        assert_eq!(steps[0]["done"]["all"][2], serde_json::json!({ "path": "blocked", "equals": null }));
+        assert_eq!(steps[1]["when"], serde_json::json!({ "command": "settings.get", "path": "settings.transportMode", "notIn": ["native", "auto"] }));
+        assert!(steps[0].get("optional").is_none() && steps[0].get("when").is_none(), "absent optional fields are skipped: {}", steps[0]);
+        assert!(out.get("warnings").is_none() && out.get("resolvedAgentTools").is_none(), "worked out by the host, not the manifest's");
+        // A v3 manifest has none of them.
+        let v3 = serde_json::to_value(load_aokie(&aokie_v3()).unwrap()).unwrap();
+        assert!(v3.get("modules").is_none() && v3.get("agentTools").is_none() && v3.get("setup").is_none());
+    }
+
+    #[test]
+    fn a_v4_section_under_an_older_schema_version_is_refused_for_its_version() {
+        for (key, value) in [
+            ("modules", serde_json::json!({ "provides": ["phone"] })),
+            ("agentTools", serde_json::json!([])),
+            ("setup", serde_json::json!({ "steps": [] })),
+            // Malformed as well: the version is still the reason.
+            ("setup", serde_json::json!("not a setup")),
+        ] {
+            let mut v = aokie_v3();
+            v[key] = value;
+            let reason = refusal(&v);
+            assert!(reason.contains(key) && reason.contains("schemaVersion 4") && reason.contains("declares 3"), "{reason}");
+        }
+        // And under 1 or 2 alike.
+        let mut v = base();
+        v["schemaVersion"] = serde_json::json!(2);
+        v["modules"] = serde_json::json!(["phone"]);
+        let d = write_manifest(&v);
+        assert!(PluginManifest::load(d.path()).unwrap_err().reason().contains("declares 2"));
+    }
+
+    #[test]
+    fn a_module_this_oaiy_does_not_know_is_refused() {
+        let mut v = aokie_v4();
+        v["modules"] = serde_json::json!({ "provides": ["phone", "fax"] });
+        let reason = refusal(&v);
+        assert!(reason.contains("\"fax\"") && reason.contains("phone, calendar"), "{reason}");
+    }
+
+    #[test]
+    fn a_modules_connector_the_plugin_does_not_declare_is_refused() {
+        let mut v = aokie_v4();
+        v["modules"] = serde_json::json!({ "provides": ["phone"], "connector": "aokie" });
+        let m = load_aokie(&v).expect("its own connector is fine");
+        assert_eq!(m.modules.unwrap().connector.as_deref(), Some("aokie"));
+        v["modules"] = serde_json::json!({ "provides": ["phone"], "connector": "someone-else" });
+        assert!(refusal(&v).contains("\"someone-else\""));
+    }
+
+    #[test]
+    fn a_malformed_modules_section_is_refused() {
+        for bad in [serde_json::json!({ "provides": "phone" }), serde_json::json!("phone"), serde_json::json!([{ "id": "phone" }])] {
+            let mut v = aokie_v4();
+            v["modules"] = bad.clone();
+            let reason = refusal(&v);
+            assert!(reason.contains("modules must be"), "{bad}: {reason}");
+        }
+    }
+
+    #[test]
+    fn agent_tools_take_their_name_description_and_schema_from_the_action() {
+        let v = with_tools(serde_json::json!([
+            { "action": "aokie.phone/sms.threads", "name": "phone_sms_threads", "audience": ["project", "runner", "runner"] },
+            { "action": "aokie.phone/call.dial", "name": "phone_call", "audience": ["runner"], "confirm": "Call {number} and say: {openingLine}",
+              "description": "Ring someone for the business." },
+            { "action": "aokie.phone/sms.thread", "name": "phone_sms_thread" }
+        ]));
+        let m = load_aokie(&v).unwrap();
+        let tools = &m.resolved_agent_tools;
+        assert_eq!(tools.len(), 3);
+        let threads = &tools[0];
+        assert_eq!((threads.definition.as_str(), threads.action_id.as_str()), ("aokie.phone", "sms.threads"));
+        assert_eq!(threads.description, "Every conversation on the paired phone, most recent first.");
+        assert_eq!(threads.side_effects.as_deref(), Some("none"));
+        assert!(!threads.has_side_effects());
+        assert_eq!(threads.audience, vec!["project", "runner"], "said twice, offered once");
+        assert_eq!(threads.input_schema, serde_json::json!({ "type": "object" }));
+        assert_eq!(threads.plugin_id, "aokie");
+        let call = &tools[1];
+        assert_eq!(call.description, "Ring someone for the business.", "the manifest's description wins");
+        assert!(call.has_side_effects());
+        assert_eq!(call.confirm.as_deref(), Some("Call {number} and say: {openingLine}"));
+        assert_eq!(call.input_schema["required"], serde_json::json!(["number", "openingLine"]));
+        assert_eq!(call.timeout_ms, Some(30000));
+        assert_eq!(tools[2].audience, vec!["project"], "no audience: the project conversation");
+    }
+
+    #[test]
+    fn a_bad_agent_tool_is_refused() {
+        for (tool, says) in [
+            (serde_json::json!({ "action": "weather.forecast/get", "name": "forecast" }), "not one of this plugin's service definitions"),
+            (serde_json::json!({ "action": "aokie.phone/sms.teleport", "name": "teleport" }), "has no action \"sms.teleport\""),
+            (serde_json::json!({ "action": "sms.threads", "name": "threads" }), "<service definition id>/<action id>"),
+            (serde_json::json!({ "action": "aokie.phone/sms.threads", "name": "Threads" }), "lowercase letters"),
+            (serde_json::json!({ "action": "aokie.phone/sms.threads", "name": "ab" }), "3 to 48"),
+            (serde_json::json!({ "action": "aokie.phone/sms.threads", "name": "threads", "audience": ["everyone"] }), "\"everyone\" is not one of"),
+            (serde_json::json!({ "action": "aokie.phone/sms.threads", "name": "threads", "audience": [] }), "audience is empty"),
+            (serde_json::json!({ "action": "aokie.phone/sms.send", "name": "send_text" }), "needs a \"confirm\" template"),
+            (serde_json::json!({ "action": "aokie.phone/sms.send", "name": "send_text", "confirm": "  " }), "needs a \"confirm\" template"),
+            (serde_json::json!({ "name": "no_action" }), "agentTools[0]: missing field `action`"),
+        ] {
+            let reason = refusal(&with_tools(serde_json::json!([tool])));
+            assert!(reason.contains(says), "{tool}: {reason}");
+        }
+        let twice = with_tools(serde_json::json!([
+            { "action": "aokie.phone/sms.threads", "name": "threads" },
+            { "action": "aokie.phone/phone.status", "name": "threads" }
+        ]));
+        assert!(refusal(&twice).contains("used twice"));
+    }
+
+    #[test]
+    fn an_action_that_does_not_say_it_is_harmless_needs_a_confirm_template() {
+        let d = write_aokie(&with_tools(serde_json::json!([{ "action": "aokie.phone/status.read", "name": "status_read" }])));
+        fs::write(
+            d.path().join("definitions/phone.json"),
+            r#"{"id":"aokie.phone","name":"Phone","actions":[{"id":"status.read","transport":{"kind":"plugin-command","command":"phone.status"}}]}"#,
+        )
+        .unwrap();
+        let reason = PluginManifest::load(d.path()).unwrap_err().reason();
+        assert!(reason.contains("does not say it has no side effects"), "{reason}");
+    }
+
+    #[test]
+    fn duplicate_or_malformed_step_ids_are_refused() {
+        let screen = |id: &str| serde_json::json!({ "id": id, "kind": "screen", "title": "A", "screen": "receptionist-home", "view": "phone" });
+        assert!(refusal(&with_steps(serde_json::json!([screen("pair"), screen("pair")]))).contains("used twice"));
+        for bad in ["Pair", "9pair", "pair_phone", "a-very-long-step-id-that-runs-past-forty-chars"] {
+            assert!(refusal(&with_steps(serde_json::json!([screen(bad)]))).contains("the id must be"), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_screen_step_naming_a_missing_screen_is_refused() {
+        let v = with_steps(serde_json::json!([{ "id": "pair", "kind": "screen", "title": "Pair", "screen": "nowhere", "view": "phone" }]));
+        assert!(refusal(&v).contains("\"nowhere\", which is not in ui.screens"));
+    }
+
+    #[test]
+    fn a_check_must_read_a_declared_command_that_is_not_journalled() {
+        let step = |done: serde_json::Value| {
+            with_steps(serde_json::json!([{ "id": "pair", "kind": "screen", "title": "Pair", "screen": "receptionist-home", "view": "phone", "done": done }]))
+        };
+        let undeclared = refusal(&step(serde_json::json!({ "command": "phone.teleport", "path": "paired", "equals": true })));
+        assert!(undeclared.contains("\"phone.teleport\", which no connector"), "{undeclared}");
+        let journalled = refusal(&step(serde_json::json!({ "command": "phone.connect", "path": "ok", "equals": true })));
+        assert!(journalled.contains("journalled"), "{journalled}");
+        // `when` is held to the same rule.
+        let when = with_steps(serde_json::json!([{ "id": "pair", "kind": "screen", "title": "Pair", "screen": "receptionist-home", "view": "phone",
+            "when": { "command": "sms.send", "path": "ok", "equals": true } }]));
+        assert!(refusal(&when).contains("journalled"));
+    }
+
+    #[test]
+    fn a_check_has_exactly_one_test_per_condition() {
+        let step = |done: serde_json::Value| {
+            with_steps(serde_json::json!([{ "id": "pair", "kind": "screen", "title": "Pair", "screen": "receptionist-home", "view": "phone", "done": done }]))
+        };
+        for (done, says) in [
+            (serde_json::json!({ "command": "phone.status", "path": "paired" }), "has no test"),
+            (serde_json::json!({ "command": "phone.status", "path": "paired", "equals": true, "present": true }), "more than one test"),
+            (serde_json::json!({ "command": "phone.status", "equals": true }), "needs a dot-separated path"),
+            (serde_json::json!({ "command": "phone.status", "path": "a..b", "equals": true }), "needs a dot-separated path"),
+            (serde_json::json!({ "command": "phone.status", "all": [] }), "empty \"all\""),
+            (serde_json::json!({ "command": "phone.status", "path": "paired", "equals": true, "all": [{ "path": "connected", "present": true }] }), "one or the other"),
+            (serde_json::json!({ "command": "phone.status", "all": [{ "path": "connected" }] }), "all[0] has no test"),
+        ] {
+            let reason = refusal(&step(done.clone()));
+            assert!(reason.contains(says), "{done}: {reason}");
+        }
+        for good in [
+            serde_json::json!({ "command": "phone.status", "path": "paired", "present": true }),
+            serde_json::json!({ "command": "phone.status", "path": "state", "in": ["a", "b"] }),
+            serde_json::json!({ "command": "phone.status", "all": [{ "path": "connected", "equals": true }, { "path": "pairingConfirm", "equals": null }] }),
+        ] {
+            load_aokie(&step(good.clone())).unwrap_or_else(|e| panic!("{good}: {}", e.reason()));
+        }
+    }
+
+    #[test]
+    fn a_settings_step_reads_and_writes_through_declared_commands() {
+        let step = |extra: serde_json::Value| {
+            let mut s = serde_json::json!({ "id": "behaviour", "kind": "settings", "title": "How calls are handled", "optional": true,
+                "fields": [{ "key": "holdAndCallWaiting", "label": "Hold and call waiting", "type": "bool" }] });
+            s.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            with_steps(serde_json::json!([s]))
+        };
+        let m = load_aokie(&step(serde_json::json!({}))).expect("the defaults, settings.get and settings.set, are declared");
+        assert!(m.setup.unwrap().steps[0].optional);
+        let read = refusal(&step(serde_json::json!({ "read": { "command": "settings.fetch" } })));
+        assert!(read.contains(".read sends \"settings.fetch\", which no connector"), "{read}");
+        let journalled = refusal(&step(serde_json::json!({ "read": { "command": "sms.send" } })));
+        assert!(journalled.contains(".read") && journalled.contains("journalled"), "{journalled}");
+        let write = refusal(&step(serde_json::json!({ "write": { "command": "settings.put" } })));
+        assert!(write.contains(".write sends \"settings.put\", which no connector"), "{write}");
+        // A journalled write is fine (writing is what it is for).
+        load_aokie(&step(serde_json::json!({ "write": { "command": "phone.connect" } }))).unwrap();
+        // The defaults must be declared too.
+        let mut undeclared = step(serde_json::json!({}));
+        let commands = undeclared["connectors"][0]["commands"].as_array_mut().unwrap();
+        commands.retain(|c| c != "settings.get");
+        undeclared["capabilities"] = serde_json::json!([]);
+        assert!(refusal(&undeclared).contains("\"settings.get\", which no connector"));
+    }
+
+    #[test]
+    fn a_settings_field_is_well_formed() {
+        let fields = |f: serde_json::Value| with_steps(serde_json::json!([{ "id": "behaviour", "kind": "settings", "title": "Calls", "fields": f }]));
+        for (f, says) in [
+            (serde_json::json!([]), "no fields"),
+            (serde_json::json!([{ "key": "mode", "label": "Mode", "type": "choice" }]), "a choice needs options"),
+            (serde_json::json!([{ "key": "on", "label": "On", "type": "bool", "options": [{ "value": 1, "label": "One" }] }]), "only for a choice"),
+            (serde_json::json!([{ "key": "on", "label": "On", "type": "bool" }, { "key": "on", "label": "Again", "type": "text" }]), "used twice"),
+            (serde_json::json!([{ "key": "on", "label": "On", "type": "toggle" }]), "unknown variant `toggle`"),
+        ] {
+            let reason = refusal(&fields(f.clone()));
+            assert!(reason.contains(says), "{f}: {reason}");
+        }
+        load_aokie(&fields(serde_json::json!([{ "key": "mode", "label": "Mode", "type": "choice", "help": "How.",
+            "options": [{ "value": "desktop_realtime", "label": "OAIY" }, { "value": 2, "label": "Two" }] }]))).unwrap();
+    }
+
+    #[test]
+    fn requirements_name_a_service_or_an_engine_group_and_no_model() {
+        let req = |r: serde_json::Value| with_steps(serde_json::json!([{ "id": "speech", "kind": "requirements", "title": "Hearing and speaking", "requires": r }]));
+        let m = load_aokie(&req(serde_json::json!([
+            { "kind": "service", "id": "oaiy-voice", "why": "Hears callers." },
+            { "kind": "engineModel", "group": "llm", "why": "Answers calls." }
+        ])))
+        .unwrap();
+        let StepKind::Requirements { requires } = &m.setup.as_ref().unwrap().steps[0].kind else { panic!() };
+        assert_eq!(requires[1], Requirement::EngineModel { group: "llm".into(), why: Some("Answers calls.".into()) });
+        assert!(refusal(&req(serde_json::json!([]))).contains("nothing in requires"));
+        assert!(refusal(&req(serde_json::json!([{ "kind": "service", "id": " " }]))).contains("service id is empty"));
+        assert!(refusal(&req(serde_json::json!([{ "kind": "model", "id": "qwen" }]))).contains("unknown variant `model`"));
+    }
+
+    #[test]
+    fn a_structurally_broken_step_is_refused_and_says_which() {
+        for (step, says) in [
+            (serde_json::json!({ "id": "x", "kind": "wizardry", "title": "X" }), "setup.steps[0] (\"x\"): unknown variant `wizardry`"),
+            (serde_json::json!({ "id": "x", "kind": "screen", "title": "X", "view": "phone" }), "missing field `screen`"),
+            (serde_json::json!({ "id": "x", "kind": "screen", "title": "X", "screen": "receptionist-home" }), "missing field `view`"),
+            (serde_json::json!({ "id": "x", "kind": "screen", "title": " ", "screen": "receptionist-home", "view": "phone" }), "the title is empty"),
+            (serde_json::json!({ "id": "x", "kind": "host", "title": "X" }), "missing field `action`"),
+        ] {
+            let reason = refusal(&with_steps(serde_json::json!([step.clone()])));
+            assert!(reason.contains(says), "{step}: {reason}");
+        }
+        let mut v = aokie_v4();
+        v["setup"] = serde_json::json!({ "version": 0, "steps": [] });
+        assert!(refusal(&v).contains("setup.version must be 1 or more"));
+        v["setup"] = serde_json::json!({ "title": "No steps" });
+        assert!(refusal(&v).contains("setup: missing field `steps`"));
+    }
+
+    #[test]
+    fn a_host_step_this_oaiy_does_not_know_is_left_out_with_a_warning() {
+        let v = with_steps(serde_json::json!([
+            { "id": "permissions", "kind": "permissions", "title": "What it may do" },
+            { "id": "answer", "kind": "host", "action": "phone.answerWithOaiy", "title": "Answer calls and texts with OAIY" },
+            { "id": "hologram", "kind": "host", "action": "phone.hologram", "title": "Beam callers in" },
+            { "id": "business", "kind": "host", "action": "calendar.business", "title": "Your business" }
+        ]));
+        let m = load_aokie(&v).expect("a newer plugin still loads");
+        let ids: Vec<&str> = m.setup.as_ref().unwrap().steps.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, vec!["permissions", "answer", "business"]);
+        assert_eq!(m.warnings.len(), 1, "{:?}", m.warnings);
+        assert!(m.warnings[0].contains("\"phone.hologram\" needs a newer OAIY"), "{:?}", m.warnings);
+        let setup = m.setup.as_ref().unwrap();
+        assert_eq!((setup.version, setup.title.as_str()), (2, "Set up the AI Receptionist"));
+    }
+
+    #[test]
+    fn a_plugin_needing_a_newer_desktop_is_refused() {
+        let mut v = aokie_v3();
+        v["minDesktopVersion"] = serde_json::json!("99.0.0");
+        let err = load_aokie(&v).unwrap_err();
+        assert!(matches!(err, ManifestError::Unsupported(_)));
+        assert!(err.reason().contains("needs OAIY Desktop 99.0.0 or later") && err.reason().contains(DESKTOP_VERSION), "{}", err.reason());
+        for fine in [DESKTOP_VERSION, "0.0.9", "0.1.0-beta.1", "0.1.0+build.7"] {
+            v["minDesktopVersion"] = serde_json::json!(fine);
+            load_aokie(&v).unwrap_or_else(|e| panic!("{fine}: {}", e.reason()));
+        }
+    }
+
+    #[test]
+    fn an_unreadable_min_desktop_version_is_a_warning() {
+        let mut v = aokie_v3();
+        for odd in ["soon", "1.2", "v0.9.0"] {
+            v["minDesktopVersion"] = serde_json::json!(odd);
+            let m = load_aokie(&v).unwrap_or_else(|e| panic!("{odd}: {}", e.reason()));
+            assert_eq!(m.warnings.len(), 1, "{odd}: {:?}", m.warnings);
+            assert!(m.warnings[0].contains("minDesktopVersion") && m.warnings[0].contains(odd), "{:?}", m.warnings);
+        }
+    }
+
+    #[test]
+    fn versions_compare_as_semver() {
+        let newer = |a: &str, b: &str| needs_newer_desktop(a, b).unwrap();
+        assert!(newer("0.2.0", "0.1.9"));
+        assert!(newer("0.10.0", "0.9.0"), "numerically, not as text");
+        assert!(!newer("0.1.0", "0.1.0"));
+        assert!(!newer("0.1.0-beta", "0.1.0"), "a pre-release is below its release");
+        assert!(newer("0.1.0", "0.1.0-rc.1"));
+        assert!(newer("1.0.0-rc.10", "1.0.0-rc.9"));
+        assert!(newer("1.0.0-beta", "1.0.0-alpha"));
+        assert!(newer("1.0.0-alpha.1", "1.0.0-alpha"));
+        assert!(!newer("1.0.0+later", "1.0.0"), "build metadata does not count");
+        assert!(needs_newer_desktop("1.x.0", "0.1.0").is_err());
     }
 
     /// Minimal scratch directory helper, so these tests need no dev-dependency.

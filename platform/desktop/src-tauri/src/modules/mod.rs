@@ -129,54 +129,48 @@ impl Claims {
     }
 }
 
-/// The module ids a `modules` section names: `{"provides": [...]}`, or the list
-/// itself, of ids or `{"id": ...}` objects.
-fn named_modules(section: &Value) -> Vec<String> {
-    let list = match section {
-        Value::Array(a) => a.as_slice(),
-        Value::Object(o) => o.get("provides").and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[]),
-        _ => &[],
-    };
-    let mut out: Vec<String> = Vec::new();
-    for item in list {
-        let id = item.as_str().or_else(|| item.get("id").and_then(Value::as_str)).map(str::trim).unwrap_or("");
-        if !id.is_empty() && !out.iter().any(|x| x == id) {
-            out.push(id.to_string());
-        }
-    }
-    out
-}
-
-/// What `manifest` claims to provide, each claim checked against what the module needs.
+/// What `manifest` claims to provide (its typed `modules` section, or the
+/// legacy rule), each claim checked against what the module needs.
 pub fn claims(manifest: &PluginManifest) -> Claims {
-    let (declared, named) = match manifest.extra.get("modules") {
-        Some(section) => (true, named_modules(section)),
-        None if manifest.id == LEGACY_PROVIDER => (false, vec![PHONE.to_string(), CALENDAR.to_string()]),
-        None => (false, Vec::new()),
+    let (declared, named, connector) = match &manifest.modules {
+        Some(section) => (true, section.provides.clone(), section.connector.as_deref()),
+        None if manifest.id == LEGACY_PROVIDER => (false, vec![PHONE.to_string(), CALENDAR.to_string()], None),
+        None => (false, Vec::new(), None),
     };
     let mut out = Claims { declared, ..Claims::default() };
     for id in named {
+        let id = id.trim().to_string();
+        if id.is_empty() || out.claims.iter().any(|c| c.module == id) || out.unknown.contains(&id) {
+            continue;
+        }
         let Some(def) = def(&id) else {
             out.unknown.push(id);
             continue;
         };
-        out.claims.push(check_claim(manifest, def));
+        out.claims.push(check_claim(manifest, def, connector));
     }
     out
 }
 
-/// A claim is honoured when one of the plugin's connectors declares every command the module uses.
-fn check_claim(manifest: &PluginManifest, def: &'static ModuleDef) -> Claim {
+/// A claim is honoured when one of the plugin's connectors (the one the
+/// section names, if it names one) declares every command the module uses.
+fn check_claim(manifest: &PluginManifest, def: &'static ModuleDef, named: Option<&str>) -> Claim {
     if def.uses.is_empty() {
         return Claim { module: def.id, connector: None, refused: None };
     }
     let missing = |c: &crate::plugins::manifest::ConnectorDecl| -> Vec<&'static str> {
         def.uses.iter().copied().filter(|cmd| !c.commands.iter().any(|x| x == cmd)).collect()
     };
-    if let Some(c) = manifest.connectors.iter().find(|c| missing(c).is_empty()) {
+    let connectors: Vec<&crate::plugins::manifest::ConnectorDecl> =
+        manifest.connectors.iter().filter(|c| named.map_or(true, |n| c.id == n)).collect();
+    if let (Some(n), true) = (named, connectors.is_empty()) {
+        let refused = format!("{} claims {} through the connector \"{n}\", which it does not declare.", manifest.name, def.noun);
+        return Claim { module: def.id, connector: None, refused: Some(refused) };
+    }
+    if let Some(c) = connectors.iter().find(|c| missing(c).is_empty()) {
         return Claim { module: def.id, connector: Some(c.id.clone()), refused: None };
     }
-    let refused = match manifest.connectors.iter().min_by_key(|c| missing(c).len()) {
+    let refused = match connectors.iter().min_by_key(|c| missing(c).len()) {
         None => format!("{} claims {}, but it declares no connector (it needs {}).", manifest.name, def.noun, def.uses.join(", ")),
         Some(c) => format!(
             "{} claims {}, but its connector \"{}\" does not declare {}.",
@@ -718,7 +712,8 @@ mod tests {
     #[test]
     fn a_declared_section_is_what_counts_even_for_aokie() {
         let mut m = aokie_manifest();
-        m["modules"] = json!(["calendar", {"id": "fax"}]);
+        // (A loaded manifest cannot name an unknown module; one built in memory can.)
+        m["modules"] = json!(["calendar", "fax"]);
         let c = claims(&manifest(m.clone()));
         assert!(c.declared);
         assert!(!c.provides(PHONE));
