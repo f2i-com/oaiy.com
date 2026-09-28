@@ -5,6 +5,26 @@ use candle_core::{DType, Device, Result, Tensor};
 use dsv41::safetensors::{Dtype, StIndex};
 use std::path::Path;
 
+/// Stop Candle's CUDA tensors made from here on (on this device) from
+/// carrying events. Candle runs each thread's work on one stream, where the
+/// events cudarc records at every use and waits on when a buffer is freed
+/// order nothing; they cost a driver call per use, and one recorded while a
+/// CUDA graph is captured cannot be waited on afterwards (freeing such a
+/// buffer then leaves an error for the next call to report). Call it before
+/// making the tensors a graph will use; the weights' loaders do.
+pub fn untracked(dev: &Device) {
+    #[cfg(feature = "cuda")]
+    if let Device::Cuda(cuda) = dev {
+        // SAFETY: the events only order work across streams. Candle queues a
+        // thread's work on that thread's one stream, and this crate hands
+        // tensors between threads only after synchronizing the device (at
+        // the end of loading and of every line), so no use depends on them.
+        unsafe { cuda.disable_event_tracking() }
+    }
+    #[cfg(not(feature = "cuda"))]
+    let _ = dev;
+}
+
 /// Named tensors, read on demand.
 pub trait TensorSource {
     /// A weight on `dev`, in the model's compute type (BF16 for the

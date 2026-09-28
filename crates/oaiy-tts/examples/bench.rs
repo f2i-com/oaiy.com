@@ -4,7 +4,7 @@
 //! cargo run --release -p oaiy-tts --features flash-attn --example bench -- \
 //!     --voice clip.wav --transcript "..." --device 1 [--frames 60]
 use oaiy_tts::codec::{CodecDecoder, CodecStream};
-use oaiy_tts::talker::Talker;
+use oaiy_tts::talker::{Draws, Talker};
 use oaiy_tts::{text, Sampling, Tts};
 use std::path::PathBuf;
 use std::time::Instant;
@@ -46,10 +46,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     for round in 0..4 {
         // Rounds alternate where the draws happen: on the device, then on the host.
         let on_device = round % 2 == 0;
+        let draws = if on_device { Draws::Device } else { Draws::Host };
         sync()?;
         let t = Instant::now();
         let (prefill, trailing) = talker.prefill_clone(&text_ids, &ref_ids, &voice, None)?;
-        let mut g = talker.start(&prefill, Some(trailing), Sampling { on_device, ..Sampling::default() })?;
+        let mut g = talker.start(&prefill, Some(trailing), Sampling { draws, ..Sampling::default() })?;
         sync()?;
         let prefill_ms = t.elapsed().as_secs_f64() * 1e3;
         let t = Instant::now();

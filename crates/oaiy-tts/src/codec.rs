@@ -113,6 +113,7 @@ impl CodecDecoder {
     }
 
     pub fn from_source(source: &mut (impl TensorSource + ?Sized), cfg: CodecConfig, dev: &Device) -> Result<Self> {
+        crate::weights::untracked(dev);
         Self::from_tensors(load_prefix_f32(source, "decoder.", dev)?, cfg, dev)
     }
 

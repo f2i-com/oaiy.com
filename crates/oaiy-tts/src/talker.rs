@@ -48,14 +48,25 @@ pub struct Sampling {
     /// Argmax instead of sampling (for tests; it tends to loop on long text).
     pub greedy: bool,
     pub seed: u64,
-    /// On a GPU, draw there (one host round trip a frame instead of 16).
-    /// Top-p below 1 always draws on the host.
-    pub on_device: bool,
+    /// Where the draws happen.
+    pub draws: Draws,
+}
+
+/// Where a frame's codes are drawn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Draws {
+    /// On the device when it is a GPU (one host round trip a frame instead
+    /// of 16, and the frame replays as a CUDA graph), else on the host.
+    Auto,
+    /// On the host, one code at a time (the reference's order of draws).
+    Host,
+    /// With tensor operations, wherever the model is.
+    Device,
 }
 
 impl Default for Sampling {
     fn default() -> Self {
-        Self { temperature: 0.9, top_k: 50, top_p: 1.0, repetition_penalty: 1.05, sub_temperature: 0.9, sub_top_k: 50, greedy: false, seed: 0, on_device: true }
+        Self { temperature: 0.9, top_k: 50, top_p: 1.0, repetition_penalty: 1.05, sub_temperature: 0.9, sub_top_k: 50, greedy: false, seed: 0, draws: Draws::Auto }
     }
 }
 
@@ -98,6 +109,7 @@ impl Talker {
     }
 
     pub fn from_source(mut store: Box<dyn TensorSource + Send>, config: Json, dev: &Device) -> Result<Self> {
+        crate::weights::untracked(dev);
         let tc = config.get("talker_config").ok_or_else(|| msg("config lacks talker_config"))?;
         let cp = tc.get("code_predictor_config").ok_or_else(|| msg("config lacks code_predictor_config"))?;
         let int = |c: &Json, k: &str| c.get(k).and_then(Json::as_i64).map(|v| v as usize).ok_or_else(|| msg(format!("config lacks {k}")));
@@ -246,7 +258,7 @@ impl Talker {
         };
         let specials = self.text(&[TTS_PAD, TTS_BOS, TTS_EOS])?;
         let (pad, bos, eos) = (specials.narrow(1, 0, 1)?, specials.narrow(1, 1, 1)?, specials.narrow(1, 2, 1)?);
-        let speaker = Tensor::from_slice(&voice.speaker, (1, 1, voice.speaker.len()), &self.dev)?.to_dtype(DType::BF16)?;
+        let speaker = Tensor::from_slice(&voice.speaker, (1, 1, voice.speaker.len()), &self.dev)?.to_dtype(self.codec_embedding.dtype())?;
         let codec_side = Tensor::cat(&[self.codec(&prefix)?, speaker, self.codec(&[CODEC_PAD])?], 1)?;
         let n = codec_side.dim(1)?;
         let text_side = Tensor::cat(&[pad.broadcast_as((1, n - 1, pad.dim(2)?))?.contiguous()?, bos], 1)?;
@@ -297,7 +309,12 @@ impl Talker {
             return Ok(None);
         }
         // On a GPU every draw stays there (top-p needs the host).
-        if g.sampling.on_device && !self.dev.is_cpu() && g.sampling.top_p >= 1.0 {
+        let on_device = match g.sampling.draws {
+            Draws::Auto => !self.dev.is_cpu(),
+            Draws::Host => false,
+            Draws::Device => true,
+        };
+        if on_device && g.sampling.top_p >= 1.0 {
             return self.next_frame_on_device(g);
         }
         let s = &g.sampling;
@@ -515,14 +532,14 @@ struct FrameWork {
 
 impl FrameWork {
     fn new(t: &Talker, s: &Sampling) -> Result<Self> {
-        let (dev, h, vocab) = (&t.dev, t.hidden, t.ids.dim(1)?);
+        let (dev, h, vocab, dtype) = (&t.dev, t.hidden, t.ids.dim(1)?, t.codec_embedding.dtype());
         Ok(Self {
-            hidden: Tensor::zeros((1, 1, h), DType::BF16, dev)?,
+            hidden: Tensor::zeros((1, 1, h), dtype, dev)?,
             noise: Tensor::zeros((16, s.top_k.max(s.sub_top_k).max(1)), DType::F32, dev)?,
             allowed: Tensor::zeros((1, vocab), DType::F32, dev)?,
             seen: Tensor::zeros((1, vocab), DType::U8, dev)?,
             codes: Tensor::zeros(16, DType::U32, dev)?,
-            summed: Tensor::zeros((1, 1, h), DType::BF16, dev)?,
+            summed: Tensor::zeros((1, 1, h), dtype, dev)?,
             cache: Cache::new(t.predictor.layers()),
             sampling: s.clone(),
             #[cfg(feature = "cuda")]
@@ -581,5 +598,85 @@ impl Generation {
     /// Text positions still to be read after the prefill.
     pub fn trailing_len(&self) -> usize {
         self.trailing_len
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::weights::InMemory;
+
+    /// A tiny random talker (16 wide, 2 layers, predictor alike) in F32 on
+    /// the CPU, with the real one's ids and layout.
+    fn tiny() -> Result<Talker> {
+        let dev = Device::Cpu;
+        let mut rng = Rng::new(21);
+        let mut w = InMemory { dtype: DType::F32, ..Default::default() };
+        let mut put = |name: String, shape: &[usize], scale: f32, offset: f32| -> Result<()> {
+            let n: usize = shape.iter().product();
+            let v: Vec<f32> = (0..n).map(|_| offset + scale * (rng.uniform() as f32 * 2. - 1.)).collect();
+            w.tensors.insert(name, Tensor::from_vec(v, shape, &dev)?);
+            Ok(())
+        };
+        let (h, heads, kv, hd, inner) = (16usize, 4usize, 2usize, 8usize, 24usize);
+        for prefix in ["talker.model", "talker.code_predictor.model"] {
+            for l in 0..2 {
+                let p = format!("{prefix}.layers.{l}");
+                put(format!("{p}.self_attn.q_proj.weight"), &[heads * hd, h], 0.4, 0.)?;
+                put(format!("{p}.self_attn.k_proj.weight"), &[kv * hd, h], 0.4, 0.)?;
+                put(format!("{p}.self_attn.v_proj.weight"), &[kv * hd, h], 0.4, 0.)?;
+                put(format!("{p}.self_attn.o_proj.weight"), &[h, heads * hd], 0.4, 0.)?;
+                put(format!("{p}.self_attn.q_norm.weight"), &[hd], 0.1, 1.)?;
+                put(format!("{p}.self_attn.k_norm.weight"), &[hd], 0.1, 1.)?;
+                put(format!("{p}.input_layernorm.weight"), &[h], 0.1, 1.)?;
+                put(format!("{p}.post_attention_layernorm.weight"), &[h], 0.1, 1.)?;
+                put(format!("{p}.mlp.gate_proj.weight"), &[inner, h], 0.4, 0.)?;
+                put(format!("{p}.mlp.up_proj.weight"), &[inner, h], 0.4, 0.)?;
+                put(format!("{p}.mlp.down_proj.weight"), &[h, inner], 0.4, 0.)?;
+            }
+            put(format!("{prefix}.norm.weight"), &[h], 0.1, 1.)?;
+        }
+        put("talker.model.codec_embedding.weight".into(), &[3072, h], 1., 0.)?;
+        put("talker.codec_head.weight".into(), &[3072, h], 1., 0.)?;
+        for i in 0..15 {
+            put(format!("talker.code_predictor.model.codec_embedding.{i}.weight"), &[2048, h], 1., 0.)?;
+            put(format!("talker.code_predictor.lm_head.{i}.weight"), &[2048, h], 1., 0.)?;
+        }
+        put("talker.model.text_embedding.weight".into(), &[151_936, h], 1., 0.)?;
+        put("talker.text_projection.linear_fc1.weight".into(), &[h, h], 0.4, 0.)?;
+        put("talker.text_projection.linear_fc1.bias".into(), &[h], 0.1, 0.)?;
+        put("talker.text_projection.linear_fc2.weight".into(), &[h, h], 0.4, 0.)?;
+        put("talker.text_projection.linear_fc2.bias".into(), &[h], 0.1, 0.)?;
+        let decoder = r#"{"num_hidden_layers": 2, "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 8, "rope_theta": 10000"#;
+        let config = format!(r#"{{"talker_config": {decoder}, "num_code_groups": 16, "codec_language_id": {{"english": 2050}}, "code_predictor_config": {decoder}}}}}}}"#);
+        Talker::from_source(Box::new(w), Json::parse(config.as_bytes()).map_err(candle_core::Error::wrap)?, &dev)
+    }
+
+    #[test]
+    fn frames_drawn_on_the_device_match_the_host_draws() -> Result<()> {
+        let mut t = tiny()?;
+        let mut rng = Rng::new(4);
+        let voice = Voice {
+            name: String::new(),
+            description: String::new(),
+            language: "auto".into(),
+            ref_text: String::new(),
+            ref_codes: (0..6).map(|_| std::array::from_fn(|_| (rng.uniform() * 2048.) as u32 % 2048)).collect(),
+            speaker: (0..16).map(|_| rng.uniform() as f32 - 0.5).collect(),
+        };
+        assert!(t.language_id("english")? == Some(2050) && t.language_id("auto")?.is_none());
+        let (text, reference) = ([9707u32, 1879, 13, 358, 646, 1492, 11, 1052], [40u32, 1079, 1588]);
+        let mut frames = Vec::new();
+        for draws in [Draws::Host, Draws::Device] {
+            let (prefill, trailing) = t.prefill_clone(&text, &reference, &voice, None)?;
+            let sampling = Sampling { greedy: true, draws, ..Sampling::default() };
+            frames.push(t.frames(&prefill, Some(trailing), sampling, 8, |_| {})?);
+        }
+        assert!(frames[0].len() >= 2, "the first two frames cannot end the line");
+        assert_eq!(frames[0], frames[1]);
+        // A voice for another model size is refused with a clear message.
+        let wrong = Voice { speaker: vec![0.; 1024], ..voice };
+        assert!(t.prefill_clone(&text, &reference, &wrong, None).is_err());
+        Ok(())
     }
 }

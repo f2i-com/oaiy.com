@@ -49,7 +49,9 @@ fn msg(s: impl Into<String>) -> candle_core::Error {
 pub fn cuda(ordinal: usize) -> Result<Device> {
     #[cfg(feature = "cuda")]
     {
-        Device::new_cuda(ordinal)
+        let dev = Device::new_cuda(ordinal)?;
+        weights::untracked(&dev);
+        Ok(dev)
     }
     #[cfg(not(feature = "cuda"))]
     {
