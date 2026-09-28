@@ -84,6 +84,8 @@ pub struct Talker {
     allowed_early: Tensor,
     /// 0..vocab, for marking drawn ids.
     ids: Tensor,
+    /// The device frame's buffers (and its CUDA graph), made on first use.
+    frame_work: std::sync::Mutex<Option<FrameWork>>,
     dev: Device,
 }
 
@@ -125,6 +127,7 @@ impl Talker {
             allowed: mask(true)?,
             allowed_early: mask(false)?,
             ids: Tensor::arange(0u32, vocab as u32, dev)?.unsqueeze(0)?,
+            frame_work: std::sync::Mutex::new(None),
             talker,
             predictor,
             codec_embedding,
@@ -334,57 +337,108 @@ impl Talker {
     }
 
     /// As the host path, with the draws on the device: the frame's 16 ids come
-    /// back in one read, and its next talker input is summed from the
-    /// embeddings the predictor already looked up.
+    /// back in one read, and the next talker input is summed from the
+    /// embeddings the predictor already looked up. The work between the
+    /// talker's step and that read has the same shapes every frame, so on a
+    /// GPU it is captured once as a CUDA graph and replayed.
     fn next_frame_on_device(&self, g: &mut Generation) -> Result<Option<[u32; 16]>> {
-        let s = g.sampling.clone();
-        let width = s.top_k.max(s.sub_top_k).max(1);
+        let mut slot = self.frame_work.lock().map_err(|_| msg("the frame buffers were poisoned by a panic"))?;
+        if slot.as_ref().is_none_or(|w| !w.fits(&g.sampling)) {
+            *slot = Some(FrameWork::new(self, &g.sampling)?);
+        }
+        let w = slot.as_mut().ok_or_else(|| msg("frame buffers"))?;
+        let width = w.noise.dim(1)?;
         let noise = Tensor::from_vec(gumbel(&mut g.rng, 16 * width), (16, width), &self.dev)?;
-        let vocab = self.ids.dim(1)?;
-        let mut logits = self.codec_head.forward(&g.hidden)?.reshape((1, vocab))?.to_dtype(DType::F32)?;
-        if s.repetition_penalty != 1.0 {
-            let p = s.repetition_penalty;
-            let penalized = logits.ge(0f64)?.where_cond(&logits.affine(1. / p, 0.)?, &logits.affine(p, 0.)?)?;
-            logits = g.seen_on_device.where_cond(&penalized, &logits)?;
-        }
-        let logits = logits.broadcast_add(if g.frames < 2 { &self.allowed_early } else { &self.allowed })?;
-        let c0 = pick(&logits, s.top_k, s.temperature, &noise.narrow(0, 0, 1)?, s.greedy)?;
-        let e0 = self.codec_embedding.index_select(&c0, 0)?.unsqueeze(0)?;
-        let mut codes = vec![c0.clone()];
-        let mut embeddings = vec![e0.clone()];
-        let cache = &mut g.predictor_cache;
-        cache.reset();
-        let mut h = self.predictor.forward(&self.project(&Tensor::cat(&[&g.hidden, &e0], 1)?)?, cache)?;
-        let heads = self.predictor_heads.len();
-        for (i, head) in self.predictor_heads.iter().enumerate() {
-            let last = h.narrow(1, h.dim(1)? - 1, 1)?;
-            let l = head.forward(&last)?.flatten_all()?.to_dtype(DType::F32)?;
-            let l = l.reshape((1, l.elem_count()))?;
-            let code = pick(&l, s.sub_top_k, s.sub_temperature, &noise.narrow(0, i + 1, 1)?, s.greedy)?;
-            let e = self.predictor_embeddings[i].index_select(&code, 0)?.unsqueeze(0)?;
-            if i + 1 < heads {
-                h = self.predictor.forward(&self.project(&e)?, cache)?;
-            }
-            codes.push(code);
-            embeddings.push(e);
-        }
-        let ids = Tensor::cat(&codes, 0)?.to_vec1::<u32>()?;
+        w.hidden.slice_set(&g.hidden.contiguous()?, 2, 0)?;
+        w.noise.slice_set(&noise, 1, 0)?;
+        w.allowed.slice_set(if g.frames < 2 { &self.allowed_early } else { &self.allowed }, 1, 0)?;
+        w.seen.slice_set(&g.seen_on_device, 1, 0)?;
+        self.run_frame(w)?;
+        let ids = w.codes.to_vec1::<u32>()?;
         if ids[0] == CODEC_EOS {
             g.done = true;
             return Ok(None);
         }
         let frame: [u32; 16] = ids.try_into().map_err(|_| msg("a frame needs 16 codes"))?;
-        let drawn = self.ids.broadcast_eq(&c0.reshape((1, 1))?)?;
-        g.seen_on_device = g.seen_on_device.maximum(&drawn)?;
+        g.seen_on_device = w.seen.copy()?;
         let step = g.frames;
         g.frames += 1;
         let text = match &g.trailing {
             Some(t) if step < g.trailing_len => t.narrow(1, step, 1)?,
             _ => g.pad.clone(),
         };
-        let summed = Tensor::cat(&embeddings, 1)?.sum_keepdim(1)?;
-        g.hidden = self.talker.forward(&(summed + text)?, &mut g.cache)?;
+        g.hidden = self.talker.forward(&(&w.summed + text)?, &mut g.cache)?;
         Ok(Some(frame))
+    }
+
+    /// The frame's work: replayed from its graph when there is one for this
+    /// thread, else captured (on CUDA) or run as it is.
+    fn run_frame(&self, w: &mut FrameWork) -> Result<()> {
+        #[cfg(feature = "cuda")]
+        if let candle_core::Device::Cuda(cuda) = &self.dev {
+            let here = std::thread::current().id();
+            if let Some(graph) = w.graph.as_ref().filter(|g| g.thread == here) {
+                return graph.graph.launch().map_err(candle_core::Error::wrap);
+            }
+            w.graph = None;
+            // Warm up with the parameter cache on (Candle then keeps the small
+            // shape uploads strided kernels make on the device, where the
+            // capture can reuse them), then capture the same work.
+            let _cache = cuda.enable_cuda_graph_htod_cache();
+            self.frame_ops(w)?;
+            self.dev.synchronize()?;
+            let stream = cuda.cuda_stream();
+            use candle_core::cuda_backend::cudarc::driver::sys;
+            stream.begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED).map_err(candle_core::Error::wrap)?;
+            let captured = self.frame_ops(w);
+            let graph = stream.end_capture(sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH);
+            captured?;
+            if let Some(graph) = graph.map_err(candle_core::Error::wrap)? {
+                graph.upload().map_err(candle_core::Error::wrap)?;
+                w.graph = Some(FrameGraph { graph, thread: here });
+            }
+            // The warm-up already made this frame's outputs; the capture only
+            // recorded the work.
+            return Ok(());
+        }
+        self.frame_ops(w)
+    }
+
+    /// Draw the first code (penalized, masked), predict and draw the other
+    /// 15, and sum the next input, from and into `w`'s buffers.
+    fn frame_ops(&self, w: &mut FrameWork) -> Result<()> {
+        let s = &w.sampling;
+        let vocab = self.ids.dim(1)?;
+        let mut logits = self.codec_head.forward(&w.hidden)?.reshape((1, vocab))?.to_dtype(DType::F32)?;
+        if s.repetition_penalty != 1.0 {
+            let p = s.repetition_penalty;
+            let penalized = logits.ge(0f64)?.where_cond(&logits.affine(1. / p, 0.)?, &logits.affine(p, 0.)?)?;
+            logits = w.seen.where_cond(&penalized, &logits)?;
+        }
+        let logits = (logits + &w.allowed)?;
+        let c0 = pick(&logits, s.top_k, s.temperature, &w.noise.narrow(0, 0, 1)?, s.greedy)?;
+        let e0 = self.codec_embedding.index_select(&c0, 0)?.unsqueeze(0)?;
+        let mut codes = vec![c0.clone()];
+        let mut embeddings = vec![e0.clone()];
+        w.cache.reset();
+        let mut h = self.predictor.forward(&self.project(&Tensor::cat(&[&w.hidden, &e0], 1)?)?, &mut w.cache)?;
+        let heads = self.predictor_heads.len();
+        for (i, head) in self.predictor_heads.iter().enumerate() {
+            let last = h.narrow(1, h.dim(1)? - 1, 1)?;
+            let l = head.forward(&last)?.flatten_all()?.to_dtype(DType::F32)?;
+            let l = l.reshape((1, l.elem_count()))?;
+            let code = pick(&l, s.sub_top_k, s.sub_temperature, &w.noise.narrow(0, i + 1, 1)?, s.greedy)?;
+            let e = self.predictor_embeddings[i].index_select(&code, 0)?.unsqueeze(0)?;
+            if i + 1 < heads {
+                h = self.predictor.forward(&self.project(&e)?, &mut w.cache)?;
+            }
+            codes.push(code);
+            embeddings.push(e);
+        }
+        w.codes.slice_set(&Tensor::cat(&codes, 0)?, 0, 0)?;
+        let seen = w.seen.maximum(&self.ids.broadcast_eq(&c0.reshape((1, 1))?)?)?;
+        w.seen.slice_set(&seen, 1, 0)?;
+        w.summed.slice_set(&Tensor::cat(&embeddings, 1)?.sum_keepdim(1)?, 2, 0)
     }
 
     fn project(&self, x: &Tensor) -> Result<Tensor> {
@@ -441,6 +495,63 @@ impl Talker {
         Ok(frames)
     }
 }
+
+/// A frame's device work between fixed buffers, so that it can be replayed as
+/// a CUDA graph: in, the talker's hidden state, Gumbel noise, the allowed
+/// first codes and those already drawn; out, the 16 codes and the next input.
+struct FrameWork {
+    hidden: Tensor,
+    noise: Tensor,
+    allowed: Tensor,
+    seen: Tensor,
+    codes: Tensor,
+    summed: Tensor,
+    cache: Cache,
+    /// What the work was made for: the draws' settings are baked into a graph.
+    sampling: Sampling,
+    #[cfg(feature = "cuda")]
+    graph: Option<FrameGraph>,
+}
+
+impl FrameWork {
+    fn new(t: &Talker, s: &Sampling) -> Result<Self> {
+        let (dev, h, vocab) = (&t.dev, t.hidden, t.ids.dim(1)?);
+        Ok(Self {
+            hidden: Tensor::zeros((1, 1, h), DType::BF16, dev)?,
+            noise: Tensor::zeros((16, s.top_k.max(s.sub_top_k).max(1)), DType::F32, dev)?,
+            allowed: Tensor::zeros((1, vocab), DType::F32, dev)?,
+            seen: Tensor::zeros((1, vocab), DType::U8, dev)?,
+            codes: Tensor::zeros(16, DType::U32, dev)?,
+            summed: Tensor::zeros((1, 1, h), DType::BF16, dev)?,
+            cache: Cache::new(t.predictor.layers()),
+            sampling: s.clone(),
+            #[cfg(feature = "cuda")]
+            graph: None,
+        })
+    }
+
+    fn fits(&self, s: &Sampling) -> bool {
+        let a = &self.sampling;
+        (a.temperature, a.top_k, a.repetition_penalty, a.sub_temperature, a.sub_top_k, a.greedy) == (s.temperature, s.top_k, s.repetition_penalty, s.sub_temperature, s.sub_top_k, s.greedy)
+    }
+}
+
+/// A captured frame, and the thread it was captured on: it replays on that
+/// thread's stream, with Candle's (thread-local) cached kernel parameters.
+#[cfg(feature = "cuda")]
+struct FrameGraph {
+    graph: candle_core::cuda_backend::cudarc::driver::CudaGraph,
+    thread: std::thread::ThreadId,
+}
+
+// SAFETY: CUDA graph objects must not be used from two threads at the same
+// time. A `FrameGraph` lives inside the talker's `frame_work` mutex, so only
+// one thread touches it at once, and it is launched only on the thread that
+// captured it (`run_frame` checks `thread` and captures anew elsewhere);
+// moving it to another thread otherwise only drops it there, which destroys
+// the graph through the driver API with no other user.
+#[cfg(feature = "cuda")]
+unsafe impl Send for FrameGraph {}
 
 /// One line being spoken: the talker's cache and where it is in the text.
 pub struct Generation {

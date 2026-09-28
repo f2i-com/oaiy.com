@@ -16,15 +16,9 @@ impl Linear {
         let b = if store.has(&bias) { Some(store.load(&bias, dev)?) } else { None };
         Ok(Self { w, b })
     }
-    /// `x`: (..., in) to (..., out). One 2-D product: a batched (broadcast)
-    /// one costs cuBLAS twice the launch time, which dominates at one token.
+    /// `x`: (..., in) to (..., out).
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let dims = x.dims();
-        let (rows, input) = (x.elem_count() / dims[dims.len() - 1], dims[dims.len() - 1]);
-        let y = x.reshape((rows, input))?.matmul(&self.w.t()?)?;
-        let mut out = dims.to_vec();
-        *out.last_mut().ok_or_else(|| candle_core::Error::Msg("linear: input has no axes".into()))? = self.w.dim(0)?;
-        let y = y.reshape(out)?;
+        let y = matmul_t(x, &self.w)?;
         match &self.b {
             Some(b) => y.broadcast_add(b),
             None => Ok(y),
@@ -39,6 +33,20 @@ impl Linear {
     pub fn bytes(&self) -> u64 {
         tensor_bytes([&self.w].into_iter().chain(self.b.as_ref()))
     }
+}
+
+/// `x` (..., in) times `w` (out, in) transposed: (..., out), as one 2-D
+/// product. A batched (broadcast) product costs cuBLAS twice the launch time
+/// and runs slower, which dominates at one token.
+pub fn matmul_t(x: &Tensor, w: &Tensor) -> Result<Tensor> {
+    let dims = x.dims();
+    let input = *dims.last().ok_or_else(|| candle_core::Error::Msg("matmul: input has no axes".into()))?;
+    let y = x.reshape((x.elem_count() / input, input))?.matmul(&w.t()?)?;
+    let mut out = dims.to_vec();
+    if let Some(last) = out.last_mut() {
+        *last = w.dim(0)?;
+    }
+    y.reshape(out)
 }
 
 fn rms(x: &Tensor, w: &Tensor, eps: f32) -> Result<Tensor> {

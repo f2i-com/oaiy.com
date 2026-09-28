@@ -65,8 +65,39 @@ pub struct CodecDecoder {
     /// Codebook vectors (2048 x 256) for each of the 16 quantizers.
     codebooks: Vec<Tensor>,
     cfg: CodecConfig,
+    /// The transformer's RoPE tables and mask for short windows, by length
+    /// (made once: a streamed window's length repeats).
+    positions: std::sync::Mutex<HashMap<usize, (Tensor, Tensor, Tensor)>>,
+    /// Captured streaming windows, by length (CUDA).
+    #[cfg(feature = "cuda")]
+    graphs: std::sync::Mutex<HashMap<usize, WindowGraph>>,
     dev: Device,
 }
+
+/// Windows at most this long keep their positional tables (and may be
+/// captured as graphs).
+const SHORT_WINDOW: usize = 64;
+/// Captured window lengths kept at most (each holds its own buffers).
+#[cfg(feature = "cuda")]
+const MAX_GRAPHS: usize = 8;
+
+/// A captured decode of one window length: its codes in, its audio out, and
+/// the thread it was captured on (it replays only there).
+#[cfg(feature = "cuda")]
+struct WindowGraph {
+    ids: Tensor,
+    wave: Tensor,
+    graph: candle_core::cuda_backend::cudarc::driver::CudaGraph,
+    thread: std::thread::ThreadId,
+}
+
+// SAFETY: CUDA graph objects must not be used from two threads at the same
+// time. A `WindowGraph` lives inside the decoder's `graphs` mutex, so one
+// thread touches it at once, and it is launched only on the thread that
+// captured it (`forward_streamed` checks `thread`); elsewhere it is only
+// dropped, which destroys the graph with no other user.
+#[cfg(feature = "cuda")]
+unsafe impl Send for WindowGraph {}
 
 fn msg(s: impl Into<String>) -> candle_core::Error {
     candle_core::Error::Msg(s.into())
@@ -97,7 +128,15 @@ impl CodecDecoder {
         for i in 0..cfg.quantizers - 1 {
             codebooks.push(codebook("rvq_rest", i)?);
         }
-        Ok(Self { w, codebooks, cfg, dev: dev.clone() })
+        Ok(Self {
+            w,
+            codebooks,
+            cfg,
+            positions: Default::default(),
+            #[cfg(feature = "cuda")]
+            graphs: Default::default(),
+            dev: dev.clone(),
+        })
     }
 
     /// Device bytes held.
@@ -135,7 +174,60 @@ impl CodecDecoder {
 
     /// One full-sequence decode, left on the device: (1, 1, samples).
     pub fn forward_tensor(&self, frames: &[[u32; 16]]) -> Result<Tensor> {
-        let h = self.quantized(frames)?;
+        self.forward_ids(&self.ids(frames)?)
+    }
+
+    /// The frames' codes as one (16, T) tensor on the device (one upload).
+    fn ids(&self, frames: &[[u32; 16]]) -> Result<Tensor> {
+        let t = frames.len();
+        let flat: Vec<u32> = (0..16).flat_map(|q| frames.iter().map(move |f| f[q])).collect();
+        Tensor::from_vec(flat, (16, t), &self.dev)
+    }
+
+    /// As `forward_tensor`, for a streamed window: on CUDA, each window length
+    /// is captured once as a graph and replayed (a window is hundreds of small
+    /// kernels, whose launches cost more than their work).
+    pub fn forward_streamed(&self, frames: &[[u32; 16]]) -> Result<Tensor> {
+        let ids = self.ids(frames)?;
+        #[cfg(feature = "cuda")]
+        if let (Device::Cuda(cuda), true) = (&self.dev, frames.len() <= SHORT_WINDOW) {
+            let t = frames.len();
+            let here = std::thread::current().id();
+            let mut graphs = self.graphs.lock().map_err(|_| msg("codec graphs poisoned by a panic"))?;
+            if let Some(g) = graphs.get(&t).filter(|g| g.thread == here) {
+                g.ids.slice_set(&ids, 1, 0)?;
+                g.graph.launch().map_err(candle_core::Error::wrap)?;
+                return g.wave.copy();
+            }
+            if graphs.len() >= MAX_GRAPHS {
+                graphs.clear();
+            }
+            // Warm up with Candle's parameter cache on (the strided kernels'
+            // shape uploads stay on the device for the capture to reuse),
+            // then capture the same work between fixed buffers.
+            let _cache = cuda.enable_cuda_graph_htod_cache();
+            let bufs = (ids.copy()?, Tensor::zeros((1, 1, t * SAMPLES_PER_FRAME), DType::F32, &self.dev)?);
+            let out = self.forward_ids(&bufs.0)?;
+            bufs.1.slice_set(&out, 2, 0)?;
+            self.dev.synchronize()?;
+            use candle_core::cuda_backend::cudarc::driver::sys;
+            let stream = cuda.cuda_stream();
+            stream.begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED).map_err(candle_core::Error::wrap)?;
+            let captured = self.forward_ids(&bufs.0).and_then(|w| bufs.1.slice_set(&w, 2, 0));
+            let graph = stream.end_capture(sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH);
+            captured?;
+            if let Some(graph) = graph.map_err(candle_core::Error::wrap)? {
+                graph.upload().map_err(candle_core::Error::wrap)?;
+                graphs.insert(t, WindowGraph { ids: bufs.0, wave: bufs.1, graph, thread: here });
+            }
+            return Ok(out);
+        }
+        self.forward_ids(&ids)
+    }
+
+    /// Decode (16, T) codes: (1, 1, T * 1920) samples.
+    fn forward_ids(&self, ids: &Tensor) -> Result<Tensor> {
+        let h = self.quantized(ids)?;
         let h = self.pre_conv(&h)?;
         let h = self.transformer(&h.transpose(1, 2)?.contiguous()?)?;
         let h = self.upsample(&h.transpose(1, 2)?.contiguous()?)?;
@@ -143,10 +235,9 @@ impl CodecDecoder {
     }
 
     /// Sum of the 16 codebooks' vectors, each group through its output
-    /// projection: (1, 512, T).
-    fn quantized(&self, frames: &[[u32; 16]]) -> Result<Tensor> {
-        let t = frames.len();
-        let ids = |q: usize| -> Result<Tensor> { Tensor::from_vec(frames.iter().map(|f| f[q]).collect::<Vec<u32>>(), t, &self.dev) };
+    /// projection: (1, 512, T). `codes`: (16, T).
+    fn quantized(&self, codes: &Tensor) -> Result<Tensor> {
+        let ids = |q: usize| codes.get(q);
         let first = self.codebooks[0].index_select(&ids(0)?, 0)?;
         let mut rest = self.codebooks[1].index_select(&ids(1)?, 0)?;
         for q in 2..self.codebooks.len() {
@@ -184,7 +275,7 @@ impl CodecDecoder {
     }
 
     fn linear(&self, x: &Tensor, prefix: &str) -> Result<Tensor> {
-        let y = x.broadcast_matmul(&self.get(&format!("{prefix}.weight"))?.t()?)?;
+        let y = crate::model::matmul_t(x, self.get(&format!("{prefix}.weight"))?)?;
         match self.w.get(&format!("{prefix}.bias")) {
             Some(b) => y.broadcast_add(b),
             None => Ok(y),
@@ -205,14 +296,7 @@ impl CodecDecoder {
         let window = self.cfg.window;
         let mut h = self.linear(x, &format!("{p}.input_proj"))?;
         let head_dim = self.get(&format!("{p}.layers.0.self_attn.q_proj.weight"))?.dim(0)? / heads;
-        // Rotate-half RoPE from position 0.
-        let inv: Vec<f32> = (0..head_dim / 2).map(|i| 1. / self.cfg.rope_theta.powf(2. * i as f64 / head_dim as f64) as f32).collect();
-        let freqs: Vec<f32> = (0..t).flat_map(|pos| inv.iter().map(move |f| pos as f32 * f)).collect();
-        let freqs = Tensor::from_vec(freqs, (t, head_dim / 2), &self.dev)?;
-        let (cos, sin) = (freqs.cos()?, freqs.sin()?);
-        // Causal, and at most `window` keys back (the current one included).
-        let mask: Vec<f32> = (0..t).flat_map(|q| (0..t).map(move |k| if k <= q && k + window > q { 0. } else { f32::NEG_INFINITY })).collect();
-        let mask = Tensor::from_vec(mask, (t, t), &self.dev)?;
+        let (cos, sin, mask) = self.positional(t, head_dim, window)?;
         let scale = 1. / (head_dim as f64).sqrt();
         for i in 0..self.cfg.layers {
             let l = format!("{p}.layers.{i}");
@@ -233,6 +317,26 @@ impl CodecDecoder {
         }
         let h = self.rms(&h, &format!("{p}.norm.weight"), 1e-5)?;
         self.linear(&h, &format!("{p}.output_proj"))
+    }
+
+    /// RoPE tables (rotate-half, from position 0) and the attention mask
+    /// (causal, at most `window` keys back, the current one included) for `t`
+    /// frames; kept for short windows.
+    fn positional(&self, t: usize, head_dim: usize, window: usize) -> Result<(Tensor, Tensor, Tensor)> {
+        if t <= SHORT_WINDOW {
+            if let Some(p) = self.positions.lock().map_err(|_| msg("codec tables poisoned by a panic"))?.get(&t) {
+                return Ok(p.clone());
+            }
+        }
+        let inv: Vec<f32> = (0..head_dim / 2).map(|i| 1. / self.cfg.rope_theta.powf(2. * i as f64 / head_dim as f64) as f32).collect();
+        let freqs: Vec<f32> = (0..t).flat_map(|pos| inv.iter().map(move |f| pos as f32 * f)).collect();
+        let freqs = Tensor::from_vec(freqs, (t, head_dim / 2), &self.dev)?;
+        let mask: Vec<f32> = (0..t).flat_map(|q| (0..t).map(move |k| if k <= q && k + window > q { 0. } else { f32::NEG_INFINITY })).collect();
+        let p = (freqs.cos()?, freqs.sin()?, Tensor::from_vec(mask, (t, t), &self.dev)?);
+        if t <= SHORT_WINDOW {
+            self.positions.lock().map_err(|_| msg("codec tables poisoned by a panic"))?.insert(t, p.clone());
+        }
+        Ok(p)
     }
 
     /// Two stages of a 2x transposed conv and a ConvNeXt block. (1, C, T).
@@ -345,7 +449,7 @@ impl CodecStream {
         let n = self.context.len();
         let mut window = self.context.clone();
         window.extend_from_slice(frames);
-        let wave = codec.forward_tensor(&window)?.flatten_all()?;
+        let wave = codec.forward_streamed(&window)?.flatten_all()?;
         let new = wave.narrow(0, n * SAMPLES_PER_FRAME, frames.len() * SAMPLES_PER_FRAME)?.to_vec1::<f32>()?;
         self.remember(frames);
         Ok(new)
@@ -529,7 +633,7 @@ pub(crate) mod tests {
             }
             Ok(())
         };
-        let q = dec.quantized(&frames)?;
+        let q = dec.quantized(&dec.ids(&frames)?)?;
         check("dec_quantized.f32", &q.squeeze(0)?, &[512, t], 1e-5)?;
         let pc = dec.pre_conv(&q)?;
         check("dec_pre_conv.f32", &pc.squeeze(0)?, &[1024, t], 1e-5)?;

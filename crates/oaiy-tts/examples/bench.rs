@@ -64,7 +64,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let per_frame = t.elapsed().as_secs_f64() * 1e3 / made.len().max(1) as f64;
         println!("round {round} (draws on the {}): prefill ({} positions) {prefill_ms:.1} ms; {} frames at {per_frame:.2} ms a frame ({:.1} frames/s)", if on_device { "device" } else { "host" }, prefill.dim(1)?, made.len(), 1e3 / per_frame);
         for chunk in [1usize, 2, 4, 8] {
+            // Once to warm up (and capture), then timed.
             let mut stream = CodecStream::primed(25, &voice.ref_codes);
+            for c in made.chunks(chunk).take(2) {
+                stream.push(&codec, c)?;
+            }
             sync()?;
             let t = Instant::now();
             let mut n = 0;

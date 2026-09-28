@@ -168,7 +168,7 @@ impl Tts {
         // Frames are made on whichever thread calls `speak`; the weights must
         // be on the device before another thread's stream reads them.
         dev.synchronize()?;
-        Ok(Self {
+        let mut tts = Self {
             talker,
             codec,
             tokenizer,
@@ -179,7 +179,35 @@ impl Tts {
             ffmpeg: PathBuf::from("ffmpeg"),
             voice_cache: Some(std::env::temp_dir().join("oaiy-tts-voices")),
             options: SpeakOptions::default(),
-        })
+        };
+        tts.warm_up()?;
+        Ok(tts)
+    }
+
+    /// Speak a few frames of nothing, so the first real line does not pay
+    /// for loading kernels and capturing the CUDA graphs a line replays.
+    /// `load` does this; the graphs belong to the thread that captured them,
+    /// so a server that speaks on another thread calls this there first (or
+    /// its first line there pays about a third of a second). Run it again
+    /// after changing `options.sampling`.
+    pub fn warm_up(&mut self) -> Result<()> {
+        let voice = Voice {
+            name: String::new(),
+            description: String::new(),
+            language: "auto".into(),
+            ref_text: "Hello.".into(),
+            ref_codes: vec![[0; 16]; self.options.context_frames.max(1)],
+            speaker: vec![0.; self.width()],
+        };
+        let saved = self.options.clone();
+        // Four frames: chunks of one frame and of `chunk_frames`, so both
+        // window lengths are captured.
+        self.options.max_seconds = (1 + 2 * saved.chunk_frames.max(1)) as f64 / talker::FRAMES_PER_SECOND;
+        self.options.trim_leading_silence = false;
+        self.options.language = "auto".into();
+        let r = self.speak("Hello there, this warms the engine up.", &voice, &AtomicBool::new(false), |_| {});
+        self.options = saved;
+        r.map(|_| ())
     }
 
     pub fn device(&self) -> &Device {
