@@ -1465,7 +1465,8 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
       test: (body) => {
         void sessions?.textArrived(TEST_NUMBER, 'Test', body).then((session) => selectSession(session.id));
       },
-      screening: desktop ? { load: readScreening, save: saveScreening } : undefined,
+      // The phone refusing who is answered (a pattern it cannot read, or the phone gone) is said, and the rest is still saved.
+      screening: desktop ? { load: readScreening, save: (s) => saveScreening(s).catch((e: unknown) => chat.system(`The phone did not take who is answered: ${(e as Error).message}`, 'error')) } : undefined,
       callbacks: callbacks?.list,
     });
     if (saved) {
