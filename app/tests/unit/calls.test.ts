@@ -211,7 +211,7 @@ describe('a phone call answered by the agent', () => {
         return { text: 'Yes, we are open on Saturday from nine. Anything else?' };
       },
       { calls: [{ name: 'end_call', input: { goodbye: 'Thanks, bye!' } }] },
-      { text: '' },
+      { text: 'Done.' },
     ]);
     const { sessions, calls } = setup();
     const call = await sessions.callEvent({ type: 'call.started', callId: 'call_1', from: '+61 491 570 006', name: 'Lance', instructions: 'You are Aokie.', greeting: 'Thanks for calling!' });
@@ -224,6 +224,7 @@ describe('a phone call answered by the agent', () => {
     ]);
     await sessions.callEvent({ type: 'call.caller', callId: 'call_1', text: "No, that's all, thanks." });
     await settled(sessions);
+    // Nothing is said after the goodbye (a model may write "Done." after end_call).
     expect(calls.at(-1)).toEqual(['finish', 'call_1', 'Thanks, bye!']);
     await sessions.callEvent({ type: 'call.ended', callId: 'call_1', reason: 'hung up' });
     expect(call?.callId).toBeUndefined();

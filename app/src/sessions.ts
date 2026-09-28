@@ -1069,8 +1069,9 @@ export class Sessions {
         if (event.type === 'tool_result') {
           session.inTool = false;
           stopHolding();
-          // What it says next is heard, even if the caller spoke over the words before the tool.
-          session.speech?.begin(true);
+          // What it says next is heard, even if the caller spoke over the words before the tool;
+          // but nothing after the goodbye (end_call): the call is ending.
+          if (event.result.name !== 'end_call') session.speech?.begin(true);
         }
         if (session.speech && event.type === 'text') session.speech.push(event.delta);
         // A reply ends (a tool is called, or the model's turn is over): what it said is complete.
