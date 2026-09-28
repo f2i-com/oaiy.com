@@ -48,13 +48,12 @@ fn forward_error_message(
 ) -> String {
     use crate::plugins::ForwardError;
     match error {
-        ForwardError::Refused(refusal) => format!(
-            "the {connector} plugin does not offer {command:?} ({refusal:?})"
-        ),
+        // The refusal's own sentence (what to do), not its debug print.
+        ForwardError::Refused(refusal) => refusal.message(),
         ForwardError::NotRunning { plugin_id } => {
             format!("the {plugin_id} plugin is not running on this desktop")
         }
-        ForwardError::Call(e) => format!("the {connector} plugin did not answer {command:?}: {e:?}"),
+        ForwardError::Call(e) => format!("the {connector} plugin did not answer {command:?}: {e}"),
         ForwardError::Internal(message) => message,
     }
 }

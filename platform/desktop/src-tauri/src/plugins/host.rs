@@ -1241,13 +1241,13 @@ impl PluginHost {
             self.forward_connector(connector_id, command, payload, Some(key), CONNECTOR_TIMEOUT)
                 .map_err(|e| match e {
                     ForwardError::Refused(refusal) => {
-                        format!("the {connector_id} plugin does not offer {command:?} ({refusal:?})")
+                        refusal.message()
                     }
                     ForwardError::NotRunning { plugin_id } => {
                         format!("the {plugin_id} plugin is not running on this desktop")
                     }
                     ForwardError::Call(err) => {
-                        format!("the {connector_id} plugin did not answer {command:?}: {err:?}")
+                        format!("the {connector_id} plugin did not answer {command:?}: {err}")
                     }
                     ForwardError::Internal(message) => message,
                 })
