@@ -750,7 +750,7 @@ export const TOOLS: ToolSpec[] = [
   {
     name: 'sandbox_shell',
     description:
-      'Run shell commands in bot.computer\'s emulated POSIX-style shell (on the Zipp VM, confined to the project; "/" is the project root). ' +
+      'Run shell commands in OAIY\'s emulated POSIX-style shell (on the Zipp VM, confined to the project; "/" is the project root). ' +
       'Bash syntax (pipes, && || ;, redirects, heredocs, $VAR/$(...)/$((...)), arrays, brace expansion, globs, if/for/while/case, functions) and built-in ls cat head tail grep find sed awk sort uniq cut tr wc diff patch mkdir cp mv rm touch tree xargs tee printf echo, ' +
       'jq, tar zip unzip gzip, md5sum/sha256sum, xxd, file, column, bc, and git (a local repository in .git/: init status add commit log diff show branch switch merge stash reset restore tag; no remotes), ' +
       'curl/wget (through the /internet gate; CORS applies), and node/js FILE and python FILE / -m / -c on Zipp. ' +

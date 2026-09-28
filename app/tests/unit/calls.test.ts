@@ -233,7 +233,7 @@ describe('a phone call answered by the agent', () => {
       { role: 'assistant', text: 'Yes, I can hear you!', calls: [] },
       { role: 'user', text: "Caller: What's your availability?" },
       { role: 'assistant', text: check, calls: [] },
-      { role: 'user', text: '[bot.computer] You said what you will do…', automatic: true },
+      { role: 'user', text: '[OAIY] You said what you will do…', automatic: true },
       { role: 'assistant', text: check, calls: [] },
       { role: 'assistant', text: '', calls: [{ id: 't1', name: 'lookup_business_data', input: {} }] },
       { role: 'tool', results: [{ id: 't1', name: 'lookup_business_data', content: '{}', isError: false }] },

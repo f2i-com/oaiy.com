@@ -138,7 +138,7 @@ const DEFAULT_CHARS_PER_TOKEN = 3.5;
 /** What an image costs, in tokens (about what vision models charge for one of ~1 megapixel). */
 const IMAGE_TOKENS = 1600;
 
-const SUMMARIZER_PROMPT = `You compress the conversation of a coding agent (bot.computer) so it can carry on with less context. Write a summary the agent can continue from as if it had read everything, with these sections (leave out empty ones):
+const SUMMARIZER_PROMPT = `You compress the conversation of a coding agent (OAIY's) so it can carry on with less context. Write a summary the agent can continue from as if it had read everything, with these sections (leave out empty ones):
 Goal: what the user asked for, in their words where it matters, including the request being worked on now.
 Decisions and constraints: what was agreed or ruled out, and why.
 Files: the files read, and the files created or changed with what changed in each.
@@ -220,7 +220,7 @@ const MEDIA_EDIT_GUIDE = `- media_info, video_frames, video_split and media_comp
  * needs (an app, a video, pictures, a long document) is in its guide, read
  * when the work calls for it (see GUIDES).
  */
-const BASE_PROMPT = `You are bot.computer, an agent working in the user's project inside their web browser. The project is a virtual filesystem: "/" is its root, and there is nothing outside it.
+const BASE_PROMPT = `You are OAIY, an agent working in the user's project inside their web browser. The project is a virtual filesystem: "/" is its root, and there is nothing outside it.
 
 The user's request is your task: do what it asks, as it asks it. Your tools say what each one does. Before work that has a guide (the guide tool lists them), read that guide first.
 
@@ -248,8 +248,8 @@ const GUIDE_WORDS: Array<[GuideTopic, RegExp]> = [
 ];
 
 /** The note that a guide was read (in a tool result): from then on it is part of the instructions. */
-const guideLoaded = (topic: GuideTopic) => `[bot.computer] The ${topic} guide is now in your instructions`;
-const GUIDE_MARK = /\[bot\.computer\] The (app|web|video|media|document) guide is now in your instructions/g;
+const guideLoaded = (topic: GuideTopic) => `[OAIY] The ${topic} guide is now in your instructions`;
+const GUIDE_MARK = /\[(?:OAIY|bot\.computer)\] The (app|web|video|media|document) guide is now in your instructions/g;
 
 /** The app tools: offered once the app guide is read, or when the project has an app. */
 const SOFTN_TOOLS = new Set(['softn_docs', 'softn_components', 'softn_examples', 'softn_check', 'softn_inspect', 'softn_interact', 'softn_import']);
@@ -264,7 +264,7 @@ const APP_FILE = /(^|\/)(manifest\.json|[^/]+\.(ui|logic))$/;
 /** A web page: writing one reads the web guide. */
 const WEB_FILE = /\.html?$/i;
 
-const APP_GUIDE = `- A SoftN app is a folder whose manifest.json names a .ui page as "main" (with ui/*.ui pages and logic/*.logic or .py). A project can hold several, each in its own folder: to rebuild or learn from an existing app, read its files and write the new one in another folder. A .softn the user attaches is unpacked into its own folder (the original stays in uploads/, and softn_import unpacks any .softn in the project): when they ask for changes, edit that folder; when they ask to recreate, redo or base something on it, write a new app in a new folder and leave the original as it is. The SoftN reference is in your tools, so do not guess the language: softn_docs with no arguments gives the map, topic "guide" is the writing guide (read it before your first app), search finds how something is done across the guides, the components and the example apps; softn_components gives exact props and events; softn_examples has complete working apps to read or copy. Keep manifest.json true. After each step that changes an app, bot.computer checks it automatically (its files, then a real render) and adds the outcome to that step's result: when it reports errors, fix them before anything else. softn_check checks on demand; softn_inspect shows what the page displays; softn_interact uses the app like a person (click, fill, select, press keys) and reports errors the app raises, so test that the app works, not just that it renders. The user watches the app in a live preview as you build it, and can export any app folder as a .softn file.
+const APP_GUIDE = `- A SoftN app is a folder whose manifest.json names a .ui page as "main" (with ui/*.ui pages and logic/*.logic or .py). A project can hold several, each in its own folder: to rebuild or learn from an existing app, read its files and write the new one in another folder. A .softn the user attaches is unpacked into its own folder (the original stays in uploads/, and softn_import unpacks any .softn in the project): when they ask for changes, edit that folder; when they ask to recreate, redo or base something on it, write a new app in a new folder and leave the original as it is. The SoftN reference is in your tools, so do not guess the language: softn_docs with no arguments gives the map, topic "guide" is the writing guide (read it before your first app), search finds how something is done across the guides, the components and the example apps; softn_components gives exact props and events; softn_examples has complete working apps to read or copy. Keep manifest.json true. After each step that changes an app, OAIY checks it automatically (its files, then a real render) and adds the outcome to that step's result: when it reports errors, fix them before anything else. softn_check checks on demand; softn_inspect shows what the page displays; softn_interact uses the app like a person (click, fill, select, press keys) and reports errors the app raises, so test that the app works, not just that it renders. The user watches the app in a live preview as you build it, and can export any app folder as a .softn file.
 - preview_screenshot shows you how the app looks (look at it and fix what looks wrong), and preview_viewport sets the screen size it is shown at (phone, tablet, laptop, desktop or any size) for responsive layouts.
 - A 3D model (a .glb, such as generate_3d_model makes) goes in the app's assets/ folder, listed under "assets" in manifest.json's files, and shows in a Scene3D as an object of type "model" whose modelUrl is asset("assets/…"), written in the .ui markup (asset() is not available in logic), for example: <Scene3D fill={true} environment="studio" orbitControls={true} camera={{ position: { x: 1.2, y: 0.8, z: 1.6 }, lookAt: { x: 0, y: 0, z: 0 }, fov: 45 }} lights={[{ id: "key", type: "directional", color: "#ffffff", intensity: 2, position: { x: 3, y: 5, z: 4 } }]} objects={[{ id: "lamp", type: "model", modelUrl: asset("assets/models/lamp.glb"), position: { x: 0, y: 0, z: 0 }, scale: 1 }]} @modelState={onModel} />. A model from generate_3d_model fits a unit cube centred on the origin with its front facing +Z: scale and place it for the scene, and keep environment="studio" (its materials are often metallic, which looks dark under lights alone). @modelState reports a model that failed to load; preview_screenshot shows the scene as the app draws it (WebGL included), and with the model's own path, the model alone from four sides.
 - The app is done when it renders without errors and softn_interact shows it working.
@@ -351,9 +351,9 @@ function estimateChars(turns: Turn[], charsPerToken = DEFAULT_CHARS_PER_TOKEN): 
 function transcript(turn: Turn): string {
   const cutText = (text: string, max: number) => (text.length > max ? `${text.slice(0, max)} […${text.length - max} more characters]` : text);
   if (turn.role === 'user') {
-    if (turn.summary) return `Summary of what came before:\n${turn.text.replace(/^\[bot\.computer\][^\n]*\n(<project>[\s\S]*?<\/project>\n\n)?/, '')}`;
+    if (turn.summary) return `Summary of what came before:\n${turn.text.replace(/^\[(?:OAIY|bot\.computer)\][^\n]*\n(<project>[\s\S]*?<\/project>\n\n)?/, '')}`;
     const text = turn.text.replace(/^<project>[\s\S]*?<\/project>\n\n/, '');
-    return `${turn.automatic ? 'bot.computer' : 'User'}: ${cutText(text, 6000)}${turn.images?.length ? ` [${turn.images.length} image(s)]` : ''}`;
+    return `${turn.automatic ? 'OAIY' : 'User'}: ${cutText(text, 6000)}${turn.images?.length ? ` [${turn.images.length} image(s)]` : ''}`;
   }
   if (turn.role === 'assistant') {
     const calls = turn.calls.map((c) => `  → ${c.name}(${cutText(JSON.stringify(c.input), 400)})`).join('\n');
@@ -1274,7 +1274,7 @@ ${this.instructions}` : ''}`;
   private async fit(provider: ProviderConfig, emit: (e: AgentEvent) => void, signal?: AbortSignal, force = false): Promise<void> {
     const b = this.budget(provider);
     // Too small to hold the instructions and tools with room to work: say so, rather than fail in circles.
-    if (b.prompt < 1024) throw new Error(`The model's context window (${formatTokens(b.window)} tokens) is too small for bot.computer: its instructions and tools alone take about ${formatTokens(b.fixed)}. Give the model a bigger window (Ollama: OLLAMA_CONTEXT_LENGTH=16384 or more; then Detect in Settings), or set the size in Settings if the detected one is wrong.`);
+    if (b.prompt < 1024) throw new Error(`The model's context window (${formatTokens(b.window)} tokens) is too small for OAIY: its instructions and tools alone take about ${formatTokens(b.fixed)}. Give the model a bigger window (Ollama: OLLAMA_CONTEXT_LENGTH=16384 or more; then Detect in Settings), or set the size in Settings if the detected one is wrong.`);
     const used = this.estimate(this.view());
     emit({ type: 'context', used: used + b.fixed, window: b.window });
     const threshold = b.prompt * (this.options.compactAt?.() ?? DEFAULT_COMPACT_AT);
@@ -1320,7 +1320,7 @@ ${this.instructions}` : ''}`;
       role: 'user',
       automatic: true,
       summary: true,
-      text: `[bot.computer] The conversation before this point (${old.length} turns) was summarized to fit the model's context.\n<project>\n${this.options.projectSummary()}\n</project>\n\n${summary}`,
+      text: `[OAIY] The conversation before this point (${old.length} turns) was summarized to fit the model's context.\n<project>\n${this.options.projectSummary()}\n</project>\n\n${summary}`,
     };
     this.turns.splice(start + keepFrom, 0, note);
     const after = this.estimate(this.view()) + b.fixed;
@@ -1359,7 +1359,7 @@ ${this.instructions}` : ''}`;
     for (const t of old) if (t.role === 'assistant') for (const c of t.calls) if (typeof c.input.path === 'string' && /write|edit|delete/.test(c.name)) touched.add(c.input.path);
     const earlier = old.find((t) => t.role === 'user' && t.summary) as Extract<Turn, { role: 'user' }> | undefined;
     return [
-      earlier ? `Earlier summary:\n${earlier.text.replace(/^\[bot\.computer\][^\n]*\n(<project>[\s\S]*?<\/project>\n\n)?/, '')}` : '',
+      earlier ? `Earlier summary:\n${earlier.text.replace(/^\[(?:OAIY|bot\.computer)\][^\n]*\n(<project>[\s\S]*?<\/project>\n\n)?/, '')}` : '',
       requests.length ? `Requests:\n${requests.join('\n')}` : '',
       touched.size ? `Files changed: ${[...touched].join(', ')}` : '',
       this.plan ? `Plan: ${this.plan.items.map((i) => `[${i.status}] ${i.text}`).join('; ')}` : '',
@@ -1528,7 +1528,7 @@ ${this.instructions}` : ''}`;
         this.turns.push({
           role: 'user',
           automatic: true,
-          text: `[bot.computer] The flagged pictures are fixed. Now go back to the work you were doing before they were flagged, and carry on from where you left off${open.length ? `: your plan's open steps are ${open.map((i) => `"${i.text}"`).join(', ')}` : ''}. If there was none, finish with a short summary.`,
+          text: `[OAIY] The flagged pictures are fixed. Now go back to the work you were doing before they were flagged, and carry on from where you left off${open.length ? `: your plan's open steps are ${open.map((i) => `"${i.text}"`).join(', ')}` : ''}. If there was none, finish with a short summary.`,
         });
         return true;
       }
@@ -1540,7 +1540,7 @@ ${this.instructions}` : ''}`;
       role: 'user',
       automatic: true,
       text: [
-        `[bot.computer] The user flagged /${f.path} as wrong${f.comment ? `: "${f.comment}"` : ', without saying why'}. Fix it before anything else, and only it${this.flags.length ? ` (${this.flags.length} more flagged picture${this.flags.length === 1 ? '' : 's'} will follow, one at a time)` : ''}:`,
+        `[OAIY] The user flagged /${f.path} as wrong${f.comment ? `: "${f.comment}"` : ', without saying why'}. Fix it before anything else, and only it${this.flags.length ? ` (${this.flags.length} more flagged picture${this.flags.length === 1 ? '' : 's'} will follow, one at a time)` : ''}:`,
         f.comment ? '- look at it (view_image) to see what they mean;' : '- run review_frame on it: a reviewer finds what is wrong;',
         '- make it again at the same path, fixing that (a clearer prompt, other reference images, another seed), until it passes its review;',
         '- then make again what was made from it, if anything (an end frame edited from it, a clip that starts or ends on it).',
@@ -1690,7 +1690,7 @@ ${this.instructions}` : ''}`;
     const guides = this.guidesFor(prompt);
     this.turns.push({ role: 'user', text, ...(images.length ? { images } : {}), ...(attachments.length ? { attachments } : {}), ...(guides.length ? { guides } : {}) });
     const carry = this.carryOver();
-    if (carry) this.turns.push({ role: 'user', text: `[bot.computer] ${carry}`, automatic: true });
+    if (carry) this.turns.push({ role: 'user', text: `[OAIY] ${carry}`, automatic: true });
     let failures = 0;
     let lastFailure = '';
     // What each step changes, by the index of the call that changed it.
@@ -1736,7 +1736,7 @@ ${this.instructions}` : ''}`;
         const finish = this.options.finish;
         if (finish && !this.finishing && step > finish.after) {
           this.finishing = true;
-          this.turns.push({ role: 'user', text: `[bot.computer] ${finish.say}`, automatic: true });
+          this.turns.push({ role: 'user', text: `[OAIY] ${finish.say}`, automatic: true });
         }
         await this.fit(provider, emit, signal);
         const reply = await this.request(provider, emit, signal);
@@ -1760,7 +1760,7 @@ ${this.instructions}` : ''}`;
             if (!repeatNudged) {
               repeatNudged = true;
               emit({ type: 'nudge', message: 'It gave the same reply again without doing anything; asked for a tool call.' });
-              this.turns.push({ role: 'user', text: `[bot.computer] ${REPEAT_NUDGE}`, automatic: true });
+              this.turns.push({ role: 'user', text: `[OAIY] ${REPEAT_NUDGE}`, automatic: true });
               continue;
             }
             emit({ type: 'status', message: 'The model kept giving the same reply without doing anything, so the run stopped. Say what to do next.' });
@@ -1771,13 +1771,13 @@ ${this.instructions}` : ''}`;
           if (!acted && !startNudged && !finish && announcesWork(reply.text)) {
             startNudged = true;
             emit({ type: 'nudge', message: 'It said what it would do without starting; asked to start.' });
-            this.turns.push({ role: 'user', text: `[bot.computer] ${START_NUDGE}`, automatic: true });
+            this.turns.push({ role: 'user', text: `[OAIY] ${START_NUDGE}`, automatic: true });
             continue;
           }
           // A run that must end with its tool: ask for it (the loop's step limit still bounds this).
           if (finish && !finish.done()) {
             this.finishing = true;
-            this.turns.push({ role: 'user', text: `[bot.computer] ${finish.say}`, automatic: true });
+            this.turns.push({ role: 'user', text: `[OAIY] ${finish.say}`, automatic: true });
             continue;
           }
           if (reply.truncated) emit({ type: 'status', message: 'The reply was cut off at the output limit.' });
@@ -1789,7 +1789,7 @@ ${this.instructions}` : ''}`;
           if (unfinished && nudges < MAX_NUDGES && idleNudges < MAX_IDLE_NUDGES && !reply.truncated) {
             nudges++;
             emit({ type: 'nudge', message: unfinished.split('\n')[0] });
-            this.turns.push({ role: 'user', text: `[bot.computer] ${unfinished}`, automatic: true });
+            this.turns.push({ role: 'user', text: `[OAIY] ${unfinished}`, automatic: true });
             continue;
           }
           emit({ type: 'done', text: reply.text, steps: step });
@@ -1838,7 +1838,7 @@ ${this.instructions}` : ''}`;
             const path = normalizePath(call.input.path);
             const times = (rewrites.get(path) ?? 0) + 1;
             rewrites.set(path, times);
-            if (times >= 3) result.content += `\n\n[bot.computer] This is the ${times}${times === 3 ? 'rd' : 'th'} time you wrote /${path} in full for this request. Do not write it again: if it is done, mark its plan step done with update_plan and go on to the next step; to change a part of it, use edit_file.`;
+            if (times >= 3) result.content += `\n\n[OAIY] This is the ${times}${times === 3 ? 'rd' : 'th'} time you wrote /${path} in full for this request. Do not write it again: if it is done, mark its plan step done with update_plan and go on to the next step; to change a part of it, use edit_file.`;
           }
           // Writing an app's files reads the app guide (and gives the app tools).
           if (!result.isError && /^(write_file|append_file|edit_file)$/.test(call.name) && typeof call.input.path === 'string' && APP_FILE.test(call.input.path) && !this.loadedGuides().has('app') && this.tools.some((t) => t.name === 'guide')) {
@@ -1874,7 +1874,7 @@ ${this.instructions}` : ''}`;
         if (openStep >= 0 && !reply.calls.some((c) => c.name === 'update_plan') && ++sincePlan >= DRIFT_STEPS && results.length) {
           sincePlan = 0;
           const n = openStep + 1;
-          results[results.length - 1].content += `\n\n[bot.computer] ${DRIFT_STEPS} steps since the plan last changed, and step ${n} "${this.plan!.items[openStep].text}" is still in progress. If it is done, mark it done (update_plan: {"step": ${n}, "status": "done"}) and go on with the next. If it is bigger than one step, split it in the plan. If you are going round in circles (writing the same files again, the same error), stop and change the approach, or change the plan.`;
+          results[results.length - 1].content += `\n\n[OAIY] ${DRIFT_STEPS} steps since the plan last changed, and step ${n} "${this.plan!.items[openStep].text}" is still in progress. If it is done, mark it done (update_plan: {"step": ${n}, "status": "done"}) and go on with the next. If it is bigger than one step, split it in the plan. If you are going round in circles (writing the same files again, the same error), stop and change the approach, or change the plan.`;
         }
         // A task: plan before going further (once, and not for a one-file fix).
         if (!planThisRun && !planNoted && this.canPlan && results.length) {
@@ -1882,7 +1882,7 @@ ${this.instructions}` : ''}`;
           const touchesApp = [...changedThisRun].some((p) => apps.some((r) => r === '' ? isAppFile(p) : p.startsWith(`${r}/`)));
           if (changedThisRun.size >= 2 || touchesApp) {
             planNoted = true;
-            results[results.length - 1].content += '\n\n[bot.computer] This is a task with several steps, and there is no plan yet. Call update_plan now with the goal and the steps that break it down (mark what is already done), then carry on.';
+            results[results.length - 1].content += '\n\n[OAIY] This is a task with several steps, and there is no plan yet. Call update_plan now with the goal and the steps that break it down (mark what is already done), then carry on.';
           }
         }
         const stop = await this.autoCheck(reply.calls, results, changes, emit);

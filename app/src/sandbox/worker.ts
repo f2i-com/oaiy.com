@@ -154,7 +154,7 @@ async function run(message: Extract<ToWorker, { type: 'run' }>): Promise<RunResu
   if (appBridge) {
     engine.setAppBridge!({
       call(kind: string, args: string[]) {
-        return HOST_KINDS.includes(kind) ? answer(kind, Array.from(args, String)) : { err: `TypeError: \`${kind}\` is not available in the bot.computer sandbox` };
+        return HOST_KINDS.includes(kind) ? answer(kind, Array.from(args, String)) : { err: `TypeError: \`${kind}\` is not available in the OAIY sandbox` };
       },
     });
     engine.setSyncHostCapabilities(HOST_KINDS.map((k) => `app.${k}`));
@@ -179,7 +179,7 @@ async function run(message: Extract<ToWorker, { type: 'run' }>): Promise<RunResu
   engine.setInstructionBudget(request.limits.maxSteps);
 
   const result: RunResult = { console: [] };
-  if (packageError) result.console.push({ text: `[bot.computer's Python additions could not load: ${packageError}]`, err: true });
+  if (packageError) result.console.push({ text: `[OAIY's Python additions could not load: ${packageError}]`, err: true });
   try {
     if (request.lang === 'python') {
       const entry = request.fileName ?? 'main.py';

@@ -471,7 +471,7 @@ export class Preview {
           page: '',
           error: this.bridgeReady
             ? `the preview did not answer within ${Math.round(timeoutMs / 1000)} s (the page may be busy)`
-            : 'the preview did not answer: bot.computer\'s bridge did not start in the preview frame (reload bot.computer; if it persists, run npm run fetch:softn -- --ensure)',
+            : 'the preview did not answer: OAIY\'s bridge did not start in the preview frame (reload the page; if it persists, run npm run fetch:softn -- --ensure)',
         });
       }, timeoutMs);
       this.requests.set(id, finish);
@@ -731,7 +731,7 @@ export class Preview {
     }
     if (!(await softnRuntimeAvailable())) {
       this.setStatus('');
-      this.showMessage('The SoftN preview runtime is not installed. Run `npm run fetch:softn` and reload bot.computer. You can still build, check and export .softn apps.');
+      this.showMessage('The SoftN preview runtime is not installed. Run `npm run fetch:softn` and reload the page. You can still build, check and export .softn apps.');
       this.settle({ ok: false, errors: ['the SoftN preview runtime is not installed'] });
       return;
     }

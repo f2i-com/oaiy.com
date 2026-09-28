@@ -40,7 +40,7 @@ import type { Vfs } from './vfs/vfs';
 const WELCOME: Array<[string, string]> = [
   [
     'README.md',
-    `# Welcome to bot.computer
+    `# Welcome to OAIY
 
 A coding agent that lives entirely in this browser tab.
 

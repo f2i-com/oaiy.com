@@ -187,7 +187,7 @@ export class SandboxHost implements HostHandler {
         return '';
       }
       default:
-        throw new TypeError(`\`${kind}\` is not available in the bot.computer sandbox`);
+        throw new TypeError(`\`${kind}\` is not available in the OAIY sandbox`);
     }
   }
 

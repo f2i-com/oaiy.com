@@ -79,7 +79,7 @@ function pageStart(turns: Turn[], size: number): number {
 export class ChatPane {
   readonly element = h('section.chat');
   private readonly log = h('div.chat-log', { role: 'log', 'aria-live': 'polite', 'aria-relevant': 'additions' });
-  private readonly input = h('textarea.chat-input', { rows: 3, placeholder: 'Ask bot.computer…  (/help for commands)', title: 'Enter sends; Shift+Enter starts a new line' });
+  private readonly input = h('textarea.chat-input', { rows: 3, placeholder: 'Ask OAIY…  (/help for commands)', title: 'Enter sends; Shift+Enter starts a new line' });
   private readonly send = h('button.primary', 'Send');
   private readonly attachButton = h('button.attach', { title: 'Attach files or images (or drop them here, or paste an image)', 'aria-label': 'Attach files' }, '📎');
   private readonly picker = h('input', { type: 'file', multiple: true, style: 'display:none' });
@@ -222,7 +222,7 @@ export class ChatPane {
     // A new run: the last run's last tool is not what the agent does now.
     if (busy) this.setActivity('');
     if (this.currentPlan) this.showPlan(this.currentPlan, busy);
-    this.input.placeholder = busy ? 'Message the agent while it works…  (it reads it at its next step)' : 'Ask bot.computer…  (/help for commands)';
+    this.input.placeholder = busy ? 'Message the agent while it works…  (it reads it at its next step)' : 'Ask OAIY…  (/help for commands)';
     this.updateSend();
     if (!busy) this.setStatus('');
   }
@@ -306,7 +306,7 @@ export class ChatPane {
   /** A summary that replaced older turns for the model: a note that opens to show it. */
   private summaryNote(text: string, heading: string): void {
     this.current = null;
-    const body = text.replace(/^\[bot\.computer\][^\n]*\n(<project>[\s\S]*?<\/project>\n\n)?/, '');
+    const body = text.replace(/^\[(?:OAIY|bot\.computer)\][^\n]*\n(<project>[\s\S]*?<\/project>\n\n)?/, '');
     this.add(h('details.msg.compacted', h('summary', h('span', '⇣'), h('span', ` ${heading}`)), h('pre', body)));
     this.scroll();
   }
@@ -913,7 +913,7 @@ export class ChatPane {
       }
       if (turn.role === 'user' && turn.automatic) {
         this.current = null;
-        this.add(h('div.msg.nudge', h('span', '↻'), h('span', ` ${turn.text.replace(/^\[bot\.computer\] /, '').split('\n')[0]}`)));
+        this.add(h('div.msg.nudge', h('span', '↻'), h('span', ` ${turn.text.replace(/^\[(?:OAIY|bot\.computer)\] /, '').split('\n')[0]}`)));
         continue;
       }
       if (turn.role === 'user') {

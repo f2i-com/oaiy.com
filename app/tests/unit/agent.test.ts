@@ -157,7 +157,7 @@ describe('tool rules', () => {
     expect(system(film.bodies[0])).not.toContain('SoftN');
     const fake = fakeProvider('openai', [
       { calls: [{ name: 'generate_image', input: { prompt: 'a cat', path: 'cat.png' } }] },
-      (body) => ({ text: JSON.stringify(body.messages).includes('Not made yet. [bot.computer] The media guide is now in your instructions') && system(body).includes('The media guide:') ? 'guided' : 'not guided' }),
+      (body) => ({ text: JSON.stringify(body.messages).includes('Not made yet. [OAIY] The media guide is now in your instructions') && system(body).includes('The media guide:') ? 'guided' : 'not guided' }),
     ]);
     const vfs = new Vfs();
     const events: AgentEvent[] = [];
