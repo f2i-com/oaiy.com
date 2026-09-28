@@ -12,6 +12,7 @@ import {
   type ServiceStatus,
   type ServiceTemplateInput,
 } from './api';
+import { Download, FolderOpen, Plus, Trash2, Upload } from 'lucide-react';
 import LogsViewer from './LogsViewer';
 import { useToast } from './Toasts';
 import { peek, put } from './useCached';
@@ -216,9 +217,12 @@ export default function ServicesPanel() {
         </div>
       )}
       {snapshot && (
-        <div className="datadir-note">
-          Service configs + scripts live under{' '}
-          <code>{snapshot.dataDir}</code>.{' '}
+        <div className="datadir-note datadir-row">
+          <span>
+            Services live in <code>{snapshot.dataDir}</code>. Drop a package <code>*.json</code> into{' '}
+            <code>templates/</code>, or use <strong>Import package</strong> at the end of the page;{' '}
+            <strong>Export</strong> makes one of any service.
+          </span>
           <button
             className="btn-tiny"
             onClick={() =>
@@ -228,14 +232,8 @@ export default function ServicesPanel() {
             }
             title="Open data folder in file explorer"
           >
-            open
-          </button>{' '}
-          Services are plug-and-play: drop a package <code>*.json</code> into{' '}
-          <code>templates/</code> (or use <strong>Import package</strong> below)
-          to register one without rebuilding. A package can bundle its own
-          scripts in a <code>"files"</code> map, so a single JSON is everything
-          needed to install + run it — <strong>Export</strong> any service to
-          get one.
+            <FolderOpen size={13} /> Open folder
+          </button>
         </div>
       )}
       {grouped.length === 0 && snapshot && !error && (
@@ -316,14 +314,14 @@ export default function ServicesPanel() {
               className="btn btn-secondary"
               onClick={() => setShowAddForm(true)}
             >
-              + Add custom service
+              <Plus size={14} /> Add custom service
             </button>
             <button
               className="btn btn-secondary"
               onClick={() => importInputRef.current?.click()}
               title="Import a self-contained service package (.json with bundled scripts)"
             >
-              ⤓ Import package
+              <Download size={14} /> Import package
             </button>
             <input
               ref={importInputRef}
@@ -1187,7 +1185,7 @@ function ServiceCard({
             className="btn btn-ghost"
             title="Export as a self-contained package (.json with bundled scripts)"
           >
-            ⤴ Export
+            <Upload size={13} /> Export
           </button>
           <button
             onClick={onDelete}
@@ -1198,7 +1196,7 @@ function ServiceCard({
             title="Delete this service template (stop it first)"
             aria-label="Delete service template"
           >
-            <span aria-hidden="true">🗑</span>
+            <Trash2 size={14} aria-hidden />
           </button>
         </div>
       </div>

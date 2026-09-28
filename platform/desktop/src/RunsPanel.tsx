@@ -77,15 +77,19 @@ function duration(rec: RunRecord): string | null {
  * status, so `succeeded` is the entry that is actually about finished work —
  * the map itself tallies every state, live runs included.
  */
+/** Every recorded run finished cleanly, in words that fit one run as well as many. */
+const allClean = (n: number) =>
+  n === 1 ? 'Nothing has failed — the one recorded run finished cleanly.' : `Nothing has failed — all ${n} recorded runs finished cleanly.`;
+
 function noFailuresMessage(data: RunHistory): string {
   if (data.total === 0) return 'No flow has run on this machine yet.';
   const counts = data.byStatus;
   // A response (or a cached snapshot) without byStatus leaves total as the only
   // number there is; saying 0 would be a worse answer than the old overcount.
-  if (!counts) return `Nothing has failed — all ${data.total} recorded runs finished cleanly.`;
+  if (!counts) return allClean(data.total);
   const clean = counts.succeeded ?? 0;
   const inFlight = (counts.queued ?? 0) + (counts.running ?? 0);
-  if (inFlight === 0) return `Nothing has failed — all ${clean} recorded runs finished cleanly.`;
+  if (inFlight === 0) return allClean(clean);
   return `Nothing has failed — ${clean} finished cleanly, ${inFlight} still queued or running.`;
 }
 

@@ -461,9 +461,9 @@ export default function AiProvidersPanel() {
             const testable = p.hasKey || p.allowLocal;
             return (
               <div key={p.id} className={`service-card service-card-${cardStatus(p)}`}>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+                <div className="card-head">
                   <Waypoints size={14} aria-hidden />
-                  <strong style={{ fontSize: 15 }}>{p.name}</strong>
+                  <strong className="card-title">{p.name}</strong>
                   <span className="badge badge-neutral">{p.protocol}</span>
                   {/* Key state, agreeing with the card accent: a local endpoint needs
                       no key, so it isn't an error — it's simply not required. */}
@@ -477,12 +477,12 @@ export default function AiProvidersPanel() {
                   {!p.enabled && <span className="badge badge-neutral">disabled</span>}
                 </div>
 
-                <p style={{ fontSize: 12.5, opacity: 0.7, margin: '6px 0 0' }}>
+                <p className="card-reason">
                   <code>{p.id}</code> · {p.baseUrl}
                   {p.model ? ` · ${p.model}` : ''}
                 </p>
 
-                <div style={{ display: 'flex', gap: 8, marginTop: 10, flexWrap: 'wrap' }}>
+                <div className="card-actions">
                   <button
                     className="btn btn-secondary"
                     onClick={() => void runAction(p.id, 'test', () => aiProviders.test(p.id), `${p.name} is reachable and authorized`)}

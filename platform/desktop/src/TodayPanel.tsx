@@ -15,16 +15,17 @@ const POLL_MS = 10_000;
 
 const pad = (n: number) => String(n).padStart(2, '0');
 const ymd = (d: Date) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
-function sayWhen(start: string): string {
+/** When an appointment is, in two parts that each fit a tile's line: the day, and the time. */
+function sayWhen(start: string): { day: string; clock: string } {
   const [date, time = '00:00'] = start.split('T');
   const [h, m] = time.split(':').map(Number);
   const clock = `${h % 12 || 12}${m ? `:${pad(m)}` : ''} ${h < 12 ? 'am' : 'pm'}`;
   const today = ymd(new Date());
   const tomorrow = ymd(new Date(Date.now() + 86_400_000));
-  if (date === today) return clock;
-  if (date === tomorrow) return `tomorrow ${clock}`;
+  if (date === today) return { day: 'Today', clock };
+  if (date === tomorrow) return { day: 'Tomorrow', clock };
   const d = new Date(`${date}T00:00`);
-  return `${d.toLocaleDateString(undefined, { weekday: 'short', day: 'numeric', month: 'short' })}, ${clock}`;
+  return { day: d.toLocaleDateString(undefined, { weekday: 'short', day: 'numeric', month: 'short' }).replace(',', ''), clock };
 }
 
 export default function TodayPanel({ onNavigate }: { onNavigate: (view: 'agent' | 'calendar' | 'engines' | 'connections') => void }) {
@@ -60,6 +61,7 @@ export default function TodayPanel({ onNavigate }: { onNavigate: (view: 'agent' 
 
   const requests = (upcoming ?? []).filter((a) => a.status === 'requested');
   const next = (upcoming ?? []).find((a) => a.status === 'confirmed') ?? upcoming?.[0];
+  const when = next ? sayWhen(next.start) : null;
   const llm = model?.llm;
 
   return (
@@ -82,10 +84,15 @@ export default function TodayPanel({ onNavigate }: { onNavigate: (view: 'agent' 
         </button>
         {receptionist && (
           <>
-            <button className="overview-tile" onClick={() => onNavigate('calendar')}>
+            <button className="overview-tile" onClick={() => onNavigate('calendar')} title="The next appointment">
               <CalendarClock size={16} aria-hidden />
-              <strong>{upcoming === null ? '—' : next ? sayWhen(next.start) : 'Nothing booked'}</strong>
-              <small>{next ? `${next.service || 'Appointment'}${next.name ? `, ${next.name}` : ''}` : 'Next appointment'}</small>
+              {/* Today's is its time; a later one its day, with the time beside what it is. */}
+              <strong>{upcoming === null ? '—' : when ? (when.day === 'Today' ? when.clock : when.day) : 'Nothing booked'}</strong>
+              <small>
+                {next && when
+                  ? `${when.day === 'Today' ? 'Today' : when.clock} · ${next.service || 'Appointment'}${next.name ? `, ${next.name}` : ''}`
+                  : 'Next appointment'}
+              </small>
             </button>
             <button className="overview-tile" onClick={() => onNavigate('calendar')}>
               <Inbox size={16} aria-hidden />
@@ -98,11 +105,12 @@ export default function TodayPanel({ onNavigate }: { onNavigate: (view: 'agent' 
           <button
             className="overview-tile"
             onClick={() => onNavigate('connections')}
+            aria-label={`FormLogic: ${formlogic.headline}. ${formlogic.detail}`}
             title={[sync?.error, linked?.heartbeatError, linked?.outbox?.lastError, 'Calls, the calendar and the agent work without FormLogic; what changed here is sent when it can be reached.'].filter(Boolean).join('\n')}
           >
             {formlogic.headline === 'Offline' ? <CloudOff size={16} aria-hidden /> : <Cloud size={16} aria-hidden />}
-            <strong className={formlogic.tone === 'ok' ? 'ok' : formlogic.tone === 'neutral' ? undefined : 'warn'}>FormLogic: {formlogic.headline}</strong>
-            <small>{formlogic.detail}</small>
+            <strong className={formlogic.tone === 'ok' ? 'ok' : formlogic.tone === 'neutral' ? undefined : 'warn'}>{formlogic.headline}</strong>
+            <small>FormLogic · {formlogic.detail}</small>
           </button>
         )}
       </div>

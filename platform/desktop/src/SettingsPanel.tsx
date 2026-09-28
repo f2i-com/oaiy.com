@@ -8,7 +8,82 @@ import {
   type MigratePlan,
   type MigrationProgress,
 } from './api';
+import { FolderOpen, FolderSearch, RotateCcw, X } from 'lucide-react';
 import { useToast } from './Toasts';
+
+/**
+ * Changing a folder, in one row: paste a path and use it, or choose one.
+ * `onReset` offers the way back to the default while a custom folder is set.
+ */
+function FolderChange({
+  label,
+  placeholder,
+  value,
+  busy,
+  setLabel,
+  browseLabel,
+  onChange,
+  onSet,
+  onBrowse,
+  onReset,
+}: {
+  label: string;
+  placeholder: string;
+  value: string;
+  busy: boolean;
+  setLabel: string;
+  browseLabel: string;
+  onChange: (value: string) => void;
+  onSet: (path: string) => void;
+  onBrowse: () => void;
+  onReset?: () => void;
+}) {
+  return (
+    <form
+      className="folder-change"
+      onSubmit={(e) => {
+        e.preventDefault();
+        if (value.trim()) onSet(value.trim());
+      }}
+    >
+      <span className="settings-label">{label}</span>
+      <div className="folder-change-row">
+        <input
+          type="text"
+          aria-label={label}
+          placeholder={placeholder}
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          disabled={busy}
+        />
+        <button type="submit" className="btn btn-secondary" disabled={busy || !value.trim()}>
+          {setLabel}
+        </button>
+        <button type="button" className="btn btn-secondary" onClick={onBrowse} disabled={busy}>
+          <FolderSearch size={14} /> {browseLabel}
+        </button>
+        {onReset && (
+          <button type="button" className="btn btn-ghost" onClick={onReset} disabled={busy}>
+            <RotateCcw size={13} /> Reset to default
+          </button>
+        )}
+      </div>
+    </form>
+  );
+}
+
+/** Open a folder or file in the system's file manager. */
+function OpenButton({ path, onError }: { path: string; onError: (message: string) => void }) {
+  return (
+    <button
+      className="btn-tiny"
+      title="Open in file explorer"
+      onClick={() => openInExplorer(path).catch((e) => onError(e instanceof Error ? e.message : String(e)))}
+    >
+      <FolderOpen size={13} /> Open
+    </button>
+  );
+}
 
 /**
  * Settings panel — the data + models folders, additional model scan dirs,
@@ -339,7 +414,7 @@ export default function SettingsPanel() {
 
       <section className="model-section">
         <h3 className="section-title">Data folder</h3>
-        <p className="form-hint" style={{ marginBottom: 12 }}>
+        <p className="form-hint">
           Everything OAIY manages — downloaded models, Python venvs,
           installed service binaries, templates and scripts — lives under this
           folder. Put it on whichever drive you like so your models are easy
@@ -352,17 +427,7 @@ export default function SettingsPanel() {
               <span className="settings-label">Current folder</span>
               <div className="settings-value">
                 <code className="path-code">{cfg.activeDir}</code>
-                <button
-                  className="btn-tiny"
-                  title="Open in file explorer"
-                  onClick={() =>
-                    openInExplorer(cfg.activeDir).catch((e) =>
-                      setError(e instanceof Error ? e.message : String(e)),
-                    )
-                  }
-                >
-                  open
-                </button>
+                <OpenButton path={cfg.activeDir} onError={setError} />
                 {cfg.isCustom ? (
                   <span className="badge badge-ok">custom</span>
                 ) : (
@@ -379,17 +444,7 @@ export default function SettingsPanel() {
                 <span className="settings-label">Log file</span>
                 <div className="settings-value">
                   <code className="path-code">{logFile}</code>
-                  <button
-                    className="btn-tiny"
-                    title="Open in file explorer"
-                    onClick={() =>
-                      openInExplorer(logFile).catch((e) =>
-                        setError(e instanceof Error ? e.message : String(e)),
-                      )
-                    }
-                  >
-                    open
-                  </button>
+                  <OpenButton path={logFile} onError={setError} />
                 </div>
               </div>
             )}
@@ -417,59 +472,31 @@ export default function SettingsPanel() {
               </div>
             )}
 
-            <div className="settings-row">
-              <span className="settings-label">Default</span>
-              <code className="path-code">{cfg.defaultDir}</code>
-            </div>
+            {/* The default only needs saying while another folder is in use. */}
+            {cfg.isCustom && (
+              <div className="settings-row">
+                <span className="settings-label">Default</span>
+                <code className="path-code">{cfg.defaultDir}</code>
+              </div>
+            )}
           </div>
         )}
 
-        <div className="form-actions" style={{ marginTop: 14 }}>
-          <button className="btn btn-primary" onClick={browse} disabled={busy}>
-            Choose folder…
-          </button>
-          {cfg?.isCustom && (
-            <button
-              className="btn btn-ghost"
-              onClick={() => applyDir('')}
-              disabled={busy}
-            >
-              Reset to default
-            </button>
-          )}
-        </div>
-
-        <form
-          className="dl-form"
-          style={{ marginTop: 12 }}
-          onSubmit={(e) => {
-            e.preventDefault();
-            if (manualPath.trim()) applyDir(manualPath.trim());
-          }}
-        >
-          <label className="form-row">
-            <span>…or type/paste a path</span>
-            <input
-              type="text"
-              placeholder="D:\\OAIY  or  C:\\Users\\me\\OAIY-data"
-              value={manualPath}
-              onChange={(e) => setManualPath(e.target.value)}
-              disabled={busy}
-            />
-          </label>
-          <div className="form-actions">
-            <button
-              type="submit"
-              className="btn btn-secondary"
-              disabled={busy || !manualPath.trim()}
-            >
-              Set folder
-            </button>
-          </div>
-        </form>
+        <FolderChange
+          label="Use another folder"
+          placeholder="Paste a path, e.g. D:\OAIY"
+          value={manualPath}
+          busy={busy}
+          setLabel="Use this path"
+          browseLabel="Choose…"
+          onChange={setManualPath}
+          onSet={applyDir}
+          onBrowse={browse}
+          onReset={cfg?.isCustom ? () => applyDir('') : undefined}
+        />
 
         {plan?.canMigrate && !skipped ? (
-          <div className="banner banner-pending" style={{ marginTop: 12 }}>
+          <div className="banner banner-pending">
             {mig?.running ? (
               <>
                 <strong>
@@ -544,7 +571,7 @@ export default function SettingsPanel() {
             )}
           </div>
         ) : (
-          <p className="form-hint" style={{ marginTop: 10 }}>
+          <p className="form-hint">
             Changing the folder applies on restart. Models you've already
             downloaded stay in the old folder unless you bring them over.
           </p>
@@ -553,7 +580,7 @@ export default function SettingsPanel() {
 
       <section className="model-section">
         <h3 className="section-title">Models folder</h3>
-        <p className="form-hint" style={{ marginBottom: 12 }}>
+        <p className="form-hint">
           Where downloaded models &amp; weights are saved — the LTX-2.3 / Lance
           installers' <code className="path-code">OAIY_MODELS_DIR</code> points
           here too. Defaults to a <code className="path-code">models</code>{' '}
@@ -568,17 +595,7 @@ export default function SettingsPanel() {
               <span className="settings-label">Current folder</span>
               <div className="settings-value">
                 <code className="path-code">{cfg.modelsActiveDir}</code>
-                <button
-                  className="btn-tiny"
-                  title="Open in file explorer"
-                  onClick={() =>
-                    openInExplorer(cfg.modelsActiveDir).catch((e) =>
-                      setError(e instanceof Error ? e.message : String(e)),
-                    )
-                  }
-                >
-                  open
-                </button>
+                <OpenButton path={cfg.modelsActiveDir} onError={setError} />
                 {cfg.modelsIsCustom ? (
                   <span className="badge badge-ok">custom</span>
                 ) : (
@@ -611,61 +628,28 @@ export default function SettingsPanel() {
               </div>
             )}
 
-            <div className="settings-row">
-              <span className="settings-label">Default</span>
-              <code className="path-code">{cfg.modelsDefaultDir}</code>
-            </div>
+            {cfg.modelsIsCustom && (
+              <div className="settings-row">
+                <span className="settings-label">Default</span>
+                <code className="path-code">{cfg.modelsDefaultDir}</code>
+              </div>
+            )}
           </div>
         )}
 
-        <div className="form-actions" style={{ marginTop: 14 }}>
-          <button
-            className="btn btn-primary"
-            onClick={browseModels}
-            disabled={modelsBusy}
-          >
-            Choose folder…
-          </button>
-          {cfg?.modelsIsCustom && (
-            <button
-              className="btn btn-ghost"
-              onClick={() => applyModelsDir('')}
-              disabled={modelsBusy}
-            >
-              Reset to default
-            </button>
-          )}
-        </div>
-
-        <form
-          className="dl-form"
-          style={{ marginTop: 12 }}
-          onSubmit={(e) => {
-            e.preventDefault();
-            if (modelsManualPath.trim()) applyModelsDir(modelsManualPath.trim());
-          }}
-        >
-          <label className="form-row">
-            <span>…or type/paste a path</span>
-            <input
-              type="text"
-              placeholder="E:\\models"
-              value={modelsManualPath}
-              onChange={(e) => setModelsManualPath(e.target.value)}
-              disabled={modelsBusy}
-            />
-          </label>
-          <div className="form-actions">
-            <button
-              type="submit"
-              className="btn btn-secondary"
-              disabled={modelsBusy || !modelsManualPath.trim()}
-            >
-              Set folder
-            </button>
-          </div>
-        </form>
-        <p className="form-hint" style={{ marginTop: 10 }}>
+        <FolderChange
+          label="Use another folder"
+          placeholder="Paste a path, e.g. E:\models"
+          value={modelsManualPath}
+          busy={modelsBusy}
+          setLabel="Use this path"
+          browseLabel="Choose…"
+          onChange={setModelsManualPath}
+          onSet={applyModelsDir}
+          onBrowse={browseModels}
+          onReset={cfg?.modelsIsCustom ? () => applyModelsDir('') : undefined}
+        />
+        <p className="form-hint">
           Changing the folder applies on restart. Models already downloaded
           stay in the old folder.
         </p>
@@ -673,7 +657,7 @@ export default function SettingsPanel() {
 
       <section className="model-section">
         <h3 className="section-title">Additional model folders</h3>
-        <p className="form-hint" style={{ marginBottom: 12 }}>
+        <p className="form-hint">
           Extra folders to scan for weights, on top of the models folder above.
           Point a service at a library you already have on another drive (e.g.{' '}
           <code className="path-code">E:\ckpts</code>) without moving anything —
@@ -688,93 +672,56 @@ export default function SettingsPanel() {
               <div className="settings-row" key={dir}>
                 <div className="settings-value">
                   <code className="path-code">{dir}</code>
+                  <OpenButton path={dir} onError={setError} />
                   <button
-                    className="btn-tiny"
-                    title="Open in file explorer"
-                    onClick={() =>
-                      openInExplorer(dir).catch((e) =>
-                        setError(e instanceof Error ? e.message : String(e)),
-                      )
-                    }
-                  >
-                    open
-                  </button>
-                  <button
-                    className="btn-tiny"
+                    className="btn-tiny btn-danger"
                     onClick={() => removeExtraDir(dir)}
                     disabled={extraBusy}
                     title="Stop scanning this folder"
                   >
-                    remove
+                    <X size={13} /> Remove
                   </button>
                 </div>
               </div>
             ))}
           </div>
         ) : (
-          <p className="form-hint" style={{ marginBottom: 4 }}>
-            No extra folders yet.
-          </p>
+          <div className="empty-state empty-state-sm">No extra folders yet.</div>
         )}
 
-        <div className="form-actions" style={{ marginTop: 14 }}>
-          <button
-            className="btn btn-primary"
-            onClick={browseExtra}
-            disabled={extraBusy}
-          >
-            Add folder…
-          </button>
-        </div>
-
-        <form
-          className="dl-form"
-          style={{ marginTop: 12 }}
-          onSubmit={(e) => {
-            e.preventDefault();
-            if (extraManualPath.trim()) addExtraDir(extraManualPath.trim());
-          }}
-        >
-          <label className="form-row">
-            <span>…or type/paste a path</span>
-            <input
-              type="text"
-              placeholder="E:\\ckpts"
-              value={extraManualPath}
-              onChange={(e) => setExtraManualPath(e.target.value)}
-              disabled={extraBusy}
-            />
-          </label>
-          <div className="form-actions">
-            <button
-              type="submit"
-              className="btn btn-secondary"
-              disabled={extraBusy || !extraManualPath.trim()}
-            >
-              Add folder
-            </button>
-          </div>
-        </form>
+        <FolderChange
+          label="Add a folder"
+          placeholder="Paste a path, e.g. E:\ckpts"
+          value={extraManualPath}
+          busy={extraBusy}
+          setLabel="Add this path"
+          browseLabel="Choose…"
+          onChange={setExtraManualPath}
+          onSet={addExtraDir}
+          onBrowse={browseExtra}
+        />
       </section>
 
       <section className="model-section">
         <h3 className="section-title">HuggingFace token</h3>
-        <p className="form-hint" style={{ marginBottom: 12 }}>
+        <p className="form-hint">
           Some models are gated or private (Llama, some Gemma releases). Paste
           an access token from{' '}
           <code className="path-code">huggingface.co/settings/tokens</code> (and
           accept the model's terms on its HF page) so OAIY can download
           them. Stored locally; only ever sent to huggingface.co.
         </p>
-        <div className="settings-row" style={{ marginBottom: 10 }}>
+        <div className="settings-row settings-row-flat">
           <span className="settings-label">Status</span>
-          {hfTokenSet == null ? (
-            <span className="badge badge-neutral">…</span>
-          ) : hfTokenSet ? (
-            <span className="badge badge-ok">token saved</span>
-          ) : (
-            <span className="badge badge-neutral">none set</span>
-          )}
+          <div className="settings-value">
+            {hfTokenSet == null ? (
+              <span className="badge badge-neutral">…</span>
+            ) : hfTokenSet ? (
+              <span className="badge badge-ok">token saved</span>
+            ) : (
+              <span className="badge badge-neutral">none set</span>
+            )}
+          </div>
         </div>
         <form
           className="dl-form"

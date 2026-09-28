@@ -64,6 +64,9 @@ async function mount() {
 const text = () => host.textContent ?? '';
 const button = (label: string) =>
   Array.from(host.querySelectorAll('button')).find((b) => b.textContent?.includes(label));
+/** The FormLogic tile, found by the name it is read out with ("FormLogic: Synced. …"). */
+const formlogicTile = (headline = '') =>
+  host.querySelector<HTMLButtonElement>(`button[aria-label^="FormLogic: ${headline}"]`);
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -107,7 +110,7 @@ describe("Today's tiles", () => {
 
   it('says nothing about FormLogic while unlinked', async () => {
     await mount();
-    expect(text()).not.toContain('FormLogic:');
+    expect(formlogicTile()).toBeNull();
   });
 
   it('tells the truth when FormLogic cannot be reached: offline, when it last synced, and what waits', async () => {
@@ -115,10 +118,10 @@ describe("Today's tiles", () => {
     syncMock.mockResolvedValue({ linked: true, state: 'offline', at: new Date().toISOString(), lastSuccessAt: lastSync, pulled: 0, pushed: 0, error: 'formlogic.com can’t be reached: it did not answer in time', pending: { creates: 1, updates: 1, deletes: 0, total: 2 } });
     linkMock.mockResolvedValue({ linked: true, heartbeatError: 'formlogic.com can’t be reached', outbox: { waiting: 3, lastError: 'formlogic.com can’t be reached' }, attempt: { phase: 'idle' }, available: [] });
     await mount();
-    expect(text()).toContain('FormLogic: Offline');
+    expect(formlogicTile('Offline')?.textContent).toContain('Offline');
     expect(text()).toContain('last synced 12 min ago');
     expect(text()).toContain('5 changes waiting');
-    await act(async () => button('FormLogic: Offline')!.click());
+    await act(async () => formlogicTile('Offline')!.click());
     expect(onNavigate).toHaveBeenCalledWith('connections');
   });
 
@@ -126,7 +129,7 @@ describe("Today's tiles", () => {
     syncMock.mockResolvedValue({ linked: true, state: 'synced', at: new Date().toISOString(), lastSuccessAt: new Date().toISOString(), pulled: 0, pushed: 0, error: null, pending: { creates: 0, updates: 0, deletes: 0, total: 0 } });
     linkMock.mockResolvedValue({ linked: true, lastHeartbeatAt: new Date().toISOString(), outbox: { waiting: 0 }, attempt: { phase: 'idle' }, available: [] });
     await mount();
-    expect(text()).toContain('FormLogic: Synced');
+    expect(formlogicTile('Synced')?.textContent).toContain('Synced');
     expect(text()).toContain('just now');
     expect(text()).not.toContain('waiting');
   });

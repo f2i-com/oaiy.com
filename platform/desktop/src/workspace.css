@@ -21,7 +21,8 @@
 .service-card { box-shadow: var(--shadow-card); }
 .banner { flex-wrap: wrap; line-height: 1.5; }
 .banner > span { min-width: 0; overflow-wrap: anywhere; flex: 1 1 240px; }
-.btn, .btn-tiny, .icon-button { min-height: 34px; }
+.btn, .icon-button { min-height: 34px; }
+.btn-tiny { min-height: 28px; }
 /* A plugin screen fills the page down to the dock, and scrolls inside itself.
    The page around it does not scroll too, so there is one scrollbar. Below
    320px of room the page scrolls again rather than squash it. */

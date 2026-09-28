@@ -33,9 +33,10 @@ export default function SetupGuidePanel({ onNavigate, onDismiss, actions, ...sta
   const steps = deriveSetupSteps(state);
   const { done, total } = setupProgress(steps);
   const complete = setupComplete(steps);
+  const optionalLeft = steps.filter((s) => s.optional && !s.done).length;
 
   return (
-    <section className="service-section setup-guide">
+    <section className={complete ? 'service-section setup-guide is-complete' : 'service-section setup-guide'}>
       <div className="section-title-row">
         <h3 className="section-title">
           {complete ? 'You’re set up' : `Getting started · ${done} of ${total}`}
@@ -45,19 +46,23 @@ export default function SetupGuidePanel({ onNavigate, onDismiss, actions, ...sta
         </button>
       </div>
 
+      {/* Set up: one line, and the steps a click away. Not yet: the step-by-step guide. */}
       {complete ? (
         <p className="form-hint">
-          <PartyPopper size={13} /> The runtime is ready and your flows have a model. Anything
-          still unticked below is optional.
+          <PartyPopper size={13} /> The runtime is ready and your flows have a model.
+          {optionalLeft > 0 && ` ${optionalLeft === 1 ? 'One optional step is' : `${optionalLeft} optional steps are`} left.`}
         </p>
       ) : (
-        <p className="form-hint">
-          Work down the list — each step is checked automatically once it’s actually true.
-        </p>
+        <>
+          <p className="form-hint">
+            Work down the list — each step is checked automatically once it’s actually true.
+          </p>
+          <SetupWizard steps={steps} onNavigate={onNavigate} actions={actions} />
+        </>
       )}
 
-      <SetupWizard steps={steps} onNavigate={onNavigate} actions={actions} />
-      <details><summary className="form-hint">View all setup checks</summary>
+      <details className="setup-more">
+        <summary>{complete ? 'Show the setup steps' : 'View all setup checks'}</summary>
       <ul className="setup-list">
         {steps.map((s) => (
           <li key={s.id} className={s.done ? 'setup-step is-done' : 'setup-step'}>

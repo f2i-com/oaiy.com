@@ -665,7 +665,7 @@ function SettingsForm({ settings, onSaved }: { settings: CalendarSettings; onSav
   return (
     <section className="service-section cal-settings">
       <label className="form-row">
-        <span>BUSINESS NAME</span>
+        <span>Business name</span>
         <input value={s.business} placeholder="As the receptionist says it" onChange={(e) => setS({ ...s, business: e.target.value })} />
       </label>
 

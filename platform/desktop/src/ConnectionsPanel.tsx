@@ -311,13 +311,14 @@ export default function ConnectionsPanel() {
           <ul className="pairing-list">
             {paired.map((app) => (
               <li key={app.id}>
-                <span>
-                  <ShieldCheck size={13} aria-hidden /> {app.label ?? app.product}{' '}
-                  <span style={{ opacity: 0.55 }}>({app.product})</span>
+                <span className="pairing-app">
+                  <ShieldCheck size={14} aria-hidden /> <strong>{app.label ?? app.product}</strong>
+                  <span className="pairing-product">{app.product}</span>
                   {/* The name and product are whatever the consumer called
                       itself; the origin is the only part that says which site
-                      this actually is — which is what a revoke decision needs. */}
-                  {app.origin && <code className="pairing-origin">{app.origin}</code>}
+                      this actually is — which is what a revoke decision needs.
+                      Said once when the app already goes by it. */}
+                  {app.origin && app.origin !== app.label && <code className="pairing-origin">{app.origin}</code>}
                 </span>
                 <button
                   className="btn-tiny btn-danger"
@@ -339,26 +340,22 @@ export default function ConnectionsPanel() {
         <div className="section-title-row">
           <h3 className="section-title">Linked account</h3>
         </div>
-        <p className="form-hint" style={{ marginBottom: 10 }}>
-          Link your FormLogic account to use this computer from another laptop, tablet, or phone.
-          OAIY connects outward to the site, so no port forwarding is needed. Approve the link
-          in your browser; OAIY receives a scoped key and never sees your password.
-        </p>
-        <p className="form-hint" style={{ marginBottom: 10 }}>
-          Keep OAIY running, then choose your linked computer on FormLogic. AI conversations and
-          desktop relay flow inputs and results are encrypted end to end. Service and plugin
-          commands use the account’s HTTPS relay. Browser pairing above is for direct access
-          from this computer; it does not replace the account link.
+        <p className="form-hint">
+          Use this computer from another laptop, tablet or phone through your FormLogic account.
+          OAIY connects outward, so no port forwarding is needed, and you approve the link in
+          your browser: OAIY gets a scoped key, never your password. Conversations and relay
+          flows are encrypted end to end; service and plugin commands use the account’s HTTPS
+          relay. The connected apps above reach this computer directly and don’t replace the link.
         </p>
 
         {(accountError ?? statusError) && (
-          <div className="banner banner-err" role="alert" style={{ marginBottom: 10 }}>
+          <div className="banner banner-err" role="alert">
             {accountError ?? statusError}
           </div>
         )}
 
         {account?.attempt.phase === 'awaitingBrowser' && (
-          <div className="banner banner-pending" style={{ marginBottom: 10 }}>
+          <div className="banner banner-pending">
             <strong>Waiting for you to approve this in your browser</strong>
             {/* The launcher can silently do nothing, and the user may simply
                 change their mind. Both need a way forward that isn't waiting
@@ -386,12 +383,12 @@ export default function ConnectionsPanel() {
           </div>
         )}
         {account?.attempt.phase === 'exchanging' && (
-          <div className="banner banner-pending" style={{ marginBottom: 10 }}>
+          <div className="banner banner-pending">
             Finishing the link
           </div>
         )}
         {account?.attempt.phase === 'cancelled' && !account.linked && (
-          <div className="banner banner-pending" style={{ marginBottom: 10 }}>
+          <div className="banner banner-pending">
             <strong>Linking cancelled.</strong>{' '}
             {/* Cancelling closes the local port the provider redirects back to.
                 An approval page still open in the browser now leads nowhere, and
@@ -402,7 +399,7 @@ export default function ConnectionsPanel() {
           </div>
         )}
         {account?.attempt.phase === 'failed' && !account.linked && (
-          <div className="banner banner-err" role="alert" style={{ marginBottom: 10 }}>
+          <div className="banner banner-err" role="alert">
             <span>{account.attempt.message}</span>{' '}
             <button className="btn-tiny" onClick={() => void cancelLink()}>
               Dismiss
@@ -418,12 +415,12 @@ export default function ConnectionsPanel() {
                 {account.accountName && <strong> · {account.accountName}</strong>}
                 <code className="pairing-origin">{account.baseUrl}</code>
                 {account.grantedScopes && (
-                  <small style={{ display: 'block', opacity: 0.6, marginTop: 2 }}>
+                  <small className="link-line link-scopes">
                     {account.grantedScopes}
                   </small>
                 )}
                 {account.sealedFlowsSupported && (
-                  <small role="status" style={{ display: 'block', marginTop: 3, color: account.sealedFlowError ? 'var(--danger)' : undefined }}>
+                  <small role="status" className={account.sealedFlowError ? 'link-line is-error' : 'link-line is-live'}>
                     {account.sealedFlowError ? `Encrypted flows unavailable: ${account.sealedFlowError}`
                       : account.lastSealedFlowAt ? `Listening for encrypted flows · ${new Date(account.lastSealedFlowAt).toLocaleTimeString()}`
                         : 'Connecting to encrypted flows…'}
@@ -435,15 +432,15 @@ export default function ConnectionsPanel() {
                     screen explaining the difference. */}
                 {account.heartbeatSupported !== false &&
                   (account.heartbeatError ? (
-                    <small style={{ display: 'block', marginTop: 3, color: 'var(--danger)' }}>
+                    <small className="link-line is-error">
                       Not checking in: {account.heartbeatError}
                     </small>
                   ) : account.lastHeartbeatAt ? (
-                    <small style={{ display: 'block', opacity: 0.6, marginTop: 3 }}>
+                    <small className="link-line">
                       Checked in {new Date(account.lastHeartbeatAt).toLocaleTimeString()}
                     </small>
                   ) : (
-                    <small style={{ display: 'block', opacity: 0.6, marginTop: 3 }}>
+                    <small className="link-line">
                       Waiting for the first check-in…
                     </small>
                   ))}
@@ -459,7 +456,7 @@ export default function ConnectionsPanel() {
                     the same way there, because two differently-formatted
                     strings make the comparison a chore people skip. */}
                 {account.dataNodeSupported && account.dataNode && (
-                  <small style={{ display: 'block', opacity: 0.6, marginTop: 3 }}>
+                  <small className="link-line">
                     Storage node:{' '}
                     {account.dataNode.approved
                       ? 'approved'
@@ -473,15 +470,15 @@ export default function ConnectionsPanel() {
                 )}
                 {account.relaySupported &&
                   (account.relayError ? (
-                    <small style={{ display: 'block', marginTop: 3, color: 'var(--danger)' }}>
+                    <small className="link-line is-error">
                       Not receiving commands: {account.relayError}
                     </small>
                   ) : account.lastRelayAt ? (
-                    <small style={{ display: 'block', opacity: 0.6, marginTop: 3 }}>
+                    <small className="link-line">
                       Listening for commands · {new Date(account.lastRelayAt).toLocaleTimeString()}
                     </small>
                   ) : (
-                    <small style={{ display: 'block', opacity: 0.6, marginTop: 3 }}>
+                    <small className="link-line">
                       Connecting to the command lane…
                     </small>
                   ))}
@@ -489,19 +486,19 @@ export default function ConnectionsPanel() {
                     kept here while it cannot be reached, and sent in order
                     once it can: say how many, and why they wait. */}
                 {(account.outbox?.waiting ?? 0) > 0 && (
-                  <small role="status" style={{ display: 'block', marginTop: 3, color: account.outbox?.lastError ? 'var(--danger)' : undefined }}>
+                  <small role="status" className={account.outbox?.lastError ? 'link-line is-error' : 'link-line'}>
                     {account.outbox!.waiting} event{account.outbox!.waiting === 1 ? '' : 's'} waiting to reach the account
                     {account.outbox?.lastError ? `: ${account.outbox.lastError}` : ''}
                     {account.outbox?.nextAttemptAt ? ` · next try ${new Date(account.outbox.nextAttemptAt).toLocaleTimeString()}` : ''}
                   </small>
                 )}
                 {account.flowRunError && (
-                  <small style={{ display: 'block', marginTop: 3, color: 'var(--danger)' }}>
+                  <small className="link-line is-error">
                     Flow runs: {account.flowRunError}
                   </small>
                 )}
                 {account.dataNodeSupported && account.dataNodeError && (
-                  <small style={{ display: 'block', marginTop: 3, color: 'var(--danger)' }}>
+                  <small className="link-line is-error">
                     Storage node: {account.dataNodeError}
                   </small>
                 )}
@@ -577,14 +574,14 @@ export default function ConnectionsPanel() {
         <div className="section-title-row">
           <h3 className="section-title">Companion relay</h3>
         </div>
-        <p className="form-hint" style={{ marginBottom: 10 }}>
+        <p className="form-hint">
           Where this machine gets permission for a phone to join a call. The relay carries
           signalling only — call audio goes phone-to-desktop and the relay never hears it.
           FormLogic can act as one, or point this at your own deployment.
         </p>
 
         {relayError && (
-          <div className="banner banner-err" role="alert" style={{ marginBottom: 10 }}>
+          <div className="banner banner-err" role="alert">
             {relayError}
           </div>
         )}

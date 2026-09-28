@@ -558,6 +558,7 @@ kbd {
  * BUTTONS — .button is the prototype's name, .btn* is the panels' contract.
  * ------------------------------------------------------------------------- */
 
+/* A plain .btn is a secondary button; the variants below restyle it. */
 .button,
 .btn {
   display: inline-flex;
@@ -565,14 +566,17 @@ kbd {
   align-items: center;
   justify-content: center;
   gap: 7px;
-  border: 1px solid transparent;
+  border: 1px solid var(--strong-border);
   border-radius: var(--r-ctl);
+  background: var(--surface-soft);
+  color: var(--text);
   padding: 0 13px;
-  font-size: 12px;
-  font-weight: 580;
+  font-size: 12.5px;
+  font-weight: 600;
   white-space: nowrap;
   transition: background 0.14s, border-color 0.14s, transform 0.06s, box-shadow 0.14s;
 }
+.btn:not([class*='btn-']):hover:not(:disabled) { border-color: var(--primary); background: var(--primary-soft); }
 .btn:active:not(:disabled) { transform: translateY(1px); }
 .button:disabled,
 .btn:disabled { cursor: not-allowed; opacity: 0.45; }
@@ -581,12 +585,24 @@ kbd {
 .btn-primary {
   border-color: color-mix(in srgb, var(--primary) 80%, white);
   background: linear-gradient(115deg, var(--primary), var(--primary-2));
-  box-shadow: 0 8px 22px color-mix(in srgb, var(--primary) 25%, transparent),
-    inset 0 1px rgba(255, 255, 255, 0.2);
+  box-shadow: 0 4px 14px color-mix(in srgb, var(--primary) 22%, transparent),
+    inset 0 1px rgba(255, 255, 255, 0.18);
   color: #fff;
 }
+/* Paper Circuit has no glow: a primary button casts its hard offset shadow. */
+:root[data-theme='light'] .button.primary,
+:root[data-theme='light'] .btn-primary {
+  border-color: var(--primary);
+  background: var(--primary);
+  box-shadow: 2px 2px 0 rgba(50, 42, 30, 0.14);
+}
 .button.primary:hover:not(:disabled),
-.btn-primary:hover:not(:disabled) { transform: translateY(-1px); }
+.btn-primary:hover:not(:disabled) {
+  border-color: color-mix(in srgb, var(--primary) 80%, white);
+  background: linear-gradient(115deg, var(--primary), var(--primary-2));
+  filter: brightness(1.08);
+}
+:root[data-theme='light'] .btn-primary:hover:not(:disabled) { background: var(--primary); border-color: var(--primary); }
 
 .button.secondary,
 .btn-secondary {
@@ -627,20 +643,21 @@ kbd {
 .button.danger:hover:not(:disabled),
 .btn-danger:hover:not(:disabled) { border-color: var(--danger); }
 
-/* Row-level micro action — the prototype's canvas-action chip. */
+/* Row-level micro action — the prototype's canvas-action chip, in the body's type like every other button. */
 .btn-tiny {
   display: inline-flex;
-  height: 27px;
+  height: 28px;
   align-items: center;
+  justify-content: center;
   gap: 5px;
-  margin-right: 6px;
   border: 1px solid var(--border);
   border-radius: var(--r-sm);
   background: var(--surface-soft);
   color: var(--muted);
-  padding: 0 9px;
-  font-family: var(--font-mono);
-  font-size: 11px;
+  padding: 0 10px;
+  font-size: 12px;
+  font-weight: 560;
+  white-space: nowrap;
   transition: background 0.14s, color 0.14s, border-color 0.14s;
 }
 .btn-tiny:hover:not(:disabled) {
@@ -677,7 +694,7 @@ code {
   font-family: var(--font-mono);
   font-size: 11px;
 }
-.path-code { color: var(--muted); font-size: 11px; word-break: break-all; }
+.path-code { color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
 .path-code-small {
   border-color: transparent;
   background: transparent;
@@ -815,14 +832,33 @@ code {
 .banner-dismiss:hover { opacity: 1; background: color-mix(in srgb, currentColor 12%, transparent); }
 .banner-dismiss:focus-visible { outline: 2px solid currentColor; outline-offset: 1px; opacity: 1; }
 
+/* Nothing here yet (or still loading): an icon, a line, and what to do about it. */
 .empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
   border: 1px dashed var(--border);
   border-radius: var(--r-ctl);
-  color: var(--faint);
+  color: var(--muted);
   padding: 26px;
-  font-size: 12px;
+  font-size: 12.5px;
   text-align: center;
 }
+.empty-state p { margin: 0; }
+.empty-state p + p { color: var(--faint); font-size: 12px; }
+.empty-state > svg { color: var(--faint); }
+
+/* A plugin's or a provider's card: the same parts as a service card. */
+.card-head { display: flex; min-width: 0; align-items: center; flex-wrap: wrap; gap: 8px 10px; }
+.card-head > svg { flex: none; color: var(--node, var(--muted)); }
+.card-title { font-size: 14.5px; font-weight: 640; letter-spacing: -0.01em; }
+.card-note { color: var(--faint); font-size: 12px; }
+.card-desc { margin: 7px 0 0; color: var(--muted); font-size: 12.5px; line-height: 1.55; }
+.card-reason { margin: 6px 0 0; color: var(--amber); font-size: 12.5px; overflow-wrap: anywhere; }
+.card-meta { margin: 5px 0 0; color: var(--faint); font-size: 12px; }
+.card-warn { display: flex; align-items: center; gap: 6px; color: var(--amber); }
+.card-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
 
 /* A framed aside for a path/location note — the prototype's rail treatment. */
 .datadir-note {
@@ -833,7 +869,11 @@ code {
   color: var(--muted);
   padding: 11px 14px;
   font-size: 12px;
+  line-height: 1.6;
 }
+/* The note and its buttons on one line (they wrap under it when there is no room). */
+.datadir-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.datadir-row > span:first-child { min-width: 0; flex: 1 1 320px; overflow-wrap: anywhere; }
 
 /* ---------------------------------------------------------------------------
  * SERVICE CARDS — status rides the left rail, as an accent per state.
@@ -856,7 +896,7 @@ code {
   transition: border-color 0.15s, transform 0.15s, box-shadow 0.15s;
 }
 :root[data-theme='light'] .service-card { background: var(--surface-raised); }
-.service-card:hover { transform: translateY(-1px); }
+/* Cards are not buttons: they stay put under the pointer (their buttons react instead). */
 
 .service-card-stopped { --node: var(--strong-border); }
 .service-card-running { --node: var(--green); }
@@ -1020,7 +1060,6 @@ code {
 .catalog-card:hover {
   border-color: color-mix(in srgb, var(--primary) 55%, var(--border));
   background: var(--surface-raised);
-  transform: translateY(-2px);
 }
 .catalog-name { font-size: 12.5px; font-weight: 620; }
 .catalog-desc {
@@ -1044,16 +1083,17 @@ h3 { margin: 0; font-size: 13px; font-weight: 650; }
 
 label { color: var(--muted); }
 
+/* A field's label: small capitals in the body type, the same for every form and
+   readout; the value (a path, a URL) keeps the mono data voice. */
 .form-row { display: flex; flex: 1; flex-direction: column; gap: 6px; }
 .form-row > span,
 .settings-label {
-  color: var(--muted);
-  font-family: var(--font-mono);
-  font-size: 10px;
-  font-weight: 650;
-  letter-spacing: 0.06em;
+  color: var(--faint);
+  font-size: 10.5px;
+  font-weight: 680;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
 }
-.settings-label { text-transform: uppercase; }
 .form-row > span code { letter-spacing: normal; text-transform: none; }
 
 input,
@@ -1204,26 +1244,32 @@ select:disabled { cursor: not-allowed; opacity: 0.5; }
  * RUN HISTORY
  * ------------------------------------------------------------------------ */
 
-/* Segmented filter. Reads as one control rather than two buttons that happen
-   to be adjacent, so the "one of these is active" state is obvious. */
+/* Segmented filter, the same control as a section's tabs. Reads as one control
+   rather than buttons that happen to be adjacent, so the "one of these is
+   active" state is obvious. */
 .seg {
   display: inline-flex;
-  overflow: hidden;
+  flex-wrap: wrap;
+  gap: 2px;
   border: 1px solid var(--border);
-  border-radius: var(--r-ctl);
-  background: var(--surface-soft);
+  border-radius: calc(var(--r-ctl) + 2px);
+  background: var(--canvas);
+  padding: 3px;
   margin-left: auto;
 }
 .seg > button {
+  height: 26px;
   border: 0;
+  border-radius: var(--r-sm);
   background: transparent;
   color: var(--muted);
-  padding: 4px 11px;
+  padding: 0 11px;
   font-size: 12px;
   font-weight: 600;
+  white-space: nowrap;
+  transition: background 0.14s, color 0.14s;
 }
-.seg > button + button { border-left: 1px solid var(--border); }
-.seg > button:hover { color: var(--text); }
+.seg > button:hover { background: var(--surface-soft); color: var(--text); }
 .seg > button.active { background: var(--primary-soft); color: var(--primary); }
 
 .run-list { list-style: none; margin: 4px 0 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
@@ -1303,7 +1349,15 @@ select:disabled { cursor: not-allowed; opacity: 0.5; }
   padding-top: 11px;
 }
 .settings-grid > .settings-row:first-child { border-top: 0; padding-top: 0; }
-.settings-value { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+.settings-row-flat { border-top: 0; padding-top: 0; }
+.settings-value { display: flex; min-width: 0; align-items: center; flex-wrap: wrap; gap: 8px; }
+.settings-value .path-code { min-width: 0; }
+
+/* Changing a folder: paste a path and use it, or choose one — one row. */
+.folder-change { display: flex; flex-direction: column; gap: 7px; border-top: 1px solid var(--border); padding-top: 12px; }
+.folder-change-row { display: flex; flex-wrap: wrap; gap: 8px; }
+.folder-change-row input { width: auto; min-width: 0; flex: 1 1 260px; font-family: var(--font-mono); }
+.empty-state-sm { padding: 14px; }
 
 /* ---------------------------------------------------------------------------
  * LOGS
@@ -1579,14 +1633,29 @@ select:disabled { cursor: not-allowed; opacity: 0.5; }
 }
 .pairing-actions { display: flex; gap: 8px; margin-top: 12px; }
 .pairing-list { list-style: none; margin: 6px 0 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
-.pairing-list li { display: flex; align-items: center; justify-content: space-between; font-size: 13px; }
+.pairing-list li { display: flex; align-items: center; justify-content: space-between; gap: 12px; font-size: 13px; }
+.pairing-list li + li { border-top: 1px solid var(--border); padding-top: 8px; }
+.pairing-app { display: inline-flex; min-width: 0; align-items: center; flex-wrap: wrap; gap: 6px; }
+.pairing-app > svg { color: var(--green); }
+.pairing-product { color: var(--faint); font-size: 12px; }
+.pairing-app .pairing-origin { margin-left: 0; }
+/* The linked account's status, a line each; what is live in green, what is wrong in red. */
+.link-line { display: block; margin-top: 3px; color: var(--muted); font-size: 12px; line-height: 1.5; }
+.link-line.link-scopes { color: var(--faint); font-family: var(--font-mono); font-size: 11px; overflow-wrap: anywhere; }
+.link-line.is-live { color: var(--green); }
+.link-line.is-error { color: var(--danger); }
 .pairing-body { overflow-wrap: anywhere; }
 /* Guided setup remains usable in narrow desktop windows. */
-.setup-wizard { margin: 16px 0; padding: 20px; border: 1px solid var(--border, #404040); border-radius: 14px; min-width: 0; }
-.setup-wizard h4 { margin: 20px 0 8px; font-size: 17px; }
-.setup-wizard-nav, .setup-wizard-footer { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
-.setup-wizard-nav [aria-current="step"], .setup-wizard-nav [aria-pressed="true"] { outline: 2px solid var(--primary); outline-offset: 2px; }
-.setup-wizard-footer { margin-top: 20px; justify-content: space-between; }
+.setup-wizard { margin: 2px 0 0; padding: 16px 18px; border: 1px solid var(--border); border-radius: var(--r-card); background: var(--surface-soft); min-width: 0; }
+.setup-wizard h4 { margin: 16px 0 6px; font-size: 16px; font-weight: 640; letter-spacing: -0.01em; }
+.setup-wizard-nav, .setup-wizard-footer { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+/* The step shown, and the AI choice made: the selected look of the segmented tabs. */
+.setup-wizard-nav [aria-current="step"], .setup-wizard-nav [aria-pressed="true"] {
+  border-color: color-mix(in srgb, var(--primary) 45%, var(--border));
+  background: var(--primary-soft);
+  color: var(--primary);
+}
+.setup-wizard-footer { margin-top: 18px; justify-content: space-between; }
 .setup-wizard-instructions { padding-left: 22px; font-size: 13px; line-height: 1.8; overflow-wrap: anywhere; }
 .setup-wizard-choice { margin-top: 16px; }
 .setup-wizard .service-section { margin-top: 20px; }
@@ -1599,7 +1668,14 @@ select:disabled { cursor: not-allowed; opacity: 0.5; }
 /* ---------------------------------------------------------------------------
  * CALENDAR
  * ------------------------------------------------------------------------- */
-.calendar .section-title-row { flex-wrap: wrap; gap: 10px; }
+.calendar .section-title-row { flex-wrap: wrap; align-items: center; gap: 10px; }
+/* The calendar's toolbar: its views and the week on the left, like a section's
+   tabs; FormLogic's state and New appointment on the right. */
+.calendar > .section-title-row { justify-content: flex-start; }
+.calendar > .section-title-row > .seg { margin-left: 0; }
+.calendar > .section-title-row > :last-child { margin-left: auto; }
+.calendar > .section-title-row > .cal-sync { margin-left: auto; }
+.calendar > .section-title-row > .cal-sync + :last-child { margin-left: 0; }
 .cal-weeknav { display: flex; align-items: center; gap: 6px; }
 .cal-range { color: var(--muted); font-size: 12px; margin-left: 4px; }
 .cal-grid {
@@ -1718,7 +1794,9 @@ select:disabled { cursor: not-allowed; opacity: 0.5; }
 .cal-voice-add input[type='file']::file-selector-button { margin-right: 10px; border: 1px solid var(--strong-border); border-radius: var(--r-sm); background: var(--surface-raised); color: var(--text); padding: 4px 10px; font: inherit; font-size: 12px; cursor: pointer; }
 .cal-voice-add input[type='file']::file-selector-button:hover { border-color: var(--primary); }
 .cal-hours { display: grid; gap: 6px; }
-.cal-hours-row { display: grid; grid-template-columns: 150px 120px auto 120px; align-items: center; gap: 8px; }
+.cal-hours-row { display: grid; grid-template-columns: 150px 136px 20px 136px; justify-content: start; align-items: center; gap: 8px; }
+.cal-hours-row > .form-hint { text-align: center; }
+.cal-hours-row > .form-hint:only-of-type:last-child { text-align: left; }
 .cal-services { display: grid; gap: 6px; }
 .cal-service-row { display: grid; grid-template-columns: 1.4fr 80px auto 1fr 1.6fr auto; align-items: center; gap: 8px; }
 
@@ -1742,8 +1820,40 @@ select:disabled { cursor: not-allowed; opacity: 0.5; }
   .sidebar nav .nav-group { visibility: hidden; height: 6px; margin: 6px 0 0; }
 }
 
-/* Overview's Today tiles: a state in colour. */
+/* Overview's Today tiles: a state in colour, on one line. */
 .today-grid .overview-tile strong.ok { color: var(--green); }
 .today-grid .overview-tile strong.warn { color: var(--amber); }
-.today-grid { grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); }
-.today-grid .overview-tile strong { font-size: 20px; line-height: 1.25; }
+/* Five tiles stay one row down to a narrow window, their states a little smaller there. */
+.today-grid { grid-template-columns: repeat(auto-fit, minmax(128px, 1fr)); }
+.today-grid .overview-tile strong { max-width: 100%; overflow: hidden; font-size: clamp(16px, 1.45vw, 20px); line-height: 1.25; text-overflow: ellipsis; white-space: nowrap; }
+@media (max-width: 1000px) { .today-grid .overview-tile { padding: 14px; } }
+.overview-tile > svg { color: var(--muted); }
+.overview-tile small { overflow-wrap: anywhere; }
+
+/* A plugin's card on the Overview: one row, its way in on the right. */
+.overview-hero { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; padding: 14px 16px; }
+.overview-hero-icon {
+  display: grid;
+  width: 34px;
+  height: 34px;
+  flex: none;
+  place-items: center;
+  border-radius: var(--r-ctl);
+  background: color-mix(in srgb, var(--node) 14%, transparent);
+  color: var(--node);
+}
+.overview-hero-text { display: flex; min-width: 0; flex: 1 1 220px; flex-direction: column; gap: 2px; }
+.overview-hero-title { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+.overview-hero-title strong { font-size: 14.5px; font-weight: 640; }
+.overview-hero-text small { color: var(--muted); font-size: 12.5px; }
+
+/* The setup guide's "more": a quiet disclosure. */
+.setup-more > summary {
+  width: fit-content;
+  color: var(--muted);
+  font-size: 12px;
+  cursor: pointer;
+}
+.setup-more > summary:hover { color: var(--text); }
+.setup-more[open] > summary { margin-bottom: 8px; }
+.setup-guide .form-hint svg { vertical-align: -2px; }

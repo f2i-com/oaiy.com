@@ -199,25 +199,29 @@ export default function OverviewPanel({ onNavigate, onOpenPluginScreen }: Props)
         return (
           <div
             key={`${plugin.id}-${card.id ?? 'card'}`}
-            className={`service-card service-card-${running ? 'running' : 'stopped'}`}
+            className={`service-card overview-hero service-card-${running ? 'running' : 'stopped'}`}
           >
-            <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
-              <Sparkles size={15} aria-hidden />
-              <strong style={{ fontSize: 15 }}>{card.title ?? plugin.manifest?.name ?? plugin.id}</strong>
-              <span className={running ? 'badge badge-ok' : 'badge badge-neutral'}>{plugin.state}</span>
-            </div>
-            {/* The declared bindings reference the plugin's own health feed; until
-                that is wired, report the state the host actually knows rather than
-                echoing an unresolved "$health.status" placeholder. */}
-            {!running && plugin.reason && (
-              <p style={{ fontSize: 12.5, opacity: 0.75, margin: '6px 0 0' }}>{plugin.reason}</p>
-            )}
+            <span className="overview-hero-icon" aria-hidden>
+              <Sparkles size={16} />
+            </span>
+            <span className="overview-hero-text">
+              <span className="overview-hero-title">
+                <strong>{card.title ?? plugin.manifest?.name ?? plugin.id}</strong>
+                <span className={running ? 'badge badge-ok' : 'badge badge-neutral'}>{plugin.state}</span>
+              </span>
+              {/* The declared bindings reference the plugin's own health feed; until
+                  that is wired, report the state the host actually knows rather than
+                  echoing an unresolved "$health.status" placeholder. */}
+              <small>
+                {running
+                  ? `From the ${plugin.manifest?.name ?? plugin.id} plugin.`
+                  : plugin.reason ?? 'Start it from Connections, under Plugins.'}
+              </small>
+            </span>
             {navId && (
-              <div style={{ display: 'flex', gap: 8, marginTop: 10 }}>
-                <button className="btn btn-secondary" onClick={() => onOpenPluginScreen(plugin.id, navId)}>
-                  {card.bind?.cta?.label ?? `Open ${card.title ?? plugin.id}`} <ChevronRight size={13} />
-                </button>
-              </div>
+              <button className="btn btn-secondary" onClick={() => onOpenPluginScreen(plugin.id, navId)}>
+                {card.bind?.cta?.label ?? `Open ${card.title ?? plugin.id}`} <ChevronRight size={13} />
+              </button>
             )}
           </div>
         );
@@ -369,24 +373,6 @@ export default function OverviewPanel({ onNavigate, onOpenPluginScreen }: Props)
             <ListChecks size={13} /> Show the setup guide
           </button>
         </div>
-      )}
-
-      {apps !== null && apps.length > 0 && (
-        <section className="service-section">
-          <div className="section-title-row">
-            <h3 className="section-title">Connected apps</h3>
-          </div>
-          <ul className="pairing-list">
-            {apps.map((a) => (
-              <li key={a.id}>
-                <span>
-                  {a.label ?? a.product} <span style={{ opacity: 0.55 }}>({a.product})</span>
-                </span>
-                <span className="badge badge-ok">paired</span>
-              </li>
-            ))}
-          </ul>
-        </section>
       )}
 
       {plug !== null && plug.length === 0 && cards.length === 0 && (

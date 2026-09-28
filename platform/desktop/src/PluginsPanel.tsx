@@ -194,7 +194,7 @@ export default function PluginsPanel() {
       )}
 
       {snapshot && (
-        <div className="datadir-note">
+        <div className="datadir-note datadir-row">
           <span>
             Plugins live in <code>{snapshot.root}</code>.
           </span>
@@ -287,18 +287,18 @@ export default function PluginsPanel() {
           </div>
           {definitions.map((d) => (
             <div key={d.id} className="service-card service-card-running">
-              <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+              <div className="card-head">
                 <Boxes size={14} aria-hidden />
-                <strong style={{ fontSize: 15 }}>{d.name}</strong>
+                <strong className="card-title">{d.name}</strong>
                 <span className="badge badge-neutral">{d.category ?? 'service'}</span>
-                <span style={{ fontSize: 12, opacity: 0.6 }}>
+                <span className="card-note">
                   from <code>{d.pluginId}</code>
                 </span>
               </div>
               {d.description && (
-                <p style={{ fontSize: 13, opacity: 0.8, margin: '6px 0 0' }}>{d.description}</p>
+                <p className="card-desc">{d.description}</p>
               )}
-              <div style={{ fontSize: 12, opacity: 0.7, marginTop: 6 }}>
+              <div className="card-meta">
                 {d.actions.length} action{d.actions.length === 1 ? '' : 's'}:{' '}
                 {d.actions.map((a) => a.id).join(', ')}
               </div>
@@ -344,28 +344,28 @@ function PluginCard({
 
   return (
     <div className={`service-card service-card-${cardStatus(p.state)}`}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+      <div className="card-head">
         <CircleDot size={14} aria-hidden />
-        <strong style={{ fontSize: 15 }}>{p.manifest?.name ?? p.id}</strong>
+        <strong className="card-title">{p.manifest?.name ?? p.id}</strong>
         <span className={badgeClass(p.state)}>{p.state}</span>
         {p.manifest?.version && (
-          <span style={{ fontSize: 12, opacity: 0.6 }}>v{p.manifest.version}</span>
+          <span className="card-note">v{p.manifest.version}</span>
         )}
         {p.userDisabled && <span className="badge badge-neutral">disabled by you</span>}
       </div>
 
       {p.manifest?.description && (
-        <p style={{ fontSize: 13, opacity: 0.8, margin: '6px 0 0' }}>{p.manifest.description}</p>
+        <p className="card-desc">{p.manifest.description}</p>
       )}
 
       {/* Every non-running state carries a reason the host wrote — surface it,
           because "it won't start" with no cause is the least useful state. */}
       {p.state !== 'running' && p.reason && (
-        <p style={{ fontSize: 12.5, opacity: 0.75, margin: '6px 0 0' }}>{p.reason}</p>
+        <p className="card-reason">{p.reason}</p>
       )}
 
       {loadable && (
-        <div style={{ fontSize: 12, opacity: 0.6, marginTop: 6 }}>
+        <div className="card-meta">
           {connectorCount > 0 && `${connectorCount} command${connectorCount === 1 ? '' : 's'}`}
           {connectorCount > 0 && (p.manifest?.events?.length ?? 0) > 0 && ' · '}
           {(p.manifest?.events?.length ?? 0) > 0 &&
@@ -377,18 +377,18 @@ function PluginCard({
           pre-OAIY name, or asking for something OAIY has no equivalent for, is a
           real fact an operator wants before a mystery denial. */}
       {p.legacyCapabilities && p.legacyCapabilities.length > 0 && (
-        <p style={{ fontSize: 12, opacity: 0.7, margin: '4px 0 0' }}>
+        <p className="card-meta">
           Uses legacy capability names: {p.legacyCapabilities.map(([o]) => o).join(', ')}
         </p>
       )}
       {p.unknownCapabilities && p.unknownCapabilities.length > 0 && (
-        <p style={{ fontSize: 12, color: 'var(--warn, #b7791f)', margin: '4px 0 0', display: 'flex', gap: 6, alignItems: 'center' }}>
+        <p className="card-meta card-warn">
           <TriangleAlert size={12} /> Asks for {p.unknownCapabilities.join(', ')}, which this OAIY
           build does not provide.
         </p>
       )}
 
-      <div style={{ display: 'flex', gap: 8, marginTop: 10, flexWrap: 'wrap' }}>
+      <div className="card-actions">
         {pending ? (
           <button className="btn btn-secondary" disabled>
             <Loader2 size={14} className="spin" /> Working…

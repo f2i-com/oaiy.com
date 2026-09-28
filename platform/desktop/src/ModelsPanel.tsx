@@ -13,6 +13,7 @@ import {
   type DownloadStatus,
   type ModelsSnapshot,
 } from './api';
+import { Check, Copy, Download, FolderOpen, Trash2 } from 'lucide-react';
 import { useToast } from './Toasts';
 
 /** Rows added per "Show more". The panel polls, so every row on screen is
@@ -175,9 +176,10 @@ export default function ModelsPanel() {
         </div>
       )}
       {snapshot && (
-        <div className="datadir-note">
-          Designated downloads folder:{' '}
-          <code className="path-code">{snapshot.rootDir}</code>
+        <div className="datadir-note datadir-row">
+          <span>
+            Models download to <code className="path-code">{snapshot.rootDir}</code>
+          </span>
           <button
             className="btn-tiny"
             onClick={async () => {
@@ -190,7 +192,7 @@ export default function ModelsPanel() {
             }}
             title="Copy path"
           >
-            copy
+            <Copy size={13} /> Copy
           </button>
           <button
             className="btn-tiny"
@@ -201,14 +203,10 @@ export default function ModelsPanel() {
             }
             title="Open folder in file explorer"
           >
-            open
+            <FolderOpen size={13} /> Open
           </button>
           {snapshot.freeBytes != null && (
-            <span
-              className="badge badge-neutral"
-              style={{ marginLeft: 8 }}
-              title="Free space on this drive"
-            >
+            <span className="badge badge-neutral" title="Free space on this drive">
               {formatBytes(snapshot.freeBytes)} free
             </span>
           )}
@@ -304,7 +302,7 @@ export default function ModelsPanel() {
                       </div>
                       {onDisk ? (
                         <button className="btn btn-ghost" disabled>
-                          ✓ On disk
+                          <Check size={14} /> On disk
                         </button>
                       ) : active ? (
                         <button className="btn btn-ghost" disabled>
@@ -312,7 +310,7 @@ export default function ModelsPanel() {
                         </button>
                       ) : (
                         <button
-                          className="btn btn-primary"
+                          className="btn btn-secondary"
                           onClick={() =>
                             onAction(() =>
                               models.download(
@@ -323,7 +321,7 @@ export default function ModelsPanel() {
                             )
                           }
                         >
-                          Download
+                          <Download size={14} /> Download
                         </button>
                       )}
                     </div>
@@ -377,16 +375,13 @@ export default function ModelsPanel() {
         )}
         {snapshot?.models.map((m) => (
           <div key={m.path} className="model-row">
-            <div className="model-info">
+            <div className="model-info" title={m.path}>
               <div className="model-name">{m.name}</div>
-              <div className="model-meta">
-                {formatBytes(m.sizeBytes)} ·{' '}
-                <span className="path-code">{m.path}</span>
-              </div>
+              <div className="model-meta">{formatBytes(m.sizeBytes)}</div>
             </div>
             <div className="row-actions">
               <button
-                className="btn btn-ghost"
+                className="btn-tiny"
                 onClick={() =>
                   openInExplorer(m.path).catch((e) =>
                     setActionError(e instanceof Error ? e.message : String(e)),
@@ -394,17 +389,17 @@ export default function ModelsPanel() {
                 }
                 title="Show in file explorer"
               >
-                Reveal
+                <FolderOpen size={13} /> Reveal
               </button>
               <button
-                className="btn btn-ghost btn-danger"
+                className="btn-tiny btn-danger"
                 onClick={() => {
                   if (confirm(`Delete ${m.name}?`)) {
                     onAction(() => models.delete(m.name));
                   }
                 }}
               >
-                Delete
+                <Trash2 size={13} /> Delete
               </button>
             </div>
           </div>
