@@ -7,6 +7,9 @@
 //! the same tokens. They ask a [`Scorer`] for the best token (and duration) at
 //! a frame; [`DeviceScorer`] answers from the joint on the model's device.
 //!
+//! Its weights are small (the LSTM and joint are about 12M parameters), so
+//! they stay f32 on every device.
+//!
 //! The prediction network only changes when a token is emitted, so between
 //! emissions the joint depends on the encoder frame alone: the scorer
 //! evaluates a block of upcoming frames in one product and serves the
@@ -15,7 +18,7 @@
 
 use candle_core::{DType, Device, Module, Tensor};
 
-use super::encoder::Linear;
+use super::encoder::{Linear, Precision};
 use super::weights::Weights;
 use super::{bad, Result};
 
@@ -82,10 +85,10 @@ impl Lstm {
     fn step(&self, x: &Tensor, h: &Tensor, c: &Tensor) -> Result<(Tensor, Tensor)> {
         let gates = self.w.forward(&Tensor::cat(&[x, h], 1)?)?;
         let n = self.hidden;
-        let i = candle_nn::ops::sigmoid(&gates.narrow(1, 0, n)?)?;
-        let f = candle_nn::ops::sigmoid(&gates.narrow(1, n, n)?)?;
+        // One sigmoid over all four gates (g's is unused), one tanh for g.
+        let s = candle_nn::ops::sigmoid(&gates)?;
+        let (i, f, o) = (s.narrow(1, 0, n)?, s.narrow(1, n, n)?, s.narrow(1, 3 * n, n)?);
         let g = gates.narrow(1, 2 * n, n)?.tanh()?;
-        let o = candle_nn::ops::sigmoid(&gates.narrow(1, 3 * n, n)?)?;
         let c = ((f * c)? + (i * g)?)?;
         let h = (o * c.tanh()?)?;
         Ok((h, c))
@@ -105,7 +108,8 @@ pub struct DecoderShape {
 }
 
 pub struct Decoder {
-    embed: Tensor,
+    /// `(tokens, hidden)` row-major, on the host.
+    embed: Vec<f32>,
     lstm: Vec<Lstm>,
     /// `joint.pred`: prediction output to the joint's width.
     pred: Linear,
@@ -126,10 +130,10 @@ pub struct PredState {
 }
 
 impl Decoder {
-    pub fn load(w: &mut Weights, d_model: usize, dtype: DType, dev: &Device) -> Result<Self> {
+    pub fn load(w: &mut Weights, d_model: usize, dev: &Device) -> Result<Self> {
         let e = w.shape("decoder.prediction.embed.weight")?;
         let [tokens, hidden] = e[..] else { return Err(bad("decoder.prediction.embed.weight is not 2-D")) };
-        let embed = w.tensor("decoder.prediction.embed.weight", &[tokens, hidden], DType::F32, dev)?;
+        let (embed, _) = w.f32_shaped("decoder.prediction.embed.weight", &[tokens, hidden])?;
         let mut lstm = Vec::new();
         while w.has(&format!("decoder.prediction.dec_rnn.lstm.weight_ih_l{}", lstm.len())) {
             let l = lstm.len();
@@ -146,7 +150,7 @@ impl Decoder {
                 cat.extend_from_slice(&wih[r * hidden..(r + 1) * hidden]);
                 cat.extend_from_slice(&whh[r * hidden..(r + 1) * hidden]);
             }
-            let weight = Tensor::from_vec(cat, (4 * hidden, 2 * hidden), &Device::Cpu)?.to_dtype(dtype)?.to_device(dev)?;
+            let weight = Tensor::from_vec(cat, (4 * hidden, 2 * hidden), dev)?;
             let bias: Vec<f32> = bih.iter().zip(&bhh).map(|(a, b)| a + b).collect();
             lstm.push(Lstm { w: Linear::from_parts(weight, Some(Tensor::from_vec(bias, 4 * hidden, dev)?)), hidden });
         }
@@ -155,9 +159,10 @@ impl Decoder {
         }
         let joint = w.shape("joint.pred.weight")?[0];
         let outputs = w.shape("joint.joint_net.2.weight")?[0];
-        let pred = Linear::load(w, "joint.pred", joint, hidden, dtype, dev)?;
-        let enc = Linear::load(w, "joint.enc", joint, d_model, dtype, dev)?;
-        let out = Linear::load(w, "joint.joint_net.2", outputs, joint, dtype, dev)?;
+        let f32 = Precision::f32();
+        let pred = Linear::load(w, "joint.pred", joint, hidden, f32, dev)?;
+        let enc = Linear::load(w, "joint.enc", joint, d_model, f32, dev)?;
+        let out = Linear::load(w, "joint.joint_net.2", outputs, joint, f32, dev)?;
         let shape = DecoderShape { tokens, hidden, layers: lstm.len(), joint, outputs };
         Ok(Self { embed, lstm, pred, enc, out, shape, dev: dev.clone() })
     }
@@ -170,13 +175,17 @@ impl Decoder {
     /// Run the prediction network on `input` `(1, hidden)` from `state`
     /// (zeros when `None`).
     fn predict(&self, input: &Tensor, state: Option<&PredState>) -> Result<PredState> {
-        let zeros = Tensor::zeros((1, self.shape.hidden), DType::F32, &self.dev)?;
+        let zeros = match state {
+            Some(_) => None,
+            None => Some(Tensor::zeros((1, self.shape.hidden), DType::F32, &self.dev)?),
+        };
         let mut x = input.clone();
         let mut layers = Vec::with_capacity(self.lstm.len());
         for (l, cell) in self.lstm.iter().enumerate() {
-            let (h, c) = match state {
-                Some(s) => (s.layers[l].0.clone(), s.layers[l].1.clone()),
-                None => (zeros.clone(), zeros.clone()),
+            let (h, c) = match (state, &zeros) {
+                (Some(s), _) => (s.layers[l].0.clone(), s.layers[l].1.clone()),
+                (None, Some(z)) => (z.clone(), z.clone()),
+                (None, None) => unreachable!("zeros are made when there is no state"),
             };
             let (h, c) = cell.step(&x, &h, &c)?;
             x = h.clone();
@@ -191,9 +200,14 @@ impl Decoder {
         self.predict(&Tensor::zeros((1, self.shape.hidden), DType::F32, &self.dev)?, None)
     }
 
-    /// The state after `token`.
+    /// The state after `token`. The embedding table stays on the host: one
+    /// row goes up per token, which is one copy instead of an index upload
+    /// and a gather.
     pub fn next(&self, state: &PredState, token: u32) -> Result<PredState> {
-        let x = self.embed.index_select(&Tensor::new(&[token], &self.dev)?, 0)?;
+        let h = self.shape.hidden;
+        let at = token as usize * h;
+        let row = self.embed.get(at..at + h).ok_or_else(|| bad(format!("token {token} is past the embedding")))?;
+        let x = Tensor::from_slice(row, (1, h), &self.dev)?;
         self.predict(&x, Some(state))
     }
 
@@ -239,16 +253,14 @@ impl Scorer for DeviceScorer<'_> {
             let logits = self.dec.joint(&self.enc_proj.narrow(0, frame, n)?, &self.state)?;
             let outputs = logits.dim(1)?;
             let tokens = logits.narrow(1, 0, self.token_outputs)?.argmax_keepdim(1)?;
-            let best = if outputs > self.token_outputs {
+            self.cache = if outputs > self.token_outputs {
                 let durations = logits.narrow(1, self.token_outputs, outputs - self.token_outputs)?.argmax_keepdim(1)?;
-                Tensor::cat(&[&tokens, &durations], 1)?
+                Tensor::cat(&[&tokens, &durations], 1)?.to_vec2::<u32>()?.into_iter().map(|r| (r[0], r[1] as usize)).collect()
             } else {
-                Tensor::cat(&[&tokens, &tokens.zeros_like()?], 1)?
+                tokens.flatten_all()?.to_vec1::<u32>()?.into_iter().map(|k| (k, 0)).collect()
             };
-            let best = best.to_vec2::<u32>()?;
             self.trips += 1;
             self.cache_start = frame;
-            self.cache = best.into_iter().map(|r| (r[0], r[1] as usize)).collect();
         }
         Ok(self.cache[frame - self.cache_start])
     }

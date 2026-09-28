@@ -49,9 +49,11 @@ fn pick_device(choice: DeviceChoice) -> Result<Device, String> {
 }
 
 fn pick_dtype(p: Precision, dev: &Device) -> DType {
+    // TF32 products are a process-wide cuBLAS setting; this process runs one model.
+    candle_core::cuda::set_gemm_reduced_precision_f32(p == Precision::Tf32 && dev.is_cuda());
     match p {
         Precision::Auto if dev.is_cuda() => DType::F16,
-        Precision::Auto | Precision::F32 => DType::F32,
+        Precision::Auto | Precision::F32 | Precision::Tf32 => DType::F32,
         Precision::F16 => DType::F16,
         Precision::Bf16 => DType::BF16,
     }
@@ -66,7 +68,8 @@ fn describe(dev: &Device, dtype: DType) -> String {
         },
         _ => format!("{:?}", dev.location()),
     };
-    format!("{d} {}", dtype.as_str())
+    let tf32 = dtype == DType::F32 && dev.is_cuda() && candle_core::cuda::gemm_reduced_precision_f32();
+    format!("{d} {}", if tf32 { "tf32" } else { dtype.as_str() })
 }
 
 fn load(path: &Path, device: DeviceChoice, precision: Precision) -> Result<Transcriber, String> {

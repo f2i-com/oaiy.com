@@ -50,8 +50,10 @@ pub struct MelFrontEnd {
     cfg: MelConfig,
     /// The Hann window zero-padded to `n_fft`, centred as `torch.stft` does.
     window: Vec<f64>,
-    /// `(n_mels, n_fft / 2 + 1)`, row-major; rounded to f32 like NeMo's buffer.
-    filters: Vec<f64>,
+    /// Each mel's nonzero span of the `(n_mels, n_fft / 2 + 1)` filterbank
+    /// (rounded to f32 like NeMo's buffer): its first bin and its weights.
+    /// A filter covers a few bins, so this is a small fraction of the matrix.
+    filters: Vec<(usize, Vec<f64>)>,
     /// Twiddle factors for the radix-2 FFT: `exp(-2 pi i k / n_fft)`.
     twiddle: Vec<(f64, f64)>,
 }
@@ -76,7 +78,16 @@ impl MelFrontEnd {
             let w = if n == 1 { 1.0 } else { 0.5 - 0.5 * (2.0 * std::f64::consts::PI * i as f64 / (n - 1) as f64).cos() };
             window[left + i] = w as f32 as f64;
         }
-        let filters = slaney_filters(cfg.sample_rate as f64, cfg.n_fft, cfg.n_mels, 0.0, cfg.sample_rate as f64 / 2.0).into_iter().map(|w| w as f64).collect();
+        let bins = cfg.n_fft / 2 + 1;
+        let dense = slaney_filters(cfg.sample_rate as f64, cfg.n_fft, cfg.n_mels, 0.0, cfg.sample_rate as f64 / 2.0);
+        let filters = dense
+            .chunks(bins)
+            .map(|row| {
+                let first = row.iter().position(|&w| w != 0.0).unwrap_or(0);
+                let last = row.iter().rposition(|&w| w != 0.0).map_or(first, |l| l + 1);
+                (first, row[first..last].iter().map(|&w| w as f64).collect())
+            })
+            .collect();
         let twiddle = (0..cfg.n_fft / 2)
             .map(|k| {
                 let a = -2.0 * std::f64::consts::PI * k as f64 / cfg.n_fft as f64;
@@ -127,9 +138,8 @@ impl MelFrontEnd {
             for (b, p) in power.iter_mut().enumerate() {
                 *p = re[b] * re[b] + im[b] * im[b];
             }
-            for m in 0..n_mels {
-                let row = &self.filters[m * bins..(m + 1) * bins];
-                let e: f64 = row.iter().zip(&power).map(|(w, p)| w * p).sum();
+            for (m, (first, row)) in self.filters.iter().enumerate() {
+                let e: f64 = row.iter().zip(&power[*first..]).map(|(w, p)| w * p).sum();
                 logmel[m * frames + f] = (e + cfg.log_guard).ln();
             }
         }

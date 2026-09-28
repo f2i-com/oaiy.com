@@ -70,6 +70,8 @@ pub enum Precision {
     /// f16 on a GPU, f32 on the CPU.
     Auto,
     F32,
+    /// f32 weights with TF32 tensor-core products (GPU only; f32 on the CPU).
+    Tf32,
     F16,
     Bf16,
 }
@@ -79,9 +81,10 @@ impl Precision {
         match v.trim().to_ascii_lowercase().as_str() {
             "auto" => Ok(Self::Auto),
             "f32" | "fp32" | "float32" => Ok(Self::F32),
+            "tf32" => Ok(Self::Tf32),
             "f16" | "fp16" | "float16" | "half" => Ok(Self::F16),
             "bf16" | "bfloat16" => Ok(Self::Bf16),
-            other => Err(format!("--dtype {other:?}: expected auto, f32, f16 or bf16")),
+            other => Err(format!("--dtype {other:?}: expected auto, f32, tf32, f16 or bf16")),
         }
     }
 }
@@ -99,7 +102,7 @@ pub struct Args {
 
 pub const USAGE: &str = "usage: oaiy-voice [--mode stt|tts|both] [--port N] [--host ADDR]
                   [--stt-model-dir PATH | --model PATH] [--tts-model-dir PATH]
-                  [--device auto|cpu|cuda|cuda:N] [--dtype auto|f32|f16|bf16]
+                  [--device auto|cpu|cuda|cuda:N] [--dtype auto|f32|tf32|f16|bf16]
        oaiy-voice transcribe --model PATH [--device ...] [--dtype ...] [--repeat N] FILE.wav...
 
 PATH is a Parakeet .nemo, a model.safetensors (with config.json and

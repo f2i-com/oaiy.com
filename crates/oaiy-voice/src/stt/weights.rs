@@ -88,6 +88,24 @@ impl Weights {
         }
     }
 
+    /// A float tensor on the CPU as f32, checked against `shape`.
+    pub fn f32_shaped(&mut self, name: &str, shape: &[usize]) -> Result<(Vec<f32>, Vec<usize>)> {
+        let (v, s) = self.f32(name)?;
+        if s != shape {
+            return Err(bad(format!("{name}: shape {s:?}, expected {shape:?}")));
+        }
+        Ok((v, s))
+    }
+
+    /// Like [`f32_shaped`](Self::f32_shaped), for a parameter that may be absent.
+    pub fn optional_f32(&mut self, name: &str, shape: &[usize]) -> Result<Option<Vec<f32>>> {
+        if self.has(name) {
+            Ok(Some(self.f32_shaped(name, shape)?.0))
+        } else {
+            Ok(None)
+        }
+    }
+
     /// A float tensor on `dev` as `dtype`, checked against `shape`.
     pub fn tensor(&mut self, name: &str, shape: &[usize], dtype: DType, dev: &Device) -> Result<Tensor> {
         let (v, s) = self.f32(name)?;

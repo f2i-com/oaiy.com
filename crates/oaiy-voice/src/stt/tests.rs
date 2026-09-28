@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use candle_core::{DType, Device};
 use oaiy_engine::json::Json;
 
+use super::encoder::Precision;
 use super::Transcriber;
 use crate::audio;
 
@@ -41,7 +42,7 @@ struct Outcome {
 }
 
 /// Compare one model against its fixtures; `None` when they are not there.
-fn check(fixture: &str, weights: &Path, dev: &Device, dtype: DType, check_features: bool) -> Option<Outcome> {
+fn check(fixture: &str, weights: &Path, dev: &Device, precision: Precision, check_features: bool) -> Option<Outcome> {
     let root = fixtures()?;
     let dir = root.join(fixture);
     let index = std::fs::read(dir.join("index.json")).ok()?;
@@ -50,7 +51,7 @@ fn check(fixture: &str, weights: &Path, dev: &Device, dtype: DType, check_featur
         return None;
     }
     let index = Json::parse(&index).unwrap();
-    let t = Transcriber::load(weights, dev, dtype).unwrap();
+    let t = Transcriber::load_with(weights, dev, precision).unwrap();
     let mut out = Outcome { mel: 0.0, enc: 0.0, tokens_equal: 0, clips: 0 };
     for (clip, want) in index.members() {
         let wav = audio::parse_wav(&std::fs::read(root.join("..").join("clips").join(format!("{clip}.wav"))).unwrap()).unwrap();
@@ -99,29 +100,85 @@ fn report(name: &str, o: Option<Outcome>, enc_limit: f32, all_tokens: bool) {
 #[test]
 fn parity_v2_nemo_cpu() {
     let w = models().join("parakeet-tdt-0.6b-v2").join("parakeet-tdt-0.6b-v2.nemo");
-    report("v2", check("v2", &w, &Device::Cpu, DType::F32, true), 1e-3, true);
+    report("v2", check("v2", &w, &Device::Cpu, Precision::f32(), true), 1e-3, true);
 }
 
 #[test]
 fn parity_unified_nemo_cpu() {
     let w = models().join("parakeet-unified-en-0.6b").join("parakeet-unified-en-0.6b.nemo");
-    report("unified", check("unified", &w, &Device::Cpu, DType::F32, true), 1e-3, true);
+    report("unified", check("unified", &w, &Device::Cpu, Precision::f32(), true), 1e-3, true);
 }
 
 #[test]
 fn parity_v3_nemo_cpu() {
     let w = models().join("parakeet-tdt-0.6b-v3").join("parakeet-tdt-0.6b-v3.nemo");
-    report("v3 .nemo", check("v3", &w, &Device::Cpu, DType::F32, true), 1e-3, true);
+    report("v3 .nemo", check("v3", &w, &Device::Cpu, Precision::f32(), true), 1e-3, true);
 }
 
 #[test]
 fn parity_v3_safetensors_cpu() {
     let w = models().join("parakeet-tdt-0.6b-v3").join("model.safetensors");
-    report("v3 safetensors", check("v3", &w, &Device::Cpu, DType::F32, true), 1e-3, true);
+    report("v3 safetensors", check("v3", &w, &Device::Cpu, Precision::f32(), true), 1e-3, true);
 }
 
 #[test]
 fn parity_ultra_safetensors_cpu() {
     let w = models().join("parakeet-ultra");
-    report("ultra", check("ultra", &w, &Device::Cpu, DType::F32, true), 1e-3, true);
+    report("ultra", check("ultra", &w, &Device::Cpu, Precision::f32(), true), 1e-3, true);
+}
+
+/// The GPU named by `OAIY_VOICE_CUDA` (an index), when this build has CUDA.
+fn cuda() -> Option<Device> {
+    let n: usize = std::env::var("OAIY_VOICE_CUDA").ok()?.parse().ok()?;
+    Device::new_cuda(n).ok()
+}
+
+fn gpu_report(name: &str, fixture: &str, weights: PathBuf, dtype: DType, all_tokens: bool) {
+    gpu_report_with(name, fixture, weights, Precision { weights: dtype, act: dtype }, all_tokens)
+}
+
+fn gpu_report_with(name: &str, fixture: &str, weights: PathBuf, precision: Precision, all_tokens: bool) {
+    let Some(dev) = cuda() else {
+        eprintln!("{name}: OAIY_VOICE_CUDA not set (or no CUDA), skipped");
+        return;
+    };
+    // Half precision moves the encoder by about 1e-2; with f16 the transcripts
+    // must not move. bf16 keeps 8 bits of mantissa and is only reported.
+    report(name, check(fixture, &weights, &dev, precision, true), 0.25, all_tokens);
+}
+
+#[test]
+fn parity_v2_cuda_f16() {
+    gpu_report("v2 cuda f16", "v2", models().join("parakeet-tdt-0.6b-v2").join("parakeet-tdt-0.6b-v2.nemo"), DType::F16, true);
+}
+
+#[test]
+fn parity_v2_cuda_bf16() {
+    gpu_report("v2 cuda bf16", "v2", models().join("parakeet-tdt-0.6b-v2").join("parakeet-tdt-0.6b-v2.nemo"), DType::BF16, false);
+}
+
+#[test]
+fn parity_v2_cuda_f32() {
+    gpu_report("v2 cuda f32", "v2", models().join("parakeet-tdt-0.6b-v2").join("parakeet-tdt-0.6b-v2.nemo"), DType::F32, true);
+}
+
+#[test]
+fn parity_unified_cuda_f16() {
+    gpu_report("unified cuda f16", "unified", models().join("parakeet-unified-en-0.6b").join("parakeet-unified-en-0.6b.nemo"), DType::F16, true);
+}
+
+#[test]
+fn parity_ultra_cuda_f16() {
+    gpu_report("ultra cuda f16", "ultra", models().join("parakeet-ultra"), DType::F16, true);
+}
+
+#[test]
+fn parity_v2_cuda_f16_mixed() {
+    let p = Precision { weights: DType::F16, act: DType::F32 };
+    gpu_report_with("v2 cuda f16 weights, f32 activations", "v2", models().join("parakeet-tdt-0.6b-v2").join("parakeet-tdt-0.6b-v2.nemo"), p, true);
+}
+
+#[test]
+fn parity_v3_cuda_f16() {
+    gpu_report("v3 cuda f16", "v3", models().join("parakeet-tdt-0.6b-v3").join("model.safetensors"), DType::F16, true);
 }

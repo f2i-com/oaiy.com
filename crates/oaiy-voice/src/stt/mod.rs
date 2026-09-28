@@ -24,7 +24,7 @@ use candle_core::{DType, Device, Tensor};
 
 use config::{Head, ModelConfig};
 use decoder::{greedy_rnnt, greedy_tdt, Decoder, DeviceScorer};
-use encoder::Encoder;
+use encoder::{Encoder, Precision};
 use mel::{Features, MelFrontEnd};
 use vocab::Vocab;
 use weights::Weights;
@@ -131,8 +131,15 @@ pub struct Transcriber {
 
 impl Transcriber {
     /// Load a model (see [`ModelFiles::find`]) onto `dev`, with its matrix
-    /// products in `dtype` (f32, f16 or bf16).
+    /// products in `dtype` (f32, f16 or bf16). Half precision runs the whole
+    /// encoder in it; the prediction network and joint stay f32.
     pub fn load(path: &Path, dev: &Device, dtype: DType) -> Result<Self> {
+        Self::load_with(path, dev, Precision { weights: dtype, act: dtype })
+    }
+
+    /// Like [`load`](Self::load), with the encoder's dtypes chosen apart.
+    pub fn load_with(path: &Path, dev: &Device, precision: Precision) -> Result<Self> {
+        let dtype = precision.weights;
         let files = ModelFiles::find(path)?;
         let mut w = Weights::open(&files.weights)?;
         let (config, vocab) = match &w {
@@ -153,8 +160,8 @@ impl Transcriber {
         if config.att_context != [-1, -1] {
             return Err(bad(format!("limited attention context {:?} is not supported", config.att_context)));
         }
-        let encoder = Encoder::load(&mut w, config.mel.n_mels, config.xscaling, dtype, dev)?;
-        let decoder = Decoder::load(&mut w, encoder.shape.d_model, dtype, dev)?;
+        let encoder = Encoder::load(&mut w, config.mel.n_mels, config.xscaling, precision, dev)?;
+        let decoder = Decoder::load(&mut w, encoder.shape.d_model, dev)?;
         let extra = match &config.head {
             Head::Tdt { durations } => durations.len(),
             Head::Rnnt => 0,
@@ -186,16 +193,16 @@ impl Transcriber {
         self.mel.features(samples)
     }
 
-    /// The encoder's output `(frames, d_model)` for features.
+    /// The encoder's output `(frames, d_model)` for features, as f32.
     pub fn encode(&self, f: &Features) -> Result<Tensor> {
         let x = Tensor::from_vec(f.data.clone(), (f.n_mels, f.frames), &Device::Cpu)?.to_device(&self.dev)?;
-        self.encoder.forward(&x)
+        self.encoder.forward(&x)?.to_dtype(DType::F32)
     }
 
     /// The encoder after its first `n` layers (parity tests).
     pub fn encode_layers(&self, f: &Features, n: usize) -> Result<Tensor> {
         let x = Tensor::from_vec(f.data.clone(), (f.n_mels, f.frames), &Device::Cpu)?.to_device(&self.dev)?;
-        self.encoder.forward_layers(&x, n)
+        self.encoder.forward_layers(&x, n)?.to_dtype(DType::F32)
     }
 
     /// Greedy decoding of encoder output; returns the tokens and the number
