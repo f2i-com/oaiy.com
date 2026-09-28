@@ -321,6 +321,8 @@ export interface AgentOptions {
   instructions?: string | (() => string);
   /** Tools of this conversation only (a text-message thread's reply), each with what it does. */
   sessionTools?: SessionTool[];
+  /** How hard the model thinks before it answers (`none` on a phone call). */
+  reasoning?: 'none' | 'low' | 'medium' | 'high' | 'max';
 }
 
 /** A tool one conversation has (not every agent): its spec, and what running it does. */
@@ -737,8 +739,8 @@ export class Agent {
   }
 
   private get tools(): ToolSpec[] {
-    // A sub-agent gets its list from its parent, media tools included.
-    if (this.options.tools) return this.options.tools;
+    // A sub-agent gets its list from its parent, media tools included (a call, a short list of its own).
+    if (this.options.tools) return [...this.options.tools, ...(this.options.sessionTools ?? []).map((t) => t.spec)];
     const provider = this.options.provider();
     // A small window holds the instructions and core tools with room to work, not the video editing ones too.
     const lean = !!provider && this.window(provider) < EDIT_TOOLS_WINDOW;
@@ -1371,7 +1373,7 @@ ${this.instructions}` : ''}`;
         const reply = await sendTurn(provider, this.systemPrompt, sent, tools, {
           maxOutputTokens: b.reply,
           signal,
-          reasoning: this.writingScript() ? 'high' : undefined,
+          reasoning: this.writingScript() ? 'high' : this.options.reasoning,
           sink: {
             text: (delta) => emit({ type: 'text', delta }),
             thinking: (delta) => emit({ type: 'thinking', delta }),
@@ -1439,6 +1441,25 @@ ${this.instructions}` : ''}`;
       }
     }
     throw lastError;
+  }
+
+  /**
+   * Have the model read the conversation now, with nothing to answer yet, so
+   * its next turn starts from a prompt it already holds: on a call, it reads
+   * while the greeting plays. One token, thrown away; only a local server
+   * (which keeps the prompt it read, and charges nothing for it).
+   */
+  async warm(signal?: AbortSignal): Promise<void> {
+    const provider = this.options.provider();
+    if (!provider || provider.type !== 'local') return;
+    const b = this.budget(provider);
+    const sent = wellFormed(trimmed(this.view(), this.keepImages, b.prompt * this.charsPerToken));
+    if (sent.at(-1)?.role !== 'user') return;
+    try {
+      await sendTurn(provider, this.systemPrompt, sent, this.tools, { maxOutputTokens: 1, signal, reasoning: this.options.reasoning });
+    } catch {
+      /* only a head start */
+    }
   }
 
   /** Run one user request to completion. */

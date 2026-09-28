@@ -205,9 +205,7 @@ fn own(page: Page, url: &Url) -> bool {
 #[tauri::command]
 pub async fn show_embedded<R: Runtime>(app: AppHandle<R>, window: tauri::Window<R>, page: String, x: f64, y: f64, width: f64, height: f64) -> Result<(), String> {
     let page = Page::parse(&page).ok_or_else(|| format!("no embedded page called {page}"))?;
-    // One at a time: two quick resizes must not both make the page's webview.
-    static PLACING: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _one = PLACING.lock().unwrap_or_else(|e| e.into_inner());
+    let _one = placing();
     for other in Page::ALL {
         if other != page {
             if let Some(w) = app.get_webview(other.label()) {
@@ -229,8 +227,40 @@ pub async fn show_embedded<R: Runtime>(app: AppHandle<R>, window: tauri::Window<
             Page::Flows => "platform/ui/",
         }));
     }
+    window.add_child(builder(&app, page), position, size).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Make the agent's page at startup, hidden: it answers texts and calls in
+/// the background, before (or without) anyone opening it. Made on its own
+/// thread (a webview is made on the main thread, which setup is still on).
+pub fn preload<R: Runtime>(app: &AppHandle<R>) {
+    let app = app.clone();
+    std::thread::spawn(move || {
+        let Some(window) = app.get_window("main") else { return };
+        if app.get_webview(Page::Agent.label()).is_some() || dist(&app, Page::Agent).is_none() {
+            return;
+        }
+        let _one = placing();
+        match window.add_child(builder(&app, Page::Agent), LogicalPosition::new(0.0, 0.0), LogicalSize::new(1.0, 1.0)) {
+            Ok(webview) => {
+                let _ = webview.hide();
+            }
+            Err(e) => log::warn!("the agent's page was not made at startup: {e}"),
+        }
+    });
+}
+
+/// One page made or placed at a time: two quick resizes must not both make a webview.
+fn placing() -> std::sync::MutexGuard<'static, ()> {
+    static PLACING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    PLACING.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// A page's webview, as `show_embedded` and `preload` make it.
+fn builder<R: Runtime>(app: &AppHandle<R>, page: Page) -> WebviewBuilder<R> {
     let (for_navigation, for_windows) = (app.clone(), app.clone());
-    let builder = WebviewBuilder::new(page.label(), WebviewUrl::CustomProtocol(page.url()))
+    WebviewBuilder::new(page.label(), WebviewUrl::CustomProtocol(page.url()))
         .initialization_script(&desktop_script())
         .additional_browser_args(BROWSER_ARGS)
         .on_navigation(move |url| {
@@ -246,9 +276,7 @@ pub async fn show_embedded<R: Runtime>(app: AppHandle<R>, window: tauri::Window<
             }
             open_outside(&for_windows, &url);
             NewWindowResponse::Deny
-        });
-    window.add_child(builder, position, size).map_err(|e| e.to_string())?;
-    Ok(())
+        })
 }
 
 /// Hide the embedded pages (the dashboard shows one of its own).

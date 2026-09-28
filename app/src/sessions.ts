@@ -1,12 +1,14 @@
 /**
  * The project's conversations besides its own chat: one per person who texts
- * the phone (through Aokie and OAIY Desktop). Each has its own agent, with the
- * person's instructions for text messages and a tool to reply. They take turns:
- * one works at a time, in the order their messages came (a local model answers
- * one request at a time anyway), and a message for a conversation that is
- * working reaches it at its next step.
+ * or calls the phone (through Aokie and OAIY Desktop). Each has its own agent,
+ * with the person's instructions and a way to answer: a text-message tool, or,
+ * on a call, its words spoken as it writes them. They take turns: one works at
+ * a time, in the order their messages came (a local model answers one request
+ * at a time anyway; a caller goes first), and a message for a conversation that
+ * is working reaches it at its next step.
  */
 import { Agent, type AgentEvent, type AgentOptions, type SessionTool } from './agent/agent';
+import { TOOLS } from './agent/tools';
 import type { Turn } from './agent/protocol';
 import type { Desktop, DesktopEvent } from './desktop/bridge';
 import type { MessageSettings } from './settings';
@@ -22,10 +24,23 @@ export interface Session extends SessionInfo {
   controller: AbortController | null;
   /** Messages for its next run (the text messages, or the person's own). */
   waiting: string[];
+  /** The live call it is on (a call conversation). */
+  callId?: string;
+  /** The receptionist brief the phone sent with the call. */
+  brief?: string;
+  /** What the agent writes, spoken on the call. */
+  speech?: Speech;
 }
 
 /** How the app makes an agent for this project, with a conversation's own instructions and tools. */
-export type MakeAgent = (extra: Pick<AgentOptions, 'instructions' | 'sessionTools'>) => Agent;
+export type MakeAgent = (extra: Pick<AgentOptions, 'instructions' | 'sessionTools' | 'tools' | 'reasoning'>) => Agent;
+
+/**
+ * What an agent on a call may use besides the call's own tools: a short list,
+ * so its prompt stays small and the caller is answered at once (reading and
+ * noting things in the project, and the web).
+ */
+export const CALL_TOOLS = new Set(['read_file', 'list_files', 'search_file', 'grep', 'glob', 'web_fetch', 'append_file', 'write_file', 'edit_file']);
 
 export interface SessionHooks {
   /** The list changed: a new conversation, an unread message, one started or finished working. */
@@ -54,6 +69,86 @@ export function smsInstructions(title: string, number: string, instructions: str
     'Use your other tools (the project\'s files, the web, flows) when a message needs it. There is no need to reply to a message that needs no answer (a thank-you, an emoji).',
     `The instructions of the person you work for, for text messages:\n${instructions.trim() || '(none)'}`,
   ].join('\n');
+}
+
+/**
+ * A call's agent writes its reply; this speaks it as it comes, a sentence at a
+ * time, in order. Hushed (the caller spoke over it), the rest of that reply is
+ * dropped.
+ */
+export class Speech {
+  private buffer = '';
+  private chain: Promise<void> = Promise.resolve();
+  private hushed = false;
+
+  constructor(private readonly say: (text: string) => Promise<void>, private readonly failed: (error: string) => void = () => {}) {}
+
+  /** A new reply: speak again. */
+  begin(): void {
+    this.hushed = false;
+    this.buffer = '';
+  }
+
+  push(delta: string): void {
+    if (this.hushed) return;
+    this.buffer += delta;
+    for (;;) {
+      // A sentence ends at . ! ? … (then a space) or a line break; a long run of words at a comma.
+      const end = /[.!?\u2026]+["')\]]?(?=\s)|\n+/.exec(this.buffer);
+      let at = end ? end.index + end[0].length : -1;
+      if (at < 0 && this.buffer.length > 220) {
+        const comma = this.buffer.lastIndexOf(', ', 220);
+        at = comma > 40 ? comma + 1 : this.buffer.lastIndexOf(' ', 220);
+      }
+      if (at <= 0) return;
+      this.speak(this.buffer.slice(0, at));
+      this.buffer = this.buffer.slice(at);
+    }
+  }
+
+  /** The reply ended: speak what is left. */
+  flush(): void {
+    if (!this.hushed) this.speak(this.buffer);
+    this.buffer = '';
+  }
+
+  hush(): void {
+    this.hushed = true;
+    this.buffer = '';
+  }
+
+  /** Everything queued has been sent to be spoken. */
+  get done(): Promise<void> {
+    return this.chain;
+  }
+
+  private speak(text: string): void {
+    const clean = spoken(text);
+    if (!clean) return;
+    this.chain = this.chain.then(() => (this.hushed ? undefined : this.say(clean))).catch((e: unknown) => this.failed((e as Error).message));
+  }
+}
+
+/** Text as it can be said: no markdown, links as their words, no emoji. */
+export function spoken(text: string): string {
+  return text
+    .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
+    .replace(/[*_`#>|~]+/g, '')
+    .replace(/\p{Extended_Pictographic}/gu, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/** What a call conversation is for, in its agent's instructions. */
+export function callInstructions(title: string, number: string, brief: string, instructions: string): string {
+  const who = title && title !== number ? `${title} (${number})` : number || 'the caller';
+  return [
+    `This conversation is a live phone call with ${who}, on the phone of the person you work for. Everything you write is spoken aloud to the caller as you write it, so write only what you would say: one or two short sentences, plain words, no markdown, lists, emoji or links. Then stop, and let them answer.`,
+    'Their words arrive as "Caller: …", transcribed from speech (allow for a misheard word). A message without that label comes from the person you work for, who may be watching: do what they say.',
+    'Your call tools: request_appointment (a booking request for staff to confirm; never say it is booked or confirmed), lookup_business_data (a question about the business\'s records or calendar), end_call (a short goodbye, then the call ends; use it when the caller is done). Your other tools work too: say a few words first ("Let me check") when one takes a moment.',
+    brief.trim() ? `The receptionist brief:\n${brief.trim()}` : '',
+    `The instructions of the person you work for, for calls:\n${instructions.trim() || '(none)'}`,
+  ].filter(Boolean).join('\n');
 }
 
 export class Sessions {
@@ -91,11 +186,138 @@ export class Sessions {
 
   private create(info: SessionInfo): Session {
     const session = { ...info, running: null, controller: null, waiting: [] } as unknown as Session;
+    if (info.kind === 'call') {
+      session.agent = this.makeAgent({
+        instructions: () => callInstructions(session.title, session.key, session.brief ?? '', this.settings().callInstructions),
+        sessionTools: this.callTools(session),
+        tools: TOOLS.filter((t) => CALL_TOOLS.has(t.name)),
+        // Answer at once: no thinking first.
+        reasoning: 'none',
+      });
+      session.speech = new Speech(
+        async (text) => {
+          const desktop = this.desktop();
+          if (desktop && session.callId) await desktop.say(session.callId, text);
+        },
+        (error) => this.hooks.event(session, { type: 'status', message: `Could not speak on the call: ${error}` }),
+      );
+      return session;
+    }
     const test = info.key === TEST_NUMBER;
     session.agent = this.makeAgent({
       instructions: () => smsInstructions(session.title, session.key, this.settings().instructions, test),
       sessionTools: [this.replyTool(session, test)],
     });
+    return session;
+  }
+
+  /** A call's own tools: through the desktop to Aokie. */
+  private callTools(session: Session): SessionTool[] {
+    const live = () => {
+      const desktop = this.desktop();
+      if (!desktop) throw new Error('OAIY Desktop is not connected');
+      if (!session.callId) throw new Error('the call has ended');
+      return { desktop, callId: session.callId };
+    };
+    const outcome = (r: { ok: boolean; output: unknown }) => JSON.stringify(r.output ?? {}, null, 1) + (r.ok ? '' : '\n(The phone refused it.)');
+    return [
+      {
+        spec: {
+          name: 'end_call',
+          description: 'Say a short goodbye, then hang up. Use it when the caller is done, not before.',
+          parameters: { type: 'object', properties: { goodbye: { type: 'string', description: 'The goodbye, one short sentence' } } },
+        },
+        run: async (input) => {
+          const { desktop, callId } = live();
+          session.speech?.hush();
+          const r = await desktop.finishCall(callId, String(input.goodbye ?? ''));
+          return r.ok ? 'The goodbye is being said, then the call ends. Write nothing more.' : `Could not end the call: ${outcome(r)}`;
+        },
+      },
+      {
+        spec: {
+          name: 'request_appointment',
+          description: 'Record an appointment REQUEST for staff to confirm (never a confirmed booking), once the caller has clearly asked for a slot and agreed to it. agreementPhrase is the caller\'s own words agreeing, as they said them.',
+          parameters: {
+            type: 'object',
+            required: ['callerName', 'service', 'date', 'time', 'agreementPhrase'],
+            properties: {
+              callerName: { type: 'string', description: 'The name the caller gave on this call' },
+              service: { type: 'string' },
+              date: { type: 'string', description: 'YYYY-MM-DD' },
+              time: { type: 'string', description: 'HH:MM, 24-hour' },
+              agreementPhrase: { type: 'string', description: 'The caller\'s words agreeing to this slot, as said' },
+            },
+          },
+        },
+        run: async (input) => {
+          const { desktop, callId } = live();
+          return outcome(await desktop.callTool(callId, 'request_appointment', input));
+        },
+      },
+      {
+        spec: {
+          name: 'lookup_business_data',
+          description: 'Ask the business\'s records a question (an existing appointment, availability, a customer\'s details): answered by the business lookup flow.',
+          parameters: { type: 'object', required: ['question'], properties: { question: { type: 'string' } } },
+        },
+        run: async (input) => {
+          const { desktop, callId } = live();
+          return outcome(await desktop.callTool(callId, 'lookup_business_data', { question: String(input.question ?? '') }));
+        },
+      },
+    ];
+  }
+
+  /**
+   * An event from the desktop's calls: a call begins (its conversation, with
+   * the caller's history), the caller speaks (the agent answers, before
+   * anyone else waiting), the caller speaks over it (the rest of that reply is
+   * dropped), and the call ends.
+   */
+  async callEvent(event: Record<string, unknown>): Promise<Session | null> {
+    const callId = typeof event.callId === 'string' ? event.callId : '';
+    const type = String(event.type ?? '');
+    if (!callId) return null;
+    let session = this.list.find((s) => s.callId === callId) ?? null;
+    if (type === 'call.started' || (!session && type === 'call.caller')) {
+      const from = String(event.from ?? '') || callId;
+      session = await this.conversationWith(from, String(event.name ?? ''), 'call');
+      session.callId = callId;
+      if (typeof event.instructions === 'string') session.brief = event.instructions;
+      session.lastAt = Date.now();
+      session.unread++;
+      const greeting = typeof event.greeting === 'string' && event.greeting.trim() ? ` You greeted them: "${event.greeting.trim()}"` : '';
+      session.agent.turns.push({ role: 'user', text: `[OAIY] 📞 A call from ${session.title}${session.title !== session.key ? ` (${session.key})` : ''} began.${greeting}`, automatic: true });
+      await this.save(session);
+      await this.saveIndex();
+      this.hooks.changed();
+      // The model reads the call's prompt while the greeting plays: its first answer comes sooner.
+      if (type === 'call.started' && !session.running) void session.agent.warm();
+      if (type === 'call.started') return session;
+    }
+    if (!session) return null;
+    switch (type) {
+      case 'call.caller': {
+        const text = `Caller: ${String(event.text ?? '').trim()}`;
+        session.lastAt = Date.now();
+        this.hooks.arrived?.(session, text);
+        this.deliver(session, text, true);
+        break;
+      }
+      case 'call.interrupted':
+        session.speech?.hush();
+        session.controller?.abort();
+        break;
+      case 'call.ended':
+        session.speech?.hush();
+        this.stop(session);
+        session.callId = undefined;
+        session.agent.turns.push({ role: 'user', text: '[OAIY] 📞 The call ended.', automatic: true });
+        await this.save(session);
+        this.hooks.changed();
+        break;
+    }
     return session;
   }
 
@@ -122,15 +344,15 @@ export class Sessions {
     };
   }
 
-  /** The conversation with `number`, made when it is the first message from them. */
-  async conversationWith(number: string, name: string): Promise<Session> {
-    const key = number === TEST_NUMBER ? TEST_NUMBER : digits(number);
-    const existing = this.list.find((s) => s.kind === 'sms' && s.key === key);
+  /** The conversation with `number` (texts or calls), made when it is the first from them. */
+  async conversationWith(number: string, name: string, kind: 'sms' | 'call' = 'sms'): Promise<Session> {
+    const key = number === TEST_NUMBER ? TEST_NUMBER : digits(number) || number;
+    const existing = this.list.find((s) => s.kind === kind && s.key === key);
     if (existing) {
       if (name && existing.title === existing.key) existing.title = name;
       return existing;
     }
-    const session = this.create({ id: `sms-${key.replace(/\D/g, '') || key}`, kind: 'sms', key, title: name || key, lastAt: Date.now(), unread: 0 });
+    const session = this.create({ id: `${kind}-${key.replace(/\W/g, '') || key}`, kind, key, title: name || key, lastAt: Date.now(), unread: 0 });
     this.list.push(session);
     await this.saveIndex();
     return session;
@@ -221,8 +443,15 @@ export class Sessions {
     let finish!: () => void;
     session.running = new Promise<void>((resolve) => (finish = resolve));
     this.hooks.changed();
+    session.speech?.begin();
     try {
-      await session.agent.run(prompt, (event) => this.hooks.event(session, event), controller.signal);
+      await session.agent.run(prompt, (event) => {
+        if (session.speech && event.type === 'text') session.speech.push(event.delta);
+        // A reply ends (a tool is called, or the model's turn is over): what it said is complete.
+        if (session.speech && (event.type === 'tool_call' || event.type === 'usage')) session.speech.flush();
+        this.hooks.event(session, event);
+      }, controller.signal);
+      session.speech?.flush();
     } catch (error) {
       this.hooks.event(session, { type: 'error', message: (error as Error).message });
     } finally {

@@ -46,7 +46,9 @@ function fakeDesktop() {
   return desktop;
 }
 
-function setup(messages: MessageSettings, desktop = fakeDesktop()) {
+function setup(partial: Partial<MessageSettings> & { answer: boolean; instructions: string }, desktop = fakeDesktop()) {
+  // The same object the test may change later.
+  const messages = Object.assign(partial, { calls: partial.calls ?? false, callInstructions: partial.callInstructions ?? '' }) as MessageSettings;
   const store = fakeProject();
   const vfs = new Vfs();
   const events: Array<{ id: string; event: AgentEvent }> = [];
@@ -169,7 +171,7 @@ describe('text-message conversations', () => {
     const again = new Sessions(
       first.store.project as never,
       (extra) => new Agent({ vfs: new Vfs(), gate: new NetGate(), provider: () => OPENAI, projectSummary: () => '', ...extra }),
-      () => ({ answer: true, instructions: '' }),
+      () => ({ answer: true, instructions: '', calls: false, callInstructions: '' }),
       () => null,
       { changed: () => {}, event: () => {} },
     );

@@ -147,6 +147,14 @@ where
     if dev_mode {
         env.insert("OAIY_DEV_MODE".into(), "1".into());
     }
+    // The names FormLogic's plugin contract gives the same things (Aokie reads
+    // these), and the token for the voice gateway on 17872, where a plugin's
+    // realtime calls reach the agent.
+    env.insert("FORMLOGIC_PLUGIN_DATA_DIR".into(), plugin_data_dir.display().to_string());
+    if dev_mode {
+        env.insert("FORMLOGIC_DEV_MODE".into(), "1".into());
+    }
+    env.insert("FORMLOGIC_AI_GATEWAY_TOKEN".into(), crate::voice::gateway_token().to_string());
     env
 }
 

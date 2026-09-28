@@ -86,6 +86,9 @@ export async function editPhone(options: PhoneDialog): Promise<MessageSettings |
   const answer = h('input', { type: 'checkbox', checked: options.messages.answer }) as HTMLInputElement;
   const instructions = h('textarea', { placeholder: 'How the agent answers text messages: what it may say, what it should never promise, when to leave it to you…' }) as HTMLTextAreaElement;
   instructions.value = options.messages.instructions;
+  const calls = h('input', { type: 'checkbox', checked: options.messages.calls }) as HTMLInputElement;
+  const callInstructions = h('textarea', { placeholder: 'Added to the receptionist brief Aokie sends with each call: what the agent may say on the phone, when to take a message…' }) as HTMLTextAreaElement;
+  callInstructions.value = options.messages.callInstructions;
   const test = h('button', { type: 'button', title: 'Pretend a text message arrived: the agent answers it in a test conversation, and nothing is sent', onclick: async () => {
     const body = await askText({ title: 'A pretend text message', message: 'The agent answers it in a test conversation. Nothing is sent to a phone.', label: 'The message', value: 'Hi, are you open this Saturday?', ok: 'Send it to the agent' });
     if (body) options.test(body);
@@ -104,8 +107,10 @@ export async function editPhone(options: PhoneDialog): Promise<MessageSettings |
       ...(options.elsewhere ? [h('p.muted', options.elsewhere)] : []),
       h('label', 'Your instructions for text messages', instructions),
       h('div.row', test),
+      h('label.row', calls, ' Answer phone calls (the agent talks with the caller, and you see the call here)'),
+      h('label', 'Your instructions for calls', callInstructions),
     )],
-    ok: { label: 'Save', value: () => ({ answer: answer.checked, instructions: instructions.value.trim() }) },
+    ok: { label: 'Save', value: () => ({ answer: answer.checked, instructions: instructions.value.trim(), calls: calls.checked, callInstructions: callInstructions.value.trim() }) },
     cancel: 'Close',
   });
   (pairing as AbortController | null)?.abort();

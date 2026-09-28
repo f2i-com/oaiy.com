@@ -159,6 +159,68 @@ export class Desktop {
     }).catch(() => {});
   }
 
+  /**
+   * The desktop's call events (server-sent: `call.started`, `call.caller`,
+   * `call.said`, `call.speech_started`, `call.interrupted`, `call.error`,
+   * `call.ended`) until `signal` aborts or the stream ends.
+   */
+  async voiceEvents(onEvent: (event: Record<string, unknown>) => void, signal: AbortSignal): Promise<void> {
+    const resp = await fetch(`${this.origin}/api/voice/events`, { headers: this.headers(), signal });
+    if (!resp.ok || !resp.body) throw new DesktopError(`OAIY Desktop's call events: HTTP ${resp.status}`, resp.status);
+    const reader = resp.body.pipeThrough(new TextDecoderStream()).getReader();
+    let buffer = '';
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) return;
+      buffer += value.replace(/\r\n/g, '\n');
+      let end: number;
+      while ((end = buffer.indexOf('\n\n')) >= 0) {
+        const block = buffer.slice(0, end);
+        buffer = buffer.slice(end + 2);
+        const data = block.split('\n').filter((l) => l.startsWith('data:')).map((l) => l.slice(5).replace(/^ /, '')).join('\n');
+        if (!data) continue;
+        try {
+          const event = JSON.parse(data) as unknown;
+          if (isRecord(event)) onEvent(event);
+        } catch {
+          /* not JSON: a comment or a keep-alive */
+        }
+      }
+    }
+  }
+
+  private async voice(callId: string, action: string, body: Record<string, unknown>, signal?: AbortSignal): Promise<Record<string, unknown>> {
+    const reply_ = await reply(await fetch(`${this.origin}/api/voice/calls/${encodeURIComponent(callId)}/${action}`, {
+      method: 'POST',
+      headers: this.headers(),
+      body: JSON.stringify(body),
+      signal,
+    }));
+    return isRecord(reply_) && isRecord(reply_.result) ? reply_.result : {};
+  }
+
+  /** Speak `text` on a live call (after what is queued). */
+  async say(callId: string, text: string, signal?: AbortSignal): Promise<void> {
+    await this.voice(callId, 'say', { text }, signal);
+  }
+
+  /** One of the call's tools (`request_appointment`, `lookup_business_data`): what the phone answered. */
+  async callTool(callId: string, name: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<{ ok: boolean; output: unknown }> {
+    const result = await this.voice(callId, 'tool', { name, arguments: args }, signal);
+    return { ok: result.ok === true, output: result.output };
+  }
+
+  /** Say goodbye, then hang up. */
+  async finishCall(callId: string, goodbye: string, signal?: AbortSignal): Promise<{ ok: boolean; output: unknown }> {
+    const result = await this.voice(callId, 'finish', { goodbye }, signal);
+    return { ok: result.ok === true, output: result.output };
+  }
+
+  /** Stop speaking on a call. */
+  async hush(callId: string): Promise<void> {
+    await this.voice(callId, 'hush', {}).catch(() => {});
+  }
+
   /** The plugins, and whether each runs. */
   async plugins(signal?: AbortSignal): Promise<Array<{ id: string; state: string }>> {
     const body = await reply(await fetch(`${this.origin}/api/plugins`, { headers: this.headers(), signal }));

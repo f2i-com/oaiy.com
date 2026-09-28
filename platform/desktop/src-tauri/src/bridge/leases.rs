@@ -49,6 +49,13 @@ pub fn take(leases: &mut HashMap<String, Lease>, name: &str, holder: &str, ttl_m
     }
 }
 
+/// Who holds `name` now (None when no one does, or their lease lapsed).
+pub fn holder(name: &str) -> Option<String> {
+    let guard = LEASES.lock().unwrap_or_else(|e| e.into_inner());
+    let lease = guard.as_ref()?.get(name)?;
+    (lease.expires_at_ms > now_ms()).then(|| lease.holder.clone())
+}
+
 /// Give `name` up, if `holder` has it.
 pub fn release(leases: &mut HashMap<String, Lease>, name: &str, holder: &str) -> bool {
     if leases.get(name).is_some_and(|l| l.holder == holder) {

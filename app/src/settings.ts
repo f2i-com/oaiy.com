@@ -98,12 +98,19 @@ export interface MessageSettings {
   answer: boolean;
   /** The person's instructions for answering them. */
   instructions: string;
+  /** Answer phone calls (Aokie hands the call's audio to OAIY Desktop, and the agent talks). */
+  calls: boolean;
+  /** The person's instructions for calls, added to the receptionist brief Aokie sends. */
+  callInstructions: string;
 }
 
 export const DEFAULT_MESSAGE_SETTINGS: MessageSettings = {
   // Off until the person turns it on: every text to their phone would be answered.
   answer: false,
   instructions: 'Reply politely and briefly, as my assistant. If you cannot help, say I will get back to them.',
+  // Off until turned on, as texts are.
+  calls: false,
+  callInstructions: '',
 };
 
 export interface Settings {

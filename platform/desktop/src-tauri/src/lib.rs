@@ -12,6 +12,7 @@ pub mod http;
 pub mod services;
 pub mod bridge;
 pub mod plugins;
+pub mod voice;
 
 /// Port the localhost API binds to. Fixed so oaiy-web's detection probe has a
 /// stable target. Shared by both binaries (the GUI and the headless server).
@@ -1690,6 +1691,10 @@ pub fn run() {
             // Build the tray icon + menu. tray::setup hides the main
             // window on close so OAIY Desktop stays alive in the tray.
             tray::setup(app)?;
+
+            // The agent runs from the start, hidden until its page is shown:
+            // texts and calls are answered whatever the window shows.
+            crate::embed::preload(app.handle());
 
             Ok(())
         })

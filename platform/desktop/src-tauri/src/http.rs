@@ -1173,6 +1173,7 @@ pub async fn serve(
     // The AI sources union needs to read the services registry; clone the handle
     // before `registry` is moved into AppState below.
     let registry_for_ai = registry.clone();
+    let registry_for_voice = registry.clone();
 
     let state = AppState {
         config,
@@ -1192,6 +1193,16 @@ pub async fn serve(
     let companion_routes =
         crate::companion::routes::router(companion.clone(), companion_upstream.clone());
     let link_routes = crate::link::routes::router(link);
+    // Calls answered by the agent: the app's side here, Aokie's on the voice gateway (17872).
+    let voice = {
+        let host = bridge.host.clone();
+        crate::voice::VoiceHub::new(crate::voice::engines::Engines::new(registry_for_voice), move |call| {
+            let events: Vec<serde_json::Value> = host.events_since(0, 500).into_iter().map(|e| e.envelope).collect();
+            crate::voice::caller_from_events(&events, call)
+        })
+    };
+    tokio::spawn(crate::voice::serve_gateway(voice.clone()));
+    let voice_routes = crate::voice::app_router(voice);
     let bridge_routes = crate::bridge::bridge_router(bridge);
 
     // The AI gateway is its own sub-router with its own state (provider store +
@@ -1246,6 +1257,7 @@ pub async fn serve(
         // origin/token gate as the services routes. Adding them after `.layer()`
         // would leave them ungated — reachable by any web page the user has open.
         .merge(bridge_routes)
+        .merge(voice_routes)
         .merge(companion_routes)
         .merge(link_routes)
         .merge(ai_routes)

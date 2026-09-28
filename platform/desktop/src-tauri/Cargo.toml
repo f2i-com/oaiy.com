@@ -56,7 +56,8 @@ serde_json = "1.0"
 # don't need the heavier alternatives. tower-http gives us the CORS
 # layer that lets a hosted oaiy-web at any origin reach OAIY Desktop.
 tokio = { version = "1.40", features = ["full"] }
-axum = "0.7"
+# `ws`: the voice gateway's realtime stream (a phone call's audio).
+axum = { version = "0.7", features = ["ws"] }
 tower-http = { version = "0.6", features = ["cors"] }
 
 # Logging through Tauri's standard mechanism so logs flow into the

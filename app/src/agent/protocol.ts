@@ -90,8 +90,12 @@ export interface RequestOptions {
   sink?: StreamSink;
   maxOutputTokens?: number;
   timeoutMs?: number;
-  /** How hard the model thinks first (OAIY's `reasoning_effort`); other servers are not asked. */
-  reasoning?: 'low' | 'medium' | 'high' | 'max';
+  /**
+   * How hard the model thinks first (OAIY's `reasoning_effort`). `none`: not at
+   * all (a phone call cannot wait), also asked of other local servers through
+   * the chat template; APIs are not asked.
+   */
+  reasoning?: 'none' | 'low' | 'medium' | 'high' | 'max';
 }
 
 function anthropicMessages(turns: Turn[]): unknown[] {
@@ -276,6 +280,7 @@ export async function sendTurn(
   if (isOpenAIHost(url)) body.max_completion_tokens = maxTokens;
   else body.max_tokens = maxTokens;
   if (options.reasoning && provider.serverKind === 'oaiy') body.reasoning_effort = options.reasoning;
+  else if (options.reasoning === 'none' && provider.type === 'local') body.chat_template_kwargs = { enable_thinking: false };
   const stream = new OpenAIStream(options.sink);
   const outcome = await postProviderStream(provider, url, body, {
     signal: options.signal,

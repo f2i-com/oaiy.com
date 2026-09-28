@@ -137,6 +137,8 @@ async function main(): Promise<void> {
   const pageId = crypto.randomUUID();
   let holdsTexts = false;
   let textHolder = '';
+  // And calls: the page holding answer-calls talks with the caller.
+  let holdsCalls = false;
   /** The conversation the chat shows: null for the project's own. */
   let viewing: string | null = null;
 
@@ -1020,8 +1022,8 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
       { id: null, label: 'Project', title: `${project.meta.name}: your conversation with the agent`, unread: 0, working: !!currentRun },
       ...sessions.list.map((s) => ({
         id: s.id,
-        label: s.key === TEST_NUMBER ? '💬 Test' : `💬 ${s.title}`,
-        title: `Text messages with ${s.title}${s.title !== s.key ? ` (${s.key})` : ''}`,
+        label: s.key === TEST_NUMBER ? '💬 Test' : `${s.kind === 'call' ? '📞' : '💬'} ${s.title}`,
+        title: `${s.kind === 'call' ? (s.callId ? 'On a call with' : 'Calls with') : 'Text messages with'} ${s.title}${s.title !== s.key ? ` (${s.key})` : ''}`,
         unread: s.id === viewing ? 0 : s.unread,
         working: !!s.running,
       })),
@@ -1125,6 +1127,41 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
       const n = sessions?.answerWaiting() ?? 0;
       if (n) chat.system(`Answering ${n} text message${n > 1 ? 's' : ''} that came while this page was not answering.`);
     }
+    // Calls, the same way.
+    if (!desktop || !messages.calls) {
+      if (holdsCalls && desktop) void desktop.release('answer-calls', pageId);
+      holdsCalls = false;
+    } else {
+      holdsCalls = await desktop.lease('answer-calls', pageId, 30_000, IN_OAIY).then((l) => l.granted, () => false);
+    }
+  }
+
+  // The desktop's calls, as they happen (a stream, reopened when it drops).
+  let callsAbort: AbortController | null = null;
+  function followCalls(): void {
+    callsAbort?.abort();
+    const d = desktop;
+    if (!d) return;
+    const abort = (callsAbort = new AbortController());
+    void (async () => {
+      while (!abort.signal.aborted) {
+        try {
+          await d.voiceEvents((event) => {
+            if (!holdsCalls) return;
+            void sessions?.callEvent(event).then((session) => {
+              // A call begins: show it (the person sees the conversation as it happens).
+              if (session && event.type === 'call.started') {
+                selectSession(session.id);
+                chat.system(`📞 ${session.title} is calling: the agent is answering.`);
+              }
+            });
+          }, abort.signal);
+        } catch {
+          /* the desktop went away: try again shortly */
+        }
+        if (!abort.signal.aborted) await new Promise((r) => setTimeout(r, 3000));
+      }
+    })();
   }
   setInterval(() => void keepTextLease(), 10_000);
   window.addEventListener('pagehide', () => {
@@ -1144,7 +1181,8 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
         if (desktop) {
           desktopEvents.start();
           void refreshPhone();
-        }
+          followCalls();
+        } else callsAbort?.abort();
         renderPhoneChip();
       },
       test: (body) => {
@@ -1189,6 +1227,7 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
     desktopEvents.start();
     void refreshPhone();
     void keepTextLease();
+    followCalls();
   }
   if (!activeProvider()) chat.system('Welcome! Set up an AI provider in ⚙ Settings to talk to the agent — a local server (Ollama, LM Studio, OAIY) keeps everything on this computer. The editor and terminal work without one.');
   // Leaving the page (closing the tab, reloading, switching away on a phone): save now.
