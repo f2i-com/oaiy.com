@@ -79,6 +79,13 @@ describe('plugin iframe bootstrap: theme', () => {
     expect(document.documentElement.classList.contains('fl-dark')).toBe(false);
   });
 
+  it('takes the page gutters the host hands over', () => {
+    // The screen runs edge to edge and draws the page's gutters itself.
+    send({ __pluginHost: 1, gutter: '18px 16px 30px' });
+    expect(document.documentElement.style.getPropertyValue('--host-page-pad')).toBe('18px 16px 30px');
+    expect(document.documentElement.classList.contains('fl-dark')).toBe(false);
+  });
+
   it('leaves the theme alone when handling an ordinary plugin event', () => {
     // A theme-less host message must not be read as "go light".
     send({ __pluginHost: 1, theme: 'dark' });

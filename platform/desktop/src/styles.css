@@ -43,6 +43,11 @@
  * ------------------------------------------------------------------------- */
 
 :root {
+  /* A page's gutters: a plugin screen draws them inside its own document, so
+     they are handed to it as well (PluginScreenPage). */
+  --page-pad-t: 24px;
+  --page-pad-x: 30px;
+  --page-pad-b: 40px;
   --shell: #070a12;
   --sidebar: #090e18;
   --surface: rgba(14, 20, 34, 0.94);
@@ -479,7 +484,7 @@ kbd {
       transparent 28%
     ),
     var(--canvas);
-  padding: 24px 30px 40px;
+  padding: var(--page-pad-t) var(--page-pad-x) var(--page-pad-b);
 }
 :root[data-theme='light'] .content-page { background: var(--canvas); }
 
@@ -1206,7 +1211,8 @@ select:disabled { cursor: not-allowed; opacity: 0.5; }
 }
 
 /* The hosted plugin screen fills the content area; the plugin owns its own
-   styling inside, so we only give it a frame. Its height is in workspace.css. */
+   styling inside. A screen that is not filling a page keeps this frame; its
+   size, and the flush page it fills, are in workspace.css. */
 .plugin-screen {
   width: 100%;
   border: 1px solid var(--border);
@@ -1567,7 +1573,7 @@ select:disabled { cursor: not-allowed; opacity: 0.5; }
   .sidebar nav button,
   .sidebar .settings { justify-content: center; padding: 0; }
   .topbar, .section-tabs, .endpoint-dock { padding-left: 24px; }
-  .content-page { padding: 22px 24px 36px; }
+  :root { --page-pad-t: 22px; --page-pad-x: 24px; --page-pad-b: 36px; }
 }
 
 @media (max-width: 960px) {
@@ -1582,7 +1588,7 @@ select:disabled { cursor: not-allowed; opacity: 0.5; }
   .top-title h1 { font-size: 16px; }
   .section-tabs { padding: 0 16px 8px; }
   .seg-tabs > button { padding: 0 10px; }
-  .content-page { padding: 18px 16px 30px; }
+  :root { --page-pad-t: 18px; --page-pad-x: 16px; --page-pad-b: 30px; }
   .endpoint-dock { gap: 10px; padding: 0 12px 0 16px; }
   .dock-status > span, .dock-trust { display: none; }
   .form-row-pair { flex-direction: column; }

@@ -36,6 +36,13 @@
 /* No frame of its own: the screen's document is transparent and draws its
    own cards, so it sits on the page canvas like a built-in panel. */
 .content-page.page-fill .plugin-screen { border: 0; border-radius: 0; background: transparent; }
+/* And edge to edge: the screen's document scrolls, so it runs from the header
+   to the dock and from the sidebar to the window's edge, where its scrollbar
+   sits like any page's. The page's gutters are drawn inside it (the host hands
+   them to the screen with its theme), so its cards line up with the header. */
+.content-page.page-fill:has(> .panel > .plugin-screen) { padding: 0; scrollbar-gutter: auto; }
+.content-page.page-fill:has(> .panel > .plugin-screen) > .panel { gap: 0; }
+.content-page.page-fill:has(> .panel > .plugin-screen) > .panel > .banner { margin: var(--page-pad-t) var(--page-pad-x) 0; }
 .form-row, .form-row-pair, .service-card { min-width: 0; }
 input, select, textarea { max-width: 100%; }
 @media (max-width: 1240px) { .sidebar .nav-badge { display: none; } }
@@ -48,7 +55,7 @@ input, select, textarea { max-width: 100%; }
 @media (max-width: 480px) {
   .app-shell { grid-template-columns: 58px minmax(0, 1fr); }
   .sidebar { padding: 18px 6px 12px; }
-  .content-page { padding: 16px 10px 24px; }
+  :root { --page-pad-t: 16px; --page-pad-x: 10px; --page-pad-b: 24px; }
   .section-tabs { padding: 0 10px 8px; }
   .seg-tabs > button > span { display: none; }
 }

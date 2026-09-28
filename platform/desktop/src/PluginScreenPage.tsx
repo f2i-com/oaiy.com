@@ -128,6 +128,21 @@ export function pluginFontCss(): Promise<string> {
   return hostFontCss;
 }
 
+/** The page's gutters as a padding (top, sides, bottom): a plugin screen runs
+ *  edge to edge and draws them inside its own document, so its cards line up
+ *  with the page's header as a built-in page's do. */
+export function pageGutter(): string {
+  const style = getComputedStyle(document.documentElement);
+  const read = (name: string, fallback: string) => style.getPropertyValue(name).trim() || fallback;
+  return `${read('--page-pad-t', '24px')} ${read('--page-pad-x', '30px')} ${read('--page-pad-b', '40px')}`;
+}
+
+/** What every screen starts from, ahead of the plugin's own css (which may
+ *  override any of it): the page's gutters, and scrollbars like the host's. */
+export const SCREEN_BASE_CSS =
+  'body { box-sizing: border-box; min-height: 100vh; padding: var(--host-page-pad, 24px 30px 40px); }' +
+  ' * { scrollbar-width: thin; scrollbar-color: var(--strong-border, #9f998f) transparent; }';
+
 /** The bootstrap injected ahead of the plugin's own scripts. Plain ES5-ish so it
  *  runs before any transform, and self-contained: the iframe has no imports. */
 export const HOST_BOOTSTRAP = `
@@ -163,6 +178,8 @@ export const HOST_BOOTSTRAP = `
     var m = e.data;
     if (!m || !m.__pluginHost) return;
     if (m.theme) { applyTheme(m.theme); return; }
+    // The page's gutters: the screen runs edge to edge and draws them itself.
+    if (m.gutter) { document.documentElement.style.setProperty('--host-page-pad', m.gutter); return; }
     if (m.event) { subs.forEach(function (s) { try { s(m.event); } catch (_) {} }); return; }
     var p = pending[m.id];
     if (!p) return;
@@ -333,10 +350,10 @@ function PluginScreenContent({ pluginId, navId, onNavigate }: Props) {
         // live call console mid-call to change a colour.
         const dark = document.documentElement.getAttribute('data-theme') !== 'light';
         setDoc(
-          `<!doctype html><html${dark ? ' class="fl-dark" data-theme="dark"' : ' data-theme="light"'}><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">` +
+          `<!doctype html><html${dark ? ' class="fl-dark" data-theme="dark"' : ' data-theme="light"'} style="--host-page-pad: ${pageGutter()}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">` +
             // No external anything: the plugin ships inline SVG and its own CSS.
             `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src data: blob:; font-src data:; connect-src 'none'">` +
-            `<style>${fonts}\n${css}</style></head><body>${body}` +
+            `<style>${SCREEN_BASE_CSS}\n${fonts}\n${css}</style></head><body>${body}` +
             `<script>${HOST_BOOTSTRAP}</script>${scripts}</body></html>`,
         );
         setError(null);
@@ -460,6 +477,14 @@ function PluginScreenContent({ pluginId, navId, onNavigate }: Props) {
     // and a re-assembled document starts from the host's current theme anyway.
     send();
     return () => observer.disconnect();
+  }, [doc]);
+
+  // And the page's gutters, which change with the window's width.
+  useEffect(() => {
+    const send = () => frameRef.current?.contentWindow?.postMessage({ __pluginHost: 1, gutter: pageGutter() }, '*');
+    window.addEventListener('resize', send);
+    send();
+    return () => window.removeEventListener('resize', send);
   }, [doc]);
 
   // RPC pump: only messages from OUR iframe are serviced.
