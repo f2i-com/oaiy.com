@@ -19,13 +19,13 @@
 import { useEffect, useRef } from 'react';
 import type { Dispatch, SetStateAction } from 'react';
 import type { Flow, OAIYProject } from 'oaiy-core';
-import { oaiyDesktop, toolFlowId } from '../lib/oaiyAgentTools';
+import { hookFlowId, oaiyDesktop, toolFlowId } from '../lib/oaiyAgentTools';
 
 const PULL_MS = 15_000;
 const SETTLE_MS = 1_200;
 const SYNCED_KEY = 'oaiy-desktop-flows-synced';
 
-type Doc = { name?: string; nodes?: unknown[]; edges?: unknown[]; oaiyTool?: unknown };
+type Doc = { name?: string; nodes?: unknown[]; edges?: unknown[]; oaiyTool?: unknown; oaiyToolHook?: unknown };
 
 /** What of a flow the desktop keeps: a change to any of it is sent. */
 export function flowKey(f: Pick<Flow, 'name' | 'graph'>): string {
@@ -152,8 +152,8 @@ export function useDesktopFlows(project: OAIYProject, setProject: Dispatch<SetSt
       there.current = new Set(ids);
       const now = new Date().toISOString();
       const flows = new Map<string, Flow>();
-      // A tool's copy (`tool-…`) is the tool, not a second flow.
-      for (const id of ids.filter((id) => !id.startsWith('tool-'))) {
+      // A tool's copy (`tool-…`) is the tool, and a hook's (`hook-…`) the hook, not second flows.
+      for (const id of ids.filter((id) => !id.startsWith('tool-') && !id.startsWith('hook-'))) {
         const doc = await call('GET', `/api/bridge/flows/${encodeURIComponent(id)}`);
         const flow = doc?.ok ? fromDoc(id, (await doc.json().catch(() => ({}))) as Doc, now) : null;
         if (flow) flows.set(id, flow);
@@ -197,18 +197,22 @@ export function useDesktopFlows(project: OAIYProject, setProject: Dispatch<SetSt
         if (!saved?.ok) continue;
         synced.current.set(id, key);
         there.current.add(id);
-        // Made a tool: its copy follows the flow, keeping its name and what it is for.
-        const toolId = toolFlowId(f);
-        if (there.current.has(toolId)) {
-          const tool = await call('GET', `/api/bridge/flows/${encodeURIComponent(toolId)}`);
-          const doc = tool?.ok ? ((await tool.json().catch(() => null)) as Doc | null) : null;
-          if (doc?.oaiyTool) await call('PUT', `/api/bridge/flows/${encodeURIComponent(toolId)}`, { ...doc, name: f.name, nodes: f.graph.nodes, edges: f.graph.edges });
+        // Made a tool, or put in front of one: each copy follows the flow, keeping what it is to the agent.
+        for (const copyId of [toolFlowId(f), hookFlowId(f)]) {
+          if (!there.current.has(copyId)) continue;
+          const copy = await call('GET', `/api/bridge/flows/${encodeURIComponent(copyId)}`);
+          const doc = copy?.ok ? ((await copy.json().catch(() => null)) as Doc | null) : null;
+          if (doc?.oaiyTool || doc?.oaiyToolHook) await call('PUT', `/api/bridge/flows/${encodeURIComponent(copyId)}`, { ...doc, name: f.name, nodes: f.graph.nodes, edges: f.graph.edges });
         }
       }
       for (const id of [...synced.current.keys()]) {
         if (current.has(id) || project.flows.some((f) => f.id === id)) continue;
         const gone = await call('DELETE', `/api/bridge/flows/${encodeURIComponent(id)}`);
         if (gone && (gone.ok || gone.status === 404)) synced.current.delete(id);
+        // A deleted flow is no longer the agent's tool, nor in front of one.
+        for (const copyId of [toolFlowId({ id } as Flow), hookFlowId({ id } as Flow)]) {
+          if (there.current.has(copyId)) await call('DELETE', `/api/bridge/flows/${encodeURIComponent(copyId)}`);
+        }
       }
       saveSynced(synced.current);
     }, SETTLE_MS);

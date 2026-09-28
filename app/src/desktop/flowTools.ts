@@ -4,8 +4,12 @@
  * one of the agent's tools: its input nodes are the parameters (by their
  * labels, as the flow engine takes inputs), and using it runs the flow on the
  * desktop and hands back what it returned.
+ *
+ * A flow can also stand in front of one of the agent's own tools
+ * (`oaiyToolHook: {tool, mode}`): run before it (to check, change or log the
+ * call) or instead of it (the person's own way of doing it). See `ToolHook`.
  */
-import type { SessionTool } from '../agent/agent';
+import type { SessionTool, ToolHook } from '../agent/agent';
 import type { ToolSpec } from '../agent/protocol';
 import type { Desktop } from './bridge';
 
@@ -95,13 +99,83 @@ export function flowSessionTools(tools: FlowTool[], desktop: () => Desktop | nul
   }));
 }
 
-/** The flows made tools, read from the desktop. */
-export async function listFlowTools(desktop: Desktop, signal?: AbortSignal): Promise<FlowTool[]> {
-  const found: FlowTool[] = [];
+/** A flow in front of one of the agent's tools. */
+export interface FlowHook {
+  /** The flow's id in the desktop's store. */
+  id: string;
+  /** The tool it stands in front of. */
+  tool: string;
+  mode: 'before' | 'instead';
+  flowName: string;
+  inputs: Array<{ label: string; type: string }>;
+}
+
+/** A stored flow as a hook, or null when it is not one. */
+export function readFlowHook(id: string, doc: unknown): FlowHook | null {
+  if (!isRecord(doc) || !isRecord(doc.oaiyToolHook)) return null;
+  const hook = doc.oaiyToolHook;
+  const tool = typeof hook.tool === 'string' ? hook.tool.trim() : '';
+  const mode = hook.mode === 'instead' ? 'instead' : hook.mode === 'before' ? 'before' : null;
+  if (!tool || !mode) return null;
+  const graph = isRecord(doc.graph) ? doc.graph : doc;
+  const nodes = Array.isArray(graph.nodes) ? graph.nodes.filter(isRecord) : [];
+  const inputs = nodes
+    .filter((n) => typeof n.type === 'string' && n.type in INPUT_KINDS)
+    .map((n) => ({ label: String((isRecord(n.data) && typeof n.data.label === 'string' && n.data.label.trim()) || n.id), type: String(n.type) }));
+  return { id, tool, mode, flowName: String(doc.name ?? id), inputs };
+}
+
+/**
+ * What a hook's flow is given from a call, by its inputs' labels: an input
+ * labelled like one of the call's parameters gets that parameter; `tool` gets
+ * the tool's name; `input` (or `call`) gets the call's whole input as JSON.
+ */
+export function hookInputs(hook: FlowHook, call: { name: string; input: Record<string, unknown> }): Record<string, string> {
+  const text = (v: unknown) => (typeof v === 'string' ? v : JSON.stringify(v ?? null));
+  const out: Record<string, string> = {};
+  for (const { label } of hook.inputs) {
+    const key = label.trim();
+    const param = Object.keys(call.input).find((k) => k.toLowerCase() === key.toLowerCase() || paramName(k).toLowerCase() === paramName(key).toLowerCase());
+    if (param) out[label] = text(call.input[param]);
+    else if (/^tool$/i.test(key)) out[label] = call.name;
+    else if (/^(input|call)$/i.test(key)) out[label] = JSON.stringify(call.input);
+    else out[label] = '';
+  }
+  return out;
+}
+
+export { beforeVerdict, type BeforeVerdict } from '../agent/hookVerdict';
+
+/** The hooks as the agents take them: each runs its flow on the desktop. */
+export function flowToolHooks(hooks: FlowHook[], desktop: () => Desktop | null): ToolHook[] {
+  return hooks.map((hook) => ({
+    tool: hook.tool,
+    mode: hook.mode,
+    flowName: hook.flowName,
+    run: async (call, signal) => {
+      const d = desktop();
+      if (!d) throw new Error('OAIY Desktop is not connected, so the flow cannot run');
+      return runOutcome(await d.runFlow(hook.id, hookInputs(hook, call), 120_000, signal));
+    },
+  }));
+}
+
+/** The flows made tools and the flows in front of tools, read from the desktop. */
+export async function readFlowStore(desktop: Desktop, signal?: AbortSignal): Promise<{ tools: FlowTool[]; hooks: FlowHook[] }> {
+  const tools: FlowTool[] = [];
+  const hooks: FlowHook[] = [];
   for (const { id } of await desktop.flows(signal)) {
     const doc = await desktop.flow(id, signal).catch(() => null);
     const tool = readFlowTool(id, doc);
-    if (tool && !found.some((t) => t.name === tool.name)) found.push(tool);
+    if (tool && !tools.some((t) => t.name === tool.name)) tools.push(tool);
+    const hook = readFlowHook(id, doc);
+    // One flow in front of a tool at a time, each way.
+    if (hook && !hooks.some((h) => h.tool === hook.tool && h.mode === hook.mode)) hooks.push(hook);
   }
-  return found;
+  return { tools, hooks };
+}
+
+/** The flows made tools, read from the desktop. */
+export async function listFlowTools(desktop: Desktop, signal?: AbortSignal): Promise<FlowTool[]> {
+  return (await readFlowStore(desktop, signal)).tools;
 }

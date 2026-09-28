@@ -6,6 +6,7 @@
  * timeouts are retried, a run has a step cap, the same failure three times in
  * a row stops it, and old tool output is trimmed as the conversation grows.
  */
+import { beforeVerdict } from './hookVerdict';
 import type { NetGate } from '../gate/netgate';
 import { AIProviderError } from './providers/aiProvider';
 import { DEFAULT_COMPACT_AT, budgetFor, contextWindow, formatTokens, outputLimit, overflowWindow } from './context';
@@ -321,6 +322,8 @@ export interface AgentOptions {
   instructions?: string | (() => string);
   /** Tools of this conversation only (a text-message thread's reply, flows made tools), each with what it does; a function when they change. */
   sessionTools?: SessionTool[] | (() => SessionTool[]);
+  /** Flows in front of the agent's tools (made so in the flow editor); a function when they change. */
+  toolHooks?: ToolHook[] | (() => ToolHook[]);
   /** How hard the model thinks before it answers (`none` on a phone call). */
   reasoning?: 'none' | 'low' | 'medium' | 'high' | 'max';
   /**
@@ -329,6 +332,23 @@ export interface AgentOptions {
    */
   conversation?: boolean;
 }
+
+/**
+ * A flow in front of one of the agent's tools. `before`: it runs first with the
+ * call, and its answer lets the call go ahead, changes its parameters, adds a
+ * note, or stops it (`beforeVerdict`). `instead`: it runs in the tool's place,
+ * and what it returns is the tool's result.
+ */
+export interface ToolHook {
+  tool: string;
+  mode: 'before' | 'instead';
+  flowName: string;
+  /** Runs the flow on the call; resolves to what it returned. */
+  run: (call: { name: string; input: Record<string, unknown> }, signal?: AbortSignal) => Promise<string>;
+}
+
+/** The agent's own workings, which no flow stands in front of. */
+const UNHOOKED = new Set(['update_plan', 'give_verdict', 'guide', 'review_frame', 'delegate']);
 
 /** A tool one conversation has (not every agent): its spec, and what running it does. */
 export interface SessionTool {
@@ -638,10 +658,28 @@ export class Agent {
     return (typeof t === 'function' ? t() : t) ?? [];
   }
 
+  /** The flows in front of a tool, as they are now. */
+  private hooksFor(tool: string): { before?: ToolHook; instead?: ToolHook } {
+    if (UNHOOKED.has(tool)) return {};
+    const h = this.options.toolHooks;
+    const all = (typeof h === 'function' ? h() : h) ?? [];
+    return { before: all.find((x) => x.tool === tool && x.mode === 'before'), instead: all.find((x) => x.tool === tool && x.mode === 'instead') };
+  }
+
   /** This conversation's own instructions, as they are now. */
   private get instructions(): string {
     const i = this.options.instructions;
     return (typeof i === 'function' ? i() : i) ?? '';
+  }
+
+  /** A flow of the person's in a tool's place: what it returned is the tool's result. */
+  private async runInstead(hook: ToolHook, call: ToolCall, signal?: AbortSignal): Promise<ToolResult> {
+    try {
+      const out = await hook.run({ name: call.name, input: call.input }, signal);
+      return { id: call.id, name: call.name, content: `[Your flow "${hook.flowName}" ran instead of ${call.name}.]\n${out}`, isError: false };
+    } catch (error) {
+      return { id: call.id, name: call.name, content: `Error: your flow "${hook.flowName}", which runs instead of ${call.name}, failed: ${(error as Error).message}`, isError: true };
+    }
   }
 
   /** A tool of this conversation only: its answer, or the error it threw. */
@@ -1811,13 +1849,32 @@ ${this.instructions}` : ''}`;
           this.turns.push({ role: 'tool', results });
           continue;
         }
-        for (const [index, call] of reply.calls.entries()) {
+        for (const [index, asked] of reply.calls.entries()) {
           signal?.throwIfAborted();
           callIndex = index;
-          emit({ type: 'tool_call', call });
+          emit({ type: 'tool_call', call: asked });
+          let call = asked;
           const allowed = this.tools.some((t) => t.name === call.name);
-          const scriptCheck = allowed ? this.guideFirst(call) ?? this.writtenAlready(call) ?? this.scriptCheck(call, changedThisRun) : null;
-          const result = !allowed
+          // A flow of the person's before the tool: it may change the call, stop it, or add a note.
+          const hooks = allowed ? this.hooksFor(call.name) : {};
+          let flowNote = '';
+          let stopped: ToolResult | null = null;
+          if (hooks.before) {
+            try {
+              const verdict = beforeVerdict(await hooks.before.run({ name: call.name, input: call.input }, signal));
+              if (verdict.stop) stopped = { id: call.id, name: call.name, content: `Error: your flow "${hooks.before.flowName}", which runs before ${call.name}, stopped this call: ${verdict.stop}`, isError: true };
+              if (verdict.input) call = { ...call, input: { ...call.input, ...verdict.input } };
+              flowNote = `[Your flow "${hooks.before.flowName}" ran before ${call.name}${verdict.input ? ` and changed ${Object.keys(verdict.input).join(', ')}` : ''}${verdict.note ? `: ${verdict.note.replace(/[.!?]+$/, '')}` : ''}.]`;
+            } catch (error) {
+              flowNote = `[Your flow "${hooks.before.flowName}", which runs before ${call.name}, failed (${(error as Error).message}); the call went ahead.]`;
+            }
+          }
+          const scriptCheck = allowed && !stopped ? this.guideFirst(call) ?? this.writtenAlready(call) ?? this.scriptCheck(call, changedThisRun) : null;
+          const result: ToolResult = stopped
+            ? stopped
+            : allowed && !scriptCheck && hooks.instead
+            ? await this.runInstead(hooks.instead, call, signal)
+            : !allowed
             ? { id: call.id, name: call.name, content: `Error: ${call.name} is not one of your tools`, isError: true }
             : scriptCheck
               ? { id: call.id, name: call.name, content: scriptCheck, isError: false }
@@ -1834,6 +1891,7 @@ ${this.instructions}` : ''}`;
                   : call.name === 'guide'
                     ? this.readGuide(call)
                     : await runTool(call, this.toolContext);
+          if (flowNote) result.content = `${flowNote}\n${result.content}`;
           if (call.name === 'write_file' && !result.isError && typeof call.input.path === 'string') {
             const path = normalizePath(call.input.path);
             const times = (rewrites.get(path) ?? 0) + 1;

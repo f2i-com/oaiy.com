@@ -8,12 +8,12 @@ import { sandboxAvailable, zippModule } from './sandbox/runner';
 import { loadSettings, saveAgentSettings, saveDesktop, saveGate, saveLastKeptProject, saveLastProject, saveMedia, saveMessages, saveProviders } from './settings';
 import { Desktop } from './desktop/bridge';
 import { DesktopEvents, Sessions, TEST_NUMBER } from './sessions';
-import { flowSessionTools, listFlowTools } from './desktop/flowTools';
+import { flowSessionTools, flowToolHooks, readFlowStore } from './desktop/flowTools';
 import { TRANSCRIBE_TOOL, transcribeTool } from './desktop/transcribe';
 import { calendarTools } from './desktop/calendarTools';
 import { flowBuilderTools } from './desktop/flowBuilder';
 import { TOOLS } from './agent/tools';
-import type { SessionTool } from './agent/agent';
+import type { SessionTool, ToolHook } from './agent/agent';
 import { editPhone } from './ui/phone';
 import { startTheme } from './ui/theme';
 import { OAIY_ORIGIN, discoverOaiy, mediaAbilities, mergeDiscovered } from './agent/media';
@@ -152,6 +152,8 @@ async function main(): Promise<void> {
   let holdsCalls = false;
   // Flows made tools in the flow editor: every agent may use them.
   let flowTools: SessionTool[] = [];
+  /** Flows in front of the agents' tools. */
+  let toolHooks: ToolHook[] = [];
   /** The conversation the chat shows: null for the project's own. */
   let viewing: string | null = null;
 
@@ -327,6 +329,7 @@ async function main(): Promise<void> {
     const agentOptions = (): AgentOptions => ({
       // Flows made tools, and speech to text: both run on OAIY Desktop.
       sessionTools: () => (desktop ? [...flowTools, transcribe, ...calendar, ...flowBuilder] : flowTools),
+      toolHooks: () => toolHooks,
       vfs: project.vfs,
       gate,
       provider: activeProvider,
@@ -1172,11 +1175,14 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
     const d = desktop;
     if (!d) {
       flowTools = [];
+      toolHooks = [];
       return;
     }
     try {
       const taken = new Set([...TOOLS.map((t) => t.name), 'send_text_message', 'end_call', 'request_appointment', 'lookup_business_data', 'guide', 'update_plan', 'delegate', TRANSCRIBE_TOOL, 'calendar_free_times', 'calendar_list', 'calendar_book', 'calendar_change', 'flow_nodes', 'flow_list', 'flow_read', 'flow_write', 'flow_run']);
-      flowTools = flowSessionTools(await listFlowTools(d, AbortSignal.timeout(10_000)), () => desktop, taken);
+      const store = await readFlowStore(d, AbortSignal.timeout(10_000));
+      flowTools = flowSessionTools(store.tools, () => desktop, taken);
+      toolHooks = flowToolHooks(store.hooks, () => desktop);
     } catch {
       /* the desktop is away: keep what was there */
     }
