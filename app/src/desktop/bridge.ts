@@ -251,4 +251,15 @@ export class Desktop {
     const list = Array.isArray(body) ? body : isRecord(body) && Array.isArray(body.plugins) ? body.plugins : [];
     return list.filter(isRecord).map((p) => ({ id: String(p.id ?? ''), state: String(p.state ?? p.status ?? '') }));
   }
+
+  /** The words spoken in `wav` (16 kHz mono, 16-bit), by the desktop's speech-to-text. */
+  async transcribe(wav: Uint8Array<ArrayBuffer>, signal?: AbortSignal): Promise<string> {
+    const body = await reply(await fetch(`${this.origin}/api/voice/transcribe`, {
+      method: 'POST',
+      headers: { ...this.headers(), 'content-type': 'audio/wav' },
+      body: wav,
+      signal,
+    }));
+    return isRecord(body) ? String(body.text ?? '') : '';
+  }
 }
