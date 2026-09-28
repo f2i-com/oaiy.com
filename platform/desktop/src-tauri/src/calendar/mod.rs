@@ -184,6 +184,113 @@ struct Book {
     settings: Settings,
     #[serde(default)]
     appointments: Vec<Appointment>,
+    /// Appointments deleted here that FormLogic may still have, kept until it
+    /// has been told (see `sync`), so a deletion made offline is not undone.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    deleted: Vec<Tombstone>,
+    /// Where the sync with FormLogic has got to.
+    #[serde(default)]
+    sync: sync::State,
+}
+
+/// An appointment deleted on this machine, until FormLogic has deleted its copy.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct Tombstone {
+    /// The local id it had.
+    pub id: String,
+    /// FormLogic's record, when the two were paired.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub formlogic_id: Option<String>,
+    /// The key FormLogic's copy carries as `request_id` (a call's request id,
+    /// or `oaiy:<id>` for one made here), to find a copy made before the two
+    /// were paired, or after (FormLogic's own flow records a call's request).
+    pub request_key: String,
+    pub deleted_at: String,
+    /// Looked for once and not found: kept for a copy that turns up late, but
+    /// no longer a change waiting to sync.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub checked: bool,
+}
+
+impl Book {
+    /// Add an appointment (the checks and defaults `Calendar::create` applies).
+    fn create(&mut self, new: NewAppointment) -> Result<Appointment, String> {
+        let start = if !new.start.trim().is_empty() {
+            parse_start(&new.start).ok_or("start is YYYY-MM-DDTHH:MM")?
+        } else {
+            let date = NaiveDate::parse_from_str(new.date.trim(), "%Y-%m-%d").map_err(|_| "date is YYYY-MM-DD".to_string())?;
+            let time = parse_time(&new.time).ok_or("time is HH:MM")?;
+            date.and_time(time)
+        };
+        let service = Calendar::service_named(&self.settings, &new.service);
+        let minutes = new.minutes.filter(|m| *m > 0).or(service.map(|s| s.minutes)).unwrap_or(self.settings.slot_minutes);
+        let now = now_rfc3339();
+        let mut a = Appointment {
+            id: format!("appt_{}", uuid::Uuid::new_v4().simple()),
+            service: service.map(|s| s.name.clone()).unwrap_or_else(|| new.service.trim().to_string()),
+            start: format_start(start),
+            minutes,
+            status: new.status.unwrap_or(Status::Confirmed),
+            name: new.name.trim().to_string(),
+            phone: new.phone.trim().to_string(),
+            notes: new.notes.trim().to_string(),
+            source: if new.source.trim().is_empty() { "manual".into() } else { new.source.trim().to_string() },
+            request_id: None,
+            call_id: None,
+            created_at: now.clone(),
+            updated_at: now,
+            formlogic: None,
+        };
+        // How it began, so a sync can tell what changed here from what changed in FormLogic.
+        a.formlogic = sync::first_version(&a);
+        self.appointments.push(a.clone());
+        Ok(a)
+    }
+
+    /// Change an appointment (what `Calendar::update` does).
+    fn change(&mut self, id: &str, change: Change) -> Result<Appointment, String> {
+        let start = match &change.start {
+            Some(s) => Some(parse_start(s).ok_or("start is YYYY-MM-DDTHH:MM")?),
+            None => None,
+        };
+        let settings = &self.settings;
+        let a = self.appointments.iter_mut().find(|a| a.id == id).ok_or_else(|| format!("no appointment {id}"))?;
+        if let Some(s) = change.status {
+            a.status = s;
+        }
+        if let Some(t) = start {
+            a.start = format_start(t);
+        }
+        if let Some(svc) = change.service {
+            match Calendar::service_named(settings, &svc) {
+                Some(found) => {
+                    a.service = found.name.clone();
+                    if change.minutes.is_none() {
+                        a.minutes = found.minutes;
+                    }
+                }
+                None => a.service = svc.trim().to_string(),
+            }
+        }
+        if let Some(m) = change.minutes.filter(|m| *m > 0) {
+            a.minutes = m;
+        }
+        if let Some(n) = change.name {
+            a.name = n.trim().to_string();
+        }
+        if let Some(p) = change.phone {
+            a.phone = p.trim().to_string();
+        }
+        if let Some(n) = change.notes {
+            a.notes = n.trim().to_string();
+        }
+        if let Some(f) = change.formlogic {
+            a.formlogic = Some(f);
+        }
+        a.updated_at = later_than(&a.updated_at);
+        Ok(a.clone())
+    }
 }
 
 /// Free times on one day.
@@ -272,7 +379,15 @@ pub fn say_date(d: NaiveDate) -> String {
 }
 
 fn now_rfc3339() -> String {
-    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
+/// A change's time: now, and always after `prev`, so a change made in the
+/// same instant as the last sync still reads as a change.
+fn later_than(prev: &str) -> String {
+    let now = chrono::Utc::now();
+    let after = chrono::DateTime::parse_from_rfc3339(prev).map(|t| t.with_timezone(&chrono::Utc) + Duration::milliseconds(1)).unwrap_or(now);
+    now.max(after).to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
 fn slug(name: &str) -> String {
@@ -384,110 +499,33 @@ impl Calendar {
         })
     }
 
+    /// A new appointment. A change here is sent to FormLogic soon after, when linked.
     pub fn create(&self, new: NewAppointment) -> Result<Appointment, String> {
-        let start = if !new.start.trim().is_empty() {
-            parse_start(&new.start).ok_or("start is YYYY-MM-DDTHH:MM")?
-        } else {
-            let date = NaiveDate::parse_from_str(new.date.trim(), "%Y-%m-%d").map_err(|_| "date is YYYY-MM-DD".to_string())?;
-            let time = parse_time(&new.time).ok_or("time is HH:MM")?;
-            date.and_time(time)
-        };
-        self.with(|book| {
-            let service = Self::service_named(&book.settings, &new.service);
-            let minutes = new.minutes.filter(|m| *m > 0).or(service.map(|s| s.minutes)).unwrap_or(book.settings.slot_minutes);
-            let now = now_rfc3339();
-            let a = Appointment {
-                id: format!("appt_{}", uuid::Uuid::new_v4().simple()),
-                service: service.map(|s| s.name.clone()).unwrap_or_else(|| new.service.trim().to_string()),
-                start: format_start(start),
-                minutes,
-                status: new.status.unwrap_or(Status::Confirmed),
-                name: new.name.trim().to_string(),
-                phone: new.phone.trim().to_string(),
-                notes: new.notes.trim().to_string(),
-                source: if new.source.trim().is_empty() { "manual".into() } else { new.source.trim().to_string() },
-                request_id: None,
-                call_id: None,
-                created_at: now.clone(),
-                updated_at: now,
-                formlogic: None,
-            };
-            book.appointments.push(a.clone());
-            Ok(a)
-        })
+        let a = self.with(|book| book.create(new))?;
+        sync::nudge();
+        Ok(a)
     }
 
     pub fn update(&self, id: &str, change: Change) -> Result<Appointment, String> {
-        let start = match &change.start {
-            Some(s) => Some(parse_start(s).ok_or("start is YYYY-MM-DDTHH:MM")?),
-            None => None,
-        };
-        self.with(|book| {
-            let settings = book.settings.clone();
-            let a = book.appointments.iter_mut().find(|a| a.id == id).ok_or_else(|| format!("no appointment {id}"))?;
-            if let Some(s) = change.status {
-                a.status = s;
-            }
-            if let Some(t) = start {
-                a.start = format_start(t);
-            }
-            if let Some(svc) = change.service {
-                match Self::service_named(&settings, &svc) {
-                    Some(found) => {
-                        a.service = found.name.clone();
-                        if change.minutes.is_none() {
-                            a.minutes = found.minutes;
-                        }
-                    }
-                    None => a.service = svc.trim().to_string(),
-                }
-            }
-            if let Some(m) = change.minutes.filter(|m| *m > 0) {
-                a.minutes = m;
-            }
-            if let Some(n) = change.name {
-                a.name = n.trim().to_string();
-            }
-            if let Some(p) = change.phone {
-                a.phone = p.trim().to_string();
-            }
-            if let Some(n) = change.notes {
-                a.notes = n.trim().to_string();
-            }
-            if let Some(f) = change.formlogic {
-                a.formlogic = Some(f);
-            }
-            a.updated_at = now_rfc3339();
-            Ok(a.clone())
-        })
+        let a = self.with(|book| book.change(id, change))?;
+        sync::nudge();
+        Ok(a)
     }
 
-    /// Record that the appointment is in step with FormLogic's record `remote_id`
-    /// (its `updatedAt` then), and the call's ids when FormLogic knew them. Not
-    /// a change of the appointment: its `updatedAt` stays as it is.
-    pub fn mark_synced(&self, id: &str, remote_id: &str, remote_updated_at: &str, request_id: Option<String>, call_id: Option<String>) -> Result<(), String> {
-        self.with(|book| {
-            let a = book.appointments.iter_mut().find(|a| a.id == id).ok_or_else(|| format!("no appointment {id}"))?;
-            a.formlogic = Some(serde_json::json!({ "id": remote_id, "updatedAt": remote_updated_at, "syncedAt": a.updated_at }));
-            if request_id.is_some() && a.request_id.is_none() {
-                a.request_id = request_id;
-            }
-            if call_id.is_some() && a.call_id.is_none() {
-                a.call_id = call_id;
-            }
-            Ok(())
-        })
-    }
-
+    /// Delete an appointment. One FormLogic has (or may have) a copy of leaves
+    /// a tombstone, so the next sync deletes that copy instead of bringing the
+    /// appointment back.
     pub fn remove(&self, id: &str) -> Result<(), String> {
         self.with(|book| {
-            let before = book.appointments.len();
-            book.appointments.retain(|a| a.id != id);
-            if book.appointments.len() == before {
-                return Err(format!("no appointment {id}"));
+            let at = book.appointments.iter().position(|a| a.id == id).ok_or_else(|| format!("no appointment {id}"))?;
+            let a = book.appointments.remove(at);
+            if let Some(t) = sync::tombstone_for(&a) {
+                book.deleted.push(t);
             }
             Ok(())
-        })
+        })?;
+        sync::nudge();
+        Ok(())
     }
 
     /// An appointment the caller agreed to on a call (`aokie.appointment.requested`):
@@ -499,34 +537,37 @@ impl Calendar {
         if request_id.is_empty() {
             return None;
         }
-        if self.book.lock().ok()?.appointments.iter().any(|a| a.request_id.as_deref() == Some(request_id.as_str())) {
-            return None;
-        }
         let date = NaiveDate::parse_from_str(&text("date"), "%Y-%m-%d").ok()?;
         let time = parse_time(&text("time"))?;
-        let mut a = self
-            .create(NewAppointment {
-                service: text("service"),
-                start: format_start(date.and_time(time)),
-                status: Some(Status::Requested),
-                name: text("callerName"),
-                phone: text("from"),
-                notes: String::new(),
-                source: "call".into(),
-                ..Default::default()
-            })
-            .ok()?;
         let call_id = text("callId");
-        self.with(|book| {
-            if let Some(stored) = book.appointments.iter_mut().find(|x| x.id == a.id) {
-                stored.request_id = Some(request_id.clone());
-                stored.call_id = (!call_id.is_empty()).then(|| call_id.clone());
-                a = stored.clone();
-            }
-            Ok(())
-        })
-        .ok()?;
-        Some(a)
+        let made = self
+            .with(|book| {
+                // Once per request: one already here, or one deleted here (the
+                // same event delivered again must not bring it back).
+                if book.appointments.iter().any(|a| a.request_id.as_deref() == Some(request_id.as_str())) || book.deleted.iter().any(|t| t.request_key == request_id) {
+                    return Ok(None);
+                }
+                let mut a = book.create(NewAppointment {
+                    service: text("service"),
+                    start: format_start(date.and_time(time)),
+                    status: Some(Status::Requested),
+                    name: text("callerName"),
+                    phone: text("from"),
+                    notes: String::new(),
+                    source: "call".into(),
+                    ..Default::default()
+                })?;
+                // In the same save, so no sync sees it without its request id.
+                a.request_id = Some(request_id.clone());
+                a.call_id = (!call_id.is_empty()).then(|| call_id.clone());
+                if let Some(stored) = book.appointments.iter_mut().find(|x| x.id == a.id) {
+                    *stored = a.clone();
+                }
+                Ok(Some(a))
+            })
+            .ok()??;
+        sync::nudge();
+        Some(made)
     }
 
     /// Free times from `from` for `days` days, for something `minutes` long,

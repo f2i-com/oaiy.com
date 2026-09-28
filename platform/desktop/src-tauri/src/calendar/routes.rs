@@ -8,8 +8,11 @@
 //!   PATCH  /api/calendar/appointments/:id                  → the appointment, changed
 //!   DELETE /api/calendar/appointments/:id                  → 204
 //!   POST   /api/calendar/lookup {question, from}            → {digest} (what the phone is told)
-//!   GET    /api/calendar/sync                               → how the last FormLogic sync went
-//!   POST   /api/calendar/sync                               → sync now
+//!   GET    /api/calendar/sync                               → how the FormLogic sync stands: its
+//!                                                            state (offline...), when it last went
+//!                                                            through, the changes waiting to go
+//!   POST   /api/calendar/sync                               → sync now (answers within ten seconds,
+//!                                                            `syncing` if it is still going)
 
 use axum::extract::{Path, Query};
 use axum::http::StatusCode;
