@@ -12,6 +12,12 @@
  * only in its own folder here (so it survives a refresh or a restart), and the
  * folder is deleted when incognito is cleared or turned off. Nothing of it goes
  * anywhere else; exporting it is the only way to keep it.
+ *
+ * The front desk is kept beside the projects, not among them (`/front-desk/`,
+ * the same layout): the phone's conversations (each call and text thread, and
+ * flows' tasks) and the files they read. It stays open whatever project the
+ * person works in, and it is not in the project menu, so it cannot be renamed,
+ * deleted or left behind by incognito.
  */
 import type { Turn } from '../agent/protocol';
 import { Vfs, type VfsChange } from './vfs';
@@ -86,6 +92,22 @@ function safeName(id: string): string {
   return id.replace(/[^\w.-]+/g, '_');
 }
 
+/** The front desk's place and name (see the module note). */
+export const FRONT_DESK = { id: 'front-desk', name: 'Front desk' } as const;
+/** What the front desk is for, in its files. */
+export const FRONT_DESK_NOTE = '/knowledge/README.md';
+const FRONT_DESK_README = `# The front desk
+
+The phone's agent works here: it answers your calls and text messages, each
+caller in a conversation of their own, and does the tasks your flows give it.
+
+Put what it should know about your business in this \`knowledge\` folder, as
+plain text or Markdown files: what you offer and what it costs, your area,
+directions, what to say about common questions, what not to promise. It reads
+these files when a call or a text needs them; callers and texters cannot
+change them. Your hours and services come from the Calendar.
+`;
+
 export function newId(): string {
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 }
@@ -154,7 +176,52 @@ export class OpenProject {
   private constructor(public meta: ProjectMeta, private readonly dir: FileSystemDirectoryHandle) {}
 
   static async open(meta: ProjectMeta): Promise<OpenProject> {
-    const dir = await (await root()).getDirectoryHandle(meta.id, { create: true });
+    return OpenProject.openAt(meta, await (await root()).getDirectoryHandle(meta.id, { create: true }));
+  }
+
+  /**
+   * The front desk (see the module note), made on first use with a note on
+   * what to put in it, and given the phone conversations a project held
+   * before it existed (see `adoptSessions`).
+   */
+  static async openFrontDesk(): Promise<OpenProject> {
+    const opfs = await navigator.storage.getDirectory();
+    const dir = await opfs.getDirectoryHandle(FRONT_DESK.id, { create: true });
+    const meta = (await readJson<ProjectMeta>(dir, 'project.json')) ?? { ...FRONT_DESK, created: Date.now(), updated: Date.now() };
+    const fresh = !(await readJson<ProjectMeta>(dir, 'project.json'));
+    if (fresh) await writeBytes(dir, 'project.json', JSON.stringify(meta));
+    const desk = await OpenProject.openAt(meta, dir);
+    if (fresh || !desk.vfs.exists(FRONT_DESK_NOTE)) {
+      desk.vfs.writeFile(FRONT_DESK_NOTE, FRONT_DESK_README, { parents: true });
+      await desk.flush();
+    }
+    if (fresh) await desk.adoptSessions();
+    return desk;
+  }
+
+  /**
+   * Phone conversations kept in a project before the front desk existed come
+   * here (from the project that has them, the latest if several do). They are
+   * copied: the project's own copies stay where they were, unread.
+   */
+  private async adoptSessions(): Promise<void> {
+    if ((await this.loadSessions()).length) return;
+    for (const meta of await listProjects()) {
+      const from = await (await root()).getDirectoryHandle(meta.id).catch(() => null);
+      const sessions = from && (await dirAt(from, 'sessions', false).catch(() => null));
+      const index = sessions && (await readJson<SessionInfo[]>(sessions, 'index.json'));
+      if (!sessions || !index?.length) continue;
+      const to = await dirAt(this.dir, 'sessions', true);
+      for await (const [name, handle] of (sessions as unknown as AsyncIterable<[string, FileSystemHandle]>)) {
+        if (handle.kind !== 'file') continue;
+        const file = await (handle as FileSystemFileHandle).getFile();
+        await writeBytes(to, name, new Uint8Array(await file.arrayBuffer()));
+      }
+      return;
+    }
+  }
+
+  private static async openAt(meta: ProjectMeta, dir: FileSystemDirectoryHandle): Promise<OpenProject> {
     const project = new OpenProject(meta, dir);
     const files: Array<[string, Uint8Array]> = [];
     const dirs: string[] = [];

@@ -135,6 +135,8 @@ async function main(): Promise<void> {
   const activeProvider = () => providers.find((p) => p.id === activeId) ?? null;
 
   let project!: OpenProject;
+  /** The phone's own place: its conversations and the files they read (see OpenProject.openFrontDesk). */
+  let frontDesk!: OpenProject;
   let agent!: Agent;
   let controller: AbortController | null = null;
   let unsubscribe: (() => void) | null = null;
@@ -314,32 +316,25 @@ async function main(): Promise<void> {
     return true;
   }
 
-  const openProjectNow = async (meta: ProjectMeta) => {
-    if (project && meta.id === project.meta.id) return;
-    await stopRun();
-    // An incognito project is deleted once another is open.
-    const leaving = project?.meta.incognito ? project.meta.id : null;
-    if (project) {
-      editor.flush();
-      await project.close();
-      await project.saveChat(agent.savedTurns());
-      unsubscribe?.();
-    }
-    project = await OpenProject.open(meta);
-    project.onError = notice;
-    const transcribe = transcribeTool(() => project.vfs, () => desktop);
+  /**
+   * An agent's options for a place (the open project, or the front desk): its
+   * files, and the desktop's tools working on them. The live preview belongs to
+   * the open project only.
+   */
+  const optionsFor = (place: () => OpenProject, withPreview: boolean) => {
+    const transcribe = transcribeTool(() => place().vfs, () => desktop);
     const calendar = calendarTools(() => desktop);
     const flowBuilder = flowBuilderTools(() => desktop);
-    const agentOptions = (): AgentOptions => ({
+    return (): AgentOptions => ({
       // Flows made tools, and speech to text: both run on OAIY Desktop.
       // The calendar's tools only while there is one (the phone receptionist is installed).
       sessionTools: () => (desktop ? [...flowTools, transcribe, ...(calendarAvailable ? calendar : []), ...flowBuilder] : flowTools),
       toolHooks: () => toolHooks,
-      vfs: project.vfs,
+      vfs: place().vfs,
       gate,
       provider: activeProvider,
-      projectSummary: () => summarizeProject(project.meta, project.vfs, gate),
-      preview,
+      projectSummary: () => summarizeProject(place().meta, place().vfs, gate),
+      ...(withPreview ? { preview } : {}),
       compactAt: () => agentSettings.compactAt,
       media: () => media,
       subAgents: () => {
@@ -354,27 +349,58 @@ async function main(): Promise<void> {
         void saveProviders(providers, activeId);
       },
     });
+  };
+  const projectOptions = optionsFor(() => project, true);
+  const deskOptions = optionsFor(() => frontDesk, false);
+
+  /**
+   * The phone's conversations (each call and text thread, and flows' tasks),
+   * each with an agent of its own, in the front desk: made once, and kept
+   * whatever project is open (switching projects never ends a call).
+   */
+  async function openFrontDesk(): Promise<void> {
+    frontDesk = await OpenProject.openFrontDesk();
+    frontDesk.onError = notice;
+    const own = (sessions = new Sessions(
+      frontDesk,
+      // A call or a text thread brings its own tools; a flow's task has the desktop's, as the project's agent does.
+      (extra) => new Agent({ ...deskOptions(), ...extra, sessionTools: Array.isArray(extra.sessionTools) ? () => [...(extra.sessionTools as SessionTool[]), ...flowTools] : deskOptions().sessionTools }),
+      () => ({ ...messages, answer: messages.answer && holdsTexts }),
+      () => desktop,
+      {
+        changed: () => renderSessions(),
+        arrived: (session, text) => {
+          if (viewing === session.id) chat.user(text, []);
+        },
+        event: (session, event) => {
+          if (viewing === session.id) chat.event(event);
+          if (event.type === 'tool_result') void own.save(session).catch(() => {});
+        },
+      },
+    ));
+    await own.load();
+  }
+
+  const openProjectNow = async (meta: ProjectMeta) => {
+    if (project && meta.id === project.meta.id) return;
+    await stopRun();
+    // An incognito project is deleted once another is open.
+    const leaving = project?.meta.incognito ? project.meta.id : null;
+    if (project) {
+      editor.flush();
+      await project.close();
+      await project.saveChat(agent.savedTurns());
+      unsubscribe?.();
+    }
+    project = await OpenProject.open(meta);
+    project.onError = notice;
+    const agentOptions = projectOptions;
     agent = new Agent(agentOptions());
     agent.turns = await project.loadChat();
     // The plan goes on where the saved conversation left it.
     agent.plan = planAfter(agent.turns);
-    // The project's text-message conversations, each with an agent of its own.
-    sessions?.stopAll();
+    // The phone's conversations stay in the front desk: the project's own conversation shows.
     viewing = null;
-    const opened = project;
-    const own = (sessions = new Sessions(project, (extra) => new Agent({ ...agentOptions(), ...extra, sessionTools: () => [...(Array.isArray(extra.sessionTools) ? extra.sessionTools : []), ...flowTools] }), () => ({ ...messages, answer: messages.answer && holdsTexts }), () => desktop, {
-      changed: () => {
-        if (project === opened) renderSessions();
-      },
-      arrived: (session, text) => {
-        if (project === opened && viewing === session.id) chat.user(text, []);
-      },
-      event: (session, event) => {
-        if (project === opened && viewing === session.id) chat.event(event);
-        if (event.type === 'tool_result') void own.save(session).catch(() => {});
-      },
-    }));
-    await own.load();
     announce();
     // The first project is open: the page is usable from here on.
     header.inert = false;
@@ -1299,6 +1325,7 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
   // Incognito projects left from before are deleted, all but the one that was
   // open (incognito stays on across a refresh or a restart).
   await clearIncognito(settings.lastProjectId ?? undefined);
+  await openFrontDesk();
   reopening = true;
   const all = await listProjects();
   let meta = all.find((m) => m.id === settings.lastProjectId) ?? all[0];
