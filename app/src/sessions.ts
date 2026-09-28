@@ -364,7 +364,18 @@ export class Sessions {
     const from = String(event.data.from ?? '');
     const body = String(event.data.body ?? '');
     if (!from || !body) return null;
-    return this.textArrived(from, String(event.data.name ?? ''), body);
+    // A text the phone delivers again (it does, when it reconnects) is not a new one.
+    const handle = String(event.data.handle ?? '');
+    if (handle) {
+      const existing = this.list.find((s) => s.kind === 'sms' && s.key === digits(from));
+      if (existing?.handles?.includes(handle)) return null;
+    }
+    const session = await this.textArrived(from, String(event.data.name ?? ''), body);
+    if (handle) {
+      session.handles = [...(session.handles ?? []), handle].slice(-100);
+      await this.saveIndex();
+    }
+    return session;
   }
 
   /** A text message from `number`: shown in its conversation, and answered when answering is on. */
@@ -503,7 +514,7 @@ export class Sessions {
   }
 
   private async saveIndex(): Promise<void> {
-    await this.project.saveSessions(this.list.map(({ id, kind, key, title, lastAt, unread }) => ({ id, kind, key, title, lastAt, unread })));
+    await this.project.saveSessions(this.list.map(({ id, kind, key, title, lastAt, unread, handles }) => ({ id, kind, key, title, lastAt, unread, ...(handles?.length ? { handles } : {}) })));
   }
 }
 

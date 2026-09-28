@@ -181,6 +181,21 @@ describe('text-message conversations', () => {
   });
 });
 
+describe('a text the phone delivers again', () => {
+  it("is not answered twice: the phone's handle says it is the same text", async () => {
+    fakeProvider('openai', [{ calls: [{ name: 'send_text_message', input: { body: 'Hi!' } }] }, { text: 'done' }]);
+    const { sessions, desktop, store } = setup({ answer: true, instructions: '' });
+    const hello = { seq: 1, name: 'aokie.sms.received', source: 'aokie', correlationId: 'c1', idempotencyKey: 'k1', occurredAt: '', data: { from: '+61491570006', name: 'Lance', body: 'Hello', handle: '040000000000002F' } };
+    await sessions.desktopEvent(hello);
+    await settled(sessions);
+    // The phone reconnects and delivers it again, under a new correlation.
+    expect(await sessions.desktopEvent({ ...hello, seq: 7, correlationId: 'c7', idempotencyKey: 'k7' })).toBeNull();
+    await settled(sessions);
+    expect(desktop.commands).toHaveLength(1);
+    expect(store.index[0].handles).toEqual(['040000000000002F']);
+  });
+});
+
 describe("following the desktop's events", () => {
   function ringOf(events: DesktopEvent[]) {
     return {

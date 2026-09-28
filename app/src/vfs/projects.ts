@@ -76,6 +76,8 @@ export interface SessionInfo {
   lastAt: number;
   /** Messages the person has not looked at yet. */
   unread: number;
+  /** The phone's handles of the texts it has had (the phone may deliver one again, when it reconnects). */
+  handles?: string[];
 }
 
 /** A session id as a file name. */
