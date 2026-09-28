@@ -39,6 +39,9 @@
 .content-page.page-fill > .page-intro,
 .content-page.page-fill > .panel { max-width: none; }
 .plugin-screen { flex: 1 1 auto; min-height: 320px; }
+/* No frame of its own: the screen's document is transparent and draws its
+   own cards, so it sits on the page canvas like a built-in panel. */
+.content-page.page-fill .plugin-screen { border: 0; border-radius: 0; background: transparent; }
 .form-row, .form-row-pair, .service-card { min-width: 0; }
 input, select, textarea { max-width: 100%; }
 @media (max-width: 1240px) { .sidebar .nav-badge { display: none; } }
