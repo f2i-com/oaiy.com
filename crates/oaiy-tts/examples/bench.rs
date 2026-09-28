@@ -64,9 +64,26 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         sync()?;
         let per_frame = t.elapsed().as_secs_f64() * 1e3 / made.len().max(1) as f64;
         println!("round {round} (draws on the {}): prefill ({} positions) {prefill_ms:.1} ms; {} frames at {per_frame:.2} ms a frame ({:.1} frames/s)", if on_device { "device" } else { "host" }, prefill.dim(1)?, made.len(), 1e3 / per_frame);
+        if round == 0 {
+            // Streaming against the whole-clip decode (the reference clip and
+            // the new frames at once, the clip's part cut off).
+            let mut all = voice.ref_codes.clone();
+            all.extend_from_slice(&made);
+            let whole = codec.forward(&all)?;
+            let whole = &whole[voice.ref_codes.len() * 1920..];
+            let mut stream = CodecStream::primed(&codec, &voice.ref_codes)?;
+            let mut streamed = stream.push(&codec, &made[..1])?;
+            for c in made[1..].chunks(2) {
+                streamed.extend(stream.push(&codec, c)?);
+            }
+            let signal: f64 = whole.iter().map(|&x| (x as f64).powi(2)).sum();
+            let noise: f64 = whole.iter().zip(&streamed).map(|(&a, &b)| (a as f64 - b as f64).powi(2)).sum();
+            let peak = whole.iter().zip(&streamed).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+            println!("  streamed vs the whole decode: SNR {:.1} dB, largest difference {peak:.6}", 10. * (signal / noise.max(1e-30)).log10());
+        }
         for chunk in [1usize, 2, 4, 8] {
             // Once to warm up (and capture), then timed.
-            let mut stream = CodecStream::primed(25, &voice.ref_codes);
+            let mut stream = CodecStream::primed(&codec, &voice.ref_codes)?;
             for c in made.chunks(chunk).take(2) {
                 stream.push(&codec, c)?;
             }
@@ -78,7 +95,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 n += 1;
             }
             sync()?;
-            println!("  codec, {chunk} frames a chunk behind 25: {:.2} ms a chunk", t.elapsed().as_secs_f64() * 1e3 / n as f64);
+            println!("  codec, {chunk} frames a chunk: {:.2} ms a chunk", t.elapsed().as_secs_f64() * 1e3 / n as f64);
         }
     }
     Ok(())

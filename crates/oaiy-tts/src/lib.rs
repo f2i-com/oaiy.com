@@ -82,8 +82,6 @@ pub struct SpeakOptions {
     pub first_chunk_frames: usize,
     /// Frames per chunk after that.
     pub chunk_frames: usize,
-    /// Earlier frames the codec decodes each chunk behind (the official 25).
-    pub context_frames: usize,
     /// Drop the silence the model sometimes opens with (up to a second), down
     /// to a tenth of a second, so speech starts sooner.
     pub trim_leading_silence: bool,
@@ -97,7 +95,6 @@ impl Default for SpeakOptions {
             max_seconds: 120.,
             first_chunk_frames: 1,
             chunk_frames: 2,
-            context_frames: codec::LEFT_CONTEXT,
             trim_leading_silence: true,
         }
     }
@@ -198,7 +195,7 @@ impl Tts {
             description: String::new(),
             language: "auto".into(),
             ref_text: "Hello.".into(),
-            ref_codes: vec![[0; 16]; self.options.context_frames.max(1)],
+            ref_codes: vec![[0; 16]; 8],
             speaker: vec![0.; self.width()],
         };
         let saved = self.options.clone();
@@ -241,6 +238,7 @@ impl Tts {
         let cached = self.voice_cache.as_ref().map(|dir| voice::cache_path(dir, &bytes, transcript, self.width()));
         if let Some(v) = cached.as_ref().and_then(|p| Voice::open(p).ok()) {
             if v.ref_text == transcript && v.speaker.len() == self.width() {
+                self.codec.prime(&v.ref_codes)?;
                 return Ok(v);
             }
         }
@@ -268,6 +266,9 @@ impl Tts {
             candle_core::bail!("the speaker encoder gives {} values but the talker takes {}", speaker.len(), self.width());
         }
         let ref_codes = enc.encode(clip)?;
+        // The codec's stream starts after the clip: work that out now, not on
+        // the voice's first line.
+        self.codec.prime(&ref_codes)?;
         self.dev.synchronize()?;
         Ok(Voice { name: String::new(), description: String::new(), language: "auto".into(), ref_text: transcript.trim().into(), ref_codes, speaker })
     }
@@ -297,7 +298,7 @@ impl Tts {
         let max_frames = ((o.max_seconds.min(2. + 0.6 * text_ids.len() as f64)) * talker::FRAMES_PER_SECOND).ceil() as usize;
         let mut g = self.talker.start(&prefill, Some(trailing), o.sampling.clone())?;
         report.prefill_seconds = started.elapsed().as_secs_f64();
-        let mut stream = codec::CodecStream::primed(o.context_frames, &voice.ref_codes);
+        let mut stream = codec::CodecStream::primed(&self.codec, &voice.ref_codes)?;
         let mut gate = LeadIn::new(o.trim_leading_silence);
         let mut pending: Vec<[u32; 16]> = Vec::new();
         let mut emit = |samples: Vec<f32>, report: &mut SpeakReport| {
