@@ -1264,18 +1264,20 @@ pub async fn serve(
             crate::voice::caller_from_events(&events, call)
         })
     };
-    tokio::spawn(crate::voice::serve_gateway(voice.clone()));
-    let voice_routes = crate::voice::app_router(voice);
+    let voice_routes = crate::voice::app_router(voice.clone());
     let bridge_routes = crate::bridge::bridge_router(bridge);
 
     // The AI gateway is its own sub-router with its own state (provider store +
     // registry clone), merged INSIDE the guard layers like the bridge — provider
     // CRUD and the credential-injecting chat proxy need the same origin/token gate.
-    let ai_routes = crate::ai::ai_router(crate::ai::AiState {
+    let ai_state = crate::ai::AiState {
         providers: ai_providers,
         registry: registry_for_ai,
         codex: ai_codex,
-    });
+    };
+    // Aokie's gateway (17872): calls, and a provider's chat for Aokie's own speech lanes.
+    tokio::spawn(crate::voice::serve_gateway(voice, crate::ai::provider_chat_router(ai_state.clone())));
+    let ai_routes = crate::ai::ai_router(ai_state);
 
     let app = Router::new()
         .route("/api/health", get(health))

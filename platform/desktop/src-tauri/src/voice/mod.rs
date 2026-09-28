@@ -373,20 +373,31 @@ async fn realtime(State(hub): State<VoiceHub>, Path(_provider): Path<String>, he
     ws.max_message_size(256 * 1024).on_upgrade(move |socket| call::run(socket, hub, engines))
 }
 
-pub fn gateway_router(hub: VoiceHub) -> Router {
+/// The gateway's routes: a call's realtime stream, and (`chat`, behind the same
+/// token) a provider's chat and models for Aokie's own speech lanes.
+pub fn gateway_router(hub: VoiceHub, chat: Router) -> Router {
     Router::new()
         .route("/api/health", get(|| async { Json(json!({"status": "ok", "product": "oaiy-gateway"})) }))
         .route("/api/ai/providers/:id/v1/realtime/stream", get(realtime))
         .with_state(hub)
+        .merge(chat.route_layer(axum::middleware::from_fn(require_gateway_token)))
+}
+
+/// The gateway token, for everything but the health check (the realtime stream checks it itself).
+async fn require_gateway_token(request: axum::extract::Request, next: axum::middleware::Next) -> axum::response::Response {
+    if !bearer_ok(request.headers()) {
+        return (StatusCode::UNAUTHORIZED, Json(json!({"error": {"code": "auth_required", "message": "the gateway token is required"}}))).into_response();
+    }
+    next.run(request).await
 }
 
 /// Serve the gateway on 127.0.0.1:17872 until the process ends (a port in use is logged, not fatal).
-pub async fn serve_gateway(hub: VoiceHub) {
+pub async fn serve_gateway(hub: VoiceHub, chat: Router) {
     let addr = SocketAddr::from(([127, 0, 0, 1], GATEWAY_PORT));
     match tokio::net::TcpListener::bind(addr).await {
         Ok(listener) => {
             log::info!("OAIY voice gateway listening on http://{addr}");
-            if let Err(e) = axum::serve(listener, gateway_router(hub)).await {
+            if let Err(e) = axum::serve(listener, gateway_router(hub, chat)).await {
                 log::error!("voice gateway stopped: {e}");
             }
         }
@@ -415,6 +426,24 @@ pub fn caller_from_events(events: &[Value], call: &str) -> Option<(String, Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A provider's chat on the gateway answers only with the gateway token.
+    #[tokio::test]
+    async fn the_gateways_chat_needs_its_token() {
+        let chat = Router::new()
+            .route("/api/ai/providers/:id/v1/models", get(|Path(id): Path<String>| async move { Json(json!({"provider": id})) }))
+            .route_layer(axum::middleware::from_fn(require_gateway_token));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, chat).await.unwrap() });
+        let url = format!("http://{addr}/api/ai/providers/studio/v1/models");
+        let client = reqwest::Client::new();
+        assert_eq!(client.get(&url).send().await.unwrap().status(), 401);
+        assert_eq!(client.get(&url).bearer_auth("wrong-token-wrong-token").send().await.unwrap().status(), 401);
+        let ok = client.get(&url).bearer_auth(gateway_token()).send().await.unwrap();
+        assert_eq!(ok.status(), 200);
+        assert_eq!(ok.json::<Value>().await.unwrap()["provider"], "studio");
+    }
 
     #[test]
     fn the_caller_is_found_by_call_id() {

@@ -20,7 +20,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use super::gateway::{self, GatewayError};
-use super::providers::{AiProviderInput, AiProviderPublic, Capability, Protocol, ProviderStoreHandle};
+use super::providers::{AiProvider, AiProviderInput, AiProviderPublic, Capability, Protocol, ProviderStoreHandle};
 use crate::services::registry::{RegistryHandle, ServiceStatus};
 
 /// Shared state for the AI router (mirrors `BridgeState`): the provider store
@@ -33,6 +33,58 @@ pub struct AiState {
     /// The ChatGPT connector: a managed `codex` CLI child that owns its own
     /// OAuth. Not in the provider store — it has no API key to hold.
     pub codex: super::codex::CodexHandle,
+}
+
+/// A provider's chat and model list, for the voice gateway on 17872 (behind its token):
+/// where Aokie's own speech lanes ask for a reply when they pick one of OAIY's
+/// providers (`provider:<id>`), as FormLogic's receptionist set them up.
+pub fn provider_chat_router(state: AiState) -> Router {
+    Router::new()
+        .route("/api/ai/providers/:id/v1/models", get(models_for))
+        .route("/api/ai/providers/:id/v1/chat/completions", post(chat_for))
+        .with_state(state)
+}
+
+/// OAIY's own engine, as a provider: its gateway, answering with the model chosen in
+/// Engines. Not in the store: it is there whenever the engines are, and follows them.
+pub const ENGINE_PROVIDER_ID: &str = "oaiy-engine";
+
+/// The engines' gateway and the model chosen in Engines, asked of the engines now
+/// (their control page's state gives the gateway, the gateway's discovery the model).
+async fn engine_now() -> Result<(String, String), String> {
+    let ui = crate::engines::ui_url().ok_or("OAIY's engines are not running")?;
+    let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(4)).build().map_err(|e| e.to_string())?;
+    let state: Value = client.get(format!("{}/api/state", ui.trim_end_matches('/'))).send().await.map_err(|e| format!("the engines did not answer: {e}"))?.json().await.map_err(|e| e.to_string())?;
+    let gateway = state.get("gateway_url").and_then(Value::as_str).filter(|g| !g.is_empty()).ok_or("the engines have no gateway yet")?.trim_end_matches('/').to_string();
+    let discovery: Value = client.get(format!("{gateway}/v1/discovery")).send().await.map_err(|e| format!("the engines' gateway did not answer: {e}"))?.json().await.map_err(|e| e.to_string())?;
+    Ok((gateway, chosen_model(&discovery)))
+}
+
+/// The model chosen in Engines, from the gateway's discovery: `defaults.llm`, else
+/// the language model marked default ("" when there is none).
+fn chosen_model(discovery: &Value) -> String {
+    discovery
+        .pointer("/defaults/llm")
+        .and_then(Value::as_str)
+        .or_else(|| discovery.pointer("/models/llm").and_then(Value::as_array).and_then(|m| m.iter().find(|m| m.get("default").and_then(Value::as_bool) == Some(true))).and_then(|m| m.get("id")).and_then(Value::as_str))
+        .unwrap_or("")
+        .to_string()
+}
+
+/// The engine as a provider record the gateway code can forward to.
+fn engine_provider(gateway: String, model: String) -> AiProvider {
+    AiProvider {
+        id: ENGINE_PROVIDER_ID.into(),
+        name: "OAIY engine".into(),
+        category: Some("LLM".into()),
+        protocol: Protocol::OpenAi,
+        base_url: gateway,
+        model: (!model.is_empty()).then_some(model),
+        capabilities: vec![Capability::Chat],
+        enabled: true,
+        allow_local: true,
+        api_key: None,
+    }
 }
 
 pub fn router(state: AiState) -> Router {
@@ -226,7 +278,18 @@ async fn chat_impl(st: &AiState, provider_id: Option<&str>, mut body: Value) -> 
         };
     }
     // Resolve the FULL provider under the lock, drop the guard before await.
-    let provider = {
+    let provider = if provider_id == Some(ENGINE_PROVIDER_ID) {
+        match engine_now().await {
+            // The engine answers with the model chosen in Engines: a model named here would load another.
+            Ok((gateway, model)) => {
+                if let Some(obj) = body.as_object_mut() {
+                    obj.remove("model");
+                }
+                Some(engine_provider(gateway, model))
+            }
+            Err(e) => return ai_error(StatusCode::SERVICE_UNAVAILABLE, "engine_unavailable", e),
+        }
+    } else {
         let store = st.providers.lock().unwrap_or_else(|e| e.into_inner());
         match provider_id {
             Some(id) => store.get_full(id).filter(|p| p.supports(Capability::Chat)),
@@ -298,7 +361,14 @@ async fn models_for(State(st): State<AiState>, Path(id): Path<String>) -> Respon
             Err(e) => ai_error(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()),
         };
     }
-    let provider = { st.providers.lock().unwrap_or_else(|e| e.into_inner()).get_full(&id) };
+    let provider = if id == ENGINE_PROVIDER_ID {
+        match engine_now().await {
+            Ok((gateway, model)) => Some(engine_provider(gateway, model)),
+            Err(e) => return ai_error(StatusCode::SERVICE_UNAVAILABLE, "engine_unavailable", e),
+        }
+    } else {
+        st.providers.lock().unwrap_or_else(|e| e.into_inner()).get_full(&id)
+    };
     let Some(p) = provider else {
         return ai_error(StatusCode::NOT_FOUND, "no_provider", format!("unknown provider {id:?}"));
     };
@@ -419,6 +489,23 @@ async fn list_ai_sources(State(st): State<AiState>) -> Response {
         }
     }
 
+    // ---- OAIY's own engine: the model chosen in Engines ----
+    if let Ok((gateway, model)) = engine_now().await {
+        sources.push(json!({
+            "id": format!("provider:{ENGINE_PROVIDER_ID}"),
+            "kind": "provider",
+            "providerId": ENGINE_PROVIDER_ID,
+            "name": if model.is_empty() { "OAIY engine".to_string() } else { format!("OAIY engine ({model})") },
+            "category": "LLM",
+            "status": "running",
+            "installed": true,
+            "url": format!("{gateway}/v1"),
+            "model": if model.is_empty() { Value::Null } else { json!(model) },
+            "capabilities": ["chat"],
+            "useCases": ["background", "forms", "flows", "live-call"],
+        }));
+    }
+
     // ---- configured PROVIDERS (public view — never the key) ----
     {
         let store = st.providers.lock().unwrap_or_else(|e| e.into_inner());
@@ -487,6 +574,16 @@ async fn list_ai_sources(State(st): State<AiState>) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_engine_answers_with_the_model_chosen_in_engines() {
+        assert_eq!(chosen_model(&json!({"defaults": {"llm": "Qwen3.8-Flash-Next"}})), "Qwen3.8-Flash-Next");
+        let listed = json!({"models": {"llm": [{"id": "a", "default": false}, {"id": "b", "default": true}]}});
+        assert_eq!(chosen_model(&listed), "b");
+        assert_eq!(chosen_model(&json!({})), "");
+        let p = engine_provider("http://127.0.0.1:8080".into(), "b".into());
+        assert_eq!((p.id.as_str(), p.model.as_deref(), p.allow_local), (ENGINE_PROVIDER_ID, Some("b"), true));
+    }
 
     #[test]
     fn a_realtime_upstream_does_not_advertise_a_realtime_gateway_that_is_not_implemented() {

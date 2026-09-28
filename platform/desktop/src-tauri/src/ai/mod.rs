@@ -20,4 +20,4 @@ pub mod tunnel;
 
 pub use codex::{CodexHandle, CODEX_PROVIDER_ID};
 pub use providers::{open_handle, ProviderStoreHandle};
-pub use routes::{router as ai_router, AiState};
+pub use routes::{provider_chat_router, router as ai_router, AiState};
