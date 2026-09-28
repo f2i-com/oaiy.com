@@ -22,7 +22,9 @@ const { servicesMock, pluginsMock, providersMock, pairedMock, statusMock, nodeIn
 const calendarMock = vi.hoisted(() => vi.fn());
 const syncMock = vi.hoisted(() => vi.fn());
 const linkMock = vi.hoisted(() => vi.fn());
+const modulesMock = vi.hoisted(() => vi.fn());
 vi.mock('./api', () => ({
+  modules: { list: (...a: unknown[]) => modulesMock(...a) },
   services: { list: servicesMock },
   plugins: { list: pluginsMock },
   aiProviders: { list: providersMock },
@@ -40,6 +42,21 @@ vi.mock('./api', () => ({
 
 import OverviewPanel from './OverviewPanel';
 import { invalidate, peek } from './useCached';
+import { resetModules } from './useModules';
+
+/** The desktop's modules: the phone and the calendar on or off. */
+const modulesOn = (phone: boolean, calendar: boolean) => ({
+  snapshot: {
+    revision: 1,
+    modules: [
+      { id: 'phone', name: 'Phone', enabled: phone, builtin: true, provider: null },
+      { id: 'calendar', name: 'Calendar', enabled: calendar, builtin: true, provider: null },
+    ],
+    contributions: {},
+    warnings: [],
+  },
+  etag: '"1-x"',
+});
 import { dismissGuide, reopenGuide } from './setupGuide';
 
 const runtime = (failed: number) => ({
@@ -82,6 +99,8 @@ beforeEach(() => {
   calendarMock.mockRejectedValue(new Error('no calendar'));
   syncMock.mockRejectedValue(new Error('no calendar'));
   linkMock.mockResolvedValue({ linked: false, attempt: { phase: 'idle' }, available: [] });
+  resetModules();
+  modulesMock.mockResolvedValue(modulesOn(true, true));
   host = document.createElement('div');
   document.body.appendChild(host);
   root = createRoot(host);
@@ -94,14 +113,15 @@ afterEach(() => {
 });
 
 describe("Today's tiles", () => {
-  it('shows the phone and its calendar only while the phone receptionist is installed', async () => {
+  it('shows the phone and its calendar only while a plugin provides them', async () => {
     calendarMock.mockResolvedValue({ available: true, settings: {}, appointments: [], now: '' });
     await mount();
     expect(text()).toContain('The phone');
     expect(text()).toContain('Next appointment');
     act(() => root.unmount());
     root = createRoot(host);
-    calendarMock.mockResolvedValue({ available: false, settings: {}, appointments: [], now: '' });
+    resetModules();
+    modulesMock.mockResolvedValue(modulesOn(false, false));
     await mount();
     expect(text()).not.toContain('The phone');
     expect(text()).not.toContain('Next appointment');

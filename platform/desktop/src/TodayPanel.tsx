@@ -2,13 +2,15 @@ import { useCallback, useEffect, useState } from 'react';
 import { CalendarClock, Cloud, CloudOff, Cpu, Inbox, Phone } from 'lucide-react';
 import { calendar, engines, link, phone, type Appointment, type CalendarSync, type EnginesStatus, type LinkStatus } from './api';
 import { describeSync } from './syncStatus';
+import { moduleOn, useModules } from './useModules';
 
 /**
  * Today, at the top of Overview: whether the phone is connected (and a call
  * live), whether the language model is loaded, the next appointments, the
  * requests waiting for someone to confirm them, and, when linked, how this
  * desktop stands with FormLogic (everything here works without it). Each tile
- * opens its page.
+ * opens its page. The phone's tile and the calendar's are there (and asked
+ * about) only while a plugin provides them.
  */
 
 const POLL_MS = 10_000;
@@ -32,23 +34,33 @@ export default function TodayPanel({ onNavigate }: { onNavigate: (view: 'agent' 
   const [phoneState, setPhoneState] = useState<{ connected: boolean; onCall: boolean } | null>(null);
   const [model, setModel] = useState<EnginesStatus | null>(null);
   const [upcoming, setUpcoming] = useState<Appointment[] | null>(null);
-  /** The phone receptionist is installed: the phone and its calendar are shown. */
-  const [receptionist, setReceptionist] = useState(true);
   const [sync, setSync] = useState<CalendarSync | null>(null);
   const [linked, setLinked] = useState<LinkStatus | null>(null);
+  /** The phone and the calendar, while a plugin provides them. */
+  const modules = useModules();
+  const phoneOn = moduleOn(modules, 'phone') === true;
+  const calendarOn = moduleOn(modules, 'calendar') === true;
 
   const refresh = useCallback(async () => {
-    const [p, calls, e, cal, s, l] = await Promise.allSettled([phone.status(), phone.calls(), engines.status(), calendar.get(ymd(new Date())), calendar.syncStatus(), link.status()]);
+    const off = Promise.reject(new Error('off'));
+    off.catch(() => {});
+    const [p, calls, e, cal, s, l] = await Promise.allSettled([
+      phoneOn ? phone.status() : off,
+      phoneOn ? phone.calls() : off,
+      engines.status(),
+      calendarOn ? calendar.get(ymd(new Date())) : off,
+      calendarOn ? calendar.syncStatus() : off,
+      link.status(),
+    ]);
     setPhoneState(p.status === 'fulfilled' ? { connected: p.value.connected, onCall: calls.status === 'fulfilled' && calls.value.length > 0 } : null);
     setModel(e.status === 'fulfilled' ? e.value : null);
     if (cal.status === 'fulfilled') {
-      setReceptionist(cal.value.available !== false);
       const now = `${ymd(new Date())}T${pad(new Date().getHours())}:${pad(new Date().getMinutes())}`;
       setUpcoming(cal.value.appointments.filter((a) => (a.status === 'confirmed' || a.status === 'requested') && a.start >= now));
     }
     setSync(s.status === 'fulfilled' ? s.value : null);
     setLinked(l.status === 'fulfilled' ? l.value : null);
-  }, []);
+  }, [phoneOn, calendarOn]);
   const formlogic = describeSync(sync, linked);
 
   useEffect(() => {
@@ -70,7 +82,7 @@ export default function TodayPanel({ onNavigate }: { onNavigate: (view: 'agent' 
         <h3 className="section-title">Today</h3>
       </div>
       <div className="overview-grid today-grid">
-        {receptionist && (
+        {phoneOn && (
           <button className="overview-tile" onClick={() => onNavigate('agent')} title="Calls and texts are answered by the agent">
             <Phone size={16} aria-hidden />
             <strong className={phoneState?.connected ? 'ok' : 'warn'}>{phoneState === null ? '—' : phoneState.onCall ? 'On a call' : phoneState.connected ? 'Connected' : 'Not connected'}</strong>
@@ -82,7 +94,7 @@ export default function TodayPanel({ onNavigate }: { onNavigate: (view: 'agent' 
           <strong className={llm?.state === 'ready' ? 'ok' : undefined}>{model === null ? '—' : !model.running ? 'Engines off' : llm?.state === 'ready' ? 'Model ready' : llm?.state === 'loading' ? 'Loading…' : 'Loads on use'}</strong>
           <small>{llm?.resident ?? 'Language model'}</small>
         </button>
-        {receptionist && (
+        {calendarOn && (
           <>
             <button className="overview-tile" onClick={() => onNavigate('calendar')} title="The next appointment">
               <CalendarClock size={16} aria-hidden />

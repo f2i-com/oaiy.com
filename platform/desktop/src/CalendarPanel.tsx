@@ -3,6 +3,7 @@ import { CalendarPlus, Check, ChevronLeft, ChevronRight, MessageSquare, Phone, P
 import { calendar, voices, type Appointment, type AppointmentStatus, type CalendarService, type CalendarSettings, type CalendarSync, type NewAppointment, type VoiceClip } from './api';
 import { useToast } from './Toasts';
 import { describeSync } from './syncStatus';
+import { moduleOn, useModules } from './useModules';
 
 /**
  * The calendar: the week's appointments, the requests waiting for someone to
@@ -58,6 +59,7 @@ function badgeFor(s: AppointmentStatus): string {
 const SOURCE_LABEL: Record<string, string> = { call: 'a call', text: 'a text', agent: 'the agent', manual: 'here', formlogic: 'FormLogic' };
 
 export default function CalendarPanel() {
+  const phoneOn = moduleOn(useModules(), 'phone') === true;
   const toast = useToast();
   const [tab, setTab] = useState<Tab>('week');
   const [week, setWeek] = useState(() => mondayOf(new Date()));
@@ -272,7 +274,8 @@ export default function CalendarPanel() {
               void refresh();
             }}
           />
-          <CallVoice business={settings.business} />
+          {/* The voice calls are answered in: only while there is a phone (a plugin provides it). */}
+          {phoneOn && <CallVoice business={settings.business} />}
         </>
       )}
 

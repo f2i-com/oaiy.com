@@ -400,6 +400,51 @@ export interface PluginsSnapshot {
   scan: { added: number; unchanged: number; invalid: number };
 }
 
+// ----- modules (the parts of OAIY a plugin brings: the phone, the calendar) -----
+
+/** One module as `GET /api/modules` reports it. */
+export interface ModuleRecord {
+  id: string;
+  name: string;
+  /** On while a plugin provides it (a crashed or stopped provider keeps it on). */
+  enabled: boolean;
+  builtin: boolean;
+  /** Why it is off. */
+  reason?: string;
+  provider: { pluginId: string; name: string; state: PluginState; connector?: string; declared: boolean } | null;
+  leases?: string[];
+  uses?: string[];
+  store?: string[];
+}
+
+export interface ModulesSnapshot {
+  /** Moves only when something here changes (it is the ETag). */
+  revision: number;
+  modules: ModuleRecord[];
+  contributions: Record<string, unknown>;
+  warnings: string[];
+}
+
+export const modules = {
+  /** The snapshot and its ETag; `null` when it has not changed since `etag` (304). */
+  list: async (etag?: string | null): Promise<{ snapshot: ModulesSnapshot; etag: string | null } | null> => {
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), 15000);
+    try {
+      const resp = await fetch(`${API_BASE}/api/modules`, {
+        headers: etag ? { 'If-None-Match': etag } : {},
+        cache: 'no-store',
+        signal: ac.signal,
+      });
+      if (resp.status === 304) return null;
+      if (!resp.ok) throw new Error(`${resp.status}: ${resp.statusText}`);
+      return { snapshot: (await resp.json()) as ModulesSnapshot, etag: resp.headers.get('ETag') };
+    } finally {
+      clearTimeout(timer);
+    }
+  },
+};
+
 // ----- pairing (a consumer earning a bearer token) -----
 
 export interface PendingPairing {

@@ -27,6 +27,7 @@ import {
   type LucideIcon,
 } from 'lucide-react';
 import { API_BASE, openExternal, phone as phoneApi, plugins as pluginsApi } from './api';
+import { moduleOn, useModules } from './useModules';
 import { applyTheme, initialTheme, THEME_LABEL, type ThemeMode } from './theme';
 import ServicesPanel from './ServicesPanel';
 import ModelsPanel from './ModelsPanel';
@@ -227,8 +228,12 @@ export default function App() {
   const [view, setView] = useState<View>('overview');
   /** Nav entries contributed by installed plugins (`manifest.ui.nav[]`). */
   const [pluginNav, setPluginNav] = useState<PluginNavEntry[]>([]);
-  /** The phone receptionist (the Aokie plugin) is installed: the calendar is its diary. `null` until known. */
-  const [receptionist, setReceptionist] = useState<boolean | null>(null);
+  /** The plugins have been listed once (until then an empty nav says nothing). */
+  const [pluginNavKnown, setPluginNavKnown] = useState(false);
+  /** The phone and the calendar are there while a plugin provides them (Aokie, the AI Receptionist). `null` until known. */
+  const modules = useModules();
+  const phoneOn = moduleOn(modules, 'phone');
+  const calendarOn = moduleOn(modules, 'calendar');
   /** Views already opened this session — they skip the entrance animation. */
   const visited = useRef<Set<string>>(new Set()).current;
   /** The tab each section was last on, so the sidebar brings you back to it. */
@@ -305,8 +310,13 @@ export default function App() {
   }, []);
 
   // A call going on now: the Agent's nav entry says so (the Agent page shows the call itself).
+  // Asked only while there is a phone.
   const [onCall, setOnCall] = useState(false);
   useEffect(() => {
+    if (phoneOn !== true) {
+      setOnCall(false);
+      return;
+    }
     let cancelled = false;
     const look = async () => {
       try {
@@ -322,7 +332,7 @@ export default function App() {
       cancelled = true;
       window.clearInterval(id);
     };
-  }, []);
+  }, [phoneOn]);
 
   // Plugins can contribute sidebar entries that open a screen they ship. Polled
   // (not one-shot) so installing or removing a plugin updates the nav without a
@@ -334,7 +344,8 @@ export default function App() {
         const snap = await pluginsApi.list();
         if (cancelled) return;
         const entries: PluginNavEntry[] = [];
-        for (const p of snap.plugins) {
+        // A plugin turned off contributes nothing (its screens come back with it).
+        for (const p of snap.plugins.filter((p) => !p.userDisabled)) {
           const ui = (p.manifest as unknown as { ui?: { nav?: Array<Record<string, string>> } } | undefined)?.ui;
           for (const n of ui?.nav ?? []) {
             if (n.id && n.label) {
@@ -350,7 +361,7 @@ export default function App() {
           }
         }
         setPluginNav(entries);
-        setReceptionist(snap.plugins.some((p) => p.id === 'aokie'));
+        setPluginNavKnown(true);
       } catch {
         /* the Plugins panel surfaces the error; the nav just stays as it was */
       }
@@ -363,20 +374,20 @@ export default function App() {
     };
   }, []);
 
-  // The calendar goes with the phone receptionist: on it when that is removed, go to Overview.
+  // The calendar is there while a plugin provides it: on it when it goes, go to Overview.
   useEffect(() => {
-    if (view === 'calendar' && receptionist === false) setView('overview');
-  }, [view, receptionist]);
+    if (view === 'calendar' && calendarOn === false) setView('overview');
+  }, [view, calendarOn]);
 
   // A plugin screen the user is on can disappear (plugin removed/disabled) —
   // fall back to Overview rather than rendering a dead page.
   useEffect(() => {
     if (!view.startsWith('plugin:')) return;
     const [, pluginId, navId] = view.split(':');
-    if (pluginNav.length > 0 && !pluginNav.some((n) => n.pluginId === pluginId && n.navId === navId)) {
+    if (pluginNavKnown && !pluginNav.some((n) => n.pluginId === pluginId && n.navId === navId)) {
       setView('overview');
     }
-  }, [view, pluginNav]);
+  }, [view, pluginNav, pluginNavKnown]);
 
   // Mark AFTER render: the first open of a view still animates, a return does not.
   // A plugin screen once opened loses its "New" badge.
@@ -419,7 +430,7 @@ export default function App() {
       };
   const tabbed = section && section.tabs.length > 1 ? section : null;
   const embedded = EMBEDDED.has(view);
-  const visibleSections = SECTIONS.filter((s) => s.id !== 'calendar' || receptionist === true);
+  const visibleSections = SECTIONS.filter((s) => s.id !== 'calendar' || calendarOn === true);
 
   const navButton = (s: Section) => {
     const Icon = s.icon;

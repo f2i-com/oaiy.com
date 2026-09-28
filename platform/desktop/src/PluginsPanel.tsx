@@ -20,6 +20,7 @@ import {
   serviceDefinitions,
   type ServiceDefinition,
 } from './api';
+import { refetchModules } from './useModules';
 import { peek, put } from './useCached';
 import { useToast } from './Toasts';
 import LogsViewer from './LogsViewer';
@@ -128,6 +129,8 @@ export default function PluginsPanel() {
       setPending((s) => new Set(s).add(id));
       try {
         await fn();
+        // Turning a plugin on or off, or removing it, can bring or take the phone and the calendar.
+        void refetchModules();
         await refresh();
       } catch (e) {
         toast.push({
@@ -162,6 +165,7 @@ export default function PluginsPanel() {
         body: 'Click Start to run it.',
       });
       setInstallSource('');
+      void refetchModules();
       await refresh();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));

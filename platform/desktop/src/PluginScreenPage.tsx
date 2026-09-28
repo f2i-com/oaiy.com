@@ -8,9 +8,11 @@ import {
   plugins,
   voices,
   type CompanionOfferRequest,
+  type ModulesSnapshot,
   type PluginRecord,
 } from './api';
 import { useToast } from './Toasts';
+import { moduleOn, useModules } from './useModules';
 
 /**
  * Host for a plugin-contributed screen.
@@ -33,6 +35,16 @@ export type PluginNavTarget = (typeof PLUGIN_NAV_TARGETS)[number];
 
 export function isPluginNavTarget(value: unknown): value is PluginNavTarget {
   return typeof value === 'string' && (PLUGIN_NAV_TARGETS as readonly string[]).includes(value);
+}
+
+/** The pages that are there only while their module is (a plugin provides it). */
+const TARGET_MODULE: Partial<Record<PluginNavTarget, string>> = { calendar: 'calendar' };
+
+/** May a plugin screen open `value` now: one of the pages, and not one whose module is off (or not yet known)? */
+export function pluginNavAllowed(value: unknown, modules: ModulesSnapshot | null): value is PluginNavTarget {
+  if (!isPluginNavTarget(value)) return false;
+  const module = TARGET_MODULE[value];
+  return !module || moduleOn(modules, module) === true;
 }
 
 /** What OAIY answers calls with, for a plugin screen to show: the voice
@@ -259,6 +271,10 @@ function PluginScreenContent({ pluginId, navId, onNavigate }: Props) {
   // message pump (handleCall depends on nothing that changes per render).
   const navigateRef = useRef(onNavigate);
   navigateRef.current = onNavigate;
+  // Which pages may be opened depends on the modules on now (the calendar only while there is one).
+  const modules = useModules();
+  const modulesRef = useRef(modules);
+  modulesRef.current = modules;
   const [record, setRecord] = useState<PluginRecord | null | undefined>(undefined);
   // The manifest selects and assembles the iframe once. Runtime status changes
   // separately so a health refresh cannot remount a call console or transcript.
@@ -419,7 +435,7 @@ function PluginScreenContent({ pluginId, navId, onNavigate }: Props) {
         case 'navigate': {
           const [target] = args as [unknown];
           const go = navigateRef.current;
-          if (!go || !isPluginNavTarget(target)) throw new Error('That page cannot be opened from a plugin screen.');
+          if (!go || !pluginNavAllowed(target, modulesRef.current)) throw new Error('That page cannot be opened from a plugin screen.');
           go(target);
           return true;
         }

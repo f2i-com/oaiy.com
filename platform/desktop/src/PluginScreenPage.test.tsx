@@ -7,8 +7,8 @@
 // `data-theme` on ITS OWN document, and nothing ever crossed the frame
 // boundary, so the plugin screens rendered light under every theme.
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { HOST_BOOTSTRAP, isPluginNavTarget, pluginAiSources, pluginFontCss, pluginOaiyStatus } from './PluginScreenPage';
-import { API_BASE, engines, voices } from './api';
+import { HOST_BOOTSTRAP, isPluginNavTarget, pluginAiSources, pluginFontCss, pluginNavAllowed, pluginOaiyStatus } from './PluginScreenPage';
+import { API_BASE, engines, voices, type ModulesSnapshot } from './api';
 
 describe('plugin AI source gateway routes', () => {
   it('uses the configured host API for provider selections and preserves their metadata', () => {
@@ -143,6 +143,25 @@ describe('plugin screen navigation and OAIY status', () => {
     expect(isPluginNavTarget('settings')).toBe(false);
     expect(isPluginNavTarget('plugin:aokie:receptionist')).toBe(false);
     expect(isPluginNavTarget(undefined)).toBe(false);
+  });
+
+  it("refuses navigate('calendar') while the calendar is off (or not yet known)", () => {
+    const modules = (calendar: boolean): ModulesSnapshot => ({
+      revision: 1,
+      modules: [
+        { id: 'phone', name: 'Phone', enabled: true, builtin: true, provider: null },
+        { id: 'calendar', name: 'Calendar', enabled: calendar, builtin: true, provider: null },
+      ],
+      contributions: {},
+      warnings: [],
+    });
+    expect(pluginNavAllowed('calendar', modules(true))).toBe(true);
+    expect(pluginNavAllowed('calendar', modules(false))).toBe(false);
+    expect(pluginNavAllowed('calendar', null)).toBe(false);
+    // The core pages are there whatever the modules.
+    expect(pluginNavAllowed('agent', modules(false))).toBe(true);
+    expect(pluginNavAllowed('engines', null)).toBe(true);
+    expect(pluginNavAllowed('settings', modules(true))).toBe(false);
   });
 
   it('reads the chosen call voice and the engines model, and keeps one when the other fails', async () => {

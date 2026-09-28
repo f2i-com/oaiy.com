@@ -75,10 +75,10 @@ interface OverviewCard {
   };
 }
 
-/** The `ui.overview` cards a plugin contributes, paired with the plugin itself. */
+/** The `ui.overview` cards a plugin contributes, paired with the plugin itself (none from one turned off). */
 function overviewCards(list: PluginRecord[]): Array<{ plugin: PluginRecord; card: OverviewCard }> {
   const out: Array<{ plugin: PluginRecord; card: OverviewCard }> = [];
-  for (const p of list) {
+  for (const p of list.filter((p) => !p.userDisabled)) {
     const ui = (p.manifest as unknown as { ui?: { overview?: OverviewCard[] } } | undefined)?.ui;
     for (const card of ui?.overview ?? []) out.push({ plugin: p, card });
   }
