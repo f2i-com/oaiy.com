@@ -5,7 +5,7 @@
  * (`flow_list`, `flow_read`), writes one (`flow_write`, checked against the
  * node types and laid out so the editor shows it tidily), and runs one
  * (`flow_run`, its inputs by their labels). A flow written with `tool` becomes
- * one of the agent's tools, as one made a tool in the editor does.
+ * one of the agent's tools at once, as one made a tool in the editor does.
  */
 import type { SessionTool } from '../agent/agent';
 import type { Desktop } from './bridge';
@@ -132,7 +132,12 @@ function connected(desktop: () => Desktop | null): Desktop {
 
 const slug = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 60) || 'flow';
 
-export function flowBuilderTools(desktop: () => Desktop | null): SessionTool[] {
+/**
+ * `toolsChanged`: looks at the flows made tools again, so a flow written as a
+ * tool is one of the agent's at its next step (not only at the next minute's
+ * look).
+ */
+export function flowBuilderTools(desktop: () => Desktop | null, toolsChanged: () => Promise<void> = async () => {}): SessionTool[] {
   return [
     {
       spec: {
@@ -190,7 +195,9 @@ export function flowBuilderTools(desktop: () => Desktop | null): SessionTool[] {
         const tool = isRecord(input.tool) && typeof input.tool.name === 'string' ? { name: input.tool.name, description: String(input.tool.description ?? '') } : null;
         await connected(desktop).putFlow(id, { name, ...(tool ? { oaiyTool: tool } : {}), nodes: layOut(nameTemplateInputs(nodes, edges), edges), edges }, signal);
         const inputs = nodes.filter((n) => n.type.startsWith('input_')).map((n) => String(n.data.label ?? n.id));
-        return `Wrote flow ${id} ("${name}"): ${nodes.length} nodes, ${edges.length} edges${inputs.length ? `; its inputs: ${inputs.join(', ')}` : ''}. It is in the flow editor now${tool ? `, and ${tool.name} becomes one of your tools within a minute` : ''}. Run it with flow_run.`;
+        // A tool: it is the agent's from its next step.
+        if (tool) await toolsChanged().catch(() => {});
+        return `Wrote flow ${id} ("${name}"): ${nodes.length} nodes, ${edges.length} edges${inputs.length ? `; its inputs: ${inputs.join(', ')}` : ''}. It is in the flow editor now${tool ? `, and ${tool.name} is one of your tools from your next step` : ''}. Run it with flow_run.`;
       },
     },
     {

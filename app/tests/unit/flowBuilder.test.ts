@@ -61,11 +61,15 @@ describe('the agent builds flows', () => {
       flow: async () => ({ name: 'Greet a person', ...greeting }),
       runFlow: async (_id: string, input: Record<string, unknown>) => ({ status: 'succeeded', output: { engine: 'zipp', output: `Hello ${String(input.person)}!` } }),
     } as unknown as Desktop;
-    const tools = Object.fromEntries(flowBuilderTools(() => desktop).map((t) => [t.spec.name, t]));
+    let looked = 0;
+    const tools = Object.fromEntries(flowBuilderTools(() => desktop, async () => void looked++).map((t) => [t.spec.name, t]));
     expect(Object.keys(tools)).toEqual(['flow_nodes', 'flow_list', 'flow_read', 'flow_write', 'flow_run']);
     expect(await tools.flow_nodes.run({ types: ['template'] }, signal)).toContain('template — ');
     const out = await tools.flow_write.run({ name: 'Greet a person', ...greeting, tool: { name: 'greet', description: 'Greets someone' } }, signal);
     expect(out).toContain('Wrote flow greet-a-person ("Greet a person"): 3 nodes, 2 edges; its inputs: person');
+    // Made a tool: the agent's tools are looked at again at once.
+    expect(out).toContain('greet is one of your tools from your next step');
+    expect(looked).toBe(1);
     const [id, doc] = stored[0];
     expect(id).toBe('greet-a-person');
     expect(doc.oaiyTool).toEqual({ name: 'greet', description: 'Greets someone' });

@@ -337,7 +337,7 @@ async function main(): Promise<void> {
   const optionsFor = (place: () => OpenProject, withPreview: boolean) => {
     const transcribe = transcribeTool(() => place().vfs, () => desktop);
     const calendar = calendarTools(() => desktop);
-    const flowBuilder = flowBuilderTools(() => desktop);
+    const flowBuilder = flowBuilderTools(() => desktop, () => refreshFlowTools());
     const phone = [phoneConversationsTool(() => sessions), callerNotesTool(() => sessions), tellAgentTool(() => sessions)];
     // The project's own agent in the Front desk is the phone's runner.
     const runner = () => withPreview && place() === frontDesk;
