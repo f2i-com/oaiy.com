@@ -257,7 +257,9 @@ pub fn document(studio: &Studio, base: &str, authorized: bool) -> Json {
                 ("format", Json::str("glb")),
                 ("resolutions", Json::Arr(vec![Json::Int(1024), Json::Int(1536)])),
                 ("faces", Json::Int(int_or(&m, "faces", crate::model3d::DEFAULT_FACES))),
-                ("input", Json::str("a picture of one object on a plain or transparent background")),
+                ("input", Json::str(if has("matte") { "a picture of one object; its background is removed" } else { "a picture of one object on a plain or transparent background" })),
+                ("removes_background", Json::Bool(has("matte"))),
+                ("upscales", Json::Bool(has("upscaler"))),
                 ("ready", Json::Bool(has("path") && has("dino") && has("naf"))),
                 ("license", Json::str("MIT (Pixal3D); DINOv3 under Meta's DINOv3 License")),
             ])

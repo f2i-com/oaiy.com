@@ -735,7 +735,7 @@ dialog::backdrop { background: var(--backdrop); }
             <button class="btn" id="add-detect">Check</button>
           </div>
           <div id="add-result"></div>
-          <p class="muted small" style="margin:0">Reads GGUF (LLMs, Qwen Image, vision projectors), safetensors (SDXL, Qwen Image, LTX 2.3/2.5, Sulphur, LoRA adapters, text encoders, VAEs), diffusers and EXL3/DeepSeek folders, Pixal3D and DINOv3 folders (3D models), and tokenizer.json. Pickled .bin/.pt files are refused because loading them can run code; NAF's naf_release.pth is the one exception, read by nrob's own reader, which runs nothing from the file.</p>
+          <p class="muted small" style="margin:0">Reads GGUF (LLMs, Qwen Image, vision projectors), safetensors (SDXL, Qwen Image, LTX 2.3/2.5, Sulphur, LoRA adapters, text encoders, VAEs), diffusers and EXL3/DeepSeek folders, Pixal3D and DINOv3 folders (3D models), and tokenizer.json. Pickled .bin/.pt files are refused because loading them can run code; NAF's naf_release.pth and Real-ESRGAN's RealESRGAN_x4plus.pth are the exceptions, read by nrob's own reader, which runs nothing from the file.</p>
         </div>
       </div>
       <div class="block">
@@ -1135,7 +1135,8 @@ $("#pick-path").onkeydown = e => { if (e.key === "Enter") browse($("#pick-path")
 /* ---------- add model ---------- */
 const kindName = {llm: "Language model", image: "Image model", video: "Video model", vision_projector: "Vision projector", adapter: "LoRA adapter", image_base: "Qwen Image base folder",
   text_encoder: "Image text encoder", video_text_encoder: "Video text encoder", vae: "VAE", audio_vae: "Audio VAE", tokenizer: "Gemma tokenizer", clip_tokenizer: "CLIP tokenizer", ffmpeg: "FFmpeg", sound_model: "Sound effect model", speech_breeze: "Speech model",
-  model3d: "3D model", model3d_dino: "3D model part: DINOv3", model3d_naf: "3D model part: NAF"};
+  model3d: "3D model", model3d_dino: "3D model part: DINOv3", model3d_naf: "3D model part: NAF",
+  model3d_matte: "3D model part: BiRefNet (background removal)", model3d_upscaler: "3D model part: Real-ESRGAN (upscaler)"};
 async function detectPath() {
   const path = $("#add-path").value.trim(); if (!path) return;
   const out = $("#add-result");
@@ -1271,9 +1272,11 @@ function renderModels() {
     const miss = missingOf("model3d", m);
     const fields = field("Pixal3D folder (MIT)", "model3d", name, "path", m.path, {dir: true, missing: miss.includes("path")})
       + field("DINOv3 ViT-L/16 folder (Meta's DINOv3 License)", "model3d", name, "dino", m.dino, {dir: true, missing: miss.includes("dino")})
-      + field("NAF weights (naf_release.pth, Apache-2.0)", "model3d", name, "naf", m.naf, {missing: miss.includes("naf")});
+      + field("NAF weights (naf_release.pth, Apache-2.0)", "model3d", name, "naf", m.naf, {missing: miss.includes("naf")})
+      + field("BiRefNet folder: removes the background (optional, MIT)", "model3d", name, "matte", m.matte, {dir: true})
+      + field("Real-ESRGAN weights: enlarges small pictures (optional, RealESRGAN_x4plus.pth, BSD-3-Clause)", "model3d", name, "upscaler", m.upscaler, {});
     return mediaItem("model3d", name, m, "Pixal3D", miss, fields);
-  }).join("") : '<div class="empty">No 3D model yet. Add the Pixal3D folder; the DINOv3 ViT-L/16 folder and NAF\'s naf_release.pth are found when they sit beside it, or add them after.</div>';
+  }).join("") : '<div class="empty">No 3D model yet. Add the Pixal3D folder; the DINOv3 ViT-L/16 folder, NAF\'s naf_release.pth, BiRefNet and Real-ESRGAN are found when they sit beside it, or add them after.</div>';
 
   const vid = Object.entries(cfg.media.video.models);
   $("#m-video").innerHTML = vid.length ? vid.map(([name, m]) => {
@@ -2021,7 +2024,8 @@ function addModel3d(job) {
   const input = fileUrl(`/api/play/model3d/${job.id}/input`), glb = fileUrl(`/api/play/model3d/${job.id}/content`);
   const rows = [["Faces", job.faces?.toLocaleString()], ["Vertices", job.vertices?.toLocaleString()], ["Size", job.bytes ? fmtSize(job.bytes) : null],
     ["Took", job.seconds_taken ? job.seconds_taken.toFixed(0) + " s" : null], ["Resolution", job.resolution], ["Seed", job.seed],
-    ["Background", job.matte === "alpha" ? "the picture's own transparency" : job.matte === "background" ? "cut away" : null]].filter(([, v]) => v !== null && v !== undefined && v !== "");
+    ["Background", job.matte === "alpha" ? "the picture's own transparency" : job.matte === "birefnet" ? "removed (BiRefNet)" : job.matte === "background" ? "cut away" : null],
+    ["Enlarged", Array.isArray(job.upscaled) && job.upscaled[0] < job.upscaled[1] ? `${job.upscaled[0]} to ${job.upscaled[1]} px (Real-ESRGAN)` : null]].filter(([, v]) => v !== null && v !== undefined && v !== "");
   const el = document.createElement("div"); el.className = "sp-item m3d-item";
   el.innerHTML = `<img src="${esc(input)}" alt="The picture, cut out">
     <div style="display:grid;gap:10px"><dl>${rows.map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join("")}</dl>

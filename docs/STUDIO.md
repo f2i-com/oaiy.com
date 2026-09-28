@@ -56,8 +56,9 @@ The console accepts `status`, `start`, `stop`, `open`, `jobs` and `quit`.
     (see [Speech](SPEECH.md)). Music composes a song from lyrics and a
     description, or an instrumental (see [Music](MUSIC.md)). Sound makes a
     sound effect from a description (see [Sound effects](SOUND.md)). 3D makes
-    a textured GLB from a dropped picture of an object, and shows the picture as
-    it was cut out (see [3D models](MODEL3D.md)).
+    a textured GLB from a dropped picture of an object. It shows the object as it
+    was cut out (its background removed by BiRefNet, and a small picture enlarged
+    by Real-ESRGAN, when the model has them). See [3D models](MODEL3D.md).
     Video comes with sound when the model has its audio VAE. Its
     **Soundtrack** choice can turn the sound off. It can also make the clip
     follow speech in a saved or described voice, or an audio file. Start and
@@ -112,7 +113,9 @@ headers, never its weights, and decides what it is:
 | MOSS-SoundEffect folder | `model_index.json` `MossSoundEffectPipeline` | a sound effects model |
 | Pixal3D folder | `pipeline.json` `Trellis2ImageTo3DPipeline`, with `ckpts/` | a 3D model ([3D models](MODEL3D.md)); its DINOv3 and NAF parts are found beside it |
 | DINOv3 ViT-L/16 folder | `config.json` `model_type: dinov3_vit` | the image encoder of a 3D model |
-| `naf_release.pth` | its name | the feature upsampler of a 3D model (the one pickle accepted: read as tensors only) |
+| `naf_release.pth` | its name | the feature upsampler of a 3D model (read as tensors only) |
+| BiRefNet folder | `config.json` `architectures: ["BiRefNet"]` | a 3D model's background removal (optional) |
+| `RealESRGAN_x4plus.pth` | its name | a 3D model's upscaler (optional; read as tensors only) |
 | MiniMax-Music3 folder | `config.json` `model_type: minimax_music3` | a music model |
 | smaller music language model | GGUF `general.architecture: music3-lm` | the music model's `language_model` |
 | LTX audio VAE | `audio_vae.*` with `vocoder.bwe_generator.*` | the optional audio VAE of every video model that lacks one (LTX 2.3 and Sulphur checkpoints are their own) |
@@ -122,7 +125,8 @@ headers, never its weights, and decides what it is:
 | EXL3 / DeepSeek folders | `config.json` | a language model |
 
 Pickled `.bin`, `.pt` and `.ckpt` files are refused, because loading them can run code
-(NAF's `naf_release.pth` is the exception: nrob reads only its tensors).
+(NAF's `naf_release.pth` and Real-ESRGAN's `RealESRGAN_x4plus.pth` are the exceptions:
+nrob reads only their tensors).
 
 A model that still needs a part is added **disabled** and marked with what it
 needs. The studio fills parts itself where it can:

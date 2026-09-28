@@ -134,8 +134,8 @@ pub fn browse(path: Option<&str>) -> Result<Json, String> {
         } else {
             let ext = p.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
             let shown = SHOWN.contains(&ext.as_str()) && (ext != "exe" || name.to_ascii_lowercase().contains("ffmpeg")) && (!ext.is_empty() || name.contains("ffmpeg"));
-            // NAF's weights, the one PyTorch file a model needs.
-            if shown || name.eq_ignore_ascii_case(crate::detect::NAF_FILE) {
+            // NAF's and Real-ESRGAN's weights, the PyTorch files a model needs.
+            if shown || crate::detect::readable_pth(&name) {
                 files.push((name.to_ascii_lowercase(), entry_json(&p, &name, false, meta.len())));
             }
         }

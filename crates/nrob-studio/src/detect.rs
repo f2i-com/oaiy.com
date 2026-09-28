@@ -16,9 +16,15 @@ use std::path::{Path, PathBuf};
 /// Largest safetensors header read (real ones are a few MB).
 const MAX_HEADER: u64 = 128 << 20;
 
-/// NAF's release weights, the one PyTorch file nrob reads (with its own reader,
-/// which never runs code from the file).
+/// NAF's release weights and Real-ESRGAN x4plus's, the PyTorch files nrob reads
+/// (with its own reader, which never runs code from the file).
 pub(crate) const NAF_FILE: &str = "naf_release.pth";
+pub(crate) const ESRGAN_FILE: &str = "realesrgan_x4plus.pth";
+
+/// Is this one of the PyTorch files nrob reads (by name, any case)?
+pub(crate) fn readable_pth(name: &str) -> bool {
+    name.eq_ignore_ascii_case(NAF_FILE) || name.eq_ignore_ascii_case(ESRGAN_FILE)
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Role {
@@ -31,7 +37,8 @@ pub enum Role {
     /// A part another model needs: `vision_projector`, `adapter`, `text_encoder`,
     /// `video_text_encoder`, `vae`, `tokenizer`, `clip_tokenizer`, `image_base`;
     /// or a model of a section of its own (`sound_model`, `music_model`,
-    /// `model3d`) and its parts (`model3d_dino`, `model3d_naf`).
+    /// `model3d`) and its parts (`model3d_dino`, `model3d_naf`, and the optional
+    /// `model3d_matte` and `model3d_upscaler`).
     Component { kind: &'static str },
 }
 
@@ -104,8 +111,9 @@ pub fn detect(path: &Path) -> Result<Detected, String> {
             path.parent().map_or(Err("no folder".into()), directory)
         }
         "exe" | "" if name.contains("ffmpeg") => Ok(detected(Role::Component { kind: "ffmpeg" }, "program", "FFmpeg (writes the video container)".into(), vec![("ffmpeg", path_json(path))])),
-        // NAF's weights are a PyTorch file, read without unpickling code.
+        // NAF's and Real-ESRGAN's weights are PyTorch files, read without unpickling code.
         "pth" if name == NAF_FILE => Ok(naf(path)),
+        "pth" if name == ESRGAN_FILE => Ok(esrgan(path)),
         "bin" | "pt" | "pth" | "ckpt" => Err(format!(
             "{name}: pickled PyTorch weights are not supported (they can run code when loaded); use the .safetensors or .gguf release"
         )),
@@ -420,6 +428,10 @@ fn naf(path: &Path) -> Detected {
     detected(Role::Component { kind: "model3d_naf" }, "pth", "NAF: feature upsampler for 3D models (Apache-2.0)".into(), vec![("naf", path_json(path))])
 }
 
+fn esrgan(path: &Path) -> Detected {
+    detected(Role::Component { kind: "model3d_upscaler" }, "pth", "Real-ESRGAN x4plus: enlarges small pictures for 3D models (BSD-3-Clause)".into(), vec![("upscaler", path_json(path))])
+}
+
 fn directory(dir: &Path) -> Result<Detected, String> {
     let label = stem(dir);
     let read = |name: &str| std::fs::read(dir.join(name)).ok().and_then(|b| Json::parse(&b).ok());
@@ -435,9 +447,12 @@ fn directory(dir: &Path) -> Result<Detected, String> {
             return Ok(d);
         }
     }
-    // A NAF folder holds its release weights (and its license).
+    // A NAF folder holds its release weights (and its license); so does a Real-ESRGAN one.
     if dir.join(NAF_FILE).is_file() {
         return Ok(naf(&dir.join(NAF_FILE)));
+    }
+    if let Some(weights) = std::fs::read_dir(dir).ok().and_then(|rd| rd.flatten().map(|e| e.path()).find(|p| p.file_name().is_some_and(|n| n.eq_ignore_ascii_case(ESRGAN_FILE)))) {
+        return Ok(esrgan(&weights));
     }
     if let Some(index) = read("model_index.json") {
         let class = str_or(&index, "_class_name", "");
@@ -498,6 +513,16 @@ fn directory(dir: &Path) -> Result<Detected, String> {
         let quant = config.get("quantization_config").map(|q| str_or(q, "quant_method", "")).unwrap_or("");
         let arch = config.get("architectures").and_then(|a| a.at(0)).and_then(Json::as_str).unwrap_or("").to_string();
         let model_type = str_or(&config, "model_type", "");
+        // BiRefNet: cuts the object out of a picture for Pixal3D. Its own weights
+        // are MIT; RMBG-2.0 (the same network) is for non-commercial use only.
+        if arch == "BiRefNet" {
+            if !dir.join("model.safetensors").is_file() {
+                return Err(format!("{label}: a BiRefNet folder needs its model.safetensors"));
+            }
+            let rmbg = str_or(&config, "_name_or_path", "").to_ascii_lowercase().contains("rmbg");
+            let licence = if rmbg { "RMBG-2.0 weights: non-commercial use only" } else { "MIT" };
+            return Ok(detected(Role::Component { kind: "model3d_matte" }, "safetensors", format!("BiRefNet: cuts objects out of pictures for 3D models ({licence})"), vec![("matte", path_json(dir))]));
+        }
         if quant == "exl3" || arch.starts_with("Deepseek") || model_type.starts_with("deepseek") {
             let mut fields = vec![("path", path_json(dir))];
             // A Qwen EXL3 folder that kept its vision tower (config, preprocessor and
@@ -785,6 +810,25 @@ mod tests {
         }
         std::fs::write(naf.join("other.pth"), b"PK\x03\x04").unwrap();
         assert!(detect(&naf.join("other.pth")).unwrap_err().contains("pickled"));
+        // BiRefNet (its own weights MIT; RMBG-2.0's said to be non-commercial), and Real-ESRGAN's weights.
+        let birefnet = d.0.join("BiRefNet");
+        std::fs::create_dir_all(&birefnet).unwrap();
+        std::fs::write(birefnet.join("config.json"), r#"{"_name_or_path":"ZhengPeng7/BiRefNet","architectures":["BiRefNet"]}"#).unwrap();
+        assert!(detect(&birefnet).unwrap_err().contains("model.safetensors"));
+        safetensors(&birefnet.join("model.safetensors"), r#"{"x":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#);
+        let r = detect(&birefnet).unwrap();
+        assert_eq!((r.kind(), r.summary.contains("(MIT)")), ("model3d_matte", true));
+        assert!(field(&r, "matte").unwrap().ends_with("BiRefNet"));
+        std::fs::write(birefnet.join("config.json"), r#"{"_name_or_path":"briaai/RMBG-2.0","architectures":["BiRefNet"]}"#).unwrap();
+        assert!(detect(&birefnet).unwrap().summary.contains("non-commercial"));
+        let esrgan = d.0.join("Real-ESRGAN");
+        std::fs::create_dir_all(&esrgan).unwrap();
+        std::fs::write(esrgan.join("RealESRGAN_x4plus.pth"), b"PK\x03\x04").unwrap();
+        for p in [esrgan.join("RealESRGAN_x4plus.pth"), esrgan.clone()] {
+            let r = detect(&p).unwrap();
+            assert_eq!(r.kind(), "model3d_upscaler");
+            assert!(field(&r, "upscaler").unwrap().ends_with("RealESRGAN_x4plus.pth"));
+        }
     }
 
     #[test]

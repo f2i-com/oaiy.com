@@ -91,7 +91,7 @@ fn nearby(path: &Path, accept: impl Fn(&Path, &Detected) -> bool) -> Option<Path
                 continue;
             }
             let ext = c.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
-            let interesting = c.is_dir() || ext == "safetensors" || ext == "gguf" || c.file_name().is_some_and(|n| n == "tokenizer.json" || n.eq_ignore_ascii_case(detect::NAF_FILE));
+            let interesting = c.is_dir() || ext == "safetensors" || ext == "gguf" || c.file_name().is_some_and(|n| n == "tokenizer.json" || detect::readable_pth(&n.to_string_lossy()));
             if !interesting {
                 continue;
             }
@@ -274,11 +274,20 @@ fn attach_sound(cfg: &mut Json, d: &Detected, target: Option<(&str, &str)>) -> R
 
 /// The fields a 3D model needs: the Pixal3D folder, DINOv3 and NAF.
 const MODEL3D_PARTS: [&str; 3] = ["path", "dino", "naf"];
+/// The fields that help it when they are there: BiRefNet (cuts objects out of
+/// any background) and Real-ESRGAN (enlarges small pictures).
+const MODEL3D_HELPERS: [&str; 2] = ["matte", "upscaler"];
 
 /// A 3D model's part from files near `picked` (the release folders usually sit
-/// side by side): a DINOv3 folder, or NAF's folder or weights.
+/// side by side): a DINOv3 folder, NAF's folder or weights, BiRefNet's folder,
+/// or Real-ESRGAN's folder or weights.
 fn model3d_nearby(picked: &Path, key: &str) -> Option<Json> {
-    let kind = if key == "dino" { "model3d_dino" } else { "model3d_naf" };
+    let kind = match key {
+        "dino" => "model3d_dino",
+        "naf" => "model3d_naf",
+        "matte" => "model3d_matte",
+        _ => "model3d_upscaler",
+    };
     let found = nearby(picked, |_, d| d.kind() == kind)?;
     field_of(&detect::detect(&found).ok()?, key)
 }
@@ -291,6 +300,8 @@ fn attach_model3d(cfg: &mut Json, d: &Detected, target: Option<(&str, &str)>, pi
     let field = match d.kind() {
         "model3d_dino" => "dino",
         "model3d_naf" => "naf",
+        "model3d_matte" => "matte",
+        "model3d_upscaler" => "upscaler",
         _ => "path",
     };
     let value = field_of(d, field).ok_or("detected part has no path")?;
@@ -299,7 +310,7 @@ fn attach_model3d(cfg: &mut Json, d: &Detected, target: Option<(&str, &str)>, pi
     let lent = |key: &str| -> Option<Json> {
         get(cfg, &["media", "model3d", "models"])?.members().find_map(|(_, m)| m.get(key).filter(|v| v.as_str().is_some_and(|s| !s.trim().is_empty())).cloned())
     };
-    let lend: Vec<(&str, Json)> = MODEL3D_PARTS.iter().filter(|k| **k != field).filter_map(|k| lent(k).map(|v| (*k, v))).collect();
+    let lend: Vec<(&str, Json)> = MODEL3D_PARTS.iter().chain(&MODEL3D_HELPERS).filter(|k| **k != field).filter_map(|k| lent(k).map(|v| (*k, v))).collect();
     let Some(Json::Obj(models)) = obj_mut(cfg, &["media", "model3d", "models"]) else { return Err("no 3D model section".into()) };
     let lacks = |m: &Json| str_or(m, field, "").trim().is_empty();
     let chosen = models.iter().position(|(n, _)| target.is_some_and(|(_, t)| n == t)).or_else(|| {
@@ -320,7 +331,7 @@ fn attach_model3d(cfg: &mut Json, d: &Detected, target: Option<(&str, &str)>, pi
     let (name, model) = &mut models[i];
     let name = name.clone();
     set(model, field, value);
-    for key in MODEL3D_PARTS.iter().filter(|k| **k != "path") {
+    for key in MODEL3D_PARTS.iter().chain(&MODEL3D_HELPERS).filter(|k| **k != "path") {
         if str_or(model, key, "").trim().is_empty() {
             if let Some(v) = lend.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone()).or_else(|| model3d_nearby(picked, key)) {
                 set(model, key, v);
@@ -373,7 +384,7 @@ fn attach(cfg: &mut Json, d: &Detected, target: Option<(&str, &str)>, picked: &P
         "speech_design" | "speech_base" | "speech_breeze" => return attach_speech(cfg, d, target),
         "music_model" | "music_lm" => return attach_music(cfg, d, target),
         "sound_model" => return attach_sound(cfg, d, target),
-        "model3d" | "model3d_dino" | "model3d_naf" => return attach_model3d(cfg, d, target, picked),
+        "model3d" | "model3d_dino" | "model3d_naf" | "model3d_matte" | "model3d_upscaler" => return attach_model3d(cfg, d, target, picked),
         "ffmpeg" => {
             let value = field_of(d, "ffmpeg").unwrap_or(Json::Null);
             set(obj_mut(cfg, &["media", "video"]).ok_or("no video section")?, "ffmpeg", value);
@@ -908,6 +919,25 @@ mod tests {
         assert_eq!((a2.name.as_str(), a2.enabled), ("pixal3d-2", true));
         assert_eq!(str_or(&model(&cfg, "pixal3d-2"), "naf", ""), str_or(&model(&cfg, "pixal3d"), "naf", ""));
         config::validate(&cfg).unwrap();
+        // BiRefNet and Real-ESRGAN, the optional helpers: found beside Pixal3D.
+        let with_helpers = d.join("with-helpers");
+        let (pixal, _, _) = pixal3d_parts(&with_helpers);
+        let birefnet = with_helpers.join("BiRefNet");
+        let esrgan = with_helpers.join("Real-ESRGAN");
+        std::fs::create_dir_all(&birefnet).unwrap();
+        std::fs::create_dir_all(&esrgan).unwrap();
+        std::fs::write(birefnet.join("config.json"), r#"{"architectures":["BiRefNet"]}"#).unwrap();
+        safetensors(&birefnet.join("model.safetensors"), r#"{"x":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#);
+        std::fs::write(esrgan.join("RealESRGAN_x4plus.pth"), b"PK").unwrap();
+        let mut helped = config::default_json();
+        let (h, _) = add(&mut helped, &pixal, None, None).unwrap();
+        let m = model(&helped, &h.name);
+        assert!(str_or(&m, "matte", "").ends_with("BiRefNet") && str_or(&m, "upscaler", "").ends_with("RealESRGAN_x4plus.pth"), "{m:?}");
+        config::validate(&helped).unwrap();
+        // Added to a model that has none yet, a helper fills it.
+        let (a3, found) = add(&mut cfg, &birefnet, None, Some(("model3d", "pixal3d"))).unwrap();
+        assert_eq!((found.kind(), a3.name.as_str()), ("model3d_matte", "pixal3d"));
+        assert!(str_or(&model(&cfg, "pixal3d"), "matte", "").ends_with("BiRefNet"));
         // Parts first, each from its own place: one model, switched on once it has all three.
         let apart = d.join("apart");
         let (pixal, _, _) = pixal3d_parts(&apart.join("a"));

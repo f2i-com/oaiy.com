@@ -250,3 +250,32 @@ fn faces_that_never_show_are_coloured_per_vertex() -> Result<()> {
     assert_eq!(base.get_pixel((uv[0] * 256.) as u32, (uv[1] * 256.) as u32).0, [255; 4]);
     Ok(())
 }
+
+/// Pictures prepared with BiRefNet and Real-ESRGAN on the GPU, written to
+/// E:/p3dref/prepare for a look: the bust (plain background), the bust at 300
+/// pixels (enlarged), and the turtle on a busy photo (cut out of it).
+/// cargo test --release --features flash-attn --lib model3d::tests::pictures_are_cut_out_and_enlarged -- --ignored --nocapture
+#[test]
+#[ignore]
+fn pictures_are_cut_out_and_enlarged() -> Result<()> {
+    let out = std::path::PathBuf::from("E:/p3dref/prepare");
+    std::fs::create_dir_all(&out)?;
+    let gpu: usize = std::env::var("NROB_GPU").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+    let dev = Device::cuda_if_available(gpu)?;
+    let bust = image::open("E:/p3dref/case4/input.png").unwrap().to_rgb8();
+    image::imageops::resize(&bust, 300, 300, image::imageops::FilterType::Lanczos3).save(out.join("small.png")).unwrap();
+    let turtle = image::open(std::env::var("TURTLE").unwrap_or_else(|_| "C:/Users/User/AppData/Local/Temp/claude/E--repos-bot-computer/fc80cba4-4bf0-4581-8aca-668cb05bf606/scratchpad/pixal3d/repo/assets/images/0_img.png".into())).unwrap().to_rgba8();
+    let turtle = image::imageops::resize(&turtle, 900, 900, image::imageops::FilterType::Lanczos3);
+    let mut scene = image::imageops::resize(&image::open(std::env::var("SCENE").unwrap_or_else(|_| "C:/Users/User/AppData/Local/Temp/claude/E--repos-bot-computer/fc80cba4-4bf0-4581-8aca-668cb05bf606/scratchpad/pixal3d/repo/assets/app/hdri_city.png".into())).unwrap().to_rgba8(), 1200, 1000, image::imageops::FilterType::Lanczos3);
+    image::imageops::overlay(&mut scene, &turtle, 150, 60);
+    image::DynamicImage::ImageRgba8(scene).to_rgb8().save(out.join("busy.png")).unwrap();
+    let helpers = super::prepare::Helpers { matte: Some(std::path::Path::new("E:/models/BiRefNet")), upscaler: Some(std::path::Path::new("E:/models/Real-ESRGAN/RealESRGAN_x4plus.pth")), dev: &dev };
+    for (name, picture) in [("bust", std::path::PathBuf::from("E:/p3dref/case4/input.png")), ("small", out.join("small.png")), ("busy", out.join("busy.png"))] {
+        let t = std::time::Instant::now();
+        let p = super::prepare::prepare(&picture, &helpers)?;
+        println!("{name}: cut out by {}, {}×{}, square {:?}, in {:.2}s", p.matte, p.image.width(), p.image.height(), p.upscaled, t.elapsed().as_secs_f64());
+        p.image.save(out.join(format!("{name}-on-black.png"))).unwrap();
+        p.cutout.save(out.join(format!("{name}-cutout.png"))).unwrap();
+    }
+    Ok(())
+}

@@ -785,6 +785,7 @@ pub fn model3d_object(job: &Job) -> Json {
         ("vertices", r("vertices")),
         ("bytes", r("bytes")),
         ("matte", r("matte")),
+        ("upscaled", r("upscaled")),
         ("seconds_taken", r("seconds")),
         ("error", error),
     ])

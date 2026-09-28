@@ -1,7 +1,9 @@
 //! 3D models from a picture (Pixal3D): requests for the worker, from `/v1/3d/models` jobs.
 //!
 //! A model entry (`media.model3d.models.<name>`) names the Pixal3D folder
-//! (`path`), DINOv3 ViT-L/16 (`dino`) and NAF's weights (`naf`).
+//! (`path`), DINOv3 ViT-L/16 (`dino`) and NAF's weights (`naf`), and may name
+//! BiRefNet (`matte`: cuts the object out of any background) and Real-ESRGAN
+//! x4plus's weights (`upscaler`: enlarges a small picture first).
 use crate::config;
 use crate::util::{bool_or, int_or, str_or};
 use nrob::json::Json;
@@ -43,6 +45,10 @@ pub fn model3d_request(cfg: &Json, root: &Path, output_dir: &Path, body: &Json, 
     let path = folder("path", "Pixal3D folder")?;
     let dino = folder("dino", "DINOv3 ViT-L/16 folder")?;
     let naf = folder("naf", "NAF weights (naf_release.pth)")?;
+    let helper = |key: &str| -> Option<String> {
+        let p = str_or(model, key, "").trim().to_string();
+        (!p.is_empty()).then(|| config::resolve(root, &p).to_string_lossy().into_owned())
+    };
     let image = match body.get("image").or_else(|| body.get("input_reference")) {
         Some(v) => crate::media::reference_image(v, output_dir, allow_local)?.ok_or("image is required: the picture of the object")?,
         None => return Err("image is required: the picture of the object (a data: URL)".into()),
@@ -82,6 +88,11 @@ pub fn model3d_request(cfg: &Json, root: &Path, output_dir: &Path, body: &Json, 
         return Err("texture_size must be 0 (vertex colours only), 512, 1024, 2048 or 4096".into());
     }
     f.push(("texture_size".into(), Json::Int(texture_size)));
+    for key in ["matte", "upscaler"] {
+        if let Some(p) = helper(key) {
+            f.push((key.into(), Json::str(&p)));
+        }
+    }
     if let Some(steps) = body.get("steps").and_then(Json::as_i64) {
         if !(1..=50).contains(&steps) {
             return Err("steps must be 1 to 50".into());
@@ -100,7 +111,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("nrob-3d-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let cfg = Json::parse(br#"{"media":{"device":1,"model3d":{"default_model":"pixal3d","models":{"pixal3d":{"path":"/m/Pixal3D","dino":"/m/dino","naf":"/m/naf.pth"}}}}}"#).unwrap();
+        let cfg = Json::parse(br#"{"media":{"device":1,"model3d":{"default_model":"pixal3d","models":{"pixal3d":{"path":"/m/Pixal3D","dino":"/m/dino","naf":"/m/naf.pth","matte":"/m/BiRefNet"}}}}}"#).unwrap();
         let png = crate::util::base64_encode(b"\x89PNG\r\n");
         let body = Json::parse(format!(r#"{{"image":"data:image/png;base64,{png}","seed":5,"faces":50000}}"#).as_bytes()).unwrap();
         let (r, name, label) = model3d_request(&cfg, &dir, &dir, &body, false).unwrap();
@@ -115,6 +126,8 @@ mod tests {
         assert!(model3d_request(&cfg, &dir, &dir, &Json::parse(b"{}").unwrap(), false).unwrap_err().contains("image"));
         assert!(model3d_request(&cfg, &dir, &dir, &Json::parse(format!(r#"{{"image":"data:image/png;base64,{png}","resolution":2048}}"#).as_bytes()).unwrap(), false).is_err());
         assert_eq!(int_or(&r, "texture_size", 0), 2048);
+        // BiRefNet goes with it; Real-ESRGAN, not configured, does not.
+        assert!(str_or(&r, "matte", "").ends_with("BiRefNet") && r.get("upscaler").is_none());
         assert!(model3d_request(&cfg, &dir, &dir, &Json::parse(format!(r#"{{"image":"data:image/png;base64,{png}","texture_size":3000}}"#).as_bytes()).unwrap(), false).is_err());
         std::fs::remove_dir_all(dir).unwrap();
     }

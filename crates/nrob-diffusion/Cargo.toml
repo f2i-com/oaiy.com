@@ -7,6 +7,7 @@ description = "Native Rust Qwen Image and LTX video inference worker for NROB"
 
 [dependencies]
 nrob = { path = "../nrob" }
+nrob-image = { path = "../nrob-image" }
 dsv41 = { path = "../dsv41" }
 candle-core = "0.11.0"
 candle-nn = "0.11.0"

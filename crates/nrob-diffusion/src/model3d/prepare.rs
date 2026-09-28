@@ -1,21 +1,44 @@
-//! The input picture, as Pixal3D wants it (its `preprocess_image`): the object
-//! cut out (the picture's own alpha when it has one; otherwise its background,
-//! when it is plain, flood-filled from the border), scaled to at most 1024,
-//! cropped square to 1.1× the object's bounding box, and put on black.
+//! The input picture, as Pixal3D wants it (its `preprocess_image`): scaled to
+//! at most 1024, the object cut out, cropped square to 1.1× its bounding box,
+//! and put on black.
 //!
-//! Pixal3D cuts objects out with RMBG-2.0, which is for non-commercial use only;
-//! this takes pictures with transparency, or of an object on a plain background
-//! (as generated product shots and cut-outs are).
+//! The object is cut out by the picture's own alpha when it has one; otherwise
+//! by BiRefNet (as Pixal3D does, with BiRefNet's MIT general-use weights rather
+//! than RMBG-2.0's non-commercial ones); without BiRefNet, by flood-filling a
+//! plain background from the border.
+//!
+//! With Real-ESRGAN, the square is made 2048 pixels a side: cut from the
+//! picture at its own resolution (not the 1024 the object is found at), and
+//! when that has fewer pixels, made four times larger by Real-ESRGAN rather than
+//! stretched. DINOv3 and NAF still see it at 512 and 1024, as Pixal3D is
+//! trained, now from a sharp picture scaled down; the cut-out kept beside the
+//! model is the full 2048.
 use candle_core::{Device, Result, Tensor};
 use image::{imageops::FilterType, Rgb, RgbImage, Rgba, RgbaImage};
 use std::collections::VecDeque;
 use std::path::Path;
 
+/// The side the square is made with Real-ESRGAN.
+const UPSCALED: u32 = 2048;
+
 pub struct Prepared {
     /// Square, the object on black.
     pub image: RgbImage,
-    /// How the object was found: "alpha" or "background".
+    /// The same, with the background transparent.
+    pub cutout: RgbaImage,
+    /// How the object was found: "alpha", "birefnet" or "background".
     pub matte: &'static str,
+    /// The square's side in the picture, and as made (2048), when Real-ESRGAN was there to make it.
+    pub upscaled: Option<(u32, u32)>,
+}
+
+/// The models that help prepare a picture, loaded while they are used.
+pub struct Helpers<'a> {
+    /// A BiRefNet folder, to cut the object out of a picture without transparency.
+    pub matte: Option<&'a Path>,
+    /// Real-ESRGAN x4plus weights: the square is made 2048 a side, enlarged where it has fewer pixels.
+    pub upscaler: Option<&'a Path>,
+    pub dev: &'a Device,
 }
 
 /// A plain background's colour, when the border is (nearly) one colour.
@@ -94,9 +117,10 @@ fn flood(img: &RgbaImage, bg: [f32; 3], tolerance: f32) -> Vec<bool> {
     background
 }
 
-pub fn prepare(path: &Path) -> Result<Prepared> {
+pub fn prepare(path: &Path, helpers: &Helpers) -> Result<Prepared> {
     let img = image::ImageReader::open(path)?.with_guessed_format()?.decode().map_err(candle_core::Error::wrap)?;
-    let mut rgba = img.to_rgba8();
+    let original = img.to_rgba8();
+    let mut rgba = original.clone();
     let has_alpha = rgba.pixels().any(|p| p[3] != 255);
     // At most 1024 on its longer side (LANCZOS, as PIL).
     let (w, h) = rgba.dimensions();
@@ -105,24 +129,30 @@ pub fn prepare(path: &Path) -> Result<Prepared> {
         let s = 1024. / longest as f64;
         rgba = image::imageops::resize(&rgba, ((w as f64 * s) as u32).max(1), ((h as f64 * s) as u32).max(1), FilterType::Lanczos3);
     }
+    let (w, h) = rgba.dimensions();
     let matte = if has_alpha {
         "alpha"
+    } else if let Some(dir) = helpers.matte {
+        let net = crate::birefnet::BiRefNet::load(dir, helpers.dev)?;
+        let rgb: Vec<u8> = rgba.pixels().flat_map(|p| [p[0], p[1], p[2]]).collect();
+        let alpha = net.matte(&rgb, w as usize, h as usize)?;
+        for (p, a) in rgba.pixels_mut().zip(alpha) {
+            p[3] = a;
+        }
+        "birefnet"
     } else {
         let Some(bg) = plain_background(&rgba) else {
-            candle_core::bail!("the picture has no transparency and no plain background to cut the object out of: give it a transparent or plain (white, grey or black) background, with the whole object in view");
+            candle_core::bail!("the picture has no transparency and no plain background to cut the object out of: give it a transparent or plain (white, grey or black) background, with the whole object in view (or add BiRefNet to the 3D model, which cuts objects out of any background)");
         };
         let background = flood(&rgba, bg, 28.);
-        let (w, _) = rgba.dimensions();
         for (i, p) in rgba.pixels_mut().enumerate() {
             if background[i] {
                 p[3] = 0;
             }
-            let _ = w;
         }
         "background"
     };
     // The object's box: alpha above 0.8.
-    let (w, h) = rgba.dimensions();
     let (mut x0, mut y0, mut x1, mut y1) = (u32::MAX, u32::MAX, 0u32, 0u32);
     for (x, y, p) in rgba.enumerate_pixels() {
         if p[3] as f32 > 0.8 * 255. {
@@ -144,17 +174,75 @@ pub fn prepare(path: &Path) -> Result<Prepared> {
     let right = (cx + (size / 2) as f64).round_ties_even() as i64;
     let bottom = (cy + (size / 2) as f64).round_ties_even() as i64;
     let (cw, ch) = ((right - left).max(1) as u32, (bottom - top).max(1) as u32);
-    let mut out = RgbImage::new(cw, ch);
-    for y in 0..ch {
-        for x in 0..cw {
+    let mut upscaled = None;
+    let crop = match helpers.upscaler {
+        None => cut(&rgba, left, top, cw, ch),
+        Some(weights) => {
+            // The same square at the picture's own resolution, its alpha from the matte found at 1024.
+            let (ow, oh) = original.dimensions();
+            let k = ow as f64 / w as f64;
+            let mut full = original;
+            if !has_alpha && k > 1. {
+                let alpha: Vec<u8> = rgba.pixels().map(|p| p[3]).collect();
+                let alpha = nrob_image::resize::resample(&alpha, 1, w as usize, h as usize, ow as usize, oh as usize, nrob_image::resize::Filter::Bicubic);
+                for (p, a) in full.pixels_mut().zip(alpha) {
+                    p[3] = a;
+                }
+            } else if !has_alpha {
+                full = rgba;
+            }
+            let side = ((cw as f64 * k).round() as u32).max(1);
+            let square = cut(&full, (left as f64 * k).round() as i64, (top as f64 * k).round() as i64, side, side);
+            drop(full);
+            // Fewer than half the pixels wanted: four times larger with Real-ESRGAN (its alpha bicubic, as Pillow).
+            let square = if side < UPSCALED / 2 {
+                let net = crate::esrgan::Esrgan::load(weights, helpers.dev)?;
+                let s = side as usize;
+                let rgb: Vec<u8> = square.pixels().flat_map(|p| [p[0], p[1], p[2]]).collect();
+                let alpha: Vec<u8> = square.pixels().map(|p| p[3]).collect();
+                let big = net.upscale(&rgb, s, s)?;
+                let b = s * crate::esrgan::SCALE;
+                let big_alpha = nrob_image::resize::resample(&alpha, 1, s, s, b, b, nrob_image::resize::Filter::Bicubic);
+                let mut bigger = RgbaImage::new(b as u32, b as u32);
+                for (i, p) in bigger.pixels_mut().enumerate() {
+                    *p = Rgba([big[i * 3], big[i * 3 + 1], big[i * 3 + 2], big_alpha[i]]);
+                }
+                bigger
+            } else {
+                square
+            };
+            upscaled = Some((side, UPSCALED));
+            if square.width() == UPSCALED {
+                square
+            } else {
+                image::imageops::resize(&square, UPSCALED, UPSCALED, FilterType::Lanczos3)
+            }
+        }
+    };
+    // On black, as Pixal3D composites it; and with the background transparent.
+    let (cw, ch) = crop.dimensions();
+    let mut image = RgbImage::new(cw, ch);
+    for (x, y, p) in crop.enumerate_pixels() {
+        let a = p[3] as f32 / 255.;
+        let c = |v: u8| ((v as f32 / 255. * a).clamp(0., 1.) * 255.) as u8;
+        image.put_pixel(x, y, Rgb([c(p[0]), c(p[1]), c(p[2])]));
+    }
+    Ok(Prepared { image, cutout: crop, matte, upscaled })
+}
+
+/// `side`-wide square (`w` × `h` at `left`, `top`) of `img`; outside it is transparent (as PIL's crop).
+fn cut(img: &RgbaImage, left: i64, top: i64, w: u32, h: u32) -> RgbaImage {
+    let (iw, ih) = img.dimensions();
+    let mut out = RgbaImage::new(w, h);
+    for y in 0..h {
+        for x in 0..w {
             let (sx, sy) = (left + x as i64, top + y as i64);
-            let p: Rgba<u8> = if sx >= 0 && sy >= 0 && (sx as u32) < w && (sy as u32) < h { *rgba.get_pixel(sx as u32, sy as u32) } else { Rgba([0, 0, 0, 0]) };
-            let a = p[3] as f32 / 255.;
-            let c = |v: u8| ((v as f32 / 255. * a).clamp(0., 1.) * 255.) as u8;
-            out.put_pixel(x, y, Rgb([c(p[0]), c(p[1]), c(p[2])]));
+            if sx >= 0 && sy >= 0 && (sx as u32) < iw && (sy as u32) < ih {
+                out.put_pixel(x, y, *img.get_pixel(sx as u32, sy as u32));
+            }
         }
     }
-    Ok(Prepared { image: out, matte })
+    out
 }
 
 /// The prepared picture at `size`² (LANCZOS) as [3, size, size] in [0, 1].

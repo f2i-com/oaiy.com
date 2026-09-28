@@ -4,23 +4,51 @@
 //! Resample.c filters in two passes, horizontal then vertical, each with
 //! per-output-pixel coefficients: the filter is stretched by the scale when
 //! shrinking (antialiasing), its taps normalized to sum to 1, then turned
-//! into 22-bit fixed point; every pass rounds to 8 bits. Only bicubic
-//! (Keys, a = -0.5) is here: it is what `ImageOps.pad` and `resize` default
-//! to.
+//! into 22-bit fixed point; every pass rounds to 8 bits. Bicubic (Keys,
+//! a = -0.5, what `ImageOps.pad` and `resize` default to) and bilinear (what
+//! torchvision's `Resize` asks of a PIL image) are here, for any number of
+//! 8-bit channels.
 
 use crate::Image;
 
 const PRECISION_BITS: u32 = 32 - 8 - 2;
 
-fn bicubic(x: f64) -> f64 {
-    const A: f64 = -0.5;
-    let x = x.abs();
-    if x < 1.0 {
-        ((A + 2.0) * x - (A + 3.0)) * x * x + 1.0
-    } else if x < 2.0 {
-        (((x - 5.0) * x + 8.0) * x - 4.0) * A
-    } else {
-        0.0
+/// A resampling filter, as Pillow's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Filter {
+    Bilinear,
+    Bicubic,
+}
+
+impl Filter {
+    fn support(self) -> f64 {
+        match self {
+            Filter::Bilinear => 1.0,
+            Filter::Bicubic => 2.0,
+        }
+    }
+
+    fn weight(self, x: f64) -> f64 {
+        let x = x.abs();
+        match self {
+            Filter::Bilinear => {
+                if x < 1.0 {
+                    1.0 - x
+                } else {
+                    0.0
+                }
+            }
+            Filter::Bicubic => {
+                const A: f64 = -0.5;
+                if x < 1.0 {
+                    ((A + 2.0) * x - (A + 3.0)) * x * x + 1.0
+                } else if x < 2.0 {
+                    (((x - 5.0) * x + 8.0) * x - 4.0) * A
+                } else {
+                    0.0
+                }
+            }
+        }
     }
 }
 
@@ -33,13 +61,12 @@ struct Taps {
     k: Vec<i32>,
 }
 
-fn taps(in_size: usize, out_size: usize) -> Taps {
-    const SUPPORT: f64 = 2.0;
+fn taps(in_size: usize, out_size: usize, filter: Filter) -> Taps {
     // the box edges are C floats
     let (in0, in1) = (0f32, in_size as f32);
     let scale = f64::from(in1 - in0) / out_size as f64;
     let filterscale = scale.max(1.0);
-    let support = SUPPORT * filterscale;
+    let support = filter.support() * filterscale;
     let ksize = support.ceil() as usize * 2 + 1;
     let mut bounds = Vec::with_capacity(out_size);
     let mut k = vec![0i32; out_size * ksize];
@@ -52,7 +79,7 @@ fn taps(in_size: usize, out_size: usize) -> Taps {
         let xmax = ((center + support + 0.5) as i64).min(in_size as i64) as usize - xmin;
         let mut ww = 0.0;
         for (x, wx) in w.iter_mut().enumerate().take(xmax) {
-            *wx = bicubic((x as f64 + xmin as f64 - center + 0.5) * ss);
+            *wx = filter.weight((x as f64 + xmin as f64 - center + 0.5) * ss);
             ww += *wx;
         }
         for (x, wx) in w.iter().enumerate().take(xmax) {
@@ -70,60 +97,65 @@ fn clip8(v: i32) -> u8 {
     (v >> PRECISION_BITS).clamp(0, 255) as u8
 }
 
-/// `Image.resize((w, h), Image.BICUBIC)` on an RGB image.
-pub fn resize_bicubic(img: &Image, w: usize, h: usize) -> Image {
-    if (w, h) == (img.width, img.height) {
-        return img.clone();
+/// `Image.resize((w, h), filter)` on `c`-channel 8-bit pixels of a `sw` × `sh` image.
+pub fn resample(src: &[u8], c: usize, sw: usize, sh: usize, w: usize, h: usize, filter: Filter) -> Vec<u8> {
+    if (w, h) == (sw, sh) {
+        return src.to_vec();
     }
-    let horiz = taps(img.width, w);
-    let vert = taps(img.height, h);
-    let mut src: std::borrow::Cow<'_, [u8]> = std::borrow::Cow::Borrowed(&img.rgb);
-    let mut src_w = img.width;
+    let horiz = taps(sw, w, filter);
+    let vert = taps(sh, h, filter);
+    let mut pixels: std::borrow::Cow<'_, [u8]> = std::borrow::Cow::Borrowed(src);
+    let mut src_w = sw;
     let mut row0 = 0; // first source row the vertical pass reads
-    if w != img.width {
+    if w != sw {
         // horizontal pass, over just the rows the vertical pass will read
-        let first = vert.bounds[0].0;
-        let last = vert.bounds[h - 1].0 + vert.bounds[h - 1].1;
-        let mut tmp = vec![0u8; w * (last - first) * 3];
+        let (first, last) = if h == sh { (0, sh) } else { (vert.bounds[0].0, vert.bounds[h - 1].0 + vert.bounds[h - 1].1) };
+        let mut tmp = vec![0u8; w * (last - first) * c];
         for y in first..last {
-            let line = &img.rgb[y * img.width * 3..(y + 1) * img.width * 3];
-            let out = &mut tmp[(y - first) * w * 3..(y - first + 1) * w * 3];
+            let line = &src[y * sw * c..(y + 1) * sw * c];
+            let out = &mut tmp[(y - first) * w * c..(y - first + 1) * w * c];
             for (xx, &(xmin, n)) in horiz.bounds.iter().enumerate() {
                 let k = &horiz.k[xx * horiz.ksize..xx * horiz.ksize + n];
-                let mut ss = [1i32 << (PRECISION_BITS - 1); 3];
-                for (x, &kx) in k.iter().enumerate() {
-                    let p = &line[(xmin + x) * 3..(xmin + x) * 3 + 3];
-                    for c in 0..3 {
-                        ss[c] = ss[c].wrapping_add(i32::from(p[c]).wrapping_mul(kx));
+                for ch in 0..c {
+                    let mut ss = 1i32 << (PRECISION_BITS - 1);
+                    for (x, &kx) in k.iter().enumerate() {
+                        ss = ss.wrapping_add(i32::from(line[(xmin + x) * c + ch]).wrapping_mul(kx));
                     }
+                    out[xx * c + ch] = clip8(ss);
                 }
-                out[xx * 3..xx * 3 + 3].copy_from_slice(&ss.map(clip8));
             }
         }
-        src = std::borrow::Cow::Owned(tmp);
+        pixels = std::borrow::Cow::Owned(tmp);
         src_w = w;
         row0 = first;
     }
-    if h == img.height {
-        return Image { width: w, height: h, rgb: src.into_owned() };
+    if h == sh {
+        return pixels.into_owned();
     }
-    let mut out = vec![0u8; w * h * 3];
-    let stride = src_w * 3;
+    let mut out = vec![0u8; w * h * c];
+    let stride = src_w * c;
     for (yy, &(ymin, n)) in vert.bounds.iter().enumerate() {
         let k = &vert.k[yy * vert.ksize..yy * vert.ksize + n];
-        let o = &mut out[yy * w * 3..(yy + 1) * w * 3];
-        for (xx, px) in o.chunks_exact_mut(3).enumerate() {
-            let mut ss = [1i32 << (PRECISION_BITS - 1); 3];
+        let o = &mut out[yy * w * c..(yy + 1) * w * c];
+        for (i, px) in o.iter_mut().enumerate() {
+            let mut ss = 1i32 << (PRECISION_BITS - 1);
             for (y, &ky) in k.iter().enumerate() {
-                let p = &src[(ymin - row0 + y) * stride + xx * 3..][..3];
-                for c in 0..3 {
-                    ss[c] = ss[c].wrapping_add(i32::from(p[c]).wrapping_mul(ky));
-                }
+                ss = ss.wrapping_add(i32::from(pixels[(ymin - row0 + y) * stride + i]).wrapping_mul(ky));
             }
-            px.copy_from_slice(&ss.map(clip8));
+            *px = clip8(ss);
         }
     }
-    Image { width: w, height: h, rgb: out }
+    out
+}
+
+/// `Image.resize((w, h), Image.BICUBIC)` on an RGB image.
+pub fn resize_bicubic(img: &Image, w: usize, h: usize) -> Image {
+    Image { width: w, height: h, rgb: resample(&img.rgb, 3, img.width, img.height, w, h, Filter::Bicubic) }
+}
+
+/// `Image.resize((w, h), Image.BILINEAR)` on an RGB image.
+pub fn resize_bilinear(img: &Image, w: usize, h: usize) -> Image {
+    Image { width: w, height: h, rgb: resample(&img.rgb, 3, img.width, img.height, w, h, Filter::Bilinear) }
 }
 
 /// Python's `round()` on a float: half to even.

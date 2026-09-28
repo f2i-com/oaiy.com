@@ -20,3 +20,5 @@ pub mod music;
 pub mod tts;
 pub mod sound;
 pub mod model3d;
+pub mod birefnet;
+pub mod esrgan;

@@ -2,8 +2,9 @@
 
 NROB makes 3D models from a picture with Pixal3D, natively in Rust
 (`nrob-diffusion`, `kind: "model3d"`). Give it a picture of one object (a
-product, a character, a prop, a building) on a plain or transparent background,
-and you get a textured GLB. The GLB is glTF 2.0, Y up, with the object's front
+product, a character, a prop, a building), and you get a textured GLB. With
+BiRefNet, any background is removed first; with Real-ESRGAN, a small picture is
+enlarged first. The GLB is glTF 2.0, Y up, with the object's front
 (the side the picture shows) facing +Z. It fits the cube from -0.5 to 0.5 and
 has PBR materials (base colour, metallic, roughness).
 
@@ -12,33 +13,54 @@ sound effects.
 
 ## The models
 
-Pixal3D needs three downloads. Pick the Pixal3D folder on the **Models** page,
-and the studio finds the other two beside it (or add each one).
+Pixal3D needs three downloads, and two more help it. Pick the Pixal3D folder on
+the **Models** page, and the studio finds the others beside it (or add each one).
 
 | Part | Download | Licence |
 |---|---|---|
 | Pixal3D (the flow transformers and decoders) | [TencentARC/Pixal3D](https://huggingface.co/TencentARC/Pixal3D) | MIT |
 | DINOv3 ViT-L/16, the image encoder | `facebook/dinov3-vitl16-pretrain-lvd1689m` (transformers layout: `config.json`, `model.safetensors`) | Meta's DINOv3 License |
 | NAF, the feature upsampler | `naf_release.pth` from [valeoai/NAF](https://github.com/valeoai/NAF) | Apache-2.0 |
+| BiRefNet, background removal (optional) | [ZhengPeng7/BiRefNet](https://huggingface.co/ZhengPeng7/BiRefNet) (`config.json`, `model.safetensors`) | MIT |
+| Real-ESRGAN x4plus, the upscaler (optional) | `RealESRGAN_x4plus.pth` from [xinntao/Real-ESRGAN](https://github.com/xinntao/Real-ESRGAN/releases/tag/v0.1.0) | BSD-3-Clause |
 
-The studio recognises Pixal3D from its `pipeline.json`
-(`Trellis2ImageTo3DPipeline`), DINOv3 from its `config.json`
-(`model_type: dinov3_vit`, ViT-L/16 only), and NAF by its file name. It adds
-`pixal3d` and enables it once all three parts are set.
+The studio recognises:
+- Pixal3D from its `pipeline.json` (`Trellis2ImageTo3DPipeline`);
+- DINOv3 from its `config.json` (`model_type: dinov3_vit`, ViT-L/16 only);
+- BiRefNet from its `config.json` (`architectures: ["BiRefNet"]`);
+- NAF and Real-ESRGAN by their file names.
 
-`naf_release.pth` is the one pickled file the studio accepts. The worker reads it
-with nrob's own tensor reader, which takes only the tensors and refuses anything
-else in the pickle, so no Python and no code from the file ever runs.
+It adds `pixal3d` and enables it once the three required parts are set.
+BiRefNet and Real-ESRGAN are used whenever the model has them.
+
+The official pipeline removes backgrounds with the same network, but with
+RMBG-2.0's weights, which are for non-commercial use only. BiRefNet's own
+general-use weights are MIT. A RMBG-2.0 folder works too, and the Models page
+says what its licence allows.
+
+`naf_release.pth` and `RealESRGAN_x4plus.pth` are the only pickled files the
+studio accepts. The worker reads them with nrob's own tensor reader, which takes
+only the tensors and refuses anything else in the pickle, so no Python and no
+code from the file ever runs.
 
 ## How it works
 
 Pixal3D is TRELLIS.2's cascade with pixel-aligned conditioning: each voxel sees
 the image features at the point where it projects into the picture.
 
-1. **The picture.** It is cut out (from its alpha, or by flooding a plain
-   background from the edges), squared around the object with a margin, and put
-   on black. DINOv3 describes it at 512 and 1024 pixels, and NAF upsamples its
-   features to each voxel's pixel.
+1. **The picture.** The object is found at up to 1024 pixels:
+   - from the picture's own transparency;
+   - otherwise with BiRefNet, which gives an alpha matte from any background;
+   - without BiRefNet, by flooding a plain background from the edges.
+
+   It is squared around the object with a margin and put on black. With
+   Real-ESRGAN, that square is made 2048 pixels a side. It is cut from the
+   picture at its own resolution, and where it has fewer than 1024 pixels,
+   Real-ESRGAN makes it four times larger first rather than stretching it.
+   DINOv3 describes it at 512 and 1024 pixels (the sizes Pixal3D is trained
+   on, so a sharp picture scaled down), and NAF upsamples its features to each
+   voxel's pixel. The 2048 cut-out, with its background transparent, is kept
+   beside the model.
 2. **The structure.** A flow transformer makes a 16³ latent. A decoder turns it
    into 64³ occupancy, pooled to 32³ voxels.
 3. **The shape.** A second transformer makes the shape latent on those voxels,
@@ -78,7 +100,9 @@ On an RTX 5090, a model takes 90 to 100 seconds at 1024:
 - about 35 s for the mesh and textures on the CPU (remesh 25 s, simplify 10 s,
   unwrap and bake 1 s).
 
-The official pipeline takes 105 s on the same GPU. Peak VRAM is about 15 GB.
+Cutting a picture out with BiRefNet takes about 1 s, and Real-ESRGAN up to
+5 s more for a small one. The official pipeline takes 105 s on the same GPU.
+Peak VRAM is about 15 GB.
 A GLB with 200,000 faces and 2048² textures is 10 to 14 MB.
 
 ## API
@@ -94,15 +118,16 @@ This creates a job and returns it at once. The fields:
 | `faces` | The simplified mesh's triangle budget, 1,000 to 2,000,000 (default 200,000). |
 | `texture_size` | The baked textures' size: 512, 1024, 2048 (default) or 4096; 0 for vertex colours only. |
 | `fov_degrees` | The camera the picture was taken with, 5 to 120 degrees (default 30). |
+| `texture_size` | The baked textures' size: 512, 1024, 2048 (default) or 4096; 0 for vertex colours only. |
 | `seed` | Repeats a model exactly. |
 | `steps` | The flow stages' steps (default: `pipeline.json`'s). |
 | `model` | A 3D model; left out, the default. |
 
 | Request | Does |
 |---|---|
-| `GET /v1/3d/models/{id}` | Polls a job (`queued`, `in_progress`, `completed`, `failed`; `progress` 0-100, and `stage`). A finished job also has `faces`, `vertices`, `bytes` and `matte` (`alpha` or `background`: how the object was cut out). |
+| `GET /v1/3d/models/{id}` | Polls a job (`queued`, `in_progress`, `completed`, `failed`; `progress` 0-100, and `stage`). A finished job also has `faces`, `vertices` and `bytes`. It also has `matte`, how the object was cut out: `alpha`, `birefnet` or `background`. With Real-ESRGAN it has `upscaled`: `[side, 2048]`, the square's side in the picture and as made. |
 | `GET /v1/3d/models/{id}/content` | Downloads the GLB (`model/gltf-binary`). |
-| `GET /v1/3d/models/{id}/input` | The picture as it was cut out and squared (PNG). |
+| `GET /v1/3d/models/{id}/input` | The object as it was cut out, squared, with its background transparent (an RGBA PNG; 2048 pixels a side with Real-ESRGAN). |
 | `GET /v1/3d/models` | Lists 3D model jobs. |
 | `POST /v1/3d/models/{id}/cancel`, `DELETE /v1/3d/models/{id}` | Stops a job, or forgets it. |
 
@@ -117,10 +142,11 @@ with each model's resolutions and default faces).
 
 ## Pictures that work
 
-The model is only as good as the picture. Use one object, whole and centred,
-on a plain white, grey or transparent background, in soft even light. A
-three-quarter view (its front and one side visible) works best. Text, other
-objects or a busy background end up in the model.
+The model is only as good as the picture. Use one object, whole and centred, in
+soft even light. A three-quarter view (its front and one side visible) works
+best. With BiRefNet, any background is removed, though a plain one gives the
+cleanest edges. Without it, use a plain white, grey or transparent background.
+Text or other objects end up in the model.
 
 Pixal3D's metallic and roughness come out nearly the same over the whole
 object, and change from seed to seed. Three seeds of one picture gave metallic
@@ -145,3 +171,11 @@ starting noise:
 
 The textured GLB made from the reference's noise has the same roughness and
 metallic as the reference's, and the same shape.
+
+BiRefNet and Real-ESRGAN were checked the same way against their own PyTorch code:
+
+| Model | Result |
+|---|---|
+| BiRefNet: every backbone level, the encoder, the squeeze block, one decoder block | within 3e-6 relative RMS |
+| BiRefNet: the final logits at 1024² | within 5.4e-6 relative RMS; no pixel of the matte on the other side of 0.5 |
+| Real-ESRGAN x4plus | within 7e-7 relative RMS in F32, 7e-4 in F16 (how it runs on a GPU) |

@@ -1470,6 +1470,7 @@ dependencies = [
  "image",
  "meshopt",
  "nrob",
+ "nrob-image",
  "regex",
  "tokenizers 0.21.4",
 ]

@@ -2,8 +2,9 @@
 //! natively on Candle. TRELLIS.2's cascade with Pixal3D's pixel-aligned
 //! conditioning (each voxel sees the image features where it projects):
 //!
-//! 1. the picture, cut out and squared; DINOv3 at 512 and 1024 (and NAF to
-//!    upsample its features) describe it;
+//! 1. the picture, cut out (BiRefNet) and squared, a small one enlarged
+//!    (Real-ESRGAN); DINOv3 at 512 and 1024 (and NAF to upsample its
+//!    features) describe it;
 //! 2. a flow transformer makes the coarse structure (a 16³ latent, decoded to
 //!    64³ occupancy and pooled to 32³ voxels);
 //! 3. a second makes the shape latent on those voxels (at 512), whose decoder
@@ -72,6 +73,10 @@ pub struct Request {
     pub remesh: Option<usize>,
     /// The baked textures' size (a power of two, 512 to 4096), or 0 for vertex colours only.
     pub texture_size: u32,
+    /// BiRefNet's folder: cuts the object out of a picture without transparency.
+    pub matte: Option<PathBuf>,
+    /// Real-ESRGAN x4plus's weights: enlarges a small picture before it is seen.
+    pub upscaler: Option<PathBuf>,
 }
 
 impl Request {
@@ -97,6 +102,8 @@ impl Request {
             coords_dir: s("coords_dir").map(PathBuf::from),
             remesh: j.get("remesh").and_then(Json::as_i64).map(|v| v as usize),
             texture_size: j.get("texture_size").and_then(Json::as_i64).unwrap_or(2048).max(0) as u32,
+            matte: s("matte").filter(|v| !v.is_empty()).map(PathBuf::from),
+            upscaler: s("upscaler").filter(|v| !v.is_empty()).map(PathBuf::from),
             model_dir,
         };
         if r.resolution != 1024 && r.resolution != 1536 {
@@ -338,13 +345,13 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
     report(event("preparing_image", 0, 1));
     let prepared = if r.prepared {
         let img = image::ImageReader::open(&r.image)?.with_guessed_format()?.decode().map_err(candle_core::Error::wrap)?;
-        prepare::Prepared { image: img.to_rgb8(), matte: "prepared" }
+        prepare::Prepared { image: img.to_rgb8(), cutout: img.to_rgba8(), matte: "prepared", upscaled: None }
     } else {
-        prepare::prepare(&r.image)?
+        prepare::prepare(&r.image, &prepare::Helpers { matte: r.matte.as_deref(), upscaler: r.upscaler.as_deref(), dev: &dev })?
     };
     let stamp = SystemTime::now().duration_since(UNIX_EPOCH).map_err(candle_core::Error::wrap)?.as_nanos();
     let cutout = r.output.join(format!("model-{stamp}-input.png"));
-    prepared.image.save(&cutout).map_err(candle_core::Error::wrap)?;
+    prepared.cutout.save(&cutout).map_err(candle_core::Error::wrap)?;
     let fov = r.fov_degrees.to_radians();
     let cam = proj::Camera::framing(fov, 1., 512., 0.);
     report(event("encoding_image", 0, 2));
@@ -509,6 +516,10 @@ pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
         ("path", Json::str(path.to_string_lossy())),
         ("input", Json::str(cutout.to_string_lossy())),
         ("matte", Json::str(prepared.matte)),
+        ("upscaled", match prepared.upscaled {
+            Some((from, to)) => Json::Arr(vec![Json::Int(from as i64), Json::Int(to as i64)]),
+            None => Json::Null,
+        }),
         ("resolution", Json::Int(res as i64)),
         ("voxels", Json::Int(voxels as i64)),
         ("tokens", Json::Int(hr_coords.len() as i64)),
