@@ -281,7 +281,7 @@ export class ChatPane {
    * text-message threads, each with its unread count and whether it is working.
    * Hidden while the project has only its own chat.
    */
-  setSessions(tabs: Array<{ id: string | null; label: string; title?: string; unread: number; working: boolean }>, active: string | null, select: (id: string | null) => void): void {
+  setSessions(tabs: Array<{ id: string | null; label: string; title?: string; unread: number; working: boolean; close?: () => void }>, active: string | null, select: (id: string | null) => void): void {
     clear(this.sessionTabs);
     this.sessionTabs.hidden = tabs.length < 2;
     for (const tab of tabs) {
@@ -290,6 +290,9 @@ export class ChatPane {
         { class: `${tab.id === active ? 'active' : ''} ${tab.working ? 'working' : ''}`, title: tab.title ?? tab.label, 'aria-current': tab.id === active ? 'true' : 'false', onclick: () => select(tab.id) },
         h('span.session-label', tab.label),
         ...(tab.unread ? [h('span.session-unread', { 'aria-label': `${tab.unread} unread` }, String(tab.unread))] : []),
+        ...(tab.close
+          ? [h('span.session-close', { role: 'button', title: 'Remove this conversation', 'aria-label': 'Remove this conversation', onclick: (e: Event) => { e.stopPropagation(); tab.close!(); } }, '×')]
+          : []),
       ));
     }
   }

@@ -23,7 +23,7 @@ export interface PhoneDialog {
 
 export async function editPhone(options: PhoneDialog): Promise<MessageSettings | null> {
   let desktop = options.desktop;
-  const status = h('p.muted', 'Looking for OAIY Desktop…');
+  const status = h('p.muted', options.given ? "This is OAIY's own window: texts and calls to the phone come here." : 'Looking for OAIY Desktop…');
   const code = h('div.pair-code');
   code.hidden = true;
   let pairing: AbortController | null = null;
@@ -42,7 +42,7 @@ export async function editPhone(options: PhoneDialog): Promise<MessageSettings |
     pair.hidden = !health || !!desktop;
     forget.hidden = !desktop || !!options.given;
     status.textContent = options.given
-      ? health ? `This is OAIY's own window: text messages to the phone come here (OAIY Desktop ${health.version}).` : 'OAIY Desktop is not answering.'
+      ? health ? `This is OAIY's own window: texts and calls to the phone come here (OAIY Desktop ${health.version}).` : 'OAIY Desktop is not answering.'
       : !health
       ? `OAIY Desktop is not running at ${origin}. Start it: it runs Aokie, which connects the phone.`
       : desktop

@@ -74,6 +74,8 @@ function embeddedDesktop(): { origin: string; token: string } | null {
 
 /** OAIY's own window, where the app is a page beside the sidebar (it knows the desktop from its first line). */
 const IN_OAIY = location.hostname === 'oaiy.localhost' || location.protocol === 'oaiy:' || !!embeddedDesktop();
+// Inside OAIY's window the page takes the window's look (styles.css, `.in-oaiy`).
+if (IN_OAIY) document.documentElement.classList.add('in-oaiy');
 const DESKTOP = IN_OAIY || location.hostname === 'botcomputer.localhost' || location.protocol === 'botcomputer:' || '__TAURI_INTERNALS__' in window;
 
 async function registerServiceWorker(): Promise<boolean> {
@@ -905,7 +907,7 @@ A project can hold several apps, each in its own folder (any folder whose manife
   );
   const header = h(
     'header.topbar',
-    h('button.menu-toggle', { title: 'Project menu', 'aria-label': 'Project menu', onclick: () => header.classList.toggle('menu-open') }, '☰'),
+    h('button.menu-toggle', { title: 'Project menu', 'aria-label': 'Project menu', onclick: () => header.classList.toggle('menu-open') }, IN_OAIY ? 'Project ▾' : '☰'),
     h('div.brand', h('span.logo', '◆'), h('span.brand-name', ' OAIY')),
     incognitoChip,
     projectSelect,
@@ -1037,10 +1039,23 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
         title: `${s.kind === 'call' ? (s.callId ? 'On a call with' : 'Calls with') : 'Text messages with'} ${s.title}${s.title !== s.key ? ` (${s.key})` : ''}`,
         unread: s.id === viewing ? 0 : s.unread,
         working: !!s.running,
+        // A finished conversation can go (not one that is working, or a live call).
+        close: s.running || s.callId ? undefined : () => void closeSession(s.id),
       })),
     ], viewing, selectSession);
     const shown = viewing ? sessions.get(viewing) : null;
     if (shown) chat.setBusy(!!shown.running);
+  }
+
+  /** Remove a call or text conversation from this project (asked first). */
+  async function closeSession(id: string): Promise<void> {
+    const session = sessions?.get(id);
+    if (!session || session.running || session.callId) return;
+    const what = session.kind === 'call' ? `the calls with ${session.title}` : `the text messages with ${session.title}`;
+    if (!(await confirmAction({ title: 'Remove this conversation?', message: `Its record of ${what} is deleted from this project. If they call or text again, a new one starts.`, ok: 'Remove', danger: true }))) return;
+    if (viewing === id) selectSession(null);
+    await sessions!.remove(session);
+    renderSessions();
   }
 
   /** Show a conversation: the project's own (null), or a text-message thread. */

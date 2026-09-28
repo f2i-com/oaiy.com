@@ -495,3 +495,36 @@ details.msg.compacted pre { white-space: pre-wrap; font-size: 12px; max-height: 
 .phone-form textarea { width: 100%; min-height: 90px; resize: vertical; }
 .phone-form .pair-code { font: 700 22px/1.2 var(--mono); letter-spacing: 0.2em; color: var(--accent); }
 .phone-form .row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+
+/* ---------- inside OAIY's window: its colours and type, and the project actions in one menu ---------- */
+:root.in-oaiy {
+  --bg: #080d18;
+  --panel: #0e1422;
+  --panel-2: #131c2d;
+  --border: #202a3c;
+  --text: #f4f7ff;
+  --muted: #98a6bd;
+  --accent: #7167ff;
+  --ok: #45d6a2;
+  --warn: #f2b84b;
+  --err: #ff6e78;
+}
+.in-oaiy body { font-family: 'Public Sans', Inter, ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif; }
+.in-oaiy button, .in-oaiy select, .in-oaiy input, .in-oaiy textarea { border-radius: 8px; }
+.in-oaiy button.primary { color: #fff; }
+.in-oaiy .brand { display: none; }
+.in-oaiy .topbar { flex-wrap: nowrap; gap: 8px; padding: 8px 12px; }
+.in-oaiy .menu-toggle { display: inline-block; font-size: 13px; padding: 4px 12px; }
+.in-oaiy .topbar .actions { display: none; }
+.in-oaiy .topbar.menu-open .actions {
+  display: flex; flex-direction: column; align-items: stretch; position: absolute; top: calc(100% - 2px); left: 10px; z-index: 30;
+  min-width: 230px; padding: 6px; gap: 2px; background: var(--panel); border: 1px solid var(--border); border-radius: 10px; box-shadow: 0 14px 36px rgba(0, 0, 0, 0.5);
+}
+.in-oaiy .topbar.menu-open .actions button { text-align: left; padding: 7px 12px; border-color: transparent; background: transparent; min-width: 0; }
+.in-oaiy .topbar.menu-open .actions button:hover { background: var(--panel-2); border-color: var(--border); }
+.in-oaiy .project-select { max-width: 260px; }
+.in-oaiy .session-tab.active { border-color: var(--accent); }
+
+/* A call or text conversation that has finished can be closed. */
+.session-close { margin-left: 2px; padding: 0 3px; border-radius: 50%; color: var(--muted); line-height: 1; cursor: pointer; }
+.session-close:hover { color: var(--text); background: var(--panel-2); }
