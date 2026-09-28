@@ -27,6 +27,57 @@
 /* OAIY's sidebar, beside this page, carries the name: the editor's rail keeps to its sections. */
 .in-oaiy .oaiy-sidebar > .oaiy-brand { display: none; }
 
+/* In OAIY's window the editor is one of OAIY's pages: no rail and no dock of its
+   own (OAIY's sidebar and dock are beside and below it). Its sections are tabs
+   in the topbar, in the breadcrumb's place. Two classes, so these hold in the
+   narrow-width rules below too. */
+.app-shell.in-oaiy-shell { grid-template-columns: minmax(0, 1fr); background: rgb(var(--color-bg-primary)); }
+.app-shell.in-oaiy-shell .oaiy-workspace { grid-template-rows: auto minmax(0, 1fr); }
+.app-shell.in-oaiy-shell .oaiy-topbar { min-height: 64px; padding-top: 8px; padding-bottom: 8px; }
+.oaiy-sections { display: flex; min-width: 0; align-items: center; gap: 10px; margin-bottom: 6px; }
+.oaiy-sections-new {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 5px;
+  height: 26px;
+  padding: 0 10px;
+  border: 1px solid rgb(var(--accent-primary));
+  border-radius: 7px;
+  background: rgb(var(--accent-primary) / 0.12);
+  color: rgb(var(--accent-primary));
+  font-size: 12px;
+  font-weight: 650;
+}
+.oaiy-sections-new:hover { background: rgb(var(--accent-primary) / 0.2); }
+.oaiy-sections-tabs {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  gap: 2px;
+  padding: 2px;
+  border: 1px solid rgb(var(--color-border-primary));
+  border-radius: 8px;
+  background: rgb(var(--color-bg-primary) / 0.6);
+}
+.oaiy-sections-tabs > button {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 22px;
+  padding: 0 9px;
+  border-radius: 6px;
+  color: rgb(var(--color-text-secondary));
+  font-size: 12px;
+  font-weight: 600;
+}
+.oaiy-sections-tabs > button:hover { color: rgb(var(--color-text-primary)); background: rgb(var(--color-bg-tertiary, var(--color-bg-secondary))); }
+.oaiy-sections-tabs > button.active { color: rgb(var(--accent-primary)); background: rgb(var(--accent-primary) / 0.12); }
+/* Narrow: the tabs keep their icons, and say their names in their titles. */
+@media (max-width: 900px) {
+  .oaiy-sections-tabs > button > span { display: none; }
+}
+
 /* Configure dark mode variant for class-based switching */
 @variant dark (&:where(.dark, .dark *));
 

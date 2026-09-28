@@ -17,7 +17,7 @@ import { usePackageManager, type LoadedPackage, type ActivePackageFlow } from '.
 import { JobQueueProvider, useJobQueue } from '../contexts/JobQueueContext';
 import { ConfirmDialogProvider } from '../hooks/useConfirmDialog';
 import ProjectImportButton from './ProjectImportButton';
-import { ShellSidebar, ShellTopbar, ShellIconAction, ShellDock } from './chrome/ShellChrome';
+import { ShellSidebar, ShellTopbar, ShellIconAction, ShellDock, ShellSections, shellNavItems, type ShellSectionsState } from './chrome/ShellChrome';
 import { Activity, HelpCircle, PanelLeft, Settings2, Share2 } from 'lucide-react';
 import { useTheme } from '../contexts/ThemeContext';
 import { useMediaQuery } from '../hooks/useMediaQuery';
@@ -569,6 +569,44 @@ export default function OAIYApp() {
     });
   }, [addToast]);
 
+  // The editor's sections (the rail's, or in OAIY's window the topbar's tabs).
+  // Picking a VIEW dismisses whatever overlay is up. Without this, tapping
+  // Workflows while Providers is open left Providers covering the workflow you
+  // had just asked to see, and the rail highlighted one thing while the screen
+  // showed another.
+  const sectionsState: ShellSectionsState = {
+    view: activeTab,
+    providersOpen: settingsPanelOpen && settingsInitialTab === 'services',
+    runsOpen: queuePanelOpen,
+    pluginsOpen: showPackageBrowser,
+    onSelectView: (v) => {
+      setQueuePanelOpen(false);
+      setShowPackageBrowser(false);
+      setSettingsPanelOpen(false);
+      setActiveTab(v);
+    },
+    onOpenQueue: () => {
+      if (queuePanelOpen) { setQueuePanelOpen(false); return; }
+      setSettingsPanelOpen(false); setShowPackageBrowser(false); setQueuePanelOpen(true);
+    },
+    onOpenPlugins: () => {
+      if (showPackageBrowser) { setShowPackageBrowser(false); return; }
+      setSettingsPanelOpen(false); setQueuePanelOpen(false); setShowPackageBrowser(true);
+    },
+    onOpenServices: () => {
+      if (settingsPanelOpen && settingsInitialTab === 'services') { setSettingsPanelOpen(false); return; }
+      setQueuePanelOpen(false);
+      setShowPackageBrowser(false);
+      setSettingsInitialTab('services');
+      setSettingsPanelOpen(true);
+    },
+  };
+  const newFlow = () => handleCreateFlow('Untitled flow');
+  const openSettings = () => {
+    if (settingsPanelOpen && settingsInitialTab !== 'services') { setSettingsPanelOpen(false); return; }
+    setQueuePanelOpen(false); setShowPackageBrowser(false); setSettingsInitialTab(undefined); setSettingsPanelOpen(true);
+  };
+
   return (
     <JobQueueProvider
       availableFlows={getAllFlows()}
@@ -591,60 +629,37 @@ export default function OAIYApp() {
         executor (defined above this provider, where useJobQueue can't
         be called directly) can reach. */}
     <JobQueueBridge handleRef={jobQueueRef} />
-    <div className="app-shell">
+    <div className={followsOaiy ? 'app-shell in-oaiy-shell' : 'app-shell'}>
       <a className="oaiy-skip" href="#oaiy-main">Skip to the canvas</a>
 
-      <ShellSidebar
-        providersOpen={settingsPanelOpen && settingsInitialTab === 'services'}
-        runsOpen={queuePanelOpen}
-        pluginsOpen={showPackageBrowser}
-        navOpen={navOpen}
-        isPhone={isPhone}
-        onCloseNav={() => setNavOpen(false)}
-        view={activeTab}
-        onSelectView={(v) => {
-          // Picking a VIEW dismisses whatever overlay is up. Without this,
-          // tapping Workflows while Providers is open left Providers covering
-          // the workflow you had just asked to see, and the rail highlighted
-          // one thing while the screen showed another.
-          setQueuePanelOpen(false);
-          setShowPackageBrowser(false);
-          setSettingsPanelOpen(false);
-          setActiveTab(v);
-        }}
-        onNewFlow={() => handleCreateFlow('Untitled flow')}
-        onOpenQueue={() => {
-          if (queuePanelOpen) { setQueuePanelOpen(false); return; }
-          setSettingsPanelOpen(false); setShowPackageBrowser(false); setQueuePanelOpen(true);
-        }}
-        onOpenPlugins={() => {
-          if (showPackageBrowser) { setShowPackageBrowser(false); return; }
-          setSettingsPanelOpen(false); setQueuePanelOpen(false); setShowPackageBrowser(true);
-        }}
-        onOpenServices={() => {
-          if (settingsPanelOpen && settingsInitialTab === 'services') { setSettingsPanelOpen(false); return; }
-          setQueuePanelOpen(false);
-          setShowPackageBrowser(false);
-          setSettingsInitialTab('services');
-          setSettingsPanelOpen(true);
-        }}
-        onOpenSettings={() => {
-          if (settingsPanelOpen) { setSettingsPanelOpen(false); return; }
-          setQueuePanelOpen(false); setShowPackageBrowser(false); setSettingsPanelOpen(true);
-        }}
-        settingsActive={settingsPanelOpen}
-        companionOnline={companion.available}
-        companionDetail={
-          companion.available
-            ? `Desktop v${companion.version ?? '?'}`
-            : 'Browser-only execution'
-        }
-      />
+      {/* In OAIY's window its own sidebar is beside the editor: the sections are tabs in the topbar instead. */}
+      {!followsOaiy && (
+        <ShellSidebar
+          {...sectionsState}
+          navOpen={navOpen}
+          isPhone={isPhone}
+          onCloseNav={() => setNavOpen(false)}
+          onNewFlow={newFlow}
+          onOpenSettings={openSettings}
+          settingsActive={settingsPanelOpen}
+          companionOnline={companion.available}
+          companionDetail={
+            companion.available
+              ? `Desktop v${companion.version ?? '?'}`
+              : 'Browser-only execution'
+          }
+        />
+      )}
 
       <main id="oaiy-main" className="oaiy-workspace" inert={isPhone && navOpen}>
         <ShellTopbar
           navOpen={navOpen}
-          onOpenNav={() => setNavOpen(true)}
+          onOpenNav={followsOaiy ? undefined : () => setNavOpen(true)}
+          sections={
+            followsOaiy ? (
+              <ShellSections items={shellNavItems(sectionsState)} onNewFlow={newFlow} onOpenSettings={openSettings} settingsActive={settingsPanelOpen && settingsInitialTab !== 'services'} />
+            ) : undefined
+          }
           crumb={activeTab === 'data' ? 'Data' : 'Workflows'}
           theme={resolvedTheme}
           onSetTheme={followsOaiy ? undefined : setTheme}
@@ -687,13 +702,15 @@ export default function OAIYApp() {
                   <Share2 size={16} />
                 </ShellIconAction>
               )}
-              <ShellIconAction
-                label="Toggle the job queue"
-                on={queuePanelOpen}
-                onClick={() => setQueuePanelOpen(!queuePanelOpen)}
-              >
-                <Activity size={16} />
-              </ShellIconAction>
+              {!followsOaiy && (
+                <ShellIconAction
+                  label="Toggle the job queue"
+                  on={queuePanelOpen}
+                  onClick={() => setQueuePanelOpen(!queuePanelOpen)}
+                >
+                  <Activity size={16} />
+                </ShellIconAction>
+              )}
               <ProjectImportButton
                 importProject={importProject}
                 projectName={project.name}
@@ -706,9 +723,11 @@ export default function OAIYApp() {
               >
                 <HelpCircle size={16} />
               </ShellIconAction>
-              <ShellIconAction label="Settings" onClick={() => setSettingsPanelOpen(true)}>
-                <Settings2 size={16} />
-              </ShellIconAction>
+              {!followsOaiy && (
+                <ShellIconAction label="Settings" onClick={() => setSettingsPanelOpen(true)}>
+                  <Settings2 size={16} />
+                </ShellIconAction>
+              )}
             </>
           }
         >
@@ -921,7 +940,7 @@ export default function OAIYApp() {
           </div>
         </section>
 
-        <ShellDock
+        {!followsOaiy && <ShellDock
           companionOnline={companion.available}
           endpointLabel={companion.available ? 'Local engine ready' : 'Local engine idle'}
           endpointUrl={backend.share ? backend.share.editUrl : DESKTOP_API_BASE}
@@ -935,7 +954,7 @@ export default function OAIYApp() {
           shared={!!backend.share}
           onManage={() => (backend.enabled ? setShareDialogOpen(true) : setSettingsPanelOpen(true))}
           manageLabel={backend.share ? 'Manage share' : 'Share'}
-        />
+        />}
       </main>
 
       {/* Settings Panel */}

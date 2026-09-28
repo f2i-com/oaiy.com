@@ -44,6 +44,88 @@ export interface ShellNavItem {
   onClick: () => void;
 }
 
+/** What the sections do, and which is showing: the same for the rail and for the tabs. */
+export interface ShellSectionsState {
+  view: ShellView;
+  providersOpen?: boolean;
+  runsOpen?: boolean;
+  pluginsOpen?: boolean;
+  onSelectView: (v: ShellView) => void;
+  onOpenQueue: () => void;
+  onOpenPlugins: () => void;
+  onOpenServices: () => void;
+}
+
+/** The editor's sections: its flows, their data, and the panels (providers, runs, plugins). */
+export function shellNavItems({ view, providersOpen = false, runsOpen = false, pluginsOpen = false, onSelectView, onOpenQueue, onOpenPlugins, onOpenServices }: ShellSectionsState): ShellNavItem[] {
+  const panel = providersOpen || runsOpen || pluginsOpen;
+  return [
+    { id: 'builder', label: 'Workflows', icon: Workflow, active: view === 'builder' && !panel, onClick: () => onSelectView('builder') },
+    { id: 'data', label: 'Data', icon: Database, active: view === 'data' && !panel, onClick: () => onSelectView('data') },
+    { id: 'runs', label: 'Runs', icon: Activity, active: runsOpen, onClick: onOpenQueue },
+    { id: 'providers', label: 'Providers', icon: Cloud, active: providersOpen, onClick: onOpenServices },
+    { id: 'plugins', label: 'Plugins', icon: Puzzle, active: pluginsOpen, onClick: onOpenPlugins },
+  ];
+}
+
+/* --------------------------------------------------------------- sections */
+
+/**
+ * In OAIY's window the editor has no rail of its own (OAIY's sidebar is beside
+ * it): its sections are a row of tabs at the top of the page, like the
+ * dashboard's own pages, with New flow first.
+ */
+export function ShellSections({
+  items,
+  onNewFlow,
+  onOpenSettings,
+  settingsActive,
+}: {
+  items: ShellNavItem[];
+  onNewFlow: () => void;
+  onOpenSettings: () => void;
+  settingsActive: boolean;
+}) {
+  return (
+    <nav className="oaiy-sections" aria-label="Flow editor">
+      <button type="button" className="oaiy-sections-new" onClick={onNewFlow} title="Make a new flow">
+        <Plus size={14} />
+        <span>New flow</span>
+      </button>
+      <div className="oaiy-sections-tabs" role="tablist" aria-label="Sections">
+        {items.map((item) => {
+          const Icon = item.icon;
+          return (
+            <button
+              type="button"
+              role="tab"
+              key={item.id}
+              className={item.active ? 'active' : ''}
+              aria-selected={item.active}
+              title={item.label}
+              onClick={item.onClick}
+            >
+              <Icon size={14} />
+              <span>{item.label}</span>
+            </button>
+          );
+        })}
+        <button
+          type="button"
+          role="tab"
+          className={settingsActive ? 'active' : ''}
+          aria-selected={settingsActive}
+          title="Settings"
+          onClick={onOpenSettings}
+        >
+          <Settings2 size={14} />
+          <span>Settings</span>
+        </button>
+      </div>
+    </nav>
+  );
+}
+
 /* ------------------------------------------------------------------ sidebar */
 
 export function ShellSidebar({
@@ -102,31 +184,7 @@ export function ShellSidebar({
     document.addEventListener('keydown', onKey, true);
     return () => document.removeEventListener('keydown', onKey, true);
   }, [isPhone, navOpen, onCloseNav]);
-  const nav: ShellNavItem[] = [
-    {
-      id: 'builder',
-      label: 'Workflows',
-      icon: Workflow,
-      active: view === 'builder' && !providersOpen && !runsOpen && !pluginsOpen,
-      onClick: () => onSelectView('builder'),
-    },
-    { id: 'providers', label: 'Providers', icon: Cloud, active: providersOpen, onClick: onOpenServices },
-    {
-      id: 'runs',
-      label: 'Runs',
-      icon: Activity,
-      active: runsOpen,
-      onClick: onOpenQueue,
-    },
-    { id: 'plugins', label: 'Plugins', icon: Puzzle, active: pluginsOpen, onClick: onOpenPlugins },
-    {
-      id: 'data',
-      label: 'Data',
-      icon: Database,
-      active: view === 'data' && !providersOpen && !runsOpen && !pluginsOpen,
-      onClick: () => onSelectView('data'),
-    },
-  ];
+  const nav = shellNavItems({ view, providersOpen, runsOpen, pluginsOpen, onSelectView, onOpenQueue, onOpenPlugins, onOpenServices });
 
   // Every control in the rail dismisses the drawer as well as doing its job.
   // Wrapped once here rather than at each call site: half of these open a panel
@@ -222,6 +280,7 @@ export function ShellTopbar({
   theme,
   onSetTheme,
   actions,
+  sections,
 }: {
   /** Opens the off-canvas nav. Only rendered below md, where the rail is not
    *  in the grid — above md the rail is always visible and needs no opener. */
@@ -237,9 +296,11 @@ export function ShellTopbar({
   /** Absent in OAIY's window, where the theme is OAIY's (its sidebar switches it). */
   onSetTheme?: (t: 'light' | 'dark') => void;
   actions?: ReactNode;
+  /** In OAIY's window: the sections' tabs, in the breadcrumb's place (OAIY's own header names the page). */
+  sections?: ReactNode;
 }) {
   return (
-    <header className="oaiy-topbar">
+    <header className={sections ? 'oaiy-topbar has-sections' : 'oaiy-topbar'}>
       {onOpenNav && (
         <button
           type="button"
@@ -254,9 +315,11 @@ export function ShellTopbar({
         </button>
       )}
       <div className="oaiy-title">
-        <span>
-          OAIY <ChevronRight size={12} /> {crumb}
-        </span>
+        {sections ?? (
+          <span>
+            OAIY <ChevronRight size={12} /> {crumb}
+          </span>
+        )}
         <div>
           {children}
           {chips}
