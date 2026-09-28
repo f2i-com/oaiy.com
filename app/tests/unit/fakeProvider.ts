@@ -8,6 +8,8 @@ export interface Step {
   error?: { status: number; body: string };
   text?: string;
   calls?: Array<{ name: string; input: Record<string, unknown> }>;
+  /** (OpenAI wire) Stream the text up to character `at`, then wait for `until` before the rest. */
+  hold?: { at: number; until: Promise<void> };
 }
 
 export const ANTHROPIC: ProviderConfig = { id: 'a', type: 'anthropic', name: 'Anthropic', apiKey: 'k', modelId: 'model-under-test' };
@@ -77,6 +79,27 @@ export function fakeProvider(wire: 'anthropic' | 'openai', script: Array<Step | 
     if (step.error) {
       n++;
       return new Response(step.error.body, { status: step.error.status, headers: { 'content-type': 'application/json' } });
+    }
+    if (step.hold && wire === 'openai') {
+      // Half the reply now, the rest later (a caller may speak over it in between).
+      const first = sse((step.text ?? '').slice(0, step.hold.at).match(/.{1,7}/gs)?.map((piece) => ({ choices: [{ index: 0, delta: { content: piece } }] })) ?? []);
+      const rest = openAIStream({ ...step, text: (step.text ?? '').slice(step.hold.at) }, n);
+      n++;
+      const until = step.hold.until;
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode(first));
+          void until.then(() => {
+            try {
+              controller.enqueue(new TextEncoder().encode(rest));
+              controller.close();
+            } catch {
+              /* the reader let go (the run was stopped) */
+            }
+          });
+        },
+      });
+      return new Response(stream, { status: 200, headers: { 'content-type': 'text/event-stream' } });
     }
     const text = wire === 'anthropic' ? anthropicStream(step, n) : openAIStream(step, n);
     n++;

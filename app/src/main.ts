@@ -7,7 +7,7 @@ import { NetGate } from './gate/netgate';
 import { sandboxAvailable, zippModule } from './sandbox/runner';
 import { loadSettings, saveAgentSettings, saveDesktop, saveGate, saveLastKeptProject, saveLastProject, saveMedia, saveMessages, saveProviders } from './settings';
 import { Desktop } from './desktop/bridge';
-import { DesktopEvents, Sessions, TEST_NUMBER, phoneConversationsTool } from './sessions';
+import { DesktopEvents, Sessions, TEST_NUMBER, callerNotesTool, phoneConversationsTool, tellAgentTool } from './sessions';
 import { flowSessionTools, flowToolHooks, readFlowStore } from './desktop/flowTools';
 import { TRANSCRIBE_TOOL, transcribeTool } from './desktop/transcribe';
 import { calendarTools } from './desktop/calendarTools';
@@ -330,13 +330,13 @@ async function main(): Promise<void> {
     const transcribe = transcribeTool(() => place().vfs, () => desktop);
     const calendar = calendarTools(() => desktop);
     const flowBuilder = flowBuilderTools(() => desktop);
-    const phone = phoneConversationsTool(() => sessions);
+    const phone = [phoneConversationsTool(() => sessions), callerNotesTool(() => sessions), tellAgentTool(() => sessions)];
     // The project's own agent in the Front desk is the phone's runner.
     const runner = () => withPreview && place() === frontDesk;
     return (): AgentOptions => ({
       // Flows made tools, and speech to text: both run on OAIY Desktop.
       // The calendar's tools only while there is one (the phone receptionist is installed).
-      sessionTools: () => [...(desktop ? [...flowTools, transcribe, ...(calendarAvailable ? calendar : []), ...flowBuilder] : flowTools), ...(runner() ? [phone] : [])],
+      sessionTools: () => [...(desktop ? [...flowTools, transcribe, ...(calendarAvailable ? calendar : []), ...flowBuilder] : flowTools), ...(runner() ? phone : [])],
       instructions: () => (runner() ? RUNNER_INSTRUCTIONS : ''),
       toolHooks: () => toolHooks,
       vfs: place().vfs,
@@ -363,6 +363,7 @@ async function main(): Promise<void> {
   const RUNNER_INSTRUCTIONS = [
     "This project is the Front desk, and you are the phone's runner. Each call, text-message thread and flow task is answered by a sub-agent of yours, in a conversation of its own (the tabs beside this one): each has its own context, reads this project's files but cannot change them, and takes its direction from /brief.md before every reply.",
     'You keep that direction. When your person tells you what callers or texters should hear, be offered, or not be promised, update /brief.md: short, current and plain, with anything out of date taken out. Put lasting facts (services explained, prices, areas served, answers to common questions) in files under /knowledge. Files your person attaches are kept in /uploads, where the sub-agents read them too.',
+    'Pass on what your person tells you, so the phone\'s agents know it: for everyone, /brief.md (read before every reply, so a call going on now has it at its next reply); about one person (their name, how they like things, what to tell them next time), caller_notes, which the agent of each of their calls reads as the call starts, and of their texts before every reply; for one conversation going on now (a call in progress), tell_agent. Each call starts fresh: its agent has what the brief and that person\'s note say, and looks up their earlier calls and texts itself.',
     'To see what the phone\'s agents said and did, use phone_conversations (the list, or one conversation). Opening hours and services come from the Calendar, not from files.',
   ].join('\n');
   const projectOptions = optionsFor(() => project, true);
@@ -384,8 +385,16 @@ async function main(): Promise<void> {
       () => desktop,
       {
         changed: () => renderSessions(),
+        // A caller's words while its agent answers go where they came, without splitting the reply being written.
         arrived: (session, text) => {
-          if (viewing === session.id) chat.user(text, []);
+          if (viewing === session.id) (session.running ? chat.heard(text) : chat.user(text, []));
+        },
+        finished: (session) => {
+          if (viewing === session.id) chat.endReply();
+        },
+        // The phone greets a caller by the name its agents know.
+        named: (note) => {
+          if (note.name) void desktop?.rememberCaller(note.number, note.name).catch(() => {});
         },
         event: (session, event) => {
           if (viewing === session.id) chat.event(event);

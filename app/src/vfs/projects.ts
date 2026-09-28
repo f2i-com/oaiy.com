@@ -87,6 +87,20 @@ export interface SessionInfo {
   handles?: string[];
 }
 
+/**
+ * What the phone's agents know about one person who calls or texts: their
+ * calls and texts share it (their numbers agree by the last nine digits).
+ */
+export interface CallerNote {
+  /** Their number, as the phone gave it. */
+  number: string;
+  name?: string;
+  /** Short facts worth knowing next time, oldest first. */
+  facts: string[];
+  /** When it last changed (ms). */
+  updatedAt: number;
+}
+
 /** A session id as a file name. */
 function safeName(id: string): string {
   return id.replace(/[^\w.-]+/g, '_');
@@ -339,6 +353,15 @@ export class OpenProject {
   /** The conversation, kept with the project (an incognito one's is deleted with it). */
   async saveChat(turns: Turn[]): Promise<void> {
     await writeBytes(this.dir, 'chat.json', JSON.stringify(turns));
+  }
+
+  /** What the phone's agents know about the people who call and text (the front desk's). */
+  async loadCallers(): Promise<CallerNote[]> {
+    return (await readJson<CallerNote[]>(this.dir, 'callers.json')) ?? [];
+  }
+
+  async saveCallers(list: CallerNote[]): Promise<void> {
+    await writeBytes(this.dir, 'callers.json', JSON.stringify(list));
   }
 
   /** The project's other conversations (a text-message thread, a call): what each is, newest first. */

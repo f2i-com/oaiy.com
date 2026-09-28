@@ -29,6 +29,8 @@ function fakeProject() {
       saveSessionChat: async (id: string, turns: Turn[]) => {
         chats.set(id, turns);
       },
+      loadCallers: async () => [],
+      saveCallers: async () => {},
     },
   };
 }

@@ -3,8 +3,8 @@ import { Agent } from '../../src/agent/agent';
 import type { Turn } from '../../src/agent/protocol';
 import { NetGate } from '../../src/gate/netgate';
 import { Vfs } from '../../src/vfs/vfs';
-import type { SessionInfo } from '../../src/vfs/projects';
-import { Sessions, Speech, callInstructions, earlierWords, sameNumber, spoken } from '../../src/sessions';
+import type { CallerNote, SessionInfo } from '../../src/vfs/projects';
+import { Sessions, Speech, callInstructions, callerNotesTool, promisesBooking, sameNumber, spoken, tellAgentTool, tidyReplies } from '../../src/sessions';
 import type { Desktop } from '../../src/desktop/bridge';
 import type { MessageSettings } from '../../src/settings';
 import { LOCAL, OPENAI, fakeProvider } from './fakeProvider';
@@ -61,6 +61,74 @@ describe('speaking what the agent writes', () => {
     expect(said.at(-1)).toBe("I've recorded the request for Thursday at ten.");
   });
 
+  it('a reply that only repeats what was said is still said: the caller is never met with silence', async () => {
+    const said: string[] = [];
+    const speech = new Speech(async (text) => void said.push(text));
+    const reply = (text: string) => {
+      speech.begin();
+      speech.push(text);
+      speech.flush();
+    };
+    reply('I will note the request as Tuesday at one. What name should I use?');
+    reply('I will note the request as Tuesday at one. What name should I use?');
+    reply('I will note the request as Tuesday at one. Anything else?');
+    await speech.done;
+    expect(said).toEqual([
+      'I will note the request as Tuesday at one.',
+      'What name should I use?',
+      'I will note the request as Tuesday at one.',
+      'What name should I use?',
+      'Anything else?',
+    ]);
+    // What the reply said, for when the caller speaks over it.
+    expect(speech.reply).toEqual(['Anything else?']);
+  });
+
+  it('one filler word opens a reply at most, never a run of them, and none after a tool', async () => {
+    const said: string[] = [];
+    const speech = new Speech(async (text) => void said.push(text));
+    speech.begin();
+    speech.push('Great! Let me look that up. Sure thing! ');
+    speech.flush();
+    speech.begin(true);
+    speech.push('Happy to! We have Friday free.');
+    speech.flush();
+    await speech.done;
+    expect(said).toEqual(['Great!', 'Let me look that up.', 'We have Friday free.']);
+  });
+
+  it("the call's replies are read back as the caller heard them: no line twice, no run of fillers", () => {
+    const turns: Turn[] = [
+      { role: 'user', text: 'Caller: A lawn mowing appointment.' },
+      { role: 'assistant', text: 'Great! Let me check what days we have open.', calls: [{ id: 't', name: 'lookup_business_data', input: {} }] },
+      { role: 'tool', results: [{ id: 't', name: 'lookup_business_data', content: 'unavailable', isError: false }] },
+      { role: 'assistant', text: 'Good! Let me check what days we have open. Sure thing! I can\'t check the calendar right now.', calls: [] },
+      { role: 'user', text: 'Caller: Okay.' },
+      { role: 'assistant', text: 'Let me check what days we have open.', calls: [] },
+    ];
+    tidyReplies(turns);
+    expect(turns.filter((t) => t.role === 'assistant').map((t) => (t as { text: string }).text)).toEqual([
+      'Great! Let me check what days we have open.',
+      "I can't check the calendar right now.",
+      // Nothing new in it: it was said again, so it stays.
+      'Let me check what days we have open.',
+    ]);
+  });
+
+  it('a booking counts as promised only when told as done or doing, not offered on a condition', () => {
+    expect(promisesBooking("Sure! I'll request Tuesday 29 September at 1 p.m. under Lance.")).toBe(true);
+    expect(promisesBooking("I've noted that down for Tuesday.")).toBe(true);
+    expect(promisesBooking("I can't check right now, so tell me the day and time you'd like and I'll take it as a request.")).toBe(false);
+    expect(promisesBooking("I'll request that. What name should I use?")).toBe(false);
+    expect(promisesBooking('Let me check what days we have open.')).toBe(false);
+  });
+
+  it('a reply in quotation marks is said without them', () => {
+    expect(spoken('"Of course! What service are you looking for today?"')).toBe('Of course! What service are you looking for today?');
+    expect(spoken('\u201cTuesday at 1 p.m.\u201d')).toBe('Tuesday at 1 p.m.');
+    expect(spoken("We don't mow on Sundays.")).toBe("We don't mow on Sundays.");
+  });
+
   it('a long run of words is spoken at a comma rather than waited on', async () => {
     const said: string[] = [];
     const speech = new Speech(async (text) => void said.push(text));
@@ -73,8 +141,10 @@ describe('speaking what the agent writes', () => {
   });
 
   it('its instructions put the phone first: spoken words, the call tools, the brief', () => {
-    const text = callInstructions('Lance', '+61491570006', 'You are Aokie, a warm receptionist.', 'Never quote prices.');
-    expect(text).toContain('live phone call with Lance (+61491570006)');
+    const text = callInstructions('You are Aokie, a warm receptionist.', 'Never quote prices.');
+    expect(text).toContain('This conversation is a live phone call');
+    // Nothing in them changes during a call or from call to call (the model's prompt cache keeps them).
+    expect(text).not.toMatch(/\d{4}|Lance/);
     expect(text).toContain('Everything you write is spoken aloud');
     expect(text).toContain('end_call');
     expect(text).toContain('The receptionist brief:\nYou are Aokie');
@@ -93,6 +163,11 @@ function setup(provider: ProviderConfig = OPENAI, toolWait?: Promise<void>) {
     loadSessionChat: async (id: string) => chats.get(id) ?? [],
     saveSessionChat: async (id: string, turns: Turn[]) => {
       chats.set(id, turns);
+    },
+    callers: [] as CallerNote[],
+    loadCallers: async () => project.callers,
+    saveCallers: async (list: CallerNote[]) => {
+      project.callers = list;
     },
   };
   const calls: Array<[string, string, unknown]> = [];
@@ -117,7 +192,7 @@ function setup(provider: ProviderConfig = OPENAI, toolWait?: Promise<void>) {
     () => desktop as unknown as Desktop,
     { changed: () => {}, event: () => {} },
   );
-  return { sessions, calls, chats };
+  return { sessions, calls, chats, project };
 }
 
 async function settled(sessions: Sessions): Promise<void> {
@@ -130,7 +205,7 @@ describe('a phone call answered by the agent', () => {
     const fake = fakeProvider('openai', [
       (body) => {
         const said = JSON.stringify(body.messages);
-        expect(said).toContain('A call from Lance (+61491570006) began. You greeted them: \\"Thanks for calling!\\"');
+        expect(said).toMatch(/A call from Lance \(\+61491570006\) began, [^.]+\. You greeted them: \\"Thanks for calling!\\"\\nToday is \w+ \d+ \w+ \d{4}\.\\nNothing is saved about them yet/);
         expect(said).toContain('Caller: Are you open on Saturday?');
         expect(JSON.stringify(body)).toContain('The receptionist brief:\\nYou are Aokie.');
         return { text: 'Yes, we are open on Saturday from nine. Anything else?' };
@@ -211,7 +286,7 @@ describe('a phone call answered by the agent', () => {
     await settled(sessions);
     expect(calls).toEqual([['say', 'call_3', "Let me check what's open on the calendar."]]);
     expect(fake.bodies).toHaveLength(1);
-    const rules = callInstructions('', '+61400000003', '', '');
+    const rules = callInstructions('', '');
     expect(rules).toContain('Never say you will check without doing it');
     expect(rules).toContain('Never make up availability');
     expect(rules).toContain('When the caller says goodbye or is done, call end_call');
@@ -238,30 +313,95 @@ describe('a phone call answered by the agent', () => {
     expect(calls.at(-1)).toEqual(['say', 'call_4', "I can't check the calendar right now."]);
   });
 
-  it("a new call starts afresh: only the caller's last words carry over, never a line said again and again", () => {
-    const check = "Let me check what's open on the calendar.";
-    const turns: Turn[] = [
-      { role: 'user', text: '[OAIY] 📞 A call from Lance began.', automatic: true },
-      { role: 'user', text: 'Caller: Hi, can you hear me?' },
-      { role: 'assistant', text: 'Yes, I can hear you!', calls: [] },
-      { role: 'user', text: "Caller: What's your availability?" },
-      { role: 'assistant', text: check, calls: [] },
-      { role: 'user', text: '[OAIY] You said what you will do…', automatic: true },
-      { role: 'assistant', text: check, calls: [] },
-      { role: 'assistant', text: '', calls: [{ id: 't1', name: 'lookup_business_data', input: {} }] },
-      { role: 'tool', results: [{ id: 't1', name: 'lookup_business_data', content: '{}', isError: false }] },
-      { role: 'user', text: 'Caller: Okay, bye.' },
-    ];
-    expect(earlierWords(turns)).toEqual([
-      { role: 'user', text: 'Caller: Hi, can you hear me?' },
-      { role: 'assistant', text: 'Yes, I can hear you!', calls: [] },
-      { role: 'user', text: "Caller: What's your availability?" },
-      { role: 'user', text: 'Caller: Okay, bye.' },
+  it("a new call starts afresh: the agent reads only this call, the earlier ones stay, and it can look them up", async () => {
+    const fake = fakeProvider('openai', [
+      { text: 'We mow on Tuesdays.' },
+      (body) => {
+        const sent = JSON.stringify(body.messages);
+        expect(sent).not.toContain('Do you mow on Tuesdays?');
+        expect(sent).not.toContain('We mow on Tuesdays.');
+        expect(sent).toContain('Caller: Hi again.');
+        return { text: '', calls: [{ name: 'earlier_conversations', input: { words: 'tuesdays' } }] };
+      },
+      (body) => {
+        const sent = JSON.stringify(body.messages);
+        expect(sent).toContain('Caller: Do you mow on Tuesdays?');
+        expect(sent).toContain('Agent: We mow on Tuesdays.');
+        return { text: 'Welcome back! Still after a Tuesday?' };
+      },
     ]);
-    expect(earlierWords(turns, 2)).toEqual([
-      { role: 'user', text: "Caller: What's your availability?" },
-      { role: 'user', text: 'Caller: Okay, bye.' },
+    const { sessions, chats } = setup();
+    const first = await sessions.callEvent({ type: 'call.started', callId: 'call_a', from: '+61400000010' });
+    await sessions.callEvent({ type: 'call.caller', callId: 'call_a', text: 'Do you mow on Tuesdays?' });
+    await settled(sessions);
+    await sessions.callEvent({ type: 'call.ended', callId: 'call_a' });
+    await sessions.callEvent({ type: 'call.started', callId: 'call_b', from: '0400000010' });
+    await sessions.callEvent({ type: 'call.caller', callId: 'call_b', text: 'Hi again.' });
+    await settled(sessions);
+    expect(fake.bodies).toHaveLength(3);
+    // Both calls are kept, for the chat.
+    const kept = JSON.stringify(chats.get(first!.id));
+    expect(kept).toContain('Do you mow on Tuesdays?');
+    expect(kept).toContain('Welcome back!');
+    // Only another caller's words are never found.
+    const other = await sessions.callEvent({ type: 'call.started', callId: 'call_c', from: '+61499999999' });
+    expect(sessions.earlierWith(other!, 'tuesdays')).toContain('Nothing earlier');
+  });
+
+  it("what the agent learns about a caller reaches their next call and texts, and the phone learns their name", async () => {
+    const fake = fakeProvider('openai', [
+      { text: '', calls: [{ name: 'remember', input: { name: 'Lance', fact: 'Has a big back lawn' } }] },
+      { text: 'Thanks, Lance!' },
+      (body) => {
+        const sent = JSON.stringify(body.messages);
+        expect(sent).toContain('Name: Lance');
+        expect(sent).toContain('- Has a big back lawn');
+        return { text: 'Hi Lance!' };
+      },
     ]);
+    const named: CallerNote[] = [];
+    const { sessions, project } = setup();
+    (sessions as unknown as { hooks: { named: (n: CallerNote) => void } }).hooks.named = (n) => void named.push({ ...n });
+    const call = await sessions.callEvent({ type: 'call.started', callId: 'call_n', from: '+61400000011' });
+    await sessions.callEvent({ type: 'call.caller', callId: 'call_n', text: "It's Lance, I've got a big back lawn." });
+    await settled(sessions);
+    expect(call?.title).toBe('Lance');
+    expect(named.at(-1)).toMatchObject({ number: '+61400000011', name: 'Lance', facts: ['Has a big back lawn'] });
+    expect(project.callers).toHaveLength(1);
+    await sessions.callEvent({ type: 'call.ended', callId: 'call_n' });
+    await sessions.callEvent({ type: 'call.started', callId: 'call_o', from: '0400000011' });
+    await sessions.callEvent({ type: 'call.caller', callId: 'call_o', text: 'Hello?' });
+    await settled(sessions);
+    expect(fake.bodies).toHaveLength(3);
+    // The runner reads and changes the same note.
+    const notes = callerNotesTool(() => sessions);
+    expect(await notes.run({}, new AbortController().signal)).toContain('Lance');
+    expect(await notes.run({ number: '0400000011', remove: 'lawn', add: 'Prefers mornings' }, new AbortController().signal)).toContain('- Prefers mornings');
+    expect(sessions.callerNote('+61400000011')?.facts).toEqual(['Prefers mornings']);
+  });
+
+  it('the runner passes a note to a call going on now: read with its next reply, or acted on at once', async () => {
+    const fake = fakeProvider('openai', [
+      (body) => {
+        expect(JSON.stringify(body.messages)).toContain('A note from the runner (the main agent your person talks to): Offer them 10% off.');
+        return { text: 'We can do ten percent off.' };
+      },
+      { text: 'Sorry to cut in, we can also do Sunday.' },
+    ]);
+    const { sessions, calls } = setup();
+    const tell = tellAgentTool(() => sessions);
+    const signal = new AbortController().signal;
+    const call = await sessions.callEvent({ type: 'call.started', callId: 'call_t', from: '+61400000012' });
+    expect(await tell.run({ id: call!.id, note: 'Offer them 10% off.' }, signal)).toContain('before its next reply');
+    expect(fake.bodies).toHaveLength(0);
+    await sessions.callEvent({ type: 'call.caller', callId: 'call_t', text: 'How much is a mow?' });
+    await settled(sessions);
+    expect(await tell.run({ id: call!.id, note: 'Tell them Sunday is free too.', now: true }, signal)).toContain('acts on it now');
+    await settled(sessions);
+    expect(fake.bodies).toHaveLength(2);
+    expect(calls.filter((c) => c[0] === 'say').map((c) => c[2])).toContain('Sorry to cut in, we can also do Sunday.');
+    await sessions.callEvent({ type: 'call.ended', callId: 'call_t' });
+    expect(await tell.run({ id: call!.id, note: 'Anything.' }, signal)).toContain('not on a call now');
   });
 
   it('when the caller speaks over it, the rest of that reply is not said', async () => {
@@ -278,6 +418,31 @@ describe('a phone call answered by the agent', () => {
     await sessions.callEvent({ type: 'call.caller', callId: 'call_5', text: 'Hello?' });
     await settled(sessions);
     expect(calls.filter((c) => c[0] === 'say')).toEqual([]);
+  });
+
+  it('a reply the caller speaks over stays in the conversation as far as they heard it', async () => {
+    let interrupt!: () => void;
+    let sayNow!: () => void;
+    const spokenYet = new Promise<void>((r) => (sayNow = r));
+    const fake = fakeProvider('openai', [
+      { text: 'We are open from nine. And on Sundays we are open too.', hold: { at: 23, until: spokenYet.then(() => interrupt()) } },
+      (body) => {
+        const sent = JSON.stringify(body.messages);
+        expect(sent).toContain('We are open from nine.…');
+        expect(sent).not.toContain('Sundays');
+        return { text: 'Sure, go ahead.' };
+      },
+    ]);
+    const { sessions, calls } = setup();
+    await sessions.callEvent({ type: 'call.started', callId: 'call_6', from: '+61400000006' });
+    interrupt = () => void sessions.callEvent({ type: 'call.interrupted', callId: 'call_6', itemId: 'out_1' });
+    await sessions.callEvent({ type: 'call.caller', callId: 'call_6', text: 'When are you open?' });
+    for (let i = 0; i < 100 && !calls.length; i++) await new Promise((r) => setTimeout(r, 10));
+    sayNow();
+    await settled(sessions);
+    await sessions.callEvent({ type: 'call.caller', callId: 'call_6', text: 'Sorry, one more thing.' });
+    await settled(sessions);
+    expect(fake.bodies).toHaveLength(2);
   });
 
   it('a caller speaking while a tool works does not stop it: the result and their words reach the agent, and the answer is spoken', async () => {
@@ -323,5 +488,27 @@ describe('a phone call answered by the agent', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it('a booking promised but not requested: the agent is told once, and requests it', async () => {
+    const fake = fakeProvider('openai', [
+      { text: "Thanks, Lance! I'll request Tuesday at one for a mow." },
+      (body) => {
+        expect(JSON.stringify(body.messages)).toContain('request_appointment was not called');
+        return { text: '', calls: [{ name: 'request_appointment', input: { callerName: 'Lance', service: 'mowing', date: '2026-09-29', time: '13:00', agreementPhrase: 'Tuesday at one' } }] };
+      },
+      { text: "It's requested." },
+      { text: "Sure, I'll note that too." },
+    ]);
+    const { sessions, calls } = setup();
+    await sessions.callEvent({ type: 'call.started', callId: 'call_b1', from: '+61400000013' });
+    await sessions.callEvent({ type: 'call.caller', callId: 'call_b1', text: "It's Lance, Tuesday at one is great." });
+    await settled(sessions);
+    expect(calls.map((c) => c[0])).toContain('request_appointment');
+    expect(calls.filter((c) => c[0] === 'say').map((c) => c[2])).toEqual(["Thanks, Lance!", "I'll request Tuesday at one for a mow.", "It's requested."]);
+    // Once a call: the next promise is left alone.
+    await sessions.callEvent({ type: 'call.caller', callId: 'call_b1', text: 'And my gate code is 1234.' });
+    await settled(sessions);
+    expect(fake.bodies).toHaveLength(4);
   });
 });

@@ -13,7 +13,7 @@ import type { Turn } from './agent/protocol';
 import type { Desktop, DesktopEvent } from './desktop/bridge';
 import { textCalendarTools } from './desktop/calendarTools';
 import type { MessageSettings } from './settings';
-import type { OpenProject, SessionInfo } from './vfs/projects';
+import type { CallerNote, OpenProject, SessionInfo } from './vfs/projects';
 
 /** A number that marks a pretend conversation: its replies are never sent. */
 export const TEST_NUMBER = 'test';
@@ -33,9 +33,16 @@ export interface Session extends SessionInfo {
   speech?: Speech;
   /** Its agent is using a tool now (a caller speaking over it does not stop the tool). */
   inTool?: boolean;
+  /** This call's agent was reminded that a booking it promised was not requested (once a call). */
+  bookingNudged?: boolean;
   /** A flow's tasks waiting for their answers, each by its prompt (one task a run; a message of the person's answers none). */
   answers?: Array<{ prompt: string; settle: (reply: string, error?: string) => void }>;
 }
+
+/** The most facts kept about one person (the oldest go first). */
+const MAX_FACTS = 30;
+/** The most turns a conversation keeps (a caller's calls add up): the oldest calls go first. */
+const MAX_KEPT_TURNS = 600;
 
 /** How the app makes an agent for this project, with a conversation's own instructions and tools. */
 export type MakeAgent = (extra: Pick<AgentOptions, 'instructions' | 'sessionTools' | 'tools' | 'reasoning' | 'conversation'>) => Agent;
@@ -63,6 +70,10 @@ export interface SessionHooks {
   arrived?: (session: Session, text: string) => void;
   /** What a conversation's agent is doing (drawn when that conversation is shown). */
   event: (session: Session, event: AgentEvent) => void;
+  /** A run ended (finished, failed or cut off): what comes next is a new reply. */
+  finished?: (session: Session) => void;
+  /** What is known about a person changed (the phone greets them by name). */
+  named?: (note: CallerNote) => void;
 }
 
 const digits = (number: string) => number.replace(/[^\d+]/g, '');
@@ -78,17 +89,41 @@ export function textMessage(title: string, number: string, body: string): string
   return `Text message from ${who}:\n${body}`;
 }
 
+/** Today, as a person says it ("Monday 28 September 2026"): so "next Tuesday" can be worked out. The date only: a prompt that changed each minute would miss the model's cache. */
+export function today(now = new Date()): string {
+  return now.toLocaleDateString('en-AU', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' }).replace(',', '');
+}
+
+/** When something happened, short ("Mon 28 Sep, 11:05 pm"). */
+export function whenSaid(ms: number): string {
+  return new Date(ms).toLocaleString('en-AU', { weekday: 'short', day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit' });
+}
+
+/** What a call's or a text thread's agent is told about the person, from their note. */
+export function knownText(note: CallerNote | undefined): string {
+  const tools = 'Save their name when they tell you it, and anything worth knowing next time, with remember; earlier_conversations finds what was said in their earlier calls and texts.';
+  if (!note || (!note.name && !note.facts.length)) return `Nothing is saved about them yet. ${tools}`;
+  return [
+    'What you know about them, saved across their calls and texts (by you, or by the main agent your person talks to):',
+    `Name: ${note.name || 'not known yet'}`,
+    ...note.facts.map((f) => `- ${f}`),
+    tools,
+  ].join('\n');
+}
+
 /** What a text-message conversation is for, in its agent's instructions. */
-export function smsInstructions(title: string, number: string, instructions: string, test: boolean): string {
+export function smsInstructions(title: string, number: string, instructions: string, test: boolean, known = '', now = new Date()): string {
   const who = title && title !== number ? `${title} (${number})` : number;
   return [
-    `This conversation is a text-message thread with ${who}, on the phone of the person you work for.${test ? ' It is a test: your replies are shown, not sent.' : ''}`,
+    `This conversation is a text-message thread with ${who}, on the phone of the person you work for.${test ? ' It is a test: your replies are shown, not sent.' : ''} Today is ${today(now)}.`,
     'Their messages arrive as "Text message from …". Answer them with send_text_message: short plain text (no markdown), in the language they write in. Only what you send with it reaches them; anything else you write is seen only by the person you work for.',
     'A message without that label comes from the person you work for, who may be watching: do what they say (they may tell you what to reply, or ask you to do something first).',
     `${REFERENCE} Use your flows made tools when a message needs one. You cannot change files, browse the web or run code here. There is no need to reply to a message that needs no answer (a thank-you, an emoji).`,
     'To book them in: find a time with calendar_free_times, agree a day and time with them, then request_appointment. It is a request that staff confirm (they are texted when it is): never say it is booked.',
+    'A message "[OAIY] A note from the runner" is your person\'s direction, passed on by the main agent they talk to: go by it, without quoting it.',
+    known,
     `The instructions of the person you work for, for text messages:\n${instructions.trim() || '(none)'}`,
-  ].join('\n');
+  ].filter(Boolean).join('\n');
 }
 
 /**
@@ -104,14 +139,23 @@ export class Speech {
   private said = new Set<string>();
   /** Something has been said in this reply. */
   private spoke = false;
+  /** This reply's sentences held back as said before: said after all when the reply has nothing new (the caller is never met with silence). */
+  private repeated: string[] = [];
+  /** What this reply has said so far (what the caller heard of it, when they spoke over it). */
+  reply: string[] = [];
+  /** A filler word ("Sure!") may start this reply: not after a tool, and only once. */
+  private fillerOk = true;
 
   constructor(private readonly say: (text: string) => Promise<void>, private readonly failed: (error: string) => void = () => {}) {}
 
   /** A new reply: speak again. */
-  begin(): void {
+  begin(afterTool = false): void {
     this.hushed = false;
     this.buffer = '';
     this.spoke = false;
+    this.repeated = [];
+    this.reply = [];
+    this.fillerOk = !afterTool;
   }
 
   /** A tool is taking a while: say a short line, unless this reply has said something already. */
@@ -144,8 +188,13 @@ export class Speech {
 
   /** The reply ended: speak what is left. */
   flush(): void {
-    if (!this.hushed) this.speak(this.buffer);
+    if (!this.hushed) {
+      this.speak(this.buffer);
+      // Everything it said was said before: better said again than nothing at all.
+      if (!this.spoke) for (const line of this.repeated) this.enqueue(line);
+    }
     this.buffer = '';
+    this.repeated = [];
   }
 
   hush(): void {
@@ -161,43 +210,115 @@ export class Speech {
   private speak(text: string): void {
     const clean = spoken(text);
     if (!clean) return;
+    // A filler word is said only to open a reply: a run of them ("Sure thing! Happy to!") is noise.
+    if (isFiller(clean)) {
+      const ok = this.fillerOk;
+      this.fillerOk = false;
+      if (!ok) return;
+    } else this.fillerOk = false;
     // A sentence of a few words already said on this call is not said again (a model repeats itself;
     // a short "Sure!" or "Okay." may come again).
     const key = clean.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
     if (key.split(' ').length >= 4) {
-      if (this.said.has(key)) return;
+      if (this.said.has(key)) {
+        this.repeated.push(clean);
+        return;
+      }
       this.said.add(key);
     }
+    this.enqueue(clean);
+  }
+
+  private enqueue(clean: string): void {
     this.spoke = true;
+    this.reply.push(clean);
     this.chain = this.chain.then(() => (this.hushed ? undefined : this.say(clean))).catch((e: unknown) => this.failed((e as Error).message));
   }
 }
 
-/** Text as it can be said: no markdown, links as their words, no emoji. */
+/** A sentence that is only a filler word or two: "Sure!", "Great!", "Happy to!", "Of course!". */
+export function isFiller(sentence: string): boolean {
+  return /^(sure( thing)?|great|good|okay|ok|of course|happy to( help)?|you bet|absolutely|certainly|perfect|no problem|alright|all right|awesome|wonderful|excellent|got it|right|lovely|no worries)[!.,]*$/i.test(sentence.trim());
+}
+
+/** A reply's sentences, split where Speech splits them. */
+function sentences(text: string): string[] {
+  return text.split(/(?<=[.!?\u2026]["')\]]?)\s+|\n+/).map((x) => x.trim()).filter(Boolean);
+}
+
+/**
+ * A call's replies as the caller heard them, for the model to read back: a
+ * sentence said before on the call is left out (Speech did not say it again),
+ * and so is a filler word anywhere but a reply's start. What a model reads of
+ * itself it copies, so a line left in would come back again and again.
+ */
+export function tidyReplies(turns: Turn[]): void {
+  const said = new Set<string>();
+  for (let i = 0; i < turns.length; i++) {
+    const t = turns[i];
+    if (t.role !== 'assistant' || !t.text.trim()) continue;
+    const opens = turns[i - 1]?.role === 'user';
+    const kept: string[] = [];
+    for (const [n, line] of sentences(t.text).entries()) {
+      const clean = spoken(line);
+      const key = clean.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
+      if (isFiller(clean) && !(opens && n === 0)) continue;
+      if (key.split(' ').length >= 4) {
+        if (said.has(key)) continue;
+        said.add(key);
+      }
+      kept.push(clean);
+    }
+    // All of it was said before: it was said again (see Speech.flush), so it stays.
+    if (kept.length) t.text = kept.join(' ');
+  }
+}
+
+/** Text as it can be said: no markdown, links as their words, no emoji, no quotation marks (a model may quote its own reply). */
 export function spoken(text: string): string {
   return text
     .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
-    .replace(/[*_`#>|~]+/g, '')
+    .replace(/[*_`#>|~"\u201c\u201d]+/g, '')
     .replace(/\p{Extended_Pictographic}/gu, '')
     .replace(/\s+/g, ' ')
     .trim();
 }
 
 /** What a call conversation is for, in its agent's instructions. */
-export function callInstructions(title: string, number: string, brief: string, instructions: string): string {
-  const who = title && title !== number ? `${title} (${number})` : number || 'the caller';
+export function callInstructions(brief: string, instructions: string): string {
   return [
-    `This conversation is a live phone call with ${who}, on the phone of the person you work for. Everything you write is spoken aloud to the caller as you write it, so write only what you would say: one or two short sentences, plain words, no markdown, lists, emoji or links. Then stop, and let them answer.`,
-    'Their words arrive as "Caller: …", transcribed from speech (allow for a misheard word). A message without that label comes from the person you work for, who may be watching: do what they say.',
+    `This conversation is a live phone call, on the phone of the person you work for: who is calling, today's date and what you know about them are in the note that starts the call. Everything you write is spoken aloud to the caller as you write it, so write only what you would say: one or two short sentences, plain words, no markdown, lists, emoji, links or quotation marks. Start with what matters, not a filler word. Then stop, and let them answer.`,
+    'Their words arrive as "Caller: …", transcribed from speech (allow for a misheard word). A message "[OAIY] A note from the runner" is your person\'s direction, passed on by the main agent they talk to: go by it, without reading it out. Any other message without the "Caller:" label comes from the person you work for, who may be watching: do what they say.',
     'Your call tools: request_appointment (a booking request for staff to confirm; never say it is booked or confirmed), lookup_business_data (a question about the business\'s records or calendar), end_call (a short goodbye, then the call ends; use it when the caller is done). Your other tools work too.',
     REFERENCE,
     'To look something up (a tool, a file), do it in the same reply as a few words: say "Let me check." and make the call at once, then answer from what it returned. Never say you will check without doing it: the caller hears you and waits. If the caller speaks while you check, their words reach you with the result: answer both.',
-    'Say only what you know: from these instructions, the brief, or what a tool returned. Never make up availability, times, prices or bookings. If you cannot check, say so, and offer to take their preferred time as a request for staff to confirm.',
+    'Say only what you know: from these instructions, the brief, or what a tool returned. Never make up availability, times, prices or bookings, and never say a time is free or agree to one unless a tool said it is. If you cannot check, say so, and offer to take their preferred time as a request for staff to confirm.',
+    'To take a booking request: once you have the service, the day and time they want and their name, call request_appointment in that same reply, and only then tell them it is requested. Saying you have noted it without calling request_appointment records nothing.',
     'Never repeat something you have already said on this call. When the caller says goodbye or is done, call end_call with a short goodbye, and write nothing else.',
+    'When you know their name, use it now and then, as a receptionist who remembers them would.',
     brief.trim() ? `The receptionist brief:\n${brief.trim()}` : '',
     `The instructions of the person you work for, for calls:\n${instructions.trim() || '(none)'}`,
   ].filter(Boolean).join('\n');
 }
+
+/**
+ * Whether a reply tells the caller a booking is (or will be) requested or noted:
+ * "I'll request Tuesday at one", "I've noted that down", "I'll put you in for…".
+ */
+export function promisesBooking(text: string): boolean {
+  const t = text.trim();
+  // Asking, or offering on a condition ("tell me a time and I'll take it as a request"), is not a promise.
+  if (!t || /\?\s*$/.test(t) || /\b(if|tell me|let me know|would you like|what day|what time|which day|when would)\b/i.test(t)) return false;
+  return /\b(i['’]ll|i will|i['’]ve|i have|i['’]m going to)\s+(just\s+)?(request|book|note|pencil|put (you|it|that|this) (in|down)|lock)/i.test(t);
+}
+
+/** Whether the caller has said when they want to come: a day, a date or a time. */
+export function namesATime(turns: Turn[]): boolean {
+  return turns.some((t) => t.role === 'user' && t.text.startsWith('Caller:') && /\b(mon|tues|wednes|thurs|fri|satur|sun)day\b|\b(tomorrow|today|tonight|morning|afternoon|evening|noon|midday|next week)\b|\b\d{1,2}(:\d\d)?\s*(a\.?m\.?|p\.?m\.?)|\bo'?clock\b|\b\d{1,2}(st|nd|rd|th)\b/i.test(t.text));
+}
+
+/** What a call's agent is told when it promised a booking without requesting it. */
+const BOOKING_NUDGE = "[OAIY] You told the caller their booking is requested, but request_appointment was not called, so nothing is recorded. Call it now (agreementPhrase: the caller's own words agreeing to the day and time), then tell them in a few words that it is requested.";
 
 /** How long a tool may run on a call before a short line is said, and the line. */
 const HOLD_AFTER_MS = 2_000;
@@ -207,36 +328,46 @@ const HOLD_LINE = 'One moment, let me check.';
 export const LOOKUP_UNAVAILABLE =
   "The business's records could not be checked just now (no business lookup is set up on OAIY Desktop, or it failed). Do not guess times, availability, prices or bookings: tell the caller you can't check right now, and offer to take their preferred time as a request for staff to confirm.";
 
-/**
- * What a new call keeps of the caller's earlier calls: the last few things said, without the
- * automatic notes, tool calls, or any line the agent said more than once. A model copies what it
- * said before, so a repeated line would be said on every call.
- */
-export function earlierWords(turns: Turn[], keep = 6): Turn[] {
-  const words: Array<{ role: 'user' | 'assistant'; text: string }> = [];
-  for (const t of turns) {
-    if (t.role === 'user' && !t.automatic && t.text.startsWith('Caller:')) words.push({ role: 'user', text: t.text });
-    else if (t.role === 'assistant' && !t.calls.length && t.text.trim()) words.push({ role: 'assistant', text: t.text });
-  }
-  const times = new Map<string, number>();
-  for (const t of words) if (t.role === 'assistant') times.set(t.text.trim(), (times.get(t.text.trim()) ?? 0) + 1);
-  return words
-    .filter((t) => t.role === 'user' || times.get(t.text.trim()) === 1)
-    .slice(-keep)
-    .map((t): Turn => (t.role === 'user' ? { role: 'user', text: t.text } : { role: 'assistant', text: t.text, calls: [] }));
+/** The note that starts a call: who, when, and what is known about them (the model's view of the call starts there). */
+export function callStartNote(who: string, greeting: string, known: string, now = new Date()): string {
+  const greeted = greeting.trim() ? ` You greeted them: "${greeting.trim()}"` : '';
+  return `[OAIY] 📞 A call from ${who} began, ${whenSaid(now.getTime())}.${greeted}\nToday is ${today(now)}.\n${known}`;
 }
 
-/** A conversation's words, as the runner reads them: who said what, and what was done. */
-export function conversationText(turns: Turn[], last = 40): string {
+/** A call's first turn: the note that it began (the model's view of the call starts there). */
+export function isCallStart(turn: Turn): boolean {
+  return turn.role === 'user' && !!turn.automatic && turn.text.startsWith('[OAIY] 📞 A call from');
+}
+
+/**
+ * A conversation's turns as its parts: each call on its own (from the note that
+ * it began), with that note as its title; a text thread is one part.
+ */
+export function conversationParts(turns: Turn[]): Array<{ title: string; lines: string[] }> {
+  const parts: Array<{ title: string; turns: Turn[] }> = [];
+  for (const t of turns) {
+    if (isCallStart(t) || !parts.length) parts.push({ title: isCallStart(t) ? (t as { text: string }).text.replace(/^\[OAIY\]\s*/, '').split('. ')[0] : '', turns: [] });
+    parts[parts.length - 1].turns.push(t);
+  }
+  return parts.map((p) => ({ title: p.title, lines: conversationLines(p.turns) })).filter((p) => p.lines.length);
+}
+
+/** A conversation's words, a line each: who said what, and what was done. */
+export function conversationLines(turns: Turn[]): string[] {
   const lines: string[] = [];
   for (const t of turns) {
-    if (t.role === 'user') lines.push(t.text.startsWith('[OAIY]') ? `(${t.text.replace(/^\[OAIY\]\s*/, '')})` : t.text);
+    if (t.role === 'user') lines.push(t.text.startsWith('[OAIY]') ? `(${t.text.replace(/^\[OAIY\]\s*/, '').split('\n')[0]})` : t.text.replace(/^\[The user sent this while you[^\]]*\]\n\n/, ''));
     else if (t.role === 'assistant') {
       if (t.text.trim()) lines.push(`Agent: ${t.text.trim()}`);
       for (const c of t.calls) lines.push(`(used ${c.name}${c.name === 'send_text_message' && typeof c.input.body === 'string' ? `: "${c.input.body}"` : ''})`);
     }
   }
-  const shown = lines.slice(-last).join('\n');
+  return lines;
+}
+
+/** A conversation's words, as the runner reads them: who said what, and what was done. */
+export function conversationText(turns: Turn[], last = 40): string {
+  const shown = conversationLines(turns).slice(-last).join('\n');
   return shown.length > 8000 ? `…${shown.slice(-8000)}` : shown;
 }
 
@@ -262,10 +393,83 @@ export function phoneConversationsTool(sessions: () => Sessions | null): Session
         return `${s.kind === 'call' ? 'Calls' : s.kind === 'task' ? "Tasks from the flow" : 'Text messages'} with ${s.title}${s.title !== s.key ? ` (${s.key})` : ''}${s.callId ? ', on a call now' : ''}:\n${conversationText(s.agent.turns, last) || '(nothing yet)'}`;
       }
       if (!all.length) return 'No calls, texts or flow tasks yet.';
-      const when = (ms: number) => new Date(ms).toLocaleString('en-AU', { weekday: 'short', day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit' });
       return all
-        .map((s) => `${s.id}: ${s.kind === 'call' ? 'call' : s.kind === 'task' ? 'flow task' : 'texts'} with ${s.title}${s.title !== s.key ? ` (${s.key})` : ''}, last ${when(s.lastAt)}${s.running ? ', working now' : ''}${s.callId ? ', on a call now' : ''}`)
+        .map((s) => `${s.id}: ${s.kind === 'call' ? 'calls' : s.kind === 'task' ? 'flow task' : 'texts'} with ${s.title}${s.title !== s.key ? ` (${s.key})` : ''}, last ${whenSaid(s.lastAt)}${s.running ? ', working now' : ''}${s.callId ? ', on a call now' : ''}`)
         .join('\n');
+    },
+  };
+}
+
+/** One person's note, as the runner reads it. */
+function noteText(c: CallerNote): string {
+  return `${c.number}: ${c.name || '(no name yet)'}${c.facts.length ? `\n${c.facts.map((f) => `  - ${f}`).join('\n')}` : ''}`;
+}
+
+/**
+ * The runner's view of what its sub-agents know about each person who calls
+ * or texts, and a way to change it: what it knows reaches their next reply.
+ */
+export function callerNotesTool(sessions: () => Sessions | null): SessionTool {
+  return {
+    spec: {
+      name: 'caller_notes',
+      description:
+        "What the phone's agents know about each person who calls or texts: one note a person (their name, and short facts): each of their calls' agents reads it as the call starts, their text thread's agent before every reply. With no number: everyone's. With a number: theirs. To change it, give name, add (one fact), remove (takes out the facts that contain these words) or facts (all of them, replacing the rest).",
+      parameters: {
+        type: 'object',
+        properties: {
+          number: { type: 'string', description: 'Their phone number' },
+          name: { type: 'string' },
+          add: { type: 'string', description: 'A fact to add, in a few words' },
+          remove: { type: 'string' },
+          facts: { type: 'array', items: { type: 'string' } },
+        },
+      },
+    },
+    run: async (input) => {
+      const all = sessions();
+      if (!all) throw new Error('the phone is not set up here (OAIY Desktop has not connected yet)');
+      const number = typeof input.number === 'string' ? input.number.trim() : '';
+      if (!number) return all.callers.length ? all.callers.map(noteText).join('\n') : 'Nothing is saved about anyone yet.';
+      const change = {
+        ...(typeof input.name === 'string' ? { name: input.name } : {}),
+        ...(typeof input.add === 'string' && input.add.trim() ? { add: input.add } : {}),
+        ...(typeof input.remove === 'string' && input.remove.trim() ? { remove: input.remove } : {}),
+        ...(Array.isArray(input.facts) ? { facts: input.facts.map(String) } : {}),
+      };
+      if (!Object.keys(change).length) {
+        const note = all.callerNote(number);
+        return note ? noteText(note) : `Nothing is saved about ${number}.`;
+      }
+      return `Saved. ${noteText(await all.noteCaller(number, change))}`;
+    },
+  };
+}
+
+/**
+ * The runner passes something on to one of the phone's conversations: read
+ * with its next reply, or acted on at once.
+ */
+export function tellAgentTool(sessions: () => Sessions | null): SessionTool {
+  return {
+    spec: {
+      name: 'tell_agent',
+      description:
+        "Pass a note to one of the phone's conversations (its id from phone_conversations): a call happening now, a text thread, or a flow's tasks. Its agent reads it before its next reply, as your person's direction. With now, it acts on it at once (on a call it may speak to the caller; in a text thread it may text them). For every conversation, change /brief.md instead; for one person's next calls and texts, caller_notes.",
+      parameters: {
+        type: 'object',
+        required: ['id', 'note'],
+        properties: { id: { type: 'string' }, note: { type: 'string', description: 'What it should know or do' }, now: { type: 'boolean' } },
+      },
+    },
+    run: async (input) => {
+      const all = sessions();
+      const id = typeof input.id === 'string' ? input.id.trim() : '';
+      const session = all?.get(id);
+      if (!all || !session) return `No conversation ${id}. Call phone_conversations for the list.`;
+      const note = typeof input.note === 'string' ? input.note.trim() : '';
+      if (!note) throw new Error('note is empty: write what it should know or do');
+      return all.pass(session, note, input.now === true);
     },
   };
 }
@@ -277,6 +481,8 @@ export function taskInstructions(flow: string): string {
 
 export class Sessions {
   list: Session[] = [];
+  /** What the phone's agents know about the people who call and text: one note a person. */
+  callers: CallerNote[] = [];
   /** Conversations with messages waiting, in the order they came. */
   /** Conversations waiting to run, one at a time per lane: calls in their own (a caller never waits behind a text or a flow's task), the rest in another. */
   private queue: Session[] = [];
@@ -304,6 +510,7 @@ export class Sessions {
 
   /** The project's saved conversations. */
   async load(): Promise<void> {
+    this.callers = await this.project.loadCallers();
     for (const info of await this.project.loadSessions()) {
       const session = this.create(info);
       session.agent.turns = await this.project.loadSessionChat(info.id);
@@ -325,8 +532,8 @@ export class Sessions {
     const session = { ...info, running: null, controller: null, waiting: [] } as unknown as Session;
     if (info.kind === 'call') {
       session.agent = this.makeAgent({
-        instructions: () => this.directed(callInstructions(session.title, session.key, session.brief ?? '', this.settings().callInstructions)),
-        sessionTools: this.callTools(session),
+        instructions: () => this.directed(callInstructions(session.brief ?? '', this.settings().callInstructions)),
+        sessionTools: [...this.callTools(session), ...this.personTools(session)],
         tools: TOOLS.filter((t) => CALL_TOOLS.has(t.name)),
         // Answer at once: no thinking first.
         reasoning: 'none',
@@ -348,14 +555,111 @@ export class Sessions {
     }
     const test = info.key === TEST_NUMBER;
     session.agent = this.makeAgent({
-      instructions: () => this.directed(smsInstructions(session.title, session.key, this.settings().instructions, test)),
+      instructions: () => this.directed(smsInstructions(session.title, session.key, this.settings().instructions, test, knownText(this.callerNote(session.key)))),
       // A texter reaches the front desk's files, to read (see KNOWLEDGE_TOOLS).
       tools: TOOLS.filter((t) => KNOWLEDGE_TOOLS.has(t.name)),
       // A pretend thread does not put requests in the real calendar.
-      sessionTools: [this.replyTool(session, test), ...(test ? [] : textCalendarTools(this.desktop, session.key, () => session.title))],
+      sessionTools: [this.replyTool(session, test), ...this.personTools(session), ...(test ? [] : textCalendarTools(this.desktop, session.key, () => session.title))],
       conversation: true,
     });
     return session;
+  }
+
+  /** What is known about the person at `number` (a call's and a text thread's numbers agree by their last nine digits). */
+  callerNote(number: string): CallerNote | undefined {
+    return this.callers.find((c) => c.number === number || sameNumber(c.number, number));
+  }
+
+  /**
+   * Change what is known about the person at `number`: their name, a fact added
+   * or taken out, or all the facts at once. Their conversations take the name.
+   */
+  async noteCaller(number: string, change: { name?: string; add?: string; remove?: string; facts?: string[] }): Promise<CallerNote> {
+    const clean = (f: string) => f.replace(/\s+/g, ' ').trim().slice(0, 200);
+    let note = this.callerNote(number);
+    if (!note) {
+      note = { number: number === TEST_NUMBER ? number : digits(number) || number, facts: [], updatedAt: Date.now() };
+      this.callers.push(note);
+    }
+    if (typeof change.name === 'string') note.name = clean(change.name).slice(0, 80) || undefined;
+    if (change.facts) note.facts = change.facts.map(clean).filter(Boolean);
+    const add = clean(change.add ?? '');
+    if (add && !note.facts.some((f) => f.toLowerCase() === add.toLowerCase())) note.facts.push(add);
+    const remove = (change.remove ?? '').trim().toLowerCase();
+    if (remove) note.facts = note.facts.filter((f) => !f.toLowerCase().includes(remove));
+    note.facts = note.facts.slice(-MAX_FACTS);
+    note.updatedAt = Date.now();
+    if (note.name) for (const s of this.list) if (s.kind !== 'task' && (s.key === note.number || sameNumber(s.key, note.number))) s.title = note.name;
+    await this.project.saveCallers(this.callers);
+    await this.saveIndex();
+    this.hooks.named?.(note);
+    this.hooks.changed();
+    return note;
+  }
+
+  /** The person's earlier calls and texts (theirs only, never anyone else's), as their agent reads them. */
+  earlierWith(session: Session, words = ''): string {
+    const parts: Array<{ title: string; lines: string[] }> = [];
+    for (const s of this.list) {
+      if (s.kind === 'task' || !(s === session || s.key === session.key || sameNumber(s.key, session.key))) continue;
+      // What this conversation's agent reads already is left out.
+      const end = s === session ? s.agent.turns.length - s.agent.view().length : s.agent.turns.length;
+      for (const part of conversationParts(s.agent.turns.slice(0, end))) parts.push({ title: s.kind === 'call' ? part.title || 'A call' : 'Their text messages', lines: part.lines });
+    }
+    if (!parts.length) return 'Nothing earlier: this is the first time they have been in touch (or what came before was removed).';
+    const cut = (text: string) => (text.length > 6000 ? `…${text.slice(-6000)}` : text);
+    const wanted = words.toLowerCase().split(/[^\p{L}\p{N}]+/u).filter((w) => w.length >= 3);
+    if (wanted.length) {
+      const found: string[] = [];
+      for (const part of parts) {
+        const hits = part.lines.filter((l) => wanted.some((w) => l.toLowerCase().includes(w)));
+        if (hits.length) found.push(`${part.title}:`, ...hits.map((l) => `  ${l}`));
+      }
+      return found.length ? cut(found.slice(-60).join('\n')) : `Nothing earlier with them mentions "${words.trim()}".`;
+    }
+    return cut(parts.slice(-3).map((p) => `${p.title}:\n${p.lines.slice(-20).map((l) => `  ${l}`).join('\n')}`).join('\n\n'));
+  }
+
+  /** A call's and a text thread's tools for the person on the other end: what is known about them, and their earlier conversations. */
+  private personTools(session: Session): SessionTool[] {
+    return [
+      {
+        spec: {
+          name: 'remember',
+          description: 'Save something about the person you are talking with, for their next call or text: their name when they tell you it, or one short fact worth knowing next time (what they usually book, a preference, where the job is). Only about them, and only what they said or what happened.',
+          parameters: { type: 'object', properties: { name: { type: 'string', description: 'Their name, as they said it' }, fact: { type: 'string', description: 'One short fact, in a few words' } } },
+        },
+        run: async (input) => {
+          const name = typeof input.name === 'string' ? input.name.trim() : '';
+          const fact = typeof input.fact === 'string' ? input.fact.trim() : '';
+          if (!name && !fact) throw new Error('give their name or a fact to save');
+          await this.noteCaller(session.key, { ...(name ? { name } : {}), ...(fact ? { add: fact } : {}) });
+          return 'Saved.';
+        },
+      },
+      {
+        spec: {
+          name: 'earlier_conversations',
+          description: 'Your earlier calls and text messages with this person (only theirs): what was said and done. With words: the lines that mention any of them. Without: how the last ones went.',
+          parameters: { type: 'object', properties: { words: { type: 'string', description: 'Words to look for, e.g. "mowing Tuesday"' } } },
+        },
+        run: async (input) => this.earlierWith(session, typeof input.words === 'string' ? input.words : ''),
+      },
+    ];
+  }
+
+  /** A note from the runner for one conversation: read with its next reply, or (now) acted on at once. */
+  async pass(session: Session, note: string, now = false): Promise<string> {
+    if (session.kind === 'call' && !session.callId) return `${session.title} is not on a call now. For their next call, save it with caller_notes.`;
+    const text = `[OAIY] A note from the runner (the main agent your person talks to): ${note}`;
+    if (now || session.running) {
+      this.deliver(session, text, true);
+      return now ? 'Passed on: it acts on it now.' : 'Passed on: it reads it at its next step.';
+    }
+    session.agent.turns.push({ role: 'user', text, automatic: true });
+    await this.save(session);
+    this.hooks.changed();
+    return 'Passed on: it reads it before its next reply.';
   }
 
   /** A call's own tools: through the desktop to Aokie. */
@@ -437,11 +741,15 @@ export class Sessions {
       if (typeof event.instructions === 'string') session.brief = event.instructions;
       session.lastAt = Date.now();
       session.unread++;
-      // A new call starts afresh, with only the last few words of the earlier ones.
-      if (type === 'call.started' && !session.running) session.agent.turns = earlierWords(session.agent.turns);
       if (type === 'call.started') session.speech?.newCall();
-      const greeting = typeof event.greeting === 'string' && event.greeting.trim() ? ` You greeted them: "${event.greeting.trim()}"` : '';
-      session.agent.turns.push({ role: 'user', text: `[OAIY] 📞 A call from ${session.title}${session.title !== session.key ? ` (${session.key})` : ''} began.${greeting}`, automatic: true });
+      // A new call starts afresh: its agent reads from the note that it began. The earlier calls
+      // stay, for the chat and for earlier_conversations; what is known about the caller is in its instructions.
+      const fresh = type === 'call.started' && !session.running;
+      if (fresh) session.agent.turns = keptTurns(session.agent.turns);
+      if (type === 'call.started') session.bookingNudged = false;
+      const who = `${session.title}${session.title !== session.key ? ` (${session.key})` : ''}`;
+      const note = callStartNote(who, typeof event.greeting === 'string' ? event.greeting : '', knownText(this.callerNote(session.key)));
+      session.agent.turns.push({ role: 'user', text: note, automatic: true, ...(fresh ? { fresh: true } : {}) });
       await this.save(session);
       await this.saveIndex();
       this.hooks.changed();
@@ -503,7 +811,8 @@ export class Sessions {
     const key = number === TEST_NUMBER ? TEST_NUMBER : digits(number) || number;
     // No name given (a call's caller id has none): the name another conversation with the same number has.
     const known = name || this.list.find((s) => s.title !== s.key && sameNumber(s.key, key))?.title || '';
-    const existing = this.list.find((s) => s.kind === kind && s.key === key);
+    // The same number, written with or without its country code, is the same conversation.
+    const existing = this.list.find((s) => s.kind === kind && (s.key === key || sameNumber(s.key, key)));
     if (existing) {
       if (known && existing.title === existing.key) existing.title = known;
       return existing;
@@ -665,7 +974,7 @@ export class Sessions {
           session.inTool = false;
           stopHolding();
           // What it says next is heard, even if the caller spoke over the words before the tool.
-          session.speech?.begin();
+          session.speech?.begin(true);
         }
         if (session.speech && event.type === 'text') session.speech.push(event.delta);
         // A reply ends (a tool is called, or the model's turn is over): what it said is complete.
@@ -673,6 +982,10 @@ export class Sessions {
         this.hooks.event(session, event);
       }, controller.signal);
       session.speech?.flush();
+      // Cut off (the caller spoke over it): what they heard of the reply is kept, so the agent knows it was said.
+      const heard = session.speech?.reply.join(' ') ?? '';
+      if (controller.signal.aborted && heard && session.agent.turns.at(-1)?.role !== 'assistant') session.agent.turns.push({ role: 'assistant', text: `${heard}…`, calls: [] });
+      if (session.speech) tidyReplies(session.agent.view());
     } catch (error) {
       failed = (error as Error).message;
       this.hooks.event(session, { type: 'error', message: (error as Error).message });
@@ -690,6 +1003,12 @@ export class Sessions {
       await this.saveIndex();
       // Messages that came as it finished: its next turn.
       const unread = session.agent.takeUnread();
+      this.hooks.finished?.(session);
+      // A booking promised but not requested: the agent is told once, and requests it.
+      if (session.callId && !controller.signal.aborted && !session.bookingNudged && promisesBooking(said) && namesATime(session.agent.view()) && !requested(session)) {
+        session.bookingNudged = true;
+        unread.push(BOOKING_NUDGE);
+      }
       if (unread.length) this.deliver(session, unread.join('\n\n'));
       this.hooks.changed();
     }
@@ -807,4 +1126,16 @@ export class DesktopEvents {
 /** The turns of a conversation, for drawing it. */
 export function sessionTurns(session: Session): Turn[] {
   return session.agent.turns;
+}
+
+/** A conversation's turns, the oldest calls left out once there are too many (from a call's start, so a call is kept whole). */
+function keptTurns(turns: Turn[]): Turn[] {
+  if (turns.length <= MAX_KEPT_TURNS) return turns;
+  const from = turns.findIndex((t, i) => i >= turns.length - MAX_KEPT_TURNS && isCallStart(t));
+  return turns.slice(from > 0 ? from : turns.length - MAX_KEPT_TURNS);
+}
+
+/** Whether this call's agent has requested an appointment. */
+function requested(session: Session): boolean {
+  return session.agent.view().some((t) => t.role === 'assistant' && t.calls.some((c) => c.name === 'request_appointment'));
 }

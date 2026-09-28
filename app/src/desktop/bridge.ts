@@ -231,6 +231,11 @@ export class Desktop {
     return { ok: result.ok === true, output: result.output };
   }
 
+  /** The name a caller goes by, so the phone's greeting can use it (an empty name forgets it). */
+  async rememberCaller(number: string, name: string): Promise<void> {
+    await reply(await fetch(`${this.origin}/api/voice/callers`, { method: 'PUT', headers: this.headers(), body: JSON.stringify({ number, name }) }));
+  }
+
   /** Stop speaking on a call. */
   async hush(callId: string): Promise<void> {
     await this.voice(callId, 'hush', {}).catch(() => {});

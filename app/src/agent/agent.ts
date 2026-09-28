@@ -410,7 +410,7 @@ export function wellFormed(turns: Turn[]): Turn[] {
     }
     const last = out[out.length - 1];
     if (turn.role === 'user' && last?.role === 'user') {
-      out[out.length - 1] = { ...last, text: `${last.text}\n\n${turn.text}`, images: [...(last.images ?? []), ...(turn.images ?? [])], summary: last.summary || turn.summary };
+      out[out.length - 1] = { ...last, text: `${last.text}\n\n${turn.text}`, images: [...(last.images ?? []), ...(turn.images ?? [])], summary: last.summary || turn.summary, ...(last.fresh || turn.fresh ? { fresh: true } : {}) };
       continue;
     }
     out.push(turn);
@@ -454,11 +454,11 @@ function trackedVfs(vfs: Vfs, record: (path: string) => void): Vfs {
   });
 }
 
-/** Where the model's view starts: the latest summary, or the beginning. */
+/** Where the model's view starts: the latest summary or fresh start, or the beginning. */
 function viewStart(turns: Turn[]): number {
   for (let i = turns.length - 1; i >= 0; i--) {
     const t = turns[i];
-    if (t.role === 'user' && t.summary) return i;
+    if (t.role === 'user' && (t.summary || t.fresh)) return i;
   }
   return 0;
 }

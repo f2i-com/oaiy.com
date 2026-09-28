@@ -557,6 +557,22 @@ export class ChatPane {
     this.scroll();
   }
 
+  /**
+   * Words from the other end of a call or text thread while its agent answers:
+   * drawn where they came, and the reply being written goes on in its own box
+   * below them (it began first), not split around them.
+   */
+  heard(text: string): void {
+    this.add(h('div.msg.user', h('div.msg-body', text || ' ')));
+    if (!this.sink) this.toTop();
+  }
+
+  /** A run ended (finished, or cut off): what the agent writes next is a new reply. */
+  endReply(): void {
+    this.current = null;
+    this.thinking = null;
+  }
+
   /** The person's message: a new request, or (`during`) one sent while the agent works, which keeps its plan. */
   user(text: string, attachments: Attachment[] = [], during = false, note = 'sent while the agent works: it reads it at its next step'): void {
     this.current = null;
