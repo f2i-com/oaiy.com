@@ -603,6 +603,11 @@ pub async fn run(socket: WebSocket, hub: VoiceHub, engines: Engines) {
                 match command {
                     CallCommand::Say { text, reply } => {
                         let text = text.trim().to_string();
+                        // Speaking again after a goodbye the caller spoke over: the call goes on,
+                        // and an "mm-hmm" is talked over again rather than taken as a word to stop for.
+                        if !text.is_empty() {
+                            ending = false;
+                        }
                         let _ = reply.send(if text.is_empty() { Err("nothing to say".into()) } else if !begun { Err("the call has not begun".into()) } else { Ok(speak(text, false, None)) });
                     }
                     CallCommand::Hush => cut(),
