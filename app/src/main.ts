@@ -1631,13 +1631,13 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
   } else {
     await openProject(meta);
   }
+  // What the desktop said already starts its parts now (the runner's role, the calls); the stream keeps them up to date.
+  if (firstModules) applyModules(firstModules);
 
   const sandbox = sandboxAvailable();
   if (!sandbox.ok) chat.system(`The code sandbox is unavailable: ${sandbox.reason}.`, 'error');
   else void zippModule().catch((error: unknown) => chat.system(`Could not load the Zipp engine: ${(error as Error).message}`, 'error'));
   await lookForOaiy();
-  // What the desktop said already starts its parts now; the stream keeps them up to date.
-  if (firstModules) applyModules(firstModules);
   renderPhoneChip();
   if (desktop) {
     desktopEvents.start();
