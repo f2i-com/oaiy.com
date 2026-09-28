@@ -23,6 +23,7 @@ import {
   Workflow,
   type LucideIcon,
   CalendarDays,
+  Cpu,
 } from 'lucide-react';
 import { API_BASE, openExternal, plugins as pluginsApi } from './api';
 import { applyTheme, initialTheme, THEME_LABEL, type ThemeMode } from './theme';
@@ -64,6 +65,7 @@ type BuiltinView =
   | 'agent'
   | 'flows'
   | 'calendar'
+  | 'engines'
   | 'overview'
   | 'services'
   | 'plugins'
@@ -91,6 +93,7 @@ const NAV: { value: BuiltinView; label: string; icon: LucideIcon }[] = [
   { value: 'agent', label: 'Agent', icon: Bot },
   { value: 'flows', label: 'Flows', icon: Workflow },
   { value: 'calendar', label: 'Calendar', icon: CalendarDays },
+  { value: 'engines', label: 'Engines', icon: Cpu },
   { value: 'overview', label: 'Overview', icon: LayoutDashboard },
   { value: 'services', label: 'Services', icon: Server },
   { value: 'plugins', label: 'Plugins', icon: Plug },
@@ -123,6 +126,12 @@ const PAGE: Record<BuiltinView, { crumb: string; kicker: string; title: string; 
     kicker: 'Bookings',
     title: 'Calendar',
     copy: 'Appointments, the requests your calls and texts bring in, and the hours the phone offers.',
+  },
+  engines: {
+    crumb: 'Engines',
+    kicker: 'On this machine',
+    title: 'Engines',
+    copy: 'The language, picture, video, speech, music and 3D models this machine runs, and their endpoints.',
   },
   overview: {
     crumb: 'Overview',
@@ -484,8 +493,8 @@ export default function App() {
               suppresses the entrance animation the second time you open a panel,
               so navigation feels instant instead of replaying a staggered reveal
               on every switch. */}
-          {(view === 'agent' || view === 'flows') && <EmbeddedPage page={view} />}
-          <div hidden={view === 'agent' || view === 'flows'} className={visited.has(view) ? 'content-page revisit' : 'content-page'} key={view}>
+          {(view === 'agent' || view === 'flows' || view === 'engines') && <EmbeddedPage page={view} />}
+          <div hidden={view === 'agent' || view === 'flows' || view === 'engines'} className={visited.has(view) ? 'content-page revisit' : 'content-page'} key={view}>
             <PairingPrompt />
             <div className="page-intro">
               <div>

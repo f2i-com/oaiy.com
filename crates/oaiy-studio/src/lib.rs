@@ -355,6 +355,39 @@ fn effective_config(args: &Args) -> Result<Json, String> {
 /// The UI address of a studio already serving this configuration, if one is:
 /// a second launch then shows that one instead of failing on busy ports.
 pub fn running_instance(args: &Args) -> Option<String> {
+    running_at(args)
+}
+
+/// For a host that runs the studio but is not its executable (OAIY Desktop):
+/// the configuration at `config_path` (made with defaults when there is none),
+/// with each engine program it names bare (`oaiy-llm-server`, `oaiy-media`)
+/// pointed at `dir` when it is there and not beside the configuration.
+/// Returns whether anything changed.
+pub fn use_programs_from(config_path: &std::path::Path, dir: &std::path::Path) -> Result<bool, String> {
+    let mut cfg = config::load(config_path)?;
+    let root = config_path.parent().unwrap_or(std::path::Path::new("."));
+    let mut changed = false;
+    for (section, key) in [("llm", "server"), ("llm", "server_webgpu"), ("media", "worker")] {
+        let Some(mut part) = cfg.get(section).cloned() else { continue };
+        let Some(name) = part.get(key).and_then(Json::as_str).map(str::to_string) else { continue };
+        if name.contains(['/', '\\']) {
+            continue;
+        }
+        let file = if cfg!(windows) && !name.to_ascii_lowercase().ends_with(".exe") { format!("{name}.exe") } else { name.clone() };
+        if root.join(&file).is_file() || !dir.join(&file).is_file() {
+            continue;
+        }
+        util::set(&mut part, key, Json::str(dir.join(&file).to_string_lossy()));
+        util::set(&mut cfg, section, part);
+        changed = true;
+    }
+    if changed {
+        config::save(config_path, &cfg)?;
+    }
+    Ok(changed)
+}
+
+fn running_at(args: &Args) -> Option<String> {
     let cfg = effective_config(args).ok()?;
     let ui = cfg.get("ui")?;
     let host = match str_or(ui, "host", "127.0.0.1") {
@@ -490,5 +523,33 @@ pub fn console(studio: &Arc<Studio>, ui_url: &str) {
     }
     loop {
         std::thread::park();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_host_points_bare_engine_programs_at_their_folder() {
+        let base = std::env::temp_dir().join(format!("oaiy-programs-{}", std::process::id()));
+        let (conf_dir, bin) = (base.join("conf"), base.join("bin"));
+        std::fs::create_dir_all(&conf_dir).unwrap();
+        std::fs::create_dir_all(&bin).unwrap();
+        let exe = |n: &str| if cfg!(windows) { format!("{n}.exe") } else { n.to_string() };
+        std::fs::write(bin.join(exe("oaiy-llm-server")), b"").unwrap();
+        std::fs::write(bin.join(exe("oaiy-media")), b"").unwrap();
+        let path = conf_dir.join(config::FILE_NAME);
+        // No configuration yet: made with defaults, then pointed at the folder.
+        assert!(use_programs_from(&path, &bin).unwrap());
+        let cfg = config::load(&path).unwrap();
+        let server = cfg.get("llm").and_then(|l| l.get("server")).and_then(Json::as_str).unwrap().to_string();
+        assert_eq!(std::path::Path::new(&server), bin.join(exe("oaiy-llm-server")));
+        let worker = cfg.get("media").and_then(|m| m.get("worker")).and_then(Json::as_str).unwrap().to_string();
+        assert_eq!(std::path::Path::new(&worker), bin.join(exe("oaiy-media")));
+        // A program that is not in the folder (the WebGPU server) keeps its name; a second call changes nothing.
+        assert_eq!(cfg.get("llm").and_then(|l| l.get("server_webgpu")).and_then(Json::as_str), Some("oaiy-llm-server-webgpu"));
+        assert!(!use_programs_from(&path, &bin).unwrap());
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

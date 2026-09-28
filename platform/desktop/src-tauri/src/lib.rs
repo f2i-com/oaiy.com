@@ -200,6 +200,8 @@ pub mod companion;
 #[cfg(feature = "gui")]
 mod embed;
 #[cfg(feature = "gui")]
+mod engines;
+#[cfg(feature = "gui")]
 mod migrate;
 #[cfg(feature = "gui")]
 mod tray;
@@ -1358,6 +1360,16 @@ pub fn run() {
             // user relocates the data folder.
             crate::applog::LOGGER.attach(&data_dir);
             log::info!("OAIY Desktop {} starting (data={})", env!("CARGO_PKG_VERSION"), data_dir.display());
+            // The engines: started on their own thread (a running studio is found
+            // over HTTP, and launching one binds its ports), so the window is not kept waiting.
+            {
+                let data_dir = data_dir.clone();
+                std::thread::spawn(move || {
+                    if let Err(e) = crate::engines::start(&data_dir) {
+                        log::warn!("engines: {e}");
+                    }
+                });
+            }
 
             let models_dir = resolve_models_dir(app.handle(), &data_dir);
             // Additional read-only weight folders the user registered (e.g.
@@ -1736,6 +1748,8 @@ pub fn run() {
                 // processes. Done synchronously — the user just clicked
                 // Quit and is waiting; a few hundred ms is fine.
                 RunEvent::Exit => {
+                    // The engines this desktop started (their model servers are children).
+                    crate::engines::stop();
                     // The warm script host first of all: it is one Node child
                     // that exits on a line, and a plugin event arriving during
                     // the stops below must not start another.

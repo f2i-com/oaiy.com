@@ -25,6 +25,7 @@ gui = [
     "dep:tauri-plugin-dialog",
     "dep:tauri-plugin-notification",
     "dep:tauri-plugin-single-instance",
+    "dep:oaiy-studio",
     "dep:tauri-build",
 ]
 
@@ -52,6 +53,8 @@ tauri-plugin-dialog = { version = "2.0", optional = true }
 tauri-plugin-notification = { version = "2.0", optional = true }
 # One OAIY: launching it again shows the running one's window.
 tauri-plugin-single-instance = { version = "2", optional = true }
+# The engines (language models, media), run by the desktop: std-only, no CUDA to build.
+oaiy-studio = { path = "../../../crates/oaiy-studio", optional = true }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 

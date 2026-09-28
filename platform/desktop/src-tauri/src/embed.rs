@@ -1,5 +1,6 @@
 //! The pages OAIY shows in its window beside the sidebar: the agent (the app in
-//! `app/`) and the flow editor (`platform/ui`).
+//! `app/`), the flow editor (`platform/ui`), and the engines' own control pages
+//! (served by the engines at their address; see `engines.rs`).
 //!
 //! Each is a webview of its own laid over the dashboard's content area, not a
 //! frame inside the dashboard: as a top-level page it can be cross-origin
@@ -29,15 +30,19 @@ pub const BROWSER_ARGS: &str = "--disable-features=msWebOOUI,msPdfOOUI,msSmartSc
 pub enum Page {
     Agent,
     Flows,
+    Engines,
 }
 
 impl Page {
-    pub const ALL: [Page; 2] = [Page::Agent, Page::Flows];
+    pub const ALL: [Page; 3] = [Page::Agent, Page::Flows, Page::Engines];
+    /// The pages this desktop serves itself (the engines serve their own).
+    pub const SERVED: [Page; 2] = [Page::Agent, Page::Flows];
 
     pub fn parse(name: &str) -> Option<Page> {
         match name {
             "agent" => Some(Page::Agent),
             "flows" => Some(Page::Flows),
+            "engines" => Some(Page::Engines),
             _ => None,
         }
     }
@@ -46,6 +51,7 @@ impl Page {
         match self {
             Page::Agent => "embed-agent",
             Page::Flows => "embed-flows",
+            Page::Engines => "embed-engines",
         }
     }
 
@@ -53,6 +59,7 @@ impl Page {
         match self {
             Page::Agent => AGENT_SCHEME,
             Page::Flows => FLOWS_SCHEME,
+            Page::Engines => "http",
         }
     }
 
@@ -61,6 +68,7 @@ impl Page {
         match self {
             Page::Agent => "app",
             Page::Flows => "flows",
+            Page::Engines => "engines",
         }
     }
 
@@ -69,11 +77,16 @@ impl Page {
         match self {
             Page::Agent => "/index.html",
             Page::Flows => "/app.html",
+            Page::Engines => "/",
         }
     }
 
     /// Its address in the webview: WebView2 (Windows) maps a custom scheme to `http://<scheme>.localhost`.
     fn url(self) -> Url {
+        if self == Page::Engines {
+            let base = crate::engines::ui_url().unwrap_or_else(|| "http://127.0.0.1:7860".into());
+            return base.parse().unwrap_or_else(|_| "http://127.0.0.1:7860/".parse().expect("a valid URL"));
+        }
         let text = if cfg!(windows) {
             format!("http://{}.localhost{}", self.scheme(), self.start())
         } else {
@@ -90,6 +103,7 @@ fn dist<R: Runtime>(app: &AppHandle<R>, page: Page) -> Option<PathBuf> {
     let var = match page {
         Page::Agent => "OAIY_APP_DIST",
         Page::Flows => "OAIY_FLOWS_DIST",
+        Page::Engines => return None,
     };
     let mut candidates: Vec<PathBuf> = Vec::new();
     if let Ok(dir) = std::env::var(var) {
@@ -102,6 +116,7 @@ fn dist<R: Runtime>(app: &AppHandle<R>, page: Page) -> Option<PathBuf> {
     candidates.push(match page {
         Page::Agent => repo.join("../../../app/dist"),
         Page::Flows => repo.join("../../ui/dist"),
+        Page::Engines => return None,
     });
     candidates.into_iter().find(|d| d.join(page.start().trim_start_matches('/')).is_file())
 }
@@ -221,10 +236,14 @@ pub async fn show_embedded<R: Runtime>(app: AppHandle<R>, window: tauri::Window<
         let _ = webview.set_focus();
         return Ok(());
     }
-    if dist(&app, page).is_none() {
+    if page == Page::Engines {
+        if crate::engines::ui_url().is_none() {
+            return Err("the engines are not running yet: they start with OAIY, or run oaiy-studio".into());
+        }
+    } else if dist(&app, page).is_none() {
         return Err(format!("the {} page is not built: run `npm run build` in {}", page.folder(), match page {
             Page::Agent => "app/",
-            Page::Flows => "platform/ui/",
+            _ => "platform/ui/",
         }));
     }
     window.add_child(builder(&app, page), position, size).map_err(|e| e.to_string())?;
@@ -260,8 +279,13 @@ fn placing() -> std::sync::MutexGuard<'static, ()> {
 /// A page's webview, as `show_embedded` and `preload` make it.
 fn builder<R: Runtime>(app: &AppHandle<R>, page: Page) -> WebviewBuilder<R> {
     let (for_navigation, for_windows) = (app.clone(), app.clone());
-    WebviewBuilder::new(page.label(), WebviewUrl::CustomProtocol(page.url()))
-        .initialization_script(&desktop_script())
+    // The engines' pages are theirs, at their own address; the desktop's two know its address and token.
+    let made = if page == Page::Engines {
+        WebviewBuilder::new(page.label(), WebviewUrl::External(page.url()))
+    } else {
+        WebviewBuilder::new(page.label(), WebviewUrl::CustomProtocol(page.url())).initialization_script(&desktop_script())
+    };
+    made
         .additional_browser_args(BROWSER_ARGS)
         .on_navigation(move |url| {
             if own(page, url) {
@@ -297,7 +321,7 @@ mod tests {
     #[test]
     fn the_embedded_pages_are_named_and_have_their_schemes() {
         use crate::http::is_embedded_origin;
-        for page in Page::ALL {
+        for page in Page::SERVED {
             let url = page.url();
             assert!(is_embedded_origin(&url.origin().ascii_serialization()), "{url}");
         }

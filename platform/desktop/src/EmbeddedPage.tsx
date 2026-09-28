@@ -8,7 +8,7 @@ import { isTauri, tauriInvoke } from './api';
  * cross-origin isolated), so this only measures where that box is and says so
  * whenever it moves or changes size.
  */
-export default function EmbeddedPage({ page }: { page: 'agent' | 'flows' }) {
+export default function EmbeddedPage({ page }: { page: 'agent' | 'flows' | 'engines' }) {
   const box = useRef<HTMLDivElement>(null);
   const [problem, setProblem] = useState<string | null>(isTauri() ? null : 'The agent and the flow editor show here in the OAIY app.');
 

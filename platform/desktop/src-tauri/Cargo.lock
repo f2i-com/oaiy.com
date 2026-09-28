@@ -2568,6 +2568,7 @@ dependencies = [
  "futures-util",
  "getrandom 0.2.17",
  "log",
+ "oaiy-studio",
  "percent-encoding",
  "qrcode",
  "reqwest 0.12.28",
@@ -2587,6 +2588,17 @@ dependencies = [
  "uuid",
  "windows-sys 0.61.2",
  "zip",
+]
+
+[[package]]
+name = "oaiy-engine"
+version = "0.7.0"
+
+[[package]]
+name = "oaiy-studio"
+version = "0.1.0"
+dependencies = [
+ "oaiy-engine",
 ]
 
 [[package]]
