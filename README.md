@@ -78,12 +78,13 @@ Every token is a small, well-planned job:
   with a shared media queue, agent tool, RAM offloading and direct SSD weight
   streaming. See [video configuration and current limits](docs/LTX_VIDEO.md).
 
-- **Native Rust speech and music.** Qwen3-TTS speaks in a voice described in
-  words, and a saved voice stays the same from line to line
-  ([Speech](docs/SPEECH.md)). MiniMax Music 3 writes songs with vocals from
+- **Native Rust speech, music and sound effects.** Qwen3-TTS or Breeze TTS 2
+  speaks in a voice described in words, and a saved voice stays the same from
+  line to line ([Speech](docs/SPEECH.md)). MOSS-SoundEffect v2.0 makes up to
+  30 seconds of 48 kHz sound from a description ([Sound effects](docs/SOUND.md)). MiniMax Music 3 writes songs with vocals from
   lyrics and a description, up to six minutes of 44.1 kHz stereo, faster than
   real time; its 8B language model converts once to q8_0 or q4_k, so an 8 GB
-  GPU can run it ([Music](docs/MUSIC.md)). Both are served on OpenAI-style
+  GPU can run it ([Music](docs/MUSIC.md)). All are served on OpenAI-style
   audio endpoints, and an LTX clip can follow that speech, or any audio file,
   with mouths moving to it.
 
@@ -338,8 +339,9 @@ crates/
   nrob-server/   OpenAI-compatible HTTP server for DeepSeek-V4.1 (std-only)
   nrob-studio/   portable host (std-only): supervises nrob-server and nrob-diffusion,
                  control UI, configurable OpenAI-style gateway, model detection
-  nrob-diffusion/ image, video, speech and music worker (Candle): Qwen Image,
-                 SDXL, LTX, Qwen3-TTS, MiniMax Music 3, with
+  nrob-diffusion/ image, video, speech, music and sound worker (Candle): Qwen Image,
+                 SDXL, LTX, Qwen3-TTS, Breeze TTS 2, MiniMax Music 3,
+                 MOSS-SoundEffect, with
                  SSD/RAM/GPU block residency
   ggml-rs-wgpu/  WebGPU backend: quantized GGUF matmuls in WGSL, the rest on the CPU
   gguf, ggml-quants, ggml-rs, ggml-rs-cuda, tokenizer, llama-rs

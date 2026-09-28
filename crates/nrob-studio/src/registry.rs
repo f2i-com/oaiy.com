@@ -150,6 +150,9 @@ fn companion(cfg: &Json, section: &str, entry: &Json, missing: &str, picked: &Pa
 /// completes the chosen (or the first) model lacking that half, else starts
 /// one.
 fn attach_speech(cfg: &mut Json, d: &Detected, target: Option<(&str, &str)>) -> Result<Added, String> {
+    if d.kind() == "speech_breeze" {
+        return attach_breeze(cfg, d, target);
+    }
     let field = if d.kind() == "speech_design" { "design" } else { "base" };
     let value = field_of(d, field).ok_or("detected part has no path")?;
     let Some(Json::Obj(models)) = obj_mut(cfg, &["media", "speech", "models"]) else { return Err("no speech section".into()) };
@@ -167,6 +170,33 @@ fn attach_speech(cfg: &mut Json, d: &Detected, target: Option<(&str, &str)>) -> 
             let taken: Vec<String> = models.iter().map(|(k, _)| k.clone()).collect();
             let name = unique(&taken, "qwen3-tts");
             models.push((name.clone(), Json::obj([(field, value), ("enabled", Json::Bool(true))])));
+            name
+        }
+    };
+    let section = obj_mut(cfg, &["media", "speech"]).ok_or("no speech section")?;
+    if str_or(section, "default_model", "").is_empty() {
+        set(section, "default_model", Json::str(&name));
+    }
+    add_route_if_absent(cfg, "speech");
+    add_route_if_absent(cfg, "voices");
+    Ok(Added { section: "speech", name, missing: Vec::new(), enabled: true })
+}
+
+/// A Breeze TTS 2 folder is a speech model of its own (or fills the chosen one).
+fn attach_breeze(cfg: &mut Json, d: &Detected, target: Option<(&str, &str)>) -> Result<Added, String> {
+    let value = field_of(d, "breeze").ok_or("detected part has no path")?;
+    let Some(Json::Obj(models)) = obj_mut(cfg, &["media", "speech", "models"]) else { return Err("no speech section".into()) };
+    let chosen = models.iter().position(|(n, _)| target.is_some_and(|(_, t)| n == t));
+    let name = match chosen {
+        Some(i) => {
+            set(&mut models[i].1, "breeze", value);
+            set(&mut models[i].1, "enabled", Json::Bool(true));
+            models[i].0.clone()
+        }
+        None => {
+            let taken: Vec<String> = models.iter().map(|(k, _)| k.clone()).collect();
+            let name = unique(&taken, "breeze-tts-2");
+            models.push((name.clone(), Json::obj([("breeze", value), ("enabled", Json::Bool(true))])));
             name
         }
     };
@@ -215,6 +245,32 @@ fn attach_music(cfg: &mut Json, d: &Detected, target: Option<(&str, &str)>) -> R
     Ok(Added { section: "music", name, missing: Vec::new(), enabled: true })
 }
 
+/// A MOSS-SoundEffect folder is a sound model of its own (or fills the chosen one).
+fn attach_sound(cfg: &mut Json, d: &Detected, target: Option<(&str, &str)>) -> Result<Added, String> {
+    let value = field_of(d, "path").ok_or("detected part has no path")?;
+    let Some(Json::Obj(models)) = obj_mut(cfg, &["media", "sound", "models"]) else { return Err("no sound section".into()) };
+    let chosen = models.iter().position(|(n, _)| target.is_some_and(|(_, t)| n == t)).or_else(|| models.iter().position(|(_, m)| str_or(m, "path", "").trim().is_empty()));
+    let name = match chosen {
+        Some(i) => {
+            set(&mut models[i].1, "path", value);
+            set(&mut models[i].1, "enabled", Json::Bool(true));
+            models[i].0.clone()
+        }
+        None => {
+            let taken: Vec<String> = models.iter().map(|(k, _)| k.clone()).collect();
+            let name = unique(&taken, "moss-soundeffect");
+            models.push((name.clone(), Json::obj([("path", value), ("enabled", Json::Bool(true))])));
+            name
+        }
+    };
+    let section = obj_mut(cfg, &["media", "sound"]).ok_or("no sound section")?;
+    if str_or(section, "default_model", "").is_empty() {
+        set(section, "default_model", Json::str(&name));
+    }
+    add_route_if_absent(cfg, "sound");
+    Ok(Added { section: "sound", name, missing: Vec::new(), enabled: true })
+}
+
 /// Components attach to the first model that lacks them.
 fn attach(cfg: &mut Json, d: &Detected, target: Option<(&str, &str)>) -> Result<Added, String> {
     type Fits = Box<dyn Fn(&Json) -> bool>;
@@ -246,8 +302,9 @@ fn attach(cfg: &mut Json, d: &Detected, target: Option<(&str, &str)>) -> Result<
             let v25 = d.summary.contains("2.5");
             ("video", "text_encoder", Box::new(move |m| (str_or(m, "family", "") == "ltx-2.5") == v25))
         }
-        "speech_design" | "speech_base" => return attach_speech(cfg, d, target),
+        "speech_design" | "speech_base" | "speech_breeze" => return attach_speech(cfg, d, target),
         "music_model" | "music_lm" => return attach_music(cfg, d, target),
+        "sound_model" => return attach_sound(cfg, d, target),
         "ffmpeg" => {
             let value = field_of(d, "ffmpeg").unwrap_or(Json::Null);
             set(obj_mut(cfg, &["media", "video"]).ok_or("no video section")?, "ffmpeg", value);
@@ -719,6 +776,31 @@ mod tests {
         assert!(add(&mut bad, &design, None, None).is_err());
         config::validate(&cfg).unwrap();
         std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn a_moss_folder_makes_a_sound_model_and_its_route() {
+        let d = tmp("moss");
+        let dir = d.join("MOSS-SoundEffect-v2.0");
+        for part in ["text_encoder", "tokenizer", "transformer", "vae"] {
+            std::fs::create_dir_all(dir.join(part)).unwrap();
+        }
+        std::fs::write(dir.join("model_index.json"), r#"{"_class_name":"MossSoundEffectPipeline","dit_variant":"1.3B"}"#).unwrap();
+        let found = crate::detect::detect(&dir).unwrap();
+        assert_eq!(found.kind(), "sound_model");
+        let mut cfg = crate::config::default_json();
+        if let Some(Json::Obj(g)) = obj_mut(&mut cfg, &["gateway"]) {
+            if let Some((_, Json::Arr(routes))) = g.iter_mut().find(|(k, _)| k == "routes") {
+                routes.retain(|r| str_or(r, "target", "") != "sound");
+            }
+        }
+        let a = attach(&mut cfg, &found, None).unwrap();
+        assert_eq!((a.section, a.name.as_str()), ("sound", "moss-soundeffect"));
+        assert_eq!(get(&cfg, &["media", "sound", "default_model"]).and_then(Json::as_str), Some("moss-soundeffect"));
+        let routes = get(&cfg, &["gateway", "routes"]).and_then(Json::as_array).unwrap();
+        assert!(routes.iter().any(|r| str_or(r, "target", "") == "sound"));
+        crate::config::validate(&cfg).unwrap();
+        let _ = std::fs::remove_dir_all(d);
     }
 
     #[test]

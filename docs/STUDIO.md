@@ -49,12 +49,13 @@ The console accepts `status`, `start`, `stop`, `open`, `jobs` and `quit`.
   - The Gallery keeps everything generated this session, with each item's
     prompt, seed, steps and where its weights lived. Items can be reused,
     downloaded or removed.
-  - The Playground has Chat, Image, Speech, Music and Video tabs sized to the window. Chat
+  - The Playground has Chat, Image, Speech, Music, Sound and Video tabs sized to the window. Chat
     renders Markdown, can stop a reply mid-stream, and takes a system prompt.
     Speech speaks text in a saved voice, an OpenAI voice name, or a voice
     described in words, and **Save this voice…** keeps a described voice
     (see [Speech](SPEECH.md)). Music composes a song from lyrics and a
-    description, or an instrumental (see [Music](MUSIC.md)).
+    description, or an instrumental (see [Music](MUSIC.md)). Sound makes a
+    sound effect from a description (see [Sound effects](SOUND.md)).
     Video comes with sound when the model has its audio VAE. Its
     **Soundtrack** choice can turn the sound off. It can also make the clip
     follow speech in a saved or described voice, or an audio file. Start and
@@ -105,6 +106,8 @@ headers, never its weights, and decides what it is:
 | LTX 2.3 / 2.5, Sulphur | `__metadata__.model_version` and its `config` | a video model (2.3 files carry their own VAE) |
 | LTX 2.5 ComfyUI folder | `diffusion_models/`, `text_encoders/`, `vae/` | a complete video model (with sound when its `vae/` holds the audio VAE) |
 | Qwen3-TTS folder | `config.json` `model_type: qwen3_tts` (VoiceDesign or Base) | half of a speech model; the other half completes it |
+| Breeze TTS 2 folder | `config.json` `model_type: breeze` | a speech model (research and non-commercial use only) |
+| MOSS-SoundEffect folder | `model_index.json` `MossSoundEffectPipeline` | a sound effects model |
 | MiniMax-Music3 folder | `config.json` `model_type: minimax_music3` | a music model |
 | smaller music language model | GGUF `general.architecture: music3-lm` | the music model's `language_model` |
 | LTX audio VAE | `audio_vae.*` with `vocoder.bwe_generator.*` | the optional audio VAE of every video model that lacks one (LTX 2.3 and Sulphur checkpoints are their own) |
@@ -182,7 +185,7 @@ It may never ask for more.
 
 ### Sharing GPUs with the language model
 
-`media.device` is the GPU that image, video, speech and music jobs use.
+`media.device` is the GPU that image, video, speech, music and sound effect jobs use.
 `llm.devices` are the language models' GPUs, and a model's own `devices`
 override them for that model. For example, the 27B can run on GPU 0 while
 Flash-Next spans GPUs 0 and 1. On the **Memory** page, **Sharing GPUs** sets
@@ -218,13 +221,14 @@ The **Endpoints** page edits `gateway.routes`. Each route has a `path`, a
 |---|---|---|
 | `chat` | `POST` → nrob-server `/v1/chat/completions`, streamed through as it arrives | — |
 | `completions` | `POST` → `/v1/completions` | — |
-| `models` | the LLM's list plus image, video, speech and music models (`type`: llm, image, video, speech, music) | — |
+| `models` | the LLM's list plus image, video, speech, music and sound effects models (`type`: llm, image, video, speech, music, sound) | — |
 | `images` | OpenAI Images (below) | nrob-server's job API: `202 {id, status_url}`, `GET …/status`, `POST …/cancel` |
 | `edits` | OpenAI image edits (below) | — |
 | `videos` | OpenAI Videos (below) | the same job API for video |
 | `speech` | OpenAI audio.speech: the audio itself ([Speech](SPEECH.md)) | the same |
 | `voices` | saved voices: list, design and save, sample, delete ([Speech](SPEECH.md)) | the same |
 | `music` | song jobs: create, poll, download, cancel ([Music](MUSIC.md)); a music model on `speech` sings too | the same |
+| `sound` | sound effect jobs on `/v1/audio/sound_effects`: create, poll, download, cancel ([Sound effects](SOUND.md)) | the same |
 | `files` | generated media under the output folder | — |
 | `health` | `{status, llm, media_busy}`, never behind the key | — |
 

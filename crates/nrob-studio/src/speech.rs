@@ -1,10 +1,12 @@
 //! Speech: OpenAI-style text to speech (`/v1/audio/speech`) and saved voices
-//! (`/v1/audio/voices`), run by the worker's Qwen3-TTS.
+//! (`/v1/audio/voices`), run by the worker's Qwen3-TTS or Breeze TTS 2.
 //!
-//! A speech model entry (`media.speech.models.<name>`) names the VoiceDesign
-//! folder (`design`: speaks in a voice described in words) and the Base folder
-//! (`base`: speaks in a saved voice). A saved voice is made from a description
-//! once, and is then used by name wherever a voice is asked for.
+//! A Qwen3-TTS speech model entry (`media.speech.models.<name>`) names the
+//! VoiceDesign folder (`design`: speaks in a voice described in words) and the
+//! Base folder (`base`: speaks in a saved voice). A Breeze TTS 2 entry names its
+//! folder (`breeze`), which does both. A saved voice is made from a description
+//! once, and is then used by name wherever a voice is asked for (a voice Qwen3-TTS
+//! made, Breeze speaks too; one Breeze made, only Breeze speaks).
 use crate::config;
 use crate::util::{bool_or, str_or};
 use nrob::json::Json;
@@ -235,11 +237,49 @@ pub fn speech_request(cfg: &Json, root: &Path, output_dir: &Path, body: &Json) -
         None => None,
     };
     let saved = inline.or_else(|| asked.as_deref().filter(|n| valid_name(n)).map(|n| voice_file(&dir, n)).filter(|p| p.is_file()));
+    // Breeze TTS 2: one folder speaks saved and described voices.
+    if let Some(breeze) = folder(root, model, "breeze") {
+        f.push(("model_dir".into(), Json::str(breeze)));
+        let label = match saved {
+            Some(path) => {
+                f.push(("voice_file".into(), Json::str(path.to_string_lossy())));
+                asked.unwrap_or_default()
+            }
+            None => {
+                let instructions = body.get("instructions").and_then(Json::as_str).map(str::trim).filter(|s| !s.is_empty());
+                let stock = asked.as_deref().map(str::to_lowercase).and_then(|n| STOCK_VOICES.iter().find(|(k, _)| *k == n).map(|(_, d)| *d));
+                if instructions.is_none() && stock.is_none() {
+                    if let Some(n) = &asked {
+                        return Err(format!("unknown voice {n:?}: not a saved voice or an OpenAI voice name; describe one in `instructions`"));
+                    }
+                }
+                let description = instructions.or(stock).unwrap_or(STOCK_VOICES[0].1);
+                if description.len() > 4000 {
+                    return Err("instructions are limited to 4000 bytes".into());
+                }
+                f.push(("instructions".into(), Json::str(description)));
+                // Guidance makes Breeze follow a description closely (its authors use 4).
+                let scale = body.get("cfg_scale").and_then(Json::as_f64).or_else(|| model.get("cfg_scale").and_then(Json::as_f64)).unwrap_or(4.0);
+                if !(0.0..=20.0).contains(&scale) {
+                    return Err("cfg_scale must be 0 to 20".into());
+                }
+                f.push(("cfg_scale".into(), Json::Num(scale)));
+                asked.filter(|_| instructions.is_none()).unwrap_or_else(|| "described".into())
+            }
+        };
+        let frames = (input.chars().count() as f64 / 14.0 * 12.5).ceil().max(12.0) as usize;
+        return Ok((Json::Obj(f), name, label, frames));
+    }
     let label = match saved {
         Some(path) => {
             // A saved voice: the Base model, prompted with the voice.
             let base = folder(root, model, "base").ok_or_else(|| format!("speech model {name} has no Base model folder, which saved voices need"))?;
-            let saved_language = Json::parse(&std::fs::read(&path).map_err(|e| e.to_string())?).ok().map(|v| str_or(&v, "language", "auto").to_string()).unwrap_or_else(|| "auto".into());
+            let voice = Json::parse(&std::fs::read(&path).map_err(|e| e.to_string())?).ok();
+            // A voice Breeze TTS 2 made has no speaker embedding, which Qwen3-TTS needs.
+            if voice.as_ref().and_then(|v| v.get("speaker")).and_then(Json::as_array).is_some_and(|s| s.is_empty()) {
+                return Err(format!("this voice was made with Breeze TTS 2, and speech model {name} is Qwen3-TTS; speak it with a Breeze TTS 2 model"));
+            }
+            let saved_language = voice.map(|v| str_or(&v, "language", "auto").to_string()).unwrap_or_else(|| "auto".into());
             f.push(("model_dir".into(), Json::str(base)));
             f.push(("voice_file".into(), Json::str(path.to_string_lossy())));
             f.push(("language".into(), Json::str(language(body, &saved_language)?)));
@@ -281,8 +321,14 @@ pub fn voice_request(cfg: &Json, root: &Path, output_dir: &Path, body: &Json) ->
         return Err("name must be 1-64 letters, digits, spaces, - or _".into());
     }
     let description = body.get("description").or_else(|| body.get("instructions")).and_then(Json::as_str).map(str::trim).filter(|s| !s.is_empty()).ok_or("description must say what the voice sounds like")?;
-    let design = folder(root, model, "design").ok_or_else(|| format!("speech model {name} has no VoiceDesign folder"))?;
-    let base = folder(root, model, "base").ok_or_else(|| format!("speech model {name} has no Base model folder, which saving a voice needs"))?;
+    // Breeze TTS 2 designs and keeps a voice by itself.
+    let (design, base) = match folder(root, model, "breeze") {
+        Some(b) => (b.clone(), b),
+        None => (
+            folder(root, model, "design").ok_or_else(|| format!("speech model {name} has no VoiceDesign folder"))?,
+            folder(root, model, "base").ok_or_else(|| format!("speech model {name} has no Base model folder, which saving a voice needs"))?,
+        ),
+    };
     let media = cfg.get("media").ok_or("no media section")?;
     let mut f: Vec<(String, Json)> = vec![
         ("kind".into(), Json::str("voice")),
@@ -346,6 +392,39 @@ mod tests {
         assert!(fast.contains("atempo=2.0,atempo=2.000000") && fast.contains("libmp3lame"));
         assert!(convert_args("pcm", 0.25).join(" ").contains("atempo=0.5,atempo=0.500000"));
         assert!(FORMATS.iter().all(|(f, _)| !convert_args(f, 1.0).is_empty()));
+    }
+
+    #[test]
+    fn a_breeze_model_speaks_described_and_saved_voices_and_designs_them() {
+        let dir = std::env::temp_dir().join(format!("nrob-voices-breeze-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("breeze")).unwrap();
+        std::fs::create_dir_all(dir.join("voices")).unwrap();
+        std::fs::write(dir.join("voices").join("chloe.json"), r#"{"nrob_voice":1,"name":"Chloe","ref_text":"hi","ref_codes":[[1]],"speaker":[]}"#).unwrap();
+        let cfg = Json::parse(format!(r#"{{"media":{{"speech":{{"models":{{"breeze":{{"breeze":"{0}/breeze"}}}},"voices_dir":"{0}/voices"}}}}}}"#, dir.to_string_lossy().replace('\\', "/")).as_bytes()).unwrap();
+        let out = dir.join("out");
+        // Described: the Breeze folder, its instruction, guided at 4 unless asked otherwise.
+        let body = Json::obj([("input", Json::str("Hello.")), ("instructions", Json::str("a sly old fox"))]);
+        let (request, name, label, _) = speech_request(&cfg, &dir, &out, &body).unwrap();
+        assert_eq!((name.as_str(), label.as_str()), ("breeze", "described"));
+        assert!(str_or(&request, "model_dir", "").ends_with("breeze"));
+        assert_eq!(str_or(&request, "instructions", ""), "a sly old fox");
+        assert_eq!(request.get("cfg_scale").and_then(Json::as_f64), Some(4.0));
+        // A saved voice by name.
+        let body = Json::obj([("input", Json::str("Hello.")), ("voice", Json::str("Chloe"))]);
+        let (request, _, label, _) = speech_request(&cfg, &dir, &out, &body).unwrap();
+        assert_eq!(label, "Chloe");
+        assert!(str_or(&request, "voice_file", "").ends_with("chloe.json"));
+        assert!(request.get("cfg_scale").is_none());
+        // Qwen3-TTS can't speak a voice Breeze made (it has no speaker embedding).
+        let qwen = Json::parse(format!(r#"{{"media":{{"speech":{{"models":{{"qwen":{{"design":"{0}/breeze","base":"{0}/breeze"}}}},"voices_dir":"{0}/voices"}}}}}}"#, dir.to_string_lossy().replace('\\', "/")).as_bytes()).unwrap();
+        let body = Json::obj([("input", Json::str("Hello.")), ("voice", Json::str("Chloe"))]);
+        assert!(speech_request(&qwen, &dir, &out, &body).unwrap_err().contains("Breeze"));
+        // Designing a voice: Breeze on its own.
+        let body = Json::obj([("name", Json::str("Fox")), ("description", Json::str("a sly old fox"))]);
+        let (request, _, _) = voice_request(&cfg, &dir, &out, &body).unwrap();
+        assert!(str_or(&request, "design_model_dir", "").ends_with("breeze") && str_or(&request, "base_model_dir", "").ends_with("breeze"));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

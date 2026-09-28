@@ -9,7 +9,7 @@
     "port": 8080,
     "api_key": "",
     "public_url": "",
-    "routes_version": 5,
+    "routes_version": 6,
     "routes": [
       {
         "path": "/v1/chat/completions",
@@ -71,6 +71,13 @@
         "path": "/v1/audio/music",
         "method": "POST",
         "target": "music",
+        "spec": "openai",
+        "enabled": true
+      },
+      {
+        "path": "/v1/audio/sound_effects",
+        "method": "POST",
+        "target": "sound",
         "spec": "openai",
         "enabled": true
       },
@@ -211,6 +218,16 @@
           "path": "models/MiniMax-Music3",
           "precision": "bf16",
           "steps": 30,
+          "enabled": true
+        }
+      }
+    },
+    "sound": {
+      "enabled": true,
+      "default_model": "moss-soundeffect",
+      "models": {
+        "moss-soundeffect": {
+          "path": "models/MOSS-SoundEffect-v2.0",
           "enabled": true
         }
       }

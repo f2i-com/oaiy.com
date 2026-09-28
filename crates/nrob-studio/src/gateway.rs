@@ -94,7 +94,7 @@ pub fn route(routes: &[Json], method: &str, path: &str) -> Option<Matched> {
     for r in routes.iter().filter(|r| bool_or(r, "enabled", true)) {
         let base = str_or(r, "path", "").trim_end_matches('/');
         let target = str_or(r, "target", "");
-        let prefix_owner = matches!(target, "images" | "videos" | "files" | "voices" | "music");
+        let prefix_owner = matches!(target, "images" | "videos" | "files" | "voices" | "music" | "sound");
         let rest = if path == base {
             ""
         } else if prefix_owner && path.starts_with(base) && path[base.len()..].starts_with('/') {
@@ -103,7 +103,7 @@ pub fn route(routes: &[Json], method: &str, path: &str) -> Option<Matched> {
             continue;
         };
         // The configured method is the primary route's; sub-routes set their own.
-        if rest.is_empty() && !matches!(target, "videos" | "files" | "voices" | "music") && !str_or(r, "method", "POST").eq_ignore_ascii_case(method) {
+        if rest.is_empty() && !matches!(target, "videos" | "files" | "voices" | "music" | "sound") && !str_or(r, "method", "POST").eq_ignore_ascii_case(method) {
             continue;
         }
         return Some(Matched { target: target.into(), spec: str_or(r, "spec", "openai").into(), rest: rest.into() });
@@ -150,6 +150,7 @@ pub fn handle(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, m: Matched
         ("speech", _) if m.rest.is_empty() => speech_openai(studio, req, w),
         ("voices", _) => voices(studio, req, w, &m.rest),
         ("music", _) => music_openai(studio, req, w, method, &m.rest),
+        ("sound", _) => sound_openai(studio, req, w, method, &m.rest),
         _ => send(w, Err(fail(404, format!("no route {} {}", method, req.route())))),
     }
 }
@@ -255,7 +256,7 @@ fn models(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream) -> io::Result<
             }
         }
     }
-    for kind in ["image", "video", "speech", "music"] {
+    for kind in ["image", "video", "speech", "music", "sound"] {
         let section = cfg.get("media").and_then(|m| m.get(kind));
         if section.is_some_and(|s| bool_or(s, "enabled", true)) {
             for (name, m) in section.and_then(|s| s.get("models")).map(|m| m.members().collect::<Vec<_>>()).unwrap_or_default() {
@@ -646,6 +647,97 @@ fn music_openai(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, method: 
             let Some(job) = song(id) else { return send(w, Err(fail(404, "no such song"))) };
             if job.status != "completed" {
                 return send(w, Err(fail(409, format!("the song is {}", job.status))));
+            }
+            let Some(wav) = job.files.first().filter(|f| f.is_file()).cloned() else { return send(w, Err(fail(404, "the file is gone"))) };
+            let format = req.query("format").unwrap_or_else(|| "wav".into());
+            if format == "wav" {
+                return serve_file(w, &wav, true, req.header("range"));
+            }
+            let Some(ctype) = crate::speech::FORMATS.iter().find(|(f, _)| *f == format).map(|(_, c)| *c) else {
+                return send(w, Err(fail(400, "format must be mp3, opus, aac, flac, wav or pcm")));
+            };
+            let cfg = studio.config();
+            match convert_audio(studio, &cfg, &wav, &format, 1.0, true) {
+                Ok(bytes) => {
+                    respond(w, 200, ctype, &bytes, true)?;
+                    Ok(true)
+                }
+                Err(e) => send(w, Err(e)),
+            }
+        }
+        _ => send(w, Err(fail(405, format!("{method} is not supported here")))),
+    }
+}
+
+pub fn sound_object(job: &Job) -> Json {
+    let (status, error) = match job.status.as_str() {
+        "cancelled" => ("failed", Json::obj([("code", Json::str("cancelled")), ("message", Json::str("the job was cancelled"))])),
+        "failed" => ("failed", Json::obj([("code", Json::str("generation_failed")), ("message", Json::str(job.error.as_deref().unwrap_or("failed")))])),
+        s => (s, Json::Null),
+    };
+    Json::obj([
+        ("id", Json::str(&job.id)),
+        ("object", Json::str("sound_effect")),
+        ("model", Json::str(&job.model)),
+        ("status", Json::str(status)),
+        ("progress", Json::Int(job.progress.floor() as i64)),
+        ("created_at", Json::Int(job.created_at as i64)),
+        ("completed_at", job.completed_at.map_or(Json::Null, |t| Json::Int(t as i64))),
+        ("prompt", Json::str(&job.prompt)),
+        ("seconds", job.result.get("duration").cloned().unwrap_or(Json::Num(job.seconds))),
+        ("seed", job.request.get("seed").cloned().unwrap_or(Json::Null)),
+        ("sample_rate", Json::Int(crate::sound::SAMPLE_RATE)),
+        ("channels", Json::Int(1)),
+        ("error", error),
+    ])
+}
+
+/// Sound effects as asynchronous jobs: create, list, get, cancel, delete, download
+/// (`/content?format=mp3|opus|aac|flac|wav|pcm`).
+fn sound_openai(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, method: &str, rest: &str) -> io::Result<bool> {
+    let parts: Vec<&str> = rest.trim_start_matches('/').split('/').filter(|p| !p.is_empty()).collect();
+    let effect = |id: &str| studio.media.get(id).filter(|j| j.kind == Kind::Sound);
+    match (method, parts.as_slice()) {
+        ("POST", []) => send(w, parse_body(req).and_then(|b| {
+            let cfg = studio.config();
+            let scratch = scratch_for(studio, req, Some(&b));
+            let out = scratch.clone().unwrap_or_else(|| studio.output_root());
+            let (request, model, label, seconds) = crate::sound::sound_request(&cfg, &studio.root, &media::day_dir(&out, "sound"), &b).map_err(|e| {
+                if let Some(s) = &scratch {
+                    let _ = std::fs::remove_dir_all(s);
+                }
+                fail(400, e)
+            })?;
+            let job = studio.media.submit(Kind::Sound, request, model, label, 1, seconds, keep_jobs(&cfg), scratch);
+            Ok(Reply { status: 200, body: sound_object(&job) })
+        })),
+        ("GET", []) => {
+            let limit = req.query("limit").and_then(|l| l.parse::<usize>().ok()).unwrap_or(20).clamp(1, 100);
+            let effects: Vec<Job> = studio.media.list().into_iter().filter(|j| j.kind == Kind::Sound).collect();
+            let has_more = effects.len() > limit;
+            let data: Vec<Json> = effects.iter().take(limit).map(sound_object).collect();
+            let id = |i: Option<&Json>| i.and_then(|v| v.get("id")).cloned().unwrap_or(Json::Null);
+            json_reply(w, 200, &Json::obj([
+                ("object", Json::str("list")),
+                ("first_id", id(data.first())),
+                ("last_id", id(data.last())),
+                ("has_more", Json::Bool(has_more)),
+                ("data", Json::Arr(data)),
+            ]))
+        }
+        ("GET", [id]) => send(w, effect(id).map(|j| Reply { status: 200, body: sound_object(&j) }).ok_or_else(|| fail(404, "no such sound effect"))),
+        ("DELETE", [id]) => {
+            let deleted = effect(id).is_some() && studio.media.remove(id);
+            send(w, Ok(Reply { status: if deleted { 200 } else { 404 }, body: Json::obj([("id", Json::str(*id)), ("object", Json::str("sound_effect.deleted")), ("deleted", Json::Bool(deleted))]) }))
+        }
+        ("POST", [id, "cancel"]) => {
+            let cancelled = effect(id).is_some() && studio.media.cancel(id);
+            send(w, Ok(Reply { status: if cancelled { 200 } else { 404 }, body: Json::obj([("id", Json::str(*id)), ("cancelled", Json::Bool(cancelled))]) }))
+        }
+        ("GET", [id, "content"]) => {
+            let Some(job) = effect(id) else { return send(w, Err(fail(404, "no such sound effect"))) };
+            if job.status != "completed" {
+                return send(w, Err(fail(409, format!("the sound effect is {}", job.status))));
             }
             let Some(wav) = job.files.first().filter(|f| f.is_file()).cloned() else { return send(w, Err(fail(404, "the file is gone"))) };
             let format = req.query("format").unwrap_or_else(|| "wav".into());

@@ -429,6 +429,15 @@ fn directory(dir: &Path) -> Result<Detected, String> {
             ];
             return Ok(detected(Role::Image { architecture: "qwen-image" }, "diffusers", format!("Qwen Image pipeline folder ({class})"), fields));
         }
+        // MOSS-SoundEffect: the whole pipeline in one folder.
+        if class == "MossSoundEffectPipeline" {
+            for part in ["text_encoder", "tokenizer", "transformer", "vae"] {
+                if !dir.join(part).is_dir() {
+                    return Err(format!("{label}: a MOSS-SoundEffect folder needs its {part}/ folder"));
+                }
+            }
+            return Ok(detected(Role::Component { kind: "sound_model" }, "diffusers", format!("MOSS-SoundEffect: sound effects from a description ({label})"), vec![("path", path_json(dir))]));
+        }
         return Err(format!("{label}: diffusers pipeline {class:?} is not one nrob runs"));
     }
     // An LTX 2.5 release laid out as ComfyUI folders. Each part is the first
@@ -478,6 +487,13 @@ fn directory(dir: &Path) -> Result<Detected, String> {
                 }
             }
             return Ok(detected(Role::Component { kind: "music_model" }, "safetensors", format!("MiniMax Music 3: songs from lyrics and a description ({label})"), vec![("path", path_json(dir))]));
+        }
+        // Breeze TTS 2: described and saved voices from one folder.
+        if model_type == "breeze" {
+            if !dir.join("audio_tokenizer").join("model.safetensors").is_file() {
+                return Err(format!("{label}: a Breeze TTS 2 folder needs its audio_tokenizer/ folder"));
+            }
+            return Ok(detected(Role::Component { kind: "speech_breeze" }, "safetensors", format!("Breeze TTS 2: speaks in described and saved voices; research and non-commercial use only ({label})"), vec![("breeze", path_json(dir))]));
         }
         // Qwen3-TTS: VoiceDesign speaks in voices described in words; Base
         // speaks in saved voices. One speech model pairs the two.

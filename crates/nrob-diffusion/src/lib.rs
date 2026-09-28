@@ -18,3 +18,4 @@ pub mod ltx;
 pub mod sdxl;
 pub mod music;
 pub mod tts;
+pub mod sound;

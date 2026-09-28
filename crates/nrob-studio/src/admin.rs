@@ -86,7 +86,7 @@ pub fn handle(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, port: u16)
         // The playground: every target, no key, local references allowed.
         let (target, sub) = rest.split_once('/').map_or((rest, String::new()), |(t, s)| (t, format!("/{s}")));
         let target = match target {
-            "chat" | "completions" | "models" | "images" | "edits" | "videos" | "speech" | "voices" | "music" | "health" => target,
+            "chat" | "completions" | "models" | "images" | "edits" | "videos" | "speech" | "voices" | "music" | "sound" | "health" => target,
             _ => return err(w, 404, "unknown playground target"),
         };
         let m = Matched { target: target.into(), spec: "openai".into(), rest: sub };

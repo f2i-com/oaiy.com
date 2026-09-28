@@ -7,6 +7,7 @@
 //! described voice, then the Base model's speaker encoder and the codec's
 //! encoder turn that clip into a speaker embedding and reference codes. Later
 //! lines prompt the Base talker with them (in-context), so the voice holds.
+pub mod breeze;
 pub mod clone;
 pub mod codec;
 pub mod model;
@@ -55,6 +56,10 @@ pub struct Request {
     pub top_k: usize,
     pub top_p: f64,
     pub repetition_penalty: f64,
+    /// Whether the request gave the repetition penalty (else each engine's default).
+    pub repetition_penalty_set: bool,
+    /// Breeze TTS 2: classifier-free guidance toward the instruction (1 = none).
+    pub cfg_scale: Option<f64>,
     /// Argmax instead of sampling (for tests; it tends to loop on long text).
     pub greedy: bool,
     /// Speak in a saved voice (a file written by `design_voice`); `model_dir`
@@ -103,8 +108,9 @@ impl Voice {
             })
             .collect::<std::result::Result<Vec<_>, _>>()?;
         let speaker: Vec<f32> = j.get("speaker").and_then(Json::as_array).ok_or("voice: missing speaker")?.iter().filter_map(|v| v.as_f64()).map(|v| v as f32).collect();
-        if speaker.len() != 2048 || ref_codes.is_empty() || ref_codes.iter().flatten().any(|&c| c >= AUDIO_CODES) {
-            return Err("voice: needs a 2048-value speaker embedding and valid reference codes".into());
+        // A voice made with Breeze TTS 2 has no speaker embedding (Breeze needs none).
+        if !(speaker.is_empty() || speaker.len() == 2048) || ref_codes.is_empty() || ref_codes.iter().flatten().any(|&c| c >= AUDIO_CODES) {
+            return Err("voice: needs valid reference codes (and a 2048-value speaker embedding, or none)".into());
         }
         Ok(Self { name: s("name"), description: s("description"), language: s("language"), ref_text: s("ref_text"), ref_codes, speaker })
     }
@@ -127,6 +133,8 @@ impl Request {
             top_k: j.get("top_k").and_then(Json::as_i64).unwrap_or(50).max(1) as usize,
             top_p: f("top_p", 1.0),
             repetition_penalty: f("repetition_penalty", 1.05),
+            repetition_penalty_set: j.get("repetition_penalty").and_then(Json::as_f64).is_some(),
+            cfg_scale: j.get("cfg_scale").and_then(Json::as_f64),
             greedy: j.get("greedy").and_then(Json::as_bool).unwrap_or(false),
             voice: match j.get("voice_file").and_then(Json::as_str) {
                 None => None,
@@ -482,6 +490,11 @@ impl DesignRequest {
 pub fn design_voice(r: &DesignRequest, mut report: impl FnMut(Json)) -> Result<Json> {
     let started = Instant::now();
     std::fs::create_dir_all(&r.output)?;
+    if breeze::is_breeze(&r.design_dir) {
+        report(event("designing_voice", 0, 3));
+        let (voice, clip) = breeze::design(&r.design_dir, &r.name, &r.description, &r.sample, &r.language, r.seed, r.device, &r.output)?;
+        return save_voice(voice, &clip, &r.output, started, &mut report);
+    }
     let dev = device(r.device)?;
     report(event("designing_voice", 0, 3));
     let speak = Request {
@@ -497,6 +510,8 @@ pub fn design_voice(r: &DesignRequest, mut report: impl FnMut(Json)) -> Result<J
         top_k: 50,
         top_p: 1.0,
         repetition_penalty: 1.05,
+        repetition_penalty_set: true,
+        cfg_scale: None,
         greedy: false,
         voice: None,
     };
@@ -518,9 +533,14 @@ pub fn design_voice(r: &DesignRequest, mut report: impl FnMut(Json)) -> Result<J
     let speaker = clone::SpeakerEncoder::load(&r.base_dir.join("model.safetensors"), &dev)?.embed(&clip)?;
     let ref_codes = clone::SpeechEncoder::load(&r.base_dir.join("speech_tokenizer").join("model.safetensors"), &dev)?.encode(&clip)?;
     let voice = Voice { name: r.name.clone(), description: r.description.clone(), language: r.language.clone(), ref_text: r.sample.clone(), ref_codes, speaker };
+    save_voice(voice, &clip, &r.output, started, &mut report)
+}
+
+/// The voice file and its sample clip, written beside each other.
+fn save_voice(voice: Voice, clip: &[f32], output: &Path, started: Instant, report: &mut impl FnMut(Json)) -> Result<Json> {
     let stamp = SystemTime::now().duration_since(UNIX_EPOCH).map_err(candle_core::Error::wrap)?.as_nanos();
-    let clip_path = r.output.join(format!("voice-{stamp}.wav"));
-    write_wav(&clip_path, &clip, codec::SAMPLE_RATE)?;
+    let clip_path = output.join(format!("voice-{stamp}.wav"));
+    write_wav(&clip_path, clip, codec::SAMPLE_RATE)?;
     let voice_path = clip_path.with_extension("voice.json");
     std::fs::write(&voice_path, voice.to_json().to_json())?;
     report(event("designing_voice", 3, 3));
@@ -563,14 +583,21 @@ fn device(index: usize) -> Result<Device> {
     {
         Device::new_cuda(index)
     }
+    // The models run in BF16, which the CPU backend cannot multiply.
     #[cfg(not(feature = "cuda"))]
     {
         let _ = index;
-        Ok(Device::Cpu)
+        candle_core::bail!("speech need a GPU: this nrob-diffusion was built without CUDA (build it with --features cuda or flash-attn)")
     }
 }
 
 pub fn generate(r: &Request, mut report: impl FnMut(Json)) -> Result<Json> {
+    if breeze::is_breeze(&r.model_dir) {
+        return breeze::generate(r, report);
+    }
+    if r.voice.as_ref().is_some_and(|v| v.speaker.is_empty()) {
+        candle_core::bail!("this voice was made with Breeze TTS 2; speak it with a Breeze model");
+    }
     let started = Instant::now();
     std::fs::create_dir_all(&r.output)?;
     let dev = device(r.device)?;
@@ -780,6 +807,8 @@ mod tests {
             top_k: 50,
             top_p: 1.0,
             repetition_penalty: 1.05,
+            repetition_penalty_set: true,
+            cfg_scale: None,
             greedy: true,
             voice: None,
         };

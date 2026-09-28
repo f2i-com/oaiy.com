@@ -38,8 +38,9 @@ struct Layer {
     /// q, k and v projections fused (outputs: heads, kv heads, kv heads).
     qkv: Linear,
     o: Linear,
-    q_norm: Tensor,
-    k_norm: Tensor,
+    /// Per-head q/k RMS norms (Qwen3); none for Llama-style layers.
+    q_norm: Option<Tensor>,
+    k_norm: Option<Tensor>,
     input_norm: Tensor,
     post_norm: Tensor,
     /// gate and up fused.
@@ -74,6 +75,14 @@ impl Decoder {
     /// `prefix`: e.g. `talker.model` (layers under `{prefix}.layers.N`).
     #[allow(clippy::too_many_arguments)]
     pub fn load(store: &mut Store, prefix: &str, layers: usize, heads: usize, kv_heads: usize, head_dim: usize, theta: f64, max_positions: usize, eps: f32, dev: &Device) -> Result<Self> {
+        let inv: Vec<f64> = (0..head_dim / 2).map(|i| 1. / theta.powf(2. * i as f64 / head_dim as f64)).collect();
+        Self::load_with(store, prefix, layers, heads, kv_heads, head_dim, &inv, max_positions, eps, true, dev)
+    }
+
+    /// As `load`, with RoPE's inverse frequencies given (scaled ones, e.g. llama3's) and the
+    /// q/k norms optional (`qk_norm`: false for Llama-style layers).
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_with(store: &mut Store, prefix: &str, layers: usize, heads: usize, kv_heads: usize, head_dim: usize, inv: &[f64], max_positions: usize, eps: f32, qk_norm: bool, dev: &Device) -> Result<Self> {
         let mut out = Vec::with_capacity(layers);
         for i in 0..layers {
             let l = format!("{prefix}.layers.{i}");
@@ -81,8 +90,8 @@ impl Decoder {
             out.push(Layer {
                 qkv: Linear::fused(store, &names(&["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj"]), dev)?,
                 o: Linear::load(store, &format!("{l}.self_attn.o_proj"), dev)?,
-                q_norm: store.tensor(&format!("{l}.self_attn.q_norm.weight"), dev, false)?,
-                k_norm: store.tensor(&format!("{l}.self_attn.k_norm.weight"), dev, false)?,
+                q_norm: if qk_norm { Some(store.tensor(&format!("{l}.self_attn.q_norm.weight"), dev, false)?) } else { None },
+                k_norm: if qk_norm { Some(store.tensor(&format!("{l}.self_attn.k_norm.weight"), dev, false)?) } else { None },
                 input_norm: store.tensor(&format!("{l}.input_layernorm.weight"), dev, false)?,
                 post_norm: store.tensor(&format!("{l}.post_attention_layernorm.weight"), dev, false)?,
                 gate_up: Linear::fused(store, &names(&["mlp.gate_proj", "mlp.up_proj"]), dev)?,
@@ -91,7 +100,6 @@ impl Decoder {
         }
         // RoPE tables in F32 (as the reference computes them), cast to BF16.
         let half = head_dim / 2;
-        let inv: Vec<f64> = (0..half).map(|i| 1. / theta.powf(2. * i as f64 / head_dim as f64)).collect();
         let freqs: Vec<f32> = (0..max_positions).flat_map(|p| inv.iter().map(move |f| (p as f64 * f) as f32)).collect();
         let freqs = Tensor::from_vec(freqs, (max_positions, half), dev)?;
         Ok(Self {
@@ -123,8 +131,10 @@ impl Decoder {
             let n = rms(&h, &l.input_norm, self.eps)?;
             // (batch, time, heads, dim) throughout: no transposes.
             let qkv = l.qkv.forward(&n)?;
-            let q = rms(&qkv.narrow(2, 0, nq * hd)?.reshape((1, t, nq, hd))?, &l.q_norm, self.eps)?;
-            let k = rms(&qkv.narrow(2, nq * hd, nkv * hd)?.reshape((1, t, nkv, hd))?, &l.k_norm, self.eps)?;
+            let q = qkv.narrow(2, 0, nq * hd)?.reshape((1, t, nq, hd))?;
+            let k = qkv.narrow(2, nq * hd, nkv * hd)?.reshape((1, t, nkv, hd))?;
+            let q = match &l.q_norm { Some(w) => rms(&q, w, self.eps)?, None => q.contiguous()? };
+            let k = match &l.k_norm { Some(w) => rms(&k, w, self.eps)?, None => k.contiguous()? };
             let v = qkv.narrow(2, (nq + nkv) * hd, nkv * hd)?.reshape((1, t, nkv, hd))?.contiguous()?;
             let q = candle_nn::rotary_emb::rope_thd(&q, &cos, &sin)?;
             let k = candle_nn::rotary_emb::rope_thd(&k, &cos, &sin)?;

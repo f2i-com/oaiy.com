@@ -26,6 +26,8 @@ pub enum Kind {
     Speech,
     /// Songs, and making the music model's smaller copy.
     Music,
+    /// Sound effects from a description.
+    Sound,
 }
 
 impl Kind {
@@ -35,6 +37,7 @@ impl Kind {
             Kind::Video => "video",
             Kind::Speech => "speech",
             Kind::Music => "music",
+            Kind::Sound => "sound",
         }
     }
 }
@@ -106,7 +109,7 @@ impl Job {
             ("seconds_taken", self.result.get("seconds").cloned().unwrap_or(Json::Null)),
             ("seconds", match self.kind {
                 Kind::Video => Json::Num(self.clip_seconds()),
-                Kind::Speech | Kind::Music => self.result.get("duration").cloned().unwrap_or(Json::Null),
+                Kind::Speech | Kind::Music | Kind::Sound => self.result.get("duration").cloned().unwrap_or(Json::Null),
                 Kind::Image => Json::Null,
             }),
             // What a viewer needs to reproduce it; never paths or references.
@@ -921,6 +924,11 @@ fn progress_of(kind: Kind, n: usize, e: &Json) -> Option<(f64, String)> {
         (Kind::Music, "rendering") if i("total") > 0.0 => 64.0 + 34.0 * i("current") / i("total"),
         (Kind::Music, "quantizing") if i("total") > 0.0 => 2.0 + 96.0 * i("current") / i("total"),
         (Kind::Music, _) => 2.0,
+        (Kind::Sound, "encoding_prompt") => 3.0,
+        (Kind::Sound, "loading_sound_model") => 8.0,
+        (Kind::Sound, "generating_sound") if i("total") > 0.0 => 10.0 + 85.0 * i("current") / i("total"),
+        (Kind::Sound, "decoding_sound") => 96.0,
+        (Kind::Sound, _) => 2.0,
     };
     Some((p, stage))
 }
@@ -951,6 +959,7 @@ impl Media {
                 Kind::Video => "video_",
                 Kind::Speech => "speech_",
                 Kind::Music => "music_",
+                Kind::Sound => "sfx_",
             }),
             kind,
             status: "queued".into(),
@@ -1186,14 +1195,14 @@ impl Media {
                         j.files = match j.kind {
                             Kind::Image => result.get("data").and_then(Json::as_array).unwrap_or(&[]).iter()
                                 .filter_map(|d| d.get("path").and_then(Json::as_str)).map(PathBuf::from).collect(),
-                            Kind::Video | Kind::Speech => result.get("path").and_then(Json::as_str).map(PathBuf::from).into_iter().collect(),
+                            Kind::Video | Kind::Speech | Kind::Sound => result.get("path").and_then(Json::as_str).map(PathBuf::from).into_iter().collect(),
                             // A song; a smaller copy of the model is not a file to show.
                             Kind::Music => result.get("path").and_then(Json::as_str).map(PathBuf::from).filter(|p| p.extension().is_some_and(|e| e == "wav")).into_iter().collect(),
                         };
                         j.preview = match j.kind {
                             Kind::Image => j.files.first().cloned(),
                             Kind::Video => result.get("preview").and_then(Json::as_str).map(PathBuf::from),
-                            Kind::Speech | Kind::Music => None,
+                            Kind::Speech | Kind::Music | Kind::Sound => None,
                         };
                         j.result = result;
                     }

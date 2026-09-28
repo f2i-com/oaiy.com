@@ -1,9 +1,9 @@
 # Speech
 
-NROB speaks with Qwen3-TTS (12 Hz, 1.7B), natively in Rust (`nrob-diffusion`,
-`kind: "speech"`). The studio serves it as OpenAI's `audio.speech`. It adds
-**saved voices**: describe a voice once, keep it, and every later line uses the
-same voice.
+NROB speaks with Qwen3-TTS (12 Hz, 1.7B) or [Breeze TTS 2](#breeze-tts-2),
+natively in Rust (`nrob-diffusion`, `kind: "speech"`). The studio serves both as
+OpenAI's `audio.speech`. It adds **saved voices**: describe a voice once, keep
+it, and every later line uses the same voice.
 
 ## Models
 
@@ -39,6 +39,38 @@ Two new lines in a saved voice measured 0.99 speaker similarity with it, against
 The Playground's **Save this voice…** button uses the same description, line
 and seed you just heard, so the saved voice is exactly that one.
 
+## Breeze TTS 2
+
+[BreezeBlue/Breeze-TTS-2](https://huggingface.co/BreezeBlue/Breeze-TTS-2) is
+an alternative to Qwen3-TTS: one folder speaks in described voices and in saved
+ones. **Its weights, and what you make with them, are for research and
+non-commercial use only.** The studio shows this beside the model, and
+discovery reports it as the model's `license`.
+
+On the **Models** page, pick the folder. The studio recognises it from its
+`config.json` (`model_type: breeze`) and adds `breeze-tts-2`. The default
+speech model stays as it was; choose Breeze per request with `model`, or make
+it the default on the Models page.
+
+It has three parts:
+
+1. **Text encoder.** A T5Gemma 2 encoder (26 layers) reads the text and the
+   voice description. Each text part is encoded on its own and projected into
+   the talker.
+2. **Talker.** A Qwen3 backbone (28 layers) picks each frame's first code, and
+   a 12-layer depth decoder picks the other 15. Both use classifier-free
+   guidance toward the description (4 by default; `cfg_scale` changes it).
+3. **Codec.** Breeze uses Qwen3-TTS's 12 Hz codec (its `audio_tokenizer/`
+   folder), so the audio is 24 kHz mono.
+
+A voice is saved the same way, as reference codes and the transcript of a
+sample line, which Breeze reads in context before the new text. It needs no
+speaker embedding, so a voice Breeze makes has none. That has one consequence:
+
+- A voice Qwen3-TTS made can be spoken by Breeze.
+- A voice Breeze made can only be spoken by Breeze. Asking a Qwen3-TTS model
+  for it is refused with a message saying so.
+
 ## API
 
 ### `POST /v1/audio/speech`
@@ -50,6 +82,7 @@ OpenAI's request, plus a few extensions. It returns the audio itself.
 | `input` | The text to speak (up to 20000 bytes). |
 | `voice` | A saved voice's name, or an OpenAI voice name (`alloy`, `ash`, `ballad`, `cedar`, `coral`, `echo`, `fable`, `marin`, `nova`, `onyx`, `sage`, `shimmer`, `verse`, each given a matching description). May also be `{"id": "..."}`, or a voice itself: the object `POST /v1/audio/voices` with `keep: false` handed back (nothing needs to be saved here). |
 | `instructions` | Describe any voice in words; this takes precedence over an OpenAI voice name. It is ignored for saved voices. |
+| `cfg_scale` | Extension, Breeze TTS 2 only: how closely a described voice follows its description, 0 to 20 (default 4). |
 | `model` | A speech model; `tts-1`, `tts-1-hd` and `gpt-4o-mini-tts` mean the default. |
 | `response_format` | `mp3` (default), `opus`, `aac`, `flac`, `wav`, or `pcm` (16-bit mono, 24 kHz). |
 | `speed` | 0.25 to 4 (FFmpeg's `atempo`, so the pitch is kept). |
@@ -70,7 +103,7 @@ curl http://127.0.0.1:8080/v1/audio/speech -H "Content-Type: application/json" \
 | Request | Does |
 |---|---|
 | `GET /v1/audio/voices` | Lists saved voices (name, description, language, sample text, time). |
-| `POST /v1/audio/voices` | Designs and saves a voice. JSON: `name`, `description`, and optionally `sample_text`, `language`, `seed`, `replace`. Takes about 10 seconds. With `keep: false` (the default in incognito, where saving is refused) nothing is saved: the reply also holds `voice` (the voice itself) and `sample` (`{format: "wav", data}` in base64), for the caller to keep and send as `voice`, with `sample` inside it for a talking video's reference voice. |
+| `POST /v1/audio/voices` | Designs and saves a voice. JSON: `name`, `description`, and optionally `sample_text`, `language`, `seed`, `replace`, and `model` (the speech model that designs it). Takes about 10 seconds. With `keep: false` (the default in incognito, where saving is refused) nothing is saved: the reply also holds `voice` (the voice itself) and `sample` (`{format: "wav", data}` in base64), for the caller to keep and send as `voice`, with `sample` inside it for a talking video's reference voice. |
 | `GET /v1/audio/voices/{name}` | One voice. |
 | `GET /v1/audio/voices/{name}/sample` | Its sample clip (WAV). |
 | `DELETE /v1/audio/voices/{name}` | Deletes it. |
@@ -104,6 +137,11 @@ On an RTX 5090:
 The talker and codec need about 3.5 GB of VRAM (BF16 talker, F32 codec). The
 text embedding table stays in the file: only the prompt's rows are read.
 
+Breeze TTS 2 writes about 7 frames a second, a little over half real time: the
+depth decoder's 15 steps a frame dominate. A 6-second line takes about 10 s
+once the model is loaded, and designing a voice about 30 s. It needs about
+6.5 GB of VRAM.
+
 ## Verification
 
 Reference activations come from the official `qwen-tts` package (strict F32 for
@@ -121,3 +159,9 @@ the F32 parts, TF32 off). The opt-in tests are `tts::codec`, `tts::clone` and
 The tokenizer reproduces the reference's token ids exactly. Greedy decoding
 reproduces the reference's first frames; later frames differ only where BF16
 near-ties flip.
+
+For Breeze TTS 2, the reference is the official `breeze-tts` code with
+Transformers. Greedy decoding reproduces its prompt and its first frame, with
+and without guidance. The first difference is a near-tie (0.03 logits apart)
+in a later codebook, as with Qwen3-TTS. Its lines transcribe back word for word
+with Whisper.

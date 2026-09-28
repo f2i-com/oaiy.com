@@ -44,6 +44,14 @@ fn operations(target: &str, spec: &str, path: &str) -> Vec<Json> {
             sub("POST", format!("{path}/{{id}}/cancel"), "stop a job"),
             sub("DELETE", format!("{path}/{{id}}"), "forget a job (files stay on disk)"),
         ],
+        ("sound", _) => vec![
+            sub("POST", path.into(), "create a sound effect job (JSON: prompt (describe the sound), seconds 0.5-30 (default 10), seed, steps, cfg_scale)"),
+            sub("GET", path.into(), "list sound effect jobs"),
+            sub("GET", format!("{path}/{{id}}"), "poll a job: status queued | in_progress | completed | failed, progress 0-100"),
+            sub("GET", format!("{path}/{{id}}/content"), "download the sound: 48 kHz mono WAV, or ?format=mp3|opus|aac|flac|pcm"),
+            sub("POST", format!("{path}/{{id}}/cancel"), "stop a job"),
+            sub("DELETE", format!("{path}/{{id}}"), "forget a job (files stay on disk)"),
+        ],
         ("voices", _) => vec![
             sub("GET", path.into(), "list saved voices"),
             sub("POST", path.into(), "design and save a voice (JSON: name, description, sample_text?, language?, seed?)"),
@@ -59,13 +67,14 @@ fn describe(target: &str) -> &'static str {
     match target {
         "chat" => "chat completions, streamed as server-sent events with stream: true",
         "completions" => "raw text completions",
-        "models" => "model list; each entry has type llm | image | video | speech | music",
+        "models" => "model list; each entry has type llm | image | video | speech | music | sound",
         "images" => "text-to-image; add images: [{image_url}] to edit",
         "edits" => "image edits: multipart (image, prompt) or JSON with images",
         "videos" => "text/image-to-video",
         "speech" => "text to speech in a saved or described voice (OpenAI audio.speech)",
         "voices" => "saved voices: design one from a description, then speak in it by name",
         "music" => "songs with vocals and instruments from lyrics and a description, as asynchronous jobs",
+        "sound" => "sound effects (ambience, creatures, machines, actions) from a description, up to 30 seconds, as asynchronous jobs",
         "files" => "generated media",
         "health" => "liveness, no key needed",
         "discovery" => "this document",
@@ -184,11 +193,15 @@ pub fn document(studio: &Studio, base: &str, authorized: bool) -> Json {
     let speech_models: Vec<Json> = names(speech)
         .into_iter()
         .map(|(name, m)| {
+            let breeze = !str_or(&m, "breeze", "").is_empty();
             Json::obj([
                 ("id", Json::str(&name)),
                 ("default", Json::Bool(name == speech_default)),
-                ("described_voices", Json::Bool(!str_or(&m, "design", "").is_empty())),
-                ("saved_voices", Json::Bool(!str_or(&m, "base", "").is_empty())),
+                ("engine", Json::str(if breeze { "breeze-tts-2" } else { "qwen3-tts" })),
+                ("described_voices", Json::Bool(breeze || !str_or(&m, "design", "").is_empty())),
+                ("saved_voices", Json::Bool(breeze || !str_or(&m, "base", "").is_empty())),
+                // Breeze TTS 2's weights and what they make are for research and non-commercial use.
+                ("license", Json::str(if breeze { "research and non-commercial" } else { "apache-2.0" })),
                 ("sample_rate", Json::Int(24_000)),
             ])
         })
@@ -208,6 +221,20 @@ pub fn document(studio: &Studio, base: &str, authorized: bool) -> Json {
             ])
         })
         .collect();
+    let sound = section("sound");
+    let sound_default = effective(sound);
+    let sound_models: Vec<Json> = names(sound)
+        .into_iter()
+        .map(|(name, _)| {
+            Json::obj([
+                ("id", Json::str(&name)),
+                ("default", Json::Bool(name == sound_default)),
+                ("max_seconds", Json::Num(crate::sound::MAX_SECONDS)),
+                ("sample_rate", Json::Int(crate::sound::SAMPLE_RATE)),
+                ("channels", Json::Int(1)),
+            ])
+        })
+        .collect();
     let models_for = |target: &str| -> Vec<Json> {
         let ids = |list: &[Json]| list.iter().filter_map(|m| m.get("id").cloned()).collect::<Vec<_>>();
         match target {
@@ -219,6 +246,7 @@ pub fn document(studio: &Studio, base: &str, authorized: bool) -> Json {
             "speech" => ids(&speech_models).into_iter().chain(ids(&music_models)).collect(),
             "voices" => ids(&speech_models),
             "music" => ids(&music_models),
+            "sound" => ids(&sound_models),
             _ => Vec::new(),
         }
     };
@@ -249,7 +277,7 @@ pub fn document(studio: &Studio, base: &str, authorized: bool) -> Json {
             if target == "speech" || target == "voices" {
                 e.push(("voices".into(), Json::Arr(voices.iter().filter_map(|v| v.get("name").cloned()).collect())));
             }
-            if !models.is_empty() || matches!(target, "chat" | "completions" | "images" | "edits" | "videos" | "speech" | "music") {
+            if !models.is_empty() || matches!(target, "chat" | "completions" | "images" | "edits" | "videos" | "speech" | "music" | "sound") {
                 e.push(("models".into(), Json::Arr(models)));
             }
             Json::Obj(e)
@@ -260,7 +288,7 @@ pub fn document(studio: &Studio, base: &str, authorized: bool) -> Json {
         ("endpoints".into(), Json::Arr(endpoints)),
         (
             "models".into(),
-            Json::obj([("llm", Json::Arr(llm_models)), ("image", Json::Arr(image_models)), ("video", Json::Arr(video_models)), ("speech", Json::Arr(speech_models)), ("music", Json::Arr(music_models))]),
+            Json::obj([("llm", Json::Arr(llm_models)), ("image", Json::Arr(image_models)), ("video", Json::Arr(video_models)), ("speech", Json::Arr(speech_models)), ("music", Json::Arr(music_models)), ("sound", Json::Arr(sound_models))]),
         ),
         (
             "defaults".into(),
@@ -270,6 +298,7 @@ pub fn document(studio: &Studio, base: &str, authorized: bool) -> Json {
                 ("video", Json::str(&video_default)),
                 ("speech", Json::str(&speech_default)),
                 ("music", Json::str(&music_default)),
+                ("sound", Json::str(&sound_default)),
             ]),
         ),
         (

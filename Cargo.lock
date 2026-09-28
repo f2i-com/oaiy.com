@@ -1445,6 +1445,7 @@ dependencies = [
  "candle-flash-attn",
  "candle-nn",
  "dsv41",
+ "half",
  "image",
  "nrob",
  "regex",
