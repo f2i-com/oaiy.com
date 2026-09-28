@@ -9,6 +9,7 @@
  * from code running on this page, which can still ask the browser to decrypt.
  * Keys are sent only to their own provider, never to sandboxed code.
  */
+import type { CallBackFilter } from './callbacks';
 import type { NetGateSettings } from './gate/netgate';
 import type { ProviderConfig } from './agent/providers/types';
 import { EMPTY_MEDIA, type MediaSettings } from './agent/media';
@@ -102,6 +103,12 @@ export interface MessageSettings {
   calls: boolean;
   /** The person's instructions for calls, added to the receptionist brief Aokie sends. */
   callInstructions: string;
+  /** Ring missed calls back when the receptionist is free (through Aokie, which must allow outbound calls). */
+  callBack: boolean;
+  /** Which missed calls are rung back: the numbers the receptionist answers, Australian ones, or any (never blocked or private ones). */
+  callBackFilter: CallBackFilter;
+  /** What the receptionist says first when they answer (empty: the default line). */
+  callBackLine: string;
 }
 
 export const DEFAULT_MESSAGE_SETTINGS: MessageSettings = {
@@ -111,6 +118,9 @@ export const DEFAULT_MESSAGE_SETTINGS: MessageSettings = {
   // Off until turned on, as texts are.
   calls: false,
   callInstructions: '',
+  callBack: false,
+  callBackFilter: 'answered',
+  callBackLine: '',
 };
 
 export interface Settings {

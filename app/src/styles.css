@@ -568,6 +568,15 @@ details.msg.compacted pre { white-space: pre-wrap; font-size: 12px; max-height: 
 .phone-form textarea { width: 100%; min-height: 90px; resize: vertical; }
 .phone-form .pair-code { font: 700 22px/1.2 var(--mono); letter-spacing: 0.2em; color: var(--accent); }
 .phone-form .row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+/* The dialog's sections: who is answered, and missed calls. */
+.phone-form .phone-heading { margin: 10px 0 0; padding-top: 12px; border-top: 1px solid var(--border); font-size: 13px; font-weight: 600; }
+.phone-form .phone-screening { display: flex; flex-direction: column; gap: 10px; }
+.phone-form .phone-screening[hidden] { display: none; }
+.phone-form label:not(.row) { display: flex; flex-direction: column; gap: 4px; }
+.phone-form select, .phone-form input:not([type='checkbox']) { width: 100%; }
+.phone-form textarea.blocked { min-height: 70px; }
+.phone-callbacks { margin: 0; padding-left: 18px; font-size: 12.5px; display: flex; flex-direction: column; gap: 2px; }
+.phone-callbacks[hidden] { display: none; }
 
 /* ---------- inside OAIY's window: its rounder controls, and the project actions in one menu ---------- */
 .in-oaiy button, .in-oaiy select, .in-oaiy input, .in-oaiy textarea { border-radius: 8px; }

@@ -8,6 +8,7 @@ import { sandboxAvailable, zippModule } from './sandbox/runner';
 import { loadSettings, saveAgentSettings, saveDesktop, saveGate, saveLastKeptProject, saveLastProject, saveMedia, saveMessages, saveProviders } from './settings';
 import { Desktop } from './desktop/bridge';
 import { DesktopEvents, Sessions, TEST_NUMBER, callerNotesTool, phoneConversationsTool, tellAgentTool } from './sessions';
+import { Callbacks, type Screening } from './callbacks';
 import { flowSessionTools, flowToolHooks, readFlowStore } from './desktop/flowTools';
 import { TRANSCRIBE_TOOL, transcribeTool } from './desktop/transcribe';
 import { calendarTools } from './desktop/calendarTools';
@@ -146,6 +147,8 @@ async function main(): Promise<void> {
   let desktop: Desktop | null = given ? new Desktop(given.origin, given.token) : settings.desktop ? new Desktop(settings.desktop.origin, settings.desktop.token) : null;
   let messages = settings.messages;
   let sessions: Sessions | null = null;
+  /** Missed calls rung back (by the page that answers the calls). */
+  let callbacks: Callbacks | null = null;
   // Several OAIY pages may follow the same phone: the one holding this lease answers its texts.
   const pageId = crypto.randomUUID();
   let holdsTexts = false;
@@ -405,6 +408,26 @@ async function main(): Promise<void> {
       () => (frontDesk.vfs.exists(FRONT_DESK_BRIEF) ? frontDesk.vfs.readText(FRONT_DESK_BRIEF) : ''),
     ));
     await own.load();
+    // Missed calls rung back: by the page that answers the calls, when no call is going on.
+    callbacks = new Callbacks(frontDesk, () => messages, () => desktop, () => holdsCalls && !own.list.some((s) => s.callId), readScreening);
+    await callbacks.load();
+    callbacks.start();
+    // A call back's call is taken by the agent knowing it rang them, and why.
+    own.callingBack = (number) => callbacks?.calling(number);
+  }
+
+  /** Aokie's call screening: which calls it answers (null when the phone cannot be asked). */
+  async function readScreening(): Promise<Screening | null> {
+    const d = desktop;
+    if (!d) return null;
+    const read = async (key: string) => ((await d.command('aokie', 'settings.get', { key }, `oaiy:settings.get:${key}:${crypto.randomUUID()}`)) as { value?: unknown } | null)?.value;
+    const [accept, blocked, hidden] = await Promise.all([read('acceptPattern'), read('blockedNumbers'), read('rejectPrivate')]);
+    return { acceptPattern: typeof accept === 'string' ? accept : '', blockedNumbers: typeof blocked === 'string' ? blocked : '', rejectPrivate: hidden === true || hidden === 'true' };
+  }
+
+  async function saveScreening(screening: Screening): Promise<void> {
+    if (!desktop) throw new Error('OAIY Desktop is not connected');
+    await desktop.command('aokie', 'settings.set', { ...screening }, `oaiy:settings.set:screening:${crypto.randomUUID()}`);
   }
 
   const openProjectNow = async (meta: ProjectMeta) => {
@@ -1267,6 +1290,7 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
       renderPhoneChip();
     }
     await sessions?.desktopEvent(event);
+    await callbacks?.event(event);
   }, (problem) => {
     desktopProblem = problem;
     renderPhoneChip();
@@ -1412,8 +1436,16 @@ With that done, Settings → Images, video and audio → Find OAIY sets it up.`)
       test: (body) => {
         void sessions?.textArrived(TEST_NUMBER, 'Test', body).then((session) => selectSession(session.id));
       },
+      screening: desktop ? { load: readScreening, save: saveScreening } : undefined,
+      callbacks: callbacks?.list,
     });
     if (saved) {
+      // Calling back needs Aokie's outbound calling (its kill switch is off until someone turns it on).
+      if (saved.callBack && !messages.callBack && desktop) {
+        await desktop.command('aokie', 'settings.set', { outboundEnabled: true }, `oaiy:settings.set:outbound:${crypto.randomUUID()}`).catch((e: unknown) => {
+          chat.system(`Missed calls are to be called back, but the phone did not turn on outbound calling: ${(e as Error).message}`, 'error');
+        });
+      }
       messages = saved;
       await saveMessages(saved);
       // Turned on: take the lease now (and answer what waits); turned off: give it up.

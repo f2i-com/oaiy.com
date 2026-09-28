@@ -19,6 +19,7 @@
  * person works in, and it is not in the project menu, so it cannot be renamed,
  * deleted or left behind by incognito.
  */
+import type { Callback } from '../callbacks';
 import type { Turn } from '../agent/protocol';
 import { Vfs, type VfsChange } from './vfs';
 
@@ -353,6 +354,15 @@ export class OpenProject {
   /** The conversation, kept with the project (an incognito one's is deleted with it). */
   async saveChat(turns: Turn[]): Promise<void> {
     await writeBytes(this.dir, 'chat.json', JSON.stringify(turns));
+  }
+
+  /** Missed calls to ring back, and the last few settled (the front desk's). */
+  async loadCallbacks(): Promise<Callback[]> {
+    return (await readJson<Callback[]>(this.dir, 'callbacks.json')) ?? [];
+  }
+
+  async saveCallbacks(list: Callback[]): Promise<void> {
+    await writeBytes(this.dir, 'callbacks.json', JSON.stringify(list));
   }
 
   /** What the phone's agents know about the people who call and text (the front desk's). */

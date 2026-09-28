@@ -4,6 +4,7 @@
  * instructions for them. A pretend text tries it without the phone.
  */
 import { DESKTOP_ORIGIN, desktopHealth, pairingStatus, startPairing } from '../desktop/bridge';
+import { AU_PATTERN, DEFAULT_CALL_BACK_LINE, type Callback, type CallBackFilter, type Screening } from '../callbacks';
 import type { DesktopSettings, MessageSettings } from '../settings';
 import { h } from './dom';
 import { askText, modal } from './modal';
@@ -19,6 +20,10 @@ export interface PhoneDialog {
   paired: (desktop: DesktopSettings | null) => void;
   /** Pretend a text message arrived, to try the agent without the phone. */
   test: (body: string) => void;
+  /** Aokie's call screening (null: the phone is not reachable), and how to change it. */
+  screening?: { load: () => Promise<Screening | null>; save: (screening: Screening) => Promise<void> };
+  /** Missed calls waiting to be rung back, and the last few settled. */
+  callbacks?: Callback[];
 }
 
 export async function editPhone(options: PhoneDialog): Promise<MessageSettings | null> {
@@ -89,6 +94,60 @@ export async function editPhone(options: PhoneDialog): Promise<MessageSettings |
   const calls = h('input', { type: 'checkbox', checked: options.messages.calls }) as HTMLInputElement;
   const callInstructions = h('textarea', { placeholder: 'Added to the receptionist brief Aokie sends with each call: what the agent may say on the phone, when to take a message…' }) as HTMLTextAreaElement;
   callInstructions.value = options.messages.callInstructions;
+  // Who is answered: Aokie's screening, read from the phone (its own settings).
+  const accept = h('select', {},
+    h('option', { value: 'any' }, 'Any number'),
+    h('option', { value: 'au' }, 'Australian numbers only'),
+    h('option', { value: 'pattern' }, 'Numbers matching a pattern…'),
+  ) as HTMLSelectElement;
+  const pattern = h('input', { placeholder: 'A regular expression the caller id must match, e.g. ^\\+?61' }) as HTMLInputElement;
+  const blocked = h('textarea', { placeholder: 'One number a line: never answered (any format: 0400 000 000, +61400000000)' }) as HTMLTextAreaElement;
+  const rejectPrivate = h('input', { type: 'checkbox' }) as HTMLInputElement;
+  const screenNote = h('p.muted', 'Reading the phone\'s call screening…');
+  const screenFields = h('div.phone-screening', { hidden: true },
+    h('label', 'Answer calls from', accept),
+    pattern,
+    h('label', 'Blocked numbers', blocked),
+    h('label.row', rejectPrivate, ' Do not answer callers who hide their number'),
+  );
+  const showPattern = () => (pattern.hidden = accept.value !== 'pattern');
+  accept.addEventListener('change', showPattern);
+  let screeningLoaded: Screening | null = null;
+  if (options.screening) {
+    void options.screening.load().then((s) => {
+      screeningLoaded = s;
+      if (!s) {
+        screenNote.textContent = 'The phone is not reachable now: who is answered is set here once OAIY Desktop and Aokie are running.';
+        return;
+      }
+      accept.value = !s.acceptPattern.trim() ? 'any' : s.acceptPattern.trim() === AU_PATTERN ? 'au' : 'pattern';
+      pattern.value = accept.value === 'pattern' ? s.acceptPattern : '';
+      blocked.value = s.blockedNumbers.split(/[,;\n]/).map((n) => n.trim()).filter(Boolean).join('\n');
+      rejectPrivate.checked = s.rejectPrivate;
+      showPattern();
+      screenNote.hidden = true;
+      screenFields.hidden = false;
+    }, (e: unknown) => (screenNote.textContent = `Could not read the phone's call screening: ${(e as Error).message}`));
+  } else screenNote.textContent = 'Who is answered is set here once OAIY Desktop is connected.';
+
+  // Missed calls rung back.
+  const callBack = h('input', { type: 'checkbox', checked: options.messages.callBack }) as HTMLInputElement;
+  const callBackFilter = h('select', {},
+    h('option', { value: 'answered' }, 'The numbers it answers'),
+    h('option', { value: 'au' }, 'Australian numbers only'),
+    h('option', { value: 'any' }, 'Any number'),
+  ) as HTMLSelectElement;
+  callBackFilter.value = options.messages.callBackFilter;
+  const callBackLine = h('input', { value: options.messages.callBackLine, placeholder: DEFAULT_CALL_BACK_LINE }) as HTMLInputElement;
+  const waiting = (options.callbacks ?? []).filter((c) => c.state === 'waiting' || c.state === 'calling');
+  const settled = (options.callbacks ?? []).filter((c) => c.state === 'done' || c.state === 'dropped').slice(-5).reverse();
+  const when = (ms: number) => new Date(ms).toLocaleString(undefined, { weekday: 'short', hour: 'numeric', minute: '2-digit' });
+  const callbackList = h('ul.phone-callbacks',
+    ...waiting.map((c) => h('li', `${c.number}: missed ${when(c.missedAt)}, ${c.state === 'calling' ? 'ringing them now' : c.tries ? `tried ${c.tries}×, next ${when(c.nextAt)}` : 'to call back'}${c.note ? ` (${c.note})` : ''}`)),
+    ...settled.map((c) => h('li.muted', `${c.number}: missed ${when(c.missedAt)}. ${c.note ?? ''}`)),
+  );
+  callbackList.hidden = !waiting.length && !settled.length;
+
   const test = h('button', { type: 'button', title: 'Pretend a text message arrived: the agent answers it in a test conversation, and nothing is sent', onclick: async () => {
     const body = await askText({ title: 'A pretend text message', message: 'The agent answers it in a test conversation. Nothing is sent to a phone.', label: 'The message', value: 'Hi, are you open this Saturday?', ok: 'Send it to the agent' });
     if (body) options.test(body);
@@ -109,10 +168,36 @@ export async function editPhone(options: PhoneDialog): Promise<MessageSettings |
       h('div.row', test),
       h('label.row', calls, ' Answer phone calls (the agent talks with the caller, and you see the call here)'),
       h('label', 'Your instructions for calls', callInstructions),
+      h('h3.phone-heading', 'Who is answered'),
+      screenNote,
+      screenFields,
+      h('h3.phone-heading', 'Missed calls'),
+      h('label.row', callBack, ' Call back missed calls when the receptionist is free (turns on outbound calling in Aokie, within its quiet hours and daily limit)'),
+      h('label', 'Call back', callBackFilter),
+      h('label', 'What it says first when they answer', callBackLine),
+      callbackList,
     )],
-    ok: { label: 'Save', value: () => ({ answer: answer.checked, instructions: instructions.value.trim(), calls: calls.checked, callInstructions: callInstructions.value.trim() }) },
+    ok: { label: 'Save', value: () => ({
+      answer: answer.checked,
+      instructions: instructions.value.trim(),
+      calls: calls.checked,
+      callInstructions: callInstructions.value.trim(),
+      callBack: callBack.checked,
+      callBackFilter: callBackFilter.value as CallBackFilter,
+      callBackLine: callBackLine.value.trim(),
+    }) },
     cancel: 'Close',
   });
   (pairing as AbortController | null)?.abort();
+  // Who is answered: saved to the phone when it was read from it (and changed).
+  if (result && options.screening && screeningLoaded) {
+    const next: Screening = {
+      acceptPattern: accept.value === 'au' ? AU_PATTERN : accept.value === 'pattern' ? pattern.value.trim() : '',
+      blockedNumbers: blocked.value.split(/\n/).map((n) => n.trim()).filter(Boolean).join(', '),
+      rejectPrivate: rejectPrivate.checked,
+    };
+    const was = screeningLoaded as Screening;
+    if (next.acceptPattern !== was.acceptPattern || next.blockedNumbers !== was.blockedNumbers.split(/[,;\n]/).map((n) => n.trim()).filter(Boolean).join(', ') || next.rejectPrivate !== was.rejectPrivate) await options.screening.save(next);
+  }
   return result;
 }

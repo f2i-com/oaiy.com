@@ -300,7 +300,7 @@ export function callInstructions(brief: string, instructions: string): string {
   return [
     `This conversation is a live phone call, on the phone of the person you work for: who is calling, today's date and what you know about them are in the note that starts the call. Everything you write is spoken aloud to the caller as you write it, so write only what you would say: one or two short sentences, plain words, no markdown, lists, emoji, links or quotation marks. Start with what matters, not a filler word. Then stop, and let them answer.`,
     'Their words arrive as "Caller [0:42]: …", transcribed from speech (allow for a misheard word), with when they said them (minutes and seconds into the call). "over you" means they spoke while you were talking: a short "mm-hmm" or "yeah" does not stop you (you see it with their next words); more than that stops you, and you see what you were saying. If they have not finished (they stopped mid-sentence, or said "um, let me think"), write nothing at all: an empty reply keeps listening. A message "[OAIY] A note from the runner" is your person\'s direction, passed on by the main agent they talk to: go by it, without reading it out. Any other message without the "Caller:" label comes from the person you work for, who may be watching: do what they say.',
-    'Your call tools: request_appointment (a booking request for staff to confirm; never say it is booked or confirmed), lookup_business_data (a question about the business\'s records or calendar), end_call (a short goodbye, then the call ends; use it when the caller is done). Your other tools work too.',
+    'Your call tools: request_appointment (a booking request for staff to confirm; never say it is booked or confirmed), lookup_business_data (a question about the business\'s records or calendar), end_call (a short goodbye, then the call ends; use it when the caller is done; a brief that says finish_call means end_call). Your other tools work too.',
     REFERENCE,
     'To look something up, do it in the same reply as a few words: say "Let me check." and make the call at once. Never say you will check without doing it: the caller hears you and waits. lookup_business_data answers later, in a message of its own ("[OAIY] The answer to your lookup …"): keep the conversation going meanwhile (answer anything else they say, without guessing the answer), and tell them the answer when it comes. Other tools (a file, remember) answer at once.',
     'Say only what you know: from these instructions, the brief, or what a tool returned. Never make up availability, times, prices or bookings, and never say a time is free or agree to one unless a tool said it is. If you cannot check, say so, and offer to take their preferred time as a request for staff to confirm.',
@@ -363,14 +363,17 @@ export const LOOKUP_UNAVAILABLE =
   "The business's records could not be checked just now (no business lookup is set up on OAIY Desktop, or it failed). Do not guess times, availability, prices or bookings: tell the caller you can't check right now, and offer to take their preferred time as a request for staff to confirm.";
 
 /** The note that starts a call: who, when, and what is known about them (the model's view of the call starts there). */
-export function callStartNote(who: string, greeting: string, known: string, now = new Date()): string {
-  const greeted = greeting.trim() ? ` You greeted them: "${greeting.trim()}"` : '';
-  return `[OAIY] 📞 A call from ${who} began, ${whenSaid(now.getTime())}.${greeted}\nToday is ${today(now)}.\n${known}`;
+export function callStartNote(who: string, greeting: string, known: string, now = new Date(), returning?: number): string {
+  const opened = greeting.trim() ? ` You ${returning ? 'opened with' : 'greeted them'}: "${greeting.trim()}"` : '';
+  const began = returning
+    ? `You rang ${who} back, returning their missed call from ${whenSaid(returning)}; they answered ${whenSaid(now.getTime())}.`
+    : `A call from ${who} began, ${whenSaid(now.getTime())}.`;
+  return `[OAIY] 📞 ${began}${opened}\nToday is ${today(now)}.\n${known}`;
 }
 
 /** A call's first turn: the note that it began (the model's view of the call starts there). */
 export function isCallStart(turn: Turn): boolean {
-  return turn.role === 'user' && !!turn.automatic && turn.text.startsWith('[OAIY] 📞 A call from');
+  return turn.role === 'user' && !!turn.automatic && /^\[OAIY\] 📞 (A call from|You rang)/.test(turn.text);
 }
 
 /**
@@ -517,6 +520,8 @@ export class Sessions {
   list: Session[] = [];
   /** What the phone's agents know about the people who call and text: one note a person. */
   callers: CallerNote[] = [];
+  /** The missed call being returned to `number` now, when the call to them is a call back. */
+  callingBack: (number: string) => { missedAt: number } | undefined = () => undefined;
   /** Conversations with messages waiting, in the order they came. */
   /** Conversations waiting to run, one at a time per lane: calls in their own (a caller never waits behind a text or a flow's task), the rest in another. */
   private queue: Session[] = [];
@@ -806,7 +811,7 @@ export class Sessions {
         session.callerSpeaking = false;
       }
       const who = `${session.title}${session.title !== session.key ? ` (${session.key})` : ''}`;
-      const note = callStartNote(who, typeof event.greeting === 'string' ? event.greeting : '', knownText(this.callerNote(session.key)));
+      const note = callStartNote(who, typeof event.greeting === 'string' ? event.greeting : '', knownText(this.callerNote(session.key)), new Date(), this.callingBack(from)?.missedAt);
       session.agent.turns.push({ role: 'user', text: note, automatic: true, ...(fresh ? { fresh: true } : {}) });
       await this.save(session);
       await this.saveIndex();

@@ -6,7 +6,7 @@ import { Vfs } from '../../src/vfs/vfs';
 import type { SessionInfo } from '../../src/vfs/projects';
 import { DesktopEvents, Sessions, TEST_NUMBER, textMessage } from '../../src/sessions';
 import type { Desktop, DesktopEvent } from '../../src/desktop/bridge';
-import type { MessageSettings } from '../../src/settings';
+import { DEFAULT_MESSAGE_SETTINGS, type MessageSettings } from '../../src/settings';
 import { OPENAI, fakeProvider } from './fakeProvider';
 
 afterEach(() => vi.unstubAllGlobals());
@@ -173,7 +173,7 @@ describe('text-message conversations', () => {
     const again = new Sessions(
       first.store.project as never,
       (extra) => new Agent({ vfs: new Vfs(), gate: new NetGate(), provider: () => OPENAI, projectSummary: () => '', ...extra }),
-      () => ({ answer: true, instructions: '', calls: false, callInstructions: '' }),
+      () => ({ ...DEFAULT_MESSAGE_SETTINGS, answer: true, instructions: '', calls: false, callInstructions: '' }),
       () => null,
       { changed: () => {}, event: () => {} },
     );

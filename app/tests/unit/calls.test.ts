@@ -6,7 +6,7 @@ import { Vfs } from '../../src/vfs/vfs';
 import type { CallerNote, SessionInfo } from '../../src/vfs/projects';
 import { Sessions, Speech, callInstructions, callerNotesTool, promisesBooking, sameNumber, spoken, tellAgentTool, tidyReplies } from '../../src/sessions';
 import type { Desktop } from '../../src/desktop/bridge';
-import type { MessageSettings } from '../../src/settings';
+import { DEFAULT_MESSAGE_SETTINGS, type MessageSettings } from '../../src/settings';
 import { LOCAL, OPENAI, fakeProvider } from './fakeProvider';
 import type { ProviderConfig } from '../../src/agent/providers/types';
 
@@ -184,7 +184,7 @@ function setup(provider: ProviderConfig = OPENAI, toolWait?: Promise<void>) {
       return { ok: true, output: name === 'lookup_business_data' ? { answer: 'Open Saturday 8 to 2.' } : { recorded: true, status: 'requested' } };
     },
   };
-  const messages: MessageSettings = { answer: false, instructions: '', calls: true, callInstructions: 'Be kind.' };
+  const messages: MessageSettings = { ...DEFAULT_MESSAGE_SETTINGS, answer: false, instructions: '', calls: true, callInstructions: 'Be kind.' };
   const sessions = new Sessions(
     project as never,
     (extra) => new Agent({ vfs: new Vfs(), gate: new NetGate(), provider: () => provider, projectSummary: () => '', ...extra }),
