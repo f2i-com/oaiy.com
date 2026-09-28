@@ -1,0 +1,229 @@
+{
+  "version": 1,
+  "groups": [
+    { "id": "llm", "name": "Chat", "about": "Language models for chat and the agent, as GGUF (4-bit)." },
+    { "id": "image", "name": "Images", "about": "Pictures from a description, and edits." },
+    { "id": "video", "name": "Video", "about": "Short clips from a description or a picture." },
+    { "id": "speech", "name": "Speech", "about": "Speech in voices you describe or save." },
+    { "id": "music", "name": "Music", "about": "Songs with vocals from lyrics and a description." },
+    { "id": "sound", "name": "Sound effects", "about": "Ambience, creatures, machines and actions from a description." },
+    { "id": "model3d", "name": "3D models", "about": "Textured 3D models (GLB) from a picture of an object." },
+    { "id": "picture", "name": "Picture tools", "about": "Background removal and upscaling." }
+  ],
+  "models": [
+    {
+      "id": "qwen3.5-9b",
+      "group": "llm",
+      "name": "Qwen3.5 9B",
+      "about": "A strong all-round chat model: reasoning, coding and tool use. The best first choice for a 12 GB GPU or larger.",
+      "license": "Apache-2.0",
+      "size_gb": 5.7,
+      "vram_gb": 8,
+      "recommended": true,
+      "parts": [{ "repo": "unsloth/Qwen3.5-9B-GGUF", "include": ["Qwen3.5-9B-Q4_K_M.gguf"], "into": "Qwen3.5-9B-GGUF" }],
+      "add": ["Qwen3.5-9B-GGUF/Qwen3.5-9B-Q4_K_M.gguf"]
+    },
+    {
+      "id": "qwen3-8b",
+      "group": "llm",
+      "name": "Qwen3 8B",
+      "about": "Qwen's own 8B chat model, with a thinking mode for harder questions.",
+      "license": "Apache-2.0",
+      "size_gb": 5.0,
+      "vram_gb": 7,
+      "parts": [{ "repo": "Qwen/Qwen3-8B-GGUF", "include": ["Qwen3-8B-Q4_K_M.gguf", "LICENSE"], "into": "Qwen3-8B-GGUF" }],
+      "add": ["Qwen3-8B-GGUF/Qwen3-8B-Q4_K_M.gguf"]
+    },
+    {
+      "id": "qwen3-4b",
+      "group": "llm",
+      "name": "Qwen3 4B",
+      "about": "A small, quick chat model for GPUs with 6 GB or less, or for the CPU.",
+      "license": "Apache-2.0",
+      "size_gb": 2.5,
+      "vram_gb": 4,
+      "parts": [{ "repo": "Qwen/Qwen3-4B-GGUF", "include": ["Qwen3-4B-Q4_K_M.gguf", "LICENSE"], "into": "Qwen3-4B-GGUF" }],
+      "add": ["Qwen3-4B-GGUF/Qwen3-4B-Q4_K_M.gguf"]
+    },
+    {
+      "id": "gemma-4-e2b",
+      "group": "llm",
+      "name": "Gemma 4 E2B (with vision)",
+      "about": "Google's compact Gemma 4: chat that also reads pictures you attach.",
+      "license": "Apache-2.0",
+      "size_gb": 4.1,
+      "vram_gb": 5,
+      "parts": [{ "repo": "unsloth/gemma-4-E2B-it-GGUF", "include": ["gemma-4-E2B-it-Q4_K_M.gguf", "mmproj-F16.gguf"], "into": "gemma-4-E2B-it-GGUF" }],
+      "add": ["gemma-4-E2B-it-GGUF/gemma-4-E2B-it-Q4_K_M.gguf", "gemma-4-E2B-it-GGUF/mmproj-F16.gguf"]
+    },
+    {
+      "id": "gemma-3-4b",
+      "group": "llm",
+      "name": "Gemma 3 4B (with vision)",
+      "about": "Google's Gemma 3 at 4B: chat that also reads pictures you attach.",
+      "license": "Gemma Terms of Use",
+      "size_gb": 3.3,
+      "vram_gb": 5,
+      "parts": [{ "repo": "ggml-org/gemma-3-4b-it-GGUF", "include": ["gemma-3-4b-it-Q4_K_M.gguf", "mmproj-model-f16.gguf"], "into": "gemma-3-4b-it-GGUF" }],
+      "add": ["gemma-3-4b-it-GGUF/gemma-3-4b-it-Q4_K_M.gguf", "gemma-3-4b-it-GGUF/mmproj-model-f16.gguf"]
+    },
+    {
+      "id": "llama-3.2-3b",
+      "group": "llm",
+      "name": "Llama 3.2 3B",
+      "about": "Meta's small Llama: light and fast, for everyday chat on modest hardware.",
+      "license": "Llama 3.2 Community License",
+      "size_gb": 2.0,
+      "vram_gb": 3,
+      "parts": [{ "repo": "bartowski/Llama-3.2-3B-Instruct-GGUF", "include": ["Llama-3.2-3B-Instruct-Q4_K_M.gguf"], "into": "Llama-3.2-3B-Instruct-GGUF" }],
+      "add": ["Llama-3.2-3B-Instruct-GGUF/Llama-3.2-3B-Instruct-Q4_K_M.gguf"]
+    },
+    {
+      "id": "qwen-image-2.1",
+      "group": "image",
+      "name": "Qwen Image 2.1 (turbo)",
+      "about": "High-quality pictures with legible text, and edits by instruction, in six steps with Viggle's turbo adapter. Streams its weights on GPUs under 24 GB.",
+      "license": "Qwen Research License (research use)",
+      "size_gb": 33.8,
+      "vram_gb": 16,
+      "recommended": true,
+      "parts": [
+        { "repo": "Qwen/Qwen-Image-2.1", "include": ["model_index.json", "LICENSE", "README.md", "transformer/**", "text_encoder/**", "vae/**", "processor/**", "tokenizer/**", "scheduler/**"], "into": "Qwen-Image-2.1" },
+        { "repo": "Viggle/Qwen-Image-2.1-viggle-turbo", "include": ["Qwen-Image-2.1-viggle-turbo-v0.2.1-6step-lora-r128.safetensors", "LICENSE"], "into": "Qwen-Image-2.1-viggle-turbo" }
+      ],
+      "add": ["Qwen-Image-2.1", "Qwen-Image-2.1-viggle-turbo/Qwen-Image-2.1-viggle-turbo-v0.2.1-6step-lora-r128.safetensors"]
+    },
+    {
+      "id": "sdxl-base",
+      "group": "image",
+      "name": "Stable Diffusion XL 1.0",
+      "about": "The classic SDXL base model: quick pictures on 8 GB GPUs, with negative prompts.",
+      "license": "CreativeML Open RAIL++-M",
+      "size_gb": 6.9,
+      "vram_gb": 8,
+      "parts": [
+        { "repo": "stabilityai/stable-diffusion-xl-base-1.0", "include": ["sd_xl_base_1.0.safetensors", "LICENSE.md"], "into": "SDXL" },
+        { "repo": "openai/clip-vit-large-patch14", "revision": "32bd64288804d66eefd0ccbe215aa642df71cc41", "include": ["tokenizer.json"], "into": "SDXL/clip-tokenizer" }
+      ],
+      "add": ["SDXL/sd_xl_base_1.0.safetensors"]
+    },
+    {
+      "id": "ltx-2.5",
+      "group": "video",
+      "name": "LTX 2.5",
+      "about": "Lightricks' video model: clips with sound from a description or a start picture, and speech a clip can follow. Streams its weights on GPUs under 48 GB.",
+      "license": "LTX-2 Community License",
+      "size_gb": 70.1,
+      "vram_gb": 24,
+      "gated": true,
+      "parts": [
+        {
+          "repo": "Lightricks/LTX-2.5",
+          "include": ["diffusion_models/ltx-2.5-22b-distilled-transformer-bf16.safetensors", "text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors", "vae/ltx-2.5-video-vae-conv-bf16.safetensors", "vae/ltx-2.5-audio-vae-bf16.safetensors", "LICENSE", "README.md"],
+          "into": "LTX-2.5"
+        }
+      ],
+      "add": ["LTX-2.5"]
+    },
+    {
+      "id": "qwen3-tts",
+      "group": "speech",
+      "name": "Qwen3-TTS 1.7B",
+      "about": "Speech in any voice you describe in words, and voices you save to reuse, in ten languages.",
+      "license": "Apache-2.0",
+      "size_gb": 9.0,
+      "vram_gb": 6,
+      "recommended": true,
+      "parts": [
+        { "repo": "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign", "include": ["**"], "exclude": [".gitattributes"], "into": "Qwen3-TTS-12Hz-1.7B-VoiceDesign" },
+        { "repo": "Qwen/Qwen3-TTS-12Hz-1.7B-Base", "include": ["**"], "exclude": [".gitattributes"], "into": "Qwen3-TTS-12Hz-1.7B-Base" }
+      ],
+      "add": ["Qwen3-TTS-12Hz-1.7B-VoiceDesign", "Qwen3-TTS-12Hz-1.7B-Base"]
+    },
+    {
+      "id": "breeze-tts-2",
+      "group": "speech",
+      "name": "Breeze TTS 2",
+      "about": "An alternative voice model for described and saved voices.",
+      "license": "BreezeBlue Research and Non-Commercial License",
+      "size_gb": 7.7,
+      "vram_gb": 8,
+      "parts": [{ "repo": "BreezeBlue/Breeze-TTS-2", "include": ["**"], "exclude": ["assets/**", ".gitattributes"], "into": "Breeze-TTS-2" }],
+      "add": ["Breeze-TTS-2"]
+    },
+    {
+      "id": "minimax-music3",
+      "group": "music",
+      "name": "MiniMax Music 3",
+      "about": "Songs up to six minutes with vocals and instruments, from lyrics and a description, or instrumentals.",
+      "license": "MiniMax-Music3 Community License",
+      "size_gb": 28.5,
+      "vram_gb": 16,
+      "parts": [
+        {
+          "repo": "MiniMaxAI/MiniMax-Music3",
+          "include": ["config.json", "modular_model_index.json", "LICENSE", "README.md", "language_model/**", "rvq_depth_decoder/**", "condition_encoder/**", "transformer/**", "vocoder/**", "tokenizer/**", "scheduler/**"],
+          "into": "MiniMax-Music3"
+        }
+      ],
+      "add": ["MiniMax-Music3"]
+    },
+    {
+      "id": "moss-soundeffect",
+      "group": "sound",
+      "name": "MOSS-SoundEffect v2.0",
+      "about": "Up to 30 seconds of 48 kHz sound from a description: rain, footsteps, engines, creatures.",
+      "license": "Apache-2.0",
+      "size_gb": 11.2,
+      "vram_gb": 6,
+      "recommended": true,
+      "parts": [{ "repo": "OpenMOSS-Team/MOSS-SoundEffect-v2.0", "include": ["**"], "exclude": [".gitattributes"], "into": "MOSS-SoundEffect-v2.0" }],
+      "add": ["MOSS-SoundEffect-v2.0"]
+    },
+    {
+      "id": "pixal3d",
+      "group": "model3d",
+      "name": "Pixal3D",
+      "about": "A textured 3D model from one picture of an object, with DINOv3 and NAF to read the picture. Brings BiRefNet and Real-ESRGAN too, so any picture works.",
+      "license": "MIT; DINOv3 under Meta's DINOv3 License",
+      "size_gb": 25.3,
+      "vram_gb": 16,
+      "gated": true,
+      "needs": ["birefnet", "real-esrgan"],
+      "parts": [
+        { "repo": "TencentARC/Pixal3D", "include": ["pipeline.json", "LICENSE", "NOTICE", "README.md", "ckpts/**"], "exclude": ["**_mv.*"], "into": "Pixal3D" },
+        { "repo": "facebook/dinov3-vitl16-pretrain-lvd1689m", "include": ["config.json", "model.safetensors", "preprocessor_config.json", "LICENSE.md", "README.md"], "into": "dinov3-vitl16" },
+        { "url": "https://github.com/valeoai/NAF/releases/download/model/naf_release.pth", "file": "naf_release.pth", "size": 2664431, "into": "NAF" },
+        { "url": "https://raw.githubusercontent.com/valeoai/NAF/main/LICENSE", "file": "LICENSE", "into": "NAF" }
+      ],
+      "add": ["Pixal3D"]
+    },
+    {
+      "id": "birefnet",
+      "group": "picture",
+      "name": "BiRefNet",
+      "about": "Removes a picture's background: the subject on a transparent background, for sprites, cut-outs and 3D models.",
+      "license": "MIT",
+      "size_gb": 0.44,
+      "vram_gb": 3,
+      "recommended": true,
+      "parts": [{ "repo": "ZhengPeng7/BiRefNet", "include": ["config.json", "model.safetensors", "README.md"], "into": "BiRefNet" }],
+      "add": ["BiRefNet"]
+    },
+    {
+      "id": "real-esrgan",
+      "group": "picture",
+      "name": "Real-ESRGAN x4plus",
+      "about": "Makes pictures two or four times larger with their detail restored rather than blurred.",
+      "license": "BSD-3-Clause",
+      "size_gb": 0.07,
+      "vram_gb": 2,
+      "recommended": true,
+      "parts": [
+        { "url": "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth", "file": "RealESRGAN_x4plus.pth", "size": 67040989, "into": "Real-ESRGAN" },
+        { "url": "https://raw.githubusercontent.com/xinntao/Real-ESRGAN/master/LICENSE", "file": "LICENSE", "into": "Real-ESRGAN" }
+      ],
+      "add": ["Real-ESRGAN/RealESRGAN_x4plus.pth"]
+    }
+  ]
+}

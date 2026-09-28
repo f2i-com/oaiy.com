@@ -394,6 +394,51 @@ dialog::backdrop { background: var(--backdrop); }
   .seg button { padding: 6px 10px; }
   .grid-f[style] { grid-template-columns: minmax(0, 1fr) !important; }
 }
+
+/* ---------- get models ---------- */
+.dl-top { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(360px, 100%), 1fr)); gap: 18px 28px; margin-bottom: 22px; }
+.dl-top .f { display: grid; gap: 6px; font-size: 13px; }
+.dl-top .f > span:first-child { font: 600 13px var(--display); letter-spacing: .02em; display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+.dl-top .f > span:first-child .muted { font: 400 12px var(--body); letter-spacing: 0; }
+.dl-free { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); }
+.dl-free .meter { width: 120px; height: 6px; }
+.dl-queue { display: grid; gap: 8px; margin-bottom: 20px; }
+.dl-queue:empty { display: none; }
+.dl-q { display: grid; grid-template-columns: minmax(0, 220px) minmax(0, 1fr) auto; gap: 14px; align-items: center; padding: 10px 14px; border: 1px solid var(--line); border-radius: var(--r); background: var(--panel); font-size: 13px; }
+.dl-q strong { font: 600 13px var(--display); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dl-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(300px, 100%), 1fr)); gap: 14px; }
+.dl-card { --accent: var(--gpu); position: relative; display: grid; grid-template-rows: auto auto 1fr auto auto; gap: 10px; padding: 16px 16px 14px; border: 1px solid var(--line); border-radius: calc(var(--r) + 2px); background: var(--panel); overflow: hidden; transition: border-color .15s, transform .15s; }
+.dl-card::before { content: ""; position: absolute; inset: 0 0 auto 0; height: 3px; background: var(--accent); opacity: .85; }
+.dl-card:hover { border-color: var(--line-2); }
+.dl-card[data-group=image] { --accent: var(--ram); } .dl-card[data-group=video] { --accent: var(--ssd); }
+.dl-card[data-group=speech], .dl-card[data-group=music], .dl-card[data-group=sound] { --accent: #D97BB6; }
+.dl-card[data-group=model3d] { --accent: #5FA8E8; } .dl-card[data-group=picture] { --accent: var(--good); }
+.dl-card.installed { background: color-mix(in srgb, var(--good) 5%, var(--panel)); }
+.dl-head { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.dl-icon { width: 30px; height: 30px; border-radius: 8px; display: grid; place-items: center; flex: none; background: color-mix(in srgb, var(--accent) 16%, transparent); color: var(--accent); }
+.dl-icon svg { width: 17px; height: 17px; stroke: currentColor; fill: none; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+.dl-group { font-size: 12px; color: var(--muted); letter-spacing: .02em; }
+.dl-head .tag { margin-left: auto; }
+.dl-name { font: 600 16px/1.25 var(--display); letter-spacing: .01em; margin: 0; }
+.dl-about { margin: 0; color: var(--muted); font-size: 13px; line-height: 1.45; }
+.dl-facts { display: flex; flex-wrap: wrap; gap: 6px; margin: 0; }
+.dl-facts span { font-size: 12px; padding: 2px 8px; border-radius: 10px; background: var(--panel-2); color: var(--muted); white-space: nowrap; }
+.dl-facts span b { color: var(--text); font-weight: 600; }
+.dl-gated { display: flex; gap: 6px; align-items: flex-start; font-size: 12px; color: var(--ssd); }
+.dl-gated svg { width: 14px; height: 14px; flex: none; margin-top: 1px; stroke: currentColor; fill: none; stroke-width: 2; }
+.dl-state { display: grid; gap: 6px; font-size: 12px; min-height: 22px; }
+.dl-state .meter { height: 6px; }
+.dl-state .meter > div { background: var(--accent); }
+.dl-state .line { display: flex; justify-content: space-between; gap: 10px; color: var(--muted); }
+.dl-state .file { font: 11px var(--code); color: var(--faint); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dl-state .err { color: var(--bad); white-space: pre-wrap; }
+.dl-state .ok { color: var(--good); display: flex; align-items: center; gap: 6px; }
+.dl-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.dl-actions .btn { padding: 6px 12px; font-size: 13px; }
+.dl-actions .btn.go { flex: 1; }
+.dl-empty-hint { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; padding: 14px 16px; border: 1px dashed color-mix(in srgb, var(--gpu) 55%, transparent); border-radius: var(--r); background: color-mix(in srgb, var(--gpu) 8%, transparent); margin-bottom: 22px; }
+.dl-empty-hint p { margin: 0; flex: 1; min-width: 220px; }
+@media (prefers-reduced-motion: reduce) { .dl-card { transition: none; } }
 </style>
 </head>
 <body>
@@ -408,6 +453,7 @@ dialog::backdrop { background: var(--backdrop); }
       <button data-view="play" title="Playground"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4l14 8-14 8z"/></svg><span class="label">Playground</span></button>
       <button data-view="gallery" title="Gallery"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="9" cy="10" r="2"/><path d="M21 17l-5-5-9 8"/></svg><span class="label">Gallery</span><span class="count" id="gallery-count" hidden></span></button>
       <button data-view="models" title="Models"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l9 5-9 5-9-5z"/><path d="M3 13l9 5 9-5"/></svg><span class="label">Models</span></button>
+      <button data-view="get" title="Get models"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12M7 10l5 5 5-5"/><path d="M4 17v2a2 2 0 002 2h12a2 2 0 002-2v-2"/></svg><span class="label">Get models</span><span class="count" id="get-count" hidden></span></button>
       <button data-view="memory" title="Memory"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="5" width="18" height="4" rx="1"/><rect x="3" y="10" width="18" height="4" rx="1"/><rect x="3" y="15" width="18" height="4" rx="1"/></svg><span class="label">Memory</span></button>
       <button data-view="endpoints" title="Endpoints"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 7l-5 5 5 5M16 7l5 5-5 5M14 4l-4 16"/></svg><span class="label">Endpoints</span></button>
       <button data-view="settings" title="Settings"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 00.3 1.8l.1.1a2 2 0 11-2.8 2.8l-.1-.1a1.7 1.7 0 00-1.8-.3 1.7 1.7 0 00-1 1.5V21a2 2 0 11-4 0v-.1a1.7 1.7 0 00-1.1-1.5 1.7 1.7 0 00-1.8.3l-.1.1a2 2 0 11-2.8-2.8l.1-.1a1.7 1.7 0 00.3-1.8 1.7 1.7 0 00-1.5-1H3a2 2 0 110-4h.1a1.7 1.7 0 001.5-1.1 1.7 1.7 0 00-.3-1.8l-.1-.1a2 2 0 112.8-2.8l.1.1a1.7 1.7 0 001.8.3H9a1.7 1.7 0 001-1.5V3a2 2 0 114 0v.1a1.7 1.7 0 001 1.5 1.7 1.7 0 001.8-.3l.1-.1a2 2 0 112.8 2.8l-.1.1a1.7 1.7 0 00-.3 1.8V9a1.7 1.7 0 001.5 1H21a2 2 0 110 4h-.1a1.7 1.7 0 00-1.5 1z"/></svg><span class="label">Settings</span></button>
@@ -427,6 +473,7 @@ dialog::backdrop { background: var(--backdrop); }
     <section class="view on" id="v-overview">
       <h1>Overview</h1>
       <p class="lede">Models run from where their weights live. Hot weights stay on the GPU, warm ones in RAM, and the rest stream from the SSD when needed, so a small machine can run big models.</p>
+      <div class="dl-empty-hint" id="first-run" hidden><p><strong>No models yet.</strong> Get models downloads ready-to-run ones from Hugging Face (a chat model, pictures, speech and more) and sets them up for you.</p><button class="btn go" data-goto="get">Get models</button></div>
       <div class="block">
         <div class="spread"><h2>Hardware</h2><span class="muted small" id="hw-note"></span></div>
         <div class="hw" id="hw"></div>
@@ -726,6 +773,7 @@ dialog::backdrop { background: var(--backdrop); }
     <!-- Models -->
     <section class="view" id="v-models">
       <h1>Models</h1>
+      <div class="dl-empty-hint" id="models-first-run" hidden><p><strong>Nothing to add yet?</strong> Get models downloads ready-to-run models and adds them here.</p><button class="btn go" data-goto="get">Get models</button></div>
       <p class="lede">Pick a file or folder and the studio reads its headers to work out what it is. Language models go to chat, image models to images, video models to videos. Parts such as projectors, adapters, encoders and tokenizers attach to the model that needs them.</p>
       <div class="block">
         <div class="drop">
@@ -751,6 +799,25 @@ dialog::backdrop { background: var(--backdrop); }
       <div class="block"><div class="spread"><h2>Music models</h2><span class="muted small">Served on /v1/audio/music, and on /v1/audio/speech by name</span></div><div class="list" id="m-music"></div></div>
       <div class="block"><div class="spread"><h2>Sound effect models</h2><span class="muted small">Served on /v1/audio/sound_effects</span></div><div class="list" id="m-sound"></div></div>
       <div class="block"><div class="spread"><h2>3D models</h2><span class="muted small">Served on /v1/3d/models</span></div><div class="list" id="m-model3d"></div></div>
+    </section>
+
+    <!-- Get models -->
+    <section class="view" id="v-get">
+      <h1>Get models</h1>
+      <p class="lede">Ready-to-run models, downloaded from Hugging Face. Each goes into a folder of its own and is added to your models when it finishes. Pause any time: a download picks up where it stopped, even after a restart.</p>
+      <div class="dl-top">
+        <label class="f"><span>Save models in</span>
+          <div class="pathfield"><input type="text" id="dl-dir" aria-label="Folder to save models in"><button class="btn" id="dl-browse">Browse</button><button class="btn" id="dl-dir-save" hidden>Use this folder</button></div>
+          <span class="dl-free" id="dl-free"></span>
+        </label>
+        <label class="f"><span>Hugging Face token <span class="muted small">(only for models whose licence you accept first)</span></span>
+          <div class="pathfield"><input type="password" id="dl-token" autocomplete="off" placeholder="hf_… (read access)" aria-label="Hugging Face token"><button class="btn" id="dl-token-save">Save</button></div>
+          <span class="muted small" id="dl-token-note">Create one at huggingface.co/settings/tokens. It stays on this machine.</span>
+        </label>
+      </div>
+      <div class="dl-queue" id="dl-queue" aria-live="polite"></div>
+      <div class="chips" id="dl-groups" role="toolbar" aria-label="Show"></div>
+      <div class="dl-grid" id="dl-grid"></div>
     </section>
 
     <!-- Memory -->
@@ -969,7 +1036,7 @@ function setPath(o, p, v) { const ks = p.split("."); const last = ks.pop(); ks.r
 function dirty() { $("#savebar").classList.toggle("on", JSON.stringify(cfg) !== JSON.stringify(saved)); }
 function touch() { dirty(); }
 
-async function loadConfig() { saved = await api("/api/config"); cfg = clone(saved); renderConfig(); dirty(); }
+async function loadConfig() { saved = await api("/api/config"); cfg = clone(saved); renderConfig(); dirty(); renderFirstRun(); }
 async function saveConfig() {
   try { saved = await api("/api/config", {method: "PUT", body: cfg}); cfg = clone(saved); renderConfig(); dirty(); toast("Saved"); refresh(); }
   catch (e) { toast(e.message, true); }
@@ -1039,6 +1106,7 @@ function show(view) {
   if (view === "play") requestAnimationFrame(fitPlayground);
   if (view === "gallery") refreshGallery();
   if (view === "endpoints") renderCompanion();
+  if (view === "get") refreshDownloads(true);
 }
 $$("nav button").forEach(b => b.onclick = () => show(b.dataset.view));
 $$("#v-play .ptabs button").forEach(b => b.onclick = () => {
@@ -2144,6 +2212,125 @@ async function pollLogs(reset) {
   } catch {}
 }
 
+
+/* ---------- get models ---------- */
+let dl = null, dlGroup = "recommended", dlDirEdited = false, dlLastDone = new Set();
+const DL_ICONS = {
+  llm: '<path d="M4 5h16v11H9l-5 4z"/>',
+  image: '<rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="9" cy="10" r="2"/><path d="M21 17l-5-5-9 8"/>',
+  video: '<rect x="3" y="6" width="13" height="12" rx="2"/><path d="M16 10l5-3v10l-5-3z"/>',
+  speech: '<path d="M12 3a3 3 0 00-3 3v6a3 3 0 006 0V6a3 3 0 00-3-3z"/><path d="M5 11a7 7 0 0014 0M12 18v3"/>',
+  music: '<path d="M9 18V6l11-2v12"/><circle cx="6.5" cy="18" r="2.5"/><circle cx="17.5" cy="16" r="2.5"/>',
+  sound: '<path d="M4 10v4h4l5 4V6L8 10z"/><path d="M16 9a4 4 0 010 6M18.5 6.5a8 8 0 010 11"/>',
+  model3d: '<path d="M12 3l8 4.5v9L12 21l-8-4.5v-9z"/><path d="M4 7.5l8 4.5 8-4.5M12 12v9"/>',
+  picture: '<path d="M4 20l7-7M14 4l6 6M12 6l6 6-8 8H4v-6z"/>'
+};
+const dlSize = n => n >= 1e12 ? (n / 1e12).toFixed(1) + " TB" : n >= 1e9 ? (n / 1e9).toFixed(1) + " GB" : n >= 1e6 ? (n / 1e6).toFixed(0) + " MB" : Math.max(1, Math.round(n / 1e3)) + " KB";
+const dur = s => !isFinite(s) || s <= 0 ? "" : s < 90 ? Math.round(s) + " s" : s < 5400 ? Math.round(s / 60) + " min" : (s / 3600).toFixed(1) + " h";
+const dlBusy = d => d && ["queued", "downloading", "adding"].includes(d.status);
+async function refreshDownloads(full) {
+  try { dl = await api("/api/downloads"); } catch (e) { if (full) toast(e.message, true); return; }
+  renderDownloads();
+  // A model finished: the model list changed on the studio's side.
+  for (const m of dl.models) {
+    if (m.download?.status === "done" && !dlLastDone.has(m.id)) {
+      dlLastDone.add(m.id);
+      if (full !== "first") { toast(`${m.name} is ready: ${(m.download.added || []).join(", ") || "added"}`); loadConfig(); }
+    }
+  }
+}
+function renderDownloads() {
+  if (!dl) return;
+  if (!dlDirEdited) $("#dl-dir").value = dl.dir;
+  $("#dl-free").innerHTML = dl.free != null ? `<span>${dlSize(dl.free)} free on this drive</span>` : "";
+  $("#dl-token").placeholder = dl.token ? "A token is saved (type a new one to replace it)" : "hf_… (read access)";
+  const groups = [{id: "recommended", name: "Recommended"}, {id: "all", name: "All"}, ...dl.groups];
+  $("#dl-groups").innerHTML = groups.map(g => `<button aria-pressed="${g.id === dlGroup}" data-group="${esc(g.id)}">${esc(g.name)}</button>`).join("");
+  $$("#dl-groups button").forEach(b => b.onclick = () => { dlGroup = b.dataset.group; renderDownloads(); });
+  const groupName = Object.fromEntries(dl.groups.map(g => [g.id, g.name]));
+  const shown = dl.models.filter(m => dlGroup === "all" || (dlGroup === "recommended" ? m.recommended : m.group === dlGroup));
+  $("#dl-grid").innerHTML = shown.map(m => dlCard(m, groupName[m.group] || m.group)).join("") || '<div class="empty">Nothing here.</div>';
+  $$("#dl-grid [data-dl]").forEach(b => b.onclick = () => dlAct(b.dataset.dl, b.dataset.id));
+  // The queue: what is downloading, waiting or paused.
+  const active = dl.models.filter(m => m.download && ["queued", "downloading", "adding", "paused"].includes(m.download.status));
+  $("#dl-queue").innerHTML = active.map(m => {
+    const d = m.download, pct = d.total ? Math.min(100, d.done / d.total * 100) : 0;
+    const what = d.status === "queued" ? "Waiting its turn" : d.status === "paused" ? "Paused" : d.status === "adding" ? "Adding to your models" : `${pct.toFixed(0)}%`;
+    return `<div class="dl-q"><strong>${esc(m.name)}</strong><div class="meter"><div style="width:${pct}%;background:var(--gpu)"></div></div><span class="muted">${what}</span></div>`;
+  }).join("");
+  const n = dl.models.filter(m => dlBusy(m.download)).length;
+  $("#get-count").hidden = !n; $("#get-count").textContent = n;
+}
+function dlCard(m, group) {
+  const d = m.download, busy = dlBusy(d);
+  const facts = [`<span>Download <b>${m.size_gb >= 1 ? m.size_gb.toFixed(1) + " GB" : Math.round(m.size_gb * 1000) + " MB"}</b></span>`, `<span>GPU <b>${m.vram_gb} GB+</b></span>`, `<span>${esc(m.license)}</span>`];
+  const gated = m.gated ? `<div class="dl-gated"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 018 0v4"/></svg><span>Its licence is accepted on huggingface.co first, then a token is saved here${dl.token ? " (one is saved)" : ""}.</span></div>` : "";
+  let state = "", actions = "";
+  if (d && d.status === "downloading") {
+    const pct = d.total ? Math.min(100, d.done / d.total * 100) : 0, left = d.speed > 0 && d.total ? (d.total - d.done) / d.speed : NaN;
+    state = `<div class="meter"><div style="width:${pct}%"></div></div><div class="line"><span>${dlSize(d.done)} of ${d.total ? dlSize(d.total) : "…"}</span><span>${d.speed > 0 ? dlSize(d.speed) + "/s" : ""}${dur(left) ? " · " + dur(left) + " left" : ""}</span></div>${d.file ? `<div class="file" title="${esc(d.file)}">${esc(d.file)}</div>` : ""}`;
+    actions = `<button class="btn" data-dl="pause" data-id="${m.id}">Pause</button><button class="btn warn" data-dl="cancel" data-id="${m.id}">Cancel</button>`;
+  } else if (d && d.status === "queued") {
+    state = `<div class="line"><span>Waiting for the download before it</span></div>`;
+    actions = `<button class="btn" data-dl="pause" data-id="${m.id}">Pause</button><button class="btn warn" data-dl="cancel" data-id="${m.id}">Cancel</button>`;
+  } else if (d && d.status === "adding") {
+    state = `<div class="meter"><div style="width:100%"></div></div><div class="line"><span>Adding to your models…</span></div>`;
+  } else if (d && d.status === "paused") {
+    const pct = d.total ? Math.min(100, d.done / d.total * 100) : 0;
+    state = `<div class="meter"><div style="width:${pct}%;opacity:.5"></div></div><div class="line"><span>Paused at ${dlSize(d.done)}${d.total ? " of " + dlSize(d.total) : ""}</span></div>`;
+    actions = `<button class="btn go" data-dl="start" data-id="${m.id}">Resume</button><button class="btn warn" data-dl="cancel" data-id="${m.id}">Cancel</button>`;
+  } else if (d && d.status === "failed") {
+    state = `<div class="err">${esc(d.error || "The download failed.")}</div>`;
+    actions = `<button class="btn go" data-dl="start" data-id="${m.id}">Try again</button>`;
+  } else if (m.installed || d?.status === "done") {
+    state = `<div class="ok"><svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true" style="stroke:currentColor;fill:none;stroke-width:2.2"><path d="M5 12l5 5 9-10"/></svg>Downloaded${d?.added?.length ? ": " + esc(d.added.join(", ")) : " and in your models"}</div>`;
+    actions = `<button class="btn" data-goto-models>Open Models</button><button class="btn quiet" data-dl="add" data-id="${m.id}" title="Add it to the model list again (after it was removed)">Add again</button>`;
+  } else if (m.partial) {
+    state = `<div class="line"><span>Partly downloaded</span></div>`;
+    actions = `<button class="btn go" data-dl="start" data-id="${m.id}">Resume download</button><button class="btn warn" data-dl="cancel" data-id="${m.id}">Discard</button>`;
+  } else {
+    actions = `<button class="btn go" data-dl="start" data-id="${m.id}">Download</button>`;
+  }
+  return `<article class="dl-card${m.installed ? " installed" : ""}${busy ? " busy" : ""}" data-group="${esc(m.group)}">
+    <div class="dl-head"><span class="dl-icon"><svg viewBox="0 0 24 24" aria-hidden="true">${DL_ICONS[m.group] || ""}</svg></span><span class="dl-group">${esc(group)}</span>${m.recommended ? '<span class="tag good">Recommended</span>' : ""}</div>
+    <h3 class="dl-name">${esc(m.name)}</h3>
+    <div style="display:grid;gap:8px;align-content:start"><p class="dl-about">${esc(m.about)}</p><div class="dl-facts">${facts.join("")}</div>${gated}</div>
+    <div class="dl-state">${state}</div>
+    <div class="dl-actions">${actions}</div>
+  </article>`;
+}
+async function dlAct(what, id) {
+  try {
+    const body = {id};
+    if (what === "start" || what === "add") body.dir = $("#dl-dir").value.trim();
+    if (what === "cancel") {
+      const r = await ask({title: "Cancel this download?", text: "What is downloaded so far is deleted.", buttons: [{label: "Keep it", value: null}, {label: "Cancel download", value: "ok", kind: "warn"}]});
+      if (!r) return;
+    }
+    dl = await api(what === "start" ? "/api/downloads" : `/api/downloads/${what}`, {method: "POST", body});
+    if (what === "add") { toast("Added again"); await loadConfig(); await refreshDownloads(); return; }
+    renderDownloads();
+  } catch (e) { toast(e.message, true); }
+}
+$("#dl-grid").addEventListener("click", e => { if (e.target.closest("[data-goto-models]")) show("models"); });
+$$("[data-goto]").forEach(b => b.onclick = () => show(b.dataset.goto));
+$("#dl-dir").oninput = () => { dlDirEdited = true; $("#dl-dir-save").hidden = false; };
+$("#dl-browse").onclick = () => pick({dir: true, title: "Choose the folder to save models in", start: $("#dl-dir").value}, p => { $("#dl-dir").value = p; dlDirEdited = true; $("#dl-dir-save").hidden = false; });
+$("#dl-dir-save").onclick = async () => {
+  try { dl = await api("/api/downloads/settings", {method: "POST", body: {dir: $("#dl-dir").value.trim()}}); dlDirEdited = false; $("#dl-dir-save").hidden = true; toast("New downloads go to " + dl.dir); await loadConfig(); renderDownloads(); }
+  catch (e) { toast(e.message, true); }
+};
+$("#dl-token-save").onclick = async () => {
+  const t = $("#dl-token").value.trim();
+  try { dl = await api("/api/downloads/settings", {method: "POST", body: {hf_token: t}}); $("#dl-token").value = ""; toast(t ? "Token saved" : "Token removed"); await loadConfig(); renderDownloads(); }
+  catch (e) { toast(e.message, true); }
+};
+function renderFirstRun() {
+  if (!cfg) return;
+  const any = (cfg.llm?.models || []).length || Object.values(cfg.media || {}).some(s => s && typeof s === "object" && s.models && Object.keys(s.models).length) || cfg.media?.picture?.background || cfg.media?.picture?.upscaler;
+  $("#first-run").hidden = !!any; $("#models-first-run").hidden = !!any;
+}
+
 /* ---------- polling ---------- */
 async function refresh() {
   try { state = await api("/api/state"); keyed(state.media.jobs); renderState(); } catch (e) { $("#foot-llm-text").textContent = "Studio unreachable"; }
@@ -2158,6 +2345,9 @@ async function refreshSystem() { try { sys = await api("/api/system"); renderHar
   setInterval(refresh, 1500);
   setInterval(() => { if ($("#v-overview").classList.contains("on") || $("#v-memory").classList.contains("on")) refreshSystem(); }, 3000);
   setInterval(() => { if ($("#v-logs").classList.contains("on")) pollLogs(false); }, 1500);
+  // Downloads: every second while one runs, else now and then (the rail's count).
+  refreshDownloads("first");
+  setInterval(() => { if ($("#v-get").classList.contains("on") || dl?.models.some(m => dlBusy(m.download))) refreshDownloads(); }, 1000);
   window.addEventListener("beforeunload", e => { if (JSON.stringify(cfg) !== JSON.stringify(saved)) e.preventDefault(); });
 })();
 </script>

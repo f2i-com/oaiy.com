@@ -61,6 +61,16 @@ fn operations(target: &str, spec: &str, path: &str) -> Vec<Json> {
             sub("POST", format!("{path}/{{id}}/cancel"), "stop a job"),
             sub("DELETE", format!("{path}/{{id}}"), "forget a job (files stay on disk)"),
         ],
+        ("background", _) => vec![sub(
+            "POST",
+            path.into(),
+            "remove a picture's background (JSON: image (a data: URL), response_format b64_json | url): {data: [{b64_json}]}, an RGBA PNG at the picture's size",
+        )],
+        ("upscale", _) => vec![sub(
+            "POST",
+            path.into(),
+            "make a picture larger (JSON: image (a data: URL, up to 4 megapixels), scale 2 | 4 (default 4), response_format b64_json | url): {data: [{b64_json}]}, a PNG",
+        )],
         ("voices", _) => vec![
             sub("GET", path.into(), "list saved voices"),
             sub("POST", path.into(), "design and save a voice (JSON: name, description, sample_text?, language?, seed?)"),
@@ -77,6 +87,8 @@ fn describe(target: &str) -> &'static str {
         "chat" => "chat completions, streamed as server-sent events with stream: true",
         "completions" => "raw text completions",
         "models" => "model list; each entry has type llm | image | video | speech | music | sound | model3d",
+        "background" => "a picture's background removed (BiRefNet): the object on a transparent background, synchronous",
+        "upscale" => "a picture made two or four times larger with its detail restored (Real-ESRGAN), synchronous",
         "images" => "text-to-image; add images: [{image_url}] to edit",
         "edits" => "image edits: multipart (image, prompt) or JSON with images",
         "videos" => "text/image-to-video",
@@ -265,6 +277,32 @@ pub fn document(studio: &Studio, base: &str, authorized: bool) -> Json {
             ])
         })
         .collect();
+    // The picture tools: one model each, when configured.
+    let background_models: Vec<Json> = if crate::picture::ready(&cfg, crate::picture::Op::RemoveBackground) {
+        vec![Json::obj([
+            ("id", Json::str(crate::picture::Op::RemoveBackground.model())),
+            ("default", Json::Bool(true)),
+            ("format", Json::str("png")),
+            ("output", Json::str("the picture at its own size, its background transparent (RGBA)")),
+            ("ready", Json::Bool(true)),
+            ("license", Json::str("MIT")),
+        ])]
+    } else {
+        Vec::new()
+    };
+    let upscale_models: Vec<Json> = if crate::picture::ready(&cfg, crate::picture::Op::Upscale) {
+        vec![Json::obj([
+            ("id", Json::str(crate::picture::Op::Upscale.model())),
+            ("default", Json::Bool(true)),
+            ("format", Json::str("png")),
+            ("scales", Json::Arr(vec![Json::Int(2), Json::Int(4)])),
+            ("max_pixels", Json::Int(crate::picture::MAX_UPSCALE_PIXELS as i64)),
+            ("ready", Json::Bool(true)),
+            ("license", Json::str("BSD-3-Clause")),
+        ])]
+    } else {
+        Vec::new()
+    };
     let models_for = |target: &str| -> Vec<Json> {
         let ids = |list: &[Json]| list.iter().filter_map(|m| m.get("id").cloned()).collect::<Vec<_>>();
         match target {
@@ -278,6 +316,8 @@ pub fn document(studio: &Studio, base: &str, authorized: bool) -> Json {
             "music" => ids(&music_models),
             "sound" => ids(&sound_models),
             "model3d" => ids(&model3d_models),
+            "background" => ids(&background_models),
+            "upscale" => ids(&upscale_models),
             _ => Vec::new(),
         }
     };
@@ -308,7 +348,7 @@ pub fn document(studio: &Studio, base: &str, authorized: bool) -> Json {
             if target == "speech" || target == "voices" {
                 e.push(("voices".into(), Json::Arr(voices.iter().filter_map(|v| v.get("name").cloned()).collect())));
             }
-            if !models.is_empty() || matches!(target, "chat" | "completions" | "images" | "edits" | "videos" | "speech" | "music" | "sound" | "model3d") {
+            if !models.is_empty() || matches!(target, "chat" | "completions" | "images" | "edits" | "videos" | "speech" | "music" | "sound" | "model3d" | "background" | "upscale") {
                 e.push(("models".into(), Json::Arr(models)));
             }
             Json::Obj(e)
@@ -319,7 +359,17 @@ pub fn document(studio: &Studio, base: &str, authorized: bool) -> Json {
         ("endpoints".into(), Json::Arr(endpoints)),
         (
             "models".into(),
-            Json::obj([("llm", Json::Arr(llm_models)), ("image", Json::Arr(image_models)), ("video", Json::Arr(video_models)), ("speech", Json::Arr(speech_models)), ("music", Json::Arr(music_models)), ("sound", Json::Arr(sound_models)), ("model3d", Json::Arr(model3d_models))]),
+            Json::obj([
+                ("llm", Json::Arr(llm_models)),
+                ("image", Json::Arr(image_models)),
+                ("video", Json::Arr(video_models)),
+                ("speech", Json::Arr(speech_models)),
+                ("music", Json::Arr(music_models)),
+                ("sound", Json::Arr(sound_models)),
+                ("model3d", Json::Arr(model3d_models)),
+                ("background", Json::Arr(background_models.clone())),
+                ("upscale", Json::Arr(upscale_models.clone())),
+            ]),
         ),
         (
             "defaults".into(),
@@ -331,6 +381,8 @@ pub fn document(studio: &Studio, base: &str, authorized: bool) -> Json {
                 ("music", Json::str(&music_default)),
                 ("sound", Json::str(&sound_default)),
                 ("model3d", Json::str(&model3d_default)),
+                ("background", background_models.first().and_then(|m| m.get("id").cloned()).unwrap_or(Json::str(""))),
+                ("upscale", upscale_models.first().and_then(|m| m.get("id").cloned()).unwrap_or(Json::str(""))),
             ]),
         ),
         (
@@ -382,6 +434,25 @@ mod tests {
         assert!(paths.contains(&"/v1/3d/models/{id}/content") && paths.contains(&"/v1/3d/models/{id}/input"));
     }
 
+    /// A Studio with `cfg` (nothing started, nothing saved).
+    fn studio_with(root: &std::path::Path, cfg: Json) -> crate::Studio {
+        crate::Studio {
+            config_path: root.join("nrob-studio.json"),
+            root: root.to_path_buf(),
+            config: std::sync::RwLock::new(cfg),
+            llm: std::sync::Arc::new(crate::llm::Llm::new()),
+            media: std::sync::Arc::new(crate::media::Media::new()),
+            system: crate::system::System::new(),
+            log: std::sync::Arc::new(crate::util::LogRing::new(10)),
+            downloads: std::sync::Arc::new(crate::downloads::Downloads::new()),
+            ui_url: std::sync::RwLock::new(String::new()),
+            gateway_url: std::sync::RwLock::new(String::new()),
+            restart_required: std::sync::RwLock::new(false),
+            saving: std::sync::Mutex::new(()),
+            port_overrides: (None, None),
+        }
+    }
+
     #[test]
     fn a_3d_model_is_listed_with_its_endpoint_and_default() {
         let root = std::env::temp_dir().join(format!("nrob-studio-discovery-{}", std::process::id()));
@@ -389,20 +460,7 @@ mod tests {
         let model3d = crate::registry::obj_mut(&mut cfg, &["media", "model3d"]).unwrap();
         crate::util::set(model3d, "models", Json::parse(br#"{"pixal3d":{"path":"P","dino":"D","naf":"N.pth"},"half":{"path":"P"}}"#).unwrap());
         crate::util::set(model3d, "default_model", Json::str("pixal3d"));
-        let studio = crate::Studio {
-            config_path: root.join("nrob-studio.json"),
-            root: root.clone(),
-            config: std::sync::RwLock::new(cfg),
-            llm: std::sync::Arc::new(crate::llm::Llm::new()),
-            media: std::sync::Arc::new(crate::media::Media::new()),
-            system: crate::system::System::new(),
-            log: std::sync::Arc::new(crate::util::LogRing::new(10)),
-            ui_url: std::sync::RwLock::new(String::new()),
-            gateway_url: std::sync::RwLock::new(String::new()),
-            restart_required: std::sync::RwLock::new(false),
-            saving: std::sync::Mutex::new(()),
-            port_overrides: (None, None),
-        };
+        let studio = studio_with(&root, cfg);
         let doc = document(&studio, "http://127.0.0.1:8080", true);
         let listed = doc.get("models").and_then(|m| m.get("model3d")).and_then(Json::as_array).unwrap();
         let by_id = |id: &str| listed.iter().find(|m| m.get("id").and_then(Json::as_str) == Some(id)).unwrap();
@@ -416,5 +474,26 @@ mod tests {
         assert_eq!(endpoint.get("url").and_then(Json::as_str), Some("http://127.0.0.1:8080/v1/3d/models"));
         assert_eq!(endpoint.get("models").map(Json::len), Some(2));
         assert_eq!(endpoint.get("operations").map(Json::len), Some(7));
+    }
+
+    #[test]
+    fn the_picture_tools_are_listed_when_configured() {
+        let root = std::env::temp_dir();
+        let doc = document(&studio_with(&root, crate::config::default_json()), "http://127.0.0.1:8080", true);
+        assert_eq!(doc.get("models").and_then(|m| m.get("background")).and_then(Json::as_array).map(|a| a.len()), Some(0));
+        let mut cfg = crate::config::default_json();
+        let picture = crate::registry::obj_mut(&mut cfg, &["media", "picture"]).unwrap();
+        crate::util::set(picture, "background", Json::str("B"));
+        crate::util::set(picture, "upscaler", Json::str("U.pth"));
+        let doc = document(&studio_with(&root, cfg), "http://127.0.0.1:8080", true);
+        let model = |kind: &str| doc.get("models").and_then(|m| m.get(kind)).and_then(Json::as_array).and_then(|a| a.first()).cloned().unwrap();
+        assert_eq!(str_or(&model("background"), "id", ""), "birefnet");
+        assert_eq!(str_or(&model("upscale"), "id", ""), "real-esrgan-x4plus");
+        for (name, path) in [("background", "/v1/images/background_removal"), ("upscale", "/v1/images/upscale")] {
+            let e = doc.get("endpoints").and_then(Json::as_array).unwrap().iter().find(|e| e.get("name").and_then(Json::as_str) == Some(name)).cloned().unwrap();
+            assert_eq!(str_or(&e, "url", ""), format!("http://127.0.0.1:8080{path}"));
+            assert_eq!(e.get("models").and_then(Json::as_array).map(|a| a.len()), Some(1));
+        }
+        assert_eq!(doc.get("defaults").and_then(|d| d.get("upscale")).and_then(Json::as_str), Some("real-esrgan-x4plus"));
     }
 }

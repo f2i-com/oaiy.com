@@ -9,7 +9,7 @@
     "port": 8080,
     "api_key": "",
     "public_url": "",
-    "routes_version": 7,
+    "routes_version": 8,
     "routes": [
       {
         "path": "/v1/chat/completions",
@@ -85,6 +85,20 @@
         "path": "/v1/3d/models",
         "method": "POST",
         "target": "model3d",
+        "spec": "openai",
+        "enabled": true
+      },
+      {
+        "path": "/v1/images/background_removal",
+        "method": "POST",
+        "target": "background",
+        "spec": "openai",
+        "enabled": true
+      },
+      {
+        "path": "/v1/images/upscale",
+        "method": "POST",
+        "target": "upscale",
         "spec": "openai",
         "enabled": true
       },
@@ -254,6 +268,11 @@
           "enabled": true
         }
       }
+    },
+    "picture": {
+      "enabled": true,
+      "background": "models/BiRefNet",
+      "upscaler": "models/Real-ESRGAN/RealESRGAN_x4plus.pth"
     }
   }
 }

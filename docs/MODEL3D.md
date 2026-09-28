@@ -49,7 +49,9 @@ Pixal3D is TRELLIS.2's cascade with pixel-aligned conditioning: each voxel sees
 the image features at the point where it projects into the picture.
 
 1. **The picture.** The object is found at up to 1024 pixels:
-   - from the picture's own transparency;
+   - from the picture's own transparency, when it cuts something out (clearly
+     transparent pixels over at least half a percent of the picture; a picture
+     that is only a little translucent still has its background removed);
    - otherwise with BiRefNet, which gives an alpha matte from any background;
    - without BiRefNet, by flooding a plain background from the edges.
 
@@ -172,10 +174,4 @@ starting noise:
 The textured GLB made from the reference's noise has the same roughness and
 metallic as the reference's, and the same shape.
 
-BiRefNet and Real-ESRGAN were checked the same way against their own PyTorch code:
-
-| Model | Result |
-|---|---|
-| BiRefNet: every backbone level, the encoder, the squeeze block, one decoder block | within 3e-6 relative RMS |
-| BiRefNet: the final logits at 1024² | within 5.4e-6 relative RMS; no pixel of the matte on the other side of 0.5 |
-| Real-ESRGAN x4plus | within 7e-7 relative RMS in F32, 7e-4 in F16 (how it runs on a GPU) |
+BiRefNet and Real-ESRGAN were checked the same way ([Picture tools](PICTURE_TOOLS.md)).

@@ -139,6 +139,31 @@ pub fn handle(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, port: u16)
             studio.llm.stop();
             studio.llm.start(&cfg, &studio.root).map(|_| studio.llm.status()).map_err(|e| (400, e))
         }
+        ("GET", "/api/downloads") => Ok(studio.downloads.state(studio)),
+        ("POST", "/api/downloads") => body(req).map_err(|e| (400, e)).and_then(|b| {
+            let dir = Some(str_or(&b, "dir", "").trim()).filter(|d| !d.is_empty()).map(PathBuf::from);
+            studio.downloads.start(studio, str_or(&b, "id", ""), dir).map_err(|e| (400, e))
+        }),
+        ("POST", "/api/downloads/pause") => body(req).map_err(|e| (400, e)).map(|b| studio.downloads.pause(studio, str_or(&b, "id", ""))),
+        ("POST", "/api/downloads/cancel") => body(req).map_err(|e| (400, e)).map(|b| studio.downloads.cancel(studio, str_or(&b, "id", ""))),
+        ("POST", "/api/downloads/add") => body(req).map_err(|e| (400, e)).and_then(|b| {
+            let dir = Some(str_or(&b, "dir", "").trim()).filter(|d| !d.is_empty()).map(PathBuf::from);
+            studio.downloads.add_again(studio, str_or(&b, "id", ""), dir).map_err(|e| (400, e))
+        }),
+        // Where downloads go, and the Hugging Face token for gated models (never sent back).
+        ("POST", "/api/downloads/settings") => body(req).map_err(|e| (400, e)).and_then(|b| {
+            let mut next = cfg.clone();
+            let mut d = next.get("downloads").cloned().unwrap_or(Json::obj(Vec::<(&str, Json)>::new()));
+            if let Some(dir) = b.get("dir").and_then(Json::as_str) {
+                crate::util::set(&mut d, "dir", Json::str(dir.trim()));
+            }
+            if let Some(t) = b.get("hf_token").and_then(Json::as_str) {
+                crate::util::set(&mut d, "hf_token", Json::str(t.trim()));
+            }
+            crate::util::set(&mut next, "downloads", d);
+            studio.set_config(next).map_err(|e| (400, e))?;
+            Ok(studio.downloads.state(studio))
+        }),
         ("GET", "/api/browse") => crate::system::browse(req.query("path").as_deref()).map_err(|e| (400, e)),
         ("POST", "/api/detect") => body(req).map_err(|e| (400, e)).and_then(|b| {
             let path = PathBuf::from(str_or(&b, "path", ""));

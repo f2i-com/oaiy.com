@@ -117,11 +117,27 @@ fn flood(img: &RgbaImage, bg: [f32; 3], tolerance: f32) -> Vec<bool> {
     background
 }
 
+/// Does the picture's own alpha cut the object out? Pixal3D trusts any alpha
+/// below 255; here it takes clearly transparent pixels (alpha under 32) over at
+/// least half a percent of the picture, so a picture with a translucent edge or
+/// a stray alpha channel still has its background removed.
+pub fn cuts_out(img: &RgbaImage) -> bool {
+    let transparent = img.pixels().filter(|p| p[3] < 32).count();
+    transparent * 200 >= img.pixels().len().max(1)
+}
+
 pub fn prepare(path: &Path, helpers: &Helpers) -> Result<Prepared> {
     let img = image::ImageReader::open(path)?.with_guessed_format()?.decode().map_err(candle_core::Error::wrap)?;
-    let original = img.to_rgba8();
+    let mut original = img.to_rgba8();
+    let has_alpha = cuts_out(&original);
+    // A picture merely a little translucent (an alpha channel an export left
+    // behind) has an opaque background still: it is cut out like one without.
+    if !has_alpha {
+        for p in original.pixels_mut() {
+            p[3] = 255;
+        }
+    }
     let mut rgba = original.clone();
-    let has_alpha = rgba.pixels().any(|p| p[3] != 255);
     // At most 1024 on its longer side (LANCZOS, as PIL).
     let (w, h) = rgba.dimensions();
     let longest = w.max(h);

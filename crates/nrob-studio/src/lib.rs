@@ -25,6 +25,8 @@ mod music;
 mod multipart;
 mod registry;
 mod model3d;
+mod picture;
+pub mod downloads;
 mod sound;
 mod speech;
 mod system;
@@ -61,6 +63,8 @@ pub struct Studio {
     pub media: Arc<media::Media>,
     pub system: system::System,
     pub log: Arc<LogRing>,
+    /// Models being downloaded from the catalog.
+    pub downloads: Arc<downloads::Downloads>,
     ui_url: RwLock<String>,
     gateway_url: RwLock<String>,
     /// Listener settings changed; they apply at the next start.
@@ -380,6 +384,7 @@ pub fn launch(args: &Args, quiet: bool) -> Result<Running, String> {
         media: Arc::new(media::Media::new()),
         system: system::System::new(),
         log: Arc::new(LogRing::new(1000)),
+        downloads: Arc::new(downloads::Downloads::new()),
         ui_url: RwLock::new(String::new()),
         gateway_url: RwLock::new(String::new()),
         restart_required: RwLock::new(false),

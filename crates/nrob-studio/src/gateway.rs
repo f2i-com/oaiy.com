@@ -152,6 +152,8 @@ pub fn handle(studio: &Arc<Studio>, req: &Request, w: &mut TcpStream, m: Matched
         ("music", _) => music_openai(studio, req, w, method, &m.rest),
         ("sound", _) => sound_openai(studio, req, w, method, &m.rest),
         ("model3d", _) => model3d_openai(studio, req, w, method, &m.rest, trusted),
+        ("background", _) if m.rest.is_empty() => send(w, parse_body(req).and_then(|b| picture_openai(studio, req, b, trusted, crate::picture::Op::RemoveBackground))),
+        ("upscale", _) if m.rest.is_empty() => send(w, parse_body(req).and_then(|b| picture_openai(studio, req, b, trusted, crate::picture::Op::Upscale))),
         _ => send(w, Err(fail(404, format!("no route {} {}", method, req.route())))),
     }
 }
@@ -960,6 +962,61 @@ fn images_openai(studio: &Arc<Studio>, req: &Request, body: Json, trusted: bool,
         ("output_format", Json::str("png")),
         ("size", Json::str(&done.size)),
         ("model", Json::str(&done.model)),
+    ]))
+}
+
+/// A picture's background removed, or the picture made larger: wait, and answer
+/// as OpenAI Images does, with a base64 PNG or a URL.
+fn picture_openai(studio: &Arc<Studio>, req: &Request, body: Json, trusted: bool, op: crate::picture::Op) -> Result<Reply, Reply> {
+    if req.method != "POST" {
+        return Err(fail(405, "use POST"));
+    }
+    let format = body.get("response_format").and_then(Json::as_str).unwrap_or("b64_json");
+    if !matches!(format, "b64_json" | "url") {
+        return Err(fail(400, "response_format must be b64_json or url"));
+    }
+    let cfg = studio.config();
+    let scratch = scratch_for(studio, req, Some(&body));
+    let root = scratch.clone().unwrap_or_else(|| studio.output_root());
+    let (request, model, label) = crate::picture::picture_request(&cfg, &studio.root, &root, &body, trusted, op).map_err(|e| {
+        if let Some(s) = &scratch {
+            let _ = std::fs::remove_dir_all(s);
+        }
+        fail(400, e)
+    })?;
+    let job = studio.media.submit(Kind::Picture, request, model, label, 1, 0.0, keep_jobs(&cfg), scratch);
+    let done = studio.media.wait(&job.id, IMAGE_WAIT).ok_or_else(|| fail(500, "the job disappeared"))?;
+    if done.status != "completed" {
+        if done.incognito {
+            if done.finished() {
+                studio.media.purge(&done.id);
+            } else {
+                studio.media.remove(&done.id);
+            }
+        }
+        return Err(fail(if done.status == "in_progress" { 504 } else { 500 }, done.error.unwrap_or_else(|| format!("picture job {}", done.status))));
+    }
+    let file = done.files.first().ok_or_else(|| fail(500, "the job made no picture"))?;
+    let item = if format == "url" {
+        let url = media::file_url(&studio.output_root(), file).ok_or_else(|| fail(500, "output outside the output root"))?;
+        ("url", Json::str(format!("{}{url}", public_base(studio, req))))
+    } else {
+        let bytes = std::fs::read(file).map_err(|e| fail(500, format!("reading {}: {e}", file.display())))?;
+        ("b64_json", Json::str(base64_encode(&bytes)))
+    };
+    if done.incognito && format != "url" {
+        studio.media.purge(&done.id);
+    }
+    let int = |k: &str| done.result.get(k).cloned().unwrap_or(Json::Null);
+    ok(Json::obj([
+        ("created", Json::Int(now() as i64)),
+        ("data", Json::Arr(vec![Json::obj([item])])),
+        ("output_format", Json::str("png")),
+        ("width", int("width")),
+        ("height", int("height")),
+        ("size", Json::str(format!("{}x{}", crate::util::int_or(&done.result, "width", 0), crate::util::int_or(&done.result, "height", 0)))),
+        ("model", Json::str(&done.model)),
+        ("seconds_taken", int("seconds")),
     ]))
 }
 

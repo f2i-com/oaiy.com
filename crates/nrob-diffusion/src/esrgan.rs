@@ -126,8 +126,16 @@ impl Esrgan {
 
     /// An RGB picture (`w` × `h`, 8-bit) four times larger: `4w` × `4h`, 8-bit RGB.
     pub fn upscale(&self, rgb: &[u8], w: usize, h: usize) -> Result<Vec<u8>> {
+        self.upscale_with(rgb, w, h, |_, _| {})
+    }
+
+    /// `upscale`, telling `progress` how many tiles of how many are done.
+    pub fn upscale_with(&self, rgb: &[u8], w: usize, h: usize, mut progress: impl FnMut(usize, usize)) -> Result<Vec<u8>> {
         let (ow, oh) = (w * SCALE, h * SCALE);
         let mut out = vec![0u8; ow * oh * 3];
+        let tiles = w.div_ceil(TILE) * h.div_ceil(TILE);
+        let mut done = 0;
+        progress(0, tiles);
         for ty in (0..h).step_by(TILE) {
             for tx in (0..w).step_by(TILE) {
                 // The tile, and the context around it that the network sees.
@@ -156,6 +164,8 @@ impl Esrgan {
                         }
                     }
                 }
+                done += 1;
+                progress(done, tiles);
             }
         }
         Ok(out)

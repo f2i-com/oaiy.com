@@ -91,7 +91,14 @@ Every token is a small, well-planned job:
 - **Native Rust 3D models from a picture.** Pixal3D (TRELLIS.2's cascade with
   pixel-aligned conditioning, with DINOv3 and NAF) turns a picture of one object
   into a textured GLB in about 95 seconds on an RTX 5090. BiRefNet removes the
-  picture's background, and Real-ESRGAN enlarges a small one first. The mesh is closed and
+  picture's background, and Real-ESRGAN enlarges a small one first. Both are
+  picture tools of their own too: background removal and upscaling on
+  `/v1/images/*` ([Picture tools](docs/PICTURE_TOOLS.md)).
+
+- **Get models.** NROB Studio downloads ready-to-run mainstream models from
+  Hugging Face (chat, images, video, speech, music, sound effects, 3D and the
+  picture tools) into folders of their own, with pause and resume, and adds
+  them when they finish ([Getting models](docs/STUDIO.md#getting-models)). The mesh is closed and
   simplified, and its colours are baked into PBR textures, ready for three.js,
   game engines and 3D printing slicers ([3D models](docs/MODEL3D.md)).
 

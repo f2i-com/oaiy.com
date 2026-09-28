@@ -310,7 +310,17 @@ fn attach_model3d(cfg: &mut Json, d: &Detected, target: Option<(&str, &str)>, pi
     let lent = |key: &str| -> Option<Json> {
         get(cfg, &["media", "model3d", "models"])?.members().find_map(|(_, m)| m.get(key).filter(|v| v.as_str().is_some_and(|s| !s.trim().is_empty())).cloned())
     };
-    let lend: Vec<(&str, Json)> = MODEL3D_PARTS.iter().chain(&MODEL3D_HELPERS).filter(|k| **k != field).filter_map(|k| lent(k).map(|v| (*k, v))).collect();
+    // The picture tools' BiRefNet and Real-ESRGAN are the 3D model's helpers too.
+    let picture = |key: &str| -> Option<Json> {
+        let field = if key == "matte" { "background" } else { "upscaler" };
+        get(cfg, &["media", "picture", field]).filter(|v| v.as_str().is_some_and(|s| !s.trim().is_empty())).cloned()
+    };
+    let lend: Vec<(&str, Json)> = MODEL3D_PARTS
+        .iter()
+        .chain(&MODEL3D_HELPERS)
+        .filter(|k| **k != field)
+        .filter_map(|k| lent(k).or_else(|| if MODEL3D_HELPERS.contains(k) { picture(k) } else { None }).map(|v| (*k, v)))
+        .collect();
     let Some(Json::Obj(models)) = obj_mut(cfg, &["media", "model3d", "models"]) else { return Err("no 3D model section".into()) };
     let lacks = |m: &Json| str_or(m, field, "").trim().is_empty();
     let chosen = models.iter().position(|(n, _)| target.is_some_and(|(_, t)| n == t)).or_else(|| {
@@ -384,7 +394,24 @@ fn attach(cfg: &mut Json, d: &Detected, target: Option<(&str, &str)>, picked: &P
         "speech_design" | "speech_base" | "speech_breeze" => return attach_speech(cfg, d, target),
         "music_model" | "music_lm" => return attach_music(cfg, d, target),
         "sound_model" => return attach_sound(cfg, d, target),
-        "model3d" | "model3d_dino" | "model3d_naf" | "model3d_matte" | "model3d_upscaler" => return attach_model3d(cfg, d, target, picked),
+        "model3d_matte" | "model3d_upscaler" => {
+            // Picture tools first (they need nothing else), then any 3D model.
+            let (field, key) = if d.kind() == "model3d_matte" { ("background", "matte") } else { ("upscaler", "upscaler") };
+            let value = field_of(d, key).ok_or("detected part has no path")?;
+            if let Some(section) = obj_mut(cfg, &["media", "picture"]) {
+                if target.is_none_or(|(s, _)| s == "picture") || str_or(section, field, "").trim().is_empty() {
+                    set(section, field, value);
+                }
+            }
+            add_route_if_absent(cfg, if field == "background" { "background" } else { "upscale" });
+            // With no 3D model yet it serves the picture tools alone (a 3D model added later borrows it).
+            let no_3d = get(cfg, &["media", "model3d", "models"]).is_none_or(|m| m.len() == 0);
+            if target.is_some_and(|(s, _)| s == "picture") || (target.is_none() && no_3d) {
+                return Ok(Added { section: "picture", name: field.to_string(), missing: Vec::new(), enabled: true });
+            }
+            return attach_model3d(cfg, d, target, picked);
+        }
+        "model3d" | "model3d_dino" | "model3d_naf" => return attach_model3d(cfg, d, target, picked),
         "ffmpeg" => {
             let value = field_of(d, "ffmpeg").unwrap_or(Json::Null);
             set(obj_mut(cfg, &["media", "video"]).ok_or("no video section")?, "ffmpeg", value);
@@ -938,6 +965,11 @@ mod tests {
         let (a3, found) = add(&mut cfg, &birefnet, None, Some(("model3d", "pixal3d"))).unwrap();
         assert_eq!((found.kind(), a3.name.as_str()), ("model3d_matte", "pixal3d"));
         assert!(str_or(&model(&cfg, "pixal3d"), "matte", "").ends_with("BiRefNet"));
+        // It is the picture tools' background remover too, and Real-ESRGAN their upscaler.
+        assert!(get(&cfg, &["media", "picture", "background"]).and_then(Json::as_str).is_some_and(|p| p.ends_with("BiRefNet")));
+        add(&mut cfg, &esrgan, None, None).unwrap();
+        assert!(get(&cfg, &["media", "picture", "upscaler"]).and_then(Json::as_str).is_some_and(|p| p.ends_with("RealESRGAN_x4plus.pth")));
+        config::validate(&cfg).unwrap();
         // Parts first, each from its own place: one model, switched on once it has all three.
         let apart = d.join("apart");
         let (pixal, _, _) = pixal3d_parts(&apart.join("a"));

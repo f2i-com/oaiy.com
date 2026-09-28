@@ -279,3 +279,34 @@ fn pictures_are_cut_out_and_enlarged() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn only_a_picture_whose_alpha_cuts_something_out_is_taken_as_cut_out() {
+    // A red square on white, all of it a little translucent (as some exports are):
+    // not a cut-out, so the plain background is cut away around the square.
+    let dir = std::env::temp_dir().join(format!("nrob-cutout-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut img = image::RgbaImage::from_pixel(200, 160, image::Rgba([255, 255, 255, 200]));
+    for y in 60..100 {
+        for x in 80..120 {
+            img.put_pixel(x, y, image::Rgba([220, 30, 30, 200]));
+        }
+    }
+    assert!(!super::prepare::cuts_out(&img));
+    img.save(dir.join("translucent.png")).unwrap();
+    let helpers = super::prepare::Helpers { matte: None, upscaler: None, dev: &Device::Cpu };
+    let p = super::prepare::prepare(&dir.join("translucent.png"), &helpers).unwrap();
+    assert_eq!(p.matte, "background");
+    assert!(p.image.width() < 60, "cropped to the square, not the whole picture: {}", p.image.width());
+    // A real cut-out: the background transparent.
+    let mut cut = image::RgbaImage::from_pixel(200, 160, image::Rgba([0, 0, 0, 0]));
+    for y in 60..100 {
+        for x in 80..120 {
+            cut.put_pixel(x, y, image::Rgba([220, 30, 30, 255]));
+        }
+    }
+    assert!(super::prepare::cuts_out(&cut));
+    cut.save(dir.join("cut.png")).unwrap();
+    assert_eq!(super::prepare::prepare(&dir.join("cut.png"), &helpers).unwrap().matte, "alpha");
+    std::fs::remove_dir_all(dir).unwrap();
+}

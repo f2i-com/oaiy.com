@@ -45,7 +45,8 @@ The console accepts `status`, `start`, `stop`, `open`, `jobs` and `quit`.
 - **Theme:** light and dark, following the system until you pick one (or add
   `?theme=light` to the address).
 - **Pages:**
-  - Overview shows what is running now.
+  - Overview shows what is running now. With no models yet, it points to Get models.
+  - Get models downloads ready-to-run models (see [Getting models](#getting-models)).
   - The Gallery keeps everything generated this session, with each item's
     prompt, seed, steps and where its weights lived. Items can be reused,
     downloaded or removed.
@@ -92,6 +93,47 @@ pops up when an image or video finishes (or fails). It takes the same options as
 just brings up the running one's UI. Windows 11 puts new icons under the **^**
 overflow at first; drag the icon onto the taskbar to keep it visible.
 
+## Getting models
+
+**Get models** in the sidebar downloads ready-to-run models from Hugging Face
+(and two small ones from GitHub releases) and adds them to the model list when
+they finish, so a new install needs no hunting for files.
+
+The catalog lists mainstream releases only, with their licences:
+
+| Group | Models |
+|---|---|
+| Chat | Qwen3.5 9B, Qwen3 8B, Qwen3 4B, Gemma 4 E2B (with vision), Gemma 3 4B (with vision), Llama 3.2 3B: 4-bit GGUF |
+| Images | Qwen Image 2.1 with Viggle's turbo adapter; Stable Diffusion XL 1.0 with its CLIP tokenizer |
+| Video | LTX 2.5 (its BF16 transformer, Gemma 4 text encoder, and video and audio VAEs) |
+| Speech | Qwen3-TTS 1.7B (VoiceDesign and Base); Breeze TTS 2 |
+| Music | MiniMax Music 3 (the parts nrob uses: 28.5 of its 57 GB) |
+| Sound effects | MOSS-SoundEffect v2.0 |
+| 3D models | Pixal3D (the single-picture checkpoints) with DINOv3 ViT-L/16 and NAF, bringing BiRefNet and Real-ESRGAN |
+| Picture tools | BiRefNet (background removal), Real-ESRGAN x4plus (upscaling) |
+
+Each card shows the download's size, the GPU memory the model wants, and its
+licence. **Recommended** picks one of each kind to start with.
+
+- **Where they go:** **Save models in** (default: the studio's `models`
+  folder). Each model gets a folder of its own there, and the page shows the
+  drive's free space. A download that would not fit is refused before it starts.
+- **Pause and resume:** **Pause** stops a download and keeps the partial file
+  (`NAME.part`). **Resume** carries on from there, also after the studio
+  restarts. **Cancel** deletes the partial file. One download runs at a time,
+  and the others wait their turn.
+- **Gated models:** LTX 2.5 and DINOv3 (for Pixal3D) ask you to accept their
+  licence on huggingface.co first. Accept it while signed in, create an access
+  token (read) at huggingface.co/settings/tokens, and save it on the page. The
+  token stays in the configuration file (`downloads.hf_token`); the `HF_TOKEN`
+  environment variable works too.
+- **When it finishes:** the files are added as the Models page's **Add**
+  would, parts attaching to their model. **Add again** re-adds a downloaded
+  model that was removed from the list.
+- **How it downloads:** with the system's `curl`, which Windows 10 and later,
+  macOS and Linux include (`downloads.curl` names another). Each finished part
+  leaves `.nrob-<id>.json` in its folder.
+
 ## Adding models
 
 On the **Models** page, choose **Browse** (a file picker over this machine's
@@ -114,8 +156,8 @@ headers, never its weights, and decides what it is:
 | Pixal3D folder | `pipeline.json` `Trellis2ImageTo3DPipeline`, with `ckpts/` | a 3D model ([3D models](MODEL3D.md)); its DINOv3 and NAF parts are found beside it |
 | DINOv3 ViT-L/16 folder | `config.json` `model_type: dinov3_vit` | the image encoder of a 3D model |
 | `naf_release.pth` | its name | the feature upsampler of a 3D model (read as tensors only) |
-| BiRefNet folder | `config.json` `architectures: ["BiRefNet"]` | a 3D model's background removal (optional) |
-| `RealESRGAN_x4plus.pth` | its name | a 3D model's upscaler (optional; read as tensors only) |
+| BiRefNet folder | `config.json` `architectures: ["BiRefNet"]` | the picture tools' background removal, and a 3D model's |
+| `RealESRGAN_x4plus.pth` | its name | the picture tools' upscaler, and a 3D model's (read as tensors only) |
 | MiniMax-Music3 folder | `config.json` `model_type: minimax_music3` | a music model |
 | smaller music language model | GGUF `general.architecture: music3-lm` | the music model's `language_model` |
 | LTX audio VAE | `audio_vae.*` with `vocoder.bwe_generator.*` | the optional audio VAE of every video model that lacks one (LTX 2.3 and Sulphur checkpoints are their own) |
@@ -240,6 +282,8 @@ The **Endpoints** page edits `gateway.routes`. Each route has a `path`, a
 | `music` | song jobs: create, poll, download, cancel ([Music](MUSIC.md)); a music model on `speech` sings too | the same |
 | `sound` | sound effect jobs on `/v1/audio/sound_effects`: create, poll, download, cancel ([Sound effects](SOUND.md)) | the same |
 | `model3d` | 3D model jobs on `/v1/3d/models`: create from a picture, poll, download the GLB and the cut-out picture, cancel ([3D models](MODEL3D.md)) | the same |
+| `background` | `/v1/images/background_removal`: a picture's background removed, answered at once as OpenAI Images does ([Picture tools](PICTURE_TOOLS.md)) | the same |
+| `upscale` | `/v1/images/upscale`: a picture two or four times larger ([Picture tools](PICTURE_TOOLS.md)) | the same |
 | `files` | generated media under the output folder | — |
 | `health` | `{status, llm, media_busy}`, never behind the key | — |
 
@@ -416,6 +460,7 @@ sections are:
 - `ui`: `host`, `port`, `open` (`app` | `browser` | `none`).
 - `gateway`: `host`, `port`, `api_key`, `public_url`, `cors_origins`, `routes`.
 - `privacy`: `incognito`.
+- `downloads`: `dir` (where Get models saves; default `models`), `hf_token`, `curl`.
 - `llm`: `server`, `server_webgpu`, `backend`, `webgpu_gb`, `models` (`[{name, path, vision_projector?, lora?, lora_strength?, devices?, enabled}]`;
   a model's `devices` are its own GPUs, for one too big for the LLM's, such as
   Qwen3.8-Flash-Next: see [FLASHNEXT.md](FLASHNEXT.md)),
