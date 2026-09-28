@@ -51,7 +51,7 @@ use super::process::{CallError, PluginProcess, SpawnOptions};
 use super::registry::{GateRefusal, PluginRegistryHandle, PluginState};
 use super::runner::{restart_delay, should_restart, HealthTracker, HealthVerdict, HEALTH_INTERVAL};
 use crate::bridge::deadletters::{DeadLetterHandle, DeadReason};
-use crate::bridge::ledger::{LedgerHandle, LineageRef, ReserveOutcome, RunRequest};
+use crate::bridge::ledger::{LedgerHandle, LineageRef, ReserveOutcome, RunRequest, RunStatus};
 use crate::bridge::triggers::{dispatch, DispatchOutcome, Event, SkipReason, TriggerBinding};
 use crate::services::runner::LogBuffer;
 
@@ -1205,6 +1205,12 @@ impl PluginHost {
             origin_run: None,
         };
 
+        if name == "aokie.appointment.requested" {
+            if let Some(cal) = crate::calendar::shared() {
+                cal.record_request(&event.data);
+            }
+        }
+
         let dispatched = self.dispatch_event(&event);
         if let Some(reason) = dispatched.dead {
             self.record_dead(&event.source, &event.name, reason, envelope.clone());
@@ -1444,6 +1450,21 @@ impl PluginHost {
             return Err(("invalid_request".into(), "flow.run needs a flowId".into()));
         };
 
+        // The phone's business lookup: answered by the calendar, unless the person
+        // stored a flow of that name to answer it their way.
+        if flow_id == "business-lookup" {
+            if let Some(cal) = crate::calendar::shared().filter(|c| !c.flow_answers(&flow_id)) {
+                let input = params.get("input").cloned().unwrap_or(Value::Null);
+                let text = |k: &str| input.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+                let digest = cal.lookup(&text("question"), &text("from"), crate::calendar::local_now());
+                return Ok(json!({
+                    "runId": format!("calendar_{}", now_ms()),
+                    "status": "done",
+                    "result": { "digest": digest },
+                }));
+            }
+        }
+
         let correlation = params
             .get("correlationId")
             .and_then(Value::as_str)
@@ -1475,15 +1496,39 @@ impl PluginHost {
             .ledger
             .lock()
             .map_err(|_| ("internal".to_string(), "ledger lock poisoned".to_string()))?;
-        match ledger.reserve(&req) {
-            ReserveOutcome::Reserved(run) | ReserveOutcome::Duplicate(run) => Ok(json!({
-                "runId": run.run_id,
-                "status": run.status,
-            })),
+        let run = match ledger.reserve(&req) {
+            ReserveOutcome::Reserved(run) | ReserveOutcome::Duplicate(run) => run,
             ReserveOutcome::Refused { reason } => {
-                Err(("invalid_request".into(), format!("refused: {reason}")))
+                return Err(("invalid_request".into(), format!("refused: {reason}")))
+            }
+        };
+        drop(ledger);
+        // A plugin asks with a budget and reads `result` (Aokie's lookups, within
+        // seconds during a call): wait for the run, up to that budget, on this
+        // request's own thread. Past it, answer as before: accepted, still running.
+        let deadline = Instant::now() + std::time::Duration::from_millis(req.timeout_ms.unwrap_or(0).min(60_000));
+        let mut current = run;
+        while !current.status.is_terminal() && Instant::now() < deadline {
+            thread::sleep(std::time::Duration::from_millis(100));
+            match self.ledger.lock().ok().and_then(|l| l.get(&current.run_id)) {
+                Some(r) => current = r,
+                None => break,
             }
         }
+        let output = current.output.clone().unwrap_or(Value::Null);
+        // The flow's own output (the engine wraps it beside how it ran); a text answer as `answer`.
+        let own = output.get("output").cloned().unwrap_or(output);
+        let result = match own {
+            Value::String(s) => json!({ "answer": s }),
+            Value::Null => Value::Null,
+            other => other,
+        };
+        Ok(json!({
+            "runId": current.run_id,
+            "status": if current.status == RunStatus::Succeeded { json!("done") } else { json!(current.status) },
+            "result": result,
+            "error": current.error,
+        }))
     }
 
     /// One supervisor tick: probe, detect exits, schedule bounded restarts.

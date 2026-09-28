@@ -735,10 +735,12 @@ fn is_privileged_path(method: &Method, path: &str) -> bool {
             ) || (path.starts_with("/api/services/") && path.ends_with("/uninstall"))
                 || is_bridge_exec_path(path)
                 || is_ai_exec_path(path)
+                || is_personal_path(path)
         }
+        Method::PATCH => is_personal_path(path),
         // PUT is only used by the bridge (flow documents). A flow doc is
         // executable code the worker hands to the CLI, so it is exec surface.
-        Method::PUT => is_bridge_exec_path(path),
+        Method::PUT => is_bridge_exec_path(path) || is_personal_path(path),
         Method::DELETE => {
             path.starts_with("/api/services/")
                 || path.starts_with("/api/models/")
@@ -747,9 +749,17 @@ fn is_privileged_path(method: &Method, path: &str) -> bool {
                 || path.starts_with("/api/plugins/")
                 || is_bridge_exec_path(path)
                 || is_ai_exec_path(path)
+                || is_personal_path(path)
         }
         _ => false,
     }
+}
+
+/// Calls and the calendar: callers' numbers and words, customers' names and
+/// appointments. Reading them is a restricted read; changing them (speaking on
+/// a live call, booking or deleting an appointment) takes the privileged gate.
+fn is_personal_path(path: &str) -> bool {
+    path.starts_with("/api/voice/") || path == "/api/calendar" || path.starts_with("/api/calendar/")
 }
 
 /// Bridge + plugin routes that EXECUTE code, cause physical side effects, or
@@ -875,6 +885,7 @@ fn is_restricted_read_path(path: &str) -> bool {
         // URLs, hasKey/enabled — no secret) and the models proxy. Not for an
         // arbitrary remote page; a paired token or a trusted origin passes.
         || path.starts_with("/api/ai/")
+        || is_personal_path(path)
 }
 
 /// Stricter allow-list for privileged endpoints: OAIY Desktop's OWN webview and
@@ -1174,6 +1185,10 @@ pub async fn serve(
     // before `registry` is moved into AppState below.
     let registry_for_ai = registry.clone();
     let registry_for_voice = registry.clone();
+    // The calendar lives in the data folder, beside the flows it may defer to.
+    if let Ok(dir) = registry.lock().map(|r| r.data_dir().to_path_buf()) {
+        crate::calendar::init(&dir);
+    }
 
     let state = AppState {
         config,
@@ -1258,6 +1273,7 @@ pub async fn serve(
         // would leave them ungated — reachable by any web page the user has open.
         .merge(bridge_routes)
         .merge(voice_routes)
+        .merge(crate::calendar::routes::router())
         .merge(companion_routes)
         .merge(link_routes)
         .merge(ai_routes)
@@ -1416,6 +1432,16 @@ mod tests {
         // machine has done. It takes the same gate as creating a run, so a
         // local page cannot erase the evidence of one.
         assert!(is_privileged_path(&Method::DELETE, "/api/bridge/runs"));
+        // Calls and the calendar hold people's numbers, words and appointments.
+        assert!(is_privileged_path(&Method::POST, "/api/voice/calls/c1/say"));
+        assert!(is_privileged_path(&Method::POST, "/api/calendar/appointments"));
+        assert!(is_privileged_path(&Method::PATCH, "/api/calendar/appointments/a1"));
+        assert!(is_privileged_path(&Method::DELETE, "/api/calendar/appointments/a1"));
+        assert!(is_privileged_path(&Method::PUT, "/api/calendar/settings"));
+        assert!(is_restricted_read_path("/api/voice/events"));
+        assert!(is_restricted_read_path("/api/calendar"));
+        assert!(is_restricted_read_path("/api/calendar/free"));
+        assert!(!is_restricted_read_path("/api/calendars-elsewhere"));
         assert!(is_privileged_path(&Method::POST, "/api/bridge/runs"));
         // Reading history stays a restricted read, not a privileged one.
         assert!(is_restricted_read_path("/api/bridge/runs"));
