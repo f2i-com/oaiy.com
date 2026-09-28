@@ -167,6 +167,21 @@ describe('tool rules', () => {
     expect(events.at(-1)).toMatchObject({ type: 'done', text: 'guided' });
   });
 
+  it('a request for a 3D model reads the media guide, which says how one is made when the service makes them', async () => {
+    const system = (body: Record<string, unknown>) => String((body.messages as Array<{ content: unknown }>)[0].content);
+    const media = { ...EMPTY_MEDIA, baseUrl: 'http://127.0.0.1:8080', imageModel: 'image', model3dModel: 'pixal3d' };
+    const fake = fakeProvider('openai', [{ text: 'ok' }]);
+    await new Agent({ vfs: new Vfs(), gate: new NetGate(), provider: () => ({ ...LOCAL, contextTokens: 32_000 }), projectSummary: () => '', media: () => media }).run('Make a 3D model of a desk lamp for my game', () => {});
+    expect(system(fake.bodies[0])).toContain('The media guide:');
+    expect(system(fake.bodies[0])).toContain('- generate_3d_model makes a 3D model (a GLB mesh) of one object from a picture of it');
+    expect((fake.bodies[0].tools as Array<{ function: { name: string } }>).map((t) => t.function.name)).toContain('generate_3d_model');
+    // Without a 3D model service, the guide says nothing of it.
+    const plain = fakeProvider('openai', [{ text: 'ok' }]);
+    await new Agent({ vfs: new Vfs(), gate: new NetGate(), provider: () => ({ ...LOCAL, contextTokens: 32_000 }), projectSummary: () => '', media: () => ({ ...media, model3dModel: undefined }) }).run('Make a picture of a desk lamp', () => {});
+    expect(system(plain.bodies[0])).toContain('The media guide:');
+    expect(system(plain.bodies[0])).not.toContain('generate_3d_model');
+  });
+
   it('a small window with a video service gets the scripted way to a story in brief, and room to work', async () => {
     const fake = fakeProvider('openai', [{ text: 'hi' }]);
     const media = { ...EMPTY_MEDIA, baseUrl: 'http://127.0.0.1:8080', imageModel: 'image', videoModel: 'video', speechModel: 'speech' };

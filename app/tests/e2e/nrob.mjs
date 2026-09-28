@@ -1,7 +1,7 @@
-// nrob end to end: a mock nrob (discovery, scripted chat, images, a video job)
-// is found on its own when the app opens, and the agent makes an image and a
-// video with it. A second mock refuses the page, as nrob does for an origin it
-// does not allow.
+// nrob end to end: a mock nrob (discovery, scripted chat, images, a video job,
+// a 3D model job) is found on its own when the app opens, and the agent makes
+// an image, a video and a 3D model with it. A second mock refuses the page, as
+// nrob does for an origin it does not allow.
 //   node tests/e2e/nrob.mjs
 import { existsSync } from 'node:fs';
 import { createServer as createHttpServer } from 'node:http';
@@ -15,6 +15,42 @@ if (!executablePath) {
 }
 
 const PNG = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==', 'base64');
+
+/** The smallest real GLB: one triangle (POSITION and indices) in the unit cube, as nrob's 3D models are laid out. */
+function triangleGlb() {
+  const bin = Buffer.alloc(44);
+  [-0.5, -0.5, 0, 0.5, -0.5, 0, 0, 0.5, 0].forEach((v, i) => bin.writeFloatLE(v, i * 4));
+  [0, 1, 2].forEach((v, i) => bin.writeUInt16LE(v, 36 + i * 2));
+  const gltf = {
+    asset: { version: '2.0', generator: 'bot.computer e2e' },
+    scene: 0,
+    scenes: [{ nodes: [0] }],
+    nodes: [{ mesh: 0 }],
+    meshes: [{ primitives: [{ attributes: { POSITION: 0 }, indices: 1, material: 0 }] }],
+    materials: [{ doubleSided: true, pbrMetallicRoughness: { baseColorFactor: [0.8, 0.4, 0.2, 1], metallicFactor: 0, roughnessFactor: 0.8 } }],
+    accessors: [
+      { bufferView: 0, componentType: 5126, count: 3, type: 'VEC3', min: [-0.5, -0.5, 0], max: [0.5, 0.5, 0] },
+      { bufferView: 1, componentType: 5123, count: 3, type: 'SCALAR' },
+    ],
+    bufferViews: [{ buffer: 0, byteOffset: 0, byteLength: 36, target: 34962 }, { buffer: 0, byteOffset: 36, byteLength: 6, target: 34963 }],
+    buffers: [{ byteLength: 42 }],
+  };
+  // Chunks are 4-byte aligned: the JSON padded with spaces, the binary with zeros.
+  let json = Buffer.from(JSON.stringify(gltf));
+  json = Buffer.concat([json, Buffer.alloc((4 - (json.length % 4)) % 4, 0x20)]);
+  const header = Buffer.alloc(12);
+  header.write('glTF', 0, 'ascii');
+  header.writeUInt32LE(2, 4);
+  header.writeUInt32LE(12 + 8 + json.length + 8 + bin.length, 8);
+  const chunk = (type, data) => {
+    const head = Buffer.alloc(8);
+    head.writeUInt32LE(data.length, 0);
+    head.writeUInt32LE(type, 4);
+    return Buffer.concat([head, data]);
+  };
+  return Buffer.concat([header, chunk(0x4e4f534a, json), chunk(0x004e4942, bin)]);
+}
+const GLB = triangleGlb();
 const chats = [];
 const images = [];
 const videos = [];
@@ -22,7 +58,9 @@ const speeches = [];
 const voicesMade = [];
 const songs = [];
 const effects = [];
+const models3d = [];
 let polls = 0;
+let modelPolls = 0;
 let songPolls = 0;
 const script = [
   { calls: [{ name: 'generate_image', input: { prompt: 'a red fox in snow, watercolour', path: 'art/fox.png' } }] },
@@ -35,6 +73,10 @@ const script = [
   { calls: [{ name: 'generate_sound_effect', input: { description: 'snow crunching under quick paws', seconds: 3, path: 'audio/steps.wav' } }] },
   { calls: [{ name: 'generate_video', input: { prompt: 'the fox grins and talks to camera', path: 'media/talk.mp4', start_image: 'art/fox.png', end_image: 'art/fox.png', say: 'Catch me if you can!', voice: 'Fox' } }] },
   { text: 'The fox talks in media/talk.mp4.' },
+  // A 3D model of the fox, from its picture: the model and the cut-out land in the project.
+  { calls: [{ name: 'generate_3d_model', input: { image: 'art/fox.png', path: 'assets/models/fox', faces: 20000 } }] },
+  { calls: [{ name: 'file_info', input: { path: 'assets/models/fox.glb' } }, { name: 'file_info', input: { path: 'assets/models/fox.cutout.png' } }] },
+  { text: 'The fox is in 3D: assets/models/fox.glb.' },
 ];
 function sse(step, n) {
   const events = [];
@@ -53,7 +95,7 @@ function discovery(origin) {
     base_url: origin,
     openai_base_url: `${origin}/v1`,
     auth: { type: 'none', required: false },
-    endpoints: ['chat:/v1/chat/completions', 'models:/v1/models', 'images:/v1/images/generations', 'edits:/v1/images/edits', 'videos:/v1/videos', 'speech:/v1/audio/speech', 'voices:/v1/audio/voices', 'music:/v1/audio/music', 'sound:/v1/audio/sound_effects'].map((e) => {
+    endpoints: ['chat:/v1/chat/completions', 'models:/v1/models', 'images:/v1/images/generations', 'edits:/v1/images/edits', 'videos:/v1/videos', 'speech:/v1/audio/speech', 'voices:/v1/audio/voices', 'music:/v1/audio/music', 'sound:/v1/audio/sound_effects', 'model3d:/v1/3d/models'].map((e) => {
       const [name, path] = e.split(':');
       return { name, path, url: `${origin}${path}`, spec: 'openai' };
     }),
@@ -61,11 +103,12 @@ function discovery(origin) {
       speech: [{ id: 'qwen3-tts', default: true, described_voices: true, saved_voices: true }],
       music: [{ id: 'minimax-music3', default: true, max_seconds: 360 }],
       sound: [{ id: 'moss-soundeffect', default: true, max_seconds: 30 }],
+      model3d: [{ id: 'pixal3d', default: true, format: 'glb', resolutions: [1024, 1536], faces: 200000, input: 'a picture of one object on a plain or transparent background', ready: true, license: "MIT (Pixal3D); DINOv3 under Meta's DINOv3 License" }],
       llm: [{ id: 'qwen3.8-27b', default: true }],
       image: [{ id: 'qwen-image-turbo-q4', default: true, edits: true, max_references: 3, size_step: 32, default_size: '1024x1024' }],
       video: [{ id: 'sulphur-2', default: true, fps: 24, max_seconds: 5, max_side: 1024, start_image: true }],
     },
-    defaults: { llm: 'qwen3.8-27b', image: 'qwen-image-turbo-q4', video: 'sulphur-2', speech: 'qwen3-tts', music: 'minimax-music3', sound: 'moss-soundeffect' },
+    defaults: { llm: 'qwen3.8-27b', image: 'qwen-image-turbo-q4', video: 'sulphur-2', speech: 'qwen3-tts', music: 'minimax-music3', sound: 'moss-soundeffect', model3d: 'pixal3d' },
     voices: { saved: [{ name: 'Narrator', description: 'a deep, calm narrator' }], openai_names: ['alloy'] },
     llm: { context_tokens: 32768 },
   };
@@ -87,7 +130,7 @@ const nrob = createHttpServer((req, res) => {
   req.on('end', () => {
     const url = req.url.split('?')[0];
     if (url === '/v1/discovery') return send(200, discovery(origin));
-    if (url === '/v1/models') return send(200, { data: [{ id: 'qwen3.8-27b', type: 'llm' }, { id: 'qwen-image-turbo-q4', type: 'image' }, { id: 'sulphur-2', type: 'video' }] });
+    if (url === '/v1/models') return send(200, { data: [{ id: 'qwen3.8-27b', type: 'llm' }, { id: 'qwen-image-turbo-q4', type: 'image' }, { id: 'sulphur-2', type: 'video' }, { id: 'pixal3d', type: 'model3d' }] });
     if (url === '/v1/chat/completions') {
       chats.push(JSON.parse(body));
       res.setHeader('content-type', 'text/event-stream');
@@ -125,6 +168,19 @@ const nrob = createHttpServer((req, res) => {
     }
     if (url === '/v1/audio/sound_effects/sfx_1') return send(200, { id: 'sfx_1', status: 'completed', seconds: 3, model: 'moss-soundeffect' });
     if (url === '/v1/audio/sound_effects/sfx_1/content') return send(200, Buffer.from('RIFF....WAVEfmt '), 'audio/wav');
+    if (url === '/v1/3d/models' && req.method === 'POST') {
+      models3d.push(JSON.parse(body));
+      modelPolls = 0;
+      return send(200, { id: 'm3d_1', object: 'model3d', model: 'pixal3d', status: 'queued', progress: 0, stage: 'queued', resolution: 1024, format: 'glb', error: null });
+    }
+    if (url === '/v1/3d/models/m3d_1') {
+      modelPolls++;
+      return send(200, modelPolls < 2
+        ? { id: 'm3d_1', object: 'model3d', model: 'pixal3d', status: 'in_progress', progress: 40, stage: 'shape', error: null }
+        : { id: 'm3d_1', object: 'model3d', model: 'pixal3d', status: 'completed', progress: 100, stage: 'done', format: 'glb', faces: 1, vertices: 3, bytes: GLB.length, matte: 'background', seconds_taken: 70.2, error: null });
+    }
+    if (url === '/v1/3d/models/m3d_1/content') return send(200, GLB, 'model/gltf-binary');
+    if (url === '/v1/3d/models/m3d_1/input') return send(200, PNG, 'image/png');
     if (url === '/v1/videos/video_1') {
       polls++;
       return send(200, polls < 3 ? { id: 'video_1', status: 'in_progress', progress: polls * 40 } : { id: 'video_1', status: 'completed', progress: 100, seconds: '4', size: '768x512', model: 'sulphur-2' });
@@ -174,14 +230,15 @@ try {
   await check('nrob is found on its own: images, video and chat are set up from its discovery document', async () => {
     await page.waitForFunction(() => document.querySelector('.chat-log')?.textContent.includes('Found nrob-studio 0.1.0'), { timeout: 15_000 });
     const log = await page.$eval('.chat-log', (e) => e.textContent);
-    expect(log.includes('The agent can make images, video, speech, music and sound effects with it.') && log.includes('in the AI providers for chat too, and in use'), log.slice(0, 500));
+    expect(log.includes('The agent can make images, video, speech, music, sound effects and 3D models with it.') && log.includes('in the AI providers for chat too, and in use'), log.slice(0, 500));
     expect(!log.includes('Welcome! Set up an AI provider'), 'the welcome still asks for a provider');
     const chip = await page.$eval('button[title="AI provider"]', (b) => b.textContent);
     expect(chip === 'nrob · qwen3.8-27b', chip);
     await page.click('button[title="AI providers"]');
     await page.waitForSelector('dialog.settings[open]');
     const media = await page.$eval('.media-settings', (s) => ({ text: s.textContent, inputs: [...s.querySelectorAll('input')].map((i) => i.value) }));
-    expect(media.text.includes(`nrob-studio 0.1.0 at ${new URL(nrobUrl).origin} (images, video, speech, music and sound effects)`), media.text);
+    expect(media.text.includes(`nrob-studio 0.1.0 at ${new URL(nrobUrl).origin} (images, video, speech, music, sound effects and 3D models)`), media.text);
+    expect(media.inputs.includes('pixal3d'), JSON.stringify(media.inputs));
     expect(media.inputs.includes(`${nrobUrl}/v1`) && media.inputs.includes('qwen-image-turbo-q4') && media.inputs.includes('sulphur-2'), JSON.stringify(media.inputs));
     await page.evaluate(() => [...document.querySelectorAll('dialog.settings button')].find((b) => b.textContent === 'Cancel').click());
   });
@@ -227,6 +284,22 @@ try {
     expect(names.includes('audio'), `tree: ${names}`);
     const players = await page.$$eval('.msg.presented audio, .msg.presented .media-name', (els) => els.length);
     expect(players >= 2, `audio players: ${players}`);
+  });
+  await check('the agent makes a 3D model of the fox from its picture; the GLB and the cut-out picture land in the project', async () => {
+    await page.type('.chat-input', 'Make a 3D model of the fox.');
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() => document.querySelector('.chat-log')?.textContent.includes('The fox is in 3D: assets/models/fox.glb.'), { timeout: 60_000 });
+    const tool = chats[0].tools.find((t) => t.function.name === 'generate_3d_model')?.function;
+    expect(tool && tool.description.includes('three-quarter view') && tool.description.includes('pixal3d (default)'), tool?.description ?? 'generate_3d_model was not offered');
+    expect(models3d.length === 1 && models3d[0].model === 'pixal3d' && models3d[0].faces === 20000 && models3d[0].image === `data:image/png;base64,${PNG.toString('base64')}`, JSON.stringify(models3d).slice(0, 300));
+    const results = chats.slice(-2).map((c) => c.messages.filter((m) => m.role === 'tool').map((m) => m.content).join('\n')).join('\n');
+    expect(results.includes('Saved /assets/models/fox.glb (1 face, 3 vertices, 1 KB, made in 70 s), made with pixal3d, and beside it the picture as the service cut the object out, /assets/models/fox.cutout.png.') && results.includes('Look at it with preview_screenshot (path: assets/models/fox.glb) before using it.'), results);
+    // The files as saved: the GLB byte for byte in size, and the cut-out a real picture.
+    expect(results.includes(`/assets/models/fox.glb: ${GLB.length} bytes`) && results.includes(`/assets/models/fox.cutout.png: ${PNG.length} bytes, image image/png, 1×1 px`), results);
+    const statuses = await page.evaluate(() => window.__statuses);
+    expect(statuses.some((s) => s.includes('making the 3D model: 40%')), statuses.slice(-8).join(' | '));
+    const names = await page.$$eval('.tree-row .name', (els) => els.map((e) => e.textContent));
+    expect(names.includes('assets'), `tree: ${names}`);
   });
   await page.close();
 

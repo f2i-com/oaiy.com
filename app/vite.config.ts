@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { copyBridge, installBridge } from './scripts/softn-bridge/install.mjs';
+import { buildViewer } from './scripts/modelview/build.mjs';
 
 // The sandbox blocks a Worker on SharedArrayBuffer + Atomics.wait while the
 // page answers its host calls, which needs a cross-origin isolated page.
@@ -18,10 +19,12 @@ const isolation = {
 const softnHeaders = {
   name: 'softn-runtime-headers',
   // The runtime in public/softn/ and the web page preview in public/webpage/ get
-  // bot.computer's bridge (errors, inspect, act, screenshot).
-  buildStart() {
+  // bot.computer's bridge (errors, inspect, act, screenshot); the 3D model
+  // preview in public/modelview/ gets its viewer.
+  async buildStart() {
     installBridge('public/softn');
     copyBridge('public/webpage');
+    await buildViewer();
   },
   configureServer(server: { middlewares: { use: (fn: (req: { url?: string }, res: { setHeader: (k: string, v: string) => void }, next: () => void) => void) => void } }) {
     server.middlewares.use(softnMiddleware);

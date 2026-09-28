@@ -1,6 +1,6 @@
 /**
- * Images, video, speech and music for the agent, from an OpenAI-spec media
- * service: nrob (found through its discovery document), or any server with
+ * Images, video, speech, music and 3D models for the agent, from an OpenAI-spec
+ * media service: nrob (found through its discovery document), or any server with
  * `/images/generations`, `/videos` and `/audio/speech`. The page calls it directly, as it
  * calls the AI provider: it is the person's own service, set up in Settings,
  * so these requests are not behind the network gate.
@@ -66,6 +66,20 @@ export interface SoundModelInfo {
   channels?: number;
 }
 
+/** A 3D model maker (nrob's Pixal3D): a picture of one object in, a GLB mesh out. */
+export interface Model3dModelInfo {
+  id: string;
+  default?: boolean;
+  /** The resolutions it makes models at (1024, 1536). */
+  resolutions?: number[];
+  /** The simplified mesh's triangle budget when none is asked for. */
+  faces?: number;
+  /** False while the service cannot make models with it yet. */
+  ready?: boolean;
+  /** The terms of the model's weights and what it makes, when nrob says. */
+  license?: string;
+}
+
 /** A voice saved on the server (designed once from a description). */
 export interface VoiceInfo {
   name: string;
@@ -99,14 +113,16 @@ export interface MediaSettings {
   speechModel?: string;
   musicModel?: string;
   soundModel?: string;
+  model3dModel?: string;
   speechModels?: SpeechModelInfo[];
   musicModels?: MusicModelInfo[];
   soundModels?: SoundModelInfo[];
+  model3dModels?: Model3dModelInfo[];
   /** Saved voices, and the OpenAI voice names the service also takes. */
   voices?: VoiceInfo[];
   openaiVoices?: string[];
   /** Full URLs from a discovery document (nrob's routes are configurable). */
-  endpoints?: { images?: string; edits?: string; videos?: string; speech?: string; voices?: string; music?: string; sound?: string };
+  endpoints?: { images?: string; edits?: string; videos?: string; speech?: string; voices?: string; music?: string; sound?: string; model3d?: string };
   /** Set when the details came from nrob's discovery document. */
   discovered?: { service: string; version: string; origin: string; at: number };
 }
@@ -117,7 +133,7 @@ export const EMPTY_MEDIA: MediaSettings = { baseUrl: '', apiKey: '', enabled: tr
 export const NROB_ORIGIN = 'http://127.0.0.1:8080';
 
 /** What the agent can make with these settings. */
-export function mediaReady(media: MediaSettings | null | undefined): { image: boolean; video: boolean; speech: boolean; music: boolean; sound: boolean } {
+export function mediaReady(media: MediaSettings | null | undefined): { image: boolean; video: boolean; speech: boolean; music: boolean; sound: boolean; model3d: boolean } {
   const on = !!media && media.enabled && !!media.baseUrl.trim();
   return {
     image: on && !!(media!.imageModel || media!.imageModels.length),
@@ -125,13 +141,14 @@ export function mediaReady(media: MediaSettings | null | undefined): { image: bo
     speech: on && !!(media!.speechModel || media!.speechModels?.length),
     music: on && !!(media!.musicModel || media!.musicModels?.length),
     sound: on && !!(media!.soundModel || media!.soundModels?.length),
+    model3d: on && !!(media!.model3dModel || media!.model3dModels?.length),
   };
 }
 
 /** What the service can make, in words ("images, video and speech"). */
 export function mediaAbilities(media: MediaSettings | null | undefined): string {
   const ready = mediaReady(media);
-  const can = [ready.image && 'images', ready.video && 'video', ready.speech && 'speech', ready.music && 'music', ready.sound && 'sound effects'].filter(Boolean) as string[];
+  const can = [ready.image && 'images', ready.video && 'video', ready.speech && 'speech', ready.music && 'music', ready.sound && 'sound effects', ready.model3d && '3D models'].filter(Boolean) as string[];
   return can.length > 1 ? `${can.slice(0, -1).join(', ')} and ${can[can.length - 1]}` : can[0] ?? '';
 }
 
@@ -151,7 +168,7 @@ export function mediaBase(address: string): string {
   return `${url.origin}${path}`;
 }
 
-function endpointsOf(media: MediaSettings): { images: string; edits: string; videos: string; models: string; speech: string; voices: string; music: string; sound: string } {
+function endpointsOf(media: MediaSettings): { images: string; edits: string; videos: string; models: string; speech: string; voices: string; music: string; sound: string; model3d: string } {
   const base = mediaBase(media.baseUrl);
   const trim = (url: string) => url.replace(/\/+$/, '');
   return {
@@ -163,6 +180,7 @@ function endpointsOf(media: MediaSettings): { images: string; edits: string; vid
     voices: trim(media.endpoints?.voices ?? `${base}/audio/voices`),
     music: trim(media.endpoints?.music ?? `${base}/audio/music`),
     sound: trim(media.endpoints?.sound ?? `${base}/audio/sound_effects`),
+    model3d: trim(media.endpoints?.model3d ?? `${base}/3d/models`),
   };
 }
 
@@ -302,6 +320,14 @@ export function readDiscovery(doc: Json, origin: string): Extract<Discovery, { s
     sampleRate: num(m.sample_rate),
     channels: num(m.channels),
   }));
+  const model3dModels: Model3dModelInfo[] = list(models.model3d).filter((m) => str(m.id)).map((m) => ({
+    id: String(m.id),
+    default: bool(m.default),
+    resolutions: Array.isArray(m.resolutions) ? m.resolutions.filter((r): r is number => typeof r === 'number') : undefined,
+    faces: num(m.faces),
+    ready: bool(m.ready),
+    license: str(m.license),
+  }));
   const voiceDoc = isRecord(doc.voices) ? doc.voices : {};
   const voices: VoiceInfo[] = list(voiceDoc.saved).map((v) => ({ name: str(v.name) ?? str(v.id) ?? '', description: str(v.description), language: str(v.language) })).filter((v) => v.name);
   const openaiVoices = Array.isArray(voiceDoc.openai_names) ? voiceDoc.openai_names.filter((n): n is string => typeof n === 'string') : [];
@@ -318,12 +344,13 @@ export function readDiscovery(doc: Json, origin: string): Extract<Discovery, { s
     media: {
       ...EMPTY_MEDIA,
       baseUrl: base,
-      endpoints: { images: urlOf('images'), edits: urlOf('edits'), videos: urlOf('videos'), speech: urlOf('speech'), voices: urlOf('voices'), music: urlOf('music'), sound: urlOf('sound') },
+      endpoints: { images: urlOf('images'), edits: urlOf('edits'), videos: urlOf('videos'), speech: urlOf('speech'), voices: urlOf('voices'), music: urlOf('music'), sound: urlOf('sound'), model3d: urlOf('model3d') },
       imageModels,
       videoModels,
       speechModels,
       musicModels,
       soundModels,
+      model3dModels,
       voices,
       openaiVoices,
       imageModel: str(defaults.image) ?? imageModels.find((m) => m.default)?.id ?? imageModels[0]?.id,
@@ -331,6 +358,7 @@ export function readDiscovery(doc: Json, origin: string): Extract<Discovery, { s
       speechModel: str(defaults.speech) ?? speechModels.find((m) => m.default)?.id ?? speechModels[0]?.id,
       musicModel: str(defaults.music) ?? musicModels.find((m) => m.default)?.id ?? musicModels[0]?.id,
       soundModel: str(defaults.sound) ?? soundModels.find((m) => m.default)?.id ?? soundModels[0]?.id,
+      model3dModel: str(defaults.model3d) ?? model3dModels.find((m) => m.default)?.id ?? model3dModels[0]?.id,
       discovered: { service, version, origin, at: Date.now() },
     },
     llm: {
@@ -394,19 +422,22 @@ export function mergeDiscovered(current: MediaSettings, found: MediaSettings): M
   const keepSpeech = current.speechModel && found.speechModels?.some((m) => m.id === current.speechModel) ? current.speechModel : found.speechModel;
   const keepMusic = current.musicModel && found.musicModels?.some((m) => m.id === current.musicModel) ? current.musicModel : found.musicModel;
   const keepSound = current.soundModel && found.soundModels?.some((m) => m.id === current.soundModel) ? current.soundModel : found.soundModel;
-  return { ...found, apiKey: current.apiKey, enabled: current.baseUrl ? current.enabled : true, imageModel: keepImage, videoModel: keepVideo, speechModel: keepSpeech, musicModel: keepMusic, soundModel: keepSound };
+  const keepModel3d = current.model3dModel && found.model3dModels?.some((m) => m.id === current.model3dModel) ? current.model3dModel : found.model3dModel;
+  return { ...found, apiKey: current.apiKey, enabled: current.baseUrl ? current.enabled : true, imageModel: keepImage, videoModel: keepVideo, speechModel: keepSpeech, musicModel: keepMusic, soundModel: keepSound, model3dModel: keepModel3d };
 }
 
-/** The image, video, speech, music and sound effects models a server lists: typed (nrob), else guessed from their names. */
-export async function listMediaModels(media: MediaSettings, signal?: AbortSignal): Promise<{ image: string[]; video: string[]; speech: string[]; music: string[]; sound: string[] }> {
+/** The image, video, speech, music, sound effects and 3D models a server lists: typed (nrob), else guessed from their names. */
+export async function listMediaModels(media: MediaSettings, signal?: AbortSignal): Promise<{ image: string[]; video: string[]; speech: string[]; music: string[]; sound: string[]; model3d: string[] }> {
   const resp = await request(endpointsOf(media).models, { apiKey: media.apiKey, what: 'Listing the models' }, signal ?? AbortSignal.timeout(10_000));
   const body = (await resp.json()) as Json;
-  const found = { image: [] as string[], video: [] as string[], speech: [] as string[], music: [] as string[], sound: [] as string[] };
+  const found = { image: [] as string[], video: [] as string[], speech: [] as string[], music: [] as string[], sound: [] as string[], model3d: [] as string[] };
   for (const m of list(body.data)) {
     const id = str(m.id);
     if (!id) continue;
     const type = str(m.type);
-    if (type === 'image' || (!type && /dall-e|gpt-image|image|flux|sdxl|stable-diffusion/i.test(id))) found.image.push(id);
+    // 3D first: a name like "hunyuan3d" or "image-to-3d" is not an image model.
+    if (type === 'model3d' || (!type && /3d|pixal|trellis|triposr/i.test(id))) found.model3d.push(id);
+    else if (type === 'image' || (!type && /dall-e|gpt-image|image|flux|sdxl|stable-diffusion/i.test(id))) found.image.push(id);
     else if (type === 'video' || (!type && /sora|video|veo|ltx|wan/i.test(id))) found.video.push(id);
     else if (type === 'speech' || (!type && /tts|speech/i.test(id))) found.speech.push(id);
     else if (type === 'music' || (!type && /music|song/i.test(id))) found.music.push(id);
@@ -590,6 +621,60 @@ export async function generateSoundEffect(media: MediaSettings, req: SoundEffect
   const content = await request(`${ep.sound}/${encodeURIComponent(id)}/content${format === 'wav' ? '' : `?format=${format}`}`, { apiKey: media.apiKey, what: 'Downloading the sound effect' }, signal);
   const seconds = num(job.seconds) ?? (str(job.seconds) ? Number(job.seconds) : undefined);
   return { bytes: new Uint8Array(await content.arrayBuffer()), seconds, model: str(job.model) ?? model ?? 'default' };
+}
+
+// --- 3D models ---------------------------------------------------------------
+
+export interface Model3dRequest {
+  /** A picture of one object, whole and centred, on a plain or transparent background. */
+  image: MediaFile;
+  /** 1024 or 1536: finer detail at 1536, and slower. */
+  resolution?: number;
+  /** The simplified mesh's triangle budget. */
+  faces?: number;
+  /** The camera the picture was taken with, in degrees (30 when not given). */
+  fovDegrees?: number;
+  seed?: number;
+  model?: string;
+}
+
+export interface Model3dResult {
+  /** The model: glTF 2.0 binary, Y up, its front facing +Z, fitted in a unit cube. */
+  glb: Uint8Array;
+  /** The picture as the service cut the object out of it (PNG), when it gave it. */
+  cutout?: Uint8Array;
+  faces?: number;
+  vertices?: number;
+  /** How long the service took to make it. */
+  seconds?: number;
+  model: string;
+}
+
+/** Start a 3D model job from a picture, follow it, and download the GLB and the cut-out picture. */
+export async function generate3dModel(media: MediaSettings, req: Model3dRequest, onProgress: (message: string) => void, signal?: AbortSignal): Promise<Model3dResult> {
+  const ep = endpointsOf(media);
+  const model = req.model || media.model3dModel;
+  const body: Json = { image: dataUrl(req.image), model };
+  if (req.resolution !== undefined) body.resolution = req.resolution;
+  if (req.faces !== undefined) body.faces = req.faces;
+  if (req.fovDegrees !== undefined) body.fov_degrees = req.fovDegrees;
+  if (req.seed !== undefined) body.seed = req.seed;
+  const created = await request(ep.model3d, { method: 'POST', body: JSON.stringify(body), headers: { 'Content-Type': 'application/json' }, apiKey: media.apiKey, what: 'Starting the 3D model' }, signal);
+  const { id, job } = await followJob(media, ep.model3d, (await created.json()) as Json, '3D model', onProgress, signal, (jobId) =>
+    fetch(`${ep.model3d}/${encodeURIComponent(jobId)}/cancel`, { method: 'POST', headers: authHeaders(media.apiKey) }));
+  onProgress('downloading the 3D model…');
+  const content = await request(`${ep.model3d}/${encodeURIComponent(id)}/content`, { apiKey: media.apiKey, what: 'Downloading the 3D model' }, signal);
+  const glb = new Uint8Array(await content.arrayBuffer());
+  if (!glb.length) throw new MediaError('The 3D model service answered without a model.');
+  // The cut-out shows what the model was made from; a service without it still made the model.
+  let cutout: Uint8Array | undefined;
+  try {
+    const input = await request(`${ep.model3d}/${encodeURIComponent(id)}/input`, { apiKey: media.apiKey, what: 'Downloading the cut-out picture' }, signal);
+    cutout = new Uint8Array(await input.arrayBuffer());
+  } catch (error) {
+    if (signal?.aborted || !(error instanceof MediaError)) throw error;
+  }
+  return { glb, cutout: cutout?.length ? cutout : undefined, faces: num(job.faces), vertices: num(job.vertices), seconds: num(job.seconds_taken), model: str(job.model) ?? model ?? 'default' };
 }
 
 // --- Images ----------------------------------------------------------------

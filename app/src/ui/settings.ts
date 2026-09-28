@@ -64,7 +64,7 @@ export function openSettings(initial: SettingsResult): Promise<SettingsResult | 
     let providers = initial.providers.map((p) => ({ ...p }));
     let activeId = initial.activeId;
     const agent = { ...initial.agent };
-    let media: MediaSettings = { ...initial.media, imageModels: [...initial.media.imageModels], videoModels: [...initial.media.videoModels], speechModels: [...(initial.media.speechModels ?? [])], musicModels: [...(initial.media.musicModels ?? [])], soundModels: [...(initial.media.soundModels ?? [])] };
+    let media: MediaSettings = { ...initial.media, imageModels: [...initial.media.imageModels], videoModels: [...initial.media.videoModels], speechModels: [...(initial.media.speechModels ?? [])], musicModels: [...(initial.media.musicModels ?? [])], soundModels: [...(initial.media.soundModels ?? [])], model3dModels: [...(initial.media.model3dModels ?? [])] };
     let editing: ProviderConfig | null = providers.find((p) => p.id === activeId) ?? providers[0] ?? null;
     // Model lists already fetched, by server address and key, so a re-render
     // (typing a name, switching rows) does not lose them.
@@ -249,10 +249,10 @@ export function openSettings(initial: SettingsResult): Promise<SettingsResult | 
         }
       } }) as HTMLInputElement;
       const key = h('input', { type: 'password', value: media.apiKey, placeholder: 'usually none', oninput: () => { media.apiKey = key.value.trim(); } }) as HTMLInputElement;
-      const modelInput = (kind: 'image' | 'video' | 'speech' | 'music' | 'sound') => {
+      const modelInput = (kind: 'image' | 'video' | 'speech' | 'music' | 'sound' | 'model3d') => {
         const listId = `media-${kind}-models`;
-        const field = `${kind}Model` as 'imageModel' | 'videoModel' | 'speechModel' | 'musicModel' | 'soundModel';
-        const ids = ((kind === 'image' ? media.imageModels : kind === 'video' ? media.videoModels : kind === 'speech' ? media.speechModels : kind === 'music' ? media.musicModels : media.soundModels) ?? []).map((m) => m.id);
+        const field = `${kind}Model` as 'imageModel' | 'videoModel' | 'speechModel' | 'musicModel' | 'soundModel' | 'model3dModel';
+        const ids = ((kind === 'image' ? media.imageModels : kind === 'video' ? media.videoModels : kind === 'speech' ? media.speechModels : kind === 'music' ? media.musicModels : kind === 'sound' ? media.soundModels : media.model3dModels) ?? []).map((m) => m.id);
         const input = h('input', { list: listId, value: media[field] ?? '', placeholder: ids.length ? 'choose or type a model' : 'type a model name', oninput: () => {
           media[field] = input.value.trim() || undefined;
         } }) as HTMLInputElement;
@@ -297,13 +297,15 @@ export function openSettings(initial: SettingsResult): Promise<SettingsResult | 
           media.speechModels = found.speech.map((id) => media.speechModels?.find((m) => m.id === id) ?? { id });
           media.musicModels = found.music.map((id) => media.musicModels?.find((m) => m.id === id) ?? { id });
           media.soundModels = found.sound.map((id) => media.soundModels?.find((m) => m.id === id) ?? { id });
+          media.model3dModels = found.model3d.map((id) => media.model3dModels?.find((m) => m.id === id) ?? { id });
           media.speechModel ??= found.speech[0];
           media.musicModel ??= found.music[0];
           media.soundModel ??= found.sound[0];
+          media.model3dModel ??= found.model3d[0];
           media.imageModel ??= found.image[0];
           media.videoModel ??= found.video[0];
           renderMedia();
-          (mediaSection.querySelector('.form-note') as HTMLElement).textContent = `${found.image.length} image, ${found.video.length} video, ${found.speech.length} speech, ${found.music.length} music and ${found.sound.length} sound effects models.`;
+          (mediaSection.querySelector('.form-note') as HTMLElement).textContent = `${found.image.length} image, ${found.video.length} video, ${found.speech.length} speech, ${found.music.length} music, ${found.sound.length} sound effects and ${found.model3d.length} 3D models.`;
         } catch (error) {
           note.textContent = (error as Error).message;
         }
@@ -311,7 +313,7 @@ export function openSettings(initial: SettingsResult): Promise<SettingsResult | 
       const enabled = h('input', { type: 'checkbox', checked: media.enabled, onchange: () => { media.enabled = enabled.checked; } }) as HTMLInputElement;
       mediaSection.append(
         h('strong', 'Images, video and audio'),
-        h('p.muted', `The agent can make pictures, short videos, speech, music and sound effects with a media service: nrob is found on its own, and any server with OpenAI's /v1/images/generations, /v1/videos and /v1/audio/speech works. Now: ${status}${media.baseUrl ? ` (${abilities || 'no models chosen'})` : ''}.`),
+        h('p.muted', `The agent can make pictures, short videos, speech, music, sound effects and 3D models with a media service: nrob is found on its own, and any server with OpenAI's /v1/images/generations, /v1/videos and /v1/audio/speech works. Now: ${status}${media.baseUrl ? ` (${abilities || 'no models chosen'})` : ''}.`),
         h('div.provider-form',
           h('label', 'Address', h('div.window-picker', address, find, listButton)),
           h('label', 'API key', key),
@@ -320,8 +322,9 @@ export function openSettings(initial: SettingsResult): Promise<SettingsResult | 
           h('label', 'Speech', modelInput('speech')),
           h('label', 'Music', modelInput('music')),
           h('label', 'Sound effects', modelInput('sound')),
+          h('label', '3D models', modelInput('model3d')),
         ),
-        h('label', enabled, ' Let the agent make images, video, speech, music and sound effects'),
+        h('label', enabled, ' Let the agent make images, video, speech, music, sound effects and 3D models'),
         note,
       );
     };

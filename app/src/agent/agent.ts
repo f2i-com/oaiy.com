@@ -20,6 +20,7 @@ import { queueFor } from './queue';
 import type { ToolSpec } from './protocol';
 import { appLabel, findApps, resolveApp } from '../softn/softn';
 import { findPages } from '../preview/page';
+import { findModels } from '../preview/model';
 import { imageMimeFor, viewImage, type ImagePart } from './images';
 
 export type AgentEvent =
@@ -157,6 +158,9 @@ const KEEP_IMAGE_TURNS = 3;
 /** How to make media: only when the media service's tools are there. */
 const MEDIA_MAKE_GUIDE = `- generate_image, generate_video, generate_speech, create_voice, generate_music and generate_sound_effect, when they are among your tools, make pictures, short videos (talking ones too), speech, music and sound effects with the user's media service and save them in the project; media_compose lays sound effects and music under clips. Write concrete prompts, save under sensible paths, and look at an image with view_image before relying on it. Every video clip is at most 5 seconds and has a start and an end frame, each made new with generate_image from the scene's background and the character images (never a character image itself), and animates between them, its prompt describing the motion from start to end (what the characters do, how the camera moves), not the scene the frames already show. For dialogue, give each character a saved voice with create_voice and use it for every line they speak, and show only the speaker, alone in close-up, while they talk (see generate_video for how).
 `;
+/** How to make a 3D model: only when the 3D model tool is there. */
+const MODEL3D_GUIDE = `- generate_3d_model makes a 3D model (a GLB mesh) of one object from a picture of it: a 3D asset for a game, a scene or a product page. Make the picture first with generate_image: the object alone, the whole of it in view and centred, on a plain white or grey background, in soft even light, from a three-quarter view (its front and one side visible), with no text and no other objects; look at it with view_image and make it again if it is off. Then make the model from it with generate_3d_model, and look at it before using it: preview_screenshot with the model's path shows it from four sides in one image (yaw and pitch show it from any other angle); make it again, from a better picture, if it is off. To use it, put it in a SoftN app's assets/ folder and show it with a Scene3D (the app guide has the syntax); a web page cannot show 3D.
+`;
 /** How to make a video with a story: from a script, shot by shot. */
 const VIDEO_SCRIPT_GUIDE = `- Every video the user asks for is made from a plan and a script, however short or vague the request, written and revised before any picture or clip is made. What the user asked for comes first: everything their request says (the story and what happens in it, the characters and how they look, what they say, the places, how many scenes or how long, the style, what to do or avoid) goes into the script as they said it. The rules below only fill in what the request leaves open, and never override it. Start with update_plan: writing the script is its first step, then one step per scene, then joining the clips. A vague request ("a video of a cat", "make something fun") becomes a short scene of your own making: a premise with a small beginning, middle and end, told in 3 to 6 shots of varied framing (an establishing wide shot, closer shots of the action, a reaction or a detail), about 10 to 25 seconds in all, joined with media_compose. Only when the user asks for exactly one clip is it a single shot. Give the video its own folder (video/NAME/) with script.md in it, and its frames, clips and audio beside it. The script has these parts, under these headings (a reviewer finds each picture's part of the script by them):
   ## Premise: what the video is about, in a few sentences: who wants what, what stands in their way, and how it ends. Every scene moves this story on; nothing happens at random.
@@ -203,7 +207,7 @@ const HEARD_BY_TASK = '[The user sent this while you worked on your task (the ma
 const HEARD_BY_REVIEWER = '[The user sent this while you reviewed the picture (the main agent has it too). If it is about this picture, judge the picture by it as well. Anything else is for the main agent: carry on with the review.]';
 
 /** The tools that make a picture, a clip or a sound: before the first after a video's script is written, the script is checked against the request. */
-const MAKE_TOOLS = new Set(['generate_image', 'generate_video', 'generate_speech', 'generate_music', 'generate_sound_effect', 'create_voice']);
+const MAKE_TOOLS = new Set(['generate_image', 'generate_video', 'generate_speech', 'generate_music', 'generate_sound_effect', 'generate_3d_model', 'create_voice']);
 
 const MEDIA_EDIT_GUIDE = `- media_info, video_frames, video_split and media_compose edit video and sound in the project, in the browser: read what a file holds, take frames out (to check a clip, or to take the last frame it really ended on), cut, join clips and pictures, and lay music, speech and effects over a whole video with volume, fades and ducking. To make a longer video: make its clips (each a cut, or continuous: starting on the last frame the clip before really ended on, from video_frames with last: true, so the motion flows on), then compose them with the soundtrack (trimming a continuous clip's first frame).
 `;
@@ -226,7 +230,7 @@ type GuideTopic = 'app' | 'web' | 'video' | 'media' | 'document';
 /** What each guide is for, as the guide tool lists them. */
 const GUIDE_ABOUT: Record<GuideTopic, string> = {
   video: 'making a video, film, animation or any story told in clips: the script, pictures, voices and clips',
-  media: 'making pictures, speech, voices, music or sound effects',
+  media: 'making pictures, speech, voices, music, sound effects or 3D models',
   app: 'building or changing an app (a SoftN app: pages, logic and a live preview); it also gives you the app tools',
   web: 'building or changing a web page or website (HTML, CSS and JavaScript, with a live preview, screenshots and screen sizes); it also gives you the page tools',
   document: 'writing a long document: a story, a script, a report',
@@ -235,7 +239,7 @@ const GUIDE_ABOUT: Record<GuideTopic, string> = {
 /** Requests that plainly ask for a kind of work: its guide is read with them. */
 const GUIDE_WORDS: Array<[GuideTopic, RegExp]> = [
   ['video', /\b(videos?|clips?|films?|movies?|animat\w*|sitcoms?|episodes?|trailers?|cartoons?|vlogs?|commercials?)\b/i],
-  ['media', /\b(images?|pictures?|photos?|drawings?|illustrations?|logos?|posters?|portraits?|songs?|music|voices?|speech|narrat\w*|podcasts?|sound effects?)\b/i],
+  ['media', /\b(images?|pictures?|photos?|drawings?|illustrations?|logos?|posters?|portraits?|songs?|music|voices?|speech|narrat\w*|podcasts?|sound effects?|3-?d[ -]?(?:models?|assets?|objects?|props?|meshe?s?|prints?|characters?)|in 3-?d|three-dimensional|meshe?s?|glb|gltf)\b/i],
   ['app', /\b(apps?|softn|dashboard|calculator|games?|to-?do list)\b/i],
   ['web', /\b(websites?|web ?sites?|web ?pages?|landing pages?|home ?pages?|html|css|responsive)\b/i],
   ['document', /\b(stor(?:y|ies)|essays?|reports?|books?|chapters?|novels?|articles?|screenplays?|poems?)\b/i],
@@ -260,12 +264,14 @@ const WEB_FILE = /\.html?$/i;
 
 const APP_GUIDE = `- A SoftN app is a folder whose manifest.json names a .ui page as "main" (with ui/*.ui pages and logic/*.logic or .py). A project can hold several, each in its own folder: to rebuild or learn from an existing app, read its files and write the new one in another folder. A .softn the user attaches is unpacked into its own folder (the original stays in uploads/, and softn_import unpacks any .softn in the project): when they ask for changes, edit that folder; when they ask to recreate, redo or base something on it, write a new app in a new folder and leave the original as it is. The SoftN reference is in your tools, so do not guess the language: softn_docs with no arguments gives the map, topic "guide" is the writing guide (read it before your first app), search finds how something is done across the guides, the components and the example apps; softn_components gives exact props and events; softn_examples has complete working apps to read or copy. Keep manifest.json true. After each step that changes an app, bot.computer checks it automatically (its files, then a real render) and adds the outcome to that step's result: when it reports errors, fix them before anything else. softn_check checks on demand; softn_inspect shows what the page displays; softn_interact uses the app like a person (click, fill, select, press keys) and reports errors the app raises, so test that the app works, not just that it renders. The user watches the app in a live preview as you build it, and can export any app folder as a .softn file.
 - preview_screenshot shows you how the app looks (look at it and fix what looks wrong), and preview_viewport sets the screen size it is shown at (phone, tablet, laptop, desktop or any size) for responsive layouts.
+- A 3D model (a .glb, such as generate_3d_model makes) goes in the app's assets/ folder, listed under "assets" in manifest.json's files, and shows in a Scene3D as an object of type "model" whose modelUrl is asset("assets/…"), written in the .ui markup (asset() is not available in logic), for example: <Scene3D fill={true} environment="studio" orbitControls={true} camera={{ position: { x: 1.2, y: 0.8, z: 1.6 }, lookAt: { x: 0, y: 0, z: 0 }, fov: 45 }} lights={[{ id: "key", type: "directional", color: "#ffffff", intensity: 2, position: { x: 3, y: 5, z: 4 } }]} objects={[{ id: "lamp", type: "model", modelUrl: asset("assets/models/lamp.glb"), position: { x: 0, y: 0, z: 0 }, scale: 1 }]} @modelState={onModel} />. A model from generate_3d_model fits a unit cube centred on the origin with its front facing +Z: scale and place it for the scene, and keep environment="studio" (its materials are often metallic, which looks dark under lights alone). @modelState reports a model that failed to load; preview_screenshot shows the scene as the app draws it (WebGL included), and with the model's own path, the model alone from four sides.
 - The app is done when it renders without errors and softn_interact shows it working.
 `;
 
 const WEB_GUIDE = `- A web page is an .html file of the project with its CSS, images and JavaScript beside it (say index.html, css/, js/, images/), linked by relative paths. The user watches it in a live preview as you build it; links between pages of the project open there too.
 - The preview runs the page's JavaScript on the Zipp VM against the page's real DOM, so write plain, classic browser JavaScript: <script src="js/app.js"> tags (several share globals and run in order), the DOM, addEventListener and on* attributes, timers and requestAnimationFrame, canvas, localStorage, and fetch of the project's own files (JSON, text). Not available: ES module import/export between files, JSX or anything needing a build step or npm packages, and the internet: CDN scripts, web fonts and remote images do not load, so put what the page needs in the project (use system font stacks).
 - After each change, page_check renders the page and reports script errors and files that did not load: fix them before anything else. page_inspect shows what the page displays; page_interact uses it like a person (click, fill, select, press keys), so test that it works, not just that it renders. preview_screenshot shows you how it looks: look at it, and fix what looks wrong (layout, spacing, alignment, overflow, contrast, cut-off text).
+- A page cannot show 3D: three.js and other WebGL libraries come from a CDN or as ES modules, and neither runs here. 3D scenes and models (.glb) belong in a SoftN app (Scene3D); preview_screenshot shows a .glb by itself.
 - Make pages responsive: preview_viewport sets the screen size (phone 390×844, tablet 820×1180, laptop 1366×768, desktop 1920×1080, or any size); check and screenshot at a phone size and a desktop size at least.
 - The page is done when page_check is clean, page_interact shows it working, and the screenshots at those sizes look right.
 `;
@@ -439,7 +445,7 @@ function withoutOldImages(turns: Turn[], keep = KEEP_IMAGE_TURNS): Turn[] {
 function guideTopics(names: Set<string>): GuideTopic[] {
   const topics: GuideTopic[] = [];
   if (names.has('generate_video')) topics.push('video');
-  if (['generate_image', 'generate_video', 'generate_speech', 'generate_music', 'generate_sound_effect', 'create_voice'].some((n) => names.has(n))) topics.push('media');
+  if (['generate_image', 'generate_video', 'generate_speech', 'generate_music', 'generate_sound_effect', 'generate_3d_model', 'create_voice'].some((n) => names.has(n))) topics.push('media');
   if ([...SOFTN_TOOLS].some((n) => names.has(n)) || names.has('guide')) topics.push('app');
   if ([...WEB_TOOLS].some((n) => names.has(n)) || names.has('guide')) topics.push('web');
   topics.push('document');
@@ -622,7 +628,9 @@ export class Agent {
     // The app tools only once there is an app to work on: otherwise they only distract.
     const apps = this.loadedGuides().has('app') || findApps(this.options.vfs).length > 0;
     const web = this.loadedGuides().has('web') || findPages(this.options.vfs).length > 0;
-    const tools = all.filter((t) => (apps || !SOFTN_TOOLS.has(t.name)) && (web || !WEB_TOOLS.has(t.name)) && (apps || web || !PREVIEW_TOOLS.has(t.name)));
+    // The preview also shows 3D models: those in the project, and those the agent can make.
+    const models = all.some((t) => t.name === 'generate_3d_model') || findModels(this.options.vfs).length > 0;
+    const tools = all.filter((t) => (apps || !SOFTN_TOOLS.has(t.name)) && (web || !WEB_TOOLS.has(t.name)) && (apps || web || models || !PREVIEW_TOOLS.has(t.name)));
     const topics = guideTopics(new Set(all.map((t) => t.name)));
     return [...tools, {
       name: 'guide',
@@ -652,9 +660,10 @@ export class Agent {
     if (topic === 'app') return APP_GUIDE;
     if (topic === 'web') return WEB_GUIDE;
     if (topic === 'document') return DOCUMENT_GUIDE;
-    if (topic === 'media') return MEDIA_MAKE_GUIDE + edit;
+    const make = MEDIA_MAKE_GUIDE + (has('generate_3d_model') ? MODEL3D_GUIDE : '');
+    if (topic === 'media') return make + edit;
     const script = has('media_compose') ? VIDEO_SCRIPT_GUIDE : VIDEO_SCRIPT_BRIEF;
-    return MEDIA_MAKE_GUIDE + script + (script === VIDEO_SCRIPT_GUIDE && this.canDelegate ? VIDEO_DELEGATE_GUIDE : '') + edit;
+    return make + script + (script === VIDEO_SCRIPT_GUIDE && this.canDelegate ? VIDEO_DELEGATE_GUIDE : '') + edit;
   }
 
   /** The guide tool: the guide joins the instructions (from the next step on). */

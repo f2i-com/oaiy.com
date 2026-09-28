@@ -36,7 +36,8 @@
     "codemirror": "^6.0.2",
     "fflate": "^0.8.3",
     "mediabunny": "^1.60.0",
-    "modern-screenshot": "^4.7.0"
+    "modern-screenshot": "^4.7.0",
+    "three": "^0.186.1"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.11.5",

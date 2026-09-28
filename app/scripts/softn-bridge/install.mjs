@@ -7,7 +7,7 @@
  * scripts/fetch-softn.mjs after an install and by vite.config.ts on every dev
  * server and build, so an existing install gets them too.
  */
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -39,11 +39,40 @@ export function copyBridge(dir) {
   }
 }
 
+/**
+ * The hosted runtime makes asset() URLs only for images, sounds and fonts, as
+ * data: URLs, so asset("assets/x.glb") comes back empty and a Scene3D model
+ * never loads (and Scene3D refuses a model's data: URL anyway). In the file
+ * that receives the app, these edits add glTF models to the runtime's list of
+ * asset types and make their URLs blob: URLs, which Scene3D accepts. Each is
+ * [the runtime's code, as it reads, and what it becomes]; the code is matched
+ * exactly, and a release that words it differently is left as it is.
+ */
+const MODEL_ASSETS = [
+  ['woff2:`font/woff2`}', 'woff2:`font/woff2`,glb:`model/gltf-binary`,gltf:`model/gltf+json`}'],
+  ['c.set(t,`data:${e};base64,${n}`)', 'c.set(t,/^model\\//.test(e)?URL.createObjectURL(new Blob([Uint8Array.from(atob(n),e=>e.charCodeAt(0))],{type:e})):`data:${e};base64,${n}`)'],
+];
+
+/** Lets a SoftN app's Scene3D load a 3D model from its assets/ folder (see MODEL_ASSETS). */
+function allowModelAssets(dir) {
+  const assets = join(dir, 'assets');
+  if (!existsSync(assets)) return;
+  for (const name of readdirSync(assets)) {
+    if (!name.endsWith('.js')) continue;
+    const file = join(assets, name);
+    const code = readFileSync(file, 'utf8');
+    if (!code.includes('formlogic:init') || MODEL_ASSETS.every(([, to]) => code.includes(to))) continue;
+    if (!MODEL_ASSETS.every(([from]) => code.split(from).length === 2)) continue;
+    writeFileSync(file, MODEL_ASSETS.reduce((text, [from, to]) => text.replace(from, () => to), code));
+  }
+}
+
 /** Returns false when there is no runtime installed in `dir`. */
 export function installBridge(dir) {
   const index = join(dir, 'index.html');
   if (!existsSync(index)) return false;
   copyBridge(dir);
+  allowModelAssets(dir);
   const original = readFileSync(index, 'utf8');
   let html = original;
   for (const [mark, tag] of TAGS) {

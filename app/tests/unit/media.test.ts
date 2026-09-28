@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { EMPTY_MEDIA, createVoice, discoverNrob, generateImage, generateMusic, generateSoundEffect, generateSpeech, generateVideo, mediaAbilities, mediaBase, mediaReady, mergeDiscovered, readDiscovery, speechModelFor } from '../../src/agent/media';
-import { mediaTools } from '../../src/agent/tools';
+import { NetGate } from '../../src/gate/netgate';
+import { EMPTY_MEDIA, createVoice, discoverNrob, generate3dModel, generateImage, generateMusic, generateSoundEffect, generateSpeech, generateVideo, mediaAbilities, mediaBase, mediaReady, mergeDiscovered, readDiscovery, speechModelFor } from '../../src/agent/media';
+import { mediaTools, runTool, type ToolContext } from '../../src/agent/tools';
+import { Vfs } from '../../src/vfs/vfs';
 
 // nrob-studio's discovery document, as it answers /v1/discovery (trimmed).
 const DOC = {
@@ -18,6 +20,7 @@ const DOC = {
     { name: 'voices', method: 'GET', path: '/v1/audio/voices', url: 'http://127.0.0.1:8080/v1/audio/voices', spec: 'openai' },
     { name: 'music', method: 'POST', path: '/v1/audio/music', url: 'http://127.0.0.1:8080/v1/audio/music', spec: 'openai' },
     { name: 'sound', method: 'POST', path: '/v1/audio/sound_effects', url: 'http://127.0.0.1:8080/v1/audio/sound_effects', spec: 'openai' },
+    { name: 'model3d', method: 'POST', path: '/v1/3d/models', url: 'http://127.0.0.1:8080/v1/3d/models', spec: 'openai', models: ['pixal3d'] },
   ],
   models: {
     llm: [{ id: 'qwen3.8-27b', default: true, loaded: false, vision: false }, { id: 'qwen3.5-9b', default: false }],
@@ -29,8 +32,9 @@ const DOC = {
     speech: [{ id: 'qwen3-tts', default: true, engine: 'qwen3-tts', license: 'apache-2.0', described_voices: true, saved_voices: true, sample_rate: 24000 }],
     music: [{ id: 'minimax-music3', default: true, max_seconds: 360, sample_rate: 44100, channels: 2 }],
     sound: [{ id: 'moss-soundeffect', default: true, max_seconds: 30, sample_rate: 48000, channels: 1 }],
+    model3d: [{ id: 'pixal3d', default: true, format: 'glb', resolutions: [1024, 1536], faces: 200000, input: 'a picture of one object on a plain or transparent background', ready: true, license: "MIT (Pixal3D); DINOv3 under Meta's DINOv3 License" }],
   },
-  defaults: { llm: 'qwen3.8-27b', image: 'qwen-image-turbo-q4', video: 'sulphur-2', speech: 'qwen3-tts', music: 'minimax-music3', sound: 'moss-soundeffect' },
+  defaults: { llm: 'qwen3.8-27b', image: 'qwen-image-turbo-q4', video: 'sulphur-2', speech: 'qwen3-tts', music: 'minimax-music3', sound: 'moss-soundeffect', model3d: 'pixal3d' },
   voices: { saved: [{ id: 'Narrator', name: 'Narrator', description: 'A deep, calm male narrator', language: 'english' }], openai_names: ['alloy', 'onyx'] },
   llm: { state: 'stopped', context_tokens: 32768, starts_on_demand: true },
 };
@@ -49,8 +53,11 @@ describe('nrob discovery', () => {
     expect(found.media.imageModels[1]).toMatchObject({ id: 'unholy-desire-sdxl', edits: false, sizeStep: 64, negativePrompt: true });
     expect(found.media.videoModels[0]).toMatchObject({ maxSeconds: 5, maxSide: 1024, startImage: true, fps: 24 });
     expect(found.llm).toEqual({ base: 'http://127.0.0.1:8080/v1', models: ['qwen3.8-27b', 'qwen3.5-9b'], default: 'qwen3.8-27b', contextTokens: 32768 });
-    expect(mediaReady(found.media)).toEqual({ image: true, video: true, speech: true, music: true, sound: true });
-    expect(mediaAbilities(found.media)).toBe('images, video, speech, music and sound effects');
+    expect(mediaReady(found.media)).toEqual({ image: true, video: true, speech: true, music: true, sound: true, model3d: true });
+    expect(mediaAbilities(found.media)).toBe('images, video, speech, music, sound effects and 3D models');
+    expect(found.media.model3dModel).toBe('pixal3d');
+    expect(found.media.model3dModels?.[0]).toMatchObject({ id: 'pixal3d', resolutions: [1024, 1536], faces: 200000, ready: true });
+    expect(found.media.endpoints?.model3d).toBe('http://127.0.0.1:8080/v1/3d/models');
     expect(found.media.soundModel).toBe('moss-soundeffect');
     expect(found.media.soundModels?.[0]).toMatchObject({ id: 'moss-soundeffect', maxSeconds: 30, sampleRate: 48000 });
     expect(found.media.endpoints?.sound).toBe('http://127.0.0.1:8080/v1/audio/sound_effects');
@@ -63,8 +70,9 @@ describe('nrob discovery', () => {
 
   it('keeps the key and a chosen model that still exists when found again', () => {
     const found = readDiscovery(DOC, 'http://127.0.0.1:8080').media;
-    const merged = mergeDiscovered({ ...found, apiKey: 'k', imageModel: 'unholy-desire-sdxl', videoModel: 'gone' }, found);
+    const merged = mergeDiscovered({ ...found, apiKey: 'k', imageModel: 'unholy-desire-sdxl', videoModel: 'gone', model3dModel: 'gone too' }, found);
     expect(merged.apiKey).toBe('k');
+    expect(merged.model3dModel).toBe('pixal3d');
     expect(merged.imageModel).toBe('unholy-desire-sdxl');
     expect(merged.videoModel).toBe('sulphur-2');
   });
@@ -230,6 +238,52 @@ describe('media requests', () => {
     expect(effect).toMatchObject({ seconds: 4, model: 'moss-soundeffect', bytes: new Uint8Array([1, 2, 3]) });
   });
 
+  it('makes 3D models as jobs from a picture, and downloads the model and the cut-out picture', async () => {
+    const calls: Array<{ url: string; method?: string; body?: Record<string, unknown> }> = [];
+    let polls = 0;
+    vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
+      calls.push({ url, method: init?.method, body: init?.body ? JSON.parse(String(init.body)) : undefined });
+      if (url.endsWith('/3d/models')) return json({ id: 'm3d_1', object: 'model3d', status: 'queued', progress: 0 });
+      if (url.endsWith('/m3d_1')) return json(++polls < 2 ? { id: 'm3d_1', status: 'in_progress', progress: 40, stage: 'shape' } : { id: 'm3d_1', status: 'completed', progress: 100, model: 'pixal3d', format: 'glb', faces: 200000, vertices: 100123, seconds_taken: 71.4, error: null });
+      if (url.endsWith('/m3d_1/content')) return new Response(new Uint8Array([103, 108, 84, 70]), { headers: { 'content-type': 'model/gltf-binary' } });
+      if (url.endsWith('/m3d_1/input')) return new Response(new Uint8Array([137, 80, 78, 71]), { headers: { 'content-type': 'image/png' } });
+      return json({}, 404);
+    }));
+    vi.useFakeTimers();
+    const progress: string[] = [];
+    const pending = generate3dModel(media, { image: { bytes: new Uint8Array([1, 2, 3]), mime: 'image/png', name: 'lamp.png' }, faces: 50000, resolution: 1536, seed: 7 }, (m) => progress.push(m));
+    await vi.runAllTimersAsync();
+    const made = await pending;
+    vi.useRealTimers();
+    expect(calls[0]).toEqual({ url: 'http://127.0.0.1:8080/v1/3d/models', method: 'POST', body: { image: 'data:image/png;base64,AQID', model: 'pixal3d', resolution: 1536, faces: 50000, seed: 7 } });
+    expect(calls.slice(-2).map((c) => c.url)).toEqual(['http://127.0.0.1:8080/v1/3d/models/m3d_1/content', 'http://127.0.0.1:8080/v1/3d/models/m3d_1/input']);
+    expect(progress).toEqual(['3D model queued, waiting for the GPU…', 'making the 3D model: 40%', 'downloading the 3D model…']);
+    expect(made).toMatchObject({ glb: new Uint8Array([103, 108, 84, 70]), cutout: new Uint8Array([137, 80, 78, 71]), faces: 200000, vertices: 100123, seconds: 71.4, model: 'pixal3d' });
+  });
+
+  it('saves a 3D model as .glb in the project with its cut-out picture beside it', async () => {
+    const sent: Array<Record<string, unknown>> = [];
+    vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
+      if (init?.method === 'POST') {
+        sent.push(JSON.parse(String(init.body)));
+        return json({ id: 'm3d_2', status: 'completed', model: 'pixal3d', faces: 20000, vertices: 10002, seconds_taken: 64 });
+      }
+      return new Response(new Uint8Array(url.endsWith('/content') ? 2_500_000 : 8));
+    }));
+    const vfs = new Vfs();
+    vfs.writeFile('/art/lamp.png', new Uint8Array([9, 9]), { parents: true });
+    vfs.writeFile('/art/lamp.gif', new Uint8Array([9]), { parents: true });
+    const ctx: ToolContext = { vfs, gate: new NetGate(), reads: new Map(), shell: { cwd: '/', env: {} }, media: () => media };
+    const made = await runTool({ id: '1', name: 'generate_3d_model', input: { image: 'art/lamp.png', path: 'assets/models/lamp.obj', faces: 20000, resolution: 2048 } }, ctx);
+    expect(sent[0]).toMatchObject({ image: 'data:image/png;base64,CQk=', faces: 20000, resolution: 1536 });
+    expect(made.files).toEqual(['assets/models/lamp.glb', 'assets/models/lamp.cutout.png']);
+    expect(vfs.readBytes('/assets/models/lamp.glb').byteLength).toBe(2_500_000);
+    expect(vfs.readBytes('/assets/models/lamp.cutout.png').byteLength).toBe(8);
+    expect(made.content).toBe('Saved /assets/models/lamp.glb (20,000 faces, 10,002 vertices, 2.5 MB, made in 64 s), made with pixal3d, and beside it the picture as the service cut the object out, /assets/models/lamp.cutout.png. Its front faces +Z, Y is up, and it fits a unit cube. Look at it with preview_screenshot (path: assets/models/lamp.glb) before using it.');
+    const gif = await runTool({ id: '2', name: 'generate_3d_model', input: { image: 'art/lamp.gif', path: 'assets/models/lamp.glb' } }, ctx);
+    expect(gif.isError && gif.content).toContain('png, jpg or webp');
+  });
+
   it('reports a failed job with the service\'s reason', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => json({ id: 'v', status: 'failed', error: { code: 'generation_failed', message: 'out of memory' } })));
     await expect(generateVideo(media, { prompt: 'x' }, () => {})).rejects.toThrow('out of memory');
@@ -240,8 +294,14 @@ describe('media tools', () => {
   it('are offered only when a service is set up, with the models described', () => {
     expect(mediaTools(EMPTY_MEDIA)).toEqual([]);
     const tools = mediaTools(readDiscovery(DOC, 'http://127.0.0.1:8080').media);
-    expect(tools.map((t) => t.name)).toEqual(['generate_image', 'generate_video', 'generate_speech', 'create_voice', 'generate_music', 'generate_sound_effect', 'review_frame']);
+    expect(tools.map((t) => t.name)).toEqual(['generate_image', 'generate_video', 'generate_speech', 'create_voice', 'generate_music', 'generate_sound_effect', 'generate_3d_model', 'review_frame']);
     expect(tools[5].description).toContain('moss-soundeffect (default): up to 30 s');
+    // A 3D model is made from a picture of the object alone, made first.
+    expect(tools[6].description).toContain('first make a picture for it with generate_image of the object alone: the whole object in view and centred, on a plain white or grey background, in soft even light, from a three-quarter view');
+    expect(tools[6].description).toContain('facing +Z');
+    expect(tools[6].description).toContain('about a minute and a half');
+    expect(tools[6].description).toContain('pixal3d (default): resolution 1024 or 1536, 200000 faces by default');
+    expect(Object.keys((tools[6].parameters as { properties: Record<string, unknown> }).properties)).toEqual(['image', 'path', 'faces', 'resolution', 'seed']);
     expect(tools[2].description).toContain('Voices: Narrator, alloy, onyx. Saved: Narrator (A deep, calm male narrator).');
     expect(tools[4].description).toContain('minimax-music3 (default): up to 360 s');
     expect(Object.keys((tools[1].parameters as { properties: Record<string, unknown> }).properties)).toEqual(expect.arrayContaining(['end_image', 'say', 'voice', 'soundtrack']));

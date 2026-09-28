@@ -6,7 +6,7 @@ A coding agent that runs entirely in your browser.
 - **AI-written code runs on the [Zipp](https://github.com/f2i-com/zipp.org) VM.** JavaScript and Python run in Zipp's WebAssembly engine inside a Web Worker. The code can reach the project and nothing else, except what the network gate lets through.
 - **A shell, emulated.** The terminal and the agent's `sandbox_shell` are a bash-like shell written in JavaScript on the same sandbox, with `git`, `jq`, `tar`/`zip`, `node` and `python` built in (see [The shell](#the-shell)). There are no real processes, so `npm install` and compilers don't exist here.
 - **Any model.** A server on your own machine (Ollama, LM Studio, nrob, llama.cpp — anything OpenAI-compatible), Anthropic's API, or any OpenAI-compatible API.
-- **Images, video and audio.** With nrob, or any service with OpenAI's media APIs, the agent can make pictures, short videos (talking ones too), speech, music and sound effects straight into the project (see [Images, video and audio](#images-video-and-audio)).
+- **Images, video and audio.** With nrob, or any service with OpenAI's media APIs, the agent can make pictures, short videos (talking ones too), speech, music, sound effects and 3D models straight into the project (see [Images, video and audio](#images-video-and-audio)).
 - **Web pages with a live preview.** The agent builds HTML, CSS and JavaScript pages and sees them as you do: their JavaScript runs on the Zipp VM against the preview's real DOM, and it can screenshot the page at phone, tablet or desktop sizes (see [Web pages](#web-pages)).
 - **A network gate.** `/internet on | off | allowlist | allow <host> | deny <host> | status` (or `/net`) decides every request made on the model's behalf. Requests to your AI provider are not gated.
 
@@ -50,6 +50,7 @@ The agent gets more tools when a media service is set up:
 - `create_voice` designs a voice from a description and saves it on nrob, so a character keeps the same voice. It uses the speech model chosen in Settings (nrob's Qwen3-TTS or Breeze TTS 2). A voice Breeze TTS 2 made is always spoken by a Breeze model.
 - `generate_music` saves a song from a style and lyrics (with [Verse] and [Chorus] sections), or an instrumental.
 - `generate_sound_effect` saves a sound effect (wav or mp3, up to 30 seconds) from a description of what makes it, where, and how it sounds (nrob's MOSS-SoundEffect).
+- `generate_3d_model` saves a 3D model (a GLB mesh) of one object from a picture of it, and the picture as the service cut the object out beside it (`NAME.cutout.png`), with nrob's Pixal3D. The agent makes the picture first with `generate_image`: the object alone, whole and centred, on a plain background, from a three-quarter view. The model has baked PBR textures, Y up, its front facing +Z, and fits a unit cube; it takes about a minute and a half. The agent looks at it with `preview_screenshot` (see [3D models](#3d-models)) and puts it in a SoftN app's `assets/`, where a `Scene3D` shows it.
 
 The results appear in the chat (with a player for video and audio) and in the project, where an app can use them.
 
@@ -68,7 +69,7 @@ These tools work on files already in the project, with or without a media servic
 They run in the page with the browser's own video and audio codecs (WebCodecs: H.264 and AAC where the system has them, otherwise VP9 and Opus). [Mediabunny](https://mediabunny.dev) reads and writes the files. Everything is re-encoded, so cuts are exact to the frame. Nothing leaves the computer, and it works offline and in the desktop app. A model with a context window under 16k tokens doesn't get these four tools, so that its window still has room to work.
 
 - **nrob is found on its own.** When the page opens, it asks `http://127.0.0.1:8080/v1/discovery`.
-  - If nrob answers, its image, video, speech, music and sound effects models, their limits (sizes, edits, seconds), its saved voices and its defaults fill **Settings → Images, video and audio**.
+  - If nrob answers, its image, video, speech, music, sound effects and 3D models, their limits (sizes, edits, seconds), its saved voices and its defaults fill **Settings → Images, video and audio**.
   - nrob is also added as a chat provider if none points at it yet. It becomes the active one only if nothing else is.
   - Found again later, its model lists are refreshed. Your chosen models and key stay.
 - **nrob allows bot.computer.** Without an API key, nrob answers only the origins in `gateway.cors_origins` in its config. Its defaults include `https://bot.computer`, `http://localhost:5317` and the desktop app. Serving bot.computer from anywhere else means adding that address there (the chat says which one), or setting an API key in nrob and typing it in Settings. Then press **Find nrob**.
@@ -92,7 +93,7 @@ They run in the page with the browser's own video and audio codecs (WebCodecs: H
 
 ## Web pages
 
-Any `.html` file of the project is a web page, with its CSS, images and JavaScript beside it. The **Preview** tab shows it; its picker lists the project's pages and SoftN apps, and clicking an `.html` file in the tree shows that page.
+Any `.html` file of the project is a web page, with its CSS, images and JavaScript beside it. The **Preview** tab shows it; its picker lists the project's pages, SoftN apps and 3D models, and clicking an `.html` file in the tree shows that page.
 
 - **JavaScript on Zipp.** A page's scripts don't run in the browser's own engine. The preview frame (`public/webpage/`) builds the page from its HTML and CSS, takes out its `<script>` elements and `on*` attributes, and runs them on the Zipp VM instead, against a DOM facade (`src/preview/zippDom.guest.js`). Every node, event, style or canvas the page touches is a proxy that reads, writes and calls the real object in the frame over Zipp's synchronous host channel. Listeners, timers and observers are the page's functions, called back when the real event fires. So the browser renders, lays out and dispatches, and only the page's code runs on Zipp. This follows the live DOM bridge described in zipp-browser's design notes.
   - Works: classic scripts (several share globals and run in order), the DOM, `addEventListener` and `on*` attributes (including ones added through `innerHTML`), timers and `requestAnimationFrame`, canvas, `localStorage` (kept per page while bot.computer is open), `fetch` and `XMLHttpRequest` for the project's own files, and links between the project's pages.
@@ -101,7 +102,16 @@ Any `.html` file of the project is a web page, with its CSS, images and JavaScri
   - The frame is sandboxed with an opaque origin and a strict CSP, so nothing of the page runs natively, even HTML it inserts later.
 - **Screen sizes.** The preview's size picker shows the page at a phone (390×844), tablet (820×1180), laptop (1366×768) or desktop (1920×1080) size, or any custom size. The page lays out at that size (media queries, `innerWidth`), and the frame is scaled down to fit the pane.
 - **The agent's tools:** `page_check` renders a page and reports script errors and files that didn't load. `page_inspect` and `page_interact` describe and use the page the way `softn_inspect` and `softn_interact` do for apps. `preview_viewport` sets the screen size. `preview_screenshot` shows the agent how the page (or a SoftN app) looks at that size, one screen or the whole page, and can save the PNG in the project.
-- **Screenshots** are drawn inside the frame with [modern-screenshot](https://github.com/qq15725/modern-screenshot) (bundled, offline), so they work in the browser and in the desktop app alike.
+- **Screenshots** are drawn inside the frame with [modern-screenshot](https://github.com/qq15725/modern-screenshot) (bundled, offline), so they work in the browser and in the desktop app alike. WebGL canvases (a SoftN `Scene3D`, a page's canvas) keep their drawing buffer, so they come out in the screenshot too.
+
+## 3D models
+
+Any `.glb` or `.gltf` file of the project is a 3D model the **Preview** tab can show: pick it in the preview's picker, or click it in the tree.
+
+- **The viewer** is bot.computer's own, with [three.js](https://threejs.org) (MIT), bundled into one script at build time (`scripts/modelview/`, built into `public/modelview/` by the dev server and the build). It runs in a sandboxed opaque-origin frame that gets the model's bytes over `postMessage` and loads nothing else. The model is fitted to the view, in soft studio light (a room environment, a sky-and-ground fill and a key light) over a floor grid, and you turn, move and zoom it with the mouse.
+- **For the agent:** `preview_screenshot` with a model's path returns one image with four labelled views (front, right, back and top) at the preview's size, drawn by the viewer itself. `yaw` and `pitch` show it from any other angle. The text gives its triangles, vertices, size and position (and whether it fits the unit cube), vertex colours, textures and materials.
+- **In SoftN apps:** a model in an app's `assets/` folder shows in a `Scene3D` as an object of type `"model"` with `modelUrl: asset("assets/…")`. The runtime's `asset()` only covers images, sounds and fonts, so `scripts/softn-bridge/install.mjs` adds glTF models to it when it installs the bridge, as `blob:` URLs, which `Scene3D` accepts. The bridge answers `fetch` for those and for `data:` URLs from the bytes the frame already holds, since the runtime's CSP lets `fetch` reach only its own folder.
+- A web page can't show 3D: three.js comes as ES modules or from a CDN, and neither runs on Zipp.
 
 ## SoftN apps
 
@@ -258,7 +268,7 @@ The shell works on the project's files through the same host calls, so it can't 
 
 ```sh
 npm test           # unit: gate, virtual filesystem, agent loop over both wire formats
-npm run test:e2e   # headless Chrome: the sandbox, shell, git and tools (tests/e2e/run.mjs), the whole app with a scripted model (tests/e2e/app.mjs), web pages on Zipp with screenshots and screen sizes (tests/e2e/webpage.mjs), images and video with a mock nrob (tests/e2e/nrob.mjs)
+npm run test:e2e   # headless Chrome: the sandbox, shell, git and tools (tests/e2e/run.mjs), the whole app with a scripted model (tests/e2e/app.mjs), web pages on Zipp with screenshots and screen sizes, 3D models in the viewer and in a SoftN Scene3D (tests/e2e/webpage.mjs), media with a mock nrob (tests/e2e/nrob.mjs)
 ```
 
 The end-to-end tests use a local Chrome or Edge (`CHROME=<path>` to choose one).

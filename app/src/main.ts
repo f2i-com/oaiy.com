@@ -14,6 +14,7 @@ import { nrobProvider, openSettings } from './ui/settings';
 import { TerminalPane } from './ui/terminal';
 import { Preview } from './preview/preview';
 import { findPages, isPagePath } from './preview/page';
+import { isModelPath } from './preview/model';
 import { exampleBundle, exampleCatalogue, warmKnowledge } from './softn/knowledge';
 import { askText, confirmAction } from './ui/modal';
 import { newAppDialog, type NewAppChoice } from './ui/newApp';
@@ -154,8 +155,9 @@ async function main(): Promise<void> {
   const tree = new FileTree(null as unknown as Vfs, (path) => {
     editor.open(path);
     tree.select(path);
-    // A web page opened is the one the preview shows.
+    // A web page or 3D model opened is the one the preview shows.
     if (isPagePath(path)) preview.setPage(path.replace(/^\/+/, ''));
+    else if (isModelPath(path)) preview.setModel(path.replace(/^\/+/, ''));
     if (window.matchMedia('(max-width: 900px)').matches) showView('editor');
   }, notice);
   const editor = new EditorPane(null as unknown as Vfs);

@@ -13,13 +13,14 @@ import { runInSandbox } from '../sandbox/runner';
 import { VfsError, normalizePath, type Vfs } from '../vfs/vfs';
 import type { FrameReview, ToolCall, ToolResult, ToolSpec } from './protocol';
 import { appLabel, checkProject, describeApp, findApps, formatFindings, guideFor, importSoftn, logicSyntax, resolveApp } from '../softn/softn';
-import { VIEWPORTS, targetLabel, type PageReport, type PreviewAction, type PreviewResult, type PreviewTarget, type Problem, type Shot, type Viewport, type ViewportInfo } from '../preview/preview';
+import { VIEWPORTS, targetLabel, type PageReport, type PreviewAction, type PreviewResult, type PreviewTarget, type ModelView, type Problem, type Shot, type Viewport, type ViewportInfo } from '../preview/preview';
 import { findPages, resolvePage } from '../preview/page';
+import { findModels, isModelPath, resolveModel } from '../preview/model';
 import { describeExample, docsMap, installExample, listExamples, lookupComponents, readTopic, searchKnowledge } from '../softn/knowledge';
 import { DEFAULT_VIEW_SIZE, MAX_VIEW_SIZE, imageMimeFor, imageSize, viewImage, type ImagePart } from './images';
 import { FRAME_KINDS, MAX_REDOS, MAX_REVIEW_FAILURES, awaitingReview, contentHash, readReviews, reviewOf, storyFolder, writeReviews, type FrameKind } from './review';
 import { VOICES_FILE, keepVoice, ownVoice, projectVoiceList, readProjectVoices, savedName, voiceFor, writeProjectVoices, type ProjectVoices } from './voices';
-import { SOUNDTRACK_FORMATS, SPEECH_FORMATS, createVoice, generateImage, generateMusic, generateSoundEffect, generateSpeech, generateVideo, mediaReady, type MediaFile, type MediaSettings, type SpeechFormat } from './media';
+import { SOUNDTRACK_FORMATS, SPEECH_FORMATS, createVoice, generate3dModel, generateImage, generateMusic, generateSoundEffect, generateSpeech, generateVideo, mediaReady, type MediaFile, type MediaSettings, type SpeechFormat } from './media';
 
 const READ_LINES = 400;
 const READ_CHARS = 40_000;
@@ -86,7 +87,7 @@ export interface PreviewHost {
   check(target?: PreviewTarget): Promise<PreviewResult>;
   inspect(target?: PreviewTarget): Promise<PageReport>;
   act(target: PreviewTarget | undefined, actions: PreviewAction[]): Promise<PageReport>;
-  screenshot(target: PreviewTarget | undefined, options: { fullPage?: boolean }): Promise<Shot & { problems: Problem[] }>;
+  screenshot(target: PreviewTarget | undefined, options: { fullPage?: boolean; view?: ModelView }): Promise<Shot & { problems: Problem[] }>;
   setViewport(size: Viewport | null): ViewportInfo;
   viewport(): ViewportInfo;
   /** What it shows now. */
@@ -116,7 +117,18 @@ export interface ToolContext {
 }
 
 /** A model's abilities in a few words, for the tool descriptions. */
-function describeModels(media: MediaSettings, kind: 'image' | 'video' | 'speech' | 'music' | 'sound'): string {
+function describeModels(media: MediaSettings, kind: 'image' | 'video' | 'speech' | 'music' | 'sound' | 'model3d'): string {
+  if (kind === 'model3d') {
+    const chosen = media.model3dModel;
+    const models = media.model3dModels ?? [];
+    if (!models.length) return chosen ? ` Model: ${chosen}.` : '';
+    const about = (m: (typeof models)[number]) => [
+      m.resolutions?.length ? `resolution ${m.resolutions.join(' or ')}` : '',
+      m.faces ? `${m.faces} faces by default` : '',
+      m.ready === false ? 'not ready on the service yet' : '',
+    ].filter(Boolean).join(', ');
+    return ` Models: ${models.map((m) => `${m.id}${m.id === chosen ? ' (default)' : ''}${about(m) ? `: ${about(m)}` : ''}`).join('; ')}.`;
+  }
   if (kind === 'speech' || kind === 'music' || kind === 'sound') {
     const chosen = kind === 'speech' ? media.speechModel : kind === 'music' ? media.musicModel : media.soundModel;
     const models = (kind === 'speech' ? media.speechModels : kind === 'music' ? media.musicModels : media.soundModels) ?? [];
@@ -156,7 +168,7 @@ function describeModels(media: MediaSettings, kind: 'image' | 'video' | 'speech'
 /** generate_image and generate_video, described for the service that is set up (none when there is none). `voices` are the project's own saved voices (see voices.ts). */
 export function mediaTools(media: MediaSettings | null | undefined, voices?: ProjectVoices): ToolSpec[] {
   const ready = mediaReady(media);
-  if (!media || (!ready.image && !ready.video && !ready.speech && !ready.music && !ready.sound)) return [];
+  if (!media || (!ready.image && !ready.video && !ready.speech && !ready.music && !ready.sound && !ready.model3d)) return [];
   // The saved voices this project may use, by the names the agent knows.
   if (voices) media = { ...media, voices: projectVoiceList(voices, media.voices ?? []) };
   const where = media.discovered ? `nrob at ${media.discovered.origin}` : new URL(media.baseUrl).host;
@@ -320,6 +332,28 @@ export function mediaTools(media: MediaSettings | null | undefined, voices?: Pro
           description: { type: 'string', description: 'What makes the sound, where, and how it sounds' },
           seconds: { type: 'number', description: 'Length in seconds, up to 30 (default 10)' },
           path: { type: 'string', description: 'Where to save it, e.g. audio/rain.wav' },
+          seed: int,
+        },
+      },
+    });
+  }
+  if (ready.model3d) {
+    tools.push({
+      name: 'generate_3d_model',
+      description:
+        `Make a 3D model (a GLB mesh) of one object from a picture of it, with the user's 3D model service (${where}), and save it in the project, with the picture as the service cut the object out of it beside it (NAME.cutout.png). ` +
+        `The model is only as good as the picture: ${ready.image ? 'first make a picture for it with generate_image' : 'give it a picture'} of the object alone: the whole object in view and centred, on a plain white or grey background, in soft even light, from a three-quarter view (its front and one side visible), with no text and no other objects in it. ` +
+        `${ready.image ? 'Look at that picture with view_image, then make the model from it with generate_3d_model. ' : ''}A picture the user attached (in uploads/) works too when it shows the object that way. ` +
+        'The model is glTF 2.0 with Y up, its front (the side the picture shows) facing +Z, fitted in a unit cube centred on the origin (-0.5 to 0.5 on each axis): scale and place it where it is used. ' +
+        `It takes about a minute and a half; the user sees its progress in the chat. Look at the model with preview_screenshot before using it.${describeModels(media, 'model3d')}`,
+      parameters: {
+        type: 'object',
+        required: ['image', 'path'],
+        properties: {
+          image: { type: 'string', description: 'Project path of the picture of the object alone (png, jpg or webp)' },
+          path: { type: 'string', description: 'Where to save the model, e.g. assets/models/lamp.glb (always .glb)' },
+          faces: { ...int, minimum: 1000, maximum: 2_000_000, description: 'Triangles in the mesh (default 200000); fewer for a small or far-off object, e.g. 20000' },
+          resolution: { ...int, enum: [1024, 1536], description: '1536 for finer detail, and slower (default 1024)' },
           seed: int,
         },
       },
@@ -673,14 +707,17 @@ export const TOOLS: ToolSpec[] = [
   {
     name: 'preview_screenshot',
     description:
-      'See how a web page or SoftN app looks: a screenshot of the live preview at its current screen size (preview_viewport sets it), shown to you as an image. Look at it and fix what looks wrong: layout, spacing, overflow, alignment, contrast, text that is cut off. ' +
-      '`full_page` captures the whole scrolling page instead of one screen; `save_to` also saves the PNG in the project (then view_image can zoom into parts of it).',
+      'See how a web page, SoftN app or 3D model looks: a screenshot of the live preview at its current screen size (preview_viewport sets it), shown to you as an image. Look at it and fix what looks wrong: layout, spacing, overflow, alignment, contrast, text that is cut off. ' +
+      '`full_page` captures the whole scrolling page instead of one screen; `save_to` also saves the PNG in the project (then view_image can zoom into parts of it). ' +
+      'A 3D model (a .glb or .gltf path) is shown from four sides in one image (front, right, back, top), with its size, triangles, colours and textures in the text; `yaw` and `pitch` (degrees) show it from one angle instead: yaw 0 is its front (+Z), 90 its right side, 180 its back; pitch 90 looks down on it.',
     parameters: {
       type: 'object',
       properties: {
-        path: { ...str, description: 'A web page, e.g. "index.html"; or leave it out for what the preview shows' },
+        path: { ...str, description: 'A web page, e.g. "index.html", or a 3D model, e.g. "assets/models/lamp.glb"; or leave it out for what the preview shows' },
         app: { ...str, description: 'A SoftN app\'s folder, instead of a page' },
         full_page: { type: 'boolean' },
+        yaw: { type: 'number', description: 'A 3D model: the angle around it, in degrees' },
+        pitch: { type: 'number', description: 'A 3D model: the angle above it (-90 to 90), in degrees' },
         save_to: { ...str, description: 'A .png path in the project, e.g. "screenshots/home-phone.png"' },
       },
     },
@@ -1174,21 +1211,32 @@ async function execute(call: ToolCall, ctx: ToolContext, out: ToolOut): Promise<
         const app = resolveApp(vfs, input.app);
         if (!app.ok) throw new Error(app.reason);
         target = { kind: 'app', root: app.root };
+      } else if (typeof input.path === 'string' && isModelPath(input.path.trim())) {
+        const model = resolveModel(vfs, input.path);
+        if (!model.ok) throw new Error(model.reason);
+        target = { kind: 'model', path: model.path };
       } else if (typeof input.path === 'string' && input.path.trim()) target = pageTarget(ctx, input.path, false);
       else if (!ctx.preview.target) {
         const pages = findPages(vfs);
         const apps = findApps(vfs);
-        if (pages.length + apps.length === 0) throw new Error('there is no web page or SoftN app to show yet');
-        target = apps.length ? { kind: 'app', root: apps[0] } : { kind: 'page', path: pages[0] };
+        const models = findModels(vfs);
+        if (pages.length + apps.length + models.length === 0) throw new Error('there is no web page, SoftN app or 3D model to show yet');
+        target = apps.length ? { kind: 'app', root: apps[0] } : pages.length ? { kind: 'page', path: pages[0] } : { kind: 'model', path: models[0] };
       }
       const fullPage = input.full_page === true;
+      const model = (target ?? ctx.preview.target)?.kind === 'model';
+      const angle = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) ? v : undefined);
+      const [yaw, pitch] = [angle(input.yaw), angle(input.pitch)];
+      const sideView = model && (yaw !== undefined || pitch !== undefined) ? { yaw: yaw ?? 0, pitch: Math.max(-90, Math.min(90, pitch ?? 0)) } : undefined;
       if (ctx.images === false) {
         const report = await ctx.preview.inspect(target);
         return `This model does not take images, so here is the page as text instead.\n${pageReport(target ? targetLabel(target) : 'The preview', report)}`;
       }
-      const shot = await ctx.preview.screenshot(target, { fullPage });
+      const shot = await ctx.preview.screenshot(target, { fullPage, view: sideView });
       const shown = ctx.preview.target ? targetLabel(ctx.preview.target) : 'the preview';
-      const lines = [`Screenshot of ${shown}: ${shot.width}×${shot.height} px at ${viewportText(ctx.preview.viewport())}${fullPage ? `, the whole page${shot.cut ? ` (cut at ${shot.height} of ${shot.pageHeight} px)` : ''}` : shot.pageHeight > shot.height ? `, one screen of a ${shot.pageHeight} px page (full_page shows it all)` : ''}.`];
+      const lines = model
+        ? [`Screenshot of the 3D model ${shown}: ${shot.width}×${shot.height} px, ${sideView ? `from yaw ${sideView.yaw}°, pitch ${sideView.pitch}°` : 'from four sides (front, right, back, top; labelled)'}.`, ...(shot.about ? [shot.about] : [])]
+        : [`Screenshot of ${shown}: ${shot.width}×${shot.height} px at ${viewportText(ctx.preview.viewport())}${fullPage ? `, the whole page${shot.cut ? ` (cut at ${shot.height} of ${shot.pageHeight} px)` : ''}` : shot.pageHeight > shot.height ? `, one screen of a ${shot.pageHeight} px page (full_page shows it all)` : ''}.`];
       if (typeof input.save_to === 'string' && input.save_to.trim()) {
         let path = normalizePath(input.save_to);
         if (!/\.png$/i.test(path)) path = `${path.replace(/\.[a-z0-9]{1,5}$/i, '')}.png`;
@@ -1452,6 +1500,42 @@ async function execute(call: ToolCall, ctx: ToolContext, out: ToolOut): Promise<
       vfs.writeFile(`/${path}`, result.bytes, { parents: true });
       out.files.push(path);
       return `Saved /${path} (${result.seconds ? `${result.seconds.toFixed(1)} s, ` : ''}${(result.bytes.byteLength / 1e6).toFixed(1)} MB), made with ${result.model}. The user has a player for it in the chat.`;
+    }
+    case 'generate_3d_model': {
+      const media = ctx.media?.();
+      if (!media || !mediaReady(media).model3d) throw new Error('no 3D model service is set up (the user can add one in Settings, under Images, video and audio)');
+      const imagePath = normalizePath(need(input, 'image'));
+      if (!/\.(png|jpe?g|webp)$/i.test(imagePath)) throw new Error(`/${imagePath} is not a picture the 3D model service takes (png, jpg or webp)`);
+      const image = projectImage(vfs, imagePath);
+      let path = normalizePath(need(input, 'path'));
+      if (!/\.glb$/i.test(path)) path = `${path.replace(/\.[a-z0-9]{1,5}$/i, '')}.glb`;
+      // The picture as the service cut the object out, beside the model: what it was made from.
+      const cutoutPath = path.replace(/\.glb$/i, '.cutout.png');
+      const faces = typeof input.faces === 'number' ? Math.round(Math.min(2_000_000, Math.max(1000, input.faces))) : undefined;
+      const asked = Number(input.resolution);
+      const resolution = input.resolution === undefined || !Number.isFinite(asked) ? undefined : asked > 1280 ? 1536 : 1024;
+      ctx.progress?.('starting the 3D model…');
+      const result = await generate3dModel(media, {
+        image,
+        faces,
+        resolution,
+        seed: typeof input.seed === 'number' ? input.seed : undefined,
+      }, (message) => ctx.progress?.(message), ctx.signal);
+      vfs.writeFile(`/${path}`, result.glb, { parents: true });
+      out.files.push(path);
+      if (result.cutout) {
+        vfs.writeFile(`/${cutoutPath}`, result.cutout, { parents: true });
+        out.files.push(cutoutPath);
+      }
+      const count = (n: number | undefined, one: string, many: string) => (n === undefined ? '' : `${n.toLocaleString('en')} ${n === 1 ? one : many}`);
+      const bytes = result.glb.byteLength;
+      const facts = [
+        count(result.faces, 'face', 'faces'),
+        count(result.vertices, 'vertex', 'vertices'),
+        bytes < 1e6 ? `${Math.max(1, Math.round(bytes / 1024))} KB` : `${(bytes / 1e6).toFixed(1)} MB`,
+        result.seconds !== undefined && `made in ${Math.round(result.seconds)} s`,
+      ].filter(Boolean).join(', ');
+      return `Saved /${path} (${facts}), made with ${result.model}${result.cutout ? `, and beside it the picture as the service cut the object out, /${cutoutPath}` : ''}. Its front faces +Z, Y is up, and it fits a unit cube. Look at it with preview_screenshot (path: ${path}) before using it.`;
     }
     case 'media_info': {
       const path = normalizePath(need(input, 'path'));

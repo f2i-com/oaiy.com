@@ -10,6 +10,9 @@
  *   built by public/webpage/page-host.js from the project's files, and its
  *   JavaScript runs on the Zipp VM against the frame's real DOM, through the
  *   facade in zippDom.guest.js.
+ * - A 3D model (a .glb or .gltf file) is drawn by bot.computer's own viewer
+ *   (public/modelview/, three.js), which the person turns with the mouse and
+ *   which screenshots it from four sides for the agent.
  *
  * bot.computer's bridge (scripts/softn-bridge/bot-bridge.js, in both frames)
  * reports what goes wrong while the page runs, and describes, operates and
@@ -25,9 +28,10 @@ import type { Vfs } from '../vfs/vfs';
 import { clear, h } from '../ui/dom';
 import { appFiles, appLabel, findApps, isSoftnApp, logicSyntax } from '../softn/softn';
 import { findPages, pageFiles, pageLabel } from './page';
+import { findModels, modelFiles, modelLabel } from './model';
 import FACADE from './zippDom.guest.js?raw';
 
-export type PreviewTarget = { kind: 'app'; root: string } | { kind: 'page'; path: string };
+export type PreviewTarget = { kind: 'app'; root: string } | { kind: 'page'; path: string } | { kind: 'model'; path: string };
 
 export interface PreviewResult {
   ok: boolean;
@@ -64,6 +68,14 @@ export interface Shot {
   scrollY: number;
   /** A full-page shot that stopped short of a very long page. */
   cut: boolean;
+  /** For a 3D model: what it is made of and how big it is, as text. */
+  about?: string;
+}
+
+/** A 3D model's screenshot from one angle, in degrees: yaw 0 looks at its front (+Z), 90 at its right side (+X); pitch 90 looks down. */
+export interface ModelView {
+  yaw: number;
+  pitch: number;
 }
 
 export interface Viewport {
@@ -132,23 +144,23 @@ const SETTLE_MS = 2500;
 /** A request's answer when the frame was re-rendered under it. */
 const RELOADED = 'the preview was re-rendered while this ran';
 
-export const targetLabel = (target: PreviewTarget): string => (target.kind === 'app' ? appLabel(target.root) : pageLabel(target.path));
+export const targetLabel = (target: PreviewTarget): string => (target.kind === 'app' ? appLabel(target.root) : target.kind === 'model' ? modelLabel(target.path) : pageLabel(target.path));
 const sameTarget = (a: PreviewTarget | null, b: PreviewTarget | null): boolean =>
   !!a && !!b && a.kind === b.kind && (a.kind === 'app' ? a.root === (b as { root: string }).root : a.path === (b as { path: string }).path);
-const targetValue = (t: PreviewTarget): string => (t.kind === 'app' ? `app:${t.root}` : `page:${t.path}`);
+const targetValue = (t: PreviewTarget): string => (t.kind === 'app' ? `app:${t.root}` : `${t.kind}:${t.path}`);
 
 type BridgeReply = Omit<PageReport, 'problems'> & { shot?: Omit<Shot, 'png'> & { png: ArrayBuffer } };
 
 export class Preview {
   readonly element = h('section.preview');
   private readonly status = h('span.preview-status', '');
-  private readonly picker = h('select.preview-app', { title: 'What to show: a SoftN app or a web page of the project' });
+  private readonly picker = h('select.preview-app', { title: 'What to show: a SoftN app, a web page or a 3D model of the project' });
   private readonly sizePicker = h('select.preview-size', { title: 'The size of the screen the page is shown on' });
   private readonly sizeWidth = h('input.preview-size-input', { type: 'number', min: String(MIN_VIEWPORT), max: String(MAX_VIEWPORT), title: 'Width in CSS pixels' }) as HTMLInputElement;
   private readonly sizeHeight = h('input.preview-size-input', { type: 'number', min: String(MIN_VIEWPORT), max: String(MAX_VIEWPORT), title: 'Height in CSS pixels' }) as HTMLInputElement;
   private readonly sizeCustom = h('span.preview-size-custom', this.sizeWidth, '×', this.sizeHeight);
   private readonly sizeNote = h('span.preview-size-note', '');
-  /** What is shown: an app folder ('' is the project root) or a page. */
+  /** What is shown: an app folder ('' is the project root), a page or a 3D model. */
   target: PreviewTarget | null = null;
   private readonly frameHost = h('div.preview-frame');
   private readonly stage = h('div.preview-stage');
@@ -191,6 +203,7 @@ export class Preview {
       const [kind, ...rest] = this.picker.value.split(':');
       const value = rest.join(':');
       if (kind === 'page') this.setPage(value);
+      else if (kind === 'model') this.setModel(value);
       else this.setApp(value);
     });
     this.sizePicker.append(
@@ -229,7 +242,7 @@ export class Preview {
     this.element.append(h('div.pane-title', 'Preview ', this.picker, this.sizePicker, this.sizeCustom, this.sizeNote, this.status, reload), this.banner, this.frameHost);
     this.picker.hidden = true;
     this.sizeCustom.hidden = true;
-    this.showMessage('Open a web page (an .html file) or a SoftN app (/softn new) to see it here.');
+    this.showMessage('Open a web page (an .html file), a 3D model (a .glb file) or a SoftN app (/softn new) to see it here.');
   }
 
   /** The app folder shown ('' when it is the project root, or when a page is shown). */
@@ -237,18 +250,21 @@ export class Preview {
     return this.target?.kind === 'app' ? this.target.root : '';
   }
 
-  /** The apps and pages of the project, for the picker; keeps the choice if it still exists. */
+  /** The apps, pages and 3D models of the project, for the picker; keeps the choice if it still exists. */
   refreshApps(): string[] {
     const apps = findApps(this.vfs);
     const pages = findPages(this.vfs);
-    const exists = (t: PreviewTarget | null) => !!t && (t.kind === 'app' ? apps.includes(t.root) : pages.includes(t.path));
-    if (!exists(this.target)) this.target = apps.length ? { kind: 'app', root: apps[0] } : pages.length ? { kind: 'page', path: pages[0] } : this.target?.kind === 'app' ? this.target : null;
+    const models = findModels(this.vfs);
+    const exists = (t: PreviewTarget | null) => !!t && (t.kind === 'app' ? apps.includes(t.root) : t.kind === 'model' ? models.includes(t.path) : pages.includes(t.path));
+    if (!exists(this.target))
+      this.target = apps.length ? { kind: 'app', root: apps[0] } : pages.length ? { kind: 'page', path: pages[0] } : models.length ? { kind: 'model', path: models[0] } : this.target?.kind === 'app' ? this.target : null;
     clear(this.picker);
     const chosen = this.target ? targetValue(this.target) : '';
     const option = (t: PreviewTarget, text: string) => h('option', { value: targetValue(t), selected: targetValue(t) === chosen }, text);
     if (apps.length) this.picker.append(h('optgroup', { label: 'SoftN apps' }, ...apps.map((root) => option({ kind: 'app', root }, root ? `${root}/` : '/ (project root)'))));
     if (pages.length) this.picker.append(h('optgroup', { label: 'Web pages' }, ...pages.map((path) => option({ kind: 'page', path }, `/${path}`))));
-    this.picker.hidden = apps.length + pages.length < 2;
+    if (models.length) this.picker.append(h('optgroup', { label: '3D models' }, ...models.map((path) => option({ kind: 'model', path }, `/${path}`))));
+    this.picker.hidden = apps.length + pages.length + models.length < 2;
     return apps;
   }
 
@@ -260,6 +276,11 @@ export class Preview {
   /** Show the web page at `path`. */
   setPage(path: string): void {
     this.show({ kind: 'page', path });
+  }
+
+  /** Show the 3D model at `path`. */
+  setModel(path: string): void {
+    this.show({ kind: 'model', path });
   }
 
   show(target: PreviewTarget): void {
@@ -285,13 +306,17 @@ export class Preview {
 
   /** The project changed: re-render after edits settle (the agent writes in bursts). */
   changed(path: string | null): void {
-    if (path === null || /(^|\/)manifest\.json$/i.test(path) || /\.html?$/i.test(path)) this.refreshApps();
+    if (path === null || /(^|\/)manifest\.json$/i.test(path) || /\.(html?|glb|gltf)$/i.test(path)) this.refreshApps();
     const target = this.target;
     if (path !== null && target) {
       const key = path.replace(/^\/+/, '');
       if (target.kind === 'app') {
         if (target.root && !key.startsWith(`${target.root}/`)) return;
         if (!/(^|\/)(manifest\.json|permission\.json)$|\.(ui|logic|py|xdb)$|(^|\/)assets\//i.test(key)) return;
+      } else if (target.kind === 'model') {
+        // A .glb is all there is to it; a .gltf also reads its folder.
+        const folder = target.path.includes('/') ? `${target.path.slice(0, target.path.lastIndexOf('/'))}/` : '';
+        if (key !== target.path && !(/\.gltf$/i.test(target.path) && (!folder || key.startsWith(folder)))) return;
       } else {
         const folder = target.path.includes('/') ? `${target.path.slice(0, target.path.lastIndexOf('/'))}/` : '';
         if ((folder && !key.startsWith(folder)) || key.split('/').some((s) => s.startsWith('.'))) return;
@@ -417,7 +442,7 @@ export class Preview {
       return;
     }
     const first = errors[errors.length - 1].message.split('\n')[0];
-    const what = this.target?.kind === 'page' ? 'page' : 'app';
+    const what = this.target?.kind === 'page' ? 'page' : this.target?.kind === 'model' ? '3D model' : 'app';
     this.bannerText.textContent = errors.length > 1 ? `${errors.length} errors in the ${what}. Latest: ${first}` : `The ${what} reported an error: ${first}`;
     this.bannerText.title = errors.map((p) => p.message).join('\n\n');
     this.fixButton.hidden = !this.onFix;
@@ -499,18 +524,20 @@ export class Preview {
     return { ...result, problems: this.problems.filter((p) => p.at >= since) };
   }
 
-  /** A PNG of what the app or page shows: the viewport, or the whole page. */
-  screenshot(target: PreviewTarget | undefined, options: { fullPage?: boolean } = {}): Promise<Shot & { problems: Problem[] }> {
+  /** A PNG of what the app or page shows: the viewport, or the whole page; a 3D model from four sides, or from `view`. */
+  screenshot(target: PreviewTarget | undefined, options: { fullPage?: boolean; view?: ModelView } = {}): Promise<Shot & { problems: Problem[] }> {
     return this.exclusive(async () => {
       const rendered = await this.ready(target);
       if (!this.frame) throw new Error(rendered.errors.join('; ') || 'nothing is rendered');
+      // A model that could not be read has nothing to draw: why is the answer.
+      if (this.target?.kind === 'model' && !rendered.ok) throw new Error(rendered.errors.join('; ') || 'the model could not be shown');
       const box = this.frame.getBoundingClientRect();
       if (box.width < 1 || box.height < 1) throw new Error('the preview is not on screen (on a narrow screen, open the Preview tab), so it cannot be drawn');
       // A size just chosen: the page lays itself out again first.
       const wait = this.resizedAt + 500 - Date.now();
       if (wait > 0) await new Promise((r) => setTimeout(r, wait));
       const since = Date.now();
-      const result = await this.requestAgain({ type: 'bot:screenshot', fullPage: options.fullPage === true }, 60_000);
+      const result = await this.requestAgain({ type: 'bot:screenshot', fullPage: options.fullPage === true, view: options.view }, 60_000);
       if (!result.ok || !result.shot) throw new Error(result.error || 'the preview could not take a screenshot');
       return { ...result.shot, png: new Uint8Array(result.shot.png), problems: this.problems.filter((p) => p.at >= since) };
     });
@@ -543,7 +570,7 @@ export class Preview {
       this.target = target;
       this.refreshApps();
     }
-    if (this.target?.kind !== 'page' && !(await softnRuntimeAvailable())) return { ok: false, errors: ['the SoftN preview runtime is not installed (npm run fetch:softn); only the file checks ran'], at: Date.now() };
+    if (this.target?.kind === 'app' && !(await softnRuntimeAvailable())) return { ok: false, errors: ['the SoftN preview runtime is not installed (npm run fetch:softn); only the file checks ran'], at: Date.now() };
     const done = new Promise<PreviewResult>((resolve) => this.waiters.push(resolve));
     this.render();
     return done;
@@ -588,7 +615,51 @@ export class Preview {
     if (this.settleTimer) clearTimeout(this.settleTimer);
     const target = this.target;
     if (target?.kind === 'page') return this.renderPage(target.path, generation);
+    if (target?.kind === 'model') return this.renderModel(target.path, generation);
     return this.renderApp(target?.root ?? '', generation);
+  }
+
+  private renderModel(path: string, generation: number): void {
+    if (!this.vfs.exists(`/${path}`)) {
+      this.setStatus('');
+      this.showMessage(`/${path} is not in the project any more.`);
+      this.settle({ ok: false, errors: [`/${path} does not exist`] });
+      return;
+    }
+    this.setStatus('loading…');
+    // No forms, no pop-ups: the viewer only draws the model it is sent.
+    const frame = this.newFrame('3D model preview', `${import.meta.env.BASE_URL}modelview/index.html?v=${generation}`, 'allow-scripts');
+    this.frame = frame;
+    const errors: string[] = [];
+    this.collecting = { errors, warnings: [], settle: () => {} };
+    const onMessage = (event: MessageEvent) => {
+      if (event.source !== frame.contentWindow || event.data?.type !== 'modelview:ready') return;
+      window.removeEventListener('message', onMessage);
+      const channel = new MessageChannel();
+      channel.port1.onmessage = (e: MessageEvent) => {
+        if (generation !== this.generation) return;
+        const data = e.data as { type?: string; ok?: boolean; errors?: string[] };
+        if (data?.type !== 'loaded') return;
+        const all = [...new Set([...(data.errors ?? []), ...errors])];
+        this.collecting = null;
+        if (all.length) this.setStatus(`error: ${all[all.length - 1]}`, 'error');
+        else this.setStatus(`shown · ${new Date().toLocaleTimeString()}`, 'ok');
+        this.settle({ ok: all.length === 0, errors: all });
+      };
+      const files = modelFiles(this.vfs, path);
+      // Copies, so the project's own bytes stay put when they are handed over.
+      const sent: Record<string, Uint8Array> = {};
+      for (const [name, data] of Object.entries(files)) sent[name] = data.slice();
+      frame.contentWindow!.postMessage({ type: 'modelview:init', path, files: sent }, '*', [channel.port2, ...Object.values(sent).map((d) => d.buffer as ArrayBuffer)]);
+    };
+    window.addEventListener('message', onMessage);
+    setTimeout(() => {
+      if (generation !== this.generation || this.status.dataset.kind !== 'busy') return;
+      window.removeEventListener('message', onMessage);
+      this.setStatus('the model did not load', 'error');
+      this.settle({ ok: false, errors: ['the 3D model preview did not finish loading within 30 s'] });
+    }, 30_000);
+    this.place(frame);
   }
 
   private async renderPage(path: string, generation: number): Promise<void> {

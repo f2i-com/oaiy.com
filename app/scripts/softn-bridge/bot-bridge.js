@@ -234,6 +234,66 @@
       setTimeout(finish, 100);
     });
 
+  // --- WebGL ------------------------------------------------------------------
+  // A WebGL canvas keeps its picture only until the frame is shown, so the
+  // screenshot (which reads canvases as images) would find it blank. Every
+  // WebGL context here keeps its drawing buffer instead: three.js (SoftN's
+  // Scene3D) always asks for preserveDrawingBuffer: false, so it is forced,
+  // not just defaulted. It costs a little speed, which a preview can spare.
+  const getContext = HTMLCanvasElement.prototype.getContext;
+  HTMLCanvasElement.prototype.getContext = function (type, attributes, ...rest) {
+    if (type === 'webgl' || type === 'webgl2' || type === 'experimental-webgl') attributes = { ...(attributes && typeof attributes === 'object' ? attributes : {}), preserveDrawingBuffer: true };
+    return getContext.call(this, type, attributes, ...rest);
+  };
+
+  // --- bytes the page already holds ---------------------------------------------
+  // The SoftN runtime's CSP lets fetch() reach only the runtime's own folder, so
+  // a 3D model from the app's assets (a data: URL) and the textures inside a GLB
+  // (blob: URLs three.js makes and then fetches) would be refused. Those bytes
+  // are already in the frame: fetch() answers them here, without the network.
+  const blobs = new Map();
+  const createObjectURL = URL.createObjectURL;
+  const revokeObjectURL = URL.revokeObjectURL;
+  URL.createObjectURL = function (object) {
+    const url = createObjectURL.call(URL, object);
+    if (object instanceof Blob) blobs.set(url, object);
+    return url;
+  };
+  URL.revokeObjectURL = function (url) {
+    blobs.delete(String(url));
+    return revokeObjectURL.call(URL, url);
+  };
+  /** A data: URL's bytes as a response, as fetch() would give them. */
+  const dataResponse = (url) => {
+    const comma = url.indexOf(',');
+    if (comma < 0) throw new TypeError('Failed to fetch: malformed data: URL');
+    const meta = url.slice(5, comma);
+    const body = url.slice(comma + 1);
+    let bytes;
+    if (/;base64$/i.test(meta)) {
+      const binary = atob(decodeURIComponent(body));
+      bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    } else bytes = new TextEncoder().encode(decodeURIComponent(body));
+    return new Response(bytes, { status: 200, headers: { 'content-type': meta.replace(/;base64$/i, '') || 'text/plain;charset=US-ASCII' } });
+  };
+  const nativeFetch = window.fetch;
+  window.fetch = function (input, init) {
+    const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input && typeof input.url === 'string' ? input.url : '';
+    if (blobs.has(url)) {
+      const blob = blobs.get(url);
+      return Promise.resolve(new Response(blob, { status: 200, headers: { 'content-type': blob.type || 'application/octet-stream' } }));
+    }
+    if (/^data:/i.test(url)) {
+      try {
+        return Promise.resolve(dataResponse(url));
+      } catch (error) {
+        return Promise.reject(error);
+      }
+    }
+    return nativeFetch.call(this, input, init);
+  };
+
   // --- screenshots ------------------------------------------------------------
   const MAX_PAGE_HEIGHT = 12_000;
   const opaque = (color) => color && color !== 'transparent' && !/rgba\([^)]*,\s*0\)$/.test(color);

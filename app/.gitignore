@@ -8,6 +8,8 @@ public/softn/
 # Copied into the web page preview by scripts/softn-bridge/install.mjs.
 public/webpage/bot-bridge.js
 public/webpage/bot-capture.js
+# Built by scripts/modelview/build.mjs (the 3D model viewer, with three.js).
+public/modelview/model-viewer.js
 .softn-release/
 *.log
 # The desktop app (Tauri): build output and generated schemas.
