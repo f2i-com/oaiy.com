@@ -22,6 +22,7 @@ import {
   TriangleAlert,
   Workflow,
   type LucideIcon,
+  CalendarDays,
 } from 'lucide-react';
 import { API_BASE, openExternal, plugins as pluginsApi } from './api';
 import { applyTheme, initialTheme, THEME_LABEL, type ThemeMode } from './theme';
@@ -32,6 +33,7 @@ import PluginsPanel from './PluginsPanel';
 import AiProvidersPanel from './AiProvidersPanel';
 import OverviewPanel from './OverviewPanel';
 import RunsPanel from './RunsPanel';
+import CalendarPanel from './CalendarPanel';
 import PluginScreenPage from './PluginScreenPage';
 import ConnectionsPanel from './ConnectionsPanel';
 import PairingPrompt from './PairingPrompt';
@@ -61,6 +63,7 @@ interface HealthResponse {
 type BuiltinView =
   | 'agent'
   | 'flows'
+  | 'calendar'
   | 'overview'
   | 'services'
   | 'plugins'
@@ -87,6 +90,7 @@ const WEB_APP_URL = 'https://oaiy.com/app.html';
 const NAV: { value: BuiltinView; label: string; icon: LucideIcon }[] = [
   { value: 'agent', label: 'Agent', icon: Bot },
   { value: 'flows', label: 'Flows', icon: Workflow },
+  { value: 'calendar', label: 'Calendar', icon: CalendarDays },
   { value: 'overview', label: 'Overview', icon: LayoutDashboard },
   { value: 'services', label: 'Services', icon: Server },
   { value: 'plugins', label: 'Plugins', icon: Plug },
@@ -113,6 +117,12 @@ const PAGE: Record<BuiltinView, { crumb: string; kicker: string; title: string; 
     kicker: 'Automate',
     title: 'The flow editor',
     copy: 'Build flows, run them, and give the agent new tools.',
+  },
+  calendar: {
+    crumb: 'Calendar',
+    kicker: 'Bookings',
+    title: 'Calendar',
+    copy: 'Appointments, the requests your calls and texts bring in, and the hours the phone offers.',
   },
   overview: {
     crumb: 'Overview',
@@ -494,6 +504,7 @@ export default function App() {
             {view === 'services' && <ServicesPanel />}
             {view === 'plugins' && <PluginsPanel />}
             {view === 'runs' && <RunsPanel />}
+            {view === 'calendar' && <CalendarPanel />}
             {view === 'models' && <ModelsPanel />}
             {view === 'providers' && <AiProvidersPanel />}
             {view === 'connections' && <ConnectionsPanel />}

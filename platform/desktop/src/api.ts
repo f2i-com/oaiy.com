@@ -1091,3 +1091,83 @@ export const appConfig = {
   setServiceGpu: (id: string, gpu: number | null) =>
     tauriInvoke<void>('set_service_gpu', { id, gpu }),
 };
+
+// ----- calendar -----
+
+/** Open from `open` to `close` (`HH:MM`). */
+export interface CalendarSpan {
+  open: string;
+  close: string;
+}
+
+export interface CalendarService {
+  id?: string;
+  name: string;
+  minutes: number;
+  description?: string;
+  price?: string;
+}
+
+export interface CalendarSettings {
+  business: string;
+  /** Seven days, Monday first; an empty day is closed. */
+  hours: CalendarSpan[][];
+  services: CalendarService[];
+  slotMinutes: number;
+  noticeMinutes: number;
+  horizonDays: number;
+  textConfirmations: boolean;
+}
+
+export type AppointmentStatus = 'requested' | 'confirmed' | 'declined' | 'cancelled' | 'done';
+
+export interface Appointment {
+  id: string;
+  service: string;
+  /** Local time, `YYYY-MM-DDTHH:MM`. */
+  start: string;
+  minutes: number;
+  status: AppointmentStatus;
+  name: string;
+  phone: string;
+  notes: string;
+  source: string;
+  requestId?: string;
+  callId?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface NewAppointment {
+  service: string;
+  date: string;
+  time: string;
+  minutes?: number;
+  status?: AppointmentStatus;
+  name?: string;
+  phone?: string;
+  notes?: string;
+  source?: string;
+}
+
+export const calendar = {
+  get: (from?: string, to?: string) =>
+    request<{ settings: CalendarSettings; appointments: Appointment[]; now: string }>(
+      `/api/calendar${from || to ? `?${new URLSearchParams({ ...(from ? { from } : {}), ...(to ? { to } : {}) })}` : ''}`,
+    ),
+  saveSettings: (s: CalendarSettings) => request<CalendarSettings>('/api/calendar/settings', { method: 'PUT', body: JSON.stringify(s) }),
+  free: (from: string, days: number, service?: string) =>
+    request<{ minutes: number; days: { date: string; times: string[] }[] }>(
+      `/api/calendar/free?${new URLSearchParams({ from, days: String(days), ...(service ? { service } : {}) })}`,
+    ),
+  create: (a: NewAppointment) => request<Appointment>('/api/calendar/appointments', { method: 'POST', body: JSON.stringify(a) }),
+  update: (id: string, change: Partial<Pick<Appointment, 'status' | 'start' | 'minutes' | 'service' | 'name' | 'phone' | 'notes'>>) =>
+    request<Appointment>(`/api/calendar/appointments/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(change) }),
+  remove: (id: string) => request<void>(`/api/calendar/appointments/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  /** Text someone through the phone (Aokie). */
+  text: (to: string, body: string) =>
+    request<unknown>('/api/bridge/connectors/aokie/request', {
+      method: 'POST',
+      body: JSON.stringify({ command: 'sms.send', payload: { to, body }, idempotencyKey: `oaiy-calendar-${Date.now()}-${Math.random().toString(36).slice(2)}` }),
+    }),
+};

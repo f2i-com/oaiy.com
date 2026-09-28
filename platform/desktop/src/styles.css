@@ -1651,3 +1651,115 @@ select:disabled { cursor: not-allowed; opacity: 0.5; }
 /* The agent and the flow editor: webviews of their own, laid over this box by the app. */
 .embedded-page { height: 100%; min-height: 0; position: relative; background: var(--canvas); }
 .embedded-problem { margin: 24px; color: var(--muted, #8b93a3); }
+
+/* ---------------------------------------------------------------------------
+ * CALENDAR
+ * ------------------------------------------------------------------------- */
+.calendar .section-title-row { flex-wrap: wrap; gap: 10px; }
+.cal-weeknav { display: flex; align-items: center; gap: 6px; }
+.cal-range { color: var(--muted); font-size: 12px; margin-left: 4px; }
+.cal-grid {
+  display: grid;
+  grid-template-columns: 64px repeat(7, minmax(0, 1fr));
+  border: 1px solid var(--border);
+  border-radius: var(--r-card);
+  background: var(--surface);
+  overflow: hidden;
+}
+.cal-dayhead {
+  height: 38px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 10px;
+  border-bottom: 1px solid var(--border);
+  color: var(--muted);
+  font-size: 12px;
+}
+.cal-dayhead strong { color: var(--text); font-size: 14px; }
+.cal-dayhead em { margin-left: auto; font-style: normal; color: var(--faint); font-size: 11px; }
+.cal-times { border-right: 1px solid var(--border); }
+.cal-time {
+  height: var(--hour-px);
+  padding: 2px 8px 0 0;
+  text-align: right;
+  color: var(--faint);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  border-bottom: 1px dashed var(--border);
+}
+.cal-day { border-right: 1px solid var(--border); min-width: 0; }
+.cal-day:last-child { border-right: 0; }
+.cal-today .cal-dayhead, .cal-today .cal-dayhead strong { color: var(--primary); }
+.cal-body {
+  position: relative;
+  height: calc(var(--hours) * var(--hour-px));
+  background: repeating-linear-gradient(to bottom, transparent 0, transparent calc(var(--hour-px) - 1px), var(--border) calc(var(--hour-px) - 1px), var(--border) var(--hour-px));
+}
+.cal-open { position: absolute; left: 0; right: 0; background: var(--primary-soft); opacity: 0.45; pointer-events: none; }
+.cal-appt {
+  position: absolute;
+  left: 4px;
+  right: 4px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 1px;
+  overflow: hidden;
+  padding: 3px 6px;
+  border: 1px solid var(--green);
+  border-left-width: 3px;
+  border-radius: var(--r-sm);
+  background: var(--green-soft);
+  color: var(--text);
+  font-size: 11px;
+  line-height: 1.25;
+  text-align: left;
+  cursor: pointer;
+}
+.cal-appt span { color: var(--muted); }
+.cal-appt:hover { filter: brightness(1.15); }
+.cal-appt.cal-requested { border-color: var(--amber); background: var(--amber-soft); border-style: dashed; border-left-style: solid; }
+.cal-appt.cal-done { border-color: var(--strong-border); background: var(--surface-soft); color: var(--muted); }
+.cal-request .row-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 8px; }
+.cal-check { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; cursor: pointer; }
+.cal-check input { width: auto; height: auto; }
+.cal-dialog-back {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: grid;
+  place-items: center;
+  background: rgba(0, 0, 0, 0.45);
+}
+.cal-dialog {
+  width: min(520px, calc(100vw - 32px));
+  max-height: calc(100vh - 48px);
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 18px;
+  border: 1px solid var(--strong-border);
+  border-radius: var(--r-card);
+  background: var(--surface-solid);
+  box-shadow: var(--shadow);
+}
+.cal-dialog .section-title-row { justify-content: space-between; }
+.cal-dialog-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.cal-free { display: flex; flex-wrap: wrap; gap: 6px; }
+.cal-chip {
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface-soft);
+  color: var(--text);
+  padding: 3px 10px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.cal-chip.active, .cal-chip:hover { border-color: var(--primary); background: var(--primary-soft); }
+.cal-settings { display: flex; flex-direction: column; gap: 14px; max-width: 860px; }
+.cal-hours { display: grid; gap: 6px; }
+.cal-hours-row { display: grid; grid-template-columns: 150px 120px auto 120px; align-items: center; gap: 8px; }
+.cal-services { display: grid; gap: 6px; }
+.cal-service-row { display: grid; grid-template-columns: 1.4fr 80px auto 1fr 1.6fr auto; align-items: center; gap: 8px; }

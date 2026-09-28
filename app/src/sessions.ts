@@ -11,6 +11,7 @@ import { Agent, type AgentEvent, type AgentOptions, type SessionTool } from './a
 import { TOOLS } from './agent/tools';
 import type { Turn } from './agent/protocol';
 import type { Desktop, DesktopEvent } from './desktop/bridge';
+import { textCalendarTools } from './desktop/calendarTools';
 import type { MessageSettings } from './settings';
 import type { OpenProject, SessionInfo } from './vfs/projects';
 
@@ -67,6 +68,7 @@ export function smsInstructions(title: string, number: string, instructions: str
     'Their messages arrive as "Text message from …". Answer them with send_text_message: short plain text (no markdown), in the language they write in. Only what you send with it reaches them; anything else you write is seen only by the person you work for.',
     'A message without that label comes from the person you work for, who may be watching: do what they say (they may tell you what to reply, or ask you to do something first).',
     'Use your other tools (the project\'s files, the web, flows) when a message needs it. There is no need to reply to a message that needs no answer (a thank-you, an emoji).',
+    'To book them in: find a time with calendar_free_times, agree a day and time with them, then request_appointment. It is a request that staff confirm (they are texted when it is): never say it is booked.',
     `The instructions of the person you work for, for text messages:\n${instructions.trim() || '(none)'}`,
   ].join('\n');
 }
@@ -247,7 +249,8 @@ export class Sessions {
     const test = info.key === TEST_NUMBER;
     session.agent = this.makeAgent({
       instructions: () => smsInstructions(session.title, session.key, this.settings().instructions, test),
-      sessionTools: [this.replyTool(session, test)],
+      // A pretend thread does not put requests in the real calendar.
+      sessionTools: [this.replyTool(session, test), ...(test ? [] : textCalendarTools(this.desktop, session.key, () => session.title))],
       conversation: true,
     });
     return session;

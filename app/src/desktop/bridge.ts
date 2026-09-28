@@ -252,6 +252,31 @@ export class Desktop {
     return list.filter(isRecord).map((p) => ({ id: String(p.id ?? ''), state: String(p.state ?? p.status ?? '') }));
   }
 
+  /** The desktop's calendar: its settings, and the appointments from `from` (YYYY-MM-DD) to before `to`. */
+  async calendar(from?: string, to?: string, signal?: AbortSignal): Promise<{ settings: Record<string, unknown>; appointments: Array<Record<string, unknown>>; now: string }> {
+    const q = new URLSearchParams({ ...(from ? { from } : {}), ...(to ? { to } : {}) }).toString();
+    const body = await reply(await fetch(`${this.origin}/api/calendar${q ? `?${q}` : ''}`, { headers: this.headers(), signal }));
+    return isRecord(body) ? (body as { settings: Record<string, unknown>; appointments: Array<Record<string, unknown>>; now: string }) : { settings: {}, appointments: [], now: '' };
+  }
+
+  /** Free times from `from` for `days` days, for `service` (a name) or its own length. */
+  async calendarFree(from: string, days: number, service?: string, signal?: AbortSignal): Promise<{ minutes: number; service: string | null; days: Array<{ date: string; times: string[] }> }> {
+    const q = new URLSearchParams({ ...(from ? { from } : {}), days: String(days), ...(service ? { service } : {}) }).toString();
+    return (await reply(await fetch(`${this.origin}/api/calendar/free?${q}`, { headers: this.headers(), signal }))) as { minutes: number; service: string | null; days: Array<{ date: string; times: string[] }> };
+  }
+
+  /** A new appointment (`date` YYYY-MM-DD and `time` HH:MM, or `start`). */
+  async calendarCreate(appointment: Record<string, unknown>, signal?: AbortSignal): Promise<Record<string, unknown>> {
+    const body = await reply(await fetch(`${this.origin}/api/calendar/appointments`, { method: 'POST', headers: this.headers(), body: JSON.stringify(appointment), signal }));
+    return isRecord(body) ? body : {};
+  }
+
+  /** Change an appointment (status, start, service, name, phone, notes). */
+  async calendarUpdate(id: string, change: Record<string, unknown>, signal?: AbortSignal): Promise<Record<string, unknown>> {
+    const body = await reply(await fetch(`${this.origin}/api/calendar/appointments/${encodeURIComponent(id)}`, { method: 'PATCH', headers: this.headers(), body: JSON.stringify(change), signal }));
+    return isRecord(body) ? body : {};
+  }
+
   /** The words spoken in `wav` (16 kHz mono, 16-bit), by the desktop's speech-to-text. */
   async transcribe(wav: Uint8Array<ArrayBuffer>, signal?: AbortSignal): Promise<string> {
     const body = await reply(await fetch(`${this.origin}/api/voice/transcribe`, {
