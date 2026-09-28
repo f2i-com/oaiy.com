@@ -1309,6 +1309,9 @@ pub fn run() {
     log::set_max_level(log::LevelFilter::Info);
 
     tauri::Builder::default()
+        // First, so a second launch (the taskbar, the Start menu) never gets as
+        // far as binding ports: it shows the running OAIY's window and exits.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| crate::tray::show_main(app)))
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
@@ -1692,6 +1695,12 @@ pub fn run() {
             // Build the tray icon + menu. tray::setup hides the main
             // window on close so OAIY Desktop stays alive in the tray.
             tray::setup(app)?;
+            // The window opens with OAIY (it is hidden until now so it first
+            // appears laid out). `--hidden` starts it in the tray only, for a
+            // start with Windows.
+            if !std::env::args().any(|a| a == "--hidden") {
+                crate::tray::show_main(app.handle());
+            }
 
             // The agent runs from the start, hidden until its page is shown:
             // texts and calls are answered whatever the window shows.

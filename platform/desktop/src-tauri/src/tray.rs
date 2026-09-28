@@ -10,6 +10,22 @@ use tauri::{
     App, Manager,
 };
 
+/// Bring the main window up: shown, restored if minimized, and focused.
+///
+/// As a `Window`, not a `WebviewWindow`: the agent's and the flow editor's
+/// pages are webviews of their own inside it, and a window with several
+/// webviews is no `WebviewWindow` (`get_webview_window` finds nothing).
+pub fn show_main(app: &tauri::AppHandle) {
+    match app.get_window("main") {
+        Some(window) => {
+            let _ = window.show();
+            let _ = window.unminimize(); // show() alone won't restore a minimized window
+            let _ = window.set_focus();
+        }
+        None => log::warn!("there is no main window to show"),
+    }
+}
+
 pub fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
     let handle = app.handle();
 
@@ -29,11 +45,7 @@ pub fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
     builder
         .on_menu_event(|app, event| match event.id.as_ref() {
             "open" => {
-                if let Some(window) = app.get_webview_window("main") {
-                    let _ = window.show();
-                    let _ = window.unminimize(); // show() alone won't restore a minimized window
-                    let _ = window.set_focus();
-                }
+                show_main(app);
             }
             "quit" => {
                 app.exit(0);
@@ -50,11 +62,7 @@ pub fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
                 ..
             } = event
             {
-                if let Some(window) = tray.app_handle().get_webview_window("main") {
-                    let _ = window.show();
-                    let _ = window.unminimize(); // show() alone won't restore a minimized window
-                    let _ = window.set_focus();
-                }
+                show_main(tray.app_handle());
             }
         })
         .build(handle)?;

@@ -24,6 +24,7 @@ gui = [
     "dep:tauri-plugin-shell",
     "dep:tauri-plugin-dialog",
     "dep:tauri-plugin-notification",
+    "dep:tauri-plugin-single-instance",
     "dep:tauri-build",
 ]
 
@@ -49,6 +50,8 @@ tauri-plugin-dialog = { version = "2.0", optional = true }
 # Native OS notifications so a download/install finishing reaches the user
 # even when OAIY Desktop window is hidden to the tray.
 tauri-plugin-notification = { version = "2.0", optional = true }
+# One OAIY: launching it again shows the running one's window.
+tauri-plugin-single-instance = { version = "2", optional = true }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
