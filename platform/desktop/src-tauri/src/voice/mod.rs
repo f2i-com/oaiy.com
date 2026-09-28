@@ -129,15 +129,22 @@ impl VoiceHub {
 /// `GET /api/voice/events` (server-sent events: `call.started`, `call.caller`,
 /// `call.said`, `call.speech_started`, `call.interrupted`, `call.error`,
 /// `call.ended`), `GET /api/voice/calls`, and per call `say`, `tool`, `finish`, `hush`.
-/// `PUT /api/voice/callers` keeps the name a caller is greeted by.
+/// `PUT /api/voice/callers` keeps the name a caller is greeted by. These are the
+/// phone's: while no plugin provides the phone they answer `module_disabled`.
+/// Speech to text and the voices are core (the agent's own tools use them).
 pub fn app_router(hub: VoiceHub) -> Router {
-    Router::new()
+    let phone = Router::new()
         .route("/api/voice/events", get(events))
         .route("/api/voice/calls", get(calls))
         .route("/api/voice/calls/:id/say", post(say))
         .route("/api/voice/calls/:id/tool", post(tool))
         .route("/api/voice/calls/:id/finish", post(finish))
         .route("/api/voice/calls/:id/hush", post(hush))
+        // A caller's name, for their number (an empty name forgets it).
+        .route("/api/voice/callers", put(caller_name))
+        // `route_layer`: a path that is not one of these still answers 404.
+        .route_layer(axum::middleware::from_fn(require_phone));
+    Router::new()
         // Half a minute of 16 kHz speech is under 1 MB; the app sends pieces that size.
         .route("/api/voice/transcribe", post(transcribe).layer(axum::extract::DefaultBodyLimit::max(8 * 1024 * 1024)))
         // The voice calls are answered in: clips by name, the one chosen, a new
@@ -146,9 +153,16 @@ pub fn app_router(hub: VoiceHub) -> Router {
         .route("/api/voice/voices/chosen", put(voice_choose))
         .route("/api/voice/voices/:name", delete(voice_remove))
         .route("/api/voice/voices/:name/try", post(voice_try))
-        // A caller's name, for their number (an empty name forgets it).
-        .route("/api/voice/callers", put(caller_name))
+        .merge(phone)
         .with_state(hub)
+}
+
+/// The phone's routes answer only while a plugin provides the phone.
+async fn require_phone(request: axum::extract::Request, next: axum::middleware::Next) -> axum::response::Response {
+    if !crate::modules::is_enabled(crate::modules::PHONE) {
+        return crate::modules::disabled_response(crate::modules::PHONE);
+    }
+    next.run(request).await
 }
 
 #[derive(Deserialize)]
@@ -366,6 +380,10 @@ fn bearer_ok(headers: &HeaderMap) -> bool {
 }
 
 async fn realtime(State(hub): State<VoiceHub>, Path(_provider): Path<String>, headers: HeaderMap, ws: WebSocketUpgrade) -> axum::response::Response {
+    // No phone, no calls: said before the token, so a plugin that is not the phone's hears why.
+    if !crate::modules::is_enabled(crate::modules::PHONE) {
+        return crate::modules::disabled_response(crate::modules::PHONE);
+    }
     if !bearer_ok(&headers) {
         return (StatusCode::UNAUTHORIZED, Json(json!({"error": {"code": "auth_required", "message": "the gateway token is required"}}))).into_response();
     }
@@ -443,6 +461,52 @@ mod tests {
         let ok = client.get(&url).bearer_auth(gateway_token()).send().await.unwrap();
         assert_eq!(ok.status(), 200);
         assert_eq!(ok.json::<Value>().await.unwrap()["provider"], "studio");
+    }
+
+    /// The app's side of the calls, on a port of its own.
+    async fn serve_app() -> String {
+        let hub = VoiceHub::new(Engines::at("http://127.0.0.1:9", "http://127.0.0.1:9"), |_| None);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app_router(hub)).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn the_call_routes_answer_module_disabled_with_the_phone_off() {
+        let _off = crate::modules::test_gate::enable(&[]);
+        let base = serve_app().await;
+        let client = reqwest::Client::new();
+        let refused = [
+            client.get(format!("{base}/api/voice/events")),
+            client.get(format!("{base}/api/voice/calls")),
+            client.post(format!("{base}/api/voice/calls/call_1/say")).json(&json!({"text": "hi"})),
+            client.post(format!("{base}/api/voice/calls/call_1/hush")),
+            client.put(format!("{base}/api/voice/callers")).json(&json!({"number": "+61400000000", "name": "Lance"})),
+        ];
+        for request in refused {
+            let resp = request.send().await.unwrap();
+            let url = resp.url().to_string();
+            assert_eq!(resp.status(), 409, "{url}");
+            let body: Value = resp.json().await.unwrap();
+            assert_eq!(body["error"]["code"], "module_disabled", "{url}");
+        }
+        // The voices and speech to text are the agent's too: not the phone's.
+        assert_eq!(client.get(format!("{base}/api/voice/voices")).send().await.unwrap().status(), 200);
+        assert_eq!(client.post(format!("{base}/api/voice/transcribe")).body("not a wav").send().await.unwrap().status(), 400);
+        // An unknown path is still not found.
+        assert_eq!(client.get(format!("{base}/api/voice/nothing")).send().await.unwrap().status(), 404);
+    }
+
+    #[tokio::test]
+    async fn the_call_routes_answer_with_the_phone_on() {
+        let _on = crate::modules::test_gate::enable(&[crate::modules::PHONE]);
+        let base = serve_app().await;
+        let client = reqwest::Client::new();
+        let calls: Value = client.get(format!("{base}/api/voice/calls")).send().await.unwrap().json().await.unwrap();
+        assert_eq!(calls["calls"], json!([]));
+        let say = client.post(format!("{base}/api/voice/calls/call_1/say")).json(&json!({"text": "hi"})).send().await.unwrap();
+        assert_eq!(say.status(), 404, "no such call, but the route answers");
     }
 
     #[test]

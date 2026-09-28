@@ -424,8 +424,18 @@ pub fn spawn(link: LinkHandle) {
                 let due = r.nudged_at.is_some_and(|n| now >= n + SETTLE) || heard || r.next_at.map_or(true, |t| now >= t);
                 (std::mem::take(&mut r.asked), due)
             };
-            // Only while the phone receptionist (and so the calendar) is installed, unless asked.
-            if asked || (due && super::available()) {
+            // Only while a plugin provides the calendar (Aokie, the phone
+            // receptionist): with it off nothing syncs, and one asked for is
+            // answered at once rather than left waiting.
+            if !super::available() {
+                if asked {
+                    let mut r = runner();
+                    r.runs += 1;
+                    WAKE.notify_all();
+                }
+                continue;
+            }
+            if asked || due {
                 run_once(cal, &link);
             }
         })

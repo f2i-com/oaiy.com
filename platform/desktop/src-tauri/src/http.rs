@@ -896,6 +896,9 @@ fn is_restricted_read_path(path: &str) -> bool {
         // `capabilities` + `health` stay open (discovery); everything else under
         // these prefixes is gated to a non-remote origin.
         || path == "/api/plugins"
+        // Which modules the plugins provide (the phone, the calendar) — same tier as /api/plugins.
+        || path == "/api/modules"
+        || path == "/api/modules/events"
         // Which plugins are installed and what they can do — same tier as /api/plugins.
         || path == "/api/services/definitions"
         // Readiness names plugins + queue depth: gated like the other bridge reads.
@@ -1193,7 +1196,9 @@ pub async fn serve(
             Method::DELETE,
             Method::OPTIONS,
         ])
-        .allow_headers(Any);
+        .allow_headers(Any)
+        // The dashboard (another origin) reads /api/modules' ETag to ask again with If-None-Match.
+        .expose_headers([axum::http::header::ETAG]);
 
     /// Answer Chrome's Private Network Access preflight.
     ///
@@ -1235,6 +1240,8 @@ pub async fn serve(
         crate::voice::voices::init(&dir);
         crate::voice::callers::init(&dir);
     }
+    // Which modules (the phone, the calendar) a plugin provides: worked out now, then kept up to date.
+    crate::modules::start(bridge.plugins.clone());
 
     let state = AppState {
         config,
@@ -1324,6 +1331,7 @@ pub async fn serve(
         .merge(bridge_routes)
         .merge(voice_routes)
         .merge(crate::calendar::routes::router())
+        .merge(crate::modules::routes::router())
         .merge(crate::agent_tasks::router())
         .route("/api/engines", axum::routing::get(engines_status))
         .merge(companion_routes)
@@ -1678,6 +1686,9 @@ mod tests {
         assert!(!is_restricted_read_path("/api/bridge/capabilities"));
         for path in [
             "/api/plugins",
+            // Which plugin provides the phone and the calendar: the same tier as the plugins.
+            "/api/modules",
+            "/api/modules/events",
             "/api/plugins/aokie/logs",
             "/api/bridge/events",
             "/api/bridge/runs",

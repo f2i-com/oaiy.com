@@ -13,6 +13,9 @@
 //!                                                            through, the changes waiting to go
 //!   POST   /api/calendar/sync                               → sync now (answers within ten seconds,
 //!                                                            `syncing` if it is still going)
+//!
+//! The changes (settings, appointments, a sync) answer 409 `module_disabled`
+//! while no plugin provides the calendar; reading it still works.
 
 use axum::extract::{Path, Query};
 use axum::http::StatusCode;
@@ -29,6 +32,15 @@ fn calendar() -> Result<&'static Calendar, Response> {
     shared().ok_or_else(|| fail(StatusCode::SERVICE_UNAVAILABLE, "calendar_unavailable", "the calendar is not open"))
 }
 
+/// The calendar's changes answer only while a plugin provides it (else
+/// `module_disabled`, before the body is read, and nothing is touched).
+async fn require_calendar(request: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    if !super::available() {
+        return crate::modules::disabled_response(crate::modules::CALENDAR);
+    }
+    next.run(request).await
+}
+
 fn fail(status: StatusCode, code: &str, message: &str) -> Response {
     (status, Json(json!({"error": {"code": code, "message": message}}))).into_response()
 }
@@ -41,14 +53,18 @@ fn date(s: &Option<String>) -> Result<Option<NaiveDate>, Response> {
 }
 
 pub fn router() -> Router {
-    Router::new()
-        .route("/api/calendar", get(overview))
+    let changes = Router::new()
         .route("/api/calendar/settings", put(set_settings))
-        .route("/api/calendar/free", get(free))
         .route("/api/calendar/appointments", post(create))
         .route("/api/calendar/appointments/:id", patch(update).delete(remove))
+        .route_layer(axum::middleware::from_fn(require_calendar));
+    Router::new()
+        .route("/api/calendar", get(overview))
+        .route("/api/calendar/free", get(free))
         .route("/api/calendar/lookup", post(lookup))
+        // Reading how the sync stands is always there; syncing needs the calendar (see sync_now).
         .route("/api/calendar/sync", get(sync_status).post(sync_now))
+        .merge(changes)
 }
 
 async fn sync_status() -> Response {
@@ -56,6 +72,9 @@ async fn sync_status() -> Response {
 }
 
 async fn sync_now() -> Response {
+    if !super::available() {
+        return crate::modules::disabled_response(crate::modules::CALENDAR);
+    }
     match tokio::task::spawn_blocking(super::sync::now).await {
         Ok(report) => Json(report).into_response(),
         Err(e) => fail(StatusCode::INTERNAL_SERVER_ERROR, "sync_failed", &e.to_string()),

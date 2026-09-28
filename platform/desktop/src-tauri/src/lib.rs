@@ -14,6 +14,7 @@ pub mod bridge;
 pub mod plugins;
 pub mod voice;
 pub mod calendar;
+pub mod modules;
 pub mod agent_tasks;
 
 /// Port the localhost API binds to. Fixed so oaiy-web's detection probe has a

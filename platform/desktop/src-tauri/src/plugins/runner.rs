@@ -100,7 +100,8 @@ pub(crate) const NEVER_FORWARD: &[&str] = &[
 /// Build the child environment from scratch.
 ///
 /// `host_env` is the parent environment, passed in rather than read from the
-/// process so this is testable.
+/// process so this is testable. `phone_provider`: the plugin provides the phone
+/// module (see `crate::modules`), and so gets the voice gateway's token.
 pub fn plugin_env<I, K, V>(
     host_env: I,
     plugin_id: &str,
@@ -108,6 +109,7 @@ pub fn plugin_env<I, K, V>(
     desktop_version: &str,
     plugin_api_version: u32,
     dev_mode: bool,
+    phone_provider: bool,
 ) -> BTreeMap<String, String>
 where
     I: IntoIterator<Item = (K, V)>,
@@ -148,13 +150,16 @@ where
         env.insert("OAIY_DEV_MODE".into(), "1".into());
     }
     // The names FormLogic's plugin contract gives the same things (Aokie reads
-    // these), and the token for the voice gateway on 17872, where a plugin's
-    // realtime calls reach the agent.
+    // these), and the token for the voice gateway on 17872, where the phone's
+    // realtime calls reach the agent: only for the plugin that provides the
+    // phone, as no other has calls to bring there.
     env.insert("FORMLOGIC_PLUGIN_DATA_DIR".into(), plugin_data_dir.display().to_string());
     if dev_mode {
         env.insert("FORMLOGIC_DEV_MODE".into(), "1".into());
     }
-    env.insert("FORMLOGIC_AI_GATEWAY_TOKEN".into(), crate::voice::gateway_token().to_string());
+    if phone_provider {
+        env.insert("FORMLOGIC_AI_GATEWAY_TOKEN".into(), crate::voice::gateway_token().to_string());
+    }
     env
 }
 
@@ -321,6 +326,7 @@ mod tests {
             "0.1.0",
             1,
             false,
+            true,
         )
     }
 
@@ -395,6 +401,7 @@ mod tests {
             "0.1.0",
             1,
             false,
+            false,
         );
         assert_eq!(env.get("Path").map(String::as_str), Some("/usr/bin"));
     }
@@ -407,6 +414,7 @@ mod tests {
             Path::new("/d"),
             "0.1.0",
             1,
+            false,
             false,
         );
         assert!(env.values().all(|v| v != "sk-x" && v != "hf-x"), "{env:?}");
@@ -432,7 +440,7 @@ mod tests {
     #[test]
     fn dev_mode_is_absent_unless_asked_for() {
         assert!(!env_for_test().contains_key("OAIY_DEV_MODE"));
-        let dev = plugin_env(host_env(), "aokie", Path::new("/d"), "0.1.0", 1, true);
+        let dev = plugin_env(host_env(), "aokie", Path::new("/d"), "0.1.0", 1, true, true);
         assert_eq!(dev.get("OAIY_DEV_MODE").map(String::as_str), Some("1"));
     }
 
@@ -447,8 +455,34 @@ mod tests {
             "0.1.0",
             1,
             false,
+            false,
         );
         assert_eq!(env.get("OAIY_PLUGIN_ID").map(String::as_str), Some("aokie"));
+    }
+
+    #[test]
+    fn only_the_phone_provider_gets_the_gateway_token() {
+        // The token opens the voice gateway on 17872, where calls reach the agent.
+        let phone = plugin_env(host_env(), "aokie", Path::new("/d"), "0.1.0", 1, false, true);
+        assert_eq!(phone.get("FORMLOGIC_AI_GATEWAY_TOKEN").map(String::as_str), Some(crate::voice::gateway_token()));
+        let other = plugin_env(host_env(), "weather", Path::new("/d"), "0.1.0", 1, false, false);
+        assert!(!other.contains_key("FORMLOGIC_AI_GATEWAY_TOKEN"), "{other:?}");
+        // Which plugins provide it: Aokie (by the legacy rule), and one that declares the phone
+        // with the commands it needs; not one that only claims the calendar.
+        let manifest = |extra: serde_json::Value| -> super::super::PluginManifest {
+            let mut m = serde_json::json!({
+                "schemaVersion": 3, "id": "aokie", "name": "Aokie", "version": "1", "pluginApiVersion": 1,
+                "entry": {"kind": "process", "command": "a.exe"},
+                "connectors": [{"id": "aokie", "commands": ["phone.status", "sms.send", "settings.get", "settings.set", "call.dial"]}],
+            });
+            m.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            serde_json::from_value(m).unwrap()
+        };
+        let phone = |m: &super::super::PluginManifest| crate::modules::provided_by(m).contains(crate::modules::PHONE);
+        assert!(phone(&manifest(serde_json::json!({}))));
+        assert!(phone(&manifest(serde_json::json!({"id": "otherphone", "modules": {"provides": ["phone"]}}))));
+        assert!(!phone(&manifest(serde_json::json!({"id": "diary", "modules": {"provides": ["calendar"]}}))));
+        assert!(!phone(&manifest(serde_json::json!({"id": "weather"}))));
     }
 
     #[test]

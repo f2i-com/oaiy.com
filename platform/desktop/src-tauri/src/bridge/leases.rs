@@ -56,6 +56,21 @@ pub fn holder(name: &str) -> Option<String> {
     (lease.expires_at_ms > now_ms()).then(|| lease.holder.clone())
 }
 
+/// Let go of `names`, whoever holds them (their module was turned off). The names let go.
+pub fn drop_for(leases: &mut HashMap<String, Lease>, names: &[&str]) -> Vec<String> {
+    names.iter().filter(|n| leases.remove(**n).is_some()).map(|n| n.to_string()).collect()
+}
+
+/// Let go of `names` on this desktop: a module turned off takes its leases with it.
+pub fn drop_names(names: &[&str]) {
+    let mut guard = LEASES.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(leases) = guard.as_mut() {
+        for name in drop_for(leases, names) {
+            log::info!("lease {name} let go: its module is off");
+        }
+    }
+}
+
 /// Give `name` up, if `holder` has it.
 pub fn release(leases: &mut HashMap<String, Lease>, name: &str, holder: &str) -> bool {
     if leases.get(name).is_some_and(|l| l.holder == holder) {
@@ -89,6 +104,12 @@ pub async fn take_lease(Path(name): Path<String>, Json(body): Json<TakeLease>) -
     if !valid_name(&name) || body.holder.is_empty() || body.holder.len() > 200 {
         return (StatusCode::BAD_REQUEST, Json(json!({"error": {"code": "invalid_request", "message": "a lease name (letters, digits, - _ .) and a holder"}}))).into_response();
     }
+    // A module's lease (answering calls or texts: the phone's) is not granted while the module is off.
+    if let Some(module) = crate::modules::lease_module(&name) {
+        if !body.release && !crate::modules::is_enabled(module.id) {
+            return crate::modules::disabled_response(module.id);
+        }
+    }
     let mut guard = LEASES.lock().unwrap_or_else(|e| e.into_inner());
     let leases = guard.get_or_insert_with(HashMap::new);
     if body.release {
@@ -120,6 +141,52 @@ mod tests {
         assert!(take(&mut l, "answer-texts", "tab", 30_000, true, 62_000).0);
         assert!(release(&mut l, "answer-texts", "tab"));
         assert!(!release(&mut l, "answer-texts", "tab"));
+    }
+
+    #[test]
+    fn turning_the_phone_off_frees_its_leases() {
+        let mut l = HashMap::new();
+        assert!(take(&mut l, "answer-calls", "window", 30_000, false, 1_000).0);
+        assert!(take(&mut l, "answer-texts", "tab", 30_000, false, 1_000).0);
+        assert!(take(&mut l, "answer-tasks", "window", 30_000, false, 1_000).0);
+        let phone = crate::modules::def(crate::modules::PHONE).unwrap();
+        let mut freed = drop_for(&mut l, phone.leases);
+        freed.sort();
+        assert_eq!(freed, vec!["answer-calls", "answer-texts"]);
+        assert!(l.contains_key("answer-tasks"), "flows' tasks are core: kept");
+        // Free now: the next page to ask (once the phone is back) gets them at once.
+        assert!(take(&mut l, "answer-calls", "tab", 30_000, false, 2_000).0);
+    }
+
+    async fn ask(name: &str, holder: &str, release: bool) -> (StatusCode, serde_json::Value) {
+        let body = TakeLease { holder: holder.into(), ttl_ms: Some(30_000), prefer: false, release };
+        let resp = take_lease(Path(name.to_string()), Json(body)).await;
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 16).await.unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null))
+    }
+
+    #[tokio::test]
+    async fn a_lease_of_a_turned_off_module_is_not_granted() {
+        let holder = format!("test-{}", std::process::id());
+        {
+            let _off = crate::modules::test_gate::enable(&[]);
+            let (status, body) = ask("answer-calls", &holder, false).await;
+            assert_eq!(status, StatusCode::CONFLICT);
+            assert_eq!(body["error"]["code"], "module_disabled");
+            let (status, _) = ask("answer-texts", &holder, false).await;
+            assert_eq!(status, StatusCode::CONFLICT);
+            // A core lease is granted whatever is off, and letting go is always allowed.
+            let (status, body) = ask("answer-tasks", &holder, false).await;
+            assert_eq!((status, body["granted"].clone()), (StatusCode::OK, serde_json::json!(true)));
+            let (status, _) = ask("answer-calls", &holder, true).await;
+            assert_eq!(status, StatusCode::OK);
+        }
+        let _on = crate::modules::test_gate::enable(&[crate::modules::PHONE]);
+        let (status, body) = ask("answer-calls", &holder, false).await;
+        assert_eq!((status, body["granted"].clone()), (StatusCode::OK, serde_json::json!(true)));
+        ask("answer-calls", &holder, true).await;
+        ask("answer-tasks", &holder, true).await;
     }
 
     #[test]

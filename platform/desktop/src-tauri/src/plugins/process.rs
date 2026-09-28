@@ -169,6 +169,7 @@ impl PluginProcess {
             &opts.desktop_version,
             manifest.plugin_api_version,
             opts.dev_mode,
+            crate::modules::provided_by(manifest).contains(crate::modules::PHONE),
         );
 
         let mut cmd = Command::new(&exe);
@@ -1134,6 +1135,7 @@ process.stdin.on("data", (chunk) => {
                 &f.dir.join("data"),
                 "0.1.0",
                 1,
+                false,
                 false,
             );
             assert!(!env.contains_key("OPENAI_API_KEY"));

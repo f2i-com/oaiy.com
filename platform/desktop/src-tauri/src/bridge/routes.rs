@@ -599,6 +599,9 @@ async fn list_plugins(State(st): State<BridgeState>) -> axum::response::Response
             // a restart. `scan` preserves live state, so this cannot knock a
             // running plugin back to Installed.
             let report = reg.scan();
+            // A plugin dropped in (or its manifest changed) can bring or take a module.
+            crate::modules::refresh(&reg);
+            crate::modules::poke();
             (
                 StatusCode::OK,
                 Json(json!({
@@ -829,6 +832,9 @@ async fn set_plugin_enabled(
     match st.plugins.lock() {
         Ok(mut reg) => {
             reg.set_user_disabled(&id, !body.enabled);
+            // Turned off, its modules go now (and their leases with them); turned on, they are back.
+            crate::modules::refresh(&reg);
+            crate::modules::poke();
             match reg.get(&id) {
                 Some(rec) => (StatusCode::OK, Json(rec.clone())).into_response(),
                 None => bridge_error(
@@ -1120,7 +1126,9 @@ async fn install_plugin(
             // Pick the new plugin up immediately rather than on the next poll.
             if let Ok(mut reg) = st.plugins.lock() {
                 reg.scan();
+                crate::modules::refresh(&reg);
             }
+            crate::modules::poke();
             (
                 StatusCode::OK,
                 Json(json!({
@@ -1159,7 +1167,9 @@ async fn uninstall_plugin(State(st): State<BridgeState>, Path(id): Path<String>)
             if let Ok(mut reg) = st.plugins.lock() {
                 reg.forget(&id);
                 reg.scan();
+                crate::modules::refresh(&reg);
             }
+            crate::modules::poke();
             StatusCode::NO_CONTENT.into_response()
         }
         Ok(Err(e)) => bridge_error(StatusCode::NOT_FOUND, "invalid_request", e),

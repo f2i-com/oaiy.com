@@ -1316,7 +1316,8 @@ impl PluginHost {
             origin_run: None,
         };
 
-        if name == "aokie.appointment.requested" {
+        // Recorded in the calendar only while a plugin provides it (turned off, it is not written to).
+        if name == "aokie.appointment.requested" && crate::calendar::available() {
             if let Some(cal) = crate::calendar::shared() {
                 cal.record_request(&event.data);
             }
@@ -1562,9 +1563,10 @@ impl PluginHost {
             return Err(("invalid_request".into(), "flow.run needs a flowId".into()));
         };
 
-        // The phone's business lookup: answered by the calendar, unless the person
-        // stored a flow of that name to answer it their way.
-        if flow_id == "business-lookup" {
+        // The phone's business lookup: answered by the calendar (while a plugin
+        // provides it), unless the person stored a flow of that name to answer it
+        // their way. With the calendar off it is a flow like any other.
+        if flow_id == "business-lookup" && crate::calendar::available() {
             if let Some(cal) = crate::calendar::shared().filter(|c| !c.flow_answers(&flow_id)) {
                 let input = params.get("input").cloned().unwrap_or(Value::Null);
                 let text = |k: &str| input.get(k).and_then(Value::as_str).unwrap_or("").to_string();
@@ -2014,6 +2016,8 @@ impl PluginHost {
         if let Ok(mut reg) = self.registry.lock() {
             reg.set_state(id, state, reason);
         }
+        // After the lock is let go: the modules name their provider's state.
+        crate::modules::poke();
     }
 }
 
@@ -2295,12 +2299,28 @@ mod tests {
         install_plugin(&sb, "aokie", &["flow.run"]);
         host.registry.lock().unwrap().scan();
         crate::calendar::init(&sb.0);
+        let _calendar = crate::modules::test_gate::enable(&[crate::modules::PHONE, crate::modules::CALENDAR]);
         let out = host
             .handle_plugin_request("aokie", "flow.run", serde_json::json!({"flowSlug": "business-lookup", "input": {"question": "Any times this week?", "from": "+61400000000"}, "timeoutMs": 6000}))
             .unwrap();
         assert_eq!(out["status"], "done");
         let digest = out["result"]["digest"].as_str().unwrap();
         assert!(digest.contains("Opening hours:") && digest.contains("Free times"), "{digest}");
+    }
+
+    #[test]
+    fn with_the_calendar_off_the_business_lookup_is_a_flow_like_any_other() {
+        let (sb, host) = host_with("lookup-off", vec![]);
+        install_plugin(&sb, "aokie", &["flow.run"]);
+        host.registry.lock().unwrap().scan();
+        crate::calendar::init(&sb.0);
+        let _off = crate::modules::test_gate::enable(&[]);
+        let out = host
+            .handle_plugin_request("aokie", "flow.run", serde_json::json!({"flowSlug": "business-lookup", "input": {"question": "Any times this week?"}, "timeoutMs": 300}))
+            .unwrap();
+        // Not the calendar's answer: a run of the flow, which no worker takes here.
+        assert_eq!(out["status"], "queued");
+        assert!(out["result"].get("digest").is_none());
     }
 
     #[test]

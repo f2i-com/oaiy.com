@@ -318,13 +318,10 @@ pub fn init(data_dir: &Path) -> &'static Calendar {
 }
 
 /// Whether the calendar is in use: it is the phone receptionist's diary, so it
-/// is there while the Aokie plugin (the phone) is installed. Kept either way.
+/// is there while a plugin provides the calendar module (Aokie does), and not
+/// while that plugin is turned off or gone. Kept either way.
 pub fn available() -> bool {
-    DATA_DIR.get().is_some_and(|d| receptionist_installed(d))
-}
-
-fn receptionist_installed(data_dir: &Path) -> bool {
-    data_dir.join("plugins").join("aokie").join("manifest.json").is_file()
+    crate::modules::is_enabled(crate::modules::CALENDAR)
 }
 
 /// The desktop's calendar, once `init` has run.
@@ -724,15 +721,43 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_calendar_is_there_with_the_phone_receptionist() {
-        let dir = std::env::temp_dir().join(format!("oaiy-calendar-available-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        assert!(!receptionist_installed(&dir));
-        std::fs::create_dir_all(dir.join("plugins/aokie")).unwrap();
-        assert!(!receptionist_installed(&dir), "a folder alone is not an installed plugin");
-        std::fs::write(dir.join("plugins/aokie/manifest.json"), "{}").unwrap();
-        assert!(receptionist_installed(&dir));
-        let _ = std::fs::remove_dir_all(&dir);
+    fn the_calendar_is_there_while_a_plugin_provides_it() {
+        {
+            let _on = crate::modules::test_gate::enable(&[crate::modules::CALENDAR]);
+            assert!(available());
+        }
+        // Aokie turned off (or gone, or its manifest broken): no calendar, and nothing of it is deleted.
+        let _off = crate::modules::test_gate::enable(&[crate::modules::PHONE]);
+        assert!(!available(), "the phone alone does not bring the calendar");
+    }
+
+    #[tokio::test]
+    async fn the_calendars_writes_answer_module_disabled_while_it_is_off() {
+        // The desktop's one calendar (another test may have opened it first: either will do).
+        init(&std::env::temp_dir().join(format!("oaiy-calendar-gate-{}", std::process::id())));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, routes::router()).await.unwrap() });
+        let base = format!("http://{addr}");
+        let client = reqwest::Client::new();
+        let _off = crate::modules::test_gate::enable(&[]);
+        let writes = [
+            client.post(format!("{base}/api/calendar/appointments")).json(&json!({"date": "2026-10-01", "time": "10:00", "name": "Lance"})),
+            client.patch(format!("{base}/api/calendar/appointments/a1")).json(&json!({"status": "confirmed"})),
+            client.delete(format!("{base}/api/calendar/appointments/a1")),
+            client.put(format!("{base}/api/calendar/settings")).json(&json!({})),
+            client.post(format!("{base}/api/calendar/sync")),
+        ];
+        for request in writes {
+            let resp = request.send().await.unwrap();
+            let url = resp.url().to_string();
+            assert_eq!(resp.status(), 409, "{url}");
+            let body: Value = resp.json().await.unwrap();
+            assert_eq!(body["error"]["code"], "module_disabled", "{url}");
+        }
+        // Reading it still works, and says it is not in use.
+        let read: Value = client.get(format!("{base}/api/calendar")).send().await.unwrap().json().await.unwrap();
+        assert_eq!(read["available"], false);
     }
     use serde_json::json;
 
