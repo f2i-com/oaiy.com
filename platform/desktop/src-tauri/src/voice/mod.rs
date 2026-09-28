@@ -13,6 +13,7 @@
 
 pub mod audio;
 pub mod call;
+pub mod callers;
 pub mod engines;
 pub mod voices;
 
@@ -85,10 +86,15 @@ impl VoiceHub {
         let _ = self.inner.events.send(event);
     }
 
-    /// What the caller said: to the app, whose agent answers it. With no page
-    /// answering calls, the caller is told so and the call is finished.
-    fn caller_said(&self, call: &str, text: &str) {
-        self.emit(json!({"type": "call.caller", "callId": call, "text": text}));
+    /// What the caller said: to the app, whose agent answers it, with `how`
+    /// (when they said it, and whether over us). With no page answering calls,
+    /// the caller is told so and the call is finished.
+    fn caller_said(&self, call: &str, text: &str, how: Value) {
+        let mut event = json!({"type": "call.caller", "callId": call, "text": text});
+        if let (Some(event), Value::Object(how)) = (event.as_object_mut(), how) {
+            event.extend(how);
+        }
+        self.emit(event);
         if crate::bridge::leases::holder(ANSWER_CALLS).is_none() {
             if let Some(tx) = self.inner.calls.lock().unwrap().get(call) {
                 let (reply, _) = oneshot::channel();
@@ -123,6 +129,7 @@ impl VoiceHub {
 /// `GET /api/voice/events` (server-sent events: `call.started`, `call.caller`,
 /// `call.said`, `call.speech_started`, `call.interrupted`, `call.error`,
 /// `call.ended`), `GET /api/voice/calls`, and per call `say`, `tool`, `finish`, `hush`.
+/// `PUT /api/voice/callers` keeps the name a caller is greeted by.
 pub fn app_router(hub: VoiceHub) -> Router {
     Router::new()
         .route("/api/voice/events", get(events))
@@ -139,7 +146,23 @@ pub fn app_router(hub: VoiceHub) -> Router {
         .route("/api/voice/voices/chosen", put(voice_choose))
         .route("/api/voice/voices/:name", delete(voice_remove))
         .route("/api/voice/voices/:name/try", post(voice_try))
+        // A caller's name, for their number (an empty name forgets it).
+        .route("/api/voice/callers", put(caller_name))
         .with_state(hub)
+}
+
+#[derive(Deserialize)]
+struct CallerName {
+    number: String,
+    #[serde(default)]
+    name: String,
+}
+
+async fn caller_name(Json(body): Json<CallerName>) -> axum::response::Response {
+    match callers::remember(&body.number, &body.name) {
+        Ok(name) => Json(json!({"number": body.number, "name": name})).into_response(),
+        Err(e) => voice_error(StatusCode::BAD_REQUEST, "bad_caller", e),
+    }
 }
 
 fn voice_error(status: StatusCode, code: &str, message: impl Into<String>) -> axum::response::Response {

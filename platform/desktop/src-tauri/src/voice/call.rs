@@ -8,13 +8,21 @@
 //! as it comes, into one output item for the reply. Aokie plays one item at a
 //! time and drops what is left of a playing item when another starts, so a
 //! reply's sentences share an item, and a new item waits until the last has
-//! played. When the caller speaks over it, Aokie cancels the item, and the
-//! rest of that reply is dropped. The greeting is not cut off: people say
-//! "hello?" as a call connects; what they say is still heard and answered.
+//! played.
+//!
+//! When the caller speaks over us, we do not stop at once: a cough or an
+//! "mm-hmm" should not cut a sentence off. We stop when they have spoken long
+//! enough to mean it, or, when they stop sooner, once their words are heard
+//! and are more than an acknowledgement. Aokie does the stopping: told the
+//! caller speaks (`speech_started`), it cancels the item, and the rest of that
+//! reply is dropped. The greeting is not cut off: people say "hello?" as a
+//! call connects; what they say is still heard and answered.
+//!
+//! The app is told when things were said, in milliseconds since the call began.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use axum::extract::ws::{Message, WebSocket};
@@ -57,6 +65,23 @@ enum Speak {
 /// How long after an item's audio should have played Aokie is sure to be done with it.
 const PLAYOUT_MARGIN: Duration = Duration::from_millis(250);
 
+/// How long the transcriber waits for a cut it asked Aokie for.
+const CUT_WAIT: Duration = Duration::from_millis(500);
+
+/// Milliseconds since the call began (`formlogic.realtime.begin`): when things were said, for the app.
+#[derive(Clone, Default)]
+struct Clock(Arc<OnceLock<Instant>>);
+
+impl Clock {
+    fn start(&self) {
+        let _ = self.0.set(Instant::now());
+    }
+
+    fn ms(&self, t: Instant) -> u64 {
+        self.0.get().map_or(0, |begun| t.saturating_duration_since(*begun).as_millis() as u64)
+    }
+}
+
 /// The output item being spoken: one per reply, each sentence added to it as it comes.
 struct OpenItem {
     id: String,
@@ -66,17 +91,23 @@ struct OpenItem {
     first_pcm: Option<Instant>,
     last_pcm: Option<Instant>,
     samples: u64,
+    /// When the audio sent so far will have been heard: Aokie plays it in order, as it comes.
+    heard_until: Option<Instant>,
 }
 
 impl OpenItem {
     fn new(id: String, epoch: u64) -> Self {
-        Self { id, epoch, said: Vec::new(), first_pcm: None, last_pcm: None, samples: 0 }
+        Self { id, epoch, said: Vec::new(), first_pcm: None, last_pcm: None, samples: 0, heard_until: None }
     }
 
-    fn sent(&mut self, samples: usize, now: Instant) {
+    /// Audio sent: when the caller starts to hear it.
+    fn sent(&mut self, samples: usize, now: Instant) -> Instant {
         self.first_pcm.get_or_insert(now);
         self.last_pcm = Some(now);
         self.samples += samples as u64;
+        let from = self.heard_until.map_or(now, |t| t.max(now));
+        self.heard_until = Some(from + Duration::from_micros(samples as u64 * 1_000_000 / WIRE_RATE as u64));
+        from
     }
 
     /// When Aokie will have played all of it: its length after the first audio,
@@ -107,6 +138,83 @@ impl Speaking {
     fn quiet(&self, now: Instant) -> bool {
         self.quiet_until.is_some_and(|t| now < t)
     }
+}
+
+/// The utterance being heard, and how it stands with our voice.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Hearing {
+    /// Our voice was audible when they began.
+    over: bool,
+    /// It may yet stop us: begun over us, not over the greeting, and it has not yet.
+    may_cut: bool,
+    /// It has stopped us.
+    cut: bool,
+}
+
+impl Hearing {
+    /// They began, over our voice (`out`) or not, maybe over the greeting
+    /// (`quiet`); and whether Aokie is told now. Over nothing it is, as ever;
+    /// over us, not yet; over the greeting, never. Over the goodbye (`ending`)
+    /// it is, as before: Aokie holds the hangup until their words are in.
+    fn began(out: bool, quiet: bool, ending: bool) -> (Self, bool) {
+        if quiet {
+            return (Self { over: out, ..Self::default() }, false);
+        }
+        if !out || ending {
+            return (Self { over: out, may_cut: false, cut: out }, true);
+        }
+        (Self { over: true, may_cut: true, cut: false }, false)
+    }
+
+    /// They have spoken long enough to mean it: whether Aokie is told now, and we stop.
+    fn went_on(&mut self, out: bool, quiet: bool) -> bool {
+        let tell = self.may_cut && out && !quiet;
+        if tell {
+            self.may_cut = false;
+            self.cut = true;
+        }
+        tell
+    }
+}
+
+/// A finished utterance, for the transcriber: its audio, when it was said
+/// (ms since the call began), and how it stood with our voice.
+struct Utterance {
+    audio: Vec<i16>,
+    start_ms: u64,
+    end_ms: u64,
+    /// Our voice was audible when they began.
+    over: bool,
+    /// It has stopped us already: they spoke long enough.
+    cut: bool,
+    /// Said over us, and short: its words decide whether we stop.
+    decides: bool,
+}
+
+/// Whether the caller only acknowledged us ("mm-hmm", "yeah, okay"): one to
+/// three of these words and nothing else. "Stop", "wait" and "no" are not.
+pub fn is_backchannel(text: &str) -> bool {
+    const WORDS: [&str; 20] = ["mm", "mmm", "mhm", "hmm", "uhuh", "yeah", "yep", "yes", "ok", "okay", "right", "sure", "alright", "cool", "great", "nice", "oh", "ah", "uh", "um"];
+    const PAIRS: [&str; 3] = ["uh huh", "i see", "got it"];
+    // "Mm-hmm." is "mm hmm": hyphens part words, other punctuation goes.
+    let words: Vec<String> = text
+        .to_lowercase()
+        .split(|c: char| c.is_whitespace() || matches!(c, '-' | '\u{2010}' | '\u{2011}' | '\u{2013}'))
+        .map(|w| w.chars().filter(|c| c.is_alphanumeric()).collect::<String>())
+        .filter(|w| !w.is_empty())
+        .collect();
+    let (mut at, mut said) = (0, 0);
+    while at < words.len() {
+        if words.get(at + 1).is_some_and(|next| PAIRS.contains(&format!("{} {next}", words[at]).as_str())) {
+            at += 2;
+        } else if WORDS.contains(&words[at].as_str()) {
+            at += 1;
+        } else {
+            return false;
+        }
+        said += 1;
+    }
+    (1..=3).contains(&said)
 }
 
 #[derive(Clone, Debug)]
@@ -190,9 +298,10 @@ pub async fn run(socket: WebSocket, hub: VoiceHub, engines: Engines) {
     let epoch = Arc::new(AtomicU64::new(0));
     let speaking = Arc::new(Mutex::new(Speaking::default()));
     let current_item: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let clock = Clock::default();
     let (speak_tx, mut speak_rx) = mpsc::unbounded_channel::<Speak>();
     let speaker = {
-        let (out_tx, ids, hub, engines, epoch, speaking, current_item, voice) = (out_tx.clone(), ids.clone(), hub.clone(), engines.clone(), epoch.clone(), speaking.clone(), current_item.clone(), voice.clone());
+        let (out_tx, ids, hub, engines, epoch, speaking, current_item, voice, clock) = (out_tx.clone(), ids.clone(), hub.clone(), engines.clone(), epoch.clone(), speaking.clone(), current_item.clone(), voice.clone(), clock.clone());
         tokio::spawn(async move {
             // Close the open item: what it said, then done (Aokie holds even a cancelled item open until its exact item_done).
             let close = |item: OpenItem, cut: bool| {
@@ -264,6 +373,8 @@ pub async fn run(socket: WebSocket, hub: VoiceHub, engines: Engines) {
                     tokio::spawn(async move { engines.speak(&text, voice.as_deref(), &pcm_tx).await })
                 };
                 let mut cut = false;
+                // When the caller starts to hear this sentence: after what went before it in the item.
+                let mut heard_from: Option<Instant> = None;
                 while let Some(samples) = pcm_rx.recv().await {
                     if job.epoch != epoch.load(Ordering::SeqCst) {
                         cut = true;
@@ -272,7 +383,8 @@ pub async fn run(socket: WebSocket, hub: VoiceHub, engines: Engines) {
                     // At most a second per frame (Aokie takes up to two).
                     for chunk in samples.chunks(WIRE_RATE as usize) {
                         let _ = out_tx.send(Message::Binary(audio::bytes(chunk))).await;
-                        item.sent(chunk.len(), Instant::now());
+                        let from = item.sent(chunk.len(), Instant::now());
+                        heard_from.get_or_insert(from);
                     }
                 }
                 drop(pcm_rx);
@@ -290,7 +402,9 @@ pub async fn run(socket: WebSocket, hub: VoiceHub, engines: Engines) {
                 }
                 if spoken.is_ok() {
                     item.said.push(job.text.clone());
-                    hub.emit(json!({"type": "call.said", "callId": ids.call, "itemId": item.id, "text": job.text}));
+                    let until = item.heard_until.unwrap_or_else(Instant::now);
+                    let from = heard_from.unwrap_or(until);
+                    hub.emit(json!({"type": "call.said", "callId": ids.call, "itemId": item.id, "text": job.text, "startMs": clock.ms(from), "endMs": clock.ms(until)}));
                 }
                 // The goodbye: its item ends with it, then Aokie hangs up once it has played.
                 if let Some(tool_call_id) = job.then_hangup {
@@ -307,21 +421,43 @@ pub async fn run(socket: WebSocket, hub: VoiceHub, engines: Engines) {
         })
     };
 
-    // The listener: finished utterances, one at a time, to text.
-    let (utter_tx, mut utter_rx) = mpsc::unbounded_channel::<Vec<i16>>();
+    // The listener: finished utterances, one at a time, to text. One said over
+    // us, and too short to have stopped us, is decided here by its words.
+    let (utter_tx, mut utter_rx) = mpsc::unbounded_channel::<Utterance>();
     let transcriber = {
-        let (out_tx, ids, hub, engines) = (out_tx.clone(), ids.clone(), hub.clone(), engines.clone());
+        let (out_tx, ids, hub, engines, speaking, epoch) = (out_tx.clone(), ids.clone(), hub.clone(), engines.clone(), speaking.clone(), epoch.clone());
         tokio::spawn(async move {
             while let Some(utterance) = utter_rx.recv().await {
-                match engines.transcribe(&utterance).await {
-                    Ok(text) if !text.is_empty() => {
-                        let item = next_item("in");
-                        let _ = out_tx.send(ids.event("formlogic.realtime.input_transcript", json!({"itemId": item, "transcript": text, "final": true}))).await;
-                        hub.caller_said(&ids.call, &text);
+                let text = match engines.transcribe(&utterance.audio).await {
+                    Ok(text) if !text.is_empty() => text,
+                    Ok(_) => continue,
+                    Err(e) => {
+                        hub.emit(json!({"type": "call.error", "callId": ids.call, "message": e}));
+                        continue;
                     }
-                    Ok(_) => {}
-                    Err(e) => hub.emit(json!({"type": "call.error", "callId": ids.call, "message": e})),
+                };
+                let backchannel = utterance.over && !utterance.cut && is_backchannel(&text);
+                let mut cut = utterance.cut;
+                let still_out = || {
+                    let s = speaking.lock().unwrap();
+                    let now = Instant::now();
+                    s.out(now) && !s.quiet(now)
+                };
+                if utterance.decides && !backchannel && still_out() {
+                    // More than an "mm-hmm": Aokie cuts what still plays. The app hears of
+                    // the cut before the words (it stops its agent at a cut), so wait for it.
+                    let before = epoch.load(Ordering::SeqCst);
+                    let _ = out_tx.send(ids.event("formlogic.realtime.speech_started", json!({}))).await;
+                    let asked = Instant::now();
+                    while epoch.load(Ordering::SeqCst) == before && asked.elapsed() < CUT_WAIT {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    cut = epoch.load(Ordering::SeqCst) != before;
                 }
+                let item = next_item("in");
+                let _ = out_tx.send(ids.event("formlogic.realtime.input_transcript", json!({"itemId": item, "transcript": text, "final": true}))).await;
+                let how = json!({"startMs": utterance.start_ms, "endMs": utterance.end_ms, "over": utterance.over, "cut": cut, "backchannel": backchannel});
+                hub.caller_said(&ids.call, &text, how);
             }
         })
     };
@@ -339,6 +475,9 @@ pub async fn run(socket: WebSocket, hub: VoiceHub, engines: Engines) {
     }
 
     let mut detector = Detector::new(WIRE_RATE);
+    let mut hearing = Hearing::default();
+    // The goodbye is being said: the call is ending.
+    let mut ending = false;
     let mut begun = false;
     let mut pending_tools: HashMap<String, oneshot::Sender<Result<Value, String>>> = HashMap::new();
     // finish_call tool calls waiting for Aokie's answer: the goodbye to speak once accepted.
@@ -363,11 +502,15 @@ pub async fn run(socket: WebSocket, hub: VoiceHub, engines: Engines) {
                         match v.get("type").and_then(Value::as_str).unwrap_or("") {
                             "formlogic.realtime.begin" => {
                                 begun = true;
+                                clock.start();
                                 if let Some(g) = v.get("greeting").and_then(Value::as_str).filter(|g| !g.trim().is_empty()) {
                                     greeting = g.to_string();
                                 }
                                 let (from, name) = hub.caller_of(&ids.call).unwrap_or_default();
-                                hub.emit(json!({"type": "call.started", "callId": ids.call, "from": from, "name": name, "instructions": instructions, "greeting": greeting}));
+                                // Greeted by name when we know it: the name kept for their number, else the phone's.
+                                let known = super::callers::name_of(&from).or_else(|| super::callers::looks_like_name(&name).then(|| name.trim().to_string())).unwrap_or_default();
+                                greeting = super::callers::personal_greeting(&greeting, &known);
+                                hub.emit(json!({"type": "call.started", "callId": ids.call, "from": from, "name": name, "knownName": known, "instructions": instructions, "greeting": greeting}));
                                 if !greeting.trim().is_empty() {
                                     speak(greeting.clone(), true, None);
                                 }
@@ -375,8 +518,9 @@ pub async fn run(socket: WebSocket, hub: VoiceHub, engines: Engines) {
                             "formlogic.realtime.cancel_output" => {
                                 let item = v.get("itemId").and_then(Value::as_str).unwrap_or("");
                                 if current_item.lock().unwrap().as_deref() == Some(item) {
+                                    // Told before the cut: what the caller said reaches the app after it (the app stops its agent at a cut).
+                                    hub.emit(json!({"type": "call.interrupted", "callId": ids.call, "itemId": item, "playedMs": v.get("playedMs"), "atMs": clock.ms(Instant::now())}));
                                     cut();
-                                    hub.emit(json!({"type": "call.interrupted", "callId": ids.call, "itemId": item, "playedMs": v.get("playedMs")}));
                                 }
                             }
                             "formlogic.realtime.tool_result" => {
@@ -387,6 +531,7 @@ pub async fn run(socket: WebSocket, hub: VoiceHub, engines: Engines) {
                                 } else if let Some((goodbye, reply)) = finishing.remove(&id) {
                                     if ok {
                                         speak(goodbye, false, Some(id));
+                                        ending = true;
                                     }
                                     let _ = reply.send(Ok(json!({"ok": ok, "output": output})));
                                 }
@@ -407,15 +552,24 @@ pub async fn run(socket: WebSocket, hub: VoiceHub, engines: Engines) {
                         detector.speaking_out = out;
                         for heard in detector.push(&audio::samples(&bytes)) {
                             match heard {
-                                Heard::Started => {
+                                Heard::Started { at_ms } => {
                                     // Over the greeting the caller is heard, not obeyed: it plays on.
-                                    if !quiet {
+                                    // Over the rest of what we say, not yet: it may be an "mm-hmm".
+                                    let (next, tell) = Hearing::began(out, quiet, ending);
+                                    hearing = next;
+                                    if tell {
                                         let _ = out_tx.send(ids.event("formlogic.realtime.speech_started", json!({}))).await;
                                     }
-                                    hub.emit(json!({"type": "call.speech_started", "callId": ids.call}));
+                                    hub.emit(json!({"type": "call.speech_started", "callId": ids.call, "atMs": at_ms, "over": out}));
                                 }
-                                Heard::Utterance(audio) => {
-                                    let _ = utter_tx.send(audio);
+                                Heard::Sustained => {
+                                    // They mean to cut in: Aokie cancels what plays, and tells us (`cancel_output`).
+                                    if hearing.went_on(out, quiet) {
+                                        let _ = out_tx.send(ids.event("formlogic.realtime.speech_started", json!({}))).await;
+                                    }
+                                }
+                                Heard::Utterance { audio, start_ms, end_ms } => {
+                                    let _ = utter_tx.send(Utterance { audio, start_ms, end_ms, over: hearing.over, cut: hearing.cut, decides: hearing.may_cut });
                                 }
                                 Heard::Nothing => {}
                             }
@@ -488,5 +642,73 @@ mod tests {
         let Message::Text(t) = event else { panic!() };
         let v: Value = serde_json::from_str(&t).unwrap();
         assert_eq!((v["type"].as_str(), v["callId"].as_str(), v["generation"].as_u64()), (Some("formlogic.realtime.ready"), Some("call_1"), Some(3)));
+    }
+
+    #[test]
+    fn an_acknowledgement_is_a_backchannel() {
+        for said in ["Mm-hmm.", "mm", "Mmm", "mhm", "Hmm?", "Uh-huh.", "uh huh", "Uhuh", "Yeah.", "yep", "Yes", "OK", "O.K.", "Okay, okay.", "Right.", "Sure", "Alright", "Cool", "Great!", "Nice", "Oh", "Ah", "Uh", "Um", "I see.", "Got it.", "Yeah, got it"] {
+            assert!(is_backchannel(said), "{said:?} is an acknowledgement");
+        }
+        // Up to three.
+        assert!(is_backchannel("Yeah, yeah, yeah."));
+        assert!(is_backchannel("Uh-huh, I see, got it."));
+        assert!(!is_backchannel("Yeah, yeah, yeah, yeah."));
+    }
+
+    #[test]
+    fn words_that_ask_us_to_stop_are_not_a_backchannel() {
+        for said in ["Stop.", "Wait", "No", "Sorry?", "Hold on.", "Hang on", "Yeah, but wait", "Okay stop", "Yes please", "What?", "", "...", "Got", "I", "Tuesday"] {
+            assert!(!is_backchannel(said), "{said:?} is not an acknowledgement");
+        }
+    }
+
+    #[test]
+    fn speech_over_us_stops_us_only_once_it_goes_on() {
+        // Over nothing: Aokie is told at once, as ever, and it is not a cut.
+        let (mut h, tell) = Hearing::began(false, false, false);
+        assert!(tell);
+        assert!(!h.over && !h.may_cut && !h.cut);
+        assert!(!h.went_on(true, false), "our voice starting after them does not make it a cut");
+        assert!(!h.cut);
+        // Over us: not yet; once it goes on, it stops us, once.
+        let (mut h, tell) = Hearing::began(true, false, false);
+        assert!(!tell);
+        assert!(h.over && h.may_cut);
+        assert!(h.went_on(true, false));
+        assert!(h.cut && !h.may_cut);
+        assert!(!h.went_on(true, false), "Aokie is told once an utterance");
+        // Over us, but we went quiet before it went on: its words decide.
+        let (mut h, _) = Hearing::began(true, false, false);
+        assert!(!h.went_on(false, false));
+        assert!(h.may_cut && !h.cut);
+        // Over the greeting: heard, never obeyed.
+        let (mut h, tell) = Hearing::began(true, true, false);
+        assert!(!tell);
+        assert!(h.over && !h.may_cut);
+        assert!(!h.went_on(true, false));
+        assert!(!h.cut);
+        // Over the goodbye: Aokie is told at once, as before (it holds the hangup for their words).
+        let (mut h, tell) = Hearing::began(true, false, true);
+        assert!(tell);
+        assert!(h.over && h.cut && !h.may_cut);
+        assert!(!h.went_on(true, false));
+    }
+
+    #[test]
+    fn a_sentence_is_heard_after_what_went_before_it() {
+        let t0 = Instant::now();
+        let second = WIRE_RATE as usize;
+        let mut item = OpenItem::new("out_1".into(), 0);
+        // A second of audio sent at once is heard from then, for a second.
+        assert_eq!(item.sent(second, t0), t0);
+        // More sent straight after is heard after it.
+        assert_eq!(item.sent(second / 2, t0 + Duration::from_millis(10)), t0 + Duration::from_secs(1));
+        assert_eq!(item.heard_until, Some(t0 + Duration::from_millis(1500)));
+        // Audio that came after a pause is heard when it came.
+        let late = t0 + Duration::from_secs(3);
+        assert_eq!(item.sent(second, late), late);
+        assert_eq!(item.heard_until, Some(late + Duration::from_secs(1)));
+        let clock = Clock::default();
+        assert_eq!(clock.ms(late), 0, "before the call begins, all is at 0");
     }
 }
