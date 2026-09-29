@@ -5,10 +5,11 @@
 // It proves that
 //  - the manifest names OAIY, and every icon it (and the page) names is served, with the right type and size;
 //  - Chrome reports NO installability errors for the served build (CDP Page.getInstallabilityErrors);
-//  - the first service worker starts at once, and it removes the caches of earlier builds and of the app's old
-//    name, and only those;
+//  - the first service worker starts at once, and it removes the caches older than the previous build's (the
+//    app's old name included) and nobody else's;
 //  - "Install app" shows only where the browser offers it (never as an installed app, never in OAIY's window),
 //    and iOS Safari gets one sentence;
+//  - an upgrade whose precache cannot be fetched fails to install: the running worker stays and nothing is announced;
 //  - a new version waits: the page says so and does not reload by itself; Reload asks first when the page would
 //    object to leaving (the agent is at work) and sends nothing if the person stays; agreeing takes the update and
 //    reloads once with no second prompt; when the browser's own leave prompt stops the reload, the next click works;
@@ -417,6 +418,23 @@ try {
     same(keys, [...wanted].sort(), what);
   };
   let navigationsBefore = 0;
+
+  await check('an upgrade whose precache cannot be fetched fails to install: the running worker stays, and no update is announced', async () => {
+    await page.evaluate(() => {
+      window.__stillHere = true;
+    });
+    // The host deploys the next version, but one of the files its worker precaches is not served.
+    serving.workerVersion = 2;
+    serving.missing.add('/icon-512.png');
+    await askUpdate();
+    for (let i = 0; i < 80 && (await page.evaluate(async () => !!(await navigator.serviceWorker.getRegistration()).installing)); i++) await sleep(250);
+    await sleep(1500);
+    same(await stateOf(), { active: 'activated', notice: false, alive: true }, 'the workers and the notice after the failed install');
+    // No cache of the failed version is left behind (an empty one would be taken for the previous build).
+    same((await cacheKeys(page)).includes(NEXT_CACHE), false, 'the failed version cache');
+    same((await cacheKeys(page)).includes(builtCache), true, 'the running version cache');
+    serving.missing.delete('/icon-512.png');
+  });
 
   await check('a new version waits: the page says so, and does not reload by itself', async () => {
     await page.evaluate(() => {

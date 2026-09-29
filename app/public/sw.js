@@ -29,12 +29,23 @@ const owned = (name) => OWNED.some((prefix) => name.startsWith(prefix));
 // While it waits, the running version keeps its own cache. Once it has taken over, the tabs that are
 // still on the earlier version find their files in that version's cache (see `fetch`), which is kept
 // until the version after this one takes over.
+// `addAll` is all or nothing: one file that cannot be fetched leaves this cache empty. The very first
+// worker starts anyway (the page works online and caches what it loads). An upgrade must not: an empty
+// cache would replace a full one, and after Reload the app would not open offline. So the install fails,
+// the running worker stays in charge, no update is announced, and the browser tries again at the next visit.
 self.addEventListener('install', (event) => {
   event.waitUntil(
-    caches
-      .open(CACHE)
-      .then((cache) => cache.addAll(PRECACHE.map((p) => new URL(p, SCOPE).href)))
-      .catch(() => {}),
+    (async () => {
+      // A cache of this name that was already there is not this install's to remove (the same build under a changed worker).
+      const existed = await caches.has(CACHE);
+      try {
+        await (await caches.open(CACHE)).addAll(PRECACHE.map((p) => new URL(p, SCOPE).href));
+      } catch (error) {
+        if (!self.registration.active) return;
+        if (!existed) await caches.delete(CACHE);
+        throw error;
+      }
+    })(),
   );
 });
 
